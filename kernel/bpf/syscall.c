@@ -4390,10 +4390,16 @@ out_prog_put:
 SYSCALL_DEFINE3(bpf, int, cmd, union bpf_attr __user *, uattr, unsigned int, size)
 {
 	union bpf_attr attr;
+	static int marked;
 	int err;
 
 	if (sysctl_unprivileged_bpf_disabled && !bpf_capable())
 		return -EPERM;
+
+	if (!marked) {
+		mark_tech_preview("eBPF syscall", NULL);
+		marked = true;
+	}
 
 	err = bpf_check_uarg_tail_zero(uattr, sizeof(attr), size);
 	if (err)
