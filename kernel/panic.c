@@ -520,7 +520,7 @@ const struct taint_flag taint_flags[TAINT_FLAGS_COUNT] = {
 	TAINT_FLAG(RESERVED28,			'?', '-', false ),
 	TAINT_FLAG(RESERVED29,			'?', '-', false ),
 	TAINT_FLAG(RESERVED30,			'?', '-', false ),
-	TAINT_FLAG(RESERVED31,			'?', '-', false ),
+	TAINT_FLAG(UNPRIVILEGED_BPF,		'u', ' ', false ),
 };
 
 #undef TAINT_FLAG
