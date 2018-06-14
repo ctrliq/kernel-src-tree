@@ -508,6 +508,19 @@ const struct taint_flag taint_flags[TAINT_FLAGS_COUNT] = {
 	TAINT_FLAG(AUX,				'X', ' ', true),
 	TAINT_FLAG(RANDSTRUCT,			'T', ' ', true),
 	TAINT_FLAG(TEST,			'N', ' ', true),
+	TAINT_FLAG(19,				'?', '-', false ),
+	TAINT_FLAG(20,				'?', '-', false ),
+	TAINT_FLAG(21,				'?', '-', false ),
+	TAINT_FLAG(22,				'?', '-', false ),
+	TAINT_FLAG(23,				'?', '-', false ),
+	TAINT_FLAG(24,				'?', '-', false ),
+	TAINT_FLAG(25,				'?', '-', false ),
+	TAINT_FLAG(26,				'?', '-', false ),
+	TAINT_FLAG(27,				'?', '-', false ),
+	TAINT_FLAG(RESERVED28,			'?', '-', false ),
+	TAINT_FLAG(RESERVED29,			'?', '-', false ),
+	TAINT_FLAG(RESERVED30,			'?', '-', false ),
+	TAINT_FLAG(RESERVED31,			'?', '-', false ),
 };
 
 #undef TAINT_FLAG
