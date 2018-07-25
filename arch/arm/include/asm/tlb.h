@@ -291,5 +291,13 @@ static inline void tlb_change_page_size(struct mmu_gather *tlb,
 {
 }
 
+static inline void tlb_flush_remove_tables(struct mm_struct *mm)
+{
+}
+
+static inline void tlb_flush_remove_tables_local(void *arg)
+{
+}
+
 #endif /* CONFIG_MMU */
 #endif
