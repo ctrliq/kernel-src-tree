@@ -463,7 +463,7 @@ extern enum system_states {
 #define TAINT_24			24
 #define TAINT_25			25
 #define TAINT_26			26
-#define TAINT_27			27
+#define TAINT_SUPPORT_REMOVED		27
 /* Bits 28 - 31 are reserved for Red Hat use only */
 #define TAINT_RESERVED28		28
 #define TAINT_RESERVED29		29
