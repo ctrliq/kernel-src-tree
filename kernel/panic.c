@@ -516,7 +516,7 @@ const struct taint_flag taint_flags[TAINT_FLAGS_COUNT] = {
 	TAINT_FLAG(24,				'?', '-', false ),
 	TAINT_FLAG(25,				'?', '-', false ),
 	TAINT_FLAG(26,				'?', '-', false ),
-	TAINT_FLAG(27,				'?', '-', false ),
+	TAINT_FLAG(SUPPORT_REMOVED,		'h', ' ', false ),
 	TAINT_FLAG(RESERVED28,			'?', '-', false ),
 	TAINT_FLAG(RESERVED29,			'?', '-', false ),
 	TAINT_FLAG(RESERVED30,			'?', '-', false ),
