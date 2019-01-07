@@ -1252,7 +1252,13 @@ endef
 define filechk_version.h
 	echo \#define LINUX_VERSION_CODE $(shell                         \
 	expr $(VERSION) \* 65536 + 0$(PATCHLEVEL) \* 256 + 0$(SUBLEVEL)); \
-	echo '#define KERNEL_VERSION(a,b,c) (((a) << 16) + ((b) << 8) + (c))'
+	echo '#define KERNEL_VERSION(a,b,c) (((a) << 16) + ((b) << 8) + (c))'; \
+	echo '#define RHEL_MAJOR $(RHEL_MAJOR)'; \
+	echo '#define RHEL_MINOR $(RHEL_MINOR)'; \
+	echo '#define RHEL_RELEASE_VERSION(a,b) (((a) << 8) + (b))'; \
+	echo '#define RHEL_RELEASE_CODE \
+		$(shell expr $(RHEL_MAJOR) \* 256 + $(RHEL_MINOR))'; \
+	echo '#define RHEL_RELEASE "$(RHEL_RELEASE)"'
 endef
 
 $(version_h): FORCE
