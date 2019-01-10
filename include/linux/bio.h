@@ -285,6 +285,10 @@ struct bio_integrity_payload {
 	struct work_struct	bip_work;	/* I/O completion */
 
 	struct bio_vec		*bip_vec;
+
+	RH_KABI_RESERVE(1)
+	RH_KABI_RESERVE(2)
+
 	struct bio_vec		bip_inline_vecs[];/* embedded bvec array */
 };
 
