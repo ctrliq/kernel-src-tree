@@ -147,6 +147,7 @@ static void megasas_get_pd_info(struct megasas_instance *instance,
  */
 static struct pci_device_id megasas_pci_table[] = {
 
+#ifndef CONFIG_RHEL_DIFFERENCES
 	{PCI_DEVICE(PCI_VENDOR_ID_LSI_LOGIC, PCI_DEVICE_ID_LSI_SAS1064R)},
 	/* xscale IOP */
 	{PCI_DEVICE(PCI_VENDOR_ID_LSI_LOGIC, PCI_DEVICE_ID_LSI_SAS1078R)},
@@ -165,6 +166,7 @@ static struct pci_device_id megasas_pci_table[] = {
 	/* xscale IOP, vega */
 	{PCI_DEVICE(PCI_VENDOR_ID_DELL, PCI_DEVICE_ID_DELL_PERC5)},
 	/* xscale IOP */
+#endif
 	{PCI_DEVICE(PCI_VENDOR_ID_LSI_LOGIC, PCI_DEVICE_ID_LSI_FUSION)},
 	/* Fusion */
 	{PCI_DEVICE(PCI_VENDOR_ID_LSI_LOGIC, PCI_DEVICE_ID_LSI_PLASMA)},
