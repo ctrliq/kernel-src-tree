@@ -236,7 +236,7 @@ setup-source: dist-git-version-check dist-clean-sources
 		cp $(REDHAT)/$(CHANGELOG_PREV) $(REDHAT)/$(CHANGELOG); \
 	fi
 	@cp $(REDHAT)/$(CHANGELOG) $(SOURCES)/$(CHANGELOG)
-	@$(REDHAT)/genspec.sh $(SOURCES) $(SOURCES)/$(SPECFILE) $(SOURCES)/$(CHANGELOG) $(PKGRELEASE) $(RPMKVERSION) $(RPMKPATCHLEVEL) $(RPMKSUBLEVEL) $(DISTRO_BUILD) $(RELEASED_KERNEL) $(SPECRELEASE) $(__ZSTREAM) "$(BUILDOPTS)" $(MARKER) `cat $(REDHAT)/marker` $(SINGLE_TARBALL) $(TARFILE_RELEASE) $(SNAPSHOT) $(BUILDID)
+	@$(REDHAT)/genspec.sh $(SOURCES) $(SOURCES)/$(SPECFILE) $(PACKAGE_NAME) $(SOURCES)/$(CHANGELOG) $(PKGRELEASE) $(RPMKVERSION) $(RPMKPATCHLEVEL) $(RPMKSUBLEVEL) $(DISTRO_BUILD) $(RELEASED_KERNEL) $(SPECRELEASE) $(__ZSTREAM) "$(BUILDOPTS)" $(MARKER) `cat $(REDHAT)/marker` $(SINGLE_TARBALL) $(TARFILE_RELEASE) $(SNAPSHOT) $(BUILDID)
 	@cp $(SOURCES)/$(SPECFILE) $(SOURCES)/../SPECS/
 
 generate-testpatch-tmp:
@@ -298,7 +298,7 @@ dist-test-patch: generate-testpatch-tmp
 	@mv $(TESTPATCH).tmp $(TESTPATCH);
 
 do-rpmbuild: dist-sources
-	$(RPMBUILD) --define "_sourcedir $(SOURCES)" --define "_builddir $(RPM)/BUILD" --define "_srcrpmdir $(RPM)/SRPMS" --define "_rpmdir $(RPM)/RPMS" --define "_specdir $(RPM)/SPECS" --define "dist $(DIST)" $(RPMBUILDOPTS) $(RPM)/SOURCES/$(PACKAGE_NAME).spec
+	$(RPMBUILD) --define "_sourcedir $(SOURCES)" --define "_builddir $(RPM)/BUILD" --define "_srcrpmdir $(RPM)/SRPMS" --define "_rpmdir $(RPM)/RPMS" --define "_specdir $(RPM)/SPECS" --define "dist $(DIST)" $(RPMBUILDOPTS) $(RPM)/SOURCES/$(SPECFILE)
 
 dist-all-rpms: RPMBUILDOPTS=--target $(MACH) -ba
 dist-all-rpms: dist-sources do-rpmbuild
@@ -330,7 +330,11 @@ dist-release-finish: setup-source
 	@cp $(SOURCES)/$(CHANGELOG) $(REDHAT)/$(CHANGELOG)
 	@$(GIT) add $(REDHAT)/$(CHANGELOG)
 	@$(GIT) add $(REDHAT)/marker
-	@$(GIT) commit -s ../Makefile.rhelver $(REDHAT)/marker $(REDHAT)/$(CHANGELOG) $(PACKAGE_NAME).spec.template -m "[redhat] $(PACKAGE_NAME)-$(STAMP_VERSION)-$(PREBUILD)$(BUILD)$(BUILDID)"
+	@echo "[redhat] $(PACKAGE_NAME)-$(STAMP_VERSION)-$(PKGRELEASE)" > /tmp/rtkcommit
+	@echo "" >> /tmp/rtkcommit
+	@echo "Bugzilla: $(RTBZ)" >> /tmp/rtkcommit
+	@echo "" >> /tmp/rtkcommit
+	@$(GIT) commit -F /tmp/rtkcommit -s ../Makefile.rhelver $(REDHAT)/marker $(REDHAT)/$(CHANGELOG) kernel.spec.template
 dist-release-changed: setup-source
 	@cp $(SOURCES)/$(CHANGELOG) $(REDHAT)/$(CHANGELOG)
 	@echo $(MARKER) > $(REDHAT)/marker
@@ -409,7 +413,7 @@ endif
 		exit 1; \
 	fi; \
 	fi
-	$(REDHAT)/scripts/rh-dist-git.sh "$(RHDISTGIT_BRANCH)" "$(RHDISTGIT_CACHE)" "$(RHDISTGIT_TMP)" "$(RHDISTGIT)" "$(TARBALL)" "$(KABI_TARBALL)" "$(KABIDW_TARBALL)" "$(__ZSTREAM)" "$(PACKAGE_NAME)" "$(RHEL_MAJOR)" "$(RHPKG_BIN)" "$(SRPMS)/$(PACKAGE_NAME)-$(KVERSION)-$(PKGRELEASE)$(DIST).src.rpm"
+	$(REDHAT)/scripts/rh-dist-git.sh "$(RHDISTGIT_BRANCH)" "$(RHDISTGIT_CACHE)" "$(RHDISTGIT_TMP)" "$(RHDISTGIT)" "$(TARBALL)" "$(KABI_TARBALL)" "$(KABIDW_TARBALL)" "$(__ZSTREAM)" "$(PACKAGE_NAME)" "$(RHEL_MAJOR)" "$(RHPKG_BIN)" "$(SRPMS)/$(PACKAGE_NAME)-$(KVERSION)-$(PKGRELEASE)$(DIST).src.rpm" "$(RTBZ)"
 
 dist-rtg: dist-release
 	@$(MAKE) dist-release-tag

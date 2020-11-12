@@ -4,7 +4,7 @@
 # and debug to form the necessary $PACKAGE_NAME<version>-<arch>-<variant>.config
 # files for building RHEL kernels, based on the contents of a control file
 
-PACKAGE_NAME="${1:-kernel}" # defines the package name used
+PACKAGE_NAME="${1:-kernel-rt}" # defines the package name used
 SUBARCH="${2:-}" # defines a specific arch
 SCRIPT=$(readlink -f "$0")
 OUTPUT_DIR="$PWD"

@@ -6,22 +6,23 @@
 
 SOURCES=$1
 SPECFILE=$2
-CHANGELOG=$3
-PKGRELEASE=$4
-KVERSION=$5
-KPATCHLEVEL=$6
-KSUBLEVEL=$7
-DISTRO_BUILD=$8
-RELEASED_KERNEL=$9
-SPECRELEASE=${10}
-ZSTREAM_FLAG=${11}
-BUILDOPTS=${12}
-MARKER=${13}
-LAST_MARKER=${14}
-SINGLE_TARBALL=${15}
-TARFILE_RELEASE=${16}
-SNAPSHOT=${17}
-BUILDID=${18}
+PACKAGE_NAME=$3
+CHANGELOG=$4
+PKGRELEASE=$5
+KVERSION=$6
+KPATCHLEVEL=$7
+KSUBLEVEL=$8
+DISTRO_BUILD=$9
+RELEASED_KERNEL=${10}
+SPECRELEASE=${11}
+ZSTREAM_FLAG=${12}
+BUILDOPTS=${13}
+MARKER=${14}
+LAST_MARKER=${15}
+SINGLE_TARBALL=${16}
+TARFILE_RELEASE=${17}
+SNAPSHOT=${18}
+BUILDID=${19}
 RPMVERSION=${KVERSION}.${KPATCHLEVEL}.${KSUBLEVEL}
 clogf="$SOURCES/changelog"
 # hide [redhat] entries from changelog
@@ -127,6 +128,7 @@ test -n "$SPECFILE" &&
         sed -i -e "
 	/%%CHANGELOG%%/r $CHANGELOG
 	/%%CHANGELOG%%/d
+	s/%%PACKAGE_NAME%%/$PACKAGE_NAME/
 	s/%%BUILDID%%/$BUILDID_DEFINE/
 	s/%%KVERSION%%/$KVERSION/
 	s/%%KPATCHLEVEL%%/$KPATCHLEVEL/
@@ -161,7 +163,7 @@ fi
 
 # generate Patchlist.changelog file that holds the shas and commits not
 # included upstream and git commit url.
-ARK_COMMIT_URL="https://gitlab.com/cki-project/kernel-ark/-/commit"
+# ARK_COMMIT_URL="https://gitlab.com/cki-project/kernel-ark/-/commit"
 
 # sed convert
 # <sha> <description>
@@ -171,9 +173,9 @@ ARK_COMMIT_URL="https://gitlab.com/cki-project/kernel-ark/-/commit"
 #
 # May need to preserve word splitting in EXCLUDE_FILES
 # shellcheck disable=SC2086
-git log --no-merges --pretty=oneline --no-decorate ${MASTER}.. $EXCLUDE_FILES | \
-	sed "s!^\([^ ]*\)!$ARK_COMMIT_URL/\1\n &!; s!\$!\n!" \
-	> "$SOURCES"/Patchlist.changelog
+# git log --no-merges --pretty=oneline --no-decorate ${MASTER}.. $EXCLUDE_FILES | \
+# 	sed "s!^\([^ ]*\)!$ARK_COMMIT_URL/\1\n &!; s!\$!\n!" \
+# 	> "$SOURCES"/Patchlist.changelog
 
 # We depend on work splitting of BUILDOPTS
 # shellcheck disable=SC2086
