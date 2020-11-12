@@ -7,6 +7,7 @@
 spec=$1;
 zstream_flag=$2;
 package_name=$3;
+rtbz=$4;
 tmp=$(mktemp);
 
 function die
@@ -47,7 +48,9 @@ else
 	}' "$tmp")
 fi
 
-echo "$bzs" |
+bzs="$rtbz $bzs"
+
+echo $bzs |
 	tr ' ' '\n' |
 	sort -u |
 	tr '\n' ',' |

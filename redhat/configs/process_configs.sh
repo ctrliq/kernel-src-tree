@@ -339,7 +339,7 @@ do
 	shift
 done
 
-PACKAGE_NAME="${1:-kernel}" # defines the package name used
+PACKAGE_NAME="${1:-kernel-rt}" # defines the package name used
 KVERREL="$(test -n "$2" && echo "-$2" || echo "")"
 SUBARCH="$(test -n "$3" && echo "-$3" || echo "")"
 FLAVOR="$(test -n "$4" && echo "-$4" || echo "-common")"

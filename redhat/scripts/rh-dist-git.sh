@@ -24,6 +24,7 @@ package_name=$9;
 rhel_major=${10};
 rhpkg_bin=${11};
 srpm_name=${12};
+rtbz=${13};
 
 redhat=$(dirname "$0")/..;
 topdir="$redhat"/..;
@@ -84,8 +85,8 @@ echo "Creating diff for review ($tmpdir/diff) and changelog"
 # differences were found
 diff -X "$redhat"/git/dontdiff -upr "$tmpdir/$package_name" "$redhat"/rpm/SOURCES/ > "$tmpdir"/diff;
 # creating the changelog file
-"$redhat"/scripts/create_distgit_changelog.sh "$redhat/rpm/SOURCES/$package_name".spec \
-	"$rhdistgit_zstream_flag" "$package_name" >"$tmpdir"/changelog
+"$redhat"/scripts/create_distgit_changelog.sh "$redhat"/rpm/SOURCES/kernel.spec \
+	"$rhdistgit_zstream_flag" "$package_name" "$rtbz" >"$tmpdir"/changelog
 
 # all done
 echo "$tmpdir"
