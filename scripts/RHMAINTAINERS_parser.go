@@ -83,7 +83,11 @@ func displayEntry(entry rh_entry, comments bool) {
 	}
 	if comments || entry.labels.readyForMergeDeps != "" {
 		fmt.Printf(
-"     readyForMergeDeps: %s\n", entry.labels.readyForMergeDeps)
+"     readyForMergeDeps:\n")
+		if entry.labels.readyForMergeDeps != "" {
+			fmt.Printf(
+"       - %s\n", entry.labels.readyForMergeDeps)
+		}
 	}
 	if comments {
 		fmt.Println(
@@ -261,6 +265,8 @@ func main() {
 				entry.paths.excludes = append(entry.paths.excludes, whiteSpace(s, "X:"))
 			} else if strings.HasPrefix(s, "SS_LABEL:") {
 				entry.labels.name = whiteSpace(s, "SS_LABEL:")
+			} else if strings.HasPrefix(s, "BLOCKER_LABEL:") {
+				entry.labels.readyForMergeDeps = whiteSpace(s, "BLOCKER_LABEL:")
 			} else {
 				entry.name = s
 			}
