@@ -18,10 +18,10 @@ x86 maintainers" will do, however, the maintainers may ask for a more detailed
 write-up.
 
 Changes are NOT accepted for the RHMAINTAINERS or CODEOWNERS files, and changes
-are only accepted for the owners.yaml file.  Merge requests must have changes
-have owners.yaml changes isolated in one commit, and new versions of
-RHMAINTAINERS & CODEOWNERS in a separate commit.  These secondary files can be
-generated using the commands (executed from the top level of documentation)
+are only accepted for the owners.yaml file.  Merge requests must have
+owners.yaml changes isolated in one commit, and new versions of RHMAINTAINERS &
+CODEOWNERS in a separate commit.  These secondary files can be generated using
+the commands (executed from the top level of documentation)
 
 ```
         cd scripts
