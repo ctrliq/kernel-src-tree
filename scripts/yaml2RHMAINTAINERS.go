@@ -18,7 +18,7 @@ type SubSystem struct {
 	Subsystem string `subsystem`
 	Labels struct {
 		Name string `name`
-		ReadyForMergeDeps string `readyForMergeDeps`
+		ReadyForMergeDeps []string `readyForMergeDeps`
 		NewLabels string `newLabels`
 		EmailLabel string `emailLabel`
 	}
