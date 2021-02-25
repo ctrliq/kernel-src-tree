@@ -1,18 +1,3 @@
-**Project Layout**
-
-The layout is
-
-- docs/ contains documentation links, etc.
-
-The current documentation is not in a format available for viewing in a
-terminal.
-
-See https://red.ht/kernel_workflow_doc for information on the Red Hat Kernel
-Workflow.
-
-- scripts/ contains scripts for generating documentation, RHMAINTAINERS, etc.
-- info/ contains the latest information (owners.yaml, etc.)
-
 **Background**
 
 The Red Hat kernel has long contained a RHMAINTAINERS file that is synonymous
@@ -28,7 +13,8 @@ All this data is now unified in a owners.yaml file that is in the info/
 directory.  It is now the canonical location for all information that must be
 mapped to kernel areas of repsonsiblity.  As the name of the file indicates,
 the file is in YAML format as many languages (python, go, etc.) include
-YAML parsers.
+YAML parsers.  The YAML file is parsed by scripts to create RHMAINTAINERS
+and CODEOWNERS files that are always synchronized with the owners.yaml file.
 
 **Making Changes**
 
@@ -53,3 +39,20 @@ generated using these commands executed from the top level of documentation:
 
 Users making changes must include a "Signed-off-by:" tag on all commits that
 acknowledges the DCO, https://developercertificate.org.
+
+**Project Layout**
+
+The layout is
+
+- docs/ contains documentation links, etc.
+
+The current documentation is not in a format available for viewing in a
+terminal.
+
+See https://red.ht/kernel_workflow_doc for information on the Red Hat Kernel
+Workflow.
+
+- scripts/ contains scripts for generating documentation, RHMAINTAINERS, etc.
+- info/ contains the latest information (owners.yaml, etc.)
+
+
