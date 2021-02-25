@@ -23,11 +23,11 @@ accompanied by a description of the modifications.  In most cases, a simple
 explanation will do (for example, "Update x86 maintainers"), however the
 maintainers may ask for a more detailed write-up.
 
-Changes are NOT accepted for the RHMAINTAINERS or CODEOWNERS files, and changes
-are only accepted for the owners.yaml file.  Merge requests must have
-owners.yaml changes isolated in a commit, and new versions of RHMAINTAINERS &
-CODEOWNERS or other changes in separate commits.  These secondary files can be
-generated using these commands executed from the top level of documentation:
+Standalone changes are NOT accepted for the RHMAINTAINERS or CODEOWNERS files,
+and changes are only accepted for the owners.yaml file.  Merge requests that
+modify owners.yaml changes must include associated changes to RHMAINTAINERS &
+CODEOWNERS.  These secondary files can be generated using these commands
+executed from the top level of documentation:
 
 ```
         cd scripts
