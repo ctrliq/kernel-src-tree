@@ -3,6 +3,7 @@ package main
 import (
 	"fmt"
 	"log"
+	"strings"
 
 	"gopkg.in/yaml.v2"
 	"os"
@@ -74,6 +75,7 @@ func main() {
 		for _, name := range entry.Maintainers {
 			maintainers += name.Email + " "
 		}
+		maintainers = strings.TrimSpace(maintainers)
 
 		// TODO No regex support (yet)
 
