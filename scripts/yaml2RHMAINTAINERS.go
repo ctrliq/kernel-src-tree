@@ -31,7 +31,7 @@ type SubSystem struct {
 		Excludes []string
 	}
 	Scm string `scm`
-	Mailisting string `mailisting`
+	MailingList string `mailingList`
 }
 
 type SubSystems struct {
@@ -134,8 +134,8 @@ func main() {
 		for _, name := range entry.Reviewers {
 			fmt.Printf("R:\t%s <%s>\n", name.Name, name.Email)
 		}
-		if entry.Mailisting != "" {
-			fmt.Printf("L:\t%s\n", entry.Mailisting)
+		if entry.MailingList != "" {
+			fmt.Printf("L:\t%s\n", entry.MailingList)
 		}
 		if entry.Status != "" {
 			fmt.Printf("S:\t%s\n", entry.Status)

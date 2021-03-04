@@ -205,14 +205,14 @@ func displayEntry(entry rh_entry, comments bool) {
 "   scm: %s\n", entry.tree)
 	}
 
-	// mailisting
+	// mailingList
 	if comments {
 		fmt.Println(
 "   # L:")
 	}
 	if comments || entry.mailist != "" {
 		fmt.Printf(
-"   mailisting: %s\n", entry.mailist)
+"   mailingList: %s\n", entry.mailist)
 	}
 }
 
