@@ -30,11 +30,7 @@ CODEOWNERS.  These secondary files can be generated using these commands
 executed from the top level of documentation:
 
 ```
-        cd scripts
-        make
-        cd ../info
-        ../scripts/yaml2CODEOWNERS owners.yaml > CODEOWNERS
-        ../scripts/yaml2RHMAINTAINERS owners.yaml > RHMAINTAINERS
+	make
 ```
 
 Users making changes must include a "Signed-off-by:" tag on all commits that
