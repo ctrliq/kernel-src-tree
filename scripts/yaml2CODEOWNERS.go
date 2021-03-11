@@ -32,7 +32,7 @@ type SubSystem struct {
 		Excludes []string
 	}
 	Scm string `scm`
-	Mailisting string `mailisting`
+	MailingList string `mailingList`
 }
 
 type SubSystems struct {
