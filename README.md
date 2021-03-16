@@ -1,3 +1,8 @@
+All changes to this file and directories included at this level must be made
+to the [Red Hat kernel documentation project](https://gitlab.com/redhat/rhel/src/kernel/documentation)
+Please see the 'Making Changes' section below for detailed information on
+providing changes for this project.
+
 **Background**
 
 The Red Hat kernel has long contained a RHMAINTAINERS file that is synonymous
