@@ -23,7 +23,7 @@ and CODEOWNERS files that are always synchronized with the owners.yaml file.
 
 **Making Changes**
 
-Changes must be made through a Merge Request to this project.  Changes must be
+Changes must be made through a Merge Request to the [Red Hat kernel documentation project](https://gitlab.com/redhat/rhel/src/kernel/documentation) project.  Changes must be
 accompanied by a description of the modifications.  In most cases, a simple
 explanation will do (for example, "Update x86 maintainers"), however the
 maintainers may ask for a more detailed write-up.
@@ -35,7 +35,7 @@ CODEOWNERS.  These secondary files can be generated using these commands
 executed from the top level of documentation:
 
 ```
-	make
+	make # requires minimum golang version 1.14
 ```
 
 Users making changes must include a "Signed-off-by:" tag on all commits that
