@@ -12,6 +12,7 @@ import (
 type NameAndEmail struct {
 	Name string
 	Email string
+	Restricted bool
 }
 
 type SubSystem struct {
