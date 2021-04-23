@@ -21,6 +21,15 @@ the file is in YAML format as many languages (python, go, etc.) include
 YAML parsers.  The YAML file is parsed by scripts to create RHMAINTAINERS
 and CODEOWNERS files that are always synchronized with the owners.yaml file.
 
+**Code Approvals, maintainers, and reviewers**
+
+Similar to the RHMAINTAINERS file, the owners.yaml file has two categories of
+code approvers: maintainers, and reviewers.  Maintainers are engineers whose
+approval are required, and reviewers are engineers that will be notified but
+whose code approval is not required. Currently the notification of review for
+both maintainers and reviewers occurs when the [kernel-webhooks](https://gitlab.com/cki-project/kernel-webhooks/) assign
+"Reviewers" to a Merge Request.
+
 **Making Changes**
 
 Changes must be made through a Merge Request to the [Red Hat kernel documentation project](https://gitlab.com/redhat/rhel/src/kernel/documentation) project.  Changes must be
