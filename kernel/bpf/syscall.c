@@ -59,9 +59,6 @@ static DEFINE_SPINLOCK(map_idr_lock);
 static DEFINE_IDR(link_idr);
 static DEFINE_SPINLOCK(link_idr_lock);
 
-/* RHEL-only: default to 1 */
-int sysctl_unprivileged_bpf_disabled __read_mostly = 1;
-
 static int __init unprivileged_bpf_setup(char *str)
 {
 	unsigned long disabled;
@@ -6054,6 +6051,11 @@ static int bpf_unpriv_handler(const struct ctl_table *table, int write,
 	if (write && !ret) {
 		if (locked_state && unpriv_enable != 1)
 			return -EPERM;
+		if (!unpriv_enable) {
+			pr_warn("Unprivileged BPF has been enabled, "
+				"tainting the kernel");
+			add_taint(TAINT_UNPRIVILEGED_BPF, LOCKDEP_STILL_OK);
+		}
 		*(int *)table->data = unpriv_enable;
 	}
 
