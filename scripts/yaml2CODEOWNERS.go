@@ -25,6 +25,7 @@ type SubSystem struct {
 		EmailLabel string `emailLabel`
 	}
 	Status string `status`
+	RequiredApproval bool `required-approval`
 	Maintainers []NameAndEmail `maintainers`
 	Reviewers []NameAndEmail `reviewers`
 	Paths struct {
@@ -67,7 +68,11 @@ func main() {
 		}
 
 		// Title
-		fmt.Printf("[%s]\n", entry.Subsystem)
+		if entry.RequiredApproval {
+			fmt.Printf("[%s]\n", entry.Subsystem)
+		} else {
+			fmt.Printf("^[%s]\n", entry.Subsystem)
+		}
 
 		// Get list of maintainers that will be output below with files
 		// 	Reviewers are NOT Code Maintainers
