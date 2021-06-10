@@ -7,7 +7,6 @@
 #include <linux/crash_core.h>
 #include <linux/utsname.h>
 #include <linux/vmalloc.h>
-#include <linux/sizes.h>
 
 #include <asm/page.h>
 #include <asm/sections.h>
@@ -42,15 +41,6 @@ static int __init parse_crashkernel_mem(char *cmdline,
 					unsigned long long *crash_base)
 {
 	char *cur = cmdline, *tmp;
-	unsigned long long total_mem = system_ram;
-
-	/*
-	 * Firmware sometimes reserves some memory regions for it's own use.
-	 * so we get less than actual system memory size.
-	 * Workaround this by round up the total size to 128M which is
-	 * enough for most test cases.
-	 */
-	total_mem = roundup(total_mem, SZ_128M);
 
 	/* for each entry of the comma-separated list */
 	do {
@@ -95,13 +85,13 @@ static int __init parse_crashkernel_mem(char *cmdline,
 			return -EINVAL;
 		}
 		cur = tmp;
-		if (size >= total_mem) {
+		if (size >= system_ram) {
 			pr_warn("crashkernel: invalid size\n");
 			return -EINVAL;
 		}
 
 		/* match ? */
-		if (total_mem >= start && total_mem < end) {
+		if (system_ram >= start && system_ram < end) {
 			*crash_size = size;
 			break;
 		}
