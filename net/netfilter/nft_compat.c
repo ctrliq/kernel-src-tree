@@ -5,6 +5,8 @@
  * This software has been sponsored by Sophos Astaro <http://www.sophos.com>
  */
 
+#define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
+
 #include <linux/kernel.h>
 #include <linux/init.h>
 #include <linux/module.h>
@@ -881,6 +883,8 @@ static struct nft_expr_type nft_target_type __read_mostly = {
 static int __init nft_compat_module_init(void)
 {
 	int ret;
+
+	mark_driver_deprecated("nft_compat");
 
 	ret = nft_register_expr(&nft_match_type);
 	if (ret < 0)
