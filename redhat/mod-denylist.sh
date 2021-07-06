@@ -10,28 +10,28 @@ Dir="$1/$2"
 List=$3
 Dest="$4"
 
-denylist()
+blacklist()
 {
-	cat > "$RpmDir/etc/modprobe.d/$1-denylist.conf" <<-__EOF__
+	cat > "$RpmDir/etc/modprobe.d/$1-blacklist.conf" <<-__EOF__
 	# This kernel module can be automatically loaded by non-root users. To
-	# enhance system security, the module is denylisted by default to ensure
+	# enhance system security, the module is blacklisted by default to ensure
 	# system administrators make the module available for use as needed.
 	# See https://access.redhat.com/articles/3760101 for more details.
 	#
-	# Remove the denylist by adding a comment # at the start of the line.
+	# Remove the blacklist by adding a comment # at the start of the line.
 	blacklist $1
 __EOF__
 }
 
-check_denylist()
+check_blacklist()
 {
 	mod=$(find "$RpmDir/$ModDir" -name "$1")
 	[ ! "$mod" ] && return 0
 	if modinfo "$mod" | grep -q '^alias:\s\+net-'; then
 		mod="${1##*/}"
 		mod="${mod%.ko*}"
-		echo "Blocking $mod from auto-loading."
-		denylist "$mod"
+		echo "$mod has an alias that allows auto-loading. Blacklisting."
+		blacklist "$mod"
 	fi
 }
 
@@ -142,7 +142,7 @@ if [ -z "$Dest" ]; then
 	sed -e "s|^.|${ModDir}|g" "$Dir"/dep2.list > "$RpmDir/$ListName"
 	echo "./$RpmDir/$ListName created."
 	[ -d "$RpmDir/etc/modprobe.d/" ] || mkdir -p "$RpmDir/etc/modprobe.d/"
-	foreachp check_denylist < "$List"
+	foreachp check_blacklist < "$List"
 fi
 
 # Many BIOS-es export a PNP-id which causes the floppy driver to autoload
@@ -152,7 +152,7 @@ fi
 
 floppylist=("$RpmDir"/"$ModDir"/kernel/drivers/block/floppy.ko*)
 if [[ -n ${floppylist[0]} && -f ${floppylist[0]} ]]; then
-     denylist "floppy"
+     blacklist "floppy"
 fi
 
 # avoid an empty kernel-extra package
