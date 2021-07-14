@@ -63,8 +63,8 @@ func main() {
 	CODEOWNERS_header()
 
 	for count, entry := range subSystems.SubSys {
-		// Do not write Disabled entries into CODEOWNERS
-		if entry.Status == "Disabled" {
+		// Do not write Disabled or unassigned entries into CODEOWNERS
+		if entry.Status == "Disabled" || entry.Status == "Unassigned" {
 			continue
 		}
 
