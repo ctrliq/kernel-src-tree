@@ -119,9 +119,15 @@ func main() {
 	RHMAINTAINERS_header()
 
 	for count, entry := range subSystems.SubSys {
+		// Do not write disabled entries into RHMAINTAINERS
+		if entry.Status == "Disabled" {
+			continue
+		}
+
 		if (count != 0) {
 			fmt.Println("")
 		}
+
 		fmt.Println(entry.Subsystem)
 		for _, name := range entry.Maintainers {
 			fmt.Printf("M:\t%s <%s>\n", name.Name, name.Email)
