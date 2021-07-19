@@ -54,10 +54,7 @@ acknowledges the DCO, https://developercertificate.org.
 
 The layout is
 
-- docs/ contains documentation links, etc.
-
-The current documentation is not in a format available for viewing in a
-terminal.
+- docs/ contains the general kernel workflow documentation, links, etc.
 
 See https://red.ht/kernel_workflow_doc for information on the Red Hat Kernel
 Workflow.
