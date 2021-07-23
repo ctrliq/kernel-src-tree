@@ -119,8 +119,8 @@ func main() {
 	RHMAINTAINERS_header()
 
 	for count, entry := range subSystems.SubSys {
-		// Do not write disabled entries into RHMAINTAINERS
-		if entry.Status == "Disabled" {
+		// Do not write disabled or unassigned entries into RHMAINTAINERS
+		if entry.Status == "Disabled" || entry.Status == "Unassigned" {
 			continue
 		}
 
