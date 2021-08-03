@@ -7,16 +7,16 @@ providing changes for this project.
 
 The Red Hat kernel has long contained a RHMAINTAINERS file that is synonymous
 with the upstream kernel's MAINTAINERS file.  The RHMAINTAINERS file contains
-entries listing areas of responsiblity and the maintainers for each area, as
+entries listing areas of responsibility and the maintainers for each area, as
 well as some additional data.
 
 GitLab offers a similar file, called CODEOWNERS, that also provides the same
 data.  In addition to that, some of the kernel webhooks also require data that
-is mapped to areas of responsiblity in the kernel.
+is mapped to areas of responsibility in the kernel.
 
 All this data is now unified in a owners.yaml file that is in the info/
 directory.  It is now the canonical location for all information that must be
-mapped to kernel areas of repsonsiblity.  As the name of the file indicates,
+mapped to kernel areas of responsibility.  As the name of the file indicates,
 the file is in YAML format as many languages (python, go, etc.) include
 YAML parsers.  The YAML file is parsed by scripts to create RHMAINTAINERS
 and CODEOWNERS files that are always synchronized with the owners.yaml file.
