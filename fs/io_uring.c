@@ -671,7 +671,6 @@ struct io_unlink {
 
 struct io_completion {
 	struct file			*file;
-	struct list_head		list;
 	u32				cflags;
 };
 
@@ -1703,7 +1702,7 @@ static void io_req_complete_post(struct io_kiocb *req, long res,
 		}
 		io_dismantle_req(req);
 		io_put_task(req->task, 1);
-		list_add(&req->compl.list, &ctx->locked_free_list);
+		list_add(&req->inflight_entry, &ctx->locked_free_list);
 		ctx->locked_free_nr++;
 	} else {
 		if (!percpu_ref_tryget(&ctx->refs))
@@ -1794,9 +1793,9 @@ static bool io_flush_cached_reqs(struct io_ring_ctx *ctx)
 	nr = state->free_reqs;
 	while (!list_empty(&cs->free_list)) {
 		struct io_kiocb *req = list_first_entry(&cs->free_list,
-						struct io_kiocb, compl.list);
+					struct io_kiocb, inflight_entry);
 
-		list_del(&req->compl.list);
+		list_del(&req->inflight_entry);
 		state->reqs[nr++] = req;
 		if (nr == ARRAY_SIZE(state->reqs))
 			break;
@@ -1870,7 +1869,7 @@ static void __io_free_req(struct io_kiocb *req)
 	io_put_task(req->task, 1);
 
 	spin_lock_irqsave(&ctx->completion_lock, flags);
-	list_add(&req->compl.list, &ctx->locked_free_list);
+	list_add(&req->inflight_entry, &ctx->locked_free_list);
 	ctx->locked_free_nr++;
 	spin_unlock_irqrestore(&ctx->completion_lock, flags);
 
@@ -2177,7 +2176,7 @@ static void io_req_free_batch(struct req_batch *rb, struct io_kiocb *req,
 	if (state->free_reqs != ARRAY_SIZE(state->reqs))
 		state->reqs[state->free_reqs++] = req;
 	else
-		list_add(&req->compl.list, &state->comp.free_list);
+		list_add(&req->inflight_entry, &state->comp.free_list);
 }
 
 static void io_submit_flush_completions(struct io_ring_ctx *ctx)
@@ -8663,8 +8662,8 @@ static void io_req_cache_free(struct list_head *list)
 {
 	struct io_kiocb *req, *nxt;
 
-	list_for_each_entry_safe(req, nxt, list, compl.list) {
-		list_del(&req->compl.list);
+	list_for_each_entry_safe(req, nxt, list, inflight_entry) {
+		list_del(&req->inflight_entry);
 		kmem_cache_free(req_cachep, req);
 	}
 }
