@@ -53,6 +53,7 @@
 #include <linux/completion.h>
 #include <linux/uuid.h>
 #include <linux/uaccess.h>
+#include <linux/rcupdate.h>
 #include <crypto/chacha.h>
 #include <crypto/blake2s.h>
 #include <asm/processor.h>
@@ -358,6 +359,11 @@ static bool crng_has_old_seed(void)
 	}
 	return time_after(jiffies, READ_ONCE(base_crng.birth) + interval);
 }
+
+/*
+ * Hook for external RNG.
+ */
+static const struct random_extrng __rcu *extrng;
 
 /*
  * This function returns a ChaCha state that you may use for generating
@@ -748,6 +754,9 @@ size_t __must_check get_random_bytes_arch(void *buf, size_t nbytes)
 }
 EXPORT_SYMBOL(get_random_bytes_arch);
 
+
+static const struct file_operations extrng_random_fops;
+static const struct file_operations extrng_urandom_fops;
 
 /**********************************************************************
  *
@@ -1177,6 +1186,19 @@ void add_bootloader_randomness(const void *buf, size_t size)
 }
 EXPORT_SYMBOL_GPL(add_bootloader_randomness);
 
+void random_register_extrng(const struct random_extrng *rng)
+{
+	rcu_assign_pointer(extrng, rng);
+}
+EXPORT_SYMBOL_GPL(random_register_extrng);
+
+void random_unregister_extrng(void)
+{
+	RCU_INIT_POINTER(extrng, NULL);
+	synchronize_rcu();
+}
+EXPORT_SYMBOL_GPL(random_unregister_extrng);
+
 #if IS_ENABLED(CONFIG_VMGENID)
 static BLOCKING_NOTIFIER_HEAD(vmfork_chain);
 
@@ -1459,6 +1481,8 @@ static void try_to_generate_entropy(void)
 SYSCALL_DEFINE3(getrandom, char __user *, buf, size_t, count, unsigned int,
 		flags)
 {
+	const struct random_extrng *rng;
+
 	if (flags & ~(GRND_NONBLOCK | GRND_RANDOM | GRND_INSECURE))
 		return -EINVAL;
 
@@ -1471,6 +1495,19 @@ SYSCALL_DEFINE3(getrandom, char __user *, buf, size_t, count, unsigned int,
 
 	if (count > INT_MAX)
 		count = INT_MAX;
+
+	rcu_read_lock();
+	rng = rcu_dereference(extrng);
+	if (rng && !try_module_get(rng->owner))
+		rng = NULL;
+	rcu_read_unlock();
+
+	if (rng) {
+		int ret;
+		ret = rng->extrng_read(buf, count);
+		module_put(rng->owner);
+		return ret;
+	}
 
 	if (!(flags & GRND_INSECURE) && !crng_ready()) {
 		int ret;
@@ -1496,6 +1533,13 @@ static __poll_t random_poll(struct file *file, poll_table *wait)
 	if (input_pool.entropy_count < POOL_MIN_BITS)
 		mask |= EPOLLOUT | EPOLLWRNORM;
 	return mask;
+}
+
+static __poll_t
+extrng_poll(struct file *file, poll_table * wait)
+{
+	/* extrng pool is always full, always read, no writes */
+	return EPOLLIN | EPOLLRDNORM;
 }
 
 static int write_pool(const char __user *ubuf, size_t count)
@@ -1631,7 +1675,58 @@ static int random_fasync(int fd, struct file *filp, int on)
 	return fasync_helper(fd, filp, on, &fasync);
 }
 
+static int random_open(struct inode *inode, struct file *filp)
+{
+	const struct random_extrng *rng;
+
+	rcu_read_lock();
+	rng = rcu_dereference(extrng);
+	if (rng && !try_module_get(rng->owner))
+		rng = NULL;
+	rcu_read_unlock();
+
+	if (!rng)
+		return 0;
+
+	filp->f_op = &extrng_random_fops;
+	filp->private_data = rng->owner;
+
+	return 0;
+}
+
+static int urandom_open(struct inode *inode, struct file *filp)
+{
+	const struct random_extrng *rng;
+
+	rcu_read_lock();
+	rng = rcu_dereference(extrng);
+	if (rng && !try_module_get(rng->owner))
+		rng = NULL;
+	rcu_read_unlock();
+
+	if (!rng)
+		return 0;
+
+	filp->f_op = &extrng_urandom_fops;
+	filp->private_data = rng->owner;
+
+	return 0;
+}
+
+static int extrng_release(struct inode *inode, struct file *filp)
+{
+	module_put(filp->private_data);
+	return 0;
+}
+
+static ssize_t
+extrng_read(struct file *file, char __user *buf, size_t nbytes, loff_t *ppos)
+{
+	return rcu_dereference_raw(extrng)->extrng_read(buf, nbytes);
+}
+
 const struct file_operations random_fops = {
+	.open  = random_open,
 	.read = random_read,
 	.write = random_write,
 	.poll = random_poll,
@@ -1642,6 +1737,7 @@ const struct file_operations random_fops = {
 };
 
 const struct file_operations urandom_fops = {
+	.open  = urandom_open,
 	.read = urandom_read,
 	.write = random_write,
 	.unlocked_ioctl = random_ioctl,
@@ -1650,6 +1746,26 @@ const struct file_operations urandom_fops = {
 	.llseek = noop_llseek,
 };
 
+static const struct file_operations extrng_random_fops = {
+	.open  = random_open,
+	.read  = extrng_read,
+	.write = random_write,
+	.poll  = extrng_poll,
+	.unlocked_ioctl = random_ioctl,
+	.fasync = random_fasync,
+	.llseek = noop_llseek,
+	.release = extrng_release,
+};
+
+static const struct file_operations extrng_urandom_fops = {
+	.open  = urandom_open,
+	.read  = extrng_read,
+	.write = random_write,
+	.unlocked_ioctl = random_ioctl,
+	.fasync = random_fasync,
+	.llseek = noop_llseek,
+	.release = extrng_release,
+};
 
 /********************************************************************
  *

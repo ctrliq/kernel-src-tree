@@ -14,6 +14,11 @@
 
 #include <uapi/linux/random.h>
 
+struct random_extrng {
+	ssize_t (*extrng_read)(void __user *buf, size_t buflen);
+	struct module *owner;
+};
+
 struct notifier_block;
 
 extern void add_device_randomness(const void *, size_t);
@@ -48,6 +53,8 @@ extern bool rng_is_initialized(void);
 extern int register_random_ready_notifier(struct notifier_block *nb);
 extern int unregister_random_ready_notifier(struct notifier_block *nb);
 extern size_t __must_check get_random_bytes_arch(void *buf, size_t nbytes);
+void random_register_extrng(const struct random_extrng *rng);
+void random_unregister_extrng(void);
 
 #ifndef MODULE
 extern const struct file_operations random_fops, urandom_fops;
