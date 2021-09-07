@@ -2562,7 +2562,7 @@ static int path_parentat(struct nameidata *nd, unsigned flags,
 }
 
 /* Note: this does not consume "name" */
-static int __filename_parentat(int dfd, struct filename *name,
+static int filename_parentat(int dfd, struct filename *name,
 			     unsigned int flags, struct path *parent,
 			     struct qstr *last, int *type)
 {
@@ -2593,7 +2593,7 @@ static struct dentry *__kern_path_locked(struct filename *name, struct path *pat
 	struct qstr last;
 	int type, error;
 
-	error = __filename_parentat(AT_FDCWD, name, 0, path, &last, &type);
+	error = filename_parentat(AT_FDCWD, name, 0, path, &last, &type);
 	if (error)
 		return ERR_PTR(error);
 	if (unlikely(type != LAST_NORM)) {
@@ -3803,7 +3803,7 @@ static struct dentry *__filename_create(int dfd, struct filename *name,
 	 */
 	lookup_flags &= LOOKUP_REVAL;
 
-	error = __filename_parentat(dfd, name, lookup_flags, path, &last, &type);
+	error = filename_parentat(dfd, name, lookup_flags, path, &last, &type);
 	if (error)
 		return ERR_PTR(error);
 
@@ -4162,7 +4162,7 @@ int do_rmdir(int dfd, struct filename *name)
 	int type;
 	unsigned int lookup_flags = 0;
 retry:
-	error = __filename_parentat(dfd, name, lookup_flags, &path, &last, &type);
+	error = filename_parentat(dfd, name, lookup_flags, &path, &last, &type);
 	if (error)
 		goto exit1;
 
@@ -4303,7 +4303,7 @@ int do_unlinkat(int dfd, struct filename *name)
 	struct inode *delegated_inode = NULL;
 	unsigned int lookup_flags = 0;
 retry:
-	error = __filename_parentat(dfd, name, lookup_flags, &path, &last, &type);
+	error = filename_parentat(dfd, name, lookup_flags, &path, &last, &type);
 	if (error)
 		goto exit1;
 
@@ -4850,13 +4850,13 @@ int do_renameat2(int olddfd, struct filename *from, int newdfd,
 		target_flags = 0;
 
 retry:
-	error = __filename_parentat(olddfd, from, lookup_flags, &old_path,
-					&old_last, &old_type);
+	error = filename_parentat(olddfd, from, lookup_flags, &old_path,
+				  &old_last, &old_type);
 	if (error)
 		goto put_names;
 
-	error = __filename_parentat(newdfd, to, lookup_flags, &new_path, &new_last,
-				&new_type);
+	error = filename_parentat(newdfd, to, lookup_flags, &new_path, &new_last,
+				  &new_type);
 	if (error)
 		goto exit1;
 
