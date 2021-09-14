@@ -322,9 +322,6 @@ static int __init mount_nodev_root(char *root_device_name)
 				    root_mount_data);
 		if (!err)
 			break;
-		if (err != -EACCES && err != -EINVAL)
-			panic("VFS: Unable to mount root \"%s\" (%s), err=%d\n",
-			      root_device_name, fstype, err);
 	}
 
 	free_page((unsigned long)fs_names);
