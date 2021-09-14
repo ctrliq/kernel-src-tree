@@ -8,10 +8,19 @@ RHPATH="$1";
 YSTREAM_FLAG="$2";
 ZSTREAM_FLAG="$3";
 BUMP_RELEASE="$4";
+RTBUILD="$5";
 
 if [ -s "$RHPATH/linux-kernel-test.patch" ]; then
 	echo "linux-kernel-test.patch is not empty, aborting" >&2;
 	exit 1;
+fi
+
+if [ "${RTBUILD}" != "" ]; then
+    RTBUILD=$(sed -n -e 's/^RTBUILD:=\.\(.*\)/\1/p' $RHPATH/../Makefile.rhelver);
+    NEW_RELEASE="$[RTBUILD + 1]";
+    sed -i -e "s/^RTBUILD:=.*$/RTBUILD:=.$NEW_RELEASE/" $RHPATH/../Makefile.rhelver;
+    echo "RTBUILD set to ${RTBUILD}"
+    exit 0;
 fi
 
 RELEASE=$(sed -n -e 's/^RHEL_RELEASE\ =\ \(.*\)/\1/p' "$RHPATH"/../Makefile.rhelver)
