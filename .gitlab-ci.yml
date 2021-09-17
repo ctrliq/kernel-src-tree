@@ -14,50 +14,7 @@ stages:
   - build
   - deploy
 
-workflow:
-  rules:
-    - if: '$CI_PIPELINE_SOURCE == "schedule"'   # ARK release pipelines
-    - if: '$CI_MERGE_REQUEST_PROJECT_PATH =~ /^cki-project.kernel-ark/'   # ARK MR CI
-      variables:
-        REQUESTED_PIPELINE_TYPE: 'ark-ci'
-    # We cannot merge rules through !reference and have to copy them over from the
-    # CKI pipeline: https://gitlab.com/gitlab-org/gitlab/-/issues/322992
-    - if: '$CI_MERGE_REQUEST_PROJECT_PATH =~ /^redhat.rhel/ || $CI_PROJECT_PATH =~ /^redhat.rhel/'
-      variables:
-        REQUESTED_PIPELINE_TYPE: 'internal'
-    - if: '$CI_MERGE_REQUEST_PROJECT_PATH =~ /^redhat.centos-stream/ || $CI_PROJECT_PATH =~ /^redhat.centos-stream/'
-      variables:
-        REQUESTED_PIPELINE_TYPE: '/^(trusted|centos-rhel)$/'
-    - if: '$CI_MERGE_REQUEST_PROJECT_PATH =~ /^redhat.prdsc/ || $CI_PROJECT_PATH =~ /^redhat.prdsc/'
-      variables:
-        REQUESTED_PIPELINE_TYPE: 'scratch'
-
-# We need to differentiate between the pipeline types that are triggered from this
-# single file. Once the mirroring to c9s stops this anchor can be dropped and the
-# regular ".trusted" anchor and "trusted" type can be used. The template is added
-# here instead of into CKI to avoid having to clear up two places after mirror drop.
-.trusted-ark:
-  trigger:
-    project: redhat/red-hat-ci-tools/kernel/cki-internal-pipelines/cki-trusted-contributors
-    strategy: depend
-  variables:
-    PIPELINE_TYPE: 'ark-ci'
-    kernel_type: 'upstream'
-
-.trigger_ark_pipeline:
-  stage: test
-  trigger:
-    branch: kernel-ark
-  variables:
-    name: kernel-ark
-    builder_image: registry.gitlab.com/cki-project/containers/builder-rawhide
-    builder_image_tag: latest
-    srpm_make_target: dist-srpm
-    # We only need srpm so skip the rest of the stages
-    skip_build: 'true'
-    skip_publish: 'true'
-    skip_test: 'true'
-    skip_results: 'true'
+workflow: !reference [.workflow]
 
 .9-common:
   variables:
@@ -101,7 +58,7 @@ workflow:
 .trigger_rhel9_build:
   extends: .trigger_rhel9_pipeline
   variables:
-    skip_test: 'true'
+    skip_only_test: 'true'
     skip_results: 'true'
 
 .realtime_full_c9s:
@@ -115,10 +72,6 @@ workflow:
     name: kernel-rt-rhel9
     kpet_tree_family: rhel9-rt
     RUN_ONLY_FOR_RT: 'true'
-
-# ARK CI
-ark_merge_request:
-  extends: [.trusted-ark, .merge_request, .trigger_ark_pipeline]
 
 # c9s CI
 c9s_merge_request:
@@ -136,11 +89,11 @@ c9s_baseline:
             .9-common, .trigger_c9s_pipeline]
 
 c9s_rhel9_compat_merge_request:
-  extends: [.centos_stream_rhel_internal, .merge_request, .rhel_common,
+  extends: [.centos_stream_rhel_internal, .merge_request, .rhel_common, .with_notifications,
             .9-common, .trigger_rhel9_build]
 
 c9s_rhel9_compat_baseline:
-  extends: [.centos_stream_rhel_internal, .baseline, .rhel_common,
+  extends: [.centos_stream_rhel_internal, .baseline, .rhel_common, .with_notifications,
             .9-common, .trigger_rhel9_build]
 
 # c9s realtime branch CI
@@ -158,7 +111,7 @@ c9s_realtime_baseline:
 
 # RHEL9 CI
 rhel9_merge_request:
-  extends: [.internal, .merge_request, .rhel_common,
+  extends: [.internal, .merge_request, .rhel_common, .with_notifications,
             .9-common, .trigger_rhel9_pipeline]
 
 rhel9_realtime_check_merge_request:
@@ -168,20 +121,8 @@ rhel9_realtime_check_merge_request:
             .trigger_rhel9_pipeline, .realtime_check_rhel9]
 
 rhel9_baseline:
-  extends: [.internal, .baseline, .rhel_common,
+  extends: [.internal, .baseline, .rhel_common, .with_notifications,
             .9-common, .trigger_rhel9_pipeline]
-
-# RHEL9 private CI
-
-rhel9_private_merge_request:
-  extends: [.scratch, .merge_request, .rhel_common,
-            .9-common, .trigger_rhel9_pipeline]
-
-rhel9_private_realtime_check_merge_request:
-  extends: [.scratch, .merge_request,
-            .9-common,
-            .realtime_check_common,
-            .trigger_rhel9_pipeline, .realtime_check_rhel9]
 
 # RHEL9 realtime branch CI
 rhel9_realtime_merge_request:
@@ -196,104 +137,19 @@ rhel9_realtime_baseline:
             .realtime_pipeline_common,
             .trigger_rhel9_pipeline, .realtime_full_rhel9]
 
-# scheduled job
-.scheduled_setup:
-  image: registry.gitlab.com/cki-project/containers/builder-fedora
-  variables:
-    GIT_DEPTH: "0"
-    GIT_CLONE_PATH: $CI_BUILDS_DIR/$CI_CONCURRENT_ID/kernel-ark
-  before_script:
-    - echo "fastestmirror=true" >> /etc/dnf/dnf.conf
-    - dnf -y install python3-gitlab git openssh-clients dnf-utils gnupg2
-    - git config user.name "Fedora Kernel Team"
-    - git config user.email "kernel-team@fedoraproject.org"
-    - echo "$PYTHON_GITLAB_CONFIG" >> ~/.python-gitlab.cfg
-    # Need SSH since the clone is set up without write access.
-    - eval $(ssh-agent -s)
-    - echo "$PRIVATE_KEY" | tr -d '\r' | ssh-add - > /dev/null
-    - mkdir -p ~/.ssh
-    - chmod 700 ~/.ssh
-    - echo "$GITLAB_KNOWN_HOSTS" >> ~/.ssh/known_hosts
-    - chmod 644 ~/.ssh/known_hosts
-    - git remote add gitlab git@gitlab.com:cki-project/kernel-ark.git
-    - gpg2 --import "$TORVALDS_GPG_KEY"
-    - git checkout --track origin/master && git describe
-    - export PROJECT_ID="$CI_PROJECT_ID"
+# RHEL9 private CI (including RT branches)
+rhel9_private_merge_request:
+  extends: [.scratch, .merge_request, .rhel_common,
+            .9-common, .trigger_rhel9_pipeline]
 
-merge_upstream:
-  extends: .scheduled_setup
-  script:
-    - git checkout --track origin/os-build && git describe
-    - make dist-merge-upstream-push || exit 1
-  retry: 2
-  rules:
-    - if: '$CI_PIPELINE_SOURCE == "schedule" && $RAWHIDE_RELEASE == "false"'
+rhel9_private_realtime_check_merge_request:
+  extends: [.scratch, .merge_request,
+            .9-common,
+            .realtime_check_common,
+            .trigger_rhel9_pipeline, .realtime_check_rhel9]
 
-# scheduled job
-rawhide_release:
-  extends: .scheduled_setup
-  script:
-    - git checkout --track origin/ark-latest && git describe
-    - git checkout --track origin/ark-infra && git describe
-    - git checkout --track origin/os-build && git describe
-    - redhat/scripts/ci/ark-create-release.sh "master" "$CI_PROJECT_ID" || exit_code=$?
-    - if [ $exit_code -eq 3 ]; then echo "Tag exists, halting" && exit 0; fi;
-    - if [ $exit_code -ne 0 ]; then echo "Unable to create release tag" && exit 1; fi;
-    - git push gitlab os-build
-    # ark-create-release.sh creates a tag for ark-latest to be pushed.
-    # Make sure the ark-latest branch is checked out.
-    - git checkout ark-latest
-    - git push gitlab "$(git describe)"
-    - git push gitlab ark/*
-    - git push -f gitlab ark-latest
-    - git push -f gitlab ark-infra
-  retry: 2
-  rules:
-    - if: '$CI_PIPELINE_SOURCE == "schedule" && $RAWHIDE_RELEASE == "true"'
-
-test_docs:
-  stage: test
-  image: registry.gitlab.com/cki-project/containers/python
-  before_script:
-    - python3 -m venv ~/docs-venv
-    - source ~/docs-venv/bin/activate
-    - pip install sphinx
-    - cd redhat/docs/
-  script: make SPHINXOPTS="-W" html
-  rules:
-    - if: '$CI_MERGE_REQUEST_TARGET_BRANCH_NAME == "os-build"'
-      changes:
-        - redhat/docs/**/*
-
-
-docs:
-  stage: build
-  image: registry.gitlab.com/cki-project/containers/python
-  before_script:
-    - python3 -m venv ~/docs-venv
-    - source ~/docs-venv/bin/activate
-    - pip install sphinx
-    - cd redhat/docs/
-  script: make SPHINXOPTS="-W" html
-  artifacts:
-    paths:
-      - redhat/docs/_build/html/
-  rules:
-    - if: '$CI_COMMIT_BRANCH == "os-build"'
-      changes:
-        - redhat/docs/**/*
-
-pages:
-  stage: deploy
-  image: registry.gitlab.com/cki-project/containers/python
-  dependencies:
-    - docs
-  script:
-    - mv redhat/docs/_build/html/ public/
-  artifacts:
-    paths:
-      - public
-  rules:
-    - if: '$CI_COMMIT_BRANCH == "os-build"'
-      changes:
-        - redhat/docs/**/*
+rhel9_private_realtime_merge_request:
+  extends: [.scratch, .merge_request,
+            .9-common,
+            .realtime_pipeline_common,
+            .trigger_rhel9_pipeline, .realtime_full_rhel9]
