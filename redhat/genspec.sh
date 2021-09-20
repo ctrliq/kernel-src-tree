@@ -38,7 +38,7 @@ RPM_VERSION="$RPMVERSION-$PKGRELEASE";
 
 echo > "$clogf"
 
-lasttag=$(git rev-list --first-parent --grep="^\[redhat\] kernel-${RPMVERSION}" --max-count=1 HEAD)
+lasttag=$(git rev-list --first-parent --grep="^\[redhat\] ${PACKAGE_NAME}-${RPMVERSION}" --max-count=1 HEAD)
 # if we didn't find the proper tag, assume this is the first release
 if [[ -z $lasttag ]]; then
     if [[ -z ${MARKER//[0-9a-f]/} ]]; then
