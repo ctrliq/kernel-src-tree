@@ -104,7 +104,7 @@ Maintainer Guide
 .. _personal GitLab projects: https://gitlab.com/?name=kernel-ark&personal=true
 .. _Fork the repository: https://gitlab.com/cki-project/kernel-ark/-/forks/new
 .. _register your SSH key: https://gitlab.com/-/profile/keys
-.. _Koji: https://fedoraproject.org/wiki/Using_the_Koji_build_system#Koji_Setup
+.. _Koji: https://docs.fedoraproject.org/en-US/package-maintainers/Using_the_Koji_Build_System/
 .. _Mock: https://fedoraproject.org/wiki/Using_Mock_to_test_package_builds#How_do_I_set_up_Mock.3F
 
 
