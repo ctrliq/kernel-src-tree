@@ -396,7 +396,6 @@ struct io_ring_ctx {
 		unsigned		cached_cq_tail;
 		unsigned		cq_entries;
 		struct eventfd_ctx	*cq_ev_fd;
-		struct wait_queue_head	poll_wait;
 		struct wait_queue_head	cq_wait;
 		unsigned		cq_extra;
 		atomic_t		cq_timeouts;
@@ -1336,7 +1335,6 @@ static struct io_ring_ctx *io_ring_ctx_alloc(struct io_uring_params *p)
 	ctx->flags = p->flags;
 	init_waitqueue_head(&ctx->sqo_sq_wait);
 	INIT_LIST_HEAD(&ctx->sqd_list);
-	init_waitqueue_head(&ctx->poll_wait);
 	INIT_LIST_HEAD(&ctx->cq_overflow_list);
 	init_completion(&ctx->ref_comp);
 	xa_init_flags(&ctx->io_buffers, XA_FLAGS_ALLOC1);
@@ -1652,8 +1650,6 @@ static void io_cqring_ev_posted(struct io_ring_ctx *ctx)
 		wake_up_all(&ctx->cq_wait);
 	if (io_should_trigger_evfd(ctx))
 		eventfd_signal(ctx->cq_ev_fd, 1);
-	if (waitqueue_active(&ctx->poll_wait))
-		wake_up_interruptible(&ctx->poll_wait);
 }
 
 static void io_cqring_ev_posted_iopoll(struct io_ring_ctx *ctx)
@@ -1667,8 +1663,6 @@ static void io_cqring_ev_posted_iopoll(struct io_ring_ctx *ctx)
 	}
 	if (io_should_trigger_evfd(ctx))
 		eventfd_signal(ctx->cq_ev_fd, 1);
-	if (waitqueue_active(&ctx->poll_wait))
-		wake_up_interruptible(&ctx->poll_wait);
 }
 
 /* Returns true if there are no backlogged entries after the flush */
@@ -9304,7 +9298,7 @@ static __poll_t io_uring_poll(struct file *file, poll_table *wait)
 	struct io_ring_ctx *ctx = file->private_data;
 	__poll_t mask = 0;
 
-	poll_wait(file, &ctx->poll_wait, wait);
+	poll_wait(file, &ctx->cq_wait, wait);
 	/*
 	 * synchronizes with barrier from wq_has_sleeper call in
 	 * io_commit_cqring
