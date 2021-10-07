@@ -1259,8 +1259,8 @@ retry:
  * only affect leaf SPTEs down to min_level.
  * Returns true if an SPTE has been changed and the TLBs need to be flushed.
  */
-bool kvm_tdp_mmu_wrprot_slot(struct kvm *kvm, struct kvm_memory_slot *slot,
-			     int min_level)
+bool kvm_tdp_mmu_wrprot_slot(struct kvm *kvm,
+			     const struct kvm_memory_slot *slot, int min_level)
 {
 	struct kvm_mmu_page *root;
 	bool spte_set = false;
@@ -1330,7 +1330,8 @@ retry:
  * each SPTE. Returns true if an SPTE has been changed and the TLBs need to
  * be flushed.
  */
-bool kvm_tdp_mmu_clear_dirty_slot(struct kvm *kvm, struct kvm_memory_slot *slot)
+bool kvm_tdp_mmu_clear_dirty_slot(struct kvm *kvm,
+				  const struct kvm_memory_slot *slot)
 {
 	struct kvm_mmu_page *root;
 	bool spte_set = false;
