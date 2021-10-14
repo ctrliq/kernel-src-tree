@@ -698,11 +698,15 @@ struct io_async_msghdr {
 	struct sockaddr_storage		addr;
 };
 
-struct io_async_rw {
+struct io_rw_state {
 	struct iovec			fast_iov[UIO_FASTIOV];
-	const struct iovec		*free_iovec;
 	struct iov_iter			iter;
 	struct iov_iter_state		iter_state;
+};
+
+struct io_async_rw {
+	struct io_rw_state		s;
+	const struct iovec		*free_iovec;
 	size_t				bytes_done;
 	struct wait_page_queue		wpq;
 };
@@ -2629,7 +2633,7 @@ static bool io_resubmit_prep(struct io_kiocb *req)
 
 	if (!req_has_async_data(req))
 		return !io_req_prep_async(req);
-	iov_iter_restore(&rw->iter, &rw->iter_state);
+	iov_iter_restore(&rw->s.iter, &rw->s.iter_state);
 	return true;
 }
 
@@ -3291,7 +3295,7 @@ static void io_req_map_rw(struct io_kiocb *req, const struct iovec *iovec,
 {
 	struct io_async_rw *rw = req->async_data;
 
-	memcpy(&rw->iter, iter, sizeof(*iter));
+	memcpy(&rw->s.iter, iter, sizeof(*iter));
 	rw->free_iovec = iovec;
 	rw->bytes_done = 0;
 	/* can only be fixed buffers, no need to do anything */
@@ -3300,13 +3304,13 @@ static void io_req_map_rw(struct io_kiocb *req, const struct iovec *iovec,
 	if (!iovec) {
 		unsigned iov_off = 0;
 
-		rw->iter.iov = rw->fast_iov;
+		rw->s.iter.iov = rw->s.fast_iov;
 		if (iter->iov != fast_iov) {
 			iov_off = iter->iov - fast_iov;
-			rw->iter.iov += iov_off;
+			rw->s.iter.iov += iov_off;
 		}
-		if (rw->fast_iov != fast_iov)
-			memcpy(rw->fast_iov + iov_off, fast_iov + iov_off,
+		if (rw->s.fast_iov != fast_iov)
+			memcpy(rw->s.fast_iov + iov_off, fast_iov + iov_off,
 			       sizeof(struct iovec) * iter->nr_segs);
 	} else {
 		req->flags |= REQ_F_NEED_CLEANUP;
@@ -3341,7 +3345,7 @@ static int io_setup_async_rw(struct io_kiocb *req, const struct iovec *iovec,
 		io_req_map_rw(req, iovec, fast_iov, iter);
 		iorw = req->async_data;
 		/* we've copied and mapped the iter, ensure state is saved */
-		iov_iter_save_state(&iorw->iter, &iorw->iter_state);
+		iov_iter_save_state(&iorw->s.iter, &iorw->s.iter_state);
 	}
 	return 0;
 }
@@ -3349,10 +3353,10 @@ static int io_setup_async_rw(struct io_kiocb *req, const struct iovec *iovec,
 static inline int io_rw_prep_async(struct io_kiocb *req, int rw)
 {
 	struct io_async_rw *iorw = req->async_data;
-	struct iovec *iov = iorw->fast_iov;
+	struct iovec *iov = iorw->s.fast_iov;
 	int ret;
 
-	ret = io_import_iovec(rw, req, &iov, &iorw->iter, false);
+	ret = io_import_iovec(rw, req, &iov, &iorw->s.iter, false);
 	if (unlikely(ret < 0))
 		return ret;
 
@@ -3360,7 +3364,7 @@ static inline int io_rw_prep_async(struct io_kiocb *req, int rw)
 	iorw->free_iovec = iov;
 	if (iov)
 		req->flags |= REQ_F_NEED_CLEANUP;
-	iov_iter_save_state(&iorw->iter, &iorw->iter_state);
+	iov_iter_save_state(&iorw->s.iter, &iorw->s.iter_state);
 	return 0;
 }
 
@@ -3470,8 +3474,8 @@ static int io_read(struct io_kiocb *req, unsigned int issue_flags)
 
 	if (req_has_async_data(req)) {
 		rw = req->async_data;
-		iter = &rw->iter;
-		state = &rw->iter_state;
+		iter = &rw->s.iter;
+		state = &rw->s.iter_state;
 		/*
 		 * We come here from an earlier attempt, restore our state to
 		 * match in case it doesn't. It's cheap enough that we don't
@@ -3542,9 +3546,9 @@ static int io_read(struct io_kiocb *req, unsigned int issue_flags)
 	 * Now use our persistent iterator and state, if we aren't already.
 	 * We've restored and mapped the iter to match.
 	 */
-	if (iter != &rw->iter) {
-		iter = &rw->iter;
-		state = &rw->iter_state;
+	if (iter != &rw->s.iter) {
+		iter = &rw->s.iter;
+		state = &rw->s.iter_state;
 	}
 
 	do {
@@ -3606,8 +3610,8 @@ static int io_write(struct io_kiocb *req, unsigned int issue_flags)
 
 	if (req_has_async_data(req)) {
 		rw = req->async_data;
-		iter = &rw->iter;
-		state = &rw->iter_state;
+		iter = &rw->s.iter;
+		state = &rw->s.iter_state;
 		iov_iter_restore(iter, state);
 		iovec = NULL;
 	} else {
