@@ -236,7 +236,7 @@ setup-source: dist-git-version-check dist-clean-sources
 		cp $(REDHAT)/$(CHANGELOG_PREV) $(REDHAT)/$(CHANGELOG); \
 	fi
 	@cp $(REDHAT)/$(CHANGELOG) $(SOURCES)/$(CHANGELOG)
-	@$(REDHAT)/genspec.sh $(SOURCES) $(SOURCES)/$(SPECFILE) $(SOURCES)/$(CHANGELOG) $(PKGRELEASE) $(RPMKVERSION) $(RPMKPATCHLEVEL) $(RPMKSUBLEVEL) $(DISTRO_BUILD) $(RELEASED_KERNEL) $(SPECRELEASE) $(__ZSTREAM) "$(BUILDOPTS)" $(MARKER) `cat $(REDHAT)/marker` $(SINGLE_TARBALL) $(TARFILE_RELEASE) $(SNAPSHOT) $(UPSTREAM_BRANCH) $(BUILDID)
+	@$(REDHAT)/genspec.sh $(SOURCES) $(SOURCES)/$(SPECFILE) $(SOURCES)/$(CHANGELOG) $(PKGRELEASE) $(RPMKVERSION) $(RPMKPATCHLEVEL) $(RPMKSUBLEVEL) $(DISTRO_BUILD) $(RELEASED_KERNEL) $(SPECRELEASE) $(__ZSTREAM) "$(BUILDOPTS)" $(MARKER) `cat $(REDHAT)/marker` $(SINGLE_TARBALL) $(TARFILE_RELEASE) $(SNAPSHOT) $(UPSTREAM_BRANCH) $(BUILDID) $(INCLUDE_FEDORA_FILES) $(INCLUDE_RHEL_FILES)
 	@cp $(SOURCES)/$(SPECFILE) $(SOURCES)/../SPECS/
 
 generate-testpatch-tmp:
@@ -254,8 +254,7 @@ sources-rh: $(TARBALL) generate-testpatch-tmp setup-source dist-configs-check
 		echo "WARNING: There are uncommitted changes in your tree or the changes are not in sync with linux-kernel-test.patch.  Either commit the changes or run 'make dist-test-patch'"
 	@rm $(TESTPATCH).tmp
 	@cp $(TESTPATCH) $(SOURCES)/linux-kernel-test.patch
-	@cp fedora_files/* $(SOURCES);
-	@cp rhel_files/* $(SOURCES);
+	@cat configs/flavors | while read flavor; do echo "Copying sources for $${flavor}"; [ -e $${flavor}_files ] && cp $${flavor}_files/* $(SOURCES); done
 	@cp cpupower.* \
 		keys/rhel*.x509 \
 		kabi/check-kabi \
@@ -275,6 +274,7 @@ sources-rh: $(TARBALL) generate-testpatch-tmp setup-source dist-configs-check
 		generate_crashkernel_default.sh \
 		../Makefile.rhelver \
 		README.rst \
+		kernel-local \
 		$(SOURCES)/
 	@if [ "$(RELEASED_KERNEL)" -ne 0 ]; then \
 		cp keys/redhatsecureboot{302,501,601,ca3,ca5,ca6}.cer $(SOURCES)/; \
