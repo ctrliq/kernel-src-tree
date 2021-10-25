@@ -34,7 +34,8 @@ separate remote in Git. Once GitLab finishes forking the repository:
 * Enter the Git repository URL: https://gitlab.com/cki-project/kernel-ark.git
 * Ensure the 'Mirror direction' is 'Pull'.
 * Leave the 'Password' blank.
-* Leave the checkboxes blank (or select them if desired).
+* Select 'Overwrite diverged branches' (ARK rebases every GA release)
+* Leave the other checkboxes blank (or select them if desired).
 * Click 'Mirror Repository'. The first update will take about 20 minutes.
 
 
