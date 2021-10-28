@@ -13,23 +13,34 @@ Branches
 os-build, a.k.a "the development branch"
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
+Frequency: Merges 'master' branch daily
+
 The os-build branch is the development branch of the tree.  The os-build branch
 tracks the latest version of the kernel patches for ARK and Fedora, as well as
 the kernel configuration and build scripts.  This is the branch to send
 merge request to.  When a new release is made, this branch is merged into the
 release branch.  Configuration and build scripts can be found in the
-``redhat/`` directory. Refer to the Configuration section below for more
+``redhat/`` directory. Refer to the `Configuration`_ section below for more
 details.
+
+If this branch does not compile or boot, then please see `ark-latest`_ branch
+below.
 
 master
 ~~~~~~
+
+Frequency: Mirrors Linus's tree
 
 The master branch tracks `Linus's master
 branch <git://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git>`__
 (i.e. "mainline").
 
+.. _ark-latest:
+
 ark-latest
 ~~~~~~~~~~
+
+Frequency: Reset daily after os-build branch merges 'master'
 
 This branch points to the latest release branch.  This branch may differ
 slightly from os-build and contain critical patches that resolve compile or
@@ -97,6 +108,8 @@ Fedora source tree.
 
 Fedora RPM tagging in the ARK kernel began in May 2020 for fc33.  Previous
 RPM tags are not available in the ARK kernel tree.
+
+.. _Configuration:
 
 Configuration
 -------------
