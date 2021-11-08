@@ -38,9 +38,8 @@ separate remote in Git. Once GitLab finishes forking the repository:
 * Leave the other checkboxes blank (or select them if desired).
 * Click 'Mirror Repository'. The first update will take about 20 minutes.
 
-
-Building packages
------------------
+Cloning the Repository
+----------------------
 
 Install the dependencies for generating source RPM packages:
 
@@ -61,7 +60,27 @@ The ``os-build`` branch is checked out automatically after cloning. This
 branch contains the configuration and build scripts, and it is regularly
 updated to work with Linus's master branch.
 
-With the ``os-build`` branch checked out, build a source RPM package:
+The ``ark-latest`` branch contains a very recent 'known-good' version of the
+os-build branch that can be used if the os-build branch does not compile due to
+upstream bugs.  However, the os-build branch must be used as a Merge Request
+target for all Fedora/ARK specific changes.
+
+Local builds
+------------
+
+With the ``os-build`` or ``ark-latest`` branch checked out, get the kernel .config:
+
+.. code-block:: sh
+
+   make dist-configs # or make dist-configs-arch
+   cp redhat/configs/<flavor_os>.config .config
+
+You can now execute any common upstream make targets (make, make -j, make cscope, etc.).
+
+Building packages
+-----------------
+
+With the ``os-build`` or ``ark-latest`` branch checked out, build a source RPM package:
 
 .. code-block:: sh
 
