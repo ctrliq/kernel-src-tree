@@ -2128,8 +2128,8 @@ static bool obj_stock_flush_required(struct memcg_stock_pcp *stock,
  * To optimize for user context access, there are now two object stocks for
  * task context and interrupt context access respectively.
  *
- * The task context object stock can be accessed by disabling preemption only
- * which is cheap in non-preempt kernel. The interrupt context object stock
+ * The task context object stock can be accessed by taking a local lock,
+ * which is cheap in preempt_rt kernel. The interrupt context object stock
  * can only be accessed after disabling interrupt. User context code can
  * access interrupt object stock, but not vice versa.
  */
@@ -2137,24 +2137,24 @@ static inline struct obj_stock *get_obj_stock(unsigned long *pflags)
 {
 	struct memcg_stock_pcp *stock;
 
-	if (likely(in_task())) {
-		*pflags = 0UL;
-		preempt_disable();
+	if (likely(!(in_hardirq() || in_nmi()))) {
+		/* softirqs are also serviced in task context in RT */
+		local_lock(&memcg_stock.lock);
 		stock = this_cpu_ptr(&memcg_stock);
 		return &stock->task_obj;
 	}
 
-	local_lock_irqsave(&memcg_stock.lock, *pflags);
+	local_irq_save(*pflags);
 	stock = this_cpu_ptr(&memcg_stock);
 	return &stock->irq_obj;
 }
 
 static inline void put_obj_stock(unsigned long flags)
 {
-	if (likely(in_task()))
-		preempt_enable();
+	if (likely(!(in_hardirq() || in_nmi())))
+		local_unlock(&memcg_stock.lock);
 	else
-		local_unlock_irqrestore(&memcg_stock.lock, flags);
+		local_irq_restore(flags);
 }
 
 /**
@@ -3104,7 +3104,7 @@ void __memcg_kmem_uncharge_page(struct page *page, int order)
 void mod_objcg_state(struct obj_cgroup *objcg, struct pglist_data *pgdat,
 		     enum node_stat_item idx, int nr)
 {
-	unsigned long flags;
+	unsigned long flags = 0;
 	struct obj_stock *stock = get_obj_stock(&flags);
 	int *bytes;
 
@@ -3163,7 +3163,7 @@ void mod_objcg_state(struct obj_cgroup *objcg, struct pglist_data *pgdat,
 
 static bool consume_obj_stock(struct obj_cgroup *objcg, unsigned int nr_bytes)
 {
-	unsigned long flags;
+	unsigned long flags = 0;
 	struct obj_stock *stock = get_obj_stock(&flags);
 	bool ret = false;
 
@@ -3250,7 +3250,7 @@ static bool obj_stock_flush_required(struct memcg_stock_pcp *stock,
 static void refill_obj_stock(struct obj_cgroup *objcg, unsigned int nr_bytes,
 			     bool allow_uncharge)
 {
-	unsigned long flags;
+	unsigned long flags = 0;
 	struct obj_stock *stock = get_obj_stock(&flags);
 	unsigned int nr_pages = 0;
 
