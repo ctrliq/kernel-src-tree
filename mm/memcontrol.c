@@ -2144,7 +2144,7 @@ static inline struct obj_stock *get_obj_stock(unsigned long *pflags)
 		return &stock->task_obj;
 	}
 
-	local_irq_save(*pflags);
+	local_lock_irqsave(&memcg_stock.lock, *pflags);
 	stock = this_cpu_ptr(&memcg_stock);
 	return &stock->irq_obj;
 }
@@ -2154,7 +2154,7 @@ static inline void put_obj_stock(unsigned long flags)
 	if (likely(in_task()))
 		preempt_enable();
 	else
-		local_irq_restore(flags);
+		local_unlock_irqrestore(&memcg_stock.lock, flags);
 }
 
 /**
