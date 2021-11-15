@@ -25,7 +25,7 @@ type SubSystem struct {
 		EmailLabel string `emailLabel`
 	}
 	Status string `status`
-	RequiredApproval bool `required-approval`
+	RequiredApproval bool `requiredApproval`
 	Maintainers []NameAndEmail `maintainers`
 	Reviewers []NameAndEmail `reviewers`
 	Paths struct {
