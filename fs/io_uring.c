@@ -2281,7 +2281,7 @@ static int io_do_iopoll(struct io_ring_ctx *ctx, unsigned int *nr_events,
 			long min, bool resubmit)
 {
 	struct io_kiocb *req, *tmp;
-	unsigned int poll_flags = 0;
+	unsigned int poll_flags = BLK_POLL_NOSLEEP;
 	LIST_HEAD(done);
 
 	/*
