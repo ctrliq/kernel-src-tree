@@ -1155,10 +1155,8 @@ struct task_struct {
 	/* Stacked block device info: */
 	struct bio_list			*bio_list;
 
-#ifdef CONFIG_BLOCK
 	/* Stack plugging: */
 	struct blk_plug			*plug;
-#endif
 
 	/* VM state: */
 	struct reclaim_state		*reclaim_state;
