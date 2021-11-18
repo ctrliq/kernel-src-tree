@@ -51,15 +51,23 @@
  *   party modules is retained.
  *
  * RH_KABI_DEPRECATE
- *   Mark the element as deprecated and make it unusable by modules while
- *   preserving kABI checksums.
+ *   Marks the element as deprecated and make it unusable by modules while
+ *   keeping a hole in its place to preserve binary compatibility.
  *
  * RH_KABI_DEPRECATE_FN
- *   Mark the function pointer as deprecated and make it unusable by modules
- *   while preserving kABI checksums.
+ *   Marks the function pointer as deprecated and make it unusable by modules
+ *   while keeping a hole in its place to preserve binary compatibility.
  *
  * RH_KABI_EXTEND
- *   Simple macro for adding a new element to a struct.
+ *   Adds a new field to a struct.  This must always be added to the end of
+ *   the struct.  Before using this macro, make sure this is actually safe
+ *   to do - there is a number of conditions under which it is *not* safe.
+ *   In particular (but not limited to), this macro cannot be used:
+ *   - if the struct in question is embedded in another struct, or
+ *   - if the struct is allocated by drivers either statically or
+ *     dynamically, or
+ *   - if the struct is allocated together with driver data (an example of
+ *     such behavior is struct net_device or struct request).
  *
  * RH_KABI_EXTEND_WITH_SIZE
  *   Adds a new element (usually a struct) to a struct and reserves extra
@@ -75,25 +83,26 @@
  *   guarantee.
  *
  * RH_KABI_FILL_HOLE
- *   Simple macro for filling a hole in a struct.
+ *   Fills a hole in a struct.
  *
  *   Warning: only use if a hole exists for _all_ arches.  Use pahole to verify.
  *
  * RH_KABI_RENAME
- *   Simple macro for renaming an element without changing its type.  This
- *   macro can be used in bitfields, for example.
+ *   Renames an element without changing its type.  This macro can be used in
+ *   bitfields, for example.
  *
  *   NOTE: this macro does not add the final ';'
  *
  * RH_KABI_REPLACE
- *   Simple replacement of _orig with a union of _orig and _new.
+ *   Replaces the _orig field by the _new field.  The size of the occupied
+ *   space is preserved, it's fine if the _new field is smaller than the
+ *   _orig field.  If a _new field is larger or has a different alignment,
+ *   compilation will abort.
  *
- *   The RH_KABI_REPLACE* macros attempt to add the ability to use the '_new'
- *   element while preserving size alignment with the '_orig' element.
- *
- *   The #ifdef __GENKSYMS__ preserves the kABI agreement, while the anonymous
- *   union structure preserves the size alignment (assuming the '_new' element
- *   is not bigger than the '_orig' element).
+ * RH_KABI_REPLACE_SPLIT
+ *   Works the same as RH_KABI_REPLACE but replaces a single _orig field by
+ *   multiple new fields.  The checks for size and alignment done by
+ *   RH_KABI_REPLACE are still applied.
  *
  * RH_KABI_HIDE_INCLUDE
  *   Hides the given include file from kABI checksum computations.  This is
@@ -111,6 +120,45 @@
  *
  *   Example usage:
  *   #include RH_KABI_FAKE_INCLUDE(<linux/rhashtable.h>)
+ *
+ * RH_KABI_RESERVE
+ *   Adds a reserved field to a struct.  This is done prior to kABI freeze
+ *   for structs that cannot be expanded later using RH_KABI_EXTEND (for
+ *   example because they are embedded in another struct or because they are
+ *   allocated by drivers or because they use unusual memory layout).  The
+ *   size of the reserved field is 'unsigned long' and is assumed to be
+ *   8 bytes.
+ *
+ *   The argument is a number unique for the given struct; usually, multiple
+ *   RH_KABI_RESERVE macros are added to a struct with numbers starting from
+ *   one.
+ *
+ *   Example usage:
+ *   struct foo {
+ *           int a;
+ *           RH_KABI_RESERVE(1)
+ *           RH_KABI_RESERVE(2)
+ *           RH_KABI_RESERVE(3)
+ *           RH_KABI_RESERVE(4)
+ *   };
+ *
+ * RH_KABI_USE
+ *   Uses a previously reserved field or multiple fields.  The arguments are
+ *   one or more numbers assigned to RH_KABI_RESERVE, followed by a field to
+ *   be put in their place.  The compiler ensures that the new field is not
+ *   larger than the reserved area.
+ *
+ *   Example usage:
+ *   struct foo {
+ *           int a;
+ *           RH_KABI_USE(1, int b)
+ *           RH_KABI_USE(2, 3, int c[3])
+ *           RH_KABI_RESERVE(4)
+ *   };
+ *
+ * RH_KABI_USE_SPLIT
+ *   Works the same as RH_KABI_USE but replaces a single reserved field by
+ *   multiple new fields.
  *
  * RH_KABI_FORCE_CHANGE
  *   Force change of the symbol checksum.  The argument of the macro is a
@@ -252,15 +300,11 @@
 
 #endif /* __GENKSYMS__ */
 
-/* semicolon added wrappers for the RH_KABI_REPLACE macros */
 # define RH_KABI_DEPRECATE(_type, _orig)	_RH_KABI_DEPRECATE(_type, _orig);
 # define RH_KABI_DEPRECATE_FN(_type, _orig, _args...)  \
 	_RH_KABI_DEPRECATE_FN(_type, _orig, _args);
 # define RH_KABI_REPLACE(_orig, _new)		_RH_KABI_REPLACE(_orig, _new);
-/*
- * Macro for breaking up a random element into two smaller chunks using an
- * anonymous struct inside an anonymous union.
- */
+
 #define _RH_KABI_REPLACE1(_new)		_new;
 #define _RH_KABI_REPLACE2(_new, ...)	_new; _RH_KABI_REPLACE1(__VA_ARGS__)
 #define _RH_KABI_REPLACE3(_new, ...)	_new; _RH_KABI_REPLACE2(__VA_ARGS__)
@@ -278,9 +322,7 @@
 		struct { __PASTE(_RH_KABI_REPLACE, COUNT_ARGS(__VA_ARGS__))(__VA_ARGS__) });
 
 # define RH_KABI_RESERVE(n)		_RH_KABI_RESERVE(n);
-/*
- * Simple wrappers to replace standard Red Hat reserved elements.
- */
+
 #define _RH_KABI_USE1(n, _new)	_RH_KABI_RESERVE(n), _new
 #define _RH_KABI_USE2(n, ...)	_RH_KABI_RESERVE(n); _RH_KABI_USE1(__VA_ARGS__)
 #define _RH_KABI_USE3(n, ...)	_RH_KABI_RESERVE(n); _RH_KABI_USE2(__VA_ARGS__)
@@ -297,24 +339,12 @@
 #define _RH_KABI_USE(...)	_RH_KABI_REPLACE(__VA_ARGS__)
 #define RH_KABI_USE(n, ...)	_RH_KABI_USE(__PASTE(_RH_KABI_USE, COUNT_ARGS(__VA_ARGS__))(n, __VA_ARGS__));
 
-/*
- * Macros for breaking up a reserved element into two smaller chunks using
- * an anonymous struct inside an anonymous union.
- */
 # define RH_KABI_USE_SPLIT(n, ...)	RH_KABI_REPLACE_SPLIT(_RH_KABI_RESERVE(n), __VA_ARGS__)
 
-/*
- * We tried to standardize on Red Hat reserved names.  These wrappers
- * leverage those common names making it easier to read and find in the
- * code.
- */
 # define _RH_KABI_RESERVE(n)		unsigned long rh_reserved##n
 
 #define RH_KABI_EXCLUDE(_elem)		_RH_KABI_EXCLUDE(_elem);
 
-/*
- * Extending a struct while reserving extra space.
- */
 #define RH_KABI_EXTEND_WITH_SIZE(_new, _size)				\
 	RH_KABI_EXTEND(union {						\
 		_new;							\
