@@ -160,6 +160,119 @@
  *   Works the same as RH_KABI_USE but replaces a single reserved field by
  *   multiple new fields.
  *
+ * RH_KABI_AUX_EMBED
+ * RH_KABI_AUX_PTR
+ *   Adds an extenstion of a struct in the form of "auxiliary structure".
+ *   This is done prior to kABI freeze for structs that cannot be expanded
+ *   later using RH_KABI_EXTEND.  See also RH_KABI_RESERVED, these two
+ *   approaches can (and often are) combined.
+ *
+ *   To use this for 'struct foo' (the "base structure"), define a new
+ *   structure called 'struct foo_rh'; this new struct is called "auxiliary
+ *   structure".  Then add RH_KABI_AUX_EMBED or RH_KABI_AUX_PTR to the end
+ *   of the base structure.  The argument is the name of the base structure,
+ *   without the 'struct' keyword.
+ *
+ *   RH_KABI_AUX_PTR stores a pointer to the aux structure in the base
+ *   struct.  The lifecycle of the aux struct needs to be properly taken
+ *   care of.
+ *
+ *   RH_KABI_AUX_EMBED embeds the aux struct into the base struct.  This
+ *   cannot be used when the base struct is itself embedded into another
+ *   struct, allocated in an array, etc.
+ *
+ *   Both approaches (ptr and embed) work correctly even when the aux struct
+ *   is allocated by modules.  To ensure this, the code responsible for
+ *   allocation/assignment of the aux struct has to properly set the size of
+ *   the aux struct; see the RH_KABI_AUX_SET_SIZE and RH_KABI_AUX_INIT_SIZE
+ *   macros.
+ *
+ *   New fields can be later added to the auxiliary structure, always to its
+ *   end.  Note the auxiliary structure cannot be shrunk in size later (i.e.,
+ *   fields cannot be removed, only deprecated).  Any code accessing fields
+ *   from the aux struct must guard the access using the RH_KABI_AUX macro.
+ *   The access itself is then done via a '_rh' field in the base struct.
+ *
+ *   The auxiliary structure is not guaranteed for access by modules unless
+ *   explicitly commented as such in the declaration of the aux struct
+ *   itself or some of its elements.
+ *
+ *   Example:
+ *
+ *   struct foo_rh {
+ *           int newly_added;
+ *   };
+ *
+ *   struct foo {
+ *           bool big_hammer;
+ *           RH_KABI_AUX_PTR(foo)
+ *   };
+ *
+ *   void use(struct foo *f)
+ *   {
+ *           if (RH_KABI_AUX(f, foo, newly_added))
+ *                   f->_rh->newly_added = 123;
+ *	     else
+ *	             // the field 'newly_added' is not present in the passed
+ *	             // struct, fall back to old behavior
+ *	             f->big_hammer = true;
+ *   }
+ *
+ *   static struct foo_rh my_foo_rh {
+ *           .newly_added = 0;
+ *   }
+ *
+ *   static struct foo my_foo = {
+ *           .big_hammer = false,
+ *           ._rh = &my_foo_rh,
+ *           RH_KABI_AUX_INIT_SIZE(foo)
+ *   };
+ *
+ * RH_KABI_USE_AUX_PTR
+ *   Creates an auxiliary structure post kABI freeze.  This works by using
+ *   two reserved fields (thus there has to be two reserved fields still
+ *   available) and converting them to RH_KABI_AUX_PTR.
+ *
+ *   Example:
+ *
+ *   struct foo_rh {
+ *   };
+ *
+ *   struct foo {
+ *           int a;
+ *           RH_KABI_RESERVE(1)
+ *           RH_KABI_USE_AUX_PTR(2, 3, foo)
+ *   };
+ *
+ * RH_KABI_AUX_SET_SIZE
+ * RH_KABI_AUX_INIT_SIZE
+ *   Calculates and stores the size of the auxiliary structure.
+ *
+ *   RH_KABI_AUX_SET_SIZE is for dynamically allocated base structs,
+ *   RH_KABI_AUX_INIT_SIZE is for statically allocated case structs.
+ *
+ *   These macros must be called from the allocation (RH_KABI_AUX_SET_SIZE)
+ *   or declaration (RH_KABI_AUX_INIT_SIZE) site, regardless of whether
+ *   that happens in the kernel or in a module.  Without calling one of
+ *   these macros, the aux struct will appear to have no fields to the
+ *   kernel.
+ *
+ *   Note: since RH_KABI_AUX_SET_SIZE is intended to be invoked outside of
+ *   a struct definition, it does not add the semicolon and must be
+ *   terminated by semicolon by the caller.
+ *
+ * RH_KABI_AUX
+ *   Verifies that the given field exists in the given auxiliary structure.
+ *   This MUST be called prior to accessing that field; failing to do that
+ *   may lead to invalid memory access.
+ *
+ *   The first argument is a pointer to the base struct, the second argument
+ *   is the name of the base struct (without the 'struct' keyword), the
+ *   third argument is the field name.
+ *
+ *   This macro works for structs extended by either of RH_KABI_AUX_EMBED,
+ *   RH_KABI_AUX_PTR and RH_KABI_USE_AUX_PTR.
+ *
  * RH_KABI_FORCE_CHANGE
  *   Force change of the symbol checksum.  The argument of the macro is a
  *   version for cases we need to do this more than once.
@@ -352,30 +465,6 @@
 		__RH_KABI_CHECK_SIZE(_new, 8 * (_size));		\
 	})
 
-/*
- * RHEL macros to extend structs.
- *
- * base struct: The struct being extended.  For example, pci_dev.
- * extended struct: The Red Hat struct being added to the base struct.
- *		    For example, pci_dev_rh.
- *
- * These macros should be used to extend structs before KABI freeze.
- * They can be used post-KABI freeze in the limited case of the base
- * struct not being embedded in another struct.
- *
- * Extended structs cannot be shrunk in size as changes will break
- * the size & offset comparison.
- *
- * Extended struct elements are not guaranteed for access by modules unless
- * explicitly commented as such in the declaration of the extended struct or
- * the element in the extended struct.
- */
-
-/*
- * RH_KABI_AUX_EMBED|_PTR() extends a struct by embedding or adding
- * a pointer in a base struct.  The name of the new struct is the name
- * of the base struct appended with _rh.
- */
 #define _RH_KABI_AUX_PTR(_struct)					\
 	size_t _struct##_size_rh;					\
 	_RH_KABI_EXCLUDE(struct _struct##_rh *_rh)
@@ -388,44 +477,17 @@
 #define RH_KABI_AUX_EMBED(_struct)					\
 	_RH_KABI_AUX_EMBED(_struct);
 
-/*
- * If there is a post-kABI freeze need of RH_KABI_AUX_PTR and there are
- * still two reserved fields available, they can be converted by
- * RH_KABI_USE_AUX_PTR.
- */
 #define RH_KABI_USE_AUX_PTR(n1, n2, _struct)				\
 	RH_KABI_USE(n1, n2,						\
 		     struct { RH_KABI_AUX_PTR(_struct) })
 
-/*
- * RH_KABI_AUX_SET_SIZE calculates and sets the size of the extended struct and
- * stores it in the size_rh field for structs that are dynamically allocated.
- * This macro MUST be called when expanding a base struct with
- * RH_KABI_AUX, and it MUST be called from the allocation site
- * regardless of being allocated in the kernel or a module.
- * Note: since this macro is intended to be invoked outside of a struct,
- * a semicolon is necessary at the end of the line where it is invoked.
- */
 #define RH_KABI_AUX_SET_SIZE(_name, _struct) ({				\
 	(_name)->_struct##_size_rh = sizeof(struct _struct##_rh);	\
 })
 
-/*
- * RH_KABI_AUX_INIT_SIZE calculates and sets the size of the extended struct and
- * stores it in the size_rh field for structs that are statically allocated.
- * This macro MUST be called when expanding a base struct with
- * RH_KABI_AUX, and it MUST be called from the declaration site
- * regardless of being allocated in the kernel or a module.
- */
 #define RH_KABI_AUX_INIT_SIZE(_struct)					\
 	._struct##_size_rh = sizeof(struct _struct##_rh),
 
-/*
- * RH_KABI_AUX verifies allocated memory exists.  This MUST be called to
- * verify that memory in the _rh struct is valid, and can be called
- * regardless if RH_KABI_AUX_EMBED or RH_KABI_AUX_PTR is
- * used.
- */
 #define RH_KABI_AUX(_ptr, _struct, _field) ({				\
 	size_t __off = offsetof(struct _struct##_rh, _field);		\
 	(_ptr)->_struct##_size_rh > __off ? true : false;		\
