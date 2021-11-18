@@ -2,7 +2,7 @@
  * rh_kabi.h - Red Hat kABI abstraction header
  *
  * Copyright (c) 2014 Don Zickus
- * Copyright (c) 2015-2018 Jiri Benc
+ * Copyright (c) 2015-2020 Jiri Benc
  * Copyright (c) 2015 Sabrina Dubroca, Hannes Frederic Sowa
  * Copyright (c) 2016-2018 Prarit Bhargava
  * Copyright (c) 2017 Paolo Abeni, Larry Woodman
@@ -140,6 +140,30 @@
  *   of the size is not allowed and would constitute a silent kABI breakage.
  *   Beware that the RH_KABI_EXCLUDE macro does not do any size checks.
  *
+ * RH_KABI_BROKEN_INSERT
+ * RH_KABI_BROKEN_REMOVE
+ *   Insert a field to the middle of a struct / delete a field from a struct.
+ *   Note that this breaks kABI! It can be done only when it's certain that
+ *   no 3rd party driver can validly reach into the struct.  A typical
+ *   example is a struct that is:  both (a) referenced only through a long
+ *   chain of pointers from another struct that is part of a whitelisted
+ *   symbol and (b) kernel internal only, it should have never been visible
+ *   to genksyms in the first place.
+ *
+ *   Another example are structs that are explicitly exempt from kABI
+ *   guarantee but we did not have enough foresight to use RH_KABI_EXCLUDE.
+ *   In this case, the warning for RH_KABI_EXCLUDE applies.
+ *
+ *   A detailed explanation of correctness of every RH_KABI_BROKEN_* macro
+ *   use is especially important.
+ *
+ * RH_KABI_BROKEN_INSERT_BLOCK
+ * RH_KABI_BROKEN_REMOVE_BLOCK
+ *   A version of RH_KABI_BROKEN_INSERT / REMOVE that allows multiple fields
+ *   to be inserted or removed together.  All fields need to be terminated
+ *   by ';' inside(!) the macro parameter.  The macro itself must not be
+ *   terminated by ';'.
+ *
  */
 
 #undef linux
@@ -154,6 +178,10 @@
 # define RH_KABI_RENAME(_orig, _new)		_orig
 # define RH_KABI_HIDE_INCLUDE(_file)		<linux/rh_kabi.h>
 # define RH_KABI_FAKE_INCLUDE(_file)		_file
+# define RH_KABI_BROKEN_INSERT(_new)
+# define RH_KABI_BROKEN_REMOVE(_orig)		_orig;
+# define RH_KABI_BROKEN_INSERT_BLOCK(_new)
+# define RH_KABI_BROKEN_REMOVE_BLOCK(_orig)	_orig
 
 # define _RH_KABI_DEPRECATE(_type, _orig)	_type _orig
 # define _RH_KABI_DEPRECATE_FN(_type, _orig, _args...)	_type (*_orig)(_args)
@@ -172,6 +200,10 @@
 # define RH_KABI_RENAME(_orig, _new)		_new
 # define RH_KABI_HIDE_INCLUDE(_file)		_file
 # define RH_KABI_FAKE_INCLUDE(_file)		<linux/rh_kabi.h>
+# define RH_KABI_BROKEN_INSERT(_new)		_new;
+# define RH_KABI_BROKEN_REMOVE(_orig)
+# define RH_KABI_BROKEN_INSERT_BLOCK(_new)	_new
+# define RH_KABI_BROKEN_REMOVE_BLOCK(_orig)
 
 
 #if IS_BUILTIN(CONFIG_RH_KABI_SIZE_ALIGN_CHECKS)
