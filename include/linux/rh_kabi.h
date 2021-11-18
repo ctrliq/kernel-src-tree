@@ -419,7 +419,7 @@
  */
 #define RH_KABI_CHECK_EXT(_ptr, _struct, _field) ({			\
 	size_t __off = offsetof(struct _struct##_rh, _field);		\
-	_ptr->_struct##_size_rh > __off ? true : false;			\
+	(_ptr)->_struct##_size_rh > __off ? true : false;		\
 })
 
 #endif /* _LINUX_RH_KABI_H */
