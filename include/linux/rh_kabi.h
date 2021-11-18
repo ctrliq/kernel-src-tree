@@ -281,7 +281,22 @@
 /*
  * Simple wrappers to replace standard Red Hat reserved elements.
  */
-# define RH_KABI_USE(n, _new)		RH_KABI_REPLACE(_RH_KABI_RESERVE(n), _new)
+#define _RH_KABI_USE1(n, _new)	_RH_KABI_RESERVE(n), _new
+#define _RH_KABI_USE2(n, ...)	_RH_KABI_RESERVE(n); _RH_KABI_USE1(__VA_ARGS__)
+#define _RH_KABI_USE3(n, ...)	_RH_KABI_RESERVE(n); _RH_KABI_USE2(__VA_ARGS__)
+#define _RH_KABI_USE4(n, ...)	_RH_KABI_RESERVE(n); _RH_KABI_USE3(__VA_ARGS__)
+#define _RH_KABI_USE5(n, ...)	_RH_KABI_RESERVE(n); _RH_KABI_USE4(__VA_ARGS__)
+#define _RH_KABI_USE6(n, ...)	_RH_KABI_RESERVE(n); _RH_KABI_USE5(__VA_ARGS__)
+#define _RH_KABI_USE7(n, ...)	_RH_KABI_RESERVE(n); _RH_KABI_USE6(__VA_ARGS__)
+#define _RH_KABI_USE8(n, ...)	_RH_KABI_RESERVE(n); _RH_KABI_USE7(__VA_ARGS__)
+#define _RH_KABI_USE9(n, ...)	_RH_KABI_RESERVE(n); _RH_KABI_USE8(__VA_ARGS__)
+#define _RH_KABI_USE10(n, ...)	_RH_KABI_RESERVE(n); _RH_KABI_USE9(__VA_ARGS__)
+#define _RH_KABI_USE11(n, ...)	_RH_KABI_RESERVE(n); _RH_KABI_USE10(__VA_ARGS__)
+#define _RH_KABI_USE12(n, ...)	_RH_KABI_RESERVE(n); _RH_KABI_USE11(__VA_ARGS__)
+
+#define _RH_KABI_USE(...)	_RH_KABI_REPLACE(__VA_ARGS__)
+#define RH_KABI_USE(n, ...)	_RH_KABI_USE(__PASTE(_RH_KABI_USE, COUNT_ARGS(__VA_ARGS__))(n, __VA_ARGS__));
+
 /*
  * Macros for breaking up a reserved element into two smaller chunks using
  * an anonymous struct inside an anonymous union.
