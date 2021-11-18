@@ -30,6 +30,14 @@
 #include <linux/stringify.h>
 
 /*
+ * NOTE
+ *   Unless indicated otherwise, don't use ';' after these macros as it
+ *   messes up the kABI checker by changing what the resulting token string
+ *   looks like.  Instead let the macros add the ';' so it can be properly
+ *   hidden from the kABI checker (mainly for RH_KABI_EXTEND, but applied to
+ *   most macros for uniformity).
+ *
+ *
  * RH_KABI_CONST
  *   Adds a new const modifier to a function parameter preserving the old
  *   checksum.
@@ -67,7 +75,7 @@
  *   Simple macro for renaming an element without changing its type.  This
  *   macro can be used in bitfields, for example.
  *
- *   NOTE: does not include the final ';'
+ *   NOTE: this macro does not add the final ';'
  *
  * RH_KABI_REPLACE
  *   Simple replacement of _orig with a union of _orig and _new.
@@ -131,12 +139,6 @@
  *   Also note that any change to the element must preserve its size. Change
  *   of the size is not allowed and would constitute a silent kABI breakage.
  *   Beware that the RH_KABI_EXCLUDE macro does not do any size checks.
- *
- * NOTE
- *   Don't use ';' after these macros as it messes up the kABI checker by
- *   changing what the resulting token string looks like.  Instead let this
- *   macro add the ';' so it can be properly hidden from the kABI checker
- *   (mainly for RH_KABI_EXTEND, but applied to all macros for uniformity).
  *
  */
 
