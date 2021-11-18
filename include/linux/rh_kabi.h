@@ -261,7 +261,21 @@
  * Macro for breaking up a random element into two smaller chunks using an
  * anonymous struct inside an anonymous union.
  */
-# define RH_KABI_REPLACE2(orig, _new1, _new2)	RH_KABI_REPLACE(orig, struct{ _new1; _new2;})
+#define _RH_KABI_REPLACE1(_new)		_new;
+#define _RH_KABI_REPLACE2(_new, ...)	_new; _RH_KABI_REPLACE1(__VA_ARGS__)
+#define _RH_KABI_REPLACE3(_new, ...)	_new; _RH_KABI_REPLACE2(__VA_ARGS__)
+#define _RH_KABI_REPLACE4(_new, ...)	_new; _RH_KABI_REPLACE3(__VA_ARGS__)
+#define _RH_KABI_REPLACE5(_new, ...)	_new; _RH_KABI_REPLACE4(__VA_ARGS__)
+#define _RH_KABI_REPLACE6(_new, ...)	_new; _RH_KABI_REPLACE5(__VA_ARGS__)
+#define _RH_KABI_REPLACE7(_new, ...)	_new; _RH_KABI_REPLACE6(__VA_ARGS__)
+#define _RH_KABI_REPLACE8(_new, ...)	_new; _RH_KABI_REPLACE7(__VA_ARGS__)
+#define _RH_KABI_REPLACE9(_new, ...)	_new; _RH_KABI_REPLACE8(__VA_ARGS__)
+#define _RH_KABI_REPLACE10(_new, ...)	_new; _RH_KABI_REPLACE9(__VA_ARGS__)
+#define _RH_KABI_REPLACE11(_new, ...)	_new; _RH_KABI_REPLACE10(__VA_ARGS__)
+#define _RH_KABI_REPLACE12(_new, ...)	_new; _RH_KABI_REPLACE11(__VA_ARGS__)
+
+#define RH_KABI_REPLACE_SPLIT(_orig, ...)	_RH_KABI_REPLACE(_orig, \
+		struct { __PASTE(_RH_KABI_REPLACE, COUNT_ARGS(__VA_ARGS__))(__VA_ARGS__) });
 
 # define RH_KABI_RESERVE(n)		_RH_KABI_RESERVE(n);
 /*
