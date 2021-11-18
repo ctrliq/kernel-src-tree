@@ -378,13 +378,13 @@
  */
 #define _RH_KABI_SIZE_AND_EXTEND_PTR(_struct)				\
 	size_t _struct##_size_rh;					\
-	RH_KABI_EXCLUDE(struct _struct##_rh *_struct##_rh)
+	RH_KABI_EXCLUDE(struct _struct##_rh *_rh)
 #define RH_KABI_SIZE_AND_EXTEND_PTR(_struct)				\
 	_RH_KABI_SIZE_AND_EXTEND_PTR(_struct)
 
 #define _RH_KABI_SIZE_AND_EXTEND(_struct)				\
 	size_t _struct##_size_rh;					\
-	RH_KABI_EXCLUDE(struct _struct##_rh _struct##_rh)
+	RH_KABI_EXCLUDE(struct _struct##_rh _rh)
 #define RH_KABI_SIZE_AND_EXTEND(_struct)				\
 	_RH_KABI_SIZE_AND_EXTEND(_struct)
 
