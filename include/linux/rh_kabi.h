@@ -389,6 +389,15 @@
 	_RH_KABI_AUX_EMBED(_struct);
 
 /*
+ * If there is a post-kABI freeze need of RH_KABI_AUX_PTR and there are
+ * still two reserved fields available, they can be converted by
+ * RH_KABI_USE_AUX_PTR.
+ */
+#define RH_KABI_USE_AUX_PTR(n1, n2, _struct)				\
+	RH_KABI_USE(n1, n2,						\
+		     struct { RH_KABI_AUX_PTR(_struct) })
+
+/*
  * RH_KABI_AUX_SET_SIZE calculates and sets the size of the extended struct and
  * stores it in the size_rh field for structs that are dynamically allocated.
  * This macro MUST be called when expanding a base struct with
