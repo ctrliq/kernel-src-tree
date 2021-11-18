@@ -95,9 +95,6 @@
  *   union structure preserves the size alignment (assuming the '_new' element
  *   is not bigger than the '_orig' element).
  *
- * RH_KABI_REPLACE_UNSAFE
- *   Unsafe version of RH_KABI_REPLACE.  Only use for typedefs.
- *
  * RH_KABI_HIDE_INCLUDE
  *   Hides the given include file from kABI checksum computations.  This is
  *   used when a newly added #include makes a previously opaque struct
@@ -172,6 +169,10 @@
  *   by ';' inside(!) the macro parameter.  The macro itself must not be
  *   terminated by ';'.
  *
+ * RH_KABI_BROKEN_REPLACE
+ *   Replace a field by a different one without doing any checking.  This
+ *   allows replacing a field by another with a different size.  Similarly
+ *   to other RH_KABI_BROKEN macros, use of this indicates a kABI breakage.
  */
 
 #undef linux
@@ -191,11 +192,11 @@
 # define RH_KABI_BROKEN_REMOVE(_orig)		_orig;
 # define RH_KABI_BROKEN_INSERT_BLOCK(_new)
 # define RH_KABI_BROKEN_REMOVE_BLOCK(_orig)	_orig
+# define RH_KABI_BROKEN_REPLACE(_orig, _new)	_orig;
 
 # define _RH_KABI_DEPRECATE(_type, _orig)	_type _orig
 # define _RH_KABI_DEPRECATE_FN(_type, _orig, _args...)	_type (*_orig)(_args)
 # define _RH_KABI_REPLACE(_orig, _new)		_orig
-# define _RH_KABI_REPLACE_UNSAFE(_orig, _new)	_orig
 # define _RH_KABI_EXCLUDE(_elem)
 
 #else
@@ -214,6 +215,7 @@
 # define RH_KABI_BROKEN_REMOVE(_orig)
 # define RH_KABI_BROKEN_INSERT_BLOCK(_new)	_new
 # define RH_KABI_BROKEN_REMOVE_BLOCK(_orig)
+# define RH_KABI_BROKEN_REPLACE(_orig, _new)	_new;
 
 
 #if IS_BUILTIN(CONFIG_RH_KABI_SIZE_ALIGN_CHECKS)
@@ -245,7 +247,6 @@
 		} RH_KABI_UNIQUE_ID;			  \
 		__RH_KABI_CHECK_SIZE_ALIGN(_orig, _new);  \
 	}
-# define _RH_KABI_REPLACE_UNSAFE(_orig, _new)	_new
 
 # define _RH_KABI_EXCLUDE(_elem)		_elem
 
@@ -256,7 +257,6 @@
 # define RH_KABI_DEPRECATE_FN(_type, _orig, _args...)  \
 	_RH_KABI_DEPRECATE_FN(_type, _orig, _args);
 # define RH_KABI_REPLACE(_orig, _new)		_RH_KABI_REPLACE(_orig, _new);
-# define RH_KABI_REPLACE_UNSAFE(_orig, _new)	_RH_KABI_REPLACE_UNSAFE(_orig, _new);
 /*
  * Macro for breaking up a random element into two smaller chunks using an
  * anonymous struct inside an anonymous union.
