@@ -82,6 +82,23 @@
  * RH_KABI_REPLACE_UNSAFE
  *   Unsafe version of RH_KABI_REPLACE.  Only use for typedefs.
  *
+ * RH_KABI_HIDE_INCLUDE
+ *   Hides the given include file from kABI checksum computations.  This is
+ *   used when a newly added #include makes a previously opaque struct
+ *   visible.
+ *
+ *   Example usage:
+ *   #include RH_KABI_HIDE_INCLUDE(<linux/poll.h>)
+ *
+ * RH_KABI_FAKE_INCLUDE
+ *   Pretends inclusion of the given file for kABI checksum computations.
+ *   This is used when upstream removed a particular #include but that made
+ *   some structures opaque that were previously visible and is causing kABI
+ *   checker failures.
+ *
+ *   Example usage:
+ *   #include RH_KABI_FAKE_INCLUDE(<linux/rhashtable.h>)
+ *
  * RH_KABI_FORCE_CHANGE
  *   Force change of the symbol checksum.  The argument of the macro is a
  *   version for cases we need to do this more than once.
@@ -122,6 +139,10 @@
  *   (mainly for RH_KABI_EXTEND, but applied to all macros for uniformity).
  *
  */
+
+#undef linux
+#define linux linux
+
 #ifdef __GENKSYMS__
 
 # define RH_KABI_CONST
@@ -129,6 +150,8 @@
 # define RH_KABI_FILL_HOLE(_new)
 # define RH_KABI_FORCE_CHANGE(ver)		__attribute__((rh_kabi_change ## ver))
 # define RH_KABI_RENAME(_orig, _new)		_orig
+# define RH_KABI_HIDE_INCLUDE(_file)		<linux/rh_kabi.h>
+# define RH_KABI_FAKE_INCLUDE(_file)		_file
 
 # define _RH_KABI_DEPRECATE(_type, _orig)	_type _orig
 # define _RH_KABI_DEPRECATE_FN(_type, _orig, _args...)	_type (*_orig)(_args)
@@ -145,6 +168,8 @@
 # define RH_KABI_FILL_HOLE(_new)		_new;
 # define RH_KABI_FORCE_CHANGE(ver)
 # define RH_KABI_RENAME(_orig, _new)		_new
+# define RH_KABI_HIDE_INCLUDE(_file)		_file
+# define RH_KABI_FAKE_INCLUDE(_file)		<linux/rh_kabi.h>
 
 
 #if IS_BUILTIN(CONFIG_RH_KABI_SIZE_ALIGN_CHECKS)
