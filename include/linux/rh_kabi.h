@@ -43,6 +43,13 @@
  *   Adds a new const modifier to a function parameter preserving the old
  *   checksum.
  *
+ * RH_KABI_ADD_MODIFIER
+ *   Adds a new modifier to a function parameter or a typedef, preserving
+ *   the old checksum.  Useful e.g. for adding rcu annotations or changing
+ *   int to unsigned.  Beware that this may change the semantics; if you're
+ *   sure this is safe, always explain why binary compatibility with 3rd
+ *   party modules is retained.
+ *
  * RH_KABI_DEPRECATE
  *   Mark the element as deprecated and make it unusable by modules while
  *   preserving kABI checksums.
@@ -173,6 +180,7 @@
 #ifdef __GENKSYMS__
 
 # define RH_KABI_CONST
+# define RH_KABI_ADD_MODIFIER(_new)
 # define RH_KABI_EXTEND(_new)
 # define RH_KABI_FILL_HOLE(_new)
 # define RH_KABI_FORCE_CHANGE(ver)		__attribute__((rh_kabi_change ## ver))
@@ -195,6 +203,7 @@
 # define RH_KABI_ALIGN_WARNING ".  Disable CONFIG_RH_KABI_SIZE_ALIGN_CHECKS if debugging."
 
 # define RH_KABI_CONST				const
+# define RH_KABI_ADD_MODIFIER(_new)		_new
 # define RH_KABI_EXTEND(_new)			_new;
 # define RH_KABI_FILL_HOLE(_new)		_new;
 # define RH_KABI_FORCE_CHANGE(ver)
