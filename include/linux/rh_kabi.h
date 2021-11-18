@@ -372,52 +372,52 @@
  */
 
 /*
- * RH_KABI_SIZE_AND_EXTEND|_PTR() extends a struct by embedding or adding
+ * RH_KABI_AUX_EMBED|_PTR() extends a struct by embedding or adding
  * a pointer in a base struct.  The name of the new struct is the name
  * of the base struct appended with _rh.
  */
-#define _RH_KABI_SIZE_AND_EXTEND_PTR(_struct)				\
+#define _RH_KABI_AUX_PTR(_struct)					\
 	size_t _struct##_size_rh;					\
 	_RH_KABI_EXCLUDE(struct _struct##_rh *_rh)
-#define RH_KABI_SIZE_AND_EXTEND_PTR(_struct)				\
-	_RH_KABI_SIZE_AND_EXTEND_PTR(_struct);
+#define RH_KABI_AUX_PTR(_struct)					\
+	_RH_KABI_AUX_PTR(_struct);
 
-#define _RH_KABI_SIZE_AND_EXTEND(_struct)				\
+#define _RH_KABI_AUX_EMBED(_struct)					\
 	size_t _struct##_size_rh;					\
 	_RH_KABI_EXCLUDE(struct _struct##_rh _rh)
-#define RH_KABI_SIZE_AND_EXTEND(_struct)				\
-	_RH_KABI_SIZE_AND_EXTEND(_struct);
+#define RH_KABI_AUX_EMBED(_struct)					\
+	_RH_KABI_AUX_EMBED(_struct);
 
 /*
- * RH_KABI_SET_SIZE calculates and sets the size of the extended struct and
+ * RH_KABI_AUX_SET_SIZE calculates and sets the size of the extended struct and
  * stores it in the size_rh field for structs that are dynamically allocated.
  * This macro MUST be called when expanding a base struct with
- * RH_KABI_SIZE_AND_EXTEND, and it MUST be called from the allocation site
+ * RH_KABI_AUX, and it MUST be called from the allocation site
  * regardless of being allocated in the kernel or a module.
  * Note: since this macro is intended to be invoked outside of a struct,
  * a semicolon is necessary at the end of the line where it is invoked.
  */
-#define RH_KABI_SET_SIZE(_name, _struct) ({				\
+#define RH_KABI_AUX_SET_SIZE(_name, _struct) ({				\
 	(_name)->_struct##_size_rh = sizeof(struct _struct##_rh);	\
 })
 
 /*
- * RH_KABI_INIT_SIZE calculates and sets the size of the extended struct and
+ * RH_KABI_AUX_INIT_SIZE calculates and sets the size of the extended struct and
  * stores it in the size_rh field for structs that are statically allocated.
  * This macro MUST be called when expanding a base struct with
- * RH_KABI_SIZE_AND_EXTEND, and it MUST be called from the declaration site
+ * RH_KABI_AUX, and it MUST be called from the declaration site
  * regardless of being allocated in the kernel or a module.
  */
-#define RH_KABI_INIT_SIZE(_struct)					\
+#define RH_KABI_AUX_INIT_SIZE(_struct)					\
 	._struct##_size_rh = sizeof(struct _struct##_rh),
 
 /*
- * RH_KABI_CHECK_EXT verifies allocated memory exists.  This MUST be called to
+ * RH_KABI_AUX verifies allocated memory exists.  This MUST be called to
  * verify that memory in the _rh struct is valid, and can be called
- * regardless if RH_KABI_SIZE_AND_EXTEND or RH_KABI_SIZE_AND_EXTEND_PTR is
+ * regardless if RH_KABI_AUX_EMBED or RH_KABI_AUX_PTR is
  * used.
  */
-#define RH_KABI_CHECK_EXT(_ptr, _struct, _field) ({			\
+#define RH_KABI_AUX(_ptr, _struct, _field) ({				\
 	size_t __off = offsetof(struct _struct##_rh, _field);		\
 	(_ptr)->_struct##_size_rh > __off ? true : false;		\
 })
