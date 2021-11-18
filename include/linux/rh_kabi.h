@@ -286,7 +286,7 @@
  * Macros for breaking up a reserved element into two smaller chunks using
  * an anonymous struct inside an anonymous union.
  */
-# define RH_KABI_USE2(n, _new1, _new2)	RH_KABI_REPLACE(_RH_KABI_RESERVE(n), struct{ _new1; _new2; })
+# define RH_KABI_USE_SPLIT(n, ...)	RH_KABI_REPLACE_SPLIT(_RH_KABI_RESERVE(n), __VA_ARGS__)
 
 /*
  * We tried to standardize on Red Hat reserved names.  These wrappers
