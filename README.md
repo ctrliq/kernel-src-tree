@@ -50,6 +50,23 @@ executed from the top level of documentation:
 Users making changes must include a "Signed-off-by:" tag on all commits that
 acknowledges the DCO, https://developercertificate.org.
 
+**owners.yaml Merge Request Approval Rules**
+
+1.  Included and excluded file changes can be merged if the MR author is a subsystem maintainer.
+If the author is not a subsystem maintainer, then the subsystem maintainer must provide an approve.
+
+2.  Any MR adding an engineer in a role must be authored by or approved by the added engineer.
+An additional approve from a subsystem maintainer is required, unless the maintainer is the author
+of the MR.
+
+3.  Any MR removing an engineer in a role must be authored by or approved by the removed engineer,
+except in the case when the removed engineer is no longer with Red Hat.  While removals from roles
+do not require the approve of the maintainer, MR authors are encouraged to add the maintainer for
+an approve.
+
+MR authors, reviewers, and maintainers should discuss disagreements about ownership or role changes
+with their management.
+
 **Project Layout**
 
 The layout is
