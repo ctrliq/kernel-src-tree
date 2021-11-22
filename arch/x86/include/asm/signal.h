@@ -42,6 +42,7 @@ typedef struct {
 #endif
 
 #ifndef CONFIG_COMPAT
+#define compat_sigset_t compat_sigset_t
 typedef sigset_t compat_sigset_t;
 #endif
 
