@@ -1237,9 +1237,6 @@ static int gfs2_lock(struct file *file, int cmd, struct file_lock *fl)
 
 	if (!(fl->fl_flags & FL_POSIX))
 		return -ENOLCK;
-	if (__mandatory_lock(&ip->i_inode) && fl->fl_type != F_UNLCK)
-		return -ENOLCK;
-
 	if (cmd == F_CANCELLK) {
 		/* Hack: */
 		cmd = F_SETLK;
@@ -1341,8 +1338,6 @@ static int gfs2_flock(struct file *file, int cmd, struct file_lock *fl)
 {
 	if (!(fl->fl_flags & FL_FLOCK))
 		return -ENOLCK;
-	if (fl->fl_type & LOCK_MAND)
-		return -EOPNOTSUPP;
 
 	if (fl->fl_type == F_UNLCK) {
 		do_unflock(file, fl);
