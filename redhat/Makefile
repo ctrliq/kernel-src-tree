@@ -2,6 +2,9 @@ GIT ?= git
 include Makefile.common
 include Makefile.rhpkg
 
+# This is for automotive kernel
+include Makefile.auto
+
 LANG=C
 
 ifeq ("$(ZSTREAM)", "yes")
@@ -385,17 +388,27 @@ dist-fedora-release: git-tree-check
 dist-fedora-release-push: export DIST_PUSH="1"
 dist-fedora-release-push: dist-fedora-release
 
-.PHONY: dist-brew dist-koji
+.PHONY: dist-brew dist-koji dist-cbs
 dist-brew : BUILD_FLAGS ?= $(BREW_FLAGS) $(TEST_FLAGS)
 dist-koji : BUILD_FLAGS ?= $(KOJI_FLAGS) $(TEST_FLAGS)
+dist-cbs  : BUILD_FLAGS ?= $(CBS_FLAGS) $(TEST_FLAGS)
 distg-brew: BUILD_FLAGS ?= $(BREW_FLAGS) $(TEST_FLAGS)
 distg-koji: BUILD_FLAGS ?= $(KOJI_FLAGS) $(TEST_FLAGS)
+distg-cbs : BUILD_FLAGS ?= $(CBS_FLAGS) $(TEST_FLAGS)
 
-dist-brew dist-koji: dist-%: dist-srpm
+dist-brew dist-koji dist-cbs: dist-%: dist-srpm
 	$* $(BUILD_PROFILE) build $(BUILD_FLAGS) $(BUILD_TARGET) $(SRPMS)/$(PACKAGE_NAME)-$(KVERSION)-$(PKGRELEASE)$(SRPM_DIST).src.rpm $(OUTPUT_FILE)
 
 distg-brew distg-koji: distg-%:
 	$* $(BUILD_PROFILE) build $(BUILD_FLAGS) $(BUILD_TARGET) "$(RHGITURL)?redhat/koji#$(RHGITCOMMIT)"
+
+distg-cbs: distg-%:
+	$* $(BUILD_PROFILE) build $(BUILD_FLAGS) $(BUILD_TARGET) "$(CSGITURL)$(PACKAGE_NAME).git#$(AUTOGITCOMMIT)"
+
+dist-auto-sig-release: dist-sources
+	$(REDHAT)/scripts/automotive_build_sig.sh "$(AUTOSIG_BRANCH)" "$(RHDISTGIT_CACHE)" "$(RHDISTGIT_TMP)" "$(TARBALL)" "$(PACKAGE_NAME)"
+
+dist-auto-sig: dist-auto-sig-release distg-cbs
 
 .PHONY: $(REDHAT)/rpm/SOURCES/$(PACKAGE_NAME).spec
 $(REDHAT)/rpm/SOURCES/$(PACKAGE_NAME).spec:
@@ -453,6 +466,8 @@ dist-help:
 	@echo  '  dist-all-rpms       - Create a source RPM and build binary RPMs locally.'
 	@echo  '  dist-brew           - Create a source RPM and call brew to build binary RPMs.'
 	@echo  '  distg-brew          - Build RPMs using a remote git repo.'
+	@echo  '  dist-cbs            - Create a source RPM and call cbs to build binary RPMs.'
+	@echo  '  distg-cbs           - Build RPMs using a remote git repo.'
 	@echo  '                        [Configuration needed.]'
 	@echo  '  dist-cross-all-rpms - Build RPMs for all supported archs using a cross'
 	@echo  '                        compiler.'
@@ -489,6 +504,9 @@ dist-full-help:
 	@echo  '  dist-koji       - Create a kernel SRPM and then call koji to build the'
 	@echo  '                    created SRPM.  See the dist-brew target for available'
 	@echo  '                    options.'
+	@echo  '  dist-cbs        - Create a kernel SRPM and then call cbs to build the'
+	@echo  '                    created SRPM.  See the dist-brew target for available'
+	@echo  '                    options.'
 	@echo  '  distg-brew      - Pass HEAD of the current git branch to brew to build an'
 	@echo  '                    RPM set.  Do not forget to push to the remote repository'
 	@echo  '                    first.  Preceed make command by RHGITCOMMIT=<commitID>'
@@ -496,6 +514,10 @@ dist-full-help:
 	@echo  '                    To set the remote repo, invoke:'
 	@echo  '                         git config rhg.url git://<repo_path>'
 	@echo  '  distg-koji      - Pass HEAD of the current git branch to koji to build an'
+	@echo  '                    RPM set.  Do not forget to push to the remote repository'
+	@echo  '                    first.  See the distg-brew target for options and'
+	@echo  '                    configuration.'
+	@echo  '  distg-cbs       - Pass HEAD of the current git branch to cbs to build an'
 	@echo  '                    RPM set.  Do not forget to push to the remote repository'
 	@echo  '                    first.  See the distg-brew target for options and'
 	@echo  '                    configuration.'
