@@ -3879,7 +3879,12 @@ static int can_idmap_mount(const struct mount_kattr *kattr, struct mount *mnt)
 	if (!is_anon_ns(mnt->mnt_ns))
 		return -EINVAL;
 
-	return 0;
+	/*
+	 * So far, there are serious concerns about the safety of idmaps.
+	 * This mechanism requires further upstream review.
+	 */
+	pr_warn_once("VFS: idmapped mount is not enabled.\n");
+	return -EPERM;
 }
 
 static struct mount *mount_setattr_prepare(struct mount_kattr *kattr,
