@@ -50,6 +50,24 @@ executed from the top level of documentation:
 Users making changes must include a "Signed-off-by:" tag on all commits that
 acknowledges the DCO, https://developercertificate.org.
 
+*** How to create a git commit ***
+
+1. Fork https://gitlab.com/redhat/rhel/src/kernel/documentation in Gitlab
+2. Git clone your forked repository and create a private branch for your changes
+3. Don't touch the RHMAINTAINERS & CODEOWNERS files - only edit info/owners.yaml
+4. Run `make` after changing info/onwners.yaml but before before you `git commit`
+5. Git push your private branch to Gitlab and create your merge request
+
+```
+$ git checkout -b my_changes
+$ vi info/owners.yaml
+$ make
+$ git add --all
+$ git commit --signoff
+$ git push origin my_changes
+$ make clean
+```
+
 **owners.yaml Merge Request Approval Rules**
 
 1.  Included and excluded file changes can be merged if the MR author is a subsystem maintainer.
