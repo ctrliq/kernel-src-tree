@@ -221,12 +221,18 @@ static int sgx_vepc_release(struct inode *inode, struct file *file)
 static int sgx_vepc_open(struct inode *inode, struct file *file)
 {
 	struct sgx_vepc *vepc;
+	static bool warned = false;
 
 	vepc = kzalloc(sizeof(struct sgx_vepc), GFP_KERNEL);
 	if (!vepc)
 		return -ENOMEM;
 	mutex_init(&vepc->lock);
 	xa_init(&vepc->page_array);
+
+	if (!warned) {
+		mark_tech_preview("Intel Software Guard Extensions (SGX)", NULL);
+		warned = true;
+	}
 
 	file->private_data = vepc;
 
