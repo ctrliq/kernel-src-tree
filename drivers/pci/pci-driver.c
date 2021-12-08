@@ -297,7 +297,7 @@ static struct attribute *pci_drv_attrs[] = {
 };
 ATTRIBUTE_GROUPS(pci_drv);
 
-#if CONFIG_RHEL_DIFFERENCES
+#ifdef CONFIG_RHEL_DIFFERENCES
 /**
  * pci_hw_deprecated - Tell if a PCI device is deprecated
  * @ids: array of PCI device id structures to search in
