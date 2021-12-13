@@ -77,4 +77,4 @@ upload_sources || die "Unable to upload the sources"
 update_patches || die "Unable to copy the patches";
 
 # all done
-echo "IMPORTANT: Remember to commit your changes here...";
+echo "dist-git updated here: $tmp"

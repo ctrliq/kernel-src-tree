@@ -240,7 +240,7 @@ setup-source: dist-git-version-check dist-clean-sources
 		cp $(REDHAT)/$(CHANGELOG_PREV) $(REDHAT)/$(CHANGELOG); \
 	fi
 	@cp $(REDHAT)/$(CHANGELOG) $(SOURCES)/$(CHANGELOG)
-	@$(REDHAT)/genspec.sh $(SOURCES) $(SOURCES)/$(SPECFILE) $(PACKAGE_NAME) $(SOURCES)/$(CHANGELOG) $(PKGRELEASE) $(RPMKVERSION) $(RPMKPATCHLEVEL) $(RPMKSUBLEVEL) $(DISTRO_BUILD) $(RELEASED_KERNEL) $(SPECRELEASE) $(__ZSTREAM) "$(BUILDOPTS)" $(RTBUILD) $(MARKER) `cat $(REDHAT)/marker` $(SINGLE_TARBALL) $(TARFILE_RELEASE) $(SNAPSHOT) $(UPSTREAM_BRANCH) $(INCLUDE_FEDORA_FILES) $(INCLUDE_RHEL_FILES) $(BUILDID)
+	@$(REDHAT)/genspec.sh $(SOURCES) $(SOURCES)/$(SPECFILE) $(PACKAGE_NAME) $(SOURCES)/$(CHANGELOG) $(PKGRELEASE) $(RPMKVERSION) $(RPMKPATCHLEVEL) $(RPMKSUBLEVEL) $(DISTRO_BUILD) $(RELEASED_KERNEL) $(SPECRELEASE) $(__ZSTREAM) "$(BUILDOPTS)" $(AUTOMOTIVEBUILD) $(MARKER) `cat $(REDHAT)/marker` $(SINGLE_TARBALL) $(TARFILE_RELEASE) $(SNAPSHOT) $(UPSTREAM_BRANCH) $(INCLUDE_FEDORA_FILES) $(INCLUDE_RHEL_FILES) $(BUILDID)
 	@cp $(SOURCES)/$(SPECFILE) $(SOURCES)/../SPECS/
 
 generate-testpatch-tmp:
@@ -349,7 +349,7 @@ dist-release-changed: setup-source
 		echo "Nothing changed, skipping updates"; \
 	else \
 		$(GIT) checkout -- $(REDHAT)/$(CHANGELOG); \
-		$(REDHAT)/scripts/new_release.sh $(REDHAT) $(__YSTREAM) $(__ZSTREAM) $(BUMP_RELEASE) $(RTBUILD); \
+		$(REDHAT)/scripts/new_release.sh $(REDHAT) $(__YSTREAM) $(__ZSTREAM) $(BUMP_RELEASE) $(AUTOMOTIVEBUILD); \
 		$(MAKE) dist-release-finish; \
 	fi
 dist-release: dist-clean-sources
@@ -405,10 +405,45 @@ distg-brew distg-koji: distg-%:
 distg-cbs: distg-%:
 	$* $(BUILD_PROFILE) build $(BUILD_FLAGS) $(BUILD_TARGET) "$(CSGITURL)$(PACKAGE_NAME).git#$(AUTOGITCOMMIT)"
 
-dist-auto-sig-release: dist-sources
+dist-auto-release-finish: setup-source
+	@cp $(SOURCES)/$(CHANGELOG) $(REDHAT)/$(CHANGELOG)
+	@$(GIT) add $(REDHAT)/$(CHANGELOG)
+	@$(GIT) add $(REDHAT)/marker
+	@echo "[redhat] $(PACKAGE_NAME)-$(STAMP_VERSION)-$(PKGRELEASE)" > /tmp/rtkcommit
+	@echo "" >> /tmp/rtkcommit
+	@$(GIT) commit -F /tmp/rtkcommit -s ../Makefile.rhelver $(REDHAT)/marker $(REDHAT)/$(CHANGELOG) kernel.spec.template Makefile.auto
+
+dist-auto-release-changed: setup-source
+	@cp $(SOURCES)/$(CHANGELOG) $(REDHAT)/$(CHANGELOG)
+	@echo $(MARKER) > $(REDHAT)/marker
+	@# if neither changelog nor marker was updated, skip bumping a release
+	@$(GIT) update-index -q --really-refresh
+	@if $(GIT) diff-index --quiet HEAD; then \
+		echo "Nothing changed, skipping updates"; \
+	else \
+		$(GIT) checkout -- $(REDHAT)/$(CHANGELOG); \
+		$(REDHAT)/scripts/new_release.sh $(REDHAT) $(__YSTREAM) $(__ZSTREAM) $(BUMP_RELEASE) $(AUTOMOTIVEBUILD); \
+	fi
+
+dist-auto-build-sig:
 	$(REDHAT)/scripts/automotive_build_sig.sh "$(AUTOSIG_BRANCH)" "$(RHDISTGIT_CACHE)" "$(RHDISTGIT_TMP)" "$(TARBALL)" "$(PACKAGE_NAME)"
 
-dist-auto-sig: dist-auto-sig-release distg-cbs
+dist-auto-sig-release: dist-clean-sources
+	@# generate new version
+	@$(MAKE) dist-auto-release-changed
+	@$(MAKE) dist-sources
+	@# if no changes were made then we don't need to update the repos
+	@if $(GIT) diff-index --quiet HEAD; then \
+		echo "No changes, nothing to commit"; \
+	else \
+		echo "Update dist-git"; \
+		$(MAKE) dist-auto-build-sig; \
+		echo "Commit source-git changes"; \
+		$(MAKE) dist-auto-release-finish; \
+	fi
+
+dist-auto-sig: dist-auto-sig-release
+	@$(MAKE) distg-cbs
 
 .PHONY: $(REDHAT)/rpm/SOURCES/$(PACKAGE_NAME).spec
 $(REDHAT)/rpm/SOURCES/$(PACKAGE_NAME).spec:
