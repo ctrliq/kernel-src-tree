@@ -406,11 +406,6 @@ static bool inode_do_switch_wbs(struct inode *inode,
 		inc_wb_stat(new_wb, WB_WRITEBACK);
 	}
 
-	if (mapping_tagged(mapping, PAGECACHE_TAG_WRITEBACK)) {
-		atomic_dec(&old_wb->writeback_inodes);
-		atomic_inc(&new_wb->writeback_inodes);
-	}
-
 	wb_get(new_wb);
 
 	/*
@@ -1039,20 +1034,20 @@ restart:
  * cgroup_writeback_by_id - initiate cgroup writeback from bdi and memcg IDs
  * @bdi_id: target bdi id
  * @memcg_id: target memcg css id
+ * @nr: number of pages to write, 0 for best-effort dirty flushing
  * @reason: reason why some writeback work initiated
  * @done: target wb_completion
  *
  * Initiate flush of the bdi_writeback identified by @bdi_id and @memcg_id
  * with the specified parameters.
  */
-int cgroup_writeback_by_id(u64 bdi_id, int memcg_id,
+int cgroup_writeback_by_id(u64 bdi_id, int memcg_id, unsigned long nr,
 			   enum wb_reason reason, struct wb_completion *done)
 {
 	struct backing_dev_info *bdi;
 	struct cgroup_subsys_state *memcg_css;
 	struct bdi_writeback *wb;
 	struct wb_writeback_work *work;
-	unsigned long dirty;
 	int ret;
 
 	/* lookup bdi and memcg */
@@ -1081,22 +1076,24 @@ int cgroup_writeback_by_id(u64 bdi_id, int memcg_id,
 	}
 
 	/*
-	 * The caller is attempting to write out most of
+	 * If @nr is zero, the caller is attempting to write out most of
 	 * the currently dirty pages.  Let's take the current dirty page
 	 * count and inflate it by 25% which should be large enough to
 	 * flush out most dirty pages while avoiding getting livelocked by
 	 * concurrent dirtiers.
-	 *
-	 * BTW the memcg stats are flushed periodically and this is best-effort
-	 * estimation, so some potential error is ok.
 	 */
-	dirty = memcg_page_state(mem_cgroup_from_css(memcg_css), NR_FILE_DIRTY);
-	dirty = dirty * 10 / 8;
+	if (!nr) {
+		unsigned long filepages, headroom, dirty, writeback;
+
+		mem_cgroup_wb_stats(wb, &filepages, &headroom, &dirty,
+				      &writeback);
+		nr = dirty * 10 / 8;
+	}
 
 	/* issue the writeback work */
 	work = kzalloc(sizeof(*work), GFP_NOWAIT | __GFP_NOWARN);
 	if (work) {
-		work->nr_pages = dirty;
+		work->nr_pages = nr;
 		work->sync_mode = WB_SYNC_NONE;
 		work->range_cyclic = 1;
 		work->reason = reason;
@@ -2002,6 +1999,7 @@ static long writeback_inodes_wb(struct bdi_writeback *wb, long nr_pages,
 static long wb_writeback(struct bdi_writeback *wb,
 			 struct wb_writeback_work *work)
 {
+	unsigned long wb_start = jiffies;
 	long nr_pages = work->nr_pages;
 	unsigned long dirtied_before = jiffies;
 	struct inode *inode;
@@ -2054,6 +2052,8 @@ static long wb_writeback(struct bdi_writeback *wb,
 		else
 			progress = __writeback_inodes_wb(wb, work);
 		trace_writeback_written(wb, work);
+
+		wb_update_bandwidth(wb, wb_start);
 
 		/*
 		 * Did we write something? Try for more

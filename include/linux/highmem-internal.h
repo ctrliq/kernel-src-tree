@@ -90,11 +90,7 @@ static inline void __kunmap_local(void *vaddr)
 
 static inline void *kmap_atomic_prot(struct page *page, pgprot_t prot)
 {
-	if (IS_ENABLED(CONFIG_PREEMPT_RT))
-		migrate_disable();
-	else
-		preempt_disable();
-
+	preempt_disable();
 	pagefault_disable();
 	return __kmap_local_page_prot(page, prot);
 }
@@ -106,11 +102,7 @@ static inline void *kmap_atomic(struct page *page)
 
 static inline void *kmap_atomic_pfn(unsigned long pfn)
 {
-	if (IS_ENABLED(CONFIG_PREEMPT_RT))
-		migrate_disable();
-	else
-		preempt_disable();
-
+	preempt_disable();
 	pagefault_disable();
 	return __kmap_local_pfn_prot(pfn, kmap_prot);
 }
@@ -119,10 +111,7 @@ static inline void __kunmap_atomic(void *addr)
 {
 	kunmap_local_indexed(addr);
 	pagefault_enable();
-	if (IS_ENABLED(CONFIG_PREEMPT_RT))
-		migrate_enable();
-	else
-		preempt_enable();
+	preempt_enable();
 }
 
 unsigned int __nr_free_highpages(void);
@@ -190,10 +179,7 @@ static inline void __kunmap_local(void *addr)
 
 static inline void *kmap_atomic(struct page *page)
 {
-	if (IS_ENABLED(CONFIG_PREEMPT_RT))
-		migrate_disable();
-	else
-		preempt_disable();
+	preempt_disable();
 	pagefault_disable();
 	return page_address(page);
 }
@@ -214,10 +200,7 @@ static inline void __kunmap_atomic(void *addr)
 	kunmap_flush_on_unmap(addr);
 #endif
 	pagefault_enable();
-	if (IS_ENABLED(CONFIG_PREEMPT_RT))
-		migrate_enable();
-	else
-		preempt_enable();
+	preempt_enable();
 }
 
 static inline unsigned int nr_free_highpages(void) { return 0; }

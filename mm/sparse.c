@@ -109,6 +109,32 @@ static inline int sparse_index_init(unsigned long section_nr, int nid)
 }
 #endif
 
+#ifdef CONFIG_SPARSEMEM_EXTREME
+unsigned long __section_nr(struct mem_section *ms)
+{
+	unsigned long root_nr;
+	struct mem_section *root = NULL;
+
+	for (root_nr = 0; root_nr < NR_SECTION_ROOTS; root_nr++) {
+		root = __nr_to_section(root_nr * SECTIONS_PER_ROOT);
+		if (!root)
+			continue;
+
+		if ((ms >= root) && (ms < (root + SECTIONS_PER_ROOT)))
+		     break;
+	}
+
+	VM_BUG_ON(!root);
+
+	return (root_nr * SECTIONS_PER_ROOT) + (ms - root);
+}
+#else
+unsigned long __section_nr(struct mem_section *ms)
+{
+	return (unsigned long)(ms - mem_section[0]);
+}
+#endif
+
 /*
  * During early boot, before section_mem_map is used for an actual
  * mem_map, we use section_mem_map to store the section's NUMA
@@ -117,7 +143,7 @@ static inline int sparse_index_init(unsigned long section_nr, int nid)
  */
 static inline unsigned long sparse_encode_early_nid(int nid)
 {
-	return ((unsigned long)nid << SECTION_NID_SHIFT);
+	return (nid << SECTION_NID_SHIFT);
 }
 
 static inline int sparse_early_nid(struct mem_section *section)
@@ -161,9 +187,10 @@ void __meminit mminit_validate_memmodel_limits(unsigned long *start_pfn,
  * those loops early.
  */
 unsigned long __highest_present_section_nr;
-static void __section_mark_present(struct mem_section *ms,
-		unsigned long section_nr)
+static void section_mark_present(struct mem_section *ms)
 {
+	unsigned long section_nr = __section_nr(ms);
+
 	if (section_nr > __highest_present_section_nr)
 		__highest_present_section_nr = section_nr;
 
@@ -253,7 +280,7 @@ static void __init memory_present(int nid, unsigned long start, unsigned long en
 		if (!ms->section_mem_map) {
 			ms->section_mem_map = sparse_encode_early_nid(nid) |
 							SECTION_IS_ONLINE;
-			__section_mark_present(ms, section);
+			section_mark_present(ms);
 		}
 	}
 }
@@ -321,8 +348,7 @@ size_t mem_section_usage_size(void)
 static inline phys_addr_t pgdat_to_phys(struct pglist_data *pgdat)
 {
 #ifndef CONFIG_NUMA
-	VM_BUG_ON(pgdat != &contig_page_data);
-	return __pa_symbol(&contig_page_data);
+	return __pa_symbol(pgdat);
 #else
 	return __pa(pgdat);
 #endif
@@ -436,7 +462,8 @@ struct page __init *__populate_section_memmap(unsigned long pfn,
 	if (map)
 		return map;
 
-	map = memmap_alloc(size, size, addr, nid, false);
+	map = memblock_alloc_try_nid_raw(size, size, addr,
+					  MEMBLOCK_ALLOC_ACCESSIBLE, nid);
 	if (!map)
 		panic("%s: Failed to allocate %lu bytes align=0x%lx nid=%d from=%pa\n",
 		      __func__, size, PAGE_SIZE, nid, &addr);
@@ -463,7 +490,8 @@ static void __init sparse_buffer_init(unsigned long size, int nid)
 	 * and we want it to be properly aligned to the section size - this is
 	 * especially the case for VMEMMAP which maps memmap to PMDs
 	 */
-	sparsemap_buf = memmap_alloc(size, section_map_size(), addr, nid, true);
+	sparsemap_buf = memblock_alloc_exact_nid_raw(size, section_map_size(),
+					addr, MEMBLOCK_ALLOC_ACCESSIBLE, nid);
 	sparsemap_buf_end = sparsemap_buf + size;
 }
 
@@ -906,7 +934,7 @@ int __meminit sparse_add_section(int nid, unsigned long start_pfn,
 
 	ms = __nr_to_section(section_nr);
 	set_section_nid(section_nr, nid);
-	__section_mark_present(ms, section_nr);
+	section_mark_present(ms);
 
 	/* Align memmap to section boundary in the subsection case */
 	if (section_nr_to_pfn(section_nr) != start_pfn)

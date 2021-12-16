@@ -306,14 +306,16 @@ __reset_isolation_pfn(struct zone *zone, unsigned long pfn, bool check_source,
 	 * is necessary for the block to be a migration source/target.
 	 */
 	do {
-		if (check_source && PageLRU(page)) {
-			clear_pageblock_skip(page);
-			return true;
-		}
+		if (pfn_valid_within(pfn)) {
+			if (check_source && PageLRU(page)) {
+				clear_pageblock_skip(page);
+				return true;
+			}
 
-		if (check_target && PageBuddy(page)) {
-			clear_pageblock_skip(page);
-			return true;
+			if (check_target && PageBuddy(page)) {
+				clear_pageblock_skip(page);
+				return true;
+			}
 		}
 
 		page += (1 << PAGE_ALLOC_COSTLY_ORDER);
@@ -583,6 +585,8 @@ static unsigned long isolate_freepages_block(struct compact_control *cc,
 			break;
 
 		nr_scanned++;
+		if (!pfn_valid_within(blockpfn))
+			goto isolate_fail;
 
 		/*
 		 * For compound pages such as THP and hugetlbfs, we can save
@@ -881,6 +885,8 @@ isolate_migratepages_block(struct compact_control *cc, unsigned long low_pfn,
 			cond_resched();
 		}
 
+		if (!pfn_valid_within(low_pfn))
+			goto isolate_fail;
 		nr_scanned++;
 
 		page = pfn_to_page(low_pfn);
@@ -2392,7 +2398,7 @@ compact_zone(struct compact_control *cc, struct capture_control *capc)
 
 		err = migrate_pages(&cc->migratepages, compaction_alloc,
 				compaction_free, (unsigned long)cc, cc->mode,
-				MR_COMPACTION, NULL);
+				MR_COMPACTION);
 
 		trace_mm_compaction_migratepages(cc->nr_migratepages, err,
 							&cc->migratepages);
@@ -2700,30 +2706,6 @@ static void compact_nodes(void)
  */
 unsigned int __read_mostly sysctl_compaction_proactiveness = 20;
 
-int compaction_proactiveness_sysctl_handler(struct ctl_table *table, int write,
-		void *buffer, size_t *length, loff_t *ppos)
-{
-	int rc, nid;
-
-	rc = proc_dointvec_minmax(table, write, buffer, length, ppos);
-	if (rc)
-		return rc;
-
-	if (write && sysctl_compaction_proactiveness) {
-		for_each_online_node(nid) {
-			pg_data_t *pgdat = NODE_DATA(nid);
-
-			if (pgdat->proactive_compact_trigger)
-				continue;
-
-			pgdat->proactive_compact_trigger = true;
-			wake_up_interruptible(&pgdat->kcompactd_wait);
-		}
-	}
-
-	return 0;
-}
-
 /*
  * This is the entry point for compacting all nodes via
  * /proc/sys/vm/compact_memory
@@ -2768,8 +2750,7 @@ void compaction_unregister_node(struct node *node)
 
 static inline bool kcompactd_work_requested(pg_data_t *pgdat)
 {
-	return pgdat->kcompactd_max_order > 0 || kthread_should_stop() ||
-		pgdat->proactive_compact_trigger;
+	return pgdat->kcompactd_max_order > 0 || kthread_should_stop();
 }
 
 static bool kcompactd_node_suitable(pg_data_t *pgdat)
@@ -2904,8 +2885,7 @@ static int kcompactd(void *p)
 {
 	pg_data_t *pgdat = (pg_data_t *)p;
 	struct task_struct *tsk = current;
-	long default_timeout = msecs_to_jiffies(HPAGE_FRAG_CHECK_INTERVAL_MSEC);
-	long timeout = default_timeout;
+	unsigned int proactive_defer = 0;
 
 	const struct cpumask *cpumask = cpumask_of_node(pgdat->node_id);
 
@@ -2920,39 +2900,25 @@ static int kcompactd(void *p)
 	while (!kthread_should_stop()) {
 		unsigned long pflags;
 
-		/*
-		 * Avoid the unnecessary wakeup for proactive compaction
-		 * when it is disabled.
-		 */
-		if (!sysctl_compaction_proactiveness)
-			timeout = MAX_SCHEDULE_TIMEOUT;
 		trace_mm_compaction_kcompactd_sleep(pgdat->node_id);
 		if (wait_event_freezable_timeout(pgdat->kcompactd_wait,
-			kcompactd_work_requested(pgdat), timeout) &&
-			!pgdat->proactive_compact_trigger) {
+			kcompactd_work_requested(pgdat),
+			msecs_to_jiffies(HPAGE_FRAG_CHECK_INTERVAL_MSEC))) {
 
 			psi_memstall_enter(&pflags);
 			kcompactd_do_work(pgdat);
 			psi_memstall_leave(&pflags);
-			/*
-			 * Reset the timeout value. The defer timeout from
-			 * proactive compaction is lost here but that is fine
-			 * as the condition of the zone changing substantionally
-			 * then carrying on with the previous defer interval is
-			 * not useful.
-			 */
-			timeout = default_timeout;
 			continue;
 		}
 
-		/*
-		 * Start the proactive work with default timeout. Based
-		 * on the fragmentation score, this timeout is updated.
-		 */
-		timeout = default_timeout;
+		/* kcompactd wait timeout */
 		if (should_proactive_compact_node(pgdat)) {
 			unsigned int prev_score, score;
 
+			if (proactive_defer) {
+				proactive_defer--;
+				continue;
+			}
 			prev_score = fragmentation_score_node(pgdat);
 			proactive_compact_node(pgdat);
 			score = fragmentation_score_node(pgdat);
@@ -2960,12 +2926,9 @@ static int kcompactd(void *p)
 			 * Defer proactive compaction if the fragmentation
 			 * score did not go down i.e. no progress made.
 			 */
-			if (unlikely(score >= prev_score))
-				timeout =
-				   default_timeout << COMPACT_MAX_DEFER_SHIFT;
+			proactive_defer = score < prev_score ?
+					0 : 1 << COMPACT_MAX_DEFER_SHIFT;
 		}
-		if (unlikely(pgdat->proactive_compact_trigger))
-			pgdat->proactive_compact_trigger = false;
 	}
 
 	return 0;

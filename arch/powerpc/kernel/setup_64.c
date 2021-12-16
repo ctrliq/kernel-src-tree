@@ -913,7 +913,7 @@ void __init setup_per_cpu_areas(void)
 }
 #endif
 
-#ifdef CONFIG_MEMORY_HOTPLUG
+#ifdef CONFIG_MEMORY_HOTPLUG_SPARSE
 unsigned long memory_block_size_bytes(void)
 {
 	if (ppc_md.memory_block_size)
