@@ -42,6 +42,8 @@
 
 #include <linux/pci_ids.h>
 
+#include <linux/rh_kabi.h>
+
 #define PCI_STATUS_ERROR_BITS (PCI_STATUS_DETECTED_PARITY  | \
 			       PCI_STATUS_SIG_SYSTEM_ERROR | \
 			       PCI_STATUS_REC_MASTER_ABORT | \
@@ -69,7 +71,7 @@
 struct pci_slot {
 	struct pci_bus		*bus;		/* Bus this slot is on */
 	struct list_head	list;		/* Node in list of slots */
-	struct hotplug_slot	*hotplug;	/* Hotplug info (move here) */
+	RH_KABI_EXCLUDE(struct hotplug_slot	*hotplug)	/* Hotplug info (move here) */
 	unsigned char		number;		/* PCI_SLOT(pci_dev->devfn) */
 	struct kobject		kobj;
 };
