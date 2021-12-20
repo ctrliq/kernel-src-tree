@@ -2109,6 +2109,12 @@ static void __split_huge_pmd_locked(struct vm_area_struct *vma, pmd_t *pmd,
 		/* Sub-page mapcount accounting for above small mappings. */
 		int val = 1;
 
+		/*
+		 * lock_page_memcg() is taken before
+		 * page_trans_huge_mapcount_lock() in
+		 * page_remove_anon_compound_rmap().
+		 */
+		lock_page_memcg(page);
 		page_trans_huge_mapcount_lock(page);
 
 		/*
@@ -2124,7 +2130,6 @@ static void __split_huge_pmd_locked(struct vm_area_struct *vma, pmd_t *pmd,
 		for (i = 0; i < HPAGE_PMD_NR; i++)
 			atomic_add(val, &page[i]._mapcount);
 
-		lock_page_memcg(page);
 		if (atomic_add_negative(-1, compound_mapcount_ptr(page))) {
 			/* Last compound_mapcount is gone. */
 			__mod_lruvec_page_state(page, NR_ANON_THPS,
@@ -2135,7 +2140,6 @@ static void __split_huge_pmd_locked(struct vm_area_struct *vma, pmd_t *pmd,
 					atomic_dec(&page[i]._mapcount);
 			}
 		}
-		unlock_page_memcg(page);
 
 		/*
 		 * Here a smp_wmb() is needed to make the pte writes visible
@@ -2143,6 +2147,7 @@ static void __split_huge_pmd_locked(struct vm_area_struct *vma, pmd_t *pmd,
 		 * page_trans_huge_mapcount_unlock().
 		 */
 		page_trans_huge_mapcount_unlock(page);
+		unlock_page_memcg(page);
 	} else
 		smp_wmb(); /* make pte visible before pmd */
 
