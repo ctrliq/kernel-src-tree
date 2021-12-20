@@ -2934,6 +2934,11 @@ static inline int vm_fault_to_errno(vm_fault_t vm_fault, int foll_flags)
 	return 0;
 }
 
+extern bool gup_must_unshare(unsigned int flags, struct page *page,
+			     bool is_head);
+extern bool gup_must_unshare_irqsafe(unsigned int flags, struct page *page,
+				     bool is_head);
+
 typedef int (*pte_fn_t)(pte_t *pte, unsigned long addr, void *data);
 extern int apply_to_page_range(struct mm_struct *mm, unsigned long address,
 			       unsigned long size, pte_fn_t fn, void *data);

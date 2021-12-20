@@ -29,6 +29,94 @@ struct follow_page_context {
 	unsigned int page_mask;
 };
 
+static __always_inline bool is_fast_only_in_irq(bool irq_safe)
+{
+	/*
+	 * If irq_safe == true, we can still spin on the mapcount
+	 * seqlock as long as we're not in irq context. Only the
+	 * gup/pin_fast_only() can be invoked in irq context. This
+	 * means all gup/pin_fast() will always obtain an accurate
+	 * reading of the mapcount.
+	 */
+	return irq_safe && unlikely(!!irq_count());
+}
+
+static bool gup_must_unshare_slowpath(struct page *page)
+{
+	bool must_unshare;
+	/*
+	 * NOTE: the mapcount of the anon page is 1 here, so there's
+	 * not going to be much contention in trylock_page().
+	 *
+	 * If trylock_page() fails (for example if the VM temporarily
+	 * holds the lock), just defer the blocking point to
+	 * wp_page_unshare() that will invoke lock_page().
+	 */
+	if (!trylock_page(page))
+		return true;
+	must_unshare = !reuse_swap_page(page, NULL);
+	unlock_page(page);
+	return must_unshare;
+}
+
+/*
+ * For a page wrprotected in the pgtable, which pages do we need to
+ * unshare with copy-on-read (COR) for the GUP pin to remain coherent
+ * with the MM?
+ *
+ * This only provides full coherency to short term pins: FOLL_LONGTERM
+ * still needs to specify FOLL_WRITE|FOLL_FORCE in the caller and in
+ * turn it still risks inefficiency and to lose coherency with the MM
+ * in various cases.
+ */
+static __always_inline bool __gup_must_unshare(unsigned int flags,
+					       struct page *page,
+					       bool is_head, bool irq_safe)
+{
+	if (flags & FOLL_WRITE)
+		return false;
+	/* mmu notifier doesn't need unshare */
+	if (!(flags & (FOLL_GET|FOLL_PIN)))
+		return false;
+	if (!PageAnon(page))
+		return false;
+	if (PageKsm(page))
+		return false;
+	if (PageHuge(page)) /* FIXME */
+		return false;
+	if (is_head) {
+		if (PageTransHuge(page)) {
+			if (!is_fast_only_in_irq(irq_safe)) {
+				if (page_trans_huge_anon_shared(page))
+					return true;
+				return gup_must_unshare_slowpath(page);
+			}
+			return true;
+		}
+		BUG();
+	} else {
+		if (!is_fast_only_in_irq(irq_safe)) {
+			if (page_mapcount(page) > 1)
+				return true;
+			return gup_must_unshare_slowpath(page);
+		}
+		return true;
+	}
+}
+
+/* requires full accuracy */
+bool gup_must_unshare(unsigned int flags, struct page *page, bool is_head)
+{
+	return __gup_must_unshare(flags, page, is_head, false);
+}
+
+/* false positives are allowed, false negatives not allowed */
+bool gup_must_unshare_irqsafe(unsigned int flags, struct page *page,
+			      bool is_head)
+{
+	return __gup_must_unshare(flags, page, is_head, true);
+}
+
 static void hpage_pincount_add(struct page *page, int refs)
 {
 	VM_BUG_ON_PAGE(!hpage_pincount_available(page), page);
