@@ -527,6 +527,7 @@ void prep_transhuge_page(struct page *page)
 
 	INIT_LIST_HEAD(page_deferred_list(page));
 	set_compound_page_dtor(page, TRANSHUGE_PAGE_DTOR);
+	page_mapcount_seq_init(page);
 }
 
 bool is_transparent_hugepage(struct page *page)
@@ -2108,6 +2109,8 @@ static void __split_huge_pmd_locked(struct vm_area_struct *vma, pmd_t *pmd,
 		/* Sub-page mapcount accounting for above small mappings. */
 		int val = 1;
 
+		page_trans_huge_mapcount_lock(page);
+
 		/*
 		 * Set PG_double_map before dropping compound_mapcount to avoid
 		 * false-negative page_mapped().
@@ -2133,9 +2136,16 @@ static void __split_huge_pmd_locked(struct vm_area_struct *vma, pmd_t *pmd,
 			}
 		}
 		unlock_page_memcg(page);
-	}
 
-	smp_wmb(); /* make pte visible before pmd */
+		/*
+		 * Here a smp_wmb() is needed to make the pte writes visible
+		 * before the pmd write and it is provided implicitly by the
+		 * page_trans_huge_mapcount_unlock().
+		 */
+		page_trans_huge_mapcount_unlock(page);
+	} else
+		smp_wmb(); /* make pte visible before pmd */
+
 	pmd_populate(mm, pmd, pgtable);
 
 	if (freeze) {
@@ -2500,23 +2510,32 @@ static void __split_huge_page(struct page *page, struct list_head *list,
 int total_mapcount(struct page *page)
 {
 	int i, compound, nr, ret;
+	unsigned int seqcount;
+	bool double_map;
 
 	VM_BUG_ON_PAGE(PageTail(page), page);
 
 	if (likely(!PageCompound(page)))
 		return atomic_read(&page->_mapcount) + 1;
 
-	compound = compound_mapcount(page);
-	nr = compound_nr(page);
 	if (PageHuge(page))
-		return compound;
-	ret = compound;
+		return compound_mapcount(page);
+
+	nr = compound_nr(page);
+
+again:
+	seqcount = page_mapcount_seq_begin(page);
+	compound = ret = compound_mapcount(page);
 	for (i = 0; i < nr; i++)
 		ret += atomic_read(&page[i]._mapcount) + 1;
+	double_map = PageDoubleMap(page);
+	if (page_mapcount_seq_retry(page, seqcount))
+		goto again;
+
 	/* File pages has compound_mapcount included in _mapcount */
 	if (!PageAnon(page))
 		return ret - compound * nr;
-	if (PageDoubleMap(page))
+	if (double_map)
 		ret -= nr;
 	return ret;
 }
@@ -2548,6 +2567,7 @@ int total_mapcount(struct page *page)
 int page_trans_huge_mapcount(struct page *page, int *total_mapcount)
 {
 	int i, ret, _total_mapcount, mapcount;
+	unsigned int seqcount;
 
 	/* hugetlbfs shouldn't call it */
 	VM_BUG_ON_PAGE(PageHuge(page), page);
@@ -2561,6 +2581,8 @@ int page_trans_huge_mapcount(struct page *page, int *total_mapcount)
 
 	page = compound_head(page);
 
+again:
+	seqcount = page_mapcount_seq_begin(page);
 	_total_mapcount = ret = 0;
 	for (i = 0; i < thp_nr_pages(page); i++) {
 		mapcount = atomic_read(&page[i]._mapcount) + 1;
@@ -2572,6 +2594,9 @@ int page_trans_huge_mapcount(struct page *page, int *total_mapcount)
 		_total_mapcount -= thp_nr_pages(page);
 	}
 	mapcount = compound_mapcount(page);
+	if (page_mapcount_seq_retry(page, seqcount))
+		goto again;
+
 	ret += mapcount;
 	_total_mapcount += mapcount;
 	if (total_mapcount)
