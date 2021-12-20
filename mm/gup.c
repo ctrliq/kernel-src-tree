@@ -73,7 +73,7 @@ static __always_inline bool __gup_must_unshare(unsigned int flags,
 					       struct page *page,
 					       bool is_head, bool irq_safe)
 {
-	if (flags & FOLL_WRITE)
+	if (flags & (FOLL_WRITE|FOLL_NOUNSHARE))
 		return false;
 	/* mmu notifier doesn't need unshare */
 	if (!(flags & (FOLL_GET|FOLL_PIN)))
@@ -892,6 +892,11 @@ static struct page *follow_p4d_mask(struct vm_area_struct *vma,
  * When getting pages from ZONE_DEVICE memory, the @ctx->pgmap caches
  * the device's dev_pagemap metadata to avoid repeating expensive lookups.
  *
+ * When getting an anonymous page and the caller has to trigger a Copy
+ * On Read (COR) fault, -EMLINK is returned. The caller should trigger
+ * a fault with FAULT_FLAG_UNSHARE set. With FOLL_NOUNSHARE set, will
+ * never require a COR fault and consequently not return -EMLINK.
+ *
  * On output, the @ctx->page_mask is set according to the size of the page.
  *
  * Return: the mapped (struct page *), %NULL if no mapping exists, or
@@ -946,6 +951,14 @@ struct page *follow_page(struct vm_area_struct *vma, unsigned long address,
 
 	if (vma_is_secretmem(vma))
 		return NULL;
+
+	/*
+	 * Don't require unsharing in case we stumble over a read-only
+	 * mapped, shared anonymous page: this is an internal API only
+	 * and callers don't actually use it for exposing page content
+	 * to user space.
+	 */
+	foll_flags |= FOLL_NOUNSHARE;
 
 	page = follow_page_mask(vma, address, foll_flags, &ctx);
 	if (ctx.pgmap)
@@ -1040,6 +1053,8 @@ static int faultin_page(struct vm_area_struct *vma,
 		fault_flags |= FAULT_FLAG_UNSHARE;
 		/* FAULT_FLAG_WRITE and FAULT_FLAG_UNSHARE are incompatible */
 		VM_BUG_ON(fault_flags & FAULT_FLAG_WRITE);
+		/* If FOLL_NOUNSHARE was set, then FOLL_UNSHARE must not be */
+		VM_BUG_ON(*flags & FOLL_NOUNSHARE);
 	}
 
 	ret = handle_mm_fault(vma, address, fault_flags, NULL);

@@ -2867,6 +2867,7 @@ struct page *follow_page(struct vm_area_struct *vma, unsigned long address,
 #define FOLL_PIN	0x40000	/* pages must be released via unpin_user_page */
 #define FOLL_FAST_ONLY	0x80000	/* gup_fast: prevent fall-back to slow gup */
 #define FOLL_UNSHARE	0x100000/* gup: unshare anon page with mapcount > 1 */
+#define FOLL_NOUNSHARE	0x200000 /* gup: don't trigger a COR fault */
 
 /*
  * FOLL_PIN and FOLL_LONGTERM may be used in various combinations with each
@@ -2920,6 +2921,12 @@ struct page *follow_page(struct vm_area_struct *vma, unsigned long address,
  * directly by the caller. That's in order to help avoid mismatches when
  * releasing pages: get_user_pages*() pages must be released via put_page(),
  * while pin_user_pages*() pages must be released via unpin_user_page().
+ *
+ * FOLL_NOUNSHARE should be set when no COR fault should be triggered when
+ * eventually taking a read-only reference on a shared anonymous page, because
+ * we are sure that user space cannot use that reference for reading the page
+ * after eventually unmapping the page. FOLL_NOUNSHARE is implicitly set for the
+ * follow_page() API.
  *
  * Please see Documentation/core-api/pin_user_pages.rst for more information.
  */
