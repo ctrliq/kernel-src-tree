@@ -7,7 +7,6 @@
 
 #include <linux/fs.h>
 #include <linux/f2fs_fs.h>
-#include <linux/moduleparam.h>
 #include <linux/writeback.h>
 #include <linux/backing-dev.h>
 #include <linux/lzo.h>

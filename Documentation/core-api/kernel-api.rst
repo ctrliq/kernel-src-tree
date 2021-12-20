@@ -315,9 +315,6 @@ Block Devices
 .. kernel-doc:: block/genhd.c
    :export:
 
-.. kernel-doc:: block/bdev.c
-   :export:
-
 Char devices
 ============
 

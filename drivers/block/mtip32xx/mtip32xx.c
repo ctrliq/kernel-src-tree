@@ -3633,9 +3633,7 @@ skip_create_disk:
 	set_capacity(dd->disk, capacity);
 
 	/* Enable the block device and add it to /dev */
-	rv = device_add_disk(&dd->pdev->dev, dd->disk, mtip_disk_attr_groups);
-	if (rv)
-		goto read_capacity_error;
+	device_add_disk(&dd->pdev->dev, dd->disk, mtip_disk_attr_groups);
 
 	if (dd->mtip_svc_handler) {
 		set_bit(MTIP_DDF_INIT_DONE_BIT, &dd->dd_flag);
@@ -4063,6 +4061,7 @@ block_initialize_err:
 
 msi_initialize_err:
 	if (dd->isr_workq) {
+		flush_workqueue(dd->isr_workq);
 		destroy_workqueue(dd->isr_workq);
 		drop_cpu(dd->work[0].cpu_binding);
 		drop_cpu(dd->work[1].cpu_binding);
@@ -4120,6 +4119,7 @@ static void mtip_pci_remove(struct pci_dev *pdev)
 	mtip_block_remove(dd);
 
 	if (dd->isr_workq) {
+		flush_workqueue(dd->isr_workq);
 		destroy_workqueue(dd->isr_workq);
 		drop_cpu(dd->work[0].cpu_binding);
 		drop_cpu(dd->work[1].cpu_binding);

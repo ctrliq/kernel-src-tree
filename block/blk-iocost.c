@@ -2988,29 +2988,34 @@ static void ioc_pd_free(struct blkg_policy_data *pd)
 	kfree(iocg);
 }
 
-static bool ioc_pd_stat(struct blkg_policy_data *pd, struct seq_file *s)
+static size_t ioc_pd_stat(struct blkg_policy_data *pd, char *buf, size_t size)
 {
 	struct ioc_gq *iocg = pd_to_iocg(pd);
 	struct ioc *ioc = iocg->ioc;
+	size_t pos = 0;
 
 	if (!ioc->enabled)
-		return false;
+		return 0;
 
 	if (iocg->level == 0) {
 		unsigned vp10k = DIV64_U64_ROUND_CLOSEST(
 			ioc->vtime_base_rate * 10000,
 			VTIME_PER_USEC);
-		seq_printf(s, " cost.vrate=%u.%02u", vp10k / 100, vp10k % 100);
+		pos += scnprintf(buf + pos, size - pos, " cost.vrate=%u.%02u",
+				  vp10k / 100, vp10k % 100);
 	}
 
-	seq_printf(s, " cost.usage=%llu", iocg->last_stat.usage_us);
+	pos += scnprintf(buf + pos, size - pos, " cost.usage=%llu",
+			 iocg->last_stat.usage_us);
 
 	if (blkcg_debug_stats)
-		seq_printf(s, " cost.wait=%llu cost.indebt=%llu cost.indelay=%llu",
-			iocg->last_stat.wait_us,
-			iocg->last_stat.indebt_us,
-			iocg->last_stat.indelay_us);
-	return true;
+		pos += scnprintf(buf + pos, size - pos,
+				 " cost.wait=%llu cost.indebt=%llu cost.indelay=%llu",
+				 iocg->last_stat.wait_us,
+				 iocg->last_stat.indebt_us,
+				 iocg->last_stat.indelay_us);
+
+	return pos;
 }
 
 static u64 ioc_weight_prfill(struct seq_file *sf, struct blkg_policy_data *pd,
@@ -3165,12 +3170,12 @@ static ssize_t ioc_qos_write(struct kernfs_open_file *of, char *input,
 	if (IS_ERR(bdev))
 		return PTR_ERR(bdev);
 
-	ioc = q_to_ioc(bdev_get_queue(bdev));
+	ioc = q_to_ioc(bdev->bd_disk->queue);
 	if (!ioc) {
-		ret = blk_iocost_init(bdev_get_queue(bdev));
+		ret = blk_iocost_init(bdev->bd_disk->queue);
 		if (ret)
 			goto err;
-		ioc = q_to_ioc(bdev_get_queue(bdev));
+		ioc = q_to_ioc(bdev->bd_disk->queue);
 	}
 
 	spin_lock_irq(&ioc->lock);
@@ -3332,12 +3337,12 @@ static ssize_t ioc_cost_model_write(struct kernfs_open_file *of, char *input,
 	if (IS_ERR(bdev))
 		return PTR_ERR(bdev);
 
-	ioc = q_to_ioc(bdev_get_queue(bdev));
+	ioc = q_to_ioc(bdev->bd_disk->queue);
 	if (!ioc) {
-		ret = blk_iocost_init(bdev_get_queue(bdev));
+		ret = blk_iocost_init(bdev->bd_disk->queue);
 		if (ret)
 			goto err;
-		ioc = q_to_ioc(bdev_get_queue(bdev));
+		ioc = q_to_ioc(bdev->bd_disk->queue);
 	}
 
 	spin_lock_irq(&ioc->lock);

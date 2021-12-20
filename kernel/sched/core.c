@@ -13,7 +13,7 @@
 #include "sched.h"
 
 #include <linux/nospec.h>
-#include <linux/blkdev.h>
+
 #include <linux/kcov.h>
 #include <linux/scs.h>
 
@@ -6362,7 +6362,7 @@ static inline void sched_submit_work(struct task_struct *tsk)
 	 * make sure to submit it to avoid deadlocks.
 	 */
 	if (blk_needs_flush_plug(tsk))
-		blk_flush_plug(tsk->plug, true);
+		blk_schedule_flush_plug(tsk);
 }
 
 static void sched_update_worker(struct task_struct *tsk)
@@ -8394,8 +8394,7 @@ int io_schedule_prepare(void)
 	int old_iowait = current->in_iowait;
 
 	current->in_iowait = 1;
-	if (current->plug)
-		blk_flush_plug(current->plug, true);
+	blk_schedule_flush_plug(current);
 
 	return old_iowait;
 }

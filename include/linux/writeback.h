@@ -11,6 +11,7 @@
 #include <linux/flex_proportions.h>
 #include <linux/backing-dev-defs.h>
 #include <linux/blk_types.h>
+#include <linux/blk-cgroup.h>
 
 struct bio;
 
@@ -108,12 +109,15 @@ static inline int wbc_to_write_flags(struct writeback_control *wbc)
 	return flags;
 }
 
+static inline struct cgroup_subsys_state *
+wbc_blkcg_css(struct writeback_control *wbc)
+{
 #ifdef CONFIG_CGROUP_WRITEBACK
-#define wbc_blkcg_css(wbc) \
-	((wbc)->wb ? (wbc)->wb->blkcg_css : blkcg_root_css)
-#else
-#define wbc_blkcg_css(wbc)		(blkcg_root_css)
-#endif /* CONFIG_CGROUP_WRITEBACK */
+	if (wbc->wb)
+		return wbc->wb->blkcg_css;
+#endif
+	return blkcg_root_css;
+}
 
 /*
  * A wb_domain represents a domain that wb's (bdi_writeback's) belong to

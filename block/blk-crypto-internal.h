@@ -7,7 +7,7 @@
 #define __LINUX_BLK_CRYPTO_INTERNAL_H
 
 #include <linux/bio.h>
-#include <linux/blk-mq.h>
+#include <linux/blkdev.h>
 
 /* Represents a crypto mode supported by blk-crypto  */
 struct blk_crypto_mode {

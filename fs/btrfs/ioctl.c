@@ -1717,7 +1717,7 @@ static noinline int btrfs_ioctl_resize(struct file *file,
 	}
 
 	if (!strcmp(sizestr, "max"))
-		new_size = bdev_nr_bytes(device->bdev);
+		new_size = device->bdev->bd_inode->i_size;
 	else {
 		if (sizestr[0] == '-') {
 			mod = -1;
@@ -1758,7 +1758,7 @@ static noinline int btrfs_ioctl_resize(struct file *file,
 		ret = -EINVAL;
 		goto out_finish;
 	}
-	if (new_size > bdev_nr_bytes(device->bdev)) {
+	if (new_size > device->bdev->bd_inode->i_size) {
 		ret = -EFBIG;
 		goto out_finish;
 	}

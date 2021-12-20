@@ -935,9 +935,7 @@ static int rsxx_pci_probe(struct pci_dev *dev,
 			card->size8 = 0;
 	}
 
-	st = rsxx_attach_dev(card);
-	if (st)
-		goto failed_create_dev;
+	rsxx_attach_dev(card);
 
 	/************* Setup Debugfs *************/
 	rsxx_debugfs_dev_new(card);

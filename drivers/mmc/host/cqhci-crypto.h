@@ -22,15 +22,12 @@ int cqhci_crypto_init(struct cqhci_host *host);
  */
 static inline u64 cqhci_crypto_prep_task_desc(struct mmc_request *mrq)
 {
-	if (!mrq->crypto_ctx)
+	if (!mrq->crypto_enabled)
 		return 0;
-
-	/* We set max_dun_bytes_supported=4, so all DUNs should be 32-bit. */
-	WARN_ON_ONCE(mrq->crypto_ctx->bc_dun[0] > U32_MAX);
 
 	return CQHCI_CRYPTO_ENABLE_BIT |
 	       CQHCI_CRYPTO_KEYSLOT(mrq->crypto_key_slot) |
-	       mrq->crypto_ctx->bc_dun[0];
+	       mrq->data_unit_num;
 }
 
 #else /* CONFIG_MMC_CRYPTO */

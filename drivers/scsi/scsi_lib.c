@@ -21,7 +21,6 @@
 #include <linux/hardirq.h>
 #include <linux/scatterlist.h>
 #include <linux/blk-mq.h>
-#include <linux/blk-integrity.h>
 #include <linux/ratelimit.h>
 #include <asm/unaligned.h>
 
@@ -1779,7 +1778,7 @@ static void scsi_mq_exit_request(struct blk_mq_tag_set *set, struct request *rq,
 }
 
 
-static int scsi_mq_poll(struct blk_mq_hw_ctx *hctx, struct io_comp_batch *iob)
+static int scsi_mq_poll(struct blk_mq_hw_ctx *hctx)
 {
 	struct Scsi_Host *shost = hctx->driver_data;
 
@@ -2625,40 +2624,6 @@ scsi_target_resume(struct scsi_target *starget)
 }
 EXPORT_SYMBOL(scsi_target_resume);
 
-static int __scsi_internal_device_block_nowait(struct scsi_device *sdev)
-{
-	if (scsi_device_set_state(sdev, SDEV_BLOCK))
-		return scsi_device_set_state(sdev, SDEV_CREATED_BLOCK);
-
-	return 0;
-}
-
-void scsi_start_queue(struct scsi_device *sdev)
-{
-	if (cmpxchg(&sdev->queue_stopped, 1, 0))
-		blk_mq_unquiesce_queue(sdev->request_queue);
-}
-
-static void scsi_stop_queue(struct scsi_device *sdev, bool nowait)
-{
-	/*
-	 * The atomic variable of ->queue_stopped covers that
-	 * blk_mq_quiesce_queue* is balanced with blk_mq_unquiesce_queue.
-	 *
-	 * However, we still need to wait until quiesce is done
-	 * in case that queue has been stopped.
-	 */
-	if (!cmpxchg(&sdev->queue_stopped, 0, 1)) {
-		if (nowait)
-			blk_mq_quiesce_queue_nowait(sdev->request_queue);
-		else
-			blk_mq_quiesce_queue(sdev->request_queue);
-	} else {
-		if (!nowait)
-			blk_mq_wait_quiesce_done(sdev->request_queue);
-	}
-}
-
 /**
  * scsi_internal_device_block_nowait - try to transition to the SDEV_BLOCK state
  * @sdev: device to block
@@ -2675,16 +2640,24 @@ static void scsi_stop_queue(struct scsi_device *sdev, bool nowait)
  */
 int scsi_internal_device_block_nowait(struct scsi_device *sdev)
 {
-	int ret = __scsi_internal_device_block_nowait(sdev);
+	struct request_queue *q = sdev->request_queue;
+	int err = 0;
+
+	err = scsi_device_set_state(sdev, SDEV_BLOCK);
+	if (err) {
+		err = scsi_device_set_state(sdev, SDEV_CREATED_BLOCK);
+
+		if (err)
+			return err;
+	}
 
 	/*
 	 * The device has transitioned to SDEV_BLOCK.  Stop the
 	 * block layer from calling the midlayer with this device's
 	 * request queue.
 	 */
-	if (!ret)
-		scsi_stop_queue(sdev, true);
-	return ret;
+	blk_mq_quiesce_queue_nowait(q);
+	return 0;
 }
 EXPORT_SYMBOL_GPL(scsi_internal_device_block_nowait);
 
@@ -2705,15 +2678,23 @@ EXPORT_SYMBOL_GPL(scsi_internal_device_block_nowait);
  */
 static int scsi_internal_device_block(struct scsi_device *sdev)
 {
+	struct request_queue *q = sdev->request_queue;
 	int err;
 
 	mutex_lock(&sdev->state_mutex);
-	err = __scsi_internal_device_block_nowait(sdev);
+	err = scsi_internal_device_block_nowait(sdev);
 	if (err == 0)
-		scsi_stop_queue(sdev, false);
+		blk_mq_quiesce_queue(q);
 	mutex_unlock(&sdev->state_mutex);
 
 	return err;
+}
+
+void scsi_start_queue(struct scsi_device *sdev)
+{
+	struct request_queue *q = sdev->request_queue;
+
+	blk_mq_unquiesce_queue(q);
 }
 
 /**

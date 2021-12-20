@@ -37,6 +37,7 @@
 
 #include <linux/binfmts.h>
 #include <linux/bitops.h>
+#include <linux/blkdev.h>
 #include <linux/compat.h>
 #include <linux/context_tracking.h>
 #include <linux/cpufreq.h>

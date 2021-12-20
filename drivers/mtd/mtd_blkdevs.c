@@ -427,9 +427,7 @@ int add_mtd_blktrans_dev(struct mtd_blktrans_dev *new)
 	if (new->readonly)
 		set_disk_ro(gd, 1);
 
-	ret = device_add_disk(&new->mtd->dev, gd, NULL);
-	if (ret)
-		goto out_cleanup_disk;
+	device_add_disk(&new->mtd->dev, gd, NULL);
 
 	if (new->disk_attributes) {
 		ret = sysfs_create_group(&disk_to_dev(gd)->kobj,
@@ -438,8 +436,6 @@ int add_mtd_blktrans_dev(struct mtd_blktrans_dev *new)
 	}
 	return 0;
 
-out_cleanup_disk:
-	blk_cleanup_disk(new->disk);
 out_free_tag_set:
 	blk_mq_free_tag_set(new->tag_set);
 out_kfree_tag_set:

@@ -1214,13 +1214,14 @@ static void memcpy_flushcache_optimized(void *dest, void *source, size_t size)
 static void bio_copy_block(struct dm_writecache *wc, struct bio *bio, void *data)
 {
 	void *buf;
+	unsigned long flags;
 	unsigned size;
 	int rw = bio_data_dir(bio);
 	unsigned remaining_size = wc->block_size;
 
 	do {
 		struct bio_vec bv = bio_iter_iovec(bio, bio->bi_iter);
-		buf = bvec_kmap_local(&bv);
+		buf = bvec_kmap_irq(&bv, &flags);
 		size = bv.bv_len;
 		if (unlikely(size > remaining_size))
 			size = remaining_size;
@@ -1238,7 +1239,7 @@ static void bio_copy_block(struct dm_writecache *wc, struct bio *bio, void *data
 			memcpy_flushcache_optimized(data, buf, size);
 		}
 
-		kunmap_local(buf);
+		bvec_kunmap_irq(buf, &flags);
 
 		data = (char *)data + size;
 		remaining_size -= size;
@@ -2252,7 +2253,7 @@ static int writecache_ctr(struct dm_target *ti, unsigned argc, char **argv)
 		ti->error = "Cache data device lookup failed";
 		goto bad;
 	}
-	wc->memory_map_size = bdev_nr_bytes(wc->ssd_dev->bdev);
+	wc->memory_map_size = i_size_read(wc->ssd_dev->bdev->bd_inode);
 
 	/*
 	 * Parse the cache block size

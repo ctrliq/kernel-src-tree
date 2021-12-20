@@ -9,7 +9,7 @@
  * description.
  */
 struct parsed_partitions {
-	struct gendisk *disk;
+	struct block_device *bdev;
 	char name[BDEVNAME_SIZE];
 	struct {
 		sector_t from;

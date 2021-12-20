@@ -129,7 +129,8 @@ static int linear_prepare_ioctl(struct dm_target *ti, struct block_device **bdev
 	/*
 	 * Only pass ioctls through if the device sizes match exactly.
 	 */
-	if (lc->start || ti->len != bdev_nr_sectors(dev->bdev))
+	if (lc->start ||
+	    ti->len != i_size_read(dev->bdev->bd_inode) >> SECTOR_SHIFT)
 		return 1;
 	return 0;
 }
