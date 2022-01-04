@@ -44,7 +44,7 @@ function update_patches()
 	tarball_name=$(basename -- "$autosig_tarball");
 
 	# Update tarball metada
-	echo "$tarball_sha SOURCES/$tarball_name" > "${package_name}/.kernel-auto.metadata";
+	echo "$tarball_sha SOURCES/$tarball_name" > "${package_name}/.kernel-automotive.metadata";
 	pushd "$package_name" &> /dev/null;
 
 	# Check for changes and commit/push them
@@ -58,7 +58,7 @@ function update_patches()
 	git push origin $autosig_branch || die "Unable to push the changes"
 	kernel_auto_rev=$(git log -1 --pretty=format:%H);
 	popd &> /dev/null;
-	sed -i -e "s/^AUTOGITCOMMIT:=[^ ]*/AUTOGITCOMMIT:=$kernel_auto_rev/" $redhat/Makefile.auto;
+	sed -i -e "s/^AUTOGITCOMMIT:=[^ ]*/AUTOGITCOMMIT:=$kernel_auto_rev/" $redhat/Makefile.automotive;
 }
 
 # Sanity check of global git variables set
