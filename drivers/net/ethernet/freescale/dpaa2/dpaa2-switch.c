@@ -1929,8 +1929,13 @@ static int dpaa2_switch_port_bridge_join(struct net_device *netdev,
 	if (err)
 		goto err_egress_flood;
 
+	err = switchdev_bridge_port_offload(netdev, netdev, extack);
+	if (err)
+		goto err_switchdev_offload;
+
 	return 0;
 
+err_switchdev_offload:
 err_egress_flood:
 	dpaa2_switch_port_set_fdb(port_priv, NULL);
 	return err;
@@ -1954,6 +1959,11 @@ static int dpaa2_switch_port_restore_rxvlan(struct net_device *vdev, int vid, vo
 		vlan_proto = vlan_dev_vlan_proto(vdev);
 
 	return dpaa2_switch_port_vlan_add(arg, vlan_proto, vid);
+}
+
+static void dpaa2_switch_port_pre_bridge_leave(struct net_device *netdev)
+{
+	switchdev_bridge_port_unoffload(netdev);
 }
 
 static int dpaa2_switch_port_bridge_leave(struct net_device *netdev)
@@ -2061,6 +2071,9 @@ static int dpaa2_switch_port_netdevice_event(struct notifier_block *nb,
 					   "Cannot join a bridge while VLAN uppers are present");
 			goto out;
 		}
+
+		if (!info->linking)
+			dpaa2_switch_port_pre_bridge_leave(netdev);
 
 		break;
 	case NETDEV_CHANGEUPPER:
