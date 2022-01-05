@@ -433,6 +433,7 @@ enum net_bridge_opts {
 	BROPT_VLAN_STATS_PER_PORT,
 	BROPT_NO_LL_LEARN,
 	BROPT_VLAN_BRIDGE_BINDING,
+	BROPT_MCAST_VLAN_SNOOPING_ENABLED,
 };
 
 struct net_bridge {
@@ -830,8 +831,9 @@ int br_ioctl_stub(struct net *net, struct net_bridge *br, unsigned int cmd,
 
 /* br_multicast.c */
 #ifdef CONFIG_BRIDGE_IGMP_SNOOPING
-int br_multicast_rcv(struct net_bridge_mcast *brmctx,
-		     struct net_bridge_mcast_port *pmctx,
+int br_multicast_rcv(struct net_bridge_mcast **brmctx,
+		     struct net_bridge_mcast_port **pmctx,
+		     struct net_bridge_vlan *vlan,
 		     struct sk_buff *skb, u16 vid);
 struct net_bridge_mdb_entry *br_mdb_get(struct net_bridge_mcast *brmctx,
 					struct sk_buff *skb, u16 vid);
@@ -905,6 +907,9 @@ void br_multicast_port_ctx_init(struct net_bridge_port *port,
 				struct net_bridge_mcast_port *pmctx);
 void br_multicast_port_ctx_deinit(struct net_bridge_mcast_port *pmctx);
 void br_multicast_toggle_one_vlan(struct net_bridge_vlan *vlan, bool on);
+void br_multicast_toggle_vlan(struct net_bridge_vlan *vlan, bool on);
+int br_multicast_toggle_vlan_snooping(struct net_bridge *br, bool on,
+				      struct netlink_ext_ack *extack);
 
 static inline bool br_group_is_l2(const struct br_ip *group)
 {
@@ -1091,7 +1096,8 @@ br_multicast_port_ctx_get_global(const struct net_bridge_mcast_port *pmctx)
 static inline bool
 br_multicast_ctx_vlan_global_disabled(const struct net_bridge_mcast *brmctx)
 {
-	return br_multicast_ctx_is_vlan(brmctx) &&
+	return br_opt_get(brmctx->br, BROPT_MCAST_VLAN_SNOOPING_ENABLED) &&
+	       br_multicast_ctx_is_vlan(brmctx) &&
 	       !(brmctx->vlan->priv_flags & BR_VLFLAG_GLOBAL_MCAST_ENABLED);
 }
 
@@ -1109,8 +1115,9 @@ br_multicast_port_ctx_vlan_disabled(const struct net_bridge_mcast_port *pmctx)
 	       !(pmctx->vlan->priv_flags & BR_VLFLAG_MCAST_ENABLED);
 }
 #else
-static inline int br_multicast_rcv(struct net_bridge_mcast *brmctx,
-				   struct net_bridge_mcast_port *pmctx,
+static inline int br_multicast_rcv(struct net_bridge_mcast **brmctx,
+				   struct net_bridge_mcast_port **pmctx,
+				   struct net_bridge_vlan *vlan,
 				   struct sk_buff *skb,
 				   u16 vid)
 {
@@ -1246,13 +1253,26 @@ static inline void br_multicast_toggle_one_vlan(struct net_bridge_vlan *vlan,
 						bool on)
 {
 }
+
+static inline void br_multicast_toggle_vlan(struct net_bridge_vlan *vlan,
+					    bool on)
+{
+}
+
+static inline int br_multicast_toggle_vlan_snooping(struct net_bridge *br,
+						    bool on,
+						    struct netlink_ext_ack *extack)
+{
+	return -EOPNOTSUPP;
+}
 #endif
 
 /* br_vlan.c */
 #ifdef CONFIG_BRIDGE_VLAN_FILTERING
 bool br_allowed_ingress(const struct net_bridge *br,
 			struct net_bridge_vlan_group *vg, struct sk_buff *skb,
-			u16 *vid, u8 *state);
+			u16 *vid, u8 *state,
+			struct net_bridge_vlan **vlan);
 bool br_allowed_egress(struct net_bridge_vlan_group *vg,
 		       const struct sk_buff *skb);
 bool br_should_learn(struct net_bridge_port *p, struct sk_buff *skb, u16 *vid);
@@ -1364,8 +1384,11 @@ static inline u16 br_vlan_flags(const struct net_bridge_vlan *v, u16 pvid)
 static inline bool br_allowed_ingress(const struct net_bridge *br,
 				      struct net_bridge_vlan_group *vg,
 				      struct sk_buff *skb,
-				      u16 *vid, u8 *state)
+				      u16 *vid, u8 *state,
+				      struct net_bridge_vlan **vlan)
+
 {
+	*vlan = NULL;
 	return true;
 }
 
