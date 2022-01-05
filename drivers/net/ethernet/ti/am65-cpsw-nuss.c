@@ -2100,7 +2100,8 @@ static int am65_cpsw_netdevice_port_link(struct net_device *ndev,
 			return -EOPNOTSUPP;
 	}
 
-	err = switchdev_bridge_port_offload(ndev, ndev, extack);
+	err = switchdev_bridge_port_offload(ndev, ndev, NULL, NULL, NULL,
+					    extack);
 	if (err)
 		return err;
 
@@ -2116,7 +2117,7 @@ static void am65_cpsw_netdevice_port_unlink(struct net_device *ndev)
 	struct am65_cpsw_common *common = am65_ndev_to_common(ndev);
 	struct am65_cpsw_ndev_priv *priv = am65_ndev_to_priv(ndev);
 
-	switchdev_bridge_port_unoffload(ndev);
+	switchdev_bridge_port_unoffload(ndev, NULL, NULL, NULL);
 
 	common->br_members &= ~BIT(priv->port->port_id);
 
