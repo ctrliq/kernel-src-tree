@@ -487,6 +487,8 @@ struct sched_avg {
 	unsigned long			runnable_avg;
 	unsigned long			util_avg;
 	struct util_est			util_est;
+	RH_KABI_RESERVE(1)
+	RH_KABI_RESERVE(2)
 } ____cacheline_aligned;
 
 struct sched_statistics {
@@ -561,6 +563,11 @@ struct sched_entity {
 	 */
 	struct sched_avg		avg;
 #endif
+
+	RH_KABI_RESERVE(1)
+	RH_KABI_RESERVE(2)
+	RH_KABI_RESERVE(3)
+	RH_KABI_RESERVE(4)
 };
 
 struct sched_rt_entity {
@@ -579,6 +586,8 @@ struct sched_rt_entity {
 	/* rq "owned" by this entity/group: */
 	struct rt_rq			*my_q;
 #endif
+	RH_KABI_RESERVE(1)
+	RH_KABI_RESERVE(2)
 } __randomize_layout;
 
 struct sched_dl_entity {
@@ -656,6 +665,10 @@ struct sched_dl_entity {
 	 */
 	struct sched_dl_entity *pi_se;
 #endif
+	RH_KABI_RESERVE(1)
+	RH_KABI_RESERVE(2)
+	RH_KABI_RESERVE(3)
+	RH_KABI_RESERVE(4)
 };
 
 #ifdef CONFIG_UCLAMP_TASK
@@ -1475,6 +1488,14 @@ struct task_struct {
 #ifdef CONFIG_KRETPROBES
 	struct llist_head               kretprobe_instances;
 #endif
+
+	/*
+	 * RHEL9: placeholder for future extension. Please add a comment
+	 * with the correct index to your added field(s).
+	*/
+	RH_KABI_REPLACE_SPLIT(long rh_reserved[64],
+		int rh_kabi_dummy,   /* 0 */ /* Use this one first */
+	)
 
 	/*
 	 * New fields for task_struct should be added above here, so that
