@@ -36,6 +36,8 @@
 #include <linux/kcsan.h>
 #include <asm/kmap_size.h>
 
+#include <linux/rh_kabi.h>
+
 /* task_struct member predeclarations (sorted alphabetically): */
 struct audit_context;
 struct backing_dev_info;
@@ -1403,7 +1405,7 @@ struct task_struct {
 #endif
 
 #ifdef CONFIG_MEMCG
-	struct mem_cgroup		*memcg_in_oom;
+	RH_KABI_EXCLUDE(struct mem_cgroup *memcg_in_oom)
 	gfp_t				memcg_oom_gfp_mask;
 	int				memcg_oom_order;
 
@@ -1411,7 +1413,7 @@ struct task_struct {
 	unsigned int			memcg_nr_pages_over_high;
 
 	/* Used by memcontrol for targeted memcg charge: */
-	struct mem_cgroup		*active_memcg;
+	RH_KABI_EXCLUDE(struct mem_cgroup *active_memcg)
 #endif
 
 #ifdef CONFIG_BLK_CGROUP
