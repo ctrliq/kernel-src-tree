@@ -23,18 +23,18 @@ else
 	SECONDARY=fedora
 fi
 
-for i in kernel-auto-*-"$PRIMARY".config; do
-	NEW=kernel-auto-"$VERSION"-$(echo "$i" | cut -d - -f3- | sed s/-"$PRIMARY"//)
+for i in kernel-automotive-*-"$PRIMARY".config; do
+	NEW=kernel-automotive-"$VERSION"-$(echo "$i" | cut -d - -f3- | sed s/-"$PRIMARY"//)
 	#echo $NEW
 	mv "$i" "$NEW"
 done
 
-rm -f kernel-auto-*-"$SECONDARY".config
+rm -f kernel-automotive-*-"$SECONDARY".config
 
 if [ "$DEBUGBUILDSENABLED" -eq 0 ]; then
-	for i in kernel-auto-*debug*.config; do
+	for i in kernel-automotive-*debug*.config; do
 		base=$(echo "$i" | sed -r s/-?debug//g)
-		NEW=kernel-auto-$(echo "$base" | cut -d - -f3-)
+		NEW=kernel-automotive-$(echo "$base" | cut -d - -f3-)
 		mv "$i" "$NEW"
 	done
 fi

@@ -3,7 +3,7 @@ include Makefile.common
 include Makefile.rhpkg
 
 # This is for automotive kernel
-include Makefile.auto
+include Makefile.automotive
 
 LANG=C
 
@@ -405,15 +405,15 @@ distg-brew distg-koji: distg-%:
 distg-cbs: distg-%:
 	$* $(BUILD_PROFILE) build $(BUILD_FLAGS) $(BUILD_TARGET) "$(CSGITURL)$(PACKAGE_NAME).git#$(AUTOGITCOMMIT)"
 
-dist-auto-release-finish: setup-source
+dist-automotive-release-finish: setup-source
 	@cp $(SOURCES)/$(CHANGELOG) $(REDHAT)/$(CHANGELOG)
 	@$(GIT) add $(REDHAT)/$(CHANGELOG)
 	@$(GIT) add $(REDHAT)/marker
 	@echo "[redhat] $(PACKAGE_NAME)-$(STAMP_VERSION)-$(PKGRELEASE)" > /tmp/rtkcommit
 	@echo "" >> /tmp/rtkcommit
-	@$(GIT) commit -F /tmp/rtkcommit -s ../Makefile.rhelver $(REDHAT)/marker $(REDHAT)/$(CHANGELOG) kernel.spec.template Makefile.auto
+	@$(GIT) commit -F /tmp/rtkcommit -s ../Makefile.rhelver $(REDHAT)/marker $(REDHAT)/$(CHANGELOG) kernel.spec.template Makefile.automotive
 
-dist-auto-release-changed: setup-source
+dist-automotive-release-changed: setup-source
 	@cp $(SOURCES)/$(CHANGELOG) $(REDHAT)/$(CHANGELOG)
 	@echo $(MARKER) > $(REDHAT)/marker
 	@# if neither changelog nor marker was updated, skip bumping a release
@@ -425,24 +425,24 @@ dist-auto-release-changed: setup-source
 		$(REDHAT)/scripts/new_release.sh $(REDHAT) $(__YSTREAM) $(__ZSTREAM) $(BUMP_RELEASE) $(AUTOMOTIVEBUILD); \
 	fi
 
-dist-auto-build-sig:
+dist-automotive-build-sig:
 	$(REDHAT)/scripts/automotive_build_sig.sh "$(AUTOSIG_BRANCH)" "$(RHDISTGIT_CACHE)" "$(RHDISTGIT_TMP)" "$(TARBALL)" "$(PACKAGE_NAME)"
 
-dist-auto-sig-release: dist-clean-sources
+dist-automotive-sig-release: dist-clean-sources
 	@# generate new version
-	@$(MAKE) dist-auto-release-changed
+	@$(MAKE) dist-automotive-release-changed
 	@$(MAKE) dist-sources
 	@# if no changes were made then we don't need to update the repos
 	@if $(GIT) diff-index --quiet HEAD; then \
 		echo "No changes, nothing to commit"; \
 	else \
 		echo "Update dist-git"; \
-		$(MAKE) dist-auto-build-sig; \
+		$(MAKE) dist-automotive-build-sig; \
 		echo "Commit source-git changes"; \
-		$(MAKE) dist-auto-release-finish; \
+		$(MAKE) dist-automotive-release-finish; \
 	fi
 
-dist-auto-sig: dist-auto-sig-release
+dist-automotive-sig: dist-automotive-sig-release
 	@$(MAKE) distg-cbs
 
 .PHONY: $(REDHAT)/rpm/SOURCES/$(PACKAGE_NAME).spec
