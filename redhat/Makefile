@@ -403,7 +403,7 @@ distg-brew distg-koji: distg-%:
 	$* $(BUILD_PROFILE) build $(BUILD_FLAGS) $(BUILD_TARGET) "$(RHGITURL)?redhat/koji#$(RHGITCOMMIT)"
 
 distg-cbs: distg-%:
-	$* $(BUILD_PROFILE) build $(BUILD_FLAGS) $(BUILD_TARGET) "$(CSGITURL)$(PACKAGE_NAME).git#$(AUTOGITCOMMIT)"
+	$* $(BUILD_PROFILE) build $(BUILD_FLAGS) $(BUILD_TARGET) "$(CSGITURL)$(PACKAGE_NAME).git#$(PACKAGE_NAME)-$(STAMP_VERSION)-$(PKGRELEASE)"
 
 dist-automotive-release-finish: setup-source
 	@cp $(SOURCES)/$(CHANGELOG) $(REDHAT)/$(CHANGELOG)
@@ -411,7 +411,7 @@ dist-automotive-release-finish: setup-source
 	@$(GIT) add $(REDHAT)/marker
 	@echo "[redhat] $(PACKAGE_NAME)-$(STAMP_VERSION)-$(PKGRELEASE)" > /tmp/rtkcommit
 	@echo "" >> /tmp/rtkcommit
-	@$(GIT) commit -F /tmp/rtkcommit -s ../Makefile.rhelver $(REDHAT)/marker $(REDHAT)/$(CHANGELOG) kernel.spec.template Makefile.automotive
+	@$(GIT) commit -F /tmp/rtkcommit -s ../Makefile.rhelver $(REDHAT)/marker $(REDHAT)/$(CHANGELOG) kernel.spec.template
 
 dist-automotive-release-changed: setup-source
 	@cp $(SOURCES)/$(CHANGELOG) $(REDHAT)/$(CHANGELOG)
@@ -425,8 +425,8 @@ dist-automotive-release-changed: setup-source
 		$(REDHAT)/scripts/new_release.sh $(REDHAT) $(__YSTREAM) $(__ZSTREAM) $(BUMP_RELEASE) $(AUTOMOTIVEBUILD); \
 	fi
 
-dist-automotive-build-sig:
-	$(REDHAT)/scripts/automotive_build_sig.sh "$(AUTOSIG_BRANCH)" "$(RHDISTGIT_CACHE)" "$(RHDISTGIT_TMP)" "$(TARBALL)" "$(PACKAGE_NAME)"
+dist-auto-build-sig:
+	$(REDHAT)/scripts/automotive_build_sig.sh "$(AUTOSIG_BRANCH)" "$(RHDISTGIT_CACHE)" "$(RHDISTGIT_TMP)" "$(TARBALL)" "$(PACKAGE_NAME)" "$(STAMP_VERSION)" "$(PKGRELEASE)"
 
 dist-automotive-sig-release: dist-clean-sources
 	@# generate new version
