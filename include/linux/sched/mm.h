@@ -50,14 +50,32 @@ static inline void mmdrop(struct mm_struct *mm)
 }
 
 #ifdef CONFIG_PREEMPT_RT
-extern void __mmdrop_delayed(struct rcu_head *rhp);
-static inline void mmdrop_delayed(struct mm_struct *mm)
+/*
+ * RCU callback for delayed mm drop. Not strictly RCU, but call_rcu() is
+ * by far the least expensive way to do that.
+ */
+static inline void __mmdrop_delayed(struct rcu_head *rhp)
 {
+	struct mm_struct *mm = container_of(rhp, struct mm_struct, delayed_drop);
+
+	__mmdrop(mm);
+}
+
+/*
+ * Invoked from finish_task_switch(). Delegates the heavy lifting on RT
+ * kernels via RCU.
+ */
+static inline void mmdrop_sched(struct mm_struct *mm)
+{
+	/* Provides a full memory barrier. See mmdrop() */
 	if (atomic_dec_and_test(&mm->mm_count))
 		call_rcu(&mm->delayed_drop, __mmdrop_delayed);
 }
 #else
-# define mmdrop_delayed(mm)    mmdrop(mm)
+static inline void mmdrop_sched(struct mm_struct *mm)
+{
+	mmdrop(mm);
+}
 #endif
 
 /**

@@ -695,19 +695,6 @@ void __mmdrop(struct mm_struct *mm)
 }
 EXPORT_SYMBOL_GPL(__mmdrop);
 
-#ifdef CONFIG_PREEMPT_RT
-/*
- * RCU callback for delayed mm drop. Not strictly rcu, but we don't
- * want another facility to make this work.
- */
-void __mmdrop_delayed(struct rcu_head *rhp)
-{
-	struct mm_struct *mm = container_of(rhp, struct mm_struct, delayed_drop);
-
-	__mmdrop(mm);
-}
-#endif
-
 static void mmdrop_async_fn(struct work_struct *work)
 {
 	struct mm_struct *mm;
@@ -2355,7 +2342,7 @@ static __latent_entropy struct task_struct *copy_process(
 	write_unlock_irq(&tasklist_lock);
 
 	proc_fork_connector(p);
-	sched_post_fork(p);
+	sched_post_fork(p, args);
 	cgroup_post_fork(p, args);
 	perf_event_fork(p);
 
