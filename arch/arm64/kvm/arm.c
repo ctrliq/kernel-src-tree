@@ -1701,11 +1701,6 @@ static bool init_psci_relay(void)
 	return true;
 }
 
-static int init_common_resources(void)
-{
-	return kvm_set_ipa_limit();
-}
-
 static int init_subsystems(void)
 {
 	int err = 0;
@@ -2068,7 +2063,7 @@ int kvm_arch_init(void *opaque)
 		}
 	}
 
-	err = init_common_resources();
+	err = kvm_set_ipa_limit();
 	if (err)
 		return err;
 
