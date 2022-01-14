@@ -86,7 +86,7 @@ static unsigned long __timeline_mark_lock(struct intel_context *ce)
 {
 	unsigned long flags = 0;
 
-	if (!force_irqthreads)
+	if (!force_irqthreads())
 		local_irq_save(flags);
 	mutex_acquire(&ce->timeline->mutex.dep_map, 2, 0, _THIS_IP_);
 
@@ -97,7 +97,7 @@ static void __timeline_mark_unlock(struct intel_context *ce,
 				   unsigned long flags)
 {
 	mutex_release(&ce->timeline->mutex.dep_map, _THIS_IP_);
-	if (!force_irqthreads)
+	if (!force_irqthreads())
 		local_irq_restore(flags);
 }
 
