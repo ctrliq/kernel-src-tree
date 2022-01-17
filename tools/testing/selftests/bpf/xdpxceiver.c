@@ -70,7 +70,6 @@
 #include <errno.h>
 #include <getopt.h>
 #include <asm/barrier.h>
-typedef __u16 __sum16;
 #include <linux/if_link.h>
 #include <linux/if_ether.h>
 #include <linux/ip.h>
@@ -524,7 +523,6 @@ static void complete_tx_only(struct xsk_socket_info *xsk, int batch_size)
 	if (rcvd) {
 		xsk_ring_cons__release(&xsk->umem->cq, rcvd);
 		xsk->outstanding_tx -= rcvd;
-		xsk->tx_npkts += rcvd;
 	}
 }
 
@@ -571,7 +569,6 @@ static void rx_pkt(struct xsk_socket_info *xsk, struct pollfd *fds)
 
 	xsk_ring_prod__submit(&xsk->umem->fq, rcvd);
 	xsk_ring_cons__release(&xsk->rx, rcvd);
-	xsk->rx_npkts += rcvd;
 }
 
 static void tx_only(struct ifobject *ifobject, u32 *frameptr, int batch_size)
