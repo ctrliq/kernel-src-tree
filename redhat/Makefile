@@ -273,7 +273,6 @@ sources-rh: $(TARBALL) generate-testpatch-tmp setup-source dist-configs-check
 		configs/merge.pl \
 		configs/process_configs.sh \
 		parallel_xz.sh \
-		generate_crashkernel_default.sh \
 		../Makefile.rhelver \
 		README.rst \
 		kernel-local \
