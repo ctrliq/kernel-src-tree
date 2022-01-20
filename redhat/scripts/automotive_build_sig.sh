@@ -15,6 +15,7 @@ autosig_tarball=$4;
 package_name=$5;
 stamp_version=$6;
 pkgrelease=$7;
+use_tags=$8;
 
 redhat=$(dirname "$0")/..;
 topdir="$redhat"/..;
@@ -58,9 +59,16 @@ function update_patches()
 	fi
 	git commit -a -s -m"$(echo -e "[redhat] Update sources for $tarball_name\n\nChanges included into this commit:\n$source_changes")" || die "Unable to commit the changes";
 	git push origin $autosig_branch || die "Unable to push the changes"
-	git tag -a -m "$package_name-$stamp_version-$pkgrelease" $package_name-$stamp_version-$pkgrelease
-	git push origin tag $package_name-$stamp_version-$pkgrelease || die "Unable to push tag $package_name-$stamp_version-$pkgrelease"
-	popd &> /dev/null;
+	if [ "$use_tags" = "y" ];
+	then
+		git tag -a -m "$package_name-$stamp_version-$pkgrelease" $package_name-$stamp_version-$pkgrelease
+		git push origin tag $package_name-$stamp_version-$pkgrelease || die "Unable to push tag $package_name-$stamp_version-$pkgrelease"
+		popd &> /dev/null;
+	else
+		kernel_auto_rev=$(git log -1 --pretty=format:%H);
+		popd &> /dev/null;
+                sed -i -e "0,/AUTOGITREF?=[^ ]*/s/AUTOGITREF?=[^ ]*/AUTOGITREF?=$kernel_auto_rev/" $redhat/Makefile.automotive;
+	fi
 }
 
 # Sanity check of global git variables set
