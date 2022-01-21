@@ -5429,7 +5429,7 @@ nfs4svc_decode_compoundargs(struct svc_rqst *rqstp, struct xdr_stream *xdr)
 	return nfsd4_decode_compound(args);
 }
 
-int
+bool
 nfs4svc_encode_compoundres(struct svc_rqst *rqstp, struct xdr_stream *xdr)
 {
 	struct nfsd4_compoundres *resp = rqstp->rq_resp;
@@ -5455,5 +5455,5 @@ nfs4svc_encode_compoundres(struct svc_rqst *rqstp, struct xdr_stream *xdr)
 	*p++ = htonl(resp->opcnt);
 
 	nfsd4_sequence_done(resp);
-	return 1;
+	return true;
 }
