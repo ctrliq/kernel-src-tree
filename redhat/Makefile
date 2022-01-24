@@ -390,10 +390,19 @@ dist-koji : BUILD_FLAGS ?= $(KOJI_FLAGS) $(TEST_FLAGS)
 distg-brew: BUILD_FLAGS ?= $(BREW_FLAGS) $(TEST_FLAGS)
 distg-koji: BUILD_FLAGS ?= $(KOJI_FLAGS) $(TEST_FLAGS)
 
-dist-brew dist-koji: dist-%: dist-srpm
+dist-vr-check:
+	@# builds may include a s390x+zfcpdump arch build.  UTS_RELEASE can only have a
+	@# version-release string with max 64 chars.  The version-release for s390x+zfcpdump
+	@# is 29 characters, leaving a maximum of 35 characters for PKGRELEASE.
+	@if [ $$(echo -n $(PKGRELEASE) | wc -c) -gt 35 ]; then \
+		echo "PKGRELEASE ($(PKGRELEASE)) is too long.  Use a shorter localversion (currently $(BUILDID))"; \
+		exit 1; \
+	fi
+
+dist-brew dist-koji: dist-%: dist-vr-check dist-srpm
 	$* $(BUILD_PROFILE) build $(BUILD_FLAGS) $(BUILD_TARGET) $(SRPMS)/$(PACKAGE_NAME)-$(KVERSION)-$(PKGRELEASE)$(DIST).src.rpm $(OUTPUT_FILE)
 
-distg-brew distg-koji: distg-%:
+distg-brew distg-koji: distg-%: dist-vr-check
 	$* $(BUILD_PROFILE) build $(BUILD_FLAGS) $(BUILD_TARGET) "$(RHGITURL)?redhat/koji#$(RHGITCOMMIT)"
 
 .PHONY: $(REDHAT)/rpm/SOURCES/$(PACKAGE_NAME).spec
