@@ -243,8 +243,10 @@ do_mptcp_sockopt_tests()
 {
 	local lret=0
 
+	sysctl -q net.mptcp.enabled=1
 	./mptcp_sockopt
 	lret=$?
+	sysctl -q net.mptcp.enabled=0
 
 	if [ $lret -ne 0 ]; then
 		echo "FAIL: SOL_MPTCP getsockopt" 1>&2
@@ -252,8 +254,10 @@ do_mptcp_sockopt_tests()
 		return
 	fi
 
+	sysctl -q net.mptcp.enabled=1
 	./mptcp_sockopt -6
 	lret=$?
+	sysctl -q net.mptcp.enabled=0
 
 	if [ $lret -ne 0 ]; then
 		echo "FAIL: SOL_MPTCP getsockopt (ipv6)" 1>&2

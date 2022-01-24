@@ -60,7 +60,7 @@ unsigned int mptcp_stale_loss_cnt(const struct net *net)
 
 static void mptcp_pernet_set_defaults(struct mptcp_pernet *pernet)
 {
-	pernet->mptcp_enabled = 1;
+	pernet->mptcp_enabled = 0;
 	pernet->add_addr_timeout = TCP_RTO_MAX;
 	pernet->checksum_enabled = 0;
 	pernet->allow_join_initial_addr_port = 1;
