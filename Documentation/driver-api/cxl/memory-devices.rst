@@ -36,8 +36,11 @@ CXL Core
 .. kernel-doc:: drivers/cxl/cxl.h
    :internal:
 
-.. kernel-doc:: drivers/cxl/core/bus.c
+.. kernel-doc:: drivers/cxl/core/port.c
    :doc: cxl core
+
+.. kernel-doc:: drivers/cxl/core/port.c
+   :identifiers:
 
 .. kernel-doc:: drivers/cxl/core/pmem.c
    :doc: cxl pmem
