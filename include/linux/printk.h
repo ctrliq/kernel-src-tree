@@ -172,6 +172,16 @@ int printk(const char *fmt, ...);
 
 bool pr_flush(int timeout_ms, bool reset_on_progress);
 
+extern void __printk_safe_enter(void);
+extern void __printk_safe_exit(void);
+/*
+ * The printk_deferred_enter/exit macros are available only as a hack for
+ * some code paths that need to defer all printk console printing. Interrupts
+ * must be disabled for the deferred duration.
+ */
+#define printk_deferred_enter __printk_safe_enter
+#define printk_deferred_exit __printk_safe_exit
+
 /*
  * Please don't use printk_ratelimit(), because it shares ratelimiting state
  * with all other unrelated printk_ratelimit() callsites.  Instead use
@@ -200,6 +210,7 @@ void dump_stack_print_info(const char *log_lvl);
 void show_regs_print_info(const char *log_lvl);
 extern asmlinkage void dump_stack_lvl(const char *log_lvl) __cold;
 extern asmlinkage void dump_stack(void) __cold;
+void printk_trigger_flush(void);
 #else
 static inline __printf(1, 0)
 int vprintk(const char *s, va_list args)
@@ -266,6 +277,10 @@ static inline void dump_stack_lvl(const char *log_lvl)
 }
 
 static inline void dump_stack(void)
+{
+}
+
+static inline void printk_trigger_flush(void)
 {
 }
 #endif
