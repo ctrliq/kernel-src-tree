@@ -306,6 +306,7 @@ struct bpf_local_storage;
   *	@sk_priority: %SO_PRIORITY setting
   *	@sk_type: socket type (%SOCK_STREAM, etc)
   *	@sk_protocol: which protocol this socket belongs in this network family
+  *	@sk_peer_lock: lock protecting @sk_peer_pid and @sk_peer_cred
   *	@sk_peer_pid: &struct pid for this socket's peer
   *	@sk_peer_cred: %SO_PEERCRED setting
   *	@sk_rcvlowat: %SO_RCVLOWAT setting
@@ -487,8 +488,10 @@ struct sock {
 	u8			sk_prefer_busy_poll;
 	u16			sk_busy_poll_budget;
 #endif
+	spinlock_t		sk_peer_lock;
 	struct pid		*sk_peer_pid;
 	const struct cred	*sk_peer_cred;
+
 	long			sk_rcvtimeo;
 	ktime_t			sk_stamp;
 #if BITS_PER_LONG==32
