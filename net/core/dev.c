@@ -956,8 +956,7 @@ struct net_device *dev_get_by_name(struct net *net, const char *name)
 
 	rcu_read_lock();
 	dev = dev_get_by_name_rcu(net, name);
-	if (dev)
-		dev_hold(dev);
+	dev_hold(dev);
 	rcu_read_unlock();
 	return dev;
 }
@@ -1030,8 +1029,7 @@ struct net_device *dev_get_by_index(struct net *net, int ifindex)
 
 	rcu_read_lock();
 	dev = dev_get_by_index_rcu(net, ifindex);
-	if (dev)
-		dev_hold(dev);
+	dev_hold(dev);
 	rcu_read_unlock();
 	return dev;
 }
@@ -5058,7 +5056,8 @@ static __latent_entropy void net_tx_action(struct softirq_action *h)
 			if (likely(get_kfree_skb_cb(skb)->reason == SKB_REASON_CONSUMED))
 				trace_consume_skb(skb);
 			else
-				trace_kfree_skb(skb, net_tx_action);
+				trace_kfree_skb(skb, net_tx_action,
+						SKB_DROP_REASON_NOT_SPECIFIED);
 
 			if (skb->fclone != SKB_FCLONE_UNAVAILABLE)
 				__kfree_skb(skb);
