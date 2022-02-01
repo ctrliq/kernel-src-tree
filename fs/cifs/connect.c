@@ -308,8 +308,10 @@ static int __cifs_reconnect(struct TCP_Server_Info *server)
 		}
 	} while (server->tcpStatus == CifsNeedReconnect);
 
+	spin_lock(&cifs_tcp_ses_lock);
 	if (server->tcpStatus == CifsNeedNegotiate)
 		mod_delayed_work(cifsiod_wq, &server->echo, 0);
+	spin_unlock(&cifs_tcp_ses_lock);
 
 	wake_up(&server->response_q);
 	return rc;
@@ -422,6 +424,7 @@ static int reconnect_dfs_server(struct TCP_Server_Info *server)
 		spin_unlock(&GlobalMid_Lock);
 		cifs_swn_reset_server_dstaddr(server);
 		mutex_unlock(&server->srv_mutex);
+		mod_delayed_work(cifsiod_wq, &server->reconnect, 0);
 	} while (server->tcpStatus == CifsNeedReconnect);
 
 	if (target_hint)
