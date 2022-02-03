@@ -23,6 +23,8 @@ struct vmem_altmap {
 	unsigned long free;
 	unsigned long align;
 	unsigned long alloc;
+	RH_KABI_RESERVE(1)
+	RH_KABI_RESERVE(2)
 };
 
 /*
