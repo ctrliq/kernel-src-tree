@@ -162,8 +162,6 @@ int __ext4_journal_ensure_credits(handle_t *handle, int check_cred,
 {
 	if (!ext4_handle_valid(handle))
 		return 0;
-	if (is_handle_aborted(handle))
-		return -EROFS;
 	if (jbd2_handle_buffer_credits(handle) >= check_cred &&
 	    handle->h_revoke_credits >= revoke_cred)
 		return 0;
@@ -220,11 +218,9 @@ static void ext4_check_bdev_write_error(struct super_block *sb)
 }
 
 int __ext4_journal_get_write_access(const char *where, unsigned int line,
-				    handle_t *handle, struct super_block *sb,
-				    struct buffer_head *bh,
-				    enum ext4_journal_trigger_type trigger_type)
+				    handle_t *handle, struct buffer_head *bh)
 {
-	int err;
+	int err = 0;
 
 	might_sleep();
 
@@ -233,18 +229,11 @@ int __ext4_journal_get_write_access(const char *where, unsigned int line,
 
 	if (ext4_handle_valid(handle)) {
 		err = jbd2_journal_get_write_access(handle, bh);
-		if (err) {
+		if (err)
 			ext4_journal_abort_handle(where, line, __func__, bh,
 						  handle, err);
-			return err;
-		}
 	}
-	if (trigger_type == EXT4_JTR_NONE || !ext4_has_metadata_csum(sb))
-		return 0;
-	BUG_ON(trigger_type >= EXT4_JOURNAL_TRIGGER_COUNT);
-	jbd2_journal_set_triggers(bh,
-		&EXT4_SB(sb)->s_journal_triggers[trigger_type].tr_triggers);
-	return 0;
+	return err;
 }
 
 /*
@@ -312,27 +301,17 @@ int __ext4_forget(const char *where, unsigned int line, handle_t *handle,
 }
 
 int __ext4_journal_get_create_access(const char *where, unsigned int line,
-				handle_t *handle, struct super_block *sb,
-				struct buffer_head *bh,
-				enum ext4_journal_trigger_type trigger_type)
+				handle_t *handle, struct buffer_head *bh)
 {
-	int err;
+	int err = 0;
 
-	if (!ext4_handle_valid(handle))
-		return 0;
-
-	err = jbd2_journal_get_create_access(handle, bh);
-	if (err) {
-		ext4_journal_abort_handle(where, line, __func__, bh, handle,
-					  err);
-		return err;
+	if (ext4_handle_valid(handle)) {
+		err = jbd2_journal_get_create_access(handle, bh);
+		if (err)
+			ext4_journal_abort_handle(where, line, __func__,
+						  bh, handle, err);
 	}
-	if (trigger_type == EXT4_JTR_NONE || !ext4_has_metadata_csum(sb))
-		return 0;
-	BUG_ON(trigger_type >= EXT4_JOURNAL_TRIGGER_COUNT);
-	jbd2_journal_set_triggers(bh,
-		&EXT4_SB(sb)->s_journal_triggers[trigger_type].tr_triggers);
-	return 0;
+	return err;
 }
 
 int __ext4_handle_dirty_metadata(const char *where, unsigned int line,

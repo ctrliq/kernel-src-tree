@@ -65,11 +65,21 @@
  *
  * Fast Commit Ineligibility
  * -------------------------
- *
  * Not all operations are supported by fast commits today (e.g extended
- * attributes). Fast commit ineligibility is marked by calling
- * ext4_fc_mark_ineligible(): This makes next fast commit operation to fall back
- * to full commit.
+ * attributes). Fast commit ineligibility is marked by calling one of the
+ * two following functions:
+ *
+ * - ext4_fc_mark_ineligible(): This makes next fast commit operation to fall
+ *   back to full commit. This is useful in case of transient errors.
+ *
+ * - ext4_fc_start_ineligible() and ext4_fc_stop_ineligible() - This makes all
+ *   the fast commits happening between ext4_fc_start_ineligible() and
+ *   ext4_fc_stop_ineligible() and one fast commit after the call to
+ *   ext4_fc_stop_ineligible() to fall back to full commits. It is important to
+ *   make one more fast commit to fall back to full commit after stop call so
+ *   that it guaranteed that the fast commit ineligible operation contained
+ *   within ext4_fc_start_ineligible() and ext4_fc_stop_ineligible() is
+ *   followed by at least 1 full commit.
  *
  * Atomicity of commits
  * --------------------
@@ -156,13 +166,15 @@
  *    fast commit recovery even if that area is invalidated by later full
  *    commits.
  *
- * 1) Fast commit's commit path locks the entire file system during fast
- *    commit. This has significant performance penalty. Instead of that, we
- *    should use ext4_fc_start/stop_update functions to start inode level
- *    updates from ext4_journal_start/stop. Once we do that we can drop file
- *    system locking during commit path.
+ * 1) Make fast commit atomic updates more fine grained. Today, a fast commit
+ *    eligible update must be protected within ext4_fc_start_update() and
+ *    ext4_fc_stop_update(). These routines are called at much higher
+ *    routines. This can be made more fine grained by combining with
+ *    ext4_journal_start().
  *
- * 2) Handle more ineligible cases.
+ * 2) Same above for ext4_fc_start_ineligible() and ext4_fc_stop_ineligible()
+ *
+ * 3) Handle more ineligible cases.
  */
 
 #include <trace/events/ext4.h>
@@ -317,6 +329,44 @@ void ext4_fc_mark_ineligible(struct super_block *sb, int reason)
 }
 
 /*
+ * Start a fast commit ineligible update. Any commits that happen while
+ * such an operation is in progress fall back to full commits.
+ */
+void ext4_fc_start_ineligible(struct super_block *sb, int reason)
+{
+	struct ext4_sb_info *sbi = EXT4_SB(sb);
+
+	if (!test_opt2(sb, JOURNAL_FAST_COMMIT) ||
+	    (EXT4_SB(sb)->s_mount_state & EXT4_FC_REPLAY))
+		return;
+
+	WARN_ON(reason >= EXT4_FC_REASON_MAX);
+	sbi->s_fc_stats.fc_ineligible_reason_count[reason]++;
+	atomic_inc(&sbi->s_fc_ineligible_updates);
+}
+
+/*
+ * Stop a fast commit ineligible update. We set EXT4_MF_FC_INELIGIBLE flag here
+ * to ensure that after stopping the ineligible update, at least one full
+ * commit takes place.
+ */
+void ext4_fc_stop_ineligible(struct super_block *sb)
+{
+	if (!test_opt2(sb, JOURNAL_FAST_COMMIT) ||
+	    (EXT4_SB(sb)->s_mount_state & EXT4_FC_REPLAY))
+		return;
+
+	ext4_set_mount_flag(sb, EXT4_MF_FC_INELIGIBLE);
+	atomic_dec(&EXT4_SB(sb)->s_fc_ineligible_updates);
+}
+
+static inline int ext4_fc_is_ineligible(struct super_block *sb)
+{
+	return (ext4_test_mount_flag(sb, EXT4_MF_FC_INELIGIBLE) ||
+		atomic_read(&EXT4_SB(sb)->s_fc_ineligible_updates));
+}
+
+/*
  * Generic fast commit tracking function. If this is the first time this we are
  * called after a full commit, we initialize fast commit fields and then call
  * __fc_track_fn() with update = 0. If we have already been called after a full
@@ -341,7 +391,7 @@ static int ext4_fc_track_template(
 	    (sbi->s_mount_state & EXT4_FC_REPLAY))
 		return -EOPNOTSUPP;
 
-	if (ext4_test_mount_flag(inode->i_sb, EXT4_MF_FC_INELIGIBLE))
+	if (ext4_fc_is_ineligible(inode->i_sb))
 		return -EINVAL;
 
 	tid = handle->h_transaction->t_tid;
@@ -725,27 +775,29 @@ static bool ext4_fc_add_tlv(struct super_block *sb, u16 tag, u16 len, u8 *val,
 }
 
 /* Same as above, but adds dentry tlv. */
-static bool ext4_fc_add_dentry_tlv(struct super_block *sb, u32 *crc,
-				   struct ext4_fc_dentry_update *fc_dentry)
+static  bool ext4_fc_add_dentry_tlv(struct super_block *sb, u16 tag,
+					int parent_ino, int ino, int dlen,
+					const unsigned char *dname,
+					u32 *crc)
 {
 	struct ext4_fc_dentry_info fcd;
 	struct ext4_fc_tl tl;
-	int dlen = fc_dentry->fcd_name.len;
 	u8 *dst = ext4_fc_reserve_space(sb, sizeof(tl) + sizeof(fcd) + dlen,
 					crc);
 
 	if (!dst)
 		return false;
 
-	fcd.fc_parent_ino = cpu_to_le32(fc_dentry->fcd_parent);
-	fcd.fc_ino = cpu_to_le32(fc_dentry->fcd_ino);
-	tl.fc_tag = cpu_to_le16(fc_dentry->fcd_op);
+	fcd.fc_parent_ino = cpu_to_le32(parent_ino);
+	fcd.fc_ino = cpu_to_le32(ino);
+	tl.fc_tag = cpu_to_le16(tag);
 	tl.fc_len = cpu_to_le16(sizeof(fcd) + dlen);
 	ext4_fc_memcpy(sb, dst, &tl, sizeof(tl), crc);
 	dst += sizeof(tl);
 	ext4_fc_memcpy(sb, dst, &fcd, sizeof(fcd), crc);
 	dst += sizeof(fcd);
-	ext4_fc_memcpy(sb, dst, fc_dentry->fcd_name.name, dlen, crc);
+	ext4_fc_memcpy(sb, dst, dname, dlen, crc);
+	dst += dlen;
 
 	return true;
 }
@@ -768,9 +820,7 @@ static int ext4_fc_write_inode(struct inode *inode, u32 *crc)
 	if (ret)
 		return ret;
 
-	if (ext4_test_inode_flag(inode, EXT4_INODE_INLINE_DATA))
-		inode_len = EXT4_INODE_SIZE(inode->i_sb);
-	else if (EXT4_INODE_SIZE(inode->i_sb) > EXT4_GOOD_OLD_INODE_SIZE)
+	if (EXT4_INODE_SIZE(inode->i_sb) > EXT4_GOOD_OLD_INODE_SIZE)
 		inode_len += ei->i_extra_isize;
 
 	fc_inode.fc_ino = cpu_to_le32(inode->i_ino);
@@ -843,12 +893,6 @@ static int ext4_fc_write_inode_data(struct inode *inode, u32 *crc)
 					    sizeof(lrange), (u8 *)&lrange, crc))
 				return -ENOSPC;
 		} else {
-			unsigned int max = (map.m_flags & EXT4_MAP_UNWRITTEN) ?
-				EXT_UNWRITTEN_MAX_LEN : EXT_INIT_MAX_LEN;
-
-			/* Limit the number of blocks in one extent */
-			map.m_len = min(max, map.m_len);
-
 			fc_ext.fc_ino = cpu_to_le32(inode->i_ino);
 			ex = (struct ext4_extent *)&fc_ext.fc_ex;
 			ex->ee_block = cpu_to_le32(map.m_lblk);
@@ -948,7 +992,11 @@ __releases(&sbi->s_fc_lock)
 				 &sbi->s_fc_dentry_q[FC_Q_MAIN], fcd_list) {
 		if (fc_dentry->fcd_op != EXT4_FC_TAG_CREAT) {
 			spin_unlock(&sbi->s_fc_lock);
-			if (!ext4_fc_add_dentry_tlv(sb, crc, fc_dentry)) {
+			if (!ext4_fc_add_dentry_tlv(
+				sb, fc_dentry->fcd_op,
+				fc_dentry->fcd_parent, fc_dentry->fcd_ino,
+				fc_dentry->fcd_name.len,
+				fc_dentry->fcd_name.name, crc)) {
 				ret = -ENOSPC;
 				goto lock_and_exit;
 			}
@@ -987,7 +1035,11 @@ __releases(&sbi->s_fc_lock)
 		if (ret)
 			goto lock_and_exit;
 
-		if (!ext4_fc_add_dentry_tlv(sb, crc, fc_dentry)) {
+		if (!ext4_fc_add_dentry_tlv(
+			sb, fc_dentry->fcd_op,
+			fc_dentry->fcd_parent, fc_dentry->fcd_ino,
+			fc_dentry->fcd_name.len,
+			fc_dentry->fcd_name.name, crc)) {
 			ret = -ENOSPC;
 			goto lock_and_exit;
 		}
@@ -1072,32 +1124,6 @@ out:
 	return ret;
 }
 
-static void ext4_fc_update_stats(struct super_block *sb, int status,
-				 u64 commit_time, int nblks)
-{
-	struct ext4_fc_stats *stats = &EXT4_SB(sb)->s_fc_stats;
-
-	jbd_debug(1, "Fast commit ended with status = %d", status);
-	if (status == EXT4_FC_STATUS_OK) {
-		stats->fc_num_commits++;
-		stats->fc_numblks += nblks;
-		if (likely(stats->s_fc_avg_commit_time))
-			stats->s_fc_avg_commit_time =
-				(commit_time +
-				 stats->s_fc_avg_commit_time * 3) / 4;
-		else
-			stats->s_fc_avg_commit_time = commit_time;
-	} else if (status == EXT4_FC_STATUS_FAILED ||
-		   status == EXT4_FC_STATUS_INELIGIBLE) {
-		if (status == EXT4_FC_STATUS_FAILED)
-			stats->fc_failed_commits++;
-		stats->fc_ineligible_commits++;
-	} else {
-		stats->fc_skipped_commits++;
-	}
-	trace_ext4_fc_commit_stop(sb, nblks, status);
-}
-
 /*
  * The main commit entry point. Performs a fast commit for transaction
  * commit_tid if needed. If it's not possible to perform a fast commit
@@ -1110,15 +1136,18 @@ int ext4_fc_commit(journal_t *journal, tid_t commit_tid)
 	struct ext4_sb_info *sbi = EXT4_SB(sb);
 	int nblks = 0, ret, bsize = journal->j_blocksize;
 	int subtid = atomic_read(&sbi->s_fc_subtid);
-	int status = EXT4_FC_STATUS_OK, fc_bufs_before = 0;
+	int reason = EXT4_FC_REASON_OK, fc_bufs_before = 0;
 	ktime_t start_time, commit_time;
 
 	trace_ext4_fc_commit_start(sb);
 
 	start_time = ktime_get();
 
-	if (!test_opt2(sb, JOURNAL_FAST_COMMIT))
-		return jbd2_complete_transaction(journal, commit_tid);
+	if (!test_opt2(sb, JOURNAL_FAST_COMMIT) ||
+		(ext4_fc_is_ineligible(sb))) {
+		reason = EXT4_FC_REASON_INELIGIBLE;
+		goto out;
+	}
 
 restart_fc:
 	ret = jbd2_fc_begin_commit(journal, commit_tid);
@@ -1127,52 +1156,67 @@ restart_fc:
 		if (atomic_read(&sbi->s_fc_subtid) <= subtid &&
 			commit_tid > journal->j_commit_sequence)
 			goto restart_fc;
-		ext4_fc_update_stats(sb, EXT4_FC_STATUS_SKIPPED, 0, 0);
-		return 0;
+		reason = EXT4_FC_REASON_ALREADY_COMMITTED;
+		goto out;
 	} else if (ret) {
-		/*
-		 * Commit couldn't start. Just update stats and perform a
-		 * full commit.
-		 */
-		ext4_fc_update_stats(sb, EXT4_FC_STATUS_FAILED, 0, 0);
-		return jbd2_complete_transaction(journal, commit_tid);
-	}
-
-	/*
-	 * After establishing journal barrier via jbd2_fc_begin_commit(), check
-	 * if we are fast commit ineligible.
-	 */
-	if (ext4_test_mount_flag(sb, EXT4_MF_FC_INELIGIBLE)) {
-		status = EXT4_FC_STATUS_INELIGIBLE;
-		goto fallback;
+		sbi->s_fc_stats.fc_ineligible_reason_count[EXT4_FC_COMMIT_FAILED]++;
+		reason = EXT4_FC_REASON_FC_START_FAILED;
+		goto out;
 	}
 
 	fc_bufs_before = (sbi->s_fc_bytes + bsize - 1) / bsize;
 	ret = ext4_fc_perform_commit(journal);
 	if (ret < 0) {
-		status = EXT4_FC_STATUS_FAILED;
-		goto fallback;
+		sbi->s_fc_stats.fc_ineligible_reason_count[EXT4_FC_COMMIT_FAILED]++;
+		reason = EXT4_FC_REASON_FC_FAILED;
+		goto out;
 	}
 	nblks = (sbi->s_fc_bytes + bsize - 1) / bsize - fc_bufs_before;
 	ret = jbd2_fc_wait_bufs(journal, nblks);
 	if (ret < 0) {
-		status = EXT4_FC_STATUS_FAILED;
-		goto fallback;
+		sbi->s_fc_stats.fc_ineligible_reason_count[EXT4_FC_COMMIT_FAILED]++;
+		reason = EXT4_FC_REASON_FC_FAILED;
+		goto out;
 	}
 	atomic_inc(&sbi->s_fc_subtid);
-	ret = jbd2_fc_end_commit(journal);
-	/*
-	 * weight the commit time higher than the average time so we
-	 * don't react too strongly to vast changes in the commit time
-	 */
-	commit_time = ktime_to_ns(ktime_sub(ktime_get(), start_time));
-	ext4_fc_update_stats(sb, status, commit_time, nblks);
-	return ret;
+	jbd2_fc_end_commit(journal);
+out:
+	/* Has any ineligible update happened since we started? */
+	if (reason == EXT4_FC_REASON_OK && ext4_fc_is_ineligible(sb)) {
+		sbi->s_fc_stats.fc_ineligible_reason_count[EXT4_FC_COMMIT_FAILED]++;
+		reason = EXT4_FC_REASON_INELIGIBLE;
+	}
 
-fallback:
-	ret = jbd2_fc_end_commit_fallback(journal);
-	ext4_fc_update_stats(sb, status, 0, 0);
-	return ret;
+	spin_lock(&sbi->s_fc_lock);
+	if (reason != EXT4_FC_REASON_OK &&
+		reason != EXT4_FC_REASON_ALREADY_COMMITTED) {
+		sbi->s_fc_stats.fc_ineligible_commits++;
+	} else {
+		sbi->s_fc_stats.fc_num_commits++;
+		sbi->s_fc_stats.fc_numblks += nblks;
+	}
+	spin_unlock(&sbi->s_fc_lock);
+	nblks = (reason == EXT4_FC_REASON_OK) ? nblks : 0;
+	trace_ext4_fc_commit_stop(sb, nblks, reason);
+	commit_time = ktime_to_ns(ktime_sub(ktime_get(), start_time));
+	/*
+	 * weight the commit time higher than the average time so we don't
+	 * react too strongly to vast changes in the commit time
+	 */
+	if (likely(sbi->s_fc_avg_commit_time))
+		sbi->s_fc_avg_commit_time = (commit_time +
+				sbi->s_fc_avg_commit_time * 3) / 4;
+	else
+		sbi->s_fc_avg_commit_time = commit_time;
+	jbd_debug(1,
+		"Fast commit ended with blks = %d, reason = %d, subtid - %d",
+		nblks, reason, subtid);
+	if (reason == EXT4_FC_REASON_FC_FAILED)
+		return jbd2_fc_end_commit_fallback(journal);
+	if (reason == EXT4_FC_REASON_FC_START_FAILED ||
+		reason == EXT4_FC_REASON_INELIGIBLE)
+		return jbd2_complete_transaction(journal, commit_tid);
+	return 0;
 }
 
 /*
@@ -1483,8 +1527,7 @@ static int ext4_fc_replay_inode(struct super_block *sb, struct ext4_fc_tl *tl,
 	 * crashing. This should be fixed but until then, we calculate
 	 * the number of blocks the inode.
 	 */
-	if (!ext4_test_inode_flag(inode, EXT4_INODE_INLINE_DATA))
-		ext4_ext_replay_set_iblocks(inode);
+	ext4_ext_replay_set_iblocks(inode);
 
 	inode->i_generation = le32_to_cpu(ext4_raw_inode(&iloc)->i_generation);
 	ext4_reset_inode_seed(inode);
@@ -1769,14 +1812,11 @@ ext4_fc_replay_del_range(struct super_block *sb, struct ext4_fc_tl *tl,
 		}
 	}
 
-	down_write(&EXT4_I(inode)->i_data_sem);
-	ret = ext4_ext_remove_space(inode, lrange.fc_lblk,
-				lrange.fc_lblk + lrange.fc_len - 1);
-	up_write(&EXT4_I(inode)->i_data_sem);
-	if (ret) {
-		iput(inode);
-		return 0;
-	}
+	ret = ext4_punch_hole(inode,
+		le32_to_cpu(lrange.fc_lblk) << sb->s_blocksize_bits,
+		le32_to_cpu(lrange.fc_len) <<  sb->s_blocksize_bits);
+	if (ret)
+		jbd_debug(1, "ext4_punch_hole returned %d", ret);
 	ext4_ext_replay_shrink_inode(inode,
 		i_size_read(inode) >> sb->s_blocksize_bits);
 	ext4_mark_inode_dirty(NULL, inode);
@@ -1805,10 +1845,6 @@ static void ext4_fc_set_bitmaps_and_counters(struct super_block *sb)
 		}
 		cur = 0;
 		end = EXT_MAX_BLOCKS;
-		if (ext4_test_inode_flag(inode, EXT4_INODE_INLINE_DATA)) {
-			iput(inode);
-			continue;
-		}
 		while (cur < end) {
 			map.m_lblk = cur;
 			map.m_len = end - cur;
@@ -2133,7 +2169,7 @@ int ext4_fc_info_show(struct seq_file *seq, void *v)
 		"fc stats:\n%ld commits\n%ld ineligible\n%ld numblks\n%lluus avg_commit_time\n",
 		   stats->fc_num_commits, stats->fc_ineligible_commits,
 		   stats->fc_numblks,
-		   div_u64(stats->s_fc_avg_commit_time, 1000));
+		   div_u64(sbi->s_fc_avg_commit_time, 1000));
 	seq_puts(seq, "Ineligible reasons:\n");
 	for (i = 0; i < EXT4_FC_REASON_MAX; i++)
 		seq_printf(seq, "\"%s\":\t%d\n", fc_ineligible_reasons[i],
@@ -2151,9 +2187,4 @@ int __init ext4_fc_init_dentry_cache(void)
 		return -ENOMEM;
 
 	return 0;
-}
-
-void ext4_fc_destroy_dentry_cache(void)
-{
-	kmem_cache_destroy(ext4_fc_dentry_cachep);
 }
