@@ -89,6 +89,8 @@ struct dev_pagemap_ops {
 	 * the page back to a CPU accessible page.
 	 */
 	vm_fault_t (*migrate_to_ram)(struct vm_fault *vmf);
+	RH_KABI_RESERVE(1)
+	RH_KABI_RESERVE(2)
 };
 
 #define PGMAP_ALTMAP_VALID	(1 << 0)
@@ -119,6 +121,11 @@ struct dev_pagemap {
 	const struct dev_pagemap_ops *ops;
 	void *owner;
 	int nr_range;
+	RH_KABI_RESERVE(1)
+	RH_KABI_RESERVE(2)
+	RH_KABI_RESERVE(3)
+	RH_KABI_RESERVE(4)
+	RH_KABI_RESERVE(5)
 	union {
 		struct range range;
 		struct range ranges[0];
