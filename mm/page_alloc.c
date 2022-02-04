@@ -153,7 +153,9 @@ struct pcpu_drain {
 	struct work_struct work;
 };
 static DEFINE_MUTEX(pcpu_drain_mutex);
+#ifndef CONFIG_PREEMPT_RT
 static DEFINE_PER_CPU(struct pcpu_drain, pcpu_drain);
+#endif
 
 #ifdef CONFIG_GCC_PLUGIN_LATENT_ENTROPY
 volatile unsigned long latent_entropy __latent_entropy;
@@ -3110,13 +3112,13 @@ static void drain_pages_zone(unsigned int cpu, struct zone *zone)
 	unsigned long flags;
 	struct per_cpu_pages *pcp;
 
-	local_lock_irqsave(&pagesets.lock, flags);
+	local_lock_irqsave_on(&pagesets.lock, flags, cpu);
 
 	pcp = per_cpu_ptr(zone->per_cpu_pageset, cpu);
 	if (pcp->count)
 		free_pcppages_bulk(zone, pcp->count, pcp);
 
-	local_unlock_irqrestore(&pagesets.lock, flags);
+	local_unlock_irqrestore_on(&pagesets.lock, flags, cpu);
 }
 
 /*
@@ -3151,6 +3153,7 @@ void drain_local_pages(struct zone *zone)
 		drain_pages(cpu);
 }
 
+#ifndef CONFIG_PREEMPT_RT
 static void drain_local_pages_wq(struct work_struct *work)
 {
 	struct pcpu_drain *drain;
@@ -3168,6 +3171,7 @@ static void drain_local_pages_wq(struct work_struct *work)
 	drain_local_pages(drain->zone);
 	migrate_enable();
 }
+#endif
 
 /*
  * The implementation of drain_all_pages(), exposing an extra parameter to
@@ -3244,6 +3248,7 @@ static void __drain_all_pages(struct zone *zone, bool force_all_cpus)
 			cpumask_clear_cpu(cpu, &cpus_with_pcps);
 	}
 
+#ifndef CONFIG_PREEMPT_RT
 	for_each_cpu(cpu, &cpus_with_pcps) {
 		struct pcpu_drain *drain = per_cpu_ptr(&pcpu_drain, cpu);
 
@@ -3253,6 +3258,14 @@ static void __drain_all_pages(struct zone *zone, bool force_all_cpus)
 	}
 	for_each_cpu(cpu, &cpus_with_pcps)
 		flush_work(&per_cpu_ptr(&pcpu_drain, cpu)->work);
+#else
+	for_each_cpu(cpu, &cpus_with_pcps) {
+	if (zone)
+		drain_pages_zone(cpu, zone);
+	else
+		drain_pages(cpu);
+	}
+#endif
 
 	mutex_unlock(&pcpu_drain_mutex);
 }
