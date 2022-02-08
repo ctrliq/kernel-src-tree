@@ -154,6 +154,7 @@ trap cleanup EXIT
 for i in "$ns1" "$ns2" "$ns3" "$ns4";do
 	ip netns add $i || exit $ksft_skip
 	ip -net $i link set lo up
+	ip netns exec ${i} sysctl -q net.mptcp.enabled=1
 done
 
 #  "$ns1"              ns2                    ns3                     ns4
@@ -273,13 +274,12 @@ check_mptcp_disabled()
 	disabled_ns="ns_disabled-$sech-$(mktemp -u XXXXXX)"
 	ip netns add ${disabled_ns} || exit $ksft_skip
 
-	# net.mptcp.enabled should be enabled by default
-	if [ "$(ip netns exec ${disabled_ns} sysctl net.mptcp.enabled | awk '{ print $3 }')" -ne 1 ]; then
-		echo -e "net.mptcp.enabled sysctl is not 1 by default\t\t[ FAIL ]"
+	# net.mptcp.enabled should be disabled by default
+	if [ "$(ip netns exec ${disabled_ns} sysctl net.mptcp.enabled | awk '{ print $3 }')" -ne 0 ]; then
+		echo -e "net.mptcp.enabled sysctl is not 0 by default\t\t[ FAIL ]"
 		ret=1
 		return 1
 	fi
-	ip netns exec ${disabled_ns} sysctl -q net.mptcp.enabled=0
 
 	local err=0
 	LC_ALL=C ip netns exec ${disabled_ns} ./mptcp_connect -p 10000 -s MPTCP 127.0.0.1 < "$cin" 2>&1 | \
