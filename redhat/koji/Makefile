@@ -20,7 +20,7 @@
 include ../Makefile.common
 
 notes:
-	git fetch --force origin refs/notes/*:refs/notes/*
+	$(GIT) fetch --force origin refs/notes/*:refs/notes/*
 
 buildid: notes
 	$(eval BUILDID := $(shell git notes --ref buildid show HEAD || echo .test))
