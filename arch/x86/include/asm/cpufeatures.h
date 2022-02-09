@@ -12,9 +12,11 @@
 
 /*
  * Defines x86 CPU feature bits
+ *
+ * These have been expanded for RH_KABI.
  */
-#define NCAPINTS			20	   /* N 32-bit words worth of info */
-#define NBUGINTS			1	   /* N 32-bit bug flags */
+#define NCAPINTS			30	   /* N 32-bit words worth of info */
+#define NBUGINTS			2	   /* N 32-bit bug flags */
 
 /*
  * Note: If the comment begins with a quoted string, that string is used
