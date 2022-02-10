@@ -616,7 +616,7 @@ static void worker_pkt_dump(void)
 	void *ptr;
 
 	fprintf(stdout, "---------------------------------------\n");
-	for (int iter = 0; iter < num_frames - 1; iter++) {
+	for (int iter = 0; iter < num_frames; iter++) {
 		ptr = pkt_buf[iter]->payload;
 		ethhdr = ptr;
 		iphdr = ptr + sizeof(*ethhdr);
@@ -643,11 +643,6 @@ static void worker_pkt_dump(void)
 		/*extract L5 frame */
 		payload = *((uint32_t *)(ptr + PKT_HDR_SIZE));
 
-		if (payload == EOT) {
-			print_verbose("End-of-transmission frame received\n");
-			fprintf(stdout, "---------------------------------------\n");
-			break;
-		}
 		fprintf(stdout, "DEBUG>> L5: payload: %d\n", payload);
 		fprintf(stdout, "---------------------------------------\n");
 	}
@@ -710,28 +705,24 @@ static void worker_pkt_validate(void)
 		/*do not increment pktcounter if !(tos=0x9 and ipv4) */
 		if (iphdr->version == IP_PKT_VER && iphdr->tos == IP_PKT_TOS) {
 			payloadseqnum = *((uint32_t *)(pkt_node_rx_q->pkt_frame + PKT_HDR_SIZE));
-			if (debug_pkt_dump && payloadseqnum != EOT) {
+			if (debug_pkt_dump) {
 				pkt_obj = malloc(sizeof(*pkt_obj));
 				pkt_obj->payload = malloc(PKT_SIZE);
 				memcpy(pkt_obj->payload, pkt_node_rx_q->pkt_frame, PKT_SIZE);
 				pkt_buf[payloadseqnum] = pkt_obj;
 			}
 
-			if (payloadseqnum == EOT) {
-				print_verbose("End-of-transmission frame received: PASS\n");
-				sigvar = 1;
-				break;
-			}
-
-			if (prev_pkt + 1 != payloadseqnum) {
+			if (pkt_counter % num_frames != payloadseqnum) {
 				ksft_test_result_fail
-				    ("ERROR: [%s] prev_pkt [%d], payloadseqnum [%d]\n",
-				     __func__, prev_pkt, payloadseqnum);
+				    ("ERROR: [%s] expected counter [%d], payloadseqnum [%d]\n",
+				     __func__, pkt_counter, payloadseqnum);
 				ksft_exit_xfail();
 			}
 
-			prev_pkt = payloadseqnum;
-			pkt_counter++;
+			if (++pkt_counter == opt_pkt_count) {
+				sigvar = 1;
+				break;
+			}
 		} else {
 			ksft_print_msg("Invalid frame received: ");
 			ksft_print_msg("[IP_PKT_VER: %02X], [IP_PKT_TOS: %02X]\n", iphdr->version,
@@ -821,11 +812,7 @@ static void *worker_testapp_validate_tx(void *arg)
 		thread_common_ops(ifobject, bufs);
 
 	for (int i = 0; i < num_frames; i++) {
-		/*send EOT frame */
-		if (i == (num_frames - 1))
-			data.seqnum = -1;
-		else
-			data.seqnum = i;
+		data.seqnum = i;
 		gen_udp_hdr(&data, ifobject, udp_hdr);
 		gen_ip_hdr(ifobject, ip_hdr);
 		gen_udp_csum(udp_hdr, ip_hdr);
@@ -833,8 +820,7 @@ static void *worker_testapp_validate_tx(void *arg)
 		gen_eth_frame(ifobject->umem, i * XSK_UMEM__DEFAULT_FRAME_SIZE);
 	}
 
-	print_verbose("Sending %d packets on interface %s\n",
-		      (opt_pkt_count - 1), ifobject->ifname);
+	print_verbose("Sending %d packets on interface %s\n", opt_pkt_count, ifobject->ifname);
 	tx_only_all(ifobject);
 
 	testapp_cleanup_xsk_res(ifobject);
@@ -909,7 +895,7 @@ static void testapp_validate(void)
 
 	if (debug_pkt_dump && test_type != TEST_TYPE_STATS) {
 		worker_pkt_dump();
-		for (int iter = 0; iter < num_frames - 1; iter++) {
+		for (int iter = 0; iter < num_frames; iter++) {
 			free(pkt_buf[iter]->payload);
 			free(pkt_buf[iter]);
 		}
@@ -926,7 +912,6 @@ static void testapp_teardown(void)
 
 	for (i = 0; i < MAX_TEARDOWN_ITER; i++) {
 		pkt_counter = 0;
-		prev_pkt = -1;
 		sigvar = 0;
 		print_verbose("Creating socket\n");
 		testapp_validate();
@@ -954,7 +939,6 @@ static void testapp_bidi(void)
 {
 	for (int i = 0; i < MAX_BIDI_ITER; i++) {
 		pkt_counter = 0;
-		prev_pkt = -1;
 		sigvar = 0;
 		print_verbose("Creating socket\n");
 		testapp_validate();
@@ -988,7 +972,6 @@ static void testapp_bpf_res(void)
 
 	for (i = 0; i < MAX_BPF_ITER; i++) {
 		pkt_counter = 0;
-		prev_pkt = -1;
 		sigvar = 0;
 		print_verbose("Creating socket\n");
 		testapp_validate();
@@ -1064,7 +1047,6 @@ static void run_pkt_test(int mode, int type)
 	xdp_flags = XDP_FLAGS_UPDATE_IF_NOEXIST;
 	pkt_counter = 0;
 	second_step = 0;
-	prev_pkt = -1;
 	sigvar = 0;
 	stat_test_type = -1;
 	rxqsize = XSK_RING_CONS__DEFAULT_NUM_DESCS;
