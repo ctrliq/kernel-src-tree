@@ -653,6 +653,7 @@ static void tx_only_all(struct ifobject *ifobject)
 
 		tx_only(ifobject->xsk, &frame_nb, batch_size);
 		pkt_cnt += batch_size;
+		usleep(10);
 	}
 
 	if (opt_pkt_count)
