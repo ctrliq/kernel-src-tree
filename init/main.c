@@ -910,7 +910,7 @@ static void __init print_unknown_bootoptions(void)
 	/* Start at unknown_options[1] to skip the initial space */
 	pr_notice("Unknown kernel command line parameters \"%s\", will be passed to user space.\n",
 		&unknown_options[1]);
-	memblock_free(__pa(unknown_options), len);
+	memblock_free_ptr(unknown_options, len);
 }
 
 asmlinkage __visible void __init __no_sanitize_address start_kernel(void)
