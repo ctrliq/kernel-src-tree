@@ -660,7 +660,6 @@ static int ets_qdisc_change(struct Qdisc *sch, struct nlattr *opt,
 
 	q->nbands = nbands;
 	for (i = nstrict; i < q->nstrict; i++) {
-		gnet_stats_basic_sync_init(&q->classes[i].bstats);
 		if (q->classes[i].qdisc->q.qlen) {
 			list_add_tail(&q->classes[i].alist, &q->active);
 			q->classes[i].deficit = quanta[i];
@@ -691,7 +690,7 @@ static int ets_qdisc_change(struct Qdisc *sch, struct nlattr *opt,
 		q->classes[i].qdisc = NULL;
 		q->classes[i].quantum = 0;
 		q->classes[i].deficit = 0;
-		memset(&q->classes[i].bstats, 0, sizeof(q->classes[i].bstats));
+		gnet_stats_basic_sync_init(&q->classes[i].bstats);
 		memset(&q->classes[i].qstats, 0, sizeof(q->classes[i].qstats));
 	}
 	return 0;
