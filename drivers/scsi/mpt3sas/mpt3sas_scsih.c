@@ -12019,6 +12019,66 @@ _scsih_determine_hba_mpi_version(struct pci_dev *pdev)
 	return 0;
 }
 
+#ifdef CONFIG_RHEL_DIFFERENCES
+static const struct pci_device_id rh_deprecated_pci_table[] = {
+
+	{0}     /* Terminating entry */
+};
+
+static const struct pci_device_id rh_unmaintained_pci_table[] = {
+	/* Thunderbolt ~ 2208 */
+	{ MPI2_MFGPAGE_VENDORID_LSI, MPI2_MFGPAGE_DEVID_SAS2208_1,
+		PCI_ANY_ID, PCI_ANY_ID },
+	{ MPI2_MFGPAGE_VENDORID_LSI, MPI2_MFGPAGE_DEVID_SAS2208_2,
+		PCI_ANY_ID, PCI_ANY_ID },
+	{ MPI2_MFGPAGE_VENDORID_LSI, MPI2_MFGPAGE_DEVID_SAS2208_3,
+		PCI_ANY_ID, PCI_ANY_ID },
+	{ MPI2_MFGPAGE_VENDORID_LSI, MPI2_MFGPAGE_DEVID_SAS2208_4,
+		PCI_ANY_ID, PCI_ANY_ID },
+	{ MPI2_MFGPAGE_VENDORID_LSI, MPI2_MFGPAGE_DEVID_SAS2208_5,
+		PCI_ANY_ID, PCI_ANY_ID },
+	{ MPI2_MFGPAGE_VENDORID_LSI, MPI2_MFGPAGE_DEVID_SAS2208_6,
+		PCI_ANY_ID, PCI_ANY_ID },
+	/* Mustang ~ 2308 */
+	{ MPI2_MFGPAGE_VENDORID_LSI, MPI2_MFGPAGE_DEVID_SAS2308_1,
+		PCI_ANY_ID, PCI_ANY_ID },
+	{ MPI2_MFGPAGE_VENDORID_LSI, MPI2_MFGPAGE_DEVID_SAS2308_2,
+		PCI_ANY_ID, PCI_ANY_ID },
+	{ MPI2_MFGPAGE_VENDORID_LSI, MPI2_MFGPAGE_DEVID_SAS2308_3,
+		PCI_ANY_ID, PCI_ANY_ID },
+
+	{0}     /* Terminating entry */
+};
+
+
+static const struct pci_device_id rh_disabled_pci_table[] = {
+	/* Spitfire ~ 2004 */
+	{ MPI2_MFGPAGE_VENDORID_LSI, MPI2_MFGPAGE_DEVID_SAS2004,
+		PCI_ANY_ID, PCI_ANY_ID },
+	/* Falcon ~ 2008 */
+	{ MPI2_MFGPAGE_VENDORID_LSI, MPI2_MFGPAGE_DEVID_SAS2008,
+		PCI_ANY_ID, PCI_ANY_ID },
+	/* Liberator ~ 2108 */
+	{ MPI2_MFGPAGE_VENDORID_LSI, MPI2_MFGPAGE_DEVID_SAS2108_1,
+		PCI_ANY_ID, PCI_ANY_ID },
+	{ MPI2_MFGPAGE_VENDORID_LSI, MPI2_MFGPAGE_DEVID_SAS2108_2,
+		PCI_ANY_ID, PCI_ANY_ID },
+	{ MPI2_MFGPAGE_VENDORID_LSI, MPI2_MFGPAGE_DEVID_SAS2108_3,
+		PCI_ANY_ID, PCI_ANY_ID },
+	/* Meteor ~ 2116 */
+	{ MPI2_MFGPAGE_VENDORID_LSI, MPI2_MFGPAGE_DEVID_SAS2116_1,
+		PCI_ANY_ID, PCI_ANY_ID },
+	{ MPI2_MFGPAGE_VENDORID_LSI, MPI2_MFGPAGE_DEVID_SAS2116_2,
+		PCI_ANY_ID, PCI_ANY_ID },
+
+	/* SSS6200 */
+	{ MPI2_MFGPAGE_VENDORID_LSI, MPI2_MFGPAGE_DEVID_SSS6200,
+		PCI_ANY_ID, PCI_ANY_ID },
+
+	{0}     /* Terminating entry */
+};
+#endif
+
 /**
  * _scsih_probe - attach and add scsi host
  * @pdev: PCI device struct
@@ -12034,6 +12094,14 @@ _scsih_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 	int rv;
 	u16 hba_mpi_version;
 	int iopoll_q_count = 0;
+
+#ifdef CONFIG_RHEL_DIFFERENCES
+	if (pci_hw_disabled(rh_disabled_pci_table, pdev))
+		return -ENODEV;
+
+	pci_hw_deprecated(rh_deprecated_pci_table, pdev);
+	pci_hw_unmaintained(rh_unmaintained_pci_table, pdev);
+#endif
 
 	/* Determine in which MPI version class this pci device belongs */
 	hba_mpi_version = _scsih_determine_hba_mpi_version(pdev);
@@ -12564,7 +12632,6 @@ bool scsih_ncq_prio_supp(struct scsi_device *sdev)
  * The pci device ids are defined in mpi/mpi2_cnfg.h.
  */
 static const struct pci_device_id mpt3sas_pci_table[] = {
-#ifndef CONFIG_RHEL_DIFFERENCES
 	/* Spitfire ~ 2004 */
 	{ MPI2_MFGPAGE_VENDORID_LSI, MPI2_MFGPAGE_DEVID_SAS2004,
 		PCI_ANY_ID, PCI_ANY_ID },
@@ -12583,7 +12650,6 @@ static const struct pci_device_id mpt3sas_pci_table[] = {
 		PCI_ANY_ID, PCI_ANY_ID },
 	{ MPI2_MFGPAGE_VENDORID_LSI, MPI2_MFGPAGE_DEVID_SAS2116_2,
 		PCI_ANY_ID, PCI_ANY_ID },
-#endif
 	/* Thunderbolt ~ 2208 */
 	{ MPI2_MFGPAGE_VENDORID_LSI, MPI2_MFGPAGE_DEVID_SAS2208_1,
 		PCI_ANY_ID, PCI_ANY_ID },
@@ -12608,11 +12674,9 @@ static const struct pci_device_id mpt3sas_pci_table[] = {
 		PCI_ANY_ID, PCI_ANY_ID },
 	{ MPI2_MFGPAGE_VENDORID_LSI, MPI2_MFGPAGE_DEVID_SWITCH_MPI_EP_1,
 		PCI_ANY_ID, PCI_ANY_ID },
-#ifndef CONFIG_RHEL_DIFFERENCES
 	/* SSS6200 */
 	{ MPI2_MFGPAGE_VENDORID_LSI, MPI2_MFGPAGE_DEVID_SSS6200,
 		PCI_ANY_ID, PCI_ANY_ID },
-#endif
 	/* Fury ~ 3004 and 3008 */
 	{ MPI2_MFGPAGE_VENDORID_LSI, MPI25_MFGPAGE_DEVID_SAS3004,
 		PCI_ANY_ID, PCI_ANY_ID },
