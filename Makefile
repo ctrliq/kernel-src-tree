@@ -6,6 +6,7 @@ all:
 	@$(MAKE) -C scripts fullbuild
 	scripts/yaml2RHMAINTAINERS info/owners.yaml > info/RHMAINTAINERS
 	scripts/yaml2CODEOWNERS info/owners.yaml > info/CODEOWNERS
+	scripts/verifySubsystems info/owners.yaml
 
 clean:
 	@$(MAKE) -C scripts clean
