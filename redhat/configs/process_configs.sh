@@ -226,15 +226,17 @@ function process_configs()
 	for cfg in "$SCRIPT_DIR/${PACKAGE_NAME}${KVERREL}${SUBARCH}"*.config
 	do
 		arch=$(head -1 "$cfg" | cut -b 3-)
-		cfgtmp="${cfg}.tmp"
-		cfgorig="${cfg}.orig"
-		cat "$cfg" > "$cfgorig"
 
 		if [ "$arch" = "EMPTY" ]
 		then
 			# This arch is intentionally left blank
 			continue
 		fi
+
+		cfgtmp="${cfg}.tmp"
+		cfgorig="${cfg}.orig"
+		cat "$cfg" > "$cfgorig"
+
 		echo -n "Processing $cfg ... "
 
 		make ${MAKEOPTS} ARCH="$arch" CROSS_COMPILE=$(get_cross_compile $arch) KCONFIG_CONFIG="$cfgorig" listnewconfig >& .listnewconfig
