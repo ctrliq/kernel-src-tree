@@ -3177,12 +3177,12 @@ static bool filemap_map_pmd(struct vm_fault *vmf, struct page *page)
 	}
 
 	if (pmd_none(*vmf->pmd) && PageTransHuge(page)) {
-	    vm_fault_t ret = do_set_pmd(vmf, page);
-	    if (!ret) {
-		    /* The page is mapped successfully, reference consumed. */
-		    unlock_page(page);
-		    return true;
-	    }
+		vm_fault_t ret = do_set_pmd(vmf, page);
+		if (!ret) {
+			/* The page is mapped successfully, reference consumed. */
+			unlock_page(page);
+			return true;
+		}
 	}
 
 	if (pmd_none(*vmf->pmd)) {
@@ -3226,8 +3226,6 @@ static struct page *next_uptodate_page(struct page *page,
 		if (unlikely(page != xas_reload(xas)))
 			goto skip;
 		if (!PageUptodate(page) || PageReadahead(page))
-			goto skip;
-		if (PageHWPoison(page))
 			goto skip;
 		if (!trylock_page(page))
 			goto skip;
