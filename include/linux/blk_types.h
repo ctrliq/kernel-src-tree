@@ -291,6 +291,9 @@ struct bio {
 
 	struct bio_set		*bi_pool;
 
+	RH_KABI_RESERVE(1)
+	RH_KABI_RESERVE(2)
+
 	/*
 	 * We can inline a number of vecs at the end of the bio, to avoid
 	 * double allocations for a small number of bio_vecs. This member

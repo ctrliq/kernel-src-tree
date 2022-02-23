@@ -639,6 +639,11 @@ struct bio_set {
 	 * Hot un-plug notifier for the per-cpu cache, if used
 	 */
 	struct hlist_node cpuhp_dead;
+
+	RH_KABI_RESERVE(1)
+	RH_KABI_RESERVE(2)
+	RH_KABI_RESERVE(3)
+	RH_KABI_RESERVE(4)
 };
 
 static inline bool bioset_initialized(struct bio_set *bs)
