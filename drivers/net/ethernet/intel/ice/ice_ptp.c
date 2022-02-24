@@ -966,7 +966,7 @@ int ice_ptp_set_ts_config(struct ice_pf *pf, struct ifreq *ifr)
  * The timestamp is in ns, so we must convert the result first.
  */
 void
-ice_ptp_rx_hwtstamp(struct ice_ring *rx_ring,
+ice_ptp_rx_hwtstamp(struct ice_rx_ring *rx_ring,
 		    union ice_32b_rx_flex_desc *rx_desc, struct sk_buff *skb)
 {
 	u32 ts_high;
@@ -1063,17 +1063,6 @@ static long ice_ptp_create_clock(struct ice_pf *pf)
 
 	info = &pf->ptp.info;
 	dev = ice_pf_to_dev(pf);
-
-	/* Allocate memory for kernel pins interface */
-	if (info->n_pins) {
-		info->pin_config = devm_kcalloc(dev, info->n_pins,
-						sizeof(*info->pin_config),
-						GFP_KERNEL);
-		if (!info->pin_config) {
-			info->n_pins = 0;
-			return -ENOMEM;
-		}
-	}
 
 	/* Attempt to register the clock before enabling the hardware. */
 	clock = ptp_clock_register(info, dev);
@@ -1281,14 +1270,17 @@ ice_ptp_flush_tx_tracker(struct ice_pf *pf, struct ice_ptp_tx *tx)
 	for (idx = 0; idx < tx->len; idx++) {
 		u8 phy_idx = idx + tx->quad_offset;
 
-		/* Clear any potential residual timestamp in the PHY block */
-		if (!pf->hw.reset_ongoing)
-			ice_clear_phy_tstamp(&pf->hw, tx->quad, phy_idx);
-
+		spin_lock(&tx->lock);
 		if (tx->tstamps[idx].skb) {
 			dev_kfree_skb_any(tx->tstamps[idx].skb);
 			tx->tstamps[idx].skb = NULL;
 		}
+		clear_bit(idx, tx->in_use);
+		spin_unlock(&tx->lock);
+
+		/* Clear any potential residual timestamp in the PHY block */
+		if (!pf->hw.reset_ongoing)
+			ice_clear_phy_tstamp(&pf->hw, tx->quad, phy_idx);
 	}
 }
 
@@ -1533,6 +1525,9 @@ err_kworker:
  */
 void ice_ptp_release(struct ice_pf *pf)
 {
+	if (!test_bit(ICE_FLAG_PTP, pf->flags))
+		return;
+
 	/* Disable timestamping for both Tx and Rx */
 	ice_ptp_cfg_timestamp(pf, false);
 
