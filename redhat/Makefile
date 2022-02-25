@@ -326,11 +326,10 @@ dist-release-finish: setup-source
 	@cp $(SOURCES)/$(CHANGELOG) $(REDHAT)/$(CHANGELOG)
 	@$(GIT) add $(REDHAT)/$(CHANGELOG)
 	@$(GIT) add $(REDHAT)/marker
-	@echo "[redhat] $(PACKAGE_NAME)-$(STAMP_VERSION)-$(PKGRELEASE)" > /tmp/rtkcommit
-	@echo "" >> /tmp/rtkcommit
-	@echo "Bugzilla: $(RTBZ)" >> /tmp/rtkcommit
-	@echo "" >> /tmp/rtkcommit
-	@$(GIT) commit -F /tmp/rtkcommit -s ../Makefile.rhelver $(REDHAT)/marker $(REDHAT)/$(CHANGELOG) kernel.spec.template
+	@$(GIT) commit \
+		-m "[redhat] $(PACKAGE_NAME)-$(STAMP_VERSION)-$(PKGRELEASE)" \
+		-m "Bugzilla: $(RTBZ)" \
+		-s ../Makefile.rhelver $(REDHAT)/marker $(REDHAT)/$(CHANGELOG) kernel.spec.template
 dist-release-changed: setup-source
 	@cp $(SOURCES)/$(CHANGELOG) $(REDHAT)/$(CHANGELOG)
 	@echo $(MARKER) > $(REDHAT)/marker
