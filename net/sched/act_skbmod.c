@@ -32,7 +32,7 @@ static int tcf_skbmod_act(struct sk_buff *skb, const struct tc_action *a,
 	int err;
 
 	tcf_lastuse_update(&d->tcf_tm);
-	bstats_cpu_update(this_cpu_ptr(d->common.cpu_bstats), skb);
+	bstats_update(this_cpu_ptr(d->common.cpu_bstats), skb);
 
 	action = READ_ONCE(d->tcf_action);
 	if (unlikely(action == TC_ACT_SHOT))

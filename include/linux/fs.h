@@ -704,7 +704,7 @@ struct inode {
 		struct pipe_inode_info	*i_pipe;
 		struct cdev		*i_cdev;
 		char			*i_link;
-		unsigned		__i_dir_seq;
+		unsigned		i_dir_seq;
 	};
 
 	__u32			i_generation;
@@ -1035,6 +1035,7 @@ static inline struct file *get_file(struct file *f)
 #define FL_UNLOCK_PENDING	512 /* Lease is being broken */
 #define FL_OFDLCK	1024	/* lock is "owned" by struct file */
 #define FL_LAYOUT	2048	/* outstanding pNFS layout */
+#define FL_RECLAIM	4096	/* reclaiming from a reboot server */
 
 #define FL_CLOSE_POSIX (FL_POSIX | FL_CLOSE)
 

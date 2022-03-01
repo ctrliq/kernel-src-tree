@@ -18,7 +18,6 @@
 #include <linux/cpu.h>
 #include <linux/notifier.h>
 #include <linux/smp.h>
-#include <linux/interrupt.h>
 #include <linux/smpboot.h>
 #include <asm/processor.h>
 #include <linux/kasan.h>
@@ -179,8 +178,9 @@ bool irq_work_needs_cpu(void)
 	raised = this_cpu_ptr(&raised_list);
 	lazy = this_cpu_ptr(&lazy_list);
 
-	if (llist_empty(raised) && llist_empty(lazy))
-		return false;
+	if (llist_empty(raised) || arch_irq_work_has_interrupt())
+		if (llist_empty(lazy))
+			return false;
 
 	/* All work should have been flushed before going offline */
 	WARN_ON_ONCE(cpu_is_offline(smp_processor_id()));

@@ -695,13 +695,12 @@ void flush_smp_call_function_from_idle(void)
 	flush_smp_call_function_queue(true);
 
 	if (local_softirq_pending()) {
-
 		if (!IS_ENABLED(CONFIG_PREEMPT_RT)) {
 			do_softirq();
 		} else {
 			struct task_struct *ksoftirqd = this_cpu_ksoftirqd();
 
-			if (ksoftirqd && task_is_running(ksoftirqd))
+			if (ksoftirqd && !task_is_running(ksoftirqd))
 				wake_up_process(ksoftirqd);
 		}
 	}

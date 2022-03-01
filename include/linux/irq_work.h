@@ -57,7 +57,7 @@ static inline bool irq_work_is_busy(struct irq_work *work)
 
 static inline bool irq_work_is_hard(struct irq_work *work)
 {
-       return atomic_read(&work->node.a_flags) & IRQ_WORK_HARD_IRQ;
+	return atomic_read(&work->node.a_flags) & IRQ_WORK_HARD_IRQ;
 }
 
 bool irq_work_queue(struct irq_work *work);
@@ -76,12 +76,6 @@ void irq_work_single(void *arg);
 static inline bool irq_work_needs_cpu(void) { return false; }
 static inline void irq_work_run(void) { }
 static inline void irq_work_single(void *arg) { }
-#endif
-
-#if defined(CONFIG_IRQ_WORK) && defined(CONFIG_PREEMPT_RT)
-void irq_work_tick_soft(void);
-#else
-static inline void irq_work_tick_soft(void) { }
 #endif
 
 #endif /* _LINUX_IRQ_WORK_H */
