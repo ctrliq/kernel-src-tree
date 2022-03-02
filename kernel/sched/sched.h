@@ -1116,7 +1116,7 @@ struct rq {
 
 #ifdef CONFIG_CPU_IDLE
 	/* Must be inspected within a rcu lock section */
-	struct cpuidle_state	*idle_state;
+	RH_KABI_EXCLUDE(struct cpuidle_state	*idle_state)
 #endif
 
 #ifdef CONFIG_SMP
