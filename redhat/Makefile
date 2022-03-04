@@ -207,9 +207,6 @@ endif
 
 FLAVOR =
 
-RHGITURL?=$(shell $(GIT) config rhg.url || $(GIT) config remote.origin.url)
-RHGITCOMMIT?=$(shell $(GIT) log -1 --pretty=format:%H)
-
 # this section is needed in order to make O= to work
 _OUTPUT := ..
 ifeq ("$(origin O)", "command line")
