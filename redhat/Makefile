@@ -5,10 +5,10 @@ TOPDIR:=$(shell $(GIT) rev-parse --show-toplevel)
 REDHAT:=$(TOPDIR)/redhat
 include $(TOPDIR)/Makefile.rhelver
 
-RPMBUILD := $(shell if [ -x "/usr/bin/rpmbuild" ]; then echo rpmbuild; \
-                   else echo rpm; fi)
+RPMBUILD:=$(shell if [ -x "/usr/bin/rpmbuild" ]; then echo rpmbuild; \
+                  else echo rpm; fi)
 
-MACH :=  $(shell uname -m)
+MACH:=$(shell uname -m)
 RPMKVERSION:=$(shell $(GIT) show $(HEAD):Makefile | sed -ne '/^VERSION\ =\ /{s///;p;q}')
 RPMKPATCHLEVEL:=$(shell $(GIT) show $(HEAD):Makefile | sed -ne '/^PATCHLEVEL\ =\ /{s///;p;q}')
 RPMKSUBLEVEL:=$(shell $(GIT) show $(HEAD):Makefile | sed -ne '/^SUBLEVEL\ =\ /{s///;p;q}')
@@ -112,8 +112,6 @@ SRPMS:=$(RPM)/SRPMS
 SOURCES:=$(RPM)/SOURCES
 TESTPATCH:=$(REDHAT)/linux-kernel-test.patch
 ARCH_LIST=aarch64 ppc64le s390x x86_64
-
-STAMP_VERSION:=$(KVERSION)
 
 LOCVERFILE:=../localversion
 # create an empty localversion file if you don't want a local buildid
@@ -521,7 +519,7 @@ dist-release-finish: setup-source
 	@cp $(SOURCES)/$(CHANGELOG) $(REDHAT)/$(CHANGELOG)
 	@$(GIT) add $(REDHAT)/$(CHANGELOG)
 	@$(GIT) add $(REDHAT)/marker
-	@$(GIT) commit -s ../Makefile.rhelver $(REDHAT)/marker $(REDHAT)/$(CHANGELOG) $(PACKAGE_NAME).spec.template -m "[redhat] $(PACKAGE_NAME)-$(STAMP_VERSION)-$(PKGRELEASE)"
+	@$(GIT) commit -s ../Makefile.rhelver $(REDHAT)/marker $(REDHAT)/$(CHANGELOG) $(PACKAGE_NAME).spec.template -m "[redhat] $(PACKAGE_NAME)-$(KVERSION)-$(PKGRELEASE)"
 dist-release-changed: setup-source
 	@cp $(SOURCES)/$(CHANGELOG) $(REDHAT)/$(CHANGELOG)
 	@echo $(MARKER) > $(REDHAT)/marker
@@ -537,7 +535,7 @@ dist-release-changed: setup-source
 dist-release: dist-clean-sources
 	@$(MAKE) dist-release-changed
 dist-release-tag:
-	@$(GIT) tag -a -m "$(PACKAGE_NAME)-$(STAMP_VERSION)-$(PKGRELEASE)" $(PACKAGE_NAME)-$(STAMP_VERSION)-$(PKGRELEASE)
+	@$(GIT) tag -a -m "$(PACKAGE_NAME)-$(KVERSION)-$(PKGRELEASE)" $(PACKAGE_NAME)-$(KVERSION)-$(PKGRELEASE)
 
 git-tree-check:
 	@if test -n "$(DIST_PUSH)" && test -z "$(shell $(GIT) remote get-url gitlab 2>/dev/null)"; then \
