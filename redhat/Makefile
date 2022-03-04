@@ -132,22 +132,32 @@ ifeq ("$(DISTRO)", "fedora")
   SINGLE_TARBALL:=0
   TARFILE_RELEASE:=$(UPSTREAM_TARBALL_NAME)
   RHDISTGIT_BRANCH:=rawhide
-  BUILD_SCRATCH_TARGET ?= temp-ark-rhel-8-test
+  ifndef BUILD_SCRATCH_TARGET
+    BUILD_SCRATCH_TARGET:=temp-ark-rhel-8-test
+  endif
 else ifeq ("$(DISTRO)", "centos")
   # A unified tarball means that the tarball in the srpm contains both the
   # upstream sources and RHEL specific patches.
   SINGLE_TARBALL:=1
   RHDISTGIT_BRANCH:=c$(RHEL_MAJOR)s
   BUILD_PROFILE ?= -p stream
-  BUILD_SCRATCH_TARGET ?= c$(RHEL_MAJOR)s-candidate
+  ifndef BUILD_SCRATCH_TARGET
+    BUILD_SCRATCH_TARGET:=c$(RHEL_MAJOR)s-candidate
+  endif
   TARFILE_RELEASE:=$(KVERSION)-$(PKGRELEASE)
 else
   # A unified tarball means that the tarball in the srpm contains both the
   # upstream sources and RHEL specific patches.
   SINGLE_TARBALL:=1
   RHDISTGIT_BRANCH:=rhel-$(RHEL_MAJOR).$(RHEL_MINOR).0
-  BUILD_SCRATCH_TARGET ?= rhel-$(RHEL_MAJOR).$(RHEL_MINOR).0-test-pesign
+  ifndef BUILD_SCRATCH_TARGET
+    BUILD_SCRATCH_TARGET:=rhel-$(RHEL_MAJOR).$(RHEL_MINOR).0-test-pesign
+  endif
   TARFILE_RELEASE:=$(KVERSION)-$(PKGRELEASE)
+endif
+
+ifndef BUILD_TARGET
+  BUILD_TARGET:=--scratch $(BUILD_SCRATCH_TARGET)
 endif
 
 TARFILE:=linux-$(TARFILE_RELEASE).tar.xz
@@ -189,7 +199,6 @@ else
    PROCESS_CONFIGS_OPTS=-n -w -c
 endif
 
-BUILD_TARGET ?= --scratch $(BUILD_SCRATCH_TARGET)
 FLAVOR =
 
 RHGITURL?=$(shell $(GIT) config rhg.url || $(GIT) config remote.origin.url)
