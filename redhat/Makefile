@@ -140,7 +140,9 @@ else ifeq ("$(DISTRO)", "centos")
   # upstream sources and RHEL specific patches.
   SINGLE_TARBALL:=1
   RHDISTGIT_BRANCH:=c$(RHEL_MAJOR)s
-  BUILD_PROFILE ?= -p stream
+  ifndef BUILD_PROFILE
+    BUILD_PROFILE:= -p stream
+  endif
   ifndef BUILD_SCRATCH_TARGET
     BUILD_SCRATCH_TARGET:=c$(RHEL_MAJOR)s-candidate
   endif
