@@ -1,8 +1,7 @@
 #!/bin/sh
 
 GITID=$1
-TARBALL=$2
-DIR=$3
+DIR=$2
 
 # shellcheck disable=SC1083
 XZ_THREADS=$(rpm --eval %{_smp_mflags} | sed -e 's!^-j!--threads !')

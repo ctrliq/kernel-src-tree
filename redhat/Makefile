@@ -364,9 +364,9 @@ dist-stub-key:
 .PHONY:	$(TARBALL)
 $(TARBALL):
 	@if [ $(SINGLE_TARBALL) -eq 1 ]; then \
-		scripts/create-tarball.sh $(GITID) $(TARBALL) linux-$(KVERSION)-$(PKGRELEASE); \
+		scripts/create-tarball.sh $(GITID) linux-$(KVERSION)-$(PKGRELEASE); \
 	else \
-		scripts/create-tarball.sh $(MARKER) $(TARBALL) linux-$(TARFILE_RELEASE); \
+		scripts/create-tarball.sh $(MARKER) linux-$(TARFILE_RELEASE); \
 	fi
 
 .PHONY: $(KABI_TARBALL)
