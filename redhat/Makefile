@@ -229,6 +229,16 @@ RHJOBS?=$(shell j=$$(echo $(MAKEFLAGS) | grep -Eo "\ -j[0-9]*" | xargs ); \
 		[ -z "$${j}" ] && nproc --all || echo $${j}; \
 	fi)
 
+ifndef BUILD_FLAGS
+  ifeq ($(filter $(MAKECMDGOALS),dist-brew distg-brew),)
+	BUILD_FLAGS := $(BREW_FLAGS)
+  endif
+  ifeq ($(filter $(MAKECMDGOALS),dist-koji distg-koji),)
+	BUILD_FLAGS := $(KOJI_FLAGS)
+  endif
+  BUILD_FLAGS += $(TEST_FLAGS)
+endif
+
 default: dist-help
 
 dist-python-check:
@@ -556,12 +566,6 @@ dist-fedora-release: git-tree-check
 
 dist-fedora-release-push: export DIST_PUSH="1"
 dist-fedora-release-push: dist-fedora-release
-
-.PHONY: dist-brew dist-koji
-dist-brew : BUILD_FLAGS ?= $(BREW_FLAGS) $(TEST_FLAGS)
-dist-koji : BUILD_FLAGS ?= $(KOJI_FLAGS) $(TEST_FLAGS)
-distg-brew: BUILD_FLAGS ?= $(BREW_FLAGS) $(TEST_FLAGS)
-distg-koji: BUILD_FLAGS ?= $(KOJI_FLAGS) $(TEST_FLAGS)
 
 dist-vr-check:
 	@# builds may include a s390x+zfcpdump arch build.  UTS_RELEASE can only have a
