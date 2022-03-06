@@ -1561,6 +1561,9 @@ static void mpi3mr_dev_rmhs_complete_iou(struct mpi3mr_ioc *mrioc,
 	u16 cmd_idx = drv_cmd->host_tag - MPI3MR_HOSTTAG_DEVRMCMD_MIN;
 	struct delayed_dev_rmhs_node *delayed_dev_rmhs = NULL;
 
+	if (drv_cmd->state & MPI3MR_CMD_RESET)
+		goto clear_drv_cmd;
+
 	ioc_info(mrioc,
 	    "%s :dev_rmhs_iouctrl_complete:handle(0x%04x), ioc_status(0x%04x), loginfo(0x%08x)\n",
 	    __func__, drv_cmd->dev_handle, drv_cmd->ioc_status,
@@ -1601,6 +1604,8 @@ static void mpi3mr_dev_rmhs_complete_iou(struct mpi3mr_ioc *mrioc,
 		kfree(delayed_dev_rmhs);
 		return;
 	}
+
+clear_drv_cmd:
 	drv_cmd->state = MPI3MR_CMD_NOTUSED;
 	drv_cmd->callback = NULL;
 	drv_cmd->retry_count = 0;
@@ -1626,6 +1631,9 @@ static void mpi3mr_dev_rmhs_complete_tm(struct mpi3mr_ioc *mrioc,
 	u16 cmd_idx = drv_cmd->host_tag - MPI3MR_HOSTTAG_DEVRMCMD_MIN;
 	struct mpi3_scsi_task_mgmt_reply *tm_reply = NULL;
 	int retval;
+
+	if (drv_cmd->state & MPI3MR_CMD_RESET)
+		goto clear_drv_cmd;
 
 	if (drv_cmd->state & MPI3MR_CMD_REPLY_VALID)
 		tm_reply = (struct mpi3_scsi_task_mgmt_reply *)drv_cmd->reply;
@@ -1655,11 +1663,11 @@ static void mpi3mr_dev_rmhs_complete_tm(struct mpi3mr_ioc *mrioc,
 	if (retval) {
 		pr_err(IOCNAME "Issue DevRmHsTMIOUCTL: Admin post failed\n",
 		    mrioc->name);
-		goto out_failed;
+		goto clear_drv_cmd;
 	}
 
 	return;
-out_failed:
+clear_drv_cmd:
 	drv_cmd->state = MPI3MR_CMD_NOTUSED;
 	drv_cmd->callback = NULL;
 	drv_cmd->dev_handle = MPI3MR_INVALID_DEV_HANDLE;
