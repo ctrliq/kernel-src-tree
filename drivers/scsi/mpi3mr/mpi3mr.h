@@ -493,6 +493,8 @@ static inline void mpi3mr_tgtdev_put(struct mpi3mr_tgt_dev *s)
  * @dev_removedelay: Device is waiting to be removed in FW
  * @dev_type: Device type
  * @tgt_dev: Internal target device pointer
+ * @pend_count: Counter to track pending I/Os during error
+ *		handling
  */
 struct mpi3mr_stgt_priv_data {
 	struct scsi_target *starget;
@@ -504,6 +506,7 @@ struct mpi3mr_stgt_priv_data {
 	u8 dev_removedelay;
 	u8 dev_type;
 	struct mpi3mr_tgt_dev *tgt_dev;
+	u32 pend_count;
 };
 
 /**
@@ -512,11 +515,14 @@ struct mpi3mr_stgt_priv_data {
  * @tgt_priv_data: Scsi_target private data pointer
  * @lun_id: LUN ID of the device
  * @ncq_prio_enable: NCQ priority enable for SATA device
+ * @pend_count: Counter to track pending I/Os during error
+ *		handling
  */
 struct mpi3mr_sdev_priv_data {
 	struct mpi3mr_stgt_priv_data *tgt_priv_data;
 	u32 lun_id;
 	u8 ncq_prio_enable;
+	u32 pend_count;
 };
 
 /**
@@ -906,5 +912,7 @@ void mpi3mr_flush_host_io(struct mpi3mr_ioc *mrioc);
 void mpi3mr_invalidate_devhandles(struct mpi3mr_ioc *mrioc);
 void mpi3mr_rfresh_tgtdevs(struct mpi3mr_ioc *mrioc);
 void mpi3mr_flush_delayed_rmhs_list(struct mpi3mr_ioc *mrioc);
+int mpi3mr_process_op_reply_q(struct mpi3mr_ioc *mrioc,
+	struct mpi3mr_intr_info *intr_info);
 
 #endif /*MPI3MR_H_INCLUDED*/
