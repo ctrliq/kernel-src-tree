@@ -13,6 +13,7 @@ RPMKVERSION:=$(shell $(GIT) show $(HEAD):Makefile | sed -ne '/^VERSION\ =\ /{s//
 RPMKPATCHLEVEL:=$(shell $(GIT) show $(HEAD):Makefile | sed -ne '/^PATCHLEVEL\ =\ /{s///;p;q}')
 RPMKSUBLEVEL:=$(shell $(GIT) show $(HEAD):Makefile | sed -ne '/^SUBLEVEL\ =\ /{s///;p;q}')
 RPMKEXTRAVERSION:=$(shell $(GIT) show $(HEAD):Makefile | sed -ne '/^EXTRAVERSION\ =\ /{s///;p;q}')
+KVERSION:=$(RPMKVERSION).$(RPMKPATCHLEVEL).$(RPMKSUBLEVEL)
 GITID:= $(shell $(GIT) log --max-count=1 --pretty=format:%H $(HEAD))
 # marker is git tag which we base off of for exporting patches
 # Make sure marker uses RPMKPATCHLEVEL and RPMKEXTRAVERSION from the kernel
@@ -97,7 +98,6 @@ ifeq ($(SNAPSHOT),1)
 endif
 
 KVERSION:=$(RPMKVERSION).$(RPMKPATCHLEVEL).$(RPMKSUBLEVEL)
-RPMVERSION:=$(KVERSION)
 
 ifndef BUILD
   BUILD:=$(RHEL_RELEASE)
@@ -122,6 +122,7 @@ else
 endif
 
 PKGRELEASE:=$(PREBUILD)$(BUILD)$(BUILDID)
+RPMVERSION:=$(RPMKVERSION).$(RPMKPATCHLEVEL)-$(PKGRELEASE)
 SPECRELEASE:=$(PREBUILD)$(BUILD)%{?buildid}%{?dist}
 
 ifeq ("$(DISTRO)", "fedora")
