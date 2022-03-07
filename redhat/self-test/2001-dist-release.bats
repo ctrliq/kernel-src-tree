@@ -24,19 +24,20 @@
 
 @test "dist-release test 2" {
     # Test whether release number in commit message matches
-    # release number in Makefile.rhelver, which is BUILD as
-    # established in Makefile.common (BUILD:=$(RHEL_RELEASE))
+    # release number in Makefile.rhelver.
     # and above in prologue.
     cd $BATS_TMPDIR/distrelease
-    commit="$(git log --oneline -n 1)"
-    # commit = ... [redhat] kernel-5.11.0-0.rc0.20201220git467f8165a2b0.104
-    # Just the commit message part AFTER "[redhat] ":
-    title=${commit##*\[redhat\] }
+    title="$(git log --oneline --all  --grep "\[redhat\] kernel" -n 1 --pretty="format:%s")"
+    # title = ... [redhat] kernel-5.11.0-0.rc0.20201220git467f8165a2b0.104
+    # Just the title message part AFTER "[redhat] ":
+    title=${title##*\[redhat\] }
     # Strip off ...kernel-VV.PP.SS-:
     pkgrelease=${title##*kernel-+([5-9]).+([0-9]).+([0-9])-}
-    # BUILD = RHEL_RELEASE from Makefile.rhelver; cf. Makefile.common:
-    BUILD=$(DIST=.fc33 make dist-dump-variables | grep "^BUILD=" | sed -e 's/BUILD=//')
-    echo $pkgrelease | grep -q -w $BUILD
+    build=$(BUILD= DIST=.fc33 make dist-dump-variables | grep -E "^BUILD=" | cut -d"=" -f2 | xargs)
+    ((build--))
+    echo "pkgrelease=$pkgrelease"
+    echo "build=$build"
+    echo $pkgrelease | grep -q -w "$build"
     status=$?
     [ "$status" = 0 ]
 }
