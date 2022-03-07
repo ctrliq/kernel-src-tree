@@ -3,6 +3,5 @@
     then
         skip "The ShellCheck package is not installed"
     fi
-    run shellcheck $(find $BATS_TEST_DIRNAME/.. -name "*.sh")
-    [ "$status" = 0 ]
+    shellcheck $(find $BATS_TEST_DIRNAME/.. -name "*.sh" -not -path "$BATS_TEST_DIRNAME/../rpm/*")
 }

@@ -1,6 +1,6 @@
 #!/bin/bash
 
-LAST_MARKER=$(cat $REDHAT/marker)
+LAST_MARKER=$(cat "${REDHAT}"/marker)
 clogf="$SOURCES/changelog"
 # hide [redhat] entries from changelog
 HIDE_REDHAT=1;
@@ -25,11 +25,11 @@ if [[ -z $lasttag ]]; then
 fi
 echo "Gathering new log entries since $lasttag"
 # master is expected to track mainline.
-UPSTREAM="$(git rev-parse -q --verify origin/$UPSTREAM_BRANCH || \
-          git rev-parse -q --verify $UPSTREAM_BRANCH)"
+UPSTREAM=$(git rev-parse -q --verify origin/"${UPSTREAM_BRANCH}" || \
+          git rev-parse -q --verify "${UPSTREAM_BRANCH}")
  
 git log --topo-order --reverse --no-merges -z --format="- %s (%an)%n%b" \
-	^${UPSTREAM} "$lasttag".. -- ':!/redhat/rhdocs' | ${0%/*}/genlog.py >> "$clogf"
+	^"${UPSTREAM}" "$lasttag".. -- ':!/redhat/rhdocs' | "${0%/*}"/genlog.py >> "$clogf"
 
 grep -v "tagging $RPMVERSION" "$clogf" > "$clogf.stripped"
 cp "$clogf.stripped" "$clogf"
@@ -151,10 +151,10 @@ if [ "$SINGLE_TARBALL" = 0 ]; then
 	# May need to preserve word splitting in EXCLUDE_FILES
 	# shellcheck disable=SC2086
 	git diff -p --no-renames --stat "$MARKER"..  $EXCLUDE_FILES \
-		> "$SOURCES"/patch-"${RPMKVERSION}.${RPMKPATCHLEVEL}"-redhat.patch
+		> ${SOURCES}/patch-${RPMKVERSION}.${RPMKPATCHLEVEL}-redhat.patch
 else
 	# Need an empty file for dist-git compatibility
-	touch "$SOURCES"/patch-"${RPMKVERSION}.${RPMKPATCHLEVEL}"-redhat.patch
+	touch "${SOURCES}/patch-${RPMKVERSION}.${RPMKPATCHLEVEL}"-redhat.patch
 fi
 
 # We depend on work splitting of BUILDOPTS
