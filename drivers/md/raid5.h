@@ -4,6 +4,7 @@
 
 #include <linux/raid/xor.h>
 #include <linux/dmaengine.h>
+#include <linux/local_lock.h>
 
 /*
  *
@@ -635,13 +636,13 @@ struct r5conf {
 	int			recovery_disabled;
 	/* per cpu variables */
 	struct raid5_percpu {
-		spinlock_t	lock;		/* Protection for -RT */
 		struct page	*spare_page; /* Used when checking P/Q in raid6 */
 		void		*scribble;  /* space for constructing buffer
 					     * lists and performing address
 					     * conversions
 					     */
-		int scribble_obj_size;
+		int             scribble_obj_size;
+		local_lock_t    lock;
 	} __percpu *percpu;
 	int scribble_disks;
 	int scribble_sectors;
