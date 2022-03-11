@@ -345,11 +345,11 @@ dist-kabi-dw-check: dist-kabi
 
 dist-configs-commit: dist-configs-prep
 	+@cd $(REDHAT)/configs; ./generate_all_configs.sh 1;\
-	./process_configs.sh -z "$(PACKAGE_NAME)" "$(KVERSION)" "" "$(FLAVOR)" "$(RHJOBS)"
+	./process_configs.sh -z "$(KVERSION)" "$(FLAVOR)"
 
 dist-configs: dist-configs-prep
 	+@cd $(REDHAT)/configs; ./generate_all_configs.sh 1;\
-	./process_configs.sh $(PROCESS_CONFIGS_OPTS) "$(PACKAGE_NAME)" "$(KVERSION)" "" "" "$(RHJOBS)"
+	./process_configs.sh $(PROCESS_CONFIGS_OPTS) "$(KVERSION)" ""
 
 dist-fedora-configs: FLAVOR = fedora
 dist-fedora-configs: dist-configs
@@ -360,7 +360,7 @@ dist-rhel-configs: dist-configs
 rh-configs: dist-rhel-configs
 
 dist-configs-check: dist-configs-prep
-	+cd $(REDHAT)/configs; ./process_configs.sh $(PROCESS_CONFIGS_CHECK_OPTS) $(PACKAGE_NAME) "" "" "" "$(RHJOBS)"
+	+cd $(REDHAT)/configs; ./process_configs.sh $(PROCESS_CONFIGS_CHECK_OPTS) "" ""
 
 dist-configs-prep: dist-clean-configs dist-buildreq-check
 	+cd $(REDHAT)/configs; ./build_configs.sh "partial" "$(ARCH_MACH)" "snip" "$(RHJOBS)"
