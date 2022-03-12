@@ -199,7 +199,7 @@ KABIDW_TARBALL:=$(SOURCES)/kernel-kabi-dw-$(KVERSION)-$(DISTRO_BUILD).tar.bz2
 PKGRELEASE:=$(PREBUILD)$(BUILD)$(BUILDID)
 RPMVERSION:=$(RPMKVERSION).$(RPMKPATCHLEVEL).$(RPMKSUBLEVEL)-$(PKGRELEASE)
 SPECRELEASE:=$(PREBUILD)$(BUILD)%{?buildid}%{?dist}
-SRPM:=$(SRPMS)/$(PACKAGE_NAME)-$(KVERSION)-$(PKGRELEASE)$(DIST).src.rpm
+SRPM:=$(SRPMS)/$(PACKAGE_NAME)-$(RPMVERSION)$(DIST).src.rpm
 
 #
 # This conditional statement is where fedora, centos, and other (aka RHEL)
@@ -225,7 +225,7 @@ else ifeq ("$(DISTRO)", "centos")
   ifndef BUILD_SCRATCH_TARGET
     BUILD_SCRATCH_TARGET:=c$(RHEL_MAJOR)s-candidate
   endif
-  TARFILE_RELEASE:=$(KVERSION)-$(PKGRELEASE)
+  TARFILE_RELEASE:=$(RPMVERSION)
 else
   # A unified tarball means that the tarball in the srpm contains both the
   # upstream sources and RHEL specific patches.
@@ -234,7 +234,7 @@ else
   ifndef BUILD_SCRATCH_TARGET
     BUILD_SCRATCH_TARGET:=rhel-$(RHEL_MAJOR).$(RHEL_MINOR).0-test-pesign
   endif
-  TARFILE_RELEASE:=$(KVERSION)-$(PKGRELEASE)
+  TARFILE_RELEASE:=$(RPMVERSION)
 endif
 
 ifndef BUILD_TARGET
@@ -397,7 +397,7 @@ dist-stub-key:
 .PHONY:	$(TARBALL)
 $(TARBALL):
 	@if [ $(SINGLE_TARBALL) -eq 1 ]; then \
-		scripts/create-tarball.sh $(GITID) linux-$(KVERSION)-$(PKGRELEASE); \
+		scripts/create-tarball.sh $(GITID) linux-$(RPMVERSION); \
 	else \
 		scripts/create-tarball.sh $(MARKER) linux-$(TARFILE_RELEASE); \
 	fi
@@ -558,7 +558,7 @@ dist-release-finish: setup-source
 	@cp $(SOURCES)/$(CHANGELOG) $(REDHAT)/$(CHANGELOG)
 	@$(GIT) add $(REDHAT)/$(CHANGELOG)
 	@$(GIT) add $(REDHAT)/marker
-	@$(GIT) commit -s ../Makefile.rhelver $(REDHAT)/marker $(REDHAT)/$(CHANGELOG) $(PACKAGE_NAME).spec.template -m "[redhat] $(PACKAGE_NAME)-$(KVERSION)-$(PKGRELEASE)"
+	@$(GIT) commit -s ../Makefile.rhelver $(REDHAT)/marker $(REDHAT)/$(CHANGELOG) $(PACKAGE_NAME).spec.template -m "[redhat] $(PACKAGE_NAME)-$(RPMVERSION)"
 dist-release-changed: setup-source
 	@cp $(SOURCES)/$(CHANGELOG) $(REDHAT)/$(CHANGELOG)
 	@echo $(MARKER) > $(REDHAT)/marker
@@ -574,7 +574,7 @@ dist-release-changed: setup-source
 dist-release: dist-clean-sources
 	@$(MAKE) dist-release-changed
 dist-release-tag:
-	@$(GIT) tag -a -m "$(PACKAGE_NAME)-$(RPMVERSION)" $(PACKAGE_NAME)-$(KVERSION)-$(PKGRELEASE)
+	@$(GIT) tag -a -m "$(PACKAGE_NAME)-$(RPMVERSION)" $(PACKAGE_NAME)-$(RPMVERSION)
 
 git-tree-check:
 	@if test -n "$(DIST_PUSH)" && test -z "$(shell $(GIT) remote get-url gitlab 2>/dev/null)"; then \
@@ -616,7 +616,7 @@ dist-vr-check:
 	fi
 
 dist-brew dist-koji: dist-%: dist-vr-check dist-srpm
-	$* $(BUILD_PROFILE) build $(BUILD_FLAGS) $(BUILD_TARGET) $(SRPMS)/$(PACKAGE_NAME)-$(KVERSION)-$(PKGRELEASE)$(DIST).src.rpm $(OUTPUT_FILE)
+	$* $(BUILD_PROFILE) build $(BUILD_FLAGS) $(BUILD_TARGET) $(SRPMS)/$(PACKAGE_NAME)-$(RPMVERSION)$(DIST).src.rpm $(OUTPUT_FILE)
 
 distg-brew distg-koji: distg-%: dist-vr-check
 	$* $(BUILD_PROFILE) build $(BUILD_FLAGS) $(BUILD_TARGET) "$(RHGITURL)?redhat/koji#$(RHGITCOMMIT)"
