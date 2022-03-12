@@ -33,6 +33,12 @@ SPECRELEASED_KERNEL=$(RELEASED_KERNEL)
 SPECINCLUDE_FEDORA_FILES=$(INCLUDE_FEDORA_FILES)
 SPECINCLUDE_RHEL_FILES=$(INCLUDE_RHEL_FILES)
 
+ifneq (,$(findstring n,$(MAKEFLAGS)))
+  # Do not set RHTEST on the command line. Use the make command built-in options
+  # -n, --just-print, --dry-run, --recon on the command line.
+  RHTEST=1
+endif
+
 LANG=C
 
 ifndef RHSELFTESTDATA

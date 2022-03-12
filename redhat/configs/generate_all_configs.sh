@@ -2,6 +2,8 @@
 
 # Adjusts the configuration options to build the variants correctly
 
+test -n "$RHTEST" && exit 0
+
 DEBUGBUILDSENABLED=$1
 if [ -z "$DEBUGBUILDSENABLED" ]; then
 	exit 1
