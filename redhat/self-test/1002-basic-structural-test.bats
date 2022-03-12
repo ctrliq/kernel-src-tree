@@ -1,6 +1,10 @@
 #!/usr/bin/env bats
 @test "SRPM unpacks OK" {
-    result=$(find "$BATS_TEST_DIRNAME"/.. -name "*.rpm" | wc -l)
+    numsrpms=$(find "$BATS_TEST_DIRNAME"/.. -name "*.rpm" | wc -l)
+    if [ "$numsrpms" != "1" ]; then
+	skip "Only one SRPM should be in $BATS_TEST_DIRNAME/redhat/rpms/SRPMS."
+    fi
+
     srpm=$(find "$BATS_TEST_DIRNAME"/.. -name "*.rpm")
     pushd "$BATS_TMPDIR"
     if [ -e SRPMS ]
@@ -16,6 +20,11 @@
 }
 
 @test "Linux tree unpacks OK" {
+    numsrpms=$(find "$BATS_TEST_DIRNAME"/.. -name "*.rpm" | wc -l)
+    if [ "$numsrpms" != "1" ]; then
+	skip "Only one SRPM should be in $BATS_TEST_DIRNAME/redhat/rpms/SRPMS."
+    fi
+
     pushd "$BATS_TMPDIR"/SRPMS >& /dev/null
     ls | wc
     linuxname=$(ls linux*.tar.xz)
@@ -25,6 +34,11 @@
 }
 
 @test "Linux top level structural check" {
+    numsrpms=$(find "$BATS_TEST_DIRNAME"/.. -name "*.rpm" | wc -l)
+    if [ "$numsrpms" != "1" ]; then
+	skip "Only one SRPM should be in $BATS_TEST_DIRNAME/redhat/rpms/SRPMS."
+    fi
+
     pushd "$BATS_TMPDIR"/SRPMS >& /dev/null
     linuxtree=$(ls linux*.tar.xz)
     linuxtree=${linuxtree/.tar.xz}
