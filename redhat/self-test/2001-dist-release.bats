@@ -48,13 +48,14 @@
     cd $BATS_TMPDIR/distrelease
     # Extract just the version part (the part between [ ]) on the first line of
     # the change log:
-    changelogversion=$(head -1 ./redhat/kernel.changelog-8.99 | sed -e 's/.*\[\(.*\)\].*/\1/')
-    commit="$(git log --oneline -n 1)"
+    changelog=$(head -1 ./redhat/kernel.changelog-${RHEL_MAJOR}.${RHEL_MINOR} | sed -e 's/.*\[\(.*\)\].*/\1/')
+    commit="$(git log --oneline --all  --grep "\[redhat\] kernel" -n 1 --pretty="format:%s")"
     # Extract just the commit message part AFTER "[redhat] ":
-    title=${commit##*\[redhat\] }
+    gitlog=${commit##*\[redhat\] }
     # This time, strip off "kernel-" also:
-    title=${title/kernel-/}
-    [ "$changelogversion" = "$title" ]
+    gitlog=${gitlog/kernel-/}
+    echo "The kernel version in the changelog ($changelog) differs from the version in the git log ($gitlog)"
+    [ "$changelog" = "$gitlog" ]
 }
 
 @test "dist-release epilogue" {
