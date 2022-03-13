@@ -61,6 +61,7 @@ switch_to_toplevel()
 checkoptions()
 {
 	count=$3
+	variant=$4
 
 	/usr/bin/awk '
 
@@ -103,10 +104,12 @@ checkoptions()
 
 		! $checkoptions_error && return
 
-		echo "Error: Mismatches found in configuration files"
+		sed -i "1s/^/Error: Mismatches found in configuration files for ${variant}\n/" .mismatches${count}
 		cat .mismatches${count}
 		RETURNCODE=1
 		[ "$CONTINUEONERROR" ] || exit 1
+	else
+		rm -f .mismatches${count}
 	fi
 }
 
@@ -227,6 +230,7 @@ function process_config()
 	local cfgtmp
 	local cfgorig
 	local count
+	local variant
 
 	cfg=$1
 	count=$2
@@ -239,17 +243,19 @@ function process_config()
 		return
 	fi
 
+	variant=$(basename "$cfg" | cut -d"-" -f3- | cut -d"." -f1)
+
 	cfgtmp="${cfg}.tmp"
 	cfgorig="${cfg}.orig"
 	cat "$cfg" > "$cfgorig"
 
-	echo -n "Processing $cfg ... "
+	echo "Processing $cfg ... "
 
 	make ${MAKEOPTS} ARCH="$arch" CROSS_COMPILE=$(get_cross_compile $arch) KCONFIG_CONFIG="$cfgorig" listnewconfig >& .listnewconfig${count}
 	grep -E 'CONFIG_' .listnewconfig${count} > .newoptions${count}
 	if test -n "$NEWOPTIONS" && test -s .newoptions${count}
 	then
-		echo "Found unset config items, please set them to an appropriate value"
+		echo "Found unset config items in ${variant}, please set them to an appropriate value"
 		cat .newoptions${count}
 		rm .newoptions${count}
 		RETURNCODE=1
@@ -260,7 +266,7 @@ function process_config()
 	grep -E 'config.*warning' .listnewconfig${count} > .warnings${count}
 	if test -n "$CHECKWARNINGS" && test -s .warnings${count}
 	then
-		echo "Found misconfigured config items, please set them to an appropriate value"
+		echo "Found misconfigured config items in ${variant}, please set them to an appropriate value"
 		cat .warnings${count}
 		rm .warnings${count}
 		RETURNCODE=1
@@ -275,7 +281,7 @@ function process_config()
 	cat "$cfgorig" >> "$cfgtmp"
 	if test -n "$CHECKOPTIONS"
 	then
-		checkoptions "$cfg" "$cfgtmp" "$count"
+		checkoptions "$cfg" "$cfgtmp" "$count" "$variant"
 	fi
 	# if test run, don't overwrite original
 	if test -n "$TESTRUN"
@@ -285,7 +291,7 @@ function process_config()
 		mv "$cfgtmp" "$cfg"
 	fi
 	rm -f "$cfgorig"
-	echo "done"
+	echo "Processing $cfg complete"
 }
 
 function process_configs()
