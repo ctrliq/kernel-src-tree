@@ -70,7 +70,7 @@ function merge_configs()
 	count=$5
 
 	name=$OUTPUT_DIR/$PACKAGE_NAME-$archvar-$flavor.config
-	echo -n "Building $name ... "
+	echo "Building $name ... "
 	touch config-merging.$count config-merged.$count
 
 	# apply based on order
@@ -108,7 +108,7 @@ function merge_configs()
 	fi
 	sort config-merging.$count >> "$name"
 	rm -f config-merged.$count config-merging.$count
-	echo "done"
+	echo "Building $name complete"
 }
 
 function build_flavor()
