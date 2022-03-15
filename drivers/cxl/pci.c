@@ -473,11 +473,14 @@ static int __cxl_dvsec_ranges(struct cxl_dev_state *cxlds,
 {
 	struct pci_dev *pdev = to_pci_dev(cxlds->dev);
 	int hdm_count, rc, i, ranges = 0;
+	struct device *dev = &pdev->dev;
 	int d = cxlds->cxl_dvsec;
 	u16 cap, ctrl;
 
-	if (!d)
+	if (!d) {
+		dev_dbg(dev, "No DVSEC Capability\n");
 		return -ENXIO;
+	}
 
 	rc = pci_read_config_word(pdev, d + CXL_DVSEC_CAP_OFFSET, &cap);
 	if (rc)
@@ -487,8 +490,10 @@ static int __cxl_dvsec_ranges(struct cxl_dev_state *cxlds,
 	if (rc)
 		return rc;
 
-	if (!(cap & CXL_DVSEC_MEM_CAPABLE))
+	if (!(cap & CXL_DVSEC_MEM_CAPABLE)) {
+		dev_dbg(dev, "Not MEM Capable\n");
 		return -ENXIO;
+	}
 
 	/*
 	 * It is not allowed by spec for MEM.capable to be set and have 0 legacy
@@ -501,8 +506,10 @@ static int __cxl_dvsec_ranges(struct cxl_dev_state *cxlds,
 		return -EINVAL;
 
 	rc = wait_for_valid(cxlds);
-	if (rc)
+	if (rc) {
+		dev_dbg(dev, "Failure awaiting MEM_INFO_VALID (%d)\n", rc);
 		return rc;
+	}
 
 	info->mem_enabled = FIELD_GET(CXL_DVSEC_MEM_ENABLE, ctrl);
 
