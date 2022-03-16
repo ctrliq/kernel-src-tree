@@ -11,19 +11,20 @@ PKGRELEASE=$4
 KVERSION=$5
 KPATCHLEVEL=$6
 KSUBLEVEL=$7
-DISTRO_BUILD=$8
-SPECRELEASE=$9
-ZSTREAM_FLAG=${10}
-BUILDOPTS=${11}
-MARKER=${12}
-LAST_MARKER=${13}
-SINGLE_TARBALL=${14}
-TARFILE_RELEASE=${15}
-SNAPSHOT=${16}
-UPSTREAM_BRANCH=${17}
-INCLUDE_FEDORA_FILES=${18}
-INCLUDE_RHEL_FILES=${19}
+SPECRELEASE=$8
+BUILDOPTS=$9
+MARKER=${10}
+LAST_MARKER=${11}
+SINGLE_TARBALL=${12}
+TARFILE_RELEASE=${13}
+SNAPSHOT=${14}
+UPSTREAM_BRANCH=${15}
+INCLUDE_FEDORA_FILES=${16}
+INCLUDE_RHEL_FILES=${17}
+RHEL_MAJOR=${18}
+RHEL_MINOR=${19}
 BUILDID=${20}
+
 RPMVERSION=${KVERSION}.${KPATCHLEVEL}.${KSUBLEVEL}
 clogf="$SOURCES/changelog"
 # hide [redhat] entries from changelog
@@ -42,7 +43,8 @@ RPM_VERSION="$RPMVERSION-$PKGRELEASE";
 # have the pathspec '(exclude)' support
 EXCLUDE=$(git log -1 --format=%P ${0%/*}/rhdocs | cut -d ' ' -f 2)
 
-echo > "$clogf"
+GIT_FORMAT="--format=- %s (%an)%n%N%n^^^NOTES-END^^^%n%b"
+GIT_NOTES="--notes=refs/notes/${RHEL_MAJOR}.${RHEL_MINOR}*"
 
 lasttag=$(git rev-list --first-parent --grep="^\[redhat\] kernel-${RPMVERSION}" --max-count=1 HEAD)
 # if we didn't find the proper tag, assume this is the first release
@@ -57,14 +59,17 @@ if [[ -z $lasttag ]]; then
 fi
 echo "Gathering new log entries since $lasttag"
 # master is expected to track mainline.
+
+cname="$(git var GIT_COMMITTER_IDENT |sed 's/>.*/>/')"
+cdate="$(LC_ALL=C date +"%a %b %d %Y")"
+cversion="[$RPM_VERSION]";
+echo "* $cdate $cname $cversion" > "$clogf"
+
 UPSTREAM="$(git rev-parse -q --verify origin/$UPSTREAM_BRANCH || \
           git rev-parse -q --verify $UPSTREAM_BRANCH)"
  
-git log --topo-order --reverse --no-merges -z --format="- %s (%an)%n%b" \
+git log --topo-order --no-merges -z $GIT_NOTES "$GIT_FORMAT" \
 	^${UPSTREAM} ${EXCLUDE:+^$EXCLUDE} "$lasttag".. | ${0%/*}/genlog.py >> "$clogf"
-
-grep -v "tagging $RPM_VERSION" "$clogf" > "$clogf.stripped"
-cp "$clogf.stripped" "$clogf"
 
 if [ "$HIDE_REDHAT" = "1" ]; then
 	grep -v -e "^- \[redhat\]" "$clogf" |
@@ -98,24 +103,19 @@ if [ -n "$(git log --oneline --first-parent --grep="Merge ark patches" "$lasttag
 	echo "- Merge ark-patches" >> "$clogf"
 fi
 
-LENGTH=$(wc -l "$clogf" | awk '{print $1}')
-
-#the changelog was created in reverse order
-#also remove the blank on top, if it exists
-#left by the 'print version\n' logic above
-cname="$(git var GIT_COMMITTER_IDENT |sed 's/>.*/>/')"
-cdate="$(LC_ALL=C date +"%a %b %d %Y")"
-cversion="[$RPM_VERSION]";
-tac "$clogf" | sed "1{/^$/d; /^- /i\
-* $cdate $cname $cversion
-	}" > "$clogf.rev"
-
+# during rh-dist-git genspec runs again and generates empty changelog
+# create empty file to avoid adding extra header to changelog
+LENGTH=$(grep "^-" $clogf | wc -l | awk '{print $1}')
 if [ "$LENGTH" = 0 ]; then
-	rm -f "$clogf.rev"; touch "$clogf.rev"
+	rm -f $clogf
+	touch $clogf
 fi
 
-cat "$clogf.rev" "$CHANGELOG" > "$clogf.full"
+cat "$clogf" "$CHANGELOG" > "$clogf.full"
 mv -f "$clogf.full" "$CHANGELOG"
+
+# genlog.py generates Resolves lines as well, strip these from RPM changelog
+cat $CHANGELOG | grep -v -e "^Resolves: " > $clogf.stripped
 
 if [ "$SNAPSHOT" = 0 ]; then
 	# This is based off a tag on Linus's tree (e.g. v5.5 or v5.5-rc5).
@@ -134,7 +134,7 @@ fi
 
 test -n "$SPECFILE" &&
         sed -i -e "
-	/%%CHANGELOG%%/r $CHANGELOG
+	/%%CHANGELOG%%/r $clogf.stripped
 	/%%CHANGELOG%%/d
 	s/%%BUILDID%%/$BUILDID_DEFINE/
 	s/%%KVERSION%%/$KVERSION/
@@ -142,7 +142,6 @@ test -n "$SPECFILE" &&
 	s/%%KSUBLEVEL%%/$KSUBLEVEL/
 	s/%%PKGRELEASE%%/$PKGRELEASE/
 	s/%%SPECRELEASE%%/$SPECRELEASE/
-	s/%%DISTRO_BUILD%%/$DISTRO_BUILD/
 	s/%%DEBUG_BUILDS_ENABLED%%/$DEBUG_BUILDS_ENABLED/
 	s/%%INCLUDE_FEDORA_FILES%%/$INCLUDE_FEDORA_FILES/
 	s/%%INCLUDE_RHEL_FILES%%/$INCLUDE_RHEL_FILES/
@@ -180,4 +179,4 @@ for opt in $BUILDOPTS; do
 	[ -n "$add_opt" ] && sed -i "s/^\\(# The following build options\\)/%define $add_opt 1\\n\\1/" $SPECFILE
 done
 
-rm -f "$clogf"{,.rev,.stripped};
+rm -f "$clogf"{,.stripped};
