@@ -1505,7 +1505,7 @@ static inline const struct pci_device_id *pci_hw_deprecated(const struct pci_dev
 							    struct pci_dev *dev) { return NULL; }
 static inline const struct pci_device_id *pci_hw_unmaintained(const struct pci_device_id *ids,
 							      struct pci_dev *dev) { return NULL; }
-const struct pci_device_id *pci_hw_disabled(const struct pci_device_id *ids,
+static inline const struct pci_device_id *pci_hw_disabled(const struct pci_device_id *ids,
 					    struct pci_dev *dev) {return NULL; }
 #endif
 int pci_scan_bridge(struct pci_bus *bus, struct pci_dev *dev, int max,
