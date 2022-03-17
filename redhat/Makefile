@@ -255,28 +255,6 @@ else
   endif
 endif
 
-ifdef NO_CONFIGCHECKS
-   PROCESS_CONFIGS_OPTS=
-   PROCESS_CONFIGS_CHECK_OPTS=
-   BUILDOPTS += -configchecks
-else
-   PROCESS_CONFIGS_CHECK_OPTS=-n -t -c
-   PROCESS_CONFIGS_OPTS=-n -w -c
-endif
-
-FLAVOR =
-
-# this section is needed in order to make O= to work
-_OUTPUT := ..
-ifeq ("$(origin O)", "command line")
-  _OUTPUT := $(O)
-  _EXTRA_ARGS := O=$(_OUTPUT)
-endif
-
-CURARCH := $(shell uname -m)
-ARCHCONFIG := $(shell uname -m | sed -e s/x86_64/X86_64/ \
-				     -e s/s390x/S390/ -e s/ppc.*/PPC/ )
-
 include Makefile.cross
 
 #
