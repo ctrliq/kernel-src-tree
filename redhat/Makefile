@@ -291,19 +291,19 @@ TARBALL:=$(REDHAT)/$(TARFILE)
 include Makefile.rhpkg
 
 ifeq ("$(ZSTREAM)", "yes")
-  __YSTREAM = no
+  YSTREAM_FLAG = no
   ifeq ("$(origin RHDISTGIT_BRANCH)", "command line")
-    __ZSTREAM = branch
+    ZSTREAM_FLAG = branch
   else
-    __ZSTREAM = yes
+    ZSTREAM_FLAG = yes
   endif
   BUILDOPTS += +kabidupchk
 else
-  __ZSTREAM = no
+  ZSTREAM_FLAG = no
   ifeq ("$(EARLY_YSTREAM)", "yes")
-    __YSTREAM = early
+    YSTREAM_FLAG = early
   else
-    __YSTREAM = yes
+    YSTREAM_FLAG = yes
   endif
 endif
 
@@ -615,7 +615,7 @@ dist-release-changed: setup-source
 		echo "Nothing changed, skipping updates"; \
 	else \
 		$(GIT) checkout -- $(REDHAT)/$(SPECCHANGELOG); \
-		$(REDHAT)/scripts/new_release.sh $(REDHAT) $(__YSTREAM) $(__ZSTREAM) $(BUMP_RELEASE); \
+		$(REDHAT)/scripts/new_release.sh $(REDHAT) $(YSTREAM_FLAG) $(ZSTREAM_FLAG) $(BUMP_RELEASE); \
 		$(MAKE) dist-release-finish; \
 	fi
 
