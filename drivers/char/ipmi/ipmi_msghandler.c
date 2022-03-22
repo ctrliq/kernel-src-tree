@@ -1711,7 +1711,7 @@ int ipmi_unregister_for_cmd(struct ipmi_user *user,
 }
 EXPORT_SYMBOL(ipmi_unregister_for_cmd);
 
-static unsigned char
+unsigned char
 ipmb_checksum(unsigned char *data, int size)
 {
 	unsigned char csum = 0;
@@ -1721,6 +1721,7 @@ ipmb_checksum(unsigned char *data, int size)
 
 	return -csum;
 }
+EXPORT_SYMBOL(ipmb_checksum);
 
 static inline void format_ipmb_msg(struct ipmi_smi_msg   *smi_msg,
 				   struct kernel_ipmi_msg *msg,
