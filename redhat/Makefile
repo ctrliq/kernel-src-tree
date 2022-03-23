@@ -33,7 +33,6 @@ RPMKVERSION:=$(shell $(GIT) show $(HEAD):Makefile | sed -ne '/^VERSION\ =\ /{s//
 RPMKPATCHLEVEL:=$(shell $(GIT) show $(HEAD):Makefile | sed -ne '/^PATCHLEVEL\ =\ /{s///;p;q}')
 RPMKSUBLEVEL:=$(shell $(GIT) show $(HEAD):Makefile | sed -ne '/^SUBLEVEL\ =\ /{s///;p;q}')
 RPMKEXTRAVERSION:=$(shell $(GIT) show $(HEAD):Makefile | sed -ne '/^EXTRAVERSION\ =\ /{s///;p;q}')
-KVERSION:=$(RPMKVERSION).$(RPMKPATCHLEVEL).$(RPMKSUBLEVEL)
 GITID:= $(shell $(GIT) log --max-count=1 --pretty=format:%H $(HEAD))
 ifndef BUILD
   BUILD:=$(RHEL_RELEASE)
@@ -182,6 +181,7 @@ ifeq ($(VERSION_ON_UPSTREAM),1)
   endif
 endif
 
+KVERSION:=$(RPMKVERSION).$(RPMKPATCHLEVEL).$(RPMKSUBLEVEL)
 DISTRO_BUILD:=$(PREBUILD)$(shell echo $(BUILD) | sed -e 's|\(^[0-9]\{1,4\}\)\..*|\1|')
 KABI_TARBALL:=$(SOURCES)/kernel-abi-stablelists-$(KVERSION)-$(DISTRO_BUILD).tar.bz2
 KABIDW := $(REDHAT)/kabi-dwarf
