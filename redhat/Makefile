@@ -254,11 +254,14 @@ KABIDW_TARBALL:=$(SOURCES)/kernel-kabi-dw-$(BASEVERSION).tar.bz2
 #
 ifeq ("$(DISTRO)", "fedora")
   SINGLE_TARBALL:=0
-  SPECTARFILE_RELEASE:=$(UPSTREAM_TARBALL_NAME)
   RHDISTGIT_BRANCH:=rawhide
   ifndef BUILD_SCRATCH_TARGET
     BUILD_SCRATCH_TARGET:=temp-ark-rhel-8-test
   endif
+  # The Fedora tarfile name is based on an upstream tag as users may
+  # replace the tarball from one with upstream, rebuild, and then deploy
+  # without changing anything else in the specfile.
+  SPECTARFILE_RELEASE:=$(UPSTREAM_TARBALL_NAME)
 else ifeq ("$(DISTRO)", "centos")
   SINGLE_TARBALL:=1
   RHDISTGIT_BRANCH:=c$(RHEL_MAJOR)s
