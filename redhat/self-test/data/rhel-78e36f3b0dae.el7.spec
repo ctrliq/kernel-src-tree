@@ -124,9 +124,6 @@ Summary: The Linux kernel
 %define primary_target rhel
 %endif
 
-# The kernel tarball/base version
-%define kversion 5.17
-
 %define specversion 5.17.0
 %define patchversion 5.17
 %define pkgrelease 0.rc0.78e36f3b0dae586.6.test
