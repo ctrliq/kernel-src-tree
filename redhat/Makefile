@@ -224,14 +224,30 @@ else
   endif
 endif
 
-SPECVERSION:=$(SPECKVERSION).$(SPECKPATCHLEVEL).$(SPECKSUBLEVEL)
+# This section contains the variables that represent the kernel rpm's NVR.
+# The NVR looks like, for example, kernel-5.17.0-0.rc8.551acdc3c3d2.124.test.fc35.
+# This string can be deconstructed as
+#
+# $(PACKAGE_NAME)-$(SPECKVERSION).$(SPECKPATCHLEVEL).$(SPECKSUBLEVEL)-$(PREBUILD)$(BUILD)$(BUILDID)$(DIST)
+#
+# This can be evaluated as
+#
+# $(PACKAGE_NAME)-$(SPECKVERSION).$(SPECKPATCHLEVEL).$(SPECKSUBLEVEL)-$(SPECBUILD)          $(DIST)
+# $(PACKAGE_NAME)-$(SPECVERSION)                                     -$(SPECBUILD)          $(DIST)
+# $(PACKAGE_NAME)-$(RPMVERSION)                                                             $(DIST)
+# $(RELEASETAG)                                                                             $(DIST)
+#
 SPECBUILD:=$(PREBUILD)$(BUILD)$(BUILDID)
-KABI_TARBALL:=$(SOURCES)/kernel-abi-stablelists-$(SPECVERSION)-$(SPECBUILD).tar.bz2
-KABIDW := $(REDHAT)/kabi-dwarf
-KABIDW_TARBALL:=$(SOURCES)/kernel-kabi-dw-$(SPECVERSION)-$(SPECBUILD).tar.bz2
+SPECVERSION:=$(SPECKVERSION).$(SPECKPATCHLEVEL).$(SPECKSUBLEVEL)
 RPMVERSION:=$(SPECVERSION)-$(SPECBUILD)
+RELEASETAG:=$(PACKAGE_NAME)-$(RPMVERSION)
+SRPM:=$(SRPMS)/$(RELEASETAG)$(DIST).src.rpm
 SPECRELEASE:=$(PREBUILD)$(BUILD)%{?buildid}%{?dist}
-SRPM:=$(SRPMS)/$(PACKAGE_NAME)-$(RPMVERSION)$(DIST).src.rpm
+
+# kabi variables
+KABI_TARBALL:=$(SOURCES)/kernel-abi-stablelists-$(RPMVERSION).tar.bz2
+KABIDW := $(REDHAT)/kabi-dwarf
+KABIDW_TARBALL:=$(SOURCES)/kernel-kabi-dw-$(RPMVERSION).tar.bz2
 
 #
 # This conditional statement is where fedora, centos, and other (aka RHEL)
@@ -444,12 +460,12 @@ dist-tarball: $(TARBALL)
 dist-kernelrelease:
 	# deprecated at 5.17.0
 	@echo "WARNING: This target will be deprecated in a future release."
-	@echo $(PACKAGE_NAME)-$(SPECVERSION)-$(SPECBUILD)
+	@echo $(PACKAGE_NAME)-$(RPMVERSION)
 
 dist-kernelversion:
 	# deprecated at 5.17.0
 	@echo "WARNING: This target will be deprecated in a future release."
-	@echo $(SPECVERSION)-$(SPECBUILD)
+	@echo $(RPMVERSION)
 
 dist-specfile: setup-source
 	# deprecated at 5.17.0
@@ -588,7 +604,7 @@ dist-release-finish: setup-source
 	@cp $(SOURCES)/$(SPECCHANGELOG) $(REDHAT)/$(SPECCHANGELOG)
 	@$(GIT) add $(REDHAT)/$(SPECCHANGELOG)
 	@$(GIT) add $(REDHAT)/marker
-	@$(GIT) commit -s ../Makefile.rhelver $(REDHAT)/marker $(REDHAT)/$(SPECCHANGELOG) $(SPECFILE).template -m "[redhat] $(PACKAGE_NAME)-$(RPMVERSION)"
+	@$(GIT) commit -s ../Makefile.rhelver $(REDHAT)/marker $(REDHAT)/$(SPECCHANGELOG) $(SPECFILE).template -m "[redhat] $(RELEASETAG)"
 dist-release-changed: setup-source
 	@cp $(SOURCES)/$(SPECCHANGELOG) $(REDHAT)/$(SPECCHANGELOG)
 	@echo $(MARKER) > $(REDHAT)/marker
@@ -604,7 +620,7 @@ dist-release-changed: setup-source
 dist-release: dist-clean-sources
 	@$(MAKE) dist-release-changed
 dist-release-tag:
-	@$(GIT) tag -a -m "$(PACKAGE_NAME)-$(RPMVERSION)" $(PACKAGE_NAME)-$(RPMVERSION)
+	@$(GIT) tag -a -m "$(RELEASETAG)" $(RELEASETAG)
 
 git-tree-check:
 	@if test -n "$(DIST_PUSH)" && test -z "$(shell $(GIT) remote get-url gitlab 2>/dev/null)"; then \
@@ -646,7 +662,7 @@ dist-vr-check:
 	fi
 
 dist-brew dist-koji: dist-%: dist-vr-check dist-srpm
-	$* $(BUILD_PROFILE) build $(BUILD_FLAGS) $(BUILD_TARGET) $(SRPMS)/$(PACKAGE_NAME)-$(RPMVERSION)$(DIST).src.rpm $(OUTPUT_FILE)
+	$* $(BUILD_PROFILE) build $(BUILD_FLAGS) $(BUILD_TARGET) $(SRPMS)/$(RELEASETAG)$(DIST).src.rpm $(OUTPUT_FILE)
 
 distg-brew distg-koji: distg-%: dist-vr-check
 	$* $(BUILD_PROFILE) build $(BUILD_FLAGS) $(BUILD_TARGET) "$(RHGITURL)?redhat/koji#$(RHGITCOMMIT)"
