@@ -27,4 +27,4 @@ trap 'rm -vf "$TARBALL"' INT
 # XZ_OPTIONS and XZ_THREADS DEPEND on word splitting, so don't disable it here:
 # shellcheck disable=SC2086
 cd ../ &&
-  git archive --prefix="linux-$TARFILE_RELEASE"/ --format=tar "$_GITID" | xz $XZ_OPTIONS $XZ_THREADS > "$TARBALL";
+  git archive --prefix="linux-$SPECTARFILE_RELEASE"/ --format=tar "$_GITID" | xz $XZ_OPTIONS $XZ_THREADS > "$TARBALL";
