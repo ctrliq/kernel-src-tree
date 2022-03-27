@@ -234,19 +234,19 @@ endif
 #
 # $(PACKAGE_NAME)-$(SPECKVERSION).$(SPECKPATCHLEVEL).$(SPECKSUBLEVEL)-$(SPECBUILD)          $(DIST)
 # $(PACKAGE_NAME)-$(SPECVERSION)                                     -$(SPECBUILD)          $(DIST)
-# $(PACKAGE_NAME)-$(RPMVERSION)                                                             $(DIST)
+# $(PACKAGE_NAME)-$(BASEVERSION)                                                            $(DIST)
 # $(RELEASETAG)                                                                             $(DIST)
 #
 SPECBUILD:=$(PREBUILD)$(BUILD)$(BUILDID)
 SPECVERSION:=$(SPECKVERSION).$(SPECKPATCHLEVEL).$(SPECKSUBLEVEL)
-RPMVERSION:=$(SPECVERSION)-$(SPECBUILD)
-RELEASETAG:=$(PACKAGE_NAME)-$(RPMVERSION)
+BASEVERSION:=$(SPECVERSION)-$(SPECBUILD)
+RELEASETAG:=$(PACKAGE_NAME)-$(BASEVERSION)
 SRPM:=$(SRPMS)/$(RELEASETAG)$(DIST).src.rpm
 
 # kabi variables
-KABI_TARBALL:=$(SOURCES)/kernel-abi-stablelists-$(RPMVERSION).tar.bz2
+KABI_TARBALL:=$(SOURCES)/kernel-abi-stablelists-$(BASEVERSION).tar.bz2
 KABIDW := $(REDHAT)/kabi-dwarf
-KABIDW_TARBALL:=$(SOURCES)/kernel-kabi-dw-$(RPMVERSION).tar.bz2
+KABIDW_TARBALL:=$(SOURCES)/kernel-kabi-dw-$(BASEVERSION).tar.bz2
 
 #
 # This conditional statement is where fedora, centos, and other (aka RHEL)
@@ -268,14 +268,14 @@ else ifeq ("$(DISTRO)", "centos")
   ifndef BUILD_SCRATCH_TARGET
     BUILD_SCRATCH_TARGET:=c$(RHEL_MAJOR)s-candidate
   endif
-  SPECTARFILE_RELEASE:=$(RPMVERSION)
+  SPECTARFILE_RELEASE:=$(BASEVERSION)
 else
   SINGLE_TARBALL:=1
   RHDISTGIT_BRANCH:=rhel-$(RHEL_MAJOR).$(RHEL_MINOR).0
   ifndef BUILD_SCRATCH_TARGET
     BUILD_SCRATCH_TARGET:=rhel-$(RHEL_MAJOR).$(RHEL_MINOR).0-test-pesign
   endif
-  SPECTARFILE_RELEASE:=$(RPMVERSION)
+  SPECTARFILE_RELEASE:=$(BASEVERSION)
 endif
 
 ifndef BUILD_TARGET
@@ -458,12 +458,12 @@ dist-tarball: $(TARBALL)
 dist-kernelrelease:
 	# deprecated at 5.17.0
 	@echo "WARNING: This target will be deprecated in a future release."
-	@echo $(PACKAGE_NAME)-$(RPMVERSION)
+	@echo $(PACKAGE_NAME)-$(BASEVERSION)
 
 dist-kernelversion:
 	# deprecated at 5.17.0
 	@echo "WARNING: This target will be deprecated in a future release."
-	@echo $(RPMVERSION)
+	@echo $(BASEVERSION)
 
 dist-specfile: setup-source
 	# deprecated at 5.17.0
@@ -500,7 +500,7 @@ setup-source: dist-git-version-check dist-clean-sources
 	@if [ -z "$(RHSELFTESTDATA)" ]; then \
 		cp $(REDHAT)/$(SPECCHANGELOG) $(SOURCES)/$(SPECCHANGELOG); \
 	else \
-		echo "Mon Mar 28 2022 Fedora Kernel Team <kernel-team@fedoraproject.org> [$(RPMVERSION)]" > $(SOURCES)/$(SPECCHANGELOG); \
+		echo "Mon Mar 28 2022 Fedora Kernel Team <kernel-team@fedoraproject.org> [$(BASEVERSION)]" > $(SOURCES)/$(SPECCHANGELOG); \
 	fi
 	@if [ -z "$(PATCHLIST_URL)" ]; then \
 		echo "Error: PATCHLIST_URL must be set (to 'none' or any URL)"; \
