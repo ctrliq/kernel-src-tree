@@ -450,7 +450,6 @@ $(KABIDW_TARBALL):
 	fi
 	@(cd kabi-dwarf && tar cjf $(KABIDW_TARBALL) base run_kabi-dw.sh)
 
-
 dist-tarball: $(TARBALL)
 	# deprecated at 5.17.0
 	@echo "WARNING: This target will be deprecated in a future release."
@@ -616,8 +615,10 @@ dist-release-changed: setup-source
 		$(REDHAT)/scripts/new_release.sh $(REDHAT) $(__YSTREAM) $(__ZSTREAM) $(BUMP_RELEASE); \
 		$(MAKE) dist-release-finish; \
 	fi
+
 dist-release: dist-clean-sources
 	@$(MAKE) dist-release-changed
+
 dist-release-tag:
 	@$(GIT) tag -a -m "$(RELEASETAG)" $(RELEASETAG)
 
