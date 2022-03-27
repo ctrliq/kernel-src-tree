@@ -53,7 +53,7 @@ MACH:=$(shell uname -m)
 SPECKVERSION:=$(shell $(GIT) show $(HEAD):Makefile | sed -ne '/^VERSION\ =\ /{s///;p;q}')
 SPECKPATCHLEVEL:=$(shell $(GIT) show $(HEAD):Makefile | sed -ne '/^PATCHLEVEL\ =\ /{s///;p;q}')
 SPECKSUBLEVEL:=$(shell $(GIT) show $(HEAD):Makefile | sed -ne '/^SUBLEVEL\ =\ /{s///;p;q}')
-RPMKEXTRAVERSION:=$(shell $(GIT) show $(HEAD):Makefile | sed -ne '/^EXTRAVERSION\ =\ /{s///;p;q}')
+SPECKEXTRAVERSION:=$(shell $(GIT) show $(HEAD):Makefile | sed -ne '/^EXTRAVERSION\ =\ /{s///;p;q}')
 GITID:= $(shell $(GIT) log --max-count=1 --pretty=format:%H $(HEAD))
 ifndef BUILD
   BUILD:=$(RHEL_RELEASE)
@@ -131,20 +131,20 @@ ifeq ("$(origin O)", "command line")
 endif
 
 # MARKER is the git tag which we base off of for exporting patches
-# Make sure MARKER uses SPECKVERSION, SPECKPATCHLEVEL and RPMKEXTRAVERSION from
-# makefile as opposed to any adjusted version for snapshotting.
-ifneq ($(RPMKEXTRAVERSION),)
-  MARKER:=v$(SPECKVERSION).$(SPECKPATCHLEVEL)$(RPMKEXTRAVERSION)
-  KEXTRAVERSION:=$(shell echo $(RPMKEXTRAVERSION) | sed -e s/-/./)
+# Make sure MARKER uses SPECKVERSION, SPECKPATCHLEVEL and SPECKEXTRAVERSION
+# from makefile as opposed to any adjusted version for snapshotting.
+ifneq ($(SPECKEXTRAVERSION),)
+  MARKER:=v$(SPECKVERSION).$(SPECKPATCHLEVEL)$(SPECKEXTRAVERSION)
+  KEXTRAVERSION:=$(shell echo $(SPECKEXTRAVERSION) | sed -e s/-/./)
   PREBUILD:=0$(KEXTRAVERSION).
-  UPSTREAM_TARBALL_NAME:=$(SPECKVERSION).$(SPECKPATCHLEVEL)$(RPMKEXTRAVERSION)
+  UPSTREAM_TARBALL_NAME:=$(SPECKVERSION).$(SPECKPATCHLEVEL)$(SPECKEXTRAVERSION)
 else
   KEXTRAVERSION:=
   ifeq ($(SPECKSUBLEVEL),0)
     MARKER:=v$(SPECKVERSION).$(SPECKPATCHLEVEL)
     UPSTREAM_TARBALL_NAME:=$(SPECKVERSION).$(SPECKPATCHLEVEL)
   else
-    # Make sure MARKER uses SPECKVERSION, SPECKPATCHLEVEL, and RPMKSUBLEVEL
+    # Make sure MARKER uses SPECKVERSION, SPECKPATCHLEVEL, and SPECKSUBLEVEL
     # from the kernel makefile as opposed to any adjusted version for snapshotting.
     # IOW, these variables are *NOT* equivalent to the SPECVERSION variable.
     MARKER:=v$(SPECKVERSION).$(SPECKPATCHLEVEL).$(SPECKSUBLEVEL)
@@ -182,7 +182,7 @@ ifeq ($(VERSION_ON_UPSTREAM),1)
     # been updated but we still need something that works for
     # packaging. Fix this by bumping the patch level and marking
     # this as rc0
-    ifeq ($(RPMKEXTRAVERSION),)
+    ifeq ($(SPECKEXTRAVERSION),)
       KEXTRAVERSION:=.rc0
       PREBUILD:=0$(KEXTRAVERSION).
       SPECKPATCHLEVEL:=$(shell expr $(SPECKPATCHLEVEL) + 1)
