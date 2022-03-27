@@ -3,13 +3,6 @@
 # environment changes that affect %%install need to go
 # here before the %%install macro is pre-built.
 
-# Include Fedora files
-%global include_fedora 1
-# Include RHEL files
-%global include_rhel 1
-# Provide Patchlist.changelog file
-%global patchlist_changelog 1
-
 # Disable LTO in userspace packages.
 %global _lto_cflags %{nil}
 
@@ -72,21 +65,6 @@
 %endif
 
 Summary: The Linux kernel
-
-# Set released_kernel to 1 when the upstream source tarball contains a
-#  kernel release. (This includes prepatch or "rc" releases.)
-# Set released_kernel to 0 when the upstream source tarball contains an
-#  unreleased kernel development snapshot.
-%global released_kernel 0
-
-# Set debugbuildsenabled to 1 to build separate base and debug kernels
-#  (on supported architectures). The kernel-debug-* subpackages will
-#  contain the debug kernel.
-# Set debugbuildsenabled to 0 to not build a separate debug kernel, but
-#  to build the base kernel using the debug configuration. (Specifying
-#  the --with-release option overrides this setting.)
-%define debugbuildsenabled 1
-
 %if 0%{?fedora}
 %define secure_boot_arch x86_64
 %else
@@ -115,24 +93,48 @@ Summary: The Linux kernel
 # for parallel xz processes, replace with 1 to go back to single process
 %endif
 
-%define buildid .test
-
-
 %if 0%{?fedora}
 %define primary_target fedora
 %else
 %define primary_target rhel
 %endif
 
+#
+# genspec.sh variables
+#
+
+# Include Fedora files
+%global include_fedora 1
+# Include RHEL files
+%global include_rhel 1
+# Provide Patchlist.changelog file
+%global patchlist_changelog 1
+# Set released_kernel to 1 when the upstream source tarball contains a
+#  kernel release. (This includes prepatch or "rc" releases.)
+# Set released_kernel to 0 when the upstream source tarball contains an
+#  unreleased kernel development snapshot.
+%global released_kernel 0
+# Set debugbuildsenabled to 1 to build separate base and debug kernels
+#  (on supported architectures). The kernel-debug-* subpackages will
+#  contain the debug kernel.
+# Set debugbuildsenabled to 0 to not build a separate debug kernel, but
+#  to build the base kernel using the debug configuration. (Specifying
+#  the --with-release option overrides this setting.)
+%define debugbuildsenabled 1
+%define buildid .test
 %define specversion 5.16.0
 %define patchversion 5.16
 %define pkgrelease 6.test
-
+%define kversion 5
+%define tarfile_release 5.16
 # This is needed to do merge window version magic
 %define patchlevel 16
-
 # allow pkg_release to have configurable %%{?dist} tag
 %define specrelease 6%{?buildid}%{?dist}
+
+#
+# End of genspec.sh variables
+#
 
 %define pkg_release %{specrelease}
 
@@ -687,7 +689,7 @@ BuildRequires: lld
 # exact git commit you can run
 #
 # xzcat -qq ${TARBALL} | git get-tar-commit-id
-Source0: linux-5.16.tar.xz
+Source0: linux-%{tarfile_release}.tar.xz
 
 Source1: Makefile.rhelver
 
@@ -1352,7 +1354,7 @@ ApplyPatch()
     exit 1
   fi
   if ! grep -E "^Patch[0-9]+: $patch\$" %{_specdir}/${RPM_PACKAGE_NAME}.spec ; then
-    if [ "${patch:0:8}" != "patch-5." ] ; then
+    if [ "${patch:0:8}" != "patch-%{kversion}." ] ; then
       echo "ERROR: Patch  $patch  not listed as a source patch in specfile"
       exit 1
     fi
@@ -1379,8 +1381,8 @@ ApplyOptionalPatch()
   fi
 }
 
-%setup -q -n kernel-5.16 -c
-mv linux-5.16 linux-%{KVERREL}
+%setup -q -n kernel-%{tarfile_release} -c
+mv linux-%{tarfile_release} linux-%{KVERREL}
 
 cd linux-%{KVERREL}
 cp -a %{SOURCE1} .
