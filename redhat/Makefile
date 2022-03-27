@@ -615,7 +615,7 @@ dist-release-changed: setup-source
 		echo "Nothing changed, skipping updates"; \
 	else \
 		$(GIT) checkout -- $(REDHAT)/$(SPECCHANGELOG); \
-		$(REDHAT)/scripts/new_release.sh $(REDHAT) $(YSTREAM_FLAG) $(ZSTREAM_FLAG) $(BUMP_RELEASE); \
+		$(REDHAT)/scripts/new_release.sh; \
 		$(MAKE) dist-release-finish; \
 	fi
 
