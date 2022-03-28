@@ -87,7 +87,7 @@ Summary: The Linux kernel
 #  the --with-release option overrides this setting.)
 %define debugbuildsenabled 0
 
-%global distro_build 0.rc5.fce15c45d3fb.6
+%global distro_build 0.rc5.fce15c45d3fbd9f.6
 
 %if 0%{?fedora}
 %define secure_boot_arch x86_64
@@ -132,13 +132,13 @@ Summary: The Linux kernel
 
 %define rpmversion 5.16.0
 %define patchversion 5.16
-%define pkgrelease 0.rc5.fce15c45d3fb.6.test
+%define pkgrelease 0.rc5.fce15c45d3fbd9f.6.test
 
 # This is needed to do merge window version magic
 %define patchlevel 16
 
 # allow pkg_release to have configurable %%{?dist} tag
-%define specrelease 0.rc5.fce15c45d3fb.6%{?buildid}%{?dist}
+%define specrelease 0.rc5.fce15c45d3fbd9f.6%{?buildid}%{?dist}
 
 %define pkg_release %{specrelease}
 
@@ -698,7 +698,7 @@ BuildRequires: lld
 # exact git commit you can run
 #
 # xzcat -qq ${TARBALL} | git get-tar-commit-id
-Source0: linux-5.16.0-0.rc5.fce15c45d3fb.6.test.tar.xz
+Source0: linux-5.16.0-0.rc5.fce15c45d3fbd9f.6.test.tar.xz
 
 Source1: Makefile.rhelver
 
@@ -1394,8 +1394,8 @@ ApplyOptionalPatch()
   fi
 }
 
-%setup -q -n kernel-5.16.0-0.rc5.fce15c45d3fb.6.test -c
-mv linux-5.16.0-0.rc5.fce15c45d3fb.6.test linux-%{KVERREL}
+%setup -q -n kernel-5.16.0-0.rc5.fce15c45d3fbd9f.6.test -c
+mv linux-5.16.0-0.rc5.fce15c45d3fbd9f.6.test linux-%{KVERREL}
 
 cd linux-%{KVERREL}
 cp -a %{SOURCE1} .
@@ -3022,7 +3022,7 @@ fi
 #
 #
 %changelog
-Mon Mar 28 2022 Fedora Kernel Team <kernel-team@fedoraproject.org> [5.16.0-0.rc5.fce15c45d3fb.6.test]
+Mon Mar 28 2022 Fedora Kernel Team <kernel-team@fedoraproject.org> [5.16.0-0.rc5.fce15c45d3fbd9f.6.test]
 
 ###
 # The following Emacs magic makes C-c C-e use UTC dates.
