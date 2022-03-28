@@ -38,6 +38,7 @@ do
 			cat Makefile.variables | grep -v "^#" | sed '/^$/d' | tr -d " " | awk -F "?=|:=" '{print $1}' | while read -r VAR
 			do
 				[ "$VAR" == "RHDISTDATADIR" ] && continue
+				[ "$VAR" == "RHGITURL" ] && continue
 				echo "$VAR=${!VAR}"
 			done >> "${varfilename}"
 
