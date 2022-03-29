@@ -26,7 +26,9 @@ do
 
 			# CURDIR is a make special target and cannot be easily changed.  Omit
 			# CURDIR from the output.
-			make RHSELFTESTDATA=1 DIST="${DIST}" DISTRO="${DISTRO}" HEAD=${commit} dist-dump-variables | grep "=" | grep -v CURDIR >& "${varfilename}"
+			# UPSTREAM is the base merge commit and can change from day-to-day as
+			# the tree is changed.  Omit UPSTREAM from the output.
+			make RHSELFTESTDATA=1 DIST="${DIST}" DISTRO="${DISTRO}" HEAD=${commit} dist-dump-variables | grep "=" | grep -v CURDIR | grep -v -w UPSTREAM >& "${varfilename}"
 
 			# When executed from a script, the variables in Makefile.variables are
 			# listed as having origin 'environment'.  This is because the script
