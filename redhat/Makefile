@@ -436,7 +436,6 @@ dist-automotive-sig-release: dist-clean-sources
 	fi
 
 dist-automotive-sig: dist-automotive-sig-release
-	@$(MAKE) distg-cbs
 
 .PHONY: $(REDHAT)/rpm/SOURCES/$(PACKAGE_NAME).spec
 $(REDHAT)/rpm/SOURCES/$(PACKAGE_NAME).spec:
