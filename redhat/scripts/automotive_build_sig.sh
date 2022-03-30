@@ -20,6 +20,10 @@ use_tags=$8;
 redhat=$(dirname "$0")/..;
 topdir="$redhat"/..;
 
+# XXX: Placeholders for RHEL variables
+rhdistgit_zstream_flag="no"
+rtbz=""
+
 function die
 {
 	echo "Error: $1" >&2;
@@ -58,9 +62,9 @@ function update_patches()
 
 # Create a stagging repository
 date=$(date +"%Y-%m-%d");
-tmp="$(mktemp -d --tmpdir="$autosig_tmp" AUTOSIG."$date".XXXXXXXX)";
+tmpdir="$(mktemp -d --tmpdir="$autosig_tmp" AUTOSIG."$date".XXXXXXXX)";
 
-cd "$tmp" || die "Unable to create temporary directory";
+cd "$tmpdir" || die "Unable to create temporary directory";
 
 # upload the sources into centos repos
 upload_sources || die "Unable to upload the sources"
@@ -68,5 +72,13 @@ upload_sources || die "Unable to upload the sources"
 # update the centos sources into package repo
 update_patches || die "Unable to copy the patches";
 
+echo "Creating diff for review ($tmpdir/diff) and changelog"
+# diff the result (redhat/cvs/dontdiff). note: diff reuturns 1 if
+# differences were found
+diff -X "$redhat"/git/dontdiff -upr "$tmpdir/$package_name" "$redhat"/rpm/SOURCES/ > "$tmpdir"/diff;
+# creating the changelog file (no zstream_flag and rtbz)
+"$redhat"/scripts/create_distgit_changelog.sh "$redhat"/rpm/SOURCES/kernel.spec \
+        "$rhdistgit_zstream_flag" "$package_name" "$rtbz" >"$tmpdir"/changelog
+
 # all done
-echo "dist-git updated here: $tmp"
+echo "dist-git updated here: $tmpdir"
