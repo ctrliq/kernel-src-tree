@@ -54,31 +54,7 @@ function update_patches()
 
 	# Update tarball metada
 	echo "$tarball_sha SOURCES/$tarball_name" > "${package_name}/.kernel-automotive.metadata";
-	pushd "$package_name" &> /dev/null;
-
-	# Check for changes and commit/push them
-	source_changes=$(git status --porcelain | cut -b4-);
-	echo $source_changes
-	if [ -z "$source_changes" ];
-	then
-		die "Nothing has changed.";
-	fi
-	git commit -a -s -m"$(echo -e "[redhat] Update sources for $tarball_name\n\nChanges included into this commit:\n$source_changes")" || die "Unable to commit the changes";
-	git push origin $autosig_branch || die "Unable to push the changes"
-	if [ "$use_tags" = "y" ];
-	then
-		git tag -a -m "$package_name-$stamp_version-$pkgrelease" $package_name-$stamp_version-$pkgrelease
-		git push origin tag $package_name-$stamp_version-$pkgrelease || die "Unable to push tag $package_name-$stamp_version-$pkgrelease"
-		popd &> /dev/null;
-	else
-		kernel_auto_rev=$(git log -1 --pretty=format:%H);
-		popd &> /dev/null;
-                sed -i -e "0,/AUTOGITREF?=[^ ]*/s/AUTOGITREF?=[^ ]*/AUTOGITREF?=$kernel_auto_rev/" $redhat/Makefile.automotive;
-	fi
 }
-
-# Sanity check of global git variables set
-git config --list --global | grep -q "user\.name" && git config --list --global | grep -q "user\.email" || die "Configure your username and email into global git settings";
 
 # Create a stagging repository
 date=$(date +"%Y-%m-%d");
