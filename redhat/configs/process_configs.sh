@@ -304,6 +304,10 @@ function process_configs()
 	count=0
 	for cfg in "$SCRIPT_DIR/${PACKAGE_NAME}${KVERREL}${SUBARCH}"*.config
 	do
+		if [ "$count" -eq 0 ]; then
+			# do the first one by itself so that tools are built
+			process_config "$cfg" "$count"
+		fi
 		process_config "$cfg" "$count" &
 		waitpids[${count}]=$!
 		((count++))
