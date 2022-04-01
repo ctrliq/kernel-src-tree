@@ -787,6 +787,9 @@ struct readahead_control {
 	struct file *file;
 	struct address_space *mapping;
 	struct file_ra_state *ra;
+	RH_KABI_RESERVE(1)
+	RH_KABI_RESERVE(2)
+	RH_KABI_RESERVE(3)
 /* private: use the readahead_* accessors instead */
 	pgoff_t _index;
 	unsigned int _nr_pages;
