@@ -12,20 +12,20 @@ PKGRELEASE=$5
 KVERSION=$6
 KPATCHLEVEL=$7
 KSUBLEVEL=$8
-DISTRO_BUILD=$9
-SPECRELEASE=${10}
-ZSTREAM_FLAG=${11}
-BUILDOPTS=${12}
-RTBUILD=${13}
-MARKER=${14}
-LAST_MARKER=${15}
-SINGLE_TARBALL=${16}
-TARFILE_RELEASE=${17}
-SNAPSHOT=${18}
-UPSTREAM_BRANCH=${19}
-INCLUDE_FEDORA_FILES=${20}
-INCLUDE_RHEL_FILES=${21}
-BUILDID=${22}
+SPECRELEASE=$9
+ZSTREAM_FLAG=${10}
+BUILDOPTS=${11}
+RTBZ=${12}
+MARKER=${13}
+LAST_MARKER=${14}
+SINGLE_TARBALL=${15}
+TARFILE_RELEASE=${16}
+SNAPSHOT=${17}
+UPSTREAM_BRANCH=${18}
+INCLUDE_FEDORA_FILES=${19}
+INCLUDE_RHEL_FILES=${20}
+BUILDID=${21}
+
 RPMVERSION=${KVERSION}.${KPATCHLEVEL}.${KSUBLEVEL}
 clogf="$SOURCES/changelog"
 # hide [redhat] entries from changelog
@@ -44,7 +44,8 @@ RPM_VERSION="$RPMVERSION-$PKGRELEASE";
 # have the pathspec '(exclude)' support
 EXCLUDE=$(git log -1 --format=%P ${0%/*}/rhdocs | cut -d ' ' -f 2)
 
-echo > "$clogf"
+GIT_FORMAT="--format=- %s (%an)%n%N%n^^^NOTES-END^^^%n%b"
+GIT_NOTES="--notes=refs/notes/${RHEL_MAJOR}.${RHEL_MINOR}*"
 
 lasttag=$(git rev-list --first-parent --grep="^\[redhat\] ${PACKAGE_NAME}-${RPMVERSION}" --max-count=1 HEAD)
 # if we didn't find the proper tag, assume this is the first release
@@ -59,14 +60,30 @@ if [[ -z $lasttag ]]; then
 fi
 echo "Gathering new log entries since $lasttag"
 # master is expected to track mainline.
+
+cname="$(git var GIT_COMMITTER_IDENT |sed 's/>.*/>/')"
+cdate="$(LC_ALL=C date +"%a %b %d %Y")"
+cversion="[$RPM_VERSION]";
+echo "* $cdate $cname $cversion" > "$clogf"
+
 UPSTREAM="$(git rev-parse -q --verify origin/$UPSTREAM_BRANCH || \
           git rev-parse -q --verify $UPSTREAM_BRANCH)"
+
+# Add a line containing the RTBZ to satisfy QE scripts.
+# changelog is no longer generated in rev, so this had to be moved
+# to the top of the gerneration logic.
+# This change means that a changelog will have length 1 even
+# when there are no new entries.
+# Lenght=1 is actualy a length of 0 because of this.
+echo "- [rt] build $PACKAGE_NAME-$RPM_VERSION [$RTBZ]" >> "$clogf"
  
-git log --topo-order --reverse --no-merges -z --format="- %s (%an)%n%b" \
+git log --topo-order --no-merges -z $GIT_NOTES "$GIT_FORMAT" \
 	^${UPSTREAM} ${EXCLUDE:+^$EXCLUDE} "$lasttag".. | ${0%/*}/genlog.py >> "$clogf"
 
-grep -v "tagging $RPM_VERSION" "$clogf" > "$clogf.stripped"
-cp "$clogf.stripped" "$clogf"
+# With the recent change from 924856ea3, resolves is generated in genspec
+# The rtbz is not added to the commit until after this step, so we need to
+# explicitly add it ourselves
+sed -i 's/Resolves: /Resolves: rhbz#'"$RTBZ"', /g'      "$clogf"
 
 if [ "$HIDE_REDHAT" = "1" ]; then
 	grep -v -e "^- \[redhat\]" "$clogf" |
@@ -100,24 +117,19 @@ if [ -n "$(git log --oneline --first-parent --grep="Merge ark patches" "$lasttag
 	echo "- Merge ark-patches" >> "$clogf"
 fi
 
-LENGTH=$(wc -l "$clogf" | awk '{print $1}')
-
-#the changelog was created in reverse order
-#also remove the blank on top, if it exists
-#left by the 'print version\n' logic above
-cname="$(git var GIT_COMMITTER_IDENT |sed 's/>.*/>/')"
-cdate="$(LC_ALL=C date +"%a %b %d %Y")"
-cversion="[$RPM_VERSION]";
-tac "$clogf" | sed "1{/^$/d; /^- /i\
-* $cdate $cname $cversion
-	}" > "$clogf.rev"
-
+# during rh-dist-git genspec runs again and generates empty changelog
+# create empty file to avoid adding extra header to changelog
+LENGTH=$(grep "^-" $clogf | wc -l | awk '{print $1}')
 if [ "$LENGTH" = 0 ]; then
-	rm -f "$clogf.rev"; touch "$clogf.rev"
+	rm -f $clogf
+	touch $clogf
 fi
 
-cat "$clogf.rev" "$CHANGELOG" > "$clogf.full"
+cat "$clogf" "$CHANGELOG" > "$clogf.full"
 mv -f "$clogf.full" "$CHANGELOG"
+
+# genlog.py generates Resolves lines as well, strip these from RPM changelog
+cat $CHANGELOG | grep -v -e "^Resolves: " > $clogf.stripped
 
 if [ "$SNAPSHOT" = 0 ]; then
 	# This is based off a tag on Linus's tree (e.g. v5.5 or v5.5-rc5).
@@ -136,7 +148,7 @@ fi
 
 test -n "$SPECFILE" &&
         sed -i -e "
-	/%%CHANGELOG%%/r $CHANGELOG
+	/%%CHANGELOG%%/r $clogf.stripped
 	/%%CHANGELOG%%/d
 	s/%%PACKAGE_NAME%%/$PACKAGE_NAME/
 	s/%%BUILDID%%/$BUILDID_DEFINE/
@@ -145,7 +157,6 @@ test -n "$SPECFILE" &&
 	s/%%KSUBLEVEL%%/$KSUBLEVEL/
 	s/%%PKGRELEASE%%/$PKGRELEASE/
 	s/%%SPECRELEASE%%/$SPECRELEASE/
-	s/%%DISTRO_BUILD%%/$DISTRO_BUILD/
 	s/%%DEBUG_BUILDS_ENABLED%%/$DEBUG_BUILDS_ENABLED/
 	s/%%INCLUDE_FEDORA_FILES%%/$INCLUDE_FEDORA_FILES/
 	s/%%INCLUDE_RHEL_FILES%%/$INCLUDE_RHEL_FILES/
@@ -184,4 +195,4 @@ for opt in $BUILDOPTS; do
 	[ -n "$add_opt" ] && sed -i "s/^\\(# The following build options\\)/%define $add_opt 1\\n\\1/" $SPECFILE
 done
 
-rm -f "$clogf"{,.rev,.stripped};
+rm -f "$clogf"{,.stripped};
