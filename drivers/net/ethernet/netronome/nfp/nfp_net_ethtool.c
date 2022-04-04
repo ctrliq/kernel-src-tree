@@ -380,7 +380,9 @@ err_bad_set:
 }
 
 static void nfp_net_get_ringparam(struct net_device *netdev,
-				  struct ethtool_ringparam *ring)
+				  struct ethtool_ringparam *ring,
+				  struct kernel_ethtool_ringparam *kernel_ring,
+				  struct netlink_ext_ack *extack)
 {
 	struct nfp_net *nn = netdev_priv(netdev);
 
@@ -405,7 +407,9 @@ static int nfp_net_set_ring_size(struct nfp_net *nn, u32 rxd_cnt, u32 txd_cnt)
 }
 
 static int nfp_net_set_ringparam(struct net_device *netdev,
-				 struct ethtool_ringparam *ring)
+				 struct ethtool_ringparam *ring,
+				 struct kernel_ethtool_ringparam *kernel_ring,
+				 struct netlink_ext_ack *extack)
 {
 	struct nfp_net *nn = netdev_priv(netdev);
 	u32 rxd_cnt, txd_cnt;
@@ -1078,7 +1082,9 @@ static void nfp_net_get_regs(struct net_device *netdev,
 }
 
 static int nfp_net_get_coalesce(struct net_device *netdev,
-				struct ethtool_coalesce *ec)
+				struct ethtool_coalesce *ec,
+				struct kernel_ethtool_coalesce *kernel_coal,
+				struct netlink_ext_ack *extack)
 {
 	struct nfp_net *nn = netdev_priv(netdev);
 
@@ -1327,7 +1333,9 @@ exit_close_nsp:
 }
 
 static int nfp_net_set_coalesce(struct net_device *netdev,
-				struct ethtool_coalesce *ec)
+				struct ethtool_coalesce *ec,
+				struct kernel_ethtool_coalesce *kernel_coal,
+				struct netlink_ext_ack *extack)
 {
 	struct nfp_net *nn = netdev_priv(netdev);
 	unsigned int factor;

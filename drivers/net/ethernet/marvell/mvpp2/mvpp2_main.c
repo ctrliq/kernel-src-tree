@@ -5367,8 +5367,11 @@ static int mvpp2_ethtool_nway_reset(struct net_device *dev)
 }
 
 /* Set interrupt coalescing for ethtools */
-static int mvpp2_ethtool_set_coalesce(struct net_device *dev,
-				      struct ethtool_coalesce *c)
+static int
+mvpp2_ethtool_set_coalesce(struct net_device *dev,
+			   struct ethtool_coalesce *c,
+			   struct kernel_ethtool_coalesce *kernel_coal,
+			   struct netlink_ext_ack *extack)
 {
 	struct mvpp2_port *port = netdev_priv(dev);
 	int queue;
@@ -5400,8 +5403,11 @@ static int mvpp2_ethtool_set_coalesce(struct net_device *dev,
 }
 
 /* get coalescing for ethtools */
-static int mvpp2_ethtool_get_coalesce(struct net_device *dev,
-				      struct ethtool_coalesce *c)
+static int
+mvpp2_ethtool_get_coalesce(struct net_device *dev,
+			   struct ethtool_coalesce *c,
+			   struct kernel_ethtool_coalesce *kernel_coal,
+			   struct netlink_ext_ack *extack)
 {
 	struct mvpp2_port *port = netdev_priv(dev);
 
@@ -5423,8 +5429,11 @@ static void mvpp2_ethtool_get_drvinfo(struct net_device *dev,
 		sizeof(drvinfo->bus_info));
 }
 
-static void mvpp2_ethtool_get_ringparam(struct net_device *dev,
-					struct ethtool_ringparam *ring)
+static void
+mvpp2_ethtool_get_ringparam(struct net_device *dev,
+			    struct ethtool_ringparam *ring,
+			    struct kernel_ethtool_ringparam *kernel_ring,
+			    struct netlink_ext_ack *extack)
 {
 	struct mvpp2_port *port = netdev_priv(dev);
 
@@ -5434,8 +5443,11 @@ static void mvpp2_ethtool_get_ringparam(struct net_device *dev,
 	ring->tx_pending = port->tx_ring_size;
 }
 
-static int mvpp2_ethtool_set_ringparam(struct net_device *dev,
-				       struct ethtool_ringparam *ring)
+static int
+mvpp2_ethtool_set_ringparam(struct net_device *dev,
+			    struct ethtool_ringparam *ring,
+			    struct kernel_ethtool_ringparam *kernel_ring,
+			    struct netlink_ext_ack *extack)
 {
 	struct mvpp2_port *port = netdev_priv(dev);
 	u16 prev_rx_ring_size = port->rx_ring_size;

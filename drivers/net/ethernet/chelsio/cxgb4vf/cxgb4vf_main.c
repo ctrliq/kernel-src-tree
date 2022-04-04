@@ -1591,7 +1591,9 @@ static void cxgb4vf_set_msglevel(struct net_device *dev, u32 msglevel)
  * first Queue Set.
  */
 static void cxgb4vf_get_ringparam(struct net_device *dev,
-				  struct ethtool_ringparam *rp)
+				  struct ethtool_ringparam *rp,
+				  struct kernel_ethtool_ringparam *kernel_rp,
+				  struct netlink_ext_ack *extack)
 {
 	const struct port_info *pi = netdev_priv(dev);
 	const struct sge *s = &pi->adapter->sge;
@@ -1614,7 +1616,9 @@ static void cxgb4vf_get_ringparam(struct net_device *dev,
  * device -- after vetting them of course!
  */
 static int cxgb4vf_set_ringparam(struct net_device *dev,
-				 struct ethtool_ringparam *rp)
+				 struct ethtool_ringparam *rp,
+				 struct kernel_ethtool_ringparam *kernel_rp,
+				 struct netlink_ext_ack *extack)
 {
 	const struct port_info *pi = netdev_priv(dev);
 	struct adapter *adapter = pi->adapter;
@@ -1647,7 +1651,9 @@ static int cxgb4vf_set_ringparam(struct net_device *dev,
  * interrupt holdoff timer to be read on all of the device's Queue Sets.
  */
 static int cxgb4vf_get_coalesce(struct net_device *dev,
-				struct ethtool_coalesce *coalesce)
+				struct ethtool_coalesce *coalesce,
+				struct kernel_ethtool_coalesce *kernel_coal,
+				struct netlink_ext_ack *extack)
 {
 	const struct port_info *pi = netdev_priv(dev);
 	const struct adapter *adapter = pi->adapter;
@@ -1667,7 +1673,9 @@ static int cxgb4vf_get_coalesce(struct net_device *dev,
  * the interrupt holdoff timer on any of the device's Queue Sets.
  */
 static int cxgb4vf_set_coalesce(struct net_device *dev,
-				struct ethtool_coalesce *coalesce)
+				struct ethtool_coalesce *coalesce,
+				struct kernel_ethtool_coalesce *kernel_coal,
+				struct netlink_ext_ack *extack)
 {
 	const struct port_info *pi = netdev_priv(dev);
 	struct adapter *adapter = pi->adapter;

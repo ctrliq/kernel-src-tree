@@ -217,16 +217,22 @@ static int mlx5e_rep_get_sset_count(struct net_device *dev, int sset)
 	}
 }
 
-static void mlx5e_rep_get_ringparam(struct net_device *dev,
-				struct ethtool_ringparam *param)
+static void
+mlx5e_rep_get_ringparam(struct net_device *dev,
+			struct ethtool_ringparam *param,
+			struct kernel_ethtool_ringparam *kernel_param,
+			struct netlink_ext_ack *extack)
 {
 	struct mlx5e_priv *priv = netdev_priv(dev);
 
 	mlx5e_ethtool_get_ringparam(priv, param);
 }
 
-static int mlx5e_rep_set_ringparam(struct net_device *dev,
-			       struct ethtool_ringparam *param)
+static int
+mlx5e_rep_set_ringparam(struct net_device *dev,
+			struct ethtool_ringparam *param,
+			struct kernel_ethtool_ringparam *kernel_param,
+			struct netlink_ext_ack *extack)
 {
 	struct mlx5e_priv *priv = netdev_priv(dev);
 
@@ -250,7 +256,9 @@ static int mlx5e_rep_set_channels(struct net_device *dev,
 }
 
 static int mlx5e_rep_get_coalesce(struct net_device *netdev,
-				  struct ethtool_coalesce *coal)
+				  struct ethtool_coalesce *coal,
+				  struct kernel_ethtool_coalesce *kernel_coal,
+				  struct netlink_ext_ack *extack)
 {
 	struct mlx5e_priv *priv = netdev_priv(netdev);
 
@@ -258,7 +266,9 @@ static int mlx5e_rep_get_coalesce(struct net_device *netdev,
 }
 
 static int mlx5e_rep_set_coalesce(struct net_device *netdev,
-				  struct ethtool_coalesce *coal)
+				  struct ethtool_coalesce *coal,
+				  struct kernel_ethtool_coalesce *kernel_coal,
+				  struct netlink_ext_ack *extack)
 {
 	struct mlx5e_priv *priv = netdev_priv(netdev);
 
