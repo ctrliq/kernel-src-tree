@@ -123,7 +123,16 @@ static void noinstr exit_el1_irq_or_nmi(struct pt_regs *regs)
 
 static void __sched arm64_preempt_schedule_irq(void)
 {
-	lockdep_assert_irqs_disabled();
+	if (!IS_ENABLED(CONFIG_PREEMPTION))
+		return;
+
+	/*
+	 * Note: thread_info::preempt_count includes both thread_info::count
+	 * and thread_info::need_resched, and is not equivalent to
+	 * preempt_count().
+	 */
+	if (READ_ONCE(current_thread_info()->preempt_count) != 0)
+		return;
 
 	/*
 	 * DAIF.DA are cleared at the start of IRQ/FIQ handling, and when GIC
@@ -350,14 +359,7 @@ static void noinstr el1_interrupt(struct pt_regs *regs,
 	enter_el1_irq_or_nmi(regs);
 	do_interrupt_handler(regs, handler);
 
-	/*
-	 * Note: thread_info::preempt_count includes both thread_info::count
-	 * and thread_info::need_resched, and is not equivalent to
-	 * preempt_count().
-	 */
-	if (IS_ENABLED(CONFIG_PREEMPTION) &&
-	    READ_ONCE(current_thread_info()->preempt_count) == 0)
-		arm64_preempt_schedule_irq();
+	arm64_preempt_schedule_irq();
 
 	exit_el1_irq_or_nmi(regs);
 }
