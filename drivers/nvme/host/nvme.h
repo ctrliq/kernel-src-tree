@@ -11,7 +11,6 @@
 #include <linux/pci.h>
 #include <linux/kref.h>
 #include <linux/blk-mq.h>
-#include <linux/lightnvm.h>
 #include <linux/sed-opal.h>
 #include <linux/fault-inject.h>
 #include <linux/rcupdate.h>
@@ -47,11 +46,6 @@ extern unsigned int admin_timeout;
 extern struct workqueue_struct *nvme_wq;
 extern struct workqueue_struct *nvme_reset_wq;
 extern struct workqueue_struct *nvme_delete_wq;
-
-enum {
-	NVME_NS_LBA		= 0,
-	NVME_NS_LIGHTNVM	= 1,
-};
 
 /*
  * List of workarounds for devices that required behavior not specified in
@@ -91,11 +85,6 @@ enum nvme_quirks {
 	 * The deepest sleep state should not be used.
 	 */
 	NVME_QUIRK_NO_DEEPEST_PS		= (1 << 5),
-
-	/*
-	 * Supports the LighNVM command set if indicated in vs[1].
-	 */
-	NVME_QUIRK_LIGHTNVM			= (1 << 6),
 
 	/*
 	 * Set MEDIUM priority on SQ creation
@@ -458,7 +447,6 @@ struct nvme_ns {
 	u32 ana_grpid;
 #endif
 	struct list_head siblings;
-	struct nvm_dev *ndev;
 	struct kref kref;
 	struct nvme_ns_head *head;
 
@@ -476,6 +464,7 @@ struct nvme_ns {
 #define NVME_NS_DEAD     	1
 #define NVME_NS_ANA_PENDING	2
 #define NVME_NS_FORCE_RO	3
+#define NVME_NS_READY		4
 #define NVME_NS_STOPPED		5
 
 	struct cdev		cdev;
@@ -656,6 +645,20 @@ static inline bool nvme_is_aen_req(u16 qid, __u16 command_id)
 }
 
 void nvme_complete_rq(struct request *req);
+void nvme_complete_batch_req(struct request *req);
+
+static __always_inline void nvme_complete_batch(struct io_comp_batch *iob,
+						void (*fn)(struct request *rq))
+{
+	struct request *req;
+
+	rq_list_for_each(&iob->req_list, req) {
+		fn(req);
+		nvme_complete_batch_req(req);
+	}
+	blk_mq_end_request_batch(iob);
+}
+
 blk_status_t nvme_host_path_error(struct request *req);
 bool nvme_cancel_request(struct request *req, void *data, bool reserved);
 void nvme_cancel_tagset(struct nvme_ctrl *ctrl);
@@ -710,7 +713,7 @@ static inline bool nvme_check_ready(struct nvme_ctrl *ctrl, struct request *rq,
 		return true;
 	if (ctrl->ops->flags & NVME_F_FABRICS &&
 	    ctrl->state == NVME_CTRL_DELETING)
-		return true;
+		return queue_live;
 	return __nvme_check_ready(ctrl, rq, queue_live);
 }
 int nvme_submit_sync_cmd(struct request_queue *q, struct nvme_command *cmd,
@@ -764,6 +767,7 @@ static inline bool nvme_ctrl_use_ana(struct nvme_ctrl *ctrl)
 void nvme_mpath_unfreeze(struct nvme_subsystem *subsys);
 void nvme_mpath_wait_freeze(struct nvme_subsystem *subsys);
 void nvme_mpath_start_freeze(struct nvme_subsystem *subsys);
+void nvme_mpath_default_iopolicy(struct nvme_subsystem *subsys);
 bool nvme_mpath_set_disk_name(struct nvme_ns *ns, char *disk_name, int *flags);
 void nvme_failover_req(struct request *req);
 void nvme_update_ana(struct request *req);
@@ -776,6 +780,7 @@ void nvme_mpath_init_ctrl(struct nvme_ctrl *ctrl);
 void nvme_mpath_uninit(struct nvme_ctrl *ctrl);
 void nvme_mpath_stop(struct nvme_ctrl *ctrl);
 bool nvme_mpath_clear_current_path(struct nvme_ns *ns);
+void nvme_mpath_revalidate_paths(struct nvme_ns *ns);
 void nvme_mpath_clear_ctrl_paths(struct nvme_ctrl *ctrl);
 void nvme_mpath_shutdown_disk(struct nvme_ns_head *head);
 
@@ -826,6 +831,9 @@ static inline bool nvme_mpath_clear_current_path(struct nvme_ns *ns)
 {
 	return false;
 }
+static inline void nvme_mpath_revalidate_paths(struct nvme_ns *ns)
+{
+}
 static inline void nvme_mpath_clear_ctrl_paths(struct nvme_ctrl *ctrl)
 {
 }
@@ -861,6 +869,9 @@ static inline void nvme_mpath_wait_freeze(struct nvme_subsystem *subsys)
 static inline void nvme_mpath_start_freeze(struct nvme_subsystem *subsys)
 {
 }
+static inline void nvme_mpath_default_iopolicy(struct nvme_subsystem *subsys)
+{
+}
 #endif /* CONFIG_NVME_MULTIPATH */
 
 int nvme_revalidate_zones(struct nvme_ns *ns);
@@ -886,26 +897,6 @@ static inline int nvme_update_zone_info(struct nvme_ns *ns, unsigned lbaf)
 	return -EPROTONOSUPPORT;
 }
 #endif
-
-#ifdef CONFIG_NVM
-int nvme_nvm_register(struct nvme_ns *ns, char *disk_name, int node);
-void nvme_nvm_unregister(struct nvme_ns *ns);
-extern const struct attribute_group nvme_nvm_attr_group;
-int nvme_nvm_ioctl(struct nvme_ns *ns, unsigned int cmd, void __user *argp);
-#else
-static inline int nvme_nvm_register(struct nvme_ns *ns, char *disk_name,
-				    int node)
-{
-	return 0;
-}
-
-static inline void nvme_nvm_unregister(struct nvme_ns *ns) {};
-static inline int nvme_nvm_ioctl(struct nvme_ns *ns, unsigned int cmd,
-		void __user *argp)
-{
-	return -ENOTTY;
-}
-#endif /* CONFIG_NVM */
 
 static inline struct nvme_ns *nvme_get_ns_from_dev(struct device *dev)
 {
