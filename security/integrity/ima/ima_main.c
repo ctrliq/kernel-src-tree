@@ -1025,7 +1025,7 @@ static int __init init_ima(void)
 		pr_warn("Couldn't register LSM notifier, error %d\n", error);
 
 	if (!error)
-		ima_update_policy_flag();
+		ima_update_policy_flags();
 
 	return error;
 }
