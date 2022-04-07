@@ -1942,12 +1942,8 @@ static int vfio_mdev_attach_domain(struct device *dev, void *data)
 	struct device *iommu_device;
 
 	iommu_device = mdev_get_iommu_device(mdev);
-	if (iommu_device) {
-		if (iommu_dev_feature_enabled(iommu_device, IOMMU_DEV_FEAT_AUX))
-			return iommu_aux_attach_device(domain, iommu_device);
-		else
-			return iommu_attach_device(domain, iommu_device);
-	}
+	if (iommu_device)
+		return iommu_attach_device(domain, iommu_device);
 
 	return -EINVAL;
 }
@@ -1959,12 +1955,8 @@ static int vfio_mdev_detach_domain(struct device *dev, void *data)
 	struct device *iommu_device;
 
 	iommu_device = mdev_get_iommu_device(mdev);
-	if (iommu_device) {
-		if (iommu_dev_feature_enabled(iommu_device, IOMMU_DEV_FEAT_AUX))
-			iommu_aux_detach_device(domain, iommu_device);
-		else
-			iommu_detach_device(domain, iommu_device);
-	}
+	if (iommu_device)
+		iommu_detach_device(domain, iommu_device);
 
 	return 0;
 }
@@ -2278,6 +2270,7 @@ static int vfio_iommu_type1_attach_group(void *iommu_data,
 		goto out_free;
 
 	if (vfio_bus_is_mdev(bus)) {
+		/* RHEL-only - BEGIN */
 		struct device *iommu_device = NULL;
 
 		group->mdev_group = true;
@@ -2285,32 +2278,34 @@ static int vfio_iommu_type1_attach_group(void *iommu_data,
 		/* Determine the isolation type */
 		ret = iommu_group_for_each_dev(iommu_group, &iommu_device,
 					       vfio_mdev_iommu_device);
-		if (ret || !iommu_device) {
-			if (!iommu->external_domain) {
-				INIT_LIST_HEAD(&domain->group_list);
-				iommu->external_domain = domain;
-				vfio_update_pgsize_bitmap(iommu);
-			} else {
-				kfree(domain);
-			}
+		if (!ret && iommu_device) {
+			bus = iommu_device->bus;
+			goto rhel_mdev_iommu_device;
+		}
+		/* RHEL-only - END */
 
-			list_add(&group->next,
-				 &iommu->external_domain->group_list);
-			/*
-			 * Non-iommu backed group cannot dirty memory directly,
-			 * it can only use interfaces that provide dirty
-			 * tracking.
-			 * The iommu scope can only be promoted with the
-			 * addition of a dirty tracking group.
-			 */
-			group->pinned_page_dirty_scope = true;
-			mutex_unlock(&iommu->lock);
-
-			return 0;
+		if (!iommu->external_domain) {
+			INIT_LIST_HEAD(&domain->group_list);
+			iommu->external_domain = domain;
+			vfio_update_pgsize_bitmap(iommu);
+		} else {
+			kfree(domain);
 		}
 
-		bus = iommu_device->bus;
+		list_add(&group->next, &iommu->external_domain->group_list);
+		/*
+		 * Non-iommu backed group cannot dirty memory directly, it can
+		 * only use interfaces that provide dirty tracking.
+		 * The iommu scope can only be promoted with the addition of a
+		 * dirty tracking group.
+		 */
+		group->pinned_page_dirty_scope = true;
+		mutex_unlock(&iommu->lock);
+
+		return 0;
 	}
+
+rhel_mdev_iommu_device:
 
 	domain->domain = iommu_domain_alloc(bus);
 	if (!domain->domain) {
