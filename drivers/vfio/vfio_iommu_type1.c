@@ -2234,7 +2234,7 @@ static void vfio_iommu_iova_insert_copy(struct vfio_iommu *iommu,
 }
 
 static int vfio_iommu_type1_attach_group(void *iommu_data,
-					 struct iommu_group *iommu_group)
+		struct iommu_group *iommu_group, enum vfio_group_type type)
 {
 	struct vfio_iommu *iommu = iommu_data;
 	struct vfio_iommu_group *group;
@@ -2269,18 +2269,21 @@ static int vfio_iommu_type1_attach_group(void *iommu_data,
 	if (ret)
 		goto out_free;
 
-	if (vfio_bus_is_mdev(bus)) {
+	if (type == VFIO_EMULATED_IOMMU) {
 		/* RHEL-only - BEGIN */
-		struct device *iommu_device = NULL;
+		if (vfio_bus_is_mdev(bus)) {
+			struct device *iommu_device = NULL;
 
-		group->mdev_group = true;
+			group->mdev_group = true;
 
-		/* Determine the isolation type */
-		ret = iommu_group_for_each_dev(iommu_group, &iommu_device,
-					       vfio_mdev_iommu_device);
-		if (!ret && iommu_device) {
-			bus = iommu_device->bus;
-			goto rhel_mdev_iommu_device;
+			/* Determine the isolation type */
+			ret = iommu_group_for_each_dev(iommu_group,
+						       &iommu_device,
+						       vfio_mdev_iommu_device);
+			if (!ret && iommu_device) {
+				bus = iommu_device->bus;
+				goto rhel_mdev_iommu_device;
+			}
 		}
 		/* RHEL-only - END */
 
