@@ -890,7 +890,9 @@ static int set_pauseparam(struct net_device *dev,
 	return 0;
 }
 
-static void get_sge_param(struct net_device *dev, struct ethtool_ringparam *e)
+static void get_sge_param(struct net_device *dev, struct ethtool_ringparam *e,
+			  struct kernel_ethtool_ringparam *kernel_e,
+			  struct netlink_ext_ack *extack)
 {
 	const struct port_info *pi = netdev_priv(dev);
 	const struct sge *s = &pi->adapter->sge;
@@ -906,7 +908,9 @@ static void get_sge_param(struct net_device *dev, struct ethtool_ringparam *e)
 	e->tx_pending = s->ethtxq[pi->first_qset].q.size;
 }
 
-static int set_sge_param(struct net_device *dev, struct ethtool_ringparam *e)
+static int set_sge_param(struct net_device *dev, struct ethtool_ringparam *e,
+			 struct kernel_ethtool_ringparam *kernel_e,
+			 struct netlink_ext_ack *extack)
 {
 	int i;
 	const struct port_info *pi = netdev_priv(dev);
@@ -1147,7 +1151,9 @@ static int set_dbqtimer_tickval(struct net_device *dev,
 }
 
 static int set_coalesce(struct net_device *dev,
-			struct ethtool_coalesce *coalesce)
+			struct ethtool_coalesce *coalesce,
+			struct kernel_ethtool_coalesce *kernel_coal,
+			struct netlink_ext_ack *extack)
 {
 	int ret;
 
@@ -1163,7 +1169,9 @@ static int set_coalesce(struct net_device *dev,
 				    coalesce->tx_coalesce_usecs);
 }
 
-static int get_coalesce(struct net_device *dev, struct ethtool_coalesce *c)
+static int get_coalesce(struct net_device *dev, struct ethtool_coalesce *c,
+			struct kernel_ethtool_coalesce *kernel_coal,
+			struct netlink_ext_ack *extack)
 {
 	const struct port_info *pi = netdev_priv(dev);
 	const struct adapter *adap = pi->adapter;

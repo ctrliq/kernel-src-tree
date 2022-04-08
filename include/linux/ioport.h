@@ -14,12 +14,6 @@
 #include <linux/compiler.h>
 #include <linux/minmax.h>
 #include <linux/types.h>
-
-#include <linux/rh_kabi.h>
-
-struct resource_rh {
-};
-
 /*
  * Resources are tree-like, allowing
  * nesting etc..
@@ -31,7 +25,6 @@ struct resource {
 	unsigned long flags;
 	unsigned long desc;
 	struct resource *parent, *sibling, *child;
-	RH_KABI_AUX_EMBED(resource)
 };
 
 /*
