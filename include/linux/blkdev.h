@@ -58,9 +58,6 @@ static inline bool blk_op_is_passthrough(unsigned int op)
 	return op == REQ_OP_DRV_IN || op == REQ_OP_DRV_OUT;
 }
 
-#define BLK_SCSI_MAX_CMDS	(256)
-#define BLK_SCSI_CMD_PER_LONG	(BLK_SCSI_MAX_CMDS / (sizeof(long) * 8))
-
 /*
  * Zoned block device models (zoned limit).
  *
