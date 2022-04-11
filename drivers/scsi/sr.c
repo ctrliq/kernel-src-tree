@@ -334,7 +334,7 @@ static int sr_done(struct scsi_cmnd *SCpnt)
 	int good_bytes = (result == 0 ? this_count : 0);
 	int block_sectors = 0;
 	long error_sector;
-	struct scsi_cd *cd = scsi_cd(SCpnt->request->rq_disk);
+	struct scsi_cd *cd = scsi_cd(SCpnt->request->q->disk);
 
 #ifdef DEBUG
 	scmd_printk(KERN_INFO, SCpnt, "done: %x\n", result);
@@ -403,7 +403,7 @@ static blk_status_t sr_init_command(struct scsi_cmnd *SCpnt)
 	ret = scsi_alloc_sgtables(SCpnt);
 	if (ret != BLK_STS_OK)
 		return ret;
-	cd = scsi_cd(rq->rq_disk);
+	cd = scsi_cd(rq->q->disk);
 
 	SCSI_LOG_HLQUEUE(1, scmd_printk(KERN_INFO, SCpnt,
 		"Doing sr request, block = %d\n", block));

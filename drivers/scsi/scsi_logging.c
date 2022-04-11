@@ -28,8 +28,9 @@ static void scsi_log_release_buffer(char *bufptr)
 
 static inline const char *scmd_name(const struct scsi_cmnd *scmd)
 {
-	return scmd->request->rq_disk ?
-		scmd->request->rq_disk->disk_name : NULL;
+	if (!scmd->request->q->disk)
+		return NULL;
+	return scmd->request->q->disk->disk_name;
 }
 
 static size_t sdev_format_header(char *logbuf, size_t logbuf_len,
