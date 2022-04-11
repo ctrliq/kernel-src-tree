@@ -3,10 +3,12 @@
 #define _LINUX_BSG_H
 
 #include <uapi/linux/bsg.h>
+#include <linux/rh_kabi.h>
 
 struct request;
+struct request_queue;
 
-#ifdef CONFIG_BLK_DEV_BSG
+#ifdef CONFIG_BLK_DEV_BSG_COMMON
 struct bsg_ops {
 	int	(*check_proto)(struct sg_io_v4 *hdr);
 	int	(*fill_hdr)(struct request *rq, struct sg_io_v4 *hdr,
@@ -30,16 +32,10 @@ struct bsg_class_device {
 
 int bsg_register_queue(struct request_queue *q, struct device *parent,
 		const char *name, const struct bsg_ops *ops);
-int bsg_scsi_register_queue(struct request_queue *q, struct device *parent);
 void bsg_unregister_queue(struct request_queue *q);
 #else
-static inline int bsg_scsi_register_queue(struct request_queue *q,
-		struct device *parent)
-{
-	return 0;
-}
 static inline void bsg_unregister_queue(struct request_queue *q)
 {
 }
-#endif /* CONFIG_BLK_DEV_BSG */
+#endif /* CONFIG_BLK_DEV_BSG_COMMON */
 #endif /* _LINUX_BSG_H */
