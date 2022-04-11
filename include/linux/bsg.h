@@ -5,10 +5,11 @@
 #include <uapi/linux/bsg.h>
 #include <linux/rh_kabi.h>
 
+struct bsg_device;
+struct device;
 struct request;
 struct request_queue;
 
-#ifdef CONFIG_BLK_DEV_BSG_COMMON
 struct bsg_ops {
 	int	(*check_proto)(struct sg_io_v4 *hdr);
 	int	(*fill_hdr)(struct request *rq, struct sg_io_v4 *hdr,
@@ -20,22 +21,9 @@ struct bsg_ops {
 	RH_KABI_RESERVE(2)
 };
 
-struct bsg_class_device {
-	struct device *class_dev;
-	int minor;
-	struct request_queue *queue;
-	const struct bsg_ops *ops;
+struct bsg_device *bsg_register_queue(struct request_queue *q,
+		struct device *parent, const char *name,
+		const struct bsg_ops *ops);
+void bsg_unregister_queue(struct bsg_device *bcd);
 
-	RH_KABI_RESERVE(1)
-	RH_KABI_RESERVE(2)
-};
-
-int bsg_register_queue(struct request_queue *q, struct device *parent,
-		const char *name, const struct bsg_ops *ops);
-void bsg_unregister_queue(struct request_queue *q);
-#else
-static inline void bsg_unregister_queue(struct request_queue *q)
-{
-}
-#endif /* CONFIG_BLK_DEV_BSG_COMMON */
 #endif /* _LINUX_BSG_H */

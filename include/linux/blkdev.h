@@ -12,7 +12,6 @@
 #include <linux/wait.h>
 #include <linux/bio.h>
 #include <linux/gfp.h>
-#include <linux/bsg.h>
 #include <linux/rcupdate.h>
 #include <linux/percpu-refcount.h>
 #include <linux/blkzoned.h>
@@ -24,7 +23,6 @@ struct elevator_queue;
 struct blk_trace;
 struct request;
 struct sg_io_hdr;
-struct bsg_job;
 struct blkcg_gq;
 struct blk_flush_queue;
 struct kiocb;
@@ -356,10 +354,6 @@ struct request_queue {
 	spinlock_t		unused_hctx_lock;
 
 	int			mq_freeze_depth;
-
-#if IS_ENABLED(CONFIG_BLK_DEV_BSG_COMMON)
-	struct bsg_class_device bsg_dev;
-#endif
 
 #ifdef CONFIG_BLK_DEV_THROTTLING
 	/* Throttle data */
