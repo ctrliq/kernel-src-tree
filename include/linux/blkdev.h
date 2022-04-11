@@ -621,7 +621,6 @@ extern void blk_unregister_queue(struct gendisk *disk);
 void submit_bio_noacct(struct bio *bio);
 extern int blk_lld_busy(struct request_queue *q);
 extern void blk_queue_split(struct bio **);
-extern int scsi_verify_blk_ioctl(struct block_device *, unsigned int);
 extern int scsi_cmd_ioctl(struct request_queue *, struct gendisk *, fmode_t,
 			  unsigned int, void __user *);
 extern int sg_scsi_ioctl(struct request_queue *, struct gendisk *, fmode_t,
