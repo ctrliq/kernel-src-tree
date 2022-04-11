@@ -28,7 +28,7 @@ static void scsi_log_release_buffer(char *bufptr)
 
 static inline const char *scmd_name(const struct scsi_cmnd *scmd)
 {
-	if (!scmd->request->q->disk)
+	if (!scmd->request->q || !scmd->request->q->disk)
 		return NULL;
 	return scmd->request->q->disk->disk_name;
 }
