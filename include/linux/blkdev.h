@@ -1178,8 +1178,6 @@ int kblockd_mod_delayed_work_on(int cpu, struct delayed_work *dwork, unsigned lo
 bool blk_crypto_register(struct blk_crypto_profile *profile,
 			 struct request_queue *q);
 
-void blk_crypto_unregister(struct request_queue *q);
-
 #else /* CONFIG_BLK_INLINE_ENCRYPTION */
 
 static inline bool blk_crypto_register(struct blk_crypto_profile *profile,
@@ -1187,8 +1185,6 @@ static inline bool blk_crypto_register(struct blk_crypto_profile *profile,
 {
 	return true;
 }
-
-static inline void blk_crypto_unregister(struct request_queue *q) { }
 
 #endif /* CONFIG_BLK_INLINE_ENCRYPTION */
 
