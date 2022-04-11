@@ -2249,7 +2249,7 @@ chmod +x tools/power/cpupower/utils/version-gen.sh
    %{make} CFLAGS+="-D_GNU_SOURCE -Iinclude -I/usr/include/libnl3"
    popd
    pushd tools/arch/x86/intel_sdsi
-   %{make}
+   %{tools_make}
    popd
 %endif
 %endif
