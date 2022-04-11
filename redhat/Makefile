@@ -50,6 +50,14 @@ KABIDW := $(REDHAT)/kabi-dwarf
 
 include Makefile.cross
 
+RHJOBS?=$(shell j=$$(echo $(MAKEFLAGS) | grep -Eo "\ -j[0-9]*" | xargs ); \
+	if [ -z "$${j}" ]; then \
+		echo "1"; \
+	else \
+		j=$$(echo "$${j}" | tr -d "\-j"); \
+		[ -z "$${j}" ] && nproc --all || echo $${j}; \
+	fi)
+
 default: dist-help
 
 dist-python-check:
@@ -121,12 +129,12 @@ dist-kabi-dw-check: dist-kabi
 	@rm -rf $(KABIDW)/base/$(CURARCH).tmp
 
 dist-configs-commit: dist-configs-prep
-	@cd $(REDHAT)/configs; VERSION=$(KVERSION) ./generate_all_configs.sh "$(FLAVOR)" 1; \
-	./process_configs.sh -z $(PACKAGE_NAME) $(KVERSION) "" $(FLAVOR)
+	+@cd $(REDHAT)/configs; VERSION=$(KVERSION) ./generate_all_configs.sh "$(FLAVOR)" 1; \
+	./process_configs.sh -z "$(PACKAGE_NAME)" "$(KVERSION)" "" "$(FLAVOR)" "$(RHJOBS)"
 
 dist-configs: dist-configs-prep
-	@cd $(REDHAT)/configs; VERSION=$(KVERSION) ./generate_all_configs.sh "$(FLAVOR)" 1; \
-	./process_configs.sh $(PROCESS_CONFIGS_OPTS) $(PACKAGE_NAME) $(KVERSION)
+	+@cd $(REDHAT)/configs; VERSION=$(KVERSION) ./generate_all_configs.sh "$(FLAVOR)" 1; \
+	./process_configs.sh $(PROCESS_CONFIGS_OPTS) "$(PACKAGE_NAME)" "$(KVERSION)" "" "" "$(RHJOBS)"
 
 dist-fedora-configs: FLAVOR = fedora
 dist-fedora-configs: dist-configs
@@ -137,19 +145,17 @@ dist-rhel-configs: dist-configs
 rh-configs: dist-rhel-configs
 
 dist-configs-check: dist-configs-prep
-	cd $(REDHAT)/configs; ./process_configs.sh $(PROCESS_CONFIGS_CHECK_OPTS) $(PACKAGE_NAME)
+	+cd $(REDHAT)/configs; ./process_configs.sh $(PROCESS_CONFIGS_CHECK_OPTS) $(PACKAGE_NAME) "" "" "" "$(RHJOBS)"
 
 dist-configs-prep: dist-clean-configs dist-buildreq-check
-	cd $(REDHAT)/configs; ./build_configs.sh "partial" "$(ARCH_MACH)" "snip"
-	cd $(REDHAT)/configs; ./build_configs.sh "$(PACKAGE_NAME)" "$(ARCH_MACH)" "$(FLAVOR)"
+	+cd $(REDHAT)/configs; ./build_configs.sh "partial" "$(ARCH_MACH)" "snip" "$(RHJOBS)"
+	+cd $(REDHAT)/configs; ./build_configs.sh "$(PACKAGE_NAME)" "$(ARCH_MACH)" "$(FLAVOR)" "$(RHJOBS)"
 
 dist-configs-arch: ARCH_MACH = $(MACH)
 dist-configs-arch: dist-configs
 
 dist-clean-configs:
-	cd $(REDHAT)/configs; rm -f kernel-*.config \
-					kernel-*.config.orig \
-					kernel-*.config.tmp
+	@cd $(REDHAT)/configs; rm -f kernel-*.config kernel-*.config.orig kernel-*.config.tmp
 
 dist-clean-sources:
 	@rm -f $(RPM)/SPECS/*
@@ -162,10 +168,7 @@ dist-clean-rpmdirs:
 		rm -rf $$i; \
 	done;
 
-dist-clean-scripts:
-	@rm -f dist-dump-variables.sh
-
-dist-clean: dist-clean-sources dist-clean-configs dist-clean-rpmdirs dist-clean-scripts
+dist-clean: dist-clean-sources dist-clean-configs dist-clean-rpmdirs
 
 dist-stub-key:
 	@echo "Copying pre-generated keys";
@@ -422,12 +425,8 @@ dist-get-latest:
 dist-os-version:
 	@echo "OSVERSION: $(RHEL_MAJOR).$(RHEL_MINOR)"
 
-.EXPORT_ALL_VARIABLES:
-.PHONY: dist-dump-variables
 dist-dump-variables:
-	grep -h "^[ 	]*[a-zA-Z_][a-zA-Z_0-9]*[ 	]*[:?]*=" $(REDHAT)/Makefile.common $(REDHAT)/Makefile $(TOPDIR)/Makefile.rhelver | sed -e 's/[ 	]*\([a-zA-Z_][a-zA-Z_0-9]*\).*/echo "\1=$$\1"/' | sort | uniq > dist-dump-variables.sh
-	chmod +x $(REDHAT)/dist-dump-variables.sh
-	@$(REDHAT)/dist-dump-variables.sh
+	@$(foreach V,$(sort $(.VARIABLES)), $(if $(filter-out environment% default automatic, $(origin $V)),$(info $V=$($V) )))
 
 dist-self-test:
 	@if test -x /usr/bin/bats; then \
