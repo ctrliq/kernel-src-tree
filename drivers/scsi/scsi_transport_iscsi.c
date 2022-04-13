@@ -2277,15 +2277,6 @@ static int iscsi_if_stop_conn(struct iscsi_transport *transport,
 		 * Figure out if it was the kernel or userspace initiating this.
 		 */
 		if (!test_and_set_bit(ISCSI_CLS_CONN_BIT_CLEANUP, &conn->flags)) {
-			if (conn->ep) {
-				/*
-				 * For offload, when iscsid is restarted it
-				 * won't know about existing endpoints. We
-				 * clean it up here for userspace.
-				 */
-				iscsi_ep_disconnect(conn, true);
-			}
-
 			iscsi_stop_conn(conn, flag);
 		} else {
 			ISCSI_DBG_TRANS_CONN(conn,
@@ -3730,6 +3721,16 @@ static int iscsi_if_transport_conn(struct iscsi_transport *transport,
 
 	switch (nlh->nlmsg_type) {
 	case ISCSI_UEVENT_BIND_CONN:
+		if (conn->ep) {
+			/*
+			 * For offload boot support where iscsid is restarted
+			 * during the pivot root stage, the ep will be intact
+			 * here when the new iscsid instance starts up and
+			 * reconnects.
+			 */
+			iscsi_ep_disconnect(conn, true);
+		}
+
 		session = iscsi_session_lookup(ev->u.b_conn.sid);
 		if (!session) {
 			err = -EINVAL;
