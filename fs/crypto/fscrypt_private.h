@@ -584,7 +584,9 @@ struct fscrypt_mode {
 	const char *cipher_str;
 	int keysize;
 	int ivsize;
-	int logged_impl_name;
+	int logged_cryptoapi_impl;
+	int logged_blk_crypto_native;
+	int logged_blk_crypto_fallback;
 	enum blk_crypto_mode_num blk_crypto_mode;
 };
 
