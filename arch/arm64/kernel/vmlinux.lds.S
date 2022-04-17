@@ -173,7 +173,6 @@ SECTIONS
 			HIBERNATE_TEXT
 			KEXEC_TEXT
 			TRAMP_TEXT
-			*(.fixup)
 			*(.gnu.warning)
 		. = ALIGN(16);
 		*(.got)			/* Global offset table		*/
