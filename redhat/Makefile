@@ -551,6 +551,7 @@ sources-rh: $(TARBALL) generate-testpatch-tmp setup-source dist-configs-check
 		kvm_stat.logrotate \
 		mod-denylist.sh \
 		mod-internal.list \
+		mod-partner.list \
 		mod-sign.sh \
 		configs/flavors \
 		configs/generate_all_configs.sh \
