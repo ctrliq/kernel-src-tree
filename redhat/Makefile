@@ -25,6 +25,12 @@ ifdef SINGLE_TARBALL
   $(warning WARNING: SINGLE_TARBALL will be deprecated in a later release.)
 endif
 
+ifdef PREBUILD_GIT_ONLY
+  # deprecated in 5.18.0
+  $(warning WARNING: PREBUILD_GIT_ONLY will be deprecated in a later release, use UPSTREAMBUILD_GIT_ONLY instead.)
+  UPSTREAMBUILD_GIT_ONLY:=$(PREBUILD_GIT_ONLY)
+endif
+
 include Makefile.variables
 # These entries are 'duplicates' of variables specified in Makefile.variables
 # that are used in the SPEC file.  Specifying these with a SPEC prefix indicates
@@ -147,7 +153,7 @@ endif
 # SPECKEXTRAVERSION, and SPECKSUBLEVEL from the top-level kernel makefile as
 # opposed to any adjusted version for snapshotting.
 ifneq ($(SPECKEXTRAVERSION),)
-  PREBUILD:=0$(shell echo $(SPECKEXTRAVERSION) | sed -e s/-/./).
+  UPSTREAMBUILD:=0$(shell echo $(SPECKEXTRAVERSION) | sed -e s/-/./).
   UPSTREAM_TARBALL_NAME:=$(SPECKVERSION).$(SPECKPATCHLEVEL)$(SPECKEXTRAVERSION)
 else
   ifeq ($(SPECKSUBLEVEL),0)
@@ -159,7 +165,7 @@ else
     # *NOT* equivalent to the SPECVERSION variable.
     UPSTREAM_TARBALL_NAME:=$(SPECKVERSION).$(SPECKPATCHLEVEL).$(SPECKSUBLEVEL)
   endif
-  PREBUILD:=
+  UPSTREAMBUILD:=
 endif
 MARKER:=v$(UPSTREAM_TARBALL_NAME)
 
@@ -193,22 +199,22 @@ ifeq ($(VERSION_ON_UPSTREAM),1)
     # packaging. Fix this by bumping the patch level and marking
     # this as rc0
     ifeq ($(SPECKEXTRAVERSION),)
-      PREBUILD:=0.rc0.
+      UPSTREAMBUILD:=0.rc0.
       SPECKPATCHLEVEL:=$(shell expr $(SPECKPATCHLEVEL) + 1)
     endif
-    ifndef PREBUILD_GIT_ONLY
+    ifndef UPSTREAMBUILD_GIT_ONLY
       ifneq ($(filter $(MAKECMDGOALS),dist-git-test dist-git),)
-        PREBUILD_GIT_ONLY:=0
+        UPSTREAMBUILD_GIT_ONLY:=0
       else
-        PREBUILD_GIT_ONLY:=1
+        UPSTREAMBUILD_GIT_ONLY:=1
       endif
     endif
-    ifeq ($(PREBUILD_GIT_ONLY),1)
-      PREBUILD:=$(PREBUILD)$(MARKER).
+    ifeq ($(UPSTREAMBUILD_GIT_ONLY),1)
+      UPSTREAMBUILD:=$(UPSTREAMBUILD)$(MARKER).
     else
       # Obtain the date that HEAD was committed (not the snapshot commit).
       HEAD_DATE:=$(shell $(GIT) show -s --format=%cd --date=format:%Y%m%d $(HEAD))
-      PREBUILD:=$(PREBUILD)$(HEAD_DATE)git$(MARKER).
+      UPSTREAMBUILD:=$(UPSTREAMBUILD)$(HEAD_DATE)git$(MARKER).
     endif
     UPSTREAM_TARBALL_NAME:=$(patsubst v%,%,$(_TAG))
   endif
@@ -228,7 +234,7 @@ endif
 # The NVR looks like, for example, kernel-5.17.0-0.rc8.551acdc3c3d2.124.test.fc35.
 # This string can be deconstructed as
 #
-# $(PACKAGE_NAME)-$(SPECKVERSION).$(SPECKPATCHLEVEL).$(SPECKSUBLEVEL)-$(PREBUILD)$(BUILD)$(LOCALVERSION)$(DIST)
+# $(PACKAGE_NAME)-$(SPECKVERSION).$(SPECKPATCHLEVEL).$(SPECKSUBLEVEL)-$(UPSTREAMBUILD)$(BUILD)$(LOCALVERSION)$(DIST)
 #
 # This can be evaluated as
 #
@@ -237,7 +243,7 @@ endif
 # $(PACKAGE_NAME)-$(BASEVERSION)                                                            $(DIST)
 # $(RELEASETAG)                                                                             $(DIST)
 #
-SPECBUILD:=$(PREBUILD)$(BUILD)$(LOCALVERSION)
+SPECBUILD:=$(UPSTREAMBUILD)$(BUILD)$(LOCALVERSION)
 SPECVERSION:=$(SPECKVERSION).$(SPECKPATCHLEVEL).$(SPECKSUBLEVEL)
 BASEVERSION:=$(SPECVERSION)-$(SPECBUILD)
 RELEASETAG:=$(PACKAGE_NAME)-$(BASEVERSION)
