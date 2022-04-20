@@ -163,12 +163,16 @@ mv -f "$clogf.full" "$SOURCES/$CHANGELOG"
 echo "MARKER is $MARKER"
 
 if [ "$SINGLE_TARBALL" = 0 ]; then
+	# The tarball in the SRPM contains only the upstream sources.
+
 	# May need to preserve word splitting in EXCLUDE_FILES
 	# shellcheck disable=SC2086
 	git diff -p --no-renames --stat "$MARKER"..  $EXCLUDE_FILES \
 		> ${SOURCES}/patch-${RPMKVERSION}.${RPMKPATCHLEVEL}-redhat.patch
 else
-	# Need an empty file for dist-git compatibility
+	# The tarball in the SRPM contains both upstream sources and OS-specifc
+	# commits.  Even though this is the case, an empty file for dist-git
+	# compatibility is necessary.
 	touch "${SOURCES}/patch-${RPMKVERSION}.${RPMKPATCHLEVEL}"-redhat.patch
 fi
 
