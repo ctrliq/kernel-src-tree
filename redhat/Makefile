@@ -18,6 +18,13 @@ ifdef TEST_FLAGS
   $(warning WARNING: TEST_FLAGS will be deprecated in a later release, use BUILD_FLAGS instead.)
 endif
 
+ifdef SINGLE_TARBALL
+  # The commit that introduced this code can be reverted if there are users of
+  # this variable.
+  # deprecated in 5.18.0
+  $(warning WARNING: SINGLE_TARBALL will be deprecated in a later release.)
+endif
+
 include Makefile.variables
 
 LANG=C
