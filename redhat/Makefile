@@ -481,13 +481,15 @@ sources-rh: $(TARBALL) generate-testpatch-tmp setup-source dist-configs-check
 	@rm $(TESTPATCH).tmp
 	@cp $(TESTPATCH) $(SOURCES)/linux-kernel-test.patch
 	@cat configs/flavors | while read flavor; do echo "Copying sources for $${flavor}"; [ -e $${flavor}_files ] && cp $${flavor}_files/* $(SOURCES); done
+	@sed -e "s/%%RPMKVERSION%%/$(RPMKVERSION)/" \
+		-e "s/%%RPMKPATCHLEVEL%%/$(RPMKPATCHLEVEL)/" \
+		rpminspect.yaml > $(SOURCES)/rpminspect.yaml
 	@cp cpupower.* \
 		keys/rhel*.x509 \
 		kabi/check-kabi \
 		configs/$(PACKAGE_NAME)-*.config \
 		configs/partial*.config \
 		gating.yaml \
-		rpminspect.yaml \
 		update_scripts.sh \
 		kvm_stat.logrotate \
 		mod-denylist.sh \
