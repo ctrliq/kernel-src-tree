@@ -396,7 +396,7 @@ distg-brew distg-koji: distg-%:
 	$* $(BUILD_PROFILE) build $(BUILD_FLAGS) $(BUILD_TARGET) "$(RHGITURL)?redhat/koji#$(RHGITCOMMIT)"
 
 distg-cbs: distg-%:
-	$* $(BUILD_PROFILE) build $(BUILD_FLAGS) $(BUILD_TARGET) "$(CSGITURL)$(PACKAGE_NAME).git#$(AUTOGITREF)"
+	$* $(BUILD_PROFILE) build $(BUILD_FLAGS) $(BUILD_TARGET) "$(CSGITURL)/$(PACKAGE_NAME).git#$(RHGITCOMMIT)"
 
 dist-automotive-release-finish: setup-source
 	@cp $(SOURCES)/$(CHANGELOG) $(REDHAT)/$(CHANGELOG)
@@ -404,7 +404,7 @@ dist-automotive-release-finish: setup-source
 	@$(GIT) add $(REDHAT)/marker
 	@echo "[redhat] $(PACKAGE_NAME)-$(STAMP_VERSION)-$(PKGRELEASE)" > /tmp/rtkcommit
 	@echo "" >> /tmp/rtkcommit
-	@$(GIT) commit -F /tmp/rtkcommit -s ../Makefile.rhelver $(REDHAT)/marker $(REDHAT)/$(CHANGELOG) kernel.spec.template Makefile.automotive
+	@$(GIT) commit -F /tmp/rtkcommit -s ../Makefile.rhelver $(REDHAT)/marker $(REDHAT)/$(CHANGELOG) kernel.spec.template
 
 dist-automotive-release-changed: setup-source
 	@cp $(SOURCES)/$(CHANGELOG) $(REDHAT)/$(CHANGELOG)
@@ -419,7 +419,7 @@ dist-automotive-release-changed: setup-source
 	fi
 
 dist-automotive-build-sig:
-	$(REDHAT)/scripts/automotive_build_sig.sh "$(AUTOSIG_BRANCH)" "$(RHDISTGIT_CACHE)" "$(RHDISTGIT_TMP)" "$(TARBALL)" "$(PACKAGE_NAME)" "$(STAMP_VERSION)" "$(PKGRELEASE)" "$(AUTOUSETAGS)"
+	$(REDHAT)/scripts/automotive_build_sig.sh "$(AUTOSIG_BRANCH)" "$(RHDISTGIT_CACHE)" "$(RHDISTGIT_TMP)" "$(TARBALL)" "$(PACKAGE_NAME)" "$(STAMP_VERSION)" "$(PKGRELEASE)"
 
 dist-automotive-sig-release: dist-clean-sources
 	@# generate new version
@@ -546,8 +546,8 @@ dist-full-help:
 	@echo  '                    configuration.'
 	@echo  '  distg-cbs       - Pass HEAD of the current git branch to cbs to build an'
 	@echo  '                    RPM set.  Do not forget to push to the remote repository'
-	@echo  '                    first.  See the distg-brew target for options and'
-	@echo  '                    configuration.'
+	@echo  '                    first.  Preceed make command by RHGITCOMMIT=<commitID>'
+	@echo  '                    to specify the dist-git commit ID to use.'
 	@echo  '  dist-rpms       - Create the binary RPMS for the kernel.'
 	@echo  '                    See the dist-brew target for available options.'
 	@echo  '  dist-rpm-baseonly  - Create the binary RPMS for the kernel and modules'
