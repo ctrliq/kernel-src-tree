@@ -2832,7 +2832,7 @@ static void kvm_end_pvclock_update(struct kvm *kvm)
 {
 	struct kvm_arch *ka = &kvm->arch;
 	struct kvm_vcpu *vcpu;
-	int i;
+	unsigned long i;
 
 	write_seqcount_end(&ka->pvclock_sc);
 	raw_spin_unlock_irq(&ka->tsc_write_lock);
@@ -3081,7 +3081,7 @@ static int kvm_guest_time_update(struct kvm_vcpu *v)
 
 static void kvmclock_update_fn(struct work_struct *work)
 {
-	int i;
+	unsigned long i;
 	struct delayed_work *dwork = to_delayed_work(work);
 	struct kvm_arch *ka = container_of(dwork, struct kvm_arch,
 					   kvmclock_update_work);
@@ -5789,7 +5789,7 @@ void kvm_arch_sync_dirty_log(struct kvm *kvm, struct kvm_memory_slot *memslot)
 	 * VM-Exit.
 	 */
 	struct kvm_vcpu *vcpu;
-	int i;
+	unsigned long i;
 
 	kvm_for_each_vcpu(i, vcpu, kvm)
 		kvm_vcpu_kick(vcpu);
@@ -6058,7 +6058,8 @@ static int kvm_vm_ioctl_set_msr_filter(struct kvm *kvm, void __user *argp)
 static int kvm_arch_suspend_notifier(struct kvm *kvm)
 {
 	struct kvm_vcpu *vcpu;
-	int i, ret = 0;
+	unsigned long i;
+	int ret = 0;
 
 	mutex_lock(&kvm->lock);
 	kvm_for_each_vcpu(i, vcpu, kvm) {
@@ -8490,7 +8491,8 @@ static void __kvmclock_cpufreq_notifier(struct cpufreq_freqs *freq, int cpu)
 {
 	struct kvm *kvm;
 	struct kvm_vcpu *vcpu;
-	int i, send_ipi = 0;
+	int send_ipi = 0;
+	unsigned long i;
 
 	/*
 	 * We allow guests to temporarily run on slowing clocks,
@@ -8619,9 +8621,8 @@ static void kvm_timer_init(void)
 static void pvclock_gtod_update_fn(struct work_struct *work)
 {
 	struct kvm *kvm;
-
 	struct kvm_vcpu *vcpu;
-	int i;
+	unsigned long i;
 
 	mutex_lock(&kvm_lock);
 	list_for_each_entry(kvm, &vm_list, vm_list)
@@ -10741,7 +10742,7 @@ static void kvm_arch_vcpu_guestdbg_update_apicv_inhibit(struct kvm *kvm)
 {
 	bool inhibit = false;
 	struct kvm_vcpu *vcpu;
-	int i;
+	unsigned long i;
 
 	down_write(&kvm->arch.apicv_update_lock);
 
@@ -11229,7 +11230,7 @@ int kvm_arch_hardware_enable(void)
 {
 	struct kvm *kvm;
 	struct kvm_vcpu *vcpu;
-	int i;
+	unsigned long i;
 	int ret;
 	u64 local_tsc;
 	u64 max_tsc = 0;
@@ -11486,7 +11487,7 @@ static void kvm_unload_vcpu_mmu(struct kvm_vcpu *vcpu)
 
 static void kvm_free_vcpus(struct kvm *kvm)
 {
-	unsigned int i;
+	unsigned long i;
 	struct kvm_vcpu *vcpu;
 
 	/*
@@ -11732,7 +11733,7 @@ out_free:
 void kvm_arch_memslots_updated(struct kvm *kvm, u64 gen)
 {
 	struct kvm_vcpu *vcpu;
-	int i;
+	unsigned long i;
 
 	/*
 	 * memslots->generation has been incremented.
