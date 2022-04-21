@@ -1291,8 +1291,7 @@ int kvm_dev_ioctl_get_cpuid(struct kvm_cpuid2 *cpuid,
 	if (sanity_check_entries(entries, cpuid->nent, type))
 		return -EINVAL;
 
-	array.entries = vzalloc(array_size(sizeof(struct kvm_cpuid_entry2),
-					   cpuid->nent));
+	array.entries = kvcalloc(sizeof(struct kvm_cpuid_entry2), cpuid->nent, GFP_KERNEL);
 	if (!array.entries)
 		return -ENOMEM;
 
@@ -1310,7 +1309,7 @@ int kvm_dev_ioctl_get_cpuid(struct kvm_cpuid2 *cpuid,
 		r = -EFAULT;
 
 out_free:
-	vfree(array.entries);
+	kvfree(array.entries);
 	return r;
 }
 
