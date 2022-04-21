@@ -1022,7 +1022,7 @@ void avic_vcpu_put(struct kvm_vcpu *vcpu)
 	WRITE_ONCE(*(svm->avic_physical_id_cache), entry);
 }
 
-void svm_vcpu_blocking(struct kvm_vcpu *vcpu)
+void avic_vcpu_blocking(struct kvm_vcpu *vcpu)
 {
 	if (!kvm_vcpu_apicv_active(vcpu))
 		return;
@@ -1047,7 +1047,7 @@ void svm_vcpu_blocking(struct kvm_vcpu *vcpu)
 	preempt_enable();
 }
 
-void svm_vcpu_unblocking(struct kvm_vcpu *vcpu)
+void avic_vcpu_unblocking(struct kvm_vcpu *vcpu)
 {
 	int cpu;
 
