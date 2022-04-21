@@ -1861,7 +1861,7 @@ static u64 kvm_hv_flush_tlb(struct kvm_vcpu *vcpu, struct kvm_hv_hcall *hc)
 			goto ret_success;
 
 		if (hc->fast) {
-			if (hc->var_cnt > HV_HYPERCALL_MAX_XMM_REGISTERS - 1)
+			if (hc->var_cnt > 2 * (HV_HYPERCALL_MAX_XMM_REGISTERS - 1))
 				return HV_STATUS_INVALID_HYPERCALL_INPUT;
 			for (i = 0; i < hc->var_cnt; i += 2) {
 				sparse_banks[i] = sse128_lo(hc->xmm[i / 2 + 1]);
