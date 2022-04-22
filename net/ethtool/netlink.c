@@ -2,6 +2,7 @@
 
 #include <net/sock.h>
 #include <linux/ethtool_netlink.h>
+#include <linux/pm_runtime.h>
 #include "netlink.h"
 
 static struct genl_family ethtool_genl_family;
@@ -28,6 +29,45 @@ const struct nla_policy ethnl_header_policy_stats[] = {
 	[ETHTOOL_A_HEADER_FLAGS]	= NLA_POLICY_MASK(NLA_U32,
 							  ETHTOOL_FLAGS_STATS),
 };
+
+int ethnl_ops_begin(struct net_device *dev)
+{
+	int ret;
+
+	if (!dev)
+		return -ENODEV;
+
+	if (dev->dev.parent)
+		pm_runtime_get_sync(dev->dev.parent);
+
+	if (!netif_device_present(dev) ||
+	    dev->reg_state == NETREG_UNREGISTERING) {
+		ret = -ENODEV;
+		goto err;
+	}
+
+	if (dev->ethtool_ops->begin) {
+		ret = dev->ethtool_ops->begin(dev);
+		if (ret)
+			goto err;
+	}
+
+	return 0;
+err:
+	if (dev->dev.parent)
+		pm_runtime_put(dev->dev.parent);
+
+	return ret;
+}
+
+void ethnl_ops_complete(struct net_device *dev)
+{
+	if (dev->ethtool_ops->complete)
+		dev->ethtool_ops->complete(dev);
+
+	if (dev->dev.parent)
+		pm_runtime_put(dev->dev.parent);
+}
 
 /**
  * ethnl_parse_header_dev_get() - parse request header
@@ -99,12 +139,6 @@ int ethnl_parse_header_dev_get(struct ethnl_req_info *req_info,
 		NL_SET_ERR_MSG_ATTR(extack, header,
 				    "neither ifindex nor name specified");
 		return -EINVAL;
-	}
-
-	if (dev && !netif_device_present(dev)) {
-		dev_put(dev);
-		NL_SET_ERR_MSG(extack, "device not present");
-		return -ENODEV;
 	}
 
 	req_info->dev = dev;
@@ -249,6 +283,7 @@ ethnl_default_requests[__ETHTOOL_MSG_USER_CNT] = {
 	[ETHTOOL_MSG_MODULE_EEPROM_GET]	= &ethnl_module_eeprom_request_ops,
 	[ETHTOOL_MSG_STATS_GET]		= &ethnl_stats_request_ops,
 	[ETHTOOL_MSG_PHC_VCLOCKS_GET]	= &ethnl_phc_vclocks_request_ops,
+	[ETHTOOL_MSG_MODULE_GET]	= &ethnl_module_request_ops,
 };
 
 static struct ethnl_dump_ctx *ethnl_dump_context(struct netlink_callback *cb)
@@ -560,6 +595,7 @@ ethnl_default_notify_ops[ETHTOOL_MSG_KERNEL_MAX + 1] = {
 	[ETHTOOL_MSG_PAUSE_NTF]		= &ethnl_pause_request_ops,
 	[ETHTOOL_MSG_EEE_NTF]		= &ethnl_eee_request_ops,
 	[ETHTOOL_MSG_FEC_NTF]		= &ethnl_fec_request_ops,
+	[ETHTOOL_MSG_MODULE_NTF]	= &ethnl_module_request_ops,
 };
 
 /* default notification handler */
@@ -599,7 +635,6 @@ static void ethnl_default_notify(struct net_device *dev, unsigned int cmd,
 	if (ret < 0)
 		goto err_cleanup;
 	reply_len = ret + ethnl_reply_header_size();
-	ret = -ENOMEM;
 	skb = genlmsg_new(reply_len, GFP_KERNEL);
 	if (!skb)
 		goto err_cleanup;
@@ -653,6 +688,7 @@ static const ethnl_notify_handler_t ethnl_notify_handlers[] = {
 	[ETHTOOL_MSG_PAUSE_NTF]		= ethnl_default_notify,
 	[ETHTOOL_MSG_EEE_NTF]		= ethnl_default_notify,
 	[ETHTOOL_MSG_FEC_NTF]		= ethnl_default_notify,
+	[ETHTOOL_MSG_MODULE_NTF]	= ethnl_default_notify,
 };
 
 void ethtool_notify(struct net_device *dev, unsigned int cmd, const void *data)
@@ -965,6 +1001,22 @@ static const struct genl_ops ethtool_genl_ops[] = {
 		.done	= ethnl_default_done,
 		.policy = ethnl_phc_vclocks_get_policy,
 		.maxattr = ARRAY_SIZE(ethnl_phc_vclocks_get_policy) - 1,
+	},
+	{
+		.cmd	= ETHTOOL_MSG_MODULE_GET,
+		.doit	= ethnl_default_doit,
+		.start	= ethnl_default_start,
+		.dumpit	= ethnl_default_dumpit,
+		.done	= ethnl_default_done,
+		.policy = ethnl_module_get_policy,
+		.maxattr = ARRAY_SIZE(ethnl_module_get_policy) - 1,
+	},
+	{
+		.cmd	= ETHTOOL_MSG_MODULE_SET,
+		.flags	= GENL_UNS_ADMIN_PERM,
+		.doit	= ethnl_set_module,
+		.policy = ethnl_module_set_policy,
+		.maxattr = ARRAY_SIZE(ethnl_module_set_policy) - 1,
 	},
 };
 
