@@ -32,6 +32,10 @@ void guest_modes_append_default(void)
 			guest_mode_append(VM_MODE_P40V48_64K, true, true);
 			vm_mode_default = VM_MODE_P40V48_4K;
 		}
+		if (limit >= 36) {
+			guest_mode_append(VM_MODE_P36V48_4K, ps4k, ps4k);
+			guest_mode_append(VM_MODE_P36V48_64K, ps64k, ps64k);
+		}
 
 		/*
 		 * Pick the first supported IPA size if the default
