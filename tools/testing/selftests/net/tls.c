@@ -29,6 +29,7 @@ struct tls_crypto_info_keys {
 	union {
 		struct tls12_crypto_info_aes_gcm_128 aes128;
 		struct tls12_crypto_info_chacha20_poly1305 chacha20;
+		struct tls12_crypto_info_aes_ccm_128 aesccm128;
 	};
 	size_t len;
 };
@@ -48,6 +49,11 @@ static void tls_crypto_info_init(uint16_t tls_version, uint16_t cipher_type,
 		tls12->len = sizeof(struct tls12_crypto_info_aes_gcm_128);
 		tls12->aes128.info.version = tls_version;
 		tls12->aes128.info.cipher_type = cipher_type;
+		break;
+	case TLS_CIPHER_AES_CCM_128:
+		tls12->len = sizeof(struct tls12_crypto_info_aes_ccm_128);
+		tls12->aesccm128.info.version = tls_version;
+		tls12->aesccm128.info.cipher_type = cipher_type;
 		break;
 	default:
 		break;
@@ -235,6 +241,18 @@ FIXTURE_VARIANT_ADD(tls, 13_chacha)
 {
 	.tls_version = TLS_1_3_VERSION,
 	.cipher_type = TLS_CIPHER_CHACHA20_POLY1305,
+};
+
+FIXTURE_VARIANT_ADD(tls, 12_aes_ccm)
+{
+	.tls_version = TLS_1_2_VERSION,
+	.cipher_type = TLS_CIPHER_AES_CCM_128,
+};
+
+FIXTURE_VARIANT_ADD(tls, 13_aes_ccm)
+{
+	.tls_version = TLS_1_3_VERSION,
+	.cipher_type = TLS_CIPHER_AES_CCM_128,
 };
 
 FIXTURE_SETUP(tls)
