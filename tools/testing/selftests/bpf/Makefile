@@ -431,13 +431,12 @@ $(TRUNNER_TESTS_DIR)-tests-hdr := y
 $(TRUNNER_TESTS_HDR): $(TRUNNER_TESTS_DIR)/*.c				\
 		      $(wildcard $(TRUNNER_TESTS_DIR)/rhskip)
 	$$(call msg,TEST-HDR,$(TRUNNER_BINARY),$$@)
-	$$(shell ( cd $(TRUNNER_TESTS_DIR);				\
-		  echo '/* Generated header, do not edit */';		\
-		  ls *.c 2> /dev/null |					\
-		  ([[ -f rhskip ]] && 					\
-		   grep -v "`$(RHSKIP_FILTER_EVAL) rhskip`" || cat	\
-		  ) |							\
-			sed -e 's@\([^\.]*\)\.c@DEFINE_TEST(\1)@';	\
+	$$(shell (echo '/* Generated header, do not edit */';					\
+		  sed -n -E 's/^void (serial_)?test_([a-zA-Z0-9_]+)\((void)?\).*/DEFINE_TEST(\2)/p'	\
+			$(TRUNNER_TESTS_DIR)/*.c | 			\
+		  ([[ -f $(TRUNNER_TESTS_DIR)/rhskip ]] && 					\
+		   grep -v "`$(RHSKIP_FILTER_EVAL) $(TRUNNER_TESTS_DIR)/rhskip`" || cat	\
+		  ) | sort						\
 		 ) > $$@)
 endif
 
