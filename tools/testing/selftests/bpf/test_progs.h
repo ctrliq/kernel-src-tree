@@ -308,3 +308,5 @@ int trigger_module_test_write(int write_sz);
 #define SO_RCVTIMEO_OLD	18
 #define SO_SNDTIMEO_OLD	19
 #endif
+
+#define BPF_TESTMOD_TEST_FILE "/sys/kernel/bpf_testmod"
