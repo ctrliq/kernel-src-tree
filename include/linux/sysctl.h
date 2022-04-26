@@ -210,7 +210,6 @@ extern int unaligned_dump_stack;
 extern int no_unaligned_warning;
 
 extern struct ctl_table sysctl_mount_point[];
-extern struct ctl_table random_table[];
 extern struct ctl_table firmware_config_table[];
 extern struct ctl_table epoll_table[];
 
