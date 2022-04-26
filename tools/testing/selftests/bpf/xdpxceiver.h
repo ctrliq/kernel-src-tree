@@ -34,10 +34,9 @@
 #define IP_PKT_TOS 0x9
 #define UDP_PKT_SIZE (IP_PKT_SIZE - sizeof(struct iphdr))
 #define UDP_PKT_DATA_SIZE (UDP_PKT_SIZE - sizeof(struct udphdr))
-#define EOT (-1)
 #define USLEEP_MAX 200000
 #define SOCK_RECONF_CTR 10
-#define BATCH_SIZE 64
+#define BATCH_SIZE 8
 #define POLL_TMOUT 1000
 #define DEFAULT_PKT_CNT 10000
 #define RX_FULL_RXQSIZE 32
@@ -84,9 +83,7 @@ static u8 opt_verbose;
 
 static u32 xdp_flags = XDP_FLAGS_UPDATE_IF_NOEXIST;
 static u32 xdp_bind_flags = XDP_USE_NEED_WAKEUP | XDP_COPY;
-static u8 pkt_data[XSK_UMEM__DEFAULT_FRAME_SIZE];
 static u32 pkt_counter;
-static long prev_pkt = -1;
 static int sigvar;
 static int stat_test_type;
 static u32 rxqsize;
@@ -118,10 +115,6 @@ struct flow_vector {
 	} vector;
 };
 
-struct generic_data {
-	u32 seqnum;
-};
-
 struct ifobject {
 	char ifname[MAX_INTERFACE_NAME_CHARS];
 	char nsname[MAX_INTERFACES_NAMESPACE_CHARS];
@@ -148,19 +141,5 @@ static struct ifobject *ifdict_tx;
 /*threads*/
 pthread_barrier_t barr;
 pthread_t t0, t1;
-
-TAILQ_HEAD(head_s, pkt) head = TAILQ_HEAD_INITIALIZER(head);
-struct head_s *head_p;
-struct pkt {
-	char *pkt_frame;
-
-	TAILQ_ENTRY(pkt) pkt_nodes;
-} *pkt_node_rx, *pkt_node_rx_q;
-
-struct pkt_frame {
-	char *payload;
-} *pkt_obj;
-
-struct pkt_frame **pkt_buf;
 
 #endif				/* XDPXCEIVER_H */

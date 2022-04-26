@@ -1180,7 +1180,7 @@ struct task_struct {
 	struct blk_plug			*plug;
 
 	/* VM state: */
-	struct reclaim_state		*reclaim_state;
+	RH_KABI_EXCLUDE(struct reclaim_state *reclaim_state)
 
 	struct backing_dev_info		*backing_dev_info;
 
