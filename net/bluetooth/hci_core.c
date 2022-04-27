@@ -3935,7 +3935,7 @@ void hci_unregister_dev(struct hci_dev *hdev)
 	}
 
 	device_del(&hdev->dev);
-	/* Actual cleanup is deferred until hci_cleanup_dev(). */
+	/* Actual cleanup is deferred until hci_release_dev(). */
 	hci_dev_put(hdev);
 }
 EXPORT_SYMBOL(hci_unregister_dev);
