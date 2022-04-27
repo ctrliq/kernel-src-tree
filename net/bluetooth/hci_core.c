@@ -4040,7 +4040,7 @@ void hci_unregister_dev(struct hci_dev *hdev)
 EXPORT_SYMBOL(hci_unregister_dev);
 
 /* Cleanup HCI device */
-void hci_cleanup_dev(struct hci_dev *hdev)
+void hci_release_dev(struct hci_dev *hdev)
 {
 	debugfs_remove_recursive(hdev->debugfs);
 	kfree_const(hdev->hw_info);
@@ -4067,7 +4067,10 @@ void hci_cleanup_dev(struct hci_dev *hdev)
 	hci_dev_unlock(hdev);
 
 	ida_simple_remove(&hci_index_ida, hdev->id);
+	kfree(hdev);
 }
+
+EXPORT_SYMBOL(hci_release_dev);
 
 /* Suspend HCI device */
 int hci_suspend_dev(struct hci_dev *hdev)
