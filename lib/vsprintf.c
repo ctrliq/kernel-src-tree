@@ -2023,6 +2023,11 @@ char *format_page_flags(char *buf, char *end, unsigned long flags)
 	bool append = false;
 	int i;
 
+	buf = number(buf, end, flags, default_flag_spec);
+	if (buf < end)
+		*buf = '(';
+	buf++;
+
 	/* Page flags from the main area. */
 	if (main_flags) {
 		buf = format_flags(buf, end, main_flags, pageflag_names);
@@ -2051,6 +2056,9 @@ char *format_page_flags(char *buf, char *end, unsigned long flags)
 
 		append = true;
 	}
+	if (buf < end)
+		*buf = ')';
+	buf++;
 
 	return buf;
 }
@@ -2897,13 +2905,15 @@ int vscnprintf(char *buf, size_t size, const char *fmt, va_list args)
 {
 	int i;
 
+	if (unlikely(!size))
+		return 0;
+
 	i = vsnprintf(buf, size, fmt, args);
 
 	if (likely(i < size))
 		return i;
-	if (size != 0)
-		return size - 1;
-	return 0;
+
+	return size - 1;
 }
 EXPORT_SYMBOL(vscnprintf);
 
