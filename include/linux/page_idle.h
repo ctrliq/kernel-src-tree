@@ -43,7 +43,6 @@ static inline void clear_page_idle(struct page *page)
  * If there is not enough space to store Idle and Young bits in page flags, use
  * page ext flags instead.
  */
-extern struct page_ext_operations page_idle_ops;
 
 static inline bool page_is_young(struct page *page)
 {
