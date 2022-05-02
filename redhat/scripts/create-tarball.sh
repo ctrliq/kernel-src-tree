@@ -1,5 +1,6 @@
 #!/bin/sh
 
+# shellcheck disable=SC2153
 [ "$SINGLE_TARBALL" -eq 1 ] && _GITID="$GITID" || _GITID="$MARKER"
 
 # shellcheck disable=SC1083
@@ -15,7 +16,7 @@ fi
 
 if [ -f "$TARBALL" ]; then
 	TARID=$(xzcat -qq "$TARBALL" | git get-tar-commit-id 2>/dev/null)
-	if [ "$_GITID" == "$TARID" ]; then
+	if [ "$_GITID" = "$TARID" ]; then
 		echo "$(basename "$TARBALL") unchanged..."
 		exit 0
 	fi

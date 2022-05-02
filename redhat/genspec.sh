@@ -114,7 +114,7 @@ cdate="$(LC_ALL=C date +"%a %b %d %Y")"
 cversion="[$RPMVERSION]";
 echo "* $cdate $cname $cversion" > "$clogf"
 
-git log --topo-order --no-merges -z $GIT_NOTES "$GIT_FORMAT" \
+git log --topo-order --no-merges -z "$GIT_NOTES" "$GIT_FORMAT" \
 	^"${UPSTREAM}" "$lasttag".. -- ':!/redhat/rhdocs' | "${0%/*}"/genlog.py >> "$clogf"
 
 if [ "$HIDE_REDHAT" = "1" ]; then
@@ -151,17 +151,17 @@ fi
 
 # during rh-dist-git genspec runs again and generates empty changelog
 # create empty file to avoid adding extra header to changelog
-LENGTH=$(grep "^-" $clogf | wc -l | awk '{print $1}')
+LENGTH=$(grep -c "^-" "$clogf" | awk '{print $1}')
 if [ "$LENGTH" = 0 ]; then
-	rm -f $clogf
-	touch $clogf
+	rm -f "$clogf"
+	touch "$clogf"
 fi
 
 cat "$clogf" "$SOURCES/$SPECCHANGELOG" > "$clogf.full"
 mv -f "$clogf.full" "$SOURCES/$SPECCHANGELOG"
 
 # genlog.py generates Resolves lines as well, strip these from RPM changelog
-cat "$SOURCES/$SPECCHANGELOG" | grep -v -e "^Resolves: " > $clogf.stripped
+grep -v -e "^Resolves: " "$SOURCES/$SPECCHANGELOG" > "$clogf".stripped
 
 test -f "$SOURCES/$SPECFILE" &&
 	sed -i -e "

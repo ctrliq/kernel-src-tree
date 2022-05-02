@@ -52,8 +52,8 @@ diff -X "$REDHAT"/git/dontdiff -upr "$tmpdir/$PACKAGE_NAME" "$REDHAT"/rpm/SOURCE
 # creating the changelog file
 
 # changelog has been created by genspec.sh, including Resolves line, just copy it here
-echo -e "${PACKAGE_NAME}-${RPMVERSION}\n" > $tmpdir/changelog
-awk '1;/^Resolves: /{exit};' $REDHAT/$SPECCHANGELOG >> $tmpdir/changelog
+echo -e "${PACKAGE_NAME}-${RPMVERSION}\n" > "$tmpdir"/changelog
+awk '1;/^Resolves: /{exit};' "$REDHAT"/"$SPECCHANGELOG" >> "$tmpdir"/changelog
 
 # all done
 echo "$tmpdir"
