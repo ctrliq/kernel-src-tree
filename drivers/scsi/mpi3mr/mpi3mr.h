@@ -1056,5 +1056,5 @@ int mpi3mr_pel_get_seqnum_post(struct mpi3mr_ioc *mrioc,
 	struct mpi3mr_drv_cmd *drv_cmd);
 void mpi3mr_app_save_logdata(struct mpi3mr_ioc *mrioc, char *event_data,
 	u16 event_data_size);
-
+extern struct device_attribute *mpi3mr_host_attrs[];
 #endif /*MPI3MR_H_INCLUDED*/
