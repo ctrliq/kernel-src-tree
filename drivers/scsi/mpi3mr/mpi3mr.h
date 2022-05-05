@@ -922,5 +922,6 @@ void mpi3mr_rfresh_tgtdevs(struct mpi3mr_ioc *mrioc);
 void mpi3mr_flush_delayed_rmhs_list(struct mpi3mr_ioc *mrioc);
 int mpi3mr_process_op_reply_q(struct mpi3mr_ioc *mrioc,
 	struct mpi3mr_intr_info *intr_info);
+void mpi3mr_check_rh_fault_ioc(struct mpi3mr_ioc *mrioc, u32 reason_code);
 
 #endif /*MPI3MR_H_INCLUDED*/
