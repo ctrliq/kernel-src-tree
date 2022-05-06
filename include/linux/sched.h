@@ -951,6 +951,9 @@ struct task_struct {
 	/* Recursion prevention for eventfd_signal() */
 	unsigned			in_eventfd_signal:1;
 #endif
+#ifdef CONFIG_IOMMU_SVA
+	RH_KABI_FILL_HOLE(unsigned	pasid_activated:1)
+#endif
 
 	unsigned long			atomic_flags; /* Flags requiring atomic access. */
 
