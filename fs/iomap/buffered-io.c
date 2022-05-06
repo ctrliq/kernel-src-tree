@@ -729,7 +729,7 @@ static size_t iomap_write_end(struct inode *inode, loff_t pos, size_t len,
 	put_page(page);
 
 	if (ret < len)
-		iomap_write_failed(inode, pos, len);
+		iomap_write_failed(inode, pos + ret, len - ret);
 	return ret;
 }
 
