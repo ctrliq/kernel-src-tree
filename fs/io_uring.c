@@ -252,6 +252,7 @@ struct io_rsrc_put {
 
 struct io_file_table {
 	struct io_fixed_file *files;
+	unsigned long *bitmap;
 };
 
 struct io_rsrc_node {
@@ -8294,6 +8295,7 @@ static inline struct file *io_file_get_fixed(struct io_kiocb *req, int fd,
 	/* mask in overlapping REQ_F and FFS bits */
 	req->flags |= (file_ptr << REQ_F_SUPPORT_NOWAIT_BIT);
 	io_req_set_rsrc_node(req, ctx, 0);
+	WARN_ON_ONCE(file && !test_bit(fd, ctx->file_table.bitmap));
 out:
 	io_ring_submit_unlock(ctx, issue_flags);
 	return file;
@@ -9364,13 +9366,35 @@ static bool io_alloc_file_tables(struct io_file_table *table, unsigned nr_files)
 {
 	table->files = kvcalloc(nr_files, sizeof(table->files[0]),
 				GFP_KERNEL_ACCOUNT);
-	return !!table->files;
+	if (unlikely(!table->files))
+		return false;
+
+	table->bitmap = bitmap_zalloc(nr_files, GFP_KERNEL_ACCOUNT);
+	if (unlikely(!table->bitmap)) {
+		kvfree(table->files);
+		return false;
+	}
+
+	return true;
 }
 
 static void io_free_file_tables(struct io_file_table *table)
 {
 	kvfree(table->files);
+	bitmap_free(table->bitmap);
 	table->files = NULL;
+	table->bitmap = NULL;
+}
+
+static inline void io_file_bitmap_set(struct io_file_table *table, int bit)
+{
+	WARN_ON_ONCE(test_bit(bit, table->bitmap));
+	__set_bit(bit, table->bitmap);
+}
+
+static inline void io_file_bitmap_clear(struct io_file_table *table, int bit)
+{
+	__clear_bit(bit, table->bitmap);
 }
 
 static void __io_sqe_files_unregister(struct io_ring_ctx *ctx)
@@ -9385,6 +9409,7 @@ static void __io_sqe_files_unregister(struct io_ring_ctx *ctx)
 			continue;
 		if (io_fixed_file_slot(&ctx->file_table, i)->file_ptr & FFS_SCM)
 			continue;
+		io_file_bitmap_clear(&ctx->file_table, i);
 		fput(file);
 	}
 #endif
@@ -9788,6 +9813,7 @@ static int io_sqe_files_register(struct io_ring_ctx *ctx, void __user *arg,
 		}
 		file_slot = io_fixed_file_slot(&ctx->file_table, i);
 		io_fixed_file_set(file_slot, file);
+		io_file_bitmap_set(&ctx->file_table, i);
 	}
 
 	io_rsrc_node_switch(ctx, NULL);
@@ -9848,6 +9874,7 @@ static int io_install_fixed_file(struct io_kiocb *req, struct file *file,
 		if (ret)
 			goto err;
 		file_slot->file_ptr = 0;
+		io_file_bitmap_clear(&ctx->file_table, slot_index);
 		needs_switch = true;
 	}
 
@@ -9855,6 +9882,7 @@ static int io_install_fixed_file(struct io_kiocb *req, struct file *file,
 	if (!ret) {
 		*io_get_tag_slot(ctx->file_data, slot_index) = 0;
 		io_fixed_file_set(file_slot, file);
+		io_file_bitmap_set(&ctx->file_table, slot_index);
 	}
 err:
 	if (needs_switch)
@@ -9896,6 +9924,7 @@ static int io_close_fixed(struct io_kiocb *req, unsigned int issue_flags)
 		goto out;
 
 	file_slot->file_ptr = 0;
+	io_file_bitmap_clear(&ctx->file_table, offset);
 	io_rsrc_node_switch(ctx, ctx->file_data);
 	ret = 0;
 out:
@@ -9945,6 +9974,7 @@ static int __io_sqe_files_update(struct io_ring_ctx *ctx,
 			if (err)
 				break;
 			file_slot->file_ptr = 0;
+			io_file_bitmap_clear(&ctx->file_table, i);
 			needs_switch = true;
 		}
 		if (fd != -1) {
@@ -9973,6 +10003,7 @@ static int __io_sqe_files_update(struct io_ring_ctx *ctx,
 			}
 			*io_get_tag_slot(data, i) = tag;
 			io_fixed_file_set(file_slot, file);
+			io_file_bitmap_set(&ctx->file_table, i);
 		}
 	}
 
