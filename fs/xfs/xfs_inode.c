@@ -837,8 +837,7 @@ xfs_init_new_inode(
 	inode->i_rdev = rdev;
 	ip->i_projid = prid;
 
-	if (dir && !(dir->i_mode & S_ISGID) &&
-	    (mp->m_flags & XFS_MOUNT_GRPID)) {
+	if (dir && !(dir->i_mode & S_ISGID) && xfs_has_grpid(mp)) {
 		inode_fsuid_set(inode, mnt_userns);
 		inode->i_gid = dir->i_gid;
 		inode->i_mode = mode;
@@ -1079,7 +1078,7 @@ xfs_create(
 	 * create transaction goes to disk before returning to
 	 * the user.
 	 */
-	if (mp->m_flags & (XFS_MOUNT_WSYNC|XFS_MOUNT_DIRSYNC))
+	if (xfs_has_wsync(mp) || xfs_has_dirsync(mp))
 		xfs_trans_set_sync(tp);
 
 	/*
@@ -1171,7 +1170,7 @@ xfs_create_tmpfile(
 	if (error)
 		goto out_trans_cancel;
 
-	if (mp->m_flags & XFS_MOUNT_WSYNC)
+	if (xfs_has_wsync(mp))
 		xfs_trans_set_sync(tp);
 
 	/*
@@ -1297,7 +1296,7 @@ xfs_link(
 	 * link transaction goes to disk before returning to
 	 * the user.
 	 */
-	if (mp->m_flags & (XFS_MOUNT_WSYNC|XFS_MOUNT_DIRSYNC))
+	if (xfs_has_wsync(mp) || xfs_has_dirsync(mp))
 		xfs_trans_set_sync(tp);
 
 	return xfs_trans_commit(tp);
@@ -1684,7 +1683,7 @@ xfs_inode_needs_inactive(
 		return false;
 
 	/* If the log isn't running, push inodes straight to reclaim. */
-	if (XFS_FORCED_SHUTDOWN(mp) || (mp->m_flags & XFS_MOUNT_NORECOVERY))
+	if (XFS_FORCED_SHUTDOWN(mp) || xfs_has_norecovery(mp))
 		return false;
 
 	/* Metadata inodes require explicit resource cleanup. */
@@ -2856,7 +2855,7 @@ xfs_remove(
 	 * remove transaction goes to disk before returning to
 	 * the user.
 	 */
-	if (mp->m_flags & (XFS_MOUNT_WSYNC|XFS_MOUNT_DIRSYNC))
+	if (xfs_has_wsync(mp) || xfs_has_dirsync(mp))
 		xfs_trans_set_sync(tp);
 
 	error = xfs_trans_commit(tp);
@@ -2933,7 +2932,7 @@ xfs_finish_rename(
 	 * If this is a synchronous mount, make sure that the rename transaction
 	 * goes to disk before returning to the user.
 	 */
-	if (tp->t_mountp->m_flags & (XFS_MOUNT_WSYNC|XFS_MOUNT_DIRSYNC))
+	if (xfs_has_wsync(tp->t_mountp) || xfs_has_dirsync(tp->t_mountp))
 		xfs_trans_set_sync(tp);
 
 	return xfs_trans_commit(tp);
