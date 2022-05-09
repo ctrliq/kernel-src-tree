@@ -202,7 +202,7 @@ xfs_getfsmap_is_shared(
 	int				error;
 
 	*stat = false;
-	if (!xfs_sb_version_hasreflink(&mp->m_sb))
+	if (!xfs_has_reflink(mp))
 		return 0;
 	/* rt files will have no perag structure */
 	if (!info->pag)
@@ -864,7 +864,7 @@ xfs_getfsmap(
 	    !xfs_getfsmap_is_valid_device(mp, &head->fmh_keys[1]))
 		return -EINVAL;
 
-	use_rmap = xfs_sb_version_hasrmapbt(&mp->m_sb) &&
+	use_rmap = xfs_has_rmapbt(mp) &&
 		   has_capability_noaudit(current, CAP_SYS_ADMIN);
 	head->fmh_entries = 0;
 
