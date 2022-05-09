@@ -29,6 +29,7 @@ do
 			# UPSTREAM is the base merge commit and can change from day-to-day as
 			# the tree is changed.  Omit UPSTREAM from the output.
 			# RHEL_RELEASE can change build-to-build.
+			unset SINGLE_TARBALL
 			make RHSELFTESTDATA=1 DIST="${DIST}" DISTRO="${DISTRO}" HEAD=${commit} dist-dump-variables | grep "=" | grep -v CURDIR | grep -v -w UPSTREAM | grep -v -w RHEL_RELEASE >& "${varfilename}"
 
 			# When executed from a script, the variables in Makefile.variables are
@@ -47,6 +48,7 @@ do
 			done >> "${varfilename}"
 
 			echo "building ${varfilename}.spec"
+			unset SINGLE_TARBALL
 			make RHSELFTESTDATA=1 DIST="${DIST}" DISTRO="${DISTRO}" HEAD=${commit} setup-source
 			cp "${SOURCES}"/kernel.spec "${varfilename}".spec
 		done
