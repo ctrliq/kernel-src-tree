@@ -716,7 +716,7 @@ xfs_setattr_nonsize(
 		 * in the transaction.
 		 */
 		if (!uid_eq(iuid, uid)) {
-			if (XFS_IS_QUOTA_RUNNING(mp) && XFS_IS_UQUOTA_ON(mp)) {
+			if (XFS_IS_UQUOTA_ON(mp)) {
 				ASSERT(mask & ATTR_UID);
 				ASSERT(udqp);
 				olddquot1 = xfs_qm_vop_chown(tp, ip,
@@ -724,7 +724,7 @@ xfs_setattr_nonsize(
 			}
 		}
 		if (!gid_eq(igid, gid)) {
-			if (XFS_IS_QUOTA_RUNNING(mp) && XFS_IS_GQUOTA_ON(mp)) {
+			if (XFS_IS_GQUOTA_ON(mp)) {
 				ASSERT(xfs_sb_version_has_pquotino(&mp->m_sb) ||
 				       !XFS_IS_PQUOTA_ON(mp));
 				ASSERT(mask & ATTR_GID);
