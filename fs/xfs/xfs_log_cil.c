@@ -1460,7 +1460,7 @@ bool
 xfs_log_item_in_current_chkpt(
 	struct xfs_log_item *lip)
 {
-	struct xfs_cil_ctx *ctx = lip->li_mountp->m_log->l_cilp->xc_ctx;
+	struct xfs_cil_ctx *ctx = lip->li_log->l_cilp->xc_ctx;
 
 	if (list_empty(&lip->li_cil))
 		return false;
