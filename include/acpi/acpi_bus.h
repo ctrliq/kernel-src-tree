@@ -278,6 +278,7 @@ struct acpi_device_power {
 	int state;		/* Current state */
 	struct acpi_device_power_flags flags;
 	struct acpi_device_power_state states[ACPI_D_STATE_COUNT];	/* Power states (D0-D3Cold) */
+	u8 state_for_enumeration; /* Deepest power state for enumeration */
 };
 
 struct acpi_dep_data {
@@ -357,6 +358,7 @@ struct acpi_gpio_mapping;
 
 /* Device */
 struct acpi_device {
+	u32 pld_crc;
 	int device_type;
 	acpi_handle handle;		/* no handle for fixed hardware */
 	struct fwnode_handle fwnode;
@@ -570,7 +572,6 @@ struct acpi_bus_type {
 	bool (*match)(struct device *dev);
 	struct acpi_device * (*find_companion)(struct device *);
 	void (*setup)(struct device *);
-	void (*cleanup)(struct device *);
 };
 int register_acpi_bus_type(struct acpi_bus_type *);
 int unregister_acpi_bus_type(struct acpi_bus_type *);
