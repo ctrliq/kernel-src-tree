@@ -684,6 +684,12 @@ static struct ishtp_cl_driver ecl_ishtp_cl_driver = {
 	.driver.pm = &ecl_ishtp_pm_ops,
 };
 
+static const struct ishtp_device_id ecl_ishtp_id_table[] = {
+	{ ecl_ishtp_guid },
+	{ }
+};
+MODULE_DEVICE_TABLE(ishtp, ecl_ishtp_id_table);
+
 static int __init ecl_ishtp_init(void)
 {
 	return ishtp_cl_driver_register(&ecl_ishtp_cl_driver, THIS_MODULE);
