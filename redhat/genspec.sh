@@ -29,6 +29,10 @@ else
 	SPECBUILDID="# define buildid .local"
 fi
 
+# The SPECRELEASE variable uses the SPECBUILDID variable which is
+# defined above.  IOW, don't remove SPECBUILDID ;)
+SPECRELEASE="${PREBUILD}""${BUILD}""%{?buildid}%{?dist}"
+
 EXCLUDE_FILES=":(exclude,top).get_maintainer.conf \
 		:(exclude,top).gitattributes \
 		:(exclude,top).gitignore \
@@ -55,8 +59,6 @@ if [ "$PATCHLIST_URL" != "none" ]; then
 		> "$SOURCES"/Patchlist.changelog
 	SPECPATCHLIST_CHANGELOG=1
 fi
-
-SPECRELEASE="${PREBUILD}""${BUILD}""%{?buildid}%{?dist}"
 
 # self-test begin
 test -f "$SOURCES/$SPECFILE" &&
