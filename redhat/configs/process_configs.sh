@@ -262,7 +262,7 @@ function process_config()
 		rm .newoptions"${count}"
 		RETURNCODE=1
 	fi
-	rm .newoptions"${count}"
+	rm -f .newoptions"${count}"
 
 	grep -E 'config.*warning' .listnewconfig"${count}" > .warnings"${count}"
 	if test -n "$CHECKWARNINGS" && test -s .warnings"${count}"
