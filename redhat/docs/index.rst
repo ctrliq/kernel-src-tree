@@ -111,6 +111,7 @@ Contributor Guide
    submitting-contributions
    faq
    makefile-changes
+   kernel-naming
 
 
 Maintainer Guide
