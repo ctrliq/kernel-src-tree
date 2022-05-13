@@ -16,10 +16,10 @@
 #include <linux/signal.h>
 #include <linux/kthread.h>
 #include <linux/dmi.h>
-#include <linux/nls.h>
 #include <linux/dma-map-ops.h>
 #include <linux/platform_data/x86/apple.h>
 #include <linux/pgtable.h>
+#include <linux/crc32.h>
 
 #include "internal.h"
 
@@ -609,6 +609,7 @@ struct acpi_device *acpi_bus_get_acpi_device(acpi_handle handle)
 {
 	return handle_to_device(handle, get_acpi_device);
 }
+EXPORT_SYMBOL_GPL(acpi_bus_get_acpi_device);
 
 static struct acpi_device_bus_id *acpi_device_bus_id_match(const char *dev_id)
 {
@@ -652,6 +653,19 @@ static int acpi_tie_acpi_dev(struct acpi_device *adev)
 	}
 
 	return 0;
+}
+
+static void acpi_store_pld_crc(struct acpi_device *adev)
+{
+	struct acpi_pld_info *pld;
+	acpi_status status;
+
+	status = acpi_get_physical_device_location(adev->handle, &pld);
+	if (ACPI_FAILURE(status))
+		return;
+
+	adev->pld_crc = crc32(~0, pld, sizeof(*pld));
+	ACPI_FREE(pld);
 }
 
 static int __acpi_device_add(struct acpi_device *device,
@@ -711,6 +725,8 @@ static int __acpi_device_add(struct acpi_device *device,
 
 	if (device->wakeup.flags.valid)
 		list_add_tail(&device->wakeup_list, &acpi_wakeup_device_list);
+
+	acpi_store_pld_crc(device);
 
 	mutex_unlock(&acpi_device_lock);
 
@@ -1017,6 +1033,7 @@ static void acpi_bus_init_power_state(struct acpi_device *device, int state)
 
 static void acpi_bus_get_power_flags(struct acpi_device *device)
 {
+	unsigned long long dsc = ACPI_STATE_D0;
 	u32 i;
 
 	/* Presence of _PS0|_PR0 indicates 'power manageable' */
@@ -1037,6 +1054,9 @@ static void acpi_bus_get_power_flags(struct acpi_device *device)
 
 	if (acpi_has_method(device->handle, "_DSW"))
 		device->power.flags.dsw_present = 1;
+
+	acpi_evaluate_integer(device->handle, "_DSC", NULL, &dsc);
+	device->power.state_for_enumeration = dsc;
 
 	/*
 	 * Enumerate supported power management states
