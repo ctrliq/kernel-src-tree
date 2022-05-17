@@ -29,8 +29,9 @@ do
 			# UPSTREAM is the base merge commit and can change from day-to-day as
 			# the tree is changed.  Omit UPSTREAM from the output.
 			# RHEL_RELEASE can change build-to-build.
+			# SHELL can change depending on user's environment
 			unset SINGLE_TARBALL
-			make RHSELFTESTDATA=1 DIST="${DIST}" DISTRO="${DISTRO}" HEAD=${commit} dist-dump-variables | grep "=" | grep -v CURDIR | grep -v -w UPSTREAM | grep -v -w RHEL_RELEASE >& "${varfilename}"
+			make RHSELFTESTDATA=1 DIST="${DIST}" DISTRO="${DISTRO}" HEAD=${commit} dist-dump-variables | grep "=" | grep -v CURDIR | grep -v -w UPSTREAM | grep -v -w RHEL_RELEASE | grep -v -w SHELL >& "${varfilename}"
 
 			# When executed from a script, the variables in Makefile.variables are
 			# listed as having origin 'environment'.  This is because the script
