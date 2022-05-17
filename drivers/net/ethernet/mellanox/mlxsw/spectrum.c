@@ -3284,7 +3284,7 @@ static int mlxsw_sp1_resources_register(struct mlxsw_core *mlxsw_core)
 
 err_resources_counter_register:
 err_resources_span_register:
-	devlink_resources_unregister(priv_to_devlink(mlxsw_core), NULL);
+	devlink_resources_unregister(priv_to_devlink(mlxsw_core));
 	return err;
 }
 
@@ -3312,7 +3312,7 @@ static int mlxsw_sp2_resources_register(struct mlxsw_core *mlxsw_core)
 
 err_resources_counter_register:
 err_resources_span_register:
-	devlink_resources_unregister(priv_to_devlink(mlxsw_core), NULL);
+	devlink_resources_unregister(priv_to_devlink(mlxsw_core));
 	return err;
 }
 
