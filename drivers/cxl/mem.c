@@ -59,7 +59,6 @@ static void enable_suspend(void *data)
 static int cxl_mem_probe(struct device *dev)
 {
 	struct cxl_memdev *cxlmd = to_cxl_memdev(dev);
-	struct cxl_endpoint_dvsec_info info = { 0 };
 	struct cxl_dev_state *cxlds = cxlmd->cxlds;
 	struct cxl_port *parent_port;
 	int rc;
@@ -100,7 +99,7 @@ unlock:
 	if (rc)
 		return rc;
 
-	rc = cxl_hdm_decode_init(cxlds, &info);
+	rc = cxl_hdm_decode_init(cxlds);
 	if (rc)
 		return rc;
 
