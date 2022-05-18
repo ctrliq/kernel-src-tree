@@ -1702,12 +1702,14 @@ static void ww_test_fail_acquire(void)
 
 #ifdef CONFIG_PREEMPT_RT
 #define ww_mutex_base_lock(b)			rt_mutex_lock(b)
+#define ww_mutex_base_trylock(b)		rt_mutex_trylock(b)
 #define ww_mutex_base_lock_nest_lock(b, b2)	rt_mutex_lock_nest_lock(b, b2)
 #define ww_mutex_base_lock_interruptible(b)	rt_mutex_lock_interruptible(b)
 #define ww_mutex_base_lock_killable(b)		rt_mutex_lock_killable(b)
 #define ww_mutex_base_unlock(b)			rt_mutex_unlock(b)
 #else
 #define ww_mutex_base_lock(b)			mutex_lock(b)
+#define ww_mutex_base_trylock(b)		mutex_trylock(b)
 #define ww_mutex_base_lock_nest_lock(b, b2)	mutex_lock_nest_lock(b, b2)
 #define ww_mutex_base_lock_interruptible(b)	mutex_lock_interruptible(b)
 #define ww_mutex_base_lock_killable(b)		mutex_lock_killable(b)
