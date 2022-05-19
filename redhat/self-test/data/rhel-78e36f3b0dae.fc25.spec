@@ -124,13 +124,13 @@ Summary: The Linux kernel
 %define buildid .test
 %define specversion 5.17.0
 %define patchversion 5.17
-%define pkgrelease 0.rc0.78e36f3b0dae586.6.test
+%define pkgrelease 0.rc0.78e36f3b0dae.6.test
 %define kversion 5
-%define tarfile_release 5.17.0-0.rc0.78e36f3b0dae586.6.test
+%define tarfile_release 5.17.0-0.rc0.78e36f3b0dae.6.test
 # This is needed to do merge window version magic
 %define patchlevel 17
 # allow pkg_release to have configurable %%{?dist} tag
-%define specrelease 0.rc0.78e36f3b0dae586.6%{?buildid}%{?dist}
+%define specrelease 0.rc0.78e36f3b0dae.6%{?buildid}%{?dist}
 
 #
 # End of genspec.sh variables
@@ -653,6 +653,10 @@ BuildRequires: kabi-dw
 %if %{signkernel}%{signmodules}
 BuildRequires: openssl
 %if %{signkernel}
+# ELN uses Fedora signing process, so exclude
+%if 0%{?rhel}%{?centos} && !0%{?eln}
+BuildRequires: system-sb-certs
+%endif
 %ifarch x86_64 aarch64
 BuildRequires: nss-tools
 BuildRequires: pesign >= 0.10-4
@@ -2292,7 +2296,7 @@ export BPFTOOL=$(pwd)/tools/bpf/bpftool/bpftool
 pushd tools/testing/selftests
 # We need to install here because we need to call make with ARCH set which
 # doesn't seem possible to do in the install section.
-%{make} %{?_smp_mflags} ARCH=$Arch V=1 TARGETS="bpf livepatch net net/forwarding net/mptcp netfilter tc-testing" SKIP_TARGETS="" INSTALL_PATH=%{buildroot}%{_libexecdir}/kselftests VMLINUX_H="${RPM_VMLINUX_H}" install
+%{make} %{?_smp_mflags} ARCH=$Arch V=1 TARGETS="bpf vm livepatch net net/forwarding net/mptcp netfilter tc-testing" SKIP_TARGETS="" INSTALL_PATH=%{buildroot}%{_libexecdir}/kselftests VMLINUX_H="${RPM_VMLINUX_H}" install
 
 # 'make install' for bpf is broken and upstream refuses to fix it.
 # Install the needed files manually.
@@ -2347,7 +2351,7 @@ find Documentation -type d | xargs chmod u+w
     fi \
   fi \
   if [ "%{zipmodules}" -eq "1" ]; then \
-    find $RPM_BUILD_ROOT/lib/modules/ -type f -name '*.ko' | xargs -P${RPM_BUILD_NCPUS} xz; \
+    find $RPM_BUILD_ROOT/lib/modules/ -type f -name '*.ko' | xargs -P${RPM_BUILD_NCPUS} -r xz; \
   fi \
 %{nil}
 
@@ -2571,6 +2575,12 @@ install -d %{buildroot}%{_libexecdir}/ksamples/pktgen
 find . -type f -executable -exec install -m755 {} %{buildroot}%{_libexecdir}/ksamples/pktgen/{} \;
 find . -type f ! -executable -exec install -m644 {} %{buildroot}%{_libexecdir}/ksamples/pktgen/{} \;
 popd
+popd
+# install vm selftests
+pushd tools/testing/selftests/vm
+find -type d -exec install -d %{buildroot}%{_libexecdir}/kselftests/vm/{} \;
+find -type f -executable -exec install -D -m755 {} %{buildroot}%{_libexecdir}/kselftests/vm/{} \;
+find -type f ! -executable -exec install -D -m644 {} %{buildroot}%{_libexecdir}/kselftests/vm/{} \;
 popd
 # install drivers/net/mlxsw selftests
 pushd tools/testing/selftests/drivers/net/mlxsw
@@ -3024,7 +3034,7 @@ fi
 #
 #
 %changelog
-Mon Mar 28 2022 Fedora Kernel Team <kernel-team@fedoraproject.org> [5.17.0-0.rc0.78e36f3b0dae586.6.test]
+Mon Mar 28 2022 Fedora Kernel Team <kernel-team@fedoraproject.org> [5.17.0-0.rc0.78e36f3b0dae.6.test]
 
 ###
 # The following Emacs magic makes C-c C-e use UTC dates.
