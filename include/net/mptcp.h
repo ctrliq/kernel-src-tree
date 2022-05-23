@@ -35,7 +35,8 @@ struct mptcp_ext {
 			frozen:1,
 			reset_transient:1;
 	u8		reset_reason:4,
-			csum_reqd:1;
+			csum_reqd:1,
+			infinite_map:1;
 };
 
 #define MPTCP_RM_IDS_MAX	8
@@ -215,12 +216,6 @@ static inline bool rsk_is_mptcp(const struct request_sock *req)
 static inline bool rsk_drop_req(const struct request_sock *req)
 {
 	return false;
-}
-
-static inline void mptcp_parse_option(const struct sk_buff *skb,
-				      const unsigned char *ptr, int opsize,
-				      struct tcp_options_received *opt_rx)
-{
 }
 
 static inline bool mptcp_syn_options(struct sock *sk, const struct sk_buff *skb,
