@@ -11,4 +11,5 @@
 %define tarfile_release 5.16-rc5-1-gfce15c45d3fb
 %define patchlevel 16
 %define specrelease 0.rc5.fce15c45d3fb.6%{?buildid}%{?dist}
+%define kabiversion 5.16.0
 Mon Mar 28 2022 Fedora Kernel Team <kernel-team@fedoraproject.org> [5.16.0-0.rc5.fce15c45d3fb.6.test]

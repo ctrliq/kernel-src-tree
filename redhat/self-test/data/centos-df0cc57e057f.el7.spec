@@ -10,4 +10,5 @@
 %define tarfile_release 5.16.0-6.test
 %define patchlevel 16
 %define specrelease 6%{?buildid}%{?dist}
+%define kabiversion 5.16.0-6.test
 Mon Mar 28 2022 Fedora Kernel Team <kernel-team@fedoraproject.org> [5.16.0-6.test]
