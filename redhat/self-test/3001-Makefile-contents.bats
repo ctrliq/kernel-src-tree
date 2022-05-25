@@ -9,7 +9,7 @@
 		exit 1
 	fi
 
-	value=$(git grep "?=" Makefile | wc -l)
+	value=$(git grep "?=" Makefile | grep -v "\"?=" | wc -l)
 	if [ $value -gt 0 ]; then
 		echo "Test failed: Makefile should not ?= declarations."
 		exit 1
