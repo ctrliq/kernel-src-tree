@@ -714,7 +714,8 @@ dist-os-version:
 	@echo "OSVERSION: $(RHEL_MAJOR).$(RHEL_MINOR)"
 
 dist-dump-variables:
-	@$(foreach V,$(sort $(.VARIABLES)), $(if $(filter-out environment% default automatic, $(origin $V)),$(info $V=$($V) )))
+	$(eval VARS:=$(sort $(shell cat Makefile.variables | sed '/^#/d; /^$$/d; s/[ ]*[?:]=.*//')))
+	@$(foreach V,$(sort $(.VARIABLES)), $(if $(filter-out environment default automatic, $(origin $V)),$(info $V=$($V) ),$(if $(filter $(VARS),$(V)),$(info $V=$($V)))))
 
 dist-self-test:
 	@if test -x /usr/bin/bats; then \
