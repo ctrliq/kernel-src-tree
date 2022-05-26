@@ -3563,6 +3563,7 @@ void unmap_mapping_pages(struct address_space *mapping, pgoff_t start,
 					 last_index, &details);
 	i_mmap_unlock_read(mapping);
 }
+EXPORT_SYMBOL_GPL(unmap_mapping_pages);
 
 /**
  * unmap_mapping_range - unmap the portion of all mmaps in the specified
