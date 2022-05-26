@@ -795,12 +795,21 @@ There are a number of operations that can be used to control cookies:
      -ENOSPC if there isn't enough space to honour the operation, -ENOMEM or
      -EIO if there's any other problem.
 
-     Note that this doesn't pin an object in a cache; it can still be culled to
-     make space if it's not in use.
+	void fscache_clear_page_bits(struct address_space *mapping,
+				     loff_t start, size_t len,
+				     bool caching)
 
+In these functions, a pointer to the mapping to which the source pages are
+attached is passed in and start and len indicate the size of the region that's
+going to be written (it doesn't have to align to page boundaries necessarily,
+but it does have to align to DIO boundaries on the backing filesystem).  The
+caching parameter indicates if caching should be skipped, and if false, the
+functions do nothing.
 
-Cookie Unregistration
-=====================
+The write function takes some additional parameters: the cookie representing
+the cache object to be written to, i_size indicates the size of the netfs file
+and term_func indicates an optional completion function, to which
+term_func_priv will be passed, along with the error or amount written.
 
 To get rid of a cookie, this function should be called::
 
