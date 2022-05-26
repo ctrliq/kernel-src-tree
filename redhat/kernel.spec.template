@@ -2649,6 +2649,10 @@ popd
 # a far more sophisticated hardlink implementation.
 # https://github.com/projectatomic/rpm-ostree/commit/58a79056a889be8814aa51f507b2c7a4dccee526
 #
+# The deletion of *.hardlink-temporary files is a temporary workaround
+# for this bug in the hardlink binary (fixed in util-linux 2.38):
+# https://github.com/util-linux/util-linux/issues/1602
+#
 %define kernel_devel_post() \
 %{expand:%%post %{?1:%{1}-}devel}\
 if [ -f /etc/sysconfig/kernel ]\
@@ -2660,7 +2664,9 @@ then\
     (cd /usr/src/kernels/%{KVERREL}%{?1:+%{1}} &&\
      /usr/bin/find . -type f | while read f; do\
        hardlink -c /usr/src/kernels/*%{?dist}.*/$f $f > /dev/null\
-     done)\
+     done;\
+     /usr/bin/find /usr/src/kernels -type f -name '*.hardlink-temporary' -delete\
+    )\
 fi\
 %{nil}
 
