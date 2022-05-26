@@ -12,3 +12,6 @@ intel_sdsi-y				:= sdsi.o
 obj-$(CONFIG_INTEL_SDSI)		+= intel_sdsi.o
 intel_vsec-y				:= vsec.o
 obj-$(CONFIG_INTEL_VSEC)		+= intel_vsec.o
+
+# Intel miscellaneous drivers
+obj-$(CONFIG_INTEL_ISHTP_ECLITE)	+= ishtp_eclite.o
