@@ -174,6 +174,7 @@ struct ap_card {
 	int id;				/* AP card number. */
 	unsigned int maxmsgsize;	/* AP msg limit for this card */
 	bool config;			/* configured state */
+	bool chkstop;			/* checkstop state */
 	atomic64_t total_request_count;	/* # requests ever for this AP device.*/
 };
 
@@ -187,6 +188,7 @@ struct ap_queue {
 	void *private;			/* ap driver private pointer. */
 	enum ap_dev_state dev_state;	/* queue device state */
 	bool config;			/* configured state */
+	bool chkstop;			/* checkstop state */
 	ap_qid_t qid;			/* AP queue id. */
 	int interrupt;			/* indicate if interrupts are enabled */
 	int queue_count;		/* # messages currently on AP queue. */
