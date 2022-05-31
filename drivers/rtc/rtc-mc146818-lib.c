@@ -8,7 +8,7 @@
 #include <linux/acpi.h>
 #endif
 
-unsigned int mc146818_get_time(struct rtc_time *time)
+int mc146818_get_time(struct rtc_time *time)
 {
 	unsigned char ctrl;
 	unsigned long flags;
