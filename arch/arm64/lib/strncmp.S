@@ -307,4 +307,4 @@ L(ret0):
 	ret
 SYM_FUNC_END(__pi_strncmp)
 SYM_FUNC_ALIAS_WEAK(strncmp, __pi_strncmp)
-EXPORT_SYMBOL_NOHWKASAN(strncmp)
+EXPORT_SYMBOL_NOKASAN(strncmp)
