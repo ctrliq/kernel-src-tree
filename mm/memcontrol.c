@@ -729,9 +729,6 @@ void __mod_memcg_lruvec_state(struct lruvec *lruvec, enum node_stat_item idx,
 
 	memcg_rstat_updated(memcg, val);
 	memcg_stats_unlock();
-
-	if (IS_ENABLED(CONFIG_PREEMPT_RT))
-		preempt_enable();
 }
 
 /**
