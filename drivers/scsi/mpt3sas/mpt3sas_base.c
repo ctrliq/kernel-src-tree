@@ -2011,9 +2011,10 @@ mpt3sas_base_sync_reply_irqs(struct MPT3SAS_ADAPTER *ioc, u8 poll)
 				enable_irq(reply_q->os_irq);
 			}
 		}
+
+		if (poll)
+			_base_process_reply_queue(reply_q);
 	}
-	if (poll)
-		_base_process_reply_queue(reply_q);
 }
 
 /**
@@ -3074,6 +3075,7 @@ _base_check_enable_msix(struct MPT3SAS_ADAPTER *ioc)
 void
 mpt3sas_base_free_irq(struct MPT3SAS_ADAPTER *ioc)
 {
+	unsigned int irq;
 	struct adapter_reply_queue *reply_q, *next;
 
 	if (list_empty(&ioc->reply_queue_list))
@@ -3086,9 +3088,10 @@ mpt3sas_base_free_irq(struct MPT3SAS_ADAPTER *ioc)
 			continue;
 		}
 
-		if (ioc->smp_affinity_enable)
-			irq_set_affinity_hint(pci_irq_vector(ioc->pdev,
-			    reply_q->msix_index), NULL);
+		if (ioc->smp_affinity_enable) {
+			irq = pci_irq_vector(ioc->pdev, reply_q->msix_index);
+			irq_update_affinity_hint(irq, NULL);
+		}
 		free_irq(pci_irq_vector(ioc->pdev, reply_q->msix_index),
 			 reply_q);
 		kfree(reply_q);
@@ -3155,18 +3158,15 @@ out:
  * @ioc: per adapter object
  *
  * The enduser would need to set the affinity via /proc/irq/#/smp_affinity
- *
- * It would nice if we could call irq_set_affinity, however it is not
- * an exported symbol
  */
 static void
 _base_assign_reply_queues(struct MPT3SAS_ADAPTER *ioc)
 {
-	unsigned int cpu, nr_cpus, nr_msix, index = 0;
+	unsigned int cpu, nr_cpus, nr_msix, index = 0, irq;
 	struct adapter_reply_queue *reply_q;
-	int local_numa_node;
 	int iopoll_q_count = ioc->reply_queue_count -
 	    ioc->iopoll_q_start_index;
+	const struct cpumask *mask;
 
 	if (!_base_is_controller_msix_enabled(ioc))
 		return;
@@ -3189,11 +3189,11 @@ _base_assign_reply_queues(struct MPT3SAS_ADAPTER *ioc)
 		 * corresponding to high iops queues.
 		 */
 		if (ioc->high_iops_queues) {
-			local_numa_node = dev_to_node(&ioc->pdev->dev);
+			mask = cpumask_of_node(dev_to_node(&ioc->pdev->dev));
 			for (index = 0; index < ioc->high_iops_queues;
 			    index++) {
-				irq_set_affinity_hint(pci_irq_vector(ioc->pdev,
-				    index), cpumask_of_node(local_numa_node));
+				irq = pci_irq_vector(ioc->pdev, index);
+				irq_set_affinity_and_hint(irq, mask);
 			}
 		}
 
@@ -3692,10 +3692,11 @@ mpt3sas_base_map_resources(struct MPT3SAS_ADAPTER *ioc)
 		}
 
 		for (i = 0; i < ioc->combined_reply_index_count; i++) {
-			ioc->replyPostRegisterIndex[i] = (resource_size_t *)
-			     ((u8 __force *)&ioc->chip->Doorbell +
-			     MPI25_SUP_REPLY_POST_HOST_INDEX_OFFSET +
-			     (i * MPT3_SUP_REPLY_POST_HOST_INDEX_REG_OFFSET));
+			ioc->replyPostRegisterIndex[i] =
+				(resource_size_t __iomem *)
+				((u8 __force *)&ioc->chip->Doorbell +
+				 MPI25_SUP_REPLY_POST_HOST_INDEX_OFFSET +
+				 (i * MPT3_SUP_REPLY_POST_HOST_INDEX_REG_OFFSET));
 		}
 	}
 
@@ -4312,7 +4313,7 @@ _base_put_smid_scsi_io_atomic(struct MPT3SAS_ADAPTER *ioc, u16 smid,
 	descriptor.MSIxIndex = _base_set_and_get_msix_index(ioc, smid);
 	descriptor.SMID = cpu_to_le16(smid);
 
-	writel(cpu_to_le32(*request), &ioc->chip->AtomicRequestDescriptorPost);
+	writel(*request, &ioc->chip->AtomicRequestDescriptorPost);
 }
 
 /**
@@ -4334,7 +4335,7 @@ _base_put_smid_fast_path_atomic(struct MPT3SAS_ADAPTER *ioc, u16 smid,
 	descriptor.MSIxIndex = _base_set_and_get_msix_index(ioc, smid);
 	descriptor.SMID = cpu_to_le16(smid);
 
-	writel(cpu_to_le32(*request), &ioc->chip->AtomicRequestDescriptorPost);
+	writel(*request, &ioc->chip->AtomicRequestDescriptorPost);
 }
 
 /**
@@ -4357,7 +4358,7 @@ _base_put_smid_hi_priority_atomic(struct MPT3SAS_ADAPTER *ioc, u16 smid,
 	descriptor.MSIxIndex = msix_task;
 	descriptor.SMID = cpu_to_le16(smid);
 
-	writel(cpu_to_le32(*request), &ioc->chip->AtomicRequestDescriptorPost);
+	writel(*request, &ioc->chip->AtomicRequestDescriptorPost);
 }
 
 /**
@@ -4378,7 +4379,7 @@ _base_put_smid_default_atomic(struct MPT3SAS_ADAPTER *ioc, u16 smid)
 	descriptor.MSIxIndex = _base_set_and_get_msix_index(ioc, smid);
 	descriptor.SMID = cpu_to_le16(smid);
 
-	writel(cpu_to_le32(*request), &ioc->chip->AtomicRequestDescriptorPost);
+	writel(*request, &ioc->chip->AtomicRequestDescriptorPost);
 }
 
 /**
@@ -4752,7 +4753,7 @@ static void
 _base_display_ioc_capabilities(struct MPT3SAS_ADAPTER *ioc)
 {
 	int i = 0;
-	char desc[16];
+	char desc[17] = {0};
 	u32 iounit_pg1_flags;
 	u32 bios_version;
 
@@ -6893,7 +6894,7 @@ _base_handshake_req_reply_wait(struct MPT3SAS_ADAPTER *ioc, int request_bytes,
 
 	/* send message 32-bits at a time */
 	for (i = 0, failed = 0; i < request_bytes/4 && !failed; i++) {
-		writel(cpu_to_le32(request[i]), &ioc->chip->Doorbell);
+		writel(request[i], &ioc->chip->Doorbell);
 		if ((_base_wait_for_doorbell_ack(ioc, 5)))
 			failed = 1;
 	}
@@ -6912,16 +6913,16 @@ _base_handshake_req_reply_wait(struct MPT3SAS_ADAPTER *ioc, int request_bytes,
 	}
 
 	/* read the first two 16-bits, it gives the total length of the reply */
-	reply[0] = le16_to_cpu(ioc->base_readl(&ioc->chip->Doorbell)
-	    & MPI2_DOORBELL_DATA_MASK);
+	reply[0] = ioc->base_readl(&ioc->chip->Doorbell)
+		& MPI2_DOORBELL_DATA_MASK;
 	writel(0, &ioc->chip->HostInterruptStatus);
 	if ((_base_wait_for_doorbell_int(ioc, 5))) {
 		ioc_err(ioc, "doorbell handshake int failed (line=%d)\n",
 			__LINE__);
 		return -EFAULT;
 	}
-	reply[1] = le16_to_cpu(ioc->base_readl(&ioc->chip->Doorbell)
-	    & MPI2_DOORBELL_DATA_MASK);
+	reply[1] = ioc->base_readl(&ioc->chip->Doorbell)
+		& MPI2_DOORBELL_DATA_MASK;
 	writel(0, &ioc->chip->HostInterruptStatus);
 
 	for (i = 2; i < default_reply->MsgLength * 2; i++)  {
@@ -6933,9 +6934,8 @@ _base_handshake_req_reply_wait(struct MPT3SAS_ADAPTER *ioc, int request_bytes,
 		if (i >=  reply_bytes/2) /* overflow case */
 			ioc->base_readl(&ioc->chip->Doorbell);
 		else
-			reply[i] = le16_to_cpu(
-			    ioc->base_readl(&ioc->chip->Doorbell)
-			    & MPI2_DOORBELL_DATA_MASK);
+			reply[i] = ioc->base_readl(&ioc->chip->Doorbell)
+				& MPI2_DOORBELL_DATA_MASK;
 		writel(0, &ioc->chip->HostInterruptStatus);
 	}
 
