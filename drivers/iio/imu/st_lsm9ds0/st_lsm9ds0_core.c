@@ -89,7 +89,6 @@ static int st_lsm9ds0_probe_accel(struct st_lsm9ds0 *lsm9ds0, struct regmap *reg
 
 	data = iio_priv(lsm9ds0->accel);
 	data->sensor_settings = (struct st_sensor_settings *)settings;
-	data->dev = dev;
 	data->irq = lsm9ds0->irq;
 	data->regmap = regmap;
 	data->vdd = lsm9ds0->vdd;
@@ -118,7 +117,6 @@ static int st_lsm9ds0_probe_magn(struct st_lsm9ds0 *lsm9ds0, struct regmap *regm
 
 	data = iio_priv(lsm9ds0->magn);
 	data->sensor_settings = (struct st_sensor_settings *)settings;
-	data->dev = dev;
 	data->irq = lsm9ds0->irq;
 	data->regmap = regmap;
 	data->vdd = lsm9ds0->vdd;
