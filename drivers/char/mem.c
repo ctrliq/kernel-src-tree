@@ -213,9 +213,9 @@ static ssize_t write_mem(struct file *file, const char __user *buf,
 	ssize_t written, sz;
 	unsigned long copied;
 	void *ptr;
-	int rc;
 
 #ifdef CONFIG_PPC_RTAS
+	int rc;
 	/* rtas: allow /dev/mem to be open()ed for mmap only: see open_mem. */
 	rc = security_locked_down(LOCKDOWN_DEV_MEM);
 	if (rc)
@@ -382,9 +382,9 @@ static int mmap_mem(struct file *file, struct vm_area_struct *vma)
 {
 	size_t size = vma->vm_end - vma->vm_start;
 	phys_addr_t offset = (phys_addr_t)vma->vm_pgoff << PAGE_SHIFT;
-	int rc;
 
 #ifdef CONFIG_PPC_RTAS
+	int rc;
 	/* rtas: we want to be careful here.
 	 *
 	 * Check carefully the address and size. If we are getting exactly
