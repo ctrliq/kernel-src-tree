@@ -173,6 +173,7 @@ struct pneigh_entry {
 	struct pneigh_entry	*next;
 	possible_net_t		net;
 	struct net_device	*dev;
+	netdevice_tracker	dev_tracker;
 	u8			flags;
 	u8			protocol;
 	u8			key[];
