@@ -30,6 +30,8 @@
 #include <asm/proto.h>
 #include <asm/memtype.h>
 #include <asm/set_memory.h>
+#include <asm/hyperv-tlfs.h>
+#include <asm/mshyperv.h>
 
 #include "../mm_internal.h"
 
@@ -635,17 +637,6 @@ pte_t *lookup_address(unsigned long address, unsigned int *level)
 	return lookup_address_in_pgd(pgd_offset_k(address), address, level);
 }
 EXPORT_SYMBOL_GPL(lookup_address);
-
-/*
- * Lookup the page table entry for a virtual address in a given mm. Return a
- * pointer to the entry and the level of the mapping.
- */
-pte_t *lookup_address_in_mm(struct mm_struct *mm, unsigned long address,
-			    unsigned int *level)
-{
-	return lookup_address_in_pgd(pgd_offset(mm, address), address, level);
-}
-EXPORT_SYMBOL_GPL(lookup_address_in_mm);
 
 static pte_t *_lookup_address_cpa(struct cpa_data *cpa, unsigned long address,
 				  unsigned int *level)
@@ -1981,14 +1972,14 @@ int set_memory_global(unsigned long addr, int numpages)
 				    __pgprot(_PAGE_GLOBAL), 0);
 }
 
-static int __set_memory_enc_dec(unsigned long addr, int numpages, bool enc)
+/*
+ * __set_memory_enc_pgtable() is used for the hypervisors that get
+ * informed about "encryption" status via page tables.
+ */
+static int __set_memory_enc_pgtable(unsigned long addr, int numpages, bool enc)
 {
 	struct cpa_data cpa;
 	int ret;
-
-	/* Nothing to do if memory encryption is not active */
-	if (!cc_platform_has(CC_ATTR_MEM_ENCRYPT))
-		return 0;
 
 	/* Should not be working on unaligned addresses */
 	if (WARN_ONCE(addr & ~PAGE_MASK, "misaligned address: %#lx\n", addr))
@@ -2021,7 +2012,24 @@ static int __set_memory_enc_dec(unsigned long addr, int numpages, bool enc)
 	 */
 	cpa_flush(&cpa, 0);
 
+	/*
+	 * Notify hypervisor that a given memory range is mapped encrypted
+	 * or decrypted.
+	 */
+	notify_range_enc_status_changed(addr, numpages, enc);
+
 	return ret;
+}
+
+static int __set_memory_enc_dec(unsigned long addr, int numpages, bool enc)
+{
+	if (hv_is_isolation_supported())
+		return hv_set_mem_host_visibility(addr, numpages, !enc);
+
+	if (cc_platform_has(CC_ATTR_MEM_ENCRYPT))
+		return __set_memory_enc_pgtable(addr, numpages, enc);
+
+	return 0;
 }
 
 int set_memory_encrypted(unsigned long addr, int numpages)

@@ -22,13 +22,17 @@
 
 static int vcpu_mmap_sz(void);
 
-/* Aligns x up to the next multiple of size. Size must be a power of 2. */
-static void *align(void *x, size_t size)
+int open_path_or_exit(const char *path, int flags)
 {
-	size_t mask = size - 1;
-	TEST_ASSERT(size != 0 && !(size & (size - 1)),
-		    "size not a power of 2: %lu", size);
-	return (void *) (((size_t) x + mask) & ~mask);
+	int fd;
+
+	fd = open(path, flags);
+	if (fd < 0) {
+		print_skip("%s not available (errno: %d)", path, errno);
+		exit(KSFT_SKIP);
+	}
+
+	return fd;
 }
 
 /*
@@ -42,16 +46,7 @@ static void *align(void *x, size_t size)
  */
 static int _open_kvm_dev_path_or_exit(int flags)
 {
-	int fd;
-
-	fd = open(KVM_DEV_PATH, flags);
-	if (fd < 0) {
-		print_skip("%s not available, is KVM loaded? (errno: %d)",
-			   KVM_DEV_PATH, errno);
-		exit(KSFT_SKIP);
-	}
-
-	return fd;
+	return open_path_or_exit(KVM_DEV_PATH, flags);
 }
 
 int open_kvm_dev_path_or_exit(void)
@@ -198,12 +193,18 @@ const char *vm_guest_mode_string(uint32_t i)
 		[VM_MODE_P52V48_4K]	= "PA-bits:52,  VA-bits:48,  4K pages",
 		[VM_MODE_P52V48_64K]	= "PA-bits:52,  VA-bits:48, 64K pages",
 		[VM_MODE_P48V48_4K]	= "PA-bits:48,  VA-bits:48,  4K pages",
+		[VM_MODE_P48V48_16K]	= "PA-bits:48,  VA-bits:48, 16K pages",
 		[VM_MODE_P48V48_64K]	= "PA-bits:48,  VA-bits:48, 64K pages",
 		[VM_MODE_P40V48_4K]	= "PA-bits:40,  VA-bits:48,  4K pages",
+		[VM_MODE_P40V48_16K]	= "PA-bits:40,  VA-bits:48, 16K pages",
 		[VM_MODE_P40V48_64K]	= "PA-bits:40,  VA-bits:48, 64K pages",
 		[VM_MODE_PXXV48_4K]	= "PA-bits:ANY, VA-bits:48,  4K pages",
 		[VM_MODE_P47V64_4K]	= "PA-bits:47,  VA-bits:64,  4K pages",
 		[VM_MODE_P44V64_4K]	= "PA-bits:44,  VA-bits:64,  4K pages",
+		[VM_MODE_P36V48_4K]	= "PA-bits:36,  VA-bits:48,  4K pages",
+		[VM_MODE_P36V48_16K]	= "PA-bits:36,  VA-bits:48, 16K pages",
+		[VM_MODE_P36V48_64K]	= "PA-bits:36,  VA-bits:48, 64K pages",
+		[VM_MODE_P36V47_16K]	= "PA-bits:36,  VA-bits:47, 16K pages",
 	};
 	_Static_assert(sizeof(strings)/sizeof(char *) == NUM_VM_MODES,
 		       "Missing new mode strings?");
@@ -214,15 +215,21 @@ const char *vm_guest_mode_string(uint32_t i)
 }
 
 const struct vm_guest_mode_params vm_guest_mode_params[] = {
-	{ 52, 48,  0x1000, 12 },
-	{ 52, 48, 0x10000, 16 },
-	{ 48, 48,  0x1000, 12 },
-	{ 48, 48, 0x10000, 16 },
-	{ 40, 48,  0x1000, 12 },
-	{ 40, 48, 0x10000, 16 },
-	{  0,  0,  0x1000, 12 },
-	{ 47, 64,  0x1000, 12 },
-	{ 44, 64,  0x1000, 12 },
+	[VM_MODE_P52V48_4K]	= { 52, 48,  0x1000, 12 },
+	[VM_MODE_P52V48_64K]	= { 52, 48, 0x10000, 16 },
+	[VM_MODE_P48V48_4K]	= { 48, 48,  0x1000, 12 },
+	[VM_MODE_P48V48_16K]	= { 48, 48,  0x4000, 14 },
+	[VM_MODE_P48V48_64K]	= { 48, 48, 0x10000, 16 },
+	[VM_MODE_P40V48_4K]	= { 40, 48,  0x1000, 12 },
+	[VM_MODE_P40V48_16K]	= { 40, 48,  0x4000, 14 },
+	[VM_MODE_P40V48_64K]	= { 40, 48, 0x10000, 16 },
+	[VM_MODE_PXXV48_4K]	= {  0,  0,  0x1000, 12 },
+	[VM_MODE_P47V64_4K]	= { 47, 64,  0x1000, 12 },
+	[VM_MODE_P44V64_4K]	= { 44, 64,  0x1000, 12 },
+	[VM_MODE_P36V48_4K]	= { 36, 48,  0x1000, 12 },
+	[VM_MODE_P36V48_16K]	= { 36, 48,  0x4000, 14 },
+	[VM_MODE_P36V48_64K]	= { 36, 48, 0x10000, 16 },
+	[VM_MODE_P36V47_16K]	= { 36, 47,  0x4000, 14 },
 };
 _Static_assert(sizeof(vm_guest_mode_params)/sizeof(struct vm_guest_mode_params) == NUM_VM_MODES,
 	       "Missing new mode params?");
@@ -284,9 +291,19 @@ struct kvm_vm *vm_create(enum vm_guest_mode mode, uint64_t phy_pages, int perm)
 		vm->pgtable_levels = 3;
 		break;
 	case VM_MODE_P40V48_4K:
+	case VM_MODE_P36V48_4K:
 		vm->pgtable_levels = 4;
 		break;
 	case VM_MODE_P40V48_64K:
+	case VM_MODE_P36V48_64K:
+		vm->pgtable_levels = 3;
+		break;
+	case VM_MODE_P48V48_16K:
+	case VM_MODE_P40V48_16K:
+	case VM_MODE_P36V48_16K:
+		vm->pgtable_levels = 4;
+		break;
+	case VM_MODE_P36V47_16K:
 		vm->pgtable_levels = 3;
 		break;
 	case VM_MODE_PXXV48_4K:
@@ -334,7 +351,7 @@ struct kvm_vm *vm_create(enum vm_guest_mode mode, uint64_t phy_pages, int perm)
 		(1ULL << (vm->va_bits - 1)) >> vm->page_shift);
 
 	/* Limit physical addresses to PA-bits. */
-	vm->max_gfn = ((1ULL << vm->pa_bits) >> vm->page_shift) - 1;
+	vm->max_gfn = vm_compute_max_gfn(vm);
 
 #ifdef __x86_64__
 	/* Avoid reserved HyperTransport region on AMD processors.  */
@@ -348,6 +365,20 @@ struct kvm_vm *vm_create(enum vm_guest_mode mode, uint64_t phy_pages, int perm)
 		vm_userspace_mem_region_add(vm, VM_MEM_SRC_ANONYMOUS,
 					    0, 0, phy_pages, 0);
 
+	return vm;
+}
+
+struct kvm_vm *vm_create_without_vcpus(enum vm_guest_mode mode, uint64_t pages)
+{
+	struct kvm_vm *vm;
+
+	vm = vm_create(mode, pages, O_RDWR);
+
+	kvm_vm_elf_load(vm, program_invocation_name);
+
+#ifdef __x86_64__
+	vm_create_irqchip(vm);
+#endif
 	return vm;
 }
 
@@ -382,13 +413,6 @@ struct kvm_vm *vm_create_with_vcpus(enum vm_guest_mode mode, uint32_t nr_vcpus,
 	struct kvm_vm *vm;
 	int i;
 
-#ifdef __x86_64__
-	/*
-	 * Permission needs to be requested before KVM_SET_CPUID2.
-	 */
-	vm_xsave_req_perm();
-#endif
-
 	/* Force slot0 memory size not small than DEFAULT_GUEST_PHY_PAGES */
 	if (slot0_mem_pages < DEFAULT_GUEST_PHY_PAGES)
 		slot0_mem_pages = DEFAULT_GUEST_PHY_PAGES;
@@ -408,13 +432,8 @@ struct kvm_vm *vm_create_with_vcpus(enum vm_guest_mode mode, uint32_t nr_vcpus,
 		    nr_vcpus, kvm_check_cap(KVM_CAP_MAX_VCPUS));
 
 	pages = vm_adjust_num_guest_pages(mode, pages);
-	vm = vm_create(mode, pages, O_RDWR);
 
-	kvm_vm_elf_load(vm, program_invocation_name);
-
-#ifdef __x86_64__
-	vm_create_irqchip(vm);
-#endif
+	vm = vm_create_without_vcpus(mode, pages);
 
 	for (i = 0; i < nr_vcpus; ++i) {
 		uint32_t vcpuid = vcpuids ? vcpuids[i] : i;
@@ -488,9 +507,11 @@ void kvm_vm_get_dirty_log(struct kvm_vm *vm, int slot, void *log)
 void kvm_vm_clear_dirty_log(struct kvm_vm *vm, int slot, void *log,
 			    uint64_t first_page, uint32_t num_pages)
 {
-	struct kvm_clear_dirty_log args = { .dirty_bitmap = log, .slot = slot,
-		                            .first_page = first_page,
-	                                    .num_pages = num_pages };
+	struct kvm_clear_dirty_log args = {
+		.dirty_bitmap = log, .slot = slot,
+		.first_page = first_page,
+		.num_pages = num_pages
+	};
 	int ret;
 
 	ret = ioctl(vm->fd, KVM_CLEAR_DIRTY_LOG, &args);
@@ -703,6 +724,27 @@ void kvm_vm_free(struct kvm_vm *vmp)
 	free(vmp);
 }
 
+int kvm_memfd_alloc(size_t size, bool hugepages)
+{
+	int memfd_flags = MFD_CLOEXEC;
+	int fd, r;
+
+	if (hugepages)
+		memfd_flags |= MFD_HUGETLB;
+
+	fd = memfd_create("kvm_selftest", memfd_flags);
+	TEST_ASSERT(fd != -1, "memfd_create() failed, errno: %i (%s)",
+		    errno, strerror(errno));
+
+	r = ftruncate(fd, size);
+	TEST_ASSERT(!r, "ftruncate() failed, errno: %i (%s)", errno, strerror(errno));
+
+	r = fallocate(fd, FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE, 0, size);
+	TEST_ASSERT(!r, "fallocate() failed, errno: %i (%s)", errno, strerror(errno));
+
+	return fd;
+}
+
 /*
  * Memory Compare, host virtual to guest virtual
  *
@@ -824,6 +866,30 @@ static void vm_userspace_mem_region_hva_insert(struct rb_root *hva_tree,
 	rb_insert_color(&region->hva_node, hva_tree);
 }
 
+
+int __vm_set_user_memory_region(struct kvm_vm *vm, uint32_t slot, uint32_t flags,
+				uint64_t gpa, uint64_t size, void *hva)
+{
+	struct kvm_userspace_memory_region region = {
+		.slot = slot,
+		.flags = flags,
+		.guest_phys_addr = gpa,
+		.memory_size = size,
+		.userspace_addr = (uintptr_t)hva,
+	};
+
+	return ioctl(vm->fd, KVM_SET_USER_MEMORY_REGION, &region);
+}
+
+void vm_set_user_memory_region(struct kvm_vm *vm, uint32_t slot, uint32_t flags,
+			       uint64_t gpa, uint64_t size, void *hva)
+{
+	int ret = __vm_set_user_memory_region(vm, slot, flags, gpa, size, hva);
+
+	TEST_ASSERT(!ret, "KVM_SET_USER_MEMORY_REGION failed, errno = %d (%s)",
+		    errno, strerror(errno));
+}
+
 /*
  * VM Userspace Memory Region Add
  *
@@ -915,32 +981,25 @@ void vm_userspace_mem_region_add(struct kvm_vm *vm,
 	alignment = 1;
 #endif
 
+	/*
+	 * When using THP mmap is not guaranteed to returned a hugepage aligned
+	 * address so we have to pad the mmap. Padding is not needed for HugeTLB
+	 * because mmap will always return an address aligned to the HugeTLB
+	 * page size.
+	 */
 	if (src_type == VM_MEM_SRC_ANONYMOUS_THP)
 		alignment = max(backing_src_pagesz, alignment);
+
+	ASSERT_EQ(guest_paddr, align_up(guest_paddr, backing_src_pagesz));
 
 	/* Add enough memory to align up if necessary */
 	if (alignment > 1)
 		region->mmap_size += alignment;
 
 	region->fd = -1;
-	if (backing_src_is_shared(src_type)) {
-		int memfd_flags = MFD_CLOEXEC;
-
-		if (src_type == VM_MEM_SRC_SHARED_HUGETLB)
-			memfd_flags |= MFD_HUGETLB;
-
-		region->fd = memfd_create("kvm_selftest", memfd_flags);
-		TEST_ASSERT(region->fd != -1,
-			    "memfd_create failed, errno: %i", errno);
-
-		ret = ftruncate(region->fd, region->mmap_size);
-		TEST_ASSERT(ret == 0, "ftruncate failed, errno: %i", errno);
-
-		ret = fallocate(region->fd,
-				FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE, 0,
-				region->mmap_size);
-		TEST_ASSERT(ret == 0, "fallocate failed, errno: %i", errno);
-	}
+	if (backing_src_is_shared(src_type))
+		region->fd = kvm_memfd_alloc(region->mmap_size,
+					     src_type == VM_MEM_SRC_SHARED_HUGETLB);
 
 	region->mmap_start = mmap(NULL, region->mmap_size,
 				  PROT_READ | PROT_WRITE,
@@ -950,8 +1009,13 @@ void vm_userspace_mem_region_add(struct kvm_vm *vm,
 		    "test_malloc failed, mmap_start: %p errno: %i",
 		    region->mmap_start, errno);
 
+	TEST_ASSERT(!is_backing_src_hugetlb(src_type) ||
+		    region->mmap_start == align_ptr_up(region->mmap_start, backing_src_pagesz),
+		    "mmap_start %p is not aligned to HugeTLB page size 0x%lx",
+		    region->mmap_start, backing_src_pagesz);
+
 	/* Align host address */
-	region->host_mem = align(region->mmap_start, alignment);
+	region->host_mem = align_ptr_up(region->mmap_start, alignment);
 
 	/* As needed perform madvise */
 	if ((src_type == VM_MEM_SRC_ANONYMOUS ||
@@ -994,7 +1058,7 @@ void vm_userspace_mem_region_add(struct kvm_vm *vm,
 			    "mmap of alias failed, errno: %i", errno);
 
 		/* Align host alias address */
-		region->host_alias = align(region->mmap_alias, alignment);
+		region->host_alias = align_ptr_up(region->mmap_alias, alignment);
 	}
 }
 
@@ -2080,6 +2144,44 @@ int kvm_device_access(int dev_fd, uint32_t group, uint64_t attr,
 	return ret;
 }
 
+int _vcpu_has_device_attr(struct kvm_vm *vm, uint32_t vcpuid, uint32_t group,
+			  uint64_t attr)
+{
+	struct vcpu *vcpu = vcpu_find(vm, vcpuid);
+
+	TEST_ASSERT(vcpu, "nonexistent vcpu id: %d", vcpuid);
+
+	return _kvm_device_check_attr(vcpu->fd, group, attr);
+}
+
+int vcpu_has_device_attr(struct kvm_vm *vm, uint32_t vcpuid, uint32_t group,
+				 uint64_t attr)
+{
+	int ret = _vcpu_has_device_attr(vm, vcpuid, group, attr);
+
+	TEST_ASSERT(!ret, "KVM_HAS_DEVICE_ATTR IOCTL failed, rc: %i errno: %i", ret, errno);
+	return ret;
+}
+
+int _vcpu_access_device_attr(struct kvm_vm *vm, uint32_t vcpuid, uint32_t group,
+			     uint64_t attr, void *val, bool write)
+{
+	struct vcpu *vcpu = vcpu_find(vm, vcpuid);
+
+	TEST_ASSERT(vcpu, "nonexistent vcpu id: %d", vcpuid);
+
+	return _kvm_device_access(vcpu->fd, group, attr, val, write);
+}
+
+int vcpu_access_device_attr(struct kvm_vm *vm, uint32_t vcpuid, uint32_t group,
+			    uint64_t attr, void *val, bool write)
+{
+	int ret = _vcpu_access_device_attr(vm, vcpuid, group, attr, val, write);
+
+	TEST_ASSERT(!ret, "KVM_SET|GET_DEVICE_ATTR IOCTL failed, rc: %i errno: %i", ret, errno);
+	return ret;
+}
+
 /*
  * VM Dump
  *
@@ -2320,6 +2422,11 @@ unsigned int vm_get_page_size(struct kvm_vm *vm)
 unsigned int vm_get_page_shift(struct kvm_vm *vm)
 {
 	return vm->page_shift;
+}
+
+unsigned long __attribute__((weak)) vm_compute_max_gfn(struct kvm_vm *vm)
+{
+	return ((1ULL << vm->pa_bits) >> vm->page_shift) - 1;
 }
 
 uint64_t vm_get_max_gfn(struct kvm_vm *vm)
