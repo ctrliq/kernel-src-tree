@@ -636,17 +636,6 @@ pte_t *lookup_address(unsigned long address, unsigned int *level)
 }
 EXPORT_SYMBOL_GPL(lookup_address);
 
-/*
- * Lookup the page table entry for a virtual address in a given mm. Return a
- * pointer to the entry and the level of the mapping.
- */
-pte_t *lookup_address_in_mm(struct mm_struct *mm, unsigned long address,
-			    unsigned int *level)
-{
-	return lookup_address_in_pgd(pgd_offset(mm, address), address, level);
-}
-EXPORT_SYMBOL_GPL(lookup_address_in_mm);
-
 static pte_t *_lookup_address_cpa(struct cpa_data *cpa, unsigned long address,
 				  unsigned int *level)
 {
@@ -2020,6 +2009,12 @@ static int __set_memory_enc_dec(unsigned long addr, int numpages, bool enc)
 	 * as above.
 	 */
 	cpa_flush(&cpa, 0);
+
+	/*
+	 * Notify hypervisor that a given memory range is mapped encrypted
+	 * or decrypted.
+	 */
+	notify_range_enc_status_changed(addr, numpages, enc);
 
 	return ret;
 }
