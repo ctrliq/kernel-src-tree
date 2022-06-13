@@ -47,7 +47,7 @@
 #include <uapi/linux/if_bonding.h>
 #include <uapi/linux/pkt_cls.h>
 #include <linux/hashtable.h>
-#include <linux/ref_tracker.h>
+#include <net/net_trackers.h>
 
 struct netpoll_info;
 struct device;
@@ -294,13 +294,6 @@ enum netdev_state_t {
 	__LINK_STATE_DORMANT,
 	__LINK_STATE_TESTING,
 };
-
-
-#ifdef CONFIG_NET_DEV_REFCNT_TRACKER
-typedef struct ref_tracker *netdevice_tracker;
-#else
-typedef struct {} netdevice_tracker;
-#endif
 
 /*
  * This structure holds boot-time configured netdevice settings. They
