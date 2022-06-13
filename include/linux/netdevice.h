@@ -1960,6 +1960,8 @@ enum netdev_ml_priv_type {
  *	@unlink_list:	As netif_addr_lock() can be called recursively,
  *			keep a list of interfaces to be deleted.
  *
+ *	@linkwatch_dev_tracker:	refcount tracker used by linkwatch.
+ *
  *	FIXME: cleanup struct net_device such that network protocol info
  *	moves out.
  */
@@ -2282,6 +2284,8 @@ struct net_device {
 
 	/* protected by rtnl_lock */
 	struct bpf_xdp_entity	xdp_state[__MAX_XDP_MODE];
+
+	netdevice_tracker	linkwatch_dev_tracker;
 };
 #define to_net_dev(d) container_of(d, struct net_device, dev)
 
