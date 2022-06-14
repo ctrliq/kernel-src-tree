@@ -1,4 +1,6 @@
 #!/usr/bin/env bats
+# Purpose: This test runs rpmlint on the source rpm.
+
 @test "rpmlint" {
     if ! test -x /usr/bin/rpmlint
     then

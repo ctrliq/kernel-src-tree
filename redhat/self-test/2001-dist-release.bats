@@ -1,4 +1,6 @@
 #!/usr/bin/env bats
+# Purpose: These are general dist-release tests.  They are run from a git
+# worktree created by the first test.
 
 @test "dist-release prologue" {
     git worktree add $BATS_TMPDIR/distrelease

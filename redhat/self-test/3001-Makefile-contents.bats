@@ -1,4 +1,6 @@
 #!/usr/bin/env bats
+# Purpose: This is a test that verifies that Makefile.variable variable
+# declarations are all declared with "?="
 
 @test "Makefile variable declarations" {
 	# By design, only the Makefile.variables file should have ?= declarations

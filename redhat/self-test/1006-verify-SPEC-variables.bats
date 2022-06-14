@@ -1,8 +1,8 @@
 #!/usr/bin/env bats
+# Purpose: This test looks at the spec file variable replacement code in
+# redhat/genspec.sh and confirms that each variable begins with "SPEC".
 
 @test "verify SPEC variables" {
-# This test looks at the spec file variable replacement code in
-# redhat/genspec.sh and confirms that each variable begins with "SPEC".
 
 # This looks at the code and replaces each / with a new-line character, removes
 # any whitespace and entry entries beginning with valid "%%SPEC" or $"SPEC".

@@ -1,4 +1,6 @@
 #!/usr/bin/env bats
+# Purpose: This test runs rpminspect on the SRPM.
+
 @test "rpminspect" {
     if ! test -x /usr/bin/rpminspect
     then
