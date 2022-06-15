@@ -1,6 +1,12 @@
 #!/usr/bin/env bats
 # Purpose: This test runs tests on the SRPM.
 
+load test-lib.bash
+
+_SRPM_unpacks_OK() {
+	rpm2cpio "$srpm" | cpio -idm
+}
+
 @test "SRPM unpacks OK" {
 	numsrpms=$(find "$BATS_TEST_DIRNAME"/.. -name "*.rpm" | wc -l)
 	if [ "$numsrpms" != "1" ]; then
@@ -14,9 +20,8 @@
 	fi
 	mkdir SRPMS
 	cd SRPMS
-	rpm2cpio "$srpm" | cpio -idm
-	status=$?
-	[ "$status" = 0 ]
+	run _SRPM_unpacks_OK
+	check_status
 	popd >& /dev/null
 }
 
@@ -30,7 +35,7 @@ numsrpms=$(find "$BATS_TEST_DIRNAME"/.. -name "*.rpm" | wc -l)
 	ls | wc
 	linuxname=$(ls linux*.tar.xz)
 	run tar --extract --xz -f "$linuxname"
-	[ "$status" = 0 ]
+	check_status
 	popd >& /dev/null
 }
 
@@ -44,7 +49,7 @@ numsrpms=$(find "$BATS_TEST_DIRNAME"/.. -name "*.rpm" | wc -l)
 	linuxtree=$(ls linux*.tar.xz)
 	linuxtree=${linuxtree/.tar.xz}
 	cd $linuxtree
-	test -d arch	&& \
+	run test -d arch	&& \
 	test -d block	&& \
 	test -d certs	&& \
 	test -d crypto	&& \
@@ -66,7 +71,6 @@ numsrpms=$(find "$BATS_TEST_DIRNAME"/.. -name "*.rpm" | wc -l)
 	test -d tools	&& \
 	test -d usr		&& \
 	test -d virt
-	status=$?
+	check_status
 	popd >& /dev/null
-	[ "$status" = 0 ]
 }

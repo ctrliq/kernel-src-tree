@@ -2,7 +2,9 @@
 # Purpose: These are general dist-release tests.  They are run from a git
 # worktree created by the first test.
 
-@test "dist-release prologue" {
+load test-lib.bash
+
+@test "dist-release setup worktree" {
 	git worktree add $BATS_TMPDIR/distrelease
 	cd $BATS_TMPDIR/distrelease
 	# All the tests start off with 'make dist-release', so we can pull
@@ -21,7 +23,12 @@
 	logb=($(git log --oneline -n 2 | tail -1))
 	# If SHA1 in loga is the same as the SHA1 in logb, then no
 	# 2nd commit has been created and the test has succeeded:
-	[ ${loga[0]} = ${logb[0]} ]
+	run [ ${loga[0]} = ${logb[0]} ]
+	check_status
+}
+
+_dist-release_test_2() {
+    echo $pkgrelease | grep -q -w "$build"
 }
 
 @test "dist-release test 2" {
@@ -39,11 +46,17 @@
 	((build--))
 	echo "pkgrelease=$pkgrelease"
 	echo "build=$build"
-	echo $pkgrelease | grep -q -w "$build"
-	status=$?
-	[ "$status" = 0 ]
+	run _dist-release_test_2
+	check_status
 }
 
+_dist-release_test_3() {
+	[ "$changelog" = "$gitlog" ]
+}
+
+# Note, when running this test on the command line you may have to specifiy the
+# RHEL_MAJOR and RHEL_MINOR variables, for example,
+#	RHEL_MAJOR=9 RHEL_MINOR=99 bats redhat/self-test/2001-dist-release.bats
 @test "dist-release test 3" {
 	# Test whether the version in the commit message matches
 	# the version in the change log.
@@ -56,11 +69,12 @@
 	gitlog=${commit##*\[redhat\] }
 	# This time, strip off "kernel-" also:
 	gitlog=${gitlog/kernel-/}
-	echo "The kernel version in the changelog ($changelog) differs from the version in the git log ($gitlog)"
-	[ "$changelog" = "$gitlog" ]
+	echo "The kernel version in the changelog-${RHEL_MAJOR}.${RHEL_MINOR} ("${changelog}") differs from the version in the git log ($gitlog)"
+	run _dist-release_test_3
+	check_status
 }
 
-@test "dist-release epilogue" {
+@test "dist-release cleanup worktree" {
 	git worktree remove --force $BATS_TMPDIR/distrelease
 	git branch -D distrelease
 }

@@ -2,18 +2,28 @@
 # Purpose: This is a test that verifies that Makefile.variable variable
 # declarations are all declared with "?="
 
+load test-lib.bash
+
+_Makefile_variable_declarations_1() {
+	git grep "?=" $BATS_TEST_DIRNAME/../Makefile.variables | wc -l
+}
+
+_Makefile_variable_declarations_2() {
+	git grep "?=" $BATS_TEST_DIRNAME/../Makefile | grep -v "\"?=" | wc -l
+}
+
 @test "Makefile variable declarations" {
-	# By design, only the Makefile.variables file should have ?= declarations
-
-	value=$(git grep "?=" Makefile.variables | wc -l)
-	if [ $value -eq 0 ]; then
+	run _Makefile_variable_declarations_1
+	if [ "$output" -eq 0 ]; then
 		echo "Test failed: No ?= variables found in Makefile.variables"
-		exit 1
+		status=1
 	fi
+	check_status
 
-	value=$(git grep "?=" Makefile | grep -v "\"?=" | wc -l)
-	if [ $value -gt 0 ]; then
+	run _Makefile_variable_declarations_2
+	if [ "$output" -ne 0 ]; then
 		echo "Test failed: Makefile should not ?= declarations."
-		exit 1
+		status=1
 	fi
+	check_status
 }

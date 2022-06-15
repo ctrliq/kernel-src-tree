@@ -2,8 +2,9 @@
 # Purpose: This test looks at the spec file variable replacement code in
 # redhat/genspec.sh and confirms that each variable begins with "SPEC".
 
-@test "verify SPEC variables" {
+load test-lib.bash
 
+_verify_SPEC_variables() {
 # This looks at the code and replaces each / with a new-line character, removes
 # any whitespace and entry entries beginning with valid "%%SPEC" or $"SPEC".
 # "$SOURCES" lines are also okay as it is used to point to the changelog and
@@ -22,4 +23,9 @@ do
 		;;
 	esac
 done
+}
+
+@test "verify SPEC variables" {
+	run _verify_SPEC_variables
+	check_status
 }
