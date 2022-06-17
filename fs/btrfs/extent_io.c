@@ -3124,7 +3124,7 @@ struct bio *btrfs_bio_alloc(u64 first_byte)
 {
 	struct bio *bio;
 
-	bio = bio_alloc_bioset(GFP_NOFS, BIO_MAX_VECS, &btrfs_bioset);
+	bio = bio_alloc_bioset(NULL, BIO_MAX_VECS, 0, GFP_NOFS, &btrfs_bioset);
 	bio->bi_iter.bi_sector = first_byte >> 9;
 	btrfs_io_bio_init(btrfs_io_bio(bio));
 	return bio;
