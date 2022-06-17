@@ -67,15 +67,6 @@
 #define upper_32_bits(n) ((u32)(((n) >> 16) >> 16))
 
 /**
- * lower_48_bits() - return bits 0-47 of a number
- * @n: the number we're accessing
- */
-static inline u64 lower_48_bits(u64 n)
-{
-	return n & ((1ull << 48) - 1);
-}
-
-/**
  * lower_32_bits - return bits 0-31 of a number
  * @n: the number we're accessing
  */
