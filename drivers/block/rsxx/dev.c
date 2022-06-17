@@ -15,7 +15,6 @@
 #include <linux/slab.h>
 
 #include <linux/hdreg.h>
-#include <linux/genhd.h>
 #include <linux/blkdev.h>
 #include <linux/bio.h>
 
