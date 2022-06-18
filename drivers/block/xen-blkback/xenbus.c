@@ -483,7 +483,6 @@ static int xen_vbd_create(struct xen_blkif *blkif, blkif_vdev_t handle,
 {
 	struct xen_vbd *vbd;
 	struct block_device *bdev;
-	struct request_queue *q;
 
 	vbd = &blkif->vbd;
 	vbd->handle   = handle;
@@ -515,11 +514,9 @@ static int xen_vbd_create(struct xen_blkif *blkif, blkif_vdev_t handle,
 	if (vbd->bdev->bd_disk->flags & GENHD_FL_REMOVABLE)
 		vbd->type |= VDISK_REMOVABLE;
 
-	q = bdev_get_queue(bdev);
 	if (bdev_write_cache(bdev))
 		vbd->flush_support = true;
-
-	if (q && blk_queue_secure_erase(q))
+	if (bdev_max_secure_erase_sectors(bdev))
 		vbd->discard_secure = true;
 
 	vbd->feature_gnt_persistent = feature_persistent;
