@@ -259,7 +259,6 @@ int rsxx_setup_dev(struct rsxx_cardinfo *card)
 	blk_queue_flag_set(QUEUE_FLAG_NONROT, card->gendisk->queue);
 	blk_queue_flag_clear(QUEUE_FLAG_ADD_RANDOM, card->gendisk->queue);
 	if (rsxx_discard_supported(card)) {
-		blk_queue_flag_set(QUEUE_FLAG_DISCARD, card->gendisk->queue);
 		blk_queue_max_discard_sectors(card->gendisk->queue,
 						RSXX_HW_BLK_SIZE >> 9);
 		card->gendisk->queue->limits.discard_granularity =
