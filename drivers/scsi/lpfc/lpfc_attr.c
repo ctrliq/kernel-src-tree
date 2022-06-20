@@ -1,7 +1,7 @@
 /*******************************************************************
  * This file is part of the Emulex Linux Device Driver for         *
  * Fibre Channel Host Bus Adapters.                                *
- * Copyright (C) 2017-2021 Broadcom. All Rights Reserved. The term *
+ * Copyright (C) 2017-2022 Broadcom. All Rights Reserved. The term *
  * “Broadcom” refers to Broadcom Inc. and/or its subsidiaries.  *
  * Copyright (C) 2004-2016 Emulex.  All rights reserved.           *
  * EMULEX and SLI are trademarks of Emulex.                        *
@@ -3981,8 +3981,8 @@ LPFC_ATTR_R(nvmet_mrq_post,
  *                    3 - register both FCP and NVME
  * Supported values are [1,3]. Default value is 3
  */
-LPFC_ATTR_R(enable_fc4_type, LPFC_ENABLE_BOTH,
-	    LPFC_ENABLE_FCP, LPFC_ENABLE_BOTH,
+LPFC_ATTR_R(enable_fc4_type, LPFC_DEF_ENBL_FC4_TYPE,
+	    LPFC_ENABLE_FCP, LPFC_MAX_ENBL_FC4_TYPE,
 	    "Enable FC4 Protocol support - FCP / NVME");
 
 /*
@@ -7086,17 +7086,34 @@ lpfc_get_stats(struct Scsi_Host *shost)
 	memset(hs, 0, sizeof (struct fc_host_statistics));
 
 	hs->tx_frames = pmb->un.varRdStatus.xmitFrameCnt;
-	/*
-	 * The MBX_READ_STATUS returns tx_k_bytes which has to
-	 * converted to words
-	 */
-	hs->tx_words = (uint64_t)
-			((uint64_t)pmb->un.varRdStatus.xmitByteCnt
-			* (uint64_t)256);
 	hs->rx_frames = pmb->un.varRdStatus.rcvFrameCnt;
-	hs->rx_words = (uint64_t)
-			((uint64_t)pmb->un.varRdStatus.rcvByteCnt
-			 * (uint64_t)256);
+
+	/*
+	 * The MBX_READ_STATUS returns tx_k_bytes which has to be
+	 * converted to words.
+	 *
+	 * Check if extended byte flag is set, to know when to collect upper
+	 * bits of 64 bit wide statistics counter.
+	 */
+	if (pmb->un.varRdStatus.xkb & RD_ST_XKB) {
+		hs->tx_words = (u64)
+			       ((((u64)(pmb->un.varRdStatus.xmit_xkb &
+					RD_ST_XMIT_XKB_MASK) << 32) |
+				(u64)pmb->un.varRdStatus.xmitByteCnt) *
+				(u64)256);
+		hs->rx_words = (u64)
+			       ((((u64)(pmb->un.varRdStatus.rcv_xkb &
+					RD_ST_RCV_XKB_MASK) << 32) |
+				(u64)pmb->un.varRdStatus.rcvByteCnt) *
+				(u64)256);
+	} else {
+		hs->tx_words = (uint64_t)
+				((uint64_t)pmb->un.varRdStatus.xmitByteCnt
+				* (uint64_t)256);
+		hs->rx_words = (uint64_t)
+				((uint64_t)pmb->un.varRdStatus.rcvByteCnt
+				 * (uint64_t)256);
+	}
 
 	memset(pmboxq, 0, sizeof (LPFC_MBOXQ_t));
 	pmb->mbxCommand = MBX_READ_LNK_STAT;
