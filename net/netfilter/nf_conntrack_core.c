@@ -37,7 +37,6 @@
 #include <net/netfilter/nf_conntrack_l4proto.h>
 #include <net/netfilter/nf_conntrack_expect.h>
 #include <net/netfilter/nf_conntrack_helper.h>
-#include <net/netfilter/nf_conntrack_seqadj.h>
 #include <net/netfilter/nf_conntrack_core.h>
 #include <net/netfilter/nf_conntrack_extend.h>
 #include <net/netfilter/nf_conntrack_acct.h>
@@ -558,7 +557,7 @@ static void nf_ct_del_from_dying_or_unconfirmed_list(struct nf_conn *ct)
 
 #define NFCT_ALIGN(len)	(((len) + NFCT_INFOMASK) & ~NFCT_INFOMASK)
 
-/* Released via destroy_conntrack() */
+/* Released via nf_ct_destroy() */
 struct nf_conn *nf_ct_tmpl_alloc(struct net *net,
 				 const struct nf_conntrack_zone *zone,
 				 gfp_t flags)
@@ -585,7 +584,7 @@ struct nf_conn *nf_ct_tmpl_alloc(struct net *net,
 	tmpl->status = IPS_TEMPLATE;
 	write_pnet(&tmpl->ct_net, net);
 	nf_ct_zone_add(tmpl, zone);
-	atomic_set(&tmpl->ct_general.use, 0);
+	refcount_set(&tmpl->ct_general.use, 1);
 
 	return tmpl;
 }
@@ -593,7 +592,7 @@ EXPORT_SYMBOL_GPL(nf_ct_tmpl_alloc);
 
 void nf_ct_tmpl_free(struct nf_conn *tmpl)
 {
-	nf_ct_ext_destroy(tmpl);
+	kfree(tmpl->ext);
 
 	if (ARCH_KMALLOC_MINALIGN <= NFCT_INFOMASK)
 		kfree((char *)tmpl - tmpl->proto.tmpl_padto);
@@ -612,13 +611,12 @@ static void destroy_gre_conntrack(struct nf_conn *ct)
 #endif
 }
 
-static void
-destroy_conntrack(struct nf_conntrack *nfct)
+void nf_ct_destroy(struct nf_conntrack *nfct)
 {
 	struct nf_conn *ct = (struct nf_conn *)nfct;
 
-	pr_debug("destroy_conntrack(%p)\n", ct);
-	WARN_ON(atomic_read(&nfct->use) != 0);
+	pr_debug("%s(%p)\n", __func__, ct);
+	WARN_ON(refcount_read(&nfct->use) != 0);
 
 	if (unlikely(nf_ct_is_template(ct))) {
 		nf_ct_tmpl_free(ct);
@@ -643,9 +641,10 @@ destroy_conntrack(struct nf_conntrack *nfct)
 	if (ct->master)
 		nf_ct_put(ct->master);
 
-	pr_debug("destroy_conntrack: returning ct=%p to slab\n", ct);
+	pr_debug("%s: returning ct=%p to slab\n", __func__, ct);
 	nf_conntrack_free(ct);
 }
+EXPORT_SYMBOL(nf_ct_destroy);
 
 static void nf_ct_delete_from_lists(struct nf_conn *ct)
 {
@@ -742,7 +741,7 @@ nf_ct_match(const struct nf_conn *ct1, const struct nf_conn *ct2)
 /* caller must hold rcu readlock and none of the nf_conntrack_locks */
 static void nf_ct_gc_expired(struct nf_conn *ct)
 {
-	if (!atomic_inc_not_zero(&ct->ct_general.use))
+	if (!refcount_inc_not_zero(&ct->ct_general.use))
 		return;
 
 	if (nf_ct_should_gc(ct))
@@ -810,7 +809,7 @@ __nf_conntrack_find_get(struct net *net, const struct nf_conntrack_zone *zone,
 		 * in, try to obtain a reference and re-check tuple
 		 */
 		ct = nf_ct_tuplehash_to_ctrack(h);
-		if (likely(atomic_inc_not_zero(&ct->ct_general.use))) {
+		if (likely(refcount_inc_not_zero(&ct->ct_general.use))) {
 			if (likely(nf_ct_key_equal(h, tuple, zone, net)))
 				goto found;
 
@@ -907,7 +906,7 @@ nf_conntrack_hash_check_insert(struct nf_conn *ct)
 
 	smp_wmb();
 	/* The caller holds a reference to this object */
-	atomic_set(&ct->ct_general.use, 2);
+	refcount_set(&ct->ct_general.use, 2);
 	__nf_conntrack_hash_insert(ct, hash, reply_hash);
 	nf_conntrack_double_unlock(hash, reply_hash);
 	NF_CT_STAT_INC(net, insert);
@@ -958,7 +957,7 @@ static void __nf_conntrack_insert_prepare(struct nf_conn *ct)
 {
 	struct nf_conn_tstamp *tstamp;
 
-	atomic_inc(&ct->ct_general.use);
+	refcount_inc(&ct->ct_general.use);
 	ct->status |= IPS_CONFIRMED;
 
 	/* set conntrack timestamp, if enabled. */
@@ -989,7 +988,7 @@ static int __nf_ct_resolve_clash(struct sk_buff *skb,
 
 		nf_ct_acct_merge(ct, ctinfo, loser_ct);
 		nf_ct_add_to_dying_list(loser_ct);
-		nf_conntrack_put(&loser_ct->ct_general);
+		nf_ct_put(loser_ct);
 		nf_ct_set(skb, ct, ctinfo);
 
 		NF_CT_STAT_INC(net, clash_resolve);
@@ -1351,7 +1350,7 @@ static unsigned int early_drop_list(struct net *net,
 		    nf_ct_is_dying(tmp))
 			continue;
 
-		if (!atomic_inc_not_zero(&tmp->ct_general.use))
+		if (!refcount_inc_not_zero(&tmp->ct_general.use))
 			continue;
 
 		/* kill only if still in same netns -- might have moved due to
@@ -1469,7 +1468,7 @@ static void gc_worker(struct work_struct *work)
 				continue;
 
 			/* need to take reference to avoid possible races */
-			if (!atomic_inc_not_zero(&tmp->ct_general.use))
+			if (!refcount_inc_not_zero(&tmp->ct_general.use))
 				continue;
 
 			if (gc_worker_skip_ct(tmp)) {
@@ -1571,7 +1570,7 @@ __nf_conntrack_alloc(struct net *net,
 	/* Because we use RCU lookups, we set ct_general.use to zero before
 	 * this is inserted in any list.
 	 */
-	atomic_set(&ct->ct_general.use, 0);
+	refcount_set(&ct->ct_general.use, 0);
 	return ct;
 out:
 	atomic_dec(&cnet->count);
@@ -1596,9 +1595,19 @@ void nf_conntrack_free(struct nf_conn *ct)
 	/* A freed object has refcnt == 0, that's
 	 * the golden rule for SLAB_TYPESAFE_BY_RCU
 	 */
-	WARN_ON(atomic_read(&ct->ct_general.use) != 0);
+	WARN_ON(refcount_read(&ct->ct_general.use) != 0);
 
-	nf_ct_ext_destroy(ct);
+	if (ct->status & IPS_SRC_NAT_DONE) {
+		const struct nf_nat_hook *nat_hook;
+
+		rcu_read_lock();
+		nat_hook = rcu_dereference(nf_nat_hook);
+		if (nat_hook)
+			nat_hook->remove_nat_bysrc(ct);
+		rcu_read_unlock();
+	}
+
+	kfree(ct->ext);
 	kmem_cache_free(nf_conntrack_cachep, ct);
 	cnet = nf_ct_pernet(net);
 
@@ -1688,8 +1697,8 @@ init_conntrack(struct net *net, struct nf_conn *tmpl,
 	if (!exp)
 		__nf_ct_try_assign_helper(ct, tmpl, GFP_ATOMIC);
 
-	/* Now it is inserted into the unconfirmed list, bump refcount */
-	nf_conntrack_get(&ct->ct_general);
+	/* Now it is inserted into the unconfirmed list, set refcount to 1. */
+	refcount_set(&ct->ct_general.use, 1);
 	nf_ct_add_to_unconfirmed_list(ct);
 
 	local_bh_enable();
@@ -1920,7 +1929,7 @@ repeat:
 		/* Invalid: inverse of the return code tells
 		 * the netfilter core what to do */
 		pr_debug("nf_conntrack_in: Can't track with proto module\n");
-		nf_conntrack_put(&ct->ct_general);
+		nf_ct_put(ct);
 		skb->_nfct = 0;
 		/* Special case: TCP tracker reports an attempt to reopen a
 		 * closed/aborted connection. We have to go back and create a
@@ -2086,9 +2095,9 @@ static int __nf_conntrack_update(struct net *net, struct sk_buff *skb,
 				 struct nf_conn *ct,
 				 enum ip_conntrack_info ctinfo)
 {
+	const struct nf_nat_hook *nat_hook;
 	struct nf_conntrack_tuple_hash *h;
 	struct nf_conntrack_tuple tuple;
-	struct nf_nat_hook *nat_hook;
 	unsigned int status;
 	int dataoff;
 	u16 l3num;
@@ -2301,7 +2310,7 @@ get_next_corpse(int (*iter)(struct nf_conn *i, void *data),
 
 	return NULL;
 found:
-	atomic_inc(&ct->ct_general.use);
+	refcount_inc(&ct->ct_general.use);
 	spin_unlock(lockp);
 	local_bh_enable();
 	return ct;
@@ -2456,7 +2465,6 @@ static int kill_all(struct nf_conn *i, void *data)
 void nf_conntrack_cleanup_start(void)
 {
 	conntrack_gc_work.exiting = true;
-	RCU_INIT_POINTER(ip_ct_attach, NULL);
 }
 
 void nf_conntrack_cleanup_end(void)
@@ -2466,13 +2474,7 @@ void nf_conntrack_cleanup_end(void)
 	kvfree(nf_conntrack_hash);
 
 	nf_conntrack_proto_fini();
-	nf_conntrack_seqadj_fini();
-	nf_conntrack_labels_fini();
 	nf_conntrack_helper_fini();
-	nf_conntrack_timeout_fini();
-	nf_conntrack_ecache_fini();
-	nf_conntrack_tstamp_fini();
-	nf_conntrack_acct_fini();
 	nf_conntrack_expect_fini();
 
 	kmem_cache_destroy(nf_conntrack_cachep);
@@ -2628,45 +2630,12 @@ int nf_conntrack_set_hashsize(const char *val, const struct kernel_param *kp)
 	return nf_conntrack_hash_resize(hashsize);
 }
 
-static __always_inline unsigned int total_extension_size(void)
-{
-	/* remember to add new extensions below */
-	BUILD_BUG_ON(NF_CT_EXT_NUM > 9);
-
-	return sizeof(struct nf_ct_ext) +
-	       sizeof(struct nf_conn_help)
-#if IS_ENABLED(CONFIG_NF_NAT)
-		+ sizeof(struct nf_conn_nat)
-#endif
-		+ sizeof(struct nf_conn_seqadj)
-		+ sizeof(struct nf_conn_acct)
-#ifdef CONFIG_NF_CONNTRACK_EVENTS
-		+ sizeof(struct nf_conntrack_ecache)
-#endif
-#ifdef CONFIG_NF_CONNTRACK_TIMESTAMP
-		+ sizeof(struct nf_conn_tstamp)
-#endif
-#ifdef CONFIG_NF_CONNTRACK_TIMEOUT
-		+ sizeof(struct nf_conn_timeout)
-#endif
-#ifdef CONFIG_NF_CONNTRACK_LABELS
-		+ sizeof(struct nf_conn_labels)
-#endif
-#if IS_ENABLED(CONFIG_NETFILTER_SYNPROXY)
-		+ sizeof(struct nf_conn_synproxy)
-#endif
-	;
-};
-
 int nf_conntrack_init_start(void)
 {
 	unsigned long nr_pages = totalram_pages();
 	int max_factor = 8;
 	int ret = -ENOMEM;
 	int i;
-
-	/* struct nf_ct_ext uses u8 to store offsets/size */
-	BUILD_BUG_ON(total_extension_size() > 255u);
 
 	seqcount_spinlock_init(&nf_conntrack_generation,
 			       &nf_conntrack_locks_all_lock);
@@ -2712,33 +2681,9 @@ int nf_conntrack_init_start(void)
 	if (ret < 0)
 		goto err_expect;
 
-	ret = nf_conntrack_acct_init();
-	if (ret < 0)
-		goto err_acct;
-
-	ret = nf_conntrack_tstamp_init();
-	if (ret < 0)
-		goto err_tstamp;
-
-	ret = nf_conntrack_ecache_init();
-	if (ret < 0)
-		goto err_ecache;
-
-	ret = nf_conntrack_timeout_init();
-	if (ret < 0)
-		goto err_timeout;
-
 	ret = nf_conntrack_helper_init();
 	if (ret < 0)
 		goto err_helper;
-
-	ret = nf_conntrack_labels_init();
-	if (ret < 0)
-		goto err_labels;
-
-	ret = nf_conntrack_seqadj_init();
-	if (ret < 0)
-		goto err_seqadj;
 
 	ret = nf_conntrack_proto_init();
 	if (ret < 0)
@@ -2750,20 +2695,8 @@ int nf_conntrack_init_start(void)
 	return 0;
 
 err_proto:
-	nf_conntrack_seqadj_fini();
-err_seqadj:
-	nf_conntrack_labels_fini();
-err_labels:
 	nf_conntrack_helper_fini();
 err_helper:
-	nf_conntrack_timeout_fini();
-err_timeout:
-	nf_conntrack_ecache_fini();
-err_ecache:
-	nf_conntrack_tstamp_fini();
-err_tstamp:
-	nf_conntrack_acct_fini();
-err_acct:
 	nf_conntrack_expect_fini();
 err_expect:
 	kmem_cache_destroy(nf_conntrack_cachep);
@@ -2772,16 +2705,15 @@ err_cachep:
 	return ret;
 }
 
-static struct nf_ct_hook nf_conntrack_hook = {
+static const struct nf_ct_hook nf_conntrack_hook = {
 	.update		= nf_conntrack_update,
-	.destroy	= destroy_conntrack,
+	.destroy	= nf_ct_destroy,
 	.get_tuple_skb  = nf_conntrack_get_tuple_skb,
+	.attach		= nf_conntrack_attach,
 };
 
 void nf_conntrack_init_end(void)
 {
-	/* For use by REJECT target */
-	RCU_INIT_POINTER(ip_ct_attach, nf_conntrack_attach);
 	RCU_INIT_POINTER(nf_ct_hook, &nf_conntrack_hook);
 }
 
