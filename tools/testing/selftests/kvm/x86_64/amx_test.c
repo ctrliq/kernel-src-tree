@@ -29,7 +29,6 @@
 #define X86_FEATURE_XSAVE		(1 << 26)
 #define X86_FEATURE_OSXSAVE		(1 << 27)
 
-#define PAGE_SIZE			(1 << 12)
 #define NUM_TILES			8
 #define TILE_SIZE			1024
 #define XSAVE_SIZE			((NUM_TILES * TILE_SIZE) + PAGE_SIZE)
@@ -328,6 +327,8 @@ int main(int argc, char *argv[])
 	struct ucall uc;
 	u32 amx_offset;
 	int stage, ret;
+
+	vm_xsave_req_perm(XSTATE_XTILE_DATA_BIT);
 
 	/* Create VM */
 	vm = vm_create_default(VCPU_ID, 0, guest_code);
