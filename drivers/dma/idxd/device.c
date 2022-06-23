@@ -715,13 +715,13 @@ static void idxd_device_wqs_clear_state(struct idxd_device *idxd)
 	for (i = 0; i < idxd->max_wqs; i++) {
 		struct idxd_wq *wq = idxd->wqs[i];
 
+		mutex_lock(&wq->wq_lock);
 		if (wq->state == IDXD_WQ_ENABLED) {
-			mutex_lock(&wq->wq_lock);
 			idxd_wq_disable_cleanup(wq);
 			wq->state = IDXD_WQ_DISABLED;
-			mutex_unlock(&wq->wq_lock);
 		}
 		idxd_wq_device_reset_cleanup(wq);
+		mutex_unlock(&wq->wq_lock);
 	}
 }
 
