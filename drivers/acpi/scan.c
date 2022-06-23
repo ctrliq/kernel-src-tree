@@ -826,6 +826,12 @@ static const char * const acpi_ignore_dep_ids[] = {
 	NULL
 };
 
+/* List of HIDs for which we honor deps of matching ACPI devs, when checking _DEP lists. */
+static const char * const acpi_honor_dep_ids[] = {
+	"INT3472", /* Camera sensor PMIC / clk and regulator info */
+	NULL
+};
+
 static struct acpi_device *acpi_bus_get_parent(acpi_handle handle)
 {
 	struct acpi_device *device;
@@ -1726,6 +1732,7 @@ static bool acpi_device_enumeration_by_parent(struct acpi_device *device)
 {
 	struct list_head resource_list;
 	bool is_serial_bus_slave = false;
+	static const struct acpi_device_id ignore_serial_bus_ids[] = {
 	/*
 	 * These devices have multiple I2cSerialBus resources and an i2c-client
 	 * must be instantiated for each, each with its own i2c_device_id.
@@ -1734,11 +1741,18 @@ static bool acpi_device_enumeration_by_parent(struct acpi_device *device)
 	 * drivers/platform/x86/i2c-multi-instantiate.c driver, which knows
 	 * which i2c_device_id to use for each resource.
 	 */
-	static const struct acpi_device_id i2c_multi_instantiate_ids[] = {
 		{"BSG1160", },
 		{"BSG2150", },
 		{"INT33FE", },
 		{"INT3515", },
+	/*
+	 * HIDs of device with an UartSerialBusV2 resource for which userspace
+	 * expects a regular tty cdev to be created (instead of the in kernel
+	 * serdev) and which have a kernel driver which expects a platform_dev
+	 * such as the rfkill-gpio driver.
+	 */
+		{"BCM4752", },
+		{"LNV4752", },
 		{}
 	};
 
@@ -1752,8 +1766,7 @@ static bool acpi_device_enumeration_by_parent(struct acpi_device *device)
 	     fwnode_property_present(&device->fwnode, "baud")))
 		return true;
 
-	/* Instantiate a pdev for the i2c-multi-instantiate drv to bind to */
-	if (!acpi_match_device_ids(device, i2c_multi_instantiate_ids))
+	if (!acpi_match_device_ids(device, ignore_serial_bus_ids))
 		return false;
 
 	/*
@@ -1802,8 +1815,12 @@ static void acpi_scan_dep_init(struct acpi_device *adev)
 	struct acpi_dep_data *dep;
 
 	list_for_each_entry(dep, &acpi_dep_list, node) {
-		if (dep->consumer == adev->handle)
+		if (dep->consumer == adev->handle) {
+			if (dep->honor_dep)
+				adev->flags.honor_deps = 1;
+
 			adev->dep_unmet++;
+		}
 	}
 }
 
@@ -2007,7 +2024,7 @@ static u32 acpi_scan_check_dep(acpi_handle handle, bool check_dep)
 	for (count = 0, i = 0; i < dep_devices.count; i++) {
 		struct acpi_device_info *info;
 		struct acpi_dep_data *dep;
-		bool skip;
+		bool skip, honor_dep;
 
 		status = acpi_get_object_info(dep_devices.handles[i], &info);
 		if (ACPI_FAILURE(status)) {
@@ -2016,6 +2033,7 @@ static u32 acpi_scan_check_dep(acpi_handle handle, bool check_dep)
 		}
 
 		skip = acpi_info_matches_ids(info, acpi_ignore_dep_ids);
+		honor_dep = acpi_info_matches_ids(info, acpi_honor_dep_ids);
 		kfree(info);
 
 		if (skip)
@@ -2029,6 +2047,7 @@ static u32 acpi_scan_check_dep(acpi_handle handle, bool check_dep)
 
 		dep->supplier = dep_devices.handles[i];
 		dep->consumer = handle;
+		dep->honor_dep = honor_dep;
 
 		mutex_lock(&acpi_dep_list_lock);
 		list_add_tail(&dep->node , &acpi_dep_list);
@@ -2194,8 +2213,8 @@ static void acpi_bus_attach(struct acpi_device *device, bool first_pass)
 		register_dock_dependent_device(device, ejd);
 
 	acpi_bus_get_status(device);
-	/* Skip devices that are not present. */
-	if (!acpi_device_is_present(device)) {
+	/* Skip devices that are not ready for enumeration (e.g. not present) */
+	if (!acpi_dev_ready_for_enumeration(device)) {
 		device->flags.initialized = false;
 		acpi_device_clear_enumerated(device);
 		device->flags.power_manageable = 0;
@@ -2358,6 +2377,23 @@ void acpi_dev_clear_dependencies(struct acpi_device *supplier)
 EXPORT_SYMBOL_GPL(acpi_dev_clear_dependencies);
 
 /**
+ * acpi_dev_ready_for_enumeration - Check if the ACPI device is ready for enumeration
+ * @device: Pointer to the &struct acpi_device to check
+ *
+ * Check if the device is present and has no unmet dependencies.
+ *
+ * Return true if the device is ready for enumeratino. Otherwise, return false.
+ */
+bool acpi_dev_ready_for_enumeration(const struct acpi_device *device)
+{
+	if (device->flags.honor_deps && device->dep_unmet)
+		return false;
+
+	return acpi_device_is_present(device);
+}
+EXPORT_SYMBOL_GPL(acpi_dev_ready_for_enumeration);
+
+/**
  * acpi_dev_get_first_consumer_dev - Return ACPI device dependent on @supplier
  * @supplier: Pointer to the dependee device
  *
@@ -2475,42 +2511,33 @@ int acpi_bus_register_early_device(int type)
 }
 EXPORT_SYMBOL_GPL(acpi_bus_register_early_device);
 
-static int acpi_bus_scan_fixed(void)
+static void acpi_bus_scan_fixed(void)
 {
-	int result = 0;
-
-	/*
-	 * Enumerate all fixed-feature devices.
-	 */
 	if (!(acpi_gbl_FADT.flags & ACPI_FADT_POWER_BUTTON)) {
-		struct acpi_device *device = NULL;
+		struct acpi_device *adev = NULL;
 
-		result = acpi_add_single_object(&device, NULL,
-						ACPI_BUS_TYPE_POWER_BUTTON, false);
-		if (result)
-			return result;
-
-		device->flags.match_driver = true;
-		result = device_attach(&device->dev);
-		if (result < 0)
-			return result;
-
-		device_init_wakeup(&device->dev, true);
+		acpi_add_single_object(&adev, NULL, ACPI_BUS_TYPE_POWER_BUTTON,
+				       false);
+		if (adev) {
+			adev->flags.match_driver = true;
+			if (device_attach(&adev->dev) >= 0)
+				device_init_wakeup(&adev->dev, true);
+			else
+				dev_dbg(&adev->dev, "No driver\n");
+		}
 	}
 
 	if (!(acpi_gbl_FADT.flags & ACPI_FADT_SLEEP_BUTTON)) {
-		struct acpi_device *device = NULL;
+		struct acpi_device *adev = NULL;
 
-		result = acpi_add_single_object(&device, NULL,
-						ACPI_BUS_TYPE_SLEEP_BUTTON, false);
-		if (result)
-			return result;
-
-		device->flags.match_driver = true;
-		result = device_attach(&device->dev);
+		acpi_add_single_object(&adev, NULL, ACPI_BUS_TYPE_SLEEP_BUTTON,
+				       false);
+		if (adev) {
+			adev->flags.match_driver = true;
+			if (device_attach(&adev->dev) < 0)
+				dev_dbg(&adev->dev, "No driver\n");
+		}
 	}
-
-	return result < 0 ? result : 0;
 }
 
 static void __init acpi_get_spcr_uart_addr(void)
@@ -2531,9 +2558,8 @@ static void __init acpi_get_spcr_uart_addr(void)
 
 static bool acpi_scan_initialized;
 
-int __init acpi_scan_init(void)
+void __init acpi_scan_init(void)
 {
-	int result;
 	acpi_status status;
 	struct acpi_table_stao *stao_ptr;
 
@@ -2583,33 +2609,23 @@ int __init acpi_scan_init(void)
 	/*
 	 * Enumerate devices in the ACPI namespace.
 	 */
-	result = acpi_bus_scan(ACPI_ROOT_OBJECT);
-	if (result)
-		goto out;
+	if (acpi_bus_scan(ACPI_ROOT_OBJECT))
+		goto unlock;
 
 	acpi_root = acpi_fetch_acpi_dev(ACPI_ROOT_OBJECT);
 	if (!acpi_root)
-		goto out;
+		goto unlock;
 
 	/* Fixed feature devices do not exist on HW-reduced platform */
-	if (!acpi_gbl_reduced_hardware) {
-		result = acpi_bus_scan_fixed();
-		if (result) {
-			acpi_detach_data(acpi_root->handle,
-					 acpi_scan_drop_device);
-			acpi_device_del(acpi_root);
-			acpi_bus_put_acpi_device(acpi_root);
-			goto out;
-		}
-	}
+	if (!acpi_gbl_reduced_hardware)
+		acpi_bus_scan_fixed();
 
 	acpi_turn_off_unused_power_resources();
 
 	acpi_scan_initialized = true;
 
- out:
+unlock:
 	mutex_unlock(&acpi_scan_lock);
-	return result;
 }
 
 static struct acpi_probe_entry *ape;
