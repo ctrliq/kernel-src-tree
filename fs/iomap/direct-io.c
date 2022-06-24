@@ -55,7 +55,8 @@ static void iomap_dio_submit_bio(struct iomap_dio *dio, struct iomap *iomap,
 {
 	atomic_inc(&dio->ref);
 
-	if (dio->iocb->ki_flags & IOCB_HIPRI) {
+	/* Sync dio can't be polled reliably */
+	if ((dio->iocb->ki_flags & IOCB_HIPRI) && !is_sync_kiocb(dio->iocb)) {
 		bio_set_polled(bio, dio->iocb);
 		dio->submit.poll_bio = bio;
 	}
@@ -637,9 +638,7 @@ __iomap_dio_rw(struct kiocb *iocb, struct iov_iter *iter,
 			if (!READ_ONCE(dio->submit.waiter))
 				break;
 
-			if (!dio->submit.poll_bio ||
-			    !bio_poll(dio->submit.poll_bio, NULL, 0))
-				blk_io_schedule();
+			blk_io_schedule();
 		}
 		__set_current_state(TASK_RUNNING);
 	}
