@@ -5555,8 +5555,10 @@ static char *lpfc_is_command_vm_io(struct scsi_cmnd *cmd)
 	char *uuid = NULL;
 
 	if (cmd->request) {
-		if (cmd->request->bio)
-			uuid = blkcg_get_fc_appid(cmd->request->bio);
+		if (cmd->request->bio) {
+			if (IS_ENABLED(CONFIG_BLK_CGROUP_FC_APPID))
+				uuid = blkcg_get_fc_appid(cmd->request->bio);
+		}
 	}
 	return uuid;
 }

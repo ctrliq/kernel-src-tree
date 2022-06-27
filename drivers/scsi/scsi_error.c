@@ -2043,11 +2043,12 @@ static void scsi_eh_lock_door(struct scsi_device *sdev)
 	rq->cmd[5] = 0;
 	rq->cmd_len = COMMAND_SIZE(rq->cmd[0]);
 
+	rq->retries = 5;
 	req->rq_flags |= RQF_QUIET;
 	req->timeout = 10 * HZ;
-	rq->retries = 5;
+	req->end_io = eh_lock_door_done;
 
-	blk_execute_rq_nowait(req, true, eh_lock_door_done);
+	blk_execute_rq_nowait(req, true);
 }
 
 /**
