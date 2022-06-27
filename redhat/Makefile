@@ -288,7 +288,7 @@ else
 endif
 
 ifndef BUILD_TARGET
-  BUILD_TARGET:=--scratch $(BUILD_SCRATCH_TARGET)
+  BUILD_TARGET:=$(BUILD_SCRATCH_TARGET)
 endif
 
 TARFILE:=linux-$(SPECTARFILE_RELEASE).tar.xz
@@ -676,15 +676,15 @@ dist-vr-check:
 
 dist-brew: DIST=.el9
 dist-brew: DISTRO=rhel
-dist-brew: BUILD_TARGET=--scratch rhel-$(RHEL_MAJOR).1.0-test-pesign
+dist-brew: BUILD_TARGET=rhel-$(RHEL_MAJOR).1.0-test-pesign
 dist-brew dist-koji: dist-%: dist-vr-check dist-srpm
-	$* $(BUILD_PROFILE) build $(BUILD_FLAGS) $(BUILD_TARGET) $(SRPMS)/$(RELEASETAG)$(DIST).src.rpm $(OUTPUT_FILE)
+	$* $(BUILD_PROFILE) build $(BUILD_FLAGS) --scratch $(BUILD_TARGET) $(SRPMS)/$(RELEASETAG)$(DIST).src.rpm $(OUTPUT_FILE)
 
 distg-brew: DIST=.el9
 distg-brew: DISTRO=rhel
-distg-brew: BUILD_TARGET=--scratch rhel-$(RHEL_MAJOR).1.0-test-pesign
+distg-brew: BUILD_TARGET=rhel-$(RHEL_MAJOR).1.0-test-pesign
 distg-brew distg-koji: distg-%: dist-vr-check
-	$* $(BUILD_PROFILE) build $(BUILD_FLAGS) $(BUILD_TARGET) "$(RHGITURL)?redhat/koji#$(RHGITCOMMIT)"
+	$* $(BUILD_PROFILE) build $(BUILD_FLAGS) --scratch $(BUILD_TARGET) "$(RHGITURL)?redhat/koji#$(RHGITCOMMIT)"
 
 .PHONY: $(REDHAT)/rpm/SOURCES/$(SPECFILE)
 $(REDHAT)/rpm/SOURCES/$(SPECFILE):
