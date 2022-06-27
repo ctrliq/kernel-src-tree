@@ -674,11 +674,15 @@ dist-vr-check:
 		exit 1; \
 	fi
 
-dist-brew: DIST=.el9 DISTRO=rhel BUILD_TARGET="--scratch rhel-$(RHEL_MAJOR).1.0-test-pesign"
+dist-brew: DIST=.el9
+dist-brew: DISTRO=rhel
+dist-brew: BUILD_TARGET=--scratch rhel-$(RHEL_MAJOR).1.0-test-pesign
 dist-brew dist-koji: dist-%: dist-vr-check dist-srpm
 	$* $(BUILD_PROFILE) build $(BUILD_FLAGS) $(BUILD_TARGET) $(SRPMS)/$(RELEASETAG)$(DIST).src.rpm $(OUTPUT_FILE)
 
-distg-brew: DIST=.el9 DISTRO=rhel BUILD_TARGET="--scratch rhel-$(RHEL_MAJOR).1.0-test-pesign"
+distg-brew: DIST=.el9
+distg-brew: DISTRO=rhel
+distg-brew: BUILD_TARGET=--scratch rhel-$(RHEL_MAJOR).1.0-test-pesign
 distg-brew distg-koji: distg-%: dist-vr-check
 	$* $(BUILD_PROFILE) build $(BUILD_FLAGS) $(BUILD_TARGET) "$(RHGITURL)?redhat/koji#$(RHGITCOMMIT)"
 
