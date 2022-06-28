@@ -240,7 +240,7 @@ ifeq ("$(DISTRO)", "fedora")
   SINGLE_TARBALL:=0
   RHDISTGIT_BRANCH:=rawhide
   ifndef BUILD_TARGET
-    BUILD_TARGET:=temp-ark-rhel-8-test
+    BUILD_TARGET:=rawhide
   endif
   # The Fedora tarfile name is based on an upstream tag as users may
   # replace the tarball from one with upstream, rebuild, and then deploy
