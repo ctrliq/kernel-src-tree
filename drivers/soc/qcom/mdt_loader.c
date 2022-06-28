@@ -206,6 +206,8 @@ static int __qcom_mdt_load(struct device *dev, const struct firmware *fw,
 		metadata = qcom_mdt_read_metadata(fw, &metadata_len, fw_name, dev);
 		if (IS_ERR(metadata)) {
 			ret = PTR_ERR(metadata);
+			dev_err(dev, "error %d reading firmware %s metadata\n",
+				ret, fw_name);
 			goto out;
 		}
 
@@ -213,7 +215,9 @@ static int __qcom_mdt_load(struct device *dev, const struct firmware *fw,
 
 		kfree(metadata);
 		if (ret) {
-			dev_err(dev, "invalid firmware metadata\n");
+			/* Invalid firmware metadata */
+			dev_err(dev, "error %d initializing firmware %s\n",
+				ret, fw_name);
 			goto out;
 		}
 	}
@@ -239,7 +243,9 @@ static int __qcom_mdt_load(struct device *dev, const struct firmware *fw,
 			ret = qcom_scm_pas_mem_setup(pas_id, mem_phys,
 						     max_addr - min_addr);
 			if (ret) {
-				dev_err(dev, "unable to setup relocation\n");
+				/* Unable to set up relocation */
+				dev_err(dev, "error %d setting up firmware %s\n",
+					ret, fw_name);
 				goto out;
 			}
 		}
@@ -283,9 +289,8 @@ static int __qcom_mdt_load(struct device *dev, const struct firmware *fw,
 		if (phdr->p_filesz && phdr->p_offset < fw->size) {
 			/* Firmware is large enough to be non-split */
 			if (phdr->p_offset + phdr->p_filesz > fw->size) {
-				dev_err(dev,
-					"failed to load segment %d from truncated file %s\n",
-					i, firmware);
+				dev_err(dev, "file %s segment %d would be truncated\n",
+					fw_name, i);
 				ret = -EINVAL;
 				break;
 			}
