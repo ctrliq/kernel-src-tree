@@ -397,7 +397,7 @@ rh-configs: dist-rhel-configs
 dist-configs-check: dist-configs-prep
 	+cd $(REDHAT)/configs; ./process_configs.sh $(PROCESS_CONFIGS_CHECK_OPTS) "" ""
 
-dist-configs-prep: dist-clean-configs dist-buildreq-check
+dist-configs-prep: dist-clean-configs
 	+cd $(REDHAT)/configs; ./build_configs.sh "partial" "snip"
 	+cd $(REDHAT)/configs; ./build_configs.sh "$(PACKAGE_NAME)" "$(FLAVOR)"
 
@@ -454,15 +454,14 @@ dist-git-version-check:
 		exit 1; \
 	fi
 
-dist-buildreq-check: setup-source
+dist-get-buildreqs: setup-source
 	@PKGLIST="rpm-build $$(rpmspec -q --buildrequires $(SOURCES)/$(SPECFILE) | cut -d ' ' -f 1)"; \
 	MISSING=""; \
 	for pkg in $$PKGLIST; do \
 		rpm -q --whatprovides $$pkg >/dev/null || MISSING="$$MISSING $$pkg"; \
 	done; \
 	if [ -n "$$MISSING" ]; then \
-		echo "Error: please install $$MISSING"; \
-		exit 1; \
+		echo " Missing dependencies: $$MISSING"; \
 	fi
 
 _setup-source: dist-git-version-check
@@ -809,7 +808,8 @@ dist-full-help:
 
 	@echo  ''
 	@echo  'Misc targets:'
-	@echo  '  dist-buildreq-check - Checks for presence of packages required for build'
+	@echo  '  dist-get-buildreqs - returns list of packages listed as build requirements'
+	@echo  '                       for this kernel'
 	@echo  '  dist-get-latest - Returns the latest "known good" kernel from brew. This'
 	@echo  '                    should not be confused with the latest top-of-tree'
 	@echo  '                    development tag.'
