@@ -8,7 +8,6 @@
 #include <linux/module.h>
 #include <linux/ctype.h>
 #include <linux/fs.h>
-#include <linux/genhd.h>
 #include <linux/kdev_t.h>
 #include <linux/kernel.h>
 #include <linux/blkdev.h>
@@ -26,10 +25,12 @@
 #include <linux/pm_runtime.h>
 #include <linux/badblocks.h>
 #include <linux/part_stat.h>
+#include "blk-throttle.h"
 
 #include "blk.h"
 #include "blk-mq-sched.h"
 #include "blk-rq-qos.h"
+#include "blk-cgroup.h"
 
 static struct kobject *block_depr;
 
@@ -185,7 +186,9 @@ static struct blk_major_name {
 	struct blk_major_name *next;
 	int major;
 	char name[16];
+#ifdef CONFIG_BLOCK_LEGACY_AUTOLOAD
 	void (*probe)(dev_t devt);
+#endif
 } *major_names[BLKDEV_MAJOR_HASH_SIZE];
 static DEFINE_MUTEX(major_names_lock);
 static DEFINE_SPINLOCK(major_names_spinlock);
@@ -275,7 +278,9 @@ int __register_blkdev(unsigned int major, const char *name,
 	}
 
 	p->major = major;
+#ifdef CONFIG_BLOCK_LEGACY_AUTOLOAD
 	p->probe = probe;
+#endif
 	strlcpy(p->name, name, sizeof(p->name));
 	p->next = NULL;
 	index = major_to_index(major);
@@ -330,7 +335,7 @@ int blk_alloc_ext_minor(void)
 {
 	int idx;
 
-	idx = ida_alloc_range(&ext_devt_ida, 0, NR_EXT_DEVT, GFP_KERNEL);
+	idx = ida_alloc_range(&ext_devt_ida, 0, NR_EXT_DEVT - 1, GFP_KERNEL);
 	if (idx == -ENOSPC)
 		return -EBUSY;
 	return idx;
@@ -525,6 +530,7 @@ int __must_check device_add_disk(struct device *parent, struct gendisk *disk,
 
 	disk_update_readahead(disk);
 	disk_add_events(disk);
+	set_bit(GD_ADDED, &disk->state);
 	return 0;
 
 out_unregister_bdi:
@@ -638,7 +644,8 @@ void del_gendisk(struct gendisk *disk)
 
 	blk_mq_freeze_queue_wait(q);
 
-	rq_qos_exit(q);
+	blk_throtl_cancel_bios(disk->queue);
+
 	blk_sync_queue(q);
 	blk_flush_integrity();
 	/*
@@ -695,6 +702,7 @@ static ssize_t disk_badblocks_store(struct device *dev,
 	return badblocks_store(disk->bb, page, len, 0);
 }
 
+#ifdef CONFIG_BLOCK_LEGACY_AUTOLOAD
 void blk_request_module(dev_t devt)
 {
 	unsigned int major = MAJOR(devt);
@@ -714,6 +722,7 @@ void blk_request_module(dev_t devt)
 		/* Make old-style 2.4 aliases work */
 		request_module("block-major-%d", MAJOR(devt));
 }
+#endif /* CONFIG_BLOCK_LEGACY_AUTOLOAD */
 
 /*
  * print a full list of all partitions - intended for places where the root
@@ -999,7 +1008,7 @@ static ssize_t disk_alignment_offset_show(struct device *dev,
 {
 	struct gendisk *disk = dev_to_disk(dev);
 
-	return sprintf(buf, "%d\n", queue_alignment_offset(disk->queue));
+	return sprintf(buf, "%d\n", bdev_alignment_offset(disk->part0));
 }
 
 static ssize_t disk_discard_alignment_show(struct device *dev,
@@ -1008,7 +1017,7 @@ static ssize_t disk_discard_alignment_show(struct device *dev,
 {
 	struct gendisk *disk = dev_to_disk(dev);
 
-	return sprintf(buf, "%d\n", queue_discard_alignment(disk->queue));
+	return sprintf(buf, "%d\n", bdev_alignment_offset(disk->part0));
 }
 
 static ssize_t diskseq_show(struct device *dev,
@@ -1107,6 +1116,31 @@ static const struct attribute_group *disk_attr_groups[] = {
 	NULL
 };
 
+static void disk_release_mq(struct request_queue *q)
+{
+	blk_mq_cancel_work_sync(q);
+
+	/*
+	 * There can't be any non non-passthrough bios in flight here, but
+	 * requests stay around longer, including passthrough ones so we
+	 * still need to freeze the queue here.
+	 */
+	blk_mq_freeze_queue(q);
+
+	/*
+	 * Since the I/O scheduler exit code may access cgroup information,
+	 * perform I/O scheduler exit before disassociating from the block
+	 * cgroup controller.
+	 */
+	if (q->elevator) {
+		mutex_lock(&q->sysfs_lock);
+		elevator_exit(q);
+		mutex_unlock(&q->sysfs_lock);
+	}
+	rq_qos_exit(q);
+	__blk_mq_unfreeze_queue(q, true);
+}
+
 /**
  * disk_release - releases all allocated resources of the gendisk
  * @dev: the device representing this disk
@@ -1128,13 +1162,21 @@ static void disk_release(struct device *dev)
 	might_sleep();
 	WARN_ON_ONCE(disk_live(disk));
 
-	blk_mq_cancel_work_sync(disk->queue);
+	if (queue_is_mq(disk->queue))
+		disk_release_mq(disk->queue);
+
+	blkcg_exit_queue(disk->queue);
 
 	disk_release_events(disk);
 	kfree(disk->random);
 	xa_destroy(&disk->part_tbl);
+
 	disk->queue->disk = NULL;
 	blk_put_queue(disk->queue);
+
+	if (test_bit(GD_ADDED, &disk->state) && disk->fops->free_disk)
+		disk->fops->free_disk(disk);
+
 	iput(disk->part0->bd_inode);	/* frees the disk */
 }
 
@@ -1334,6 +1376,9 @@ struct gendisk *__alloc_disk_node(struct request_queue *q, int node_id,
 	if (xa_insert(&disk->part_tbl, 0, disk->part0, GFP_KERNEL))
 		goto out_destroy_part_tbl;
 
+	if (blkcg_init_queue(q))
+		goto out_erase_part0;
+
 	rand_initialize_disk(disk);
 	disk_to_dev(disk)->class = &block_class;
 	disk_to_dev(disk)->type = &disk_type;
@@ -1346,6 +1391,8 @@ struct gendisk *__alloc_disk_node(struct request_queue *q, int node_id,
 #endif
 	return disk;
 
+out_erase_part0:
+	xa_erase(&disk->part_tbl, 0);
 out_destroy_part_tbl:
 	xa_destroy(&disk->part_tbl);
 	disk->part0->bd_disk = NULL;

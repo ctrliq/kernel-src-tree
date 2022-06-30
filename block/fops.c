@@ -66,8 +66,13 @@ static ssize_t __blkdev_direct_IO_simple(struct kiocb *iocb,
 			return -ENOMEM;
 	}
 
-	bio_init(&bio, vecs, nr_pages);
-	bio_set_dev(&bio, bdev);
+	if (iov_iter_rw(iter) == READ) {
+		bio_init(&bio, bdev, vecs, nr_pages, REQ_OP_READ);
+		if (iter_is_iovec(iter))
+			should_dirty = true;
+	} else {
+		bio_init(&bio, bdev, vecs, nr_pages, dio_bio_write_op(iocb));
+	}
 	bio.bi_iter.bi_sector = pos >> SECTOR_SHIFT;
 	bio.bi_write_hint = iocb->ki_hint;
 	bio.bi_ioprio = iocb->ki_ioprio;
@@ -77,14 +82,9 @@ static ssize_t __blkdev_direct_IO_simple(struct kiocb *iocb,
 		goto out;
 	ret = bio.bi_iter.bi_size;
 
-	if (iov_iter_rw(iter) == READ) {
-		bio.bi_opf = REQ_OP_READ;
-		if (iter_is_iovec(iter))
-			should_dirty = true;
-	} else {
-		bio.bi_opf = dio_bio_write_op(iocb);
+	if (iov_iter_rw(iter) == WRITE)
 		task_io_account_write(ret);
-	}
+
 	if (iocb->ki_flags & IOCB_NOWAIT)
 		bio.bi_opf |= REQ_NOWAIT;
 
@@ -169,6 +169,7 @@ static ssize_t __blkdev_direct_IO(struct kiocb *iocb, struct iov_iter *iter,
 	struct blkdev_dio *dio;
 	struct bio *bio;
 	bool is_read = (iov_iter_rw(iter) == READ), is_sync;
+	unsigned int opf = is_read ? REQ_OP_READ : dio_bio_write_op(iocb);
 	loff_t pos = iocb->ki_pos;
 	int ret = 0;
 
@@ -176,8 +177,10 @@ static ssize_t __blkdev_direct_IO(struct kiocb *iocb, struct iov_iter *iter,
 	    (bdev_logical_block_size(bdev) - 1))
 		return -EINVAL;
 
-	bio = bio_alloc_kiocb(iocb, nr_pages, &blkdev_dio_pool);
-
+	if (iocb->ki_flags & IOCB_ALLOC_CACHE)
+		opf |= REQ_ALLOC_CACHE;
+	bio = bio_alloc_bioset(bdev, nr_pages, opf, GFP_KERNEL,
+			       &blkdev_dio_pool);
 	dio = container_of(bio, struct blkdev_dio, bio);
 	atomic_set(&dio->ref, 1);
 	/*
@@ -202,7 +205,6 @@ static ssize_t __blkdev_direct_IO(struct kiocb *iocb, struct iov_iter *iter,
 	blk_start_plug(&plug);
 
 	for (;;) {
-		bio_set_dev(bio, bdev);
 		bio->bi_iter.bi_sector = pos >> SECTOR_SHIFT;
 		bio->bi_write_hint = iocb->ki_hint;
 		bio->bi_private = dio;
@@ -217,11 +219,9 @@ static ssize_t __blkdev_direct_IO(struct kiocb *iocb, struct iov_iter *iter,
 		}
 
 		if (is_read) {
-			bio->bi_opf = REQ_OP_READ;
 			if (dio->flags & DIO_SHOULD_DIRTY)
 				bio_set_pages_dirty(bio);
 		} else {
-			bio->bi_opf = dio_bio_write_op(iocb);
 			task_io_account_write(bio->bi_iter.bi_size);
 		}
 		if (iocb->ki_flags & IOCB_NOWAIT)
@@ -237,7 +237,7 @@ static ssize_t __blkdev_direct_IO(struct kiocb *iocb, struct iov_iter *iter,
 		}
 		atomic_inc(&dio->ref);
 		submit_bio(bio);
-		bio = bio_alloc(GFP_KERNEL, nr_pages);
+		bio = bio_alloc(bdev, nr_pages, opf, GFP_KERNEL);
 	}
 
 	blk_finish_plug(&plug);
@@ -292,6 +292,8 @@ static ssize_t __blkdev_direct_IO_async(struct kiocb *iocb,
 					unsigned int nr_pages)
 {
 	struct block_device *bdev = iocb->ki_filp->private_data;
+	bool is_read = iov_iter_rw(iter) == READ;
+	unsigned int opf = is_read ? REQ_OP_READ : dio_bio_write_op(iocb);
 	struct blkdev_dio *dio;
 	struct bio *bio;
 	loff_t pos = iocb->ki_pos;
@@ -301,11 +303,13 @@ static ssize_t __blkdev_direct_IO_async(struct kiocb *iocb,
 	    (bdev_logical_block_size(bdev) - 1))
 		return -EINVAL;
 
-	bio = bio_alloc_kiocb(iocb, nr_pages, &blkdev_dio_pool);
+	if (iocb->ki_flags & IOCB_ALLOC_CACHE)
+		opf |= REQ_ALLOC_CACHE;
+	bio = bio_alloc_bioset(bdev, nr_pages, opf, GFP_KERNEL,
+			       &blkdev_dio_pool);
 	dio = container_of(bio, struct blkdev_dio, bio);
 	dio->flags = 0;
 	dio->iocb = iocb;
-	bio_set_dev(bio, bdev);
 	bio->bi_iter.bi_sector = pos >> SECTOR_SHIFT;
 	bio->bi_write_hint = iocb->ki_hint;
 	bio->bi_end_io = blkdev_bio_end_io_async;
@@ -328,14 +332,12 @@ static ssize_t __blkdev_direct_IO_async(struct kiocb *iocb,
 	}
 	dio->size = bio->bi_iter.bi_size;
 
-	if (iov_iter_rw(iter) == READ) {
-		bio->bi_opf = REQ_OP_READ;
+	if (is_read) {
 		if (iter_is_iovec(iter)) {
 			dio->flags |= DIO_SHOULD_DIRTY;
 			bio_set_pages_dirty(bio);
 		}
 	} else {
-		bio->bi_opf = dio_bio_write_op(iocb);
 		task_io_account_write(bio->bi_iter.bi_size);
 	}
 
@@ -656,7 +658,7 @@ static long blkdev_fallocate(struct file *file, int mode, loff_t start,
 		break;
 	case FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE | FALLOC_FL_NO_HIDE_STALE:
 		error = blkdev_issue_discard(bdev, start >> SECTOR_SHIFT,
-					     len >> SECTOR_SHIFT, GFP_KERNEL, 0);
+					     len >> SECTOR_SHIFT, GFP_KERNEL);
 		break;
 	default:
 		error = -EOPNOTSUPP;

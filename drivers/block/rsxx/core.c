@@ -20,7 +20,7 @@
 #include <linux/debugfs.h>
 #include <linux/seq_file.h>
 
-#include <linux/genhd.h>
+#include <linux/blkdev.h>
 #include <linux/idr.h>
 
 #include "rsxx_priv.h"
