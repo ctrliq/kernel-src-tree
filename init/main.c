@@ -382,6 +382,7 @@ static char * __init xbc_make_cmdline(const char *key)
 	ret = xbc_snprint_cmdline(new_cmdline, len + 1, root);
 	if (ret < 0 || ret > len) {
 		pr_err("Failed to print extra kernel cmdline.\n");
+		memblock_free(new_cmdline, len + 1);
 		return NULL;
 	}
 
@@ -910,7 +911,7 @@ static void __init print_unknown_bootoptions(void)
 	/* Start at unknown_options[1] to skip the initial space */
 	pr_notice("Unknown kernel command line parameters \"%s\", will be passed to user space.\n",
 		&unknown_options[1]);
-	memblock_free_ptr(unknown_options, len);
+	memblock_free(unknown_options, len);
 }
 
 asmlinkage __visible void __init __no_sanitize_address start_kernel(void)
