@@ -67,6 +67,7 @@
 #include <linux/crash_dump.h>
 #include <linux/sort.h>
 #include <linux/stop_machine.h>
+#include <linux/sysfs.h>
 #include <linux/types.h>
 #include <linux/minmax.h>
 #include <linux/mm.h>
@@ -250,8 +251,8 @@ static const struct arm64_ftr_bits ftr_id_aa64pfr0[] = {
 	S_ARM64_FTR_BITS(FTR_VISIBLE, FTR_STRICT, FTR_LOWER_SAFE, ID_AA64PFR0_FP_SHIFT, 4, ID_AA64PFR0_FP_NI),
 	ARM64_FTR_BITS(FTR_HIDDEN, FTR_NONSTRICT, FTR_LOWER_SAFE, ID_AA64PFR0_EL3_SHIFT, 4, 0),
 	ARM64_FTR_BITS(FTR_HIDDEN, FTR_NONSTRICT, FTR_LOWER_SAFE, ID_AA64PFR0_EL2_SHIFT, 4, 0),
-	ARM64_FTR_BITS(FTR_HIDDEN, FTR_NONSTRICT, FTR_LOWER_SAFE, ID_AA64PFR0_EL1_SHIFT, 4, ID_AA64PFR0_EL1_64BIT_ONLY),
-	ARM64_FTR_BITS(FTR_HIDDEN, FTR_NONSTRICT, FTR_LOWER_SAFE, ID_AA64PFR0_EL0_SHIFT, 4, ID_AA64PFR0_EL0_64BIT_ONLY),
+	ARM64_FTR_BITS(FTR_HIDDEN, FTR_NONSTRICT, FTR_LOWER_SAFE, ID_AA64PFR0_EL1_SHIFT, 4, ID_AA64PFR0_ELx_64BIT_ONLY),
+	ARM64_FTR_BITS(FTR_HIDDEN, FTR_NONSTRICT, FTR_LOWER_SAFE, ID_AA64PFR0_EL0_SHIFT, 4, ID_AA64PFR0_ELx_64BIT_ONLY),
 	ARM64_FTR_END,
 };
 
@@ -584,15 +585,19 @@ static const struct arm64_ftr_bits ftr_raz[] = {
 	ARM64_FTR_END,
 };
 
-#define ARM64_FTR_REG_OVERRIDE(id, table, ovr) {		\
+#define __ARM64_FTR_REG_OVERRIDE(id_str, id, table, ovr) {	\
 		.sys_id = id,					\
 		.reg = 	&(struct arm64_ftr_reg){		\
-			.name = #id,				\
+			.name = id_str,				\
 			.override = (ovr),			\
 			.ftr_bits = &((table)[0]),		\
 	}}
 
-#define ARM64_FTR_REG(id, table) ARM64_FTR_REG_OVERRIDE(id, table, &no_override)
+#define ARM64_FTR_REG_OVERRIDE(id, table, ovr)	\
+	__ARM64_FTR_REG_OVERRIDE(#id, id, table, ovr)
+
+#define ARM64_FTR_REG(id, table)		\
+	__ARM64_FTR_REG_OVERRIDE(#id, id, table, &no_override)
 
 struct arm64_ftr_override __ro_after_init id_aa64mmfr1_override;
 struct arm64_ftr_override __ro_after_init id_aa64pfr1_override;
@@ -954,7 +959,7 @@ void __init init_cpu_features(struct cpuinfo_arm64 *info)
 
 	if (id_aa64pfr0_sve(info->reg_id_aa64pfr0)) {
 		init_cpu_ftr_reg(SYS_ZCR_EL1, info->reg_zcr);
-		sve_init_vq_map();
+		vec_init_vq_map(ARM64_VEC_SVE);
 	}
 
 	if (id_aa64pfr1_mte(info->reg_id_aa64pfr1))
@@ -1190,7 +1195,7 @@ void update_cpu_features(int cpu,
 		/* Probe vector lengths, unless we already gave up on SVE */
 		if (id_aa64pfr0_sve(read_sanitised_ftr_reg(SYS_ID_AA64PFR0_EL1)) &&
 		    !system_capabilities_finalized())
-			sve_update_vq_map();
+			vec_update_vq_map(ARM64_VEC_SVE);
 	}
 
 	/*
@@ -1337,6 +1342,31 @@ const struct cpumask *system_32bit_el0_cpumask(void)
 
 	return cpu_possible_mask;
 }
+
+static int __init parse_32bit_el0_param(char *str)
+{
+	allow_mismatched_32bit_el0 = true;
+	return 0;
+}
+early_param("allow_mismatched_32bit_el0", parse_32bit_el0_param);
+
+static ssize_t aarch32_el0_show(struct device *dev,
+				struct device_attribute *attr, char *buf)
+{
+	const struct cpumask *mask = system_32bit_el0_cpumask();
+
+	return sysfs_emit(buf, "%*pbl\n", cpumask_pr_args(mask));
+}
+static const DEVICE_ATTR_RO(aarch32_el0);
+
+static int __init aarch32_el0_sysfs_init(void)
+{
+	if (!allow_mismatched_32bit_el0)
+		return 0;
+
+	return device_create_file(cpu_subsys.dev_root, &dev_attr_aarch32_el0);
+}
+device_initcall(aarch32_el0_sysfs_init);
 
 static bool has_32bit_el0(const struct arm64_cpu_capabilities *entry, int scope)
 {
@@ -1588,8 +1618,6 @@ kpti_install_ng_mappings(const struct arm64_cpu_capabilities *__unused)
 
 	if (!cpu)
 		arm64_use_ng_mappings = true;
-
-	return;
 }
 #else
 static void
@@ -1761,7 +1789,7 @@ static void cpu_has_fwb(const struct arm64_cpu_capabilities *__unused)
 	u64 val = read_sysreg_s(SYS_CLIDR_EL1);
 
 	/* Check that CLIDR_EL1.LOU{U,IS} are both 0 */
-	WARN_ON(val & (7 << 27 | 7 << 21));
+	WARN_ON(CLIDR_LOUU(val) || CLIDR_LOUIS(val));
 }
 
 #ifdef CONFIG_ARM64_PAN
@@ -1870,6 +1898,9 @@ static void bti_enable(const struct arm64_cpu_capabilities *__unused)
 #ifdef CONFIG_ARM64_MTE
 static void cpu_enable_mte(struct arm64_cpu_capabilities const *cap)
 {
+	sysreg_clear_set(sctlr_el1, 0, SCTLR_ELx_ATA | SCTLR_EL1_ATA0);
+	isb();
+
 	/*
 	 * Clear the tags in the zero page. This needs to be done via the
 	 * linear map which has the Tagged attribute.
@@ -1923,6 +1954,16 @@ static const struct arm64_cpu_capabilities arm64_features[] = {
 		.matches = has_useable_gicv3_cpuif,
 		.sys_reg = SYS_ID_AA64PFR0_EL1,
 		.field_pos = ID_AA64PFR0_GIC_SHIFT,
+		.sign = FTR_UNSIGNED,
+		.min_field_value = 1,
+	},
+	{
+		.desc = "Enhanced Counter Virtualization",
+		.capability = ARM64_HAS_ECV,
+		.type = ARM64_CPUCAP_SYSTEM_FEATURE,
+		.matches = has_cpuid_feature,
+		.sys_reg = SYS_ID_AA64MMFR0_EL1,
+		.field_pos = ID_AA64MMFR0_ECV_SHIFT,
 		.sign = FTR_UNSIGNED,
 		.min_field_value = 1,
 	},
@@ -1983,7 +2024,7 @@ static const struct arm64_cpu_capabilities arm64_features[] = {
 		.sys_reg = SYS_ID_AA64PFR0_EL1,
 		.sign = FTR_UNSIGNED,
 		.field_pos = ID_AA64PFR0_EL0_SHIFT,
-		.min_field_value = ID_AA64PFR0_EL0_32BIT_64BIT,
+		.min_field_value = ID_AA64PFR0_ELx_32BIT_64BIT,
 	},
 #ifdef CONFIG_KVM
 	{
@@ -1994,7 +2035,7 @@ static const struct arm64_cpu_capabilities arm64_features[] = {
 		.sys_reg = SYS_ID_AA64PFR0_EL1,
 		.sign = FTR_UNSIGNED,
 		.field_pos = ID_AA64PFR0_EL1_SHIFT,
-		.min_field_value = ID_AA64PFR0_EL1_32BIT_64BIT,
+		.min_field_value = ID_AA64PFR0_ELx_32BIT_64BIT,
 	},
 	{
 		.desc = "Protected KVM",
@@ -2316,6 +2357,16 @@ static const struct arm64_cpu_capabilities arm64_features[] = {
 		.min_field_value = ID_AA64PFR1_MTE,
 		.sign = FTR_UNSIGNED,
 		.cpu_enable = cpu_enable_mte,
+	},
+	{
+		.desc = "Asymmetric MTE Tag Check Fault",
+		.capability = ARM64_MTE_ASYMM,
+		.type = ARM64_CPUCAP_BOOT_CPU_FEATURE,
+		.matches = has_cpuid_feature,
+		.sys_reg = SYS_ID_AA64PFR1_EL1,
+		.field_pos = ID_AA64PFR1_MTE_SHIFT,
+		.min_field_value = ID_AA64PFR1_MTE_ASYMM,
+		.sign = FTR_UNSIGNED,
 	},
 #endif /* CONFIG_ARM64_MTE */
 	{
@@ -2738,7 +2789,7 @@ static void verify_sve_features(void)
 	unsigned int safe_len = safe_zcr & ZCR_ELx_LEN_MASK;
 	unsigned int len = zcr & ZCR_ELx_LEN_MASK;
 
-	if (len < safe_len || sve_verify_vq_map()) {
+	if (len < safe_len || vec_verify_vq_map(ARM64_VEC_SVE)) {
 		pr_crit("CPU%d: SVE: vector length support mismatch\n",
 			smp_processor_id());
 		cpu_die_early();
@@ -2842,6 +2893,7 @@ bool this_cpu_has_cap(unsigned int n)
 
 	return false;
 }
+EXPORT_SYMBOL_GPL(this_cpu_has_cap);
 
 /*
  * This helper function is used in a narrow window when,
@@ -2931,15 +2983,38 @@ void __init setup_cpu_features(void)
 
 static int enable_mismatched_32bit_el0(unsigned int cpu)
 {
+	/*
+	 * The first 32-bit-capable CPU we detected and so can no longer
+	 * be offlined by userspace. -1 indicates we haven't yet onlined
+	 * a 32-bit-capable CPU.
+	 */
+	static int lucky_winner = -1;
+
 	struct cpuinfo_arm64 *info = &per_cpu(cpu_data, cpu);
 	bool cpu_32bit = id_aa64pfr0_32bit_el0(info->reg_id_aa64pfr0);
 
 	if (cpu_32bit) {
 		cpumask_set_cpu(cpu, cpu_32bit_el0_mask);
 		static_branch_enable_cpuslocked(&arm64_mismatched_32bit_el0);
-		setup_elf_hwcaps(compat_elf_hwcaps);
 	}
 
+	if (cpumask_test_cpu(0, cpu_32bit_el0_mask) == cpu_32bit)
+		return 0;
+
+	if (lucky_winner >= 0)
+		return 0;
+
+	/*
+	 * We've detected a mismatch. We need to keep one of our CPUs with
+	 * 32-bit EL0 online so that is_cpu_allowed() doesn't end up rejecting
+	 * every CPU in the system for a 32-bit task.
+	 */
+	lucky_winner = cpu_32bit ? cpu : cpumask_any_and(cpu_32bit_el0_mask,
+							 cpu_active_mask);
+	get_cpu_device(lucky_winner)->offline_disabled = true;
+	setup_elf_hwcaps(compat_elf_hwcaps);
+	pr_info("Asymmetric 32-bit EL0 support detected on CPU %u; CPU hot-unplug disabled on CPU %u\n",
+		cpu, lucky_winner);
 	return 0;
 }
 

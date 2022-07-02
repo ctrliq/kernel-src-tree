@@ -211,43 +211,6 @@ static void __init zone_sizes_init(unsigned long min, unsigned long max)
 	free_area_init(max_zone_pfns);
 }
 
-int pfn_valid(unsigned long pfn)
-{
-	phys_addr_t addr = PFN_PHYS(pfn);
-	struct mem_section *ms;
-
-	/*
-	 * Ensure the upper PAGE_SHIFT bits are clear in the
-	 * pfn. Else it might lead to false positives when
-	 * some of the upper bits are set, but the lower bits
-	 * match a valid pfn.
-	 */
-	if (PHYS_PFN(addr) != pfn)
-		return 0;
-
-	if (pfn_to_section_nr(pfn) >= NR_MEM_SECTIONS)
-		return 0;
-
-	ms = __pfn_to_section(pfn);
-	if (!valid_section(ms))
-		return 0;
-
-	/*
-	 * ZONE_DEVICE memory does not have the memblock entries.
-	 * memblock_is_map_memory() check for ZONE_DEVICE based
-	 * addresses will always fail. Even the normal hotplugged
-	 * memory will never have MEMBLOCK_NOMAP flag set in their
-	 * memblock entries. Skip memblock search for all non early
-	 * memory sections covering all of hotplug memory including
-	 * both normal and ZONE_DEVICE based.
-	 */
-	if (!early_section(ms))
-		return pfn_section_valid(ms, pfn);
-
-	return memblock_is_memory(addr);
-}
-EXPORT_SYMBOL(pfn_valid);
-
 int pfn_is_map_memory(unsigned long pfn)
 {
 	phys_addr_t addr = PFN_PHYS(pfn);
@@ -311,7 +274,21 @@ static void __init fdt_enforce_memory_region(void)
 
 void __init arm64_memblock_init(void)
 {
-	const s64 linear_region_size = PAGE_END - _PAGE_OFFSET(vabits_actual);
+	s64 linear_region_size = PAGE_END - _PAGE_OFFSET(vabits_actual);
+
+	/*
+	 * Corner case: 52-bit VA capable systems running KVM in nVHE mode may
+	 * be limited in their ability to support a linear map that exceeds 51
+	 * bits of VA space, depending on the placement of the ID map. Given
+	 * that the placement of the ID map may be randomized, let's simply
+	 * limit the kernel's linear map to 51 bits as well if we detect this
+	 * configuration.
+	 */
+	if (IS_ENABLED(CONFIG_KVM) && vabits_actual == 52 &&
+	    is_hyp_mode_available() && !is_kernel_in_hyp_mode()) {
+		pr_info("Capping linear region to 51 bits for KVM in nVHE mode on LVA capable hardware.\n");
+		linear_region_size = min_t(u64, linear_region_size, BIT(51));
+	}
 
 	/* Handle linux,usable-memory-range property */
 	fdt_enforce_memory_region();
@@ -489,8 +466,6 @@ void __init mem_init(void)
 		swiotlb_init(1);
 	else if (!xen_swiotlb_detect())
 		swiotlb_force = SWIOTLB_NO_FORCE;
-
-	set_max_mapnr(max_pfn - PHYS_PFN_OFFSET);
 
 	/* this will put all unused low memory onto the freelists */
 	memblock_free_all();
