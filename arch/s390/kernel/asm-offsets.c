@@ -152,5 +152,6 @@ int main(void)
 	DEFINE(__KEXEC_SHA_REGION_SIZE, sizeof(struct kexec_sha_region));
 	/* sizeof kernel parameter area */
 	DEFINE(__PARMAREA_SIZE, sizeof(struct parmarea));
+	DEFINE(MAX_COMMAND_LINE_SIZE, PARMAREA + offsetof(struct parmarea, max_command_line_size));
 	return 0;
 }
