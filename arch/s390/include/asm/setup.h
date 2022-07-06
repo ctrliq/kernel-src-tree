@@ -13,7 +13,7 @@
 #define EP_OFFSET		0x10008
 #define EP_STRING		"S390EP"
 #define PARMAREA		0x10400
-#define HEAD_END		PARMAREA + COMMAND_LINE_SIZE
+
 /*
  * Machine features detected in early.c
  */
@@ -55,7 +55,7 @@
 #define COMMAND_LINE_OFFSET	0x10480
 
 #define LEGACY_COMMAND_LINE_SIZE	896
-
+#define COMMAND_LINE_SIZE		CONFIG_COMMAND_LINE_SIZE
 #ifndef __ASSEMBLY__
 
 #include <asm/lowcore.h>
@@ -67,6 +67,7 @@
 #define OLDMEM_BASE	(*(unsigned long *)  (OLDMEM_BASE_OFFSET))
 #define OLDMEM_SIZE	(*(unsigned long *)  (OLDMEM_SIZE_OFFSET))
 #define COMMAND_LINE	((char *)	     (COMMAND_LINE_OFFSET))
+#define HEAD_END		COMMAND_LINE_OFFSET + COMMAND_LINE_SIZE
 
 struct parmarea {
 	unsigned long ipl_device;			/* 0x10400 */
