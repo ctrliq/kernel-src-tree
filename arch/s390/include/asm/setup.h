@@ -13,7 +13,6 @@
 #define EP_OFFSET		0x10008
 #define EP_STRING		"S390EP"
 #define PARMAREA		0x10400
-#define HEAD_END		0x11000
 
 /*
  * Machine features detected in early.c
