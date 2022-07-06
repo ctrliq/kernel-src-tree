@@ -65,6 +65,26 @@ os-build branch that can be used if the os-build branch does not compile due to
 upstream bugs.  However, the os-build branch must be used as a Merge Request
 target for all Fedora/ARK specific changes.
 
+Build Dependencies
+------------------
+
+kernel-ark has a long list of BuildRequires that are specified in the
+kernel.spec file.  Built-in rpm commands like 'yum builddep' will not
+work on all OSes (`see BZ 2103214`_),
+and 'yum deplist' which requires the configuration and enabling of a source
+repository.  As a result a 'dist-get-buildreqs' target has been added that will
+provide a list of missing dependencies.  This list can be consumed by other
+commands to install missing packages:
+
+.. code-block:: sh
+
+   # install missing build dependencies
+   yum -y install $(make dist-get-buildreqs | grep "Missing dependencies:" | cut -d":" -f2)
+
+Some packages may require the enabling of additional repositories such as the
+system-sb-certs package which can be found in a Centos-Stream or RHEL CodeReady
+Linux Builder (CRB) repository.
+
 Local builds
 ------------
 
@@ -137,6 +157,7 @@ Maintainer Guide
 .. _register your SSH key: https://gitlab.com/-/profile/keys
 .. _Koji: https://docs.fedoraproject.org/en-US/package-maintainers/Using_the_Koji_Build_System/
 .. _Mock: https://fedoraproject.org/wiki/Using_Mock_to_test_package_builds#How_do_I_set_up_Mock.3F
+.. _see BZ 2103214: https://bugzilla.redhat.com/2103214
 
 
 Indices and tables
