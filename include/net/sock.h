@@ -349,6 +349,7 @@ struct bpf_local_storage;
   *	@sk_txtime_deadline_mode: set deadline mode for SO_TXTIME
   *	@sk_txtime_report_errors: set report errors mode for SO_TXTIME
   *	@sk_txtime_unused: unused txtime flags
+  *	@ns_tracker: tracker for netns reference
   */
 struct sock {
 	/*
@@ -537,6 +538,7 @@ struct sock {
 	struct bpf_local_storage __rcu	*sk_bpf_storage;
 #endif
 	struct rcu_head		sk_rcu;
+	netns_tracker		ns_tracker;
 };
 
 enum sk_pacing {
@@ -1426,13 +1428,32 @@ proto_memory_pressure(struct proto *prot)
 
 
 #ifdef CONFIG_PROC_FS
-/* Called with local bh disabled */
-void sock_prot_inuse_add(struct net *net, struct proto *prot, int inc);
+#define PROTO_INUSE_NR	64	/* should be enough for the first time */
+struct prot_inuse {
+	int all;
+	int val[PROTO_INUSE_NR];
+};
+
+static inline void sock_prot_inuse_add(const struct net *net,
+				       const struct proto *prot, int val)
+{
+	this_cpu_add(net->core.prot_inuse->val[prot->inuse_idx], val);
+}
+
+static inline void sock_inuse_add(const struct net *net, int val)
+{
+	this_cpu_add(net->core.prot_inuse->all, val);
+}
+
 int sock_prot_inuse_get(struct net *net, struct proto *proto);
 int sock_inuse_get(struct net *net);
 #else
-static inline void sock_prot_inuse_add(struct net *net, struct proto *prot,
-		int inc)
+static inline void sock_prot_inuse_add(const struct net *net,
+				       const struct proto *prot, int val)
+{
+}
+
+static inline void sock_inuse_add(const struct net *net, int val)
 {
 }
 #endif

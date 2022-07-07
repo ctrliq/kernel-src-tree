@@ -395,6 +395,7 @@ struct pktgen_dev {
 				  * device name (not when the inject is
 				  * started as it used to do.)
 				  */
+	netdevice_tracker dev_tracker;
 	char odevname[32];
 	struct flow_state *flows;
 	unsigned int cflows;	/* Concurrent flows (config) */
@@ -1990,7 +1991,7 @@ static int pktgen_setup_dev(const struct pktgen_net *pn,
 
 	/* Clean old setups */
 	if (pkt_dev->odev) {
-		dev_put(pkt_dev->odev);
+		dev_put_track(pkt_dev->odev, &pkt_dev->dev_tracker);
 		pkt_dev->odev = NULL;
 	}
 
@@ -2008,6 +2009,7 @@ static int pktgen_setup_dev(const struct pktgen_net *pn,
 		err = -ENETDOWN;
 	} else {
 		pkt_dev->odev = odev;
+		netdev_tracker_alloc(odev, &pkt_dev->dev_tracker, GFP_KERNEL);
 		return 0;
 	}
 
@@ -3650,7 +3652,7 @@ static int pktgen_add_device(struct pktgen_thread *t, const char *ifname)
 
 	return add_dev_to_thread(t, pkt_dev);
 out2:
-	dev_put(pkt_dev->odev);
+	dev_put_track(pkt_dev->odev, &pkt_dev->dev_tracker);
 out1:
 #ifdef CONFIG_XFRM
 	free_SAs(pkt_dev);
@@ -3744,7 +3746,7 @@ static int pktgen_remove_device(struct pktgen_thread *t,
 	/* Dis-associate from the interface */
 
 	if (pkt_dev->odev) {
-		dev_put(pkt_dev->odev);
+		dev_put_track(pkt_dev->odev, &pkt_dev->dev_tracker);
 		pkt_dev->odev = NULL;
 	}
 
