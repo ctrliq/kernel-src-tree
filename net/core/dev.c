@@ -11774,7 +11774,7 @@ static int __init net_dev_init(void)
 
 		INIT_WORK(flush, flush_backlog);
 
-		skb_queue_head_init_raw(&sd->input_pkt_queue);
+		skb_queue_head_init(&sd->input_pkt_queue);
 		skb_queue_head_init(&sd->process_queue);
 #ifdef CONFIG_XFRM_OFFLOAD
 		skb_queue_head_init(&sd->xfrm_backlog);
