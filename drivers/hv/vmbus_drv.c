@@ -938,7 +938,7 @@ static int vmbus_dma_configure(struct device *child_device)
 /*
  * vmbus_remove - Remove a vmbus device
  */
-static int vmbus_remove(struct device *child_device)
+static void vmbus_remove(struct device *child_device)
 {
 	struct hv_driver *drv;
 	struct hv_device *dev = device_to_hv_device(child_device);
@@ -948,10 +948,7 @@ static int vmbus_remove(struct device *child_device)
 		if (drv->remove)
 			drv->remove(dev);
 	}
-
-	return 0;
 }
-
 
 /*
  * vmbus_shutdown - Shutdown a vmbus device
