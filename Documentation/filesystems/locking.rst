@@ -263,7 +263,7 @@ prototypes::
 	bool (*isolate_page) (struct page *, isolate_mode_t);
 	int (*migratepage)(struct address_space *, struct page *, struct page *);
 	void (*putback_page) (struct page *);
-	int (*launder_page)(struct page *);
+	int (*launder_folio)(struct folio *);
 	int (*is_partially_uptodate)(struct page *, unsigned long, unsigned long);
 	int (*error_remove_page)(struct address_space *, struct page *);
 	int (*swap_activate)(struct file *);
@@ -292,7 +292,7 @@ direct_IO:
 isolate_page:		yes
 migratepage:		yes (both)
 putback_page:		yes
-launder_page:		yes
+launder_folio:		yes
 is_partially_uptodate:	yes
 error_remove_page:	yes
 swap_activate:		no
@@ -392,9 +392,9 @@ the kernel assumes that the fs has no private interest in the buffers.
 ->freepage() is called when the kernel is done dropping the page
 from the page cache.
 
-->launder_page() may be called prior to releasing a page if
-it is still found to be dirty. It returns zero if the page was successfully
-cleaned, or an error value if not. Note that in order to prevent the page
+->launder_folio() may be called prior to releasing a folio if
+it is still found to be dirty. It returns zero if the folio was successfully
+cleaned, or an error value if not. Note that in order to prevent the folio
 getting mapped back in and redirtied, it needs to be kept locked
 across the entire operation.
 

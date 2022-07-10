@@ -407,7 +407,10 @@ struct address_space_operations {
 			struct page *, struct page *, enum migrate_mode);
 	bool (*isolate_page)(struct page *, isolate_mode_t);
 	void (*putback_page)(struct page *);
-	int (*launder_page) (struct page *);
+	union {
+		int (*launder_page) (struct page *);
+		int (*launder_folio) (struct folio *);
+	};
 	int (*is_partially_uptodate) (struct page *, unsigned long,
 					unsigned long);
 	void (*is_dirty_writeback) (struct page *, bool *, bool *);
