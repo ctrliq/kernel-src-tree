@@ -251,6 +251,8 @@ static bool remove_migration_pte(struct page *page, struct vm_area_struct *vma,
 			else
 				page_add_file_rmap(new, vma, false);
 		}
+		if (vma->vm_flags & VM_LOCKED)
+			mlock_page_drain(smp_processor_id());
 
 		/* No need to invalidate - it was non-present before */
 		update_mmu_cache(vma, pvmw.address, pvmw.pte);
