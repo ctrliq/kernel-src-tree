@@ -131,7 +131,8 @@ extern unsigned long highest_memmap_pfn;
 /*
  * in mm/vmscan.c:
  */
-extern int isolate_lru_page(struct page *page);
+int isolate_lru_page(struct page *page);
+int folio_isolate_lru(struct folio *folio);
 extern void putback_lru_page(struct page *page);
 
 /*
