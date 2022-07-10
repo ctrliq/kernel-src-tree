@@ -1111,15 +1111,14 @@ static pageout_t pageout(struct page *page, struct address_space *mapping)
  * Same as remove_mapping, but if the page is removed from the mapping, it
  * gets returned with a refcount of 0.
  */
-static int __remove_mapping(struct address_space *mapping, struct page *page,
+static int __remove_mapping(struct address_space *mapping, struct folio *folio,
 			    bool reclaimed, struct mem_cgroup *target_memcg)
 {
-	struct folio *folio = page_folio(page);
 	int refcount;
 	void *shadow = NULL;
 
-	BUG_ON(!PageLocked(page));
-	BUG_ON(mapping != page_mapping(page));
+	BUG_ON(!folio_test_locked(folio));
+	BUG_ON(mapping != folio_mapping(folio));
 
 	xa_lock_irq(&mapping->i_pages);
 	/*
@@ -1147,23 +1146,23 @@ static int __remove_mapping(struct address_space *mapping, struct page *page,
 	 * Note that if SetPageDirty is always performed via set_page_dirty,
 	 * and thus under the i_pages lock, then this ordering is not required.
 	 */
-	refcount = 1 + compound_nr(page);
-	if (!page_ref_freeze(page, refcount))
+	refcount = 1 + folio_nr_pages(folio);
+	if (!folio_ref_freeze(folio, refcount))
 		goto cannot_free;
 	/* note: atomic_cmpxchg in page_ref_freeze provides the smp_rmb */
-	if (unlikely(PageDirty(page))) {
-		page_ref_unfreeze(page, refcount);
+	if (unlikely(folio_test_dirty(folio))) {
+		folio_ref_unfreeze(folio, refcount);
 		goto cannot_free;
 	}
 
-	if (PageSwapCache(page)) {
-		swp_entry_t swap = { .val = page_private(page) };
+	if (folio_test_swapcache(folio)) {
+		swp_entry_t swap = folio_swap_entry(folio);
 		mem_cgroup_swapout(folio, swap);
 		if (reclaimed && !mapping_exiting(mapping))
 			shadow = workingset_eviction(folio, target_memcg);
-		__delete_from_swap_cache(page, swap, shadow);
+		__delete_from_swap_cache(&folio->page, swap, shadow);
 		xa_unlock_irq(&mapping->i_pages);
-		put_swap_page(page, swap);
+		put_swap_page(&folio->page, swap);
 	} else {
 		void (*freepage)(struct page *);
 
@@ -1184,14 +1183,14 @@ static int __remove_mapping(struct address_space *mapping, struct page *page,
 		 * exceptional entries and shadow exceptional entries in the
 		 * same address_space.
 		 */
-		if (reclaimed && page_is_file_lru(page) &&
+		if (reclaimed && folio_is_file_lru(folio) &&
 		    !mapping_exiting(mapping) && !dax_mapping(mapping))
 			shadow = workingset_eviction(folio, target_memcg);
 		__filemap_remove_folio(folio, shadow);
 		xa_unlock_irq(&mapping->i_pages);
 
 		if (freepage != NULL)
-			freepage(page);
+			freepage(&folio->page);
 	}
 
 	return 1;
@@ -1209,13 +1208,14 @@ cannot_free:
  */
 int remove_mapping(struct address_space *mapping, struct page *page)
 {
-	if (__remove_mapping(mapping, page, false, NULL)) {
+	struct folio *folio = page_folio(page);
+	if (__remove_mapping(mapping, folio, false, NULL)) {
 		/*
 		 * Unfreezing the refcount with 1 rather than 2 effectively
 		 * drops the pagecache ref for us without requiring another
 		 * atomic operation.
 		 */
-		page_ref_unfreeze(page, 1);
+		folio_ref_unfreeze(folio, 1);
 		return 1;
 	}
 	return 0;
@@ -1398,14 +1398,16 @@ retry:
 	while (!list_empty(page_list)) {
 		struct address_space *mapping;
 		struct page *page;
+		struct folio *folio;
 		enum page_references references = PAGEREF_RECLAIM;
 		bool dirty, writeback, may_enter_fs;
 		unsigned int nr_pages;
 
 		cond_resched();
 
-		page = lru_to_page(page_list);
-		list_del(&page->lru);
+		folio = lru_to_folio(page_list);
+		list_del(&folio->lru);
+		page = &folio->page;
 
 		if (!trylock_page(page))
 			goto keep;
@@ -1757,7 +1759,7 @@ retry:
 			 */
 			count_vm_event(PGLAZYFREED);
 			count_memcg_page_event(page, PGLAZYFREED);
-		} else if (!mapping || !__remove_mapping(mapping, page, true,
+		} else if (!mapping || !__remove_mapping(mapping, folio, true,
 							 sc->target_mem_cgroup))
 			goto keep_locked;
 
