@@ -175,30 +175,32 @@ void putback_movable_pages(struct list_head *l)
 static bool remove_migration_pte(struct page *page, struct vm_area_struct *vma,
 				 unsigned long addr, void *old)
 {
-	DEFINE_PAGE_VMA_WALK(pvmw, (struct page *)old, vma, addr,
-				PVMW_SYNC | PVMW_MIGRATION);
-	struct page *new;
-	pte_t pte;
-	swp_entry_t entry;
+	struct folio *folio = page_folio(page);
+	DEFINE_FOLIO_VMA_WALK(pvmw, old, vma, addr, PVMW_SYNC | PVMW_MIGRATION);
 
 	VM_BUG_ON_PAGE(PageTail(page), page);
 	while (page_vma_mapped_walk(&pvmw)) {
-		if (PageKsm(page))
-			new = page;
-		else
-			new = page - pvmw.pgoff +
-				linear_page_index(vma, pvmw.address);
+		pte_t pte;
+		swp_entry_t entry;
+		struct page *new;
+		unsigned long idx = 0;
+
+		/* pgoff is invalid for ksm pages, but they are never large */
+		if (folio_test_large(folio) && !folio_test_hugetlb(folio))
+			idx = linear_page_index(vma, pvmw.address) - pvmw.pgoff;
+		new = folio_page(folio, idx);
 
 #ifdef CONFIG_ARCH_ENABLE_THP_MIGRATION
 		/* PMD-mapped THP migration entry */
 		if (!pvmw.pte) {
-			VM_BUG_ON_PAGE(PageHuge(page) || !PageTransCompound(page), page);
+			VM_BUG_ON_FOLIO(folio_test_hugetlb(folio) ||
+					!folio_test_pmd_mappable(folio), folio);
 			remove_migration_pmd(&pvmw, new);
 			continue;
 		}
 #endif
 
-		get_page(new);
+		folio_get(folio);
 		pte = pte_mkold(mk_pte(new, READ_ONCE(vma->vm_page_prot)));
 		if (pte_swp_soft_dirty(*pvmw.pte))
 			pte = pte_mksoft_dirty(pte);
@@ -227,13 +229,13 @@ static bool remove_migration_pte(struct page *page, struct vm_area_struct *vma,
 		}
 
 #ifdef CONFIG_HUGETLB_PAGE
-		if (PageHuge(new)) {
+		if (folio_test_hugetlb(folio)) {
 			unsigned int shift = huge_page_shift(hstate_vma(vma));
 
 			pte = pte_mkhuge(pte);
 			pte = arch_make_huge_pte(pte, shift, vma->vm_flags);
 			set_huge_pte_at(vma->vm_mm, pvmw.address, pvmw.pte, pte);
-			if (PageAnon(new))
+			if (folio_test_anon(folio))
 				hugepage_add_anon_rmap(new, vma, pvmw.address);
 			else
 				page_dup_rmap(new, true);
@@ -242,7 +244,7 @@ static bool remove_migration_pte(struct page *page, struct vm_area_struct *vma,
 		{
 			set_pte_at(vma->vm_mm, pvmw.address, pvmw.pte, pte);
 
-			if (PageAnon(new))
+			if (folio_test_anon(folio))
 				page_add_anon_rmap(new, vma, pvmw.address, false);
 			else
 				page_add_file_rmap(new, vma, false);
@@ -261,17 +263,17 @@ static bool remove_migration_pte(struct page *page, struct vm_area_struct *vma,
  * Get rid of all migration entries and replace them by
  * references to the indicated page.
  */
-void remove_migration_ptes(struct page *old, struct page *new, bool locked)
+void remove_migration_ptes(struct folio *src, struct folio *dst, bool locked)
 {
 	struct rmap_walk_control rwc = {
 		.rmap_one = remove_migration_pte,
-		.arg = old,
+		.arg = src,
 	};
 
 	if (locked)
-		rmap_walk_locked(new, &rwc);
+		rmap_walk_locked(&dst->page, &rwc);
 	else
-		rmap_walk(new, &rwc);
+		rmap_walk(&dst->page, &rwc);
 }
 
 /*
@@ -764,6 +766,7 @@ int buffer_migrate_page_norefs(struct address_space *mapping,
  */
 static int writeout(struct address_space *mapping, struct page *page)
 {
+	struct folio *folio = page_folio(page);
 	struct writeback_control wbc = {
 		.sync_mode = WB_SYNC_NONE,
 		.nr_to_write = 1,
@@ -789,7 +792,7 @@ static int writeout(struct address_space *mapping, struct page *page)
 	 * At this point we know that the migration attempt cannot
 	 * be successful.
 	 */
-	remove_migration_ptes(page, page, false);
+	remove_migration_ptes(folio, folio, false);
 
 	rc = mapping->a_ops->writepage(page, &wbc);
 
@@ -921,6 +924,7 @@ static int __unmap_and_move(struct page *page, struct page *newpage,
 				int force, enum migrate_mode mode)
 {
 	struct folio *folio = page_folio(page);
+	struct folio *dst = page_folio(newpage);
 	int rc = -EAGAIN;
 	bool page_was_mapped = false;
 	struct anon_vma *anon_vma = NULL;
@@ -1047,8 +1051,8 @@ static int __unmap_and_move(struct page *page, struct page *newpage,
 	}
 
 	if (page_was_mapped)
-		remove_migration_ptes(page,
-			rc == MIGRATEPAGE_SUCCESS ? newpage : page, false);
+		remove_migration_ptes(folio,
+			rc == MIGRATEPAGE_SUCCESS ? dst : folio, false);
 
 out_unlock_both:
 	unlock_page(newpage);
@@ -1248,7 +1252,7 @@ static int unmap_and_move_huge_page(new_page_t get_new_page,
 				enum migrate_mode mode, int reason,
 				struct list_head *ret)
 {
-	struct folio *src = page_folio(hpage);
+	struct folio *dst, *src = page_folio(hpage);
 	int rc = -EAGAIN;
 	int page_was_mapped = 0;
 	struct page *new_hpage;
@@ -1276,6 +1280,7 @@ static int unmap_and_move_huge_page(new_page_t get_new_page,
 	new_hpage = get_new_page(hpage, private);
 	if (!new_hpage)
 		return -ENOMEM;
+	dst = page_folio(new_hpage);
 
 	if (!trylock_page(hpage)) {
 		if (!force)
@@ -1336,8 +1341,8 @@ static int unmap_and_move_huge_page(new_page_t get_new_page,
 		rc = move_to_new_page(new_hpage, hpage, mode);
 
 	if (page_was_mapped)
-		remove_migration_ptes(hpage,
-			rc == MIGRATEPAGE_SUCCESS ? new_hpage : hpage, false);
+		remove_migration_ptes(src,
+			rc == MIGRATEPAGE_SUCCESS ? dst : src, false);
 
 unlock_put_anon:
 	unlock_page(new_hpage);
@@ -2622,14 +2627,16 @@ restore:
 
 	for (addr = start, i = 0; i < npages && restore; addr += PAGE_SIZE, i++) {
 		struct page *page = migrate_pfn_to_page(migrate->src[i]);
+		struct folio *folio;
 
 		if (!page || (migrate->src[i] & MIGRATE_PFN_MIGRATE))
 			continue;
 
-		remove_migration_ptes(page, page, false);
+		folio = page_folio(page);
+		remove_migration_ptes(folio, folio, false);
 
 		migrate->src[i] = 0;
-		unlock_page(page);
+		folio_unlock(folio);
 		restore--;
 
 		if (is_zone_device_page(page))
@@ -2985,6 +2992,7 @@ void migrate_vma_finalize(struct migrate_vma *migrate)
 	unsigned long i;
 
 	for (i = 0; i < npages; i++) {
+		struct folio *dst, *src;
 		struct page *newpage = migrate_pfn_to_page(migrate->dst[i]);
 		struct page *page = migrate_pfn_to_page(migrate->src[i]);
 
@@ -3004,8 +3012,10 @@ void migrate_vma_finalize(struct migrate_vma *migrate)
 			newpage = page;
 		}
 
-		remove_migration_ptes(page, newpage, false);
-		unlock_page(page);
+		src = page_folio(page);
+		dst = page_folio(newpage);
+		remove_migration_ptes(src, dst, false);
+		folio_unlock(src);
 
 		if (is_zone_device_page(page))
 			put_page(page);
