@@ -720,4 +720,9 @@ int numa_migrate_prep(struct page *page, struct vm_area_struct *vma,
 
 DECLARE_PER_CPU(struct per_cpu_nodestat, boot_nodestats);
 
+/*
+ * mm/gup.c
+ */
+struct folio *try_grab_folio(struct page *page, int refs, unsigned int flags);
+
 #endif	/* __MM_INTERNAL_H */
