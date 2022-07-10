@@ -133,7 +133,8 @@ extern unsigned long highest_memmap_pfn;
  */
 int isolate_lru_page(struct page *page);
 int folio_isolate_lru(struct folio *folio);
-extern void putback_lru_page(struct page *page);
+void putback_lru_page(struct page *page);
+void folio_putback_lru(struct folio *folio);
 
 /*
  * in mm/rmap.c:
