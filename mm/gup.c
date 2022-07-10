@@ -375,9 +375,8 @@ static inline struct page *compound_range_next(struct page *start,
 	return page;
 }
 
-static inline void compound_next(unsigned long i, unsigned long npages,
-				 struct page **list, struct page **head,
-				 unsigned int *ntails)
+static inline struct page *compound_next(struct page **list,
+		unsigned long npages, unsigned long i, unsigned int *ntails)
 {
 	struct page *page;
 	unsigned int nr;
@@ -388,8 +387,8 @@ static inline void compound_next(unsigned long i, unsigned long npages,
 			break;
 	}
 
-	*head = page;
 	*ntails = nr - i;
+	return page;
 }
 
 /**
@@ -427,7 +426,7 @@ void unpin_user_pages_dirty_lock(struct page **pages, unsigned long npages,
 	}
 
 	for (index = 0; index < npages; index += ntails) {
-		compound_next(index, npages, pages, &head, &ntails);
+		head = compound_next(pages, npages, index, &ntails);
 		/*
 		 * Checking PageDirty at this point may race with
 		 * clear_page_dirty_for_io(), but that's OK. Two key
@@ -516,7 +515,7 @@ void unpin_user_pages(struct page **pages, unsigned long npages)
 		return;
 
 	for (index = 0; index < npages; index += ntails) {
-		compound_next(index, npages, pages, &head, &ntails);
+		head = compound_next(pages, npages, index, &ntails);
 		put_compound_head(head, ntails, FOLL_PIN);
 	}
 }
