@@ -52,11 +52,11 @@ static void clear_shadow_entry(struct address_space *mapping, pgoff_t index,
 
 /*
  * Unconditionally remove exceptional entries. Usually called from truncate
- * path. Note that the pagevec may be altered by this function by removing
+ * path. Note that the folio_batch may be altered by this function by removing
  * exceptional entries similar to what pagevec_remove_exceptionals does.
  */
-static void truncate_exceptional_pvec_entries(struct address_space *mapping,
-				struct pagevec *pvec, pgoff_t *indices)
+static void truncate_folio_batch_exceptionals(struct address_space *mapping,
+				struct folio_batch *fbatch, pgoff_t *indices)
 {
 	int i, j;
 	bool dax;
@@ -65,23 +65,23 @@ static void truncate_exceptional_pvec_entries(struct address_space *mapping,
 	if (shmem_mapping(mapping))
 		return;
 
-	for (j = 0; j < pagevec_count(pvec); j++)
-		if (xa_is_value(pvec->pages[j]))
+	for (j = 0; j < folio_batch_count(fbatch); j++)
+		if (xa_is_value(fbatch->folios[j]))
 			break;
 
-	if (j == pagevec_count(pvec))
+	if (j == folio_batch_count(fbatch))
 		return;
 
 	dax = dax_mapping(mapping);
 	if (!dax)
 		xa_lock_irq(&mapping->i_pages);
 
-	for (i = j; i < pagevec_count(pvec); i++) {
-		struct page *page = pvec->pages[i];
+	for (i = j; i < folio_batch_count(fbatch); i++) {
+		struct folio *folio = fbatch->folios[i];
 		pgoff_t index = indices[i];
 
-		if (!xa_is_value(page)) {
-			pvec->pages[j++] = page;
+		if (!xa_is_value(folio)) {
+			fbatch->folios[j++] = folio;
 			continue;
 		}
 
@@ -90,19 +90,12 @@ static void truncate_exceptional_pvec_entries(struct address_space *mapping,
 			continue;
 		}
 
-		__clear_shadow_entry(mapping, index, page);
+		__clear_shadow_entry(mapping, index, folio);
 	}
 
 	if (!dax)
 		xa_unlock_irq(&mapping->i_pages);
-	pvec->nr = j;
-}
-
-static void truncate_folio_batch_exceptionals(struct address_space *mapping,
-				struct folio_batch *fbatch, pgoff_t *indices)
-{
-	truncate_exceptional_pvec_entries(mapping, (struct pagevec *)fbatch,
-						indices);
+	fbatch->nr = j;
 }
 
 /*
@@ -293,7 +286,6 @@ void truncate_inode_pages_range(struct address_space *mapping,
 	pgoff_t		end;		/* exclusive */
 	unsigned int	partial_start;	/* inclusive */
 	unsigned int	partial_end;	/* exclusive */
-	struct pagevec	pvec;
 	struct folio_batch fbatch;
 	pgoff_t		indices[PAGEVEC_SIZE];
 	pgoff_t		index;
@@ -323,18 +315,18 @@ void truncate_inode_pages_range(struct address_space *mapping,
 	else
 		end = (lend + 1) >> PAGE_SHIFT;
 
-	pagevec_init(&pvec);
+	folio_batch_init(&fbatch);
 	index = start;
 	while (index < end && find_lock_entries(mapping, index, end - 1,
-			&pvec, indices)) {
-		index = indices[pagevec_count(&pvec) - 1] + 1;
-		truncate_exceptional_pvec_entries(mapping, &pvec, indices);
-		for (i = 0; i < pagevec_count(&pvec); i++)
-			truncate_cleanup_folio(page_folio(pvec.pages[i]));
-		delete_from_page_cache_batch(mapping, &pvec);
-		for (i = 0; i < pagevec_count(&pvec); i++)
-			unlock_page(pvec.pages[i]);
-		pagevec_release(&pvec);
+			&fbatch, indices)) {
+		index = indices[folio_batch_count(&fbatch) - 1] + 1;
+		truncate_folio_batch_exceptionals(mapping, &fbatch, indices);
+		for (i = 0; i < folio_batch_count(&fbatch); i++)
+			truncate_cleanup_folio(fbatch.folios[i]);
+		delete_from_page_cache_batch(mapping, &fbatch);
+		for (i = 0; i < folio_batch_count(&fbatch); i++)
+			folio_unlock(fbatch.folios[i]);
+		folio_batch_release(&fbatch);
 		cond_resched();
 	}
 
@@ -377,7 +369,6 @@ void truncate_inode_pages_range(struct address_space *mapping,
 	if (start >= end)
 		goto out;
 
-	folio_batch_init(&fbatch);
 	index = start;
 	for ( ; ; ) {
 		cond_resched();
@@ -479,16 +470,16 @@ static unsigned long __invalidate_mapping_pages(struct address_space *mapping,
 		pgoff_t start, pgoff_t end, unsigned long *nr_pagevec)
 {
 	pgoff_t indices[PAGEVEC_SIZE];
-	struct pagevec pvec;
+	struct folio_batch fbatch;
 	pgoff_t index = start;
 	unsigned long ret;
 	unsigned long count = 0;
 	int i;
 
-	pagevec_init(&pvec);
-	while (find_lock_entries(mapping, index, end, &pvec, indices)) {
-		for (i = 0; i < pagevec_count(&pvec); i++) {
-			struct page *page = pvec.pages[i];
+	folio_batch_init(&fbatch);
+	while (find_lock_entries(mapping, index, end, &fbatch, indices)) {
+		for (i = 0; i < folio_batch_count(&fbatch); i++) {
+			struct page *page = &fbatch.folios[i]->page;
 
 			/* We rely upon deletion not changing page->index */
 			index = indices[i];
@@ -515,8 +506,8 @@ static unsigned long __invalidate_mapping_pages(struct address_space *mapping,
 			}
 			count += ret;
 		}
-		pagevec_remove_exceptionals(&pvec);
-		pagevec_release(&pvec);
+		folio_batch_remove_exceptionals(&fbatch);
+		folio_batch_release(&fbatch);
 		cond_resched();
 		index++;
 	}
