@@ -487,6 +487,7 @@ void page_cache_ra_order(struct readahead_control *ractl,
 			new_order--;
 	}
 
+	filemap_invalidate_lock_shared(mapping);
 	while (index <= limit) {
 		unsigned int order = new_order;
 
@@ -513,6 +514,7 @@ void page_cache_ra_order(struct readahead_control *ractl,
 	}
 
 	read_pages(ractl, NULL, false);
+	filemap_invalidate_unlock_shared(mapping);
 
 	/*
 	 * If there were already pages in the page cache, then we may have
