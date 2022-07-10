@@ -570,6 +570,12 @@ static inline void page_trans_huge_mapcount_unlock(struct page *page)
 
 extern bool page_trans_huge_anon_shared(struct page *);
 
+static inline int split_folio_to_list(struct folio *folio,
+		struct list_head *list)
+{
+	return split_huge_page_to_list(&folio->page, list);
+}
+
 /**
  * thp_size - Size of a transparent huge page.
  * @page: Head page of a transparent huge page.
