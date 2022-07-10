@@ -1277,7 +1277,9 @@ static void destroy_compound_gigantic_page(struct page *page,
 	}
 
 	set_compound_order(page, 0);
+#ifdef CONFIG_64BIT
 	page[1].compound_nr = 0;
+#endif
 	__ClearPageHead(page);
 }
 
@@ -1724,7 +1726,9 @@ out_error:
 	for (; j < nr_pages; j++, p = mem_map_next(p, page, j))
 		__ClearPageReserved(p);
 	set_compound_order(page, 0);
+#ifdef CONFIG_64BIT
 	page[1].compound_nr = 0;
+#endif
 	__ClearPageHead(page);
 	return false;
 }
