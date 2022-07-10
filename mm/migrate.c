@@ -920,6 +920,7 @@ out:
 static int __unmap_and_move(struct page *page, struct page *newpage,
 				int force, enum migrate_mode mode)
 {
+	struct folio *folio = page_folio(page);
 	int rc = -EAGAIN;
 	bool page_was_mapped = false;
 	struct anon_vma *anon_vma = NULL;
@@ -1023,7 +1024,7 @@ static int __unmap_and_move(struct page *page, struct page *newpage,
 		/* Establish migration ptes */
 		VM_BUG_ON_PAGE(PageAnon(page) && !PageKsm(page) && !anon_vma,
 				page);
-		try_to_migrate(page, 0);
+		try_to_migrate(folio, 0);
 		page_was_mapped = true;
 	}
 
@@ -1247,6 +1248,7 @@ static int unmap_and_move_huge_page(new_page_t get_new_page,
 				enum migrate_mode mode, int reason,
 				struct list_head *ret)
 {
+	struct folio *src = page_folio(hpage);
 	int rc = -EAGAIN;
 	int page_was_mapped = 0;
 	struct page *new_hpage;
@@ -1323,7 +1325,7 @@ static int unmap_and_move_huge_page(new_page_t get_new_page,
 			ttu |= TTU_RMAP_LOCKED;
 		}
 
-		try_to_migrate(hpage, ttu);
+		try_to_migrate(src, ttu);
 		page_was_mapped = 1;
 
 		if (mapping_locked)
@@ -2597,13 +2599,15 @@ static void migrate_vma_unmap(struct migrate_vma *migrate)
 
 	for (i = 0; i < npages; i++) {
 		struct page *page = migrate_pfn_to_page(migrate->src[i]);
+		struct folio *folio;
 
 		if (!page || !(migrate->src[i] & MIGRATE_PFN_MIGRATE))
 			continue;
 
-		if (page_mapped(page)) {
-			try_to_migrate(page, 0);
-			if (page_mapped(page))
+		folio = page_folio(page);
+		if (folio_mapped(folio)) {
+			try_to_migrate(folio, 0);
+			if (folio_mapped(folio))
 				goto restore;
 		}
 
