@@ -3531,7 +3531,7 @@ static __always_inline void slab_free(struct kmem_cache *s, struct page *page,
 #ifdef CONFIG_KASAN_GENERIC
 void ___cache_free(struct kmem_cache *cache, void *x, unsigned long addr)
 {
-	do_slab_free(cache, virt_to_head_page(x), x, NULL, 1, addr);
+	do_slab_free(cache, slab_page(virt_to_slab(x)), x, NULL, 1, addr);
 }
 #endif
 
@@ -3540,7 +3540,7 @@ void kmem_cache_free(struct kmem_cache *s, void *x)
 	s = cache_from_obj(s, x);
 	if (!s)
 		return;
-	slab_free(s, virt_to_head_page(x), x, NULL, 1, _RET_IP_);
+	slab_free(s, slab_page(virt_to_slab(x)), x, NULL, 1, _RET_IP_);
 	trace_kmem_cache_free(_RET_IP_, x, s->name);
 }
 EXPORT_SYMBOL(kmem_cache_free);
@@ -3553,16 +3553,17 @@ struct detached_freelist {
 	struct kmem_cache *s;
 };
 
-static inline void free_nonslab_page(struct page *page, void *object)
+static inline void free_large_kmalloc(struct folio *folio, void *object)
 {
-	unsigned int order = compound_order(page);
+	unsigned int order = folio_order(folio);
 
-	if (WARN_ON_ONCE(!PageCompound(page)))
+	if (WARN_ON_ONCE(order == 0))
 		pr_warn_once("object pointer: 0x%p\n", object);
 
 	kfree_hook(object);
-	mod_lruvec_page_state(page, NR_SLAB_UNRECLAIMABLE_B, -(PAGE_SIZE << order));
-	__free_pages(page, order);
+	mod_lruvec_page_state(folio_page(folio, 0), NR_SLAB_UNRECLAIMABLE_B,
+			      -(PAGE_SIZE << order));
+	__free_pages(folio_page(folio, 0), order);
 }
 
 /*
@@ -3602,7 +3603,7 @@ int build_detached_freelist(struct kmem_cache *s, size_t size,
 	if (!s) {
 		/* Handle kalloc'ed objects */
 		if (unlikely(!folio_test_slab(folio))) {
-			free_nonslab_page(folio_page(folio, 0), object);
+			free_large_kmalloc(folio, object);
 			p[size] = NULL; /* mark object processed */
 			return size;
 		}
@@ -4575,7 +4576,8 @@ EXPORT_SYMBOL(__ksize);
 
 void kfree(const void *x)
 {
-	struct page *page;
+	struct folio *folio;
+	struct slab *slab;
 	void *object = (void *)x;
 
 	trace_kfree(_RET_IP_, x);
@@ -4583,12 +4585,13 @@ void kfree(const void *x)
 	if (unlikely(ZERO_OR_NULL_PTR(x)))
 		return;
 
-	page = virt_to_head_page(x);
-	if (unlikely(!PageSlab(page))) {
-		free_nonslab_page(page, object);
+	folio = virt_to_folio(x);
+	if (unlikely(!folio_test_slab(folio))) {
+		free_large_kmalloc(folio, object);
 		return;
 	}
-	slab_free(page->slab_cache, page, object, NULL, 1, _RET_IP_);
+	slab = folio_slab(folio);
+	slab_free(slab->slab_cache, slab_page(slab), object, NULL, 1, _RET_IP_);
 }
 EXPORT_SYMBOL(kfree);
 
