@@ -5,6 +5,12 @@ SUBLEVEL = 0
 EXTRAVERSION =
 NAME = Opossums on Parade
 
+# DRM backport version
+#
+RHEL_DRM_VERSION = 5
+RHEL_DRM_PATCHLEVEL = 18
+RHEL_DRM_SUBLEVEL = 
+
 # *DOCUMENTATION*
 # To see a list of typical targets execute "make help"
 # More info can be located in ./README
