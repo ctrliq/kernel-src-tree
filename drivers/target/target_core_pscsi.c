@@ -588,7 +588,7 @@ static void pscsi_destroy_device(struct se_device *dev)
 }
 
 static void pscsi_complete_cmd(struct se_cmd *cmd, u8 scsi_status,
-			       unsigned char *req_sense)
+			       unsigned char *req_sense, int valid_data)
 {
 	struct pscsi_dev_virt *pdv = PSCSI_DEV(cmd->se_dev);
 	struct scsi_device *sd = pdv->pdv_sd;
@@ -681,7 +681,7 @@ after_mode_select:
 		 * back despite framework assumption that a
 		 * check condition means there is no data
 		 */
-		if (sd->type == TYPE_TAPE &&
+		if (sd->type == TYPE_TAPE && valid_data &&
 		    cmd->data_direction == DMA_FROM_DEVICE) {
 			/*
 			 * is sense data valid, fixed format,
@@ -1003,6 +1003,7 @@ static void pscsi_req_done(struct request *req, blk_status_t status)
 	struct se_cmd *cmd = req->end_io_data;
 	int result = scsi_req(req)->result;
 	enum sam_status scsi_status = result & 0xff;
+	int valid_data = cmd->data_length - scsi_req(req)->resid_len;
 	u8 *cdb = cmd->priv;
 
 	if (scsi_status != SAM_STAT_GOOD) {
@@ -1010,12 +1011,12 @@ static void pscsi_req_done(struct request *req, blk_status_t status)
 			" 0x%02x Result: 0x%08x\n", cmd, cdb[0], result);
 	}
 
-	pscsi_complete_cmd(cmd, scsi_status, scsi_req(req)->sense);
+	pscsi_complete_cmd(cmd, scsi_status, scsi_req(req)->sense, valid_data);
 
 	switch (host_byte(result)) {
 	case DID_OK:
 		target_complete_cmd_with_length(cmd, scsi_status,
-			cmd->data_length - scsi_req(req)->resid_len);
+			valid_data);
 		break;
 	default:
 		pr_debug("PSCSI Host Byte exception at cmd: %p CDB:"
