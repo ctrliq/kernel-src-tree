@@ -341,7 +341,6 @@ lpfc_dump_wakeup_param_cmpl(struct lpfc_hba *phba, LPFC_MBOXQ_t *pmboxq)
 
 /**
  * lpfc_update_vport_wwn - Updates the fc_nodename, fc_portname,
- *	cfg_soft_wwnn, cfg_soft_wwpn
  * @vport: pointer to lpfc vport data structure.
  *
  *
@@ -351,22 +350,13 @@ lpfc_dump_wakeup_param_cmpl(struct lpfc_hba *phba, LPFC_MBOXQ_t *pmboxq)
 void
 lpfc_update_vport_wwn(struct lpfc_vport *vport)
 {
-	uint8_t vvvl = vport->fc_sparam.cmn.valid_vendor_ver_level;
-	u32 *fawwpn_key = (u32 *)&vport->fc_sparam.un.vendorVersion[0];
-
-	/* If the soft name exists then update it using the service params */
-	if (vport->phba->cfg_soft_wwnn)
-		u64_to_wwn(vport->phba->cfg_soft_wwnn,
-			   vport->fc_sparam.nodeName.u.wwn);
-	if (vport->phba->cfg_soft_wwpn)
-		u64_to_wwn(vport->phba->cfg_soft_wwpn,
-			   vport->fc_sparam.portName.u.wwn);
+	struct lpfc_hba *phba = vport->phba;
 
 	/*
 	 * If the name is empty or there exists a soft name
 	 * then copy the service params name, otherwise use the fc name
 	 */
-	if (vport->fc_nodename.u.wwn[0] == 0 || vport->phba->cfg_soft_wwnn)
+	if (vport->fc_nodename.u.wwn[0] == 0)
 		memcpy(&vport->fc_nodename, &vport->fc_sparam.nodeName,
 			sizeof(struct lpfc_name));
 	else
@@ -379,22 +369,35 @@ lpfc_update_vport_wwn(struct lpfc_vport *vport)
 	 */
 	if (vport->fc_portname.u.wwn[0] != 0 &&
 		memcmp(&vport->fc_portname, &vport->fc_sparam.portName,
-			sizeof(struct lpfc_name)))
+		       sizeof(struct lpfc_name))) {
 		vport->vport_flag |= FAWWPN_PARAM_CHG;
 
-	if (vport->fc_portname.u.wwn[0] == 0 ||
-	    vport->phba->cfg_soft_wwpn ||
-	    (vvvl == 1 && cpu_to_be32(*fawwpn_key) == FAPWWN_KEY_VENDOR) ||
-	    vport->vport_flag & FAWWPN_SET) {
-		memcpy(&vport->fc_portname, &vport->fc_sparam.portName,
-			sizeof(struct lpfc_name));
-		vport->vport_flag &= ~FAWWPN_SET;
-		if (vvvl == 1 && cpu_to_be32(*fawwpn_key) == FAPWWN_KEY_VENDOR)
-			vport->vport_flag |= FAWWPN_SET;
+		if (phba->sli_rev == LPFC_SLI_REV4 &&
+		    vport->port_type == LPFC_PHYSICAL_PORT &&
+		    phba->sli4_hba.fawwpn_flag & LPFC_FAWWPN_FABRIC) {
+			if (!(phba->sli4_hba.fawwpn_flag & LPFC_FAWWPN_CONFIG))
+				phba->sli4_hba.fawwpn_flag &=
+						~LPFC_FAWWPN_FABRIC;
+			lpfc_printf_log(phba, KERN_INFO,
+					LOG_SLI | LOG_DISCOVERY | LOG_ELS,
+					"2701 FA-PWWN change WWPN from %llx to "
+					"%llx: vflag x%x fawwpn_flag x%x\n",
+					wwn_to_u64(vport->fc_portname.u.wwn),
+					wwn_to_u64
+					   (vport->fc_sparam.portName.u.wwn),
+					vport->vport_flag,
+					phba->sli4_hba.fawwpn_flag);
+			memcpy(&vport->fc_portname, &vport->fc_sparam.portName,
+			       sizeof(struct lpfc_name));
+		}
 	}
+
+	if (vport->fc_portname.u.wwn[0] == 0)
+		memcpy(&vport->fc_portname, &vport->fc_sparam.portName,
+		       sizeof(struct lpfc_name));
 	else
 		memcpy(&vport->fc_sparam.portName, &vport->fc_portname,
-			sizeof(struct lpfc_name));
+		       sizeof(struct lpfc_name));
 }
 
 /**
@@ -2415,6 +2418,90 @@ lpfc_parse_vpd(struct lpfc_hba *phba, uint8_t *vpd, int len)
 }
 
 /**
+ * lpfc_get_atto_model_desc - Retrieve ATTO HBA device model name and description
+ * @phba: pointer to lpfc hba data structure.
+ * @mdp: pointer to the data structure to hold the derived model name.
+ * @descp: pointer to the data structure to hold the derived description.
+ *
+ * This routine retrieves HBA's description based on its registered PCI device
+ * ID. The @descp passed into this function points to an array of 256 chars. It
+ * shall be returned with the model name, maximum speed, and the host bus type.
+ * The @mdp passed into this function points to an array of 80 chars. When the
+ * function returns, the @mdp will be filled with the model name.
+ **/
+static void
+lpfc_get_atto_model_desc(struct lpfc_hba *phba, uint8_t *mdp, uint8_t *descp)
+{
+	uint16_t sub_dev_id = phba->pcidev->subsystem_device;
+	char *model = "<Unknown>";
+	int tbolt = 0;
+
+	switch (sub_dev_id) {
+	case PCI_DEVICE_ID_CLRY_161E:
+		model = "161E";
+		break;
+	case PCI_DEVICE_ID_CLRY_162E:
+		model = "162E";
+		break;
+	case PCI_DEVICE_ID_CLRY_164E:
+		model = "164E";
+		break;
+	case PCI_DEVICE_ID_CLRY_161P:
+		model = "161P";
+		break;
+	case PCI_DEVICE_ID_CLRY_162P:
+		model = "162P";
+		break;
+	case PCI_DEVICE_ID_CLRY_164P:
+		model = "164P";
+		break;
+	case PCI_DEVICE_ID_CLRY_321E:
+		model = "321E";
+		break;
+	case PCI_DEVICE_ID_CLRY_322E:
+		model = "322E";
+		break;
+	case PCI_DEVICE_ID_CLRY_324E:
+		model = "324E";
+		break;
+	case PCI_DEVICE_ID_CLRY_321P:
+		model = "321P";
+		break;
+	case PCI_DEVICE_ID_CLRY_322P:
+		model = "322P";
+		break;
+	case PCI_DEVICE_ID_CLRY_324P:
+		model = "324P";
+		break;
+	case PCI_DEVICE_ID_TLFC_2XX2:
+		model = "2XX2";
+		tbolt = 1;
+		break;
+	case PCI_DEVICE_ID_TLFC_3162:
+		model = "3162";
+		tbolt = 1;
+		break;
+	case PCI_DEVICE_ID_TLFC_3322:
+		model = "3322";
+		tbolt = 1;
+		break;
+	default:
+		model = "Unknown";
+		break;
+	}
+
+	if (mdp && mdp[0] == '\0')
+		snprintf(mdp, 79, "%s", model);
+
+	if (descp && descp[0] == '\0')
+		snprintf(descp, 255,
+			 "ATTO %s%s, Fibre Channel Adapter Initiator, Port %s",
+			 (tbolt) ? "ThunderLink FC " : "Celerity FC-",
+			 model,
+			 phba->Port);
+}
+
+/**
  * lpfc_get_hba_model_desc - Retrieve HBA device model name and description
  * @phba: pointer to lpfc hba data structure.
  * @mdp: pointer to the data structure to hold the derived model name.
@@ -2443,6 +2530,11 @@ lpfc_get_hba_model_desc(struct lpfc_hba *phba, uint8_t *mdp, uint8_t *descp)
 	if (mdp && mdp[0] != '\0'
 		&& descp && descp[0] != '\0')
 		return;
+
+	if (phba->pcidev->vendor == PCI_VENDOR_ID_ATTO) {
+		lpfc_get_atto_model_desc(phba, mdp, descp);
+		return;
+	}
 
 	if (phba->lmt & LMT_64Gb)
 		max_speed = 64;
@@ -2592,11 +2684,6 @@ lpfc_get_hba_model_desc(struct lpfc_hba *phba, uint8_t *mdp, uint8_t *descp)
 		break;
 	case PCI_DEVICE_ID_SAT_S:
 		m = (typeof(m)){"LPe12000-S", "PCIe", "Fibre Channel Adapter"};
-		break;
-	case PCI_DEVICE_ID_HORNET:
-		m = (typeof(m)){"LP21000", "PCIe",
-				"Obsolete, Unsupported FCoE Adapter"};
-		GE = 1;
 		break;
 	case PCI_DEVICE_ID_PROTEUS_VF:
 		m = (typeof(m)){"LPev12000", "PCIe IOV",
@@ -6539,12 +6626,15 @@ lpfc_sli4_async_sli_evt(struct lpfc_hba *phba, struct lpfc_acqe_sli *acqe_sli)
 	case LPFC_SLI_EVENT_TYPE_MISCONF_FAWWN:
 		/* Misconfigured WWN. Reports that the SLI Port is configured
 		 * to use FA-WWN, but the attached device doesn’t support it.
-		 * No driver action is required.
 		 * Event Data1 - N.A, Event Data2 - N.A
+		 * This event only happens on the physical port.
 		 */
-		lpfc_log_msg(phba, KERN_WARNING, LOG_SLI,
-			     "2699 Misconfigured FA-WWN - Attached device does "
-			     "not support FA-WWN\n");
+		lpfc_log_msg(phba, KERN_WARNING, LOG_SLI | LOG_DISCOVERY,
+			     "2699 Misconfigured FA-PWWN - Attached device "
+			     "does not support FA-PWWN\n");
+		phba->sli4_hba.fawwpn_flag &= ~LPFC_FAWWPN_FABRIC;
+		memset(phba->pport->fc_portname.u.wwn, 0,
+		       sizeof(struct lpfc_name));
 		break;
 	case LPFC_SLI_EVENT_TYPE_EEPROM_FAILURE:
 		/* EEPROM failure. No driver action is required */
@@ -7600,7 +7690,6 @@ lpfc_setup_driver_resource_phase1(struct lpfc_hba *phba)
 	INIT_LIST_HEAD(&phba->port_list);
 
 	INIT_LIST_HEAD(&phba->work_list);
-	init_waitqueue_head(&phba->wait_4_mlo_m_q);
 
 	/* Initialize the wait queue head for the kernel thread */
 	init_waitqueue_head(&phba->work_waitq);
@@ -7683,13 +7772,6 @@ lpfc_sli_driver_resource_setup(struct lpfc_hba *phba)
 	rc = lpfc_setup_driver_resource_phase1(phba);
 	if (rc)
 		return -ENODEV;
-
-	if (phba->pcidev->device == PCI_DEVICE_ID_HORNET) {
-		phba->menlo_flag |= HBA_MENLO_SUPPORT;
-		/* check for menlo minimum sg count */
-		if (phba->cfg_sg_seg_cnt < LPFC_DEFAULT_MENLO_SG_SEG_CNT)
-			phba->cfg_sg_seg_cnt = LPFC_DEFAULT_MENLO_SG_SEG_CNT;
-	}
 
 	if (!phba->sli.sli3_ring)
 		phba->sli.sli3_ring = kcalloc(LPFC_SLI3_MAX_RING,
@@ -7996,6 +8078,18 @@ lpfc_sli4_driver_resource_setup(struct lpfc_hba *phba)
 	rc = lpfc_sli4_read_config(phba);
 	if (unlikely(rc))
 		goto out_free_bsmbx;
+
+	if (phba->sli4_hba.fawwpn_flag & LPFC_FAWWPN_CONFIG) {
+		/* Right now the link is down, if FA-PWWN is configured the
+		 * firmware will try FLOGI before the driver gets a link up.
+		 * If it fails, the driver should get a MISCONFIGURED async
+		 * event which will clear this flag. The only notification
+		 * the driver gets is if it fails, if it succeeds there is no
+		 * notification given. Assume success.
+		 */
+		phba->sli4_hba.fawwpn_flag |= LPFC_FAWWPN_FABRIC;
+	}
+
 	rc = lpfc_mem_alloc_active_rrq_pool_s4(phba);
 	if (unlikely(rc))
 		goto out_free_bsmbx;
@@ -9820,7 +9914,7 @@ lpfc_sli4_read_config(struct lpfc_hba *phba)
 	struct lpfc_rsrc_desc_fcfcoe *desc;
 	char *pdesc_0;
 	uint16_t forced_link_speed;
-	uint32_t if_type, qmin;
+	uint32_t if_type, qmin, fawwpn;
 	int length, i, rc = 0, rc2;
 
 	pmb = (LPFC_MBOXQ_t *) mempool_alloc(phba->mbox_mem_pool, GFP_KERNEL);
@@ -9862,10 +9956,24 @@ lpfc_sli4_read_config(struct lpfc_hba *phba)
 			phba->sli4_hba.bbscn_params.word0 = rd_config->word8;
 		}
 
+		fawwpn = bf_get(lpfc_mbx_rd_conf_fawwpn, rd_config);
+
+		if (fawwpn) {
+			lpfc_printf_log(phba, KERN_INFO,
+					LOG_INIT | LOG_DISCOVERY,
+					"2702 READ_CONFIG: FA-PWWN is "
+					"configured on\n");
+			phba->sli4_hba.fawwpn_flag |= LPFC_FAWWPN_CONFIG;
+		} else {
+			/* Clear FW configured flag, preserve driver flag */
+			phba->sli4_hba.fawwpn_flag &= ~LPFC_FAWWPN_CONFIG;
+		}
+
 		phba->sli4_hba.conf_trunk =
 			bf_get(lpfc_mbx_rd_conf_trunk, rd_config);
 		phba->sli4_hba.extents_in_use =
 			bf_get(lpfc_mbx_rd_conf_extnts_inuse, rd_config);
+
 		phba->sli4_hba.max_cfg_param.max_xri =
 			bf_get(lpfc_mbx_rd_conf_xri_count, rd_config);
 		/* Reduce resource usage in kdump environment */
@@ -12071,7 +12179,7 @@ lpfc_sli_enable_msi(struct lpfc_hba *phba)
 	rc = pci_enable_msi(phba->pcidev);
 	if (!rc)
 		lpfc_printf_log(phba, KERN_INFO, LOG_INIT,
-				"0462 PCI enable MSI mode success.\n");
+				"0012 PCI enable MSI mode success.\n");
 	else {
 		lpfc_printf_log(phba, KERN_INFO, LOG_INIT,
 				"0471 PCI enable MSI mode failed (%d)\n", rc);
