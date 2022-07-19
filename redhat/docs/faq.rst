@@ -72,7 +72,6 @@ Yes.
 
 .. code-block:: sh
 
-   # use baseonly to skip building userspace tools to avoid failures
-   make dist-srpm-baseonly
-   brew build --scratch rhel-9.0.0-candidate <srpm>
-
+   # this target requires internal Red Hat network access and will always
+   # build against the latest RHEL major compose
+   make dist-brew
