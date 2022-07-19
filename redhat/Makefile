@@ -262,7 +262,11 @@ else
   SINGLE_TARBALL:=1
   RHDISTGIT_BRANCH:=rhel-$(RHEL_MAJOR).$(RHEL_MINOR).0
   ifndef BUILD_TARGET
-    BUILD_TARGET:=rhel-$(RHEL_MAJOR)-scratch
+    ifeq ("$(DIST)", ".eln")
+      BUILD_TARGET:=eln
+    else
+      BUILD_TARGET:=rhel-$(RHEL_MAJOR)-scratch
+    endif
   endif
   SPECTARFILE_RELEASE:=$(BASEVERSION)
   SPECKABIVERSION:=$(BASEVERSION)
