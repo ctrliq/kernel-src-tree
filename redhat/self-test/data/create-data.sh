@@ -50,11 +50,21 @@ do
 				grep -v -w RHGITURL |\
 				grep -v -w RHDISTDATADIR |\
 				grep -v -w VARS |\
-				sort -u >& "${varfilename}"
+				sort -u >& "${varfilename}" &
+
+			waitpids[${count}]=$!
+			((count++))
 
 			echo "building ${varfilename}.spec"
 			make RHSELFTESTDATA=1 DIST="${DIST}" DISTRO="${DISTRO}" HEAD=${commit} setup-source
 			 grep -Fvx -f "./kernel.spec.template" "$specfile" > "${varfilename}".spec
+		done
+
+		# There isn't an easy way to make sure the parallel execution doesn't go crazy
+		# and hammer a system.  Putting the wait loop here will artificially limit the
+		# number of jobs.
+		for pid in ${waitpids[*]}; do
+			wait ${pid}
 		done
 	done
 done
