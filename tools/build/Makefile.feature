@@ -99,6 +99,7 @@ FEATURE_TESTS_EXTRA :=                  \
          clang                          \
          libbpf                         \
          libbpf-bpf_object__next_program \
+         libbpf-bpf_object__next_map    \
          libpfm4                        \
          libdebuginfod			\
          clang-bpf-co-re
