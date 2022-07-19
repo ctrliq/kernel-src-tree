@@ -22,6 +22,16 @@ sources="${SOURCES}"
 makefile_vars=$(unset SINGLE_TARBALL; make dist-dump-variables | grep "=" | cut -d"=" -f1)
 while read -r VAR; do unset "$VAR"; done < <(echo "$makefile_vars")
 
+specfile_helper () {
+	local specfilename
+
+	specfilename=$1
+	cp ./kernel.spec.template ${varfilename}.spec.template
+	make RHSELFTESTDATA=1 SPECFILE="${specfilename}.spec" DIST="${DIST}" DISTRO="${DISTRO}" HEAD=${commit} _setup-source
+	grep -Fvx -f "${specfilename}.spec.template" "${sources}/${specfilename}.spec" > "${destdir}"/"${specfilename}".spec
+	rm -f ${specfilename}.spec.template
+}
+
 for DISTRO in fedora rhel centos
 do
 	for commit in 78e36f3b0dae 2585cf9dfaad df0cc57e057f fce15c45d3fb
@@ -56,8 +66,9 @@ do
 			((count++))
 
 			echo "building ${destdir}/${varfilename}.spec"
-			make RHSELFTESTDATA=1 DIST="${DIST}" DISTRO="${DISTRO}" HEAD=${commit} setup-source
-			grep -Fvx -f "./kernel.spec.template" "${sources}/kernel.spec" > "${destdir}"/"${varfilename}".spec
+			specfile_helper "${varfilename}" &
+			waitpids[${count}]=$!
+			((count++))
 		done
 
 		# There isn't an easy way to make sure the parallel execution doesn't go crazy
