@@ -587,7 +587,7 @@ static bool wakeup_source_not_registered(struct wakeup_source *ws)
  * @ws: Wakeup source to handle.
  *
  * Update the @ws' statistics and, if @ws has just been activated, notify the PM
- * core of the event by incrementing the counter of of wakeup events being
+ * core of the event by incrementing the counter of the wakeup events being
  * processed.
  */
 static void wakeup_source_activate(struct wakeup_source *ws)
@@ -733,7 +733,7 @@ static void wakeup_source_deactivate(struct wakeup_source *ws)
 
 	/*
 	 * Increment the counter of registered wakeup events and decrement the
-	 * couter of wakeup events in progress simultaneously.
+	 * counter of wakeup events in progress simultaneously.
 	 */
 	cec = atomic_add_return(MAX_IN_PROGRESS, &combined_event_count);
 	trace_wakeup_source_deactivate(ws->name, cec);
@@ -1207,7 +1207,7 @@ static const struct file_operations wakeup_sources_stats_fops = {
 
 static int __init wakeup_sources_debugfs_init(void)
 {
-	debugfs_create_file("wakeup_sources", S_IRUGO, NULL, NULL,
+	debugfs_create_file("wakeup_sources", 0444, NULL, NULL,
 			    &wakeup_sources_stats_fops);
 	return 0;
 }

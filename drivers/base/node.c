@@ -79,7 +79,7 @@ static BIN_ATTR_RO(cpulist, 0);
 struct node_access_nodes {
 	struct device		dev;
 	struct list_head	list_node;
-	unsigned		access;
+	unsigned int		access;
 #ifdef CONFIG_HMEM_REPORTING
 	struct node_hmem_attrs	hmem_attrs;
 #endif
@@ -126,7 +126,7 @@ static void node_access_release(struct device *dev)
 }
 
 static struct node_access_nodes *node_init_node_access(struct node *node,
-						       unsigned access)
+						       unsigned int access)
 {
 	struct node_access_nodes *access_node;
 	struct device *dev;
@@ -191,7 +191,7 @@ static struct attribute *access_attrs[] = {
  * @access: The access class the for the given attributes
  */
 void node_set_perf_attrs(unsigned int nid, struct node_hmem_attrs *hmem_attrs,
-			 unsigned access)
+			 unsigned int access)
 {
 	struct node_access_nodes *c;
 	struct node *node;
@@ -731,7 +731,7 @@ int register_cpu_under_node(unsigned int cpu, unsigned int nid)
  */
 int register_memory_node_under_compute_node(unsigned int mem_nid,
 					    unsigned int cpu_nid,
-					    unsigned access)
+					    unsigned int access)
 {
 	struct node *init_node, *targ_node;
 	struct node_access_nodes *initiator, *target;
