@@ -784,12 +784,13 @@ void print_tracking(struct kmem_cache *s, void *object)
 	print_track("Freed", get_track(s, object, TRACK_FREE), pr_time);
 }
 
-static void print_page_info(struct page *page)
+static void print_slab_info(const struct slab *slab)
 {
-	pr_err("Slab 0x%p objects=%u used=%u fp=0x%p flags=%pGp\n",
-	       page, page->objects, page->inuse, page->freelist,
-	       &page->flags);
+	struct folio *folio = (struct folio *)slab_folio(slab);
 
+	pr_err("Slab 0x%p objects=%u used=%u fp=0x%p flags=%pGp\n",
+	       slab, slab->objects, slab->inuse, slab->freelist,
+	       folio_flags(folio, 0));
 }
 
 static void slab_bug(struct kmem_cache *s, char *fmt, ...)
@@ -843,7 +844,7 @@ static void print_trailer(struct kmem_cache *s, struct page *page, u8 *p)
 
 	print_tracking(s, p);
 
-	print_page_info(page);
+	print_slab_info(page_slab(page));
 
 	pr_err("Object 0x%p @offset=%tu fp=0x%p\n\n",
 	       p, p - addr, get_freepointer(s, p));
@@ -899,7 +900,7 @@ static __printf(3, 4) void slab_err(struct kmem_cache *s, struct page *page,
 	vsnprintf(buf, sizeof(buf), fmt, args);
 	va_end(args);
 	slab_bug(s, "%s", buf);
-	print_page_info(page);
+	print_slab_info(page_slab(page));
 	dump_stack();
 	add_taint(TAINT_BAD_PAGE, LOCKDEP_NOW_UNRELIABLE);
 }
@@ -1783,18 +1784,27 @@ static void *setup_object(struct kmem_cache *s, struct page *page,
 /*
  * Slab allocation and freeing
  */
-static inline struct page *alloc_slab_page(struct kmem_cache *s,
+static inline struct slab *alloc_slab_page(struct kmem_cache *s,
 		gfp_t flags, int node, struct kmem_cache_order_objects oo)
 {
-	struct page *page;
+	struct folio *folio;
+	struct slab *slab;
 	unsigned int order = oo_order(oo);
 
 	if (node == NUMA_NO_NODE)
-		page = alloc_pages(flags, order);
+		folio = (struct folio *)alloc_pages(flags, order);
 	else
-		page = __alloc_pages_node(node, flags, order);
+		folio = (struct folio *)__alloc_pages_node(node, flags, order);
 
-	return page;
+	if (!folio)
+		return NULL;
+
+	slab = folio_slab(folio);
+	__folio_set_slab(folio);
+	if (page_is_pfmemalloc(folio_page(folio, 0)))
+		slab_set_pfmemalloc(slab);
+
+	return slab;
 }
 
 #ifdef CONFIG_SLAB_FREELIST_RANDOM
@@ -1927,7 +1937,7 @@ static struct page *allocate_slab(struct kmem_cache *s, gfp_t flags, int node)
 	if ((alloc_gfp & __GFP_DIRECT_RECLAIM) && oo_order(oo) > oo_order(s->min))
 		alloc_gfp = (alloc_gfp | __GFP_NOMEMALLOC) & ~(__GFP_RECLAIM|__GFP_NOFAIL);
 
-	page = alloc_slab_page(s, alloc_gfp, node, oo);
+	page = slab_page(alloc_slab_page(s, alloc_gfp, node, oo));
 	if (unlikely(!page)) {
 		oo = s->min;
 		alloc_gfp = flags;
@@ -1935,7 +1945,7 @@ static struct page *allocate_slab(struct kmem_cache *s, gfp_t flags, int node)
 		 * Allocation may have failed due to fragmentation.
 		 * Try a lower order alloc if possible
 		 */
-		page = alloc_slab_page(s, alloc_gfp, node, oo);
+		page = slab_page(alloc_slab_page(s, alloc_gfp, node, oo));
 		if (unlikely(!page))
 			goto out;
 		stat(s, ORDER_FALLBACK);
@@ -1943,12 +1953,9 @@ static struct page *allocate_slab(struct kmem_cache *s, gfp_t flags, int node)
 
 	page->objects = oo_objects(oo);
 
-	account_slab_page(page, oo_order(oo), s, flags);
+	account_slab(page_slab(page), oo_order(oo), s, flags);
 
 	page->slab_cache = s;
-	__SetPageSlab(page);
-	if (page_is_pfmemalloc(page))
-		SetPageSlabPfmemalloc(page);
 
 	kasan_poison_slab(page);
 
@@ -1994,35 +2001,34 @@ static struct page *new_slab(struct kmem_cache *s, gfp_t flags, int node)
 		flags & (GFP_RECLAIM_MASK | GFP_CONSTRAINT_MASK), node);
 }
 
-static void __free_slab(struct kmem_cache *s, struct page *page)
+static void __free_slab(struct kmem_cache *s, struct slab *slab)
 {
-	int order = compound_order(page);
+	struct folio *folio = slab_folio(slab);
+	int order = folio_order(folio);
 	int pages = 1 << order;
 
 	if (kmem_cache_debug_flags(s, SLAB_CONSISTENCY_CHECKS)) {
 		void *p;
 
-		slab_pad_check(s, page);
-		for_each_object(p, s, page_address(page),
-						page->objects)
-			check_object(s, page, p, SLUB_RED_INACTIVE);
+		slab_pad_check(s, folio_page(folio, 0));
+		for_each_object(p, s, slab_address(slab), slab->objects)
+			check_object(s, folio_page(folio, 0), p, SLUB_RED_INACTIVE);
 	}
 
-	__ClearPageSlabPfmemalloc(page);
-	__ClearPageSlab(page);
-	/* In union with page->mapping where page allocator expects NULL */
-	page->slab_cache = NULL;
+	__slab_clear_pfmemalloc(slab);
+	__folio_clear_slab(folio);
+	folio->mapping = NULL;
 	if (current->reclaim_state)
 		current->reclaim_state->reclaimed_slab += pages;
-	unaccount_slab_page(page, order, s);
-	__free_pages(page, order);
+	unaccount_slab(slab, order, s);
+	__free_pages(folio_page(folio, 0), order);
 }
 
 static void rcu_free_slab(struct rcu_head *h)
 {
 	struct page *page = container_of(h, struct page, rcu_head);
 
-	__free_slab(page->slab_cache, page);
+	__free_slab(page->slab_cache, page_slab(page));
 }
 
 static void free_slab(struct kmem_cache *s, struct page *page)
@@ -2030,7 +2036,7 @@ static void free_slab(struct kmem_cache *s, struct page *page)
 	if (unlikely(s->flags & SLAB_TYPESAFE_BY_RCU)) {
 		call_rcu(&page->rcu_head, rcu_free_slab);
 	} else
-		__free_slab(s, page);
+		__free_slab(s, page_slab(page));
 }
 
 static void discard_slab(struct kmem_cache *s, struct page *page)
@@ -3531,7 +3537,7 @@ static __always_inline void slab_free(struct kmem_cache *s, struct page *page,
 #ifdef CONFIG_KASAN_GENERIC
 void ___cache_free(struct kmem_cache *cache, void *x, unsigned long addr)
 {
-	do_slab_free(cache, virt_to_head_page(x), x, NULL, 1, addr);
+	do_slab_free(cache, slab_page(virt_to_slab(x)), x, NULL, 1, addr);
 }
 #endif
 
@@ -3540,36 +3546,37 @@ void kmem_cache_free(struct kmem_cache *s, void *x)
 	s = cache_from_obj(s, x);
 	if (!s)
 		return;
-	slab_free(s, virt_to_head_page(x), x, NULL, 1, _RET_IP_);
+	slab_free(s, slab_page(virt_to_slab(x)), x, NULL, 1, _RET_IP_);
 	trace_kmem_cache_free(_RET_IP_, x, s->name);
 }
 EXPORT_SYMBOL(kmem_cache_free);
 
 struct detached_freelist {
-	struct page *page;
+	struct slab *slab;
 	void *tail;
 	void *freelist;
 	int cnt;
 	struct kmem_cache *s;
 };
 
-static inline void free_nonslab_page(struct page *page, void *object)
+static inline void free_large_kmalloc(struct folio *folio, void *object)
 {
-	unsigned int order = compound_order(page);
+	unsigned int order = folio_order(folio);
 
-	if (WARN_ON_ONCE(!PageCompound(page)))
+	if (WARN_ON_ONCE(order == 0))
 		pr_warn_once("object pointer: 0x%p\n", object);
 
 	kfree_hook(object);
-	mod_lruvec_page_state(page, NR_SLAB_UNRECLAIMABLE_B, -(PAGE_SIZE << order));
-	__free_pages(page, order);
+	mod_lruvec_page_state(folio_page(folio, 0), NR_SLAB_UNRECLAIMABLE_B,
+			      -(PAGE_SIZE << order));
+	__free_pages(folio_page(folio, 0), order);
 }
 
 /*
  * This function progressively scans the array with free objects (with
  * a limited look ahead) and extract objects belonging to the same
- * page.  It builds a detached freelist directly within the given
- * page/objects.  This can happen without any need for
+ * slab.  It builds a detached freelist directly within the given
+ * slab/objects.  This can happen without any need for
  * synchronization, because the objects are owned by running process.
  * The freelist is build up as a single linked list in the objects.
  * The idea is, that this detached freelist can then be bulk
@@ -3584,10 +3591,11 @@ int build_detached_freelist(struct kmem_cache *s, size_t size,
 	size_t first_skipped_index = 0;
 	int lookahead = 3;
 	void *object;
-	struct page *page;
+	struct folio *folio;
+	struct slab *slab;
 
 	/* Always re-init detached_freelist */
-	df->page = NULL;
+	df->slab = NULL;
 
 	do {
 		object = p[--size];
@@ -3597,17 +3605,19 @@ int build_detached_freelist(struct kmem_cache *s, size_t size,
 	if (!object)
 		return 0;
 
-	page = virt_to_head_page(object);
+	folio = virt_to_folio(object);
 	if (!s) {
 		/* Handle kalloc'ed objects */
-		if (unlikely(!PageSlab(page))) {
-			free_nonslab_page(page, object);
+		if (unlikely(!folio_test_slab(folio))) {
+			free_large_kmalloc(folio, object);
 			p[size] = NULL; /* mark object processed */
 			return size;
 		}
 		/* Derive kmem_cache from object */
-		df->s = page->slab_cache;
+		slab = folio_slab(folio);
+		df->s = slab->slab_cache;
 	} else {
+		slab = folio_slab(folio);
 		df->s = cache_from_obj(s, object); /* Support for memcg */
 	}
 
@@ -3619,7 +3629,7 @@ int build_detached_freelist(struct kmem_cache *s, size_t size,
 	}
 
 	/* Start new detached freelist */
-	df->page = page;
+	df->slab = slab;
 	set_freepointer(df->s, object, NULL);
 	df->tail = object;
 	df->freelist = object;
@@ -3631,8 +3641,8 @@ int build_detached_freelist(struct kmem_cache *s, size_t size,
 		if (!object)
 			continue; /* Skip processed objects */
 
-		/* df->page is always set at this point */
-		if (df->page == virt_to_head_page(object)) {
+		/* df->slab is always set at this point */
+		if (df->slab == virt_to_slab(object)) {
 			/* Opportunity build freelist */
 			set_freepointer(df->s, object, df->freelist);
 			df->freelist = object;
@@ -3664,10 +3674,10 @@ void kmem_cache_free_bulk(struct kmem_cache *s, size_t size, void **p)
 		struct detached_freelist df;
 
 		size = build_detached_freelist(s, size, p, &df);
-		if (!df.page)
+		if (!df.slab)
 			continue;
 
-		slab_free(df.s, df.page, df.freelist, df.tail, df.cnt, _RET_IP_);
+		slab_free(df.s, slab_page(df.slab), df.freelist, df.tail, df.cnt, _RET_IP_);
 	} while (likely(size));
 }
 EXPORT_SYMBOL(kmem_cache_free_bulk);
@@ -3801,7 +3811,7 @@ static unsigned int slub_min_objects;
  * requested a higher minimum order then we start with that one instead of
  * the smallest order which will fit the object.
  */
-static inline unsigned int slab_order(unsigned int size,
+static inline unsigned int calc_slab_order(unsigned int size,
 		unsigned int min_objects, unsigned int max_order,
 		unsigned int fract_leftover)
 {
@@ -3865,7 +3875,7 @@ static inline int calculate_order(unsigned int size)
 
 		fraction = 16;
 		while (fraction >= 4) {
-			order = slab_order(size, min_objects,
+			order = calc_slab_order(size, min_objects,
 					slub_max_order, fraction);
 			if (order <= slub_max_order)
 				return order;
@@ -3878,14 +3888,14 @@ static inline int calculate_order(unsigned int size)
 	 * We were unable to place multiple objects in a slab. Now
 	 * lets see if we can place a single object there.
 	 */
-	order = slab_order(size, 1, slub_max_order, 1);
+	order = calc_slab_order(size, 1, slub_max_order, 1);
 	if (order <= slub_max_order)
 		return order;
 
 	/*
 	 * Doh this slab cannot be placed using slub_max_order.
 	 */
-	order = slab_order(size, 1, MAX_ORDER, 1);
+	order = calc_slab_order(size, 1, MAX_ORDER, 1);
 	if (order < MAX_ORDER)
 		return order;
 	return -ENOSYS;
@@ -4336,31 +4346,32 @@ int __kmem_cache_shutdown(struct kmem_cache *s)
 }
 
 #ifdef CONFIG_PRINTK
-void kmem_obj_info(struct kmem_obj_info *kpp, void *object, struct page *page)
+void kmem_obj_info(struct kmem_obj_info *kpp, void *object, struct slab *slab)
 {
 	void *base;
 	int __maybe_unused i;
 	unsigned int objnr;
 	void *objp;
 	void *objp0;
-	struct kmem_cache *s = page->slab_cache;
+	struct kmem_cache *s = slab->slab_cache;
 	struct track __maybe_unused *trackp;
 
 	kpp->kp_ptr = object;
-	kpp->kp_page = page;
+	kpp->kp_slab = slab;
 	kpp->kp_slab_cache = s;
-	base = page_address(page);
+	base = slab_address(slab);
 	objp0 = kasan_reset_tag(object);
 #ifdef CONFIG_SLUB_DEBUG
 	objp = restore_red_left(s, objp0);
 #else
 	objp = objp0;
 #endif
-	objnr = obj_to_index(s, page, objp);
+	objnr = obj_to_index(s, slab_page(slab), objp);
 	kpp->kp_data_offset = (unsigned long)((char *)objp0 - (char *)objp);
 	objp = base + s->size * objnr;
 	kpp->kp_objp = objp;
-	if (WARN_ON_ONCE(objp < base || objp >= base + page->objects * s->size || (objp - base) % s->size) ||
+	if (WARN_ON_ONCE(objp < base || objp >= base + slab->objects * s->size
+			 || (objp - base) % s->size) ||
 	    !(s->flags & SLAB_STORE_USER))
 		return;
 #ifdef CONFIG_SLUB_DEBUG
@@ -4498,8 +4509,8 @@ EXPORT_SYMBOL(__kmalloc_node);
  * Returns NULL if check passes, otherwise const char * to name of cache
  * to indicate an error.
  */
-void __check_heap_object(const void *ptr, unsigned long n, struct page *page,
-			 bool to_user)
+void __check_heap_object(const void *ptr, unsigned long n,
+			 const struct slab *slab, bool to_user)
 {
 	struct kmem_cache *s;
 	unsigned int offset;
@@ -4509,10 +4520,10 @@ void __check_heap_object(const void *ptr, unsigned long n, struct page *page,
 	ptr = kasan_reset_tag(ptr);
 
 	/* Find object and usable object size. */
-	s = page->slab_cache;
+	s = slab->slab_cache;
 
 	/* Reject impossible pointers. */
-	if (ptr < page_address(page))
+	if (ptr < slab_address(slab))
 		usercopy_abort("SLUB object not in SLUB page?!", NULL,
 			       to_user, 0, n);
 
@@ -4520,7 +4531,7 @@ void __check_heap_object(const void *ptr, unsigned long n, struct page *page,
 	if (is_kfence)
 		offset = ptr - kfence_object_start(ptr);
 	else
-		offset = (ptr - page_address(page)) % s->size;
+		offset = (ptr - slab_address(slab)) % s->size;
 
 	/* Adjust for redzone and reject if within the redzone. */
 	if (!is_kfence && kmem_cache_debug_flags(s, SLAB_RED_ZONE)) {
@@ -4555,25 +4566,24 @@ void __check_heap_object(const void *ptr, unsigned long n, struct page *page,
 
 size_t __ksize(const void *object)
 {
-	struct page *page;
+	struct folio *folio;
 
 	if (unlikely(object == ZERO_SIZE_PTR))
 		return 0;
 
-	page = virt_to_head_page(object);
+	folio = virt_to_folio(object);
 
-	if (unlikely(!PageSlab(page))) {
-		WARN_ON(!PageCompound(page));
-		return page_size(page);
-	}
+	if (unlikely(!folio_test_slab(folio)))
+		return folio_size(folio);
 
-	return slab_ksize(page->slab_cache);
+	return slab_ksize(folio_slab(folio)->slab_cache);
 }
 EXPORT_SYMBOL(__ksize);
 
 void kfree(const void *x)
 {
-	struct page *page;
+	struct folio *folio;
+	struct slab *slab;
 	void *object = (void *)x;
 
 	trace_kfree(_RET_IP_, x);
@@ -4581,12 +4591,13 @@ void kfree(const void *x)
 	if (unlikely(ZERO_OR_NULL_PTR(x)))
 		return;
 
-	page = virt_to_head_page(x);
-	if (unlikely(!PageSlab(page))) {
-		free_nonslab_page(page, object);
+	folio = virt_to_folio(x);
+	if (unlikely(!folio_test_slab(folio))) {
+		free_large_kmalloc(folio, object);
 		return;
 	}
-	slab_free(page->slab_cache, page, object, NULL, 1, _RET_IP_);
+	slab = folio_slab(folio);
+	slab_free(slab->slab_cache, slab_page(slab), object, NULL, 1, _RET_IP_);
 }
 EXPORT_SYMBOL(kfree);
 

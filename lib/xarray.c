@@ -157,7 +157,7 @@ static void xas_move_index(struct xa_state *xas, unsigned long offset)
 	xas->xa_index += offset << shift;
 }
 
-static void xas_advance(struct xa_state *xas)
+static void xas_next_offset(struct xa_state *xas)
 {
 	xas->xa_offset++;
 	xas_move_index(xas, xas->xa_offset);
@@ -207,6 +207,8 @@ static void *xas_descend(struct xa_state *xas, struct xa_node *node)
 	if (xa_is_sibling(entry)) {
 		offset = xa_to_sibling(entry);
 		entry = xa_entry(xas->xa, node, offset);
+		if (node->shift && xa_is_node(entry))
+			entry = XA_RETRY_ENTRY;
 	}
 
 	xas->xa_offset = offset;
@@ -262,9 +264,10 @@ static void xa_node_free(struct xa_node *node)
  * xas_destroy() - Free any resources allocated during the XArray operation.
  * @xas: XArray operation state.
  *
- * This function is now internal-only.
+ * Most users will not need to call this function; it is called for you
+ * by xas_nomem().
  */
-static void xas_destroy(struct xa_state *xas)
+void xas_destroy(struct xa_state *xas)
 {
 	struct xa_node *next, *node = xas->xa_alloc;
 
@@ -722,6 +725,8 @@ void xas_create_range(struct xa_state *xas)
 
 		for (;;) {
 			struct xa_node *node = xas->xa_node;
+			if (node->shift >= shift)
+				break;
 			xas->xa_node = xa_parent_locked(xas->xa, node);
 			xas->xa_offset = node->offset - 1;
 			if (node->offset != 0)
@@ -1079,6 +1084,7 @@ void xas_split(struct xa_state *xas, void *entry, unsigned int order)
 					xa_mk_node(child));
 			if (xa_is_value(curr))
 				values--;
+			xas_update(xas, child);
 		} else {
 			unsigned int canon = offset - xas->xa_sibs;
 
@@ -1093,6 +1099,7 @@ void xas_split(struct xa_state *xas, void *entry, unsigned int order)
 	} while (offset-- > xas->xa_offset);
 
 	node->nr_values += values;
+	xas_update(xas, node);
 }
 EXPORT_SYMBOL_GPL(xas_split);
 #endif
@@ -1250,7 +1257,7 @@ void *xas_find(struct xa_state *xas, unsigned long max)
 		xas->xa_offset = ((xas->xa_index - 1) & XA_CHUNK_MASK) + 1;
 	}
 
-	xas_advance(xas);
+	xas_next_offset(xas);
 
 	while (xas->xa_node && (xas->xa_index <= max)) {
 		if (unlikely(xas->xa_offset == XA_CHUNK_SIZE)) {
@@ -1268,7 +1275,7 @@ void *xas_find(struct xa_state *xas, unsigned long max)
 		if (entry && !xa_is_sibling(entry))
 			return entry;
 
-		xas_advance(xas);
+		xas_next_offset(xas);
 	}
 
 	if (!xas->xa_node)

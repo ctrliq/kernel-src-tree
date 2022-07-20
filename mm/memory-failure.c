@@ -486,12 +486,13 @@ static struct task_struct *task_early_kill(struct task_struct *tsk,
 static void collect_procs_anon(struct page *page, struct list_head *to_kill,
 				int force_early)
 {
+	struct folio *folio = page_folio(page);
 	struct vm_area_struct *vma;
 	struct task_struct *tsk;
 	struct anon_vma *av;
 	pgoff_t pgoff;
 
-	av = page_lock_anon_vma_read(page);
+	av = folio_lock_anon_vma_read(folio);
 	if (av == NULL)	/* Not actually mapped anymore */
 		return;
 
@@ -1267,7 +1268,7 @@ try_again:
 	}
 out:
 	if (ret == -EIO)
-		dump_page(p, "hwpoison: unhandlable page");
+		pr_err("Memory failure: %#lx: unhandlable page.\n", page_to_pfn(p));
 
 	return ret;
 }
@@ -1341,6 +1342,7 @@ static int get_hwpoison_page(struct page *p, unsigned long flags)
 static bool hwpoison_user_mappings(struct page *p, unsigned long pfn,
 				  int flags, struct page *hpage)
 {
+	struct folio *folio = page_folio(hpage);
 	enum ttu_flags ttu = TTU_IGNORE_MLOCK | TTU_SYNC;
 	struct address_space *mapping;
 	LIST_HEAD(tokill);
@@ -1406,7 +1408,7 @@ static bool hwpoison_user_mappings(struct page *p, unsigned long pfn,
 		collect_procs(hpage, &tokill, flags & MF_ACTION_REQUIRED);
 
 	if (!PageHuge(hpage)) {
-		try_to_unmap(hpage, ttu);
+		try_to_unmap(folio, ttu);
 	} else {
 		if (!PageAnon(hpage)) {
 			/*
@@ -1418,12 +1420,12 @@ static bool hwpoison_user_mappings(struct page *p, unsigned long pfn,
 			 */
 			mapping = hugetlb_page_mapping_lock_write(hpage);
 			if (mapping) {
-				try_to_unmap(hpage, ttu|TTU_RMAP_LOCKED);
+				try_to_unmap(folio, ttu|TTU_RMAP_LOCKED);
 				i_mmap_unlock_write(mapping);
 			} else
 				pr_info("Memory failure: %#lx: could not lock mapping for mapped huge page\n", pfn);
 		} else {
-			try_to_unmap(hpage, ttu);
+			try_to_unmap(folio, ttu);
 		}
 	}
 
@@ -2127,7 +2129,7 @@ static bool isolate_page(struct page *page, struct list_head *pagelist)
  */
 static int __soft_offline_page(struct page *page)
 {
-	int ret = 0;
+	long ret = 0;
 	unsigned long pfn = page_to_pfn(page);
 	struct page *hpage = compound_head(page);
 	char const *msg_page[] = {"page", "hugepage"};
@@ -2184,7 +2186,7 @@ static int __soft_offline_page(struct page *page)
 			if (!list_empty(&pagelist))
 				putback_movable_pages(&pagelist);
 
-			pr_info("soft offline: %#lx: %s migration failed %d, type %pGp\n",
+			pr_info("soft offline: %#lx: %s migration failed %ld, type %pGp\n",
 				pfn, msg_page[huge], ret, &page->flags);
 			if (ret > 0)
 				ret = -EBUSY;
