@@ -11,7 +11,6 @@
 #include <linux/errno.h>
 #include <linux/kernel.h>
 #include <linux/signal.h>
-#include <linux/personality.h>
 #include <linux/freezer.h>
 #include <linux/stddef.h>
 #include <linux/uaccess.h>
@@ -577,10 +576,12 @@ static int setup_sigframe_layout(struct rt_sigframe_user_layout *user,
 {
 	int err;
 
-	err = sigframe_alloc(user, &user->fpsimd_offset,
-			     sizeof(struct fpsimd_context));
-	if (err)
-		return err;
+	if (system_supports_fpsimd()) {
+		err = sigframe_alloc(user, &user->fpsimd_offset,
+				     sizeof(struct fpsimd_context));
+		if (err)
+			return err;
+	}
 
 	/* fault information, if valid */
 	if (add_all || current->thread.fault_code) {
@@ -950,7 +951,7 @@ void do_notify_resume(struct pt_regs *regs, unsigned long thread_flags)
 		}
 
 		local_daif_mask();
-		thread_flags = READ_ONCE(current_thread_info()->flags);
+		thread_flags = read_thread_flags();
 	} while (thread_flags & _TIF_WORK_MASK);
 }
 
