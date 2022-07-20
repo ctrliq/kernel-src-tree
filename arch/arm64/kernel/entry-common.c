@@ -6,6 +6,7 @@
  */
 
 #include <linux/context_tracking.h>
+#include <linux/kasan.h>
 #include <linux/linkage.h>
 #include <linux/lockdep.h>
 #include <linux/ptrace.h>
@@ -55,6 +56,7 @@ static void noinstr enter_from_kernel_mode(struct pt_regs *regs)
 {
 	__enter_from_kernel_mode(regs);
 	mte_check_tfsr_entry();
+	mte_disable_tco_entry(current);
 }
 
 /*
@@ -102,6 +104,7 @@ static __always_inline void __enter_from_user_mode(void)
 	CT_WARN_ON(ct_state() != CONTEXT_USER);
 	user_exit_irqoff();
 	trace_hardirqs_off_finish();
+	mte_disable_tco_entry(current);
 }
 
 static __always_inline void enter_from_user_mode(struct pt_regs *regs)
@@ -128,7 +131,7 @@ static __always_inline void prepare_exit_to_user_mode(struct pt_regs *regs)
 
 	local_daif_mask();
 
-	flags = READ_ONCE(current_thread_info()->flags);
+	flags = read_thread_flags();
 	if (unlikely(flags & _TIF_WORK_MASK))
 		do_notify_resume(regs, flags);
 }

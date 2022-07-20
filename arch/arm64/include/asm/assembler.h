@@ -542,11 +542,6 @@ alternative_endif
 #define EXPORT_SYMBOL_NOKASAN(name)	EXPORT_SYMBOL(name)
 #endif
 
-#ifdef CONFIG_KASAN_HW_TAGS
-#define EXPORT_SYMBOL_NOHWKASAN(name)
-#else
-#define EXPORT_SYMBOL_NOHWKASAN(name)	EXPORT_SYMBOL_NOKASAN(name)
-#endif
 	/*
 	 * Emit a 64-bit absolute little endian symbol reference in a way that
 	 * ensures that it will be resolved at build time, even when building a
@@ -795,6 +790,16 @@ alternative_endif
 	ldr		w\tmp, [\tmp, \tmp2]
 	cbnz		w\tmp, \lbl	// yield on pending softirq in task context
 .Lnoyield_\@:
+	.endm
+
+/*
+ * Branch Target Identifier (BTI)
+ */
+	.macro  bti, targets
+	.equ	.L__bti_targets_c, 34
+	.equ	.L__bti_targets_j, 36
+	.equ	.L__bti_targets_jc,38
+	hint	#.L__bti_targets_\targets
 	.endm
 
 /*
