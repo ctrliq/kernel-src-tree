@@ -465,6 +465,8 @@ dist-get-buildreqs: setup-source
 		if  echo "$$MISSING" | grep -q system-sb-certs ; then \
 			echo "system-sb-certs can be installed from a RHEL or Centos-Stream CodeReady Linux Builder (CRB) repository."; \
 		fi; \
+	else \
+		echo "PASS: All build dependencies found."; \
 	fi
 
 _setup-source: dist-git-version-check
