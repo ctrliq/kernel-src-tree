@@ -1642,7 +1642,7 @@ discard:
 		 */
 		page_remove_rmap(subpage, vma, folio_test_hugetlb(folio));
 		if (vma->vm_flags & VM_LOCKED)
-			mlock_page_drain(smp_processor_id());
+			mlock_page_drain_local();
 		folio_put(folio);
 	}
 
@@ -1920,7 +1920,7 @@ static bool try_to_migrate_one(struct folio *folio, struct vm_area_struct *vma,
 		 */
 		page_remove_rmap(subpage, vma, folio_test_hugetlb(folio));
 		if (vma->vm_flags & VM_LOCKED)
-			mlock_page_drain(smp_processor_id());
+			mlock_page_drain_local();
 		folio_put(folio);
 	}
 

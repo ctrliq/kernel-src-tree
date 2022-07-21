@@ -623,7 +623,6 @@ void lru_add_drain_cpu(int cpu)
 		pagevec_lru_move_fn(pvec, lru_lazyfree_fn);
 
 	activate_page_drain(cpu);
-	mlock_page_drain(cpu);
 }
 
 /**
@@ -705,6 +704,7 @@ void lru_add_drain(void)
 	local_lock(&lru_pvecs.lock);
 	lru_add_drain_cpu(smp_processor_id());
 	local_unlock(&lru_pvecs.lock);
+	mlock_page_drain_local();
 }
 
 /*
@@ -719,6 +719,7 @@ static void lru_add_and_bh_lrus_drain(void)
 	lru_add_drain_cpu(smp_processor_id());
 	local_unlock(&lru_pvecs.lock);
 	invalidate_bh_lrus_cpu();
+	mlock_page_drain_local();
 }
 
 void lru_add_drain_cpu_zone(struct zone *zone)
@@ -727,6 +728,7 @@ void lru_add_drain_cpu_zone(struct zone *zone)
 	lru_add_drain_cpu(smp_processor_id());
 	drain_local_pages(zone);
 	local_unlock(&lru_pvecs.lock);
+	mlock_page_drain_local();
 }
 
 #ifdef CONFIG_SMP

@@ -247,7 +247,7 @@ static bool remove_migration_pte(struct folio *folio,
 				page_add_file_rmap(new, vma, false);
 		}
 		if (vma->vm_flags & VM_LOCKED)
-			mlock_page_drain(smp_processor_id());
+			mlock_page_drain_local();
 
 		trace_remove_migration_pte(pvmw.address, pte_val(pte),
 					   compound_order(new));
