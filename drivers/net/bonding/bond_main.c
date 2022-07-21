@@ -2166,8 +2166,8 @@ int bond_enslave(struct net_device *bond_dev, struct net_device *slave_dev,
 	if (!slave_dev->netdev_ops->ndo_bpf ||
 	    !slave_dev->netdev_ops->ndo_xdp_xmit) {
 		if (bond->xdp_prog) {
-			NL_SET_ERR_MSG(extack, "Slave does not support XDP");
-			slave_err(bond_dev, slave_dev, "Slave does not support XDP\n");
+			SLAVE_NL_ERR(bond_dev, slave_dev, extack,
+				     "Slave does not support XDP");
 			res = -EOPNOTSUPP;
 			goto err_sysfs_del;
 		}
@@ -2180,10 +2180,8 @@ int bond_enslave(struct net_device *bond_dev, struct net_device *slave_dev,
 		};
 
 		if (dev_xdp_prog_count(slave_dev) > 0) {
-			NL_SET_ERR_MSG(extack,
-				       "Slave has XDP program loaded, please unload before enslaving");
-			slave_err(bond_dev, slave_dev,
-				  "Slave has XDP program loaded, please unload before enslaving\n");
+			SLAVE_NL_ERR(bond_dev, slave_dev, extack,
+				     "Slave has XDP program loaded, please unload before enslaving");
 			res = -EOPNOTSUPP;
 			goto err_sysfs_del;
 		}
@@ -5469,17 +5467,15 @@ static int bond_xdp_set(struct net_device *dev, struct bpf_prog *prog,
 
 		if (!slave_dev->netdev_ops->ndo_bpf ||
 		    !slave_dev->netdev_ops->ndo_xdp_xmit) {
-			NL_SET_ERR_MSG(extack, "Slave device does not support XDP");
-			slave_err(dev, slave_dev, "Slave does not support XDP\n");
+			SLAVE_NL_ERR(dev, slave_dev, extack,
+				     "Slave device does not support XDP");
 			err = -EOPNOTSUPP;
 			goto err;
 		}
 
 		if (dev_xdp_prog_count(slave_dev) > 0) {
-			NL_SET_ERR_MSG(extack,
-				       "Slave has XDP program loaded, please unload before enslaving");
-			slave_err(dev, slave_dev,
-				  "Slave has XDP program loaded, please unload before enslaving\n");
+			SLAVE_NL_ERR(dev, slave_dev, extack,
+				     "Slave has XDP program loaded, please unload before enslaving");
 			err = -EOPNOTSUPP;
 			goto err;
 		}
