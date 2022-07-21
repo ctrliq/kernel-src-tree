@@ -2778,10 +2778,8 @@ int tb_switch_add(struct tb_switch *sw)
 
 		/* read drom */
 		ret = tb_drom_read(sw);
-		if (ret) {
-			dev_err(&sw->dev, "reading DROM failed\n");
-			return ret;
-		}
+		if (ret)
+			dev_warn(&sw->dev, "reading DROM failed: %d\n", ret);
 		tb_sw_dbg(sw, "uid: %#llx\n", sw->uid);
 
 		tb_check_quirks(sw);
@@ -2973,6 +2971,10 @@ int tb_switch_resume(struct tb_switch *sw)
 			tb_sw_info(sw, "switch not present anymore\n");
 			return err;
 		}
+
+		/* We don't have any way to confirm this was the same device */
+		if (!sw->uid)
+			return -ENODEV;
 
 		if (tb_switch_is_usb4(sw))
 			err = usb4_switch_read_uid(sw, &uid);
