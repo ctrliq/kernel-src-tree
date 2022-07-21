@@ -41,9 +41,12 @@ static void __init spectre_v2_select_mitigation(void);
 static void __init ssb_select_mitigation(void);
 static void __init l1tf_select_mitigation(void);
 static void __init mds_select_mitigation(void);
-static void __init mds_print_mitigation(void);
+static void __init md_clear_update_mitigation(void);
+static void __init md_clear_select_mitigation(void);
 static void __init taa_select_mitigation(void);
+static void __init mmio_select_mitigation(void);
 static void __init srbds_select_mitigation(void);
+static void __init l1d_flush_select_mitigation(void);
 
 /* The base value of the SPEC_CTRL MSR that always has to be preserved. */
 u64 x86_spec_ctrl_base;
@@ -77,6 +80,17 @@ EXPORT_SYMBOL_GPL(mds_user_clear);
 DEFINE_STATIC_KEY_FALSE(mds_idle_clear);
 EXPORT_SYMBOL_GPL(mds_idle_clear);
 
+/*
+ * Controls whether l1d flush based mitigations are enabled,
+ * based on hw features and admin setting via boot parameter
+ * defaults to false
+ */
+DEFINE_STATIC_KEY_FALSE(switch_mm_cond_l1d_flush);
+
+/* Controls CPU Fill buffer clear before KVM guest MMIO accesses */
+DEFINE_STATIC_KEY_FALSE(mmio_stale_data_clear);
+EXPORT_SYMBOL_GPL(mmio_stale_data_clear);
+
 void __init check_bugs(void)
 {
 	identify_boot_cpu();
@@ -109,15 +123,9 @@ void __init check_bugs(void)
 	spectre_v2_select_mitigation();
 	ssb_select_mitigation();
 	l1tf_select_mitigation();
-	mds_select_mitigation();
-	taa_select_mitigation();
+	md_clear_select_mitigation();
 	srbds_select_mitigation();
-
-	/*
-	 * As MDS and TAA mitigations are inter-related, print MDS
-	 * mitigation until after TAA mitigation selection is done.
-	 */
-	mds_print_mitigation();
+	l1d_flush_select_mitigation();
 
 	arch_smt_update();
 
@@ -258,14 +266,6 @@ static void __init mds_select_mitigation(void)
 	}
 }
 
-static void __init mds_print_mitigation(void)
-{
-	if (!boot_cpu_has_bug(X86_BUG_MDS) || cpu_mitigations_off())
-		return;
-
-	pr_info("%s\n", mds_strings[mds_mitigation]);
-}
-
 static int __init mds_cmdline(char *str)
 {
 	if (!boot_cpu_has_bug(X86_BUG_MDS))
@@ -320,7 +320,7 @@ static void __init taa_select_mitigation(void)
 	/* TSX previously disabled by tsx=off */
 	if (!boot_cpu_has(X86_FEATURE_RTM)) {
 		taa_mitigation = TAA_MITIGATION_TSX_DISABLED;
-		goto out;
+		return;
 	}
 
 	if (cpu_mitigations_off()) {
@@ -334,7 +334,7 @@ static void __init taa_select_mitigation(void)
 	 */
 	if (taa_mitigation == TAA_MITIGATION_OFF &&
 	    mds_mitigation == MDS_MITIGATION_OFF)
-		goto out;
+		return;
 
 	if (boot_cpu_has(X86_FEATURE_MD_CLEAR))
 		taa_mitigation = TAA_MITIGATION_VERW;
@@ -366,18 +366,6 @@ static void __init taa_select_mitigation(void)
 
 	if (taa_nosmt || cpu_mitigations_auto_nosmt())
 		cpu_smt_disable(false);
-
-	/*
-	 * Update MDS mitigation, if necessary, as the mds_user_clear is
-	 * now enabled for TAA mitigation.
-	 */
-	if (mds_mitigation == MDS_MITIGATION_OFF &&
-	    boot_cpu_has_bug(X86_BUG_MDS)) {
-		mds_mitigation = MDS_MITIGATION_FULL;
-		mds_select_mitigation();
-	}
-out:
-	pr_info("%s\n", taa_strings[taa_mitigation]);
 }
 
 static int __init tsx_async_abort_parse_cmdline(char *str)
@@ -400,6 +388,151 @@ static int __init tsx_async_abort_parse_cmdline(char *str)
 	return 0;
 }
 early_param("tsx_async_abort", tsx_async_abort_parse_cmdline);
+
+#undef pr_fmt
+#define pr_fmt(fmt)	"MMIO Stale Data: " fmt
+
+enum mmio_mitigations {
+	MMIO_MITIGATION_OFF,
+	MMIO_MITIGATION_UCODE_NEEDED,
+	MMIO_MITIGATION_VERW,
+};
+
+/* Default mitigation for Processor MMIO Stale Data vulnerabilities */
+static enum mmio_mitigations mmio_mitigation __ro_after_init = MMIO_MITIGATION_VERW;
+static bool mmio_nosmt __ro_after_init = false;
+
+static const char * const mmio_strings[] = {
+	[MMIO_MITIGATION_OFF]		= "Vulnerable",
+	[MMIO_MITIGATION_UCODE_NEEDED]	= "Vulnerable: Clear CPU buffers attempted, no microcode",
+	[MMIO_MITIGATION_VERW]		= "Mitigation: Clear CPU buffers",
+};
+
+static void __init mmio_select_mitigation(void)
+{
+	u64 ia32_cap;
+
+	if (!boot_cpu_has_bug(X86_BUG_MMIO_STALE_DATA) ||
+	    cpu_mitigations_off()) {
+		mmio_mitigation = MMIO_MITIGATION_OFF;
+		return;
+	}
+
+	if (mmio_mitigation == MMIO_MITIGATION_OFF)
+		return;
+
+	ia32_cap = x86_read_arch_cap_msr();
+
+	/*
+	 * Enable CPU buffer clear mitigation for host and VMM, if also affected
+	 * by MDS or TAA. Otherwise, enable mitigation for VMM only.
+	 */
+	if (boot_cpu_has_bug(X86_BUG_MDS) || (boot_cpu_has_bug(X86_BUG_TAA) &&
+					      boot_cpu_has(X86_FEATURE_RTM)))
+		static_branch_enable(&mds_user_clear);
+	else
+		static_branch_enable(&mmio_stale_data_clear);
+
+	/*
+	 * If Processor-MMIO-Stale-Data bug is present and Fill Buffer data can
+	 * be propagated to uncore buffers, clearing the Fill buffers on idle
+	 * is required irrespective of SMT state.
+	 */
+	if (!(ia32_cap & ARCH_CAP_FBSDP_NO))
+		static_branch_enable(&mds_idle_clear);
+
+	/*
+	 * Check if the system has the right microcode.
+	 *
+	 * CPU Fill buffer clear mitigation is enumerated by either an explicit
+	 * FB_CLEAR or by the presence of both MD_CLEAR and L1D_FLUSH on MDS
+	 * affected systems.
+	 */
+	if ((ia32_cap & ARCH_CAP_FB_CLEAR) ||
+	    (boot_cpu_has(X86_FEATURE_MD_CLEAR) &&
+	     boot_cpu_has(X86_FEATURE_FLUSH_L1D) &&
+	     !(ia32_cap & ARCH_CAP_MDS_NO)))
+		mmio_mitigation = MMIO_MITIGATION_VERW;
+	else
+		mmio_mitigation = MMIO_MITIGATION_UCODE_NEEDED;
+
+	if (mmio_nosmt || cpu_mitigations_auto_nosmt())
+		cpu_smt_disable(false);
+}
+
+static int __init mmio_stale_data_parse_cmdline(char *str)
+{
+	if (!boot_cpu_has_bug(X86_BUG_MMIO_STALE_DATA))
+		return 0;
+
+	if (!str)
+		return -EINVAL;
+
+	if (!strcmp(str, "off")) {
+		mmio_mitigation = MMIO_MITIGATION_OFF;
+	} else if (!strcmp(str, "full")) {
+		mmio_mitigation = MMIO_MITIGATION_VERW;
+	} else if (!strcmp(str, "full,nosmt")) {
+		mmio_mitigation = MMIO_MITIGATION_VERW;
+		mmio_nosmt = true;
+	}
+
+	return 0;
+}
+early_param("mmio_stale_data", mmio_stale_data_parse_cmdline);
+
+#undef pr_fmt
+#define pr_fmt(fmt)     "" fmt
+
+static void __init md_clear_update_mitigation(void)
+{
+	if (cpu_mitigations_off())
+		return;
+
+	if (!static_key_enabled(&mds_user_clear))
+		goto out;
+
+	/*
+	 * mds_user_clear is now enabled. Update MDS, TAA and MMIO Stale Data
+	 * mitigation, if necessary.
+	 */
+	if (mds_mitigation == MDS_MITIGATION_OFF &&
+	    boot_cpu_has_bug(X86_BUG_MDS)) {
+		mds_mitigation = MDS_MITIGATION_FULL;
+		mds_select_mitigation();
+	}
+	if (taa_mitigation == TAA_MITIGATION_OFF &&
+	    boot_cpu_has_bug(X86_BUG_TAA)) {
+		taa_mitigation = TAA_MITIGATION_VERW;
+		taa_select_mitigation();
+	}
+	if (mmio_mitigation == MMIO_MITIGATION_OFF &&
+	    boot_cpu_has_bug(X86_BUG_MMIO_STALE_DATA)) {
+		mmio_mitigation = MMIO_MITIGATION_VERW;
+		mmio_select_mitigation();
+	}
+out:
+	if (boot_cpu_has_bug(X86_BUG_MDS))
+		pr_info("MDS: %s\n", mds_strings[mds_mitigation]);
+	if (boot_cpu_has_bug(X86_BUG_TAA))
+		pr_info("TAA: %s\n", taa_strings[taa_mitigation]);
+	if (boot_cpu_has_bug(X86_BUG_MMIO_STALE_DATA))
+		pr_info("MMIO Stale Data: %s\n", mmio_strings[mmio_mitigation]);
+}
+
+static void __init md_clear_select_mitigation(void)
+{
+	mds_select_mitigation();
+	taa_select_mitigation();
+	mmio_select_mitigation();
+
+	/*
+	 * As MDS, TAA and MMIO Stale Data mitigations are inter-related, update
+	 * and print their mitigation after MDS, TAA and MMIO Stale Data
+	 * mitigation selection is done.
+	 */
+	md_clear_update_mitigation();
+}
 
 #undef pr_fmt
 #define pr_fmt(fmt)	"SRBDS: " fmt
@@ -462,11 +595,13 @@ static void __init srbds_select_mitigation(void)
 		return;
 
 	/*
-	 * Check to see if this is one of the MDS_NO systems supporting
-	 * TSX that are only exposed to SRBDS when TSX is enabled.
+	 * Check to see if this is one of the MDS_NO systems supporting TSX that
+	 * are only exposed to SRBDS when TSX is enabled or when CPU is affected
+	 * by Processor MMIO Stale Data vulnerability.
 	 */
 	ia32_cap = x86_read_arch_cap_msr();
-	if ((ia32_cap & ARCH_CAP_MDS_NO) && !boot_cpu_has(X86_FEATURE_RTM))
+	if ((ia32_cap & ARCH_CAP_MDS_NO) && !boot_cpu_has(X86_FEATURE_RTM) &&
+	    !boot_cpu_has_bug(X86_BUG_MMIO_STALE_DATA))
 		srbds_mitigation = SRBDS_MITIGATION_TSX_OFF;
 	else if (boot_cpu_has(X86_FEATURE_HYPERVISOR))
 		srbds_mitigation = SRBDS_MITIGATION_HYPERVISOR;
@@ -491,6 +626,34 @@ static int __init srbds_parse_cmdline(char *str)
 	return 0;
 }
 early_param("srbds", srbds_parse_cmdline);
+
+#undef pr_fmt
+#define pr_fmt(fmt)     "L1D Flush : " fmt
+
+enum l1d_flush_mitigations {
+	L1D_FLUSH_OFF = 0,
+	L1D_FLUSH_ON,
+};
+
+static enum l1d_flush_mitigations l1d_flush_mitigation __initdata = L1D_FLUSH_OFF;
+
+static void __init l1d_flush_select_mitigation(void)
+{
+	if (!l1d_flush_mitigation || !boot_cpu_has(X86_FEATURE_FLUSH_L1D))
+		return;
+
+	static_branch_enable(&switch_mm_cond_l1d_flush);
+	pr_info("Conditional flush on switch_mm() enabled\n");
+}
+
+static int __init l1d_flush_parse_cmdline(char *str)
+{
+	if (!strcmp(str, "on"))
+		l1d_flush_mitigation = L1D_FLUSH_ON;
+
+	return 0;
+}
+early_param("l1d_flush", l1d_flush_parse_cmdline);
 
 #undef pr_fmt
 #define pr_fmt(fmt)     "Spectre V1 : " fmt
@@ -1072,6 +1235,8 @@ static void update_indir_branch_cond(void)
 /* Update the static key controlling the MDS CPU buffer clear in idle */
 static void update_mds_branch_idle(void)
 {
+	u64 ia32_cap = x86_read_arch_cap_msr();
+
 	/*
 	 * Enable the idle clearing if SMT is active on CPUs which are
 	 * affected only by MSBDS and not any other MDS variant.
@@ -1083,14 +1248,17 @@ static void update_mds_branch_idle(void)
 	if (!boot_cpu_has_bug(X86_BUG_MSBDS_ONLY))
 		return;
 
-	if (sched_smt_active())
+	if (sched_smt_active()) {
 		static_branch_enable(&mds_idle_clear);
-	else
+	} else if (mmio_mitigation == MMIO_MITIGATION_OFF ||
+		   (ia32_cap & ARCH_CAP_FBSDP_NO)) {
 		static_branch_disable(&mds_idle_clear);
+	}
 }
 
 #define MDS_MSG_SMT "MDS CPU bug present and SMT on, data leak possible. See https://www.kernel.org/doc/html/latest/admin-guide/hw-vuln/mds.html for more details.\n"
 #define TAA_MSG_SMT "TAA CPU bug present and SMT on, data leak possible. See https://www.kernel.org/doc/html/latest/admin-guide/hw-vuln/tsx_async_abort.html for more details.\n"
+#define MMIO_MSG_SMT "MMIO Stale Data CPU bug present and SMT on, data leak possible. See https://www.kernel.org/doc/html/latest/admin-guide/hw-vuln/processor_mmio_stale_data.html for more details.\n"
 
 void cpu_bugs_smt_update(void)
 {
@@ -1132,6 +1300,16 @@ void cpu_bugs_smt_update(void)
 		break;
 	case TAA_MITIGATION_TSX_DISABLED:
 	case TAA_MITIGATION_OFF:
+		break;
+	}
+
+	switch (mmio_mitigation) {
+	case MMIO_MITIGATION_VERW:
+	case MMIO_MITIGATION_UCODE_NEEDED:
+		if (sched_smt_active())
+			pr_warn_once(MMIO_MSG_SMT);
+		break;
+	case MMIO_MITIGATION_OFF:
 		break;
 	}
 
@@ -1300,6 +1478,24 @@ static void task_update_spec_tif(struct task_struct *tsk)
 		speculation_ctrl_update_current();
 }
 
+static int l1d_flush_prctl_set(struct task_struct *task, unsigned long ctrl)
+{
+
+	if (!static_branch_unlikely(&switch_mm_cond_l1d_flush))
+		return -EPERM;
+
+	switch (ctrl) {
+	case PR_SPEC_ENABLE:
+		set_ti_thread_flag(&task->thread_info, TIF_SPEC_L1D_FLUSH);
+		return 0;
+	case PR_SPEC_DISABLE:
+		clear_ti_thread_flag(&task->thread_info, TIF_SPEC_L1D_FLUSH);
+		return 0;
+	default:
+		return -ERANGE;
+	}
+}
+
 static int ssb_prctl_set(struct task_struct *task, unsigned long ctrl)
 {
 	if (ssb_mode != SPEC_STORE_BYPASS_PRCTL &&
@@ -1409,6 +1605,8 @@ int arch_prctl_spec_ctrl_set(struct task_struct *task, unsigned long which,
 		return ssb_prctl_set(task, ctrl);
 	case PR_SPEC_INDIRECT_BRANCH:
 		return ib_prctl_set(task, ctrl);
+	case PR_SPEC_L1D_FLUSH:
+		return l1d_flush_prctl_set(task, ctrl);
 	default:
 		return -ENODEV;
 	}
@@ -1424,6 +1622,17 @@ void arch_seccomp_spec_mitigate(struct task_struct *task)
 		ib_prctl_set(task, PR_SPEC_FORCE_DISABLE);
 }
 #endif
+
+static int l1d_flush_prctl_get(struct task_struct *task)
+{
+	if (!static_branch_unlikely(&switch_mm_cond_l1d_flush))
+		return PR_SPEC_FORCE_DISABLE;
+
+	if (test_ti_thread_flag(&task->thread_info, TIF_SPEC_L1D_FLUSH))
+		return PR_SPEC_PRCTL | PR_SPEC_ENABLE;
+	else
+		return PR_SPEC_PRCTL | PR_SPEC_DISABLE;
+}
 
 static int ssb_prctl_get(struct task_struct *task)
 {
@@ -1475,6 +1684,8 @@ int arch_prctl_spec_ctrl_get(struct task_struct *task, unsigned long which)
 		return ssb_prctl_get(task);
 	case PR_SPEC_INDIRECT_BRANCH:
 		return ib_prctl_get(task);
+	case PR_SPEC_L1D_FLUSH:
+		return l1d_flush_prctl_get(task);
 	default:
 		return -ENODEV;
 	}
@@ -1704,6 +1915,20 @@ static ssize_t tsx_async_abort_show_state(char *buf)
 		       sched_smt_active() ? "vulnerable" : "disabled");
 }
 
+static ssize_t mmio_stale_data_show_state(char *buf)
+{
+	if (mmio_mitigation == MMIO_MITIGATION_OFF)
+		return sysfs_emit(buf, "%s\n", mmio_strings[mmio_mitigation]);
+
+	if (boot_cpu_has(X86_FEATURE_HYPERVISOR)) {
+		return sysfs_emit(buf, "%s; SMT Host state unknown\n",
+				  mmio_strings[mmio_mitigation]);
+	}
+
+	return sysfs_emit(buf, "%s; SMT %s\n", mmio_strings[mmio_mitigation],
+			  sched_smt_active() ? "vulnerable" : "disabled");
+}
+
 static char *stibp_state(void)
 {
 	if (spectre_v2_in_eibrs_mode(spectre_v2_enabled))
@@ -1804,6 +2029,9 @@ static ssize_t cpu_show_common(struct device *dev, struct device_attribute *attr
 	case X86_BUG_SRBDS:
 		return srbds_show_state(buf);
 
+	case X86_BUG_MMIO_STALE_DATA:
+		return mmio_stale_data_show_state(buf);
+
 	default:
 		break;
 	}
@@ -1854,5 +2082,10 @@ ssize_t cpu_show_itlb_multihit(struct device *dev, struct device_attribute *attr
 ssize_t cpu_show_srbds(struct device *dev, struct device_attribute *attr, char *buf)
 {
 	return cpu_show_common(dev, attr, buf, X86_BUG_SRBDS);
+}
+
+ssize_t cpu_show_mmio_stale_data(struct device *dev, struct device_attribute *attr, char *buf)
+{
+	return cpu_show_common(dev, attr, buf, X86_BUG_MMIO_STALE_DATA);
 }
 #endif
