@@ -86,6 +86,7 @@ static void pqi_ofa_free_host_buffer(struct pqi_ctrl_info *ctrl_info);
 static int pqi_ofa_host_memory_update(struct pqi_ctrl_info *ctrl_info);
 static int pqi_device_wait_for_pending_io(struct pqi_ctrl_info *ctrl_info,
 	struct pqi_scsi_dev *device, u8 lun, unsigned long timeout_msecs);
+static void pqi_fail_all_outstanding_requests(struct pqi_ctrl_info *ctrl_info);
 
 /* for flags argument to pqi_submit_raid_request_synchronous() */
 #define PQI_SYNC_FLAGS_INTERRUPTABLE	0x1
@@ -6148,9 +6149,11 @@ static int pqi_device_wait_for_pending_io(struct pqi_ctrl_info *ctrl_info,
 	warning_timeout = (PQI_PENDING_IO_WARNING_TIMEOUT_SECS * HZ) + start_jiffies;
 
 	while ((cmds_outstanding = atomic_read(&device->scsi_cmds_outstanding[lun])) > 0) {
-		pqi_check_ctrl_health(ctrl_info);
-		if (pqi_ctrl_offline(ctrl_info))
-			return -ENXIO;
+		if (ctrl_info->ctrl_removal_state != PQI_CTRL_GRACEFUL_REMOVAL) {
+			pqi_check_ctrl_health(ctrl_info);
+			if (pqi_ctrl_offline(ctrl_info))
+				return -ENXIO;
+		}
 		msecs_waiting = jiffies_to_msecs(jiffies - start_jiffies);
 		if (msecs_waiting >= timeout_msecs) {
 			dev_err(&ctrl_info->pci_dev->dev,
@@ -6934,6 +6937,9 @@ static ssize_t pqi_unique_id_show(struct device *dev,
 	sdev = to_scsi_device(dev);
 	ctrl_info = shost_to_hba(sdev->host);
 
+	if (pqi_ctrl_offline(ctrl_info))
+		return -ENODEV;
+
 	spin_lock_irqsave(&ctrl_info->scsi_device_list_lock, flags);
 
 	device = sdev->hostdata;
@@ -6970,6 +6976,9 @@ static ssize_t pqi_lunid_show(struct device *dev,
 	sdev = to_scsi_device(dev);
 	ctrl_info = shost_to_hba(sdev->host);
 
+	if (pqi_ctrl_offline(ctrl_info))
+		return -ENODEV;
+
 	spin_lock_irqsave(&ctrl_info->scsi_device_list_lock, flags);
 
 	device = sdev->hostdata;
@@ -7004,6 +7013,9 @@ static ssize_t pqi_path_info_show(struct device *dev,
 
 	sdev = to_scsi_device(dev);
 	ctrl_info = shost_to_hba(sdev->host);
+
+	if (pqi_ctrl_offline(ctrl_info))
+		return -ENODEV;
 
 	spin_lock_irqsave(&ctrl_info->scsi_device_list_lock, flags);
 
@@ -7082,6 +7094,9 @@ static ssize_t pqi_sas_address_show(struct device *dev,
 	sdev = to_scsi_device(dev);
 	ctrl_info = shost_to_hba(sdev->host);
 
+	if (pqi_ctrl_offline(ctrl_info))
+		return -ENODEV;
+
 	spin_lock_irqsave(&ctrl_info->scsi_device_list_lock, flags);
 
 	device = sdev->hostdata;
@@ -7107,6 +7122,9 @@ static ssize_t pqi_ssd_smart_path_enabled_show(struct device *dev,
 
 	sdev = to_scsi_device(dev);
 	ctrl_info = shost_to_hba(sdev->host);
+
+	if (pqi_ctrl_offline(ctrl_info))
+		return -ENODEV;
 
 	spin_lock_irqsave(&ctrl_info->scsi_device_list_lock, flags);
 
@@ -7136,6 +7154,9 @@ static ssize_t pqi_raid_level_show(struct device *dev,
 
 	sdev = to_scsi_device(dev);
 	ctrl_info = shost_to_hba(sdev->host);
+
+	if (pqi_ctrl_offline(ctrl_info))
+		return -ENODEV;
 
 	spin_lock_irqsave(&ctrl_info->scsi_device_list_lock, flags);
 
@@ -7167,6 +7188,9 @@ static ssize_t pqi_raid_bypass_cnt_show(struct device *dev,
 	sdev = to_scsi_device(dev);
 	ctrl_info = shost_to_hba(sdev->host);
 
+	if (pqi_ctrl_offline(ctrl_info))
+		return -ENODEV;
+
 	spin_lock_irqsave(&ctrl_info->scsi_device_list_lock, flags);
 
 	device = sdev->hostdata;
@@ -7193,6 +7217,9 @@ static ssize_t pqi_sas_ncq_prio_enable_show(struct device *dev,
 
 	sdev = to_scsi_device(dev);
 	ctrl_info = shost_to_hba(sdev->host);
+
+	if (pqi_ctrl_offline(ctrl_info))
+		return -ENODEV;
 
 	spin_lock_irqsave(&ctrl_info->scsi_device_list_lock, flags);
 
@@ -8533,7 +8560,6 @@ static void pqi_free_interrupts(struct pqi_ctrl_info *ctrl_info)
 
 static void pqi_free_ctrl_resources(struct pqi_ctrl_info *ctrl_info)
 {
-	pqi_stop_heartbeat_timer(ctrl_info);
 	pqi_free_interrupts(ctrl_info);
 	if (ctrl_info->queue_memory_base)
 		dma_free_coherent(&ctrl_info->pci_dev->dev,
@@ -8558,8 +8584,15 @@ static void pqi_free_ctrl_resources(struct pqi_ctrl_info *ctrl_info)
 
 static void pqi_remove_ctrl(struct pqi_ctrl_info *ctrl_info)
 {
+	ctrl_info->controller_online = false;
+	pqi_stop_heartbeat_timer(ctrl_info);
+	pqi_ctrl_block_requests(ctrl_info);
 	pqi_cancel_rescan_worker(ctrl_info);
 	pqi_cancel_update_time_worker(ctrl_info);
+	if (ctrl_info->ctrl_removal_state == PQI_CTRL_SURPRISE_REMOVAL) {
+		pqi_fail_all_outstanding_requests(ctrl_info);
+		ctrl_info->pqi_mode_enabled = false;
+	}
 	pqi_remove_all_scsi_devices(ctrl_info);
 	pqi_unregister_scsi(ctrl_info);
 	if (ctrl_info->pqi_mode_enabled)
@@ -8900,10 +8933,17 @@ error:
 static void pqi_pci_remove(struct pci_dev *pci_dev)
 {
 	struct pqi_ctrl_info *ctrl_info;
+	u16 vendor_id;
 
 	ctrl_info = pci_get_drvdata(pci_dev);
 	if (!ctrl_info)
 		return;
+
+	pci_read_config_word(ctrl_info->pci_dev, PCI_SUBSYSTEM_VENDOR_ID, &vendor_id);
+	if (vendor_id == 0xffff)
+		ctrl_info->ctrl_removal_state = PQI_CTRL_SURPRISE_REMOVAL;
+	else
+		ctrl_info->ctrl_removal_state = PQI_CTRL_GRACEFUL_REMOVAL;
 
 	pqi_remove_ctrl(ctrl_info);
 }
