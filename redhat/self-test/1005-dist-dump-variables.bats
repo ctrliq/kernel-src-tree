@@ -16,3 +16,10 @@ load test-lib.bash
 	[ -d $BATS_TMPDIR ] && rm -rf $BATS_TMPDIR/data
 	check_status
 }
+
+# Purpose: This test verifies the BUILD_TARGET value is "eln" for DIST=".eln".
+@test "eln BUILD_TARGET test" {
+	bt=$(make DIST=".eln" dist-dump-variables | grep "BUILD_TARGET=" | cut -d"=" -f2)
+	run [ "$bt" != "eln" ]
+	check_status
+}
