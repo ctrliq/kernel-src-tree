@@ -3,12 +3,6 @@
 #
 # This section is intentionally left at the top of the Makefile so it won't be ignored.
 #
-ifdef PREBUILD_GIT_ONLY
-  # deprecated in 5.18.0
-  $(warning WARNING: PREBUILD_GIT_ONLY will be deprecated in a later release, use UPSTREAMBUILD_GIT_ONLY instead.)
-  UPSTREAMBUILD_GIT_ONLY:=$(PREBUILD_GIT_ONLY)
-endif
-
 ifdef BUILD_SCRATCH_TARGET
   # deprecated in 5.19.0
   $(warning WARNING: BUILD_SCRATCH_TARGET will be deprecated in a later release, use BUILD_TARGET instead.)
