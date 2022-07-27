@@ -59,22 +59,6 @@ static bool gup_must_unshare_slowpath(struct page *page)
 	return must_unshare;
 }
 
-static bool gup_must_unshare_hugetlbfs_slowpath(struct page *page)
-{
-	bool must_unshare;
-	/*
-	 * The hugetlbfs COW and COR fault always run under the page
-	 * lock. The page lock is needed here as well to prevent a
-	 * race with page migration. If we fail taking the lock it'll
-	 * sleep in the COR fault.
-	 */
-	if (!trylock_page(page))
-		return true;
-	must_unshare = __page_mapcount(page) > 1;
-	unlock_page(page);
-	return must_unshare;
-}
-
 /*
  * For a page wrprotected in the pgtable, which pages do we need to
  * unshare with copy-on-read (COR) for the GUP pin to remain coherent
@@ -98,11 +82,8 @@ static __always_inline bool __gup_must_unshare(unsigned int flags,
 		return false;
 	if (PageKsm(page))
 		return false;
-	if (PageHuge(page)) {
-		if (__page_mapcount(page) > 1)
-			return true;
-		return gup_must_unshare_hugetlbfs_slowpath(page);
-	}
+	if (PageHuge(page)) /* FIXME */
+		return false;
 	if (is_head) {
 		if (PageTransHuge(page)) {
 			if (!is_fast_only_in_irq(irq_safe)) {
