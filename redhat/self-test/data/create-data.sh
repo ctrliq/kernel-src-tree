@@ -19,7 +19,7 @@ destdir="${RHDISTDATADIR}"
 sources="${SOURCES}"
 
 # unset all redhat/Makefile variables so they do not interfere with make targets below
-makefile_vars=$(unset SINGLE_TARBALL; make dist-dump-variables | grep "=" | cut -d"=" -f1)
+makefile_vars=$(make dist-dump-variables | grep "=" | cut -d"=" -f1)
 while read -r VAR; do unset "$VAR"; done < <(echo "$makefile_vars")
 
 specfile_helper () {

@@ -1,7 +1,7 @@
 #!/bin/sh
 
 # shellcheck disable=SC2153
-[ "$SINGLE_TARBALL" -eq 1 ] && _GITID="$GITID" || _GITID="$MARKER"
+[ "$DISTRO" != "fedora" ] && _GITID="$GITID" || _GITID="$MARKER"
 
 # shellcheck disable=SC1083
 XZ_THREADS=$(rpm --eval %{_smp_mflags} | sed -e 's!^-j!--threads !')
