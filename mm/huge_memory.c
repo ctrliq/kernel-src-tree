@@ -1341,9 +1341,6 @@ vm_fault_t do_huge_pmd_wp_page(struct vm_fault *vmf)
 	page = pmd_page(orig_pmd);
 	VM_BUG_ON_PAGE(!PageHead(page), page);
 
-	if (page_trans_huge_anon_shared(page))
-		goto copy;
-
 	/* Lock page for reuse_swap_page() */
 	if (!trylock_page(page)) {
 		get_page(page);
@@ -1375,7 +1372,6 @@ vm_fault_t do_huge_pmd_wp_page(struct vm_fault *vmf)
 	}
 
 	unlock_page(page);
-copy:
 	spin_unlock(vmf->ptl);
 fallback:
 	__split_huge_pmd(vma, vmf->pmd, vmf->address, false, NULL);
