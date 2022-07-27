@@ -532,8 +532,6 @@ static inline void page_trans_huge_mapcount_unlock(struct page *page)
 
 #endif /* CONFIG_TRANSPARENT_HUGEPAGE */
 
-extern bool page_trans_huge_anon_shared(struct page *);
-
 static inline int split_folio_to_list(struct folio *folio,
 		struct list_head *list)
 {
