@@ -807,7 +807,7 @@ static int nvme_tcp_recv_ddgst(struct nvme_tcp_queue *queue,
 		return 0;
 
 	if (queue->recv_ddgst != queue->exp_ddgst) {
-		struct request *rq = blk_mq_tag_to_rq(nvme_tcp_tagset(queue),
+		struct request *rq = nvme_cid_to_rq(nvme_tcp_tagset(queue),
 						pdu->command_id);
 		struct nvme_tcp_request *req = blk_mq_rq_to_pdu(rq);
 
