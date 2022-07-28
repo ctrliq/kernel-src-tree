@@ -522,14 +522,6 @@ static inline bool page_mapcount_seq_retry(struct page *page,
 	return false;
 }
 
-static inline void page_trans_huge_mapcount_lock(struct page *page)
-{
-}
-
-static inline void page_trans_huge_mapcount_unlock(struct page *page)
-{
-}
-
 #endif /* CONFIG_TRANSPARENT_HUGEPAGE */
 
 static inline int split_folio_to_list(struct folio *folio,
