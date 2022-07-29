@@ -355,9 +355,11 @@ SYM_CODE_START(early_idt_handler_array)
 	.rept NUM_EXCEPTION_VECTORS
 	.if ((EXCEPTION_ERRCODE_MASK >> i) & 1) == 0
 		UNWIND_HINT_IRET_REGS
+		ENDBR
 		pushq $0	# Dummy error code, to make stack frame uniform
 	.else
 		UNWIND_HINT_IRET_REGS offset=8
+		ENDBR
 	.endif
 	pushq $i		# 72(%rsp) Vector number
 	jmp early_idt_handler_common
@@ -365,11 +367,11 @@ SYM_CODE_START(early_idt_handler_array)
 	i = i + 1
 	.fill early_idt_handler_array + i*EARLY_IDT_HANDLER_SIZE - ., 1, 0xcc
 	.endr
-	UNWIND_HINT_IRET_REGS offset=16
 SYM_CODE_END(early_idt_handler_array)
 	ANNOTATE_NOENDBR // early_idt_handler_array[NUM_EXCEPTION_VECTORS]
 
 SYM_CODE_START_LOCAL(early_idt_handler_common)
+	UNWIND_HINT_IRET_REGS offset=16
 	/*
 	 * The stack is the hardware frame, an error code or zero, and the
 	 * vector number.
