@@ -116,6 +116,12 @@
 .Lskip_rsb_\@:
 .endm
 
+#ifdef CONFIG_CPU_UNRET_ENTRY
+#define CALL_ZEN_UNTRAIN_RET	"call zen_untrain_ret"
+#else
+#define CALL_ZEN_UNTRAIN_RET	""
+#endif
+
 /*
  * Mitigate RETBleed for AMD/Hygon Zen uarch. Requires KERNEL CR3 because the
  * return thunk isn't mapped into the userspace tables (then again, AMD
@@ -128,9 +134,9 @@
  * where we have a stack but before any RET instruction.
  */
 .macro UNTRAIN_RET
-#ifdef CONFIG_RETPOLINE
+#if defined(CONFIG_CPU_UNRET_ENTRY) || defined(CONFIG_CPU_IBPB_ENTRY)
 	ALTERNATIVE_2 "",						\
-	              "call zen_untrain_ret", X86_FEATURE_UNRET,	\
+	              CALL_ZEN_UNTRAIN_RET, X86_FEATURE_UNRET,		\
 		      "call entry_ibpb", X86_FEATURE_ENTRY_IBPB
 #endif
 .endm
