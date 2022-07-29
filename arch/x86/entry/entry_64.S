@@ -805,6 +805,7 @@ SYM_CODE_END(exc_xen_hypervisor_callback)
  */
 SYM_CODE_START(xen_failsafe_callback)
 	UNWIND_HINT_EMPTY
+	ENDBR
 	movl	%ds, %ecx
 	cmpw	%cx, 0x10(%rsp)
 	jne	1f
