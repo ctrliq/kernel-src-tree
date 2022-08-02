@@ -68,7 +68,7 @@ int fsl8250_handle_irq(struct uart_port *port)
 
 		if (is_console)
 			console_atomic_lock(flags);
-		up->ier = port->serial_in(port, UART_IER);
+		up->ier = serial8250_in_IER(up);
 		if (is_console)
 			console_atomic_unlock(flags);
 

@@ -132,8 +132,27 @@ static inline void serial_dl_write(struct uart_8250_port *up, int value)
 	up->dl_write(up, value);
 }
 
-static inline void serial8250_set_IER(struct uart_8250_port *up,
-				      unsigned char ier)
+static inline int serial8250_in_IER(struct uart_8250_port *up)
+{
+	struct uart_port *port = &up->port;
+	unsigned long flags;
+	bool is_console;
+	int ier;
+
+	is_console = uart_console(port);
+
+	if (is_console)
+		printk_cpu_sync_get_irqsave(flags);
+
+	ier = serial_in(up, UART_IER);
+
+	if (is_console)
+		printk_cpu_sync_put_irqrestore(flags);
+
+	return ier;
+}
+
+static inline void serial8250_set_IER(struct uart_8250_port *up, int ier)
 {
 	struct uart_port *port = &up->port;
 	unsigned long flags;
@@ -142,21 +161,21 @@ static inline void serial8250_set_IER(struct uart_8250_port *up,
 	is_console = uart_console(port);
 
 	if (is_console)
-		console_atomic_lock(flags);
+		printk_cpu_sync_get_irqsave(flags);
 
 	serial_out(up, UART_IER, ier);
 
 	if (is_console)
-		console_atomic_unlock(flags);
+		printk_cpu_sync_put_irqrestore(flags);
 }
 
-static inline unsigned char serial8250_clear_IER(struct uart_8250_port *up)
+static inline int serial8250_clear_IER(struct uart_8250_port *up)
 {
 	struct uart_port *port = &up->port;
 	unsigned int clearval = 0;
 	unsigned long flags;
-	unsigned int prior;
 	bool is_console;
+	int prior;
 
 	is_console = uart_console(port);
 
@@ -164,13 +183,13 @@ static inline unsigned char serial8250_clear_IER(struct uart_8250_port *up)
 		clearval = UART_IER_UUE;
 
 	if (is_console)
-		console_atomic_lock(flags);
+		printk_cpu_sync_get_irqsave(flags);
 
-	prior = serial_port_in(port, UART_IER);
-	serial_port_out(port, UART_IER, clearval);
+	prior = serial_in(up, UART_IER);
+	serial_out(up, UART_IER, clearval);
 
 	if (is_console)
-		console_atomic_unlock(flags);
+		printk_cpu_sync_put_irqrestore(flags);
 
 	return prior;
 }
