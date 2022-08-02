@@ -1122,6 +1122,12 @@ static int vfio_group_add_container_user(struct vfio_group *group)
 
 static const struct file_operations vfio_device_fops;
 
+/* true if the vfio_device has open_device() called but not close_device() */
+static bool vfio_assert_device_open(struct vfio_device *device)
+{
+	return !WARN_ON_ONCE(!READ_ONCE(device->open_count));
+}
+
 static int vfio_group_get_device_fd(struct vfio_group *group, char *buf)
 {
 	struct vfio_device *device;
@@ -1336,8 +1342,10 @@ static int vfio_device_fops_release(struct inode *inode, struct file *filep)
 	struct vfio_device *device = filep->private_data;
 
 	mutex_lock(&device->dev_set->lock);
-	if (!--device->open_count && device->ops->close_device)
+	vfio_assert_device_open(device);
+	if (device->open_count == 1 && device->ops->close_device)
 		device->ops->close_device(device);
+	device->open_count--;
 	mutex_unlock(&device->dev_set->lock);
 
 	module_put(device->dev->driver->owner);
@@ -1904,7 +1912,8 @@ int vfio_pin_pages(struct vfio_device *device, unsigned long *user_pfn,
 	struct vfio_iommu_driver *driver;
 	int ret;
 
-	if (!user_pfn || !phys_pfn || !npage)
+	if (!user_pfn || !phys_pfn || !npage ||
+	    !vfio_assert_device_open(device))
 		return -EINVAL;
 
 	if (npage > VFIO_PIN_PAGES_MAX_ENTRIES)
@@ -1912,10 +1921,6 @@ int vfio_pin_pages(struct vfio_device *device, unsigned long *user_pfn,
 
 	if (group->dev_counter > 1)
 		return -EINVAL;
-
-	ret = vfio_group_add_container_user(group);
-	if (ret)
-		return ret;
 
 	container = group->container;
 	driver = container->iommu_driver;
@@ -1925,8 +1930,6 @@ int vfio_pin_pages(struct vfio_device *device, unsigned long *user_pfn,
 					     npage, prot, phys_pfn);
 	else
 		ret = -ENOTTY;
-
-	vfio_group_try_dissolve_container(group);
 
 	return ret;
 }
@@ -1948,15 +1951,11 @@ int vfio_unpin_pages(struct vfio_device *device, unsigned long *user_pfn,
 	struct vfio_iommu_driver *driver;
 	int ret;
 
-	if (!user_pfn || !npage)
+	if (!user_pfn || !npage || !vfio_assert_device_open(device))
 		return -EINVAL;
 
 	if (npage > VFIO_PIN_PAGES_MAX_ENTRIES)
 		return -E2BIG;
-
-	ret = vfio_group_add_container_user(device->group);
-	if (ret)
-		return ret;
 
 	container = device->group->container;
 	driver = container->iommu_driver;
@@ -1965,8 +1964,6 @@ int vfio_unpin_pages(struct vfio_device *device, unsigned long *user_pfn,
 					       npage);
 	else
 		ret = -ENOTTY;
-
-	vfio_group_try_dissolve_container(device->group);
 
 	return ret;
 }
@@ -1996,12 +1993,8 @@ int vfio_dma_rw(struct vfio_device *device, dma_addr_t user_iova, void *data,
 	struct vfio_iommu_driver *driver;
 	int ret = 0;
 
-	if (!data || len <= 0)
+	if (!data || len <= 0 || !vfio_assert_device_open(device))
 		return -EINVAL;
-
-	ret = vfio_group_add_container_user(device->group);
-	if (ret)
-		return ret;
 
 	container = device->group->container;
 	driver = container->iommu_driver;
@@ -2011,9 +2004,6 @@ int vfio_dma_rw(struct vfio_device *device, dma_addr_t user_iova, void *data,
 					  user_iova, data, len, write);
 	else
 		ret = -ENOTTY;
-
-	vfio_group_try_dissolve_container(device->group);
-
 	return ret;
 }
 EXPORT_SYMBOL(vfio_dma_rw);
@@ -2026,10 +2016,6 @@ static int vfio_register_iommu_notifier(struct vfio_group *group,
 	struct vfio_iommu_driver *driver;
 	int ret;
 
-	ret = vfio_group_add_container_user(group);
-	if (ret)
-		return -EINVAL;
-
 	container = group->container;
 	driver = container->iommu_driver;
 	if (likely(driver && driver->ops->register_notifier))
@@ -2037,9 +2023,6 @@ static int vfio_register_iommu_notifier(struct vfio_group *group,
 						     events, nb);
 	else
 		ret = -ENOTTY;
-
-	vfio_group_try_dissolve_container(group);
-
 	return ret;
 }
 
@@ -2050,10 +2033,6 @@ static int vfio_unregister_iommu_notifier(struct vfio_group *group,
 	struct vfio_iommu_driver *driver;
 	int ret;
 
-	ret = vfio_group_add_container_user(group);
-	if (ret)
-		return -EINVAL;
-
 	container = group->container;
 	driver = container->iommu_driver;
 	if (likely(driver && driver->ops->unregister_notifier))
@@ -2061,9 +2040,6 @@ static int vfio_unregister_iommu_notifier(struct vfio_group *group,
 						       nb);
 	else
 		ret = -ENOTTY;
-
-	vfio_group_try_dissolve_container(group);
-
 	return ret;
 }
 
@@ -2092,10 +2068,6 @@ static int vfio_register_group_notifier(struct vfio_group *group,
 	if (*events)
 		return -EINVAL;
 
-	ret = vfio_group_add_container_user(group);
-	if (ret)
-		return -EINVAL;
-
 	ret = blocking_notifier_chain_register(&group->notifier, nb);
 
 	/*
@@ -2105,25 +2077,6 @@ static int vfio_register_group_notifier(struct vfio_group *group,
 	if (!ret && set_kvm && group->kvm)
 		blocking_notifier_call_chain(&group->notifier,
 					VFIO_GROUP_NOTIFY_SET_KVM, group->kvm);
-
-	vfio_group_try_dissolve_container(group);
-
-	return ret;
-}
-
-static int vfio_unregister_group_notifier(struct vfio_group *group,
-					 struct notifier_block *nb)
-{
-	int ret;
-
-	ret = vfio_group_add_container_user(group);
-	if (ret)
-		return -EINVAL;
-
-	ret = blocking_notifier_chain_unregister(&group->notifier, nb);
-
-	vfio_group_try_dissolve_container(group);
-
 	return ret;
 }
 
@@ -2134,7 +2087,8 @@ int vfio_register_notifier(struct vfio_device *device,
 	struct vfio_group *group = device->group;
 	int ret;
 
-	if (!nb || !events || (*events == 0))
+	if (!nb || !events || (*events == 0) ||
+	    !vfio_assert_device_open(device))
 		return -EINVAL;
 
 	switch (type) {
@@ -2158,7 +2112,7 @@ int vfio_unregister_notifier(struct vfio_device *device,
 	struct vfio_group *group = device->group;
 	int ret;
 
-	if (!nb)
+	if (!nb || !vfio_assert_device_open(device))
 		return -EINVAL;
 
 	switch (type) {
@@ -2166,7 +2120,7 @@ int vfio_unregister_notifier(struct vfio_device *device,
 		ret = vfio_unregister_iommu_notifier(group, nb);
 		break;
 	case VFIO_GROUP_NOTIFY:
-		ret = vfio_unregister_group_notifier(group, nb);
+		ret = blocking_notifier_chain_unregister(&group->notifier, nb);
 		break;
 	default:
 		ret = -EINVAL;
