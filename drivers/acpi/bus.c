@@ -1356,6 +1356,7 @@ static int __init acpi_init(void)
 	acpi_iort_init();
 	acpi_hest_init();
 	acpi_ghes_init();
+	acpi_viot_early_init();
 	acpi_scan_init();
 	acpi_ec_init();
 	acpi_debugfs_init();
