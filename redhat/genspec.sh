@@ -128,8 +128,6 @@ fi
 cat "$clogf" "$CHANGELOG" > "$clogf.full"
 mv -f "$clogf.full" "$CHANGELOG"
 
-vim ${CHANGELOG}
-
 # genlog.py generates Resolves lines as well, strip these from RPM changelog
 cat $CHANGELOG | grep -v -e "^Resolves: " > $clogf.stripped
 
