@@ -180,7 +180,7 @@ if [ "$DISTRO" == "fedora" ]; then
 
 	# May need to preserve word splitting in EXCLUDE_FILES
 	# shellcheck disable=SC2086
-	git diff -p --no-renames --stat "$MARKER"..  $EXCLUDE_FILES \
+	git diff -p --binary --no-renames --stat "$MARKER".. $EXCLUDE_FILES \
 		> ${SOURCES}/patch-${SPECKVERSION}.${SPECKPATCHLEVEL}-redhat.patch
 else
 	# The tarball in the SRPM contains both upstream sources and OS-specifc
