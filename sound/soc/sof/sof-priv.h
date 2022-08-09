@@ -37,6 +37,8 @@
 #define SOF_DBG_IGNORE_D3_PERSISTENT		BIT(7) /* ignore the DSP D3 persistent capability
 							* and always download firmware upon D3 exit
 							*/
+#define SOF_DBG_D3_PERSISTENT		BIT(30)	/* Enable DSP D3 peristent capability
+						   (Red Hat specific flag) */
 
 /* Flag definitions used for controlling the DSP dump behavior */
 #define SOF_DBG_DUMP_REGS		BIT(0)

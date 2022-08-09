@@ -399,6 +399,7 @@ int hda_dsp_cl_boot_firmware(struct snd_sof_dev *sdev)
 
 	if ((sdev->fw_ready.flags & SOF_IPC_INFO_D3_PERSISTENT) &&
 	    !(sof_debug_check_flag(SOF_DBG_IGNORE_D3_PERSISTENT)) &&
+	    sof_debug_check_flag(SOF_DBG_D3_PERSISTENT) &&
 	    !sdev->first_boot) {
 		dev_dbg(sdev->dev, "IMR restore supported, booting from IMR directly\n");
 		return hda_dsp_boot_imr(sdev);
