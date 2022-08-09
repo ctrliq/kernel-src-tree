@@ -1,7 +1,7 @@
 #!/bin/bash
 
 LAST_MARKER=$(cat "${REDHAT}"/marker)
-clogf="$SOURCES/changelog"
+clogf="$1"
 # hide [redhat] entries from changelog
 HIDE_REDHAT=1;
 # hide entries for unsupported arches
@@ -70,8 +70,7 @@ fi
 # create empty file to avoid adding extra header to changelog
 LENGTH=$(grep -c "^-" "$clogf" | awk '{print $1}')
 if [ "$LENGTH" = 0 ]; then
-	rm -f "$clogf"
-	touch "$clogf"
+	echo -n > "$clogf"
 fi
 
 cat "$clogf" "$SOURCES/$SPECCHANGELOG" > "$clogf.full"
@@ -87,4 +86,4 @@ test -f "$SOURCES/$SPECFILE" &&
 
 echo "MARKER is $MARKER"
 
-rm -f "$clogf"{,.stripped};
+rm -f "$clogf".stripped;

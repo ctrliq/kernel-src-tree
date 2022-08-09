@@ -87,7 +87,9 @@ if [ -n "$RHSELFTESTDATA" ]; then
 	exit 0
 fi
 
-"${0%/*}"/genlog.sh
+clogf=$(mktemp)
+trap 'rm -f "$clogf"' SIGHUP SIGINT SIGTERM EXIT
+"${0%/*}"/genlog.sh "$clogf"
 
 if [ "$DISTRO" == "fedora" ]; then
 	# The tarball in the SRPM contains only the upstream sources.
