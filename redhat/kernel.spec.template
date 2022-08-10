@@ -595,7 +595,7 @@ BuildRequires: sparse
 %endif
 %if %{with_perf}
 BuildRequires: zlib-devel binutils-devel newt-devel perl(ExtUtils::Embed) bison flex xz-devel
-BuildRequires: audit-libs-devel
+BuildRequires: audit-libs-devel python3-setuptools
 BuildRequires: java-devel
 BuildRequires: libbpf-devel
 BuildRequires: libbabeltrace-devel
