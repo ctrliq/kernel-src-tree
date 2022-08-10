@@ -43,7 +43,6 @@ _dist-release_test_2() {
 	# Strip off ...kernel-VV.PP.SS-:
 	pkgrelease=${title##*kernel-+([5-9]).+([0-9]).+([0-9])-}
 	build=$(BUILD= DIST=.fc33 make dist-dump-variables | grep -E "^BUILD=" | cut -d"=" -f2 | xargs)
-	((build--))
 	echo "pkgrelease=$pkgrelease"
 	echo "build=$build"
 	run _dist-release_test_2
