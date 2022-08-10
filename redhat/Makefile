@@ -58,7 +58,7 @@ SPECKPATCHLEVEL:=$(shell $(GIT) show $(HEAD):Makefile | sed -ne '/^PATCHLEVEL\ =
 SPECKSUBLEVEL:=$(shell $(GIT) show $(HEAD):Makefile | sed -ne '/^SUBLEVEL\ =\ /{s///;p;q}')
 SPECKEXTRAVERSION:=$(shell $(GIT) show $(HEAD):Makefile | sed -ne '/^EXTRAVERSION\ =\ /{s///;p;q}')
 GITID:= $(shell $(GIT) log --max-count=1 --pretty=format:%H $(HEAD))
-ifndef BUILD
+ifndef RHSELFTESTDATA
   BUILD:=$(RHEL_RELEASE)
 endif
 FLAVOR=
