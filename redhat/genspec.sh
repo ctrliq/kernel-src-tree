@@ -88,8 +88,19 @@ if [ -n "$RHSELFTESTDATA" ]; then
 fi
 
 clogf=$(mktemp)
-trap 'rm -f "$clogf"' SIGHUP SIGINT SIGTERM EXIT
+trap 'rm -f "$clogf" "$clogf".stripped' SIGHUP SIGINT SIGTERM EXIT
 "${0%/*}"/genlog.sh "$clogf"
+
+cat "$clogf" "$SOURCES/$SPECCHANGELOG" > "$clogf.full"
+mv -f "$clogf.full" "$SOURCES/$SPECCHANGELOG"
+
+# genlog.py generates Resolves lines as well, strip these from RPM changelog
+grep -v -e "^Resolves: " "$SOURCES/$SPECCHANGELOG" > "$clogf".stripped
+
+test -f "$SOURCES/$SPECFILE" &&
+	sed -i -e "
+	/%%SPECCHANGELOG%%/r $clogf.stripped
+	/%%SPECCHANGELOG%%/d" "$SOURCES/$SPECFILE"
 
 if [ "$DISTRO" == "fedora" ]; then
 	# The tarball in the SRPM contains only the upstream sources.
