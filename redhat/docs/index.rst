@@ -124,6 +124,14 @@ or
    # build against the latest RHEL major compose
    make dist-brew
 
+The dist-brew target can be used with the BUILD_FLAGS variable to specify specific architectures.  For example, to only build the x86_64 and noarch architectures,
+
+.. code-block:: sh
+
+   # this target requires internal Red Hat network access and will always
+   # build against the latest RHEL major compose
+   make dist-brew BUILD_FLAGS="--arch-override=x86_64,noarch"
+
 Want to add a patch? Just apply it with ``git cherry-pick`` or ``git am``, and
 re-run ``make dist-srpm``. To modify the kernel configuration, make changes in
 ``redhat/configs/`` (consult the repository layout for details on this).
