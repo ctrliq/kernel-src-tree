@@ -638,11 +638,11 @@ static int virtblk_init_request(struct blk_mq_tag_set *set, struct request *rq,
 	return 0;
 }
 
-static int virtblk_map_queues(struct blk_mq_tag_set *set)
+static void virtblk_map_queues(struct blk_mq_tag_set *set)
 {
 	struct virtio_blk *vblk = set->driver_data;
 
-	return blk_mq_virtio_map_queues(&set->map[HCTX_TYPE_DEFAULT],
+	blk_mq_virtio_map_queues(&set->map[HCTX_TYPE_DEFAULT],
 					vblk->vdev, 0);
 }
 
