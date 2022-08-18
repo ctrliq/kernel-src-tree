@@ -98,6 +98,8 @@ FEATURE_TESTS_EXTRA :=                  \
          llvm-version                   \
          clang                          \
          libbpf                         \
+         libbpf-bpf_object__next_program \
+         libbpf-bpf_object__next_map    \
          libpfm4                        \
          libdebuginfod			\
          clang-bpf-co-re
