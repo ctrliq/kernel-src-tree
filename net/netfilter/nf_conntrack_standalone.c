@@ -619,6 +619,10 @@ enum nf_ct_sysctl_index {
 	__NF_SYSCTL_CT_LAST_SYSCTL,
 };
 
+#ifdef CONFIG_NF_CONNTRACK_EVENTS
+static const int two = 2;
+#endif
+
 #define NF_SYSCTL_CT_LAST_SYSCTL (__NF_SYSCTL_CT_LAST_SYSCTL + 1)
 
 static struct ctl_table nf_ct_sysctl_table[] = {
@@ -690,7 +694,7 @@ static struct ctl_table nf_ct_sysctl_table[] = {
 		.mode		= 0644,
 		.proc_handler	= proc_dou8vec_minmax,
 		.extra1 	= SYSCTL_ZERO,
-		.extra2 	= SYSCTL_ONE,
+		.extra2		= (void *)&two,
 	},
 #endif
 #ifdef CONFIG_NF_CONNTRACK_TIMESTAMP
