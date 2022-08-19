@@ -1119,7 +1119,6 @@ void fpsimd_thread_switch(struct task_struct *next)
 static void fpsimd_flush_thread_vl(enum vec_type type)
 {
 	int vl, supported_vl;
-	void *sve_state = NULL;
 
 	/*
 	 * Reset the task vector length as required.  This is where we
@@ -1154,6 +1153,8 @@ static void fpsimd_flush_thread_vl(enum vec_type type)
 
 void fpsimd_flush_thread(void)
 {
+	void *sve_state = NULL;
+
 	if (!system_supports_fpsimd())
 		return;
 
