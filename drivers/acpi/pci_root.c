@@ -22,6 +22,8 @@
 #include <linux/slab.h>
 #include <linux/dmi.h>
 #include <linux/platform_data/x86/apple.h>
+#include <acpi/apei.h>	/* for acpi_hest_init() */
+
 #include "internal.h"
 
 #define ACPI_PCI_ROOT_CLASS		"pci_bridge"
@@ -941,6 +943,7 @@ out_release_info:
 
 void __init acpi_pci_root_init(void)
 {
+	acpi_hest_init();
 	if (acpi_pci_disabled)
 		return;
 
