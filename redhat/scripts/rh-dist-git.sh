@@ -46,7 +46,7 @@ upload_list="$TARBALL $KABI_TARBALL $KABIDW_TARBALL"
 upload $upload_list
 
 echo "Creating diff for review ($tmpdir/diff) and changelog"
-# diff the result (redhat/cvs/dontdiff). note: diff reuturns 1 if
+# diff the result (redhat/git/dontdiff). note: diff reuturns 1 if
 # differences were found
 diff -X "$REDHAT"/git/dontdiff -upr "$tmpdir/$PACKAGE_NAME" "$REDHAT"/rpm/SOURCES/ > "$tmpdir"/diff;
 # creating the changelog file
