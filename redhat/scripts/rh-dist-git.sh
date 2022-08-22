@@ -23,7 +23,7 @@ fi
 
 echo "Cloning the repository"
 # clone the dist-git, considering cache
-tmpdir=$("$REDHAT"/scripts/clone_tree.sh "$RHDISTGIT" "$RHDISTGIT_CACHE" "$RHDISTGIT_TMP" "$PACKAGE_NAME" "$RHEL_MAJOR" "$RHPKG_BIN");
+tmpdir=$("$REDHAT"/scripts/clone_tree.sh);
 
 echo "Switching the branch"
 # change in the correct branch

@@ -1,17 +1,6 @@
 #!/bin/bash
 
 # Clones a RHEL dist-git tree using a local reference if existent
-# $1: repository
-# $2: local clone
-# $3: use a different tmp directory (for people with SSDs)
-# $4: package name
-
-repo="$1";
-local="$2";
-tmp_dir="$3";
-package_name="$4";
-rhel_major="$5";
-rhpkg_bin="$6";
 
 function die
 {
@@ -20,23 +9,23 @@ function die
 }
 
 date=$(date +"%Y-%m-%d")
-tmp="$(mktemp -d --tmpdir="$tmp_dir" RHEL"$rhel_major"."$date".XXXXXXXX)";
+tmp="$(mktemp -d --tmpdir="$RHDISTGIT_TMP" RHEL"$RHEL_MAJOR"."$date".XXXXXXXX)";
 cd "$tmp" || die "Unable to create temporary directory";
 
-if [[ -n $repo && -n $local ]]; then
-	git clone --reference "$local" "$repo" "$package_name" >/dev/null || die "Unable to clone using local cache";
+if [[ -n $RHDISTGIT && -n $RHDISTGIT_CACHE ]]; then
+	git clone --reference "$RHDISTGIT_CACHE" "$RHDISTGIT" "$PACKAGE_NAME" >/dev/null || die "Unable to clone using local cache";
 	# if there're tarballs present that are listed in the "sources" file,
 	# copy them or it'll be downloaded again
-	if [ -e "$local/sources" ]; then
+	if [ -e "$RHDISTGIT_CACHE/sources" ]; then
 		while IFS= read -r i; do
-			if [ -f "$local/$i" ]; then
-				cp "$local/$i" "$tmp/kernel/";
+			if [ -f "$RHDISTGIT_CACHE/$i" ]; then
+				cp "$RHDISTGIT_CACHE/$i" "$tmp/kernel/";
 			fi
-		done < "$local"/sources
+		done < "$RHDISTGIT_CACHE"/sources
 	fi
 else
-	echo "No local repo, cloning using $rhpkg_bin" >&2;
-	$rhpkg_bin clone "$package_name" >/dev/null || die "Unable to clone using $rhpkg_bin";
+	echo "No local repo, cloning using $RHPKG_BIN" >&2;
+	$RHPKG_BIN clone "$PACKAGE_NAME" >/dev/null || die "Unable to clone using $RHPKG_BIN";
 fi
 
 echo "$tmp";
