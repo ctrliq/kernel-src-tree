@@ -32,7 +32,7 @@ $RHPKG_BIN switch-branch "$RHDISTGIT_BRANCH" || die "switching to branch $RHDIST
 
 echo "Copying updated files"
 # copy the required files (redhat/git/files)
-"$REDHAT"/scripts/expand_srpm.sh "$TOPDIR" "$tmpdir" "$PACKAGE_NAME" "$SRPM";
+"$REDHAT"/scripts/expand_srpm.sh "$tmpdir";
 
 echo "Uploading new tarballs"
 # upload tarballs
