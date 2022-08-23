@@ -88,6 +88,101 @@ dist-kabi-dup: dist-python-check
 		fi \
 	done;
 
+dist-assert-tree-clean:
+ifeq ($(FORCE),)
+	@if ! git diff-index --quiet --cached HEAD -- &> /dev/null; then \
+		echo "ERROR: staged changes found. Please clean the git tree."; >&2 \
+		git status; \
+		exit 1; \
+	fi
+	@if ! git diff-files --quiet &> /dev/null; then \
+		echo "ERROR: unstaged changes found. Please clean the git tree." >&2; \
+		git status; \
+		exit 1; \
+	fi
+	@if [ $$(git ls-files --exclude-standard --others | wc -l) -gt 0 ]; then \
+		echo "ERROR: untracked files found. Please clean the git tree." >&2; \
+		git status; \
+		exit 1; \
+	fi
+endif
+
+KABI_SUPPORTED_ARCHS ?= $(patsubst kabi_%,%,$(notdir $(wildcard kabi/kabi-module/*)))
+export KABI_CROSS_COMPILE_PREFIX ?= /usr/bin/
+export KABI_CROSS_COMPILE_SUFFIX ?= -linux-gnu-
+KABI_CROSS_COMPILE = $(patsubst %,$(KABI_CROSS_COMPILE_PREFIX)%$(KABI_CROSS_COMPILE_SUFFIX),$(filter-out $(CURARCH),$(KABI_SUPPORTED_ARCHS)))
+
+ifeq ($(ARCH),$(CURARCH))
+dist-assert-cross-tools: # no dependencies when we're building for native arch
+else
+dist-assert-cross-tools: $(patsubst %,%gcc,$(KABI_CROSS_COMPILE))
+endif
+
+$(KABI_CROSS_COMPILE_PREFIX)%$(KABI_CROSS_COMPILE_SUFFIX)gcc:
+	@echo "ERROR: couldn't find cross compilation toolchain (looking for: $@)" >&2
+	@echo "       override KABI_CROSS_COMPILE_PREFIX to set path (currently $(KABI_CROSS_COMPILE_PREFIX))" >&2
+	@echo "       override KABI_CROSS_COMPILE_SUFFIX to set suffix (currently $(KABI_CROSS_COMPILE_SUFFIX))" >&2
+	@exit 1
+
+
+ifeq ($(ARCH),)
+dist-kabi-index: ARCH=$(CURARCH)
+endif
+dist-kabi-index:
+	: > $(REDHAT)/kabi/kabi-module/kabi_$(ARCH)/.index.json
+	for sym in $$(find $(REDHAT)/kabi/kabi-module/kabi_$(ARCH)/ -type f -not -name "*.*" \
+	                  -exec basename {} \;); do \
+		$(REDHAT)/kabi/symtypes index \
+			$(REDHAT)/kabi/kabi-module/kabi_$(ARCH)/.$$(basename $$sym) \
+			-o $(REDHAT)/kabi/kabi-module/kabi_$(ARCH)/.index.json || : ; \
+	done
+
+ifeq ($(ARCH),)
+dist-kabi-image-%: ARCH=$(CURARCH)
+endif
+dist-kabi-image-%: NODE = $(patsubst dist-kabi-image-%,%,$@)
+dist-kabi-image-%: dist-kabi-index
+	$(REDHAT)/kabi/symtypes image -s $(NODE) -t $(REDHAT)/kabi/kabi-module/kabi_$(ARCH)/.index.json
+
+ifeq ($(ARCH),)
+dist-kabi-preimage-%: ARCH=$(CURARCH)
+endif
+dist-kabi-preimage-%: NODE = $(patsubst dist-kabi-preimage-%,%,$@)
+dist-kabi-preimage-%: dist-kabi-index
+	@node="$(NODE)"; \
+	if [ "${node:1:1}" = "#" ]; then \
+		$(REDHAT)/kabi/symtypes preimage -s '$(NODE)' -t $(REDHAT)/kabi/kabi-module/kabi_$(ARCH)/.index.json; \
+	else \
+		for prefix in {E,e,s,t,u}; do \
+		$(REDHAT)/kabi/symtypes preimage -S -s "$$prefix#$(NODE)" -t $(REDHAT)/kabi/kabi-module/kabi_$(ARCH)/.index.json || :; \
+		done; \
+	fi
+
+dist-symtype-diff: KABI_TOOL = $(REDHAT)/kabi/diff-kabi
+dist-symtype-diff: dist-assert-cross-tools dist-assert-tree-clean dist-configs dist-symtype-shared
+
+dist-kabi-update: KABI_TOOL = $(REDHAT)/kabi/update-kabi
+dist-kabi-update: dist-assert-cross-tools dist-assert-tree-clean dist-configs dist-symtype-shared
+
+dist-symtype-shared:
+	@declare -a _ARGS; \
+	declare -a _ARCHS; \
+	for symbol in $${SYMBOL:-}; do \
+		_ARGS=("$${_ARGS[@]}" -s "$$symbol"); \
+	done; \
+	if [ -n "$${SRC:-}" ]; then \
+		_ARGS=("$${_ARGS[@]}" $$SRC); \
+	fi; \
+	if [ -n "$${ARCH:-}" ]; then \
+		$(KABI_TOOL) -a $(ARCH) $${_ARGS[@]}; \
+	else \
+		cnt=1; \
+		for arch in $(KABI_SUPPORTED_ARCHS); do \
+			$(KABI_TOOL) -a $$arch $${_ARGS[@]} || : ; \
+			let cnt++; \
+		done; \
+	fi
+
 dist-check-kabi: dist-kabi
 	@if [ ! -e $(_OUTPUT)/Module.symvers ]; then \
 		echo "ERROR: You must compile the kernel and modules first";\
@@ -531,6 +626,8 @@ dist-full-help:
 	@echo  '  dist-kabi-dw-base   - Generate the base dataset for kABI DWARF-based check.'
 	@echo  '  dist-kabi-dw-check  - Run DWARF-based kABI comparison of current binaries'
 	@echo  '                        with the base dataset.'
+	@echo  '  dist-kabi-update    - Update kabi stablelist checksums.'
+	@echo  '  dist-symtype-diff   - Diff kabi stablelist and current kernel.'
 
 	@echo  ''
 	@echo  'Configuration targets:'
