@@ -25,6 +25,8 @@ type SubSystem struct {
 		EmailLabel string `emailLabel`
 	}
 	Status string `status`
+	DevelSst []string `devel-sst`
+	QeSst []string `qe-sst`
 	Maintainers []NameAndEmail `maintainers`
 	Reviewers []NameAndEmail `reviewers`
 	Paths struct {
@@ -94,6 +96,12 @@ func main() {
 			if r.Gluser == "" {
 				log.Fatalf("error: '%s' has reviewer %s <%s> listed without a gluser: entry", s.Subsystem, r.Name, r.Email)
 			}
+		}
+		if s.DevelSst == nil {
+			log.Fatalf("error: '%s' is missing a devel-sst entry", s.Subsystem)
+		}
+		if s.QeSst == nil {
+			log.Fatalf("error: '%s' is missing a qe-sst entry", s.Subsystem)
 		}
 	}
 }
