@@ -2207,6 +2207,11 @@ static const struct ib_device_ops mlx4_ib_hw_stats_ops = {
 	.get_hw_stats = mlx4_ib_get_hw_stats,
 };
 
+static const struct ib_device_ops mlx4_ib_hw_stats_ops1 = {
+	.alloc_hw_device_stats = mlx4_ib_alloc_hw_device_stats,
+	.get_hw_stats = mlx4_ib_get_hw_stats,
+};
+
 static int mlx4_ib_alloc_diag_counters(struct mlx4_ib_dev *ibdev)
 {
 	struct mlx4_ib_diag_counters *diag = ibdev->diag_counters;
@@ -2219,9 +2224,16 @@ static int mlx4_ib_alloc_diag_counters(struct mlx4_ib_dev *ibdev)
 		return 0;
 
 	for (i = 0; i < MLX4_DIAG_COUNTERS_TYPES; i++) {
-		/* i == 1 means we are building port counters */
-		if (i && !per_port)
-			continue;
+		/*
+		 * i == 1 means we are building port counters, set a different
+		 * stats ops without port stats callback.
+		 */
+		if (i && !per_port) {
+			ib_set_device_ops(&ibdev->ib_dev,
+					  &mlx4_ib_hw_stats_ops1);
+
+			return 0;
+		}
 
 		ret = __mlx4_ib_alloc_diag_counters(ibdev, &diag[i].descs,
 						    &diag[i].offset,
@@ -2265,7 +2277,7 @@ static void mlx4_ib_update_qps(struct mlx4_ib_dev *ibdev,
 	u64 release_mac = MLX4_IB_INVALID_MAC;
 	struct mlx4_ib_qp *qp;
 
-	new_smac = mlx4_mac_to_u64(dev->dev_addr);
+	new_smac = ether_addr_to_u64(dev->dev_addr);
 	atomic64_set(&ibdev->iboe.mac[port - 1], new_smac);
 
 	/* no need for update QP1 and mac registration in non-SRIOV */
@@ -2764,10 +2776,8 @@ static void *mlx4_ib_add(struct mlx4_dev *dev)
 		if (err)
 			goto err_counter;
 
-		ibdev->ib_uc_qpns_bitmap =
-			kmalloc_array(BITS_TO_LONGS(ibdev->steer_qpn_count),
-				      sizeof(long),
-				      GFP_KERNEL);
+		ibdev->ib_uc_qpns_bitmap = bitmap_alloc(ibdev->steer_qpn_count,
+							GFP_KERNEL);
 		if (!ibdev->ib_uc_qpns_bitmap)
 			goto err_steer_qp_release;
 
@@ -2855,7 +2865,7 @@ err_diag_counters:
 	mlx4_ib_diag_cleanup(ibdev);
 
 err_steer_free_bitmap:
-	kfree(ibdev->ib_uc_qpns_bitmap);
+	bitmap_free(ibdev->ib_uc_qpns_bitmap);
 
 err_steer_qp_release:
 	mlx4_qp_release_range(dev, ibdev->steer_qpn_base,
@@ -2968,7 +2978,7 @@ static void mlx4_ib_remove(struct mlx4_dev *dev, void *ibdev_ptr)
 
 	mlx4_qp_release_range(dev, ibdev->steer_qpn_base,
 			      ibdev->steer_qpn_count);
-	kfree(ibdev->ib_uc_qpns_bitmap);
+	bitmap_free(ibdev->ib_uc_qpns_bitmap);
 
 	iounmap(ibdev->uar_map);
 	for (p = 0; p < ibdev->num_ports; ++p)
@@ -3227,7 +3237,7 @@ static void mlx4_ib_event(struct mlx4_dev *dev, void *ibdev_ptr,
 	case MLX4_DEV_EVENT_PORT_MGMT_CHANGE:
 		ew = kmalloc(sizeof *ew, GFP_ATOMIC);
 		if (!ew)
-			break;
+			return;
 
 		INIT_WORK(&ew->work, handle_port_mgmt_change_event);
 		memcpy(&ew->ib_eqe, eqe, sizeof *eqe);
