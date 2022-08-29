@@ -6,6 +6,8 @@
 # Globally disable suggestion of appending '|| exit' or '|| return' to cd/pushd/popd commands
 # shellcheck disable=SC2164
 
+test -n "$RHTEST" && exit 0
+
 usage()
 {
 	# alphabetical order please

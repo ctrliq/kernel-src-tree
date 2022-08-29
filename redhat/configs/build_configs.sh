@@ -4,6 +4,8 @@
 # and debug to form the necessary $PACKAGE_NAME<version>-<arch>-<variant>.config
 # files for building RHEL kernels, based on the contents of a control file
 
+test -n "$RHTEST" && exit 0
+
 PACKAGE_NAME="${1:-kernel}" # defines the package name used
 if [ -z "$2" ]; then
 	cat flavors > .flavors
