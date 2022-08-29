@@ -87,12 +87,8 @@ done
 # test changes.
 [ -n "$RHSELFTESTDATA" ] && exit 0
 
-GIT_FORMAT="--format=- %s (%an)%n%b"
-GIT_NOTES=""
-if [ "$__ZSTREAM" != "no" ]; then
-       GIT_FORMAT="--format=- %s (%an)%n%N"
-       GIT_NOTES="--notes=refs/notes/${RHEL_MAJOR}.${RHEL_MINOR}*"
-fi
+GIT_FORMAT="--format=- %s (%an)%n%N%n^^^NOTES-END^^^%n%b"
+GIT_NOTES="--notes=refs/notes/${RHEL_MAJOR}.${RHEL_MINOR}*"
 
 echo > "$clogf"
 
