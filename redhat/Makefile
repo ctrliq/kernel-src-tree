@@ -88,25 +88,6 @@ dist-kabi-dup: dist-python-check
 		fi \
 	done;
 
-dist-assert-tree-clean:
-ifeq ($(FORCE),)
-	@if ! git diff-index --quiet --cached HEAD -- &> /dev/null; then \
-		echo "ERROR: staged changes found. Please clean the git tree."; >&2 \
-		git status; \
-		exit 1; \
-	fi
-	@if ! git diff-files --quiet &> /dev/null; then \
-		echo "ERROR: unstaged changes found. Please clean the git tree." >&2; \
-		git status; \
-		exit 1; \
-	fi
-	@if [ $$(git ls-files --exclude-standard --others | wc -l) -gt 0 ]; then \
-		echo "ERROR: untracked files found. Please clean the git tree." >&2; \
-		git status; \
-		exit 1; \
-	fi
-endif
-
 dist-check-kabi: dist-kabi
 	@if [ ! -e $(_OUTPUT)/Module.symvers ]; then \
 		echo "ERROR: You must compile the kernel and modules first";\
