@@ -110,6 +110,7 @@ Contributor Guide
    repository-layout
    submitting-contributions
    faq
+   makefile-changes
 
 
 Maintainer Guide
