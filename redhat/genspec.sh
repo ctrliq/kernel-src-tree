@@ -23,10 +23,7 @@ SNAPSHOT=${16}
 UPSTREAM_BRANCH=${17}
 INCLUDE_FEDORA_FILES=${18}
 INCLUDE_RHEL_FILES=${19}
-RHEL_MAJOR=${20}
-RHEL_MINOR=${21}
-BUILDID=${22}
-
+BUILDID=${20}
 RPMVERSION=${KVERSION}.${KPATCHLEVEL}.${KSUBLEVEL}
 clogf="$SOURCES/changelog"
 # hide [redhat] entries from changelog
@@ -44,13 +41,6 @@ RPM_VERSION="$RPMVERSION-$PKGRELEASE";
 # This is done this way to be compatible with old git versions which do not
 # have the pathspec '(exclude)' support
 EXCLUDE=$(git log -1 --format=%P ${0%/*}/rhdocs | cut -d ' ' -f 2)
-
-GIT_FORMAT="--format=- %s (%an)%n%b"
-GIT_NOTES=""
-if [ "$ZSTREAM_FLAG" != "no" ]; then
-       GIT_FORMAT="--format=- %s (%an)%n%N"
-       GIT_NOTES="--notes=refs/notes/${RHEL_MAJOR}.${RHEL_MINOR}*"
-fi
 
 echo > "$clogf"
 
@@ -70,7 +60,7 @@ echo "Gathering new log entries since $lasttag"
 UPSTREAM="$(git rev-parse -q --verify origin/$UPSTREAM_BRANCH || \
           git rev-parse -q --verify $UPSTREAM_BRANCH)"
  
-git log --topo-order --reverse --no-merges -z $GIT_NOTES "$GIT_FORMAT" \
+git log --topo-order --reverse --no-merges -z --format="- %s (%an)%n%b" \
 	^${UPSTREAM} ${EXCLUDE:+^$EXCLUDE} "$lasttag".. | ${0%/*}/genlog.py >> "$clogf"
 
 grep -v "tagging $RPM_VERSION" "$clogf" > "$clogf.stripped"

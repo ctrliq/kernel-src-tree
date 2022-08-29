@@ -17,18 +17,16 @@ import sys
 
 def find_bz_in_line(line, prefix):
     """Return bug number from properly formated Bugzilla: line."""
-    # BZs must begin with '{prefix}: ' and contain a complete BZ URL or id
-    _bugs = set()
-    if not line.startswith(f"{prefix}: "):
-        return _bugs
-    bznum_re = re.compile(r'(?P<bug_ids> \d{4,8})|'
-        r'( http(s)?://bugzilla\.redhat\.com/(show_bug\.cgi\?id=)?(?P<url_bugs>\d{4,8}))')
-    for match in bznum_re.finditer(line[len(f"{prefix}:"):]):
-        for group in [ 'bug_ids', 'url_bugs' ]:
-            if match.group(group):
-                bid = match.group(group).strip()
-                _bugs.add(bid)
-    return _bugs
+    # BZs must begin with '{prefix}: ' and contain a complete BZ URL
+    line = line.rstrip()
+    pattern = prefix + r': http(s)?://bugzilla\.redhat\.com/(show_bug\.cgi\?id=)?(?P<bug>\d{4,8})$'
+    bznum_re = re.compile(pattern)
+    bzn = set()
+    match = bznum_re.match(line)
+    if match:
+        bzn.add(match.group('bug'))
+    return bzn
+
 
 def find_cve_in_line(line):
     """Return cve number from properly formated CVE: line."""
