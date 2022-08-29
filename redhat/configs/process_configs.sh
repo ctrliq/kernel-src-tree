@@ -105,7 +105,6 @@ checkoptions()
 		! $checkoptions_error && return
 
 		sed -i "1s/^/Error: Mismatches found in configuration files for ${arch} ${variant}\n/" .mismatches"${count}"
-		[ "$CONTINUEONERROR" ] || exit 1
 	else
 		rm -f .mismatches"${count}"
 	fi
@@ -260,7 +259,6 @@ function process_config()
 		cat .newoptions"${count}" >> .errors"${count}"
 		rm .newoptions"${count}"
 		RETURNCODE=1
-		[ "$CONTINUEONERROR" ] || exit 1
 	fi
 	rm .newoptions"${count}"
 
@@ -270,7 +268,6 @@ function process_config()
 		echo "Found misconfigured config items in ${arch} ${variant}, please set them to an appropriate value" >> .errors"${count}"
 		cat .warnings"${count}" >> .errors"${count}"
 		rm .warnings"${count}"
-		[ "$CONTINUEONERROR" ] || exit 1
 	fi
 	rm .warnings"${count}"
 
@@ -340,7 +337,6 @@ function process_configs()
 }
 
 CHECKOPTIONS=""
-CONTINUEONERROR=""
 NEWOPTIONS=""
 TESTRUN=""
 CHECKWARNINGS=""
@@ -355,7 +351,6 @@ do
 	case $key in
 		-a)
 			CHECKOPTIONS="x"
-			CONTINUEONERROR="x"
 			NEWOPTIONS="x"
 			CHECKWARNINGS="x"
 			;;
@@ -364,9 +359,6 @@ do
 			;;
 		-h)
 			usage
-			;;
-		-i)
-			CONTINUEONERROR="x"
 			;;
 		-n)
 			NEWOPTIONS="x"
