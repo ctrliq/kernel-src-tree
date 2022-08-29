@@ -208,11 +208,11 @@ else
 endif
 
 SPECVERSION:=$(SPECKVERSION).$(SPECKPATCHLEVEL).$(SPECKSUBLEVEL)
-PKGRELEASE:=$(PREBUILD)$(BUILD)$(BUILDID)
-KABI_TARBALL:=$(SOURCES)/kernel-abi-stablelists-$(SPECVERSION)-$(PKGRELEASE).tar.bz2
+SPECBUILD:=$(PREBUILD)$(BUILD)$(BUILDID)
+KABI_TARBALL:=$(SOURCES)/kernel-abi-stablelists-$(SPECVERSION)-$(SPECBUILD).tar.bz2
 KABIDW := $(REDHAT)/kabi-dwarf
-KABIDW_TARBALL:=$(SOURCES)/kernel-kabi-dw-$(SPECVERSION)-$(PKGRELEASE).tar.bz2
-RPMVERSION:=$(SPECVERSION)-$(PKGRELEASE)
+KABIDW_TARBALL:=$(SOURCES)/kernel-kabi-dw-$(SPECVERSION)-$(SPECBUILD).tar.bz2
+RPMVERSION:=$(SPECVERSION)-$(SPECBUILD)
 SPECRELEASE:=$(PREBUILD)$(BUILD)%{?buildid}%{?dist}
 SRPM:=$(SRPMS)/$(PACKAGE_NAME)-$(RPMVERSION)$(DIST).src.rpm
 
@@ -427,12 +427,12 @@ dist-tarball: $(TARBALL)
 dist-kernelrelease:
 	# deprecated at 5.17.0
 	@echo "WARNING: This target will be deprecated in a future release."
-	@echo $(PACKAGE_NAME)-$(SPECVERSION)-$(PKGRELEASE)
+	@echo $(PACKAGE_NAME)-$(SPECVERSION)-$(SPECBUILD)
 
 dist-kernelversion:
 	# deprecated at 5.17.0
 	@echo "WARNING: This target will be deprecated in a future release."
-	@echo $(SPECVERSION)-$(PKGRELEASE)
+	@echo $(SPECVERSION)-$(SPECBUILD)
 
 dist-specfile: setup-source
 	# deprecated at 5.17.0
@@ -622,9 +622,9 @@ dist-fedora-release-push: dist-fedora-release
 dist-vr-check:
 	@# builds may include a s390x+zfcpdump arch build.  UTS_RELEASE can only have a
 	@# version-release string with max 64 chars.  The version-release for s390x+zfcpdump
-	@# is 29 characters, leaving a maximum of 35 characters for PKGRELEASE.
-	@if [ $$(echo -n $(PKGRELEASE) | wc -c) -gt 35 ]; then \
-		echo "PKGRELEASE ($(PKGRELEASE)) is too long.  Use a shorter localversion (currently $(BUILDID))"; \
+	@# is 29 characters, leaving a maximum of 35 characters for SPECBUILD.
+	@if [ $$(echo -n $(SPECBUILD) | wc -c) -gt 35 ]; then \
+		echo "SPECBUILD ($(SPECBUILD)) is too long.  Use a shorter localversion (currently $(BUILDID))"; \
 		exit 1; \
 	fi
 
