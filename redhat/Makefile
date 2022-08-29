@@ -79,10 +79,12 @@ ifeq ($(SNAPSHOT),1)
     PREBUILD:=0$(KEXTRAVERSION).
     RPMKPATCHLEVEL:=$(shell expr $(RPMKPATCHLEVEL) + 1)
   endif
-  ifneq ($(filter $(MAKECMDGOALS),dist-git-test dist-git),)
-    PREBUILD_GIT_ONLY ?= 0
-  else
-    PREBUILD_GIT_ONLY ?= 1
+  ifndef PREBUILD_GIT_ONLY
+    ifneq ($(filter $(MAKECMDGOALS),dist-git-test dist-git),)
+      PREBUILD_GIT_ONLY:=0
+    else
+      PREBUILD_GIT_ONLY:=1
+    endif
   endif
   ifeq ($(PREBUILD_GIT_ONLY),1)
     PREBUILD:=$(PREBUILD)$(MARKER).
