@@ -217,6 +217,14 @@ ifeq ($(VERSION_ON_UPSTREAM),1)
   endif
 else
   SNAPSHOT:=0
+  _EXACT_TAG:=$(shell $(GIT) describe --exact-match 2>/dev/null)
+  ifeq ($(_EXACT_TAG),)
+    _TAG:=$(shell $(GIT) describe 2>/dev/null)
+    ifneq ($(_TAG),)
+      _BUILDCOMMIT:=$(shell echo $(_TAG) | awk -F- '{ printf(".%s", $$(NF)) }' | cut -c 1-6)
+      BUILD:=$(BUILD)$(_BUILDCOMMIT)
+    endif
+  endif
 endif
 
 SPECVERSION:=$(SPECKVERSION).$(SPECKPATCHLEVEL).$(SPECKSUBLEVEL)
