@@ -175,7 +175,7 @@ test -f "$SOURCES/$SPECFILE" &&
 
 echo "MARKER is $MARKER"
 
-if [ "$SINGLE_TARBALL" = 0 ]; then
+if [ "$DISTRO" == "fedora" ]; then
 	# The tarball in the SRPM contains only the upstream sources.
 
 	# May need to preserve word splitting in EXCLUDE_FILES
