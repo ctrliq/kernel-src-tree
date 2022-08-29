@@ -191,7 +191,7 @@ function commit_new_configs()
 	# assume we are in $source_tree/configs, need to get to top level
 	pushd "$(switch_to_toplevel)" &>/dev/null
 
-	for cfg in "$SCRIPT_DIR/${PACKAGE_NAME}${KVERREL}${SUBARCH}"*.config
+	for cfg in "$SCRIPT_DIR/${PACKAGE_NAME}${KVERREL}"*.config
 	do
 		arch=$(head -1 "$cfg" | cut -b 3-)
 		cfgtmp="${cfg}.tmp"
@@ -303,7 +303,7 @@ function process_configs()
 	[ -f .mismatches ] && rm -f .mismatches
 
 	count=0
-	for cfg in "$SCRIPT_DIR/${PACKAGE_NAME}${KVERREL}${SUBARCH}"*.config
+	for cfg in "$SCRIPT_DIR/${PACKAGE_NAME}${KVERREL}"*.config
 	do
 		if [ "$count" -eq 0 ]; then
 			# do the first one by itself so that tools are built
@@ -385,12 +385,9 @@ do
 	shift
 done
 
-PACKAGE_NAME="${1:-kernel}" # defines the package name used
-KVERREL="$(test -n "$2" && echo "-$2" || echo "")"
-SUBARCH="$(test -n "$3" && echo "-$3" || echo "")"
-FLAVOR="$(test -n "$4" && echo "-$4" || echo "-ark")"
+KVERREL="$(test -n "$1" && echo "-$1" || echo "")"
+FLAVOR="$(test -n "$2" && echo "-$2" || echo "-ark")"
 # shellcheck disable=SC2015
-RHJOBS="$(test -n "$5" && echo "$5" || nproc --all)"
 SCRIPT=$(readlink -f "$0")
 SCRIPT_DIR=$(dirname "$SCRIPT")
 
