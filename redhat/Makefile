@@ -274,7 +274,6 @@ sources-rh: $(TARBALL) generate-testpatch-tmp setup-source dist-configs-check
 		generate_crashkernel_default.sh \
 		../Makefile.rhelver \
 		README.rst \
-		kernel-local \
 		$(SOURCES)/
 	@if [ "$(RELEASED_KERNEL)" -ne 0 ]; then \
 		cp keys/redhatsecureboot{302,501,601,ca3,ca5,ca6}.cer $(SOURCES)/; \
