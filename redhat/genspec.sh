@@ -59,7 +59,7 @@ test -f "$SOURCES/$SPECFILE" &&
 	sed -i -e "
 	s/%%BUILDID%%/$BUILDID_DEFINE/
 	s/%%SPECKVERSION%%/$SPECKVERSION/
-	s/%%RPMKPATCHLEVEL%%/$RPMKPATCHLEVEL/
+	s/%%SPECKPATCHLEVEL%%/$SPECKPATCHLEVEL/
 	s/%%PKGRELEASE%%/$PKGRELEASE/
 	s/%%SPECRELEASE%%/$SPECRELEASE/
 	s/%%RELEASED_KERNEL%%/$RELEASED_KERNEL/
@@ -93,7 +93,7 @@ fi
 GIT_FORMAT="--format=- %s (%an)%n%N%n^^^NOTES-END^^^%n%b"
 GIT_NOTES="--notes=refs/notes/${RHEL_MAJOR}.${RHEL_MINOR}*"
 
-lasttag=$(git rev-list --first-parent --grep="^\[redhat\] kernel-${SPECKVERSION}.${RPMKPATCHLEVEL}" --max-count=1 HEAD)
+lasttag=$(git rev-list --first-parent --grep="^\[redhat\] kernel-${SPECKVERSION}.${SPECKPATCHLEVEL}" --max-count=1 HEAD)
 # if we didn't find the proper tag, assume this is the first release
 if [[ -z $lasttag ]]; then
     if [[ -z ${MARKER//[0-9a-f]/} ]]; then
@@ -174,12 +174,12 @@ if [ "$SINGLE_TARBALL" = 0 ]; then
 	# May need to preserve word splitting in EXCLUDE_FILES
 	# shellcheck disable=SC2086
 	git diff -p --no-renames --stat "$MARKER"..  $EXCLUDE_FILES \
-		> ${SOURCES}/patch-${SPECKVERSION}.${RPMKPATCHLEVEL}-redhat.patch
+		> ${SOURCES}/patch-${SPECKVERSION}.${SPECKPATCHLEVEL}-redhat.patch
 else
 	# The tarball in the SRPM contains both upstream sources and OS-specifc
 	# commits.  Even though this is the case, an empty file for dist-git
 	# compatibility is necessary.
-	touch "${SOURCES}/patch-${SPECKVERSION}.${RPMKPATCHLEVEL}"-redhat.patch
+	touch "${SOURCES}/patch-${SPECKVERSION}.${SPECKPATCHLEVEL}"-redhat.patch
 fi
 
 rm -f "$clogf"{,.stripped};

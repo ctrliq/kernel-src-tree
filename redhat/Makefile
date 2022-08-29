@@ -51,7 +51,7 @@ RPMBUILD:=$(shell if [ -x "/usr/bin/rpmbuild" ]; then echo rpmbuild; \
 
 MACH:=$(shell uname -m)
 SPECKVERSION:=$(shell $(GIT) show $(HEAD):Makefile | sed -ne '/^VERSION\ =\ /{s///;p;q}')
-RPMKPATCHLEVEL:=$(shell $(GIT) show $(HEAD):Makefile | sed -ne '/^PATCHLEVEL\ =\ /{s///;p;q}')
+SPECKPATCHLEVEL:=$(shell $(GIT) show $(HEAD):Makefile | sed -ne '/^PATCHLEVEL\ =\ /{s///;p;q}')
 RPMKSUBLEVEL:=$(shell $(GIT) show $(HEAD):Makefile | sed -ne '/^SUBLEVEL\ =\ /{s///;p;q}')
 RPMKEXTRAVERSION:=$(shell $(GIT) show $(HEAD):Makefile | sed -ne '/^EXTRAVERSION\ =\ /{s///;p;q}')
 GITID:= $(shell $(GIT) log --max-count=1 --pretty=format:%H $(HEAD))
@@ -131,24 +131,24 @@ ifeq ("$(origin O)", "command line")
 endif
 
 # MARKER is the git tag which we base off of for exporting patches
-# Make sure MARKER uses SPECKVERSION, RPMKPATCHLEVEL and RPMKEXTRAVERSION from
-# the kernel makefile as opposed to any adjusted version for snapshotting.
+# Make sure MARKER uses SPECKVERSION, SPECKPATCHLEVEL and RPMKEXTRAVERSION from
+# makefile as opposed to any adjusted version for snapshotting.
 ifneq ($(RPMKEXTRAVERSION),)
-  MARKER:=v$(SPECKVERSION).$(RPMKPATCHLEVEL)$(RPMKEXTRAVERSION)
+  MARKER:=v$(SPECKVERSION).$(SPECKPATCHLEVEL)$(RPMKEXTRAVERSION)
   KEXTRAVERSION:=$(shell echo $(RPMKEXTRAVERSION) | sed -e s/-/./)
   PREBUILD:=0$(KEXTRAVERSION).
-  UPSTREAM_TARBALL_NAME:=$(SPECKVERSION).$(RPMKPATCHLEVEL)$(RPMKEXTRAVERSION)
+  UPSTREAM_TARBALL_NAME:=$(SPECKVERSION).$(SPECKPATCHLEVEL)$(RPMKEXTRAVERSION)
 else
   KEXTRAVERSION:=
   ifeq ($(RPMKSUBLEVEL),0)
-    MARKER:=v$(SPECKVERSION).$(RPMKPATCHLEVEL)
-    UPSTREAM_TARBALL_NAME:=$(SPECKVERSION).$(RPMKPATCHLEVEL)
+    MARKER:=v$(SPECKVERSION).$(SPECKPATCHLEVEL)
+    UPSTREAM_TARBALL_NAME:=$(SPECKVERSION).$(SPECKPATCHLEVEL)
   else
-    # Make sure MARKER uses SPECKVERSION, RPMKPATCHLEVEL, and RPMKSUBLEVEL from
+    # Make sure MARKER uses SPECKVERSION, SPECKPATCHLEVEL, and RPMKSUBLEVEL
     # from the kernel makefile as opposed to any adjusted version for snapshotting.
     # IOW, these variables are *NOT* equivalent to the SPECVERSION variable.
-    MARKER:=v$(SPECKVERSION).$(RPMKPATCHLEVEL).$(RPMKSUBLEVEL)
-    UPSTREAM_TARBALL_NAME:=$(SPECKVERSION).$(RPMKPATCHLEVEL).$(RPMKSUBLEVEL)
+    MARKER:=v$(SPECKVERSION).$(SPECKPATCHLEVEL).$(RPMKSUBLEVEL)
+    UPSTREAM_TARBALL_NAME:=$(SPECKVERSION).$(SPECKPATCHLEVEL).$(RPMKSUBLEVEL)
   endif
   PREBUILD:=
 endif
@@ -185,7 +185,7 @@ ifeq ($(VERSION_ON_UPSTREAM),1)
     ifeq ($(RPMKEXTRAVERSION),)
       KEXTRAVERSION:=.rc0
       PREBUILD:=0$(KEXTRAVERSION).
-      RPMKPATCHLEVEL:=$(shell expr $(RPMKPATCHLEVEL) + 1)
+      SPECKPATCHLEVEL:=$(shell expr $(SPECKPATCHLEVEL) + 1)
     endif
     ifndef PREBUILD_GIT_ONLY
       ifneq ($(filter $(MAKECMDGOALS),dist-git-test dist-git),)
@@ -207,7 +207,7 @@ else
   SNAPSHOT:=0
 endif
 
-SPECVERSION:=$(SPECKVERSION).$(RPMKPATCHLEVEL).$(RPMKSUBLEVEL)
+SPECVERSION:=$(SPECKVERSION).$(SPECKPATCHLEVEL).$(RPMKSUBLEVEL)
 PKGRELEASE:=$(PREBUILD)$(BUILD)$(BUILDID)
 KABI_TARBALL:=$(SOURCES)/kernel-abi-stablelists-$(SPECVERSION)-$(PKGRELEASE).tar.bz2
 KABIDW := $(REDHAT)/kabi-dwarf
@@ -495,7 +495,7 @@ sources-rh: $(TARBALL) generate-testpatch-tmp setup-source dist-configs-check
 	@cp $(TESTPATCH) $(SOURCES)/linux-kernel-test.patch
 	@cat configs/flavors | while read flavor; do echo "Copying sources for $${flavor}"; [ -e $${flavor}_files ] && cp $${flavor}_files/* $(SOURCES); done
 	@sed -e "s/%%SPECKVERSION%%/$(SPECKVERSION)/" \
-		-e "s/%%RPMKPATCHLEVEL%%/$(RPMKPATCHLEVEL)/" \
+		-e "s/%%SPECKPATCHLEVEL%%/$(SPECKPATCHLEVEL)/" \
 		rpminspect.yaml > $(SOURCES)/rpminspect.yaml
 	@cp cpupower.* \
 		keys/rhel*.x509 \
