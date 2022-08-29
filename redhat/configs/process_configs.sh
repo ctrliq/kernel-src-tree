@@ -296,6 +296,11 @@ function process_configs()
 	# assume we are in $source_tree/configs, need to get to top level
 	pushd "$(switch_to_toplevel)" &>/dev/null
 
+	# The next line is throwaway code for transition to parallel
+	# processing.  Leaving this line in place is harmless, but it can be
+	# removed the next time anyone updates this function.
+	[ -f .mismatches ] && rm -f .mismatches
+
 	count=0
 	for cfg in "$SCRIPT_DIR/${PACKAGE_NAME}${KVERREL}${SUBARCH}"*.config
 	do
