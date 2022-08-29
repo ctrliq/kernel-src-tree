@@ -131,13 +131,13 @@ ifeq ("$(DISTRO)", "fedora")
   # and the patches get applied as a diff in the spec file
   SINGLE_TARBALL:=0
   TARFILE_RELEASE:=$(UPSTREAM_TARBALL_NAME)
-  RHPRODUCT:=rawhide
+  RHDISTGIT_BRANCH:=rawhide
   BUILD_SCRATCH_TARGET ?= temp-ark-rhel-8-test
 else ifeq ("$(DISTRO)", "centos")
   # A unified tarball means that the tarball in the srpm contains both the
   # upstream sources and RHEL specific patches.
   SINGLE_TARBALL:=1
-  RHPRODUCT:=c$(RHEL_MAJOR)s
+  RHDISTGIT_BRANCH:=c$(RHEL_MAJOR)s
   BUILD_PROFILE ?= -p stream
   BUILD_SCRATCH_TARGET ?= c$(RHEL_MAJOR)s-candidate
   TARFILE_RELEASE:=$(KVERSION)-$(PKGRELEASE)
@@ -145,7 +145,7 @@ else
   # A unified tarball means that the tarball in the srpm contains both the
   # upstream sources and RHEL specific patches.
   SINGLE_TARBALL:=1
-  RHPRODUCT:=rhel-$(RHEL_MAJOR).$(RHEL_MINOR).0
+  RHDISTGIT_BRANCH:=rhel-$(RHEL_MAJOR).$(RHEL_MINOR).0
   BUILD_SCRATCH_TARGET ?= rhel-$(RHEL_MAJOR).$(RHEL_MINOR).0-test-pesign
   TARFILE_RELEASE:=$(KVERSION)-$(PKGRELEASE)
 endif
