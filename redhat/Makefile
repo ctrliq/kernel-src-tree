@@ -26,6 +26,12 @@ ifdef SINGLE_TARBALL
 endif
 
 include Makefile.variables
+# These entries are 'duplicates' of variables specified in Makefile.variables
+# that are used in the SPEC file.  Specifying these with a SPEC prefix indicates
+# that the value is passed through to the spec file.
+SPECRELEASED_KERNEL=$(RELEASED_KERNEL)
+SPECINCLUDE_FEDORA_FILES=$(INCLUDE_FEDORA_FILES)
+SPECINCLUDE_RHEL_FILES=$(INCLUDE_RHEL_FILES)
 
 LANG=C
 
