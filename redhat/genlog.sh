@@ -50,7 +50,7 @@ fi
 if [ "$MARKER" != "$LAST_MARKER" ]; then
 	# genlog.py always adds a Resolves: line, thus we
 	# can insert the rebase changelog item before it
-	sed -i "s/\(^Resolves:.*\)/- $MARKER rebase\n\1/" "$clogf"
+	sed -i "s/\(^Resolves:.*\)/- Linux v${SPECVERSION}${UPSTREAMBUILD:+-}${UPSTREAMBUILD%.}\n\1/" "$clogf"
 fi
 
 # during rh-dist-git genspec runs again and generates empty changelog
