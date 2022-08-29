@@ -453,7 +453,11 @@ setup-source: dist-git-version-check dist-clean-sources
 		echo "Creating $(CHANGELOG) as copy of $(CHANGELOG_PREV)"; \
 		cp $(REDHAT)/$(CHANGELOG_PREV) $(REDHAT)/$(CHANGELOG); \
 	fi
-	@cp $(REDHAT)/$(CHANGELOG) $(SOURCES)/$(CHANGELOG)
+	@if [ -z "$(RHSELFTESTDATA)" ]; then \
+		cp $(REDHAT)/$(CHANGELOG) $(SOURCES)/$(CHANGELOG); \
+	else \
+		echo "Mon Mar 28 2022 Fedora Kernel Team <kernel-team@fedoraproject.org> [$(RPMVERSION)]" > $(SOURCES)/$(CHANGELOG); \
+	fi
 	@if [ -z "$(PATCHLIST_URL)" ]; then \
 		echo "Error: PATCHLIST_URL must be set (to 'none' or any URL)"; \
 		exit 1; \
