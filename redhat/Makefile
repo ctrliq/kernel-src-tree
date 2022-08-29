@@ -96,10 +96,6 @@ ifeq ($(SNAPSHOT),1)
   UPSTREAM_TARBALL_NAME:=$(patsubst v%,%,$(_TAG))
 endif
 
-
-# RPMKPATCHVERSION may get adjusted if we're snapshotting
-# during the merge window so ensure this gets set after
-# we've checked for snapshots
 KVERSION:=$(RPMKVERSION).$(RPMKPATCHLEVEL).$(RPMKSUBLEVEL)
 RPMVERSION:=$(KVERSION)
 
