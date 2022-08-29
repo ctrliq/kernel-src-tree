@@ -410,6 +410,7 @@ dist-clean-rpmdirs:
 	done;
 
 dist-clean: dist-clean-sources dist-clean-configs dist-clean-rpmdirs
+	@rm -f $(REDHAT)/linux-*.tar.xz
 
 dist-stub-key:
 	@echo "Copying pre-generated keys";
