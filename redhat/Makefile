@@ -52,7 +52,7 @@ RPMBUILD:=$(shell if [ -x "/usr/bin/rpmbuild" ]; then echo rpmbuild; \
 MACH:=$(shell uname -m)
 SPECKVERSION:=$(shell $(GIT) show $(HEAD):Makefile | sed -ne '/^VERSION\ =\ /{s///;p;q}')
 SPECKPATCHLEVEL:=$(shell $(GIT) show $(HEAD):Makefile | sed -ne '/^PATCHLEVEL\ =\ /{s///;p;q}')
-RPMKSUBLEVEL:=$(shell $(GIT) show $(HEAD):Makefile | sed -ne '/^SUBLEVEL\ =\ /{s///;p;q}')
+SPECKSUBLEVEL:=$(shell $(GIT) show $(HEAD):Makefile | sed -ne '/^SUBLEVEL\ =\ /{s///;p;q}')
 RPMKEXTRAVERSION:=$(shell $(GIT) show $(HEAD):Makefile | sed -ne '/^EXTRAVERSION\ =\ /{s///;p;q}')
 GITID:= $(shell $(GIT) log --max-count=1 --pretty=format:%H $(HEAD))
 ifndef BUILD
@@ -140,15 +140,15 @@ ifneq ($(RPMKEXTRAVERSION),)
   UPSTREAM_TARBALL_NAME:=$(SPECKVERSION).$(SPECKPATCHLEVEL)$(RPMKEXTRAVERSION)
 else
   KEXTRAVERSION:=
-  ifeq ($(RPMKSUBLEVEL),0)
+  ifeq ($(SPECKSUBLEVEL),0)
     MARKER:=v$(SPECKVERSION).$(SPECKPATCHLEVEL)
     UPSTREAM_TARBALL_NAME:=$(SPECKVERSION).$(SPECKPATCHLEVEL)
   else
     # Make sure MARKER uses SPECKVERSION, SPECKPATCHLEVEL, and RPMKSUBLEVEL
     # from the kernel makefile as opposed to any adjusted version for snapshotting.
     # IOW, these variables are *NOT* equivalent to the SPECVERSION variable.
-    MARKER:=v$(SPECKVERSION).$(SPECKPATCHLEVEL).$(RPMKSUBLEVEL)
-    UPSTREAM_TARBALL_NAME:=$(SPECKVERSION).$(SPECKPATCHLEVEL).$(RPMKSUBLEVEL)
+    MARKER:=v$(SPECKVERSION).$(SPECKPATCHLEVEL).$(SPECKSUBLEVEL)
+    UPSTREAM_TARBALL_NAME:=$(SPECKVERSION).$(SPECKPATCHLEVEL).$(SPECKSUBLEVEL)
   endif
   PREBUILD:=
 endif
@@ -207,7 +207,7 @@ else
   SNAPSHOT:=0
 endif
 
-SPECVERSION:=$(SPECKVERSION).$(SPECKPATCHLEVEL).$(RPMKSUBLEVEL)
+SPECVERSION:=$(SPECKVERSION).$(SPECKPATCHLEVEL).$(SPECKSUBLEVEL)
 PKGRELEASE:=$(PREBUILD)$(BUILD)$(BUILDID)
 KABI_TARBALL:=$(SOURCES)/kernel-abi-stablelists-$(SPECVERSION)-$(PKGRELEASE).tar.bz2
 KABIDW := $(REDHAT)/kabi-dwarf
