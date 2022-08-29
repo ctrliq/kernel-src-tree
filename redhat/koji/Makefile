@@ -17,7 +17,7 @@
 #	  set it with - git notes --ref buildid -m ".buildid" HEAD
 ######################################################################
 
-include ../Makefile.variables
+include ../Makefile.common
 
 notes:
 	$(GIT) fetch --force origin refs/notes/*:refs/notes/*
