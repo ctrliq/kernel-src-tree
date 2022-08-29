@@ -56,6 +56,7 @@ if [ "$PATCHLIST_URL" != "none" ]; then
 	SPECPATCHLIST_CHANGELOG=1
 fi
 
+# self-test begin
 test -f "$SOURCES/$SPECFILE" &&
 	sed -i -e "
 	s/%%SPECBUILDID%%/$SPECBUILDID/
@@ -70,6 +71,10 @@ test -f "$SOURCES/$SPECFILE" &&
 	s/%%SPECPATCHLIST_CHANGELOG%%/$SPECPATCHLIST_CHANGELOG/
 	s/%%SPECVERSION%%/$SPECVERSION/
 	s/%%SPECTARFILE_RELEASE%%/$SPECTARFILE_RELEASE/" "$SOURCES/$SPECFILE"
+test -n "$RHSELFTESTDATA" && test -f "$SOURCES/$SPECFILE" && sed -i -e "
+	/%%SPECCHANGELOG%%/r $SOURCES/$SPECCHANGELOG
+	/%%SPECCHANGELOG%%/d" "$SOURCES/$SPECFILE"
+# self-test end
 
 # We depend on work splitting of BUILDOPTS
 # shellcheck disable=SC2086
@@ -84,10 +89,6 @@ done
 # rest of the script can be ignored.  See redhat/Makefile setup-source target for related
 # test changes.
 if [ -n "$RHSELFTESTDATA" ]; then
-	test -f "$SOURCES/$SPECFILE" &&
-		sed -i -e "
-		/%%SPECCHANGELOG%%/r $SOURCES/$SPECCHANGELOG
-		/%%SPECCHANGELOG%%/d" "$SOURCES/$SPECFILE"
 	exit 0
 fi
 

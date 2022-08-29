@@ -46,6 +46,12 @@ external scripts.  Variables in this file should be considered stable.
 Variables still may be deprecated and will follow the guidelines in
 "Deprecating variables and targets" section below.
 
+Variable Naming
+===============
+
+Variables names prefixed with SPEC indicate that the variable is used
+in redhat/kernel.spec.template (see redhat/genspec.sh).
+
 Deprecating variables and targets
 =================================
 
