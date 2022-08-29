@@ -219,8 +219,8 @@ ifeq ($(VERSION_ON_UPSTREAM),1)
     UPSTREAM_TARBALL_NAME:=$(patsubst v%,%,$(_TAG))
   endif
 else
+  SNAPSHOT:=0
   ifneq ("$(DISTRO)", "fedora")
-    SNAPSHOT:=0
     _EXACT_TAG:=$(shell $(GIT) describe --exact-match 2>/dev/null)
     ifeq ($(_EXACT_TAG),)
       _TAG:=$(shell $(GIT) describe 2>/dev/null)
