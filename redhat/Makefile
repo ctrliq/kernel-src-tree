@@ -545,7 +545,6 @@ git-tree-check:
 	@$(GIT) diff-index --quiet HEAD || \
 		{ echo -e "Dirty tree, please clean before merging.\n"; exit 1; }
 
-DIST_BRANCH ?= "os-build"
 dist-merge-upstream: git-tree-check
 	@if test "$(shell $(GIT) branch --show-current)" != "$(DIST_BRANCH)"; then \
 		echo -e "Please checkout $(DIST_BRANCH) branch before merging.\n"; \
