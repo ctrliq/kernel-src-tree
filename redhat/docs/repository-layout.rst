@@ -134,8 +134,8 @@ A flavor is defined by:
    configuration directories and should include the directory you
    defined in step 2.
 
-common and common-pending
-~~~~~~~~~~~~~~~~~~~~~~~~~
+common and pending-ark
+~~~~~~~~~~~~~~~~~~~~~~
 
 The ``common`` directory contains configuration values that are shared
 across all configuration "flavors". For a configuration to be in
@@ -145,19 +145,19 @@ can override settings in ``common``, so it's not guaranteed settings in
 common are the same across all flavors. It's simply a good place to set
 common values across the flavors and use as a base for new flavors.
 
-``common-pending`` is where configuration options that have not been
+``pending-ark`` is where configuration options that have not been
 reviewed are placed. Automation creates snippets for all new
 configuration options exposed during a rebase of ARK in the
-``pending-common`` directory, at which point subsystem maintainers
+``pending-ark`` directory, at which point subsystem maintainers
 review the options and set them as appropriate before moving them into
 ``common``.
 
-New ARK configurations are placed in ``common-pending`` because it is
+New ARK configurations are placed in ``pending-ark`` because it is
 assumed that ARK generally has the most conservative settings, whereas
 other flavors like Fedora will be (for the most part) a superset of the
 ARK configuration.
 
-fedora and fedora-pending
+fedora and pending-fedora
 ~~~~~~~~~~~~~~~~~~~~~~~~~
 
 The ``fedora`` directory contains settings that have been reviewed by
@@ -168,6 +168,6 @@ rebase to expose new configuration options that only apply to Fedora.
 For this reason, Fedora has a ``pending-fedora`` directory as well.
 ``pending-fedora`` contains settings that are not exposed by the
 ``common`` configuration set and only apply to Fedora. It is, like
-``pending-common``, populated automatically during a rebase. A Fedora
+``pending-ark``, populated automatically during a rebase. A Fedora
 kernel maintain can review the settings at their leisure and move them
 over to ``fedora`` as they do so.

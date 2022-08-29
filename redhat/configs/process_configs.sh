@@ -388,16 +388,15 @@ done
 PACKAGE_NAME="${1:-kernel}" # defines the package name used
 KVERREL="$(test -n "$2" && echo "-$2" || echo "")"
 SUBARCH="$(test -n "$3" && echo "-$3" || echo "")"
-FLAVOR="$(test -n "$4" && echo "-$4" || echo "-common")"
+FLAVOR="$(test -n "$4" && echo "-$4" || echo "-ark")"
 RHJOBS="$(test -n "$5" && echo "$5" || nproc --all)"
 SCRIPT=$(readlink -f "$0")
 SCRIPT_DIR=$(dirname "$SCRIPT")
 
-# Most RHEL options are options we want in Fedora so RHEL pending settings head
-# to common/
+# Config options for RHEL should target the pending-ark directory, not pending-common.
 if [ "$FLAVOR" = "-rhel" ]
 then
-	FLAVOR="-common"
+	FLAVOR="-ark"
 fi
 
 # to handle this script being a symlink
