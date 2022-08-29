@@ -54,7 +54,7 @@ do
 
 			echo "building ${varfilename}.spec"
 			make RHSELFTESTDATA=1 DIST="${DIST}" DISTRO="${DISTRO}" HEAD=${commit} setup-source
-			cp "$specfile" "${varfilename}".spec
+			 grep -Fvx -f "./kernel.spec.template" "$specfile" > "${varfilename}".spec
 		done
 	done
 done
