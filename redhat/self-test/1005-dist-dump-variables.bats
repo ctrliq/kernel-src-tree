@@ -1,4 +1,7 @@
 #!/usr/bin/env bats
+# Purpose: This test creates a set of Makefile variables, and a set of
+# variables that are used in the specfile.  This data is diff'd against a
+# "known good" set of data and if there is a difference an error is reported.
 
 @test "self-test-data check" {
 	mkdir -p $BATS_TMPDIR/data

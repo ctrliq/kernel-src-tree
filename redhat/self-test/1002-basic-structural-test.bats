@@ -1,4 +1,6 @@
 #!/usr/bin/env bats
+# Purpose: This test runs tests on the SRPM.
+
 @test "SRPM unpacks OK" {
     numsrpms=$(find "$BATS_TEST_DIRNAME"/.. -name "*.rpm" | wc -l)
     if [ "$numsrpms" != "1" ]; then
