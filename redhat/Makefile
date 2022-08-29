@@ -205,11 +205,10 @@ else
 endif
 
 KVERSION:=$(RPMKVERSION).$(RPMKPATCHLEVEL).$(RPMKSUBLEVEL)
-DISTRO_BUILD:=$(PREBUILD)$(shell echo $(BUILD) | sed -e 's|\(^[0-9]\{1,4\}\)\..*|\1|')
-KABI_TARBALL:=$(SOURCES)/kernel-abi-stablelists-$(KVERSION)-$(DISTRO_BUILD).tar.bz2
-KABIDW := $(REDHAT)/kabi-dwarf
-KABIDW_TARBALL:=$(SOURCES)/kernel-kabi-dw-$(KVERSION)-$(DISTRO_BUILD).tar.bz2
 PKGRELEASE:=$(PREBUILD)$(BUILD)$(BUILDID)
+KABI_TARBALL:=$(SOURCES)/kernel-abi-stablelists-$(KVERSION)-$(PKGRELEASE).tar.bz2
+KABIDW := $(REDHAT)/kabi-dwarf
+KABIDW_TARBALL:=$(SOURCES)/kernel-kabi-dw-$(KVERSION)-$(PKGRELEASE).tar.bz2
 RPMVERSION:=$(RPMKVERSION).$(RPMKPATCHLEVEL).$(RPMKSUBLEVEL)-$(PKGRELEASE)
 SPECRELEASE:=$(PREBUILD)$(BUILD)%{?buildid}%{?dist}
 SRPM:=$(SRPMS)/$(PACKAGE_NAME)-$(RPMVERSION)$(DIST).src.rpm
@@ -421,10 +420,10 @@ dist-tarball: $(TARBALL)
 	@echo "redhat/$(TARFILE)"
 
 dist-kernelrelease:
-	@echo $(PACKAGE_NAME)-$(KVERSION)-$(DISTRO_BUILD)
+	@echo $(PACKAGE_NAME)-$(KVERSION)-$(PKGRELEASE)
 
 dist-kernelversion:
-	@echo $(KVERSION)-$(DISTRO_BUILD)
+	@echo $(KVERSION)-$(PKGRELEASE)
 
 dist-specfile: setup-source
 	@echo $(SOURCES)/$(SPECFILE)
