@@ -87,8 +87,6 @@ Summary: The Linux kernel
 #  the --with-release option overrides this setting.)
 %define debugbuildsenabled 0
 
-%global distro_build 0.rc0.78e36f3b0dae586.6
-
 %if 0%{?fedora}
 %define secure_boot_arch x86_64
 %else
@@ -828,8 +826,8 @@ Source211: Module.kabi_dup_ppc64le
 Source212: Module.kabi_dup_s390x
 Source213: Module.kabi_dup_x86_64
 
-Source300: kernel-abi-stablelists-%{specversion}-%{distro_build}.tar.bz2
-Source301: kernel-kabi-dw-%{specversion}-%{distro_build}.tar.bz2
+Source300: kernel-abi-stablelists-%{specversion}-%{pkgrelease}.tar.bz2
+Source301: kernel-kabi-dw-%{specversion}-%{pkgrelease}.tar.bz2
 
 # Sources for kernel-tools
 Source2000: cpupower.service
