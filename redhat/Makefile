@@ -142,26 +142,26 @@ ifeq ("$(origin O)", "command line")
   _EXTRA_ARGS := O=$(_OUTPUT)
 endif
 
-# MARKER is the git tag which we base off of for exporting patches
-# Make sure MARKER uses SPECKVERSION, SPECKPATCHLEVEL and SPECKEXTRAVERSION
-# from makefile as opposed to any adjusted version for snapshotting.
+# MARKER is the upstream git tag which we base off of for exporting patches.
+# MARKER (and UPSTREAM_TARBALL_NAME) must use SPECKVERSION, SPECKPATCHLEVEL,
+# SPECKEXTRAVERSION, and SPECKSUBLEVEL from the top-level kernel makefile as
+# opposed to any adjusted version for snapshotting.
 ifneq ($(SPECKEXTRAVERSION),)
-  MARKER:=v$(SPECKVERSION).$(SPECKPATCHLEVEL)$(SPECKEXTRAVERSION)
   PREBUILD:=0$(shell echo $(SPECKEXTRAVERSION) | sed -e s/-/./).
   UPSTREAM_TARBALL_NAME:=$(SPECKVERSION).$(SPECKPATCHLEVEL)$(SPECKEXTRAVERSION)
 else
   ifeq ($(SPECKSUBLEVEL),0)
-    MARKER:=v$(SPECKVERSION).$(SPECKPATCHLEVEL)
     UPSTREAM_TARBALL_NAME:=$(SPECKVERSION).$(SPECKPATCHLEVEL)
   else
-    # Make sure MARKER uses SPECKVERSION, SPECKPATCHLEVEL, and SPECKSUBLEVEL
-    # from the kernel makefile as opposed to any adjusted version for snapshotting.
-    # IOW, these variables are *NOT* equivalent to the SPECVERSION variable.
-    MARKER:=v$(SPECKVERSION).$(SPECKPATCHLEVEL).$(SPECKSUBLEVEL)
+    # MARKER (and UPSTREAM_TARBALL_NAME) must use SPECKVERSION,
+    # SPECKPATCHLEVEL, and SPECKSUBLEVEL from the top-level kernel makefile as
+    # opposed to any adjusted version for snapshotting.  IOW, these variables are
+    # *NOT* equivalent to the SPECVERSION variable.
     UPSTREAM_TARBALL_NAME:=$(SPECKVERSION).$(SPECKPATCHLEVEL).$(SPECKSUBLEVEL)
   endif
   PREBUILD:=
 endif
+MARKER:=v$(UPSTREAM_TARBALL_NAME)
 
 # If VERSION_ON_UPSTREAM is set, the versioning of the rpm package is based
 # on a branch tracking upstream. This allows for generating rpms
