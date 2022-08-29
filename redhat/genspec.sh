@@ -23,9 +23,9 @@ else
 fi
 
 if [ -n "$BUILDID" ]; then
-	BUILDID_DEFINE=$(printf "%%define buildid %s" "$BUILDID")
+	SPECBUILDID=$(printf "%%define buildid %s" "$BUILDID")
 else
-	BUILDID_DEFINE="# define buildid .local"
+	SPECBUILDID="# define buildid .local"
 fi
 
 EXCLUDE_FILES=":(exclude,top).get_maintainer.conf \
@@ -57,7 +57,7 @@ fi
 
 test -f "$SOURCES/$SPECFILE" &&
 	sed -i -e "
-	s/%%BUILDID%%/$BUILDID_DEFINE/
+	s/%%SPECBUILDID%%/$SPECBUILDID/
 	s/%%SPECKVERSION%%/$SPECKVERSION/
 	s/%%SPECKPATCHLEVEL%%/$SPECKPATCHLEVEL/
 	s/%%PKGRELEASE%%/$PKGRELEASE/
