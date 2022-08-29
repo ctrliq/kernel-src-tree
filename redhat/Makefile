@@ -29,6 +29,10 @@ endif
 REDHAT:=$(TOPDIR)/redhat
 include $(TOPDIR)/Makefile.rhelver
 
+ifndef RHDISTDATADIR
+  RHDISTDATADIR=${REDHAT}/self-test/data
+endif
+
 RPMBUILD:=$(shell if [ -x "/usr/bin/rpmbuild" ]; then echo rpmbuild; \
                   else echo rpm; fi)
 
@@ -655,7 +659,7 @@ dist-self-test:
 	fi
 
 dist-self-test-data:
-	./self-test/data/create-data.sh ${REDHAT}/self-test/data
+	./self-test/data/create-data.sh
 
 dist-help:
 	@echo  'Cleaning targets:'
