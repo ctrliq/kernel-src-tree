@@ -21,7 +21,11 @@ endif
 include Makefile.variables
 
 LANG=C
-TOPDIR:=$(shell $(GIT) rev-parse --show-toplevel)
+ifndef RHSELFTESTDATA
+  TOPDIR:=$(shell $(GIT) rev-parse --show-toplevel)
+else
+  TOPDIR:=..
+endif
 REDHAT:=$(TOPDIR)/redhat
 include $(TOPDIR)/Makefile.rhelver
 
@@ -649,6 +653,9 @@ dist-self-test:
 	else \
 		echo "dist-self-test: The bats package is not installed" ; \
 	fi
+
+dist-self-test-data:
+	./self-test/data/create-data.sh ${REDHAT}/self-test/data
 
 dist-help:
 	@echo  'Cleaning targets:'
