@@ -16,6 +16,7 @@
 
 # Store variables used in *this* script before unsetting them below.
 destdir="${RHDISTDATADIR}"
+# shellcheck disable=SC2153
 sources="${SOURCES}"
 
 # unset all redhat/Makefile variables so they do not interfere with make targets below
@@ -26,10 +27,10 @@ specfile_helper () {
 	local specfilename
 
 	specfilename=$1
-	cp ./kernel.spec.template ${varfilename}.spec.template
-	make RHSELFTESTDATA=1 SPECFILE="${specfilename}.spec" DIST="${DIST}" DISTRO="${DISTRO}" HEAD=${commit} _setup-source
+	cp ./kernel.spec.template "${varfilename}.spec.template"
+	make RHSELFTESTDATA=1 SPECFILE="${specfilename}.spec" DIST="${DIST}" DISTRO="${DISTRO}" HEAD="${commit}" _setup-source
 	grep -Fvx -f "${specfilename}.spec.template" "${sources}/${specfilename}.spec" > "${destdir}"/"${specfilename}".spec
-	rm -f ${specfilename}.spec.template
+	rm -f "${specfilename}.spec.template"
 }
 
 for DISTRO in fedora rhel centos
