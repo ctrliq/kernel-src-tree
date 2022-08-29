@@ -556,7 +556,7 @@ dist-test-patch: generate-testpatch-tmp
 	@mv $(TESTPATCH).tmp $(TESTPATCH);
 
 do-rpmbuild: dist-sources
-	$(RPMBUILD) --define "_sourcedir $(SOURCES)" --define "_builddir $(RPM)/BUILD" --define "_srcrpmdir $(RPM)/SRPMS" --define "_rpmdir $(RPM)/RPMS" --define "_specdir $(RPM)/SPECS" --define "dist $(DIST)" $(RPMBUILDOPTS) $(RPM)/SOURCES/$(PACKAGE_NAME).spec
+	$(RPMBUILD) --define "_sourcedir $(SOURCES)" --define "_builddir $(RPM)/BUILD" --define "_srcrpmdir $(RPM)/SRPMS" --define "_rpmdir $(RPM)/RPMS" --define "_specdir $(RPM)/SPECS" --define "dist $(DIST)" $(RPMBUILDOPTS) $(RPM)/SOURCES/$(SPECFILE)
 
 dist-all-rpms: RPMBUILDOPTS=--target $(MACH) -ba
 dist-all-rpms: dist-sources do-rpmbuild
@@ -588,7 +588,7 @@ dist-release-finish: setup-source
 	@cp $(SOURCES)/$(SPECCHANGELOG) $(REDHAT)/$(SPECCHANGELOG)
 	@$(GIT) add $(REDHAT)/$(SPECCHANGELOG)
 	@$(GIT) add $(REDHAT)/marker
-	@$(GIT) commit -s ../Makefile.rhelver $(REDHAT)/marker $(REDHAT)/$(SPECCHANGELOG) $(PACKAGE_NAME).spec.template -m "[redhat] $(PACKAGE_NAME)-$(RPMVERSION)"
+	@$(GIT) commit -s ../Makefile.rhelver $(REDHAT)/marker $(REDHAT)/$(SPECCHANGELOG) $(SPECFILE).template -m "[redhat] $(PACKAGE_NAME)-$(RPMVERSION)"
 dist-release-changed: setup-source
 	@cp $(SOURCES)/$(SPECCHANGELOG) $(REDHAT)/$(SPECCHANGELOG)
 	@echo $(MARKER) > $(REDHAT)/marker
@@ -651,8 +651,8 @@ dist-brew dist-koji: dist-%: dist-vr-check dist-srpm
 distg-brew distg-koji: distg-%: dist-vr-check
 	$* $(BUILD_PROFILE) build $(BUILD_FLAGS) $(BUILD_TARGET) "$(RHGITURL)?redhat/koji#$(RHGITCOMMIT)"
 
-.PHONY: $(REDHAT)/rpm/SOURCES/$(PACKAGE_NAME).spec
-$(REDHAT)/rpm/SOURCES/$(PACKAGE_NAME).spec:
+.PHONY: $(REDHAT)/rpm/SOURCES/$(SPECFILE)
+$(REDHAT)/rpm/SOURCES/$(SPECFILE):
 	@echo "dist-sources"
 	@$(MAKE) dist-sources
 
