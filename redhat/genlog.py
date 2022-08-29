@@ -74,8 +74,6 @@ def parse_commit(commit):
 
 
 if __name__ == "__main__":
-    all_bzs = []
-    all_zbzs = []
     commits = sys.stdin.read().split('\0')
     for c in commits:
         if not c:
@@ -86,25 +84,11 @@ if __name__ == "__main__":
             entry += " ["
             if zbugs:
                 entry += " ".join(zbugs)
-                all_zbzs.extend(zbugs)
             if bugs and zbugs:
                 entry += " "
             if bugs:
                 entry += " ".join(bugs)
-                all_bzs.extend(bugs)
             entry += "]"
         if cves:
             entry += " {" + " ".join(cves) + "}"
         print(entry)
-
-    resolved_bzs = []
-    for bzid in (all_zbzs if all_zbzs else all_bzs):
-        if not bzid in resolved_bzs:
-            resolved_bzs.append(bzid)
-    print("Resolves: ", end="")
-    for i, bzid in enumerate(resolved_bzs):
-        if i:
-            print(", ", end="")
-        print(f"rhbz#{bzid}", end="")
-    print("\n")
-

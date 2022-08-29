@@ -47,6 +47,8 @@ EXCLUDE=$(git log -1 --format=%P ${0%/*}/rhdocs | cut -d ' ' -f 2)
 GIT_FORMAT="--format=- %s (%an)%n%N%n^^^NOTES-END^^^%n%b"
 GIT_NOTES="--notes=refs/notes/${RHEL_MAJOR}.${RHEL_MINOR}*"
 
+echo > "$clogf"
+
 lasttag=$(git rev-list --first-parent --grep="^\[redhat\] kernel-${RPMVERSION}" --max-count=1 HEAD)
 # if we didn't find the proper tag, assume this is the first release
 if [[ -z $lasttag ]]; then
@@ -60,17 +62,14 @@ if [[ -z $lasttag ]]; then
 fi
 echo "Gathering new log entries since $lasttag"
 # master is expected to track mainline.
-
-cname="$(git var GIT_COMMITTER_IDENT |sed 's/>.*/>/')"
-cdate="$(LC_ALL=C date +"%a %b %d %Y")"
-cversion="[$RPM_VERSION]";
-echo "* $cdate $cname $cversion" > "$clogf"
-
 UPSTREAM="$(git rev-parse -q --verify origin/$UPSTREAM_BRANCH || \
           git rev-parse -q --verify $UPSTREAM_BRANCH)"
  
-git log --topo-order --no-merges -z $GIT_NOTES "$GIT_FORMAT" \
+git log --topo-order --reverse --no-merges -z $GIT_NOTES "$GIT_FORMAT" \
 	^${UPSTREAM} ${EXCLUDE:+^$EXCLUDE} "$lasttag".. | ${0%/*}/genlog.py >> "$clogf"
+
+grep -v "tagging $RPM_VERSION" "$clogf" > "$clogf.stripped"
+cp "$clogf.stripped" "$clogf"
 
 if [ "$HIDE_REDHAT" = "1" ]; then
 	grep -v -e "^- \[redhat\]" "$clogf" |
@@ -104,19 +103,24 @@ if [ -n "$(git log --oneline --first-parent --grep="Merge ark patches" "$lasttag
 	echo "- Merge ark-patches" >> "$clogf"
 fi
 
-# during rh-dist-git genspec runs again and generates empty changelog
-# create empty file to avoid adding extra header to changelog
-LENGTH=$(grep "^-" $clogf | wc -l | awk '{print $1}')
+LENGTH=$(wc -l "$clogf" | awk '{print $1}')
+
+#the changelog was created in reverse order
+#also remove the blank on top, if it exists
+#left by the 'print version\n' logic above
+cname="$(git var GIT_COMMITTER_IDENT |sed 's/>.*/>/')"
+cdate="$(LC_ALL=C date +"%a %b %d %Y")"
+cversion="[$RPM_VERSION]";
+tac "$clogf" | sed "1{/^$/d; /^- /i\
+* $cdate $cname $cversion
+	}" > "$clogf.rev"
+
 if [ "$LENGTH" = 0 ]; then
-	rm -f $clogf
-	touch $clogf
+	rm -f "$clogf.rev"; touch "$clogf.rev"
 fi
 
-cat "$clogf" "$CHANGELOG" > "$clogf.full"
+cat "$clogf.rev" "$CHANGELOG" > "$clogf.full"
 mv -f "$clogf.full" "$CHANGELOG"
-
-# genlog.py generates Resolves lines as well, strip these from RPM changelog
-cat $CHANGELOG | grep -v -e "^Resolves: " > $clogf.stripped
 
 if [ "$SNAPSHOT" = 0 ]; then
 	# This is based off a tag on Linus's tree (e.g. v5.5 or v5.5-rc5).
@@ -135,7 +139,7 @@ fi
 
 test -n "$SPECFILE" &&
         sed -i -e "
-	/%%CHANGELOG%%/r $clogf.stripped
+	/%%CHANGELOG%%/r $CHANGELOG
 	/%%CHANGELOG%%/d
 	s/%%BUILDID%%/$BUILDID_DEFINE/
 	s/%%KVERSION%%/$KVERSION/
@@ -181,4 +185,4 @@ for opt in $BUILDOPTS; do
 	[ -n "$add_opt" ] && sed -i "s/^\\(# The following build options\\)/%define $add_opt 1\\n\\1/" $SPECFILE
 done
 
-rm -f "$clogf"{,.stripped};
+rm -f "$clogf"{,.rev,.stripped};

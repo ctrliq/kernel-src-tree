@@ -19,12 +19,11 @@ rhdistgit_server=$4;
 rhdistgit_tarball=$5;
 rhdistgit_kabi_tarball=$6;
 rhdistgit_kabidw_tarball=$7;
-package_name=$8;
-rpm_version=$9;
-changelog=${10};
-rhel_major=${11};
-rhpkg_bin=${12};
-srpm_name=${13};
+rhdistgit_zstream_flag=$8;
+package_name=$9;
+rhel_major=${10};
+rhpkg_bin=${11};
+srpm_name=${12};
 
 redhat=$(dirname "$0")/..;
 topdir="$redhat"/..;
@@ -84,11 +83,9 @@ echo "Creating diff for review ($tmpdir/diff) and changelog"
 # diff the result (redhat/cvs/dontdiff). note: diff reuturns 1 if
 # differences were found
 diff -X "$redhat"/git/dontdiff -upr "$tmpdir/$package_name" "$redhat"/rpm/SOURCES/ > "$tmpdir"/diff;
-
-# changelog has been created by genspec.sh, including Resolves line, just copy it here
-echo -e "${package_name}-${rpm_version}\n" > $tmpdir/changelog
-awk '1;/^Resolves: /{exit};' $changelog >> $tmpdir/changelog
-
+# creating the changelog file
+"$redhat"/scripts/create_distgit_changelog.sh "$redhat/rpm/SOURCES/$package_name".spec \
+	"$rhdistgit_zstream_flag" "$package_name" >"$tmpdir"/changelog
 
 # all done
 echo "$tmpdir"
