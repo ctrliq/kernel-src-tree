@@ -16,8 +16,6 @@ else
 	echo "$3" > .flavors
 fi
 
-RHJOBS="$(test -n "$4" && echo "$4" || nproc --all)"
-
 LANG=en_US.UTF-8
 
 # to handle this script being a symlink
@@ -153,16 +151,9 @@ function build_flavor()
 				esac
 			fi
 
-			merge_configs "$arch" "$configs" "$order" "$flavor" "$count" &
-			waitpids[$count]=$!
-			((count++))
-			while [ "$(jobs | grep Running | wc -l)" -ge $RHJOBS ]; do :; done
+			merge_configs "$arch" "$configs" "$order" "$flavor" "$count"
 		fi
 	done < "$control_file"
-
-	for pid in ${waitpids[*]}; do
-		wait $pid
-	done
 }
 
 while read -r line
