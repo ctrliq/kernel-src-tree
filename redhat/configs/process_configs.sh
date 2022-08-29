@@ -105,6 +105,8 @@ checkoptions()
 		! $checkoptions_error && return
 
 		sed -i "1s/^/Error: Mismatches found in configuration files for ${variant}\n/" .mismatches${count}
+		cat .mismatches${count}
+		RETURNCODE=1
 		[ "$CONTINUEONERROR" ] || exit 1
 	else
 		rm -f .mismatches${count}
@@ -253,8 +255,8 @@ function process_config()
 	grep -E 'CONFIG_' .listnewconfig${count} > .newoptions${count}
 	if test -n "$NEWOPTIONS" && test -s .newoptions${count}
 	then
-		echo "Found unset config items in ${variant}, please set them to an appropriate value" >> .errors${count}
-		cat .newoptions${count} >> .errors${count}
+		echo "Found unset config items in ${variant}, please set them to an appropriate value"
+		cat .newoptions${count}
 		rm .newoptions${count}
 		RETURNCODE=1
 		[ "$CONTINUEONERROR" ] || exit 1
@@ -264,9 +266,10 @@ function process_config()
 	grep -E 'config.*warning' .listnewconfig${count} > .warnings${count}
 	if test -n "$CHECKWARNINGS" && test -s .warnings${count}
 	then
-		echo "Found misconfigured config items in ${variant}, please set them to an appropriate value" >> .errors${count}
-		cat .warnings${count} >> .errors${count}
+		echo "Found misconfigured config items in ${variant}, please set them to an appropriate value"
+		cat .warnings${count}
 		rm .warnings${count}
+		RETURNCODE=1
 		[ "$CONTINUEONERROR" ] || exit 1
 	fi
 	rm .warnings${count}
@@ -299,31 +302,13 @@ function process_configs()
 	count=0
 	for cfg in "$SCRIPT_DIR/${PACKAGE_NAME}${KVERREL}${SUBARCH}"*.config
 	do
-		process_config "$cfg" "$count" &
-		waitpids[${count}]=$!
+		process_config "$cfg" "$count"
 		((count++))
-		while [ "$(jobs | grep Running | wc -l)" -ge $RHJOBS ]; do :; done
 	done
-	for pid in ${waitpids[*]}; do
-		wait ${pid}
-	done
-
 	rm "$SCRIPT_DIR"/*.config*.old
-
-	if ls .errors* 1> /dev/null 2>&1; then
-		RETURNCODE=1
-		cat .errors*
-		rm .errors* -f
-	fi
-	if ls .mismatches* 1> /dev/null 2>&1; then
-		RETURNCODE=1
-		cat .mismatches*
-		rm .mismatches* -f
-	fi
-
 	popd > /dev/null
 
-	[ $RETURNCODE -eq 0 ] && echo "Processed config files are in $SCRIPT_DIR"
+	echo "Processed config files are in $SCRIPT_DIR"
 }
 
 CHECKOPTIONS=""
@@ -384,7 +369,6 @@ PACKAGE_NAME="${1:-kernel}" # defines the package name used
 KVERREL="$(test -n "$2" && echo "-$2" || echo "")"
 SUBARCH="$(test -n "$3" && echo "-$3" || echo "")"
 FLAVOR="$(test -n "$4" && echo "-$4" || echo "-common")"
-RHJOBS="$(test -n "$5" && echo "$5" || nproc --all)"
 SCRIPT=$(readlink -f "$0")
 SCRIPT_DIR=$(dirname "$SCRIPT")
 
