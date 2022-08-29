@@ -154,10 +154,12 @@ ifndef VERSION_ON_UPSTREAM
     VERSION_ON_UPSTREAM:=0
   endif
 endif
+
+UPSTREAM:=$(shell $(GIT) rev-parse -q --verify origin/$(UPSTREAM_BRANCH) || \
+            $(GIT) rev-parse -q --verify $(UPSTREAM_BRANCH))
+
 ifeq ($(VERSION_ON_UPSTREAM),1)
   # UPSTREAM_BRANCH is expected to track mainline.
-  UPSTREAM:=$(shell $(GIT) rev-parse -q --verify origin/$(UPSTREAM_BRANCH) || \
-                  $(GIT) rev-parse -q --verify $(UPSTREAM_BRANCH))
   ifeq ($(UPSTREAM),)
       $(error "Missing an $(UPSTREAM_BRANCH) branch")
   endif
