@@ -53,14 +53,6 @@ function combine_config_layer()
 
 function merge_configs()
 {
-	local archvar
-	local arch
-	local configs
-	local order
-	local flavor
-	local name
-	local skip_if_missing
-
 	archvar=$1
 	arch=$(echo "$archvar" | cut -f1 -d"-")
 	configs=$2
