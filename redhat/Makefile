@@ -147,11 +147,9 @@ endif
 # from makefile as opposed to any adjusted version for snapshotting.
 ifneq ($(SPECKEXTRAVERSION),)
   MARKER:=v$(SPECKVERSION).$(SPECKPATCHLEVEL)$(SPECKEXTRAVERSION)
-  KEXTRAVERSION:=$(shell echo $(SPECKEXTRAVERSION) | sed -e s/-/./)
-  PREBUILD:=0$(KEXTRAVERSION).
+  PREBUILD:=0$(shell echo $(SPECKEXTRAVERSION) | sed -e s/-/./).
   UPSTREAM_TARBALL_NAME:=$(SPECKVERSION).$(SPECKPATCHLEVEL)$(SPECKEXTRAVERSION)
 else
-  KEXTRAVERSION:=
   ifeq ($(SPECKSUBLEVEL),0)
     MARKER:=v$(SPECKVERSION).$(SPECKPATCHLEVEL)
     UPSTREAM_TARBALL_NAME:=$(SPECKVERSION).$(SPECKPATCHLEVEL)
@@ -195,8 +193,7 @@ ifeq ($(VERSION_ON_UPSTREAM),1)
     # packaging. Fix this by bumping the patch level and marking
     # this as rc0
     ifeq ($(SPECKEXTRAVERSION),)
-      KEXTRAVERSION:=.rc0
-      PREBUILD:=0$(KEXTRAVERSION).
+      PREBUILD:=0.rc0.
       SPECKPATCHLEVEL:=$(shell expr $(SPECKPATCHLEVEL) + 1)
     endif
     ifndef PREBUILD_GIT_ONLY
