@@ -18,7 +18,7 @@ else
 fi
 
 for i in kernel-*-"$FLAVOR".config; do
-	NEW=kernel-"$KVERSION"-$(echo "$i" | cut -d - -f2- | sed s/-"$FLAVOR"//)
+	NEW=kernel-"$SPECVERSION"-$(echo "$i" | cut -d - -f2- | sed s/-"$FLAVOR"//)
 	#echo $NEW
 	mv "$i" "$NEW"
 done

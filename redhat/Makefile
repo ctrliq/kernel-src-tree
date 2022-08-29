@@ -131,8 +131,8 @@ ifeq ("$(origin O)", "command line")
 endif
 
 # MARKER is the git tag which we base off of for exporting patches
-# Make sure MARKER uses RPMKPATCHLEVEL and RPMKEXTRAVERSION from the kernel
-# makefile as opposed to any adjusted version for snapshotting.
+# Make sure MARKER uses RPMKVERSION, RPMKPATCHLEVEL and RPMKEXTRAVERSION from
+# the kernel makefile as opposed to any adjusted version for snapshotting.
 ifneq ($(RPMKEXTRAVERSION),)
   MARKER:=v$(RPMKVERSION).$(RPMKPATCHLEVEL)$(RPMKEXTRAVERSION)
   KEXTRAVERSION:=$(shell echo $(RPMKEXTRAVERSION) | sed -e s/-/./)
@@ -144,9 +144,9 @@ else
     MARKER:=v$(RPMKVERSION).$(RPMKPATCHLEVEL)
     UPSTREAM_TARBALL_NAME:=$(RPMKVERSION).$(RPMKPATCHLEVEL)
   else
-    # Make sure MARKER uses RPMKPATCHLEVEL and RPMKEXTRAVERSION from the kernel
-    # makefile as opposed to any adjusted version for snapshotting.  IOW,
-    # these variables are *NOT* equivalent to the KVERSION variable.
+    # Make sure MARKER uses RPMKVERSION, RPMKPATCHLEVEL, and RPMKSUBLEVEL from
+    # the kernel makefile as opposed to any adjusted version for snapshotting.
+    # IOW these variables are *NOT* equivalent to the SPECVERSION variable.
     MARKER:=v$(RPMKVERSION).$(RPMKPATCHLEVEL).$(RPMKSUBLEVEL)
     UPSTREAM_TARBALL_NAME:=$(RPMKVERSION).$(RPMKPATCHLEVEL).$(RPMKSUBLEVEL)
   endif
@@ -207,12 +207,12 @@ else
   SNAPSHOT:=0
 endif
 
-KVERSION:=$(RPMKVERSION).$(RPMKPATCHLEVEL).$(RPMKSUBLEVEL)
+SPECVERSION:=$(RPMKVERSION).$(RPMKPATCHLEVEL).$(RPMKSUBLEVEL)
 PKGRELEASE:=$(PREBUILD)$(BUILD)$(BUILDID)
-KABI_TARBALL:=$(SOURCES)/kernel-abi-stablelists-$(KVERSION)-$(PKGRELEASE).tar.bz2
+KABI_TARBALL:=$(SOURCES)/kernel-abi-stablelists-$(SPECVERSION)-$(PKGRELEASE).tar.bz2
 KABIDW := $(REDHAT)/kabi-dwarf
-KABIDW_TARBALL:=$(SOURCES)/kernel-kabi-dw-$(KVERSION)-$(PKGRELEASE).tar.bz2
-RPMVERSION:=$(KVERSION)-$(PKGRELEASE)
+KABIDW_TARBALL:=$(SOURCES)/kernel-kabi-dw-$(SPECVERSION)-$(PKGRELEASE).tar.bz2
+RPMVERSION:=$(SPECVERSION)-$(PKGRELEASE)
 SPECRELEASE:=$(PREBUILD)$(BUILD)%{?buildid}%{?dist}
 SRPM:=$(SRPMS)/$(PACKAGE_NAME)-$(RPMVERSION)$(DIST).src.rpm
 
@@ -354,11 +354,11 @@ dist-kabi-dw-check: dist-kabi
 
 dist-configs-commit: dist-configs-prep
 	+@cd $(REDHAT)/configs; ./generate_all_configs.sh 1;\
-	./process_configs.sh -z "$(KVERSION)" "$(FLAVOR)"
+	./process_configs.sh -z "$(SPECVERSION)" "$(FLAVOR)"
 
 dist-configs: dist-configs-prep
 	+@cd $(REDHAT)/configs; ./generate_all_configs.sh 1;\
-	./process_configs.sh $(PROCESS_CONFIGS_OPTS) "$(KVERSION)" ""
+	./process_configs.sh $(PROCESS_CONFIGS_OPTS) "$(SPECVERSION)" ""
 
 dist-fedora-configs: FLAVOR = fedora
 dist-fedora-configs: dist-configs
@@ -427,12 +427,12 @@ dist-tarball: $(TARBALL)
 dist-kernelrelease:
 	# deprecated at 5.17.0
 	@echo "WARNING: This target will be deprecated in a future release."
-	@echo $(PACKAGE_NAME)-$(KVERSION)-$(PKGRELEASE)
+	@echo $(PACKAGE_NAME)-$(SPECVERSION)-$(PKGRELEASE)
 
 dist-kernelversion:
 	# deprecated at 5.17.0
 	@echo "WARNING: This target will be deprecated in a future release."
-	@echo $(KVERSION)-$(PKGRELEASE)
+	@echo $(SPECVERSION)-$(PKGRELEASE)
 
 dist-specfile: setup-source
 	# deprecated at 5.17.0

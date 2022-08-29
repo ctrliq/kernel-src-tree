@@ -73,4 +73,4 @@ or,
   dist-kernelversion:
     # deprecated in 5.17.0
     @echo "WARNING: This target will be removed in a later release."
-    @echo $(KVERSION)-$(DISTRO_BUILD)
+    @echo $(SPECVERSION)-$(DISTRO_BUILD)
