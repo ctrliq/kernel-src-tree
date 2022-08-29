@@ -587,8 +587,8 @@ dist-all-rpms: dist-sources do-rpmbuild
 dist-srpm: RPMBUILDOPTS=--nodeps -bs
 dist-srpm: dist-sources do-rpmbuild
 
-dist-srpm-gcov: LOCALVERSION=".gcov"
-dist-srpm-gcov: BUILDOPTS+="+gcov"
+dist-srpm-gcov: LOCALVERSION=.gcov
+dist-srpm-gcov: BUILDOPTS+=+gcov
 dist-srpm-gcov: dist-srpm
 
 dist-rpms: RPMBUILDOPTS=--target $(MACH) -bb
