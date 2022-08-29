@@ -58,14 +58,6 @@ if [ "$MARKER" != "$LAST_MARKER" ]; then
 	rm "$clogf.tmp" "$clogf.unique"
 fi
 
-# HACK temporary hack until single tree workflow
-# Don't reprint all the ark-patches again.
-if [ -n "$(git log --oneline --first-parent --grep="Merge ark patches" "$lasttag"..)" ]; then
-	# Throw away the clogf and just print the summary merge
-	echo "" > "$clogf"
-	echo "- Merge ark-patches" >> "$clogf"
-fi
-
 # during rh-dist-git genspec runs again and generates empty changelog
 # create empty file to avoid adding extra header to changelog
 LENGTH=$(grep -c "^-" "$clogf" | awk '{print $1}')
