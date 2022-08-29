@@ -90,6 +90,7 @@ Contributor Guide
 
    repository-layout
    submitting-contributions
+   faq
 
 
 Maintainer Guide
