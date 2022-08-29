@@ -58,7 +58,6 @@ function merge_configs()
 	local configs
 	local order
 	local flavor
-	local count
 	local name
 	local skip_if_missing
 
@@ -67,11 +66,10 @@ function merge_configs()
 	configs=$2
 	order=$3
 	flavor=$4
-	count=$5
 
 	name=$OUTPUT_DIR/$PACKAGE_NAME-$archvar-$flavor.config
 	echo -n "Building $name ... "
-	touch config-merging.$count config-merged.$count
+	touch config-merging config-merged
 
 	# apply based on order
 	skip_if_missing=""
@@ -83,10 +81,10 @@ function merge_configs()
 
 			test -n "$skip_if_missing" && test ! -e "$cfile" && continue
 
-			if ! perl merge.pl "$cfile" config-merging.$count > config-merged.$count; then
+			if ! perl merge.pl "$cfile" config-merging > config-merged; then
 				die "Failed to merge $cfile"
 			fi
-			mv config-merged.$count config-merging.$count
+			mv config-merged config-merging
 		done
 
 		# first configs in $order is baseline, all files should be
@@ -106,8 +104,8 @@ function merge_configs()
 	else
 		echo "# $arch" > "$name"
 	fi
-	sort config-merging.$count >> "$name"
-	rm -f config-merged.$count config-merging.$count
+	sort config-merging >> "$name"
+	rm -f config-merged config-merging
 	echo "done"
 }
 
@@ -151,7 +149,7 @@ function build_flavor()
 				esac
 			fi
 
-			merge_configs "$arch" "$configs" "$order" "$flavor" "$count"
+			merge_configs "$arch" "$configs" "$order" "$flavor"
 		fi
 	done < "$control_file"
 }
