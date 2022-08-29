@@ -16,7 +16,7 @@
 
 # Store variables used in *this* script before unsetting them below.
 destdir="${RHDISTDATADIR}"
-specfile="${SOURCES}"/kernel.spec
+sources="${SOURCES}"
 
 # unset all redhat/Makefile variables so they do not interfere with make targets below
 makefile_vars=$(unset SINGLE_TARBALL; make dist-dump-variables | grep "=" | cut -d"=" -f1)
@@ -57,7 +57,7 @@ do
 
 			echo "building ${destdir}/${varfilename}.spec"
 			make RHSELFTESTDATA=1 DIST="${DIST}" DISTRO="${DISTRO}" HEAD=${commit} setup-source
-			grep -Fvx -f "./kernel.spec.template" "$specfile" > "${destdir}"/"${varfilename}".spec
+			grep -Fvx -f "./kernel.spec.template" "${sources}/kernel.spec" > "${destdir}"/"${varfilename}".spec
 		done
 
 		# There isn't an easy way to make sure the parallel execution doesn't go crazy
