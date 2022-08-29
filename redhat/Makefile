@@ -237,7 +237,7 @@ setup-source: dist-git-version-check dist-clean-sources
 		echo "Error: PATCHLIST_URL must be set (to 'none' or any URL)"; \
 		exit 1; \
 	fi
-	@$(REDHAT)/genspec.sh $(SOURCES) $(SOURCES)/$(SPECFILE) $(SOURCES)/$(CHANGELOG) $(PKGRELEASE) $(RPMKVERSION) $(RPMKPATCHLEVEL) $(RPMKSUBLEVEL) $(DISTRO_BUILD) $(RELEASED_KERNEL) $(SPECRELEASE) $(__ZSTREAM) "$(BUILDOPTS)" $(MARKER) `cat $(REDHAT)/marker` $(SINGLE_TARBALL) $(TARFILE_RELEASE) $(SNAPSHOT) $(UPSTREAM_BRANCH) $(INCLUDE_FEDORA_FILES) $(INCLUDE_RHEL_FILES) $(PATCHLIST_URL) $(BUILDID)
+	@$(REDHAT)/genspec.sh
 	@cp $(SOURCES)/$(SPECFILE) $(SOURCES)/../SPECS/
 
 generate-testpatch-tmp:
@@ -564,3 +564,5 @@ dist-full-help:
 	@echo  '                    target used by the current branch/tree.'
 	@echo  '  dist-self-test  - Runs self-tests from the redhat/self-test directory'
 	@echo  ''
+
+export
