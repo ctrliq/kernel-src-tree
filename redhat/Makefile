@@ -28,11 +28,17 @@ endif
 include Makefile.variables
 
 LANG=C
+
 ifndef RHSELFTESTDATA
   TOPDIR:=$(shell $(GIT) rev-parse --show-toplevel)
 else
+  # change TOPDIR to be relative
   TOPDIR:=..
+  # RHEL_RELEASE may be updated which will cause a difference with the BUILD variable
+  RHEL_RELEASE:=6
+  BUILD:=$(RHEL_RELEASE)
 endif
+
 REDHAT:=$(TOPDIR)/redhat
 include $(TOPDIR)/Makefile.rhelver
 
