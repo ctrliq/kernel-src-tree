@@ -1,7 +1,5 @@
 #!/usr/bin/bash
 
-[ -z "${RHDISTDATADIR}" ] && echo "ERROR: RHDISTDATADIR undefined." && exit 1
-
 # This script generates 'dist-dump-variables' output for various configurations
 # using known ark commit IDs.  It uses this information as well as setting
 # different values for DISTRO and DIST.
@@ -14,13 +12,23 @@
 #    fce15c45d3fb := 5.16-rc5 + 2 additional commits
 #
 
+[ -z "${RHDISTDATADIR}" ] && echo "ERROR: RHDISTDATADIR undefined." && exit 1
+
+# Store variables used in *this* script before unsetting them below.
+destdir="${RHDISTDATADIR}"
+specfile="${SOURCES}"/kernel.spec
+
+# unset all redhat/Makefile variables so they do not interfere with make targets below
+makefile_vars=$(unset SINGLE_TARBALL; make dist-dump-variables | grep "=" | cut -d"=" -f1)
+while read -r VAR; do unset "$VAR"; done < <(echo "$makefile_vars")
+
 for DISTRO in fedora rhel centos
 do
 	for commit in 78e36f3b0dae 2585cf9dfaad df0cc57e057f fce15c45d3fb
 	do
 		for DIST in .fc25 .el7
 		do
-			varfilename="${RHDISTDATADIR}/${DISTRO}-${commit}${DIST}"
+			varfilename="${destdir}/${DISTRO}-${commit}${DIST}"
 
 			echo "building $varfilename"
 
@@ -30,7 +38,6 @@ do
 			# the tree is changed.  Omit UPSTREAM from the output.
 			# RHEL_RELEASE can change build-to-build.
 			# SHELL can change depending on user's environment
-			unset SINGLE_TARBALL
 			make RHSELFTESTDATA=1 DIST="${DIST}" DISTRO="${DISTRO}" HEAD=${commit} dist-dump-variables | grep "=" | grep -v CURDIR | grep -v -w UPSTREAM | grep -v -w RHEL_RELEASE | grep -v -w SHELL >& "${varfilename}"
 
 			# When executed from a script, the variables in Makefile.variables are
@@ -49,9 +56,8 @@ do
 			done >> "${varfilename}"
 
 			echo "building ${varfilename}.spec"
-			unset SINGLE_TARBALL
 			make RHSELFTESTDATA=1 DIST="${DIST}" DISTRO="${DISTRO}" HEAD=${commit} setup-source
-			cp "${SOURCES}"/kernel.spec "${varfilename}".spec
+			cp "$specfile" "${varfilename}".spec
 		done
 	done
 done
