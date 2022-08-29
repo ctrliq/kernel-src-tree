@@ -256,7 +256,7 @@ else
     ifeq ("$(DIST)", ".eln")
       BUILD_TARGET:=eln
     else
-      BUILD_TARGET:=rhel-$(RHEL_MAJOR)-scratch
+      BUILD_TARGET:=rhel-$(RHEL_MAJOR).$(RHEL_MINOR).0-test-pesign
     endif
   endif
   SPECTARFILE_RELEASE:=$(BASEVERSION)
