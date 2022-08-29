@@ -1,4 +1,8 @@
-# deprecated variables
+#
+# Deprecated variables
+#
+# This section is intentionally left at the top of the Makefile so it won't be ignored.
+#
 ifdef BREW_FLAGS
   # deprecated in 5.17.0
   $(warning WARNING: BREW_FLAGS will be deprecated in a later release, use BUILD_FLAGS instead.)
@@ -139,6 +143,10 @@ PKGRELEASE:=$(PREBUILD)$(BUILD)$(BUILDID)
 RPMVERSION:=$(RPMKVERSION).$(RPMKPATCHLEVEL)-$(PKGRELEASE)
 SPECRELEASE:=$(PREBUILD)$(BUILD)%{?buildid}%{?dist}
 
+#
+# This conditional statement is where fedora, centos, and other (aka RHEL)
+# specific values should be set.
+#
 ifeq ("$(DISTRO)", "fedora")
   # A non-unified tarball means that the tarball is only upstream sources
   # and the patches get applied as a diff in the spec file
@@ -247,6 +255,14 @@ ifndef BUILD_FLAGS
   endif
   BUILD_FLAGS += $(TEST_FLAGS)
 endif
+
+#
+# Targets
+#
+# Do not place variable declarations below this line.  Variables are exported
+# to scripts called in the targets below and do not need to be passed on the
+# command-line.
+#
 
 default: dist-help
 
