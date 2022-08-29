@@ -40,6 +40,10 @@ do
 				[ "$VAR" == "RHDISTDATADIR" ] && continue
 				echo "$VAR=${!VAR}"
 			done >> "${varfilename}"
+
+			echo "building ${varfilename}.spec"
+			make RHSELFTESTDATA=1 DIST="${DIST}" DISTRO="${DISTRO}" HEAD=${commit} setup-source
+			cp "${SOURCES}"/kernel.spec "${varfilename}".spec
 		done
 	done
 done
