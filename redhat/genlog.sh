@@ -36,13 +36,13 @@ git log --topo-order --no-merges -z "$GIT_NOTES" "$GIT_FORMAT" \
 
 if [ "$HIDE_REDHAT" = "1" ]; then
 	grep -v -e "^- \[redhat\]" "$clogf" |
-		sed -e 's!\[Fedora\]!!g' > "$clogf.stripped"
-	cp "$clogf.stripped" "$clogf"
+		sed -e 's!\[Fedora\]!!g' > "$clogf.tmp"
+	mv -f "$clogf.tmp" "$clogf"
 fi
 
 if [ "$HIDE_UNSUPPORTED_ARCH" = "1" ]; then
-	grep -E -v "^- \[(alpha|arc|arm|avr32|blackfin|c6x|cris|frv|h8300|hexagon|ia64|m32r|m68k|metag|microblaze|mips|mn10300|openrisc|parisc|score|sh|sparc|tile|um|unicore32|xtensa)\]" "$clogf" > "$clogf.stripped"
-	cp "$clogf.stripped" "$clogf"
+	grep -E -v "^- \[(alpha|arc|arm|avr32|blackfin|c6x|cris|frv|h8300|hexagon|ia64|m32r|m68k|metag|microblaze|mips|mn10300|openrisc|parisc|score|sh|sparc|tile|um|unicore32|xtensa)\]" "$clogf" > "$clogf.tmp"
+	mv -f "$clogf.tmp" "$clogf"
 fi
 
 # If the markers aren't the same then this a rebase.
@@ -60,17 +60,4 @@ if [ "$LENGTH" = 0 ]; then
 	echo -n > "$clogf"
 fi
 
-cat "$clogf" "$SOURCES/$SPECCHANGELOG" > "$clogf.full"
-mv -f "$clogf.full" "$SOURCES/$SPECCHANGELOG"
-
-# genlog.py generates Resolves lines as well, strip these from RPM changelog
-grep -v -e "^Resolves: " "$SOURCES/$SPECCHANGELOG" > "$clogf".stripped
-
-test -f "$SOURCES/$SPECFILE" &&
-	sed -i -e "
-	/%%SPECCHANGELOG%%/r $clogf.stripped
-	/%%SPECCHANGELOG%%/d" "$SOURCES/$SPECFILE"
-
 echo "MARKER is $MARKER"
-
-rm -f "$clogf".stripped;
