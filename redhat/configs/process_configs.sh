@@ -104,7 +104,7 @@ checkoptions()
 
 		! $checkoptions_error && return
 
-		sed -i "1s/^/Error: Mismatches found in configuration files for ${variant}\n/" .mismatches${count}
+		sed -i "1s/^/Error: Mismatches found in configuration files for ${arch} ${variant}\n/" .mismatches${count}
 		[ "$CONTINUEONERROR" ] || exit 1
 	else
 		rm -f .mismatches${count}
@@ -253,7 +253,7 @@ function process_config()
 	grep -E 'CONFIG_' .listnewconfig${count} > .newoptions${count}
 	if test -n "$NEWOPTIONS" && test -s .newoptions${count}
 	then
-		echo "Found unset config items in ${variant}, please set them to an appropriate value" >> .errors${count}
+		echo "Found unset config items in ${arch} ${variant}, please set them to an appropriate value" >> .errors${count}
 		cat .newoptions${count} >> .errors${count}
 		rm .newoptions${count}
 		RETURNCODE=1
@@ -264,7 +264,7 @@ function process_config()
 	grep -E 'config.*warning' .listnewconfig${count} > .warnings${count}
 	if test -n "$CHECKWARNINGS" && test -s .warnings${count}
 	then
-		echo "Found misconfigured config items in ${variant}, please set them to an appropriate value" >> .errors${count}
+		echo "Found misconfigured config items in ${arch} ${variant}, please set them to an appropriate value" >> .errors${count}
 		cat .warnings${count} >> .errors${count}
 		rm .warnings${count}
 		[ "$CONTINUEONERROR" ] || exit 1
