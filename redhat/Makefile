@@ -251,11 +251,6 @@ BASEVERSION:=$(SPECVERSION)-$(SPECBUILD)
 RELEASETAG:=$(PACKAGE_NAME)-$(BASEVERSION)
 SRPM:=$(SRPMS)/$(RELEASETAG)$(DIST).src.rpm
 
-# kabi variables
-KABI_TARBALL:=$(SOURCES)/kernel-abi-stablelists-$(BASEVERSION).tar.bz2
-KABIDW := $(REDHAT)/kabi-dwarf
-KABIDW_TARBALL:=$(SOURCES)/kernel-kabi-dw-$(BASEVERSION).tar.bz2
-
 #
 # This conditional statement is where fedora, centos, and other (aka RHEL)
 # specific values should be set.
@@ -270,6 +265,7 @@ ifeq ("$(DISTRO)", "fedora")
   # replace the tarball from one with upstream, rebuild, and then deploy
   # without changing anything else in the specfile.
   SPECTARFILE_RELEASE:=$(UPSTREAM_TARBALL_NAME)
+  SPECKABIVERSION:=$(SPECVERSION)
 else ifeq ("$(DISTRO)", "centos")
   SINGLE_TARBALL:=1
   RHDISTGIT_BRANCH:=c$(RHEL_MAJOR)s
@@ -280,6 +276,7 @@ else ifeq ("$(DISTRO)", "centos")
     BUILD_SCRATCH_TARGET:=c$(RHEL_MAJOR)s-candidate
   endif
   SPECTARFILE_RELEASE:=$(BASEVERSION)
+  SPECKABIVERSION:=$(BASEVERSION)
 else
   SINGLE_TARBALL:=1
   RHDISTGIT_BRANCH:=rhel-$(RHEL_MAJOR).$(RHEL_MINOR).0
@@ -287,6 +284,7 @@ else
     BUILD_SCRATCH_TARGET:=rhel-$(RHEL_MAJOR).$(RHEL_MINOR).0-test-pesign
   endif
   SPECTARFILE_RELEASE:=$(BASEVERSION)
+  SPECKABIVERSION:=$(BASEVERSION)
 endif
 
 ifndef BUILD_TARGET
@@ -295,6 +293,10 @@ endif
 
 TARFILE:=linux-$(SPECTARFILE_RELEASE).tar.xz
 TARBALL:=$(REDHAT)/$(TARFILE)
+
+KABI_TARBALL:=$(SOURCES)/kernel-abi-stablelists-$(SPECKABIVERSION).tar.bz2
+KABIDW := $(REDHAT)/kabi-dwarf
+KABIDW_TARBALL:=$(SOURCES)/kernel-kabi-dw-$(SPECKABIVERSION).tar.bz2
 
 include Makefile.rhpkg
 
