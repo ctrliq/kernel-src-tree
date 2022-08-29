@@ -96,6 +96,14 @@ You can now build the binary RPM packages however you would like:
    koji build --scratch rawhide redhat/rpm/SRPMS/kernel-*.src.rpm
    koji build --scratch eln redhat/rpm/SRPMS/kernel-*.src.rpm
 
+or
+
+.. code-block:: sh
+
+   # this target requires internal Red Hat network access and will always
+   # build against the latest RHEL major compose
+   make dist-brew
+
 Want to add a patch? Just apply it with ``git cherry-pick`` or ``git am``, and
 re-run ``make dist-srpm``. To modify the kernel configuration, make changes in
 ``redhat/configs/`` (consult the repository layout for details on this).
