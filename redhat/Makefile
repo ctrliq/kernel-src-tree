@@ -277,7 +277,7 @@ sources-rh: $(TARBALL) generate-testpatch-tmp setup-source dist-configs-check
 		README.rst \
 		$(SOURCES)/
 	@if [ "$(RELEASED_KERNEL)" -ne 0 ]; then \
-		cp keys/redhatsecureboot{301,302,303,501,ca5,ca3}.cer $(SOURCES)/; \
+		cp keys/redhatsecureboot{301,302,303,501,ca5,ca1}.cer $(SOURCES)/; \
 	else \
 		cp keys/redhatsecureboot{003,401,ca2,ca4}.cer $(SOURCES)/; \
 	fi
