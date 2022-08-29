@@ -41,4 +41,4 @@ The kernel name is constructed as
 
 $(PACKAGE_NAME)-$(SPECKVERSION).$(SPECKPATCHLEVEL).$(SPECKSUBLEVEL)-$(UPSTREAMBUILD)$(BUILD)$(LOCALVERSION)$(DIST)
 
-In general, the kernel follows the Fedora Naming Guidelines, `https://fedoraproject.org/wiki/Packaging:Naming?rd=Packaging:NamingGuidelines <https://fedoraproject.org/wiki/Packaging:Naming?rd=Packaging:NamingGuidelines`__.
+In general, the kernel follows the Fedora Naming Guidelines, `https://fedoraproject.org/wiki/Packaging:Naming?rd=Packaging:NamingGuidelines <https://fedoraproject.org/wiki/Packaging:Naming?rd=Packaging:NamingGuidelines>`__.
