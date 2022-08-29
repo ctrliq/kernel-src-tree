@@ -160,7 +160,21 @@ else
 	touch "$SOURCES"/patch-"$RPMVERSION"-redhat.patch
 fi
 
-# don't generate Patchlist.changelog file for RHEL
+# generate Patchlist.changelog file that holds the shas and commits not
+# included upstream and git commit url.
+ARK_COMMIT_URL="https://gitlab.com/cki-project/kernel-ark/-/commit"
+
+# sed convert
+# <sha> <description>
+# to
+# <ark_commit_url>/<sha>
+#  <sha> <description>
+#
+# May need to preserve word splitting in EXCLUDE_FILES
+# shellcheck disable=SC2086
+git log --no-merges --pretty=oneline --no-decorate ${UPSTREAM}.. $EXCLUDE_FILES | \
+	sed "s!^\([^ ]*\)!$ARK_COMMIT_URL/\1\n &!; s!\$!\n!" \
+	> "$SOURCES"/Patchlist.changelog
 
 # We depend on work splitting of BUILDOPTS
 # shellcheck disable=SC2086
