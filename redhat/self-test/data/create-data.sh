@@ -28,9 +28,9 @@ do
 	do
 		for DIST in .fc25 .el7
 		do
-			varfilename="${destdir}/${DISTRO}-${commit}${DIST}"
+			varfilename="${DISTRO}-${commit}${DIST}"
 
-			echo "building $varfilename"
+			echo "building ${destdir}/$varfilename"
 
 			# Ignored Makefile variables:
 			# CURDIR is a make special target and cannot be easily changed.
@@ -50,14 +50,14 @@ do
 				grep -v -w RHGITURL |\
 				grep -v -w RHDISTDATADIR |\
 				grep -v -w VARS |\
-				sort -u >& "${varfilename}" &
+				sort -u >& "${destdir}/${varfilename}" &
 
 			waitpids[${count}]=$!
 			((count++))
 
-			echo "building ${varfilename}.spec"
+			echo "building ${destdir}/${varfilename}.spec"
 			make RHSELFTESTDATA=1 DIST="${DIST}" DISTRO="${DISTRO}" HEAD=${commit} setup-source
-			 grep -Fvx -f "./kernel.spec.template" "$specfile" > "${varfilename}".spec
+			grep -Fvx -f "./kernel.spec.template" "$specfile" > "${destdir}"/"${varfilename}".spec
 		done
 
 		# There isn't an easy way to make sure the parallel execution doesn't go crazy
