@@ -16,6 +16,12 @@ ifdef PREBUILD_GIT_ONLY
   UPSTREAMBUILD_GIT_ONLY:=$(PREBUILD_GIT_ONLY)
 endif
 
+ifdef BUILD_SCRATCH_TARGET
+  # deprecated in 5.19.0
+  $(warning WARNING: BUILD_SCRATCH_TARGET will be deprecated in a later release, use BUILD_TARGET instead.)
+  BUILD_TARGET:=$(BUILD_SCRATCH_TARGET)
+endif
+
 include Makefile.variables
 # These entries are 'duplicates' of variables specified in Makefile.variables
 # that are used in the SPEC file.  Specifying these with a SPEC prefix indicates
@@ -233,8 +239,8 @@ SRPM:=$(SRPMS)/$(RELEASETAG)$(DIST).src.rpm
 ifeq ("$(DISTRO)", "fedora")
   SINGLE_TARBALL:=0
   RHDISTGIT_BRANCH:=rawhide
-  ifndef BUILD_SCRATCH_TARGET
-    BUILD_SCRATCH_TARGET:=temp-ark-rhel-8-test
+  ifndef BUILD_TARGET
+    BUILD_TARGET:=temp-ark-rhel-8-test
   endif
   # The Fedora tarfile name is based on an upstream tag as users may
   # replace the tarball from one with upstream, rebuild, and then deploy
@@ -247,23 +253,19 @@ else ifeq ("$(DISTRO)", "centos")
   ifndef BUILD_PROFILE
     BUILD_PROFILE:= -p stream
   endif
-  ifndef BUILD_SCRATCH_TARGET
-    BUILD_SCRATCH_TARGET:=c$(RHEL_MAJOR)s-candidate
+  ifndef BUILD_TARGET
+    BUILD_TARGET:=c$(RHEL_MAJOR)s-candidate
   endif
   SPECTARFILE_RELEASE:=$(BASEVERSION)
   SPECKABIVERSION:=$(BASEVERSION)
 else
   SINGLE_TARBALL:=1
   RHDISTGIT_BRANCH:=rhel-$(RHEL_MAJOR).$(RHEL_MINOR).0
-  ifndef BUILD_SCRATCH_TARGET
-    BUILD_SCRATCH_TARGET:=rhel-$(RHEL_MAJOR).$(RHEL_MINOR).0-test-pesign
+  ifndef BUILD_TARGET
+    BUILD_TARGET:=rhel-$(RHEL_MAJOR).$(RHEL_MINOR).0-test-pesign
   endif
   SPECTARFILE_RELEASE:=$(BASEVERSION)
   SPECKABIVERSION:=$(BASEVERSION)
-endif
-
-ifndef BUILD_TARGET
-  BUILD_TARGET:=$(BUILD_SCRATCH_TARGET)
 endif
 
 TARFILE:=linux-$(SPECTARFILE_RELEASE).tar.xz
