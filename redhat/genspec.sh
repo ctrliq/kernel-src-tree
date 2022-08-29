@@ -56,6 +56,8 @@ if [ "$PATCHLIST_URL" != "none" ]; then
 	SPECPATCHLIST_CHANGELOG=1
 fi
 
+SPECRELEASE="${PREBUILD}""${BUILD}""%{?buildid}%{?dist}"
+
 # self-test begin
 test -f "$SOURCES/$SPECFILE" &&
 	sed -i -e "
