@@ -189,7 +189,7 @@ KABI_TARBALL:=$(SOURCES)/kernel-abi-stablelists-$(KVERSION)-$(DISTRO_BUILD).tar.
 KABIDW := $(REDHAT)/kabi-dwarf
 KABIDW_TARBALL:=$(SOURCES)/kernel-kabi-dw-$(KVERSION)-$(DISTRO_BUILD).tar.bz2
 PKGRELEASE:=$(PREBUILD)$(BUILD)$(BUILDID)
-RPMVERSION:=$(RPMKVERSION).$(RPMKPATCHLEVEL)-$(PKGRELEASE)
+RPMVERSION:=$(RPMKVERSION).$(RPMKPATCHLEVEL).$(RPMKSUBLEVEL)-$(PKGRELEASE)
 SPECRELEASE:=$(PREBUILD)$(BUILD)%{?buildid}%{?dist}
 SRPM:=$(SRPMS)/$(PACKAGE_NAME)-$(KVERSION)-$(PKGRELEASE)$(DIST).src.rpm
 
@@ -560,7 +560,7 @@ dist-release-changed: setup-source
 dist-release: dist-clean-sources
 	@$(MAKE) dist-release-changed
 dist-release-tag:
-	@$(GIT) tag -a -m "$(PACKAGE_NAME)-$(KVERSION)-$(PKGRELEASE)" $(PACKAGE_NAME)-$(KVERSION)-$(PKGRELEASE)
+	@$(GIT) tag -a -m "$(PACKAGE_NAME)-$(RPMVERSION)" $(PACKAGE_NAME)-$(KVERSION)-$(PKGRELEASE)
 
 git-tree-check:
 	@if test -n "$(DIST_PUSH)" && test -z "$(shell $(GIT) remote get-url gitlab 2>/dev/null)"; then \
