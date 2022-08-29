@@ -1,6 +1,8 @@
 #!/usr/bin/env bats
 # Purpose: This test runs rpmlint on the source rpm.
 
+load test-lib.bash
+
 @test "rpmlint" {
 	if ! test -x /usr/bin/rpmlint; then
 		skip "The rpmlint package is not installed"
@@ -15,6 +17,5 @@
 
 	srpm=$(find "$BATS_TEST_DIRNAME"/.. -name "*.rpm")
 	run rpmlint $srpm
-	status=$?
-	[ "$status" = 0 ]
+	check_result
 }

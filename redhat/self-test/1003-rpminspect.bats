@@ -1,6 +1,8 @@
 #!/usr/bin/env bats
 # Purpose: This test runs rpminspect on the SRPM.
 
+load test-lib.bash
+
 @test "rpminspect" {
 	if ! test -x /usr/bin/rpminspect; then
 		skip "The rpminspect package is not installed"
@@ -15,5 +17,5 @@
 
 	srpm=$(find "$BATS_TEST_DIRNAME"/.. -name "*.rpm")
 	run rpminspect $srpm
-	[ "$status" = 0 ]
+	check_status
 }
