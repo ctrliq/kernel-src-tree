@@ -36,13 +36,6 @@ LC_TIME=
 # STAMP=$(echo $MARKER | cut -f 1 -d '-' | sed -e "s/v//"); # unused
 RPM_VERSION="$RPMVERSION-$PKGRELEASE";
 
-# We want to exclude changes in redhat/rhdocs tree from the changelog output.
-# Since the redhat/rhdocs is a separate git subtree, we can exclude the full
-# list of commits with "^" specifier against latest child from the subtree.
-# This is done this way to be compatible with old git versions which do not
-# have the pathspec '(exclude)' support
-EXCLUDE=$(git log -1 --format=%P ${0%/*}/rhdocs | cut -d ' ' -f 2)
-
 echo > "$clogf"
 
 lasttag=$(git rev-list --first-parent --grep="^\[redhat\] kernel-${RPMVERSION}" --max-count=1 HEAD)
@@ -62,7 +55,7 @@ UPSTREAM="$(git rev-parse -q --verify origin/$UPSTREAM_BRANCH || \
           git rev-parse -q --verify $UPSTREAM_BRANCH)"
  
 git log --topo-order --reverse --no-merges -z --format="- %s (%an)%n%b" \
-	^${UPSTREAM} "$lasttag".. -- ${EXCLUDE:+^$EXCLUDE} | ${0%/*}/genlog.py >> "$clogf"
+	^${UPSTREAM} "$lasttag".. -- ':!/redhat/rhdocs' | ${0%/*}/genlog.py >> "$clogf"
 
 grep -v "tagging $RPM_VERSION" "$clogf" > "$clogf.stripped"
 cp "$clogf.stripped" "$clogf"
