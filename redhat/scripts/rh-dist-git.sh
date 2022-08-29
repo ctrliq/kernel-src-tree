@@ -60,8 +60,10 @@ echo "Creating diff for review ($tmpdir/diff) and changelog"
 # differences were found
 diff -X "$REDHAT"/git/dontdiff -upr "$tmpdir/$PACKAGE_NAME" "$REDHAT"/rpm/SOURCES/ > "$tmpdir"/diff;
 # creating the changelog file
-"$REDHAT"/scripts/create_distgit_changelog.sh "$REDHAT/rpm/SOURCES/$PACKAGE_NAME".spec \
-	"$__ZSTREAM" "$PACKAGE_NAME" >"$tmpdir"/changelog
+
+# changelog has been created by genspec.sh, including Resolves line, just copy it here
+echo -e "${PACKAGE_NAME}-${RPMVERSION}\n" > $tmpdir/changelog
+awk '1;/^Resolves: /{exit};' $REDHAT/$CHANGELOG >> $tmpdir/changelog
 
 # all done
 echo "$tmpdir"

@@ -57,8 +57,6 @@ fi
 
 test -f "$SOURCES/$SPECFILE" &&
 	sed -i -e "
-	/%%CHANGELOG%%/r $SOURCES/$CHANGELOG
-	/%%CHANGELOG%%/d
 	s/%%BUILDID%%/$BUILDID_DEFINE/
 	s/%%RPMKVERSION%%/$RPMKVERSION/
 	s/%%RPMKPATCHLEVEL%%/$RPMKPATCHLEVEL/
@@ -85,12 +83,16 @@ done
 # The self-test data doesn't currently have tests for the changelog or patch file, so the
 # rest of the script can be ignored.  See redhat/Makefile setup-source target for related
 # test changes.
-[ -n "$RHSELFTESTDATA" ] && exit 0
+if [ -n "$RHSELFTESTDATA" ]; then
+	test -f "$SOURCES/$SPECFILE" &&
+		sed -i -e "
+		/%%CHANGELOG%%/r $SOURCES/$CHANGELOG
+		/%%CHANGELOG%%/d" "$SOURCES/$SPECFILE"
+	exit 0
+fi
 
 GIT_FORMAT="--format=- %s (%an)%n%N%n^^^NOTES-END^^^%n%b"
 GIT_NOTES="--notes=refs/notes/${RHEL_MAJOR}.${RHEL_MINOR}*"
-
-echo > "$clogf"
 
 lasttag=$(git rev-list --first-parent --grep="^\[redhat\] kernel-${RPMKVERSION}.${RPMKPATCHLEVEL}" --max-count=1 HEAD)
 # if we didn't find the proper tag, assume this is the first release
@@ -106,11 +108,13 @@ fi
 echo "Gathering new log entries since $lasttag"
 # master is expected to track mainline.
 
-git log --topo-order --reverse --no-merges -z $GIT_NOTES "$GIT_FORMAT" \
-	^"${UPSTREAM}" "$lasttag".. -- ':!/redhat/rhdocs' | "${0%/*}"/genlog.py >> "$clogf"
+cname="$(git var GIT_COMMITTER_IDENT |sed 's/>.*/>/')"
+cdate="$(LC_ALL=C date +"%a %b %d %Y")"
+cversion="[$RPMVERSION]";
+echo "* $cdate $cname $cversion" > "$clogf"
 
-grep -v "tagging $RPMVERSION" "$clogf" > "$clogf.stripped"
-cp "$clogf.stripped" "$clogf"
+git log --topo-order --no-merges -z $GIT_NOTES "$GIT_FORMAT" \
+	^"${UPSTREAM}" "$lasttag".. -- ':!/redhat/rhdocs' | "${0%/*}"/genlog.py >> "$clogf"
 
 if [ "$HIDE_REDHAT" = "1" ]; then
 	grep -v -e "^- \[redhat\]" "$clogf" |
@@ -144,24 +148,24 @@ if [ -n "$(git log --oneline --first-parent --grep="Merge ark patches" "$lasttag
 	echo "- Merge ark-patches" >> "$clogf"
 fi
 
-LENGTH=$(wc -l "$clogf" | awk '{print $1}')
-
-#the changelog was created in reverse order
-#also remove the blank on top, if it exists
-#left by the 'print version\n' logic above
-cname="$(git var GIT_COMMITTER_IDENT |sed 's/>.*/>/')"
-cdate="$(LC_ALL=C date +"%a %b %d %Y")"
-cversion="[$RPMVERSION]";
-tac "$clogf" | sed "1{/^$/d; /^- /i\
-* $cdate $cname $cversion
-	}" > "$clogf.rev"
-
+# during rh-dist-git genspec runs again and generates empty changelog
+# create empty file to avoid adding extra header to changelog
+LENGTH=$(grep "^-" $clogf | wc -l | awk '{print $1}')
 if [ "$LENGTH" = 0 ]; then
-	rm -f "$clogf.rev"; touch "$clogf.rev"
+	rm -f $clogf
+	touch $clogf
 fi
 
-cat "$clogf.rev" "$SOURCES/$CHANGELOG" > "$clogf.full"
+cat "$clogf" "$SOURCES/$CHANGELOG" > "$clogf.full"
 mv -f "$clogf.full" "$SOURCES/$CHANGELOG"
+
+# genlog.py generates Resolves lines as well, strip these from RPM changelog
+cat "$SOURCES/$CHANGELOG" | grep -v -e "^Resolves: " > $clogf.stripped
+
+test -f "$SOURCES/$SPECFILE" &&
+	sed -i -e "
+	/%%CHANGELOG%%/r $clogf.stripped
+	/%%CHANGELOG%%/d" "$SOURCES/$SPECFILE"
 
 echo "MARKER is $MARKER"
 
@@ -179,4 +183,4 @@ else
 	touch "${SOURCES}/patch-${RPMKVERSION}.${RPMKPATCHLEVEL}"-redhat.patch
 fi
 
-rm -f "$clogf"{,.rev,.stripped};
+rm -f "$clogf"{,.stripped};
