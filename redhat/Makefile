@@ -196,7 +196,7 @@ else
   endif
 endif
 
-ifeq ("$(NO_CONFIGCHECKS)","1")
+ifdef NO_CONFIGCHECKS
    PROCESS_CONFIGS_OPTS=
    PROCESS_CONFIGS_CHECK_OPTS=
    BUILDOPTS += -configchecks
