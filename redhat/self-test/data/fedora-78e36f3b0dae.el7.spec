@@ -3022,18 +3022,6 @@ fi
 #
 #
 %changelog
-* Tue Mar 29 2022 Prarit Bhargava <prarit@redhat.com> [5.17.0-0.rc0.78e36f3b0dae.6.test]
-- 78e36f3b0dae rebase
-- redhat/self-test: Add spec file data (Prarit Bhargava)
-- redhat/self-test: Add better dist-dump-variables test (Prarit Bhargava)
-- redhat/self-test: Add variable test data (Prarit Bhargava)
-- Fedora config updates to fix process_configs (Justin M. Forbes)
-- redhat: Fix release tagging (Prarit Bhargava)
-- redhat/self-test: Fix version tag test (Prarit Bhargava)
-- redhat/self-test: Fix BUILD verification test (Prarit Bhargava)
-- redhat/self-test: Cleanup SRPM related self-tests (Prarit Bhargava)
-- redhat/self-test: Fix shellcheck test (Prarit Bhargava)
-
 * Fri Mar 25 2022 Fedora Kernel Team <kernel-team@fedoraproject.org> [5.18-0.rc0.34af78c4e616.5]
 - redhat/configs: Disable watchdog components (Prarit Bhargava)
 - redhat/README.Makefile: Add a Makefile README file (Prarit Bhargava)
