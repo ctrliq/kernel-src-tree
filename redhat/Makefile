@@ -1,3 +1,4 @@
+GIT ?= git
 include Makefile.common
 include Makefile.rhpkg
 
