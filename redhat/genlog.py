@@ -57,12 +57,6 @@ def parse_commit(commit):
     bug_set = set()
     zbug_set = set()
     for line in lines[1:]:
-        # Metadata in git notes has priority over commit log
-        # If we found any BZ/ZBZ/CVE in git notes, we ignore commit log
-        if line == "^^^NOTES-END^^^":
-            if bug_set or zbug_set or cve_set:
-                break
-
         # Process Bugzilla and ZStream Bugzilla entries
         bug_set.update(find_bz_in_line(line, 'Bugzilla'))
         zbug_set.update(find_bz_in_line(line, 'Z-Bugzilla'))

@@ -13,18 +13,19 @@ KPATCHLEVEL=$6
 KSUBLEVEL=$7
 DISTRO_BUILD=$8
 SPECRELEASE=$9
-BUILDOPTS=${10}
-MARKER=${11}
-LAST_MARKER=${12}
-SINGLE_TARBALL=${13}
-TARFILE_RELEASE=${14}
-SNAPSHOT=${15}
-UPSTREAM_BRANCH=${16}
-INCLUDE_FEDORA_FILES=${17}
-INCLUDE_RHEL_FILES=${18}
-RHEL_MAJOR=${19}
-RHEL_MINOR=${20}
-BUILDID=${21}
+ZSTREAM_FLAG=${10}
+BUILDOPTS=${11}
+MARKER=${12}
+LAST_MARKER=${13}
+SINGLE_TARBALL=${14}
+TARFILE_RELEASE=${15}
+SNAPSHOT=${16}
+UPSTREAM_BRANCH=${17}
+INCLUDE_FEDORA_FILES=${18}
+INCLUDE_RHEL_FILES=${19}
+RHEL_MAJOR=${20}
+RHEL_MINOR=${21}
+BUILDID=${22}
 
 RPMVERSION=${KVERSION}.${KPATCHLEVEL}.${KSUBLEVEL}
 clogf="$SOURCES/changelog"
@@ -44,8 +45,12 @@ RPM_VERSION="$RPMVERSION-$PKGRELEASE";
 # have the pathspec '(exclude)' support
 EXCLUDE=$(git log -1 --format=%P ${0%/*}/rhdocs | cut -d ' ' -f 2)
 
-GIT_FORMAT="--format=- %s (%an)%n%N%n^^^NOTES-END^^^%n%b"
-GIT_NOTES="--notes=refs/notes/${RHEL_MAJOR}.${RHEL_MINOR}*"
+GIT_FORMAT="--format=- %s (%an)%n%b"
+GIT_NOTES=""
+if [ "$ZSTREAM_FLAG" != "no" ]; then
+       GIT_FORMAT="--format=- %s (%an)%n%N"
+       GIT_NOTES="--notes=refs/notes/${RHEL_MAJOR}.${RHEL_MINOR}*"
+fi
 
 echo > "$clogf"
 
