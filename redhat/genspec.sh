@@ -85,8 +85,8 @@ done
 if [ -n "$RHSELFTESTDATA" ]; then
 	test -f "$SOURCES/$SPECFILE" &&
 		sed -i -e "
-		/%%CHANGELOG%%/r $SOURCES/$CHANGELOG
-		/%%CHANGELOG%%/d" "$SOURCES/$SPECFILE"
+		/%%SPECCHANGELOG%%/r $SOURCES/$SPECCHANGELOG
+		/%%SPECCHANGELOG%%/d" "$SOURCES/$SPECFILE"
 	exit 0
 fi
 
@@ -130,7 +130,7 @@ fi
 # This means we need to zap entries that are already present in the changelog.
 if [ "$MARKER" != "$LAST_MARKER" ]; then
 	# awk trick to get all unique lines
-	awk '!seen[$0]++' "$SOURCES/$CHANGELOG" "$clogf" > "$clogf.unique"
+	awk '!seen[$0]++' "$SOURCES/$SPECCHANGELOG" "$clogf" > "$clogf.unique"
 	# sed trick to get the end of the changelog minus the line
 	sed -e '1,/# END OF CHANGELOG/ d' "$clogf.unique" > "$clogf.tmp"
 	# Add an explicit entry to indicate a rebase.
@@ -155,16 +155,16 @@ if [ "$LENGTH" = 0 ]; then
 	touch $clogf
 fi
 
-cat "$clogf" "$SOURCES/$CHANGELOG" > "$clogf.full"
-mv -f "$clogf.full" "$SOURCES/$CHANGELOG"
+cat "$clogf" "$SOURCES/$SPECCHANGELOG" > "$clogf.full"
+mv -f "$clogf.full" "$SOURCES/$SPECCHANGELOG"
 
 # genlog.py generates Resolves lines as well, strip these from RPM changelog
-cat "$SOURCES/$CHANGELOG" | grep -v -e "^Resolves: " > $clogf.stripped
+cat "$SOURCES/$SPECCHANGELOG" | grep -v -e "^Resolves: " > $clogf.stripped
 
 test -f "$SOURCES/$SPECFILE" &&
 	sed -i -e "
-	/%%CHANGELOG%%/r $clogf.stripped
-	/%%CHANGELOG%%/d" "$SOURCES/$SPECFILE"
+	/%%SPECCHANGELOG%%/r $clogf.stripped
+	/%%SPECCHANGELOG%%/d" "$SOURCES/$SPECFILE"
 
 echo "MARKER is $MARKER"
 

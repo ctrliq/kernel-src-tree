@@ -69,7 +69,7 @@ RPM:=$(REDHAT)/rpm
 SRPMS:=$(RPM)/SRPMS
 SOURCES:=$(RPM)/SOURCES
 TESTPATCH:=$(REDHAT)/linux-kernel-test.patch
-CHANGELOG:=$(PACKAGE_NAME).changelog-$(RHEL_MAJOR).$(RHEL_MINOR)
+SPECCHANGELOG:=$(PACKAGE_NAME).changelog-$(RHEL_MAJOR).$(RHEL_MINOR)
 CHANGELOG_PREV:=$(PACKAGE_NAME).changelog-$(RHEL_MAJOR).$(shell expr $(RHEL_MINOR) - 1)
 ARCH_LIST=aarch64 ppc64le s390x x86_64
 
@@ -462,14 +462,14 @@ dist-buildreq-check: setup-source
 
 setup-source: dist-git-version-check dist-clean-sources
 	@cp $(REDHAT)/$(SPECFILE).template $(SOURCES)/$(SPECFILE)
-	@if [ ! -e  $(REDHAT)/$(CHANGELOG) ]; then \
-		echo "Creating $(CHANGELOG) as copy of $(CHANGELOG_PREV)"; \
-		cp $(REDHAT)/$(CHANGELOG_PREV) $(REDHAT)/$(CHANGELOG); \
+	@if [ ! -e  $(REDHAT)/$(SPECCHANGELOG) ]; then \
+		echo "Creating $(SPECCHANGELOG) as copy of $(CHANGELOG_PREV)"; \
+		cp $(REDHAT)/$(CHANGELOG_PREV) $(REDHAT)/$(SPECCHANGELOG); \
 	fi
 	@if [ -z "$(RHSELFTESTDATA)" ]; then \
-		cp $(REDHAT)/$(CHANGELOG) $(SOURCES)/$(CHANGELOG); \
+		cp $(REDHAT)/$(SPECCHANGELOG) $(SOURCES)/$(SPECCHANGELOG); \
 	else \
-		echo "Mon Mar 28 2022 Fedora Kernel Team <kernel-team@fedoraproject.org> [$(RPMVERSION)]" > $(SOURCES)/$(CHANGELOG); \
+		echo "Mon Mar 28 2022 Fedora Kernel Team <kernel-team@fedoraproject.org> [$(RPMVERSION)]" > $(SOURCES)/$(SPECCHANGELOG); \
 	fi
 	@if [ -z "$(PATCHLIST_URL)" ]; then \
 		echo "Error: PATCHLIST_URL must be set (to 'none' or any URL)"; \
@@ -568,19 +568,19 @@ dist-rpm-baseonly: dist-sources do-rpmbuild
 
 # unless you know what you're doing, you don't want to use the next four ones
 dist-release-finish: setup-source
-	@cp $(SOURCES)/$(CHANGELOG) $(REDHAT)/$(CHANGELOG)
-	@$(GIT) add $(REDHAT)/$(CHANGELOG)
+	@cp $(SOURCES)/$(SPECCHANGELOG) $(REDHAT)/$(SPECCHANGELOG)
+	@$(GIT) add $(REDHAT)/$(SPECCHANGELOG)
 	@$(GIT) add $(REDHAT)/marker
-	@$(GIT) commit -s ../Makefile.rhelver $(REDHAT)/marker $(REDHAT)/$(CHANGELOG) $(PACKAGE_NAME).spec.template -m "[redhat] $(PACKAGE_NAME)-$(RPMVERSION)"
+	@$(GIT) commit -s ../Makefile.rhelver $(REDHAT)/marker $(REDHAT)/$(SPECCHANGELOG) $(PACKAGE_NAME).spec.template -m "[redhat] $(PACKAGE_NAME)-$(RPMVERSION)"
 dist-release-changed: setup-source
-	@cp $(SOURCES)/$(CHANGELOG) $(REDHAT)/$(CHANGELOG)
+	@cp $(SOURCES)/$(SPECCHANGELOG) $(REDHAT)/$(SPECCHANGELOG)
 	@echo $(MARKER) > $(REDHAT)/marker
 	@# if neither changelog nor marker was updated, skip bumping a release
 	@$(GIT) update-index -q --really-refresh
 	@if $(GIT) diff-index --quiet HEAD; then \
 		echo "Nothing changed, skipping updates"; \
 	else \
-		$(GIT) checkout -- $(REDHAT)/$(CHANGELOG); \
+		$(GIT) checkout -- $(REDHAT)/$(SPECCHANGELOG); \
 		$(REDHAT)/scripts/new_release.sh $(REDHAT) $(__YSTREAM) $(__ZSTREAM) $(BUMP_RELEASE); \
 		$(MAKE) dist-release-finish; \
 	fi
