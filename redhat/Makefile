@@ -397,11 +397,7 @@ dist-stub-key:
 # force tarball to be regenerated if HEAD changes
 .PHONY:	$(TARBALL)
 $(TARBALL):
-	@if [ $(SINGLE_TARBALL) -eq 1 ]; then \
-		scripts/create-tarball.sh $(GITID) linux-$(RPMVERSION); \
-	else \
-		scripts/create-tarball.sh $(MARKER) linux-$(TARFILE_RELEASE); \
-	fi
+	@scripts/create-tarball.sh
 
 .PHONY: $(KABI_TARBALL)
 $(KABI_TARBALL):
