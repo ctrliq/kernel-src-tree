@@ -48,14 +48,9 @@ fi
 # If the markers aren't the same then this a rebase.
 # This means we need to zap entries that are already present in the changelog.
 if [ "$MARKER" != "$LAST_MARKER" ]; then
-	# awk trick to get all unique lines
-	awk '!seen[$0]++' "$SOURCES/$SPECCHANGELOG" "$clogf" > "$clogf.unique"
-	# sed trick to get the end of the changelog minus the line
-	sed -e '1,/# END OF CHANGELOG/ d' "$clogf.unique" > "$clogf.tmp"
-	# Add an explicit entry to indicate a rebase.
-	echo "" > "$clogf"
-	echo -e "- $MARKER rebase" | cat "$clogf.tmp" - >> "$clogf"
-	rm "$clogf.tmp" "$clogf.unique"
+	# genlog.py always adds a Resolves: line, thus we
+	# can insert the rebase changelog item before it
+	sed -i "s/\(^Resolves:.*\)/- $MARKER rebase\n\1/" "$clogf"
 fi
 
 # during rh-dist-git genspec runs again and generates empty changelog
