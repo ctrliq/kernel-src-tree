@@ -146,7 +146,7 @@ dist-rhel-configs: dist-configs
 rh-configs: dist-rhel-configs
 
 dist-configs-check: dist-configs-prep
-	+cd $(REDHAT)/configs; ./process_configs.sh $(PROCESS_CONFIGS_CHECK_OPTS) $(PACKAGE_NAME) "" "" "" "$(RHJOBS)"
+	+cd $(REDHAT)/configs; ./process_configs.sh $(PROCESS_CONFIGS_CHECK_OPTS) $(PACKAGE_NAME)
 
 dist-configs-prep: dist-clean-configs dist-buildreq-check
 	+cd $(REDHAT)/configs; ./build_configs.sh "partial" "$(ARCH_MACH)" "snip" "$(RHJOBS)"
