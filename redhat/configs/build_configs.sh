@@ -106,8 +106,6 @@ function merge_configs()
 		echo "# s390" > "$name";;
 	"armv7hl")
 		echo "# arm" > "$name";;
-	"i686")
-		echo "# i386" > "$name";;
 	*)
 		echo "# $arch" > "$name";;
 	esac
