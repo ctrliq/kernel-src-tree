@@ -87,6 +87,13 @@ done
 # test changes.
 [ -n "$RHSELFTESTDATA" ] && exit 0
 
+GIT_FORMAT="--format=- %s (%an)%n%b"
+GIT_NOTES=""
+if [ "$__ZSTREAM" != "no" ]; then
+       GIT_FORMAT="--format=- %s (%an)%n%N"
+       GIT_NOTES="--notes=refs/notes/${RHEL_MAJOR}.${RHEL_MINOR}*"
+fi
+
 echo > "$clogf"
 
 lasttag=$(git rev-list --first-parent --grep="^\[redhat\] kernel-${RPMKVERSION}.${RPMKPATCHLEVEL}" --max-count=1 HEAD)
@@ -103,7 +110,7 @@ fi
 echo "Gathering new log entries since $lasttag"
 # master is expected to track mainline.
 
-git log --topo-order --reverse --no-merges -z --format="- %s (%an)%n%b" \
+git log --topo-order --reverse --no-merges -z $GIT_NOTES "$GIT_FORMAT" \
 	^"${UPSTREAM}" "$lasttag".. -- ':!/redhat/rhdocs' | "${0%/*}"/genlog.py >> "$clogf"
 
 grep -v "tagging $RPMVERSION" "$clogf" > "$clogf.stripped"
