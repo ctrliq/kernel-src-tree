@@ -113,7 +113,7 @@ echo "Gathering new log entries since $lasttag"
 
 cname="$(git var GIT_COMMITTER_IDENT |sed 's/>.*/>/')"
 cdate="$(LC_ALL=C date +"%a %b %d %Y")"
-cversion="[$RPMVERSION]";
+cversion="[$BASEVERSION]";
 echo "* $cdate $cname $cversion" > "$clogf"
 
 git log --topo-order --no-merges -z "$GIT_NOTES" "$GIT_FORMAT" \
