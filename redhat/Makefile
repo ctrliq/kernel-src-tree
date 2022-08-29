@@ -179,6 +179,8 @@ ifeq ($(VERSION_ON_UPSTREAM),1)
     endif
     UPSTREAM_TARBALL_NAME:=$(patsubst v%,%,$(_TAG))
   endif
+else
+  SNAPSHOT:=0
 endif
 
 KVERSION:=$(RPMKVERSION).$(RPMKPATCHLEVEL).$(RPMKSUBLEVEL)
