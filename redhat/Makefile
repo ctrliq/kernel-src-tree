@@ -3,21 +3,6 @@
 #
 # This section is intentionally left at the top of the Makefile so it won't be ignored.
 #
-ifdef BREW_FLAGS
-  # deprecated in 5.17.0
-  $(warning WARNING: BREW_FLAGS will be deprecated in a later release, use BUILD_FLAGS instead.)
-endif
-
-ifdef KOJI_FLAGS
-  # deprecated in 5.17.0
-  $(warning WARNING: KOJI_FLAGS will be deprecated in a later release, use BUILD_FLAGS instead.)
-endif
-
-ifdef TEST_FLAGS
-  # deprecated in 5.17.0
-  $(warning WARNING: TEST_FLAGS will be deprecated in a later release, use BUILD_FLAGS instead.)
-endif
-
 ifdef SINGLE_TARBALL
   # The commit that introduced this code can be reverted if there are users of
   # this variable.
@@ -97,16 +82,6 @@ ifndef DISTRO
   else
     DISTRO := rhel
   endif
-endif
-
-ifndef BUILD_FLAGS
-  ifeq ($(filter $(MAKECMDGOALS),dist-brew distg-brew),)
-	BUILD_FLAGS := $(BREW_FLAGS)
-  endif
-  ifeq ($(filter $(MAKECMDGOALS),dist-koji distg-koji),)
-	BUILD_FLAGS := $(KOJI_FLAGS)
-  endif
-  BUILD_FLAGS += $(TEST_FLAGS)
 endif
 
 ifndef RHJOBS
@@ -462,26 +437,6 @@ $(KABIDW_TARBALL):
 		mkdir -p $(KABIDW)/base; \
 	fi
 	@(cd kabi-dwarf && tar cjf $(KABIDW_TARBALL) base run_kabi-dw.sh)
-
-dist-tarball: $(TARBALL)
-	# deprecated at 5.17.0
-	@echo "WARNING: This target will be deprecated in a future release."
-	@echo "redhat/$(TARFILE)"
-
-dist-kernelrelease:
-	# deprecated at 5.17.0
-	@echo "WARNING: This target will be deprecated in a future release."
-	@echo $(PACKAGE_NAME)-$(BASEVERSION)
-
-dist-kernelversion:
-	# deprecated at 5.17.0
-	@echo "WARNING: This target will be deprecated in a future release."
-	@echo $(BASEVERSION)
-
-dist-specfile: setup-source
-	# deprecated at 5.17.0
-	@echo "WARNING: This target will be deprecated in a future release."
-	@echo $(SOURCES)/$(SPECFILE)
 
 dist-git-version-check:
 	@# genspec.sh uses pathspec magic that wasn't introduced until version 2.13
