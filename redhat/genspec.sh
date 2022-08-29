@@ -1,7 +1,6 @@
 #!/bin/bash
 
 LAST_MARKER=$(cat $REDHAT/marker)
-RPMVERSION=${RPMKVERSION}.${RPMKPATCHLEVEL}
 clogf="$SOURCES/changelog"
 # hide [redhat] entries from changelog
 HIDE_REDHAT=1;
@@ -10,11 +9,10 @@ HIDE_UNSUPPORTED_ARCH=1;
 # override LC_TIME to avoid date conflicts when building the srpm
 LC_TIME=
 # STAMP=$(echo $MARKER | cut -f 1 -d '-' | sed -e "s/v//"); # unused
-RPM_VERSION="$RPMVERSION-$PKGRELEASE";
 
 echo > "$clogf"
 
-lasttag=$(git rev-list --first-parent --grep="^\[redhat\] kernel-${RPMVERSION}" --max-count=1 HEAD)
+lasttag=$(git rev-list --first-parent --grep="^\[redhat\] kernel-${RPMKVERSION}.${RPMKPATCHLEVEL}" --max-count=1 HEAD)
 # if we didn't find the proper tag, assume this is the first release
 if [[ -z $lasttag ]]; then
     if [[ -z ${MARKER//[0-9a-f]/} ]]; then
@@ -33,7 +31,7 @@ UPSTREAM="$(git rev-parse -q --verify origin/$UPSTREAM_BRANCH || \
 git log --topo-order --reverse --no-merges -z --format="- %s (%an)%n%b" \
 	^${UPSTREAM} "$lasttag".. -- ':!/redhat/rhdocs' | ${0%/*}/genlog.py >> "$clogf"
 
-grep -v "tagging $RPM_VERSION" "$clogf" > "$clogf.stripped"
+grep -v "tagging $RPMVERSION" "$clogf" > "$clogf.stripped"
 cp "$clogf.stripped" "$clogf"
 
 if [ "$HIDE_REDHAT" = "1" ]; then
@@ -75,7 +73,7 @@ LENGTH=$(wc -l "$clogf" | awk '{print $1}')
 #left by the 'print version\n' logic above
 cname="$(git var GIT_COMMITTER_IDENT |sed 's/>.*/>/')"
 cdate="$(LC_ALL=C date +"%a %b %d %Y")"
-cversion="[$RPM_VERSION]";
+cversion="[$RPMVERSION]";
 tac "$clogf" | sed "1{/^$/d; /^- /i\
 * $cdate $cname $cversion
 	}" > "$clogf.rev"
@@ -153,10 +151,10 @@ if [ "$SINGLE_TARBALL" = 0 ]; then
 	# May need to preserve word splitting in EXCLUDE_FILES
 	# shellcheck disable=SC2086
 	git diff -p --no-renames --stat "$MARKER"..  $EXCLUDE_FILES \
-		> "$SOURCES"/patch-"$RPMVERSION"-redhat.patch
+		> "$SOURCES"/patch-"${RPMKVERSION}.${RPMKPATCHLEVEL}"-redhat.patch
 else
 	# Need an empty file for dist-git compatibility
-	touch "$SOURCES"/patch-"$RPMVERSION"-redhat.patch
+	touch "$SOURCES"/patch-"${RPMKVERSION}.${RPMKPATCHLEVEL}"-redhat.patch
 fi
 
 # We depend on work splitting of BUILDOPTS
