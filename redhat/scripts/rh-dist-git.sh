@@ -62,9 +62,19 @@ echo "Copying updated files"
 echo "Uploading new tarballs"
 # upload tarballs
 sed -i "/linux-.*.tar.xz/d" "$tmpdir/$package_name"/{sources,.gitignore};
-sed -i "/kernel-abi-stablelists.*.tar.bz2/d" "$tmpdir/$package_name"/{sources,.gitignore};
-sed -i "/kernel-kabi-dw-.*.tar.bz2/d" "$tmpdir/$package_name"/{sources,.gitignore};
-upload_list="$rhdistgit_tarball $rhdistgit_kabi_tarball $rhdistgit_kabidw_tarball"
+upload_list="$rhdistgit_tarball"
+
+# Only upload kernel-abi-stablelists tarball if its release counter changed.
+if [ "$rhdistgit_zstream_flag" == "no" ]; then
+	if ! grep -q "$rhdistgit_kabi_tarball" "$tmpdir/$package_name"/sources; then
+		sed -i "/kernel-abi-stablelists.*.tar.bz2/d" "$tmpdir/$package_name"/{sources,.gitignore};
+		upload_list="$upload_list $rhdistgit_kabi_tarball"
+	fi
+	if ! grep -q "$rhdistgit_kabidw_tarball" "$tmpdir/$package_name"/sources; then
+		sed -i "/kernel-kabi-dw-.*.tar.bz2/d" "$tmpdir/$package_name"/{sources,.gitignore};
+		upload_list="$upload_list $rhdistgit_kabidw_tarball"
+	fi
+fi
 
 # We depend on word splitting here:
 # shellcheck disable=SC2086
