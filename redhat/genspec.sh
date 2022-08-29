@@ -62,7 +62,7 @@ UPSTREAM="$(git rev-parse -q --verify origin/$UPSTREAM_BRANCH || \
           git rev-parse -q --verify $UPSTREAM_BRANCH)"
  
 git log --topo-order --reverse --no-merges -z --format="- %s (%an)%n%b" \
-	^${UPSTREAM} ${EXCLUDE:+^$EXCLUDE} "$lasttag".. | ${0%/*}/genlog.py >> "$clogf"
+	^${UPSTREAM} "$lasttag".. -- ${EXCLUDE:+^$EXCLUDE} | ${0%/*}/genlog.py >> "$clogf"
 
 grep -v "tagging $RPM_VERSION" "$clogf" > "$clogf.stripped"
 cp "$clogf.stripped" "$clogf"
