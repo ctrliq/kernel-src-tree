@@ -222,13 +222,15 @@ KABIDW := $(REDHAT)/kabi-dwarf
 
 include Makefile.cross
 
-RHJOBS?=$(shell j=$$(echo $(MAKEFLAGS) | grep -Eo "\ -j[0-9]*" | xargs ); \
-	if [ -z "$${j}" ]; then \
-		echo "1"; \
-	else \
-		j=$$(echo "$${j}" | tr -d "\-j"); \
-		[ -z "$${j}" ] && nproc --all || echo $${j}; \
-	fi)
+ifndef RHJOBS
+  RHJOBS=$(shell j=$$(echo $(MAKEFLAGS) | grep -Eo "\ -j[0-9]*" | xargs ); \
+	  if [ -z "$${j}" ]; then \
+	  	echo "1"; \
+	  else \
+	  	j=$$(echo "$${j}" | tr -d "\-j"); \
+	  	[ -z "$${j}" ] && nproc --all || echo $${j}; \
+	  fi)
+endif
 
 ifndef BUILD_FLAGS
   ifeq ($(filter $(MAKECMDGOALS),dist-brew distg-brew),)
