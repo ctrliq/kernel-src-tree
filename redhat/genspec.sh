@@ -40,7 +40,7 @@ EXCLUDE_FILES=":(exclude,top).get_maintainer.conf \
 
 # If PATCHLIST_URL is not set to "none", generate Patchlist.changelog file that
 # holds the shas and commits not included upstream and git commit url.
-PATCHLIST_CHANGELOG=0
+SPECPATCHLIST_CHANGELOG=0
 if [ "$PATCHLIST_URL" != "none" ]; then
 	# sed convert
 	# <sha> <description>
@@ -53,7 +53,7 @@ if [ "$PATCHLIST_URL" != "none" ]; then
 	git log --no-merges --pretty=oneline --no-decorate ${UPSTREAM}.. $EXCLUDE_FILES | \
 		sed "s!^\([^ ]*\)!$PATCHLIST_URL/\1\n &!; s!\$!\n!" \
 		> "$SOURCES"/Patchlist.changelog
-	PATCHLIST_CHANGELOG=1
+	SPECPATCHLIST_CHANGELOG=1
 fi
 
 test -f "$SOURCES/$SPECFILE" &&
@@ -67,7 +67,7 @@ test -f "$SOURCES/$SPECFILE" &&
 	s/%%SPECDEBUG_BUILDS_ENABLED%%/$SPECDEBUG_BUILDS_ENABLED/
 	s/%%INCLUDE_FEDORA_FILES%%/$INCLUDE_FEDORA_FILES/
 	s/%%INCLUDE_RHEL_FILES%%/$INCLUDE_RHEL_FILES/
-	s/%%PATCHLIST_CHANGELOG%%/$PATCHLIST_CHANGELOG/
+	s/%%SPECPATCHLIST_CHANGELOG%%/$SPECPATCHLIST_CHANGELOG/
 	s/%%SPECVERSION%%/$SPECVERSION/
 	s/%%TARFILE_RELEASE%%/$TARFILE_RELEASE/" "$SOURCES/$SPECFILE"
 
