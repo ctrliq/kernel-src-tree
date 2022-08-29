@@ -32,28 +32,25 @@ do
 
 			echo "building $varfilename"
 
-			# CURDIR is a make special target and cannot be easily changed.  Omit
-			# CURDIR from the output.
+			# Ignored Makefile variables:
+			# CURDIR is a make special target and cannot be easily changed.
 			# UPSTREAM is the base merge commit and can change from day-to-day as
-			# the tree is changed.  Omit UPSTREAM from the output.
+			# the tree is changed.
 			# RHEL_RELEASE can change build-to-build.
 			# SHELL can change depending on user's environment
-			make RHSELFTESTDATA=1 DIST="${DIST}" DISTRO="${DISTRO}" HEAD=${commit} dist-dump-variables | grep "=" | grep -v CURDIR | grep -v -w UPSTREAM | grep -v -w RHEL_RELEASE | grep -v -w SHELL >& "${varfilename}"
-
-			# When executed from a script, the variables in Makefile.variables are
-			# listed as having origin 'environment'.  This is because the script
-			# inherits the variables from the 'export' command in the redhat/Makefile.
-			# The 'dist-dump-variables' target explicitly omits these variables from
-			# its output.  As a workaround, read in the variables and output them to
-			# the data file.
-			# shellcheck disable=SC2002
-			cat Makefile.variables | grep -v "^#" | sed '/^$/d' | tr -d " " | awk -F "?=|:=" '{print $1}' | while read -r VAR
-			do
-				[ "$VAR" == "RHDISTDATADIR" ] && continue
-				[ "$VAR" == "RHGITURL" ] && continue
-				[ "$VAR" == "BUILD" ] && continue
-				echo "$VAR=${!VAR}"
-			done >> "${varfilename}"
+			# RHGITURL may change depending on the user's method of cloning
+			# RHDISTDATADIR will change based on these tests
+			# VARS is a list of variables added for the 'dist-dump-variables' target
+			# and can be ignored.
+			make RHSELFTESTDATA=1 DIST="${DIST}" DISTRO="${DISTRO}" HEAD=${commit} dist-dump-variables | grep "=" |\
+				grep -v -w CURDIR |\
+				grep -v -w UPSTREAM |\
+				grep -v -w RHEL_RELEASE |\
+				grep -v -w SHELL |\
+				grep -v -w RHGITURL |\
+				grep -v -w RHDISTDATADIR |\
+				grep -v -w VARS |\
+				sort -u >& "${varfilename}"
 
 			echo "building ${varfilename}.spec"
 			make RHSELFTESTDATA=1 DIST="${DIST}" DISTRO="${DISTRO}" HEAD=${commit} setup-source
