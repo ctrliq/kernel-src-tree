@@ -60,8 +60,6 @@ switch_to_toplevel()
 
 checkoptions()
 {
-	count=$3
-
 	/usr/bin/awk '
 
 		/is not set/ {
@@ -84,10 +82,10 @@ checkoptions()
 					 print "Found "a[1]"="a[2]" after generation, had " a[1]"="configs[a[1]]" in Source tree";
 			}
 		}
-	' "$1" "$2" > .mismatches${count}
+	' "$1" "$2" > .mismatches
 
 	checkoptions_error=false
-	if test -s .mismatches${count}
+	if test -s .mismatches
 	then
 		while read -r LINE
 		do
@@ -99,12 +97,12 @@ checkoptions()
 				checkoptions_error=true
 				break
 			fi
-		done < .mismatches${count}
+		done < .mismatches
 
 		! $checkoptions_error && return
 
 		echo "Error: Mismatches found in configuration files"
-		cat .mismatches${count}
+		cat .mismatches
 		RETURNCODE=1
 		[ "$CONTINUEONERROR" ] || exit 1
 	fi
@@ -226,11 +224,8 @@ function process_config()
 	local arch
 	local cfgtmp
 	local cfgorig
-	local count
 
 	cfg=$1
-	count=$2
-
 	arch=$(head -1 "$cfg" | cut -b 3-)
 
 	if [ "$arch" = "EMPTY" ]
@@ -245,37 +240,37 @@ function process_config()
 
 	echo -n "Processing $cfg ... "
 
-	make ${MAKEOPTS} ARCH="$arch" CROSS_COMPILE=$(get_cross_compile $arch) KCONFIG_CONFIG="$cfgorig" listnewconfig >& .listnewconfig${count}
-	grep -E 'CONFIG_' .listnewconfig${count} > .newoptions${count}
-	if test -n "$NEWOPTIONS" && test -s .newoptions${count}
+	make ${MAKEOPTS} ARCH="$arch" CROSS_COMPILE=$(get_cross_compile $arch) KCONFIG_CONFIG="$cfgorig" listnewconfig >& .listnewconfig
+	grep -E 'CONFIG_' .listnewconfig > .newoptions
+	if test -n "$NEWOPTIONS" && test -s .newoptions
 	then
 		echo "Found unset config items, please set them to an appropriate value"
-		cat .newoptions${count}
-		rm .newoptions${count}
+		cat .newoptions
+		rm .newoptions
 		RETURNCODE=1
 		[ "$CONTINUEONERROR" ] || exit 1
 	fi
-	rm .newoptions${count}
+	rm .newoptions
 
-	grep -E 'config.*warning' .listnewconfig${count} > .warnings${count}
-	if test -n "$CHECKWARNINGS" && test -s .warnings${count}
+	grep -E 'config.*warning' .listnewconfig > .warnings
+	if test -n "$CHECKWARNINGS" && test -s .warnings
 	then
 		echo "Found misconfigured config items, please set them to an appropriate value"
-		cat .warnings${count}
-		rm .warnings${count}
+		cat .warnings
+		rm .warnings
 		RETURNCODE=1
 		[ "$CONTINUEONERROR" ] || exit 1
 	fi
-	rm .warnings${count}
+	rm .warnings
 
-	rm .listnewconfig${count}
+	rm .listnewconfig
 
 	make ${MAKEOPTS} ARCH="$arch" CROSS_COMPILE=$(get_cross_compile $arch) KCONFIG_CONFIG="$cfgorig" olddefconfig > /dev/null || exit 1
 	echo "# $arch" > "$cfgtmp"
 	cat "$cfgorig" >> "$cfgtmp"
 	if test -n "$CHECKOPTIONS"
 	then
-		checkoptions "$cfg" "$cfgtmp" "$count"
+		checkoptions "$cfg" "$cfgtmp"
 	fi
 	# if test run, don't overwrite original
 	if test -n "$TESTRUN"
@@ -293,11 +288,9 @@ function process_configs()
 	# assume we are in $source_tree/configs, need to get to top level
 	pushd "$(switch_to_toplevel)" &>/dev/null
 
-	count=0
 	for cfg in "$SCRIPT_DIR/${PACKAGE_NAME}${KVERREL}${SUBARCH}"*.config
 	do
-		process_config "$cfg" "$count"
-		((count++))
+		process_config "$cfg"
 	done
 	rm "$SCRIPT_DIR"/*.config*.old
 	popd > /dev/null
