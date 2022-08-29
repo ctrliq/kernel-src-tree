@@ -24,7 +24,8 @@ SNAPSHOT=${17}
 UPSTREAM_BRANCH=${18}
 INCLUDE_FEDORA_FILES=${19}
 INCLUDE_RHEL_FILES=${20}
-BUILDID=${21}
+PATCHLIST_URL=${21}
+BUILDID=${22}
 RPMVERSION=${KVERSION}.${KPATCHLEVEL}
 clogf="$SOURCES/changelog"
 # hide [redhat] entries from changelog
@@ -126,6 +127,33 @@ else
 	BUILDID_DEFINE="# define buildid .local"
 fi
 
+EXCLUDE_FILES=":(exclude,top).get_maintainer.conf \
+		:(exclude,top).gitattributes \
+		:(exclude,top).gitignore \
+		:(exclude,top).gitlab-ci.yml \
+		:(exclude,top)makefile \
+		:(exclude,top)Makefile.rhelver \
+		:(exclude,top)redhat \
+		:(exclude,top)configs"
+
+# If PATCHLIST_URL is not set to "none", generate Patchlist.changelog file that
+# holds the shas and commits not included upstream and git commit url.
+PATCHLIST_CHANGELOG=0
+if [ "$PATCHLIST_URL" != "none" ]; then
+	# sed convert
+	# <sha> <description>
+	# to
+	# <ark_commit_url>/<sha>
+	#  <sha> <description>
+	#
+	# May need to preserve word splitting in EXCLUDE_FILES
+	# shellcheck disable=SC2086
+	git log --no-merges --pretty=oneline --no-decorate ${UPSTREAM}.. $EXCLUDE_FILES | \
+		sed "s!^\([^ ]*\)!$PATCHLIST_URL/\1\n &!; s!\$!\n!" \
+		> "$SOURCES"/Patchlist.changelog
+	PATCHLIST_CHANGELOG=1
+fi
+
 test -n "$SPECFILE" &&
         sed -i -e "
 	/%%CHANGELOG%%/r $CHANGELOG
@@ -141,18 +169,10 @@ test -n "$SPECFILE" &&
 	s/%%DEBUG_BUILDS_ENABLED%%/$DEBUG_BUILDS_ENABLED/
 	s/%%INCLUDE_FEDORA_FILES%%/$INCLUDE_FEDORA_FILES/
 	s/%%INCLUDE_RHEL_FILES%%/$INCLUDE_RHEL_FILES/
+	s/%%PATCHLIST_CHANGELOG%%/$PATCHLIST_CHANGELOG/
 	s/%%TARBALL_VERSION%%/$TARFILE_RELEASE/" "$SPECFILE"
 
 echo "MARKER is $MARKER"
-
-EXCLUDE_FILES=":(exclude,top).get_maintainer.conf \
-		:(exclude,top).gitattributes \
-		:(exclude,top).gitignore \
-		:(exclude,top).gitlab-ci.yml \
-		:(exclude,top)makefile \
-		:(exclude,top)Makefile.rhelver \
-		:(exclude,top)redhat \
-		:(exclude,top)configs"
 
 if [ "$SINGLE_TARBALL" = 0 ]; then
 	# May need to preserve word splitting in EXCLUDE_FILES
@@ -163,22 +183,6 @@ else
 	# Need an empty file for dist-git compatibility
 	touch "$SOURCES"/patch-"$RPMVERSION"-redhat.patch
 fi
-
-# generate Patchlist.changelog file that holds the shas and commits not
-# included upstream and git commit url.
-ARK_COMMIT_URL="https://gitlab.com/cki-project/kernel-ark/-/commit"
-
-# sed convert
-# <sha> <description>
-# to
-# <ark_commit_url>/<sha>
-#  <sha> <description>
-#
-# May need to preserve word splitting in EXCLUDE_FILES
-# shellcheck disable=SC2086
-git log --no-merges --pretty=oneline --no-decorate ${UPSTREAM}.. $EXCLUDE_FILES | \
-	sed "s!^\([^ ]*\)!$ARK_COMMIT_URL/\1\n &!; s!\$!\n!" \
-	> "$SOURCES"/Patchlist.changelog
 
 # We depend on work splitting of BUILDOPTS
 # shellcheck disable=SC2086
