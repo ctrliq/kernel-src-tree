@@ -420,15 +420,23 @@ $(KABIDW_TARBALL):
 
 
 dist-tarball: $(TARBALL)
+	# deprecated at 5.17.0
+	@echo "WARNING: This target will be deprecated in a future release."
 	@echo "redhat/$(TARFILE)"
 
 dist-kernelrelease:
+	# deprecated at 5.17.0
+	@echo "WARNING: This target will be deprecated in a future release."
 	@echo $(PACKAGE_NAME)-$(KVERSION)-$(PKGRELEASE)
 
 dist-kernelversion:
+	# deprecated at 5.17.0
+	@echo "WARNING: This target will be deprecated in a future release."
 	@echo $(KVERSION)-$(PKGRELEASE)
 
 dist-specfile: setup-source
+	# deprecated at 5.17.0
+	@echo "WARNING: This target will be deprecated in a future release."
 	@echo $(SOURCES)/$(SPECFILE)
 
 dist-git-version-check:
