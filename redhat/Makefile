@@ -80,37 +80,35 @@ ifeq ($(VERSION_ON_UPSTREAM),1)
   _TAG:=$(shell $(GIT) describe $(MERGE_BASE))
   # a snapshot off of a tagged git is of the form [tag]-[cnt]-g[hash]
   SNAPSHOT:=$(shell echo $(_TAG) | grep -c '\-g')
-else
-  SNAPSHOT:=0
-endif
 
-ifeq ($(SNAPSHOT),1)
-  # The base for generating tags is the snapshot commit
-  MARKER:=$(shell echo $(_TAG) | awk -F "-g" '{ print $$2 }')
-  # The merge window is weird because the actual versioning hasn't
-  # been updated but we still need something that works for
-  # packaging. Fix this by bumping the patch level and marking
-  # this as rc0
-  ifeq ($(RPMKEXTRAVERSION),)
-    KEXTRAVERSION:=.rc0
-    PREBUILD:=0$(KEXTRAVERSION).
-    RPMKPATCHLEVEL:=$(shell expr $(RPMKPATCHLEVEL) + 1)
-  endif
-  ifndef PREBUILD_GIT_ONLY
-    ifneq ($(filter $(MAKECMDGOALS),dist-git-test dist-git),)
-      PREBUILD_GIT_ONLY:=0
-    else
-      PREBUILD_GIT_ONLY:=1
+  ifeq ($(SNAPSHOT),1)
+    # The base for generating tags is the snapshot commit
+    MARKER:=$(shell echo $(_TAG) | awk -F "-g" '{ print $$2 }')
+    # The merge window is weird because the actual versioning hasn't
+    # been updated but we still need something that works for
+    # packaging. Fix this by bumping the patch level and marking
+    # this as rc0
+    ifeq ($(RPMKEXTRAVERSION),)
+      KEXTRAVERSION:=.rc0
+      PREBUILD:=0$(KEXTRAVERSION).
+      RPMKPATCHLEVEL:=$(shell expr $(RPMKPATCHLEVEL) + 1)
     endif
+    ifndef PREBUILD_GIT_ONLY
+      ifneq ($(filter $(MAKECMDGOALS),dist-git-test dist-git),)
+        PREBUILD_GIT_ONLY:=0
+      else
+        PREBUILD_GIT_ONLY:=1
+      endif
+    endif
+    ifeq ($(PREBUILD_GIT_ONLY),1)
+      PREBUILD:=$(PREBUILD)$(MARKER).
+    else
+      # Obtain the date that HEAD was committed (not the snapshot commit).
+      HEAD_DATE:=$(shell $(GIT) show -s --format=%cd --date=format:%Y%m%d $(HEAD))
+      PREBUILD:=$(PREBUILD)$(HEAD_DATE)git$(MARKER).
+    endif
+    UPSTREAM_TARBALL_NAME:=$(patsubst v%,%,$(_TAG))
   endif
-  ifeq ($(PREBUILD_GIT_ONLY),1)
-    PREBUILD:=$(PREBUILD)$(MARKER).
-  else
-    # Obtain the date that HEAD was committed (not the snapshot commit).
-    HEAD_DATE:=$(shell $(GIT) show -s --format=%cd --date=format:%Y%m%d $(HEAD))
-    PREBUILD:=$(PREBUILD)$(HEAD_DATE)git$(MARKER).
-  endif
-  UPSTREAM_TARBALL_NAME:=$(patsubst v%,%,$(_TAG))
 endif
 
 KVERSION:=$(RPMKVERSION).$(RPMKPATCHLEVEL).$(RPMKSUBLEVEL)
