@@ -4,6 +4,8 @@
  * Copyright (C) 2020 Marvell International Ltd.
  */
 
+#include <linux/module.h>
+
 #include "otx2_common.h"
 #include "otx2_ptp.h"
 
