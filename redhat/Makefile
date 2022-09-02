@@ -495,13 +495,7 @@ dist-git: dist-srpm $(KABI_TARBALL) $(KABIDW_TARBALL)
 ifeq ("$(RHDISTGIT_BRANCH)", "")
  $(error RHDISTGIT_BRANCH unset)
 endif
-	@if [ "$(DISTRO)" == "centos" ]; then \
-	if [ -z "$(GL_DISTGIT_USER)" ]; then \
-		echo "Error: please provide your gitlab username with GL_DISTGIT_USER"; \
-		exit 1; \
-	fi; \
-	fi
-	$(REDHAT)/scripts/rh-dist-git.sh "$(RHDISTGIT_BRANCH)" "$(RHDISTGIT_CACHE)" "$(RHDISTGIT_TMP)" "$(RHDISTGIT)" "$(TARBALL)" "$(KABI_TARBALL)" "$(KABIDW_TARBALL)" "$(PACKAGE_NAME)" "$(RPMVERSION)-$(PKGRELEASE)" "$(REDHAT)/$(CHANGELOG)" "$(RHEL_MAJOR)" "$(RHPKG_BIN)" "$(SRPMS)/$(PACKAGE_NAME)-$(KVERSION)-$(PKGRELEASE)$(SRPM_DIST).src.rpm"
+	$(REDHAT)/scripts/rh-dist-git.sh "$(RHDISTGIT_BRANCH)" "$(RHDISTGIT_CACHE)" "$(RHDISTGIT_TMP)" "$(TARBALL)" "$(KABI_TARBALL)" "$(KABIDW_TARBALL)" "$(PACKAGE_NAME)" "$(RPMVERSION)-$(PKGRELEASE)" "$(REDHAT)/$(CHANGELOG)" "$(RHEL_MAJOR)" "$(RHPKG_BIN)" "$(SRPMS)/$(PACKAGE_NAME)-$(KVERSION)-$(PKGRELEASE)$(SRPM_DIST).src.rpm"
 
 dist-rtg: dist-release
 	@$(MAKE) dist-release-tag
