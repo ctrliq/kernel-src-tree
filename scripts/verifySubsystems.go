@@ -85,21 +85,30 @@ func main() {
 		}
 	}
 
-	// check that all names have a gluser entry
+	//
+	// General data verification
+	//
+
 	for _, s := range subSystems.SubSys {
+		// check that all maintainers have a gluser entry
 		for _, m := range s.Maintainers {
 			if m.Gluser == "" {
 				log.Fatalf("error: '%s' has maintainer %s <%s> listed without a gluser: entry", s.Subsystem, m.Name, m.Email)
 			}
 		}
+
+		// check that all reviewers have a gluser entry
 		for _, r := range s.Reviewers {
 			if r.Gluser == "" {
 				log.Fatalf("error: '%s' has reviewer %s <%s> listed without a gluser: entry", s.Subsystem, r.Name, r.Email)
 			}
 		}
+
+		// check that devel-sst is set
 		if s.DevelSst == nil {
 			log.Fatalf("error: '%s' is missing a devel-sst entry", s.Subsystem)
 		}
+		// check that qe-sst is set
 		if s.QeSst == nil {
 			log.Fatalf("error: '%s' is missing a qe-sst entry", s.Subsystem)
 		}
