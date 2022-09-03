@@ -35,7 +35,7 @@ all:
 		echo "        git config --add owners.warning false"; \
 		echo "======================================================="; \
 	fi
-	@if test -n "$$(git diff | grep "^+" | grep "\- rhel-sst-null" )"; then \
+	@if test -n "$$(git diff main | grep "^+" | grep "\s\- rhel-sst-null" )"; then \
 		echo "ERROR: New entries cannot set devel-sst or qe-sst to rhel-sst-null."; \
 		exit 1; \
 	fi
