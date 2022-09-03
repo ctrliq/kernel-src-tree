@@ -42,6 +42,20 @@ type SubSystems struct {
 	SubSys []SubSystem `subsystems`
 }
 
+var validDevelSSTNames = []string {"rhel-sst-null",
+				      "rhel-sst-arch-hw" }
+
+var validQeSSTNames = []string {"rhel-sst-null"}
+
+func contains(names []string, name string) bool {
+	for _, a := range names {
+		if a == name {
+			return true
+		}
+	}
+	return false
+}
+
 func main() {
 	var subSystems SubSystems
 
@@ -111,6 +125,18 @@ func main() {
 		// check that qe-sst is set
 		if s.QeSst == nil {
 			log.Fatalf("error: '%s' is missing a qe-sst entry", s.Subsystem)
+		}
+		// check that the devel-sst is valid
+		for _, sst := range s.DevelSst {
+			if !contains(validDevelSSTNames, sst) {
+				log.Fatalf("error: '%s' devel-sst entry (%s) is not valid", s.Subsystem, sst)
+			}
+		}
+		// check that the qe-sst is valid
+		for _, sst := range s.QeSst {
+			if !contains(validQeSSTNames, sst) {
+				log.Fatalf("error: '%s' qe-sst entry (%s) is not valid", s.Subsystem, sst)
+			}
 		}
 	}
 }
