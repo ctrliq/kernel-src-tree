@@ -1511,7 +1511,7 @@ SYSCALL_DEFINE3(getrandom, char __user *, buf, size_t, count, unsigned int,
 
 	if (rng) {
 		int ret;
-		ret = rng->extrng_read(buf, count);
+		ret = rng->extrng_read(buf, count, !!(flags & GRND_RANDOM));
 		module_put(rng->owner);
 		return ret;
 	}
@@ -1729,7 +1729,7 @@ static int extrng_release(struct inode *inode, struct file *filp)
 static ssize_t
 extrng_read(struct file *file, char __user *buf, size_t nbytes, loff_t *ppos)
 {
-	return rcu_dereference_raw(extrng)->extrng_read(buf, nbytes);
+	return rcu_dereference_raw(extrng)->extrng_read(buf, nbytes, false);
 }
 
 const struct file_operations random_fops = {
