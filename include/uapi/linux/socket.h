@@ -26,7 +26,7 @@ struct __kernel_sockaddr_storage {
 	};
 };
 
-#define SOCK_TXREHASH_DEFAULT	((u8)-1)
+#define SOCK_TXREHASH_DEFAULT	255
 #define SOCK_TXREHASH_DISABLED	0
 #define SOCK_TXREHASH_ENABLED	1
 
