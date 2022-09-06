@@ -1455,7 +1455,8 @@ set_sndbuf:
 			ret = -EINVAL;
 			break;
 		}
-		sk->sk_txrehash = (u8)val;
+		/* Paired with READ_ONCE() in tcp_rtx_synack() */
+		WRITE_ONCE(sk->sk_txrehash, (u8)val);
 		break;
 
 	default:
