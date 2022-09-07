@@ -100,8 +100,13 @@ ifneq ($(wildcard $(LOCVERFILE)),)
   LOCALVERSION:=$(shell cat $(LOCVERFILE))
   $(info LOCALVERSION is "$(LOCALVERSION)". Update '$(shell dirname $(REDHAT))/localversion' to change.)
 else
-  ifeq ($(LOCALVERSION),)
-    LOCALVERSION:=.test
+  ifeq ($(origin BUILDID),undefined)
+    ifeq ($(LOCALVERSION),)
+      LOCALVERSION:=.test
+    endif
+  else
+    $(warning WARNING: BUILDID will be deprecated in RHEL9.3.  Use LOCALVERSION instead.)
+    LOCALVERSION:=$(BUILDID)
   endif
   $(info LOCALVERSION is "$(LOCALVERSION)".)
 endif
