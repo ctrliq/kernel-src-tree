@@ -1603,12 +1603,10 @@ void vcpu_run(struct kvm_vm *vm, uint32_t vcpuid)
 
 int _vcpu_run(struct kvm_vm *vm, uint32_t vcpuid)
 {
-	struct vcpu *vcpu = vcpu_find(vm, vcpuid);
 	int rc;
 
-	TEST_ASSERT(vcpu != NULL, "vcpu not found, vcpuid: %u", vcpuid);
 	do {
-		rc = ioctl(vcpu->fd, KVM_RUN, NULL);
+		rc = __vcpu_run(vm, vcpuid);
 	} while (rc == -1 && errno == EINTR);
 
 	assert_on_unhandled_exception(vm, vcpuid);
@@ -1633,7 +1631,7 @@ void vcpu_run_complete_io(struct kvm_vm *vm, uint32_t vcpuid)
 	TEST_ASSERT(vcpu != NULL, "vcpu not found, vcpuid: %u", vcpuid);
 
 	vcpu->state->immediate_exit = 1;
-	ret = ioctl(vcpu->fd, KVM_RUN, NULL);
+	ret = __vcpu_run(vm, vcpuid);
 	vcpu->state->immediate_exit = 0;
 
 	TEST_ASSERT(ret == -1 && errno == EINTR,
