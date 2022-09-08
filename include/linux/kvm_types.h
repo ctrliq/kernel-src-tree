@@ -92,6 +92,7 @@ struct gfn_to_pfn_cache {
 struct kvm_mmu_memory_cache {
 	int nobjs;
 	gfp_t gfp_zero;
+	gfp_t gfp_custom;
 	struct kmem_cache *kmem_cache;
 	int capacity;
 	void **objects;
