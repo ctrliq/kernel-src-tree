@@ -239,7 +239,6 @@ struct nsim_dev {
 	struct dentry *take_snapshot;
 	struct dentry *nodes_ddir;
 
-	struct mutex vfs_lock;  /* Protects vfconfigs */
 	struct nsim_vf_config *vfconfigs;
 
 	struct bpf_offload_dev *bpf_dev;
@@ -252,7 +251,6 @@ struct nsim_dev {
 	struct list_head bpf_bound_maps;
 	struct netdev_phys_item_id switch_id;
 	struct list_head port_list;
-	struct mutex port_list_lock; /* protects port list */
 	bool fw_update_status;
 	u32 fw_update_overwrite_mask;
 	u32 max_macs;
