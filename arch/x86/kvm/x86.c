@@ -9467,7 +9467,7 @@ static void update_cr8_intercept(struct kvm_vcpu *vcpu)
 	if (!lapic_in_kernel(vcpu))
 		return;
 
-	if (vcpu->arch.apicv_active)
+	if (vcpu->arch.apic->apicv_active)
 		return;
 
 	if (!vcpu->arch.apic->vapic_addr)
@@ -9920,6 +9920,7 @@ void kvm_make_scan_ioapic_request(struct kvm *kvm)
 
 void kvm_vcpu_update_apicv(struct kvm_vcpu *vcpu)
 {
+	struct kvm_lapic *apic = vcpu->arch.apic;
 	bool activate;
 
 	if (!lapic_in_kernel(vcpu))
@@ -9930,10 +9931,10 @@ void kvm_vcpu_update_apicv(struct kvm_vcpu *vcpu)
 
 	activate = kvm_vcpu_apicv_activated(vcpu);
 
-	if (vcpu->arch.apicv_active == activate)
+	if (apic->apicv_active == activate)
 		goto out;
 
-	vcpu->arch.apicv_active = activate;
+	apic->apicv_active = activate;
 	kvm_apic_update_apicv(vcpu);
 	static_call(kvm_x86_refresh_apicv_exec_ctrl)(vcpu);
 
@@ -9943,7 +9944,7 @@ void kvm_vcpu_update_apicv(struct kvm_vcpu *vcpu)
 	 * still active when the interrupt got accepted. Make sure
 	 * inject_pending_event() is called to check for that.
 	 */
-	if (!vcpu->arch.apicv_active)
+	if (!apic->apicv_active)
 		kvm_make_request(KVM_REQ_EVENT, vcpu);
 
 out:
@@ -11386,7 +11387,7 @@ int kvm_arch_vcpu_create(struct kvm_vcpu *vcpu)
 		 * will ensure the vCPU gets the correct state before VM-Entry.
 		 */
 		if (enable_apicv) {
-			vcpu->arch.apicv_active = true;
+			vcpu->arch.apic->apicv_active = true;
 			kvm_make_request(KVM_REQ_APICV_UPDATE, vcpu);
 		}
 	} else
