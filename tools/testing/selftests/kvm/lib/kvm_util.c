@@ -567,23 +567,7 @@ kvm_userspace_memory_region_find(struct kvm_vm *vm, uint64_t start,
 	return &region->region;
 }
 
-/*
- * VCPU Find
- *
- * Input Args:
- *   vm - Virtual Machine
- *   vcpuid - VCPU ID
- *
- * Output Args: None
- *
- * Return:
- *   Pointer to VCPU structure
- *
- * Locates a vcpu structure that describes the VCPU specified by vcpuid and
- * returns a pointer to it.  Returns NULL if the VM doesn't contain a VCPU
- * for the specified vcpuid.
- */
-struct vcpu *vcpu_find(struct kvm_vm *vm, uint32_t vcpuid)
+static struct vcpu *vcpu_find(struct kvm_vm *vm, uint32_t vcpuid)
 {
 	struct vcpu *vcpu;
 
@@ -593,6 +577,14 @@ struct vcpu *vcpu_find(struct kvm_vm *vm, uint32_t vcpuid)
 	}
 
 	return NULL;
+}
+
+struct vcpu *vcpu_get(struct kvm_vm *vm, uint32_t vcpuid)
+{
+	struct vcpu *vcpu = vcpu_find(vm, vcpuid);
+
+	TEST_ASSERT(vcpu, "vCPU %d does not exist", vcpuid);
+	return vcpu;
 }
 
 /*
@@ -1574,8 +1566,7 @@ void vm_create_irqchip(struct kvm_vm *vm)
  */
 struct kvm_run *vcpu_state(struct kvm_vm *vm, uint32_t vcpuid)
 {
-	struct vcpu *vcpu = vcpu_find(vm, vcpuid);
-	TEST_ASSERT(vcpu != NULL, "vcpu not found, vcpuid: %u", vcpuid);
+	struct vcpu *vcpu = vcpu_get(vm, vcpuid);
 
 	return vcpu->state;
 }
@@ -1616,10 +1607,8 @@ int _vcpu_run(struct kvm_vm *vm, uint32_t vcpuid)
 
 void vcpu_run_complete_io(struct kvm_vm *vm, uint32_t vcpuid)
 {
-	struct vcpu *vcpu = vcpu_find(vm, vcpuid);
+	struct vcpu *vcpu = vcpu_get(vm, vcpuid);
 	int ret;
-
-	TEST_ASSERT(vcpu != NULL, "vcpu not found, vcpuid: %u", vcpuid);
 
 	vcpu->state->immediate_exit = 1;
 	ret = __vcpu_run(vm, vcpuid);
@@ -1662,14 +1651,9 @@ struct kvm_reg_list *vcpu_get_reg_list(struct kvm_vm *vm, uint32_t vcpuid)
 int __vcpu_ioctl(struct kvm_vm *vm, uint32_t vcpuid,
 		 unsigned long cmd, void *arg)
 {
-	struct vcpu *vcpu = vcpu_find(vm, vcpuid);
-	int ret;
+	struct vcpu *vcpu = vcpu_get(vm, vcpuid);
 
-	TEST_ASSERT(vcpu != NULL, "vcpu not found, vcpuid: %u", vcpuid);
-
-	ret = ioctl(vcpu->fd, cmd, arg);
-
-	return ret;
+	return ioctl(vcpu->fd, cmd, arg);
 }
 
 void _vcpu_ioctl(struct kvm_vm *vm, uint32_t vcpuid, unsigned long cmd,
@@ -1682,14 +1666,10 @@ void _vcpu_ioctl(struct kvm_vm *vm, uint32_t vcpuid, unsigned long cmd,
 
 void *vcpu_map_dirty_ring(struct kvm_vm *vm, uint32_t vcpuid)
 {
-	struct vcpu *vcpu;
+	struct vcpu *vcpu = vcpu_get(vm, vcpuid);
 	uint32_t size = vm->dirty_ring_size;
 
 	TEST_ASSERT(size > 0, "Should enable dirty ring first");
-
-	vcpu = vcpu_find(vm, vcpuid);
-
-	TEST_ASSERT(vcpu, "Cannot find vcpu %u", vcpuid);
 
 	if (!vcpu->dirty_gfns) {
 		void *addr;
@@ -1846,9 +1826,7 @@ int kvm_device_access(int dev_fd, uint32_t group, uint64_t attr,
 int _vcpu_has_device_attr(struct kvm_vm *vm, uint32_t vcpuid, uint32_t group,
 			  uint64_t attr)
 {
-	struct vcpu *vcpu = vcpu_find(vm, vcpuid);
-
-	TEST_ASSERT(vcpu, "nonexistent vcpu id: %d", vcpuid);
+	struct vcpu *vcpu = vcpu_get(vm, vcpuid);
 
 	return _kvm_device_check_attr(vcpu->fd, group, attr);
 }
@@ -1865,9 +1843,7 @@ int vcpu_has_device_attr(struct kvm_vm *vm, uint32_t vcpuid, uint32_t group,
 int _vcpu_access_device_attr(struct kvm_vm *vm, uint32_t vcpuid, uint32_t group,
 			     uint64_t attr, void *val, bool write)
 {
-	struct vcpu *vcpu = vcpu_find(vm, vcpuid);
-
-	TEST_ASSERT(vcpu, "nonexistent vcpu id: %d", vcpuid);
+	struct vcpu *vcpu = vcpu_get(vm, vcpuid);
 
 	return _kvm_device_access(vcpu->fd, group, attr, val, write);
 }
