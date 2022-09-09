@@ -5999,7 +5999,6 @@ should put the acknowledged interrupt vector into the 'epr' field.
   #define KVM_SYSTEM_EVENT_WAKEUP         4
   #define KVM_SYSTEM_EVENT_SUSPEND        5
   #define KVM_SYSTEM_EVENT_SEV_TERM       6
-  #define KVM_SYSTEM_EVENT_NDATA_VALID    (1u << 31)
 			__u32 type;
                         __u32 ndata;
                         __u64 data[16];
