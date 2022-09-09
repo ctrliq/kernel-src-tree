@@ -7854,7 +7854,7 @@ When enabled, KVM will exit to userspace with KVM_EXIT_SYSTEM_EVENT of
 type KVM_SYSTEM_EVENT_SUSPEND to process the guest suspend request.
 
 8.38 KVM_CAP_VM_DISABLE_NX_HUGE_PAGES
----------------------------
+-------------------------------------
 
 :Capability KVM_CAP_VM_DISABLE_NX_HUGE_PAGES
 :Architectures: x86
