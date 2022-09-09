@@ -253,12 +253,11 @@ static int nsim_bus_probe(struct device *dev)
 	return nsim_drv_probe(nsim_bus_dev);
 }
 
-static int nsim_bus_remove(struct device *dev)
+static void nsim_bus_remove(struct device *dev)
 {
 	struct nsim_bus_dev *nsim_bus_dev = to_nsim_bus_dev(dev);
 
 	nsim_drv_remove(nsim_bus_dev);
-	return 0;
 }
 
 static int nsim_num_vf(struct device *dev)

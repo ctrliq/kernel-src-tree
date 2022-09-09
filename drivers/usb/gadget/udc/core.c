@@ -1519,7 +1519,7 @@ static int gadget_bind_driver(struct device *dev)
 	return ret;
 }
 
-static int gadget_unbind_driver(struct device *dev)
+static void gadget_unbind_driver(struct device *dev)
 {
 	struct usb_gadget *gadget = dev_to_usb_gadget(dev);
 	struct usb_udc *udc = gadget->udc;
@@ -1540,7 +1540,6 @@ static int gadget_unbind_driver(struct device *dev)
 	driver->is_bound = false;
 	udc->driver = NULL;
 	mutex_unlock(&udc_lock);
-	return 0;
 }
 
 /* ------------------------------------------------------------------------- */
