@@ -13,8 +13,6 @@
 #define EP_OFFSET		0x10008
 #define EP_STRING		"S390EP"
 #define PARMAREA		0x10400
-#define EARLY_SCCB_OFFSET	0x11000
-#define HEAD_END		0x12000
 
 /*
  * Machine features detected in early.c
@@ -56,6 +54,8 @@
 #define KERNEL_VERSION_OFFSET	0x10428
 #define COMMAND_LINE_OFFSET	0x10480
 
+#define LEGACY_COMMAND_LINE_SIZE	896
+#define COMMAND_LINE_SIZE		CONFIG_COMMAND_LINE_SIZE
 #ifndef __ASSEMBLY__
 
 #include <asm/lowcore.h>
@@ -67,6 +67,7 @@
 #define OLDMEM_BASE	(*(unsigned long *)  (OLDMEM_BASE_OFFSET))
 #define OLDMEM_SIZE	(*(unsigned long *)  (OLDMEM_SIZE_OFFSET))
 #define COMMAND_LINE	((char *)	     (COMMAND_LINE_OFFSET))
+#define HEAD_END		COMMAND_LINE_OFFSET + COMMAND_LINE_SIZE
 
 struct parmarea {
 	unsigned long ipl_device;			/* 0x10400 */
@@ -75,8 +76,9 @@ struct parmarea {
 	unsigned long oldmem_base;			/* 0x10418 */
 	unsigned long oldmem_size;			/* 0x10420 */
 	unsigned long kernel_version;			/* 0x10428 */
-	char pad1[0x10480 - 0x10430];			/* 0x10430 - 0x10480 */
-	char command_line[ARCH_COMMAND_LINE_SIZE];	/* 0x10480 */
+	unsigned long max_command_line_size;		/* 0x10430 */
+	char pad1[0x10480-0x10438];			/* 0x10438 - 0x10480 */
+	char command_line[COMMAND_LINE_SIZE];		/* 0x10480 */
 };
 
 extern struct parmarea parmarea;
