@@ -74,11 +74,7 @@ static inline void console_silent(void)
 	console_loglevel = CONSOLE_LOGLEVEL_SILENT;
 }
 
-static inline void console_verbose(void)
-{
-	if (console_loglevel)
-		console_loglevel = CONSOLE_LOGLEVEL_MOTORMOUTH;
-}
+extern void console_verbose(void);
 
 /* strlen("ratelimit") + 1 */
 #define DEVKMSG_STR_MAX_SIZE 10
