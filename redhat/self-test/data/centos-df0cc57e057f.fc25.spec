@@ -11,4 +11,5 @@
 %define patchlevel 16
 %define specrelease 6%{?buildid}%{?dist}
 %define kabiversion 5.16.0-6.test
+%define selftests_must_build 0
 Mon Mar 28 2022 Fedora Kernel Team <kernel-team@fedoraproject.org> [5.16.0-6.test]
