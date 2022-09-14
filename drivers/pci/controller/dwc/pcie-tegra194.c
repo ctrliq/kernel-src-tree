@@ -2102,7 +2102,6 @@ static int tegra_pcie_dw_probe(struct platform_device *pdev)
 	pcie->of_data = (struct tegra_pcie_dw_of_data *)data;
 	pci->n_fts[0] = pcie->of_data->n_fts[0];
 	pci->n_fts[1] = pcie->of_data->n_fts[1];
-	pci->version = DW_PCIE_VER_490A;
 	pp = &pci->pp;
 	pp->num_vectors = MAX_MSI_IRQS;
 
