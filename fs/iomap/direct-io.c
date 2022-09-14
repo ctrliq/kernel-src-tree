@@ -231,7 +231,6 @@ iomap_dio_bio_actor(struct inode *inode, loff_t pos, loff_t length,
 {
 	unsigned int blkbits = blksize_bits(bdev_logical_block_size(iomap->bdev));
 	unsigned int fs_block_size = i_blocksize(inode), pad;
-	unsigned int align = iov_iter_alignment(dio->submit.iter);
 	unsigned int bio_opf;
 	struct bio *bio;
 	bool need_zeroout = false;
@@ -240,7 +239,8 @@ iomap_dio_bio_actor(struct inode *inode, loff_t pos, loff_t length,
 	size_t copied = 0;
 	size_t orig_count;
 
-	if ((pos | length | align) & ((1 << blkbits) - 1))
+	if ((pos | length) & ((1 << blkbits) - 1) ||
+	    !bdev_iter_is_aligned(iomap->bdev, dio->submit.iter))
 		return -EINVAL;
 
 	if (iomap->type == IOMAP_UNWRITTEN) {
