@@ -188,7 +188,7 @@ static blk_qc_t xpram_submit_bio(struct bio *bio)
 	unsigned long page_addr;
 	unsigned long bytes;
 
-	blk_queue_split(&bio);
+	bio = bio_split_to_limits(bio);
 
 	if ((bio->bi_iter.bi_sector & 7) != 0 ||
 	    (bio->bi_iter.bi_size & 4095) != 0)

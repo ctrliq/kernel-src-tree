@@ -125,7 +125,7 @@ static void rsxx_submit_bio(struct bio *bio)
 	struct rsxx_bio_meta *bio_meta;
 	blk_status_t st = BLK_STS_IOERR;
 
-	blk_queue_split(&bio);
+	bio = bio_split_to_limits(bio);
 
 	might_sleep();
 
