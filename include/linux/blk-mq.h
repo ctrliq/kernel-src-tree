@@ -542,7 +542,7 @@ struct blk_mq_queue_data {
 	RH_KABI_RESERVE(1)
 };
 
-typedef bool (busy_tag_iter_fn)(struct request *, void *, bool);
+typedef bool (busy_tag_iter_fn)(struct request *, void *);
 
 /**
  * struct blk_mq_ops - Callback functions that implements block driver
