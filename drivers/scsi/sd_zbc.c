@@ -797,7 +797,7 @@ int sd_zbc_read_zones(struct scsi_disk *sdkp, unsigned char *buf)
 		/*
 		 * This can happen for a host aware disk with partitions.
 		 * The block device zone information was already cleared
-		 * by blk_queue_set_zoned(). Only clear the scsi disk zone
+		 * by disk_set_zoned(). Only free the scsi disk zone
 		 * information and exit early.
 		 */
 		sd_zbc_clear_zone_info(sdkp);
