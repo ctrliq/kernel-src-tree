@@ -377,7 +377,7 @@ static int __init xpram_setup_blkdev(void)
 	return 0;
 out:
 	while (i--)
-		blk_cleanup_disk(xpram_disks[i]);
+		put_disk(xpram_disks[i]);
 	return rc;
 }
 
@@ -389,7 +389,7 @@ static void __exit xpram_exit(void)
 	int i;
 	for (i = 0; i < xpram_devs; i++) {
 		del_gendisk(xpram_disks[i]);
-		blk_cleanup_disk(xpram_disks[i]);
+		put_disk(xpram_disks[i]);
 	}
 	unregister_blkdev(XPRAM_MAJOR, XPRAM_NAME);
 }

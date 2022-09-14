@@ -2731,7 +2731,7 @@ static int pkt_setup_dev(dev_t dev, dev_t* pkt_dev)
 	return 0;
 
 out_mem2:
-	blk_cleanup_disk(disk);
+	put_disk(disk);
 out_mem:
 	mempool_exit(&pd->rb_pool);
 	kfree(pd);
@@ -2781,7 +2781,7 @@ static int pkt_remove_dev(dev_t pkt_dev)
 	pkt_dbg(1, pd, "writer unmapped\n");
 
 	del_gendisk(pd->disk);
-	blk_cleanup_disk(pd->disk);
+	put_disk(pd->disk);
 
 	mempool_exit(&pd->rb_pool);
 	kfree(pd);

@@ -507,7 +507,7 @@ out:
 void scm_blk_dev_cleanup(struct scm_blk_dev *bdev)
 {
 	del_gendisk(bdev->gendisk);
-	blk_cleanup_disk(bdev->gendisk);
+	put_disk(bdev->gendisk);
 	blk_mq_free_tag_set(&bdev->tag_set);
 }
 

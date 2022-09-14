@@ -4538,7 +4538,7 @@ out:
 	return;
 
 cleanup_disk:
-	blk_cleanup_disk(disks[drive][type]);
+	put_disk(disks[drive][type]);
 	disks[drive][type] = NULL;
 	mutex_unlock(&floppy_probe_lock);
 }
@@ -4734,7 +4734,7 @@ out_put_disk:
 		if (!disks[drive][0])
 			break;
 		del_timer_sync(&motor_off_timer[drive]);
-		blk_cleanup_disk(disks[drive][0]);
+		put_disk(disks[drive][0]);
 		blk_mq_free_tag_set(&tag_sets[drive]);
 	}
 	return err;
@@ -4966,7 +4966,7 @@ static void __exit floppy_module_exit(void)
 		}
 		for (i = 0; i < ARRAY_SIZE(floppy_type); i++) {
 			if (disks[drive][i])
-				blk_cleanup_disk(disks[drive][i]);
+				put_disk(disks[drive][i]);
 		}
 		blk_mq_free_tag_set(&tag_sets[drive]);
 	}
