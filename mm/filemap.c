@@ -2393,6 +2393,8 @@ retry:
 static int filemap_read_folio(struct file *file, struct address_space *mapping,
 		struct folio *folio)
 {
+	bool workingset = folio_test_workingset(folio);
+	unsigned long pflags;
 	int error;
 
 	/*
@@ -2401,8 +2403,13 @@ static int filemap_read_folio(struct file *file, struct address_space *mapping,
 	 * fails.
 	 */
 	folio_clear_error(folio);
+
 	/* Start the actual read. The read will unlock the page. */
+	if (unlikely(workingset))
+		psi_memstall_enter(&pflags);
 	error = mapping->a_ops->readpage(file, &folio->page);
+	if (unlikely(workingset))
+		psi_memstall_leave(&pflags);
 	if (error)
 		return error;
 
