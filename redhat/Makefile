@@ -197,7 +197,7 @@ ifeq ($(VERSION_ON_UPSTREAM),1)
   endif
 else
   SNAPSHOT:=0
-  ifneq ("$(DISTRO)", "fedora")
+  ifneq ($(ADD_COMMITID_TO_VERSION),)
     _EXACT_TAG:=$(shell $(GIT) describe --exact-match 2>/dev/null)
     ifeq ($(_EXACT_TAG),)
       _TAG:=$(shell $(GIT) describe 2>/dev/null)
