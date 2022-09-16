@@ -4352,7 +4352,7 @@ static void ext4_set_def_opts(struct super_block *sb,
 		set_opt(sb, DELALLOC);
 }
 
-static int ext4_handle_clustersize(struct super_block *sb, int blocksize)
+static int ext4_handle_clustersize(struct super_block *sb)
 {
 	struct ext4_sb_info *sbi = EXT4_SB(sb);
 	struct ext4_super_block *es = sbi->s_es;
@@ -4361,24 +4361,24 @@ static int ext4_handle_clustersize(struct super_block *sb, int blocksize)
 	/* Handle clustersize */
 	clustersize = BLOCK_SIZE << le32_to_cpu(es->s_log_cluster_size);
 	if (ext4_has_feature_bigalloc(sb)) {
-		if (clustersize < blocksize) {
+		if (clustersize < sb->s_blocksize) {
 			ext4_msg(sb, KERN_ERR,
 				 "cluster size (%d) smaller than "
-				 "block size (%d)", clustersize, blocksize);
+				 "block size (%lu)", clustersize, sb->s_blocksize);
 			return -EINVAL;
 		}
 		sbi->s_cluster_bits = le32_to_cpu(es->s_log_cluster_size) -
 			le32_to_cpu(es->s_log_block_size);
 		sbi->s_clusters_per_group =
 			le32_to_cpu(es->s_clusters_per_group);
-		if (sbi->s_clusters_per_group > blocksize * 8) {
+		if (sbi->s_clusters_per_group > sb->s_blocksize * 8) {
 			ext4_msg(sb, KERN_ERR,
 				 "#clusters per group too big: %lu",
 				 sbi->s_clusters_per_group);
 			return -EINVAL;
 		}
 		if (sbi->s_blocks_per_group !=
-		    (sbi->s_clusters_per_group * (clustersize / blocksize))) {
+		    (sbi->s_clusters_per_group * (clustersize / sb->s_blocksize))) {
 			ext4_msg(sb, KERN_ERR, "blocks per group (%lu) and "
 				 "clusters per group (%lu) inconsistent",
 				 sbi->s_blocks_per_group,
@@ -4386,13 +4386,13 @@ static int ext4_handle_clustersize(struct super_block *sb, int blocksize)
 			return -EINVAL;
 		}
 	} else {
-		if (clustersize != blocksize) {
+		if (clustersize != sb->s_blocksize) {
 			ext4_msg(sb, KERN_ERR,
 				 "fragment/cluster size (%d) != "
-				 "block size (%d)", clustersize, blocksize);
+				 "block size (%lu)", clustersize, sb->s_blocksize);
 			return -EINVAL;
 		}
-		if (sbi->s_blocks_per_group > blocksize * 8) {
+		if (sbi->s_blocks_per_group > sb->s_blocksize * 8) {
 			ext4_msg(sb, KERN_ERR,
 				 "#blocks per group too big: %lu",
 				 sbi->s_blocks_per_group);
@@ -4401,7 +4401,7 @@ static int ext4_handle_clustersize(struct super_block *sb, int blocksize)
 		sbi->s_clusters_per_group = sbi->s_blocks_per_group;
 		sbi->s_cluster_bits = 0;
 	}
-	sbi->s_cluster_ratio = clustersize / blocksize;
+	sbi->s_cluster_ratio = clustersize / sb->s_blocksize;
 
 	/* Do we have standard group size of clustersize * 8 blocks ? */
 	if (sbi->s_blocks_per_group == clustersize << 3)
@@ -4435,8 +4435,7 @@ static void ext4_fast_commit_init(struct super_block *sb)
 }
 
 static int ext4_inode_info_init(struct super_block *sb,
-				struct ext4_super_block *es,
-				int blocksize)
+				struct ext4_super_block *es)
 {
 	struct ext4_sb_info *sbi = EXT4_SB(sb);
 
@@ -4453,11 +4452,11 @@ static int ext4_inode_info_init(struct super_block *sb,
 		}
 		if ((sbi->s_inode_size < EXT4_GOOD_OLD_INODE_SIZE) ||
 		    (!is_power_of_2(sbi->s_inode_size)) ||
-		    (sbi->s_inode_size > blocksize)) {
+		    (sbi->s_inode_size > sb->s_blocksize)) {
 			ext4_msg(sb, KERN_ERR,
 			       "unsupported inode size: %d",
 			       sbi->s_inode_size);
-			ext4_msg(sb, KERN_ERR, "blocksize: %d", blocksize);
+			ext4_msg(sb, KERN_ERR, "blocksize: %lu", sb->s_blocksize);
 			return -EINVAL;
 		}
 		/*
@@ -5049,7 +5048,6 @@ static int __ext4_fill_super(struct fs_context *fc, struct super_block *sb)
 	ext4_fsblk_t logical_sb_block;
 	struct inode *root;
 	int ret = -ENOMEM;
-	int blocksize;
 	unsigned int i;
 	int needs_recovery, has_huge_files;
 	int err = 0;
@@ -5072,7 +5070,6 @@ static int __ext4_fill_super(struct fs_context *fc, struct super_block *sb)
 		goto out_fail;
 
 	es = sbi->s_es;
-	blocksize = sb->s_blocksize;
 	sbi->s_kbytes_written = le64_to_cpu(es->s_kbytes_written);
 
 	err = ext4_init_metadata_csum(sb, es);
@@ -5093,10 +5090,10 @@ static int __ext4_fill_super(struct fs_context *fc, struct super_block *sb)
 	 */
 	sbi->s_li_wait_mult = EXT4_DEF_LI_WAIT_MULT;
 
-	if (blocksize == PAGE_SIZE)
+	if (sb->s_blocksize == PAGE_SIZE)
 		set_opt(sb, DIOREAD_NOLOCK);
 
-	if (ext4_inode_info_init(sb, es, blocksize))
+	if (ext4_inode_info_init(sb, es))
 		goto failed_mount;
 
 	err = parse_apply_sb_mount_options(sb, ctx);
@@ -5123,14 +5120,14 @@ static int __ext4_fill_super(struct fs_context *fc, struct super_block *sb)
 	if (ext4_check_feature_compatibility(sb, es, silent))
 		goto failed_mount;
 
-	if (le16_to_cpu(sbi->s_es->s_reserved_gdt_blocks) > (blocksize / 4)) {
+	if (le16_to_cpu(sbi->s_es->s_reserved_gdt_blocks) > (sb->s_blocksize / 4)) {
 		ext4_msg(sb, KERN_ERR,
 			 "Number of reserved GDT blocks insanely large: %d",
 			 le16_to_cpu(sbi->s_es->s_reserved_gdt_blocks));
 		goto failed_mount;
 	}
 
-	if (dax_supported(dax_dev, sb->s_bdev, blocksize, 0,
+	if (dax_supported(dax_dev, sb->s_bdev, sb->s_blocksize, 0,
 			bdev_nr_sectors(sb->s_bdev)))
 		set_bit(EXT4_FLAGS_BDEV_IS_DAX, &sbi->s_ext4_flags);
 
@@ -5179,21 +5176,21 @@ static int __ext4_fill_super(struct fs_context *fc, struct super_block *sb)
 	sbi->s_blocks_per_group = le32_to_cpu(es->s_blocks_per_group);
 	sbi->s_inodes_per_group = le32_to_cpu(es->s_inodes_per_group);
 
-	sbi->s_inodes_per_block = blocksize / EXT4_INODE_SIZE(sb);
+	sbi->s_inodes_per_block = sb->s_blocksize / EXT4_INODE_SIZE(sb);
 	if (sbi->s_inodes_per_block == 0 || sbi->s_blocks_per_group == 0) {
 		if (!silent)
 			ext4_msg(sb, KERN_ERR, "VFS: Can't find ext4 filesystem");
 		goto failed_mount;
 	}
 	if (sbi->s_inodes_per_group < sbi->s_inodes_per_block ||
-	    sbi->s_inodes_per_group > blocksize * 8) {
+	    sbi->s_inodes_per_group > sb->s_blocksize * 8) {
 		ext4_msg(sb, KERN_ERR, "invalid inodes per group: %lu\n",
 			 sbi->s_inodes_per_group);
 		goto failed_mount;
 	}
 	sbi->s_itb_per_group = sbi->s_inodes_per_group /
 					sbi->s_inodes_per_block;
-	sbi->s_desc_per_block = blocksize / EXT4_DESC_SIZE(sb);
+	sbi->s_desc_per_block = sb->s_blocksize / EXT4_DESC_SIZE(sb);
 	sbi->s_mount_state = le16_to_cpu(es->s_state) & ~EXT4_FC_REPLAY;
 	sbi->s_addr_per_block_bits = ilog2(EXT4_ADDR_PER_BLOCK(sb));
 	sbi->s_desc_per_block_bits = ilog2(EXT4_DESC_PER_BLOCK(sb));
@@ -5219,7 +5216,7 @@ static int __ext4_fill_super(struct fs_context *fc, struct super_block *sb)
 		}
 	}
 
-	if (ext4_handle_clustersize(sb, blocksize))
+	if (ext4_handle_clustersize(sb))
 		goto failed_mount;
 
 	/*
@@ -5352,7 +5349,7 @@ static int __ext4_fill_super(struct fs_context *fc, struct super_block *sb)
 		}
 	}
 
-	if (ext4_has_feature_verity(sb) && blocksize != PAGE_SIZE) {
+	if (ext4_has_feature_verity(sb) && sb->s_blocksize != PAGE_SIZE) {
 		ext4_msg(sb, KERN_ERR, "Unsupported blocksize for fs-verity");
 		goto failed_mount_wq;
 	}
