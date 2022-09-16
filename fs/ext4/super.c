@@ -4360,8 +4360,12 @@ static int __ext4_fill_super(struct fs_context *fc, struct super_block *sb)
 	es = (struct ext4_super_block *) (bh->b_data + offset);
 	sbi->s_es = es;
 	sb->s_magic = le16_to_cpu(es->s_magic);
-	if (sb->s_magic != EXT4_SUPER_MAGIC)
-		goto cantfind_ext4;
+	if (sb->s_magic != EXT4_SUPER_MAGIC) {
+		if (!silent)
+			ext4_msg(sb, KERN_ERR, "VFS: Can't find ext4 filesystem");
+		goto failed_mount;
+	}
+
 	sbi->s_kbytes_written = le64_to_cpu(es->s_kbytes_written);
 
 	/* Warn if metadata_csum and gdt_csum are both set. */
@@ -4374,8 +4378,7 @@ static int __ext4_fill_super(struct fs_context *fc, struct super_block *sb)
 	if (!ext4_verify_csum_type(sb, es)) {
 		ext4_msg(sb, KERN_ERR, "VFS: Found ext4 filesystem with "
 			 "unknown checksum algorithm.");
-		silent = 1;
-		goto cantfind_ext4;
+		goto failed_mount;
 	}
 	ext4_setup_csum_trigger(sb, EXT4_JTR_ORPHAN_FILE,
 				ext4_orphan_file_block_trigger);
@@ -4393,9 +4396,8 @@ static int __ext4_fill_super(struct fs_context *fc, struct super_block *sb)
 	if (!ext4_superblock_csum_verify(sb, es)) {
 		ext4_msg(sb, KERN_ERR, "VFS: Found ext4 filesystem with "
 			 "invalid superblock checksum.  Run e2fsck?");
-		silent = 1;
 		ret = -EFSBADCRC;
-		goto cantfind_ext4;
+		goto failed_mount;
 	}
 
 	/* Precompute checksum seed for all metadata */
@@ -4781,8 +4783,11 @@ static int __ext4_fill_super(struct fs_context *fc, struct super_block *sb)
 	sbi->s_inodes_per_group = le32_to_cpu(es->s_inodes_per_group);
 
 	sbi->s_inodes_per_block = blocksize / EXT4_INODE_SIZE(sb);
-	if (sbi->s_inodes_per_block == 0)
-		goto cantfind_ext4;
+	if (sbi->s_inodes_per_block == 0 || sbi->s_blocks_per_group == 0) {
+		if (!silent)
+			ext4_msg(sb, KERN_ERR, "VFS: Can't find ext4 filesystem");
+		goto failed_mount;
+	}
 	if (sbi->s_inodes_per_group < sbi->s_inodes_per_block ||
 	    sbi->s_inodes_per_group > blocksize * 8) {
 		ext4_msg(sb, KERN_ERR, "invalid inodes per group: %lu\n",
@@ -4878,9 +4883,6 @@ static int __ext4_fill_super(struct fs_context *fc, struct super_block *sb)
 			 " too large to mount safely on this system");
 		goto failed_mount;
 	}
-
-	if (EXT4_BLOCKS_PER_GROUP(sb) == 0)
-		goto cantfind_ext4;
 
 	/* check blocks count against device size */
 	blocks_count = sb_bdev_nr_blocks(sb);
@@ -5390,11 +5392,6 @@ no_journal:
 	atomic_set(&sbi->s_msg_count, 0);
 
 	return 0;
-
-cantfind_ext4:
-	if (!silent)
-		ext4_msg(sb, KERN_ERR, "VFS: Can't find ext4 filesystem");
-	goto failed_mount;
 
 failed_mount9:
 	ext4_release_orphan_info(sb);
