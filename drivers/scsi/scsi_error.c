@@ -1112,6 +1112,7 @@ retry:
 	shost->eh_action = &done;
 
 	scsi_log_send(scmd);
+	scmd->scsi_done = scsi_eh_done;
 	scmd->submitter = SUBMITTED_BY_SCSI_ERROR_HANDLER;
 
 	/*
@@ -2371,6 +2372,11 @@ void scsi_report_device_reset(struct Scsi_Host *shost, int channel, int target)
 }
 EXPORT_SYMBOL(scsi_report_device_reset);
 
+static void
+scsi_reset_provider_done_command(struct scsi_cmnd *scmd)
+{
+}
+
 /**
  * scsi_ioctl_reset: explicitly reset a host/bus/target/device
  * @dev:	scsi_device to operate on
@@ -2408,6 +2414,7 @@ scsi_ioctl_reset(struct scsi_device *dev, int __user *arg)
 	scmd->request = rq;
 	scmd->cmnd = scsi_req(rq)->cmd;
 
+	scmd->scsi_done         = scsi_reset_provider_done_command;
 	scmd->submitter = SUBMITTED_BY_SCSI_RESET_IOCTL;
 	memset(&scmd->sdb, 0, sizeof(scmd->sdb));
 
