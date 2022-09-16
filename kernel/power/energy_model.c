@@ -346,6 +346,8 @@ int em_dev_register_perf_domain(struct device *dev, unsigned int nr_states,
 
 	if (milliwatts)
 		dev->em_pd->flags |= EM_PERF_DOMAIN_MILLIWATTS;
+	else if (cb->get_cost)
+		dev->em_pd->flags |= EM_PERF_DOMAIN_ARTIFICIAL;
 
 	em_debug_create_pd(dev);
 	dev_info(dev, "EM: created perf domain\n");
