@@ -61,7 +61,8 @@ do
 				grep -v -w RHGITURL |\
 				grep -v -w RHDISTDATADIR |\
 				grep -v -w VARS |\
-				sort -u >& "${destdir}/${varfilename}" &
+				sort -u >& "${destdir}/${varfilename}" && \
+				sed -i 's/ \S*\(rhpkg.mk\)\S*//g' "${destdir}/${varfilename}" &
 
 			waitpids[${count}]=$!
 			((count++))
