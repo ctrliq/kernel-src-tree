@@ -165,12 +165,6 @@ struct page {
 #ifdef CONFIG_64BIT
 			unsigned int compound_nr; /* 1 << compound_order */
 #endif
-			/*
-			 * mapcount_seqcount is serialized by the
-			 * PG_locked bit spinlock from the first tail
-			 * page.
-			 */
-			unsigned int mapcount_seqcount;
 		};
 		struct {	/* Second tail page of compound page */
 			unsigned long _compound_pad_1;	/* compound_head */

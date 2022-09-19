@@ -1611,7 +1611,6 @@ static int page_trans_huge_map_swapcount(struct page *page, int *total_mapcount,
 	struct swap_cluster_info *ci = NULL;
 	unsigned char *map = NULL;
 	int mapcount, swapcount = 0;
-	unsigned int seqcount;
 
 	/* hugetlbfs shouldn't call it */
 	VM_BUG_ON_PAGE(PageHuge(page), page);
@@ -1627,6 +1626,7 @@ static int page_trans_huge_map_swapcount(struct page *page, int *total_mapcount,
 
 	page = compound_head(page);
 
+	_total_mapcount = _total_swapcount = map_swapcount = 0;
 	if (PageSwapCache(page)) {
 		swp_entry_t entry;
 
@@ -1639,11 +1639,6 @@ static int page_trans_huge_map_swapcount(struct page *page, int *total_mapcount,
 	}
 	if (map)
 		ci = lock_cluster(si, offset);
-
-again:
-	seqcount = page_mapcount_seq_begin(page);
-
-	_total_mapcount = _total_swapcount = map_swapcount = 0;
 	for (i = 0; i < HPAGE_PMD_NR; i++) {
 		mapcount = atomic_read(&page[i]._mapcount) + 1;
 		_total_mapcount += mapcount;
@@ -1653,17 +1648,12 @@ again:
 		}
 		map_swapcount = max(map_swapcount, mapcount + swapcount);
 	}
+	unlock_cluster(ci);
 	if (PageDoubleMap(page)) {
 		map_swapcount -= 1;
 		_total_mapcount -= HPAGE_PMD_NR;
 	}
 	mapcount = compound_mapcount(page);
-
-	if (page_mapcount_seq_retry(page, seqcount))
-		goto again;
-
-	unlock_cluster(ci);
-
 	map_swapcount += mapcount;
 	_total_mapcount += mapcount;
 	if (total_mapcount)
