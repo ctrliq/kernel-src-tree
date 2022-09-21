@@ -1198,7 +1198,8 @@ static void nvme_queue_keep_alive_work(struct nvme_ctrl *ctrl)
 	queue_delayed_work(nvme_wq, &ctrl->ka_work, ctrl->kato * HZ / 2);
 }
 
-static void nvme_keep_alive_end_io(struct request *rq, blk_status_t status)
+static enum rq_end_io_ret nvme_keep_alive_end_io(struct request *rq,
+						 blk_status_t status)
 {
 	struct nvme_ctrl *ctrl = rq->end_io_data;
 	unsigned long flags;
@@ -1210,7 +1211,7 @@ static void nvme_keep_alive_end_io(struct request *rq, blk_status_t status)
 		dev_err(ctrl->device,
 			"failed nvme_keep_alive_end_io error=%d\n",
 				status);
-		return;
+		return RQ_END_IO_NONE;
 	}
 
 	ctrl->comp_seen = false;
@@ -1221,6 +1222,7 @@ static void nvme_keep_alive_end_io(struct request *rq, blk_status_t status)
 	spin_unlock_irqrestore(&ctrl->lock, flags);
 	if (startka)
 		nvme_queue_keep_alive_work(ctrl);
+	return RQ_END_IO_NONE;
 }
 
 static void nvme_keep_alive_work(struct work_struct *work)
