@@ -277,7 +277,16 @@ KABI_TARBALL:=$(SOURCES)/kernel-abi-stablelists-$(SPECKABIVERSION).tar.bz2
 KABIDW := $(REDHAT)/kabi-dwarf
 KABIDW_TARBALL:=$(SOURCES)/kernel-kabi-dw-$(SPECKABIVERSION).tar.bz2
 
-include Makefile.rhpkg
+# load Makefile variable settings from user-specified configuration file,
+# ~/.rhpkg.mk or $TOPDIR/.rhpkg.mk
+ifeq ("$(RHDISTGIT_CACHE)", "")
+  ifneq ("$(wildcard ${HOME}/.rhpkg.mk)", "")
+    include ${HOME}/.rhpkg.mk
+  endif
+  ifneq ("$(wildcard $(TOPDIR)/.rhpkg.mk)", "")
+    include $(TOPDIR)/.rhpkg.mk
+  endif
+endif
 
 ifeq ("$(ZSTREAM)", "yes")
   YSTREAM_FLAG = no
