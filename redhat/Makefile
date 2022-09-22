@@ -242,6 +242,7 @@ ifeq ("$(DISTRO)", "fedora")
   # without changing anything else in the specfile.
   SPECTARFILE_RELEASE:=$(UPSTREAM_TARBALL_NAME)
   SPECKABIVERSION:=$(SPECVERSION)
+  RHPKG_BIN:=fedpkg
 else ifeq ("$(DISTRO)", "centos")
   RHDISTGIT_BRANCH:=c$(RHEL_MAJOR)s
   ifndef BUILD_PROFILE
@@ -253,6 +254,7 @@ else ifeq ("$(DISTRO)", "centos")
   SPECTARFILE_RELEASE:=$(BASEVERSION)
   SPECKABIVERSION:=$(BASEVERSION)
   PATCHLIST_URL:=none
+  RHPKG_BIN:=centpkg
 else
   RHDISTGIT_BRANCH:=rhel-$(RHEL_MAJOR).$(RHEL_MINOR).0
   ifndef BUILD_TARGET
@@ -265,6 +267,7 @@ else
   SPECTARFILE_RELEASE:=$(BASEVERSION)
   SPECKABIVERSION:=$(BASEVERSION)
   PATCHLIST_URL:=none
+  RHPKG_BIN:=rhpkg
 endif
 
 TARFILE:=linux-$(SPECTARFILE_RELEASE).tar.xz
