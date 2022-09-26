@@ -1893,7 +1893,7 @@ static void bpf_prog_select_func(struct bpf_prog *fp)
 
 /**
  *	bpf_prog_select_runtime - select exec runtime for BPF program
- *	@fp: bpf_prog populated with internal BPF program
+ *	@fp: bpf_prog populated with BPF program
  *	@err: pointer to error variable
  *
  * Try to JIT eBPF program, if JIT is not available, use interpreter.
@@ -2302,7 +2302,6 @@ static void bpf_prog_free_deferred(struct work_struct *work)
 	}
 }
 
-/* Free internal BPF program */
 void bpf_prog_free(struct bpf_prog *fp)
 {
 	struct bpf_prog_aux *aux = fp->aux;
