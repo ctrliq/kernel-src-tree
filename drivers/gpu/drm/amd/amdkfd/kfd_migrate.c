@@ -685,15 +685,13 @@ svm_migrate_vma_to_ram(struct amdgpu_device *adev, struct svm_range *prange,
 	migrate.vma = vma;
 	migrate.start = start;
 	migrate.end = end;
+	migrate.flags = MIGRATE_VMA_SELECT_DEVICE_PRIVATE;
 	migrate.pgmap_owner = SVM_ADEV_PGMAP_OWNER(adev);
-	if (adev->gmc.xgmi.connected_to_cpu)
-		migrate.flags = MIGRATE_VMA_SELECT_DEVICE_COHERENT;
-	else
-		migrate.flags = MIGRATE_VMA_SELECT_DEVICE_PRIVATE;
 
 	buf = kvcalloc(npages,
 		       2 * sizeof(*migrate.src) + sizeof(uint64_t) + sizeof(dma_addr_t),
 		       GFP_KERNEL);
+
 	if (!buf)
 		goto out;
 
@@ -976,7 +974,7 @@ int svm_migrate_init(struct amdgpu_device *adev)
 {
 	struct kfd_dev *kfddev = adev->kfd.dev;
 	struct dev_pagemap *pgmap;
-	struct resource *res = NULL;
+	struct resource *res;
 	unsigned long size;
 	void *r;
 
@@ -991,34 +989,28 @@ int svm_migrate_init(struct amdgpu_device *adev)
 	 * should remove reserved size
 	 */
 	size = ALIGN(adev->gmc.real_vram_size, 2ULL << 20);
-	if (adev->gmc.xgmi.connected_to_cpu) {
-		pgmap->range.start = adev->gmc.aper_base;
-		pgmap->range.end = adev->gmc.aper_base + adev->gmc.aper_size - 1;
-		pgmap->type = MEMORY_DEVICE_COHERENT;
-	} else {
-		res = devm_request_free_mem_region(adev->dev, &iomem_resource, size);
-		if (IS_ERR(res))
-			return -ENOMEM;
-		pgmap->range.start = res->start;
-		pgmap->range.end = res->end;
-		pgmap->type = MEMORY_DEVICE_PRIVATE;
-	}
+	res = devm_request_free_mem_region(adev->dev, &iomem_resource, size);
+	if (IS_ERR(res))
+		return -ENOMEM;
 
+	pgmap->type = MEMORY_DEVICE_PRIVATE;
 	pgmap->nr_range = 1;
+	pgmap->range.start = res->start;
+	pgmap->range.end = res->end;
 	pgmap->ops = &svm_migrate_pgmap_ops;
 	pgmap->owner = SVM_ADEV_PGMAP_OWNER(adev);
-	pgmap->flags = 0;
+	pgmap->flags = MIGRATE_VMA_SELECT_DEVICE_PRIVATE;
+
 	/* Device manager releases device-specific resources, memory region and
 	 * pgmap when driver disconnects from device.
 	 */
 	r = devm_memremap_pages(adev->dev, pgmap);
 	if (IS_ERR(r)) {
 		pr_err("failed to register HMM device memory\n");
+
 		/* Disable SVM support capability */
 		pgmap->type = 0;
-		if (pgmap->type == MEMORY_DEVICE_PRIVATE)
-			devm_release_mem_region(adev->dev, res->start,
-						res->end - res->start + 1);
+		devm_release_mem_region(adev->dev, res->start, resource_size(res));
 		return PTR_ERR(r);
 	}
 
