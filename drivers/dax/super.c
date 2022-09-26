@@ -311,7 +311,7 @@ static void dax_free_inode(struct inode *inode)
 {
 	struct dax_device *dax_dev = to_dax_dev(inode);
 	if (inode->i_rdev)
-		ida_simple_remove(&dax_minor_ida, iminor(inode));
+		ida_free(&dax_minor_ida, iminor(inode));
 	kmem_cache_free(dax_cache, dax_dev);
 }
 
@@ -393,7 +393,7 @@ struct dax_device *alloc_dax(void *private, const struct dax_operations *ops)
 	if (WARN_ON_ONCE(ops && !ops->zero_page_range))
 		return ERR_PTR(-EINVAL);
 
-	minor = ida_simple_get(&dax_minor_ida, 0, MINORMASK+1, GFP_KERNEL);
+	minor = ida_alloc_max(&dax_minor_ida, MINORMASK, GFP_KERNEL);
 	if (minor < 0)
 		return ERR_PTR(-ENOMEM);
 
@@ -407,7 +407,7 @@ struct dax_device *alloc_dax(void *private, const struct dax_operations *ops)
 	return dax_dev;
 
  err_dev:
-	ida_simple_remove(&dax_minor_ida, minor);
+	ida_free(&dax_minor_ida, minor);
 	return ERR_PTR(-ENOMEM);
 }
 EXPORT_SYMBOL_GPL(alloc_dax);
