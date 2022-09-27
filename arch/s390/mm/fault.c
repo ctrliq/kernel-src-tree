@@ -392,9 +392,7 @@ static inline vm_fault_t do_exception(struct pt_regs *regs, int access)
 	flags = FAULT_FLAG_DEFAULT;
 	if (user_mode(regs))
 		flags |= FAULT_FLAG_USER;
-	if ((trans_exc_code & store_indication) == 0x400)
-		access = VM_WRITE;
-	if (access == VM_WRITE)
+	if (access == VM_WRITE || (trans_exc_code & store_indication) == 0x400)
 		flags |= FAULT_FLAG_WRITE;
 	mmap_read_lock(mm);
 
