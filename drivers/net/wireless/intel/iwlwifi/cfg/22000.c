@@ -444,6 +444,9 @@ const struct iwl_cfg iwl9560_quz_a0_jf_b0_cfg = {
 	 */
 	.max_tx_agg_size = IEEE80211_MAX_AMPDU_BUF_HT,
 	.num_rbds = IWL_NUM_RBDS_NON_HE,
+
+	/* RHEL-only, workaround for BZs 2096128 and 2129297 */
+	.ucode_api_max = 55,
 };
 
 const struct iwl_cfg iwl9560_qnj_b0_jf_b0_cfg = {
