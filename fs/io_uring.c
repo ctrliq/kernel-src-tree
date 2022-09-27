@@ -2807,7 +2807,7 @@ static void io_iopoll_req_issued(struct io_kiocb *req)
 
 static bool io_bdev_nowait(struct block_device *bdev)
 {
-	return !bdev || blk_queue_nowait(bdev_get_queue(bdev));
+	return !bdev || bdev_nowait(bdev);
 }
 
 /*
