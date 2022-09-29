@@ -247,6 +247,8 @@ ifeq ("$(DISTRO)", "fedora")
   # without changing anything else in the specfile.
   SPECTARFILE_RELEASE:=$(UPSTREAM_TARBALL_NAME)
   SPECKABIVERSION:=$(SPECVERSION)
+  DISTRELEASETAG:=$(RELEASETAG)
+  DISTBASEVERSION:=$(BASEVERSION)
 else ifeq ("$(DISTRO)", "centos")
   RHDISTGIT_BRANCH:=c$(RHEL_MAJOR)s
   ifndef BUILD_PROFILE
@@ -255,8 +257,10 @@ else ifeq ("$(DISTRO)", "centos")
   ifndef BUILD_TARGET
     BUILD_TARGET:=c$(RHEL_MAJOR)s-candidate
   endif
-  SPECTARFILE_RELEASE:=$(BASEVERSION)
-  SPECKABIVERSION:=$(BASEVERSION)
+  SPECTARFILE_RELEASE:=$(BASEVERSION)$(DIST)
+  SPECKABIVERSION:=$(BASEVERSION)$(DIST)
+  DISTRELEASETAG:=$(RELEASETAG)$(DIST)
+  DISTBASEVERSION:=$(BASEVERSION)$(DIST)
   PATCHLIST_URL:=none
 else
   RHDISTGIT_BRANCH:=rhel-$(RHEL_MAJOR).$(RHEL_MINOR).0
@@ -267,8 +271,17 @@ else
       BUILD_TARGET:=rhel-$(RHEL_MAJOR).$(RHEL_MINOR).0-test-pesign
     endif
   endif
-  SPECTARFILE_RELEASE:=$(BASEVERSION)
-  SPECKABIVERSION:=$(BASEVERSION)
+  ifeq ("$(DIST)", ".eln)
+    DISTRELEASETAG:=$(RELEASETAG)
+    DISTBASEVERSION:=$(BASEVERSION)
+    SPECTARFILE_RELEASE:=$(BASEVERSION)
+    SPECKABIVERSION:=$(BASEVERSION)
+  else
+    DISTRELEASETAG:=$(RELEASETAG)$(DIST)
+    DISTBASEVERSION:=$(BASEVERSION)$(DIST)
+    SPECTARFILE_RELEASE:=$(BASEVERSION)$(DIST)
+    SPECKABIVERSION:=$(BASEVERSION)$(DIST)
+  endif
   PATCHLIST_URL:=none
 endif
 
@@ -673,7 +686,7 @@ dist-release-finish: setup-source
 	@echo $(MARKER) > $(REDHAT)/marker
 	@$(GIT) add $(REDHAT)/$(SPECCHANGELOG)
 	@$(GIT) add $(REDHAT)/marker
-	@$(GIT) commit -s ../Makefile.rhelver $(REDHAT)/marker $(REDHAT)/$(SPECCHANGELOG) $(SPECFILE).template -m "[redhat] $(RELEASETAG)"
+	@$(GIT) commit -s ../Makefile.rhelver $(REDHAT)/marker $(REDHAT)/$(SPECCHANGELOG) $(SPECFILE).template -m "[redhat] $(DISTRELEASETAG)"
 dist-release-changed:
 	@CLOGF="$$(mktemp)"; \
 	trap 'rm -f "$$CLOGF"' SIGHUP SIGINT SIGTERM EXIT; \
@@ -690,7 +703,7 @@ dist-release: dist-clean-sources
 	@$(MAKE) dist-release-changed
 
 dist-release-tag:
-	@$(GIT) tag -a -m "$(RELEASETAG)" $(RELEASETAG)
+	@$(GIT) tag -a -m "$(DISTRELEASETAG)" $(DISTRELEASETAG)
 
 git-tree-check:
 	@if test -n "$(DIST_PUSH)" && test -z "$(shell $(GIT) remote get-url gitlab 2>/dev/null)"; then \
