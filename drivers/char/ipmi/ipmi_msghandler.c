@@ -146,6 +146,12 @@ module_param(default_max_retries, uint, 0644);
 MODULE_PARM_DESC(default_max_retries,
 		 "The time (milliseconds) between retry sends in maintenance mode");
 
+/* The default maximum number of users that may register. */
+static unsigned int max_users = 30;
+module_param(max_users, uint, 0644);
+MODULE_PARM_DESC(max_users,
+		 "The most users that may use the IPMI stack at one time.");
+
 /* Call every ~1000 ms. */
 #define IPMI_TIMEOUT_TIME	1000
 
@@ -443,6 +449,7 @@ struct ipmi_smi {
 	 */
 	struct list_head users;
 	struct srcu_struct users_srcu;
+	atomic_t nr_users;
 
 	/* Used for wake ups at startup. */
 	wait_queue_head_t waitq;
@@ -1231,6 +1238,11 @@ int ipmi_create_user(unsigned int          if_num,
 	goto out_kfree;
 
  found:
+	if (atomic_add_return(1, &intf->nr_users) > max_users) {
+		rv = -EBUSY;
+		goto out_kfree;
+	}
+
 	INIT_WORK(&new_user->remove_work, free_user_work);
 
 	rv = init_srcu_struct(&new_user->release_barrier);
@@ -1263,6 +1275,7 @@ int ipmi_create_user(unsigned int          if_num,
 	return 0;
 
 out_kfree:
+	atomic_dec(&intf->nr_users);
 	srcu_read_unlock(&ipmi_interfaces_srcu, index);
 	vfree(new_user);
 	return rv;
@@ -1337,6 +1350,7 @@ static void _ipmi_destroy_user(struct ipmi_user *user)
 	/* Remove the user from the interface's sequence table. */
 	spin_lock_irqsave(&intf->seq_lock, flags);
 	list_del_rcu(&user->link);
+	atomic_dec(&intf->nr_users);
 
 	for (i = 0; i < IPMI_IPMB_NUM_SEQ; i++) {
 		if (intf->seq_table[i].inuse
@@ -3530,6 +3544,7 @@ int ipmi_add_smi(struct module         *owner,
 	if (slave_addr != 0)
 		intf->addrinfo[0].address = slave_addr;
 	INIT_LIST_HEAD(&intf->users);
+	atomic_set(&intf->nr_users, 0);
 	intf->handlers = handlers;
 	intf->send_info = send_info;
 	spin_lock_init(&intf->seq_lock);
