@@ -1183,9 +1183,8 @@ static int phylink_register_sfp(struct phylink *pl,
 
 	bus = sfp_bus_find_fwnode(fwnode);
 	if (IS_ERR(bus)) {
-		ret = PTR_ERR(bus);
-		phylink_err(pl, "unable to attach SFP bus: %d\n", ret);
-		return ret;
+		phylink_err(pl, "unable to attach SFP bus: %pe\n", bus);
+		return PTR_ERR(bus);
 	}
 
 	pl->sfp_bus = bus;
@@ -1374,11 +1373,11 @@ static int phylink_bringup_phy(struct phylink *pl, struct phy_device *phy,
 
 	ret = phylink_validate(pl, supported, &config);
 	if (ret) {
-		phylink_warn(pl, "validation of %s with support %*pb and advertisement %*pb failed: %d\n",
+		phylink_warn(pl, "validation of %s with support %*pb and advertisement %*pb failed: %pe\n",
 			     phy_modes(config.interface),
 			     __ETHTOOL_LINK_MODE_MASK_NBITS, phy->supported,
 			     __ETHTOOL_LINK_MODE_MASK_NBITS, config.advertising,
-			     ret);
+			     ERR_PTR(ret));
 		return ret;
 	}
 
@@ -2577,8 +2576,9 @@ static int phylink_sfp_config(struct phylink *pl, u8 mode,
 	/* Ignore errors if we're expecting a PHY to attach later */
 	ret = phylink_validate(pl, support, &config);
 	if (ret) {
-		phylink_err(pl, "validation with support %*pb failed: %d\n",
-			    __ETHTOOL_LINK_MODE_MASK_NBITS, support, ret);
+		phylink_err(pl, "validation with support %*pb failed: %pe\n",
+			    __ETHTOOL_LINK_MODE_MASK_NBITS, support,
+			    ERR_PTR(ret));
 		return ret;
 	}
 
@@ -2594,10 +2594,12 @@ static int phylink_sfp_config(struct phylink *pl, u8 mode,
 	linkmode_copy(support1, support);
 	ret = phylink_validate(pl, support1, &config);
 	if (ret) {
-		phylink_err(pl, "validation of %s/%s with support %*pb failed: %d\n",
+		phylink_err(pl,
+			    "validation of %s/%s with support %*pb failed: %pe\n",
 			    phylink_an_mode_str(mode),
 			    phy_modes(config.interface),
-			    __ETHTOOL_LINK_MODE_MASK_NBITS, support, ret);
+			    __ETHTOOL_LINK_MODE_MASK_NBITS, support,
+			    ERR_PTR(ret));
 		return ret;
 	}
 
