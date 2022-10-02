@@ -1028,8 +1028,6 @@ static int intel_eth_pci_probe(struct pci_dev *pdev,
 	struct stmmac_resources res;
 	int ret;
 
-	mark_tech_preview("intel-eth-pci", THIS_MODULE);
-
 	intel_priv = devm_kzalloc(&pdev->dev, sizeof(*intel_priv), GFP_KERNEL);
 	if (!intel_priv)
 		return -ENOMEM;
