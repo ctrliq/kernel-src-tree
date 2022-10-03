@@ -4756,6 +4756,9 @@ static inline void netif_set_gso_max_segs(struct net_device *dev,
 	WRITE_ONCE(dev->gso_max_segs, segs);
 }
 
+void netif_inherit_tso_max(struct net_device *to,
+			   const struct net_device *from);
+
 static inline void skb_gso_error_unwind(struct sk_buff *skb, __be16 protocol,
 					int pulled_hlen, u16 mac_offset,
 					int mac_len)
