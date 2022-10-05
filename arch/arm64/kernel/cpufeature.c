@@ -2286,6 +2286,7 @@ static const struct arm64_cpu_capabilities arm64_features[] = {
 		.sys_reg = SYS_ID_AA64ISAR2_EL1,
 		.sign = FTR_UNSIGNED,
 		.field_pos = ID_AA64ISAR2_APA3_SHIFT,
+		.field_width = 4,
 		.min_field_value = ID_AA64ISAR2_APA3_ARCHITECTED,
 		.matches = has_address_auth_cpucap,
 	},
@@ -2323,6 +2324,7 @@ static const struct arm64_cpu_capabilities arm64_features[] = {
 		.sys_reg = SYS_ID_AA64ISAR2_EL1,
 		.sign = FTR_UNSIGNED,
 		.field_pos = ID_AA64ISAR2_GPA3_SHIFT,
+		.field_width = 4,
 		.min_field_value = ID_AA64ISAR2_GPA3_ARCHITECTED,
 		.matches = has_cpuid_feature,
 	},
@@ -2485,7 +2487,7 @@ static const struct arm64_cpu_capabilities ptr_auth_hwcap_addr_matches[] = {
 	},
 	{
 		HWCAP_CPUID_MATCH(SYS_ID_AA64ISAR2_EL1, ID_AA64ISAR2_APA3_SHIFT,
-				  FTR_UNSIGNED, ID_AA64ISAR2_APA3_ARCHITECTED)
+				  4, FTR_UNSIGNED, ID_AA64ISAR2_APA3_ARCHITECTED)
 	},
 	{
 		HWCAP_CPUID_MATCH(SYS_ID_AA64ISAR1_EL1, ID_AA64ISAR1_API_SHIFT,
@@ -2501,7 +2503,7 @@ static const struct arm64_cpu_capabilities ptr_auth_hwcap_gen_matches[] = {
 	},
 	{
 		HWCAP_CPUID_MATCH(SYS_ID_AA64ISAR2_EL1, ID_AA64ISAR2_GPA3_SHIFT,
-				  FTR_UNSIGNED, ID_AA64ISAR2_GPA3_ARCHITECTED)
+				  4, FTR_UNSIGNED, ID_AA64ISAR2_GPA3_ARCHITECTED)
 	},
 	{
 		HWCAP_CPUID_MATCH(SYS_ID_AA64ISAR1_EL1, ID_AA64ISAR1_GPI_SHIFT,
