@@ -262,7 +262,7 @@ static int acpi_irq_parse_one(acpi_handle handle, unsigned int index,
 	 * Don't do the producer/consumer check for that device.
 	 */
 	if (IS_ENABLED(CONFIG_ARM64)) {
-		struct acpi_device *adev = acpi_bus_get_acpi_device(handle);
+		struct acpi_device *adev = acpi_get_acpi_dev(handle);
 
 		if (adev && !strcmp(acpi_device_hid(adev), "APMC0D08"))
 			ctx.skip_producer_check = true;
