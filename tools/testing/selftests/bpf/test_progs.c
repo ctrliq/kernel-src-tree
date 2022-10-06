@@ -1553,6 +1553,17 @@ static void free_test_states(void)
 	}
 }
 
+static const char *rhskip =
+#include "prog_tests/rhskip"
+;
+
+static error_t rh_init(void)
+{
+	if (parse_test_list(rhskip, &env.test_selector.blacklist, true))
+		return -ENOMEM;
+	return 0;
+}
+
 int main(int argc, char **argv)
 {
 	static const struct argp argp = {
@@ -1567,6 +1578,10 @@ int main(int argc, char **argv)
 	int err, i;
 
 	sigaction(SIGSEGV, &sigact, NULL);
+
+	err = rh_init();
+	if (err)
+		return err;
 
 	err = argp_parse(&argp, argc, argv, 0, NULL, &env);
 	if (err)

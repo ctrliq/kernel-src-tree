@@ -380,19 +380,13 @@ define DEFINE_TEST_RUNNER
 
 TRUNNER_OUTPUT := $(OUTPUT)$(if $2,/)$2
 TRUNNER_BINARY := $1$(if $2,-)$2
-TRUNNER_TESTS_RHSKIP := $$(shell $(RHSKIP_FILTER_EVAL)			\
-				 $$(TRUNNER_TESTS_DIR)/rhskip 2>/dev/null)
 TRUNNER_TEST_OBJS := $$(patsubst %.c,$$(TRUNNER_OUTPUT)/%.test.o,	\
-				 $$(filter-out $$(TRUNNER_TESTS_RHSKIP),\
-					       $$(notdir $$(wildcard $(TRUNNER_TESTS_DIR)/*.c))))
+				 $$(notdir $$(wildcard $(TRUNNER_TESTS_DIR)/*.c)))
 TRUNNER_EXTRA_OBJS := $$(patsubst %.c,$$(TRUNNER_OUTPUT)/%.o,		\
 				 $$(filter %.c,$(TRUNNER_EXTRA_SOURCES)))
 TRUNNER_EXTRA_HDRS := $$(filter %.h,$(TRUNNER_EXTRA_SOURCES))
 TRUNNER_TESTS_HDR := $(TRUNNER_TESTS_DIR)/tests.h
-TRUNNER_BPF_RHSKIP := $$(shell $(RHSKIP_FILTER_EVAL)			\
-			       $$(TRUNNER_BPF_PROGS_DIR)/rhskip 2>/dev/null)
-TRUNNER_BPF_SRCS := $$(filter-out $$(TRUNNER_BPF_RHSKIP),		\
-				  $$(notdir $$(wildcard $(TRUNNER_BPF_PROGS_DIR)/*.c)))
+TRUNNER_BPF_SRCS := $$(notdir $$(wildcard $(TRUNNER_BPF_PROGS_DIR)/*.c))
 TRUNNER_BPF_OBJS := $$(patsubst %.c,$$(TRUNNER_OUTPUT)/%.o, $$(TRUNNER_BPF_SRCS))
 TRUNNER_BPF_SKELS := $$(patsubst %.c,$$(TRUNNER_OUTPUT)/%.skel.h,	\
 				 $$(filter-out $(SKEL_BLACKLIST) $(LINKED_BPF_SRCS),\
@@ -464,15 +458,11 @@ endif
 # ensure we set up tests.h header generation rule just once
 ifeq ($($(TRUNNER_TESTS_DIR)-tests-hdr),)
 $(TRUNNER_TESTS_DIR)-tests-hdr := y
-$(TRUNNER_TESTS_HDR): $(TRUNNER_TESTS_DIR)/*.c				\
-		      $(wildcard $(TRUNNER_TESTS_DIR)/rhskip)
+$(TRUNNER_TESTS_HDR): $(TRUNNER_TESTS_DIR)/*.c
 	$$(call msg,TEST-HDR,$(TRUNNER_BINARY),$$@)
 	$$(shell (echo '/* Generated header, do not edit */';					\
 		  sed -n -E 's/^void (serial_)?test_([a-zA-Z0-9_]+)\((void)?\).*/DEFINE_TEST(\2)/p'	\
-			$(TRUNNER_TESTS_DIR)/*.c | 			\
-		  ([[ -f $(TRUNNER_TESTS_DIR)/rhskip ]] && 					\
-		   grep -v "`$(RHSKIP_FILTER_EVAL) $(TRUNNER_TESTS_DIR)/rhskip`" || cat	\
-		  ) | sort						\
+			$(TRUNNER_TESTS_DIR)/*.c | sort ;	\
 		 ) > $$@)
 endif
 
