@@ -640,7 +640,6 @@ sources-rh: $(TARBALL) generate-testpatch-tmp setup-source dist-configs-check
 		configs/generate_all_configs.sh \
 		configs/merge.pl \
 		configs/process_configs.sh \
-		parallel_xz.sh \
 		../Makefile.rhelver \
 		README.rst \
 		kernel-local \
