@@ -4,6 +4,13 @@ if [ -s "$REDHAT/linux-kernel-test.patch" ]; then
 	exit 1;
 fi
 
+if [ "${RTBUILD}" != "" ]; then
+	RTBUILD="$[RTBUILD + 1]";
+	sed -i -e "s/^RTBUILD:=.*$/RTBUILD:=.$RTBUILD/" "$REDHAT"/../Makefile.rhelver;
+	echo "RTBUILD set to ${RTBUILD}"
+	exit 0
+fi
+
 RELEASE=$(sed -n -e 's/^RHEL_RELEASE\ =\ \(.*\)/\1/p' "$REDHAT"/../Makefile.rhelver)
 
 YVER=$(echo "$RELEASE" | cut -d "." -f 1)

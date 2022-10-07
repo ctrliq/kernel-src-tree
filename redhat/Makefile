@@ -65,9 +65,13 @@ FLAVOR=
 CURARCH := $(shell uname -m)
 ARCHCONFIG := $(shell uname -m | sed -e s/x86_64/X86_64/ \
 				     -e s/s390x/S390/ -e s/ppc.*/PPC/ )
+# Realtime variables
+RTBZ:=2125474
+RTTAG:=.$(shell cat $(REDHAT)/../localversion-rt | cut -c 2-)
+RTBUILD:=$(shell sed -n -e 's/^RTBUILD:=\.\(.*\)/\1/p' $(REDHAT)/../Makefile.rhelver)
 
 # rpm information
-SPECFILE:=$(PACKAGE_NAME).spec
+SPECFILE:=kernel.spec
 RPM:=$(REDHAT)/rpm
 SRPMS:=$(RPM)/SRPMS
 SOURCES:=$(RPM)/SOURCES
@@ -227,7 +231,7 @@ endif
 # $(PACKAGE_NAME)-$(BASEVERSION)                                                            $(DIST)
 # $(RELEASETAG)                                                                             $(DIST)
 #
-SPECBUILD:=$(UPSTREAMBUILD)$(BUILD)$(LOCALVERSION)
+SPECBUILD:=$(UPSTREAMBUILD)$(BUILD)$(RTTAG).$(RTBUILD)$(LOCALVERSION)
 SPECVERSION:=$(SPECKVERSION).$(SPECKPATCHLEVEL).$(SPECKSUBLEVEL)
 BASEVERSION:=$(SPECVERSION)-$(SPECBUILD)
 RELEASETAG:=$(PACKAGE_NAME)-$(BASEVERSION)

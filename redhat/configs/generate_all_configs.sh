@@ -19,8 +19,8 @@ else
 	SECONDARY=fedora
 fi
 
-for i in kernel-*-"$FLAVOR".config; do
-	NEW=kernel-"$SPECVERSION"-$(echo "$i" | cut -d - -f2- | sed s/-"$FLAVOR"//)
+for i in kernel-rt-*-"$FLAVOR".config; do
+	NEW=kernel-rt-"$SPECVERSION"-$(echo "$i" | cut -d - -f3- | sed s/-"$FLAVOR"//)
 	#echo $NEW
 	mv "$i" "$NEW"
 done
