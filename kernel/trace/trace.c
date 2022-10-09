@@ -9744,6 +9744,8 @@ static __init int tracer_init_tracefs(void)
 		tracer_init_tracefs_work_func(NULL);
 	}
 
+	rv_init_interface();
+
 	return 0;
 }
 
