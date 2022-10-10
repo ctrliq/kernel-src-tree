@@ -1441,11 +1441,6 @@ static int lm49453_i2c_probe(struct i2c_client *i2c)
 	return ret;
 }
 
-static int lm49453_i2c_remove(struct i2c_client *client)
-{
-	return 0;
-}
-
 static const struct i2c_device_id lm49453_i2c_id[] = {
 	{ "lm49453", 0 },
 	{ }
@@ -1457,7 +1452,6 @@ static struct i2c_driver lm49453_i2c_driver = {
 		.name = "lm49453",
 	},
 	.probe_new = lm49453_i2c_probe,
-	.remove = lm49453_i2c_remove,
 	.id_table = lm49453_i2c_id,
 };
 
