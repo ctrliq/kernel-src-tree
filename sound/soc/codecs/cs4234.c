@@ -662,6 +662,7 @@ static const struct snd_soc_component_driver soc_component_cs4234 = {
 	.set_bias_level		= cs4234_set_bias_level,
 	.idle_bias_on		= 1,
 	.suspend_bias_off	= 1,
+	.endianness		= 1,
 };
 
 static const struct regmap_config cs4234_regmap = {
