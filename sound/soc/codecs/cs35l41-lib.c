@@ -1063,6 +1063,9 @@ static int cs35l41_boost_config(struct device *dev, struct regmap *regmap, int b
 		return ret;
 	}
 
+	regmap_update_bits(regmap, CS35L41_PWR_CTRL2, CS35L41_BST_EN_MASK,
+			   CS35L41_BST_EN_DEFAULT << CS35L41_BST_EN_SHIFT);
+
 	return 0;
 }
 
