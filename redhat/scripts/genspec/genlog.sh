@@ -32,7 +32,7 @@ cversion="[$DISTBASEVERSION]";
 echo "* $cdate $cname $cversion" > "$clogf"
 
 git log --topo-order --no-merges -z "$GIT_NOTES" "$GIT_FORMAT" \
-	^"${UPSTREAM}" "$lasttag".. -- ':!/redhat/rhdocs' | "${0%/*}"/genlog.py >> "$clogf"
+	^"${UPSTREAM}" "$lasttag".. -- ':!/redhat/rhdocs' | "${0%/*}"/scripts/genspec/genlog.py >> "$clogf"
 
 if [ "$HIDE_REDHAT" = "1" ]; then
 	grep -v -e "^- \[redhat\]" "$clogf" |

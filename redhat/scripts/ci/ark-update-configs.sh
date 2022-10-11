@@ -61,7 +61,7 @@ new_head="$(git rev-parse HEAD)"
 # configs/<date>/<config> branch.  These commits are used for Merge
 # Requests.
 if [ "$old_head" != "$new_head" ]; then
-	./redhat/gen_config_patches.sh
+	./redhat/scripts/genspec/gen_config_patches.sh
 else
 	printf "No new configuration values exposed from merging %s into $BRANCH\n" "$UPSTREAM_REF"
 fi

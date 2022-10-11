@@ -103,7 +103,7 @@ for f in "$config_bundles_dir"/*; do
 	echo "[redhat] New configs in $_f" > "$tmpdir"/commit
 	echo "" >> "$tmpdir"/commit
 	# And the boiler plate
-	cat redhat/commit_template >> "$tmpdir"/commit
+	cat redhat/scripts/genspec/commit_template >> "$tmpdir"/commit
 	# This loop actually grabs the help text to put in the commit
 	while read -r line; do
 		# last line is the actual config we need to put in the dir

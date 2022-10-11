@@ -597,7 +597,7 @@ _setup-source: dist-git-version-check
 		echo "Error: PATCHLIST_URL must be set (to 'none' or any URL)"; \
 		exit 1; \
 	fi
-	@$(REDHAT)/genspec.sh
+	@$(REDHAT)/scripts/genspec/genspec.sh
 	@cp $(SOURCES)/$(SPECFILE) $(SOURCES)/../SPECS/
 
 setup-source: dist-clean-sources _setup-source
@@ -700,7 +700,7 @@ dist-release-finish: setup-source
 dist-release-changed:
 	@CLOGF="$$(mktemp)"; \
 	trap 'rm -f "$$CLOGF"' SIGHUP SIGINT SIGTERM EXIT; \
-	$(REDHAT)/genlog.sh "$$CLOGF"; \
+	$(REDHAT)/scripts/genspec/genlog.sh "$$CLOGF"; \
 	if [ "$(MARKER)" == "$$(cat $(REDHAT)/marker)" ] && \
 	   [ "$$(wc -l $$CLOGF | cut -d ' ' -f 1)" -le 3 ]; then \
 		echo "Nothing changed, skipping updates"; \
