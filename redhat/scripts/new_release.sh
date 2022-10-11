@@ -1,29 +1,18 @@
 #!/bin/bash
-if [[ -z $1 || -z $2 ]]; then
-	echo "$(basename "$0") <redhat path> <zstream? no/yes/branch>" >&2;
-	exit 1;
-fi
-
-RHPATH="$1";
-YSTREAM_FLAG="$2";
-ZSTREAM_FLAG="$3";
-BUMP_RELEASE="$4";
-AUTOMOTIVEBUILD="$5";
-
-if [ -s "$RHPATH/linux-kernel-test.patch" ]; then
+if [ -s "$REDHAT/linux-kernel-test.patch" ]; then
 	echo "linux-kernel-test.patch is not empty, aborting" >&2;
 	exit 1;
 fi
 
 if [ "${AUTOMOTIVEBUILD}" != "" ]; then
-    AUTOMOTIVEBUILD=$(sed -n -e 's/^AUTOMOTIVEBUILD:=\.\(.*\)/\1/p' $RHPATH/../Makefile.rhelver);
-    NEW_RELEASE="$[AUTOMOTIVEBUILD + 1]";
-    sed -i -e "s/^AUTOMOTIVEBUILD:=.*$/AUTOMOTIVEBUILD:=.$NEW_RELEASE/" $RHPATH/../Makefile.rhelver;
-    echo "AUTOMOTIVEBUILD set to ${NEW_RELEASE}"
-    exit 0;
+        AUTOMOTIVEBUILD=$(sed -n -e 's/^AUTOMOTIVEBUILD:=\.\(.*\)/\1/p' $REDHAT/../Makefile.rhelver);
+	AUTOMOTIVEBUILD="$[AUTOMOTIVEBUILD + 1]";
+	sed -i -e "s/^AUTOMOTIVEBUILD:=.*$/AUTOMOTIVEBUILD:=.$AUTOMOTIVEBUILD/" "$REDHAT"/../Makefile.rhelver;
+	echo "AUTOMOTIVEBUILD set to ${AUTOMOTIVEBUILD}"
+	exit 0
 fi
 
-RELEASE=$(sed -n -e 's/^RHEL_RELEASE\ =\ \(.*\)/\1/p' "$RHPATH"/../Makefile.rhelver)
+RELEASE=$(sed -n -e 's/^RHEL_RELEASE\ =\ \(.*\)/\1/p' "$REDHAT"/../Makefile.rhelver)
 
 YVER=$(echo "$RELEASE" | cut -d "." -f 1)
 YVER=${YVER:="$RELEASE"}
@@ -38,15 +27,15 @@ elif [ "$ZSTREAM_FLAG" == "no" ]; then
 	if [ "$YSTREAM_FLAG" == "yes" ]; then
 		NEW_RELEASE="$((RELEASE + 1))";
 	else
-		EARLY_YBUILD=$(sed -n -e 's/^EARLY_YBUILD:=\(.*\)/\1/p' "$RHPATH"/../Makefile.rhelver);
-		EARLY_YRELEASE=$(sed -n -e 's/^EARLY_YRELEASE:=\(.*\)/\1/p' "$RHPATH"/../Makefile.rhelver);
+		EARLY_YBUILD=$(sed -n -e 's/^EARLY_YBUILD:=\(.*\)/\1/p' "$REDHAT"/../Makefile.rhelver);
+		EARLY_YRELEASE=$(sed -n -e 's/^EARLY_YRELEASE:=\(.*\)/\1/p' "$REDHAT"/../Makefile.rhelver);
 		if [ "$EARLY_YBUILD" != "$RELEASE" ]; then
 			NEW_EARLY_YRELEASE=1;
 		else
 			NEW_EARLY_YRELEASE="$((EARLY_YRELEASE + 1))";
 		fi
-		sed -i -e "s/^EARLY_YBUILD:=$EARLY_YBUILD/EARLY_YBUILD:=$RELEASE/" "$RHPATH"/../Makefile.rhelver;
-		sed -i -e "s/^EARLY_YRELEASE:=$EARLY_YRELEASE/EARLY_YRELEASE:=$NEW_EARLY_YRELEASE/" "$RHPATH"/../Makefile.rhelver;
+		sed -i -e "s/^EARLY_YBUILD:=$EARLY_YBUILD/EARLY_YBUILD:=$RELEASE/" "$REDHAT"/../Makefile.rhelver;
+		sed -i -e "s/^EARLY_YRELEASE:=$EARLY_YRELEASE/EARLY_YRELEASE:=$NEW_EARLY_YRELEASE/" "$REDHAT"/../Makefile.rhelver;
 		NEW_RELEASE=$RELEASE;
 	fi
 elif [ "$ZSTREAM_FLAG" == "yes" ]; then
@@ -58,5 +47,5 @@ else
 	exit 1;
 fi
 
-sed -i -e "s/RHEL_RELEASE\ =.*/RHEL_RELEASE\ =\ $NEW_RELEASE/" "$RHPATH"/../Makefile.rhelver;
+sed -i -e "s/RHEL_RELEASE\ =.*/RHEL_RELEASE\ =\ $NEW_RELEASE/" "$REDHAT"/../Makefile.rhelver;
 
