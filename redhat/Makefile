@@ -629,10 +629,10 @@ sources-rh: $(TARBALL) generate-testpatch-tmp setup-source dist-configs-check
 		gating.yaml \
 		update_scripts.sh \
 		kvm_stat.logrotate \
-		mod-denylist.sh \
-		mod-internal.list \
-		mod-partner.list \
-		mod-sign.sh \
+		scripts/mod/mod-denylist.sh \
+		scripts/mod/mod-internal.list \
+		scripts/mod/mod-partner.list \
+		scripts/mod/mod-sign.sh \
 		configs/flavors \
 		configs/generate_all_configs.sh \
 		configs/merge.pl \
