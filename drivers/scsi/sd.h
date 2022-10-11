@@ -165,7 +165,11 @@ struct scsi_disk {
 	 * The following padding has been inserted before ABI freeze to
 	 * allow extending the structure while preserving ABI.
 	 */
-	RH_KABI_RESERVE(1)
+	/*
+	 * Either zero or a power of two. If not zero it means that the offset
+	 * between zone starting LBAs is constant.
+	 */
+	RH_KABI_USE(1, u32 zone_starting_lba_gran)
 	RH_KABI_RESERVE(2)
 	RH_KABI_RESERVE(3)
 	RH_KABI_RESERVE(4)
