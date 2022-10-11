@@ -170,7 +170,7 @@ struct scsi_disk {
 	 * between zone starting LBAs is constant.
 	 */
 	RH_KABI_USE(1, u32 zone_starting_lba_gran)
-	RH_KABI_RESERVE(2)
+	RH_KABI_USE(2, u32 min_xfer_blocks)
 	RH_KABI_RESERVE(3)
 	RH_KABI_RESERVE(4)
 };
