@@ -4822,7 +4822,7 @@ static void sdebug_q_cmd_complete(struct sdebug_defer *sd_dp)
 			pr_info("bypassing scsi_done() due to aborted cmd\n");
 		return;
 	}
-	scp->scsi_done(scp); /* callback to mid level */
+	scsi_done(scp); /* callback to mid level */
 }
 
 /* When high resolution timer goes off this function is called. */
@@ -5530,7 +5530,7 @@ static int schedule_resp(struct scsi_cmnd *cmnd, struct sdebug_dev_info *devip,
 					if (new_sd_dp)
 						kfree(sd_dp);
 					/* call scsi_done() from this thread */
-					cmnd->scsi_done(cmnd);
+					scsi_done(cmnd);
 					return 0;
 				}
 				/* otherwise reduce kt by elapsed time */
@@ -5610,7 +5610,7 @@ respond_in_thread:	/* call back to mid-layer using invocation thread */
 	cmnd->result &= ~SDEG_RES_IMMED_MASK;
 	if (cmnd->result == 0 && scsi_result != 0)
 		cmnd->result = scsi_result;
-	cmnd->scsi_done(cmnd);
+	scsi_done(cmnd);
 	return 0;
 }
 
@@ -7369,7 +7369,7 @@ static int sdebug_blk_mq_poll(struct Scsi_Host *shost, unsigned int queue_num)
 		}
 		WRITE_ONCE(sd_dp->defer_t, SDEB_DEFER_NONE);
 		spin_unlock_irqrestore(&sqp->qc_lock, iflags);
-		scp->scsi_done(scp); /* callback to mid level */
+		scsi_done(scp); /* callback to mid level */
 		spin_lock_irqsave(&sqp->qc_lock, iflags);
 		num_entries++;
 	}
