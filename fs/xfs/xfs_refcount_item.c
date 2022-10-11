@@ -423,7 +423,7 @@ xfs_cui_validate_phys(
 	struct xfs_mount		*mp,
 	struct xfs_phys_extent		*refc)
 {
-	if (!xfs_sb_version_hasreflink(&mp->m_sb))
+	if (!xfs_has_reflink(mp))
 		return false;
 
 	if (refc->pe_flags & ~XFS_REFCOUNT_EXTENT_FLAGS)
@@ -457,7 +457,7 @@ xfs_cui_item_recover(
 	struct xfs_cud_log_item		*cudp;
 	struct xfs_trans		*tp;
 	struct xfs_btree_cur		*rcur = NULL;
-	struct xfs_mount		*mp = lip->li_mountp;
+	struct xfs_mount		*mp = lip->li_log->l_mp;
 	xfs_fsblock_t			new_fsb;
 	xfs_extlen_t			new_len;
 	unsigned int			refc_type;
@@ -522,6 +522,9 @@ xfs_cui_item_recover(
 			error = xfs_trans_log_finish_refcount_update(tp, cudp,
 				type, refc->pe_startblock, refc->pe_len,
 				&new_fsb, &new_len, &rcur);
+		if (error == -EFSCORRUPTED)
+			XFS_CORRUPTION_ERROR(__func__, XFS_ERRLEVEL_LOW, mp,
+					refc, sizeof(*refc));
 		if (error)
 			goto abort_error;
 
