@@ -488,17 +488,6 @@ struct vm_area_struct {
 	RH_KABI_RESERVE(4)
 } __randomize_layout;
 
-struct core_thread {
-	struct task_struct *task;
-	struct core_thread *next;
-};
-
-struct core_state {
-	atomic_t nr_threads;
-	struct core_thread dumper;
-	struct completion startup;
-};
-
 struct kioctx_table;
 struct mm_struct {
 	struct {
@@ -618,8 +607,6 @@ struct mm_struct {
 		mm_context_t context;
 
 		unsigned long flags; /* Must use atomic bitops to access */
-
-		struct core_state *core_state; /* coredumping support */
 
 #ifdef CONFIG_AIO
 		spinlock_t			ioctx_lock;
