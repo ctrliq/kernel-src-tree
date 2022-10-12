@@ -165,15 +165,14 @@ static inline int num_contig_ptes(unsigned long size, size_t *pgsize)
  *
  * This helper performs the break step.
  */
-static pte_t get_clear_flush(struct mm_struct *mm,
+static pte_t get_clear_contig(struct mm_struct *mm,
 			     unsigned long addr,
 			     pte_t *ptep,
 			     unsigned long pgsize,
 			     unsigned long ncontig)
 {
 	pte_t orig_pte = huge_ptep_get(ptep);
-	bool valid = pte_valid(orig_pte);
-	unsigned long i, saddr = addr;
+	unsigned long i;
 
 	for (i = 0; i < ncontig; i++, addr += pgsize, ptep++) {
 		pte_t pte = ptep_get_and_clear(mm, addr, ptep);
@@ -188,11 +187,6 @@ static pte_t get_clear_flush(struct mm_struct *mm,
 
 		if (pte_young(pte))
 			orig_pte = pte_mkyoung(orig_pte);
-	}
-
-	if (valid) {
-		struct vm_area_struct vma = TLB_FLUSH_VMA(mm, 0);
-		flush_tlb_range(&vma, saddr, addr);
 	}
 	return orig_pte;
 }
@@ -391,7 +385,7 @@ pte_t huge_ptep_get_and_clear(struct mm_struct *mm,
 
 	ncontig = find_num_contig(mm, addr, ptep, &pgsize);
 
-	return get_clear_flush(mm, addr, ptep, pgsize, ncontig);
+	return get_clear_contig(mm, addr, ptep, pgsize, ncontig);
 }
 
 /*
@@ -442,7 +436,7 @@ int huge_ptep_set_access_flags(struct vm_area_struct *vma,
 	if (!__cont_access_flags_changed(ptep, pte, ncontig))
 		return 0;
 
-	orig_pte = get_clear_flush(vma->vm_mm, addr, ptep, pgsize, ncontig);
+	orig_pte = get_clear_contig(vma->vm_mm, addr, ptep, pgsize, ncontig);
 
 	/* Make sure we don't lose the dirty or young state */
 	if (pte_dirty(orig_pte))
@@ -475,7 +469,7 @@ void huge_ptep_set_wrprotect(struct mm_struct *mm,
 	ncontig = find_num_contig(mm, addr, ptep, &pgsize);
 	dpfn = pgsize >> PAGE_SHIFT;
 
-	pte = get_clear_flush(mm, addr, ptep, pgsize, ncontig);
+	pte = get_clear_contig(mm, addr, ptep, pgsize, ncontig);
 	pte = pte_wrprotect(pte);
 
 	hugeprot = pte_pgprot(pte);
