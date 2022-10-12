@@ -865,6 +865,8 @@ static inline void page_mapcount_reset(struct page *page)
 
 int __page_mapcount(struct page *page);
 
+unsigned long nr_free_buffer_pages(void);
+
 /*
  * Mapcount of 0-order page; when compound sub-page, includes
  * compound_mapcount().
