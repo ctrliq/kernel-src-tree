@@ -52,9 +52,7 @@ SECTIONS
 		KEEP(*(.dma.ex_table))
 		_stop_dma_ex_table = .;
 	}
-	.dma.data : {
-		*(.dma.data)
-	}
+	.dma.data : { *(.dma.data) }
 	. = ALIGN(PAGE_SIZE);
 	_edma = .;
 
