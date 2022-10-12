@@ -620,7 +620,7 @@ sources-rh: $(TARBALL) generate-testpatch-tmp setup-source dist-configs-check
 	@cat configs/flavors | while read flavor; do echo "Copying sources for $${flavor}"; [ -e $${flavor}_files ] && cp $${flavor}_files/* $(SOURCES); done
 	@sed -e "s/%%SPECKVERSION%%/$(SPECKVERSION)/" \
 		-e "s/%%SPECKPATCHLEVEL%%/$(SPECKPATCHLEVEL)/" \
-		rpminspect.yaml > $(SOURCES)/rpminspect.yaml
+		scripts/gating/rpminspect.yaml > $(SOURCES)/rpminspect.yaml
 	@cp scripts/kernel-tools/cpupower.config \
 		scripts/kernel-tools/cpupower.service \
 		scripts/kernel-tools/kvm_stat.logrotate \
@@ -628,7 +628,7 @@ sources-rh: $(TARBALL) generate-testpatch-tmp setup-source dist-configs-check
 		kabi/check-kabi \
 		configs/$(PACKAGE_NAME)-*.config \
 		configs/partial*.config \
-		gating.yaml \
+		scripts/gating/gating.yaml \
 		scripts/update_scripts.sh \
 		scripts/mod/mod-denylist.sh \
 		scripts/mod/mod-internal.list \
