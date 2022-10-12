@@ -7,9 +7,9 @@
 #include <linux/mm_types.h>
 #include <linux/memblock.h>
 #include <linux/memremap.h>
+#include <linux/debugfs.h>
 #include <misc/cxl-base.h>
 
-#include <asm/debugfs.h>
 #include <asm/pgalloc.h>
 #include <asm/tlb.h>
 #include <asm/trace.h>
@@ -521,7 +521,7 @@ static int __init pgtable_debugfs_setup(void)
 	 * invalidated as expected.
 	 */
 	debugfs_create_bool("tlbie_enabled", 0600,
-			powerpc_debugfs_root,
+			arch_debugfs_dir,
 			&tlbie_enabled);
 
 	return 0;
