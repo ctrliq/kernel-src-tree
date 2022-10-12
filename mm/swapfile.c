@@ -1602,31 +1602,30 @@ static bool page_swapped(struct page *page)
 	return false;
 }
 
-static int page_trans_huge_map_swapcount(struct page *page, int *total_mapcount,
+static int page_trans_huge_map_swapcount(struct page *page,
 					 int *total_swapcount)
 {
-	int i, map_swapcount, _total_mapcount, _total_swapcount;
+	int i, map_swapcount, _total_swapcount;
 	unsigned long offset = 0;
 	struct swap_info_struct *si;
 	struct swap_cluster_info *ci = NULL;
 	unsigned char *map = NULL;
-	int mapcount, swapcount = 0;
+	int swapcount = 0;
 
 	/* hugetlbfs shouldn't call it */
 	VM_BUG_ON_PAGE(PageHuge(page), page);
 
 	if (!IS_ENABLED(CONFIG_THP_SWAP) || likely(!PageTransCompound(page))) {
-		mapcount = page_trans_huge_mapcount(page, total_mapcount);
 		if (PageSwapCache(page))
 			swapcount = page_swapcount(page);
 		if (total_swapcount)
 			*total_swapcount = swapcount;
-		return mapcount + swapcount;
+		return swapcount + page_trans_huge_mapcount(page, NULL);
 	}
 
 	page = compound_head(page);
 
-	_total_mapcount = _total_swapcount = map_swapcount = 0;
+	_total_swapcount = map_swapcount = 0;
 	if (PageSwapCache(page)) {
 		swp_entry_t entry;
 
@@ -1640,8 +1639,7 @@ static int page_trans_huge_map_swapcount(struct page *page, int *total_mapcount,
 	if (map)
 		ci = lock_cluster(si, offset);
 	for (i = 0; i < HPAGE_PMD_NR; i++) {
-		mapcount = atomic_read(&page[i]._mapcount) + 1;
-		_total_mapcount += mapcount;
+		int mapcount = atomic_read(&page[i]._mapcount) + 1;
 		if (map) {
 			swapcount = swap_count(map[offset + i]);
 			_total_swapcount += swapcount;
@@ -1649,19 +1647,14 @@ static int page_trans_huge_map_swapcount(struct page *page, int *total_mapcount,
 		map_swapcount = max(map_swapcount, mapcount + swapcount);
 	}
 	unlock_cluster(ci);
-	if (PageDoubleMap(page)) {
+
+	if (PageDoubleMap(page))
 		map_swapcount -= 1;
-		_total_mapcount -= HPAGE_PMD_NR;
-	}
-	mapcount = compound_mapcount(page);
-	map_swapcount += mapcount;
-	_total_mapcount += mapcount;
-	if (total_mapcount)
-		*total_mapcount = _total_mapcount;
+
 	if (total_swapcount)
 		*total_swapcount = _total_swapcount;
 
-	return map_swapcount;
+	return map_swapcount + compound_mapcount(page);
 }
 
 /*
@@ -1672,13 +1665,12 @@ static int page_trans_huge_map_swapcount(struct page *page, int *total_mapcount,
  */
 bool reuse_swap_page(struct page *page)
 {
-	int count, total_mapcount, total_swapcount;
+	int count, total_swapcount;
 
 	VM_BUG_ON_PAGE(!PageLocked(page), page);
 	if (unlikely(PageKsm(page)))
 		return false;
-	count = page_trans_huge_map_swapcount(page, &total_mapcount,
-					      &total_swapcount);
+	count = page_trans_huge_map_swapcount(page, &total_swapcount);
 	if (count == 1 && PageSwapCache(page) &&
 	    (likely(!PageTransCompound(page)) ||
 	     /* The remaining swap count will be freed soon */
