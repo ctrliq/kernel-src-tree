@@ -231,20 +231,19 @@ static bool remove_migration_pte(struct folio *folio,
 
 			pte = pte_mkhuge(pte);
 			pte = arch_make_huge_pte(pte, shift, vma->vm_flags);
-			set_huge_pte_at(vma->vm_mm, pvmw.address, pvmw.pte, pte);
 			if (folio_test_anon(folio))
 				hugepage_add_anon_rmap(new, vma, pvmw.address);
 			else
 				page_dup_rmap(new, true);
+			set_huge_pte_at(vma->vm_mm, pvmw.address, pvmw.pte, pte);
 		} else
 #endif
 		{
-			set_pte_at(vma->vm_mm, pvmw.address, pvmw.pte, pte);
-
 			if (folio_test_anon(folio))
 				page_add_anon_rmap(new, vma, pvmw.address, false);
 			else
 				page_add_file_rmap(new, vma, false);
+			set_pte_at(vma->vm_mm, pvmw.address, pvmw.pte, pte);
 		}
 		if (vma->vm_flags & VM_LOCKED)
 			mlock_page_drain_local();
