@@ -1428,7 +1428,7 @@ static bool try_to_unmap_one(struct folio *folio, struct vm_area_struct *vma,
 		pvmw.flags = PVMW_SYNC;
 
 	if (flags & TTU_SPLIT_HUGE_PMD)
-		split_huge_pmd_address(vma, address, false, folio_page(folio, 0));
+		split_huge_pmd_address(vma, address, false, folio);
 
 	/*
 	 * For THP, we have to assume the worse case ie pmd for invalidation.
@@ -1725,7 +1725,7 @@ static bool try_to_migrate_one(struct folio *folio, struct vm_area_struct *vma,
 	 * TTU_SPLIT_HUGE_PMD and it wants to freeze.
 	 */
 	if (flags & TTU_SPLIT_HUGE_PMD)
-		split_huge_pmd_address(vma, address, true, folio_page(folio, 0));
+		split_huge_pmd_address(vma, address, true, folio);
 
 	/*
 	 * For THP, we have to assume the worse case ie pmd for invalidation.
