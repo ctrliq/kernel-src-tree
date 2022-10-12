@@ -26,7 +26,7 @@ extern unsigned long raw_copy_to_user(void __user *to, const void *from, unsigne
 extern long strncpy_from_user(char *dst, const char __user *src, long count);
 extern long strnlen_user(const void __user *str, long len);
 extern unsigned long __clear_user(void __user *mem, unsigned long len);
-static inline int __access_ok(unsigned long addr, unsigned long size);
+static inline int __access_ok(const void __user *ptr, unsigned long size);
 
 /* Teach asm-generic/uaccess.h that we have C functions for these. */
 #define __access_ok __access_ok
@@ -38,8 +38,9 @@ static inline int __access_ok(unsigned long addr, unsigned long size);
 
 #include <asm-generic/uaccess.h>
 
-static inline int __access_ok(unsigned long addr, unsigned long size)
+static inline int __access_ok(const void __user *ptr, unsigned long size)
 {
+	unsigned long addr = (unsigned long)ptr;
 	return __addr_range_nowrap(addr, size) &&
 		(__under_task_size(addr, size) ||
 		__access_ok_vsyscall(addr, size) ||
