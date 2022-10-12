@@ -1391,7 +1391,7 @@ static enum page_references folio_check_references(struct folio *folio,
 		/*
 		 * All mapped folios start out with page table
 		 * references from the instantiating fault, so we need
-		 * to look twice if a mapped file folio is used more
+		 * to look twice if a mapped file/anon folio is used more
 		 * than once.
 		 *
 		 * Mark it and spare it for another trip around the
