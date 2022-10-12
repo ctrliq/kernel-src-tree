@@ -143,14 +143,14 @@ file_ra_state_init(struct file_ra_state *ra, struct address_space *mapping)
 }
 EXPORT_SYMBOL_GPL(file_ra_state_init);
 
-static void read_pages(struct readahead_control *rac, bool skip_page)
+static void read_pages(struct readahead_control *rac)
 {
 	const struct address_space_operations *aops = rac->mapping->a_ops;
 	struct page *page;
 	struct blk_plug plug;
 
 	if (!readahead_count(rac))
-		goto out;
+		return;
 
 	blk_start_plug(&plug);
 
@@ -180,10 +180,6 @@ static void read_pages(struct readahead_control *rac, bool skip_page)
 	blk_finish_plug(&plug);
 
 	BUG_ON(readahead_count(rac));
-
-out:
-	if (skip_page)
-		rac->_index++;
 }
 
 /**
@@ -236,7 +232,8 @@ void page_cache_ra_unbounded(struct readahead_control *ractl,
 			 * have a stable reference to this page, and it's
 			 * not worth getting one just for that.
 			 */
-			read_pages(ractl, true);
+			read_pages(ractl);
+			ractl->_index++;
 			i = ractl->_index + ractl->_nr_pages - index - 1;
 			continue;
 		}
@@ -247,7 +244,8 @@ void page_cache_ra_unbounded(struct readahead_control *ractl,
 		if (filemap_add_folio(mapping, folio, index + i,
 					gfp_mask) < 0) {
 			folio_put(folio);
-			read_pages(ractl, true);
+			read_pages(ractl);
+			ractl->_index++;
 			i = ractl->_index + ractl->_nr_pages - index - 1;
 			continue;
 		}
@@ -261,7 +259,7 @@ void page_cache_ra_unbounded(struct readahead_control *ractl,
 	 * uptodate then the caller will launch readpage again, and
 	 * will then handle the error.
 	 */
-	read_pages(ractl, false);
+	read_pages(ractl);
 	filemap_invalidate_unlock_shared(mapping);
 	memalloc_nofs_restore(nofs);
 }
@@ -537,7 +535,7 @@ void page_cache_ra_order(struct readahead_control *ractl,
 		ra->async_size += index - limit - 1;
 	}
 
-	read_pages(ractl, false);
+	read_pages(ractl);
 	filemap_invalidate_unlock_shared(mapping);
 
 	/*
