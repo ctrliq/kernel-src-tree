@@ -261,9 +261,13 @@ void filemap_remove_folio(struct folio *folio)
 	struct address_space *mapping = folio->mapping;
 
 	BUG_ON(!folio_test_locked(folio));
+	spin_lock(&mapping->host->i_lock);
 	xa_lock_irq(&mapping->i_pages);
 	__filemap_remove_folio(folio, NULL);
 	xa_unlock_irq(&mapping->i_pages);
+	if (mapping_shrinkable(mapping))
+		inode_add_lru(mapping->host);
+	spin_unlock(&mapping->host->i_lock);
 
 	filemap_free_folio(mapping, folio);
 }
@@ -330,6 +334,7 @@ void delete_from_page_cache_batch(struct address_space *mapping,
 	if (!folio_batch_count(fbatch))
 		return;
 
+	spin_lock(&mapping->host->i_lock);
 	xa_lock_irq(&mapping->i_pages);
 	for (i = 0; i < folio_batch_count(fbatch); i++) {
 		struct folio *folio = fbatch->folios[i];
@@ -339,6 +344,9 @@ void delete_from_page_cache_batch(struct address_space *mapping,
 	}
 	page_cache_delete_batch(mapping, fbatch);
 	xa_unlock_irq(&mapping->i_pages);
+	if (mapping_shrinkable(mapping))
+		inode_add_lru(mapping->host);
+	spin_unlock(&mapping->host->i_lock);
 
 	for (i = 0; i < folio_batch_count(fbatch); i++)
 		filemap_free_folio(mapping, fbatch->folios[i]);

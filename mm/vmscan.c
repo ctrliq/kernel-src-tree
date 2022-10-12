@@ -1205,6 +1205,8 @@ static int __remove_mapping(struct address_space *mapping, struct folio *folio,
 	BUG_ON(!folio_test_locked(folio));
 	BUG_ON(mapping != folio_mapping(folio));
 
+	if (!folio_test_swapcache(folio))
+		spin_lock(&mapping->host->i_lock);
 	xa_lock_irq(&mapping->i_pages);
 	/*
 	 * The non racy check for a busy page.
@@ -1273,6 +1275,9 @@ static int __remove_mapping(struct address_space *mapping, struct folio *folio,
 			shadow = workingset_eviction(folio, target_memcg);
 		__filemap_remove_folio(folio, shadow);
 		xa_unlock_irq(&mapping->i_pages);
+		if (mapping_shrinkable(mapping))
+			inode_add_lru(mapping->host);
+		spin_unlock(&mapping->host->i_lock);
 
 		if (freepage != NULL)
 			freepage(&folio->page);
@@ -1282,6 +1287,8 @@ static int __remove_mapping(struct address_space *mapping, struct folio *folio,
 
 cannot_free:
 	xa_unlock_irq(&mapping->i_pages);
+	if (!folio_test_swapcache(folio))
+		spin_unlock(&mapping->host->i_lock);
 	return 0;
 }
 
