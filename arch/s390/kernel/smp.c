@@ -674,7 +674,7 @@ void __init smp_save_dump_cpus(void)
 	unsigned long page;
 	bool is_boot_cpu;
 
-	if (!(OLDMEM_BASE || is_ipl_type_dump()))
+	if (!(oldmem_data.start || is_ipl_type_dump()))
 		/* No previous system present, normal boot. */
 		return;
 	/* Allocate a page as dumping area for the store status sigps */
@@ -705,7 +705,7 @@ void __init smp_save_dump_cpus(void)
 		 * these registers an SCLP request is required which is
 		 * done by drivers/s390/char/zcore.c:init_cpu_info()
 		 */
-		if (!is_boot_cpu || OLDMEM_BASE)
+		if (!is_boot_cpu || oldmem_data.start)
 			/* Get the CPU registers */
 			smp_save_cpu_regs(sa, addr, is_boot_cpu, page);
 	}
