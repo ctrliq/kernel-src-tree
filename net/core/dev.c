@@ -9865,7 +9865,7 @@ static void netdev_wait_allrefs(struct net_device *dev)
 
 		if (refcnt != 1 &&
 		    time_after(jiffies, warning_time +
-			       netdev_unregister_timeout_secs * HZ)) {
+			       READ_ONCE(netdev_unregister_timeout_secs) * HZ)) {
 			pr_emerg("unregister_netdevice: waiting for %s to become free. Usage count = %d\n",
 				 dev->name, refcnt);
 			ref_tracker_dir_print(&dev->refcnt_tracker, 10);
