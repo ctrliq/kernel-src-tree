@@ -412,8 +412,8 @@ struct address_space_operations {
 		int (*launder_page) (struct page *);
 		int (*launder_folio) (struct folio *);
 	};
-	int (*is_partially_uptodate) (struct page *, unsigned long,
-					unsigned long);
+	bool (*is_partially_uptodate) (struct folio *, size_t from,
+			size_t count);
 	void (*is_dirty_writeback) (struct page *, bool *, bool *);
 	int (*error_remove_page)(struct address_space *, struct page *);
 
