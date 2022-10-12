@@ -85,6 +85,7 @@ Todolist:
    cpu_hotplug
    genericirq
    memory-hotplug
+   protection-keys
 
 Todolist:
 
@@ -92,7 +93,6 @@ Todolist:
    memory-hotplug
    cpu_hotplug
    genericirq
-   protection-keys
 
 
 内存管理
