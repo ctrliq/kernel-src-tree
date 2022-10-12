@@ -629,7 +629,7 @@ sources-rh: $(TARBALL) generate-testpatch-tmp setup-source dist-configs-check
 		configs/$(PACKAGE_NAME)-*.config \
 		configs/partial*.config \
 		gating.yaml \
-		update_scripts.sh \
+		scripts/update_scripts.sh \
 		scripts/mod/mod-denylist.sh \
 		scripts/mod/mod-internal.list \
 		scripts/mod/mod-partner.list \
