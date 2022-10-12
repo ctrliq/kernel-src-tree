@@ -44,6 +44,17 @@ static inline void *folio_raw_mapping(struct folio *folio)
 	return (void *)(mapping & ~PAGE_MAPPING_FLAGS);
 }
 
+void __acct_reclaim_writeback(pg_data_t *pgdat, struct folio *folio,
+						int nr_throttled);
+static inline void acct_reclaim_writeback(struct folio *folio)
+{
+	pg_data_t *pgdat = folio_pgdat(folio);
+	int nr_throttled = atomic_read(&pgdat->nr_writeback_throttled);
+
+	if (nr_throttled)
+		__acct_reclaim_writeback(pgdat, folio, nr_throttled);
+}
+
 vm_fault_t do_swap_page(struct vm_fault *vmf);
 void folio_rotate_reclaimable(struct folio *folio);
 bool __folio_end_writeback(struct folio *folio);
