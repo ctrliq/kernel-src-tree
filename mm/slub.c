@@ -5272,6 +5272,7 @@ static ssize_t show_slab_objects(struct kmem_cache *s,
 			total += x;
 			nodes[node] += x;
 
+#ifdef CONFIG_SLUB_CPU_PARTIAL
 			slab = slub_percpu_partial_read_once(c);
 			if (slab) {
 				node = slab_nid(slab);
@@ -5284,6 +5285,7 @@ static ssize_t show_slab_objects(struct kmem_cache *s,
 				total += x;
 				nodes[node] += x;
 			}
+#endif
 		}
 	}
 
@@ -5483,9 +5485,10 @@ static ssize_t slabs_cpu_partial_show(struct kmem_cache *s, char *buf)
 {
 	int objects = 0;
 	int slabs = 0;
-	int cpu;
+	int cpu __maybe_unused;
 	int len = 0;
 
+#ifdef CONFIG_SLUB_CPU_PARTIAL
 	for_each_online_cpu(cpu) {
 		struct slab *slab;
 
@@ -5494,12 +5497,13 @@ static ssize_t slabs_cpu_partial_show(struct kmem_cache *s, char *buf)
 		if (slab)
 			slabs += slab->slabs;
 	}
+#endif
 
 	/* Approximate half-full slabs, see slub_set_cpu_partial() */
 	objects = (slabs * oo_objects(s->oo)) / 2;
 	len += sysfs_emit_at(buf, len, "%d(%d)", objects, slabs);
 
-#ifdef CONFIG_SMP
+#if defined(CONFIG_SLUB_CPU_PARTIAL) && defined(CONFIG_SMP)
 	for_each_online_cpu(cpu) {
 		struct slab *slab;
 
