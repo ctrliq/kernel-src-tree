@@ -436,6 +436,8 @@ static int tcf_police_act_to_flow_act(int tc_act, u32 *extval)
 	} else if (TC_ACT_EXT_CMP(tc_act, TC_ACT_JUMP)) {
 		act_id = FLOW_ACTION_JUMP;
 		*extval = tc_act & TC_ACT_EXT_VAL_MASK;
+	} else if (tc_act == TC_ACT_UNSPEC) {
+		act_id = FLOW_ACTION_CONTINUE;
 	}
 
 	return act_id;
