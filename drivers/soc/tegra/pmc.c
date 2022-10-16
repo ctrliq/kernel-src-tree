@@ -2886,17 +2886,10 @@ static int tegra_pmc_probe(struct platform_device *pdev)
 		pmc->scratch = base;
 	}
 
-	pmc->clk = devm_clk_get(&pdev->dev, "pclk");
-	if (IS_ERR(pmc->clk)) {
-		err = PTR_ERR(pmc->clk);
-
-		if (err != -ENOENT) {
-			dev_err(&pdev->dev, "failed to get pclk: %d\n", err);
-			return err;
-		}
-
-		pmc->clk = NULL;
-	}
+	pmc->clk = devm_clk_get_optional(&pdev->dev, "pclk");
+	if (IS_ERR(pmc->clk))
+		return dev_err_probe(&pdev->dev, PTR_ERR(pmc->clk),
+				     "failed to get pclk\n");
 
 	/*
 	 * PCLK clock rate can't be retrieved using CLK API because it
