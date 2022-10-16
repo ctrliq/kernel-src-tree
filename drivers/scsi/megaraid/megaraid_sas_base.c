@@ -1835,7 +1835,7 @@ megasas_queue_command(struct Scsi_Host *shost, struct scsi_cmnd *scmd)
 
 	if (instance->unload == 1) {
 		scmd->result = DID_NO_CONNECT << 16;
-		scmd->scsi_done(scmd);
+		scsi_done(scmd);
 		return 0;
 	}
 
@@ -1850,7 +1850,7 @@ megasas_queue_command(struct Scsi_Host *shost, struct scsi_cmnd *scmd)
 			return SCSI_MLQUEUE_HOST_BUSY;
 		} else {
 			scmd->result = DID_NO_CONNECT << 16;
-			scmd->scsi_done(scmd);
+			scsi_done(scmd);
 			return 0;
 		}
 	}
@@ -1859,7 +1859,7 @@ megasas_queue_command(struct Scsi_Host *shost, struct scsi_cmnd *scmd)
 	if (!mr_device_priv_data ||
 	    (atomic_read(&instance->adprecovery) == MEGASAS_HW_CRITICAL_ERROR)) {
 		scmd->result = DID_NO_CONNECT << 16;
-		scmd->scsi_done(scmd);
+		scsi_done(scmd);
 		return 0;
 	}
 
@@ -1867,7 +1867,7 @@ megasas_queue_command(struct Scsi_Host *shost, struct scsi_cmnd *scmd)
 		ld_tgt_id = MEGASAS_TARGET_ID(scmd->device);
 		if (instance->ld_tgtid_status[ld_tgt_id] == LD_TARGET_ID_DELETED) {
 			scmd->result = DID_NO_CONNECT << 16;
-			scmd->scsi_done(scmd);
+			scsi_done(scmd);
 			return 0;
 		}
 	}
@@ -1898,7 +1898,7 @@ megasas_queue_command(struct Scsi_Host *shost, struct scsi_cmnd *scmd)
 	return instance->instancet->build_and_issue_cmd(instance, scmd);
 
  out_done:
-	scmd->scsi_done(scmd);
+	scsi_done(scmd);
 	return 0;
 }
 
@@ -2831,7 +2831,7 @@ static int megasas_wait_for_outstanding(struct megasas_instance *instance)
 					reset_index, reset_cmd,
 					reset_cmd->scmd->cmnd[0]);
 
-				reset_cmd->scmd->scsi_done(reset_cmd->scmd);
+				scsi_done(reset_cmd->scmd);
 				megasas_return_cmd(instance, reset_cmd);
 			} else if (reset_cmd->sync_cmd) {
 				dev_notice(&instance->pdev->dev, "%p synch cmds"
@@ -3691,7 +3691,7 @@ megasas_complete_cmd(struct megasas_instance *instance, struct megasas_cmd *cmd,
 			atomic_dec(&instance->fw_outstanding);
 
 			scsi_dma_unmap(cmd->scmd);
-			cmd->scmd->scsi_done(cmd->scmd);
+			scsi_done(cmd->scmd);
 			megasas_return_cmd(instance, cmd);
 
 			break;
@@ -3737,7 +3737,7 @@ megasas_complete_cmd(struct megasas_instance *instance, struct megasas_cmd *cmd,
 		atomic_dec(&instance->fw_outstanding);
 
 		scsi_dma_unmap(cmd->scmd);
-		cmd->scmd->scsi_done(cmd->scmd);
+		scsi_done(cmd->scmd);
 		megasas_return_cmd(instance, cmd);
 
 		break;
