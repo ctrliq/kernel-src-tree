@@ -1369,7 +1369,7 @@ static int btmtksdio_runtime_suspend(struct device *dev)
 
 	err = btmtksdio_fw_pmctrl(bdev);
 
-	bt_dev_info(bdev->hdev, "status (%d) return ownership to device", err);
+	bt_dev_dbg(bdev->hdev, "status (%d) return ownership to device", err);
 
 	return err;
 }
@@ -1389,7 +1389,7 @@ static int btmtksdio_runtime_resume(struct device *dev)
 
 	err = btmtksdio_drv_pmctrl(bdev);
 
-	bt_dev_info(bdev->hdev, "status (%d) get ownership from device", err);
+	bt_dev_dbg(bdev->hdev, "status (%d) get ownership from device", err);
 
 	return err;
 }
