@@ -48,8 +48,11 @@
 #include <linux/spinlock.h>
 #include <linux/slab.h>
 #include <linux/atomic.h>
+#include <linux/hashtable.h>
 #include "ttm_object.h"
 #include "vmwgfx_drv.h"
+
+#define VMW_TTM_OBJECT_REF_HT_ORDER 10
 
 /**
  * struct ttm_object_file
@@ -71,7 +74,7 @@ struct ttm_object_file {
 	struct ttm_object_device *tdev;
 	spinlock_t lock;
 	struct list_head ref_list;
-	struct vmwgfx_open_hash ref_hash;
+	DECLARE_HASHTABLE(ref_hash, VMW_TTM_OBJECT_REF_HT_ORDER);
 	struct kref refcount;
 };
 
@@ -133,6 +136,36 @@ ttm_object_file_ref(struct ttm_object_file *tfile)
 {
 	kref_get(&tfile->refcount);
 	return tfile;
+}
+
+static int ttm_tfile_find_ref_rcu(struct ttm_object_file *tfile,
+				  uint64_t key,
+				  struct vmwgfx_hash_item **p_hash)
+{
+	struct vmwgfx_hash_item *hash;
+
+	hash_for_each_possible_rcu(tfile->ref_hash, hash, head, key) {
+		if (hash->key == key) {
+			*p_hash = hash;
+			return 0;
+		}
+	}
+	return -EINVAL;
+}
+
+static int ttm_tfile_find_ref(struct ttm_object_file *tfile,
+			      uint64_t key,
+			      struct vmwgfx_hash_item **p_hash)
+{
+	struct vmwgfx_hash_item *hash;
+
+	hash_for_each_possible(tfile->ref_hash, hash, head, key) {
+		if (hash->key == key) {
+			*p_hash = hash;
+			return 0;
+		}
+	}
+	return -EINVAL;
 }
 
 static void ttm_object_file_destroy(struct kref *kref)
@@ -237,14 +270,13 @@ void ttm_base_object_unref(struct ttm_base_object **p_base)
  * Return: A pointer to the object if successful or NULL otherwise.
  */
 struct ttm_base_object *
-ttm_base_object_noref_lookup(struct ttm_object_file *tfile, uint32_t key)
+ttm_base_object_noref_lookup(struct ttm_object_file *tfile, uint64_t key)
 {
 	struct vmwgfx_hash_item *hash;
-	struct vmwgfx_open_hash *ht = &tfile->ref_hash;
 	int ret;
 
 	rcu_read_lock();
-	ret = vmwgfx_ht_find_item_rcu(ht, key, &hash);
+	ret = ttm_tfile_find_ref_rcu(tfile, key, &hash);
 	if (ret) {
 		rcu_read_unlock();
 		return NULL;
@@ -256,15 +288,14 @@ ttm_base_object_noref_lookup(struct ttm_object_file *tfile, uint32_t key)
 EXPORT_SYMBOL(ttm_base_object_noref_lookup);
 
 struct ttm_base_object *ttm_base_object_lookup(struct ttm_object_file *tfile,
-					       uint32_t key)
+					       uint64_t key)
 {
 	struct ttm_base_object *base = NULL;
 	struct vmwgfx_hash_item *hash;
-	struct vmwgfx_open_hash *ht = &tfile->ref_hash;
 	int ret;
 
 	rcu_read_lock();
-	ret = vmwgfx_ht_find_item_rcu(ht, key, &hash);
+	ret = ttm_tfile_find_ref_rcu(tfile, key, &hash);
 
 	if (likely(ret == 0)) {
 		base = drm_hash_entry(hash, struct ttm_ref_object, hash)->obj;
@@ -277,7 +308,7 @@ struct ttm_base_object *ttm_base_object_lookup(struct ttm_object_file *tfile,
 }
 
 struct ttm_base_object *
-ttm_base_object_lookup_for_ref(struct ttm_object_device *tdev, uint32_t key)
+ttm_base_object_lookup_for_ref(struct ttm_object_device *tdev, uint64_t key)
 {
 	struct ttm_base_object *base;
 
@@ -296,7 +327,6 @@ int ttm_ref_object_add(struct ttm_object_file *tfile,
 		       bool *existed,
 		       bool require_existed)
 {
-	struct vmwgfx_open_hash *ht = &tfile->ref_hash;
 	struct ttm_ref_object *ref;
 	struct vmwgfx_hash_item *hash;
 	int ret = -EINVAL;
@@ -309,7 +339,7 @@ int ttm_ref_object_add(struct ttm_object_file *tfile,
 
 	while (ret == -EINVAL) {
 		rcu_read_lock();
-		ret = vmwgfx_ht_find_item_rcu(ht, base->handle, &hash);
+		ret = ttm_tfile_find_ref_rcu(tfile, base->handle, &hash);
 
 		if (ret == 0) {
 			ref = drm_hash_entry(hash, struct ttm_ref_object, hash);
@@ -334,21 +364,14 @@ int ttm_ref_object_add(struct ttm_object_file *tfile,
 		kref_init(&ref->kref);
 
 		spin_lock(&tfile->lock);
-		ret = vmwgfx_ht_insert_item_rcu(ht, &ref->hash);
+		hash_add_rcu(tfile->ref_hash, &ref->hash.head, ref->hash.key);
+		ret = 0;
 
-		if (likely(ret == 0)) {
-			list_add_tail(&ref->head, &tfile->ref_list);
-			kref_get(&base->refcount);
-			spin_unlock(&tfile->lock);
-			if (existed != NULL)
-				*existed = false;
-			break;
-		}
-
+		list_add_tail(&ref->head, &tfile->ref_list);
+		kref_get(&base->refcount);
 		spin_unlock(&tfile->lock);
-		BUG_ON(ret != -EINVAL);
-
-		kfree(ref);
+		if (existed != NULL)
+			*existed = false;
 	}
 
 	return ret;
@@ -360,10 +383,8 @@ ttm_ref_object_release(struct kref *kref)
 	struct ttm_ref_object *ref =
 	    container_of(kref, struct ttm_ref_object, kref);
 	struct ttm_object_file *tfile = ref->tfile;
-	struct vmwgfx_open_hash *ht;
 
-	ht = &tfile->ref_hash;
-	(void)vmwgfx_ht_remove_item_rcu(ht, &ref->hash);
+	hash_del_rcu(&ref->hash.head);
 	list_del(&ref->head);
 	spin_unlock(&tfile->lock);
 
@@ -375,13 +396,12 @@ ttm_ref_object_release(struct kref *kref)
 int ttm_ref_object_base_unref(struct ttm_object_file *tfile,
 			      unsigned long key)
 {
-	struct vmwgfx_open_hash *ht = &tfile->ref_hash;
 	struct ttm_ref_object *ref;
 	struct vmwgfx_hash_item *hash;
 	int ret;
 
 	spin_lock(&tfile->lock);
-	ret = vmwgfx_ht_find_item(ht, key, &hash);
+	ret = ttm_tfile_find_ref(tfile, key, &hash);
 	if (unlikely(ret != 0)) {
 		spin_unlock(&tfile->lock);
 		return -EINVAL;
@@ -413,16 +433,13 @@ void ttm_object_file_release(struct ttm_object_file **p_tfile)
 	}
 
 	spin_unlock(&tfile->lock);
-	vmwgfx_ht_remove(&tfile->ref_hash);
 
 	ttm_object_file_unref(&tfile);
 }
 
-struct ttm_object_file *ttm_object_file_init(struct ttm_object_device *tdev,
-					     unsigned int hash_order)
+struct ttm_object_file *ttm_object_file_init(struct ttm_object_device *tdev)
 {
 	struct ttm_object_file *tfile = kmalloc(sizeof(*tfile), GFP_KERNEL);
-	int ret;
 
 	if (unlikely(tfile == NULL))
 		return NULL;
@@ -432,17 +449,9 @@ struct ttm_object_file *ttm_object_file_init(struct ttm_object_device *tdev,
 	kref_init(&tfile->refcount);
 	INIT_LIST_HEAD(&tfile->ref_list);
 
-	ret = vmwgfx_ht_create(&tfile->ref_hash, hash_order);
-	if (ret)
-		goto out_err;
+	hash_init(tfile->ref_hash);
 
 	return tfile;
-out_err:
-	vmwgfx_ht_remove(&tfile->ref_hash);
-
-	kfree(tfile);
-
-	return NULL;
 }
 
 struct ttm_object_device *
