@@ -435,9 +435,10 @@ int __must_check add_disk_fwnode(struct device *parent, struct gendisk *disk,
 	 * Otherwise just allocate the device numbers for both the whole device
 	 * and all partitions from the extended dev_t space.
 	 */
+	ret = -EINVAL;
 	if (disk->major) {
 		if (WARN_ON(!disk->minors))
-			return -EINVAL;
+			goto out_exit_elevator;
 
 		if (disk->minors > DISK_MAX_PARTS) {
 			pr_err("block: can't allocate more than %d partitions\n",
@@ -447,14 +448,14 @@ int __must_check add_disk_fwnode(struct device *parent, struct gendisk *disk,
 		if (disk->first_minor > MINORMASK ||
 		    disk->minors > MINORMASK + 1 ||
 		    disk->first_minor + disk->minors > MINORMASK + 1)
-			return -EINVAL;
+			goto out_exit_elevator;
 	} else {
 		if (WARN_ON(disk->minors))
-			return -EINVAL;
+			goto out_exit_elevator;
 
 		ret = blk_alloc_ext_minor();
 		if (ret < 0)
-			return ret;
+			goto out_exit_elevator;
 		disk->major = BLOCK_EXT_MAJOR;
 		disk->first_minor = ret;
 	}
@@ -563,6 +564,9 @@ out_device_del:
 out_free_ext_minor:
 	if (disk->major == BLOCK_EXT_MAJOR)
 		blk_free_ext_minor(disk->first_minor);
+out_exit_elevator:
+	if (disk->queue->elevator)
+		elevator_exit(disk->queue);
 	return ret;
 }
 EXPORT_SYMBOL_GPL(add_disk_fwnode);
