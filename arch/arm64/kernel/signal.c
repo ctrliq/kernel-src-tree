@@ -16,7 +16,7 @@
 #include <linux/uaccess.h>
 #include <linux/sizes.h>
 #include <linux/string.h>
-#include <linux/tracehook.h>
+#include <linux/resume_user_mode.h>
 #include <linux/ratelimit.h>
 #include <linux/syscalls.h>
 
@@ -941,10 +941,8 @@ void do_notify_resume(struct pt_regs *regs, unsigned long thread_flags)
 			if (thread_flags & (_TIF_SIGPENDING | _TIF_NOTIFY_SIGNAL))
 				do_signal(regs);
 
-			if (thread_flags & _TIF_NOTIFY_RESUME) {
-				tracehook_notify_resume(regs);
-				rseq_handle_notify_resume(NULL, regs);
-			}
+			if (thread_flags & _TIF_NOTIFY_RESUME)
+				resume_user_mode_work(regs);
 
 			if (thread_flags & _TIF_FOREIGN_FPSTATE)
 				fpsimd_restore_current_state();

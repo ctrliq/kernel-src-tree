@@ -26,7 +26,8 @@
 #include <linux/delay.h>
 #include <linux/atomic.h>
 #include <linux/ctype.h>
-#include <linux/tracehook.h>
+#include <linux/blk-cgroup.h>
+#include <linux/resume_user_mode.h>
 #include <linux/psi.h>
 #include <linux/part_stat.h>
 #include "blk.h"

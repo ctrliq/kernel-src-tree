@@ -10,10 +10,9 @@
 #include <uapi/asm/setup.h>
 #include <linux/build_bug.h>
 
-#define EP_OFFSET		0x10008
-#define EP_STRING		"S390EP"
 #define PARMAREA		0x10400
 
+#define COMMAND_LINE_SIZE CONFIG_COMMAND_LINE_SIZE
 /*
  * Machine features detected in early.c
  */
@@ -44,30 +43,12 @@
 #define STARTUP_NORMAL_OFFSET	0x10000
 #define STARTUP_KDUMP_OFFSET	0x10010
 
-/* Offsets to parameters in kernel/head.S  */
-
-#define IPL_DEVICE_OFFSET	0x10400
-#define INITRD_START_OFFSET	0x10408
-#define INITRD_SIZE_OFFSET	0x10410
-#define OLDMEM_BASE_OFFSET	0x10418
-#define OLDMEM_SIZE_OFFSET	0x10420
-#define KERNEL_VERSION_OFFSET	0x10428
-#define COMMAND_LINE_OFFSET	0x10480
-
 #define LEGACY_COMMAND_LINE_SIZE	896
-#define COMMAND_LINE_SIZE		CONFIG_COMMAND_LINE_SIZE
+
 #ifndef __ASSEMBLY__
 
 #include <asm/lowcore.h>
 #include <asm/types.h>
-
-#define IPL_DEVICE	(*(unsigned long *)  (IPL_DEVICE_OFFSET))
-#define INITRD_START	(*(unsigned long *)  (INITRD_START_OFFSET))
-#define INITRD_SIZE	(*(unsigned long *)  (INITRD_SIZE_OFFSET))
-#define OLDMEM_BASE	(*(unsigned long *)  (OLDMEM_BASE_OFFSET))
-#define OLDMEM_SIZE	(*(unsigned long *)  (OLDMEM_SIZE_OFFSET))
-#define COMMAND_LINE	((char *)	     (COMMAND_LINE_OFFSET))
-#define HEAD_END		COMMAND_LINE_OFFSET + COMMAND_LINE_SIZE
 
 struct parmarea {
 	unsigned long ipl_device;			/* 0x10400 */
@@ -165,20 +146,22 @@ static inline unsigned long kaslr_offset(void)
 
 extern int is_full_image;
 
+struct initrd_data {
+	unsigned long start;
+	unsigned long size;
+};
+extern struct initrd_data initrd_data;
+
+struct oldmem_data {
+	unsigned long start;
+	unsigned long size;
+};
+extern struct oldmem_data oldmem_data;
+
 static inline u32 gen_lpswe(unsigned long addr)
 {
 	BUILD_BUG_ON(addr > 0xfff);
 	return 0xb2b20000 | addr;
 }
-
-#else /* __ASSEMBLY__ */
-
-#define IPL_DEVICE	(IPL_DEVICE_OFFSET)
-#define INITRD_START	(INITRD_START_OFFSET)
-#define INITRD_SIZE	(INITRD_SIZE_OFFSET)
-#define OLDMEM_BASE	(OLDMEM_BASE_OFFSET)
-#define OLDMEM_SIZE	(OLDMEM_SIZE_OFFSET)
-#define COMMAND_LINE	(COMMAND_LINE_OFFSET)
-
 #endif /* __ASSEMBLY__ */
 #endif /* _ASM_S390_SETUP_H */

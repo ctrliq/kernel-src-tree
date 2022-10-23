@@ -29,7 +29,6 @@
 #include <linux/writeback.h>
 #include <linux/backing-dev.h>
 #include <linux/pagevec.h>
-#include <linux/cleancache.h>
 #include "internal.h"
 
 /*
@@ -257,12 +256,6 @@ static struct bio *do_mpage_readpage(struct mpage_readpage_args *args)
 		SetPageMappedToDisk(page);
 	}
 
-	if (fully_mapped && blocks_per_page == 1 && !PageUptodate(page) &&
-	    cleancache_get_page(page) == 0) {
-		SetPageUptodate(page);
-		goto confused;
-	}
-
 	/*
 	 * This page will go to BIO.  Do we need to send this BIO off first?
 	 */
@@ -484,7 +477,7 @@ static int __mpage_writepage(struct page *page, struct writeback_control *wbc,
 			if (!buffer_mapped(bh)) {
 				/*
 				 * unmapped dirty buffers are created by
-				 * __set_page_dirty_buffers -> mmapped data
+				 * block_dirty_folio -> mmapped data
 				 */
 				if (buffer_dirty(bh))
 					goto confused;
