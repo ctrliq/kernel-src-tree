@@ -3522,8 +3522,8 @@ out:
 		 * leave kernel.
 		 */
 		if (p->mm && printk_ratelimit()) {
-			printk("process %d (%s) no longer affine to cpu%d\n",
-			       task_pid_nr(p), p->comm, cpu);
+			printk_deferred("process %d (%s) no longer affine to cpu%d\n",
+					task_pid_nr(p), p->comm, cpu);
 		}
 	}
 
