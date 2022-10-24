@@ -84,7 +84,7 @@ function merge_configs()
 
 			test -n "$skip_if_missing" && test ! -e "$cfile" && continue
 
-			if ! perl merge.pl "$cfile" config-merging."$count" > config-merged."$count"; then
+			if ! ./merge.py "$cfile" config-merging."$count" > config-merged."$count"; then
 				die "Failed to merge $cfile"
 			fi
 			mv config-merged."$count" config-merging."$count"
