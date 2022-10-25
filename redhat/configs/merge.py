@@ -50,9 +50,8 @@ if not os.path.exists(sys.argv[2]):
     usage("base config file %s does not exist!" % sys.argv[2])
 baseconfigs = read_config_file(sys.argv[2])
 
-# iterate over the overrides, replacing values in the base config
-for v in overrides.keys():
-    baseconfigs[v] = overrides[v]
+# update baseconfigs with the overrides values
+baseconfigs.update(overrides)
 
 # print the new config to stdout
 for v in baseconfigs.keys():
