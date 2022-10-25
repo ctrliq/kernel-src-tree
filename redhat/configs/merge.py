@@ -54,5 +54,5 @@ baseconfigs = read_config_file(sys.argv[2])
 baseconfigs.update(overrides)
 
 # print the new config to stdout
-for v in baseconfigs.keys():
-    print(baseconfigs[v])
+for v in baseconfigs.values():
+    print(v)
