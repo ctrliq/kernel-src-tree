@@ -731,12 +731,12 @@ static void abx500_chargalg_check_temp(struct abx500_chargalg *di)
 		di->t_hyst_norm = 0;
 		di->t_hyst_lowhigh = 0;
 	} else {
-		if (((di->batt_data.temp >= di->bm->temp_high) &&
+		if (((di->batt_data.temp >= bi->temp_alert_max) &&
 			(di->batt_data.temp <
-				(di->bm->temp_over - di->t_hyst_lowhigh))) ||
+				(bi->temp_max - di->t_hyst_lowhigh))) ||
 			((di->batt_data.temp >
-				(di->bm->temp_under + di->t_hyst_lowhigh)) &&
-			(di->batt_data.temp <= di->bm->temp_low))) {
+				(bi->temp_min + di->t_hyst_lowhigh)) &&
+			(di->batt_data.temp <= bi->temp_alert_min))) {
 			/* TEMP minor!!!!! */
 			di->events.btemp_underover = false;
 			di->events.btemp_lowhigh = true;
@@ -1589,12 +1589,10 @@ static void abx500_chargalg_algorithm(struct abx500_chargalg *di)
 		break;
 
 	case STATE_TEMP_LOWHIGH_INIT:
-		abx500_chargalg_start_charging(di,
-			di->bm->bat_type[
-				di->bm->batt_id].low_high_vol_lvl,
-			di->bm->bat_type[
-				di->bm->batt_id].low_high_cur_lvl);
-		abx500_chargalg_stop_maintenance_timer(di);
+		ab8500_chargalg_start_charging(di,
+			di->bm->bat_type->low_high_vol_lvl,
+			di->bm->bat_type->low_high_cur_lvl);
+		ab8500_chargalg_stop_maintenance_timer(di);
 		di->charge_status = POWER_SUPPLY_STATUS_CHARGING;
 		abx500_chargalg_state_to(di, STATE_TEMP_LOWHIGH);
 		power_supply_changed(di->chargalg_psy);
