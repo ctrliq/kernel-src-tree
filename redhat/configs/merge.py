@@ -26,14 +26,15 @@ def usage(msg):
 # read a config file and return a dictionary of the contents
 def read_config_file(cfgfile):
     configs = {}
-    for l in [ n.strip() for n in open(cfgfile).readlines()]:
-        if len(l) == 0:  continue
-        if l.startswith("# CONFIG_"):
-            configs[l.split()[1]] = l
-            continue
-        if l.startswith("CONFIG_"):
-            configs[l.split('=')[0]] = l
-            continue
+    with open(cfgfile) as f:
+        for l in [n.strip() for n in f.readlines()]:
+            if not l:  continue
+            if l.startswith("# CONFIG_"):
+                configs[l.split()[1]] = l
+                continue
+            if l.startswith("CONFIG_"):
+                configs[l.split('=')[0]] = l
+                continue
     return configs
 
 
