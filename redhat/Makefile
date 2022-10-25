@@ -265,7 +265,9 @@ else
     ifeq ("$(DIST)", ".eln")
       BUILD_TARGET:=eln
     else
-      BUILD_TARGET:=rhel-$(RHEL_MAJOR)-scratch
+      # This value is used by the dist[g]-targets.  Changing this value has significant
+      # consequences for all of RHEL kernel engineering.
+      BUILD_TARGET:=rhel-$(RHEL_MAJOR)-newest-test-pesign
     endif
   endif
   ifeq ("$(DIST)", ".eln)
@@ -759,13 +761,11 @@ dist-vr-check:
 
 dist-brew: DIST=.el9
 dist-brew: DISTRO=rhel
-dist-brew: BUILD_TARGET:=rhel-$(RHEL_MAJOR)-scratch
 dist-brew dist-koji: dist-%: dist-vr-check dist-srpm
 	$* $(BUILD_PROFILE) build $(BUILD_FLAGS) --scratch $(BUILD_TARGET) $(SRPMS)/$(RELEASETAG)$(DIST).src.rpm $(OUTPUT_FILE)
 
 distg-brew: DIST=.el9
 distg-brew: DISTRO=rhel
-distg-brew: BUILD_TARGET:=rhel-$(RHEL_MAJOR)-scratch
 distg-brew distg-koji: distg-%: dist-vr-check
 	$* $(BUILD_PROFILE) build $(BUILD_FLAGS) --scratch $(BUILD_TARGET) "$(RHGITURL)?redhat/koji#$(RHGITCOMMIT)"
 
