@@ -4893,7 +4893,7 @@ out:
 	flush_work(&sbi->s_error_work);
 	jbd2_journal_destroy(sbi->s_journal);
 	sbi->s_journal = NULL;
-	return err;
+	return -EINVAL;
 }
 
 static int __ext4_fill_super(struct fs_context *fc, struct super_block *sb)
