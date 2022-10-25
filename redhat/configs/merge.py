@@ -26,7 +26,7 @@ def usage(msg):
 # read a config file and return a dictionary of the contents
 def read_config_file(cfgfile):
     configs = {}
-    for l in open(cfgfile).readlines():
+    for l in [ n.strip() for n in open(cfgfile).readlines()]:
         if len(l) == 0:  continue
         if l.startswith("# CONFIG_"):
             configs[l.split()[1]] = l
