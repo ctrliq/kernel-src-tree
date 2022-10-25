@@ -888,7 +888,7 @@ static enum maxim_ret abx500_chargalg_chg_curr_maxim(struct abx500_chargalg *di)
 		di->ccm.max_current) {
 		if (di->ccm.condition_cnt-- == 0) {
 			/* Increse the iset with cco.test_delta_i */
-			di->ccm.condition_cnt = di->bm->maxi->wait_cycles;
+	di->ccm.condition_cnt = di->bm->maxi->wait_cycles;
 			di->ccm.current_iset += di->ccm.test_delta_i;
 			di->ccm.level++;
 			dev_dbg(di->dev, " Maximization needed, increase"
@@ -900,8 +900,8 @@ static enum maxim_ret abx500_chargalg_chg_curr_maxim(struct abx500_chargalg *di)
 				di->ccm.level);
 			return MAXIM_RET_CHANGE;
 		} else {
-			return MAXIM_RET_NOACTION;
-		}
+	return MAXIM_RET_NOACTION;
+}
 	}  else {
 		di->ccm.condition_cnt = di->bm->maxi->wait_cycles;
 		return MAXIM_RET_NOACTION;
@@ -1329,7 +1329,6 @@ static void abx500_chargalg_algorithm(struct abx500_chargalg *di)
 		di->charge_state == STATE_SUSPENDED) {
 		/* We don't do anything here, just don,t continue */
 	}
-
 	/* Safety timer expiration */
 	else if (di->events.safety_timer_expired) {
 		if (di->charge_state != STATE_SAFETY_TIMER_EXPIRED)
@@ -1443,7 +1442,6 @@ static void abx500_chargalg_algorithm(struct abx500_chargalg *di)
 	case STATE_SUSPENDED:
 		/* CHARGING is suspended */
 		break;
-
 	case STATE_BATT_REMOVED_INIT:
 		abx500_chargalg_stop_charging(di);
 		abx500_chargalg_state_to(di, STATE_BATT_REMOVED);
@@ -2060,7 +2058,6 @@ static int abx500_chargalg_probe(struct platform_device *pdev)
 		return ret;
 	}
 	di->curr_status.curr_step = CHARGALG_CURR_STEP_HIGH;
-
 	dev_info(di->dev, "probe success\n");
 	return component_add(dev, &abx500_chargalg_component_ops);
 }
