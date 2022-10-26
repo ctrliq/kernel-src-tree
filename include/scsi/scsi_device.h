@@ -102,6 +102,10 @@ struct scsi_vpd {
 	unsigned char	data[];
 };
 
+enum scsi_vpd_parameters {
+	SCSI_VPD_HEADER_SIZE = 4,
+};
+
 struct scsi_device {
 	struct Scsi_Host *host;
 	struct request_queue *request_queue;
@@ -143,11 +147,11 @@ struct scsi_device {
 	const char * model;		/* ... after scan; point to static string */
 	const char * rev;		/* ... "nullnullnullnull" before scan */
 
-#define SCSI_VPD_PG_LEN                255
 	struct scsi_vpd __rcu *vpd_pg0;
 	struct scsi_vpd __rcu *vpd_pg83;
 	struct scsi_vpd __rcu *vpd_pg80;
 	struct scsi_vpd __rcu *vpd_pg89;
+
 	struct scsi_target      *sdev_target;
 
 	blist_flags_t		sdev_bflags; /* black/white flags as also found in
@@ -253,9 +257,9 @@ struct scsi_device {
 	 * The following padding has been inserted before ABI freeze to
 	 * allow extending the structure while preserving ABI.
 	 */
-	RH_KABI_RESERVE(1)
-	RH_KABI_RESERVE(2)
-	RH_KABI_RESERVE(3)
+	RH_KABI_USE(1, struct scsi_vpd __rcu *vpd_pgb0)
+	RH_KABI_USE(2, struct scsi_vpd __rcu *vpd_pgb1)
+	RH_KABI_USE(3, struct scsi_vpd __rcu *vpd_pgb2)
 	RH_KABI_RESERVE(4)
 	RH_KABI_RESERVE(5)
 	RH_KABI_RESERVE(6)
