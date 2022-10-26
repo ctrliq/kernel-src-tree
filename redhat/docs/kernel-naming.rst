@@ -31,7 +31,7 @@ reference to the top of tree commit.
 **BUILD**: This is the RHEL_RELEASE variable defined in the top-level linux
 Makefile.rhelver.
 
-**LOCALVERSION**: By default, this variable is set to ".test".  This value can
+**DISTLOCALVERSION**: By default, this variable is set to ".test".  This value can
 be overriden by defining a string in redhat/localversion.
 
 **DIST**:  This is the dist release suffix used in the package release, eg.
@@ -39,6 +39,6 @@ be overriden by defining a string in redhat/localversion.
 
 The kernel name is constructed as
 
-$(PACKAGE_NAME)-$(SPECKVERSION).$(SPECKPATCHLEVEL).$(SPECKSUBLEVEL)-$(UPSTREAMBUILD)$(BUILD)$(LOCALVERSION)$(DIST)
+$(PACKAGE_NAME)-$(SPECKVERSION).$(SPECKPATCHLEVEL).$(SPECKSUBLEVEL)-$(UPSTREAMBUILD)$(BUILD)$(DISTLOCALVERSION)$(DIST)
 
 In general, the kernel follows the Fedora Naming Guidelines, `https://fedoraproject.org/wiki/Packaging:Naming?rd=Packaging:NamingGuidelines <https://fedoraproject.org/wiki/Packaging:Naming?rd=Packaging:NamingGuidelines>`__.
