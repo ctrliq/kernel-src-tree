@@ -1507,8 +1507,6 @@ int __sk_mem_schedule(struct sock *sk, int size, int kind);
 void __sk_mem_reduce_allocated(struct sock *sk, int amount);
 void __sk_mem_reclaim(struct sock *sk, int amount);
 
-#define SK_MEM_QUANTUM ((int)PAGE_SIZE)
-#define SK_MEM_QUANTUM_SHIFT ilog2(SK_MEM_QUANTUM)
 #define SK_MEM_SEND	0
 #define SK_MEM_RECV	1
 
@@ -1520,7 +1518,7 @@ static inline long sk_prot_mem_limits(const struct sock *sk, int index)
 
 static inline int sk_mem_pages(int amt)
 {
-	return (amt + SK_MEM_QUANTUM - 1) >> SK_MEM_QUANTUM_SHIFT;
+	return (amt + PAGE_SIZE - 1) >> PAGE_SHIFT;
 }
 
 static inline bool sk_has_account(struct sock *sk)
@@ -1569,7 +1567,7 @@ static inline void sk_mem_reclaim(struct sock *sk)
 
 	reclaimable = sk->sk_forward_alloc - sk_unused_reserved_mem(sk);
 
-	if (reclaimable >= SK_MEM_QUANTUM)
+	if (reclaimable >= (int)PAGE_SIZE)
 		__sk_mem_reclaim(sk, reclaimable);
 }
 
@@ -1588,7 +1586,7 @@ static inline void sk_mem_reclaim_partial(struct sock *sk)
 
 	reclaimable = sk->sk_forward_alloc - sk_unused_reserved_mem(sk);
 
-	if (reclaimable > SK_MEM_QUANTUM)
+	if (reclaimable > (int)PAGE_SIZE)
 		__sk_mem_reclaim(sk, reclaimable - 1);
 }
 
