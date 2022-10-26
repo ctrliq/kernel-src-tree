@@ -861,9 +861,6 @@ struct sk_buff *sk_stream_alloc_skb(struct sock *sk, int size, gfp_t gfp,
 	/* The TCP header must be at least 32-bit aligned.  */
 	size = ALIGN(size, 4);
 
-	if (unlikely(tcp_under_memory_pressure(sk)))
-		sk_mem_reclaim_partial(sk);
-
 	skb = alloc_skb_fclone(size + sk->sk_prot->max_header, gfp);
 	if (likely(skb)) {
 		bool mem_scheduled;
@@ -2742,8 +2739,6 @@ void __tcp_close(struct sock *sk, long timeout)
 		__kfree_skb(skb);
 	}
 
-	sk_mem_reclaim(sk);
-
 	/* If socket has been already reset (e.g. in tcp_reset()) - kill it. */
 	if (sk->sk_state == TCP_CLOSE)
 		goto adjudge_to_death;
@@ -2851,7 +2846,6 @@ adjudge_to_death:
 		}
 	}
 	if (sk->sk_state != TCP_CLOSE) {
-		sk_mem_reclaim(sk);
 		if (tcp_check_oom(sk, 0)) {
 			tcp_set_state(sk, TCP_CLOSE);
 			tcp_send_active_reset(sk, GFP_ATOMIC);
@@ -2929,7 +2923,6 @@ void tcp_write_queue_purge(struct sock *sk)
 	}
 	tcp_rtx_queue_purge(sk);
 	INIT_LIST_HEAD(&tcp_sk(sk)->tsorted_sent_queue);
-	sk_mem_reclaim(sk);
 	tcp_clear_all_retrans_hints(tcp_sk(sk));
 	tcp_sk(sk)->packets_out = 0;
 	inet_csk(sk)->icsk_backoff = 0;

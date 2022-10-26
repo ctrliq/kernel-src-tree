@@ -775,7 +775,6 @@ static void tcp_event_data_recv(struct sock *sk, struct sk_buff *skb)
 			 * restart window, so that we send ACKs quickly.
 			 */
 			tcp_incr_quickack(sk, TCP_MAX_QUICKACKS);
-			sk_mem_reclaim(sk);
 		}
 	}
 	icsk->icsk_ack.lrcvtime = now;
@@ -4349,7 +4348,6 @@ void tcp_fin(struct sock *sk)
 	skb_rbtree_purge(&tp->out_of_order_queue);
 	if (tcp_is_sack(tp))
 		tcp_sack_reset(&tp->rx_opt);
-	sk_mem_reclaim(sk);
 
 	if (!sock_flag(sk, SOCK_DEAD)) {
 		sk->sk_state_change(sk);
@@ -5295,7 +5293,6 @@ static bool tcp_prune_ofo_queue(struct sock *sk)
 		tcp_drop_reason(sk, rb_to_skb(node),
 				SKB_DROP_REASON_TCP_OFO_QUEUE_PRUNE);
 		if (!prev || goal <= 0) {
-			sk_mem_reclaim(sk);
 			if (atomic_read(&sk->sk_rmem_alloc) <= sk->sk_rcvbuf &&
 			    !tcp_under_memory_pressure(sk))
 				break;
@@ -5342,7 +5339,6 @@ static int tcp_prune_queue(struct sock *sk)
 			     skb_peek(&sk->sk_receive_queue),
 			     NULL,
 			     tp->copied_seq, tp->rcv_nxt);
-	sk_mem_reclaim(sk);
 
 	if (atomic_read(&sk->sk_rmem_alloc) <= sk->sk_rcvbuf)
 		return 0;
