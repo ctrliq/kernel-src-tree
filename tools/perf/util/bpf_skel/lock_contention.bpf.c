@@ -74,7 +74,7 @@ int has_cpu;
 int has_task;
 
 /* error stat */
-unsigned long lost;
+int lost;
 
 static inline int can_record(void)
 {
