@@ -1128,6 +1128,9 @@ struct rq {
 	u64			core_forceidle_start;
 #endif
 
+	/* Scratch cpumask to be temporarily used under rq_lock */
+	cpumask_var_t		scratch_mask;
+
 	/* RH KABI: A few reserved fields to mark this as needing KABI but
 	 * struct rq is generally safe to EXTEND.
 	 */
