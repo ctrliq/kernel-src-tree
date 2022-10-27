@@ -361,6 +361,9 @@ SYM_CODE_END(xen_error_entry)
 
 	call	\cfunc
 
+	/* For some configurations \cfunc ends up being a noreturn. */
+	REACHABLE
+
 	jmp	error_return
 .endm
 
