@@ -42,6 +42,8 @@ struct unwind_hint {
 
 #ifdef CONFIG_STACK_VALIDATION
 
+#include <asm/asm.h>
+
 #ifndef __ASSEMBLY__
 
 #define UNWIND_HINT(sp_reg, sp_offset, type, end)		\
@@ -139,7 +141,7 @@ struct unwind_hint {
 
 .macro STACK_FRAME_NON_STANDARD func:req
 	.pushsection .discard.func_stack_frame_non_standard, "aw"
-		.long \func - .
+	_ASM_PTR \func
 	.popsection
 .endm
 
