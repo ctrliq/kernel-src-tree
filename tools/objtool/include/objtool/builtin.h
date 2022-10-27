@@ -19,6 +19,7 @@ struct opts {
 	bool rethunk;
 	bool sls;
 	bool stackval;
+	bool static_call;
 	bool uaccess;
 
 	/* options: */
