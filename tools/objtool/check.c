@@ -1337,7 +1337,7 @@ static bool is_first_func_insn(struct objtool_file *file, struct instruction *in
  */
 static int add_jump_destinations(struct objtool_file *file)
 {
-	struct instruction *insn;
+	struct instruction *insn, *jump_dest;
 	struct reloc *reloc;
 	struct section *dest_sec;
 	unsigned long dest_off;
@@ -1360,7 +1360,10 @@ static int add_jump_destinations(struct objtool_file *file)
 			add_return_call(file, insn, true);
 			continue;
 		} else if (insn->func) {
-			/* internal or external sibling call (with reloc) */
+			/*
+			 * External sibling call or internal sibling call with
+			 * STT_FUNC reloc.
+			 */
 			add_call_dest(file, insn, reloc->sym, true);
 			continue;
 		} else if (reloc->sym->sec->idx) {
@@ -1372,8 +1375,8 @@ static int add_jump_destinations(struct objtool_file *file)
 			continue;
 		}
 
-		insn->jump_dest = find_insn(file, dest_sec, dest_off);
-		if (!insn->jump_dest) {
+		jump_dest = find_insn(file, dest_sec, dest_off);
+		if (!jump_dest) {
 			struct symbol *sym = find_symbol_by_offset(dest_sec, dest_off);
 
 			/*
@@ -1406,8 +1409,8 @@ static int add_jump_destinations(struct objtool_file *file)
 		/*
 		 * Cross-function jump.
 		 */
-		if (insn->func && insn->jump_dest->func &&
-		    insn->func != insn->jump_dest->func) {
+		if (insn->func && jump_dest->func &&
+		    insn->func != jump_dest->func) {
 
 			/*
 			 * For GCC 8+, create parent/child links for any cold
@@ -1425,16 +1428,22 @@ static int add_jump_destinations(struct objtool_file *file)
 			 * subfunction is through a jump table.
 			 */
 			if (!strstr(insn->func->name, ".cold") &&
-			    strstr(insn->jump_dest->func->name, ".cold")) {
-				insn->func->cfunc = insn->jump_dest->func;
-				insn->jump_dest->func->pfunc = insn->func;
+			    strstr(jump_dest->func->name, ".cold")) {
+				insn->func->cfunc = jump_dest->func;
+				jump_dest->func->pfunc = insn->func;
 
-			} else if (!same_function(insn, insn->jump_dest) &&
-				   is_first_func_insn(file, insn->jump_dest)) {
-				/* internal sibling call (without reloc) */
-				add_call_dest(file, insn, insn->jump_dest->func, true);
+			} else if (!same_function(insn, jump_dest) &&
+				   is_first_func_insn(file, jump_dest)) {
+				/*
+				 * Internal sibling call without reloc or with
+				 * STT_SECTION reloc.
+				 */
+				add_call_dest(file, insn, jump_dest->func, true);
+				continue;
 			}
 		}
+
+		insn->jump_dest = jump_dest;
 	}
 
 	return 0;
