@@ -92,8 +92,10 @@ With the ``os-build`` or ``ark-latest`` branch checked out, get the kernel .conf
 
 .. code-block:: sh
 
-   make dist-configs # or make dist-configs-arch
-   cp redhat/configs/<flavor_os>.config .config
+   make dist-<flavor>-configs # or make dist-configs-arch
+   cp redhat/configs/kernel-<version>-<arch>.config .config
+
+Where flavor can be ``rhel`` or ``fedora``
 
 You can now execute any common upstream make targets (make, make -j, make cscope, etc.).
 
