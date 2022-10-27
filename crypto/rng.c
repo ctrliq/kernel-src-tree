@@ -276,8 +276,11 @@ static ssize_t crypto_devrandom_read(void __user *buf, size_t buflen,
 		i = min_t(int, buflen, sizeof(tmp));
 		err = crypto_rng_get_bytes(crypto_default_rng, tmp, i);
 
-		crypto_tfm_clear_flags(crypto_rng_tfm(crypto_default_rng),
-				       flags);
+		/* The above call to crypto_rng_get_bytes will reset
+		 * the CRYPTO_TFM_REQ_NEED_RESEED flag.
+		 */
+		crypto_tfm_set_flags(crypto_rng_tfm(crypto_default_rng),
+				     CRYPTO_TFM_REQ_NEED_RESEED);
 
 		mutex_unlock(&crypto_default_rng_lock);
 		if (err) {
