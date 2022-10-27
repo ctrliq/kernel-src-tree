@@ -1822,7 +1822,6 @@ void cifs_put_smb_ses(struct cifs_ses *ses)
 
 	spin_lock(&ses->chan_lock);
 	chan_count = ses->chan_count;
-	spin_unlock(&ses->chan_lock);
 
 	/* close any extra channels */
 	if (chan_count > 1) {
@@ -1839,6 +1838,7 @@ void cifs_put_smb_ses(struct cifs_ses *ses)
 			ses->chans[i].server = NULL;
 		}
 	}
+	spin_unlock(&ses->chan_lock);
 
 	sesInfoFree(ses);
 	cifs_put_tcp_session(server, 0);
@@ -2127,8 +2127,10 @@ cifs_get_smb_ses(struct TCP_Server_Info *server, struct smb3_fs_context *ctx)
 	mutex_unlock(&ses->session_mutex);
 
 	/* each channel uses a different signing key */
+	spin_lock(&ses->chan_lock);
 	memcpy(ses->chans[0].signkey, ses->smb3signingkey,
 	       sizeof(ses->smb3signingkey));
+	spin_unlock(&ses->chan_lock);
 
 	if (rc)
 		goto get_ses_fail;
