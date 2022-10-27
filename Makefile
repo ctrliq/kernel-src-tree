@@ -1377,7 +1377,7 @@ install: sub_make_done :=
 # ---------------------------------------------------------------------------
 # Tools
 
-ifdef CONFIG_STACK_VALIDATION
+ifdef CONFIG_OBJTOOL
 prepare: tools/objtool
 endif
 
