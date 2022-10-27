@@ -85,6 +85,12 @@ struct unwind_hint {
 	_ASM_PTR " 986b\n\t"					\
 	".popsection\n\t"
 
+#define ASM_REACHABLE							\
+	"998:\n\t"							\
+	".pushsection .discard.reachable\n\t"				\
+	".long 998b - .\n\t"						\
+	".popsection\n\t"
+
 #else /* __ASSEMBLY__ */
 
 /*
@@ -144,6 +150,13 @@ struct unwind_hint {
 	.popsection
 .endm
 
+.macro REACHABLE
+.Lhere_\@:
+	.pushsection .discard.reachable
+	.long	.Lhere_\@ - .
+	.popsection
+.endm
+
 #endif /* __ASSEMBLY__ */
 
 #else /* !CONFIG_STACK_VALIDATION */
@@ -155,6 +168,7 @@ struct unwind_hint {
 #define STACK_FRAME_NON_STANDARD(func)
 #define STACK_FRAME_NON_STANDARD_FP(func)
 #define ANNOTATE_NOENDBR
+#define ASM_REACHABLE
 #else
 #define ANNOTATE_INTRA_FUNCTION_CALL
 .macro UNWIND_HINT type:req sp_reg=0 sp_offset=0 end=0
@@ -162,6 +176,8 @@ struct unwind_hint {
 .macro STACK_FRAME_NON_STANDARD func:req
 .endm
 .macro ANNOTATE_NOENDBR
+.endm
+.macro REACHABLE
 .endm
 #endif
 
