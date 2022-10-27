@@ -23,33 +23,6 @@
 #include <../entry/calling.h>
 
 /*
- * Enable events.  This clears the event mask and tests the pending
- * event status with one and operation.  If there are pending events,
- * then enter the hypervisor to get them handled.
- */
-SYM_FUNC_START(xen_irq_enable_direct)
-	FRAME_BEGIN
-	/* Unmask events */
-	movb $0, PER_CPU_VAR(xen_vcpu_info) + XEN_vcpu_info_mask
-
-	/*
-	 * Preempt here doesn't matter because that will deal with any
-	 * pending interrupts.  The pending check may end up being run
-	 * on the wrong CPU, but that doesn't hurt.
-	 */
-
-	/* Test for pending */
-	testb $0xff, PER_CPU_VAR(xen_vcpu_info) + XEN_vcpu_info_pending
-	jz 1f
-
-	call check_events
-1:
-	FRAME_END
-	RET
-SYM_FUNC_END(xen_irq_enable_direct)
-
-
-/*
  * Disabling events is simply a matter of making the event mask
  * non-zero.
  */
@@ -57,6 +30,8 @@ SYM_FUNC_START(xen_irq_disable_direct)
 	movb $1, PER_CPU_VAR(xen_vcpu_info) + XEN_vcpu_info_mask
 	RET
 SYM_FUNC_END(xen_irq_disable_direct)
+
+.pushsection .noinstr.text, "ax"
 
 /*
  * Force an event check by making a hypercall, but preserve regs
@@ -87,7 +62,32 @@ SYM_FUNC_START(check_events)
 	RET
 SYM_FUNC_END(check_events)
 
-.pushsection .noinstr.text, "ax"
+/*
+ * Enable events.  This clears the event mask and tests the pending
+ * event status with one and operation.  If there are pending events,
+ * then enter the hypervisor to get them handled.
+ */
+SYM_FUNC_START(xen_irq_enable_direct)
+	FRAME_BEGIN
+	/* Unmask events */
+	movb $0, PER_CPU_VAR(xen_vcpu_info) + XEN_vcpu_info_mask
+
+	/*
+	 * Preempt here doesn't matter because that will deal with any
+	 * pending interrupts.  The pending check may end up being run
+	 * on the wrong CPU, but that doesn't hurt.
+	 */
+
+	/* Test for pending */
+	testb $0xff, PER_CPU_VAR(xen_vcpu_info) + XEN_vcpu_info_pending
+	jz 1f
+
+	call check_events
+1:
+	FRAME_END
+	RET
+SYM_FUNC_END(xen_irq_enable_direct)
+
 /*
  * (xen_)save_fl is used to get the current interrupt enable status.
  * Callers expect the status to be in X86_EFLAGS_IF, and other bits
