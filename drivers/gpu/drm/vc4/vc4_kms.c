@@ -395,6 +395,7 @@ static void vc4_atomic_commit_tail(struct drm_atomic_state *state)
 			drm_err(dev, "Timed out waiting for commit\n");
 
 		drm_crtc_commit_put(commit);
+		old_hvs_state->fifo_state[channel].pending_commit = NULL;
 	}
 
 	drm_atomic_helper_commit_modeset_disables(dev, state);
