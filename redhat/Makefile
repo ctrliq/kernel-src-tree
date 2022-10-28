@@ -621,9 +621,7 @@ sources-rh: $(TARBALL) generate-testpatch-tmp setup-source dist-configs-check
 	@sed -e "s/%%SPECKVERSION%%/$(SPECKVERSION)/" \
 		-e "s/%%SPECKPATCHLEVEL%%/$(SPECKPATCHLEVEL)/" \
 		scripts/gating/rpminspect.yaml > $(SOURCES)/rpminspect.yaml
-	@cp scripts/kernel-tools/cpupower.config \
-		scripts/kernel-tools/cpupower.service \
-		scripts/kernel-tools/kvm_stat.logrotate \
+	@cp scripts/kernel-tools/kvm_stat.logrotate \
 		keys/rhel*.x509 \
 		kabi/check-kabi \
 		configs/$(PACKAGE_NAME)-*.config \
