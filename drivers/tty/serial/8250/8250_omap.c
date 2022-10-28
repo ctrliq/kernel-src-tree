@@ -325,7 +325,7 @@ static void omap8250_restore_regs(struct uart_8250_port *up)
 
 	/* drop TCR + TLR access, we setup XON/XOFF later */
 	serial8250_out_MCR(up, up->mcr);
-	serial_out(up, UART_IER, up->ier);
+	serial8250_set_IER(up, up->ier);
 
 	serial_out(up, UART_LCR, UART_LCR_CONF_MODE_B);
 	serial_dl_write(up, priv->quot);
@@ -526,7 +526,7 @@ static void omap_8250_pm(struct uart_port *port, unsigned int state,
 	serial_out(up, UART_EFR, efr | UART_EFR_ECB);
 	serial_out(up, UART_LCR, 0);
 
-	serial_out(up, UART_IER, (state != 0) ? UART_IERX_SLEEP : 0);
+	serial8250_set_IER(up, (state != 0) ? UART_IERX_SLEEP : 0);
 	serial_out(up, UART_LCR, UART_LCR_CONF_MODE_B);
 	serial_out(up, UART_EFR, efr);
 	serial_out(up, UART_LCR, 0);
@@ -617,7 +617,7 @@ static irqreturn_t omap8250_irq(int irq, void *dev_id)
 	struct uart_port *port = dev_id;
 	struct omap8250_priv *priv = port->private_data;
 	struct uart_8250_port *up = up_to_u8250p(port);
-	unsigned int iir;
+	unsigned int iir, lsr;
 	int ret;
 
 #ifdef CONFIG_SERIAL_8250_DMA
@@ -628,6 +628,7 @@ static irqreturn_t omap8250_irq(int irq, void *dev_id)
 #endif
 
 	serial8250_rpm_get(up);
+	lsr = serial_port_in(port, UART_LSR);
 	iir = serial_port_in(port, UART_IIR);
 	ret = serial8250_handle_irq(port, iir);
 
@@ -640,6 +641,24 @@ static irqreturn_t omap8250_irq(int irq, void *dev_id)
 	    (iir & UART_IIR_RX_TIMEOUT) == UART_IIR_RX_TIMEOUT &&
 	    serial_port_in(port, UART_OMAP_RX_LVL) == 0) {
 		serial_port_in(port, UART_RX);
+	}
+
+	/* Stop processing interrupts on input overrun */
+	if ((lsr & UART_LSR_OE) && up->overrun_backoff_time_ms > 0) {
+		unsigned long delay;
+
+		up->ier = serial8250_in_IER(up);
+		if (up->ier & (UART_IER_RLSI | UART_IER_RDI)) {
+			port->ops->stop_rx(port);
+		} else {
+			/* Keep restarting the timer until
+			 * the input overrun subsides.
+			 */
+			cancel_delayed_work(&up->overrun_backoff);
+		}
+
+		delay = msecs_to_jiffies(up->overrun_backoff_time_ms);
+		schedule_delayed_work(&up->overrun_backoff, delay);
 	}
 
 	serial8250_rpm_put(up);
@@ -688,7 +707,7 @@ static int omap_8250_startup(struct uart_port *port)
 		goto err;
 
 	up->ier = UART_IER_RLSI | UART_IER_RDI;
-	serial_out(up, UART_IER, up->ier);
+	serial8250_set_IER(up, up->ier);
 
 #ifdef CONFIG_PM
 	up->capabilities |= UART_CAP_RPM;
@@ -729,7 +748,7 @@ static void omap_8250_shutdown(struct uart_port *port)
 		serial_out(up, UART_OMAP_EFR2, 0x0);
 
 	up->ier = 0;
-	serial_out(up, UART_IER, 0);
+	serial8250_set_IER(up, 0);
 
 	if (up->dma)
 		serial8250_release_dma(up);
@@ -777,7 +796,7 @@ static void omap_8250_unthrottle(struct uart_port *port)
 		up->dma->rx_dma(up);
 	up->ier |= UART_IER_RLSI | UART_IER_RDI;
 	port->read_status_mask |= UART_LSR_DR;
-	serial_out(up, UART_IER, up->ier);
+	serial8250_set_IER(up, up->ier);
 	spin_unlock_irqrestore(&port->lock, flags);
 
 	pm_runtime_mark_last_busy(port->dev);
@@ -868,7 +887,7 @@ static void __dma_rx_complete(void *param)
 	__dma_rx_do_complete(p);
 	if (!priv->throttled) {
 		p->ier |= UART_IER_RLSI | UART_IER_RDI;
-		serial_out(p, UART_IER, p->ier);
+		serial8250_set_IER(p, p->ier);
 		if (!(priv->habit & UART_HAS_EFR2))
 			omap_8250_rx_dma(p);
 	}
@@ -925,7 +944,7 @@ static int omap_8250_rx_dma(struct uart_8250_port *p)
 			 * callback to run.
 			 */
 			p->ier &= ~(UART_IER_RLSI | UART_IER_RDI);
-			serial_out(p, UART_IER, p->ier);
+			serial8250_set_IER(p, p->ier);
 		}
 		goto out;
 	}
@@ -1141,12 +1160,12 @@ static void am654_8250_handle_rx_dma(struct uart_8250_port *up, u8 iir,
 		 * periodic timeouts, re-enable interrupts.
 		 */
 		up->ier &= ~(UART_IER_RLSI | UART_IER_RDI);
-		serial_out(up, UART_IER, up->ier);
+		serial8250_set_IER(up, up->ier);
 		omap_8250_rx_dma_flush(up);
 		serial_in(up, UART_IIR);
 		serial_out(up, UART_OMAP_EFR2, 0x0);
 		up->ier |= UART_IER_RLSI | UART_IER_RDI;
-		serial_out(up, UART_IER, up->ier);
+		serial8250_set_IER(up, up->ier);
 	}
 }
 
@@ -1352,6 +1371,10 @@ static int omap8250_probe(struct platform_device *pdev)
 			up.port.uartclk = clk_get_rate(clk);
 		}
 	}
+
+	if (of_property_read_u32(np, "overrun-throttle-ms",
+				 &up.overrun_backoff_time_ms) != 0)
+		up.overrun_backoff_time_ms = 0;
 
 	priv->wakeirq = irq_of_parse_and_map(np, 1);
 

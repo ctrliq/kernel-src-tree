@@ -146,6 +146,7 @@ OF_EARLYCON_DECLARE(x1000_uart, "ingenic,x1000-uart",
 
 static void ingenic_uart_serial_out(struct uart_port *p, int offset, int value)
 {
+	struct uart_8250_port *up = up_to_u8250p(p);
 	unsigned long flags;
 	bool is_console;
 	int ier;
@@ -171,10 +172,10 @@ static void ingenic_uart_serial_out(struct uart_port *p, int offset, int value)
 		 */
 		is_console = uart_console(p);
 		if (is_console)
-			console_atomic_lock(flags);
-		ier = p->serial_in(p, UART_IER);
+			printk_cpu_sync_get_irqsave(flags);
+		ier = serial8250_in_IER(up);
 		if (is_console)
-			console_atomic_unlock(flags);
+			printk_cpu_sync_put_irqrestore(flags);
 
 		if (ier & UART_IER_MSI)
 			value |= UART_MCR_MDCE | UART_MCR_FCM;
