@@ -1028,8 +1028,8 @@ static int sock_reserve_memory(struct sock *sk, int bytes)
  *	at the socket level. Everything here is generic.
  */
 
-static int sk_setsockopt(struct sock *sk, int level, int optname,
-			 sockptr_t optval, unsigned int optlen)
+int sk_setsockopt(struct sock *sk, int level, int optname,
+		  sockptr_t optval, unsigned int optlen)
 {
 	struct so_timestamping timestamping;
 	struct socket *sock = sk->sk_socket;
