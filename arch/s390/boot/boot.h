@@ -2,13 +2,8 @@
 #ifndef BOOT_BOOT_H
 #define BOOT_BOOT_H
 
-#include <linux/types.h>
-
-#define BOOT_STACK_OFFSET 0x8000
-
-#ifndef __ASSEMBLY__
-
 #include <asm/extable.h>
+#include <linux/types.h>
 
 void startup_kernel(void);
 unsigned long detect_memory(void);
@@ -31,13 +26,9 @@ extern int vmalloc_size_set;
 extern int kaslr_enabled;
 extern char __boot_data_start[], __boot_data_end[];
 extern char __boot_data_preserved_start[], __boot_data_preserved_end[];
-extern char _sdma[], _edma[];
-extern char _stext_dma[], _etext_dma[];
-extern struct exception_table_entry _start_dma_ex_table[];
-extern struct exception_table_entry _stop_dma_ex_table[];
 extern char _decompressor_syms_start[], _decompressor_syms_end[];
+extern char _stack_start[], _stack_end[];
 
 unsigned long read_ipl_report(unsigned long safe_offset);
 
-#endif /* __ASSEMBLY__ */
 #endif /* BOOT_BOOT_H */
