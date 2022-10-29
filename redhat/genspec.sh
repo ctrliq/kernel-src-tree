@@ -95,7 +95,7 @@ trap 'rm -f "$clogf" "$clogf".stripped' SIGHUP SIGINT SIGTERM EXIT
 if grep "^Resolves: $" "$clogf"; then
 	sed -i "s/^Resolves:/Resolves: rhbz#${RTBZ}/" "$clogf"
 else
-	sed -i "s/^Resolves:\(.*\)$/Resolves: rhbz#${RTBZ}, \1/" "$clogf"
+	sed -i "s/^Resolves:\(.*\)$/Resolves: rhbz#${RTBZ},\1/" "$clogf"
 fi
 
 cat "$clogf" "$SOURCES/$SPECCHANGELOG" > "$clogf.full"
