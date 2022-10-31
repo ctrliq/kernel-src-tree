@@ -163,7 +163,7 @@ void mark_tech_preview(const char *msg, struct module *mod)
 	if (msg)
 		str = msg;
 #ifdef CONFIG_MODULES
-	else if (mod && mod->name)
+	else if (mod)
 		str = mod->name;
 #endif
 
