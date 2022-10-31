@@ -1,17 +1,12 @@
+include Makefile.variables
+
 #
 # Deprecated variables
 #
 # This section is intentionally left at the top of the Makefile so it won't be ignored.
 #
-ifdef BUILD_SCRATCH_TARGET
-  # deprecated in 5.19.0
-  $(warning WARNING: BUILD_SCRATCH_TARGET will be deprecated in a later release, use BUILD_TARGET instead.)
-  BUILD_TARGET:=$(BUILD_SCRATCH_TARGET)
-endif
-
-include Makefile.variables
-
 # This deprecation message must come after GIT is set in Makefile.variables.
+
 ifneq ($(GIT),git)
   # deprecated in 5.20.0
   $(warning WARNING: GIT($(GIT)) will be deprecated in a later release.)
