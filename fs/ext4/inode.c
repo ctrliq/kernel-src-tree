@@ -136,8 +136,6 @@ static inline int ext4_begin_ordered_truncate(struct inode *inode,
 						   new_size);
 }
 
-static void ext4_invalidatepage(struct page *page, unsigned int offset,
-				unsigned int length);
 static int __ext4_journalled_writepage(struct page *page, unsigned int len);
 static int ext4_meta_trans_blocks(struct inode *inode, int lblocks,
 				  int pextents);
@@ -1570,16 +1568,18 @@ static void mpage_release_unused_pages(struct mpage_da_data *mpd,
 			break;
 		for (i = 0; i < nr_pages; i++) {
 			struct page *page = pvec.pages[i];
+			struct folio *folio = page_folio(page);
 
-			BUG_ON(!PageLocked(page));
-			BUG_ON(PageWriteback(page));
+			BUG_ON(!folio_test_locked(folio));
+			BUG_ON(folio_test_writeback(folio));
 			if (invalidate) {
-				if (page_mapped(page))
-					clear_page_dirty_for_io(page);
-				block_invalidatepage(page, 0, PAGE_SIZE);
-				ClearPageUptodate(page);
+				if (folio_mapped(folio))
+					folio_clear_dirty_for_io(folio);
+				block_invalidate_folio(folio, 0,
+						folio_size(folio));
+				folio_clear_uptodate(folio);
 			}
-			unlock_page(page);
+			folio_unlock(folio);
 		}
 		pagevec_release(&pvec);
 	}
@@ -3206,15 +3206,15 @@ static void ext4_readahead(struct readahead_control *rac)
 	ext4_mpage_readpages(inode, rac, NULL);
 }
 
-static void ext4_invalidatepage(struct page *page, unsigned int offset,
-				unsigned int length)
+static void ext4_invalidate_folio(struct folio *folio, size_t offset,
+				size_t length)
 {
-	trace_ext4_invalidatepage(page, offset, length);
+	trace_ext4_invalidatepage(&folio->page, offset, length);
 
 	/* No journalling happens on data buffers when this function is used */
-	WARN_ON(page_has_buffers(page) && buffer_jbd(page_buffers(page)));
+	WARN_ON(folio_buffers(folio) && buffer_jbd(folio_buffers(folio)));
 
-	block_invalidatepage(page, offset, length);
+	block_invalidate_folio(folio, offset, length);
 }
 
 static int __ext4_journalled_invalidatepage(struct page *page,
@@ -3559,31 +3559,31 @@ const struct iomap_ops ext4_iomap_report_ops = {
 };
 
 /*
- * Whenever the page is being dirtied, corresponding buffers should already be
- * attached to the transaction (we take care of this in ext4_page_mkwrite() and
- * ext4_write_begin()). However we cannot move buffers to dirty transaction
- * lists here because ->set_page_dirty is called under VFS locks and the page
- * is not necessarily locked.
+ * Folios can be marked dirty completely asynchronously from ext4's
+ * journalling activity.  By filemap_sync_pte(), try_to_unmap_one(), etc.
+ * We cannot do much here because ->dirty_folio may be called with the
+ * page table lock held.  The folio is not necessarily locked.
  *
- * We cannot just dirty the page and leave attached buffers clean, because the
+ * We cannot just dirty the folio and leave attached buffers clean, because the
  * buffers' dirty state is "definitive".  We cannot just set the buffers dirty
  * or jbddirty because all the journalling code will explode.
  *
- * So what we do is to mark the page "pending dirty" and next time writepage
+ * So what we do is to mark the folio "pending dirty" and next time writepage
  * is called, propagate that into the buffers appropriately.
  */
-static int ext4_journalled_set_page_dirty(struct page *page)
+static bool ext4_journalled_dirty_folio(struct address_space *mapping,
+		struct folio *folio)
 {
-	WARN_ON_ONCE(!page_has_buffers(page));
-	SetPageChecked(page);
-	return __set_page_dirty_nobuffers(page);
+	WARN_ON_ONCE(!folio_buffers(folio));
+	folio_set_checked(folio);
+	return filemap_dirty_folio(mapping, folio);
 }
 
-static int ext4_set_page_dirty(struct page *page)
+static bool ext4_dirty_folio(struct address_space *mapping, struct folio *folio)
 {
-	WARN_ON_ONCE(!PageLocked(page) && !PageDirty(page));
-	WARN_ON_ONCE(!page_has_buffers(page));
-	return __set_page_dirty_buffers(page);
+	WARN_ON_ONCE(!folio_test_locked(folio) && !folio_test_dirty(folio));
+	WARN_ON_ONCE(!folio_buffers(folio));
+	return block_dirty_folio(mapping, folio);
 }
 
 static int ext4_iomap_swap_activate(struct swap_info_struct *sis,
@@ -3600,9 +3600,9 @@ static const struct address_space_operations ext4_aops = {
 	.writepages		= ext4_writepages,
 	.write_begin		= ext4_write_begin,
 	.write_end		= ext4_write_end,
-	.set_page_dirty		= ext4_set_page_dirty,
+	.dirty_folio		= ext4_dirty_folio,
 	.bmap			= ext4_bmap,
-	.invalidatepage		= ext4_invalidatepage,
+	.invalidate_folio	= ext4_invalidate_folio,
 	.releasepage		= ext4_releasepage,
 	.direct_IO		= noop_direct_IO,
 	.migratepage		= buffer_migrate_page,
@@ -3618,7 +3618,7 @@ static const struct address_space_operations ext4_journalled_aops = {
 	.writepages		= ext4_writepages,
 	.write_begin		= ext4_write_begin,
 	.write_end		= ext4_journalled_write_end,
-	.set_page_dirty		= ext4_journalled_set_page_dirty,
+	.dirty_folio		= ext4_journalled_dirty_folio,
 	.bmap			= ext4_bmap,
 	.invalidatepage		= ext4_journalled_invalidatepage,
 	.releasepage		= ext4_releasepage,
@@ -3635,9 +3635,9 @@ static const struct address_space_operations ext4_da_aops = {
 	.writepages		= ext4_writepages,
 	.write_begin		= ext4_da_write_begin,
 	.write_end		= ext4_da_write_end,
-	.set_page_dirty		= ext4_set_page_dirty,
+	.dirty_folio		= ext4_dirty_folio,
 	.bmap			= ext4_bmap,
-	.invalidatepage		= ext4_invalidatepage,
+	.invalidate_folio	= ext4_invalidate_folio,
 	.releasepage		= ext4_releasepage,
 	.direct_IO		= noop_direct_IO,
 	.migratepage		= buffer_migrate_page,
@@ -3649,9 +3649,8 @@ static const struct address_space_operations ext4_da_aops = {
 static const struct address_space_operations ext4_dax_aops = {
 	.writepages		= ext4_dax_writepages,
 	.direct_IO		= noop_direct_IO,
-	.set_page_dirty		= __set_page_dirty_no_writeback,
+	.dirty_folio		= noop_dirty_folio,
 	.bmap			= ext4_bmap,
-	.invalidatepage		= noop_invalidatepage,
 	.swap_activate		= ext4_iomap_swap_activate,
 };
 
