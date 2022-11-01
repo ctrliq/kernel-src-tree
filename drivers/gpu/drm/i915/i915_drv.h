@@ -36,7 +36,6 @@
 
 #include <linux/i2c.h>
 #include <linux/i2c-algo-bit.h>
-#include <linux/intel-iommu.h>
 #include <linux/pm_qos.h>
 
 #include <drm/drm_connector.h>
