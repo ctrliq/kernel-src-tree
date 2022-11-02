@@ -99,7 +99,7 @@ static inline struct sk_buff *nf_hook_egress(struct sk_buff *skb, int *rc,
 		return skb;
 
 	nf_hook_state_init(&state, NF_NETDEV_EGRESS,
-			   NFPROTO_NETDEV, dev, NULL, NULL,
+			   NFPROTO_NETDEV, NULL, dev, NULL,
 			   dev_net(dev), NULL);
 	ret = nf_hook_slow(skb, &state, e, 0);
 
