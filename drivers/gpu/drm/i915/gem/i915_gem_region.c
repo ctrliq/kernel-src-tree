@@ -3,6 +3,8 @@
  * Copyright © 2019 Intel Corporation
  */
 
+#include <uapi/drm/i915_drm.h>
+
 #include "intel_memory_region.h"
 #include "i915_gem_region.h"
 #include "i915_drv.h"
@@ -64,6 +66,9 @@ __i915_gem_object_create_region(struct intel_memory_region *mem,
 	GEM_BUG_ON(default_page_size < PAGE_SIZE);
 
 	size = round_up(size, default_page_size);
+
+	if (default_page_size == size)
+		flags |= I915_BO_ALLOC_CONTIGUOUS;
 
 	GEM_BUG_ON(!size);
 	GEM_BUG_ON(!IS_ALIGNED(size, I915_GTT_MIN_ALIGNMENT));

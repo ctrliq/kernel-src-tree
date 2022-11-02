@@ -3,6 +3,7 @@
  * Copyright © 2019 Intel Corporation
  */
 
+#include <linux/string_helpers.h>
 #include <linux/suspend.h>
 
 #include "i915_drv.h"
@@ -164,7 +165,7 @@ static void gt_sanitize(struct intel_gt *gt, bool force)
 	enum intel_engine_id id;
 	intel_wakeref_t wakeref;
 
-	GT_TRACE(gt, "force:%s", yesno(force));
+	GT_TRACE(gt, "force:%s", str_yes_no(force));
 
 	/* Use a raw wakeref to avoid calling intel_display_power_get early */
 	wakeref = intel_runtime_pm_get(gt->uncore->rpm);
@@ -181,15 +182,16 @@ static void gt_sanitize(struct intel_gt *gt, bool force)
 	if (intel_gt_is_wedged(gt))
 		intel_gt_unset_wedged(gt);
 
-	for_each_engine(engine, gt, id)
+	/* For GuC mode, ensure submission is disabled before stopping ring */
+	intel_uc_reset_prepare(&gt->uc);
+
+	for_each_engine(engine, gt, id) {
 		if (engine->reset.prepare)
 			engine->reset.prepare(engine);
 
-	intel_uc_reset_prepare(&gt->uc);
-
-	for_each_engine(engine, gt, id)
 		if (engine->sanitize)
 			engine->sanitize(engine);
+	}
 
 	if (reset_engines(gt) || force) {
 		for_each_engine(engine, gt, id)
