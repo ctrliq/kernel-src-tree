@@ -351,7 +351,8 @@ static inline bool __maybe_unused nf_ingress_hook(const struct nf_hook_ops *reg,
 	return false;
 }
 
-static inline bool nf_egress_hook(const struct nf_hook_ops *reg, int pf)
+static inline bool __maybe_unused nf_egress_hook(const struct nf_hook_ops *reg,
+						 int pf)
 {
 	return pf == NFPROTO_NETDEV && reg->hooknum == NF_NETDEV_EGRESS;
 }
