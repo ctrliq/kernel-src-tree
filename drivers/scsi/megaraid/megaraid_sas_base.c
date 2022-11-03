@@ -3215,7 +3215,7 @@ megasas_bios_param(struct scsi_device *sdev, struct block_device *bdev,
 	return 0;
 }
 
-static int megasas_map_queues(struct Scsi_Host *shost)
+static void megasas_map_queues(struct Scsi_Host *shost)
 {
 	struct megasas_instance *instance;
 	int qoff = 0, offset;
@@ -3224,7 +3224,7 @@ static int megasas_map_queues(struct Scsi_Host *shost)
 	instance = (struct megasas_instance *)shost->hostdata;
 
 	if (shost->nr_hw_queues == 1)
-		return 0;
+		return;
 
 	offset = instance->low_latency_index_start;
 
@@ -3250,8 +3250,6 @@ static int megasas_map_queues(struct Scsi_Host *shost)
 		map->queue_offset = qoff;
 		blk_mq_map_queues(map);
 	}
-
-	return 0;
 }
 
 static void megasas_aen_polling(struct work_struct *work);
