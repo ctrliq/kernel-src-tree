@@ -69,5 +69,6 @@ var validSSTNames = []string {"rhel-sst-null",
 			      "rhel-sst-virtualization-spice",
 			      "rhel-sst-virtualization-storage",
 			      "rhel-sst-virtualization-windows",
+			      "rhivos-ft-auto-kernel",
 			      "RHEL-SST-Conversions",
 			      "security-compliance-team"}
