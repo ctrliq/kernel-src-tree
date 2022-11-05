@@ -151,6 +151,7 @@
 #include <linux/prandom.h>
 #include <linux/once_lite.h>
 
+#include "dev.h"
 #include "net-sysfs.h"
 
 
@@ -2954,6 +2955,51 @@ undo_rx:
 	return err;
 }
 EXPORT_SYMBOL(netif_set_real_num_queues);
+
+/**
+ * netif_set_tso_max_size() - set the max size of TSO frames supported
+ * @dev:	netdev to update
+ * @size:	max skb->len of a TSO frame
+ *
+ * Set the limit on the size of TSO super-frames the device can handle.
+ * Unless explicitly set the stack will assume the value of %GSO_MAX_SIZE.
+ */
+void netif_set_tso_max_size(struct net_device *dev, unsigned int size)
+{
+	dev->tso_max_size = size;
+	if (size < READ_ONCE(dev->gso_max_size))
+		netif_set_gso_max_size(dev, size);
+}
+EXPORT_SYMBOL(netif_set_tso_max_size);
+
+/**
+ * netif_set_tso_max_segs() - set the max number of segs supported for TSO
+ * @dev:	netdev to update
+ * @segs:	max number of TCP segments
+ *
+ * Set the limit on the number of TCP segments the device can generate from
+ * a single TSO super-frame.
+ * Unless explicitly set the stack will assume the value of %GSO_MAX_SEGS.
+ */
+void netif_set_tso_max_segs(struct net_device *dev, unsigned int segs)
+{
+	dev->tso_max_segs = segs;
+	if (segs < READ_ONCE(dev->gso_max_segs))
+		netif_set_gso_max_segs(dev, segs);
+}
+EXPORT_SYMBOL(netif_set_tso_max_segs);
+
+/**
+ * netif_inherit_tso_max() - copy all TSO limits from a lower device to an upper
+ * @to:		netdev to update
+ * @from:	netdev from which to copy the limits
+ */
+void netif_inherit_tso_max(struct net_device *to, const struct net_device *from)
+{
+	netif_set_tso_max_size(to, from->tso_max_size);
+	netif_set_tso_max_segs(to, from->tso_max_segs);
+}
+EXPORT_SYMBOL(netif_inherit_tso_max);
 
 /**
  * netif_get_num_default_rss_queues - default number of RSS queues
@@ -8325,7 +8371,6 @@ void dev_set_group(struct net_device *dev, int new_group)
 {
 	dev->group = new_group;
 }
-EXPORT_SYMBOL(dev_set_group);
 
 /**
  *	dev_pre_changeaddr_notify - Call NETDEV_PRE_CHANGEADDR.
@@ -8440,7 +8485,6 @@ int dev_change_carrier(struct net_device *dev, bool new_carrier)
 		return -ENODEV;
 	return ops->ndo_change_carrier(dev, new_carrier);
 }
-EXPORT_SYMBOL(dev_change_carrier);
 
 /**
  *	dev_get_phys_port_id - Get device physical port ID
@@ -8458,7 +8502,6 @@ int dev_get_phys_port_id(struct net_device *dev,
 		return -EOPNOTSUPP;
 	return ops->ndo_get_phys_port_id(dev, ppid);
 }
-EXPORT_SYMBOL(dev_get_phys_port_id);
 
 /**
  *	dev_get_phys_port_name - Get device physical port name
@@ -8481,7 +8524,6 @@ int dev_get_phys_port_name(struct net_device *dev,
 	}
 	return devlink_compat_phys_port_name_get(dev, name, len);
 }
-EXPORT_SYMBOL(dev_get_phys_port_name);
 
 /**
  *	dev_get_port_parent_id - Get the device's port parent identifier
@@ -8548,35 +8590,17 @@ bool netdev_port_same_parent_id(struct net_device *a, struct net_device *b)
 EXPORT_SYMBOL(netdev_port_same_parent_id);
 
 /**
- *	dev_change_proto_down - update protocol port state information
+ *	dev_change_proto_down - set carrier according to proto_down.
+ *
  *	@dev: device
  *	@proto_down: new value
- *
- *	This info can be used by switch drivers to set the phys state of the
- *	port.
  */
 int dev_change_proto_down(struct net_device *dev, bool proto_down)
 {
-	const struct net_device_ops *ops = dev->netdev_ops;
-
-	if (!ops->ndo_change_proto_down)
+	if (!(dev->priv_flags & IFF_CHANGE_PROTO_DOWN))
 		return -EOPNOTSUPP;
 	if (!netif_device_present(dev))
 		return -ENODEV;
-	return ops->ndo_change_proto_down(dev, proto_down);
-}
-EXPORT_SYMBOL(dev_change_proto_down);
-
-/**
- *	dev_change_proto_down_generic - generic implementation for
- * 	ndo_change_proto_down that sets carrier according to
- * 	proto_down.
- *
- *	@dev: device
- *	@proto_down: new value
- */
-int dev_change_proto_down_generic(struct net_device *dev, bool proto_down)
-{
 	if (proto_down)
 		netif_carrier_off(dev);
 	else
@@ -8584,7 +8608,6 @@ int dev_change_proto_down_generic(struct net_device *dev, bool proto_down)
 	dev->proto_down = proto_down;
 	return 0;
 }
-EXPORT_SYMBOL(dev_change_proto_down_generic);
 
 /**
  *	dev_change_proto_down_reason - proto down reason
@@ -8609,7 +8632,6 @@ void dev_change_proto_down_reason(struct net_device *dev, unsigned long mask,
 		}
 	}
 }
-EXPORT_SYMBOL(dev_change_proto_down_reason);
 
 struct bpf_xdp_link {
 	struct bpf_link link;
@@ -10185,6 +10207,8 @@ struct net_device *alloc_netdev_mqs(int sizeof_priv, const char *name,
 
 	dev->gso_max_size = GSO_MAX_SIZE;
 	dev->gso_max_segs = GSO_MAX_SEGS;
+	dev->tso_max_size = TSO_LEGACY_MAX_SIZE;
+	dev->tso_max_segs = TSO_MAX_SEGS;
 	dev->upper_level = 1;
 	dev->lower_level = 1;
 #ifdef CONFIG_LOCKDEP
