@@ -633,6 +633,7 @@ sources-rh: $(TARBALL) generate-testpatch-tmp setup-source dist-configs-check
 		../Makefile.rhelver \
 		README.rst \
 		kernel-local \
+		dracut-virt.conf \
 		$(SOURCES)/
 	@if [ "$(RELEASED_KERNEL)" -ne 0 ]; then \
 		cp keys/redhatsecureboot{301,501,ca5,ca1}.cer $(SOURCES)/; \

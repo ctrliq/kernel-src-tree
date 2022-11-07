@@ -91,6 +91,12 @@ Summary: The Linux kernel
 %global zipmodules 1
 %endif
 
+%ifarch x86_64
+%global efiuki 1
+%else
+%global efiuki 0
+%endif
+
 %if %{zipmodules}
 %global zipsed -e 's/\.ko$/\.ko.xz/'
 %endif
@@ -699,6 +705,21 @@ BuildRequires: llvm
 BuildRequires: lld
 %endif
 
+%if %{efiuki}
+BuildRequires: dracut
+# For dracut UEFI uki binaries
+BuildRequires: binutils
+# For the initrd
+BuildRequires: lvm2
+%if 0%{?fedora} > 37
+BuildRequires: systemd-boot-unsigned
+%endif
+# For systemd-stub and systemd-pcrphase
+BuildRequires: systemd-udev >= 252-1
+# For TPM operations in UKI initramfs
+BuildRequires: tpm2-tools
+%endif
+
 # Because this is the kernel, it's hard to get a single upstream URL
 # to represent the base without needing to do a bunch of patching. This
 # tarball is generated from a src-git tree. If you want to see the
@@ -825,6 +846,8 @@ Source82: update_scripts.sh
 
 Source84: mod-internal.list
 Source85: mod-partner.list
+
+Source86: dracut-virt.conf
 
 Source100: rheldup3.x509
 Source101: rhelkpatch1.x509
@@ -1331,6 +1354,13 @@ Requires: kernel-%{?1:%{1}-}-modules-core-uname-r = %{KVERREL}%{?1:+%{1}}\
 %endif\
 %{expand:%%kernel_debuginfo_package %{?1:%{1}}}\
 %endif\
+%if %{efiuki}\
+%package %{?1:%{1}-}uki-virt\
+Summary: %{variant_summary} unified kernel image for virtual machines\
+Provides: installonlypkg(kernel)\
+Provides: kernel-%{?1:%{1}-}uname-r = %{KVERREL}%{?1:+%{1}}\
+Requires: kernel%{?1:-%{1}}-modules-core-uname-r = %{KVERREL}%{?1:+%{1}}\
+%endif\
 %{nil}
 
 #
@@ -1399,6 +1429,14 @@ The kernel package contains the Linux kernel (vmlinuz), the core of any
 Linux operating system.  The kernel handles the basic functions
 of the operating system: memory allocation, process allocation, device
 input and output, etc.
+
+%if %{efiuki}
+%description debug-uki-virt
+Prebuilt debug unified kernel image for virtual machines.
+
+%description uki-virt
+Prebuilt default unified kernel image for virtual machines.
+%endif
 
 %if %{with_ipaclones}
 %kernel_ipaclones_package
@@ -2181,6 +2219,45 @@ BuildKernel() {
 	touch lib/modules/$KernelVer/modules.builtin
     fi
 
+%if %{efiuki}
+    popd
+
+    KernelUnifiedImageDir="$RPM_BUILD_ROOT/lib/modules/$KernelVer"
+    KernelUnifiedImage="$KernelUnifiedImageDir/$InstallName-virt.efi"
+
+    mkdir -p $KernelUnifiedImageDir
+
+    dracut --conf=%{SOURCE86} \
+           --confdir=$(mktemp -d) \
+           --verbose \
+           --kver "$KernelVer" \
+           --kmoddir "$RPM_BUILD_ROOT/lib/modules/$KernelVer/" \
+           --logfile=$(mktemp) \
+           --uefi \
+           --kernel-image $(realpath $KernelImage) \
+           --kernel-cmdline 'console=tty0 console=ttyS0' \
+	   $KernelUnifiedImage
+
+%if %{signkernel}
+
+    %pesign -s -i $KernelUnifiedImage -o $KernelUnifiedImage.tmp -a %{secureboot_ca_0} -c %{secureboot_key_0} -n %{pesign_name_0}
+    %pesign -s -i $KernelUnifiedImage.tmp -o $KernelUnifiedImage.signed -a %{secureboot_ca_1} -c %{secureboot_key_1} -n %{pesign_name_1}
+    rm -f $KernelUnifiedImage.tmp
+
+    if [ ! -s $KernelUnifiedImage.signed ]; then
+      echo "pesigning failed"
+      exit 1
+    fi
+    mv $KernelUnifiedImage.signed $KernelUnifiedImage
+
+# signkernel
+%endif
+
+    pushd $RPM_BUILD_ROOT
+
+# efiuki
+%endif
+
     remove_depmod_files
 
     # Go back and find all of the various directories in the tree.  We use this
@@ -2865,12 +2942,14 @@ fi\
 # It also defines a %%postun script that does the same thing.
 #	%%kernel_modules_core_post [<subpackage>]
 #
+# FIXME: /bin/kernel-install can't handle UKIs (yet), so cleanup depmod files in %postun for now.
+#
 %define kernel_modules_core_post() \
 %{expand:%%posttrans %{?1:%{1}-}modules-core}\
 /sbin/depmod -a %{KVERREL}%{?1:+%{1}}\
 %{nil}\
 %{expand:%%postun %{?1:%{1}-}modules-core}\
-/sbin/depmod -a %{KVERREL}%{?1:+%{1}}\
+rm -f /lib/modules/%{KVERREL}%{?1:+%{1}}/modules.*\
 %{nil}
 
 # This macro defines a %%posttrans script for a kernel package.
@@ -2919,6 +2998,20 @@ touch %{_localstatedir}/lib/rpm-state/%{name}/installing_core_%{KVERREL}%{?-v:+%
 %{nil}
 
 #
+# This macro defines scripts for a kernel*-uki-virt package
+#
+# FIXME: /bin/kernel-install can't handle UKIs (yet), so just cp/rm as temporary stop-gap
+#
+%define kernel_uki_virt_scripts() \
+%{expand:%%posttrans %{?1:%{1}-}uki-virt}\
+mkdir -p /boot/efi/EFI/Linux\
+cp /lib/modules/%{KVERREL}%{?1:+%{1}}/vmlinuz-virt.efi /boot/efi/EFI/Linux/vmlinuz-%{KVERREL}%{?1:+%{1}}-virt.efi\
+%{nil}\
+%{expand:%%postun %{?1:%{1}-}uki-virt}\
+rm -f /boot/efi/EFI/Linux/vmlinuz-%{KVERREL}%{?1:+%{1}}-virt.efi\
+%{nil}
+
+#
 # This macro defines a %%preun script for a kernel package.
 #	%%kernel_variant_preun <subpackage>
 #
@@ -2931,6 +3024,10 @@ then\
 fi\
 %{nil}
 
+%if %{efiuki}
+%kernel_uki_virt_scripts
+%endif
+
 %kernel_variant_preun
 %kernel_variant_post -r kernel-smp
 
@@ -2940,6 +3037,9 @@ fi\
 %endif
 
 %if %{with_debug}
+%if %{efiuki}
+%kernel_uki_virt_scripts debug
+%endif
 %kernel_variant_preun debug
 %kernel_variant_post -v debug
 %endif
@@ -3181,6 +3281,11 @@ fi
 %ifnarch noarch\
 %{expand:%%files -f debuginfo%{?3}.list %{?3:%{3}-}debuginfo}\
 %endif\
+%endif\
+%if %{efiuki}\
+%{expand:%%files %{?3:%{3}-}uki-virt}\
+/lib/modules/%{KVERREL}%{?3:+%{3}}/%{?-k:%{-k*}}%{!?-k:vmlinuz}-virt.efi\
+%ghost /%{image_install_path}/efi/EFI/Linux/%{?-k:%{-k*}}%{!?-k:vmlinuz}-%{KVERREL}%{?3:+%{3}}-virt.efi\
 %endif\
 %if %{?3:1} %{!?3:0}\
 %{expand:%%files %{3}}\
