@@ -116,6 +116,7 @@ struct mlxsw_sp_rif_ops {
 
 struct mlxsw_sp_router_ops {
 	int (*init)(struct mlxsw_sp *mlxsw_sp);
+	int (*ipips_init)(struct mlxsw_sp *mlxsw_sp);
 };
 
 static struct mlxsw_sp_rif *
@@ -9469,7 +9470,6 @@ static int mlxsw_sp_ipips_init(struct mlxsw_sp *mlxsw_sp)
 {
 	int err;
 
-	mlxsw_sp->router->ipip_ops_arr = mlxsw_sp_ipip_ops_arr;
 	INIT_LIST_HEAD(&mlxsw_sp->router->ipip_list);
 
 	err = mlxsw_sp_ipip_ecn_encap_init(mlxsw_sp);
@@ -9480,6 +9480,18 @@ static int mlxsw_sp_ipips_init(struct mlxsw_sp *mlxsw_sp)
 		return err;
 
 	return mlxsw_sp_ipip_config_tigcr(mlxsw_sp);
+}
+
+static int mlxsw_sp1_ipips_init(struct mlxsw_sp *mlxsw_sp)
+{
+	mlxsw_sp->router->ipip_ops_arr = mlxsw_sp1_ipip_ops_arr;
+	return mlxsw_sp_ipips_init(mlxsw_sp);
+}
+
+static int mlxsw_sp2_ipips_init(struct mlxsw_sp *mlxsw_sp)
+{
+	mlxsw_sp->router->ipip_ops_arr = mlxsw_sp2_ipip_ops_arr;
+	return mlxsw_sp_ipips_init(mlxsw_sp);
 }
 
 static void mlxsw_sp_ipips_fini(struct mlxsw_sp *mlxsw_sp)
@@ -9896,6 +9908,7 @@ static int mlxsw_sp1_router_init(struct mlxsw_sp *mlxsw_sp)
 
 const struct mlxsw_sp_router_ops mlxsw_sp1_router_ops = {
 	.init = mlxsw_sp1_router_init,
+	.ipips_init = mlxsw_sp1_ipips_init,
 };
 
 static int mlxsw_sp2_router_init(struct mlxsw_sp *mlxsw_sp)
@@ -9911,6 +9924,7 @@ static int mlxsw_sp2_router_init(struct mlxsw_sp *mlxsw_sp)
 
 const struct mlxsw_sp_router_ops mlxsw_sp2_router_ops = {
 	.init = mlxsw_sp2_router_init,
+	.ipips_init = mlxsw_sp2_ipips_init,
 };
 
 int mlxsw_sp_router_init(struct mlxsw_sp *mlxsw_sp,
@@ -9956,7 +9970,7 @@ int mlxsw_sp_router_init(struct mlxsw_sp *mlxsw_sp,
 	if (err)
 		goto err_rifs_init;
 
-	err = mlxsw_sp_ipips_init(mlxsw_sp);
+	err = mlxsw_sp->router_ops->ipips_init(mlxsw_sp);
 	if (err)
 		goto err_ipips_init;
 
