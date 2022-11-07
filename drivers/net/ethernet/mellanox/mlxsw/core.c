@@ -1985,12 +1985,6 @@ __mlxsw_core_bus_device_register(const struct mlxsw_bus_info *mlxsw_bus_info,
 	if (err)
 		goto err_health_init;
 
-	if (mlxsw_driver->init) {
-		err = mlxsw_driver->init(mlxsw_core, mlxsw_bus_info, extack);
-		if (err)
-			goto err_driver_init;
-	}
-
 	err = mlxsw_hwmon_init(mlxsw_core, mlxsw_bus_info, &mlxsw_core->hwmon);
 	if (err)
 		goto err_hwmon_init;
@@ -2004,6 +1998,12 @@ __mlxsw_core_bus_device_register(const struct mlxsw_bus_info *mlxsw_bus_info,
 	if (err)
 		goto err_env_init;
 
+	if (mlxsw_driver->init) {
+		err = mlxsw_driver->init(mlxsw_core, mlxsw_bus_info, extack);
+		if (err)
+			goto err_driver_init;
+	}
+
 	mlxsw_core->is_initialized = true;
 
 	if (!reload) {
@@ -2012,14 +2012,13 @@ __mlxsw_core_bus_device_register(const struct mlxsw_bus_info *mlxsw_bus_info,
 	}
 	return 0;
 
+err_driver_init:
+	mlxsw_env_fini(mlxsw_core->env);
 err_env_init:
 	mlxsw_thermal_fini(mlxsw_core->thermal);
 err_thermal_init:
 	mlxsw_hwmon_fini(mlxsw_core->hwmon);
 err_hwmon_init:
-	if (mlxsw_core->driver->fini)
-		mlxsw_core->driver->fini(mlxsw_core);
-err_driver_init:
 	mlxsw_core_health_fini(mlxsw_core);
 err_health_init:
 err_fw_rev_validate:
@@ -2088,11 +2087,11 @@ void mlxsw_core_bus_device_unregister(struct mlxsw_core *mlxsw_core,
 	}
 
 	mlxsw_core->is_initialized = false;
+	if (mlxsw_core->driver->fini)
+		mlxsw_core->driver->fini(mlxsw_core);
 	mlxsw_env_fini(mlxsw_core->env);
 	mlxsw_thermal_fini(mlxsw_core->thermal);
 	mlxsw_hwmon_fini(mlxsw_core->hwmon);
-	if (mlxsw_core->driver->fini)
-		mlxsw_core->driver->fini(mlxsw_core);
 	mlxsw_core_health_fini(mlxsw_core);
 	if (!reload)
 		mlxsw_core_params_unregister(mlxsw_core);
