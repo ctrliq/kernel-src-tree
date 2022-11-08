@@ -8845,6 +8845,9 @@ void nfs4_test_session_trunk(struct rpc_clnt *clnt, struct rpc_xprt *xprt,
 
 	if (status == 0)
 		rpc_clnt_xprt_switch_add_xprt(clnt, xprt);
+	else if (rpc_clnt_xprt_switch_has_addr(clnt,
+				(struct sockaddr *)&xprt->addr))
+		rpc_clnt_xprt_switch_remove_xprt(clnt, xprt);
 
 	rpc_put_task(task);
 }
@@ -9169,6 +9172,13 @@ int nfs4_proc_create_session(struct nfs_client *clp, const struct cred *cred)
 	int status;
 	unsigned *ptr;
 	struct nfs4_session *session = clp->cl_session;
+	struct nfs4_add_xprt_data xprtdata = {
+		.clp = clp,
+	};
+	struct rpc_add_xprt_test rpcdata = {
+		.add_xprt_test = clp->cl_mvops->session_trunk,
+		.data = &xprtdata,
+	};
 
 	dprintk("--> %s clp=%p session=%p\n", __func__, clp, session);
 
@@ -9185,6 +9195,7 @@ int nfs4_proc_create_session(struct nfs_client *clp, const struct cred *cred)
 	ptr = (unsigned *)&session->sess_id.data[0];
 	dprintk("%s client>seqid %d sessionid %u:%u:%u:%u\n", __func__,
 		clp->cl_seqid, ptr[0], ptr[1], ptr[2], ptr[3]);
+	rpc_clnt_probe_trunked_xprts(clp->cl_rpcclient, &rpcdata);
 out:
 	return status;
 }
@@ -9214,6 +9225,7 @@ int nfs4_proc_destroy_session(struct nfs4_session *session,
 	if (status)
 		dprintk("NFS: Got error %d from the server on DESTROY_SESSION. "
 			"Session has been destroyed regardless...\n", status);
+	rpc_clnt_manage_trunked_xprts(session->clp->cl_rpcclient);
 	return status;
 }
 
