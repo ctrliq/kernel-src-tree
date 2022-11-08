@@ -31,6 +31,12 @@ all:
 		echo "from roles do not require the approve of the maintainer, MR"; \
 		echo "authors are encouraged to add the maintainer for an approve."; \
 		echo " "; \
+		echo "* Any MR adding or modifying a devel-sst field requires the"; \
+		echo "approval from the subsystem maintainer."; \
+		echo " "; \
+		echo "* Any MR adding a or modifying a qe-sst field requires the"; \
+		echo "approval from a member of the QE SST being added."; \
+		echo " "; \
 		echo "This warning can be disabled by executing:"; \
 		echo "        git config --add owners.warning false"; \
 		echo "======================================================="; \
