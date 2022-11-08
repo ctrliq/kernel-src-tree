@@ -27,6 +27,7 @@
 #include <linux/kthread.h>
 #include <linux/mutex.h>
 #include <asm/airq.h>
+#include <asm/tpi.h>
 #include <linux/atomic.h>
 #include <asm/isc.h>
 #include <linux/hrtimer.h>
@@ -125,7 +126,8 @@ static int ap_max_adapter_id = 63;
 static struct bus_type ap_bus_type;
 
 /* Adapter interrupt definitions */
-static void ap_interrupt_handler(struct airq_struct *airq, bool floating);
+static void ap_interrupt_handler(struct airq_struct *airq,
+				 struct tpi_info *tpi_info);
 
 static int ap_airq_flag;
 
@@ -222,7 +224,6 @@ static inline int ap_fetch_qci_info(struct ap_config_info *info)
  * ap_init_qci_info(): Allocate and query qci config info.
  * Does also update the static variables ap_max_domain_id
  * and ap_max_adapter_id if this info is available.
-
  */
 static void __init ap_init_qci_info(void)
 {
@@ -449,8 +450,10 @@ static enum hrtimer_restart ap_poll_timeout(struct hrtimer *unused)
 /**
  * ap_interrupt_handler() - Schedule ap_tasklet on interrupt
  * @airq: pointer to adapter interrupt descriptor
+ * @tpi_info: ignored
  */
-static void ap_interrupt_handler(struct airq_struct *airq, bool floating)
+static void ap_interrupt_handler(struct airq_struct *airq,
+				 struct tpi_info *tpi_info)
 {
 	inc_irq_stat(IRQIO_APB);
 	tasklet_schedule(&ap_tasklet);
@@ -1848,6 +1851,7 @@ static inline void ap_scan_adapter(int ap)
 /**
  * ap_scan_bus(): Scan the AP bus for new devices
  * Runs periodically, workqueue timer (ap_config_time)
+ * @unused: Unused pointer.
  */
 static void ap_scan_bus(struct work_struct *unused)
 {
