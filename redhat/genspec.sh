@@ -13,8 +13,8 @@ else
 	SPECDEBUG_BUILDS_ENABLED=0
 fi
 
-if [ -n "$LOCALVERSION" ]; then
-	SPECBUILDID=$(printf "%%define buildid %s" "$LOCALVERSION")
+if [ -n "$DISTLOCALVERSION" ]; then
+	SPECBUILDID=$(printf "%%define buildid %s" "$DISTLOCALVERSION")
 else
 	SPECBUILDID="# define buildid .local"
 fi
