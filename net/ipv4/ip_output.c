@@ -612,18 +612,6 @@ void ip_fraglist_init(struct sk_buff *skb, struct iphdr *iph,
 }
 EXPORT_SYMBOL(ip_fraglist_init);
 
-static void ip_fraglist_ipcb_prepare(struct sk_buff *skb,
-				     struct ip_fraglist_iter *iter)
-{
-	struct sk_buff *to = iter->frag;
-
-	/* Copy the flags to each fragment. */
-	IPCB(to)->flags = IPCB(skb)->flags;
-
-	if (iter->offset == 0)
-		ip_options_fragment(to);
-}
-
 void ip_fraglist_prepare(struct sk_buff *skb, struct ip_fraglist_iter *iter)
 {
 	unsigned int hlen = iter->hlen;
@@ -669,7 +657,7 @@ void ip_frag_init(struct sk_buff *skb, unsigned int hlen,
 EXPORT_SYMBOL(ip_frag_init);
 
 static void ip_frag_ipcb(struct sk_buff *from, struct sk_buff *to,
-			 bool first_frag, struct ip_frag_state *state)
+			 bool first_frag)
 {
 	/* Copy the flags to each fragment. */
 	IPCB(to)->flags = IPCB(from)->flags;
@@ -848,8 +836,20 @@ int ip_do_fragment(struct net *net, struct sock *sk, struct sk_buff *skb,
 			/* Prepare header of the next frame,
 			 * before previous one went down. */
 			if (iter.frag) {
-				ip_fraglist_ipcb_prepare(skb, &iter);
+				bool first_frag = (iter.offset == 0);
+
+				IPCB(iter.frag)->flags = IPCB(skb)->flags;
 				ip_fraglist_prepare(skb, &iter);
+				if (first_frag && IPCB(skb)->opt.optlen) {
+					/* ipcb->opt is not populated for frags
+					 * coming from __ip_make_skb(),
+					 * ip_options_fragment() needs optlen
+					 */
+					IPCB(iter.frag)->opt.optlen =
+						IPCB(skb)->opt.optlen;
+					ip_options_fragment(iter.frag);
+					ip_send_check(iter.iph);
+				}
 			}
 
 			skb->tstamp = tstamp;
@@ -903,7 +903,7 @@ slow_path:
 			err = PTR_ERR(skb2);
 			goto fail;
 		}
-		ip_frag_ipcb(skb, skb2, first_frag, &state);
+		ip_frag_ipcb(skb, skb2, first_frag);
 
 		/*
 		 *	Put this fragment into the sending queue.
