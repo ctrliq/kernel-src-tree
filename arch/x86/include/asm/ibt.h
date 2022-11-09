@@ -56,11 +56,26 @@ static inline __attribute_const__ u32 gen_endbr(void)
 	return endbr;
 }
 
+static inline __attribute_const__ u32 gen_endbr_poison(void)
+{
+	/*
+	 * 4 byte NOP that isn't NOP4 (in fact it is OSP NOP3), such that it
+	 * will be unique to (former) ENDBR sites.
+	 */
+	return 0x001f0f66; /* osp nopl (%rax) */
+}
+
 static inline bool is_endbr(u32 val)
 {
+	if (val == gen_endbr_poison())
+		return true;
+
 	val &= ~0x01000000U; /* ENDBR32 -> ENDBR64 */
 	return val == gen_endbr();
 }
+
+extern __noendbr u64 ibt_save(void);
+extern __noendbr void ibt_restore(u64 save);
 
 #else /* __ASSEMBLY__ */
 
@@ -84,6 +99,9 @@ static inline bool is_endbr(u32 val)
 #define __noendbr
 
 static inline bool is_endbr(u32 val) { return false; }
+
+static inline u64 ibt_save(void) { return 0; }
+static inline void ibt_restore(u64 save) { }
 
 #else /* __ASSEMBLY__ */
 
