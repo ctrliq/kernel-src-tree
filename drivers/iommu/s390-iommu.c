@@ -90,7 +90,7 @@ static int s390_iommu_attach_device(struct iommu_domain *domain,
 	struct zpci_dev *zdev = to_zpci_dev(dev);
 	struct s390_domain_device *domain_device;
 	unsigned long flags;
-	int rc;
+	int cc, rc;
 
 	if (!zdev)
 		return -ENODEV;
@@ -99,17 +99,24 @@ static int s390_iommu_attach_device(struct iommu_domain *domain,
 	if (!domain_device)
 		return -ENOMEM;
 
-	if (zdev->dma_table && !zdev->s390_domain)
-		zpci_dma_exit_device(zdev);
+	if (zdev->dma_table && !zdev->s390_domain) {
+		cc = zpci_dma_exit_device(zdev);
+		if (cc) {
+			rc = -EIO;
+			goto out_free;
+		}
+	}
 
 	if (zdev->s390_domain)
 		zpci_unregister_ioat(zdev, 0);
 
 	zdev->dma_table = s390_domain->dma_table;
-	rc = zpci_register_ioat(zdev, 0, zdev->start_dma, zdev->end_dma,
-				(u64) zdev->dma_table);
-	if (rc)
+	cc = zpci_register_ioat(zdev, 0, zdev->start_dma, zdev->end_dma,
+				virt_to_phys(zdev->dma_table));
+	if (cc) {
+		rc = -EIO;
 		goto out_restore;
+	}
 
 	spin_lock_irqsave(&s390_domain->list_lock, flags);
 	/* First device defines the DMA range limits */
@@ -139,6 +146,7 @@ out_restore:
 		zpci_register_ioat(zdev, 0, zdev->start_dma, zdev->end_dma,
 				   virt_to_phys(zdev->dma_table));
 	}
+out_free:
 	kfree(domain_device);
 
 	return rc;
@@ -206,11 +214,11 @@ static void s390_iommu_release_device(struct device *dev)
 }
 
 static int s390_iommu_update_trans(struct s390_domain *s390_domain,
-				   unsigned long pa, dma_addr_t dma_addr,
+				   phys_addr_t pa, dma_addr_t dma_addr,
 				   size_t size, int flags)
 {
 	struct s390_domain_device *domain_device;
-	u8 *page_addr = (u8 *) (pa & PAGE_MASK);
+	phys_addr_t page_addr = pa & PAGE_MASK;
 	dma_addr_t start_dma_addr = dma_addr;
 	unsigned long irq_flags, nr_pages, i;
 	unsigned long *entry;
@@ -275,7 +283,7 @@ static int s390_iommu_map(struct iommu_domain *domain, unsigned long iova,
 	if (!(prot & IOMMU_WRITE))
 		flags |= ZPCI_TABLE_PROTECTED;
 
-	rc = s390_iommu_update_trans(s390_domain, (unsigned long) paddr, iova,
+	rc = s390_iommu_update_trans(s390_domain, paddr, iova,
 				     size, flags);
 
 	return rc;
@@ -325,7 +333,7 @@ static size_t s390_iommu_unmap(struct iommu_domain *domain,
 	if (!paddr)
 		return 0;
 
-	rc = s390_iommu_update_trans(s390_domain, (unsigned long) paddr, iova,
+	rc = s390_iommu_update_trans(s390_domain, paddr, iova,
 				     size, flags);
 	if (rc)
 		return 0;

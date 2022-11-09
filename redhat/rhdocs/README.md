@@ -85,6 +85,10 @@ an approve.
 MR authors, reviewers, and maintainers should discuss disagreements about ownership or role changes
 with their management.
 
+** validSSTNames.go Changes**
+
+These changes include validSSTNames.go changes.  You must ensure the SST names themselves, and the SST name changes in the file are approved by RHEL management.  Changes to this file that have not been verified by management will be removed by reverting commits.
+
 **Project Layout**
 
 The layout is
