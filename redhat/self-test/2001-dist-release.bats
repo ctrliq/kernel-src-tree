@@ -36,7 +36,7 @@ _dist-release_test_2() {
 	# release number in Makefile.rhelver.
 	# and above in prologue.
 	cd $BATS_TMPDIR/distrelease
-	title="$(git log --oneline --all  --grep "\[redhat\] kernel" -n 1 --pretty="format:%s")"
+	title="$(git log --oneline --grep "\[redhat\] kernel" -n 1 --pretty="format:%s")"
 	# title = ... [redhat] kernel-5.11.0-0.rc0.20201220git467f8165a2b0.104
 	# Just the title message part AFTER "[redhat] ":
 	title=${title##*\[redhat\] }
