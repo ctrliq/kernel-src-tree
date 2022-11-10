@@ -1347,6 +1347,12 @@ PAGE_SIZE multiple when read back.
 		Amount of cached filesystem data that is swap-backed,
 		such as tmpfs, shm segments, shared anonymous mmap()s
 
+	  zswap
+		Amount of memory consumed by the zswap compression backend.
+
+	  zswapped
+		Amount of application memory swapped out to zswap.
+
 	  file_mapped
 		Amount of cached filesystem data mapped with mmap()
 
@@ -1420,6 +1426,24 @@ PAGE_SIZE multiple when read back.
 	  workingset_nodereclaim
 		Number of times a shadow node has been reclaimed
 
+	  pgscan (npn)
+		Amount of scanned pages (in an inactive LRU list)
+
+	  pgsteal (npn)
+		Amount of reclaimed pages
+
+	  pgscan_kswapd (npn)
+		Amount of scanned pages by kswapd (in an inactive LRU list)
+
+	  pgscan_direct (npn)
+		Amount of scanned pages directly  (in an inactive LRU list)
+
+	  pgsteal_kswapd (npn)
+		Amount of reclaimed pages by kswapd
+
+	  pgsteal_direct (npn)
+		Amount of reclaimed pages directly
+
 	  pgfault (npn)
 		Total number of page faults incurred
 
@@ -1428,12 +1452,6 @@ PAGE_SIZE multiple when read back.
 
 	  pgrefill (npn)
 		Amount of scanned pages (in an active LRU list)
-
-	  pgscan (npn)
-		Amount of scanned pages (in an inactive LRU list)
-
-	  pgsteal (npn)
-		Amount of reclaimed pages
 
 	  pgactivate (npn)
 		Amount of pages moved to the active LRU list
@@ -1536,6 +1554,21 @@ PAGE_SIZE multiple when read back.
 	entries are reclaimed gradually and the swap usage may stay
 	higher than the limit for an extended period of time.  This
 	reduces the impact on the workload and memory management.
+
+  memory.zswap.current
+	A read-only single value file which exists on non-root
+	cgroups.
+
+	The total amount of memory consumed by the zswap compression
+	backend.
+
+  memory.zswap.max
+	A read-write single value file which exists on non-root
+	cgroups.  The default is "max".
+
+	Zswap usage hard limit. If a cgroup's zswap pool reaches this
+	limit, it will refuse to take any more stores before existing
+	entries fault back in or are written out to disk.
 
   memory.pressure
 	A read-only nested-keyed file.
