@@ -1074,6 +1074,7 @@ retry:
 		goto open_file;
 
 	nfsd_file_slab_free(&nf->nf_rcu);
+	nf = NULL;
 	if (ret == -EEXIST)
 		goto retry;
 	trace_nfsd_file_insert_err(rqstp, key.inode, may_flags, ret);
