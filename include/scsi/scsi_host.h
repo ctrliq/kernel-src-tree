@@ -549,6 +549,12 @@ enum scsi_host_state {
 	SHOST_DEL_RECOVERY,
 };
 
+struct Scsi_Host_Aux {
+	struct Scsi_Host *host;
+	struct kref             tagset_refcnt;
+	struct completion       tagset_freed;
+};
+
 struct Scsi_Host {
 	/*
 	 * __devices is protected by the host_lock, but you should
@@ -721,13 +727,14 @@ struct Scsi_Host {
 	 */
 	struct device *dma_dev;
 
+	RH_KABI_USE(1, struct Scsi_Host_Aux *aux)
+
 	/* FOR RH USE ONLY
 	 *
 	 * The following padding has been inserted before ABI freeze to
 	 * allow extending the structure while preserving ABI.
 	 */
 
-	RH_KABI_RESERVE(1)
 	RH_KABI_RESERVE(2)
 	RH_KABI_RESERVE(3)
 	RH_KABI_RESERVE(4)
