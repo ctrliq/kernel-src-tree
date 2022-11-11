@@ -446,28 +446,36 @@ int trace_print_lat_fmt(struct trace_seq *s, struct trace_entry *entry)
 	char irqs_off;
 	int hardirq;
 	int softirq;
+	int bh_off;
 	int nmi;
 
 	nmi = entry->flags & TRACE_FLAG_NMI;
 	hardirq = entry->flags & TRACE_FLAG_HARDIRQ;
 	softirq = entry->flags & TRACE_FLAG_SOFTIRQ;
+	bh_off = entry->flags & TRACE_FLAG_BH_OFF;
 
 	irqs_off =
+		(entry->flags & TRACE_FLAG_IRQS_OFF && bh_off) ? 'D' :
 		(entry->flags & TRACE_FLAG_IRQS_OFF) ? 'd' :
+		bh_off ? 'b' :
 		(entry->flags & TRACE_FLAG_IRQS_NOSUPPORT) ? 'X' :
 		'.';
 
 	switch (entry->flags & (TRACE_FLAG_NEED_RESCHED |
 				TRACE_FLAG_PREEMPT_RESCHED)) {
+#ifndef CONFIG_PREEMPT_LAZY
 	case TRACE_FLAG_NEED_RESCHED | TRACE_FLAG_PREEMPT_RESCHED:
 		need_resched = 'N';
 		break;
+#endif
 	case TRACE_FLAG_NEED_RESCHED:
 		need_resched = 'n';
 		break;
+#ifndef CONFIG_PREEMPT_LAZY
 	case TRACE_FLAG_PREEMPT_RESCHED:
 		need_resched = 'p';
 		break;
+#endif
 	default:
 		need_resched = '.';
 		break;
@@ -488,8 +496,13 @@ int trace_print_lat_fmt(struct trace_seq *s, struct trace_entry *entry)
 			 irqs_off, need_resched, need_resched_lazy,
 			 hardsoft_irq);
 
-	if (entry->preempt_count)
-		trace_seq_printf(s, "%x", entry->preempt_count);
+	if (entry->preempt_count & 0xf)
+		trace_seq_printf(s, "%x", entry->preempt_count & 0xf);
+	else
+		trace_seq_putc(s, '.');
+
+	if (entry->preempt_count & 0xf0)
+		trace_seq_printf(s, "%x", entry->preempt_count >> 4);
 	else
 		trace_seq_putc(s, '.');
 
@@ -662,7 +675,7 @@ int trace_print_lat_context(struct trace_iterator *iter)
 		trace_seq_printf(
 			s, "%16s %7d %3d %d %08x %08lx ",
 			comm, entry->pid, iter->cpu, entry->flags,
-			entry->preempt_count, iter->idx);
+			entry->preempt_count & 0xf, iter->idx);
 	} else {
 		lat_print_generic(s, entry, iter->cpu);
 	}
