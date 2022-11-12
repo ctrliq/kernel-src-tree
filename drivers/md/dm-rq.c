@@ -43,7 +43,6 @@ unsigned dm_get_reserved_rq_based_ios(void)
 	return __dm_get_module_param(&reserved_rq_based_ios,
 				     RESERVED_REQUEST_BASED_IOS, DM_RESERVED_MAX_IOS);
 }
-EXPORT_SYMBOL_GPL(dm_get_reserved_rq_based_ios);
 
 static unsigned dm_get_blk_mq_nr_hw_queues(void)
 {
@@ -239,7 +238,7 @@ static void dm_done(struct request *clone, blk_status_t error, bool mapped)
 		dm_requeue_original_request(tio, true);
 		break;
 	default:
-		DMWARN("unimplemented target endio return value: %d", r);
+		DMCRIT("unimplemented target endio return value: %d", r);
 		BUG();
 	}
 }
@@ -410,7 +409,7 @@ static int map_request(struct dm_rq_target_io *tio)
 		dm_kill_unmapped_request(rq, BLK_STS_IOERR);
 		break;
 	default:
-		DMWARN("unimplemented target map return value: %d", r);
+		DMCRIT("unimplemented target map return value: %d", r);
 		BUG();
 	}
 
