@@ -2010,9 +2010,13 @@ int scsi_mq_setup_tags(struct Scsi_Host *shost)
 	return blk_mq_alloc_tag_set(tag_set);
 }
 
-void scsi_mq_destroy_tags(struct Scsi_Host *shost)
+void scsi_mq_free_tags(struct kref *kref)
 {
-	blk_mq_free_tag_set(&shost->tag_set);
+	struct Scsi_Host_Aux *aux = container_of(kref, typeof(*aux),
+					       tagset_refcnt);
+
+	blk_mq_free_tag_set(&aux->host->tag_set);
+	complete(&aux->tagset_freed);
 }
 
 /**
