@@ -76,9 +76,6 @@ enum m_can_reg {
 	M_CAN_TXEFA	= 0xf8,
 };
 
-/* napi related */
-#define M_CAN_NAPI_WEIGHT	64
-
 /* message ram configuration data length */
 #define MRAM_CFG_LEN	8
 
@@ -920,7 +917,7 @@ static int m_can_rx_peripheral(struct net_device *dev)
 {
 	struct m_can_classdev *cdev = netdev_priv(dev);
 
-	m_can_rx_handler(dev, M_CAN_NAPI_WEIGHT);
+	m_can_rx_handler(dev, NAPI_POLL_WEIGHT);
 
 	m_can_enable_all_interrupts(cdev);
 
@@ -1416,8 +1413,7 @@ static int m_can_dev_setup(struct m_can_classdev *cdev)
 	}
 
 	if (!cdev->is_peripheral)
-		netif_napi_add(dev, &cdev->napi,
-			       m_can_poll, M_CAN_NAPI_WEIGHT);
+		netif_napi_add(dev, &cdev->napi, m_can_poll);
 
 	/* Shared properties of all M_CAN versions */
 	cdev->version = m_can_version;
@@ -1910,7 +1906,7 @@ int m_can_class_register(struct m_can_classdev *cdev)
 
 	if (cdev->is_peripheral) {
 		ret = can_rx_offload_add_manual(cdev->net, &cdev->offload,
-						M_CAN_NAPI_WEIGHT);
+						NAPI_POLL_WEIGHT);
 		if (ret)
 			goto clk_disable;
 	}
