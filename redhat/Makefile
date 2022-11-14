@@ -80,7 +80,7 @@ ifndef DISTRO
 endif
 
 ifndef RHJOBS
-  RHJOBS=$(shell j=$$(echo $(MAKEFLAGS) | grep -Eo "\ -j[0-9]*" | xargs ); \
+  RHJOBS=$(shell j=$$(echo $(MAKEFLAGS) | grep -Eo "(^|[ ])-j[0-9]*" | xargs ); \
 	  if [ -z "$${j}" ]; then \
 	  	echo "1"; \
 	  else \
