@@ -49,7 +49,8 @@ function combine_config_layer()
 		return
 	fi
 
-	cat "$dir"/CONFIG_* > "$file"
+	# avoid picking up editor backup files
+	cat $(ls -1 "$dir"/CONFIG_* | grep -v "~$") > "$file"
 }
 
 function merge_configs()
