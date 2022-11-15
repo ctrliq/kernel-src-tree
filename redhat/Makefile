@@ -517,7 +517,7 @@ dist-configs-arch: ARCH_MACH = $(MACH)
 dist-configs-arch: dist-configs
 
 dist-clean-configs:
-	@cd $(REDHAT)/configs; rm -f kernel-*.config kernel-*.config.orig kernel-*.config.tmp
+	@cd $(REDHAT)/configs; rm -f kernel-*.config kernel-*.config.orig kernel-*.config.tmp partial-*-snip.config
 
 dist-clean-sources:
 	@rm -f $(RPM)/SPECS/*
