@@ -1887,9 +1887,9 @@ static int lan743x_tx_open(struct lan743x_tx *tx)
 	tx->vector_flags = lan743x_intr_get_vector_flags(adapter,
 							 INT_BIT_DMA_TX_
 							 (tx->channel_number));
-	netif_tx_napi_add(adapter->netdev,
-			  &tx->napi, lan743x_tx_napi_poll,
-			  tx->ring_size - 1);
+	netif_napi_add_tx_weight(adapter->netdev,
+				 &tx->napi, lan743x_tx_napi_poll,
+				 tx->ring_size - 1);
 	napi_enable(&tx->napi);
 
 	data = 0;
@@ -2356,9 +2356,7 @@ static int lan743x_rx_open(struct lan743x_rx *rx)
 	if (ret)
 		goto return_error;
 
-	netif_napi_add(adapter->netdev,
-		       &rx->napi, lan743x_rx_napi_poll,
-		       NAPI_POLL_WEIGHT);
+	netif_napi_add(adapter->netdev, &rx->napi, lan743x_rx_napi_poll);
 
 	lan743x_csr_write(adapter, DMAC_CMD,
 			  DMAC_CMD_RX_SWR_(rx->channel_number));
