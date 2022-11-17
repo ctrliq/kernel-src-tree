@@ -5616,7 +5616,7 @@ static inline bool pqi_is_io_high_priority(struct pqi_ctrl_info *ctrl_info,
 
 	if (device->ncq_prio_enable) {
 		priority_class =
-			IOPRIO_PRIO_CLASS(req_get_ioprio(scmd->request));
+			IOPRIO_PRIO_CLASS(req_get_ioprio(scsi_cmd_to_rq(scmd)));
 		if (priority_class == IOPRIO_CLASS_RT) {
 			/* Set NCQ priority for read/write commands. */
 			switch (scmd->cmnd[0]) {
