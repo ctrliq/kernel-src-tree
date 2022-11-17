@@ -1187,18 +1187,7 @@ static int host1x_drm_probe(struct host1x_device *dev)
 		if (err < 0)
 			goto device;
 	}
-
-	/*
-	 * We don't use the drm_irq_install() helpers provided by the DRM
-	 * core, so we need to set this manually in order to allow the
-	 * DRM_IOCTL_WAIT_VBLANK to operate correctly.
-	 */
-
-	//mjp
-#if 0	
-	drm->irq_enabled = true;
-#endif	
-
+	
 	/* syncpoints are used for full 32-bit hardware VBLANK counters */
 	drm->max_vblank_count = 0xffffffff;
 
