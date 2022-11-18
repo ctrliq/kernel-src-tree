@@ -1548,7 +1548,8 @@ static int unix_accept(struct socket *sock, struct socket *newsock, int flags,
 	 * so that no locks are necessary.
 	 */
 
-	skb = skb_recv_datagram(sk, 0, flags&O_NONBLOCK, &err);
+	skb = skb_recv_datagram(sk, (flags & O_NONBLOCK) ? MSG_DONTWAIT : 0,
+				&err);
 	if (!skb) {
 		/* This means receive shutdown. */
 		if (err == 0)
@@ -2341,7 +2342,7 @@ static int unix_read_sock(struct sock *sk, read_descriptor_t *desc,
 		int used, err;
 
 		mutex_lock(&u->iolock);
-		skb = skb_recv_datagram(sk, 0, 1, &err);
+		skb = skb_recv_datagram(sk, MSG_DONTWAIT, &err);
 		mutex_unlock(&u->iolock);
 		if (!skb)
 			return err;
