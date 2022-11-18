@@ -105,6 +105,9 @@ TRACE_MAKE_SYSTEM_STR();
 #undef __string_len
 #define __string_len(item, src, len) __dynamic_array(char, item, -1)
 
+#undef __vstring
+#define __vstring(item, fmt, ap) __dynamic_array(char, item, -1)
+
 #undef __bitmask
 #define __bitmask(item, nr_bits) __dynamic_array(char, item, -1)
 
@@ -220,6 +223,9 @@ TRACE_MAKE_SYSTEM_STR();
 
 #undef __string_len
 #define __string_len(item, src, len) __dynamic_array(char, item, -1)
+
+#undef __vstring
+#define __vstring(item, fmt, ap) __dynamic_array(char, item, -1)
 
 #undef __bitmask
 #define __bitmask(item, nr_bits) __dynamic_array(unsigned long, item, -1)
@@ -532,6 +538,9 @@ static struct trace_event_functions trace_event_type_funcs_##call = {	\
 #undef __string_len
 #define __string_len(item, src, len) __dynamic_array(char, item, -1)
 
+#undef __vstring
+#define __vstring(item, fmt, ap) __dynamic_array(char, item, -1)
+
 #undef __bitmask
 #define __bitmask(item, nr_bits) __dynamic_array(unsigned long, item, -1)
 
@@ -603,6 +612,10 @@ static struct trace_event_fields trace_event_fields_##call[] = {	\
 
 #undef __string_len
 #define __string_len(item, src, len) __dynamic_array(char, item, (len) + 1)
+
+#undef __vstring
+#define __vstring(item, fmt, ap) __dynamic_array(char, item,		\
+		      __trace_event_vstr_len(fmt, ap))
 
 #undef __rel_dynamic_array
 #define __rel_dynamic_array(type, item, len)				\
@@ -796,6 +809,9 @@ static inline notrace int trace_event_get_offsets_##call(		\
 #undef __string_len
 #define __string_len(item, src, len) __dynamic_array(char, item, -1)
 
+#undef __vstring
+#define __vstring(item, fmt, ap) __dynamic_array(char, item, -1)
+
 #undef __assign_str
 #define __assign_str(dst, src)						\
 	strcpy(__get_str(dst), (src) ? (const char *)(src) : "(null)");
@@ -806,6 +822,10 @@ static inline notrace int trace_event_get_offsets_##call(		\
 		memcpy(__get_str(dst), (src), (len));			\
 		__get_str(dst)[len] = '\0';				\
 	} while(0)
+
+#undef __assign_vstr
+#define __assign_vstr(dst, fmt, va)					\
+	vsnprintf(__get_str(dst), TRACE_EVENT_STR_MAX, fmt, *(va))
 
 #undef __bitmask
 #define __bitmask(item, nr_bits) __dynamic_array(unsigned long, item, -1)
