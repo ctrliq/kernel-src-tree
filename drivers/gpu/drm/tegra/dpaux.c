@@ -18,7 +18,6 @@
 #include <linux/reset.h>
 #include <linux/workqueue.h>
 
-//mjp
 #include <drm/dp/drm_dp_helper.h>
 #include <drm/drm_panel.h>
 

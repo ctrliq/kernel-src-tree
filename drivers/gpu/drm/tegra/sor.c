@@ -18,7 +18,7 @@
 
 #include <drm/drm_atomic_helper.h>
 #include <drm/drm_debugfs.h>
-//mjp
+
 #include <drm/dp/drm_dp_helper.h>
 #include <drm/drm_file.h>
 #include <drm/drm_panel.h>

@@ -1197,12 +1197,10 @@ static int host1x_drm_probe(struct host1x_device *dev)
 
 	drm_mode_config_reset(drm);
 
-	//mjp
-#if 0	
-	err = drm_aperture_remove_framebuffers(false, "tegradrmfb");
+	err = drm_aperture_remove_framebuffers(false, &tegra_drm_driver);
 	if (err < 0)
-	  goto hub;
-#endif
+		goto hub;
+
 	err = tegra_drm_fb_init(drm);
 	if (err < 0)
 		goto hub;
