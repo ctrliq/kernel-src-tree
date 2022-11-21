@@ -4,7 +4,7 @@
  * Copyright (C) 2015 Rob Clark
  */
 
-#include <drm/dp/drm_dp_helper.h>
+#include <drm/display/drm_dp_helper.h>
 #include <drm/drm_crtc.h>
 #include <drm/drm_print.h>
 
