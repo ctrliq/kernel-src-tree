@@ -7372,7 +7372,6 @@ static int raid456_cpu_up_prepare(unsigned int cpu, struct hlist_node *node)
 			__func__, cpu);
 		return -ENOMEM;
 	}
-	spin_lock_init(&per_cpu_ptr(conf->percpu, cpu)->lock);
 	return 0;
 }
 

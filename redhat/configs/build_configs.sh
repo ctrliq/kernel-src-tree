@@ -6,7 +6,7 @@
 
 test -n "$RHTEST" && exit 0
 
-PACKAGE_NAME="${1:-kernel-rt}" # defines the package name used
+PACKAGE_NAME="${1:-kernel}" # defines the package name used
 if [ -z "$2" ]; then
 	cat flavors > .flavors
 else

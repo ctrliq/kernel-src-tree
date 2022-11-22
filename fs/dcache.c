@@ -32,7 +32,6 @@
 #include <linux/bit_spinlock.h>
 #include <linux/rculist_bl.h>
 #include <linux/list_lru.h>
-#include <linux/swait.h>
 #include "internal.h"
 #include "mount.h"
 
@@ -2558,34 +2557,31 @@ static inline unsigned start_dir_add(struct inode *dir)
 }
 
 static inline void end_dir_add(struct inode *dir, unsigned int n,
-			       struct swait_queue_head *d_wait)
+			       wait_queue_head_t *d_wait)
 {
 	smp_store_release(&dir->i_dir_seq, n + 2);
 	if (IS_ENABLED(CONFIG_PREEMPT_RT))
 		preempt_enable();
-	swake_up_all(d_wait);
+	wake_up_all(d_wait);
 }
 
 static void d_wait_lookup(struct dentry *dentry)
 {
-	struct swait_queue __wait;
-
-	if (!d_in_lookup(dentry))
-		return;
-
-	INIT_LIST_HEAD(&__wait.task_list);
-	do {
-		prepare_to_swait_exclusive(dentry->d_wait, &__wait, TASK_UNINTERRUPTIBLE);
-		spin_unlock(&dentry->d_lock);
-		schedule();
-		spin_lock(&dentry->d_lock);
-	} while (d_in_lookup(dentry));
-	finish_swait(dentry->d_wait, &__wait);
+	if (d_in_lookup(dentry)) {
+		DECLARE_WAITQUEUE(wait, current);
+		add_wait_queue(dentry->d_wait, &wait);
+		do {
+			set_current_state(TASK_UNINTERRUPTIBLE);
+			spin_unlock(&dentry->d_lock);
+			schedule();
+			spin_lock(&dentry->d_lock);
+		} while (d_in_lookup(dentry));
+	}
 }
 
 struct dentry *d_alloc_parallel(struct dentry *parent,
 				const struct qstr *name,
-				struct swait_queue_head *wq)
+				wait_queue_head_t *wq)
 {
 	unsigned int hash = name->hash;
 	struct hlist_bl_head *b = in_lookup_hash(parent, hash);
@@ -2698,9 +2694,9 @@ EXPORT_SYMBOL(d_alloc_parallel);
  * - Retrieve and clear the waitqueue head in dentry
  * - Return the waitqueue head
  */
-static struct swait_queue_head *__d_lookup_unhash(struct dentry *dentry)
+static wait_queue_head_t *__d_lookup_unhash(struct dentry *dentry)
 {
-	struct swait_queue_head *d_wait;
+	wait_queue_head_t *d_wait;
 	struct hlist_bl_head *b;
 
 	lockdep_assert_held(&dentry->d_lock);
@@ -2720,7 +2716,7 @@ static struct swait_queue_head *__d_lookup_unhash(struct dentry *dentry)
 void __d_lookup_unhash_wake(struct dentry *dentry)
 {
 	spin_lock(&dentry->d_lock);
-	swake_up_all(__d_lookup_unhash(dentry));
+	wake_up_all(__d_lookup_unhash(dentry));
 	spin_unlock(&dentry->d_lock);
 }
 EXPORT_SYMBOL(__d_lookup_unhash_wake);
@@ -2729,7 +2725,7 @@ EXPORT_SYMBOL(__d_lookup_unhash_wake);
 
 static inline void __d_add(struct dentry *dentry, struct inode *inode)
 {
-	struct swait_queue_head *d_wait;
+	wait_queue_head_t *d_wait;
 	struct inode *dir = NULL;
 	unsigned n;
 	spin_lock(&dentry->d_lock);
@@ -2895,7 +2891,7 @@ static void __d_move(struct dentry *dentry, struct dentry *target,
 		     bool exchange)
 {
 	struct dentry *old_parent, *p;
-	struct swait_queue_head *d_wait;
+	wait_queue_head_t *d_wait;
 	struct inode *dir = NULL;
 	unsigned n;
 

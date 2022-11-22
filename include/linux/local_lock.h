@@ -31,15 +31,6 @@
 	__local_lock_irqsave(lock, flags)
 
 /**
- * local_lock_irqsave_on - Acquire a per CPU lock (remotely), save and disable
- *			 interrupts
- * @lock:	The lock variable
- * @flags:	Storage for interrupt flags
- */
-#define local_lock_irqsave_on(lock, flags, cpu)			\
-	__local_lock_irqsave_on(lock, flags, cpu)
-
-/**
  * local_unlock - Release a per CPU local lock
  * @lock:	The lock variable
  */
@@ -59,14 +50,5 @@
  */
 #define local_unlock_irqrestore(lock, flags)			\
 	__local_unlock_irqrestore(lock, flags)
-
-/**
- * local_unlock_irqrestore_on - Release a per CPU local lock (remotely)
- *				 and restore interrupt flags
- * @lock:	The lock variable
- * @flags:      Interrupt flags to restore
- */
-#define local_unlock_irqrestore_on(lock, flags, cpu)		\
-	__local_unlock_irqrestore_on(lock, flags, cpu)
 
 #endif

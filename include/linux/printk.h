@@ -174,11 +174,7 @@ extern void __printk_safe_exit(void);
 #define printk_deferred_enter __printk_safe_enter
 #define printk_deferred_exit __printk_safe_exit
 
-extern void printk_prefer_direct_enter(void);
-extern void printk_prefer_direct_exit(void);
-
 extern bool pr_flush(int timeout_ms, bool reset_on_progress);
-extern void try_block_console_kthreads(int timeout_ms);
 
 /*
  * Please don't use printk_ratelimit(), because it shares ratelimiting state
@@ -230,21 +226,9 @@ static inline void printk_deferred_exit(void)
 {
 }
 
-static inline void printk_prefer_direct_enter(void)
-{
-}
-
-static inline void printk_prefer_direct_exit(void)
-{
-}
-
 static inline bool pr_flush(int timeout_ms, bool reset_on_progress)
 {
 	return true;
-}
-
-static inline void try_block_console_kthreads(int timeout_ms)
-{
 }
 
 static inline int printk_ratelimit(void)
@@ -308,16 +292,9 @@ extern int __printk_cpu_sync_try_get(void);
 extern void __printk_cpu_sync_wait(void);
 extern void __printk_cpu_sync_put(void);
 
-#else
-
-#define __printk_cpu_sync_try_get() true
-#define __printk_cpu_sync_wait()
-#define __printk_cpu_sync_put()
-#endif /* CONFIG_SMP */
-
 /**
- * printk_cpu_sync_get_irqsave() - Disable interrupts and acquire the printk
- *                                 cpu-reentrant spinning lock.
+ * printk_cpu_sync_get_irqsave() - Acquire the printk cpu-reentrant spinning
+ *                                 lock and disable interrupts.
  * @flags: Stack-allocated storage for saving local interrupt state,
  *         to be passed to printk_cpu_sync_put_irqrestore().
  *
@@ -355,6 +332,13 @@ extern void __printk_cpu_sync_put(void);
 		__printk_cpu_sync_put();	\
 		local_irq_restore(flags);	\
 	} while (0)
+
+#else
+
+#define printk_cpu_sync_get_irqsave(flags) ((void)flags)
+#define printk_cpu_sync_put_irqrestore(flags) ((void)flags)
+
+#endif /* CONFIG_SMP */
 
 extern int kptr_restrict;
 

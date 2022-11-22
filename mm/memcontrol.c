@@ -262,10 +262,8 @@ bool mem_cgroup_kmem_disabled(void)
 	return cgroup_memory_nokmem;
 }
 
-struct memcg_stock_pcp;
 static void obj_cgroup_uncharge_pages(struct obj_cgroup *objcg,
-				      unsigned int nr_pages,
-				      bool stock_lock_acquried);
+				      unsigned int nr_pages);
 
 static void obj_cgroup_release(struct percpu_ref *ref)
 {
@@ -299,7 +297,7 @@ static void obj_cgroup_release(struct percpu_ref *ref)
 	nr_pages = nr_bytes >> PAGE_SHIFT;
 
 	if (nr_pages)
-		obj_cgroup_uncharge_pages(objcg, nr_pages, false);
+		obj_cgroup_uncharge_pages(objcg, nr_pages);
 
 	spin_lock_irqsave(&objcg_lock, flags);
 	list_del(&objcg->list);
@@ -752,14 +750,8 @@ void __mod_memcg_state(struct mem_cgroup *memcg, int idx, int val)
 	if (mem_cgroup_disabled())
 		return;
 
-	if (IS_ENABLED(CONFIG_PREEMPT_RT))
-		preempt_disable();
-
 	__this_cpu_add(memcg->vmstats_percpu->state[idx], val);
 	memcg_rstat_updated(memcg, val);
-
-	if (IS_ENABLED(CONFIG_PREEMPT_RT))
-		preempt_enable();
 }
 
 /* idx can be of type enum memcg_stat_item or node_stat_item. */
@@ -931,9 +923,6 @@ static unsigned long memcg_events_local(struct mem_cgroup *memcg, int event)
 static void mem_cgroup_charge_statistics(struct mem_cgroup *memcg,
 					 int nr_pages)
 {
-	if (IS_ENABLED(CONFIG_PREEMPT_RT))
-		preempt_disable();
-
 	/* pagein of a big page is an event. So, ignore page size */
 	if (nr_pages > 0)
 		__count_memcg_events(memcg, PGPGIN, 1);
@@ -943,19 +932,12 @@ static void mem_cgroup_charge_statistics(struct mem_cgroup *memcg,
 	}
 
 	__this_cpu_add(memcg->vmstats_percpu->nr_page_events, nr_pages);
-
-	if (IS_ENABLED(CONFIG_PREEMPT_RT))
-		preempt_enable();
 }
 
 static bool mem_cgroup_event_ratelimit(struct mem_cgroup *memcg,
 				       enum mem_cgroup_events_target target)
 {
 	unsigned long val, next;
-	bool ret = false;
-
-	if (IS_ENABLED(CONFIG_PREEMPT_RT))
-		preempt_disable();
 
 	val = __this_cpu_read(memcg->vmstats_percpu->nr_page_events);
 	next = __this_cpu_read(memcg->vmstats_percpu->targets[target]);
@@ -972,11 +954,9 @@ static bool mem_cgroup_event_ratelimit(struct mem_cgroup *memcg,
 			break;
 		}
 		__this_cpu_write(memcg->vmstats_percpu->targets[target], next);
-		ret = true;
+		return true;
 	}
-	if (IS_ENABLED(CONFIG_PREEMPT_RT))
-		preempt_enable();
-	return ret;
+	return false;
 }
 
 /*
@@ -2225,7 +2205,7 @@ static bool obj_stock_flush_required(struct memcg_stock_pcp *stock,
 static void memcg_account_kmem(struct mem_cgroup *memcg, int nr_pages);
 
 #else
-static inline struct obj_cgroup *drain_obj_stock(struct obj_stock *stock);
+static inline struct obj_cgroup *drain_obj_stock(struct memcg_stock_pcp *stock)
 {
 	return NULL;
 }
@@ -2351,7 +2331,7 @@ static void refill_stock(struct mem_cgroup *memcg, unsigned int nr_pages)
  */
 static void drain_all_stock(struct mem_cgroup *root_memcg)
 {
-	int cpu;
+	int cpu, curcpu;
 
 	/* If someone's already draining, avoid adding running more workers. */
 	if (!mutex_trylock(&percpu_charge_mutex))
@@ -2363,6 +2343,7 @@ static void drain_all_stock(struct mem_cgroup *root_memcg)
 	 * per-cpu data. CPU up doesn't touch memcg_stock at all.
 	 */
 	migrate_disable();
+	curcpu = smp_processor_id();
 	for_each_online_cpu(cpu) {
 		struct memcg_stock_pcp *stock = &per_cpu(memcg_stock, cpu);
 		struct mem_cgroup *memcg;
@@ -2378,8 +2359,12 @@ static void drain_all_stock(struct mem_cgroup *root_memcg)
 		rcu_read_unlock();
 
 		if (flush &&
-		    !test_and_set_bit(FLUSHING_CACHED_CHARGE, &stock->flags))
-			schedule_work_on(cpu, &stock->work);
+		    !test_and_set_bit(FLUSHING_CACHED_CHARGE, &stock->flags)) {
+			if (cpu == curcpu)
+				drain_local_stock(&stock->work);
+			else
+				schedule_work_on(cpu, &stock->work);
+		}
 	}
 	migrate_enable();
 	mutex_unlock(&percpu_charge_mutex);
@@ -3049,8 +3034,7 @@ static void memcg_account_kmem(struct mem_cgroup *memcg, int nr_pages)
  * @nr_pages: number of pages to uncharge
  */
 static void obj_cgroup_uncharge_pages(struct obj_cgroup *objcg,
-				      unsigned int nr_pages,
-				      bool stock_lock_acquried)
+				      unsigned int nr_pages)
 {
 	struct mem_cgroup *memcg;
 
@@ -3130,7 +3114,7 @@ void __memcg_kmem_uncharge_page(struct page *page, int order)
 		return;
 
 	objcg = __folio_objcg(folio);
-	obj_cgroup_uncharge_pages(objcg, nr_pages, false);
+	obj_cgroup_uncharge_pages(objcg, nr_pages);
 	folio->memcg_data = 0;
 	obj_cgroup_put(objcg);
 }
@@ -3301,9 +3285,9 @@ static void refill_obj_stock(struct obj_cgroup *objcg, unsigned int nr_bytes,
 			     bool allow_uncharge)
 {
 	struct memcg_stock_pcp *stock;
+	struct obj_cgroup *old = NULL;
 	unsigned long flags;
 	unsigned int nr_pages = 0;
-	struct obj_cgroup *old = NULL;
 
 	local_lock_irqsave(&memcg_stock.stock_lock, flags);
 
@@ -3328,7 +3312,7 @@ static void refill_obj_stock(struct obj_cgroup *objcg, unsigned int nr_bytes,
 		obj_cgroup_put(old);
 
 	if (nr_pages)
-		obj_cgroup_uncharge_pages(objcg, nr_pages, false);
+		obj_cgroup_uncharge_pages(objcg, nr_pages);
 }
 
 int obj_cgroup_charge(struct obj_cgroup *objcg, gfp_t gfp, size_t size)
@@ -5731,14 +5715,12 @@ static int mem_cgroup_move_account(struct page *page,
 	ret = 0;
 	nid = folio_nid(folio);
 
-	if (!IS_ENABLED(CONFIG_PREEMPT_RT))
-		local_irq_disable();
+	local_irq_disable();
 	mem_cgroup_charge_statistics(to, nr_pages);
 	memcg_check_events(to, nid);
 	mem_cgroup_charge_statistics(from, -nr_pages);
 	memcg_check_events(from, nid);
-	if (!IS_ENABLED(CONFIG_PREEMPT_RT))
-		local_irq_enable();
+	local_irq_enable();
 out_unlock:
 	folio_unlock(folio);
 out:
@@ -6805,12 +6787,10 @@ static int charge_memcg(struct folio *folio, struct mem_cgroup *memcg,
 	css_get(&memcg->css);
 	commit_charge(folio, memcg);
 
-	if (!IS_ENABLED(CONFIG_PREEMPT_RT))
-		local_irq_disable();
+	local_irq_disable();
 	mem_cgroup_charge_statistics(memcg, nr_pages);
 	memcg_check_events(memcg, folio_nid(folio));
-	if (!IS_ENABLED(CONFIG_PREEMPT_RT))
-		local_irq_enable();
+	local_irq_enable();
 out:
 	return ret;
 }
@@ -6922,20 +6902,11 @@ static void uncharge_batch(const struct uncharge_gather *ug)
 		memcg_oom_recover(ug->memcg);
 	}
 
-	if (!IS_ENABLED(CONFIG_PREEMPT_RT)) {
-		local_irq_save(flags);
-		__count_memcg_events(ug->memcg, PGPGOUT, ug->pgpgout);
-		__this_cpu_add(ug->memcg->vmstats_percpu->nr_page_events, ug->nr_memory);
-		memcg_check_events(ug->memcg, ug->nid);
-		local_irq_restore(flags);
-	} else {
-		preempt_disable();
-		__count_memcg_events(ug->memcg, PGPGOUT, ug->pgpgout);
-		__this_cpu_add(ug->memcg->vmstats_percpu->nr_page_events, ug->nr_memory);
-		preempt_enable();
-
-		memcg_check_events(ug->memcg, ug->nid);
-	}
+	local_irq_save(flags);
+	__count_memcg_events(ug->memcg, PGPGOUT, ug->pgpgout);
+	__this_cpu_add(ug->memcg->vmstats_percpu->nr_page_events, ug->nr_memory);
+	memcg_check_events(ug->memcg, ug->nid);
+	local_irq_restore(flags);
 
 	/* drop reference from uncharge_folio */
 	css_put(&ug->memcg->css);
@@ -7075,12 +7046,10 @@ void mem_cgroup_migrate(struct folio *old, struct folio *new)
 	css_get(&memcg->css);
 	commit_charge(new, memcg);
 
-	if (!IS_ENABLED(CONFIG_PREEMPT_RT))
-		local_irq_save(flags);
+	local_irq_save(flags);
 	mem_cgroup_charge_statistics(memcg, nr_pages);
 	memcg_check_events(memcg, folio_nid(new));
-	if (!IS_ENABLED(CONFIG_PREEMPT_RT))
-		local_irq_restore(flags);
+	local_irq_restore(flags);
 }
 
 DEFINE_STATIC_KEY_FALSE(memcg_sockets_enabled_key);
@@ -7304,8 +7273,6 @@ void mem_cgroup_swapout(struct folio *folio, swp_entry_t entry)
 	 * i_pages lock which is taken with interrupts-off. It is
 	 * important here to have the interrupts disabled because it is the
 	 * only synchronisation we have for updating the per-CPU variables.
-	 * On PREEMPT_RT interrupts are never disabled and the updates to per-CPU
-	 * variables are synchronised by keeping preemption disabled.
 	 */
 	memcg_stats_lock();
 	mem_cgroup_charge_statistics(memcg, -nr_entries);

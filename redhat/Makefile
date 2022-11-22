@@ -65,13 +65,9 @@ FLAVOR=
 CURARCH := $(shell uname -m)
 ARCHCONFIG := $(shell uname -m | sed -e s/x86_64/X86_64/ \
 				     -e s/s390x/S390/ -e s/ppc.*/PPC/ )
-# Realtime variables
-RTBZ:=2125474
-RTTAG:=.$(shell cat $(REDHAT)/../localversion-rt | cut -c 2-)
-RTBUILD:=$(shell sed -n -e 's/^RTBUILD:=\.\(.*\)/\1/p' $(REDHAT)/../Makefile.rhelver)
 
 # rpm information
-SPECFILE:=kernel.spec
+SPECFILE:=$(PACKAGE_NAME).spec
 RPM:=$(REDHAT)/rpm
 SRPMS:=$(RPM)/SRPMS
 SOURCES:=$(RPM)/SOURCES
@@ -231,7 +227,7 @@ endif
 # $(PACKAGE_NAME)-$(BASEVERSION)                                                            $(DIST)
 # $(RELEASETAG)                                                                             $(DIST)
 #
-SPECBUILD:=$(UPSTREAMBUILD)$(BUILD)$(RTTAG).$(RTBUILD)$(DISTLOCALVERSION)
+SPECBUILD:=$(UPSTREAMBUILD)$(BUILD)$(DISTLOCALVERSION)
 SPECVERSION:=$(SPECKVERSION).$(SPECKPATCHLEVEL).$(SPECKSUBLEVEL)
 BASEVERSION:=$(SPECVERSION)-$(SPECBUILD)
 RELEASETAG:=$(PACKAGE_NAME)-$(BASEVERSION)
@@ -590,7 +586,6 @@ _setup-source: dist-git-version-check
 		echo "Creating $(SPECCHANGELOG) as copy of $(CHANGELOG_PREV)"; \
 		cp $(REDHAT)/$(CHANGELOG_PREV) $(REDHAT)/$(SPECCHANGELOG); \
 	fi
-
 	@if [ -z "$(RHSELFTESTDATA)" ]; then \
 		cp $(REDHAT)/$(SPECCHANGELOG) $(SOURCES)/$(SPECCHANGELOG); \
 	else \
@@ -634,7 +629,6 @@ sources-rh: $(TARBALL) generate-testpatch-tmp setup-source dist-configs-check
 		kvm_stat.logrotate \
 		mod-denylist.sh \
 		mod-internal.list \
-	    	mod-kvm.list \
 		mod-sign.sh \
 		configs/flavors \
 		configs/generate_all_configs.sh \

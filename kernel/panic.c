@@ -215,17 +215,13 @@ void panic(const char *fmt, ...)
 		panic_smp_self_stop();
 
 	console_verbose();
+	bust_spinlocks(1);
 	va_start(args, fmt);
 	len = vscnprintf(buf, sizeof(buf), fmt, args);
 	va_end(args);
 
 	if (len && buf[len - 1] == '\n')
 		buf[len - 1] = '\0';
-
-	/* If atomic consoles are available, flush the kernel log. */
-	console_flush_on_panic(CONSOLE_ATOMIC_FLUSH_PENDING);
-
-	bust_spinlocks(1);
 
 	pr_emerg("Kernel panic - not syncing: %s\n", buf);
 #ifdef CONFIG_DEBUG_BUGVERBOSE
@@ -259,7 +255,6 @@ void panic(const char *fmt, ...)
 		 * unfortunately means it may not be hardened to work in a
 		 * panic situation.
 		 */
-		try_block_console_kthreads(10000);
 		smp_send_stop();
 	} else {
 		/*
@@ -267,7 +262,6 @@ void panic(const char *fmt, ...)
 		 * kmsg_dump, we will need architecture dependent extra
 		 * works in addition to stopping other CPUs.
 		 */
-		try_block_console_kthreads(10000);
 		crash_smp_send_stop();
 	}
 
@@ -560,11 +554,9 @@ static u64 oops_id;
 
 static int init_oops_id(void)
 {
-#ifndef CONFIG_PREEMPT_RT
 	if (!oops_id)
 		get_random_bytes(&oops_id, sizeof(oops_id));
 	else
-#endif
 		oops_id++;
 
 	return 0;
@@ -597,8 +589,6 @@ void __warn(const char *file, int line, void *caller, unsigned taint,
 	    struct pt_regs *regs, struct warn_args *args)
 {
 	disable_trace_on_warning();
-
-	printk_prefer_direct_enter();
 
 	if (file)
 		pr_warn("WARNING: CPU: %d PID: %d at %s:%d %pS\n",
@@ -636,8 +626,6 @@ void __warn(const char *file, int line, void *caller, unsigned taint,
 
 	/* Just a warning, don't kill lockdep. */
 	add_taint(taint, LOCKDEP_STILL_OK);
-
-	printk_prefer_direct_exit();
 }
 
 #ifndef __WARN_FLAGS
