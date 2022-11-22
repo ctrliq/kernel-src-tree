@@ -86,20 +86,6 @@
 
 #define ZS_HANDLE_SIZE (sizeof(unsigned long))
 
-#ifdef CONFIG_PREEMPT_RT
-
-struct zsmalloc_handle {
-	unsigned long addr;
-	spinlock_t lock;
-};
-
-#define ZS_HANDLE_ALLOC_SIZE (sizeof(struct zsmalloc_handle))
-
-#else
-
-#define ZS_HANDLE_ALLOC_SIZE (sizeof(unsigned long))
-#endif
-
 /*
  * Object location (<PFN>, <obj_idx>) is encoded as
  * a single (unsigned long) handle value.
@@ -338,7 +324,7 @@ static void SetZsPageMovable(struct zs_pool *pool, struct zspage *zspage) {}
 
 static int create_cache(struct zs_pool *pool)
 {
-	pool->handle_cachep = kmem_cache_create("zs_handle", ZS_HANDLE_ALLOC_SIZE,
+	pool->handle_cachep = kmem_cache_create("zs_handle", ZS_HANDLE_SIZE,
 					0, 0, NULL);
 	if (!pool->handle_cachep)
 		return 1;
@@ -362,26 +348,9 @@ static void destroy_cache(struct zs_pool *pool)
 
 static unsigned long cache_alloc_handle(struct zs_pool *pool, gfp_t gfp)
 {
-	void *p;
-
-	p = kmem_cache_alloc(pool->handle_cachep,
-			     gfp & ~(__GFP_HIGHMEM|__GFP_MOVABLE));
-#ifdef CONFIG_PREEMPT_RT
-	if (p) {
-		struct zsmalloc_handle *zh = p;
-
-		spin_lock_init(&zh->lock);
-	}
-#endif
-	return (unsigned long)p;
+	return (unsigned long)kmem_cache_alloc(pool->handle_cachep,
+			gfp & ~(__GFP_HIGHMEM|__GFP_MOVABLE));
 }
-
-#ifdef CONFIG_PREEMPT_RT
-static struct zsmalloc_handle *zs_get_pure_handle(unsigned long handle)
-{
-	return (void *)(handle & ~((1 << OBJ_TAG_BITS) - 1));
-}
-#endif
 
 static void cache_free_handle(struct zs_pool *pool, unsigned long handle)
 {
@@ -897,13 +866,7 @@ static unsigned long location_to_obj(struct page *page, unsigned int obj_idx)
 
 static unsigned long handle_to_obj(unsigned long handle)
 {
-#ifdef CONFIG_PREEMPT_RT
-	struct zsmalloc_handle *zh = zs_get_pure_handle(handle);
-
-	return zh->addr;
-#else
 	return *(unsigned long *)handle;
-#endif
 }
 
 static bool obj_allocated(struct page *page, void *obj, unsigned long *phandle)

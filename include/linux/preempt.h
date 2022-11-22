@@ -230,13 +230,7 @@ do { \
 	preempt_count_dec(); \
 } while (0)
 
-#ifndef CONFIG_PREEMPT_RT
-# define preempt_enable_no_resched() sched_preempt_enable_no_resched()
-# define preempt_check_resched_rt() barrier();
-#else
-# define preempt_enable_no_resched() preempt_enable()
-# define preempt_check_resched_rt() preempt_check_resched()
-#endif
+#define preempt_enable_no_resched() sched_preempt_enable_no_resched()
 
 #define preemptible()	(preempt_count() == 0 && !irqs_disabled())
 
@@ -324,7 +318,6 @@ do { \
 #define preempt_disable_notrace()		barrier()
 #define preempt_enable_no_resched_notrace()	barrier()
 #define preempt_enable_notrace()		barrier()
-#define preempt_check_resched_rt()		barrier()
 #define preemptible()				0
 
 #define preempt_lazy_disable()			barrier()
@@ -475,5 +468,47 @@ static inline void migrate_enable(void)
 }
 
 #endif /* CONFIG_SMP */
+
+/**
+ * preempt_disable_nested - Disable preemption inside a normally preempt disabled section
+ *
+ * Use for code which requires preemption protection inside a critical
+ * section which has preemption disabled implicitly on non-PREEMPT_RT
+ * enabled kernels, by e.g.:
+ *  - holding a spinlock/rwlock
+ *  - soft interrupt context
+ *  - regular interrupt handlers
+ *
+ * On PREEMPT_RT enabled kernels spinlock/rwlock held sections, soft
+ * interrupt context and regular interrupt handlers are preemptible and
+ * only prevent migration. preempt_disable_nested() ensures that preemption
+ * is disabled for cases which require CPU local serialization even on
+ * PREEMPT_RT. For non-PREEMPT_RT kernels this is a NOP.
+ *
+ * The use cases are code sequences which are not serialized by a
+ * particular lock instance, e.g.:
+ *  - seqcount write side critical sections where the seqcount is not
+ *    associated to a particular lock and therefore the automatic
+ *    protection mechanism does not work. This prevents a live lock
+ *    against a preempting high priority reader.
+ *  - RMW per CPU variable updates like vmstat.
+ */
+/* Macro to avoid header recursion hell vs. lockdep */
+#define preempt_disable_nested()				\
+do {								\
+	if (IS_ENABLED(CONFIG_PREEMPT_RT))			\
+		preempt_disable();				\
+	else							\
+		lockdep_assert_preemption_disabled();		\
+} while (0)
+
+/**
+ * preempt_enable_nested - Undo the effect of preempt_disable_nested()
+ */
+static __always_inline void preempt_enable_nested(void)
+{
+	if (IS_ENABLED(CONFIG_PREEMPT_RT))
+		preempt_enable();
+}
 
 #endif /* __LINUX_PREEMPT_H */

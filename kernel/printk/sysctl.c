@@ -75,7 +75,7 @@ static struct ctl_table printk_sysctls[] = {
 		.mode		= 0644,
 		.proc_handler	= proc_dointvec_minmax_sysadmin,
 		.extra1		= SYSCTL_ZERO,
-		.extra2		= (void *)&two,
+		.extra2		= &two,
 	},
 	{}
 };

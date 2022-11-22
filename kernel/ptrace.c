@@ -197,18 +197,7 @@ static bool ptrace_freeze_traced(struct task_struct *task)
 	spin_lock_irq(&task->sighand->siglock);
 	if (task_is_traced(task) && !looks_like_a_spurious_pid(task) &&
 	    !__fatal_signal_pending(task)) {
-#ifdef CONFIG_PREEMPT_RT
-		unsigned long flags;
-
-		raw_spin_lock_irqsave(&task->pi_lock, flags);
-		if (READ_ONCE(task->__state) & __TASK_TRACED)
-			WRITE_ONCE(task->__state, __TASK_TRACED);
-		else
-			task->saved_state = __TASK_TRACED;
-		raw_spin_unlock_irqrestore(&task->pi_lock, flags);
-#else
 		WRITE_ONCE(task->__state, __TASK_TRACED);
-#endif
 		ret = true;
 	}
 	spin_unlock_irq(&task->sighand->siglock);
@@ -218,11 +207,7 @@ static bool ptrace_freeze_traced(struct task_struct *task)
 
 static void ptrace_unfreeze_traced(struct task_struct *task)
 {
-	unsigned long flags;
-	bool frozen = true;
-
-	if (!IS_ENABLED(CONFIG_PREEMPT_RT) &&
-	    READ_ONCE(task->__state) != __TASK_TRACED)
+	if (READ_ONCE(task->__state) != __TASK_TRACED)
 		return;
 
 	WARN_ON(!task->ptrace || task->parent != current);
@@ -232,21 +217,12 @@ static void ptrace_unfreeze_traced(struct task_struct *task)
 	 * Recheck state under the lock to close this race.
 	 */
 	spin_lock_irq(&task->sighand->siglock);
-	raw_spin_lock_irqsave(&task->pi_lock, flags);
-	if (READ_ONCE(task->__state) == __TASK_TRACED)
-		WRITE_ONCE(task->__state, TASK_TRACED);
-
-#ifdef CONFIG_PREEMPT_RT
-	else if (task->saved_state == __TASK_TRACED)
-		task->saved_state = TASK_TRACED;
-#endif
-	else
-		frozen = false;
-	raw_spin_unlock_irqrestore(&task->pi_lock, flags);
-
-	if (frozen && __fatal_signal_pending(task))
-		wake_up_state(task, __TASK_TRACED);
-
+	if (READ_ONCE(task->__state) == __TASK_TRACED) {
+		if (__fatal_signal_pending(task))
+			wake_up_state(task, __TASK_TRACED);
+		else
+			WRITE_ONCE(task->__state, TASK_TRACED);
+	}
 	spin_unlock_irq(&task->sighand->siglock);
 }
 

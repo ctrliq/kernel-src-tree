@@ -2644,17 +2644,19 @@ unsigned int tracing_gen_ctx_irq_test(unsigned int irqs_status)
 	if (softirq_count() >> (SOFTIRQ_SHIFT + 1))
 		trace_flags |= TRACE_FLAG_BH_OFF;
 
-	if (tif_need_resched())
+	if (tif_need_resched_now())
 		trace_flags |= TRACE_FLAG_NEED_RESCHED;
-	if (test_preempt_need_resched())
-		trace_flags |= TRACE_FLAG_PREEMPT_RESCHED;
-
 #ifdef CONFIG_PREEMPT_LAZY
+	/* Run out of bits. Share the LAZY and PREEMPT_RESCHED */
 	if (need_resched_lazy())
 		trace_flags |= TRACE_FLAG_NEED_RESCHED_LAZY;
+#else
+	if (test_preempt_need_resched())
+		trace_flags |= TRACE_FLAG_PREEMPT_RESCHED;
 #endif
 
-	return (trace_flags << 16) | (min_t(unsigned int, pc & 0xff, 0xf)) |
+	return (trace_flags << 24) | (min_t(unsigned int, pc & 0xff, 0xf)) |
+		(preempt_lazy_count() & 0xff) << 16 |
 		(min_t(unsigned int, migration_disable_value(), 0xf)) << 4;
 }
 

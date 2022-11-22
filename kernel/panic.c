@@ -222,11 +222,6 @@ void panic(const char *fmt, ...)
 	if (len && buf[len - 1] == '\n')
 		buf[len - 1] = '\0';
 
-	/* If atomic consoles are available, flush the kernel log. */
-	console_flush_on_panic(CONSOLE_ATOMIC_FLUSH_PENDING);
-
-	bust_spinlocks(1);
-
 	pr_emerg("Kernel panic - not syncing: %s\n", buf);
 #ifdef CONFIG_DEBUG_BUGVERBOSE
 	/*
@@ -235,6 +230,11 @@ void panic(const char *fmt, ...)
 	if (!test_taint(TAINT_DIE) && oops_in_progress <= 1)
 		dump_stack();
 #endif
+
+	/* If atomic consoles are available, flush the kernel log. */
+	console_flush_on_panic(CONSOLE_ATOMIC_FLUSH_PENDING);
+
+	bust_spinlocks(1);
 
 	/*
 	 * If kgdb is enabled, give it a chance to run before we stop all
@@ -560,11 +560,9 @@ static u64 oops_id;
 
 static int init_oops_id(void)
 {
-#ifndef CONFIG_PREEMPT_RT
 	if (!oops_id)
 		get_random_bytes(&oops_id, sizeof(oops_id));
 	else
-#endif
 		oops_id++;
 
 	return 0;
