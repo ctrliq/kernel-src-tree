@@ -66,7 +66,7 @@ struct vdpa_mgmt_dev;
  * @dma_dev: the actual device that is performing DMA
  * @driver_override: driver name to force a match
  * @config: the configuration ops for this device.
- * @cf_mutex: Protects get and set access to configuration layout.
+ * @cf_lock: Protects get and set access to configuration layout.
  * @index: device index
  * @features_valid: were features initialized? for legacy guests
  * @ngroups: the number of virtqueue groups
@@ -81,7 +81,7 @@ struct vdpa_device {
 	struct device *dma_dev;
 	const char *driver_override;
 	const struct vdpa_config_ops *config;
-	struct mutex cf_mutex; /* Protects get/set config */
+	struct rw_semaphore cf_lock; /* Protects get/set config */
 	unsigned int index;
 	bool features_valid;
 	bool use_va;
@@ -292,6 +292,9 @@ struct vdpa_config_ops {
 			    const struct vdpa_vq_state *state);
 	int (*get_vq_state)(struct vdpa_device *vdev, u16 idx,
 			    struct vdpa_vq_state *state);
+	int (*get_vendor_vq_stats)(struct vdpa_device *vdev, u16 idx,
+				   struct sk_buff *msg,
+				   struct netlink_ext_ack *extack);
 	struct vdpa_notification_area
 	(*get_vq_notification)(struct vdpa_device *vdev, u16 idx);
 	/* vq irq is not expected to be changed once DRIVER_OK is set */
@@ -420,25 +423,31 @@ static inline int vdpa_reset(struct vdpa_device *vdev)
 	const struct vdpa_config_ops *ops = vdev->config;
 	int ret;
 
-	mutex_lock(&vdev->cf_mutex);
+	down_write(&vdev->cf_lock);
 	vdev->features_valid = false;
 	ret = ops->reset(vdev);
-	mutex_unlock(&vdev->cf_mutex);
+	up_write(&vdev->cf_lock);
 	return ret;
 }
 
-static inline int vdpa_set_features(struct vdpa_device *vdev, u64 features, bool locked)
+static inline int vdpa_set_features_unlocked(struct vdpa_device *vdev, u64 features)
 {
 	const struct vdpa_config_ops *ops = vdev->config;
 	int ret;
 
-	if (!locked)
-		mutex_lock(&vdev->cf_mutex);
-
 	vdev->features_valid = true;
 	ret = ops->set_driver_features(vdev, features);
-	if (!locked)
-		mutex_unlock(&vdev->cf_mutex);
+
+	return ret;
+}
+
+static inline int vdpa_set_features(struct vdpa_device *vdev, u64 features)
+{
+	int ret;
+
+	down_write(&vdev->cf_lock);
+	ret = vdpa_set_features_unlocked(vdev, features);
+	up_write(&vdev->cf_lock);
 
 	return ret;
 }
