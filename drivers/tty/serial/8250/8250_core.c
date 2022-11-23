@@ -273,7 +273,8 @@ static void serial8250_backup_timeout(struct timer_list *t)
 		if (is_console)
 			printk_cpu_sync_get_irqsave(cs_flags);
 
-		ier = serial8250_clear_IER(up);
+		ier = serial_in(up, UART_IER);
+		serial_out(up, UART_IER, 0);
 
 		if (is_console)
 			printk_cpu_sync_put_irqrestore(cs_flags);

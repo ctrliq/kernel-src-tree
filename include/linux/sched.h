@@ -120,7 +120,11 @@ struct task_group;
 
 #define task_is_running(task)		(READ_ONCE((task)->__state) == TASK_RUNNING)
 
+#define task_is_traced(task)		((READ_ONCE(task->__state) & __TASK_TRACED) != 0)
+
 #define task_is_stopped(task)		((READ_ONCE(task->__state) & __TASK_STOPPED) != 0)
+
+#define task_is_stopped_or_traced(task)	((READ_ONCE(task->__state) & (__TASK_STOPPED | __TASK_TRACED)) != 0)
 
 /*
  * Special states are those that do not use the normal wait-loop pattern. See
@@ -1105,10 +1109,6 @@ struct task_struct {
 	/* Restored if set_restore_sigmask() was used: */
 	sigset_t			saved_sigmask;
 	struct sigpending		pending;
-#ifdef CONFIG_PREEMPT_RT
-	/* TODO: move me into ->restart_block ? */
-	struct				kernel_siginfo forced_info;
-#endif
 	unsigned long			sas_ss_sp;
 	size_t				sas_ss_size;
 	unsigned int			sas_ss_flags;
@@ -1777,16 +1777,6 @@ static inline bool is_percpu_thread(void)
 #endif
 }
 
-/* Is the current task guaranteed to stay on its current CPU? */
-static inline bool is_migratable(void)
-{
-#ifdef CONFIG_SMP
-	return preemptible() && !current->migration_disabled;
-#else
-	return false;
-#endif
-}
-
 /* Per-process atomic flags. */
 #define PFA_NO_NEW_PRIVS		0	/* May not gain new privileges. */
 #define PFA_SPREAD_PAGE			1	/* Spread page cache over cpuset */
@@ -2098,81 +2088,6 @@ static inline int need_resched_now(void)
 }
 
 #endif
-
-#ifdef CONFIG_PREEMPT_RT
-static inline bool task_match_saved_state(struct task_struct *p, long match_state)
-{
-	return p->saved_state == match_state;
-}
-
-static inline bool task_is_traced(struct task_struct *task)
-{
-	bool traced = false;
-
-	/* in case the task is sleeping on tasklist_lock */
-	raw_spin_lock_irq(&task->pi_lock);
-	if (READ_ONCE(task->__state) & __TASK_TRACED)
-		traced = true;
-	else if (task->saved_state & __TASK_TRACED)
-		traced = true;
-	raw_spin_unlock_irq(&task->pi_lock);
-	return traced;
-}
-
-static inline bool task_is_stopped_or_traced(struct task_struct *task)
-{
-	bool traced_stopped = false;
-	unsigned long flags;
-
-	raw_spin_lock_irqsave(&task->pi_lock, flags);
-
-	if (READ_ONCE(task->__state) & (__TASK_STOPPED | __TASK_TRACED))
-		traced_stopped = true;
-	else if (task->saved_state & (__TASK_STOPPED | __TASK_TRACED))
-		traced_stopped = true;
-
-	raw_spin_unlock_irqrestore(&task->pi_lock, flags);
-	return traced_stopped;
-}
-
-#else
-
-static inline bool task_match_saved_state(struct task_struct *p, long match_state)
-{
-	return false;
-}
-
-static inline bool task_is_traced(struct task_struct *task)
-{
-	return READ_ONCE(task->__state) & __TASK_TRACED;
-}
-
-static inline bool task_is_stopped_or_traced(struct task_struct *task)
-{
-	return READ_ONCE(task->__state) & (__TASK_STOPPED | __TASK_TRACED);
-}
-#endif
-
-static inline bool task_match_state_or_saved(struct task_struct *p,
-					     long match_state)
-{
-	if (READ_ONCE(p->__state) == match_state)
-		return true;
-
-	return task_match_saved_state(p, match_state);
-}
-
-static inline bool task_match_state_lock(struct task_struct *p,
-					 long match_state)
-{
-	bool match;
-
-	raw_spin_lock_irq(&p->pi_lock);
-	match = task_match_state_or_saved(p, match_state);
-	raw_spin_unlock_irq(&p->pi_lock);
-
-	return match;
-}
 
 /*
  * cond_resched() and cond_resched_lock(): latency reduction via

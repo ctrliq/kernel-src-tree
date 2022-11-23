@@ -104,10 +104,6 @@ bool nmi_cpu_backtrace(struct pt_regs *regs)
 			pr_warn("NMI backtrace for cpu %d skipped: idling at %pS\n",
 				cpu, (void *)instruction_pointer(regs));
 		} else {
-			/*
-			 * Allow nested NMI backtraces while serializing
-			 * against other CPUs.
-			 */
 			pr_warn("NMI backtrace for cpu %d\n", cpu);
 			if (regs)
 				show_regs(regs);
