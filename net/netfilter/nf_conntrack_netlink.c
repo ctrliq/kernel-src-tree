@@ -2026,9 +2026,7 @@ static int ctnetlink_change_timeout(struct nf_conn *ct,
 {
 	u64 timeout = (u64)ntohl(nla_get_be32(cda[CTA_TIMEOUT])) * HZ;
 
-	if (timeout > INT_MAX)
-		timeout = INT_MAX;
-	WRITE_ONCE(ct->timeout, nfct_time_stamp + (u32)timeout);
+	__nf_ct_set_timeout(ct, timeout);
 
 	if (test_bit(IPS_DYING_BIT, &ct->status))
 		return -ETIME;
@@ -2293,9 +2291,7 @@ ctnetlink_create_conntrack(struct net *net,
 		goto err1;
 
 	timeout = (u64)ntohl(nla_get_be32(cda[CTA_TIMEOUT])) * HZ;
-	if (timeout > INT_MAX)
-		timeout = INT_MAX;
-	ct->timeout = (u32)timeout + nfct_time_stamp;
+	__nf_ct_set_timeout(ct, timeout);
 
 	rcu_read_lock();
  	if (cda[CTA_HELP]) {
