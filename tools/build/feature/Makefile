@@ -58,6 +58,7 @@ FILES=                                          \
          test-bpf.bin                           \
          test-libbpf.bin                        \
          test-libbpf-btf__load_from_kernel_by_id.bin	\
+         test-libbpf-bpf_prog_load.bin          \
          test-libbpf-bpf_object__next_program.bin \
          test-libbpf-bpf_object__next_map.bin   \
          test-get_cpuid.bin                     \
@@ -291,6 +292,9 @@ $(OUTPUT)test-libbpf.bin:
 	$(BUILD) -lbpf
 
 $(OUTPUT)test-libbpf-btf__load_from_kernel_by_id.bin:
+	$(BUILD) -lbpf
+
+$(OUTPUT)test-libbpf-bpf_prog_load.bin:
 	$(BUILD) -lbpf
 
 $(OUTPUT)test-libbpf-bpf_object__next_program.bin:
