@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0
 #include <test_progs.h>
 #include <network_helpers.h>
+#include <linux/netfilter/nf_conntrack_common.h>
 #include "test_bpf_nf.skel.h"
 #include "test_bpf_nf_fail.skel.h"
 
@@ -61,8 +62,8 @@ static void test_bpf_nf_ct(int mode)
 	/* allow some tolerance for test_delta_timeout value to avoid races. */
 	ASSERT_GT(skel->bss->test_delta_timeout, 8, "Test for min ct timeout update");
 	ASSERT_LE(skel->bss->test_delta_timeout, 10, "Test for max ct timeout update");
-	/* expected status is IPS_SEEN_REPLY */
-	ASSERT_EQ(skel->bss->test_status, 2, "Test for ct status update ");
+	ASSERT_EQ(skel->bss->test_status, IPS_CONFIRMED | IPS_SEEN_REPLY,
+		  "Test for ct status update ");
 end:
 	test_bpf_nf__destroy(skel);
 }
