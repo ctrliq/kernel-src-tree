@@ -3002,14 +3002,21 @@ static void ieee80211_destroy_auth_data(struct ieee80211_sub_if_data *sdata,
 	sdata->u.mgd.auth_data = NULL;
 }
 
+enum assoc_status {
+	ASSOC_SUCCESS,
+	ASSOC_REJECTED,
+	ASSOC_TIMEOUT,
+	ASSOC_ABANDON,
+};
+
 static void ieee80211_destroy_assoc_data(struct ieee80211_sub_if_data *sdata,
-					 bool assoc, bool abandon)
+					 enum assoc_status status)
 {
 	struct ieee80211_mgd_assoc_data *assoc_data = sdata->u.mgd.assoc_data;
 
 	sdata_assert_lock(sdata);
 
-	if (!assoc) {
+	if (status != ASSOC_SUCCESS) {
 		/*
 		 * we are not associated yet, the only timer that could be
 		 * running is the timeout for the association response which
@@ -3030,9 +3037,10 @@ static void ieee80211_destroy_assoc_data(struct ieee80211_sub_if_data *sdata,
 		ieee80211_link_release_channel(&sdata->deflink);
 		mutex_unlock(&sdata->local->mtx);
 
-		if (abandon) {
+		if (status != ASSOC_REJECTED) {
 			struct cfg80211_assoc_failure data = {
 				.bss[0] = assoc_data->bss,
+				.timeout = status == ASSOC_TIMEOUT,
 			};
 
 			cfg80211_assoc_failure(sdata->dev, &data);
@@ -3313,7 +3321,7 @@ static void ieee80211_rx_mgmt_deauth(struct ieee80211_sub_if_data *sdata,
 			   bssid, reason_code,
 			   ieee80211_get_reason_code_string(reason_code));
 
-		ieee80211_destroy_assoc_data(sdata, false, true);
+		ieee80211_destroy_assoc_data(sdata, ASSOC_ABANDON);
 
 		cfg80211_rx_mlme_mgmt(sdata->dev, (u8 *)mgmt, len);
 		return;
@@ -3957,19 +3965,14 @@ static void ieee80211_rx_mgmt_assoc_resp(struct ieee80211_sub_if_data *sdata,
 	if (status_code != WLAN_STATUS_SUCCESS) {
 		sdata_info(sdata, "%pM denied association (code=%d)\n",
 			   mgmt->sa, status_code);
-		ieee80211_destroy_assoc_data(sdata, false, false);
+		ieee80211_destroy_assoc_data(sdata, ASSOC_REJECTED);
 		event.u.mlme.status = MLME_DENIED;
 		event.u.mlme.reason = status_code;
 		drv_event_callback(sdata->local, sdata, &event);
 	} else {
 		if (!ieee80211_assoc_success(sdata, cbss, mgmt, len, elems)) {
 			/* oops -- internal error -- send timeout for now */
-			struct cfg80211_assoc_failure data = {
-				.timeout = true,
-				.bss[0] = cbss,
-			};
-			ieee80211_destroy_assoc_data(sdata, false, false);
-			cfg80211_assoc_failure(sdata->dev, &data);
+			ieee80211_destroy_assoc_data(sdata, ASSOC_TIMEOUT);
 			goto notify_driver;
 		}
 		event.u.mlme.status = MLME_SUCCESS;
@@ -3981,7 +3984,7 @@ static void ieee80211_rx_mgmt_assoc_resp(struct ieee80211_sub_if_data *sdata,
 		 * recalc after assoc_data is NULL but before associated
 		 * is set can cause the interface to go idle
 		 */
-		ieee80211_destroy_assoc_data(sdata, true, false);
+		ieee80211_destroy_assoc_data(sdata, ASSOC_SUCCESS);
 
 		/* get uapsd queues configuration */
 		uapsd_queues = 0;
@@ -4839,19 +4842,13 @@ void ieee80211_sta_work(struct ieee80211_sub_if_data *sdata)
 		if ((ifmgd->assoc_data->need_beacon &&
 		     !sdata->deflink.u.mgd.have_beacon) ||
 		    ieee80211_do_assoc(sdata)) {
-			struct cfg80211_bss *bss = ifmgd->assoc_data->bss;
 			struct ieee80211_event event = {
 				.type = MLME_EVENT,
 				.u.mlme.data = ASSOC_EVENT,
 				.u.mlme.status = MLME_TIMEOUT,
 			};
-			struct cfg80211_assoc_failure data = {
-				.bss[0] = bss,
-				.timeout = true,
-			};
 
-			ieee80211_destroy_assoc_data(sdata, false, false);
-			cfg80211_assoc_failure(sdata->dev, &data);
+			ieee80211_destroy_assoc_data(sdata, ASSOC_TIMEOUT);
 			drv_event_callback(sdata->local, sdata, &event);
 		}
 	} else if (ifmgd->assoc_data && ifmgd->assoc_data->timeout_started)
@@ -5016,7 +5013,7 @@ void ieee80211_mgd_quiesce(struct ieee80211_sub_if_data *sdata)
 					       WLAN_REASON_DEAUTH_LEAVING,
 					       false, frame_buf);
 		if (ifmgd->assoc_data)
-			ieee80211_destroy_assoc_data(sdata, false, true);
+			ieee80211_destroy_assoc_data(sdata, ASSOC_ABANDON);
 		if (ifmgd->auth_data)
 			ieee80211_destroy_auth_data(sdata, false);
 		cfg80211_tx_mlme_mgmt(sdata->dev, frame_buf,
@@ -6411,7 +6408,7 @@ int ieee80211_mgd_deauth(struct ieee80211_sub_if_data *sdata,
 					       IEEE80211_STYPE_DEAUTH,
 					       req->reason_code, tx,
 					       frame_buf);
-		ieee80211_destroy_assoc_data(sdata, false, true);
+		ieee80211_destroy_assoc_data(sdata, ASSOC_ABANDON);
 		ieee80211_report_disconnect(sdata, frame_buf,
 					    sizeof(frame_buf), true,
 					    req->reason_code, false);
@@ -6482,16 +6479,8 @@ void ieee80211_mgd_stop(struct ieee80211_sub_if_data *sdata)
 	cancel_delayed_work_sync(&ifmgd->tdls_peer_del_work);
 
 	sdata_lock(sdata);
-	if (ifmgd->assoc_data) {
-		struct cfg80211_bss *bss = ifmgd->assoc_data->bss;
-		struct cfg80211_assoc_failure data = {
-			.bss[0] = bss,
-			.timeout = true,
-		};
-
-		ieee80211_destroy_assoc_data(sdata, false, false);
-		cfg80211_assoc_failure(sdata->dev, &data);
-	}
+	if (ifmgd->assoc_data)
+		ieee80211_destroy_assoc_data(sdata, ASSOC_TIMEOUT);
 	if (ifmgd->auth_data)
 		ieee80211_destroy_auth_data(sdata, false);
 	spin_lock_bh(&ifmgd->teardown_lock);
