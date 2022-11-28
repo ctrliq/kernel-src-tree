@@ -1033,6 +1033,7 @@ struct ieee80211_sub_if_data {
 	} u;
 
 	struct ieee80211_link_data deflink;
+	struct ieee80211_link_data *link[IEEE80211_MLD_MAX_NUM_LINKS];
 
 #ifdef CONFIG_MAC80211_DEBUGFS
 	struct {
