@@ -1651,12 +1651,6 @@ static inline bool txq_has_queue(struct ieee80211_txq *txq)
 	return !(skb_queue_empty(&txqi->frags) && !txqi->tin.backlog_packets);
 }
 
-static inline int ieee80211_bssid_match(const u8 *raddr, const u8 *addr)
-{
-	return ether_addr_equal(raddr, addr) ||
-	       is_broadcast_ether_addr(raddr);
-}
-
 static inline bool
 ieee80211_have_rx_timestamp(struct ieee80211_rx_status *status)
 {
