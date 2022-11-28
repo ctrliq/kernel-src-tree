@@ -1468,6 +1468,8 @@ static void __update_context_time(struct perf_event_context *ctx, bool adv)
 {
 	u64 now = perf_clock();
 
+	lockdep_assert_held(&ctx->lock);
+
 	if (adv)
 		ctx->time += now - ctx->timestamp;
 	ctx->timestamp = now;
@@ -2224,16 +2226,22 @@ static inline int __pmu_filter_match(struct perf_event *event)
 static inline int pmu_filter_match(struct perf_event *event)
 {
 	struct perf_event *sibling;
+	unsigned long flags;
+	int ret = 1;
 
 	if (!__pmu_filter_match(event))
 		return 0;
 
+	local_irq_save(flags);
 	for_each_sibling_event(sibling, event) {
-		if (!__pmu_filter_match(sibling))
-			return 0;
+		if (!__pmu_filter_match(sibling)) {
+			ret = 0;
+			break;
+		}
 	}
+	local_irq_restore(flags);
 
-	return 1;
+	return ret;
 }
 
 static inline int
@@ -4457,7 +4465,7 @@ int perf_event_read_local(struct perf_event *event, u64 *value,
 
 	*value = local64_read(&event->count);
 	if (enabled || running) {
-		u64 __enabled, __running, __now;;
+		u64 __enabled, __running, __now;
 
 		calc_timer_values(event, &__now, &__enabled, &__running);
 		if (enabled)
@@ -6893,8 +6901,15 @@ static void perf_output_read_group(struct perf_output_handle *handle,
 {
 	struct perf_event *leader = event->group_leader, *sub;
 	u64 read_format = event->attr.read_format;
+	unsigned long flags;
 	u64 values[6];
 	int n = 0;
+
+	/*
+	 * Disabling interrupts avoids all counter scheduling
+	 * (context switches, timer based rotation and IPIs).
+	 */
+	local_irq_save(flags);
 
 	values[n++] = 1 + leader->nr_siblings;
 
@@ -6931,6 +6946,8 @@ static void perf_output_read_group(struct perf_output_handle *handle,
 
 		__output_copy(handle, values, n * sizeof(u64));
 	}
+
+	local_irq_restore(flags);
 }
 
 #define PERF_FORMAT_TOTAL_TIMES (PERF_FORMAT_TOTAL_TIME_ENABLED|\
