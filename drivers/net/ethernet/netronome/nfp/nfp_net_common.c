@@ -1900,6 +1900,7 @@ const struct net_device_ops nfp_nfd3_netdev_ops = {
 	.ndo_vlan_rx_kill_vid	= nfp_net_vlan_rx_kill_vid,
 	.ndo_set_vf_mac         = nfp_app_set_vf_mac,
 	.ndo_set_vf_vlan        = nfp_app_set_vf_vlan,
+	.ndo_set_vf_rate	= nfp_app_set_vf_rate,
 	.ndo_set_vf_spoofchk    = nfp_app_set_vf_spoofchk,
 	.ndo_set_vf_trust	= nfp_app_set_vf_trust,
 	.ndo_get_vf_config	= nfp_app_get_vf_config,
@@ -1981,7 +1982,7 @@ static const struct udp_tunnel_nic_info nfp_udp_tunnels = {
  */
 void nfp_net_info(struct nfp_net *nn)
 {
-	nn_info(nn, "Netronome NFP-6xxx %sNetdev: TxQs=%d/%d RxQs=%d/%d\n",
+	nn_info(nn, "NFP-6xxx %sNetdev: TxQs=%d/%d RxQs=%d/%d\n",
 		nn->dp.is_vf ? "VF " : "",
 		nn->dp.num_tx_rings, nn->max_tx_rings,
 		nn->dp.num_rx_rings, nn->max_rx_rings);
@@ -2256,8 +2257,12 @@ static void nfp_net_netdev_init(struct nfp_net *nn)
 	if (nn->cap & NFP_NET_CFG_CTRL_RSS_ANY)
 		netdev->hw_features |= NETIF_F_RXHASH;
 	if (nn->cap & NFP_NET_CFG_CTRL_VXLAN) {
-		if (nn->cap & NFP_NET_CFG_CTRL_LSO)
-			netdev->hw_features |= NETIF_F_GSO_UDP_TUNNEL;
+		if (nn->cap & NFP_NET_CFG_CTRL_LSO) {
+			netdev->hw_features |= NETIF_F_GSO_UDP_TUNNEL |
+					       NETIF_F_GSO_UDP_TUNNEL_CSUM |
+					       NETIF_F_GSO_PARTIAL;
+			netdev->gso_partial_features = NETIF_F_GSO_UDP_TUNNEL_CSUM;
+		}
 		netdev->udp_tunnel_nic_info = &nfp_udp_tunnels;
 		nn->dp.ctrl |= NFP_NET_CFG_CTRL_VXLAN;
 	}
