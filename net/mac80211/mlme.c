@@ -1838,7 +1838,7 @@ void ieee80211_recalc_ps_vif(struct ieee80211_sub_if_data *sdata)
 
 	if (sdata->vif.bss_conf.ps != ps_allowed) {
 		sdata->vif.bss_conf.ps = ps_allowed;
-		ieee80211_bss_info_change_notify(sdata, BSS_CHANGED_PS);
+		ieee80211_link_info_change_notify(sdata, 0, BSS_CHANGED_PS);
 	}
 }
 
@@ -2034,7 +2034,7 @@ __ieee80211_sta_handle_tspec_ac_params(struct ieee80211_sub_if_data *sdata)
 void ieee80211_sta_handle_tspec_ac_params(struct ieee80211_sub_if_data *sdata)
 {
 	if (__ieee80211_sta_handle_tspec_ac_params(sdata))
-		ieee80211_bss_info_change_notify(sdata, BSS_CHANGED_QOS);
+		ieee80211_link_info_change_notify(sdata, 0, BSS_CHANGED_QOS);
 }
 
 static void ieee80211_sta_handle_tspec_ac_params_wk(struct work_struct *work)
@@ -2923,7 +2923,7 @@ static void ieee80211_destroy_auth_data(struct ieee80211_sub_if_data *sdata,
 		sta_info_destroy_addr(sdata, auth_data->bss->bssid);
 
 		eth_zero_addr(sdata->deflink.u.mgd.bssid);
-		ieee80211_bss_info_change_notify(sdata, BSS_CHANGED_BSSID);
+		ieee80211_link_info_change_notify(sdata, 0, BSS_CHANGED_BSSID);
 		sdata->u.mgd.flags = 0;
 		mutex_lock(&sdata->local->mtx);
 		ieee80211_vif_release_channel(sdata);
@@ -2952,7 +2952,7 @@ static void ieee80211_destroy_assoc_data(struct ieee80211_sub_if_data *sdata,
 		sta_info_destroy_addr(sdata, assoc_data->bss->bssid);
 
 		eth_zero_addr(sdata->deflink.u.mgd.bssid);
-		ieee80211_bss_info_change_notify(sdata, BSS_CHANGED_BSSID);
+		ieee80211_link_info_change_notify(sdata, 0, BSS_CHANGED_BSSID);
 		sdata->u.mgd.flags = 0;
 		sdata->vif.bss_conf.mu_mimo_owner = false;
 
@@ -4390,7 +4390,7 @@ static void ieee80211_rx_mgmt_beacon(struct ieee80211_sub_if_data *sdata,
 					       elems->pwr_constr_elem,
 					       elems->cisco_dtpc_elem);
 
-	ieee80211_bss_info_change_notify(sdata, changed);
+	ieee80211_link_info_change_notify(sdata, 0, changed);
 free:
 	kfree(elems);
 }
@@ -5700,7 +5700,7 @@ skip_rates:
 		 * tell driver about BSSID, basic rates and timing
 		 * this was set up above, before setting the channel
 		 */
-		ieee80211_bss_info_change_notify(sdata,
+		ieee80211_link_info_change_notify(sdata, 0,
 			BSS_CHANGED_BSSID | BSS_CHANGED_BASIC_RATES |
 			BSS_CHANGED_BEACON_INT);
 
@@ -5868,7 +5868,7 @@ int ieee80211_mgd_auth(struct ieee80211_sub_if_data *sdata,
 
  err_clear:
 	eth_zero_addr(sdata->deflink.u.mgd.bssid);
-	ieee80211_bss_info_change_notify(sdata, BSS_CHANGED_BSSID);
+	ieee80211_link_info_change_notify(sdata, 0, BSS_CHANGED_BSSID);
 	ifmgd->auth_data = NULL;
 	mutex_lock(&sdata->local->mtx);
 	ieee80211_vif_release_channel(sdata);
@@ -6215,7 +6215,7 @@ int ieee80211_mgd_assoc(struct ieee80211_sub_if_data *sdata,
 	return 0;
  err_clear:
 	eth_zero_addr(sdata->deflink.u.mgd.bssid);
-	ieee80211_bss_info_change_notify(sdata, BSS_CHANGED_BSSID);
+	ieee80211_link_info_change_notify(sdata, 0, BSS_CHANGED_BSSID);
 	ifmgd->assoc_data = NULL;
  err_free:
 	kfree(assoc_data);
