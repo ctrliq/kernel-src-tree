@@ -375,6 +375,5 @@ SYM_CODE_START(return_to_handler)
 .Ldo_rop:
 	mov %rdi, (%rsp)
 	RET
-SYM_FUNC_END(return_to_handler)
 SYM_CODE_END(return_to_handler)
 #endif
