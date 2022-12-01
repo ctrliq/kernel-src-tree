@@ -400,28 +400,12 @@ struct cxl_region {
 	struct cxl_region_params params;
 };
 
-/**
- * enum cxl_nvdimm_brige_state - state machine for managing bus rescans
- * @CXL_NVB_NEW: Set at bridge create and after cxl_pmem_wq is destroyed
- * @CXL_NVB_DEAD: Set at brige unregistration to preclude async probing
- * @CXL_NVB_ONLINE: Target state after successful ->probe()
- * @CXL_NVB_OFFLINE: Target state after ->remove() or failed ->probe()
- */
-enum cxl_nvdimm_brige_state {
-	CXL_NVB_NEW,
-	CXL_NVB_DEAD,
-	CXL_NVB_ONLINE,
-	CXL_NVB_OFFLINE,
-};
-
 struct cxl_nvdimm_bridge {
 	int id;
 	struct device dev;
 	struct cxl_port *port;
 	struct nvdimm_bus *nvdimm_bus;
 	struct nvdimm_bus_descriptor nd_desc;
-	struct work_struct state_work;
-	enum cxl_nvdimm_brige_state state;
 };
 
 #define CXL_DEV_ID_LEN 19
@@ -429,7 +413,6 @@ struct cxl_nvdimm_bridge {
 struct cxl_nvdimm {
 	struct device dev;
 	struct cxl_memdev *cxlmd;
-	struct cxl_nvdimm_bridge *bridge;
 	u8 dev_id[CXL_DEV_ID_LEN]; /* for nvdimm, string of 'serial' */
 };
 
