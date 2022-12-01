@@ -424,10 +424,13 @@ struct cxl_nvdimm_bridge {
 	enum cxl_nvdimm_brige_state state;
 };
 
+#define CXL_DEV_ID_LEN 19
+
 struct cxl_nvdimm {
 	struct device dev;
 	struct cxl_memdev *cxlmd;
 	struct cxl_nvdimm_bridge *bridge;
+	u8 dev_id[CXL_DEV_ID_LEN]; /* for nvdimm, string of 'serial' */
 };
 
 struct cxl_pmem_region_mapping {
