@@ -701,13 +701,18 @@ dist-release-finish: setup-source
 dist-release-changed:
 	@CLOGF="$$(mktemp)"; \
 	trap 'rm -f "$$CLOGF"' SIGHUP SIGINT SIGTERM EXIT; \
-	$(REDHAT)/scripts/genspec/genlog.sh "$$CLOGF"; \
-	if [ "$(MARKER)" == "$$(cat $(REDHAT)/marker)" ] && \
-	   [ "$$(wc -l $$CLOGF | cut -d ' ' -f 1)" -le 3 ]; then \
-		echo "Nothing changed, skipping updates"; \
+	if $(REDHAT)/scripts/genspec/genlog.sh "$$CLOGF"; then \
+		if [ "$(MARKER)" == "$$(cat $(REDHAT)/marker)" ] && \
+		   [ "$$(wc -l $$CLOGF | cut -d ' ' -f 1)" -le 3 ]; then \
+			echo "Nothing changed, skipping updates"; \
+		else \
+			$(REDHAT)/scripts/new_release.sh; \
+			$(MAKE) dist-release-finish; \
+		fi \
 	else \
-		$(REDHAT)/scripts/new_release.sh; \
-		$(MAKE) dist-release-finish; \
+		retval=$$?; \
+		echo "genlog.sh failed with return code $$retval, aborting."; \
+		exit $$retval; \
 	fi
 
 dist-release: dist-clean-sources

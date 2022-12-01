@@ -1,5 +1,7 @@
 #!/bin/bash
 
+set -e
+
 LAST_MARKER=$(cat "${REDHAT}"/marker)
 clogf="$1"
 # hide [redhat] entries from changelog
