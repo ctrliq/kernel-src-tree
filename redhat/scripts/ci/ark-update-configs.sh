@@ -68,6 +68,7 @@ fi
 
 if test -n "$DIST_PUSH"; then
         tmpfile=".push-warnings"
+	touch $tmpfile
 
 	echo "Pushing branch $(git branch --show-current) to $(git remote get-url gitlab)"
 	git push gitlab HEAD
