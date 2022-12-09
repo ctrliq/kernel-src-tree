@@ -31,3 +31,4 @@ Linux Tracing Technologies
    stm
    sys-t
    coresight/index
+   rv/index
