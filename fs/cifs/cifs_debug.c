@@ -94,7 +94,7 @@ static void cifs_debug_tcon(struct seq_file *m, struct cifs_tcon *tcon)
 		   le32_to_cpu(tcon->fsDevInfo.DeviceCharacteristics),
 		   le32_to_cpu(tcon->fsAttrInfo.Attributes),
 		   le32_to_cpu(tcon->fsAttrInfo.MaxPathNameComponentLength),
-		   tcon->tidStatus);
+		   tcon->status);
 	if (dev_type == FILE_DEVICE_DISK)
 		seq_puts(m, " type: DISK ");
 	else if (dev_type == FILE_DEVICE_CD_ROM)
@@ -378,7 +378,7 @@ skip_rdma:
 				(ses->serverNOS == NULL)) {
 				seq_printf(m, "\n\t%d) Address: %s Uses: %d Capability: 0x%x\tSession Status: %d ",
 					i, ses->ip_addr, ses->ses_count,
-					ses->capabilities, ses->status);
+					ses->capabilities, ses->ses_status);
 				if (ses->session_flags & SMB2_SESSION_FLAG_IS_GUEST)
 					seq_printf(m, "Guest ");
 				else if (ses->session_flags & SMB2_SESSION_FLAG_IS_NULL)
@@ -390,7 +390,7 @@ skip_rdma:
 					"\n\tSMB session status: %d ",
 				i, ses->ip_addr, ses->serverDomain,
 				ses->ses_count, ses->serverOS, ses->serverNOS,
-				ses->capabilities, ses->status);
+				ses->capabilities, ses->ses_status);
 			}
 
 			seq_printf(m, "\n\tSecurity type: %s ",
