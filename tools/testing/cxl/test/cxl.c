@@ -9,6 +9,8 @@
 #include <linux/pci.h>
 #include <linux/mm.h>
 #include <cxlmem.h>
+
+#include "../watermark.h"
 #include "mock.h"
 
 #define NR_CXL_HOST_BRIDGES 2
@@ -1018,6 +1020,12 @@ static void cxl_single_exit(void)
 static __init int cxl_test_init(void)
 {
 	int rc, i;
+
+	cxl_acpi_test();
+	cxl_core_test();
+	cxl_mem_test();
+	cxl_pmem_test();
+	cxl_port_test();
 
 	register_cxl_mock_ops(&cxl_mock_ops);
 
