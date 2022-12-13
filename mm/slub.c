@@ -49,7 +49,7 @@
  *   1. slab_mutex (Global Mutex)
  *   2. node->list_lock (Spinlock)
  *   3. kmem_cache->cpu_slab->lock (Local lock)
- *   4. slab_lock(slab) (Only on some arches or for debugging)
+ *   4. slab_lock(slab) (Only on some arches)
  *   5. object_map_lock (Only for debugging)
  *
  *   slab_mutex
@@ -63,8 +63,9 @@
  *   The slab_lock is a wrapper around the page lock, thus it is a bit
  *   spinlock.
  *
- *   The slab_lock is only used for debugging and on arches that do not
- *   have the ability to do a cmpxchg_double. It only protects:
+ *   The slab_lock is only used on arches that do not have the ability
+ *   to do a cmpxchg_double. It only protects:
+ *
  *	A. slab->freelist	-> List of free objects in a slab
  *	B. slab->inuse		-> Number of objects in use
  *	C. slab->objects	-> Number of objects in slab
@@ -92,6 +93,9 @@
  *   slabs, operations can continue without any centralized lock. F.e.
  *   allocating a long series of objects that fill up slabs does not require
  *   the list lock.
+ *
+ *   For debug caches, all allocations are forced to go through a list_lock
+ *   protected region to serialize against concurrent validation.
  *
  *   cpu_slab->lock local lock
  *
@@ -4397,7 +4401,6 @@ static void list_slab_objects(struct kmem_cache *s, struct slab *slab,
 	void *p;
 
 	slab_err(s, slab, text, s->name);
-	slab_lock(slab, &flags);
 
 	map = get_map(s, slab);
 	for_each_object(p, s, addr, slab->objects) {
@@ -4408,7 +4411,6 @@ static void list_slab_objects(struct kmem_cache *s, struct slab *slab,
 		}
 	}
 	put_map(map);
-	slab_unlock(slab, &flags);
 #endif
 }
 
@@ -5140,12 +5142,9 @@ static void validate_slab(struct kmem_cache *s, struct slab *slab,
 {
 	void *p;
 	void *addr = slab_address(slab);
-	unsigned long flags;
-
-	slab_lock(slab, &flags);
 
 	if (!check_slab(s, slab) || !on_freelist(s, slab, NULL))
-		goto unlock;
+		return;
 
 	/* Now we know that a valid freelist exists */
 	__fill_map(obj_map, s, slab);
@@ -5156,8 +5155,6 @@ static void validate_slab(struct kmem_cache *s, struct slab *slab,
 		if (!check_object(s, slab, p, val))
 			break;
 	}
-unlock:
-	slab_unlock(slab, &flags);
 }
 
 static int validate_slab_node(struct kmem_cache *s,
