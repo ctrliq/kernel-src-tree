@@ -29,7 +29,6 @@
 #include "cifs_fs_sb.h"
 #include "cifsacl.h"
 #include <crypto/internal/hash.h>
-#include <linux/scatterlist.h>
 #include <uapi/linux/cifs/cifs_mount.h>
 #include "smb2pdu.h"
 #include "smb2glob.h"
