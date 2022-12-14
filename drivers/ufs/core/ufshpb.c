@@ -17,7 +17,7 @@
 
 #include "ufshcd-priv.h"
 #include "ufshpb.h"
-#include "../sd.h"
+#include "../../scsi/sd.h"
 
 #define ACTIVATION_THRESHOLD 8 /* 8 IOs */
 #define READ_TO_MS 1000
@@ -614,14 +614,17 @@ static void ufshpb_activate_subregion(struct ufshpb_lu *hpb,
 	srgn->srgn_state = HPB_SRGN_VALID;
 }
 
-static void ufshpb_umap_req_compl_fn(struct request *req, blk_status_t error)
+static enum rq_end_io_ret ufshpb_umap_req_compl_fn(struct request *req,
+						   blk_status_t error)
 {
 	struct ufshpb_req *umap_req = (struct ufshpb_req *)req->end_io_data;
 
 	ufshpb_put_req(umap_req->hpb, umap_req);
+	return RQ_END_IO_NONE;
 }
 
-static void ufshpb_map_req_compl_fn(struct request *req, blk_status_t error)
+static enum rq_end_io_ret ufshpb_map_req_compl_fn(struct request *req,
+						  blk_status_t error)
 {
 	struct ufshpb_req *map_req = (struct ufshpb_req *) req->end_io_data;
 	struct ufshpb_lu *hpb = map_req->hpb;
@@ -637,6 +640,7 @@ static void ufshpb_map_req_compl_fn(struct request *req, blk_status_t error)
 	spin_unlock_irqrestore(&hpb->rgn_state_lock, flags);
 
 	ufshpb_put_map_req(map_req->hpb, map_req);
+	return RQ_END_IO_NONE;
 }
 
 static void ufshpb_set_unmap_cmd(unsigned char *cdb, struct ufshpb_region *rgn)
@@ -672,11 +676,12 @@ static void ufshpb_execute_umap_req(struct ufshpb_lu *hpb,
 	req = umap_req->req;
 	req->timeout = 0;
 	req->end_io_data = (void *)umap_req;
+	req->end_io = ufshpb_umap_req_compl_fn;
 	rq = scsi_req(req);
 	ufshpb_set_unmap_cmd(rq->cmd, rgn);
 	rq->cmd_len = HPB_WRITE_BUFFER_CMD_LENGTH;
 
-	blk_execute_rq_nowait(req, true, ufshpb_umap_req_compl_fn);
+	blk_execute_rq_nowait(req, true);
 
 	hpb->stats.umap_req_cnt++;
 }
@@ -708,6 +713,7 @@ static int ufshpb_execute_map_req(struct ufshpb_lu *hpb,
 	blk_rq_append_bio(req, map_req->bio);
 
 	req->end_io_data = map_req;
+	req->end_io = ufshpb_map_req_compl_fn;
 
 	rq = scsi_req(req);
 
@@ -718,7 +724,7 @@ static int ufshpb_execute_map_req(struct ufshpb_lu *hpb,
 				map_req->rb.srgn_idx, mem_size);
 	rq->cmd_len = HPB_READ_BUFFER_CMD_LENGTH;
 
-	blk_execute_rq_nowait(req, true, ufshpb_map_req_compl_fn);
+	blk_execute_rq_nowait(req, true);
 
 	hpb->stats.map_req_cnt++;
 	return 0;

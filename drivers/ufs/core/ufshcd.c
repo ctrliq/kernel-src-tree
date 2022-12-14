@@ -26,8 +26,8 @@
 #include <scsi/scsi_driver.h>
 #include <scsi/scsi_eh.h>
 #include "ufshcd-priv.h"
-#include "ufs_quirks.h"
-#include "unipro.h"
+#include <ufs/ufs_quirks.h>
+#include <ufs/unipro.h>
 #include "ufs-sysfs.h"
 #include "ufs-debugfs.h"
 #include "ufs-fault-injection.h"
@@ -2690,9 +2690,9 @@ static inline bool is_device_wlun(struct scsi_device *sdev)
  * Associate the UFS controller queue with the default and poll HCTX types.
  * Initialize the mq_map[] arrays.
  */
-static int ufshcd_map_queues(struct Scsi_Host *shost)
+static void ufshcd_map_queues(struct Scsi_Host *shost)
 {
-	int i, ret;
+	int i;
 
 	for (i = 0; i < shost->nr_maps; i++) {
 		struct blk_mq_queue_map *map = &shost->tag_set.map[i];
@@ -2709,11 +2709,8 @@ static int ufshcd_map_queues(struct Scsi_Host *shost)
 			WARN_ON_ONCE(true);
 		}
 		map->queue_offset = 0;
-		ret = blk_mq_map_queues(map);
-		WARN_ON_ONCE(ret);
+		blk_mq_map_queues(map);
 	}
-
-	return 0;
 }
 
 static void ufshcd_init_lrb(struct ufs_hba *hba, struct ufshcd_lrb *lrb, int i)
@@ -9471,7 +9468,7 @@ void ufshcd_remove(struct ufs_hba *hba)
 	ufs_bsg_remove(hba);
 	ufshpb_remove(hba);
 	ufs_sysfs_remove_nodes(hba->dev);
-	blk_cleanup_queue(hba->tmf_queue);
+	blk_mq_destroy_queue(hba->tmf_queue);
 	blk_mq_free_tag_set(&hba->tmf_tag_set);
 	scsi_remove_host(hba->host);
 	/* disable interrupts */
@@ -9767,7 +9764,7 @@ int ufshcd_init(struct ufs_hba *hba, void __iomem *mmio_base, unsigned int irq)
 	return 0;
 
 free_tmf_queue:
-	blk_cleanup_queue(hba->tmf_queue);
+	blk_mq_destroy_queue(hba->tmf_queue);
 free_tmf_tag_set:
 	blk_mq_free_tag_set(&hba->tmf_tag_set);
 out_remove_scsi_host:
