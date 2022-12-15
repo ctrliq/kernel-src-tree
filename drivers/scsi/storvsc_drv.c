@@ -1233,6 +1233,11 @@ static void storvsc_on_channel_callback(void *context)
 			return;
 		}
 
+		if (unlikely(time_after(jiffies, time_limit))) {
+			hv_pkt_iter_close(channel);
+			return;
+		}
+
 		if (pktlen < minlen) {
 			dev_err(&device->device,
 				"Invalid pkt: id=%llu, len=%u, minlen=%u\n",
