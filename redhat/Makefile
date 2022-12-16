@@ -109,7 +109,8 @@ else
       DISTLOCALVERSION:=.test
     endif
   else
-    $(warning WARNING: BUILDID will be deprecated in RHEL9.3.  Use DISTLOCALVERSION instead.)
+    # Do NOT drop the ability to use BUILDID! Keep backwards compatibility to be
+    # able to build all RHEL kernels the same way.
     DISTLOCALVERSION:=$(BUILDID)
   endif
   $(info DISTLOCALVERSION is "$(DISTLOCALVERSION)".)
