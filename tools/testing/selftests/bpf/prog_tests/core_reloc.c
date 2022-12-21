@@ -280,13 +280,21 @@ static int duration = 0;
 #define SIZE_OUTPUT_DATA(type)						\
 	STRUCT_TO_CHAR_PTR(core_reloc_size_output) {			\
 		.int_sz = sizeof(((type *)0)->int_field),		\
+		.int_off = offsetof(type, int_field),			\
 		.struct_sz = sizeof(((type *)0)->struct_field),		\
+		.struct_off = offsetof(type, struct_field),		\
 		.union_sz = sizeof(((type *)0)->union_field),		\
+		.union_off = offsetof(type, union_field),		\
 		.arr_sz = sizeof(((type *)0)->arr_field),		\
-		.arr_elem_sz = sizeof(((type *)0)->arr_field[0]),	\
+		.arr_off = offsetof(type, arr_field),			\
+		.arr_elem_sz = sizeof(((type *)0)->arr_field[1]),	\
+		.arr_elem_off = offsetof(type, arr_field[1]),		\
 		.ptr_sz = 8, /* always 8-byte pointer for BPF */	\
+		.ptr_off = offsetof(type, ptr_field),			\
 		.enum_sz = sizeof(((type *)0)->enum_field),		\
+		.enum_off = offsetof(type, enum_field),			\
 		.float_sz = sizeof(((type *)0)->float_field),		\
+		.float_off = offsetof(type, float_field),		\
 	}
 
 #define SIZE_CASE(name) {						\
@@ -356,6 +364,25 @@ static int duration = 0;
 
 #define ENUMVAL_ERR_CASE(name) {					\
 	ENUMVAL_CASE_COMMON(name),					\
+	.fails = true,							\
+}
+
+#define ENUM64VAL_CASE_COMMON(name)					\
+	.case_name = #name,						\
+	.bpf_obj_file = "test_core_reloc_enum64val.o",			\
+	.btf_src_file = "btf__core_reloc_" #name ".o",			\
+	.raw_tp_name = "sys_enter",					\
+	.prog_name = "test_core_enum64val"
+
+#define ENUM64VAL_CASE(name, ...) {					\
+	ENUM64VAL_CASE_COMMON(name),					\
+	.output = STRUCT_TO_CHAR_PTR(core_reloc_enum64val_output)	\
+			__VA_ARGS__,					\
+	.output_len = sizeof(struct core_reloc_enum64val_output),	\
+}
+
+#define ENUM64VAL_ERR_CASE(name) {					\
+	ENUM64VAL_CASE_COMMON(name),					\
 	.fails = true,							\
 }
 
@@ -719,9 +746,10 @@ static const struct core_reloc_test_case test_cases[] = {
 	}),
 	BITFIELDS_ERR_CASE(bitfields___err_too_big_bitfield),
 
-	/* size relocation checks */
+	/* field size and offset relocation checks */
 	SIZE_CASE(size),
 	SIZE_CASE(size___diff_sz),
+	SIZE_CASE(size___diff_offs),
 	SIZE_ERR_CASE(size___err_ambiguous),
 
 	/* validate type existence and size relocations */
@@ -827,6 +855,45 @@ static const struct core_reloc_test_case test_cases[] = {
 		.anon_val2 = 0x222,
 	}),
 	ENUMVAL_ERR_CASE(enumval___err_missing),
+
+	/* 64bit enumerator value existence and value relocations */
+	ENUM64VAL_CASE(enum64val, {
+		.unsigned_val1_exists = true,
+		.unsigned_val2_exists = true,
+		.unsigned_val3_exists = true,
+		.signed_val1_exists = true,
+		.signed_val2_exists = true,
+		.signed_val3_exists = true,
+		.unsigned_val1 = 0x1ffffffffULL,
+		.unsigned_val2 = 0x2,
+		.signed_val1 = 0x1ffffffffLL,
+		.signed_val2 = -2,
+	}),
+	ENUM64VAL_CASE(enum64val___diff, {
+		.unsigned_val1_exists = true,
+		.unsigned_val2_exists = true,
+		.unsigned_val3_exists = true,
+		.signed_val1_exists = true,
+		.signed_val2_exists = true,
+		.signed_val3_exists = true,
+		.unsigned_val1 = 0x101ffffffffULL,
+		.unsigned_val2 = 0x202ffffffffULL,
+		.signed_val1 = -101,
+		.signed_val2 = -202,
+	}),
+	ENUM64VAL_CASE(enum64val___val3_missing, {
+		.unsigned_val1_exists = true,
+		.unsigned_val2_exists = true,
+		.unsigned_val3_exists = false,
+		.signed_val1_exists = true,
+		.signed_val2_exists = true,
+		.signed_val3_exists = false,
+		.unsigned_val1 = 0x111ffffffffULL,
+		.unsigned_val2 = 0x222,
+		.signed_val1 = 0x111ffffffffLL,
+		.signed_val2 = -222,
+	}),
+	ENUM64VAL_ERR_CASE(enum64val___err_missing),
 };
 
 struct data {

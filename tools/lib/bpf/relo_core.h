@@ -46,9 +46,9 @@ struct bpf_core_spec {
 
 struct bpf_core_relo_res {
 	/* expected value in the instruction, unless validate == false */
-	__u32 orig_val;
+	__u64 orig_val;
 	/* new value that needs to be patched up to */
-	__u32 new_val;
+	__u64 new_val;
 	/* relocation unsuccessful, poison instruction, but don't fail load */
 	bool poison;
 	/* some relocations can't be validated against orig_val */
@@ -83,5 +83,11 @@ int bpf_core_calc_relo_insn(const char *prog_name,
 int bpf_core_patch_insn(const char *prog_name, struct bpf_insn *insn,
 			int insn_idx, const struct bpf_core_relo *relo,
 			int relo_idx, const struct bpf_core_relo_res *res);
+
+int bpf_core_parse_spec(const char *prog_name, const struct btf *btf,
+		        const struct bpf_core_relo *relo,
+		        struct bpf_core_spec *spec);
+
+int bpf_core_format_spec(char *buf, size_t buf_sz, const struct bpf_core_spec *spec);
 
 #endif
