@@ -38,7 +38,7 @@
 #include "selftest.h"
 
 /* Bluetooth sockets */
-#define BT_MAX_PROTO	8
+#define BT_MAX_PROTO	(BTPROTO_LAST + 1)
 static const struct net_proto_family *bt_proto[BT_MAX_PROTO];
 static DEFINE_RWLOCK(bt_proto_lock);
 
@@ -52,6 +52,7 @@ static const char *const bt_key_strings[BT_MAX_PROTO] = {
 	"sk_lock-AF_BLUETOOTH-BTPROTO_CMTP",
 	"sk_lock-AF_BLUETOOTH-BTPROTO_HIDP",
 	"sk_lock-AF_BLUETOOTH-BTPROTO_AVDTP",
+	"sk_lock-AF_BLUETOOTH-BTPROTO_ISO",
 };
 
 static struct lock_class_key bt_slock_key[BT_MAX_PROTO];
@@ -64,6 +65,7 @@ static const char *const bt_slock_key_strings[BT_MAX_PROTO] = {
 	"slock-AF_BLUETOOTH-BTPROTO_CMTP",
 	"slock-AF_BLUETOOTH-BTPROTO_HIDP",
 	"slock-AF_BLUETOOTH-BTPROTO_AVDTP",
+	"slock-AF_BLUETOOTH-BTPROTO_ISO",
 };
 
 void bt_sock_reclassify_lock(struct sock *sk, int proto)
@@ -567,7 +569,7 @@ int bt_sock_wait_state(struct sock *sk, int state, unsigned long timeo)
 EXPORT_SYMBOL(bt_sock_wait_state);
 
 /* This function expects the sk lock to be held when called */
-int bt_sock_wait_ready(struct sock *sk, unsigned long flags)
+int bt_sock_wait_ready(struct sock *sk, unsigned int msg_flags)
 {
 	DECLARE_WAITQUEUE(wait, current);
 	unsigned long timeo;
@@ -575,7 +577,7 @@ int bt_sock_wait_ready(struct sock *sk, unsigned long flags)
 
 	BT_DBG("sk %p", sk);
 
-	timeo = sock_sndtimeo(sk, flags & O_NONBLOCK);
+	timeo = sock_sndtimeo(sk, !!(msg_flags & MSG_DONTWAIT));
 
 	add_wait_queue(sk_sleep(sk), &wait);
 	set_current_state(TASK_INTERRUPTIBLE);
