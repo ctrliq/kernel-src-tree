@@ -4,12 +4,6 @@
 
 #include <linux/build_bug.h>
 
-#define GET_SMSTATE(type, buf, offset)		\
-	(*(type *)((buf) + (offset) - 0x7e00))
-
-#define PUT_SMSTATE(type, buf, offset, val)                      \
-	*(type *)((buf) + (offset) - 0x7e00) = val
-
 
 /*
  * 32 bit KVM's emulated SMM layout. Based on Intel P6 layout
