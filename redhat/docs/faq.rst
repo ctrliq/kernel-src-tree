@@ -35,8 +35,19 @@ resolve this properly.
 Please notify us on kernel@lists.fedoraproject.org or file an issue at
 https://gitlab.com/cki-project/kernel-ark/-/issues.
 
+3. I am booting an ELN/RHEL kernel on Fedora (or vice versa) and the kernel won't boot.  What do I do now?
+----------------------------------------------------------------------------------------------------------
 
-3. How does an MR get reviewed?
+This is not uncommon and may be due to a config difference between RHEL and Fedora.  One key difference between the two kernels is that Fedora has enabled CONFIG_BTRFS where ELN/RHEL has not, and as a result ELN/RHEL kernels will not mount Fedora BTRFS filesystems.  If you are booting the ELN/RHEL kernel config on Fedora you must change these configuration values in the .config:
+
+.. code-block:: sh
+
+   CONFIG_BTRFS=y
+   CONFIG_BTRFS_FS_POSIX_ACL=y
+
+If that change doesn't resolve the boot failure, users should attempt to "flip" configs to determine the difference between the two flavors before reporting bugs.  The maintainers acknowledge that this can be a time consuming process but it is left to the user to resolve config differences when cross booting between flavors.
+
+4. How does an MR get reviewed?
 -------------------------------
 
 Anything Fedora specific (configs, custom patches, scripts) will be decided
