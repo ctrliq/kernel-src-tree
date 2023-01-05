@@ -730,6 +730,22 @@ unsigned long nfs_block_size(unsigned long bsize, unsigned char *nrbitsp)
 }
 
 /*
+ * Compute and set NFS server rsize / wsize
+ */
+static inline
+unsigned long nfs_io_size(unsigned long iosize, enum xprt_transports proto)
+{
+	if (iosize < NFS_MIN_FILE_IO_SIZE)
+		iosize = NFS_DEF_FILE_IO_SIZE;
+	else if (iosize >= NFS_MAX_FILE_IO_SIZE)
+		iosize = NFS_MAX_FILE_IO_SIZE;
+
+	if (proto == XPRT_TRANSPORT_UDP || iosize < PAGE_SIZE)
+		return nfs_block_bits(iosize, NULL);
+	return iosize & PAGE_MASK;
+}
+
+/*
  * Determine the maximum file size for a superblock
  */
 static inline
