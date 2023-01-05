@@ -1193,7 +1193,11 @@ static int host1x_drm_probe(struct host1x_device *dev)
 	 * core, so we need to set this manually in order to allow the
 	 * DRM_IOCTL_WAIT_VBLANK to operate correctly.
 	 */
+
+	//mjp
+#if 0	
 	drm->irq_enabled = true;
+#endif	
 
 	/* syncpoints are used for full 32-bit hardware VBLANK counters */
 	drm->max_vblank_count = 0xffffffff;
@@ -1204,10 +1208,12 @@ static int host1x_drm_probe(struct host1x_device *dev)
 
 	drm_mode_config_reset(drm);
 
+	//mjp
+#if 0	
 	err = drm_aperture_remove_framebuffers(false, "tegradrmfb");
 	if (err < 0)
-		goto hub;
-
+	  goto hub;
+#endif
 	err = tegra_drm_fb_init(drm);
 	if (err < 0)
 		goto hub;

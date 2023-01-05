@@ -5,7 +5,8 @@
  */
 
 #include <drm/drm_crtc.h>
-#include <drm/drm_dp_helper.h>
+//mjp
+#include <drm/dp/drm_dp_helper.h>
 #include <drm/drm_print.h>
 
 #include "dp.h"
@@ -559,8 +560,11 @@ static void drm_dp_link_get_adjustments(struct drm_dp_link *link,
 			drm_dp_get_adjust_request_pre_emphasis(status, i) >>
 				DP_TRAIN_PRE_EMPHASIS_SHIFT;
 
+		//mjp
+#if 0		
 		adjust->post_cursor[i] =
 			drm_dp_get_adjust_request_post_cursor(status, i);
+#endif		
 	}
 }
 
