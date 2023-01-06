@@ -9,7 +9,6 @@
 #include <linux/ratelimit.h>
 #include "internal.h"
 
-static const int two = 2;
 static const int ten_thousand = 10000;
 
 static int proc_dointvec_minmax_sysadmin(struct ctl_table *table, int write,
@@ -75,7 +74,7 @@ static struct ctl_table printk_sysctls[] = {
 		.mode		= 0644,
 		.proc_handler	= proc_dointvec_minmax_sysadmin,
 		.extra1		= SYSCTL_ZERO,
-		.extra2		= &two,
+		.extra2		= SYSCTL_TWO,
 	},
 	{}
 };
