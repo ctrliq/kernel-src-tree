@@ -961,6 +961,7 @@ static int gs_can_open(struct net_device *netdev)
 		flags |= GS_CAN_MODE_HW_TIMESTAMP;
 
 	/* finally start device */
+	dev->can.state = CAN_STATE_ERROR_ACTIVE;
 	dm->mode = cpu_to_le32(GS_CAN_MODE_START);
 	dm->flags = cpu_to_le32(flags);
 	rc = usb_control_msg(interface_to_usbdev(dev->iface),
@@ -972,6 +973,7 @@ static int gs_can_open(struct net_device *netdev)
 	if (rc < 0) {
 		netdev_err(netdev, "Couldn't start device (err=%d)\n", rc);
 		kfree(dm);
+		dev->can.state = CAN_STATE_STOPPED;
 		return rc;
 	}
 
@@ -980,8 +982,6 @@ static int gs_can_open(struct net_device *netdev)
 	/* start polling timestamp */
 	if (dev->feature & GS_CAN_FEATURE_HW_TIMESTAMP)
 		gs_usb_timestamp_init(dev);
-
-	dev->can.state = CAN_STATE_ERROR_ACTIVE;
 
 	parent->active_channels++;
 	if (!(dev->can.ctrlmode & CAN_CTRLMODE_LISTENONLY))
