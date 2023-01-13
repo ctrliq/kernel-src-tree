@@ -5481,6 +5481,23 @@ static inline vm_fault_t hugetlb_handle_userfault(struct vm_area_struct *vma,
 	return ret;
 }
 
+/*
+ * Recheck pte with pgtable lock.  Returns true if pte didn't change, or
+ * false if pte changed or is changing.
+ */
+static bool hugetlb_pte_stable(struct hstate *h, struct mm_struct *mm,
+			       pte_t *ptep, pte_t old_pte)
+{
+	spinlock_t *ptl;
+	bool same;
+
+	ptl = huge_pte_lock(h, mm, ptep);
+	same = pte_same(huge_ptep_get(ptep), old_pte);
+	spin_unlock(ptl);
+
+	return same;
+}
+
 static vm_fault_t hugetlb_no_page(struct mm_struct *mm,
 			struct vm_area_struct *vma,
 			struct address_space *mapping, pgoff_t idx,
@@ -5524,6 +5541,28 @@ retry:
 	if (!page) {
 		/* Check for page in userfault range */
 		if (userfaultfd_missing(vma)) {
+			/*
+			 * Since hugetlb_no_page() was examining pte
+			 * without pgtable lock, we need to re-test under
+			 * lock because the pte may not be stable and could
+			 * have changed from under us.  Try to detect
+			 * either changed or during-changing ptes and retry
+			 * properly when needed.
+			 *
+			 * Note that userfaultfd is actually fine with
+			 * false positives (e.g. caused by pte changed),
+			 * but not wrong logical events (e.g. caused by
+			 * reading a pte during changing).  The latter can
+			 * confuse the userspace, so the strictness is very
+			 * much preferred.  E.g., MISSING event should
+			 * never happen on the page after UFFDIO_COPY has
+			 * correctly installed the page and returned.
+			 */
+			if (!hugetlb_pte_stable(h, mm, ptep, old_pte)) {
+				ret = 0;
+				goto out;
+			}
+
 			ret = hugetlb_handle_userfault(vma, mapping, idx,
 						       flags, haddr, address,
 						       VM_UFFD_MISSING);
@@ -5588,6 +5627,11 @@ retry:
 		if (userfaultfd_minor(vma)) {
 			unlock_page(page);
 			put_page(page);
+			/* See comment in userfaultfd_missing() block above */
+			if (!hugetlb_pte_stable(h, mm, ptep, old_pte)) {
+				ret = 0;
+				goto out;
+			}
 			ret = hugetlb_handle_userfault(vma, mapping, idx,
 						       flags, haddr, address,
 						       VM_UFFD_MINOR);
