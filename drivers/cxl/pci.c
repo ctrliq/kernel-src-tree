@@ -381,8 +381,30 @@ static void devm_cxl_pci_create_doe(struct cxl_dev_state *cxlds)
 	}
 }
 
+static void free_event_buf(void *buf)
+{
+	kvfree(buf);
+}
+
+/*
+ * There is a single buffer for reading event logs from the mailbox.  All logs
+ * share this buffer protected by the cxlds->event_log_lock.
+ */
+static int cxl_mem_alloc_event_buf(struct cxl_dev_state *cxlds)
+{
+	struct cxl_get_event_payload *buf;
+
+	buf = kvmalloc(cxlds->payload_size, GFP_KERNEL);
+	if (!buf)
+		return -ENOMEM;
+	cxlds->event.buf = buf;
+
+	return devm_add_action_or_reset(cxlds->dev, free_event_buf, buf);
+}
+
 static int cxl_pci_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 {
+	struct pci_host_bridge *host_bridge = pci_find_host_bridge(pdev->bus);
 	struct cxl_register_map map;
 	struct cxl_memdev *cxlmd;
 	struct cxl_dev_state *cxlds;
@@ -459,6 +481,17 @@ static int cxl_pci_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 	cxlmd = devm_cxl_add_memdev(cxlds);
 	if (IS_ERR(cxlmd))
 		return PTR_ERR(cxlmd);
+
+	/*
+	 * When BIOS maintains CXL error reporting control, it will process
+	 * event records.  Only one agent can do so.
+	 */
+	if (host_bridge->native_cxl_error) {
+		rc = cxl_mem_alloc_event_buf(cxlds);
+		if (rc)
+			return rc;
+		cxl_mem_get_event_records(cxlds, CXLDEV_EVENT_STATUS_ALL);
+	}
 
 	pci_save_state(pdev);
 
