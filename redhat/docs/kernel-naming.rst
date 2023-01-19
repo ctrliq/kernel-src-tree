@@ -10,7 +10,7 @@ information about the upstream release, a unique build number, and information
 about the distribution the RPM was targeted for.  An explanation of each of the
 fields and how the fields are used in the kernel NVR, is below.
 
-**PACKAGE_NAME**: This is the name of the package.  By default this is
+**SPECPACKAGE_NAME**: This is the name of the package.  By default this is
 'kernel', but a well-known variant is kernel-rt.
 
 **SPECKVERSION**: This is the VERSION variable defined in the top-level linux
@@ -39,6 +39,6 @@ be overriden by defining a string in redhat/localversion.
 
 The kernel name is constructed as
 
-$(PACKAGE_NAME)-$(SPECKVERSION).$(SPECKPATCHLEVEL).$(SPECKSUBLEVEL)-$(UPSTREAMBUILD)$(BUILD)$(DISTLOCALVERSION)$(DIST)
+$(SPECPACKAGE_NAME)-$(SPECKVERSION).$(SPECKPATCHLEVEL).$(SPECKSUBLEVEL)-$(UPSTREAMBUILD)$(BUILD)$(DISTLOCALVERSION)$(DIST)
 
 In general, the kernel follows the Fedora Naming Guidelines, `https://fedoraproject.org/wiki/Packaging:Naming?rd=Packaging:NamingGuidelines <https://fedoraproject.org/wiki/Packaging:Naming?rd=Packaging:NamingGuidelines>`__.

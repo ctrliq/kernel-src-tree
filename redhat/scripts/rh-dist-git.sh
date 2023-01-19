@@ -29,11 +29,11 @@ cd "$tmpdir" || die "Unable to create temporary directory";
 test -n "$RHDISTGIT_CACHE" && reference="-- --reference $RHDISTGIT_CACHE"
 echo "Cloning using $RHPKG_BIN" >&2;
 # shellcheck disable=SC2086
-eval $RHPKG_BIN clone "$PACKAGE_NAME" "$reference" >/dev/null || die "Unable to clone using $RHPKG_BIN";
+eval $RHPKG_BIN clone "$SPECPACKAGE_NAME" "$reference" >/dev/null || die "Unable to clone using $RHPKG_BIN";
  
 echo "Switching the branch"
 # change in the correct branch
-cd "$tmpdir/$PACKAGE_NAME";
+cd "$tmpdir/$SPECPACKAGE_NAME";
 $RHPKG_BIN switch-branch "$RHDISTGIT_BRANCH" || die "switching to branch $RHDISTGIT_BRANCH";
 
 echo "Copying updated files"
@@ -42,9 +42,9 @@ echo "Copying updated files"
 
 echo "Uploading new tarballs"
 # upload tarballs
-sed -i "/linux-.*.tar.xz/d" "$tmpdir/$PACKAGE_NAME"/{sources,.gitignore};
-sed -i "/kernel-abi-stablelists.*.tar.bz2/d" "$tmpdir/$PACKAGE_NAME"/{sources,.gitignore};
-sed -i "/kernel-kabi-dw-.*.tar.bz2/d" "$tmpdir/$PACKAGE_NAME"/{sources,.gitignore};
+sed -i "/linux-.*.tar.xz/d" "$tmpdir/$SPECPACKAGE_NAME"/{sources,.gitignore};
+sed -i "/kernel-abi-stablelists.*.tar.bz2/d" "$tmpdir/$SPECPACKAGE_NAME"/{sources,.gitignore};
+sed -i "/kernel-kabi-dw-.*.tar.bz2/d" "$tmpdir/$SPECPACKAGE_NAME"/{sources,.gitignore};
 upload_list="$TARBALL $KABI_TARBALL $KABIDW_TARBALL"
 
 # We depend on word splitting here:
@@ -54,11 +54,11 @@ upload $upload_list
 echo "Creating diff for review ($tmpdir/diff) and changelog"
 # diff the result (redhat/git/dontdiff). note: diff reuturns 1 if
 # differences were found
-diff -X "$REDHAT"/git/dontdiff -upr "$tmpdir/$PACKAGE_NAME" "$REDHAT"/rpm/SOURCES/ > "$tmpdir"/diff;
+diff -X "$REDHAT"/git/dontdiff -upr "$tmpdir/$SPECPACKAGE_NAME" "$REDHAT"/rpm/SOURCES/ > "$tmpdir"/diff;
 # creating the changelog file
 
 # changelog has been created by genspec.sh, including Resolves line, just copy it here
-echo -e "${PACKAGE_NAME}-${DISTBASEVERSION}\n" > "$tmpdir"/changelog
+echo -e "${SPECPACKAGE_NAME}-${DISTBASEVERSION}\n" > "$tmpdir"/changelog
 awk '1;/^Resolves: /{exit};' "$REDHAT"/"$SPECCHANGELOG" >> "$tmpdir"/changelog
 
 # all done

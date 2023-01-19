@@ -29,8 +29,8 @@ sources: buildid
 	echo $(BUILDID) > ../../localversion
 	$(MAKE) -C ../ dist-sources
 	mv -f ../rpm/SOURCES/* .
-	rm -f ./$(PACKAGE_NAME).spec
-	mv ../rpm/SPECS/$(PACKAGE_NAME).spec .
+	rm -f ./$(SPECPACKAGE_NAME).spec
+	mv ../rpm/SPECS/$(SPECPACKAGE_NAME).spec .
 
 test:	buildid
 	echo $(BUILDID)
