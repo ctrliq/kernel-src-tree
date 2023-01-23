@@ -991,7 +991,7 @@ static struct sk_buff *bnxt_rx_multi_page_skb(struct bnxt *bp,
 	skb = build_skb(page_address(page), BNXT_PAGE_MODE_BUF_SIZE +
 					    bp->rx_dma_offset);
 	if (!skb) {
-		__free_page(page);
+		page_pool_recycle_direct(rxr->page_pool, page);
 		return NULL;
 	}
 	skb_mark_for_recycle(skb);
@@ -1029,7 +1029,7 @@ static struct sk_buff *bnxt_rx_page_skb(struct bnxt *bp,
 
 	skb = napi_alloc_skb(&rxr->bnapi->napi, payload);
 	if (!skb) {
-		__free_page(page);
+		page_pool_recycle_direct(rxr->page_pool, page);
 		return NULL;
 	}
 
