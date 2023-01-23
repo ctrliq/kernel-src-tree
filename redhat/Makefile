@@ -634,7 +634,7 @@ sources-rh: $(TARBALL) generate-testpatch-tmp setup-source dist-configs-check
 		scripts/mod/mod-sign.sh \
 		configs/flavors \
 		configs/generate_all_configs.sh \
-		configs/merge.pl \
+		configs/merge.py \
 		configs/process_configs.sh \
 		../Makefile.rhelver \
 		README.rst \
