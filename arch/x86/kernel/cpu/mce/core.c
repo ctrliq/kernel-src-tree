@@ -993,13 +993,13 @@ static atomic_t global_nwo;
  * in the entry order.
  * TBD double check parallel CPU hotunplug
  */
-static int mce_start(int *no_way_out)
+static noinstr int mce_start(int *no_way_out)
 {
-	int order;
 	u64 timeout = (u64)mca_cfg.monarch_timeout * NSEC_PER_USEC;
+	int order, ret = -1;
 
 	if (!timeout)
-		return -1;
+		return ret;
 
 	atomic_add(*no_way_out, &global_nwo);
 	/*
@@ -1009,6 +1009,9 @@ static int mce_start(int *no_way_out)
 	order = atomic_inc_return(&mce_callin);
 	cpumask_clear_cpu(smp_processor_id(), &mce_missing_cpus);
 
+	/* Enable instrumentation around calls to external facilities */
+	instrumentation_begin();
+
 	/*
 	 * Wait for everyone.
 	 */
@@ -1016,7 +1019,7 @@ static int mce_start(int *no_way_out)
 		if (mce_timed_out(&timeout,
 				  "Timeout: Not all CPUs entered broadcast exception handler")) {
 			atomic_set(&global_nwo, 0);
-			return -1;
+			goto out;
 		}
 		ndelay(SPINUNIT);
 	}
@@ -1042,7 +1045,7 @@ static int mce_start(int *no_way_out)
 			if (mce_timed_out(&timeout,
 					  "Timeout: Subject CPUs unable to finish machine check processing")) {
 				atomic_set(&global_nwo, 0);
-				return -1;
+				goto out;
 			}
 			ndelay(SPINUNIT);
 		}
@@ -1053,7 +1056,12 @@ static int mce_start(int *no_way_out)
 	 */
 	*no_way_out = atomic_read(&global_nwo);
 
-	return order;
+	ret = order;
+
+out:
+	instrumentation_end();
+
+	return ret;
 }
 
 /*
