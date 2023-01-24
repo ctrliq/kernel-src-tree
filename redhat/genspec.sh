@@ -102,6 +102,8 @@ fi
 cat "$clogf" "$SOURCES/$SPECCHANGELOG" > "$clogf.full"
 mv -f "$clogf.full" "$SOURCES/$SPECCHANGELOG"
 
+vim "$SOURCES/$SPECCHANGELOG"
+
 # genlog.py generates Resolves lines as well, strip these from RPM changelog
 grep -v -e "^Resolves: " "$SOURCES/$SPECCHANGELOG" > "$clogf".stripped
 
