@@ -373,7 +373,7 @@ static void pl010_shutdown(struct uart_port *port)
 
 static void
 pl010_set_termios(struct uart_port *port, struct ktermios *termios,
-		     struct ktermios *old)
+		  const struct ktermios *old)
 {
 	struct uart_amba_port *uap =
 		container_of(port, struct uart_amba_port, port);
