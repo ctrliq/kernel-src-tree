@@ -3963,6 +3963,7 @@ static void __spi_transfer_message_noqueue(struct spi_controller *ctlr, struct s
 
 	was_busy = ctlr->busy;
 
+	ctlr->cur_msg = msg;
 	ret = __spi_pump_transfer_message(ctlr, msg, was_busy);
 	if (ret)
 		goto out;
