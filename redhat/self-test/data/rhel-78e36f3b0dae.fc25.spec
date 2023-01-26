@@ -2,7 +2,6 @@
 %global include_rhel 1
 %global patchlist_changelog 0
 %global released_kernel 0
-%define debugbuildsenabled 0
 %define buildid .test
 %define specversion 5.17.0
 %define patchversion 5.17
