@@ -20,6 +20,7 @@ import re
 import os.path
 
 def usage(msg):
+    '''print a usage message and exit'''
     sys.stderr.write(msg + "\n")
     sys.stderr.write("usage: merge.py overrides baseconfig [arch]\n")
     sys.exit(1)
@@ -30,7 +31,8 @@ notset = re.compile(r'^#\s+(CONFIG_\w+)\s+is not set')
 # search an input line for a config (set or notset) pattern
 # if we get a match return the config that is being changed
 def find_config(line):
-    if m := isset .match(line):
+    '''find a configuration line in the input and return the config name'''
+    if m := isset.match(line):
         return m.group(1)
     if m := notset.match(line):
         return m.group(1)
@@ -45,26 +47,26 @@ override_file = sys.argv[1]
 baseconfig_file = sys.argv[2]
 
 if not os.path.exists(override_file):
-    usage("overrides config file %s does not exist!" % override_file)
+    usage(f"overrides config file {override_file: s} does not exist!")
 
 if not os.path.exists(baseconfig_file):
-    usage("base configs file %s does not exist" % baseconfig_file)
+    usage(f"base configs file {baseconfig_file: s} does not exist")
 
 if len(sys.argv) == 4:
-    print("# %s" % sys.argv[3])
+    print(f"# {sys.argv[3]:s}")
 
 # read each line of the override file and store any configuration values
 # in the overrides dictionary, keyed by the configuration name.
 overrides = {}
-with open(override_file, "rt") as f:
-    for l in [n.strip() for n in f.readlines()]:
-        if c := find_config(l):
-            overrides[c] = l
+with open(override_file, "rt", encoding="utf-8") as f:
+    for line in [l.strip() for l in f.readlines()]:
+        if c := find_config(line):
+            overrides[c] = line
 
 # now read and print the base config, checking each line
 # that defines a config value and printing the override if
 # it exists
-with open(baseconfig_file, "rt") as f:
+with open(baseconfig_file, "rt", encoding="utf-8") as f:
     for line in [ l.strip() for l in f.readlines() ]:
         c = find_config(line)
         if c and c in overrides:
@@ -75,7 +77,7 @@ with open(baseconfig_file, "rt") as f:
 
 # print out the remaining configs (new values)
 # from the overrides file
-for c in overrides:
-    print (overrides[c])
+for v in overrides.values():
+    print (v)
 
 sys.exit(0)
