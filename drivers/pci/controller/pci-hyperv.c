@@ -1769,7 +1769,7 @@ static void hv_compose_msi_msg(struct irq_data *data, struct msi_msg *msg)
 	int cpu;
 
 	msi_desc  = irq_data_get_msi_desc(data);
-	multi_msi = !msi_desc->msi_attrib.is_msix &&
+	multi_msi = !msi_desc->pci.msi_attrib.is_msix &&
 		    msi_desc->nvec_used > 1;
 
 	/* Reuse the previous allocation */
