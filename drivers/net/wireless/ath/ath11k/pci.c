@@ -451,7 +451,7 @@ static int ath11k_pci_alloc_msi(struct ath11k_pci *ab_pci)
 	pci_read_config_dword(pci_dev, pci_dev->msi_cap + PCI_MSI_ADDRESS_LO,
 			      &ab->pci.msi.addr_lo);
 
-	if (msi_desc->msi_attrib.is_64) {
+	if (msi_desc->pci.msi_attrib.is_64) {
 		pci_read_config_dword(pci_dev, pci_dev->msi_cap + PCI_MSI_ADDRESS_HI,
 				      &ab->pci.msi.addr_hi);
 	} else {
