@@ -4,15 +4,6 @@
 UPSTREAM=$(git rev-parse -q --verify origin/"${UPSTREAM_BRANCH}" || \
 	   git rev-parse -q --verify "${UPSTREAM_BRANCH}")
 
-if [ "$SNAPSHOT" = 0 ]; then
-	# This is based off a tag on Linus's tree (e.g. v5.5 or v5.5-rc5).
-	# Two kernels are built, one with debug configuration and one without.
-	SPECDEBUG_BUILDS_ENABLED=1
-else
-	# All kernels are built with debug configurations.
-	SPECDEBUG_BUILDS_ENABLED=0
-fi
-
 if [ -n "$DISTLOCALVERSION" ]; then
 	SPECBUILDID=$(printf "%%define buildid %s" "$DISTLOCALVERSION")
 else
@@ -59,7 +50,6 @@ test -f "$SOURCES/$SPECFILE" &&
 	s/%%SPECBUILD%%/$SPECBUILD/
 	s/%%SPECRELEASE%%/$SPECRELEASE/
 	s/%%SPECRELEASED_KERNEL%%/$SPECRELEASED_KERNEL/
-	s/%%SPECDEBUG_BUILDS_ENABLED%%/$SPECDEBUG_BUILDS_ENABLED/
 	s/%%SPECINCLUDE_FEDORA_FILES%%/$SPECINCLUDE_FEDORA_FILES/
 	s/%%SPECINCLUDE_RHEL_FILES%%/$SPECINCLUDE_RHEL_FILES/
 	s/%%SPECPATCHLIST_CHANGELOG%%/$SPECPATCHLIST_CHANGELOG/
