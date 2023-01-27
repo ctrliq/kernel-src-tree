@@ -5,12 +5,6 @@ include Makefile.variables
 #
 # This section is intentionally left at the top of the Makefile so it won't be ignored.
 #
-# This deprecation message must come after GIT is set in Makefile.variables.
-
-ifneq ($(GIT),git)
-  # deprecated in 5.20.0
-  $(warning WARNING: GIT($(GIT)) will be deprecated in a later release.)
-endif
 
 # These entries are 'duplicates' of variables specified in Makefile.variables
 # that are used in the SPEC file.  Specifying these with a SPEC prefix indicates
