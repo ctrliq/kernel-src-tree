@@ -2472,6 +2472,9 @@ static void rtl_wol_enable_rx(struct rtl8169_private *tp)
 	if (tp->mac_version >= RTL_GIGA_MAC_VER_25)
 		RTL_W32(tp, RxConfig, RTL_R32(tp, RxConfig) |
 			AcceptBroadcast | AcceptMulticast | AcceptMyPhys);
+
+	if (tp->mac_version >= RTL_GIGA_MAC_VER_40)
+		rtl_disable_rxdvgate(tp);
 }
 
 static void rtl_prepare_power_down(struct rtl8169_private *tp)
@@ -3992,7 +3995,7 @@ static void rtl8169_tx_clear(struct rtl8169_private *tp)
 	netdev_reset_queue(tp->dev);
 }
 
-static void rtl8169_cleanup(struct rtl8169_private *tp, bool going_down)
+static void rtl8169_cleanup(struct rtl8169_private *tp)
 {
 	napi_disable(&tp->napi);
 
@@ -4003,9 +4006,6 @@ static void rtl8169_cleanup(struct rtl8169_private *tp, bool going_down)
 	rtl8169_irq_mask_and_ack(tp);
 
 	rtl_rx_close(tp);
-
-	if (going_down && tp->dev->wol_enabled)
-		goto no_reset;
 
 	switch (tp->mac_version) {
 	case RTL_GIGA_MAC_VER_27:
@@ -4028,7 +4028,7 @@ static void rtl8169_cleanup(struct rtl8169_private *tp, bool going_down)
 	}
 
 	rtl_hw_reset(tp);
-no_reset:
+
 	rtl8169_tx_clear(tp);
 	rtl8169_init_ring_indexes(tp);
 }
@@ -4039,7 +4039,7 @@ static void rtl_reset_work(struct rtl8169_private *tp)
 
 	netif_stop_queue(tp->dev);
 
-	rtl8169_cleanup(tp, false);
+	rtl8169_cleanup(tp);
 
 	for (i = 0; i < NUM_RX_DESC; i++)
 		rtl8169_mark_to_asic(tp->RxDescArray + i);
@@ -4727,7 +4727,7 @@ static void rtl8169_down(struct rtl8169_private *tp)
 	pci_clear_master(tp->pci_dev);
 	rtl_pci_commit(tp);
 
-	rtl8169_cleanup(tp, true);
+	rtl8169_cleanup(tp);
 	rtl_disable_exit_l1(tp);
 	rtl_prepare_power_down(tp);
 }
