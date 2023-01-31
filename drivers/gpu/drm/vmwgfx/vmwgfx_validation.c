@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0 OR MIT
 /**************************************************************************
  *
- * Copyright © 2018 VMware, Inc., Palo Alto, CA., USA
+ * Copyright © 2018 - 2023 VMware, Inc., Palo Alto, CA., USA
  * All Rights Reserved.
  *
  * Permission is hereby granted, free of charge, to any person obtaining a
@@ -25,9 +25,11 @@
  * USE OR OTHER DEALINGS IN THE SOFTWARE.
  *
  **************************************************************************/
-#include <linux/slab.h>
-#include "vmwgfx_validation.h"
+#include "vmwgfx_bo.h"
 #include "vmwgfx_drv.h"
+#include "vmwgfx_validation.h"
+
+#include <linux/slab.h>
 
 
 #define VMWGFX_VALIDATION_MEM_GRAN (16*PAGE_SIZE)
@@ -77,7 +79,7 @@ struct vmw_validation_res_node {
 	struct list_head head;
 	struct vmwgfx_hash_item hash;
 	struct vmw_resource *res;
-	struct vmw_buffer_object *new_backup;
+	struct vmw_bo *new_backup;
 	unsigned long new_backup_offset;
 	u32 no_buffer_needed : 1;
 	u32 switching_backup : 1;
@@ -173,7 +175,7 @@ static void vmw_validation_mem_free(struct vmw_validation_context *ctx)
  */
 static struct vmw_validation_bo_node *
 vmw_validation_find_bo_dup(struct vmw_validation_context *ctx,
-			   struct vmw_buffer_object *vbo)
+			   struct vmw_bo *vbo)
 {
 	struct  vmw_validation_bo_node *bo_node = NULL;
 
@@ -254,7 +256,7 @@ out:
  * Return: Zero on success, negative error code otherwise.
  */
 int vmw_validation_add_bo(struct vmw_validation_context *ctx,
-			  struct vmw_buffer_object *vbo,
+			  struct vmw_bo *vbo,
 			  bool as_mob,
 			  bool cpu_blit)
 {
@@ -411,7 +413,7 @@ void vmw_validation_res_set_dirty(struct vmw_validation_context *ctx,
  */
 void vmw_validation_res_switch_backup(struct vmw_validation_context *ctx,
 				      void *val_private,
-				      struct vmw_buffer_object *vbo,
+				      struct vmw_bo *vbo,
 				      unsigned long backup_offset)
 {
 	struct vmw_validation_res_node *val;
@@ -452,7 +454,7 @@ int vmw_validation_res_reserve(struct vmw_validation_context *ctx,
 
 		val->reserved = 1;
 		if (res->backup) {
-			struct vmw_buffer_object *vbo = res->backup;
+			struct vmw_bo *vbo = res->backup;
 
 			ret = vmw_validation_add_bo
 				(ctx, vbo, vmw_resource_needs_backup(res),
@@ -527,8 +529,8 @@ int vmw_validation_bo_validate_single(struct ttm_buffer_object *bo,
 				      bool interruptible,
 				      bool validate_as_mob)
 {
-	struct vmw_buffer_object *vbo =
-		container_of(bo, struct vmw_buffer_object, base);
+	struct vmw_bo *vbo =
+		container_of(bo, struct vmw_bo, base);
 	struct ttm_operation_ctx ctx = {
 		.interruptible = interruptible,
 		.no_wait_gpu = false
@@ -579,7 +581,7 @@ int vmw_validation_bo_validate(struct vmw_validation_context *ctx, bool intr)
 	int ret;
 
 	list_for_each_entry(entry, &ctx->bo_list, base.head) {
-		struct vmw_buffer_object *vbo =
+		struct vmw_bo *vbo =
 			container_of(entry->base.bo, typeof(*vbo), base);
 
 		if (entry->cpu_blit) {
@@ -640,7 +642,7 @@ int vmw_validation_res_validate(struct vmw_validation_context *ctx, bool intr)
 
 	list_for_each_entry(val, &ctx->resource_list, head) {
 		struct vmw_resource *res = val->res;
-		struct vmw_buffer_object *backup = res->backup;
+		struct vmw_bo *backup = res->backup;
 
 		ret = vmw_resource_validate(res, intr, val->dirty_set &&
 					    val->dirty);
@@ -652,7 +654,7 @@ int vmw_validation_res_validate(struct vmw_validation_context *ctx, bool intr)
 
 		/* Check if the resource switched backup buffer */
 		if (backup && res->backup && (backup != res->backup)) {
-			struct vmw_buffer_object *vbo = res->backup;
+			struct vmw_bo *vbo = res->backup;
 
 			ret = vmw_validation_add_bo
 				(ctx, vbo, vmw_resource_needs_backup(res),
@@ -890,7 +892,7 @@ void vmw_validation_bo_backoff(struct vmw_validation_context *ctx)
 	list_for_each_entry(entry, &ctx->bo_list, base.head) {
 		if (entry->coherent_count) {
 			unsigned int coherent_count = entry->coherent_count;
-			struct vmw_buffer_object *vbo =
+			struct vmw_bo *vbo =
 				container_of(entry->base.bo, typeof(*vbo),
 					     base);
 
