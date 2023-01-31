@@ -302,6 +302,19 @@ static void vfio_container_put(struct vfio_container *container)
 	kref_put(&container->kref, vfio_container_release);
 }
 
+unsigned int vfio_device_set_open_count(struct vfio_device_set *dev_set)
+{
+	struct vfio_device *cur;
+	unsigned int open_count = 0;
+
+	lockdep_assert_held(&dev_set->lock);
+
+	list_for_each_entry(cur, &dev_set->device_list, dev_set_list)
+		open_count += cur->open_count;
+	return open_count;
+}
+EXPORT_SYMBOL_GPL(vfio_device_set_open_count);
+
 /*
  * Group objects - create, release, get, put, search
  */
@@ -1085,9 +1098,28 @@ static void vfio_device_unassign_container(struct vfio_device *device)
 	up_write(&device->group->group_rwsem);
 }
 
+static void vfio_device_container_register(struct vfio_device *device)
+{
+	struct vfio_iommu_driver *iommu_driver =
+		device->group->container->iommu_driver;
+
+	if (iommu_driver && iommu_driver->ops->register_device)
+		iommu_driver->ops->register_device(
+			device->group->container->iommu_data, device);
+}
+
+static void vfio_device_container_unregister(struct vfio_device *device)
+{
+	struct vfio_iommu_driver *iommu_driver =
+		device->group->container->iommu_driver;
+
+	if (iommu_driver && iommu_driver->ops->unregister_device)
+		iommu_driver->ops->unregister_device(
+			device->group->container->iommu_data, device);
+}
+
 static struct file *vfio_device_open(struct vfio_device *device)
 {
-	struct vfio_iommu_driver *iommu_driver;
 	struct file *filep;
 	int ret;
 
@@ -1118,12 +1150,7 @@ static struct file *vfio_device_open(struct vfio_device *device)
 			if (ret)
 				goto err_undo_count;
 		}
-
-		iommu_driver = device->group->container->iommu_driver;
-		if (iommu_driver && iommu_driver->ops->register_device)
-			iommu_driver->ops->register_device(
-				device->group->container->iommu_data, device);
-
+		vfio_device_container_register(device);
 		up_read(&device->group->group_rwsem);
 	}
 	mutex_unlock(&device->dev_set->lock);
@@ -1158,13 +1185,11 @@ static struct file *vfio_device_open(struct vfio_device *device)
 err_close_device:
 	mutex_lock(&device->dev_set->lock);
 	down_read(&device->group->group_rwsem);
-	if (device->open_count == 1 && device->ops->close_device) {
-		device->ops->close_device(device);
+	if (device->open_count == 1) {
+		if (device->ops->close_device)
+			device->ops->close_device(device);
 
-		iommu_driver = device->group->container->iommu_driver;
-		if (iommu_driver && iommu_driver->ops->unregister_device)
-			iommu_driver->ops->unregister_device(
-				device->group->container->iommu_data, device);
+		vfio_device_container_unregister(device);
 	}
 err_undo_count:
 	up_read(&device->group->group_rwsem);
@@ -1360,18 +1385,16 @@ static const struct file_operations vfio_group_fops = {
 static int vfio_device_fops_release(struct inode *inode, struct file *filep)
 {
 	struct vfio_device *device = filep->private_data;
-	struct vfio_iommu_driver *iommu_driver;
 
 	mutex_lock(&device->dev_set->lock);
 	vfio_assert_device_open(device);
 	down_read(&device->group->group_rwsem);
-	if (device->open_count == 1 && device->ops->close_device)
-		device->ops->close_device(device);
+	if (device->open_count == 1) {
+		if (device->ops->close_device)
+			device->ops->close_device(device);
 
-	iommu_driver = device->group->container->iommu_driver;
-	if (iommu_driver && iommu_driver->ops->unregister_device)
-		iommu_driver->ops->unregister_device(
-			device->group->container->iommu_data, device);
+		vfio_device_container_unregister(device);
+	}
 	up_read(&device->group->group_rwsem);
 	device->open_count--;
 	if (device->open_count == 0)
@@ -1607,6 +1630,34 @@ out_copy:
 	return 0;
 }
 
+static int
+vfio_ioctl_device_feature_migration_data_size(struct vfio_device *device,
+					      u32 flags, void __user *arg,
+					      size_t argsz)
+{
+	struct vfio_device_feature_mig_data_size data_size = {};
+	unsigned long stop_copy_length;
+	int ret;
+
+	if (!device->mig_ops)
+		return -ENOTTY;
+
+	ret = vfio_check_feature(flags, argsz, VFIO_DEVICE_FEATURE_GET,
+				 sizeof(data_size));
+	if (ret != 1)
+		return ret;
+
+	ret = device->mig_ops->migration_get_data_size(device, &stop_copy_length);
+	if (ret)
+		return ret;
+
+	data_size.stop_copy_length = stop_copy_length;
+	if (copy_to_user(arg, &data_size, sizeof(data_size)))
+		return -EFAULT;
+
+	return 0;
+}
+
 static int vfio_ioctl_device_feature_migration(struct vfio_device *device,
 					       u32 flags, void __user *arg,
 					       size_t argsz)
@@ -1659,6 +1710,10 @@ static int vfio_ioctl_device_feature(struct vfio_device *device,
 			feature.argsz - minsz);
 	case VFIO_DEVICE_FEATURE_MIG_DEVICE_STATE:
 		return vfio_ioctl_device_feature_mig_device_state(
+			device, feature.flags, arg->data,
+			feature.argsz - minsz);
+	case VFIO_DEVICE_FEATURE_MIG_DATA_SIZE:
+		return vfio_ioctl_device_feature_migration_data_size(
 			device, feature.flags, arg->data,
 			feature.argsz - minsz);
 	default:
