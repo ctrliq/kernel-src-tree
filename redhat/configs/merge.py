@@ -60,7 +60,8 @@ if len(sys.argv) == 4:
 overrides = {}
 with open(override_file, "rt", encoding="utf-8") as f:
     for line in [l.strip() for l in f.readlines()]:
-        if c := find_config(line):
+        c = find_config(line)
+        if c and c not in overrides:
             overrides[c] = line
 
 # now read and print the base config, checking each line
