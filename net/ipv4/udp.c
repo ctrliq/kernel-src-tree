@@ -234,8 +234,8 @@ int udp_lib_get_port(struct sock *sk, unsigned short snum,
 {
 	struct udp_hslot *hslot, *hslot2;
 	struct udp_table *udptable = sk->sk_prot->h.udp_table;
-	int    error = 1;
 	struct net *net = sock_net(sk);
+	int error = -EADDRINUSE;
 
 	if (!snum) {
 		int low, high, remaining;
