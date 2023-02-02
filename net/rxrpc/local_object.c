@@ -183,7 +183,6 @@ struct rxrpc_local *rxrpc_lookup_local(struct net *net,
 	struct rxrpc_local *local;
 	struct rxrpc_net *rxnet = rxrpc_net(net);
 	struct hlist_node *cursor;
-	const char *age;
 	long diff;
 	int ret;
 
@@ -217,7 +216,6 @@ struct rxrpc_local *rxrpc_lookup_local(struct net *net,
 		if (!rxrpc_use_local(local))
 			break;
 
-		age = "old";
 		goto found;
 	}
 
@@ -235,14 +233,9 @@ struct rxrpc_local *rxrpc_lookup_local(struct net *net,
 	} else {
 		hlist_add_head_rcu(&local->link, &rxnet->local_endpoints);
 	}
-	age = "new";
 
 found:
 	mutex_unlock(&rxnet->local_mutex);
-
-	_net("LOCAL %s %d {%pISp}",
-	     age, local->debug_id, &local->srx.transport);
-
 	_leave(" = %p", local);
 	return local;
 
@@ -452,7 +445,6 @@ static void rxrpc_local_rcu(struct rcu_head *rcu)
 
 	ASSERT(!work_pending(&local->processor));
 
-	_net("DESTROY LOCAL %d", local->debug_id);
 	kfree(local);
 	_leave("");
 }
