@@ -2305,7 +2305,14 @@ static int vfio_iommu_type1_attach_group(void *iommu_data,
 						       &iommu_device,
 						       vfio_mdev_iommu_device);
 			if (!ret && iommu_device) {
-				bus = iommu_device->bus;
+				/*
+				 * Replace iommu_group with that of the IOMMU
+				 * backing device for all remaining operations,
+				 * ie. domain_alloc, reserved regions, and
+				 * capability checks.  Be careful this is
+				 * appropriate for all new uses.
+				 */
+				iommu_group = iommu_device->iommu_group;
 				goto rhel_mdev_iommu_device;
 			}
 		}
