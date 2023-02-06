@@ -109,7 +109,8 @@ int memcmp_pages(struct page *page1, struct page *page2)
 static inline void __mte_enable_kernel(const char *mode, unsigned long tcf)
 {
 	/* Enable MTE Sync Mode for EL1. */
-	sysreg_clear_set(sctlr_el1, SCTLR_ELx_TCF_MASK, tcf);
+	sysreg_clear_set(sctlr_el1, SCTLR_EL1_TCF_MASK,
+			 SYS_FIELD_PREP(SCTLR_EL1, TCF, tcf));
 	isb();
 
 	pr_info_once("MTE: enabled in %s mode at EL1\n", mode);
@@ -125,12 +126,12 @@ void mte_enable_kernel_sync(void)
 	WARN_ONCE(system_uses_mte_async_or_asymm_mode(),
 			"MTE async mode enabled system wide!");
 
-	__mte_enable_kernel("synchronous", SCTLR_ELx_TCF_SYNC);
+	__mte_enable_kernel("synchronous", SCTLR_EL1_TCF_SYNC);
 }
 
 void mte_enable_kernel_async(void)
 {
-	__mte_enable_kernel("asynchronous", SCTLR_ELx_TCF_ASYNC);
+	__mte_enable_kernel("asynchronous", SCTLR_EL1_TCF_ASYNC);
 
 	/*
 	 * MTE async mode is set system wide by the first PE that
@@ -147,7 +148,7 @@ void mte_enable_kernel_async(void)
 void mte_enable_kernel_asymm(void)
 {
 	if (cpus_have_cap(ARM64_MTE_ASYMM)) {
-		__mte_enable_kernel("asymmetric", SCTLR_ELx_TCF_ASYMM);
+		__mte_enable_kernel("asymmetric", SCTLR_EL1_TCF_ASYMM);
 
 		/*
 		 * MTE asymm mode behaves as async mode for store
@@ -219,11 +220,11 @@ static void mte_update_sctlr_user(struct task_struct *task)
 	 * default order.
 	 */
 	if (resolved_mte_tcf & MTE_CTRL_TCF_ASYMM)
-		sctlr |= SCTLR_EL1_TCF0_ASYMM;
+		sctlr |= SYS_FIELD_PREP_ENUM(SCTLR_EL1, TCF0, ASYMM);
 	else if (resolved_mte_tcf & MTE_CTRL_TCF_ASYNC)
-		sctlr |= SCTLR_EL1_TCF0_ASYNC;
+		sctlr |= SYS_FIELD_PREP_ENUM(SCTLR_EL1, TCF0, ASYNC);
 	else if (resolved_mte_tcf & MTE_CTRL_TCF_SYNC)
-		sctlr |= SCTLR_EL1_TCF0_SYNC;
+		sctlr |= SYS_FIELD_PREP_ENUM(SCTLR_EL1, TCF0, SYNC);
 	task->thread.sctlr_user = sctlr;
 }
 
@@ -242,6 +243,11 @@ static void mte_update_gcr_excl(struct task_struct *task)
 		SYS_GCR_EL1);
 }
 
+#ifdef CONFIG_KASAN_HW_TAGS
+/* Only called from assembly, silence sparse */
+void __init kasan_hw_tags_enable(struct alt_instr *alt, __le32 *origptr,
+				 __le32 *updptr, int nr_inst);
+
 void __init kasan_hw_tags_enable(struct alt_instr *alt, __le32 *origptr,
 				 __le32 *updptr, int nr_inst)
 {
@@ -250,6 +256,7 @@ void __init kasan_hw_tags_enable(struct alt_instr *alt, __le32 *origptr,
 	if (kasan_hw_tags_enabled())
 		*updptr = cpu_to_le32(aarch64_insn_gen_nop());
 }
+#endif
 
 void mte_thread_init_user(void)
 {
