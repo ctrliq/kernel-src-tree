@@ -590,7 +590,7 @@ static int iomap_write_begin_inline(const struct iomap_iter *iter,
 	return iomap_read_inline_data(iter, page);
 }
 
-static int iomap_write_begin(const struct iomap_iter *iter, loff_t pos,
+static int iomap_write_begin(struct iomap_iter *iter, loff_t pos,
 		unsigned len, struct page **pagep)
 {
 	const struct iomap_page_ops *page_ops = iter->iomap.page_ops;
@@ -616,6 +616,26 @@ static int iomap_write_begin(const struct iomap_iter *iter, loff_t pos,
 	if (!page) {
 		status = -ENOMEM;
 		goto out_no_page;
+	}
+
+	/*
+	 * Now we have a locked folio, before we do anything with it we need to
+	 * check that the iomap we have cached is not stale. The inode extent
+	 * mapping can change due to concurrent IO in flight (e.g.
+	 * IOMAP_UNWRITTEN state can change and memory reclaim could have
+	 * reclaimed a previously partially written page at this index after IO
+	 * completion before this write reaches this file offset) and hence we
+	 * could do the wrong thing here (zero a page range incorrectly or fail
+	 * to zero) and corrupt data.
+	 */
+	if (page_ops && page_ops->iomap_valid) {
+		bool iomap_valid = page_ops->iomap_valid(iter->inode,
+							&iter->iomap);
+		if (!iomap_valid) {
+			iter->iomap.flags |= IOMAP_F_STALE;
+			status = 0;
+			goto out_unlock;
+		}
 	}
 
 	if (srcmap->type == IOMAP_INLINE)
@@ -756,6 +776,8 @@ again:
 
 		status = iomap_write_begin(iter, pos, bytes, &page);
 		if (unlikely(status))
+			break;
+		if (iter->iomap.flags & IOMAP_F_STALE)
 			break;
 
 		if (mapping_writably_mapped(iter->inode->i_mapping))
@@ -1059,6 +1081,8 @@ static loff_t iomap_unshare_iter(struct iomap_iter *iter)
 		status = iomap_write_begin(iter, pos, bytes, &page);
 		if (unlikely(status))
 			return status;
+		if (iter->iomap.flags & IOMAP_F_STALE)
+			break;
 
 		status = iomap_write_end(iter, pos, bytes, bytes, page);
 		if (WARN_ON_ONCE(status == 0))
@@ -1104,6 +1128,8 @@ static s64 __iomap_zero_iter(struct iomap_iter *iter, loff_t pos, u64 length)
 	status = iomap_write_begin(iter, pos, bytes, &page);
 	if (status)
 		return status;
+	if (iter->iomap.flags & IOMAP_F_STALE)
+		return status;
 
 	zero_user(page, offset, bytes);
 	mark_page_accessed(page);
@@ -1132,6 +1158,8 @@ static loff_t iomap_zero_iter(struct iomap_iter *iter, bool *did_zero)
 			bytes = __iomap_zero_iter(iter, pos, length);
 		if (bytes < 0)
 			return bytes;
+		if (!bytes && iter->iomap.flags & IOMAP_F_STALE)
+			break;
 
 		pos += bytes;
 		length -= bytes;
