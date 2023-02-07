@@ -1115,6 +1115,7 @@
 
 #else
 
+#include <linux/bitfield.h>
 #include <linux/build_bug.h>
 #include <linux/types.h>
 #include <asm/alternative.h>
