@@ -10,11 +10,14 @@
 
 #include <linux/init.h>
 #include <linux/cpu.h>
+#include <linux/elf.h>
 #include <asm/cacheflush.h>
 #include <asm/alternative.h>
 #include <asm/cpufeature.h>
 #include <asm/insn.h>
+#include <asm/module.h>
 #include <asm/sections.h>
+#include <asm/vdso.h>
 #include <linux/stop_machine.h>
 
 #define __ALT_PTR(a, f)		((void *)&(a)->f + (a)->f)
@@ -193,6 +196,30 @@ static void __nocfi __apply_alternatives(const struct alt_region *region,
 	}
 }
 
+void apply_alternatives_vdso(void)
+{
+	struct alt_region region;
+	const struct elf64_hdr *hdr;
+	const struct elf64_shdr *shdr;
+	const struct elf64_shdr *alt;
+	DECLARE_BITMAP(all_capabilities, ARM64_NCAPS);
+
+	bitmap_fill(all_capabilities, ARM64_NCAPS);
+
+	hdr = (struct elf64_hdr *)vdso_start;
+	shdr = (void *)hdr + hdr->e_shoff;
+	alt = find_section(hdr, shdr, ".altinstructions");
+	if (!alt)
+		return;
+
+	region = (struct alt_region){
+		.begin	= (void *)hdr + alt->sh_offset,
+		.end	= (void *)hdr + alt->sh_offset + alt->sh_size,
+	};
+
+	__apply_alternatives(&region, false, &all_capabilities[0]);
+}
+
 static const struct alt_region kernel_alternatives = {
 	.begin	= (struct alt_instr *)__alt_instructions,
 	.end	= (struct alt_instr *)__alt_instructions_end,
@@ -229,6 +256,7 @@ void __init apply_alternatives_all(void)
 {
 	pr_info("applying system-wide alternatives\n");
 
+	apply_alternatives_vdso();
 	/* better not try code patching on a live SMP system */
 	stop_machine(__apply_alternatives_multi_stop, NULL, cpu_online_mask);
 }
