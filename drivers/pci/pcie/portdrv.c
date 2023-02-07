@@ -586,7 +586,6 @@ int pcie_port_service_register(struct pcie_port_service_driver *new)
 
 	return driver_register(&new->driver);
 }
-EXPORT_SYMBOL(pcie_port_service_register);
 
 /**
  * pcie_port_service_unregister - unregister PCI Express port service driver
@@ -596,7 +595,6 @@ void pcie_port_service_unregister(struct pcie_port_service_driver *drv)
 {
 	driver_unregister(&drv->driver);
 }
-EXPORT_SYMBOL(pcie_port_service_unregister);
 
 /* If this switch is set, PCIe port native services should not be enabled. */
 bool pcie_ports_disabled;
