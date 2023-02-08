@@ -5048,6 +5048,52 @@ static int sol_socket_setsockopt(struct sock *sk, int optname,
 			     KERNEL_SOCKPTR(optval), optlen);
 }
 
+static int bpf_sol_tcp_setsockopt(struct sock *sk, int optname,
+				  char *optval, int optlen)
+{
+	struct tcp_sock *tp = tcp_sk(sk);
+	unsigned long timeout;
+	int val;
+
+	if (optlen != sizeof(int))
+		return -EINVAL;
+
+	val = *(int *)optval;
+
+	/* Only some options are supported */
+	switch (optname) {
+	case TCP_BPF_IW:
+		if (val <= 0 || tp->data_segs_out > tp->syn_data)
+			return -EINVAL;
+		tcp_snd_cwnd_set(tp, val);
+		break;
+	case TCP_BPF_SNDCWND_CLAMP:
+		if (val <= 0)
+			return -EINVAL;
+		tp->snd_cwnd_clamp = val;
+		tp->snd_ssthresh = val;
+		break;
+	case TCP_BPF_DELACK_MAX:
+		timeout = usecs_to_jiffies(val);
+		if (timeout > TCP_DELACK_MAX ||
+		    timeout < TCP_TIMEOUT_MIN)
+			return -EINVAL;
+		inet_csk(sk)->icsk_delack_max = timeout;
+		break;
+	case TCP_BPF_RTO_MIN:
+		timeout = usecs_to_jiffies(val);
+		if (timeout > TCP_RTO_MIN ||
+		    timeout < TCP_TIMEOUT_MIN)
+			return -EINVAL;
+		inet_csk(sk)->icsk_rto_min = timeout;
+		break;
+	default:
+		return -EINVAL;
+	}
+
+	return 0;
+}
+
 static int __bpf_setsockopt(struct sock *sk, int level, int optname,
 			    char *optval, int optlen)
 {
@@ -5102,6 +5148,10 @@ static int __bpf_setsockopt(struct sock *sk, int level, int optname,
 		}
 	} else if (IS_ENABLED(CONFIG_INET) && level == SOL_TCP &&
 		   sk->sk_prot->setsockopt == tcp_setsockopt) {
+		if (optname >= TCP_BPF_IW)
+			return bpf_sol_tcp_setsockopt(sk, optname,
+						      optval, optlen);
+
 		if (optname == TCP_CONGESTION) {
 			char name[TCP_CA_NAME_MAX];
 
@@ -5112,7 +5162,6 @@ static int __bpf_setsockopt(struct sock *sk, int level, int optname,
 		} else {
 			struct inet_connection_sock *icsk = inet_csk(sk);
 			struct tcp_sock *tp = tcp_sk(sk);
-			unsigned long timeout;
 
 			if (optlen != sizeof(int))
 				return -EINVAL;
@@ -5120,34 +5169,6 @@ static int __bpf_setsockopt(struct sock *sk, int level, int optname,
 			val = *((int *)optval);
 			/* Only some options are supported */
 			switch (optname) {
-			case TCP_BPF_IW:
-				if (val <= 0 || tp->data_segs_out > tp->syn_data)
-					ret = -EINVAL;
-				else
-					tcp_snd_cwnd_set(tp, val);
-				break;
-			case TCP_BPF_SNDCWND_CLAMP:
-				if (val <= 0) {
-					ret = -EINVAL;
-				} else {
-					tp->snd_cwnd_clamp = val;
-					tp->snd_ssthresh = val;
-				}
-				break;
-			case TCP_BPF_DELACK_MAX:
-				timeout = usecs_to_jiffies(val);
-				if (timeout > TCP_DELACK_MAX ||
-				    timeout < TCP_TIMEOUT_MIN)
-					return -EINVAL;
-				inet_csk(sk)->icsk_delack_max = timeout;
-				break;
-			case TCP_BPF_RTO_MIN:
-				timeout = usecs_to_jiffies(val);
-				if (timeout > TCP_RTO_MIN ||
-				    timeout < TCP_TIMEOUT_MIN)
-					return -EINVAL;
-				inet_csk(sk)->icsk_rto_min = timeout;
-				break;
 			case TCP_SAVE_SYN:
 				if (val < 0 || val > 1)
 					ret = -EINVAL;
