@@ -370,7 +370,7 @@ static void acpi_bus_osc_negotiate_platform_control(void)
 
 	capbuf_ret = context.ret.pointer;
 	if (context.ret.length > OSC_SUPPORT_DWORD) {
-#ifdef CONFIG_X86
+#ifdef CONFIG_ACPI_CPPC_LIB
 		osc_sb_cppc2_support_acked = capbuf_ret[OSC_SUPPORT_DWORD] & OSC_SB_CPCV2_SUPPORT;
 #endif
 
