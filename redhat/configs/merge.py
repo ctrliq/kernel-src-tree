@@ -32,10 +32,14 @@ notset = re.compile(r'^#\s+(CONFIG_\w+)\s+is not set')
 # if we get a match return the config that is being changed
 def find_config(line):
     '''find a configuration line in the input and return the config name'''
-    if m := isset.match(line):
+    m = isset.match(line)
+    if (m is not None):
         return m.group(1)
-    if m := notset.match(line):
+
+    m = notset.match(line)
+    if (m is not None):
         return m.group(1)
+
     return None
 
 #########################################################
