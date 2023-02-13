@@ -16,7 +16,7 @@ os-build, a.k.a "the development branch"
 Frequency: Merges 'master' branch daily
 
 The os-build branch is the development branch of the tree.  The os-build branch
-tracks the latest version of the kernel patches for ARK and Fedora, as well as
+tracks the latest version of the kernel patches for RHEL and Fedora, as well as
 the kernel configuration and build scripts.  This is the branch to send
 merge request to.  When a new release is made, this branch is merged into the
 release branch.  Configuration and build scripts can be found in the
@@ -119,7 +119,7 @@ located on the ``os-build`` branch in ``redhat/configs/``. Inside this
 directory there are a number of scripts used to automatically generate
 complete configurations, along with a number of directories that contain
 configuration snippets. At this time, there are three main configuration
-directories: ``ark``, ``common``, and ``fedora``. ``ark`` and ``fedora``
+directories: ``rhel``, ``common``, and ``fedora``. ``rhel`` and ``fedora``
 are configuration "flavors", while ``common`` is shared configuration
 across flavors.
 
@@ -134,28 +134,28 @@ A flavor is defined by:
    configuration directories and should include the directory you
    defined in step 2.
 
-common and pending-ark
+common and pending-rhel
 ~~~~~~~~~~~~~~~~~~~~~~
 
 The ``common`` directory contains configuration values that are shared
 across all configuration "flavors". For a configuration to be in
 ``common``, it MUST be reviewed and approved by one or more Red Hat
-subsystem maintainers since it affects ARK. A flavor's configurations
+subsystem maintainers since it affects RHEL. A flavor's configurations
 can override settings in ``common``, so it's not guaranteed settings in
 common are the same across all flavors. It's simply a good place to set
 common values across the flavors and use as a base for new flavors.
 
-``pending-ark`` is where configuration options that have not been
+``pending-rhel`` is where configuration options that have not been
 reviewed are placed. Automation creates snippets for all new
 configuration options exposed during a rebase of ARK in the
-``pending-ark`` directory, at which point subsystem maintainers
+``pending-rhel`` directory, at which point subsystem maintainers
 review the options and set them as appropriate before moving them into
 ``common``.
 
-New ARK configurations are placed in ``pending-ark`` because it is
-assumed that ARK generally has the most conservative settings, whereas
+New RHEL configurations are placed in ``pending-rhel`` because it is
+assumed that RHEL generally has the most conservative settings, whereas
 other flavors like Fedora will be (for the most part) a superset of the
-ARK configuration.
+RHEL configuration.
 
 fedora and pending-fedora
 ~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -163,11 +163,11 @@ fedora and pending-fedora
 The ``fedora`` directory contains settings that have been reviewed by
 Fedora kernel maintainers for the Fedora Rawhide kernel.
 
-Since Fedora tends to turn on more things than ARK, it's common for a
+Since Fedora tends to turn on more things than RHEL, it's common for a
 rebase to expose new configuration options that only apply to Fedora.
 For this reason, Fedora has a ``pending-fedora`` directory as well.
 ``pending-fedora`` contains settings that are not exposed by the
 ``common`` configuration set and only apply to Fedora. It is, like
-``pending-ark``, populated automatically during a rebase. A Fedora
+``pending-rhel``, populated automatically during a rebase. A Fedora
 kernel maintain can review the settings at their leisure and move them
 over to ``fedora`` as they do so.

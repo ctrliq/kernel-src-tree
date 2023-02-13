@@ -72,11 +72,11 @@ more generic directories. Configurations that are specific to a
 particular architecture should be placed in that architecture's
 directory rather in the generic directory.
 
-Configuration changes in the ``ark`` directory requires review from Red Hat
+Configuration changes in the ``rhel`` directory requires review from Red Hat
 kernel developers, where-as the configurations in ``fedora`` can be changed
 with the approval of the Fedora kernel maintainers.  The ``common``
-directory is for changes common to both ``ark`` and ``fedora`` and will be
-populated by a bot that periodically looks in both ``ark`` and ``fedora``
+directory is for changes common to both ``rhel`` and ``fedora`` and will be
+populated by a bot that periodically looks in both ``rhel`` and ``fedora``
 for common changes.
 
 Makefile changes
