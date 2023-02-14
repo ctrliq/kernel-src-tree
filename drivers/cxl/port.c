@@ -59,6 +59,7 @@ static int discover_region(struct device *dev, void *root)
 
 static int cxl_switch_port_probe(struct cxl_port *port)
 {
+	struct cxl_endpoint_dvsec_info info = { 0 };
 	struct cxl_hdm *cxlhdm;
 	int rc;
 
@@ -73,7 +74,7 @@ static int cxl_switch_port_probe(struct cxl_port *port)
 	if (IS_ERR(cxlhdm))
 		return PTR_ERR(cxlhdm);
 
-	return devm_cxl_enumerate_decoders(cxlhdm);
+	return devm_cxl_enumerate_decoders(cxlhdm, &info);
 }
 
 static int cxl_endpoint_port_probe(struct cxl_port *port)
@@ -114,7 +115,7 @@ static int cxl_endpoint_port_probe(struct cxl_port *port)
 		return rc;
 	}
 
-	rc = devm_cxl_enumerate_decoders(cxlhdm);
+	rc = devm_cxl_enumerate_decoders(cxlhdm, &info);
 	if (rc)
 		return rc;
 

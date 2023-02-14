@@ -839,7 +839,8 @@ static void mock_init_hdm_decoder(struct cxl_decoder *cxld)
 	}
 }
 
-static int mock_cxl_enumerate_decoders(struct cxl_hdm *cxlhdm)
+static int mock_cxl_enumerate_decoders(struct cxl_hdm *cxlhdm,
+				       struct cxl_endpoint_dvsec_info *info)
 {
 	struct cxl_port *port = cxlhdm->port;
 	struct cxl_port *parent_port = to_cxl_port(port->dev.parent);
