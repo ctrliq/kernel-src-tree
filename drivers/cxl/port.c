@@ -70,7 +70,7 @@ static int cxl_switch_port_probe(struct cxl_port *port)
 	if (rc == 1)
 		return devm_cxl_add_passthrough_decoder(port);
 
-	cxlhdm = devm_cxl_setup_hdm(port);
+	cxlhdm = devm_cxl_setup_hdm(port, &info);
 	if (IS_ERR(cxlhdm))
 		return PTR_ERR(cxlhdm);
 
