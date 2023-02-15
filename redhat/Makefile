@@ -651,6 +651,7 @@ sources-rh: $(TARBALL) generate-testpatch-tmp setup-source dist-configs-check
 		../Makefile.rhelver \
 		README.rst \
 		kernel-local \
+		dracut-virt.conf \
 		$(SOURCES)/
 	@for KABIARCH in $(ARCH_LIST); do \
 		cp kabi/Module.kabi_$$KABIARCH $(SOURCES)/; \
