@@ -135,7 +135,7 @@ A flavor is defined by:
    defined in step 2.
 
 common and pending-rhel
-~~~~~~~~~~~~~~~~~~~~~~
+~~~~~~~~~~~~~~~~~~~~~~~
 
 The ``common`` directory contains configuration values that are shared
 across all configuration "flavors". For a configuration to be in
