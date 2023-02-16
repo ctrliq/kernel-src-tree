@@ -592,6 +592,9 @@ static int __init rxperf_init(void)
 	ret = rxperf_open_socket();
 	if (ret < 0)
 		goto error_socket;
+#ifdef CONFIG_RHEL_DIFFERENCES
+	mark_partner_supported("rxperf", THIS_MODULE);
+#endif
 	return 0;
 
 error_socket:
