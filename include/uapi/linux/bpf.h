@@ -5709,6 +5709,11 @@ enum {
 	BPF_F_SEQ_NUMBER		= (1ULL << 3),
 };
 
+/* BPF_FUNC_skb_get_tunnel_key flags. */
+enum {
+	BPF_F_TUNINFO_FLAGS		= (1ULL << 4),
+};
+
 /* BPF_FUNC_perf_event_output, BPF_FUNC_perf_event_read and
  * BPF_FUNC_perf_event_read_value flags.
  */
@@ -5898,7 +5903,10 @@ struct bpf_tunnel_key {
 	};
 	__u8 tunnel_tos;
 	__u8 tunnel_ttl;
-	__u16 tunnel_ext;	/* Padding, future use. */
+	union {
+		__u16 tunnel_ext;	/* compat */
+		__be16 tunnel_flags;
+	};
 	__u32 tunnel_label;
 	union {
 		__u32 local_ipv4;
