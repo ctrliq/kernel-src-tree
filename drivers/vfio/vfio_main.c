@@ -1205,14 +1205,21 @@ err_unassign_container:
 	return ERR_PTR(ret);
 }
 
-static int vfio_group_get_device_fd(struct vfio_group *group, char *buf)
+static int vfio_group_ioctl_get_device_fd(struct vfio_group *group,
+					  char __user *arg)
 {
 	struct vfio_device *device;
 	struct file *filep;
+	char *buf;
 	int fdno;
 	int ret;
 
+	buf = strndup_user(arg, PAGE_SIZE);
+	if (IS_ERR(buf))
+		return PTR_ERR(buf);
+
 	device = vfio_device_get_from_name(group, buf);
+	kfree(buf);
 	if (IS_ERR(device))
 		return PTR_ERR(device);
 
@@ -1242,9 +1249,12 @@ static long vfio_group_fops_unl_ioctl(struct file *filep,
 				      unsigned int cmd, unsigned long arg)
 {
 	struct vfio_group *group = filep->private_data;
+	void __user *uarg = (void __user *)arg;
 	long ret = -ENOTTY;
 
 	switch (cmd) {
+	case VFIO_GROUP_GET_DEVICE_FD:
+		return vfio_group_ioctl_get_device_fd(group, uarg);
 	case VFIO_GROUP_GET_STATUS:
 	{
 		struct vfio_group_status status;
@@ -1294,18 +1304,6 @@ static long vfio_group_fops_unl_ioctl(struct file *filep,
 		ret = vfio_group_unset_container(group);
 		up_write(&group->group_rwsem);
 		break;
-	case VFIO_GROUP_GET_DEVICE_FD:
-	{
-		char *buf;
-
-		buf = strndup_user((const char __user *)arg, PAGE_SIZE);
-		if (IS_ERR(buf))
-			return PTR_ERR(buf);
-
-		ret = vfio_group_get_device_fd(group, buf);
-		kfree(buf);
-		break;
-	}
 	}
 
 	return ret;
