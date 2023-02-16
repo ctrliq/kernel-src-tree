@@ -781,6 +781,7 @@ static struct pci_driver otx2vf_driver = {
 static int __init otx2vf_init_module(void)
 {
 	pr_info("%s: %s\n", DRV_NAME, DRV_STRING);
+	mark_tech_preview("Marvell OcteonTX2 NIC Virtual Function driver", THIS_MODULE);
 
 	return pci_register_driver(&otx2vf_driver);
 }

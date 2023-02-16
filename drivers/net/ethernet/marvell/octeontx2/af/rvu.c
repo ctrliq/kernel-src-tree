@@ -3352,6 +3352,7 @@ static int __init rvu_init_module(void)
 	int err;
 
 	pr_info("%s: %s\n", DRV_NAME, DRV_STRING);
+	mark_tech_preview("Marvell OcteonTX2 RVU Admin Function driver", THIS_MODULE);
 
 	err = pci_register_driver(&cgx_driver);
 	if (err < 0)
