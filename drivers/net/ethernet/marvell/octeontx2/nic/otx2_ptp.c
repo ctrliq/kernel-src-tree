@@ -299,6 +299,7 @@ int otx2_ptp_init(struct otx2_nic *pfvf)
 error:
 	return err;
 }
+EXPORT_SYMBOL_GPL(otx2_ptp_init);
 
 void otx2_ptp_destroy(struct otx2_nic *pfvf)
 {
@@ -311,6 +312,7 @@ void otx2_ptp_destroy(struct otx2_nic *pfvf)
 	kfree(ptp);
 	pfvf->ptp = NULL;
 }
+EXPORT_SYMBOL_GPL(otx2_ptp_destroy);
 
 int otx2_ptp_clock_index(struct otx2_nic *pfvf)
 {
@@ -319,6 +321,7 @@ int otx2_ptp_clock_index(struct otx2_nic *pfvf)
 
 	return ptp_clock_index(pfvf->ptp->ptp_clock);
 }
+EXPORT_SYMBOL_GPL(otx2_ptp_clock_index);
 
 int otx2_ptp_tstamp2time(struct otx2_nic *pfvf, u64 tstamp, u64 *tsns)
 {
@@ -329,3 +332,8 @@ int otx2_ptp_tstamp2time(struct otx2_nic *pfvf, u64 tstamp, u64 *tsns)
 
 	return 0;
 }
+EXPORT_SYMBOL_GPL(otx2_ptp_tstamp2time);
+
+MODULE_AUTHOR("Sunil Goutham <sgoutham@marvell.com>");
+MODULE_DESCRIPTION("Marvell RVU NIC PTP Driver");
+MODULE_LICENSE("GPL v2");
