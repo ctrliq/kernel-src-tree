@@ -521,6 +521,7 @@ extern int generate_smb30signingkey(struct cifs_ses *ses,
 extern int generate_smb311signingkey(struct cifs_ses *ses,
 				     struct TCP_Server_Info *server);
 
+#ifdef CONFIG_CIFS_ALLOW_INSECURE_LEGACY
 extern int CIFSSMBCopy(unsigned int xid,
 			struct cifs_tcon *source_tcon,
 			const char *fromName,
@@ -551,6 +552,7 @@ extern int CIFSSMBSetPosixACL(const unsigned int xid, struct cifs_tcon *tcon,
 		const struct nls_table *nls_codepage, int remap_special_chars);
 extern int CIFSGetExtAttr(const unsigned int xid, struct cifs_tcon *tcon,
 			const int netfid, __u64 *pExtAttrBits, __u64 *pMask);
+#endif /* CIFS_ALLOW_INSECURE_LEGACY */
 extern void cifs_autodisable_serverino(struct cifs_sb_info *cifs_sb);
 extern bool couldbe_mf_symlink(const struct cifs_fattr *fattr);
 extern int check_mf_symlink(unsigned int xid, struct cifs_tcon *tcon,
@@ -599,7 +601,6 @@ enum securityEnum cifs_select_sectype(struct TCP_Server_Info *,
 struct cifs_aio_ctx *cifs_aio_ctx_alloc(void);
 void cifs_aio_ctx_release(struct kref *refcount);
 int setup_aio_ctx_iter(struct cifs_aio_ctx *ctx, struct iov_iter *iter, int rw);
-void smb2_cached_lease_break(struct work_struct *work);
 
 int cifs_alloc_hash(const char *name, struct crypto_shash **shash,
 		    struct sdesc **sdesc);
@@ -619,6 +620,15 @@ unsigned int
 cifs_ses_get_chan_index(struct cifs_ses *ses,
 			struct TCP_Server_Info *server);
 void
+cifs_chan_set_in_reconnect(struct cifs_ses *ses,
+			     struct TCP_Server_Info *server);
+void
+cifs_chan_clear_in_reconnect(struct cifs_ses *ses,
+			       struct TCP_Server_Info *server);
+bool
+cifs_chan_in_reconnect(struct cifs_ses *ses,
+			  struct TCP_Server_Info *server);
+void
 cifs_chan_set_need_reconnect(struct cifs_ses *ses,
 			     struct TCP_Server_Info *server);
 void
@@ -627,6 +637,11 @@ cifs_chan_clear_need_reconnect(struct cifs_ses *ses,
 bool
 cifs_chan_needs_reconnect(struct cifs_ses *ses,
 			  struct TCP_Server_Info *server);
+bool
+cifs_chan_is_iface_active(struct cifs_ses *ses,
+			  struct TCP_Server_Info *server);
+int
+cifs_chan_update_iface(struct cifs_ses *ses, struct TCP_Server_Info *server);
 
 void extract_unc_hostname(const char *unc, const char **h, size_t *len);
 int copy_path_name(char *dst, const char *src);
