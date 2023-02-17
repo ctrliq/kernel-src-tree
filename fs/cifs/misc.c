@@ -23,6 +23,7 @@
 #include "dns_resolve.h"
 #endif
 #include "fs_context.h"
+#include "cached_dir.h"
 
 extern mempool_t *cifs_sm_req_poolp;
 extern mempool_t *cifs_req_poolp;
@@ -69,12 +70,14 @@ sesInfoAlloc(void)
 	ret_buf = kzalloc(sizeof(struct cifs_ses), GFP_KERNEL);
 	if (ret_buf) {
 		atomic_inc(&sesInfoAllocCount);
+		spin_lock_init(&ret_buf->ses_lock);
 		ret_buf->ses_status = SES_NEW;
 		++ret_buf->ses_count;
 		INIT_LIST_HEAD(&ret_buf->smb_ses_list);
 		INIT_LIST_HEAD(&ret_buf->tcon_list);
 		mutex_init(&ret_buf->session_mutex);
 		spin_lock_init(&ret_buf->iface_lock);
+		INIT_LIST_HEAD(&ret_buf->iface_list);
 		spin_lock_init(&ret_buf->chan_lock);
 	}
 	return ret_buf;
@@ -83,6 +86,8 @@ sesInfoAlloc(void)
 void
 sesInfoFree(struct cifs_ses *buf_to_free)
 {
+	struct cifs_server_iface *iface = NULL, *niface = NULL;
+
 	if (buf_to_free == NULL) {
 		cifs_dbg(FYI, "Null buffer passed to sesInfoFree\n");
 		return;
@@ -96,7 +101,11 @@ sesInfoFree(struct cifs_ses *buf_to_free)
 	kfree(buf_to_free->user_name);
 	kfree(buf_to_free->domainName);
 	kfree_sensitive(buf_to_free->auth_key.response);
-	kfree(buf_to_free->iface_list);
+	spin_lock(&buf_to_free->iface_lock);
+	list_for_each_entry_safe(iface, niface, &buf_to_free->iface_list,
+				 iface_head)
+		kref_put(&iface->refcount, release_iface);
+	spin_unlock(&buf_to_free->iface_lock);
 	kfree_sensitive(buf_to_free);
 }
 
@@ -108,8 +117,8 @@ tconInfoAlloc(void)
 	ret_buf = kzalloc(sizeof(*ret_buf), GFP_KERNEL);
 	if (!ret_buf)
 		return NULL;
-	ret_buf->crfid.fid = kzalloc(sizeof(*ret_buf->crfid.fid), GFP_KERNEL);
-	if (!ret_buf->crfid.fid) {
+	ret_buf->cfids = init_cached_dirs();
+	if (!ret_buf->cfids) {
 		kfree(ret_buf);
 		return NULL;
 	}
@@ -117,10 +126,10 @@ tconInfoAlloc(void)
 	atomic_inc(&tconInfoAllocCount);
 	ret_buf->status = TID_NEW;
 	++ret_buf->tc_count;
+	spin_lock_init(&ret_buf->tc_lock);
 	INIT_LIST_HEAD(&ret_buf->openFileList);
 	INIT_LIST_HEAD(&ret_buf->tcon_list);
 	spin_lock_init(&ret_buf->open_file_lock);
-	mutex_init(&ret_buf->crfid.fid_mutex);
 	spin_lock_init(&ret_buf->stat_lock);
 	atomic_set(&ret_buf->num_local_opens, 0);
 	atomic_set(&ret_buf->num_remote_opens, 0);
@@ -129,17 +138,17 @@ tconInfoAlloc(void)
 }
 
 void
-tconInfoFree(struct cifs_tcon *buf_to_free)
+tconInfoFree(struct cifs_tcon *tcon)
 {
-	if (buf_to_free == NULL) {
+	if (tcon == NULL) {
 		cifs_dbg(FYI, "Null buffer passed to tconInfoFree\n");
 		return;
 	}
+	free_cached_dirs(tcon->cfids);
 	atomic_dec(&tconInfoAllocCount);
-	kfree(buf_to_free->nativeFileSystem);
-	kfree_sensitive(buf_to_free->password);
-	kfree(buf_to_free->crfid.fid);
-	kfree(buf_to_free);
+	kfree(tcon->nativeFileSystem);
+	kfree_sensitive(tcon->password);
+	kfree(tcon);
 }
 
 struct smb_hdr *
