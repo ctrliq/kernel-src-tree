@@ -122,7 +122,7 @@ static void wait_for_xmit_ready(struct uart_port *port)
 	}
 }
 
-static void lpc32xx_hsuart_console_putchar(struct uart_port *port, int ch)
+static void lpc32xx_hsuart_console_putchar(struct uart_port *port, unsigned char ch)
 {
 	wait_for_xmit_ready(port);
 	writel((u32)ch, LPC32XX_HSUART_FIFO(port->membase));
@@ -495,7 +495,7 @@ static void serial_lpc32xx_shutdown(struct uart_port *port)
 /* port->lock is not held.  */
 static void serial_lpc32xx_set_termios(struct uart_port *port,
 				       struct ktermios *termios,
-				       struct ktermios *old)
+				       const struct ktermios *old)
 {
 	unsigned long flags;
 	unsigned int baud, quot;
