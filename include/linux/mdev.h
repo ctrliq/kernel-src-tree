@@ -71,8 +71,6 @@ static inline struct device *mdev_get_iommu_device(struct mdev_device *mdev)
 	return mdev->iommu_device;
 }
 
-struct device *mtype_get_parent_dev(struct mdev_type *mtype);
-
 /* interface for exporting mdev supported type attributes */
 struct mdev_type_attribute {
 	struct attribute attr;
