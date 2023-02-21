@@ -55,7 +55,7 @@ void cifs_dump_mids(struct TCP_Server_Info *server)
 		return;
 
 	cifs_dbg(VFS, "Dump pending requests:\n");
-	spin_lock(&GlobalMid_Lock);
+	spin_lock(&server->mid_lock);
 	list_for_each_entry(mid_entry, &server->pending_mid_q, qhead) {
 		cifs_dbg(VFS, "State: %d Cmd: %d Pid: %d Cbdata: %p Mid %llu\n",
 			 mid_entry->mid_state,
@@ -78,7 +78,7 @@ void cifs_dump_mids(struct TCP_Server_Info *server)
 				mid_entry->resp_buf, 62);
 		}
 	}
-	spin_unlock(&GlobalMid_Lock);
+	spin_unlock(&server->mid_lock);
 #endif /* CONFIG_CIFS_DEBUG2 */
 }
 
@@ -161,6 +161,8 @@ cifs_dump_iface(struct seq_file *m, struct cifs_server_iface *iface)
 		seq_printf(m, "\t\tIPv4: %pI4\n", &ipv4->sin_addr);
 	else if (iface->sockaddr.ss_family == AF_INET6)
 		seq_printf(m, "\t\tIPv6: %pI6\n", &ipv6->sin6_addr);
+	if (!iface->is_active)
+		seq_puts(m, "\t\t[for-cleanup]\n");
 }
 
 static int cifs_debug_files_proc_show(struct seq_file *m, void *v)
@@ -214,6 +216,7 @@ static int cifs_debug_data_proc_show(struct seq_file *m, void *v)
 	struct TCP_Server_Info *server;
 	struct cifs_ses *ses;
 	struct cifs_tcon *tcon;
+	struct cifs_server_iface *iface;
 	int c, i, j;
 
 	seq_puts(m,
@@ -410,6 +413,8 @@ skip_rdma:
 			spin_lock(&ses->chan_lock);
 			if (CIFS_CHAN_NEEDS_RECONNECT(ses, 0))
 				seq_puts(m, "\tPrimary channel: DISCONNECTED ");
+			if (CIFS_CHAN_IN_RECONNECT(ses, 0))
+				seq_puts(m, "\t[RECONNECTING] ");
 
 			if (ses->chan_count > 1) {
 				seq_printf(m, "\n\n\tExtra Channels: %zu ",
@@ -418,6 +423,8 @@ skip_rdma:
 					cifs_dump_channel(m, j, &ses->chans[j]);
 					if (CIFS_CHAN_NEEDS_RECONNECT(ses, j))
 						seq_puts(m, "\tDISCONNECTED ");
+					if (CIFS_CHAN_IN_RECONNECT(ses, j))
+						seq_puts(m, "\t[RECONNECTING] ");
 				}
 			}
 			spin_unlock(&ses->chan_lock);
@@ -441,11 +448,10 @@ skip_rdma:
 			if (ses->iface_count)
 				seq_printf(m, "\n\n\tServer interfaces: %zu",
 					   ses->iface_count);
-			for (j = 0; j < ses->iface_count; j++) {
-				struct cifs_server_iface *iface;
-
-				iface = &ses->iface_list[j];
-				seq_printf(m, "\n\t%d)", j+1);
+			j = 0;
+			list_for_each_entry(iface, &ses->iface_list,
+						 iface_head) {
+				seq_printf(m, "\n\t%d)", ++j);
 				cifs_dump_iface(m, iface);
 				if (is_ses_using_iface(ses, iface))
 					seq_puts(m, "\t\t[CONNECTED]\n");
@@ -456,7 +462,7 @@ skip_rdma:
 			seq_printf(m, "\n\t\t[NONE]");
 
 		seq_puts(m, "\n\n\tMIDs: ");
-		spin_lock(&GlobalMid_Lock);
+		spin_lock(&server->mid_lock);
 		list_for_each_entry(mid_entry, &server->pending_mid_q, qhead) {
 			seq_printf(m, "\n\tState: %d com: %d pid:"
 					" %d cbdata: %p mid %llu\n",
@@ -466,7 +472,7 @@ skip_rdma:
 					mid_entry->callback_data,
 					mid_entry->mid);
 		}
-		spin_unlock(&GlobalMid_Lock);
+		spin_unlock(&server->mid_lock);
 		seq_printf(m, "\n--\n");
 	}
 	if (c == 0)
