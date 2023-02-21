@@ -77,7 +77,6 @@ struct vfio_group {
 	struct list_head		vfio_next;
 	struct list_head		container_next;
 	enum vfio_group_type		type;
-	unsigned int			dev_counter;
 	struct rw_semaphore		group_rwsem;
 	struct kvm			*kvm;
 	struct file			*opened_file;
@@ -624,7 +623,6 @@ static int __vfio_register_dev(struct vfio_device *device,
 
 	mutex_lock(&group->device_lock);
 	list_add(&device->group_next, &group->device_list);
-	group->dev_counter++;
 	mutex_unlock(&group->device_lock);
 
 	return 0;
@@ -712,7 +710,6 @@ void vfio_unregister_group_dev(struct vfio_device *device)
 
 	mutex_lock(&group->device_lock);
 	list_del(&device->group_next);
-	group->dev_counter--;
 	mutex_unlock(&group->device_lock);
 
 	if (group->type == VFIO_NO_IOMMU || group->type == VFIO_EMULATED_IOMMU)
@@ -2291,6 +2288,9 @@ EXPORT_SYMBOL(vfio_set_irqs_validate_and_prepare);
  * @prot [in]    : protection flags
  * @pages[out]   : array of host pages
  * Return error or number of pages pinned.
+ *
+ * A driver may only call this function if the vfio_device was created
+ * by vfio_register_emulated_iommu_dev().
  */
 int vfio_pin_pages(struct vfio_device *device, dma_addr_t iova,
 		   int npage, int prot, struct page **pages)
@@ -2305,9 +2305,6 @@ int vfio_pin_pages(struct vfio_device *device, dma_addr_t iova,
 
 	if (npage > VFIO_PIN_PAGES_MAX_ENTRIES)
 		return -E2BIG;
-
-	if (group->dev_counter > 1)
-		return -EINVAL;
 
 	/* group->container cannot change while a vfio device is open */
 	container = group->container;
