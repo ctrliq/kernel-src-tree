@@ -1733,7 +1733,7 @@ bool vfio_file_enforced_coherent(struct file *file)
 	struct vfio_group *group = file->private_data;
 	bool ret;
 
-	if (file->f_op != &vfio_group_fops)
+	if (!vfio_file_is_group(file))
 		return true;
 
 	mutex_lock(&group->group_lock);
@@ -1765,7 +1765,7 @@ void vfio_file_set_kvm(struct file *file, struct kvm *kvm)
 {
 	struct vfio_group *group = file->private_data;
 
-	if (file->f_op != &vfio_group_fops)
+	if (!vfio_file_is_group(file))
 		return;
 
 	mutex_lock(&group->group_lock);
@@ -1785,7 +1785,7 @@ bool vfio_file_has_dev(struct file *file, struct vfio_device *device)
 {
 	struct vfio_group *group = file->private_data;
 
-	if (file->f_op != &vfio_group_fops)
+	if (!vfio_file_is_group(file))
 		return false;
 
 	return group == device->group;
