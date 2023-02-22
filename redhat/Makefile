@@ -281,6 +281,12 @@ KABI_TARBALL:=$(SOURCES)/kernel-abi-stablelists-$(SPECKABIVERSION).tar.bz2
 KABIDW := $(REDHAT)/kabi-dwarf
 KABIDW_TARBALL:=$(SOURCES)/kernel-kabi-dw-$(SPECKABIVERSION).tar.bz2
 
+# Taken from tools/lib/bpf/Makefile
+SPECBPFTOOLVERSION:=$(shell \
+	grep -oE '^LIBBPF_([0-9.]+)' $(TOPDIR)/tools/lib/bpf/libbpf.map | \
+	sort -rV | head -n1 | cut -d'_' -f2 | \
+	awk -F. -v OFS=. '{$$1 += 6 ; print}')
+
 # load Makefile variable settings from user-specified configuration file,
 # ~/.rhpkg.mk or $TOPDIR/.rhpkg.mk
 ifeq ("$(RHDISTGIT_CACHE)", "")
