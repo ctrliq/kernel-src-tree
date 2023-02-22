@@ -6391,6 +6391,7 @@ struct bpf_sock_ops {
 				 * the outgoing header has not
 				 * been written yet.
 				 */
+	__u64 skb_hwtstamp;
 };
 
 /* Definitions for bpf_sock_ops_cb_flags */
