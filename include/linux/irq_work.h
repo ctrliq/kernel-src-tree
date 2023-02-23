@@ -5,8 +5,6 @@
 #include <linux/smp_types.h>
 #include <linux/rcuwait.h>
 
-#include <linux/rh_kabi.h>
-
 /*
  * An entry can be in one of four states:
  *
@@ -20,10 +18,6 @@ struct irq_work {
 	struct __call_single_node node;
 	void (*func)(struct irq_work *);
 	struct rcuwait irqwait;
-	RH_KABI_RESERVE(1)
-	RH_KABI_RESERVE(2)
-	RH_KABI_RESERVE(3)
-	RH_KABI_RESERVE(4)
 };
 
 #define __IRQ_WORK_INIT(_func, _flags) (struct irq_work){	\
