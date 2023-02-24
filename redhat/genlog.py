@@ -80,13 +80,13 @@ def parse_commit(commit):
         # Process Jira issues
         jira_set.update(find_ji_in_line(line, 'JIRA'))
 
-    return (log_entry, sorted(cve_set), sorted(bug_set), sorted(zbug_set), sorted(jira_set))
+    return (log_entry, cve_set, bug_set, zbug_set, jira_set)
 
 
 if __name__ == "__main__":
-    all_bzs = []
-    all_zbzs = []
-    all_jiras = []
+    all_bzs = set()
+    all_zbzs = set()
+    all_jiras = set()
     commits = sys.stdin.read().split('\0')
     for c in commits:
         if not c:
@@ -96,32 +96,29 @@ if __name__ == "__main__":
         if bugs or zbugs or jiras:
             entry += " ["
             if zbugs:
-                entry += " ".join(zbugs)
-                all_zbzs.extend(zbugs)
+                entry += " ".join(sorted(zbugs))
+                all_zbzs.update(zbugs)
             if bugs:
                 entry += " " if zbugs else ""
-                entry += " ".join(bugs)
-                all_bzs.extend(bugs)
+                entry += " ".join(sorted(bugs))
+                all_bzs.update(bugs)
             if jiras:
                 entry += " " if bugs or zbugs else ""
-                entry += " ".join(jiras)
-                all_jiras.extend(jiras)
+                entry += " ".join(sorted(jiras))
+                all_jiras.update(jiras)
             entry += "]"
         if cves:
-            entry += " {" + " ".join(cves) + "}"
+            entry += " {" + " ".join(sorted(cves)) + "}"
         print(entry)
 
-    resolved_bzs = []
-    for bzid in (all_zbzs if all_zbzs else all_bzs):
-        if not bzid in resolved_bzs:
-            resolved_bzs.append(bzid)
+    resolved_bzs = all_zbzs if all_zbzs else all_bzs
     print("Resolves: ", end="")
-    for i, bzid in enumerate(resolved_bzs):
+    for i, bzid in enumerate(sorted(resolved_bzs)):
         if i:
             print(", ", end="")
         print(f"rhbz#{bzid}", end="")
-    for j, jid in enumerate(all_jiras):
-        if j or len(resolved_bzs) > 0:
+    for j, jid in enumerate(sorted(all_jiras)):
+        if j or resolved_bzs:
            print(", ", end="")
         print(f"{jid}", end="")
     print("\n")
