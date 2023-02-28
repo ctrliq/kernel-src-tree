@@ -115,10 +115,6 @@ for f in "$config_bundles_dir"/*; do
 		# remove the pending option
 		rm redhat/configs/pending-rhel/generic/"$line"
 	done < "$f"
-	if [ -n "$RHMAINTAINERS" ] && [ -f ./scripts/get_maintainer.pl ] && [ -f "$RHMAINTAINERS" ]; then
-		echo "" >> "$tmpdir"/commit
-		./scripts/get_maintainer.pl --no-rolestats --mpath "$RHMAINTAINERS" --no-git --no-git-fallback -f "$_f"  | sed "s/^/Cc: /" >> "$tmpdir"/commit
-	fi
 	# We do a separate branch per config commit
 	if ! git checkout -b "configs/$(date +%F)/$_f"; then
 		printf "Unable to check out configs/%s/%s branch!\n" "$(date +%F)" "$_f"
