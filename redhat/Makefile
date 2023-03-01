@@ -65,6 +65,16 @@ SPECCHANGELOG:=$(PACKAGE_NAME).changelog-$(RHEL_MAJOR).$(RHEL_MINOR)
 CHANGELOG_PREV:=$(PACKAGE_NAME).changelog-$(RHEL_MAJOR).$(shell expr $(RHEL_MINOR) - 1)
 ARCH_LIST=aarch64 ppc64le s390x x86_64
 
+# save some user selectable values to know later if we can override them
+DISTRO_USERDEF:=$(DISTRO)
+DIST_USERDEF:=$(DIST)
+BUILD_PROFILE_USERDEF:=$(BUILD_PROFILE)
+BUILD_TARGET_USERDEF:=$(BUILD_TARGET)
+
+ifndef DIST
+  DIST := $(shell $(RPMBUILD) --eval '%{?dist}')
+endif
+
 ifndef DISTRO
   ifneq ($(findstring .fc,$(DIST)),)
     DISTRO := fedora
@@ -259,7 +269,7 @@ else
       BUILD_TARGET:=rhel-$(RHEL_MAJOR)-newest-test-pesign
     endif
   endif
-  ifeq ("$(DIST)", ".eln)
+  ifeq ("$(DIST)", ".eln")
     DISTRELEASETAG:=$(RELEASETAG)
     DISTBASEVERSION:=$(BASEVERSION)
     SPECTARFILE_RELEASE:=$(BASEVERSION)
@@ -759,14 +769,21 @@ dist-vr-check:
 		exit 1; \
 	fi
 
-dist-brew: DIST=.el9
-dist-brew: DISTRO=rhel
-dist-brew dist-koji: dist-%: dist-vr-check dist-srpm
+# Call as sub-make to select different default DISTRO and DIST for dist-brew.
+# This is because target-specific variables only apply inside the recipe, but we
+# need to recalculate some values such as BUILD_TARGET that depends on them.
+# However, do not override any value directly defined by the user.
+dist-brew distg-brew: DISTRO=$(if $(DISTRO_USERDEF),$(DISTRO_USERDEF),rhel)
+dist-brew distg-brew: DIST=$(if $(DIST_USERDEF),$(DIST_USERDEF),.el$(RHEL_MAJOR))
+dist-brew distg-brew: BUILD_PROFILE=$(if $(BUILD_PROFILE_USERDEF),$(BUILD_PROFILE_USERDEF))
+dist-brew distg-brew: BUILD_TARGET=$(if $(BUILD_TARGET_USERDEF),$(BUILD_TARGET_USERDEF))
+dist-brew distg-brew dist-koji distg_koji:
+	$(MAKE) _$@
+
+_dist-brew _dist-koji: _dist-%: dist-vr-check dist-srpm
 	$* $(BUILD_PROFILE) build $(BUILD_FLAGS) --scratch $(BUILD_TARGET) $(SRPMS)/$(RELEASETAG)$(DIST).src.rpm $(OUTPUT_FILE)
 
-distg-brew: DIST=.el9
-distg-brew: DISTRO=rhel
-distg-brew distg-koji: distg-%: dist-vr-check
+_distg-brew _distg-koji: _distg-%: dist-vr-check
 	$* $(BUILD_PROFILE) build $(BUILD_FLAGS) --scratch $(BUILD_TARGET) "$(RHGITURL)?redhat/koji#$(RHGITCOMMIT)"
 
 .PHONY: $(REDHAT)/rpm/SOURCES/$(SPECFILE)
