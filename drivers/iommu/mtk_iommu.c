@@ -469,7 +469,7 @@ static int mtk_iommu_attach_device(struct iommu_domain *domain,
 
 	if (!dom->data) {
 		if (mtk_iommu_domain_finalise(dom, data, domid))
-			return -ENODEV;
+			return ret;
 		dom->data = data;
 	}
 
