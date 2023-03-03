@@ -22,6 +22,18 @@ $(if $(filter __%, $(MAKECMDGOALS)), \
 PHONY := __all
 __all:
 
+# Set RHEL variables
+# Note that this ifdef'ery is required to handle when building with
+# the O= mechanism (relocate the object file results) due to upstream
+# commit 67d7c302 which broke our RHEL include file
+ifneq ($(realpath source),)
+include $(realpath source)/Makefile.rhelver
+else
+ifneq ($(realpath Makefile.rhelver),)
+include Makefile.rhelver
+endif
+endif
+
 # We are using a recursive build, so we need to do a little thinking
 # to get the ordering right.
 #
@@ -188,9 +200,6 @@ $(shell mkdir -p "$(KBUILD_OUTPUT)")
 abs_objtree := $(realpath $(KBUILD_OUTPUT))
 $(if $(abs_objtree),,$(error failed to create output directory "$(KBUILD_OUTPUT)"))
 endif # ifneq ($(KBUILD_OUTPUT),)
-
-# Set RHEL variables
-include $(abs_srctree)/Makefile.rhelver
 
 ifneq ($(words $(subst :, ,$(abs_srctree))), 1)
 $(error source directory cannot contain spaces or colons)
