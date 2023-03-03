@@ -1348,6 +1348,10 @@ static int __init vfio_init(void)
 	if (ret)
 		return ret;
 
+	ret = vfio_virqfd_init();
+	if (ret)
+		goto err_virqfd;
+
 	/* /sys/class/vfio-dev/vfioX */
 	vfio.device_class = class_create(THIS_MODULE, "vfio-dev");
 	if (IS_ERR(vfio.device_class)) {
@@ -1359,6 +1363,8 @@ static int __init vfio_init(void)
 	return 0;
 
 err_dev_class:
+	vfio_virqfd_exit();
+err_virqfd:
 	vfio_group_cleanup();
 	return ret;
 }
@@ -1368,6 +1374,7 @@ static void __exit vfio_cleanup(void)
 	ida_destroy(&vfio.device_ida);
 	class_destroy(vfio.device_class);
 	vfio.device_class = NULL;
+	vfio_virqfd_exit();
 	vfio_group_cleanup();
 	xa_destroy(&vfio_device_set_xa);
 }
