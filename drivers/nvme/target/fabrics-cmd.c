@@ -333,7 +333,6 @@ static void nvmet_execute_io_connect(struct nvmet_req *req)
 	req->cqe->result.u16 = cpu_to_le16(ctrl->cntlid);
 
 	pr_debug("adding queue %d to ctrl %d.\n", qid, ctrl->cntlid);
-	req->cqe->result.u16 = cpu_to_le16(ctrl->cntlid);
 	if (nvmet_has_auth(ctrl))
 		req->cqe->result.u32 |=
 			cpu_to_le32((u32)NVME_CONNECT_AUTHREQ_ATR << 16);
