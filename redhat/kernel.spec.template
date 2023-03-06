@@ -726,11 +726,7 @@ BuildRequires: dracut
 BuildRequires: binutils
 # For the initrd
 BuildRequires: lvm2
-%if 0%{?fedora} > 37
-# The UKI code was introduced in Fedora 38 and is not needed by
-# earlier versions.  This wrapper can be removed in Fedora 41.
 BuildRequires: systemd-boot-unsigned
-%endif
 # For systemd-stub and systemd-pcrphase
 BuildRequires: systemd-udev >= 252-1
 # For TPM operations in UKI initramfs
