@@ -22,7 +22,6 @@ struct genl_info;
 
 /**
  * struct genl_family - generic netlink family
- * @id: protocol family identifier (private)
  * @hdrsize: length of user specific header in bytes
  * @name: name of family
  * @version: protocol version
@@ -42,8 +41,6 @@ struct genl_info;
  * @resv_start_op: first operation for which reserved fields of the header
  *	can be validated and policies are required (see below);
  *	new families should leave this field at zero
- * @mcgrp_offset: starting number of multicast group IDs in this family
- *	(private)
  * @ops: the operations supported by this family
  * @n_ops: number of operations supported by this family
  * @small_ops: the small-struct operations supported by this family
@@ -57,12 +54,10 @@ struct genl_info;
  * if policy is not provided core will reject all TLV attributes.
  */
 struct genl_family {
-	int			id;		/* private */
 	unsigned int		hdrsize;
 	char			name[GENL_NAMSIZ];
 	unsigned int		version;
 	unsigned int		maxattr;
-	unsigned int		mcgrp_offset;	/* private */
 	u8			netnsok:1;
 	u8			parallel_ops:1;
 	u8			n_ops;
@@ -80,6 +75,12 @@ struct genl_family {
 	const struct genl_small_ops *small_ops;
 	const struct genl_multicast_group *mcgrps;
 	struct module		*module;
+
+/* private: internal use only */
+	/* protocol family identifier */
+	int			id;
+	/* starting number of multicast group IDs in this family */
+	unsigned int		mcgrp_offset;
 };
 
 /**
