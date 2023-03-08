@@ -1,3 +1,9 @@
+**Attention**
+
+Are you looking to read the RHEL kernel documentation? Be sure to view
+the rendered version [here](https://redhat.gitlab.io/centos-stream/src/kernel/documentation/) instead of the gitlab markdown version to avoid
+broken links!
+
 All changes to this file and directories included at this level must be made
 to the [Red Hat kernel documentation project](https://gitlab.com/redhat/centos-stream/src/kernel/documentation)
 Please see the 'Making Changes' section below for detailed information on
