@@ -472,10 +472,10 @@ static __always_inline void slab_unlock(struct slab *slab)
 
 /*
  * Interrupts must be disabled (for the fallback code to work right), typically
- * by an _irqsave() lock variant. Except on PREEMPT_RT where these variants do
- * not actually disable interrupts. On the other hand the migrate_disable()
- * done by bit_spin_lock() is sufficient on PREEMPT_RT thanks to its threaded
- * interrupts.
+ * by an _irqsave() lock variant. On PREEMPT_RT the preempt_disable(), which is
+ * part of bit_spin_lock(), is sufficient because the policy is not to allow any
+ * allocation/ free operation in hardirq context. Therefore nothing can
+ * interrupt the operation.
  */
 static inline bool __cmpxchg_double_slab(struct kmem_cache *s, struct slab *slab,
 		void *freelist_old, unsigned long counters_old,
@@ -2839,20 +2839,24 @@ out:
 		set_freepointer(s, tail, prior);
 		slab->freelist = head;
 
-		/* Do we need to remove the slab from full or partial list? */
+		/*
+		 * If the slab is empty, and node's partial list is full,
+		 * it should be discarded anyway no matter it's on full or
+		 * partial list.
+		 */
+		if (slab->inuse == 0 && n->nr_partial >= s->min_partial)
+			slab_free = slab;
+
 		if (!prior) {
+			/* was on full list */
 			remove_full(s, n, slab);
-		} else if (slab->inuse == 0) {
+			if (!slab_free) {
+				add_partial(n, slab, DEACTIVATE_TO_TAIL);
+				stat(s, FREE_ADD_PARTIAL);
+			}
+		} else if (slab_free) {
 			remove_partial(n, slab);
 			stat(s, FREE_REMOVE_PARTIAL);
-		}
-
-		/* Do we need to discard the slab or add to partial list? */
-		if (slab->inuse == 0) {
-			slab_free = slab;
-		} else if (!prior) {
-			add_partial(n, slab, DEACTIVATE_TO_TAIL);
-			stat(s, FREE_ADD_PARTIAL);
 		}
 	}
 

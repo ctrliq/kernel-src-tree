@@ -712,9 +712,9 @@ EXPORT_SYMBOL_GPL(generic_handle_domain_irq);
  *
  * Returns:	0 on success, a negative value on error.
  *
- * This function can be called from any context (IRQ or process context). It
- * will report an error if not invoked from IRQ context and the irq has been
- * marked to enforce IRQ-context only.
+ * This function can be called from any context (IRQ or process
+ * context). If the interrupt is marked as 'enforce IRQ-context only' then
+ * the function must be invoked from hard interrupt context.
  */
 int generic_handle_domain_irq_safe(struct irq_domain *domain, unsigned int hwirq)
 {
