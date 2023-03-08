@@ -455,7 +455,7 @@ out_free:
                              Notification Handling
    -------------------------------------------------------------------------- */
 
-/**
+/*
  * acpi_bus_notify
  * ---------------
  * Callback for all 'system-level' device notifications (values 0x00-0x7F).
