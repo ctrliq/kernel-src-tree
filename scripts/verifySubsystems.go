@@ -6,6 +6,7 @@ import (
 	"log"
 	"os"
 	"strings"
+	"regexp"
 
 	"gopkg.in/yaml.v2"
 )
@@ -98,7 +99,11 @@ func main() {
 	//
 	// General data verification
 	//
-
+	r := regexp.MustCompile(`[-.\*]`)
+	validIncludeFiles := []string {"makefile",
+				       "Makefile",
+				       "Kconfig",
+				      }
 	for _, s := range subSystems.SubSys {
 		// check that devel-sst is set
 		if s.DevelSst == nil {
@@ -137,7 +142,28 @@ func main() {
 					log.Fatalf("error: '%s' reviewer fields (name, email, and gluser) cannot be empty", s.Subsystem)
 				}
 			}
+		}
 
+		// check for '/' at the end of directories
+		for _, include := range s.Paths.Includes {
+			parts := strings.SplitAfter(include, "/")
+			// This implies the last char before the newline was
+			// a '/'.  This is good, we can skip.
+			if parts[len(parts)-1] == "" {
+				continue
+			}
+			if parts[0] == "Documentation/" {
+				continue
+			}
+			file := parts[len(parts)-1]
+			matches := r.FindAllString(file, -1)
+			if matches != nil {
+				continue
+			}
+			if contains(validIncludeFiles, file) {
+				continue
+			}
+			log.Fatalf("error: '%s:%s' is a bad includes entry (missing directory '/'?)", s.Subsystem, include)
 		}
 	}
 
