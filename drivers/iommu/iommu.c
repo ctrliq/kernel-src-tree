@@ -9,7 +9,6 @@
 #include <linux/amba/bus.h>
 #include <linux/device.h>
 #include <linux/dmi.h>
-#include <linux/dma-iommu.h>
 #include <linux/kernel.h>
 #include <linux/bits.h>
 #include <linux/bug.h>
@@ -34,6 +33,8 @@
 #include <linux/sched/mm.h>
 
 #include "iommu-sva.h"
+
+#include "dma-iommu.h"
 
 static struct kset *iommu_group_kset;
 static DEFINE_IDA(iommu_group_ida);

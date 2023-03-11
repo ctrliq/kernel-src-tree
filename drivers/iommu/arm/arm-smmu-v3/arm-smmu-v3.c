@@ -14,7 +14,6 @@
 #include <linux/bitops.h>
 #include <linux/crash_dump.h>
 #include <linux/delay.h>
-#include <linux/dma-iommu.h>
 #include <linux/err.h>
 #include <linux/interrupt.h>
 #include <linux/io-pgtable.h>
@@ -30,6 +29,7 @@
 
 #include "arm-smmu-v3.h"
 #include "../../iommu-sva.h"
+#include "../../dma-iommu.h"
 
 static bool disable_bypass = true;
 module_param(disable_bypass, bool, 0444);
