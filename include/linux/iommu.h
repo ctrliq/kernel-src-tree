@@ -233,7 +233,7 @@ struct iommu_iotlb_gather {
  * @of_xlate: add OF master IDs to iommu grouping
  * @is_attach_deferred: Check if domain attach should be deferred from iommu
  *                      driver init to device driver init (default no)
- * @dev_has/enable/disable_feat: per device entries to check/enable/disable
+ * @dev_enable/disable_feat: per device entries to enable/disable
  *                               iommu specific features.
  * @page_response: handle page request response
  * @def_domain_type: device default domain type, return value:
