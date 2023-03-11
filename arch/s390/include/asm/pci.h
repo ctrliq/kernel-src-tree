@@ -120,6 +120,7 @@ struct zpci_dev {
 	struct list_head bus_next;
 	struct list_head iommu_list;
 	struct kref kref;
+	struct rcu_head rcu;
 	struct hotplug_slot hotplug_slot;
 
 	enum zpci_state state;
