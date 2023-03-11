@@ -38,7 +38,6 @@
 #include <linux/workqueue.h>
 #include <linux/mdev.h>
 #include <linux/notifier.h>
-#include <linux/dma-iommu.h>
 #include <linux/irqdomain.h>
 #include "vfio.h"
 
