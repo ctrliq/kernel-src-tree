@@ -426,11 +426,12 @@ static const struct drm_i915_gem_object_ops i915_gem_userptr_ops = {
 static int
 probe_range(struct mm_struct *mm, unsigned long addr, unsigned long len)
 {
-	VMA_ITERATOR(vmi, mm, addr);
+	const unsigned long end = addr + len;
 	struct vm_area_struct *vma;
+	int ret = -EFAULT;
 
 	mmap_read_lock(mm);
-	for_each_vma_range(vmi, vma, addr + len) {
+	for (vma = find_vma(mm, addr); vma; vma = vma->vm_next) {
 		/* Check for holes, note that we also update the addr below */
 		if (vma->vm_start > addr)
 			break;
@@ -438,13 +439,16 @@ probe_range(struct mm_struct *mm, unsigned long addr, unsigned long len)
 		if (vma->vm_flags & (VM_PFNMAP | VM_MIXEDMAP))
 			break;
 
+		if (vma->vm_end >= end) {
+			ret = 0;
+			break;
+		}
+
 		addr = vma->vm_end;
 	}
 	mmap_read_unlock(mm);
 
-	if (vma)
-		return -EFAULT;
-	return 0;
+	return ret;
 }
 
 /*
