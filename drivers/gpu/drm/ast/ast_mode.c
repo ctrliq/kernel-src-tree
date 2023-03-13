@@ -636,11 +636,10 @@ static void ast_handle_damage(struct ast_plane *ast_plane, struct iosys_map *src
 			      struct drm_framebuffer *fb,
 			      const struct drm_rect *clip)
 {
-	void __iomem *dst = ast_plane->vaddr;
-	void *vaddr = src[0].vaddr;
+	struct iosys_map dst = IOSYS_MAP_INIT_VADDR(ast_plane->vaddr);
 
-	dst += drm_fb_clip_offset(fb->pitches[0], fb->format, clip);
-	drm_fb_memcpy_toio(dst, fb->pitches[0], vaddr, fb, clip);
+	iosys_map_incr(&dst, drm_fb_clip_offset(fb->pitches[0], fb->format, clip));
+	drm_fb_memcpy(&dst, fb->pitches, src, fb, clip);
 }
 
 static void ast_primary_plane_helper_atomic_update(struct drm_plane *plane,
