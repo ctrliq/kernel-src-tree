@@ -964,8 +964,8 @@ static int genpd_runtime_suspend(struct device *dev)
 		return 0;
 
 	genpd_lock(genpd);
-	gpd_data->rpm_pstate = genpd_drop_performance_state(dev);
 	genpd_power_off(genpd, true, 0);
+	gpd_data->rpm_pstate = genpd_drop_performance_state(dev);
 	genpd_unlock(genpd);
 
 	return 0;
@@ -1003,9 +1003,8 @@ static int genpd_runtime_resume(struct device *dev)
 		goto out;
 
 	genpd_lock(genpd);
+	genpd_restore_performance_state(dev, gpd_data->rpm_pstate);
 	ret = genpd_power_on(genpd, 0);
-	if (!ret)
-		genpd_restore_performance_state(dev, gpd_data->rpm_pstate);
 	genpd_unlock(genpd);
 
 	if (ret)
@@ -1043,8 +1042,8 @@ err_stop:
 err_poweroff:
 	if (!pm_runtime_is_irq_safe(dev) || genpd_is_irq_safe(genpd)) {
 		genpd_lock(genpd);
-		gpd_data->rpm_pstate = genpd_drop_performance_state(dev);
 		genpd_power_off(genpd, true, 0);
+		gpd_data->rpm_pstate = genpd_drop_performance_state(dev);
 		genpd_unlock(genpd);
 	}
 
@@ -2733,17 +2732,6 @@ static int __genpd_dev_pm_attach(struct device *dev, struct device *base_dev,
 	dev->pm_domain->detach = genpd_dev_pm_detach;
 	dev->pm_domain->sync = genpd_dev_pm_sync;
 
-	if (power_on) {
-		genpd_lock(pd);
-		ret = genpd_power_on(pd, 0);
-		genpd_unlock(pd);
-	}
-
-	if (ret) {
-		genpd_remove_device(pd, dev);
-		return -EPROBE_DEFER;
-	}
-
 	/* Set the default performance state */
 	pstate = of_get_required_opp_performance_state(dev->of_node, index);
 	if (pstate < 0 && pstate != -ENODEV && pstate != -EOPNOTSUPP) {
@@ -2755,6 +2743,24 @@ static int __genpd_dev_pm_attach(struct device *dev, struct device *base_dev,
 			goto err;
 		dev_gpd_data(dev)->default_pstate = pstate;
 	}
+
+	if (power_on) {
+		genpd_lock(pd);
+		ret = genpd_power_on(pd, 0);
+		genpd_unlock(pd);
+	}
+
+	if (ret) {
+		/* Drop the default performance state */
+		if (dev_gpd_data(dev)->default_pstate) {
+			dev_pm_genpd_set_performance_state(dev, 0);
+			dev_gpd_data(dev)->default_pstate = 0;
+		}
+
+		genpd_remove_device(pd, dev);
+		return -EPROBE_DEFER;
+	}
+
 	return 1;
 
 err:
