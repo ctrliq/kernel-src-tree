@@ -113,7 +113,7 @@ static int acpi_register_gsi_xen_hvm(struct device *dev, u32 gsi,
 				 false /* no mapping of GSI to PIRQ */);
 }
 
-#ifdef CONFIG_XEN_DOM0
+#ifdef CONFIG_XEN_PV_DOM0
 static int xen_register_gsi(u32 gsi, int triggering, int polarity)
 {
 	int rc, irq;
@@ -261,7 +261,7 @@ error:
 	return irq;
 }
 
-#ifdef CONFIG_XEN_DOM0
+#ifdef CONFIG_XEN_PV_DOM0
 static bool __read_mostly pci_seg_supported = true;
 
 static int xen_initdom_setup_msi_irqs(struct pci_dev *dev, int nvec, int type)
@@ -379,9 +379,9 @@ bool xen_initdom_restore_msi(struct pci_dev *dev)
 	}
 	return false;
 }
-#else /* CONFIG_XEN_DOM0 */
+#else /* CONFIG_XEN_PV_DOM0 */
 #define xen_initdom_setup_msi_irqs	NULL
-#endif /* !CONFIG_XEN_DOM0 */
+#endif /* !CONFIG_XEN_PV_DOM0 */
 
 static void xen_teardown_msi_irqs(struct pci_dev *dev)
 {
@@ -556,7 +556,7 @@ int __init pci_xen_hvm_init(void)
 	return 0;
 }
 
-#ifdef CONFIG_XEN_DOM0
+#ifdef CONFIG_XEN_PV_DOM0
 int __init pci_xen_initial_domain(void)
 {
 	int irq;
@@ -584,6 +584,9 @@ int __init pci_xen_initial_domain(void)
 	}
 	return 0;
 }
+#endif
+
+#ifdef CONFIG_XEN_DOM0
 
 struct xen_device_domain_owner {
 	domid_t domain;
@@ -657,4 +660,4 @@ int xen_unregister_device_domain_owner(struct pci_dev *dev)
 	return 0;
 }
 EXPORT_SYMBOL_GPL(xen_unregister_device_domain_owner);
-#endif
+#endif /* CONFIG_XEN_DOM0 */
