@@ -55,7 +55,7 @@ struct subsys_private {
 
 	struct lock_class_key lock_key;
 };
-#define to_subsys_private(obj) container_of(obj, struct subsys_private, subsys.kobj)
+#define to_subsys_private(obj) container_of_const(obj, struct subsys_private, subsys.kobj)
 
 struct driver_private {
 	struct kobject kobj;
