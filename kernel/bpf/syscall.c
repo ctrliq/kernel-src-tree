@@ -545,6 +545,9 @@ void btf_record_free(struct btf_record *rec)
 		return;
 	for (i = 0; i < rec->cnt; i++) {
 		switch (rec->fields[i].type) {
+		case BPF_SPIN_LOCK:
+		case BPF_TIMER:
+			break;
 		case BPF_KPTR_UNREF:
 		case BPF_KPTR_REF:
 			if (rec->fields[i].kptr.module)
@@ -582,6 +585,9 @@ struct btf_record *btf_record_dup(const struct btf_record *rec)
 	new_rec->cnt = 0;
 	for (i = 0; i < rec->cnt; i++) {
 		switch (fields[i].type) {
+		case BPF_SPIN_LOCK:
+		case BPF_TIMER:
+			break;
 		case BPF_KPTR_UNREF:
 		case BPF_KPTR_REF:
 			btf_get(fields[i].kptr.btf);
@@ -618,6 +624,13 @@ bool btf_record_equal(const struct btf_record *rec_a, const struct btf_record *r
 	return !memcmp(rec_a, rec_b, size);
 }
 
+void bpf_obj_free_timer(const struct btf_record *rec, void *obj)
+{
+	if (WARN_ON_ONCE(!btf_record_has_field(rec, BPF_TIMER)))
+		return;
+	bpf_timer_cancel_and_free(obj + rec->timer_off);
+}
+
 void bpf_obj_free_fields(const struct btf_record *rec, void *obj)
 {
 	const struct btf_field *fields;
@@ -631,6 +644,11 @@ void bpf_obj_free_fields(const struct btf_record *rec, void *obj)
 		void *field_ptr = obj + field->offset;
 
 		switch (fields[i].type) {
+		case BPF_SPIN_LOCK:
+			break;
+		case BPF_TIMER:
+			bpf_timer_cancel_and_free(field_ptr);
+			break;
 		case BPF_KPTR_UNREF:
 			WRITE_ONCE(*(u64 *)field_ptr, 0);
 			break;
@@ -816,8 +834,7 @@ static int bpf_map_mmap(struct file *filp, struct vm_area_struct *vma)
 	struct bpf_map *map = filp->private_data;
 	int err;
 
-	if (!map->ops->map_mmap || map_value_has_spin_lock(map) ||
-	    map_value_has_timer(map) || !IS_ERR_OR_NULL(map->record))
+	if (!map->ops->map_mmap || !IS_ERR_OR_NULL(map->record))
 		return -ENOTSUPP;
 
 	if (!(vma->vm_flags & VM_SHARED))
@@ -972,48 +989,30 @@ static void map_field_offs_swap(void *_a, void *_b, int size, const void *priv)
 
 static int bpf_map_alloc_off_arr(struct bpf_map *map)
 {
-	bool has_spin_lock = map_value_has_spin_lock(map);
-	bool has_timer = map_value_has_timer(map);
 	bool has_fields = !IS_ERR_OR_NULL(map->record);
 	struct btf_field_offs *fo;
-	u32 i;
+	struct btf_record *rec;
+	u32 i, *off;
+	u8 *sz;
 
-	if (!has_spin_lock && !has_timer && !has_fields) {
+	if (!has_fields) {
 		map->field_offs = NULL;
 		return 0;
 	}
 
-	fo = kmalloc(sizeof(*map->field_offs), GFP_KERNEL | __GFP_NOWARN);
+	fo = kzalloc(sizeof(*map->field_offs), GFP_KERNEL | __GFP_NOWARN);
 	if (!fo)
 		return -ENOMEM;
 	map->field_offs = fo;
 
-	fo->cnt = 0;
-	if (has_spin_lock) {
-		i = fo->cnt;
-
-		fo->field_off[i] = map->spin_lock_off;
-		fo->field_sz[i] = sizeof(struct bpf_spin_lock);
-		fo->cnt++;
+	rec = map->record;
+	off = fo->field_off;
+	sz = fo->field_sz;
+	for (i = 0; i < rec->cnt; i++) {
+		*off++ = rec->fields[i].offset;
+		*sz++ = btf_field_type_size(rec->fields[i].type);
 	}
-	if (has_timer) {
-		i = fo->cnt;
-
-		fo->field_off[i] = map->timer_off;
-		fo->field_sz[i] = sizeof(struct bpf_timer);
-		fo->cnt++;
-	}
-	if (has_fields) {
-		struct btf_record *rec = map->record;
-		u32 *off = &fo->field_off[fo->cnt];
-		u8 *sz = &fo->field_sz[fo->cnt];
-
-		for (i = 0; i < rec->cnt; i++) {
-			*off++ = rec->fields[i].offset;
-			*sz++ = btf_field_type_size(rec->fields[i].type);
-		}
-		fo->cnt += rec->cnt;
-	}
+	fo->cnt = rec->cnt;
 
 	if (fo->cnt == 1)
 		return 0;
@@ -1044,39 +1043,8 @@ static int map_check_btf(struct bpf_map *map, const struct btf *btf,
 	if (!value_type || value_size != map->value_size)
 		return -EINVAL;
 
-	map->spin_lock_off = btf_find_spin_lock(btf, value_type);
-
-	if (map_value_has_spin_lock(map)) {
-		if (map->map_flags & BPF_F_RDONLY_PROG)
-			return -EACCES;
-		if (map->map_type != BPF_MAP_TYPE_HASH &&
-		    map->map_type != BPF_MAP_TYPE_ARRAY &&
-		    map->map_type != BPF_MAP_TYPE_CGROUP_STORAGE &&
-		    map->map_type != BPF_MAP_TYPE_SK_STORAGE &&
-		    map->map_type != BPF_MAP_TYPE_INODE_STORAGE &&
-		    map->map_type != BPF_MAP_TYPE_TASK_STORAGE &&
-		    map->map_type != BPF_MAP_TYPE_CGRP_STORAGE)
-			return -ENOTSUPP;
-		if (map->spin_lock_off + sizeof(struct bpf_spin_lock) >
-		    map->value_size) {
-			WARN_ONCE(1,
-				  "verifier bug spin_lock_off %d value_size %d\n",
-				  map->spin_lock_off, map->value_size);
-			return -EFAULT;
-		}
-	}
-
-	map->timer_off = btf_find_timer(btf, value_type);
-	if (map_value_has_timer(map)) {
-		if (map->map_flags & BPF_F_RDONLY_PROG)
-			return -EACCES;
-		if (map->map_type != BPF_MAP_TYPE_HASH &&
-		    map->map_type != BPF_MAP_TYPE_LRU_HASH &&
-		    map->map_type != BPF_MAP_TYPE_ARRAY)
-			return -EOPNOTSUPP;
-	}
-
-	map->record = btf_parse_fields(btf, value_type);
+	map->record = btf_parse_fields(btf, value_type, BPF_SPIN_LOCK | BPF_TIMER | BPF_KPTR,
+				       map->value_size);
 	if (!IS_ERR_OR_NULL(map->record)) {
 		int i;
 
@@ -1092,6 +1060,26 @@ static int map_check_btf(struct bpf_map *map, const struct btf *btf,
 			switch (map->record->field_mask & (1 << i)) {
 			case 0:
 				continue;
+			case BPF_SPIN_LOCK:
+				if (map->map_type != BPF_MAP_TYPE_HASH &&
+				    map->map_type != BPF_MAP_TYPE_ARRAY &&
+				    map->map_type != BPF_MAP_TYPE_CGROUP_STORAGE &&
+				    map->map_type != BPF_MAP_TYPE_SK_STORAGE &&
+				    map->map_type != BPF_MAP_TYPE_INODE_STORAGE &&
+				    map->map_type != BPF_MAP_TYPE_TASK_STORAGE &&
+				    map->map_type != BPF_MAP_TYPE_CGRP_STORAGE) {
+					ret = -EOPNOTSUPP;
+					goto free_map_tab;
+				}
+				break;
+			case BPF_TIMER:
+				if (map->map_type != BPF_MAP_TYPE_HASH &&
+				    map->map_type != BPF_MAP_TYPE_LRU_HASH &&
+				    map->map_type != BPF_MAP_TYPE_ARRAY) {
+					return -EOPNOTSUPP;
+					goto free_map_tab;
+				}
+				break;
 			case BPF_KPTR_UNREF:
 			case BPF_KPTR_REF:
 				if (map->map_type != BPF_MAP_TYPE_HASH &&
@@ -1171,8 +1159,6 @@ static int map_create(union bpf_attr *attr)
 	mutex_init(&map->freeze_mutex);
 	spin_lock_init(&map->owner.lock);
 
-	map->spin_lock_off = -EINVAL;
-	map->timer_off = -EINVAL;
 	if (attr->btf_key_type_id || attr->btf_value_type_id ||
 	    /* Even the map's value is a kernel's struct,
 	     * the bpf_prog.o must have BTF to begin with
@@ -1386,7 +1372,7 @@ static int map_lookup_elem(union bpf_attr *attr)
 	}
 
 	if ((attr->flags & BPF_F_LOCK) &&
-	    !map_value_has_spin_lock(map)) {
+	    !btf_record_has_field(map->record, BPF_SPIN_LOCK)) {
 		err = -EINVAL;
 		goto err_put;
 	}
@@ -1459,7 +1445,7 @@ static int map_update_elem(union bpf_attr *attr, bpfptr_t uattr)
 	}
 
 	if ((attr->flags & BPF_F_LOCK) &&
-	    !map_value_has_spin_lock(map)) {
+	    !btf_record_has_field(map->record, BPF_SPIN_LOCK)) {
 		err = -EINVAL;
 		goto err_put;
 	}
@@ -1622,7 +1608,7 @@ int generic_map_delete_batch(struct bpf_map *map,
 		return -EINVAL;
 
 	if ((attr->batch.elem_flags & BPF_F_LOCK) &&
-	    !map_value_has_spin_lock(map)) {
+	    !btf_record_has_field(map->record, BPF_SPIN_LOCK)) {
 		return -EINVAL;
 	}
 
@@ -1679,7 +1665,7 @@ int generic_map_update_batch(struct bpf_map *map,
 		return -EINVAL;
 
 	if ((attr->batch.elem_flags & BPF_F_LOCK) &&
-	    !map_value_has_spin_lock(map)) {
+	    !btf_record_has_field(map->record, BPF_SPIN_LOCK)) {
 		return -EINVAL;
 	}
 
@@ -1742,7 +1728,7 @@ int generic_map_lookup_batch(struct bpf_map *map,
 		return -EINVAL;
 
 	if ((attr->batch.elem_flags & BPF_F_LOCK) &&
-	    !map_value_has_spin_lock(map))
+	    !btf_record_has_field(map->record, BPF_SPIN_LOCK))
 		return -EINVAL;
 
 	value_size = bpf_map_value_size(map);
@@ -1864,7 +1850,7 @@ static int map_lookup_and_delete_elem(union bpf_attr *attr)
 	}
 
 	if ((attr->flags & BPF_F_LOCK) &&
-	    !map_value_has_spin_lock(map)) {
+	    !btf_record_has_field(map->record, BPF_SPIN_LOCK)) {
 		err = -EINVAL;
 		goto err_put;
 	}
@@ -1935,8 +1921,7 @@ static int map_freeze(const union bpf_attr *attr)
 	if (IS_ERR(map))
 		return PTR_ERR(map);
 
-	if (map->map_type == BPF_MAP_TYPE_STRUCT_OPS ||
-	    map_value_has_timer(map) || !IS_ERR_OR_NULL(map->record)) {
+	if (map->map_type == BPF_MAP_TYPE_STRUCT_OPS || !IS_ERR_OR_NULL(map->record)) {
 		fdput(f);
 		return -ENOTSUPP;
 	}
