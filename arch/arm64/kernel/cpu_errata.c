@@ -633,13 +633,6 @@ const struct arm64_cpu_capabilities arm64_errata[] = {
 		ERRATA_MIDR_ALL_VERSIONS(MIDR_NVIDIA_CARMEL),
 	},
 #endif
-#ifdef CONFIG_ARM64_ERRATUM_2077057
-	{
-		.desc = "ARM erratum 2077057",
-		.capability = ARM64_WORKAROUND_2077057,
-		ERRATA_MIDR_REV_RANGE(MIDR_CORTEX_A510, 0, 0, 2),
-	},
-#endif
 #ifdef CONFIG_ARM64_WORKAROUND_TRBE_OVERWRITE_FILL_MODE
 	{
 		/*
@@ -666,6 +659,20 @@ const struct arm64_cpu_capabilities arm64_errata[] = {
 		.capability = ARM64_WORKAROUND_TRBE_WRITE_OUT_OF_RANGE,
 		.type = ARM64_CPUCAP_WEAK_LOCAL_CPU_FEATURE,
 		CAP_MIDR_RANGE_LIST(trbe_write_out_of_range_cpus),
+	},
+#endif
+#ifdef CONFIG_ARM64_ERRATUM_2645198
+	{
+		.desc = "ARM erratum 2645198",
+		.capability = ARM64_WORKAROUND_2645198,
+		ERRATA_MIDR_ALL_VERSIONS(MIDR_CORTEX_A715)
+	},
+#endif
+#ifdef CONFIG_ARM64_ERRATUM_2077057
+	{
+		.desc = "ARM erratum 2077057",
+		.capability = ARM64_WORKAROUND_2077057,
+		ERRATA_MIDR_REV_RANGE(MIDR_CORTEX_A510, 0, 0, 2),
 	},
 #endif
 #ifdef CONFIG_ARM64_ERRATUM_2064142
