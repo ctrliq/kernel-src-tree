@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-
+#include <linux/module.h>
 #include <linux/moduleparam.h>
 #include <linux/vmalloc.h>
 
