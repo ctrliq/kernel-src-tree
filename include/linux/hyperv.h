@@ -1273,7 +1273,7 @@ struct hv_driver {
 	} dynids;
 
 	int (*probe)(struct hv_device *, const struct hv_vmbus_device_id *);
-	int (*remove)(struct hv_device *);
+	void (*remove)(struct hv_device *dev);
 	void (*shutdown)(struct hv_device *);
 
 	int (*suspend)(struct hv_device *);
@@ -1336,6 +1336,8 @@ struct hv_ring_buffer_debug_info {
 
 int hv_ringbuffer_get_debuginfo(struct hv_ring_buffer_info *ring_info,
 				struct hv_ring_buffer_debug_info *debug_info);
+
+bool hv_ringbuffer_spinlock_busy(struct vmbus_channel *channel);
 
 /* Vmbus interface */
 #define vmbus_driver_register(driver)	\
