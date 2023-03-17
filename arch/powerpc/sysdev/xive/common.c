@@ -1167,7 +1167,7 @@ static int xive_request_ipi(unsigned int cpu)
 		return 0;
 
 	ret = request_irq(xid->irq, xive_muxed_ipi_action,
-			  IRQF_PERCPU | IRQF_NO_THREAD,
+			  IRQF_NO_DEBUG | IRQF_PERCPU | IRQF_NO_THREAD,
 			  xid->name, NULL);
 
 	WARN(ret < 0, "Failed to request IPI %d: %d\n", xid->irq, ret);
