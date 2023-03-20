@@ -109,7 +109,7 @@ struct nvme_dev;
 struct nvme_queue;
 
 static void nvme_dev_disable(struct nvme_dev *dev, bool shutdown);
-static bool __nvme_disable_io_queues(struct nvme_dev *dev, u8 opcode);
+static void nvme_delete_io_queues(struct nvme_dev *dev);
 static void nvme_update_attrs(struct nvme_dev *dev);
 
 /*
@@ -2320,12 +2320,6 @@ static int nvme_setup_irqs(struct nvme_dev *dev, unsigned int nr_io_queues)
 			      PCI_IRQ_ALL_TYPES | PCI_IRQ_AFFINITY, &affd);
 }
 
-static void nvme_disable_io_queues(struct nvme_dev *dev)
-{
-	if (__nvme_disable_io_queues(dev, nvme_admin_delete_sq))
-		__nvme_disable_io_queues(dev, nvme_admin_delete_cq);
-}
-
 static unsigned int nvme_max_io_queues(struct nvme_dev *dev)
 {
 	/*
@@ -2433,7 +2427,7 @@ static int nvme_setup_io_queues(struct nvme_dev *dev)
 
 	if (dev->online_queues - 1 < dev->max_qid) {
 		nr_io_queues = dev->online_queues - 1;
-		nvme_disable_io_queues(dev);
+		nvme_delete_io_queues(dev);
 		result = nvme_setup_io_queues_trylock(dev);
 		if (result)
 			return result;
@@ -2496,7 +2490,7 @@ static int nvme_delete_queue(struct nvme_queue *nvmeq, u8 opcode)
 	return 0;
 }
 
-static bool __nvme_disable_io_queues(struct nvme_dev *dev, u8 opcode)
+static bool __nvme_delete_io_queues(struct nvme_dev *dev, u8 opcode)
 {
 	int nr_queues = dev->online_queues - 1, sent = 0;
 	unsigned long timeout;
@@ -2522,6 +2516,12 @@ static bool __nvme_disable_io_queues(struct nvme_dev *dev, u8 opcode)
 			goto retry;
 	}
 	return true;
+}
+
+static void nvme_delete_io_queues(struct nvme_dev *dev)
+{
+	if (__nvme_delete_io_queues(dev, nvme_admin_delete_sq))
+		__nvme_delete_io_queues(dev, nvme_admin_delete_cq);
 }
 
 static void nvme_pci_alloc_tag_set(struct nvme_dev *dev)
@@ -2695,7 +2695,7 @@ static void nvme_dev_disable(struct nvme_dev *dev, bool shutdown)
 	nvme_quiesce_io_queues(&dev->ctrl);
 
 	if (!dead && dev->ctrl.queue_count > 0) {
-		nvme_disable_io_queues(dev);
+		nvme_delete_io_queues(dev);
 		nvme_disable_ctrl(&dev->ctrl, shutdown);
 		nvme_poll_irqdisable(&dev->queues[0]);
 	}
