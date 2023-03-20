@@ -172,22 +172,6 @@ static const struct pci_device_id rh_deprecated_pci_table[] = {
 	{ 0 }
 };
 
-static const struct pci_device_id rh_unmaintained_pci_table[] = {
-	{PCI_VENDOR_ID_EMULEX, PCI_DEVICE_ID_SKYHAWK,
-		PCI_ANY_ID, PCI_ANY_ID, },
-	{PCI_VENDOR_ID_EMULEX, PCI_DEVICE_ID_LANCER_FC,
-		PCI_ANY_ID, PCI_ANY_ID, },
-	{PCI_VENDOR_ID_EMULEX, PCI_DEVICE_ID_SAT,
-		PCI_ANY_ID, PCI_ANY_ID, },
-	{PCI_VENDOR_ID_EMULEX, PCI_DEVICE_ID_SAT_MID,
-		PCI_ANY_ID, PCI_ANY_ID, },
-	{PCI_VENDOR_ID_EMULEX, PCI_DEVICE_ID_SAT_SMB,
-		PCI_ANY_ID, PCI_ANY_ID, },
-	{PCI_VENDOR_ID_EMULEX, PCI_DEVICE_ID_SAT_S,
-		PCI_ANY_ID, PCI_ANY_ID, },
-	{ 0 }
-};
-
 static const struct pci_device_id rh_disabled_pci_table[] = {
 	{ 0 }
 };

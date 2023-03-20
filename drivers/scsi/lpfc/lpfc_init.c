@@ -15494,7 +15494,6 @@ lpfc_pci_probe_one(struct pci_dev *pdev, const struct pci_device_id *pid)
 		return -ENODEV;
 
 	pci_hw_deprecated(rh_deprecated_pci_table, pdev);
-	pci_hw_unmaintained(rh_unmaintained_pci_table, pdev);
 #endif
 
 	if (pci_read_config_dword(pdev, LPFC_SLI_INTF, &intf.word0))

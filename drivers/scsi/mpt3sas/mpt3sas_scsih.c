@@ -12096,32 +12096,6 @@ static const struct pci_device_id rh_deprecated_pci_table[] = {
 	{0}     /* Terminating entry */
 };
 
-static const struct pci_device_id rh_unmaintained_pci_table[] = {
-	/* Thunderbolt ~ 2208 */
-	{ MPI2_MFGPAGE_VENDORID_LSI, MPI2_MFGPAGE_DEVID_SAS2208_1,
-		PCI_ANY_ID, PCI_ANY_ID },
-	{ MPI2_MFGPAGE_VENDORID_LSI, MPI2_MFGPAGE_DEVID_SAS2208_2,
-		PCI_ANY_ID, PCI_ANY_ID },
-	{ MPI2_MFGPAGE_VENDORID_LSI, MPI2_MFGPAGE_DEVID_SAS2208_3,
-		PCI_ANY_ID, PCI_ANY_ID },
-	{ MPI2_MFGPAGE_VENDORID_LSI, MPI2_MFGPAGE_DEVID_SAS2208_4,
-		PCI_ANY_ID, PCI_ANY_ID },
-	{ MPI2_MFGPAGE_VENDORID_LSI, MPI2_MFGPAGE_DEVID_SAS2208_5,
-		PCI_ANY_ID, PCI_ANY_ID },
-	{ MPI2_MFGPAGE_VENDORID_LSI, MPI2_MFGPAGE_DEVID_SAS2208_6,
-		PCI_ANY_ID, PCI_ANY_ID },
-	/* Mustang ~ 2308 */
-	{ MPI2_MFGPAGE_VENDORID_LSI, MPI2_MFGPAGE_DEVID_SAS2308_1,
-		PCI_ANY_ID, PCI_ANY_ID },
-	{ MPI2_MFGPAGE_VENDORID_LSI, MPI2_MFGPAGE_DEVID_SAS2308_2,
-		PCI_ANY_ID, PCI_ANY_ID },
-	{ MPI2_MFGPAGE_VENDORID_LSI, MPI2_MFGPAGE_DEVID_SAS2308_3,
-		PCI_ANY_ID, PCI_ANY_ID },
-
-	{0}     /* Terminating entry */
-};
-
-
 static const struct pci_device_id rh_disabled_pci_table[] = {
 	/* Spitfire ~ 2004 */
 	{ MPI2_MFGPAGE_VENDORID_LSI, MPI2_MFGPAGE_DEVID_SAS2004,
@@ -12171,7 +12145,6 @@ _scsih_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 		return -ENODEV;
 
 	pci_hw_deprecated(rh_deprecated_pci_table, pdev);
-	pci_hw_unmaintained(rh_unmaintained_pci_table, pdev);
 #endif
 
 	/* Determine in which MPI version class this pci device belongs */

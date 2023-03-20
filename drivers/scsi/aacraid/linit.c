@@ -77,12 +77,6 @@ static const struct pci_device_id rh_deprecated_pci_table[] = {
 	{0}     /* Terminating entry */
 };
 
-static const struct pci_device_id rh_unmaintained_pci_table[] = {
-
-	{0}     /* Terminating entry */
-};
-
-
 static const struct pci_device_id rh_disabled_pci_table[] = {
 
 	{ 0x1028, 0x0001, 0x1028, 0x0001, 0, 0, 0 }, /* PERC 2/Si (Iguana/PERC2Si) */
@@ -1674,7 +1668,6 @@ static int aac_probe_one(struct pci_dev *pdev, const struct pci_device_id *id)
 		return -ENODEV;
 
 	pci_hw_deprecated(rh_deprecated_pci_table, pdev);
-	pci_hw_unmaintained(rh_unmaintained_pci_table, pdev);
 #endif
 
 	/*

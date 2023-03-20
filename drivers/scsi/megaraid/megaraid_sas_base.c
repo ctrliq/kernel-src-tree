@@ -150,21 +150,6 @@ static const struct pci_device_id rh_deprecated_pci_table[] = {
 	{0}     /* Terminating entry */
 };
 
-static const struct pci_device_id rh_unmaintained_pci_table[] = {
-
-	{PCI_DEVICE(PCI_VENDOR_ID_LSI_LOGIC, PCI_DEVICE_ID_LSI_SAS0079GEN2)},
-	/* gen2*/
-	{PCI_DEVICE(PCI_VENDOR_ID_LSI_LOGIC, PCI_DEVICE_ID_LSI_SAS0073SKINNY)},
-	/* skinny*/
-	{PCI_DEVICE(PCI_VENDOR_ID_LSI_LOGIC, PCI_DEVICE_ID_LSI_SAS0071SKINNY)},
-	/* skinny*/
-
-	{PCI_DEVICE(PCI_VENDOR_ID_LSI_LOGIC, PCI_DEVICE_ID_LSI_FUSION)},
-	/* Fusion */
-
-	{0}     /* Terminating entry */
-};
-
 static const struct pci_device_id rh_disabled_pci_table[] = {
 
 	{PCI_DEVICE(PCI_VENDOR_ID_LSI_LOGIC, PCI_DEVICE_ID_LSI_SAS1064R)},
@@ -7502,7 +7487,6 @@ static int megasas_probe_one(struct pci_dev *pdev,
 		return -ENODEV;
 
 	pci_hw_deprecated(rh_deprecated_pci_table, pdev);
-	pci_hw_unmaintained(rh_unmaintained_pci_table, pdev);
 #endif
 
 	switch (pdev->device) {

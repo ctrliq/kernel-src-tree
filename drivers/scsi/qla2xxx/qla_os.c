@@ -2874,13 +2874,6 @@ static const struct pci_device_id rh_deprecated_pci_table[] = {
 	{ 0 }
 };
 
-static const struct pci_device_id rh_unmaintained_pci_table[] = {
-	{ PCI_DEVICE(PCI_VENDOR_ID_QLOGIC, PCI_DEVICE_ID_QLOGIC_ISP2532) },
-	{ PCI_DEVICE(PCI_VENDOR_ID_QLOGIC, PCI_DEVICE_ID_QLOGIC_ISP2031) },
-	{ PCI_DEVICE(PCI_VENDOR_ID_QLOGIC, PCI_DEVICE_ID_QLOGIC_ISP8031) },
-	{ 0 }
-};
-
 static const struct pci_device_id rh_disabled_pci_table[] = {
 	{ 0 }
 };
@@ -2931,7 +2924,6 @@ qla2x00_probe_one(struct pci_dev *pdev, const struct pci_device_id *id)
 		return -ENODEV;
 
 	pci_hw_deprecated(rh_deprecated_pci_table, pdev);
-	pci_hw_unmaintained(rh_unmaintained_pci_table, pdev);
 #endif
 
 	bars = pci_select_bars(pdev, IORESOURCE_MEM | IORESOURCE_IO);
