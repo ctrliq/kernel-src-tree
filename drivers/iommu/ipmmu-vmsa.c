@@ -1082,7 +1082,7 @@ static int ipmmu_probe(struct platform_device *pdev)
 	return 0;
 }
 
-static int ipmmu_remove(struct platform_device *pdev)
+static void ipmmu_remove(struct platform_device *pdev)
 {
 	struct ipmmu_vmsa_device *mmu = platform_get_drvdata(pdev);
 
@@ -1092,8 +1092,6 @@ static int ipmmu_remove(struct platform_device *pdev)
 	arm_iommu_release_mapping(mmu->mapping);
 
 	ipmmu_device_reset(mmu);
-
-	return 0;
 }
 
 #ifdef CONFIG_PM_SLEEP
@@ -1140,6 +1138,6 @@ static struct platform_driver ipmmu_driver = {
 		.pm = DEV_PM_OPS,
 	},
 	.probe = ipmmu_probe,
-	.remove	= ipmmu_remove,
+	.remove_new = ipmmu_remove,
 };
 builtin_platform_driver(ipmmu_driver);
