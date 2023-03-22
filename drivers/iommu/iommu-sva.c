@@ -16,8 +16,8 @@ static int iommu_sva_alloc_pasid(struct mm_struct *mm, ioasid_t min, ioasid_t ma
 {
 	int ret = 0;
 
-	if (min == INVALID_IOASID ||
-	    max == INVALID_IOASID ||
+	if (min == IOMMU_PASID_INVALID ||
+	    max == IOMMU_PASID_INVALID ||
 	    min == 0 || max < min)
 		return -EINVAL;
 
