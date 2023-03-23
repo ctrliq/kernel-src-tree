@@ -46,6 +46,14 @@ SPECKVERSION:=$(shell $(GIT) show $(HEAD):Makefile | sed -ne '/^VERSION\ =\ /{s/
 SPECKPATCHLEVEL:=$(shell $(GIT) show $(HEAD):Makefile | sed -ne '/^PATCHLEVEL\ =\ /{s///;p;q}')
 SPECKSUBLEVEL:=$(shell $(GIT) show $(HEAD):Makefile | sed -ne '/^SUBLEVEL\ =\ /{s///;p;q}')
 SPECKEXTRAVERSION:=$(shell $(GIT) show $(HEAD):Makefile | sed -ne '/^EXTRAVERSION\ =\ /{s///;p;q}')
+
+SPECRVERSION:=$(shell echo $$(( $(RHEL_MAJOR) - 9 )))
+SPECRPATCHLEVEL:=$(RHEL_REBASE_NUM)
+
+ifneq ($(SPECGEMINI),0)
+  SPECKEXTRAVERSION:=
+endif
+
 GITID:= $(shell $(GIT) log --max-count=1 --pretty=format:%H $(HEAD))
 ifndef RHSELFTESTDATA
   BUILD:=$(RHEL_RELEASE)
@@ -222,9 +230,16 @@ endif
 # $(SPECPACKAGE_NAME)-$(BASEVERSION)                                                            $(DIST)
 # $(RELEASETAG)                                                                             $(DIST)
 #
+# Gemini kernels override RPM NVR to:
+# $(SPECPACKAGE_NAME)-$(SPECRVERSION).$(SPECRPATCHLEVEL)-$(SPECBUILD)                           $(DIST)
+#
 SPECBUILD:=$(UPSTREAMBUILD)$(BUILD)$(DISTLOCALVERSION)
 SPECVERSION:=$(SPECKVERSION).$(SPECKPATCHLEVEL).$(SPECKSUBLEVEL)
-SPECRPMVERSION:=$(SPECKVERSION).$(SPECKPATCHLEVEL).$(SPECKSUBLEVEL)
+ifeq ($(SPECGEMINI),0)
+  SPECRPMVERSION:=$(SPECKVERSION).$(SPECKPATCHLEVEL).$(SPECKSUBLEVEL)
+else
+  SPECRPMVERSION:=$(SPECRVERSION).$(SPECRPATCHLEVEL)
+endif
 BASEVERSION:=$(SPECRPMVERSION)-$(SPECBUILD)
 RELEASETAG:=$(SPECPACKAGE_NAME)-$(BASEVERSION)
 SRPM:=$(SRPMS)/$(RELEASETAG)$(DIST).src.rpm

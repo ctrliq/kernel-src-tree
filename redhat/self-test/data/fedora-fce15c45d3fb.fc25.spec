@@ -1,4 +1,5 @@
 %global package_name kernel
+%global gemini 0
 %global include_fedora 1
 %global include_rhel 1
 %global patchlist_changelog 1
