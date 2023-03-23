@@ -4,6 +4,7 @@
 %global patchlist_changelog 1
 %global released_kernel 0
 %define buildid .test
+%define specrpmversion 5.17.0
 %define specversion 5.17.0
 %define patchversion 5.17
 %define pkgrelease 0.rc0.78e36f3b0dae.6.test

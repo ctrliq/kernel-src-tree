@@ -218,13 +218,14 @@ endif
 # This can be evaluated as
 #
 # $(SPECPACKAGE_NAME)-$(SPECKVERSION).$(SPECKPATCHLEVEL).$(SPECKSUBLEVEL)-$(SPECBUILD)          $(DIST)
-# $(SPECPACKAGE_NAME)-$(SPECVERSION)                                     -$(SPECBUILD)          $(DIST)
+# $(SPECPACKAGE_NAME)-$(SPECRPMVERSION)                                  -$(SPECBUILD)          $(DIST)
 # $(SPECPACKAGE_NAME)-$(BASEVERSION)                                                            $(DIST)
 # $(RELEASETAG)                                                                             $(DIST)
 #
 SPECBUILD:=$(UPSTREAMBUILD)$(BUILD)$(DISTLOCALVERSION)
 SPECVERSION:=$(SPECKVERSION).$(SPECKPATCHLEVEL).$(SPECKSUBLEVEL)
-BASEVERSION:=$(SPECVERSION)-$(SPECBUILD)
+SPECRPMVERSION:=$(SPECKVERSION).$(SPECKPATCHLEVEL).$(SPECKSUBLEVEL)
+BASEVERSION:=$(SPECRPMVERSION)-$(SPECBUILD)
 RELEASETAG:=$(SPECPACKAGE_NAME)-$(BASEVERSION)
 SRPM:=$(SRPMS)/$(RELEASETAG)$(DIST).src.rpm
 
@@ -241,7 +242,7 @@ ifeq ("$(DISTRO)", "fedora")
   # replace the tarball from one with upstream, rebuild, and then deploy
   # without changing anything else in the specfile.
   SPECTARFILE_RELEASE:=$(UPSTREAM_TARBALL_NAME)
-  SPECKABIVERSION:=$(SPECVERSION)
+  SPECKABIVERSION:=$(SPECRPMVERSION)
   DISTRELEASETAG:=$(RELEASETAG)
   DISTBASEVERSION:=$(BASEVERSION)
   RHPKG_BIN:=fedpkg
@@ -503,11 +504,11 @@ dist-kabi-dw-check: dist-kabi
 
 dist-configs-commit: dist-configs-prep
 	+@cd $(REDHAT)/configs; ./generate_all_configs.sh 1;\
-	./process_configs.sh -z "$(SPECVERSION)" "$(FLAVOR)"
+	./process_configs.sh -z "$(SPECRPMVERSION)" "$(FLAVOR)"
 
 dist-configs: dist-configs-prep
 	+@cd $(REDHAT)/configs; ./generate_all_configs.sh 1;\
-	./process_configs.sh $(PROCESS_CONFIGS_OPTS) "$(SPECVERSION)" ""
+	./process_configs.sh $(PROCESS_CONFIGS_OPTS) "$(SPECRPMVERSION)" ""
 
 dist-fedora-configs: FLAVOR = fedora
 dist-fedora-configs: dist-configs

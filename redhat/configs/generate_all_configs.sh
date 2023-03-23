@@ -22,7 +22,7 @@ fi
 # The +1 is to remove the - at the end of the SPECPACKAGE_NAME string
 specpackage_name_len=$((${#SPECPACKAGE_NAME} + 1))
 for i in ${SPECPACKAGE_NAME}*-"$FLAVOR".config; do
-	NEW=${SPECPACKAGE_NAME}-"$SPECVERSION"-$(echo ${i:$specpackage_name_len} | sed s/-"$FLAVOR"//)
+	NEW=${SPECPACKAGE_NAME}-"$SPECRPMVERSION"-$(echo ${i:$specpackage_name_len} | sed s/-"$FLAVOR"//)
 	mv "$i" "$NEW"
 done
 
