@@ -44,6 +44,9 @@ struct ms_hyperv_info ms_hyperv;
 #if IS_ENABLED(CONFIG_HYPERV)
 static inline unsigned int hv_get_nested_reg(unsigned int reg)
 {
+	if (hv_is_sint_reg(reg))
+		return reg - HV_REGISTER_SINT0 + HV_REGISTER_NESTED_SINT0;
+
 	switch (reg) {
 	case HV_REGISTER_SIMP:
 		return HV_REGISTER_NESTED_SIMP;
@@ -53,8 +56,6 @@ static inline unsigned int hv_get_nested_reg(unsigned int reg)
 		return HV_REGISTER_NESTED_SVERSION;
 	case HV_REGISTER_SCONTROL:
 		return HV_REGISTER_NESTED_SCONTROL;
-	case HV_REGISTER_SINT0:
-		return HV_REGISTER_NESTED_SINT0;
 	case HV_REGISTER_EOM:
 		return HV_REGISTER_NESTED_EOM;
 	default:
@@ -80,8 +81,7 @@ void hv_set_non_nested_register(unsigned int reg, u64 value)
 		hv_ghcb_msr_write(reg, value);
 
 		/* Write proxy bit via wrmsl instruction */
-		if (reg >= HV_REGISTER_SINT0 &&
-		    reg <= HV_REGISTER_SINT15)
+		if (hv_is_sint_reg(reg))
 			wrmsrl(reg, value | 1 << 20);
 	} else {
 		wrmsrl(reg, value);
@@ -460,7 +460,7 @@ static void __init ms_hyperv_init_platform(void)
 		 * setting of this MSR bit should happen before init_intel()
 		 * is called.
 		 */
-		wrmsrl(HV_X64_MSR_TSC_INVARIANT_CONTROL, 0x1);
+		wrmsrl(HV_X64_MSR_TSC_INVARIANT_CONTROL, HV_EXPOSE_INVARIANT_TSC);
 		setup_force_cpu_cap(X86_FEATURE_TSC_RELIABLE);
 	}
 
@@ -547,6 +547,12 @@ static bool __init ms_hyperv_x2apic_available(void)
  * (logically) generates MSIs directly to the system APIC irq domain.
  * There is no HPET, and PCI MSI/MSI-X interrupts are remapped by the
  * pci-hyperv host bridge.
+ *
+ * Note: for a Hyper-V root partition, this will always return false.
+ * The hypervisor doesn't expose these HYPERV_CPUID_VIRT_STACK_* cpuids by
+ * default, they are implemented as intercepts by the Windows Hyper-V stack.
+ * Even a nested root partition (L2 root) will not get them because the
+ * nested (L1) hypervisor filters them out.
  */
 static bool __init ms_hyperv_msi_ext_dest_id(void)
 {
