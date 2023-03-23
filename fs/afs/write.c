@@ -91,7 +91,7 @@ try_again:
 			goto flush_conflicting_write;
 	}
 
-	*_page = &folio->page;
+	*_page = folio_file_page(folio, pos / PAGE_SIZE);
 	_leave(" = 0");
 	return 0;
 
@@ -635,6 +635,7 @@ static ssize_t afs_write_back_from_locked_folio(struct address_space *mapping,
 	case -EKEYEXPIRED:
 	case -EKEYREJECTED:
 	case -EKEYREVOKED:
+	case -ENETRESET:
 		afs_redirty_pages(wbc, mapping, start, len);
 		mapping_set_error(mapping, ret);
 		break;
