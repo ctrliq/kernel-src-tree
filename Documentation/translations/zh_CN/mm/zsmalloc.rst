@@ -1,4 +1,4 @@
-:Original: Documentation/mm/zs_malloc.rst
+:Original: Documentation/mm/zsmalloc.rst
 
 :翻译:
 
