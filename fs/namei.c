@@ -22,6 +22,7 @@
 #include <linux/fs.h>
 #include <linux/namei.h>
 #include <linux/pagemap.h>
+#include <linux/sched/mm.h>
 #include <linux/fsnotify.h>
 #include <linux/personality.h>
 #include <linux/security.h>
@@ -5044,13 +5045,15 @@ int __page_symlink(struct inode *inode, const char *symname, int len, int nofs)
 	struct page *page;
 	void *fsdata;
 	int err;
-	unsigned int flags = 0;
-	if (nofs)
-		flags |= AOP_FLAG_NOFS;
+	unsigned int flags;
 
 retry:
+	if (nofs)
+		flags = memalloc_nofs_save();
 	err = pagecache_write_begin(NULL, mapping, 0, len-1,
-				flags, &page, &fsdata);
+				0, &page, &fsdata);
+	if (nofs)
+		memalloc_nofs_restore(flags);
 	if (err)
 		goto fail;
 
