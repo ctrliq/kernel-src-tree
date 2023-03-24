@@ -3497,6 +3497,9 @@ static struct folio *do_read_cache_folio(struct address_space *mapping,
 {
 	struct folio *folio;
 	int err;
+
+	if (!filler)
+		filler = mapping->a_ops->read_folio;
 repeat:
 	folio = filemap_get_folio(mapping, index);
 	if (!folio) {
@@ -3513,11 +3516,7 @@ repeat:
 		}
 
 filler:
-		if (filler)
-			err = filler(file, folio);
-		else
-			err = mapping->a_ops->read_folio(file, folio);
-
+		err = filler(file, folio);
 		if (err < 0) {
 			folio_put(folio);
 			return ERR_PTR(err);
