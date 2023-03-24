@@ -170,7 +170,7 @@ static __always_inline int buffer_uptodate(const struct buffer_head *bh)
 #define page_has_buffers(page)	PagePrivate(page)
 #define folio_buffers(folio)		folio_get_private(folio)
 
-void buffer_check_dirty_writeback(struct page *page,
+void buffer_check_dirty_writeback(struct folio *folio,
 				     bool *dirty, bool *writeback);
 
 /*
