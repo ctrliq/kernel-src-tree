@@ -335,8 +335,8 @@ zero_out:
  * This is usable whether or not caching is enabled.
  */
 int netfs_write_begin(struct file *file, struct address_space *mapping,
-		      loff_t pos, unsigned int len, unsigned int aop_flags,
-		      struct folio **_folio, void **_fsdata)
+		      loff_t pos, unsigned int len, struct folio **_folio,
+		      void **_fsdata)
 {
 	struct netfs_io_request *rreq;
 	struct netfs_inode *ctx = netfs_inode(file_inode(file ));
