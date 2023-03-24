@@ -103,6 +103,7 @@ TODOList:
    accounting/index
    scheduler/index
    vm/index
+   peci/index
 
 TODOList:
 
