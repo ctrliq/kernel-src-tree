@@ -144,27 +144,6 @@ static void megasas_get_pd_info(struct megasas_instance *instance,
 static void
 megasas_set_ld_removed_by_fw(struct megasas_instance *instance);
 
-#ifdef CONFIG_RHEL_DIFFERENCES
-static const struct pci_device_id rh_disabled_pci_table[] = {
-
-	{PCI_DEVICE(PCI_VENDOR_ID_LSI_LOGIC, PCI_DEVICE_ID_LSI_SAS1064R)},
-	/* xscale IOP */
-	{PCI_DEVICE(PCI_VENDOR_ID_LSI_LOGIC, PCI_DEVICE_ID_LSI_SAS1078R)},
-	/* ppc IOP */
-	{PCI_DEVICE(PCI_VENDOR_ID_LSI_LOGIC, PCI_DEVICE_ID_LSI_SAS1078DE)},
-	/* ppc IOP */
-	{PCI_DEVICE(PCI_VENDOR_ID_LSI_LOGIC, PCI_DEVICE_ID_LSI_SAS1078GEN2)},
-	/* gen2*/
-
-	{PCI_DEVICE(PCI_VENDOR_ID_LSI_LOGIC, PCI_DEVICE_ID_LSI_VERDE_ZCR)},
-	/* xscale IOP, vega */
-	{PCI_DEVICE(PCI_VENDOR_ID_DELL, PCI_DEVICE_ID_DELL_PERC5)},
-	/* xscale IOP */
-
-	{0}     /* Terminating entry */
-};
-#endif
-
 /*
  * PCI ID table for all supported controllers
  */
@@ -7476,11 +7455,6 @@ static int megasas_probe_one(struct pci_dev *pdev,
 	struct Scsi_Host *host;
 	struct megasas_instance *instance;
 	u16 control = 0;
-
-#ifdef CONFIG_RHEL_DIFFERENCES
-	if (pci_hw_disabled(rh_disabled_pci_table, pdev))
-		return -ENODEV;
-#endif
 
 	switch (pdev->device) {
 	case PCI_DEVICE_ID_LSI_AERO_10E0:

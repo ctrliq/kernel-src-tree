@@ -166,9 +166,3 @@ const struct pci_device_id lpfc_id_table[] = {
 		PCI_VENDOR_ID_ATTO, PCI_DEVICE_ID_TLFC_3322, },
 	{ 0 }
 };
-
-#ifdef CONFIG_RHEL_DIFFERENCES
-static const struct pci_device_id rh_disabled_pci_table[] = {
-	{ 0 }
-};
-#endif
