@@ -5,7 +5,7 @@
 	\renewcommand\thesection*
 	\renewcommand\thesubsection*
 	\kerneldocCJKon
-	\kerneldocBeginSC
+	\kerneldocBeginSC{
 
 .. _linux_doc_zh:
 
@@ -188,4 +188,4 @@ TODOList:
 
 .. raw:: latex
 
-	\kerneldocEndSC
+	}\kerneldocEndSC
