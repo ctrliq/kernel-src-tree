@@ -860,8 +860,9 @@ static int fuse_do_readpage(struct file *file, struct page *page)
 	return 0;
 }
 
-static int fuse_readpage(struct file *file, struct page *page)
+static int fuse_read_folio(struct file *file, struct folio *folio)
 {
+	struct page *page = &folio->page;
 	struct inode *inode = page->mapping->host;
 	int err;
 
@@ -3132,7 +3133,7 @@ static const struct file_operations fuse_file_operations = {
 };
 
 static const struct address_space_operations fuse_file_aops  = {
-	.readpage	= fuse_readpage,
+	.read_folio	= fuse_read_folio,
 	.readahead	= fuse_readahead,
 	.writepage	= fuse_writepage,
 	.writepages	= fuse_writepages,
