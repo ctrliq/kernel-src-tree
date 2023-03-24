@@ -102,6 +102,7 @@ TODOList:
    infiniband/index
    accounting/index
    scheduler/index
+   vm/index
 
 TODOList:
 
@@ -130,7 +131,6 @@ TODOList:
 * gpu/index
 * security/index
 * crypto/index
-* vm/index
 * bpf/index
 * usb/index
 * PCI/index
