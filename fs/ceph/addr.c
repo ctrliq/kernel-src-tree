@@ -1767,7 +1767,7 @@ int ceph_mmap(struct file *file, struct vm_area_struct *vma)
 {
 	struct address_space *mapping = file->f_mapping;
 
-	if (!mapping->a_ops->readpage && !mapping->a_ops->read_folio)
+	if (!mapping->a_ops->read_folio)
 		return -ENOEXEC;
 	vma->vm_ops = &ceph_vmops;
 	return 0;
