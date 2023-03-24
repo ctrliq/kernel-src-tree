@@ -420,8 +420,8 @@ latex_elements['preamble']  += '''
 	\\newcommand{\\kerneldocEndTC}{}
 	\\newcommand{\\kerneldocBeginKR}{}
 	\\newcommand{\\kerneldocEndKR}{}
-	\\newcommand{\\kerneldocBeginSC}{}
-	\\newcommand{\\kerneldocEndKR}{}
+	\\newcommand{\\kerneldocBeginJP}{}
+	\\newcommand{\\kerneldocEndJP}{}
     }
 '''
 
