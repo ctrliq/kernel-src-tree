@@ -3739,7 +3739,7 @@ int build_detached_freelist(struct kmem_cache *s, size_t size,
 /* Note that interrupts must be enabled when calling this function. */
 void kmem_cache_free_bulk(struct kmem_cache *s, size_t size, void **p)
 {
-	if (WARN_ON(!size))
+	if (!size)
 		return;
 
 	do {
@@ -3830,7 +3830,7 @@ int kmem_cache_alloc_bulk(struct kmem_cache *s, gfp_t flags, size_t size,
 error:
 	slub_put_cpu_ptr(s->cpu_slab);
 	slab_post_alloc_hook(s, objcg, flags, i, p, false);
-	__kmem_cache_free_bulk(s, i, p);
+	kmem_cache_free_bulk(s, i, p);
 	return 0;
 }
 EXPORT_SYMBOL(kmem_cache_alloc_bulk);
