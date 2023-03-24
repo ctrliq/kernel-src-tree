@@ -2830,6 +2830,11 @@ static int early_mod_check(struct load_info *info, int flags)
 		return -EPERM;
 	}
 
+#ifdef CONFIG_RHEL_DIFFERENCES
+	if (get_modinfo(info, "intree"))
+		module_rh_check_status(info->name);
+#endif
+
 	err = rewrite_section_headers(info, flags);
 	if (err)
 		return err;
