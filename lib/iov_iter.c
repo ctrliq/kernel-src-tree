@@ -1560,8 +1560,7 @@ static ssize_t iter_xarray_get_pages(struct iov_iter *i,
 
 /* must be done on non-empty ITER_IOVEC one */
 static unsigned long first_iovec_segment(const struct iov_iter *i,
-					 size_t *size, size_t *start,
-					 size_t maxsize)
+					 size_t *size, size_t *start)
 {
 	size_t skip;
 	long k;
@@ -1572,10 +1571,9 @@ static unsigned long first_iovec_segment(const struct iov_iter *i,
 
 		if (unlikely(!len))
 			continue;
-		if (len > maxsize)
-			len = maxsize;
+		if (*size > len)
+			*size = len;
 		*start = addr % PAGE_SIZE;
-		*size = len;
 		return addr & PAGE_MASK;
 	}
 	BUG(); // if it had been empty, we wouldn't get called
@@ -1583,19 +1581,17 @@ static unsigned long first_iovec_segment(const struct iov_iter *i,
 
 /* must be done on non-empty ITER_BVEC one */
 static struct page *first_bvec_segment(const struct iov_iter *i,
-				       size_t *size, size_t *start,
-				       size_t maxsize)
+				       size_t *size, size_t *start)
 {
 	struct page *page;
 	size_t skip = i->iov_offset, len;
 
 	len = i->bvec->bv_len - skip;
-	if (len > maxsize)
-		len = maxsize;
+	if (*size > len)
+		*size = len;
 	skip += i->bvec->bv_offset;
 	page = i->bvec->bv_page + skip / PAGE_SIZE;
 	*start = skip % PAGE_SIZE;
-	*size = len;
 	return page;
 }
 
@@ -1603,7 +1599,6 @@ ssize_t iov_iter_get_pages(struct iov_iter *i,
 		   struct page **pages, size_t maxsize, unsigned maxpages,
 		   size_t *start)
 {
-	size_t len;
 	int n, res;
 
 	if (maxsize > i->count)
@@ -1620,25 +1615,25 @@ ssize_t iov_iter_get_pages(struct iov_iter *i,
 		if (i->nofault)
 			gup_flags |= FOLL_NOFAULT;
 
-		addr = first_iovec_segment(i, &len, start, maxsize);
-		n = DIV_ROUND_UP(len + *start, PAGE_SIZE);
+		addr = first_iovec_segment(i, &maxsize, start);
+		n = DIV_ROUND_UP(maxsize + *start, PAGE_SIZE);
 		if (n > maxpages)
 			n = maxpages;
 		res = get_user_pages_fast(addr, n, gup_flags, pages);
 		if (unlikely(res <= 0))
 			return res;
-		return min_t(size_t, len, res * PAGE_SIZE - *start);
+		return min_t(size_t, maxsize, res * PAGE_SIZE - *start);
 	}
 	if (iov_iter_is_bvec(i)) {
 		struct page *page;
 
-		page = first_bvec_segment(i, &len, start, maxsize);
-		n = DIV_ROUND_UP(len + *start, PAGE_SIZE);
+		page = first_bvec_segment(i, &maxsize, start);
+		n = DIV_ROUND_UP(maxsize + *start, PAGE_SIZE);
 		if (n > maxpages)
 			n = maxpages;
 		for (int k = 0; k < n; k++)
 			get_page(*pages++ = page++);
-		return min_t(size_t, len, n * PAGE_SIZE - *start);
+		return min_t(size_t, maxsize, n * PAGE_SIZE - *start);
 	}
 	if (iov_iter_is_pipe(i))
 		return pipe_get_pages(i, pages, maxsize, maxpages, start);
@@ -1733,7 +1728,6 @@ ssize_t iov_iter_get_pages_alloc(struct iov_iter *i,
 		   size_t *start)
 {
 	struct page **p;
-	size_t len;
 	int n, res;
 
 	if (maxsize > i->count)
@@ -1750,8 +1744,8 @@ ssize_t iov_iter_get_pages_alloc(struct iov_iter *i,
 		if (i->nofault)
 			gup_flags |= FOLL_NOFAULT;
 
-		addr = first_iovec_segment(i, &len, start, maxsize);
-		n = DIV_ROUND_UP(len + *start, PAGE_SIZE);
+		addr = first_iovec_segment(i, &maxsize, start);
+		n = DIV_ROUND_UP(maxsize + *start, PAGE_SIZE);
 		p = get_pages_array(n);
 		if (!p)
 			return -ENOMEM;
@@ -1762,19 +1756,19 @@ ssize_t iov_iter_get_pages_alloc(struct iov_iter *i,
 			return res;
 		}
 		*pages = p;
-		return min_t(size_t, len, res * PAGE_SIZE - *start);
+		return min_t(size_t, maxsize, res * PAGE_SIZE - *start);
 	}
 	if (iov_iter_is_bvec(i)) {
 		struct page *page;
 
-		page = first_bvec_segment(i, &len, start, maxsize);
-		n = DIV_ROUND_UP(len + *start, PAGE_SIZE);
+		page = first_bvec_segment(i, &maxsize, start);
+		n = DIV_ROUND_UP(maxsize + *start, PAGE_SIZE);
 		*pages = p = get_pages_array(n);
 		if (!p)
 			return -ENOMEM;
 		for (int k = 0; k < n; k++)
 			get_page(*p++ = page++);
-		return min_t(size_t, len, n * PAGE_SIZE - *start);
+		return min_t(size_t, maxsize, n * PAGE_SIZE - *start);
 	}
 	if (iov_iter_is_pipe(i))
 		return pipe_get_pages_alloc(i, pages, maxsize, start);
