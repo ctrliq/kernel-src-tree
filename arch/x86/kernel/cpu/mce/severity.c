@@ -332,8 +332,7 @@ static int mce_severity_amd_smca(struct mce *m, enum context err_ctx)
  * See AMD Error Scope Hierarchy table in a newer BKDG. For example
  * 49125_15h_Models_30h-3Fh_BKDG.pdf, section "RAS Features"
  */
-static noinstr int mce_severity_amd(struct mce *m, struct pt_regs *regs, int tolerant,
-				    char **msg, bool is_excp)
+static noinstr int mce_severity_amd(struct mce *m, struct pt_regs *regs, char **msg, bool is_excp)
 {
 	enum context ctx = error_context(m, regs);
 
@@ -385,8 +384,7 @@ static noinstr int mce_severity_amd(struct mce *m, struct pt_regs *regs, int tol
 	return MCE_KEEP_SEVERITY;
 }
 
-static noinstr int mce_severity_intel(struct mce *m, struct pt_regs *regs,
-				      int tolerant, char **msg, bool is_excp)
+static noinstr int mce_severity_intel(struct mce *m, struct pt_regs *regs, char **msg, bool is_excp)
 {
 	enum exception excp = (is_excp ? EXCP_CONTEXT : NO_EXCP);
 	enum context ctx = error_context(m, regs);
@@ -414,22 +412,21 @@ static noinstr int mce_severity_intel(struct mce *m, struct pt_regs *regs,
 		if (msg)
 			*msg = s->msg;
 		s->covered = 1;
-		if (s->sev >= MCE_UC_SEVERITY && ctx == IN_KERNEL) {
-			if (tolerant < 1)
-				return MCE_PANIC_SEVERITY;
-		}
+
+		if (s->sev >= MCE_UC_SEVERITY && ctx == IN_KERNEL)
+			return MCE_PANIC_SEVERITY;
+
 		return s->sev;
 	}
 }
 
-int noinstr mce_severity(struct mce *m, struct pt_regs *regs, int tolerant, char **msg,
-			 bool is_excp)
+int noinstr mce_severity(struct mce *m, struct pt_regs *regs, char **msg, bool is_excp)
 {
 	if (boot_cpu_data.x86_vendor == X86_VENDOR_AMD ||
 	    boot_cpu_data.x86_vendor == X86_VENDOR_HYGON)
-		return mce_severity_amd(m, regs, tolerant, msg, is_excp);
+		return mce_severity_amd(m, regs, msg, is_excp);
 	else
-		return mce_severity_intel(m, regs, tolerant, msg, is_excp);
+		return mce_severity_intel(m, regs, msg, is_excp);
 }
 
 #ifdef CONFIG_DEBUG_FS
