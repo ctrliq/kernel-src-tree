@@ -1008,4 +1008,8 @@ static inline unsigned long find_kallsyms_symbol_value(struct module *mod,
 
 #endif  /* CONFIG_MODULES && CONFIG_KALLSYMS */
 
+#ifdef CONFIG_RHEL_DIFFERENCES
+void module_rh_check_status(const char * module_name);
+#endif
+
 #endif /* _LINUX_MODULE_H */
