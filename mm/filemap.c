@@ -2383,7 +2383,7 @@ retry:
 	rcu_read_unlock();
 }
 
-static int filemap_read_folio(struct file *file, struct address_space *mapping,
+static int filemap_read_folio(struct file *file, filler_t filler,
 		struct folio *folio)
 {
 	bool workingset = folio_test_workingset(folio);
@@ -2400,7 +2400,7 @@ static int filemap_read_folio(struct file *file, struct address_space *mapping,
 	/* Start the actual read. The read will unlock the page. */
 	if (unlikely(workingset))
 		psi_memstall_enter(&pflags);
-	error = mapping->a_ops->read_folio(file, folio);
+	error = filler(file, folio);
 	if (unlikely(workingset))
 		psi_memstall_leave(&pflags);
 	if (error)
@@ -2411,7 +2411,8 @@ static int filemap_read_folio(struct file *file, struct address_space *mapping,
 		return error;
 	if (folio_test_uptodate(folio))
 		return 0;
-	shrink_readahead_size_eio(&file->f_ra);
+	if (file)
+		shrink_readahead_size_eio(&file->f_ra);
 	return -EIO;
 }
 
@@ -2484,7 +2485,8 @@ static int filemap_update_page(struct kiocb *iocb,
 	if (iocb->ki_flags & (IOCB_NOIO | IOCB_NOWAIT | IOCB_WAITQ))
 		goto unlock;
 
-	error = filemap_read_folio(iocb->ki_filp, mapping, folio);
+	error = filemap_read_folio(iocb->ki_filp, mapping->a_ops->read_folio,
+			folio);
 	goto unlock_mapping;
 unlock:
 	folio_unlock(folio);
@@ -2527,7 +2529,7 @@ static int filemap_create_folio(struct file *file,
 	if (error)
 		goto error;
 
-	error = filemap_read_folio(file, mapping, folio);
+	error = filemap_read_folio(file, mapping->a_ops->read_folio, folio);
 	if (error)
 		goto error;
 
@@ -3211,7 +3213,7 @@ page_not_uptodate:
 	 * and we need to check for errors.
 	 */
 	fpin = maybe_unlock_mmap_for_io(vmf, fpin);
-	error = filemap_read_folio(file, mapping, folio);
+	error = filemap_read_folio(file, mapping->a_ops->read_folio, folio);
 	if (fpin)
 		goto out_retry;
 	folio_put(folio);
@@ -3524,26 +3526,13 @@ repeat:
 		goto out;
 	}
 
-	/*
-	 * A previous I/O error may have been due to temporary
-	 * failures.
-	 * Clear page error before actual read, PG_error will be
-	 * set again if read page fails.
-	 */
-	folio_clear_error(folio);
 filler:
-	err = filler(file, folio);
+	err = filemap_read_folio(file, filler, folio);
 	if (err) {
 		folio_put(folio);
 		if (err == AOP_TRUNCATED_PAGE)
 			goto repeat;
 		return ERR_PTR(err);
-	}
-
-	folio_wait_locked(folio);
-	if (!folio_test_uptodate(folio)) {
-		folio_put(folio);
-		return ERR_PTR(-EIO);
 	}
 
 out:
