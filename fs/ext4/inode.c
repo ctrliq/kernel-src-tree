@@ -3202,8 +3202,9 @@ out:
 	return ret;
 }
 
-static int ext4_readpage(struct file *file, struct page *page)
+static int ext4_read_folio(struct file *file, struct folio *folio)
 {
+	struct page *page = &folio->page;
 	int ret = -EAGAIN;
 	struct inode *inode = page->mapping->host;
 
@@ -3616,7 +3617,7 @@ static int ext4_iomap_swap_activate(struct swap_info_struct *sis,
 }
 
 static const struct address_space_operations ext4_aops = {
-	.readpage		= ext4_readpage,
+	.read_folio		= ext4_read_folio,
 	.readahead		= ext4_readahead,
 	.writepage		= ext4_writepage,
 	.writepages		= ext4_writepages,
@@ -3634,7 +3635,7 @@ static const struct address_space_operations ext4_aops = {
 };
 
 static const struct address_space_operations ext4_journalled_aops = {
-	.readpage		= ext4_readpage,
+	.read_folio		= ext4_read_folio,
 	.readahead		= ext4_readahead,
 	.writepage		= ext4_writepage,
 	.writepages		= ext4_writepages,
@@ -3651,7 +3652,7 @@ static const struct address_space_operations ext4_journalled_aops = {
 };
 
 static const struct address_space_operations ext4_da_aops = {
-	.readpage		= ext4_readpage,
+	.read_folio		= ext4_read_folio,
 	.readahead		= ext4_readahead,
 	.writepage		= ext4_writepage,
 	.writepages		= ext4_writepages,
