@@ -5,6 +5,7 @@
 	\renewcommand\thesection*
 	\renewcommand\thesubsection*
 	\kerneldocCJKon
+	\kerneldocBeginSC
 
 .. _linux_doc_zh:
 
@@ -184,3 +185,7 @@ TODOList:
 ----------
 
 * :ref:`genindex`
+
+.. raw:: latex
+
+	\kerneldocEndSC
