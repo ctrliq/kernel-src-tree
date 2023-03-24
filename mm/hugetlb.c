@@ -6421,8 +6421,10 @@ long hugetlb_change_protection(struct vm_area_struct *vma,
 			 * pre-allocations to install pte markers.
 			 */
 			ptep = huge_pte_alloc(mm, vma, address, psize);
-			if (!ptep)
+			if (!ptep) {
+				pages = -ENOMEM;
 				break;
+			}
 		}
 		ptl = huge_pte_lock(h, mm, ptep);
 		if (huge_pmd_unshare(mm, vma, address, ptep)) {
@@ -6511,7 +6513,7 @@ long hugetlb_change_protection(struct vm_area_struct *vma,
 	i_mmap_unlock_write(vma->vm_file->f_mapping);
 	mmu_notifier_invalidate_range_end(&range);
 
-	return pages << h->order;
+	return pages > 0 ? (pages << h->order) : pages;
 }
 
 /* Return true if reservation was successful, false otherwise.  */
