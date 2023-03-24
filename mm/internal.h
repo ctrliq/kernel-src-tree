@@ -877,4 +877,6 @@ static inline bool vma_soft_dirty_enabled(struct vm_area_struct *vma)
 	return !(vma->vm_flags & VM_SOFTDIRTY);
 }
 
+extern bool mirrored_kernelcore;
+
 #endif	/* __MM_INTERNAL_H */
