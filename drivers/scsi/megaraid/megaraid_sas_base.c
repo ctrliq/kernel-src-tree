@@ -145,11 +145,6 @@ static void
 megasas_set_ld_removed_by_fw(struct megasas_instance *instance);
 
 #ifdef CONFIG_RHEL_DIFFERENCES
-static const struct pci_device_id rh_deprecated_pci_table[] = {
-
-	{0}     /* Terminating entry */
-};
-
 static const struct pci_device_id rh_disabled_pci_table[] = {
 
 	{PCI_DEVICE(PCI_VENDOR_ID_LSI_LOGIC, PCI_DEVICE_ID_LSI_SAS1064R)},
@@ -7485,8 +7480,6 @@ static int megasas_probe_one(struct pci_dev *pdev,
 #ifdef CONFIG_RHEL_DIFFERENCES
 	if (pci_hw_disabled(rh_disabled_pci_table, pdev))
 		return -ENODEV;
-
-	pci_hw_deprecated(rh_deprecated_pci_table, pdev);
 #endif
 
 	switch (pdev->device) {

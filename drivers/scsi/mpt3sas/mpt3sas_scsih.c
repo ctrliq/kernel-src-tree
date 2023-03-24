@@ -12091,11 +12091,6 @@ _scsih_determine_hba_mpi_version(struct pci_dev *pdev)
 }
 
 #ifdef CONFIG_RHEL_DIFFERENCES
-static const struct pci_device_id rh_deprecated_pci_table[] = {
-
-	{0}     /* Terminating entry */
-};
-
 static const struct pci_device_id rh_disabled_pci_table[] = {
 	/* Spitfire ~ 2004 */
 	{ MPI2_MFGPAGE_VENDORID_LSI, MPI2_MFGPAGE_DEVID_SAS2004,
@@ -12143,8 +12138,6 @@ _scsih_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 #ifdef CONFIG_RHEL_DIFFERENCES
 	if (pci_hw_disabled(rh_disabled_pci_table, pdev))
 		return -ENODEV;
-
-	pci_hw_deprecated(rh_deprecated_pci_table, pdev);
 #endif
 
 	/* Determine in which MPI version class this pci device belongs */

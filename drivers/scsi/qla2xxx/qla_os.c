@@ -2870,10 +2870,6 @@ static void qla2x00_iocb_work_fn(struct work_struct *work)
 }
 
 #ifdef CONFIG_RHEL_DIFFERENCES
-static const struct pci_device_id rh_deprecated_pci_table[] = {
-	{ 0 }
-};
-
 static const struct pci_device_id rh_disabled_pci_table[] = {
 	{ 0 }
 };
@@ -2922,8 +2918,6 @@ qla2x00_probe_one(struct pci_dev *pdev, const struct pci_device_id *id)
 #ifdef CONFIG_RHEL_DIFFERENCES
 	if (pci_hw_disabled(rh_disabled_pci_table, pdev))
 		return -ENODEV;
-
-	pci_hw_deprecated(rh_deprecated_pci_table, pdev);
 #endif
 
 	bars = pci_select_bars(pdev, IORESOURCE_MEM | IORESOURCE_IO);

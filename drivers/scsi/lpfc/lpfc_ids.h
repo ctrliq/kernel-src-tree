@@ -168,10 +168,6 @@ const struct pci_device_id lpfc_id_table[] = {
 };
 
 #ifdef CONFIG_RHEL_DIFFERENCES
-static const struct pci_device_id rh_deprecated_pci_table[] = {
-	{ 0 }
-};
-
 static const struct pci_device_id rh_disabled_pci_table[] = {
 	{ 0 }
 };

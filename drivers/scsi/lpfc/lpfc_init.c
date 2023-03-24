@@ -15492,8 +15492,6 @@ lpfc_pci_probe_one(struct pci_dev *pdev, const struct pci_device_id *pid)
 #ifdef CONFIG_RHEL_DIFFERENCES
 	if (pci_hw_disabled(rh_disabled_pci_table, pdev))
 		return -ENODEV;
-
-	pci_hw_deprecated(rh_deprecated_pci_table, pdev);
 #endif
 
 	if (pci_read_config_dword(pdev, LPFC_SLI_INTF, &intf.word0))

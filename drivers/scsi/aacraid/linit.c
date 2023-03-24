@@ -72,11 +72,6 @@ static int aac_cfg_major = AAC_CHARDEV_UNREGISTERED;
 char aac_driver_version[] = AAC_DRIVER_FULL_VERSION;
 
 #ifdef CONFIG_RHEL_DIFFERENCES
-static const struct pci_device_id rh_deprecated_pci_table[] = {
-
-	{0}     /* Terminating entry */
-};
-
 static const struct pci_device_id rh_disabled_pci_table[] = {
 
 	{ 0x1028, 0x0001, 0x1028, 0x0001, 0, 0, 0 }, /* PERC 2/Si (Iguana/PERC2Si) */
@@ -1666,8 +1661,6 @@ static int aac_probe_one(struct pci_dev *pdev, const struct pci_device_id *id)
 #ifdef CONFIG_RHEL_DIFFERENCES
 	if (pci_hw_disabled(rh_disabled_pci_table, pdev))
 		return -ENODEV;
-
-	pci_hw_deprecated(rh_deprecated_pci_table, pdev);
 #endif
 
 	/*
