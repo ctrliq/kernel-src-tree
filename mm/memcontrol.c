@@ -4836,9 +4836,6 @@ static ssize_t memcg_write_event_control(struct kernfs_open_file *of,
 	char *endp;
 	int ret;
 
-	if (IS_ENABLED(CONFIG_PREEMPT_RT))
-		return -EOPNOTSUPP;
-
 	buf = strstrip(buf);
 
 	efd = simple_strtoul(buf, &endp, 10);
@@ -4895,12 +4892,20 @@ static ssize_t memcg_write_event_control(struct kernfs_open_file *of,
 	 */
 	name = cfile.file->f_path.dentry->d_name.name;
 
-	if (!strcmp(name, "memory.usage_in_bytes")) {
-		event->register_event = mem_cgroup_usage_register_event;
-		event->unregister_event = mem_cgroup_usage_unregister_event;
-	} else if (!strcmp(name, "memory.oom_control")) {
+	/*
+	 * Notifications sent for anything but OOM are done in problematic
+	 * context for PREEMPT_RT - IRQ/preemption must be disabled due to
+	 * fiddling with percpu stats, but signaling via eventfd implies
+	 * acquiring a non-raw spinlock.
+	 */
+	if (!strcmp(name, "memory.oom_control")) {
 		event->register_event = mem_cgroup_oom_register_event;
 		event->unregister_event = mem_cgroup_oom_unregister_event;
+	} else if (IS_ENABLED(CONFIG_PREEMPT_RT)) {
+		goto invalid;
+	} else if (!strcmp(name, "memory.usage_in_bytes")) {
+		event->register_event = mem_cgroup_usage_register_event;
+		event->unregister_event = mem_cgroup_usage_unregister_event;
 	} else if (!strcmp(name, "memory.pressure_level")) {
 		event->register_event = vmpressure_register_event;
 		event->unregister_event = vmpressure_unregister_event;
@@ -4908,6 +4913,7 @@ static ssize_t memcg_write_event_control(struct kernfs_open_file *of,
 		event->register_event = memsw_cgroup_usage_register_event;
 		event->unregister_event = memsw_cgroup_usage_unregister_event;
 	} else {
+invalid:
 		ret = -EINVAL;
 		goto out_put_cfile;
 	}
