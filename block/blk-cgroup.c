@@ -58,7 +58,6 @@ static struct blkcg_policy *blkcg_policy[BLKCG_MAX_POLS];
 static LIST_HEAD(all_blkcgs);		/* protected by blkcg_pol_mutex */
 
 bool blkcg_debug_stats = false;
-static struct workqueue_struct *blkcg_punt_bio_wq;
 
 static DEFINE_RAW_SPINLOCK(blkg_stat_lock);
 
@@ -174,7 +173,9 @@ static void __blkg_release(struct rcu_head *rcu)
 	struct blkcg *blkcg = blkg->blkcg;
 	int cpu;
 
+#ifdef CONFIG_BLK_CGROUP_PUNT_BIO
 	WARN_ON(!bio_list_empty(&blkg->async_bios));
+#endif
 	/*
 	 * Flush all the non-empty percpu lockless lists before releasing
 	 * us, given these stat belongs to us.
@@ -204,6 +205,9 @@ static void blkg_release(struct percpu_ref *ref)
 	call_rcu(&blkg->rcu_head, __blkg_release);
 }
 
+#ifdef CONFIG_BLK_CGROUP_PUNT_BIO
+static struct workqueue_struct *blkcg_punt_bio_wq;
+
 static void blkg_async_bio_workfn(struct work_struct *work)
 {
 	struct blkcg_gq *blkg = container_of(work, struct blkcg_gq,
@@ -229,6 +233,40 @@ static void blkg_async_bio_workfn(struct work_struct *work)
 	if (need_plug)
 		blk_finish_plug(&plug);
 }
+
+/*
+ * When a shared kthread issues a bio for a cgroup, doing so synchronously can
+ * lead to priority inversions as the kthread can be trapped waiting for that
+ * cgroup.  Use this helper instead of submit_bio to punt the actual issuing to
+ * a dedicated per-blkcg work item to avoid such priority inversions.
+ */
+void blkcg_punt_bio_submit(struct bio *bio)
+{
+	struct blkcg_gq *blkg = bio->bi_blkg;
+
+	if (blkg->parent) {
+		spin_lock(&blkg->async_bio_lock);
+		bio_list_add(&blkg->async_bios, bio);
+		spin_unlock(&blkg->async_bio_lock);
+		queue_work(blkcg_punt_bio_wq, &blkg->async_bio_work);
+	} else {
+		/* never bounce for the root cgroup */
+		submit_bio(bio);
+	}
+}
+EXPORT_SYMBOL_GPL(blkcg_punt_bio_submit);
+
+static int __init blkcg_punt_bio_init(void)
+{
+	blkcg_punt_bio_wq = alloc_workqueue("blkcg_punt_bio",
+					    WQ_MEM_RECLAIM | WQ_FREEZABLE |
+					    WQ_UNBOUND | WQ_SYSFS, 0);
+	if (!blkcg_punt_bio_wq)
+		return -ENOMEM;
+	return 0;
+}
+subsys_initcall(blkcg_punt_bio_init);
+#endif /* CONFIG_BLK_CGROUP_PUNT_BIO */
 
 /**
  * bio_blkcg_css - return the blkcg CSS associated with a bio
@@ -285,10 +323,12 @@ static struct blkcg_gq *blkg_alloc(struct blkcg *blkcg, struct gendisk *disk,
 
 	blkg->q = disk->queue;
 	INIT_LIST_HEAD(&blkg->q_node);
+	blkg->blkcg = blkcg;
+#ifdef CONFIG_BLK_CGROUP_PUNT_BIO
 	spin_lock_init(&blkg->async_bio_lock);
 	bio_list_init(&blkg->async_bios);
 	INIT_WORK(&blkg->async_bio_work, blkg_async_bio_workfn);
-	blkg->blkcg = blkcg;
+#endif
 	blkg->iostat.blkg = blkg;
 
 	u64_stats_init(&blkg->iostat.sync);
@@ -1783,28 +1823,6 @@ out_unlock:
 EXPORT_SYMBOL_GPL(blkcg_policy_unregister);
 
 /*
- * When a shared kthread issues a bio for a cgroup, doing so synchronously can
- * lead to priority inversions as the kthread can be trapped waiting for that
- * cgroup.  Use this helper instead of submit_bio to punt the actual issuing to
- * a dedicated per-blkcg work item to avoid such priority inversions.
- */
-void blkcg_punt_bio_submit(struct bio *bio)
-{
-	struct blkcg_gq *blkg = bio->bi_blkg;
-
-	if (blkg->parent) {
-		spin_lock(&blkg->async_bio_lock);
-		bio_list_add(&blkg->async_bios, bio);
-		spin_unlock(&blkg->async_bio_lock);
-		queue_work(blkcg_punt_bio_wq, &blkg->async_bio_work);
-	} else {
-		/* never bounce for the root cgroup */
-		submit_bio(bio);
-	}
-}
-EXPORT_SYMBOL_GPL(blkcg_punt_bio_submit);
-
-/*
  * Scale the accumulated delay based on how long it has been since we updated
  * the delay.  We only call this when we are adding delay, in case it's been a
  * while since we added delay, and when we are checking to see if we need to
@@ -2185,17 +2203,6 @@ bool blk_cgroup_congested(void)
 	rcu_read_unlock();
 	return ret;
 }
-
-static int __init blkcg_init(void)
-{
-	blkcg_punt_bio_wq = alloc_workqueue("blkcg_punt_bio",
-					    WQ_MEM_RECLAIM | WQ_FREEZABLE |
-					    WQ_UNBOUND | WQ_SYSFS, 0);
-	if (!blkcg_punt_bio_wq)
-		return -ENOMEM;
-	return 0;
-}
-subsys_initcall(blkcg_init);
 
 module_param(blkcg_debug_stats, bool, 0644);
 MODULE_PARM_DESC(blkcg_debug_stats, "True if you want debug stats, false if not");
