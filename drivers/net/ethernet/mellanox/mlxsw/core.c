@@ -3092,17 +3092,17 @@ void mlxsw_core_cpu_port_fini(struct mlxsw_core *mlxsw_core)
 }
 EXPORT_SYMBOL(mlxsw_core_cpu_port_fini);
 
-void mlxsw_core_port_eth_set(struct mlxsw_core *mlxsw_core, u16 local_port,
-			     void *port_driver_priv, struct net_device *dev)
+void mlxsw_core_port_netdev_link(struct mlxsw_core *mlxsw_core, u16 local_port,
+				 void *port_driver_priv, struct net_device *dev)
 {
 	struct mlxsw_core_port *mlxsw_core_port =
 					&mlxsw_core->ports[local_port];
 	struct devlink_port *devlink_port = &mlxsw_core_port->devlink_port;
 
 	mlxsw_core_port->port_driver_priv = port_driver_priv;
-	devlink_port_type_eth_set(devlink_port, dev);
+	SET_NETDEV_DEVLINK_PORT(dev, devlink_port);
 }
-EXPORT_SYMBOL(mlxsw_core_port_eth_set);
+EXPORT_SYMBOL(mlxsw_core_port_netdev_link);
 
 void mlxsw_core_port_ib_set(struct mlxsw_core *mlxsw_core, u16 local_port,
 			    void *port_driver_priv)
@@ -3115,18 +3115,6 @@ void mlxsw_core_port_ib_set(struct mlxsw_core *mlxsw_core, u16 local_port,
 	devlink_port_type_ib_set(devlink_port, NULL);
 }
 EXPORT_SYMBOL(mlxsw_core_port_ib_set);
-
-void mlxsw_core_port_clear(struct mlxsw_core *mlxsw_core, u16 local_port,
-			   void *port_driver_priv)
-{
-	struct mlxsw_core_port *mlxsw_core_port =
-					&mlxsw_core->ports[local_port];
-	struct devlink_port *devlink_port = &mlxsw_core_port->devlink_port;
-
-	mlxsw_core_port->port_driver_priv = port_driver_priv;
-	devlink_port_type_clear(devlink_port);
-}
-EXPORT_SYMBOL(mlxsw_core_port_clear);
 
 enum devlink_port_type mlxsw_core_port_type_get(struct mlxsw_core *mlxsw_core,
 						u16 local_port)

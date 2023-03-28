@@ -2519,6 +2519,8 @@ static int am65_cpsw_nuss_register_ndevs(struct am65_cpsw_common *common)
 		if (!port->ndev)
 			continue;
 
+		SET_NETDEV_DEVLINK_PORT(port->ndev, &port->devlink_port);
+
 		ret = register_netdev(port->ndev);
 		if (ret) {
 			dev_err(dev, "error registering slave net device%i %d\n",
