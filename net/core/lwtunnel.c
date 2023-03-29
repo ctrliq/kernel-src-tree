@@ -46,9 +46,11 @@ static const char *lwtunnel_encap_str(enum lwtunnel_encap_types encap_type)
 	case LWTUNNEL_ENCAP_IOAM6:
 		/* currently not implemented in RHEL 9 */
 		return NULL;
+	case LWTUNNEL_ENCAP_XFRM:
+		/* module autoload not supported for encap type */
+		return NULL;
 	case LWTUNNEL_ENCAP_IP6:
 	case LWTUNNEL_ENCAP_IP:
-	case LWTUNNEL_ENCAP_XFRM:
 	case LWTUNNEL_ENCAP_NONE:
 	case __LWTUNNEL_ENCAP_MAX:
 		/* should not have got here */
