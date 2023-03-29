@@ -38,12 +38,22 @@ struct genl_info;
  *	undo operations done by pre_doit, for example release locks
  * @mcgrps: multicast groups used by this family
  * @n_mcgrps: number of multicast groups
+ * @resv_start_op: first operation for which reserved fields of the header
+ *	can be validated and policies are required (see below);
+ *	new families should leave this field at zero
  * @mcgrp_offset: starting number of multicast group IDs in this family
  *	(private)
  * @ops: the operations supported by this family
  * @n_ops: number of operations supported by this family
  * @small_ops: the small-struct operations supported by this family
  * @n_small_ops: number of small-struct operations supported by this family
+ *
+ * Attribute policies (the combination of @policy and @maxattr fields)
+ * can be attached at the family level or at the operation level.
+ * If both are present the per-operation policy takes precedence.
+ * For operations before @resv_start_op lack of policy means that the core
+ * will perform no attribute parsing or validation. For newer operations
+ * if policy is not provided core will reject all TLV attributes.
  */
 struct genl_family {
 	int			id;		/* private */
@@ -57,6 +67,7 @@ struct genl_family {
 	u8			n_ops;
 	u8			n_small_ops;
 	u8			n_mcgrps;
+	u8			resv_start_op;
 	const struct nla_policy *policy;
 	int			(*pre_doit)(const struct genl_ops *ops,
 					    struct sk_buff *skb,
