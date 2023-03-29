@@ -580,7 +580,7 @@ extern int  nfs_updatepage(struct file *, struct page *, unsigned int, unsigned 
 extern int nfs_sync_inode(struct inode *inode);
 extern int nfs_wb_all(struct inode *inode);
 extern int nfs_wb_page(struct inode *inode, struct page *page);
-extern int nfs_wb_page_cancel(struct inode *inode, struct page* page);
+int nfs_wb_folio_cancel(struct inode *inode, struct folio *folio);
 extern int  nfs_commit_inode(struct inode *, int);
 extern struct nfs_commit_data *nfs_commitdata_alloc(void);
 extern void nfs_commit_free(struct nfs_commit_data *data);
@@ -596,7 +596,7 @@ static inline bool nfs_have_writebacks(const struct inode *inode)
 /*
  * linux/fs/nfs/read.c
  */
-extern int  nfs_readpage(struct file *, struct page *);
+int  nfs_read_folio(struct file *, struct folio *);
 void nfs_readahead(struct readahead_control *);
 
 /*

@@ -964,7 +964,34 @@ static inline void iounmap(void __iomem *addr)
 #elif defined(CONFIG_GENERIC_IOREMAP)
 #include <linux/pgtable.h>
 
-void __iomem *ioremap_prot(phys_addr_t addr, size_t size, unsigned long prot);
+/*
+ * Arch code can implement the following two hooks when using GENERIC_IOREMAP
+ * ioremap_allowed() return a bool,
+ *   - true means continue to remap
+ *   - false means skip remap and return directly
+ * iounmap_allowed() return a bool,
+ *   - true means continue to vunmap
+ *   - false means skip vunmap and return directly
+ */
+#ifndef ioremap_allowed
+#define ioremap_allowed ioremap_allowed
+static inline bool ioremap_allowed(phys_addr_t phys_addr, size_t size,
+				   unsigned long prot)
+{
+	return true;
+}
+#endif
+
+#ifndef iounmap_allowed
+#define iounmap_allowed iounmap_allowed
+static inline bool iounmap_allowed(void *addr)
+{
+	return true;
+}
+#endif
+
+void __iomem *ioremap_prot(phys_addr_t phys_addr, size_t size,
+			   unsigned long prot);
 void iounmap(volatile void __iomem *addr);
 
 static inline void __iomem *ioremap(phys_addr_t addr, size_t size)
@@ -1077,20 +1104,6 @@ static inline void *xlate_dev_mem_ptr(phys_addr_t addr)
 static inline void unxlate_dev_mem_ptr(phys_addr_t phys, void *addr)
 {
 }
-#endif
-
-#ifdef CONFIG_VIRT_TO_BUS
-#ifndef virt_to_bus
-static inline unsigned long virt_to_bus(void *address)
-{
-	return (unsigned long)address;
-}
-
-static inline void *bus_to_virt(unsigned long address)
-{
-	return (void *)address;
-}
-#endif
 #endif
 
 #ifndef memset_io

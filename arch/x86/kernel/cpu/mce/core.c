@@ -86,20 +86,11 @@ struct mce_vendor_flags mce_flags __read_mostly;
 
 struct mca_config mca_cfg __read_mostly = {
 	.bootlog  = -1,
-	/*
-	 * Tolerant levels:
-	 * 0: always panic on uncorrected errors, log corrected errors
-	 * 1: panic or SIGBUS on uncorrected errors, log corrected errors
-	 * 2: SIGBUS or log uncorrected errors (if possible), log corr. errors
-	 * 3: never panic or SIGBUS, log all errors (for testing only)
-	 */
-	.tolerant = 1,
 	.monarch_timeout = -1
 };
 
 static DEFINE_PER_CPU(struct mce, mces_seen);
 static unsigned long mce_need_notify;
-static int cpu_missing;
 
 /*
  * MCA banks polled by the period polling timer for corrected events.
@@ -337,8 +328,6 @@ static void mce_panic(const char *msg, struct mce *final, char *exp)
 		if (!apei_err)
 			apei_err = apei_write_mce(final);
 	}
-	if (cpu_missing)
-		pr_emerg(HW_ERR "Some CPUs didn't answer in synchronization\n");
 	if (exp)
 		pr_emerg(HW_ERR "Machine check: %s\n", exp);
 	if (!fake_panic) {
@@ -785,7 +774,7 @@ log_it:
 			goto clear_it;
 
 		mce_read_aux(&m, i);
-		m.severity = mce_severity(&m, NULL, mca_cfg.tolerant, NULL, false);
+		m.severity = mce_severity(&m, NULL, NULL, false);
 		/*
 		 * Don't get the IP here because it's unlikely to
 		 * have anything to do with the actual error location.
@@ -837,7 +826,7 @@ static int mce_no_way_out(struct mce *m, char **msg, unsigned long *validp,
 			quirk_no_way_out(i, m, regs);
 
 		m->bank = i;
-		if (mce_severity(m, regs, mca_cfg.tolerant, &tmp, true) >= MCE_PANIC_SEVERITY) {
+		if (mce_severity(m, regs, &tmp, true) >= MCE_PANIC_SEVERITY) {
 			mce_read_aux(m, i);
 			*msg = tmp;
 			return 1;
@@ -866,8 +855,13 @@ static cpumask_t mce_missing_cpus = CPU_MASK_ALL;
 /*
  * Check if a timeout waiting for other CPUs happened.
  */
-static int mce_timed_out(u64 *t, const char *msg)
+static noinstr int mce_timed_out(u64 *t, const char *msg)
 {
+	int ret = 0;
+
+	/* Enable instrumentation around calls to external facilities */
+	instrumentation_begin();
+
 	/*
 	 * The others already did panic for some reason.
 	 * Bail out like in a timeout.
@@ -880,19 +874,22 @@ static int mce_timed_out(u64 *t, const char *msg)
 	if (!mca_cfg.monarch_timeout)
 		goto out;
 	if ((s64)*t < SPINUNIT) {
-		if (mca_cfg.tolerant <= 1) {
-			if (cpumask_and(&mce_missing_cpus, cpu_online_mask, &mce_missing_cpus))
-				pr_emerg("CPUs not responding to MCE broadcast (may include false positives): %*pbl\n",
-					 cpumask_pr_args(&mce_missing_cpus));
-			mce_panic(msg, NULL, NULL);
-		}
-		cpu_missing = 1;
-		return 1;
+		if (cpumask_and(&mce_missing_cpus, cpu_online_mask, &mce_missing_cpus))
+			pr_emerg("CPUs not responding to MCE broadcast (may include false positives): %*pbl\n",
+				 cpumask_pr_args(&mce_missing_cpus));
+		mce_panic(msg, NULL, NULL);
+
+		ret = 1;
+		goto out;
 	}
 	*t -= SPINUNIT;
+
 out:
 	touch_nmi_watchdog();
-	return 0;
+
+	instrumentation_end();
+
+	return ret;
 }
 
 /*
@@ -945,9 +942,9 @@ static void mce_reign(void)
 	 * This dumps all the mces in the log buffer and stops the
 	 * other CPUs.
 	 */
-	if (m && global_worst >= MCE_PANIC_SEVERITY && mca_cfg.tolerant < 3) {
+	if (m && global_worst >= MCE_PANIC_SEVERITY) {
 		/* call mce_severity() to get "msg" for panic */
-		mce_severity(m, NULL, mca_cfg.tolerant, &msg, true);
+		mce_severity(m, NULL, &msg, true);
 		mce_panic("Fatal machine check", m, msg);
 	}
 
@@ -961,7 +958,7 @@ static void mce_reign(void)
 	 * No machine check event found. Must be some external
 	 * source or one CPU is hung. Panic.
 	 */
-	if (global_worst <= MCE_KEEP_SEVERITY && mca_cfg.tolerant < 3)
+	if (global_worst <= MCE_KEEP_SEVERITY)
 		mce_panic("Fatal machine check from unknown source", NULL, NULL);
 
 	/*
@@ -1195,7 +1192,7 @@ static void __mc_scan_banks(struct mce *m, struct pt_regs *regs, struct mce *fin
 		/* Set taint even when machine check was not enabled. */
 		add_taint(TAINT_MACHINE_CHECK, LOCKDEP_NOW_UNRELIABLE);
 
-		severity = mce_severity(m, regs, cfg->tolerant, NULL, true);
+		severity = mce_severity(m, regs, NULL, true);
 
 		/*
 		 * When machine check was for corrected/deferred handler don't
@@ -1305,6 +1302,15 @@ static void queue_task_work(struct mce *m, char *msg, int kill_current_task)
 	task_work_add(current, &current->mce_kill_me, TWA_RESUME);
 }
 
+/* Handle unconfigured int18 (should never happen) */
+static noinstr void unexpected_machine_check(struct pt_regs *regs)
+{
+	instrumentation_begin();
+	pr_err("CPU#%d: Unexpected int18 (Machine Check)\n",
+	       smp_processor_id());
+	instrumentation_end();
+}
+
 /*
  * The actual machine check handler. This only handles real
  * exceptions when something got corrupted coming in through int 18.
@@ -1325,36 +1331,42 @@ static void queue_task_work(struct mce *m, char *msg, int kill_current_task)
  */
 noinstr void do_machine_check(struct pt_regs *regs)
 {
-	DECLARE_BITMAP(valid_banks, MAX_NR_BANKS);
-	DECLARE_BITMAP(toclear, MAX_NR_BANKS);
-	struct mca_config *cfg = &mca_cfg;
+	int worst = 0, order, no_way_out, kill_current_task, lmce;
+	DECLARE_BITMAP(valid_banks, MAX_NR_BANKS) = { 0 };
+	DECLARE_BITMAP(toclear, MAX_NR_BANKS) = { 0 };
 	struct mce m, *final;
 	char *msg = NULL;
-	int worst = 0;
+
+	if (unlikely(mce_flags.p5))
+		return pentium_machine_check(regs);
+	else if (unlikely(mce_flags.winchip))
+		return winchip_machine_check(regs);
+	else if (unlikely(!mca_cfg.initialized))
+		return unexpected_machine_check(regs);
 
 	/*
 	 * Establish sequential order between the CPUs entering the machine
 	 * check handler.
 	 */
-	int order = -1;
+	order = -1;
 
 	/*
 	 * If no_way_out gets set, there is no safe way to recover from this
-	 * MCE.  If mca_cfg.tolerant is cranked up, we'll try anyway.
+	 * MCE.
 	 */
-	int no_way_out = 0;
+	no_way_out = 0;
 
 	/*
 	 * If kill_current_task is not set, there might be a way to recover from this
 	 * error.
 	 */
-	int kill_current_task = 0;
+	kill_current_task = 0;
 
 	/*
 	 * MCEs are always local on AMD. Same is determined by MCG_STATUS_LMCES
 	 * on Intel.
 	 */
-	int lmce = 1;
+	lmce = 1;
 
 	this_cpu_inc(mce_exception_count);
 
@@ -1364,7 +1376,6 @@ noinstr void do_machine_check(struct pt_regs *regs)
 	final = this_cpu_ptr(&mces_seen);
 	*final = m;
 
-	memset(valid_banks, 0, sizeof(valid_banks));
 	no_way_out = mce_no_way_out(&m, &msg, valid_banks, regs);
 
 	barrier();
@@ -1375,7 +1386,7 @@ noinstr void do_machine_check(struct pt_regs *regs)
 	 * severity is MCE_AR_SEVERITY we have other options.
 	 */
 	if (!(m.mcgstatus & MCG_STATUS_RIPV))
-		kill_current_task = (cfg->tolerant == 3) ? 0 : 1;
+		kill_current_task = 1;
 	/*
 	 * Check if this MCE is signaled to only this logical processor,
 	 * on Intel, Zhaoxin only.
@@ -1392,7 +1403,7 @@ noinstr void do_machine_check(struct pt_regs *regs)
 	 * to see it will clear it.
 	 */
 	if (lmce) {
-		if (no_way_out && cfg->tolerant < 3)
+		if (no_way_out)
 			mce_panic("Fatal local machine check", &m, msg);
 	} else {
 		order = mce_start(&no_way_out);
@@ -1412,7 +1423,7 @@ noinstr void do_machine_check(struct pt_regs *regs)
 			if (!no_way_out)
 				no_way_out = worst >= MCE_PANIC_SEVERITY;
 
-			if (no_way_out && cfg->tolerant < 3)
+			if (no_way_out)
 				mce_panic("Fatal machine check on current CPU", &m, msg);
 		}
 	} else {
@@ -1424,8 +1435,8 @@ noinstr void do_machine_check(struct pt_regs *regs)
 		 * fatal error. We call "mce_severity()" again to
 		 * make sure we have the right "msg".
 		 */
-		if (worst >= MCE_PANIC_SEVERITY && mca_cfg.tolerant < 3) {
-			mce_severity(&m, regs, cfg->tolerant, &msg, true);
+		if (worst >= MCE_PANIC_SEVERITY) {
+			mce_severity(&m, regs, &msg, true);
 			mce_panic("Local fatal machine check!", &m, msg);
 		}
 	}
@@ -1829,9 +1840,11 @@ static int __mcheck_cpu_ancient_init(struct cpuinfo_x86 *c)
 	switch (c->x86_vendor) {
 	case X86_VENDOR_INTEL:
 		intel_p5_mcheck_init(c);
+		mce_flags.p5 = 1;
 		return 1;
 	case X86_VENDOR_CENTAUR:
 		winchip_mcheck_init(c);
+		mce_flags.winchip = 1;
 		return 1;
 	default:
 		return 0;
@@ -1986,18 +1999,6 @@ bool filter_mce(struct mce *m)
 	return false;
 }
 
-/* Handle unconfigured int18 (should never happen) */
-static noinstr void unexpected_machine_check(struct pt_regs *regs)
-{
-	instrumentation_begin();
-	pr_err("CPU#%d: Unexpected int18 (Machine Check)\n",
-	       smp_processor_id());
-	instrumentation_end();
-}
-
-/* Call the installed machine check handler for this CPU setup. */
-void (*machine_check_vector)(struct pt_regs *) = unexpected_machine_check;
-
 static __always_inline void exc_machine_check_kernel(struct pt_regs *regs)
 {
 	irqentry_state_t irq_state;
@@ -2008,31 +2009,22 @@ static __always_inline void exc_machine_check_kernel(struct pt_regs *regs)
 	 * Only required when from kernel mode. See
 	 * mce_check_crashing_cpu() for details.
 	 */
-	if (machine_check_vector == do_machine_check &&
-	    mce_check_crashing_cpu())
+	if (mca_cfg.initialized && mce_check_crashing_cpu())
 		return;
 
 	irq_state = irqentry_nmi_enter(regs);
-	/*
-	 * The call targets are marked noinstr, but objtool can't figure
-	 * that out because it's an indirect call. Annotate it.
-	 */
-	instrumentation_begin();
 
-	machine_check_vector(regs);
+	do_machine_check(regs);
 
-	instrumentation_end();
 	irqentry_nmi_exit(regs, irq_state);
 }
 
 static __always_inline void exc_machine_check_user(struct pt_regs *regs)
 {
 	irqentry_enter_from_user_mode(regs);
-	instrumentation_begin();
 
-	machine_check_vector(regs);
+	do_machine_check(regs);
 
-	instrumentation_end();
 	irqentry_exit_to_user_mode(regs);
 }
 
@@ -2099,7 +2091,7 @@ void mcheck_cpu_init(struct cpuinfo_x86 *c)
 		return;
 	}
 
-	machine_check_vector = do_machine_check;
+	mca_cfg.initialized = 1;
 
 	__mcheck_cpu_init_early(c);
 	__mcheck_cpu_init_generic();
@@ -2191,10 +2183,9 @@ static int __init mcheck_enable(char *str)
 		cfg->bios_cmci_threshold = 1;
 	else if (!strcmp(str, "recovery"))
 		cfg->recovery = 1;
-	else if (isdigit(str[0])) {
-		if (get_option(&str, &cfg->tolerant) == 2)
-			get_option(&str, &(cfg->monarch_timeout));
-	} else {
+	else if (isdigit(str[0]))
+		get_option(&str, &(cfg->monarch_timeout));
+	else {
 		pr_info("mce argument %s ignored. Please use /sys\n", str);
 		return 0;
 	}
@@ -2207,7 +2198,6 @@ int __init mcheck_init(void)
 	mce_register_decode_chain(&early_nb);
 	mce_register_decode_chain(&mce_uc_nb);
 	mce_register_decode_chain(&mce_default_nb);
-	mcheck_vendor_init_severity();
 
 	INIT_WORK(&mce_work, mce_gen_pool_process);
 	init_irq_work(&mce_irq_work, mce_irq_work_cb);
@@ -2445,7 +2435,6 @@ static ssize_t store_int_with_restart(struct device *s,
 	return ret;
 }
 
-static DEVICE_INT_ATTR(tolerant, 0644, mca_cfg.tolerant);
 static DEVICE_INT_ATTR(monarch_timeout, 0644, mca_cfg.monarch_timeout);
 static DEVICE_BOOL_ATTR(dont_log_ce, 0644, mca_cfg.dont_log_ce);
 static DEVICE_BOOL_ATTR(print_all, 0644, mca_cfg.print_all);
@@ -2466,7 +2455,6 @@ static struct dev_ext_attribute dev_attr_cmci_disabled = {
 };
 
 static struct device_attribute *mce_device_attrs[] = {
-	&dev_attr_tolerant.attr,
 	&dev_attr_check_interval.attr,
 #ifdef CONFIG_X86_MCELOG_LEGACY
 	&dev_attr_trigger,
@@ -2733,7 +2721,6 @@ struct dentry *mce_get_debugfs_dir(void)
 
 static void mce_reset(void)
 {
-	cpu_missing = 0;
 	atomic_set(&mce_fake_panicked, 0);
 	atomic_set(&mce_executing, 0);
 	atomic_set(&mce_callin, 0);

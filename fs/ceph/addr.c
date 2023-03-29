@@ -162,24 +162,24 @@ static void ceph_invalidate_folio(struct folio *folio, size_t offset,
 	folio_wait_fscache(folio);
 }
 
-static int ceph_releasepage(struct page *page, gfp_t gfp)
+static bool ceph_release_folio(struct folio *folio, gfp_t gfp)
 {
-	struct inode *inode = page->mapping->host;
+	struct inode *inode = folio->mapping->host;
 
-	dout("%llx:%llx releasepage %p idx %lu (%sdirty)\n",
-	     ceph_vinop(inode), page,
-	     page->index, PageDirty(page) ? "" : "not ");
+	dout("%llx:%llx release_folio idx %lu (%sdirty)\n",
+	     ceph_vinop(inode),
+	     folio->index, folio_test_dirty(folio) ? "" : "not ");
 
-	if (PagePrivate(page))
-		return 0;
+	if (folio_test_private(folio))
+		return false;
 
-	if (PageFsCache(page)) {
+	if (folio_test_fscache(folio)) {
 		if (current_is_kswapd() || !(gfp & __GFP_FS))
-			return 0;
-		wait_on_page_fscache(page);
+			return false;
+		folio_wait_fscache(folio);
 	}
 	ceph_fscache_note_page_release(inode);
-	return 1;
+	return true;
 }
 
 static void ceph_netfs_expand_readahead(struct netfs_io_request *rreq)
@@ -547,6 +547,7 @@ static u64 get_writepages_data_length(struct inode *inode,
  */
 static int writepage_nounlock(struct page *page, struct writeback_control *wbc)
 {
+	struct folio *folio = page_folio(page);
 	struct inode *inode = page->mapping->host;
 	struct ceph_inode_info *ci = ceph_inode(inode);
 	struct ceph_fs_client *fsc = ceph_inode_to_client(inode);
@@ -581,8 +582,9 @@ static int writepage_nounlock(struct page *page, struct writeback_control *wbc)
 
 	/* is this a partial page at end of file? */
 	if (page_off >= ceph_wbc.i_size) {
-		dout("%p page eof %llu\n", page, ceph_wbc.i_size);
-		page->mapping->a_ops->invalidatepage(page, 0, thp_size(page));
+		dout("folio at %lu beyond eof %llu\n", folio->index,
+				ceph_wbc.i_size);
+		folio_invalidate(folio, 0, folio_size(folio));
 		return 0;
 	}
 
@@ -904,14 +906,16 @@ get_more_pages:
 				continue;
 			}
 			if (page_offset(page) >= ceph_wbc.i_size) {
-				dout("%p page eof %llu\n",
-				     page, ceph_wbc.i_size);
+				struct folio *folio = page_folio(page);
+
+				dout("folio at %lu beyond eof %llu\n",
+				     folio->index, ceph_wbc.i_size);
 				if ((ceph_wbc.size_stable ||
-				    page_offset(page) >= i_size_read(inode)) &&
-				    clear_page_dirty_for_io(page))
-					mapping->a_ops->invalidatepage(page,
-								0, thp_size(page));
-				unlock_page(page);
+				    folio_pos(folio) >= i_size_read(inode)) &&
+				    folio_clear_dirty_for_io(folio))
+					folio_invalidate(folio, 0,
+							folio_size(folio));
+				folio_unlock(folio);
 				continue;
 			}
 			if (strip_unit_end && (page->index > strip_unit_end)) {
@@ -1304,14 +1308,14 @@ static int ceph_netfs_check_write_begin(struct file *file, loff_t pos, unsigned 
  * clean, or already dirty within the same snap context.
  */
 static int ceph_write_begin(struct file *file, struct address_space *mapping,
-			    loff_t pos, unsigned len, unsigned aop_flags,
+			    loff_t pos, unsigned len,
 			    struct page **pagep, void **fsdata)
 {
 	struct inode *inode = file_inode(file);
 	struct folio *folio = NULL;
 	int r;
 
-	r = netfs_write_begin(file, inode->i_mapping, pos, len, 0, &folio, NULL);
+	r = netfs_write_begin(file, inode->i_mapping, pos, len, &folio, NULL);
 	if (r == 0)
 		folio_wait_fscache(folio);
 	if (r < 0) {
@@ -1365,7 +1369,7 @@ out:
 }
 
 const struct address_space_operations ceph_aops = {
-	.readpage = netfs_readpage,
+	.read_folio = netfs_read_folio,
 	.readahead = netfs_readahead,
 	.writepage = ceph_writepage,
 	.writepages = ceph_writepages_start,
@@ -1373,7 +1377,7 @@ const struct address_space_operations ceph_aops = {
 	.write_end = ceph_write_end,
 	.dirty_folio = ceph_dirty_folio,
 	.invalidate_folio = ceph_invalidate_folio,
-	.releasepage = ceph_releasepage,
+	.release_folio = ceph_release_folio,
 	.direct_IO = noop_direct_IO,
 };
 
@@ -1763,7 +1767,7 @@ int ceph_mmap(struct file *file, struct vm_area_struct *vma)
 {
 	struct address_space *mapping = file->f_mapping;
 
-	if (!mapping->a_ops->readpage)
+	if (!mapping->a_ops->read_folio)
 		return -ENOEXEC;
 	vma->vm_ops = &ceph_vmops;
 	return 0;

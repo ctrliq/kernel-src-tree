@@ -2372,7 +2372,7 @@ static ssize_t f2fs_quota_write(struct super_block *sb, int type,
 		tocopy = min_t(unsigned long, sb->s_blocksize - offset,
 								towrite);
 retry:
-		err = a_ops->write_begin(NULL, mapping, off, tocopy, 0,
+		err = a_ops->write_begin(NULL, mapping, off, tocopy,
 							&page, &fsdata);
 		if (unlikely(err)) {
 			if (err == -ENOMEM) {
@@ -4391,7 +4391,7 @@ static int __init init_f2fs_fs(void)
 	err = f2fs_init_sysfs();
 	if (err)
 		goto free_garbage_collection_cache;
-	err = register_shrinker(&f2fs_shrinker_info);
+	err = register_shrinker(&f2fs_shrinker_info, "f2fs-shrinker");
 	if (err)
 		goto free_sysfs;
 	err = register_filesystem(&f2fs_fs_type);
