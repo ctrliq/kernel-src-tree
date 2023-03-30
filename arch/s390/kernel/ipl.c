@@ -19,6 +19,7 @@
 #include <linux/gfp.h>
 #include <linux/crash_dump.h>
 #include <linux/debug_locks.h>
+#include <asm/asm-extable.h>
 #include <asm/diag.h>
 #include <asm/ipl.h>
 #include <asm/smp.h>
@@ -28,6 +29,7 @@
 #include <asm/sclp.h>
 #include <asm/checksum.h>
 #include <asm/debug.h>
+#include <asm/abs_lowcore.h>
 #include <asm/os_info.h>
 #include <asm/sections.h>
 #include <asm/boot_data.h>
@@ -178,8 +180,6 @@ static inline int __diag308(unsigned long subcode, void *addr)
 
 int diag308(unsigned long subcode, void *addr)
 {
-	if (IS_ENABLED(CONFIG_KASAN))
-		__arch_local_irq_stosm(0x04); /* enable DAT */
 	diag_stat_inc(DIAG_STAT_X308);
 	return __diag308(subcode, addr);
 }
@@ -1643,12 +1643,16 @@ static struct shutdown_action __refdata dump_action = {
 static void dump_reipl_run(struct shutdown_trigger *trigger)
 {
 	unsigned long ipib = (unsigned long) reipl_block_actual;
+	struct lowcore *abs_lc;
+	unsigned long flags;
 	unsigned int csum;
 
 	csum = (__force unsigned int)
 	       csum_partial(reipl_block_actual, reipl_block_actual->hdr.len, 0);
-	mem_assign_absolute(S390_lowcore.ipib, ipib);
-	mem_assign_absolute(S390_lowcore.ipib_checksum, csum);
+	abs_lc = get_abs_lowcore(&flags);
+	abs_lc->ipib = ipib;
+	abs_lc->ipib_checksum = csum;
+	put_abs_lowcore(abs_lc, flags);
 	dump_run(trigger);
 }
 
@@ -1842,7 +1846,6 @@ static struct kobj_attribute on_restart_attr = __ATTR_RW(on_restart);
 
 static void __do_restart(void *ignore)
 {
-	__arch_local_irq_stosm(0x04); /* enable DAT */
 	smp_send_stop();
 #ifdef CONFIG_CRASH_DUMP
 	crash_kexec(NULL);
