@@ -650,7 +650,6 @@ struct kvm_queued_exception {
 	u32 error_code;
 	unsigned long payload;
 	bool has_payload;
-	u8 nested_apf;
 };
 
 struct kvm_vcpu_arch {
@@ -752,8 +751,12 @@ struct kvm_vcpu_arch {
 
 	u8 event_exit_inst_len;
 
+	bool exception_from_userspace;
+
 	/* Exceptions to be injected to the guest. */
 	struct kvm_queued_exception exception;
+	/* Exception VM-Exits to be synthesized to L1. */
+	struct kvm_queued_exception exception_vmexit;
 
 	struct kvm_queued_interrupt {
 		bool injected;
@@ -864,7 +867,6 @@ struct kvm_vcpu_arch {
 		u32 id;
 		bool send_user_only;
 		u32 host_apf_flags;
-		unsigned long nested_apf_token;
 		bool delivery_as_pf_vmexit;
 		bool pageready_pending;
 	} apf;
@@ -1640,9 +1642,9 @@ struct kvm_x86_ops {
 
 struct kvm_x86_nested_ops {
 	void (*leave_nested)(struct kvm_vcpu *vcpu);
+	bool (*is_exception_vmexit)(struct kvm_vcpu *vcpu, u8 vector,
+				    u32 error_code);
 	int (*check_events)(struct kvm_vcpu *vcpu);
-	bool (*handle_page_fault_workaround)(struct kvm_vcpu *vcpu,
-					     struct x86_exception *fault);
 	bool (*hv_timer_pending)(struct kvm_vcpu *vcpu);
 	void (*triple_fault)(struct kvm_vcpu *vcpu);
 	int (*get_state)(struct kvm_vcpu *vcpu,
@@ -1870,7 +1872,7 @@ void kvm_queue_exception_p(struct kvm_vcpu *vcpu, unsigned nr, unsigned long pay
 void kvm_requeue_exception(struct kvm_vcpu *vcpu, unsigned nr);
 void kvm_requeue_exception_e(struct kvm_vcpu *vcpu, unsigned nr, u32 error_code);
 void kvm_inject_page_fault(struct kvm_vcpu *vcpu, struct x86_exception *fault);
-bool kvm_inject_emulated_page_fault(struct kvm_vcpu *vcpu,
+void kvm_inject_emulated_page_fault(struct kvm_vcpu *vcpu,
 				    struct x86_exception *fault);
 bool kvm_require_cpl(struct kvm_vcpu *vcpu, int required_cpl);
 bool kvm_require_dr(struct kvm_vcpu *vcpu, int dr);
