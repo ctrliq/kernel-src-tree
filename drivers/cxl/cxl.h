@@ -696,8 +696,9 @@ int cxl_endpoint_autoremove(struct cxl_memdev *cxlmd, struct cxl_port *endpoint)
 
 /**
  * struct cxl_endpoint_dvsec_info - Cached DVSEC info
- * @mem_enabled: cached value of mem_enabled in the DVSEC, PCIE_DEVICE
+ * @mem_enabled: cached value of mem_enabled in the DVSEC at init time
  * @ranges: Number of active HDM ranges this device uses.
+ * @port: endpoint port associated with this info instance
  * @dvsec_range: cached attributes of the ranges in the DVSEC, PCIE_DEVICE
  */
 struct cxl_endpoint_dvsec_info {
