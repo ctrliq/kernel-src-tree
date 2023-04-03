@@ -1689,8 +1689,9 @@ process:
 			return 0;
 		}
 	}
-	if (hdr->hop_limit < tcp_inet6_sk(sk)->min_hopcount) {
+	if (unlikely(hdr->hop_limit < tcp_inet6_sk(sk)->min_hopcount)) {
 		__NET_INC_STATS(net, LINUX_MIB_TCPMINTTLDROP);
+		drop_reason = SKB_DROP_REASON_TCP_MINTTL;
 		goto discard_and_relse;
 	}
 
