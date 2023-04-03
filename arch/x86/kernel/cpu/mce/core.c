@@ -613,7 +613,7 @@ static int uc_decode_notifier(struct notifier_block *nb, unsigned long val,
 
 	pfn = mce->addr >> PAGE_SHIFT;
 	if (!memory_failure(pfn, 0)) {
-		set_mce_nospec(pfn, whole_page(mce));
+		set_mce_nospec(pfn);
 		mce->kflags |= MCE_HANDLED_UC;
 	}
 
@@ -1246,8 +1246,8 @@ static void kill_me_maybe(struct callback_head *cb)
 		flags |= MF_MUST_KILL;
 
 	ret = memory_failure(p->mce_addr >> PAGE_SHIFT, flags);
-	if (!ret && !(p->mce_kflags & MCE_IN_KERNEL_COPYIN)) {
-		set_mce_nospec(p->mce_addr >> PAGE_SHIFT, p->mce_whole_page);
+	if (!ret) {
+		set_mce_nospec(p->mce_addr >> PAGE_SHIFT);
 		sync_core();
 		return;
 	}
@@ -1262,15 +1262,21 @@ static void kill_me_maybe(struct callback_head *cb)
 	if (ret == -EHWPOISON || ret == -EOPNOTSUPP)
 		return;
 
-	if (p->mce_vaddr != (void __user *)-1l) {
-		force_sig_mceerr(BUS_MCEERR_AR, p->mce_vaddr, PAGE_SHIFT);
-	} else {
-		pr_err("Memory error not recovered");
-		kill_me_now(cb);
-	}
+	pr_err("Memory error not recovered");
+	kill_me_now(cb);
 }
 
-static void queue_task_work(struct mce *m, char *msg, int kill_current_task)
+static void kill_me_never(struct callback_head *cb)
+{
+	struct task_struct *p = container_of(cb, struct task_struct, mce_kill_me);
+
+	p->mce_count = 0;
+	pr_err("Kernel accessed poison in user space at %llx\n", p->mce_addr);
+	if (!memory_failure(p->mce_addr >> PAGE_SHIFT, 0))
+		set_mce_nospec(p->mce_addr >> PAGE_SHIFT);
+}
+
+static void queue_task_work(struct mce *m, char *msg, void (*func)(struct callback_head *))
 {
 	int count = ++current->mce_count;
 
@@ -1280,11 +1286,7 @@ static void queue_task_work(struct mce *m, char *msg, int kill_current_task)
 		current->mce_kflags = m->kflags;
 		current->mce_ripv = !!(m->mcgstatus & MCG_STATUS_RIPV);
 		current->mce_whole_page = whole_page(m);
-
-		if (kill_current_task)
-			current->mce_kill_me.func = kill_me_now;
-		else
-			current->mce_kill_me.func = kill_me_maybe;
+		current->mce_kill_me.func = func;
 	}
 
 	/* Ten is likely overkill. Don't expect more than two faults before task_work() */
@@ -1449,7 +1451,10 @@ noinstr void do_machine_check(struct pt_regs *regs)
 		/* If this triggers there is no way to recover. Die hard. */
 		BUG_ON(!on_thread_stack() || !user_mode(regs));
 
-		queue_task_work(&m, msg, kill_current_task);
+		if (kill_current_task)
+			queue_task_work(&m, msg, kill_me_now);
+		else
+			queue_task_work(&m, msg, kill_me_maybe);
 
 	} else {
 		/*
@@ -1467,7 +1472,7 @@ noinstr void do_machine_check(struct pt_regs *regs)
 		}
 
 		if (m.kflags & MCE_IN_KERNEL_COPYIN)
-			queue_task_work(&m, msg, kill_current_task);
+			queue_task_work(&m, msg, kill_me_never);
 	}
 out:
 	mce_wrmsrl(MSR_IA32_MCG_STATUS, 0);
