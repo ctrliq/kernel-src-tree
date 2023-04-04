@@ -90,7 +90,7 @@ ifndef RHJOBS
 	  	echo "1"; \
 	  else \
 	  	j=$$(echo "$${j}" | tr -d "\-j"); \
-	  	[ -z "$${j}" ] && nproc --all || echo $${j}; \
+	  	[ -z "$${j}" ] && nproc || echo $${j}; \
 	  fi)
 endif
 
