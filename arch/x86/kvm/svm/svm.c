@@ -2709,9 +2709,6 @@ static int svm_get_msr_feature(struct kvm_msr_entry *msr)
 		if (cpu_feature_enabled(X86_FEATURE_LFENCE_RDTSC))
 			msr->data |= MSR_AMD64_DE_CFG_LFENCE_SERIALIZE;
 		break;
-	case MSR_IA32_PERF_CAPABILITIES:
-		msr->data = kvm_caps.supported_perf_cap;
-		return 0;
 	default:
 		return KVM_MSR_RET_INVALID;
 	}
