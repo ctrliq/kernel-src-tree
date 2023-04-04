@@ -703,6 +703,7 @@ int cxl_endpoint_autoremove(struct cxl_memdev *cxlmd, struct cxl_port *endpoint)
 struct cxl_endpoint_dvsec_info {
 	bool mem_enabled;
 	int ranges;
+	struct cxl_port *port;
 	struct range dvsec_range[2];
 };
 

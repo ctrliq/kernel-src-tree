@@ -59,7 +59,7 @@ static int discover_region(struct device *dev, void *root)
 
 static int cxl_switch_port_probe(struct cxl_port *port)
 {
-	struct cxl_endpoint_dvsec_info info = { 0 };
+	struct cxl_endpoint_dvsec_info info = { .port = port };
 	struct cxl_hdm *cxlhdm;
 	int rc;
 
