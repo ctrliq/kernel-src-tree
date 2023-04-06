@@ -306,8 +306,6 @@ static void test_run(void)
 
 int main(void)
 {
-	setbuf(stdout, NULL);
-
 	test_run();
 	return 0;
 }
