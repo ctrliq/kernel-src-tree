@@ -2116,20 +2116,12 @@ static void amd_iommu_detach_device(struct iommu_domain *dom,
 static int amd_iommu_attach_device(struct iommu_domain *dom,
 				   struct device *dev)
 {
+	struct iommu_dev_data *dev_data = dev_iommu_priv_get(dev);
 	struct protection_domain *domain = to_pdomain(dom);
-	struct iommu_dev_data *dev_data;
-	struct amd_iommu *iommu;
+	struct amd_iommu *iommu = rlookup_amd_iommu(dev);
 	int ret;
 
-	if (!check_device(dev))
-		return -EINVAL;
-
-	dev_data = dev_iommu_priv_get(dev);
 	dev_data->defer_attach = false;
-
-	iommu = rlookup_amd_iommu(dev);
-	if (!iommu)
-		return -EINVAL;
 
 	if (dev_data->domain)
 		detach_device(dev);
@@ -2233,7 +2225,7 @@ static phys_addr_t amd_iommu_iova_to_phys(struct iommu_domain *dom,
 	return ops->iova_to_phys(ops, iova);
 }
 
-static bool amd_iommu_capable(enum iommu_cap cap)
+static bool amd_iommu_capable(struct device *dev, enum iommu_cap cap)
 {
 	switch (cap) {
 	case IOMMU_CAP_CACHE_COHERENCY:
@@ -2244,6 +2236,8 @@ static bool amd_iommu_capable(enum iommu_cap cap)
 		return false;
 	case IOMMU_CAP_PRE_BOOT_PROTECTION:
 		return amdr_ivrs_remap_support;
+	case IOMMU_CAP_ENFORCE_CACHE_COHERENCY:
+		return true;
 	default:
 		break;
 	}

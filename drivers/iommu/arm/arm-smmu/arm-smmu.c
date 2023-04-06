@@ -1167,9 +1167,6 @@ static int arm_smmu_attach_dev(struct iommu_domain *domain, struct device *dev)
 	 * different SMMUs.
 	 */
 	if (smmu_domain->smmu != smmu) {
-		dev_err(dev,
-			"cannot attach to SMMU %s whilst already attached to domain on SMMU %s\n",
-			dev_name(smmu_domain->smmu->dev), dev_name(smmu->dev));
 		ret = -EINVAL;
 		goto rpm_put;
 	}
@@ -1330,15 +1327,20 @@ static phys_addr_t arm_smmu_iova_to_phys(struct iommu_domain *domain,
 	return ops->iova_to_phys(ops, iova);
 }
 
-static bool arm_smmu_capable(enum iommu_cap cap)
+static bool arm_smmu_capable(struct device *dev, enum iommu_cap cap)
 {
+	struct arm_smmu_master_cfg *cfg = dev_iommu_priv_get(dev);
+
 	switch (cap) {
 	case IOMMU_CAP_CACHE_COHERENCY:
 		/*
-		 * Return true here as the SMMU can always send out coherent
-		 * requests.
+		 * It's overwhelmingly the case in practice that when the pagetable
+		 * walk interface is connected to a coherent interconnect, all the
+		 * translation interfaces are too. Furthermore if the device is
+		 * natively coherent, then its translation interface must also be.
 		 */
-		return true;
+		return cfg->smmu->features & ARM_SMMU_FEAT_COHERENT_WALK ||
+			device_get_dma_attr(dev) == DEV_DMA_COHERENT;
 	case IOMMU_CAP_NOEXEC:
 		return true;
 	default:
