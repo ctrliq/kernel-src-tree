@@ -735,7 +735,7 @@ struct Scsi_Host {
 	 * allow extending the structure while preserving ABI.
 	 */
 
-	RH_KABI_RESERVE(2)
+	RH_KABI_USE_SPLIT(2, unsigned int opt_sectors)
 	RH_KABI_RESERVE(3)
 	RH_KABI_RESERVE(4)
 	RH_KABI_RESERVE(5)
