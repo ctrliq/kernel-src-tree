@@ -214,6 +214,8 @@ struct scsi_device {
 	unsigned ignore_media_change:1; /* Ignore MEDIA CHANGE on resume */
 	unsigned silence_suspend:1;	/* Do not print runtime PM related messages */
 
+	RH_KABI_FILL_HOLE(unsigned use_16_for_sync:1)	/* Use sync (16) over sync (10) */
+
 	unsigned int queue_stopped;	/* request queue is quiesced */
 	bool offline_already;		/* Device offline message logged */
 
