@@ -237,6 +237,7 @@ int scsi_execute_cmd(struct scsi_device *sdev, const unsigned char *cmd,
 	static const struct scsi_exec_args default_args;
 	struct request *req;
 	struct scsi_request *rq;
+	struct scsi_cmnd *scmd;
 	int ret;
 
 	if (!args)
@@ -260,6 +261,8 @@ int scsi_execute_cmd(struct scsi_device *sdev, const unsigned char *cmd,
 	rq->cmd_len = COMMAND_SIZE(cmd[0]);
 	memcpy(rq->cmd, cmd, rq->cmd_len);
 	rq->retries = retries;
+	scmd = blk_mq_rq_to_pdu(req);
+	scmd->flags |= args->scmd_flags;
 	req->timeout = timeout;
 	req->rq_flags |= RQF_QUIET;
 
