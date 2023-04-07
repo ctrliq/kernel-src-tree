@@ -7492,7 +7492,6 @@ static int ufshcd_abort(struct scsi_cmnd *cmd)
 	if (outstanding)
 		ufshcd_release_scsi_cmd(hba, lrbp);
 
-	lrbp->cmd = NULL;
 	err = SUCCESS;
 
 release:
