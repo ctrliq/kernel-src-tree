@@ -210,14 +210,42 @@ int __scsi_execute(struct scsi_device *sdev, const unsigned char *cmd,
 		 int timeout, int retries, blk_opf_t flags,
 		 req_flags_t rq_flags, int *resid)
 {
+	return scsi_execute(sdev, cmd, data_direction, buffer, bufflen, sense,
+			    sshdr, timeout, retries, flags, rq_flags, resid);
+}
+EXPORT_SYMBOL(__scsi_execute);
+
+/**
+ * scsi_execute_cmd - insert request and wait for the result
+ * @sdev:	scsi_device
+ * @cmd:	scsi command
+ * @opf:	block layer request cmd_flags
+ * @buffer:	data buffer
+ * @bufflen:	len of buffer
+ * @timeout:	request timeout in HZ
+ * @retries:	number of times to retry request
+ * @args:	Optional args. See struct definition for field descriptions
+ *
+ * Returns the scsi_cmnd result field if a command was executed, or a negative
+ * Linux error code if we didn't get that far.
+ */
+int scsi_execute_cmd(struct scsi_device *sdev, const unsigned char *cmd,
+		     blk_opf_t opf, void *buffer, unsigned int bufflen,
+		     int timeout, int retries,
+		     const struct scsi_exec_args *args)
+{
+	static const struct scsi_exec_args default_args;
 	struct request *req;
 	struct scsi_request *rq;
 	int ret;
 
-	req = scsi_alloc_request(sdev->request_queue,
-			data_direction == DMA_TO_DEVICE ?
-			REQ_OP_DRV_OUT : REQ_OP_DRV_IN,
-			rq_flags & RQF_PM ? BLK_MQ_REQ_PM : 0);
+	if (!args)
+		args = &default_args;
+	else if (WARN_ON_ONCE(args->sense &&
+			      args->sense_len != SCSI_SENSE_BUFFERSIZE))
+		return -EINVAL;
+
+	req = scsi_alloc_request(sdev->request_queue, opf, args->req_flags);
 	if (IS_ERR(req))
 		return PTR_ERR(req);
 
@@ -233,8 +261,7 @@ int __scsi_execute(struct scsi_device *sdev, const unsigned char *cmd,
 	memcpy(rq->cmd, cmd, rq->cmd_len);
 	rq->retries = retries;
 	req->timeout = timeout;
-	req->cmd_flags |= flags;
-	req->rq_flags |= rq_flags | RQF_QUIET;
+	req->rq_flags |= RQF_QUIET;
 
 	/*
 	 * head injection *required* here otherwise quiesce won't work
@@ -250,19 +277,20 @@ int __scsi_execute(struct scsi_device *sdev, const unsigned char *cmd,
 	if (unlikely(rq->resid_len > 0 && rq->resid_len <= bufflen))
 		memset(buffer + (bufflen - rq->resid_len), 0, rq->resid_len);
 
-	if (resid)
-		*resid = rq->resid_len;
-	if (sense && rq->sense_len)
-		memcpy(sense, rq->sense, SCSI_SENSE_BUFFERSIZE);
-	if (sshdr)
-		scsi_normalize_sense(rq->sense, rq->sense_len, sshdr);
+	if (args->resid)
+		*args->resid = rq->resid_len;
+	if (args->sense)
+		memcpy(args->sense, rq->sense, SCSI_SENSE_BUFFERSIZE);
+	if (args->sshdr)
+		scsi_normalize_sense(rq->sense, rq->sense_len, args->sshdr);
+
 	ret = rq->result;
  out:
 	blk_mq_free_request(req);
 
 	return ret;
 }
-EXPORT_SYMBOL(__scsi_execute);
+EXPORT_SYMBOL(scsi_execute_cmd);
 
 /*
  * Wake up the error handler if necessary. Avoid as follows that the error
