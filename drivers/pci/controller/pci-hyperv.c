@@ -629,7 +629,7 @@ static void hv_arch_irq_unmask(struct irq_data *data)
 	struct hv_retarget_device_interrupt *params;
 	struct tran_int_desc *int_desc;
 	struct hv_pcibus_device *hbus;
-	struct cpumask *dest;
+	const struct cpumask *dest;
 	cpumask_var_t tmp;
 	struct pci_bus *pbus;
 	struct pci_dev *pdev;
@@ -1731,7 +1731,7 @@ static void hv_compose_msi_msg(struct irq_data *data, struct msi_msg *msg)
 	struct hv_pci_dev *hpdev;
 	struct pci_bus *pbus;
 	struct pci_dev *pdev;
-	struct cpumask *dest;
+	const struct cpumask *dest;
 	struct compose_comp_ctxt comp;
 	struct tran_int_desc *int_desc;
 	struct msi_desc *msi_desc;
