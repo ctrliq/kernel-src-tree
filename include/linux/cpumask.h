@@ -123,6 +123,12 @@ static inline unsigned int cpumask_first(const struct cpumask *srcp)
 	return 0;
 }
 
+static inline unsigned int cpumask_first_and(const struct cpumask *srcp1,
+					     const struct cpumask *srcp2)
+{
+	return 0;
+}
+
 static inline unsigned int cpumask_last(const struct cpumask *srcp)
 {
 	return 0;
@@ -165,12 +171,12 @@ static inline unsigned int cpumask_local_spread(unsigned int i, int node)
 	return 0;
 }
 
-static inline int cpumask_any_and_distribute(const struct cpumask *src1p,
+static inline unsigned int cpumask_any_and_distribute(const struct cpumask *src1p,
 					     const struct cpumask *src2p) {
-	return cpumask_next_and(-1, src1p, src2p);
+	return cpumask_first_and(src1p, src2p);
 }
 
-static inline int cpumask_any_distribute(const struct cpumask *srcp)
+static inline unsigned int cpumask_any_distribute(const struct cpumask *srcp)
 {
 	return cpumask_first(srcp);
 }
@@ -196,6 +202,19 @@ static inline unsigned int cpumask_first(const struct cpumask *srcp)
 }
 
 /**
+ * cpumask_first_and - return the first cpu from *srcp1 & *srcp2
+ * @src1p: the first input
+ * @src2p: the second input
+ *
+ * Returns >= nr_cpu_ids if no cpus set in both.  See also cpumask_next_and().
+ */
+static inline
+unsigned int cpumask_first_and(const struct cpumask *srcp1, const struct cpumask *srcp2)
+{
+	return find_first_and_bit(cpumask_bits(srcp1), cpumask_bits(srcp2), nr_cpumask_bits);
+}
+
+/**
  * cpumask_last - get the last CPU in a cpumask
  * @srcp:	- the cpumask pointer
  *
@@ -206,7 +225,21 @@ static inline unsigned int cpumask_last(const struct cpumask *srcp)
 	return find_last_bit(cpumask_bits(srcp), nr_cpumask_bits);
 }
 
-unsigned int __pure cpumask_next(int n, const struct cpumask *srcp);
+/**
+ * cpumask_next - get the next cpu in a cpumask
+ * @n: the cpu prior to the place to search (ie. return will be > @n)
+ * @srcp: the cpumask pointer
+ *
+ * Returns >= nr_cpu_ids if no further cpus set.
+ */
+static inline
+unsigned int cpumask_next(int n, const struct cpumask *srcp)
+{
+	/* -1 is a legal arg here. */
+	if (n != -1)
+		cpumask_check(n);
+	return find_next_bit(cpumask_bits(srcp), nr_cpumask_bits, n + 1);
+}
 
 /**
  * cpumask_next_zero - get the next unset cpu in a cpumask
@@ -223,12 +256,29 @@ static inline unsigned int cpumask_next_zero(int n, const struct cpumask *srcp)
 	return find_next_zero_bit(cpumask_bits(srcp), nr_cpumask_bits, n+1);
 }
 
-int __pure cpumask_next_and(int n, const struct cpumask *, const struct cpumask *);
-int __pure cpumask_any_but(const struct cpumask *mask, unsigned int cpu);
+/**
+ * cpumask_next_and - get the next cpu in *src1p & *src2p
+ * @n: the cpu prior to the place to search (ie. return will be > @n)
+ * @src1p: the first cpumask pointer
+ * @src2p: the second cpumask pointer
+ *
+ * Returns >= nr_cpu_ids if no further cpus set in both.
+ */
+static inline
+unsigned int cpumask_next_and(int n, const struct cpumask *src1p,
+		     const struct cpumask *src2p)
+{
+	/* -1 is a legal arg here. */
+	if (n != -1)
+		cpumask_check(n);
+	return find_next_and_bit(cpumask_bits(src1p), cpumask_bits(src2p),
+		nr_cpumask_bits, n + 1);
+}
+
 unsigned int cpumask_local_spread(unsigned int i, int node);
-int cpumask_any_and_distribute(const struct cpumask *src1p,
+unsigned int cpumask_any_and_distribute(const struct cpumask *src1p,
 			       const struct cpumask *src2p);
-int cpumask_any_distribute(const struct cpumask *srcp);
+unsigned int cpumask_any_distribute(const struct cpumask *srcp);
 
 /**
  * for_each_cpu - iterate over every cpu in a mask
@@ -254,7 +304,7 @@ int cpumask_any_distribute(const struct cpumask *srcp);
 		(cpu) = cpumask_next_zero((cpu), (mask)),	\
 		(cpu) < nr_cpu_ids;)
 
-extern int cpumask_next_wrap(int n, const struct cpumask *mask, int start, bool wrap);
+unsigned int cpumask_next_wrap(int n, const struct cpumask *mask, int start, bool wrap);
 
 /**
  * for_each_cpu_wrap - iterate over every cpu in a mask, starting at a specified location
@@ -289,7 +339,91 @@ extern int cpumask_next_wrap(int n, const struct cpumask *mask, int start, bool 
 	for ((cpu) = -1;						\
 		(cpu) = cpumask_next_and((cpu), (mask1), (mask2)),	\
 		(cpu) < nr_cpu_ids;)
+
+/**
+ * cpumask_any_but - return a "random" in a cpumask, but not this one.
+ * @mask: the cpumask to search
+ * @cpu: the cpu to ignore.
+ *
+ * Often used to find any cpu but smp_processor_id() in a mask.
+ * Returns >= nr_cpu_ids if no cpus set.
+ */
+static inline
+unsigned int cpumask_any_but(const struct cpumask *mask, unsigned int cpu)
+{
+	unsigned int i;
+
+	cpumask_check(cpu);
+	for_each_cpu(i, mask)
+		if (i != cpu)
+			break;
+	return i;
+}
 #endif /* SMP */
+
+/**
+ * cpumask_nth - get the first cpu in a cpumask
+ * @srcp: the cpumask pointer
+ * @cpu: the N'th cpu to find, starting from 0
+ *
+ * Returns >= nr_cpu_ids if such cpu doesn't exist.
+ */
+static inline unsigned int cpumask_nth(unsigned int cpu, const struct cpumask *srcp)
+{
+	return find_nth_bit(cpumask_bits(srcp), nr_cpumask_bits, cpumask_check(cpu));
+}
+
+/**
+ * cpumask_nth_and - get the first cpu in 2 cpumasks
+ * @srcp1: the cpumask pointer
+ * @srcp2: the cpumask pointer
+ * @cpu: the N'th cpu to find, starting from 0
+ *
+ * Returns >= nr_cpu_ids if such cpu doesn't exist.
+ */
+static inline
+unsigned int cpumask_nth_and(unsigned int cpu, const struct cpumask *srcp1,
+							const struct cpumask *srcp2)
+{
+	return find_nth_and_bit(cpumask_bits(srcp1), cpumask_bits(srcp2),
+				nr_cpumask_bits, cpumask_check(cpu));
+}
+
+/**
+ * cpumask_nth_andnot - get the first cpu set in 1st cpumask, and clear in 2nd.
+ * @srcp1: the cpumask pointer
+ * @srcp2: the cpumask pointer
+ * @cpu: the N'th cpu to find, starting from 0
+ *
+ * Returns >= nr_cpu_ids if such cpu doesn't exist.
+ */
+static inline
+unsigned int cpumask_nth_andnot(unsigned int cpu, const struct cpumask *srcp1,
+							const struct cpumask *srcp2)
+{
+	return find_nth_andnot_bit(cpumask_bits(srcp1), cpumask_bits(srcp2),
+				nr_cpumask_bits, cpumask_check(cpu));
+}
+
+/**
+ * cpumask_nth_and_andnot - get the Nth cpu set in 1st and 2nd cpumask, and clear in 3rd.
+ * @srcp1: the cpumask pointer
+ * @srcp2: the cpumask pointer
+ * @srcp3: the cpumask pointer
+ * @cpu: the N'th cpu to find, starting from 0
+ *
+ * Returns >= nr_cpu_ids if such cpu doesn't exist.
+ */
+static __always_inline
+unsigned int cpumask_nth_and_andnot(unsigned int cpu, const struct cpumask *srcp1,
+							const struct cpumask *srcp2,
+							const struct cpumask *srcp3)
+{
+	return find_nth_and_andnot_bit(cpumask_bits(srcp1),
+					cpumask_bits(srcp2),
+					cpumask_bits(srcp3),
+					nr_cpumask_bits, cpumask_check(cpu));
+}
 
 #define CPU_BITS_NONE						\
 {								\
@@ -306,12 +440,12 @@ extern int cpumask_next_wrap(int n, const struct cpumask *mask, int start, bool 
  * @cpu: cpu number (< nr_cpu_ids)
  * @dstp: the cpumask pointer
  */
-static inline void cpumask_set_cpu(unsigned int cpu, struct cpumask *dstp)
+static __always_inline void cpumask_set_cpu(unsigned int cpu, struct cpumask *dstp)
 {
 	set_bit(cpumask_check(cpu), cpumask_bits(dstp));
 }
 
-static inline void __cpumask_set_cpu(unsigned int cpu, struct cpumask *dstp)
+static __always_inline void __cpumask_set_cpu(unsigned int cpu, struct cpumask *dstp)
 {
 	__set_bit(cpumask_check(cpu), cpumask_bits(dstp));
 }
@@ -322,12 +456,12 @@ static inline void __cpumask_set_cpu(unsigned int cpu, struct cpumask *dstp)
  * @cpu: cpu number (< nr_cpu_ids)
  * @dstp: the cpumask pointer
  */
-static inline void cpumask_clear_cpu(int cpu, struct cpumask *dstp)
+static __always_inline void cpumask_clear_cpu(int cpu, struct cpumask *dstp)
 {
 	clear_bit(cpumask_check(cpu), cpumask_bits(dstp));
 }
 
-static inline void __cpumask_clear_cpu(int cpu, struct cpumask *dstp)
+static __always_inline void __cpumask_clear_cpu(int cpu, struct cpumask *dstp)
 {
 	__clear_bit(cpumask_check(cpu), cpumask_bits(dstp));
 }
@@ -337,9 +471,9 @@ static inline void __cpumask_clear_cpu(int cpu, struct cpumask *dstp)
  * @cpu: cpu number (< nr_cpu_ids)
  * @cpumask: the cpumask pointer
  *
- * Returns 1 if @cpu is set in @cpumask, else returns 0
+ * Returns true if @cpu is set in @cpumask, else returns false
  */
-static inline int cpumask_test_cpu(int cpu, const struct cpumask *cpumask)
+static __always_inline bool cpumask_test_cpu(int cpu, const struct cpumask *cpumask)
 {
 	return test_bit(cpumask_check(cpu), cpumask_bits((cpumask)));
 }
@@ -349,11 +483,11 @@ static inline int cpumask_test_cpu(int cpu, const struct cpumask *cpumask)
  * @cpu: cpu number (< nr_cpu_ids)
  * @cpumask: the cpumask pointer
  *
- * Returns 1 if @cpu is set in old bitmap of @cpumask, else returns 0
+ * Returns true if @cpu is set in old bitmap of @cpumask, else returns false
  *
  * test_and_set_bit wrapper for cpumasks.
  */
-static inline int cpumask_test_and_set_cpu(int cpu, struct cpumask *cpumask)
+static __always_inline bool cpumask_test_and_set_cpu(int cpu, struct cpumask *cpumask)
 {
 	return test_and_set_bit(cpumask_check(cpu), cpumask_bits(cpumask));
 }
@@ -363,11 +497,11 @@ static inline int cpumask_test_and_set_cpu(int cpu, struct cpumask *cpumask)
  * @cpu: cpu number (< nr_cpu_ids)
  * @cpumask: the cpumask pointer
  *
- * Returns 1 if @cpu is set in old bitmap of @cpumask, else returns 0
+ * Returns true if @cpu is set in old bitmap of @cpumask, else returns false
  *
  * test_and_clear_bit wrapper for cpumasks.
  */
-static inline int cpumask_test_and_clear_cpu(int cpu, struct cpumask *cpumask)
+static __always_inline bool cpumask_test_and_clear_cpu(int cpu, struct cpumask *cpumask)
 {
 	return test_and_clear_bit(cpumask_check(cpu), cpumask_bits(cpumask));
 }
@@ -396,9 +530,9 @@ static inline void cpumask_clear(struct cpumask *dstp)
  * @src1p: the first input
  * @src2p: the second input
  *
- * If *@dstp is empty, returns 0, else returns 1
+ * If *@dstp is empty, returns false, else returns true
  */
-static inline int cpumask_and(struct cpumask *dstp,
+static inline bool cpumask_and(struct cpumask *dstp,
 			       const struct cpumask *src1p,
 			       const struct cpumask *src2p)
 {
@@ -439,9 +573,9 @@ static inline void cpumask_xor(struct cpumask *dstp,
  * @src1p: the first input
  * @src2p: the second input
  *
- * If *@dstp is empty, returns 0, else returns 1
+ * If *@dstp is empty, returns false, else returns true
  */
-static inline int cpumask_andnot(struct cpumask *dstp,
+static inline bool cpumask_andnot(struct cpumask *dstp,
 				  const struct cpumask *src1p,
 				  const struct cpumask *src2p)
 {
@@ -504,9 +638,9 @@ static inline bool cpumask_intersects(const struct cpumask *src1p,
  * @src1p: the first input
  * @src2p: the second input
  *
- * Returns 1 if *@src1p is a subset of *@src2p, else returns 0
+ * Returns true if *@src1p is a subset of *@src2p, else returns false
  */
-static inline int cpumask_subset(const struct cpumask *src1p,
+static inline bool cpumask_subset(const struct cpumask *src1p,
 				 const struct cpumask *src2p)
 {
 	return bitmap_subset(cpumask_bits(src1p), cpumask_bits(src2p),
@@ -538,6 +672,17 @@ static inline bool cpumask_full(const struct cpumask *srcp)
 static inline unsigned int cpumask_weight(const struct cpumask *srcp)
 {
 	return bitmap_weight(cpumask_bits(srcp), nr_cpumask_bits);
+}
+
+/**
+ * cpumask_weight_and - Count of bits in (*srcp1 & *srcp2)
+ * @srcp1: the cpumask to count bits (< nr_cpu_ids) in.
+ * @srcp2: the cpumask to count bits (< nr_cpu_ids) in.
+ */
+static inline unsigned int cpumask_weight_and(const struct cpumask *srcp1,
+						const struct cpumask *srcp2)
+{
+	return bitmap_weight_and(cpumask_bits(srcp1), cpumask_bits(srcp2), nr_cpumask_bits);
 }
 
 /**
@@ -584,15 +729,6 @@ static inline void cpumask_copy(struct cpumask *dstp,
  * Returns >= nr_cpu_ids if no cpus set.
  */
 #define cpumask_any(srcp) cpumask_first(srcp)
-
-/**
- * cpumask_first_and - return the first cpu from *srcp1 & *srcp2
- * @src1p: the first input
- * @src2p: the second input
- *
- * Returns >= nr_cpu_ids if no cpus set in both.  See also cpumask_next_and().
- */
-#define cpumask_first_and(src1p, src2p) cpumask_next_and(-1, (src1p), (src2p))
 
 /**
  * cpumask_any_and - pick a "random" cpu from *mask1 & *mask2
