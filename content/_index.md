@@ -2,6 +2,7 @@
 title: CentOS Stream Kernel Documentation
 ---
 
+<!-- scope -->
 Welcome to documentation about development of Red Hat-based Linux kernel projects
 
 : [CentOS stream 9 kernel](https://gitlab.com/redhat/centos-stream/src/kernel/centos-stream-9)
