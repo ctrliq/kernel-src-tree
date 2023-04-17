@@ -3783,7 +3783,7 @@ static int set_feature_rx_vlan(struct net_device *netdev, bool enable)
 
 	mutex_lock(&priv->state_lock);
 
-	priv->fs->vlan_strip_disable = !enable;
+	mlx5e_fs_set_vlan_strip_disable(priv->fs, !enable);
 	priv->channels.params.vlan_strip_disable = !enable;
 
 	if (!test_bit(MLX5E_STATE_OPENED, &priv->state))
@@ -3791,7 +3791,7 @@ static int set_feature_rx_vlan(struct net_device *netdev, bool enable)
 
 	err = mlx5e_modify_channels_vsd(&priv->channels, !enable);
 	if (err) {
-		priv->fs->vlan_strip_disable = enable;
+		mlx5e_fs_set_vlan_strip_disable(priv->fs, enable);
 		priv->channels.params.vlan_strip_disable = enable;
 	}
 unlock:
@@ -3941,15 +3941,17 @@ static netdev_features_t mlx5e_fix_features(struct net_device *netdev,
 					    netdev_features_t features)
 {
 	struct mlx5e_priv *priv = netdev_priv(netdev);
+	struct mlx5e_vlan_table *vlan;
 	struct mlx5e_params *params;
 
 	if (!netif_device_present(netdev))
 		return features;
 
+	vlan = mlx5e_fs_get_vlan(priv->fs);
 	mutex_lock(&priv->state_lock);
 	params = &priv->channels.params;
-	if (!priv->fs->vlan ||
-	    !bitmap_empty(mlx5e_vlan_get_active_svlans(priv->fs->vlan), VLAN_N_VID)) {
+	if (!vlan ||
+	    !bitmap_empty(mlx5e_vlan_get_active_svlans(vlan), VLAN_N_VID)) {
 		/* HW strips the outer C-tag header, this is a problem
 		 * for S-tag traffic.
 		 */
@@ -5547,7 +5549,8 @@ int mlx5e_attach_netdev(struct mlx5e_priv *priv)
 
 	clear_bit(MLX5E_STATE_DESTROYING, &priv->state);
 	if (priv->fs)
-		priv->fs->state_destroy = !test_bit(MLX5E_STATE_DESTROYING, &priv->state);
+		mlx5e_fs_set_state_destroy(priv->fs,
+					   !test_bit(MLX5E_STATE_DESTROYING, &priv->state));
 
 	/* Validate the max_wqe_size_sq capability. */
 	if (WARN_ON_ONCE(mlx5e_get_max_sq_wqebbs(priv->mdev) < MLX5E_MAX_TX_WQEBBS)) {
@@ -5615,7 +5618,8 @@ out:
 	mlx5e_reset_channels(priv->netdev);
 	set_bit(MLX5E_STATE_DESTROYING, &priv->state);
 	if (priv->fs)
-		priv->fs->state_destroy = !test_bit(MLX5E_STATE_DESTROYING, &priv->state);
+		mlx5e_fs_set_state_destroy(priv->fs,
+					   !test_bit(MLX5E_STATE_DESTROYING, &priv->state));
 	cancel_work_sync(&priv->update_stats_work);
 	return err;
 }
@@ -5626,7 +5630,8 @@ void mlx5e_detach_netdev(struct mlx5e_priv *priv)
 
 	set_bit(MLX5E_STATE_DESTROYING, &priv->state);
 	if (priv->fs)
-		priv->fs->state_destroy = !test_bit(MLX5E_STATE_DESTROYING, &priv->state);
+		mlx5e_fs_set_state_destroy(priv->fs,
+					   !test_bit(MLX5E_STATE_DESTROYING, &priv->state));
 
 	if (profile->disable)
 		profile->disable(priv);
