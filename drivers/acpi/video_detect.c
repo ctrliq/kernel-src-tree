@@ -587,7 +587,7 @@ static int acpi_video_backlight_notify(struct notifier_block *nb,
  * Arguably the native on win8 check should be done first, but that would
  * be a behavior change, which may causes issues.
  */
-static enum acpi_backlight_type __acpi_video_get_backlight_type(bool native)
+enum acpi_backlight_type __acpi_video_get_backlight_type(bool native, bool *auto_detect)
 {
 	static DEFINE_MUTEX(init_mutex);
 	static bool native_available;
@@ -614,11 +614,17 @@ static enum acpi_backlight_type __acpi_video_get_backlight_type(bool native)
 		native_available = true;
 	mutex_unlock(&init_mutex);
 
+	if (auto_detect)
+		*auto_detect = false;
+
 	if (acpi_backlight_cmdline != acpi_backlight_undef)
 		return acpi_backlight_cmdline;
 
 	if (acpi_backlight_dmi != acpi_backlight_undef)
 		return acpi_backlight_dmi;
+
+	if (auto_detect)
+		*auto_detect = true;
 
 	if (!(video_caps & ACPI_VIDEO_BACKLIGHT))
 		return acpi_backlight_vendor;
@@ -630,17 +636,7 @@ static enum acpi_backlight_type __acpi_video_get_backlight_type(bool native)
 	return acpi_backlight_video;
 }
 
-enum acpi_backlight_type acpi_video_get_backlight_type(void)
-{
-	return __acpi_video_get_backlight_type(false);
-}
-EXPORT_SYMBOL(acpi_video_get_backlight_type);
-
-bool acpi_video_backlight_use_native(void)
-{
-	return __acpi_video_get_backlight_type(true) == acpi_backlight_native;
-}
-EXPORT_SYMBOL(acpi_video_backlight_use_native);
+EXPORT_SYMBOL(__acpi_video_get_backlight_type);
 
 /*
  * Set the preferred backlight interface type based on DMI info.
