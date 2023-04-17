@@ -210,6 +210,8 @@ static int __init rxe_module_init(void)
 {
 	int err;
 
+	mark_tech_preview("Soft-RoCE (rdma_rxe) Driver", THIS_MODULE);
+
 	err = rxe_net_init();
 	if (err)
 		return err;
