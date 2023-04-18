@@ -404,7 +404,7 @@ static void kill_procs(struct list_head *to_kill, int forcekill, bool fail,
 {
 	struct to_kill *tk, *next;
 
-	list_for_each_entry_safe (tk, next, to_kill, nd) {
+	list_for_each_entry_safe(tk, next, to_kill, nd) {
 		if (forcekill) {
 			/*
 			 * In case something went wrong with munmapping
@@ -428,6 +428,7 @@ static void kill_procs(struct list_head *to_kill, int forcekill, bool fail,
 				pr_err("%#lx: Cannot send advisory machine check signal to %s:%d\n",
 				       pfn, tk->tsk->comm, tk->tsk->pid);
 		}
+		list_del(&tk->nd);
 		put_task_struct(tk->tsk);
 		kfree(tk);
 	}
