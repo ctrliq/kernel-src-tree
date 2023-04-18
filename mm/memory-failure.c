@@ -1790,8 +1790,10 @@ retry:
 
 	if (hwpoison_filter(p)) {
 		hugetlb_clear_page_hwpoison(head);
-		res = -EOPNOTSUPP;
-		goto out;
+		unlock_page(head);
+		if (res == 1)
+			put_page(head);
+		return -EOPNOTSUPP;
 	}
 
 	/*
