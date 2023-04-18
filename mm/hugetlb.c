@@ -6098,6 +6098,10 @@ int hugetlb_mcopy_atomic_pte(struct mm_struct *dst_mm,
 	if (idx >= size)
 		goto out_release_unlock;
 
+	ret = -EIO;
+	if (PageHWPoison(page))
+		goto out_release_unlock;
+
 	ret = -EEXIST;
 	/*
 	 * We allow to overwrite a pte marker: consider when both MISSING|WP
