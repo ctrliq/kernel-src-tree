@@ -86,6 +86,7 @@ struct sock_args {
 
 	int use_setsockopt;
 	int use_cmsg;
+	uint8_t dsfield;
 	const char *dev;
 	const char *server_dev;
 	int ifindex;
@@ -554,6 +555,36 @@ static int set_reuseaddr(int sd)
 	}
 
 	return rc;
+}
+
+static int set_dsfield(int sd, int version, int dsfield)
+{
+	if (!dsfield)
+		return 0;
+
+	switch (version) {
+	case AF_INET:
+		if (setsockopt(sd, SOL_IP, IP_TOS, &dsfield,
+			       sizeof(dsfield)) < 0) {
+			log_err_errno("setsockopt(IP_TOS)");
+			return -1;
+		}
+		break;
+
+	case AF_INET6:
+		if (setsockopt(sd, SOL_IPV6, IPV6_TCLASS, &dsfield,
+			       sizeof(dsfield)) < 0) {
+			log_err_errno("setsockopt(IPV6_TCLASS)");
+			return -1;
+		}
+		break;
+
+	default:
+		log_error("Invalid address family\n");
+		return -1;
+	}
+
+	return 0;
 }
 
 static int str_to_uint(const char *str, int min, int max, unsigned int *value)
@@ -1293,6 +1324,9 @@ static int msock_init(struct sock_args *args, int server)
 		       (char *)&one, sizeof(one)) < 0)
 		log_err_errno("Setting SO_BROADCAST error");
 
+	if (set_dsfield(sd, AF_INET, args->dsfield) != 0)
+		goto out_err;
+
 	if (args->dev && bind_to_device(sd, args->dev) != 0)
 		goto out_err;
 	else if (args->use_setsockopt &&
@@ -1419,6 +1453,9 @@ static int lsock_init(struct sock_args *args)
 		goto err;
 
 	if (set_reuseport(sd) != 0)
+		goto err;
+
+	if (set_dsfield(sd, args->version, args->dsfield) != 0)
 		goto err;
 
 	if (args->dev && bind_to_device(sd, args->dev) != 0)
@@ -1631,6 +1668,9 @@ static int connectsock(void *addr, socklen_t alen, struct sock_args *args)
 	if (set_reuseport(sd) != 0)
 		goto err;
 
+	if (set_dsfield(sd, args->version, args->dsfield) != 0)
+		goto err;
+
 	if (args->dev && bind_to_device(sd, args->dev) != 0)
 		goto err;
 	else if (args->use_setsockopt &&
@@ -1835,7 +1875,7 @@ static int ipc_parent(int cpid, int fd, struct sock_args *args)
 	return client_status;
 }
 
-#define GETOPT_STR  "sr:l:c:p:t:g:P:DRn:M:X:m:d:I:BN:O:SUCi6xL:0:1:2:3:Fbq"
+#define GETOPT_STR  "sr:l:c:Q:p:t:g:P:DRn:M:X:m:d:I:BN:O:SUCi6xL:0:1:2:3:Fbq"
 #define OPT_FORCE_BIND_KEY_IFINDEX 1001
 #define OPT_NO_BIND_KEY_IFINDEX 1002
 
@@ -1866,6 +1906,8 @@ static void print_usage(char *prog)
 	"    -D|R          datagram (D) / raw (R) socket (default stream)\n"
 	"    -l addr       local address to bind to in server mode\n"
 	"    -c addr       local address to bind to in client mode\n"
+	"    -Q dsfield    DS Field value of the socket (the IP_TOS or\n"
+	"                  IPV6_TCLASS socket option)\n"
 	"    -x            configure XFRM policy on socket\n"
 	"\n"
 	"    -d dev        bind socket to given device name\n"
@@ -1942,6 +1984,13 @@ int main(int argc, char *argv[])
 		case 'c':
 			args.has_local_ip = 1;
 			args.client_local_addr_str = optarg;
+			break;
+		case 'Q':
+			if (str_to_uint(optarg, 0, 255, &tmp) != 0) {
+				fprintf(stderr, "Invalid DS Field\n");
+				return 1;
+			}
+			args.dsfield = tmp;
 			break;
 		case 'p':
 			if (str_to_uint(optarg, 1, 65535, &tmp) != 0) {
