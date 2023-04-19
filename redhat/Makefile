@@ -141,7 +141,14 @@ endif
 # opposed to any adjusted version for snapshotting.
 ifneq ($(SPECKEXTRAVERSION),)
   UPSTREAMBUILD:=0$(shell echo $(SPECKEXTRAVERSION) | sed -e s/-/./).
-  UPSTREAM_TARBALL_NAME:=$(SPECKVERSION).$(SPECKPATCHLEVEL)$(SPECKEXTRAVERSION)
+  ifeq ($(SPECKSUBLEVEL),0)
+    UPSTREAM_TARBALL_NAME:=$(SPECKVERSION).$(SPECKPATCHLEVEL)$(SPECKEXTRAVERSION)
+  else
+    UPSTREAM_TARBALL_NAME:=$(SPECKVERSION).$(SPECKPATCHLEVEL).$(SPECKSUBLEVEL)$(SPECKEXTRAVERSION)
+    # stable-rc's are not tagged
+    STABLERC_MARKER:=$(shell $(GIT) rev-parse -q --verify origin/$(UPSTREAM_BRANCH) | cut -c 1-12 || \
+            $(GIT) rev-parse -q --verify $(UPSTREAM_BRANCH) | cut -c 1-12)
+  endif
 else
   ifeq ($(SPECKSUBLEVEL),0)
     UPSTREAM_TARBALL_NAME:=$(SPECKVERSION).$(SPECKPATCHLEVEL)
@@ -154,7 +161,11 @@ else
   endif
   UPSTREAMBUILD:=
 endif
-MARKER:=v$(UPSTREAM_TARBALL_NAME)
+ifneq ($(STABLERC_MARKER),)
+  MARKER:=$(STABLERC_MARKER)
+else
+  MARKER:=v$(UPSTREAM_TARBALL_NAME)
+endif
 
 # If VERSION_ON_UPSTREAM is set, the versioning of the rpm package is based
 # on a branch tracking upstream. This allows for generating rpms
