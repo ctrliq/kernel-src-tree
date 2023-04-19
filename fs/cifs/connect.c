@@ -97,6 +97,10 @@ static int reconn_set_ipaddr_from_hostname(struct TCP_Server_Info *server)
 	if (!server->hostname)
 		return -EINVAL;
 
+	/* if server hostname isn't populated, there's nothing to do here */
+	if (server->hostname[0] == '\0')
+		return 0;
+
 	len = strlen(server->hostname) + 3;
 
 	unc = kmalloc(len, GFP_KERNEL);
@@ -141,6 +145,25 @@ requeue_resolve:
 	return rc;
 }
 
+static void smb2_query_server_interfaces(struct work_struct *work)
+{
+	int rc;
+	struct cifs_tcon *tcon = container_of(work,
+					struct cifs_tcon,
+					query_interfaces.work);
+
+	/*
+	 * query server network interfaces, in case they change
+	 */
+	rc = SMB3_request_interfaces(0, tcon, false);
+	if (rc) {
+		cifs_dbg(FYI, "%s: failed to query server interfaces: %d\n",
+				__func__, rc);
+	}
+
+	queue_delayed_work(cifsiod_wq, &tcon->query_interfaces,
+			   (SMB_INTERFACE_POLL_INTERVAL * HZ));
+}
 
 static void cifs_resolve_server(struct work_struct *work)
 {
@@ -288,7 +311,7 @@ cifs_abort_connection(struct TCP_Server_Info *server)
 	}
 	server->sequence_number = 0;
 	server->session_estab = false;
-	kfree(server->session_key.response);
+	kfree_sensitive(server->session_key.response);
 	server->session_key.response = NULL;
 	server->session_key.len = 0;
 	server->lstrp = jiffies;
@@ -311,7 +334,7 @@ cifs_abort_connection(struct TCP_Server_Info *server)
 	list_for_each_entry_safe(mid, nmid, &retry_list, qhead) {
 		list_del_init(&mid->qhead);
 		mid->callback(mid);
-		cifs_mid_q_entry_release(mid);
+		release_mid(mid);
 	}
 
 	if (cifs_rdma_enabled(server)) {
@@ -984,7 +1007,7 @@ static void clean_demultiplex_info(struct TCP_Server_Info *server)
 			cifs_dbg(FYI, "Callback mid %llu\n", mid_entry->mid);
 			list_del_init(&mid_entry->qhead);
 			mid_entry->callback(mid_entry);
-			cifs_mid_q_entry_release(mid_entry);
+			release_mid(mid_entry);
 		}
 		/* 1/8th of sec is more than enough time for them to exit */
 		msleep(125);
@@ -1220,7 +1243,7 @@ next_pdu:
 		if (length < 0) {
 			for (i = 0; i < num_mids; i++)
 				if (mids[i])
-					cifs_mid_q_entry_release(mids[i]);
+					release_mid(mids[i]);
 			continue;
 		}
 
@@ -1247,7 +1270,7 @@ next_pdu:
 				if (!mids[i]->multiRsp || mids[i]->multiEnd)
 					mids[i]->callback(mids[i]);
 
-				cifs_mid_q_entry_release(mids[i]);
+				release_mid(mids[i]);
 			} else if (server->ops->is_oplock_break &&
 				   server->ops->is_oplock_break(bufs[i],
 								server)) {
@@ -1562,7 +1585,7 @@ cifs_put_tcp_session(struct TCP_Server_Info *server, int from_reconnect)
 
 	cifs_crypto_secmech_release(server);
 
-	kfree(server->session_key.response);
+	kfree_sensitive(server->session_key.response);
 	server->session_key.response = NULL;
 	server->session_key.len = 0;
 	kfree(server->hostname);
@@ -1923,7 +1946,8 @@ void cifs_put_smb_ses(struct cifs_ses *ses)
 	spin_unlock(&ses->ses_lock);
 
 	cifs_dbg(FYI, "%s: ses_count=%d\n", __func__, ses->ses_count);
-	cifs_dbg(FYI, "%s: ses ipc: %s\n", __func__, ses->tcon_ipc ? ses->tcon_ipc->treeName : "NONE");
+	cifs_dbg(FYI,
+		 "%s: ses ipc: %s\n", __func__, ses->tcon_ipc ? ses->tcon_ipc->tree_name : "NONE");
 
 	spin_lock(&cifs_tcp_ses_lock);
 	if (--ses->ses_count > 0) {
@@ -2276,7 +2300,7 @@ static int match_tcon(struct cifs_tcon *tcon, struct smb3_fs_context *ctx)
 {
 	if (tcon->status == TID_EXITING)
 		return 0;
-	if (strncmp(tcon->treeName, ctx->UNC, MAX_TREE_SIZE))
+	if (strncmp(tcon->tree_name, ctx->UNC, MAX_TREE_SIZE))
 		return 0;
 	if (tcon->seal != ctx->seal)
 		return 0;
@@ -2341,6 +2365,9 @@ cifs_put_tcon(struct cifs_tcon *tcon)
 	list_del_init(&tcon->tcon_list);
 	spin_unlock(&tcon->tc_lock);
 	spin_unlock(&cifs_tcp_ses_lock);
+
+	/* cancel polling of interfaces */
+	cancel_delayed_work_sync(&tcon->query_interfaces);
 
 	if (tcon->use_witness) {
 		int rc;
@@ -2578,6 +2605,15 @@ cifs_get_tcon(struct cifs_ses *ses, struct smb3_fs_context *ctx)
 	tcon->local_lease = ctx->local_lease;
 	INIT_LIST_HEAD(&tcon->pending_opens);
 
+	INIT_DELAYED_WORK(&tcon->query_interfaces,
+			  smb2_query_server_interfaces);
+	if (ses->server->dialect >= SMB30_PROT_ID &&
+	    (ses->server->capabilities & SMB2_GLOBAL_CAP_MULTI_CHANNEL)) {
+		/* schedule query interfaces poll */
+		queue_delayed_work(cifsiod_wq, &tcon->query_interfaces,
+				   (SMB_INTERFACE_POLL_INTERVAL * HZ));
+	}
+
 	spin_lock(&cifs_tcp_ses_lock);
 	list_add(&tcon->tcon_list, &ses->tcon_list);
 	spin_unlock(&cifs_tcp_ses_lock);
@@ -2648,6 +2684,8 @@ compare_mount_options(struct super_block *sb, struct cifs_mnt_data *mnt_data)
 	if (old->ctx->acregmax != new->ctx->acregmax)
 		return 0;
 	if (old->ctx->acdirmax != new->ctx->acdirmax)
+		return 0;
+	if (old->ctx->closetimeo != new->ctx->closetimeo)
 		return 0;
 
 	return 1;
@@ -2801,65 +2839,48 @@ ip_rfc1001_connect(struct TCP_Server_Info *server)
 	 * negprot - BB check reconnection in case where second
 	 * sessinit is sent but no second negprot
 	 */
-	struct rfc1002_session_packet *ses_init_buf;
-	struct smb_hdr *smb_buf;
-	ses_init_buf = kzalloc(sizeof(struct rfc1002_session_packet),
-			       GFP_KERNEL);
-	if (ses_init_buf) {
-		ses_init_buf->trailer.session_req.called_len = 32;
+	struct rfc1002_session_packet req = {};
+	struct smb_hdr *smb_buf = (struct smb_hdr *)&req;
+	unsigned int len;
 
-		if (server->server_RFC1001_name[0] != 0)
-			rfc1002mangle(ses_init_buf->trailer.
-				      session_req.called_name,
-				      server->server_RFC1001_name,
-				      RFC1001_NAME_LEN_WITH_NULL);
-		else
-			rfc1002mangle(ses_init_buf->trailer.
-				      session_req.called_name,
-				      DEFAULT_CIFS_CALLED_NAME,
-				      RFC1001_NAME_LEN_WITH_NULL);
+	req.trailer.session_req.called_len = sizeof(req.trailer.session_req.called_name);
 
-		ses_init_buf->trailer.session_req.calling_len = 32;
+	if (server->server_RFC1001_name[0] != 0)
+		rfc1002mangle(req.trailer.session_req.called_name,
+			      server->server_RFC1001_name,
+			      RFC1001_NAME_LEN_WITH_NULL);
+	else
+		rfc1002mangle(req.trailer.session_req.called_name,
+			      DEFAULT_CIFS_CALLED_NAME,
+			      RFC1001_NAME_LEN_WITH_NULL);
 
-		/*
-		 * calling name ends in null (byte 16) from old smb
-		 * convention.
-		 */
-		if (server->workstation_RFC1001_name[0] != 0)
-			rfc1002mangle(ses_init_buf->trailer.
-				      session_req.calling_name,
-				      server->workstation_RFC1001_name,
-				      RFC1001_NAME_LEN_WITH_NULL);
-		else
-			rfc1002mangle(ses_init_buf->trailer.
-				      session_req.calling_name,
-				      "LINUX_CIFS_CLNT",
-				      RFC1001_NAME_LEN_WITH_NULL);
+	req.trailer.session_req.calling_len = sizeof(req.trailer.session_req.calling_name);
 
-		ses_init_buf->trailer.session_req.scope1 = 0;
-		ses_init_buf->trailer.session_req.scope2 = 0;
-		smb_buf = (struct smb_hdr *)ses_init_buf;
+	/* calling name ends in null (byte 16) from old smb convention */
+	if (server->workstation_RFC1001_name[0] != 0)
+		rfc1002mangle(req.trailer.session_req.calling_name,
+			      server->workstation_RFC1001_name,
+			      RFC1001_NAME_LEN_WITH_NULL);
+	else
+		rfc1002mangle(req.trailer.session_req.calling_name,
+			      "LINUX_CIFS_CLNT",
+			      RFC1001_NAME_LEN_WITH_NULL);
 
-		/* sizeof RFC1002_SESSION_REQUEST with no scope */
-		smb_buf->smb_buf_length = cpu_to_be32(0x81000044);
-		rc = smb_send(server, smb_buf, 0x44);
-		kfree(ses_init_buf);
-		/*
-		 * RFC1001 layer in at least one server
-		 * requires very short break before negprot
-		 * presumably because not expecting negprot
-		 * to follow so fast.  This is a simple
-		 * solution that works without
-		 * complicating the code and causes no
-		 * significant slowing down on mount
-		 * for everyone else
-		 */
-		usleep_range(1000, 2000);
-	}
 	/*
-	 * else the negprot may still work without this
-	 * even though malloc failed
+	 * As per rfc1002, @len must be the number of bytes that follows the
+	 * length field of a rfc1002 session request payload.
 	 */
+	len = sizeof(req) - offsetof(struct rfc1002_session_packet, trailer.session_req);
+
+	smb_buf->smb_buf_length = cpu_to_be32((RFC1002_SESSION_REQUEST << 24) | len);
+	rc = smb_send(server, smb_buf, len);
+	/*
+	 * RFC1001 layer in at least one server requires very short break before
+	 * negprot presumably because not expecting negprot to follow so fast.
+	 * This is a simple solution that works without complicating the code
+	 * and causes no significant slowing down on mount for everyone else
+	 */
+	usleep_range(1000, 2000);
 
 	return rc;
 }
@@ -3951,7 +3972,7 @@ CIFSTCon(const unsigned int xid, struct cifs_ses *ses,
 		}
 		bcc_ptr += length + 1;
 		bytes_left -= (length + 1);
-		strscpy(tcon->treeName, tree, sizeof(tcon->treeName));
+		strscpy(tcon->tree_name, tree, sizeof(tcon->tree_name));
 
 		/* mostly informational -- no need to fail on error here */
 		kfree(tcon->nativeFileSystem);
@@ -4096,7 +4117,7 @@ cifs_setup_session(const unsigned int xid, struct cifs_ses *ses,
 		if (ses->auth_key.response) {
 			cifs_dbg(FYI, "Free previous auth_key.response = %p\n",
 				 ses->auth_key.response);
-			kfree(ses->auth_key.response);
+			kfree_sensitive(ses->auth_key.response);
 			ses->auth_key.response = NULL;
 			ses->auth_key.len = 0;
 		}
@@ -4159,7 +4180,7 @@ cifs_construct_tcon(struct cifs_sb_info *cifs_sb, kuid_t fsuid)
 	ctx->local_nls = cifs_sb->local_nls;
 	ctx->linux_uid = fsuid;
 	ctx->cred_uid = fsuid;
-	ctx->UNC = master_tcon->treeName;
+	ctx->UNC = master_tcon->tree_name;
 	ctx->retry = master_tcon->retry;
 	ctx->nocase = master_tcon->nocase;
 	ctx->nohandlecache = master_tcon->nohandlecache;
@@ -4595,7 +4616,7 @@ int cifs_tree_connect(const unsigned int xid, struct cifs_tcon *tcon, const stru
 	if (tcon->ses->ses_status != SES_GOOD ||
 	    (tcon->status != TID_NEW &&
 	    tcon->status != TID_NEED_TCON)) {
-		spin_unlock(&tcon->ses->ses_lock);
+		spin_unlock(&tcon->tc_lock);
 		return 0;
 	}
 	tcon->status = TID_IN_TCON;
@@ -4625,7 +4646,7 @@ int cifs_tree_connect(const unsigned int xid, struct cifs_tcon *tcon, const stru
 	/* If it is not dfs or there was no cached dfs referral, then reconnect to same share */
 	if (!server->current_fullpath ||
 	    dfs_cache_noreq_find(server->current_fullpath + 1, &ref, &tl)) {
-		rc = ops->tree_connect(xid, tcon->ses, tcon->treeName, tcon, cifs_sb->local_nls);
+		rc = ops->tree_connect(xid, tcon->ses, tcon->tree_name, tcon, cifs_sb->local_nls);
 		goto out;
 	}
 
@@ -4669,7 +4690,7 @@ int cifs_tree_connect(const unsigned int xid, struct cifs_tcon *tcon, const stru
 	tcon->status = TID_IN_TCON;
 	spin_unlock(&tcon->tc_lock);
 
-	rc = ops->tree_connect(xid, tcon->ses, tcon->treeName, tcon, nlsc);
+	rc = ops->tree_connect(xid, tcon->ses, tcon->tree_name, tcon, nlsc);
 	if (rc) {
 		spin_lock(&tcon->tc_lock);
 		if (tcon->status == TID_IN_TCON)
