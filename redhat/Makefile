@@ -106,12 +106,16 @@ LOCVERFILE:=../localversion
 # create an empty localversion file if you don't want a local buildid
 ifneq ($(wildcard $(LOCVERFILE)),)
   DISTLOCALVERSION:=$(shell cat $(LOCVERFILE))
-  $(info DISTLOCALVERSION is "$(DISTLOCALVERSION)". Update '$(shell dirname $(REDHAT))/localversion' to change.)
+  ifeq (,$(findstring s,$(firstword -$(MAKEFLAGS))))
+    $(info DISTLOCALVERSION is "$(DISTLOCALVERSION)". Update '$(shell dirname $(REDHAT))/localversion' to change.)
+  endif
 else
   ifeq ($(DISTLOCALVERSION),)
     DISTLOCALVERSION:=.test
   endif
-  $(info DISTLOCALVERSION is "$(DISTLOCALVERSION)".)
+  ifeq (,$(findstring s,$(firstword -$(MAKEFLAGS))))
+    $(info DISTLOCALVERSION is "$(DISTLOCALVERSION)".)
+  endif
 endif
 
 # options for process_configs.sh script
@@ -753,6 +757,9 @@ dist-release-changed:
 dist-release: dist-clean-sources
 	@$(MAKE) dist-release-changed
 
+dist-get-tag:
+	$(info $(DISTRELEASETAG))
+
 dist-release-tag:
 	@$(GIT) tag -a -m "$(DISTRELEASETAG)" $(DISTRELEASETAG)
 
@@ -972,6 +979,7 @@ dist-full-help:
 	@echo  '  dist-get-latest - Returns the latest "known good" kernel from brew. This'
 	@echo  '                    should not be confused with the latest top-of-tree'
 	@echo  '                    development tag.'
+	@echo  '  dist-get-tag    - Returns the latest release tag'
 	@echo  '  dist-os-version - Displays the current Red Hat Enterprise Linux versioni'
 	@echo  '                    target used by the current branch/tree.'
 	@echo  '  dist-self-test  - Runs self-tests from the redhat/self-test directory'
