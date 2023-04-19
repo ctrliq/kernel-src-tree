@@ -181,7 +181,19 @@ endif
 UPSTREAM:=$(shell $(GIT) rev-parse -q --verify origin/$(UPSTREAM_BRANCH) || \
             $(GIT) rev-parse -q --verify $(UPSTREAM_BRANCH))
 
-ifeq ($(VERSION_ON_UPSTREAM),1)
+ifneq ("$(wildcard $(TOPDIR)/localversion-next)", "")
+  # we are building linux-next
+  MARKER:=$(shell $(GIT) describe $(UPSTREAM))
+  # The merge window is weird because the actual versioning hasn't
+  # been updated but we still need something that works for
+  # packaging. Fix this by bumping the patch level.
+  ifeq ($(SPECKEXTRAVERSION),)
+    SPECKPATCHLEVEL:=$(shell expr $(SPECKPATCHLEVEL) + 1)
+  endif
+  LINUXNEXT_VERSION:=$(shell echo $(MARKER) | sed 's!next-!!')
+  UPSTREAMBUILD:=0.0.next.$(LINUXNEXT_VERSION).
+  UPSTREAM_TARBALL_NAME:=$(MARKER)
+else ifeq ($(VERSION_ON_UPSTREAM),1)
   # UPSTREAM_BRANCH is expected to track mainline.
   ifeq ($(UPSTREAM),)
       $(error "Missing an $(UPSTREAM_BRANCH) branch")
