@@ -2199,6 +2199,12 @@ static void __intel_pmu_enable_all(int added, bool pmi)
 	u64 intel_ctrl = hybrid(cpuc->pmu, intel_ctrl);
 
 	intel_pmu_lbr_enable_all(pmi);
+
+	if (cpuc->fixed_ctrl_val != cpuc->active_fixed_ctrl_val) {
+		wrmsrl(MSR_ARCH_PERFMON_FIXED_CTR_CTRL, cpuc->fixed_ctrl_val);
+		cpuc->active_fixed_ctrl_val = cpuc->fixed_ctrl_val;
+	}
+
 	wrmsrl(MSR_CORE_PERF_GLOBAL_CTRL,
 	       intel_ctrl & ~cpuc->intel_ctrl_guest_mask);
 
@@ -2416,9 +2422,10 @@ static inline void intel_clear_masks(struct perf_event *event, int idx)
 
 static void intel_pmu_disable_fixed(struct perf_event *event)
 {
+	struct cpu_hw_events *cpuc = this_cpu_ptr(&cpu_hw_events);
 	struct hw_perf_event *hwc = &event->hw;
-	u64 ctrl_val, mask;
 	int idx = hwc->idx;
+	u64 mask;
 
 	if (is_topdown_idx(idx)) {
 		struct cpu_hw_events *cpuc = this_cpu_ptr(&cpu_hw_events);
@@ -2435,9 +2442,7 @@ static void intel_pmu_disable_fixed(struct perf_event *event)
 	intel_clear_masks(event, idx);
 
 	mask = 0xfULL << ((idx - INTEL_PMC_IDX_FIXED) * 4);
-	rdmsrl(hwc->config_base, ctrl_val);
-	ctrl_val &= ~mask;
-	wrmsrl(hwc->config_base, ctrl_val);
+	cpuc->fixed_ctrl_val &= ~mask;
 }
 
 static void intel_pmu_disable_event(struct perf_event *event)
@@ -2710,8 +2715,9 @@ static void intel_pmu_read_event(struct perf_event *event)
 
 static void intel_pmu_enable_fixed(struct perf_event *event)
 {
+	struct cpu_hw_events *cpuc = this_cpu_ptr(&cpu_hw_events);
 	struct hw_perf_event *hwc = &event->hw;
-	u64 ctrl_val, mask, bits = 0;
+	u64 mask, bits = 0;
 	int idx = hwc->idx;
 
 	if (is_topdown_idx(idx)) {
@@ -2755,10 +2761,8 @@ static void intel_pmu_enable_fixed(struct perf_event *event)
 		mask |= ICL_FIXED_0_ADAPTIVE << (idx * 4);
 	}
 
-	rdmsrl(hwc->config_base, ctrl_val);
-	ctrl_val &= ~mask;
-	ctrl_val |= bits;
-	wrmsrl(hwc->config_base, ctrl_val);
+	cpuc->fixed_ctrl_val &= ~mask;
+	cpuc->fixed_ctrl_val |= bits;
 }
 
 static void intel_pmu_enable_event(struct perf_event *event)
