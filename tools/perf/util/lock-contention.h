@@ -115,6 +115,8 @@ struct lock_contention {
 	struct hlist_head *result;
 	unsigned long map_nr_entries;
 	int lost;
+	int max_stack;
+	int stack_skip;
 };
 
 #ifdef HAVE_BPF_SKEL
