@@ -43,14 +43,26 @@
 #define NO_CONT_MAPPINGS	BIT(1)
 #define NO_EXEC_MAPPINGS	BIT(2)	/* assumes FEAT_HPDS is not used */
 
-u64 idmap_t0sz = TCR_T0SZ(VA_BITS_MIN);
-u64 idmap_ptrs_per_pgd = PTRS_PER_PGD;
+int idmap_t0sz __ro_after_init;
 
-u64 __section(".mmuoff.data.write") vabits_actual;
+#if VA_BITS > 48
+u64 vabits_actual __ro_after_init = VA_BITS_MIN;
 EXPORT_SYMBOL(vabits_actual);
+#endif
+
+u64 kimage_vaddr __ro_after_init = (u64)&_text;
+EXPORT_SYMBOL(kimage_vaddr);
 
 u64 kimage_voffset __ro_after_init;
 EXPORT_SYMBOL(kimage_voffset);
+
+u32 __boot_cpu_mode[] = { BOOT_CPU_MODE_EL2, BOOT_CPU_MODE_EL1 };
+
+/*
+ * The booting CPU updates the failed status @__early_cpu_boot_status,
+ * with MMU turned off.
+ */
+long __section(".mmuoff.data.write") __early_cpu_boot_status;
 
 /*
  * Empty_zero_page is a special page that is used for zero-initialized data
@@ -319,12 +331,6 @@ static void alloc_init_pud(pgd_t *pgdp, unsigned long addr, unsigned long end,
 	}
 	BUG_ON(p4d_bad(p4d));
 
-	/*
-	 * No need for locking during early boot. And it doesn't work as
-	 * expected with KASLR enabled.
-	 */
-	if (system_state != SYSTEM_BOOTING)
-		mutex_lock(&fixmap_lock);
 	pudp = pud_set_fixmap_offset(p4dp, addr);
 	do {
 		pud_t old_pud = READ_ONCE(*pudp);
@@ -356,15 +362,13 @@ static void alloc_init_pud(pgd_t *pgdp, unsigned long addr, unsigned long end,
 	} while (pudp++, addr = next, addr != end);
 
 	pud_clear_fixmap();
-	if (system_state != SYSTEM_BOOTING)
-		mutex_unlock(&fixmap_lock);
 }
 
-static void __create_pgd_mapping(pgd_t *pgdir, phys_addr_t phys,
-				 unsigned long virt, phys_addr_t size,
-				 pgprot_t prot,
-				 phys_addr_t (*pgtable_alloc)(int),
-				 int flags)
+static void __create_pgd_mapping_locked(pgd_t *pgdir, phys_addr_t phys,
+					unsigned long virt, phys_addr_t size,
+					pgprot_t prot,
+					phys_addr_t (*pgtable_alloc)(int),
+					int flags)
 {
 	unsigned long addr, end, next;
 	pgd_t *pgdp = pgd_offset_pgd(pgdir, virt);
@@ -388,8 +392,20 @@ static void __create_pgd_mapping(pgd_t *pgdir, phys_addr_t phys,
 	} while (pgdp++, addr = next, addr != end);
 }
 
+static void __create_pgd_mapping(pgd_t *pgdir, phys_addr_t phys,
+				 unsigned long virt, phys_addr_t size,
+				 pgprot_t prot,
+				 phys_addr_t (*pgtable_alloc)(int),
+				 int flags)
+{
+	mutex_lock(&fixmap_lock);
+	__create_pgd_mapping_locked(pgdir, phys, virt, size, prot,
+				    pgtable_alloc, flags);
+	mutex_unlock(&fixmap_lock);
+}
+
 #ifdef CONFIG_UNMAP_KERNEL_AT_EL0
-extern __alias(__create_pgd_mapping)
+extern __alias(__create_pgd_mapping_locked)
 void create_kpti_ng_temp_pgd(pgd_t *pgdir, phys_addr_t phys, unsigned long virt,
 			     phys_addr_t size, pgprot_t prot,
 			     phys_addr_t (*pgtable_alloc)(int), int flags);
@@ -692,7 +708,7 @@ static bool arm64_early_this_cpu_has_bti(void)
 
 	pfr1 = __read_sysreg_by_encoding(SYS_ID_AA64PFR1_EL1);
 	return cpuid_feature_extract_unsigned_field(pfr1,
-						    ID_AA64PFR1_BT_SHIFT);
+						    ID_AA64PFR1_EL1_BT_SHIFT);
 }
 
 /*
@@ -763,22 +779,57 @@ static void __init map_kernel(pgd_t *pgdp)
 	kasan_copy_shadow(pgdp);
 }
 
+static void __init create_idmap(void)
+{
+	u64 start = __pa_symbol(__idmap_text_start);
+	u64 size = __pa_symbol(__idmap_text_end) - start;
+	pgd_t *pgd = idmap_pg_dir;
+	u64 pgd_phys;
+
+	/* check if we need an additional level of translation */
+	if (VA_BITS < 48 && idmap_t0sz < (64 - VA_BITS_MIN)) {
+		pgd_phys = early_pgtable_alloc(PAGE_SHIFT);
+		set_pgd(&idmap_pg_dir[start >> VA_BITS],
+			__pgd(pgd_phys | P4D_TYPE_TABLE));
+		pgd = __va(pgd_phys);
+	}
+	__create_pgd_mapping(pgd, start, start, size, PAGE_KERNEL_ROX,
+			     early_pgtable_alloc, 0);
+
+	if (IS_ENABLED(CONFIG_UNMAP_KERNEL_AT_EL0)) {
+		extern u32 __idmap_kpti_flag;
+		u64 pa = __pa_symbol(&__idmap_kpti_flag);
+
+		/*
+		 * The KPTI G-to-nG conversion code needs a read-write mapping
+		 * of its synchronization flag in the ID map.
+		 */
+		__create_pgd_mapping(pgd, pa, pa, sizeof(u32), PAGE_KERNEL,
+				     early_pgtable_alloc, 0);
+	}
+}
+
 void __init paging_init(void)
 {
 	pgd_t *pgdp = pgd_set_fixmap(__pa_symbol(swapper_pg_dir));
+	extern pgd_t init_idmap_pg_dir[];
+
+	idmap_t0sz = 63UL - __fls(__pa_symbol(_end) | GENMASK(VA_BITS_MIN - 1, 0));
 
 	map_kernel(pgdp);
 	map_mem(pgdp);
 
 	pgd_clear_fixmap();
 
-	cpu_replace_ttbr1(lm_alias(swapper_pg_dir));
+	cpu_replace_ttbr1(lm_alias(swapper_pg_dir), init_idmap_pg_dir);
 	init_mm.pgd = swapper_pg_dir;
 
 	memblock_phys_free(__pa_symbol(init_pg_dir),
 			   __pa_symbol(init_pg_end) - __pa_symbol(init_pg_dir));
 
 	memblock_allow_resize();
+
+	create_idmap();
 }
 
 /*
@@ -1678,3 +1729,24 @@ static int __init prevent_bootmem_remove_init(void)
 }
 early_initcall(prevent_bootmem_remove_init);
 #endif
+
+pte_t ptep_modify_prot_start(struct vm_area_struct *vma, unsigned long addr, pte_t *ptep)
+{
+	if (IS_ENABLED(CONFIG_ARM64_ERRATUM_2645198) &&
+	    cpus_have_const_cap(ARM64_WORKAROUND_2645198)) {
+		/*
+		 * Break-before-make (BBM) is required for all user space mappings
+		 * when the permission changes from executable to non-executable
+		 * in cases where cpu is affected with errata #2645198.
+		 */
+		if (pte_user_exec(READ_ONCE(*ptep)))
+			return ptep_clear_flush(vma, addr, ptep);
+	}
+	return ptep_get_and_clear(vma->vm_mm, addr, ptep);
+}
+
+void ptep_modify_prot_commit(struct vm_area_struct *vma, unsigned long addr, pte_t *ptep,
+			     pte_t old_pte, pte_t pte)
+{
+	set_pte_at(vma->vm_mm, addr, ptep, pte);
+}
