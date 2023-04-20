@@ -2927,9 +2927,12 @@ ice_xdp_setup_prog(struct ice_vsi *vsi, struct bpf_prog *prog,
 	bool if_running = netif_running(vsi->netdev);
 	int ret = 0, xdp_ring_err = 0;
 
-	if (frame_size > ice_max_xdp_frame_size(vsi)) {
-		NL_SET_ERR_MSG_MOD(extack, "MTU too large for loading XDP");
-		return -EOPNOTSUPP;
+	if (prog && !prog->aux->xdp_has_frags) {
+		if (frame_size > ice_max_xdp_frame_size(vsi)) {
+			NL_SET_ERR_MSG_MOD(extack,
+					   "MTU is too large for linear frames and XDP prog does not support frags");
+			return -EOPNOTSUPP;
+		}
 	}
 
 	/* need to stop netdev while setting up the program for Rx rings */
@@ -7576,6 +7579,7 @@ static int ice_change_mtu(struct net_device *netdev, int new_mtu)
 	struct ice_netdev_priv *np = netdev_priv(netdev);
 	struct ice_vsi *vsi = np->vsi;
 	struct ice_pf *pf = vsi->back;
+	struct bpf_prog *prog;
 	u8 count = 0;
 	int err = 0;
 
@@ -7584,7 +7588,8 @@ static int ice_change_mtu(struct net_device *netdev, int new_mtu)
 		return 0;
 	}
 
-	if (ice_is_xdp_ena_vsi(vsi)) {
+	prog = vsi->xdp_prog;
+	if (prog && !prog->aux->xdp_has_frags) {
 		int frame_size = ice_max_xdp_frame_size(vsi);
 
 		if (new_mtu + ICE_ETH_PKT_HDR_PAD > frame_size) {
