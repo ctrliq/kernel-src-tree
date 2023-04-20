@@ -110,7 +110,7 @@ function merge_configs()
 
 	sort config-merging."$count" >> "$name"
 
-	if [ -n "$ENABLE_WERROR" ]; then
+	if [ "$arch" == "x86_64" ] && [ -n "$ENABLE_WERROR" ]; then
 	       sed -i "1,$$s|# CONFIG_WERROR is not set|CONFIG_WERROR=y|g" "$name"
 	fi
 
