@@ -5515,7 +5515,7 @@ bool ice_fw_supports_report_dflt_cfg(struct ice_hw *hw)
  * returned by the firmware is a 16 bit * value, but is indexed
  * by [fls(speed) - 1]
  */
-static const u32 ice_aq_to_link_speed[15] = {
+static const u32 ice_aq_to_link_speed[] = {
 	SPEED_10,	/* BIT(0) */
 	SPEED_100,
 	SPEED_1000,
@@ -5527,10 +5527,6 @@ static const u32 ice_aq_to_link_speed[15] = {
 	SPEED_40000,
 	SPEED_50000,
 	SPEED_100000,	/* BIT(10) */
-	0,
-	0,
-	0,
-	0		/* BIT(14) */
 };
 
 /**
@@ -5541,5 +5537,8 @@ static const u32 ice_aq_to_link_speed[15] = {
  */
 u32 ice_get_link_speed(u16 index)
 {
+	if (index >= ARRAY_SIZE(ice_aq_to_link_speed))
+		return 0;
+
 	return ice_aq_to_link_speed[index];
 }
