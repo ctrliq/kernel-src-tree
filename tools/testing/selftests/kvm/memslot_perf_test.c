@@ -292,7 +292,6 @@ static bool prepare_vm(struct vm_data *data, int nslots, uint64_t *maxslots,
 	mempages = mem_size / guest_page_size;
 
 	data->vm = __vm_create_with_one_vcpu(&data->vcpu, mempages, guest_code);
-	ucall_init(data->vm, NULL);
 	TEST_ASSERT(data->vm->page_size == guest_page_size, "Invalid VM page size");
 
 	data->npages = mempages;
