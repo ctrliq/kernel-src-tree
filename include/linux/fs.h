@@ -1021,9 +1021,6 @@ static inline struct file *get_file(struct file *f)
 #define FL_LAYOUT	2048	/* outstanding pNFS layout */
 #define FL_RECLAIM	4096	/* reclaiming from a reboot server */
 
-/* RHEL-only flags */
-#define FL_EXT_LMOPS	(1U<<31) /* fl_lmops is extended */
-
 #define FL_CLOSE_POSIX (FL_POSIX | FL_CLOSE)
 
 /*
@@ -1043,6 +1040,7 @@ struct file_lock_operations {
 };
 
 struct lock_manager_operations {
+	void *lm_mod_owner;
 	fl_owner_t (*lm_get_owner)(fl_owner_t);
 	void (*lm_put_owner)(fl_owner_t);
 	void (*lm_notify)(struct file_lock *);	/* unblock callback */
@@ -1051,8 +1049,6 @@ struct lock_manager_operations {
 	int (*lm_change)(struct file_lock *, int, struct list_head *);
 	void (*lm_setup)(struct file_lock *, void **);
 	bool (*lm_breaker_owns_lease)(struct file_lock *);
-	/* The fields below must only be accessed if FL_EXT_LMOPS is set */
-	void *lm_mod_owner;
 	bool (*lm_lock_expirable)(struct file_lock *cfl);
 	void (*lm_expire_lock)(void);
 };
