@@ -62,6 +62,7 @@ int acpi_fix_pin2_polarity __initdata;
 
 #ifdef CONFIG_X86_LOCAL_APIC
 static u64 acpi_lapic_addr __initdata = APIC_DEFAULT_PHYS_BASE;
+static bool acpi_support_online_capable;
 #endif
 
 #ifdef CONFIG_X86_64
@@ -146,6 +147,12 @@ static int __init acpi_parse_madt(struct acpi_table_header *table)
 		pr_debug("Local APIC address 0x%08x\n", madt->address);
 	}
 
+	/* ACPI 6.3 and newer support the online capable bit. */
+	if (acpi_gbl_FADT.header.revision > 6 ||
+	    (acpi_gbl_FADT.header.revision == 6 &&
+	     acpi_gbl_FADT.minor_revision >= 3))
+		acpi_support_online_capable = true;
+
 	default_acpi_madt_oem_check(madt->header.oem_id,
 				    madt->header.oem_table_id);
 
@@ -185,6 +192,18 @@ static int acpi_register_lapic(int id, u32 acpiid, u8 enabled)
 	return cpu;
 }
 
+static bool __init acpi_is_processor_usable(u32 lapic_flags)
+{
+	if (lapic_flags & ACPI_MADT_ENABLED)
+		return true;
+
+	if (!acpi_support_online_capable ||
+	    (lapic_flags & ACPI_MADT_ONLINE_CAPABLE))
+		return true;
+
+	return false;
+}
+
 static int __init
 acpi_parse_x2apic(union acpi_subtable_headers *header, const unsigned long end)
 {
@@ -207,6 +226,10 @@ acpi_parse_x2apic(union acpi_subtable_headers *header, const unsigned long end)
 
 	/* Ignore invalid ID */
 	if (apic_id == 0xffffffff)
+		return 0;
+
+	/* don't register processors that cannot be onlined */
+	if (!acpi_is_processor_usable(processor->lapic_flags))
 		return 0;
 
 	/*
@@ -244,6 +267,10 @@ acpi_parse_lapic(union acpi_subtable_headers * header, const unsigned long end)
 
 	/* Ignore invalid ID */
 	if (processor->id == 0xff)
+		return 0;
+
+	/* don't register processors that can not be onlined */
+	if (!acpi_is_processor_usable(processor->lapic_flags))
 		return 0;
 
 	/*
