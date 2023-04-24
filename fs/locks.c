@@ -902,8 +902,7 @@ retry:
 	list_for_each_entry(cfl, &ctx->flc_posix, fl_list) {
 		if (!posix_locks_conflict(fl, cfl))
 			continue;
-		if ((cfl->fl_flags & FL_EXT_LMOPS) &&
-		    cfl->fl_lmops && cfl->fl_lmops->lm_lock_expirable
+		if (cfl->fl_lmops && cfl->fl_lmops->lm_lock_expirable
 		     && (*cfl->fl_lmops->lm_lock_expirable)(cfl)) {
 			owner = cfl->fl_lmops->lm_mod_owner;
 			func = cfl->fl_lmops->lm_expire_lock;
@@ -1120,8 +1119,7 @@ retry:
 		list_for_each_entry(fl, &ctx->flc_posix, fl_list) {
 			if (!posix_locks_conflict(request, fl))
 				continue;
-			if ((fl->fl_flags & FL_EXT_LMOPS) &&
-			    fl->fl_lmops && fl->fl_lmops->lm_lock_expirable
+			if (fl->fl_lmops && fl->fl_lmops->lm_lock_expirable
 			     && (*fl->fl_lmops->lm_lock_expirable)(fl)) {
 				owner = fl->fl_lmops->lm_mod_owner;
 				func = fl->fl_lmops->lm_expire_lock;
