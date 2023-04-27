@@ -976,6 +976,10 @@ struct mlx5e_priv {
 	struct mlx5e_mqprio_rl    *mqprio_rl;
 };
 
+struct mlx5e_dev {
+	struct mlx5e_priv *priv;
+};
+
 struct mlx5e_rx_handlers {
 	mlx5e_fp_handle_rx_cqe handle_rx_cqe;
 	mlx5e_fp_handle_rx_cqe handle_rx_cqe_mpwqe;

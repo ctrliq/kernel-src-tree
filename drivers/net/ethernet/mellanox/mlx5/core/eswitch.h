@@ -342,8 +342,8 @@ struct mlx5_eswitch {
 
 void esw_offloads_disable(struct mlx5_eswitch *esw);
 int esw_offloads_enable(struct mlx5_eswitch *esw);
-void esw_offloads_cleanup_reps(struct mlx5_eswitch *esw);
-int esw_offloads_init_reps(struct mlx5_eswitch *esw);
+void esw_offloads_cleanup(struct mlx5_eswitch *esw);
+int esw_offloads_init(struct mlx5_eswitch *esw);
 void esw_offloads_del_send_to_vport_meta_rules(struct mlx5_eswitch *esw);
 
 bool mlx5_esw_vport_match_metadata_supported(const struct mlx5_eswitch *esw);
