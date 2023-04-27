@@ -433,17 +433,15 @@ static int taprio_enqueue_one(struct sk_buff *skb, struct Qdisc *sch,
 	return qdisc_enqueue(skb, child, to_free);
 }
 
+/* Will not be called in the full offload case, since the TX queues are
+ * attached to the Qdisc created using qdisc_create_dflt()
+ */
 static int taprio_enqueue(struct sk_buff *skb, struct Qdisc *sch,
 			  struct sk_buff **to_free)
 {
 	struct taprio_sched *q = qdisc_priv(sch);
 	struct Qdisc *child;
 	int queue;
-
-	if (unlikely(FULL_OFFLOAD_IS_ENABLED(q->flags))) {
-		WARN_ONCE(1, "Trying to enqueue skb into the root of a taprio qdisc configured with full offload\n");
-		return qdisc_drop(skb, sch, to_free);
-	}
 
 	queue = skb_get_queue_mapping(skb);
 
@@ -490,6 +488,9 @@ static int taprio_enqueue(struct sk_buff *skb, struct Qdisc *sch,
 	return taprio_enqueue_one(skb, sch, child, to_free);
 }
 
+/* Will not be called in the full offload case, since the TX queues are
+ * attached to the Qdisc created using qdisc_create_dflt()
+ */
 static struct sk_buff *taprio_peek(struct Qdisc *sch)
 {
 	struct taprio_sched *q = qdisc_priv(sch);
@@ -498,11 +499,6 @@ static struct sk_buff *taprio_peek(struct Qdisc *sch)
 	struct sk_buff *skb;
 	u32 gate_mask;
 	int i;
-
-	if (unlikely(FULL_OFFLOAD_IS_ENABLED(q->flags))) {
-		WARN_ONCE(1, "Trying to peek into the root of a taprio qdisc configured with full offload\n");
-		return NULL;
-	}
 
 	rcu_read_lock();
 	entry = rcu_dereference(q->current_entry);
@@ -546,6 +542,9 @@ static void taprio_set_budget(struct taprio_sched *q, struct sched_entry *entry)
 			     atomic64_read(&q->picos_per_byte)));
 }
 
+/* Will not be called in the full offload case, since the TX queues are
+ * attached to the Qdisc created using qdisc_create_dflt()
+ */
 static struct sk_buff *taprio_dequeue(struct Qdisc *sch)
 {
 	struct taprio_sched *q = qdisc_priv(sch);
@@ -554,11 +553,6 @@ static struct sk_buff *taprio_dequeue(struct Qdisc *sch)
 	struct sched_entry *entry;
 	u32 gate_mask;
 	int i;
-
-	if (unlikely(FULL_OFFLOAD_IS_ENABLED(q->flags))) {
-		WARN_ONCE(1, "Trying to dequeue from the root of a taprio qdisc configured with full offload\n");
-		return NULL;
-	}
 
 	rcu_read_lock();
 	entry = rcu_dereference(q->current_entry);
