@@ -35,6 +35,7 @@ tu102_fb = {
 	.init = gm200_fb_init,
 	.init_page = gv100_fb_init_page,
 	.init_unkn = gp100_fb_init_unkn,
+	.sysmem.flush_page_init = gf100_fb_sysmem_flush_page_init,
 	.vpr.scrub_required = tu102_fb_vpr_scrub_required,
 	.vpr.scrub = gp102_fb_vpr_scrub,
 	.ram_new = gp100_ram_new,
