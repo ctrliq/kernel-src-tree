@@ -526,13 +526,18 @@ static ssize_t phys_port_name_show(struct device *dev,
 				   struct device_attribute *attr, char *buf)
 {
 	struct net_device *netdev = to_net_dev(dev);
+	struct devlink_port* devlink_port;
 	ssize_t ret = -EINVAL;
+
+	if (netdev->netdev_ops->__rh_deprecated_ndo_get_devlink_port)
+		devlink_port = netdev->netdev_ops->__rh_deprecated_ndo_get_devlink_port(netdev);
+	else devlink_port = netdev->devlink_port;
 
 	/* The checks are also done in dev_get_phys_port_name; this helps
 	 * returning early without hitting the trylock/restart below.
 	 */
 	if (!netdev->netdev_ops->ndo_get_phys_port_name &&
-	    !netdev->netdev_ops->ndo_get_devlink_port)
+	    !devlink_port)
 		return -EOPNOTSUPP;
 
 	if (!rtnl_trylock())
@@ -555,14 +560,19 @@ static ssize_t phys_switch_id_show(struct device *dev,
 				   struct device_attribute *attr, char *buf)
 {
 	struct net_device *netdev = to_net_dev(dev);
+	struct devlink_port* devlink_port;
 	ssize_t ret = -EINVAL;
+
+	if (netdev->netdev_ops->__rh_deprecated_ndo_get_devlink_port)
+		devlink_port = netdev->netdev_ops->__rh_deprecated_ndo_get_devlink_port(netdev);
+	else devlink_port = netdev->devlink_port;
 
 	/* The checks are also done in dev_get_phys_port_name; this helps
 	 * returning early without hitting the trylock/restart below. This works
 	 * because recurse is false when calling dev_get_port_parent_id.
 	 */
 	if (!netdev->netdev_ops->ndo_get_port_parent_id &&
-	    !netdev->netdev_ops->ndo_get_devlink_port)
+	    !devlink_port)
 		return -EOPNOTSUPP;
 
 	if (!rtnl_trylock())

@@ -134,14 +134,6 @@ static int ice_repr_stop(struct net_device *netdev)
 	return 0;
 }
 
-static struct devlink_port *
-ice_repr_get_devlink_port(struct net_device *netdev)
-{
-	struct ice_repr *repr = ice_netdev_to_repr(netdev);
-
-	return &repr->vf->devlink_port;
-}
-
 /**
  * ice_repr_sp_stats64 - get slow path stats for port representor
  * @dev: network interface device structure
@@ -250,7 +242,6 @@ static const struct net_device_ops ice_repr_netdev_ops = {
 	.ndo_open = ice_repr_open,
 	.ndo_stop = ice_repr_stop,
 	.ndo_start_xmit = ice_eswitch_port_start_xmit,
-	.ndo_get_devlink_port = ice_repr_get_devlink_port,
 	.ndo_setup_tc = ice_repr_setup_tc,
 	.ndo_has_offload_stats = ice_repr_ndo_has_offload_stats,
 	.ndo_get_offload_stats = ice_repr_ndo_get_offload_stats,
@@ -338,11 +329,10 @@ static int ice_repr_add(struct ice_vf *vf)
 	repr->netdev->min_mtu = ETH_MIN_MTU;
 	repr->netdev->max_mtu = ICE_MAX_MTU;
 
+	SET_NETDEV_DEVLINK_PORT(repr->netdev, &vf->devlink_port);
 	err = ice_repr_reg_netdev(repr->netdev);
 	if (err)
 		goto err_netdev;
-
-	devlink_port_type_eth_set(&vf->devlink_port, repr->netdev);
 
 	ice_virtchnl_set_repr_ops(vf);
 
@@ -376,10 +366,10 @@ static void ice_repr_rem(struct ice_vf *vf)
 	if (!vf->repr)
 		return;
 
-	ice_devlink_destroy_vf_port(vf);
 	kfree(vf->repr->q_vector);
 	vf->repr->q_vector = NULL;
 	unregister_netdev(vf->repr->netdev);
+	ice_devlink_destroy_vf_port(vf);
 	free_netdev(vf->repr->netdev);
 	vf->repr->netdev = NULL;
 #ifdef CONFIG_ICE_SWITCHDEV

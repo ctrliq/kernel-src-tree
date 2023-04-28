@@ -1184,16 +1184,6 @@ static int mlxsw_sp_set_features(struct net_device *dev,
 	return 0;
 }
 
-static struct devlink_port *
-mlxsw_sp_port_get_devlink_port(struct net_device *dev)
-{
-	struct mlxsw_sp_port *mlxsw_sp_port = netdev_priv(dev);
-	struct mlxsw_sp *mlxsw_sp = mlxsw_sp_port->mlxsw_sp;
-
-	return mlxsw_core_port_devlink_port_get(mlxsw_sp->core,
-						mlxsw_sp_port->local_port);
-}
-
 static int mlxsw_sp_port_hwtstamp_set(struct mlxsw_sp_port *mlxsw_sp_port,
 				      struct ifreq *ifr)
 {
@@ -1267,7 +1257,6 @@ static const struct net_device_ops mlxsw_sp_port_netdev_ops = {
 	.ndo_vlan_rx_add_vid	= mlxsw_sp_port_add_vid,
 	.ndo_vlan_rx_kill_vid	= mlxsw_sp_port_kill_vid,
 	.ndo_set_features	= mlxsw_sp_set_features,
-	.ndo_get_devlink_port	= mlxsw_sp_port_get_devlink_port,
 	.ndo_eth_ioctl		= mlxsw_sp_port_ioctl,
 };
 
@@ -1576,6 +1565,8 @@ static int mlxsw_sp_port_create(struct mlxsw_sp *mlxsw_sp, u16 local_port,
 	SET_NETDEV_DEV(dev, mlxsw_sp->bus_info->dev);
 	dev_net_set(dev, mlxsw_sp_net(mlxsw_sp));
 	mlxsw_sp_port = netdev_priv(dev);
+	mlxsw_core_port_netdev_link(mlxsw_sp->core, local_port,
+				    mlxsw_sp_port, dev);
 	mlxsw_sp_port->dev = dev;
 	mlxsw_sp_port->mlxsw_sp = mlxsw_sp;
 	mlxsw_sp_port->local_port = local_port;
@@ -1764,8 +1755,6 @@ static int mlxsw_sp_port_create(struct mlxsw_sp *mlxsw_sp, u16 local_port,
 		goto err_register_netdev;
 	}
 
-	mlxsw_core_port_eth_set(mlxsw_sp->core, mlxsw_sp_port->local_port,
-				mlxsw_sp_port, dev);
 	mlxsw_core_schedule_dw(&mlxsw_sp_port->periodic_hw_stats.update_dw, 0);
 	return 0;
 
@@ -1823,7 +1812,6 @@ static void mlxsw_sp_port_remove(struct mlxsw_sp *mlxsw_sp, u16 local_port)
 	cancel_delayed_work_sync(&mlxsw_sp_port->periodic_hw_stats.update_dw);
 	cancel_delayed_work_sync(&mlxsw_sp_port->ptp.shaper_dw);
 	mlxsw_sp_port_ptp_clear(mlxsw_sp_port);
-	mlxsw_core_port_clear(mlxsw_sp->core, local_port, mlxsw_sp);
 	unregister_netdev(mlxsw_sp_port->dev); /* This calls ndo_stop */
 	mlxsw_sp_port_vlan_classification_set(mlxsw_sp_port, true, true);
 	mlxsw_sp->ports[local_port] = NULL;
@@ -3725,62 +3713,6 @@ static int mlxsw_sp_kvd_sizes_get(struct mlxsw_core *mlxsw_core,
 	return 0;
 }
 
-static int
-mlxsw_sp_params_acl_region_rehash_intrvl_get(struct devlink *devlink, u32 id,
-					     struct devlink_param_gset_ctx *ctx)
-{
-	struct mlxsw_core *mlxsw_core = devlink_priv(devlink);
-	struct mlxsw_sp *mlxsw_sp = mlxsw_core_driver_priv(mlxsw_core);
-
-	ctx->val.vu32 = mlxsw_sp_acl_region_rehash_intrvl_get(mlxsw_sp);
-	return 0;
-}
-
-static int
-mlxsw_sp_params_acl_region_rehash_intrvl_set(struct devlink *devlink, u32 id,
-					     struct devlink_param_gset_ctx *ctx)
-{
-	struct mlxsw_core *mlxsw_core = devlink_priv(devlink);
-	struct mlxsw_sp *mlxsw_sp = mlxsw_core_driver_priv(mlxsw_core);
-
-	return mlxsw_sp_acl_region_rehash_intrvl_set(mlxsw_sp, ctx->val.vu32);
-}
-
-static const struct devlink_param mlxsw_sp2_devlink_params[] = {
-	DEVLINK_PARAM_DRIVER(MLXSW_DEVLINK_PARAM_ID_ACL_REGION_REHASH_INTERVAL,
-			     "acl_region_rehash_interval",
-			     DEVLINK_PARAM_TYPE_U32,
-			     BIT(DEVLINK_PARAM_CMODE_RUNTIME),
-			     mlxsw_sp_params_acl_region_rehash_intrvl_get,
-			     mlxsw_sp_params_acl_region_rehash_intrvl_set,
-			     NULL),
-};
-
-static int mlxsw_sp2_params_register(struct mlxsw_core *mlxsw_core)
-{
-	struct devlink *devlink = priv_to_devlink(mlxsw_core);
-	union devlink_param_value value;
-	int err;
-
-	err = devlink_params_register(devlink, mlxsw_sp2_devlink_params,
-				      ARRAY_SIZE(mlxsw_sp2_devlink_params));
-	if (err)
-		return err;
-
-	value.vu32 = 0;
-	devlink_param_driverinit_value_set(devlink,
-					   MLXSW_DEVLINK_PARAM_ID_ACL_REGION_REHASH_INTERVAL,
-					   value);
-	return 0;
-}
-
-static void mlxsw_sp2_params_unregister(struct mlxsw_core *mlxsw_core)
-{
-	devlink_params_unregister(priv_to_devlink(mlxsw_core),
-				  mlxsw_sp2_devlink_params,
-				  ARRAY_SIZE(mlxsw_sp2_devlink_params));
-}
-
 static void mlxsw_sp_ptp_transmitted(struct mlxsw_core *mlxsw_core,
 				     struct sk_buff *skb, u16 local_port)
 {
@@ -3857,8 +3789,6 @@ static struct mlxsw_driver mlxsw_sp2_driver = {
 	.trap_policer_counter_get	= mlxsw_sp_trap_policer_counter_get,
 	.txhdr_construct		= mlxsw_sp_txhdr_construct,
 	.resources_register		= mlxsw_sp2_resources_register,
-	.params_register		= mlxsw_sp2_params_register,
-	.params_unregister		= mlxsw_sp2_params_unregister,
 	.ptp_transmitted		= mlxsw_sp_ptp_transmitted,
 	.txhdr_len			= MLXSW_TXHDR_LEN,
 	.profile			= &mlxsw_sp2_config_profile,
@@ -3895,8 +3825,6 @@ static struct mlxsw_driver mlxsw_sp3_driver = {
 	.trap_policer_counter_get	= mlxsw_sp_trap_policer_counter_get,
 	.txhdr_construct		= mlxsw_sp_txhdr_construct,
 	.resources_register		= mlxsw_sp2_resources_register,
-	.params_register		= mlxsw_sp2_params_register,
-	.params_unregister		= mlxsw_sp2_params_unregister,
 	.ptp_transmitted		= mlxsw_sp_ptp_transmitted,
 	.txhdr_len			= MLXSW_TXHDR_LEN,
 	.profile			= &mlxsw_sp2_config_profile,
@@ -3931,8 +3859,6 @@ static struct mlxsw_driver mlxsw_sp4_driver = {
 	.trap_policer_counter_get	= mlxsw_sp_trap_policer_counter_get,
 	.txhdr_construct		= mlxsw_sp_txhdr_construct,
 	.resources_register		= mlxsw_sp2_resources_register,
-	.params_register		= mlxsw_sp2_params_register,
-	.params_unregister		= mlxsw_sp2_params_unregister,
 	.ptp_transmitted		= mlxsw_sp_ptp_transmitted,
 	.txhdr_len			= MLXSW_TXHDR_LEN,
 	.profile			= &mlxsw_sp2_config_profile,
