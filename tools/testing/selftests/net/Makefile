@@ -30,6 +30,7 @@ TEST_PROGS += gre_gso.sh
 TEST_PROGS += cmsg_so_mark.sh
 TEST_PROGS += vrf_strict_mode_test.sh
 TEST_PROGS += stress_reuseport_listen.sh
+TEST_PROGS += l2_tos_ttl_inherit.sh
 TEST_PROGS += rps_default_mask.sh
 TEST_PROGS_EXTENDED := in_netns.sh setup_loopback.sh setup_veth.sh
 TEST_GEN_FILES =  socket nettest
