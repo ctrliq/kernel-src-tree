@@ -38,6 +38,13 @@ is_enabled() {
 	grep -q "^$1=y" include/config/auto.conf
 }
 
+# RHEL-only workaround for missing upstream b42d23065024
+# ("kbuild: factor out the common objtool arguments"), provide a means
+# to read configuration values for a key like CONFIG_FUNCTION_PADDING_BYTES
+config_value() {
+	gawk -vkey="$1" -F= '$1==key{ print $NF }' include/config/auto.conf 2>/dev/null
+}
+
 # Nice output in kbuild format
 # Will be supressed by "make -s"
 info()
@@ -112,6 +119,19 @@ objtool_link()
 		return;
 	fi
 
+	# RHEL-only workaround for missing upstream b42d23065024
+	# ("kbuild: factor out the common objtool arguments"), objtool
+	# is only enabled for vmlinux.o under the following conditions:
+	#
+	# scripts/Makefile.lib
+	#   delay-objtool := $(or $(CONFIG_LTO_CLANG),$(CONFIG_X86_KERNEL_IBT))
+	#
+	# scripts/Makefile.vmlinux_o
+	#   objtool-enabled := $(or $(delay-objtool),$(CONFIG_NOINSTR_VALIDATION))
+	if ! (is_enabled CONFIG_LTO_CLANG || is_enabled CONFIG_X86_KERNEL_IBT || is_enabled CONFIG_NOINSTR_VALIDATION); then
+		return
+	fi
+
 	if is_enabled CONFIG_LTO_CLANG || is_enabled CONFIG_X86_KERNEL_IBT; then
 
 		# For LTO and IBT, objtool doesn't run on individual
@@ -163,6 +183,10 @@ objtool_link()
 		if is_enabled CONFIG_RETPOLINE; then
 			objtoolopt="${objtoolopt} --unret"
 		fi
+	fi
+
+	if is_enabled CONFIG_PREFIX_SYMBOLS; then
+		objtoolopt="${objtoolopt} --prefix=$(config_value "CONFIG_FUNCTION_PADDING_BYTES")"
 	fi
 
 	if [ -n "${objtoolopt}" ]; then
