@@ -2902,8 +2902,8 @@ static int kfd_mmio_mmap(struct kfd_dev *dev, struct kfd_process *process,
 
 	address = dev->adev->rmmio_remap.bus_addr;
 
-	vm_flags_set(vma, VM_IO | VM_DONTCOPY | VM_DONTEXPAND | VM_NORESERVE |
-				VM_DONTDUMP | VM_PFNMAP);
+	vma->vm_flags |= VM_IO | VM_DONTCOPY | VM_DONTEXPAND | VM_NORESERVE |
+				VM_DONTDUMP | VM_PFNMAP;
 
 	vma->vm_page_prot = pgprot_noncached(vma->vm_page_prot);
 
