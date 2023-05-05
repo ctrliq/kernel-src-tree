@@ -149,9 +149,6 @@ do_transfer()
 	:> "$sout"
 	:> "$capout"
 
-	local addr_port
-	addr_port=$(printf "%s:%d" ${connect_addr} ${port})
-
 	if $capture; then
 		local capuser
 		if [ -z $SUDO_USER ] ; then
