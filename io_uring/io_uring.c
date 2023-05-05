@@ -137,6 +137,26 @@ struct io_defer_entry {
 	u32			seq;
 };
 
+/* RHEL-only: provide a mechanism to globally disable io_uring. */
+DEFINE_STATIC_KEY_TRUE(io_uring_disabled);
+static bool io_uring_enabled = false;
+static int param_set_io_uring(const char *buffer, const struct kernel_param *kp)
+{
+	int ret = param_set_bool(buffer, kp);
+	if (ret)
+		return ret;
+	if (io_uring_enabled)
+		static_branch_disable(&io_uring_disabled);
+	return 0;
+}
+static const struct kernel_param_ops param_ops_io_uring = {
+	.set = param_set_io_uring,
+	.get = param_get_bool,
+};
+module_param_cb(enable, &param_ops_io_uring, &io_uring_enabled, 0);
+__MODULE_PARM_TYPE(enable, "bool");
+
+
 /* requests with any of those set should undergo io_disarm_next() */
 #define IO_DISARM_MASK (REQ_F_ARM_LTIMEOUT | REQ_F_LINK_TIMEOUT | REQ_F_FAIL)
 #define IO_REQ_LINK_FLAGS (REQ_F_LINK | REQ_F_HARDLINK)
@@ -3288,6 +3308,9 @@ SYSCALL_DEFINE6(io_uring_enter, unsigned int, fd, u32, to_submit,
 	struct fd f;
 	long ret;
 
+	if (static_branch_unlikely(&io_uring_disabled))
+		return -ENOSYS;
+
 	if (unlikely(flags & ~(IORING_ENTER_GETEVENTS | IORING_ENTER_SQ_WAKEUP |
 			       IORING_ENTER_SQ_WAIT | IORING_ENTER_EXT_ARG |
 			       IORING_ENTER_REGISTERED_RING)))
@@ -3715,6 +3738,9 @@ static long io_uring_setup(u32 entries, struct io_uring_params __user *params)
 {
 	struct io_uring_params p;
 	int i;
+
+	if (static_branch_unlikely(&io_uring_disabled))
+		return -ENOSYS;
 
 	if (copy_from_user(&p, params, sizeof(p)))
 		return -EFAULT;
@@ -4185,6 +4211,9 @@ SYSCALL_DEFINE4(io_uring_register, unsigned int, fd, unsigned int, opcode,
 	struct io_ring_ctx *ctx;
 	long ret = -EBADF;
 	struct fd f;
+
+	if (static_branch_unlikely(&io_uring_disabled))
+		return -ENOSYS;
 
 	if (opcode >= IORING_REGISTER_LAST)
 		return -EINVAL;
