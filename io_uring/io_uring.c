@@ -145,8 +145,10 @@ static int param_set_io_uring(const char *buffer, const struct kernel_param *kp)
 	int ret = param_set_bool(buffer, kp);
 	if (ret)
 		return ret;
-	if (io_uring_enabled)
+	if (io_uring_enabled) {
 		static_branch_disable(&io_uring_disabled);
+		mark_tech_preview("io_uring", NULL);
+	}
 	return 0;
 }
 static const struct kernel_param_ops param_ops_io_uring = {
