@@ -2262,16 +2262,6 @@ static struct packet_type iucv_packet_type = {
 	.func = afiucv_hs_rcv,
 };
 
-static int afiucv_iucv_init(void)
-{
-	return pr_iucv->iucv_register(&af_iucv_handler, 0);
-}
-
-static void afiucv_iucv_exit(void)
-{
-	pr_iucv->iucv_unregister(&af_iucv_handler, 0);
-}
-
 static int __init afiucv_init(void)
 {
 	int err;
@@ -2298,7 +2288,7 @@ static int __init afiucv_init(void)
 		goto out_proto;
 
 	if (pr_iucv) {
-		err = afiucv_iucv_init();
+		err = pr_iucv->iucv_register(&af_iucv_handler, 0);
 		if (err)
 			goto out_sock;
 	}
@@ -2312,7 +2302,7 @@ static int __init afiucv_init(void)
 
 out_notifier:
 	if (pr_iucv)
-		afiucv_iucv_exit();
+		pr_iucv->iucv_unregister(&af_iucv_handler, 0);
 out_sock:
 	sock_unregister(PF_IUCV);
 out_proto:
@@ -2324,7 +2314,7 @@ out:
 static void __exit afiucv_exit(void)
 {
 	if (pr_iucv)
-		afiucv_iucv_exit();
+		pr_iucv->iucv_unregister(&af_iucv_handler, 0);
 
 	unregister_netdevice_notifier(&afiucv_netdev_notifier);
 	dev_remove_pack(&iucv_packet_type);
