@@ -2512,6 +2512,7 @@ int bpf_dev_bound_kfunc_check(struct bpf_verifier_log *log,
 			      struct bpf_prog_aux *prog_aux);
 void *bpf_dev_bound_resolve_kfunc(struct bpf_prog *prog, u32 func_id);
 int bpf_prog_dev_bound_init(struct bpf_prog *prog, union bpf_attr *attr);
+int bpf_prog_dev_bound_inherit(struct bpf_prog *new_prog, struct bpf_prog *old_prog);
 void bpf_dev_bound_netdev_unregister(struct net_device *dev);
 
 static inline bool bpf_prog_is_dev_bound(const struct bpf_prog_aux *aux)
@@ -2523,6 +2524,8 @@ static inline bool bpf_prog_is_offloaded(const struct bpf_prog_aux *aux)
 {
 	return aux->offload_requested;
 }
+
+bool bpf_prog_dev_bound_match(const struct bpf_prog *lhs, const struct bpf_prog *rhs);
 
 static inline bool bpf_map_is_offloaded(struct bpf_map *map)
 {
@@ -2563,6 +2566,12 @@ static inline int bpf_prog_dev_bound_init(struct bpf_prog *prog,
 	return -EOPNOTSUPP;
 }
 
+static inline int bpf_prog_dev_bound_inherit(struct bpf_prog *new_prog,
+					     struct bpf_prog *old_prog)
+{
+	return -EOPNOTSUPP;
+}
+
 static inline void bpf_dev_bound_netdev_unregister(struct net_device *dev)
 {
 }
@@ -2573,6 +2582,11 @@ static inline bool bpf_prog_is_dev_bound(const struct bpf_prog_aux *aux)
 }
 
 static inline bool bpf_prog_is_offloaded(struct bpf_prog_aux *aux)
+{
+	return false;
+}
+
+static inline bool bpf_prog_dev_bound_match(const struct bpf_prog *lhs, const struct bpf_prog *rhs)
 {
 	return false;
 }
