@@ -763,23 +763,22 @@ error:
 }
 
 /*
- * Like delete_from_page_cache, but substitutes swap for page.
+ * Like delete_from_page_cache, but substitutes swap for @folio.
  */
-static void shmem_delete_from_page_cache(struct page *page, void *radswap)
+static void shmem_delete_from_page_cache(struct folio *folio, void *radswap)
 {
-	struct address_space *mapping = page->mapping;
+	struct address_space *mapping = folio->mapping;
+	long nr = folio_nr_pages(folio);
 	int error;
 
-	VM_BUG_ON_PAGE(PageCompound(page), page);
-
 	xa_lock_irq(&mapping->i_pages);
-	error = shmem_replace_entry(mapping, page->index, page, radswap);
-	page->mapping = NULL;
-	mapping->nrpages--;
-	__dec_lruvec_page_state(page, NR_FILE_PAGES);
-	__dec_lruvec_page_state(page, NR_SHMEM);
+	error = shmem_replace_entry(mapping, folio->index, folio, radswap);
+	folio->mapping = NULL;
+	mapping->nrpages -= nr;
+	__lruvec_stat_mod_folio(folio, NR_FILE_PAGES, -nr);
+	__lruvec_stat_mod_folio(folio, NR_SHMEM, -nr);
 	xa_unlock_irq(&mapping->i_pages);
-	put_page(page);
+	folio_put(folio);
 	BUG_ON(error);
 }
 
@@ -1328,17 +1327,18 @@ static int shmem_writepage(struct page *page, struct writeback_control *wbc)
 	 * "force", drivers/gpu/drm/i915/gem/i915_gem_shmem.c gets huge pages,
 	 * and its shmem_writeback() needs them to be split when swapping.
 	 */
-	if (PageTransCompound(page)) {
+	if (folio_test_large(folio)) {
 		/* Ensure the subpages are still dirty */
-		SetPageDirty(page);
+		folio_test_set_dirty(folio);
 		if (split_huge_page(page) < 0)
 			goto redirty;
-		ClearPageDirty(page);
+		folio = page_folio(page);
+		folio_clear_dirty(folio);
 	}
 
-	BUG_ON(!PageLocked(page));
-	mapping = page->mapping;
-	index = page->index;
+	BUG_ON(!folio_test_locked(folio));
+	mapping = folio->mapping;
+	index = folio->index;
 	inode = mapping->host;
 	info = SHMEM_I(inode);
 	if (info->flags & VM_LOCKED)
@@ -1361,15 +1361,15 @@ static int shmem_writepage(struct page *page, struct writeback_control *wbc)
 	/*
 	 * This is somewhat ridiculous, but without plumbing a SWAP_MAP_FALLOC
 	 * value into swapfile.c, the only way we can correctly account for a
-	 * fallocated page arriving here is now to initialize it and write it.
+	 * fallocated folio arriving here is now to initialize it and write it.
 	 *
-	 * That's okay for a page already fallocated earlier, but if we have
+	 * That's okay for a folio already fallocated earlier, but if we have
 	 * not yet completed the fallocation, then (a) we want to keep track
-	 * of this page in case we have to undo it, and (b) it may not be a
+	 * of this folio in case we have to undo it, and (b) it may not be a
 	 * good idea to continue anyway, once we're pushing into swap.  So
-	 * reactivate the page, and let shmem_fallocate() quit when too many.
+	 * reactivate the folio, and let shmem_fallocate() quit when too many.
 	 */
-	if (!PageUptodate(page)) {
+	if (!folio_test_uptodate(folio)) {
 		if (inode->i_private) {
 			struct shmem_falloc *shmem_falloc;
 			spin_lock(&inode->i_lock);
@@ -1385,9 +1385,9 @@ static int shmem_writepage(struct page *page, struct writeback_control *wbc)
 			if (shmem_falloc)
 				goto redirty;
 		}
-		clear_highpage(page);
-		flush_dcache_page(page);
-		SetPageUptodate(page);
+		folio_zero_range(folio, 0, folio_size(folio));
+		flush_dcache_folio(folio);
+		folio_mark_uptodate(folio);
 	}
 
 	swap = folio_alloc_swap(folio);
@@ -1396,7 +1396,7 @@ static int shmem_writepage(struct page *page, struct writeback_control *wbc)
 
 	/*
 	 * Add inode to shmem_unuse()'s list of swapped-out inodes,
-	 * if it's not already there.  Do it now before the page is
+	 * if it's not already there.  Do it now before the folio is
 	 * moved to swap cache, when its pagelock no longer protects
 	 * the inode from eviction.  But don't unlock the mutex until
 	 * we've incremented swapped, because shmem_unuse_inode() will
@@ -1406,7 +1406,7 @@ static int shmem_writepage(struct page *page, struct writeback_control *wbc)
 	if (list_empty(&info->swaplist))
 		list_add(&info->swaplist, &shmem_swaplist);
 
-	if (add_to_swap_cache(page, swap,
+	if (add_to_swap_cache(&folio->page, swap,
 			__GFP_HIGH | __GFP_NOMEMALLOC | __GFP_NOWARN,
 			NULL) == 0) {
 		spin_lock_irq(&info->lock);
@@ -1415,21 +1415,21 @@ static int shmem_writepage(struct page *page, struct writeback_control *wbc)
 		spin_unlock_irq(&info->lock);
 
 		swap_shmem_alloc(swap);
-		shmem_delete_from_page_cache(page, swp_to_radix_entry(swap));
+		shmem_delete_from_page_cache(folio, swp_to_radix_entry(swap));
 
 		mutex_unlock(&shmem_swaplist_mutex);
-		BUG_ON(page_mapped(page));
-		swap_writepage(page, wbc);
+		BUG_ON(folio_mapped(folio));
+		swap_writepage(&folio->page, wbc);
 		return 0;
 	}
 
 	mutex_unlock(&shmem_swaplist_mutex);
-	put_swap_page(page, swap);
+	put_swap_page(&folio->page, swap);
 redirty:
-	set_page_dirty(page);
+	folio_mark_dirty(folio);
 	if (wbc->for_reclaim)
-		return AOP_WRITEPAGE_ACTIVATE;	/* Return with page locked */
-	unlock_page(page);
+		return AOP_WRITEPAGE_ACTIVATE;	/* Return with folio locked */
+	folio_unlock(folio);
 	return 0;
 }
 
@@ -1560,12 +1560,6 @@ static struct folio *shmem_alloc_folio(gfp_t gfp,
 	return folio;
 }
 
-static struct page *shmem_alloc_page(gfp_t gfp,
-			struct shmem_inode_info *info, pgoff_t index)
-{
-	return &shmem_alloc_folio(gfp, info, index)->page;
-}
-
 static struct folio *shmem_alloc_and_acct_folio(gfp_t gfp, struct inode *inode,
 		pgoff_t index, bool huge)
 {
@@ -1617,51 +1611,49 @@ static bool shmem_should_replace_folio(struct folio *folio, gfp_t gfp)
 static int shmem_replace_page(struct page **pagep, gfp_t gfp,
 				struct shmem_inode_info *info, pgoff_t index)
 {
-	struct page *oldpage, *newpage;
 	struct folio *old, *new;
 	struct address_space *swap_mapping;
 	swp_entry_t entry;
 	pgoff_t swap_index;
 	int error;
 
-	oldpage = *pagep;
-	entry.val = page_private(oldpage);
+	old = page_folio(*pagep);
+	entry = folio_swap_entry(old);
 	swap_index = swp_offset(entry);
-	swap_mapping = page_mapping(oldpage);
+	swap_mapping = swap_address_space(entry);
 
 	/*
 	 * We have arrived here because our zones are constrained, so don't
 	 * limit chance of success by further cpuset and node constraints.
 	 */
 	gfp &= ~GFP_CONSTRAINT_MASK;
-	newpage = shmem_alloc_page(gfp, info, index);
-	if (!newpage)
+	VM_BUG_ON_FOLIO(folio_test_large(old), old);
+	new = shmem_alloc_folio(gfp, info, index);
+	if (!new)
 		return -ENOMEM;
 
-	get_page(newpage);
-	copy_highpage(newpage, oldpage);
-	flush_dcache_page(newpage);
+	folio_get(new);
+	folio_copy(new, old);
+	flush_dcache_folio(new);
 
-	__SetPageLocked(newpage);
-	__SetPageSwapBacked(newpage);
-	SetPageUptodate(newpage);
-	set_page_private(newpage, entry.val);
-	SetPageSwapCache(newpage);
+	__folio_set_locked(new);
+	__folio_set_swapbacked(new);
+	folio_mark_uptodate(new);
+	folio_set_swap_entry(new, entry);
+	folio_set_swapcache(new);
 
 	/*
 	 * Our caller will very soon move newpage out of swapcache, but it's
 	 * a nice clean interface for us to replace oldpage by newpage there.
 	 */
 	xa_lock_irq(&swap_mapping->i_pages);
-	error = shmem_replace_entry(swap_mapping, swap_index, oldpage, newpage);
+	error = shmem_replace_entry(swap_mapping, swap_index, old, new);
 	if (!error) {
-		old = page_folio(oldpage);
-		new = page_folio(newpage);
 		mem_cgroup_migrate(old, new);
-		__inc_lruvec_page_state(newpage, NR_FILE_PAGES);
-		__inc_lruvec_page_state(newpage, NR_SHMEM);
-		__dec_lruvec_page_state(oldpage, NR_FILE_PAGES);
-		__dec_lruvec_page_state(oldpage, NR_SHMEM);
+		__lruvec_stat_mod_folio(new, NR_FILE_PAGES, 1);
+		__lruvec_stat_mod_folio(new, NR_SHMEM, 1);
+		__lruvec_stat_mod_folio(old, NR_FILE_PAGES, -1);
+		__lruvec_stat_mod_folio(old, NR_SHMEM, -1);
 	}
 	xa_unlock_irq(&swap_mapping->i_pages);
 
@@ -1671,18 +1663,17 @@ static int shmem_replace_page(struct page **pagep, gfp_t gfp,
 		 * both PageSwapCache and page_private after getting page lock;
 		 * but be defensive.  Reverse old to newpage for clear and free.
 		 */
-		oldpage = newpage;
+		old = new;
 	} else {
-		lru_cache_add(newpage);
-		*pagep = newpage;
+		folio_add_lru(new);
+		*pagep = &new->page;
 	}
 
-	ClearPageSwapCache(oldpage);
-	set_page_private(oldpage, 0);
+	folio_clear_swapcache(old);
+	old->private = NULL;
 
-	unlock_page(oldpage);
-	put_page(oldpage);
-	put_page(oldpage);
+	folio_unlock(old);
+	folio_put_refs(old, 2);
 	return error;
 }
 
@@ -2383,6 +2374,12 @@ static struct inode *shmem_get_inode(struct super_block *sb, struct inode *dir,
 }
 
 #ifdef CONFIG_USERFAULTFD
+static struct page *shmem_alloc_page(gfp_t gfp,
+			struct shmem_inode_info *info, pgoff_t index)
+{
+	return &shmem_alloc_folio(gfp, info, index)->page;
+}
+
 int shmem_mfill_atomic_pte(struct mm_struct *dst_mm,
 			   pmd_t *dst_pmd,
 			   struct vm_area_struct *dst_vma,
