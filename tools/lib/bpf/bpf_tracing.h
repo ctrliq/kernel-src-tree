@@ -60,6 +60,10 @@
 
 #if defined(bpf_target_x86)
 
+/*
+ * https://en.wikipedia.org/wiki/X86_calling_conventions#System_V_AMD64_ABI
+ */
+
 #if defined(__KERNEL__) || defined(__VMLINUX_H__)
 
 #define __PT_PARM1_REG di
@@ -67,6 +71,7 @@
 #define __PT_PARM3_REG dx
 #define __PT_PARM4_REG cx
 #define __PT_PARM5_REG r8
+#define __PT_PARM6_REG r9
 #define __PT_RET_REG sp
 #define __PT_FP_REG bp
 #define __PT_RC_REG ax
@@ -97,6 +102,7 @@
 #define __PT_PARM3_REG rdx
 #define __PT_PARM4_REG rcx
 #define __PT_PARM5_REG r8
+#define __PT_PARM6_REG r9
 #define __PT_RET_REG rsp
 #define __PT_FP_REG rbp
 #define __PT_RC_REG rax
