@@ -1568,6 +1568,10 @@ static int __init cfg80211_init(void)
 {
 	int err;
 
+#ifdef CONFIG_ARM64
+	mark_tech_preview("Wifi drivers for aarch64", NULL);
+#endif
+
 	err = register_pernet_device(&cfg80211_pernet_ops);
 	if (err)
 		goto out_fail_pernet;
