@@ -1796,6 +1796,26 @@ static void bond_ether_setup(struct net_device *bond_dev)
 	bond_dev->priv_flags &= ~IFF_TX_SKB_SHARING;
 }
 
+void bond_xdp_set_features(struct net_device *bond_dev)
+{
+	struct bonding *bond = netdev_priv(bond_dev);
+	xdp_features_t val = NETDEV_XDP_ACT_MASK;
+	struct list_head *iter;
+	struct slave *slave;
+
+	ASSERT_RTNL();
+
+	if (!bond_xdp_check(bond)) {
+		xdp_clear_features_flag(bond_dev);
+		return;
+	}
+
+	bond_for_each_slave(bond, slave, iter)
+		val &= slave->dev->xdp_features;
+
+	xdp_set_features_flag(bond_dev, val);
+}
+
 /* enslave device <slave> to bond device <master> */
 int bond_enslave(struct net_device *bond_dev, struct net_device *slave_dev,
 		 struct netlink_ext_ack *extack)
@@ -2243,6 +2263,8 @@ int bond_enslave(struct net_device *bond_dev, struct net_device *slave_dev,
 			bpf_prog_inc(bond->xdp_prog);
 	}
 
+	bond_xdp_set_features(bond_dev);
+
 	slave_info(bond_dev, slave_dev, "Enslaving as %s interface with %s link\n",
 		   bond_is_active_slave(new_slave) ? "an active" : "a backup",
 		   new_slave->link != BOND_LINK_DOWN ? "an up" : "a down");
@@ -2490,6 +2512,7 @@ static int __bond_release_one(struct net_device *bond_dev,
 	if (!netif_is_bond_master(slave_dev))
 		slave_dev->priv_flags &= ~IFF_BONDING;
 
+	bond_xdp_set_features(bond_dev);
 	kobject_put(&slave->kobj);
 
 	return 0;
@@ -3936,6 +3959,9 @@ static int bond_slave_netdev_event(unsigned long event,
 	case NETDEV_RESEND_IGMP:
 		/* Propagate to master device */
 		call_netdevice_notifiers(event, slave->bond->dev);
+		break;
+	case NETDEV_XDP_FEAT_CHANGE:
+		bond_xdp_set_features(bond_dev);
 		break;
 	default:
 		break;
@@ -5855,6 +5881,9 @@ void bond_setup(struct net_device *bond_dev)
 	if (bond_sk_check(bond))
 		bond_dev->features |= BOND_TLS_FEATURES;
 #endif
+
+	if (bond_xdp_check(bond))
+		bond_dev->xdp_features = NETDEV_XDP_ACT_MASK;
 }
 
 /* Destroy a bonding device.
