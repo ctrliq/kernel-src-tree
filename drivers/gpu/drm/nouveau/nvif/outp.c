@@ -137,7 +137,9 @@ nvif_outp_acquire_dp(struct nvif_outp *outp, u8 dpcd[DP_RECEIVER_CAP_SIZE],
 	args.dp.link_bw = link_bw;
 	args.dp.hda = hda;
 	args.dp.mst = mst;
-	memcpy(args.dp.dpcd, dpcd, sizeof(args.dp.dpcd));
+	memcpy(args.dp.dpcd, dpcd,
+		DP_RECEIVER_CAP_SIZE < sizeof(args.dp.dpcd) ? DP_RECEIVER_CAP_SIZE
+		: sizeof(args.dp.dpcd));
 
 	ret = nvif_outp_acquire(outp, NVIF_OUTP_ACQUIRE_V0_DP, &args);
 	NVIF_ERRON(ret, &outp->object,
