@@ -1169,8 +1169,6 @@ open_file:
 	 * then unhash.
 	 */
 	if (status == nfs_ok && key.inode->i_nlink == 0)
-		status = nfserr_jukebox;
-	if (status != nfs_ok)
 		nfsd_file_unhash(nf);
 	clear_bit_unlock(NFSD_FILE_PENDING, &nf->nf_flags);
 	smp_mb__after_atomic();
