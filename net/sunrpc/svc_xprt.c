@@ -462,11 +462,9 @@ void svc_xprt_enqueue(struct svc_xprt *xprt)
 
 	pool = svc_pool_for_cpu(xprt->xpt_server);
 
-	atomic_long_inc(&pool->sp_stats.packets);
-
+	percpu_counter_inc(&pool->sp_sockets_queued);
 	spin_lock_bh(&pool->sp_lock);
 	list_add_tail(&xprt->xpt_ready, &pool->sp_sockets);
-	pool->sp_stats.sockets_queued++;
 	spin_unlock_bh(&pool->sp_lock);
 
 	/* find a thread for this xprt */
@@ -474,7 +472,7 @@ void svc_xprt_enqueue(struct svc_xprt *xprt)
 	list_for_each_entry_rcu(rqstp, &pool->sp_all_threads, rq_all) {
 		if (test_and_set_bit(RQ_BUSY, &rqstp->rq_flags))
 			continue;
-		atomic_long_inc(&pool->sp_stats.threads_woken);
+		percpu_counter_inc(&pool->sp_threads_woken);
 		rqstp->rq_qtime = ktime_get();
 		wake_up_process(rqstp->rq_task);
 		goto out_unlock;
@@ -691,7 +689,7 @@ static int svc_alloc_arg(struct svc_rqst *rqstp)
 			set_current_state(TASK_RUNNING);
 			return -EINTR;
 		}
-		trace_svc_alloc_arg_err(pages);
+		trace_svc_alloc_arg_err(pages, ret);
 		memalloc_retry_wait(GFP_KERNEL);
 	}
 	rqstp->rq_page_end = &rqstp->rq_pages[pages];
@@ -769,7 +767,7 @@ static struct svc_xprt *svc_get_next_xprt(struct svc_rqst *rqstp, long timeout)
 		goto out_found;
 
 	if (!time_left)
-		atomic_long_inc(&pool->sp_stats.threads_timedout);
+		percpu_counter_inc(&pool->sp_threads_timedout);
 
 	if (signalled() || kthread_should_stop())
 		return ERR_PTR(-EINTR);
@@ -888,9 +886,7 @@ int svc_recv(struct svc_rqst *rqstp, long timeout)
 
 	clear_bit(XPT_OLD, &xprt->xpt_flags);
 
-	xprt->xpt_ops->xpo_secure_port(rqstp);
 	rqstp->rq_chandle.defer = svc_defer;
-	rqstp->rq_xid = svc_getu32(&rqstp->rq_arg.head[0]);
 
 	if (serv->sv_stats)
 		serv->sv_stats->netcnt++;
@@ -1227,7 +1223,6 @@ static struct cache_deferred_req *svc_defer(struct cache_req *req)
 		dr->addrlen = rqstp->rq_addrlen;
 		dr->daddr = rqstp->rq_daddr;
 		dr->argslen = rqstp->rq_arg.len >> 2;
-		dr->xprt_hlen = rqstp->rq_xprt_hlen;
 		dr->xprt_ctxt = rqstp->rq_xprt_ctxt;
 		rqstp->rq_xprt_ctxt = NULL;
 
@@ -1255,22 +1250,21 @@ static noinline int svc_deferred_recv(struct svc_rqst *rqstp)
 	trace_svc_defer_recv(dr);
 
 	/* setup iov_base past transport header */
-	rqstp->rq_arg.head[0].iov_base = dr->args + (dr->xprt_hlen>>2);
+	rqstp->rq_arg.head[0].iov_base = dr->args;
 	/* The iov_len does not include the transport header bytes */
-	rqstp->rq_arg.head[0].iov_len = (dr->argslen<<2) - dr->xprt_hlen;
+	rqstp->rq_arg.head[0].iov_len = dr->argslen << 2;
 	rqstp->rq_arg.page_len = 0;
 	/* The rq_arg.len includes the transport header bytes */
-	rqstp->rq_arg.len     = dr->argslen<<2;
+	rqstp->rq_arg.len     = dr->argslen << 2;
 	rqstp->rq_prot        = dr->prot;
 	memcpy(&rqstp->rq_addr, &dr->addr, dr->addrlen);
 	rqstp->rq_addrlen     = dr->addrlen;
 	/* Save off transport header len in case we get deferred again */
-	rqstp->rq_xprt_hlen   = dr->xprt_hlen;
 	rqstp->rq_daddr       = dr->daddr;
 	rqstp->rq_respages    = rqstp->rq_pages;
 	rqstp->rq_xprt_ctxt   = dr->xprt_ctxt;
 	svc_xprt_received(rqstp->rq_xprt);
-	return (dr->argslen<<2) - dr->xprt_hlen;
+	return dr->argslen << 2;
 }
 
 
@@ -1443,12 +1437,12 @@ static int svc_pool_stats_show(struct seq_file *m, void *p)
 		return 0;
 	}
 
-	seq_printf(m, "%u %lu %lu %lu %lu\n",
+	seq_printf(m, "%u %llu %llu %llu %llu\n",
 		pool->sp_id,
-		(unsigned long)atomic_long_read(&pool->sp_stats.packets),
-		pool->sp_stats.sockets_queued,
-		(unsigned long)atomic_long_read(&pool->sp_stats.threads_woken),
-		(unsigned long)atomic_long_read(&pool->sp_stats.threads_timedout));
+		percpu_counter_sum_positive(&pool->sp_sockets_queued),
+		percpu_counter_sum_positive(&pool->sp_sockets_queued),
+		percpu_counter_sum_positive(&pool->sp_threads_woken),
+		percpu_counter_sum_positive(&pool->sp_threads_timedout));
 
 	return 0;
 }

@@ -214,4 +214,19 @@ u32 krb5_etm_encrypt(struct krb5_ctx *kctx, u32 offset, struct xdr_buf *buf,
 u32 krb5_etm_decrypt(struct krb5_ctx *kctx, u32 offset, u32 len,
 		     struct xdr_buf *buf, u32 *headskip, u32 *tailskip);
 
+#if IS_ENABLED(CONFIG_KUNIT)
+void krb5_nfold(u32 inbits, const u8 *in, u32 outbits, u8 *out);
+const struct gss_krb5_enctype *gss_krb5_lookup_enctype(u32 etype);
+int krb5_cbc_cts_encrypt(struct crypto_sync_skcipher *cts_tfm,
+			 struct crypto_sync_skcipher *cbc_tfm, u32 offset,
+			 struct xdr_buf *buf, struct page **pages,
+			 u8 *iv, unsigned int ivsize);
+int krb5_cbc_cts_decrypt(struct crypto_sync_skcipher *cts_tfm,
+			 struct crypto_sync_skcipher *cbc_tfm,
+			 u32 offset, struct xdr_buf *buf);
+u32 krb5_etm_checksum(struct crypto_sync_skcipher *cipher,
+		      struct crypto_ahash *tfm, const struct xdr_buf *body,
+		      int body_offset, struct xdr_netobj *cksumout);
+#endif
+
 #endif /* _NET_SUNRPC_AUTH_GSS_KRB5_INTERNAL_H */

@@ -117,15 +117,6 @@ static void svc_reclassify_socket(struct socket *sock)
  */
 static void svc_tcp_release_rqst(struct svc_rqst *rqstp)
 {
-	struct sk_buff *skb = rqstp->rq_xprt_ctxt;
-
-	if (skb) {
-		struct svc_sock *svsk =
-			container_of(rqstp->rq_xprt, struct svc_sock, sk_xprt);
-
-		rqstp->rq_xprt_ctxt = NULL;
-		skb_free_datagram_locked(svsk->sk_sk, skb);
-	}
 }
 
 /**
@@ -258,8 +249,6 @@ static ssize_t svc_tcp_read_msg(struct svc_rqst *rqstp, size_t buflen,
 	unsigned int i;
 	ssize_t len;
 	size_t t;
-
-	rqstp->rq_xprt_hlen = 0;
 
 	clear_bit(XPT_DATA, &svsk->sk_xprt.xpt_flags);
 
@@ -519,6 +508,7 @@ static int svc_udp_recvfrom(struct svc_rqst *rqstp)
 	if (serv->sv_stats)
 		serv->sv_stats->netudpcnt++;
 
+	svc_sock_secure_port(rqstp);
 	svc_xprt_received(rqstp->rq_xprt);
 	return len;
 
@@ -647,7 +637,6 @@ static const struct svc_xprt_ops svc_udp_ops = {
 	.xpo_free = svc_sock_free,
 	.xpo_has_wspace = svc_udp_has_wspace,
 	.xpo_accept = svc_udp_accept,
-	.xpo_secure_port = svc_sock_secure_port,
 	.xpo_kill_temp_xprt = svc_udp_kill_temp_xprt,
 };
 
@@ -1039,6 +1028,7 @@ static int svc_tcp_recvfrom(struct svc_rqst *rqstp)
 	if (serv->sv_stats)
 		serv->sv_stats->nettcpcnt++;
 
+	svc_sock_secure_port(rqstp);
 	svc_xprt_received(rqstp->rq_xprt);
 	return rqstp->rq_arg.len;
 
@@ -1220,7 +1210,6 @@ static const struct svc_xprt_ops svc_tcp_ops = {
 	.xpo_free = svc_sock_free,
 	.xpo_has_wspace = svc_tcp_has_wspace,
 	.xpo_accept = svc_tcp_accept,
-	.xpo_secure_port = svc_sock_secure_port,
 	.xpo_kill_temp_xprt = svc_tcp_kill_temp_xprt,
 };
 
