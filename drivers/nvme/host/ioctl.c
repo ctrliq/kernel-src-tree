@@ -526,7 +526,7 @@ static enum rq_end_io_ret nvme_uring_cmd_end_io(struct request *req,
 		WRITE_ONCE(ioucmd->cookie, NULL);
 		nvme_uring_task_cb(ioucmd, IO_URING_F_UNLOCKED);
 	} else {
-		io_uring_cmd_complete_in_task(ioucmd, nvme_uring_task_cb);
+		io_uring_cmd_do_in_task_lazy(ioucmd, nvme_uring_task_cb);
 	}
 
 	return RQ_END_IO_FREE;
@@ -549,7 +549,7 @@ static enum rq_end_io_ret nvme_uring_cmd_end_io_meta(struct request *req,
 		WRITE_ONCE(ioucmd->cookie, NULL);
 		nvme_uring_task_meta_cb(ioucmd, IO_URING_F_UNLOCKED);
 	} else {
-		io_uring_cmd_complete_in_task(ioucmd, nvme_uring_task_meta_cb);
+		io_uring_cmd_do_in_task_lazy(ioucmd, nvme_uring_task_meta_cb);
 	}
 
 	return RQ_END_IO_NONE;
