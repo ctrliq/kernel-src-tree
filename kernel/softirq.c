@@ -659,7 +659,9 @@ static inline void __irq_exit_rcu(void)
 	preempt_count_sub(HARDIRQ_OFFSET);
 	if (!in_interrupt() && local_softirq_pending())
 		invoke_softirq();
-	if (IS_ENABLED(CONFIG_PREEMPT_RT) && !in_interrupt() && local_pending_timers())
+
+	if (IS_ENABLED(CONFIG_PREEMPT_RT) && local_pending_timers() &&
+	    !(in_nmi() | in_hardirq()))
 		wake_timersd();
 
 	tick_irq_exit();
