@@ -1053,7 +1053,7 @@ static int za_get(struct task_struct *target,
 	if (thread_za_enabled(&target->thread)) {
 		start = end;
 		end = ZA_PT_SIZE(vq);
-		membuf_write(&to, target->thread.za_state, end - start);
+		membuf_write(&to, target->thread.sme_state, end - start);
 	}
 
 	/* Zero any trailing padding */
@@ -1107,7 +1107,7 @@ static int za_set(struct task_struct *target,
 
 	/* Allocate/reinit ZA storage */
 	sme_alloc(target);
-	if (!target->thread.za_state) {
+	if (!target->thread.sme_state) {
 		ret = -ENOMEM;
 		goto out;
 	}
@@ -1132,7 +1132,7 @@ static int za_set(struct task_struct *target,
 	start = ZA_PT_ZA_OFFSET;
 	end = ZA_PT_SIZE(vq);
 	ret = user_regset_copyin(&pos, &count, &kbuf, &ubuf,
-				 target->thread.za_state,
+				 target->thread.sme_state,
 				 start, end);
 	if (ret)
 		goto out;
