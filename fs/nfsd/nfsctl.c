@@ -569,7 +569,9 @@ static ssize_t __write_versions(struct file *file, char *buf, size_t size)
 
 			cmd = sign == '-' ? NFSD_CLEAR : NFSD_SET;
 			switch(num) {
+#ifdef CONFIG_NFSD_V2
 			case 2:
+#endif
 			case 3:
 				nfsd_vers(nn, num, cmd);
 				break;
@@ -589,7 +591,9 @@ static ssize_t __write_versions(struct file *file, char *buf, size_t size)
 				}
 				break;
 			default:
-				return -EINVAL;
+				/* Ignore requests to disable non-existent versions */
+				if (cmd == NFSD_SET)
+					return -EINVAL;
 			}
 			vers += len + 1;
 		} while ((len = qword_get(&mesg, vers, size)) > 0);
@@ -1210,22 +1214,17 @@ static void nfsd_symlink(struct dentry *parent, const char *name,
 {
 	struct inode *dir = parent->d_inode;
 	struct dentry *dentry;
-	int ret = -ENOMEM;
+	int ret;
 
 	inode_lock(dir);
 	dentry = d_alloc_name(parent, name);
 	if (!dentry)
-		goto out_err;
+		goto out;
 	ret = __nfsd_symlink(d_inode(parent), dentry, S_IFLNK | 0777, content);
 	if (ret)
-		goto out_err;
+		dput(dentry);
 out:
 	inode_unlock(dir);
-	return;
-out_err:
-	dput(dentry);
-	dentry = ERR_PTR(ret);
-	goto out;
 }
 #else
 static inline void nfsd_symlink(struct dentry *parent, const char *name,

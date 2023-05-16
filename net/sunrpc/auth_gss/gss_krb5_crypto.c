@@ -46,6 +46,7 @@
 #include <linux/random.h>
 #include <linux/sunrpc/gss_krb5.h>
 #include <linux/sunrpc/xdr.h>
+#include <kunit/visibility.h>
 
 #include "gss_krb5_internal.h"
 
@@ -362,6 +363,7 @@ out_free_cksum:
 	kfree_sensitive(checksumdata);
 	return err ? GSS_S_FAILURE : GSS_S_COMPLETE;
 }
+EXPORT_SYMBOL_IF_KUNIT(gss_krb5_checksum);
 
 struct encryptor_desc {
 	u8 iv[GSS_KRB5_MAX_BLOCKSIZE];
@@ -637,19 +639,43 @@ gss_krb5_cts_crypt(struct crypto_sync_skcipher *cipher, struct xdr_buf *buf,
 
 	ret = write_bytes_to_xdr_buf(buf, offset, data, len);
 
+#if IS_ENABLED(CONFIG_KUNIT)
+	/*
+	 * CBC-CTS does not define an output IV but RFC 3962 defines it as the
+	 * penultimate block of ciphertext, so copy that into the IV buffer
+	 * before returning.
+	 */
+	if (encrypt)
+		memcpy(iv, data, crypto_sync_skcipher_ivsize(cipher));
+#endif
+
 out:
 	kfree(data);
 	return ret;
 }
 
-/*
+/**
+ * krb5_cbc_cts_encrypt - encrypt in CBC mode with CTS
+ * @cts_tfm: CBC cipher with CTS
+ * @cbc_tfm: base CBC cipher
+ * @offset: starting byte offset for plaintext
+ * @buf: OUT: output buffer
+ * @pages: plaintext
+ * @iv: output CBC initialization vector, or NULL
+ * @ivsize: size of @iv, in octets
+ *
  * To provide confidentiality, encrypt using cipher block chaining
  * with ciphertext stealing. Message integrity is handled separately.
+ *
+ * Return values:
+ *   %0: encryption successful
+ *   negative errno: encryption could not be completed
  */
-static int
-krb5_cbc_cts_encrypt(struct crypto_sync_skcipher *cts_tfm,
-		     struct crypto_sync_skcipher *cbc_tfm,
-		     u32 offset, struct xdr_buf *buf, struct page **pages)
+VISIBLE_IF_KUNIT
+int krb5_cbc_cts_encrypt(struct crypto_sync_skcipher *cts_tfm,
+			 struct crypto_sync_skcipher *cbc_tfm,
+			 u32 offset, struct xdr_buf *buf, struct page **pages,
+			 u8 *iv, unsigned int ivsize)
 {
 	u32 blocksize, nbytes, nblocks, cbcbytes;
 	struct encryptor_desc desc;
@@ -693,13 +719,27 @@ krb5_cbc_cts_encrypt(struct crypto_sync_skcipher *cts_tfm,
 	if (err)
 		return err;
 
+	if (unlikely(iv))
+		memcpy(iv, desc.iv, ivsize);
 	return 0;
 }
+EXPORT_SYMBOL_IF_KUNIT(krb5_cbc_cts_encrypt);
 
-static int
-krb5_cbc_cts_decrypt(struct crypto_sync_skcipher *cts_tfm,
-		     struct crypto_sync_skcipher *cbc_tfm,
-		     u32 offset, struct xdr_buf *buf)
+/**
+ * krb5_cbc_cts_decrypt - decrypt in CBC mode with CTS
+ * @cts_tfm: CBC cipher with CTS
+ * @cbc_tfm: base CBC cipher
+ * @offset: starting byte offset for plaintext
+ * @buf: OUT: output buffer
+ *
+ * Return values:
+ *   %0: decryption successful
+ *   negative errno: decryption could not be completed
+ */
+VISIBLE_IF_KUNIT
+int krb5_cbc_cts_decrypt(struct crypto_sync_skcipher *cts_tfm,
+			 struct crypto_sync_skcipher *cbc_tfm,
+			 u32 offset, struct xdr_buf *buf)
 {
 	u32 blocksize, nblocks, cbcbytes;
 	struct decryptor_desc desc;
@@ -735,6 +775,7 @@ krb5_cbc_cts_decrypt(struct crypto_sync_skcipher *cts_tfm,
 	/* Remaining plaintext is handled with CBC-CTS. */
 	return gss_krb5_cts_crypt(cts_tfm, buf, cbcbytes, desc.iv, NULL, 0);
 }
+EXPORT_SYMBOL_IF_KUNIT(krb5_cbc_cts_decrypt);
 
 u32
 gss_krb5_aes_encrypt(struct krb5_ctx *kctx, u32 offset,
@@ -801,7 +842,7 @@ gss_krb5_aes_encrypt(struct krb5_ctx *kctx, u32 offset,
 
 	err = krb5_cbc_cts_encrypt(cipher, aux_cipher,
 				   offset + GSS_KRB5_TOK_HDR_LEN,
-				   buf, pages);
+				   buf, pages, NULL, 0);
 	if (err)
 		return GSS_S_FAILURE;
 
@@ -867,10 +908,27 @@ out_err:
 	return ret;
 }
 
-static u32
-krb5_etm_checksum(struct crypto_sync_skcipher *cipher,
-		  struct crypto_ahash *tfm, const struct xdr_buf *body,
-		  int body_offset, struct xdr_netobj *cksumout)
+/**
+ * krb5_etm_checksum - Compute a MAC for a GSS Wrap token
+ * @cipher: an initialized cipher transform
+ * @tfm: an initialized hash transform
+ * @body: xdr_buf containing an RPC message (body.len is the message length)
+ * @body_offset: byte offset into @body to start checksumming
+ * @cksumout: OUT: a buffer to be filled in with the computed HMAC
+ *
+ * Usually expressed as H = HMAC(K, IV | ciphertext)[1..h] .
+ *
+ * Caller provides the truncation length of the output token (h) in
+ * cksumout.len.
+ *
+ * Return values:
+ *   %GSS_S_COMPLETE: Digest computed, @cksumout filled in
+ *   %GSS_S_FAILURE: Call failed
+ */
+VISIBLE_IF_KUNIT
+u32 krb5_etm_checksum(struct crypto_sync_skcipher *cipher,
+		      struct crypto_ahash *tfm, const struct xdr_buf *body,
+		      int body_offset, struct xdr_netobj *cksumout)
 {
 	unsigned int ivsize = crypto_sync_skcipher_ivsize(cipher);
 	struct ahash_request *req;
@@ -917,6 +975,7 @@ out_free_mem:
 	kfree_sensitive(checksumdata);
 	return err ? GSS_S_FAILURE : GSS_S_COMPLETE;
 }
+EXPORT_SYMBOL_IF_KUNIT(krb5_etm_checksum);
 
 /**
  * krb5_etm_encrypt - Encrypt using the RFC 8009 rules
@@ -992,7 +1051,7 @@ krb5_etm_encrypt(struct krb5_ctx *kctx, u32 offset,
 
 	err = krb5_cbc_cts_encrypt(cipher, aux_cipher,
 				   offset + GSS_KRB5_TOK_HDR_LEN,
-				   buf, pages);
+				   buf, pages, NULL, 0);
 	if (err)
 		return GSS_S_FAILURE;
 
