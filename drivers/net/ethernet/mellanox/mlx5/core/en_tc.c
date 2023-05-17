@@ -647,9 +647,9 @@ get_mod_hdr_table(struct mlx5e_priv *priv, struct mlx5e_tc_flow *flow)
 		&tc->mod_hdr;
 }
 
-static int mlx5e_tc_attach_mod_hdr(struct mlx5e_priv *priv,
-				   struct mlx5e_tc_flow *flow,
-				   struct mlx5_flow_attr *attr)
+int mlx5e_tc_attach_mod_hdr(struct mlx5e_priv *priv,
+			    struct mlx5e_tc_flow *flow,
+			    struct mlx5_flow_attr *attr)
 {
 	struct mlx5e_mod_hdr_handle *mh;
 
@@ -666,9 +666,9 @@ static int mlx5e_tc_attach_mod_hdr(struct mlx5e_priv *priv,
 	return 0;
 }
 
-static void mlx5e_tc_detach_mod_hdr(struct mlx5e_priv *priv,
-				    struct mlx5e_tc_flow *flow,
-				    struct mlx5_flow_attr *attr)
+void mlx5e_tc_detach_mod_hdr(struct mlx5e_priv *priv,
+			     struct mlx5e_tc_flow *flow,
+			     struct mlx5_flow_attr *attr)
 {
 	/* flow wasn't fully initialized */
 	if (!attr->mh)
@@ -1763,26 +1763,6 @@ int mlx5e_tc_query_route_vport(struct net_device *out_dev, struct net_device *ro
 	return err;
 }
 
-int mlx5e_tc_add_flow_mod_hdr(struct mlx5e_priv *priv,
-			      struct mlx5e_tc_flow *flow,
-			      struct mlx5_flow_attr *attr)
-{
-	struct mlx5e_tc_mod_hdr_acts *mod_hdr_acts = &attr->parse_attr->mod_hdr_acts;
-	struct mlx5_modify_hdr *mod_hdr;
-
-	mod_hdr = mlx5_modify_header_alloc(priv->mdev,
-					   mlx5e_get_flow_namespace(flow),
-					   mod_hdr_acts->num_actions,
-					   mod_hdr_acts->actions);
-	if (IS_ERR(mod_hdr))
-		return PTR_ERR(mod_hdr);
-
-	WARN_ON(attr->modify_hdr);
-	attr->modify_hdr = mod_hdr;
-
-	return 0;
-}
-
 static int
 set_encap_dests(struct mlx5e_priv *priv,
 		struct mlx5e_tc_flow *flow,
@@ -1902,7 +1882,6 @@ verify_attr_actions(u32 actions, struct netlink_ext_ack *extack)
 static int
 post_process_attr(struct mlx5e_tc_flow *flow,
 		  struct mlx5_flow_attr *attr,
-		  bool is_post_act_attr,
 		  struct netlink_ext_ack *extack)
 {
 	struct mlx5_eswitch *esw = flow->priv->mdev->priv.eswitch;
@@ -1924,27 +1903,21 @@ post_process_attr(struct mlx5e_tc_flow *flow,
 	}
 
 	if (attr->action & MLX5_FLOW_CONTEXT_ACTION_MOD_HDR) {
-		if (vf_tun || is_post_act_attr) {
-			err = mlx5e_tc_add_flow_mod_hdr(flow->priv, flow, attr);
-			if (err)
-				goto err_out;
-		} else {
-			err = mlx5e_tc_attach_mod_hdr(flow->priv, flow, attr);
-			if (err)
-				goto err_out;
-		}
+		err = mlx5e_tc_attach_mod_hdr(flow->priv, flow, attr);
+		if (err)
+			goto err_out;
 	}
 
 	if (attr->branch_true &&
 	    attr->branch_true->action & MLX5_FLOW_CONTEXT_ACTION_MOD_HDR) {
-		err = mlx5e_tc_add_flow_mod_hdr(flow->priv, flow, attr->branch_true);
+		err = mlx5e_tc_attach_mod_hdr(flow->priv, flow, attr->branch_true);
 		if (err)
 			goto err_out;
 	}
 
 	if (attr->branch_false &&
 	    attr->branch_false->action & MLX5_FLOW_CONTEXT_ACTION_MOD_HDR) {
-		err = mlx5e_tc_add_flow_mod_hdr(flow->priv, flow, attr->branch_false);
+		err = mlx5e_tc_attach_mod_hdr(flow->priv, flow, attr->branch_false);
 		if (err)
 			goto err_out;
 	}
@@ -2058,7 +2031,7 @@ mlx5e_tc_add_fdb_flow(struct mlx5e_priv *priv,
 		esw_attr->int_port = int_port;
 	}
 
-	err = post_process_attr(flow, attr, false, extack);
+	err = post_process_attr(flow, attr, extack);
 	if (err)
 		goto err_out;
 
@@ -2143,10 +2116,7 @@ static void mlx5e_tc_del_fdb_flow(struct mlx5e_priv *priv,
 
 	if (attr->action & MLX5_FLOW_CONTEXT_ACTION_MOD_HDR) {
 		mlx5e_mod_hdr_dealloc(&attr->parse_attr->mod_hdr_acts);
-		if (vf_tun && attr->modify_hdr)
-			mlx5_modify_header_dealloc(priv->mdev, attr->modify_hdr);
-		else
-			mlx5e_tc_detach_mod_hdr(priv, flow, attr);
+		mlx5e_tc_detach_mod_hdr(priv, flow, attr);
 	}
 
 	if (attr->action & MLX5_FLOW_CONTEXT_ACTION_COUNT)
@@ -3965,7 +3935,7 @@ alloc_flow_post_acts(struct mlx5e_tc_flow *flow, struct netlink_ext_ack *extack)
 		if (err)
 			goto out_free;
 
-		err = post_process_attr(flow, attr, true, extack);
+		err = post_process_attr(flow, attr, extack);
 		if (err)
 			goto out_free;
 
@@ -4532,8 +4502,7 @@ mlx5_free_flow_attr(struct mlx5e_tc_flow *flow, struct mlx5_flow_attr *attr)
 
 	if (attr->action & MLX5_FLOW_CONTEXT_ACTION_MOD_HDR) {
 		mlx5e_mod_hdr_dealloc(&attr->parse_attr->mod_hdr_acts);
-		if (attr->modify_hdr)
-			mlx5_modify_header_dealloc(flow->priv->mdev, attr->modify_hdr);
+		mlx5e_tc_detach_mod_hdr(flow->priv, flow, attr);
 	}
 }
 
