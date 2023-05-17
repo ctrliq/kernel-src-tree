@@ -696,7 +696,7 @@ xfs_ilock_for_iomap(
 	unsigned		flags,
 	unsigned		*lockmode)
 {
-	unsigned		mode = XFS_ILOCK_SHARED;
+	unsigned int		mode = *lockmode;
 	bool			is_write = flags & (IOMAP_WRITE | IOMAP_ZERO);
 
 	/*
@@ -774,7 +774,7 @@ xfs_direct_write_iomap_begin(
 	int			nimaps = 1, error = 0;
 	bool			shared = false;
 	u16			iomap_flags = 0;
-	unsigned		lockmode;
+	unsigned int		lockmode = XFS_ILOCK_SHARED;
 	u64			seq;
 
 	ASSERT(flags & (IOMAP_WRITE | IOMAP_ZERO));
@@ -922,6 +922,7 @@ xfs_buffered_write_iomap_begin(
 	bool			eof = false, cow_eof = false, shared = false;
 	int			allocfork = XFS_DATA_FORK;
 	int			error = 0;
+	unsigned int		lockmode = XFS_ILOCK_EXCL;
 	u64			seq;
 
 	if (xfs_is_shutdown(mp))
@@ -934,7 +935,9 @@ xfs_buffered_write_iomap_begin(
 
 	ASSERT(!XFS_IS_REALTIME_INODE(ip));
 
-	xfs_ilock(ip, XFS_ILOCK_EXCL);
+	error = xfs_ilock_for_iomap(ip, flags, &lockmode);
+	if (error)
+		return error;
 
 	if (XFS_IS_CORRUPT(mp, !xfs_ifork_has_extents(&ip->i_df)) ||
 	    XFS_TEST_ERROR(false, mp, XFS_ERRTAG_BMAPIFORMAT)) {
@@ -1194,7 +1197,7 @@ xfs_read_iomap_begin(
 	xfs_fileoff_t		end_fsb = xfs_iomap_end_fsb(mp, offset, length);
 	int			nimaps = 1, error = 0;
 	bool			shared = false;
-	unsigned		lockmode;
+	unsigned int		lockmode = XFS_ILOCK_SHARED;
 	u64			seq;
 
 	ASSERT(!(flags & (IOMAP_WRITE | IOMAP_ZERO)));
