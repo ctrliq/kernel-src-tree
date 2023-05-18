@@ -3146,18 +3146,6 @@ void mlxsw_core_port_netdev_link(struct mlxsw_core *mlxsw_core, u16 local_port,
 }
 EXPORT_SYMBOL(mlxsw_core_port_netdev_link);
 
-enum devlink_port_type mlxsw_core_port_type_get(struct mlxsw_core *mlxsw_core,
-						u16 local_port)
-{
-	struct mlxsw_core_port *mlxsw_core_port =
-					&mlxsw_core->ports[local_port];
-	struct devlink_port *devlink_port = &mlxsw_core_port->devlink_port;
-
-	return devlink_port->type;
-}
-EXPORT_SYMBOL(mlxsw_core_port_type_get);
-
-
 struct devlink_port *
 mlxsw_core_port_devlink_port_get(struct mlxsw_core *mlxsw_core,
 				 u16 local_port)
