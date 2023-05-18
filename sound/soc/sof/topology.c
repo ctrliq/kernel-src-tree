@@ -1030,7 +1030,7 @@ static int sof_connect_dai_widget(struct snd_soc_component *scomp,
 					break;
 				}
 			}
-			if (i == rtd->num_cpus) {
+			if (i == rtd->dai_link->num_cpus) {
 				dev_err(scomp->dev, "error: can't find BE for DAI %s\n",
 					w->name);
 
@@ -1052,7 +1052,7 @@ static int sof_connect_dai_widget(struct snd_soc_component *scomp,
 					break;
 				}
 			}
-			if (i == rtd->num_cpus) {
+			if (i == rtd->dai_link->num_cpus) {
 				dev_err(scomp->dev, "error: can't find BE for DAI %s\n",
 					w->name);
 
