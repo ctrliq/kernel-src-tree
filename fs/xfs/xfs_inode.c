@@ -2083,7 +2083,8 @@ xfs_iunlink_update_inode(
 
 	/* Make sure the old pointer isn't garbage. */
 	old_value = be32_to_cpu(dip->di_next_unlinked);
-	if (!xfs_verify_agino_or_null(pag, old_value)) {
+	if (old_value != ip->i_next_unlinked ||
+	    !xfs_verify_agino_or_null(pag, old_value)) {
 		xfs_inode_verifier_error(ip, -EFSCORRUPTED, __func__, dip,
 				sizeof(*dip), __this_address);
 		error = -EFSCORRUPTED;
@@ -2152,6 +2153,7 @@ xfs_iunlink_insert_inode(
 		if (error)
 			return error;
 		ASSERT(old_agino == NULLAGINO);
+		ip->i_next_unlinked = next_agino;
 
 		/*
 		 * agino has been unlinked, add a backref from the next inode
@@ -2353,6 +2355,7 @@ xfs_iunlink_remove_inode(
 	error = xfs_iunlink_update_inode(tp, ip, pag, NULLAGINO, &next_agino);
 	if (error)
 		return error;
+	ip->i_next_unlinked = NULLAGINO;
 
 	/*
 	 * If there was a backref pointing from the next inode back to this
