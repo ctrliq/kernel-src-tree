@@ -3366,7 +3366,7 @@ fi
 %if %{with_efiuki}\
 %{expand:%%files %{?3:%{3}-}uki-virt}\
 %attr(0600, root, root) /lib/modules/%{KVERREL}%{?3:+%{3}}/System.map\
-/lib/modules/%{KVERREL}%{?3:+%{3}}/symvers.gz\
+/lib/modules/%{KVERREL}%{?3:+%{3}}/symvers.%compext\
 /lib/modules/%{KVERREL}%{?3:+%{3}}/config\
 /lib/modules/%{KVERREL}%{?3:+%{3}}/modules.builtin*\
 /lib/modules/%{KVERREL}%{?3:+%{3}}/%{?-k:%{-k*}}%{!?-k:vmlinuz}-virt.efi\
