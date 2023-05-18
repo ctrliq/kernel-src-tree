@@ -56,7 +56,7 @@ xfs_iomap_inode_sequence(
 	u64			cookie = 0;
 
 	if (iomap_flags & IOMAP_F_XATTR)
-		return READ_ONCE(ip->i_afp->if_seq);
+		return READ_ONCE(ip->i_af.if_seq);
 	if ((iomap_flags & IOMAP_F_SHARED) && ip->i_cowfp)
 		cookie = (u64)READ_ONCE(ip->i_cowfp->if_seq) << 32;
 	return cookie | READ_ONCE(ip->i_df.if_seq);
@@ -1343,18 +1343,17 @@ xfs_xattr_iomap_begin(
 	lockmode = xfs_ilock_attr_map_shared(ip);
 
 	/* if there are no attribute fork or extents, return ENOENT */
-	if (!XFS_IFORK_Q(ip) || !ip->i_afp->if_nextents) {
+	if (!XFS_IFORK_Q(ip) || !ip->i_af.if_nextents) {
 		error = -ENOENT;
 		goto out_unlock;
 	}
 
-	ASSERT(ip->i_afp->if_format != XFS_DINODE_FMT_LOCAL);
+	ASSERT(ip->i_af.if_format != XFS_DINODE_FMT_LOCAL);
 	error = xfs_bmapi_read(ip, offset_fsb, end_fsb - offset_fsb, &imap,
 			       &nimaps, XFS_BMAPI_ATTRFORK);
 out_unlock:
 
-	if (ip->i_afp)
-		seq = xfs_iomap_inode_sequence(ip, IOMAP_F_XATTR);
+	seq = xfs_iomap_inode_sequence(ip, IOMAP_F_XATTR);
 	xfs_iunlock(ip, lockmode);
 
 	if (error)
