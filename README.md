@@ -61,7 +61,7 @@ acknowledges the DCO, https://developercertificate.org.
 1. Fork https://gitlab.com/redhat/centos-stream/src/kernel/documentation in Gitlab
 2. Git clone your forked repository and create a private branch for your changes
 3. Don't touch the RHMAINTAINERS & CODEOWNERS files - only edit info/owners.yaml
-4. Run `make` after changing info/onwners.yaml but before before you `git commit`
+4. Run `make` after changing info/owners.yaml but before before you `git commit`
 5. Git push your private branch to Gitlab and create your merge request
 
 ```
