@@ -1155,7 +1155,6 @@ static void skl_remove(struct pci_dev *pci)
 	if (skl->nhlt)
 		intel_nhlt_free(skl->nhlt);
 	skl_free(bus);
-	dev_set_drvdata(&pci->dev, NULL);
 }
 
 /* PCI IDs */
