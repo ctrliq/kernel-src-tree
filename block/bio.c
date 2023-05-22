@@ -1174,7 +1174,7 @@ void __bio_release_pages(struct bio *bio, bool mark_dirty)
 		nr_pages = (fi.offset + fi.length - 1) / PAGE_SIZE -
 			   fi.offset / PAGE_SIZE + 1;
 		do {
-			put_page(page++);
+			bio_release_page(bio, page++);
 		} while (--nr_pages != 0);
 	}
 }
@@ -1511,8 +1511,8 @@ EXPORT_SYMBOL_GPL(bio_set_pages_dirty);
  * the BIO and re-dirty the pages in process context.
  *
  * It is expected that bio_check_pages_dirty() will wholly own the BIO from
- * here on.  It will run one put_page() against each page and will run one
- * bio_put() against the BIO.
+ * here on.  It will unpin each page and will run one bio_put() against the
+ * BIO.
  */
 
 static void bio_dirty_fn(struct work_struct *work);
