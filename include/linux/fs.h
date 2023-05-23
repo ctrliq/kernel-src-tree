@@ -1126,6 +1126,9 @@ struct file_lock {
 			int state;		/* state of grant or error if -ve */
 			unsigned int	debug_id;
 		} afs;
+		struct {
+			struct inode *inode;
+		} ceph;
 	} fl_u;
 } __randomize_layout;
 
