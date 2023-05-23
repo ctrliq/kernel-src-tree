@@ -1318,7 +1318,7 @@ thermal_zone_device_register_with_trips(const char *type, struct thermal_trip *t
 	}
 
 	tz->id = id;
-	strlcpy(tz->type, type, sizeof(tz->type));
+	strscpy(tz->type, type, sizeof(tz->type));
 
 	if (!ops->critical)
 		ops->critical = thermal_zone_device_critical;
