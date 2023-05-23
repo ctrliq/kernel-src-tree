@@ -678,10 +678,7 @@ struct device_link {
 	bool supplier_preactivated; /* Owned by consumer probe. */
 };
 
-static inline struct device *kobj_to_dev(struct kobject *kobj)
-{
-	return container_of(kobj, struct device, kobj);
-}
+#define kobj_to_dev(__kobj)	container_of_const(__kobj, struct device, kobj)
 
 /**
  * device_iommu_mapped - Returns true when the device DMA is translated
