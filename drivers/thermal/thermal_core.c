@@ -779,6 +779,9 @@ static void thermal_release(struct device *dev)
 	} else if (!strncmp(dev_name(dev), "cooling_device",
 			    sizeof("cooling_device") - 1)) {
 		cdev = to_cooling_device(dev);
+		thermal_cooling_device_destroy_sysfs(cdev);
+		kfree(cdev->type);
+		ida_free(&thermal_cdev_ida, cdev->id);
 		kfree(cdev);
 	}
 }
@@ -914,23 +917,21 @@ __thermal_cooling_device_register(struct device_node *np,
 	cdev->devdata = devdata;
 
 	ret = cdev->ops->get_max_state(cdev, &cdev->max_state);
-	if (ret) {
-		kfree(cdev->type);
-		goto out_ida_remove;
-	}
+	if (ret)
+		goto out_cdev_type;
 
 	thermal_cooling_device_setup_sysfs(cdev);
 
 	ret = dev_set_name(&cdev->device, "cooling_device%d", cdev->id);
-	if (ret) {
-		kfree(cdev->type);
-		thermal_cooling_device_destroy_sysfs(cdev);
-		goto out_ida_remove;
-	}
+	if (ret)
+		goto out_cooling_dev;
 
 	ret = device_register(&cdev->device);
-	if (ret)
-		goto out_kfree_type;
+	if (ret) {
+		/* thermal_release() handles rest of the cleanup */
+		put_device(&cdev->device);
+		return ERR_PTR(ret);
+	}
 
 	/* Add 'this' new cdev to the global cdev list */
 	mutex_lock(&thermal_list_lock);
@@ -949,13 +950,10 @@ __thermal_cooling_device_register(struct device_node *np,
 
 	return cdev;
 
-out_kfree_type:
+out_cooling_dev:
 	thermal_cooling_device_destroy_sysfs(cdev);
+out_cdev_type:
 	kfree(cdev->type);
-	put_device(&cdev->device);
-
-	/* thermal_release() takes care of the rest */
-	cdev = NULL;
 out_ida_remove:
 	ida_free(&thermal_cdev_ida, id);
 out_kfree_cdev:
@@ -1198,10 +1196,7 @@ void thermal_cooling_device_unregister(struct thermal_cooling_device *cdev)
 
 	mutex_unlock(&thermal_list_lock);
 
-	ida_free(&thermal_cdev_ida, cdev->id);
 	device_del(&cdev->device);
-	thermal_cooling_device_destroy_sysfs(cdev);
-	kfree(cdev->type);
 	put_device(&cdev->device);
 }
 EXPORT_SYMBOL_GPL(thermal_cooling_device_unregister);
