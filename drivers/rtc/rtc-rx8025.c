@@ -548,12 +548,11 @@ static int rx8025_probe(struct i2c_client *client,
 	if (err)
 		return err;
 
-	rx8025->rtc = devm_rtc_device_register(&client->dev, client->name,
-					  &rx8025_rtc_ops, THIS_MODULE);
-	if (IS_ERR(rx8025->rtc)) {
-		dev_err(&client->dev, "unable to register the class device\n");
+	rx8025->rtc = devm_rtc_allocate_device(&client->dev);
+	if (IS_ERR(rx8025->rtc))
 		return PTR_ERR(rx8025->rtc);
-	}
+
+	rx8025->rtc->ops = &rx8025_rtc_ops;
 
 	if (client->irq > 0) {
 		dev_info(&client->dev, "IRQ %d supplied\n", client->irq);
@@ -571,6 +570,10 @@ static int rx8025_probe(struct i2c_client *client,
 
 	set_bit(RTC_FEATURE_ALARM_RES_MINUTE, rx8025->rtc->features);
 	clear_bit(RTC_FEATURE_UPDATE_INTERRUPT, rx8025->rtc->features);
+
+	err = devm_rtc_register_device(rx8025->rtc);
+	if (err)
+		return err;
 
 	err = rx8025_sysfs_register(&client->dev);
 	return err;
