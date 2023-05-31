@@ -50,7 +50,7 @@
 #include <linux/hashtable.h>
 #include <net/net_trackers.h>
 #include <net/net_debug.h>
-#include <net/dropreason.h>
+#include <net/dropreason-core.h>
 
 struct netpoll_info;
 struct device;

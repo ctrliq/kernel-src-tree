@@ -42,7 +42,7 @@
 #if IS_ENABLED(CONFIG_NF_CONNTRACK)
 #include <linux/netfilter/nf_conntrack_common.h>
 #endif
-#include <net/dropreason.h>
+#include <net/dropreason-core.h>
 
 /* The interface for checksum offload between the stack and networking drivers
  * is as follows...
