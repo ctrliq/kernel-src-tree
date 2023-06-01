@@ -1484,6 +1484,7 @@ void blkdev_show(struct seq_file *seqf, off_t offset);
 #endif
 
 struct blk_holder_ops {
+	void (*mark_dead)(struct block_device *bdev);
 };
 
 struct block_device *blkdev_get_by_dev(dev_t dev, fmode_t mode, void *holder,
