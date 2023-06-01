@@ -501,7 +501,7 @@ btrfs_get_bdev_and_sb(const char *device_path, fmode_t flags, void *holder,
 {
 	int ret;
 
-	*bdev = blkdev_get_by_path(device_path, flags, holder);
+	*bdev = blkdev_get_by_path(device_path, flags, holder, NULL);
 
 	if (IS_ERR(*bdev)) {
 		ret = PTR_ERR(*bdev);
@@ -1340,7 +1340,7 @@ struct btrfs_device *btrfs_scan_one_device(const char *path, fmode_t flags,
 	 */
 	flags |= FMODE_EXCL;
 
-	bdev = blkdev_get_by_path(path, flags, holder);
+	bdev = blkdev_get_by_path(path, flags, holder, NULL);
 	if (IS_ERR(bdev))
 		return ERR_CAST(bdev);
 
@@ -2570,7 +2570,7 @@ int btrfs_init_new_device(struct btrfs_fs_info *fs_info, const char *device_path
 		return -EROFS;
 
 	bdev = blkdev_get_by_path(device_path, FMODE_WRITE | FMODE_EXCL,
-				  fs_info->bdev_holder);
+				  fs_info->bdev_holder, NULL);
 	if (IS_ERR(bdev))
 		return PTR_ERR(bdev);
 
