@@ -12,6 +12,7 @@ include Makefile.variables
 SPECRELEASED_KERNEL=$(RELEASED_KERNEL)
 SPECINCLUDE_FEDORA_FILES=$(INCLUDE_FEDORA_FILES)
 SPECINCLUDE_RHEL_FILES=$(INCLUDE_RHEL_FILES)
+SPECINCLUDE_RT_FILES=$(INCLUDE_RT_FILES)
 
 ifneq (,$(findstring n,$(firstword -$(MAKEFLAGS))))
   # Do not set RHTEST on the command line. Use the make command built-in options
@@ -695,6 +696,7 @@ sources-rh: $(TARBALL) generate-testpatch-tmp setup-source dist-configs-check
 		scripts/mod/mod-internal.list \
 		scripts/mod/mod-partner.list \
 		scripts/mod/mod-sign.sh \
+		scripts/mod/mod-kvm.list \
 		configs/flavors \
 		configs/generate_all_configs.sh \
 		configs/merge.py \
