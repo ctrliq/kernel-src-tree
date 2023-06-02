@@ -1147,7 +1147,7 @@ static inline int of_perf_domain_get_sharing_cpumask(int pcpu, const char *list_
 		if (cpu == pcpu)
 			continue;
 
-		ret = parse_perf_domain(pcpu, list_name, cell_name, &args);
+		ret = parse_perf_domain(cpu, list_name, cell_name, &args);
 		if (ret < 0)
 			continue;
 
