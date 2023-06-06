@@ -15,6 +15,8 @@
 #include "xfs_iwalk.h"
 #include "xfs_itable.h"
 #include "xfs_error.h"
+#include "xfs_da_format.h"
+#include "xfs_da_btree.h"
 #include "xfs_attr.h"
 #include "xfs_bmap.h"
 #include "xfs_bmap_util.h"
@@ -35,8 +37,7 @@
 #include "xfs_health.h"
 #include "xfs_reflink.h"
 #include "xfs_ioctl.h"
-#include "xfs_da_format.h"
-#include "xfs_da_btree.h"
+#include "xfs_xattr.h"
 
 #include <linux/mount.h>
 #include <linux/namei.h>
@@ -372,7 +373,7 @@ int
 xfs_ioc_attr_list(
 	struct xfs_inode		*dp,
 	void __user			*ubuf,
-	int				bufsize,
+	size_t				bufsize,
 	int				flags,
 	struct xfs_attrlist_cursor __user *ucursor)
 {
@@ -524,7 +525,7 @@ xfs_attrmulti_attr_set(
 		args.valuelen = len;
 	}
 
-	error = xfs_attr_set(&args);
+	error = xfs_attr_change(&args);
 	if (!error && (flags & XFS_IOC_ATTR_ROOT))
 		xfs_forget_acl(inode, name);
 	kfree(args.value);
@@ -753,7 +754,7 @@ xfs_bulkstat_fmt(
 static int
 xfs_bulk_ireq_setup(
 	struct xfs_mount	*mp,
-	struct xfs_bulk_ireq	*hdr,
+	const struct xfs_bulk_ireq *hdr,
 	struct xfs_ibulk	*breq,
 	void __user		*ubuffer)
 {
@@ -779,7 +780,7 @@ xfs_bulk_ireq_setup(
 
 		switch (hdr->ino) {
 		case XFS_BULK_IREQ_SPECIAL_ROOT:
-			hdr->ino = mp->m_sb.sb_rootino;
+			breq->startino = mp->m_sb.sb_rootino;
 			break;
 		default:
 			return -EINVAL;
@@ -812,6 +813,9 @@ xfs_bulk_ireq_setup(
 	/* Asking for an inode past the end of the FS?  We're done! */
 	if (XFS_INO_TO_AGNO(mp, breq->startino) >= mp->m_sb.sb_agcount)
 		return -ECANCELED;
+
+	if (hdr->flags & XFS_BULK_IREQ_NREXT64)
+		breq->flags |= XFS_IBULK_NREXT64;
 
 	return 0;
 }
@@ -951,6 +955,7 @@ xfs_ioc_ag_geometry(
 	struct xfs_mount	*mp,
 	void			__user *arg)
 {
+	struct xfs_perag	*pag;
 	struct xfs_ag_geometry	ageo;
 	int			error;
 
@@ -961,7 +966,12 @@ xfs_ioc_ag_geometry(
 	if (memchr_inv(&ageo.ag_reserved, 0, sizeof(ageo.ag_reserved)))
 		return -EINVAL;
 
-	error = xfs_ag_get_geometry(mp, ageo.ag_number, &ageo);
+	pag = xfs_perag_get(mp, ageo.ag_number);
+	if (!pag)
+		return -EINVAL;
+
+	error = xfs_ag_get_geometry(pag, &ageo);
+	xfs_perag_put(pag);
 	if (error)
 		return error;
 
@@ -981,7 +991,7 @@ xfs_fill_fsxattr(
 	struct fileattr		*fa)
 {
 	struct xfs_mount	*mp = ip->i_mount;
-	struct xfs_ifork	*ifp = XFS_IFORK_PTR(ip, whichfork);
+	struct xfs_ifork	*ifp = xfs_ifork_ptr(ip, whichfork);
 
 	fileattr_fill_xflags(fa, xfs_ip2xflags(ip));
 
@@ -1092,7 +1102,8 @@ xfs_flags2diflags2(
 {
 	uint64_t		di_flags2 =
 		(ip->i_diflags2 & (XFS_DIFLAG2_REFLINK |
-				   XFS_DIFLAG2_BIGTIME));
+				   XFS_DIFLAG2_BIGTIME |
+				   XFS_DIFLAG2_NREXT64));
 
 	if (xflags & FS_XFLAG_DAX)
 		di_flags2 |= XFS_DIFLAG2_DAX;
@@ -1464,7 +1475,7 @@ xfs_ioc_getbmap(
 
 	if (bmx.bmv_count < 2)
 		return -EINVAL;
-	if (bmx.bmv_count > ULONG_MAX / recsize)
+	if (bmx.bmv_count >= INT_MAX / recsize)
 		return -ENOMEM;
 
 	buf = kvcalloc(bmx.bmv_count, sizeof(*buf), GFP_KERNEL);
@@ -1853,6 +1864,15 @@ xfs_fs_eofblocks_from_user(
 	}
 	return 0;
 }
+
+/*
+ * These long-unused ioctls were removed from the official ioctl API in 5.17,
+ * but retain these definitions so that we can log warnings about them.
+ */
+#define XFS_IOC_ALLOCSP		_IOW ('X', 10, struct xfs_flock64)
+#define XFS_IOC_FREESP		_IOW ('X', 11, struct xfs_flock64)
+#define XFS_IOC_ALLOCSP64	_IOW ('X', 36, struct xfs_flock64)
+#define XFS_IOC_FREESP64	_IOW ('X', 37, struct xfs_flock64)
 
 /*
  * Note: some of the ioctl's return positive numbers as a
