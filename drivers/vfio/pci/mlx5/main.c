@@ -21,8 +21,8 @@
 
 #include "cmd.h"
 
-/* Arbitrary to prevent userspace from consuming endless memory */
-#define MAX_MIGRATION_SIZE (512*1024*1024)
+/* Device specification max LOAD size */
+#define MAX_LOAD_SIZE (BIT_ULL(__mlx5_bit_sz(load_vhca_state_in, size)) - 1)
 
 static struct mlx5vf_pci_core_device *mlx5vf_drvdata(struct pci_dev *pdev)
 {
@@ -73,12 +73,13 @@ int mlx5vf_add_migration_pages(struct mlx5_vhca_data_buffer *buf,
 	int ret;
 
 	to_fill = min_t(unsigned int, npages, PAGE_SIZE / sizeof(*page_list));
-	page_list = kvzalloc(to_fill * sizeof(*page_list), GFP_KERNEL);
+	page_list = kvzalloc(to_fill * sizeof(*page_list), GFP_KERNEL_ACCOUNT);
 	if (!page_list)
 		return -ENOMEM;
 
 	do {
-		filled = alloc_pages_bulk_array(GFP_KERNEL, to_fill, page_list);
+		filled = alloc_pages_bulk_array(GFP_KERNEL_ACCOUNT, to_fill,
+						page_list);
 		if (!filled) {
 			ret = -ENOMEM;
 			goto err;
@@ -87,7 +88,7 @@ int mlx5vf_add_migration_pages(struct mlx5_vhca_data_buffer *buf,
 		ret = sg_alloc_append_table_from_pages(
 			&buf->table, page_list, filled, 0,
 			filled << PAGE_SHIFT, UINT_MAX, SG_MAX_SINGLE_ALLOC,
-			GFP_KERNEL);
+			GFP_KERNEL_ACCOUNT);
 
 		if (ret)
 			goto err;
@@ -530,7 +531,7 @@ mlx5vf_pci_save_device_data(struct mlx5vf_pci_core_device *mvdev, bool track)
 	size_t length;
 	int ret;
 
-	migf = kzalloc(sizeof(*migf), GFP_KERNEL);
+	migf = kzalloc(sizeof(*migf), GFP_KERNEL_ACCOUNT);
 	if (!migf)
 		return ERR_PTR(-ENOMEM);
 
@@ -633,7 +634,7 @@ mlx5vf_resume_read_image_no_header(struct mlx5_vhca_data_buffer *vhca_buf,
 {
 	int ret;
 
-	if (requested_length > MAX_MIGRATION_SIZE)
+	if (requested_length > MAX_LOAD_SIZE)
 		return -ENOMEM;
 
 	if (vhca_buf->allocated_length < requested_length) {
@@ -768,7 +769,7 @@ mlx5vf_resume_read_header(struct mlx5_vf_migration_file *migf,
 		u32 flags;
 
 		record_size = le64_to_cpup((__le64 *)to_buff);
-		if (record_size > MAX_MIGRATION_SIZE) {
+		if (record_size > MAX_LOAD_SIZE) {
 			ret = -ENOMEM;
 			goto end;
 		}
@@ -939,7 +940,7 @@ mlx5vf_pci_resume_device_data(struct mlx5vf_pci_core_device *mvdev)
 	struct mlx5_vhca_data_buffer *buf;
 	int ret;
 
-	migf = kzalloc(sizeof(*migf), GFP_KERNEL);
+	migf = kzalloc(sizeof(*migf), GFP_KERNEL_ACCOUNT);
 	if (!migf)
 		return ERR_PTR(-ENOMEM);
 
