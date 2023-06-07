@@ -103,7 +103,7 @@ static struct qcom_icc_bcm *mc_virt_bcms[] = {
 	&bcm_mc0,
 };
 
-static struct qcom_icc_node *mc_virt_nodes[] = {
+static struct qcom_icc_node * const mc_virt_nodes[] = {
 	[MASTER_LLCC] = &llcc_mc,
 	[SLAVE_EBI_CH0] = &ebi,
 };
@@ -121,7 +121,7 @@ static struct qcom_icc_bcm *mem_noc_bcms[] = {
 	&bcm_sh4,
 };
 
-static struct qcom_icc_node *mem_noc_nodes[] = {
+static struct qcom_icc_node * const mem_noc_nodes[] = {
 	[MASTER_TCU_0] = &acm_tcu,
 	[MASTER_SNOC_GC_MEM_NOC] = &qnm_snoc_gc,
 	[MASTER_AMPSS_M0] = &xm_apps_rdwr,
@@ -156,7 +156,7 @@ static struct qcom_icc_bcm *system_noc_bcms[] = {
 	&bcm_sn11,
 };
 
-static struct qcom_icc_node *system_noc_nodes[] = {
+static struct qcom_icc_node * const system_noc_nodes[] = {
 	[MASTER_AUDIO] = &qhm_audio,
 	[MASTER_BLSP_1] = &qhm_blsp1,
 	[MASTER_QDSS_BAM] = &qhm_qdss_bam,
