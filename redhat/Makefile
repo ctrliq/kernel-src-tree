@@ -786,10 +786,13 @@ dist-automotive-release-changed: setup-source
 		$(REDHAT)/scripts/new_release.sh; \
 	fi
 
-dist-automotive-build-sig:
-	$(REDHAT)/scripts/automotive_build_sig.sh "$(AUTOSIG_BRANCH)" "$(RHDISTGIT_CACHE)" "$(RHDISTGIT_TMP)" "$(TARBALL)" "$(PACKAGE_NAME)" "$(STAMP_VERSION)" "$(PKGRELEASE)"
+dist-automotive-git:
+	$(REDHAT)/scripts/automotive-dist-git.sh "$(AUTOMOTIVE_BRANCH)" "$(RHDISTGIT_CACHE)" "$(RHDISTGIT_TMP)" "$(TARBALL)" "$(PACKAGE_NAME)" "$(STAMP_VERSION)" "$(PKGRELEASE)"
 
-dist-automotive-sig-release: dist-clean-sources
+dist-automotive-git-test: export RH_DIST_GIT_TEST="1"
+dist-automotive-git-test: dist-automotive-git
+
+dist-automotive-release: dist-clean-sources
 	@# generate new version
 	@$(MAKE) dist-automotive-release-changed
 	@$(MAKE) dist-sources
@@ -798,12 +801,14 @@ dist-automotive-sig-release: dist-clean-sources
 		echo "No changes, nothing to commit"; \
 	else \
 		echo "Update dist-git"; \
-		$(MAKE) dist-automotive-build-sig; \
+		$(MAKE) dist-automotive-git; \
 		echo "Commit source-git changes"; \
 		$(MAKE) dist-release-finish; \
 	fi
 
-dist-automotive-sig: dist-automotive-sig-release
+dist-automotive-rtg: dist-automotive-release
+	@$(MAKE) dist-release-tag
+	# Dist-git is not required. Automotive has a different one.
 
 .PHONY: $(REDHAT)/rpm/SOURCES/$(SPECFILE)
 $(REDHAT)/rpm/SOURCES/$(SPECFILE):
