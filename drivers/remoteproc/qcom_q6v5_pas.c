@@ -80,6 +80,8 @@ struct qcom_adsp {
 	void *mem_region;
 	size_t mem_size;
 
+	u64 region_assign_perms;
+
 	struct qcom_rproc_glink glink_subdev;
 	struct qcom_rproc_subdev smd_subdev;
 	struct qcom_rproc_ssr ssr_subdev;
