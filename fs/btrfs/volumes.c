@@ -495,7 +495,7 @@ static struct btrfs_fs_devices *find_fsid_with_metadata_uuid(
 
 
 static int
-btrfs_get_bdev_and_sb(const char *device_path, fmode_t flags, void *holder,
+btrfs_get_bdev_and_sb(const char *device_path, blk_mode_t flags, void *holder,
 		      int flush, struct block_device **bdev,
 		      struct btrfs_super_block **disk_super)
 {
@@ -605,7 +605,7 @@ static int btrfs_free_stale_devices(const char *path,
  * fs_devices->device_list_mutex here.
  */
 static int btrfs_open_one_device(struct btrfs_fs_devices *fs_devices,
-			struct btrfs_device *device, fmode_t flags,
+			struct btrfs_device *device, blk_mode_t flags,
 			void *holder)
 {
 	struct request_queue *q;
@@ -1179,7 +1179,7 @@ void btrfs_close_devices(struct btrfs_fs_devices *fs_devices)
 }
 
 static int open_fs_devices(struct btrfs_fs_devices *fs_devices,
-				fmode_t flags, void *holder)
+				blk_mode_t flags, void *holder)
 {
 	struct btrfs_device *device;
 	struct btrfs_device *latest_dev = NULL;
@@ -1227,7 +1227,7 @@ static int devid_cmp(void *priv, const struct list_head *a,
 }
 
 int btrfs_open_devices(struct btrfs_fs_devices *fs_devices,
-		       fmode_t flags, void *holder)
+		       blk_mode_t flags, void *holder)
 {
 	int ret;
 
@@ -2567,7 +2567,7 @@ int btrfs_init_new_device(struct btrfs_fs_info *fs_info, const char *device_path
 	if (sb_rdonly(sb) && !fs_devices->seeding)
 		return -EROFS;
 
-	bdev = blkdev_get_by_path(device_path, FMODE_WRITE,
+	bdev = blkdev_get_by_path(device_path, BLK_OPEN_WRITE,
 				  fs_info->bdev_holder, NULL);
 	if (IS_ERR(bdev))
 		return PTR_ERR(bdev);
@@ -7182,7 +7182,7 @@ static struct btrfs_fs_devices *open_seed_devices(struct btrfs_fs_info *fs_info,
 	if (IS_ERR(fs_devices))
 		return fs_devices;
 
-	ret = open_fs_devices(fs_devices, FMODE_READ, fs_info->bdev_holder);
+	ret = open_fs_devices(fs_devices, BLK_OPEN_READ, fs_info->bdev_holder);
 	if (ret) {
 		free_fs_devices(fs_devices);
 		return ERR_PTR(ret);

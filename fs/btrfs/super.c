@@ -1653,7 +1653,7 @@ static struct dentry *btrfs_mount_root(struct file_system_type *fs_type,
 	struct btrfs_fs_devices *fs_devices = NULL;
 	struct btrfs_fs_info *fs_info = NULL;
 	void *new_sec_opts = NULL;
-	fmode_t mode = sb_open_mode(flags);
+	blk_mode_t mode = sb_open_mode(flags);
 	int error = 0;
 
 	if (data) {
