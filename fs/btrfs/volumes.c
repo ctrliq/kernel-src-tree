@@ -512,14 +512,14 @@ btrfs_get_bdev_and_sb(const char *device_path, fmode_t flags, void *holder,
 		sync_blockdev(*bdev);
 	ret = set_blocksize(*bdev, BTRFS_BDEV_BLOCKSIZE);
 	if (ret) {
-		blkdev_put(*bdev, flags);
+		blkdev_put(*bdev, holder);
 		goto error;
 	}
 	invalidate_bdev(*bdev);
 	*disk_super = btrfs_read_dev_super(*bdev);
 	if (IS_ERR(*disk_super)) {
 		ret = PTR_ERR(*disk_super);
-		blkdev_put(*bdev, flags);
+		blkdev_put(*bdev, holder);
 		goto error;
 	}
 
@@ -655,7 +655,7 @@ static int btrfs_open_one_device(struct btrfs_fs_devices *fs_devices,
 
 	device->bdev = bdev;
 	clear_bit(BTRFS_DEV_STATE_IN_FS_METADATA, &device->dev_state);
-	device->mode = flags;
+	device->holder = holder;
 
 	fs_devices->open_devices++;
 	if (test_bit(BTRFS_DEV_STATE_WRITEABLE, &device->dev_state) &&
@@ -669,7 +669,7 @@ static int btrfs_open_one_device(struct btrfs_fs_devices *fs_devices,
 
 error_free_page:
 	btrfs_release_disk_super(disk_super);
-	blkdev_put(bdev, flags);
+	blkdev_put(bdev, holder);
 
 	return -EINVAL;
 }
@@ -1059,7 +1059,7 @@ static void __btrfs_free_extra_devids(struct btrfs_fs_devices *fs_devices,
 			continue;
 
 		if (device->bdev) {
-			blkdev_put(device->bdev, device->mode);
+			blkdev_put(device->bdev, device->holder);
 			device->bdev = NULL;
 			fs_devices->open_devices--;
 		}
@@ -1105,7 +1105,7 @@ static void btrfs_close_bdev(struct btrfs_device *device)
 		invalidate_bdev(device->bdev);
 	}
 
-	blkdev_put(device->bdev, device->mode);
+	blkdev_put(device->bdev, device->holder);
 }
 
 static void btrfs_close_one_device(struct btrfs_device *device)
@@ -1184,8 +1184,6 @@ static int open_fs_devices(struct btrfs_fs_devices *fs_devices,
 	struct btrfs_device *device;
 	struct btrfs_device *latest_dev = NULL;
 	struct btrfs_device *tmp_device;
-
-	flags |= FMODE_EXCL;
 
 	list_for_each_entry_safe(device, tmp_device, &fs_devices->devices,
 				 dev_list) {
@@ -1364,7 +1362,7 @@ struct btrfs_device *btrfs_scan_one_device(const char *path, fmode_t flags,
 	btrfs_release_disk_super(disk_super);
 
 error_bdev_put:
-	blkdev_put(bdev, flags);
+	blkdev_put(bdev, NULL);
 
 	return device;
 }
@@ -2569,7 +2567,7 @@ int btrfs_init_new_device(struct btrfs_fs_info *fs_info, const char *device_path
 	if (sb_rdonly(sb) && !fs_devices->seeding)
 		return -EROFS;
 
-	bdev = blkdev_get_by_path(device_path, FMODE_WRITE | FMODE_EXCL,
+	bdev = blkdev_get_by_path(device_path, FMODE_WRITE,
 				  fs_info->bdev_holder, NULL);
 	if (IS_ERR(bdev))
 		return PTR_ERR(bdev);
@@ -2637,7 +2635,7 @@ int btrfs_init_new_device(struct btrfs_fs_info *fs_info, const char *device_path
 	device->commit_total_bytes = device->total_bytes;
 	set_bit(BTRFS_DEV_STATE_IN_FS_METADATA, &device->dev_state);
 	clear_bit(BTRFS_DEV_STATE_REPLACE_TGT, &device->dev_state);
-	device->mode = FMODE_EXCL;
+	device->holder = fs_info->bdev_holder;
 	device->dev_stats_valid = 1;
 	set_blocksize(device->bdev, BTRFS_BDEV_BLOCKSIZE);
 
@@ -2786,7 +2784,7 @@ error_free_zone:
 error_free_device:
 	btrfs_free_device(device);
 error:
-	blkdev_put(bdev, FMODE_EXCL);
+	blkdev_put(bdev, fs_info->bdev_holder);
 	if (locked) {
 		mutex_unlock(&uuid_mutex);
 		up_write(&sb->s_umount);

@@ -1368,7 +1368,7 @@ static void cached_dev_free(struct closure *cl)
 		put_page(virt_to_page(dc->sb_disk));
 
 	if (!IS_ERR_OR_NULL(dc->bdev))
-		blkdev_put(dc->bdev, FMODE_READ|FMODE_WRITE|FMODE_EXCL);
+		blkdev_put(dc->bdev, bcache_kobj);
 
 	wake_up(&unregister_wait);
 
@@ -2216,7 +2216,7 @@ void bch_cache_release(struct kobject *kobj)
 		put_page(virt_to_page(ca->sb_disk));
 
 	if (!IS_ERR_OR_NULL(ca->bdev))
-		blkdev_put(ca->bdev, FMODE_READ|FMODE_WRITE|FMODE_EXCL);
+		blkdev_put(ca->bdev, bcache_kobj);
 
 	kfree(ca);
 	module_put(THIS_MODULE);
@@ -2357,7 +2357,7 @@ static int register_cache(struct cache_sb *sb, struct cache_sb_disk *sb_disk,
 		 * call blkdev_put() to bdev in bch_cache_release(). So we
 		 * explicitly call blkdev_put() here.
 		 */
-		blkdev_put(bdev, FMODE_READ|FMODE_WRITE|FMODE_EXCL);
+		blkdev_put(bdev, bcache_kobj);
 		if (ret == -ENOMEM)
 			err = "cache_alloc(): -ENOMEM";
 		else if (ret == -EPERM)
@@ -2459,7 +2459,7 @@ static void register_bdev_worker(struct work_struct *work)
 	if (!dc) {
 		fail = true;
 		put_page(virt_to_page(args->sb_disk));
-		blkdev_put(args->bdev, FMODE_READ | FMODE_WRITE | FMODE_EXCL);
+		blkdev_put(args->bdev, bcache_kobj);
 		goto out;
 	}
 
@@ -2489,7 +2489,7 @@ static void register_cache_worker(struct work_struct *work)
 	if (!ca) {
 		fail = true;
 		put_page(virt_to_page(args->sb_disk));
-		blkdev_put(args->bdev, FMODE_READ | FMODE_WRITE | FMODE_EXCL);
+		blkdev_put(args->bdev, bcache_kobj);
 		goto out;
 	}
 
@@ -2556,8 +2556,7 @@ static ssize_t register_bcache(struct kobject *k, struct kobj_attribute *attr,
 
 	ret = -EINVAL;
 	err = "failed to open device";
-	bdev = blkdev_get_by_path(strim(path),
-				  FMODE_READ|FMODE_WRITE|FMODE_EXCL,
+	bdev = blkdev_get_by_path(strim(path), FMODE_READ|FMODE_WRITE,
 				  sb, NULL);
 	if (IS_ERR(bdev)) {
 		if (bdev == ERR_PTR(-EBUSY)) {
@@ -2646,7 +2645,7 @@ async_done:
 out_put_sb_page:
 	put_page(virt_to_page(sb_disk));
 out_blkdev_put:
-	blkdev_put(bdev, FMODE_READ | FMODE_WRITE | FMODE_EXCL);
+	blkdev_put(bdev, register_bcache);
 out_free_sb:
 	kfree(sb);
 out_free_path:
