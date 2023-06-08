@@ -96,6 +96,7 @@
 #include "notif.h"
 #include "waitid.h"
 #include "futex.h"
+#include "napi.h"
 #include "uring_cmd.h"
 
 #include "timeout.h"
@@ -345,6 +346,8 @@ static __cold struct io_ring_ctx *io_ring_ctx_alloc(struct io_uring_params *p)
 	INIT_DELAYED_WORK(&ctx->fallback_work, io_fallback_req_func);
 	INIT_WQ_LIST(&ctx->submit_state.compl_reqs);
 	INIT_HLIST_HEAD(&ctx->cancelable_uring_cmd);
+	io_napi_init(ctx);
+
 	return ctx;
 err:
 	kfree(ctx->cancel_table.hbs);
@@ -2615,7 +2618,9 @@ static int io_cqring_wait(struct io_ring_ctx *ctx, int min_events,
 
 		if (get_timespec64(&ts, uts))
 			return -EFAULT;
+
 		iowq.timeout = ktime_add_ns(timespec64_to_ktime(ts), ktime_get_ns());
+		io_napi_adjust_timeout(ctx, &iowq, &ts);
 	}
 
 	if (sig) {
@@ -2630,6 +2635,8 @@ static int io_cqring_wait(struct io_ring_ctx *ctx, int min_events,
 		if (ret)
 			return ret;
 	}
+
+	io_napi_busy_loop(ctx, &iowq);
 
 	trace_io_uring_cqring_wait(ctx, min_events);
 	do {
@@ -2928,6 +2935,7 @@ static __cold void io_ring_ctx_free(struct io_ring_ctx *ctx)
 	io_req_caches_free(ctx);
 	if (ctx->hash_map)
 		io_wq_put_hash(ctx->hash_map);
+	io_napi_free(ctx);
 	kfree(ctx->cancel_table.hbs);
 	kfree(ctx->cancel_table_locked.hbs);
 	xa_destroy(&ctx->io_bl_xa);
