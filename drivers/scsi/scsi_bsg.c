@@ -44,7 +44,7 @@ static int scsi_bsg_sg_io_fn(struct request_queue *q, struct sg_io_v4 *hdr,
 	if (copy_from_user(sreq->cmd, uptr64(hdr->request), sreq->cmd_len))
 		goto out_free_cmd;
 	ret = -EPERM;
-	if (!scsi_cmd_allowed(sreq->cmd, mode))
+	if (!scsi_cmd_allowed(sreq->cmd, mode & FMODE_WRITE))
 		goto out_free_cmd;
 
 	ret = 0;
