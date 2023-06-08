@@ -267,19 +267,10 @@ static void tpm_dev_release(struct device *dev)
 	idr_remove(&dev_nums_idr, chip->dev_num);
 	mutex_unlock(&idr_lock);
 
-	kfree(chip->log.bios_event_log);
 	kfree(chip->work_space.context_buf);
 	kfree(chip->work_space.session_buf);
 	kfree(chip->allocated_banks);
 	kfree(chip);
-}
-
-static void tpm_devs_release(struct device *dev)
-{
-	struct tpm_chip *chip = container_of(dev, struct tpm_chip, devs);
-
-	/* release the master device reference */
-	put_device(&chip->dev);
 }
 
 /**
@@ -344,7 +335,6 @@ struct tpm_chip *tpm_chip_alloc(struct device *pdev,
 	chip->dev_num = rc;
 
 	device_initialize(&chip->dev);
-	device_initialize(&chip->devs);
 
 	chip->dev.class = tpm_class;
 	chip->dev.class->shutdown_pre = tpm_class_shutdown;
@@ -352,29 +342,12 @@ struct tpm_chip *tpm_chip_alloc(struct device *pdev,
 	chip->dev.parent = pdev;
 	chip->dev.groups = chip->groups;
 
-	chip->devs.parent = pdev;
-	chip->devs.class = tpmrm_class;
-	chip->devs.release = tpm_devs_release;
-	/* get extra reference on main device to hold on
-	 * behalf of devs.  This holds the chip structure
-	 * while cdevs is in use.  The corresponding put
-	 * is in the tpm_devs_release (TPM2 only)
-	 */
-	if (chip->flags & TPM_CHIP_FLAG_TPM2)
-		get_device(&chip->dev);
-
 	if (chip->dev_num == 0)
 		chip->dev.devt = MKDEV(MISC_MAJOR, TPM_MINOR);
 	else
 		chip->dev.devt = MKDEV(MAJOR(tpm_devt), chip->dev_num);
 
-	chip->devs.devt =
-		MKDEV(MAJOR(tpm_devt), chip->dev_num + TPM_NUM_DEVICES);
-
 	rc = dev_set_name(&chip->dev, "tpm%d", chip->dev_num);
-	if (rc)
-		goto out;
-	rc = dev_set_name(&chip->devs, "tpmrm%d", chip->dev_num);
 	if (rc)
 		goto out;
 
@@ -382,9 +355,7 @@ struct tpm_chip *tpm_chip_alloc(struct device *pdev,
 		chip->flags |= TPM_CHIP_FLAG_VIRTUAL;
 
 	cdev_init(&chip->cdev, &tpm_fops);
-	cdev_init(&chip->cdevs, &tpmrm_fops);
 	chip->cdev.owner = THIS_MODULE;
-	chip->cdevs.owner = THIS_MODULE;
 
 	rc = tpm2_init_space(&chip->work_space, TPM2_SPACE_BUFFER_SIZE);
 	if (rc) {
@@ -396,11 +367,15 @@ struct tpm_chip *tpm_chip_alloc(struct device *pdev,
 	return chip;
 
 out:
-	put_device(&chip->devs);
 	put_device(&chip->dev);
 	return ERR_PTR(rc);
 }
 EXPORT_SYMBOL_GPL(tpm_chip_alloc);
+
+static void tpm_put_device(void *dev)
+{
+	put_device(dev);
+}
 
 /**
  * tpmm_chip_alloc() - allocate a new struct tpm_chip instance
@@ -420,7 +395,7 @@ struct tpm_chip *tpmm_chip_alloc(struct device *pdev,
 		return chip;
 
 	rc = devm_add_action_or_reset(pdev,
-				      (void (*)(void *)) put_device,
+				      tpm_put_device,
 				      &chip->dev);
 	if (rc)
 		return ERR_PTR(rc);
@@ -445,14 +420,9 @@ static int tpm_add_char_device(struct tpm_chip *chip)
 	}
 
 	if (chip->flags & TPM_CHIP_FLAG_TPM2) {
-		rc = cdev_device_add(&chip->cdevs, &chip->devs);
-		if (rc) {
-			dev_err(&chip->devs,
-				"unable to cdev_device_add() %s, major %d, minor %d, err=%d\n",
-				dev_name(&chip->devs), MAJOR(chip->devs.devt),
-				MINOR(chip->devs.devt), rc);
-			return rc;
-		}
+		rc = tpm_devs_add(chip);
+		if (rc)
+			goto err_del_cdev;
 	}
 
 	/* Make the chip available. */
@@ -460,6 +430,10 @@ static int tpm_add_char_device(struct tpm_chip *chip)
 	idr_replace(&dev_nums_idr, chip, chip->dev_num);
 	mutex_unlock(&idr_lock);
 
+	return 0;
+
+err_del_cdev:
+	cdev_device_del(&chip->cdev, &chip->dev);
 	return rc;
 }
 
@@ -535,6 +509,63 @@ static int tpm_add_legacy_sysfs(struct tpm_chip *chip)
 	return 0;
 }
 
+/*
+ * Some AMD fTPM versions may cause stutter
+ * https://www.amd.com/en/support/kb/faq/pa-410
+ *
+ * Fixes are available in two series of fTPM firmware:
+ * 6.x.y.z series: 6.0.18.6 +
+ * 3.x.y.z series: 3.57.y.5 +
+ */
+static bool tpm_amd_is_rng_defective(struct tpm_chip *chip)
+{
+	u32 val1, val2;
+	u64 version;
+	int ret;
+
+	if (!(chip->flags & TPM_CHIP_FLAG_TPM2))
+		return false;
+
+	ret = tpm_request_locality(chip);
+	if (ret)
+		return false;
+
+	ret = tpm2_get_tpm_pt(chip, TPM2_PT_MANUFACTURER, &val1, NULL);
+	if (ret)
+		goto release;
+	if (val1 != 0x414D4400U /* AMD */) {
+		ret = -ENODEV;
+		goto release;
+	}
+	ret = tpm2_get_tpm_pt(chip, TPM2_PT_FIRMWARE_VERSION_1, &val1, NULL);
+	if (ret)
+		goto release;
+	ret = tpm2_get_tpm_pt(chip, TPM2_PT_FIRMWARE_VERSION_2, &val2, NULL);
+
+release:
+	tpm_relinquish_locality(chip);
+
+	if (ret)
+		return false;
+
+	version = ((u64)val1 << 32) | val2;
+	if ((version >> 48) == 6) {
+		if (version >= 0x0006000000180006ULL)
+			return false;
+	} else if ((version >> 48) == 3) {
+		if (version >= 0x0003005700000005ULL)
+			return false;
+	} else {
+		return false;
+	}
+
+	dev_warn(&chip->dev,
+		 "AMD fTPM version 0x%llx causes system stutter; hwrng disabled\n",
+		 version);
+
+	return true;
+}
+
 static int tpm_hwrng_read(struct hwrng *rng, void *data, size_t max, bool wait)
 {
 	struct tpm_chip *chip = container_of(rng, struct tpm_chip, hwrng);
@@ -544,7 +575,8 @@ static int tpm_hwrng_read(struct hwrng *rng, void *data, size_t max, bool wait)
 
 static int tpm_add_hwrng(struct tpm_chip *chip)
 {
-	if (!IS_ENABLED(CONFIG_HW_RANDOM_TPM))
+	if (!IS_ENABLED(CONFIG_HW_RANDOM_TPM) ||
+	    tpm_amd_is_rng_defective(chip))
 		return 0;
 
 	snprintf(chip->hwrng_name, sizeof(chip->hwrng_name),
@@ -649,7 +681,7 @@ void tpm_chip_unregister(struct tpm_chip *chip)
 		hwrng_unregister(&chip->hwrng);
 	tpm_bios_log_teardown(chip);
 	if (chip->flags & TPM_CHIP_FLAG_TPM2)
-		cdev_device_del(&chip->cdevs, &chip->devs);
+		tpm_devs_remove(chip);
 	tpm_del_char_device(chip);
 }
 EXPORT_SYMBOL_GPL(tpm_chip_unregister);
