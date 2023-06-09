@@ -497,7 +497,6 @@ static void __init setup_lowcore_dat_off(void)
 	lc->spinlock_lockval = arch_spin_lockval(0);
 	lc->spinlock_index = 0;
 	arch_spin_lock_setup(0);
-	lc->br_r1_trampoline = 0x07f1;	/* br %r1 */
 	lc->return_lpswe = gen_lpswe(__LC_RETURN_PSW);
 	lc->return_mcck_lpswe = gen_lpswe(__LC_RETURN_MCCK_PSW);
 	lc->preempt_count = PREEMPT_DISABLED;
@@ -979,21 +978,7 @@ static int __init setup_hwcaps(void)
 	get_cpu_id(&cpu_id);
 	add_device_randomness(&cpu_id, sizeof(cpu_id));
 	switch (cpu_id.machine) {
-	case 0x2064:
-	case 0x2066:
-	default:	/* Use "z900" as default for 64 bit kernels. */
-		strcpy(elf_platform, "z900");
-		break;
-	case 0x2084:
-	case 0x2086:
-		strcpy(elf_platform, "z990");
-		break;
-	case 0x2094:
-	case 0x2096:
-		strcpy(elf_platform, "z9-109");
-		break;
-	case 0x2097:
-	case 0x2098:
+	default:        /* Use "z10" as default. */
 		strcpy(elf_platform, "z10");
 		break;
 	case 0x2817:

@@ -80,8 +80,6 @@ union oac {
 	};
 };
 
-#ifdef CONFIG_HAVE_MARCH_Z10_FEATURES
-
 #define __put_user_asm(to, from, size)					\
 ({									\
 	union oac __oac_spec = {					\
@@ -190,22 +188,6 @@ static __always_inline int __get_user_fn(void *x, const void __user *ptr, unsign
 	}
 	return rc;
 }
-
-#else /* CONFIG_HAVE_MARCH_Z10_FEATURES */
-
-static inline int __put_user_fn(void *x, void __user *ptr, unsigned long size)
-{
-	size = raw_copy_to_user(ptr, x, size);
-	return size ? -EFAULT : 0;
-}
-
-static inline int __get_user_fn(void *x, const void __user *ptr, unsigned long size)
-{
-	size = raw_copy_from_user(x, ptr, size);
-	return size ? -EFAULT : 0;
-}
-
-#endif /* CONFIG_HAVE_MARCH_Z10_FEATURES */
 
 /*
  * These are the main single-value transfer routines.  They automatically

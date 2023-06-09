@@ -684,13 +684,9 @@ void __init vmem_map_init(void)
 	/* lowcore requires 4k mapping for real addresses / prefixing */
 	set_memory_4k(0, LC_PAGES);
 
-	if (nospec_uses_trampoline() || !static_key_enabled(&cpu_has_bear)) {
-		/*
-		 * Lowcore must be executable for LPSWE
-		 * and expoline trampoline branch instructions.
-		 */
+	/* lowcore must be executable for LPSWE */
+	if (!static_key_enabled(&cpu_has_bear))
 		set_memory_x(0, 1);
-	}
 
 	pr_info("Write protected kernel read-only data: %luk\n",
 		(unsigned long)(__end_rodata - _stext) >> 10);
