@@ -27,6 +27,9 @@ INTERFACE_TIMEOUT=${INTERFACE_TIMEOUT:=600}
 LOW_AGEING_TIME=${LOW_AGEING_TIME:=1000}
 REQUIRE_JQ=${REQUIRE_JQ:=yes}
 REQUIRE_MZ=${REQUIRE_MZ:=yes}
+REQUIRE_MTOOLS=${REQUIRE_MTOOLS:=no}
+STABLE_MAC_ADDRS=${STABLE_MAC_ADDRS:=no}
+TCPDUMP_EXTRA_FLAGS=${TCPDUMP_EXTRA_FLAGS:=}
 
 relative_path="${BASH_SOURCE%/*}"
 if [[ "$relative_path" == "${BASH_SOURCE}" ]]; then
@@ -134,6 +137,14 @@ check_locked_port_support()
 	fi
 }
 
+check_port_mab_support()
+{
+	if ! bridge -d link show | grep -q "mab"; then
+		echo "SKIP: iproute2 too old; MacAuth feature not supported."
+		return $ksft_skip
+	fi
+}
+
 if [[ "$(id -u)" -ne 0 ]]; then
 	echo "SKIP: need root privileges"
 	exit $ksft_skip
@@ -158,6 +169,12 @@ if [[ "$REQUIRE_JQ" = "yes" ]]; then
 fi
 if [[ "$REQUIRE_MZ" = "yes" ]]; then
 	require_command $MZ
+fi
+if [[ "$REQUIRE_MTOOLS" = "yes" ]]; then
+	# https://github.com/vladimiroltean/mtools/
+	# patched for IPv6 support
+	require_command msend
+	require_command mreceive
 fi
 
 if [[ ! -v NUM_NETIFS ]]; then
@@ -214,8 +231,39 @@ create_netif()
 	esac
 }
 
+declare -A MAC_ADDR_ORIG
+mac_addr_prepare()
+{
+	local new_addr=
+	local dev=
+
+	for ((i = 1; i <= NUM_NETIFS; ++i)); do
+		dev=${NETIFS[p$i]}
+		new_addr=$(printf "00:01:02:03:04:%02x" $i)
+
+		MAC_ADDR_ORIG["$dev"]=$(ip -j link show dev $dev | jq -e '.[].address')
+		# Strip quotes
+		MAC_ADDR_ORIG["$dev"]=${MAC_ADDR_ORIG["$dev"]//\"/}
+		ip link set dev $dev address $new_addr
+	done
+}
+
+mac_addr_restore()
+{
+	local dev=
+
+	for ((i = 1; i <= NUM_NETIFS; ++i)); do
+		dev=${NETIFS[p$i]}
+		ip link set dev $dev address ${MAC_ADDR_ORIG["$dev"]}
+	done
+}
+
 if [[ "$NETIF_CREATE" = "yes" ]]; then
 	create_netif
+fi
+
+if [[ "$STABLE_MAC_ADDRS" = "yes" ]]; then
+	mac_addr_prepare
 fi
 
 for ((i = 1; i <= NUM_NETIFS; ++i)); do
@@ -502,6 +550,10 @@ pre_cleanup()
 	if [ "${PAUSE_ON_CLEANUP}" = "yes" ]; then
 		echo "Pausing before cleanup, hit any key to continue"
 		read
+	fi
+
+	if [[ "$STABLE_MAC_ADDRS" = "yes" ]]; then
+		mac_addr_restore
 	fi
 }
 
@@ -833,6 +885,15 @@ mac_get()
 	local if_name=$1
 
 	ip -j link show dev $if_name | jq -r '.[]["address"]'
+}
+
+ipv6_lladdr_get()
+{
+	local if_name=$1
+
+	ip -j addr show dev $if_name | \
+		jq -r '.[]["addr_info"][] | select(.scope == "link").local' | \
+		head -1
 }
 
 bridge_ageing_time_get()
@@ -1379,13 +1440,17 @@ stop_traffic()
 	{ kill %% && wait %%; } 2>/dev/null
 }
 
+declare -A cappid
+declare -A capfile
+declare -A capout
+
 tcpdump_start()
 {
 	local if_name=$1; shift
 	local ns=$1; shift
 
-	capfile=$(mktemp)
-	capout=$(mktemp)
+	capfile[$if_name]=$(mktemp)
+	capout[$if_name]=$(mktemp)
 
 	if [ -z $ns ]; then
 		ns_cmd=""
@@ -1399,27 +1464,35 @@ tcpdump_start()
 		capuser="-Z $SUDO_USER"
 	fi
 
-	$ns_cmd tcpdump -e -n -Q in -i $if_name \
-		-s 65535 -B 32768 $capuser -w $capfile > "$capout" 2>&1 &
-	cappid=$!
+	$ns_cmd tcpdump $TCPDUMP_EXTRA_FLAGS -e -n -Q in -i $if_name \
+		-s 65535 -B 32768 $capuser -w ${capfile[$if_name]} \
+		> "${capout[$if_name]}" 2>&1 &
+	cappid[$if_name]=$!
 
 	sleep 1
 }
 
 tcpdump_stop()
 {
-	$ns_cmd kill $cappid
+	local if_name=$1
+	local pid=${cappid[$if_name]}
+
+	$ns_cmd kill "$pid" && wait "$pid"
 	sleep 1
 }
 
 tcpdump_cleanup()
 {
-	rm $capfile $capout
+	local if_name=$1
+
+	rm ${capfile[$if_name]} ${capout[$if_name]}
 }
 
 tcpdump_show()
 {
-	tcpdump -e -n -r $capfile 2>&1
+	local if_name=$1
+
+	tcpdump -e -n -r ${capfile[$if_name]} 2>&1
 }
 
 # return 0 if the packet wasn't seen on host2_if or 1 if it was
@@ -1529,6 +1602,37 @@ brmcast_check_sg_state()
 	done
 }
 
+mc_join()
+{
+	local if_name=$1
+	local group=$2
+	local vrf_name=$(master_name_get $if_name)
+
+	# We don't care about actual reception, just about joining the
+	# IP multicast group and adding the L2 address to the device's
+	# MAC filtering table
+	ip vrf exec $vrf_name \
+		mreceive -g $group -I $if_name > /dev/null 2>&1 &
+	mreceive_pid=$!
+
+	sleep 1
+}
+
+mc_leave()
+{
+	kill "$mreceive_pid" && wait "$mreceive_pid"
+}
+
+mc_send()
+{
+	local if_name=$1
+	local groups=$2
+	local vrf_name=$(master_name_get $if_name)
+
+	ip vrf exec $vrf_name \
+		msend -g $groups -I $if_name -c 1 > /dev/null 2>&1
+}
+
 start_ip_monitor()
 {
 	local mtype=$1; shift
@@ -1587,4 +1691,220 @@ hw_stats_monitor_test()
 	stop_ip_monitor $ipmout 1 "${type}_stats disablement"
 
 	log_test "${type}_stats notifications"
+}
+
+ipv4_to_bytes()
+{
+	local IP=$1; shift
+
+	printf '%02x:' ${IP//./ } |
+	    sed 's/:$//'
+}
+
+# Convert a given IPv6 address, `IP' such that the :: token, if present, is
+# expanded, and each 16-bit group is padded with zeroes to be 4 hexadecimal
+# digits. An optional `BYTESEP' parameter can be given to further separate
+# individual bytes of each 16-bit group.
+expand_ipv6()
+{
+	local IP=$1; shift
+	local bytesep=$1; shift
+
+	local cvt_ip=${IP/::/_}
+	local colons=${cvt_ip//[^:]/}
+	local allcol=:::::::
+	# IP where :: -> the appropriate number of colons:
+	local allcol_ip=${cvt_ip/_/${allcol:${#colons}}}
+
+	echo $allcol_ip | tr : '\n' |
+	    sed s/^/0000/ |
+	    sed 's/.*\(..\)\(..\)/\1'"$bytesep"'\2/' |
+	    tr '\n' : |
+	    sed 's/:$//'
+}
+
+ipv6_to_bytes()
+{
+	local IP=$1; shift
+
+	expand_ipv6 "$IP" :
+}
+
+u16_to_bytes()
+{
+	local u16=$1; shift
+
+	printf "%04x" $u16 | sed 's/^/000/;s/^.*\(..\)\(..\)$/\1:\2/'
+}
+
+# Given a mausezahn-formatted payload (colon-separated bytes given as %02x),
+# possibly with a keyword CHECKSUM stashed where a 16-bit checksum should be,
+# calculate checksum as per RFC 1071, assuming the CHECKSUM field (if any)
+# stands for 00:00.
+payload_template_calc_checksum()
+{
+	local payload=$1; shift
+
+	(
+	    # Set input radix.
+	    echo "16i"
+	    # Push zero for the initial checksum.
+	    echo 0
+
+	    # Pad the payload with a terminating 00: in case we get an odd
+	    # number of bytes.
+	    echo "${payload%:}:00:" |
+		sed 's/CHECKSUM/00:00/g' |
+		tr '[:lower:]' '[:upper:]' |
+		# Add the word to the checksum.
+		sed 's/\(..\):\(..\):/\1\2+\n/g' |
+		# Strip the extra odd byte we pushed if left unconverted.
+		sed 's/\(..\):$//'
+
+	    echo "10000 ~ +"	# Calculate and add carry.
+	    echo "FFFF r - p"	# Bit-flip and print.
+	) |
+	    dc |
+	    tr '[:upper:]' '[:lower:]'
+}
+
+payload_template_expand_checksum()
+{
+	local payload=$1; shift
+	local checksum=$1; shift
+
+	local ckbytes=$(u16_to_bytes $checksum)
+
+	echo "$payload" | sed "s/CHECKSUM/$ckbytes/g"
+}
+
+payload_template_nbytes()
+{
+	local payload=$1; shift
+
+	payload_template_expand_checksum "${payload%:}" 0 |
+		sed 's/:/\n/g' | wc -l
+}
+
+igmpv3_is_in_get()
+{
+	local GRP=$1; shift
+	local sources=("$@")
+
+	local igmpv3
+	local nsources=$(u16_to_bytes ${#sources[@]})
+
+	# IS_IN ( $sources )
+	igmpv3=$(:
+		)"22:"$(			: Type - Membership Report
+		)"00:"$(			: Reserved
+		)"CHECKSUM:"$(			: Checksum
+		)"00:00:"$(			: Reserved
+		)"00:01:"$(			: Number of Group Records
+		)"01:"$(			: Record Type - IS_IN
+		)"00:"$(			: Aux Data Len
+		)"${nsources}:"$(		: Number of Sources
+		)"$(ipv4_to_bytes $GRP):"$(	: Multicast Address
+		)"$(for src in "${sources[@]}"; do
+			ipv4_to_bytes $src
+			echo -n :
+		    done)"$(			: Source Addresses
+		)
+	local checksum=$(payload_template_calc_checksum "$igmpv3")
+
+	payload_template_expand_checksum "$igmpv3" $checksum
+}
+
+igmpv2_leave_get()
+{
+	local GRP=$1; shift
+
+	local payload=$(:
+		)"17:"$(			: Type - Leave Group
+		)"00:"$(			: Max Resp Time - not meaningful
+		)"CHECKSUM:"$(			: Checksum
+		)"$(ipv4_to_bytes $GRP)"$(	: Group Address
+		)
+	local checksum=$(payload_template_calc_checksum "$payload")
+
+	payload_template_expand_checksum "$payload" $checksum
+}
+
+mldv2_is_in_get()
+{
+	local SIP=$1; shift
+	local GRP=$1; shift
+	local sources=("$@")
+
+	local hbh
+	local icmpv6
+	local nsources=$(u16_to_bytes ${#sources[@]})
+
+	hbh=$(:
+		)"3a:"$(			: Next Header - ICMPv6
+		)"00:"$(			: Hdr Ext Len
+		)"00:00:00:00:00:00:"$(		: Options and Padding
+		)
+
+	icmpv6=$(:
+		)"8f:"$(			: Type - MLDv2 Report
+		)"00:"$(			: Code
+		)"CHECKSUM:"$(			: Checksum
+		)"00:00:"$(			: Reserved
+		)"00:01:"$(			: Number of Group Records
+		)"01:"$(			: Record Type - IS_IN
+		)"00:"$(			: Aux Data Len
+		)"${nsources}:"$(		: Number of Sources
+		)"$(ipv6_to_bytes $GRP):"$(	: Multicast address
+		)"$(for src in "${sources[@]}"; do
+			ipv6_to_bytes $src
+			echo -n :
+		    done)"$(			: Source Addresses
+		)
+
+	local len=$(u16_to_bytes $(payload_template_nbytes $icmpv6))
+	local sudohdr=$(:
+		)"$(ipv6_to_bytes $SIP):"$(	: SIP
+		)"$(ipv6_to_bytes $GRP):"$(	: DIP is multicast address
+	        )"${len}:"$(			: Upper-layer length
+	        )"00:3a:"$(			: Zero and next-header
+	        )
+	local checksum=$(payload_template_calc_checksum ${sudohdr}${icmpv6})
+
+	payload_template_expand_checksum "$hbh$icmpv6" $checksum
+}
+
+mldv1_done_get()
+{
+	local SIP=$1; shift
+	local GRP=$1; shift
+
+	local hbh
+	local icmpv6
+
+	hbh=$(:
+		)"3a:"$(			: Next Header - ICMPv6
+		)"00:"$(			: Hdr Ext Len
+		)"00:00:00:00:00:00:"$(		: Options and Padding
+		)
+
+	icmpv6=$(:
+		)"84:"$(			: Type - MLDv1 Done
+		)"00:"$(			: Code
+		)"CHECKSUM:"$(			: Checksum
+		)"00:00:"$(			: Max Resp Delay - not meaningful
+		)"00:00:"$(			: Reserved
+		)"$(ipv6_to_bytes $GRP):"$(	: Multicast address
+		)
+
+	local len=$(u16_to_bytes $(payload_template_nbytes $icmpv6))
+	local sudohdr=$(:
+		)"$(ipv6_to_bytes $SIP):"$(	: SIP
+		)"$(ipv6_to_bytes $GRP):"$(	: DIP is multicast address
+	        )"${len}:"$(			: Upper-layer length
+	        )"00:3a:"$(			: Zero and next-header
+	        )
+	local checksum=$(payload_template_calc_checksum ${sudohdr}${icmpv6})
+
+	payload_template_expand_checksum "$hbh$icmpv6" $checksum
 }
