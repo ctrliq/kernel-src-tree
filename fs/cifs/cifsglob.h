@@ -13,6 +13,8 @@
 #include <linux/in6.h>
 #include <linux/inet.h>
 #include <linux/slab.h>
+#include <linux/scatterlist.h>
+#include <linux/mm.h>
 #include <linux/mempool.h>
 #include <linux/workqueue.h>
 #include <linux/utsname.h>
@@ -21,7 +23,6 @@
 #include "cifs_fs_sb.h"
 #include "cifsacl.h"
 #include <crypto/internal/hash.h>
-#include <linux/scatterlist.h>
 #include <uapi/linux/cifs/cifs_mount.h>
 #include "../smbfs_common/smb2pdu.h"
 #include "smb2pdu.h"
@@ -106,6 +107,8 @@
 
 #define CIFS_MAX_WORKSTATION_LEN  (__NEW_UTS_LEN + 1)  /* reasonable max for client */
 
+#define CIFS_DFS_ROOT_SES(ses) ((ses)->dfs_root_ses ?: (ses))
+
 /*
  * CIFS vfs client Status information (based on what we know.)
  */
@@ -153,26 +156,16 @@ struct session_key {
 	char *response;
 };
 
-/* crypto security descriptor definition */
-struct sdesc {
-	struct shash_desc shash;
-	char ctx[];
-};
-
 /* crypto hashing related structure/fields, not specific to a sec mech */
 struct cifs_secmech {
-	struct crypto_shash *hmacmd5; /* hmac-md5 hash function */
-	struct crypto_shash *md5; /* md5 hash function */
-	struct crypto_shash *hmacsha256; /* hmac-sha256 hash function */
-	struct crypto_shash *cmacaes; /* block-cipher based MAC function */
-	struct crypto_shash *sha512; /* sha512 hash function */
-	struct sdesc *sdeschmacmd5;  /* ctxt to generate ntlmv2 hash, CR1 */
-	struct sdesc *sdescmd5; /* ctxt to generate cifs/smb signature */
-	struct sdesc *sdeschmacsha256;  /* ctxt to generate smb2 signature */
-	struct sdesc *sdesccmacaes;  /* ctxt to generate smb3 signature */
-	struct sdesc *sdescsha512; /* ctxt to generate smb3.11 signing key */
-	struct crypto_aead *enc; /* smb3 AEAD encryption TFM (AES-CCM and AES-GCM) */
-	struct crypto_aead *dec; /* smb3 AEAD decryption TFM (AES-CCM and AES-GCM) */
+	struct shash_desc *hmacmd5; /* hmacmd5 hash function, for NTLMv2/CR1 hashes */
+	struct shash_desc *md5; /* md5 hash function, for CIFS/SMB1 signatures */
+	struct shash_desc *hmacsha256; /* hmac-sha256 hash function, for SMB2 signatures */
+	struct shash_desc *sha512; /* sha512 hash function, for SMB3.1.1 preauth hash */
+	struct shash_desc *aes_cmac; /* block-cipher based MAC function, for SMB3 signatures */
+
+	struct crypto_aead *enc; /* smb3 encryption AEAD TFM (AES-CCM and AES-GCM) */
+	struct crypto_aead *dec; /* smb3 decryption AEAD TFM (AES-CCM and AES-GCM) */
 };
 
 /* per smb session structure/fields */
@@ -194,6 +187,19 @@ struct cifs_cred {
 	struct cifs_ntace *ntaces;
 	struct cifs_ace *aces;
 };
+
+struct cifs_open_info_data {
+	char *symlink_target;
+	union {
+		struct smb2_file_all_info fi;
+		struct smb311_posix_qinfo posix_fi;
+	};
+};
+
+static inline void cifs_free_open_info(struct cifs_open_info_data *data)
+{
+	kfree(data->symlink_target);
+}
 
 /*
  *****************************************************************
@@ -317,20 +323,20 @@ struct smb_version_operations {
 	int (*is_path_accessible)(const unsigned int, struct cifs_tcon *,
 				  struct cifs_sb_info *, const char *);
 	/* query path data from the server */
-	int (*query_path_info)(const unsigned int, struct cifs_tcon *,
-			       struct cifs_sb_info *, const char *,
-			       FILE_ALL_INFO *, bool *, bool *);
+	int (*query_path_info)(const unsigned int xid, struct cifs_tcon *tcon,
+			       struct cifs_sb_info *cifs_sb, const char *full_path,
+			       struct cifs_open_info_data *data, bool *adjust_tz, bool *reparse);
 	/* query file data from the server */
-	int (*query_file_info)(const unsigned int, struct cifs_tcon *,
-			       struct cifs_fid *, FILE_ALL_INFO *);
+	int (*query_file_info)(const unsigned int xid, struct cifs_tcon *tcon,
+			       struct cifsFileInfo *cfile, struct cifs_open_info_data *data);
 	/* query reparse tag from srv to determine which type of special file */
 	int (*query_reparse_tag)(const unsigned int xid, struct cifs_tcon *tcon,
 				struct cifs_sb_info *cifs_sb, const char *path,
 				__u32 *reparse_tag);
 	/* get server index number */
-	int (*get_srv_inum)(const unsigned int, struct cifs_tcon *,
-			    struct cifs_sb_info *, const char *,
-			    u64 *uniqueid, FILE_ALL_INFO *);
+	int (*get_srv_inum)(const unsigned int xid, struct cifs_tcon *tcon,
+			    struct cifs_sb_info *cifs_sb, const char *full_path, u64 *uniqueid,
+			    struct cifs_open_info_data *data);
 	/* set size by path */
 	int (*set_path_size)(const unsigned int, struct cifs_tcon *,
 			     const char *, __u64, struct cifs_sb_info *, bool);
@@ -379,8 +385,8 @@ struct smb_version_operations {
 			     struct cifs_sb_info *, const char *,
 			     char **, bool);
 	/* open a file for non-posix mounts */
-	int (*open)(const unsigned int, struct cifs_open_parms *,
-		    __u32 *, FILE_ALL_INFO *);
+	int (*open)(const unsigned int xid, struct cifs_open_parms *oparms, __u32 *oplock,
+		    void *buf);
 	/* set fid protocol-specific info */
 	void (*set_fid)(struct cifsFileInfo *, struct cifs_fid *, __u32);
 	/* close a file */
@@ -734,8 +740,6 @@ struct TCP_Server_Info {
 	bool use_swn_dstaddr;
 	struct sockaddr_storage swn_dstaddr;
 #endif
-#ifdef CONFIG_CIFS_DFS_UPCALL
-	bool is_dfs_conn; /* if a dfs connection */
 	struct mutex refpath_lock; /* protects leaf_fullpath */
 	/*
 	 * Canonical DFS full paths that were used to chase referrals in mount and reconnect.
@@ -749,7 +753,6 @@ struct TCP_Server_Info {
 	 * format: \\HOST\SHARE\[OPTIONAL PATH]
 	 */
 	char *origin_fullpath, *leaf_fullpath, *current_fullpath;
-#endif
 };
 
 static inline bool is_smb1(struct TCP_Server_Info *server)
@@ -782,6 +785,7 @@ static inline unsigned int
 in_flight(struct TCP_Server_Info *server)
 {
 	unsigned int num;
+
 	spin_lock(&server->req_lock);
 	num = server->in_flight;
 	spin_unlock(&server->req_lock);
@@ -792,6 +796,7 @@ static inline bool
 has_credits(struct TCP_Server_Info *server, int *credits, int num_credits)
 {
 	int num;
+
 	spin_lock(&server->req_lock);
 	num = *credits;
 	spin_unlock(&server->req_lock);
@@ -1022,7 +1027,7 @@ struct cifs_ses {
 	struct TCP_Server_Info *server;	/* pointer to server info */
 	int ses_count;		/* reference counter */
 	enum ses_status_enum ses_status;  /* updates protected by cifs_tcp_ses_lock */
-	unsigned overrideSecFlg;  /* if non-zero override global sec flags */
+	unsigned int overrideSecFlg; /* if non-zero override global sec flags */
 	char *serverOS;		/* name of operating system underlying server */
 	char *serverNOS;	/* name of network operating system of server */
 	char *serverDomain;	/* security realm of server */
@@ -1096,6 +1101,7 @@ struct cifs_ses {
 	 */
 	unsigned long chans_need_reconnect;
 	/* ========= end: protected by chan_lock ======== */
+	struct cifs_ses *dfs_root_ses;
 };
 
 static inline bool
@@ -1133,6 +1139,7 @@ struct cifs_fattr {
 	struct timespec64 cf_mtime;
 	struct timespec64 cf_ctime;
 	u32             cf_cifstag;
+	char            *cf_symlink_target;
 };
 
 /*
@@ -1377,7 +1384,7 @@ struct cifsFileInfo {
 	__u32 pid;		/* process id who opened file */
 	struct cifs_fid fid;	/* file id from remote */
 	struct list_head rlist; /* reconnect list */
-	/* BB add lock scope info here if needed */ ;
+	/* BB add lock scope info here if needed */
 	/* lock scope id (0 if none) */
 	struct dentry *dentry;
 	struct tcon_link *tlink;
@@ -1395,6 +1402,7 @@ struct cifsFileInfo {
 	struct work_struct put; /* work for the final part of _put */
 	struct delayed_work deferred;
 	bool deferred_close_scheduled; /* Flag to indicate close is scheduled */
+	char *symlink_target;
 };
 
 struct cifs_io_parms {
@@ -1553,6 +1561,7 @@ struct cifsInodeInfo {
 	struct list_head deferred_closes; /* list of deferred closes */
 	spinlock_t deferred_lock; /* protection on deferred list */
 	bool lease_granted; /* Flag to indicate whether lease or oplock is granted. */
+	char *symlink_target;
 };
 
 static inline struct cifsInodeInfo *
@@ -1751,6 +1760,18 @@ struct file_list {
 	struct cifsFileInfo *cfile;
 };
 
+struct cifs_mount_ctx {
+	struct cifs_sb_info *cifs_sb;
+	struct smb3_fs_context *fs_ctx;
+	unsigned int xid;
+	struct TCP_Server_Info *server;
+	struct cifs_ses *ses;
+	struct cifs_tcon *tcon;
+	struct cifs_ses *root_ses;
+	uuid_t mount_id;
+	char *origin_fullpath, *leaf_fullpath;
+};
+
 static inline void free_dfs_info_param(struct dfs_info3_param *param)
 {
 	if (param) {
@@ -1763,6 +1784,7 @@ static inline void free_dfs_info_array(struct dfs_info3_param *param,
 				       int number_of_items)
 {
 	int i;
+
 	if ((number_of_items == 0) || (param == NULL))
 		return;
 	for (i = 0; i < number_of_items; i++) {
@@ -2119,6 +2141,82 @@ static inline size_t ntlmssp_workstation_name_size(const struct cifs_ses *ses)
 	if (ses->server->dialect <= SMB20_PROT_ID)
 		return min_t(size_t, sizeof(ses->workstation_name), RFC1001_NAME_LEN_WITH_NULL);
 	return sizeof(ses->workstation_name);
+}
+
+static inline void move_cifs_info_to_smb2(struct smb2_file_all_info *dst, const FILE_ALL_INFO *src)
+{
+	memcpy(dst, src, (size_t)((u8 *)&src->AccessFlags - (u8 *)src));
+	dst->AccessFlags = src->AccessFlags;
+	dst->CurrentByteOffset = src->CurrentByteOffset;
+	dst->Mode = src->Mode;
+	dst->AlignmentRequirement = src->AlignmentRequirement;
+	dst->FileNameLength = src->FileNameLength;
+}
+
+static inline unsigned int cifs_get_num_sgs(const struct smb_rqst *rqst,
+					    int num_rqst,
+					    const u8 *sig)
+{
+	unsigned int len, skip;
+	unsigned int nents = 0;
+	unsigned long addr;
+	int i, j;
+
+	/* Assumes the first rqst has a transform header as the first iov.
+	 * I.e.
+	 * rqst[0].rq_iov[0]  is transform header
+	 * rqst[0].rq_iov[1+] data to be encrypted/decrypted
+	 * rqst[1+].rq_iov[0+] data to be encrypted/decrypted
+	 */
+	for (i = 0; i < num_rqst; i++) {
+		/*
+		 * The first rqst has a transform header where the
+		 * first 20 bytes are not part of the encrypted blob.
+		 */
+		for (j = 0; j < rqst[i].rq_nvec; j++) {
+			struct kvec *iov = &rqst[i].rq_iov[j];
+
+			skip = (i == 0) && (j == 0) ? 20 : 0;
+			addr = (unsigned long)iov->iov_base + skip;
+			if (unlikely(is_vmalloc_addr((void *)addr))) {
+				len = iov->iov_len - skip;
+				nents += DIV_ROUND_UP(offset_in_page(addr) + len,
+						      PAGE_SIZE);
+			} else {
+				nents++;
+			}
+		}
+		nents += rqst[i].rq_npages;
+	}
+	nents += DIV_ROUND_UP(offset_in_page(sig) + SMB2_SIGNATURE_SIZE, PAGE_SIZE);
+	return nents;
+}
+
+/* We can not use the normal sg_set_buf() as we will sometimes pass a
+ * stack object as buf.
+ */
+static inline struct scatterlist *cifs_sg_set_buf(struct scatterlist *sg,
+						  const void *buf,
+						  unsigned int buflen)
+{
+	unsigned long addr = (unsigned long)buf;
+	unsigned int off = offset_in_page(addr);
+
+	addr &= PAGE_MASK;
+	if (unlikely(is_vmalloc_addr((void *)addr))) {
+		do {
+			unsigned int len = min_t(unsigned int, buflen, PAGE_SIZE - off);
+
+			sg_set_page(sg++, vmalloc_to_page((void *)addr), len, off);
+
+			off = 0;
+			addr += PAGE_SIZE;
+			buflen -= len;
+		} while (buflen);
+	} else {
+		sg_set_page(sg++, virt_to_page(addr), buflen, off);
+	}
+	return sg;
 }
 
 #endif	/* _CIFS_GLOB_H */
