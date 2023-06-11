@@ -886,6 +886,11 @@ static int do_dentry_open(struct file *f,
 			truncate_pagecache(inode, 0);
 	}
 
+	/*
+	 * Once we return a file with FMODE_OPENED, __fput() will call
+	 * fsnotify_close(), so we need fsnotify_open() here for symmetry.
+	 */
+	fsnotify_open(f);
 	return 0;
 
 cleanup_all:
@@ -1270,7 +1275,6 @@ static long do_sys_openat2(int dfd, const char __user *filename,
 			put_unused_fd(fd);
 			fd = PTR_ERR(f);
 		} else {
-			fsnotify_open(f);
 			fd_install(fd, f);
 		}
 	}
