@@ -1109,7 +1109,7 @@ int cxl_mem_sanitize(struct cxl_dev_state *cxlds, u16 cmd)
 	struct cxl_mbox_cmd mbox_cmd = { .opcode = cmd };
 	struct cxl_memdev_state *mds = to_cxl_memdev_state(cxlds);
 
-	if (cmd != CXL_MBOX_OP_SANITIZE)
+	if (cmd != CXL_MBOX_OP_SANITIZE && cmd != CXL_MBOX_OP_SECURE_ERASE)
 		return -EINVAL;
 
 	rc = cxl_internal_send_cmd(mds, &sec_cmd);
@@ -1125,6 +1125,10 @@ int cxl_mem_sanitize(struct cxl_dev_state *cxlds, u16 cmd)
 	 */
 	sec_out = le32_to_cpu(out.flags);
 	if (sec_out & CXL_PMEM_SEC_STATE_USER_PASS_SET)
+		return -EINVAL;
+
+	if (cmd == CXL_MBOX_OP_SECURE_ERASE &&
+	    sec_out & CXL_PMEM_SEC_STATE_LOCKED)
 		return -EINVAL;
 
 	rc = cxl_internal_send_cmd(mds, &mbox_cmd);
