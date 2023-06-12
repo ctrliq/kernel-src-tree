@@ -2,12 +2,14 @@
 #include <linux/bitops.h>
 #include <linux/types.h>
 #include <linux/slab.h>
+#include <linux/sched/clock.h>
 
 #include <asm/cpu_entry_area.h>
 #include <asm/perf_event.h>
 #include <asm/tlbflush.h>
 #include <asm/insn.h>
 #include <asm/io.h>
+#include <asm/timer.h>
 
 #include "../perf_event.h"
 
@@ -982,8 +984,13 @@ struct event_constraint intel_icl_pebs_event_constraints[] = {
 	INTEL_FLAGS_UEVENT_CONSTRAINT(0x0400, 0x800000000ULL),	/* SLOTS */
 
 	INTEL_PLD_CONSTRAINT(0x1cd, 0xff),			/* MEM_TRANS_RETIRED.LOAD_LATENCY */
-	INTEL_FLAGS_UEVENT_CONSTRAINT_DATALA_LD(0x1d0, 0xf),	/* MEM_INST_RETIRED.LOAD */
-	INTEL_FLAGS_UEVENT_CONSTRAINT_DATALA_ST(0x2d0, 0xf),	/* MEM_INST_RETIRED.STORE */
+	INTEL_FLAGS_UEVENT_CONSTRAINT_DATALA_LD(0x11d0, 0xf),	/* MEM_INST_RETIRED.STLB_MISS_LOADS */
+	INTEL_FLAGS_UEVENT_CONSTRAINT_DATALA_ST(0x12d0, 0xf),	/* MEM_INST_RETIRED.STLB_MISS_STORES */
+	INTEL_FLAGS_UEVENT_CONSTRAINT_DATALA_LD(0x21d0, 0xf),	/* MEM_INST_RETIRED.LOCK_LOADS */
+	INTEL_FLAGS_UEVENT_CONSTRAINT_DATALA_LD(0x41d0, 0xf),	/* MEM_INST_RETIRED.SPLIT_LOADS */
+	INTEL_FLAGS_UEVENT_CONSTRAINT_DATALA_ST(0x42d0, 0xf),	/* MEM_INST_RETIRED.SPLIT_STORES */
+	INTEL_FLAGS_UEVENT_CONSTRAINT_DATALA_LD(0x81d0, 0xf),	/* MEM_INST_RETIRED.ALL_LOADS */
+	INTEL_FLAGS_UEVENT_CONSTRAINT_DATALA_ST(0x82d0, 0xf),	/* MEM_INST_RETIRED.ALL_STORES */
 
 	INTEL_FLAGS_EVENT_CONSTRAINT_DATALA_LD_RANGE(0xd1, 0xd4, 0xf), /* MEM_LOAD_*_RETIRED.* */
 
@@ -1004,8 +1011,13 @@ struct event_constraint intel_spr_pebs_event_constraints[] = {
 	INTEL_FLAGS_EVENT_CONSTRAINT(0xc0, 0xfe),
 	INTEL_PLD_CONSTRAINT(0x1cd, 0xfe),
 	INTEL_PSD_CONSTRAINT(0x2cd, 0x1),
-	INTEL_FLAGS_UEVENT_CONSTRAINT_DATALA_LD(0x1d0, 0xf),
-	INTEL_FLAGS_UEVENT_CONSTRAINT_DATALA_ST(0x2d0, 0xf),
+	INTEL_FLAGS_UEVENT_CONSTRAINT_DATALA_LD(0x11d0, 0xf),	/* MEM_INST_RETIRED.STLB_MISS_LOADS */
+	INTEL_FLAGS_UEVENT_CONSTRAINT_DATALA_ST(0x12d0, 0xf),	/* MEM_INST_RETIRED.STLB_MISS_STORES */
+	INTEL_FLAGS_UEVENT_CONSTRAINT_DATALA_LD(0x21d0, 0xf),	/* MEM_INST_RETIRED.LOCK_LOADS */
+	INTEL_FLAGS_UEVENT_CONSTRAINT_DATALA_LD(0x41d0, 0xf),	/* MEM_INST_RETIRED.SPLIT_LOADS */
+	INTEL_FLAGS_UEVENT_CONSTRAINT_DATALA_ST(0x42d0, 0xf),	/* MEM_INST_RETIRED.SPLIT_STORES */
+	INTEL_FLAGS_UEVENT_CONSTRAINT_DATALA_LD(0x81d0, 0xf),	/* MEM_INST_RETIRED.ALL_LOADS */
+	INTEL_FLAGS_UEVENT_CONSTRAINT_DATALA_ST(0x82d0, 0xf),	/* MEM_INST_RETIRED.ALL_STORES */
 
 	INTEL_FLAGS_EVENT_CONSTRAINT_DATALA_LD_RANGE(0xd1, 0xd4, 0xf),
 
@@ -1059,7 +1071,7 @@ static inline bool pebs_needs_sched_cb(struct cpu_hw_events *cpuc)
 	return cpuc->n_pebs && (cpuc->n_pebs == cpuc->n_large_pebs);
 }
 
-void intel_pmu_pebs_sched_task(struct perf_event_context *ctx, bool sched_in)
+void intel_pmu_pebs_sched_task(struct perf_event_pmu_context *pmu_ctx, bool sched_in)
 {
 	struct cpu_hw_events *cpuc = this_cpu_ptr(&cpu_hw_events);
 
@@ -1167,7 +1179,7 @@ static void
 pebs_update_state(bool needed_cb, struct cpu_hw_events *cpuc,
 		  struct perf_event *event, bool add)
 {
-	struct pmu *pmu = event->ctx->pmu;
+	struct pmu *pmu = event->pmu;
 	/*
 	 * Make sure we get updated with the first PEBS
 	 * event. It will trigger also during removal, but
@@ -1509,6 +1521,27 @@ static u64 get_data_src(struct perf_event *event, u64 aux)
 	return val;
 }
 
+static void setup_pebs_time(struct perf_event *event,
+			    struct perf_sample_data *data,
+			    u64 tsc)
+{
+	/* Converting to a user-defined clock is not supported yet. */
+	if (event->attr.use_clockid != 0)
+		return;
+
+	/*
+	 * Doesn't support the conversion when the TSC is unstable.
+	 * The TSC unstable case is a corner case and very unlikely to
+	 * happen. If it happens, the TSC in a PEBS record will be
+	 * dropped and fall back to perf_event_clock().
+	 */
+	if (!using_native_sched_clock() || !sched_clock_stable())
+		return;
+
+	data->time = native_sched_clock_from_tsc(tsc) + __sched_clock_offset;
+	data->sample_flags |= PERF_SAMPLE_TIME;
+}
+
 #define PERF_SAMPLE_ADDR_TYPE	(PERF_SAMPLE_ADDR |		\
 				 PERF_SAMPLE_PHYS_ADDR |	\
 				 PERF_SAMPLE_DATA_PAGE_SIZE)
@@ -1540,14 +1573,18 @@ static void setup_pebs_fixed_sample_data(struct perf_event *event,
 	/*
 	 * Use latency for weight (only avail with PEBS-LL)
 	 */
-	if (fll && (sample_type & PERF_SAMPLE_WEIGHT_TYPE))
+	if (fll && (sample_type & PERF_SAMPLE_WEIGHT_TYPE)) {
 		data->weight.full = pebs->lat;
+		data->sample_flags |= PERF_SAMPLE_WEIGHT_TYPE;
+	}
 
 	/*
 	 * data.data_src encodes the data source
 	 */
-	if (sample_type & PERF_SAMPLE_DATA_SRC)
+	if (sample_type & PERF_SAMPLE_DATA_SRC) {
 		data->data_src.val = get_data_src(event, pebs->dse);
+		data->sample_flags |= PERF_SAMPLE_DATA_SRC;
+	}
 
 	/*
 	 * We must however always use iregs for the unwinder to stay sane; the
@@ -1555,8 +1592,10 @@ static void setup_pebs_fixed_sample_data(struct perf_event *event,
 	 * previous PMI context or an (I)RET happened between the record and
 	 * PMI.
 	 */
-	if (sample_type & PERF_SAMPLE_CALLCHAIN)
+	if (sample_type & PERF_SAMPLE_CALLCHAIN) {
 		data->callchain = perf_callchain(event, iregs);
+		data->sample_flags |= PERF_SAMPLE_CALLCHAIN;
+	}
 
 	/*
 	 * We use the interrupt regs as a base because the PEBS record does not
@@ -1628,17 +1667,22 @@ static void setup_pebs_fixed_sample_data(struct perf_event *event,
 
 
 	if ((sample_type & PERF_SAMPLE_ADDR_TYPE) &&
-	    x86_pmu.intel_cap.pebs_format >= 1)
+	    x86_pmu.intel_cap.pebs_format >= 1) {
 		data->addr = pebs->dla;
+		data->sample_flags |= PERF_SAMPLE_ADDR;
+	}
 
 	if (x86_pmu.intel_cap.pebs_format >= 2) {
 		/* Only set the TSX weight when no memory weight. */
-		if ((sample_type & PERF_SAMPLE_WEIGHT_TYPE) && !fll)
+		if ((sample_type & PERF_SAMPLE_WEIGHT_TYPE) && !fll) {
 			data->weight.full = intel_get_tsx_weight(pebs->tsx_tuning);
-
-		if (sample_type & PERF_SAMPLE_TRANSACTION)
+			data->sample_flags |= PERF_SAMPLE_WEIGHT_TYPE;
+		}
+		if (sample_type & PERF_SAMPLE_TRANSACTION) {
 			data->txn = intel_get_tsx_transaction(pebs->tsx_tuning,
 							      pebs->ax);
+			data->sample_flags |= PERF_SAMPLE_TRANSACTION;
+		}
 	}
 
 	/*
@@ -1647,12 +1691,13 @@ static void setup_pebs_fixed_sample_data(struct perf_event *event,
 	 *
 	 * We can only do this for the default trace clock.
 	 */
-	if (x86_pmu.intel_cap.pebs_format >= 3 &&
-		event->attr.use_clockid == 0)
-		data->time = native_sched_clock_from_tsc(pebs->tsc);
+	if (x86_pmu.intel_cap.pebs_format >= 3)
+		setup_pebs_time(event, data, pebs->tsc);
 
-	if (has_branch_stack(event))
+	if (has_branch_stack(event)) {
 		data->br_stack = &cpuc->lbr_stack;
+		data->sample_flags |= PERF_SAMPLE_BRANCH_STACK;
+	}
 }
 
 static void adaptive_pebs_save_regs(struct pt_regs *regs,
@@ -1710,8 +1755,7 @@ static void setup_pebs_adaptive_sample_data(struct perf_event *event,
 	perf_sample_data_init(data, 0, event->hw.last_period);
 	data->period = event->hw.last_period;
 
-	if (event->attr.use_clockid == 0)
-		data->time = native_sched_clock_from_tsc(basic->tsc);
+	setup_pebs_time(event, data, basic->tsc);
 
 	/*
 	 * We must however always use iregs for the unwinder to stay sane; the
@@ -1719,8 +1763,10 @@ static void setup_pebs_adaptive_sample_data(struct perf_event *event,
 	 * previous PMI context or an (I)RET happened between the record and
 	 * PMI.
 	 */
-	if (sample_type & PERF_SAMPLE_CALLCHAIN)
+	if (sample_type & PERF_SAMPLE_CALLCHAIN) {
 		data->callchain = perf_callchain(event, iregs);
+		data->sample_flags |= PERF_SAMPLE_CALLCHAIN;
+	}
 
 	*regs = *iregs;
 	/* The ip in basic is EventingIP */
@@ -1771,17 +1817,24 @@ static void setup_pebs_adaptive_sample_data(struct perf_event *event,
 				data->weight.var1_dw = (u32)(weight & PEBS_LATENCY_MASK) ?:
 					intel_get_tsx_weight(meminfo->tsx_tuning);
 			}
+			data->sample_flags |= PERF_SAMPLE_WEIGHT_TYPE;
 		}
 
-		if (sample_type & PERF_SAMPLE_DATA_SRC)
+		if (sample_type & PERF_SAMPLE_DATA_SRC) {
 			data->data_src.val = get_data_src(event, meminfo->aux);
+			data->sample_flags |= PERF_SAMPLE_DATA_SRC;
+		}
 
-		if (sample_type & PERF_SAMPLE_ADDR_TYPE)
+		if (sample_type & PERF_SAMPLE_ADDR_TYPE) {
 			data->addr = meminfo->address;
+			data->sample_flags |= PERF_SAMPLE_ADDR;
+		}
 
-		if (sample_type & PERF_SAMPLE_TRANSACTION)
+		if (sample_type & PERF_SAMPLE_TRANSACTION) {
 			data->txn = intel_get_tsx_transaction(meminfo->tsx_tuning,
 							  gprs ? gprs->ax : 0);
+			data->sample_flags |= PERF_SAMPLE_TRANSACTION;
+		}
 	}
 
 	if (format_size & PEBS_DATACFG_XMMS) {
@@ -1800,6 +1853,7 @@ static void setup_pebs_adaptive_sample_data(struct perf_event *event,
 		if (has_branch_stack(event)) {
 			intel_pmu_store_pebs_lbrs(lbr);
 			data->br_stack = &cpuc->lbr_stack;
+			data->sample_flags |= PERF_SAMPLE_BRANCH_STACK;
 		}
 	}
 

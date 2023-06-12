@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0
 #include <errno.h>
+#include <signal.h>
 #include <inttypes.h>
 #include <linux/err.h>
 #include <linux/kernel.h>
@@ -313,7 +314,9 @@ void perf_session__delete(struct perf_session *session)
 			evlist__delete(session->evlist);
 		perf_data__close(session->data);
 	}
+#ifdef HAVE_LIBTRACEEVENT
 	trace_event__cleanup(&session->tevent);
+#endif
 	free(session);
 }
 
@@ -943,6 +946,11 @@ static void perf_event__cpu_map_swap(union perf_event *event,
 		default:
 			pr_err("cpu_map swap: unsupported long size\n");
 		}
+		break;
+	case PERF_CPU_MAP__RANGE_CPUS:
+		data->range_cpu_data.start_cpu = bswap_16(data->range_cpu_data.start_cpu);
+		data->range_cpu_data.end_cpu = bswap_16(data->range_cpu_data.end_cpu);
+		break;
 	default:
 		break;
 	}
@@ -1180,7 +1188,7 @@ static void branch_stack__printf(struct perf_sample *sample, bool callstack)
 				e->flags.abort ? "A" : " ",
 				e->flags.in_tx ? "T" : " ",
 				(unsigned)e->flags.reserved,
-				e->flags.type ? branch_type_name(e->flags.type) : "");
+				get_branch_type(e));
 		} else {
 			if (i == 0) {
 				printf("..... %2"PRIu64": %016" PRIx64 "\n"
@@ -2017,7 +2025,7 @@ static int perf_session__flush_thread_stacks(struct perf_session *session)
 					 NULL);
 }
 
-volatile int session_done;
+volatile sig_atomic_t session_done;
 
 static int __perf_session__process_decomp_events(struct perf_session *session);
 
@@ -2743,7 +2751,7 @@ int perf_session__cpu_bitmap(struct perf_session *session,
 			goto out_delete_map;
 		}
 
-		set_bit(cpu.cpu, cpu_bitmap);
+		__set_bit(cpu.cpu, cpu_bitmap);
 	}
 
 	err = 0;
