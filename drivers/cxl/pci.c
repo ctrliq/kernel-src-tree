@@ -120,9 +120,11 @@ static irqreturn_t cxl_pci_mbox_irq(int irq, void *id)
 	struct cxl_dev_state *cxlds = dev_id->cxlds;
 	struct cxl_memdev_state *mds = to_cxl_memdev_state(cxlds);
 
+	if (!cxl_mbox_background_complete(cxlds))
+		return IRQ_NONE;
+
 	/* short-circuit the wait in __cxl_pci_mbox_send_cmd() */
-	if (cxl_mbox_background_complete(cxlds))
-		rcuwait_wake_up(&mds->mbox_wait);
+	rcuwait_wake_up(&mds->mbox_wait);
 
 	return IRQ_HANDLED;
 }
