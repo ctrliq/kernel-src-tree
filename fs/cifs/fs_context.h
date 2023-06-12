@@ -62,6 +62,7 @@ enum cifs_param {
 	Opt_noblocksend,
 	Opt_noautotune,
 	Opt_nolease,
+	Opt_nosparse,
 	Opt_hard,
 	Opt_soft,
 	Opt_perm,
@@ -223,6 +224,7 @@ struct smb3_fs_context {
 	bool noautotune:1;
 	bool nostrictsync:1; /* do not force expensive SMBflush on every sync */
 	bool no_lease:1;     /* disable requesting leases */
+	bool no_sparse:1;    /* do not attempt to set files sparse */
 	bool fsc:1;	/* enable fscache */
 	bool mfsymlinks:1; /* use Minshall+French Symlinks */
 	bool multiuser:1;
@@ -262,8 +264,7 @@ struct smb3_fs_context {
 	__u16 compression; /* compression algorithm 0xFFFF default 0=disabled */
 	bool rootfs:1; /* if it's a SMB root file system */
 	bool witness:1; /* use witness protocol */
-
-	char *mount_options;
+	char *leaf_fullpath;
 };
 
 extern const struct fs_parameter_spec smb3_fs_parameters[];
