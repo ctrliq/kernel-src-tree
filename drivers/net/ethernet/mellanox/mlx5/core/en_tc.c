@@ -4080,7 +4080,7 @@ parse_tc_actions(struct mlx5e_tc_act_parse_state *parse_state,
 	struct mlx5e_priv *priv = flow->priv;
 	struct flow_action_entry *act, **_act;
 	struct mlx5e_tc_act *tc_act;
-	int err, i;
+	int err, i, i_split = 0;
 
 	flow_action_reorder.num_entries = flow_action->num_entries;
 	flow_action_reorder.entries = kcalloc(flow_action->num_entries,
@@ -4127,7 +4127,8 @@ parse_tc_actions(struct mlx5e_tc_act_parse_state *parse_state,
 		    (tc_act->is_multi_table_act &&
 		    tc_act->is_multi_table_act(priv, act, attr) &&
 		    i < flow_action_reorder.num_entries - 1)) {
-			err = mlx5e_tc_act_post_parse(parse_state, flow_action, attr, ns_type);
+			err = mlx5e_tc_act_post_parse(parse_state, flow_action, i_split, i, attr,
+						      ns_type);
 			if (err)
 				goto out_free;
 
@@ -4137,13 +4138,14 @@ parse_tc_actions(struct mlx5e_tc_act_parse_state *parse_state,
 				goto out_free;
 			}
 
+			i_split = i + 1;
 			list_add(&attr->list, &flow->attrs);
 		}
 	}
 
 	kfree(flow_action_reorder.entries);
 
-	err = mlx5e_tc_act_post_parse(parse_state, flow_action, attr, ns_type);
+	err = mlx5e_tc_act_post_parse(parse_state, flow_action, i_split, i, attr, ns_type);
 	if (err)
 		goto out_free_post_acts;
 
