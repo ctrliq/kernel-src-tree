@@ -5,12 +5,22 @@
 #include <linux/list.h>
 #include <linux/rbtree.h>
 
+struct lock_filter {
+	int			nr_types;
+	int			nr_addrs;
+	int			nr_syms;
+	unsigned int		*types;
+	unsigned long		*addrs;
+	char			**syms;
+};
+
 struct lock_stat {
 	struct hlist_node	hash_entry;
 	struct rb_node		rb;		/* used for sorting */
 
 	u64			addr;		/* address of lockdep_map, used as ID */
 	char			*name;		/* for strcpy(), we cannot use const */
+	u64			*callstack;
 
 	unsigned int		nr_acquire;
 	unsigned int		nr_acquired;
@@ -90,7 +100,7 @@ struct thread_stat {
  * Number of stack trace entries to skip when finding callers.
  * The first few entries belong to the locking implementation itself.
  */
-#define CONTENTION_STACK_SKIP  3
+#define CONTENTION_STACK_SKIP  4
 
 /*
  * flags for lock:contention_begin
@@ -112,8 +122,12 @@ struct lock_contention {
 	struct target *target;
 	struct machine *machine;
 	struct hlist_head *result;
+	struct lock_filter *filters;
 	unsigned long map_nr_entries;
 	int lost;
+	int max_stack;
+	int stack_skip;
+	int aggr_mode;
 };
 
 #ifdef HAVE_BPF_SKEL
@@ -141,7 +155,5 @@ static inline int lock_contention_read(struct lock_contention *con __maybe_unuse
 }
 
 #endif  /* HAVE_BPF_SKEL */
-
-bool is_lock_function(struct machine *machine, u64 addr);
 
 #endif  /* PERF_LOCK_CONTENTION_H */
