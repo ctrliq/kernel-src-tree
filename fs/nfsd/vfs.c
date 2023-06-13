@@ -2171,7 +2171,7 @@ nfsd_getxattr(struct svc_rqst *rqstp, struct svc_fh *fhp, char *name,
 		goto out;
 	}
 
-	buf = kvmalloc(len, GFP_KERNEL | GFP_NOFS);
+	buf = kvmalloc(len, GFP_KERNEL);
 	if (buf == NULL) {
 		err = nfserr_jukebox;
 		goto out;
@@ -2234,10 +2234,7 @@ nfsd_listxattr(struct svc_rqst *rqstp, struct svc_fh *fhp, char **bufp,
 		goto out;
 	}
 
-	/*
-	 * We're holding i_rwsem - use GFP_NOFS.
-	 */
-	buf = kvmalloc(len, GFP_KERNEL | GFP_NOFS);
+	buf = kvmalloc(len, GFP_KERNEL);
 	if (buf == NULL) {
 		err = nfserr_jukebox;
 		goto out;
