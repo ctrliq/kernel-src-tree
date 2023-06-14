@@ -807,7 +807,11 @@ stackp-flags-$(CONFIG_STACKPROTECTOR_STRONG)      := -fstack-protector-strong
 
 KBUILD_CFLAGS += $(stackp-flags-y)
 
+# don't enforce WERROR for out of tree modules
+ifeq ($(KBUILD_EXTMOD),)
 KBUILD_CFLAGS-$(CONFIG_WERROR) += -Werror
+endif
+
 KBUILD_CFLAGS-$(CONFIG_CC_NO_ARRAY_BOUNDS) += -Wno-array-bounds
 KBUILD_CFLAGS += $(KBUILD_CFLAGS-y) $(CONFIG_CC_IMPLICIT_FALLTHROUGH)
 
