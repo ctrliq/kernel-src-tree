@@ -522,8 +522,8 @@ static void count_tx(struct net_device *dev, int ret, int len)
 		struct pcpu_sw_netstats *stats = this_cpu_ptr(dev->tstats);
 
 		u64_stats_update_begin(&stats->syncp);
-		stats->tx_packets++;
-		stats->tx_bytes += len;
+		u64_stats_inc(&stats->tx_packets);
+		u64_stats_add(&stats->tx_bytes, len);
 		u64_stats_update_end(&stats->syncp);
 	}
 }
@@ -830,8 +830,8 @@ static void count_rx(struct net_device *dev, int len)
 	struct pcpu_sw_netstats *stats = this_cpu_ptr(dev->tstats);
 
 	u64_stats_update_begin(&stats->syncp);
-	stats->rx_packets++;
-	stats->rx_bytes += len;
+	u64_stats_inc(&stats->rx_packets);
+	u64_stats_add(&stats->rx_bytes, len);
 	u64_stats_update_end(&stats->syncp);
 }
 
@@ -2796,9 +2796,9 @@ static void get_rx_sc_stats(struct net_device *dev,
 
 		stats = per_cpu_ptr(rx_sc->stats, cpu);
 		do {
-			start = u64_stats_fetch_begin_irq(&stats->syncp);
+			start = u64_stats_fetch_begin(&stats->syncp);
 			memcpy(&tmp, &stats->stats, sizeof(tmp));
-		} while (u64_stats_fetch_retry_irq(&stats->syncp, start));
+		} while (u64_stats_fetch_retry(&stats->syncp, start));
 
 		sum->InOctetsValidated += tmp.InOctetsValidated;
 		sum->InOctetsDecrypted += tmp.InOctetsDecrypted;
@@ -2877,9 +2877,9 @@ static void get_tx_sc_stats(struct net_device *dev,
 
 		stats = per_cpu_ptr(macsec_priv(dev)->secy.tx_sc.stats, cpu);
 		do {
-			start = u64_stats_fetch_begin_irq(&stats->syncp);
+			start = u64_stats_fetch_begin(&stats->syncp);
 			memcpy(&tmp, &stats->stats, sizeof(tmp));
-		} while (u64_stats_fetch_retry_irq(&stats->syncp, start));
+		} while (u64_stats_fetch_retry(&stats->syncp, start));
 
 		sum->OutPktsProtected   += tmp.OutPktsProtected;
 		sum->OutPktsEncrypted   += tmp.OutPktsEncrypted;
@@ -2933,9 +2933,9 @@ static void get_secy_stats(struct net_device *dev, struct macsec_dev_stats *sum)
 
 		stats = per_cpu_ptr(macsec_priv(dev)->stats, cpu);
 		do {
-			start = u64_stats_fetch_begin_irq(&stats->syncp);
+			start = u64_stats_fetch_begin(&stats->syncp);
 			memcpy(&tmp, &stats->stats, sizeof(tmp));
-		} while (u64_stats_fetch_retry_irq(&stats->syncp, start));
+		} while (u64_stats_fetch_retry(&stats->syncp, start));
 
 		sum->OutPktsUntagged  += tmp.OutPktsUntagged;
 		sum->InPktsUntagged   += tmp.InPktsUntagged;
