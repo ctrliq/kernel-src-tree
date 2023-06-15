@@ -42,7 +42,7 @@
 #if IS_ENABLED(CONFIG_NF_CONNTRACK)
 #include <linux/netfilter/nf_conntrack_common.h>
 #endif
-#include <net/dropreason.h>
+#include <net/dropreason-core.h>
 
 /* The interface for checksum offload between the stack and networking drivers
  * is as follows...
@@ -261,6 +261,7 @@ struct nf_bridge_info {
 	u8			pkt_otherhost:1;
 	u8			in_prerouting:1;
 	u8			bridged_dnat:1;
+	u8			sabotage_in_done:1;
 	__u16			frag_max_size;
 	struct net_device	*physindev;
 
@@ -2491,27 +2492,33 @@ void *skb_pull_data(struct sk_buff *skb, size_t len);
 
 void *__pskb_pull_tail(struct sk_buff *skb, int delta);
 
-static inline void *__pskb_pull(struct sk_buff *skb, unsigned int len)
+static inline enum skb_drop_reason
+pskb_may_pull_reason(struct sk_buff *skb, unsigned int len)
 {
-	if (len > skb_headlen(skb) &&
-	    !__pskb_pull_tail(skb, len - skb_headlen(skb)))
-		return NULL;
-	skb->len -= len;
-	return skb->data += len;
-}
+	if (likely(len <= skb_headlen(skb)))
+		return SKB_NOT_DROPPED_YET;
 
-static inline void *pskb_pull(struct sk_buff *skb, unsigned int len)
-{
-	return unlikely(len > skb->len) ? NULL : __pskb_pull(skb, len);
+	if (unlikely(len > skb->len))
+		return SKB_DROP_REASON_PKT_TOO_SMALL;
+
+	if (unlikely(!__pskb_pull_tail(skb, len - skb_headlen(skb))))
+		return SKB_DROP_REASON_NOMEM;
+
+	return SKB_NOT_DROPPED_YET;
 }
 
 static inline bool pskb_may_pull(struct sk_buff *skb, unsigned int len)
 {
-	if (likely(len <= skb_headlen(skb)))
-		return true;
-	if (unlikely(len > skb->len))
-		return false;
-	return __pskb_pull_tail(skb, len - skb_headlen(skb)) != NULL;
+	return pskb_may_pull_reason(skb, len) == SKB_NOT_DROPPED_YET;
+}
+
+static inline void *pskb_pull(struct sk_buff *skb, unsigned int len)
+{
+	if (!pskb_may_pull(skb, len))
+		return NULL;
+
+	skb->len -= len;
+	return skb->data += len;
 }
 
 void skb_condense(struct sk_buff *skb);
