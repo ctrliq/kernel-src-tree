@@ -200,13 +200,13 @@ void __iomem *devm_cxl_iomap_block(struct device *dev, resource_size_t addr,
 	return ret_val;
 }
 
-int cxl_map_component_regs(struct cxl_register_map *map,
+int cxl_map_component_regs(const struct cxl_register_map *map,
 			   struct cxl_component_regs *regs,
 			   unsigned long map_mask)
 {
 	struct device *host = map->host;
 	struct mapinfo {
-		struct cxl_reg_map *rmap;
+		const struct cxl_reg_map *rmap;
 		void __iomem **addr;
 	} mapinfo[] = {
 		{ &map->component_map.hdm_decoder, &regs->hdm_decoder },
@@ -234,13 +234,13 @@ int cxl_map_component_regs(struct cxl_register_map *map,
 }
 EXPORT_SYMBOL_NS_GPL(cxl_map_component_regs, CXL);
 
-int cxl_map_device_regs(struct cxl_register_map *map,
+int cxl_map_device_regs(const struct cxl_register_map *map,
 			struct cxl_device_regs *regs)
 {
 	struct device *host = map->host;
 	resource_size_t phys_addr = map->resource;
 	struct mapinfo {
-		struct cxl_reg_map *rmap;
+		const struct cxl_reg_map *rmap;
 		void __iomem **addr;
 	} mapinfo[] = {
 		{ &map->device_map.status, &regs->status, },
