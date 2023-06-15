@@ -8,10 +8,10 @@
 # $5: package name
 # shellcheck disable=SC2164
 
-autosig_branch=$1;
-autosig_cache=$2;
-autosig_tmp=$3;
-autosig_tarball=$4;
+automotive_branch=$1;
+automotive_cache=$2;
+automotive_tmp=$3;
+automotive_tarball=$4;
 package_name=$5;
 stamp_version=$6;
 pkgrelease=$7;
@@ -42,13 +42,18 @@ function upload_sources()
 	# Uploading the tarball only using CentOS tools (uses the old lookaside cache)
 	echo "Cloning the centos common repository";
 	git clone https://git.centos.org/centos-git-common.git centos-git-common >/dev/null || die "Unable to clone centos tools";
-	./centos-git-common/lookaside_upload -f $autosig_tarball -n $package_name -b $autosig_branch;
+
+	[ -n "$RH_DIST_GIT_TEST" ] && return
+
+	./centos-git-common/lookaside_upload -f $automotive_tarball -n $package_name -b $automotive_branch;
 }
 
 # Upload the tarball to the lookaside cache (not using the tools)
 function upload()
 {
 	test -a ~/.centos.cert || die "Client certificate required. See: https://wiki.centos.org/Authentication"
+
+	[ -n "$RH_DIST_GIT_TEST" ] && return
 
 	# Until the centos-git-common project is updated, upload the tarball manually.
 	curl ${lookaside_url} \
@@ -57,7 +62,7 @@ function upload()
 		--form "name=${package_name}" \
 		--form "hash=${hashtype}" \
 		--form "${hashtype}sum=${sha}" \
-		--form "file=@${autosig_tarball}" \
+		--form "file=@${automotive_tarball}" \
 		--progress-bar | tee /dev/null
 }
 
@@ -65,11 +70,11 @@ function update_distgit()
 {
 	# Cloning the dist-git repo
 	echo "Cloning $package_name dist-git repository";
-	git clone -b $autosig_branch $distgit $tmpdir/$package_name >/dev/null || die "Unable to clone $distgit";
+	git clone -b $automotive_branch $distgit $tmpdir/$package_name >/dev/null || die "Unable to clone $distgit";
 
 	# Copy all the new sources (including SPEC) except the big tarball, but use it as a reference
 	rm -f "$tmpdir/$package_name/*" &> /dev/null; # Replaces everything, git will know if a file changes
-	tarball_name=$(basename -- "$autosig_tarball");
+	tarball_name=$(basename -- "$automotive_tarball");
 	find "$redhat"/rpm/SOURCES/ \
 		\( ! -name "${tarball_name}" \) \
 		\( ! -name "*.tar.bz2" \) \
@@ -98,12 +103,12 @@ function create_changelog()
 	sed -i "/^Resolves: /d" "$tmpdir"/changelog;
 }
 
-sha=($(${hashtype}sum $autosig_tarball))
-test -n "$sha" || die "Could not generate the file hash. Does $autosig_tarball exist?"
+sha=($(${hashtype}sum $automotive_tarball))
+test -n "$sha" || die "Could not generate the file hash. Does $automotive_tarball exist?"
 
 # Create a directory for staging dist-git changes
 date=$(date +"%Y-%m-%d");
-tmpdir="$(mktemp -d --tmpdir="$autosig_tmp" AUTOSIG."$date".XXXXXXXX)";
+tmpdir="$(mktemp -d --tmpdir="$automotive_tmp" AUTOMOTIVE."$date".XXXXXXXX)";
 test -d $tmpdir || die "Unable to create temporary directory";
 
 # update the dist-git repo
