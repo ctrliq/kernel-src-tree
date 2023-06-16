@@ -73,42 +73,40 @@ new_head="$(git rev-parse HEAD)"
 
 if test "$CONFIGS_ADDED"; then
 	./redhat/scripts/genspec/gen_config_patches.sh
+        PUSH_VERB="Pushing"
 else
 	printf "No new configuration values exposed from merging %s into $BRANCH\n" "$UPSTREAM_REF"
+        PUSH_VERB="To push"
 fi
 
-if test -n "$DIST_PUSH"; then
-        tmpfile=".push-warnings"
-	touch $tmpfile
+echo
+PUSH_STR="branch ${BRANCH} to ${GITLAB_URL}"
+PUSH_CMD="git push gitlab ${BRANCH}"
+PUSH_CONFIG_STR="config update branches"
+PUSH_CONFIG_CMD="for branch in \$(git branch | grep configs/\"\$(date +%F)\"); do
+	git push \\
+		-o merge_request.create \\
+		-o merge_request.target=\"$BRANCH\" \\
+		-o merge_request.remove_source_branch \\
+		gitlab \"\$branch\" 2>&1 | tee -a $TMPFILE
+done
+"
 
-	echo "Pushing branch $(git branch --show-current) to $(git remote get-url gitlab)"
-	git push gitlab HEAD
+#Push branch
+echo "# $PUSH_VERB $PUSH_STR"
+echo "$PUSH_CMD"
+test "$TO_PUSH" && eval "$PUSH_CMD"
 
-	echo "Pushing config update branches"
-	for branch in $(git branch | grep configs/"$(date +%F)"); do
-		git push \
- 			-o merge_request.create \
-			-o merge_request.target="$BRANCH" \
-			-o merge_request.remove_source_branch \
-			gitlab "$branch" 2>&1 | tee -a $tmpfile
-	done
-
-	# GitLab server side warnings do not fail git-push but leave verbose
-	# WARNING messages.  Grep for those and consider it a script
-	# failure.  Make sure all branches are pushed first as follow up
-	# git-pushes may succeed.
-	grep -q "remote:[ ]* WARNINGS" $tmpfile && RC=1 || RC=0
-	rm $tmpfile
-	test $RC && exit $RC
-else
-	printf "
-To push all the release artifacts, run:
-
-git push gitlab HEAD
-for branch in \$(git branch | grep configs/\"\$(date +%%F)\"); do
-\tgit push -o merge_request.create -o merge_request.target=$BRANCH\
- -o merge_request.remove_source_branch upstream gitlab \"\$branch\"
-done\n"
-
+#Push config branches if created
+if test "$CONFIGS_ADDED"; then
+	echo
+	echo "# $PUSH_VERB $PUSH_CONFIG_STR"
+	echo "$PUSH_CONFIG_CMD"
+	test "$TO_PUSH" && eval "$PUSH_CONFIG_CMD"
 fi
 
+# GitLab server side warnings do not fail git-push but leave verbose
+# WARNING messages.  Grep for those and consider it a script
+# failure.  Make sure all branches are pushed first as follow up
+# git-pushes may succeed.
+grep -q "remote:[ ]* WARNINGS" $TMPFILE && die "Server side warnings"
