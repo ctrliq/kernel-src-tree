@@ -37,7 +37,7 @@ if test "$old_head" == "$new_head"; then
 fi
 
 make dist-release-tag
-RELEASE=$(git describe)
+RELEASE=$(git describe) #grab the tag
 git checkout ark-latest
 git reset --hard "$RELEASE"
 
@@ -59,14 +59,16 @@ git add makefile Makefile.rhelver Makefile redhat
 
 git commit -m "bulk merge ark-infra as of $(date)"
 
-printf "All done!
+echo
+test "$TO_PUSH" && PUSH_VERB="Pushing" || PUSH_VERB="To push"
+PUSH_STR="all release artifacts"
+PUSH_CMD="git push gitlab ${BRANCH} && \\
+	git push gitlab \"${RELEASE}\" && \\
+	git push -f gitlab ark-latest && \\
+	git push -f gitlab ark-infra
+"
 
-To push all the release artifacts, run:
-
-git push os-build
-for branch in \$(git branch | grep configs/\"\$(date +%%F)\"); do
-\tgit push -o merge_request.create -o merge_request.target=os-build\
- -o merge_request.remove_source_branch upstream \"\$branch\"
-done
-git push upstream %s%s
-git push -f upstream ark-latest\n" "$RELEASE" "$RELEASE_BRANCHES"
+#Push branch
+echo "# $PUSH_VERB $PUSH_STR"
+echo "$PUSH_CMD"
+test "$TO_PUSH" && eval "$PUSH_CMD"
