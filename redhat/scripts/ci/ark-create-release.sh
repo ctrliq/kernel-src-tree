@@ -11,40 +11,13 @@ set -e
 # shellcheck source=./redhat/scripts/ci/ark-ci-env.sh
 . "$(dirname "$0")"/ark-ci-env.sh
 
-# Detect if there's one or more prior releases for this upstream ref.
-if git describe "$UPSTREAM_REF" | grep -q -c '\-g'; then
-	SHORT_COMMIT=$(git describe "$UPSTREAM_REF" | cut -d "g" -f 2)
-	BASE_RELEASE=$(git tag -l | grep "$SHORT_COMMIT" | tail -n 1)
-else
-	if git describe "$UPSTREAM_REF" | grep -q -c "\-"; then
-		RC_LEVEL="0.$(git describe "$UPSTREAM_REF" | cut -d "-" -f 2)"
-		VERSION=$(git describe "$UPSTREAM_REF" | cut -d "-" -f 1 | cut -c 2-)
-	else
-		RC_LEVEL=""
-		VERSION=$(git describe "$UPSTREAM_REF" | cut -c 2-)
-	fi
-	BASE_RELEASE=$(git tag -l | grep -E "kernel-$VERSION\.0-$RC_LEVEL\.[0-9]+" | tail -n 1)
-fi
-if [ -n "$BASE_RELEASE" ]; then
-	printf "There's already a release for %s (tagged as %s); if you're trying \
-		to create a new release check out that tag, apply any commits you \
-		want, and then run \"touch localversion && make dist-release && make \
-		dist-release-tag\".\n" "$UPSTREAM_REF" "$BASE_RELEASE"
-	exit 3
-fi
-
-git checkout os-build
+git checkout "${BRANCH}"
 touch localversion
 make dist-release
 
-if git tag -v "$UPSTREAM_REF" > /dev/null 2>&1; then
-	git checkout -b ark/"$UPSTREAM_REF" ark/patches/"$UPSTREAM_REF"
-	RELEASE_BRANCHES=" ark/$UPSTREAM_REF ark/patches/$UPSTREAM_REF"
-else
-	# This is a snapshot release so we're only going to make a tag
-	git checkout --detach os-build && git describe
-	RELEASE_BRANCHES=""
-fi
+# prep ark-latest branch
+git checkout --detach "${BRANCH}" && git describe
+
 MR_PATCHES=$(gitlab project-merge-request list --project-id="$PROJECT_ID" \
 	--labels="Include in Releases" --state=opened | grep -v "^$" | sort | \
 	awk '{ print "https://gitlab.com/cki-project/kernel-ark/-/merge_requests/" $2 ".patch" }')
