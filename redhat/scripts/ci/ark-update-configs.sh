@@ -18,8 +18,9 @@
 
 set -e
 
-UPSTREAM_REF=${1:-master}
-test -n "$PROJECT_ID" || PROJECT_ID="${2:-13604247}"
+# source common CI functions and variables
+# shellcheck source=./redhat/scripts/ci/ark-ci-env.sh
+. "$(dirname "$0")"/ark-ci-env.sh
 
 ISSUE_DESCRIPTION="A merge conflict has occurred and must be resolved manually.
 
@@ -31,8 +32,7 @@ To resolve this, do the following:
 4. git push
 "
 
-git checkout os-build
-BRANCH="$(git branch --show-current)"
+git checkout "${BRANCH}"
 if ! git merge -m "Merge '$UPSTREAM_REF' into '$BRANCH'" "$UPSTREAM_REF"; then
 	git merge --abort
 	printf "Merge conflict; halting!\n"

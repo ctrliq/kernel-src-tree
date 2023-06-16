@@ -7,8 +7,9 @@
 
 set -e
 
-UPSTREAM_REF=${1-master}
-PROJECT_ID=${2:-13604247}
+# source common CI functions and variables
+# shellcheck source=./redhat/scripts/ci/ark-ci-env.sh
+. "$(dirname "$0")"/ark-ci-env.sh
 
 # Detect if there's one or more prior releases for this upstream ref.
 if git describe "$UPSTREAM_REF" | grep -q -c '\-g'; then
