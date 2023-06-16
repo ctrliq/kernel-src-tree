@@ -22,6 +22,15 @@ set -e
 # shellcheck source=./redhat/scripts/ci/ark-ci-env.sh
 . "$(dirname "$0")"/ark-ci-env.sh
 
+finish()
+{
+	rm "$TMPFILE"
+}
+trap finish EXIT
+
+TMPFILE=".push-warnings"
+touch $TMPFILE
+
 ISSUE_DESCRIPTION="A merge conflict has occurred and must be resolved manually.
 
 To resolve this, do the following:
@@ -45,7 +54,7 @@ if ! git merge -m "Merge '$UPSTREAM_REF' into '$BRANCH'" "$UPSTREAM_REF"; then
 				--description "$ISSUE_DESCRIPTION"
 		fi
 	fi
-	exit 1
+	die "Merge conflicts"
 fi
 
 # Generates and commits all the pending configs
@@ -60,7 +69,9 @@ new_head="$(git rev-parse HEAD)"
 # Converts each new pending config from above into its finalized git
 # configs/<date>/<config> branch.  These commits are used for Merge
 # Requests.
-if [ "$old_head" != "$new_head" ]; then
+[ "$old_head" != "$new_head" ] && CONFIGS_ADDED="1" || CONFIGS_ADDED=""
+
+if test "$CONFIGS_ADDED"; then
 	./redhat/scripts/genspec/gen_config_patches.sh
 else
 	printf "No new configuration values exposed from merging %s into $BRANCH\n" "$UPSTREAM_REF"
