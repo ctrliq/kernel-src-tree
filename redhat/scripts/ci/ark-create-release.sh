@@ -13,6 +13,7 @@ set -e
 
 git checkout "${BRANCH}"
 touch localversion
+old_head="$(git rev-parse HEAD)"
 make dist-release
 
 # prep ark-latest branch
@@ -25,7 +26,16 @@ for patch_url in $MR_PATCHES; do
 	curl -sL "$patch_url" | git am
 done
 
+# if dist-release doesn't update anything, then there is a good chance the
+# tag already exists and infra changes have already been applied.  Let's
+# skip those conditions and exit gracefully.
 make dist-release
+new_head="$(git rev-parse HEAD)"
+if test "$old_head" == "$new_head"; then
+	echo "Nothing changed, skipping updates"
+	exit 0
+fi
+
 make dist-release-tag
 RELEASE=$(git describe)
 git checkout ark-latest
