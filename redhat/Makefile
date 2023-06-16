@@ -797,22 +797,14 @@ git-tree-check:
 		{ echo -e "Dirty tree, please clean before merging.\n"; exit 1; }
 
 dist-merge-upstream: git-tree-check
-	@if test "$(shell $(GIT) branch --show-current)" != "$(DIST_BRANCH)"; then \
-		echo -e "Please checkout $(DIST_BRANCH) branch before merging.\n"; \
-		exit 1; \
-		fi;
-
-	@# If TAG is empty, script defaults to master:HEAD
-	@$(GIT) checkout $(DIST_BRANCH)
-	@cd ..; $(REDHAT)/scripts/ci/ark-update-configs.sh $(TAG)
+	@cd ..; $(REDHAT)/scripts/ci/ark-update-configs.sh
 
 dist-merge-upstream-push: export DIST_PUSH="1"
 dist-merge-upstream-push: dist-merge-upstream
 
 dist-fedora-release: git-tree-check
 
-	@# If TAG is empty, script defaults to master:HEAD
-	@cd ..; $(REDHAT)/scripts/ci/ark-create-release.sh $(TAG) || \
+	@cd ..; $(REDHAT)/scripts/ci/ark-create-release.sh || \
 		(echo "Unable to create release tag"; exit 1)
 
 dist-fedora-release-push: export DIST_PUSH="1"
