@@ -76,7 +76,7 @@ $(obj)/lib-%.o: $(srctree)/lib/%.c FORCE
 
 lib-$(CONFIG_EFI_GENERIC_STUB)	+= efi-stub.o fdt.o string.o intrinsics.o \
 				   $(patsubst %.c,lib-%.o,$(efi-deps-y)) \
-				   systable.o screen_info.o
+				   systable.o screen_info.o efi-stub-entry.o
 
 lib-$(CONFIG_ARM)		+= arm32-stub.o
 lib-$(CONFIG_ARM64)		+= arm64-stub.o arm64-entry.o
