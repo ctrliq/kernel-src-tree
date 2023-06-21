@@ -635,10 +635,10 @@ enum acpi_backlight_type __acpi_video_get_backlight_type(bool native, bool *auto
 		return acpi_backlight_video;
 
 	/* Use native if available */
-	if (native_available && prefer_native_over_acpi_video())
+	if (native_available)
 		return acpi_backlight_native;
 
-	/* No ACPI video (old hw), use vendor specific fw methods. */
+	/* No ACPI video/native (old hw), use vendor specific fw methods. */
 	return acpi_backlight_vendor;
 }
 
