@@ -824,7 +824,6 @@ create_posix_buf(umode_t mode)
 static int
 add_posix_context(struct kvec *iov, unsigned int *num_iovec, umode_t mode)
 {
-	struct smb2_create_req *req = iov[0].iov_base;
 	unsigned int num = *num_iovec;
 
 	iov[num].iov_base = create_posix_buf(mode);
@@ -833,7 +832,6 @@ add_posix_context(struct kvec *iov, unsigned int *num_iovec, umode_t mode)
 	if (iov[num].iov_base == NULL)
 		return -ENOMEM;
 	iov[num].iov_len = sizeof(struct create_posix);
-	le32_add_cpu(&req->CreateContextsLength, sizeof(struct create_posix));
 	*num_iovec = num + 1;
 	return 0;
 }
@@ -2183,8 +2181,6 @@ add_lease_context(struct TCP_Server_Info *server, struct kvec *iov,
 		return -ENOMEM;
 	iov[num].iov_len = server->vals->create_lease_size;
 	req->RequestedOplockLevel = SMB2_OPLOCK_LEVEL_LEASE;
-	le32_add_cpu(&req->CreateContextsLength,
-		     server->vals->create_lease_size);
 	*num_iovec = num + 1;
 	return 0;
 }
@@ -2263,14 +2259,12 @@ static int
 add_durable_v2_context(struct kvec *iov, unsigned int *num_iovec,
 		    struct cifs_open_parms *oparms)
 {
-	struct smb2_create_req *req = iov[0].iov_base;
 	unsigned int num = *num_iovec;
 
 	iov[num].iov_base = create_durable_v2_buf(oparms);
 	if (iov[num].iov_base == NULL)
 		return -ENOMEM;
 	iov[num].iov_len = sizeof(struct create_durable_v2);
-	le32_add_cpu(&req->CreateContextsLength, sizeof(struct create_durable_v2));
 	*num_iovec = num + 1;
 	return 0;
 }
@@ -2279,7 +2273,6 @@ static int
 add_durable_reconnect_v2_context(struct kvec *iov, unsigned int *num_iovec,
 		    struct cifs_open_parms *oparms)
 {
-	struct smb2_create_req *req = iov[0].iov_base;
 	unsigned int num = *num_iovec;
 
 	/* indicate that we don't need to relock the file */
@@ -2289,8 +2282,6 @@ add_durable_reconnect_v2_context(struct kvec *iov, unsigned int *num_iovec,
 	if (iov[num].iov_base == NULL)
 		return -ENOMEM;
 	iov[num].iov_len = sizeof(struct create_durable_handle_reconnect_v2);
-	le32_add_cpu(&req->CreateContextsLength,
-			sizeof(struct create_durable_handle_reconnect_v2));
 	*num_iovec = num + 1;
 	return 0;
 }
@@ -2299,7 +2290,6 @@ static int
 add_durable_context(struct kvec *iov, unsigned int *num_iovec,
 		    struct cifs_open_parms *oparms, bool use_persistent)
 {
-	struct smb2_create_req *req = iov[0].iov_base;
 	unsigned int num = *num_iovec;
 
 	if (use_persistent) {
@@ -2319,7 +2309,6 @@ add_durable_context(struct kvec *iov, unsigned int *num_iovec,
 	if (iov[num].iov_base == NULL)
 		return -ENOMEM;
 	iov[num].iov_len = sizeof(struct create_durable);
-	le32_add_cpu(&req->CreateContextsLength, sizeof(struct create_durable));
 	*num_iovec = num + 1;
 	return 0;
 }
@@ -2353,14 +2342,12 @@ create_twarp_buf(__u64 timewarp)
 static int
 add_twarp_context(struct kvec *iov, unsigned int *num_iovec, __u64 timewarp)
 {
-	struct smb2_create_req *req = iov[0].iov_base;
 	unsigned int num = *num_iovec;
 
 	iov[num].iov_base = create_twarp_buf(timewarp);
 	if (iov[num].iov_base == NULL)
 		return -ENOMEM;
 	iov[num].iov_len = sizeof(struct crt_twarp_ctxt);
-	le32_add_cpu(&req->CreateContextsLength, sizeof(struct crt_twarp_ctxt));
 	*num_iovec = num + 1;
 	return 0;
 }
@@ -2483,7 +2470,6 @@ create_sd_buf(umode_t mode, bool set_owner, unsigned int *len)
 static int
 add_sd_context(struct kvec *iov, unsigned int *num_iovec, umode_t mode, bool set_owner)
 {
-	struct smb2_create_req *req = iov[0].iov_base;
 	unsigned int num = *num_iovec;
 	unsigned int len = 0;
 
@@ -2491,7 +2477,6 @@ add_sd_context(struct kvec *iov, unsigned int *num_iovec, umode_t mode, bool set
 	if (iov[num].iov_base == NULL)
 		return -ENOMEM;
 	iov[num].iov_len = len;
-	le32_add_cpu(&req->CreateContextsLength, len);
 	*num_iovec = num + 1;
 	return 0;
 }
@@ -2522,14 +2507,12 @@ create_query_id_buf(void)
 static int
 add_query_id_context(struct kvec *iov, unsigned int *num_iovec)
 {
-	struct smb2_create_req *req = iov[0].iov_base;
 	unsigned int num = *num_iovec;
 
 	iov[num].iov_base = create_query_id_buf();
 	if (iov[num].iov_base == NULL)
 		return -ENOMEM;
 	iov[num].iov_len = sizeof(struct crt_query_id_ctxt);
-	le32_add_cpu(&req->CreateContextsLength, sizeof(struct crt_query_id_ctxt));
 	*num_iovec = num + 1;
 	return 0;
 }
@@ -2893,6 +2876,7 @@ SMB2_open_init(struct cifs_tcon *tcon, struct TCP_Server_Info *server,
 		req->CreateContextsOffset = cpu_to_le32(
 			sizeof(struct smb2_create_req) +
 			iov[1].iov_len);
+		req->CreateContextsLength = 0;
 
 		for (unsigned int i = 2; i < (n_iov-1); i++) {
 			struct kvec *v = &iov[i];
@@ -2901,7 +2885,10 @@ SMB2_open_init(struct cifs_tcon *tcon, struct TCP_Server_Info *server,
 				(struct create_context *)v->iov_base;
 
 			cctx->Next = cpu_to_le32(len);
+			le32_add_cpu(&req->CreateContextsLength, len);
 		}
+		le32_add_cpu(&req->CreateContextsLength,
+			     iov[n_iov-1].iov_len);
 	}
 
 	rqst->rq_nvec = n_iov;
