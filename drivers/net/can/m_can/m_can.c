@@ -368,9 +368,14 @@ m_can_txe_fifo_read(struct m_can_classdev *cdev, u32 fgi, u32 offset, u32 *val)
 	return cdev->ops->read_fifo(cdev, addr_offset, val, 1);
 }
 
+static inline bool _m_can_tx_fifo_full(u32 txfqs)
+{
+	return !!(txfqs & TXFQS_TFQF);
+}
+
 static inline bool m_can_tx_fifo_full(struct m_can_classdev *cdev)
 {
-	return !!(m_can_read(cdev, M_CAN_TXFQS) & TXFQS_TFQF);
+	return _m_can_tx_fifo_full(m_can_read(cdev, M_CAN_TXFQS));
 }
 
 static void m_can_config_endisable(struct m_can_classdev *cdev, bool enable)
@@ -1599,6 +1604,7 @@ static netdev_tx_t m_can_tx_handler(struct m_can_classdev *cdev)
 	struct sk_buff *skb = cdev->tx_skb;
 	struct id_and_dlc fifo_header;
 	u32 cccr, fdflags;
+	u32 txfqs;
 	int err;
 	int putidx;
 
@@ -1655,8 +1661,10 @@ static netdev_tx_t m_can_tx_handler(struct m_can_classdev *cdev)
 	} else {
 		/* Transmit routine for version >= v3.1.x */
 
+		txfqs = m_can_read(cdev, M_CAN_TXFQS);
+
 		/* Check if FIFO full */
-		if (m_can_tx_fifo_full(cdev)) {
+		if (_m_can_tx_fifo_full(txfqs)) {
 			/* This shouldn't happen */
 			netif_stop_queue(dev);
 			netdev_warn(dev,
@@ -1672,8 +1680,7 @@ static netdev_tx_t m_can_tx_handler(struct m_can_classdev *cdev)
 		}
 
 		/* get put index for frame */
-		putidx = FIELD_GET(TXFQS_TFQPI_MASK,
-				   m_can_read(cdev, M_CAN_TXFQS));
+		putidx = FIELD_GET(TXFQS_TFQPI_MASK, txfqs);
 
 		/* Construct DLC Field, with CAN-FD configuration.
 		 * Use the put index of the fifo as the message marker,
