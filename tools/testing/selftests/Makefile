@@ -43,6 +43,7 @@ TARGETS += mqueue
 TARGETS += nci
 TARGETS += net
 TARGETS += net/forwarding
+TARGETS += net/hsr
 TARGETS += net/mptcp
 TARGETS += netfilter
 TARGETS += nsfs
