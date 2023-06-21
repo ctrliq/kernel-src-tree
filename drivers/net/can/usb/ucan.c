@@ -276,7 +276,6 @@ struct ucan_priv {
 
 	/* linux USB device structures */
 	struct usb_device *udev;
-	struct usb_interface *intf;
 	struct net_device *netdev;
 
 	/* lock for can->echo_skb (used around
@@ -1500,7 +1499,6 @@ static int ucan_probe(struct usb_interface *intf,
 
 	/* initialize data */
 	up->udev = udev;
-	up->intf = intf;
 	up->netdev = netdev;
 	up->intf_index = iface_desc->desc.bInterfaceNumber;
 	up->in_ep_addr = in_ep_addr;
