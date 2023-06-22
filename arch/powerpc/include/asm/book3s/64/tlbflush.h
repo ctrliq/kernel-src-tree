@@ -136,7 +136,8 @@ static inline void flush_all_mm(struct mm_struct *mm)
 
 #define flush_tlb_fix_spurious_fault flush_tlb_fix_spurious_fault
 static inline void flush_tlb_fix_spurious_fault(struct vm_area_struct *vma,
-						unsigned long address)
+						unsigned long address,
+						pte_t *ptep)
 {
 	/*
 	 * Book3S 64 does not require spurious fault flushes because the PTE
