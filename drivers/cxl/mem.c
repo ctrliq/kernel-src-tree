@@ -132,7 +132,7 @@ static int cxl_mem_probe(struct device *dev)
 	}
 
 	if (dport->rch)
-		endpoint_parent = parent_port->uport;
+		endpoint_parent = parent_port->uport_dev;
 	else
 		endpoint_parent = &parent_port->dev;
 
