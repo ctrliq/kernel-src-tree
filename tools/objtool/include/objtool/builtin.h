@@ -19,10 +19,12 @@ struct opts {
 	bool orc;
 	bool retpoline;
 	bool rethunk;
+	bool unret;
 	bool sls;
 	bool stackval;
 	bool static_call;
 	bool uaccess;
+	int prefix;
 
 	/* options: */
 	bool backtrace;
