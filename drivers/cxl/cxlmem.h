@@ -86,7 +86,7 @@ static inline bool is_cxl_endpoint(struct cxl_port *port)
 
 struct cxl_memdev *devm_cxl_add_memdev(struct cxl_dev_state *cxlds);
 struct cxl_memdev_state;
-int cxl_memdev_setup_fw_upload(struct cxl_dev_state *cxlds);
+int cxl_memdev_setup_fw_upload(struct cxl_memdev_state *mds);
 int devm_cxl_dpa_reserve(struct cxl_endpoint_decoder *cxled,
 			 resource_size_t base, resource_size_t len,
 			 resource_size_t skipped);
@@ -867,7 +867,7 @@ static inline void cxl_mem_active_dec(void)
 }
 #endif
 
-int cxl_mem_sanitize(struct cxl_dev_state *cxlds, u16 cmd);
+int cxl_mem_sanitize(struct cxl_memdev_state *mds, u16 cmd);
 
 struct cxl_hdm {
 	struct cxl_component_regs regs;

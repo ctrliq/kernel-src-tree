@@ -1083,7 +1083,7 @@ EXPORT_SYMBOL_NS_GPL(cxl_dev_state_identify, CXL);
 
 /**
  * cxl_mem_sanitize() - Send a sanitization command to the device.
- * @cxlds: The device data for the operation
+ * @mds: The device data for the operation
  * @cmd: The specific sanitization command opcode
  *
  * Return: 0 if the command was executed successfully, regardless of
@@ -1094,7 +1094,7 @@ EXPORT_SYMBOL_NS_GPL(cxl_dev_state_identify, CXL);
  *
  * See CXL 3.0 @8.2.9.8.5.1 Sanitize and @8.2.9.8.5.2 Secure Erase.
  */
-int cxl_mem_sanitize(struct cxl_dev_state *cxlds, u16 cmd)
+int cxl_mem_sanitize(struct cxl_memdev_state *mds, u16 cmd)
 {
 	int rc;
 	u32 sec_out = 0;
@@ -1107,7 +1107,7 @@ int cxl_mem_sanitize(struct cxl_dev_state *cxlds, u16 cmd)
 		.size_out = sizeof(out),
 	};
 	struct cxl_mbox_cmd mbox_cmd = { .opcode = cmd };
-	struct cxl_memdev_state *mds = to_cxl_memdev_state(cxlds);
+	struct cxl_dev_state *cxlds = &mds->cxlds;
 
 	if (cmd != CXL_MBOX_OP_SANITIZE && cmd != CXL_MBOX_OP_SECURE_ERASE)
 		return -EINVAL;

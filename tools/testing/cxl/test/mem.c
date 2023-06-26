@@ -567,11 +567,9 @@ static int mock_partition_info(struct cxl_mbox_cmd *cmd)
 	return 0;
 }
 
-static int mock_sanitize(struct cxl_dev_state *cxlds,
+static int mock_sanitize(struct cxl_mockmem_data *mdata,
 			 struct cxl_mbox_cmd *cmd)
 {
-	struct cxl_mockmem_data *mdata = dev_get_drvdata(cxlds->dev);
-
 	if (cmd->size_in != 0)
 		return -EINVAL;
 
@@ -590,11 +588,9 @@ static int mock_sanitize(struct cxl_dev_state *cxlds,
 	return 0; /* assume less than 2 secs, no bg */
 }
 
-static int mock_secure_erase(struct cxl_dev_state *cxlds,
+static int mock_secure_erase(struct cxl_mockmem_data *mdata,
 			     struct cxl_mbox_cmd *cmd)
 {
-	struct cxl_mockmem_data *mdata = dev_get_drvdata(cxlds->dev);
-
 	if (cmd->size_in != 0)
 		return -EINVAL;
 
@@ -1187,10 +1183,9 @@ static struct attribute *cxl_mock_mem_core_attrs[] = {
 };
 ATTRIBUTE_GROUPS(cxl_mock_mem_core);
 
-static int mock_fw_info(struct cxl_dev_state *cxlds,
-			    struct cxl_mbox_cmd *cmd)
+static int mock_fw_info(struct cxl_mockmem_data *mdata,
+			struct cxl_mbox_cmd *cmd)
 {
-	struct cxl_mockmem_data *mdata = dev_get_drvdata(cxlds->dev);
 	struct cxl_mbox_get_fw_info fw_info = {
 		.num_slots = FW_SLOTS,
 		.slot_info = (mdata->fw_slot & 0x7) |
@@ -1210,11 +1205,10 @@ static int mock_fw_info(struct cxl_dev_state *cxlds,
 	return 0;
 }
 
-static int mock_transfer_fw(struct cxl_dev_state *cxlds,
+static int mock_transfer_fw(struct cxl_mockmem_data *mdata,
 			    struct cxl_mbox_cmd *cmd)
 {
 	struct cxl_mbox_transfer_fw *transfer = cmd->payload_in;
-	struct cxl_mockmem_data *mdata = dev_get_drvdata(cxlds->dev);
 	void *fw = mdata->fw;
 	size_t offset, length;
 
@@ -1246,11 +1240,10 @@ static int mock_transfer_fw(struct cxl_dev_state *cxlds,
 	return 0;
 }
 
-static int mock_activate_fw(struct cxl_dev_state *cxlds,
+static int mock_activate_fw(struct cxl_mockmem_data *mdata,
 			    struct cxl_mbox_cmd *cmd)
 {
 	struct cxl_mbox_activate_fw *activate = cmd->payload_in;
-	struct cxl_mockmem_data *mdata = dev_get_drvdata(cxlds->dev);
 
 	if (activate->slot == 0 || activate->slot > FW_SLOTS)
 		return -EINVAL;
@@ -1311,10 +1304,10 @@ static int cxl_mock_mbox_send(struct cxl_memdev_state *mds,
 		rc = mock_health_info(cmd);
 		break;
 	case CXL_MBOX_OP_SANITIZE:
-		rc = mock_sanitize(cxlds, cmd);
+		rc = mock_sanitize(mdata, cmd);
 		break;
 	case CXL_MBOX_OP_SECURE_ERASE:
-		rc = mock_secure_erase(cxlds, cmd);
+		rc = mock_secure_erase(mdata, cmd);
 		break;
 	case CXL_MBOX_OP_GET_SECURITY_STATE:
 		rc = mock_get_security_state(mdata, cmd);
@@ -1344,13 +1337,13 @@ static int cxl_mock_mbox_send(struct cxl_memdev_state *mds,
 		rc = mock_clear_poison(cxlds, cmd);
 		break;
 	case CXL_MBOX_OP_GET_FW_INFO:
-		rc = mock_fw_info(cxlds, cmd);
+		rc = mock_fw_info(mdata, cmd);
 		break;
 	case CXL_MBOX_OP_TRANSFER_FW:
-		rc = mock_transfer_fw(cxlds, cmd);
+		rc = mock_transfer_fw(mdata, cmd);
 		break;
 	case CXL_MBOX_OP_ACTIVATE_FW:
-		rc = mock_activate_fw(cxlds, cmd);
+		rc = mock_activate_fw(mdata, cmd);
 		break;
 	default:
 		break;
@@ -1461,7 +1454,7 @@ static int cxl_mock_mem_probe(struct platform_device *pdev)
 	if (IS_ERR(cxlmd))
 		return PTR_ERR(cxlmd);
 
-	rc = cxl_memdev_setup_fw_upload(cxlds);
+	rc = cxl_memdev_setup_fw_upload(mds);
 	if (rc)
 		return rc;
 

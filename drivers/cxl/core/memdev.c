@@ -152,8 +152,8 @@ static ssize_t security_sanitize_store(struct device *dev,
 				       const char *buf, size_t len)
 {
 	struct cxl_memdev *cxlmd = to_cxl_memdev(dev);
-	struct cxl_dev_state *cxlds = cxlmd->cxlds;
-	struct cxl_port *port = dev_get_drvdata(&cxlmd->dev);
+	struct cxl_memdev_state *mds = to_cxl_memdev_state(cxlmd->cxlds);
+	struct cxl_port *port = cxlmd->endpoint;
 	bool sanitize;
 	ssize_t rc;
 
@@ -167,7 +167,7 @@ static ssize_t security_sanitize_store(struct device *dev,
 	if (port->commit_end != -1)
 		return -EBUSY;
 
-	rc = cxl_mem_sanitize(cxlds, CXL_MBOX_OP_SANITIZE);
+	rc = cxl_mem_sanitize(mds, CXL_MBOX_OP_SANITIZE);
 
 	return rc ? rc : len;
 }
@@ -179,8 +179,8 @@ static ssize_t security_erase_store(struct device *dev,
 				    const char *buf, size_t len)
 {
 	struct cxl_memdev *cxlmd = to_cxl_memdev(dev);
-	struct cxl_dev_state *cxlds = cxlmd->cxlds;
-	struct cxl_port *port = dev_get_drvdata(&cxlmd->dev);
+	struct cxl_memdev_state *mds = to_cxl_memdev_state(cxlmd->cxlds);
+	struct cxl_port *port = cxlmd->endpoint;
 	ssize_t rc;
 	bool erase;
 
@@ -194,7 +194,7 @@ static ssize_t security_erase_store(struct device *dev,
 	if (port->commit_end != -1)
 		return -EBUSY;
 
-	rc = cxl_mem_sanitize(cxlds, CXL_MBOX_OP_SECURE_ERASE);
+	rc = cxl_mem_sanitize(mds, CXL_MBOX_OP_SECURE_ERASE);
 
 	return rc ? rc : len;
 }
@@ -674,12 +674,11 @@ static int cxl_memdev_release_file(struct inode *inode, struct file *file)
  *
  * See CXL-3.0 8.2.9.3.1 Get FW Info
  */
-static int cxl_mem_get_fw_info(struct cxl_dev_state *cxlds)
+static int cxl_mem_get_fw_info(struct cxl_memdev_state *mds)
 {
 	struct cxl_mbox_get_fw_info info;
 	struct cxl_mbox_cmd mbox_cmd;
 	int rc;
-	struct cxl_memdev_state *mds = to_cxl_memdev_state(cxlds);
 
 	mbox_cmd = (struct cxl_mbox_cmd) {
 		.opcode = CXL_MBOX_OP_GET_FW_INFO,
@@ -700,7 +699,7 @@ static int cxl_mem_get_fw_info(struct cxl_dev_state *cxlds)
 
 /**
  * cxl_mem_activate_fw - Activate Firmware
- * @cxlds: The device data for the operation
+ * @mds: The device data for the operation
  * @slot: slot number to activate
  *
  * Activate firmware in a given slot for the device specified.
@@ -709,11 +708,10 @@ static int cxl_mem_get_fw_info(struct cxl_dev_state *cxlds)
  *
  * See CXL-3.0 8.2.9.3.3 Activate FW
  */
-static int cxl_mem_activate_fw(struct cxl_dev_state *cxlds, int slot)
+static int cxl_mem_activate_fw(struct cxl_memdev_state *mds, int slot)
 {
 	struct cxl_mbox_activate_fw activate;
 	struct cxl_mbox_cmd mbox_cmd;
-	struct cxl_memdev_state *mds = to_cxl_memdev_state(cxlds);
 
 	if (slot == 0 || slot > mds->fw.num_slots)
 		return -EINVAL;
@@ -733,7 +731,7 @@ static int cxl_mem_activate_fw(struct cxl_dev_state *cxlds, int slot)
 
 /**
  * cxl_mem_abort_fw_xfer - Abort an in-progress FW transfer
- * @cxlds: The device data for the operation
+ * @mds: The device data for the operation
  *
  * Abort an in-progress firmware transfer for the device specified.
  *
@@ -741,11 +739,10 @@ static int cxl_mem_activate_fw(struct cxl_dev_state *cxlds, int slot)
  *
  * See CXL-3.0 8.2.9.3.2 Transfer FW
  */
-static int cxl_mem_abort_fw_xfer(struct cxl_dev_state *cxlds)
+static int cxl_mem_abort_fw_xfer(struct cxl_memdev_state *mds)
 {
 	struct cxl_mbox_transfer_fw *transfer;
 	struct cxl_mbox_cmd mbox_cmd;
-	struct cxl_memdev_state *mds = to_cxl_memdev_state(cxlds);
 	int rc;
 
 	transfer = kzalloc(struct_size(transfer, data, 0), GFP_KERNEL);
@@ -770,19 +767,19 @@ static int cxl_mem_abort_fw_xfer(struct cxl_dev_state *cxlds)
 
 static void cxl_fw_cleanup(struct fw_upload *fwl)
 {
-	struct cxl_dev_state *cxlds = fwl->dd_handle;
-	struct cxl_memdev_state *mds = to_cxl_memdev_state(cxlds);
+	struct cxl_memdev_state *mds = fwl->dd_handle;
 
 	mds->fw.next_slot = 0;
 }
 
 static int cxl_fw_do_cancel(struct fw_upload *fwl)
 {
-	struct cxl_dev_state *cxlds = fwl->dd_handle;
+	struct cxl_memdev_state *mds = fwl->dd_handle;
+	struct cxl_dev_state *cxlds = &mds->cxlds;
 	struct cxl_memdev *cxlmd = cxlds->cxlmd;
 	int rc;
 
-	rc = cxl_mem_abort_fw_xfer(cxlds);
+	rc = cxl_mem_abort_fw_xfer(mds);
 	if (rc < 0)
 		dev_err(&cxlmd->dev, "Error aborting FW transfer: %d\n", rc);
 
@@ -792,9 +789,8 @@ static int cxl_fw_do_cancel(struct fw_upload *fwl)
 static enum fw_upload_err cxl_fw_prepare(struct fw_upload *fwl, const u8 *data,
 					 u32 size)
 {
-	struct cxl_dev_state *cxlds = fwl->dd_handle;
+	struct cxl_memdev_state *mds = fwl->dd_handle;
 	struct cxl_mbox_transfer_fw *transfer;
-	struct cxl_memdev_state *mds = to_cxl_memdev_state(cxlds);
 
 	if (!size)
 		return FW_UPLOAD_ERR_INVALID_SIZE;
@@ -802,7 +798,7 @@ static enum fw_upload_err cxl_fw_prepare(struct fw_upload *fwl, const u8 *data,
 	mds->fw.oneshot = struct_size(transfer, data, size) <
 			    mds->payload_size;
 
-	if (cxl_mem_get_fw_info(cxlds))
+	if (cxl_mem_get_fw_info(mds))
 		return FW_UPLOAD_ERR_HW_ERROR;
 
 	/*
@@ -818,9 +814,9 @@ static enum fw_upload_err cxl_fw_prepare(struct fw_upload *fwl, const u8 *data,
 static enum fw_upload_err cxl_fw_write(struct fw_upload *fwl, const u8 *data,
 				       u32 offset, u32 size, u32 *written)
 {
-	struct cxl_dev_state *cxlds = fwl->dd_handle;
+	struct cxl_memdev_state *mds = fwl->dd_handle;
+	struct cxl_dev_state *cxlds = &mds->cxlds;
 	struct cxl_memdev *cxlmd = cxlds->cxlmd;
-	struct cxl_memdev_state *mds = to_cxl_memdev_state(cxlds);
 	struct cxl_mbox_transfer_fw *transfer;
 	struct cxl_mbox_cmd mbox_cmd;
 	u32 cur_size, remaining;
@@ -899,7 +895,7 @@ static enum fw_upload_err cxl_fw_write(struct fw_upload *fwl, const u8 *data,
 	if (mds->fw.oneshot || remaining == 0) {
 		dev_dbg(&cxlmd->dev, "Activating firmware slot: %d\n",
 			mds->fw.next_slot);
-		rc = cxl_mem_activate_fw(cxlds, mds->fw.next_slot);
+		rc = cxl_mem_activate_fw(mds, mds->fw.next_slot);
 		if (rc < 0) {
 			dev_err(&cxlmd->dev, "Error activating firmware: %d\n",
 				rc);
@@ -917,8 +913,7 @@ out_free:
 
 static enum fw_upload_err cxl_fw_poll_complete(struct fw_upload *fwl)
 {
-	struct cxl_dev_state *cxlds = fwl->dd_handle;
-	struct cxl_memdev_state *mds = to_cxl_memdev_state(cxlds);
+	struct cxl_memdev_state *mds = fwl->dd_handle;
 
 	/*
 	 * cxl_internal_send_cmd() handles background operations synchronously.
@@ -934,8 +929,7 @@ static enum fw_upload_err cxl_fw_poll_complete(struct fw_upload *fwl)
 
 static void cxl_fw_cancel(struct fw_upload *fwl)
 {
-	struct cxl_dev_state *cxlds = fwl->dd_handle;
-	struct cxl_memdev_state *mds = to_cxl_memdev_state(cxlds);
+	struct cxl_memdev_state *mds = fwl->dd_handle;
 
 	set_bit(CXL_FW_CANCEL, mds->fw.state);
 }
@@ -953,10 +947,10 @@ static void devm_cxl_remove_fw_upload(void *fwl)
 	firmware_upload_unregister(fwl);
 }
 
-int cxl_memdev_setup_fw_upload(struct cxl_dev_state *cxlds)
+int cxl_memdev_setup_fw_upload(struct cxl_memdev_state *mds)
 {
+	struct cxl_dev_state *cxlds = &mds->cxlds;
 	struct device *dev = &cxlds->cxlmd->dev;
-	struct cxl_memdev_state *mds = to_cxl_memdev_state(cxlds);
 	struct fw_upload *fwl;
 	int rc;
 
@@ -964,7 +958,7 @@ int cxl_memdev_setup_fw_upload(struct cxl_dev_state *cxlds)
 		return 0;
 
 	fwl = firmware_upload_register(THIS_MODULE, dev, dev_name(dev),
-				       &cxl_memdev_fw_ops, cxlds);
+				       &cxl_memdev_fw_ops, mds);
 	if (IS_ERR(fwl))
 		return dev_err_probe(dev, PTR_ERR(fwl),
 				     "Failed to register firmware loader\n");
@@ -991,8 +985,7 @@ static const struct file_operations cxl_memdev_fops = {
 
 static void put_sanitize(void *data)
 {
-	struct cxl_dev_state *cxlds = data;
-	struct cxl_memdev_state *mds = to_cxl_memdev_state(cxlds);
+	struct cxl_memdev_state *mds = data;
 
 	sysfs_put(mds->security.sanitize_node);
 }
@@ -1016,7 +1009,7 @@ static int cxl_memdev_security_init(struct cxl_memdev *cxlmd)
 		return -ENODEV;
 	}
 
-	return devm_add_action_or_reset(cxlds->dev, put_sanitize, cxlds);
+	return devm_add_action_or_reset(cxlds->dev, put_sanitize, mds);
  }
 
 struct cxl_memdev *devm_cxl_add_memdev(struct cxl_dev_state *cxlds)
