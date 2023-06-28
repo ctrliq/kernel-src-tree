@@ -1343,8 +1343,7 @@ static void show_instructions(struct pt_regs *regs)
 		if (!(i % 8))
 			pr_cont("\n");
 
-		if (!__kernel_text_address(pc) ||
-		    get_kernel_nofault(instr, (const void *)pc)) {
+		if (get_kernel_nofault(instr, (const void *)pc)) {
 			pr_cont("XXXXXXXX ");
 		} else {
 			if (nip == pc)

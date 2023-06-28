@@ -420,7 +420,11 @@ struct compact_control {
 	bool proactive_compaction;	/* kcompactd proactive compaction */
 	bool whole_zone;		/* Whole zone should/has been scanned */
 	bool contended;			/* Signal lock contention */
-	bool rescan;			/* Rescanning the same pageblock */
+	bool finish_pageblock;		/* Scan the remainder of a pageblock. Used
+					 * when there are potentially transient
+					 * isolation or migration failures to
+					 * ensure forward progress.
+					 */
 	bool alloc_contig;		/* alloc_contig_range allocation */
 };
 
@@ -637,34 +641,6 @@ static inline void vunmap_range_noflush(unsigned long start, unsigned long end)
 {
 }
 #endif /* !CONFIG_MMU */
-
-/*
- * Return the mem_map entry representing the 'offset' subpage within
- * the maximally aligned gigantic page 'base'.  Handle any discontiguity
- * in the mem_map at MAX_ORDER_NR_PAGES boundaries.
- */
-static inline struct page *mem_map_offset(struct page *base, int offset)
-{
-	if (unlikely(offset >= MAX_ORDER_NR_PAGES))
-		return nth_page(base, offset);
-	return base + offset;
-}
-
-/*
- * Iterator over all subpages within the maximally aligned gigantic
- * page 'base'.  Handle any discontiguity in the mem_map.
- */
-static inline struct page *mem_map_next(struct page *iter,
-						struct page *base, int offset)
-{
-	if (unlikely((offset & (MAX_ORDER_NR_PAGES - 1)) == 0)) {
-		unsigned long pfn = page_to_pfn(base) + offset;
-		if (!pfn_valid(pfn))
-			return NULL;
-		return pfn_to_page(pfn);
-	}
-	return iter + 1;
-}
 
 /* Memory initialisation debug and verification */
 enum mminit_level {

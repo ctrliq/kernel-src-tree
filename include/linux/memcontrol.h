@@ -134,6 +134,8 @@ struct mem_cgroup_per_node {
 	unsigned long		usage_in_excess;/* Set to the value by which */
 						/* the soft limit is exceeded*/
 	bool			on_tree;
+	RH_KABI_EXTEND(unsigned short nid)
+
 	struct mem_cgroup	*memcg;		/* Back pointer, we cannot */
 						/* use container_of	   */
 };
@@ -343,6 +345,12 @@ struct mem_cgroup {
 #ifdef CONFIG_TRANSPARENT_HUGEPAGE
 	struct deferred_split deferred_split_queue;
 #endif
+	/*
+	 * Disable percpu stats when offline, flush and free them after one
+	 * grace period.
+	 */
+	RH_KABI_EXTEND(struct rcu_work	percpu_stats_rwork)
+	RH_KABI_EXTEND(int 		percpu_stats_disabled)
 
 	struct mem_cgroup_per_node *nodeinfo[];
 };
@@ -1013,6 +1021,9 @@ static inline unsigned long lruvec_page_state_local(struct lruvec *lruvec,
 		return node_page_state(lruvec_pgdat(lruvec), idx);
 
 	pn = container_of(lruvec, struct mem_cgroup_per_node, lruvec);
+	if (pn->memcg->percpu_stats_disabled)
+		return 0;
+
 	for_each_possible_cpu(cpu)
 		x += per_cpu(pn->lruvec_stats_percpu->state[idx], cpu);
 #ifdef CONFIG_SMP
@@ -1730,6 +1741,12 @@ struct obj_cgroup *get_obj_cgroup_from_page(struct page *page);
 int obj_cgroup_charge(struct obj_cgroup *objcg, gfp_t gfp, size_t size);
 void obj_cgroup_uncharge(struct obj_cgroup *objcg, size_t size);
 
+extern struct static_key_false memcg_bpf_enabled_key;
+static inline bool memcg_bpf_enabled(void)
+{
+	return static_branch_likely(&memcg_bpf_enabled_key);
+}
+
 extern struct static_key_false memcg_kmem_enabled_key;
 
 static inline bool memcg_kmem_enabled(void)
@@ -1806,6 +1823,11 @@ static inline void __memcg_kmem_uncharge_page(struct page *page, int order)
 static inline struct obj_cgroup *get_obj_cgroup_from_page(struct page *page)
 {
 	return NULL;
+}
+
+static inline bool memcg_bpf_enabled(void)
+{
+	return false;
 }
 
 static inline bool memcg_kmem_enabled(void)

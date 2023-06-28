@@ -98,6 +98,9 @@ if major >= 3:
 
             # include/linux/linkage.h:
             "asmlinkage",
+
+            # include/linux/btf.h
+            "__bpf_kfunc",
         ]
 
 else:

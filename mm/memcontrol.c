@@ -88,6 +88,9 @@ static bool cgroup_memory_nosocket __ro_after_init;
 /* Kernel memory accounting disabled? */
 static bool cgroup_memory_nokmem __ro_after_init;
 
+/* BPF memory accounting disabled? */
+static bool cgroup_memory_nobpf __ro_after_init;
+
 /* Whether the swap controller is active */
 #ifdef CONFIG_MEMCG_SWAP
 static bool cgroup_memory_noswap __ro_after_init;
@@ -212,6 +215,14 @@ enum res_type {
 	_MEMSWAP,
 	_KMEM,
 	_TCP,
+};
+
+enum percpu_stats_state {
+	PERCPU_STATS_ACTIVE = 0,
+	PERCPU_STATS_DISABLED,
+	PERCPU_STATS_FLUSHING,
+	PERCPU_STATS_FLUSHED,
+	PERCPU_STATS_FREED
 };
 
 #define MEMFILE_PRIVATE(x, val)	((x) << 16 | (val))
@@ -354,6 +365,9 @@ static void memcg_reparent_objcgs(struct mem_cgroup *memcg,
  */
 DEFINE_STATIC_KEY_FALSE(memcg_kmem_enabled_key);
 EXPORT_SYMBOL(memcg_kmem_enabled_key);
+
+DEFINE_STATIC_KEY_FALSE(memcg_bpf_enabled_key);
+EXPORT_SYMBOL(memcg_bpf_enabled_key);
 #endif
 
 /**
@@ -737,6 +751,30 @@ unsigned long memcg_page_state(struct mem_cgroup *memcg, int idx)
 	return x;
 }
 
+/*
+ * Return the active percpu stats memcg and optionally mem_cgroup_per_node.
+ *
+ * When percpu_stats_disabled, the percpu stats update is transferred to
+ * its parent.
+ */
+static __always_inline struct mem_cgroup *
+percpu_stats_memcg(struct mem_cgroup *memcg, struct mem_cgroup_per_node **pn)
+{
+	if (likely(!memcg->percpu_stats_disabled))
+		return memcg;
+
+	do {
+		memcg = parent_mem_cgroup(memcg);
+	} while (memcg->percpu_stats_disabled);
+
+	if (pn) {
+		unsigned int nid = (*pn)->nid;
+
+		*pn = memcg->nodeinfo[nid];
+	}
+	return memcg;
+}
+
 /**
  * __mod_memcg_state - update cgroup memory statistics
  * @memcg: the memory cgroup
@@ -748,6 +786,7 @@ void __mod_memcg_state(struct mem_cgroup *memcg, int idx, int val)
 	if (mem_cgroup_disabled())
 		return;
 
+	memcg = percpu_stats_memcg(memcg, NULL);
 	__this_cpu_add(memcg->vmstats_percpu->state[idx], val);
 	memcg_rstat_updated(memcg, val);
 }
@@ -757,6 +796,9 @@ static unsigned long memcg_page_state_local(struct mem_cgroup *memcg, int idx)
 {
 	long x = 0;
 	int cpu;
+
+	if (unlikely(memcg->percpu_stats_disabled))
+		return 0;
 
 	for_each_possible_cpu(cpu)
 		x += per_cpu(memcg->vmstats_percpu->state[idx], cpu);
@@ -774,7 +816,7 @@ void __mod_memcg_lruvec_state(struct lruvec *lruvec, enum node_stat_item idx,
 	struct mem_cgroup *memcg;
 
 	pn = container_of(lruvec, struct mem_cgroup_per_node, lruvec);
-	memcg = pn->memcg;
+	memcg = percpu_stats_memcg(pn->memcg, &pn);
 
 	/*
 	 * The caller from rmap relay on disabled preemption becase they never
@@ -838,6 +880,7 @@ void __mod_lruvec_page_state(struct page *page, enum node_stat_item idx,
 
 	rcu_read_lock();
 	memcg = page_memcg(head);
+
 	/* Untracked pages have no memcg, no lruvec. Update only the node */
 	if (!memcg) {
 		rcu_read_unlock();
@@ -889,6 +932,7 @@ void __count_memcg_events(struct mem_cgroup *memcg, enum vm_event_item idx,
 	if (mem_cgroup_disabled() || index < 0)
 		return;
 
+	memcg = percpu_stats_memcg(memcg, NULL);
 	memcg_stats_lock();
 	__this_cpu_add(memcg->vmstats_percpu->events[index], count);
 	memcg_rstat_updated(memcg, count);
@@ -913,6 +957,9 @@ static unsigned long memcg_events_local(struct mem_cgroup *memcg, int event)
 	if (index < 0)
 		return 0;
 
+	if (unlikely(memcg->percpu_stats_disabled))
+		return 0;
+
 	for_each_possible_cpu(cpu)
 		x += per_cpu(memcg->vmstats_percpu->events[index], cpu);
 	return x;
@@ -921,6 +968,8 @@ static unsigned long memcg_events_local(struct mem_cgroup *memcg, int event)
 static void mem_cgroup_charge_statistics(struct mem_cgroup *memcg,
 					 int nr_pages)
 {
+	memcg = percpu_stats_memcg(memcg, NULL);
+
 	/* pagein of a big page is an event. So, ignore page size */
 	if (nr_pages > 0)
 		__count_memcg_events(memcg, PGPGIN, 1);
@@ -936,6 +985,8 @@ static bool mem_cgroup_event_ratelimit(struct mem_cgroup *memcg,
 				       enum mem_cgroup_events_target target)
 {
 	unsigned long val, next;
+
+	memcg = percpu_stats_memcg(memcg, NULL);
 
 	val = __this_cpu_read(memcg->vmstats_percpu->nr_page_events);
 	next = __this_cpu_read(memcg->vmstats_percpu->targets[target]);
@@ -3032,7 +3083,7 @@ struct obj_cgroup *get_obj_cgroup_from_page(struct page *page)
 {
 	struct obj_cgroup *objcg;
 
-	if (!memcg_kmem_enabled() || memcg_kmem_bypass())
+	if (!memcg_kmem_enabled())
 		return NULL;
 
 	if (PageMemcgKmem(page)) {
@@ -4833,6 +4884,7 @@ static ssize_t memcg_write_event_control(struct kernfs_open_file *of,
 	unsigned int efd, cfd;
 	struct fd efile;
 	struct fd cfile;
+	struct dentry *cdentry;
 	const char *name;
 	char *endp;
 	int ret;
@@ -4884,6 +4936,16 @@ static ssize_t memcg_write_event_control(struct kernfs_open_file *of,
 		goto out_put_cfile;
 
 	/*
+	 * The control file must be a regular cgroup1 file. As a regular cgroup
+	 * file can't be renamed, it's safe to access its name afterwards.
+	 */
+	cdentry = cfile.file->f_path.dentry;
+	if (cdentry->d_sb->s_type != &cgroup_fs_type || !d_is_reg(cdentry)) {
+		ret = -EINVAL;
+		goto out_put_cfile;
+	}
+
+	/*
 	 * Determine the event callbacks and set them in @event.  This used
 	 * to be done via struct cftype but cgroup core no longer knows
 	 * about these events.  The following is crude but the whole thing
@@ -4891,7 +4953,7 @@ static ssize_t memcg_write_event_control(struct kernfs_open_file *of,
 	 *
 	 * DO NOT ADD NEW FILES.
 	 */
-	name = cfile.file->f_path.dentry->d_name.name;
+	name = cdentry->d_name.name;
 
 	/*
 	 * Notifications sent for anything but OOM are done in problematic
@@ -4924,7 +4986,7 @@ invalid:
 	 * automatically removed on cgroup destruction but the removal is
 	 * asynchronous, so take an extra ref on @css.
 	 */
-	cfile_css = css_tryget_online_from_dir(cfile.file->f_path.dentry->d_parent,
+	cfile_css = css_tryget_online_from_dir(cdentry->d_parent,
 					       &memory_cgrp_subsys);
 	ret = -EINVAL;
 	if (IS_ERR(cfile_css))
@@ -5209,6 +5271,7 @@ static int alloc_mem_cgroup_per_node_info(struct mem_cgroup *memcg, int node)
 
 	lruvec_init(&pn->lruvec);
 	pn->memcg = memcg;
+	pn->nid = node;
 
 	memcg->nodeinfo[node] = pn;
 	return 0;
@@ -5221,7 +5284,7 @@ static void free_mem_cgroup_per_node_info(struct mem_cgroup *memcg, int node)
 	if (!pn)
 		return;
 
-	free_percpu(pn->lruvec_stats_percpu);
+	//free_percpu(pn->lruvec_stats_percpu);
 	kfree(pn);
 }
 
@@ -5232,7 +5295,7 @@ static void __mem_cgroup_free(struct mem_cgroup *memcg)
 	for_each_node(node)
 		free_mem_cgroup_per_node_info(memcg, node);
 	kfree(memcg->vmstats);
-	free_percpu(memcg->vmstats_percpu);
+	//free_percpu(memcg->vmstats_percpu);
 	kfree(memcg);
 }
 
@@ -5307,6 +5370,61 @@ fail:
 	return ERR_PTR(error);
 }
 
+/*
+ * Flush and free the percpu stats
+ */
+static void percpu_stats_free_rwork_fn(struct work_struct *work)
+{
+	struct mem_cgroup *memcg = container_of(to_rcu_work(work),
+						struct mem_cgroup,
+						percpu_stats_rwork);
+	int node;
+
+	if (cmpxchg(&memcg->percpu_stats_disabled, PERCPU_STATS_DISABLED,
+		    PERCPU_STATS_FLUSHING) != PERCPU_STATS_DISABLED) {
+		static DEFINE_RATELIMIT_STATE(_rs,
+					      DEFAULT_RATELIMIT_INTERVAL,
+					      DEFAULT_RATELIMIT_BURST);
+
+		if (__ratelimit(&_rs))
+			WARN(1, "percpu_stats_free_rwork_fn() called more than once!\n");
+		return;
+	}
+
+	cgroup_rstat_flush_hold(memcg->css.cgroup);
+	WRITE_ONCE(memcg->percpu_stats_disabled, PERCPU_STATS_FLUSHED);
+	cgroup_rstat_flush_release();
+
+	for_each_node(node) {
+		struct mem_cgroup_per_node *pn = memcg->nodeinfo[node];
+
+		if (pn)
+			free_percpu(pn->lruvec_stats_percpu);
+	}
+	free_percpu(memcg->vmstats_percpu);
+	WRITE_ONCE(memcg->percpu_stats_disabled, PERCPU_STATS_FREED);
+	css_put(&memcg->css);
+}
+
+static void memcg_percpu_stats_disable(struct mem_cgroup *memcg)
+{
+	/*
+	 * Block memcg from being freed before percpu_stats_free_rwork_fn()
+	 * is called. css_get() will succeed before a potential final
+	 * css_put() in mem_cgroup_id_put().
+	 */
+	css_get(&memcg->css);
+	mem_cgroup_id_put(memcg);
+	memcg->percpu_stats_disabled = PERCPU_STATS_DISABLED;
+	INIT_RCU_WORK(&memcg->percpu_stats_rwork, percpu_stats_free_rwork_fn);
+	queue_rcu_work(system_wq, &memcg->percpu_stats_rwork);
+}
+
+static inline bool memcg_percpu_stats_flushed(struct mem_cgroup *memcg)
+{
+	return memcg->percpu_stats_disabled >= PERCPU_STATS_FLUSHED;
+}
+
 static struct cgroup_subsys_state * __ref
 mem_cgroup_css_alloc(struct cgroup_subsys_state *parent_css)
 {
@@ -5346,6 +5464,11 @@ mem_cgroup_css_alloc(struct cgroup_subsys_state *parent_css)
 
 	if (cgroup_subsys_on_dfl(memory_cgrp_subsys) && !cgroup_memory_nosocket)
 		static_branch_inc(&memcg_sockets_enabled_key);
+
+#if defined(CONFIG_MEMCG_KMEM)
+	if (!cgroup_memory_nobpf)
+		static_branch_inc(&memcg_bpf_enabled_key);
+#endif
 
 	return &memcg->css;
 }
@@ -5406,7 +5529,7 @@ static void mem_cgroup_css_offline(struct cgroup_subsys_state *css)
 
 	drain_all_stock(memcg);
 
-	mem_cgroup_id_put(memcg);
+	memcg_percpu_stats_disable(memcg);
 }
 
 static void mem_cgroup_css_released(struct cgroup_subsys_state *css)
@@ -5430,6 +5553,11 @@ static void mem_cgroup_css_free(struct cgroup_subsys_state *css)
 
 	if (!cgroup_subsys_on_dfl(memory_cgrp_subsys) && memcg->tcpmem_active)
 		static_branch_dec(&memcg_sockets_enabled_key);
+
+#if defined(CONFIG_MEMCG_KMEM)
+	if (!cgroup_memory_nobpf)
+		static_branch_dec(&memcg_bpf_enabled_key);
+#endif
 
 	vmpressure_cleanup(&memcg->vmpressure);
 	cancel_work_sync(&memcg->high_work);
@@ -5474,6 +5602,9 @@ static void mem_cgroup_css_rstat_flush(struct cgroup_subsys_state *css, int cpu)
 	struct memcg_vmstats_percpu *statc;
 	long delta, v;
 	int i, nid;
+
+	if (memcg_percpu_stats_flushed(memcg))
+		return;
 
 	statc = per_cpu_ptr(memcg->vmstats_percpu, cpu);
 
@@ -6970,6 +7101,7 @@ static inline void uncharge_gather_clear(struct uncharge_gather *ug)
 static void uncharge_batch(const struct uncharge_gather *ug)
 {
 	unsigned long flags;
+	struct mem_cgroup *memcg;
 
 	if (ug->nr_memory) {
 		page_counter_uncharge(&ug->memcg->memory, ug->nr_memory);
@@ -6980,10 +7112,12 @@ static void uncharge_batch(const struct uncharge_gather *ug)
 		memcg_oom_recover(ug->memcg);
 	}
 
+	memcg = percpu_stats_memcg(ug->memcg, NULL);
+
 	local_irq_save(flags);
-	__count_memcg_events(ug->memcg, PGPGOUT, ug->pgpgout);
-	__this_cpu_add(ug->memcg->vmstats_percpu->nr_page_events, ug->nr_memory);
-	memcg_check_events(ug->memcg, ug->nid);
+	__count_memcg_events(memcg, PGPGOUT, ug->pgpgout);
+	__this_cpu_add(memcg->vmstats_percpu->nr_page_events, ug->nr_memory);
+	memcg_check_events(memcg, ug->nid);
 	local_irq_restore(flags);
 
 	/* drop reference from uncharge_folio */
@@ -7225,6 +7359,8 @@ static int __init cgroup_memory(char *s)
 			cgroup_memory_nosocket = true;
 		if (!strcmp(token, "nokmem"))
 			cgroup_memory_nokmem = true;
+		if (!strcmp(token, "nobpf"))
+			cgroup_memory_nobpf = true;
 	}
 	return 1;
 }
