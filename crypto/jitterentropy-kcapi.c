@@ -146,6 +146,8 @@ static int jent_kcapi_random(struct crypto_rng *tfm,
 
 	/* Return a permanent error in case we had too many resets in a row. */
 	if (rng->reset_cnt > (1<<10)) {
+		if (jent_fips_enabled())
+			jent_panic("jitterentropy: Too many RCT/APT health test failures\n");
 		ret = -EFAULT;
 		goto out;
 	}
