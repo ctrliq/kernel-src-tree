@@ -30,6 +30,8 @@ specfile_helper () {
 	cp ./kernel.spec.template "${varfilename}.spec.template"
 	make RHSELFTESTDATA=1 SPECFILE="${specfilename}.spec" DIST="${DIST}" DISTRO="${DISTRO}" HEAD="${commit}" _setup-source
 	grep -Fvx -f "${specfilename}.spec.template" "${sources}/${specfilename}.spec" > "${destdir}"/"${specfilename}".spec
+	# Ignore bpftoolversion definition as it may change.
+	sed -i '/^%define bpftoolversion /d' "${destdir}"/"${specfilename}".spec
 	rm -f "${specfilename}.spec.template"
 }
 
@@ -49,6 +51,7 @@ do
 			# the tree is changed.
 			# RHEL_RELEASE can change build-to-build.
 			# SHELL can change depending on user's environment
+			# SPECBPFTOOLVERSION is derived from tools/lib/bpf/Makefile and may change.
 			# RHGITURL may change depending on the user's method of cloning
 			# RHDISTDATADIR will change based on these tests
 			# VARS is a list of variables added for the 'dist-dump-variables' target
@@ -58,6 +61,7 @@ do
 				grep -v -w UPSTREAM |\
 				grep -v -w RHEL_RELEASE |\
 				grep -v -w SHELL |\
+				grep -v -w SPECBPFTOOLVERSION |\
 				grep -v -w RHGITURL |\
 				grep -v -w RHDISTDATADIR |\
 				grep -v -w VARS |\
