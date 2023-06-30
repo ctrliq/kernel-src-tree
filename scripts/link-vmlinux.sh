@@ -359,10 +359,7 @@ sorttable()
 cleanup()
 {
 	rm -f .btf.*
-	rm -f .tmp_System.map
-	rm -f .tmp_initcalls.lds
 	rm -f .tmp_symversions.lds
-	rm -f .tmp_vmlinux*
 	rm -f System.map
 	rm -f vmlinux
 	rm -f vmlinux.map
