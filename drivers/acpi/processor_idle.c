@@ -110,7 +110,7 @@ static void __cpuidle acpi_safe_halt(void)
 {
 	if (!tif_need_resched()) {
 		raw_safe_halt();
-		raw_local_irq_disable();
+		local_irq_disable();
 	}
 }
 
