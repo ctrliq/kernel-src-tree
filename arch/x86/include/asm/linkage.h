@@ -15,8 +15,19 @@
 #define __ALIGN		.balign CONFIG_FUNCTION_ALIGNMENT, 0x90;
 #define __ALIGN_STR	__stringify(__ALIGN)
 
-#define ASM_FUNC_ALIGN		__ALIGN_STR
-#define __FUNC_ALIGN		__ALIGN
+#if defined(CONFIG_CALL_THUNKS) && !defined(__DISABLE_EXPORTS) && !defined(BUILD_VDSO)
+#define FUNCTION_PADDING	.skip CONFIG_FUNCTION_ALIGNMENT, 0x90;
+#else
+#define FUNCTION_PADDING
+#endif
+
+#if (CONFIG_FUNCTION_ALIGNMENT > 8) && !defined(__DISABLE_EXPORTS) && !defined(BULID_VDSO)
+# define __FUNC_ALIGN		__ALIGN; FUNCTION_PADDING
+#else
+# define __FUNC_ALIGN		__ALIGN
+#endif
+
+#define ASM_FUNC_ALIGN		__stringify(__FUNC_ALIGN)
 #define SYM_F_ALIGN		__FUNC_ALIGN
 
 #ifdef __ASSEMBLY__
