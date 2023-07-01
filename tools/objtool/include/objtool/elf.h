@@ -38,7 +38,7 @@ struct section {
 	Elf_Data *data;
 	char *name;
 	int idx;
-	bool changed, text, rodata, noinstr, truncate;
+	bool changed, text, rodata, noinstr, init, truncate;
 };
 
 struct symbol {
