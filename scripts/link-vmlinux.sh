@@ -145,6 +145,10 @@ objtool_link()
 			objtoolopt="${objtoolopt} --hacks=noinstr"
 		fi
 
+		if is_enabled CONFIG_CALL_DEPTH_TRACKING; then
+			objtoolopt="${objtoolopt} --hacks=skylake"
+		fi
+
 		if is_enabled CONFIG_X86_KERNEL_IBT; then
 			objtoolopt="${objtoolopt} --ibt"
 		fi
