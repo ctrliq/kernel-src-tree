@@ -836,6 +836,12 @@ static int __init retbleed_parse_cmdline(char *str)
 			retbleed_cmd = RETBLEED_CMD_IBPB;
 		} else if (!strcmp(str, "stuff")) {
 			retbleed_cmd = RETBLEED_CMD_STUFF;
+			/*
+			 * There are known issues with retbleed=stuff
+			 * mitigation in the current code base.
+			 * Mark it as a tech preview for now.
+			 */
+			mark_tech_preview("Retbleed call depth tracking mitigation", NULL);
 		} else if (!strcmp(str, "nosmt")) {
 			retbleed_nosmt = true;
 		} else if (!strcmp(str, "force")) {
