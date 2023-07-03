@@ -4040,6 +4040,7 @@ static const struct hash_testvec hmac_sha1_tv_template[] = {
 		.digest	= "\xb6\x17\x31\x86\x55\x05\x72\x64"
 			  "\xe2\x8b\xc0\xb6\xfb\x37\x8c\x8e\xf1"
 			  "\x46\xbe",
+#if 0 /* fips insists keysize be 14 bytes or greater. */
 	}, {
 		.key	= "Jefe",
 		.ksize	= 4,
@@ -4049,6 +4050,7 @@ static const struct hash_testvec hmac_sha1_tv_template[] = {
 			  "\x16\xd5\xf1\x84\xdf\x9c\x25\x9a\x7c\x79",
 		.np	= 2,
 		.tap	= { 14, 14 }
+#endif
 	}, {
 		.key	= "\xaa\xaa\xaa\xaa\xaa\xaa\xaa\xaa\xaa\xaa\xaa\xaa\xaa\xaa\xaa\xaa\xaa\xaa\xaa\xaa",
 		.ksize	= 20,
@@ -4125,6 +4127,7 @@ static const struct hash_testvec hmac_sha224_tv_template[] = {
 			"\x68\x32\x10\x7c\xd4\x9d\xf3\x3f"
 			"\x47\xb4\xb1\x16\x99\x12\xba\x4f"
 			"\x53\x68\x4b\x22",
+#if 0 /* fips insists keysize be 14 bytes or greater. */
 	}, {
 		.key    = "Jefe",
 		.ksize  = 4,
@@ -4140,6 +4143,7 @@ static const struct hash_testvec hmac_sha224_tv_template[] = {
 			"\x8f\xd0\x5e\x44",
 		.np = 4,
 		.tap    = { 7, 7, 7, 7 }
+#endif
 	}, {
 		.key    = "\xaa\xaa\xaa\xaa\xaa\xaa\xaa\xaa"
 			"\xaa\xaa\xaa\xaa\xaa\xaa\xaa\xaa"
@@ -4729,6 +4733,7 @@ static const struct hash_testvec hmac_sha384_tv_template[] = {
 			  "\x82\xaa\x03\x4c\x7c\xeb\xc5\x9c"
 			  "\xfa\xea\x9e\xa9\x07\x6e\xde\x7f"
 			  "\x4a\xf1\x52\xe8\xb2\xfa\x9c\xb6",
+#if 0 /* fips insists keysize be 14 bytes or greater. */
 	}, {
 		.key	= "Jefe",
 		.ksize	= 4,
@@ -4742,6 +4747,7 @@ static const struct hash_testvec hmac_sha384_tv_template[] = {
 			  "\x8b\x32\x39\xec\xfa\xb2\x16\x49",
 		.np	= 4,
 		.tap	= { 7, 7, 7, 7 }
+#endif
 	}, {
 		.key	= "\xaa\xaa\xaa\xaa\xaa\xaa\xaa\xaa"
 			  "\xaa\xaa\xaa\xaa\xaa\xaa\xaa\xaa"
@@ -4932,6 +4938,7 @@ static const struct hash_testvec hmac_sha3_224_tv_template[] = {
 			  "\x6a\x03\x1d\xca\xfd\x56\x37\x3d"
 			  "\x98\x84\x36\x76\x41\xd8\xc5\x9a"
 			  "\xf3\xc8\x60\xf7",
+#if 0 /* fips insists keysize be 14 bytes or greater. */
 	}, {
 		.key	= "Jefe",
 		.ksize	= 4,
@@ -4943,6 +4950,7 @@ static const struct hash_testvec hmac_sha3_224_tv_template[] = {
 			  "\xba\xce\x5e\x66",
 		.np	= 4,
 		.tap	= { 7, 7, 7, 7 }
+#endif
 	}, {
 		.key	= "\xaa\xaa\xaa\xaa\xaa\xaa\xaa\xaa"
 			  "\xaa\xaa\xaa\xaa\xaa\xaa\xaa\xaa"
@@ -5021,6 +5029,7 @@ static const struct hash_testvec hmac_sha3_256_tv_template[] = {
 			  "\xe2\xa3\xa4\x0e\x69\x77\x43\x51"
 			  "\x14\x0b\xb7\x18\x5e\x12\x02\xcd"
 			  "\xcc\x91\x75\x89\xf9\x5e\x16\xbb",
+#if 0 /* fips insists keysize be 14 bytes or greater. */
 	}, {
 		.key	= "Jefe",
 		.ksize	= 4,
@@ -5032,6 +5041,7 @@ static const struct hash_testvec hmac_sha3_256_tv_template[] = {
 			  "\xe8\x57\xfb\xe2\x64\x5e\x1b\xa5",
 		.np	= 4,
 		.tap	= { 7, 7, 7, 7 }
+#endif
 	}, {
 		.key	= "\xaa\xaa\xaa\xaa\xaa\xaa\xaa\xaa"
 			  "\xaa\xaa\xaa\xaa\xaa\xaa\xaa\xaa"
@@ -5112,6 +5122,7 @@ static const struct hash_testvec hmac_sha3_384_tv_template[] = {
 			  "\x1b\xc2\x7d\xc1\x0a\x2e\x72\x3a"
 			  "\x20\xd3\x70\xb4\x77\x43\x13\x0e"
 			  "\x26\xac\x7e\x3d\x53\x28\x86\xbd",
+#if 0 /* fips insists keysize be 14 bytes or greater. */
 	}, {
 		.key	= "Jefe",
 		.ksize	= 4,
@@ -5125,6 +5136,7 @@ static const struct hash_testvec hmac_sha3_384_tv_template[] = {
 			  "\x1b\x3f\x5e\x0e\x9d\xf4\xc2\x0a",
 		.np	= 4,
 		.tap	= { 7, 7, 7, 7 }
+#endif
 	}, {
 		.key	= "\xaa\xaa\xaa\xaa\xaa\xaa\xaa\xaa"
 			  "\xaa\xaa\xaa\xaa\xaa\xaa\xaa\xaa"
@@ -5211,6 +5223,7 @@ static const struct hash_testvec hmac_sha3_512_tv_template[] = {
 			  "\x88\xd2\x2b\x6d\xc6\x13\x80\xf2"
 			  "\x3a\x66\x8f\xd3\x88\x8b\xb8\x05"
 			  "\x37\xc0\xa0\xb8\x64\x07\x68\x9e",
+#if 0 /* fips insists keysize be 14 bytes or greater. */
 	}, {
 		.key	= "Jefe",
 		.ksize	= 4,
@@ -5226,6 +5239,7 @@ static const struct hash_testvec hmac_sha3_512_tv_template[] = {
 			  "\x96\x02\x75\xbe\xb4\xe6\x20\x24",
 		.np	= 4,
 		.tap	= { 7, 7, 7, 7 }
+#endif
 	}, {
 		.key	= "\xaa\xaa\xaa\xaa\xaa\xaa\xaa\xaa"
 			  "\xaa\xaa\xaa\xaa\xaa\xaa\xaa\xaa"
