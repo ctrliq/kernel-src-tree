@@ -18,8 +18,13 @@ load test-lib.bash
 }
 
 # Purpose: This test verifies the BUILD_TARGET value is "eln" for DIST=".eln".
+# The BUILD_TARGET & DISTRO environment variables need to be unset or the
+# redhat/Makefile will just pick up existing values and not reconsider the
+# DIST=".eln" passed to the make dist-dump-variables below.
 @test "eln BUILD_TARGET test" {
+	unset BUILD_TARGET
+	unset DISTRO
 	bt=$(make DIST=".eln" dist-dump-variables | grep "BUILD_TARGET=" | cut -d"=" -f2)
-	run [ "$bt" != "eln" ]
+	run [ "$bt" = "eln" ]
 	check_status
 }
