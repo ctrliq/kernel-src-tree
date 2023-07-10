@@ -2800,6 +2800,12 @@ static inline void layout_symtab(struct module *mod, struct load_info *info)
 static void add_kallsyms(struct module *mod, const struct load_info *info)
 {
 }
+
+static inline unsigned long find_kallsyms_symbol_value(struct module *mod,
+						       const char *name)
+{
+	return 0;
+}
 #endif /* CONFIG_KALLSYMS */
 
 #if IS_ENABLED(CONFIG_KALLSYMS) && IS_ENABLED(CONFIG_STACKTRACE_BUILD_ID)
