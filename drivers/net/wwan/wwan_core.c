@@ -491,6 +491,7 @@ struct wwan_port *wwan_create_port(struct device *parent,
 	if (err)
 		goto error_put_device;
 
+	dev_info(&wwandev->dev, "port %s attached\n", dev_name(&port->dev));
 	return port;
 
 error_put_device:
@@ -516,6 +517,8 @@ void wwan_remove_port(struct wwan_port *port)
 
 	skb_queue_purge(&port->rxq);
 	dev_set_drvdata(&port->dev, NULL);
+
+	dev_info(&wwandev->dev, "port %s disconnected\n", dev_name(&port->dev));
 	device_unregister(&port->dev);
 
 	/* Release related wwan device */
