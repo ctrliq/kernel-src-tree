@@ -224,9 +224,9 @@ alloc_zero_tailing_info(const void *orecord, __u32 cnt,
 int bpf_prog_load(enum bpf_prog_type prog_type,
 		  const char *prog_name, const char *license,
 		  const struct bpf_insn *insns, size_t insn_cnt,
-		  const struct bpf_prog_load_opts *opts)
+		  struct bpf_prog_load_opts *opts)
 {
-	const size_t attr_sz = offsetofend(union bpf_attr, fd_array);
+	const size_t attr_sz = offsetofend(union bpf_attr, log_true_size);
 	void *finfo = NULL, *linfo = NULL;
 	const char *func_info, *line_info;
 	__u32 log_size, log_level, attach_prog_fd, attach_btf_obj_fd;
@@ -306,6 +306,7 @@ int bpf_prog_load(enum bpf_prog_type prog_type,
 	}
 
 	fd = sys_bpf_prog_load(&attr, attr_sz, attempts);
+	OPTS_SET(opts, log_true_size, attr.log_true_size);
 	if (fd >= 0)
 		return fd;
 
@@ -346,6 +347,7 @@ int bpf_prog_load(enum bpf_prog_type prog_type,
 		}
 
 		fd = sys_bpf_prog_load(&attr, attr_sz, attempts);
+		OPTS_SET(opts, log_true_size, attr.log_true_size);
 		if (fd >= 0)
 			goto done;
 	}
@@ -360,6 +362,7 @@ int bpf_prog_load(enum bpf_prog_type prog_type,
 		attr.log_level = 1;
 
 		fd = sys_bpf_prog_load(&attr, attr_sz, attempts);
+		OPTS_SET(opts, log_true_size, attr.log_true_size);
 	}
 done:
 	/* free() doesn't affect errno, so we don't need to restore it */
