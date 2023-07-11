@@ -220,7 +220,7 @@ found:
  * Sends a command to the SCM and waits for the command to finish processing.
  * This should *only* be called in pre-emptible context.
  */
-static int qcom_scm_call(struct device *dev, const struct qcom_scm_desc *desc,
+int qcom_scm_call(struct device *dev, const struct qcom_scm_desc *desc,
 			 struct qcom_scm_res *res)
 {
 	might_sleep();
@@ -235,6 +235,7 @@ static int qcom_scm_call(struct device *dev, const struct qcom_scm_desc *desc,
 		return -EINVAL;
 	}
 }
+EXPORT_SYMBOL_GPL(qcom_scm_call);
 
 /**
  * qcom_scm_call_atomic() - atomic variation of qcom_scm_call()
@@ -245,7 +246,7 @@ static int qcom_scm_call(struct device *dev, const struct qcom_scm_desc *desc,
  * Sends a command to the SCM and waits for the command to finish processing.
  * This can be called in atomic context.
  */
-static int qcom_scm_call_atomic(struct device *dev,
+int qcom_scm_call_atomic(struct device *dev,
 				const struct qcom_scm_desc *desc,
 				struct qcom_scm_res *res)
 {
@@ -260,6 +261,7 @@ static int qcom_scm_call_atomic(struct device *dev,
 		return -EINVAL;
 	}
 }
+EXPORT_SYMBOL_GPL(qcom_scm_call_atomic);
 
 static bool __qcom_scm_is_call_available(struct device *dev, u32 svc_id,
 					 u32 cmd_id)
