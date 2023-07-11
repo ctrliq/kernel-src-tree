@@ -802,6 +802,7 @@ static int ceph_writepages_start(struct address_space *mapping,
 	bool should_loop, range_whole = false;
 	bool done = false;
 	bool caching = ceph_is_cache_enabled(inode);
+	xa_mark_t tag;
 
 	if (wbc->sync_mode == WB_SYNC_NONE &&
 	    fsc->write_congested)
@@ -828,6 +829,11 @@ static int ceph_writepages_start(struct address_space *mapping,
 	start_index = wbc->range_cyclic ? mapping->writeback_index : 0;
 	index = start_index;
 
+	if (wbc->sync_mode == WB_SYNC_ALL || wbc->tagged_writepages) {
+		tag = PAGECACHE_TAG_TOWRITE;
+	} else {
+		tag = PAGECACHE_TAG_DIRTY;
+	}
 retry:
 	/* find oldest snap context with dirty data */
 	snapc = get_oldest_context(inode, &ceph_wbc, NULL);
@@ -866,6 +872,9 @@ retry:
 		dout(" non-head snapc, range whole\n");
 	}
 
+	if (wbc->sync_mode == WB_SYNC_ALL || wbc->tagged_writepages)
+		tag_pages_for_writeback(mapping, index, end);
+
 	ceph_put_snap_context(last_snapc);
 	last_snapc = snapc;
 
@@ -882,7 +891,7 @@ retry:
 
 get_more_pages:
 		pvec_pages = pagevec_lookup_range_tag(&pvec, mapping, &index,
-						end, PAGECACHE_TAG_DIRTY);
+						      end, tag);
 		dout("pagevec_lookup_range_tag got %d\n", pvec_pages);
 		if (!pvec_pages && !locked_pages)
 			break;
