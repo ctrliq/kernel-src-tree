@@ -598,6 +598,8 @@ static int mhi_mbim_probe(struct mhi_device *mhi_dev, const struct mhi_device_id
 	struct mhi_mbim_context *mbim;
 	int err;
 
+	mark_tech_preview("Qualcomm mhi mbim (WWAN) driver", THIS_MODULE);
+
 	mbim = devm_kzalloc(&mhi_dev->dev, sizeof(*mbim), GFP_KERNEL);
 	if (!mbim)
 		return -ENOMEM;
