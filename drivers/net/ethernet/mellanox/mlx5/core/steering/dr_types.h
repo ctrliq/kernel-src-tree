@@ -148,6 +148,8 @@ struct mlx5dr_cmd_caps;
 struct mlx5dr_rule_rx_tx;
 struct mlx5dr_matcher_rx_tx;
 struct mlx5dr_ste_ctx;
+struct mlx5dr_send_info_pool;
+struct mlx5dr_icm_hot_chunk;
 
 struct mlx5dr_ste {
 	/* refcount: indicates the num of rules that using this ste */
@@ -922,6 +924,10 @@ struct mlx5dr_domain {
 	refcount_t refcount;
 	struct mlx5dr_icm_pool *ste_icm_pool;
 	struct mlx5dr_icm_pool *action_icm_pool;
+	struct mlx5dr_send_info_pool *send_info_pool_rx;
+	struct mlx5dr_send_info_pool *send_info_pool_tx;
+	struct kmem_cache *chunks_kmem_cache;
+	struct kmem_cache *htbls_kmem_cache;
 	struct mlx5dr_send_ring *send_ring;
 	struct mlx5dr_domain_info info;
 	struct xarray csum_fts_xa;
@@ -1126,7 +1132,6 @@ int mlx5dr_rule_get_reverse_rule_members(struct mlx5dr_ste **ste_arr,
 
 struct mlx5dr_icm_chunk {
 	struct mlx5dr_icm_buddy_mem *buddy_mem;
-	struct list_head chunk_list;
 
 	/* indicates the index of this chunk in the whole memory,
 	 * used for deleting the chunk from the buddy
@@ -1178,6 +1183,9 @@ u64 mlx5dr_icm_pool_get_chunk_icm_addr(struct mlx5dr_icm_chunk *chunk);
 u32 mlx5dr_icm_pool_get_chunk_num_of_entries(struct mlx5dr_icm_chunk *chunk);
 u32 mlx5dr_icm_pool_get_chunk_byte_size(struct mlx5dr_icm_chunk *chunk);
 u8 *mlx5dr_ste_get_hw_ste(struct mlx5dr_ste *ste);
+
+struct mlx5dr_ste_htbl *mlx5dr_icm_pool_alloc_htbl(struct mlx5dr_icm_pool *pool);
+void mlx5dr_icm_pool_free_htbl(struct mlx5dr_icm_pool *pool, struct mlx5dr_ste_htbl *htbl);
 
 static inline int
 mlx5dr_icm_pool_dm_type_to_entry_size(enum mlx5dr_icm_type icm_type)
@@ -1323,20 +1331,6 @@ struct mlx5dr_cmd_gid_attr {
 	u32 roce_ver;
 };
 
-struct mlx5dr_cmd_qp_create_attr {
-	u32 page_id;
-	u32 pdn;
-	u32 cqn;
-	u32 pm_state;
-	u32 service_type;
-	u32 buff_umem_id;
-	u32 db_umem_id;
-	u32 sq_wqe_cnt;
-	u32 rq_wqe_cnt;
-	u32 rq_wqe_shift;
-	u8 isolate_vl_tc:1;
-};
-
 int mlx5dr_cmd_query_gid(struct mlx5_core_dev *mdev, u8 vhca_port_num,
 			 u16 index, struct mlx5dr_cmd_gid_attr *attr);
 
@@ -1446,6 +1440,12 @@ int mlx5dr_send_postsend_formatted_htbl(struct mlx5dr_domain *dmn,
 					bool update_hw_ste);
 int mlx5dr_send_postsend_action(struct mlx5dr_domain *dmn,
 				struct mlx5dr_action *action);
+
+int mlx5dr_send_info_pool_create(struct mlx5dr_domain *dmn);
+void mlx5dr_send_info_pool_destroy(struct mlx5dr_domain *dmn);
+struct mlx5dr_ste_send_info *mlx5dr_send_info_alloc(struct mlx5dr_domain *dmn,
+						    enum mlx5dr_domain_nic_type nic_type);
+void mlx5dr_send_info_free(struct mlx5dr_ste_send_info *ste_send_info);
 
 struct mlx5dr_cmd_ft_info {
 	u32 id;
