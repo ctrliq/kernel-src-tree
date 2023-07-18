@@ -1172,6 +1172,5 @@ static struct platform_driver amd_gpio_driver = {
 
 module_platform_driver(amd_gpio_driver);
 
-MODULE_LICENSE("GPL v2");
 MODULE_AUTHOR("Ken Xue <Ken.Xue@amd.com>, Jeff Wu <Jeff.Wu@amd.com>");
 MODULE_DESCRIPTION("AMD GPIO pinctrl driver");
