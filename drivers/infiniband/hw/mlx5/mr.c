@@ -39,9 +39,7 @@
 #include <linux/delay.h>
 #include <linux/dma-buf.h>
 #include <linux/dma-resv.h>
-#include <rdma/ib_umem.h>
 #include <rdma/ib_umem_odp.h>
-#include <rdma/ib_verbs.h>
 #include "dm.h"
 #include "mlx5_ib.h"
 #include "umr.h"
@@ -1405,7 +1403,6 @@ static int umr_rereg_pas(struct mlx5_ib_mr *mr, struct ib_pd *pd,
 		upd_flags |= MLX5_IB_UPD_XLT_ACCESS;
 	}
 
-	mr->ibmr.length = new_umem->length;
 	mr->ibmr.iova = iova;
 	mr->ibmr.length = new_umem->length;
 	mr->page_shift = order_base_2(page_size);
@@ -1932,10 +1929,8 @@ int mlx5_ib_alloc_mw(struct ib_mw *ibmw, struct ib_udata *udata)
 	ndescs = req.num_klms ? roundup(req.num_klms, 4) : roundup(1, 4);
 
 	in = kzalloc(inlen, GFP_KERNEL);
-	if (!in) {
-		err = -ENOMEM;
-		goto free;
-	}
+	if (!in)
+		return -ENOMEM;
 
 	mkc = MLX5_ADDR_OF(create_mkey_in, in, memory_key_mkey_entry);
 
