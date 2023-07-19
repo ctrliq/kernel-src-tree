@@ -778,6 +778,9 @@ struct fuse_conn {
 	/* Initialize security xattrs when creating a new inode */
 	unsigned int init_security:1;
 
+	/* Add supplementary group info when creating a new inode */
+	unsigned int create_supp_group:1;
+
 	/** The number of requests waiting for completion */
 	atomic_t num_waiting;
 

@@ -355,6 +355,8 @@ struct fuse_file_lock {
  * FUSE_INIT_RESERVED: reserved, do not use
  * FUSE_SECURITY_CTX:	add security context to create, mkdir, symlink, and
  *			mknod
+ * FUSE_CREATE_SUPP_GROUP: add supplementary group info to create, mkdir,
+ *			symlink and mknod (single group that matches parent)
  * FUSE_HAS_EXPIRE_ONLY: kernel supports expiry-only entry invalidation
  */
 #define FUSE_ASYNC_READ		(1 << 0)
@@ -391,6 +393,7 @@ struct fuse_file_lock {
 #define FUSE_INIT_RESERVED	(1 << 31)
 /* bits 32..63 get shifted down 32 bits into the flags2 field */
 #define FUSE_SECURITY_CTX	(1ULL << 32)
+#define FUSE_CREATE_SUPP_GROUP	(1ULL << 34)
 #define FUSE_HAS_EXPIRE_ONLY	(1ULL << 35)
 
 /**
@@ -498,10 +501,12 @@ struct fuse_file_lock {
 /**
  * extension type
  * FUSE_MAX_NR_SECCTX: maximum value of &fuse_secctx_header.nr_secctx
+ * FUSE_EXT_GROUPS: &fuse_supp_groups extension
  */
 enum fuse_ext_type {
 	/* Types 0..31 are reserved for fuse_secctx_header */
 	FUSE_MAX_NR_SECCTX	= 31,
+	FUSE_EXT_GROUPS		= 32,
 };
 
 enum fuse_opcode {
@@ -1059,6 +1064,16 @@ struct fuse_secctx_header {
 struct fuse_ext_header {
 	uint32_t	size;
 	uint32_t	type;
+};
+
+/**
+ * struct fuse_supp_groups - Supplementary group extension
+ * @nr_groups: number of supplementary groups
+ * @groups: flexible array of group IDs
+ */
+struct fuse_supp_groups {
+	uint32_t	nr_groups;
+	uint32_t	groups[];
 };
 
 #endif /* _LINUX_FUSE_H */
