@@ -18,6 +18,20 @@ struct mlx5_vdpa_net_resources {
 	bool valid;
 };
 
+#define MLX5_VDPA_IRQ_NAME_LEN 32
+
+struct mlx5_vdpa_irq_pool_entry {
+	struct msi_map map;
+	bool used;
+	char name[MLX5_VDPA_IRQ_NAME_LEN];
+	void *dev_id;
+};
+
+struct mlx5_vdpa_irq_pool {
+	int num_ent;
+	struct mlx5_vdpa_irq_pool_entry *entries;
+};
+
 struct mlx5_vdpa_net {
 	struct mlx5_vdpa_dev mvdev;
 	struct mlx5_vdpa_net_resources res;
@@ -40,6 +54,7 @@ struct mlx5_vdpa_net {
 	struct notifier_block nb;
 	struct vdpa_callback config_cb;
 	struct mlx5_vdpa_wq_ent cvq_ent;
+	struct mlx5_vdpa_irq_pool irqp;
 };
 
 #endif /* __MLX5_VNET_H__ */
