@@ -57,7 +57,7 @@ gen_initcalls()
 {
 	info GEN .tmp_initcalls.lds
 
-	${PYTHON} ${srctree}/scripts/jobserver-exec		\
+	${PYTHON3} ${srctree}/scripts/jobserver-exec		\
 	${PERL} ${srctree}/scripts/generate_initcall_order.pl	\
 		${KBUILD_VMLINUX_OBJS} ${KBUILD_VMLINUX_LIBS}	\
 		> .tmp_initcalls.lds
@@ -143,6 +143,10 @@ objtool_link()
 
 		if is_enabled CONFIG_HAVE_NOINSTR_HACK; then
 			objtoolopt="${objtoolopt} --hacks=noinstr"
+		fi
+
+		if is_enabled CONFIG_CALL_DEPTH_TRACKING; then
+			objtoolopt="${objtoolopt} --hacks=skylake"
 		fi
 
 		if is_enabled CONFIG_X86_KERNEL_IBT; then
@@ -359,10 +363,7 @@ sorttable()
 cleanup()
 {
 	rm -f .btf.*
-	rm -f .tmp_System.map
-	rm -f .tmp_initcalls.lds
 	rm -f .tmp_symversions.lds
-	rm -f .tmp_vmlinux*
 	rm -f System.map
 	rm -f vmlinux
 	rm -f vmlinux.map
