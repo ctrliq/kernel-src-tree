@@ -12,7 +12,7 @@
 #include <linux/swiotlb.h>
 #include <linux/cc_platform.h>
 #include <linux/mem_encrypt.h>
-#include <linux/virtio_config.h>
+#include <linux/platform-feature.h>
 
 /* Override for DMA direct allocation check - ARCH_HAS_FORCE_DMA_UNENCRYPTED */
 bool force_dma_unencrypted(struct device *dev)
@@ -93,12 +93,6 @@ void __init mem_encrypt_init(void)
 	print_mem_encrypt_feature_info();
 }
 
-int arch_has_restricted_virtio_memory_access(void)
-{
-	return cc_platform_has(CC_ATTR_GUEST_MEM_ENCRYPT);
-}
-EXPORT_SYMBOL_GPL(arch_has_restricted_virtio_memory_access);
-
 void __init mem_encrypt_setup_arch(void)
 {
 	phys_addr_t total_mem = memblock_phys_mem_size();
@@ -127,4 +121,7 @@ void __init mem_encrypt_setup_arch(void)
 	size = total_mem * 6 / 100;
 	size = clamp_val(size, IO_TLB_DEFAULT_SIZE, SZ_1G);
 	swiotlb_adjust_size(size);
+
+	/* Set restricted memory access for virtio. */
+	platform_set(PLATFORM_VIRTIO_RESTRICTED_MEM_ACCESS);
 }

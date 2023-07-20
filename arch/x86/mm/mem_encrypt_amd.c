@@ -21,6 +21,7 @@
 #include <linux/dma-mapping.h>
 #include <linux/virtio_config.h>
 #include <linux/cc_platform.h>
+#include <linux/platform-feature.h>
 
 #include <asm/tlbflush.h>
 #include <asm/fixmap.h>

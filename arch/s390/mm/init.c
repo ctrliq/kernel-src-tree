@@ -31,6 +31,7 @@
 #include <linux/cma.h>
 #include <linux/gfp.h>
 #include <linux/dma-direct.h>
+#include <linux/platform-feature.h>
 #include <linux/percpu.h>
 #include <asm/processor.h>
 #include <linux/uaccess.h>
@@ -169,21 +170,13 @@ bool force_dma_unencrypted(struct device *dev)
 	return is_prot_virt_guest();
 }
 
-#ifdef CONFIG_ARCH_HAS_RESTRICTED_VIRTIO_MEMORY_ACCESS
-
-int arch_has_restricted_virtio_memory_access(void)
-{
-	return is_prot_virt_guest();
-}
-EXPORT_SYMBOL(arch_has_restricted_virtio_memory_access);
-
-#endif
-
 /* protected virtualization */
 static void pv_init(void)
 {
 	if (!is_prot_virt_guest())
 		return;
+
+	platform_set(PLATFORM_VIRTIO_RESTRICTED_MEM_ACCESS);
 
 	/* make sure bounce buffers are shared */
 	swiotlb_init(true, SWIOTLB_FORCE | SWIOTLB_VERBOSE);
