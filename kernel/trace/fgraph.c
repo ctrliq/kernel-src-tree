@@ -29,6 +29,7 @@ int ftrace_graph_active;
 /* Both enabled by default (can be cleared by function_graph tracer flags */
 static bool fgraph_sleep_time = true;
 
+#ifdef CONFIG_DYNAMIC_FTRACE
 /*
  * archs can override this function if they must do something
  * to enable hook for graph tracer.
@@ -46,6 +47,7 @@ int __weak ftrace_disable_ftrace_graph_caller(void)
 {
 	return 0;
 }
+#endif
 
 /**
  * ftrace_graph_is_dead - returns true if ftrace_graph_stop() was called
