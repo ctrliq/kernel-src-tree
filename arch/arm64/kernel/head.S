@@ -404,7 +404,7 @@ SYM_FUNC_END(create_kernel_mapping)
 	stp	xzr, xzr, [sp, #S_STACKFRAME]
 	add	x29, sp, #S_STACKFRAME
 
-	scs_load \tsk
+	scs_load_current
 
 	adr_l	\tmp1, __per_cpu_offset
 	ldr	w\tmp2, [\tsk, #TSK_CPU]
@@ -584,7 +584,6 @@ SYM_FUNC_START_LOCAL(secondary_startup)
 	 * Common entry point for secondary CPUs.
 	 */
 	mov	x20, x0				// preserve boot mode
-	bl	finalise_el2
 	bl	__cpu_secondary_check52bitva
 #if VA_BITS > 48
 	ldr_l	x0, vabits_actual
@@ -600,6 +599,10 @@ SYM_FUNC_END(secondary_startup)
 SYM_FUNC_START_LOCAL(__secondary_switched)
 	mov	x0, x20
 	bl	set_cpu_boot_mode_flag
+
+	mov	x0, x20
+	bl	finalise_el2
+
 	str_l	xzr, __early_cpu_boot_status, x3
 	adr_l	x5, vectors
 	msr	vbar_el1, x5
