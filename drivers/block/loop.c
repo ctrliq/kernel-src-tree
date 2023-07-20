@@ -2083,6 +2083,7 @@ static void loop_remove(struct loop_device *lo)
 	put_disk(lo->lo_disk);
 }
 
+#ifdef CONFIG_BLOCK_LEGACY_AUTOLOAD
 static void loop_probe(dev_t dev)
 {
 	int idx = MINOR(dev) >> part_shift;
@@ -2091,6 +2092,9 @@ static void loop_probe(dev_t dev)
 		return;
 	loop_add(idx);
 }
+#else
+#define loop_probe NULL
+#endif /* !CONFIG_BLOCK_LEGACY_AUTOLOAD */
 
 static int loop_control_remove(int idx)
 {
