@@ -3117,10 +3117,10 @@ static void mlx5_vdpa_dev_del(struct vdpa_mgmt_dev *v_mdev, struct vdpa_device *
 	struct workqueue_struct *wq;
 
 	unregister_link_notifier(ndev);
+	_vdpa_unregister_device(dev);
 	wq = mvdev->wq;
 	mvdev->wq = NULL;
 	destroy_workqueue(wq);
-	_vdpa_unregister_device(dev);
 	mgtdev->ndev = NULL;
 }
 
