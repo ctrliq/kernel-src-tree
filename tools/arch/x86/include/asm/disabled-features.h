@@ -10,12 +10,6 @@
  * cpu_feature_enabled().
  */
 
-#ifdef CONFIG_X86_SMAP
-# define DISABLE_SMAP	0
-#else
-# define DISABLE_SMAP	(1<<(X86_FEATURE_SMAP & 31))
-#endif
-
 #ifdef CONFIG_X86_UMIP
 # define DISABLE_UMIP	0
 #else

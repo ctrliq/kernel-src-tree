@@ -177,9 +177,8 @@ objtool_link()
 			objtoolopt="${objtoolopt} --static-call"
 		fi
 
-		if is_enabled CONFIG_X86_SMAP; then
-			objtoolopt="${objtoolopt} --uaccess"
-		fi
+		objtoolopt="${objtoolopt} --uaccess"
+
 	fi
 
 	if is_enabled CONFIG_NOINSTR_VALIDATION; then
