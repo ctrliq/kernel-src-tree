@@ -144,10 +144,6 @@ void flush_thread(void)
 	*/
 }
 
-void release_thread(struct task_struct *dead_task)
-{
-}
-
 /*
  * Idle thread support
  *

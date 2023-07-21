@@ -224,11 +224,6 @@ flush_thread(void)
 	current_thread_info()->pcb.unique = 0;
 }
 
-void
-release_thread(struct task_struct *dead_task)
-{
-}
-
 /*
  * Copy architecture-specific thread state
  */
