@@ -769,6 +769,12 @@ static __always_inline bool system_supports_sme(void)
 		cpus_have_const_cap(ARM64_SME);
 }
 
+static __always_inline bool system_supports_sme2(void)
+{
+	return IS_ENABLED(CONFIG_ARM64_SME) &&
+		cpus_have_const_cap(ARM64_SME2);
+}
+
 static __always_inline bool system_supports_fa64(void)
 {
 	return IS_ENABLED(CONFIG_ARM64_SME) &&
@@ -806,7 +812,7 @@ static inline bool system_has_full_ptr_auth(void)
 static __always_inline bool system_uses_irq_prio_masking(void)
 {
 	return IS_ENABLED(CONFIG_ARM64_PSEUDO_NMI) &&
-	       cpus_have_const_cap(ARM64_HAS_IRQ_PRIO_MASKING);
+	       cpus_have_const_cap(ARM64_HAS_GIC_PRIO_MASKING);
 }
 
 static inline bool system_supports_mte(void)

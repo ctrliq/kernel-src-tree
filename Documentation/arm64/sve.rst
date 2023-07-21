@@ -112,7 +112,7 @@ the SVE instruction set architecture.
 
 * On syscall, V0..V31 are preserved (as without SVE).  Thus, bits [127:0] of
   Z0..Z31 are preserved.  All other bits of Z0..Z31, and all of P0..P15 and FFR
-  become unspecified on return from a syscall.
+  become zero on return from a syscall.
 
 * The SVE registers are not used to pass arguments to or receive results from
   any syscall.
@@ -175,7 +175,7 @@ the SVE instruction set architecture.
 When returning from a signal handler:
 
 * If there is no sve_context record in the signal frame, or if the record is
-  present but contains no register data as desribed in the previous section,
+  present but contains no register data as described in the previous section,
   then the SVE registers/bits become non-live and take unspecified values.
 
 * If sve_context is present in the signal frame and contains full register
@@ -223,7 +223,7 @@ prctl(PR_SVE_SET_VL, unsigned long arg)
 	    Defer the requested vector length change until the next execve()
 	    performed by this thread.
 
-	    The effect is equivalent to implicit exceution of the following
+	    The effect is equivalent to implicit execution of the following
 	    call immediately after the next execve() (if any) by the thread:
 
 		prctl(PR_SVE_SET_VL, arg & ~PR_SVE_SET_VL_ONEXEC)
