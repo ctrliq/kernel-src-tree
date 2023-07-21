@@ -419,10 +419,3 @@ int __cpu_up(unsigned int cpu, struct task_struct *tidle)
 
 	return cpu_online(cpu) ? 0 : -ENOSYS;
 }
-
-#ifdef CONFIG_PROC_FS
-int setup_profiling_timer(unsigned int multiplier)
-{
-	return -EINVAL;
-}
-#endif
