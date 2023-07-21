@@ -135,7 +135,7 @@ xfs_dax_notify_ddev_failure(
 			break;
 		}
 
-		cur = xfs_rmapbt_init_cursor(mp, tp, agf_bp, agf_bp->b_pag);
+		cur = xfs_rmapbt_init_cursor(mp, tp, agf_bp, pag);
 
 		/*
 		 * Set the rmap range from ri_low to ri_high, which represents
