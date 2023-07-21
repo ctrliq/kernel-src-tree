@@ -75,6 +75,10 @@ ifeq ($(CONFIG_EFI_STUB),y)
 # never referenced explicitly from the startup code
 LDFLAGS_vmlinux += -u efi_pe_entry
 endif
+LDFLAGS_vmlinux += -z noexecstack
+ifeq ($(CONFIG_LD_IS_BFD),y)
+LDFLAGS_vmlinux += $(call ld-option,--no-warn-rwx-segments)
+endif
 LDFLAGS_vmlinux += -T
 
 hostprogs	:= mkpiggy
