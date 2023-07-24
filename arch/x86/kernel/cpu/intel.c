@@ -1006,7 +1006,8 @@ static const struct {
 
 static struct ratelimit_state bld_ratelimit;
 
-static unsigned int sysctl_sld_mitigate = 1;
+// RHEL9: we want this to be disabled by default (ie, set to 0)
+static unsigned int sysctl_sld_mitigate = 0;
 static DEFINE_SEMAPHORE(buslock_sem);
 
 #ifdef CONFIG_PROC_SYSCTL
