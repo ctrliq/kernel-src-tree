@@ -132,10 +132,12 @@
 	.endm
 
 SYM_TYPED_FUNC_START(ftrace_stub)
+	CALL_DEPTH_ACCOUNT
 	RET
 SYM_FUNC_END(ftrace_stub)
 
 SYM_TYPED_FUNC_START(ftrace_stub_graph)
+	CALL_DEPTH_ACCOUNT
 	RET
 SYM_FUNC_END(ftrace_stub_graph)
 
