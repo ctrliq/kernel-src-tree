@@ -356,6 +356,52 @@ unsigned long find_last_bit(const unsigned long *addr, unsigned long size)
 }
 #endif
 
+/**
+ * find_next_and_bit_wrap - find the next set bit in both memory regions
+ * @addr1: The first address to base the search on
+ * @addr2: The second address to base the search on
+ * @size: The bitmap size in bits
+ * @offset: The bitnumber to start searching at
+ *
+ * Returns the bit number for the next set bit, or first set bit up to @offset
+ * If no bits are set, returns @size.
+ */
+static inline
+unsigned long find_next_and_bit_wrap(const unsigned long *addr1,
+					const unsigned long *addr2,
+					unsigned long size, unsigned long offset)
+{
+	unsigned long bit = find_next_and_bit(addr1, addr2, size, offset);
+
+	if (bit < size)
+		return bit;
+
+	bit = find_first_and_bit(addr1, addr2, offset);
+	return bit < offset ? bit : size;
+}
+
+/**
+ * find_next_bit_wrap - find the next set bit in both memory regions
+ * @addr: The first address to base the search on
+ * @size: The bitmap size in bits
+ * @offset: The bitnumber to start searching at
+ *
+ * Returns the bit number for the next set bit, or first set bit up to @offset
+ * If no bits are set, returns @size.
+ */
+static inline
+unsigned long find_next_bit_wrap(const unsigned long *addr,
+					unsigned long size, unsigned long offset)
+{
+	unsigned long bit = find_next_bit(addr, size, offset);
+
+	if (bit < size)
+		return bit;
+
+	bit = find_first_bit(addr, offset);
+	return bit < offset ? bit : size;
+}
+
 /*
  * Helper for for_each_set_bit_wrap(). Make sure you're doing right thing
  * before using it alone.
