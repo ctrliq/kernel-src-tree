@@ -1,9 +1,18 @@
 #!/bin/sh
 
-# $1: cloned tree
-cloned="$1";
+die() {
+	echo "Error: $1" >&2
+	exit 1
+}
 
-cd "$cloned/$SPECPACKAGE_NAME" || die "\"$cloned\" doesn't seem to have a dist-git clone";
+# $1: cloned tree
+cloned="$1"
+
+# Avoid accidental "rm *" in the root directory
+test "$cloned" || die '$1 is not given'
+test "$SPECPACKAGE_NAME" || die '$SPECPACKAGE_NAME is not set'
+
+cd "$cloned/$SPECPACKAGE_NAME" || die "\"$cloned\" doesn't seem to have a dist-git clone"
 
 # delete everything in the cloned tree to avoid having stale files
 rm -r -- *
@@ -17,4 +26,3 @@ echo "*.bz2" >> .gitignore
 rpm2cpio "$SRPM" | cpio -idmv
 
 git add -A
-
