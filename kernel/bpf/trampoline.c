@@ -444,8 +444,7 @@ again:
 	if (err < 0)
 		goto out_free;
 
-	set_memory_ro((long)im->image, 1);
-	set_memory_x((long)im->image, 1);
+	set_memory_rox((long)im->image, 1);
 
 	WARN_ON(tr->cur_image && total == 0);
 	if (tr->cur_image)
