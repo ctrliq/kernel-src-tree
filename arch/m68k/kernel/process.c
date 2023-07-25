@@ -32,6 +32,7 @@
 #include <linux/rcupdate.h>
 #include <linux/syscalls.h>
 #include <linux/uaccess.h>
+#include <linux/elfcore.h>
 
 #include <asm/traps.h>
 #include <asm/machdep.h>
@@ -215,7 +216,7 @@ int copy_thread(struct task_struct *p, const struct kernel_clone_args *args)
 }
 
 /* Fill in the fpu structure for a core dump.  */
-int dump_fpu (struct pt_regs *regs, struct user_m68kfp_struct *fpu)
+int elf_core_copy_task_fpregs(struct task_struct *t, elf_fpregset_t *fpu)
 {
 	if (FPU_IS_EMU) {
 		int i;
@@ -264,7 +265,6 @@ int dump_fpu (struct pt_regs *regs, struct user_m68kfp_struct *fpu)
 
 	return 1;
 }
-EXPORT_SYMBOL(dump_fpu);
 
 unsigned long __get_wchan(struct task_struct *p)
 {
