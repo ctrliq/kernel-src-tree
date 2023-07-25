@@ -321,6 +321,7 @@ static struct sys_off_handler platform_sys_off_handler;
 static struct sys_off_handler *alloc_sys_off_handler(int priority)
 {
 	struct sys_off_handler *handler;
+	gfp_t flags;
 
 	/*
 	 * Platforms like m68k can't allocate sys_off handler dynamically
@@ -331,7 +332,12 @@ static struct sys_off_handler *alloc_sys_off_handler(int priority)
 		if (handler->cb_data)
 			return ERR_PTR(-EBUSY);
 	} else {
-		handler = kzalloc(sizeof(*handler), GFP_KERNEL);
+		if (system_state > SYSTEM_RUNNING)
+			flags = GFP_ATOMIC;
+		else
+			flags = GFP_KERNEL;
+
+		handler = kzalloc(sizeof(*handler), flags);
 		if (!handler)
 			return ERR_PTR(-ENOMEM);
 	}
@@ -441,7 +447,7 @@ void unregister_sys_off_handler(struct sys_off_handler *handler)
 {
 	int err;
 
-	if (!handler)
+	if (IS_ERR_OR_NULL(handler))
 		return;
 
 	if (handler->blocking)
@@ -572,7 +578,23 @@ static void do_kernel_power_off_prepare(void)
  */
 void do_kernel_power_off(void)
 {
+	struct sys_off_handler *sys_off = NULL;
+
+	/*
+	 * Register sys-off handlers for legacy PM callback. This allows
+	 * legacy PM callbacks temporary co-exist with the new sys-off API.
+	 *
+	 * TODO: Remove legacy handlers once all legacy PM users will be
+	 *       switched to the sys-off based APIs.
+	 */
+	if (pm_power_off)
+		sys_off = register_sys_off_handler(SYS_OFF_MODE_POWER_OFF,
+						   SYS_OFF_PRIO_DEFAULT,
+						   legacy_pm_power_off, NULL);
+
 	atomic_notifier_call_chain(&power_off_handler_list, 0, NULL);
+
+	unregister_sys_off_handler(sys_off);
 }
 
 /**
@@ -583,7 +605,8 @@ void do_kernel_power_off(void)
  */
 bool kernel_can_power_off(void)
 {
-	return !atomic_notifier_call_chain_is_empty(&power_off_handler_list);
+	return !atomic_notifier_call_chain_is_empty(&power_off_handler_list) ||
+		pm_power_off;
 }
 EXPORT_SYMBOL_GPL(kernel_can_power_off);
 
@@ -618,7 +641,6 @@ SYSCALL_DEFINE4(reboot, int, magic1, int, magic2, unsigned int, cmd,
 		void __user *, arg)
 {
 	struct pid_namespace *pid_ns = task_active_pid_ns(current);
-	struct sys_off_handler *sys_off = NULL;
 	char buffer[256];
 	int ret = 0;
 
@@ -642,21 +664,6 @@ SYSCALL_DEFINE4(reboot, int, magic1, int, magic2, unsigned int, cmd,
 	ret = reboot_pid_ns(pid_ns, cmd);
 	if (ret)
 		return ret;
-
-	/*
-	 * Register sys-off handlers for legacy PM callback. This allows
-	 * legacy PM callbacks temporary co-exist with the new sys-off API.
-	 *
-	 * TODO: Remove legacy handlers once all legacy PM users will be
-	 *       switched to the sys-off based APIs.
-	 */
-	if (pm_power_off) {
-		sys_off = register_sys_off_handler(SYS_OFF_MODE_POWER_OFF,
-						   SYS_OFF_PRIO_DEFAULT,
-						   legacy_pm_power_off, NULL);
-		if (IS_ERR(sys_off))
-			return PTR_ERR(sys_off);
-	}
 
 	/* Instead of trying to make the power_off code look like
 	 * halt when pm_power_off is not set do it the easy way.
@@ -715,7 +722,6 @@ SYSCALL_DEFINE4(reboot, int, magic1, int, magic2, unsigned int, cmd,
 		break;
 	}
 	mutex_unlock(&system_transition_mutex);
-	unregister_sys_off_handler(sys_off);
 	return ret;
 }
 
