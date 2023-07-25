@@ -1224,7 +1224,7 @@ void __init setup_arch(char **cmdline_p)
 	 *
 	 * Note the host kernel TDX also requires the first 1MB being reserved.
 	 */
-	reserve_real_mode();
+	x86_platform.realmode_reserve();
 
 	init_mem_mapping();
 
