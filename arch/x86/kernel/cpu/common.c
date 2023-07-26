@@ -2170,7 +2170,6 @@ static void dbg_restore_debug_regs(void)
 #define dbg_restore_debug_regs()
 #endif /* ! CONFIG_KGDB */
 
-#ifdef CONFIG_X86_64
 static inline void setup_getcpu(int cpu)
 {
 	unsigned long cpudata = vdso_encode_cpunode(cpu, early_cpu_to_node(cpu));
@@ -2191,6 +2190,7 @@ static inline void setup_getcpu(int cpu)
 
 	write_gdt_entry(get_cpu_gdt_rw(cpu), GDT_ENTRY_CPUNODE, &d, DESCTYPE_S);
 }
+#ifdef CONFIG_X86_64
 
 static inline void tss_setup_ist(struct tss_struct *tss)
 {
@@ -2204,8 +2204,6 @@ static inline void tss_setup_ist(struct tss_struct *tss)
 }
 
 #else /* CONFIG_X86_64 */
-
-static inline void setup_getcpu(int cpu) { }
 
 static inline void tss_setup_ist(struct tss_struct *tss) { }
 
