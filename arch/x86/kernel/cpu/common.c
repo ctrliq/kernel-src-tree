@@ -2016,6 +2016,7 @@ void __init identify_boot_cpu(void)
 
 	tsx_init();
 	tdx_init();
+	lkgs_init();
 }
 
 void identify_secondary_cpu(struct cpuinfo_x86 *c)
