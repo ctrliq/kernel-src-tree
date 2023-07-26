@@ -27,6 +27,8 @@ intel-rst-y				:= rst.o
 obj-$(CONFIG_INTEL_RST)			+= intel-rst.o
 intel-smartconnect-y			:= smartconnect.o
 obj-$(CONFIG_INTEL_SMARTCONNECT)	+= intel-smartconnect.o
+intel_turbo_max_3-y			:= turbo_max_3.o
+obj-$(CONFIG_INTEL_TURBO_MAX_3)		+= intel_turbo_max_3.o
 
 # TPMI drivers
 intel_vsec_tpmi-y			:= tpmi.o
