@@ -2243,6 +2243,7 @@ static int read_unwind_hints(struct objtool_file *file)
 
 		cfi.cfa.offset = bswap_if_needed(hint->sp_offset);
 		cfi.type = hint->type;
+		cfi.signal = hint->signal;
 		cfi.end = hint->end;
 
 		insn->cfi = cfi_hash_find_or_add(&cfi);
