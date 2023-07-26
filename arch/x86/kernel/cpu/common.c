@@ -587,7 +587,7 @@ static __init int setup_disable_pku(char *arg)
 	return 1;
 }
 __setup("nopku", setup_disable_pku);
-#endif /* CONFIG_X86_64 */
+#endif
 
 #ifdef CONFIG_X86_KERNEL_IBT
 
