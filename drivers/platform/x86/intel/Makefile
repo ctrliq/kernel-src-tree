@@ -25,6 +25,8 @@ obj-$(CONFIG_INTEL_VSEC)		+= intel_vsec.o
 # Intel Uncore drivers
 intel-rst-y				:= rst.o
 obj-$(CONFIG_INTEL_RST)			+= intel-rst.o
+intel-smartconnect-y			:= smartconnect.o
+obj-$(CONFIG_INTEL_SMARTCONNECT)	+= intel-smartconnect.o
 
 # TPMI drivers
 intel_vsec_tpmi-y			:= tpmi.o
