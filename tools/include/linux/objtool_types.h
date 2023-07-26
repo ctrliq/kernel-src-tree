@@ -15,6 +15,7 @@ struct unwind_hint {
 	s16		sp_offset;
 	u8		sp_reg;
 	u8		type;
+	u8		signal;
 	u8		end;
 };
 
