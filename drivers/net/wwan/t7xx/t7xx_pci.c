@@ -680,6 +680,8 @@ static int t7xx_pci_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 	struct t7xx_pci_dev *t7xx_dev;
 	int ret;
 
+	mark_tech_preview("Mediatek t7xx (WWAN) driver", THIS_MODULE);
+
 	t7xx_dev = devm_kzalloc(&pdev->dev, sizeof(*t7xx_dev), GFP_KERNEL);
 	if (!t7xx_dev)
 		return -ENOMEM;
