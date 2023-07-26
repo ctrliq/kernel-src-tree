@@ -428,11 +428,8 @@ static ssize_t reload_store(struct device *dev,
 	ssize_t ret = 0;
 
 	ret = kstrtoul(buf, 0, &val);
-	if (ret)
-		return ret;
-
-	if (val != 1)
-		return size;
+	if (ret || val != 1)
+		return -EINVAL;
 
 	cpus_read_lock();
 
