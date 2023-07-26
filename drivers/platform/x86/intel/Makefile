@@ -38,3 +38,7 @@ obj-$(CONFIG_INTEL_TPMI)		+= intel_vsec_tpmi.o
 # Intel input drivers
 intel-hid-y				:= hid.o
 obj-$(CONFIG_INTEL_HID_EVENT)		+= intel-hid.o
+
+# Intel miscellaneous drivers
+intel_int0002_vgpio-y			:= int0002_vgpio.o
+obj-$(CONFIG_INTEL_INT0002_VGPIO)	+= intel_int0002_vgpio.o
