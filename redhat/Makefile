@@ -648,6 +648,8 @@ sources-rh: $(TARBALL) generate-testpatch-tmp setup-source dist-configs-check
 		README.rst \
 		kernel-local \
 		dracut-virt.conf \
+		uki-sb-cert-x86_64-centos.crt \
+		uki-sb-cert-x86_64-rhel.crt \
 		$(SOURCES)/
 	@for KABIARCH in $(ARCH_LIST); do \
 		cp kabi/Module.kabi_$$KABIARCH $(SOURCES)/; \
