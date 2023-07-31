@@ -1192,10 +1192,10 @@ static inline int copy_from_iotlb(const struct vringh *vrh, void *dst,
 			return ret;
 
 		if (vrh->use_va) {
-			iov_iter_init(&iter, READ, ivec.iov.iovec, ret,
+			iov_iter_init(&iter, WRITE, ivec.iov.iovec, ret,
 				      translated);
 		} else {
-			iov_iter_bvec(&iter, READ, ivec.iov.bvec, ret,
+			iov_iter_bvec(&iter, WRITE, ivec.iov.bvec, ret,
 				      translated);
 		}
 
@@ -1238,10 +1238,10 @@ static inline int copy_to_iotlb(const struct vringh *vrh, void *dst,
 			return ret;
 
 		if (vrh->use_va) {
-			iov_iter_init(&iter, WRITE, ivec.iov.iovec, ret,
+			iov_iter_init(&iter, READ, ivec.iov.iovec, ret,
 				      translated);
 		} else {
-			iov_iter_bvec(&iter, WRITE, ivec.iov.bvec, ret,
+			iov_iter_bvec(&iter, READ, ivec.iov.bvec, ret,
 				      translated);
 		}
 
