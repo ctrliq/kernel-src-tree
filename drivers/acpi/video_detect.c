@@ -189,6 +189,20 @@ static const struct dmi_system_id video_detect_dmi_table[] = {
 	},
 
 	/*
+	 * Older models with nvidia GPU which need acpi_video backlight
+	 * control and where the old nvidia binary driver series does not
+	 * call acpi_video_register_backlight().
+	 */
+	{
+	 .callback = video_detect_force_video,
+	 /* ThinkPad W530 */
+	 .matches = {
+		DMI_MATCH(DMI_SYS_VENDOR, "LENOVO"),
+		DMI_MATCH(DMI_PRODUCT_VERSION, "ThinkPad W530"),
+		},
+	},
+
+	/*
 	 * These models have a working acpi_video backlight control, and using
 	 * native backlight causes a regression where backlight does not work
 	 * when userspace is not handling brightness key events. Disable
@@ -578,6 +592,16 @@ static bool google_cros_ec_present(void)
 }
 
 /*
+ * Windows 8 and newer no longer use the ACPI video interface, so it often
+ * does not work. So on win8+ systems prefer native brightness control.
+ * Chromebooks should always prefer native backlight control.
+ */
+static bool prefer_native_over_acpi_video(void)
+{
+	return acpi_osi_is_win8() || google_cros_ec_present();
+}
+
+/*
  * Determine which type of backlight interface to use on this system,
  * First check cmdline, then dmi quirks, then do autodetect.
  */
@@ -619,28 +643,37 @@ enum acpi_backlight_type __acpi_video_get_backlight_type(bool native, bool *auto
 	if (auto_detect)
 		*auto_detect = true;
 
-	/* Chromebooks should always prefer native backlight control. */
-	if (google_cros_ec_present() && native_available)
+	/* Use ACPI video if available, except when native should be preferred. */
+	if ((video_caps & ACPI_VIDEO_BACKLIGHT) &&
+	     !(native_available && prefer_native_over_acpi_video()))
+		return acpi_backlight_video;
+
+	/* Use native if available */
+	if (native_available)
 		return acpi_backlight_native;
 
-	/* On systems with ACPI video use either native or ACPI video. */
-	if (video_caps & ACPI_VIDEO_BACKLIGHT) {
-		/*
-		 * Windows 8 and newer no longer use the ACPI video interface,
-		 * so it often does not work. If the ACPI tables are written
-		 * for win8 and native brightness ctl is available, use that.
-		 *
-		 * The native check deliberately is inside the if acpi-video
-		 * block on older devices without acpi-video support native
-		 * is usually not the best choice.
-		 */
-		if (acpi_osi_is_win8() && native_available)
-			return acpi_backlight_native;
-		else
-			return acpi_backlight_video;
-	}
+	/*
+	 * The vendor specific BIOS interfaces are only necessary for
+	 * laptops from before ~2008.
+	 *
+	 * For laptops from ~2008 till ~2023 this point is never reached
+	 * because on those (video_caps & ACPI_VIDEO_BACKLIGHT) above is true.
+	 *
+	 * Laptops from after ~2023 no longer support ACPI_VIDEO_BACKLIGHT,
+	 * if this point is reached on those, this likely means that
+	 * the GPU kms driver which sets native_available has not loaded yet.
+	 *
+	 * Returning acpi_backlight_vendor in this case is known to sometimes
+	 * cause a non working vendor specific /sys/class/backlight device to
+	 * get registered.
+	 *
+	 * Return acpi_backlight_none on laptops with ACPI tables written
+	 * for Windows 8 (laptops from after ~2012) to avoid this problem.
+	 */
+	if (acpi_osi_is_win8())
+		return acpi_backlight_none;
 
-	/* No ACPI video (old hw), use vendor specific fw methods. */
+	/* No ACPI video/native (old hw), use vendor specific fw methods. */
 	return acpi_backlight_vendor;
 }
 
