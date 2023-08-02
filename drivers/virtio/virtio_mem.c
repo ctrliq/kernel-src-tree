@@ -38,10 +38,13 @@ module_param(bbm_block_size, ulong, 0444);
 MODULE_PARM_DESC(bbm_block_size,
 		 "Big Block size in bytes. Default is 0 (auto-detection).");
 
+/* RHEL: Hide the parameter, we don't want unsafe unplug to ever be active. */
 static bool bbm_safe_unplug = true;
+/*
 module_param(bbm_safe_unplug, bool, 0444);
 MODULE_PARM_DESC(bbm_safe_unplug,
 	     "Use a safe unplug mechanism in BBM, avoiding long/endless loops");
+*/
 
 /*
  * virtio-mem currently supports the following modes of operation:
@@ -2787,17 +2790,6 @@ static int virtio_mem_probe(struct virtio_device *vdev)
 
 	/* trigger a config update to start processing the requested_size */
 	if (!vm->in_kdump) {
-		static bool printed;
-
-		/*
-		 * virtio-mem, and especially its memory hot(un)plug
-		 * functionality, is tech-preview.
-		 */
-		if (!printed) {
-			printed = true;
-			mark_tech_preview("virtio_mem", THIS_MODULE);
-		}
-
 		atomic_set(&vm->config_changed, 1);
 		queue_work(system_freezable_wq, &vm->wq);
 	}
