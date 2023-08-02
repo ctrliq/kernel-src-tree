@@ -72,3 +72,5 @@ PUSH_CMD="git push gitlab ${BRANCH} && \\
 echo "# $PUSH_VERB $PUSH_STR"
 echo "$PUSH_CMD"
 test "$TO_PUSH" && eval "$PUSH_CMD"
+
+exit 0

@@ -110,3 +110,5 @@ fi
 # failure.  Make sure all branches are pushed first as follow up
 # git-pushes may succeed.
 grep -q "remote:[ ]* WARNINGS" $TMPFILE && die "Server side warnings"
+
+exit 0
