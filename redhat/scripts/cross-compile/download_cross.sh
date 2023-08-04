@@ -26,7 +26,7 @@ fi
 
 # if we're not root, all we can do now is see what's installed
 if [ "$(whoami)" != "root" ]; then
-	echo "Checking for RHEL7 cross compile packages.  If this fails, run \"make dist-cross-download\" as root."
+	echo "Checking for RHEL/Centos Stream cross compile packages.  If this fails, run \"make dist-cross-download\" as root."
 	if rpm -q "$@" >& /dev/null; then
 		echo "Compilers found."
 		exit 0
@@ -40,12 +40,11 @@ fi
 rpm -q "$@" && exit 0
 
 # install epel-release if necessary
+dnf -y install /usr/lib/rpm/redhat/dist.sh
 
-if ! rpm -q epel-release >& /dev/null; then
-	wget -nd -r -l1 --no-parent -A "epel-release*.rpm" http://dl.fedoraproject.org/pub/epel/7/x86_64/e/
-	rpm -ivh epel-release*.rpm
-	# clean up
-	rm -f epel-release*.rpm
+if [ -x /usr/lib/rpm/redhat/dist.sh ]; then
+	dist=$(/usr/lib/rpm/redhat/dist.sh)
+	[ "$dist" == el* ] && dnf -y install epel-release
 fi
 
 # install list of rpms for cross compile
