@@ -331,7 +331,7 @@ static void class_pktcdvd_release(struct class *cls)
 	kfree(cls);
 }
 
-static ssize_t device_map_show(struct class *c, struct class_attribute *attr,
+static ssize_t device_map_show(const struct class *c, const struct class_attribute *attr,
 			       char *data)
 {
 	int n = 0;
@@ -352,7 +352,7 @@ static ssize_t device_map_show(struct class *c, struct class_attribute *attr,
 }
 static CLASS_ATTR_RO(device_map);
 
-static ssize_t add_store(struct class *c, struct class_attribute *attr,
+static ssize_t add_store(const struct class *c, const struct class_attribute *attr,
 			 const char *buf, size_t count)
 {
 	unsigned int major, minor;
@@ -373,7 +373,7 @@ static ssize_t add_store(struct class *c, struct class_attribute *attr,
 }
 static CLASS_ATTR_WO(add);
 
-static ssize_t remove_store(struct class *c, struct class_attribute *attr,
+static ssize_t remove_store(const struct class *c, const struct class_attribute *attr,
 			    const char *buf, size_t count)
 {
 	unsigned int major, minor;
