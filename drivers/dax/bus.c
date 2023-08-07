@@ -1474,7 +1474,7 @@ int __init dax_bus_init(void)
 	int rc;
 
 	if (IS_ENABLED(CONFIG_DEV_DAX_PMEM_COMPAT)) {
-		dax_class = class_create(THIS_MODULE, "dax");
+		dax_class = class_create("dax");
 		if (IS_ERR(dax_class))
 			return PTR_ERR(dax_class);
 	}
