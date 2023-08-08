@@ -249,6 +249,9 @@ static struct crypto_larval *__crypto_register_alg(struct crypto_alg *alg)
 	memcpy(larval->alg.cra_driver_name, alg->cra_driver_name,
 	       CRYPTO_MAX_ALG_NAME);
 	larval->alg.cra_priority = alg->cra_priority;
+	if (!fips_enabled) {
+		larval->alg.cra_flags &= ~CRYPTO_ALG_FIPS_INTERNAL;
+	}
 
 	list_add(&alg->cra_list, &crypto_alg_list);
 	list_add(&larval->alg.cra_list, &crypto_alg_list);
