@@ -19,6 +19,7 @@
 #include <linux/kernel.h>
 #include <linux/module.h>
 #include <linux/slab.h>
+#include <linux/fips.h>
 
 #include "internal.h"
 
@@ -970,6 +971,9 @@ static int cbcmac_create(struct crypto_template *tmpl, struct rtattr **tb)
 
 	inst->alg.base.cra_priority = alg->cra_priority;
 	inst->alg.base.cra_blocksize = 1;
+	if (fips_enabled) {
+		inst->alg.base.cra_flags |= CRYPTO_ALG_FIPS_INTERNAL;
+	}
 
 	inst->alg.digestsize = alg->cra_blocksize;
 	inst->alg.descsize = ALIGN(sizeof(struct cbcmac_desc_ctx),
