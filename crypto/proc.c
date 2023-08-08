@@ -41,6 +41,7 @@ static void c_stop(struct seq_file *m, void *p)
 static int c_show(struct seq_file *m, void *p)
 {
 	struct crypto_alg *alg = list_entry(p, struct crypto_alg, cra_list);
+	u32 cra_flags = alg->cra_flags;
 	
 	seq_printf(m, "name         : %s\n", alg->cra_name);
 	seq_printf(m, "driver       : %s\n", alg->cra_driver_name);
@@ -48,15 +49,15 @@ static int c_show(struct seq_file *m, void *p)
 	seq_printf(m, "priority     : %d\n", alg->cra_priority);
 	seq_printf(m, "refcnt       : %u\n", refcount_read(&alg->cra_refcnt));
 	seq_printf(m, "selftest     : %s\n",
-		   (alg->cra_flags & CRYPTO_ALG_TESTED) ?
+		   (cra_flags & CRYPTO_ALG_TESTED) ?
 		   "passed" : "unknown");
 	seq_printf(m, "internal     : %s\n",
-		   (alg->cra_flags & CRYPTO_ALG_INTERNAL) ?
+		   (cra_flags & CRYPTO_ALG_INTERNAL) ?
 		   "yes" : "no");
 
-	if (alg->cra_flags & CRYPTO_ALG_LARVAL) {
+	if (cra_flags & CRYPTO_ALG_LARVAL) {
 		seq_printf(m, "type         : larval\n");
-		seq_printf(m, "flags        : 0x%x\n", alg->cra_flags);
+		seq_printf(m, "flags        : 0x%x\n", cra_flags);
 		goto out;
 	}
 
@@ -65,7 +66,7 @@ static int c_show(struct seq_file *m, void *p)
 		goto out;
 	}
 	
-	switch (alg->cra_flags & (CRYPTO_ALG_TYPE_MASK | CRYPTO_ALG_LARVAL)) {
+	switch (cra_flags & (CRYPTO_ALG_TYPE_MASK | CRYPTO_ALG_LARVAL)) {
 	case CRYPTO_ALG_TYPE_CIPHER:
 		seq_printf(m, "type         : cipher\n");
 		seq_printf(m, "blocksize    : %u\n", alg->cra_blocksize);
