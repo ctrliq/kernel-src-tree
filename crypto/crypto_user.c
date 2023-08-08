@@ -29,6 +29,7 @@
 #include <crypto/internal/rng.h>
 #include <crypto/akcipher.h>
 #include <crypto/kpp.h>
+#include <linux/fips.h>
 
 #include "internal.h"
 
@@ -171,7 +172,11 @@ static int crypto_report_one(struct crypto_alg *alg,
 
 	ualg->cru_type = 0;
 	ualg->cru_mask = 0;
-	ualg->cru_flags = alg->cra_flags;
+	ualg->cru_flags = alg->cra_flags & ~CRYPTO_ALG_FIPS_INTERNAL;
+	if (fips_enabled & (alg->cra_flags & CRYPTO_ALG_FIPS_INTERNAL)) {
+		/* In fips mode, mark an internal agorithm as CRYPTO_ALG_INTERNAL. */
+		ualg->cru_flags |= CRYPTO_ALG_INTERNAL;
+	}
 	ualg->cru_refcnt = refcount_read(&alg->cra_refcnt);
 
 	if (nla_put_u32(skb, CRYPTOCFGA_PRIORITY_VAL, alg->cra_priority))
@@ -354,8 +359,11 @@ static int crypto_update_alg(struct sk_buff *skb, struct nlmsghdr *nlh,
 
 	crypto_remove_spawns(alg, &list, NULL);
 
-	if (priority)
-		alg->cra_priority = nla_get_u32(priority);
+	/* Only allow changes for non fips only. */
+	if (!fips_enabled || !(alg->cra_flags & CRYPTO_ALG_FIPS_INTERNAL)) {
+		if (priority)
+			alg->cra_priority = nla_get_u32(priority);
+	}
 
 	up_write(&crypto_alg_sem);
 
@@ -388,6 +396,12 @@ static int crypto_del_alg(struct sk_buff *skb, struct nlmsghdr *nlh,
 	 * removing the module is not possible, so we restrict to crypto
 	 * instances that are build from templates. */
 	err = -EINVAL;
+
+	/* We can't unregister fips_only algorithms. */
+	if (fips_enabled && (alg->cra_flags & CRYPTO_ALG_FIPS_INTERNAL)) {
+		goto drop_alg;
+	}
+
 	if (!(alg->cra_flags & CRYPTO_ALG_INSTANCE))
 		goto drop_alg;
 
@@ -440,8 +454,15 @@ static int crypto_add_alg(struct sk_buff *skb, struct nlmsghdr *nlh,
 
 	down_write(&crypto_alg_sem);
 
-	if (priority)
-		alg->cra_priority = nla_get_u32(priority);
+	if (!fips_enabled || !(alg->cra_flags & CRYPTO_ALG_FIPS_INTERNAL)) {
+		/*
+		 * It doesn't hurt to instantiate fips_only algorithms as
+		 * we block access to them via kcapi. But we don't allow
+		 * them to be changed.
+		 */
+		if (priority)
+			alg->cra_priority = nla_get_u32(priority);
+	}
 
 	up_write(&crypto_alg_sem);
 
