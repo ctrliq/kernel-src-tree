@@ -20,6 +20,7 @@
 #include <linux/module.h>
 #include <linux/net.h>
 #include <net/sock.h>
+#include <linux/fips.h>
 
 struct hash_ctx {
 	struct af_alg_sgl sgl;
@@ -405,7 +406,18 @@ static struct proto_ops algif_hash_ops_nokey = {
 
 static void *hash_bind(const char *name, u32 type, u32 mask)
 {
-	return crypto_alloc_ahash(name, type, mask);
+	struct crypto_ahash *ahash = crypto_alloc_ahash(name, type, mask);
+	if (!fips_enabled) {
+		return ahash;
+	}
+	if (IS_ERR(ahash))
+		return ERR_CAST(ahash);
+	/* Don't allow fips_only algorithms. */
+	if (ahash->base.__crt_alg->cra_flags & CRYPTO_ALG_FIPS_INTERNAL) {
+		crypto_free_ahash(ahash);
+		return ERR_PTR(-ENOENT);
+	}
+	return ahash;
 }
 
 static void hash_release(void *private)
