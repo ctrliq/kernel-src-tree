@@ -150,6 +150,14 @@
 #define CRYPTO_ALG_ALLOCATES_MEMORY	0x00010000
 
 /*
+ * Mark an algorithm as usable only internally by
+ * other fips-complient algorithms. The use of this
+ * flag here is different from the upstream kernel,
+ * as we filter at the kcapi and /proc/crypto interfaces.
+ * Use the same value for consistency.
+ */
+#define CRYPTO_ALG_FIPS_INTERNAL	0x00020000
+/*
  * Transform masks and values (for crt_flags).
  */
 #define CRYPTO_TFM_NEED_KEY		0x00000001
