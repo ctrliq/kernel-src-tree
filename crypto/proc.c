@@ -20,6 +20,7 @@
 #include <linux/rwsem.h>
 #include <linux/proc_fs.h>
 #include <linux/seq_file.h>
+#include <linux/fips.h>
 #include "internal.h"
 
 static void *c_start(struct seq_file *m, loff_t *pos)
@@ -41,8 +42,12 @@ static void c_stop(struct seq_file *m, void *p)
 static int c_show(struct seq_file *m, void *p)
 {
 	struct crypto_alg *alg = list_entry(p, struct crypto_alg, cra_list);
-	u32 cra_flags = alg->cra_flags;
+	u32 cra_flags = alg->cra_flags & ~CRYPTO_ALG_FIPS_INTERNAL;
 	
+	if (fips_enabled && (alg->cra_flags & CRYPTO_ALG_FIPS_INTERNAL)) {
+		/* In fips mode, mark an internal agorithm as CRYPTO_ALG_INTERNAL. */
+		cra_flags |= CRYPTO_ALG_INTERNAL;
+	}
 	seq_printf(m, "name         : %s\n", alg->cra_name);
 	seq_printf(m, "driver       : %s\n", alg->cra_driver_name);
 	seq_printf(m, "module       : %s\n", module_name(alg->cra_module));
