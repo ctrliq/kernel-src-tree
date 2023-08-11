@@ -496,7 +496,8 @@ nla_put_failure:
 	return -1;
 }
 
-static int nft_exthdr_dump(struct sk_buff *skb, const struct nft_expr *expr)
+static int nft_exthdr_dump(struct sk_buff *skb,
+			   const struct nft_expr *expr, bool reset)
 {
 	const struct nft_exthdr *priv = nft_expr_priv(expr);
 
@@ -506,7 +507,8 @@ static int nft_exthdr_dump(struct sk_buff *skb, const struct nft_expr *expr)
 	return nft_exthdr_dump_common(skb, priv);
 }
 
-static int nft_exthdr_dump_set(struct sk_buff *skb, const struct nft_expr *expr)
+static int nft_exthdr_dump_set(struct sk_buff *skb,
+			       const struct nft_expr *expr, bool reset)
 {
 	const struct nft_exthdr *priv = nft_expr_priv(expr);
 
