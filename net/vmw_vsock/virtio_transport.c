@@ -221,7 +221,7 @@ out_rcu:
 static void virtio_vsock_rx_fill(struct virtio_vsock *vsock)
 {
 	int total_len = VIRTIO_VSOCK_DEFAULT_RX_BUF_SIZE + VIRTIO_VSOCK_SKB_HEADROOM;
-	struct scatterlist pkt, *p;
+	struct scatterlist hdr, buf, *sgs[2];
 	struct virtqueue *vq;
 	struct sk_buff *skb;
 	int ret;
@@ -234,9 +234,14 @@ static void virtio_vsock_rx_fill(struct virtio_vsock *vsock)
 			break;
 
 		memset(skb->head, 0, VIRTIO_VSOCK_SKB_HEADROOM);
-		sg_init_one(&pkt, virtio_vsock_hdr(skb), total_len);
-		p = &pkt;
-		ret = virtqueue_add_sgs(vq, &p, 0, 1, skb, GFP_KERNEL);
+
+		sg_init_one(&hdr, virtio_vsock_hdr(skb),
+			    VIRTIO_VSOCK_SKB_HEADROOM);
+		sgs[0] = &hdr;
+
+		sg_init_one(&buf, skb->data, VIRTIO_VSOCK_DEFAULT_RX_BUF_SIZE);
+		sgs[1] = &buf;
+		ret = virtqueue_add_sgs(vq, sgs, 0, 2, skb, GFP_KERNEL);
 		if (ret < 0) {
 			kfree_skb(skb);
 			break;
