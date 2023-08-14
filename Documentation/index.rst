@@ -138,7 +138,6 @@ needed).
    scheduler/index
    mhi/index
    tty/index
-   hte/index
 
 Architecture-agnostic documentation
 -----------------------------------
