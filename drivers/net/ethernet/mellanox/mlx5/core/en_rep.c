@@ -30,6 +30,7 @@
  * SOFTWARE.
  */
 
+#include <linux/debugfs.h>
 #include <linux/mlx5/fs.h>
 #include <net/switchdev.h>
 #include <net/pkt_cls.h>
@@ -755,7 +756,6 @@ static void mlx5e_build_rep_params(struct net_device *netdev)
 	mlx5e_set_rx_cq_mode_params(params, cq_period_mode);
 
 	params->mqprio.num_tc       = 1;
-	params->tunneled_offload_en = false;
 	if (rep->vport != MLX5_VPORT_UPLINK)
 		params->vlan_strip_disable = true;
 
@@ -792,10 +792,15 @@ static int mlx5e_init_rep(struct mlx5_core_dev *mdev,
 {
 	struct mlx5e_priv *priv = netdev_priv(netdev);
 
+	priv->dfs_root = debugfs_create_dir("nic",
+					    mlx5_debugfs_get_dev_root(mdev));
+
 	priv->fs = mlx5e_fs_init(priv->profile, mdev,
-				 !test_bit(MLX5E_STATE_DESTROYING, &priv->state));
+				 !test_bit(MLX5E_STATE_DESTROYING, &priv->state),
+				 priv->dfs_root);
 	if (!priv->fs) {
 		netdev_err(priv->netdev, "FS allocation failed\n");
+		debugfs_remove_recursive(priv->dfs_root);
 		return -ENOMEM;
 	}
 
@@ -810,8 +815,10 @@ static int mlx5e_init_ul_rep(struct mlx5_core_dev *mdev,
 {
 	struct mlx5e_priv *priv = netdev_priv(netdev);
 
-	priv->fs = mlx5e_fs_init(priv->profile, mdev,
-				 !test_bit(MLX5E_STATE_DESTROYING, &priv->state));
+	priv->fs =
+		mlx5e_fs_init(priv->profile, mdev,
+			      !test_bit(MLX5E_STATE_DESTROYING, &priv->state),
+			      priv->dfs_root);
 	if (!priv->fs) {
 		netdev_err(priv->netdev, "FS allocation failed\n");
 		return -ENOMEM;
@@ -826,6 +833,8 @@ static int mlx5e_init_ul_rep(struct mlx5_core_dev *mdev,
 static void mlx5e_cleanup_rep(struct mlx5e_priv *priv)
 {
 	mlx5e_fs_cleanup(priv->fs);
+	debugfs_remove_recursive(priv->dfs_root);
+	priv->fs = NULL;
 }
 
 static int mlx5e_create_rep_ttc_table(struct mlx5e_priv *priv)
@@ -992,6 +1001,7 @@ err_close_drop_rq:
 	priv->rx_res = NULL;
 err_free_fs:
 	mlx5e_fs_cleanup(priv->fs);
+	priv->fs = NULL;
 	return err;
 }
 
@@ -1007,8 +1017,23 @@ static void mlx5e_cleanup_rep_rx(struct mlx5e_priv *priv)
 	priv->rx_res = NULL;
 }
 
+static void mlx5e_rep_mpesw_work(struct work_struct *work)
+{
+	struct mlx5_rep_uplink_priv *uplink_priv =
+		container_of(work, struct mlx5_rep_uplink_priv,
+			     mpesw_work);
+	struct mlx5e_rep_priv *rpriv =
+		container_of(uplink_priv, struct mlx5e_rep_priv,
+			     uplink_priv);
+	struct mlx5e_priv *priv = netdev_priv(rpriv->netdev);
+
+	rep_vport_rx_rule_destroy(priv);
+	mlx5e_create_rep_vport_rx_rule(priv);
+}
+
 static int mlx5e_init_ul_rep_rx(struct mlx5e_priv *priv)
 {
+	struct mlx5e_rep_priv *rpriv = priv->ppriv;
 	int err;
 
 	mlx5e_create_q_counters(priv);
@@ -1018,12 +1043,17 @@ static int mlx5e_init_ul_rep_rx(struct mlx5e_priv *priv)
 
 	mlx5e_tc_int_port_init_rep_rx(priv);
 
+	INIT_WORK(&rpriv->uplink_priv.mpesw_work, mlx5e_rep_mpesw_work);
+
 out:
 	return err;
 }
 
 static void mlx5e_cleanup_ul_rep_rx(struct mlx5e_priv *priv)
 {
+	struct mlx5e_rep_priv *rpriv = priv->ppriv;
+
+	cancel_work_sync(&rpriv->uplink_priv.mpesw_work);
 	mlx5e_tc_int_port_cleanup_rep_rx(priv);
 	mlx5e_cleanup_rep_rx(priv);
 	mlx5e_destroy_q_counters(priv);
@@ -1132,6 +1162,19 @@ static int mlx5e_update_rep_rx(struct mlx5e_priv *priv)
 	return 0;
 }
 
+static int mlx5e_rep_event_mpesw(struct mlx5e_priv *priv)
+{
+	struct mlx5e_rep_priv *rpriv = priv->ppriv;
+	struct mlx5_eswitch_rep *rep = rpriv->rep;
+
+	if (rep->vport != MLX5_VPORT_UPLINK)
+		return NOTIFY_DONE;
+
+	queue_work(priv->wq, &rpriv->uplink_priv.mpesw_work);
+
+	return NOTIFY_OK;
+}
+
 static int uplink_rep_async_event(struct notifier_block *nb, unsigned long event, void *data)
 {
 	struct mlx5e_priv *priv = container_of(nb, struct mlx5e_priv, events_nb);
@@ -1153,6 +1196,8 @@ static int uplink_rep_async_event(struct notifier_block *nb, unsigned long event
 
 	if (event == MLX5_DEV_EVENT_PORT_AFFINITY)
 		return mlx5e_rep_tc_event_port_affinity(priv);
+	else if (event == MLX5_DEV_EVENT_MULTIPORT_ESW)
+		return mlx5e_rep_event_mpesw(priv);
 
 	return NOTIFY_DONE;
 }

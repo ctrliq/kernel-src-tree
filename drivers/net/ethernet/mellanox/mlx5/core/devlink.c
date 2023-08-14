@@ -7,6 +7,7 @@
 #include "fw_reset.h"
 #include "fs_core.h"
 #include "eswitch.h"
+#include "lag/lag.h"
 #include "esw/qos.h"
 #include "sf/dev/dev.h"
 #include "sf/sf.h"
@@ -104,7 +105,7 @@ static int mlx5_devlink_reload_fw_activate(struct devlink *devlink, struct netli
 	if (err)
 		return err;
 
-	mlx5_unload_one_devl_locked(dev);
+	mlx5_unload_one_devl_locked(dev, true);
 	err = mlx5_health_wait_pci_up(dev);
 	if (err)
 		NL_SET_ERR_MSG_MOD(extack, "FW activate aborted, PCI reads fail after reset");
@@ -167,7 +168,7 @@ static int mlx5_devlink_reload_down(struct devlink *devlink, bool netns_change,
 
 	switch (action) {
 	case DEVLINK_RELOAD_ACTION_DRIVER_REINIT:
-		mlx5_unload_one_devl_locked(dev);
+		mlx5_unload_one_devl_locked(dev, false);
 		break;
 	case DEVLINK_RELOAD_ACTION_FW_ACTIVATE:
 		if (limit == DEVLINK_RELOAD_LIMIT_NO_RESET)
@@ -201,7 +202,7 @@ static int mlx5_devlink_reload_up(struct devlink *devlink, enum devlink_reload_a
 			break;
 		/* On fw_activate action, also driver is reloaded and reinit performed */
 		*actions_performed |= BIT(DEVLINK_RELOAD_ACTION_DRIVER_REINIT);
-		ret = mlx5_load_one_devl_locked(dev, false);
+		ret = mlx5_load_one_devl_locked(dev, true);
 		break;
 	default:
 		/* Unsupported action should not get to this function */
@@ -268,9 +269,10 @@ static int mlx5_devlink_trap_action_set(struct devlink *devlink,
 					struct netlink_ext_ack *extack)
 {
 	struct mlx5_core_dev *dev = devlink_priv(devlink);
+	struct mlx5_devlink_trap_event_ctx trap_event_ctx;
 	enum devlink_trap_action action_orig;
 	struct mlx5_devlink_trap *dl_trap;
-	int err = 0;
+	int err;
 
 	if (is_mdev_switchdev_mode(dev)) {
 		NL_SET_ERR_MSG_MOD(extack, "Devlink traps can't be set in switchdev mode");
@@ -280,26 +282,25 @@ static int mlx5_devlink_trap_action_set(struct devlink *devlink,
 	dl_trap = mlx5_find_trap_by_id(dev, trap->id);
 	if (!dl_trap) {
 		mlx5_core_err(dev, "Devlink trap: Set action on invalid trap id 0x%x", trap->id);
-		err = -EINVAL;
-		goto out;
+		return -EINVAL;
 	}
 
-	if (action != DEVLINK_TRAP_ACTION_DROP && action != DEVLINK_TRAP_ACTION_TRAP) {
-		err = -EOPNOTSUPP;
-		goto out;
-	}
+	if (action != DEVLINK_TRAP_ACTION_DROP && action != DEVLINK_TRAP_ACTION_TRAP)
+		return -EOPNOTSUPP;
 
 	if (action == dl_trap->trap.action)
-		goto out;
+		return 0;
 
 	action_orig = dl_trap->trap.action;
 	dl_trap->trap.action = action;
+	trap_event_ctx.trap = &dl_trap->trap;
+	trap_event_ctx.err = 0;
 	err = mlx5_blocking_notifier_call_chain(dev, MLX5_DRIVER_EVENT_TYPE_TRAP,
-						&dl_trap->trap);
-	if (err)
+						&trap_event_ctx);
+	if (err == NOTIFY_BAD)
 		dl_trap->trap.action = action_orig;
-out:
-	return err;
+
+	return trap_event_ctx.err;
 }
 
 static const struct devlink_ops mlx5_devlink_ops = {
@@ -437,6 +438,53 @@ static int mlx5_devlink_large_group_num_validate(struct devlink *devlink, u32 id
 	return 0;
 }
 
+static int mlx5_devlink_esw_multiport_set(struct devlink *devlink, u32 id,
+					  struct devlink_param_gset_ctx *ctx)
+{
+	struct mlx5_core_dev *dev = devlink_priv(devlink);
+
+	if (!MLX5_ESWITCH_MANAGER(dev))
+		return -EOPNOTSUPP;
+
+	if (ctx->val.vbool)
+		return mlx5_lag_mpesw_enable(dev);
+
+	mlx5_lag_mpesw_disable(dev);
+	return 0;
+}
+
+static int mlx5_devlink_esw_multiport_get(struct devlink *devlink, u32 id,
+					  struct devlink_param_gset_ctx *ctx)
+{
+	struct mlx5_core_dev *dev = devlink_priv(devlink);
+
+	if (!MLX5_ESWITCH_MANAGER(dev))
+		return -EOPNOTSUPP;
+
+	ctx->val.vbool = mlx5_lag_is_mpesw(dev);
+	return 0;
+}
+
+static int mlx5_devlink_esw_multiport_validate(struct devlink *devlink, u32 id,
+					       union devlink_param_value val,
+					       struct netlink_ext_ack *extack)
+{
+	struct mlx5_core_dev *dev = devlink_priv(devlink);
+
+	if (!MLX5_ESWITCH_MANAGER(dev)) {
+		NL_SET_ERR_MSG_MOD(extack, "E-Switch is unsupported");
+		return -EOPNOTSUPP;
+	}
+
+	if (mlx5_eswitch_mode(dev) != MLX5_ESWITCH_OFFLOADS) {
+		NL_SET_ERR_MSG_MOD(extack,
+				   "E-Switch must be in switchdev mode");
+		return -EBUSY;
+	}
+
+	return 0;
+}
+
 #endif
 
 static int mlx5_devlink_eq_depth_validate(struct devlink *devlink, u32 id,
@@ -455,6 +503,12 @@ static const struct devlink_param mlx5_devlink_params[] = {
 			     BIT(DEVLINK_PARAM_CMODE_DRIVERINIT),
 			     NULL, NULL,
 			     mlx5_devlink_large_group_num_validate),
+	DEVLINK_PARAM_DRIVER(MLX5_DEVLINK_PARAM_ID_ESW_MULTIPORT,
+			     "esw_multiport", DEVLINK_PARAM_TYPE_BOOL,
+			     BIT(DEVLINK_PARAM_CMODE_RUNTIME),
+			     mlx5_devlink_esw_multiport_get,
+			     mlx5_devlink_esw_multiport_set,
+			     mlx5_devlink_esw_multiport_validate),
 #endif
 	DEVLINK_PARAM_GENERIC(IO_EQ_SIZE, BIT(DEVLINK_PARAM_CMODE_DRIVERINIT),
 			      NULL, NULL, mlx5_devlink_eq_depth_validate),

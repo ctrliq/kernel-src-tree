@@ -104,7 +104,7 @@ mlx5e_tc_act_reorder_flow_actions(struct flow_action *flow_action,
 
 int
 mlx5e_tc_act_post_parse(struct mlx5e_tc_act_parse_state *parse_state,
-			struct flow_action *flow_action,
+			struct flow_action *flow_action, int from, int to,
 			struct mlx5_flow_attr *attr,
 			enum mlx5_flow_namespace_type ns_type)
 {
@@ -116,6 +116,11 @@ mlx5e_tc_act_post_parse(struct mlx5e_tc_act_parse_state *parse_state,
 	priv = parse_state->flow->priv;
 
 	flow_action_for_each(i, act, flow_action) {
+		if (i < from)
+			continue;
+		else if (i > to)
+			break;
+
 		tc_act = mlx5e_tc_act_get(act->id, ns_type);
 		if (!tc_act || !tc_act->post_parse)
 			continue;

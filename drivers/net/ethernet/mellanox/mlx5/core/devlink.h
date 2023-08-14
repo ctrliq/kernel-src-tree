@@ -11,6 +11,7 @@ enum mlx5_devlink_param_id {
 	MLX5_DEVLINK_PARAM_ID_FLOW_STEERING_MODE,
 	MLX5_DEVLINK_PARAM_ID_ESW_LARGE_GROUP_NUM,
 	MLX5_DEVLINK_PARAM_ID_ESW_PORT_METADATA,
+	MLX5_DEVLINK_PARAM_ID_ESW_MULTIPORT,
 };
 
 struct mlx5_trap_ctx {
@@ -22,6 +23,11 @@ struct mlx5_devlink_trap {
 	struct mlx5_trap_ctx trap;
 	void *item;
 	struct list_head list;
+};
+
+struct mlx5_devlink_trap_event_ctx {
+	struct mlx5_trap_ctx *trap;
+	int err;
 };
 
 struct mlx5_core_dev;
