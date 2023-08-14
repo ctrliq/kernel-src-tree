@@ -154,7 +154,7 @@ static __cold void io_fallback_tw(struct io_uring_task *tctx);
 
 static struct kmem_cache *req_cachep;
 
-static int __read_mostly sysctl_io_uring_disabled;
+static int __read_mostly sysctl_io_uring_disabled = 2;
 #ifdef CONFIG_SYSCTL
 static struct ctl_table kernel_io_uring_disabled_table[] = {
 	{
