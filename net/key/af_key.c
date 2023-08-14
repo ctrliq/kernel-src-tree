@@ -3912,6 +3912,9 @@ static int __init ipsec_pfkey_init(void)
 	err = xfrm_register_km(&pfkeyv2_mgr);
 	if (err != 0)
 		goto out_sock_unregister;
+
+	mark_driver_deprecated("PF_KEY");
+
 out:
 	return err;
 
