@@ -3778,8 +3778,17 @@ static long io_uring_setup(u32 entries, struct io_uring_params __user *params)
 static inline bool io_uring_allowed(void)
 {
 	int disabled = READ_ONCE(sysctl_io_uring_disabled);
+	static bool printed = false;
 
-	return disabled == 0 || (disabled == 1 && capable(CAP_SYS_ADMIN));
+	if (disabled == 0 || (disabled == 1 && capable(CAP_SYS_ADMIN))) {
+		if (!printed) {
+			mark_tech_preview("io_uring", NULL);
+			printed = true;
+		}
+		return true;
+	}
+
+	return false;
 }
 
 SYSCALL_DEFINE2(io_uring_setup, u32, entries,
