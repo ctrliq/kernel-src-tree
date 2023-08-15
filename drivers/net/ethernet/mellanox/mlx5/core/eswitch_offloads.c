@@ -73,7 +73,7 @@
 
 #define MLX5_ESW_FT_OFFLOADS_DROP_RULE (1)
 
-static const struct esw_vport_tbl_namespace mlx5_esw_vport_tbl_mirror_ns = {
+static struct esw_vport_tbl_namespace mlx5_esw_vport_tbl_mirror_ns = {
 	.max_fte = MLX5_ESW_VPORT_TBL_SIZE,
 	.max_num_groups = MLX5_ESW_VPORT_TBL_NUM_GROUPS,
 	.flags = 0,
@@ -443,7 +443,7 @@ esw_setup_vport_dest(struct mlx5_flow_destination *dest, struct mlx5_flow_act *f
 			MLX5_CAP_GEN(esw_attr->dests[attr_idx].mdev, vhca_id);
 		dest[dest_idx].vport.flags |= MLX5_FLOW_DEST_VPORT_VHCA_ID;
 		if (dest[dest_idx].vport.num == MLX5_VPORT_UPLINK &&
-		    mlx5_lag_mpesw_is_activated(esw->dev))
+		    mlx5_lag_is_mpesw(esw->dev))
 			dest[dest_idx].type = MLX5_FLOW_DESTINATION_TYPE_UPLINK;
 	}
 	if (esw_attr->dests[attr_idx].flags & MLX5_ESW_DEST_ENCAP_VALID) {
@@ -579,16 +579,16 @@ mlx5_eswitch_add_offloaded_rule(struct mlx5_eswitch *esw,
 	if (esw->mode != MLX5_ESWITCH_OFFLOADS)
 		return ERR_PTR(-EOPNOTSUPP);
 
+	if (!mlx5_eswitch_vlan_actions_supported(esw->dev, 1))
+		return ERR_PTR(-EOPNOTSUPP);
+
 	dest = kcalloc(MLX5_MAX_FLOW_FWD_VPORTS + 1, sizeof(*dest), GFP_KERNEL);
 	if (!dest)
 		return ERR_PTR(-ENOMEM);
 
 	flow_act.action = attr->action;
-	/* if per flow vlan pop/push is emulated, don't set that into the firmware */
-	if (!mlx5_eswitch_vlan_actions_supported(esw->dev, 1))
-		flow_act.action &= ~(MLX5_FLOW_CONTEXT_ACTION_VLAN_PUSH |
-				     MLX5_FLOW_CONTEXT_ACTION_VLAN_POP);
-	else if (flow_act.action & MLX5_FLOW_CONTEXT_ACTION_VLAN_PUSH) {
+
+	if (flow_act.action & MLX5_FLOW_CONTEXT_ACTION_VLAN_PUSH) {
 		flow_act.vlan[0].ethtype = ntohs(esw_attr->vlan_proto[0]);
 		flow_act.vlan[0].vid = esw_attr->vlan_vid[0];
 		flow_act.vlan[0].prio = esw_attr->vlan_prio[0];
@@ -723,11 +723,11 @@ mlx5_eswitch_add_fwd_rule(struct mlx5_eswitch *esw,
 
 	flow_act.action = MLX5_FLOW_CONTEXT_ACTION_FWD_DEST;
 	for (i = 0; i < esw_attr->split_count; i++) {
-		if (esw_is_indir_table(esw, attr))
-			err = esw_setup_indir_table(dest, &flow_act, esw, attr, false, &i);
-		else if (esw_is_chain_src_port_rewrite(esw, esw_attr))
-			err = esw_setup_chain_src_port_rewrite(dest, &flow_act, esw, chains, attr,
-							       &i);
+		if (esw_attr->dests[i].flags & MLX5_ESW_DEST_CHAIN_WITH_SRC_PORT_CHANGE)
+			/* Source port rewrite (forward to ovs internal port or statck device) isn't
+			 * supported in the rule of split action.
+			 */
+			err = -EOPNOTSUPP;
 		else
 			esw_setup_vport_dest(dest, &flow_act, esw, esw_attr, i, i, false);
 
@@ -760,7 +760,6 @@ mlx5_eswitch_add_fwd_rule(struct mlx5_eswitch *esw,
 	kfree(dest);
 	return rule;
 err_chain_src_rewrite:
-	esw_put_dest_tables_loop(esw, attr, 0, i);
 	mlx5_esw_vporttbl_put(esw, &fwd_attr);
 err_get_fwd:
 	mlx5_chains_put_table(chains, attr->chain, attr->prio, 0);
@@ -803,7 +802,6 @@ __mlx5_eswitch_del_rule(struct mlx5_eswitch *esw,
 	if (fwd_rule)  {
 		mlx5_esw_vporttbl_put(esw, &fwd_attr);
 		mlx5_chains_put_table(chains, attr->chain, attr->prio, 0);
-		esw_put_dest_tables_loop(esw, attr, 0, esw_attr->split_count);
 	} else {
 		if (split)
 			mlx5_esw_vporttbl_put(esw, &fwd_attr);
@@ -827,204 +825,6 @@ mlx5_eswitch_del_fwd_rule(struct mlx5_eswitch *esw,
 			  struct mlx5_flow_attr *attr)
 {
 	__mlx5_eswitch_del_rule(esw, rule, attr, true);
-}
-
-static int esw_set_global_vlan_pop(struct mlx5_eswitch *esw, u8 val)
-{
-	struct mlx5_eswitch_rep *rep;
-	unsigned long i;
-	int err = 0;
-
-	esw_debug(esw->dev, "%s applying global %s policy\n", __func__, val ? "pop" : "none");
-	mlx5_esw_for_each_host_func_vport(esw, i, rep, esw->esw_funcs.num_vfs) {
-		if (atomic_read(&rep->rep_data[REP_ETH].state) != REP_LOADED)
-			continue;
-
-		err = __mlx5_eswitch_set_vport_vlan(esw, rep->vport, 0, 0, val);
-		if (err)
-			goto out;
-	}
-
-out:
-	return err;
-}
-
-static struct mlx5_eswitch_rep *
-esw_vlan_action_get_vport(struct mlx5_esw_flow_attr *attr, bool push, bool pop)
-{
-	struct mlx5_eswitch_rep *in_rep, *out_rep, *vport = NULL;
-
-	in_rep  = attr->in_rep;
-	out_rep = attr->dests[0].rep;
-
-	if (push)
-		vport = in_rep;
-	else if (pop)
-		vport = out_rep;
-	else
-		vport = in_rep;
-
-	return vport;
-}
-
-static int esw_add_vlan_action_check(struct mlx5_esw_flow_attr *attr,
-				     bool push, bool pop, bool fwd)
-{
-	struct mlx5_eswitch_rep *in_rep, *out_rep;
-
-	if ((push || pop) && !fwd)
-		goto out_notsupp;
-
-	in_rep  = attr->in_rep;
-	out_rep = attr->dests[0].rep;
-
-	if (push && in_rep->vport == MLX5_VPORT_UPLINK)
-		goto out_notsupp;
-
-	if (pop && out_rep->vport == MLX5_VPORT_UPLINK)
-		goto out_notsupp;
-
-	/* vport has vlan push configured, can't offload VF --> wire rules w.o it */
-	if (!push && !pop && fwd)
-		if (in_rep->vlan && out_rep->vport == MLX5_VPORT_UPLINK)
-			goto out_notsupp;
-
-	/* protects against (1) setting rules with different vlans to push and
-	 * (2) setting rules w.o vlans (attr->vlan = 0) && w. vlans to push (!= 0)
-	 */
-	if (push && in_rep->vlan_refcount && (in_rep->vlan != attr->vlan_vid[0]))
-		goto out_notsupp;
-
-	return 0;
-
-out_notsupp:
-	return -EOPNOTSUPP;
-}
-
-int mlx5_eswitch_add_vlan_action(struct mlx5_eswitch *esw,
-				 struct mlx5_flow_attr *attr)
-{
-	struct offloads_fdb *offloads = &esw->fdb_table.offloads;
-	struct mlx5_esw_flow_attr *esw_attr = attr->esw_attr;
-	struct mlx5_eswitch_rep *vport = NULL;
-	bool push, pop, fwd;
-	int err = 0;
-
-	/* nop if we're on the vlan push/pop non emulation mode */
-	if (mlx5_eswitch_vlan_actions_supported(esw->dev, 1))
-		return 0;
-
-	push = !!(attr->action & MLX5_FLOW_CONTEXT_ACTION_VLAN_PUSH);
-	pop  = !!(attr->action & MLX5_FLOW_CONTEXT_ACTION_VLAN_POP);
-	fwd  = !!((attr->action & MLX5_FLOW_CONTEXT_ACTION_FWD_DEST) &&
-		   !attr->dest_chain);
-
-	mutex_lock(&esw->state_lock);
-
-	err = esw_add_vlan_action_check(esw_attr, push, pop, fwd);
-	if (err)
-		goto unlock;
-
-	attr->flags &= ~MLX5_ATTR_FLAG_VLAN_HANDLED;
-
-	vport = esw_vlan_action_get_vport(esw_attr, push, pop);
-
-	if (!push && !pop && fwd) {
-		/* tracks VF --> wire rules without vlan push action */
-		if (esw_attr->dests[0].rep->vport == MLX5_VPORT_UPLINK) {
-			vport->vlan_refcount++;
-			attr->flags |= MLX5_ATTR_FLAG_VLAN_HANDLED;
-		}
-
-		goto unlock;
-	}
-
-	if (!push && !pop)
-		goto unlock;
-
-	if (!(offloads->vlan_push_pop_refcount)) {
-		/* it's the 1st vlan rule, apply global vlan pop policy */
-		err = esw_set_global_vlan_pop(esw, SET_VLAN_STRIP);
-		if (err)
-			goto out;
-	}
-	offloads->vlan_push_pop_refcount++;
-
-	if (push) {
-		if (vport->vlan_refcount)
-			goto skip_set_push;
-
-		err = __mlx5_eswitch_set_vport_vlan(esw, vport->vport, esw_attr->vlan_vid[0],
-						    0, SET_VLAN_INSERT | SET_VLAN_STRIP);
-		if (err)
-			goto out;
-		vport->vlan = esw_attr->vlan_vid[0];
-skip_set_push:
-		vport->vlan_refcount++;
-	}
-out:
-	if (!err)
-		attr->flags |= MLX5_ATTR_FLAG_VLAN_HANDLED;
-unlock:
-	mutex_unlock(&esw->state_lock);
-	return err;
-}
-
-int mlx5_eswitch_del_vlan_action(struct mlx5_eswitch *esw,
-				 struct mlx5_flow_attr *attr)
-{
-	struct offloads_fdb *offloads = &esw->fdb_table.offloads;
-	struct mlx5_esw_flow_attr *esw_attr = attr->esw_attr;
-	struct mlx5_eswitch_rep *vport = NULL;
-	bool push, pop, fwd;
-	int err = 0;
-
-	/* nop if we're on the vlan push/pop non emulation mode */
-	if (mlx5_eswitch_vlan_actions_supported(esw->dev, 1))
-		return 0;
-
-	if (!(attr->flags & MLX5_ATTR_FLAG_VLAN_HANDLED))
-		return 0;
-
-	push = !!(attr->action & MLX5_FLOW_CONTEXT_ACTION_VLAN_PUSH);
-	pop  = !!(attr->action & MLX5_FLOW_CONTEXT_ACTION_VLAN_POP);
-	fwd  = !!(attr->action & MLX5_FLOW_CONTEXT_ACTION_FWD_DEST);
-
-	mutex_lock(&esw->state_lock);
-
-	vport = esw_vlan_action_get_vport(esw_attr, push, pop);
-
-	if (!push && !pop && fwd) {
-		/* tracks VF --> wire rules without vlan push action */
-		if (esw_attr->dests[0].rep->vport == MLX5_VPORT_UPLINK)
-			vport->vlan_refcount--;
-
-		goto out;
-	}
-
-	if (push) {
-		vport->vlan_refcount--;
-		if (vport->vlan_refcount)
-			goto skip_unset_push;
-
-		vport->vlan = 0;
-		err = __mlx5_eswitch_set_vport_vlan(esw, vport->vport,
-						    0, 0, SET_VLAN_STRIP);
-		if (err)
-			goto out;
-	}
-
-skip_unset_push:
-	offloads->vlan_push_pop_refcount--;
-	if (offloads->vlan_push_pop_refcount)
-		goto out;
-
-	/* no more vlan rules, stop global vlan pop policy */
-	err = esw_set_global_vlan_pop(esw, 0);
-
-out:
-	mutex_unlock(&esw->state_lock);
-	return err;
 }
 
 struct mlx5_flow_handle *
@@ -1067,7 +867,8 @@ mlx5_eswitch_add_send_to_vport_rule(struct mlx5_eswitch *on_esw,
 	dest.vport.flags |= MLX5_FLOW_DEST_VPORT_VHCA_ID;
 	flow_act.action = MLX5_FLOW_CONTEXT_ACTION_FWD_DEST;
 
-	if (rep->vport == MLX5_VPORT_UPLINK)
+	if (MLX5_CAP_ESW_FLOWTABLE(on_esw->dev, flow_source) &&
+	    rep->vport == MLX5_VPORT_UPLINK)
 		spec->flow_context.flow_source = MLX5_FLOW_CONTEXT_FLOW_SOURCE_LOCAL_VPORT;
 
 	flow_rule = mlx5_add_flow_rules(mlx5_eswitch_get_slow_fdb(on_esw),
@@ -2980,7 +2781,7 @@ err_out:
 	return err;
 }
 
-static void esw_offloads_devcom_init(struct mlx5_eswitch *esw)
+void mlx5_esw_offloads_devcom_init(struct mlx5_eswitch *esw)
 {
 	struct mlx5_devcom *devcom = esw->dev->priv.devcom;
 
@@ -3003,7 +2804,7 @@ static void esw_offloads_devcom_init(struct mlx5_eswitch *esw)
 			       ESW_OFFLOADS_DEVCOM_PAIR, esw);
 }
 
-static void esw_offloads_devcom_cleanup(struct mlx5_eswitch *esw)
+void mlx5_esw_offloads_devcom_cleanup(struct mlx5_eswitch *esw)
 {
 	struct mlx5_devcom *devcom = esw->dev->priv.devcom;
 
@@ -3473,8 +3274,6 @@ int esw_offloads_enable(struct mlx5_eswitch *esw)
 	if (err)
 		goto err_vports;
 
-	esw_offloads_devcom_init(esw);
-
 	return 0;
 
 err_vports:
@@ -3515,7 +3314,6 @@ static int esw_offloads_stop(struct mlx5_eswitch *esw,
 
 void esw_offloads_disable(struct mlx5_eswitch *esw)
 {
-	esw_offloads_devcom_cleanup(esw);
 	mlx5_eswitch_disable_pf_vf_vports(esw);
 	esw_offloads_unload_rep(esw, MLX5_VPORT_UPLINK);
 	esw_set_passing_vport_metadata(esw, false);
@@ -3602,6 +3400,18 @@ static int esw_inline_mode_to_devlink(u8 mlx5_mode, u8 *mode)
 	return 0;
 }
 
+static bool esw_offloads_devlink_ns_eq_netdev_ns(struct devlink *devlink)
+{
+	struct net *devl_net, *netdev_net;
+	struct mlx5_eswitch *esw;
+
+	esw = mlx5_devlink_eswitch_get(devlink);
+	netdev_net = dev_net(esw->dev->mlx5e_res.uplink_netdev);
+	devl_net = devlink_net(devlink);
+
+	return net_eq(devl_net, netdev_net);
+}
+
 int mlx5_devlink_eswitch_mode_set(struct devlink *devlink, u16 mode,
 				  struct netlink_ext_ack *extack)
 {
@@ -3615,6 +3425,13 @@ int mlx5_devlink_eswitch_mode_set(struct devlink *devlink, u16 mode,
 
 	if (esw_mode_from_devlink(mode, &mlx5_mode))
 		return -EINVAL;
+
+	if (mode == DEVLINK_ESWITCH_MODE_SWITCHDEV &&
+	    !esw_offloads_devlink_ns_eq_netdev_ns(devlink)) {
+		NL_SET_ERR_MSG_MOD(extack,
+				   "Can't change E-Switch mode to switchdev when netdev net namespace has diverged from the devlink's.");
+		return -EPERM;
+	}
 
 	mlx5_lag_disable_change(esw->dev);
 	err = mlx5_esw_try_lock(esw);
@@ -3660,9 +3477,9 @@ int mlx5_devlink_eswitch_mode_get(struct devlink *devlink, u16 *mode)
 	if (IS_ERR(esw))
 		return PTR_ERR(esw);
 
-	down_write(&esw->mode_lock);
+	down_read(&esw->mode_lock);
 	err = esw_mode_to_devlink(esw->mode, mode);
-	up_write(&esw->mode_lock);
+	up_read(&esw->mode_lock);
 	return err;
 }
 
@@ -3760,9 +3577,9 @@ int mlx5_devlink_eswitch_inline_mode_get(struct devlink *devlink, u8 *mode)
 	if (IS_ERR(esw))
 		return PTR_ERR(esw);
 
-	down_write(&esw->mode_lock);
+	down_read(&esw->mode_lock);
 	err = esw_inline_mode_to_devlink(esw->offloads.inline_mode, mode);
-	up_write(&esw->mode_lock);
+	up_read(&esw->mode_lock);
 	return err;
 }
 
@@ -3834,9 +3651,9 @@ int mlx5_devlink_eswitch_encap_mode_get(struct devlink *devlink,
 	if (IS_ERR(esw))
 		return PTR_ERR(esw);
 
-	down_write(&esw->mode_lock);
+	down_read(&esw->mode_lock);
 	*encap = esw->offloads.encap;
-	up_write(&esw->mode_lock);
+	up_read(&esw->mode_lock);
 	return 0;
 }
 

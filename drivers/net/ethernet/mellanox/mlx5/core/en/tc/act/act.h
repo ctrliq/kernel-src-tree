@@ -18,7 +18,6 @@ struct mlx5e_tc_act_parse_state {
 	struct netlink_ext_ack *extack;
 	u32 actions;
 	bool ct;
-	bool ct_clear;
 	bool encap;
 	bool decap;
 	bool mpls_push;
@@ -116,7 +115,7 @@ mlx5e_tc_act_reorder_flow_actions(struct flow_action *flow_action,
 
 int
 mlx5e_tc_act_post_parse(struct mlx5e_tc_act_parse_state *parse_state,
-			struct flow_action *flow_action,
+			struct flow_action *flow_action, int from, int to,
 			struct mlx5_flow_attr *attr,
 			enum mlx5_flow_namespace_type ns_type);
 
