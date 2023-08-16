@@ -4,12 +4,12 @@
 # using known ark commit IDs.  It uses this information as well as setting
 # different values for DISTRO and DIST.
 #
-# The ark commit IDs are
+# The centos-stream-9 commit IDs are
 #
-#    78e36f3b0dae := 5.17.0 merge window (5.16 + additional changes before -rc1)
-#    2585cf9dfaad := 5.16-rc5
-#    df0cc57e057f := 5.16
-#    fce15c45d3fb := 5.16-rc5 + 2 additional commits
+#    edc9dd1e3c31 := 5.13.0 merge window (5.13 + additional changes before -rc1)
+#    a5e13c6df0e4 := 5.12-rc5
+#    9f4ad9e425a1 := 5.12
+#    6161a435c191 := 5.12-rc5 + 2 additional commits
 #
 
 [ -z "${RHDISTDATADIR}" ] && echo "ERROR: RHDISTDATADIR undefined." && exit 1
@@ -35,7 +35,7 @@ specfile_helper () {
 
 for DISTRO in fedora rhel centos
 do
-	for commit in 78e36f3b0dae 2585cf9dfaad df0cc57e057f fce15c45d3fb
+	for commit in edc9dd1e3c31 a5e13c6df0e4 9f4ad9e425a1 6161a435c191
 	do
 		for DIST in .fc25 .el7
 		do
