@@ -44,6 +44,7 @@ dnf -y install /usr/lib/rpm/redhat/dist.sh
 
 if [ -x /usr/lib/rpm/redhat/dist.sh ]; then
 	dist=$(/usr/lib/rpm/redhat/dist.sh)
+	# shellcheck disable=SC2081
 	[ "$dist" == el* ] && dnf -y install epel-release
 fi
 

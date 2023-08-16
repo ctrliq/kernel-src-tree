@@ -9,8 +9,8 @@ die() {
 cloned="$1"
 
 # Avoid accidental "rm *" in the root directory
-test "$cloned" || die '$1 is not given'
-test "$SPECPACKAGE_NAME" || die '$SPECPACKAGE_NAME is not set'
+test "$cloned" || die "$1 is not given"
+test "$SPECPACKAGE_NAME" || die "$SPECPACKAGE_NAME is not set"
 
 cd "$cloned/$SPECPACKAGE_NAME" || die "\"$cloned\" doesn't seem to have a dist-git clone"
 

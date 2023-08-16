@@ -19,11 +19,12 @@
 set -e
 
 # source common CI functions and variables
-# shellcheck source=./redhat/scripts/ci/ark-ci-env.sh
+# shellcheck disable=SC1091
 . "$(dirname "$0")"/ark-ci-env.sh
 
 finish()
 {
+	# shellcheck disable=SC2317
 	rm "$TMPFILE"
 }
 trap finish EXIT

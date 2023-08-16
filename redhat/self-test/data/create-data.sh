@@ -68,11 +68,13 @@ do
 				sort -u >& "${destdir}/${varfilename}" && \
 				sed -i 's/ \S*\(rhpkg.mk\)\S*//g' "${destdir}/${varfilename}" &
 
+			# shellcheck disable=SC2004
 			waitpids[${count}]=$!
 			((count++))
 
 			echo "building ${destdir}/${varfilename}.spec"
 			specfile_helper "${varfilename}" &
+			# shellcheck disable=SC2004
 			waitpids[${count}]=$!
 			((count++))
 		done
@@ -80,8 +82,9 @@ do
 		# There isn't an easy way to make sure the parallel execution doesn't go crazy
 		# and hammer a system.  Putting the wait loop here will artificially limit the
 		# number of jobs.
+		# shellcheck disable=SC2048
 		for pid in ${waitpids[*]}; do
-			wait ${pid}
+			wait "${pid}"
 		done
 	done
 done
