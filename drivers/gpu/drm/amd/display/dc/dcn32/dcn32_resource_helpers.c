@@ -284,8 +284,6 @@ bool dcn32_is_psr_capable(struct pipe_ctx *pipe)
  * @param [in]: context: New DC state to be programmed
  * @param [in]: pipes: Array of DML pipes
  *
- * @return: void
- *
  * *******************************************************************************************
  */
 void dcn32_determine_det_override(struct dc *dc,
@@ -301,9 +299,8 @@ void dcn32_determine_det_override(struct dc *dc,
 
 	for (i = 0; i < context->stream_count; i++) {
 		/* Don't count SubVP streams for DET allocation */
-		if (context->streams[i]->mall_stream_config.type != SUBVP_PHANTOM) {
+		if (context->streams[i]->mall_stream_config.type != SUBVP_PHANTOM)
 			stream_count++;
-		}
 	}
 
 	if (stream_count > 0) {
@@ -311,6 +308,7 @@ void dcn32_determine_det_override(struct dc *dc,
 		for (i = 0; i < context->stream_count; i++) {
 			if (context->streams[i]->mall_stream_config.type == SUBVP_PHANTOM)
 				continue;
+
 			if (context->stream_status[i].plane_count > 0)
 				plane_segments = stream_segments / context->stream_status[i].plane_count;
 			else

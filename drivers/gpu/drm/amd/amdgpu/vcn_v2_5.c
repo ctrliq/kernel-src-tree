@@ -143,7 +143,7 @@ static int vcn_v2_5_sw_init(void *handle)
 
 		/* VCN POISON TRAP */
 		r = amdgpu_irq_add_id(adev, amdgpu_ih_clientid_vcns[j],
-			VCN_2_6__SRCID_UVD_POISON, &adev->vcn.inst[j].irq);
+			VCN_2_6__SRCID_UVD_POISON, &adev->vcn.inst[j].ras_poison_irq);
 		if (r)
 			return r;
 	}
@@ -224,6 +224,10 @@ static int vcn_v2_5_sw_init(void *handle)
 
 	if (adev->pg_flags & AMD_PG_SUPPORT_VCN_DPG)
 		adev->vcn.pause_dpg_mode = vcn_v2_5_pause_dpg_mode;
+
+	r = amdgpu_vcn_ras_sw_init(adev);
+	if (r)
+		return r;
 
 	return 0;
 }
@@ -339,6 +343,9 @@ static int vcn_v2_5_hw_fini(void *handle)
 		    (adev->vcn.cur_state != AMD_PG_STATE_GATE &&
 		     RREG32_SOC15(VCN, i, mmUVD_STATUS)))
 			vcn_v2_5_set_powergating_state(adev, AMD_PG_STATE_GATE);
+
+		if (amdgpu_ras_is_supported(adev, AMDGPU_RAS_BLOCK__VCN))
+			amdgpu_irq_put(adev, &adev->vcn.inst[i].ras_poison_irq, 0);
 	}
 
 	return 0;
@@ -1861,6 +1868,14 @@ static int vcn_v2_5_set_interrupt_state(struct amdgpu_device *adev,
 	return 0;
 }
 
+static int vcn_v2_6_set_ras_interrupt_state(struct amdgpu_device *adev,
+					struct amdgpu_irq_src *source,
+					unsigned int type,
+					enum amdgpu_interrupt_state state)
+{
+	return 0;
+}
+
 static int vcn_v2_5_process_interrupt(struct amdgpu_device *adev,
 				      struct amdgpu_irq_src *source,
 				      struct amdgpu_iv_entry *entry)
@@ -1891,9 +1906,6 @@ static int vcn_v2_5_process_interrupt(struct amdgpu_device *adev,
 	case VCN_2_0__SRCID__UVD_ENC_LOW_LATENCY:
 		amdgpu_fence_process(&adev->vcn.inst[ip_instance].ring_enc[1]);
 		break;
-	case VCN_2_6__SRCID_UVD_POISON:
-		amdgpu_vcn_process_poison_irq(adev, source, entry);
-		break;
 	default:
 		DRM_ERROR("Unhandled interrupt: %d %d\n",
 			  entry->src_id, entry->src_data[0]);
@@ -1908,6 +1920,11 @@ static const struct amdgpu_irq_src_funcs vcn_v2_5_irq_funcs = {
 	.process = vcn_v2_5_process_interrupt,
 };
 
+static const struct amdgpu_irq_src_funcs vcn_v2_6_ras_irq_funcs = {
+	.set = vcn_v2_6_set_ras_interrupt_state,
+	.process = amdgpu_vcn_process_poison_irq,
+};
+
 static void vcn_v2_5_set_irq_funcs(struct amdgpu_device *adev)
 {
 	int i;
@@ -1917,6 +1934,9 @@ static void vcn_v2_5_set_irq_funcs(struct amdgpu_device *adev)
 			continue;
 		adev->vcn.inst[i].irq.num_types = adev->vcn.num_enc_rings + 1;
 		adev->vcn.inst[i].irq.funcs = &vcn_v2_5_irq_funcs;
+
+		adev->vcn.inst[i].ras_poison_irq.num_types = adev->vcn.num_enc_rings + 1;
+		adev->vcn.inst[i].ras_poison_irq.funcs = &vcn_v2_6_ras_irq_funcs;
 	}
 }
 
@@ -2019,6 +2039,7 @@ const struct amdgpu_ras_block_hw_ops vcn_v2_6_ras_hw_ops = {
 static struct amdgpu_vcn_ras vcn_v2_6_ras = {
 	.ras_block = {
 		.hw_ops = &vcn_v2_6_ras_hw_ops,
+		.ras_late_init = amdgpu_vcn_ras_late_init,
 	},
 };
 
@@ -2031,6 +2052,4 @@ static void vcn_v2_5_set_ras_funcs(struct amdgpu_device *adev)
 	default:
 		break;
 	}
-
-	amdgpu_vcn_set_ras_funcs(adev);
 }
