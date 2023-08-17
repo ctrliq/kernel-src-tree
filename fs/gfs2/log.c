@@ -1342,6 +1342,7 @@ int gfs2_logd(void *data)
 		t = wait_event_interruptible_timeout(sdp->sd_logd_waitq,
 				gfs2_ail_flush_reqd(sdp) ||
 				gfs2_jrnl_flush_reqd(sdp) ||
+				sdp->sd_log_error ||
 				kthread_should_stop(),
 				t);
 	}
