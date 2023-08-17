@@ -137,28 +137,6 @@ struct io_defer_entry {
 	u32			seq;
 };
 
-/* RHEL-only: provide a mechanism to globally disable io_uring. */
-DEFINE_STATIC_KEY_TRUE(io_uring_disabled);
-static bool io_uring_enabled = false;
-static int param_set_io_uring(const char *buffer, const struct kernel_param *kp)
-{
-	int ret = param_set_bool(buffer, kp);
-	if (ret)
-		return ret;
-	if (io_uring_enabled) {
-		static_branch_disable(&io_uring_disabled);
-		mark_tech_preview("io_uring", NULL);
-	}
-	return 0;
-}
-static const struct kernel_param_ops param_ops_io_uring = {
-	.set = param_set_io_uring,
-	.get = param_get_bool,
-};
-module_param_cb(enable, &param_ops_io_uring, &io_uring_enabled, 0);
-__MODULE_PARM_TYPE(enable, "bool");
-
-
 /* requests with any of those set should undergo io_disarm_next() */
 #define IO_DISARM_MASK (REQ_F_ARM_LTIMEOUT | REQ_F_LINK_TIMEOUT | REQ_F_FAIL)
 #define IO_REQ_LINK_FLAGS (REQ_F_LINK | REQ_F_HARDLINK)
@@ -175,6 +153,22 @@ static void __io_submit_flush_completions(struct io_ring_ctx *ctx);
 static __cold void io_fallback_tw(struct io_uring_task *tctx);
 
 static struct kmem_cache *req_cachep;
+
+static int __read_mostly sysctl_io_uring_disabled = 2;
+#ifdef CONFIG_SYSCTL
+static struct ctl_table kernel_io_uring_disabled_table[] = {
+	{
+		.procname	= "io_uring_disabled",
+		.data		= &sysctl_io_uring_disabled,
+		.maxlen		= sizeof(sysctl_io_uring_disabled),
+		.mode		= 0644,
+		.proc_handler	= proc_dointvec_minmax,
+		.extra1		= SYSCTL_ZERO,
+		.extra2		= SYSCTL_TWO,
+	},
+	{},
+};
+#endif
 
 struct sock *io_uring_get_socket(struct file *file)
 {
@@ -1956,6 +1950,14 @@ fail:
 		ret = io_issue_sqe(req, issue_flags);
 		if (ret != -EAGAIN)
 			break;
+
+		/*
+		 * If REQ_F_NOWAIT is set, then don't wait or retry with
+		 * poll. -EAGAIN is final for that case.
+		 */
+		if (req->flags & REQ_F_NOWAIT)
+			break;
+
 		/*
 		 * We can get EAGAIN for iopolled IO even though we're
 		 * forcing a sync submission from here, since we can't
@@ -2914,7 +2916,18 @@ static __cold void io_ring_exit_work(struct work_struct *work)
 			/* there is little hope left, don't run it too often */
 			interval = HZ * 60;
 		}
-	} while (!wait_for_completion_timeout(&ctx->ref_comp, interval));
+		/*
+		 * This is really an uninterruptible wait, as it has to be
+		 * complete. But it's also run from a kworker, which doesn't
+		 * take signals, so it's fine to make it interruptible. This
+		 * avoids scenarios where we knowingly can wait much longer
+		 * on completions, for example if someone does a SIGSTOP on
+		 * a task that needs to finish task_work to make this loop
+		 * complete. That's a synthetic situation that should not
+		 * cause a stuck task backtrace, and hence a potential panic
+		 * on stuck tasks if that is enabled.
+		 */
+	} while (!wait_for_completion_interruptible_timeout(&ctx->ref_comp, interval));
 
 	init_completion(&exit.completion);
 	init_task_work(&exit.task_work, io_tctx_exit_cb);
@@ -2938,7 +2951,12 @@ static __cold void io_ring_exit_work(struct work_struct *work)
 			continue;
 
 		mutex_unlock(&ctx->uring_lock);
-		wait_for_completion(&exit.completion);
+		/*
+		 * See comment above for
+		 * wait_for_completion_interruptible_timeout() on why this
+		 * wait is marked as interruptible.
+		 */
+		wait_for_completion_interruptible(&exit.completion);
 		mutex_lock(&ctx->uring_lock);
 	}
 	mutex_unlock(&ctx->uring_lock);
@@ -3310,9 +3328,6 @@ SYSCALL_DEFINE6(io_uring_enter, unsigned int, fd, u32, to_submit,
 	struct fd f;
 	long ret;
 
-	if (static_branch_unlikely(&io_uring_disabled))
-		return -ENOSYS;
-
 	if (unlikely(flags & ~(IORING_ENTER_GETEVENTS | IORING_ENTER_SQ_WAKEUP |
 			       IORING_ENTER_SQ_WAIT | IORING_ENTER_EXT_ARG |
 			       IORING_ENTER_REGISTERED_RING)))
@@ -3616,7 +3631,7 @@ static __cold int io_uring_create(unsigned entries, struct io_uring_params *p,
 		ctx->syscall_iopoll = 1;
 
 	ctx->compat = in_compat_syscall();
-	if (!capable(CAP_IPC_LOCK))
+	if (!ns_capable_noaudit(&init_user_ns, CAP_IPC_LOCK))
 		ctx->user = get_uid(current_user());
 
 	/*
@@ -3741,9 +3756,6 @@ static long io_uring_setup(u32 entries, struct io_uring_params __user *params)
 	struct io_uring_params p;
 	int i;
 
-	if (static_branch_unlikely(&io_uring_disabled))
-		return -ENOSYS;
-
 	if (copy_from_user(&p, params, sizeof(p)))
 		return -EFAULT;
 	for (i = 0; i < ARRAY_SIZE(p.resv); i++) {
@@ -3763,9 +3775,28 @@ static long io_uring_setup(u32 entries, struct io_uring_params __user *params)
 	return io_uring_create(entries, &p, params);
 }
 
+static inline bool io_uring_allowed(void)
+{
+	int disabled = READ_ONCE(sysctl_io_uring_disabled);
+	static bool printed = false;
+
+	if (disabled == 0 || (disabled == 1 && capable(CAP_SYS_ADMIN))) {
+		if (!printed) {
+			mark_tech_preview("io_uring", NULL);
+			printed = true;
+		}
+		return true;
+	}
+
+	return false;
+}
+
 SYSCALL_DEFINE2(io_uring_setup, u32, entries,
 		struct io_uring_params __user *, params)
 {
+	if (!io_uring_allowed())
+		return -EPERM;
+
 	return io_uring_setup(entries, params);
 }
 
@@ -4214,9 +4245,6 @@ SYSCALL_DEFINE4(io_uring_register, unsigned int, fd, unsigned int, opcode,
 	long ret = -EBADF;
 	struct fd f;
 
-	if (static_branch_unlikely(&io_uring_disabled))
-		return -ENOSYS;
-
 	if (opcode >= IORING_REGISTER_LAST)
 		return -EINVAL;
 
@@ -4317,6 +4345,11 @@ static int __init io_uring_init(void)
 
 	req_cachep = KMEM_CACHE(io_kiocb, SLAB_HWCACHE_ALIGN | SLAB_PANIC |
 				SLAB_ACCOUNT);
+
+#ifdef CONFIG_SYSCTL
+	register_sysctl_init("kernel", kernel_io_uring_disabled_table);
+#endif
+
 	return 0;
 };
 __initcall(io_uring_init);
