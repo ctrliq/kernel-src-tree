@@ -636,9 +636,9 @@ static inline int xfer_to_user(const struct vringh *vrh,
  * @features: the feature bits for this ring.
  * @num: the number of elements.
  * @weak_barriers: true if we only need memory barriers, not I/O.
- * @desc: the userpace descriptor pointer.
- * @avail: the userpace avail pointer.
- * @used: the userpace used pointer.
+ * @desc: the userspace descriptor pointer.
+ * @avail: the userspace avail pointer.
+ * @used: the userspace used pointer.
  *
  * Returns an error if num is invalid: you should check pointers
  * yourself!
@@ -911,9 +911,9 @@ static inline int kern_xfer(const struct vringh *vrh, void *dst,
  * @features: the feature bits for this ring.
  * @num: the number of elements.
  * @weak_barriers: true if we only need memory barriers, not I/O.
- * @desc: the userpace descriptor pointer.
- * @avail: the userpace avail pointer.
- * @used: the userpace used pointer.
+ * @desc: the userspace descriptor pointer.
+ * @avail: the userspace avail pointer.
+ * @used: the userspace used pointer.
  *
  * Returns an error if num is invalid.
  */
@@ -1109,7 +1109,7 @@ static int iotlb_translate(const struct vringh *vrh,
 	struct vhost_iotlb_map *map;
 	struct vhost_iotlb *iotlb = vrh->iotlb;
 	int ret = 0;
-	u64 s = 0;
+	u64 s = 0, last = addr + len - 1;
 
 	spin_lock(vrh->iotlb_lock);
 
@@ -1123,8 +1123,7 @@ static int iotlb_translate(const struct vringh *vrh,
 			break;
 		}
 
-		map = vhost_iotlb_itree_first(iotlb, addr,
-					      addr + len - 1);
+		map = vhost_iotlb_itree_first(iotlb, addr, last);
 		if (!map || map->start > addr) {
 			ret = -EINVAL;
 			break;
@@ -1192,10 +1191,10 @@ static inline int copy_from_iotlb(const struct vringh *vrh, void *dst,
 			return ret;
 
 		if (vrh->use_va) {
-			iov_iter_init(&iter, READ, ivec.iov.iovec, ret,
+			iov_iter_init(&iter, WRITE, ivec.iov.iovec, ret,
 				      translated);
 		} else {
-			iov_iter_bvec(&iter, READ, ivec.iov.bvec, ret,
+			iov_iter_bvec(&iter, WRITE, ivec.iov.bvec, ret,
 				      translated);
 		}
 
@@ -1238,10 +1237,10 @@ static inline int copy_to_iotlb(const struct vringh *vrh, void *dst,
 			return ret;
 
 		if (vrh->use_va) {
-			iov_iter_init(&iter, WRITE, ivec.iov.iovec, ret,
+			iov_iter_init(&iter, READ, ivec.iov.iovec, ret,
 				      translated);
 		} else {
-			iov_iter_bvec(&iter, WRITE, ivec.iov.bvec, ret,
+			iov_iter_bvec(&iter, READ, ivec.iov.bvec, ret,
 				      translated);
 		}
 
@@ -1388,9 +1387,9 @@ static inline int putused_iotlb(const struct vringh *vrh,
  * @features: the feature bits for this ring.
  * @num: the number of elements.
  * @weak_barriers: true if we only need memory barriers, not I/O.
- * @desc: the userpace descriptor pointer.
- * @avail: the userpace avail pointer.
- * @used: the userpace used pointer.
+ * @desc: the userspace descriptor pointer.
+ * @avail: the userspace avail pointer.
+ * @used: the userspace used pointer.
  *
  * Returns an error if num is invalid.
  */
