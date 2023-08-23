@@ -57,11 +57,10 @@ struct sys_off_handler {
 };
 
 /*
- * If set, this is used for preparing the system to power off.
+ * Temporary stub that prevents linkage failure while we're in process
+ * of removing all uses of legacy pm_power_off() around the kernel.
  */
-
-void (*pm_power_off_prepare)(void);
-EXPORT_SYMBOL_GPL(pm_power_off_prepare);
+void __weak (*pm_power_off)(void);
 
 /**
  *	emergency_restart - reboot the system
@@ -317,6 +316,43 @@ static int sys_off_notify(struct notifier_block *nb,
 	return handler->sys_off_cb(&data);
 }
 
+static struct sys_off_handler platform_sys_off_handler;
+
+static struct sys_off_handler *alloc_sys_off_handler(int priority)
+{
+	struct sys_off_handler *handler;
+	gfp_t flags;
+
+	/*
+	 * Platforms like m68k can't allocate sys_off handler dynamically
+	 * at the early boot time because memory allocator isn't available yet.
+	 */
+	if (priority == SYS_OFF_PRIO_PLATFORM) {
+		handler = &platform_sys_off_handler;
+		if (handler->cb_data)
+			return ERR_PTR(-EBUSY);
+	} else {
+		if (system_state > SYSTEM_RUNNING)
+			flags = GFP_ATOMIC;
+		else
+			flags = GFP_KERNEL;
+
+		handler = kzalloc(sizeof(*handler), flags);
+		if (!handler)
+			return ERR_PTR(-ENOMEM);
+	}
+
+	return handler;
+}
+
+static void free_sys_off_handler(struct sys_off_handler *handler)
+{
+	if (handler == &platform_sys_off_handler)
+		memset(handler, 0, sizeof(*handler));
+	else
+		kfree(handler);
+}
+
 /**
  *	register_sys_off_handler - Register sys-off handler
  *	@mode: Sys-off mode
@@ -347,9 +383,9 @@ register_sys_off_handler(enum sys_off_mode mode,
 	struct sys_off_handler *handler;
 	int err;
 
-	handler = kzalloc(sizeof(*handler), GFP_KERNEL);
-	if (!handler)
-		return ERR_PTR(-ENOMEM);
+	handler = alloc_sys_off_handler(priority);
+	if (IS_ERR(handler))
+		return handler;
 
 	switch (mode) {
 	case SYS_OFF_MODE_POWER_OFF_PREPARE:
@@ -366,7 +402,7 @@ register_sys_off_handler(enum sys_off_mode mode,
 		break;
 
 	default:
-		kfree(handler);
+		free_sys_off_handler(handler);
 		return ERR_PTR(-EINVAL);
 	}
 
@@ -393,7 +429,7 @@ register_sys_off_handler(enum sys_off_mode mode,
 	}
 
 	if (err) {
-		kfree(handler);
+		free_sys_off_handler(handler);
 		return ERR_PTR(err);
 	}
 
@@ -411,7 +447,7 @@ void unregister_sys_off_handler(struct sys_off_handler *handler)
 {
 	int err;
 
-	if (!handler)
+	if (IS_ERR_OR_NULL(handler))
 		return;
 
 	if (handler->blocking)
@@ -424,7 +460,7 @@ void unregister_sys_off_handler(struct sys_off_handler *handler)
 	/* sanity check, shall never happen */
 	WARN_ON(err);
 
-	kfree(handler);
+	free_sys_off_handler(handler);
 }
 EXPORT_SYMBOL_GPL(unregister_sys_off_handler);
 
@@ -464,6 +500,116 @@ int devm_register_sys_off_handler(struct device *dev,
 }
 EXPORT_SYMBOL_GPL(devm_register_sys_off_handler);
 
+static struct sys_off_handler *platform_power_off_handler;
+
+static int platform_power_off_notify(struct sys_off_data *data)
+{
+	void (*platform_power_power_off_cb)(void) = data->cb_data;
+
+	platform_power_power_off_cb();
+
+	return NOTIFY_DONE;
+}
+
+/**
+ *	register_platform_power_off - Register platform-level power-off callback
+ *	@power_off: Power-off callback
+ *
+ *	Registers power-off callback that will be called as last step
+ *	of the power-off sequence. This callback is expected to be invoked
+ *	for the last resort. Only one platform power-off callback is allowed
+ *	to be registered at a time.
+ *
+ *	Returns zero on success, or error code on failure.
+ */
+int register_platform_power_off(void (*power_off)(void))
+{
+	struct sys_off_handler *handler;
+
+	handler = register_sys_off_handler(SYS_OFF_MODE_POWER_OFF,
+					   SYS_OFF_PRIO_PLATFORM,
+					   platform_power_off_notify,
+					   power_off);
+	if (IS_ERR(handler))
+		return PTR_ERR(handler);
+
+	platform_power_off_handler = handler;
+
+	return 0;
+}
+EXPORT_SYMBOL_GPL(register_platform_power_off);
+
+/**
+ *	unregister_platform_power_off - Unregister platform-level power-off callback
+ *	@power_off: Power-off callback
+ *
+ *	Unregisters previously registered platform power-off callback.
+ */
+void unregister_platform_power_off(void (*power_off)(void))
+{
+	if (platform_power_off_handler &&
+	    platform_power_off_handler->cb_data == power_off) {
+		unregister_sys_off_handler(platform_power_off_handler);
+		platform_power_off_handler = NULL;
+	}
+}
+EXPORT_SYMBOL_GPL(unregister_platform_power_off);
+
+static int legacy_pm_power_off(struct sys_off_data *data)
+{
+	if (pm_power_off)
+		pm_power_off();
+
+	return NOTIFY_DONE;
+}
+
+static void do_kernel_power_off_prepare(void)
+{
+	blocking_notifier_call_chain(&power_off_prep_handler_list, 0, NULL);
+}
+
+/**
+ *	do_kernel_power_off - Execute kernel power-off handler call chain
+ *
+ *	Expected to be called as last step of the power-off sequence.
+ *
+ *	Powers off the system immediately if a power-off handler function has
+ *	been registered. Otherwise does nothing.
+ */
+void do_kernel_power_off(void)
+{
+	struct sys_off_handler *sys_off = NULL;
+
+	/*
+	 * Register sys-off handlers for legacy PM callback. This allows
+	 * legacy PM callbacks temporary co-exist with the new sys-off API.
+	 *
+	 * TODO: Remove legacy handlers once all legacy PM users will be
+	 *       switched to the sys-off based APIs.
+	 */
+	if (pm_power_off)
+		sys_off = register_sys_off_handler(SYS_OFF_MODE_POWER_OFF,
+						   SYS_OFF_PRIO_DEFAULT,
+						   legacy_pm_power_off, NULL);
+
+	atomic_notifier_call_chain(&power_off_handler_list, 0, NULL);
+
+	unregister_sys_off_handler(sys_off);
+}
+
+/**
+ *	kernel_can_power_off - check whether system can be powered off
+ *
+ *	Returns true if power-off handler is registered and system can be
+ *	powered off, false otherwise.
+ */
+bool kernel_can_power_off(void)
+{
+	return !atomic_notifier_call_chain_is_empty(&power_off_handler_list) ||
+		pm_power_off;
+}
+EXPORT_SYMBOL_GPL(kernel_can_power_off);
+
 /**
  *	kernel_power_off - power_off the system
  *
@@ -472,8 +618,7 @@ EXPORT_SYMBOL_GPL(devm_register_sys_off_handler);
 void kernel_power_off(void)
 {
 	kernel_shutdown_prepare(SYSTEM_POWER_OFF);
-	if (pm_power_off_prepare)
-		pm_power_off_prepare();
+	do_kernel_power_off_prepare();
 	migrate_to_reboot_cpu();
 	syscore_shutdown();
 	pr_emerg("Power down\n");
@@ -523,7 +668,7 @@ SYSCALL_DEFINE4(reboot, int, magic1, int, magic2, unsigned int, cmd,
 	/* Instead of trying to make the power_off code look like
 	 * halt when pm_power_off is not set do it the easy way.
 	 */
-	if ((cmd == LINUX_REBOOT_CMD_POWER_OFF) && !pm_power_off)
+	if ((cmd == LINUX_REBOOT_CMD_POWER_OFF) && !kernel_can_power_off())
 		cmd = LINUX_REBOOT_CMD_HALT;
 
 	mutex_lock(&system_transition_mutex);

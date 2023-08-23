@@ -906,6 +906,22 @@ int load_pdptrs(struct kvm_vcpu *vcpu, unsigned long cr3)
 }
 EXPORT_SYMBOL_GPL(load_pdptrs);
 
+static bool kvm_is_valid_cr0(struct kvm_vcpu *vcpu, unsigned long cr0)
+{
+#ifdef CONFIG_X86_64
+	if (cr0 & 0xffffffff00000000UL)
+		return false;
+#endif
+
+	if ((cr0 & X86_CR0_NW) && !(cr0 & X86_CR0_CD))
+		return false;
+
+	if ((cr0 & X86_CR0_PG) && !(cr0 & X86_CR0_PE))
+		return false;
+
+	return static_call(kvm_x86_is_valid_cr0)(vcpu, cr0);
+}
+
 void kvm_post_set_cr0(struct kvm_vcpu *vcpu, unsigned long old_cr0, unsigned long cr0)
 {
 	/*
@@ -952,20 +968,13 @@ int kvm_set_cr0(struct kvm_vcpu *vcpu, unsigned long cr0)
 {
 	unsigned long old_cr0 = kvm_read_cr0(vcpu);
 
+	if (!kvm_is_valid_cr0(vcpu, cr0))
+		return 1;
+
 	cr0 |= X86_CR0_ET;
 
-#ifdef CONFIG_X86_64
-	if (cr0 & 0xffffffff00000000UL)
-		return 1;
-#endif
-
+	/* Write to CR0 reserved bits are ignored, even on Intel. */
 	cr0 &= ~CR0_RESERVED_BITS;
-
-	if ((cr0 & X86_CR0_NW) && !(cr0 & X86_CR0_CD))
-		return 1;
-
-	if ((cr0 & X86_CR0_PG) && !(cr0 & X86_CR0_PE))
-		return 1;
 
 #ifdef CONFIG_X86_64
 	if ((vcpu->arch.efer & EFER_LME) && !is_paging(vcpu) &&
@@ -1449,7 +1458,7 @@ static const u32 msrs_to_save_base[] = {
 #endif
 	MSR_IA32_TSC, MSR_IA32_CR_PAT, MSR_VM_HSAVE_PA,
 	MSR_IA32_FEAT_CTL, MSR_IA32_BNDCFGS, MSR_TSC_AUX,
-	MSR_IA32_SPEC_CTRL,
+	MSR_IA32_SPEC_CTRL, MSR_IA32_TSX_CTRL,
 	MSR_IA32_RTIT_CTL, MSR_IA32_RTIT_STATUS, MSR_IA32_RTIT_CR3_MATCH,
 	MSR_IA32_RTIT_OUTPUT_BASE, MSR_IA32_RTIT_OUTPUT_MASK,
 	MSR_IA32_RTIT_ADDR0_A, MSR_IA32_RTIT_ADDR0_B,
@@ -1486,6 +1495,10 @@ static const u32 msrs_to_save_pmu[] = {
 	MSR_F15H_PERF_CTL3, MSR_F15H_PERF_CTL4, MSR_F15H_PERF_CTL5,
 	MSR_F15H_PERF_CTR0, MSR_F15H_PERF_CTR1, MSR_F15H_PERF_CTR2,
 	MSR_F15H_PERF_CTR3, MSR_F15H_PERF_CTR4, MSR_F15H_PERF_CTR5,
+
+	MSR_AMD64_PERF_CNTR_GLOBAL_CTL,
+	MSR_AMD64_PERF_CNTR_GLOBAL_STATUS,
+	MSR_AMD64_PERF_CNTR_GLOBAL_STATUS_CLR,
 };
 
 static u32 msrs_to_save[ARRAY_SIZE(msrs_to_save_base) +
@@ -2177,6 +2190,8 @@ fastpath_t handle_fastpath_set_msr_irqoff(struct kvm_vcpu *vcpu)
 	u64 data;
 	fastpath_t ret = EXIT_FASTPATH_NONE;
 
+	kvm_vcpu_srcu_read_lock(vcpu);
+
 	switch (msr) {
 	case APIC_BASE_MSR + (APIC_ICR >> 4):
 		data = kvm_read_edx_eax(vcpu);
@@ -2198,6 +2213,8 @@ fastpath_t handle_fastpath_set_msr_irqoff(struct kvm_vcpu *vcpu)
 
 	if (ret != EXIT_FASTPATH_NONE)
 		trace_kvm_msr_write(msr, data);
+
+	kvm_vcpu_srcu_read_unlock(vcpu);
 
 	return ret;
 }
@@ -4476,6 +4493,7 @@ int kvm_vm_ioctl_check_extension(struct kvm *kvm, long ext)
 	case KVM_CAP_VAPIC:
 	case KVM_CAP_ENABLE_CAP:
 	case KVM_CAP_VM_DISABLE_NX_HUGE_PAGES:
+	case KVM_CAP_IRQFD_RESAMPLE:
 		r = 1;
 		break;
 	case KVM_CAP_EXIT_HYPERCALL:
@@ -4575,9 +4593,7 @@ int kvm_vm_ioctl_check_extension(struct kvm *kvm, long ext)
 			r = 0;
 		break;
 	case KVM_CAP_XSAVE2: {
-		u64 guest_perm = xstate_get_guest_group_perm();
-
-		r = xstate_required_size(kvm_caps.supported_xcr0 & guest_perm, false);
+		r = xstate_required_size(kvm_get_filtered_xcr0(), false);
 		if (r < sizeof(struct kvm_xsave))
 			r = sizeof(struct kvm_xsave);
 		break;
@@ -5169,7 +5185,7 @@ static void kvm_vcpu_ioctl_x86_get_vcpu_events(struct kvm_vcpu *vcpu,
 	events->interrupt.shadow = static_call(kvm_x86_get_interrupt_shadow)(vcpu);
 
 	events->nmi.injected = vcpu->arch.nmi_injected;
-	events->nmi.pending = vcpu->arch.nmi_pending != 0;
+	events->nmi.pending = kvm_get_nr_pending_nmis(vcpu);
 	events->nmi.masked = static_call(kvm_x86_get_nmi_mask)(vcpu);
 
 	/* events->sipi_vector is never valid when reporting to user space */
@@ -5256,8 +5272,11 @@ static int kvm_vcpu_ioctl_x86_set_vcpu_events(struct kvm_vcpu *vcpu,
 						events->interrupt.shadow);
 
 	vcpu->arch.nmi_injected = events->nmi.injected;
-	if (events->flags & KVM_VCPUEVENT_VALID_NMI_PENDING)
-		vcpu->arch.nmi_pending = events->nmi.pending;
+	if (events->flags & KVM_VCPUEVENT_VALID_NMI_PENDING) {
+		vcpu->arch.nmi_pending = 0;
+		atomic_set(&vcpu->arch.nmi_queued, events->nmi.pending);
+		kvm_make_request(KVM_REQ_NMI, vcpu);
+	}
 	static_call(kvm_x86_set_nmi_mask)(vcpu, events->nmi.masked);
 
 	if (events->flags & KVM_VCPUEVENT_VALID_SIPI_VECTOR &&
@@ -7125,9 +7144,19 @@ static void kvm_probe_msr_to_save(u32 msr_index)
 		    kvm_pmu_cap.num_counters_fixed)
 			return;
 		break;
+	case MSR_AMD64_PERF_CNTR_GLOBAL_CTL:
+	case MSR_AMD64_PERF_CNTR_GLOBAL_STATUS:
+	case MSR_AMD64_PERF_CNTR_GLOBAL_STATUS_CLR:
+		if (!kvm_cpu_cap_has(X86_FEATURE_PERFMON_V2))
+			return;
+		break;
 	case MSR_IA32_XFD:
 	case MSR_IA32_XFD_ERR:
 		if (!kvm_cpu_cap_has(X86_FEATURE_XFD))
+			return;
+		break;
+	case MSR_IA32_TSX_CTRL:
+		if (!(kvm_get_arch_capabilities() & ARCH_CAP_TSX_CTRL_MSR))
 			return;
 		break;
 	default:
@@ -10176,9 +10205,13 @@ static int kvm_check_and_inject_events(struct kvm_vcpu *vcpu,
 		if (r < 0)
 			goto out;
 		if (r) {
-			kvm_queue_interrupt(vcpu, kvm_cpu_get_interrupt(vcpu), false);
-			static_call(kvm_x86_inject_irq)(vcpu, false);
-			WARN_ON(static_call(kvm_x86_interrupt_allowed)(vcpu, true) < 0);
+			int irq = kvm_cpu_get_interrupt(vcpu);
+
+			if (!WARN_ON_ONCE(irq == -1)) {
+				kvm_queue_interrupt(vcpu, irq, false);
+				static_call(kvm_x86_inject_irq)(vcpu, false);
+				WARN_ON(static_call(kvm_x86_interrupt_allowed)(vcpu, true) < 0);
+			}
 		}
 		if (kvm_cpu_has_injectable_intr(vcpu))
 			static_call(kvm_x86_enable_irq_window)(vcpu);
@@ -10215,19 +10248,46 @@ out:
 
 static void process_nmi(struct kvm_vcpu *vcpu)
 {
-	unsigned limit = 2;
+	unsigned int limit;
 
 	/*
-	 * x86 is limited to one NMI running, and one NMI pending after it.
-	 * If an NMI is already in progress, limit further NMIs to just one.
-	 * Otherwise, allow two (and we'll inject the first one immediately).
+	 * x86 is limited to one NMI pending, but because KVM can't react to
+	 * incoming NMIs as quickly as bare metal, e.g. if the vCPU is
+	 * scheduled out, KVM needs to play nice with two queued NMIs showing
+	 * up at the same time.  To handle this scenario, allow two NMIs to be
+	 * (temporarily) pending so long as NMIs are not blocked and KVM is not
+	 * waiting for a previous NMI injection to complete (which effectively
+	 * blocks NMIs).  KVM will immediately inject one of the two NMIs, and
+	 * will request an NMI window to handle the second NMI.
 	 */
 	if (static_call(kvm_x86_get_nmi_mask)(vcpu) || vcpu->arch.nmi_injected)
 		limit = 1;
+	else
+		limit = 2;
+
+	/*
+	 * Adjust the limit to account for pending virtual NMIs, which aren't
+	 * tracked in vcpu->arch.nmi_pending.
+	 */
+	if (static_call(kvm_x86_is_vnmi_pending)(vcpu))
+		limit--;
 
 	vcpu->arch.nmi_pending += atomic_xchg(&vcpu->arch.nmi_queued, 0);
 	vcpu->arch.nmi_pending = min(vcpu->arch.nmi_pending, limit);
-	kvm_make_request(KVM_REQ_EVENT, vcpu);
+
+	if (vcpu->arch.nmi_pending &&
+	    (static_call(kvm_x86_set_vnmi_pending)(vcpu)))
+		vcpu->arch.nmi_pending--;
+
+	if (vcpu->arch.nmi_pending)
+		kvm_make_request(KVM_REQ_EVENT, vcpu);
+}
+
+/* Return total number of NMIs pending injection to the VM */
+int kvm_get_nr_pending_nmis(struct kvm_vcpu *vcpu)
+{
+	return vcpu->arch.nmi_pending +
+	       static_call(kvm_x86_is_vnmi_pending)(vcpu);
 }
 
 void kvm_make_scan_ioapic_request_mask(struct kvm *kvm,
@@ -10717,6 +10777,9 @@ static int vcpu_enter_guest(struct kvm_vcpu *vcpu)
 			exit_fastpath = EXIT_FASTPATH_EXIT_HANDLED;
 			break;
 		}
+
+		/* Note, VM-Exits that go down the "slow" path are accounted below. */
+		++vcpu->stat.exits;
 	}
 
 	/*
@@ -11417,7 +11480,8 @@ static bool kvm_is_valid_sregs(struct kvm_vcpu *vcpu, struct kvm_sregs *sregs)
 			return false;
 	}
 
-	return kvm_is_valid_cr4(vcpu, sregs->cr4);
+	return kvm_is_valid_cr4(vcpu, sregs->cr4) &&
+	       kvm_is_valid_cr0(vcpu, sregs->cr0);
 }
 
 static int __set_sregs_common(struct kvm_vcpu *vcpu, struct kvm_sregs *sregs,
@@ -13142,7 +13206,7 @@ EXPORT_SYMBOL_GPL(kvm_arch_has_noncoherent_dma);
 
 bool kvm_arch_has_irq_bypass(void)
 {
-	return true;
+	return enable_apicv && irq_remapping_cap(IRQ_POSTING_CAP);
 }
 
 int kvm_arch_irq_bypass_add_producer(struct irq_bypass_consumer *cons,

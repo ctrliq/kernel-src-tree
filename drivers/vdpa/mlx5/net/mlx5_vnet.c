@@ -2411,7 +2411,7 @@ static int mlx5_vdpa_change_map(struct mlx5_vdpa_dev *mvdev,
 		goto err_mr;
 
 	teardown_driver(ndev);
-	mlx5_vdpa_destroy_mr(mvdev);
+	mlx5_vdpa_destroy_mr_asid(mvdev, asid);
 	err = mlx5_vdpa_create_mr(mvdev, iotlb, asid);
 	if (err)
 		goto err_mr;
@@ -2427,7 +2427,7 @@ static int mlx5_vdpa_change_map(struct mlx5_vdpa_dev *mvdev,
 	return 0;
 
 err_setup:
-	mlx5_vdpa_destroy_mr(mvdev);
+	mlx5_vdpa_destroy_mr_asid(mvdev, asid);
 err_mr:
 	return err;
 }
@@ -3316,17 +3316,6 @@ static void mlx5v_remove(struct auxiliary_device *adev)
 	kfree(mgtdev);
 }
 
-static void mlx5v_shutdown(struct auxiliary_device *auxdev)
-{
-	struct mlx5_vdpa_mgmtdev *mgtdev;
-	struct mlx5_vdpa_net *ndev;
-
-	mgtdev = auxiliary_get_drvdata(auxdev);
-	ndev = mgtdev->ndev;
-
-	free_irqs(ndev);
-}
-
 static const struct auxiliary_device_id mlx5v_id_table[] = {
 	{ .name = MLX5_ADEV_NAME ".vnet", },
 	{},
@@ -3338,7 +3327,6 @@ static struct auxiliary_driver mlx5v_driver = {
 	.name = "vnet",
 	.probe = mlx5v_probe,
 	.remove = mlx5v_remove,
-	.shutdown = mlx5v_shutdown,
 	.id_table = mlx5v_id_table,
 };
 
