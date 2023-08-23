@@ -3,6 +3,7 @@
 #define ARCH_X86_KVM_X86_H
 
 #include <linux/kvm_host.h>
+#include <asm/fpu/xstate.h>
 #include <asm/mce.h>
 #include <asm/pvclock.h>
 #include "kvm_cache_regs.h"
@@ -171,19 +172,19 @@ static inline bool mmu_is_nested(struct kvm_vcpu *vcpu)
 	return vcpu->arch.walk_mmu == &vcpu->arch.nested_mmu;
 }
 
-static inline int is_pae(struct kvm_vcpu *vcpu)
+static inline bool is_pae(struct kvm_vcpu *vcpu)
 {
-	return kvm_read_cr4_bits(vcpu, X86_CR4_PAE);
+	return kvm_is_cr4_bit_set(vcpu, X86_CR4_PAE);
 }
 
-static inline int is_pse(struct kvm_vcpu *vcpu)
+static inline bool is_pse(struct kvm_vcpu *vcpu)
 {
-	return kvm_read_cr4_bits(vcpu, X86_CR4_PSE);
+	return kvm_is_cr4_bit_set(vcpu, X86_CR4_PSE);
 }
 
-static inline int is_paging(struct kvm_vcpu *vcpu)
+static inline bool is_paging(struct kvm_vcpu *vcpu)
 {
-	return likely(kvm_read_cr0_bits(vcpu, X86_CR0_PG));
+	return likely(kvm_is_cr0_bit_set(vcpu, X86_CR0_PG));
 }
 
 static inline bool is_pae_paging(struct kvm_vcpu *vcpu)
@@ -314,6 +315,34 @@ extern u64 host_xss;
 extern struct kvm_caps kvm_caps;
 
 extern bool enable_pmu;
+
+/*
+ * Get a filtered version of KVM's supported XCR0 that strips out dynamic
+ * features for which the current process doesn't (yet) have permission to use.
+ * This is intended to be used only when enumerating support to userspace,
+ * e.g. in KVM_GET_SUPPORTED_CPUID and KVM_CAP_XSAVE2, it does NOT need to be
+ * used to check/restrict guest behavior as KVM rejects KVM_SET_CPUID{2} if
+ * userspace attempts to enable unpermitted features.
+ */
+static inline u64 kvm_get_filtered_xcr0(void)
+{
+	u64 permitted_xcr0 = kvm_caps.supported_xcr0;
+
+	BUILD_BUG_ON(XFEATURE_MASK_USER_DYNAMIC != XFEATURE_MASK_XTILE_DATA);
+
+	if (permitted_xcr0 & XFEATURE_MASK_USER_DYNAMIC) {
+		permitted_xcr0 &= xstate_get_guest_group_perm();
+
+		/*
+		 * Treat XTILE_CFG as unsupported if the current process isn't
+		 * allowed to use XTILE_DATA, as attempting to set XTILE_CFG in
+		 * XCR0 without setting XTILE_DATA is architecturally illegal.
+		 */
+		if (!(permitted_xcr0 & XFEATURE_MASK_XTILE_DATA))
+			permitted_xcr0 &= ~XFEATURE_MASK_XTILE_CFG;
+	}
+	return permitted_xcr0;
+}
 
 static inline bool kvm_mpx_supported(void)
 {
