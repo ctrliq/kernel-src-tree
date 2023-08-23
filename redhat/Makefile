@@ -877,6 +877,13 @@ dist-self-test:
 dist-self-test-data:
 	./self-test/data/create-data.sh
 
+dist-check-licenses:
+	@if test -x /usr/bin/bats; then \
+		bats $(REDHAT)/self-test/1007-spdx-licenses.bats ; \
+	else \
+		echo "dist-check-licenses: The bats package is not installed" ; \
+	fi
+
 dist-help:
 	@echo  'Cleaning targets:'
 	@echo  '  dist-clean          - Clean redhat/configs/ and redhat/rpm/ directories.'
@@ -1000,6 +1007,9 @@ dist-full-help:
 	@echo  '  dist-os-version - Displays the current Red Hat Enterprise Linux versioni'
 	@echo  '                    target used by the current branch/tree.'
 	@echo  '  dist-self-test  - Runs self-tests from the redhat/self-test directory'
+	@echo  '  dist-check-licenses - Runs license selftest checking SPDX-License-Identifier:'
+	@echo  '                        tags in all source files against `License:` field in the'
+	@echo  '                        specfile template.'
 	@echo  ''
 
 export
