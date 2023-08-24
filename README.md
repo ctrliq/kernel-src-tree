@@ -105,7 +105,7 @@ These changes include validSSTNames.go changes.  You must ensure the SST names t
 
 The layout is
 
-- docs/ contains the general kernel workflow documentation, links, etc.
+- content/docs/ contains the general kernel workflow documentation, links, etc.
 
 See https://red.ht/kernel_workflow_doc for information on the Red Hat Kernel
 Workflow.
