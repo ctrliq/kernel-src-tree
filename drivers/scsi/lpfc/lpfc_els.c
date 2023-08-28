@@ -2377,10 +2377,10 @@ lpfc_cmpl_els_prli(struct lpfc_hba *phba, struct lpfc_iocbq *cmdiocb,
 		/* PRLI failed */
 		lpfc_printf_vlog(vport, mode, loglevel,
 				 "2754 PRLI failure DID:%06X Status:x%x/x%x, "
-				 "data: x%x x%x\n",
+				 "data: x%x x%x x%x\n",
 				 ndlp->nlp_DID, ulp_status,
 				 ulp_word4, ndlp->nlp_state,
-				 ndlp->fc4_prli_sent);
+				 ndlp->fc4_prli_sent, ndlp->nlp_flag);
 
 		/* Do not call DSM for lpfc_els_abort'ed ELS cmds */
 		if (!lpfc_error_lost_link(vport, ulp_status, ulp_word4))
@@ -2391,14 +2391,16 @@ lpfc_cmpl_els_prli(struct lpfc_hba *phba, struct lpfc_iocbq *cmdiocb,
 		 * mismatch typically caused by an RSCN. Skip any
 		 * processing to allow recovery.
 		 */
-		if (ndlp->nlp_state >= NLP_STE_PLOGI_ISSUE &&
-		    ndlp->nlp_state <= NLP_STE_REG_LOGIN_ISSUE) {
+		if ((ndlp->nlp_state >= NLP_STE_PLOGI_ISSUE &&
+		     ndlp->nlp_state <= NLP_STE_REG_LOGIN_ISSUE) ||
+		    (ndlp->nlp_state == NLP_STE_NPR_NODE &&
+		     ndlp->nlp_flag & NLP_DELAY_TMO)) {
 			lpfc_printf_vlog(vport, KERN_WARNING, LOG_NODE,
-					 "2784 PRLI cmpl: state mismatch "
+					 "2784 PRLI cmpl: Allow Node recovery "
 					 "DID x%06x nstate x%x nflag x%x\n",
 					 ndlp->nlp_DID, ndlp->nlp_state,
 					 ndlp->nlp_flag);
-				goto out;
+			goto out;
 		}
 
 		/*
@@ -6156,11 +6158,25 @@ lpfc_els_rsp_prli_acc(struct lpfc_vport *vport, struct lpfc_iocbq *oldiocb,
 			npr->TaskRetryIdReq = 1;
 		}
 		npr->acceptRspCode = PRLI_REQ_EXECUTED;
-		npr->estabImagePair = 1;
+
+		/* Set image pair for complementary pairs only. */
+		if (ndlp->nlp_type & NLP_FCP_TARGET)
+			npr->estabImagePair = 1;
+		else
+			npr->estabImagePair = 0;
 		npr->readXferRdyDis = 1;
 		npr->ConfmComplAllowed = 1;
 		npr->prliType = PRLI_FCP_TYPE;
 		npr->initiatorFunc = 1;
+
+		/* Xmit PRLI ACC response tag <ulpIoTag> */
+		lpfc_printf_vlog(vport, KERN_INFO,
+				 LOG_ELS | LOG_NODE | LOG_DISCOVERY,
+				 "6014 FCP issue PRLI ACC imgpair %d "
+				 "retry %d task %d\n",
+				 npr->estabImagePair,
+				 npr->Retry, npr->TaskRetryIdReq);
+
 	} else if (prli_fc4_req == PRLI_NVME_TYPE) {
 		/* Respond with an NVME PRLI Type */
 		npr_nvme = (struct lpfc_nvme_prli *) pcmd;
