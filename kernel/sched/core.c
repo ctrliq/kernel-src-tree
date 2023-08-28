@@ -6753,7 +6753,7 @@ void sched_resume_work(void)
 	}
 }
 
-static void schedule_loop(unsigned int sched_mode)
+static void __always_inline schedule_loop(unsigned int sched_mode)
 {
 	do {
 		preempt_disable();
