@@ -3470,7 +3470,7 @@ fi\
 
 %ifarch %{cpupowerarchs}
 %files -n %{package_name}-tools-libs
-%{_libdir}/libcpupower.so.0
+%{_libdir}/libcpupower.so.1
 %{_libdir}/libcpupower.so.0.0.1
 
 %files -n %{package_name}-tools-libs-devel
