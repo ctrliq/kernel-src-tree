@@ -9,6 +9,9 @@ XZ_THREADS="--threads $RHJOBS"
 ARCH=$(arch)
 XZ_OPTIONS=""
 
+# convert from shortened git sha to standard 40 digit git sha
+_GITID="$(git rev-parse "$_GITID")"
+
 if [ "$ARCH" != "x86_64" ]
 then
         XZ_OPTIONS="-M 3G"
