@@ -1911,6 +1911,8 @@ struct hci_conn *hci_bind_cis(struct hci_dev *hdev, bdaddr_t *dst,
 		return ERR_PTR(-EINVAL);
 	}
 
+	hci_conn_hold(cis);
+
 	cis->iso_qos = *qos;
 	cis->state = BT_BOUND;
 
@@ -2263,6 +2265,9 @@ struct hci_conn *hci_connect_cis(struct hci_dev *hdev, bdaddr_t *dst,
 		hci_conn_drop(cis);
 		return ERR_PTR(-ENOLINK);
 	}
+
+	/* Link takes the refcount */
+	hci_conn_drop(cis);
 
 	cis->state = BT_CONNECT;
 
