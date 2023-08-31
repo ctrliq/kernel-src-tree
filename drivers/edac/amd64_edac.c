@@ -2927,6 +2927,24 @@ static struct amd64_family_type family_types[] = {
 			.dbam_to_cs		= f17_addr_mask_to_cs_size,
 		}
 	},
+	[F19_M60H_CPUS] = {
+		.ctl_name = "F19h_M60h",
+		.max_mcs = 2,
+		.flags.zn_regs_v2 = 1,
+		.ops = {
+			.early_channel_count	= f17_early_channel_count,
+			.dbam_to_cs		= f17_addr_mask_to_cs_size,
+		}
+	},
+	[F19_M70H_CPUS] = {
+		.ctl_name = "F19h_M70h",
+		.max_mcs = 2,
+		.flags.zn_regs_v2 = 1,
+		.ops = {
+			.early_channel_count	= f17_early_channel_count,
+			.dbam_to_cs		= f17_addr_mask_to_cs_size,
+		}
+	},
 	[F19_M10H_CPUS] = {
 		.ctl_name = "F19h_M10h",
 		.max_mcs = 12,
@@ -3960,6 +3978,16 @@ static struct amd64_family_type *per_family_init(struct amd64_pvt *pvt)
 			fam_type = &family_types[F17_M70H_CPUS];
 			pvt->ops = &family_types[F17_M70H_CPUS].ops;
 			fam_type->ctl_name = "F19h_M20h";
+			break;
+		} else if (pvt->model >= 0x60 && pvt->model <= 0x6f) {
+			fam_type = &family_types[F19_M60H_CPUS];
+			pvt->ops = &family_types[F19_M60H_CPUS].ops;
+			fam_type->ctl_name = "F19h_M60h";
+			break;
+		} else if (pvt->model >= 0x70 && pvt->model <= 0x7f) {
+			fam_type = &family_types[F19_M70H_CPUS];
+			pvt->ops = &family_types[F19_M70H_CPUS].ops;
+			fam_type->ctl_name = "F19h_M70h";
 			break;
 		} else if (pvt->model >= 0xa0 && pvt->model <= 0xaf) {
 			fam_type = &family_types[F19_M10H_CPUS];

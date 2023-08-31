@@ -288,6 +288,8 @@ enum amd_families {
 	F17_M70H_CPUS,
 	F19_CPUS,
 	F19_M10H_CPUS,
+	F19_M60H_CPUS,
+	F19_M70H_CPUS,
 	NUM_FAMILIES,
 };
 
