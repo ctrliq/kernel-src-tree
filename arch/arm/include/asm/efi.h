@@ -17,7 +17,6 @@
 
 #ifdef CONFIG_EFI
 void efi_init(void);
-void arm_efi_init(void);
 
 int efi_create_mapping(struct mm_struct *mm, efi_memory_desc_t *md);
 int efi_set_mapping_permissions(struct mm_struct *mm, efi_memory_desc_t *md);
@@ -38,7 +37,7 @@ void efi_virtmap_load(void);
 void efi_virtmap_unload(void);
 
 #else
-#define arm_efi_init()
+#define efi_init()
 #endif /* CONFIG_EFI */
 
 /* arch specific definitions used by the stub code */
