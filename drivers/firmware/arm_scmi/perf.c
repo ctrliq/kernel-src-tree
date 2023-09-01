@@ -140,7 +140,8 @@ struct perf_dom_info {
 struct scmi_perf_info {
 	u32 version;
 	int num_domains;
-	enum scmi_power_scale power_scale;
+	bool power_scale_mw;
+	bool power_scale_uw;
 	u64 stats_addr;
 	u32 stats_size;
 	struct perf_dom_info *dom_info;
@@ -170,13 +171,9 @@ static int scmi_perf_attributes_get(const struct scmi_protocol_handle *ph,
 		u16 flags = le16_to_cpu(attr->flags);
 
 		pi->num_domains = le16_to_cpu(attr->num_domains);
-
-		if (POWER_SCALE_IN_MILLIWATT(flags))
-			pi->power_scale = SCMI_POWER_MILLIWATTS;
+		pi->power_scale_mw = POWER_SCALE_IN_MILLIWATT(flags);
 		if (PROTOCOL_REV_MAJOR(pi->version) >= 0x3)
-			if (POWER_SCALE_IN_MICROWATT(flags))
-				pi->power_scale = SCMI_POWER_MICROWATTS;
-
+			pi->power_scale_uw = POWER_SCALE_IN_MICROWATT(flags);
 		pi->stats_addr = le32_to_cpu(attr->stats_addr_low) |
 				(u64)le32_to_cpu(attr->stats_addr_high) << 32;
 		pi->stats_size = le32_to_cpu(attr->stats_size);
@@ -678,12 +675,11 @@ static bool scmi_fast_switch_possible(const struct scmi_protocol_handle *ph,
 	return dom->fc_info && dom->fc_info[PERF_FC_LEVEL].set_addr;
 }
 
-static enum scmi_power_scale
-scmi_power_scale_get(const struct scmi_protocol_handle *ph)
+static bool scmi_power_scale_mw_get(const struct scmi_protocol_handle *ph)
 {
 	struct scmi_perf_info *pi = ph->get_priv(ph);
 
-	return pi->power_scale;
+	return pi->power_scale_mw;
 }
 
 static const struct scmi_perf_proto_ops perf_proto_ops = {
@@ -698,7 +694,7 @@ static const struct scmi_perf_proto_ops perf_proto_ops = {
 	.freq_get = scmi_dvfs_freq_get,
 	.est_power_get = scmi_dvfs_est_power_get,
 	.fast_switch_possible = scmi_fast_switch_possible,
-	.power_scale_get = scmi_power_scale_get,
+	.power_scale_mw_get = scmi_power_scale_mw_get,
 };
 
 static int scmi_perf_set_notify_enabled(const struct scmi_protocol_handle *ph,
