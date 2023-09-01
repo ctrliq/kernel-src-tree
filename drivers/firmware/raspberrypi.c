@@ -329,18 +329,12 @@ struct rpi_firmware *rpi_firmware_get(struct device_node *firmware_node)
 
 	fw = platform_get_drvdata(pdev);
 	if (!fw)
-		goto err_put_device;
+		return NULL;
 
 	if (!kref_get_unless_zero(&fw->consumers))
-		goto err_put_device;
-
-	put_device(&pdev->dev);
+		return NULL;
 
 	return fw;
-
-err_put_device:
-	put_device(&pdev->dev);
-	return NULL;
 }
 EXPORT_SYMBOL_GPL(rpi_firmware_get);
 
