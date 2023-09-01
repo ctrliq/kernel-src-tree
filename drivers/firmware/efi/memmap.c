@@ -59,7 +59,8 @@ static void __init efi_memmap_free(void)
  * Depending on whether mm_init() has already been invoked or not,
  * either memblock or "normal" page allocation is used.
  *
- * Returns zero on success, a negative error code on failure.
+ * Returns the physical address of the allocated memory map on
+ * success, zero on failure.
  */
 int __init efi_memmap_alloc(unsigned int num_entries,
 		struct efi_memory_map_data *data)
