@@ -51,18 +51,17 @@ static efi_status_t efi_open_file(efi_file_protocol_t *volume,
 			*c = L'\\';
 	}
 
-	status = efi_call_proto(volume, open, &fh, fi->filename,
-				EFI_FILE_MODE_READ, 0);
+	status = volume->open(volume, &fh, fi->filename, EFI_FILE_MODE_READ, 0);
 	if (status != EFI_SUCCESS) {
 		efi_err("Failed to open file: %ls\n", fi->filename);
 		return status;
 	}
 
 	info_sz = sizeof(struct finfo);
-	status = efi_call_proto(fh, get_info, &info_guid, &info_sz, fi);
+	status = fh->get_info(fh, &info_guid, &info_sz, fi);
 	if (status != EFI_SUCCESS) {
 		efi_err("Failed to get file info\n");
-		efi_call_proto(fh, close);
+		fh->close(fh);
 		return status;
 	}
 
@@ -78,14 +77,14 @@ static efi_status_t efi_open_volume(efi_loaded_image_t *image,
 	efi_simple_file_system_protocol_t *io;
 	efi_status_t status;
 
-	status = efi_bs_call(handle_protocol, efi_table_attr(image, device_handle),
-			     &fs_proto, (void **)&io);
+	status = efi_bs_call(handle_protocol, image->device_handle, &fs_proto,
+			     (void **)&io);
 	if (status != EFI_SUCCESS) {
 		efi_err("Failed to handle fs_proto\n");
 		return status;
 	}
 
-	status = efi_call_proto(io, open_volume, fh);
+	status = io->open_volume(io, fh);
 	if (status != EFI_SUCCESS)
 		efi_err("Failed to open volume\n");
 
@@ -145,8 +144,7 @@ static efi_status_t efi_open_device_path(efi_file_protocol_t **volume,
 
 
 	/* Convert the filename wide string into a device path */
-	initrd_dp = efi_fn_call(text_to_dp, convert_text_to_device_path,
-				fi->filename);
+	initrd_dp = text_to_dp->convert_text_to_device_path(fi->filename);
 
 	/* Check whether the device path in question implements simple FS */
 	if ((efi_bs_call(locate_device_path, &fs_proto, &initrd_dp, &handle) ?:
@@ -168,7 +166,7 @@ static efi_status_t efi_open_device_path(efi_file_protocol_t **volume,
 	       min(sizeof(fi->filename),
 		   fpath->header.length - sizeof(fpath->header)));
 
-	status = efi_call_proto(io, open_volume, volume);
+	status = io->open_volume(io, volume);
 	if (status != EFI_SUCCESS)
 		efi_err("Failed to open volume\n");
 
@@ -189,8 +187,8 @@ efi_status_t handle_cmdline_files(efi_loaded_image_t *image,
 				  unsigned long *load_addr,
 				  unsigned long *load_size)
 {
-	const efi_char16_t *cmdline = efi_table_attr(image, load_options);
-	u32 cmdline_len = efi_table_attr(image, load_options_size);
+	const efi_char16_t *cmdline = image->load_options;
+	u32 cmdline_len = image->load_options_size;
 	unsigned long efi_chunk_size = ULONG_MAX;
 	efi_file_protocol_t *volume = NULL;
 	efi_file_protocol_t *file;
@@ -278,7 +276,7 @@ efi_status_t handle_cmdline_files(efi_loaded_image_t *image,
 		while (size) {
 			unsigned long chunksize = min(size, efi_chunk_size);
 
-			status = efi_call_proto(file, read, &chunksize, addr);
+			status = file->read(file, &chunksize, addr);
 			if (status != EFI_SUCCESS) {
 				efi_err("Failed to read file\n");
 				goto err_close_file;
@@ -286,8 +284,8 @@ efi_status_t handle_cmdline_files(efi_loaded_image_t *image,
 			addr += chunksize;
 			size -= chunksize;
 		}
-		efi_call_proto(file, close);
-		efi_call_proto(volume, close);
+		file->close(file);
+		volume->close(volume);
 	} while (offset > 0);
 
 	*load_addr = alloc_addr;
@@ -298,10 +296,10 @@ efi_status_t handle_cmdline_files(efi_loaded_image_t *image,
 	return EFI_SUCCESS;
 
 err_close_file:
-	efi_call_proto(file, close);
+	file->close(file);
 
 err_close_volume:
-	efi_call_proto(volume, close);
+	volume->close(volume);
 
 err_free_alloc:
 	efi_free(alloc_size, alloc_addr);
