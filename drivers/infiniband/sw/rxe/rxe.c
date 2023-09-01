@@ -214,9 +214,15 @@ static int __init rxe_module_init(void)
 
 	mark_tech_preview("Soft-RoCE (rdma_rxe) Driver", THIS_MODULE);
 
-	err = rxe_net_init();
+	err = rxe_alloc_wq();
 	if (err)
 		return err;
+
+	err = rxe_net_init();
+	if (err) {
+		rxe_destroy_wq();
+		return err;
+	}
 
 	rdma_link_register(&rxe_link_ops);
 	pr_info("loaded\n");
@@ -228,6 +234,7 @@ static void __exit rxe_module_exit(void)
 	rdma_link_unregister(&rxe_link_ops);
 	ib_unregister_driver(RDMA_DRIVER_RXE);
 	rxe_net_exit();
+	rxe_destroy_wq();
 
 	pr_info("unloaded\n");
 }
