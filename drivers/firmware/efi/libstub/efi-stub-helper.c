@@ -439,14 +439,13 @@ efi_status_t efi_exit_boot_services(void *handle, void *priv,
 	efi_status_t status;
 
 	status = efi_get_memory_map(&map);
+
 	if (status != EFI_SUCCESS)
-		return status;
+		goto fail;
 
 	status = priv_func(map, priv);
-	if (status != EFI_SUCCESS) {
-		efi_bs_call(free_pool, map);
-		return status;
-	}
+	if (status != EFI_SUCCESS)
+		goto free_map;
 
 	if (efi_disable_pci_dma)
 		efi_pci_disable_bridge_busmaster();
@@ -477,16 +476,25 @@ efi_status_t efi_exit_boot_services(void *handle, void *priv,
 
 		/* exit_boot_services() was called, thus cannot free */
 		if (status != EFI_SUCCESS)
-			return status;
+			goto fail;
 
 		status = priv_func(map, priv);
 		/* exit_boot_services() was called, thus cannot free */
 		if (status != EFI_SUCCESS)
-			return status;
+			goto fail;
 
 		status = efi_bs_call(exit_boot_services, handle, map->map_key);
 	}
 
+	/* exit_boot_services() was called, thus cannot free */
+	if (status != EFI_SUCCESS)
+		goto fail;
+
+	return EFI_SUCCESS;
+
+free_map:
+	efi_bs_call(free_pool, map);
+fail:
 	return status;
 }
 
