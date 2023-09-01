@@ -12,8 +12,6 @@
 #include <linux/module.h>
 #include <linux/scmi_protocol.h>
 
-#include <trace/events/scmi.h>
-
 #include "protocols.h"
 #include "notify.h"
 
@@ -325,8 +323,6 @@ static int scmi_powercap_cap_get(const struct scmi_protocol_handle *ph,
 	dom = pi->powercaps + domain_id;
 	if (dom->fc_info && dom->fc_info[POWERCAP_FC_CAP].get_addr) {
 		*power_cap = ioread32(dom->fc_info[POWERCAP_FC_CAP].get_addr);
-		trace_scmi_fc_call(SCMI_PROTOCOL_POWERCAP, POWERCAP_CAP_GET,
-				   domain_id, *power_cap, 0);
 		return 0;
 	}
 
@@ -392,8 +388,6 @@ static int scmi_powercap_cap_set(const struct scmi_protocol_handle *ph,
 
 		iowrite32(power_cap, fci->set_addr);
 		ph->hops->fastchannel_db_ring(fci->set_db);
-		trace_scmi_fc_call(SCMI_PROTOCOL_POWERCAP, POWERCAP_CAP_SET,
-				   domain_id, power_cap, 0);
 		return 0;
 	}
 
@@ -433,8 +427,6 @@ static int scmi_powercap_pai_get(const struct scmi_protocol_handle *ph,
 	dom = pi->powercaps + domain_id;
 	if (dom->fc_info && dom->fc_info[POWERCAP_FC_PAI].get_addr) {
 		*pai = ioread32(dom->fc_info[POWERCAP_FC_PAI].get_addr);
-		trace_scmi_fc_call(SCMI_PROTOCOL_POWERCAP, POWERCAP_PAI_GET,
-				   domain_id, *pai, 0);
 		return 0;
 	}
 
@@ -477,8 +469,6 @@ static int scmi_powercap_pai_set(const struct scmi_protocol_handle *ph,
 	if (pc->fc_info && pc->fc_info[POWERCAP_FC_PAI].set_addr) {
 		struct scmi_fc_info *fci = &pc->fc_info[POWERCAP_FC_PAI];
 
-		trace_scmi_fc_call(SCMI_PROTOCOL_POWERCAP, POWERCAP_PAI_SET,
-				   domain_id, pai, 0);
 		iowrite32(pai, fci->set_addr);
 		ph->hops->fastchannel_db_ring(fci->set_db);
 		return 0;
