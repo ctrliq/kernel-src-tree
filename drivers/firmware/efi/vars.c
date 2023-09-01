@@ -40,25 +40,31 @@ static efi_status_t check_var_size(bool nonblocking, u32 attributes,
 }
 
 /**
- * efivar_is_available - check if efivars is available
+ * efivars_kobject - get the kobject for the registered efivars
  *
- * @return true iff evivars is currently registered
+ * If efivars_register() has not been called we return NULL,
+ * otherwise return the kobject used at registration time.
  */
-bool efivar_is_available(void)
+struct kobject *efivars_kobject(void)
 {
-	return __efivars != NULL;
+	if (!__efivars)
+		return NULL;
+
+	return __efivars->kobject;
 }
-EXPORT_SYMBOL_GPL(efivar_is_available);
+EXPORT_SYMBOL_GPL(efivars_kobject);
 
 /**
  * efivars_register - register an efivars
  * @efivars: efivars to register
  * @ops: efivars operations
+ * @kobject: @efivars-specific kobject
  *
  * Only a single efivars can be registered at any time.
  */
 int efivars_register(struct efivars *efivars,
-		     const struct efivar_operations *ops)
+		     const struct efivar_operations *ops,
+		     struct kobject *kobject)
 {
 	int rv;
 
@@ -72,6 +78,7 @@ int efivars_register(struct efivars *efivars,
 	}
 
 	efivars->ops = ops;
+	efivars->kobject = kobject;
 
 	__efivars = efivars;
 
