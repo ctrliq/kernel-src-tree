@@ -437,21 +437,13 @@ exit_falcon:
 	return err;
 }
 
-static int nvdec_remove(struct platform_device *pdev)
+static void nvdec_remove(struct platform_device *pdev)
 {
 	struct nvdec *nvdec = platform_get_drvdata(pdev);
-	int err;
 
-	err = host1x_client_unregister(&nvdec->client.base);
-	if (err < 0) {
-		dev_err(&pdev->dev, "failed to unregister host1x client: %d\n",
-			err);
-		return err;
-	}
+	host1x_client_unregister(&nvdec->client.base);
 
 	falcon_exit(&nvdec->falcon);
-
-	return 0;
 }
 
 static const struct dev_pm_ops nvdec_pm_ops = {
@@ -467,7 +459,7 @@ struct platform_driver tegra_nvdec_driver = {
 		.pm = &nvdec_pm_ops
 	},
 	.probe = nvdec_probe,
-	.remove = nvdec_remove,
+	.remove_new = nvdec_remove,
 };
 
 #if IS_ENABLED(CONFIG_ARCH_TEGRA_210_SOC)
