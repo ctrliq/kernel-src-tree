@@ -157,7 +157,7 @@ efi_status_t handle_kernel_image(unsigned long *image_addr,
 			 */
 			*image_addr = (u64)_text;
 			*reserve_size = 0;
-			goto clean_image_to_poc;
+			return EFI_SUCCESS;
 		}
 
 		status = efi_allocate_pages_aligned(*reserve_size, reserve_addr,
@@ -172,14 +172,6 @@ efi_status_t handle_kernel_image(unsigned long *image_addr,
 
 	*image_addr = *reserve_addr;
 	memcpy((void *)*image_addr, _text, kernel_size);
-
-clean_image_to_poc:
-	/*
-	 * Clean the copied Image to the PoC, and ensure it is not shadowed by
-	 * stale icache entries from before relocation.
-	 */
-	dcache_clean_poc(*image_addr, *image_addr + kernel_size);
-	asm("ic ialluis");
 
 	return EFI_SUCCESS;
 }
