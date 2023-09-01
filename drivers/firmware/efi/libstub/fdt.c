@@ -199,7 +199,7 @@ static efi_status_t update_fdt_memmap(void *fdt, struct efi_boot_memmap *map)
 
 struct exit_boot_struct {
 	efi_memory_desc_t	*runtime_map;
-	int			runtime_entry_count;
+	int			*runtime_entry_count;
 	void			*new_fdt_addr;
 };
 
@@ -213,7 +213,7 @@ static efi_status_t exit_boot_func(struct efi_boot_memmap *map,
 	 * entries so that we can pass it straight to SetVirtualAddressMap()
 	 */
 	efi_get_virtmap(*map->map, *map->map_size, *map->desc_size,
-			p->runtime_map, &p->runtime_entry_count);
+			p->runtime_map, p->runtime_entry_count);
 
 	return update_fdt_memmap(p->new_fdt_addr, map);
 }
@@ -246,24 +246,29 @@ efi_status_t allocate_new_fdt_and_exit_boot(void *handle,
 	unsigned long map_size, desc_size, buff_size;
 	u32 desc_ver;
 	unsigned long mmap_key;
-	efi_memory_desc_t *memory_map;
+	efi_memory_desc_t *memory_map, *runtime_map;
 	efi_status_t status;
+	int runtime_entry_count;
 	struct efi_boot_memmap map;
 	struct exit_boot_struct priv;
 
+	map.map		= &runtime_map;
 	map.map_size	= &map_size;
 	map.desc_size	= &desc_size;
 	map.desc_ver	= &desc_ver;
 	map.key_ptr	= &mmap_key;
 	map.buff_size	= &buff_size;
 
-	if (!efi_novamap) {
-		status = efi_alloc_virtmap(&priv.runtime_map, &desc_size,
-					   &desc_ver);
-		if (status != EFI_SUCCESS) {
-			efi_err("Unable to retrieve UEFI memory map.\n");
-			return status;
-		}
+	/*
+	 * Get a copy of the current memory map that we will use to prepare
+	 * the input for SetVirtualAddressMap(). We don't have to worry about
+	 * subsequent allocations adding entries, since they could not affect
+	 * the number of EFI_MEMORY_RUNTIME regions.
+	 */
+	status = efi_get_memory_map(&map);
+	if (status != EFI_SUCCESS) {
+		efi_err("Unable to retrieve UEFI memory map.\n");
+		return status;
 	}
 
 	efi_info("Exiting boot services...\n");
@@ -284,7 +289,10 @@ efi_status_t allocate_new_fdt_and_exit_boot(void *handle,
 		goto fail_free_new_fdt;
 	}
 
-	priv.new_fdt_addr = (void *)*new_fdt_addr;
+	runtime_entry_count		= 0;
+	priv.runtime_map		= runtime_map;
+	priv.runtime_entry_count	= &runtime_entry_count;
+	priv.new_fdt_addr		= (void *)*new_fdt_addr;
 
 	status = efi_exit_boot_services(handle, &map, &priv, exit_boot_func);
 
@@ -296,8 +304,8 @@ efi_status_t allocate_new_fdt_and_exit_boot(void *handle,
 
 		/* Install the new virtual address map */
 		svam = efi_system_table->runtime->set_virtual_address_map;
-		status = svam(priv.runtime_entry_count * desc_size, desc_size,
-			      desc_ver, priv.runtime_map);
+		status = svam(runtime_entry_count * desc_size, desc_size,
+			      desc_ver, runtime_map);
 
 		/*
 		 * We are beyond the point of no return here, so if the call to
@@ -329,7 +337,7 @@ fail_free_new_fdt:
 	efi_free(MAX_FDT_SIZE, *new_fdt_addr);
 
 fail:
-	efi_bs_call(free_pool, priv.runtime_map);
+	efi_system_table->boottime->free_pool(runtime_map);
 
 	return EFI_LOAD_ERROR;
 }
