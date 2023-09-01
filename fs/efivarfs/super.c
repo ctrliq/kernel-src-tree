@@ -180,7 +180,10 @@ fail:
 
 static int efivarfs_destroy(struct efivar_entry *entry, void *data)
 {
-	efivar_entry_remove(entry);
+	int err = efivar_entry_remove(entry);
+
+	if (err)
+		return err;
 	kfree(entry);
 	return 0;
 }
@@ -216,7 +219,7 @@ static int efivarfs_fill_super(struct super_block *sb, struct fs_context *fc)
 
 	err = efivar_init(efivarfs_callback, (void *)sb, true, &efivarfs_list);
 	if (err)
-		efivar_entry_iter(efivarfs_destroy, &efivarfs_list, NULL);
+		__efivar_entry_iter(efivarfs_destroy, &efivarfs_list, NULL, NULL);
 
 	return err;
 }
@@ -241,7 +244,7 @@ static void efivarfs_kill_sb(struct super_block *sb)
 	kill_litter_super(sb);
 
 	/* Remove all entries and destroy */
-	efivar_entry_iter(efivarfs_destroy, &efivarfs_list, NULL);
+	__efivar_entry_iter(efivarfs_destroy, &efivarfs_list, NULL, NULL);
 }
 
 static struct file_system_type efivarfs_type = {

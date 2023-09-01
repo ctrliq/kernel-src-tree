@@ -602,7 +602,10 @@ static int efivars_sysfs_callback(efi_char16_t *name, efi_guid_t vendor,
 
 static int efivar_sysfs_destroy(struct efivar_entry *entry, void *data)
 {
-	efivar_entry_remove(entry);
+	int err = efivar_entry_remove(entry);
+
+	if (err)
+		return err;
 	efivar_unregister(entry);
 	return 0;
 }
@@ -612,7 +615,8 @@ static void efivars_sysfs_exit(void)
 	/* Remove all entries and destroy */
 	int err;
 
-	err = efivar_entry_iter(efivar_sysfs_destroy, &efivar_sysfs_list, NULL);
+	err = __efivar_entry_iter(efivar_sysfs_destroy, &efivar_sysfs_list,
+				  NULL, NULL);
 	if (err) {
 		pr_err("efivars: Failed to destroy sysfs entries\n");
 		return;
