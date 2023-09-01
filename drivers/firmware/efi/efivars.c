@@ -527,7 +527,10 @@ efivar_create_sysfs_entry(struct efivar_entry *new_var)
 	}
 
 	kobject_uevent(&new_var->kobj, KOBJ_ADD);
-	__efivar_entry_add(new_var, &efivar_sysfs_list);
+	if (efivar_entry_add(new_var, &efivar_sysfs_list)) {
+		efivar_unregister(new_var);
+		return -EINTR;
+	}
 
 	return 0;
 }
