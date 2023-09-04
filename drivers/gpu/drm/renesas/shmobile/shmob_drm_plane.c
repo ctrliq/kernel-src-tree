@@ -8,10 +8,10 @@
  */
 
 #include <drm/drm_crtc.h>
-#include <drm/drm_crtc_helper.h>
-#include <drm/drm_fb_cma_helper.h>
+#include <drm/drm_fb_dma_helper.h>
 #include <drm/drm_fourcc.h>
-#include <drm/drm_gem_cma_helper.h>
+#include <drm/drm_framebuffer.h>
+#include <drm/drm_gem_dma_helper.h>
 
 #include "shmob_drm_drv.h"
 #include "shmob_drm_kms.h"
@@ -40,18 +40,18 @@ static void shmob_drm_plane_compute_base(struct shmob_drm_plane *splane,
 					 struct drm_framebuffer *fb,
 					 int x, int y)
 {
-	struct drm_gem_cma_object *gem;
+	struct drm_gem_dma_object *gem;
 	unsigned int bpp;
 
 	bpp = splane->format->yuv ? 8 : splane->format->bpp;
-	gem = drm_fb_cma_get_gem_obj(fb, 0);
-	splane->dma[0] = gem->paddr + fb->offsets[0]
+	gem = drm_fb_dma_get_gem_obj(fb, 0);
+	splane->dma[0] = gem->dma_addr + fb->offsets[0]
 		       + y * fb->pitches[0] + x * bpp / 8;
 
 	if (splane->format->yuv) {
 		bpp = splane->format->bpp - 8;
-		gem = drm_fb_cma_get_gem_obj(fb, 1);
-		splane->dma[1] = gem->paddr + fb->offsets[1]
+		gem = drm_fb_dma_get_gem_obj(fb, 1);
+		splane->dma[1] = gem->dma_addr + fb->offsets[1]
 			       + y / (bpp == 4 ? 2 : 1) * fb->pitches[1]
 			       + x * (bpp == 16 ? 2 : 1);
 	}
@@ -80,6 +80,7 @@ static void __shmob_drm_plane_setup(struct shmob_drm_plane *splane,
 		format |= LDBBSIFR_SWPL | LDBBSIFR_SWPW | LDBBSIFR_SWPB;
 		break;
 	case DRM_FORMAT_ARGB8888:
+	case DRM_FORMAT_XRGB8888:
 	default:
 		format |= LDBBSIFR_SWPL;
 		break;
@@ -94,6 +95,9 @@ static void __shmob_drm_plane_setup(struct shmob_drm_plane *splane,
 		break;
 	case DRM_FORMAT_ARGB8888:
 		format |= LDBBSIFR_AL_PK | LDBBSIFR_RY | LDDFR_PKF_ARGB32;
+		break;
+	case DRM_FORMAT_XRGB8888:
+		format |= LDBBSIFR_AL_1 | LDBBSIFR_RY | LDDFR_PKF_ARGB32;
 		break;
 	case DRM_FORMAT_NV12:
 	case DRM_FORMAT_NV21:
@@ -231,6 +235,7 @@ static const uint32_t formats[] = {
 	DRM_FORMAT_RGB565,
 	DRM_FORMAT_RGB888,
 	DRM_FORMAT_ARGB8888,
+	DRM_FORMAT_XRGB8888,
 	DRM_FORMAT_NV12,
 	DRM_FORMAT_NV21,
 	DRM_FORMAT_NV16,
@@ -251,9 +256,10 @@ int shmob_drm_plane_create(struct shmob_drm_device *sdev, unsigned int index)
 	splane->index = index;
 	splane->alpha = 255;
 
-	ret = drm_plane_init(sdev->ddev, &splane->plane, 1,
-			     &shmob_drm_plane_funcs, formats,
-			     ARRAY_SIZE(formats), false);
+	ret = drm_universal_plane_init(sdev->ddev, &splane->plane, 1,
+				       &shmob_drm_plane_funcs,
+				       formats, ARRAY_SIZE(formats), NULL,
+				       DRM_PLANE_TYPE_OVERLAY, NULL);
 
 	return ret;
 }
