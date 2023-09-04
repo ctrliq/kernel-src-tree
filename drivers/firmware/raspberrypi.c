@@ -270,8 +270,9 @@ static int rpi_firmware_probe(struct platform_device *pdev)
 	fw->chan = mbox_request_channel(&fw->cl, 0);
 	if (IS_ERR(fw->chan)) {
 		int ret = PTR_ERR(fw->chan);
-		kfree(fw);
-		return dev_err_probe(dev, ret, "Failed to get mbox channel\n");
+		if (ret != -EPROBE_DEFER)
+			dev_err(dev, "Failed to get mbox channel: %d\n", ret);
+		return ret;
 	}
 
 	init_completion(&fw->c);
@@ -310,18 +311,6 @@ static int rpi_firmware_remove(struct platform_device *pdev)
 	return 0;
 }
 
-static const struct of_device_id rpi_firmware_of_match[] = {
-	{ .compatible = "raspberrypi,bcm2835-firmware", },
-	{},
-};
-MODULE_DEVICE_TABLE(of, rpi_firmware_of_match);
-
-struct device_node *rpi_firmware_find_node(void)
-{
-	return of_find_matching_node(NULL, rpi_firmware_of_match);
-}
-EXPORT_SYMBOL_GPL(rpi_firmware_find_node);
-
 /**
  * rpi_firmware_get - Get pointer to rpi_firmware structure.
  * @firmware_node:    Pointer to the firmware Device Tree node.
@@ -340,18 +329,12 @@ struct rpi_firmware *rpi_firmware_get(struct device_node *firmware_node)
 
 	fw = platform_get_drvdata(pdev);
 	if (!fw)
-		goto err_put_device;
+		return NULL;
 
 	if (!kref_get_unless_zero(&fw->consumers))
-		goto err_put_device;
-
-	put_device(&pdev->dev);
+		return NULL;
 
 	return fw;
-
-err_put_device:
-	put_device(&pdev->dev);
-	return NULL;
 }
 EXPORT_SYMBOL_GPL(rpi_firmware_get);
 
@@ -376,6 +359,12 @@ struct rpi_firmware *devm_rpi_firmware_get(struct device *dev,
 	return fw;
 }
 EXPORT_SYMBOL_GPL(devm_rpi_firmware_get);
+
+static const struct of_device_id rpi_firmware_of_match[] = {
+	{ .compatible = "raspberrypi,bcm2835-firmware", },
+	{},
+};
+MODULE_DEVICE_TABLE(of, rpi_firmware_of_match);
 
 static struct platform_driver rpi_firmware_driver = {
 	.driver = {
