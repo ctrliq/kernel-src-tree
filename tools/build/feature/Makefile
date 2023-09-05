@@ -22,6 +22,7 @@ FILES=                                          \
          test-libbfd-liberty.bin                \
          test-libbfd-liberty-z.bin              \
          test-cplus-demangle.bin                \
+         test-cxa-demangle.bin                  \
          test-libcap.bin			\
          test-libelf.bin                        \
          test-libelf-getphdrnum.bin             \
@@ -253,6 +254,9 @@ $(OUTPUT)test-libbfd-liberty-z.bin:
 
 $(OUTPUT)test-cplus-demangle.bin:
 	$(BUILD) -liberty
+
+$(OUTPUT)test-cxa-demangle.bin:
+	$(BUILDXX)
 
 $(OUTPUT)test-backtrace.bin:
 	$(BUILD)
