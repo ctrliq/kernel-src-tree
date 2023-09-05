@@ -247,6 +247,7 @@ static void ovl_free_fs(struct ovl_fs *ofs)
 	kfree(ofs->config.upperdir);
 	kfree(ofs->config.workdir);
 	kfree(ofs->config.redirect_mode);
+	kfree(ofs->config.verity);
 	if (ofs->creator_cred)
 		put_cred(ofs->creator_cred);
 	kfree(ofs);
@@ -337,6 +338,11 @@ static const char *ovl_redirect_mode_def(void)
 	return ovl_redirect_dir_def ? "on" : "off";
 }
 
+static const char *ovl_verity_def(void)
+{
+	return "off";
+}
+
 static const char * const ovl_xino_str[] = {
 	"off",
 	"auto",
@@ -368,6 +374,8 @@ static int ovl_show_options(struct seq_file *m, struct dentry *dentry)
 		seq_puts(m, ",default_permissions");
 	if (strcmp(ofs->config.redirect_mode, ovl_redirect_mode_def()) != 0)
 		seq_printf(m, ",redirect_dir=%s", ofs->config.redirect_mode);
+	if (strcmp(ofs->config.verity, ovl_verity_def()) != 0)
+		seq_printf(m, ",verity=%s", ofs->config.verity);
 	if (ofs->config.index != ovl_index_def)
 		seq_printf(m, ",index=%s", ofs->config.index ? "on" : "off");
 	if (!ofs->config.uuid)
@@ -440,6 +448,7 @@ enum {
 	OPT_METACOPY_OFF,
 	OPT_VOLATILE,
 	OPT_ERR,
+	OPT_VERITY,
 };
 
 static const match_table_t ovl_tokens = {
@@ -461,6 +470,7 @@ static const match_table_t ovl_tokens = {
 	{OPT_METACOPY_ON,		"metacopy=on"},
 	{OPT_METACOPY_OFF,		"metacopy=off"},
 	{OPT_VOLATILE,			"volatile"},
+	{OPT_VERITY,                    "verity=%s"},
 	{OPT_ERR,			NULL}
 };
 
@@ -510,15 +520,35 @@ static int ovl_parse_redirect_mode(struct ovl_config *config, const char *mode)
 	return 0;
 }
 
+static int ovl_parse_verity(struct ovl_config *config, const char *mode)
+{
+	if (strcmp(mode, "on") == 0) {
+		config->verity_mode = OVL_VERITY_ON;
+	} else if (strcmp(mode, "require") == 0) {
+		config->verity_mode = OVL_VERITY_REQUIRE;
+	} else if (strcmp(mode, "off") != 0) {
+		pr_err("bad mount option \"verity=%s\"\n",
+		       mode);
+		return -EINVAL;
+	}
+
+	return 0;
+}
+
 static int ovl_parse_opt(char *opt, struct ovl_config *config)
 {
 	char *p;
 	int err;
 	bool metacopy_opt = false, redirect_opt = false;
 	bool nfs_export_opt = false, index_opt = false;
+	bool verity_opt = false;
 
 	config->redirect_mode = kstrdup(ovl_redirect_mode_def(), GFP_KERNEL);
 	if (!config->redirect_mode)
+		return -ENOMEM;
+
+	config->verity = kstrdup(ovl_verity_def(), GFP_KERNEL);
+	if (!config->verity)
 		return -ENOMEM;
 
 	while ((p = ovl_next_opt(&opt)) != NULL) {
@@ -561,6 +591,14 @@ static int ovl_parse_opt(char *opt, struct ovl_config *config)
 			if (!config->redirect_mode)
 				return -ENOMEM;
 			redirect_opt = true;
+			break;
+
+		case OPT_VERITY:
+			kfree(config->verity);
+			config->verity = match_strdup(&args[0]);
+			if (!config->verity)
+				return -ENOMEM;
+			verity_opt = true;
 			break;
 
 		case OPT_INDEX_ON:
@@ -652,6 +690,10 @@ static int ovl_parse_opt(char *opt, struct ovl_config *config)
 	if (err)
 		return err;
 
+	err = ovl_parse_verity(config, config->verity);
+	if (err)
+		return err;
+
 	/*
 	 * This is to make the logic below simpler.  It doesn't make any other
 	 * difference, since config->redirect_dir is only used for upper.
@@ -659,11 +701,28 @@ static int ovl_parse_opt(char *opt, struct ovl_config *config)
 	if (!config->upperdir && config->redirect_follow)
 		config->redirect_dir = true;
 
-	/* Resolve metacopy -> redirect_dir dependency */
+	/* Resolve verity -> metacopy dependency */
+	if (config->verity_mode && !config->metacopy) {
+		/* Don't allow explicit specified conflicting combinations */
+		if (metacopy_opt) {
+			pr_err("conflicting options: metacopy=off,verity=%s\n",
+			       config->verity);
+			return -EINVAL;
+		}
+		/* Otherwise automatically enable metacopy. */
+		config->metacopy = true;
+	}
+
+	/* Resolve verity -> metacopy -> redirect_dir dependency */
 	if (config->metacopy && !config->redirect_dir) {
 		if (metacopy_opt && redirect_opt) {
 			pr_err("conflicting options: metacopy=on,redirect_dir=%s\n",
 			       config->redirect_mode);
+			return -EINVAL;
+		}
+		if (config->verity_mode && redirect_opt) {
+			pr_err("conflicting options: verity=%s,redirect_dir=%s\n",
+			       config->verity, config->redirect_mode);
 			return -EINVAL;
 		}
 		if (redirect_opt) {
@@ -701,7 +760,7 @@ static int ovl_parse_opt(char *opt, struct ovl_config *config)
 		}
 	}
 
-	/* Resolve nfs_export -> !metacopy dependency */
+	/* Resolve nfs_export -> !metacopy && !verity dependency */
 	if (config->nfs_export && config->metacopy) {
 		if (nfs_export_opt && metacopy_opt) {
 			pr_err("conflicting options: nfs_export=on,metacopy=on\n");
@@ -714,6 +773,14 @@ static int ovl_parse_opt(char *opt, struct ovl_config *config)
 			 */
 			pr_info("disabling nfs_export due to metacopy=on\n");
 			config->nfs_export = false;
+		} else if (config->verity_mode) {
+			/*
+			 * There was an explicit verity=.. that resulted
+			 * in this conflict.
+			 */
+			pr_info("disabling nfs_export due to verity=%s\n",
+				config->verity);
+			config->nfs_export = false;
 		} else {
 			/*
 			 * There was an explicit nfs_export=on that resulted
@@ -725,7 +792,7 @@ static int ovl_parse_opt(char *opt, struct ovl_config *config)
 	}
 
 
-	/* Resolve userxattr -> !redirect && !metacopy dependency */
+	/* Resolve userxattr -> !redirect && !metacopy && !verity dependency */
 	if (config->userxattr) {
 		if (config->redirect_follow && redirect_opt) {
 			pr_err("conflicting options: userxattr,redirect_dir=%s\n",
@@ -734,6 +801,11 @@ static int ovl_parse_opt(char *opt, struct ovl_config *config)
 		}
 		if (config->metacopy && metacopy_opt) {
 			pr_err("conflicting options: userxattr,metacopy=on\n");
+			return -EINVAL;
+		}
+		if (config->verity_mode) {
+			pr_err("conflicting options: userxattr,verity=%s\n",
+			       config->verity);
 			return -EINVAL;
 		}
 		/*
