@@ -23,6 +23,7 @@ union hv_ghcb;
 
 DECLARE_STATIC_KEY_FALSE(isolation_type_snp);
 DECLARE_STATIC_KEY_FALSE(isolation_type_en_snp);
+DECLARE_STATIC_KEY_FALSE(isolation_type_tdx);
 
 typedef int (*hyperv_fill_flush_list_func)(
 		struct hv_guest_mapping_flush_list *flush,
@@ -40,6 +41,8 @@ extern u64 hv_current_partition_id;
 extern union hv_ghcb * __percpu *hv_ghcb_pg;
 
 extern bool hv_isolation_type_en_snp(void);
+bool hv_isolation_type_tdx(void);
+
 /*
  * DEFAULT INIT GPAT and SEGMENT LIMIT value in struct VMSA
  * to start AP in enlightened SEV guest.
