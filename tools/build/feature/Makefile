@@ -64,6 +64,7 @@ FILES=                                          \
          test-gettid.bin			\
          test-jvmti.bin				\
          test-jvmti-cmlr.bin			\
+         test-scandirat.bin			\
          test-sched_getcpu.bin			\
          test-setns.bin				\
          test-libopencsd.bin			\
@@ -124,6 +125,9 @@ $(OUTPUT)test-get_current_dir_name.bin:
 	$(BUILD)
 
 $(OUTPUT)test-glibc.bin:
+	$(BUILD)
+
+$(OUTPUT)test-scandirat.bin:
 	$(BUILD)
 
 $(OUTPUT)test-sched_getcpu.bin:
