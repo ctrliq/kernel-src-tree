@@ -10,7 +10,6 @@
 #include <linux/kernel.h>
 #include <linux/serial_core.h>
 #include <linux/screen_info.h>
-#include <linux/string.h>
 
 #include <asm/early_ioremap.h>
 
@@ -144,10 +143,16 @@ efi_earlycon_write(struct console *con, const char *str, unsigned int num)
 	len = si->lfb_linelength;
 
 	while (num) {
-		unsigned int linemax = (si->lfb_width - efi_x) / font->width;
-		unsigned int h, count;
+		unsigned int linemax;
+		unsigned int h, count = 0;
 
-		count = strnchrnul(str, num, '\n') - str;
+		for (s = str; *s && *s != '\n'; s++) {
+			if (count == num)
+				break;
+			count++;
+		}
+
+		linemax = (si->lfb_width - efi_x) / font->width;
 		if (count > linemax)
 			count = linemax;
 
@@ -199,14 +204,6 @@ efi_earlycon_write(struct console *con, const char *str, unsigned int num)
 	}
 }
 
-static bool __initdata fb_probed;
-
-void __init efi_earlycon_reprobe(void)
-{
-	if (fb_probed)
-		setup_earlycon("efifb");
-}
-
 static int __init efi_earlycon_setup(struct earlycon_device *device,
 				     const char *opt)
 {
@@ -214,16 +211,14 @@ static int __init efi_earlycon_setup(struct earlycon_device *device,
 	u16 xres, yres;
 	u32 i;
 
-	fb_wb = opt && !strcmp(opt, "ram");
-
-	if (screen_info.orig_video_isVGA != VIDEO_TYPE_EFI) {
-		fb_probed = true;
+	if (screen_info.orig_video_isVGA != VIDEO_TYPE_EFI)
 		return -ENODEV;
-	}
 
 	fb_base = screen_info.lfb_base;
 	if (screen_info.capabilities & VIDEO_CAPABILITY_64BIT_BASE)
 		fb_base |= (u64)screen_info.ext_lfb_base << 32;
+
+	fb_wb = opt && !strcmp(opt, "ram");
 
 	si = &screen_info;
 	xres = si->lfb_width;

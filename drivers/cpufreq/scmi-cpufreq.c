@@ -23,9 +23,7 @@
 
 struct scmi_data {
 	int domain_id;
-	int nr_opp;
 	struct device *cpu_dev;
-	cpumask_var_t opp_shared_cpus;
 };
 
 static struct scmi_protocol_handle *ph;
@@ -100,7 +98,7 @@ static int __maybe_unused
 scmi_get_cpu_power(struct device *cpu_dev, unsigned long *power,
 		   unsigned long *KHz)
 {
-	enum scmi_power_scale power_scale = perf_ops->power_scale_get(ph);
+	bool power_scale_mw = perf_ops->power_scale_mw_get(ph);
 	unsigned long Hz;
 	int ret, domain;
 
@@ -114,8 +112,8 @@ scmi_get_cpu_power(struct device *cpu_dev, unsigned long *power,
 	if (ret)
 		return ret;
 
-	/* Convert the power to uW if it is mW (ignore bogoW) */
-	if (power_scale == SCMI_POWER_MILLIWATTS)
+	/* Provide bigger resolution power to the Energy Model */
+	if (power_scale_mw)
 		*power *= MICROWATT_PER_MILLIWATT;
 
 	/* The EM framework specifies the frequency in KHz. */
@@ -131,6 +129,9 @@ static int scmi_cpufreq_init(struct cpufreq_policy *policy)
 	struct device *cpu_dev;
 	struct scmi_data *priv;
 	struct cpufreq_frequency_table *freq_table;
+	struct em_data_callback em_cb = EM_DATA_CB(scmi_get_cpu_power);
+	cpumask_var_t opp_shared_cpus;
+	bool power_scale_mw;
 
 	cpu_dev = get_cpu_device(policy->cpu);
 	if (!cpu_dev) {
@@ -138,14 +139,8 @@ static int scmi_cpufreq_init(struct cpufreq_policy *policy)
 		return -ENODEV;
 	}
 
-	priv = kzalloc(sizeof(*priv), GFP_KERNEL);
-	if (!priv)
+	if (!zalloc_cpumask_var(&opp_shared_cpus, GFP_KERNEL))
 		return -ENOMEM;
-
-	if (!zalloc_cpumask_var(&priv->opp_shared_cpus, GFP_KERNEL)) {
-		ret = -ENOMEM;
-		goto out_free_priv;
-	}
 
 	/* Obtain CPUs that share SCMI performance controls */
 	ret = scmi_get_sharing_cpus(cpu_dev, policy->cpus);
@@ -159,14 +154,14 @@ static int scmi_cpufreq_init(struct cpufreq_policy *policy)
 	 * The OPP 'sharing cpus' info may come from DT through an empty opp
 	 * table and opp-shared.
 	 */
-	ret = dev_pm_opp_of_get_sharing_cpus(cpu_dev, priv->opp_shared_cpus);
-	if (ret || !cpumask_weight(priv->opp_shared_cpus)) {
+	ret = dev_pm_opp_of_get_sharing_cpus(cpu_dev, opp_shared_cpus);
+	if (ret || !cpumask_weight(opp_shared_cpus)) {
 		/*
 		 * Either opp-table is not set or no opp-shared was found.
 		 * Use the CPU mask from SCMI to designate CPUs sharing an OPP
 		 * table.
 		 */
-		cpumask_copy(priv->opp_shared_cpus, policy->cpus);
+		cpumask_copy(opp_shared_cpus, policy->cpus);
 	}
 
 	 /*
@@ -191,7 +186,7 @@ static int scmi_cpufreq_init(struct cpufreq_policy *policy)
 			goto out_free_opp;
 		}
 
-		ret = dev_pm_opp_set_sharing_cpus(cpu_dev, priv->opp_shared_cpus);
+		ret = dev_pm_opp_set_sharing_cpus(cpu_dev, opp_shared_cpus);
 		if (ret) {
 			dev_err(cpu_dev, "%s: failed to mark OPPs as shared: %d\n",
 				__func__, ret);
@@ -199,13 +194,21 @@ static int scmi_cpufreq_init(struct cpufreq_policy *policy)
 			goto out_free_opp;
 		}
 
-		priv->nr_opp = nr_opp;
+		power_scale_mw = perf_ops->power_scale_mw_get(ph);
+		em_dev_register_perf_domain(cpu_dev, nr_opp, &em_cb,
+					    opp_shared_cpus, power_scale_mw);
+	}
+
+	priv = kzalloc(sizeof(*priv), GFP_KERNEL);
+	if (!priv) {
+		ret = -ENOMEM;
+		goto out_free_opp;
 	}
 
 	ret = dev_pm_opp_init_cpufreq_table(cpu_dev, &freq_table);
 	if (ret) {
 		dev_err(cpu_dev, "failed to init cpufreq table: %d\n", ret);
-		goto out_free_opp;
+		goto out_free_priv;
 	}
 
 	priv->cpu_dev = cpu_dev;
@@ -226,16 +229,17 @@ static int scmi_cpufreq_init(struct cpufreq_policy *policy)
 	policy->fast_switch_possible =
 		perf_ops->fast_switch_possible(ph, cpu_dev);
 
+	free_cpumask_var(opp_shared_cpus);
 	return 0;
+
+out_free_priv:
+	kfree(priv);
 
 out_free_opp:
 	dev_pm_opp_remove_all_dynamic(cpu_dev);
 
 out_free_cpumask:
-	free_cpumask_var(priv->opp_shared_cpus);
-
-out_free_priv:
-	kfree(priv);
+	free_cpumask_var(opp_shared_cpus);
 
 	return ret;
 }
@@ -246,36 +250,9 @@ static int scmi_cpufreq_exit(struct cpufreq_policy *policy)
 
 	dev_pm_opp_free_cpufreq_table(priv->cpu_dev, &policy->freq_table);
 	dev_pm_opp_remove_all_dynamic(priv->cpu_dev);
-	free_cpumask_var(priv->opp_shared_cpus);
 	kfree(priv);
 
 	return 0;
-}
-
-static void scmi_cpufreq_register_em(struct cpufreq_policy *policy)
-{
-	struct em_data_callback em_cb = EM_DATA_CB(scmi_get_cpu_power);
-	enum scmi_power_scale power_scale = perf_ops->power_scale_get(ph);
-	struct scmi_data *priv = policy->driver_data;
-	bool em_power_scale = false;
-
-	/*
-	 * This callback will be called for each policy, but we don't need to
-	 * register with EM every time. Despite not being part of the same
-	 * policy, some CPUs may still share their perf-domains, and a CPU from
-	 * another policy may already have registered with EM on behalf of CPUs
-	 * of this policy.
-	 */
-	if (!priv->nr_opp)
-		return;
-
-	if (power_scale == SCMI_POWER_MILLIWATTS
-	    || power_scale == SCMI_POWER_MICROWATTS)
-		em_power_scale = true;
-
-	em_dev_register_perf_domain(get_cpu_device(policy->cpu), priv->nr_opp,
-				    &em_cb, priv->opp_shared_cpus,
-				    em_power_scale);
 }
 
 static struct cpufreq_driver scmi_cpufreq_driver = {
@@ -290,7 +267,6 @@ static struct cpufreq_driver scmi_cpufreq_driver = {
 	.get	= scmi_cpufreq_get_rate,
 	.init	= scmi_cpufreq_init,
 	.exit	= scmi_cpufreq_exit,
-	.register_em	= scmi_cpufreq_register_em,
 };
 
 static int scmi_cpufreq_probe(struct scmi_device *sdev)
