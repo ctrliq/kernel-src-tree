@@ -1518,7 +1518,6 @@ out_baddir:
 out_drop:
 	svc_drop(rqstp);
 }
-EXPORT_SYMBOL_GPL(svc_process);
 
 #if defined(CONFIG_SUNRPC_BACKCHANNEL)
 /*
