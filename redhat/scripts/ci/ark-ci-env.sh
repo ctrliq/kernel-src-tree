@@ -8,8 +8,13 @@ die()
 
 ci_pre_check()
 {
-	if test -n "${TO_PUSH}" && test -z "${GITLAB_URL}"; then
-                die "Please run 'git remote add gitlab <url>' to enable git-push."
+	if test -n "${TO_PUSH}"; then
+		if test -z "${GITLAB_URL}" || test -z "$GITLAB_PUSHURL"; then
+	                echo "To enable git-push, please run:"
+			echo "git remote add gitlab <url>"
+			echo "git remote set-url --push gitlab <pushurl>"
+			die "Misconfigured 'gitlab' entry for git"
+		fi
         fi
         git diff-index --quiet HEAD || die "Dirty tree, please clean before merging."
 }
@@ -20,6 +25,7 @@ BRANCH=${2:-"os-build"}
 PROJECT_ID=${PROJECT_ID:-"13604247"}
 TO_PUSH=${DIST_PUSH:-""}
 GITLAB_URL="$(git remote get-url gitlab 2>/dev/null)"
+GITLAB_PUSHURL="$(git config --get remote.gitlab.pushurl 2>/dev/null)"
 
 ci_pre_check
 
@@ -28,3 +34,4 @@ export BRANCH
 export PROJECT_ID
 export TO_PUSH
 export GITLAB_URL
+export GITLAB_PUSHURL
