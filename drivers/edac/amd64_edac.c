@@ -182,21 +182,6 @@ static inline int amd64_read_dct_pci_cfg(struct amd64_pvt *pvt, u8 dct,
  * other archs, we might not have access to the caches directly.
  */
 
-static inline void __f17h_set_scrubval(struct amd64_pvt *pvt, u32 scrubval)
-{
-	/*
-	 * Fam17h supports scrub values between 0x5 and 0x14. Also, the values
-	 * are shifted down by 0x5, so scrubval 0x5 is written to the register
-	 * as 0x0, scrubval 0x6 as 0x1, etc.
-	 */
-	if (scrubval >= 0x5 && scrubval <= 0x14) {
-		scrubval -= 0x5;
-		pci_write_bits32(pvt->F6, F17H_SCR_LIMIT_ADDR, scrubval, 0xF);
-		pci_write_bits32(pvt->F6, F17H_SCR_BASE_ADDR, 1, 0x1);
-	} else {
-		pci_write_bits32(pvt->F6, F17H_SCR_BASE_ADDR, 0, 0x1);
-	}
-}
 /*
  * Scan the scrub rate mapping table for a close or matching bandwidth value to
  * issue. If requested is too big, then use last maximum value found.
@@ -229,9 +214,7 @@ static int __set_scrub_rate(struct amd64_pvt *pvt, u32 new_bw, u32 min_rate)
 
 	scrubval = scrubrates[i].scrubval;
 
-	if (pvt->umc) {
-		__f17h_set_scrubval(pvt, scrubval);
-	} else if (pvt->fam == 0x15 && pvt->model == 0x60) {
+	if (pvt->fam == 0x15 && pvt->model == 0x60) {
 		f15h_select_dct(pvt, 0);
 		pci_write_bits32(pvt->F2, F15H_M60H_SCRCTRL, scrubval, 0x001F);
 		f15h_select_dct(pvt, 1);
@@ -271,16 +254,7 @@ static int get_scrub_rate(struct mem_ctl_info *mci)
 	int i, retval = -EINVAL;
 	u32 scrubval = 0;
 
-	if (pvt->umc) {
-		amd64_read_pci_cfg(pvt->F6, F17H_SCR_BASE_ADDR, &scrubval);
-		if (scrubval & BIT(0)) {
-			amd64_read_pci_cfg(pvt->F6, F17H_SCR_LIMIT_ADDR, &scrubval);
-			scrubval &= 0xF;
-			scrubval += 0x5;
-		} else {
-			scrubval = 0;
-		}
-	} else if (pvt->fam == 0x15) {
+	if (pvt->fam == 0x15) {
 		/* Erratum #505 */
 		if (pvt->model < 0x10)
 			f15h_select_dct(pvt, 0);
@@ -1433,9 +1407,6 @@ static void __dump_misc_regs_df(struct amd64_pvt *pvt)
 
 		debug_display_dimm_sizes_df(pvt, i);
 	}
-
-	edac_dbg(1, "F0x104 (DRAM Hole Address): 0x%08x, base: 0x%08x\n",
-		 pvt->dhar, dhar_base(pvt));
 }
 
 /* Display and decode various NB registers for debug purposes. */
@@ -1470,6 +1441,8 @@ static void __dump_misc_regs(struct amd64_pvt *pvt)
 	/* Only if NOT ganged does dclr1 have valid info */
 	if (!dct_ganging_enabled(pvt))
 		debug_dump_dramcfg_low(pvt, pvt->dclr1, 1);
+
+	edac_dbg(1, "  DramHoleValid: %s\n", dhar_valid(pvt) ? "yes" : "no");
 }
 
 /* Display and decode various NB registers for debug purposes. */
@@ -1479,8 +1452,6 @@ static void dump_misc_regs(struct amd64_pvt *pvt)
 		__dump_misc_regs_df(pvt);
 	else
 		__dump_misc_regs(pvt);
-
-	edac_dbg(1, "  DramHoleValid: %s\n", dhar_valid(pvt) ? "yes" : "no");
 
 	amd64_info("using x%u syndromes.\n", pvt->ecc_sym_sz);
 }
@@ -2910,8 +2881,6 @@ static struct amd64_family_type family_types[] = {
 	},
 	[F17_CPUS] = {
 		.ctl_name = "F17h",
-		.f0_id = PCI_DEVICE_ID_AMD_17H_DF_F0,
-		.f6_id = PCI_DEVICE_ID_AMD_17H_DF_F6,
 		.max_mcs = 2,
 		.ops = {
 			.early_channel_count	= f17_early_channel_count,
@@ -2920,8 +2889,6 @@ static struct amd64_family_type family_types[] = {
 	},
 	[F17_M10H_CPUS] = {
 		.ctl_name = "F17h_M10h",
-		.f0_id = PCI_DEVICE_ID_AMD_17H_M10H_DF_F0,
-		.f6_id = PCI_DEVICE_ID_AMD_17H_M10H_DF_F6,
 		.max_mcs = 2,
 		.ops = {
 			.early_channel_count	= f17_early_channel_count,
@@ -2930,8 +2897,6 @@ static struct amd64_family_type family_types[] = {
 	},
 	[F17_M30H_CPUS] = {
 		.ctl_name = "F17h_M30h",
-		.f0_id = PCI_DEVICE_ID_AMD_17H_M30H_DF_F0,
-		.f6_id = PCI_DEVICE_ID_AMD_17H_M30H_DF_F6,
 		.max_mcs = 8,
 		.ops = {
 			.early_channel_count	= f17_early_channel_count,
@@ -2940,8 +2905,6 @@ static struct amd64_family_type family_types[] = {
 	},
 	[F17_M60H_CPUS] = {
 		.ctl_name = "F17h_M60h",
-		.f0_id = PCI_DEVICE_ID_AMD_17H_M60H_DF_F0,
-		.f6_id = PCI_DEVICE_ID_AMD_17H_M60H_DF_F6,
 		.max_mcs = 2,
 		.ops = {
 			.early_channel_count	= f17_early_channel_count,
@@ -2950,8 +2913,6 @@ static struct amd64_family_type family_types[] = {
 	},
 	[F17_M70H_CPUS] = {
 		.ctl_name = "F17h_M70h",
-		.f0_id = PCI_DEVICE_ID_AMD_17H_M70H_DF_F0,
-		.f6_id = PCI_DEVICE_ID_AMD_17H_M70H_DF_F6,
 		.max_mcs = 2,
 		.ops = {
 			.early_channel_count	= f17_early_channel_count,
@@ -2960,9 +2921,25 @@ static struct amd64_family_type family_types[] = {
 	},
 	[F19_CPUS] = {
 		.ctl_name = "F19h",
-		.f0_id = PCI_DEVICE_ID_AMD_19H_DF_F0,
-		.f6_id = PCI_DEVICE_ID_AMD_19H_DF_F6,
 		.max_mcs = 8,
+		.ops = {
+			.early_channel_count	= f17_early_channel_count,
+			.dbam_to_cs		= f17_addr_mask_to_cs_size,
+		}
+	},
+	[F19_M60H_CPUS] = {
+		.ctl_name = "F19h_M60h",
+		.max_mcs = 2,
+		.flags.zn_regs_v2 = 1,
+		.ops = {
+			.early_channel_count	= f17_early_channel_count,
+			.dbam_to_cs		= f17_addr_mask_to_cs_size,
+		}
+	},
+	[F19_M70H_CPUS] = {
+		.ctl_name = "F19h_M70h",
+		.max_mcs = 2,
+		.flags.zn_regs_v2 = 1,
 		.ops = {
 			.early_channel_count	= f17_early_channel_count,
 			.dbam_to_cs		= f17_addr_mask_to_cs_size,
@@ -2970,8 +2947,6 @@ static struct amd64_family_type family_types[] = {
 	},
 	[F19_M10H_CPUS] = {
 		.ctl_name = "F19h_M10h",
-		.f0_id = PCI_DEVICE_ID_AMD_19H_M10H_DF_F0,
-		.f6_id = PCI_DEVICE_ID_AMD_19H_M10H_DF_F6,
 		.max_mcs = 12,
 		.flags.zn_regs_v2 = 1,
 		.ops = {
@@ -3285,36 +3260,12 @@ log_error:
 /*
  * Use pvt->F3 which contains the F3 CPU PCI device to get the related
  * F1 (AddrMap) and F2 (Dct) devices. Return negative value on error.
- * Reserve F0 and F6 on systems with a UMC.
  */
 static int
 reserve_mc_sibling_devs(struct amd64_pvt *pvt, u16 pci_id1, u16 pci_id2)
 {
-	if (pvt->umc) {
-		pvt->F0 = pci_get_related_function(pvt->F3->vendor, pci_id1, pvt->F3);
-		if (!pvt->F0) {
-			edac_dbg(1, "F0 not found, device 0x%x\n", pci_id1);
-			return -ENODEV;
-		}
-
-		pvt->F6 = pci_get_related_function(pvt->F3->vendor, pci_id2, pvt->F3);
-		if (!pvt->F6) {
-			pci_dev_put(pvt->F0);
-			pvt->F0 = NULL;
-
-			edac_dbg(1, "F6 not found: device 0x%x\n", pci_id2);
-			return -ENODEV;
-		}
-
-		if (!pci_ctl_dev)
-			pci_ctl_dev = &pvt->F0->dev;
-
-		edac_dbg(1, "F0: %s\n", pci_name(pvt->F0));
-		edac_dbg(1, "F3: %s\n", pci_name(pvt->F3));
-		edac_dbg(1, "F6: %s\n", pci_name(pvt->F6));
-
+	if (pvt->umc)
 		return 0;
-	}
 
 	/* Reserve the ADDRESS MAP Device */
 	pvt->F1 = pci_get_related_function(pvt->F3->vendor, pci_id1, pvt->F3);
@@ -3346,8 +3297,7 @@ reserve_mc_sibling_devs(struct amd64_pvt *pvt, u16 pci_id1, u16 pci_id2)
 static void free_mc_sibling_devs(struct amd64_pvt *pvt)
 {
 	if (pvt->umc) {
-		pci_dev_put(pvt->F0);
-		pci_dev_put(pvt->F6);
+		return;
 	} else {
 		pci_dev_put(pvt->F1);
 		pci_dev_put(pvt->F2);
@@ -3437,7 +3387,6 @@ static void read_mc_regs(struct amd64_pvt *pvt)
 
 	if (pvt->umc) {
 		__read_mc_regs_df(pvt);
-		amd64_read_pci_cfg(pvt->F0, DF_DHAR, &pvt->dhar);
 
 		goto skip;
 	}
@@ -3936,6 +3885,9 @@ static void setup_mci_misc_attrs(struct mem_ctl_info *mci)
 	mci->dev_name		= pci_name(pvt->F3);
 	mci->ctl_page_to_phys	= NULL;
 
+	if (pvt->fam >= 0x17)
+		return;
+
 	/* memory scrubber interface */
 	mci->set_sdram_scrub_rate = set_scrub_rate;
 	mci->get_sdram_scrub_rate = get_scrub_rate;
@@ -4027,6 +3979,16 @@ static struct amd64_family_type *per_family_init(struct amd64_pvt *pvt)
 			pvt->ops = &family_types[F17_M70H_CPUS].ops;
 			fam_type->ctl_name = "F19h_M20h";
 			break;
+		} else if (pvt->model >= 0x60 && pvt->model <= 0x6f) {
+			fam_type = &family_types[F19_M60H_CPUS];
+			pvt->ops = &family_types[F19_M60H_CPUS].ops;
+			fam_type->ctl_name = "F19h_M60h";
+			break;
+		} else if (pvt->model >= 0x70 && pvt->model <= 0x7f) {
+			fam_type = &family_types[F19_M70H_CPUS];
+			pvt->ops = &family_types[F19_M70H_CPUS].ops;
+			fam_type->ctl_name = "F19h_M70h";
+			break;
 		} else if (pvt->model >= 0xa0 && pvt->model <= 0xaf) {
 			fam_type = &family_types[F19_M10H_CPUS];
 			pvt->ops = &family_types[F19_M10H_CPUS].ops;
@@ -4063,9 +4025,6 @@ static int hw_info_get(struct amd64_pvt *pvt)
 		pvt->umc = kcalloc(fam_type->max_mcs, sizeof(struct amd64_umc), GFP_KERNEL);
 		if (!pvt->umc)
 			return -ENOMEM;
-
-		pci_id1 = fam_type->f0_id;
-		pci_id2 = fam_type->f6_id;
 	} else {
 		pci_id1 = fam_type->f1_id;
 		pci_id2 = fam_type->f2_id;
@@ -4082,7 +4041,7 @@ static int hw_info_get(struct amd64_pvt *pvt)
 
 static void hw_info_put(struct amd64_pvt *pvt)
 {
-	if (pvt->F0 || pvt->F1)
+	if (pvt->F1)
 		free_mc_sibling_devs(pvt);
 
 	kfree(pvt->umc);
@@ -4331,12 +4290,12 @@ static int __init amd64_edac_init(void)
 	}
 
 	/* register stuff with EDAC MCE */
-	if (boot_cpu_data.x86 >= 0x17)
+	if (boot_cpu_data.x86 >= 0x17) {
 		amd_register_ecc_decoder(decode_umc_error);
-	else
+	} else {
 		amd_register_ecc_decoder(decode_bus_error);
-
-	setup_pci_device();
+		setup_pci_device();
+	}
 
 #ifdef CONFIG_X86_32
 	amd64_err("%s on 32-bit is unsupported. USE AT YOUR OWN RISK!\n", EDAC_MOD_STR);
