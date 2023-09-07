@@ -81,7 +81,7 @@ else
 fi
 
 echo
-PUSH_STR="branch ${BRANCH} to ${GITLAB_URL}"
+PUSH_STR="branch ${BRANCH} to ${GITLAB_PROJECT_URL}"
 PUSH_CMD="git push gitlab ${BRANCH}"
 PUSH_CONFIG_STR="config update branches"
 PUSH_CONFIG_CMD="for branch in \$(git branch | grep configs/\"\$(date +%F)\"); do
