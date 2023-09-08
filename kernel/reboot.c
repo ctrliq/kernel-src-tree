@@ -506,6 +506,19 @@ static void do_kernel_power_off_prepare(void)
 }
 
 /**
+ *	do_kernel_power_off - Execute kernel power-off handler call chain
+ *
+ *	Expected to be called as last step of the power-off sequence.
+ *
+ *	Powers off the system immediately if a power-off handler function has
+ *	been registered. Otherwise does nothing.
+ */
+void do_kernel_power_off(void)
+{
+	atomic_notifier_call_chain(&power_off_handler_list, 0, NULL);
+}
+
+/**
  *	kernel_can_power_off - check whether system can be powered off
  *
  *	Returns true if power-off handler is registered and system can be
