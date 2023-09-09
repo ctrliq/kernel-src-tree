@@ -769,7 +769,6 @@ void pstore_get_backend_records(struct pstore_info *psi,
 		if (rc) {
 			/* pstore_mkfile() did not take record, so free it. */
 			kfree(record->buf);
-			kfree(record->priv);
 			kfree(record);
 			if (rc != -EEXIST || !quiet)
 				failed++;
