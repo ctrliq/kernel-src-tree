@@ -33,6 +33,11 @@ enforced by CI. You can check your changes locally with::
 
     make SPHINXOPTS="-W" html
 
+Reporting Bugs
+==============
+
+Fedora bugs are only tracked in Red Hat's Bugzilla instance.  Fedora kernel bugs can be filed at https://bugzilla.redhat.com/ under Product "Fedora" and Component "kernel".  Please try to be as detailed as possible when reporting a bug.  The more detailed you are, the more likely it is that your bug will be resolved.
+
 Patches
 =======
 
