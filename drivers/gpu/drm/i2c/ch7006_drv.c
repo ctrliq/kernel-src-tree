@@ -498,7 +498,7 @@ static const struct dev_pm_ops ch7006_pm_ops = {
 
 static struct drm_i2c_encoder_driver ch7006_driver = {
 	.i2c_driver = {
-		.probe = ch7006_probe,
+		.probe_new = ch7006_probe,
 		.remove = ch7006_remove,
 
 		.driver = {
