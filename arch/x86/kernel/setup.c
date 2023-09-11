@@ -33,6 +33,7 @@
 #include <asm/numa.h>
 #include <asm/bios_ebda.h>
 #include <asm/bugs.h>
+#include <asm/cacheinfo.h>
 #include <asm/cpu.h>
 #include <asm/efi.h>
 #include <asm/gart.h>
@@ -1034,7 +1035,7 @@ void __init setup_arch(char **cmdline_p)
 
 	/* update e820 for memory not covered by WB MTRRs */
 	if (IS_ENABLED(CONFIG_MTRR))
-		mtrr_bp_init();
+		cache_bp_init();
 	else
 		pat_disable("PAT support disabled because CONFIG_MTRR is disabled in the kernel.");
 
