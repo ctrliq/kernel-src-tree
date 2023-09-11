@@ -29,6 +29,9 @@
 #define LVL_3		4
 #define LVL_TRACE	5
 
+/* Kernel controls MTRR and/or PAT MSRs. */
+unsigned int memory_caching_control __ro_after_init;
+
 struct _cache_table {
 	unsigned char descriptor;
 	char cache_type;
