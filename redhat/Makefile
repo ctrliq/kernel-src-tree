@@ -801,7 +801,7 @@ dist-dump-variables:
 
 dist-self-test:
 	@if test -x /usr/bin/bats; then \
-		bats $(REDHAT)/self-test/*.bats ; \
+		RHEL_MAJOR=$(RHEL_MAJOR) RHEL_MINOR=$(RHEL_MINOR) bats $(REDHAT)/self-test/*.bats ; \
 	else \
 		echo "dist-self-test: The bats package is not installed" ; \
 	fi
