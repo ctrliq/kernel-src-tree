@@ -17,5 +17,9 @@ obj-$(CONFIG_INTEL_SDSI)		+= intel_sdsi.o
 intel_vsec-y				:= vsec.o
 obj-$(CONFIG_INTEL_VSEC)		+= intel_vsec.o
 
+# TPMI drivers
+intel_vsec_tpmi-y			:= tpmi.o
+obj-$(CONFIG_INTEL_TPMI)		+= intel_vsec_tpmi.o
+
 # Intel miscellaneous drivers
 obj-$(CONFIG_INTEL_ISHTP_ECLITE)	+= ishtp_eclite.o
