@@ -654,9 +654,6 @@ void vfio_device_remove_group(struct vfio_device *device)
 	struct vfio_group *group = device->group;
 	struct iommu_group *iommu_group;
 
-	if (group->type == VFIO_NO_IOMMU || group->type == VFIO_EMULATED_IOMMU)
-		iommu_group_remove_device(device->dev);
-
 	/* Pairs with vfio_create_group() / vfio_group_get_from_iommu() */
 	if (!refcount_dec_and_mutex_lock(&group->drivers, &vfio.group_lock))
 		return;
@@ -691,6 +688,10 @@ void vfio_device_remove_group(struct vfio_device *device)
 	group->iommu_group = NULL;
 	mutex_unlock(&group->group_lock);
 	mutex_unlock(&vfio.group_lock);
+
+	/* RHEL-only: relocated to support mdev IOMMU backing devices */
+	if (group->type == VFIO_NO_IOMMU || group->type == VFIO_EMULATED_IOMMU)
+		iommu_group_remove_device(device->dev);
 
 	iommu_group_put(iommu_group);
 	put_device(&group->dev);
