@@ -4,7 +4,7 @@
 #define __NOUVEAU_UVMM_H__
 
 #include <drm/drm_gpuva_mgr.h>
-
+#include <linux/maple_tree.h>
 #include "nouveau_drv.h"
 
 struct nouveau_uvmm {
