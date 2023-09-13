@@ -17,12 +17,12 @@ struct random_extrng {
 
 struct notifier_block;
 
-void add_device_randomness(const void *, size_t);
-void add_bootloader_randomness(const void *, size_t);
+void add_device_randomness(const void *buf, size_t len);
+void add_bootloader_randomness(const void *buf, size_t len);
 void add_input_randomness(unsigned int type, unsigned int code,
 			  unsigned int value) __latent_entropy;
 void add_interrupt_randomness(int irq) __latent_entropy;
-void add_hwgenerator_randomness(const void *buffer, size_t count, size_t entropy);
+void add_hwgenerator_randomness(const void *buf, size_t len, size_t entropy);
 
 #if defined(LATENT_ENTROPY_PLUGIN) && !defined(__CHECKER__)
 static inline void add_latent_entropy(void)
@@ -34,7 +34,7 @@ static inline void add_latent_entropy(void) { }
 #endif
 
 #if IS_ENABLED(CONFIG_VMGENID)
-void add_vmfork_randomness(const void *unique_vm_id, size_t size);
+void add_vmfork_randomness(const void *unique_vm_id, size_t len);
 int register_random_vmfork_notifier(struct notifier_block *nb);
 int unregister_random_vmfork_notifier(struct notifier_block *nb);
 #else
@@ -45,8 +45,8 @@ static inline int unregister_random_vmfork_notifier(struct notifier_block *nb) {
 void random_register_extrng(const struct random_extrng *rng);
 void random_unregister_extrng(void);
 
-void get_random_bytes(void *buf, size_t nbytes);
-size_t __must_check get_random_bytes_arch(void *buf, size_t nbytes);
+void get_random_bytes(void *buf, size_t len);
+size_t __must_check get_random_bytes_arch(void *buf, size_t len);
 u32 get_random_u32(void);
 u64 get_random_u64(void);
 static inline unsigned int get_random_int(void)
