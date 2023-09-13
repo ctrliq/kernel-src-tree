@@ -52,6 +52,7 @@
 #include <linux/security.h>
 #include <linux/hugetlb.h>
 
+#include <asm/archrandom.h>
 #include <asm/boot_data.h>
 #include <asm/ipl.h>
 #include <asm/facility.h>
