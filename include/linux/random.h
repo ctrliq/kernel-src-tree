@@ -33,6 +33,8 @@ static inline void add_latent_entropy(void) {}
 extern void add_input_randomness(unsigned int type, unsigned int code,
 				 unsigned int value) __latent_entropy;
 extern void add_interrupt_randomness(int irq) __latent_entropy;
+extern void add_hwgenerator_randomness(const void *buffer, size_t count,
+				       size_t entropy);
 #if IS_ENABLED(CONFIG_VMGENID)
 extern void add_vmfork_randomness(const void *unique_vm_id, size_t size);
 extern int register_random_vmfork_notifier(struct notifier_block *nb);
