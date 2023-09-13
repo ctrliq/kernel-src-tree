@@ -1291,8 +1291,10 @@ SYSCALL_DEFINE3(getrandom, char __user *, ubuf, size_t, len, unsigned int, flags
 	rcu_read_unlock();
 
 	if (rng) {
-		int ret;
-		ret = rng->extrng_read(ubuf, len, !!(flags & GRND_RANDOM));
+		ret = import_single_range(READ, ubuf, len, &iov, &iter);
+		if (unlikely(ret))
+			return ret;
+		ret = rng->extrng_read_iter(&iter, !!(flags & GRND_RANDOM));
 		module_put(rng->owner);
 		return ret;
 	}
@@ -1499,9 +1501,9 @@ static int extrng_release(struct inode *inode, struct file *filp)
 }
 
 static ssize_t
-extrng_read(struct file *file, char __user *buf, size_t nbytes, loff_t *ppos)
+extrng_read_iter(struct kiocb *kiocb, struct iov_iter *iter)
 {
-	return rcu_dereference_raw(extrng)->extrng_read(buf, nbytes, false);
+	return rcu_dereference_raw(extrng)->extrng_read_iter(iter, false);
 }
 
 const struct file_operations random_fops = {
@@ -1527,7 +1529,7 @@ const struct file_operations urandom_fops = {
 
 static const struct file_operations extrng_random_fops = {
 	.open  = random_open,
-	.read  = extrng_read,
+	.read_iter = extrng_read_iter,
 	.write_iter = random_write_iter,
 	.poll  = extrng_poll,
 	.unlocked_ioctl = random_ioctl,
@@ -1538,7 +1540,7 @@ static const struct file_operations extrng_random_fops = {
 
 static const struct file_operations extrng_urandom_fops = {
 	.open  = urandom_open,
-	.read  = extrng_read,
+	.read_iter = extrng_read_iter,
 	.write_iter = random_write_iter,
 	.unlocked_ioctl = random_ioctl,
 	.fasync = random_fasync,

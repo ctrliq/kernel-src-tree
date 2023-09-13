@@ -10,8 +10,9 @@
 
 #include <uapi/linux/random.h>
 
+struct iov_iter;
 struct random_extrng {
-	ssize_t (*extrng_read)(void __user *buf, size_t buflen, bool reseed);
+	ssize_t (*extrng_read_iter)(struct iov_iter *, bool reseed);
 	struct module *owner;
 };
 
