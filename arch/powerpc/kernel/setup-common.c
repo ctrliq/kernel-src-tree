@@ -176,14 +176,14 @@ EXPORT_SYMBOL_GPL(machine_power_off);
 void (*pm_power_off)(void);
 EXPORT_SYMBOL_GPL(pm_power_off);
 
-bool __must_check arch_get_random_seed_long(unsigned long *v)
+size_t __must_check arch_get_random_seed_longs(unsigned long *v, size_t max_longs)
 {
 	if (ppc_md.get_random_seed)
 		return ppc_md.get_random_seed(v);
 
 	return false;
 }
-EXPORT_SYMBOL(arch_get_random_seed_long);
+EXPORT_SYMBOL(arch_get_random_seed_longs);
 
 void machine_halt(void)
 {
