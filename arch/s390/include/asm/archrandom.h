@@ -11,8 +11,6 @@
 #ifndef _ASM_S390_ARCHRANDOM_H
 #define _ASM_S390_ARCHRANDOM_H
 
-#ifdef CONFIG_ARCH_RANDOM
-
 #include <linux/static_key.h>
 #include <linux/preempt.h>
 #include <linux/atomic.h>
@@ -53,5 +51,4 @@ static inline bool __must_check arch_get_random_seed_int(unsigned int *v)
 	return false;
 }
 
-#endif /* CONFIG_ARCH_RANDOM */
 #endif /* _ASM_S390_ARCHRANDOM_H */
