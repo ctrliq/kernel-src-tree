@@ -98,7 +98,7 @@ bool pcie_failed_link_retrain(struct pci_dev *dev)
 		lnkctl2 |= PCI_EXP_LNKCTL2_TLS_2_5GT;
 		pcie_capability_write_word(dev, PCI_EXP_LNKCTL2, lnkctl2);
 
-		if (!pcie_retrain_link(dev, false)) {
+		if (pcie_retrain_link(dev, false)) {
 			pci_info(dev, "retraining failed\n");
 			return false;
 		}
@@ -117,7 +117,7 @@ bool pcie_failed_link_retrain(struct pci_dev *dev)
 		lnkctl2 |= lnkcap & PCI_EXP_LNKCAP_SLS;
 		pcie_capability_write_word(dev, PCI_EXP_LNKCTL2, lnkctl2);
 
-		if (!pcie_retrain_link(dev, false)) {
+		if (pcie_retrain_link(dev, false)) {
 			pci_info(dev, "retraining failed\n");
 			return false;
 		}

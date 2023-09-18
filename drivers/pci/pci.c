@@ -4888,11 +4888,11 @@ static int pci_pm_reset(struct pci_dev *dev, bool probe)
  * @use_lt: Use the LT bit if TRUE, or the DLLLA bit if FALSE.
  * @active: Waiting for active or inactive?
  *
- * Return TRUE if successful, or FALSE if status has not changed within
+ * Return 0 if successful, or -ETIMEDOUT if status has not changed within
  * PCIE_LINK_RETRAIN_TIMEOUT_MS milliseconds.
  */
-static bool pcie_wait_for_link_status(struct pci_dev *pdev,
-				      bool use_lt, bool active)
+static int pcie_wait_for_link_status(struct pci_dev *pdev,
+				     bool use_lt, bool active)
 {
 	u16 lnksta_mask, lnksta_match;
 	unsigned long end_jiffies;
@@ -4905,10 +4905,11 @@ static bool pcie_wait_for_link_status(struct pci_dev *pdev,
 	do {
 		pcie_capability_read_word(pdev, PCI_EXP_LNKSTA, &lnksta);
 		if ((lnksta & lnksta_mask) == lnksta_match)
-			break;
+			return 0;
 		msleep(1);
 	} while (time_before(jiffies, end_jiffies));
-	return (lnksta & lnksta_mask) == lnksta_match;
+
+	return -ETIMEDOUT;
 }
 
 /**
@@ -4920,12 +4921,23 @@ static bool pcie_wait_for_link_status(struct pci_dev *pdev,
  * according to @use_lt.  It is not verified whether the use of the DLLLA
  * bit is valid.
  *
- * Return TRUE if successful, or FALSE if training has not completed
+ * Return 0 if successful, or -ETIMEDOUT if training has not completed
  * within PCIE_LINK_RETRAIN_TIMEOUT_MS milliseconds.
  */
-bool pcie_retrain_link(struct pci_dev *pdev, bool use_lt)
+int pcie_retrain_link(struct pci_dev *pdev, bool use_lt)
 {
+	int rc;
 	u16 lnkctl;
+
+	/*
+	 * Ensure the updated LNKCTL parameters are used during link
+	 * training by checking that there is no ongoing link training to
+	 * avoid LTSSM race as recommended in Implementation Note at the
+	 * end of PCIe r6.0.1 sec 7.5.3.7.
+	 */
+	rc = pcie_wait_for_link_status(pdev, use_lt, !use_lt);
+	if (rc)
+		return rc;
 
 	pcie_capability_read_word(pdev, PCI_EXP_LNKCTL, &lnkctl);
 	lnkctl |= PCI_EXP_LNKCTL_RL;
@@ -4954,7 +4966,7 @@ bool pcie_retrain_link(struct pci_dev *pdev, bool use_lt)
 static bool pcie_wait_for_link_delay(struct pci_dev *pdev, bool active,
 				     int delay)
 {
-	bool ret;
+	int rc;
 
 	/*
 	 * Some controllers might not implement link active reporting. In this
@@ -4976,13 +4988,21 @@ static bool pcie_wait_for_link_delay(struct pci_dev *pdev, bool active,
 	 */
 	if (active)
 		msleep(20);
-	ret = pcie_wait_for_link_status(pdev, false, active);
-	if (active && !ret)
-		ret = pcie_failed_link_retrain(pdev);
-	if (active && ret)
-		msleep(delay);
+	rc = pcie_wait_for_link_status(pdev, false, active);
+	if (active) {
+		if (rc)
+			rc = pcie_failed_link_retrain(pdev);
+		if (rc)
+			return false;
 
-	return ret;
+		msleep(delay);
+		return true;
+	}
+
+	if (rc)
+		return false;
+
+	return true;
 }
 
 /**
