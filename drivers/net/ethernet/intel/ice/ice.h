@@ -202,7 +202,9 @@
 enum ice_feature {
 	ICE_F_DSCP,
 	ICE_F_PTP_EXTTS,
+	ICE_F_PHY_RCLK,
 	ICE_F_SMA_CTRL,
+	ICE_F_CGU,
 	ICE_F_GNSS,
 	ICE_F_MAX
 };
