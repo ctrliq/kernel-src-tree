@@ -940,8 +940,11 @@ int tls_sw_sendmsg(struct sock *sk, struct msghdr *msg, size_t size)
 	int pending;
 
 	if (msg->msg_flags & ~(MSG_MORE | MSG_DONTWAIT | MSG_NOSIGNAL |
-			       MSG_CMSG_COMPAT))
+			       MSG_EOR | MSG_CMSG_COMPAT))
 		return -EOPNOTSUPP;
+
+	if (!eor && (msg->msg_flags & MSG_EOR))
+		return -EINVAL;
 
 	ret = mutex_lock_interruptible(&tls_ctx->tx_lock);
 	if (ret)
@@ -1276,7 +1279,8 @@ int tls_sw_sendpage(struct sock *sk, struct page *page,
 	int ret;
 
 	if (flags & ~(MSG_MORE | MSG_DONTWAIT | MSG_NOSIGNAL |
-		      MSG_SENDPAGE_NOTLAST | MSG_SENDPAGE_NOPOLICY))
+		      MSG_SENDPAGE_NOTLAST | MSG_EOR |
+		      MSG_SENDPAGE_NOPOLICY))
 		return -EOPNOTSUPP;
 
 	ret = mutex_lock_interruptible(&tls_ctx->tx_lock);
