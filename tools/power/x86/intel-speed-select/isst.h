@@ -77,7 +77,7 @@
 
 #define DISP_FREQ_MULTIPLIER 100
 
-#define MAX_PACKAGE_COUNT 32
+#define MAX_PACKAGE_COUNT 8
 #define MAX_DIE_PER_PACKAGE 2
 
 /* Unified structure to specific a CPU or a Power Domain */
