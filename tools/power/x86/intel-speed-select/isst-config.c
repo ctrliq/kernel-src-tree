@@ -497,7 +497,7 @@ static void force_all_cpus_online(void)
 	unlink("/var/run/isst_cpu_topology.dat");
 }
 
-void for_each_online_package_in_set(void (*callback)(struct isst_id *, void *, void *,
+void for_each_online_power_domain_in_set(void (*callback)(struct isst_id *, void *, void *,
 						     void *, void *),
 				    void *arg1, void *arg2, void *arg3,
 				    void *arg4)
@@ -1142,7 +1142,7 @@ static void exec_on_get_ctdp_cpu(struct isst_id *id, void *arg1, void *arg2, voi
 				exec_on_get_ctdp_cpu, isst_get_ctdp_##suffix,     \
 				&ctdp, desc, &ctdp.object);                       \
 		else                                                              \
-			for_each_online_package_in_set(exec_on_get_ctdp_cpu,      \
+			for_each_online_power_domain_in_set(exec_on_get_ctdp_cpu,      \
 						       isst_get_ctdp_##suffix,    \
 						       &ctdp, desc,               \
 						       &ctdp.object);             \
@@ -1346,7 +1346,7 @@ static void dump_isst_config(int arg)
 	if (max_target_cpus)
 		for_each_online_target_cpu_in_set(fn, NULL, NULL, NULL, NULL);
 	else
-		for_each_online_package_in_set(fn, NULL, NULL, NULL, NULL);
+		for_each_online_power_domain_in_set(fn, NULL, NULL, NULL, NULL);
 
 	isst_ctdp_display_information_end(outf);
 }
@@ -1457,7 +1457,7 @@ static void set_tdp_level(int arg)
 		for_each_online_target_cpu_in_set(set_tdp_level_for_cpu, NULL,
 						  NULL, NULL, NULL);
 	else
-		for_each_online_package_in_set(set_tdp_level_for_cpu, NULL,
+		for_each_online_power_domain_in_set(set_tdp_level_for_cpu, NULL,
 					       NULL, NULL, NULL);
 	isst_ctdp_display_information_end(outf);
 }
@@ -1526,7 +1526,7 @@ static void dump_pbf_config(int arg)
 	if (max_target_cpus)
 		for_each_online_target_cpu_in_set(fn, NULL, NULL, NULL, NULL);
 	else
-		for_each_online_package_in_set(fn, NULL, NULL, NULL, NULL);
+		for_each_online_power_domain_in_set(fn, NULL, NULL, NULL, NULL);
 
 	isst_ctdp_display_information_end(outf);
 }
@@ -1932,7 +1932,7 @@ static void set_pbf_enable(int arg)
 		for_each_online_target_cpu_in_set(set_pbf_for_cpu, NULL, NULL,
 						  NULL, &enable);
 	else
-		for_each_online_package_in_set(set_pbf_for_cpu, NULL, NULL,
+		for_each_online_power_domain_in_set(set_pbf_for_cpu, NULL, NULL,
 					       NULL, &enable);
 	isst_ctdp_display_information_end(outf);
 }
@@ -1978,7 +1978,7 @@ static void dump_fact_config(int arg)
 		for_each_online_target_cpu_in_set(dump_fact_config_for_cpu,
 						  NULL, NULL, NULL, NULL);
 	else
-		for_each_online_package_in_set(dump_fact_config_for_cpu, NULL,
+		for_each_online_power_domain_in_set(dump_fact_config_for_cpu, NULL,
 					       NULL, NULL, NULL);
 	isst_ctdp_display_information_end(outf);
 }
@@ -2087,7 +2087,7 @@ static void set_fact_enable(int arg)
 		for_each_online_target_cpu_in_set(set_fact_for_cpu, NULL, NULL,
 						  NULL, &enable);
 	else
-		for_each_online_package_in_set(set_fact_for_cpu, NULL, NULL,
+		for_each_online_power_domain_in_set(set_fact_for_cpu, NULL, NULL,
 					       NULL, &enable);
 	isst_ctdp_display_information_end(outf);
 
@@ -2226,7 +2226,7 @@ static void set_clos_enable(int arg)
 		for_each_online_target_cpu_in_set(enable_clos_qos_config, NULL,
 						  NULL, NULL, &enable);
 	else
-		for_each_online_package_in_set(enable_clos_qos_config, NULL,
+		for_each_online_power_domain_in_set(enable_clos_qos_config, NULL,
 					       NULL, NULL, &enable);
 	isst_ctdp_display_information_end(outf);
 }
@@ -2265,7 +2265,7 @@ static void dump_clos_config(int arg)
 		for_each_online_target_cpu_in_set(dump_clos_config_for_cpu,
 						  NULL, NULL, NULL, NULL);
 	else
-		for_each_online_package_in_set(dump_clos_config_for_cpu, NULL,
+		for_each_online_power_domain_in_set(dump_clos_config_for_cpu, NULL,
 					       NULL, NULL, NULL);
 	isst_ctdp_display_information_end(outf);
 }
@@ -2301,7 +2301,7 @@ static void dump_clos_info(int arg)
 		for_each_online_target_cpu_in_set(get_clos_info_for_cpu, NULL,
 						  NULL, NULL, NULL);
 	else
-		for_each_online_package_in_set(get_clos_info_for_cpu, NULL,
+		for_each_online_power_domain_in_set(get_clos_info_for_cpu, NULL,
 					       NULL, NULL, NULL);
 	isst_ctdp_display_information_end(outf);
 
@@ -2373,7 +2373,7 @@ static void set_clos_config(int arg)
 		for_each_online_target_cpu_in_set(set_clos_config_for_cpu, NULL,
 						  NULL, NULL, NULL);
 	else
-		for_each_online_package_in_set(set_clos_config_for_cpu, NULL,
+		for_each_online_power_domain_in_set(set_clos_config_for_cpu, NULL,
 					       NULL, NULL, NULL);
 	isst_ctdp_display_information_end(outf);
 }
@@ -2540,7 +2540,7 @@ static void process_trl(int arg)
 		for_each_online_target_cpu_in_set(get_set_trl, NULL,
 						  NULL, NULL, &arg);
 	else
-		for_each_online_package_in_set(get_set_trl, NULL,
+		for_each_online_power_domain_in_set(get_set_trl, NULL,
 					       NULL, NULL, &arg);
 	isst_ctdp_display_information_end(outf);
 }
