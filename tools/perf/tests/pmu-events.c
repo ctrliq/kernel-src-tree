@@ -2,6 +2,7 @@
 #include "math.h"
 #include "parse-events.h"
 #include "pmu.h"
+#include "pmus.h"
 #include "tests.h"
 #include <errno.h>
 #include <stdio.h>
@@ -325,20 +326,14 @@ static int compare_pmu_events(const struct pmu_event *e1, const struct pmu_event
 		return -1;
 	}
 
-	if (!is_same(e1->perpkg, e2->perpkg)) {
-		pr_debug2("testing event e1 %s: mismatched perpkg, %s vs %s\n",
+	if (e1->perpkg != e2->perpkg) {
+		pr_debug2("testing event e1 %s: mismatched perpkg, %d vs %d\n",
 			  e1->name, e1->perpkg, e2->perpkg);
 		return -1;
 	}
 
-	if (!is_same(e1->aggr_mode, e2->aggr_mode)) {
-		pr_debug2("testing event e1 %s: mismatched aggr_mode, %s vs %s\n",
-			  e1->name, e1->aggr_mode, e2->aggr_mode);
-		return -1;
-	}
-
-	if (!is_same(e1->deprecated, e2->deprecated)) {
-		pr_debug2("testing event e1 %s: mismatched deprecated, %s vs %s\n",
+	if (e1->deprecated != e2->deprecated) {
+		pr_debug2("testing event e1 %s: mismatched deprecated, %d vs %d\n",
 			  e1->name, e1->deprecated, e2->deprecated);
 		return -1;
 	}
@@ -513,7 +508,7 @@ static struct perf_pmu_alias *find_alias(const char *test_event, struct list_hea
 }
 
 /* Verify aliases are as expected */
-static int __test_core_pmu_event_aliases(char *pmu_name, int *count)
+static int __test_core_pmu_event_aliases(const char *pmu_name, int *count)
 {
 	struct perf_pmu_test_event const **test_event_table;
 	struct perf_pmu *pmu;
@@ -640,7 +635,7 @@ out:
 static struct perf_pmu_test_pmu test_pmus[] = {
 	{
 		.pmu = {
-			.name = (char *)"hisi_sccl1_ddrc2",
+			.name = "hisi_sccl1_ddrc2",
 			.is_uncore = 1,
 		},
 		.aliases = {
@@ -649,7 +644,7 @@ static struct perf_pmu_test_pmu test_pmus[] = {
 	},
 	{
 		.pmu = {
-			.name = (char *)"uncore_cbox_0",
+			.name = "uncore_cbox_0",
 			.is_uncore = 1,
 		},
 		.aliases = {
@@ -660,7 +655,7 @@ static struct perf_pmu_test_pmu test_pmus[] = {
 	},
 	{
 		.pmu = {
-			.name = (char *)"hisi_sccl3_l3c7",
+			.name = "hisi_sccl3_l3c7",
 			.is_uncore = 1,
 		},
 		.aliases = {
@@ -669,7 +664,7 @@ static struct perf_pmu_test_pmu test_pmus[] = {
 	},
 	{
 		.pmu = {
-			.name = (char *)"uncore_imc_free_running_0",
+			.name = "uncore_imc_free_running_0",
 			.is_uncore = 1,
 		},
 		.aliases = {
@@ -678,7 +673,7 @@ static struct perf_pmu_test_pmu test_pmus[] = {
 	},
 	{
 		.pmu = {
-			.name = (char *)"uncore_imc_0",
+			.name = "uncore_imc_0",
 			.is_uncore = 1,
 		},
 		.aliases = {
@@ -687,9 +682,9 @@ static struct perf_pmu_test_pmu test_pmus[] = {
 	},
 	{
 		.pmu = {
-			.name = (char *)"uncore_sys_ddr_pmu0",
+			.name = "uncore_sys_ddr_pmu0",
 			.is_uncore = 1,
-			.id = (char *)"v8",
+			.id = "v8",
 		},
 		.aliases = {
 			&sys_ddr_pmu_write_cycles,
@@ -697,9 +692,9 @@ static struct perf_pmu_test_pmu test_pmus[] = {
 	},
 	{
 		.pmu = {
-			.name = (char *)"uncore_sys_ccn_pmu4",
+			.name = "uncore_sys_ccn_pmu4",
 			.is_uncore = 1,
-			.id = (char *)"0x01",
+			.id = "0x01",
 		},
 		.aliases = {
 			&sys_ccn_pmu_read_cycles,
@@ -714,11 +709,8 @@ static int test__aliases(struct test_suite *test __maybe_unused,
 	struct perf_pmu *pmu = NULL;
 	unsigned long i;
 
-	while ((pmu = perf_pmu__scan(pmu)) != NULL) {
+	while ((pmu = perf_pmus__scan_core(pmu)) != NULL) {
 		int count = 0;
-
-		if (!is_pmu_core(pmu->name))
-			continue;
 
 		if (list_empty(&pmu->format)) {
 			pr_debug2("skipping testing core PMU %s\n", pmu->name);
@@ -782,16 +774,8 @@ static int check_parse_id(const char *id, struct parse_events_error *error,
 	for (cur = strchr(dup, '@') ; cur; cur = strchr(++cur, '@'))
 		*cur = '/';
 
-	if (fake_pmu) {
-		/*
-		 * Every call to __parse_events will try to initialize the PMU
-		 * state from sysfs and then clean it up at the end. Reset the
-		 * PMU events to the test state so that we don't pick up
-		 * erroneous prefixes and suffixes.
-		 */
-		perf_pmu__test_parse_init();
-	}
-	ret = __parse_events(evlist, dup, error, fake_pmu);
+	ret = __parse_events(evlist, dup, /*pmu_filter=*/NULL, error, fake_pmu,
+			     /*warn_if_reordered=*/true);
 	free(dup);
 
 	evlist__delete(evlist);
@@ -822,7 +806,6 @@ static int test__parsing_callback(const struct pmu_metric *pm,
 	int k;
 	struct evlist *evlist;
 	struct perf_cpu_map *cpus;
-	struct runtime_stat st;
 	struct evsel *evsel;
 	struct rblist metric_events = {
 		.nr_entries = 0,
@@ -850,11 +833,8 @@ static int test__parsing_callback(const struct pmu_metric *pm,
 	}
 
 	perf_evlist__set_maps(&evlist->core, cpus, NULL);
-	runtime_stat__init(&st);
 
-	err = metricgroup__parse_groups_test(evlist, table, pm->metric_name,
-					     false, false,
-					     &metric_events);
+	err = metricgroup__parse_groups_test(evlist, table, pm->metric_name, &metric_events);
 	if (err) {
 		if (!strcmp(pm->metric_name, "M1") || !strcmp(pm->metric_name, "M2") ||
 		    !strcmp(pm->metric_name, "M3")) {
@@ -873,10 +853,10 @@ static int test__parsing_callback(const struct pmu_metric *pm,
 	 * zero when subtracted and so try to make them unique.
 	 */
 	k = 1;
-	perf_stat__reset_shadow_stats();
+	evlist__alloc_aggr_stats(evlist, 1);
 	evlist__for_each_entry(evlist, evsel) {
-		perf_stat__update_shadow_stats(evsel, k, 0, &st);
-		if (!strcmp(evsel->name, "duration_time"))
+		evsel->stats->aggr->counts.val = k;
+		if (evsel__name_is(evsel, "duration_time"))
 			update_stats(&walltime_nsecs_stats, k);
 		k++;
 	}
@@ -889,7 +869,7 @@ static int test__parsing_callback(const struct pmu_metric *pm,
 			list_for_each_entry (mexp, &me->head, nd) {
 				if (strcmp(mexp->metric_name, pm->metric_name))
 					continue;
-				pr_debug("Result %f\n", test_generic_metric(mexp, 0, &st));
+				pr_debug("Result %f\n", test_generic_metric(mexp, 0));
 				err = 0;
 				(*failures)--;
 				goto out_err;
@@ -904,7 +884,6 @@ out_err:
 
 	/* ... cleanup. */
 	metricgroup__rblist_exit(&metric_events);
-	runtime_stat__exit(&st);
 	evlist__free_stats(evlist);
 	perf_cpu_map__put(cpus);
 	evlist__delete(evlist);
@@ -1027,12 +1006,34 @@ static int test__parsing_fake(struct test_suite *test __maybe_unused,
 	return pmu_for_each_sys_metric(test__parsing_fake_callback, NULL);
 }
 
+static int test__parsing_threshold_callback(const struct pmu_metric *pm,
+					const struct pmu_metrics_table *table __maybe_unused,
+					void *data __maybe_unused)
+{
+	if (!pm->metric_threshold)
+		return 0;
+	return metric_parse_fake(pm->metric_name, pm->metric_threshold);
+}
+
+static int test__parsing_threshold(struct test_suite *test __maybe_unused,
+			      int subtest __maybe_unused)
+{
+	int err = 0;
+
+	err = pmu_for_each_core_metric(test__parsing_threshold_callback, NULL);
+	if (err)
+		return err;
+
+	return pmu_for_each_sys_metric(test__parsing_threshold_callback, NULL);
+}
+
 static struct test_case pmu_events_tests[] = {
 	TEST_CASE("PMU event table sanity", pmu_event_table),
 	TEST_CASE("PMU event map aliases", aliases),
 	TEST_CASE_REASON("Parsing of PMU event table metrics", parsing,
 			 "some metrics failed"),
 	TEST_CASE("Parsing of PMU event table metrics with fake PMUs", parsing_fake),
+	TEST_CASE("Parsing of metric thresholds with fake PMUs", parsing_threshold),
 	{ .name = NULL, }
 };
 
