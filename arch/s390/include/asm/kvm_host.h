@@ -1022,6 +1022,9 @@ void kvm_arch_crypto_set_masks(struct kvm *kvm, unsigned long *apm,
 extern int sie64a(struct kvm_s390_sie_block *, u64 *);
 extern char sie_exit;
 
+bool kvm_s390_pv_is_protected(struct kvm *kvm);
+bool kvm_s390_pv_cpu_is_protected(struct kvm_vcpu *vcpu);
+
 extern int kvm_s390_gisc_register(struct kvm *kvm, u32 gisc);
 extern int kvm_s390_gisc_unregister(struct kvm *kvm, u32 gisc);
 
