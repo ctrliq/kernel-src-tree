@@ -2063,7 +2063,7 @@ static int module_enforce_rwx_sections(Elf_Ehdr *hdr, Elf_Shdr *sechdrs,
 
 #ifdef CONFIG_LIVEPATCH
 /*
- * Persist Elf information about a module. Copy the Elf header,
+ * Persist ELF information about a module. Copy the ELF header,
  * section header table, section string table, and symtab section
  * index from info to mod->klp_info.
  */
@@ -2077,11 +2077,11 @@ static int copy_module_elf(struct module *mod, struct load_info *info)
 	if (mod->klp_info == NULL)
 		return -ENOMEM;
 
-	/* Elf header */
+	/* ELF header */
 	size = sizeof(mod->klp_info->hdr);
 	memcpy(&mod->klp_info->hdr, info->hdr, size);
 
-	/* Elf section header table */
+	/* ELF section header table */
 	size = sizeof(*info->sechdrs) * info->hdr->e_shnum;
 	mod->klp_info->sechdrs = kmemdup(info->sechdrs, size, GFP_KERNEL);
 	if (mod->klp_info->sechdrs == NULL) {
@@ -2089,7 +2089,7 @@ static int copy_module_elf(struct module *mod, struct load_info *info)
 		goto free_info;
 	}
 
-	/* Elf section name string table */
+	/* ELF section name string table */
 	size = info->sechdrs[info->hdr->e_shstrndx].sh_size;
 	mod->klp_info->secstrings = kmemdup(info->secstrings, size, GFP_KERNEL);
 	if (mod->klp_info->secstrings == NULL) {
@@ -2097,7 +2097,7 @@ static int copy_module_elf(struct module *mod, struct load_info *info)
 		goto free_sechdrs;
 	}
 
-	/* Elf symbol section index */
+	/* ELF symbol section index */
 	symndx = info->index.sym;
 	mod->klp_info->symndx = symndx;
 
