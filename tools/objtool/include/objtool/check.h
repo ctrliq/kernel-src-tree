@@ -62,10 +62,12 @@ struct instruction {
 	/* u8 hole */
 
 	struct alt_group *alt_group;
-	struct symbol *call_dest;
 	struct instruction *jump_dest;
 	struct instruction *first_jump_src;
-	struct reloc *jump_table;
+	union {
+		struct symbol *_call_dest;
+		struct reloc *_jump_table;
+	};
 	struct reloc *reloc;
 	struct list_head alts;
 	struct symbol *sym;
