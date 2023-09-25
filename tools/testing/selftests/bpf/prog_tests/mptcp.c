@@ -154,6 +154,8 @@ static void test_base(void)
 	if (!ASSERT_OK_PTR(nstoken, "open_netns"))
 		goto fail;
 
+	SYS(fail, "sysctl net.mptcp.enabled=1");
+
 	/* without MPTCP */
 	server_fd = start_server(AF_INET, SOCK_STREAM, NULL, 0, 0);
 	if (!ASSERT_GE(server_fd, 0, "start_server"))
