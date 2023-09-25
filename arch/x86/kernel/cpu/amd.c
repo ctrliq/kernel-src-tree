@@ -1272,3 +1272,17 @@ void amd_check_microcode(void)
 {
 	on_each_cpu(zenbleed_check_cpu, NULL, 1);
 }
+
+bool cpu_has_ibpb_brtype_microcode(void)
+{
+	u8 fam = boot_cpu_data.x86;
+
+	if (fam == 0x17) {
+		/* Zen1/2 IBPB flushes branch type predictions too. */
+		return boot_cpu_has(X86_FEATURE_AMD_IBPB);
+	} else if (fam == 0x19) {
+		return false;
+	}
+
+	return false;
+}
