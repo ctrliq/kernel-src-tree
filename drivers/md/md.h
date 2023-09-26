@@ -122,8 +122,6 @@ struct md_rdev {
 
 	struct serial_in_rdev *serial;  /* used for raid1 io serialization */
 
-	struct work_struct del_work;	/* used for delayed sysfs removal */
-
 	struct kernfs_node *sysfs_state; /* handle for 'state'
 					   * sysfs entry */
 	/* handle for 'unacknowledged_bad_blocks' sysfs dentry */
@@ -212,6 +210,9 @@ enum flag_bits {
 	CollisionCheck,		/*
 				 * check if there is collision between raid1
 				 * serial bios.
+				 */
+	Holder,			/* rdev is used as holder while opening
+				 * underlying disk exclusively.
 				 */
 };
 
@@ -367,8 +368,8 @@ struct mddev {
 	int				new_chunk_sectors;
 	int				reshape_backwards;
 
-	struct md_thread		*thread;	/* management thread */
-	struct md_thread		*sync_thread;	/* doing resync or reconstruct */
+	struct md_thread __rcu		*thread;	/* management thread */
+	struct md_thread __rcu		*sync_thread;	/* doing resync or reconstruct */
 
 	/* 'last_sync_action' is initialized to "none".  It is set when a
 	 * sync operation (i.e "data-check", "requested-resync", "resync",
@@ -530,6 +531,12 @@ struct mddev {
 	struct md_cluster_info		*cluster_info;
 	unsigned int			good_device_nr;	/* good device num within cluster raid */
 	unsigned int			noio_flag; /* for memalloc scope API */
+
+	/*
+	 * Temporarily store rdev that will be finally removed when
+	 * reconfig_mutex is unlocked, protected by reconfig_mutex.
+	 */
+	struct list_head		deleting;
 
 	bool	has_superblocks:1;
 	bool	fail_last_dev:1;
@@ -734,8 +741,8 @@ extern struct md_thread *md_register_thread(
 	void (*run)(struct md_thread *thread),
 	struct mddev *mddev,
 	const char *name);
-extern void md_unregister_thread(struct md_thread **threadp);
-extern void md_wakeup_thread(struct md_thread *thread);
+extern void md_unregister_thread(struct md_thread __rcu **threadp);
+extern void md_wakeup_thread(struct md_thread __rcu *thread);
 extern void md_check_recovery(struct mddev *mddev);
 extern void md_reap_sync_thread(struct mddev *mddev);
 extern int mddev_init_writes_pending(struct mddev *mddev);
