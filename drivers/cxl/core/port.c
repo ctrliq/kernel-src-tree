@@ -180,17 +180,7 @@ static ssize_t mode_show(struct device *dev, struct device_attribute *attr,
 {
 	struct cxl_endpoint_decoder *cxled = to_cxl_endpoint_decoder(dev);
 
-	switch (cxled->mode) {
-	case CXL_DECODER_RAM:
-		return sysfs_emit(buf, "ram\n");
-	case CXL_DECODER_PMEM:
-		return sysfs_emit(buf, "pmem\n");
-	case CXL_DECODER_NONE:
-		return sysfs_emit(buf, "none\n");
-	case CXL_DECODER_MIXED:
-	default:
-		return sysfs_emit(buf, "mixed\n");
-	}
+	return sysfs_emit(buf, "%s\n", cxl_decoder_mode_name(cxled->mode));
 }
 
 static ssize_t mode_store(struct device *dev, struct device_attribute *attr,
@@ -304,6 +294,7 @@ static struct attribute *cxl_decoder_root_attrs[] = {
 	&dev_attr_cap_type3.attr,
 	&dev_attr_target_list.attr,
 	SET_CXL_REGION_ATTR(create_pmem_region)
+	SET_CXL_REGION_ATTR(create_ram_region)
 	SET_CXL_REGION_ATTR(delete_region)
 	NULL,
 };
@@ -311,6 +302,13 @@ static struct attribute *cxl_decoder_root_attrs[] = {
 static bool can_create_pmem(struct cxl_root_decoder *cxlrd)
 {
 	unsigned long flags = CXL_DECODER_F_TYPE3 | CXL_DECODER_F_PMEM;
+
+	return (cxlrd->cxlsd.cxld.flags & flags) == flags;
+}
+
+static bool can_create_ram(struct cxl_root_decoder *cxlrd)
+{
+	unsigned long flags = CXL_DECODER_F_TYPE3 | CXL_DECODER_F_RAM;
 
 	return (cxlrd->cxlsd.cxld.flags & flags) == flags;
 }
@@ -323,7 +321,11 @@ static umode_t cxl_root_decoder_visible(struct kobject *kobj, struct attribute *
 	if (a == CXL_REGION_ATTR(create_pmem_region) && !can_create_pmem(cxlrd))
 		return 0;
 
-	if (a == CXL_REGION_ATTR(delete_region) && !can_create_pmem(cxlrd))
+	if (a == CXL_REGION_ATTR(create_ram_region) && !can_create_ram(cxlrd))
+		return 0;
+
+	if (a == CXL_REGION_ATTR(delete_region) &&
+	    !(can_create_pmem(cxlrd) || can_create_ram(cxlrd)))
 		return 0;
 
 	return a->mode;
@@ -444,6 +446,7 @@ bool is_endpoint_decoder(struct device *dev)
 {
 	return dev->type == &cxl_decoder_endpoint_type;
 }
+EXPORT_SYMBOL_NS_GPL(is_endpoint_decoder, CXL);
 
 bool is_root_decoder(struct device *dev)
 {
@@ -455,6 +458,7 @@ bool is_switch_decoder(struct device *dev)
 {
 	return is_root_decoder(dev) || dev->type == &cxl_decoder_switch_type;
 }
+EXPORT_SYMBOL_NS_GPL(is_switch_decoder, CXL);
 
 struct cxl_decoder *to_cxl_decoder(struct device *dev)
 {
@@ -482,6 +486,7 @@ struct cxl_switch_decoder *to_cxl_switch_decoder(struct device *dev)
 		return NULL;
 	return container_of(dev, struct cxl_switch_decoder, cxld.dev);
 }
+EXPORT_SYMBOL_NS_GPL(to_cxl_switch_decoder, CXL);
 
 static void cxl_ep_release(struct cxl_ep *ep)
 {
@@ -581,6 +586,29 @@ static int devm_cxl_link_uport(struct device *host, struct cxl_port *port)
 	if (rc)
 		return rc;
 	return devm_add_action_or_reset(host, cxl_unlink_uport, port);
+}
+
+static void cxl_unlink_parent_dport(void *_port)
+{
+	struct cxl_port *port = _port;
+
+	sysfs_remove_link(&port->dev.kobj, "parent_dport");
+}
+
+static int devm_cxl_link_parent_dport(struct device *host,
+				      struct cxl_port *port,
+				      struct cxl_dport *parent_dport)
+{
+	int rc;
+
+	if (!parent_dport)
+		return 0;
+
+	rc = sysfs_create_link(&port->dev.kobj, &parent_dport->dport->kobj,
+			       "parent_dport");
+	if (rc)
+		return rc;
+	return devm_add_action_or_reset(host, cxl_unlink_parent_dport, port);
 }
 
 static struct lock_class_key cxl_port_key;
@@ -692,6 +720,10 @@ static struct cxl_port *__devm_cxl_add_port(struct device *host,
 	if (rc)
 		return ERR_PTR(rc);
 
+	rc = devm_cxl_link_parent_dport(host, port, parent_dport);
+	if (rc)
+		return ERR_PTR(rc);
+
 	return port;
 
 err:
@@ -789,41 +821,17 @@ static bool dev_is_cxl_root_child(struct device *dev)
 	return false;
 }
 
-/* Find a 2nd level CXL port that has a dport that is an ancestor of @match */
-static int match_root_child(struct device *dev, const void *match)
+struct cxl_port *find_cxl_root(struct cxl_port *port)
 {
-	const struct device *iter = NULL;
-	struct cxl_dport *dport;
-	struct cxl_port *port;
+	struct cxl_port *iter = port;
 
-	if (!dev_is_cxl_root_child(dev))
-		return 0;
+	while (iter && !is_cxl_root(iter))
+		iter = to_cxl_port(iter->dev.parent);
 
-	port = to_cxl_port(dev);
-	iter = match;
-	while (iter) {
-		dport = cxl_find_dport_by_dev(port, iter);
-		if (dport)
-			break;
-		iter = iter->parent;
-	}
-
-	return !!iter;
-}
-
-struct cxl_port *find_cxl_root(struct device *dev)
-{
-	struct device *port_dev;
-	struct cxl_port *root;
-
-	port_dev = bus_find_device(&cxl_bus_type, NULL, dev, match_root_child);
-	if (!port_dev)
+	if (!iter)
 		return NULL;
-
-	root = to_cxl_port(port_dev->parent);
-	get_device(&root->dev);
-	put_device(port_dev);
-	return root;
+	get_device(&iter->dev);
+	return iter;
 }
 EXPORT_SYMBOL_NS_GPL(find_cxl_root, CXL);
 
@@ -1164,6 +1172,7 @@ static void delete_endpoint(void *data)
 
 	device_lock(parent);
 	if (parent->driver && !endpoint->dead) {
+		devm_release_action(parent, cxl_unlink_parent_dport, endpoint);
 		devm_release_action(parent, cxl_unlink_uport, endpoint);
 		devm_release_action(parent, unregister_port, endpoint);
 	}
@@ -1195,6 +1204,7 @@ EXPORT_SYMBOL_NS_GPL(cxl_endpoint_autoremove, CXL);
  */
 static void delete_switch_port(struct cxl_port *port)
 {
+	devm_release_action(port->dev.parent, cxl_unlink_parent_dport, port);
 	devm_release_action(port->dev.parent, cxl_unlink_uport, port);
 	devm_release_action(port->dev.parent, unregister_port, port);
 }
@@ -1597,6 +1607,7 @@ struct cxl_root_decoder *cxl_root_decoder_alloc(struct cxl_port *port,
 	}
 
 	cxlrd->calc_hb = calc_hb;
+	mutex_init(&cxlrd->range_lock);
 
 	cxld = &cxlsd->cxld;
 	cxld->dev.type = &cxl_decoder_root_type;
