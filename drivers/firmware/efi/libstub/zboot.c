@@ -140,6 +140,11 @@ static void append_end_node(efi_device_path_protocol_t **dp)
 	++*dp;
 }
 
+struct screen_info *alloc_screen_info(void)
+{
+	return __alloc_screen_info();
+}
+
 asmlinkage efi_status_t __efiapi
 efi_zboot_entry(efi_handle_t handle, efi_system_table_t *systab)
 {
