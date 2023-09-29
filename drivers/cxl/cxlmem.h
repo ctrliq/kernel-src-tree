@@ -364,7 +364,6 @@ struct cxl_fw_state {
  *
  * @state: state of last security operation
  * @enabled_cmds: All security commands enabled in the CEL
- * @poll: polling for sanitization is enabled, device has no mbox irq support
  * @poll_tmo_secs: polling timeout
  * @sanitize_active: sanitize completion pending
  * @poll_dwork: polling work item
@@ -373,7 +372,6 @@ struct cxl_fw_state {
 struct cxl_security_state {
 	unsigned long state;
 	DECLARE_BITMAP(enabled_cmds, CXL_SEC_ENABLED_MAX);
-	bool poll;
 	int poll_tmo_secs;
 	bool sanitize_active;
 	struct delayed_work poll_dwork;
