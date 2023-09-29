@@ -438,7 +438,7 @@ efi_status_t efi_exit_boot_services(void *handle, void *priv,
 	struct efi_boot_memmap *map;
 	efi_status_t status;
 
-	status = efi_get_memory_map(&map);
+	status = efi_get_memory_map(&map, true);
 	if (status != EFI_SUCCESS)
 		return status;
 
