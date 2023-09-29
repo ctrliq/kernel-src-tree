@@ -8,6 +8,10 @@
 # information for the relevant maintainers using get_maintainers.pl. This
 # requires that you have $RHMAINTAINERS pointing to a valid maintainer file.
 
+target_branch=$1
+prev_branch="$(git rev-parse --abbrev-ref HEAD)"
+git checkout "$target_branch"
+
 if ! git show -s --oneline HEAD | grep -q "AUTOMATIC: New configs"; then
 	echo "The git HEAD doesn't look like the correct commit"
 	exit 1
@@ -116,12 +120,14 @@ for f in "$config_bundles_dir"/*; do
 		rm redhat/configs/pending-rhel/generic/"$line"
 	done < "$f"
 	# We do a separate branch per config commit
-	if ! git checkout -b "configs/$(date +%F)/$_f"; then
-		printf "Unable to check out configs/%s/%s branch!\n" "$(date +%F)" "$_f"
+	if ! git checkout -b "configs/$target_branch/$(date +%F)/$_f"; then
+		printf "Unable to check out configs/%s/%s/%s branch!\n" "$target_branch" "$(date +%F)" "$_f"
 		exit 1
 	fi
 	# One file path is done, time to commit!
 	git add redhat/configs
 	git commit -s -F "$tmpdir"/commit
-	git checkout os-build
+	git checkout "$target_branch"
 done
+
+git checkout "$prev_branch"
