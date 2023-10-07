@@ -789,6 +789,7 @@ struct ibmvnic_sub_crq_queue {
 	atomic_t used;
 	char name[32];
 	u64 handle;
+	cpumask_var_t affinity_mask;
 } ____cacheline_aligned;
 
 struct ibmvnic_long_term_buff {
@@ -942,6 +943,10 @@ struct ibmvnic_adapter {
 	struct completion reset_done;
 	int reset_done_rc;
 	bool wait_for_reset;
+
+	/* CPU hotplug instances for online & dead */
+	struct hlist_node node;
+	struct hlist_node node_dead;
 
 	/* partner capabilities */
 	u64 min_tx_queues;
