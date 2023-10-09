@@ -4421,7 +4421,7 @@ int module_get_kallsym(unsigned int symnum, unsigned long *value, char *type,
 }
 
 /* Given a module and name of symbol, find and return the symbol's value */
-static unsigned long find_kallsyms_symbol_value(struct module *mod, const char *name)
+static unsigned long __find_kallsyms_symbol_value(struct module *mod, const char *name)
 {
 	unsigned int i;
 	struct mod_kallsyms *kallsyms = rcu_dereference_sched(mod->kallsyms);
@@ -4447,15 +4447,25 @@ unsigned long module_kallsyms_lookup_name(const char *name)
 	preempt_disable();
 	if ((colon = strnchr(name, MODULE_NAME_LEN, ':')) != NULL) {
 		if ((mod = find_module_all(name, colon - name, false)) != NULL)
-			ret = find_kallsyms_symbol_value(mod, colon+1);
+			ret = __find_kallsyms_symbol_value(mod, colon+1);
 	} else {
 		list_for_each_entry_rcu(mod, &modules, list) {
 			if (mod->state == MODULE_STATE_UNFORMED)
 				continue;
-			if ((ret = find_kallsyms_symbol_value(mod, name)) != 0)
+			if ((ret = __find_kallsyms_symbol_value(mod, name)) != 0)
 				break;
 		}
 	}
+	preempt_enable();
+	return ret;
+}
+
+unsigned long find_kallsyms_symbol_value(struct module *mod, const char *name)
+{
+	unsigned long ret;
+
+	preempt_disable();
+	ret = __find_kallsyms_symbol_value(mod, name);
 	preempt_enable();
 	return ret;
 }
@@ -4501,11 +4511,11 @@ static void cfi_init(struct module *mod)
 
 	rcu_read_lock_sched();
 	mod->cfi_check = (cfi_check_fn)
-		find_kallsyms_symbol_value(mod, "__cfi_check");
+		__find_kallsyms_symbol_value(mod, "__cfi_check");
 	init = (initcall_t *)
-		find_kallsyms_symbol_value(mod, "__cfi_jt_init_module");
+		__find_kallsyms_symbol_value(mod, "__cfi_jt_init_module");
 	exit = (exitcall_t *)
-		find_kallsyms_symbol_value(mod, "__cfi_jt_cleanup_module");
+		__find_kallsyms_symbol_value(mod, "__cfi_jt_cleanup_module");
 	rcu_read_unlock_sched();
 
 	/* Fix init/exit functions to point to the CFI jump table */
