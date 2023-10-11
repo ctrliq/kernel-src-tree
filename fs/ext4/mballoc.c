@@ -6424,7 +6424,7 @@ void ext4_free_blocks(handle_t *handle, struct inode *inode,
 	sbi = EXT4_SB(sb);
 
 	if (sbi->s_mount_state & EXT4_FC_REPLAY) {
-		ext4_free_blocks_simple(inode, block, count);
+		ext4_free_blocks_simple(inode, block, EXT4_NUM_B2C(sbi, count));
 		return;
 	}
 
