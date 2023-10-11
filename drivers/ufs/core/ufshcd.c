@@ -986,10 +986,11 @@ static inline void ufshcd_hba_start(struct ufs_hba *hba)
  *
  * Returns true if and only if the controller is active.
  */
-static inline bool ufshcd_is_hba_active(struct ufs_hba *hba)
+bool ufshcd_is_hba_active(struct ufs_hba *hba)
 {
 	return ufshcd_readl(hba, REG_CONTROLLER_ENABLE) & CONTROLLER_ENABLE;
 }
+EXPORT_SYMBOL_GPL(ufshcd_is_hba_active);
 
 u32 ufshcd_get_local_unipro_ver(struct ufs_hba *hba)
 {
@@ -4359,8 +4360,8 @@ static void ufshcd_init_pwr_info(struct ufs_hba *hba)
 {
 	hba->pwr_info.gear_rx = UFS_PWM_G1;
 	hba->pwr_info.gear_tx = UFS_PWM_G1;
-	hba->pwr_info.lane_rx = 1;
-	hba->pwr_info.lane_tx = 1;
+	hba->pwr_info.lane_rx = UFS_LANE_1;
+	hba->pwr_info.lane_tx = UFS_LANE_1;
 	hba->pwr_info.pwr_rx = SLOWAUTO_MODE;
 	hba->pwr_info.pwr_tx = SLOWAUTO_MODE;
 	hba->pwr_info.hs_rate = 0;
@@ -8600,7 +8601,8 @@ static int ufshcd_probe_hba(struct ufs_hba *hba, bool init_dev_params)
 	if (ret)
 		goto out;
 
-	if (hba->quirks & UFSHCD_QUIRK_REINIT_AFTER_MAX_GEAR_SWITCH) {
+	if (!hba->pm_op_in_progress &&
+	    (hba->quirks & UFSHCD_QUIRK_REINIT_AFTER_MAX_GEAR_SWITCH)) {
 		/* Reset the device and controller before doing reinit */
 		ufshcd_device_reset(hba);
 		ufshcd_hba_stop(hba);
