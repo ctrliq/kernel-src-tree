@@ -197,12 +197,12 @@ enum nft_data_desc_flags {
 
 struct nft_data_desc {
 	enum nft_data_types		type;
+	unsigned int			size;
 	unsigned int			len;
 	unsigned int			flags;
 };
 
-int nft_data_init(const struct nft_ctx *ctx,
-		  struct nft_data *data, unsigned int size,
+int nft_data_init(const struct nft_ctx *ctx, struct nft_data *data,
 		  struct nft_data_desc *desc, const struct nlattr *nla);
 void nft_data_hold(const struct nft_data *data, enum nft_data_types type);
 void nft_data_release(const struct nft_data *data, enum nft_data_types type);
