@@ -3663,23 +3663,26 @@ const struct iomap_ops ext4_iomap_report_ops = {
 };
 
 /*
- * Folios can be marked dirty completely asynchronously from ext4's
- * journalling activity.  By filemap_sync_pte(), try_to_unmap_one(), etc.
- * We cannot do much here because ->dirty_folio may be called with the
- * page table lock held.  The folio is not necessarily locked.
- *
- * We cannot just dirty the folio and leave attached buffers clean, because the
- * buffers' dirty state is "definitive".  We cannot just set the buffers dirty
- * or jbddirty because all the journalling code will explode.
- *
- * So what we do is to mark the folio "pending dirty" and next time writepage
- * is called, propagate that into the buffers appropriately.
+ * For data=journal mode, folio should be marked dirty only when it was
+ * writeably mapped. When that happens, it was already attached to the
+ * transaction and marked as jbddirty (we take care of this in
+ * ext4_page_mkwrite()). On transaction commit, we writeprotect page mappings
+ * so we should have nothing to do here, except for the case when someone
+ * had the page pinned and dirtied the page through this pin (e.g. by doing
+ * direct IO to it). In that case we'd need to attach buffers here to the
+ * transaction but we cannot due to lock ordering.  We cannot just dirty the
+ * folio and leave attached buffers clean, because the buffers' dirty state is
+ * "definitive".  We cannot just set the buffers dirty or jbddirty because all
+ * the journalling code will explode.  So what we do is to mark the folio
+ * "pending dirty" and next time ext4_writepages() is called, attach buffers
+ * to the transaction appropriately.
  */
 static bool ext4_journalled_dirty_folio(struct address_space *mapping,
 		struct folio *folio)
 {
 	WARN_ON_ONCE(!folio_buffers(folio));
-	folio_set_checked(folio);
+	if (folio_maybe_dma_pinned(folio))
+		folio_set_checked(folio);
 	return filemap_dirty_folio(mapping, folio);
 }
 
