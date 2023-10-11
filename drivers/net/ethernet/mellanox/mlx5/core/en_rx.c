@@ -1683,9 +1683,8 @@ mlx5e_skb_from_cqe_nonlinear(struct mlx5e_rq *rq, struct mlx5e_wqe_frag_info *wi
 		}
 
 		frag = &sinfo->frags[sinfo->nr_frags++];
-		__skb_frag_set_page(frag, au->page);
-		skb_frag_off_set(frag, wi->offset);
-		skb_frag_size_set(frag, frag_consumed_bytes);
+		skb_frag_fill_page_desc(frag, au->page, wi->offset,
+					frag_consumed_bytes);
 
 		if (page_is_pfmemalloc(au->page))
 			xdp_buff_set_frag_pfmemalloc(&mxbuf.xdp);
