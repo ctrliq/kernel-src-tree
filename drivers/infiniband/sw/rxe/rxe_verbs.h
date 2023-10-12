@@ -309,7 +309,7 @@ struct rxe_mr {
 	int			access;
 	atomic_t		num_mw;
 
-	unsigned int		page_offset;
+	u32			offset;
 	unsigned int		page_shift;
 	u64			page_mask;
 
@@ -321,7 +321,7 @@ struct rxe_mr {
 
 static inline unsigned int mr_page_size(struct rxe_mr *mr)
 {
-	return mr ? mr->ibmr.page_size : PAGE_SIZE;
+	return PAGE_SIZE;
 }
 
 enum rxe_mw_state {
