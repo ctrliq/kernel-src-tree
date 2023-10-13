@@ -852,6 +852,7 @@ static char rtas_os_term_buf[2048];
 
 void rtas_os_term(char *str)
 {
+	static struct rtas_args args;
 	int status;
 
 	/*
@@ -867,8 +868,9 @@ void rtas_os_term(char *str)
 	snprintf(rtas_os_term_buf, 2048, "OS panic: %s", str);
 
 	do {
-		status = rtas_call(rtas_token("ibm,os-term"), 1, 1, NULL,
+		rtas_call_unlocked(&args, rtas_token("ibm,os-term"), 1, 1, NULL,
 				   __pa(rtas_os_term_buf));
+		status = be32_to_cpu(args.rets[0]);
 	} while (rtas_busy_delay(status));
 
 	if (status != 0)
