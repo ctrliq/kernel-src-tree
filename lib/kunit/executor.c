@@ -163,8 +163,8 @@ static struct suite_set kunit_filter_suites(const struct suite_set *suite_set,
 		filter_count = kunit_get_filter_count(filters);
 		parsed_filters = kcalloc(filter_count, sizeof(*parsed_filters), GFP_KERNEL);
 		if (!parsed_filters) {
-			kfree(copy);
-			return filtered;
+			*err = -ENOMEM;
+			goto free_parsed_glob;
 		}
 		for (j = 0; j < filter_count; j++)
 			parsed_filters[j] = kunit_next_attr_filter(&filters, err);
