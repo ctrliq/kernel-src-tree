@@ -73,3 +73,4 @@ include ../lib.mk
 $(OUTPUT)/reuseport_bpf_numa: LDLIBS += -lnuma
 $(OUTPUT)/tcp_mmap: LDLIBS += -lpthread
 $(OUTPUT)/tcp_inq: LDLIBS += -lpthread
+$(OUTPUT)/io_uring_zerocopy_tx: CFLAGS += -I../../../include/
