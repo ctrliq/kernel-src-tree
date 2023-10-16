@@ -17,8 +17,8 @@ function upload()
 }
 
 if [ -z "$RHDISTGIT_BRANCH" ]; then
-	echo "$0 <branch> [local clone] [alternate tmp] [alternate dist-git server]" >&2;
-	exit 1;
+	echo "$0: RHDISTGIT_BRANCH is not set" >&2
+	exit 1
 fi
 
 echo "Cloning the repository"
