@@ -791,7 +791,7 @@ static u64 arm64_ftr_set_value(const struct arm64_ftr_bits *ftrp, s64 reg,
 	return reg;
 }
 
-static s64 arm64_ftr_safe_value(const struct arm64_ftr_bits *ftrp, s64 new,
+s64 arm64_ftr_safe_value(const struct arm64_ftr_bits *ftrp, s64 new,
 				s64 cur)
 {
 	s64 ret = 0;
@@ -2644,7 +2644,6 @@ static const struct arm64_cpu_capabilities arm64_features[] = {
 		.cpu_enable = cpu_enable_e0pd,
 	},
 #endif
-#ifdef CONFIG_ARCH_RANDOM
 	{
 		.desc = "Random Number Generator",
 		.capability = ARM64_HAS_RNG,
@@ -2656,7 +2655,6 @@ static const struct arm64_cpu_capabilities arm64_features[] = {
 		.sign = FTR_UNSIGNED,
 		.min_field_value = 1,
 	},
-#endif
 #ifdef CONFIG_ARM64_BTI
 	{
 		.desc = "Branch Target Identification",
