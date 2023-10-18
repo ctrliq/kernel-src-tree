@@ -2225,7 +2225,7 @@ static const struct arm64_cpu_capabilities arm64_features[] = {
 		.field_pos = ID_AA64PFR0_EL1_GIC_SHIFT,
 		.field_width = 4,
 		.sign = FTR_UNSIGNED,
-		.min_field_value = 1,
+		.min_field_value = ID_AA64PFR0_EL1_GIC_IMP,
 	},
 	{
 		.desc = "Enhanced Counter Virtualization",
@@ -2236,7 +2236,7 @@ static const struct arm64_cpu_capabilities arm64_features[] = {
 		.field_pos = ID_AA64MMFR0_EL1_ECV_SHIFT,
 		.field_width = 4,
 		.sign = FTR_UNSIGNED,
-		.min_field_value = 1,
+		.min_field_value = ID_AA64MMFR0_EL1_ECV_IMP,
 	},
 	{
 		.desc = "Enhanced Counter Virtualization (CNTPOFF)",
@@ -2259,7 +2259,7 @@ static const struct arm64_cpu_capabilities arm64_features[] = {
 		.field_pos = ID_AA64MMFR1_EL1_PAN_SHIFT,
 		.field_width = 4,
 		.sign = FTR_UNSIGNED,
-		.min_field_value = 1,
+		.min_field_value = ID_AA64MMFR1_EL1_PAN_IMP,
 		.cpu_enable = cpu_enable_pan,
 	},
 #endif /* CONFIG_ARM64_PAN */
@@ -2273,7 +2273,7 @@ static const struct arm64_cpu_capabilities arm64_features[] = {
 		.field_pos = ID_AA64MMFR1_EL1_PAN_SHIFT,
 		.field_width = 4,
 		.sign = FTR_UNSIGNED,
-		.min_field_value = 3,
+		.min_field_value = ID_AA64MMFR1_EL1_PAN_PAN3,
 	},
 #endif /* CONFIG_ARM64_EPAN */
 #ifdef CONFIG_ARM64_LSE_ATOMICS
@@ -2286,7 +2286,7 @@ static const struct arm64_cpu_capabilities arm64_features[] = {
 		.field_pos = ID_AA64ISAR0_EL1_ATOMIC_SHIFT,
 		.field_width = 4,
 		.sign = FTR_UNSIGNED,
-		.min_field_value = 2,
+		.min_field_value = ID_AA64ISAR0_EL1_ATOMIC_IMP,
 	},
 #endif /* CONFIG_ARM64_LSE_ATOMICS */
 	{
@@ -2354,7 +2354,7 @@ static const struct arm64_cpu_capabilities arm64_features[] = {
 		.sys_reg = SYS_ID_AA64PFR0_EL1,
 		.field_pos = ID_AA64PFR0_EL1_CSV3_SHIFT,
 		.field_width = 4,
-		.min_field_value = 1,
+		.min_field_value = ID_AA64PFR0_EL1_CSV3_IMP,
 		.matches = unmap_kernel_at_el0,
 		.cpu_enable = kpti_install_ng_mappings,
 	},
@@ -2374,7 +2374,7 @@ static const struct arm64_cpu_capabilities arm64_features[] = {
 		.sys_reg = SYS_ID_AA64ISAR1_EL1,
 		.field_pos = ID_AA64ISAR1_EL1_DPB_SHIFT,
 		.field_width = 4,
-		.min_field_value = 1,
+		.min_field_value = ID_AA64ISAR1_EL1_DPB_IMP,
 	},
 	{
 		.desc = "Data cache clean to Point of Deep Persistence",
@@ -2385,7 +2385,7 @@ static const struct arm64_cpu_capabilities arm64_features[] = {
 		.sign = FTR_UNSIGNED,
 		.field_pos = ID_AA64ISAR1_EL1_DPB_SHIFT,
 		.field_width = 4,
-		.min_field_value = 2,
+		.min_field_value = ID_AA64ISAR1_EL1_DPB_DPB2,
 	},
 #endif
 #ifdef CONFIG_ARM64_SVE
@@ -2456,7 +2456,7 @@ static const struct arm64_cpu_capabilities arm64_features[] = {
 		.sign = FTR_UNSIGNED,
 		.field_pos = ID_AA64MMFR2_EL1_FWB_SHIFT,
 		.field_width = 4,
-		.min_field_value = 1,
+		.min_field_value = ID_AA64MMFR2_EL1_FWB_IMP,
 		.matches = has_cpuid_feature,
 	},
 	{
@@ -2467,7 +2467,7 @@ static const struct arm64_cpu_capabilities arm64_features[] = {
 		.sign = FTR_UNSIGNED,
 		.field_pos = ID_AA64MMFR2_EL1_TTL_SHIFT,
 		.field_width = 4,
-		.min_field_value = 1,
+		.min_field_value = ID_AA64MMFR2_EL1_TTL_IMP,
 		.matches = has_cpuid_feature,
 	},
 	{
@@ -2497,7 +2497,7 @@ static const struct arm64_cpu_capabilities arm64_features[] = {
 		.sign = FTR_UNSIGNED,
 		.field_pos = ID_AA64MMFR1_EL1_HAFDBS_SHIFT,
 		.field_width = 4,
-		.min_field_value = 2,
+		.min_field_value = ID_AA64MMFR1_EL1_HAFDBS_DBM,
 		.matches = has_hw_dbm,
 		.cpu_enable = cpu_enable_hw_dbm,
 	},
@@ -2510,7 +2510,7 @@ static const struct arm64_cpu_capabilities arm64_features[] = {
 		.sys_reg = SYS_ID_AA64ISAR0_EL1,
 		.field_pos = ID_AA64ISAR0_EL1_CRC32_SHIFT,
 		.field_width = 4,
-		.min_field_value = 1,
+		.min_field_value = ID_AA64ISAR0_EL1_CRC32_IMP,
 	},
 	{
 		.desc = "Speculative Store Bypassing Safe (SSBS)",
@@ -2533,7 +2533,7 @@ static const struct arm64_cpu_capabilities arm64_features[] = {
 		.sign = FTR_UNSIGNED,
 		.field_pos = ID_AA64MMFR2_EL1_CnP_SHIFT,
 		.field_width = 4,
-		.min_field_value = 1,
+		.min_field_value = ID_AA64MMFR2_EL1_CnP_IMP,
 		.cpu_enable = cpu_enable_cnp,
 	},
 #endif
@@ -2546,7 +2546,7 @@ static const struct arm64_cpu_capabilities arm64_features[] = {
 		.field_pos = ID_AA64ISAR1_EL1_SB_SHIFT,
 		.field_width = 4,
 		.sign = FTR_UNSIGNED,
-		.min_field_value = 1,
+		.min_field_value = ID_AA64ISAR1_EL1_SB_IMP,
 	},
 #ifdef CONFIG_ARM64_PTR_AUTH
 	{
@@ -2655,7 +2655,7 @@ static const struct arm64_cpu_capabilities arm64_features[] = {
 		.field_width = 4,
 		.field_pos = ID_AA64MMFR2_EL1_E0PD_SHIFT,
 		.matches = has_cpuid_feature,
-		.min_field_value = 1,
+		.min_field_value = ID_AA64MMFR2_EL1_E0PD_IMP,
 		.cpu_enable = cpu_enable_e0pd,
 	},
 #endif
@@ -2668,7 +2668,7 @@ static const struct arm64_cpu_capabilities arm64_features[] = {
 		.field_pos = ID_AA64ISAR0_EL1_RNDR_SHIFT,
 		.field_width = 4,
 		.sign = FTR_UNSIGNED,
-		.min_field_value = 1,
+		.min_field_value = ID_AA64ISAR0_EL1_RNDR_IMP,
 	},
 #ifdef CONFIG_ARM64_BTI
 	{
@@ -2722,7 +2722,7 @@ static const struct arm64_cpu_capabilities arm64_features[] = {
 		.field_pos = ID_AA64ISAR1_EL1_LRCPC_SHIFT,
 		.field_width = 4,
 		.matches = has_cpuid_feature,
-		.min_field_value = 1,
+		.min_field_value = ID_AA64ISAR1_EL1_LRCPC_IMP,
 	},
 #ifdef CONFIG_ARM64_SME
 	{
