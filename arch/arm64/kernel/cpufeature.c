@@ -2675,6 +2675,12 @@ static const struct arm64_cpu_capabilities arm64_features[] = {
 		ARM64_CPUID_FIELDS(ID_AA64ISAR2_EL1, MOPS, IMP)
 	},
 	{
+		.capability = ARM64_HAS_TCR2,
+		.type = ARM64_CPUCAP_SYSTEM_FEATURE,
+		.matches = has_cpuid_feature,
+		ARM64_CPUID_FIELDS(ID_AA64MMFR3_EL1, TCRX, IMP)
+	},
+	{
 		.desc = "Enhanced Virtualization Traps",
 		.capability = ARM64_HAS_EVT,
 		.type = ARM64_CPUCAP_SYSTEM_FEATURE,
