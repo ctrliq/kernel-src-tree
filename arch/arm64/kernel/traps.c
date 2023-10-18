@@ -940,7 +940,7 @@ void do_serror(struct pt_regs *regs, unsigned long esr)
 }
 
 /* GENERIC_BUG traps */
-
+#ifdef CONFIG_GENERIC_BUG
 int is_valid_bugaddr(unsigned long addr)
 {
 	/*
@@ -952,6 +952,7 @@ int is_valid_bugaddr(unsigned long addr)
 	 */
 	return 1;
 }
+#endif
 
 static int bug_handler(struct pt_regs *regs, unsigned long esr)
 {
