@@ -33,10 +33,33 @@ enforced by CI. You can check your changes locally with::
 
     make SPHINXOPTS="-W" html
 
-Reporting Bugs
-==============
+Reporting Kernel Bugs
+=====================
 
-Fedora bugs are only tracked in Red Hat's Bugzilla instance.  Fedora kernel bugs can be filed at https://bugzilla.redhat.com/ under Product "Fedora" and Component "kernel".  Please try to be as detailed as possible when reporting a bug.  The more detailed you are, the more likely it is that your bug will be resolved.
+Fedora bugs are only tracked in Red Hat's Bugzilla instance.  Fedora kernel
+bugs can be filed at https://bugzilla.redhat.com/ under Product "Fedora",
+Component "kernel" and specifying the Version "rawhide".  Please try to be as
+detailed as possible when reporting a bug.  The more detailed you are, the more
+likely it is that your bug will be resolved.
+
+"Rawhide" is the name given to the current development version of Fedora Linux.
+If the kernel bug you're reporting isn't against the development version, then
+select the appropriate Fedora version (e.g., 38, 39, 40, etc.) instead of
+selecting "rawhide".
+
+Reporting ARK Project Issues
+============================
+
+To report a problem with the kernel-ark project itself use the project issue
+tracker in GitLab at https://gitlab.com/cki-project/kernel-ark/-/issues and
+select the "New Issue" button.
+
+An issue could be, for example, an infrastructure issue with merge request CI
+pipelines, a bug related to the RPM Spec file, a bug in the features and
+functionality maintained in the ``redhat`` directory, or it could be used to
+propose new ideas you may have for kernel-ark. The only type of issue that
+should not be reported here are kernel bugs. As noted above, please open a
+Bugzilla to track any kernel bugs that you find.
 
 Patches
 =======
