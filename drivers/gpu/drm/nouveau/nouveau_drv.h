@@ -187,7 +187,7 @@ u_free(void *addr)
 }
 
 static inline void *
-u_memcpya(uint64_t user, unsigned int nmemb, unsigned int size)
+u_memcpya(uint64_t user, size_t nmemb, size_t size)
 {
 	void __user *userptr = u64_to_user_ptr(user);
 	size_t bytes;
