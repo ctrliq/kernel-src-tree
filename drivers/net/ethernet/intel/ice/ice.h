@@ -74,6 +74,7 @@
 #include "ice_lag.h"
 #include "ice_vsi_vlan_ops.h"
 #include "ice_gnss.h"
+#include "ice_irq.h"
 #include "ice_dpll.h"
 
 #define ICE_BAR0		0
