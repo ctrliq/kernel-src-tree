@@ -2,22 +2,17 @@
 
 # clones and updates an automotive sig repo
 # $1: branch to be used
-# $2: local pristine clone of auto-sig
-# $3: alternate tmp directory (if you have faster storage)
-# $4: kernel source tarball
-# $5: package name
+# $2: alternate tmp directory (if you have faster storage)
+# $3: kernel source tarball
+# $4: package name
 # shellcheck disable=SC2164
 
 automotive_branch=$1;
-automotive_cache=$2;
-automotive_tmp=$3;
-automotive_tarball=$4;
-package_name=$5;
-stamp_version=$6;
-pkgrelease=$7;
+automotive_tmp=$2;
+automotive_tarball=$3;
+package_name=$4;
 
 redhat=$(dirname "$0")/..;
-topdir="$redhat"/..;
 distgit="git@gitlab.com:CentOS/automotive/rpms/${package_name}"
 lookaside_url=https://git.centos.org/sources/upload_sig.cgi
 hashtype=sha512

@@ -787,7 +787,7 @@ dist-automotive-release-changed: setup-source
 	fi
 
 dist-automotive-git:
-	$(REDHAT)/scripts/automotive-dist-git.sh "$(AUTOMOTIVE_BRANCH)" "$(RHDISTGIT_CACHE)" "$(RHDISTGIT_TMP)" "$(TARBALL)" "$(PACKAGE_NAME)" "$(STAMP_VERSION)" "$(PKGRELEASE)"
+	$(REDHAT)/scripts/automotive-dist-git.sh "$(AUTOMOTIVE_BRANCH)" "$(RHDISTGIT_TMP)" "$(TARBALL)" "$(PACKAGE_NAME)"
 
 dist-automotive-git-test: export RH_DIST_GIT_TEST="1"
 dist-automotive-git-test: dist-automotive-git
