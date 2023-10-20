@@ -266,6 +266,17 @@ static inline void ptep_clear(struct mm_struct *mm, unsigned long addr,
 }
 #endif
 
+#ifndef arch_has_hw_nonleaf_pmd_young
+/*
+ * Return whether the accessed bit in non-leaf PMD entries is supported on the
+ * local CPU.
+ */
+static inline bool arch_has_hw_nonleaf_pmd_young(void)
+{
+	return IS_ENABLED(CONFIG_ARCH_HAS_NONLEAF_PMD_YOUNG);
+}
+#endif
+
 #ifndef arch_has_hw_pte_young
 /*
  * Return whether the accessed bit is supported on the local CPU.
