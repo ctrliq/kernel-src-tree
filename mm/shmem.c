@@ -1619,7 +1619,7 @@ static bool shmem_should_replace_folio(struct folio *folio, gfp_t gfp)
 	return folio_zonenum(folio) > gfp_zone(gfp);
 }
 
-static int shmem_replace_page(struct page **pagep, gfp_t gfp,
+static int shmem_replace_folio(struct folio **foliop, gfp_t gfp,
 				struct shmem_inode_info *info, pgoff_t index)
 {
 	struct folio *old, *new;
@@ -1628,7 +1628,7 @@ static int shmem_replace_page(struct page **pagep, gfp_t gfp,
 	pgoff_t swap_index;
 	int error;
 
-	old = page_folio(*pagep);
+	old = *foliop;
 	entry = folio_swap_entry(old);
 	swap_index = swp_offset(entry);
 	swap_mapping = swap_address_space(entry);
@@ -1677,7 +1677,7 @@ static int shmem_replace_page(struct page **pagep, gfp_t gfp,
 		old = new;
 	} else {
 		folio_add_lru(new);
-		*pagep = &new->page;
+		*foliop = new;
 	}
 
 	folio_clear_swapcache(old);
@@ -1783,8 +1783,7 @@ static int shmem_swapin_folio(struct inode *inode, pgoff_t index,
 	arch_swap_restore(swap, folio);
 
 	if (shmem_should_replace_folio(folio, gfp)) {
-		error = shmem_replace_page(&page, gfp, info, index);
-		folio = page_folio(page);
+		error = shmem_replace_folio(&folio, gfp, info, index);
 		if (error)
 			goto failed;
 	}
