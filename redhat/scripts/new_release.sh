@@ -5,8 +5,8 @@ if [ -s "$REDHAT/linux-kernel-test.patch" ]; then
 fi
 
 if [ "${AUTOMOTIVEBUILD}" != "" ]; then
-        AUTOMOTIVEBUILD=$(sed -n -e 's/^AUTOMOTIVEBUILD:=\.\(.*\)/\1/p' $REDHAT/../Makefile.rhelver);
-	AUTOMOTIVEBUILD="$[AUTOMOTIVEBUILD + 1]";
+        AUTOMOTIVEBUILD=$(sed -n -e 's/^AUTOMOTIVEBUILD:=\.\(.*\)/\1/p' "$REDHAT"/../Makefile.rhelver);
+	AUTOMOTIVEBUILD="$((AUTOMOTIVEBUILD + 1))";
 	sed -i -e "s/^AUTOMOTIVEBUILD:=.*$/AUTOMOTIVEBUILD:=.$AUTOMOTIVEBUILD/" "$REDHAT"/../Makefile.rhelver;
 	echo "AUTOMOTIVEBUILD set to ${AUTOMOTIVEBUILD}"
 	exit 0
