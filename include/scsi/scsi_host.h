@@ -472,6 +472,9 @@ struct scsi_host_template {
 	/* True if the host uses host-wide tagspace */
 	unsigned host_tagset:1;
 
+	/* The queuecommand callback may block. See also BLK_MQ_F_BLOCKING. */
+	RH_KABI_FILL_HOLE(unsigned queuecommand_may_block:1)
+
 	/*
 	 * Countdown for host blocking with no commands outstanding.
 	 */
@@ -687,6 +690,9 @@ struct Scsi_Host {
 
 	/* True if the host uses host-wide tagspace */
 	unsigned host_tagset:1;
+
+	/* The queuecommand callback may block. See also BLK_MQ_F_BLOCKING. */
+	RH_KABI_FILL_HOLE(unsigned queuecommand_may_block:1)
 
 	/* Host responded with short (<36 bytes) INQUIRY result */
 	unsigned short_inquiry:1;
