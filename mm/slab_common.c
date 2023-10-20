@@ -1007,7 +1007,18 @@ void kfree(const void *object)
 }
 EXPORT_SYMBOL(kfree);
 
-/* Uninstrumented ksize. Only called by KASAN. */
+/**
+ * __ksize -- Report full size of underlying allocation
+ * @object: pointer to the object
+ *
+ * This should only be used internally to query the true size of allocations.
+ * It is not meant to be a way to discover the usable size of an allocation
+ * after the fact. Instead, use kmalloc_size_roundup(). Using memory beyond
+ * the originally requested allocation size may trigger KASAN, UBSAN_BOUNDS,
+ * and/or FORTIFY_SOURCE.
+ *
+ * Return: size of the actual memory used by @object in bytes
+ */
 size_t __ksize(const void *object)
 {
 	struct folio *folio;
