@@ -697,6 +697,17 @@ rate for each task.
 scanned for a given scan.
 
 
+numa_balancing_promote_rate_limit_MBps
+======================================
+
+Too high promotion/demotion throughput between different memory types
+may hurt application latency.  This can be used to rate limit the
+promotion throughput.  The per-node max promotion throughput in MB/s
+will be limited to be no more than the set value.
+
+A rule of thumb is to set this to less than 1/10 of the PMEM node
+write bandwidth.
+
 oops_all_cpu_backtrace
 ======================
 
