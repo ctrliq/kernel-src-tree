@@ -3602,9 +3602,9 @@ static int do_open(struct nameidata *nd,
 /**
  * vfs_tmpfile - create tmpfile
  * @mnt_userns:	user namespace of the mount the inode was found from
- * @dentry:	pointer to dentry of the base directory
+ * @parentpath:	pointer to the path of the base directory
+ * @file:	file descriptor of the new tmpfile
  * @mode:	mode of the new tmpfile
- * @open_flag:	flags
  *
  * Create a temporary file.
  *
