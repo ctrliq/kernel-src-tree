@@ -40,7 +40,7 @@ function upload_sources()
 
 	[ -n "$RH_DIST_GIT_TEST" ] && return
 
-	./centos-git-common/lookaside_upload -f $automotive_tarball -n $package_name -b $automotive_branch;
+	./centos-git-common/lookaside_upload -f "$automotive_tarball" -n "$package_name" -b "$automotive_branch";
 }
 
 # Upload the tarball to the lookaside cache (not using the tools)
@@ -65,7 +65,7 @@ function update_distgit()
 {
 	# Cloning the dist-git repo
 	echo "Cloning $package_name dist-git repository";
-	git clone -b $automotive_branch $distgit $tmpdir/$package_name >/dev/null || die "Unable to clone $distgit";
+	git clone -b "$automotive_branch" "$distgit" "$tmpdir/$package_name" >/dev/null || die "Unable to clone $distgit";
 
 	# Copy all the new sources (including SPEC) except the big tarball, but use it as a reference
 	rm -f "$tmpdir/$package_name/*" &> /dev/null; # Replaces everything, git will know if a file changes
@@ -104,7 +104,7 @@ test -n "$sha" || die "Could not generate the file hash. Does $automotive_tarbal
 # Create a directory for staging dist-git changes
 date=$(date +"%Y-%m-%d");
 tmpdir="$(mktemp -d --tmpdir="$automotive_tmp" AUTOMOTIVE."$date".XXXXXXXX)";
-test -d $tmpdir || die "Unable to create temporary directory";
+test -d "$tmpdir" || die "Unable to create temporary directory";
 
 # update the dist-git repo
 update_distgit || die "Unable to update package repository.";

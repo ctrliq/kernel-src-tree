@@ -50,7 +50,7 @@ fi
 
 bzs="$rtbz $bzs"
 
-echo $bzs |
+echo "$bzs" |
 	tr ' ' '\n' |
 	sort -u |
 	tr '\n' ',' |
