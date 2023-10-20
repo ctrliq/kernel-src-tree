@@ -107,6 +107,7 @@ Todolist:
    memory-allocation
    unaligned-memory-access
    mm-api
+   genalloc
 
 Todolist:
 
@@ -114,7 +115,6 @@ Todolist:
    dma-api-howto
    dma-attributes
    dma-isa-lpc
-   genalloc
    pin_user_pages
    boot-time-mm
    gfp_mask-from-fs-io
