@@ -42,6 +42,7 @@
    kref
    assoc_array
    xarray
+   rbtree
 
 Todolist:
 
@@ -49,7 +50,6 @@ Todolist:
 
    idr
    circular-buffers
-   rbtree
    generic-radix-tree
    packing
    this_cpu_ops
