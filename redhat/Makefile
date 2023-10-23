@@ -749,7 +749,7 @@ dist-kernel-%: dist-sources
 dist-prep: RPMBUILDOPTS=--nodeps --target noarch -bp
 dist-prep: dist-sources do-rpmbuild
 
-dist-perf: RPMBUILDOPTS=--without up --without smp --without zfcpdump --without debug --without doc --without headers --without  --without doc --without debuginfo --target $(MACH) -bb
+dist-perf: RPMBUILDOPTS=--without up --without smp --without zfcpdump --without debug --without doc --without headers --without doc --without debuginfo --target $(MACH) -bb
 dist-perf: dist-sources do-rpmbuild
 
 dist-rpm-baseonly: RPMBUILDOPTS=--target $(MACH) --without debug --without debuginfo --without vdso_install --without bpftool --without perf --without tools -bb
