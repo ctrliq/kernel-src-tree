@@ -332,9 +332,9 @@ endif
 TARFILE:=linux-$(SPECTARFILE_RELEASE).tar.xz
 TARBALL:=$(REDHAT)/$(TARFILE)
 
-KABI_TARBALL:=$(SOURCES)/kernel-abi-stablelists-$(SPECKABIVERSION).tar.bz2
+KABI_TARBALL:=$(SOURCES)/kernel-abi-stablelists-$(SPECKABIVERSION).tar.xz
 KABIDW := $(REDHAT)/kabi-dwarf
-KABIDW_TARBALL:=$(SOURCES)/kernel-kabi-dw-$(SPECKABIVERSION).tar.bz2
+KABIDW_TARBALL:=$(SOURCES)/kernel-kabi-dw-$(SPECKABIVERSION).tar.xz
 
 # Taken from tools/lib/bpf/Makefile
 SPECBPFTOOLVERSION:=$(shell \
@@ -603,14 +603,14 @@ $(TARBALL):
 
 .PHONY: $(KABI_TARBALL)
 $(KABI_TARBALL):
-	@(cd kabi && tar cjf $(KABI_TARBALL) kabi-rhel$(RHEL_MAJOR)* kabi-current)
+	@(cd kabi && tar -cJf $(KABI_TARBALL) kabi-rhel$(RHEL_MAJOR)* kabi-current)
 
 .PHONY: $(KABIDW_TARBALL)
 $(KABIDW_TARBALL):
 	@if [ ! -d $(KABIDW)/base ]; then \
 		mkdir -p $(KABIDW)/base; \
 	fi
-	@(cd kabi-dwarf && tar cjf $(KABIDW_TARBALL) base run_kabi-dw.sh)
+	@(cd kabi-dwarf && tar -cJf $(KABIDW_TARBALL) base run_kabi-dw.sh)
 
 dist-git-version-check:
 	@# genspec.sh uses pathspec magic that wasn't introduced until version 2.13
@@ -716,11 +716,11 @@ sources-rh: $(TARBALL) generate-testpatch-tmp setup-source dist-configs-check
 		cp kabi/Module.kabi_$$KABIARCH $(SOURCES)/; \
 		cp kabi/Module.kabi_dup_$$KABIARCH $(SOURCES)/; \
 	done
-	@(cd kabi && tar cjf $(KABI_TARBALL) kabi-rhel$(RHEL_MAJOR)* kabi-current)
+	@(cd kabi && tar -cJf $(KABI_TARBALL) kabi-rhel$(RHEL_MAJOR)* kabi-current)
 	@if [ ! -d $(KABIDW)/base ]; then \
 		mkdir -p $(KABIDW)/base; \
 	fi
-	@(cd kabi-dwarf && tar cjf $(KABIDW_TARBALL) base run_kabi-dw.sh)
+	@(cd kabi-dwarf && tar -cJf $(KABIDW_TARBALL) base run_kabi-dw.sh)
 
 dist-sources: dist-kabi dist-kabi-dup sources-rh
 
