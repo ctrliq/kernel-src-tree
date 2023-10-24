@@ -6,3 +6,4 @@
 
 amd-pmc-y			:= pmc.o
 obj-$(CONFIG_AMD_PMC)		+= amd-pmc.o
+obj-$(CONFIG_AMD_PMF)		+= pmf/
