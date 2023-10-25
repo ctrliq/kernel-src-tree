@@ -94,10 +94,11 @@ static void __dump_page(struct page *page)
 			page, page_ref_count(head), mapcount, mapping,
 			page_to_pgoff(page), page_to_pfn(page));
 	if (compound) {
-		pr_warn("head:%p order:%u compound_mapcount:%d compound_pincount:%d\n",
+		pr_warn("head:%p order:%u compound_mapcount:%d nr_pages_mapped:%d pincount:%d\n",
 				head, compound_order(head),
-				folio_entire_mapcount(folio),
-				head_compound_pincount(head));
+				head_compound_mapcount(head),
+				folio_nr_pages_mapped(folio),
+				atomic_read(&folio->_pincount));
 	}
 
 #ifdef CONFIG_MEMCG

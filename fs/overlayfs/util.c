@@ -10,6 +10,7 @@
 #include <linux/cred.h>
 #include <linux/xattr.h>
 #include <linux/exportfs.h>
+#include <linux/fileattr.h>
 #include <linux/uuid.h>
 #include <linux/namei.h>
 #include <linux/ratelimit.h>
@@ -187,6 +188,20 @@ enum ovl_path_type ovl_path_real(struct dentry *dentry, struct path *path)
 
 	if (!OVL_TYPE_UPPER(type))
 		ovl_path_lower(dentry, path);
+	else
+		ovl_path_upper(dentry, path);
+
+	return type;
+}
+
+enum ovl_path_type ovl_path_realdata(struct dentry *dentry, struct path *path)
+{
+	enum ovl_path_type type = ovl_path_type(dentry);
+
+	WARN_ON_ONCE(d_is_dir(dentry));
+
+	if (!OVL_TYPE_UPPER(type) || OVL_TYPE_MERGE(type))
+		ovl_path_lowerdata(dentry, path);
 	else
 		ovl_path_upper(dentry, path);
 
@@ -462,7 +477,7 @@ bool ovl_is_whiteout(struct dentry *dentry)
 	return inode && IS_WHITEOUT(inode);
 }
 
-struct file *ovl_path_open(struct path *path, int flags)
+struct file *ovl_path_open(const struct path *path, int flags)
 {
 	struct inode *inode = d_inode(path->dentry);
 	int err, acc_mode;
@@ -549,11 +564,11 @@ void ovl_copy_up_end(struct dentry *dentry)
 	ovl_inode_unlock(d_inode(dentry));
 }
 
-bool ovl_check_origin_xattr(struct ovl_fs *ofs, struct dentry *dentry)
+bool ovl_path_check_origin_xattr(struct ovl_fs *ofs, const struct path *path)
 {
 	int res;
 
-	res = ovl_do_getxattr(ofs, dentry, OVL_XATTR_ORIGIN, NULL, 0);
+	res = ovl_path_getxattr(ofs, path, OVL_XATTR_ORIGIN, NULL, 0);
 
 	/* Zero size value means "copied up but origin unknown" */
 	if (res >= 0)
@@ -562,16 +577,16 @@ bool ovl_check_origin_xattr(struct ovl_fs *ofs, struct dentry *dentry)
 	return false;
 }
 
-bool ovl_check_dir_xattr(struct super_block *sb, struct dentry *dentry,
-			 enum ovl_xattr ox)
+bool ovl_path_check_dir_xattr(struct ovl_fs *ofs, const struct path *path,
+			       enum ovl_xattr ox)
 {
 	int res;
 	char val;
 
-	if (!d_is_dir(dentry))
+	if (!d_is_dir(path->dentry))
 		return false;
 
-	res = ovl_do_getxattr(OVL_FS(sb), dentry, ox, &val, 1);
+	res = ovl_path_getxattr(ofs, path, ox, &val, 1);
 	if (res == 1 && val == 'y')
 		return true;
 
@@ -585,6 +600,7 @@ bool ovl_check_dir_xattr(struct super_block *sb, struct dentry *dentry,
 #define OVL_XATTR_NLINK_POSTFIX		"nlink"
 #define OVL_XATTR_UPPER_POSTFIX		"upper"
 #define OVL_XATTR_METACOPY_POSTFIX	"metacopy"
+#define OVL_XATTR_PROTATTR_POSTFIX	"protattr"
 
 #define OVL_XATTR_TAB_ENTRY(x) \
 	[x] = { [false] = OVL_XATTR_TRUSTED_PREFIX x ## _POSTFIX, \
@@ -598,19 +614,19 @@ const char *const ovl_xattr_table[][2] = {
 	OVL_XATTR_TAB_ENTRY(OVL_XATTR_NLINK),
 	OVL_XATTR_TAB_ENTRY(OVL_XATTR_UPPER),
 	OVL_XATTR_TAB_ENTRY(OVL_XATTR_METACOPY),
+	OVL_XATTR_TAB_ENTRY(OVL_XATTR_PROTATTR),
 };
 
-int ovl_check_setxattr(struct dentry *dentry, struct dentry *upperdentry,
+int ovl_check_setxattr(struct ovl_fs *ofs, struct dentry *upperdentry,
 		       enum ovl_xattr ox, const void *value, size_t size,
 		       int xerr)
 {
 	int err;
-	struct ovl_fs *ofs = dentry->d_sb->s_fs_info;
 
 	if (ofs->noxattr)
 		return xerr;
 
-	err = ovl_do_setxattr(ofs, upperdentry, ox, value, size);
+	err = ovl_setxattr(ofs, upperdentry, ox, value, size);
 
 	if (err == -EOPNOTSUPP) {
 		pr_warn("cannot set %s xattr on upper\n", ovl_xattr(ofs, ox));
@@ -623,6 +639,7 @@ int ovl_check_setxattr(struct dentry *dentry, struct dentry *upperdentry,
 
 int ovl_set_impure(struct dentry *dentry, struct dentry *upperdentry)
 {
+	struct ovl_fs *ofs = OVL_FS(dentry->d_sb);
 	int err;
 
 	if (ovl_test_flag(OVL_IMPURE, d_inode(dentry)))
@@ -632,12 +649,93 @@ int ovl_set_impure(struct dentry *dentry, struct dentry *upperdentry)
 	 * Do not fail when upper doesn't support xattrs.
 	 * Upper inodes won't have origin nor redirect xattr anyway.
 	 */
-	err = ovl_check_setxattr(dentry, upperdentry, OVL_XATTR_IMPURE,
-				 "y", 1, 0);
+	err = ovl_check_setxattr(ofs, upperdentry, OVL_XATTR_IMPURE, "y", 1, 0);
 	if (!err)
 		ovl_set_flag(OVL_IMPURE, d_inode(dentry));
 
 	return err;
+}
+
+
+#define OVL_PROTATTR_MAX 32 /* Reserved for future flags */
+
+void ovl_check_protattr(struct inode *inode, struct dentry *upper)
+{
+	struct ovl_fs *ofs = OVL_FS(inode->i_sb);
+	u32 iflags = inode->i_flags & OVL_PROT_I_FLAGS_MASK;
+	char buf[OVL_PROTATTR_MAX+1];
+	int res, n;
+
+	res = ovl_getxattr_upper(ofs, upper, OVL_XATTR_PROTATTR, buf,
+				 OVL_PROTATTR_MAX);
+	if (res < 0)
+		return;
+
+	/*
+	 * Initialize inode flags from overlay.protattr xattr and upper inode
+	 * flags.  If upper inode has those fileattr flags set (i.e. from old
+	 * kernel), we do not clear them on ovl_get_inode(), but we will clear
+	 * them on next fileattr_set().
+	 */
+	for (n = 0; n < res; n++) {
+		if (buf[n] == 'a')
+			iflags |= S_APPEND;
+		else if (buf[n] == 'i')
+			iflags |= S_IMMUTABLE;
+		else
+			break;
+	}
+
+	if (!res || n < res) {
+		pr_warn_ratelimited("incompatible overlay.protattr format (%pd2, len=%d)\n",
+				    upper, res);
+	} else {
+		inode_set_flags(inode, iflags, OVL_PROT_I_FLAGS_MASK);
+	}
+}
+
+int ovl_set_protattr(struct inode *inode, struct dentry *upper,
+		      struct fileattr *fa)
+{
+	struct ovl_fs *ofs = OVL_FS(inode->i_sb);
+	char buf[OVL_PROTATTR_MAX];
+	int len = 0, err = 0;
+	u32 iflags = 0;
+
+	BUILD_BUG_ON(HWEIGHT32(OVL_PROT_FS_FLAGS_MASK) > OVL_PROTATTR_MAX);
+
+	if (fa->flags & FS_APPEND_FL) {
+		buf[len++] = 'a';
+		iflags |= S_APPEND;
+	}
+	if (fa->flags & FS_IMMUTABLE_FL) {
+		buf[len++] = 'i';
+		iflags |= S_IMMUTABLE;
+	}
+
+	/*
+	 * Do not allow to set protection flags when upper doesn't support
+	 * xattrs, because we do not set those fileattr flags on upper inode.
+	 * Remove xattr if it exist and all protection flags are cleared.
+	 */
+	if (len) {
+		err = ovl_check_setxattr(ofs, upper, OVL_XATTR_PROTATTR,
+					 buf, len, -EPERM);
+	} else if (inode->i_flags & OVL_PROT_I_FLAGS_MASK) {
+		err = ovl_removexattr(ofs, upper, OVL_XATTR_PROTATTR);
+		if (err == -EOPNOTSUPP || err == -ENODATA)
+			err = 0;
+	}
+	if (err)
+		return err;
+
+	inode_set_flags(inode, iflags, OVL_PROT_I_FLAGS_MASK);
+
+	/* Mask out the fileattr flags that should not be set in upper inode */
+	fa->flags &= ~OVL_PROT_FS_FLAGS_MASK;
+	fa->fsx_xflags &= ~OVL_PROT_FSX_FLAGS_MASK;
+
+	return 0;
 }
 
 /**
@@ -750,7 +848,7 @@ static void ovl_cleanup_index(struct dentry *dentry)
 					       dir, index);
 	} else {
 		/* Cleanup orphan index entries */
-		err = ovl_cleanup(dir, index);
+		err = ovl_cleanup(ofs, dir, index);
 	}
 
 	inode_unlock(dir);
@@ -859,15 +957,15 @@ err:
 }
 
 /* err < 0, 0 if no metacopy xattr, 1 if metacopy xattr found */
-int ovl_check_metacopy_xattr(struct ovl_fs *ofs, struct dentry *dentry)
+int ovl_check_metacopy_xattr(struct ovl_fs *ofs, const struct path *path)
 {
 	int res;
 
 	/* Only regular files can have metacopy xattr */
-	if (!S_ISREG(d_inode(dentry)->i_mode))
+	if (!S_ISREG(d_inode(path->dentry)->i_mode))
 		return 0;
 
-	res = ovl_do_getxattr(ofs, dentry, OVL_XATTR_METACOPY, NULL, 0);
+	res = ovl_path_getxattr(ofs, path, OVL_XATTR_METACOPY, NULL, 0);
 	if (res < 0) {
 		if (res == -ENODATA || res == -EOPNOTSUPP)
 			return 0;
@@ -903,13 +1001,12 @@ bool ovl_is_metacopy_dentry(struct dentry *dentry)
 	return (oe->numlower > 1);
 }
 
-char *ovl_get_redirect_xattr(struct ovl_fs *ofs, struct dentry *dentry,
-			     int padding)
+char *ovl_get_redirect_xattr(struct ovl_fs *ofs, const struct path *path, int padding)
 {
 	int res;
 	char *s, *next, *buf = NULL;
 
-	res = ovl_do_getxattr(ofs, dentry, OVL_XATTR_REDIRECT, NULL, 0);
+	res = ovl_path_getxattr(ofs, path, OVL_XATTR_REDIRECT, NULL, 0);
 	if (res == -ENODATA || res == -EOPNOTSUPP)
 		return NULL;
 	if (res < 0)
@@ -921,7 +1018,7 @@ char *ovl_get_redirect_xattr(struct ovl_fs *ofs, struct dentry *dentry,
 	if (!buf)
 		return ERR_PTR(-ENOMEM);
 
-	res = ovl_do_getxattr(ofs, dentry, OVL_XATTR_REDIRECT, buf, res);
+	res = ovl_path_getxattr(ofs, path, OVL_XATTR_REDIRECT, buf, res);
 	if (res < 0)
 		goto fail;
 	if (res == 0)

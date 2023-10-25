@@ -239,7 +239,7 @@ bool truncate_inode_partial_folio(struct folio *folio, loff_t start, loff_t end)
 		folio_invalidate(folio, offset, length);
 	if (!folio_test_large(folio))
 		return true;
-	if (split_huge_page(&folio->page) == 0)
+	if (split_folio(folio) == 0)
 		return true;
 	if (folio_test_dirty(folio))
 		return false;
@@ -572,7 +572,7 @@ EXPORT_SYMBOL(invalidate_mapping_pages);
  * refcount.  We do this because invalidate_inode_pages2() needs stronger
  * invalidation guarantees, and cannot afford to leave pages behind because
  * shrink_page_list() has a temp ref on them, or because they're transiently
- * sitting in the lru_cache_add() pagevecs.
+ * sitting in the folio_add_lru() pagevecs.
  */
 static int invalidate_complete_folio2(struct address_space *mapping,
 					struct folio *folio)
