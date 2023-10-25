@@ -513,10 +513,11 @@ static int queue_pages_pte_range(pmd_t *pmd, unsigned long addr,
 	if (ptl)
 		return queue_pages_pmd(pmd, ptl, addr, end, walk);
 
-	if (pmd_trans_unstable(pmd))
-		return 0;
-
 	mapped_pte = pte = pte_offset_map_lock(walk->mm, pmd, addr, &ptl);
+	if (!pte) {
+		walk->action = ACTION_AGAIN;
+		return 0;
+	}
 	for (; addr != end; pte++, addr += PAGE_SIZE) {
 		if (!pte_present(*pte))
 			continue;
@@ -1261,7 +1262,7 @@ static long do_mbind(unsigned long start, unsigned long len,
 	if (mode == MPOL_DEFAULT)
 		flags &= ~MPOL_MF_STRICT;
 
-	len = (len + PAGE_SIZE - 1) & PAGE_MASK;
+	len = PAGE_ALIGN(len);
 	end = start + len;
 
 	if (end < start)
@@ -1497,7 +1498,7 @@ SYSCALL_DEFINE4(set_mempolicy_home_node, unsigned long, start, unsigned long, le
 	if (home_node >= MAX_NUMNODES || !node_online(home_node))
 		return -EINVAL;
 
-	len = (len + PAGE_SIZE - 1) & PAGE_MASK;
+	len = PAGE_ALIGN(len);
 	end = start + len;
 
 	if (end < start)

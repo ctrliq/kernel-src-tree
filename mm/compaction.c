@@ -52,8 +52,6 @@ static inline void count_compact_events(enum vm_event_item item, long delta)
 
 #define block_start_pfn(pfn, order)	round_down(pfn, 1UL << (order))
 #define block_end_pfn(pfn, order)	ALIGN((pfn) + 1, 1UL << (order))
-#define pageblock_start_pfn(pfn)	block_start_pfn(pfn, pageblock_order)
-#define pageblock_end_pfn(pfn)		block_end_pfn(pfn, pageblock_order)
 
 /*
  * Page order with-respect-to which proactive compaction
@@ -395,16 +393,12 @@ void reset_isolation_suitable(pg_data_t *pgdat)
  * Sets the pageblock skip bit if it was clear. Note that this is a hint as
  * locks are not required for read/writers. Returns true if it was already set.
  */
-static bool test_and_set_skip(struct compact_control *cc, struct page *page,
-							unsigned long pfn)
+static bool test_and_set_skip(struct compact_control *cc, struct page *page)
 {
 	bool skip;
 
-	/* Do no update if skip hint is being ignored */
+	/* Do not update if skip hint is being ignored */
 	if (cc->ignore_skip_hint)
-		return false;
-
-	if (!IS_ALIGNED(pfn, pageblock_nr_pages))
 		return false;
 
 	skip = get_pageblock_skip(page);
@@ -473,8 +467,7 @@ static void update_cached_migrate(struct compact_control *cc, unsigned long pfn)
 {
 }
 
-static bool test_and_set_skip(struct compact_control *cc, struct page *page,
-							unsigned long pfn)
+static bool test_and_set_skip(struct compact_control *cc, struct page *page)
 {
 	return false;
 }
@@ -882,11 +875,12 @@ isolate_migratepages_block(struct compact_control *cc, unsigned long low_pfn,
 
 		/*
 		 * Check if the pageblock has already been marked skipped.
-		 * Only the aligned PFN is checked as the caller isolates
+		 * Only the first PFN is checked as the caller isolates
 		 * COMPACT_CLUSTER_MAX at a time so the second call must
 		 * not falsely conclude that the block should be skipped.
 		 */
-		if (!valid_page && IS_ALIGNED(low_pfn, pageblock_nr_pages)) {
+		if (!valid_page && (pageblock_aligned(low_pfn) ||
+				    low_pfn == cc->zone->zone_start_pfn)) {
 			if (!isolation_suitable(cc, page)) {
 				low_pfn = end_pfn;
 				page = NULL;
@@ -1066,11 +1060,17 @@ isolate_migratepages_block(struct compact_control *cc, unsigned long low_pfn,
 
 			lruvec_memcg_debug(lruvec, page_folio(page));
 
-			/* Try get exclusive access under lock */
-			if (!skip_updated) {
+			/*
+			 * Try get exclusive access under lock. If marked for
+			 * skip, the scan is aborted unless the current context
+			 * is a rescan to reach the end of the pageblock.
+			 */
+			if (!skip_updated && valid_page) {
 				skip_updated = true;
-				if (test_and_set_skip(cc, page, low_pfn))
+				if (test_and_set_skip(cc, valid_page) &&
+				    !cc->finish_pageblock) {
 					goto isolate_abort;
+				}
 			}
 
 			/*
@@ -1848,7 +1848,6 @@ static unsigned long fast_find_migrateblock(struct compact_control *cc)
 					pfn = cc->zone->zone_start_pfn;
 				cc->fast_search_fail = 0;
 				found_block = true;
-				set_pageblock_skip(freepage);
 				break;
 			}
 		}
@@ -1934,7 +1933,8 @@ static isolate_migrate_t isolate_migratepages(struct compact_control *cc)
 		 * before making it "skip" so other compaction instances do
 		 * not scan the same block.
 		 */
-		if (IS_ALIGNED(low_pfn, pageblock_nr_pages) &&
+		if ((pageblock_aligned(low_pfn) ||
+		     low_pfn == cc->zone->zone_start_pfn) &&
 		    !fast_find_block && !isolation_suitable(cc, page))
 			continue;
 
@@ -1976,9 +1976,21 @@ static inline bool is_via_compact_memory(int order)
 	return order == -1;
 }
 
+/*
+ * Determine whether kswapd is (or recently was!) running on this node.
+ *
+ * pgdat_kswapd_lock() pins pgdat->kswapd, so a concurrent kswapd_stop() can't
+ * zero it.
+ */
 static bool kswapd_is_running(pg_data_t *pgdat)
 {
-	return pgdat->kswapd && task_is_running(pgdat->kswapd);
+	bool running;
+
+	pgdat_kswapd_lock(pgdat);
+	running = pgdat->kswapd && task_is_running(pgdat->kswapd);
+	pgdat_kswapd_unlock(pgdat);
+
+	return running;
 }
 
 /*
@@ -2108,7 +2120,7 @@ static enum compact_result __compact_finished(struct compact_control *cc)
 	 * migration source is unmovable/reclaimable but it's not worth
 	 * special casing.
 	 */
-	if (!IS_ALIGNED(cc->migrate_pfn, pageblock_nr_pages))
+	if (!pageblock_aligned(cc->migrate_pfn))
 		return COMPACT_CONTINUE;
 
 	/* Direct compactor: Is a suitable page free? */
@@ -2429,7 +2441,8 @@ rescan:
 			}
 			/*
 			 * If an ASYNC or SYNC_LIGHT fails to migrate a page
-			 * within the current order-aligned block, scan the
+			 * within the current order-aligned block and
+			 * fast_find_migrateblock may be used then scan the
 			 * remainder of the pageblock. This will mark the
 			 * pageblock "skip" to avoid rescanning in the near
 			 * future. This will isolate more pages than necessary
@@ -2437,8 +2450,9 @@ rescan:
 			 * fast_find_migrateblock revisiting blocks that were
 			 * recently partially scanned.
 			 */
-			if (cc->direct_compaction && !cc->finish_pageblock &&
-						(cc->mode < MIGRATE_SYNC)) {
+			if (!pageblock_aligned(cc->migrate_pfn) &&
+			    !cc->ignore_skip_hint && !cc->finish_pageblock &&
+			    (cc->mode < MIGRATE_SYNC)) {
 				cc->finish_pageblock = true;
 
 				/*
