@@ -15,6 +15,8 @@ obj-$(CONFIG_INTEL_UNCORE_FREQ_CONTROL)	+= uncore-frequency/
 
 # Intel miscellaneous drivers
 obj-$(CONFIG_INTEL_ISHTP_ECLITE)	+= ishtp_eclite.o
+intel_p2sb-y				:= p2sb.o
+obj-$(CONFIG_P2SB)			+= intel_p2sb.o
 intel_sdsi-y				:= sdsi.o
 obj-$(CONFIG_INTEL_SDSI)		+= intel_sdsi.o
 intel_vsec-y				:= vsec.o
