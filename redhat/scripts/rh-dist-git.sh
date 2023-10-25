@@ -41,8 +41,8 @@ echo "Unpacking from SRPM"
 
 # upload tarballs
 sed -i "/linux-.*.tar.xz/d" "$tmpdir/$SPECPACKAGE_NAME"/{sources,.gitignore};
-sed -i "/kernel-abi-stablelists.*.tar.bz2/d" "$tmpdir/$SPECPACKAGE_NAME"/{sources,.gitignore};
-sed -i "/kernel-kabi-dw-.*.tar.bz2/d" "$tmpdir/$SPECPACKAGE_NAME"/{sources,.gitignore};
+sed -i "/kernel-abi-stablelists.*.tar.xz/d" "$tmpdir/$SPECPACKAGE_NAME"/{sources,.gitignore};
+sed -i "/kernel-kabi-dw-.*.tar.xz/d" "$tmpdir/$SPECPACKAGE_NAME"/{sources,.gitignore};
 upload_list="$TARBALL $KABI_TARBALL $KABIDW_TARBALL"
 
 echo "Uploading new tarballs: $upload_list"
