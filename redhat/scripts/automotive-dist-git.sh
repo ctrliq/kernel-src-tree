@@ -98,7 +98,7 @@ function create_changelog()
 	sed -i "/^Resolves: /d" "$tmpdir"/changelog;
 }
 
-sha=$("${hashtype}"sum "$automotive_tarball" | awk "{ print $1 }")
+sha=$("${hashtype}"sum "$automotive_tarball" | awk "{ print \$1 }")
 test -n "$sha" || die "Could not generate the file hash. Does $automotive_tarball exist?"
 
 # Create a directory for staging dist-git changes
