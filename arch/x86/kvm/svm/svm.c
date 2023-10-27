@@ -3827,13 +3827,13 @@ static void svm_flush_tlb_all(struct kvm_vcpu *vcpu)
 {
 	/*
 	 * When running on Hyper-V with EnlightenedNptTlb enabled, remote TLB
-	 * flushes should be routed to hv_remote_flush_tlb() without requesting
+	 * flushes should be routed to hv_flush_remote_tlbs() without requesting
 	 * a "regular" remote flush.  Reaching this point means either there's
-	 * a KVM bug or a prior hv_remote_flush_tlb() call failed, both of
+	 * a KVM bug or a prior hv_flush_remote_tlbs() call failed, both of
 	 * which might be fatal to the guest.  Yell, but try to recover.
 	 */
 	if (WARN_ON_ONCE(svm_hv_is_enlightened_tlb_enabled(vcpu)))
-		hv_remote_flush_tlb(vcpu->kvm);
+		hv_flush_remote_tlbs(vcpu->kvm);
 
 	svm_flush_tlb_asid(vcpu);
 }
