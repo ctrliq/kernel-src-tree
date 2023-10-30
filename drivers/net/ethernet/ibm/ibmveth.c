@@ -203,7 +203,7 @@ static inline void ibmveth_flush_buffer(void *addr, unsigned long length)
 	unsigned long offset;
 
 	for (offset = 0; offset < length; offset += SMP_CACHE_BYTES)
-		asm("dcbfl %0,%1" :: "b" (addr), "r" (offset));
+		asm("dcbf %0,%1,1" :: "b" (addr), "r" (offset));
 }
 
 /* replenish the buffers for a pool.  note that we don't need to
@@ -522,17 +522,6 @@ retry:
 	return rc;
 }
 
-static u64 ibmveth_encode_mac_addr(u8 *mac)
-{
-	int i;
-	u64 encoded = 0;
-
-	for (i = 0; i < ETH_ALEN; i++)
-		encoded = (encoded << 8) | mac[i];
-
-	return encoded;
-}
-
 static int ibmveth_open(struct net_device *netdev)
 {
 	struct ibmveth_adapter *adapter = netdev_priv(netdev);
@@ -597,7 +586,7 @@ static int ibmveth_open(struct net_device *netdev)
 	adapter->rx_queue.num_slots = rxq_entries;
 	adapter->rx_queue.toggle = 1;
 
-	mac_address = ibmveth_encode_mac_addr(netdev->dev_addr);
+	mac_address = ether_addr_to_u64(netdev->dev_addr);
 
 	rxq_desc.fields.flags_len = IBMVETH_BUF_VALID |
 					adapter->rx_queue.queue_len;
@@ -1319,24 +1308,23 @@ static void ibmveth_rx_csum_helper(struct sk_buff *skb,
 	 * the user space for finding a flow. During this process, OVS computes
 	 * checksum on the first packet when CHECKSUM_PARTIAL flag is set.
 	 *
-	 * So, re-compute TCP pseudo header checksum when configured for
-	 * trunk mode.
+	 * So, re-compute TCP pseudo header checksum.
 	 */
+
 	if (iph_proto == IPPROTO_TCP) {
 		struct tcphdr *tcph = (struct tcphdr *)(skb->data + iphlen);
+
 		if (tcph->check == 0x0000) {
 			/* Recompute TCP pseudo header checksum  */
-			if (adapter->is_active_trunk) {
-				tcphdrlen = skb->len - iphlen;
-				if (skb_proto == ETH_P_IP)
-					tcph->check =
-					 ~csum_tcpudp_magic(iph->saddr,
-					iph->daddr, tcphdrlen, iph_proto, 0);
-				else if (skb_proto == ETH_P_IPV6)
-					tcph->check =
-					 ~csum_ipv6_magic(&iph6->saddr,
-					&iph6->daddr, tcphdrlen, iph_proto, 0);
-			}
+			tcphdrlen = skb->len - iphlen;
+			if (skb_proto == ETH_P_IP)
+				tcph->check =
+				 ~csum_tcpudp_magic(iph->saddr,
+				iph->daddr, tcphdrlen, iph_proto, 0);
+			else if (skb_proto == ETH_P_IPV6)
+				tcph->check =
+				 ~csum_ipv6_magic(&iph6->saddr,
+				&iph6->daddr, tcphdrlen, iph_proto, 0);
 			/* Setup SKB fields for checksum offload */
 			skb_partial_csum_set(skb, iphlen,
 					     offsetof(struct tcphdr, check));
@@ -1505,7 +1493,7 @@ static void ibmveth_set_multicast_list(struct net_device *netdev)
 		netdev_for_each_mc_addr(ha, netdev) {
 			/* add the multicast address to the filter table */
 			u64 mcast_addr;
-			mcast_addr = ibmveth_encode_mac_addr(ha->addr);
+			mcast_addr = ether_addr_to_u64(ha->addr);
 			lpar_rc = h_multicast_ctrl(adapter->vdev->unit_address,
 						   IbmVethMcastAddFilter,
 						   mcast_addr);
@@ -1637,7 +1625,7 @@ static int ibmveth_set_mac_addr(struct net_device *dev, void *p)
 	if (!is_valid_ether_addr(addr->sa_data))
 		return -EADDRNOTAVAIL;
 
-	mac_address = ibmveth_encode_mac_addr(addr->sa_data);
+	mac_address = ether_addr_to_u64(addr->sa_data);
 	rc = h_change_logical_lan_mac(adapter->vdev->unit_address, mac_address);
 	if (rc) {
 		netdev_err(adapter->netdev, "h_change_logical_lan_mac failed with rc=%d\n", rc);
@@ -1943,6 +1931,7 @@ static struct attribute *veth_pool_attrs[] = {
 	&veth_size_attr,
 	NULL,
 };
+ATTRIBUTE_GROUPS(veth_pool);
 
 static const struct sysfs_ops veth_pool_ops = {
 	.show   = veth_pool_show,
@@ -1952,7 +1941,7 @@ static const struct sysfs_ops veth_pool_ops = {
 static struct kobj_type ktype_veth_pool = {
 	.release        = NULL,
 	.sysfs_ops      = &veth_pool_ops,
-	.default_attrs  = veth_pool_attrs,
+	.default_groups = veth_pool_groups,
 };
 
 static int ibmveth_resume(struct device *dev)
