@@ -67,6 +67,9 @@ old_head="$(git rev-parse HEAD)"
 make FLAVOR=rhel dist-configs-commit
 new_head="$(git rev-parse HEAD)"
 
+# check for config mismatches after setting configs in the commit step above
+make dist-configs-check || die "Config mismatch detected"
+
 # Converts each new pending config from above into its finalized git
 # configs/<date>/<config> branch.  These commits are used for Merge
 # Requests.
