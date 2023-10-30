@@ -16,6 +16,11 @@ logger = logging.getLogger("hidtools.test.apple-keyboard")
 
 KERNEL_MODULE = ("apple", "hid-apple")
 
+# RHEL 9 only:
+# we are hitting an alias that libevdev in RHEL 9 doesn't know
+# how to process
+libevdev.EV_KEY.KEY_ALL_APPLICATIONS = libevdev.EV_KEY.KEY_DASHBOARD
+
 
 class KbdData(object):
     pass
