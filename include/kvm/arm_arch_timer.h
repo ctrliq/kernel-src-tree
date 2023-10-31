@@ -84,6 +84,8 @@ struct timer_map {
 	struct arch_timer_context *emul_ptimer;
 };
 
+void get_timer_map(struct kvm_vcpu *vcpu, struct timer_map *map);
+
 struct arch_timer_cpu {
 	struct arch_timer_context timers[NR_KVM_TIMERS];
 
@@ -146,5 +148,10 @@ u64 timer_get_cval(struct arch_timer_context *ctxt);
 /* CPU HP callbacks */
 void kvm_timer_cpu_up(void);
 void kvm_timer_cpu_down(void);
+
+static inline bool has_cntpoff(void)
+{
+	return (has_vhe() && cpus_have_final_cap(ARM64_HAS_ECV_CNTPOFF));
+}
 
 #endif
