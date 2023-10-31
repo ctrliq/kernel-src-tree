@@ -77,6 +77,9 @@ static struct ieee80211_channel rtw89_channels_5ghz[] = {
 	RTW89_DEF_CHAN_5G(5785, 157),
 	RTW89_DEF_CHAN_5G(5805, 161),
 	RTW89_DEF_CHAN_5G_NO_HT40MINUS(5825, 165),
+	RTW89_DEF_CHAN_5G(5845, 169),
+	RTW89_DEF_CHAN_5G(5865, 173),
+	RTW89_DEF_CHAN_5G(5885, 177),
 };
 
 static struct ieee80211_channel rtw89_channels_6ghz[] = {
@@ -3760,7 +3763,12 @@ static int rtw89_core_register_hw(struct rtw89_dev *rtwdev)
 		return ret;
 	}
 
-	hw->wiphy->reg_notifier = rtw89_regd_notifier;
+	ret = rtw89_regd_setup(rtwdev);
+	if (ret) {
+		rtw89_err(rtwdev, "failed to set up regd\n");
+		goto err_free_supported_band;
+	}
+
 	hw->wiphy->sar_capa = &rtw89_sar_capa;
 
 	ret = ieee80211_register_hw(hw);
