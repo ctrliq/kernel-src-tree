@@ -451,7 +451,7 @@ static struct i2c_driver tfp410_i2c_driver = {
 		.of_match_table = tfp410_match,
 	},
 	.id_table	= tfp410_i2c_ids,
-	.probe		= tfp410_i2c_probe,
+	.probe_new	= tfp410_i2c_probe,
 	.remove		= tfp410_i2c_remove,
 };
 #endif /* IS_ENABLED(CONFIG_I2C) */
