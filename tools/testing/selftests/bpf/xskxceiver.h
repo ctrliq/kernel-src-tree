@@ -89,6 +89,7 @@ enum test_type {
 	TEST_TYPE_STATS_FILL_EMPTY,
 	TEST_TYPE_BPF_RES,
 	TEST_TYPE_XDP_DROP_HALF,
+	TEST_TYPE_XDP_METADATA_COUNT,
 	TEST_TYPE_MAX
 };
 
@@ -159,6 +160,7 @@ struct ifobject {
 	bool use_fill_ring;
 	bool release_rx;
 	bool shared_umem;
+	bool use_metadata;
 	u8 dst_mac[ETH_ALEN];
 	u8 src_mac[ETH_ALEN];
 };
