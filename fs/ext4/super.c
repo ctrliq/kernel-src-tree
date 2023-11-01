@@ -1094,8 +1094,9 @@ static struct bdev_handle *ext4_blkdev_get(dev_t dev, struct super_block *sb)
 {
 	struct bdev_handle *bdev_handle;
 
-	bdev_handle = bdev_open_by_dev(dev, BLK_OPEN_READ | BLK_OPEN_WRITE,
-				       sb, &fs_holder_ops);
+	bdev_handle = bdev_open_by_dev(dev,
+		BLK_OPEN_READ | BLK_OPEN_WRITE | BLK_OPEN_RESTRICT_WRITES,
+		sb, &fs_holder_ops);
 	if (IS_ERR(bdev_handle))
 		goto fail;
 	return bdev_handle;
