@@ -155,6 +155,8 @@ static __cold void io_fallback_tw(struct io_uring_task *tctx);
 static struct kmem_cache *req_cachep;
 
 static int __read_mostly sysctl_io_uring_disabled = 2;
+static int __read_mostly sysctl_io_uring_group = -1;
+
 #ifdef CONFIG_SYSCTL
 static struct ctl_table kernel_io_uring_disabled_table[] = {
 	{
@@ -165,6 +167,13 @@ static struct ctl_table kernel_io_uring_disabled_table[] = {
 		.proc_handler	= proc_dointvec_minmax,
 		.extra1		= SYSCTL_ZERO,
 		.extra2		= SYSCTL_TWO,
+	},
+	{
+		.procname	= "io_uring_group",
+		.data		= &sysctl_io_uring_group,
+		.maxlen		= sizeof(gid_t),
+		.mode		= 0644,
+		.proc_handler	= proc_dointvec,
 	},
 	{},
 };
@@ -3778,17 +3787,25 @@ static long io_uring_setup(u32 entries, struct io_uring_params __user *params)
 static inline bool io_uring_allowed(void)
 {
 	int disabled = READ_ONCE(sysctl_io_uring_disabled);
+	kgid_t io_uring_group;
 	static bool printed = false;
 
-	if (disabled == 0 || (disabled == 1 && capable(CAP_SYS_ADMIN))) {
-		if (!printed) {
-			mark_tech_preview("io_uring", NULL);
-			printed = true;
-		}
-		return true;
+	if (!printed) {
+		mark_tech_preview("io_uring", NULL);
+		printed = true;
 	}
 
-	return false;
+	if (disabled == 2)
+		return false;
+
+	if (disabled == 0 || capable(CAP_SYS_ADMIN))
+		return true;
+
+	io_uring_group = make_kgid(&init_user_ns, sysctl_io_uring_group);
+	if (!gid_valid(io_uring_group))
+		return false;
+
+	return in_group_p(io_uring_group);
 }
 
 SYSCALL_DEFINE2(io_uring_setup, u32, entries,
