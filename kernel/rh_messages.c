@@ -39,7 +39,7 @@
  *
  * Reserved for Internal Red Hat use only.
  */
-void mark_hardware_unmaintained(const char *driver_name, char *fmt, ...)
+void __maybe_unused mark_hardware_unmaintained(const char *driver_name, char *fmt, ...)
 {
 	char device_description[DEV_DESC_LEN];
 	va_list args;
@@ -69,7 +69,7 @@ EXPORT_SYMBOL(mark_hardware_unmaintained);
  *
  * Reserved for Internal Red Hat use only.
  */
-void mark_hardware_deprecated(const char *driver_name, char *fmt, ...)
+void __maybe_unused mark_hardware_deprecated(const char *driver_name, char *fmt, ...)
 {
 	char device_description[DEV_DESC_LEN];
 	va_list args;
@@ -98,7 +98,7 @@ void mark_hardware_deprecated(const char *driver_name, char *fmt, ...)
  *
  * Reserved for Internal Red Hat use only.
  */
-static void mark_hardware_disabled(const char *driver_name, char *fmt, ...)
+static void __maybe_unused mark_hardware_disabled(const char *driver_name, char *fmt, ...)
 {
 	char device_description[DEV_DESC_LEN];
 	va_list args;
@@ -119,7 +119,7 @@ static void mark_hardware_disabled(const char *driver_name, char *fmt, ...)
  *
  * Reserved for Internal Red Hat use only.
  */
-static void pci_hw_deprecated(struct pci_dev *dev)
+static void __maybe_unused pci_hw_deprecated(struct pci_dev *dev)
 {
 	const struct pci_device_id *ret = pci_match_id(rh_deprecated_pci_devices, dev);
 
@@ -157,7 +157,7 @@ static void pci_hw_unmaintained(struct pci_dev *dev)
  *
  * Reserved for Internal Red Hat use only.
  */
-static bool pci_hw_disabled(struct pci_dev *dev)
+static bool __maybe_unused pci_hw_disabled(struct pci_dev *dev)
 {
 	const struct pci_device_id *ret = pci_match_id(rh_disabled_pci_devices, dev);
 
@@ -186,7 +186,7 @@ static bool pci_hw_disabled(struct pci_dev *dev)
  *
  * Reserved for Internal Red Hat use only.
  */
-static void driver_unmaintained(const char* module_name)
+static void __maybe_unused driver_unmaintained(const char* module_name)
 {
 	int i = 0;
 
@@ -215,7 +215,7 @@ static void driver_unmaintained(const char* module_name)
  *
  * Reserved for Internal Red Hat use only.
  */
-static void driver_deprecated(const char* module_name)
+static void __maybe_unused driver_deprecated(const char* module_name)
 {
 	int i = 0;
 
@@ -247,7 +247,7 @@ static void driver_deprecated(const char* module_name)
  * Reserved for Internal Red Hat use only.
  */
 
-static void init_fn_unmaintained(char* fn_name)
+static void __maybe_unused init_fn_unmaintained(char* fn_name)
 {
 	int i = 0;
 
@@ -276,7 +276,7 @@ static void init_fn_unmaintained(char* fn_name)
  *
  * Reserved for Internal Red Hat use only.
  */
-static void init_fn_deprecated(char* fn_name)
+static void __maybe_unused init_fn_deprecated(char* fn_name)
 {
 	int i = 0;
 
@@ -302,7 +302,7 @@ static void init_fn_deprecated(char* fn_name)
  *
  * Reserved for Internal Red Hat use only.
  */
-void mark_tech_preview(const char *msg, struct module *mod)
+void __maybe_unused mark_tech_preview(const char *msg, struct module *mod)
 {
 	const char *str = NULL;
 
@@ -332,7 +332,7 @@ EXPORT_SYMBOL(mark_tech_preview);
  *
  * Reserved for Internal Red Hat use only.
  */
-void mark_partner_supported(const char *msg, struct module *mod)
+void __maybe_unused mark_partner_supported(const char *msg, struct module *mod)
 {
         const char *str = NULL;
 
@@ -370,7 +370,7 @@ EXPORT_SYMBOL(mark_partner_supported);
  *
  * Reserved for Internal Red Hat use only.
  */
-bool pci_rh_check_status(struct pci_dev *pci_dev)
+bool __maybe_unused pci_rh_check_status(struct pci_dev *pci_dev)
 {
 	if (pci_dev->driver->driver.owner != NULL) {
 		if (!test_bit(TAINT_OOT_MODULE, &pci_dev->driver->driver.owner->taints)) {
@@ -391,7 +391,7 @@ bool pci_rh_check_status(struct pci_dev *pci_dev)
  *
  * Reserved for Internal Red Hat use only.
  */
-void module_rh_check_status(const char * module_name)
+void __maybe_unused module_rh_check_status(const char * module_name)
 {
 	driver_unmaintained(module_name);
 	driver_deprecated(module_name);
@@ -407,7 +407,7 @@ void module_rh_check_status(const char * module_name)
   *
   * Reserved for Internal Red Hat use only.
   */
-void init_rh_check_status(char *fn_name)
+void __maybe_unused init_rh_check_status(char *fn_name)
 {
 	init_fn_deprecated(fn_name);
 	init_fn_unmaintained(fn_name);
