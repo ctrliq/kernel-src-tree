@@ -64,6 +64,7 @@ struct dev_dax *__dax_pmem_probe(struct device *dev, enum dev_dax_subsys subsys)
 		.pgmap = &pgmap,
 		.subsys = subsys,
 		.size = range_len(&range),
+		.memmap_on_memory = false,
 	};
 	return devm_create_dev_dax(&data);
 }
