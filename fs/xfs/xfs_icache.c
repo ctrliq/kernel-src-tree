@@ -1765,7 +1765,7 @@ xfs_icwalk(
 		if (error) {
 			last_error = error;
 			if (error == -EFSCORRUPTED) {
-				xfs_perag_put(pag);
+				xfs_perag_rele(pag);
 				break;
 			}
 		}
