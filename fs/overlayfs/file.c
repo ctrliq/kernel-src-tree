@@ -104,14 +104,23 @@ static int ovl_real_fdget_meta(const struct file *file, struct fd *real,
 {
 	struct dentry *dentry = file_dentry(file);
 	struct path realpath;
+	int err;
 
 	real->flags = 0;
 	real->file = file->private_data;
 
-	if (allow_meta)
+	if (allow_meta) {
 		ovl_path_real(dentry, &realpath);
-	else
+	} else {
+		/* lazy lookup and verify of lowerdata */
+		err = ovl_verify_lowerdata(dentry);
+		if (err)
+			return err;
+
 		ovl_path_realdata(dentry, &realpath);
+	}
+	if (!realpath.dentry)
+		return -EIO;
 
 	/* Has it been copied up since we'd opened it? */
 	if (unlikely(file_inode(real->file) != d_inode(realpath.dentry))) {
@@ -147,6 +156,11 @@ static int ovl_open(struct inode *inode, struct file *file)
 	struct path realpath;
 	int err;
 
+	/* lazy lookup and verify lowerdata */
+	err = ovl_verify_lowerdata(dentry);
+	if (err)
+		return err;
+
 	err = ovl_maybe_copy_up(dentry, file->f_flags);
 	if (err)
 		return err;
@@ -155,6 +169,9 @@ static int ovl_open(struct inode *inode, struct file *file)
 	file->f_flags &= ~(O_CREAT | O_EXCL | O_NOCTTY | O_TRUNC);
 
 	ovl_path_realdata(dentry, &realpath);
+	if (!realpath.dentry)
+		return -EIO;
+
 	realfile = ovl_open_realfile(file, &realpath);
 	if (IS_ERR(realfile))
 		return PTR_ERR(realfile);
@@ -274,7 +291,7 @@ static void ovl_aio_cleanup_handler(struct ovl_aio_req *aio_req)
 		__sb_writers_acquired(file_inode(iocb->ki_filp)->i_sb,
 				      SB_FREEZE_WRITE);
 		file_end_write(iocb->ki_filp);
-		ovl_copyattr(ovl_inode_real(inode), inode);
+		ovl_copyattr(inode);
 	}
 
 	orig_iocb->ki_pos = iocb->ki_pos;
@@ -356,7 +373,7 @@ static ssize_t ovl_write_iter(struct kiocb *iocb, struct iov_iter *iter)
 
 	inode_lock(inode);
 	/* Update mode */
-	ovl_copyattr(ovl_inode_real(inode), inode);
+	ovl_copyattr(inode);
 	ret = file_remove_privs(file);
 	if (ret)
 		goto out_unlock;
@@ -380,7 +397,7 @@ static ssize_t ovl_write_iter(struct kiocb *iocb, struct iov_iter *iter)
 				     ovl_iocb_to_rwf(ifl));
 		file_end_write(real.file);
 		/* Update size */
-		ovl_copyattr(ovl_inode_real(inode), inode);
+		ovl_copyattr(inode);
 	} else {
 		struct ovl_aio_req *aio_req;
 
@@ -430,12 +447,11 @@ static ssize_t ovl_splice_write(struct pipe_inode_info *pipe, struct file *out,
 	struct fd real;
 	const struct cred *old_cred;
 	struct inode *inode = file_inode(out);
-	struct inode *realinode = ovl_inode_real(inode);
 	ssize_t ret;
 
 	inode_lock(inode);
 	/* Update mode */
-	ovl_copyattr(realinode, inode);
+	ovl_copyattr(inode);
 	ret = file_remove_privs(out);
 	if (ret)
 		goto out_unlock;
@@ -451,7 +467,7 @@ static ssize_t ovl_splice_write(struct pipe_inode_info *pipe, struct file *out,
 
 	file_end_write(real.file);
 	/* Update size */
-	ovl_copyattr(realinode, inode);
+	ovl_copyattr(inode);
 	revert_creds(old_cred);
 	fdput(real);
 
@@ -525,7 +541,7 @@ static long ovl_fallocate(struct file *file, int mode, loff_t offset, loff_t len
 	revert_creds(old_cred);
 
 	/* Update size */
-	ovl_copyattr(ovl_inode_real(inode), inode);
+	ovl_copyattr(inode);
 
 	fdput(real);
 
@@ -597,7 +613,7 @@ static loff_t ovl_copyfile(struct file *file_in, loff_t pos_in,
 	revert_creds(old_cred);
 
 	/* Update size */
-	ovl_copyattr(ovl_inode_real(inode_out), inode_out);
+	ovl_copyattr(inode_out);
 
 	fdput(real_in);
 	fdput(real_out);

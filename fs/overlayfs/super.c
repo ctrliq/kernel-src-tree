@@ -54,33 +54,16 @@ module_param_named(xino_auto, ovl_xino_auto_def, bool, 0644);
 MODULE_PARM_DESC(xino_auto,
 		 "Auto enable xino feature");
 
-static void ovl_entry_stack_free(struct ovl_entry *oe)
-{
-	unsigned int i;
-
-	for (i = 0; i < oe->numlower; i++)
-		dput(oe->lowerstack[i].dentry);
-}
-
 static bool ovl_metacopy_def = IS_ENABLED(CONFIG_OVERLAY_FS_METACOPY);
 module_param_named(metacopy, ovl_metacopy_def, bool, 0644);
 MODULE_PARM_DESC(metacopy,
 		 "Default to on or off for the metadata only copy up feature");
 
-static void ovl_dentry_release(struct dentry *dentry)
-{
-	struct ovl_entry *oe = dentry->d_fsdata;
-
-	if (oe) {
-		ovl_entry_stack_free(oe);
-		kfree_rcu(oe, rcu);
-	}
-}
-
 static struct dentry *ovl_d_real(struct dentry *dentry,
 				 const struct inode *inode)
 {
 	struct dentry *real = NULL, *lower;
+	int err;
 
 	/* It's an overlay file */
 	if (inode && d_inode(dentry) == inode)
@@ -99,6 +82,17 @@ static struct dentry *ovl_d_real(struct dentry *dentry,
 	if (real && !inode && ovl_has_upperdata(d_inode(dentry)))
 		return real;
 
+	/*
+	 * Best effort lazy lookup of lowerdata for !inode case to return
+	 * the real lowerdata dentry.  The only current caller of d_real() with
+	 * NULL inode is d_real_inode() from trace_uprobe and this caller is
+	 * likely going to be followed reading from the file, before placing
+	 * uprobes on offset within the file, so lowerdata should be available
+	 * when setting the uprobe.
+	 */
+	err = ovl_verify_lowerdata(dentry);
+	if (err)
+		goto bug;
 	lower = ovl_dentry_lowerdata(dentry);
 	if (!lower)
 		goto bug;
@@ -121,6 +115,9 @@ static int ovl_revalidate_real(struct dentry *d, unsigned int flags, bool weak)
 {
 	int ret = 1;
 
+	if (!d)
+		return 1;
+
 	if (weak) {
 		if (d->d_flags & DCACHE_OP_WEAK_REVALIDATE)
 			ret =  d->d_op->d_weak_revalidate(d, flags);
@@ -138,19 +135,26 @@ static int ovl_revalidate_real(struct dentry *d, unsigned int flags, bool weak)
 static int ovl_dentry_revalidate_common(struct dentry *dentry,
 					unsigned int flags, bool weak)
 {
-	struct ovl_entry *oe = dentry->d_fsdata;
+	struct ovl_entry *oe;
+	struct ovl_path *lowerstack;
+	struct inode *inode = d_inode_rcu(dentry);
 	struct dentry *upper;
 	unsigned int i;
 	int ret = 1;
 
-	upper = ovl_dentry_upper(dentry);
+	/* Careful in RCU mode */
+	if (!inode)
+		return -ECHILD;
+
+	oe = OVL_I_E(inode);
+	lowerstack = ovl_lowerstack(oe);
+	upper = ovl_i_dentry_upper(inode);
 	if (upper)
 		ret = ovl_revalidate_real(upper, flags, weak);
 
-	for (i = 0; ret > 0 && i < oe->numlower; i++) {
-		ret = ovl_revalidate_real(oe->lowerstack[i].dentry, flags,
-					  weak);
-	}
+	for (i = 0; ret > 0 && i < ovl_numlower(oe); i++)
+		ret = ovl_revalidate_real(lowerstack[i].dentry, flags, weak);
+
 	return ret;
 }
 
@@ -165,7 +169,6 @@ static int ovl_dentry_weak_revalidate(struct dentry *dentry, unsigned int flags)
 }
 
 static const struct dentry_operations ovl_dentry_operations = {
-	.d_release = ovl_dentry_release,
 	.d_real = ovl_d_real,
 	.d_revalidate = ovl_dentry_revalidate,
 	.d_weak_revalidate = ovl_dentry_weak_revalidate,
@@ -185,8 +188,8 @@ static struct inode *ovl_alloc_inode(struct super_block *sb)
 	oi->version = 0;
 	oi->flags = 0;
 	oi->__upperdentry = NULL;
-	oi->lower = NULL;
-	oi->lowerdata = NULL;
+	oi->lowerdata_redirect = NULL;
+	oi->oe = NULL;
 	mutex_init(&oi->lock);
 
 	return &oi->vfs_inode;
@@ -197,6 +200,7 @@ static void ovl_free_inode(struct inode *inode)
 	struct ovl_inode *oi = OVL_I(inode);
 
 	kfree(oi->redirect);
+	kfree(oi->oe);
 	mutex_destroy(&oi->lock);
 	kmem_cache_free(ovl_inode_cachep, oi);
 }
@@ -206,11 +210,11 @@ static void ovl_destroy_inode(struct inode *inode)
 	struct ovl_inode *oi = OVL_I(inode);
 
 	dput(oi->__upperdentry);
-	iput(oi->lower);
+	ovl_stack_put(ovl_lowerstack(oi->oe), ovl_numlower(oi->oe));
 	if (S_ISDIR(inode->i_mode))
 		ovl_dir_cache_free(inode);
 	else
-		iput(oi->lowerdata);
+		kfree(oi->lowerdata_redirect);
 }
 
 static void ovl_free_fs(struct ovl_fs *ofs)
@@ -246,6 +250,7 @@ static void ovl_free_fs(struct ovl_fs *ofs)
 	kfree(ofs->config.upperdir);
 	kfree(ofs->config.workdir);
 	kfree(ofs->config.redirect_mode);
+	kfree(ofs->config.verity);
 	if (ofs->creator_cred)
 		put_cred(ofs->creator_cred);
 	kfree(ofs);
@@ -336,6 +341,11 @@ static const char *ovl_redirect_mode_def(void)
 	return ovl_redirect_dir_def ? "on" : "off";
 }
 
+static const char *ovl_verity_def(void)
+{
+	return "off";
+}
+
 static const char * const ovl_xino_str[] = {
 	"off",
 	"auto",
@@ -367,6 +377,8 @@ static int ovl_show_options(struct seq_file *m, struct dentry *dentry)
 		seq_puts(m, ",default_permissions");
 	if (strcmp(ofs->config.redirect_mode, ovl_redirect_mode_def()) != 0)
 		seq_printf(m, ",redirect_dir=%s", ofs->config.redirect_mode);
+	if (strcmp(ofs->config.verity, ovl_verity_def()) != 0)
+		seq_printf(m, ",verity=%s", ofs->config.verity);
 	if (ofs->config.index != ovl_index_def)
 		seq_printf(m, ",index=%s", ofs->config.index ? "on" : "off");
 	if (!ofs->config.uuid)
@@ -439,6 +451,7 @@ enum {
 	OPT_METACOPY_OFF,
 	OPT_VOLATILE,
 	OPT_ERR,
+	OPT_VERITY,
 };
 
 static const match_table_t ovl_tokens = {
@@ -460,6 +473,7 @@ static const match_table_t ovl_tokens = {
 	{OPT_METACOPY_ON,		"metacopy=on"},
 	{OPT_METACOPY_OFF,		"metacopy=off"},
 	{OPT_VOLATILE,			"volatile"},
+	{OPT_VERITY,                    "verity=%s"},
 	{OPT_ERR,			NULL}
 };
 
@@ -509,15 +523,35 @@ static int ovl_parse_redirect_mode(struct ovl_config *config, const char *mode)
 	return 0;
 }
 
+static int ovl_parse_verity(struct ovl_config *config, const char *mode)
+{
+	if (strcmp(mode, "on") == 0) {
+		config->verity_mode = OVL_VERITY_ON;
+	} else if (strcmp(mode, "require") == 0) {
+		config->verity_mode = OVL_VERITY_REQUIRE;
+	} else if (strcmp(mode, "off") != 0) {
+		pr_err("bad mount option \"verity=%s\"\n",
+		       mode);
+		return -EINVAL;
+	}
+
+	return 0;
+}
+
 static int ovl_parse_opt(char *opt, struct ovl_config *config)
 {
 	char *p;
 	int err;
 	bool metacopy_opt = false, redirect_opt = false;
 	bool nfs_export_opt = false, index_opt = false;
+	bool verity_opt = false;
 
 	config->redirect_mode = kstrdup(ovl_redirect_mode_def(), GFP_KERNEL);
 	if (!config->redirect_mode)
+		return -ENOMEM;
+
+	config->verity = kstrdup(ovl_verity_def(), GFP_KERNEL);
+	if (!config->verity)
 		return -ENOMEM;
 
 	while ((p = ovl_next_opt(&opt)) != NULL) {
@@ -560,6 +594,14 @@ static int ovl_parse_opt(char *opt, struct ovl_config *config)
 			if (!config->redirect_mode)
 				return -ENOMEM;
 			redirect_opt = true;
+			break;
+
+		case OPT_VERITY:
+			kfree(config->verity);
+			config->verity = match_strdup(&args[0]);
+			if (!config->verity)
+				return -ENOMEM;
+			verity_opt = true;
 			break;
 
 		case OPT_INDEX_ON:
@@ -651,6 +693,10 @@ static int ovl_parse_opt(char *opt, struct ovl_config *config)
 	if (err)
 		return err;
 
+	err = ovl_parse_verity(config, config->verity);
+	if (err)
+		return err;
+
 	/*
 	 * This is to make the logic below simpler.  It doesn't make any other
 	 * difference, since config->redirect_dir is only used for upper.
@@ -658,11 +704,28 @@ static int ovl_parse_opt(char *opt, struct ovl_config *config)
 	if (!config->upperdir && config->redirect_follow)
 		config->redirect_dir = true;
 
-	/* Resolve metacopy -> redirect_dir dependency */
+	/* Resolve verity -> metacopy dependency */
+	if (config->verity_mode && !config->metacopy) {
+		/* Don't allow explicit specified conflicting combinations */
+		if (metacopy_opt) {
+			pr_err("conflicting options: metacopy=off,verity=%s\n",
+			       config->verity);
+			return -EINVAL;
+		}
+		/* Otherwise automatically enable metacopy. */
+		config->metacopy = true;
+	}
+
+	/* Resolve verity -> metacopy -> redirect_dir dependency */
 	if (config->metacopy && !config->redirect_dir) {
 		if (metacopy_opt && redirect_opt) {
 			pr_err("conflicting options: metacopy=on,redirect_dir=%s\n",
 			       config->redirect_mode);
+			return -EINVAL;
+		}
+		if (config->verity_mode && redirect_opt) {
+			pr_err("conflicting options: verity=%s,redirect_dir=%s\n",
+			       config->verity, config->redirect_mode);
 			return -EINVAL;
 		}
 		if (redirect_opt) {
@@ -700,7 +763,7 @@ static int ovl_parse_opt(char *opt, struct ovl_config *config)
 		}
 	}
 
-	/* Resolve nfs_export -> !metacopy dependency */
+	/* Resolve nfs_export -> !metacopy && !verity dependency */
 	if (config->nfs_export && config->metacopy) {
 		if (nfs_export_opt && metacopy_opt) {
 			pr_err("conflicting options: nfs_export=on,metacopy=on\n");
@@ -713,6 +776,14 @@ static int ovl_parse_opt(char *opt, struct ovl_config *config)
 			 */
 			pr_info("disabling nfs_export due to metacopy=on\n");
 			config->nfs_export = false;
+		} else if (config->verity_mode) {
+			/*
+			 * There was an explicit verity=.. that resulted
+			 * in this conflict.
+			 */
+			pr_info("disabling nfs_export due to verity=%s\n",
+				config->verity);
+			config->nfs_export = false;
 		} else {
 			/*
 			 * There was an explicit nfs_export=on that resulted
@@ -724,7 +795,7 @@ static int ovl_parse_opt(char *opt, struct ovl_config *config)
 	}
 
 
-	/* Resolve userxattr -> !redirect && !metacopy dependency */
+	/* Resolve userxattr -> !redirect && !metacopy && !verity dependency */
 	if (config->userxattr) {
 		if (config->redirect_follow && redirect_opt) {
 			pr_err("conflicting options: userxattr,redirect_dir=%s\n",
@@ -733,6 +804,11 @@ static int ovl_parse_opt(char *opt, struct ovl_config *config)
 		}
 		if (config->metacopy && metacopy_opt) {
 			pr_err("conflicting options: userxattr,metacopy=on\n");
+			return -EINVAL;
+		}
+		if (config->verity_mode) {
+			pr_err("conflicting options: userxattr,verity=%s\n",
+			       config->verity);
 			return -EINVAL;
 		}
 		/*
@@ -1537,7 +1613,7 @@ static int ovl_get_indexdir(struct super_block *sb, struct ovl_fs *ofs,
 
 	/* Verify lower root is upper root origin */
 	err = ovl_verify_origin(ofs, upperpath->dentry,
-				oe->lowerstack[0].dentry, true);
+				ovl_lowerstack(oe)->dentry, true);
 	if (err) {
 		pr_err("failed to verify upper root origin\n");
 		goto out;
@@ -1674,6 +1750,16 @@ static int ovl_get_fsid(struct ovl_fs *ofs, const struct path *path)
 	return ofs->numfs++;
 }
 
+/*
+ * The fsid after the last lower fsid is used for the data layers.
+ * It is a "null fs" with a null sb, null uuid, and no pseudo dev.
+ */
+static int ovl_get_data_fsid(struct ovl_fs *ofs)
+{
+	return ofs->numfs;
+}
+
+
 static int ovl_get_layers(struct super_block *sb, struct ovl_fs *ofs,
 			  struct path *stack, unsigned int numlower,
 			  struct ovl_layer *layers)
@@ -1681,12 +1767,14 @@ static int ovl_get_layers(struct super_block *sb, struct ovl_fs *ofs,
 	int err;
 	unsigned int i;
 
-	err = -ENOMEM;
-	ofs->fs = kcalloc(numlower + 1, sizeof(struct ovl_sb), GFP_KERNEL);
+	ofs->fs = kcalloc(numlower + 2, sizeof(struct ovl_sb), GFP_KERNEL);
 	if (ofs->fs == NULL)
-		goto out;
+		return -ENOMEM;
 
-	/* idx/fsid 0 are reserved for upper fs even with lower only overlay */
+	/*
+	 * idx/fsid 0 are reserved for upper fs even with lower only overlay
+	 * and the last fsid is reserved for "null fs" of the data layers.
+	 */
 	ofs->numfs++;
 
 	/*
@@ -1698,7 +1786,7 @@ static int ovl_get_layers(struct super_block *sb, struct ovl_fs *ofs,
 	err = get_anon_bdev(&ofs->fs[0].pseudo_dev);
 	if (err) {
 		pr_err("failed to get anonymous bdev for upper fs\n");
-		goto out;
+		return err;
 	}
 
 	if (ovl_upper_mnt(ofs)) {
@@ -1711,9 +1799,12 @@ static int ovl_get_layers(struct super_block *sb, struct ovl_fs *ofs,
 		struct inode *trap;
 		int fsid;
 
-		err = fsid = ovl_get_fsid(ofs, &stack[i]);
-		if (err < 0)
-			goto out;
+		if (i < numlower - ofs->numdatalayer)
+			fsid = ovl_get_fsid(ofs, &stack[i]);
+		else
+			fsid = ovl_get_data_fsid(ofs);
+		if (fsid < 0)
+			return fsid;
 
 		/*
 		 * Check if lower root conflicts with this overlay layers before
@@ -1724,13 +1815,13 @@ static int ovl_get_layers(struct super_block *sb, struct ovl_fs *ofs,
 		 */
 		err = ovl_setup_trap(sb, stack[i].dentry, &trap, "lowerdir");
 		if (err)
-			goto out;
+			return err;
 
 		if (ovl_is_inuse(stack[i].dentry)) {
 			err = ovl_report_in_use(ofs, "lowerdir");
 			if (err) {
 				iput(trap);
-				goto out;
+				return err;
 			}
 		}
 
@@ -1739,7 +1830,7 @@ static int ovl_get_layers(struct super_block *sb, struct ovl_fs *ofs,
 		if (IS_ERR(mnt)) {
 			pr_err("failed to clone lowerpath\n");
 			iput(trap);
-			goto out;
+			return err;
 		}
 
 		/*
@@ -1789,9 +1880,7 @@ static int ovl_get_layers(struct super_block *sb, struct ovl_fs *ofs,
 			ofs->xino_mode);
 	}
 
-	err = 0;
-out:
-	return err;
+	return 0;
 }
 
 static struct ovl_entry *ovl_get_lowerstack(struct super_block *sb,
@@ -1800,6 +1889,8 @@ static struct ovl_entry *ovl_get_lowerstack(struct super_block *sb,
 {
 	int err;
 	struct path *stack = NULL;
+	struct ovl_path *lowerstack;
+	unsigned int numlowerdata = 0;
 	unsigned int i;
 	struct ovl_entry *oe;
 
@@ -1812,13 +1903,50 @@ static struct ovl_entry *ovl_get_lowerstack(struct super_block *sb,
 	if (!stack)
 		return ERR_PTR(-ENOMEM);
 
-	err = -EINVAL;
-	for (i = 0; i < numlower; i++) {
+	for (i = 0; i < numlower;) {
 		err = ovl_lower_dir(lower, &stack[i], ofs, &sb->s_stack_depth);
 		if (err)
 			goto out_err;
 
 		lower = strchr(lower, '\0') + 1;
+
+		i++;
+		if (i == numlower)
+			break;
+
+		err = -EINVAL;
+		/*
+		 * Empty lower layer path could mean :: separator that indicates
+		 * a data-only lower data.
+		 * Several data-only layers are allowed, but they all need to be
+		 * at the bottom of the stack.
+		 */
+		if (*lower) {
+			/* normal lower dir */
+			if (numlowerdata) {
+				pr_err("lower data-only dirs must be at the bottom of the stack.\n");
+				goto out_err;
+			}
+		} else {
+			/* data-only lower dir */
+			if (!ofs->config.metacopy) {
+				pr_err("lower data-only dirs require metacopy support.\n");
+				goto out_err;
+			}
+			if (i == numlower - 1) {
+				pr_err("lowerdir argument must not end with double colon.\n");
+				goto out_err;
+			}
+			lower++;
+			numlower--;
+			numlowerdata++;
+		}
+	}
+
+	if (numlowerdata) {
+		ofs->numdatalayer = numlowerdata;
+		pr_info("using the lowest %d of %d lowerdirs as data layers\n",
+			numlowerdata, numlower);
 	}
 
 	err = -EINVAL;
@@ -1833,13 +1961,15 @@ static struct ovl_entry *ovl_get_lowerstack(struct super_block *sb,
 		goto out_err;
 
 	err = -ENOMEM;
-	oe = ovl_alloc_entry(numlower);
+	/* Data-only layers are not merged in root directory */
+	oe = ovl_alloc_entry(numlower - numlowerdata);
 	if (!oe)
 		goto out_err;
 
-	for (i = 0; i < numlower; i++) {
-		oe->lowerstack[i].dentry = dget(stack[i].dentry);
-		oe->lowerstack[i].layer = &ofs->layers[i+1];
+	lowerstack = ovl_lowerstack(oe);
+	for (i = 0; i < numlower - numlowerdata; i++) {
+		lowerstack[i].dentry = dget(stack[i].dentry);
+		lowerstack[i].layer = &ofs->layers[i+1];
 	}
 
 out:
@@ -1932,19 +2062,17 @@ static struct dentry *ovl_get_root(struct super_block *sb,
 				   struct ovl_entry *oe)
 {
 	struct dentry *root;
-	struct ovl_path *lowerpath = &oe->lowerstack[0];
+	struct ovl_path *lowerpath = ovl_lowerstack(oe);
 	unsigned long ino = d_inode(lowerpath->dentry)->i_ino;
 	int fsid = lowerpath->layer->fsid;
 	struct ovl_inode_params oip = {
 		.upperdentry = upperdentry,
-		.lowerpath = lowerpath,
+		.oe = oe,
 	};
 
 	root = d_make_root(ovl_new_inode(sb, S_IFDIR, 0));
 	if (!root)
 		return NULL;
-
-	root->d_fsdata = oe;
 
 	if (upperdentry) {
 		/* Root inode uses upper st_ino/i_ino */
@@ -1960,7 +2088,7 @@ static struct dentry *ovl_get_root(struct super_block *sb,
 	ovl_dentry_set_flag(OVL_E_CONNECTED, root);
 	ovl_set_upperdata(d_inode(root));
 	ovl_inode_init(d_inode(root), &oip, ino, fsid);
-	ovl_dentry_update_reval(root, upperdentry, DCACHE_OP_WEAK_REVALIDATE);
+	ovl_dentry_init_flags(root, upperdentry, oe, DCACHE_OP_WEAK_REVALIDATE);
 
 	return root;
 }
@@ -2150,8 +2278,7 @@ static int ovl_fill_super(struct super_block *sb, void *data, int silent)
 	return 0;
 
 out_free_oe:
-	ovl_entry_stack_free(oe);
-	kfree(oe);
+	ovl_free_entry(oe);
 out_err:
 	kfree(splitlower);
 	path_put(&upperpath);
