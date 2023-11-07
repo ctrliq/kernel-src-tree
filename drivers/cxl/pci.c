@@ -403,11 +403,6 @@ static void devm_cxl_pci_create_doe(struct cxl_dev_state *cxlds)
 	}
 }
 
-static void disable_aer(void *pdev)
-{
-	pci_disable_pcie_error_reporting(pdev);
-}
-
 /*
  * Assume that any RCIEP that emits the CXL memory expander class code
  * is an RCD
@@ -494,12 +489,6 @@ static int cxl_pci_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 	if (IS_ERR(cxlmd))
 		return PTR_ERR(cxlmd);
 
-	if (cxlds->regs.ras) {
-		pci_enable_pcie_error_reporting(pdev);
-		rc = devm_add_action_or_reset(&pdev->dev, disable_aer, pdev);
-		if (rc)
-			return rc;
-	}
 	pci_save_state(pdev);
 
 	return rc;
