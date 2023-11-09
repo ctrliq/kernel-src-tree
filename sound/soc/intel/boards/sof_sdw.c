@@ -592,7 +592,6 @@ static struct sof_sdw_codec_info codec_info_list[] = {
 			},
 		},
 		.dai_num = 1,
-		.codec_type = SOF_SDW_CODEC_TYPE_JACK,
 	},
 	{
 		.part_id = 0x711,
@@ -608,7 +607,6 @@ static struct sof_sdw_codec_info codec_info_list[] = {
 			},
 		},
 		.dai_num = 1,
-		.codec_type = SOF_SDW_CODEC_TYPE_JACK,
 	},
 	{
 		.part_id = 0x711,
@@ -624,7 +622,6 @@ static struct sof_sdw_codec_info codec_info_list[] = {
 			},
 		},
 		.dai_num = 1,
-		.codec_type = SOF_SDW_CODEC_TYPE_JACK,
 	},
 	{
 		.part_id = 0x1308,
@@ -641,7 +638,6 @@ static struct sof_sdw_codec_info codec_info_list[] = {
 		},
 		.dai_num = 1,
 		.ops = &sof_sdw_rt1308_i2s_ops,
-		.codec_type = SOF_SDW_CODEC_TYPE_AMP,
 	},
 	{
 		.part_id = 0x1316,
@@ -656,7 +652,6 @@ static struct sof_sdw_codec_info codec_info_list[] = {
 			},
 		},
 		.dai_num = 1,
-		.codec_type = SOF_SDW_CODEC_TYPE_AMP,
 	},
 	{
 		.part_id = 0x1318,
@@ -671,7 +666,6 @@ static struct sof_sdw_codec_info codec_info_list[] = {
 			},
 		},
 		.dai_num = 1,
-		.codec_type = SOF_SDW_CODEC_TYPE_AMP,
 	},
 	{
 		.part_id = 0x714,
@@ -687,7 +681,6 @@ static struct sof_sdw_codec_info codec_info_list[] = {
 			},
 		},
 		.dai_num = 1,
-		.codec_type = SOF_SDW_CODEC_TYPE_MIC,
 	},
 	{
 		.part_id = 0x715,
@@ -703,7 +696,6 @@ static struct sof_sdw_codec_info codec_info_list[] = {
 			},
 		},
 		.dai_num = 1,
-		.codec_type = SOF_SDW_CODEC_TYPE_MIC,
 	},
 	{
 		.part_id = 0x714,
@@ -719,7 +711,6 @@ static struct sof_sdw_codec_info codec_info_list[] = {
 			},
 		},
 		.dai_num = 1,
-		.codec_type = SOF_SDW_CODEC_TYPE_MIC,
 	},
 	{
 		.part_id = 0x715,
@@ -735,7 +726,6 @@ static struct sof_sdw_codec_info codec_info_list[] = {
 			},
 		},
 		.dai_num = 1,
-		.codec_type = SOF_SDW_CODEC_TYPE_MIC,
 	},
 	{
 		.part_id = 0x8373,
@@ -749,7 +739,6 @@ static struct sof_sdw_codec_info codec_info_list[] = {
 			},
 		},
 		.dai_num = 1,
-		.codec_type = SOF_SDW_CODEC_TYPE_AMP,
 	},
 	{
 		.part_id = 0x5682,
@@ -763,7 +752,6 @@ static struct sof_sdw_codec_info codec_info_list[] = {
 			},
 		},
 		.dai_num = 1,
-		.codec_type = SOF_SDW_CODEC_TYPE_JACK,
 	},
 	{
 		.part_id = 0xaaaa, /* generic codec mockup */
@@ -778,7 +766,6 @@ static struct sof_sdw_codec_info codec_info_list[] = {
 			},
 		},
 		.dai_num = 1,
-		.codec_type = SOF_SDW_CODEC_TYPE_JACK,
 	},
 	{
 		.part_id = 0xaa55, /* headset codec mockup */
@@ -793,7 +780,6 @@ static struct sof_sdw_codec_info codec_info_list[] = {
 			},
 		},
 		.dai_num = 1,
-		.codec_type = SOF_SDW_CODEC_TYPE_JACK,
 	},
 	{
 		.part_id = 0x55aa, /* amplifier mockup */
@@ -808,7 +794,6 @@ static struct sof_sdw_codec_info codec_info_list[] = {
 			},
 		},
 		.dai_num = 1,
-		.codec_type = SOF_SDW_CODEC_TYPE_AMP,
 	},
 	{
 		.part_id = 0x5555,
@@ -823,7 +808,6 @@ static struct sof_sdw_codec_info codec_info_list[] = {
 			},
 		},
 		.dai_num = 1,
-		.codec_type = SOF_SDW_CODEC_TYPE_MIC,
 	},
 };
 
@@ -1200,7 +1184,7 @@ static int create_sdw_dailink(struct snd_soc_card *card,
 			      int codec_count, int *link_id,
 			      int *codec_conf_index,
 			      bool *ignore_pch_dmic,
-			      bool append_codec_type,
+			      bool append_dai_type,
 			      int adr_index)
 {
 	const struct snd_soc_acpi_link_adr *link_next;
@@ -1280,10 +1264,10 @@ static int create_sdw_dailink(struct snd_soc_card *card,
 		}
 
 		/* create stream name according to first link id */
-		if (append_codec_type) {
+		if (append_dai_type) {
 			name = devm_kasprintf(dev, GFP_KERNEL,
 					      sdw_stream_name[stream + 2], cpu_dai_id[0],
-					      type_strings[codec_info->codec_type]);
+					      type_strings[codec_info->dais[0].dai_type]);
 		} else {
 			name = devm_kasprintf(dev, GFP_KERNEL,
 					      sdw_stream_name[stream], cpu_dai_id[0]);
@@ -1403,7 +1387,7 @@ static int sof_card_dai_links_create(struct device *dev,
 	const struct snd_soc_acpi_link_adr *adr_link;
 	struct snd_soc_dai_link_component *cpus;
 	struct snd_soc_codec_conf *codec_conf;
-	bool append_codec_type = false;
+	bool append_dai_type = false;
 	bool ignore_pch_dmic = false;
 	int codec_conf_count;
 	int codec_conf_index = 0;
@@ -1508,7 +1492,7 @@ static int sof_card_dai_links_create(struct device *dev,
 				    SDW_PART_ID(adr_link->adr_d[j].adr)) ||
 				    (SDW_MFG_ID(adr_link->adr_d[i].adr) !=
 				    SDW_MFG_ID(adr_link->adr_d[i].adr))) {
-					append_codec_type = true;
+					append_dai_type = true;
 					goto out;
 				}
 			}
@@ -1538,7 +1522,7 @@ out:
 						 &cpu_id, group_generated,
 						 codec_conf, codec_conf_count,
 						 &be_id, &codec_conf_index,
-						 &ignore_pch_dmic, append_codec_type, i);
+						 &ignore_pch_dmic, append_dai_type, i);
 			if (ret < 0) {
 				dev_err(dev, "failed to create dai link %d", link_index);
 				return ret;
