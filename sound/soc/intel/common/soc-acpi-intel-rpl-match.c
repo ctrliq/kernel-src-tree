@@ -351,14 +351,19 @@ static const struct snd_soc_acpi_codecs rpl_max98373_amp = {
 	.codecs = {"MX98373"}
 };
 
-static const struct snd_soc_acpi_codecs rpl_rt1019p_amp = {
+static const struct snd_soc_acpi_codecs rpl_lt6911_hdmi = {
 	.num_codecs = 1,
-	.codecs = {"RTL1019"}
+	.codecs = {"INTC10B0"}
 };
 
 static const struct snd_soc_acpi_codecs rpl_nau8318_amp = {
 	.num_codecs = 1,
 	.codecs = {"NVTN2012"}
+};
+
+static const struct snd_soc_acpi_codecs rpl_rt1019p_amp = {
+	.num_codecs = 1,
+	.codecs = {"RTL1019"}
 };
 
 struct snd_soc_acpi_mach snd_soc_acpi_intel_rpl_machines[] = {
@@ -396,6 +401,13 @@ struct snd_soc_acpi_mach snd_soc_acpi_intel_rpl_machines[] = {
 		.machine_quirk = snd_soc_acpi_codec_list,
 		.quirk_data = &rpl_rt1019p_amp,
 		.sof_tplg_filename = "sof-rpl-rt1019-rt5682.tplg",
+	},
+	{
+		.comp_ids = &rpl_essx_83x6,
+		.drv_name = "rpl_es83x6_c1_h02",
+		.machine_quirk = snd_soc_acpi_codec_list,
+		.quirk_data = &rpl_lt6911_hdmi,
+		.sof_tplg_filename = "sof-rpl-es83x6-ssp1-hdmi-ssp02.tplg",
 	},
 	{
 		.comp_ids = &rpl_essx_83x6,
