@@ -59,6 +59,7 @@ enum regcache_type {
 	REGCACHE_NONE,
 	REGCACHE_RBTREE,
 	REGCACHE_FLAT,
+	REGCACHE_MAPLE,
 };
 
 /**
