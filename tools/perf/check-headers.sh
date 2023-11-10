@@ -44,6 +44,7 @@ FILES=(
   "arch/x86/tools/gen-insn-attr-x86.awk"
   "arch/arm/include/uapi/asm/perf_regs.h"
   "arch/arm64/include/uapi/asm/perf_regs.h"
+  "arch/loongarch/include/uapi/asm/perf_regs.h"
   "arch/mips/include/uapi/asm/perf_regs.h"
   "arch/powerpc/include/uapi/asm/perf_regs.h"
   "arch/s390/include/uapi/asm/perf_regs.h"
