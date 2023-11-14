@@ -19,6 +19,7 @@
 #include <linux/mm.h> /* for put_page() */
 #include <linux/poison.h>
 #include <linux/ethtool.h>
+#include <linux/netdevice.h>
 
 #include <trace/events/page_pool.h>
 
@@ -861,6 +862,21 @@ void page_pool_use_xdp_mem(struct page_pool *pool, void (*disconnect)(void *),
 	pool->xdp_mem_id = mem->id;
 }
 
+void page_pool_unlink_napi(struct page_pool *pool)
+{
+	if (!pool->p.napi)
+		return;
+
+	/* To avoid races with recycling and additional barriers make sure
+	 * pool and NAPI are unlinked when NAPI is disabled.
+	 */
+	WARN_ON(!test_bit(NAPI_STATE_SCHED, &pool->p.napi->state) ||
+		READ_ONCE(pool->p.napi->list_owner) != -1);
+
+	WRITE_ONCE(pool->p.napi, NULL);
+}
+EXPORT_SYMBOL(page_pool_unlink_napi);
+
 void page_pool_destroy(struct page_pool *pool)
 {
 	if (!pool)
@@ -869,6 +885,7 @@ void page_pool_destroy(struct page_pool *pool)
 	if (!page_pool_put(pool))
 		return;
 
+	page_pool_unlink_napi(pool);
 	page_pool_free_frag(pool);
 
 	if (!page_pool_release(pool))
@@ -898,9 +915,11 @@ void page_pool_update_nid(struct page_pool *pool, int new_nid)
 }
 EXPORT_SYMBOL(page_pool_update_nid);
 
-bool page_pool_return_skb_page(struct page *page)
+bool page_pool_return_skb_page(struct page *page, bool napi_safe)
 {
+	struct napi_struct *napi;
 	struct page_pool *pp;
+	bool allow_direct;
 
 	page = compound_head(page);
 
@@ -916,12 +935,20 @@ bool page_pool_return_skb_page(struct page *page)
 
 	pp = page->pp;
 
+	/* Allow direct recycle if we have reasons to believe that we are
+	 * in the same context as the consumer would run, so there's
+	 * no possible race.
+	 */
+	napi = READ_ONCE(pp->p.napi);
+	allow_direct = napi_safe && napi &&
+		READ_ONCE(napi->list_owner) == smp_processor_id();
+
 	/* Driver set this to memory recycling info. Reset it on recycle.
 	 * This will *not* work for NIC using a split-page memory model.
 	 * The page will be returned to the pool here regardless of the
 	 * 'flipped' fragment being in use or not.
 	 */
-	page_pool_put_full_page(pp, page, false);
+	page_pool_put_full_page(pp, page, allow_direct);
 
 	return true;
 }
