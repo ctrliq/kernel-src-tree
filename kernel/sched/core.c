@@ -8432,7 +8432,6 @@ out_free_cpus_allowed:
 
 long sched_setaffinity(pid_t pid, const struct cpumask *in_mask)
 {
-	bool reset_cpumasks = cpumask_empty(in_mask);
 	struct affinity_context ac;
 	struct cpumask *user_mask;
 	struct task_struct *p;
@@ -8470,13 +8469,16 @@ long sched_setaffinity(pid_t pid, const struct cpumask *in_mask)
 		goto out_put_task;
 
 	/*
-	 * If an empty cpumask is passed in and user_cpus_ptr is set,
+	 * If a NULL cpumask is passed in and user_cpus_ptr is set,
 	 * clear user_cpus_ptr and reset the current cpu affinity to the
 	 * default for the current cpuset. If user_cpus_ptr isn't set,
-	 * -EINVAL will be returned as before.
+	 * -EINVAL will be returned.
 	 */
-	if (reset_cpumasks && p->user_cpus_ptr) {
-		in_mask = NULL;	/* To be updated in __sched_setaffinity */
+	if (!in_mask) {
+		if (!p->user_cpus_ptr) {
+			retval = -EINVAL;
+			goto out_put_task;
+		}
 		user_mask = NULL;
 	} else {
 		/*
@@ -8501,27 +8503,46 @@ long sched_setaffinity(pid_t pid, const struct cpumask *in_mask)
 	retval = __sched_setaffinity(p, &ac);
 	kfree(ac.user_mask);
 
-	/*
-	 * Force an error return (-ENODEV), if no error yet, for the empty
-	 * cpumask case to avoid breaking existing tests.
-	 */
-	if (reset_cpumasks && !retval)
-		retval = -ENODEV;
-
 out_put_task:
 	put_task_struct(p);
 	return retval;
 }
 
 static int get_user_cpu_mask(unsigned long __user *user_mask_ptr, unsigned len,
-			     struct cpumask *new_mask)
+			     struct cpumask *new_mask, bool *empty)
 {
+	/* len in bytes, but offset is in units of unsigned long */
+	unsigned int bytes_left = len, offset = 0;
+
 	if (len < cpumask_size())
 		cpumask_clear(new_mask);
 	else if (len > cpumask_size())
 		len = cpumask_size();
+	/*
+	 * The first copy_from_user() call will copy out the relevant
+	 * portion of the new_mask to be set. However, if it is empty, we
+	 * need to check the full length of the user_mask buffer to verify
+	 * if it is fully empty before we can trigger the resetting of
+	 * user_cpus_ptr.
+	 */
+	for (;;) {
+		if (copy_from_user(new_mask, user_mask_ptr + offset, len))
+			return -EFAULT;
+		*empty = bitmap_empty(cpumask_bits(new_mask),
+				      cpumask_size() * 8);
+		if (offset && !*empty)
+			return -EINVAL;	/* Bit set outside of cpumask_size() */
 
-	return copy_from_user(new_mask, user_mask_ptr, len) ? -EFAULT : 0;
+		if ((bytes_left <= len) || !*empty)
+			return 0;
+		/*
+		 * len = cpumask_size() which is a multiple of sizeof(long)
+		 */
+		offset += len/sizeof(long);
+		bytes_left -= len;
+		if (bytes_left < len)
+			len = bytes_left;
+	}
 }
 
 /**
@@ -8536,14 +8557,15 @@ SYSCALL_DEFINE3(sched_setaffinity, pid_t, pid, unsigned int, len,
 		unsigned long __user *, user_mask_ptr)
 {
 	cpumask_var_t new_mask;
+	bool mask_empty;
 	int retval;
 
 	if (!alloc_cpumask_var(&new_mask, GFP_KERNEL))
 		return -ENOMEM;
 
-	retval = get_user_cpu_mask(user_mask_ptr, len, new_mask);
+	retval = get_user_cpu_mask(user_mask_ptr, len, new_mask, &mask_empty);
 	if (retval == 0)
-		retval = sched_setaffinity(pid, new_mask);
+		retval = sched_setaffinity(pid, mask_empty ? NULL : new_mask);
 	free_cpumask_var(new_mask);
 	return retval;
 }
