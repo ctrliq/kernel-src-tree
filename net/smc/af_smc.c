@@ -3483,8 +3483,6 @@ static int __init smc_init(void)
 
 out_ib:
 	smc_ib_unregister_client();
-out_ulp:
-	tcp_unregister_ulp(&smc_ulp_ops);
 out_sock:
 	sock_unregister(PF_SMC);
 out_proto6:
