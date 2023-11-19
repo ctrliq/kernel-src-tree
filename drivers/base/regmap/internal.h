@@ -31,8 +31,8 @@ struct regmap_format {
 	size_t buf_size;
 	size_t reg_bytes;
 	size_t pad_bytes;
-	size_t reg_downshift;
 	size_t val_bytes;
+	s8 reg_shift;
 	void (*format_write)(struct regmap *map,
 			     unsigned int reg, unsigned int val);
 	void (*format_reg)(void *buf, unsigned int reg, unsigned int shift);
@@ -270,6 +270,7 @@ unsigned int regcache_get_val(struct regmap *map, const void *base,
 bool regcache_set_val(struct regmap *map, void *base, unsigned int idx,
 		      unsigned int val);
 int regcache_lookup_reg(struct regmap *map, unsigned int reg);
+int regcache_sync_val(struct regmap *map, unsigned int reg, unsigned int val);
 
 int _regmap_raw_write(struct regmap *map, unsigned int reg,
 		      const void *val, size_t val_len, bool noinc);
@@ -281,7 +282,6 @@ enum regmap_endian regmap_get_val_endian(struct device *dev,
 					 const struct regmap_config *config);
 
 extern struct regcache_ops regcache_rbtree_ops;
-extern struct regcache_ops regcache_lzo_ops;
 extern struct regcache_ops regcache_flat_ops;
 
 static inline const char *regmap_name(const struct regmap *map)
