@@ -1232,9 +1232,9 @@ static void napi_skb_cache_put(struct sk_buff *skb)
 	}
 }
 
-void __kfree_skb_defer(struct sk_buff *skb)
+void __napi_kfree_skb(struct sk_buff *skb, enum skb_drop_reason reason)
 {
-	skb_release_all(skb, SKB_DROP_REASON_NOT_SPECIFIED, true);
+	skb_release_all(skb, reason, true);
 	napi_skb_cache_put(skb);
 }
 
@@ -3597,20 +3597,32 @@ struct sk_buff *skb_dequeue_tail(struct sk_buff_head *list)
 EXPORT_SYMBOL(skb_dequeue_tail);
 
 /**
- *	skb_queue_purge - empty a list
+ *	skb_queue_purge_reason - empty a list
  *	@list: list to empty
+ *	@reason: drop reason
  *
  *	Delete all buffers on an &sk_buff list. Each buffer is removed from
  *	the list and one reference dropped. This function takes the list
  *	lock and is atomic with respect to other list locking functions.
  */
-void skb_queue_purge(struct sk_buff_head *list)
+void skb_queue_purge_reason(struct sk_buff_head *list,
+			    enum skb_drop_reason reason)
 {
-	struct sk_buff *skb;
-	while ((skb = skb_dequeue(list)) != NULL)
-		kfree_skb(skb);
+	struct sk_buff_head tmp;
+	unsigned long flags;
+
+	if (skb_queue_empty_lockless(list))
+		return;
+
+	__skb_queue_head_init(&tmp);
+
+	spin_lock_irqsave(&list->lock, flags);
+	skb_queue_splice_init(list, &tmp);
+	spin_unlock_irqrestore(&list->lock, flags);
+
+	__skb_queue_purge_reason(&tmp, reason);
 }
-EXPORT_SYMBOL(skb_queue_purge);
+EXPORT_SYMBOL(skb_queue_purge_reason);
 
 /**
  *	skb_rbtree_purge - empty a skb rbtree
