@@ -581,6 +581,9 @@ static int erofs_fc_fill_super(struct super_block *sb, struct fs_context *fc)
 {
 	struct inode *inode;
 	struct erofs_sb_info *sbi = EROFS_SB(sb);
+#ifdef CONFIG_RHEL_DIFFERENCES
+	static bool printed = false;
+#endif
 	int err;
 
 	sb->s_magic = EROFS_SUPER_MAGIC;
@@ -687,6 +690,12 @@ static int erofs_fc_fill_super(struct super_block *sb, struct fs_context *fc)
 		return err;
 
 	erofs_info(sb, "mounted with root inode @ nid %llu.", sbi->root_nid);
+#ifdef CONFIG_RHEL_DIFFERENCES
+	if (!printed) {
+		mark_tech_preview("EROFS filesystem", NULL);
+		printed = true;
+       }
+#endif
 	return 0;
 }
 
