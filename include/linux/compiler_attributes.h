@@ -123,6 +123,19 @@
 #endif
 
 /*
+ * Optional: only supported since gcc >= 14
+ * Optional: only supported since clang >= 18
+ *
+ *   gcc: https://gcc.gnu.org/bugzilla/show_bug.cgi?id=108896
+ * clang: https://reviews.llvm.org/D148381
+ */
+#if __has_attribute(__counted_by__)
+# define __counted_by(member)		__attribute__((__counted_by__(member)))
+#else
+# define __counted_by(member)
+#endif
+
+/*
  * Optional: not supported by gcc
  * Optional: only supported since clang >= 14.0
  * Optional: not supported by icc
@@ -312,19 +325,6 @@
 # define __pass_object_size(type)	__attribute__((__pass_object_size__(type)))
 #else
 # define __pass_object_size(type)
-#endif
-
-/*
- * Optional: only supported since gcc >= 14
- * Optional: only supported since clang >= 17
- *
- *   gcc: https://gcc.gnu.org/bugzilla/show_bug.cgi?id=108896
- * clang: https://reviews.llvm.org/D148381
- */
-#if __has_attribute(__element_count__)
-# define __counted_by(member)		__attribute__((__element_count__(#member)))
-#else
-# define __counted_by(member)
 #endif
 
 /*
