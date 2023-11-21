@@ -704,7 +704,7 @@ static const struct attribute_group vmbus_dev_group = {
 __ATTRIBUTE_GROUPS(vmbus_dev);
 
 /* Set up the attribute for /sys/bus/vmbus/hibernation */
-static ssize_t hibernation_show(struct bus_type *bus, char *buf)
+static ssize_t hibernation_show(const struct bus_type *bus, char *buf)
 {
 	return sprintf(buf, "%d\n", !!hv_is_hibernation_supported());
 }
@@ -731,9 +731,9 @@ __ATTRIBUTE_GROUPS(vmbus_bus);
  * representation of the device guid (each byte of the guid will be
  * represented with two hex characters.
  */
-static int vmbus_uevent(struct device *device, struct kobj_uevent_env *env)
+static int vmbus_uevent(const struct device *device, struct kobj_uevent_env *env)
 {
-	struct hv_device *dev = device_to_hv_device(device);
+	const struct hv_device *dev = device_to_hv_device(device);
 	const char *format = "MODALIAS=vmbus:%*phN";
 
 	return add_uevent_var(env, format, UUID_SIZE, &dev->dev_type);

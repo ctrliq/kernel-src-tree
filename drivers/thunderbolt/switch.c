@@ -271,9 +271,9 @@ static int nvm_authenticate(struct tb_switch *sw, bool auth_only)
 		}
 		sw->nvm->authenticating = true;
 		return usb4_switch_nvm_authenticate(sw);
-	} else if (auth_only) {
-		return -EOPNOTSUPP;
 	}
+	if (auth_only)
+		return -EOPNOTSUPP;
 
 	sw->nvm->authenticating = true;
 	if (!tb_route(sw)) {
@@ -2184,9 +2184,9 @@ static void tb_switch_release(struct device *dev)
 	kfree(sw);
 }
 
-static int tb_switch_uevent(struct device *dev, struct kobj_uevent_env *env)
+static int tb_switch_uevent(const struct device *dev, struct kobj_uevent_env *env)
 {
-	struct tb_switch *sw = tb_to_switch(dev);
+	const struct tb_switch *sw = tb_to_switch(dev);
 	const char *type;
 
 	if (sw->config.thunderbolt_version == USB4_VERSION_1_0) {

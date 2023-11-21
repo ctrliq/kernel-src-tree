@@ -20,7 +20,7 @@ struct dax_id {
 	char dev_name[DAX_NAME_LEN];
 };
 
-static int dax_bus_uevent(struct device *dev, struct kobj_uevent_env *env)
+static int dax_bus_uevent(const struct device *dev, struct kobj_uevent_env *env)
 {
 	/*
 	 * We only ever expect to handle device-dax instances, i.e. the
@@ -1474,7 +1474,7 @@ int __init dax_bus_init(void)
 	int rc;
 
 	if (IS_ENABLED(CONFIG_DEV_DAX_PMEM_COMPAT)) {
-		dax_class = class_create(THIS_MODULE, "dax");
+		dax_class = class_create("dax");
 		if (IS_ERR(dax_class))
 			return PTR_ERR(dax_class);
 	}
