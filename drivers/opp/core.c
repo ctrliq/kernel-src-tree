@@ -2190,6 +2190,10 @@ struct opp_table *dev_pm_opp_set_clkname(struct device *dev, const char *name)
 		goto err;
 	}
 
+	/* Another CPU that shares the OPP table has set the clkname ? */
+	if (opp_table->clk_configured)
+		return opp_table;
+
 	/* clk shouldn't be initialized at this point */
 	if (WARN_ON(opp_table->clk)) {
 		ret = -EBUSY;
@@ -2203,6 +2207,8 @@ struct opp_table *dev_pm_opp_set_clkname(struct device *dev, const char *name)
 				    "%s: Couldn't find clock\n", __func__);
 		goto err;
 	}
+
+	opp_table->clk_configured = true;
 
 	return opp_table;
 
@@ -2224,6 +2230,7 @@ void dev_pm_opp_put_clkname(struct opp_table *opp_table)
 
 	clk_put(opp_table->clk);
 	opp_table->clk = ERR_PTR(-EINVAL);
+	opp_table->clk_configured = false;
 
 	dev_pm_opp_put_opp_table(opp_table);
 }
