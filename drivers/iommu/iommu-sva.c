@@ -2,6 +2,7 @@
 /*
  * Helpers for IOMMU drivers implementing SVA
  */
+#include <linux/mmu_context.h>
 #include <linux/mutex.h>
 #include <linux/sched/mm.h>
 #include <linux/iommu.h>
@@ -15,6 +16,9 @@ static int iommu_sva_alloc_pasid(struct mm_struct *mm, struct device *dev)
 {
 	ioasid_t pasid;
 	int ret = 0;
+
+	if (!arch_pgtable_dma_compat(mm))
+		return -EBUSY;
 
 	mutex_lock(&iommu_sva_lock);
 	/* Is a PASID already associated with this mm? */

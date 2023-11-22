@@ -236,6 +236,16 @@ static void tcp_measure_rcv_mss(struct sock *sk, const struct sk_buff *skb)
 	 */
 	len = skb_shinfo(skb)->gso_size ? : skb->len;
 	if (len >= icsk->icsk_ack.rcv_mss) {
+		/* Note: divides are still a bit expensive.
+		 * For the moment, only adjust scaling_ratio
+		 * when we update icsk_ack.rcv_mss.
+		 */
+		if (unlikely(len != icsk->icsk_ack.rcv_mss)) {
+			u64 val = (u64)skb->len << TCP_RMEM_TO_WIN_SCALE;
+
+			do_div(val, skb->truesize);
+			tcp_sk(sk)->scaling_ratio = val ? val : 1;
+		}
 		icsk->icsk_ack.rcv_mss = min_t(unsigned int, len,
 					       tcp_sk(sk)->advmss);
 		/* Account for possibly-removed options */
@@ -491,8 +501,11 @@ static void tcp_grow_window(struct sock *sk, const struct sk_buff *skb)
 
 	room = min_t(int, tp->window_clamp, tcp_space(sk)) - tp->rcv_ssthresh;
 
+	if (room <= 0)
+		return;
+
 	/* Check #1 */
-	if (room > 0 && !tcp_under_memory_pressure(sk)) {
+	if (!tcp_under_memory_pressure(sk)) {
 		int incr;
 
 		/* Check #2. Increase window, if skb with such overhead
@@ -508,6 +521,11 @@ static void tcp_grow_window(struct sock *sk, const struct sk_buff *skb)
 			tp->rcv_ssthresh += min(room, incr);
 			inet_csk(sk)->icsk_ack.quick |= 1;
 		}
+	} else {
+		/* Under pressure:
+		 * Adjust rcv_ssthresh according to reserved mem
+		 */
+		tcp_adjust_rcv_ssthresh(sk);
 	}
 }
 
@@ -709,8 +727,8 @@ void tcp_rcv_space_adjust(struct sock *sk)
 
 	if (READ_ONCE(sock_net(sk)->ipv4.sysctl_tcp_moderate_rcvbuf) &&
 	    !(sk->sk_userlocks & SOCK_RCVBUF_LOCK)) {
-		int rcvmem, rcvbuf;
 		u64 rcvwin, grow;
+		int rcvbuf;
 
 		/* minimal window to cope with packet losses, assuming
 		 * steady state. Add some cushion because of small variations.
@@ -722,12 +740,7 @@ void tcp_rcv_space_adjust(struct sock *sk)
 		do_div(grow, tp->rcvq_space.space);
 		rcvwin += (grow << 1);
 
-		rcvmem = SKB_TRUESIZE(tp->advmss + MAX_TCP_HEADER);
-		while (tcp_win_from_space(sk, rcvmem) < tp->advmss)
-			rcvmem += 128;
-
-		do_div(rcvwin, tp->advmss);
-		rcvbuf = min_t(u64, rcvwin * rcvmem,
+		rcvbuf = min_t(u64, tcp_space_from_win(sk, rcvwin),
 			       READ_ONCE(sock_net(sk)->ipv4.sysctl_tcp_rmem[2]));
 		if (rcvbuf > sk->sk_rcvbuf) {
 			WRITE_ONCE(sk->sk_rcvbuf, rcvbuf);
@@ -4274,10 +4287,16 @@ static inline bool tcp_paws_discard(const struct sock *sk,
  * (borrowed from freebsd)
  */
 
-static inline bool tcp_sequence(const struct tcp_sock *tp, u32 seq, u32 end_seq)
+static enum skb_drop_reason tcp_sequence(const struct tcp_sock *tp,
+					 u32 seq, u32 end_seq)
 {
-	return	!before(end_seq, tp->rcv_wup) &&
-		!after(seq, tp->rcv_nxt + tcp_receive_window(tp));
+	if (before(end_seq, tp->rcv_wup))
+		return SKB_DROP_REASON_TCP_OLD_SEQUENCE;
+
+	if (after(seq, tp->rcv_nxt + tcp_receive_window(tp)))
+		return SKB_DROP_REASON_TCP_INVALID_SEQUENCE;
+
+	return SKB_NOT_DROPPED_YET;
 }
 
 /* When we get a reset we do this. */
@@ -5363,7 +5382,7 @@ static int tcp_prune_queue(struct sock *sk)
 	if (atomic_read(&sk->sk_rmem_alloc) >= sk->sk_rcvbuf)
 		tcp_clamp_window(sk);
 	else if (tcp_under_memory_pressure(sk))
-		tp->rcv_ssthresh = min(tp->rcv_ssthresh, 4U * tp->advmss);
+		tcp_adjust_rcv_ssthresh(sk);
 
 	if (atomic_read(&sk->sk_rmem_alloc) <= sk->sk_rcvbuf)
 		return 0;
@@ -5677,7 +5696,8 @@ static bool tcp_validate_incoming(struct sock *sk, struct sk_buff *skb,
 	}
 
 	/* Step 1: check sequence number */
-	if (!tcp_sequence(tp, TCP_SKB_CB(skb)->seq, TCP_SKB_CB(skb)->end_seq)) {
+	reason = tcp_sequence(tp, TCP_SKB_CB(skb)->seq, TCP_SKB_CB(skb)->end_seq);
+	if (reason) {
 		/* RFC793, page 37: "In all states except SYN-SENT, all reset
 		 * (RST) segments are validated by checking their SEQ-fields."
 		 * And page 69: "If an incoming segment is not acceptable,
@@ -5694,7 +5714,6 @@ static bool tcp_validate_incoming(struct sock *sk, struct sk_buff *skb,
 		} else if (tcp_reset_check(sk, skb)) {
 			goto reset;
 		}
-		SKB_DR_SET(reason, TCP_INVALID_SEQUENCE);
 		goto discard;
 	}
 

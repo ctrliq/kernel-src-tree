@@ -7,11 +7,14 @@
 #include <linux/compiler.h>
 #include <linux/instrumented.h>
 #include <linux/kasan-checks.h>
+#include <linux/mm_types.h>
 #include <linux/string.h>
+#include <linux/mmap_lock.h>
 #include <asm/asm.h>
 #include <asm/page.h>
 #include <asm/smap.h>
 #include <asm/extable.h>
+#include <asm/tlbflush.h>
 
 #ifdef CONFIG_DEBUG_ATOMIC_SLEEP
 static inline bool pagefault_disabled(void);
@@ -19,6 +22,12 @@ static inline bool pagefault_disabled(void);
 	WARN_ON_ONCE(!in_task() && !pagefault_disabled())
 #else
 # define WARN_ON_IN_IRQ()
+#endif
+
+#ifdef CONFIG_X86_32
+# include <asm/uaccess_32.h>
+#else
+# include <asm/uaccess_64.h>
 #endif
 
 /**
@@ -37,11 +46,14 @@ static inline bool pagefault_disabled(void);
  *
  * Return: true (nonzero) if the memory block may be valid, false (zero)
  * if it is definitely invalid.
+ *
+ * This should not be x86-specific. The only odd things out here is
+ * the WARN_ON_IN_IRQ(), which doesn't exist in the generic version.
  */
-#define access_ok(addr, size)					\
-({									\
-	WARN_ON_IN_IRQ();						\
-	likely(__access_ok(addr, size));				\
+#define access_ok(addr, size)			\
+({						\
+	WARN_ON_IN_IRQ();			\
+	likely(__access_ok(addr, size));	\
 })
 
 #include <asm-generic/access_ok.h>
@@ -530,14 +542,6 @@ extern struct movsl_mask {
 #endif
 
 #define ARCH_HAS_NOCACHE_UACCESS 1
-
-#ifdef CONFIG_X86_32
-unsigned long __must_check clear_user(void __user *mem, unsigned long len);
-unsigned long __must_check __clear_user(void __user *mem, unsigned long len);
-# include <asm/uaccess_32.h>
-#else
-# include <asm/uaccess_64.h>
-#endif
 
 /*
  * The "unsafe" user accesses aren't really "unsafe", but the naming
