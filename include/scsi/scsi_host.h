@@ -808,6 +808,7 @@ extern int __must_check scsi_add_host_with_dma(struct Scsi_Host *,
 					       struct device *);
 extern void scsi_scan_host(struct Scsi_Host *);
 extern void scsi_rescan_device(struct device *);
+extern int scsi_rescan_device_rh(struct device *dev);
 extern void scsi_remove_host(struct Scsi_Host *);
 extern struct Scsi_Host *scsi_host_get(struct Scsi_Host *);
 extern int scsi_host_busy(struct Scsi_Host *shost);
