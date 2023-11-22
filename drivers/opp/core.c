@@ -736,7 +736,7 @@ EXPORT_SYMBOL_GPL(dev_pm_opp_find_level_ceil);
 /**
  * dev_pm_opp_find_bw_ceil() - Search for a rounded ceil bandwidth
  * @dev:	device for which we do this operation
- * @freq:	start bandwidth
+ * @bw:	start bandwidth
  * @index:	which bandwidth to compare, in case of OPPs with several values
  *
  * Search for the matching floor *available* OPP from a starting bandwidth
@@ -795,7 +795,7 @@ EXPORT_SYMBOL_GPL(dev_pm_opp_find_bw_ceil);
 /**
  * dev_pm_opp_find_bw_floor() - Search for a rounded floor bandwidth
  * @dev:	device for which we do this operation
- * @freq:	start bandwidth
+ * @bw:	start bandwidth
  * @index:	which bandwidth to compare, in case of OPPs with several values
  *
  * Search for the matching floor *available* OPP from a starting bandwidth
