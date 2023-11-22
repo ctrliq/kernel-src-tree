@@ -43,6 +43,7 @@
 
 #include <net/strparser.h>
 #include <net/tls.h>
+#include <trace/events/sock.h>
 
 #include "tls.h"
 
@@ -2409,6 +2410,8 @@ static void tls_data_ready(struct sock *sk)
 	struct tls_sw_context_rx *ctx = tls_sw_ctx_rx(tls_ctx);
 	struct sk_psock *psock;
 	gfp_t alloc_save;
+
+	trace_sk_data_ready(sk);
 
 	alloc_save = sk->sk_allocation;
 	sk->sk_allocation = GFP_ATOMIC;
