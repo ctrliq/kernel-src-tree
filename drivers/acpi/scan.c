@@ -1545,7 +1545,6 @@ int acpi_dma_get_range(struct device *dev, const struct bus_dma_region **map)
 			r->cpu_start = rentry->res->start;
 			r->dma_start = rentry->res->start - rentry->offset;
 			r->size = resource_size(rentry->res);
-			r->offset = rentry->offset;
 			r++;
 		}
 	}
