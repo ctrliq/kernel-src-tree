@@ -2192,7 +2192,6 @@ static unsigned int xhci_get_block_size(struct usb_device *udev)
 	case USB_SPEED_SUPER_PLUS:
 		return SS_BLOCK;
 	case USB_SPEED_UNKNOWN:
-	case USB_SPEED_WIRELESS:
 	default:
 		/* Should never happen */
 		return 1;
@@ -2553,10 +2552,7 @@ static void xhci_drop_ep_from_interval_table(struct xhci_hcd *xhci,
 	case USB_SPEED_HIGH:
 		interval_bw->overhead[HS_OVERHEAD_TYPE] -= 1;
 		break;
-	case USB_SPEED_SUPER:
-	case USB_SPEED_SUPER_PLUS:
-	case USB_SPEED_UNKNOWN:
-	case USB_SPEED_WIRELESS:
+	default:
 		/* Should never happen because only LS/FS/HS endpoints will get
 		 * added to the endpoint list.
 		 */
@@ -2613,10 +2609,7 @@ static void xhci_add_ep_to_interval_table(struct xhci_hcd *xhci,
 	case USB_SPEED_HIGH:
 		interval_bw->overhead[HS_OVERHEAD_TYPE] += 1;
 		break;
-	case USB_SPEED_SUPER:
-	case USB_SPEED_SUPER_PLUS:
-	case USB_SPEED_UNKNOWN:
-	case USB_SPEED_WIRELESS:
+	default:
 		/* Should never happen because only LS/FS/HS endpoints will get
 		 * added to the endpoint list.
 		 */
