@@ -1880,7 +1880,7 @@ select_insn:
 		case 1:
 			AX = abs((s32)DST);
 			do_div(AX, abs((s32)SRC));
-			if ((s32)DST < 0 == (s32)SRC < 0)
+			if (((s32)DST < 0) == ((s32)SRC < 0))
 				DST = (u32)AX;
 			else
 				DST = (u32)-AX;
@@ -1907,7 +1907,7 @@ select_insn:
 		case 1:
 			AX = abs((s32)DST);
 			do_div(AX, abs((s32)IMM));
-			if ((s32)DST < 0 == (s32)IMM < 0)
+			if (((s32)DST < 0) == ((s32)IMM < 0))
 				DST = (u32)AX;
 			else
 				DST = (u32)-AX;
