@@ -2197,12 +2197,6 @@ static inline void setup_getcpu(int cpu)
 	write_gdt_entry(get_cpu_gdt_rw(cpu), GDT_ENTRY_CPUNODE, &d, DESCTYPE_S);
 }
 
-static inline void ucode_cpu_init(int cpu)
-{
-	if (cpu)
-		load_ucode_ap();
-}
-
 static inline void tss_setup_ist(struct tss_struct *tss)
 {
 	/* Set up the per-CPU TSS IST stacks */
@@ -2217,11 +2211,6 @@ static inline void tss_setup_ist(struct tss_struct *tss)
 #else /* CONFIG_X86_64 */
 
 static inline void setup_getcpu(int cpu) { }
-
-static inline void ucode_cpu_init(int cpu)
-{
-	show_ucode_info_early();
-}
 
 static inline void tss_setup_ist(struct tss_struct *tss) { }
 
@@ -2279,8 +2268,6 @@ void cpu_init(void)
 {
 	struct task_struct *cur = current;
 	int cpu = raw_smp_processor_id();
-
-	ucode_cpu_init(cpu);
 
 #ifdef CONFIG_NUMA
 	if (this_cpu_read(numa_node) == 0 &&
