@@ -628,6 +628,7 @@ sources-rh: $(TARBALL) generate-testpatch-tmp setup-source dist-configs-check
 		rpminspect.yaml > $(SOURCES)/rpminspect.yaml
 	@cp cpupower.* \
 		keys/rhel*.x509 \
+		keys/nvidia*.x509 \
 		kabi/check-kabi \
 		configs/$(PACKAGE_NAME)-*.config \
 		configs/partial*.config \
