@@ -3087,8 +3087,6 @@ static int __init team_module_init(void)
 	if (err)
 		goto err_nl_init;
 
-	mark_driver_deprecated(DRV_NAME);
-
 	return 0;
 
 err_nl_init:

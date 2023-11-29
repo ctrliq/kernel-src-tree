@@ -1876,7 +1876,6 @@ static int __init nvmet_tcp_init(void)
 	if (ret)
 		goto err;
 
-	mark_driver_unmaintained("NVMe/TCP Target");
 	return 0;
 err:
 	destroy_workqueue(nvmet_tcp_wq);
