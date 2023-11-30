@@ -159,8 +159,7 @@ static void osnoise_unregister_instance(struct trace_array *tr)
 	if (!found)
 		return;
 
-	synchronize_rcu();
-	kfree(inst);
+	kvfree_rcu(inst);
 }
 
 /*
