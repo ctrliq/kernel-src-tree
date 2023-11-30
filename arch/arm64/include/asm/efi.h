@@ -114,6 +114,8 @@ static inline unsigned long efi_get_kimg_min_align(void)
 #define EFI_ALLOC_ALIGN		SZ_64K
 #define EFI_ALLOC_LIMIT		((1UL << 48) - 1)
 
+extern unsigned long primary_entry_offset(void);
+
 /*
  * On ARM systems, virtually remapped UEFI runtime services are set up in two
  * distinct stages:
@@ -162,5 +164,7 @@ static inline void efi_capsule_flush_cache_range(void *addr, int size)
 {
 	dcache_clean_inval_poc((unsigned long)addr, (unsigned long)addr + size);
 }
+
+efi_status_t efi_handle_corrupted_x18(efi_status_t s, const char *f);
 
 #endif /* _ASM_EFI_H */

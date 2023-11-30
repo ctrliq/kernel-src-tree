@@ -123,6 +123,7 @@ static const struct ftr_set_desc isar2 __initconst = {
 	.fields		= {
 		FIELD("gpa3", ID_AA64ISAR2_EL1_GPA3_SHIFT, NULL),
 		FIELD("apa3", ID_AA64ISAR2_EL1_APA3_SHIFT, NULL),
+		FIELD("mops", ID_AA64ISAR2_EL1_MOPS_SHIFT, NULL),
 		{}
 	},
 };
@@ -167,16 +168,24 @@ static const struct {
 } aliases[] __initconst = {
 	{ "kvm-arm.mode=nvhe",		"id_aa64mmfr1.vh=0" },
 	{ "kvm-arm.mode=protected",	"id_aa64mmfr1.vh=0" },
-	{ "arm64.nosve",		"id_aa64pfr0.sve=0 id_aa64pfr1.sme=0" },
+	{ "arm64.nosve",		"id_aa64pfr0.sve=0" },
 	{ "arm64.nosme",		"id_aa64pfr1.sme=0" },
 	{ "arm64.nobti",		"id_aa64pfr1.bt=0" },
 	{ "arm64.nopauth",
 	  "id_aa64isar1.gpi=0 id_aa64isar1.gpa=0 "
 	  "id_aa64isar1.api=0 id_aa64isar1.apa=0 "
 	  "id_aa64isar2.gpa3=0 id_aa64isar2.apa3=0"	   },
+	{ "arm64.nomops",		"id_aa64isar2.mops=0" },
 	{ "arm64.nomte",		"id_aa64pfr1.mte=0" },
 	{ "nokaslr",			"kaslr.disabled=1" },
 };
+
+static int __init parse_nokaslr(char *unused)
+{
+	/* nokaslr param handling is done by early cpufeature code */
+	return 0;
+}
+early_param("nokaslr", parse_nokaslr);
 
 static int __init find_field(const char *cmdline,
 			     const struct ftr_set_desc *reg, int f, u64 *v)
@@ -247,8 +256,8 @@ static __init void __parse_cmdline(const char *cmdline, bool parse_aliases)
 			return;
 
 		len = min(len, ARRAY_SIZE(buf) - 1);
-		strncpy(buf, cmdline, len);
-		buf[len] = 0;
+		memcpy(buf, cmdline, len);
+		buf[len] = '\0';
 
 		if (strcmp(buf, "--") == 0)
 			return;
