@@ -1352,19 +1352,6 @@ static int lpuart_config_rs485(struct uart_port *port,
 		modem |= UARTMODEM_TXRTSE;
 
 		/*
-		 * RTS needs to be logic HIGH either during transfer _or_ after
-		 * transfer, other variants are not supported by the hardware.
-		 */
-
-		if (!(rs485->flags & (SER_RS485_RTS_ON_SEND |
-				SER_RS485_RTS_AFTER_SEND)))
-			rs485->flags |= SER_RS485_RTS_ON_SEND;
-
-		if (rs485->flags & SER_RS485_RTS_ON_SEND &&
-				rs485->flags & SER_RS485_RTS_AFTER_SEND)
-			rs485->flags &= ~SER_RS485_RTS_AFTER_SEND;
-
-		/*
 		 * The hardware defaults to RTS logic HIGH while transfer.
 		 * Switch polarity in case RTS shall be logic HIGH
 		 * after transfer.
@@ -1375,9 +1362,6 @@ static int lpuart_config_rs485(struct uart_port *port,
 		else if (rs485->flags & SER_RS485_RTS_AFTER_SEND)
 			modem |= UARTMODEM_TXRTSPOL;
 	}
-
-	/* Store the new configuration */
-	sport->port.rs485 = *rs485;
 
 	writeb(modem, sport->port.membase + UARTMODEM);
 	return 0;
@@ -1403,19 +1387,6 @@ static int lpuart32_config_rs485(struct uart_port *port,
 		modem |= UARTMODEM_TXRTSE;
 
 		/*
-		 * RTS needs to be logic HIGH either during transfer _or_ after
-		 * transfer, other variants are not supported by the hardware.
-		 */
-
-		if (!(rs485->flags & (SER_RS485_RTS_ON_SEND |
-				SER_RS485_RTS_AFTER_SEND)))
-			rs485->flags |= SER_RS485_RTS_ON_SEND;
-
-		if (rs485->flags & SER_RS485_RTS_ON_SEND &&
-				rs485->flags & SER_RS485_RTS_AFTER_SEND)
-			rs485->flags &= ~SER_RS485_RTS_AFTER_SEND;
-
-		/*
 		 * The hardware defaults to RTS logic HIGH while transfer.
 		 * Switch polarity in case RTS shall be logic HIGH
 		 * after transfer.
@@ -1426,9 +1397,6 @@ static int lpuart32_config_rs485(struct uart_port *port,
 		else if (rs485->flags & SER_RS485_RTS_AFTER_SEND)
 			modem |= UARTMODEM_TXRTSPOL;
 	}
-
-	/* Store the new configuration */
-	sport->port.rs485 = *rs485;
 
 	lpuart32_write(&sport->port, modem, UARTMODIR);
 	return 0;
