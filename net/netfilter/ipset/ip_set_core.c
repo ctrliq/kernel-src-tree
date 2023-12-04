@@ -1051,8 +1051,6 @@ static int ip_set_create(struct sk_buff *skb, const struct nfnl_info *info,
 	u32 flags = flag_exist(info->nlh);
 	int ret = 0;
 
-	DO_ONCE_LITE(mark_driver_deprecated, "ipset");
-
 	if (unlikely(protocol_min_failed(attr) ||
 		     !attr[IPSET_ATTR_SETNAME] ||
 		     !attr[IPSET_ATTR_TYPENAME] ||

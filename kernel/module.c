@@ -3987,6 +3987,11 @@ static int load_module(struct load_info *info, const char __user *uargs,
 		goto free_copy;
 	}
 
+#ifdef CONFIG_RHEL_DIFFERENCES
+	if (get_modinfo(info, "intree"))
+		module_rh_check_status(info->name);
+#endif
+
 	err = rewrite_section_headers(info, flags);
 	if (err)
 		goto free_copy;
