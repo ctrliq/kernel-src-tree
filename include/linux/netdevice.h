@@ -2832,7 +2832,6 @@ enum netdev_cmd {
 	NETDEV_OFFLOAD_XSTATS_REPORT_USED,
 	NETDEV_OFFLOAD_XSTATS_REPORT_DELTA,
 	NETDEV_XDP_FEAT_CHANGE,
-	NETDEV_PRE_CHANGE_HWTSTAMP,
 };
 const char *netdev_cmd_to_name(enum netdev_cmd cmd);
 
@@ -2881,11 +2880,6 @@ struct netdev_notifier_changelowerstate_info {
 struct netdev_notifier_pre_changeaddr_info {
 	struct netdev_notifier_info info; /* must be first */
 	const unsigned char *dev_addr;
-};
-
-struct netdev_notifier_hwtstamp_info {
-	struct netdev_notifier_info info; /* must be first */
-	struct kernel_hwtstamp_config *config;
 };
 
 enum netdev_offload_xstats_type {
