@@ -1,5 +1,7 @@
 #!/bin/bash
 
+# shellcheck disable=all
+
 releasenum=$1
 
 # Releasenum is really just the last digit as we have series based on Fedora Release
