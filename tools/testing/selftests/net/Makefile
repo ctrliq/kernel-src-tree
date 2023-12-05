@@ -58,6 +58,7 @@ TEST_GEN_FILES += cmsg_so_mark
 TEST_GEN_FILES += stress_reuseport_listen
 TEST_GEN_FILES += io_uring_zerocopy_tx
 TEST_PROGS += io_uring_zerocopy_tx.sh
+TEST_PROGS += test_bridge_neigh_suppress.sh
 
 TEST_FILES := settings
 
