@@ -5583,6 +5583,15 @@ static int __ext4_fill_super(struct fs_context *fc, struct super_block *sb)
 	atomic_set(&sbi->s_warning_count, 0);
 	atomic_set(&sbi->s_msg_count, 0);
 
+	if (ext4_has_feature_verity(sb)) {
+		static bool printed = false;
+
+		if (!printed) {
+			mark_tech_preview("fs-verity on ext4", NULL);
+			printed = true;
+		}
+	}
+
 	return 0;
 
 failed_mount9:
