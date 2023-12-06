@@ -234,6 +234,10 @@ void panic(const char *fmt, ...)
 		buf[len - 1] = '\0';
 
 	pr_emerg("Kernel panic - not syncing: %s\n", buf);
+
+	/* Bust spinlocks before flushing console on panic to prevent hangs */
+	bust_spinlocks(1);
+
 #ifdef CONFIG_DEBUG_BUGVERBOSE
 	/*
 	 * Avoid nested stack-dumping if a panic occurs during oops processing
@@ -245,7 +249,6 @@ void panic(const char *fmt, ...)
 	/* If atomic consoles are available, flush the kernel log. */
 	console_flush_on_panic(CONSOLE_ATOMIC_FLUSH_PENDING);
 
-	bust_spinlocks(1);
 
 	/*
 	 * If kgdb is enabled, give it a chance to run before we stop all
