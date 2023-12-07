@@ -58,6 +58,9 @@ void adf_dev_stop(struct adf_accel_dev *accel_dev);
 void adf_dev_shutdown(struct adf_accel_dev *accel_dev);
 int adf_dev_shutdown_cache_cfg(struct adf_accel_dev *accel_dev);
 
+int adf_dev_up(struct adf_accel_dev *accel_dev, bool init_config);
+int adf_dev_down(struct adf_accel_dev *accel_dev, bool cache_config);
+
 void adf_devmgr_update_class_index(struct adf_hw_device_data *hw_data);
 void adf_clean_vf_map(bool);
 
@@ -88,8 +91,6 @@ int adf_ae_start(struct adf_accel_dev *accel_dev);
 int adf_ae_stop(struct adf_accel_dev *accel_dev);
 
 extern const struct pci_error_handlers adf_err_handler;
-void adf_enable_aer(struct adf_accel_dev *accel_dev);
-void adf_disable_aer(struct adf_accel_dev *accel_dev);
 void adf_reset_sbr(struct adf_accel_dev *accel_dev);
 void adf_reset_flr(struct adf_accel_dev *accel_dev);
 void adf_dev_restore(struct adf_accel_dev *accel_dev);
