@@ -69,8 +69,6 @@ extern const struct tls_cipher_size_desc tls_cipher_size_desc[];
 
 #define TLS_CRYPTO_INFO_READY(info)	((info)->cipher_type)
 
-#define TLS_RECORD_TYPE_DATA		0x17
-
 #define TLS_AAD_SPACE_SIZE		13
 
 #define MAX_IV_SIZE			16
