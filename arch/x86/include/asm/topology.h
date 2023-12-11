@@ -141,7 +141,6 @@ static inline int topology_max_smt_threads(void)
 int topology_update_package_map(unsigned int apicid, unsigned int cpu);
 int topology_update_die_map(unsigned int dieid, unsigned int cpu);
 int topology_phys_to_logical_pkg(unsigned int pkg);
-int topology_phys_to_logical_die(unsigned int die, unsigned int cpu);
 bool topology_is_primary_thread(unsigned int cpu);
 #else
 #define topology_max_packages()			(1)
@@ -150,8 +149,6 @@ topology_update_package_map(unsigned int apicid, unsigned int cpu) { return 0; }
 static inline int
 topology_update_die_map(unsigned int dieid, unsigned int cpu) { return 0; }
 static inline int topology_phys_to_logical_pkg(unsigned int pkg) { return 0; }
-static inline int topology_phys_to_logical_die(unsigned int die,
-		unsigned int cpu) { return 0; }
 static inline int topology_max_die_per_package(void) { return 1; }
 static inline int topology_max_smt_threads(void) { return 1; }
 static inline bool topology_is_primary_thread(unsigned int cpu) { return true; }
@@ -212,17 +209,17 @@ static inline long arch_scale_freq_capacity(int cpu)
 }
 #define arch_scale_freq_capacity arch_scale_freq_capacity
 
+extern void arch_set_max_freq_ratio(bool turbo_disabled);
+extern void freq_invariance_set_perf_ratio(u64 ratio, bool turbo_disabled);
+#else
+static inline void arch_set_max_freq_ratio(bool turbo_disabled) { }
+static inline void freq_invariance_set_perf_ratio(u64 ratio, bool turbo_disabled) { }
+#endif
+
 extern void arch_scale_freq_tick(void);
 #define arch_scale_freq_tick arch_scale_freq_tick
 
-extern void arch_set_max_freq_ratio(bool turbo_disabled);
-#else
-static inline void arch_set_max_freq_ratio(bool turbo_disabled)
-{
-}
-#endif
-
-#if defined(CONFIG_ACPI_CPPC_LIB) && defined(CONFIG_SMP)
+#ifdef CONFIG_ACPI_CPPC_LIB
 void init_freq_invariance_cppc(void);
 #define arch_init_invariance_cppc init_freq_invariance_cppc
 #endif

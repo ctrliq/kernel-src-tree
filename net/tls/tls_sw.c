@@ -940,8 +940,11 @@ int tls_sw_sendmsg(struct sock *sk, struct msghdr *msg, size_t size)
 	int pending;
 
 	if (msg->msg_flags & ~(MSG_MORE | MSG_DONTWAIT | MSG_NOSIGNAL |
-			       MSG_CMSG_COMPAT))
+			       MSG_EOR | MSG_CMSG_COMPAT))
 		return -EOPNOTSUPP;
+
+	if (!eor && (msg->msg_flags & MSG_EOR))
+		return -EINVAL;
 
 	ret = mutex_lock_interruptible(&tls_ctx->tx_lock);
 	if (ret)
@@ -1276,7 +1279,8 @@ int tls_sw_sendpage(struct sock *sk, struct page *page,
 	int ret;
 
 	if (flags & ~(MSG_MORE | MSG_DONTWAIT | MSG_NOSIGNAL |
-		      MSG_SENDPAGE_NOTLAST | MSG_SENDPAGE_NOPOLICY))
+		      MSG_SENDPAGE_NOTLAST | MSG_EOR |
+		      MSG_SENDPAGE_NOPOLICY))
 		return -EOPNOTSUPP;
 
 	ret = mutex_lock_interruptible(&tls_ctx->tx_lock);
@@ -1855,13 +1859,11 @@ tls_read_flush_backlog(struct sock *sk, struct tls_prot_info *prot,
 	return sk_flush_backlog(sk);
 }
 
-static int tls_rx_reader_lock(struct sock *sk, struct tls_sw_context_rx *ctx,
-			      bool nonblock)
+static int tls_rx_reader_acquire(struct sock *sk, struct tls_sw_context_rx *ctx,
+				 bool nonblock)
 {
 	long timeo;
-	int err;
-
-	lock_sock(sk);
+	int ret;
 
 	timeo = sock_rcvtimeo(sk, nonblock);
 
@@ -1871,32 +1873,36 @@ static int tls_rx_reader_lock(struct sock *sk, struct tls_sw_context_rx *ctx,
 		ctx->reader_contended = 1;
 
 		add_wait_queue(&ctx->wq, &wait);
-		err = sk_wait_event(sk, &timeo,
+		ret = sk_wait_event(sk, &timeo,
 				    !READ_ONCE(ctx->reader_present), &wait);
 		remove_wait_queue(&ctx->wq, &wait);
 
-		if (timeo <= 0) {
-			err = -EAGAIN;
-			goto err_unlock;
-		}
-		if (signal_pending(current)) {
-			err = sock_intr_errno(timeo);
-			goto err_unlock;
-		}
-		if (err < 0)
-			goto err_unlock;
+		if (timeo <= 0)
+			return -EAGAIN;
+		if (signal_pending(current))
+			return sock_intr_errno(timeo);
+		if (ret < 0)
+			return ret;
 	}
 
 	WRITE_ONCE(ctx->reader_present, 1);
 
 	return 0;
+}
 
-err_unlock:
-	release_sock(sk);
+static int tls_rx_reader_lock(struct sock *sk, struct tls_sw_context_rx *ctx,
+			      bool nonblock)
+{
+	int err;
+
+	lock_sock(sk);
+	err = tls_rx_reader_acquire(sk, ctx, nonblock);
+	if (err)
+		release_sock(sk);
 	return err;
 }
 
-static void tls_rx_reader_unlock(struct sock *sk, struct tls_sw_context_rx *ctx)
+static void tls_rx_reader_release(struct sock *sk, struct tls_sw_context_rx *ctx)
 {
 	if (unlikely(ctx->reader_contended)) {
 		if (wq_has_sleeper(&ctx->wq))
@@ -1908,6 +1914,11 @@ static void tls_rx_reader_unlock(struct sock *sk, struct tls_sw_context_rx *ctx)
 	}
 
 	WRITE_ONCE(ctx->reader_present, 0);
+}
+
+static void tls_rx_reader_unlock(struct sock *sk, struct tls_sw_context_rx *ctx)
+{
+	tls_rx_reader_release(sk, ctx);
 	release_sock(sk);
 }
 
@@ -2206,6 +2217,105 @@ splice_read_end:
 splice_requeue:
 	__skb_queue_head(&ctx->rx_list, skb);
 	goto splice_read_end;
+}
+
+int tls_sw_read_sock(struct sock *sk, read_descriptor_t *desc,
+		     sk_read_actor_t read_actor)
+{
+	struct tls_context *tls_ctx = tls_get_ctx(sk);
+	struct tls_sw_context_rx *ctx = tls_sw_ctx_rx(tls_ctx);
+	struct tls_prot_info *prot = &tls_ctx->prot_info;
+	struct strp_msg *rxm = NULL;
+	struct sk_buff *skb = NULL;
+	struct sk_psock *psock;
+	size_t flushed_at = 0;
+	bool released = true;
+	struct tls_msg *tlm;
+	ssize_t copied = 0;
+	ssize_t decrypted;
+	int err, used;
+
+	psock = sk_psock_get(sk);
+	if (psock) {
+		sk_psock_put(sk, psock);
+		return -EINVAL;
+	}
+	err = tls_rx_reader_acquire(sk, ctx, true);
+	if (err < 0)
+		return err;
+
+	/* If crypto failed the connection is broken */
+	err = ctx->async_wait.err;
+	if (err)
+		goto read_sock_end;
+
+	decrypted = 0;
+	do {
+		if (!skb_queue_empty(&ctx->rx_list)) {
+			skb = __skb_dequeue(&ctx->rx_list);
+			rxm = strp_msg(skb);
+			tlm = tls_msg(skb);
+		} else {
+			struct tls_decrypt_arg darg;
+			int to_decrypt;
+
+			err = tls_rx_rec_wait(sk, NULL, true, released);
+			if (err <= 0)
+				goto read_sock_end;
+
+			memset(&darg.inargs, 0, sizeof(darg.inargs));
+
+			rxm = strp_msg(tls_strp_msg(ctx));
+			tlm = tls_msg(tls_strp_msg(ctx));
+
+			to_decrypt = rxm->full_len - prot->overhead_size;
+
+			err = tls_rx_one_record(sk, NULL, &darg);
+			if (err < 0) {
+				tls_err_abort(sk, -EBADMSG);
+				goto read_sock_end;
+			}
+
+			released = tls_read_flush_backlog(sk, prot, rxm->full_len, to_decrypt,
+							  decrypted, &flushed_at);
+			skb = darg.skb;
+			decrypted += rxm->full_len;
+
+			tls_rx_rec_done(ctx);
+		}
+
+		/* read_sock does not support reading control messages */
+		if (tlm->control != TLS_RECORD_TYPE_DATA) {
+			err = -EINVAL;
+			goto read_sock_requeue;
+		}
+
+		used = read_actor(desc, skb, rxm->offset, rxm->full_len);
+		if (used <= 0) {
+			if (!copied)
+				err = used;
+			goto read_sock_requeue;
+		}
+		copied += used;
+		if (used < rxm->full_len) {
+			rxm->offset += used;
+			rxm->full_len -= used;
+			if (!desc->count)
+				goto read_sock_requeue;
+		} else {
+			consume_skb(skb);
+			if (!desc->count)
+				skb = NULL;
+		}
+	} while (skb);
+
+read_sock_end:
+	tls_rx_reader_release(sk, ctx);
+	return copied ? : err;
+
+read_sock_requeue:
+	__skb_queue_head(&ctx->rx_list, skb);
+	goto read_sock_end;
 }
 
 bool tls_sw_sock_is_readable(struct sock *sk)
