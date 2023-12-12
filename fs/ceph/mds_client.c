@@ -2310,7 +2310,7 @@ static void ceph_cap_unlink_work(struct work_struct *work)
 			spin_unlock(&mdsc->cap_unlink_delay_lock);
 			dout("on %p %llx.%llx\n", inode,
 			      ceph_vinop(inode));
-			ceph_check_caps(ci, CHECK_CAPS_FLUSH, NULL);
+			ceph_check_caps(ci, CHECK_CAPS_FLUSH);
 			iput(inode);
 			spin_lock(&mdsc->cap_unlink_delay_lock);
 		}
