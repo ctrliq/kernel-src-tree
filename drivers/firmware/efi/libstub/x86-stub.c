@@ -23,7 +23,7 @@
 
 const efi_system_table_t *efi_system_table;
 const efi_dxe_services_table_t *efi_dxe_table;
-extern u32 image_offset;
+u32 image_offset __section(".data");
 static efi_loaded_image_t *image = NULL;
 
 typedef union sev_memory_acceptance_protocol sev_memory_acceptance_protocol_t;
