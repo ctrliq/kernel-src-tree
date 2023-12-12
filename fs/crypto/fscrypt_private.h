@@ -591,8 +591,9 @@ int __init fscrypt_init_keyring(void);
 struct fscrypt_mode {
 	const char *friendly_name;
 	const char *cipher_str;
-	int keysize;
-	int ivsize;
+	int keysize;            /* key size in bytes */
+	int security_strength;  /* security strength in bytes */
+	int ivsize;             /* IV size in bytes */
 	int logged_cryptoapi_impl;
 	int logged_blk_crypto_native;
 	int logged_blk_crypto_fallback;
