@@ -3050,7 +3050,7 @@ int __ceph_get_caps(struct inode *inode, struct ceph_file_info *fi, int need,
 		}
 
 		if (S_ISREG(ci->netfs.inode.i_mode) &&
-		    ci->i_inline_version != CEPH_INLINE_NONE &&
+		    ceph_has_inline_data(ci) &&
 		    (_got & (CEPH_CAP_FILE_CACHE|CEPH_CAP_FILE_LAZYIO)) &&
 		    i_size_read(inode) > 0) {
 			struct page *page =
