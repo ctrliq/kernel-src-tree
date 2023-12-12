@@ -82,7 +82,7 @@ static noinline void __nft_trace_verdict(struct nft_traceinfo *info,
 {
 	enum nft_trace_types type;
 
-	switch (regs->verdict.code) {
+	switch (regs->verdict.code & NF_VERDICT_MASK) {
 	case NFT_CONTINUE:
 	case NFT_RETURN:
 		type = NFT_TRACETYPE_RETURN;
