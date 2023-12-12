@@ -22,7 +22,6 @@ obj-$(CONFIG_ACER_WIRELESS)	+= acer-wireless.o
 obj-$(CONFIG_ACER_WMI)		+= acer-wmi.o
 
 # AMD
-obj-$(CONFIG_AMD_HSMP)		+= amd_hsmp.o
 obj-y				+= amd/
 
 # Advantech
