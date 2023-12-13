@@ -11,7 +11,7 @@
 #include <linux/cpu_pm.h>
 #include <linux/psci.h>
 
-#ifdef CONFIG_ACPI
+#ifdef CONFIG_ACPI_PROCESSOR_IDLE
 
 #include <acpi/processor.h>
 
