@@ -506,7 +506,7 @@ static int blkdev_open(struct inode *inode, struct file *filp)
 	 * during an unstable branch.
 	 */
 	filp->f_flags |= O_LARGEFILE;
-	filp->f_mode |= FMODE_NOWAIT | FMODE_BUF_RASYNC;
+	filp->f_mode |= FMODE_BUF_RASYNC;
 
 	/*
 	 * Use the file private data to store the holder for exclusive openes.
@@ -519,6 +519,9 @@ static int blkdev_open(struct inode *inode, struct file *filp)
 				 filp->private_data, NULL);
 	if (IS_ERR(bdev))
 		return PTR_ERR(bdev);
+
+	if (bdev_nowait(bdev))
+		filp->f_mode |= FMODE_NOWAIT;
 
 	filp->f_mapping = bdev->bd_inode->i_mapping;
 	filp->f_wb_err = filemap_sample_wb_err(filp->f_mapping);
