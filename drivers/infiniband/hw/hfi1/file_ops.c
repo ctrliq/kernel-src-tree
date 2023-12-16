@@ -267,16 +267,13 @@ static ssize_t hfi1_write_iter(struct kiocb *kiocb, struct iov_iter *from)
 
 	if (!HFI1_CAP_IS_KSET(SDMA))
 		return -EINVAL;
+	if (!from->user_backed)
+		return -EINVAL;
 	idx = srcu_read_lock(&fd->pq_srcu);
 	pq = srcu_dereference(fd->pq, &fd->pq_srcu);
 	if (!cq || !pq) {
 		srcu_read_unlock(&fd->pq_srcu, idx);
 		return -EIO;
-	}
-
-	if (!iter_is_iovec(from) || !dim) {
-		srcu_read_unlock(&fd->pq_srcu, idx);
-		return -EINVAL;
 	}
 
 	trace_hfi1_sdma_request(fd->dd, fd->uctxt->ctxt, fd->subctxt, dim);
@@ -977,7 +974,7 @@ static int allocate_ctxt(struct hfi1_filedata *fd, struct hfi1_devdata *dd,
 		ret = -ENOMEM;
 		goto ctxdata_free;
 	}
-	hfi1_cdbg(PROC, "allocated send context %u(%u)\n", uctxt->sc->sw_index,
+	hfi1_cdbg(PROC, "allocated send context %u(%u)", uctxt->sc->sw_index,
 		  uctxt->sc->hw_context);
 	ret = sc_enable(uctxt->sc);
 	if (ret)
