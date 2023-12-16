@@ -8,7 +8,7 @@ NAME = Opossums on Parade
 # DRM backport version
 #
 RHEL_DRM_VERSION = 6
-RHEL_DRM_PATCHLEVEL = 3
+RHEL_DRM_PATCHLEVEL = 6
 RHEL_DRM_SUBLEVEL = 
 
 # *DOCUMENTATION*
