@@ -2044,6 +2044,9 @@ void bio_associate_blkg(struct bio *bio)
 {
 	struct cgroup_subsys_state *css;
 
+	if (blk_op_is_passthrough(bio->bi_opf))
+		return;
+
 	rcu_read_lock();
 
 	if (bio->bi_blkg)
