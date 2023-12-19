@@ -699,6 +699,8 @@ sources-rh: $(TARBALL) generate-testpatch-tmp setup-source dist-configs-check
 		kernel-local \
 		dracut-virt.conf \
 		$(SOURCES)/
+	@cat $$(ls -1 $(SPECPACKAGE_NAME).changelog-* | sort -t '.' -k 3 -n -r) \
+		| xz > $(SOURCES)/kernel.changelog.xz
 	@if [ "$(RELEASED_KERNEL)" -ne 0 ]; then \
 		cp keys/redhatsecureboot{301,501,ca5,ca1}.cer $(SOURCES)/; \
 		cp keys/secureboot_{ppc,s390}.cer $(SOURCES)/; \
