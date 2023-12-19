@@ -60,15 +60,20 @@ _dist-release_test_3() {
 	# Test whether the version in the commit message matches
 	# the version in the change log.
 	cd $BATS_TMPDIR/distrelease
+
 	# Extract just the version part (the part between [ ]) on the first line of
 	# the change log:
 	changelog=$(head -1 ./redhat/kernel.changelog-${RHEL_MAJOR}.${RHEL_MINOR} | sed -e 's/.*\[\(.*\)\].*/\1/')
-	commit="$(git log --oneline --all  --grep "\[redhat\] kernel" -n 1 --pretty="format:%s")"
+
+	# Extract the tag in the latest [redhat] kernel commit message
+	commit="$(git log --oneline --grep "\[redhat\] kernel" -n 1 --pretty="format:%s")"
 	# Extract just the commit message part AFTER "[redhat] ":
 	gitlog=${commit##*\[redhat\] }
 	# This time, strip off "kernel-" also:
 	gitlog=${gitlog/kernel-/}
+
 	echo "The kernel version in the changelog-${RHEL_MAJOR}.${RHEL_MINOR} ("${changelog}") differs from the version in the git log ($gitlog)"
+
 	run _dist-release_test_3
 	check_status
 }
