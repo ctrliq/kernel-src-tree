@@ -49,7 +49,8 @@ struct iov_iter {
 	};
 	size_t count;
 	union {
-		const struct iovec *iov;
+		/* use iter_iov() to get the current vec */
+		const struct iovec *__iov;
 		const struct kvec *kvec;
 		const struct bio_vec *bvec;
 		struct xarray *xarray;
@@ -65,6 +66,10 @@ struct iov_iter {
 		loff_t xarray_start;
 	};
 };
+
+#define iter_iov(iter)	(iter)->__iov
+#define iter_iov_addr(iter)	(iter_iov(iter)->iov_base + (iter)->iov_offset)
+#define iter_iov_len(iter)	(iter_iov(iter)->iov_len - (iter)->iov_offset)
 
 static inline enum iter_type iov_iter_type(const struct iov_iter *i)
 {
@@ -139,15 +144,6 @@ static inline size_t iov_length(const struct iovec *iov, unsigned long nr_segs)
 	for (seg = 0; seg < nr_segs; seg++)
 		ret += iov[seg].iov_len;
 	return ret;
-}
-
-static inline struct iovec iov_iter_iovec(const struct iov_iter *iter)
-{
-	return (struct iovec) {
-		.iov_base = iter->iov->iov_base + iter->iov_offset,
-		.iov_len = min(iter->count,
-			       iter->iov->iov_len - iter->iov_offset),
-	};
 }
 
 size_t copy_page_from_iter_atomic(struct page *page, unsigned offset,
@@ -343,6 +339,7 @@ ssize_t __import_iovec(int type, const struct iovec __user *uvec,
 		 struct iov_iter *i, bool compat);
 int import_single_range(int type, void __user *buf, size_t len,
 		 struct iovec *iov, struct iov_iter *i);
+int import_ubuf(int type, void __user *buf, size_t len, struct iov_iter *i);
 
 static inline void iov_iter_ubuf(struct iov_iter *i, unsigned int direction,
 			void __user *buf, size_t count)

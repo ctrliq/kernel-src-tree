@@ -448,17 +448,26 @@ io_uring_disabled
 Prevents all processes from creating new io_uring instances. Enabling this
 shrinks the kernel's attack surface.
 
-= ==================================================================
-0 All processes can create io_uring instances as normal. This is the
-  default setting.
-1 io_uring creation is disabled for unprivileged processes.
-  io_uring_setup fails with -EPERM unless the calling process is
-  privileged (CAP_SYS_ADMIN). Existing io_uring instances can
-  still be used.
-2 io_uring creation is disabled for all processes. io_uring_setup
+= ======================================================================
+0 All processes can create io_uring instances as normal.
+1 io_uring creation is disabled (io_uring_setup() will fail with
+  -EPERM) for unprivileged processes not in the io_uring_group group.
+  Existing io_uring instances can still be used.  See the
+  documentation for io_uring_group for more information.
+2 io_uring creation is disabled for all processes. io_uring_setup()
   always fails with -EPERM. Existing io_uring instances can still be
-  used.
-= ==================================================================
+  used.  This is the default setting.
+= ======================================================================
+
+
+io_uring_group
+==============
+
+When io_uring_disabled is set to 1, a process must either be
+privileged (CAP_SYS_ADMIN) or be in the io_uring_group group in order
+to create an io_uring instance.  If io_uring_group is set to -1 (the
+default), only processes with the CAP_SYS_ADMIN capability may create
+io_uring instances.
 
 
 kexec_load_disabled

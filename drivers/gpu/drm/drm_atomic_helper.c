@@ -290,7 +290,8 @@ static int
 update_connector_routing(struct drm_atomic_state *state,
 			 struct drm_connector *connector,
 			 struct drm_connector_state *old_connector_state,
-			 struct drm_connector_state *new_connector_state)
+			 struct drm_connector_state *new_connector_state,
+			 bool added_by_user)
 {
 	const struct drm_connector_helper_funcs *funcs;
 	struct drm_encoder *new_encoder;
@@ -339,9 +340,13 @@ update_connector_routing(struct drm_atomic_state *state,
 	 * there's a chance the connector may have been destroyed during the
 	 * process, but it's better to ignore that then cause
 	 * drm_atomic_helper_resume() to fail.
+	 *
+	 * Last, we want to ignore connector registration when the connector
+	 * was not pulled in the atomic state by user-space (ie, was pulled
+	 * in by the driver, e.g. when updating a DP-MST stream).
 	 */
 	if (!state->duplicated && drm_connector_is_unregistered(connector) &&
-	    crtc_state->active) {
+	    added_by_user && crtc_state->active) {
 		drm_dbg_atomic(connector->dev,
 			       "[CONNECTOR:%d:%s] is not registered\n",
 			       connector->base.id, connector->name);
@@ -620,7 +625,10 @@ drm_atomic_helper_check_modeset(struct drm_device *dev,
 	struct drm_connector *connector;
 	struct drm_connector_state *old_connector_state, *new_connector_state;
 	int i, ret;
-	unsigned int connectors_mask = 0;
+	unsigned int connectors_mask = 0, user_connectors_mask = 0;
+
+	for_each_oldnew_connector_in_state(state, connector, old_connector_state, new_connector_state, i)
+		user_connectors_mask |= BIT(i);
 
 	for_each_oldnew_crtc_in_state(state, crtc, old_crtc_state, new_crtc_state, i) {
 		bool has_connectors =
@@ -685,7 +693,8 @@ drm_atomic_helper_check_modeset(struct drm_device *dev,
 		 */
 		ret = update_connector_routing(state, connector,
 					       old_connector_state,
-					       new_connector_state);
+					       new_connector_state,
+					       BIT(i) & user_connectors_mask);
 		if (ret)
 			return ret;
 		if (old_connector_state->crtc) {
@@ -1520,6 +1529,47 @@ void drm_atomic_helper_commit_modeset_enables(struct drm_device *dev,
 }
 EXPORT_SYMBOL(drm_atomic_helper_commit_modeset_enables);
 
+/*
+ * For atomic updates which touch just a single CRTC, calculate the time of the
+ * next vblank, and inform all the fences of the deadline.
+ */
+static void set_fence_deadline(struct drm_device *dev,
+			       struct drm_atomic_state *state)
+{
+	struct drm_crtc *crtc;
+	struct drm_crtc_state *new_crtc_state;
+	struct drm_plane *plane;
+	struct drm_plane_state *new_plane_state;
+	ktime_t vbltime = 0;
+	int i;
+
+	for_each_new_crtc_in_state (state, crtc, new_crtc_state, i) {
+		ktime_t v;
+
+		if (drm_atomic_crtc_needs_modeset(new_crtc_state))
+			continue;
+
+		if (!new_crtc_state->active)
+			continue;
+
+		if (drm_crtc_next_vblank_start(crtc, &v))
+			continue;
+
+		if (!vbltime || ktime_before(v, vbltime))
+			vbltime = v;
+	}
+
+	/* If no CRTCs updated, then nothing to do: */
+	if (!vbltime)
+		return;
+
+	for_each_new_plane_in_state (state, plane, new_plane_state, i) {
+		if (!new_plane_state->fence)
+			continue;
+		dma_fence_set_deadline(new_plane_state->fence, vbltime);
+	}
+}
+
 /**
  * drm_atomic_helper_wait_for_fences - wait for fences stashed in plane state
  * @dev: DRM device
@@ -1548,6 +1598,8 @@ int drm_atomic_helper_wait_for_fences(struct drm_device *dev,
 	struct drm_plane *plane;
 	struct drm_plane_state *new_plane_state;
 	int i, ret;
+
+	set_fence_deadline(dev, state);
 
 	for_each_new_plane_in_state(state, plane, new_plane_state, i) {
 		if (!new_plane_state->fence)
@@ -2711,6 +2763,11 @@ void drm_atomic_helper_commit_planes(struct drm_device *dev,
 			funcs->atomic_disable(plane, old_state);
 		} else if (new_plane_state->crtc || disabling) {
 			funcs->atomic_update(plane, old_state);
+
+			if (!disabling && funcs->atomic_enable) {
+				if (drm_atomic_plane_enabling(old_plane_state, new_plane_state))
+					funcs->atomic_enable(plane, old_state);
+			}
 		}
 	}
 
@@ -2771,6 +2828,7 @@ drm_atomic_helper_commit_planes_on_crtc(struct drm_crtc_state *old_crtc_state)
 		struct drm_plane_state *new_plane_state =
 			drm_atomic_get_new_plane_state(old_state, plane);
 		const struct drm_plane_helper_funcs *plane_funcs;
+		bool disabling;
 
 		plane_funcs = plane->helper_private;
 
@@ -2780,12 +2838,18 @@ drm_atomic_helper_commit_planes_on_crtc(struct drm_crtc_state *old_crtc_state)
 		WARN_ON(new_plane_state->crtc &&
 			new_plane_state->crtc != crtc);
 
-		if (drm_atomic_plane_disabling(old_plane_state, new_plane_state) &&
-		    plane_funcs->atomic_disable)
+		disabling = drm_atomic_plane_disabling(old_plane_state, new_plane_state);
+
+		if (disabling && plane_funcs->atomic_disable) {
 			plane_funcs->atomic_disable(plane, old_state);
-		else if (new_plane_state->crtc ||
-			 drm_atomic_plane_disabling(old_plane_state, new_plane_state))
+		} else if (new_plane_state->crtc || disabling) {
 			plane_funcs->atomic_update(plane, old_state);
+
+			if (!disabling && plane_funcs->atomic_enable) {
+				if (drm_atomic_plane_enabling(old_plane_state, new_plane_state))
+					plane_funcs->atomic_enable(plane, old_state);
+			}
+		}
 	}
 
 	if (crtc_funcs && crtc_funcs->atomic_flush)
@@ -3099,7 +3163,7 @@ fail:
 EXPORT_SYMBOL(drm_atomic_helper_update_plane);
 
 /**
- * drm_atomic_helper_disable_plane - Helper for primary plane disable using * atomic
+ * drm_atomic_helper_disable_plane - Helper for primary plane disable using atomic
  * @plane: plane to disable
  * @ctx: lock acquire context
  *
@@ -3277,7 +3341,7 @@ EXPORT_SYMBOL(drm_atomic_helper_disable_all);
  * that also takes a snapshot of the modeset state to be restored on resume.
  *
  * This is just a convenience wrapper around drm_atomic_helper_disable_all(),
- * and it is the atomic version of drm_crtc_force_disable_all().
+ * and it is the atomic version of drm_helper_force_disable_all().
  */
 void drm_atomic_helper_shutdown(struct drm_device *dev)
 {
