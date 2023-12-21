@@ -648,6 +648,8 @@ sources-rh: $(TARBALL) generate-testpatch-tmp setup-source dist-configs-check
 		kernel-local \
 		dracut-virt.conf \
 		$(SOURCES)/
+	@cat $$(ls -1 $(SPECPACKAGE_NAME).changelog-* | sort -t '.' -k 3 -n -r) \
+		| xz > $(SOURCES)/kernel.changelog.xz
 	@for KABIARCH in $(ARCH_LIST); do \
 		cp kabi/Module.kabi_$$KABIARCH $(SOURCES)/; \
 		cp kabi/Module.kabi_dup_$$KABIARCH $(SOURCES)/; \
