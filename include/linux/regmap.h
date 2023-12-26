@@ -59,6 +59,7 @@ enum regcache_type {
 	REGCACHE_NONE,
 	REGCACHE_RBTREE,
 	REGCACHE_FLAT,
+	REGCACHE_MAPLE,
 };
 
 /**
@@ -528,6 +529,7 @@ typedef void (*regmap_hw_free_context)(void *context);
  *	     to perform locking. This field is ignored if custom lock/unlock
  *	     functions are used (see fields lock/unlock of
  *	     struct regmap_config).
+ * @free_on_exit: kfree this on exit of regmap
  * @write: Write operation.
  * @gather_write: Write operation with split register/value, return -ENOTSUPP
  *                if not implemented  on a given device.
@@ -556,10 +558,10 @@ typedef void (*regmap_hw_free_context)(void *context);
  *     DEFAULT, BIG is assumed.
  * @max_raw_read: Max raw read size that can be used on the bus.
  * @max_raw_write: Max raw write size that can be used on the bus.
- * @free_on_exit: kfree this on exit of regmap
  */
 struct regmap_bus {
 	bool fast_io;
+	bool free_on_exit;
 	regmap_hw_write write;
 	regmap_hw_gather_write gather_write;
 	regmap_hw_async_write async_write;
@@ -576,7 +578,6 @@ struct regmap_bus {
 	enum regmap_endian val_format_endian_default;
 	size_t max_raw_read;
 	size_t max_raw_write;
-	bool free_on_exit;
 };
 
 /*
@@ -1286,6 +1287,7 @@ int regcache_drop_region(struct regmap *map, unsigned int min,
 void regcache_cache_only(struct regmap *map, bool enable);
 void regcache_cache_bypass(struct regmap *map, bool enable);
 void regcache_mark_dirty(struct regmap *map);
+bool regcache_reg_cached(struct regmap *map, unsigned int reg);
 
 bool regmap_check_range_table(struct regmap *map, unsigned int reg,
 			      const struct regmap_access_table *table);
