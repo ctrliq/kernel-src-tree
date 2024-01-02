@@ -1710,8 +1710,10 @@ static int htb_delete(struct Qdisc *sch, unsigned long arg,
 	 * tc subsys guarantee us that in htb_destroy it holds no class
 	 * refs so that we can remove children safely there ?
 	 */
-	if (cl->children || cl->filter_cnt)
+	if (cl->children || cl->filter_cnt) {
+		NL_SET_ERR_MSG(extack, "HTB class in use");
 		return -EBUSY;
+	}
 
 	if (!cl->level && htb_parent_last_child(cl))
 		last_child = 1;
