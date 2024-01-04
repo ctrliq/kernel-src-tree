@@ -707,7 +707,7 @@ sources-rh: $(TARBALL) $(KABI_TARBALL) $(KABIDW_TARBALL) generate-testpatch-tmp 
 	@cat $$(ls -1 $(SPECPACKAGE_NAME).changelog-* | sort -t '.' -k 3 -n -r) \
 		> $(SOURCES)/kernel.changelog
 	@if [ "$(RELEASED_KERNEL)" -ne 0 ]; then \
-		cp keys/redhatsecureboot{302,303,501,ca5,ca3}.cer $(SOURCES)/; \
+		cp keys/redhatsecureboot{302,501,601,ca3,ca5,ca6}.cer $(SOURCES)/; \
 	else \
 		cp keys/redhatsecureboot{401,ca4}.cer $(SOURCES)/; \
 	fi
