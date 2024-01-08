@@ -40,6 +40,7 @@ Contents:
    intel/iavf
    intel/ice
    marvell/octeontx2
+   marvell/octeon_ep
    mellanox/mlx5
    microsoft/netvsc
    neterion/s2io
