@@ -24,3 +24,7 @@ obj-$(CONFIG_INTEL_VSEC)		+= intel_vsec.o
 # TPMI drivers
 intel_vsec_tpmi-y			:= tpmi.o
 obj-$(CONFIG_INTEL_TPMI)		+= intel_vsec_tpmi.o
+
+# Intel input drivers
+intel-hid-y				:= hid.o
+obj-$(CONFIG_INTEL_HID_EVENT)		+= intel-hid.o
