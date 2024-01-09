@@ -1422,7 +1422,7 @@ SYSCALL_DEFINE3(getrandom, char __user *, ubuf, size_t, len, unsigned int, flags
 	rcu_read_unlock();
 
 	if (rng) {
-		ret = import_single_range(ITER_DEST, ubuf, len, &iov, &iter);
+		ret = import_ubuf(ITER_DEST, ubuf, len, &iter);
 		if (unlikely(ret))
 			return ret;
 		ret = rng->extrng_read_iter(&iter, !!(flags & GRND_RANDOM));
