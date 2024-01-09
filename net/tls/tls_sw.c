@@ -58,7 +58,7 @@ struct tls_decrypt_arg {
 };
 
 struct tls_decrypt_ctx {
-	u8 iv[MAX_IV_SIZE];
+	u8 iv[TLS_MAX_IV_SIZE];
 	u8 aad[TLS_MAX_AAD_SIZE];
 	u8 tail;
 	struct scatterlist sg[];
@@ -2340,7 +2340,7 @@ int tls_rx_msg_size(struct tls_strparser *strp, struct sk_buff *skb)
 {
 	struct tls_context *tls_ctx = tls_get_ctx(strp->sk);
 	struct tls_prot_info *prot = &tls_ctx->prot_info;
-	char header[TLS_HEADER_SIZE + MAX_IV_SIZE];
+	char header[TLS_HEADER_SIZE + TLS_MAX_IV_SIZE];
 	size_t cipher_overhead;
 	size_t data_len = 0;
 	int ret;
@@ -2488,9 +2488,6 @@ void tls_sw_release_resources_rx(struct sock *sk)
 	struct tls_context *tls_ctx = tls_get_ctx(sk);
 	struct tls_sw_context_rx *ctx = tls_sw_ctx_rx(tls_ctx);
 
-	kfree(tls_ctx->rx.rec_seq);
-	kfree(tls_ctx->rx.iv);
-
 	if (ctx->aead_recv) {
 		__skb_queue_purge(&ctx->rx_list);
 		crypto_free_aead(ctx->aead_recv);
@@ -2602,213 +2599,53 @@ void tls_update_rx_zc_capable(struct tls_context *tls_ctx)
 		tls_ctx->prot_info.version != TLS_1_3_VERSION;
 }
 
-int tls_set_sw_offload(struct sock *sk, struct tls_context *ctx, int tx)
+static struct tls_sw_context_tx *init_ctx_tx(struct tls_context *ctx, struct sock *sk)
 {
-	struct tls_context *tls_ctx = tls_get_ctx(sk);
-	struct tls_prot_info *prot = &tls_ctx->prot_info;
-	struct tls_crypto_info *crypto_info;
-	struct tls_sw_context_tx *sw_ctx_tx = NULL;
-	struct tls_sw_context_rx *sw_ctx_rx = NULL;
-	struct cipher_context *cctx;
-	struct crypto_aead **aead;
-	u16 nonce_size, tag_size, iv_size, rec_seq_size, salt_size;
-	struct crypto_tfm *tfm;
-	char *iv, *rec_seq, *key, *salt, *cipher_name;
-	size_t keysize;
-	int rc = 0;
+	struct tls_sw_context_tx *sw_ctx_tx;
 
-	if (!ctx) {
-		rc = -EINVAL;
-		goto out;
-	}
-
-	if (tx) {
-		if (!ctx->priv_ctx_tx) {
-			sw_ctx_tx = kzalloc(sizeof(*sw_ctx_tx), GFP_KERNEL);
-			if (!sw_ctx_tx) {
-				rc = -ENOMEM;
-				goto out;
-			}
-			ctx->priv_ctx_tx = sw_ctx_tx;
-		} else {
-			sw_ctx_tx =
-				(struct tls_sw_context_tx *)ctx->priv_ctx_tx;
-		}
+	if (!ctx->priv_ctx_tx) {
+		sw_ctx_tx = kzalloc(sizeof(*sw_ctx_tx), GFP_KERNEL);
+		if (!sw_ctx_tx)
+			return NULL;
 	} else {
-		if (!ctx->priv_ctx_rx) {
-			sw_ctx_rx = kzalloc(sizeof(*sw_ctx_rx), GFP_KERNEL);
-			if (!sw_ctx_rx) {
-				rc = -ENOMEM;
-				goto out;
-			}
-			ctx->priv_ctx_rx = sw_ctx_rx;
-		} else {
-			sw_ctx_rx =
-				(struct tls_sw_context_rx *)ctx->priv_ctx_rx;
-		}
+		sw_ctx_tx = ctx->priv_ctx_tx;
 	}
 
-	if (tx) {
-		crypto_init_wait(&sw_ctx_tx->async_wait);
-		spin_lock_init(&sw_ctx_tx->encrypt_compl_lock);
-		crypto_info = &ctx->crypto_send.info;
-		cctx = &ctx->tx;
-		aead = &sw_ctx_tx->aead_send;
-		INIT_LIST_HEAD(&sw_ctx_tx->tx_list);
-		INIT_DELAYED_WORK(&sw_ctx_tx->tx_work.work, tx_work_handler);
-		sw_ctx_tx->tx_work.sk = sk;
+	crypto_init_wait(&sw_ctx_tx->async_wait);
+	spin_lock_init(&sw_ctx_tx->encrypt_compl_lock);
+	INIT_LIST_HEAD(&sw_ctx_tx->tx_list);
+	INIT_DELAYED_WORK(&sw_ctx_tx->tx_work.work, tx_work_handler);
+	sw_ctx_tx->tx_work.sk = sk;
+
+	return sw_ctx_tx;
+}
+
+static struct tls_sw_context_rx *init_ctx_rx(struct tls_context *ctx)
+{
+	struct tls_sw_context_rx *sw_ctx_rx;
+
+	if (!ctx->priv_ctx_rx) {
+		sw_ctx_rx = kzalloc(sizeof(*sw_ctx_rx), GFP_KERNEL);
+		if (!sw_ctx_rx)
+			return NULL;
 	} else {
-		crypto_init_wait(&sw_ctx_rx->async_wait);
-		spin_lock_init(&sw_ctx_rx->decrypt_compl_lock);
-		init_waitqueue_head(&sw_ctx_rx->wq);
-		crypto_info = &ctx->crypto_recv.info;
-		cctx = &ctx->rx;
-		skb_queue_head_init(&sw_ctx_rx->rx_list);
-		skb_queue_head_init(&sw_ctx_rx->async_hold);
-		aead = &sw_ctx_rx->aead_recv;
+		sw_ctx_rx = ctx->priv_ctx_rx;
 	}
 
-	switch (crypto_info->cipher_type) {
-	case TLS_CIPHER_AES_GCM_128: {
-		struct tls12_crypto_info_aes_gcm_128 *gcm_128_info;
+	crypto_init_wait(&sw_ctx_rx->async_wait);
+	spin_lock_init(&sw_ctx_rx->decrypt_compl_lock);
+	init_waitqueue_head(&sw_ctx_rx->wq);
+	skb_queue_head_init(&sw_ctx_rx->rx_list);
+	skb_queue_head_init(&sw_ctx_rx->async_hold);
 
-		gcm_128_info = (void *)crypto_info;
-		nonce_size = TLS_CIPHER_AES_GCM_128_IV_SIZE;
-		tag_size = TLS_CIPHER_AES_GCM_128_TAG_SIZE;
-		iv_size = TLS_CIPHER_AES_GCM_128_IV_SIZE;
-		iv = gcm_128_info->iv;
-		rec_seq_size = TLS_CIPHER_AES_GCM_128_REC_SEQ_SIZE;
-		rec_seq = gcm_128_info->rec_seq;
-		keysize = TLS_CIPHER_AES_GCM_128_KEY_SIZE;
-		key = gcm_128_info->key;
-		salt = gcm_128_info->salt;
-		salt_size = TLS_CIPHER_AES_GCM_128_SALT_SIZE;
-		cipher_name = "gcm(aes)";
-		break;
-	}
-	case TLS_CIPHER_AES_GCM_256: {
-		struct tls12_crypto_info_aes_gcm_256 *gcm_256_info;
+	return sw_ctx_rx;
+}
 
-		gcm_256_info = (void *)crypto_info;
-		nonce_size = TLS_CIPHER_AES_GCM_256_IV_SIZE;
-		tag_size = TLS_CIPHER_AES_GCM_256_TAG_SIZE;
-		iv_size = TLS_CIPHER_AES_GCM_256_IV_SIZE;
-		iv = gcm_256_info->iv;
-		rec_seq_size = TLS_CIPHER_AES_GCM_256_REC_SEQ_SIZE;
-		rec_seq = gcm_256_info->rec_seq;
-		keysize = TLS_CIPHER_AES_GCM_256_KEY_SIZE;
-		key = gcm_256_info->key;
-		salt = gcm_256_info->salt;
-		salt_size = TLS_CIPHER_AES_GCM_256_SALT_SIZE;
-		cipher_name = "gcm(aes)";
-		break;
-	}
-	case TLS_CIPHER_AES_CCM_128: {
-		struct tls12_crypto_info_aes_ccm_128 *ccm_128_info;
-
-		ccm_128_info = (void *)crypto_info;
-		nonce_size = TLS_CIPHER_AES_CCM_128_IV_SIZE;
-		tag_size = TLS_CIPHER_AES_CCM_128_TAG_SIZE;
-		iv_size = TLS_CIPHER_AES_CCM_128_IV_SIZE;
-		iv = ccm_128_info->iv;
-		rec_seq_size = TLS_CIPHER_AES_CCM_128_REC_SEQ_SIZE;
-		rec_seq = ccm_128_info->rec_seq;
-		keysize = TLS_CIPHER_AES_CCM_128_KEY_SIZE;
-		key = ccm_128_info->key;
-		salt = ccm_128_info->salt;
-		salt_size = TLS_CIPHER_AES_CCM_128_SALT_SIZE;
-		cipher_name = "ccm(aes)";
-		break;
-	}
-	case TLS_CIPHER_CHACHA20_POLY1305: {
-		struct tls12_crypto_info_chacha20_poly1305 *chacha20_poly1305_info;
-
-		chacha20_poly1305_info = (void *)crypto_info;
-		nonce_size = 0;
-		tag_size = TLS_CIPHER_CHACHA20_POLY1305_TAG_SIZE;
-		iv_size = TLS_CIPHER_CHACHA20_POLY1305_IV_SIZE;
-		iv = chacha20_poly1305_info->iv;
-		rec_seq_size = TLS_CIPHER_CHACHA20_POLY1305_REC_SEQ_SIZE;
-		rec_seq = chacha20_poly1305_info->rec_seq;
-		keysize = TLS_CIPHER_CHACHA20_POLY1305_KEY_SIZE;
-		key = chacha20_poly1305_info->key;
-		salt = chacha20_poly1305_info->salt;
-		salt_size = TLS_CIPHER_CHACHA20_POLY1305_SALT_SIZE;
-		cipher_name = "rfc7539(chacha20,poly1305)";
-		break;
-	}
-	case TLS_CIPHER_SM4_GCM: {
-		struct tls12_crypto_info_sm4_gcm *sm4_gcm_info;
-
-		sm4_gcm_info = (void *)crypto_info;
-		nonce_size = TLS_CIPHER_SM4_GCM_IV_SIZE;
-		tag_size = TLS_CIPHER_SM4_GCM_TAG_SIZE;
-		iv_size = TLS_CIPHER_SM4_GCM_IV_SIZE;
-		iv = sm4_gcm_info->iv;
-		rec_seq_size = TLS_CIPHER_SM4_GCM_REC_SEQ_SIZE;
-		rec_seq = sm4_gcm_info->rec_seq;
-		keysize = TLS_CIPHER_SM4_GCM_KEY_SIZE;
-		key = sm4_gcm_info->key;
-		salt = sm4_gcm_info->salt;
-		salt_size = TLS_CIPHER_SM4_GCM_SALT_SIZE;
-		cipher_name = "gcm(sm4)";
-		break;
-	}
-	case TLS_CIPHER_SM4_CCM: {
-		struct tls12_crypto_info_sm4_ccm *sm4_ccm_info;
-
-		sm4_ccm_info = (void *)crypto_info;
-		nonce_size = TLS_CIPHER_SM4_CCM_IV_SIZE;
-		tag_size = TLS_CIPHER_SM4_CCM_TAG_SIZE;
-		iv_size = TLS_CIPHER_SM4_CCM_IV_SIZE;
-		iv = sm4_ccm_info->iv;
-		rec_seq_size = TLS_CIPHER_SM4_CCM_REC_SEQ_SIZE;
-		rec_seq = sm4_ccm_info->rec_seq;
-		keysize = TLS_CIPHER_SM4_CCM_KEY_SIZE;
-		key = sm4_ccm_info->key;
-		salt = sm4_ccm_info->salt;
-		salt_size = TLS_CIPHER_SM4_CCM_SALT_SIZE;
-		cipher_name = "ccm(sm4)";
-		break;
-	}
-	case TLS_CIPHER_ARIA_GCM_128: {
-		struct tls12_crypto_info_aria_gcm_128 *aria_gcm_128_info;
-
-		aria_gcm_128_info = (void *)crypto_info;
-		nonce_size = TLS_CIPHER_ARIA_GCM_128_IV_SIZE;
-		tag_size = TLS_CIPHER_ARIA_GCM_128_TAG_SIZE;
-		iv_size = TLS_CIPHER_ARIA_GCM_128_IV_SIZE;
-		iv = aria_gcm_128_info->iv;
-		rec_seq_size = TLS_CIPHER_ARIA_GCM_128_REC_SEQ_SIZE;
-		rec_seq = aria_gcm_128_info->rec_seq;
-		keysize = TLS_CIPHER_ARIA_GCM_128_KEY_SIZE;
-		key = aria_gcm_128_info->key;
-		salt = aria_gcm_128_info->salt;
-		salt_size = TLS_CIPHER_ARIA_GCM_128_SALT_SIZE;
-		cipher_name = "gcm(aria)";
-		break;
-	}
-	case TLS_CIPHER_ARIA_GCM_256: {
-		struct tls12_crypto_info_aria_gcm_256 *gcm_256_info;
-
-		gcm_256_info = (void *)crypto_info;
-		nonce_size = TLS_CIPHER_ARIA_GCM_256_IV_SIZE;
-		tag_size = TLS_CIPHER_ARIA_GCM_256_TAG_SIZE;
-		iv_size = TLS_CIPHER_ARIA_GCM_256_IV_SIZE;
-		iv = gcm_256_info->iv;
-		rec_seq_size = TLS_CIPHER_ARIA_GCM_256_REC_SEQ_SIZE;
-		rec_seq = gcm_256_info->rec_seq;
-		keysize = TLS_CIPHER_ARIA_GCM_256_KEY_SIZE;
-		key = gcm_256_info->key;
-		salt = gcm_256_info->salt;
-		salt_size = TLS_CIPHER_ARIA_GCM_256_SALT_SIZE;
-		cipher_name = "gcm(aria)";
-		break;
-	}
-	default:
-		rc = -EINVAL;
-		goto free_priv;
-	}
+int init_prot_info(struct tls_prot_info *prot,
+		   const struct tls_crypto_info *crypto_info,
+		   const struct tls_cipher_desc *cipher_desc)
+{
+	u16 nonce_size = cipher_desc->nonce;
 
 	if (crypto_info->version == TLS_1_3_VERSION) {
 		nonce_size = 0;
@@ -2820,49 +2657,89 @@ int tls_set_sw_offload(struct sock *sk, struct tls_context *ctx, int tx)
 	}
 
 	/* Sanity-check the sizes for stack allocations. */
-	if (iv_size > MAX_IV_SIZE || nonce_size > MAX_IV_SIZE ||
-	    rec_seq_size > TLS_MAX_REC_SEQ_SIZE || tag_size != TLS_TAG_SIZE ||
-	    prot->aad_size > TLS_MAX_AAD_SIZE) {
-		rc = -EINVAL;
-		goto free_priv;
-	}
+	if (nonce_size > TLS_MAX_IV_SIZE || prot->aad_size > TLS_MAX_AAD_SIZE)
+		return -EINVAL;
 
 	prot->version = crypto_info->version;
 	prot->cipher_type = crypto_info->cipher_type;
 	prot->prepend_size = TLS_HEADER_SIZE + nonce_size;
-	prot->tag_size = tag_size;
-	prot->overhead_size = prot->prepend_size +
-			      prot->tag_size + prot->tail_size;
-	prot->iv_size = iv_size;
-	prot->salt_size = salt_size;
-	cctx->iv = kmalloc(iv_size + salt_size, GFP_KERNEL);
-	if (!cctx->iv) {
-		rc = -ENOMEM;
-		goto free_priv;
-	}
-	/* Note: 128 & 256 bit salt are the same size */
-	prot->rec_seq_size = rec_seq_size;
-	memcpy(cctx->iv, salt, salt_size);
-	memcpy(cctx->iv + salt_size, iv, iv_size);
-	cctx->rec_seq = kmemdup(rec_seq, rec_seq_size, GFP_KERNEL);
-	if (!cctx->rec_seq) {
-		rc = -ENOMEM;
-		goto free_iv;
+	prot->tag_size = cipher_desc->tag;
+	prot->overhead_size = prot->prepend_size + prot->tag_size + prot->tail_size;
+	prot->iv_size = cipher_desc->iv;
+	prot->salt_size = cipher_desc->salt;
+	prot->rec_seq_size = cipher_desc->rec_seq;
+
+	return 0;
+}
+
+int tls_set_sw_offload(struct sock *sk, int tx)
+{
+	struct tls_sw_context_tx *sw_ctx_tx = NULL;
+	struct tls_sw_context_rx *sw_ctx_rx = NULL;
+	const struct tls_cipher_desc *cipher_desc;
+	struct tls_crypto_info *crypto_info;
+	char *iv, *rec_seq, *key, *salt;
+	struct cipher_context *cctx;
+	struct tls_prot_info *prot;
+	struct crypto_aead **aead;
+	struct tls_context *ctx;
+	struct crypto_tfm *tfm;
+	int rc = 0;
+
+	ctx = tls_get_ctx(sk);
+	prot = &ctx->prot_info;
+
+	if (tx) {
+		ctx->priv_ctx_tx = init_ctx_tx(ctx, sk);
+		if (!ctx->priv_ctx_tx)
+			return -ENOMEM;
+
+		sw_ctx_tx = ctx->priv_ctx_tx;
+		crypto_info = &ctx->crypto_send.info;
+		cctx = &ctx->tx;
+		aead = &sw_ctx_tx->aead_send;
+	} else {
+		ctx->priv_ctx_rx = init_ctx_rx(ctx);
+		if (!ctx->priv_ctx_rx)
+			return -ENOMEM;
+
+		sw_ctx_rx = ctx->priv_ctx_rx;
+		crypto_info = &ctx->crypto_recv.info;
+		cctx = &ctx->rx;
+		aead = &sw_ctx_rx->aead_recv;
 	}
 
+	cipher_desc = get_cipher_desc(crypto_info->cipher_type);
+	if (!cipher_desc) {
+		rc = -EINVAL;
+		goto free_priv;
+	}
+
+	rc = init_prot_info(prot, crypto_info, cipher_desc);
+	if (rc)
+		goto free_priv;
+
+	iv = crypto_info_iv(crypto_info, cipher_desc);
+	key = crypto_info_key(crypto_info, cipher_desc);
+	salt = crypto_info_salt(crypto_info, cipher_desc);
+	rec_seq = crypto_info_rec_seq(crypto_info, cipher_desc);
+
+	memcpy(cctx->iv, salt, cipher_desc->salt);
+	memcpy(cctx->iv + cipher_desc->salt, iv, cipher_desc->iv);
+	memcpy(cctx->rec_seq, rec_seq, cipher_desc->rec_seq);
+
 	if (!*aead) {
-		*aead = crypto_alloc_aead(cipher_name, 0, 0);
+		*aead = crypto_alloc_aead(cipher_desc->cipher_name, 0, 0);
 		if (IS_ERR(*aead)) {
 			rc = PTR_ERR(*aead);
 			*aead = NULL;
-			goto free_rec_seq;
+			goto free_priv;
 		}
 	}
 
 	ctx->push_pending_record = tls_sw_push_pending_record;
 
-	rc = crypto_aead_setkey(*aead, key, keysize);
-
+	rc = crypto_aead_setkey(*aead, key, cipher_desc->key);
 	if (rc)
 		goto free_aead;
 
@@ -2888,12 +2765,6 @@ int tls_set_sw_offload(struct sock *sk, struct tls_context *ctx, int tx)
 free_aead:
 	crypto_free_aead(*aead);
 	*aead = NULL;
-free_rec_seq:
-	kfree(cctx->rec_seq);
-	cctx->rec_seq = NULL;
-free_iv:
-	kfree(cctx->iv);
-	cctx->iv = NULL;
 free_priv:
 	if (tx) {
 		kfree(ctx->priv_ctx_tx);
