@@ -49,6 +49,8 @@
 #include <crypto/aead.h>
 #include <uapi/linux/tls.h>
 
+#include <linux/rh_kabi.h>
+
 struct tls_rec;
 
 /* Maximum data size carried in a TLS record */
@@ -281,6 +283,11 @@ struct tlsdev_ops {
 	int (*tls_dev_resync)(struct net_device *netdev,
 			      struct sock *sk, u32 seq, u8 *rcd_sn,
 			      enum tls_offload_ctx_dir direction);
+
+	RH_KABI_RESERVE(1)
+	RH_KABI_RESERVE(2)
+	RH_KABI_RESERVE(3)
+	RH_KABI_RESERVE(4)
 };
 
 enum tls_offload_sync_type {
