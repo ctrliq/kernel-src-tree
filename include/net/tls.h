@@ -195,6 +195,11 @@ enum tls_context_flags {
 struct cipher_context {
 	char iv[TLS_MAX_IV_SIZE + TLS_MAX_SALT_SIZE];
 	char rec_seq[TLS_MAX_REC_SEQ_SIZE];
+
+	RH_KABI_RESERVE(1)
+	RH_KABI_RESERVE(2)
+	RH_KABI_RESERVE(3)
+	RH_KABI_RESERVE(4)
 };
 
 /* Note: sizeof(struct tls12_crypto_info_aes_gcm_256) + 32 at rhel9 GA */
