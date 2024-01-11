@@ -10,6 +10,8 @@
 #include <linux/perf_event.h>
 #include <linux/tracepoint.h>
 
+#include <linux/rh_kabi.h>
+
 struct trace_array;
 struct array_buffer;
 struct tracer;
@@ -367,7 +369,7 @@ struct trace_event_call {
 #ifdef CONFIG_PERF_EVENTS
 	int				perf_refcount;
 	struct hlist_head __percpu	*perf_events;
-	struct bpf_prog_array __rcu	*prog_array;
+	RH_KABI_EXCLUDE(struct bpf_prog_array __rcu	*prog_array)
 
 	int	(*perf_perm)(struct trace_event_call *,
 			     struct perf_event *);

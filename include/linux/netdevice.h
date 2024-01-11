@@ -632,7 +632,7 @@ struct netdev_queue {
 	/* Subordinate device that the queue has been assigned to */
 	struct net_device	*sb_dev;
 #ifdef CONFIG_XDP_SOCKETS
-	struct xsk_buff_pool    *pool;
+	RH_KABI_EXCLUDE(struct xsk_buff_pool    *pool)
 #endif
 /*
  * write-mostly part
@@ -785,7 +785,7 @@ bool rps_may_expire_flow(struct net_device *dev, u16 rxq_index, u32 flow_id,
 
 /* This structure contains an instance of an RX queue. */
 struct netdev_rx_queue {
-	struct xdp_rxq_info		xdp_rxq;
+	RH_KABI_EXCLUDE_WITH_SIZE(struct xdp_rxq_info xdp_rxq, RH_KABI_XDP_RXQ_MAX_LONGS)
 #ifdef CONFIG_RPS
 	struct rps_map __rcu		*rps_map;
 	struct rps_dev_flow_table __rcu	*rps_flow_table;
@@ -795,7 +795,7 @@ struct netdev_rx_queue {
 	netdevice_tracker		dev_tracker;
 
 #ifdef CONFIG_XDP_SOCKETS
-	struct xsk_buff_pool            *pool;
+	RH_KABI_EXCLUDE(struct xsk_buff_pool            *pool)
 #endif
 
 	RH_KABI_RESERVE(1)
@@ -1650,15 +1650,15 @@ struct net_device_ops {
 						       struct sk_buff *skb);
 	void			(*ndo_set_rx_headroom)(struct net_device *dev,
 						       int needed_headroom);
-	int			(*ndo_bpf)(struct net_device *dev,
-					   struct netdev_bpf *bpf);
-	int			(*ndo_xdp_xmit)(struct net_device *dev, int n,
+	RH_KABI_EXCLUDE(int	(*ndo_bpf)(struct net_device *dev,
+					   struct netdev_bpf *bpf))
+	RH_KABI_EXCLUDE(int	(*ndo_xdp_xmit)(struct net_device *dev, int n,
 						struct xdp_frame **xdp,
-						u32 flags);
-	struct net_device *	(*ndo_xdp_get_xmit_slave)(struct net_device *dev,
-							  struct xdp_buff *xdp);
-	int			(*ndo_xsk_wakeup)(struct net_device *dev,
-						  u32 queue_id, u32 flags);
+						u32 flags))
+	RH_KABI_EXCLUDE(struct net_device *	(*ndo_xdp_get_xmit_slave)(struct net_device *dev,
+									  struct xdp_buff *xdp))
+	RH_KABI_EXCLUDE(int	(*ndo_xsk_wakeup)(struct net_device *dev,
+						  u32 queue_id, u32 flags))
 	struct devlink_port *	(*__rh_deprecated_ndo_get_devlink_port)(struct net_device *dev);
 	int			(*ndo_tunnel_ctl)(struct net_device *dev,
 						  struct ip_tunnel_parm *p, int cmd);
@@ -2154,7 +2154,7 @@ struct net_device {
 	xdp_features_t		xdp_features;
 	unsigned long long	priv_flags;
 	const struct net_device_ops *netdev_ops;
-	const struct xdp_metadata_ops *xdp_metadata_ops;
+	RH_KABI_EXCLUDE(const struct xdp_metadata_ops *xdp_metadata_ops)
 	int			ifindex;
 	unsigned short		gflags;
 	unsigned short		hard_header_len;
@@ -2302,7 +2302,7 @@ struct net_device {
 	unsigned int		num_rx_queues;
 	unsigned int		real_num_rx_queues;
 
-	struct bpf_prog __rcu	*xdp_prog;
+	RH_KABI_EXCLUDE(struct bpf_prog __rcu	*xdp_prog)
 	unsigned long		gro_flush_timeout;
 	int			napi_defer_hard_irqs;
 #define GRO_LEGACY_MAX_SIZE	65536u
@@ -2340,7 +2340,7 @@ struct net_device {
 	unsigned int		tx_queue_len;
 	spinlock_t		tx_global_lock;
 
-	struct xdp_dev_bulk_queue __percpu *xdp_bulkq;
+	RH_KABI_EXCLUDE(struct xdp_dev_bulk_queue __percpu *xdp_bulkq)
 
 #ifdef CONFIG_XPS
 	struct xps_dev_maps __rcu *xps_maps[XPS_MAPS_MAX];
@@ -2468,7 +2468,7 @@ struct net_device {
 	struct udp_tunnel_nic	*udp_tunnel_nic;
 
 	/* protected by rtnl_lock */
-	struct bpf_xdp_entity	xdp_state[__MAX_XDP_MODE];
+	RH_KABI_EXCLUDE_WITH_SIZE(struct bpf_xdp_entity	xdp_state[__MAX_XDP_MODE], 24)
 
 	netdevice_tracker	linkwatch_dev_tracker;
 	netdevice_tracker	watchdog_dev_tracker;
