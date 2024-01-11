@@ -30,6 +30,8 @@
 #include <linux/workqueue.h>
 #include <net/rtnetlink.h>
 
+#include <linux/rh_kabi.h>
+
 /*
  * NUD stands for "neighbor unreachability detection"
  */
@@ -160,6 +162,10 @@ struct neighbour {
 	struct rcu_head		rcu;
 	struct net_device	*dev;
 	netdevice_tracker	dev_tracker;
+
+	RH_KABI_RESERVE(1)
+	RH_KABI_RESERVE(2)
+
 	u8			primary_key[0];
 } __randomize_layout;
 
