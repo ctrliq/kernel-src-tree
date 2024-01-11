@@ -53,6 +53,8 @@
 #include <net/net_debug.h>
 #include <net/dropreason-core.h>
 
+#include <linux/rh_kabi.h>
+
 struct netpoll_info;
 struct device;
 struct ethtool_ops;
@@ -2406,6 +2408,39 @@ struct net_device {
 #if IS_ENABLED(CONFIG_DPLL)
 	struct dpll_pin		*dpll_pin;
 #endif
+
+	RH_KABI_RESERVE(1)
+	RH_KABI_RESERVE(2)
+	RH_KABI_RESERVE(3)
+	RH_KABI_RESERVE(4)
+	RH_KABI_RESERVE(5)
+	RH_KABI_RESERVE(6)
+	RH_KABI_RESERVE(7)
+	RH_KABI_RESERVE(8)
+	RH_KABI_RESERVE(9)
+	RH_KABI_RESERVE(10)
+	RH_KABI_RESERVE(11)
+	RH_KABI_RESERVE(12)
+	RH_KABI_RESERVE(13)
+	RH_KABI_RESERVE(14)
+	RH_KABI_RESERVE(15)
+	RH_KABI_RESERVE(16)
+	RH_KABI_RESERVE(17)
+	RH_KABI_RESERVE(18)
+	RH_KABI_RESERVE(19)
+	RH_KABI_RESERVE(20)
+	RH_KABI_RESERVE(21)
+	RH_KABI_RESERVE(22)
+	RH_KABI_RESERVE(23)
+	RH_KABI_RESERVE(24)
+	RH_KABI_RESERVE(25)
+	RH_KABI_RESERVE(26)
+	RH_KABI_RESERVE(27)
+	RH_KABI_RESERVE(28)
+	RH_KABI_RESERVE(29)
+	RH_KABI_RESERVE(30)
+	RH_KABI_RESERVE(31)
+	RH_KABI_RESERVE(32)
 };
 #define to_net_dev(d) container_of(d, struct net_device, dev)
 
