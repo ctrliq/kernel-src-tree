@@ -159,6 +159,10 @@ struct fib_info {
 	bool			pfsrc_removed;
 	struct nexthop		*nh;
 	struct rcu_head		rcu;
+
+	RH_KABI_RESERVE(1)
+	RH_KABI_RESERVE(2)
+
 	struct fib_nh		fib_nh[];
 };
 
