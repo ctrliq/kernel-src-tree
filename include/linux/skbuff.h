@@ -44,6 +44,8 @@
 #endif
 #include <net/dropreason-core.h>
 
+#include <linux/rh_kabi.h>
+
 /* The interface for checksum offload between the stack and networking drivers
  * is as follows...
  *
@@ -973,7 +975,7 @@ struct sk_buff {
 
 #ifdef CONFIG_SKB_EXTENSIONS
 	/* only useable after checking ->active_extensions != 0 */
-	struct skb_ext		*extensions;
+	RH_KABI_EXCLUDE(struct skb_ext		*extensions)
 #endif
 };
 
