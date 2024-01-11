@@ -2201,7 +2201,10 @@ struct net_device {
 	const struct l3mdev_ops	*l3mdev_ops;
 #endif
 #if IS_ENABLED(CONFIG_IPV6)
-	const struct ndisc_ops *ndisc_ops;
+	/* RHEL: this structure is strictly internal to the kernel
+	 * IPv6 stack and is not intended for use by 3rd party modules
+	 */
+	RH_KABI_EXCLUDE(const struct ndisc_ops *ndisc_ops)
 #endif
 
 #ifdef CONFIG_XFRM_OFFLOAD
