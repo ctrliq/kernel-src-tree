@@ -19,6 +19,8 @@
 #include <linux/netlink.h>
 #include <uapi/linux/ethtool.h>
 
+#include <linux/rh_kabi.h>
+
 struct compat_ethtool_rx_flow_spec {
 	u32		flow_type;
 	union ethtool_flow_union h_u;
@@ -912,6 +914,23 @@ struct ethtool_ops {
 	int	(*set_mm)(struct net_device *dev, struct ethtool_mm_cfg *cfg,
 			  struct netlink_ext_ack *extack);
 	void	(*get_mm_stats)(struct net_device *dev, struct ethtool_mm_stats *stats);
+
+	RH_KABI_RESERVE(1)
+	RH_KABI_RESERVE(2)
+	RH_KABI_RESERVE(3)
+	RH_KABI_RESERVE(4)
+	RH_KABI_RESERVE(5)
+	RH_KABI_RESERVE(6)
+	RH_KABI_RESERVE(7)
+	RH_KABI_RESERVE(8)
+	RH_KABI_RESERVE(9)
+	RH_KABI_RESERVE(10)
+	RH_KABI_RESERVE(11)
+	RH_KABI_RESERVE(12)
+	RH_KABI_RESERVE(13)
+	RH_KABI_RESERVE(14)
+	RH_KABI_RESERVE(15)
+	RH_KABI_RESERVE(16)
 };
 
 int ethtool_check_ops(const struct ethtool_ops *ops);
