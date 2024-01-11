@@ -2279,7 +2279,11 @@ struct net_device {
 	void			*ax25_ptr;
 #endif
 #if IS_ENABLED(CONFIG_CFG80211)
-	struct wireless_dev	*ieee80211_ptr;
+	/* RHEL: this structure is strictly internal to the kernel
+	 * wireless stack and is not intended for use by 3rd party
+	 * modules
+	 */
+	RH_KABI_EXCLUDE(struct wireless_dev	*ieee80211_ptr)
 #endif
 #if IS_ENABLED(CONFIG_IEEE802154) || IS_ENABLED(CONFIG_6LOWPAN)
 	struct wpan_dev		*ieee802154_ptr;
