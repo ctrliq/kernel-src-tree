@@ -21,6 +21,8 @@
 #include <linux/xarray.h>
 #include <linux/firmware.h>
 
+#include <linux/rh_kabi.h>
+
 struct devlink;
 struct devlink_linecard;
 
@@ -150,6 +152,23 @@ struct devlink_port {
 
 	struct devlink_rate *devlink_rate;
 	struct devlink_linecard *linecard;
+
+	RH_KABI_RESERVE(1)
+	RH_KABI_RESERVE(2)
+	RH_KABI_RESERVE(3)
+	RH_KABI_RESERVE(4)
+	RH_KABI_RESERVE(5)
+	RH_KABI_RESERVE(6)
+	RH_KABI_RESERVE(7)
+	RH_KABI_RESERVE(8)
+	RH_KABI_RESERVE(9)
+	RH_KABI_RESERVE(10)
+	RH_KABI_RESERVE(11)
+	RH_KABI_RESERVE(12)
+	RH_KABI_RESERVE(13)
+	RH_KABI_RESERVE(14)
+	RH_KABI_RESERVE(15)
+	RH_KABI_RESERVE(16)
 };
 
 struct devlink_port_new_attrs {
