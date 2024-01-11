@@ -22,6 +22,8 @@
 #include <linux/indirect_call_wrapper.h>
 #include <uapi/linux/bpf.h>
 
+#include <linux/rh_kabi.h>
+
 #ifdef CONFIG_IPV6_MULTIPLE_TABLES
 #define FIB6_TABLE_HASHSZ 256
 #else
@@ -203,6 +205,10 @@ struct fib6_info {
 
 	struct rcu_head			rcu;
 	struct nexthop			*nh;
+
+	RH_KABI_RESERVE(1)
+	RH_KABI_RESERVE(2)
+
 	struct fib6_nh			fib6_nh[];
 };
 
