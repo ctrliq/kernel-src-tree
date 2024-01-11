@@ -103,6 +103,11 @@ struct socket_wq {
 	struct fasync_struct	*fasync_list;
 	unsigned long		flags; /* %SOCKWQ_ASYNC_NOSPACE, etc */
 	struct rcu_head		rcu;
+
+	RH_KABI_RESERVE(1)
+	RH_KABI_RESERVE(2)
+	RH_KABI_RESERVE(3)
+	RH_KABI_RESERVE(4)
 } ____cacheline_aligned_in_smp;
 
 /**
