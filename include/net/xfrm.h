@@ -28,6 +28,8 @@
 
 #include <linux/interrupt.h>
 
+#include <linux/rh_kabi.h>
+
 #ifdef CONFIG_XFRM_STATISTICS
 #include <net/snmp.h>
 #endif
@@ -124,6 +126,8 @@ struct xfrm_state_walk {
 	u8			proto;
 	u32			seq;
 	struct xfrm_address_filter *filter;
+
+	RH_KABI_RESERVE(1)
 };
 
 enum {
@@ -150,6 +154,11 @@ struct xfrm_dev_offload {
 	u8			dir : 2;
 	u8			type : 2;
 	u8			flags : 2;
+
+	RH_KABI_RESERVE(1)
+	RH_KABI_RESERVE(2)
+	RH_KABI_RESERVE(3)
+	RH_KABI_RESERVE(4)
 };
 
 struct xfrm_mode {
