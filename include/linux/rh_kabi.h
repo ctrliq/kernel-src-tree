@@ -408,7 +408,7 @@
 	}
 # define __RH_KABI_CHECK_SIZE(_item, _size)				\
 	_Static_assert(sizeof(struct{_item;}) <= _size,			\
-		       __FILE__ ":" __stringify(__LINE__) ": " __stringify(_item) " is larger than the reserved size (" __stringify(_size) " bytes)" RH_KABI_ALIGN_WARNING)
+		       __FILE__ ":" __stringify(__LINE__) ": " __stringify(_item) " is larger than the reserved size (" __stringify(_size) " bytes)" RH_KABI_ALIGN_WARNING);
 #else
 # define __RH_KABI_CHECK_SIZE_ALIGN(_orig, _new)
 # define __RH_KABI_CHECK_SIZE(_item, _size)
@@ -481,7 +481,7 @@
 	RH_KABI_EXTEND(union {						\
 		_new;							\
 		unsigned long RH_KABI_UNIQUE_ID[_size];			\
-		__RH_KABI_CHECK_SIZE(_new, 8 * (_size));		\
+		__RH_KABI_CHECK_SIZE(_new, 8 * (_size))			\
 	})
 
 #define _RH_KABI_AUX_PTR(_struct)					\
