@@ -306,6 +306,23 @@
  *   of the size is not allowed and would constitute a silent kABI breakage.
  *   Beware that the RH_KABI_EXCLUDE macro does not do any size checks.
  *
+ * RH_KABI_EXCLUDE_WITH_SIZE
+ *   Like RH_KABI_EXCLUDE, this macro excludes the element from
+ *   checksum generation.  The same warnings as for RH_KABI_EXCLUDE
+ *   apply: use RH_KABI_FORCE_CHANGE.
+ *
+ *   This macro is intended to be used for elements embedded inside
+ *   kABI-protected structures (struct, array). In contrast with
+ *   RH_KABI_EXCLUDE, this macro reserves extra space, so that the
+ *   embedded element can grow without changing the offsets of the
+ *   fields that follow. The provided 'size' is the total space to be
+ *   added in longs (i.e. it's 8 * 'size' bytes), including the size
+ *   of the added element.  It is automatically checked that the new
+ *   element does not overflow the reserved space, now nor in the
+ *   future. The size is also included in the checksum via the
+ *   reserved space, to ensure that we don't accidentally change it,
+ *   which would change the offsets of the fields that follow.
+ *
  * RH_KABI_BROKEN_INSERT
  * RH_KABI_BROKEN_REMOVE
  *   Insert a field to the middle of a struct / delete a field from a struct.
@@ -376,6 +393,8 @@
 # define _RH_KABI_DEPRECATE_FN(_type, _orig, _args...)	_type (*_orig)(_args)
 # define _RH_KABI_REPLACE(_orig, _new)		_orig
 # define _RH_KABI_EXCLUDE(_elem)
+
+# define __RH_KABI_CHECK_SIZE(_item, _size)
 
 #else
 
@@ -476,6 +495,13 @@
 # define _RH_KABI_RESERVE(n)		unsigned long rh_reserved##n
 
 #define RH_KABI_EXCLUDE(_elem)		_RH_KABI_EXCLUDE(_elem);
+
+#define RH_KABI_EXCLUDE_WITH_SIZE(_new, _size)				\
+	union {								\
+		RH_KABI_EXCLUDE(_new)					\
+		unsigned long RH_KABI_UNIQUE_ID[_size];			\
+		__RH_KABI_CHECK_SIZE(_new, 8 * (_size))			\
+	};
 
 #define RH_KABI_EXTEND_WITH_SIZE(_new, _size)				\
 	RH_KABI_EXTEND(union {						\
