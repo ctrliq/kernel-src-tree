@@ -6,6 +6,8 @@
 #include <net/netlink.h>
 #include <net/net_namespace.h>
 
+#include <linux/rh_kabi.h>
+
 #define GENLMSG_DEFAULT_SIZE (NLMSG_DEFAULT_SIZE - GENL_HDRLEN)
 
 /**
@@ -187,6 +189,15 @@ struct genl_ops {
 	u8			internal_flags;
 	u8			flags;
 	u8			validate;
+
+	RH_KABI_RESERVE(1)
+	RH_KABI_RESERVE(2)
+	RH_KABI_RESERVE(3)
+	RH_KABI_RESERVE(4)
+	RH_KABI_RESERVE(5)
+	RH_KABI_RESERVE(6)
+	RH_KABI_RESERVE(7)
+	RH_KABI_RESERVE(8)
 };
 
 /**
