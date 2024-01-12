@@ -532,6 +532,7 @@ struct bpf_fentry_test_t {
 
 int noinline bpf_fentry_test7(struct bpf_fentry_test_t *arg)
 {
+	asm volatile ("");
 	return (long)arg;
 }
 
@@ -543,6 +544,10 @@ int noinline bpf_fentry_test8(struct bpf_fentry_test_t *arg)
 __bpf_kfunc u32 bpf_fentry_test9(u32 *a)
 {
 	return *a;
+}
+
+void noinline bpf_fentry_test_sinfo(struct skb_shared_info *sinfo)
+{
 }
 
 __bpf_kfunc int bpf_modify_return_test(int a, int *b)
@@ -572,6 +577,13 @@ long noinline bpf_kfunc_call_test4(signed char a, short b, int c, long d)
 	 * b and c on platforms where this is required (e.g. s390x).
 	 */
 	return (long)a + (long)b + (long)c + d;
+}
+
+__bpf_kfunc int bpf_modify_return_test2(int a, int *b, short c, int d,
+					void *e, char f, int g)
+{
+	*b += 1;
+	return a + *b + c + d + (long)e + f + g;
 }
 
 int noinline bpf_fentry_shadow_test(int a)
@@ -763,6 +775,7 @@ __diag_pop();
 
 BTF_SET8_START(bpf_test_modify_return_ids)
 BTF_ID_FLAGS(func, bpf_modify_return_test)
+BTF_ID_FLAGS(func, bpf_modify_return_test2)
 BTF_ID_FLAGS(func, bpf_fentry_test1, KF_SLEEPABLE)
 BTF_SET8_END(bpf_test_modify_return_ids)
 
@@ -854,7 +867,11 @@ int bpf_prog_test_run_tracing(struct bpf_prog *prog,
 	case BPF_MODIFY_RETURN:
 		ret = bpf_modify_return_test(1, &b);
 		if (b != 2)
-			side_effect = 1;
+			side_effect++;
+		b = 2;
+		ret += bpf_modify_return_test2(1, &b, 3, 4, (void *)5, 6, 7);
+		if (b != 2)
+			side_effect++;
 		break;
 	default:
 		goto out;
