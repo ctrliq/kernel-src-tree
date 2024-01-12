@@ -673,7 +673,7 @@ BuildRequires: bpftool
 BuildRequires: rsync
 %endif
 %if %{with_doc}
-BuildRequires: xmlto, asciidoc, python3-sphinx, python3-sphinx_rtd_theme
+BuildRequires: xmlto, asciidoc, python3-sphinx, python3-sphinx_rtd_theme, python3-pyyaml
 %endif
 %if %{with_sparse}
 BuildRequires: sparse
