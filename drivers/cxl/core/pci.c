@@ -67,7 +67,7 @@ static int match_add_dports(struct pci_dev *pdev, void *data)
 
 /**
  * devm_cxl_port_enumerate_dports - enumerate downstream ports of the upstream port
- * @port: cxl_port whose ->uport is the upstream of dports to be enumerated
+ * @port: cxl_port whose ->uport_dev is the upstream of dports to be enumerated
  *
  * Returns a positive number of dports enumerated or a negative error
  * code.
@@ -594,7 +594,7 @@ void read_cdat_data(struct cxl_port *port)
 {
 	struct pci_doe_mb *cdat_doe;
 	struct device *dev = &port->dev;
-	struct device *uport = port->uport;
+	struct device *uport = port->uport_dev;
 	size_t cdat_length;
 	int rc;
 

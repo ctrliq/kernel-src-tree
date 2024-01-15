@@ -1502,7 +1502,7 @@ vmxnet3_rq_rx_complete(struct vmxnet3_rx_queue *rq,
 				goto rcd_done;
 			}
 
-			if (rxDataRingUsed) {
+			if (rxDataRingUsed && adapter->rxdataring_enabled) {
 				size_t sz;
 
 				BUG_ON(rcd->len > rq->data_ring.desc_size);
