@@ -278,6 +278,11 @@ static inline void bio_first_folio(struct folio_iter *fi, struct bio *bio,
 {
 	struct bio_vec *bvec = bio_first_bvec_all(bio) + i;
 
+	if (unlikely(i >= bio->bi_vcnt)) {
+		fi->folio = NULL;
+		return;
+	}
+
 	fi->folio = page_folio(bvec->bv_page);
 	fi->offset = bvec->bv_offset +
 			PAGE_SIZE * (bvec->bv_page - &fi->folio->page);
@@ -293,10 +298,8 @@ static inline void bio_next_folio(struct folio_iter *fi, struct bio *bio)
 		fi->folio = folio_next(fi->folio);
 		fi->offset = 0;
 		fi->length = min(folio_size(fi->folio), fi->_seg_count);
-	} else if (fi->_i + 1 < bio->bi_vcnt) {
-		bio_first_folio(fi, bio, fi->_i + 1);
 	} else {
-		fi->folio = NULL;
+		bio_first_folio(fi, bio, fi->_i + 1);
 	}
 }
 
