@@ -1089,6 +1089,8 @@ asmlinkage __visible void __init __no_sanitize_address start_kernel(void)
 	sched_clock_init();
 	calibrate_delay();
 
+	arch_cpu_finalize_init();
+
 	/*
 	 * This needs to be called before any devices perform DMA
 	 * operations that might use the SWIOTLB bounce buffers. It will
@@ -1125,7 +1127,6 @@ asmlinkage __visible void __init __no_sanitize_address start_kernel(void)
 	taskstats_init_early();
 	delayacct_init();
 
-	arch_cpu_finalize_init();
 	/* Temporary conditional until everything has been converted */
 #ifndef CONFIG_ARCH_HAS_CPU_FINALIZE_INIT
 	check_bugs();
