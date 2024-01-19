@@ -44,6 +44,7 @@ bool check_huge_file(void *addr, int nr_hpages, uint64_t hpage_size);
 bool check_huge_shmem(void *addr, int nr_hpages, uint64_t hpage_size);
 int64_t allocate_transhuge(void *ptr, int pagemap_fd);
 unsigned long default_huge_page_size(void);
+unsigned long get_free_hugepages(void);
 
 /*
  * On ppc64 this will only work with radix 2M hugepage size
