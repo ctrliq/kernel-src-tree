@@ -218,6 +218,8 @@ CATEGORY="mlock" run_test ./mlock2-tests
 
 CATEGORY="mremap" run_test ./mremap_test
 
+CATEGORY="process_mrelease" run_test ./mrelease_test
+
 CATEGORY="hugetlb" run_test ./thuge-gen
 
 if [ $VADDR64 -ne 0 ]; then
