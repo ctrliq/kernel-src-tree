@@ -16,6 +16,7 @@
 #include <fcntl.h>
 #include <dirent.h>
 #include <assert.h>
+#include <linux/mman.h>
 #include <sys/mman.h>
 #include <sys/ioctl.h>
 #include <sys/wait.h>
