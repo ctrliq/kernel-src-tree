@@ -603,7 +603,7 @@ $(TARBALL):
 	@scripts/create-tarball.sh
 
 .PHONY: $(KABI_TARBALL)
-$(KABI_TARBALL):
+$(KABI_TARBALL): dist-kabi
 	@(cd kabi && tar -cJf $(KABI_TARBALL) kabi-rhel$(RHEL_MAJOR)* kabi-current)
 
 .PHONY: $(KABIDW_TARBALL)
