@@ -262,4 +262,7 @@ fi
 
 run_test ./soft-dirty
 
+# COW tests for anonymous memory
+run_test ./anon_cow
+
 exit $exitcode
