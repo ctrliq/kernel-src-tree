@@ -638,7 +638,11 @@ dist-get-buildreqs: setup-source
 		echo "PASS: All build dependencies found."; \
 	fi
 
-_setup-source: dist-git-version-check
+# IMPORTANT: All targets whose recipes read/modify files under $(SOURCES)
+# MUST depend on setup-source (at least indirectly). Otherwise such
+# recipes may be ordered before/in parallel with dist-clean-sources
+# (prerequisite of setup-source), which would then delete their results.
+setup-source: dist-clean-sources dist-git-version-check
 	@if [ ! -e $(REDHAT)/$(SPECFILE).template ]; then \
 		echo "Creating $(REDHAT)/$(SPECFILE).template as a copy of $(REDHAT)/kernel.spec.template"; \
 		cp $(REDHAT)/kernel.spec.template $(REDHAT)/$(SPECFILE).template; \
@@ -659,8 +663,6 @@ _setup-source: dist-git-version-check
 	fi
 	@$(REDHAT)/scripts/genspec/genspec.sh
 	@cp $(SOURCES)/$(SPECFILE) $(SOURCES)/../SPECS/
-
-setup-source: dist-clean-sources _setup-source
 
 generate-testpatch-tmp:
 	@$(GIT) diff --no-renames HEAD ":(exclude,top).get_maintainer.conf" \
