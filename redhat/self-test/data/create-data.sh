@@ -28,7 +28,7 @@ specfile_helper () {
 
 	specfilename=$1
 	cp ./kernel.spec.template "${varfilename}.spec.template"
-	make RHSELFTESTDATA=1 SPECFILE="${specfilename}.spec" DIST="${DIST}" DISTRO="${DISTRO}" HEAD="${commit}" _setup-source
+	make RHSELFTESTDATA=1 SPECFILE="${specfilename}.spec" DIST="${DIST}" DISTRO="${DISTRO}" HEAD="${commit}" setup-source
 	grep -Fvx -f "${specfilename}.spec.template" "${sources}/${specfilename}.spec" > "${destdir}"/"${specfilename}".spec
 	# Ignore bpftoolversion definition as it may change.
 	sed -i '/^%define bpftoolversion /d' "${destdir}"/"${specfilename}".spec
