@@ -49,6 +49,8 @@
 #include <crypto/aead.h>
 #include <uapi/linux/tls.h>
 
+#include <linux/rh_kabi.h>
+
 struct tls_rec;
 
 /* Maximum data size carried in a TLS record */
@@ -193,17 +195,31 @@ enum tls_context_flags {
 struct cipher_context {
 	char iv[TLS_MAX_IV_SIZE + TLS_MAX_SALT_SIZE];
 	char rec_seq[TLS_MAX_REC_SEQ_SIZE];
+
+	RH_KABI_RESERVE(1)
+	RH_KABI_RESERVE(2)
+	RH_KABI_RESERVE(3)
+	RH_KABI_RESERVE(4)
 };
+
+/* Note: sizeof(struct tls12_crypto_info_aes_gcm_256) + 32 at rhel9 GA */
+#define RH_KABI_TLS_CRYPTO_CONTEXT_SIZE         88
 
 union tls_crypto_context {
 	struct tls_crypto_info info;
 	union {
+		/* RHEL: new alternative ciphers must be added under KABI_EXTEND().
+		 * build time checks in tls_register() will ensure tls_crypto_context
+		 * does not exceed the padding storage
+		 */
 		struct tls12_crypto_info_aes_gcm_128 aes_gcm_128;
 		struct tls12_crypto_info_aes_gcm_256 aes_gcm_256;
 		struct tls12_crypto_info_chacha20_poly1305 chacha20_poly1305;
 		struct tls12_crypto_info_sm4_gcm sm4_gcm;
 		struct tls12_crypto_info_sm4_ccm sm4_ccm;
 	};
+
+	char rh_kabi_padding[RH_KABI_TLS_CRYPTO_CONTEXT_SIZE];
 };
 
 struct tls_prot_info {
@@ -281,6 +297,11 @@ struct tlsdev_ops {
 	int (*tls_dev_resync)(struct net_device *netdev,
 			      struct sock *sk, u32 seq, u8 *rcd_sn,
 			      enum tls_offload_ctx_dir direction);
+
+	RH_KABI_RESERVE(1)
+	RH_KABI_RESERVE(2)
+	RH_KABI_RESERVE(3)
+	RH_KABI_RESERVE(4)
 };
 
 enum tls_offload_sync_type {

@@ -14,6 +14,8 @@
 #ifndef _LINUX_PERF_EVENT_H
 #define _LINUX_PERF_EVENT_H
 
+#include <linux/rh_kabi.h>
+
 #include <uapi/linux/perf_event.h>
 #include <uapi/linux/bpf_perf_event.h>
 
@@ -811,7 +813,7 @@ struct perf_event {
 	void				*overflow_handler_context;
 #ifdef CONFIG_BPF_SYSCALL
 	perf_overflow_handler_t		orig_overflow_handler;
-	struct bpf_prog			*prog;
+	RH_KABI_EXCLUDE(struct bpf_prog	*prog)
 	u64				bpf_cookie;
 #endif
 

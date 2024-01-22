@@ -32,6 +32,8 @@
 #include <linux/percpu.h>
 #include <asm/module.h>
 
+#include <linux/rh_kabi.h>
+
 #define MODULE_NAME_LEN MAX_PARAM_PREFIX_LEN
 
 struct modversion_info {
@@ -477,7 +479,7 @@ struct module {
 #endif
 #ifdef CONFIG_BPF_EVENTS
 	unsigned int num_bpf_raw_events;
-	struct bpf_raw_event_map *bpf_raw_events;
+	RH_KABI_EXCLUDE(struct bpf_raw_event_map *bpf_raw_events)
 #endif
 #ifdef CONFIG_DEBUG_INFO_BTF_MODULES
 	unsigned int btf_data_size;

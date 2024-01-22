@@ -9,6 +9,8 @@
 #include <net/scm.h>
 #include <uapi/linux/netlink.h>
 
+#include <linux/rh_kabi.h>
+
 struct net;
 
 void do_trace_netlink_extack(const char *msg);
@@ -88,6 +90,11 @@ struct netlink_ext_ack {
 	u8 cookie[NETLINK_MAX_COOKIE_LEN];
 	u8 cookie_len;
 	char _msg_buf[NETLINK_MAX_FMTMSG_LEN];
+
+	RH_KABI_RESERVE(1)
+	RH_KABI_RESERVE(2)
+	RH_KABI_RESERVE(3)
+	RH_KABI_RESERVE(4)
 };
 
 /* Always use this macro, this allows later putting the

@@ -44,6 +44,8 @@
 #endif
 #include <net/dropreason-core.h>
 
+#include <linux/rh_kabi.h>
+
 /* The interface for checksum offload between the stack and networking drivers
  * is as follows...
  *
@@ -632,6 +634,8 @@ typedef unsigned int sk_buff_data_t;
 typedef unsigned char *sk_buff_data_t;
 #endif
 
+#define RH_KABI_SKBUFF_RESERVED		16
+
 /**
  *	struct sk_buff - socket buffer
  *	@next: Next buffer in list
@@ -938,7 +942,28 @@ struct sk_buff {
 	u64			kcov_handle;
 #endif
 
+#ifndef __GENKSYMS__
+	/* RHEL kABI: if a new field needs to be copied by
+	 * __copy_skb_header, append it here (after the existing ones)
+	 * and update the size of the *non-__GENKSYMS__* rh_reserved
+	 * padding. Be mindful of alignments, and use pahole to check.
+	 */
+	char rh_reserved_start[0];
+#endif
 	); /* end headers group */
+
+#ifdef __GENKSYMS__
+	char rh_reserved[RH_KABI_SKBUFF_RESERVED];
+#else
+	char rh_reserved[RH_KABI_SKBUFF_RESERVED];
+
+	/* RHEL kABI: add new fields that don't need to be copied by
+	 * __copy_skb_header here (just above rh_reserved_end), and
+	 * update the size of the rh_reserved array. Be mindful of
+	 * alignments, and use pahole to check.
+	 */
+	char rh_reserved_end[0];
+#endif
 
 	/* These elements must be at the end, see alloc_skb() for details.  */
 	sk_buff_data_t		tail;
@@ -950,7 +975,7 @@ struct sk_buff {
 
 #ifdef CONFIG_SKB_EXTENSIONS
 	/* only useable after checking ->active_extensions != 0 */
-	struct skb_ext		*extensions;
+	RH_KABI_EXCLUDE(struct skb_ext		*extensions)
 #endif
 };
 

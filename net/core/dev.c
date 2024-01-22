@@ -10273,12 +10273,12 @@ void netdev_stats_to_stats64(struct rtnl_link_stats64 *stats64,
 	const atomic_long_t *src = (atomic_long_t *)netdev_stats;
 	u64 *dst = (u64 *)stats64;
 
-	BUILD_BUG_ON(n > sizeof(*stats64) / sizeof(u64));
+	BUILD_BUG_ON(n > sizeof_rtnl_link_stats64 / sizeof(u64));
 	for (i = 0; i < n; i++)
 		dst[i] = (unsigned long)atomic_long_read(&src[i]);
 	/* zero out counters that only exist in rtnl_link_stats64 */
 	memset((char *)stats64 + n * sizeof(u64), 0,
-	       sizeof(*stats64) - n * sizeof(u64));
+	       sizeof_rtnl_link_stats64 - n * sizeof(u64));
 }
 EXPORT_SYMBOL(netdev_stats_to_stats64);
 

@@ -23,6 +23,8 @@
 #include <linux/notifier.h>
 #include <linux/refcount.h>
 
+#include <linux/rh_kabi.h>
+
 struct fib_config {
 	u8			fc_dst_len;
 	dscp_t			fc_dscp;
@@ -157,6 +159,10 @@ struct fib_info {
 	bool			pfsrc_removed;
 	struct nexthop		*nh;
 	struct rcu_head		rcu;
+
+	RH_KABI_RESERVE(1)
+	RH_KABI_RESERVE(2)
+
 	struct fib_nh		fib_nh[];
 };
 
@@ -255,6 +261,12 @@ struct fib_table {
 	int			tb_num_default;
 	struct rcu_head		rcu;
 	unsigned long 		*tb_data;
+
+	RH_KABI_RESERVE(1)
+	RH_KABI_RESERVE(2)
+	RH_KABI_RESERVE(3)
+	RH_KABI_RESERVE(4)
+
 	unsigned long		__data[];
 };
 
