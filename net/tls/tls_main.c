@@ -1119,6 +1119,9 @@ static int __init tls_register(void)
 {
 	int err;
 
+	BUILD_BUG_ON(sizeof(union tls_crypto_context) >
+		     RH_KABI_TLS_CRYPTO_CONTEXT_SIZE);
+
 	err = register_pernet_subsys(&tls_proc_ops);
 	if (err)
 		return err;

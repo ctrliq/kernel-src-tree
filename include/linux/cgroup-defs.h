@@ -22,6 +22,8 @@
 #include <linux/bpf-cgroup-defs.h>
 #include <linux/psi_types.h>
 
+#include <linux/rh_kabi.h>
+
 #ifdef CONFIG_CGROUPS
 
 struct cgroup;
@@ -496,7 +498,7 @@ struct cgroup {
 	struct psi_group *psi;
 
 	/* used to store eBPF programs */
-	struct cgroup_bpf bpf;
+	RH_KABI_EXCLUDE_WITH_SIZE(struct cgroup_bpf bpf, 256)
 
 	/* If there is block congestion on this cgroup. */
 	atomic_t congestion_count;
@@ -505,7 +507,7 @@ struct cgroup {
 	struct cgroup_freezer_state freezer;
 
 #ifdef CONFIG_BPF_SYSCALL
-	struct bpf_local_storage __rcu  *bpf_cgrp_storage;
+	RH_KABI_EXCLUDE(struct bpf_local_storage __rcu  *bpf_cgrp_storage)
 #endif
 
 	/* All ancestors including self */
