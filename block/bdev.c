@@ -911,7 +911,6 @@ free_handle:
 	kfree(handle);
 	return ERR_PTR(ret);
 }
-EXPORT_SYMBOL(bdev_open_by_dev);
 
 void bdev_release(struct bdev_handle *handle)
 {
@@ -951,7 +950,6 @@ void bdev_release(struct bdev_handle *handle)
 	blkdev_put_no_open(bdev);
 	kfree(handle);
 }
-EXPORT_SYMBOL(bdev_release);
 
 /*
  * If BLK_OPEN_WRITE_IOCTL is set then this is a historical quirk
