@@ -1090,21 +1090,21 @@ void ext4_update_dynamic_rev(struct super_block *sb)
 /*
  * Open the external journal device
  */
-static struct bdev_handle *ext4_blkdev_get(dev_t dev, struct super_block *sb)
+static struct file *ext4_blkdev_get(dev_t dev, struct super_block *sb)
 {
-	struct bdev_handle *bdev_handle;
+	struct file *bdev_file;
 
-	bdev_handle = bdev_open_by_dev(dev,
+	bdev_file = bdev_file_open_by_dev(dev,
 		BLK_OPEN_READ | BLK_OPEN_WRITE | BLK_OPEN_RESTRICT_WRITES,
 		sb, &fs_holder_ops);
-	if (IS_ERR(bdev_handle))
+	if (IS_ERR(bdev_file))
 		goto fail;
-	return bdev_handle;
+	return bdev_file;
 
 fail:
 	ext4_msg(sb, KERN_ERR,
 		 "failed to open journal device unknown-block(%u,%u) %ld",
-		 MAJOR(dev), MINOR(dev), PTR_ERR(bdev_handle));
+		 MAJOR(dev), MINOR(dev), PTR_ERR(bdev_file));
 	return NULL;
 }
 
@@ -1248,14 +1248,14 @@ static void ext4_put_super(struct super_block *sb)
 
 	sync_blockdev(sb->s_bdev);
 	invalidate_bdev(sb->s_bdev);
-	if (sbi->s_journal_bdev_handle) {
+	if (sbi->s_journal_bdev_file) {
 		/*
 		 * Invalidate the journal device's buffers.  We don't want them
 		 * floating about in memory - the physical journal device may
 		 * hotswapped, and it breaks the `ro-after' testing code.
 		 */
-		sync_blockdev(sbi->s_journal_bdev_handle->bdev);
-		invalidate_bdev(sbi->s_journal_bdev_handle->bdev);
+		sync_blockdev(file_bdev(sbi->s_journal_bdev_file));
+		invalidate_bdev(file_bdev(sbi->s_journal_bdev_file));
 	}
 
 	ext4_xattr_destroy_cache(sbi->s_ea_inode_cache);
@@ -4160,7 +4160,7 @@ int ext4_calculate_overhead(struct super_block *sb)
 	 * Add the internal journal blocks whether the journal has been
 	 * loaded or not
 	 */
-	if (sbi->s_journal && !sbi->s_journal_bdev_handle)
+	if (sbi->s_journal && !sbi->s_journal_bdev_file)
 		overhead += EXT4_NUM_B2C(sbi, sbi->s_journal->j_total_len);
 	else if (ext4_has_feature_journal(sb) && !sbi->s_journal && j_inum) {
 		/* j_inum for internal journal is non-zero */
@@ -5629,9 +5629,9 @@ failed_mount:
 #endif
 	fscrypt_free_dummy_policy(&sbi->s_dummy_enc_policy);
 	brelse(sbi->s_sbh);
-	if (sbi->s_journal_bdev_handle) {
-		invalidate_bdev(sbi->s_journal_bdev_handle->bdev);
-		bdev_release(sbi->s_journal_bdev_handle);
+	if (sbi->s_journal_bdev_file) {
+		invalidate_bdev(file_bdev(sbi->s_journal_bdev_file));
+		fput(sbi->s_journal_bdev_file);
 	}
 out_fail:
 	invalidate_bdev(sb->s_bdev);
@@ -5811,19 +5811,19 @@ static journal_t *ext4_get_dev_journal(struct super_block *sb,
 	unsigned long offset;
 	struct ext4_super_block *es;
 	struct block_device *bdev;
-	struct bdev_handle *bdev_handle;
+	struct file *bdev_file;
 
 	if (WARN_ON_ONCE(!ext4_has_feature_journal(sb)))
 		return NULL;
 
 	/* see get_tree_bdev why this is needed and safe */
 	up_write(&sb->s_umount);
-	bdev_handle = ext4_blkdev_get(j_dev, sb);
+	bdev_file = ext4_blkdev_get(j_dev, sb);
 	down_write(&sb->s_umount);
-	if (bdev_handle == NULL)
+	if (bdev_file == NULL)
 		return NULL;
 
-	bdev = bdev_handle->bdev;
+	bdev = file_bdev(bdev_file);
 	blocksize = sb->s_blocksize;
 	hblock = bdev_logical_block_size(bdev);
 	if (blocksize < hblock) {
@@ -5887,14 +5887,14 @@ static journal_t *ext4_get_dev_journal(struct super_block *sb,
 			be32_to_cpu(journal->j_superblock->s_nr_users));
 		goto out_journal;
 	}
-	EXT4_SB(sb)->s_journal_bdev_handle = bdev_handle;
+	EXT4_SB(sb)->s_journal_bdev_file = bdev_file;
 	ext4_init_journal_params(sb, journal);
 	return journal;
 
 out_journal:
 	jbd2_journal_destroy(journal);
 out_bdev:
-	bdev_release(bdev_handle);
+	fput(bdev_file);
 	return NULL;
 }
 
@@ -7271,12 +7271,12 @@ static inline int ext3_feature_set_ok(struct super_block *sb)
 static void ext4_kill_sb(struct super_block *sb)
 {
 	struct ext4_sb_info *sbi = EXT4_SB(sb);
-	struct bdev_handle *handle = sbi ? sbi->s_journal_bdev_handle : NULL;
+	struct file *bdev_file = sbi ? sbi->s_journal_bdev_file : NULL;
 
 	kill_block_super(sb);
 
-	if (handle)
-		bdev_release(handle);
+	if (bdev_file)
+		fput(bdev_file);
 }
 
 static struct file_system_type ext4_fs_type = {
