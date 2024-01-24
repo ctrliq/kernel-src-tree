@@ -845,6 +845,22 @@ ifeq ("$(RHDISTGIT_BRANCH)", "")
 endif
 	$(REDHAT)/scripts/rh-dist-git.sh
 
+dist-headers-srpm:
+	@scripts/create_headers_tarball.sh
+	@cp $(REDHAT)/kernel-headers.spec.template $(SOURCES)/kernel-headers.spec
+	@$(REDHAT)/scripts/genspec/headerspec.sh
+	@cp $(SOURCES)/kernel-headers.spec $(SOURCES)/../SPECS/
+	$(RPMBUILD) --define "_sourcedir $(SOURCES)" --define "_builddir $(RPM)/BUILD" --define "_srcrpmdir $(RPM)/SRPMS" --define "_rpmdir $(RPM)/RPMS" --define "_specdir $(RPM)/SPECS" --define "dist $(DIST)" --nodeps -bs $(RPM)/SOURCES/kernel-headers.spec
+
+dist-git-headers: dist-headers-srpm
+ifeq ("$(RHDISTGIT_BRANCH)", "")
+ $(error RHDISTGIT_BRANCH unset)
+endif
+	SPECPACKAGE_NAME=kernel-headers SRPM=$(SRPMS)/kernel-headers-$(BASEVERSION)$(DIST).src.rpm $(REDHAT)/scripts/rh-headers-dist-git.sh
+
+dist-git-headers-test: export RH_DIST_GIT_TEST="1"
+dist-git-headers-test: dist-git-headers
+
 dist-rtg: dist-release
 	@$(MAKE) dist-release-tag
 	@$(MAKE) dist-git
