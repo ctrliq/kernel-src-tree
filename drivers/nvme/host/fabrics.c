@@ -276,12 +276,6 @@ static void nvmf_log_connect_error(struct nvme_ctrl *ctrl,
 		return;
 	}
 
-	if (errval < 0) {
-		dev_err(ctrl->device,
-			"Connect command failed, errno: %d\n", errval);
-		return;
-	}
-
 	switch (err_sctype) {
 	case NVME_SC_CONNECT_INVALID_PARAM:
 		if (offset >> 16) {
