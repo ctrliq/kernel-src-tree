@@ -574,7 +574,7 @@ dist-clean-configs:
 	@cd $(REDHAT)/configs; rm -f kernel-*.config kernel-*.config.orig kernel-*.config.tmp partial-*-snip.config
 
 dist-clean-sources:
-# skip dist-clean-sources when generating test data to prevent race condition
+# Do not cleanup when creating self-test data
 ifndef RHSELFTESTDATA
 	@rm -f $(RPM)/SPECS/*
 	@rm -f $(SOURCES)/*
@@ -832,11 +832,6 @@ _dist-brew _dist-koji: _dist-%: dist-vr-check dist-srpm
 
 _distg-brew _distg-koji: _distg-%: dist-vr-check
 	$* $(BUILD_PROFILE) build $(BUILD_FLAGS) --scratch $(BUILD_TARGET) "$(RHGITURL)?redhat/koji#$(RHGITCOMMIT)"
-
-.PHONY: $(REDHAT)/rpm/SOURCES/$(SPECFILE)
-$(REDHAT)/rpm/SOURCES/$(SPECFILE):
-	@echo "dist-sources"
-	@$(MAKE) dist-sources
 
 dist-git-test: export RH_DIST_GIT_TEST="1"
 dist-git-test: dist-git
