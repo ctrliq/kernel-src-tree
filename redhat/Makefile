@@ -685,6 +685,7 @@ sources-rh: $(TARBALL) $(KABI_TARBALL) $(KABIDW_TARBALL) generate-testpatch-tmp 
 	@sed -e "s/%%SPECKVERSION%%/$(SPECKVERSION)/" \
 		-e "s/%%SPECKPATCHLEVEL%%/$(SPECKPATCHLEVEL)/" \
 		scripts/gating/rpminspect.yaml > $(SOURCES)/rpminspect.yaml
+	@$(REDHAT)/scripts/uki_addons/uki_create_json.py $(REDHAT)/scripts/uki_addons/uki_addons.json
 	@cp scripts/kernel-tools/kvm_stat.logrotate \
 		keys/rhel*.x509 \
 		keys/nvidia*.x509 \
@@ -696,6 +697,8 @@ sources-rh: $(TARBALL) $(KABI_TARBALL) $(KABIDW_TARBALL) generate-testpatch-tmp 
 		scripts/filtermods.py \
 		scripts/mod/mod-denylist.sh \
 		scripts/mod/mod-sign.sh \
+		scripts/uki_addons/uki_create_addons.py \
+		scripts/uki_addons/uki_addons.json \
 		configs/flavors \
 		configs/generate_all_configs.sh \
 		configs/merge.py \
