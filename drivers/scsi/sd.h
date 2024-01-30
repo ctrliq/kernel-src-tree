@@ -162,6 +162,7 @@ struct scsi_disk {
 	RH_KABI_FILL_HOLE(unsigned use_atomic_write_boundary:1)
 
 	RH_KABI_FILL_HOLE(bool suspended)	/* Disk is suspended (stopped) */
+	RH_KABI_FILL_HOLE(unsigned rscs:1)
 
 	/* FOR RH USE ONLY
 	 *

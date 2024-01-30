@@ -292,7 +292,7 @@ struct scsi_device {
 	RH_KABI_USE(1, struct scsi_vpd __rcu *vpd_pgb0)
 	RH_KABI_USE(2, struct scsi_vpd __rcu *vpd_pgb1)
 	RH_KABI_USE(3, struct scsi_vpd __rcu *vpd_pgb2)
-	RH_KABI_RESERVE(4)
+	RH_KABI_USE(4, struct scsi_vpd __rcu *vpd_pgb7)
 	RH_KABI_RESERVE(5)
 	RH_KABI_RESERVE(6)
 
