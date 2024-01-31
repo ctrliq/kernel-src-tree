@@ -78,7 +78,7 @@ TARGETS += tpm2
 TARGETS += tty
 TARGETS += user
 TARGETS += vDSO
-TARGETS += vm
+TARGETS += mm
 TARGETS += x86
 TARGETS += zram
 #Please keep the TARGETS list alphabetically sorted
