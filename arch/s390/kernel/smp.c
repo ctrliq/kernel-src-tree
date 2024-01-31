@@ -1070,9 +1070,11 @@ static ssize_t cpu_configure_store(struct device *dev,
 	cpus_read_lock();
 	mutex_lock(&smp_cpu_state_mutex);
 	rc = -EBUSY;
-	/* disallow configuration changes of online cpus */
+	/* disallow configuration changes of online cpus and cpu 0 */
 	cpu = dev->id;
 	cpu = smp_get_base_cpu(cpu);
+	if (cpu == 0)
+		goto out;
 	for (i = 0; i <= smp_cpu_mtid; i++)
 		if (cpu_online(cpu + i))
 			goto out;
@@ -1172,7 +1174,7 @@ static int smp_add_present_cpu(int cpu)
 		return -ENOMEM;
 	per_cpu(cpu_device, cpu) = c;
 	s = &c->dev;
-	c->hotpluggable = !!cpu;
+	c->hotpluggable = 1;
 	rc = register_cpu(c, cpu);
 	if (rc)
 		goto out;
