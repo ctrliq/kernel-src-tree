@@ -110,7 +110,7 @@ void kobject_put(struct kobject *kobj);
 
 const void *kobject_namespace(const struct kobject *kobj);
 void kobject_get_ownership(const struct kobject *kobj, kuid_t *uid, kgid_t *gid);
-char *kobject_get_path(struct kobject *kobj, gfp_t flag);
+char *kobject_get_path(const struct kobject *kobj, gfp_t flag);
 
 struct kobj_type {
 	void (*release)(struct kobject *kobj);
