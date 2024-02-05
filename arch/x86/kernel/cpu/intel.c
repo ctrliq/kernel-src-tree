@@ -1282,18 +1282,6 @@ void handle_bus_lock(struct pt_regs *regs)
 }
 
 /*
- * This function is called only when switching between tasks with
- * different split-lock detection modes. It sets the MSR for the
- * mode of the new task. This is right most of the time, but since
- * the MSR is shared by hyperthreads on a physical core there can
- * be glitches when the two threads need different modes.
- */
-void switch_to_sld(unsigned long tifn)
-{
-	sld_update_msr(!(tifn & _TIF_SLD));
-}
-
-/*
  * CPU models that are known to have the per-core split-lock detection
  * feature even though they do not enumerate IA32_CORE_CAPABILITIES.
  */
