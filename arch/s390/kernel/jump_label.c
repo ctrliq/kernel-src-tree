@@ -82,9 +82,3 @@ void arch_jump_label_transform(struct jump_entry *entry,
 	__jump_label_transform(entry, type, 0);
 	smp_call_function(__jump_label_sync, NULL, 1);
 }
-
-void arch_jump_label_transform_static(struct jump_entry *entry,
-				      enum jump_label_type type)
-{
-	__jump_label_transform(entry, type, 1);
-}
