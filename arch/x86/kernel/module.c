@@ -369,9 +369,6 @@ int module_finalize(const Elf_Ehdr *hdr,
 					    text, text_end);
 	}
 
-	/* make jump label nops */
-	jump_label_apply_nops(me);
-
 	if (orc && orc_ip)
 		unwind_module_init(me, (void *)orc_ip->sh_addr, orc_ip->sh_size,
 				   (void *)orc->sh_addr, orc->sh_size);
