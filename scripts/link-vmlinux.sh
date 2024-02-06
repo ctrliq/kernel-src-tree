@@ -157,6 +157,10 @@ objtool_link()
 			objtoolopt="${objtoolopt} --mcount"
 		fi
 
+		if is_enabled CONFIG_FTRACE_MCOUNT_USE_OBJTOOL; then
+			objtoolopt="${objtoolopt} --mnop"
+		fi
+
 		if is_enabled CONFIG_UNWINDER_ORC; then
 			objtoolopt="${objtoolopt} --orc"
 		fi
