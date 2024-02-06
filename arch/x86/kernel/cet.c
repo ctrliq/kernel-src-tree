@@ -6,8 +6,6 @@
 
 static __ro_after_init bool ibt_fatal = true;
 
-extern void ibt_selftest_ip(void); /* code label defined in asm below */
-
 enum cp_error_code {
 	CP_EC        = (1 << 15) - 1,
 
@@ -30,7 +28,7 @@ DEFINE_IDTENTRY_ERRORCODE(exc_control_protection)
 	if (WARN_ON_ONCE(user_mode(regs) || (error_code & CP_EC) != CP_ENDBR))
 		return;
 
-	if (unlikely(regs->ip == (unsigned long)&ibt_selftest_ip)) {
+	if (unlikely(regs->ip == (unsigned long)&ibt_selftest_noendbr)) {
 		regs->ax = 0;
 		return;
 	}
@@ -42,24 +40,6 @@ DEFINE_IDTENTRY_ERRORCODE(exc_control_protection)
 		return;
 	}
 	BUG();
-}
-
-/* Must be noinline to ensure uniqueness of ibt_selftest_ip. */
-noinline bool ibt_selftest(void)
-{
-	unsigned long ret;
-
-	asm ("	lea ibt_selftest_ip(%%rip), %%rax\n\t"
-	     ANNOTATE_RETPOLINE_SAFE
-	     "	jmp *%%rax\n\t"
-	     "ibt_selftest_ip:\n\t"
-	     UNWIND_HINT_FUNC
-	     ANNOTATE_NOENDBR
-	     "	nop\n\t"
-
-	     : "=a" (ret) : : "memory");
-
-	return !ret;
 }
 
 static int __init ibt_setup(char *str)
