@@ -400,38 +400,37 @@ DECLARE_APIC_CALL(write);
 
 static __always_inline u32 apic_read(u32 reg)
 {
-	return apic->read(reg);
+	return static_call(apic_call_read)(reg);
 }
 
 static __always_inline void apic_write(u32 reg, u32 val)
 {
-	apic->write(reg, val);
+	static_call(apic_call_write)(reg, val);
 }
 
 static __always_inline void apic_eoi(void)
 {
-	apic->eoi();
+	static_call(apic_call_eoi)();
 }
 
 static __always_inline void apic_native_eoi(void)
 {
-	apic->native_eoi();
+	static_call(apic_call_native_eoi)();
 }
 
 static __always_inline u64 apic_icr_read(void)
 {
-	return apic->icr_read();
+	return static_call(apic_call_icr_read)();
 }
 
 static __always_inline void apic_icr_write(u32 low, u32 high)
 {
-	apic->icr_write(low, high);
+	static_call(apic_call_icr_write)(low, high);
 }
 
 static __always_inline void apic_wait_icr_idle(void)
 {
-	if (apic->wait_icr_idle)
-		apic->wait_icr_idle();
+	static_call_cond(apic_call_wait_icr_idle)();
 }
 
 static __always_inline u32 safe_apic_wait_icr_idle(void)
