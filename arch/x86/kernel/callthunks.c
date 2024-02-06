@@ -292,6 +292,7 @@ void *callthunks_translate_call_dest(void *dest)
 	return target ? : dest;
 }
 
+#ifdef CONFIG_BPF_JIT
 bool is_callthunk(void *addr)
 {
 	unsigned int tmpl_size = SKL_TMPL_SIZE;
@@ -305,7 +306,6 @@ bool is_callthunk(void *addr)
 	return !bcmp((void *)(dest - tmpl_size), tmpl, tmpl_size);
 }
 
-#ifdef CONFIG_BPF_JIT
 int x86_call_depth_emit_accounting(u8 **pprog, void *func)
 {
 	unsigned int tmpl_size = SKL_TMPL_SIZE;
