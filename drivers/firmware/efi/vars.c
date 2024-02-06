@@ -1229,3 +1229,15 @@ int efivar_supports_writes(void)
 	return __efivars && __efivars->ops->set_variable;
 }
 EXPORT_SYMBOL_GPL(efivar_supports_writes);
+
+efi_status_t efivar_query_variable_info(u32 attr,
+					u64 *storage_space,
+					u64 *remaining_space,
+					u64 *max_variable_size)
+{
+	if (!__efivars->ops->query_variable_info)
+		return EFI_UNSUPPORTED;
+	return __efivars->ops->query_variable_info(attr, storage_space,
+			remaining_space, max_variable_size);
+}
+EXPORT_SYMBOL_NS_GPL(efivar_query_variable_info, EFIVAR);
