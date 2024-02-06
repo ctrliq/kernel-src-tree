@@ -638,7 +638,6 @@ ia64_imva (void *addr)
 
 #define ARCH_HAS_PREFETCH
 #define ARCH_HAS_PREFETCHW
-#define ARCH_HAS_SPINLOCK_PREFETCH
 #define PREFETCH_STRIDE			L1_CACHE_BYTES
 
 static inline void
@@ -652,8 +651,6 @@ prefetchw (const void *x)
 {
 	ia64_lfetch_excl(ia64_lfhint_none, x);
 }
-
-#define spin_lock_prefetch(x)	prefetchw(x)
 
 extern unsigned long boot_option_idle_override;
 
