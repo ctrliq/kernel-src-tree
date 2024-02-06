@@ -416,16 +416,6 @@ static inline void apic_native_eoi(void) { WARN_ON_ONCE(1); }
 
 extern void apic_ack_irq(struct irq_data *data);
 
-static inline void ack_APIC_irq(void)
-{
-	/*
-	 * ack_APIC_irq() actually gets compiled as a single instruction
-	 * ... yummie.
-	 */
-	apic_eoi();
-}
-
-
 static inline bool lapic_vector_set_in_irr(unsigned int vector)
 {
 	u32 irr = apic_read(APIC_IRR + (vector / 32 * 0x10));
