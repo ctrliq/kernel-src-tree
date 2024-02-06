@@ -100,6 +100,11 @@ static inline u32 native_apic_mem_read(u32 reg)
 	return *((volatile u32 *)(APIC_BASE + reg));
 }
 
+static inline void native_apic_mem_eoi(void)
+{
+	native_apic_mem_write(APIC_EOI, APIC_EOI_ACK);
+}
+
 extern void native_apic_icr_write(u32 low, u32 id);
 extern u64 native_apic_icr_read(void);
 
@@ -191,7 +196,7 @@ static inline void native_apic_msr_write(u32 reg, u32 v)
 	wrmsr(APIC_BASE_MSR + (reg >> 4), v, 0);
 }
 
-static inline void native_apic_msr_eoi_write(u32 reg, u32 v)
+static inline void native_apic_msr_eoi(void)
 {
 	__wrmsr(APIC_BASE_MSR + (APIC_EOI >> 4), APIC_EOI_ACK, 0);
 }
@@ -255,8 +260,8 @@ struct apic_extended_rh {
  */
 struct apic {
 	/* Hotpath functions first */
-	void	(*eoi_write)(u32 reg, u32 v);
-	void	(*native_eoi_write)(u32 reg, u32 v);
+	void	(*eoi)(void);
+	void	(*native_eoi)(void);
 	void	(*write)(u32 reg, u32 v);
 	u32	(*read)(u32 reg);
 
@@ -357,7 +362,7 @@ static inline void apic_write(u32 reg, u32 val)
 
 static inline void apic_eoi(void)
 {
-	apic->eoi_write(APIC_EOI, APIC_EOI_ACK);
+	apic->eoi();
 }
 
 static inline u64 apic_icr_read(void)
@@ -386,7 +391,7 @@ static inline bool apic_id_valid(u32 apic_id)
 	return apic_id <= apic->max_apic_id;
 }
 
-extern void __init apic_set_eoi_write(void (*eoi_write)(u32 reg, u32 v));
+extern void __init apic_set_eoi_cb(void (*eoi)(void));
 
 #else /* CONFIG_X86_LOCAL_APIC */
 
@@ -397,7 +402,7 @@ static inline u64 apic_icr_read(void) { return 0; }
 static inline void apic_icr_write(u32 low, u32 high) { }
 static inline void apic_wait_icr_idle(void) { }
 static inline u32 safe_apic_wait_icr_idle(void) { return 0; }
-static inline void apic_set_eoi_write(void (*eoi_write)(u32 reg, u32 v)) {}
+static inline void apic_set_eoi_cb(void (*eoi)(void)) {}
 
 #endif /* CONFIG_X86_LOCAL_APIC */
 
