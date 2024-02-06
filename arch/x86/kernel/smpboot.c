@@ -1578,9 +1578,7 @@ void play_dead_common(void)
 	idle_task_exit();
 
 	cpuhp_ap_report_dead();
-	/*
-	 * With physical CPU hotplug, we should halt the cpu
-	 */
+
 	local_irq_disable();
 }
 
