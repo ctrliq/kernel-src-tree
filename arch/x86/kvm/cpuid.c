@@ -759,6 +759,7 @@ void kvm_set_cpu_caps(void)
 		F(WRMSR_XX_BASE_NS)
 	);
 
+	kvm_cpu_cap_check_and_set(X86_FEATURE_SBPB);
 	kvm_cpu_cap_check_and_set(X86_FEATURE_IBPB_BRTYPE);
 	kvm_cpu_cap_check_and_set(X86_FEATURE_SRSO_NO);
 
