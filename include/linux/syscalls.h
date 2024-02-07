@@ -376,9 +376,6 @@ asmlinkage long sys_fremovexattr(int fd, const char __user *name);
 /* fs/dcache.c */
 asmlinkage long sys_getcwd(char __user *buf, unsigned long size);
 
-/* fs/cookies.c */
-asmlinkage long sys_lookup_dcookie(u64 cookie64, char __user *buf, size_t len);
-
 /* fs/eventfd.c */
 asmlinkage long sys_eventfd2(unsigned int count, int flags);
 

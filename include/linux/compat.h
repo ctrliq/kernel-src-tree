@@ -584,9 +584,6 @@ asmlinkage long compat_sys_io_pgetevents_time64(compat_aio_context_t ctx_id,
 					struct __kernel_timespec __user *timeout,
 					const struct __compat_aio_sigset __user *usig);
 
-/* fs/cookies.c */
-asmlinkage long compat_sys_lookup_dcookie(u32, u32, char __user *, compat_size_t);
-
 /* fs/eventpoll.c */
 asmlinkage long compat_sys_epoll_pwait(int epfd,
 			struct epoll_event __user *events,
