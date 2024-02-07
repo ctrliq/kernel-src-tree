@@ -5896,7 +5896,7 @@ static bool stripe_ahead_of_reshape(struct mddev *mddev, struct r5conf *conf,
 			continue;
 
 		min_sector = min(min_sector, sh->dev[dd_idx].sector);
-		max_sector = max(max_sector, sh->dev[dd_idx].sector);
+		max_sector = min(max_sector, sh->dev[dd_idx].sector);
 	}
 
 	spin_lock_irq(&conf->device_lock);
