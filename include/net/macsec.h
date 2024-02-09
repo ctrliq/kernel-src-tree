@@ -8,6 +8,7 @@
 #define _NET_MACSEC_H_
 
 #include <linux/u64_stats_sync.h>
+#include <linux/if_vlan.h>
 #include <uapi/linux/if_link.h>
 #include <uapi/linux/if_macsec.h>
 
@@ -322,5 +323,14 @@ static inline bool macsec_send_sci(const struct macsec_secy *secy)
 }
 struct net_device *macsec_get_real_dev(const struct net_device *dev);
 bool macsec_netdev_is_offloaded(struct net_device *dev);
+
+static inline void *macsec_netdev_priv(const struct net_device *dev)
+{
+#if IS_ENABLED(CONFIG_VLAN_8021Q)
+	if (is_vlan_dev(dev))
+		return netdev_priv(vlan_dev_priv(dev)->real_dev);
+#endif
+	return netdev_priv(dev);
+}
 
 #endif /* _NET_MACSEC_H_ */
