@@ -681,6 +681,7 @@ sources-rh: $(TARBALL) generate-testpatch-tmp setup-source dist-configs-check
 		scripts/gating/rpminspect.yaml > $(SOURCES)/rpminspect.yaml
 	@cp scripts/kernel-tools/kvm_stat.logrotate \
 		keys/rhel*.x509 \
+		keys/nvidia*.x509 \
 		kabi/check-kabi \
 		configs/$(SPECPACKAGE_NAME)-*.config \
 		configs/partial*.config \
