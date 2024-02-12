@@ -28,7 +28,6 @@
 #include <linux/platform_device.h>
 
 #include "arm-smmu-v3.h"
-#include "../../iommu-sva.h"
 #include "../../dma-iommu.h"
 
 static bool disable_bypass = true;
