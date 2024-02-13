@@ -2,3 +2,4 @@
 obj-y					+= actions/
 obj-y					+= amlogic/
 obj-y					+= bcm/
+obj-y					+= mediatek/
