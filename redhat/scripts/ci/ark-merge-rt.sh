@@ -103,18 +103,6 @@ else
 	die "Neither version ($OS_BUILD_VER, $OS_BUILD_VER_prev) in upstream tree: $UPSTREAM_RT_TREE_NAME"
 fi
 
-# verify the core branches exist or use provided defaults
-UPSTREAM_RT_DEVEL_BRANCH="linux-${UPSTREAM_RT_DEVEL_VER}.y-rt"
-ark_git_branch "$DOWNSTREAM_RT_BRANCH" "$UPSTREAM_RT_TREE_NAME/$UPSTREAM_RT_DEVEL_BRANCH"
-ark_git_branch "$RT_AUTOMATED_BRANCH" "$UPSTREAM_RT_TREE_NAME/$UPSTREAM_RT_DEVEL_BRANCH"
-ark_git_branch "$RT_DEVEL_BRANCH" "$UPSTREAM_RT_TREE_NAME/$UPSTREAM_RT_DEVEL_BRANCH"
-ark_git_branch "$AUTOMOTIVE_DEVEL_BRANCH" "$UPSTREAM_RT_TREE_NAME/$UPSTREAM_RT_DEVEL_BRANCH"
-
-MASTER_RT_DEVEL_VER="$(get_upstream_version "$DOWNSTREAM_RT_BRANCH")"
-RT_AUTOMATED_VER="$(get_upstream_version $RT_AUTOMATED_BRANCH)"
-RT_DEVEL_VER="$(get_upstream_version $RT_DEVEL_BRANCH)"
-AUTOMOTIVE_DEVEL_VER="$(get_upstream_version $AUTOMOTIVE_DEVEL_BRANCH)"
-
 OS_BUILD_BASE_BRANCH="os-build"
 RT_REBASE=""
 
@@ -123,6 +111,18 @@ if test "$UPSTREAM_RT_DEVEL_VER" != "$OS_BUILD_VER"; then
 	# os-build stable tag
 	OS_BUILD_BASE_BRANCH="kernel-${MASTER_RT_DEVEL_VER}.0-0"
 fi
+
+# verify the core branches exist or use provided defaults
+UPSTREAM_RT_DEVEL_BRANCH="linux-${UPSTREAM_RT_DEVEL_VER}.y-rt"
+ark_git_branch "$DOWNSTREAM_RT_BRANCH" "$UPSTREAM_RT_TREE_NAME/$UPSTREAM_RT_DEVEL_BRANCH"
+ark_git_branch "$RT_AUTOMATED_BRANCH" "$OS_BUILD_BASE_BRANCH"
+ark_git_branch "$RT_DEVEL_BRANCH" "$OS_BUILD_BASE_BRANCH"
+ark_git_branch "$AUTOMOTIVE_DEVEL_BRANCH" "$OS_BUILD_BASE_BRANCH"
+
+MASTER_RT_DEVEL_VER="$(get_upstream_version "$DOWNSTREAM_RT_BRANCH")"
+RT_AUTOMATED_VER="$(get_upstream_version $RT_AUTOMATED_BRANCH)"
+RT_DEVEL_VER="$(get_upstream_version $RT_DEVEL_BRANCH)"
+AUTOMOTIVE_DEVEL_VER="$(get_upstream_version $AUTOMOTIVE_DEVEL_BRANCH)"
 
 # sanity check, sometimes broken scripts leave a mess
 if test "$MASTER_RT_DEVEL_VER" != "$UPSTREAM_RT_DEVEL_VER" -o \
