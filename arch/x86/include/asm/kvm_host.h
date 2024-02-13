@@ -1127,6 +1127,8 @@ struct kvm_hv {
 
 	struct hv_partition_assist_pg *hv_pa_pg;
 	struct kvm_hv_syndbg hv_syndbg;
+
+	bool xsaves_xsavec_checked;
 };
 
 struct msr_bitmap_range {
