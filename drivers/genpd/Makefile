@@ -9,3 +9,4 @@ obj-y					+= rockchip/
 obj-y					+= samsung/
 obj-y					+= tegra/
 obj-y					+= ti/
+obj-y					+= xilinx/
