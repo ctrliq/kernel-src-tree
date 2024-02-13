@@ -8,3 +8,4 @@ obj-y					+= renesas/
 obj-y					+= rockchip/
 obj-y					+= samsung/
 obj-y					+= tegra/
+obj-y					+= ti/
