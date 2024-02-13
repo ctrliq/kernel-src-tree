@@ -40,7 +40,7 @@ obj-$(CONFIG_DMADEVICES)	+= dma/
 
 # SOC specific infrastructure drivers.
 obj-y				+= soc/
-obj-$(CONFIG_PM_GENERIC_DOMAINS)	+= genpd/
+obj-$(CONFIG_PM_GENERIC_DOMAINS)	+= pmdomain/
 
 obj-y				+= virtio/
 obj-$(CONFIG_VDPA)		+= vdpa/
