@@ -348,7 +348,7 @@ struct vmtransfer_page_packet_header {
 	u8  sender_owns_set;
 	u8 reserved;
 	u32 range_cnt;
-	struct vmtransfer_page_range ranges[1];
+	struct vmtransfer_page_range ranges[];
 } __packed;
 
 struct vmgpadl_packet_header {
@@ -1238,9 +1238,6 @@ extern int vmbus_recvpacket_raw(struct vmbus_channel *channel,
 				     u32 bufferlen,
 				     u32 *buffer_actual_len,
 				     u64 *requestid);
-
-
-extern void vmbus_ontimer(unsigned long data);
 
 /* Base driver object */
 struct hv_driver {

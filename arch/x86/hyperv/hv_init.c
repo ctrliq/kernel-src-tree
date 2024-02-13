@@ -7,13 +7,17 @@
  * Author : K. Y. Srinivasan <kys@microsoft.com>
  */
 
+#define pr_fmt(fmt)  "Hyper-V: " fmt
+
 #include <linux/efi.h>
 #include <linux/types.h>
 #include <linux/bitfield.h>
 #include <linux/io.h>
 #include <asm/apic.h>
 #include <asm/desc.h>
+#include <asm/e820/api.h>
 #include <asm/sev.h>
+#include <asm/ibt.h>
 #include <asm/hypervisor.h>
 #include <asm/hyperv-tlfs.h>
 #include <asm/mshyperv.h>
@@ -190,7 +194,7 @@ void set_hv_tscchange_cb(void (*cb)(void))
 	struct hv_tsc_emulation_control emu_ctrl = {.enabled = 1};
 
 	if (!hv_reenlightenment_available()) {
-		pr_warn("Hyper-V: reenlightenment support is unavailable\n");
+		pr_warn("reenlightenment support is unavailable\n");
 		return;
 	}
 
@@ -283,15 +287,31 @@ static int hv_cpu_die(unsigned int cpu)
 
 static int __init hv_pci_init(void)
 {
-	int gen2vm = efi_enabled(EFI_BOOT);
+	bool gen2vm = efi_enabled(EFI_BOOT);
 
 	/*
-	 * For Generation-2 VM, we exit from pci_arch_init() by returning 0.
-	 * The purpose is to suppress the harmless warning:
+	 * A Generation-2 VM doesn't support legacy PCI/PCIe, so both
+	 * raw_pci_ops and raw_pci_ext_ops are NULL, and pci_subsys_init() ->
+	 * pcibios_init() doesn't call pcibios_resource_survey() ->
+	 * e820__reserve_resources_late(); as a result, any emulated persistent
+	 * memory of E820_TYPE_PRAM (12) via the kernel parameter
+	 * memmap=nn[KMG]!ss is not added into iomem_resource and hence can't be
+	 * detected by register_e820_pmem(). Fix this by directly calling
+	 * e820__reserve_resources_late() here: e820__reserve_resources_late()
+	 * depends on e820__reserve_resources(), which has been called earlier
+	 * from setup_arch(). Note: e820__reserve_resources_late() also adds
+	 * any memory of E820_TYPE_PMEM (7) into iomem_resource, and
+	 * acpi_nfit_register_region() -> acpi_nfit_insert_resource() ->
+	 * region_intersects() returns REGION_INTERSECTS, so the memory of
+	 * E820_TYPE_PMEM won't get added twice.
+	 *
+	 * We return 0 here so that pci_arch_init() won't print the warning:
 	 * "PCI: Fatal: No config space access function found"
 	 */
-	if (gen2vm)
+	if (gen2vm) {
+		e820__reserve_resources_late();
 		return 0;
+	}
 
 	/* For Generation-1 VM, we'll proceed in pci_arch_init().  */
 	return 1;
@@ -393,6 +413,7 @@ static void __init hv_get_partition_id(void)
 	local_irq_restore(flags);
 }
 
+#if IS_ENABLED(CONFIG_HYPERV_VTL_MODE)
 static u8 __init get_vtl(void)
 {
 	u64 control = HV_HYPERCALL_REP_COMP_1 | HVCALL_GET_VP_REGISTERS;
@@ -415,13 +436,16 @@ static u8 __init get_vtl(void)
 	if (hv_result_success(ret)) {
 		ret = output->as64.low & HV_X64_VTL_MASK;
 	} else {
-		pr_err("Failed to get VTL(%lld) and set VTL to zero by default.\n", ret);
-		ret = 0;
+		pr_err("Failed to get VTL(error: %lld) exiting...\n", ret);
+		BUG();
 	}
 
 	local_irq_restore(flags);
 	return ret;
 }
+#else
+static inline u8 get_vtl(void) { return 0; }
+#endif
 
 static int hv_write_efer(unsigned int cpu)
 {
@@ -588,6 +612,26 @@ void __init hyperv_init(void)
 
 skip_hypercall_pg_init:
 	/*
+	 * Some versions of Hyper-V that provide IBT in guest VMs have a bug
+	 * in that there's no ENDBR64 instruction at the entry to the
+	 * hypercall page. Because hypercalls are invoked via an indirect call
+	 * to the hypercall page, all hypercall attempts fail when IBT is
+	 * enabled, and Linux panics. For such buggy versions, disable IBT.
+	 *
+	 * Fixed versions of Hyper-V always provide ENDBR64 on the hypercall
+	 * page, so if future Linux kernel versions enable IBT for 32-bit
+	 * builds, additional hypercall page hackery will be required here
+	 * to provide an ENDBR32.
+	 */
+#ifdef CONFIG_X86_KERNEL_IBT
+	if (cpu_feature_enabled(X86_FEATURE_IBT) &&
+	    *(u32 *)hv_hypercall_pg != gen_endbr()) {
+		setup_clear_cpu_cap(X86_FEATURE_IBT);
+		pr_warn("Disabling IBT because of Hyper-V bug\n");
+	}
+#endif
+
+	/*
 	 * hyperv_init() is called before LAPIC is initialized: see
 	 * apic_intr_mode_init() -> x86_platform.apic_post_init() and
 	 * apic_bsp_setup() -> setup_local_APIC(). The direct-mode STIMER
@@ -623,8 +667,10 @@ skip_hypercall_pg_init:
 	hv_query_ext_cap(0);
 
 	/* Find the VTL */
-	if (!ms_hyperv.paravisor_present && hv_isolation_type_snp())
-		ms_hyperv.vtl = get_vtl();
+	ms_hyperv.vtl = get_vtl();
+
+	if (ms_hyperv.vtl > 0) /* non default VTL */
+		hv_vtl_early_init();
 
 	return;
 
