@@ -106,7 +106,7 @@ out_put_node:
 #endif
 }
 
-static int mt76_get_of_epprom_from_nvmem(struct mt76_dev *dev, void *eep, int len)
+static int mt76_get_of_eeprom_from_nvmem(struct mt76_dev *dev, void *eep, int len)
 {
 	struct device_node *np = dev->dev->of_node;
 	struct nvmem_cell *cell;
@@ -153,7 +153,7 @@ int mt76_get_of_eeprom(struct mt76_dev *dev, void *eep, int offset, int len)
 	if (!ret)
 		return 0;
 
-	return mt76_get_of_epprom_from_nvmem(dev, eep, len);
+	return mt76_get_of_eeprom_from_nvmem(dev, eep, len);
 }
 EXPORT_SYMBOL_GPL(mt76_get_of_eeprom);
 
@@ -188,7 +188,7 @@ static bool mt76_string_prop_find(struct property *prop, const char *str)
 	return false;
 }
 
-static struct device_node *
+struct device_node *
 mt76_find_power_limits_node(struct mt76_dev *dev)
 {
 	struct device_node *np = dev->dev->of_node;
@@ -227,6 +227,7 @@ mt76_find_power_limits_node(struct mt76_dev *dev)
 	of_node_put(np);
 	return fallback;
 }
+EXPORT_SYMBOL_GPL(mt76_find_power_limits_node);
 
 static const __be32 *
 mt76_get_of_array(struct device_node *np, char *name, size_t *len, int min)
@@ -241,7 +242,7 @@ mt76_get_of_array(struct device_node *np, char *name, size_t *len, int min)
 	return prop->value;
 }
 
-static struct device_node *
+struct device_node *
 mt76_find_channel_node(struct device_node *np, struct ieee80211_channel *chan)
 {
 	struct device_node *cur;
@@ -265,6 +266,8 @@ mt76_find_channel_node(struct device_node *np, struct ieee80211_channel *chan)
 
 	return NULL;
 }
+EXPORT_SYMBOL_GPL(mt76_find_channel_node);
+
 
 static s8
 mt76_get_txs_delta(struct device_node *np, u8 nss)
