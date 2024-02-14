@@ -327,6 +327,9 @@ struct io_ring_ctx {
 
 	struct list_head	io_buffers_cache;
 
+	/* deferred free list, protected by ->uring_lock */
+	struct hlist_head	io_buf_list;
+
 	/* Keep this last, we don't need it for the fast path */
 	struct wait_queue_head		poll_wq;
 	struct io_restriction		restrictions;
@@ -341,8 +344,6 @@ struct io_ring_ctx {
 	struct io_alloc_cache		rsrc_node_cache;
 	struct wait_queue_head		rsrc_quiesce_wq;
 	unsigned			rsrc_quiesce;
-
-	struct list_head		io_buffers_pages;
 
 	#if defined(CONFIG_UNIX)
 		struct socket		*ring_sock;
