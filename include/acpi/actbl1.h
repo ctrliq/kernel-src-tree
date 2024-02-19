@@ -525,8 +525,6 @@ struct acpi_cedt_cxims {
 
 struct acpi_cedt_rdpas {
 	struct acpi_cedt_header header;
-	u8 reserved1;
-	u16 length;
 	u16 segment;
 	u16 bdf;
 	u8 protocol;
