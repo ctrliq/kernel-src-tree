@@ -667,8 +667,7 @@ static void byt_set_group_simple_mux(struct intel_pinctrl *vg,
 
 		padcfg0 = byt_gpio_reg(vg, group.grp.pins[i], BYT_CONF0_REG);
 		if (!padcfg0) {
-			dev_warn(vg->dev,
-				 "Group %s, pin %i not muxed (no padcfg0)\n",
+			dev_warn(vg->dev, "Group %s, pin %i not muxed (can't retrieve CONF0)\n",
 				 group.grp.name, i);
 			continue;
 		}
@@ -697,8 +696,7 @@ static void byt_set_group_mixed_mux(struct intel_pinctrl *vg,
 
 		padcfg0 = byt_gpio_reg(vg, group.grp.pins[i], BYT_CONF0_REG);
 		if (!padcfg0) {
-			dev_warn(vg->dev,
-				 "Group %s, pin %i not muxed (no padcfg0)\n",
+			dev_warn(vg->dev, "Group %s, pin %i not muxed (can't retrieve CONF0)\n",
 				 group.grp.name, i);
 			continue;
 		}
@@ -790,7 +788,7 @@ static int byt_gpio_request_enable(struct pinctrl_dev *pctl_dev,
 		value |= gpio_mux;
 		writel(value, reg);
 
-		dev_warn(vg->dev, FW_BUG "pin %u forcibly re-configured as GPIO\n", offset);
+		dev_warn(vg->dev, FW_BUG "Pin %i: forcibly re-configured as GPIO\n", offset);
 	}
 
 	raw_spin_unlock_irqrestore(&byt_lock, flags);
@@ -822,7 +820,9 @@ static void byt_gpio_direct_irq_check(struct intel_pinctrl *vg,
 	 * themselves in the foot.
 	 */
 	if (readl(conf_reg) & BYT_DIRECT_IRQ_EN)
-		dev_info_once(vg->dev, "Potential Error: Setting GPIO with direct_irq_en to output");
+		dev_info_once(vg->dev,
+			      "Potential Error: Pin %i: forcibly set GPIO with DIRECT_IRQ_EN to output\n",
+			      offset);
 }
 
 static int byt_gpio_set_direction(struct pinctrl_dev *pctl_dev,
@@ -1025,9 +1025,7 @@ static int byt_pin_config_set(struct pinctrl_dev *pctl_dev,
 			if (val & BYT_INPUT_EN) {
 				val &= ~BYT_INPUT_EN;
 				writel(val, val_reg);
-				dev_warn(vg->dev,
-					 "pin %u forcibly set to input mode\n",
-					 offset);
+				dev_warn(vg->dev, "Pin %i: forcibly set to input mode\n", offset);
 			}
 
 			conf &= ~BYT_PULL_ASSIGN_MASK;
@@ -1047,9 +1045,7 @@ static int byt_pin_config_set(struct pinctrl_dev *pctl_dev,
 			if (val & BYT_INPUT_EN) {
 				val &= ~BYT_INPUT_EN;
 				writel(val, val_reg);
-				dev_warn(vg->dev,
-					 "pin %u forcibly set to input mode\n",
-					 offset);
+				dev_warn(vg->dev, "Pin %i: forcibly set to input mode\n", offset);
 			}
 
 			conf &= ~BYT_PULL_ASSIGN_MASK;
@@ -1255,9 +1251,7 @@ static void byt_gpio_dbg_show(struct seq_file *s, struct gpio_chip *chip)
 		pin = vg->soc->pins[i].number;
 		reg = byt_gpio_reg(vg, pin, BYT_CONF0_REG);
 		if (!reg) {
-			seq_printf(s,
-				   "Could not retrieve pin %i conf0 reg\n",
-				   pin);
+			seq_printf(s, "Pin %i: can't retrieve CONF0\n", pin);
 			raw_spin_unlock_irqrestore(&byt_lock, flags);
 			continue;
 		}
@@ -1265,8 +1259,7 @@ static void byt_gpio_dbg_show(struct seq_file *s, struct gpio_chip *chip)
 
 		reg = byt_gpio_reg(vg, pin, BYT_VAL_REG);
 		if (!reg) {
-			seq_printf(s,
-				   "Could not retrieve pin %i val reg\n", pin);
+			seq_printf(s, "Pin %i: can't retrieve VAL\n", pin);
 			raw_spin_unlock_irqrestore(&byt_lock, flags);
 			continue;
 		}
@@ -1275,8 +1268,7 @@ static void byt_gpio_dbg_show(struct seq_file *s, struct gpio_chip *chip)
 
 		comm = byt_get_community(vg, pin);
 		if (!comm) {
-			seq_printf(s,
-				   "Could not get community for pin %i\n", pin);
+			seq_printf(s, "Pin %i: can't retrieve community\n", pin);
 			continue;
 		}
 		label = gpiochip_is_requested(chip, i);
@@ -1428,7 +1420,7 @@ static int byt_irq_type(struct irq_data *d, unsigned int type)
 	value = readl(reg);
 
 	WARN(value & BYT_DIRECT_IRQ_EN,
-	     "Bad pad config for io mode, force direct_irq_en bit clearing");
+	     "Bad pad config for IO mode, force DIRECT_IRQ_EN bit clearing");
 
 	/* For level trigges the BYT_TRIG_POS and BYT_TRIG_NEG bits
 	 * are used to indicate high and low level triggering
@@ -1476,9 +1468,7 @@ static void byt_gpio_irq_handler(struct irq_desc *desc)
 		reg = byt_gpio_reg(vg, base, BYT_INT_STAT_REG);
 
 		if (!reg) {
-			dev_warn(vg->dev,
-				 "Pin %i: could not retrieve interrupt status register\n",
-				 base);
+			dev_warn(vg->dev, "Pin %i: can't retrieve INT_STAT%u\n", base / 32, base);
 			continue;
 		}
 
@@ -1503,7 +1493,7 @@ static bool byt_direct_irq_sanity_check(struct intel_pinctrl *vg, int pin, u32 c
 		      sizeof(direct_irq_mux));
 	match = memchr(direct_irq_mux, pin, sizeof(direct_irq_mux));
 	if (!match) {
-		dev_warn(vg->dev, FW_BUG "pin %i: direct_irq_en set but no IRQ assigned, clearing\n", pin);
+		dev_warn(vg->dev, FW_BUG "Pin %i: DIRECT_IRQ_EN set but no IRQ assigned, clearing\n", pin);
 		return false;
 	}
 
@@ -1530,7 +1520,8 @@ static bool byt_direct_irq_sanity_check(struct intel_pinctrl *vg, int pin, u32 c
 	trig = conf0 & BYT_TRIG_MASK;
 	if (trig != (BYT_TRIG_POS | BYT_TRIG_LVL) &&
 	    trig != (BYT_TRIG_NEG | BYT_TRIG_LVL)) {
-		dev_warn(vg->dev, FW_BUG "pin %i: direct_irq_en set without trigger (conf0: %xh), clearing\n",
+		dev_warn(vg->dev,
+			 FW_BUG "Pin %i: DIRECT_IRQ_EN set without trigger (CONF0: %#08x), clearing\n",
 			 pin, conf0);
 		return false;
 	}
@@ -1557,9 +1548,7 @@ static void byt_init_irq_valid_mask(struct gpio_chip *chip,
 
 		reg = byt_gpio_reg(vg, pin, BYT_CONF0_REG);
 		if (!reg) {
-			dev_warn(vg->dev,
-				 "Pin %i: could not retrieve conf0 register\n",
-				 i);
+			dev_warn(vg->dev, "Pin %i: could not retrieve CONF0\n", i);
 			continue;
 		}
 
@@ -1590,9 +1579,7 @@ static int byt_gpio_irq_init_hw(struct gpio_chip *chip)
 		reg = byt_gpio_reg(vg, base, BYT_INT_STAT_REG);
 
 		if (!reg) {
-			dev_warn(vg->dev,
-				 "Pin %i: could not retrieve irq status reg\n",
-				 base);
+			dev_warn(vg->dev, "Pin %i: can't retrieve INT_STAT%u\n", base / 32, base);
 			continue;
 		}
 
@@ -1602,7 +1589,7 @@ static int byt_gpio_irq_init_hw(struct gpio_chip *chip)
 		value = readl(reg);
 		if (value)
 			dev_err(vg->dev,
-				"GPIO interrupt error, pins misconfigured. INT_STAT%u: 0x%08x\n",
+				"GPIO interrupt error, pins misconfigured. INT_STAT%u: %#08x\n",
 				base / 32, value);
 	}
 
@@ -1766,9 +1753,7 @@ static int byt_gpio_suspend(struct device *dev)
 
 		reg = byt_gpio_reg(vg, pin, BYT_CONF0_REG);
 		if (!reg) {
-			dev_warn(vg->dev,
-				 "Pin %i: could not retrieve conf0 register\n",
-				 i);
+			dev_warn(vg->dev, "Pin %i: can't retrieve CONF0\n", i);
 			continue;
 		}
 		value = readl(reg) & BYT_CONF0_RESTORE_MASK;
@@ -1798,9 +1783,7 @@ static int byt_gpio_resume(struct device *dev)
 
 		reg = byt_gpio_reg(vg, pin, BYT_CONF0_REG);
 		if (!reg) {
-			dev_warn(vg->dev,
-				 "Pin %i: could not retrieve conf0 register\n",
-				 i);
+			dev_warn(vg->dev, "Pin %i: can't retrieve CONF0\n", i);
 			continue;
 		}
 		value = readl(reg);
@@ -1809,7 +1792,7 @@ static int byt_gpio_resume(struct device *dev)
 			value &= ~BYT_CONF0_RESTORE_MASK;
 			value |= vg->context.pads[i].conf0;
 			writel(value, reg);
-			dev_info(dev, "restored pin %d conf0 %#08x", i, value);
+			dev_info(dev, "restored pin %d CONF0 %#08x", i, value);
 		}
 
 		reg = byt_gpio_reg(vg, pin, BYT_VAL_REG);
@@ -1822,8 +1805,7 @@ static int byt_gpio_resume(struct device *dev)
 			v |= vg->context.pads[i].val;
 			if (v != value) {
 				writel(v, reg);
-				dev_dbg(dev, "restored pin %d val %#08x\n",
-					i, v);
+				dev_dbg(dev, "restored pin %d VAL %#08x\n", i, v);
 			}
 		}
 	}
