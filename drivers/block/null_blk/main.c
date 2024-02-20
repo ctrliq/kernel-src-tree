@@ -1710,7 +1710,7 @@ static void null_del_dev(struct nullb *nullb)
 	dev->nullb = NULL;
 }
 
-static void null_config_discard(struct nullb *nullb)
+static void null_config_discard(struct nullb *nullb, struct queue_limits *lim)
 {
 	if (nullb->dev->discard == false)
 		return;
@@ -1727,7 +1727,7 @@ static void null_config_discard(struct nullb *nullb)
 		return;
 	}
 
-	blk_queue_max_discard_sectors(nullb->q, UINT_MAX >> 9);
+	lim->max_hw_discard_sectors = UINT_MAX >> 9;
 }
 
 static const struct block_device_operations null_ops = {
@@ -1886,6 +1886,12 @@ static bool null_setup_fault(void)
 
 static int null_add_dev(struct nullb_device *dev)
 {
+	struct queue_limits lim = {
+		.logical_block_size	= dev->blocksize,
+		.physical_block_size	= dev->blocksize,
+		.max_hw_sectors		= dev->max_sectors,
+	};
+
 	struct nullb *nullb;
 	int rv;
 
@@ -1911,10 +1917,19 @@ static int null_add_dev(struct nullb_device *dev)
 	if (rv)
 		goto out_cleanup_queues;
 
-	nullb->disk = blk_mq_alloc_disk(nullb->tag_set, NULL, nullb);
+	if (dev->virt_boundary)
+		lim.virt_boundary_mask = PAGE_SIZE - 1;
+	null_config_discard(nullb, &lim);
+	if (dev->zoned) {
+		rv = null_init_zoned_dev(dev, &lim);
+		if (rv)
+			goto out_cleanup_tags;
+	}
+
+	nullb->disk = blk_mq_alloc_disk(nullb->tag_set, &lim, nullb);
 	if (IS_ERR(nullb->disk)) {
 		rv = PTR_ERR(nullb->disk);
-		goto out_cleanup_tags;
+		goto out_cleanup_zone;
 	}
 	nullb->q = nullb->disk->queue;
 
@@ -1928,30 +1943,14 @@ static int null_add_dev(struct nullb_device *dev)
 		blk_queue_write_cache(nullb->q, true, true);
 	}
 
-	if (dev->zoned) {
-		rv = null_init_zoned_dev(dev, nullb->q);
-		if (rv)
-			goto out_cleanup_disk;
-	}
-
 	nullb->q->queuedata = nullb;
 	blk_queue_flag_set(QUEUE_FLAG_NONROT, nullb->q);
 
 	rv = ida_alloc(&nullb_indexes, GFP_KERNEL);
 	if (rv < 0)
-		goto out_cleanup_zone;
+		goto out_cleanup_disk;
 	nullb->index = rv;
 	dev->index = rv;
-
-	blk_queue_logical_block_size(nullb->q, dev->blocksize);
-	blk_queue_physical_block_size(nullb->q, dev->blocksize);
-	if (dev->max_sectors)
-		blk_queue_max_hw_sectors(nullb->q, dev->max_sectors);
-
-	if (dev->virt_boundary)
-		blk_queue_virt_boundary(nullb->q, PAGE_SIZE - 1);
-
-	null_config_discard(nullb);
 
 	if (config_item_name(&dev->group.cg_item)) {
 		/* Use configfs dir name as the device name */
