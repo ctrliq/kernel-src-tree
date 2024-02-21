@@ -1177,12 +1177,6 @@ err:
 	return ret;
 }
 
-#define EXPORT_NS_GPL_DEV_PM_OPS(name, ns)	\
-	const struct dev_pm_ops name;		\
-	EXPORT_SYMBOL_NS_GPL(name, ns);		\
-	const struct dev_pm_ops name
-
-
 EXPORT_NS_GPL_DEV_PM_OPS(cs42l43_pm_ops, MFD_CS42L43) = {
 	SYSTEM_SLEEP_PM_OPS(cs42l43_suspend, cs42l43_resume)
 	RUNTIME_PM_OPS(cs42l43_runtime_suspend, cs42l43_runtime_resume, NULL)
