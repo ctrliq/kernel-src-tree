@@ -807,6 +807,20 @@ static int mxser_activate(struct tty_port *port, struct tty_struct *tty)
 }
 
 /*
+ * To stop accepting input, we disable the receive line status interrupts, and
+ * tell the interrupt driver to stop checking the data ready bit in the line
+ * status register.
+ */
+static void mxser_stop_rx(struct mxser_port *info)
+{
+	info->IER &= ~UART_IER_RLSI;
+	if (info->board->must_hwid)
+		info->IER &= ~MOXA_MUST_RECV_ISR;
+
+	outb(info->IER, info->ioaddr + UART_IER);
+}
+
+/*
  * This routine will shutdown a serial port
  */
 static void mxser_shutdown_port(struct tty_port *port)
@@ -815,6 +829,8 @@ static void mxser_shutdown_port(struct tty_port *port)
 	unsigned long flags;
 
 	spin_lock_irqsave(&info->slock, flags);
+
+	mxser_stop_rx(info);
 
 	/*
 	 * clear delta_msr_wait queue to avoid mem leaks: we may free the irq
@@ -880,20 +896,6 @@ static void mxser_flush_buffer(struct tty_struct *tty)
 }
 
 /*
- * To stop accepting input, we disable the receive line status interrupts, and
- * tell the interrupt driver to stop checking the data ready bit in the line
- * status register.
- */
-static void mxser_stop_rx(struct mxser_port *info)
-{
-	info->IER &= ~UART_IER_RLSI;
-	if (info->board->must_hwid)
-		info->IER &= ~MOXA_MUST_RECV_ISR;
-
-	outb(info->IER, info->ioaddr + UART_IER);
-}
-
-/*
  * This routine is called when the serial port gets closed.  First, we
  * wait for the last remaining data to be sent.  Then, we unlink its
  * async structure from the interrupt chain if necessary, and we free
@@ -907,7 +909,6 @@ static void mxser_close(struct tty_struct *tty, struct file *filp)
 	if (tty_port_close_start(port, tty, filp) == 0)
 		return;
 	mutex_lock(&port->mutex);
-	mxser_stop_rx(info);
 	mxser_flush_buffer(tty);
 	if (tty_port_initialized(port) && C_HUPCL(tty))
 		tty_port_lower_dtr_rts(port);
