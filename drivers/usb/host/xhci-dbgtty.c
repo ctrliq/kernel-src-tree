@@ -563,7 +563,7 @@ int dbc_tty_init(void)
 	ret = tty_register_driver(dbc_tty_driver);
 	if (ret) {
 		pr_err("Can't register dbc tty driver\n");
-		put_tty_driver(dbc_tty_driver);
+		tty_driver_kref_put(dbc_tty_driver);
 		idr_destroy(&dbc_tty_minors);
 	}
 
@@ -574,7 +574,7 @@ void dbc_tty_exit(void)
 {
 	if (dbc_tty_driver) {
 		tty_unregister_driver(dbc_tty_driver);
-		put_tty_driver(dbc_tty_driver);
+		tty_driver_kref_put(dbc_tty_driver);
 		dbc_tty_driver = NULL;
 	}
 
