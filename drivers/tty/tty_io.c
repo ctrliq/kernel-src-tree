@@ -171,7 +171,6 @@ static void free_tty_struct(struct tty_struct *tty)
 	tty_ldisc_deinit(tty);
 	put_device(tty->dev);
 	kvfree(tty->write_buf);
-	tty->magic = 0xDEADDEAD;
 	kfree(tty);
 }
 
@@ -263,11 +262,6 @@ static int tty_paranoia_check(struct tty_struct *tty, struct inode *inode,
 #ifdef TTY_PARANOIA_CHECK
 	if (!tty) {
 		pr_warn("(%d:%d): %s: NULL tty\n",
-			imajor(inode), iminor(inode), routine);
-		return 1;
-	}
-	if (tty->magic != TTY_MAGIC) {
-		pr_warn("(%d:%d): %s: bad magic number\n",
 			imajor(inode), iminor(inode), routine);
 		return 1;
 	}
@@ -1542,7 +1536,6 @@ static void release_one_tty(struct work_struct *work)
 	if (tty->ops->cleanup)
 		tty->ops->cleanup(tty);
 
-	tty->magic = 0;
 	tty_driver_kref_put(driver);
 	module_put(owner);
 
@@ -3102,7 +3095,6 @@ struct tty_struct *alloc_tty_struct(struct tty_driver *driver, int idx)
 		return NULL;
 
 	kref_init(&tty->kref);
-	tty->magic = TTY_MAGIC;
 	if (tty_ldisc_init(tty)) {
 		kfree(tty);
 		return NULL;
