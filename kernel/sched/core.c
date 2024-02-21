@@ -8563,6 +8563,19 @@ SYSCALL_DEFINE3(sched_setaffinity, pid_t, pid, unsigned int, len,
 	retval = get_user_cpu_mask(user_mask_ptr, len, new_mask, &mask_empty);
 	if (retval == 0)
 		retval = sched_setaffinity(pid, mask_empty ? NULL : new_mask);
+	/*
+	 * RHEL Note:
+	 *
+	 * Setting mask_empty to true has the effect of resetting a previously
+	 * set CPU affinity and return a success in this case instead of
+	 * -EINVAL. This, however, can break existing test cases where a
+	 * sched_setaffinity() syscall with empty mask is expected to return
+	 * error. So restore the old behavior by always returning -EINVAL on
+	 * empty mask even if a previous sched_setaffinity() call is reset.
+	 * The only exception if the given len parameter is 0.
+	 */
+	if (len && mask_empty && !retval)
+		retval = -EINVAL;
 	free_cpumask_var(new_mask);
 	return retval;
 }
