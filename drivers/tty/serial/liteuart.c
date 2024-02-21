@@ -178,7 +178,7 @@ static void liteuart_shutdown(struct uart_port *port)
 }
 
 static void liteuart_set_termios(struct uart_port *port, struct ktermios *new,
-				 const struct ktermios *old)
+				 struct ktermios *old)
 {
 	unsigned int baud;
 	unsigned long flags;

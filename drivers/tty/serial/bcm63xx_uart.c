@@ -492,8 +492,9 @@ static void bcm_uart_shutdown(struct uart_port *port)
 /*
  * serial core request to change current uart setting
  */
-static void bcm_uart_set_termios(struct uart_port *port, struct ktermios *new,
-				 const struct ktermios *old)
+static void bcm_uart_set_termios(struct uart_port *port,
+				 struct ktermios *new,
+				 struct ktermios *old)
 {
 	unsigned int ctl, baud, quot, ier;
 	unsigned long flags;

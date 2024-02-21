@@ -351,7 +351,7 @@ static void arc_serial_shutdown(struct uart_port *port)
 
 static void
 arc_serial_set_termios(struct uart_port *port, struct ktermios *new,
-		       const struct ktermios *old)
+		       struct ktermios *old)
 {
 	struct arc_uart_port *uart = to_arc_port(port);
 	unsigned int baud, uartl, uarth, hw_val;

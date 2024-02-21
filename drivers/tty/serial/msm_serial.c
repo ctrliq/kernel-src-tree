@@ -1257,7 +1257,7 @@ static void msm_shutdown(struct uart_port *port)
 }
 
 static void msm_set_termios(struct uart_port *port, struct ktermios *termios,
-			    const struct ktermios *old)
+			    struct ktermios *old)
 {
 	struct msm_port *msm_port = UART_TO_MSM(port);
 	struct msm_dma *dma = &msm_port->rx_dma;

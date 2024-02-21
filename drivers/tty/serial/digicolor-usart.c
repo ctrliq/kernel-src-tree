@@ -287,7 +287,7 @@ static void digicolor_uart_shutdown(struct uart_port *port)
 
 static void digicolor_uart_set_termios(struct uart_port *port,
 				       struct ktermios *termios,
-				       const struct ktermios *old)
+				       struct ktermios *old)
 {
 	unsigned int baud, divisor;
 	u8 config = 0;

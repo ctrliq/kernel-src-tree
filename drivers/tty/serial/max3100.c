@@ -418,7 +418,7 @@ static void max3100_set_mctrl(struct uart_port *port, unsigned int mctrl)
 
 static void
 max3100_set_termios(struct uart_port *port, struct ktermios *termios,
-		    const struct ktermios *old)
+		    struct ktermios *old)
 {
 	struct max3100_port *s = container_of(port,
 					      struct max3100_port,
