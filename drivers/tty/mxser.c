@@ -1401,6 +1401,18 @@ static void mxser_set_termios(struct tty_struct *tty, struct ktermios *old_termi
 	}
 }
 
+static bool mxser_tx_empty(struct mxser_port *info)
+{
+	unsigned long flags;
+	u8 lsr;
+
+	spin_lock_irqsave(&info->slock, flags);
+	lsr = inb(info->ioaddr + UART_LSR);
+	spin_unlock_irqrestore(&info->slock, flags);
+
+	return !(lsr & UART_LSR_TEMT);
+}
+
 /*
  * mxser_wait_until_sent() --- wait until the transmitter is empty
  */
@@ -1408,8 +1420,6 @@ static void mxser_wait_until_sent(struct tty_struct *tty, int timeout)
 {
 	struct mxser_port *info = tty->driver_data;
 	unsigned long orig_jiffies, char_time;
-	unsigned long flags;
-	int lsr;
 
 	if (info->type == PORT_UNKNOWN)
 		return;
@@ -1444,17 +1454,13 @@ static void mxser_wait_until_sent(struct tty_struct *tty, int timeout)
 	if (!timeout || timeout > 2 * info->timeout)
 		timeout = 2 * info->timeout;
 
-	spin_lock_irqsave(&info->slock, flags);
-	while (!((lsr = inb(info->ioaddr + UART_LSR)) & UART_LSR_TEMT)) {
-		spin_unlock_irqrestore(&info->slock, flags);
+	while (mxser_tx_empty(info)) {
 		schedule_timeout_interruptible(char_time);
-		spin_lock_irqsave(&info->slock, flags);
 		if (signal_pending(current))
 			break;
 		if (timeout && time_after(jiffies, orig_jiffies + timeout))
 			break;
 	}
-	spin_unlock_irqrestore(&info->slock, flags);
 	set_current_state(TASK_RUNNING);
 }
 
