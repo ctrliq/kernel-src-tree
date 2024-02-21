@@ -1381,7 +1381,7 @@ static int gsm_dlci_data_sweep(struct gsm_mux *gsm)
 		}
 		if (!sent)
 			break;
-	};
+	}
 
 	return ret;
 }
