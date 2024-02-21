@@ -2225,6 +2225,7 @@ int uart_suspend_port(struct uart_driver *drv, struct uart_port *uport)
 	if (tty_port_initialized(port)) {
 		const struct uart_ops *ops = uport->ops;
 		int tries;
+		unsigned int mctrl;
 
 		tty_port_set_suspended(port, 1);
 		tty_port_set_initialized(port, 0);
@@ -2232,6 +2233,9 @@ int uart_suspend_port(struct uart_driver *drv, struct uart_port *uport)
 		spin_lock_irq(&uport->lock);
 		ops->stop_tx(uport);
 		ops->set_mctrl(uport, 0);
+		/* save mctrl so it can be restored on resume */
+		mctrl = uport->mctrl;
+		uport->mctrl = 0;
 		ops->stop_rx(uport);
 		spin_unlock_irq(&uport->lock);
 
@@ -2245,6 +2249,7 @@ int uart_suspend_port(struct uart_driver *drv, struct uart_port *uport)
 				uport->name);
 
 		ops->shutdown(uport);
+		uport->mctrl = mctrl;
 	}
 
 	/*
