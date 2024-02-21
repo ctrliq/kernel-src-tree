@@ -3034,9 +3034,6 @@ static int this_tty(const void *t, struct file *file, unsigned fd)
  */
 void __do_SAK(struct tty_struct *tty)
 {
-#ifdef TTY_SOFT_SAK
-	tty_hangup(tty);
-#else
 	struct task_struct *g, *p;
 	struct pid *session;
 	int		i;
@@ -3080,7 +3077,6 @@ void __do_SAK(struct tty_struct *tty)
 	} while_each_thread(g, p);
 	read_unlock(&tasklist_lock);
 	put_pid(session);
-#endif
 }
 
 static void do_SAK_work(struct work_struct *work)
