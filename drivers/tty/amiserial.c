@@ -105,8 +105,6 @@ static struct serial_state serial_state;
 
 #include <linux/uaccess.h>
 
-#define serial_isroot()	(capable(CAP_SYS_ADMIN))
-
 /* some serial hardware definitions */
 #define SDR_OVRUN   (1<<15)
 #define SDR_RBF     (1<<14)
@@ -481,11 +479,11 @@ static int startup(struct tty_struct *tty, struct serial_state *info)
 
 	retval = request_irq(IRQ_AMIGA_VERTB, ser_vbl_int, 0, "serial status", info);
 	if (retval) {
-	  if (serial_isroot()) {
-	      set_bit(TTY_IO_ERROR, &tty->flags);
-	    retval = 0;
-	  }
-	  goto errout;
+		if (capable(CAP_SYS_ADMIN)) {
+			set_bit(TTY_IO_ERROR, &tty->flags);
+			retval = 0;
+		}
+		goto errout;
 	}
 
 	/* enable both Rx and Tx interrupts */
@@ -949,7 +947,7 @@ static int set_serial_info(struct tty_struct *tty, struct serial_struct *ss)
 	if (closing_wait != ASYNC_CLOSING_WAIT_NONE)
 		closing_wait = msecs_to_jiffies(closing_wait * 10);
 
-	if (!serial_isroot()) {
+	if (!capable(CAP_SYS_ADMIN)) {
 		if ((ss->baud_base != state->baud_base) ||
 		    (close_delay != port->close_delay) ||
 		    (closing_wait != port->closing_wait) ||
