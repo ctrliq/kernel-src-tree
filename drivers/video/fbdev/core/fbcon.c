@@ -2229,7 +2229,7 @@ static int fbcon_debug_leave(struct vc_data *vc)
 	return 0;
 }
 
-static int fbcon_get_font(struct vc_data *vc, struct console_font *font)
+static int fbcon_get_font(struct vc_data *vc, struct console_font *font, unsigned int vpitch)
 {
 	u8 *fontdata = vc->vc_font.data;
 	u8 *data = font->data;
@@ -2248,8 +2248,8 @@ static int fbcon_get_font(struct vc_data *vc, struct console_font *font)
 
 		for (i = 0; i < font->charcount; i++) {
 			memcpy(data, fontdata, j);
-			memset(data + j, 0, 32 - j);
-			data += 32;
+			memset(data + j, 0, vpitch - j);
+			data += vpitch;
 			fontdata += j;
 		}
 	} else if (font->width <= 16) {
@@ -2259,8 +2259,8 @@ static int fbcon_get_font(struct vc_data *vc, struct console_font *font)
 
 		for (i = 0; i < font->charcount; i++) {
 			memcpy(data, fontdata, j);
-			memset(data + j, 0, 64 - j);
-			data += 64;
+			memset(data + j, 0, 2*vpitch - j);
+			data += 2*vpitch;
 			fontdata += j;
 		}
 	} else if (font->width <= 24) {
@@ -2274,8 +2274,8 @@ static int fbcon_get_font(struct vc_data *vc, struct console_font *font)
 				*data++ = fontdata[2];
 				fontdata += sizeof(u32);
 			}
-			memset(data, 0, 3 * (32 - j));
-			data += 3 * (32 - j);
+			memset(data, 0, 3 * (vpitch - j));
+			data += 3 * (vpitch - j);
 		}
 	} else {
 		j = vc->vc_font.height * 4;
@@ -2284,8 +2284,8 @@ static int fbcon_get_font(struct vc_data *vc, struct console_font *font)
 
 		for (i = 0; i < font->charcount; i++) {
 			memcpy(data, fontdata, j);
-			memset(data + j, 0, 128 - j);
-			data += 128;
+			memset(data + j, 0, 4 * vpitch - j);
+			data += 4 * vpitch;
 			fontdata += j;
 		}
 	}
@@ -2396,19 +2396,12 @@ static int fbcon_do_set_font(struct vc_data *vc, int w, int h, int charcount,
 }
 
 /*
- *  User asked to set font; we are guaranteed that
- *	a) width and height are in range 1..32
- *	b) charcount does not exceed 512
- *  but lets not assume that, since someone might someday want to use larger
- *  fonts. And charcount of 512 is small for unicode support.
- *
- *  However, user space gives the font in 32 rows , regardless of
- *  actual font height. So a new API is needed if support for larger fonts
- *  is ever implemented.
+ *  User asked to set font; we are guaranteed that charcount does not exceed 512
+ *  but lets not assume that, since charcount of 512 is small for unicode support.
  */
 
 static int fbcon_set_font(struct vc_data *vc, struct console_font *font,
-			  unsigned int flags)
+			  unsigned int vpitch, unsigned int flags)
 {
 	struct fb_info *info = fbcon_info_from_console(vc->vc_num);
 	unsigned charcount = font->charcount;
@@ -2454,7 +2447,7 @@ static int fbcon_set_font(struct vc_data *vc, struct console_font *font,
 	FNTSIZE(new_data) = size;
 	REFCOUNT(new_data) = 0;	/* usage counter */
 	for (i=0; i< charcount; i++) {
-		memcpy(new_data + i*h*pitch, data +  i*32*pitch, h*pitch);
+		memcpy(new_data + i*h*pitch, data +  i*vpitch*pitch, h*pitch);
 	}
 
 	/* Since linux has a nice crc32 function use it for counting font
