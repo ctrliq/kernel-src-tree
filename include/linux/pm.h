@@ -877,4 +877,9 @@ enum dpm_order {
 	DPM_ORDER_DEV_LAST,
 };
 
+#define EXPORT_NS_GPL_DEV_SLEEP_PM_OPS(name, ns)      \
+        const struct dev_pm_ops name;           \
+        EXPORT_SYMBOL_NS_GPL(name, ns);         \
+        const struct dev_pm_ops name
+
 #endif /* _LINUX_PM_H */
