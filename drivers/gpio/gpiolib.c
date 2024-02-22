@@ -244,6 +244,19 @@ struct gpio_device *gpiod_to_gpio_device(struct gpio_desc *desc)
 EXPORT_SYMBOL_GPL(gpiod_to_gpio_device);
 
 /**
+ * gpio_device_get_base() - Get the base GPIO number allocated by this device
+ * @gdev: GPIO device
+ *
+ * Returns:
+ * First GPIO number in the global GPIO numberspace for this device.
+ */
+int gpio_device_get_base(struct gpio_device *gdev)
+{
+	return gdev->base;
+}
+EXPORT_SYMBOL_GPL(gpio_device_get_base);
+
+/**
  * gpiod_get_direction - return the current direction of a GPIO
  * @desc:	GPIO to get the direction of
  *
