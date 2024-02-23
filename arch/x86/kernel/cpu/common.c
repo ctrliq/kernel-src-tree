@@ -2083,6 +2083,7 @@ void microcode_check(void)
 
 	/* Reload CPUID max function as it might've changed. */
 	info.cpuid_level = cpuid_eax(0);
+	amd_check_microcode();
 
 	/*
 	 * Copy all capability leafs to pick up the synthetic ones so that
