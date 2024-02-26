@@ -692,11 +692,9 @@ sources-rh: $(TARBALL) $(KABI_TARBALL) $(KABIDW_TARBALL) generate-testpatch-tmp 
 		configs/$(SPECPACKAGE_NAME)-*.config \
 		configs/partial*.config \
 		scripts/gating/gating.yaml \
+		scripts/filtermods.py \
 		scripts/mod/mod-denylist.sh \
-		scripts/mod/mod-internal.list \
-		scripts/mod/mod-partner.list \
 		scripts/mod/mod-sign.sh \
-		scripts/mod/mod-kvm.list \
 		configs/flavors \
 		configs/generate_all_configs.sh \
 		configs/merge.py \
