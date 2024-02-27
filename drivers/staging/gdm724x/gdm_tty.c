@@ -23,9 +23,9 @@
 #define ACM_CTRL_RI  0x08
 #define ACM_CTRL_DCD 0x01
 
-#define WRITE_SIZE 2048
+#define WRITE_SIZE 2048UL
 
-#define MUX_TX_MAX_SIZE 2048
+#define MUX_TX_MAX_SIZE 2048UL
 
 #define GDM_TTY_READY(gdm) (gdm && gdm->tty_dev && gdm->port.count)
 
@@ -155,9 +155,8 @@ static void gdm_tty_send_complete(void *arg)
 static ssize_t gdm_tty_write(struct tty_struct *tty, const u8 *buf, size_t len)
 {
 	struct gdm *gdm = tty->driver_data;
-	int remain = len;
-	int sent_len = 0;
-	int sending_len = 0;
+	size_t remain = len;
+	size_t sent_len = 0;
 
 	if (!GDM_TTY_READY(gdm))
 		return -ENODEV;
@@ -166,7 +165,7 @@ static ssize_t gdm_tty_write(struct tty_struct *tty, const u8 *buf, size_t len)
 		return 0;
 
 	while (1) {
-		sending_len = min(MUX_TX_MAX_SIZE, remain);
+		size_t sending_len = min(MUX_TX_MAX_SIZE, remain);
 		gdm->tty_dev->send_func(gdm->tty_dev->priv_dev,
 					(void *)(buf + sent_len),
 					sending_len,
