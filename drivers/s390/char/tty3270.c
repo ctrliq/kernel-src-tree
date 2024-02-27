@@ -1709,7 +1709,7 @@ tty3270_do_write(struct tty3270 *tp, struct tty_struct *tty,
  */
 static int
 tty3270_write(struct tty_struct * tty,
-	      const unsigned char *buf, int count)
+	      const u8 *buf, int count)
 {
 	struct tty3270 *tp;
 

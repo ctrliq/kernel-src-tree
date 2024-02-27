@@ -57,8 +57,7 @@ static void rs_close(struct tty_struct *tty, struct file * filp)
 }
 
 
-static int rs_write(struct tty_struct * tty,
-		    const unsigned char *buf, int count)
+static int rs_write(struct tty_struct * tty, const u8 *buf, int count)
 {
 	/* see drivers/char/serialX.c to reference original version */
 
