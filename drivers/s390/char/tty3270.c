@@ -1707,9 +1707,9 @@ tty3270_do_write(struct tty3270 *tp, struct tty_struct *tty,
 /*
  * String write routine for 3270 ttys
  */
-static int
+static ssize_t
 tty3270_write(struct tty_struct * tty,
-	      const u8 *buf, int count)
+	      const u8 *buf, size_t count)
 {
 	struct tty3270 *tp;
 
