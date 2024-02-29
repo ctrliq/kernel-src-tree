@@ -127,7 +127,7 @@
 		fprintf(TH_LOG_STREAM, "#      SKIP      %s\n", \
 			_metadata->results->reason); \
 	} \
-	_metadata->passed = 1; \
+	_metadata->exit_code = KSFT_PASS; \
 	_metadata->skip = 1; \
 	_metadata->trigger = 0; \
 	statement; \
@@ -386,7 +386,7 @@
 		if (setjmp(_metadata->env) == 0) { \
 			fixture_name##_setup(_metadata, &self, variant->data); \
 			/* Let setup failure terminate early. */ \
-			if (!_metadata->passed || _metadata->skip) \
+			if (!__test_passed(_metadata) || _metadata->skip) \
 				return; \
 			_metadata->setup_completed = true; \
 			/* Use the same _metadata. */ \
@@ -397,7 +397,7 @@
 			} \
 			if (child < 0) { \
 				ksft_print_msg("ERROR SPAWNING TEST GRANDCHILD\n"); \
-				_metadata->passed = 0; \
+				_metadata->exit_code = KSFT_FAIL; \
 			} \
 		} \
 		if (child == 0) \
@@ -746,7 +746,7 @@
 			break; \
 			} \
 		} \
-		_metadata->passed = 0; \
+		_metadata->exit_code = KSFT_FAIL; \
 		/* Ensure the optional handler is triggered */ \
 		_metadata->trigger = 1; \
 	} \
@@ -757,7 +757,7 @@
 	const char *__seen = (_seen); \
 	if (!(strcmp(__exp, __seen) _t 0))  { \
 		__TH_LOG("Expected '%s' %s '%s'.", __exp, #_t, __seen); \
-		_metadata->passed = 0; \
+		_metadata->exit_code = KSFT_FAIL; \
 		_metadata->trigger = 1; \
 	} \
 } while (0); OPTIONAL_HANDLER(_assert)
@@ -835,7 +835,7 @@ struct __test_metadata {
 	pid_t pid;	/* pid of test when being run */
 	struct __fixture_metadata *fixture;
 	int termsig;
-	int passed;
+	int exit_code;
 	int skip;	/* did SKIP get used? */
 	int trigger; /* extra handler after the evaluation */
 	int timeout;	/* seconds to wait for test timeout */
@@ -846,6 +846,12 @@ struct __test_metadata {
 	struct __test_results *results;
 	struct __test_metadata *prev, *next;
 };
+
+static inline bool __test_passed(struct __test_metadata *metadata)
+{
+	return metadata->exit_code != KSFT_FAIL &&
+	       metadata->exit_code <= KSFT_SKIP;
+}
 
 /*
  * Since constructors are called in reverse order, reverse the test
@@ -911,7 +917,7 @@ void __wait_for_test(struct __test_metadata *t)
 	int status;
 
 	if (sigaction(SIGALRM, &action, &saved_action)) {
-		t->passed = 0;
+		t->exit_code = KSFT_FAIL;
 		fprintf(TH_LOG_STREAM,
 			"# %s: unable to install SIGALRM handler\n",
 			t->name);
@@ -923,7 +929,7 @@ void __wait_for_test(struct __test_metadata *t)
 	waitpid(t->pid, &status, 0);
 	alarm(0);
 	if (sigaction(SIGALRM, &saved_action, NULL)) {
-		t->passed = 0;
+		t->exit_code = KSFT_FAIL;
 		fprintf(TH_LOG_STREAM,
 			"# %s: unable to uninstall SIGALRM handler\n",
 			t->name);
@@ -932,16 +938,16 @@ void __wait_for_test(struct __test_metadata *t)
 	__active_test = NULL;
 
 	if (t->timed_out) {
-		t->passed = 0;
+		t->exit_code = KSFT_FAIL;
 		fprintf(TH_LOG_STREAM,
 			"# %s: Test terminated by timeout\n", t->name);
 	} else if (WIFEXITED(status)) {
 		if (WEXITSTATUS(status) == 255) {
 			/* SKIP */
-			t->passed = 1;
+			t->exit_code = KSFT_PASS;
 			t->skip = 1;
 		} else if (t->termsig != -1) {
-			t->passed = 0;
+			t->exit_code = KSFT_FAIL;
 			fprintf(TH_LOG_STREAM,
 				"# %s: Test exited normally instead of by signal (code: %d)\n",
 				t->name,
@@ -949,25 +955,25 @@ void __wait_for_test(struct __test_metadata *t)
 		} else {
 			switch (WEXITSTATUS(status)) {
 			/* Success */
-			case 0:
-				t->passed = 1;
+			case KSFT_PASS:
+				t->exit_code = KSFT_PASS;
 				break;
 			/* Failure */
 			default:
-				t->passed = 0;
+				t->exit_code = KSFT_FAIL;
 				fprintf(TH_LOG_STREAM,
 					"# %s: Test failed\n",
 					t->name);
 			}
 		}
 	} else if (WIFSIGNALED(status)) {
-		t->passed = 0;
+		t->exit_code = KSFT_FAIL;
 		if (WTERMSIG(status) == SIGABRT) {
 			fprintf(TH_LOG_STREAM,
 				"# %s: Test terminated by assertion\n",
 				t->name);
 		} else if (WTERMSIG(status) == t->termsig) {
-			t->passed = 1;
+			t->exit_code = KSFT_PASS;
 		} else {
 			fprintf(TH_LOG_STREAM,
 				"# %s: Test terminated unexpectedly by signal %d\n",
@@ -1108,7 +1114,7 @@ void __run_test(struct __fixture_metadata *f,
 		struct __test_metadata *t)
 {
 	/* reset test struct */
-	t->passed = 1;
+	t->exit_code = KSFT_PASS;
 	t->skip = 0;
 	t->trigger = 0;
 	memset(t->results->reason, 0, sizeof(t->results->reason));
@@ -1123,28 +1129,26 @@ void __run_test(struct __fixture_metadata *f,
 	t->pid = fork();
 	if (t->pid < 0) {
 		ksft_print_msg("ERROR SPAWNING TEST CHILD\n");
-		t->passed = 0;
+		t->exit_code = KSFT_FAIL;
 	} else if (t->pid == 0) {
 		setpgrp();
 		t->fn(t, variant);
 		if (t->skip)
-			_exit(255);
-		/* Pass is exit 0 */
-		if (t->passed)
-			_exit(0);
-		_exit(1);
+			_exit(KSFT_SKIP);
+		if (__test_passed(t))
+			_exit(KSFT_PASS);
+		_exit(KSFT_FAIL);
 	} else {
 		__wait_for_test(t);
 	}
-	ksft_print_msg("         %4s  %s%s%s.%s\n", t->passed ? "OK" : "FAIL",
-	       f->name, variant->name[0] ? "." : "", variant->name, t->name);
+	ksft_print_msg("         %4s  %s\n",
+		       __test_passed(t) ? "OK" : "FAIL", t->name);
 
 	if (t->skip)
 		ksft_test_result_skip("%s\n", t->results->reason[0] ?
 					t->results->reason : "unknown");
 	else
-		ksft_test_result(t->passed, "%s%s%s.%s\n",
-			f->name, variant->name[0] ? "." : "", variant->name, t->name);
+		ksft_test_result(__test_passed(t), "%s\n", t->name);
 }
 
 static int test_harness_run(int argc, char **argv)
@@ -1192,7 +1196,7 @@ static int test_harness_run(int argc, char **argv)
 				t->results = results;
 				__run_test(f, v, t);
 				t->results = NULL;
-				if (t->passed)
+				if (__test_passed(t))
 					pass_count++;
 				else
 					ret = 1;
