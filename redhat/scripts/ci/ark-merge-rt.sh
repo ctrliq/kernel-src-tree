@@ -111,6 +111,7 @@ if test "$UPSTREAM_RT_DEVEL_VER" != "$OS_BUILD_VER"; then
 	# os-build stable tag
 	OS_BUILD_BASE_BRANCH="kernel-${MASTER_RT_DEVEL_VER}.0-0"
 fi
+UPSTREAM_RT_PREV_BRANCH=""
 
 # verify the core branches exist or use provided defaults
 UPSTREAM_RT_DEVEL_BRANCH="linux-${UPSTREAM_RT_DEVEL_VER}.y-rt"
@@ -140,33 +141,48 @@ ark_git_mirror "$DOWNSTREAM_RT_BRANCH" "$UPSTREAM_RT_TREE_NAME" "$UPSTREAM_RT_DE
 # finally merge the two correct branches
 ark_git_merge "$OS_BUILD_BASE_BRANCH" "$RT_AUTOMATED_BRANCH" "$RT_REBASE"
 ark_git_merge "$DOWNSTREAM_RT_BRANCH" "$RT_AUTOMATED_BRANCH"
+# handle rebasing
+if test "$UPSTREAM_RT_DEVEL_VER" != "$RT_DEVEL_VER" -o \
+	"$UPSTREAM_RT_DEVEL_VER" != "$AUTOMOTIVE_DEVEL_VER"; then
+	# we need the previous rt branch for rebase purposes
+	UPSTREAM_RT_PREV_BRANCH="linux-${OS_BUILD_VER_prev}.y-rt"
+	git fetch -q "$UPSTREAM_RT_TREE_NAME" "$UPSTREAM_RT_PREV_BRANCH"
 
-## MERGE the upstream branches to the development branches
-if test -n "$RT_REBASE"; then
 	# handle the rebase
 	# rebases usually go from prev version to new version
-	# rebuild the prev merge base in case the previous automated one is
-	# corrupted.
+	# rebuild the prev merge base as it isn't saved.
+	# then rebuild the current merge base as it isn't saved either
+	# because we use an octopus merge below.
 	prev_branch="$(git rev-parse --abbrev-ref HEAD)"
-	temp_branch="_temp_rt_devel_$(date +%F)"
-	git branch -D "$temp_branch" 2>/dev/null
-	git checkout -b "$temp_branch" "kernel-${OS_BUILD_VER_prev}.0-0"
-	git merge "$UPSTREAM_RT_TREE_NAME/linux-${OS_BUILD_VER_prev}.y-rt"
+	temp_prev_branch="_temp_prev_rt_devel_$(date +%F)"
+	git branch -D "$temp_prev_branch" 2>/dev/null
+	git fetch "$UPSTREAM_RT_TREE_NAME" "$UPSTREAM_RT_PREV_BRANCH"
+	git checkout -b "$temp_prev_branch" "kernel-${OS_BUILD_VER_prev}.0-0"
+	git merge "$UPSTREAM_RT_TREE_NAME/$UPSTREAM_RT_PREV_BRANCH"
+
+	# create devel merge branch to base octopus merge on.
+	temp_devel_branch="_temp_devel_rt_devel_$(date +%F)"
+	git branch -D "$temp_devel_branch" 2>/dev/null
+	git checkout -b "$temp_devel_branch" "$OS_BUILD_BASE_BRANCH"
+	git merge "$UPSTREAM_RT_TREE_NAME/$UPSTREAM_RT_DEVEL_BRANCH"
+
 	git checkout "$prev_branch"
-	ark_git_rebase "$RT_DEVEL_BRANCH" "$temp_branch" "$RT_AUTOMATED_BRANCH"
-	ark_git_rebase "$AUTOMOTIVE_DEVEL_BRANCH" "$temp_branch" "$RT_AUTOMATED_BRANCH"
-	git branch -D "$temp_branch"
+        # do the git rebase --onto $temp_devel_branch $temp_prev_branch
+	ark_git_rebase "$RT_DEVEL_BRANCH" "$temp_prev_branch" "$temp_devel_branch"
+	ark_git_rebase "$AUTOMOTIVE_DEVEL_BRANCH" "$temp_prev_branch" "$temp_devel_branch"
+	git branch -D "$temp_prev_branch"
+	git branch -D "$temp_devel_branch"
 fi
 
 ## Build -rt-devel branch, generate pending-rhel configs
-ark_git_merge "$RT_AUTOMATED_BRANCH" "$RT_DEVEL_BRANCH"
+ark_git_merge "$RT_DEVEL_BRANCH" "$OS_BUILD_BASE_BRANCH" "$UPSTREAM_RT_TREE_NAME/$UPSTREAM_RT_DEVEL_BRANCH"
 # don't care if configs were added or not hence '|| true'
 ark_update_configs "$RT_DEVEL_BRANCH" || true
 # skip pushing config update MRs, keep them in pending-rhel
 ark_push_changes "$RT_DEVEL_BRANCH" "skip"
 
 ## Build -automotive-devel branch, generate pending-rhel configs
-ark_git_merge "$RT_AUTOMATED_BRANCH" "$AUTOMOTIVE_DEVEL_BRANCH"
+ark_git_merge "$AUTOMOTIVE_DEVEL_BRANCH" "$OS_BUILD_BASE_BRANCH" "$UPSTREAM_RT_TREE_NAME/$UPSTREAM_RT_DEVEL_BRANCH"
 # don't care if configs were added or not hence '|| true'
 ark_update_configs "$AUTOMOTIVE_DEVEL_BRANCH" || true
 # skip pushing config update MRs, keep them in pending-rhel

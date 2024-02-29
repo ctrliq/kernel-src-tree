@@ -56,22 +56,23 @@ ark_git_mirror()
 # Merge wrapper in case issues arise
 ark_git_merge()
 {
-	source_branch="$1"
-	target_branch="$2"
-	reset_branch="$3"
+	# support octopus merging with source_branch 1|2
+
+	target_branch="$1"
+	source_branch1="$2"
+	source_branch2="$3"
 
 	prev_branch="$(git rev-parse --abbrev-ref HEAD)"
-	ark_git_branch "$target_branch" "$source_branch"
+	ark_git_branch "$target_branch" "${source_branch1}"
 	git checkout "$target_branch"
-	if test -n "$reset_branch"; then
-		# there are cases when the initial merge is a reset
-		git reset --hard "$source_branch"  || die "git reset $source_branch failed"
-	elif ! git merge -m "Merge '$source_branch' into '$target_branch'" "$source_branch"; then
+
+	msg="Merge '${source_branch1} ${source_branch2}' into '$target_branch'"
+	if ! git merge -m "$msg" "${source_branch1}" "${source_branch2}"; then
 		git merge --abort
 		printf "Merge conflict; halting!\n"
 		printf "To reproduce:\n"
 		printf "* git checkout %s\n" "${target_branch}"
-		printf "* git merge %s\n" "${source_branch}"
+		printf "* git merge %s\n" "${source_branch1} ${source_branch2}"
 		die "Merge conflicts"
 	fi
 
