@@ -24,8 +24,6 @@ set -e
 #Upstream RT tree git://git.kernel.org/pub/scm/linux/kernel/git/rt/linux-rt-devel.git
 UPSTREAM_RT_TREE_URL="git://git.kernel.org/pub/scm/linux/kernel/git/rt/linux-rt-devel.git"
 UPSTREAM_RT_TREE_NAME="linux-rt-devel"
-DOWNSTREAM_RT_BRANCH="master-rt-devel"
-RT_AUTOMATED_BRANCH="os-build-rt-automated"
 RT_DEVEL_BRANCH="os-build-rt-devel"
 AUTOMOTIVE_DEVEL_BRANCH="os-build-automotive-devel"
 
@@ -40,10 +38,6 @@ ark_git_mirror "master" "origin" "master"
 
 # make sure tags are available for git-describe to correctly work
 git fetch -t origin
-
-# upstream -rt devel branches are aligned with version numbers and are not
-# always up to date with master.  Figure out which branch to mirror based on
-# version number and existance.  We may have to trigger a rebase.
 
 # what are the current versions of rt-devel and os-build (use 'master' to
 # avoid fedora tagging of kernel-X.Y.0.0.....)
@@ -94,56 +88,35 @@ get_prev_version()
 OS_BUILD_VER="$(get_upstream_version os-build)"
 OS_BUILD_VER_prev="$(get_prev_version "$OS_BUILD_VER")"
 
+# upstream -rt devel branches are aligned with version numbers and are not
+# always up to date with master.  Figure out which branch to mirror based on
+# version number and existance.  We may have to trigger a rebase.
+
 # check latest upstream RT branch
 if git fetch -q "$UPSTREAM_RT_TREE_NAME" "linux-${OS_BUILD_VER}.y-rt"; then
 	UPSTREAM_RT_DEVEL_VER="${OS_BUILD_VER}"
+	OS_BUILD_BASE_BRANCH="os-build"
 elif git fetch -q "$UPSTREAM_RT_TREE_NAME" "linux-${OS_BUILD_VER_prev}.y-rt"; then
 	UPSTREAM_RT_DEVEL_VER="${OS_BUILD_VER_prev}"
+	OS_BUILD_BASE_BRANCH="kernel-${UPSTREAM_RT_DEVEL_VER}.0-0"
 else
 	die "Neither version ($OS_BUILD_VER, $OS_BUILD_VER_prev) in upstream tree: $UPSTREAM_RT_TREE_NAME"
 fi
 
-OS_BUILD_BASE_BRANCH="os-build"
-RT_REBASE=""
-
-if test "$UPSTREAM_RT_DEVEL_VER" != "$OS_BUILD_VER"; then
-	# no newer upstream branch to rebase onto, continue with an
-	# os-build stable tag
-	OS_BUILD_BASE_BRANCH="kernel-${MASTER_RT_DEVEL_VER}.0-0"
-fi
 UPSTREAM_RT_PREV_BRANCH=""
 
 # verify the core branches exist or use provided defaults
 UPSTREAM_RT_DEVEL_BRANCH="linux-${UPSTREAM_RT_DEVEL_VER}.y-rt"
-ark_git_branch "$DOWNSTREAM_RT_BRANCH" "$UPSTREAM_RT_TREE_NAME/$UPSTREAM_RT_DEVEL_BRANCH"
-ark_git_branch "$RT_AUTOMATED_BRANCH" "$OS_BUILD_BASE_BRANCH"
 ark_git_branch "$RT_DEVEL_BRANCH" "$OS_BUILD_BASE_BRANCH"
 ark_git_branch "$AUTOMOTIVE_DEVEL_BRANCH" "$OS_BUILD_BASE_BRANCH"
 
-MASTER_RT_DEVEL_VER="$(get_upstream_version "$DOWNSTREAM_RT_BRANCH")"
-RT_AUTOMATED_VER="$(get_upstream_version $RT_AUTOMATED_BRANCH)"
 RT_DEVEL_VER="$(get_upstream_version $RT_DEVEL_BRANCH)"
 AUTOMOTIVE_DEVEL_VER="$(get_upstream_version $AUTOMOTIVE_DEVEL_BRANCH)"
 
-# sanity check, sometimes broken scripts leave a mess
-if test "$MASTER_RT_DEVEL_VER" != "$UPSTREAM_RT_DEVEL_VER" -o \
-	"$MASTER_RT_DEVEL_VER" != "$RT_AUTOMATED_VER" -o \
-	"$MASTER_RT_DEVEL_VER" != "$RT_DEVEL_VER" -o \
-	"$MASTER_RT_DEVEL_VER" != "$AUTOMOTIVE_DEVEL_VER"; then
-	# rebase time
-	RT_REBASE="yes"
-fi
-
-## PREP the upstream branches
-# on a rebase, propogate all the git resets
-# fetch the determined rt-devel branch
-ark_git_mirror "$DOWNSTREAM_RT_BRANCH" "$UPSTREAM_RT_TREE_NAME" "$UPSTREAM_RT_DEVEL_BRANCH" "$RT_REBASE"
-# finally merge the two correct branches
-ark_git_merge "$OS_BUILD_BASE_BRANCH" "$RT_AUTOMATED_BRANCH" "$RT_REBASE"
-ark_git_merge "$DOWNSTREAM_RT_BRANCH" "$RT_AUTOMATED_BRANCH"
 # handle rebasing
 if test "$UPSTREAM_RT_DEVEL_VER" != "$RT_DEVEL_VER" -o \
 	"$UPSTREAM_RT_DEVEL_VER" != "$AUTOMOTIVE_DEVEL_VER"; then
+
 	# we need the previous rt branch for rebase purposes
 	UPSTREAM_RT_PREV_BRANCH="linux-${OS_BUILD_VER_prev}.y-rt"
 	git fetch -q "$UPSTREAM_RT_TREE_NAME" "$UPSTREAM_RT_PREV_BRANCH"
