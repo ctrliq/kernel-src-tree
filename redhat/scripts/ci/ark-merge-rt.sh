@@ -125,7 +125,6 @@ if test "$UPSTREAM_RT_DEVEL_VER" != "$RT_DEVEL_VER" -o \
 	# rebases usually go from prev version to new version
 	# rebuild the prev merge base as it isn't saved.
 	# then rebuild the current merge base as it isn't saved either
-	# because we use an octopus merge below.
 	prev_branch="$(git rev-parse --abbrev-ref HEAD)"
 	temp_prev_branch="_temp_prev_rt_devel_$(date +%F)"
 	git branch -D "$temp_prev_branch" 2>/dev/null
@@ -133,7 +132,7 @@ if test "$UPSTREAM_RT_DEVEL_VER" != "$RT_DEVEL_VER" -o \
 	git checkout -b "$temp_prev_branch" "kernel-${OS_BUILD_VER_prev}.0-0"
 	git merge "$UPSTREAM_RT_TREE_NAME/$UPSTREAM_RT_PREV_BRANCH"
 
-	# create devel merge branch to base octopus merge on.
+	# create devel merge branch to base merge on.
 	temp_devel_branch="_temp_devel_rt_devel_$(date +%F)"
 	git branch -D "$temp_devel_branch" 2>/dev/null
 	git checkout -b "$temp_devel_branch" "$OS_BUILD_BASE_BRANCH"
@@ -148,14 +147,16 @@ if test "$UPSTREAM_RT_DEVEL_VER" != "$RT_DEVEL_VER" -o \
 fi
 
 ## Build -rt-devel branch, generate pending-rhel configs
-ark_git_merge "$RT_DEVEL_BRANCH" "$OS_BUILD_BASE_BRANCH" "$UPSTREAM_RT_TREE_NAME/$UPSTREAM_RT_DEVEL_BRANCH"
+ark_git_merge "$RT_DEVEL_BRANCH" "$OS_BUILD_BASE_BRANCH"
+ark_git_merge "$RT_DEVEL_BRANCH" "$UPSTREAM_RT_TREE_NAME/$UPSTREAM_RT_DEVEL_BRANCH"
 # don't care if configs were added or not hence '|| true'
 ark_update_configs "$RT_DEVEL_BRANCH" || true
 # skip pushing config update MRs, keep them in pending-rhel
 ark_push_changes "$RT_DEVEL_BRANCH" "skip"
 
 ## Build -automotive-devel branch, generate pending-rhel configs
-ark_git_merge "$AUTOMOTIVE_DEVEL_BRANCH" "$OS_BUILD_BASE_BRANCH" "$UPSTREAM_RT_TREE_NAME/$UPSTREAM_RT_DEVEL_BRANCH"
+ark_git_merge "$AUTOMOTIVE_DEVEL_BRANCH" "$OS_BUILD_BASE_BRANCH"
+ark_git_merge "$AUTOMOTIVE_DEVEL_BRANCH" "$UPSTREAM_RT_TREE_NAME/$UPSTREAM_RT_DEVEL_BRANCH"
 # don't care if configs were added or not hence '|| true'
 ark_update_configs "$AUTOMOTIVE_DEVEL_BRANCH" || true
 # skip pushing config update MRs, keep them in pending-rhel

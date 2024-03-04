@@ -56,23 +56,20 @@ ark_git_mirror()
 # Merge wrapper in case issues arise
 ark_git_merge()
 {
-	# support octopus merging with source_branch 1|2
-
 	target_branch="$1"
-	source_branch1="$2"
-	source_branch2="$3"
+	source_branch="$2"
 
 	prev_branch="$(git rev-parse --abbrev-ref HEAD)"
-	ark_git_branch "$target_branch" "${source_branch1}"
+	ark_git_branch "$target_branch" "${source_branch}"
 	git checkout "$target_branch"
 
-	msg="Merge '${source_branch1} ${source_branch2}' into '$target_branch'"
-	if ! git merge -m "$msg" "${source_branch1}" "${source_branch2}"; then
+	msg="Merge '${source_branch}' into '$target_branch'"
+	if ! git merge -m "$msg" "${source_branch}"; then
 		git merge --abort
 		printf "Merge conflict; halting!\n"
 		printf "To reproduce:\n"
 		printf "* git checkout %s\n" "${target_branch}"
-		printf "* git merge %s\n" "${source_branch1} ${source_branch2}"
+		printf "* git merge %s\n" "${source_branch}"
 		die "Merge conflicts"
 	fi
 
