@@ -517,8 +517,6 @@ static void pci_epf_device_remove(struct device *dev)
 	if (driver->remove)
 		driver->remove(epf);
 	epf->driver = NULL;
-
-	return 0;
 }
 
 static const struct bus_type pci_epf_bus_type = {
