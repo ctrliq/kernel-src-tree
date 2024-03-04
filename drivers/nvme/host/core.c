@@ -1739,6 +1739,8 @@ static bool nvme_init_integrity(struct gendisk *disk, struct nvme_ns_head *head)
 {
 	struct blk_integrity integrity = { };
 
+	blk_integrity_unregister(disk);
+
 	if (!head->ms)
 		return true;
 
@@ -1991,8 +1993,6 @@ static void nvme_update_disk_info(struct nvme_ctrl *ctrl, struct gendisk *disk,
 		capacity = 0;
 		bs = (1 << 9);
 	}
-
-	blk_integrity_unregister(disk);
 
 	atomic_bs = phys_bs = bs;
 	if (id->nabo == 0) {
