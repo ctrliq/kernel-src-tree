@@ -76,7 +76,6 @@ SRPMS:=$(RPM)/SRPMS
 SOURCES:=$(RPM)/SOURCES
 TESTPATCH:=$(REDHAT)/linux-kernel-test.patch
 SPECCHANGELOG:=$(PACKAGE_NAME).changelog-$(RHEL_MAJOR).$(RHEL_MINOR)
-CHANGELOG_PREV:=$(PACKAGE_NAME).changelog-$(RHEL_MAJOR).$(shell expr $(RHEL_MINOR) - 1)
 ARCH_LIST=aarch64 ppc64le s390x x86_64
 
 ifndef DISTRO
@@ -593,8 +592,8 @@ dist-get-buildreqs: setup-source
 _setup-source: dist-git-version-check
 	@cp $(REDHAT)/$(SPECFILE).template $(SOURCES)/$(SPECFILE)
 	@if [ ! -e  $(REDHAT)/$(SPECCHANGELOG) ]; then \
-		echo "Creating $(SPECCHANGELOG) as copy of $(CHANGELOG_PREV)"; \
-		cp $(REDHAT)/$(CHANGELOG_PREV) $(REDHAT)/$(SPECCHANGELOG); \
+		echo "Creating an empty $(SPECCHANGELOG) since it does not exist yet"; \
+		touch $(REDHAT)/$(SPECCHANGELOG); \
 	fi
 
 	@if [ -z "$(RHSELFTESTDATA)" ]; then \
@@ -655,6 +654,8 @@ sources-rh: $(TARBALL) generate-testpatch-tmp setup-source dist-configs-check
 		kernel-local \
 		dracut-virt.conf \
 		$(SOURCES)/
+	@cat $$(ls -1 $(PACKAGE_NAME).changelog-* | sort -t '.' -k 3 -n -r) \
+		> $(SOURCES)/kernel.changelog
 	@for KABIARCH in $(ARCH_LIST); do \
 		cp kabi/Module.kabi_$$KABIARCH $(SOURCES)/; \
 		cp kabi/Module.kabi_dup_$$KABIARCH $(SOURCES)/; \

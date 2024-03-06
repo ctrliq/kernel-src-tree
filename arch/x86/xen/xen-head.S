@@ -58,7 +58,7 @@ SYM_CODE_START(startup_xen)
 	rep stosq
 
 	mov %rsi, xen_start_info
-	mov initial_stack(%rip), %rsp
+	leaq	(__end_init_task - PTREGS_SIZE)(%rip), %rsp
 
 	/* Set up %gs.
 	 *
