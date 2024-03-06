@@ -804,6 +804,8 @@ const struct bpf_func_proto bpf_find_vma_proto = {
 	.arg5_type	= ARG_ANYTHING,
 };
 
+#ifdef CONFIG_CGROUPS
+
 struct bpf_iter_css_task {
 	__u64 __opaque[1];
 } __attribute__((aligned(8)));
@@ -861,6 +863,8 @@ __bpf_kfunc void bpf_iter_css_task_destroy(struct bpf_iter_css_task *it)
 }
 
 __diag_pop();
+
+#endif /* CONFIG_CGROUPS */
 
 struct bpf_iter_task {
 	__u64 __opaque[3];
