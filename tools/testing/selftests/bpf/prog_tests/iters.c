@@ -238,6 +238,7 @@ void test_iters(void)
 	RUN_TESTS(iters_state_safety);
 	RUN_TESTS(iters_looping);
 	RUN_TESTS(iters);
+	RUN_TESTS(iters_css_task);
 
 	if (env.has_testmod)
 		RUN_TESTS(iters_testmod_seq);
