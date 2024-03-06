@@ -6402,7 +6402,7 @@ struct page *hugetlb_follow_page_mask(struct vm_area_struct *vma,
 		 * try_grab_page() should always succeed here, because we hold
 		 * the ptl lock and have verified pte_present().
 		 */
-		if (WARN_ON_ONCE(!try_grab_page(page, flags))) {
+		if (try_grab_page(page, flags)) {
 			page = NULL;
 			goto out;
 		}
