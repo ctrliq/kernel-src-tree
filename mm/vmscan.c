@@ -4119,9 +4119,6 @@ restart:
 	for (i = pmd_index(start), addr = start; addr != end; i++, addr = next) {
 		pmd_t val = pmdp_get_lockless(pmd + i);
 
-		/* for pmdp_get_lockless() */
-		barrier();
-
 		next = pmd_addr_end(addr, end);
 
 		if (!pmd_present(val) || is_huge_zero_pmd(val)) {
