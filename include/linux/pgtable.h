@@ -332,7 +332,7 @@ static inline pmd_t pmdp_get(pmd_t *pmdp)
 }
 #endif
 
-#ifdef CONFIG_GUP_GET_PTE_LOW_HIGH
+#ifdef CONFIG_GUP_GET_PXX_LOW_HIGH
 /*
  * WARNING: only to be used in the get_user_pages_fast() implementation.
  *
@@ -395,7 +395,7 @@ static inline pmd_t pmdp_get_lockless(pmd_t *pmdp)
 }
 #define pmdp_get_lockless pmdp_get_lockless
 #endif /* CONFIG_PGTABLE_LEVELS > 2 */
-#endif /* CONFIG_GUP_GET_PTE_LOW_HIGH */
+#endif /* CONFIG_GUP_GET_PXX_LOW_HIGH */
 
 /*
  * We require that the PTE can be read atomically.
