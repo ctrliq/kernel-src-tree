@@ -372,7 +372,7 @@ static void test_insert_bound(struct test_sockmap_listen *skel __always_unused,
 			      int family, int sotype, int mapfd)
 {
 	struct sockaddr_storage addr;
-	socklen_t len;
+	socklen_t len = 0;
 	u32 key = 0;
 	u64 value;
 	int err, s;
