@@ -676,17 +676,6 @@ static int nfs_writepage_locked(struct folio *folio,
 	return err;
 }
 
-int nfs_writepage(struct page *page, struct writeback_control *wbc)
-{
-	struct folio *folio = page_folio(page);
-	int ret;
-
-	ret = nfs_writepage_locked(folio, wbc);
-	if (ret != AOP_WRITEPAGE_ACTIVATE)
-		unlock_page(page);
-	return ret;
-}
-
 static int nfs_writepages_callback(struct page *page,
 				   struct writeback_control *wbc, void *data)
 {
