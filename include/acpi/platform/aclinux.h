@@ -181,6 +181,8 @@
 
 #ifdef ACPI_USE_STANDARD_HEADERS
 #include <unistd.h>
+#include <stdint.h>
+
 #endif
 
 /* Define/disable kernel-specific declarators */
