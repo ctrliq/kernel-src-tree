@@ -1118,7 +1118,7 @@ struct acpi_madt_multiproc_wakeup_mailbox {
 /* 17: OEM data */
 
 struct acpi_madt_oem_data {
-	u8 oem_data[0];
+	ACPI_FLEX_ARRAY(u8, oem_data);
 };
 
 /*
