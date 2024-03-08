@@ -2423,7 +2423,7 @@ int md_integrity_register(struct mddev *mddev)
 
 	if (list_empty(&mddev->disks))
 		return 0; /* nothing to do */
-	if (!mddev->gendisk || blk_get_integrity(mddev->gendisk))
+	if (mddev_is_dm(mddev) || blk_get_integrity(mddev->gendisk))
 		return 0; /* shouldn't register, or already is */
 	rdev_for_each(rdev, mddev) {
 		/* skip spares and non-functional disks */
@@ -2476,7 +2476,7 @@ int md_integrity_add_rdev(struct md_rdev *rdev, struct mddev *mddev)
 {
 	struct blk_integrity *bi_mddev;
 
-	if (!mddev->gendisk)
+	if (mddev_is_dm(mddev))
 		return 0;
 
 	bi_mddev = blk_get_integrity(mddev->gendisk);
@@ -6005,7 +6005,7 @@ int md_run(struct mddev *mddev)
 		invalidate_bdev(rdev->bdev);
 		if (mddev->ro != MD_RDONLY && rdev_read_only(rdev)) {
 			mddev->ro = MD_RDONLY;
-			if (mddev->gendisk)
+			if (!mddev_is_dm(mddev))
 				set_disk_ro(mddev->gendisk, 1);
 		}
 
@@ -6167,7 +6167,7 @@ int md_run(struct mddev *mddev)
 		}
 	}
 
-	if (mddev->queue) {
+	if (!mddev_is_dm(mddev)) {
 		bool nonrot = true;
 
 		rdev_for_each(rdev, mddev) {
@@ -6432,7 +6432,7 @@ static void mddev_detach(struct mddev *mddev)
 		mddev->pers->quiesce(mddev, 0);
 	}
 	md_unregister_thread(mddev, &mddev->thread);
-	if (mddev->queue)
+	if (!mddev_is_dm(mddev))
 		blk_sync_queue(mddev->queue); /* the unplug fn references 'conf'*/
 }
 
@@ -7391,10 +7391,9 @@ static int update_size(struct mddev *mddev, sector_t num_sectors)
 	if (!rv) {
 		if (mddev_is_clustered(mddev))
 			md_cluster_ops->update_size(mddev, old_dev_sectors);
-		else if (mddev->queue) {
+		else if (!mddev_is_dm(mddev))
 			set_capacity_and_notify(mddev->gendisk,
 						mddev->array_sectors);
-		}
 	}
 	return rv;
 }
@@ -9212,7 +9211,7 @@ void md_do_sync(struct md_thread *thread)
 			mddev->delta_disks > 0 &&
 			mddev->pers->finish_reshape &&
 			mddev->pers->size &&
-			mddev->queue) {
+			!mddev_is_dm(mddev)) {
 		mddev_lock_nointr(mddev);
 		md_set_array_sectors(mddev, mddev->pers->size(mddev, 0, 0));
 		mddev_unlock(mddev);
