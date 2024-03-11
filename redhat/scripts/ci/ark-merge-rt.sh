@@ -140,8 +140,12 @@ if test "$UPSTREAM_RT_DEVEL_VER" != "$RT_DEVEL_VER" -o \
 
 	git checkout "$prev_branch"
         # do the git rebase --onto $temp_devel_branch $temp_prev_branch
+	prev_rt_branch="$(git rev-parse --abbrev-ref $RT_DEVEL_BRANCH)"
 	ark_git_rebase "$RT_DEVEL_BRANCH" "$temp_prev_branch" "$temp_devel_branch"
-	ark_git_rebase "$AUTOMOTIVE_DEVEL_BRANCH" "$temp_prev_branch" "$temp_devel_branch"
+
+	# use the pre-rebase rt-devel branch and the post-rebase rt-devel
+	# branch as input to git rebase
+	ark_git_rebase "$AUTOMOTIVE_DEVEL_BRANCH" "$prev_rt_branch" "$RT_DEVEL_BRANCH"
 	git branch -D "$temp_prev_branch"
 	git branch -D "$temp_devel_branch"
 fi
@@ -154,9 +158,9 @@ ark_update_configs "$RT_DEVEL_BRANCH" || true
 # skip pushing config update MRs, keep them in pending-rhel
 ark_push_changes "$RT_DEVEL_BRANCH" "skip"
 
-## Build -automotive-devel branch, generate pending-rhel configs
-ark_git_merge "$AUTOMOTIVE_DEVEL_BRANCH" "$OS_BUILD_BASE_BRANCH"
-ark_git_merge "$AUTOMOTIVE_DEVEL_BRANCH" "$UPSTREAM_RT_TREE_NAME/$UPSTREAM_RT_DEVEL_BRANCH"
+## Build -automotive-devel branch based on the rt-devel branch, generate
+## pending-rhel configs
+ark_git_merge "$AUTOMOTIVE_DEVEL_BRANCH" "$RT_DEVEL_BRANCH"
 # don't care if configs were added or not hence '|| true'
 ark_update_configs "$AUTOMOTIVE_DEVEL_BRANCH" || true
 # skip pushing config update MRs, keep them in pending-rhel
