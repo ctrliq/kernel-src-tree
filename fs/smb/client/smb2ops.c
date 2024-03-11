@@ -2397,7 +2397,7 @@ smb2_is_status_io_timeout(char *buf)
 		return false;
 }
 
-static void
+static bool
 smb2_is_network_name_deleted(char *buf, struct TCP_Server_Info *server)
 {
 	struct smb2_hdr *shdr = (struct smb2_hdr *)buf;
@@ -2406,7 +2406,7 @@ smb2_is_network_name_deleted(char *buf, struct TCP_Server_Info *server)
 	struct cifs_tcon *tcon;
 
 	if (shdr->Status != STATUS_NETWORK_NAME_DELETED)
-		return;
+		return false;
 
 	/* If server is a channel, select the primary channel */
 	pserver = CIFS_SERVER_IS_CHAN(server) ? server->primary_server : server;
@@ -2421,11 +2421,13 @@ smb2_is_network_name_deleted(char *buf, struct TCP_Server_Info *server)
 				spin_unlock(&cifs_tcp_ses_lock);
 				pr_warn_once("Server share %s deleted.\n",
 					     tcon->tree_name);
-				return;
+				return true;
 			}
 		}
 	}
 	spin_unlock(&cifs_tcp_ses_lock);
+
+	return false;
 }
 
 static int
