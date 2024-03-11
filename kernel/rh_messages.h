@@ -50,11 +50,13 @@ static const char *rh_deprecated_drivers[] = {
 	"aacraid",
 	"af_key",
 	"firewire-core",
+	"qla4xxx",
 	"team",
 	0     /* Terminating entry */
 };
 
 static const char *rh_deprecated_init_fns[] = {
+	"qla4xxx_module_init",
 	"team_module_init",
 	"fw_core_init",
 	"ipsec_pfkey_init",
