@@ -200,7 +200,7 @@ struct acpi_resource_fixed_dma {
 
 struct acpi_resource_vendor {
 	u16 byte_length;
-	u8 byte_data[1];
+	u8 byte_data[];
 };
 
 /* Vendor resource with UUID info (introduced in ACPI 3.0) */
@@ -209,7 +209,7 @@ struct acpi_resource_vendor_typed {
 	u16 byte_length;
 	u8 uuid_subtype;
 	u8 uuid[ACPI_UUID_LENGTH];
-	u8 byte_data[1];
+	u8 byte_data[];
 };
 
 struct acpi_resource_end_tag {
