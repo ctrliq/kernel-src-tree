@@ -1,4 +1,4 @@
-#! /bin/sh
+#! /bin/bash
 
 die()
 {
@@ -83,9 +83,13 @@ ark_git_rebase()
 	_upstream="$2"
 	_base="$3"
 
+	# GIT_SEQUENCE_EDITOR is used to filter out some commits
+	# This requires interactive mode to work, so force it on.
+	test -n "$GIT_SEQUENCE_EDITOR" && interactive=(-i) || interactive=()
+
 	prev_branch="$(git rev-parse --abbrev-ref HEAD)"
 	git checkout "${rebase_branch}"
-	if ! git rebase --onto "$_base" "$_upstream"; then
+	if ! git rebase "${interactive[@]}" --onto "$_base" "$_upstream"; then
 		git rebase --abort
 		printf "Rebase conflict; halting!\n"
 		printf "To reproduce:\n"
@@ -144,9 +148,10 @@ ark_push_changes()
 	TMPFILE=".push-warnings"
 	touch "$TMPFILE"
 
+	test "$ARK_REBASE" && FORCE=(-f) || FORCE=()
 	test "$TO_PUSH" && PUSH_VERB="Pushing" || PUSH_VERB="To push"
 	PUSH_STR="branch ${push_branch} to ${GITLAB_URL}"
-	PUSH_CMD="git push gitlab ${push_branch}"
+	PUSH_CMD="git push ${FORCE[*]} gitlab ${push_branch}"
 	PUSH_CONFIG_STR="config update branches"
 	PUSH_CONFIG_CMD="for conf_branch in \$(git branch | grep configs/${push_branch}/\"\$(date +%F)\"); do
 				git push \\
