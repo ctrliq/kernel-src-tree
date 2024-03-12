@@ -681,7 +681,7 @@ static void rh_check_supported(void)
 	guest = (x86_hyper_type != X86_HYPER_NATIVE || boot_cpu_has(X86_FEATURE_HYPERVISOR));
 
 	/* RHEL supports single cpu on guests only */
-	if (((boot_cpu_data.x86_max_cores * smp_num_siblings) == 1) &&
+	if (((topology_num_threads_per_package() * __max_threads_per_core) == 1) &&
 	    !guest && is_kdump_kernel()) {
 		pr_crit("Detected single cpu native boot.\n");
 		pr_crit("Important:  In this kernel, single threaded, single CPU 64-bit physical systems are unsupported.");
