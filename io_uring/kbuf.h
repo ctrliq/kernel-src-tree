@@ -28,7 +28,7 @@ struct io_buffer_list {
 	atomic_t refs;
 
 	/* ring mapped provided buffers */
-	__u8 is_mapped;
+	__u8 is_buf_ring;
 	/* ring mapped provided buffers, but mmap'ed by application */
 	__u8 is_mmap;
 };
