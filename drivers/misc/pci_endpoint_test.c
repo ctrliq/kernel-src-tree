@@ -837,7 +837,7 @@ static int pci_endpoint_test_probe(struct pci_dev *pdev,
 
 	pci_set_drvdata(pdev, test);
 
-	id = ida_simple_get(&pci_endpoint_test_ida, 0, 0, GFP_KERNEL);
+	id = ida_alloc(&pci_endpoint_test_ida, GFP_KERNEL);
 	if (id < 0) {
 		err = id;
 		dev_err(dev, "Unable to get id\n");
@@ -884,7 +884,7 @@ err_kfree_test_name:
 	kfree(test->name);
 
 err_ida_remove:
-	ida_simple_remove(&pci_endpoint_test_ida, id);
+	ida_free(&pci_endpoint_test_ida, id);
 
 err_iounmap:
 	for (bar = 0; bar < PCI_STD_NUM_BARS; bar++) {
@@ -920,7 +920,7 @@ static void pci_endpoint_test_remove(struct pci_dev *pdev)
 	misc_deregister(&test->miscdev);
 	kfree(misc_device->name);
 	kfree(test->name);
-	ida_simple_remove(&pci_endpoint_test_ida, id);
+	ida_free(&pci_endpoint_test_ida, id);
 	for (bar = 0; bar < PCI_STD_NUM_BARS; bar++) {
 		if (test->bar[bar])
 			pci_iounmap(pdev, test->bar[bar]);
