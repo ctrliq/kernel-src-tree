@@ -1460,6 +1460,16 @@ struct blk_holder_ops {
 	 * Sync the file system mounted on the block device.
 	 */
 	void (*sync)(struct block_device *bdev);
+
+	/*
+	 * If needed, get a reference to the holder.
+	 */
+	void (*get_holder)(void *holder);
+
+	/*
+	 * Release the holder.
+	 */
+	void (*put_holder)(void *holder);
 };
 
 extern const struct blk_holder_ops fs_holder_ops;
