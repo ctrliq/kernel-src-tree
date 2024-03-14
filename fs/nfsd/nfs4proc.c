@@ -1369,7 +1369,7 @@ try_again:
 		/* found a match */
 		if (ni->nsui_busy) {
 			/*  wait - and try again */
-			prepare_to_wait(&nn->nfsd_ssc_waitq, &wait, TASK_IDLE);
+			prepare_to_wait(&nn->nfsd_ssc_waitq, &wait, TASK_INTERRUPTIBLE);
 			spin_unlock(&nn->nfsd_ssc_lock);
 
 			/* allow 20secs for mount/unmount for now - revisit */
