@@ -781,7 +781,7 @@ err_pm_disable:
 	return ret;
 }
 
-static int knav_dma_remove(struct platform_device *pdev)
+static void knav_dma_remove(struct platform_device *pdev)
 {
 	struct knav_dma_device *dma;
 
@@ -792,8 +792,6 @@ static int knav_dma_remove(struct platform_device *pdev)
 
 	pm_runtime_put_sync(&pdev->dev);
 	pm_runtime_disable(&pdev->dev);
-
-	return 0;
 }
 
 static struct of_device_id of_match[] = {
@@ -805,7 +803,7 @@ MODULE_DEVICE_TABLE(of, of_match);
 
 static struct platform_driver knav_dma_driver = {
 	.probe	= knav_dma_probe,
-	.remove	= knav_dma_remove,
+	.remove_new = knav_dma_remove,
 	.driver = {
 		.name		= "keystone-navigator-dma",
 		.of_match_table	= of_match,
