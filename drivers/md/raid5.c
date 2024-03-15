@@ -6087,8 +6087,7 @@ static bool raid5_make_request(struct mddev *mddev, struct bio * bi)
 			md_write_end(mddev);
 		return true;
 	}
-	if (rw == WRITE)
-		md_account_bio(mddev, &bi);
+	md_account_bio(mddev, &bi);
 
 	add_wait_queue(&conf->wait_for_overlap, &wait);
 	while (1) {
