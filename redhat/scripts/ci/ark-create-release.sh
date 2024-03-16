@@ -23,7 +23,7 @@ MR_PATCHES=$(gitlab project-merge-request list --project-id="$PROJECT_ID" \
 	--labels="Include in Releases" --state=opened | grep -v "^$" | sort | \
 	awk '{ print "https://gitlab.com/cki-project/kernel-ark/-/merge_requests/" $2 ".patch" }')
 for patch_url in $MR_PATCHES; do
-	curl -sL "$patch_url" | git am
+	curl -sL "$patch_url" | git am -3
 done
 
 # if dist-release doesn't update anything, then there is a good chance the
