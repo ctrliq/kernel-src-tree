@@ -1,10 +1,21 @@
 #!/bin/bash
 set -e
+
+function in_names()
+{
+	local name
+	for name in "${names[@]}"; do
+		[[ $1 != "$name" ]] || return 0
+	done
+	return 1
+}
+
 if ! git rev-parse --verify main >& /dev/null; then
 	git fetch origin main
 	git branch --track main origin/main
 fi
-if test -n "$(git diff --name-status main | grep owners.yaml)" && \
+IFS=$'\n' names=($(git diff --name-only main))
+if in_names info/owners.yaml && \
 	test "$(git config --get owners.warning)" != "false"; then
 	echo "======================================================="
 	echo "These changes include owners.yaml modifications.  Please"
@@ -39,7 +50,7 @@ if test -n "$(git diff main | grep "^+" | grep "\s\- rhel-sst-null" )"; then
 	echo "ERROR: New entries cannot set devel-sst to rhel-sst-null."
 	exit 1
 fi
-if test -n "$(git diff --name-status main | grep validSSTNames.go)" && \
+if in_names scripts/validSSTNames.go && \
 	test "$(git config --get validsstnames.warning)" != "false"; then
 	echo "======================================================="
 	echo "These changes include validSSTNames.go changes.  You must ensure"
