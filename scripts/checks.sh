@@ -15,6 +15,20 @@ if ! git rev-parse --verify main >& /dev/null; then
 	git branch --track main origin/main
 fi
 IFS=$'\n' names=($(git diff --name-only main))
+if in_names info/owners.yaml; then
+	for name in "${names[@]}"; do
+		[[ $name != info/owners.yaml && $name != info/RHMAINTAINERS &&
+		   $name != info/CODEOWNERS ]] || continue
+		echo "======================================================="
+		echo "These changes include owners.yaml modifications together with other"
+		echo "changes.  As a safeguard against mistakes, this is not allowed."
+		echo
+		echo "If you need to do infrastructure changes please submit two separate"
+		echo "merge requests, one for owners.yaml and one for the rest."
+		echo "======================================================="
+		exit 1
+	done
+fi
 if in_names info/owners.yaml && \
 	test "$(git config --get owners.warning)" != "false"; then
 	echo "======================================================="
