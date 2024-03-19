@@ -2,7 +2,7 @@
 set -e
 if ! git rev-parse --verify main >& /dev/null; then
 	git fetch origin main
-	git checkout -b main --track origin/main -b main
+	git branch --track main origin/main
 fi
 if test -n "$(git diff --name-status main | grep owners.yaml)" && \
 	test "$(git config --get owners.warning)" != "false"; then
