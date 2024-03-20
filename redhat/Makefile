@@ -816,6 +816,9 @@ dist-check-licenses:
 		echo "dist-check-licenses: The bats package is not installed" ; \
 	fi
 
+dist-maint-update:
+	@cd ..; $(REDHAT)/scripts/merge-subtrees.sh || \
+		(echo "Unable merge documentation subtree"; exit 1)
 dist-help:
 	@echo  'Cleaning targets:'
 	@echo  '  dist-clean          - Clean redhat/configs/ and redhat/rpm/ directories.'
@@ -941,6 +944,7 @@ dist-full-help:
 	@echo  '  dist-check-licenses - Runs license selftest checking SPDX-License-Identifier:'
 	@echo  '                        tags in all source files against `License:` field in the'
 	@echo  '                        specfile template.'
+	@echo  '  dist-maint-update - Runs merge-subtrees.sh from the redhat/scripts/ directory'
 	@echo  ''
 
 export
