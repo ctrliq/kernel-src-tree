@@ -113,7 +113,7 @@ From the release branch/tag, run:
    # localversion sets the buildid, releases should have an empty build id
    rm localversion
    touch localversion
-   make dist-dist-git
+   make dist-git
 
    cd /tmp/RHEL*/kernel
    git commit -a -s -F ../changelog
