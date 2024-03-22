@@ -1922,6 +1922,7 @@ static int iaa_crypto_probe(struct idxd_dev *idxd_dev)
 		}
 		try_module_get(THIS_MODULE);
 
+		mark_tech_preview("Intel IAA Compression Accelerator (IAA)", THIS_MODULE);
 		pr_info("iaa_crypto now ENABLED\n");
 	}
 
