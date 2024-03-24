@@ -6352,44 +6352,7 @@ static void __init restrict_unbound_cpumask(const char *name, const struct cpuma
 	cpumask_and(wq_unbound_cpumask, wq_unbound_cpumask, mask);
 }
 
-static void __init wq_pod_init(void)
-{
-	cpumask_var_t *tbl;
-	int node, cpu;
-
-	if (num_possible_nodes() <= 1)
-		return;
-
-	for_each_possible_cpu(cpu) {
-		if (WARN_ON(cpu_to_node(cpu) == NUMA_NO_NODE)) {
-			pr_warn("workqueue: NUMA node mapping not available for cpu%d, disabling NUMA support\n", cpu);
-			return;
-		}
-	}
-
-	wq_update_pod_attrs_buf = alloc_workqueue_attrs();
-	BUG_ON(!wq_update_pod_attrs_buf);
-
-	/*
-	 * We want masks of possible CPUs of each node which isn't readily
-	 * available.  Build one from cpu_to_node() which should have been
-	 * fully initialized by now.
-	 */
-	tbl = kcalloc(nr_node_ids, sizeof(tbl[0]), GFP_KERNEL);
-	BUG_ON(!tbl);
-
-	for_each_node(node)
-		BUG_ON(!zalloc_cpumask_var_node(&tbl[node], GFP_KERNEL,
-				node_online(node) ? node : NUMA_NO_NODE));
-
-	for_each_possible_cpu(cpu) {
-		node = cpu_to_node(cpu);
-		cpumask_set_cpu(cpu, tbl[node]);
-	}
-
-	wq_pod_cpus = tbl;
-	wq_pod_enabled = true;
-}
+static void wq_pod_init(void);
 
 /**
  * workqueue_init_early - early init for workqueue subsystem
@@ -6571,6 +6534,45 @@ void __init workqueue_init(void)
 
 	wq_online = true;
 	wq_watchdog_init();
+}
+
+static void __init wq_pod_init(void)
+{
+	cpumask_var_t *tbl;
+	int node, cpu;
+
+	if (num_possible_nodes() <= 1)
+		return;
+
+	for_each_possible_cpu(cpu) {
+		if (WARN_ON(cpu_to_node(cpu) == NUMA_NO_NODE)) {
+			pr_warn("workqueue: NUMA node mapping not available for cpu%d, disabling NUMA support\n", cpu);
+			return;
+		}
+	}
+
+	wq_update_pod_attrs_buf = alloc_workqueue_attrs();
+	BUG_ON(!wq_update_pod_attrs_buf);
+
+	/*
+	 * We want masks of possible CPUs of each node which isn't readily
+	 * available.  Build one from cpu_to_node() which should have been
+	 * fully initialized by now.
+	 */
+	tbl = kcalloc(nr_node_ids, sizeof(tbl[0]), GFP_KERNEL);
+	BUG_ON(!tbl);
+
+	for_each_node(node)
+		BUG_ON(!zalloc_cpumask_var_node(&tbl[node], GFP_KERNEL,
+				node_online(node) ? node : NUMA_NO_NODE));
+
+	for_each_possible_cpu(cpu) {
+		node = cpu_to_node(cpu);
+		cpumask_set_cpu(cpu, tbl[node]);
+	}
+
+	wq_pod_cpus = tbl;
+	wq_pod_enabled = true;
 }
 
 void __warn_flushing_systemwide_wq(void)
