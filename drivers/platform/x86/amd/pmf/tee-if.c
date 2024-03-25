@@ -254,8 +254,10 @@ static int amd_pmf_start_policy_engine(struct amd_pmf_dev *dev)
 
 	header = (struct cookie_header *)(dev->policy_buf + POLICY_COOKIE_OFFSET);
 
-	if (header->sign != POLICY_SIGN_COOKIE || !header->length)
+	if (header->sign != POLICY_SIGN_COOKIE || !header->length) {
+		dev_dbg(dev->dev, "cookie doesn't match\n");
 		return -EINVAL;
+	}
 
 	if (dev->policy_sz < header->length + 512)
 		return -EINVAL;
