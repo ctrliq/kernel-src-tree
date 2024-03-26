@@ -111,7 +111,7 @@ function merge_configs()
 	sort config-merging."$count" >> "$name"
 
 	gcc_version=$(echo __GNUC__ | gcc -E -xc - | grep -v "#")
-	if [ "$arch" != "aarch64" ] && [ "$gcc_version" -eq 11 ] && [ -n "$ENABLE_WERROR" ]; then
+	if [ "$gcc_version" -eq 11 ] && [ -n "$ENABLE_WERROR" ]; then
 		sed -i "s|# CONFIG_WERROR is not set|CONFIG_WERROR=y|g" "$name"
 	fi
 
