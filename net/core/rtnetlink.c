@@ -3305,7 +3305,7 @@ static int rtnl_dellink(struct sk_buff *skb, struct nlmsghdr *nlh,
 		goto out;
 
 	if (!dev) {
-		if (tb[IFLA_IFNAME] || ifm->ifi_index > 0)
+		if (tb[IFLA_IFNAME] || tb[IFLA_ALT_IFNAME] || ifm->ifi_index > 0)
 			err = -ENODEV;
 
 		goto out;
