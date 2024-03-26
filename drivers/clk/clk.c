@@ -1468,6 +1468,7 @@ static void clk_core_init_rate_req(struct clk_core * const core,
 	if (!core)
 		return;
 
+	req->core = core;
 	req->rate = rate;
 	clk_core_get_boundaries(core, &req->min_rate, &req->max_rate);
 
