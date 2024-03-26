@@ -57,8 +57,6 @@ COND_SYSCALL(io_uring_register);
 /* fs/dcache.c */
 
 /* fs/cookies.c */
-COND_SYSCALL(lookup_dcookie);
-COND_SYSCALL_COMPAT(lookup_dcookie);
 
 /* fs/eventfd.c */
 COND_SYSCALL(eventfd2);

@@ -153,7 +153,7 @@ SECTIONS
 		ALIGN_ENTRY_TEXT_END
 		*(.gnu.warning)
 
-	} :text =0xcccc
+	} :text = 0xcccccccc
 
 	/* End of text section, which should occupy whole number of pages */
 	_etext = .;
@@ -314,6 +314,15 @@ SECTIONS
 		__ibt_endbr_seal = .;
 		*(.ibt_endbr_seal)
 		__ibt_endbr_seal_end = .;
+	}
+#endif
+
+#ifdef CONFIG_FINEIBT
+	. = ALIGN(8);
+	.cfi_sites : AT(ADDR(.cfi_sites) - LOAD_OFFSET) {
+		__cfi_sites = .;
+		*(.cfi_sites)
+		__cfi_sites_end = .;
 	}
 #endif
 

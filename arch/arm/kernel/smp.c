@@ -766,21 +766,13 @@ void smp_send_stop(void)
  * kdump fails. So split out the panic_smp_self_stop() and add
  * set_cpu_online(smp_processor_id(), false).
  */
-void panic_smp_self_stop(void)
+void __noreturn panic_smp_self_stop(void)
 {
 	pr_debug("CPU %u will stop doing anything useful since another CPU has paniced\n",
 	         smp_processor_id());
 	set_cpu_online(smp_processor_id(), false);
 	while (1)
 		cpu_relax();
-}
-
-/*
- * not supported here
- */
-int setup_profiling_timer(unsigned int multiplier)
-{
-	return -EINVAL;
 }
 
 #ifdef CONFIG_CPU_FREQ

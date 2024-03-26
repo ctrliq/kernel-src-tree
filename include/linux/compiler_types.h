@@ -86,8 +86,6 @@ static inline void __chk_io_ptr(const volatile void __iomem *ptr) { }
 /* Compiler specific macros. */
 #ifdef __clang__
 #include <linux/compiler-clang.h>
-#elif defined(__INTEL_COMPILER)
-#include <linux/compiler-intel.h>
 #elif defined(__GNUC__)
 /* The above compilers also define __GNUC__, so order is important here. */
 #include <linux/compiler-gcc.h>
@@ -259,15 +257,15 @@ __no_sanitize_memory
 # define __latent_entropy
 #endif
 
-#ifndef __randomize_layout
+#if defined(RANDSTRUCT) && !defined(__CHECKER__)
+# define __randomize_layout __designated_init __attribute__((randomize_layout))
+# define __no_randomize_layout __attribute__((no_randomize_layout))
+/* This anon struct can add padding, so only enable it under randstruct. */
+# define randomized_struct_fields_start	struct {
+# define randomized_struct_fields_end	} __randomize_layout;
+#else
 # define __randomize_layout __designated_init
-#endif
-
-#ifndef __no_randomize_layout
 # define __no_randomize_layout
-#endif
-
-#ifndef randomized_struct_fields_start
 # define randomized_struct_fields_start
 # define randomized_struct_fields_end
 #endif

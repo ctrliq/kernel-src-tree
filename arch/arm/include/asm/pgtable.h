@@ -242,7 +242,7 @@ static inline pte_t pte_wrprotect(pte_t pte)
 	return set_pte_bit(pte, __pgprot(L_PTE_RDONLY));
 }
 
-static inline pte_t pte_mkwrite(pte_t pte)
+static inline pte_t pte_mkwrite_novma(pte_t pte)
 {
 	return clear_pte_bit(pte, __pgprot(L_PTE_RDONLY));
 }
@@ -314,10 +314,6 @@ static inline pte_t pte_modify(pte_t pte, pgprot_t newprot)
  * is increased beyond what we presently support.
  */
 #define MAX_SWAPFILES_CHECK() BUILD_BUG_ON(MAX_SWAPFILES_SHIFT > __SWP_TYPE_BITS)
-
-/* Needs to be defined here and not in linux/mm.h, as it is arch dependent */
-/* FIXME: this is not correct */
-#define kern_addr_valid(addr)	(1)
 
 /*
  * We provide our own arch_get_unmapped_area to cope with VIPT caches.

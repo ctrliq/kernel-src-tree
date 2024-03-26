@@ -151,7 +151,6 @@ static u32 __amode31_ref *__ctl_duald = __ctl_duald_amode31;
 static u32 __amode31_ref *__ctl_linkage_stack = __ctl_linkage_stack_amode31;
 static u32 __amode31_ref *__ctl_duct = __ctl_duct_amode31;
 
-int __bootdata(noexec_disabled);
 unsigned long __bootdata(ident_map_size);
 struct mem_detect_info __bootdata(mem_detect);
 struct initrd_data __bootdata(initrd_data);
@@ -399,7 +398,7 @@ int __init arch_early_irq_init(void)
 	return 0;
 }
 
-void __init arch_call_rest_init(void)
+void __init __noreturn arch_call_rest_init(void)
 {
 	unsigned long stack;
 

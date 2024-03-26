@@ -90,6 +90,12 @@ DEFINE_ENTRY(pud, pud, init)
 DEFINE_ENTRY(pmd, pmd, init)
 DEFINE_ENTRY(pte, pte, init)
 
+static inline pgprot_t prot_sethuge(pgprot_t prot)
+{
+	WARN_ON_ONCE(pgprot_val(prot) & _PAGE_PAT);
+
+	return __pgprot(pgprot_val(prot) | _PAGE_PSE);
+}
 
 /*
  * NOTE: pagetable_init alloc all the fixmap pagetables contiguous on the
@@ -110,7 +116,6 @@ int force_personality32;
 /*
  * noexec32=on|off
  * Control non executable heap for 32bit processes.
- * To control the stack too use noexec=off
  *
  * on	PROT_READ does not imply PROT_EXEC for 32-bit processes (default)
  * off	PROT_READ implies PROT_EXEC
@@ -558,9 +563,8 @@ phys_pmd_init(pmd_t *pmd_page, unsigned long paddr, unsigned long paddr_end,
 		if (page_size_mask & (1<<PG_LEVEL_2M)) {
 			pages++;
 			spin_lock(&init_mm.page_table_lock);
-			set_pte_init((pte_t *)pmd,
-				     pfn_pte((paddr & PMD_MASK) >> PAGE_SHIFT,
-					     __pgprot(pgprot_val(prot) | _PAGE_PSE)),
+			set_pmd_init(pmd,
+				     pfn_pmd(paddr >> PAGE_SHIFT, prot_sethuge(prot)),
 				     init);
 			spin_unlock(&init_mm.page_table_lock);
 			paddr_last = paddr_next;
@@ -645,12 +649,8 @@ phys_pud_init(pud_t *pud_page, unsigned long paddr, unsigned long paddr_end,
 		if (page_size_mask & (1<<PG_LEVEL_1G)) {
 			pages++;
 			spin_lock(&init_mm.page_table_lock);
-
-			prot = __pgprot(pgprot_val(prot) | _PAGE_PSE);
-
-			set_pte_init((pte_t *)pud,
-				     pfn_pte((paddr & PUD_MASK) >> PAGE_SHIFT,
-					     prot),
+			set_pud_init(pud,
+				     pfn_pud(paddr >> PAGE_SHIFT, prot_sethuge(prot)),
 				     init);
 			spin_unlock(&init_mm.page_table_lock);
 			paddr_last = paddr_next;
@@ -1288,7 +1288,7 @@ static void __init preallocate_vmalloc_pages(void)
 	unsigned long addr;
 	const char *lvl;
 
-	for (addr = VMALLOC_START; addr <= VMALLOC_END; addr = ALIGN(addr + 1, PGDIR_SIZE)) {
+	for (addr = VMALLOC_START; addr <= VMEMORY_END; addr = ALIGN(addr + 1, PGDIR_SIZE)) {
 		pgd_t *pgd = pgd_offset_k(addr);
 		p4d_t *p4d;
 		pud_t *pud;
@@ -1414,47 +1414,6 @@ void mark_rodata_ro(void)
 				(void *)rodata_end, (void *)_sdata);
 
 	debug_checkwx();
-}
-
-int kern_addr_valid(unsigned long addr)
-{
-	unsigned long above = ((long)addr) >> __VIRTUAL_MASK_SHIFT;
-	pgd_t *pgd;
-	p4d_t *p4d;
-	pud_t *pud;
-	pmd_t *pmd;
-	pte_t *pte;
-
-	if (above != 0 && above != -1UL)
-		return 0;
-
-	pgd = pgd_offset_k(addr);
-	if (pgd_none(*pgd))
-		return 0;
-
-	p4d = p4d_offset(pgd, addr);
-	if (!p4d_present(*p4d))
-		return 0;
-
-	pud = pud_offset(p4d, addr);
-	if (!pud_present(*pud))
-		return 0;
-
-	if (pud_large(*pud))
-		return pfn_valid(pud_pfn(*pud));
-
-	pmd = pmd_offset(pud, addr);
-	if (!pmd_present(*pmd))
-		return 0;
-
-	if (pmd_large(*pmd))
-		return pfn_valid(pmd_pfn(*pmd));
-
-	pte = pte_offset_kernel(pmd, addr);
-	if (pte_none(*pte))
-		return 0;
-
-	return pfn_valid(pte_pfn(*pte));
 }
 
 /*
