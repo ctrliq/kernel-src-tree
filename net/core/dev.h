@@ -47,6 +47,7 @@ extern int		dev_weight_rx_bias;
 extern int		dev_weight_tx_bias;
 
 /* rtnl helpers */
+extern struct list_head net_todo_list;
 void netdev_run_todo(void);
 
 /* netdev management, shared between various uAPI entry points */
