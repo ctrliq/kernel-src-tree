@@ -672,7 +672,7 @@ static bool svc_alloc_arg(struct svc_rqst *rqstp)
 			/* Made progress, don't sleep yet */
 			continue;
 
-		set_current_state(TASK_IDLE);
+		set_current_state(TASK_INTERRUPTIBLE);
 		if (kthread_should_stop()) {
 			set_current_state(TASK_RUNNING);
 			return false;
@@ -732,7 +732,7 @@ static struct svc_xprt *svc_get_next_xprt(struct svc_rqst *rqstp)
 	if (rqstp->rq_xprt)
 		goto out_found;
 
-	set_current_state(TASK_IDLE);
+	set_current_state(TASK_INTERRUPTIBLE);
 	smp_mb__before_atomic();
 	clear_bit(SP_CONGESTED, &pool->sp_flags);
 	clear_bit(RQ_BUSY, &rqstp->rq_flags);
