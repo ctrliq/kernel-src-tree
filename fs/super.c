@@ -1509,27 +1509,9 @@ static void fs_bdev_sync(struct block_device *bdev)
 	super_unlock_shared(sb);
 }
 
-static void fs_bdev_super_get(void *data)
-{
-	struct super_block *sb = data;
-
-	spin_lock(&sb_lock);
-	sb->s_count++;
-	spin_unlock(&sb_lock);
-}
-
-static void fs_bdev_super_put(void *data)
-{
-	struct super_block *sb = data;
-
-	put_super(sb);
-}
-
 const struct blk_holder_ops fs_holder_ops = {
 	.mark_dead		= fs_bdev_mark_dead,
 	.sync			= fs_bdev_sync,
-	.get_holder		= fs_bdev_super_get,
-	.put_holder		= fs_bdev_super_put,
 };
 EXPORT_SYMBOL_GPL(fs_holder_ops);
 
@@ -1554,7 +1536,7 @@ int setup_bdev_super(struct super_block *sb, int sb_flags,
 	 * writable from userspace even for a read-only block device.
 	 */
 	if ((mode & BLK_OPEN_WRITE) && bdev_read_only(bdev)) {
-		fput(bdev_file);
+		bdev_fput(bdev_file);
 		return -EACCES;
 	}
 
@@ -1570,7 +1552,7 @@ int setup_bdev_super(struct super_block *sb, int sb_flags,
 		mutex_unlock(&bdev->bd_fsfreeze_mutex);
 		if (fc)
 			warnf(fc, "%pg: Can't mount, blockdev is frozen", bdev);
-		fput(bdev_file);
+		bdev_fput(bdev_file);
 		return -EBUSY;
 	}
 	spin_lock(&sb_lock);
@@ -1707,7 +1689,7 @@ void kill_block_super(struct super_block *sb)
 	generic_shutdown_super(sb);
 	if (bdev) {
 		sync_blockdev(bdev);
-		fput(sb->s_bdev_file);
+		bdev_fput(sb->s_bdev_file);
 	}
 }
 

@@ -1149,7 +1149,7 @@ journal_found:
 	lbmLogShutdown(log);
 
       close:		/* close external log device */
-	fput(bdev_file);
+	bdev_fput(bdev_file);
 
       free:		/* free log descriptor */
 	mutex_unlock(&jfs_log_mutex);
@@ -1493,7 +1493,7 @@ int lmLogClose(struct super_block *sb)
 	bdev_file = log->bdev_file;
 	rc = lmLogShutdown(log);
 
-	fput(bdev_file);
+	bdev_fput(bdev_file);
 
 	kfree(log);
 
