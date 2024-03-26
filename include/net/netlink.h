@@ -748,6 +748,7 @@ static inline int __nlmsg_parse(const struct nlmsghdr *nlh, int hdrlen,
  * @hdrlen: length of family specific header
  * @tb: destination array with maxtype+1 elements
  * @maxtype: maximum attribute type to be expected
+ * @policy: validation policy
  * @extack: extended ACK report struct
  *
  * See nla_parse()
@@ -767,6 +768,7 @@ static inline int nlmsg_parse(const struct nlmsghdr *nlh, int hdrlen,
  * @hdrlen: length of family specific header
  * @tb: destination array with maxtype+1 elements
  * @maxtype: maximum attribute type to be expected
+ * @policy: validation policy
  * @extack: extended ACK report struct
  *
  * See nla_parse_deprecated()
@@ -786,6 +788,7 @@ static inline int nlmsg_parse_deprecated(const struct nlmsghdr *nlh, int hdrlen,
  * @hdrlen: length of family specific header
  * @tb: destination array with maxtype+1 elements
  * @maxtype: maximum attribute type to be expected
+ * @policy: validation policy
  * @extack: extended ACK report struct
  *
  * See nla_parse_deprecated_strict()
@@ -821,7 +824,6 @@ static inline struct nlattr *nlmsg_find_attr(const struct nlmsghdr *nlh,
  * @len: length of attribute stream
  * @maxtype: maximum attribute type to be expected
  * @policy: validation policy
- * @validate: validation strictness
  * @extack: extended ACK report struct
  *
  * Validates all attributes in the specified attribute stream against the
