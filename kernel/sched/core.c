@@ -6758,11 +6758,14 @@ void __noreturn do_task_dead(void)
 		cpu_relax();
 }
 
-void sched_submit_work(void)
+static inline void sched_submit_work(struct task_struct *tsk)
 {
-	struct task_struct *tsk = current;
-	unsigned int task_flags = tsk->flags;
+	unsigned int task_flags;
 
+	if (task_is_running(tsk))
+		return;
+
+	task_flags = tsk->flags;
 	/*
 	 * If a worker goes to sleep, notify and ask workqueue whether it
 	 * wants to wake up a task to maintain concurrency.
@@ -6788,10 +6791,8 @@ void sched_submit_work(void)
 	blk_flush_plug(tsk->plug, true);
 }
 
-void sched_resume_work(void)
+static void sched_update_worker(struct task_struct *tsk)
 {
-	struct task_struct *tsk = current;
-
 	if (tsk->flags & (PF_WQ_WORKER | PF_IO_WORKER)) {
 		if (tsk->flags & PF_WQ_WORKER)
 			wq_worker_running(tsk);
@@ -6800,28 +6801,19 @@ void sched_resume_work(void)
 	}
 }
 
-static void schedule_loop(unsigned int sched_mode)
-{
-	do {
-		preempt_disable();
-		__schedule(sched_mode);
-		sched_preempt_enable_no_resched();
-	} while (need_resched());
-}
-
 asmlinkage __visible void __sched schedule(void)
 {
-	if (!task_is_running(current))
-		sched_submit_work();
-	schedule_loop(SM_NONE);
-	sched_resume_work();
+	struct task_struct *tsk = current;
+
+	sched_submit_work(tsk);
+	do {
+		preempt_disable();
+		__schedule(SM_NONE);
+		sched_preempt_enable_no_resched();
+	} while (need_resched());
+	sched_update_worker(tsk);
 }
 EXPORT_SYMBOL(schedule);
-
-void schedule_rtmutex(void)
-{
-	schedule_loop(SM_NONE);
-}
 
 /*
  * synchronize_rcu_tasks() makes sure that no task is stuck in preempted
@@ -6882,7 +6874,11 @@ void __sched schedule_preempt_disabled(void)
 #ifdef CONFIG_PREEMPT_RT
 void __sched notrace schedule_rtlock(void)
 {
-	schedule_loop(SM_RTLOCK_WAIT);
+	do {
+		preempt_disable();
+		__schedule(SM_RTLOCK_WAIT);
+		sched_preempt_enable_no_resched();
+	} while (need_resched());
 }
 NOKPROBE_SYMBOL(schedule_rtlock);
 #endif
