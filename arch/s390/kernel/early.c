@@ -207,10 +207,8 @@ static __init void detect_machine_facilities(void)
 	}
 	if (test_facility(51))
 		S390_lowcore.machine_flags |= MACHINE_FLAG_TLB_LC;
-	if (test_facility(129)) {
-		S390_lowcore.machine_flags |= MACHINE_FLAG_VX;
+	if (test_facility(129))
 		__ctl_set_bit(0, 17);
-	}
 	if (test_facility(130)) {
 		S390_lowcore.machine_flags |= MACHINE_FLAG_NX;
 		__ctl_set_bit(0, 20);

@@ -88,7 +88,7 @@ static noinline void __machine_kdump(void *image)
 	}
 	/* Store status of the boot CPU */
 	mcesa = __va(S390_lowcore.mcesad & MCESA_ORIGIN_MASK);
-	if (MACHINE_HAS_VX)
+	if (cpu_has_vx())
 		save_vx_regs((__vector128 *) mcesa->vector_save_area);
 	if (MACHINE_HAS_GS) {
 		__ctl_store(cr2_old.val, 2, 2);
