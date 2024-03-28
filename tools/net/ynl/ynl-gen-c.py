@@ -1048,14 +1048,30 @@ class RenderInfo:
 
 
 class CodeWriter:
-    def __init__(self, nlib, out_file):
+    def __init__(self, nlib, out_file=None):
         self.nlib = nlib
 
         self._nl = False
         self._block_end = False
         self._silent_block = False
         self._ind = 0
-        self._out = out_file
+        if out_file is None:
+            self._out = os.sys.stdout
+        else:
+            self._out = tempfile.TemporaryFile('w+')
+            self._out_file = out_file
+
+    def __del__(self):
+        self.close_out_file()
+
+    def close_out_file(self):
+        if self._out == os.sys.stdout:
+            return
+        with open(self._out_file, 'w+') as out_file:
+            self._out.seek(0)
+            shutil.copyfileobj(self._out, out_file)
+            self._out.close()
+        self._out = os.sys.stdout
 
     @classmethod
     def _is_cond(cls, line):
@@ -2316,10 +2332,8 @@ def main():
     parser.add_argument('--source', dest='header', action='store_false')
     parser.add_argument('--user-header', nargs='+', default=[])
     parser.add_argument('--exclude-op', action='append', default=[])
-    parser.add_argument('-o', dest='out_file', type=str)
+    parser.add_argument('-o', dest='out_file', type=str, default=None)
     args = parser.parse_args()
-
-    tmp_file = tempfile.TemporaryFile('w+') if args.out_file else os.sys.stdout
 
     if args.header is None:
         parser.error("--header or --source is required")
@@ -2344,7 +2358,7 @@ def main():
         print(f'Message enum-model {parsed.msg_id_model} not supported for {args.mode} generation')
         os.sys.exit(1)
 
-    cw = CodeWriter(BaseNlLib(), tmp_file)
+    cw = CodeWriter(BaseNlLib(), args.out_file)
 
     _, spec_kernel = find_kernel_root(args.spec)
     if args.mode == 'uapi' or args.header:
@@ -2593,10 +2607,6 @@ def main():
     if args.header:
         cw.p(f'#endif /* {hdr_prot} */')
 
-    if args.out_file:
-        out_file = open(args.out_file, 'w+')
-        tmp_file.seek(0)
-        shutil.copyfileobj(tmp_file, out_file)
 
 if __name__ == "__main__":
     main()
