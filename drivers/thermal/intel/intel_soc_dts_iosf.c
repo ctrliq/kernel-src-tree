@@ -327,7 +327,7 @@ intel_soc_dts_iosf_init(enum intel_soc_dts_interrupt_type intr_type,
 			bool critical_trip, int crit_offset)
 {
 	struct intel_soc_dts_sensors *sensors;
-	u32 tj_max;
+	int tj_max;
 	int ret;
 	int i;
 
