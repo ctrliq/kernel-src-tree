@@ -530,6 +530,7 @@ struct request_queue {
 #define QUEUE_FLAG_IO_STAT	7	/* do disk/partitions IO accounting */
 #define QUEUE_FLAG_NOXMERGES	9	/* No extended merges */
 #define QUEUE_FLAG_ADD_RANDOM	10	/* Contributes to random pool */
+#define QUEUE_FLAG_SYNCHRONOUS	11	/* always completes in submit context */
 #define QUEUE_FLAG_SAME_FORCE	12	/* force complete on same CPU */
 #define QUEUE_FLAG_HW_WC	13	/* Write back caching supported */
 #define QUEUE_FLAG_INIT_DONE	14	/* queue is initialized */
@@ -737,7 +738,8 @@ static inline int bdev_read_only(struct block_device *bdev)
 }
 
 bool set_capacity_and_notify(struct gendisk *disk, sector_t size);
-bool disk_force_media_change(struct gendisk *disk, unsigned int events);
+void disk_force_media_change(struct gendisk *disk);
+void bdev_mark_dead(struct block_device *bdev, bool surprise);
 
 void add_disk_randomness(struct gendisk *disk) __latent_entropy;
 void rand_initialize_disk(struct gendisk *disk);
@@ -796,13 +798,11 @@ int __register_blkdev(unsigned int major, const char *name,
 void unregister_blkdev(unsigned int major, const char *name);
 
 bool disk_check_media_change(struct gendisk *disk);
-int __invalidate_device(struct block_device *bdev, bool kill_dirty);
 void set_capacity(struct gendisk *disk, sector_t size);
 
 #ifdef CONFIG_BLOCK_HOLDER_DEPRECATED
 int bd_link_disk_holder(struct block_device *bdev, struct gendisk *disk);
 void bd_unlink_disk_holder(struct block_device *bdev, struct gendisk *disk);
-int bd_register_pending_holders(struct gendisk *disk);
 #else
 static inline int bd_link_disk_holder(struct block_device *bdev,
 				      struct gendisk *disk)
@@ -812,10 +812,6 @@ static inline int bd_link_disk_holder(struct block_device *bdev,
 static inline void bd_unlink_disk_holder(struct block_device *bdev,
 					 struct gendisk *disk)
 {
-}
-static inline int bd_register_pending_holders(struct gendisk *disk)
-{
-	return 0;
 }
 #endif /* CONFIG_BLOCK_HOLDER_DEPRECATED */
 
@@ -1224,6 +1220,12 @@ static inline bool bdev_nonrot(struct block_device *bdev)
 	return blk_queue_nonrot(bdev_get_queue(bdev));
 }
 
+static inline bool bdev_synchronous(struct block_device *bdev)
+{
+	return test_bit(QUEUE_FLAG_SYNCHRONOUS,
+			&bdev_get_queue(bdev)->queue_flags);
+}
+
 static inline bool bdev_stable_writes(struct block_device *bdev)
 {
 	return test_bit(QUEUE_FLAG_STABLE_WRITES,
@@ -1359,7 +1361,6 @@ struct block_device_operations {
 			unsigned int flags);
 	int (*open)(struct gendisk *disk, blk_mode_t mode);
 	void (*release)(struct gendisk *disk);
-	int (*rw_page)(struct block_device *, sector_t, struct page *, enum req_op);
 	int (*ioctl)(struct block_device *bdev, blk_mode_t mode,
 			unsigned cmd, unsigned long arg);
 	int (*compat_ioctl)(struct block_device *bdev, blk_mode_t mode,
@@ -1400,10 +1401,6 @@ extern int blkdev_compat_ptr_ioctl(struct block_device *, blk_mode_t,
 #else
 #define blkdev_compat_ptr_ioctl NULL
 #endif
-
-extern int bdev_read_page(struct block_device *, sector_t, struct page *);
-extern int bdev_write_page(struct block_device *, sector_t, struct page *,
-						struct writeback_control *);
 
 static inline void blk_wake_io_task(struct task_struct *waiter)
 {
@@ -1454,8 +1451,15 @@ void blkdev_show(struct seq_file *seqf, off_t offset);
 #endif
 
 struct blk_holder_ops {
-	void (*mark_dead)(struct block_device *bdev);
+	void (*mark_dead)(struct block_device *bdev, bool surprise);
+
+	/*
+	 * Sync the file system mounted on the block device.
+	 */
+	void (*sync)(struct block_device *bdev);
 };
+
+extern const struct blk_holder_ops fs_holder_ops;
 
 /*
  * Return the correct open flags for blkdev_get_by_* for super block flags
@@ -1464,14 +1468,25 @@ struct blk_holder_ops {
 #define sb_open_mode(flags) \
 	(BLK_OPEN_READ | (((flags) & SB_RDONLY) ? 0 : BLK_OPEN_WRITE))
 
+struct bdev_handle {
+	struct block_device *bdev;
+	void *holder;
+	blk_mode_t mode;
+};
+
 struct block_device *blkdev_get_by_dev(dev_t dev, blk_mode_t mode, void *holder,
 		const struct blk_holder_ops *hops);
 struct block_device *blkdev_get_by_path(const char *path, blk_mode_t mode,
+		void *holder, const struct blk_holder_ops *hops);
+struct bdev_handle *bdev_open_by_dev(dev_t dev, blk_mode_t mode, void *holder,
+		const struct blk_holder_ops *hops);
+struct bdev_handle *bdev_open_by_path(const char *path, blk_mode_t mode,
 		void *holder, const struct blk_holder_ops *hops);
 int bd_prepare_to_claim(struct block_device *bdev, void *holder,
 		const struct blk_holder_ops *hops);
 void bd_abort_claiming(struct block_device *bdev, void *holder);
 void blkdev_put(struct block_device *bdev, void *holder);
+void bdev_release(struct bdev_handle *handle);
 
 /* just for blk-cgroup, don't use elsewhere */
 struct block_device *blkdev_get_no_open(dev_t dev);
@@ -1514,8 +1529,6 @@ static inline int early_lookup_bdev(const char *pathname, dev_t *dev)
 	return -EINVAL;
 }
 #endif /* CONFIG_BLOCK */
-
-int fsync_bdev(struct block_device *bdev);
 
 int freeze_bdev(struct block_device *bdev);
 int thaw_bdev(struct block_device *bdev);
