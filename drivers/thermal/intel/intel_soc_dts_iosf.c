@@ -344,7 +344,7 @@ intel_soc_dts_iosf_init(enum intel_soc_dts_interrupt_type intr_type,
 	spin_lock_init(&sensors->intr_notify_lock);
 	mutex_init(&sensors->dts_update_lock);
 	sensors->intr_type = intr_type;
-	sensors->tj_max = tj_max;
+	sensors->tj_max = tj_max * 1000;
 
 	for (i = 0; i < SOC_MAX_DTS_SENSORS; ++i) {
 		enum thermal_trip_type trip_type;
