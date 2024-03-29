@@ -828,8 +828,9 @@ __acquires(&gl->gl_lockref.lock)
 {
 	struct gfs2_holder *gh;
 
-	if (test_and_set_bit(GLF_LOCK, &gl->gl_flags))
+	if (test_bit(GLF_LOCK, &gl->gl_flags))
 		return;
+	set_bit(GLF_LOCK, &gl->gl_flags);
 
 	/*
 	 * The GLF_DEMOTE_IN_PROGRESS flag is only set intermittently during
