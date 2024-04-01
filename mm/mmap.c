@@ -2697,6 +2697,8 @@ cannot_expand:
 		error = -EINVAL;
 		if (file)
 			goto close_and_free_vma;
+		else if (vma->vm_file)
+			goto unmap_and_free_vma;
 		else
 			goto free_vma;
 	}
@@ -2705,6 +2707,8 @@ cannot_expand:
 		error = -ENOMEM;
 		if (file)
 			goto close_and_free_vma;
+		else if (vma->vm_file)
+			goto unmap_and_free_vma;
 		else
 			goto free_vma;
 	}
@@ -2774,7 +2778,7 @@ unmap_and_free_vma:
 
 	/* Undo any partial mapping done by a device driver. */
 	unmap_region(mm, mas.tree, vma, prev, next, vma->vm_start, vma->vm_end);
-	if (vm_flags & VM_SHARED)
+	if (file && (vm_flags & VM_SHARED))
 		mapping_unmap_writable(file->f_mapping);
 free_vma:
 	vm_area_free(vma);
