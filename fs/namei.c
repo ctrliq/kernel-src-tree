@@ -5148,7 +5148,7 @@ int __page_symlink(struct inode *inode, const char *symname, int len, int nofs)
 	struct address_space *mapping = inode->i_mapping;
 	const struct address_space_operations *aops = mapping->a_ops;
 	struct page *page;
-	void *fsdata;
+	void *fsdata = NULL;
 	int err;
 	unsigned int flags;
 
