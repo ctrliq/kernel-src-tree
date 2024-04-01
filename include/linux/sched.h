@@ -889,7 +889,6 @@ struct task_struct {
 	struct mm_struct		*active_mm;
 
 	/* Per-thread vma caching: */
-	struct vmacache			vmacache;
 
 	int				exit_state;
 	int				exit_code;
