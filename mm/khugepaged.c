@@ -1463,7 +1463,7 @@ int collapse_pte_mapped_thp(struct mm_struct *mm, unsigned long addr,
 			    bool install_pmd)
 {
 	unsigned long haddr = addr & HPAGE_PMD_MASK;
-	struct vm_area_struct *vma = find_vma(mm, haddr);
+	struct vm_area_struct *vma = vma_lookup(mm, haddr);
 	struct page *hpage;
 	pte_t *start_pte, *pte;
 	pmd_t *pmd;
