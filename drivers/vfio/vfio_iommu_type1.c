@@ -1675,7 +1675,7 @@ out_unlock:
 
 static int vfio_bus_type(struct device *dev, void *data)
 {
-	struct bus_type **bus = data;
+	const struct bus_type **bus = data;
 
 	if (*bus && *bus != dev->bus)
 		return -EINVAL;
@@ -1976,7 +1976,7 @@ static void vfio_iommu_detach_group(struct vfio_domain *domain,
 		iommu_detach_group(domain->domain, group->iommu_group);
 }
 
-static bool vfio_bus_is_mdev(struct bus_type *bus)
+static bool vfio_bus_is_mdev(const struct bus_type *bus)
 {
 	struct bus_type *mdev_bus;
 	bool ret = false;
@@ -2267,7 +2267,7 @@ static int vfio_iommu_type1_attach_group(void *iommu_data,
 
 	if (type == VFIO_EMULATED_IOMMU) {
 		/* RHEL-only - BEGIN */
-		struct bus_type *bus = NULL;
+		const struct bus_type *bus = NULL;
 
 		ret = iommu_group_for_each_dev(iommu_group, &bus, vfio_bus_type);
 
