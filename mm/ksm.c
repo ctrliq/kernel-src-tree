@@ -114,7 +114,7 @@
 
 /**
  * struct ksm_mm_slot - ksm information per mm that is being scanned
- * @slot: hash lookup from mm to mm_slot
+ * @link: link to the mm_slots hash list
  * @rmap_list: head for this mm_slot's singly-linked list of rmap_items
  */
 struct ksm_mm_slot {
