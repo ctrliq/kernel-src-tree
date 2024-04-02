@@ -1824,6 +1824,8 @@ void bond_xdp_set_features(struct net_device *bond_dev)
 	bond_for_each_slave(bond, slave, iter)
 		val &= slave->dev->xdp_features;
 
+	val &= ~NETDEV_XDP_ACT_XSK_ZEROCOPY;
+
 	xdp_set_features_flag(bond_dev, val);
 }
 
@@ -5918,9 +5920,6 @@ void bond_setup(struct net_device *bond_dev)
 	if (bond_sk_check(bond))
 		bond_dev->features |= BOND_TLS_FEATURES;
 #endif
-
-	if (bond_xdp_check(bond))
-		bond_dev->xdp_features = NETDEV_XDP_ACT_MASK;
 }
 
 /* Destroy a bonding device.
