@@ -257,12 +257,6 @@ int xfrm_dev_state_add(struct net *net, struct xfrm_state *x,
 		return -EINVAL;
 	}
 
-	/* We don't yet support UDP encapsulation and TFC padding. */
-	if (x->encap || x->tfcpad) {
-		NL_SET_ERR_MSG(extack, "Encapsulation and TFC padding can't be offloaded");
-		return -EINVAL;
-	}
-
 	if (xuo->flags &
 	    ~(XFRM_OFFLOAD_IPV6 | XFRM_OFFLOAD_INBOUND | XFRM_OFFLOAD_PACKET)) {
 		NL_SET_ERR_MSG(extack, "Unrecognized flags in offload request");
@@ -272,6 +266,12 @@ int xfrm_dev_state_add(struct net *net, struct xfrm_state *x,
 	is_packet_offload = xuo->flags & XFRM_OFFLOAD_PACKET;
 	if (is_packet_offload)
 		xfrm_packet_offload_tech_preview();
+
+	/* We don't yet support UDP encapsulation and TFC padding. */
+	if ((!is_packet_offload && x->encap) || x->tfcpad) {
+		NL_SET_ERR_MSG(extack, "Encapsulation and TFC padding can't be offloaded");
+		return -EINVAL;
+	}
 
 	dev = dev_get_by_index(net, xuo->ifindex);
 	if (!dev) {
