@@ -736,7 +736,7 @@ static void rh_check_supported(void)
 		   !boot_cpu_has(X86_FEATURE_FMA) ||
 		   /* LZCNT is not explicitly listed, but appears to be paired with BMI2 */
 		   !boot_cpu_has(X86_FEATURE_MOVBE) ||
-		   !boot_cpu_has(X86_FEATURE_OSXSAVE)) {
+		   !boot_cpu_has(X86_FEATURE_XSAVE)) {
 		mark_hardware_deprecated("x86_64-v2", "%s:%s",
 					 boot_cpu_data.x86_vendor_id, boot_cpu_data.x86_model_id);
 	}
