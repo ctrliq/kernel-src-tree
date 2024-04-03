@@ -2214,4 +2214,17 @@ static inline struct scatterlist *cifs_sg_set_buf(struct scatterlist *sg,
 	return sg;
 }
 
+struct smb2_compound_vars {
+	struct cifs_open_parms oparms;
+	struct kvec rsp_iov[3];
+	struct smb_rqst rqst[3];
+	struct kvec open_iov[SMB2_CREATE_IOV_SIZE];
+	struct kvec qi_iov;
+	struct kvec io_iov[SMB2_IOCTL_IOV_SIZE];
+	struct kvec si_iov[SMB2_SET_INFO_IOV_SIZE];
+	struct kvec close_iov;
+	struct smb2_file_rename_info rename_info;
+	struct smb2_file_link_info link_info;
+};
+
 #endif	/* _CIFS_GLOB_H */
