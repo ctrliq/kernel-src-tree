@@ -11,6 +11,7 @@
  */
 
 #include <linux/acpi.h>
+#include <linux/cpu.h>
 #include <linux/device.h>
 #include <linux/kernel.h>
 #include <linux/module.h>

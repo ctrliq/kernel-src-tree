@@ -17,6 +17,14 @@
 
 #include <asm/bootparam.h>
 
+#ifdef CONFIG_X86_MEM_ENCRYPT
+void __init mem_encrypt_init(void);
+void __init mem_encrypt_setup_arch(void);
+#else
+static inline void mem_encrypt_init(void) { }
+static inline void __init mem_encrypt_setup_arch(void) { }
+#endif
+
 #ifdef CONFIG_AMD_MEM_ENCRYPT
 
 extern u64 sme_me_mask;
@@ -37,7 +45,6 @@ void __init sme_map_bootdata(char *real_mode_data);
 void __init sme_unmap_bootdata(char *real_mode_data);
 
 void __init sme_early_init(void);
-void __init sev_setup_arch(void);
 
 void __init sme_encrypt_kernel(struct boot_params *bp);
 void __init sme_enable(struct boot_params *bp);
@@ -67,7 +74,6 @@ static inline void __init sme_map_bootdata(char *real_mode_data) { }
 static inline void __init sme_unmap_bootdata(char *real_mode_data) { }
 
 static inline void __init sme_early_init(void) { }
-static inline void __init sev_setup_arch(void) { }
 
 static inline void __init sme_encrypt_kernel(struct boot_params *bp) { }
 static inline void __init sme_enable(struct boot_params *bp) { }
@@ -86,9 +92,6 @@ static inline void mem_encrypt_free_decrypted_mem(void) { }
 #define __bss_decrypted
 
 #endif	/* CONFIG_AMD_MEM_ENCRYPT */
-
-/* Architecture __weak replacement functions */
-void __init mem_encrypt_init(void);
 
 void add_encrypt_protection_map(void);
 

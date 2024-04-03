@@ -260,13 +260,12 @@ static void __ftrace_sync(void *dummy)
 {
 }
 
-int ftrace_arch_code_modify_post_process(void)
+void ftrace_arch_code_modify_post_process(void)
 {
 	if (ftrace_shared_hotpatch_trampoline(NULL)) {
 		/* Send SIGP to the other CPUs, so they see the new code. */
 		smp_call_function(__ftrace_sync, NULL, 1);
 	}
-	return 0;
 }
 
 #ifdef CONFIG_MODULES

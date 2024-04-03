@@ -43,14 +43,8 @@ static void jump_label_bug(struct jump_entry *entry, struct insn *expected,
 	panic("Corrupted kernel text");
 }
 
-static struct insn orignop = {
-	.opcode = 0xc004,
-	.offset = JUMP_LABEL_NOP_OFFSET >> 1,
-};
-
-static void __jump_label_transform(struct jump_entry *entry,
-				   enum jump_label_type type,
-				   int init)
+static void jump_label_transform(struct jump_entry *entry,
+				 enum jump_label_type type)
 {
 	void *code = (void *)jump_entry_code(entry);
 	struct insn old, new;
@@ -62,13 +56,8 @@ static void __jump_label_transform(struct jump_entry *entry,
 		jump_label_make_branch(entry, &old);
 		jump_label_make_nop(entry, &new);
 	}
-	if (init) {
-		if (memcmp(code, &orignop, sizeof(orignop)))
-			jump_label_bug(entry, &orignop, &new);
-	} else {
-		if (memcmp(code, &old, sizeof(old)))
-			jump_label_bug(entry, &old, &new);
-	}
+	if (memcmp(code, &old, sizeof(old)))
+		jump_label_bug(entry, &old, &new);
 	s390_kernel_write(code, &new, sizeof(new));
 }
 
@@ -79,12 +68,6 @@ static void __jump_label_sync(void *dummy)
 void arch_jump_label_transform(struct jump_entry *entry,
 			       enum jump_label_type type)
 {
-	__jump_label_transform(entry, type, 0);
+	jump_label_transform(entry, type);
 	smp_call_function(__jump_label_sync, NULL, 1);
-}
-
-void arch_jump_label_transform_static(struct jump_entry *entry,
-				      enum jump_label_type type)
-{
-	__jump_label_transform(entry, type, 1);
 }

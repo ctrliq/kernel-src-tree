@@ -186,6 +186,7 @@ static bool __dead_end_function(struct objtool_file *file, struct symbol *func,
 		"__reiserfs_panic",
 		"__stack_chk_fail",
 		"__ubsan_handle_builtin_unreachable",
+		"arch_call_rest_init",
 		"cpu_bringup_and_idle",
 		"cpu_startup_entry",
 		"do_exit",
@@ -193,6 +194,7 @@ static bool __dead_end_function(struct objtool_file *file, struct symbol *func,
 		"do_task_dead",
 		"ex_handler_msr_mce",
 		"fortify_panic",
+		"hlt_play_dead",
 		"hv_ghcb_terminate",
 		"kthread_complete_and_exit",
 		"kthread_exit",
@@ -200,25 +202,34 @@ static bool __dead_end_function(struct objtool_file *file, struct symbol *func,
 		"lbug_with_loc",
 		"machine_real_restart",
 		"make_task_dead",
+		"mpt_halt_firmware",
+		"nmi_panic_self_stop",
 		"panic",
+		"panic_smp_self_stop",
+		"rest_init",
+		"resume_play_dead",
 		"rewind_stack_and_make_dead",
 		"sev_es_terminate",
 		"snp_abort",
+		"start_kernel",
 		"stop_this_cpu",
 		"usercopy_abort",
+		"x86_64_start_kernel",
+		"x86_64_start_reservations",
+		"xen_cpu_bringup_again",
 		"xen_start_kernel",
 	};
 
 	if (!func)
 		return false;
 
-	if (func->bind == STB_WEAK)
-		return false;
-
-	if (func->bind == STB_GLOBAL)
+	if (func->bind == STB_GLOBAL || func->bind == STB_WEAK)
 		for (i = 0; i < ARRAY_SIZE(global_noreturns); i++)
 			if (!strcmp(func->name, global_noreturns[i]))
 				return true;
+
+	if (func->bind == STB_WEAK)
+		return false;
 
 	if (!func->len)
 		return false;
@@ -1358,17 +1369,18 @@ static void annotate_call_site(struct objtool_file *file,
 	if (opts.mcount && sym->fentry) {
 		if (sibling)
 			WARN_FUNC("Tail call to __fentry__ !?!?", insn->sec, insn->offset);
+		if (opts.mnop) {
+			if (reloc) {
+				reloc->type = R_NONE;
+				elf_write_reloc(file->elf, reloc);
+			}
 
-		if (reloc) {
-			reloc->type = R_NONE;
-			elf_write_reloc(file->elf, reloc);
+			elf_write_insn(file->elf, insn->sec,
+				       insn->offset, insn->len,
+				       arch_nop_insn(insn->len));
+
+			insn->type = INSN_NOP;
 		}
-
-		elf_write_insn(file->elf, insn->sec,
-			       insn->offset, insn->len,
-			       arch_nop_insn(insn->len));
-
-		insn->type = INSN_NOP;
 
 		list_add_tail(&insn->call_node, &file->mcount_loc_list);
 		return;
@@ -2242,6 +2254,7 @@ static int read_unwind_hints(struct objtool_file *file)
 
 		cfi.cfa.offset = bswap_if_needed(hint->sp_offset);
 		cfi.type = hint->type;
+		cfi.signal = hint->signal;
 		cfi.end = hint->end;
 
 		insn->cfi = cfi_hash_find_or_add(&cfi);

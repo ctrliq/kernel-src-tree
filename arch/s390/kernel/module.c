@@ -549,6 +549,5 @@ int module_finalize(const Elf_Ehdr *hdr,
 #endif /* CONFIG_FUNCTION_TRACER */
 	}
 
-	jump_label_apply_nops(me);
 	return 0;
 }

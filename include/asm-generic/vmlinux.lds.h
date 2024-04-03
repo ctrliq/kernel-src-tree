@@ -166,6 +166,16 @@
 #define PATCHABLE_DISCARDS	*(__patchable_function_entries)
 #endif
 
+#ifndef CONFIG_ARCH_SUPPORTS_CFI_CLANG
+/*
+ * Simply points to ftrace_stub, but with the proper protocol.
+ * Defined by the linker script in linux/vmlinux.lds.h
+ */
+#define	FTRACE_STUB_HACK	ftrace_stub_graph = ftrace_stub;
+#else
+#define FTRACE_STUB_HACK
+#endif
+
 #ifdef CONFIG_FTRACE_MCOUNT_RECORD
 /*
  * The ftrace call sites are logged to a section whose name depends on the
@@ -182,10 +192,11 @@
 			KEEP(*(__mcount_loc))			\
 			KEEP_PATCHABLE				\
 			__stop_mcount_loc = .;			\
-			ftrace_stub_graph = ftrace_stub;
+			FTRACE_STUB_HACK;
 #else
 # ifdef CONFIG_FUNCTION_TRACER
-#  define MCOUNT_REC()	ftrace_stub_graph = ftrace_stub;
+#  define MCOUNT_REC()	FTRACE_STUB_HACK			\
+		ftrace_stub_graph = ftrace_stub;
 # else
 #  define MCOUNT_REC()
 # endif

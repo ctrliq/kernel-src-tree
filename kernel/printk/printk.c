@@ -84,7 +84,7 @@ EXPORT_SYMBOL(oops_in_progress);
  * provides serialisation for access to the entire console
  * driver system.
  */
-static DEFINE_SEMAPHORE(console_sem);
+static DEFINE_SEMAPHORE(console_sem, 1);
 struct console *console_drivers;
 EXPORT_SYMBOL_GPL(console_drivers);
 

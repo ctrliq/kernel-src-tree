@@ -215,6 +215,7 @@ static int generic_ops_register(void)
 	generic_ops.get_variable = efi.get_variable;
 	generic_ops.get_next_variable = efi.get_next_variable;
 	generic_ops.query_variable_store = efi_query_variable_store;
+	generic_ops.query_variable_info = efi.query_variable_info;
 
 	if (efi_rt_services_supported(EFI_RT_SUPPORTED_SET_VARIABLE)) {
 		generic_ops.set_variable = efi.set_variable;
@@ -441,10 +442,6 @@ static int __init efisubsys_init(void)
 		goto err_unregister;
 	}
 
-	error = efi_runtime_map_init(efi_kobj);
-	if (error)
-		goto err_remove_group;
-
 	/* and the standard mountpoint for efivarfs */
 	error = sysfs_create_mount_point(efi_kobj, "efivars");
 	if (error) {
@@ -479,6 +476,29 @@ err_destroy_wq:
 }
 
 subsys_initcall(efisubsys_init);
+
+void __init efi_find_mirror(void)
+{
+	efi_memory_desc_t *md;
+	u64 mirror_size = 0, total_size = 0;
+
+	if (!efi_enabled(EFI_MEMMAP))
+		return;
+
+	for_each_efi_memory_desc(md) {
+		unsigned long long start = md->phys_addr;
+		unsigned long long size = md->num_pages << EFI_PAGE_SHIFT;
+
+		total_size += size;
+		if (md->attribute & EFI_MEMORY_MORE_RELIABLE) {
+			memblock_mark_mirror(start, size);
+			mirror_size += size;
+		}
+	}
+	if (mirror_size)
+		pr_info("Memory: %lldM/%lldM mirrored memory\n",
+			mirror_size>>20, total_size>>20);
+}
 
 /*
  * Find the efi memory descriptor for a given physical address.  Given a
@@ -776,19 +796,12 @@ int __init efi_config_parse_tables(const efi_config_table_t *config_tables,
 	return 0;
 }
 
-int __init efi_systab_check_header(const efi_table_hdr_t *systab_hdr,
-				   int min_major_version)
+int __init efi_systab_check_header(const efi_table_hdr_t *systab_hdr)
 {
 	if (systab_hdr->signature != EFI_SYSTEM_TABLE_SIGNATURE) {
 		pr_err("System table signature incorrect!\n");
 		return -EINVAL;
 	}
-
-	if ((systab_hdr->revision >> 16) < min_major_version)
-		pr_err("Warning: System table version %d.%02d, expected %d.00 or greater!\n",
-		       systab_hdr->revision >> 16,
-		       systab_hdr->revision & 0xffff,
-		       min_major_version);
 
 	return 0;
 }
