@@ -52,106 +52,6 @@ info()
 	printf "  %-7s %s\n" "${1}" "${2}"
 }
 
-objtool_link()
-{
-	local objtoolcmd;
-	local objtoolopt;
-
-	if ! is_enabled CONFIG_OBJTOOL; then
-		return;
-	fi
-
-	# RHEL-only workaround for missing upstream b42d23065024
-	# ("kbuild: factor out the common objtool arguments"), objtool
-	# is only enabled for vmlinux.o under the following conditions:
-	#
-	# scripts/Makefile.lib
-	#   delay-objtool := $(or $(CONFIG_LTO_CLANG),$(CONFIG_X86_KERNEL_IBT))
-	#
-	# scripts/Makefile.vmlinux_o
-	#   objtool-enabled := $(or $(delay-objtool),$(CONFIG_NOINSTR_VALIDATION))
-	if ! (is_enabled CONFIG_LTO_CLANG || is_enabled CONFIG_X86_KERNEL_IBT || is_enabled CONFIG_NOINSTR_VALIDATION); then
-		return
-	fi
-
-	if is_enabled CONFIG_LTO_CLANG || is_enabled CONFIG_X86_KERNEL_IBT; then
-
-		# For LTO and IBT, objtool doesn't run on individual
-		# translation units.  Run everything on vmlinux instead.
-
-		if is_enabled CONFIG_HAVE_JUMP_LABEL_HACK; then
-			objtoolopt="${objtoolopt} --hacks=jump_label"
-		fi
-
-		if is_enabled CONFIG_HAVE_NOINSTR_HACK; then
-			objtoolopt="${objtoolopt} --hacks=noinstr"
-		fi
-
-		if is_enabled CONFIG_CALL_DEPTH_TRACKING; then
-			objtoolopt="${objtoolopt} --hacks=skylake"
-		fi
-
-		if is_enabled CONFIG_X86_KERNEL_IBT; then
-			objtoolopt="${objtoolopt} --ibt"
-		fi
-
-		if is_enabled CONFIG_FTRACE_MCOUNT_USE_OBJTOOL; then
-			objtoolopt="${objtoolopt} --mcount"
-		fi
-
-		if is_enabled CONFIG_FTRACE_MCOUNT_USE_OBJTOOL; then
-			objtoolopt="${objtoolopt} --mnop"
-		fi
-
-		if is_enabled CONFIG_UNWINDER_ORC; then
-			objtoolopt="${objtoolopt} --orc"
-		fi
-
-		if is_enabled CONFIG_RETPOLINE; then
-			objtoolopt="${objtoolopt} --retpoline"
-		fi
-
-		if is_enabled CONFIG_SLS; then
-			objtoolopt="${objtoolopt} --sls"
-		fi
-
-		if is_enabled CONFIG_STACK_VALIDATION; then
-			objtoolopt="${objtoolopt} --stackval"
-		fi
-
-		if is_enabled CONFIG_HAVE_STATIC_CALL_INLINE; then
-			objtoolopt="${objtoolopt} --static-call"
-		fi
-
-		if is_enabled CONFIG_HAVE_UACCESS_VALIDATION; then
-			objtoolopt="${objtoolopt} --uaccess"
-		fi
-	fi
-
-	if is_enabled CONFIG_NOINSTR_VALIDATION; then
-		objtoolopt="${objtoolopt} --noinstr"
-		if is_enabled CONFIG_CPU_UNRET_ENTRY || is_enabled CONFIG_CPU_SRSO; then
-			objtoolopt="${objtoolopt} --unret"
-		fi
-	fi
-
-	if is_enabled CONFIG_PREFIX_SYMBOLS; then
-		objtoolopt="${objtoolopt} --prefix=$(config_value "CONFIG_FUNCTION_PADDING_BYTES")"
-	fi
-
-	if [ -n "${objtoolopt}" ]; then
-
-		if is_enabled CONFIG_GCOV_KERNEL; then
-			objtoolopt="${objtoolopt} --no-unreachable"
-		fi
-
-		objtoolopt="${objtoolopt} --link"
-
-		info OBJTOOL ${1}
-		tools/objtool/objtool ${objtoolopt} ${1}
-	fi
-}
-
 # Link of vmlinux
 # ${1} - output file
 # ${2}, ${3}, ... - optional extra .o files
@@ -342,7 +242,6 @@ ${MAKE} -f "${srctree}/scripts/Makefile.build" obj=init need-builtin=1
 
 #link vmlinux.o
 ${MAKE} -f "${srctree}/scripts/Makefile.vmlinux_o"
-objtool_link vmlinux.o
 
 # modpost vmlinux.o to check for section mismatches
 ${MAKE} -f "${srctree}/scripts/Makefile.modpost" MODPOST_VMLINUX=1
