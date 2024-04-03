@@ -371,8 +371,6 @@ cleanup()
 	rm -f System.map
 	rm -f vmlinux
 	rm -f vmlinux.map
-	rm -f vmlinux.o
-	rm -f .vmlinux.d
 }
 
 # Use "make V=1" to debug this script
