@@ -1452,17 +1452,19 @@ static int kfd_add_peer_prop(struct kfd_topology_device *kdev,
 		/* CPU->CPU  link*/
 		cpu_dev = kfd_topology_device_by_proximity_domain(iolink1->node_to);
 		if (cpu_dev) {
-			list_for_each_entry(iolink3, &cpu_dev->io_link_props, list)
-				if (iolink3->node_to == iolink2->node_to)
-					break;
+			list_for_each_entry(iolink3, &cpu_dev->io_link_props, list) {
+				if (iolink3->node_to != iolink2->node_to)
+					continue;
 
-			props->weight += iolink3->weight;
-			props->min_latency += iolink3->min_latency;
-			props->max_latency += iolink3->max_latency;
-			props->min_bandwidth = min(props->min_bandwidth,
-							iolink3->min_bandwidth);
-			props->max_bandwidth = min(props->max_bandwidth,
-							iolink3->max_bandwidth);
+				props->weight += iolink3->weight;
+				props->min_latency += iolink3->min_latency;
+				props->max_latency += iolink3->max_latency;
+				props->min_bandwidth = min(props->min_bandwidth,
+							   iolink3->min_bandwidth);
+				props->max_bandwidth = min(props->max_bandwidth,
+							   iolink3->max_bandwidth);
+				break;
+			}
 		} else {
 			WARN(1, "CPU node not found");
 		}
@@ -1636,12 +1638,10 @@ static int fill_in_l2_l3_pcache(struct kfd_cache_properties **props_ext,
 		else
 			mode = UNKNOWN_MEMORY_PARTITION_MODE;
 
-		if (pcache->cache_level == 2)
-			pcache->cache_size = pcache_info[cache_type].cache_size * num_xcc;
-		else if (mode)
-			pcache->cache_size = pcache_info[cache_type].cache_size / mode;
-		else
-			pcache->cache_size = pcache_info[cache_type].cache_size;
+		pcache->cache_size = pcache_info[cache_type].cache_size;
+		/* Partition mode only affects L3 cache size */
+		if (mode && pcache->cache_level == 3)
+			pcache->cache_size /= mode;
 
 		if (pcache_info[cache_type].flags & CRAT_CACHE_FLAGS_DATA_CACHE)
 			pcache->cache_type |= HSA_CACHE_TYPE_DATA;
