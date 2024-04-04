@@ -386,7 +386,7 @@ static int mlx5_ptp_adjphase(struct ptp_clock_info *ptp, s32 delta)
 	if (!mlx5_is_mtutc_time_adj_cap(mdev, delta))
 		return -ERANGE;
 
-	return mlx5_ptp_adjtime_real_time(mdev, delta);
+	return mlx5_ptp_adjtime(ptp, delta);
 }
 
 static int mlx5_ptp_freq_adj_real_time(struct mlx5_core_dev *mdev, long scaled_ppm)
