@@ -1519,6 +1519,7 @@ struct cifs_writedata {
 	struct cifs_credits		credits;
 	unsigned int			nr_pages;
 	struct page			**pages;
+	bool				replay;
 };
 
 /*
