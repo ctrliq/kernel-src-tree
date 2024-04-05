@@ -92,6 +92,7 @@ static int ext4_get_tree(struct fs_context *fc);
 static int ext4_reconfigure(struct fs_context *fc);
 static void ext4_fc_free(struct fs_context *fc);
 static int ext4_init_fs_context(struct fs_context *fc);
+static void ext4_kill_sb(struct super_block *sb);
 static const struct fs_parameter_spec ext4_param_specs[];
 
 /*
@@ -134,12 +135,12 @@ static struct file_system_type ext2_fs_type = {
 	.name			= "ext2",
 	.init_fs_context	= ext4_init_fs_context,
 	.parameters		= ext4_param_specs,
-	.kill_sb		= kill_block_super,
+	.kill_sb		= ext4_kill_sb,
 	.fs_flags		= FS_REQUIRES_DEV,
 };
 MODULE_ALIAS_FS("ext2");
 MODULE_ALIAS("ext2");
-#define IS_EXT2_SB(sb) ((sb)->s_bdev->bd_holder == &ext2_fs_type)
+#define IS_EXT2_SB(sb) ((sb)->s_type == &ext2_fs_type)
 #else
 #define IS_EXT2_SB(sb) (0)
 #endif
@@ -150,12 +151,12 @@ static struct file_system_type ext3_fs_type = {
 	.name			= "ext3",
 	.init_fs_context	= ext4_init_fs_context,
 	.parameters		= ext4_param_specs,
-	.kill_sb		= kill_block_super,
+	.kill_sb		= ext4_kill_sb,
 	.fs_flags		= FS_REQUIRES_DEV,
 };
 MODULE_ALIAS_FS("ext3");
 MODULE_ALIAS("ext3");
-#define IS_EXT3_SB(sb) ((sb)->s_bdev->bd_holder == &ext3_fs_type)
+#define IS_EXT3_SB(sb) ((sb)->s_type == &ext3_fs_type)
 
 
 static inline void __ext4_read_bh(struct buffer_head *bh, blk_opf_t op_flags,
@@ -1086,46 +1087,24 @@ void ext4_update_dynamic_rev(struct super_block *sb)
 	 */
 }
 
-static void ext4_bdev_mark_dead(struct block_device *bdev)
-{
-	ext4_force_shutdown(bdev->bd_holder, EXT4_GOING_FLAGS_NOLOGFLUSH);
-}
-
-static const struct blk_holder_ops ext4_holder_ops = {
-	.mark_dead		= ext4_bdev_mark_dead,
-};
-
 /*
  * Open the external journal device
  */
-static struct block_device *ext4_blkdev_get(dev_t dev, struct super_block *sb)
+static struct bdev_handle *ext4_blkdev_get(dev_t dev, struct super_block *sb)
 {
-	struct block_device *bdev;
+	struct bdev_handle *bdev_handle;
 
-	bdev = blkdev_get_by_dev(dev, BLK_OPEN_READ | BLK_OPEN_WRITE, sb,
-				 &ext4_holder_ops);
-	if (IS_ERR(bdev))
+	bdev_handle = bdev_open_by_dev(dev, BLK_OPEN_READ | BLK_OPEN_WRITE,
+				       sb, &fs_holder_ops);
+	if (IS_ERR(bdev_handle))
 		goto fail;
-	return bdev;
+	return bdev_handle;
 
 fail:
 	ext4_msg(sb, KERN_ERR,
 		 "failed to open journal device unknown-block(%u,%u) %ld",
-		 MAJOR(dev), MINOR(dev), PTR_ERR(bdev));
+		 MAJOR(dev), MINOR(dev), PTR_ERR(bdev_handle));
 	return NULL;
-}
-
-/*
- * Release the journal device
- */
-static void ext4_blkdev_remove(struct ext4_sb_info *sbi)
-{
-	struct block_device *bdev;
-	bdev = sbi->s_journal_bdev;
-	if (bdev) {
-		blkdev_put(bdev, sbi->s_sb);
-		sbi->s_journal_bdev = NULL;
-	}
 }
 
 static inline struct inode *orphan_list_entry(struct list_head *l)
@@ -1268,15 +1247,14 @@ static void ext4_put_super(struct super_block *sb)
 
 	sync_blockdev(sb->s_bdev);
 	invalidate_bdev(sb->s_bdev);
-	if (sbi->s_journal_bdev && sbi->s_journal_bdev != sb->s_bdev) {
+	if (sbi->s_journal_bdev_handle) {
 		/*
 		 * Invalidate the journal device's buffers.  We don't want them
 		 * floating about in memory - the physical journal device may
 		 * hotswapped, and it breaks the `ro-after' testing code.
 		 */
-		sync_blockdev(sbi->s_journal_bdev);
-		invalidate_bdev(sbi->s_journal_bdev);
-		ext4_blkdev_remove(sbi);
+		sync_blockdev(sbi->s_journal_bdev_handle->bdev);
+		invalidate_bdev(sbi->s_journal_bdev_handle->bdev);
 	}
 
 	ext4_xattr_destroy_cache(sbi->s_ea_inode_cache);
@@ -4192,7 +4170,7 @@ int ext4_calculate_overhead(struct super_block *sb)
 	 * Add the internal journal blocks whether the journal has been
 	 * loaded or not
 	 */
-	if (sbi->s_journal && !sbi->s_journal_bdev)
+	if (sbi->s_journal && !sbi->s_journal_bdev_handle)
 		overhead += EXT4_NUM_B2C(sbi, sbi->s_journal->j_total_len);
 	else if (ext4_has_feature_journal(sb) && !sbi->s_journal && j_inum) {
 		/* j_inum for internal journal is non-zero */
@@ -5550,7 +5528,6 @@ static int __ext4_fill_super(struct fs_context *fc, struct super_block *sb)
 	spin_lock_init(&sbi->s_bdev_wb_lock);
 	errseq_check_and_advance(&sb->s_bdev->bd_inode->i_mapping->wb_err,
 				 &sbi->s_bdev_wb_err);
-	sb->s_bdev->bd_super = sb;
 	EXT4_SB(sb)->s_mount_state |= EXT4_ORPHAN_FS;
 	ext4_orphan_cleanup(sb, es);
 	EXT4_SB(sb)->s_mount_state &= ~EXT4_ORPHAN_FS;
@@ -5661,10 +5638,13 @@ failed_mount:
 		kfree(get_qf_name(sb, sbi, i));
 #endif
 	fscrypt_free_dummy_policy(&sbi->s_dummy_enc_policy);
-	/* ext4_blkdev_remove() calls kill_bdev(), release bh before it. */
 	brelse(sbi->s_sbh);
-	ext4_blkdev_remove(sbi);
+	if (sbi->s_journal_bdev_handle) {
+		invalidate_bdev(sbi->s_journal_bdev_handle->bdev);
+		bdev_release(sbi->s_journal_bdev_handle);
+	}
 out_fail:
+	invalidate_bdev(sb->s_bdev);
 	sb->s_fs_info = NULL;
 	return err ? err : ret;
 }
@@ -5841,14 +5821,19 @@ static journal_t *ext4_get_dev_journal(struct super_block *sb,
 	unsigned long offset;
 	struct ext4_super_block *es;
 	struct block_device *bdev;
+	struct bdev_handle *bdev_handle;
 
 	if (WARN_ON_ONCE(!ext4_has_feature_journal(sb)))
 		return NULL;
 
-	bdev = ext4_blkdev_get(j_dev, sb);
-	if (bdev == NULL)
+	/* see get_tree_bdev why this is needed and safe */
+	up_write(&sb->s_umount);
+	bdev_handle = ext4_blkdev_get(j_dev, sb);
+	down_write(&sb->s_umount);
+	if (IS_ERR(bdev_handle))
 		return NULL;
 
+	bdev = bdev_handle->bdev;
 	blocksize = sb->s_blocksize;
 	hblock = bdev_logical_block_size(bdev);
 	if (blocksize < hblock) {
@@ -5912,14 +5897,14 @@ static journal_t *ext4_get_dev_journal(struct super_block *sb,
 			be32_to_cpu(journal->j_superblock->s_nr_users));
 		goto out_journal;
 	}
-	EXT4_SB(sb)->s_journal_bdev = bdev;
+	EXT4_SB(sb)->s_journal_bdev_handle = bdev_handle;
 	ext4_init_journal_params(sb, journal);
 	return journal;
 
 out_journal:
 	jbd2_journal_destroy(journal);
 out_bdev:
-	blkdev_put(bdev, sb);
+	bdev_release(bdev_handle);
 	return NULL;
 }
 
@@ -7293,12 +7278,23 @@ static inline int ext3_feature_set_ok(struct super_block *sb)
 	return 1;
 }
 
+static void ext4_kill_sb(struct super_block *sb)
+{
+	struct ext4_sb_info *sbi = EXT4_SB(sb);
+	struct bdev_handle *handle = sbi ? sbi->s_journal_bdev_handle : NULL;
+
+	kill_block_super(sb);
+
+	if (handle)
+		bdev_release(handle);
+}
+
 static struct file_system_type ext4_fs_type = {
 	.owner			= THIS_MODULE,
 	.name			= "ext4",
 	.init_fs_context	= ext4_init_fs_context,
 	.parameters		= ext4_param_specs,
-	.kill_sb		= kill_block_super,
+	.kill_sb		= ext4_kill_sb,
 	.fs_flags		= FS_REQUIRES_DEV | FS_ALLOW_IDMAP,
 };
 MODULE_ALIAS_FS("ext4");

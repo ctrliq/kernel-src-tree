@@ -155,6 +155,11 @@ cifs_dump_channel(struct seq_file *m, int i, struct cifs_chan *chan)
 		   in_flight(server),
 		   atomic_read(&server->in_send),
 		   atomic_read(&server->num_waiters));
+#ifdef CONFIG_NET_NS
+	if (server->net)
+		seq_printf(m, " Net namespace: %u ", server->net->ns.inum);
+#endif /* NET_NS */
+
 }
 
 static inline const char *smb_speed_to_str(size_t bps)
@@ -338,6 +343,7 @@ static int cifs_debug_data_proc_show(struct seq_file *m, void *v)
 		spin_lock(&server->srv_lock);
 		if (server->hostname)
 			seq_printf(m, "Hostname: %s ", server->hostname);
+		seq_printf(m, "\nClientGUID: %pUL", server->client_guid);
 		spin_unlock(&server->srv_lock);
 #ifdef CONFIG_CIFS_SMB_DIRECT
 		if (!server->rdma)
@@ -431,10 +437,15 @@ skip_rdma:
 				server->reconnect_instance,
 				server->srv_count,
 				server->sec_mode, in_flight(server));
+#ifdef CONFIG_NET_NS
+		if (server->net)
+			seq_printf(m, " Net namespace: %u ", server->net->ns.inum);
+#endif /* NET_NS */
 
 		seq_printf(m, "\nIn Send: %d In MaxReq Wait: %d",
 				atomic_read(&server->in_send),
 				atomic_read(&server->num_waiters));
+
 		if (server->leaf_fullpath) {
 			seq_printf(m, "\nDFS leaf full path: %s",
 				   server->leaf_fullpath);
