@@ -1044,9 +1044,11 @@ class RenderInfo:
         if op_mode == 'notify':
             op_mode = 'do'
         for op_dir in ['request', 'reply']:
-            if op and op_dir in op[op_mode]:
-                self.struct[op_dir] = Struct(family, self.attr_set,
-                                             type_list=op[op_mode][op_dir]['attributes'])
+            if op:
+                type_list = []
+                if op_dir in op[op_mode]:
+                    type_list = op[op_mode][op_dir]['attributes']
+                self.struct[op_dir] = Struct(family, self.attr_set, type_list=type_list)
         if op_mode == 'event':
             self.struct['reply'] = Struct(family, self.attr_set, type_list=op['event']['attributes'])
 
@@ -1755,6 +1757,8 @@ def print_type_helpers(ri, direction, deref=False):
 
 
 def print_req_type_helpers(ri):
+    if len(ri.struct["request"].attr_list) == 0:
+        return
     print_alloc_wrapper(ri, "request")
     print_type_helpers(ri, "request")
 
@@ -1776,6 +1780,8 @@ def print_parse_prototype(ri, direction, terminate=True):
 
 
 def print_req_type(ri):
+    if len(ri.struct["request"].attr_list) == 0:
+        return
     print_type(ri, "request")
 
 
@@ -2518,9 +2524,8 @@ def main():
                 if 'dump' in op:
                     cw.p(f"/* {op.enum_name} - dump */")
                     ri = RenderInfo(cw, parsed, args.mode, op, 'dump')
-                    if 'request' in op['dump']:
-                        print_req_type(ri)
-                        print_req_type_helpers(ri)
+                    print_req_type(ri)
+                    print_req_type_helpers(ri)
                     if not ri.type_consistent:
                         print_rsp_type(ri)
                     print_wrapped_type(ri)
