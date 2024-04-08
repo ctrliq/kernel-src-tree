@@ -353,6 +353,9 @@ static void handle_thermal_trip(struct thermal_zone_device *tz, int trip_id)
 
 	__thermal_zone_get_trip(tz, trip_id, &trip);
 
+	if (trip.temperature == THERMAL_TEMP_INVALID)
+		return;
+
 	if (tz->last_temperature != THERMAL_TEMP_INVALID) {
 		if (tz->last_temperature < trip.temperature &&
 		    tz->temperature >= trip.temperature)
@@ -582,10 +585,9 @@ struct thermal_zone_device *thermal_zone_get_by_id(int id)
  */
 
 /**
- * thermal_zone_bind_cooling_device() - bind a cooling device to a thermal zone
+ * thermal_bind_cdev_to_trip - bind a cooling device to a thermal zone
  * @tz:		pointer to struct thermal_zone_device
- * @trip:	indicates which trip point the cooling devices is
- *		associated with in this thermal zone.
+ * @trip:	trip point the cooling devices is associated with in this zone.
  * @cdev:	pointer to struct thermal_cooling_device
  * @upper:	the Maximum cooling state for this trip point.
  *		THERMAL_NO_LIMIT means no upper limit,
@@ -603,8 +605,8 @@ struct thermal_zone_device *thermal_zone_get_by_id(int id)
  *
  * Return: 0 on success, the proper error value otherwise.
  */
-int thermal_zone_bind_cooling_device(struct thermal_zone_device *tz,
-				     int trip,
+int thermal_bind_cdev_to_trip(struct thermal_zone_device *tz,
+				     const struct thermal_trip *trip,
 				     struct thermal_cooling_device *cdev,
 				     unsigned long upper, unsigned long lower,
 				     unsigned int weight)
@@ -615,9 +617,6 @@ int thermal_zone_bind_cooling_device(struct thermal_zone_device *tz,
 	struct thermal_cooling_device *pos2;
 	bool upper_no_limit;
 	int result;
-
-	if (trip >= tz->num_trips || trip < 0)
-		return -EINVAL;
 
 	list_for_each_entry(pos1, &thermal_tz_list, node) {
 		if (pos1 == tz)
@@ -715,14 +714,26 @@ free_mem:
 	kfree(dev);
 	return result;
 }
+EXPORT_SYMBOL_GPL(thermal_bind_cdev_to_trip);
+
+int thermal_zone_bind_cooling_device(struct thermal_zone_device *tz,
+				     int trip_index,
+				     struct thermal_cooling_device *cdev,
+				     unsigned long upper, unsigned long lower,
+				     unsigned int weight)
+{
+	if (trip_index < 0 || trip_index >= tz->num_trips)
+		return -EINVAL;
+
+	return thermal_bind_cdev_to_trip(tz, &tz->trips[trip_index], cdev,
+					 upper, lower, weight);
+}
 EXPORT_SYMBOL_GPL(thermal_zone_bind_cooling_device);
 
 /**
- * thermal_zone_unbind_cooling_device() - unbind a cooling device from a
- *					  thermal zone.
+ * thermal_unbind_cdev_from_trip - unbind a cooling device from a thermal zone.
  * @tz:		pointer to a struct thermal_zone_device.
- * @trip:	indicates which trip point the cooling devices is
- *		associated with in this thermal zone.
+ * @trip:	trip point the cooling devices is associated with in this zone.
  * @cdev:	pointer to a struct thermal_cooling_device.
  *
  * This interface function unbind a thermal cooling device from the certain
@@ -731,9 +742,9 @@ EXPORT_SYMBOL_GPL(thermal_zone_bind_cooling_device);
  *
  * Return: 0 on success, the proper error value otherwise.
  */
-int thermal_zone_unbind_cooling_device(struct thermal_zone_device *tz,
-				       int trip,
-				       struct thermal_cooling_device *cdev)
+int thermal_unbind_cdev_from_trip(struct thermal_zone_device *tz,
+				  const struct thermal_trip *trip,
+				  struct thermal_cooling_device *cdev)
 {
 	struct thermal_instance *pos, *next;
 
@@ -760,6 +771,17 @@ unbind:
 	ida_free(&tz->ida, pos->id);
 	kfree(pos);
 	return 0;
+}
+EXPORT_SYMBOL_GPL(thermal_unbind_cdev_from_trip);
+
+int thermal_zone_unbind_cooling_device(struct thermal_zone_device *tz,
+				       int trip_index,
+				       struct thermal_cooling_device *cdev)
+{
+	if (trip_index < 0 || trip_index >= tz->num_trips)
+		return -EINVAL;
+
+	return thermal_unbind_cdev_from_trip(tz, &tz->trips[trip_index], cdev);
 }
 EXPORT_SYMBOL_GPL(thermal_zone_unbind_cooling_device);
 
@@ -1246,7 +1268,7 @@ thermal_zone_device_register_with_trips(const char *type, struct thermal_trip *t
 		return ERR_PTR(-EINVAL);
 	}
 
-	if (num_trips > 0 && (!ops->get_trip_type || !ops->get_trip_temp) && !trips)
+	if (num_trips > 0 && !trips)
 		return ERR_PTR(-EINVAL);
 
 	if (!thermal_class)
@@ -1384,6 +1406,24 @@ void *thermal_zone_device_priv(struct thermal_zone_device *tzd)
 	return tzd->devdata;
 }
 EXPORT_SYMBOL_GPL(thermal_zone_device_priv);
+
+int thermal_zone_device_id(struct thermal_zone_device *tzd)
+{
+	return tzd->id;
+}
+EXPORT_SYMBOL_GPL(thermal_zone_device_id);
+
+struct device *thermal_zone_device(struct thermal_zone_device *tzd)
+{
+	return &tzd->device;
+}
+EXPORT_SYMBOL_GPL(thermal_zone_device);
+
+const char *thermal_zone_device_type(struct thermal_zone_device *tzd)
+{
+	return tzd->type;
+}
+EXPORT_SYMBOL_GPL(thermal_zone_device_type);
 
 /**
  * thermal_zone_device_unregister - removes the registered thermal zone device
