@@ -1382,7 +1382,14 @@ scripts_unifdef: scripts_basic
 # to this Makefile to build and install external modules.
 # Cancel sub_make_done so that options such as M=, V=, etc. are parsed.
 
+# RHEL-only: Retain the following single "install:" target line, which
+# immediately follows this comment, until upstream commit f774f5bb87d1
+# ("kbuild: factor out the common installation code into scripts/install.sh")
+# is backported to all arches supported by RHEL9.
 install: sub_make_done :=
+
+quiet_cmd_install = INSTALL $(INSTALL_PATH)
+      cmd_install = unset sub_make_done; $(srctree)/scripts/install.sh
 
 # ---------------------------------------------------------------------------
 # Tools
