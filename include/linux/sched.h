@@ -888,9 +888,9 @@ struct task_struct {
 	struct mm_struct		*mm;
 	struct mm_struct		*active_mm;
 
-	/* Per-thread vma caching: */
-	struct vmacache			vmacache;
-
+#ifdef SPLIT_RSS_COUNTING
+	struct task_rss_stat		rss_stat;
+#endif
 	int				exit_state;
 	int				exit_code;
 	int				exit_signal;
