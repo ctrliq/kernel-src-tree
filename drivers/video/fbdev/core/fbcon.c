@@ -859,10 +859,10 @@ static int set_con2fb_map(int unit, int newidx, int user)
 
 	found = search_fb_in_map(newidx);
 
-	con2fb_map[unit] = newidx;
 	if (!err && !found)
  		err = con2fb_acquire_newinfo(vc, info, unit, oldidx);
 
+	con2fb_map[unit] = newidx;
 
 	/*
 	 * If old fb is not mapped to any of the consoles,
