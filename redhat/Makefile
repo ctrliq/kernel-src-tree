@@ -719,8 +719,7 @@ sources-rh: $(TARBALL) $(KABI_TARBALL) $(KABIDW_TARBALL) generate-testpatch-tmp 
 	@find $(SOURCES)/ -name "*.yaml" -o -name "*.yaml.fedora" -o -name "*.yaml.rhel" | \
 		xargs -i{} $(REDHAT)/scripts/yamlsanity.py {}
 	@echo Sanity checking filtermods configs
-	@$(REDHAT)/scripts/filtermods.py -q sort -c $(SOURCES)/def_variants.yaml.fedora -d /dev/null
-	@$(REDHAT)/scripts/filtermods.py -q sort -c $(SOURCES)/def_variants.yaml.rhel -d /dev/null
+	@ls -1 -B $(SOURCES)/def_variants.yaml.* | xargs -i{} sh -c "$(REDHAT)/scripts/filtermods.py -q sort -c {} -d /dev/null"
 
 dist-sources: dist-kabi dist-kabi-dup sources-rh
 
