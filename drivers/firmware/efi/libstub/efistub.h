@@ -1072,4 +1072,7 @@ void process_unaccepted_memory(u64 start, u64 end);
 void accept_memory(phys_addr_t start, phys_addr_t end);
 void arch_accept_memory(phys_addr_t start, phys_addr_t end);
 
+asmlinkage efi_status_t __efiapi
+efi_zboot_entry(efi_handle_t handle, efi_system_table_t *systab);
+
 #endif
