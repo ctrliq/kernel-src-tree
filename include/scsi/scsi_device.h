@@ -514,6 +514,7 @@ int scsi_execute_cmd(struct scsi_device *sdev, const unsigned char *cmd,
 			 _buffer, _bufflen, _timeout, _retries,	\
 			 &(struct scsi_exec_args) {			\
 				.sense = _sense,			\
+				.sense_len = SCSI_SENSE_BUFFERSIZE,	\
 				.sshdr = _sshdr,			\
 				.req_flags = _rq_flags & RQF_PM  ?	\
 						BLK_MQ_REQ_PM : 0,	\
