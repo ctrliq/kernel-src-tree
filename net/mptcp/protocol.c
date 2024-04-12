@@ -3850,8 +3850,6 @@ static int mptcp_stream_accept(struct socket *sock, struct socket *newsock,
 				inet_sk_state_store(newsk, TCP_CLOSE);
 		}
 	} else {
-		MPTCP_INC_STATS(sock_net(ssk),
-				MPTCP_MIB_MPCAPABLEPASSIVEFALLBACK);
 tcpfallback:
 		newsk->sk_kern_sock = kern;
 		lock_sock(newsk);
