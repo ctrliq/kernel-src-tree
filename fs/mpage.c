@@ -399,7 +399,6 @@ struct mpage_data {
 	struct bio *bio;
 	sector_t last_block_in_bio;
 	get_block_t *get_block;
-	unsigned use_writepage;
 };
 
 /*
@@ -613,15 +612,10 @@ confused:
 	if (bio)
 		bio = mpage_bio_submit(bio);
 
-	if (mpd->use_writepage) {
-		ret = mapping->a_ops->writepage(&folio->page, wbc);
-	} else {
-		ret = -EAGAIN;
-		goto out;
-	}
 	/*
 	 * The caller has a ref on the inode, so *mapping is stable
 	 */
+	ret = mapping->a_ops->writepage(&folio->page, wbc);
 	mapping_set_error(mapping, ret);
 out:
 	mpd->bio = bio;
@@ -643,7 +637,6 @@ mpage_writepages(struct address_space *mapping,
 {
 	struct mpage_data mpd = {
 		.get_block	= get_block,
-		.use_writepage	= 1,
 	};
 	struct blk_plug plug;
 	int ret;
@@ -656,19 +649,3 @@ mpage_writepages(struct address_space *mapping,
 	return ret;
 }
 EXPORT_SYMBOL(mpage_writepages);
-
-int mpage_writepage(struct page *page, get_block_t get_block,
-	struct writeback_control *wbc)
-{
-	struct mpage_data mpd = {
-		.bio = NULL,
-		.last_block_in_bio = 0,
-		.get_block = get_block,
-		.use_writepage = 0,
-	};
-	int ret = __mpage_writepage(page_folio(page), wbc, &mpd);
-	if (mpd.bio)
-		mpage_bio_submit(mpd.bio);
-	return ret;
-}
-EXPORT_SYMBOL(mpage_writepage);
