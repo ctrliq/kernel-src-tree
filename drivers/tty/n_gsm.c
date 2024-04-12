@@ -2061,7 +2061,7 @@ static int gsm_disconnect(struct gsm_mux *gsm)
 static void gsm_cleanup_mux(struct gsm_mux *gsm)
 {
 	int i;
-	struct gsm_dlci *dlci = gsm->dlci[0];
+	struct gsm_dlci *dlci;
 	struct gsm_msg *txq, *ntxq;
 
 	gsm->dead = 1;
@@ -2079,12 +2079,13 @@ static void gsm_cleanup_mux(struct gsm_mux *gsm)
 		return;
 
 	del_timer_sync(&gsm->t2_timer);
+	/* Free up any link layer users */
+	mutex_lock(&gsm->mutex);
+	dlci = gsm->dlci[0];
 	/* Now we are sure T2 has stopped */
 	if (dlci)
 		dlci->dead = 1;
 
-	/* Free up any link layer users */
-	mutex_lock(&gsm->mutex);
 	for (i = 0; i < NUM_DLCI; i++)
 		if (gsm->dlci[i])
 			gsm_dlci_release(gsm->dlci[i]);
