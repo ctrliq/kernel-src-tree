@@ -282,12 +282,11 @@ void splice_shrink_spd(struct splice_pipe_desc *spd)
 }
 
 /*
- * Splice data from an O_DIRECT file into pages and then add them to the output
- * pipe.
+ * Copy data from a file into pages and then splice those into the output pipe.
  */
-ssize_t direct_splice_read(struct file *in, loff_t *ppos,
-			   struct pipe_inode_info *pipe,
-			   size_t len, unsigned int flags)
+ssize_t copy_splice_read(struct file *in, loff_t *ppos,
+			 struct pipe_inode_info *pipe,
+			 size_t len, unsigned int flags)
 {
 	struct iov_iter to;
 	struct bio_vec *bv;
@@ -372,6 +371,7 @@ ssize_t direct_splice_read(struct file *in, loff_t *ppos,
 	kfree(bv);
 	return ret;
 }
+EXPORT_SYMBOL(copy_splice_read);
 
 /**
  * generic_file_splice_read - splice data from file to a pipe
