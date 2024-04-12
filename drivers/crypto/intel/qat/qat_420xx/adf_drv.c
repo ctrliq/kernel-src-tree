@@ -1,22 +1,20 @@
-// SPDX-License-Identifier: (BSD-3-Clause OR GPL-2.0-only)
-/* Copyright(c) 2020 Intel Corporation */
+// SPDX-License-Identifier: GPL-2.0-only
+/* Copyright(c) 2023 Intel Corporation */
 #include <linux/device.h>
 #include <linux/module.h>
 #include <linux/pci.h>
 
 #include <adf_accel_devices.h>
+#include <adf_gen4_hw_data.h>
+#include <adf_gen4_config.h>
 #include <adf_cfg.h>
 #include <adf_common_drv.h>
 #include <adf_dbgfs.h>
-#include <adf_gen4_config.h>
-#include <adf_gen4_hw_data.h>
 
-#include "adf_4xxx_hw_data.h"
+#include "adf_420xx_hw_data.h"
 
 static const struct pci_device_id adf_pci_tbl[] = {
-	{ PCI_VDEVICE(INTEL, ADF_4XXX_PCI_DEVICE_ID), },
-	{ PCI_VDEVICE(INTEL, ADF_401XX_PCI_DEVICE_ID), },
-	{ PCI_VDEVICE(INTEL, ADF_402XX_PCI_DEVICE_ID), },
+	{ PCI_VDEVICE(INTEL, ADF_420XX_PCI_DEVICE_ID), },
 	{ }
 };
 MODULE_DEVICE_TABLE(pci, adf_pci_tbl);
@@ -24,7 +22,7 @@ MODULE_DEVICE_TABLE(pci, adf_pci_tbl);
 static void adf_cleanup_accel(struct adf_accel_dev *accel_dev)
 {
 	if (accel_dev->hw_device) {
-		adf_clean_hw_data_4xxx(accel_dev->hw_device);
+		adf_clean_hw_data_420xx(accel_dev->hw_device);
 		accel_dev->hw_device = NULL;
 	}
 	adf_dbgfs_exit(accel_dev);
@@ -78,7 +76,7 @@ static int adf_probe(struct pci_dev *pdev, const struct pci_device_id *ent)
 	}
 
 	accel_dev->hw_device = hw_data;
-	adf_init_hw_data_4xxx(accel_dev->hw_device, ent->device);
+	adf_init_hw_data_420xx(accel_dev->hw_device, ent->device);
 
 	pci_read_config_byte(pdev, PCI_REVISION_ID, &accel_pci_dev->revid);
 	pci_read_config_dword(pdev, ADF_GEN4_FUSECTL4_OFFSET, &hw_data->fuses);
@@ -185,7 +183,7 @@ static void adf_remove(struct pci_dev *pdev)
 
 static struct pci_driver adf_driver = {
 	.id_table = adf_pci_tbl,
-	.name = ADF_4XXX_DEVICE_NAME,
+	.name = ADF_420XX_DEVICE_NAME,
 	.probe = adf_probe,
 	.remove = adf_remove,
 	.sriov_configure = adf_sriov_configure,
@@ -194,10 +192,10 @@ static struct pci_driver adf_driver = {
 
 module_pci_driver(adf_driver);
 
-MODULE_LICENSE("Dual BSD/GPL");
+MODULE_LICENSE("GPL");
 MODULE_AUTHOR("Intel");
-MODULE_FIRMWARE(ADF_4XXX_FW);
-MODULE_FIRMWARE(ADF_4XXX_MMP);
+MODULE_FIRMWARE(ADF_420XX_FW);
+MODULE_FIRMWARE(ADF_420XX_MMP);
 MODULE_DESCRIPTION("Intel(R) QuickAssist Technology");
 MODULE_VERSION(ADF_DRV_VERSION);
 MODULE_SOFTDEP("pre: crypto-intel_qat");

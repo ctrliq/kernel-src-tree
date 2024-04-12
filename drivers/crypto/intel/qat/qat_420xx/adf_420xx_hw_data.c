@@ -1,5 +1,5 @@
-// SPDX-License-Identifier: (BSD-3-Clause OR GPL-2.0-only)
-/* Copyright(c) 2020 - 2021 Intel Corporation */
+// SPDX-License-Identifier: GPL-2.0-only
+/* Copyright(c) 2023 Intel Corporation */
 #include <linux/iopoll.h>
 #include <adf_accel_devices.h>
 #include <adf_admin.h>
@@ -13,87 +13,84 @@
 #include <adf_gen4_hw_data.h>
 #include <adf_gen4_pfvf.h>
 #include <adf_gen4_pm.h>
-#include "adf_gen4_ras.h"
+#include <adf_gen4_ras.h>
 #include <adf_gen4_timer.h>
 #include <adf_gen4_tl.h>
-#include "adf_4xxx_hw_data.h"
+#include "adf_420xx_hw_data.h"
 #include "icp_qat_hw.h"
 
 #define ADF_AE_GROUP_0		GENMASK(3, 0)
 #define ADF_AE_GROUP_1		GENMASK(7, 4)
-#define ADF_AE_GROUP_2		BIT(8)
+#define ADF_AE_GROUP_2		GENMASK(11, 8)
+#define ADF_AE_GROUP_3		GENMASK(15, 12)
+#define ADF_AE_GROUP_4		BIT(16)
 
 #define ENA_THD_MASK_ASYM	GENMASK(1, 0)
-#define ENA_THD_MASK_ASYM_401XX	GENMASK(5, 0)
-#define ENA_THD_MASK_SYM	GENMASK(6, 0)
+#define ENA_THD_MASK_SYM	GENMASK(3, 0)
 #define ENA_THD_MASK_DC		GENMASK(1, 0)
 
-static const char * const adf_4xxx_fw_objs[] = {
-	[ADF_FW_SYM_OBJ] =  ADF_4XXX_SYM_OBJ,
-	[ADF_FW_ASYM_OBJ] =  ADF_4XXX_ASYM_OBJ,
-	[ADF_FW_DC_OBJ] =  ADF_4XXX_DC_OBJ,
-	[ADF_FW_ADMIN_OBJ] = ADF_4XXX_ADMIN_OBJ,
-};
-
-static const char * const adf_402xx_fw_objs[] = {
-	[ADF_FW_SYM_OBJ] =  ADF_402XX_SYM_OBJ,
-	[ADF_FW_ASYM_OBJ] =  ADF_402XX_ASYM_OBJ,
-	[ADF_FW_DC_OBJ] =  ADF_402XX_DC_OBJ,
-	[ADF_FW_ADMIN_OBJ] = ADF_402XX_ADMIN_OBJ,
+static const char * const adf_420xx_fw_objs[] = {
+	[ADF_FW_SYM_OBJ] =  ADF_420XX_SYM_OBJ,
+	[ADF_FW_ASYM_OBJ] =  ADF_420XX_ASYM_OBJ,
+	[ADF_FW_DC_OBJ] =  ADF_420XX_DC_OBJ,
+	[ADF_FW_ADMIN_OBJ] = ADF_420XX_ADMIN_OBJ,
 };
 
 static const struct adf_fw_config adf_fw_cy_config[] = {
+	{ADF_AE_GROUP_3, ADF_FW_SYM_OBJ},
+	{ADF_AE_GROUP_2, ADF_FW_ASYM_OBJ},
 	{ADF_AE_GROUP_1, ADF_FW_SYM_OBJ},
 	{ADF_AE_GROUP_0, ADF_FW_ASYM_OBJ},
-	{ADF_AE_GROUP_2, ADF_FW_ADMIN_OBJ},
+	{ADF_AE_GROUP_4, ADF_FW_ADMIN_OBJ},
 };
 
 static const struct adf_fw_config adf_fw_dc_config[] = {
 	{ADF_AE_GROUP_1, ADF_FW_DC_OBJ},
 	{ADF_AE_GROUP_0, ADF_FW_DC_OBJ},
-	{ADF_AE_GROUP_2, ADF_FW_ADMIN_OBJ},
+	{ADF_AE_GROUP_4, ADF_FW_ADMIN_OBJ},
 };
 
 static const struct adf_fw_config adf_fw_sym_config[] = {
+	{ADF_AE_GROUP_3, ADF_FW_SYM_OBJ},
+	{ADF_AE_GROUP_2, ADF_FW_SYM_OBJ},
 	{ADF_AE_GROUP_1, ADF_FW_SYM_OBJ},
 	{ADF_AE_GROUP_0, ADF_FW_SYM_OBJ},
-	{ADF_AE_GROUP_2, ADF_FW_ADMIN_OBJ},
+	{ADF_AE_GROUP_4, ADF_FW_ADMIN_OBJ},
 };
 
 static const struct adf_fw_config adf_fw_asym_config[] = {
+	{ADF_AE_GROUP_3, ADF_FW_ASYM_OBJ},
+	{ADF_AE_GROUP_2, ADF_FW_ASYM_OBJ},
 	{ADF_AE_GROUP_1, ADF_FW_ASYM_OBJ},
 	{ADF_AE_GROUP_0, ADF_FW_ASYM_OBJ},
-	{ADF_AE_GROUP_2, ADF_FW_ADMIN_OBJ},
+	{ADF_AE_GROUP_4, ADF_FW_ADMIN_OBJ},
 };
 
 static const struct adf_fw_config adf_fw_asym_dc_config[] = {
+	{ADF_AE_GROUP_3, ADF_FW_ASYM_OBJ},
+	{ADF_AE_GROUP_2, ADF_FW_ASYM_OBJ},
 	{ADF_AE_GROUP_1, ADF_FW_ASYM_OBJ},
 	{ADF_AE_GROUP_0, ADF_FW_DC_OBJ},
-	{ADF_AE_GROUP_2, ADF_FW_ADMIN_OBJ},
+	{ADF_AE_GROUP_4, ADF_FW_ADMIN_OBJ},
 };
 
 static const struct adf_fw_config adf_fw_sym_dc_config[] = {
+	{ADF_AE_GROUP_2, ADF_FW_SYM_OBJ},
 	{ADF_AE_GROUP_1, ADF_FW_SYM_OBJ},
 	{ADF_AE_GROUP_0, ADF_FW_DC_OBJ},
-	{ADF_AE_GROUP_2, ADF_FW_ADMIN_OBJ},
+	{ADF_AE_GROUP_4, ADF_FW_ADMIN_OBJ},
 };
 
 static const struct adf_fw_config adf_fw_dcc_config[] = {
 	{ADF_AE_GROUP_1, ADF_FW_DC_OBJ},
 	{ADF_AE_GROUP_0, ADF_FW_SYM_OBJ},
-	{ADF_AE_GROUP_2, ADF_FW_ADMIN_OBJ},
+	{ADF_AE_GROUP_4, ADF_FW_ADMIN_OBJ},
 };
 
-static_assert(ARRAY_SIZE(adf_fw_cy_config) == ARRAY_SIZE(adf_fw_dc_config));
-static_assert(ARRAY_SIZE(adf_fw_cy_config) == ARRAY_SIZE(adf_fw_sym_config));
-static_assert(ARRAY_SIZE(adf_fw_cy_config) == ARRAY_SIZE(adf_fw_asym_config));
-static_assert(ARRAY_SIZE(adf_fw_cy_config) == ARRAY_SIZE(adf_fw_asym_dc_config));
-static_assert(ARRAY_SIZE(adf_fw_cy_config) == ARRAY_SIZE(adf_fw_sym_dc_config));
-static_assert(ARRAY_SIZE(adf_fw_cy_config) == ARRAY_SIZE(adf_fw_dcc_config));
 
-static struct adf_hw_device_class adf_4xxx_class = {
-	.name = ADF_4XXX_DEVICE_NAME,
-	.type = DEV_4XXX,
+static struct adf_hw_device_class adf_420xx_class = {
+	.name = ADF_420XX_DEVICE_NAME,
+	.type = DEV_420XX,
 	.instances = 0,
 };
 
@@ -101,15 +98,89 @@ static u32 get_ae_mask(struct adf_hw_device_data *self)
 {
 	u32 me_disable = self->fuses;
 
-	return ~me_disable & ADF_4XXX_ACCELENGINES_MASK;
+	return ~me_disable & ADF_420XX_ACCELENGINES_MASK;
+}
+
+static u32 uof_get_num_objs(struct adf_accel_dev *accel_dev)
+{
+	switch (adf_get_service_enabled(accel_dev)) {
+	case SVC_CY:
+	case SVC_CY2:
+		return ARRAY_SIZE(adf_fw_cy_config);
+	case SVC_DC:
+		return ARRAY_SIZE(adf_fw_dc_config);
+	case SVC_DCC:
+		return ARRAY_SIZE(adf_fw_dcc_config);
+	case SVC_SYM:
+		return ARRAY_SIZE(adf_fw_sym_config);
+	case SVC_ASYM:
+		return ARRAY_SIZE(adf_fw_asym_config);
+	case SVC_ASYM_DC:
+	case SVC_DC_ASYM:
+		return ARRAY_SIZE(adf_fw_asym_dc_config);
+	case SVC_SYM_DC:
+	case SVC_DC_SYM:
+		return ARRAY_SIZE(adf_fw_sym_dc_config);
+	default:
+		return 0;
+	}
+}
+
+static const struct adf_fw_config *get_fw_config(struct adf_accel_dev *accel_dev)
+{
+	switch (adf_get_service_enabled(accel_dev)) {
+	case SVC_CY:
+	case SVC_CY2:
+		return adf_fw_cy_config;
+	case SVC_DC:
+		return adf_fw_dc_config;
+	case SVC_DCC:
+		return adf_fw_dcc_config;
+	case SVC_SYM:
+		return adf_fw_sym_config;
+	case SVC_ASYM:
+		return adf_fw_asym_config;
+	case SVC_ASYM_DC:
+	case SVC_DC_ASYM:
+		return adf_fw_asym_dc_config;
+	case SVC_SYM_DC:
+	case SVC_DC_SYM:
+		return adf_fw_sym_dc_config;
+	default:
+		return NULL;
+	}
+}
+
+static void update_ae_mask(struct adf_accel_dev *accel_dev)
+{
+	struct adf_hw_device_data *hw_data = GET_HW_DATA(accel_dev);
+	const struct adf_fw_config *fw_config;
+	u32 config_ae_mask = 0;
+	u32 ae_mask, num_objs;
+	int i;
+
+	ae_mask = get_ae_mask(hw_data);
+
+	/* Modify the AE mask based on the firmware configuration loaded */
+	fw_config = get_fw_config(accel_dev);
+	num_objs = uof_get_num_objs(accel_dev);
+
+	config_ae_mask |= ADF_420XX_ADMIN_AE_MASK;
+	for (i = 0; i < num_objs; i++)
+		config_ae_mask |= fw_config[i].ae_mask;
+
+	hw_data->ae_mask = ae_mask & config_ae_mask;
 }
 
 static u32 get_accel_cap(struct adf_accel_dev *accel_dev)
 {
-	struct pci_dev *pdev = accel_dev->accel_pci_dev.pci_dev;
 	u32 capabilities_sym, capabilities_asym, capabilities_dc;
+	struct pci_dev *pdev = accel_dev->accel_pci_dev.pci_dev;
 	u32 capabilities_dcc;
 	u32 fusectl1;
+
+	/* As a side effect, update ae_mask based on configuration */
+	update_ae_mask(accel_dev);
 
 	/* Read accelerator capabilities mask */
 	pci_read_config_dword(pdev, ADF_GEN4_FUSECTL1_OFFSET, &fusectl1);
@@ -124,7 +195,11 @@ static u32 get_accel_cap(struct adf_accel_dev *accel_dev)
 			  ICP_ACCEL_CAPABILITIES_AESGCM_SPC |
 			  ICP_ACCEL_CAPABILITIES_SM3 |
 			  ICP_ACCEL_CAPABILITIES_SM4 |
-			  ICP_ACCEL_CAPABILITIES_AES_V2;
+			  ICP_ACCEL_CAPABILITIES_AES_V2 |
+			  ICP_ACCEL_CAPABILITIES_ZUC |
+			  ICP_ACCEL_CAPABILITIES_ZUC_256 |
+			  ICP_ACCEL_CAPABILITIES_WIRELESS_CRYPTO_EXT |
+			  ICP_ACCEL_CAPABILITIES_EXT_ALGCHAIN;
 
 	/* A set bit in fusectl1 means the feature is OFF in this SKU */
 	if (fusectl1 & ICP_ACCEL_GEN4_MASK_CIPHER_SLICE) {
@@ -152,8 +227,21 @@ static u32 get_accel_cap(struct adf_accel_dev *accel_dev)
 		capabilities_sym &= ~ICP_ACCEL_CAPABILITIES_SM4;
 	}
 
+	if (fusectl1 & ICP_ACCEL_GEN4_MASK_WCP_WAT_SLICE) {
+		capabilities_sym &= ~ICP_ACCEL_CAPABILITIES_ZUC;
+		capabilities_sym &= ~ICP_ACCEL_CAPABILITIES_ZUC_256;
+		capabilities_sym &= ~ICP_ACCEL_CAPABILITIES_WIRELESS_CRYPTO_EXT;
+	}
+
+	if (fusectl1 & ICP_ACCEL_GEN4_MASK_EIA3_SLICE) {
+		capabilities_sym &= ~ICP_ACCEL_CAPABILITIES_ZUC;
+		capabilities_sym &= ~ICP_ACCEL_CAPABILITIES_ZUC_256;
+	}
+
+	if (fusectl1 & ICP_ACCEL_GEN4_MASK_ZUC_256_SLICE)
+		capabilities_sym &= ~ICP_ACCEL_CAPABILITIES_ZUC_256;
+
 	capabilities_asym = ICP_ACCEL_CAPABILITIES_CRYPTO_ASYMMETRIC |
-			  ICP_ACCEL_CAPABILITIES_CIPHER |
 			  ICP_ACCEL_CAPABILITIES_SM2 |
 			  ICP_ACCEL_CAPABILITIES_ECEDMONT;
 
@@ -221,44 +309,14 @@ static void adf_init_rl_data(struct adf_rl_hw_data *rl_data)
 	rl_data->l2c_offset = ADF_GEN4_RL_L2C_OFFSET;
 	rl_data->c2s_offset = ADF_GEN4_RL_C2S_OFFSET;
 
-	rl_data->pcie_scale_div = ADF_4XXX_RL_PCIE_SCALE_FACTOR_DIV;
-	rl_data->pcie_scale_mul = ADF_4XXX_RL_PCIE_SCALE_FACTOR_MUL;
-	rl_data->dcpr_correction = ADF_4XXX_RL_DCPR_CORRECTION;
-	rl_data->max_tp[ADF_SVC_ASYM] = ADF_4XXX_RL_MAX_TP_ASYM;
-	rl_data->max_tp[ADF_SVC_SYM] = ADF_4XXX_RL_MAX_TP_SYM;
-	rl_data->max_tp[ADF_SVC_DC] = ADF_4XXX_RL_MAX_TP_DC;
-	rl_data->scan_interval = ADF_4XXX_RL_SCANS_PER_SEC;
-	rl_data->scale_ref = ADF_4XXX_RL_SLICE_REF;
-}
-
-static u32 uof_get_num_objs(struct adf_accel_dev *accel_dev)
-{
-	return ARRAY_SIZE(adf_fw_cy_config);
-}
-
-static const struct adf_fw_config *get_fw_config(struct adf_accel_dev *accel_dev)
-{
-	switch (adf_get_service_enabled(accel_dev)) {
-	case SVC_CY:
-	case SVC_CY2:
-		return adf_fw_cy_config;
-	case SVC_DC:
-		return adf_fw_dc_config;
-	case SVC_DCC:
-		return adf_fw_dcc_config;
-	case SVC_SYM:
-		return adf_fw_sym_config;
-	case SVC_ASYM:
-		return adf_fw_asym_config;
-	case SVC_ASYM_DC:
-	case SVC_DC_ASYM:
-		return adf_fw_asym_dc_config;
-	case SVC_SYM_DC:
-	case SVC_DC_SYM:
-		return adf_fw_sym_dc_config;
-	default:
-		return NULL;
-	}
+	rl_data->pcie_scale_div = ADF_420XX_RL_PCIE_SCALE_FACTOR_DIV;
+	rl_data->pcie_scale_mul = ADF_420XX_RL_PCIE_SCALE_FACTOR_MUL;
+	rl_data->dcpr_correction = ADF_420XX_RL_DCPR_CORRECTION;
+	rl_data->max_tp[ADF_SVC_ASYM] = ADF_420XX_RL_MAX_TP_ASYM;
+	rl_data->max_tp[ADF_SVC_SYM] = ADF_420XX_RL_MAX_TP_SYM;
+	rl_data->max_tp[ADF_SVC_DC] = ADF_420XX_RL_MAX_TP_DC;
+	rl_data->scan_interval = ADF_420XX_RL_SCANS_PER_SEC;
+	rl_data->scale_ref = ADF_420XX_RL_SLICE_REF;
 }
 
 static int get_rp_group(struct adf_accel_dev *accel_dev, u32 ae_mask)
@@ -267,7 +325,13 @@ static int get_rp_group(struct adf_accel_dev *accel_dev, u32 ae_mask)
 	case ADF_AE_GROUP_0:
 		return RP_GROUP_0;
 	case ADF_AE_GROUP_1:
+	case ADF_AE_GROUP_3:
 		return RP_GROUP_1;
+	case ADF_AE_GROUP_2:
+		if (get_fw_config(accel_dev) == adf_fw_cy_config)
+			return RP_GROUP_0;
+		else
+			return RP_GROUP_1;
 	default:
 		dev_dbg(&GET_DEV(accel_dev), "ae_mask not recognized");
 		return -EINVAL;
@@ -297,29 +361,6 @@ static u32 get_ena_thd_mask(struct adf_accel_dev *accel_dev, u32 obj_num)
 	}
 }
 
-static u32 get_ena_thd_mask_401xx(struct adf_accel_dev *accel_dev, u32 obj_num)
-{
-	const struct adf_fw_config *fw_config;
-
-	if (obj_num >= uof_get_num_objs(accel_dev))
-		return ADF_GEN4_ENA_THD_MASK_ERROR;
-
-	fw_config = get_fw_config(accel_dev);
-	if (!fw_config)
-		return ADF_GEN4_ENA_THD_MASK_ERROR;
-
-	switch (fw_config[obj_num].obj) {
-	case ADF_FW_ASYM_OBJ:
-		return ENA_THD_MASK_ASYM_401XX;
-	case ADF_FW_SYM_OBJ:
-		return ENA_THD_MASK_SYM;
-	case ADF_FW_DC_OBJ:
-		return ENA_THD_MASK_DC;
-	default:
-		return ADF_GEN4_ENA_THD_MASK_ERROR;
-	}
-}
-
 static const char *uof_get_name(struct adf_accel_dev *accel_dev, u32 obj_num,
 				const char * const fw_objs[], int num_objs)
 {
@@ -338,18 +379,11 @@ static const char *uof_get_name(struct adf_accel_dev *accel_dev, u32 obj_num,
 	return fw_objs[id];
 }
 
-static const char *uof_get_name_4xxx(struct adf_accel_dev *accel_dev, u32 obj_num)
+static const char *uof_get_name_420xx(struct adf_accel_dev *accel_dev, u32 obj_num)
 {
-	int num_fw_objs = ARRAY_SIZE(adf_4xxx_fw_objs);
+	int num_fw_objs = ARRAY_SIZE(adf_420xx_fw_objs);
 
-	return uof_get_name(accel_dev, obj_num, adf_4xxx_fw_objs, num_fw_objs);
-}
-
-static const char *uof_get_name_402xx(struct adf_accel_dev *accel_dev, u32 obj_num)
-{
-	int num_fw_objs = ARRAY_SIZE(adf_402xx_fw_objs);
-
-	return uof_get_name(accel_dev, obj_num, adf_402xx_fw_objs, num_fw_objs);
+	return uof_get_name(accel_dev, obj_num, adf_420xx_fw_objs, num_fw_objs);
 }
 
 static int uof_get_obj_type(struct adf_accel_dev *accel_dev, u32 obj_num)
@@ -379,23 +413,23 @@ static u32 uof_get_ae_mask(struct adf_accel_dev *accel_dev, u32 obj_num)
 
 static void adf_gen4_set_err_mask(struct adf_dev_err_mask *dev_err_mask)
 {
-	dev_err_mask->cppagentcmdpar_mask = ADF_4XXX_HICPPAGENTCMDPARERRLOG_MASK;
-	dev_err_mask->parerr_ath_cph_mask = ADF_4XXX_PARITYERRORMASK_ATH_CPH_MASK;
-	dev_err_mask->parerr_cpr_xlt_mask = ADF_4XXX_PARITYERRORMASK_CPR_XLT_MASK;
-	dev_err_mask->parerr_dcpr_ucs_mask = ADF_4XXX_PARITYERRORMASK_DCPR_UCS_MASK;
-	dev_err_mask->parerr_pke_mask = ADF_4XXX_PARITYERRORMASK_PKE_MASK;
-	dev_err_mask->ssmfeatren_mask = ADF_4XXX_SSMFEATREN_MASK;
+	dev_err_mask->cppagentcmdpar_mask = ADF_420XX_HICPPAGENTCMDPARERRLOG_MASK;
+	dev_err_mask->parerr_ath_cph_mask = ADF_420XX_PARITYERRORMASK_ATH_CPH_MASK;
+	dev_err_mask->parerr_cpr_xlt_mask = ADF_420XX_PARITYERRORMASK_CPR_XLT_MASK;
+	dev_err_mask->parerr_dcpr_ucs_mask = ADF_420XX_PARITYERRORMASK_DCPR_UCS_MASK;
+	dev_err_mask->parerr_pke_mask = ADF_420XX_PARITYERRORMASK_PKE_MASK;
+	dev_err_mask->ssmfeatren_mask = ADF_420XX_SSMFEATREN_MASK;
 }
 
-void adf_init_hw_data_4xxx(struct adf_hw_device_data *hw_data, u32 dev_id)
+void adf_init_hw_data_420xx(struct adf_hw_device_data *hw_data, u32 dev_id)
 {
-	hw_data->dev_class = &adf_4xxx_class;
-	hw_data->instance_id = adf_4xxx_class.instances++;
+	hw_data->dev_class = &adf_420xx_class;
+	hw_data->instance_id = adf_420xx_class.instances++;
 	hw_data->num_banks = ADF_GEN4_ETR_MAX_BANKS;
 	hw_data->num_banks_per_vf = ADF_GEN4_NUM_BANKS_PER_VF;
 	hw_data->num_rings_per_bank = ADF_GEN4_NUM_RINGS_PER_BANK;
 	hw_data->num_accel = ADF_GEN4_MAX_ACCELERATORS;
-	hw_data->num_engines = ADF_4XXX_MAX_ACCELENGINES;
+	hw_data->num_engines = ADF_420XX_MAX_ACCELENGINES;
 	hw_data->num_logical_accel = 1;
 	hw_data->tx_rx_gap = ADF_GEN4_RX_RINGS_OFFSET;
 	hw_data->tx_rings_mask = ADF_GEN4_TX_RINGS_MASK;
@@ -423,32 +457,16 @@ void adf_init_hw_data_4xxx(struct adf_hw_device_data *hw_data, u32 dev_id)
 	hw_data->enable_ints = adf_gen4_enable_ints;
 	hw_data->init_device = adf_gen4_init_device;
 	hw_data->reset_device = adf_reset_flr;
-	hw_data->admin_ae_mask = ADF_4XXX_ADMIN_AE_MASK;
+	hw_data->admin_ae_mask = ADF_420XX_ADMIN_AE_MASK;
 	hw_data->num_rps = ADF_GEN4_MAX_RPS;
-	switch (dev_id) {
-	case ADF_402XX_PCI_DEVICE_ID:
-		hw_data->fw_name = ADF_402XX_FW;
-		hw_data->fw_mmp_name = ADF_402XX_MMP;
-		hw_data->uof_get_name = uof_get_name_402xx;
-		hw_data->get_ena_thd_mask = get_ena_thd_mask;
-		break;
-	case ADF_401XX_PCI_DEVICE_ID:
-		hw_data->fw_name = ADF_4XXX_FW;
-		hw_data->fw_mmp_name = ADF_4XXX_MMP;
-		hw_data->uof_get_name = uof_get_name_4xxx;
-		hw_data->get_ena_thd_mask = get_ena_thd_mask_401xx;
-		break;
-	default:
-		hw_data->fw_name = ADF_4XXX_FW;
-		hw_data->fw_mmp_name = ADF_4XXX_MMP;
-		hw_data->uof_get_name = uof_get_name_4xxx;
-		hw_data->get_ena_thd_mask = get_ena_thd_mask;
-		break;
-	}
+	hw_data->fw_name = ADF_420XX_FW;
+	hw_data->fw_mmp_name = ADF_420XX_MMP;
+	hw_data->uof_get_name = uof_get_name_420xx;
 	hw_data->uof_get_num_objs = uof_get_num_objs;
 	hw_data->uof_get_obj_type = uof_get_obj_type;
 	hw_data->uof_get_ae_mask = uof_get_ae_mask;
 	hw_data->get_rp_group = get_rp_group;
+	hw_data->get_ena_thd_mask = get_ena_thd_mask;
 	hw_data->set_msix_rttable = adf_gen4_set_msix_default_rttable;
 	hw_data->set_ssm_wdtimer = adf_gen4_set_ssm_wdtimer;
 	hw_data->get_ring_to_svc_map = adf_gen4_get_ring_to_svc_map;
@@ -461,7 +479,7 @@ void adf_init_hw_data_4xxx(struct adf_hw_device_data *hw_data, u32 dev_id)
 	hw_data->stop_timer = adf_gen4_timer_stop;
 	hw_data->get_hb_clock = adf_gen4_get_heartbeat_clock;
 	hw_data->num_hb_ctrs = ADF_NUM_HB_CNT_PER_AE;
-	hw_data->clock_frequency = ADF_4XXX_AE_FREQ;
+	hw_data->clock_frequency = ADF_420XX_AE_FREQ;
 
 	adf_gen4_set_err_mask(&hw_data->dev_err_mask);
 	adf_gen4_init_hw_csr_ops(&hw_data->csr_ops);
@@ -472,7 +490,7 @@ void adf_init_hw_data_4xxx(struct adf_hw_device_data *hw_data, u32 dev_id)
 	adf_init_rl_data(&hw_data->rl_data);
 }
 
-void adf_clean_hw_data_4xxx(struct adf_hw_device_data *hw_data)
+void adf_clean_hw_data_420xx(struct adf_hw_device_data *hw_data)
 {
 	hw_data->dev_class->instances--;
 }
