@@ -950,7 +950,7 @@ asmlinkage __visible void __init __no_sanitize_address __noreturn start_kernel(v
 	boot_cpu_hotplug_init();
 
 	build_all_zonelists(NULL);
-	page_alloc_init();
+	page_alloc_init_cpuhp();
 
 	pr_notice("Kernel command line: %s\n", saved_command_line);
 	/* parameters may set static keys */
