@@ -518,6 +518,12 @@ static int __mpage_writepage(struct folio *folio, struct writeback_control *wbc,
 	 */
 	BUG_ON(!folio_test_uptodate(folio));
 	block_in_file = (sector_t)folio->index << (PAGE_SHIFT - blkbits);
+	/*
+	 * Whole page beyond EOF? Skip allocating blocks to avoid leaking
+	 * space.
+	 */
+	if (block_in_file >= (i_size + (1 << blkbits) - 1) >> blkbits)
+		goto page_is_mapped;
 	last_block = (i_size - 1) >> blkbits;
 	map_bh.b_folio = folio;
 	for (page_block = 0; page_block < blocks_per_page; ) {
