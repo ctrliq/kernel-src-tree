@@ -5819,7 +5819,7 @@ static journal_t *ext4_get_dev_journal(struct super_block *sb,
 	up_write(&sb->s_umount);
 	bdev_handle = ext4_blkdev_get(j_dev, sb);
 	down_write(&sb->s_umount);
-	if (IS_ERR(bdev_handle))
+	if (bdev_handle == NULL)
 		return NULL;
 
 	bdev = bdev_handle->bdev;
