@@ -45,7 +45,7 @@ Install the dependencies for generating source RPM packages:
 
 .. code-block:: sh
 
-   sudo dnf install git make gcc flex bison bzip2 rpm-build
+   sudo dnf install git make gcc flex bison bzip2 rpm-build python3-pyyaml
 
 Then clone the repository. To use SSH, `register your SSH key`_ in GitLab first.
 
