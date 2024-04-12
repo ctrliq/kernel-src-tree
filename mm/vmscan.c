@@ -193,7 +193,6 @@ int vm_swappiness = 60;
 LIST_HEAD(shrinker_list);
 DECLARE_RWSEM(shrinker_rwsem);
 DEFINE_SRCU(shrinker_srcu);
-static atomic_t shrinker_srcu_generation = ATOMIC_INIT(0);
 
 #ifdef CONFIG_MEMCG
 static int shrinker_nr_max;
@@ -819,7 +818,6 @@ void unregister_shrinker(struct shrinker *shrinker)
 	debugfs_entry = shrinker_debugfs_detach(shrinker, &debugfs_id);
 	up_write(&shrinker_rwsem);
 
-	atomic_inc(&shrinker_srcu_generation);
 	synchronize_srcu(&shrinker_srcu);
 
 	shrinker_debugfs_remove(debugfs_entry, debugfs_id);
@@ -841,7 +839,6 @@ void synchronize_shrinkers(void)
 {
 	down_write(&shrinker_rwsem);
 	up_write(&shrinker_rwsem);
-	atomic_inc(&shrinker_srcu_generation);
 	synchronize_srcu(&shrinker_srcu);
 }
 EXPORT_SYMBOL(synchronize_shrinkers);
@@ -951,20 +948,18 @@ static unsigned long shrink_slab_memcg(gfp_t gfp_mask, int nid,
 {
 	struct shrinker_info *info;
 	unsigned long ret, freed = 0;
-	int srcu_idx, generation;
-	int i = 0;
+	int srcu_idx;
+	int i;
 
 	if (!mem_cgroup_online(memcg))
 		return 0;
 
-again:
 	srcu_idx = srcu_read_lock(&shrinker_srcu);
 	info = shrinker_info_srcu(memcg, nid);
 	if (unlikely(!info))
 		goto unlock;
 
-	generation = atomic_read(&shrinker_srcu_generation);
-	for_each_set_bit_from(i, info->map, info->map_nr_max) {
+	for_each_set_bit(i, info->map, info->map_nr_max) {
 		struct shrink_control sc = {
 			.gfp_mask = gfp_mask,
 			.nid = nid,
@@ -1010,11 +1005,6 @@ again:
 				set_shrinker_bit(memcg, nid, i);
 		}
 		freed += ret;
-		if (atomic_read(&shrinker_srcu_generation) != generation) {
-			srcu_read_unlock(&shrinker_srcu, srcu_idx);
-			i++;
-			goto again;
-		}
 	}
 unlock:
 	srcu_read_unlock(&shrinker_srcu, srcu_idx);
@@ -1054,7 +1044,7 @@ static unsigned long shrink_slab(gfp_t gfp_mask, int nid,
 {
 	unsigned long ret, freed = 0;
 	struct shrinker *shrinker;
-	int srcu_idx, generation;
+	int srcu_idx;
 
 	/*
 	 * The root memcg might be allocated even though memcg is disabled
@@ -1068,7 +1058,6 @@ static unsigned long shrink_slab(gfp_t gfp_mask, int nid,
 
 	srcu_idx = srcu_read_lock(&shrinker_srcu);
 
-	generation = atomic_read(&shrinker_srcu_generation);
 	list_for_each_entry_srcu(shrinker, &shrinker_list, list,
 				 srcu_read_lock_held(&shrinker_srcu)) {
 		struct shrink_control sc = {
@@ -1081,11 +1070,6 @@ static unsigned long shrink_slab(gfp_t gfp_mask, int nid,
 		if (ret == SHRINK_EMPTY)
 			ret = 0;
 		freed += ret;
-
-		if (atomic_read(&shrinker_srcu_generation) != generation) {
-			freed = freed ? : 1;
-			break;
-		}
 	}
 
 	srcu_read_unlock(&shrinker_srcu, srcu_idx);
