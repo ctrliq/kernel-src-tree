@@ -3839,9 +3839,6 @@ end:
 	return ERR_PTR(ret);
 }
 
-#define GRAPH_ROOT_MASK (BPF_LIST_HEAD | BPF_RB_ROOT)
-#define GRAPH_NODE_MASK (BPF_LIST_NODE | BPF_RB_NODE)
-
 int btf_check_and_fixup_fields(const struct btf *btf, struct btf_record *rec)
 {
 	int i;
@@ -3854,13 +3851,13 @@ int btf_check_and_fixup_fields(const struct btf *btf, struct btf_record *rec)
 	 * Hence we only need to ensure that bpf_{list_head,rb_root} ownership
 	 * does not form cycles.
 	 */
-	if (IS_ERR_OR_NULL(rec) || !(rec->field_mask & GRAPH_ROOT_MASK))
+	if (IS_ERR_OR_NULL(rec) || !(rec->field_mask & BPF_GRAPH_ROOT))
 		return 0;
 	for (i = 0; i < rec->cnt; i++) {
 		struct btf_struct_meta *meta;
 		u32 btf_id;
 
-		if (!(rec->fields[i].type & GRAPH_ROOT_MASK))
+		if (!(rec->fields[i].type & BPF_GRAPH_ROOT))
 			continue;
 		btf_id = rec->fields[i].graph_root.value_btf_id;
 		meta = btf_find_struct_meta(btf, btf_id);
@@ -3872,7 +3869,7 @@ int btf_check_and_fixup_fields(const struct btf *btf, struct btf_record *rec)
 		 * to check ownership cycle for a type unless it's also a
 		 * node type.
 		 */
-		if (!(rec->field_mask & GRAPH_NODE_MASK))
+		if (!(rec->field_mask & BPF_GRAPH_NODE))
 			continue;
 
 		/* We need to ensure ownership acyclicity among all types. The
@@ -3908,7 +3905,7 @@ int btf_check_and_fixup_fields(const struct btf *btf, struct btf_record *rec)
 		 * - A is both an root and node.
 		 * - B is only an node.
 		 */
-		if (meta->record->field_mask & GRAPH_ROOT_MASK)
+		if (meta->record->field_mask & BPF_GRAPH_ROOT)
 			return -ELOOP;
 	}
 	return 0;
