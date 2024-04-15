@@ -1779,10 +1779,14 @@ static void __mark_reg_known_zero(struct bpf_reg_state *reg)
 	__mark_reg_known(reg, 0);
 }
 
-static void __mark_reg_const_zero(struct bpf_reg_state *reg)
+static void __mark_reg_const_zero(const struct bpf_verifier_env *env, struct bpf_reg_state *reg)
 {
 	__mark_reg_known(reg, 0);
 	reg->type = SCALAR_VALUE;
+	/* all scalars are assumed imprecise initially (unless unprivileged,
+	 * in which case everything is forced to be precise)
+	 */
+	reg->precise = !env->bpf_capable;
 }
 
 static void mark_reg_known_zero(struct bpf_verifier_env *env,
@@ -4708,21 +4712,10 @@ static void mark_reg_stack_read(struct bpf_verifier_env *env,
 		zeros++;
 	}
 	if (zeros == max_off - min_off) {
-		/* any access_size read into register is zero extended,
-		 * so the whole register == const_zero
+		/* Any access_size read into register is zero extended,
+		 * so the whole register == const_zero.
 		 */
-		__mark_reg_const_zero(&state->regs[dst_regno]);
-		/* backtracking doesn't support STACK_ZERO yet,
-		 * so mark it precise here, so that later
-		 * backtracking can stop here.
-		 * Backtracking may not need this if this register
-		 * doesn't participate in pointer adjustment.
-		 * Forward propagation of precise flag is not
-		 * necessary either. This mark is only to stop
-		 * backtracking. Any register that contributed
-		 * to const 0 was marked precise before spill.
-		 */
-		state->regs[dst_regno].precise = true;
+		__mark_reg_const_zero(env, &state->regs[dst_regno]);
 	} else {
 		/* have read misc data from the stack */
 		mark_reg_unknown(env, state->regs, dst_regno);
@@ -4805,11 +4798,11 @@ static int check_stack_read_fixed_off(struct bpf_verifier_env *env,
 
 				if (spill_cnt == size &&
 				    tnum_is_const(reg->var_off) && reg->var_off.value == 0) {
-					__mark_reg_const_zero(&state->regs[dst_regno]);
+					__mark_reg_const_zero(env, &state->regs[dst_regno]);
 					/* this IS register fill, so keep insn_flags */
 				} else if (zero_cnt == size) {
 					/* similarly to mark_reg_stack_read(), preserve zeroes */
-					__mark_reg_const_zero(&state->regs[dst_regno]);
+					__mark_reg_const_zero(env, &state->regs[dst_regno]);
 					insn_flags = 0; /* not restoring original register state */
 				} else {
 					mark_reg_unknown(env, state->regs, dst_regno);
@@ -7965,7 +7958,7 @@ static int process_iter_next_call(struct bpf_verifier_env *env, int insn_idx,
 	/* switch to DRAINED state, but keep the depth unchanged */
 	/* mark current iter state as drained and assume returned NULL */
 	cur_iter->iter.state = BPF_ITER_STATE_DRAINED;
-	__mark_reg_const_zero(&cur_fr->regs[BPF_REG_0]);
+	__mark_reg_const_zero(env, &cur_fr->regs[BPF_REG_0]);
 
 	return 0;
 }
