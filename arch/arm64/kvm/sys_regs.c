@@ -31,6 +31,7 @@
 
 #include <trace/events/kvm.h>
 
+#include "check-res-bits.h"
 #include "sys_regs.h"
 
 #include "trace.h"
@@ -4023,6 +4024,8 @@ int __init kvm_sys_reg_table_init(void)
 	bool valid = true;
 	unsigned int i;
 	int ret = 0;
+
+	check_res_bits();
 
 	/* Make sure tables are unique and in order. */
 	valid &= check_sysreg_table(sys_reg_descs, ARRAY_SIZE(sys_reg_descs), false);
