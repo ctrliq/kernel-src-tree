@@ -930,6 +930,13 @@ int __must_check try_grab_page(struct page *page, unsigned int flags);
 void free_zone_device_page(struct page *page);
 int migrate_device_coherent_page(struct page *page);
 
+/*
+ * mm/huge_memory.c
+ */
+struct page *follow_trans_huge_pmd(struct vm_area_struct *vma,
+				   unsigned long addr, pmd_t *pmd,
+				   unsigned int flags);
+
 enum {
 	/* mark page accessed */
 	FOLL_TOUCH = 1 << 16,
