@@ -102,6 +102,7 @@ void kvm_vcpu_pmu_resync_el0(void);
 
 u8 kvm_arm_pmu_get_pmuver_limit(void);
 u64 kvm_pmu_evtyper_mask(struct kvm *kvm);
+int kvm_arm_set_default_pmu(struct kvm *kvm);
 
 #else
 struct kvm_pmu {
@@ -178,6 +179,11 @@ static inline u64 kvm_pmu_evtyper_mask(struct kvm *kvm)
 	return 0;
 }
 static inline void kvm_vcpu_pmu_resync_el0(void) {}
+
+static inline int kvm_arm_set_default_pmu(struct kvm *kvm)
+{
+	return -ENODEV;
+}
 
 #endif
 
