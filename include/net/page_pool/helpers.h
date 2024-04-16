@@ -18,9 +18,8 @@
  *
  * API keeps track of in-flight pages, in-order to let API user know
  * when it is safe to dealloactor page_pool object.  Thus, API users
- * must make sure to call page_pool_release_page() when a page is
- * "leaving" the page_pool.  Or call page_pool_put_page() where
- * appropiate.  For maintaining correct accounting.
+ * must call page_pool_put_page() where appropriate and only attach
+ * the page to a page_pool-aware objects, like skbs marked for recycling.
  *
  * API user must only call page_pool_put_page() once on a page, as it
  * will either recycle the page, or in case of elevated refcnt, it

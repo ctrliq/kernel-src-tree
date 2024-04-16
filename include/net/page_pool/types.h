@@ -194,7 +194,6 @@ void page_pool_unlink_napi(struct page_pool *pool);
 void page_pool_destroy(struct page_pool *pool);
 void page_pool_use_xdp_mem(struct page_pool *pool, void (*disconnect)(void *),
 			   struct xdp_mem_info *mem);
-void page_pool_release_page(struct page_pool *pool, struct page *page);
 void page_pool_put_page_bulk(struct page_pool *pool, void **data,
 			     int count);
 #else
@@ -209,11 +208,6 @@ static inline void page_pool_destroy(struct page_pool *pool)
 static inline void page_pool_use_xdp_mem(struct page_pool *pool,
 					 void (*disconnect)(void *),
 					 struct xdp_mem_info *mem)
-{
-}
-
-static inline void page_pool_release_page(struct page_pool *pool,
-					  struct page *page)
 {
 }
 

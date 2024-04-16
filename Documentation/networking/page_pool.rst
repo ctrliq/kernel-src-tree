@@ -13,9 +13,9 @@ replacing dev_alloc_pages().
 
 API keeps track of in-flight pages, in order to let API user know
 when it is safe to free a page_pool object.  Thus, API users
-must run page_pool_release_page() when a page is leaving the page_pool or
-call page_pool_put_page() where appropriate in order to maintain correct
-accounting.
+must call page_pool_put_page() to free the page, or attach
+the page to a page_pool-aware objects like skbs marked with
+skb_mark_for_recycle().
 
 API user must call page_pool_put_page() once on a page, as it
 will either recycle the page, or in case of refcnt > 1, it will
@@ -175,7 +175,7 @@ NAPI poller
             if XDP_DROP:
                 page_pool_recycle_direct(page_pool, page);
         } else (packet_is_skb) {
-            page_pool_release_page(page_pool, page);
+            skb_mark_for_recycle(skb);
             new_page = page_pool_dev_alloc_pages(page_pool);
         }
     }
