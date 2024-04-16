@@ -316,6 +316,7 @@ MODULE_AUTHOR("Matthew Garrett, Jeremy Kerr");
 MODULE_DESCRIPTION("EFI Variable Filesystem");
 MODULE_LICENSE("GPL");
 MODULE_ALIAS_FS("efivarfs");
+MODULE_IMPORT_NS(EFIVAR);
 
 module_init(efivarfs_init);
 module_exit(efivarfs_exit);
