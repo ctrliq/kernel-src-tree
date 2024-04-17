@@ -1,12 +1,12 @@
 /* SPDX-License-Identifier: GPL-2.0 */
-/* Marvell Octeon EP (EndPoint) Ethernet Driver
+/* Marvell Octeon EP (EndPoint) VF Ethernet Driver
  *
  * Copyright (C) 2020 Marvell.
  *
  */
 
-#ifndef _OCTEP_TX_H_
-#define _OCTEP_TX_H_
+#ifndef _OCTEP_VF_TX_H_
+#define _OCTEP_VF_TX_H_
 
 #define IQ_SEND_OK          0
 #define IQ_SEND_STOP        1
@@ -32,12 +32,12 @@
  * |                Ptr 3                  |
  * -----------------------------------------
  */
-struct octep_tx_sglist_desc {
+struct octep_vf_tx_sglist_desc {
 	u16 len[4];
 	dma_addr_t dma_ptr[4];
 };
 
-static_assert(sizeof(struct octep_tx_sglist_desc) == 40);
+static_assert(sizeof(struct octep_vf_tx_sglist_desc) == 40);
 
 /* Each Scatter/Gather entry sent to hardwar hold four pointers.
  * So, number of entries required is (MAX_SKB_FRAGS + 1)/4, where '+1'
@@ -45,22 +45,22 @@ static_assert(sizeof(struct octep_tx_sglist_desc) == 40);
  * To allocate sufficient SGLIST entries for a packet with max fragments,
  * align by adding 3 before calcuating max SGLIST entries per packet.
  */
-#define OCTEP_SGLIST_ENTRIES_PER_PKT ((MAX_SKB_FRAGS + 1 + 3) / 4)
-#define OCTEP_SGLIST_SIZE_PER_PKT \
-	(OCTEP_SGLIST_ENTRIES_PER_PKT * sizeof(struct octep_tx_sglist_desc))
+#define OCTEP_VF_SGLIST_ENTRIES_PER_PKT ((MAX_SKB_FRAGS + 1 + 3) / 4)
+#define OCTEP_VF_SGLIST_SIZE_PER_PKT \
+	(OCTEP_VF_SGLIST_ENTRIES_PER_PKT * sizeof(struct octep_vf_tx_sglist_desc))
 
-struct octep_tx_buffer {
+struct octep_vf_tx_buffer {
 	struct sk_buff *skb;
 	dma_addr_t dma;
-	struct octep_tx_sglist_desc *sglist;
+	struct octep_vf_tx_sglist_desc *sglist;
 	dma_addr_t sglist_dma;
 	u8 gather;
 };
 
-#define OCTEP_IQ_TXBUFF_INFO_SIZE (sizeof(struct octep_tx_buffer))
+#define OCTEP_VF_IQ_TXBUFF_INFO_SIZE (sizeof(struct octep_vf_tx_buffer))
 
-/* Hardware interface Tx statistics */
-struct octep_iface_tx_stats {
+/* VF Hardware interface Tx statistics */
+struct octep_vf_iface_tx_stats {
 	/* Total frames sent on the interface */
 	u64 pkts;
 
@@ -73,57 +73,15 @@ struct octep_iface_tx_stats {
 	/* Packets sent to the multicast DMAC */
 	u64 mcst;
 
-	/* Packets dropped due to excessive collisions */
-	u64 xscol;
+	/* Packets dropped */
+	u64 dropped;
 
-	/* Packets dropped due to excessive deferral */
-	u64 xsdef;
-
-	/* Packets sent that experienced multiple collisions before successful
-	 * transmission
-	 */
-	u64 mcol;
-
-	/* Packets sent that experienced a single collision before successful
-	 * transmission
-	 */
-	u64 scol;
-
-	/* Packets sent with an octet count < 64 */
-	u64 hist_lt64;
-
-	/* Packets sent with an octet count == 64 */
-	u64 hist_eq64;
-
-	/* Packets sent with an octet count of 65–127 */
-	u64 hist_65to127;
-
-	/* Packets sent with an octet count of 128–255 */
-	u64 hist_128to255;
-
-	/* Packets sent with an octet count of 256–511 */
-	u64 hist_256to511;
-
-	/* Packets sent with an octet count of 512–1023 */
-	u64 hist_512to1023;
-
-	/* Packets sent with an octet count of 1024-1518 */
-	u64 hist_1024to1518;
-
-	/* Packets sent with an octet count of > 1518 */
-	u64 hist_gt1518;
-
-	/* Packets sent that experienced a transmit underflow and were
-	 * truncated
-	 */
-	u64 undflw;
-
-	/* Control/PAUSE packets sent */
-	u64 ctl;
+	/* Reserved */
+	u64 reserved[13];
 };
 
-/* Input Queue statistics. Each input queue has four stats fields. */
-struct octep_iq_stats {
+/* VF Input Queue statistics */
+struct octep_vf_iq_stats {
 	/* Instructions posted to this queue. */
 	u64 instr_posted;
 
@@ -151,10 +109,10 @@ struct octep_iq_stats {
  * data to Octeon device from the host. Each input queue (up to 4) for
  * a Octeon device has one such structure to represent it.
  */
-struct octep_iq {
+struct octep_vf_iq {
 	u32 q_no;
 
-	struct octep_device *octep_dev;
+	struct octep_vf_device *octep_vf_dev;
 	struct net_device *netdev;
 	struct device *dev;
 	struct netdev_queue *netdev_q;
@@ -163,7 +121,7 @@ struct octep_iq {
 	u16 host_write_index;
 
 	/* Index in input ring where Octeon is expected to read next packet */
-	u16 octep_read_index;
+	u16 octep_vf_read_index;
 
 	/* This index aids in finding the window in the queue where Octeon
 	 * has read the commands.
@@ -171,19 +129,19 @@ struct octep_iq {
 	u16 flush_index;
 
 	/* Statistics for this input queue. */
-	struct octep_iq_stats stats;
+	struct octep_vf_iq_stats stats;
 
 	/* Pointer to the Virtual Base addr of the input ring. */
-	struct octep_tx_desc_hw *desc_ring;
+	struct octep_vf_tx_desc_hw *desc_ring;
 
 	/* DMA mapped base address of the input descriptor ring. */
 	dma_addr_t desc_ring_dma;
 
 	/* Info of Tx buffers pending completion. */
-	struct octep_tx_buffer *buff_info;
+	struct octep_vf_tx_buffer *buff_info;
 
 	/* Base pointer to Scatter/Gather lists for all ring descriptors. */
-	struct octep_tx_sglist_desc *sglist;
+	struct octep_vf_tx_sglist_desc *sglist;
 
 	/* DMA mapped addr of Scatter Gather Lists */
 	dma_addr_t sglist_dma;
@@ -216,7 +174,7 @@ struct octep_iq {
 };
 
 /* Hardware Tx Instruction Header */
-struct octep_instr_hdr {
+struct octep_vf_instr_hdr {
 	/* Data Len */
 	u64 tlen:16;
 
@@ -239,35 +197,34 @@ struct octep_instr_hdr {
 	u64 reserved3:1;
 };
 
-static_assert(sizeof(struct octep_instr_hdr) == 8);
+static_assert(sizeof(struct octep_vf_instr_hdr) == 8);
 
 /* Tx offload flags */
-#define OCTEP_TX_OFFLOAD_VLAN_INSERT   BIT(0)
-#define OCTEP_TX_OFFLOAD_IPV4_CKSUM    BIT(1)
-#define OCTEP_TX_OFFLOAD_UDP_CKSUM     BIT(2)
-#define OCTEP_TX_OFFLOAD_TCP_CKSUM     BIT(3)
-#define OCTEP_TX_OFFLOAD_SCTP_CKSUM    BIT(4)
-#define OCTEP_TX_OFFLOAD_TCP_TSO       BIT(5)
-#define OCTEP_TX_OFFLOAD_UDP_TSO       BIT(6)
+#define OCTEP_VF_TX_OFFLOAD_VLAN_INSERT	BIT(0)
+#define OCTEP_VF_TX_OFFLOAD_IPV4_CKSUM	BIT(1)
+#define OCTEP_VF_TX_OFFLOAD_UDP_CKSUM	BIT(2)
+#define OCTEP_VF_TX_OFFLOAD_TCP_CKSUM	BIT(3)
+#define OCTEP_VF_TX_OFFLOAD_SCTP_CKSUM	BIT(4)
+#define OCTEP_VF_TX_OFFLOAD_TCP_TSO	BIT(5)
+#define OCTEP_VF_TX_OFFLOAD_UDP_TSO	BIT(6)
 
-#define OCTEP_TX_OFFLOAD_CKSUM         (OCTEP_TX_OFFLOAD_IPV4_CKSUM | \
-					OCTEP_TX_OFFLOAD_UDP_CKSUM | \
-					OCTEP_TX_OFFLOAD_TCP_CKSUM)
+#define OCTEP_VF_TX_OFFLOAD_CKSUM	(OCTEP_VF_TX_OFFLOAD_IPV4_CKSUM | \
+					 OCTEP_VF_TX_OFFLOAD_UDP_CKSUM | \
+					 OCTEP_VF_TX_OFFLOAD_TCP_CKSUM)
 
-#define OCTEP_TX_OFFLOAD_TSO           (OCTEP_TX_OFFLOAD_TCP_TSO | \
-					OCTEP_TX_OFFLOAD_UDP_TSO)
+#define OCTEP_VF_TX_OFFLOAD_TSO		(OCTEP_VF_TX_OFFLOAD_TCP_TSO | \
+					 OCTEP_VF_TX_OFFLOAD_UDP_TSO)
 
-#define OCTEP_TX_IP_CSUM(flags)		((flags) & \
-					 (OCTEP_TX_OFFLOAD_IPV4_CKSUM | \
-					  OCTEP_TX_OFFLOAD_TCP_CKSUM | \
-					  OCTEP_TX_OFFLOAD_UDP_CKSUM))
+#define OCTEP_VF_TX_IP_CSUM(flags)	((flags) & \
+					 (OCTEP_VF_TX_OFFLOAD_IPV4_CKSUM | \
+					  OCTEP_VF_TX_OFFLOAD_TCP_CKSUM | \
+					  OCTEP_VF_TX_OFFLOAD_UDP_CKSUM))
 
-#define OCTEP_TX_TSO(flags)		((flags) & \
-					 (OCTEP_TX_OFFLOAD_TCP_TSO | \
-					  OCTEP_TX_OFFLOAD_UDP_TSO))
+#define OCTEP_VF_TX_TSO(flags)		((flags) & \
+					 (OCTEP_VF_TX_OFFLOAD_TCP_TSO | \
+					  OCTEP_VF_TX_OFFLOAD_UDP_TSO))
 
 struct tx_mdata {
-
 	/* offload flags */
 	u16 ol_flags;
 
@@ -294,24 +251,26 @@ static_assert(sizeof(struct tx_mdata) == 16);
  * These optional headers together called Front Data and its size is
  * described by ih->fsz.
  */
-struct octep_tx_desc_hw {
+struct octep_vf_tx_desc_hw {
 	/* Pointer where the input data is available. */
 	u64 dptr;
 
 	/* Instruction Header. */
 	union {
-		struct octep_instr_hdr ih;
+		struct octep_vf_instr_hdr ih;
 		u64 ih64;
 	};
+
 	union  {
 		u64 txm64[2];
 		struct tx_mdata txm;
 	};
+
 	/* Additional headers available in a 64-byte instruction. */
-	u64 exthdr[4];
+	u64 exhdr[4];
 };
 
-static_assert(sizeof(struct octep_tx_desc_hw) == 64);
+static_assert(sizeof(struct octep_vf_tx_desc_hw) == 64);
 
-#define OCTEP_IQ_DESC_SIZE (sizeof(struct octep_tx_desc_hw))
-#endif /* _OCTEP_TX_H_ */
+#define OCTEP_VF_IQ_DESC_SIZE (sizeof(struct octep_vf_tx_desc_hw))
+#endif /* _OCTEP_VF_TX_H_ */
