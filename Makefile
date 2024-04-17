@@ -25,8 +25,16 @@ PHONY := __all
 __all:
 
 # Set RHEL variables
-# Use this spot to avoid future merge conflicts
+# Note that this ifdef'ery is required to handle when building with
+# the O= mechanism (relocate the object file results) due to upstream
+# commit 67d7c302 which broke our RHEL include file
+ifneq ($(realpath source),)
+include $(realpath source)/Makefile.rhelver
+else
+ifneq ($(realpath Makefile.rhelver),)
 include Makefile.rhelver
+endif
+endif
 
 # We are using a recursive build, so we need to do a little thinking
 # to get the ordering right.
