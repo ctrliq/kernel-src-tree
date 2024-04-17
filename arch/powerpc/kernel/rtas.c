@@ -13,6 +13,7 @@
 #include <linux/init.h>
 #include <linux/kernel.h>
 #include <linux/memblock.h>
+#include <linux/mutex.h>
 #include <linux/of.h>
 #include <linux/of_fdt.h>
 #include <linux/reboot.h>
@@ -74,6 +75,8 @@ unsigned long rtas_rmo_buf;
  */
 void (*rtas_flash_term_hook)(int);
 EXPORT_SYMBOL(rtas_flash_term_hook);
+
+DEFINE_MUTEX(rtas_ibm_get_vpd_lock);
 
 /* RTAS use home made raw locking instead of spin_lock_irqsave
  * because those can be called from within really nasty contexts
@@ -1107,6 +1110,7 @@ SYSCALL_DEFINE1(rtas, struct rtas_args __user *, uargs)
 	unsigned long flags;
 	char *buff_copy, *errbuf = NULL;
 	int nargs, nret, token;
+	bool is_get_vpd;
 
 	if (!capable(CAP_SYS_ADMIN))
 		return -EPERM;
@@ -1162,6 +1166,10 @@ SYSCALL_DEFINE1(rtas, struct rtas_args __user *, uargs)
 
 	buff_copy = get_errorlog_buffer();
 
+	is_get_vpd = (token == rtas_token("ibm,get-vpd"));
+	if (is_get_vpd)
+		mutex_lock(&rtas_ibm_get_vpd_lock);
+
 	flags = lock_rtas();
 
 	rtas.args = args;
@@ -1174,6 +1182,9 @@ SYSCALL_DEFINE1(rtas, struct rtas_args __user *, uargs)
 		errbuf = __fetch_rtas_last_error(buff_copy);
 
 	unlock_rtas(flags);
+
+	if (is_get_vpd)
+		mutex_unlock(&rtas_ibm_get_vpd_lock);
 
 	if (buff_copy) {
 		if (errbuf)
