@@ -39,7 +39,7 @@
 #include <uapi/linux/mount.h>
 #include "internal.h"
 
-static int thaw_super_locked(struct super_block *sb);
+static int thaw_super_locked(struct super_block *sb, enum freeze_holder who);
 
 static LIST_HEAD(super_blocks);
 static DEFINE_SPINLOCK(sb_lock);
@@ -1109,7 +1109,7 @@ static void do_thaw_all_callback(struct super_block *sb)
 
 	if (born && sb->s_root) {
 		emergency_thaw_bdev(sb);
-		thaw_super_locked(sb);
+		thaw_super_locked(sb, FREEZE_HOLDER_USERSPACE);
 	} else {
 		super_unlock_excl(sb);
 	}
@@ -1813,10 +1813,21 @@ static void sb_freeze_unlock(struct super_block *sb)
 /**
  * freeze_super - lock the filesystem and force it into a consistent state
  * @sb: the super to lock
+ * @who: context that wants to freeze
  *
  * Syncs the super to make sure the filesystem is consistent and calls the fs's
- * freeze_fs.  Subsequent calls to this without first thawing the fs will return
+ * freeze_fs.  Subsequent calls to this without first thawing the fs may return
  * -EBUSY.
+ *
+ * @who should be:
+ * * %FREEZE_HOLDER_USERSPACE if userspace wants to freeze the fs;
+ * * %FREEZE_HOLDER_KERNEL if the kernel wants to freeze the fs.
+ *
+ * The @who argument distinguishes between the kernel and userspace trying to
+ * freeze the filesystem.  Although there cannot be multiple kernel freezes or
+ * multiple userspace freezes in effect at any given time, the kernel and
+ * userspace can both hold a filesystem frozen.  The filesystem remains frozen
+ * until there are no kernel or userspace freezes in effect.
  *
  * During this function, sb->s_writers.frozen goes through these values:
  *
@@ -1843,12 +1854,30 @@ static void sb_freeze_unlock(struct super_block *sb)
  *
  * sb->s_writers.frozen is protected by sb->s_umount.
  */
-int freeze_super(struct super_block *sb)
+int freeze_super(struct super_block *sb, enum freeze_holder who)
 {
 	int ret;
 
 	atomic_inc(&sb->s_active);
 	__super_lock_excl(sb);
+
+	if (sb->s_writers.frozen == SB_FREEZE_COMPLETE) {
+		if (sb->s_writers.freeze_holders & who) {
+			deactivate_locked_super(sb);
+			return -EBUSY;
+		}
+
+		WARN_ON(sb->s_writers.freeze_holders == 0);
+
+		/*
+		 * Someone else already holds this type of freeze; share the
+		 * freeze and assign the active ref to the freeze.
+		 */
+		sb->s_writers.freeze_holders |= who;
+		up_write(&sb->s_umount);
+		return 0;
+	}
+
 	if (sb->s_writers.frozen != SB_UNFROZEN) {
 		deactivate_locked_super(sb);
 		return -EBUSY;
@@ -1861,6 +1890,7 @@ int freeze_super(struct super_block *sb)
 
 	if (sb_rdonly(sb)) {
 		/* Nothing to do really... */
+		sb->s_writers.freeze_holders |= who;
 		sb->s_writers.frozen = SB_FREEZE_COMPLETE;
 		super_unlock_excl(sb);
 		return 0;
@@ -1899,6 +1929,7 @@ int freeze_super(struct super_block *sb)
 	 * For debugging purposes so that fs can warn if it sees write activity
 	 * when frozen is set to SB_FREEZE_COMPLETE, and for thaw_super().
 	 */
+	sb->s_writers.freeze_holders |= who;
 	sb->s_writers.frozen = SB_FREEZE_COMPLETE;
 	lockdep_sb_freeze_release(sb);
 	super_unlock_excl(sb);
@@ -1906,16 +1937,39 @@ int freeze_super(struct super_block *sb)
 }
 EXPORT_SYMBOL(freeze_super);
 
-static int thaw_super_locked(struct super_block *sb)
+/*
+ * Undoes the effect of a freeze_super_locked call.  If the filesystem is
+ * frozen both by userspace and the kernel, a thaw call from either source
+ * removes that state without releasing the other state or unlocking the
+ * filesystem.
+ */
+static int thaw_super_locked(struct super_block *sb, enum freeze_holder who)
 {
 	int error;
 
-	if (sb->s_writers.frozen != SB_FREEZE_COMPLETE) {
+	if (sb->s_writers.frozen == SB_FREEZE_COMPLETE) {
+		if (!(sb->s_writers.freeze_holders & who)) {
+			up_write(&sb->s_umount);
+			return -EINVAL;
+		}
+
+		/*
+		 * Freeze is shared with someone else.  Release our hold and
+		 * drop the active ref that freeze_super assigned to the
+		 * freezer.
+		 */
+		if (sb->s_writers.freeze_holders & ~who) {
+			sb->s_writers.freeze_holders &= ~who;
+			deactivate_locked_super(sb);
+			return 0;
+		}
+	} else {
 		super_unlock_excl(sb);
 		return -EINVAL;
 	}
 
 	if (sb_rdonly(sb)) {
+		sb->s_writers.freeze_holders &= ~who;
 		sb->s_writers.frozen = SB_UNFROZEN;
 		goto out;
 	}
@@ -1933,6 +1987,7 @@ static int thaw_super_locked(struct super_block *sb)
 		}
 	}
 
+	sb->s_writers.freeze_holders &= ~who;
 	sb->s_writers.frozen = SB_UNFROZEN;
 	sb_freeze_unlock(sb);
 out:
@@ -1945,11 +2000,18 @@ out:
  * thaw_super -- unlock filesystem
  * @sb: the super to thaw
  *
- * Unlocks the filesystem and marks it writeable again after freeze_super().
+ * @who: context that wants to freeze
+ *
+ * Unlocks the filesystem and marks it writeable again after freeze_super()
+ * if there are no remaining freezes on the filesystem.
+ *
+ * @who should be:
+ * * %FREEZE_HOLDER_USERSPACE if userspace wants to thaw the fs;
+ * * %FREEZE_HOLDER_KERNEL if the kernel wants to thaw the fs.
  */
-int thaw_super(struct super_block *sb)
+int thaw_super(struct super_block *sb, enum freeze_holder who)
 {
 	__super_lock_excl(sb);
-	return thaw_super_locked(sb);
+	return thaw_super_locked(sb, who);
 }
 EXPORT_SYMBOL(thaw_super);
