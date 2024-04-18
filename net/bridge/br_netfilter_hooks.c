@@ -618,9 +618,6 @@ static unsigned int br_nf_local_in(void *priv,
 	if (likely(nf_ct_is_confirmed(ct)))
 		return NF_ACCEPT;
 
-	WARN_ON_ONCE(skb_shared(skb));
-	WARN_ON_ONCE(refcount_read(&nfct->use) != 1);
-
 	/* We can't call nf_confirm here, it would create a dependency
 	 * on nf_conntrack module.
 	 */
@@ -640,9 +637,6 @@ static unsigned int br_nf_local_in(void *priv,
 		nf_bridge_push_encap_header(skb);
 		break;
 	}
-
-	ct = container_of(nfct, struct nf_conn, ct_general);
-	WARN_ON_ONCE(!nf_ct_is_confirmed(ct));
 
 	return ret;
 }
