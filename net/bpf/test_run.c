@@ -20,6 +20,7 @@
 #include <linux/smp.h>
 #include <linux/sock_diag.h>
 #include <linux/netfilter.h>
+#include <net/netdev_rx_queue.h>
 #include <net/xdp.h>
 #include <net/netfilter/nf_bpf_link.h>
 
@@ -492,9 +493,8 @@ out:
  * architecture dependent calling conventions. 7+ can be supported in the
  * future.
  */
-__diag_push();
-__diag_ignore_all("-Wmissing-prototypes",
-		  "Global functions as their definitions will be in vmlinux BTF");
+__bpf_kfunc_start_defs();
+
 __bpf_kfunc int bpf_fentry_test1(int a)
 {
 	return a + 1;
@@ -771,7 +771,7 @@ __bpf_kfunc static u32 bpf_kfunc_call_test_static_unused_arg(u32 arg, u32 unused
 	return arg;
 }
 
-__diag_pop();
+__bpf_kfunc_end_defs();
 
 BTF_SET8_START(bpf_test_modify_return_ids)
 BTF_ID_FLAGS(func, bpf_modify_return_test)

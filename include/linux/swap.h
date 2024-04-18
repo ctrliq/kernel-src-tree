@@ -56,17 +56,13 @@ static inline int current_is_kswapd(void)
  */
 
 /*
- * PTE markers are used to persist information onto PTEs that are mapped with
- * file-backed memories.  As its name "PTE" hints, it should only be applied to
- * the leaves of pgtables.
- */
-#ifdef CONFIG_PTE_MARKER
+ * PTE markers are used to persist information onto PTEs that otherwise
+ * should be a none pte.  As its name "PTE" hints, it should only be
+ * applied to the leaves of pgtables.
+*/
 #define SWP_PTE_MARKER_NUM 1
 #define SWP_PTE_MARKER     (MAX_SWAPFILES + SWP_HWPOISON_NUM + \
 			    SWP_MIGRATION_NUM + SWP_DEVICE_NUM)
-#else
-#define SWP_PTE_MARKER_NUM 0
-#endif
 
 /*
  * Unaddressable device memory support. See include/linux/hmm.h and
@@ -471,7 +467,7 @@ static inline unsigned long total_swapcache_pages(void)
 
 extern void free_swap_cache(struct page *page);
 extern void free_page_and_swap_cache(struct page *);
-extern void free_pages_and_swap_cache(struct page **, int);
+extern void free_pages_and_swap_cache(struct encoded_page **, int);
 /* linux/mm/swapfile.c */
 extern atomic_long_t nr_swap_pages;
 extern long total_swap_pages;

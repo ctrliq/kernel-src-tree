@@ -202,17 +202,19 @@ static void gup_put_folio(struct folio *folio, int refs, unsigned int flags)
  * time. Cases: please see the try_grab_folio() documentation, with
  * "refs=1".
  *
- * Return: true for success, or if no action was required (if neither FOLL_PIN
- * nor FOLL_GET was set, nothing is done). False for failure: FOLL_GET or
- * FOLL_PIN was set, but the page could not be grabbed.
+ * Return: 0 for success, or if no action was required (if neither FOLL_PIN
+ * nor FOLL_GET was set, nothing is done). A negative error code for failure:
+ *
+ *   -ENOMEM		FOLL_GET or FOLL_PIN was set, but the page could not
+ *			be grabbed.
  */
-bool __must_check try_grab_page(struct page *page, unsigned int flags)
+int __must_check try_grab_page(struct page *page, unsigned int flags)
 {
 	struct folio *folio = page_folio(page);
 
 	WARN_ON_ONCE((flags & (FOLL_GET | FOLL_PIN)) == (FOLL_GET | FOLL_PIN));
 	if (WARN_ON_ONCE(folio_ref_count(folio) <= 0))
-		return false;
+		return -ENOMEM;
 
 	if (flags & FOLL_GET)
 		folio_ref_inc(folio);
@@ -232,7 +234,7 @@ bool __must_check try_grab_page(struct page *page, unsigned int flags)
 		node_stat_mod_folio(folio, NR_FOLL_PIN_ACQUIRED, 1);
 	}
 
-	return true;
+	return 0;
 }
 
 /**
@@ -537,30 +539,13 @@ static struct page *follow_page_pte(struct vm_area_struct *vma,
 	if (WARN_ON_ONCE((flags & (FOLL_PIN | FOLL_GET)) ==
 			 (FOLL_PIN | FOLL_GET)))
 		return ERR_PTR(-EINVAL);
-retry:
 
 	ptep = pte_offset_map_lock(mm, pmd, address, &ptl);
 	if (!ptep)
 		return no_page_table(vma, flags);
 	pte = *ptep;
-	if (!pte_present(pte)) {
-		swp_entry_t entry;
-		/*
-		 * KSM's break_ksm() relies upon recognizing a ksm page
-		 * even while it is being migrated, so for that case we
-		 * need migration_entry_wait().
-		 */
-		if (likely(!(flags & FOLL_MIGRATION)))
-			goto no_page;
-		if (pte_none(pte))
-			goto no_page;
-		entry = pte_to_swp_entry(pte);
-		if (!is_migration_entry(entry))
-			goto no_page;
-		pte_unmap_unlock(ptep, ptl);
-		migration_entry_wait(mm, pmd, address);
-		goto retry;
-	}
+	if (!pte_present(pte))
+		goto no_page;
 	if (pte_protnone(pte) && !gup_can_follow_protnone(flags))
 		goto no_page;
 
@@ -603,7 +588,7 @@ retry:
 		}
 	}
 
-	if (!pte_write(pte) && gup_must_unshare(flags, page)) {
+	if (!pte_write(pte) && gup_must_unshare(vma, flags, page)) {
 		page = ERR_PTR(-EMLINK);
 		goto out;
 	}
@@ -612,8 +597,9 @@ retry:
 		       !PageAnonExclusive(page), page);
 
 	/* try_grab_page() does nothing unless FOLL_GET or FOLL_PIN is set. */
-	if (unlikely(!try_grab_page(page, flags))) {
-		page = ERR_PTR(-ENOMEM);
+	ret = try_grab_page(page, flags);
+	if (unlikely(ret)) {
+		page = ERR_PTR(ret);
 		goto out;
 	}
 	/*
@@ -664,28 +650,8 @@ static struct page *follow_pmd_mask(struct vm_area_struct *vma,
 	pmdval = pmdp_get_lockless(pmd);
 	if (pmd_none(pmdval))
 		return no_page_table(vma, flags);
-retry:
-	if (!pmd_present(pmdval)) {
-		/*
-		 * Should never reach here, if thp migration is not supported;
-		 * Otherwise, it must be a thp migration entry.
-		 */
-		VM_BUG_ON(!thp_migration_supported() ||
-				  !is_pmd_migration_entry(pmdval));
-
-		if (likely(!(flags & FOLL_MIGRATION)))
-			return no_page_table(vma, flags);
-
-		pmd_migration_entry_wait(mm, pmd);
-		pmdval = READ_ONCE(*pmd);
-		/*
-		 * MADV_DONTNEED may convert the pmd to null because
-		 * mmap_lock is held in read mode
-		 */
-		if (pmd_none(pmdval))
-			return no_page_table(vma, flags);
-		goto retry;
-	}
+	if (!pmd_present(pmdval))
+		return no_page_table(vma, flags);
 	if (pmd_devmap(pmdval)) {
 		ptl = pmd_lock(mm, pmd);
 		page = follow_devmap_pmd(vma, address, pmd, flags, &ctx->pgmap);
@@ -699,18 +665,10 @@ retry:
 	if (pmd_protnone(pmdval) && !gup_can_follow_protnone(flags))
 		return no_page_table(vma, flags);
 
-retry_locked:
 	ptl = pmd_lock(mm, pmd);
-	if (unlikely(pmd_none(*pmd))) {
-		spin_unlock(ptl);
-		return no_page_table(vma, flags);
-	}
 	if (unlikely(!pmd_present(*pmd))) {
 		spin_unlock(ptl);
-		if (likely(!(flags & FOLL_MIGRATION)))
-			return no_page_table(vma, flags);
-		pmd_migration_entry_wait(mm, pmd);
-		goto retry_locked;
+		return no_page_table(vma, flags);
 	}
 	if (unlikely(!pmd_trans_huge(*pmd))) {
 		spin_unlock(ptl);
@@ -890,10 +848,9 @@ static int get_gate_page(struct mm_struct *mm, unsigned long address,
 			goto unmap;
 		*page = pte_page(*pte);
 	}
-	if (unlikely(!try_grab_page(*page, gup_flags))) {
-		ret = -ENOMEM;
+	ret = try_grab_page(*page, gup_flags);
+	if (unlikely(ret))
 		goto unmap;
-	}
 out:
 	ret = 0;
 unmap:
@@ -2063,14 +2020,19 @@ static long __gup_longterm_locked(struct mm_struct *mm,
 				  unsigned long nr_pages,
 				  struct page **pages,
 				  struct vm_area_struct **vmas,
+				  int *locked,
 				  unsigned int gup_flags)
 {
+	bool must_unlock = false;
 	unsigned int flags;
 	long rc, nr_pinned_pages;
 
+	if (locked && WARN_ON_ONCE(!*locked))
+		return -EINVAL;
+
 	if (!(gup_flags & FOLL_LONGTERM))
 		return __get_user_pages_locked(mm, start, nr_pages, pages, vmas,
-					       NULL, gup_flags);
+					       locked, gup_flags);
 
 	/*
 	 * If we get to this point then FOLL_LONGTERM is set, and FOLL_LONGTERM
@@ -2084,8 +2046,13 @@ static long __gup_longterm_locked(struct mm_struct *mm,
 		return -EINVAL;
 	flags = memalloc_pin_save();
 	do {
+		if (locked && !*locked) {
+			mmap_read_lock(mm);
+			must_unlock = true;
+			*locked = 1;
+		}
 		nr_pinned_pages = __get_user_pages_locked(mm, start, nr_pages,
-							  pages, vmas, NULL,
+							  pages, vmas, locked,
 							  gup_flags);
 		if (nr_pinned_pages <= 0) {
 			rc = nr_pinned_pages;
@@ -2095,6 +2062,10 @@ static long __gup_longterm_locked(struct mm_struct *mm,
 	} while (rc == -EAGAIN);
 	memalloc_pin_restore(flags);
 
+	if (locked && *locked && must_unlock) {
+		mmap_read_unlock(mm);
+		*locked = 0;
+	}
 	return rc ? rc : nr_pinned_pages;
 }
 
@@ -2118,35 +2089,6 @@ static bool is_valid_gup_flags(unsigned int gup_flags)
 }
 
 #ifdef CONFIG_MMU
-static long __get_user_pages_remote(struct mm_struct *mm,
-				    unsigned long start, unsigned long nr_pages,
-				    unsigned int gup_flags, struct page **pages,
-				    struct vm_area_struct **vmas, int *locked)
-{
-	/*
-	 * Parts of FOLL_LONGTERM behavior are incompatible with
-	 * FAULT_FLAG_ALLOW_RETRY because of the FS DAX check requirement on
-	 * vmas. However, this only comes up if locked is set, and there are
-	 * callers that do request FOLL_LONGTERM, but do not set locked. So,
-	 * allow what we can.
-	 */
-	if (gup_flags & FOLL_LONGTERM) {
-		if (WARN_ON_ONCE(locked))
-			return -EINVAL;
-		/*
-		 * This will check the vmas (even if our vmas arg is NULL)
-		 * and return -ENOTSUPP if DAX isn't allowed in this case:
-		 */
-		return __gup_longterm_locked(mm, start, nr_pages, pages,
-					     vmas, gup_flags | FOLL_TOUCH |
-					     FOLL_REMOTE);
-	}
-
-	return __get_user_pages_locked(mm, start, nr_pages, pages, vmas,
-				       locked,
-				       gup_flags | FOLL_TOUCH | FOLL_REMOTE);
-}
-
 /**
  * get_user_pages_remote() - pin user pages in memory
  * @mm:		mm_struct of target mm
@@ -2215,8 +2157,8 @@ long get_user_pages_remote(struct mm_struct *mm,
 	if (!is_valid_gup_flags(gup_flags))
 		return -EINVAL;
 
-	return __get_user_pages_remote(mm, start, nr_pages, gup_flags,
-				       pages, vmas, locked);
+	return __gup_longterm_locked(mm, start, nr_pages, pages, vmas, locked,
+				     gup_flags | FOLL_TOUCH | FOLL_REMOTE);
 }
 EXPORT_SYMBOL(get_user_pages_remote);
 
@@ -2225,14 +2167,6 @@ long get_user_pages_remote(struct mm_struct *mm,
 			   unsigned long start, unsigned long nr_pages,
 			   unsigned int gup_flags, struct page **pages,
 			   struct vm_area_struct **vmas, int *locked)
-{
-	return 0;
-}
-
-static long __get_user_pages_remote(struct mm_struct *mm,
-				    unsigned long start, unsigned long nr_pages,
-				    unsigned int gup_flags, struct page **pages,
-				    struct vm_area_struct **vmas, int *locked)
 {
 	return 0;
 }
@@ -2262,7 +2196,7 @@ long get_user_pages(unsigned long start, unsigned long nr_pages,
 		return -EINVAL;
 
 	return __gup_longterm_locked(current->mm, start, nr_pages,
-				     pages, vmas, gup_flags | FOLL_TOUCH);
+				     pages, vmas, NULL, gup_flags | FOLL_TOUCH);
 }
 EXPORT_SYMBOL(get_user_pages);
 
@@ -2288,18 +2222,9 @@ long get_user_pages_unlocked(unsigned long start, unsigned long nr_pages,
 	int locked = 1;
 	long ret;
 
-	/*
-	 * FIXME: Current FOLL_LONGTERM behavior is incompatible with
-	 * FAULT_FLAG_ALLOW_RETRY because of the FS DAX check requirement on
-	 * vmas.  As there are no users of this flag in this call we simply
-	 * disallow this option for now.
-	 */
-	if (WARN_ON_ONCE(gup_flags & FOLL_LONGTERM))
-		return -EINVAL;
-
 	mmap_read_lock(mm);
-	ret = __get_user_pages_locked(mm, start, nr_pages, pages, NULL,
-				      &locked, gup_flags | FOLL_TOUCH);
+	ret = __gup_longterm_locked(mm, start, nr_pages, pages, NULL, &locked,
+				    gup_flags | FOLL_TOUCH);
 	if (locked)
 		mmap_read_unlock(mm);
 	return ret;
@@ -2428,7 +2353,7 @@ static int gup_pte_range(pmd_t pmd, pmd_t *pmdp, unsigned long addr,
 			goto pte_unmap;
 		}
 
-		if (!pte_write(pte) && gup_must_unshare(flags, page)) {
+		if (!pte_write(pte) && gup_must_unshare(NULL, flags, page)) {
 			gup_put_folio(folio, 1, flags);
 			goto pte_unmap;
 		}
@@ -2496,7 +2421,7 @@ static int __gup_device_huge(unsigned long pfn, unsigned long addr,
 		}
 		SetPageReferenced(page);
 		pages[*nr] = page;
-		if (unlikely(!try_grab_page(page, flags))) {
+		if (unlikely(try_grab_page(page, flags))) {
 			undo_dev_pagemap(nr, nr_start, flags, pages);
 			break;
 		}
@@ -2614,7 +2539,7 @@ static int gup_hugepte(pte_t *ptep, unsigned long sz, unsigned long addr,
 		return 0;
 	}
 
-	if (!pte_write(pte) && gup_must_unshare(flags, &folio->page)) {
+	if (!pte_write(pte) && gup_must_unshare(NULL, flags, &folio->page)) {
 		gup_put_folio(folio, refs, flags);
 		return 0;
 	}
@@ -2680,7 +2605,7 @@ static int gup_huge_pmd(pmd_t orig, pmd_t *pmdp, unsigned long addr,
 		return 0;
 	}
 
-	if (!pmd_write(orig) && gup_must_unshare(flags, &folio->page)) {
+	if (!pmd_write(orig) && gup_must_unshare(NULL, flags, &folio->page)) {
 		gup_put_folio(folio, refs, flags);
 		return 0;
 	}
@@ -2720,7 +2645,7 @@ static int gup_huge_pud(pud_t orig, pud_t *pudp, unsigned long addr,
 		return 0;
 	}
 
-	if (!pud_write(orig) && gup_must_unshare(flags, &folio->page)) {
+	if (!pud_write(orig) && gup_must_unshare(NULL, flags, &folio->page)) {
 		gup_put_folio(folio, refs, flags);
 		return 0;
 	}
@@ -2768,7 +2693,7 @@ static int gup_pmd_range(pud_t *pudp, pud_t pud, unsigned long addr, unsigned lo
 
 	pmdp = pmd_offset_lockless(pudp, pud, addr);
 	do {
-		pmd_t pmd = READ_ONCE(*pmdp);
+		pmd_t pmd = pmdp_get_lockless(pmdp);
 
 		next = pmd_addr_end(addr, end);
 		if (!pmd_present(pmd))
@@ -2895,29 +2820,6 @@ static bool gup_fast_permitted(unsigned long start, unsigned long end)
 }
 #endif
 
-static int __gup_longterm_unlocked(unsigned long start, int nr_pages,
-				   unsigned int gup_flags, struct page **pages)
-{
-	int ret;
-
-	/*
-	 * FIXME: FOLL_LONGTERM does not work with
-	 * get_user_pages_unlocked() (see comments in that function)
-	 */
-	if (gup_flags & FOLL_LONGTERM) {
-		mmap_read_lock(current->mm);
-		ret = __gup_longterm_locked(current->mm,
-					    start, nr_pages,
-					    pages, NULL, gup_flags);
-		mmap_read_unlock(current->mm);
-	} else {
-		ret = get_user_pages_unlocked(start, nr_pages,
-					      pages, gup_flags);
-	}
-
-	return ret;
-}
-
 static unsigned long lockless_pages_from_mm(unsigned long start,
 					    unsigned long end,
 					    unsigned int gup_flags,
@@ -3003,8 +2905,8 @@ static int internal_get_user_pages_fast(unsigned long start,
 	/* Slow path: try to get the remaining pages with get_user_pages */
 	start += nr_pinned << PAGE_SHIFT;
 	pages += nr_pinned;
-	ret = __gup_longterm_unlocked(start, nr_pages - nr_pinned, gup_flags,
-				      pages);
+	ret = get_user_pages_unlocked(start, nr_pages - nr_pinned, pages,
+				      gup_flags);
 	if (ret < 0) {
 		/*
 		 * The caller has to unpin the pages we already pinned so
@@ -3203,9 +3105,9 @@ long pin_user_pages_remote(struct mm_struct *mm,
 	if (WARN_ON_ONCE(!pages))
 		return -EINVAL;
 
-	gup_flags |= FOLL_PIN;
-	return __get_user_pages_remote(mm, start, nr_pages, gup_flags,
-				       pages, vmas, locked);
+	return __gup_longterm_locked(mm, start, nr_pages, pages, vmas, locked,
+				     gup_flags | FOLL_PIN | FOLL_TOUCH |
+					     FOLL_REMOTE);
 }
 EXPORT_SYMBOL(pin_user_pages_remote);
 
@@ -3239,7 +3141,7 @@ long pin_user_pages(unsigned long start, unsigned long nr_pages,
 
 	gup_flags |= FOLL_PIN;
 	return __gup_longterm_locked(current->mm, start, nr_pages,
-				     pages, vmas, gup_flags);
+				     pages, vmas, NULL, gup_flags);
 }
 EXPORT_SYMBOL(pin_user_pages);
 

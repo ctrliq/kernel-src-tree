@@ -932,7 +932,14 @@ enum bpf_map_type {
 	 */
 	BPF_MAP_TYPE_CGROUP_STORAGE = BPF_MAP_TYPE_CGROUP_STORAGE_DEPRECATED,
 	BPF_MAP_TYPE_REUSEPORT_SOCKARRAY,
-	BPF_MAP_TYPE_PERCPU_CGROUP_STORAGE,
+	BPF_MAP_TYPE_PERCPU_CGROUP_STORAGE_DEPRECATED,
+	/* BPF_MAP_TYPE_PERCPU_CGROUP_STORAGE is available to bpf programs
+	 * attaching to a cgroup. The new mechanism (BPF_MAP_TYPE_CGRP_STORAGE +
+	 * local percpu kptr) supports all BPF_MAP_TYPE_PERCPU_CGROUP_STORAGE
+	 * functionality and more. So mark * BPF_MAP_TYPE_PERCPU_CGROUP_STORAGE
+	 * deprecated.
+	 */
+	BPF_MAP_TYPE_PERCPU_CGROUP_STORAGE = BPF_MAP_TYPE_PERCPU_CGROUP_STORAGE_DEPRECATED,
 	BPF_MAP_TYPE_QUEUE,
 	BPF_MAP_TYPE_STACK,
 	BPF_MAP_TYPE_SK_STORAGE,
@@ -1040,6 +1047,13 @@ enum bpf_attach_type {
 	BPF_TCX_INGRESS,
 	BPF_TCX_EGRESS,
 	BPF_TRACE_UPROBE_MULTI,
+	BPF_CGROUP_UNIX_CONNECT,
+	BPF_CGROUP_UNIX_SENDMSG,
+	BPF_CGROUP_UNIX_RECVMSG,
+	BPF_CGROUP_UNIX_GETPEERNAME,
+	BPF_CGROUP_UNIX_GETSOCKNAME,
+	BPF_NETKIT_PRIMARY,
+	BPF_NETKIT_PEER,
 	__MAX_BPF_ATTACH_TYPE
 };
 
@@ -1059,6 +1073,7 @@ enum bpf_link_type {
 	BPF_LINK_TYPE_NETFILTER = 10,
 	BPF_LINK_TYPE_TCX = 11,
 	BPF_LINK_TYPE_UPROBE_MULTI = 12,
+	BPF_LINK_TYPE_NETKIT = 13,
 	MAX_BPF_LINK_TYPE,
 };
 
@@ -1639,6 +1654,13 @@ union bpf_attr {
 				__u32		flags;
 				__u32		pid;
 			} uprobe_multi;
+			struct {
+				union {
+					__u32	relative_fd;
+					__u32	relative_id;
+				};
+				__u64		expected_revision;
+			} netkit;
 		};
 	} link_create;
 
@@ -2692,8 +2714,8 @@ union bpf_attr {
  * 		*bpf_socket* should be one of the following:
  *
  * 		* **struct bpf_sock_ops** for **BPF_PROG_TYPE_SOCK_OPS**.
- * 		* **struct bpf_sock_addr** for **BPF_CGROUP_INET4_CONNECT**
- * 		  and **BPF_CGROUP_INET6_CONNECT**.
+ *		* **struct bpf_sock_addr** for **BPF_CGROUP_INET4_CONNECT**,
+ *		  **BPF_CGROUP_INET6_CONNECT** and **BPF_CGROUP_UNIX_CONNECT**.
  *
  * 		This helper actually implements a subset of **setsockopt()**.
  * 		It supports the following *level*\ s:
@@ -2931,8 +2953,8 @@ union bpf_attr {
  * 		*bpf_socket* should be one of the following:
  *
  * 		* **struct bpf_sock_ops** for **BPF_PROG_TYPE_SOCK_OPS**.
- * 		* **struct bpf_sock_addr** for **BPF_CGROUP_INET4_CONNECT**
- * 		  and **BPF_CGROUP_INET6_CONNECT**.
+ *		* **struct bpf_sock_addr** for **BPF_CGROUP_INET4_CONNECT**,
+ *		  **BPF_CGROUP_INET6_CONNECT** and **BPF_CGROUP_UNIX_CONNECT**.
  *
  * 		This helper actually implements a subset of **getsockopt()**.
  * 		It supports the same set of *optname*\ s that is supported by
@@ -5087,6 +5109,8 @@ union bpf_attr {
  *		**BPF_F_TIMER_ABS**
  *			Start the timer in absolute expire value instead of the
  *			default relative one.
+ *		**BPF_F_TIMER_CPU_PIN**
+ *			Timer will be pinned to the CPU of the caller.
  *
  *	Return
  *		0 on success.
@@ -6523,6 +6547,7 @@ struct bpf_link_info {
 			__aligned_u64 addrs;
 			__u32 count; /* in/out: kprobe_multi function count */
 			__u32 flags;
+			__u64 missed;
 		} kprobe_multi;
 		struct {
 			__u32 type; /* enum bpf_perf_event_type */
@@ -6538,6 +6563,7 @@ struct bpf_link_info {
 					__u32 name_len;
 					__u32 offset; /* offset from func_name */
 					__u64 addr;
+					__u64 missed;
 				} kprobe; /* BPF_PERF_EVENT_KPROBE, BPF_PERF_EVENT_KRETPROBE */
 				struct {
 					__aligned_u64 tp_name;   /* in/out */
@@ -6553,6 +6579,10 @@ struct bpf_link_info {
 			__u32 ifindex;
 			__u32 attach_type;
 		} tcx;
+		struct {
+			__u32 ifindex;
+			__u32 attach_type;
+		} netkit;
 	};
 } __attribute__((aligned(8)));
 
@@ -7299,9 +7329,11 @@ struct bpf_core_relo {
  * Flags to control bpf_timer_start() behaviour.
  *     - BPF_F_TIMER_ABS: Timeout passed is absolute time, by default it is
  *       relative to current time.
+ *     - BPF_F_TIMER_CPU_PIN: Timer will be pinned to the CPU of the caller.
  */
 enum {
 	BPF_F_TIMER_ABS = (1ULL << 0),
+	BPF_F_TIMER_CPU_PIN = (1ULL << 1),
 };
 
 /* BPF numbers iterator state */
