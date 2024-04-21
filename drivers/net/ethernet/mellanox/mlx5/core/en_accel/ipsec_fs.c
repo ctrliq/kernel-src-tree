@@ -1867,7 +1867,8 @@ void mlx5e_accel_ipsec_fs_cleanup(struct mlx5e_ipsec *ipsec)
 	}
 }
 
-int mlx5e_accel_ipsec_fs_init(struct mlx5e_ipsec *ipsec)
+int mlx5e_accel_ipsec_fs_init(struct mlx5e_ipsec *ipsec,
+			      struct mlx5_devcom_comp_dev **devcom)
 {
 	struct mlx5_core_dev *mdev = ipsec->mdev;
 	struct mlx5_flow_namespace *ns, *ns_esw;
@@ -1919,7 +1920,7 @@ int mlx5e_accel_ipsec_fs_init(struct mlx5e_ipsec *ipsec)
 		ipsec->tx_esw->ns = ns_esw;
 		xa_init_flags(&ipsec->rx_esw->ipsec_obj_id_map, XA_FLAGS_ALLOC1);
 	} else if (mlx5_ipsec_device_caps(mdev) & MLX5_IPSEC_CAP_ROCE) {
-		ipsec->roce = mlx5_ipsec_fs_roce_init(mdev);
+		ipsec->roce = mlx5_ipsec_fs_roce_init(mdev, devcom);
 	}
 
 	return 0;
