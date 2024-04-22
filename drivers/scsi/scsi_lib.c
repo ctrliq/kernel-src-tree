@@ -214,6 +214,92 @@ int __scsi_execute(struct scsi_device *sdev, const unsigned char *cmd,
 }
 EXPORT_SYMBOL(__scsi_execute);
 
+void scsi_failures_reset_retries(struct scsi_failures *failures)
+{
+	struct scsi_failure *failure;
+
+	failures->total_retries = 0;
+
+	for (failure = failures->failure_definitions; failure->result;
+	     failure++)
+		failure->retries = 0;
+}
+EXPORT_SYMBOL_GPL(scsi_failures_reset_retries);
+
+/**
+ * scsi_check_passthrough - Determine if passthrough scsi_cmnd needs a retry.
+ * @scmd: scsi_cmnd to check.
+ * @failures: scsi_failures struct that lists failures to check for.
+ *
+ * Returns -EAGAIN if the caller should retry else 0.
+ */
+static int scsi_check_passthrough(struct scsi_cmnd *scmd,
+				  struct scsi_failures *failures)
+{
+	struct scsi_failure *failure;
+	struct scsi_sense_hdr sshdr;
+	enum sam_status status;
+
+	if (!failures)
+		return 0;
+
+	for (failure = failures->failure_definitions; failure->result;
+	     failure++) {
+		if (failure->result == SCMD_FAILURE_RESULT_ANY)
+			goto maybe_retry;
+
+		if (host_byte(scmd->result) &&
+		    host_byte(scmd->result) == host_byte(failure->result))
+			goto maybe_retry;
+
+		status = status_byte(scmd->result);
+		if (!status)
+			continue;
+
+		if (failure->result == SCMD_FAILURE_STAT_ANY &&
+		    !scsi_status_is_good(scmd->result))
+			goto maybe_retry;
+
+		if (status != status_byte(failure->result))
+			continue;
+
+		if (status_byte(failure->result) != SAM_STAT_CHECK_CONDITION ||
+		    failure->sense == SCMD_FAILURE_SENSE_ANY)
+			goto maybe_retry;
+
+		if (!scsi_command_normalize_sense(scmd, &sshdr))
+			return 0;
+
+		if (failure->sense != sshdr.sense_key)
+			continue;
+
+		if (failure->asc == SCMD_FAILURE_ASC_ANY)
+			goto maybe_retry;
+
+		if (failure->asc != sshdr.asc)
+			continue;
+
+		if (failure->ascq == SCMD_FAILURE_ASCQ_ANY ||
+		    failure->ascq == sshdr.ascq)
+			goto maybe_retry;
+	}
+
+	return 0;
+
+maybe_retry:
+	if (failure->allowed) {
+		if (failure->allowed == SCMD_FAILURE_NO_LIMIT ||
+		    ++failure->retries <= failure->allowed)
+			return -EAGAIN;
+	} else {
+		if (failures->total_allowed == SCMD_FAILURE_NO_LIMIT ||
+		    ++failures->total_retries <= failures->total_allowed)
+			return -EAGAIN;
+	}
+
+	return 0;
+}
+
 /**
  * scsi_execute_cmd - insert request and wait for the result
  * @sdev:	scsi_device
@@ -222,7 +308,7 @@ EXPORT_SYMBOL(__scsi_execute);
  * @buffer:	data buffer
  * @bufflen:	len of buffer
  * @timeout:	request timeout in HZ
- * @retries:	number of times to retry request
+ * @ml_retries:	number of times SCSI midlayer will retry request
  * @args:	Optional args. See struct definition for field descriptions
  *
  * Returns the scsi_cmnd result field if a command was executed, or a negative
@@ -230,7 +316,7 @@ EXPORT_SYMBOL(__scsi_execute);
  */
 int scsi_execute_cmd(struct scsi_device *sdev, const unsigned char *cmd,
 		     blk_opf_t opf, void *buffer, unsigned int bufflen,
-		     int timeout, int retries,
+		     int timeout, int ml_retries,
 		     const struct scsi_exec_args *args)
 {
 	static const struct scsi_exec_args default_args;
@@ -245,6 +331,7 @@ int scsi_execute_cmd(struct scsi_device *sdev, const unsigned char *cmd,
 			      args->sense_len != SCSI_SENSE_BUFFERSIZE))
 		return -EINVAL;
 
+retry:
 	req = scsi_alloc_request(sdev->request_queue, opf, args->req_flags);
 	if (IS_ERR(req))
 		return PTR_ERR(req);
@@ -259,7 +346,7 @@ int scsi_execute_cmd(struct scsi_device *sdev, const unsigned char *cmd,
 	}
 	rq->cmd_len = COMMAND_SIZE(cmd[0]);
 	memcpy(rq->cmd, cmd, rq->cmd_len);
-	rq->retries = retries;
+	rq->retries = ml_retries;
 	scmd = blk_mq_rq_to_pdu(req);
 	scmd->flags |= args->scmd_flags;
 	req->timeout = timeout;
@@ -269,6 +356,11 @@ int scsi_execute_cmd(struct scsi_device *sdev, const unsigned char *cmd,
 	 * head injection *required* here otherwise quiesce won't work
 	 */
 	blk_execute_rq(req, true);
+
+	if (scsi_check_passthrough(scmd, args->failures) == -EAGAIN) {
+		blk_mq_free_request(req);
+		goto retry;
+	}
 
 	/*
 	 * Some devices (USB mass-storage in particular) may transfer
