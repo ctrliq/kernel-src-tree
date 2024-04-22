@@ -24,4 +24,8 @@ extern void __cfi_check(uint64_t id, void *ptr, void *diag);
 
 #endif /* CONFIG_CFI_CLANG */
 
+#ifndef CFI_NOSEAL
+#define CFI_NOSEAL(x)
+#endif
+
 #endif /* _LINUX_CFI_H */
