@@ -67,3 +67,15 @@ void arch_jump_label_transform(struct jump_entry *entry,
 	jump_label_transform(entry, type);
 	text_poke_sync();
 }
+
+bool arch_jump_label_transform_queue(struct jump_entry *entry,
+				     enum jump_label_type type)
+{
+	jump_label_transform(entry, type);
+	return true;
+}
+
+void arch_jump_label_transform_apply(void)
+{
+	text_poke_sync();
+}
