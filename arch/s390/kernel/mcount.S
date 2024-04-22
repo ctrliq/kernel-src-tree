@@ -25,10 +25,11 @@ SYM_CODE_START(ftrace_stub_direct_tramp)
 	BR_EX	%r1
 SYM_CODE_END(ftrace_stub_direct_tramp)
 
-#define STACK_FRAME_SIZE  (STACK_FRAME_OVERHEAD + __PT_SIZE)
-#define STACK_PTREGS	  (STACK_FRAME_OVERHEAD)
-#define STACK_PTREGS_GPRS (STACK_PTREGS + __PT_GPRS)
-#define STACK_PTREGS_PSW  (STACK_PTREGS + __PT_PSW)
+#define STACK_FRAME_SIZE	(STACK_FRAME_OVERHEAD + __PT_SIZE)
+#define STACK_PTREGS		(STACK_FRAME_OVERHEAD)
+#define STACK_PTREGS_GPRS	(STACK_PTREGS + __PT_GPRS)
+#define STACK_PTREGS_PSW	(STACK_PTREGS + __PT_PSW)
+#define STACK_PTREGS_ORIG_GPR2	(STACK_PTREGS + __PT_ORIG_GPR2)
 #ifdef __PACK_STACK
 /* allocate just enough for r14, r15 and backchain */
 #define TRACED_FUNC_FRAME_SIZE	24
@@ -54,6 +55,7 @@ SYM_CODE_END(ftrace_stub_direct_tramp)
 	# allocate pt_regs and stack frame for ftrace_trace_function
 	aghi	%r15,-STACK_FRAME_SIZE
 	stg	%r1,(STACK_PTREGS_GPRS+15*8)(%r15)
+	xc	STACK_PTREGS_ORIG_GPR2(8,%r15),STACK_PTREGS_ORIG_GPR2(%r15)
 
 	.if \allregs == 1
 	stg	%r14,(STACK_PTREGS_PSW)(%r15)
@@ -104,8 +106,17 @@ SYM_INNER_LABEL(ftrace_graph_caller, SYM_L_GLOBAL)
 	stg	%r2,(STACK_PTREGS_GPRS+14*8)(%r15)
 .Lftrace_graph_caller_end:
 #endif
-	lg	%r1,(STACK_PTREGS_PSW+8)(%r15)
-	lmg	%r2,%r15,(STACK_PTREGS_GPRS+2*8)(%r15)
+	lg	%r0,(STACK_PTREGS_PSW+8)(%r15)
+#ifdef CONFIG_HAVE_MARCH_Z196_FEATURES
+	ltg	%r1,STACK_PTREGS_ORIG_GPR2(%r15)
+	locgrz	%r1,%r0
+#else
+	lg	%r1,STACK_PTREGS_ORIG_GPR2(%r15)
+	ltgr	%r1,%r1
+	jnz	0f
+	lgr	%r1,%r0
+#endif
+0:	lmg	%r2,%r15,(STACK_PTREGS_GPRS+2*8)(%r15)
 	BR_EX	%r1
 SYM_CODE_END(ftrace_common)
 
