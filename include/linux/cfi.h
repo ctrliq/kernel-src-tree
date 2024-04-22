@@ -9,6 +9,13 @@
 
 #include <asm/cfi.h>
 
+#ifndef cfi_get_offset
+static inline int cfi_get_offset(void)
+{
+	return 0;
+}
+#endif
+
 #ifdef CONFIG_CFI_CLANG
 typedef void (*cfi_check_fn)(uint64_t id, void *ptr, void *diag);
 
