@@ -7,6 +7,8 @@
 #ifndef _LINUX_CFI_H
 #define _LINUX_CFI_H
 
+#include <asm/cfi.h>
+
 #ifdef CONFIG_CFI_CLANG
 typedef void (*cfi_check_fn)(uint64_t id, void *ptr, void *diag);
 
