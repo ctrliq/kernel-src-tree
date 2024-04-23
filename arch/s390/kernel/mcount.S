@@ -31,12 +31,8 @@ SYM_CODE_END(ftrace_stub_direct_tramp)
 #define STACK_PTREGS_PSW	(STACK_PTREGS + __PT_PSW)
 #define STACK_PTREGS_ORIG_GPR2	(STACK_PTREGS + __PT_ORIG_GPR2)
 #define STACK_PTREGS_FLAGS	(STACK_PTREGS + __PT_FLAGS)
-#ifdef __PACK_STACK
-/* allocate just enough for r14, r15 and backchain */
+/* packed stack: allocate just enough for r14, r15 and backchain */
 #define TRACED_FUNC_FRAME_SIZE	24
-#else
-#define TRACED_FUNC_FRAME_SIZE	STACK_FRAME_OVERHEAD
-#endif
 
 	.macro	ftrace_regs_entry, allregs=0
 	stg	%r14,(__SF_GPRS+8*8)(%r15)	# save traced function caller
