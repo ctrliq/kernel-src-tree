@@ -640,14 +640,6 @@ void regcache_set_val(struct regmap *map, void *base, unsigned int idx,
 		cache[idx] = val;
 		break;
 	}
-#ifdef CONFIG_64BIT
-	case 8: {
-		u64 *cache = base;
-
-		cache[idx] = val;
-		break;
-	}
-#endif
 	default:
 		BUG();
 	}
@@ -680,13 +672,6 @@ unsigned int regcache_get_val(struct regmap *map, const void *base,
 
 		return cache[idx];
 	}
-#ifdef CONFIG_64BIT
-	case 8: {
-		const u64 *cache = base;
-
-		return cache[idx];
-	}
-#endif
 	default:
 		BUG();
 	}
