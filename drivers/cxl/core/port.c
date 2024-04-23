@@ -2078,3 +2078,4 @@ static void cxl_core_exit(void)
 module_init(cxl_core_init);
 module_exit(cxl_core_exit);
 MODULE_LICENSE("GPL v2");
+MODULE_IMPORT_NS(CXL);
