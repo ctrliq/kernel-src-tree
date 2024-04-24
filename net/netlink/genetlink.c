@@ -13,7 +13,7 @@
 #include <linux/errno.h>
 #include <linux/types.h>
 #include <linux/socket.h>
-#include <linux/string.h>
+#include <linux/string_helpers.h>
 #include <linux/skbuff.h>
 #include <linux/mutex.h>
 #include <linux/bitmap.h>
@@ -39,14 +39,6 @@ void genl_unlock(void)
 	mutex_unlock(&genl_mutex);
 }
 EXPORT_SYMBOL(genl_unlock);
-
-#ifdef CONFIG_LOCKDEP
-bool lockdep_genl_is_held(void)
-{
-	return lockdep_is_held(&genl_mutex);
-}
-EXPORT_SYMBOL(lockdep_genl_is_held);
-#endif
 
 static void genl_lock_all(void)
 {
@@ -465,7 +457,7 @@ static int genl_validate_assign_mc_groups(struct genl_family *family)
 
 		if (WARN_ON(grp->name[0] == '\0'))
 			return -EINVAL;
-		if (WARN_ON(memchr(grp->name, '\0', GENL_NAMSIZ) == NULL))
+		if (WARN_ON(!string_is_terminated(grp->name, GENL_NAMSIZ)))
 			return -EINVAL;
 	}
 
@@ -1684,7 +1676,7 @@ static int genl_bind(struct net *net, int group)
 	unsigned int id;
 	int ret = 0;
 
-	genl_lock_all();
+	down_read(&cb_lock);
 
 	idr_for_each_entry(&genl_fam_idr, family, id) {
 		const struct genl_multicast_group *grp;
@@ -1708,7 +1700,7 @@ static int genl_bind(struct net *net, int group)
 		break;
 	}
 
-	genl_unlock_all();
+	up_read(&cb_lock);
 	return ret;
 }
 
@@ -1806,6 +1798,7 @@ int genlmsg_multicast_allns(const struct genl_family *family,
 {
 	if (WARN_ON_ONCE(group >= family->n_mcgrps))
 		return -EINVAL;
+
 	group = family->mcgrp_offset + group;
 	return genlmsg_mcast(skb, portid, group, flags);
 }
@@ -1816,14 +1809,12 @@ void genl_notify(const struct genl_family *family, struct sk_buff *skb,
 {
 	struct net *net = genl_info_net(info);
 	struct sock *sk = net->genl_sock;
-	int report = 0;
-
-	if (info->nlhdr)
-		report = nlmsg_report(info->nlhdr);
 
 	if (WARN_ON_ONCE(group >= family->n_mcgrps))
 		return;
+
 	group = family->mcgrp_offset + group;
-	nlmsg_notify(sk, skb, info->snd_portid, group, report, flags);
+	nlmsg_notify(sk, skb, info->snd_portid, group,
+		     nlmsg_report(info->nlhdr), flags);
 }
 EXPORT_SYMBOL(genl_notify);
