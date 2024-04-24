@@ -644,7 +644,7 @@ static int sh_pfc_pinconf_get(struct pinctrl_dev *pctldev, unsigned _pin,
 		if (!pfc->info->ops || !pfc->info->ops->pin_to_pocctrl)
 			return -ENOTSUPP;
 
-		bit = pfc->info->ops->pin_to_pocctrl(pfc, _pin, &pocctrl);
+		bit = pfc->info->ops->pin_to_pocctrl(_pin, &pocctrl);
 		if (WARN(bit < 0, "invalid pin %#x", _pin))
 			return bit;
 
@@ -718,7 +718,7 @@ static int sh_pfc_pinconf_set(struct pinctrl_dev *pctldev, unsigned _pin,
 			if (!pfc->info->ops || !pfc->info->ops->pin_to_pocctrl)
 				return -ENOTSUPP;
 
-			bit = pfc->info->ops->pin_to_pocctrl(pfc, _pin, &pocctrl);
+			bit = pfc->info->ops->pin_to_pocctrl(_pin, &pocctrl);
 			if (WARN(bit < 0, "invalid pin %#x", _pin))
 				return bit;
 
