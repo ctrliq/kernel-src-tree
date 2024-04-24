@@ -1796,6 +1796,7 @@ enum netdev_ml_priv_type {
  *	@netdev_ops:	Includes several pointers to callbacks,
  *			if one wants to override the ndo_*() functions
  *	@xdp_metadata_ops:	Includes pointers to XDP metadata callbacks.
+ *	@xsk_tx_metadata_ops:	Includes pointers to AF_XDP TX metadata callbacks.
  *	@ethtool_ops:	Management operations
  *	@l3mdev_ops:	Layer 3 master device operations
  *	@ndisc_ops:	Includes callbacks for different IPv6 neighbour
@@ -2054,6 +2055,7 @@ struct net_device {
 	unsigned long long	priv_flags;
 	const struct net_device_ops *netdev_ops;
 	RH_KABI_EXCLUDE(const struct xdp_metadata_ops *xdp_metadata_ops)
+	RH_KABI_EXCLUDE(const struct xsk_tx_metadata_ops *xsk_tx_metadata_ops)
 	int			ifindex;
 	unsigned short		gflags;
 	unsigned short		hard_header_len;
