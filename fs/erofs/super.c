@@ -20,6 +20,7 @@
 #include <trace/events/erofs.h>
 
 static struct kmem_cache *erofs_inode_cachep __read_mostly;
+static struct file_system_type erofs_fs_type;
 
 void _erofs_err(struct super_block *sb, const char *function,
 		const char *fmt, ...)
@@ -220,7 +221,53 @@ static int erofs_load_compr_cfgs(struct super_block *sb,
 }
 #endif
 
-static int erofs_init_devices(struct super_block *sb,
+static int erofs_init_device(struct erofs_buf *buf, struct super_block *sb,
+			     struct erofs_device_info *dif, erofs_off_t *pos)
+{
+	struct erofs_sb_info *sbi = EROFS_SB(sb);
+	struct erofs_deviceslot *dis;
+	struct block_device *bdev;
+	void *ptr;
+	int ret;
+
+	ptr = erofs_read_metabuf(buf, sb, erofs_blknr(*pos), EROFS_KMAP);
+	if (IS_ERR(ptr))
+		return PTR_ERR(ptr);
+	dis = ptr + erofs_blkoff(*pos);
+
+	if (!dif->path) {
+		if (!dis->tag[0]) {
+			erofs_err(sb, "empty device tag @ pos %llu", *pos);
+			return -EINVAL;
+		}
+		dif->path = kmemdup_nul(dis->tag, sizeof(dis->tag), GFP_KERNEL);
+		if (!dif->path)
+			return -ENOMEM;
+	}
+
+	if (erofs_is_fscache_mode(sb)) {
+		ret = erofs_fscache_register_cookie(sb, &dif->fscache,
+				dif->path, false);
+		if (ret)
+			return ret;
+	} else {
+		bdev = blkdev_get_by_path(dif->path, FMODE_READ, sb->s_type,
+					  NULL);
+		if (IS_ERR(bdev))
+			return PTR_ERR(bdev);
+		dif->bdev = bdev;
+		dif->dax_dev = fs_dax_get_by_bdev(bdev, &dif->dax_part_off,
+						  NULL, NULL);
+	}
+
+	dif->blocks = le32_to_cpu(dis->blocks);
+	dif->mapped_blkaddr = le32_to_cpu(dis->mapped_blkaddr);
+	sbi->total_blocks += dif->blocks;
+	*pos += EROFS_DEVT_SLOT_SIZE;
+	return 0;
+}
+
+static int erofs_scan_devices(struct super_block *sb,
 			      struct erofs_super_block *dsb)
 {
 	struct erofs_sb_info *sbi = EROFS_SB(sb);
@@ -228,8 +275,6 @@ static int erofs_init_devices(struct super_block *sb,
 	erofs_off_t pos;
 	struct erofs_buf buf = __EROFS_BUF_INITIALIZER;
 	struct erofs_device_info *dif;
-	struct erofs_deviceslot *dis;
-	void *ptr;
 	int id, err = 0;
 
 	sbi->total_blocks = sbi->primarydevice_blocks;
@@ -238,7 +283,8 @@ static int erofs_init_devices(struct super_block *sb,
 	else
 		ondisk_extradevs = le16_to_cpu(dsb->extra_devices);
 
-	if (ondisk_extradevs != sbi->devs->extra_devices) {
+	if (sbi->devs->extra_devices &&
+	    ondisk_extradevs != sbi->devs->extra_devices) {
 		erofs_err(sb, "extra devices don't match (ondisk %u, given %u)",
 			  ondisk_extradevs, sbi->devs->extra_devices);
 		return -EINVAL;
@@ -249,39 +295,31 @@ static int erofs_init_devices(struct super_block *sb,
 	sbi->device_id_mask = roundup_pow_of_two(ondisk_extradevs + 1) - 1;
 	pos = le16_to_cpu(dsb->devt_slotoff) * EROFS_DEVT_SLOT_SIZE;
 	down_read(&sbi->devs->rwsem);
-	idr_for_each_entry(&sbi->devs->tree, dif, id) {
-		struct block_device *bdev;
-
-		ptr = erofs_read_metabuf(&buf, sb, erofs_blknr(pos),
-					 EROFS_KMAP);
-		if (IS_ERR(ptr)) {
-			err = PTR_ERR(ptr);
-			break;
-		}
-		dis = ptr + erofs_blkoff(pos);
-
-		if (erofs_is_fscache_mode(sb)) {
-			err = erofs_fscache_register_cookie(sb, &dif->fscache,
-							    dif->path, false);
+	if (sbi->devs->extra_devices) {
+		idr_for_each_entry(&sbi->devs->tree, dif, id) {
+			err = erofs_init_device(&buf, sb, dif, &pos);
 			if (err)
 				break;
-		} else {
-			bdev = blkdev_get_by_path(dif->path,
-						  FMODE_READ | FMODE_EXCL,
-						  sb->s_type);
-			if (IS_ERR(bdev)) {
-				err = PTR_ERR(bdev);
+		}
+	} else {
+		for (id = 0; id < ondisk_extradevs; id++) {
+			dif = kzalloc(sizeof(*dif), GFP_KERNEL);
+			if (!dif) {
+				err = -ENOMEM;
 				break;
 			}
-			dif->bdev = bdev;
-			dif->dax_dev = fs_dax_get_by_bdev(bdev,
-					&dif->dax_part_off, NULL, NULL);
-		}
 
-		dif->blocks = le32_to_cpu(dis->blocks);
-		dif->mapped_blkaddr = le32_to_cpu(dis->mapped_blkaddr);
-		sbi->total_blocks += dif->blocks;
-		pos += EROFS_DEVT_SLOT_SIZE;
+			err = idr_alloc(&sbi->devs->tree, dif, 0, 0, GFP_KERNEL);
+			if (err < 0) {
+				kfree(dif);
+				break;
+			}
+			++sbi->devs->extra_devices;
+
+			err = erofs_init_device(&buf, sb, dif, &pos);
+			if (err)
+				break;
+		}
 	}
 	up_read(&sbi->devs->rwsem);
 	erofs_put_metabuf(&buf);
@@ -368,7 +406,7 @@ static int erofs_read_superblock(struct super_block *sb)
 		goto out;
 
 	/* handle multiple devices */
-	ret = erofs_init_devices(sb, dsb);
+	ret = erofs_scan_devices(sb, dsb);
 
 	if (erofs_sb_has_ztailpacking(sbi))
 		erofs_info(sb, "EXPERIMENTAL compressed inline data feature in use. Use at your own risk!");
@@ -782,9 +820,9 @@ static int erofs_release_device_info(int id, void *ptr, void *data)
 {
 	struct erofs_device_info *dif = ptr;
 
-	fs_put_dax(dif->dax_dev);
+	fs_put_dax(dif->dax_dev, NULL);
 	if (dif->bdev)
-		blkdev_put(dif->bdev, FMODE_READ | FMODE_EXCL);
+		blkdev_put(dif->bdev, &erofs_fs_type);
 	erofs_fscache_unregister_cookie(&dif->fscache);
 	kfree(dif->path);
 	kfree(dif);
