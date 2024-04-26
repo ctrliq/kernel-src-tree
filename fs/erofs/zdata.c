@@ -1247,8 +1247,9 @@ static void z_erofs_submit_queue(struct super_block *sb,
 	struct z_erofs_decompressqueue *q[NR_JOBQUEUES];
 	void *bi_private;
 	z_erofs_next_pcluster_t owned_head = f->clt.owned_head;
-	/* since bio will be NULL, no need to initialize last_index */
+	/* bio is NULL initially, so no need to initialize last_{index,bdev} */
 	pgoff_t last_index;
+	struct block_device *last_bdev;
 	unsigned int nr_bios = 0;
 	struct bio *bio = NULL;
 
@@ -1260,6 +1261,7 @@ static void z_erofs_submit_queue(struct super_block *sb,
 	q[JQ_SUBMIT]->head = owned_head;
 
 	do {
+		struct erofs_map_dev mdev;
 		struct z_erofs_pcluster *pcl;
 		pgoff_t cur, end;
 		unsigned int i = 0;
@@ -1271,7 +1273,13 @@ static void z_erofs_submit_queue(struct super_block *sb,
 
 		pcl = container_of(owned_head, struct z_erofs_pcluster, next);
 
-		cur = pcl->obj.index;
+		/* no device id here, thus it will always succeed */
+		mdev = (struct erofs_map_dev) {
+			.m_pa = blknr_to_addr(pcl->obj.index),
+		};
+		(void)erofs_map_dev(sb, &mdev);
+
+		cur = erofs_blknr(mdev.m_pa);
 		end = cur + pcl->pclusterpages;
 
 		/* close the main owned chain at first */
@@ -1287,17 +1295,19 @@ static void z_erofs_submit_queue(struct super_block *sb,
 			if (!page)
 				continue;
 
-			if (bio && cur != last_index + 1) {
+			if (bio && (cur != last_index + 1 ||
+				    last_bdev != mdev.m_bdev)) {
 submit_bio_retry:
 				submit_bio(bio);
 				bio = NULL;
 			}
 
 			if (!bio) {
-				bio = bio_alloc(sb->s_bdev, BIO_MAX_VECS,
+				bio = bio_alloc(mdev.m_bdev, BIO_MAX_VECS,
 						REQ_OP_READ, GFP_NOIO);
-
 				bio->bi_end_io = z_erofs_decompressqueue_endio;
+
+				last_bdev = mdev.m_bdev;
 				bio->bi_iter.bi_sector = (sector_t)cur <<
 					LOG_SECTORS_PER_BLOCK;
 				bio->bi_private = bi_private;
