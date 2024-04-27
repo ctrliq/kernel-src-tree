@@ -4354,14 +4354,13 @@ static int cgroup_init_cftypes(struct cgroup_subsys *ss, struct cftype *cfts)
 	return ret;
 }
 
-static int cgroup_rm_cftypes_locked(struct cftype *cfts)
+static void cgroup_rm_cftypes_locked(struct cftype *cfts)
 {
 	lockdep_assert_held(&cgroup_mutex);
 
 	list_del(&cfts->node);
 	cgroup_apply_cftypes(cfts, false);
 	cgroup_exit_cftypes(cfts);
-	return 0;
 }
 
 /**
@@ -4377,8 +4376,6 @@ static int cgroup_rm_cftypes_locked(struct cftype *cfts)
  */
 int cgroup_rm_cftypes(struct cftype *cfts)
 {
-	int ret;
-
 	if (!cfts || cfts[0].name[0] == '\0')
 		return 0;
 
@@ -4386,9 +4383,9 @@ int cgroup_rm_cftypes(struct cftype *cfts)
 		return -ENOENT;
 
 	cgroup_lock();
-	ret = cgroup_rm_cftypes_locked(cfts);
+	cgroup_rm_cftypes_locked(cfts);
 	cgroup_unlock();
-	return ret;
+	return 0;
 }
 
 /**
