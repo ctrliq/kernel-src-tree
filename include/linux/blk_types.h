@@ -51,6 +51,9 @@ struct block_device {
 #define BD_WRITE_HOLDER		(1u<<9)
 #define BD_HAS_SUBMIT_BIO	(1u<<10)
 #define BD_RO_WARNED		(1u<<11)
+#ifdef CONFIG_FAIL_MAKE_REQUEST
+#define BD_MAKE_IT_FAIL		(1u<<12)
+#endif
 	dev_t			bd_dev;
 	struct inode *		bd_inode;	/* will die */
 
@@ -70,9 +73,6 @@ struct block_device {
 	struct super_block	*bd_fsfreeze_sb;
 
 	struct partition_meta_info *bd_meta_info;
-#ifdef CONFIG_FAIL_MAKE_REQUEST
-	bool			bd_make_it_fail;
-#endif
 	int			bd_writers;
 	/*
 	 * keep this out-of-line as it's both big and not needed in the fast
