@@ -2097,6 +2097,7 @@ static int add_page_for_migration(struct mm_struct *mm, const void __user *p,
 	unsigned long addr;
 	struct page *page;
 	int err;
+	bool isolated;
 
 	mmap_read_lock(mm);
 	addr = (unsigned long)untagged_addr_remote(mm, p);
@@ -2130,13 +2131,11 @@ static int add_page_for_migration(struct mm_struct *mm, const void __user *p,
 
 	if (PageHuge(page)) {
 		if (PageHead(page)) {
-			err = isolate_hugetlb(page_folio(page), pagelist);
-			if (!err)
-				err = 1;
+			isolated = isolate_hugetlb(page_folio(page), pagelist);
+			err = isolated ? 1 : -EBUSY;
 		}
 	} else {
 		struct page *head;
-		bool isolated;
 
 		head = compound_head(page);
 		isolated = isolate_lru_page(head);
