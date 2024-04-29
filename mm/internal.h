@@ -864,6 +864,7 @@ int numa_migrate_prep(struct page *page, struct vm_area_struct *vma,
  * mm/gup.c
  */
 struct folio *try_grab_folio(struct page *page, int refs, unsigned int flags);
+int __must_check try_grab_page(struct page *page, unsigned int flags);
 void free_zone_device_page(struct page *page);
 int migrate_device_coherent_page(struct page *page);
 
