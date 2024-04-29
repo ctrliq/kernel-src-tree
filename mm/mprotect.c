@@ -382,7 +382,7 @@ again:
 		if (!range.start) {
 			mmu_notifier_range_init(&range,
 				MMU_NOTIFY_PROTECTION_VMA, 0,
-				vma, vma->vm_mm, addr, end);
+				vma->vm_mm, addr, end);
 			mmu_notifier_invalidate_range_start(&range);
 		}
 
