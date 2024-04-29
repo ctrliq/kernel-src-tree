@@ -1783,23 +1783,23 @@ static int hugetlb_set_page_hwpoison(struct page *hpage, struct page *page)
 	return ret;
 }
 
-static unsigned long free_raw_hwp_pages(struct page *hpage, bool move_flag)
+static unsigned long folio_free_raw_hwp(struct folio *folio, bool move_flag)
 {
 	/*
-	 * HPageVmemmapOptimized hugepages can't be freed because struct
+	 * hugetlb_vmemmap_optimized hugepages can't be freed because struct
 	 * pages for tail pages are required but they don't exist.
 	 */
-	if (move_flag && HPageVmemmapOptimized(hpage))
+	if (move_flag && folio_test_hugetlb_vmemmap_optimized(folio))
 		return 0;
 
 	/*
-	 * HPageRawHwpUnreliable hugepages shouldn't be unpoisoned by
+	 * hugetlb_raw_hwp_unreliable hugepages shouldn't be unpoisoned by
 	 * definition.
 	 */
-	if (HPageRawHwpUnreliable(hpage))
+	if (folio_test_hugetlb_raw_hwp_unreliable(folio))
 		return 0;
 
-	return __free_raw_hwp_pages(hpage, move_flag);
+	return __free_raw_hwp_pages(&folio->page, move_flag);
 }
 
 void folio_clear_hugetlb_hwpoison(struct folio *folio)
@@ -1807,7 +1807,7 @@ void folio_clear_hugetlb_hwpoison(struct folio *folio)
 	if (folio_test_hugetlb_raw_hwp_unreliable(folio))
 		return;
 	folio_clear_hwpoison(folio);
-	free_raw_hwp_pages(&folio->page, true);
+	folio_free_raw_hwp(folio, true);
 }
 
 /*
@@ -1946,7 +1946,7 @@ static inline int try_memory_failure_hugetlb(unsigned long pfn, int flags, int *
 	return 0;
 }
 
-static inline unsigned long free_raw_hwp_pages(struct page *hpage, bool flag)
+static inline unsigned long folio_free_raw_hwp(struct folio *folio, bool flag)
 {
 	return 0;
 }
@@ -2353,6 +2353,7 @@ core_initcall(memory_failure_init);
 int unpoison_memory(unsigned long pfn)
 {
 	struct page *page;
+	struct folio *folio;
 	struct page *p;
 	int ret = -EBUSY;
 	unsigned long count = 1;
@@ -2365,6 +2366,7 @@ int unpoison_memory(unsigned long pfn)
 
 	p = pfn_to_page(pfn);
 	page = compound_head(p);
+	folio = page_folio(p);
 
 	mutex_lock(&mf_mutex);
 
@@ -2406,7 +2408,7 @@ int unpoison_memory(unsigned long pfn)
 	if (!ret) {
 		if (PageHuge(p)) {
 			huge = true;
-			count = free_raw_hwp_pages(page, false);
+			count = folio_free_raw_hwp(folio, false);
 			if (count == 0) {
 				ret = -EBUSY;
 				put_page(page);
@@ -2423,7 +2425,7 @@ int unpoison_memory(unsigned long pfn)
 	} else {
 		if (PageHuge(p)) {
 			huge = true;
-			count = free_raw_hwp_pages(page, false);
+			count = folio_free_raw_hwp(folio, false);
 			if (count == 0) {
 				ret = -EBUSY;
 				put_page(page);
