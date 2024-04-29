@@ -2911,7 +2911,7 @@ out:
 }
 
 /*
- * brk_munmap() - Unmap a parital vma.
+ * brk_munmap() - Unmap a partial vma.
  * @mas: The maple tree state.
  * @vma: The vma to be modified
  * @newbrk: the start of the address to unmap
