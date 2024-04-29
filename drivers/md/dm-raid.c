@@ -255,7 +255,7 @@ struct raid_set {
 		int mode;
 	} journal_dev;
 
-	struct raid_dev dev[];
+	struct raid_dev dev[] __counted_by(raid_disks);
 };
 
 static void rs_config_backup(struct raid_set *rs, struct rs_layout *l)
