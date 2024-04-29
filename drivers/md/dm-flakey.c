@@ -384,7 +384,7 @@ static void corrupt_bio_random(struct bio *bio)
 		return;
 
 	corrupt_byte = get_random_u32() % bio->bi_iter.bi_size;
-	corrupt_value = get_random_u32() & 0xff;
+	corrupt_value = get_random_u8();
 
 	corrupt_bio_common(bio, corrupt_byte, corrupt_value);
 }
