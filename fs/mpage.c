@@ -444,13 +444,11 @@ void clean_page_buffers(struct page *page)
 static int __mpage_writepage(struct folio *folio, struct writeback_control *wbc,
 		      void *data)
 {
-	struct page *page = &folio->page;
 	struct mpage_data *mpd = data;
 	struct bio *bio = mpd->bio;
-	struct address_space *mapping = page->mapping;
-	struct inode *inode = page->mapping->host;
+	struct address_space *mapping = folio->mapping;
+	struct inode *inode = mapping->host;
 	const unsigned blkbits = inode->i_blkbits;
-	unsigned long end_index;
 	const unsigned blocks_per_page = PAGE_SIZE >> blkbits;
 	sector_t last_block;
 	sector_t block_in_file;
@@ -461,13 +459,13 @@ static int __mpage_writepage(struct folio *folio, struct writeback_control *wbc,
 	int boundary = 0;
 	sector_t boundary_block = 0;
 	struct block_device *boundary_bdev = NULL;
-	int length;
+	size_t length;
 	struct buffer_head map_bh;
 	loff_t i_size = i_size_read(inode);
 	int ret = 0;
+	struct buffer_head *head = folio_buffers(folio);
 
-	if (page_has_buffers(page)) {
-		struct buffer_head *head = page_buffers(page);
+	if (head) {
 		struct buffer_head *bh = head;
 
 		/* If they're all mapped and dirty, do it */
@@ -519,10 +517,10 @@ static int __mpage_writepage(struct folio *folio, struct writeback_control *wbc,
 	/*
 	 * The page has no buffers: map it to disk
 	 */
-	BUG_ON(!PageUptodate(page));
-	block_in_file = (sector_t)page->index << (PAGE_SHIFT - blkbits);
+	BUG_ON(!folio_test_uptodate(folio));
+	block_in_file = (sector_t)folio->index << (PAGE_SHIFT - blkbits);
 	last_block = (i_size - 1) >> blkbits;
-	map_bh.b_page = page;
+	map_bh.b_folio = folio;
 	for (page_block = 0; page_block < blocks_per_page; ) {
 
 		map_bh.b_state = 0;
@@ -551,8 +549,11 @@ static int __mpage_writepage(struct folio *folio, struct writeback_control *wbc,
 	first_unmapped = page_block;
 
 page_is_mapped:
-	end_index = i_size >> PAGE_SHIFT;
-	if (page->index >= end_index) {
+	/* Don't bother writing beyond EOF, truncate will discard the folio */
+	if (folio_pos(folio) >= i_size)
+		goto confused;
+	length = folio_size(folio);
+	if (folio_pos(folio) + length > i_size) {
 		/*
 		 * The page straddles i_size.  It must be zeroed out on each
 		 * and every writepage invocation because it may be mmapped.
@@ -561,11 +562,8 @@ page_is_mapped:
 		 * is zeroed when mapped, and writes to that region are not
 		 * written out to the file."
 		 */
-		unsigned offset = i_size & (PAGE_SIZE - 1);
-
-		if (page->index > end_index || !offset)
-			goto confused;
-		zero_user_segment(page, offset, PAGE_SIZE);
+		length = i_size - folio_pos(folio);
+		folio_zero_segment(folio, length, folio_size(folio));
 	}
 
 	/*
@@ -588,18 +586,18 @@ alloc_new:
 	 * the confused fail path above (OOM) will be very confused when
 	 * it finds all bh marked clean (i.e. it will not write anything)
 	 */
-	wbc_account_cgroup_owner(wbc, page, PAGE_SIZE);
+	wbc_account_cgroup_owner(wbc, &folio->page, folio_size(folio));
 	length = first_unmapped << blkbits;
-	if (bio_add_page(bio, page, length, 0) < length) {
+	if (!bio_add_folio(bio, folio, length, 0)) {
 		bio = mpage_bio_submit(bio);
 		goto alloc_new;
 	}
 
-	clean_buffers(page, first_unmapped);
+	clean_buffers(&folio->page, first_unmapped);
 
-	BUG_ON(PageWriteback(page));
-	set_page_writeback(page);
-	unlock_page(page);
+	BUG_ON(folio_test_writeback(folio));
+	folio_start_writeback(folio);
+	folio_unlock(folio);
 	if (boundary || (first_unmapped != blocks_per_page)) {
 		bio = mpage_bio_submit(bio);
 		if (boundary_block) {
@@ -616,7 +614,7 @@ confused:
 		bio = mpage_bio_submit(bio);
 
 	if (mpd->use_writepage) {
-		ret = mapping->a_ops->writepage(page, wbc);
+		ret = mapping->a_ops->writepage(&folio->page, wbc);
 	} else {
 		ret = -EAGAIN;
 		goto out;
