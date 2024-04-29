@@ -511,11 +511,11 @@ static void dm_io_acct(struct dm_io *io, bool end)
 
 	if (dm_io_flagged(io, DM_IO_BLK_STAT)) {
 		if (!end)
-			bdev_start_io_acct(bio->bi_bdev,
-					   dm_io_sectors(io, bio),
-					   bio_op(bio), io->start_time);
+			bdev_start_io_acct(bio->bi_bdev, bio_op(bio),
+					   io->start_time);
 		else
 			bdev_end_io_acct(bio->bi_bdev, bio_op(bio),
+					 dm_io_sectors(io, bio),
 					 io->start_time);
 	}
 
