@@ -630,7 +630,6 @@ static int madvise_free_pte_range(pmd_t *pmd, unsigned long addr,
 	spinlock_t *ptl;
 	pte_t *start_pte, *pte, ptent;
 	struct folio *folio;
-	struct page *page;
 	int nr_swap = 0;
 	unsigned long next;
 
@@ -670,10 +669,9 @@ static int madvise_free_pte_range(pmd_t *pmd, unsigned long addr,
 			continue;
 		}
 
-		page = vm_normal_page(vma, addr, ptent);
-		if (!page || is_zone_device_page(page))
+		folio = vm_normal_folio(vma, addr, ptent);
+		if (!folio || folio_is_zone_device(folio))
 			continue;
-		folio = page_folio(page);
 
 		/*
 		 * If pmd isn't transhuge but the folio is large and
