@@ -441,9 +441,10 @@ void clean_page_buffers(struct page *page)
 	clean_buffers(page, ~0U);
 }
 
-static int __mpage_writepage(struct page *page, struct writeback_control *wbc,
+static int __mpage_writepage(struct folio *folio, struct writeback_control *wbc,
 		      void *data)
 {
+	struct page *page = &folio->page;
 	struct mpage_data *mpd = data;
 	struct bio *bio = mpd->bio;
 	struct address_space *mapping = page->mapping;
@@ -667,7 +668,7 @@ int mpage_writepage(struct page *page, get_block_t get_block,
 		.get_block = get_block,
 		.use_writepage = 0,
 	};
-	int ret = __mpage_writepage(page, wbc, &mpd);
+	int ret = __mpage_writepage(page_folio(page), wbc, &mpd);
 	if (mpd.bio)
 		mpage_bio_submit(mpd.bio);
 	return ret;

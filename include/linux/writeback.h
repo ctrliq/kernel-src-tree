@@ -374,7 +374,7 @@ int balance_dirty_pages_ratelimited_flags(struct address_space *mapping,
 
 bool wb_over_bg_thresh(struct bdi_writeback *wb);
 
-typedef int (*writepage_t)(struct page *page, struct writeback_control *wbc,
+typedef int (*writepage_t)(struct folio *folio, struct writeback_control *wbc,
 				void *data);
 
 int generic_writepages(struct address_space *mapping,

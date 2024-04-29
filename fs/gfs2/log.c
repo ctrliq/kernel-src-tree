@@ -80,10 +80,11 @@ void gfs2_remove_from_ail(struct gfs2_bufdata *bd)
 	brelse(bd->bd_bh);
 }
 
-static int __gfs2_writepage(struct page *page, struct writeback_control *wbc,
+static int __gfs2_writepage(struct folio *folio, struct writeback_control *wbc,
 		       void *data)
 {
 	struct address_space *mapping = data;
+	struct page *page = &folio->page;
 	int ret = mapping->a_ops->writepage(page, wbc);
 	mapping_set_error(mapping, ret);
 	return ret;
