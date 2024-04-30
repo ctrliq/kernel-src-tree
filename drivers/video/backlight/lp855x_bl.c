@@ -550,7 +550,7 @@ static int lp855x_remove(struct i2c_client *cl)
 	return 0;
 }
 
-static const struct of_device_id lp855x_dt_ids[] = {
+static const struct of_device_id lp855x_dt_ids[] __maybe_unused = {
 	{ .compatible = "ti,lp8550", },
 	{ .compatible = "ti,lp8551", },
 	{ .compatible = "ti,lp8552", },
