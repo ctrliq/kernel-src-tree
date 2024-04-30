@@ -412,7 +412,7 @@ static void offb_init_fb(struct platform_device *parent, const char *name,
 
 	info = framebuffer_alloc(sizeof(u32) * 16, &parent->dev);
 
-	if (info == 0) {
+	if (!info) {
 		release_mem_region(res_start, res_size);
 		return;
 	}
