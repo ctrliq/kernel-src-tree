@@ -2555,6 +2555,9 @@ static int __init savagefb_init(void)
 
 	DBG("savagefb_init");
 
+	if (fb_modesetting_disabled("savagefb"))
+		return -ENODEV;
+
 	if (fb_get_options("savagefb", &option))
 		return -ENODEV;
 

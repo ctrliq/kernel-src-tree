@@ -1164,6 +1164,9 @@ static int __init lynxfb_init(void)
 {
 	char *option;
 
+	if (fb_modesetting_disabled("sm750fb"))
+		return -ENODEV;
+
 #ifdef MODULE
 	option = g_option;
 #else
