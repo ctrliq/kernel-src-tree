@@ -763,7 +763,7 @@ fb_read(struct file *file, char __user *buf, size_t count, loff_t *ppos)
 {
 	struct fb_info *info = file_fb_info(file);
 
-	if (!info || ! info->screen_base)
+	if (!info)
 		return -ENODEV;
 
 	if (info->state != FBINFO_STATE_RUNNING)
@@ -780,7 +780,7 @@ fb_write(struct file *file, const char __user *buf, size_t count, loff_t *ppos)
 {
 	struct fb_info *info = file_fb_info(file);
 
-	if (!info || !info->screen_base)
+	if (!info)
 		return -ENODEV;
 
 	if (info->state != FBINFO_STATE_RUNNING)
