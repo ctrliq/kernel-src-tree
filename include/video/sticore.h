@@ -2,6 +2,8 @@
 #ifndef STICORE_H
 #define STICORE_H
 
+struct device;
+
 /* generic STI structures & functions */
 
 #define MAX_STI_ROMS 4		/* max no. of ROMs which this driver handles */
@@ -367,6 +369,9 @@ struct sti_struct {
 
 	/* pointer to the fb_info where this STI device is used */
 	struct fb_info *info;
+
+	/* pointer to the parent device */
+	struct device *dev;
 
 	/* pointer to all internal data */
 	struct sti_all_data *sti_data;
