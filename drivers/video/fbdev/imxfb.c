@@ -688,8 +688,7 @@ static int imxfb_init_fbinfo(struct platform_device *pdev)
 	info->var.vmode			= FB_VMODE_NONINTERLACED;
 
 	info->fbops			= &imxfb_ops;
-	info->flags			= FBINFO_FLAG_DEFAULT |
-					  FBINFO_READS_FAST;
+	info->flags			= FBINFO_READS_FAST;
 	if (pdata) {
 		fbi->lscr1			= pdata->lscr1;
 		fbi->dmacr			= pdata->dmacr;
