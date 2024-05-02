@@ -1486,6 +1486,8 @@ sh_mobile_lcdc_overlay_mmap(struct fb_info *info, struct vm_area_struct *vma)
 	if (info->fbdefio)
 		return fb_deferred_io_mmap(info, vma);
 
+	vma->vm_page_prot = pgprot_decrypted(vma->vm_page_prot);
+
 	return dma_mmap_coherent(ovl->channel->lcdc->dev, vma, ovl->fb_mem,
 				 ovl->dma_handle, ovl->fb_size);
 }
@@ -1958,6 +1960,8 @@ sh_mobile_lcdc_mmap(struct fb_info *info, struct vm_area_struct *vma)
 
 	if (info->fbdefio)
 		return fb_deferred_io_mmap(info, vma);
+
+	vma->vm_page_prot = pgprot_decrypted(vma->vm_page_prot);
 
 	return dma_mmap_coherent(ch->lcdc->dev, vma, ch->fb_mem,
 				 ch->dma_handle, ch->fb_size);
