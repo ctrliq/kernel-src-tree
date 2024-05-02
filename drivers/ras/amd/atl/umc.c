@@ -239,56 +239,6 @@ static unsigned long convert_dram_to_norm_addr_mi300(unsigned long addr)
 	return addr;
 }
 
-static unsigned long get_addr(unsigned long addr)
-{
-	if (df_cfg.rev == DF4p5 && df_cfg.flags.heterogeneous)
-		return convert_dram_to_norm_addr_mi300(addr);
-
-	return addr;
-}
-
-#define MCA_IPID_INST_ID_HI	GENMASK_ULL(47, 44)
-static u8 get_die_id(struct atl_err *err)
-{
-	/*
-	 * AMD Node ID is provided in MCA_IPID[InstanceIdHi], and this
-	 * needs to be divided by 4 to get the internal Die ID.
-	 */
-	if (df_cfg.rev == DF4p5 && df_cfg.flags.heterogeneous) {
-		u8 node_id = FIELD_GET(MCA_IPID_INST_ID_HI, err->ipid);
-
-		return node_id >> 2;
-	}
-
-	/*
-	 * For CPUs, this is the AMD Node ID modulo the number
-	 * of AMD Nodes per socket.
-	 */
-	return topology_die_id(err->cpu) % amd_get_nodes_per_socket();
-}
-
-#define UMC_CHANNEL_NUM	GENMASK(31, 20)
-static u8 get_coh_st_inst_id(struct atl_err *err)
-{
-	if (df_cfg.rev == DF4p5 && df_cfg.flags.heterogeneous)
-		return get_coh_st_inst_id_mi300(err);
-
-	return FIELD_GET(UMC_CHANNEL_NUM, err->ipid);
-}
-
-unsigned long convert_umc_mca_addr_to_sys_addr(struct atl_err *err)
-{
-	u8 socket_id = topology_physical_package_id(err->cpu);
-	u8 coh_st_inst_id = get_coh_st_inst_id(err);
-	unsigned long addr = get_addr(err->addr);
-	u8 die_id = get_die_id(err);
-
-	pr_debug("socket_id=0x%x die_id=0x%x coh_st_inst_id=0x%x addr=0x%016lx",
-		 socket_id, die_id, coh_st_inst_id, addr);
-
-	return norm_to_sys_addr(socket_id, die_id, coh_st_inst_id, addr);
-}
-
 /*
  * When a DRAM ECC error occurs on MI300 systems, it is recommended to retire
  * all memory within that DRAM row. This applies to the memory with a DRAM
@@ -339,3 +289,53 @@ void amd_retire_dram_row(struct atl_err *a_err)
 		return retire_row_mi300(a_err);
 }
 EXPORT_SYMBOL_GPL(amd_retire_dram_row);
+
+static unsigned long get_addr(unsigned long addr)
+{
+	if (df_cfg.rev == DF4p5 && df_cfg.flags.heterogeneous)
+		return convert_dram_to_norm_addr_mi300(addr);
+
+	return addr;
+}
+
+#define MCA_IPID_INST_ID_HI	GENMASK_ULL(47, 44)
+static u8 get_die_id(struct atl_err *err)
+{
+	/*
+	 * AMD Node ID is provided in MCA_IPID[InstanceIdHi], and this
+	 * needs to be divided by 4 to get the internal Die ID.
+	 */
+	if (df_cfg.rev == DF4p5 && df_cfg.flags.heterogeneous) {
+		u8 node_id = FIELD_GET(MCA_IPID_INST_ID_HI, err->ipid);
+
+		return node_id >> 2;
+	}
+
+	/*
+	 * For CPUs, this is the AMD Node ID modulo the number
+	 * of AMD Nodes per socket.
+	 */
+	return topology_amd_node_id(err->cpu) % topology_amd_nodes_per_pkg();
+}
+
+#define UMC_CHANNEL_NUM	GENMASK(31, 20)
+static u8 get_coh_st_inst_id(struct atl_err *err)
+{
+	if (df_cfg.rev == DF4p5 && df_cfg.flags.heterogeneous)
+		return get_coh_st_inst_id_mi300(err);
+
+	return FIELD_GET(UMC_CHANNEL_NUM, err->ipid);
+}
+
+unsigned long convert_umc_mca_addr_to_sys_addr(struct atl_err *err)
+{
+	u8 socket_id = topology_physical_package_id(err->cpu);
+	u8 coh_st_inst_id = get_coh_st_inst_id(err);
+	unsigned long addr = get_addr(err->addr);
+	u8 die_id = get_die_id(err);
+
+	pr_debug("socket_id=0x%x die_id=0x%x coh_st_inst_id=0x%x addr=0x%016lx",
+		 socket_id, die_id, coh_st_inst_id, addr);
+
+	return norm_to_sys_addr(socket_id, die_id, coh_st_inst_id, addr);
+}
