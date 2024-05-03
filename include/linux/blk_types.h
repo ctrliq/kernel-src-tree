@@ -72,6 +72,7 @@ struct block_device {
 	bool			bd_make_it_fail;
 #endif
 	bool			bd_ro_warned;
+	int			bd_writers;
 	/*
 	 * keep this out-of-line as it's both big and not needed in the fast
 	 * path

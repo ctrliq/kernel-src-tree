@@ -49,6 +49,7 @@
 #include <trace/events/block.h>
 #include <linux/fscrypt.h>
 #include <linux/sched/isolation.h>
+#include <linux/fsverity.h>
 
 #include "internal.h"
 
@@ -296,20 +297,53 @@ still_busy:
 	return;
 }
 
-struct decrypt_bh_ctx {
+struct postprocess_bh_ctx {
 	struct work_struct work;
 	struct buffer_head *bh;
 };
 
+static void verify_bh(struct work_struct *work)
+{
+	struct postprocess_bh_ctx *ctx =
+		container_of(work, struct postprocess_bh_ctx, work);
+	struct buffer_head *bh = ctx->bh;
+	bool valid;
+
+	valid = fsverity_verify_blocks(page_folio(bh->b_page), bh->b_size,
+				       bh_offset(bh));
+	end_buffer_async_read(bh, valid);
+	kfree(ctx);
+}
+
+static bool need_fsverity(struct buffer_head *bh)
+{
+	struct page *page = bh->b_page;
+	struct inode *inode = page->mapping->host;
+
+	return fsverity_active(inode) &&
+		/* needed by ext4 */
+		page->index < DIV_ROUND_UP(inode->i_size, PAGE_SIZE);
+}
+
 static void decrypt_bh(struct work_struct *work)
 {
-	struct decrypt_bh_ctx *ctx =
-		container_of(work, struct decrypt_bh_ctx, work);
+	struct postprocess_bh_ctx *ctx =
+		container_of(work, struct postprocess_bh_ctx, work);
 	struct buffer_head *bh = ctx->bh;
 	int err;
 
 	err = fscrypt_decrypt_pagecache_blocks(page_folio(bh->b_page),
 					       bh->b_size, bh_offset(bh));
+	if (err == 0 && need_fsverity(bh)) {
+		/*
+		 * We use different work queues for decryption and for verity
+		 * because verity may require reading metadata pages that need
+		 * decryption, and we shouldn't recurse to the same workqueue.
+		 */
+		INIT_WORK(&ctx->work, verify_bh);
+		fsverity_enqueue_verify_work(&ctx->work);
+		return;
+	}
 	end_buffer_async_read(bh, err == 0);
 	kfree(ctx);
 }
@@ -320,15 +354,24 @@ static void decrypt_bh(struct work_struct *work)
  */
 static void end_buffer_async_read_io(struct buffer_head *bh, int uptodate)
 {
-	/* Decrypt if needed */
-	if (uptodate &&
-	    fscrypt_inode_uses_fs_layer_crypto(bh->b_page->mapping->host)) {
-		struct decrypt_bh_ctx *ctx = kmalloc(sizeof(*ctx), GFP_ATOMIC);
+	struct inode *inode = bh->b_page->mapping->host;
+	bool decrypt = fscrypt_inode_uses_fs_layer_crypto(inode);
+	bool verify = need_fsverity(bh);
+
+	/* Decrypt (with fscrypt) and/or verify (with fsverity) if needed. */
+	if (uptodate && (decrypt || verify)) {
+		struct postprocess_bh_ctx *ctx =
+			kmalloc(sizeof(*ctx), GFP_ATOMIC);
 
 		if (ctx) {
-			INIT_WORK(&ctx->work, decrypt_bh);
 			ctx->bh = bh;
-			fscrypt_enqueue_decrypt_work(&ctx->work);
+			if (decrypt) {
+				INIT_WORK(&ctx->work, decrypt_bh);
+				fscrypt_enqueue_decrypt_work(&ctx->work);
+			} else {
+				INIT_WORK(&ctx->work, verify_bh);
+				fsverity_enqueue_verify_work(&ctx->work);
+			}
 			return;
 		}
 		uptodate = 0;
@@ -520,12 +563,6 @@ repeat:
 	}
 	spin_unlock(lock);
 	return err;
-}
-
-void emergency_thaw_bdev(struct super_block *sb)
-{
-	while (sb->s_bdev && !thaw_bdev(sb->s_bdev))
-		printk(KERN_WARNING "Emergency Thaw on %pg\n", sb->s_bdev);
 }
 
 /**
@@ -1899,7 +1936,7 @@ void page_zero_new_buffers(struct page *page, unsigned from, unsigned to)
 }
 EXPORT_SYMBOL(page_zero_new_buffers);
 
-static void
+static int
 iomap_to_bh(struct inode *inode, sector_t block, struct buffer_head *bh,
 		const struct iomap *iomap)
 {
@@ -1913,7 +1950,8 @@ iomap_to_bh(struct inode *inode, sector_t block, struct buffer_head *bh,
 	 * current block, then do not map the buffer and let the caller
 	 * handle it.
 	 */
-	BUG_ON(offset >= iomap->offset + iomap->length);
+	if (offset >= iomap->offset + iomap->length)
+		return -EIO;
 
 	switch (iomap->type) {
 	case IOMAP_HOLE:
@@ -1925,7 +1963,7 @@ iomap_to_bh(struct inode *inode, sector_t block, struct buffer_head *bh,
 		if (!buffer_uptodate(bh) ||
 		    (offset >= i_size_read(inode)))
 			set_buffer_new(bh);
-		break;
+		return 0;
 	case IOMAP_DELALLOC:
 		if (!buffer_uptodate(bh) ||
 		    (offset >= i_size_read(inode)))
@@ -1933,7 +1971,7 @@ iomap_to_bh(struct inode *inode, sector_t block, struct buffer_head *bh,
 		set_buffer_uptodate(bh);
 		set_buffer_mapped(bh);
 		set_buffer_delay(bh);
-		break;
+		return 0;
 	case IOMAP_UNWRITTEN:
 		/*
 		 * For unwritten regions, we always need to ensure that regions
@@ -1950,7 +1988,10 @@ iomap_to_bh(struct inode *inode, sector_t block, struct buffer_head *bh,
 		bh->b_blocknr = (iomap->addr + offset - iomap->offset) >>
 				inode->i_blkbits;
 		set_buffer_mapped(bh);
-		break;
+		return 0;
+	default:
+		WARN_ON_ONCE(1);
+		return -EIO;
 	}
 }
 
@@ -1991,13 +2032,12 @@ int __block_write_begin_int(struct folio *folio, loff_t pos, unsigned len,
 			clear_buffer_new(bh);
 		if (!buffer_mapped(bh)) {
 			WARN_ON(bh->b_size != blocksize);
-			if (get_block) {
+			if (get_block)
 				err = get_block(inode, block, bh, 1);
-				if (err)
-					break;
-			} else {
-				iomap_to_bh(inode, block, bh, iomap);
-			}
+			else
+				err = iomap_to_bh(inode, block, bh, iomap);
+			if (err)
+				break;
 
 			if (buffer_new(bh)) {
 				clean_bdev_bh_alias(bh);
@@ -2248,6 +2288,11 @@ int block_read_full_folio(struct folio *folio, get_block_t *get_block)
 	unsigned int blocksize, bbits;
 	int nr, i;
 	int fully_mapped = 1;
+	loff_t limit = i_size_read(inode);
+
+	/* This is needed for ext4. */
+	if (IS_ENABLED(CONFIG_FS_VERITY) && IS_VERITY(inode))
+		limit = inode->i_sb->s_maxbytes;
 
 	VM_BUG_ON_FOLIO(folio_test_large(folio), folio);
 
@@ -2256,7 +2301,7 @@ int block_read_full_folio(struct folio *folio, get_block_t *get_block)
 	bbits = block_size_bits(blocksize);
 
 	iblock = (sector_t)folio->index << (PAGE_SHIFT - bbits);
-	lblock = (i_size_read(inode)+blocksize-1) >> bbits;
+	lblock = (limit+blocksize-1) >> bbits;
 	bh = head;
 	nr = 0;
 	i = 0;
