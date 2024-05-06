@@ -11,7 +11,7 @@ import sys
 import yaml
 import unittest
 
-from logging import getLogger, DEBUG, INFO, WARN, ERROR, CRITICAL, NOTSET, StreamHandler, Formatter, Logger
+from logging import getLogger, DEBUG, INFO, WARN, ERROR, CRITICAL, NOTSET, FileHandler, StreamHandler, Formatter, Logger
 from typing import Optional
 
 log = getLogger('filtermods')
@@ -42,14 +42,25 @@ def safe_run_command(cmd, cwddir=None):
     return retcode, out, err
 
 
-def setup_logging():
+def setup_logging(log_filename, stdout_log_level):
     log_format = '%(asctime)s %(levelname)7.7s %(funcName)20.20s:%(lineno)4s %(message)s'
     log = getLogger('filtermods')
+    log.setLevel(DEBUG)
+
     handler = StreamHandler(sys.stdout)
     formatter = Formatter(log_format, '%H:%M:%S')
     handler.setFormatter(formatter)
+    handler.setLevel(stdout_log_level)
     log.addHandler(handler)
-    log.debug('Logging on')
+    log.debug('stdout logging on')
+
+    if log_filename:
+        file_handler = FileHandler(log_filename, 'w')
+        file_handler.setFormatter(formatter)
+        file_handler.setLevel(DEBUG)
+        log.addHandler(file_handler)
+        log.info('file logging on: %s', log_filename)
+
     return log
 
 
@@ -342,7 +353,7 @@ def update_allowed(kmod: KMod, visited: set[KMod], update_linked: bool = False) 
 
         if init:
             kmod.allowed_list = init_allowed_list
-            log.info('%s: init to %s', kmod.name, [x.name for x in kmod.allowed_list])
+            log.debug('%s: init to %s', kmod.name, [x.name for x in kmod.allowed_list])
 
     kmod_allowed_list = kmod.allowed_list or set()
     # log.debug('%s: update to %s', kmod.name, [x.name for x in kmod_allowed_list])
@@ -354,8 +365,8 @@ def update_allowed(kmod: KMod, visited: set[KMod], update_linked: bool = False) 
                 continue
             if not is_pkg_parent_to_any(pkg, kmod_dep.allowed_list):
                 to_remove.add(pkg)
-                log.info('%s: remove %s from allowed, child: %s [%s]',
-                         kmod.name, [pkg.name], kmod_dep.name, [x.name for x in kmod_dep.allowed_list])
+                log.debug('%s: remove %s from allowed, child: %s [%s]',
+                          kmod.name, [pkg.name], kmod_dep.name, [x.name for x in kmod_dep.allowed_list])
 
     # each allowed is child to at least one parent allowed [for _all_ parents]
     for pkg in kmod_allowed_list:
@@ -365,8 +376,8 @@ def update_allowed(kmod: KMod, visited: set[KMod], update_linked: bool = False) 
 
             if not is_pkg_child_to_any(pkg, kmod_par.allowed_list):
                 to_remove.add(pkg)
-                log.info('%s: remove %s from allowed, parent: %s %s',
-                         kmod.name, [pkg.name], kmod_par.name, [x.name for x in kmod_par.allowed_list])
+                log.debug('%s: remove %s from allowed, parent: %s %s',
+                          kmod.name, [pkg.name], kmod_par.name, [x.name for x in kmod_par.allowed_list])
 
     for pkg in to_remove:
         kmod_allowed_list.remove(pkg)
@@ -377,7 +388,7 @@ def update_allowed(kmod: KMod, visited: set[KMod], update_linked: bool = False) 
 
     if init or to_remove or update_linked:
         if to_remove:
-            log.info('%s: updated to %s', kmod.name, [x.name for x in kmod_allowed_list])
+            log.debug('%s: updated to %s', kmod.name, [x.name for x in kmod_allowed_list])
 
         for kmod_dep in kmod.depends_on:
             num_updated = num_updated + update_allowed(kmod_dep, visited)
@@ -488,8 +499,8 @@ def propagate_labels_2(pkg_list: KModPackageList, kmod_list: KModList):
 
             if chosen_pkg is not None:
                 kmod.allowed_list = set([chosen_pkg])
-                log.info('%s: making to prefer %s (preffered is %s), allowed: %s', kmod.name, chosen_pkg.name,
-                         kmod.preferred_pkg.name, [pkg.name for pkg in kmod.allowed_list])
+                log.debug('%s: making to prefer %s (preffered is %s), allowed: %s', kmod.name, chosen_pkg.name,
+                          kmod.preferred_pkg.name, [pkg.name for pkg in kmod.allowed_list])
                 update_linked = True
 
         visited: set[KMod] = set()
@@ -551,7 +562,7 @@ def propagate_labels_3(pkg_list: KModPackageList, kmod_list: KModList):
 
         if chosen_pkg:
             kmod.allowed_list = set([chosen_pkg])
-            log.info('%s: making to prefer %s (default: %s)', kmod.name, [chosen_pkg.name], default_name)
+            log.debug('%s: making to prefer %s (default: %s)', kmod.name, [chosen_pkg.name], default_name)
             update_linked = True
 
         visited: set[KMod] = set()
@@ -1002,13 +1013,15 @@ def cmd_cmp2rpm(options):
 
 def main():
     global log
-    log = setup_logging()
 
     parser = argparse.ArgumentParser()
     parser.add_argument('-v', '--verbose', dest='verbose',
                         help='be more verbose', action='count', default=4)
     parser.add_argument('-q', '--quiet', dest='quiet',
                         help='be more quiet', action='count', default=0)
+    parser.add_argument('-l', '--log-filename', dest='log_filename',
+                        help='log filename', default='filtermods.log')
+
     subparsers = parser.add_subparsers(dest='cmd')
 
     def add_graphviz_arg(p):
@@ -1061,7 +1074,9 @@ def main():
         options.verbose = options.verbose - 2
     options.verbose = max(options.verbose - options.quiet, 0)
     levels = [NOTSET, CRITICAL, ERROR, WARN, INFO, DEBUG]
-    log.setLevel(levels[min(options.verbose, len(levels) - 1)])
+    stdout_log_level = levels[min(options.verbose, len(levels) - 1)]
+
+    log = setup_logging(options.log_filename, stdout_log_level)
 
     ret = 0
     if options.cmd == "sort":
