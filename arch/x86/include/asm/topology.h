@@ -129,6 +129,11 @@ static inline int topology_max_die_per_package(void)
 	return __max_die_per_package;
 }
 
+static inline int topology_max_dies_per_package(void)
+{
+	return __max_die_per_package;
+}
+
 extern int __max_smt_threads;
 
 static inline int topology_max_smt_threads(void)
