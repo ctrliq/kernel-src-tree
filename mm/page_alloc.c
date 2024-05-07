@@ -523,13 +523,6 @@ static int page_outside_zone_boundaries(struct zone *zone, struct page *page)
 	return ret;
 }
 
-static int page_is_consistent(struct zone *zone, struct page *page)
-{
-	if (zone != page_zone(page))
-		return 0;
-
-	return 1;
-}
 /*
  * Temporary debugging check for pages not lying within a given zone.
  */
@@ -537,7 +530,7 @@ static int __maybe_unused bad_range(struct zone *zone, struct page *page)
 {
 	if (page_outside_zone_boundaries(zone, page))
 		return 1;
-	if (!page_is_consistent(zone, page))
+	if (zone != page_zone(page))
 		return 1;
 
 	return 0;
