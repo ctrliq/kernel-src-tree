@@ -2897,6 +2897,7 @@ static int vxlan_init(struct net_device *dev)
 		return err;
 	}
 
+	netdev_lockdep_set_classes(dev);
 	return 0;
 }
 
