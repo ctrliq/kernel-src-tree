@@ -737,8 +737,11 @@ static int mptcp_setsockopt_v4_set_tos(struct mptcp_sock *msk, int optname,
 	val = inet_sk(sk)->tos;
 	mptcp_for_each_subflow(msk, subflow) {
 		struct sock *ssk = mptcp_subflow_tcp_sock(subflow);
+		bool slow;
 
+		slow = lock_sock_fast(ssk);
 		__ip_sock_set_tos(ssk, val);
+		unlock_sock_fast(ssk, slow);
 	}
 	release_sock(sk);
 
@@ -1474,6 +1477,10 @@ int mptcp_set_rcvlowat(struct sock *sk, int val)
 {
 	struct mptcp_subflow_context *subflow;
 	int space, cap;
+
+	/* bpf can land here with a wrong sk type */
+	if (sk->sk_protocol == IPPROTO_TCP)
+		return -EINVAL;
 
 	if (sk->sk_userlocks & SOCK_RCVBUF_LOCK)
 		cap = sk->sk_rcvbuf >> 1;

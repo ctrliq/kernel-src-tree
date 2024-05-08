@@ -413,7 +413,7 @@ extern int kexec_load_disabled;
 
 /* List of defined/legal kexec file flags */
 #define KEXEC_FILE_FLAGS	(KEXEC_FILE_UNLOAD | KEXEC_FILE_ON_CRASH | \
-				 KEXEC_FILE_NO_INITRAMFS)
+				 KEXEC_FILE_NO_INITRAMFS | KEXEC_FILE_DEBUG)
 
 /* flag to track if kexec reboot is in progress */
 extern bool kexec_in_progress;
@@ -491,6 +491,11 @@ static inline int arch_kexec_post_alloc_pages(void *vaddr, unsigned int pages, g
 #ifndef arch_kexec_pre_free_pages
 static inline void arch_kexec_pre_free_pages(void *vaddr, unsigned int pages) { }
 #endif
+
+extern bool kexec_file_dbg_print;
+
+#define kexec_dprintk(fmt, arg...) \
+        do { if (kexec_file_dbg_print) pr_info(fmt, ##arg); } while (0)
 
 #else /* !CONFIG_KEXEC_CORE */
 struct pt_regs;
