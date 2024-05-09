@@ -1358,7 +1358,6 @@ static int addend_mips_rel(struct elf_info *elf, Elf_Shdr *sechdr, Elf_Rela *r)
 static void section_rela(const char *modname, struct elf_info *elf,
 			 Elf_Shdr *sechdr)
 {
-	Elf_Sym  *sym;
 	Elf_Rela *rela;
 	Elf_Rela r;
 	unsigned int r_sym;
@@ -1389,11 +1388,8 @@ static void section_rela(const char *modname, struct elf_info *elf,
 		r_sym = ELF_R_SYM(r.r_info);
 #endif
 		r.r_addend = TO_NATIVE(rela->r_addend);
-		sym = elf->symtab_start + r_sym;
-		/* Skip special sections */
-		if (is_shndx_special(sym->st_shndx))
-			continue;
-		check_section_mismatch(modname, elf, sym,
+
+		check_section_mismatch(modname, elf, elf->symtab_start + r_sym,
 				       fsecndx, fromsec, r.r_offset, r.r_addend);
 	}
 }
@@ -1401,7 +1397,6 @@ static void section_rela(const char *modname, struct elf_info *elf,
 static void section_rel(const char *modname, struct elf_info *elf,
 			Elf_Shdr *sechdr)
 {
-	Elf_Sym *sym;
 	Elf_Rel *rel;
 	Elf_Rela r;
 	unsigned int r_sym;
@@ -1448,11 +1443,8 @@ static void section_rel(const char *modname, struct elf_info *elf,
 		default:
 			fatal("Please add code to calculate addend for this architecture\n");
 		}
-		sym = elf->symtab_start + r_sym;
-		/* Skip special sections */
-		if (is_shndx_special(sym->st_shndx))
-			continue;
-		check_section_mismatch(modname, elf, sym,
+
+		check_section_mismatch(modname, elf, elf->symtab_start + r_sym,
 				       fsecndx, fromsec, r.r_offset, r.r_addend);
 	}
 }
