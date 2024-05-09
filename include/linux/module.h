@@ -916,8 +916,7 @@ static inline bool module_sig_ok(struct module *module)
 
 #if defined(CONFIG_MODULES) && defined(CONFIG_KALLSYMS)
 int module_kallsyms_on_each_symbol(const char *modname,
-				   int (*fn)(void *, const char *,
-					     struct module *, unsigned long),
+				   int (*fn)(void *, const char *, unsigned long),
 				   void *data);
 
 /* For kallsyms to ask for address resolution.  namebuf should be at
@@ -950,8 +949,7 @@ unsigned long find_kallsyms_symbol_value(struct module *mod, const char *name);
 #else	/* CONFIG_MODULES && CONFIG_KALLSYMS */
 
 static inline int module_kallsyms_on_each_symbol(const char *modname,
-						 int (*fn)(void *, const char *,
-						 struct module *, unsigned long),
+						 int (*fn)(void *, const char *, unsigned long),
 						 void *data)
 {
 	return -EOPNOTSUPP;
