@@ -1886,6 +1886,9 @@ struct file *do_accept(struct file *file, unsigned file_flags,
 	struct file *newfile;
 	int err, len;
 	struct sockaddr_storage address;
+	struct proto_accept_arg arg = {
+		.flags = file_flags,
+	};
 
 	sock = sock_from_file(file);
 	if (!sock)
@@ -1912,8 +1915,8 @@ struct file *do_accept(struct file *file, unsigned file_flags,
 	if (err)
 		goto out_fd;
 
-	err = sock->ops->accept(sock, newsock, sock->file->f_flags | file_flags,
-					false);
+	arg.flags |= sock->file->f_flags;
+	err = sock->ops->accept(sock, newsock, &arg);
 	if (err < 0)
 		goto out_fd;
 
@@ -3564,6 +3567,10 @@ EXPORT_SYMBOL(kernel_listen);
 int kernel_accept(struct socket *sock, struct socket **newsock, int flags)
 {
 	struct sock *sk = sock->sk;
+	struct proto_accept_arg arg = {
+		.flags = flags,
+		.kern = true,
+	};
 	int err;
 
 	err = sock_create_lite(sk->sk_family, sk->sk_type, sk->sk_protocol,
@@ -3571,7 +3578,7 @@ int kernel_accept(struct socket *sock, struct socket **newsock, int flags)
 	if (err < 0)
 		goto done;
 
-	err = sock->ops->accept(sock, *newsock, flags, true);
+	err = sock->ops->accept(sock, *newsock, &arg);
 	if (err < 0) {
 		sock_release(*newsock);
 		*newsock = NULL;

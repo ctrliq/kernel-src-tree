@@ -3906,11 +3906,10 @@ unlock:
 }
 
 static int mptcp_stream_accept(struct socket *sock, struct socket *newsock,
-			       int flags, bool kern)
+			       struct proto_accept_arg *arg)
 {
 	struct mptcp_sock *msk = mptcp_sk(sock->sk);
 	struct sock *ssk, *newsk;
-	int err;
 
 	pr_debug("msk=%p\n", msk);
 
@@ -3922,9 +3921,9 @@ static int mptcp_stream_accept(struct socket *sock, struct socket *newsock,
 		return -EINVAL;
 
 	pr_debug("ssk=%p, listener=%p\n", ssk, mptcp_subflow_ctx(ssk));
-	newsk = inet_csk_accept(ssk, flags, &err, kern);
+	newsk = inet_csk_accept(ssk, arg);
 	if (!newsk)
-		return err;
+		return arg->err;
 
 	pr_debug("newsk=%p, subflow is mptcp=%d\n", newsk, sk_is_mptcp(newsk));
 	if (sk_is_mptcp(newsk)) {
@@ -3945,7 +3944,7 @@ static int mptcp_stream_accept(struct socket *sock, struct socket *newsock,
 		newsk = new_mptcp_sock;
 		MPTCP_INC_STATS(sock_net(ssk), MPTCP_MIB_MPCAPABLEPASSIVEACK);
 
-		newsk->sk_kern_sock = kern;
+		newsk->sk_kern_sock = arg->kern;
 		lock_sock(newsk);
 		__inet_accept(sock, newsock, newsk);
 
@@ -3974,7 +3973,7 @@ static int mptcp_stream_accept(struct socket *sock, struct socket *newsock,
 		}
 	} else {
 tcpfallback:
-		newsk->sk_kern_sock = kern;
+		newsk->sk_kern_sock = arg->kern;
 		lock_sock(newsk);
 		__inet_accept(sock, newsock, newsk);
 		/* we are being invoked after accepting a non-mp-capable
