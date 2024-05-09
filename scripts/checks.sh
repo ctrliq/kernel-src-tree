@@ -10,6 +10,8 @@ function in_names()
 	return 1
 }
 
+python3 scripts/owners-tool.py verify info/owners.yaml templates/owners-schema.yaml
+
 if [[ $GITLAB_CI ]]; then
 	git fetch origin main
 fi
@@ -63,10 +65,6 @@ if in_names info/owners.yaml && \
 	echo "This warning can be disabled by executing:"
 	echo "        git config --add owners.warning false"
 	echo "======================================================="
-fi
-if test -n "$(git diff $base | grep "^+" | grep "\s\- rhel-sst-null" )"; then
-	echo "ERROR: New entries cannot set devel-sst to rhel-sst-null."
-	exit 1
 fi
 if in_names scripts/validSSTNames.go && \
 	test "$(git config --get validsstnames.warning)" != "false"; then
