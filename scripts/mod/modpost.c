@@ -2145,6 +2145,11 @@ static void check_exports(struct module *mod)
 			      s->name, mod->name);
 			continue;
 		}
+
+		s->module = exp->module;
+		s->crc_valid = exp->crc_valid;
+		s->crc = exp->crc;
+
 		basename = strrchr(mod->name, '/');
 		if (basename)
 			basename++;
@@ -2237,16 +2242,7 @@ static void add_staging_flag(struct buffer *b, const char *name)
  **/
 static void add_versions(struct buffer *b, struct module *mod)
 {
-	struct symbol *s, *exp;
-
-	for (s = mod->unres; s; s = s->next) {
-		exp = find_symbol(s->name);
-		if (!exp || exp->module == mod)
-			continue;
-		s->module = exp->module;
-		s->crc_valid = exp->crc_valid;
-		s->crc = exp->crc;
-	}
+	struct symbol *s;
 
 	if (!modversions)
 		return;
