@@ -176,7 +176,7 @@ send_call_function_ipi_mask(struct cpumask *mask, smp_call_func_t func)
 
 #ifdef CONFIG_CSD_LOCK_WAIT_DEBUG
 
-static DEFINE_STATIC_KEY_FALSE(csdlock_debug_enabled);
+static DEFINE_STATIC_KEY_MAYBE(CONFIG_CSD_LOCK_WAIT_DEBUG_DEFAULT, csdlock_debug_enabled);
 static DEFINE_STATIC_KEY_FALSE(csdlock_debug_extended);
 
 static int __init csdlock_debug(char *str)
