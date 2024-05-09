@@ -2670,6 +2670,31 @@ static int unknown_module_param_cb(char *param, char *val, const char *modname,
 
 static void cfi_init(struct module *mod);
 
+/* Module within temporary copy, this doesn't do any allocation  */
+static int early_mod_check(struct load_info *info, int flags)
+{
+	int err;
+
+	/*
+	 * Now that we know we have the correct module name, check
+	 * if it's blacklisted.
+	 */
+	if (blacklisted(info->name)) {
+		pr_err("Module %s is blacklisted\n", info->name);
+		return -EPERM;
+	}
+
+	err = rewrite_section_headers(info, flags);
+	if (err)
+		return err;
+
+	/* Check module struct version now, before we try to use module. */
+	if (!check_modstruct_version(info, info->mod))
+		return -ENOEXEC;
+
+	return 0;
+}
+
 /*
  * Allocate and load the module: note that size of section 0 is always
  * zero, and we rely on this for optional sections.
@@ -2713,30 +2738,14 @@ static int load_module(struct load_info *info, const char __user *uargs,
 	if (err)
 		goto free_copy;
 
-	/*
-	 * Now that we know we have the correct module name, check
-	 * if it's blacklisted.
-	 */
-	if (blacklisted(info->name)) {
-		err = -EPERM;
-		pr_err("Module %s is blacklisted\n", info->name);
-		goto free_copy;
-	}
-
 #ifdef CONFIG_RHEL_DIFFERENCES
 	if (get_modinfo(info, "intree"))
 		module_rh_check_status(info->name);
 #endif
 
-	err = rewrite_section_headers(info, flags);
+	err = early_mod_check(info, flags);
 	if (err)
 		goto free_copy;
-
-	/* Check module struct version now, before we try to use module. */
-	if (!check_modstruct_version(info, info->mod)) {
-		err = -ENOEXEC;
-		goto free_copy;
-	}
 
 	/* Figure out module layout, and allocate all the memory. */
 	mod = layout_and_allocate(info, flags);
