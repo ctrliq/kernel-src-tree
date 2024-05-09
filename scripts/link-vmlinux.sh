@@ -298,6 +298,9 @@ if is_enabled CONFIG_DEBUG_INFO_BTF && is_enabled CONFIG_BPF; then
 	${RESOLVE_BTFIDS} vmlinux
 fi
 
+info SYSMAP System.map
+mksysmap vmlinux System.map
+
 if is_enabled CONFIG_BUILDTIME_TABLE_SORT; then
 	info SORTTAB vmlinux
 	if ! sorttable vmlinux; then
@@ -305,9 +308,6 @@ if is_enabled CONFIG_BUILDTIME_TABLE_SORT; then
 		exit 1
 	fi
 fi
-
-info SYSMAP System.map
-mksysmap vmlinux System.map
 
 # step a (see comment above)
 if is_enabled CONFIG_KALLSYMS; then
