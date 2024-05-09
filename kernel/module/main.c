@@ -525,7 +525,10 @@ MODINFO_ATTR(version);
 MODINFO_ATTR(srcversion);
 MODINFO_ATTR(rhelversion);
 
-static char last_unloaded_module[MODULE_NAME_LEN+1];
+static struct {
+	char name[MODULE_NAME_LEN + 1];
+	char taints[MODULE_FLAGS_BUF_SIZE];
+} last_unloaded_module;
 
 #ifdef CONFIG_MODULE_UNLOAD
 
@@ -695,6 +698,7 @@ SYSCALL_DEFINE2(delete_module, const char __user *, name_user,
 {
 	struct module *mod;
 	char name[MODULE_NAME_LEN];
+	char buf[MODULE_FLAGS_BUF_SIZE];
 	int ret, forced = 0;
 
 	if (!capable(CAP_SYS_MODULE) || modules_disabled)
@@ -754,8 +758,9 @@ SYSCALL_DEFINE2(delete_module, const char __user *, name_user,
 
 	async_synchronize_full();
 
-	/* Store the name of the last unloaded module for diagnostic purposes */
-	strscpy(last_unloaded_module, mod->name, sizeof(last_unloaded_module));
+	/* Store the name and taints of the last unloaded module for diagnostic purposes */
+	strscpy(last_unloaded_module.name, mod->name, sizeof(last_unloaded_module.name));
+	strscpy(last_unloaded_module.taints, module_flags(mod, buf, false), sizeof(last_unloaded_module.taints));
 
 	free_module(mod);
 	/* someone could wait for the module in add_unformed_module() */
@@ -3173,7 +3178,8 @@ void print_modules(void)
 
 	print_unloaded_tainted_modules();
 	preempt_enable();
-	if (last_unloaded_module[0])
-		pr_cont(" [last unloaded: %s]", last_unloaded_module);
+	if (last_unloaded_module.name[0])
+		pr_cont(" [last unloaded: %s%s]", last_unloaded_module.name,
+			last_unloaded_module.taints);
 	pr_cont("\n");
 }
