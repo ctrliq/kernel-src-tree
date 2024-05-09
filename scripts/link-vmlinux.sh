@@ -200,7 +200,6 @@ sorttable()
 cleanup()
 {
 	rm -f .btf.*
-	rm -f .tmp_symversions.lds
 	rm -f System.map
 	rm -f vmlinux
 	rm -f vmlinux.map
