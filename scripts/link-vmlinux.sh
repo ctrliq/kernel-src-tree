@@ -78,6 +78,10 @@ vmlinux_link()
 		libs="${KBUILD_VMLINUX_LIBS}"
 	fi
 
+	if is_enabled CONFIG_MODULES; then
+		objs="${objs} .vmlinux.export.o"
+	fi
+
 	if [ "${SRCARCH}" = "um" ]; then
 		wl=-Wl,
 		ld="${CC}"
@@ -201,6 +205,7 @@ cleanup()
 	rm -f vmlinux
 	rm -f vmlinux.map
 	rm -f .vmlinux.objs
+	rm -f .vmlinux.export.c
 }
 
 # Use "make V=1" to debug this script
@@ -250,6 +255,10 @@ info GEN modules.builtin
 # The second line aids cases where multiple modules share the same object.
 tr '\0' '\n' < modules.builtin.modinfo | sed -n 's/^[[:alnum:]:_]*\.file=//p' |
 	tr ' ' '\n' | uniq | sed -e 's:^:kernel/:' -e 's/$/.ko/' > modules.builtin
+
+if is_enabled CONFIG_MODULES; then
+	${MAKE} -f "${srctree}/scripts/Makefile.vmlinux" .vmlinux.export.o
+fi
 
 btf_vmlinux_bin_o=""
 if is_enabled CONFIG_DEBUG_INFO_BTF; then
