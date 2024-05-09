@@ -2574,6 +2574,9 @@ static int complete_formation(struct module *mod, struct load_info *info)
 	/* This relies on module_mutex for list integrity. */
 	module_bug_finalize(info->hdr, info->sechdrs, mod);
 
+	if (module_check_misalignment(mod))
+		goto out_misaligned;
+
 	module_enable_ro(mod, false);
 	module_enable_nx(mod);
 	module_enable_x(mod);
@@ -2587,6 +2590,8 @@ static int complete_formation(struct module *mod, struct load_info *info)
 
 	return 0;
 
+out_misaligned:
+	err = -EINVAL;
 out:
 	mutex_unlock(&module_mutex);
 	return err;
