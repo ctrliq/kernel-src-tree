@@ -436,7 +436,7 @@ void __mptcp_sync_state(struct sock *sk, int state)
 		 */
 		WRITE_ONCE(msk->write_seq, subflow->idsn + 1);
 		WRITE_ONCE(msk->snd_nxt, msk->write_seq);
-		inet_sk_state_store(sk, state);
+		mptcp_set_state(sk, state);
 		sk->sk_state_change(sk);
 	}
 }
