@@ -126,6 +126,20 @@ struct xdp_test_data {
 #define TEST_XDP_FRAME_SIZE (PAGE_SIZE - sizeof(struct xdp_page_head))
 #define TEST_XDP_MAX_BATCH 256
 
+#if BITS_PER_LONG == 64 && PAGE_SIZE == SZ_4K
+/* tools/testing/selftests/bpf/prog_tests/xdp_do_redirect.c:%MAX_PKT_SIZE
+ * must be updated accordingly when any of these changes, otherwise BPF
+ * selftests will fail.
+ */
+#ifdef __s390x__
+#define TEST_MAX_PKT_SIZE 3216
+#else
+#define TEST_MAX_PKT_SIZE 3408
+#endif
+static_assert(SKB_WITH_OVERHEAD(TEST_XDP_FRAME_SIZE - XDP_PACKET_HEADROOM) ==
+	      TEST_MAX_PKT_SIZE);
+#endif
+
 static void xdp_test_run_init_page(struct page *page, void *arg)
 {
 	struct xdp_page_head *head = phys_to_virt(page_to_phys(page));
