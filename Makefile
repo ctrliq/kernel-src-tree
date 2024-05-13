@@ -11,3 +11,14 @@ all:
 
 clean:
 	@$(MAKE) -C scripts clean
+	rm -rf resources themes
+
+themes/hugo-geekdoc/theme.toml:
+	mkdir -p themes/hugo-geekdoc
+	cd themes/hugo-geekdoc; \
+	wget -q -O - https://github.com/thegeeklab/hugo-geekdoc/releases/download/v0.38.1/hugo-geekdoc.tar.gz | tar -xz
+
+docs-prepare: themes/hugo-geekdoc/theme.toml
+
+docs: docs-prepare
+	hugo server
