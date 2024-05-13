@@ -20,9 +20,8 @@ gcc)
 	echo 5.1.0
 	;;
 llvm)
-	# https://lore.kernel.org/r/YMtib5hKVyNknZt3@osiris/
 	if [ "$SRCARCH" = s390 ]; then
-		echo 13.0.0
+		echo 14.0.0
 	else
 		echo 10.0.1
 	fi

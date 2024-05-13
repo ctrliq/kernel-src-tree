@@ -28,7 +28,6 @@
 #define MACHINE_FLAG_TOPOLOGY	BIT(10)
 #define MACHINE_FLAG_TE		BIT(11)
 #define MACHINE_FLAG_TLB_LC	BIT(12)
-#define MACHINE_FLAG_VX		BIT(13)
 #define MACHINE_FLAG_TLB_GUEST	BIT(14)
 #define MACHINE_FLAG_NX		BIT(15)
 #define MACHINE_FLAG_GS		BIT(16)
@@ -89,7 +88,6 @@ extern unsigned long mio_wb_bit_mask;
 #define MACHINE_HAS_TOPOLOGY	(S390_lowcore.machine_flags & MACHINE_FLAG_TOPOLOGY)
 #define MACHINE_HAS_TE		(S390_lowcore.machine_flags & MACHINE_FLAG_TE)
 #define MACHINE_HAS_TLB_LC	(S390_lowcore.machine_flags & MACHINE_FLAG_TLB_LC)
-#define MACHINE_HAS_VX		(S390_lowcore.machine_flags & MACHINE_FLAG_VX)
 #define MACHINE_HAS_TLB_GUEST	(S390_lowcore.machine_flags & MACHINE_FLAG_TLB_GUEST)
 #define MACHINE_HAS_NX		(S390_lowcore.machine_flags & MACHINE_FLAG_NX)
 #define MACHINE_HAS_GS		(S390_lowcore.machine_flags & MACHINE_FLAG_GS)
@@ -115,14 +113,6 @@ extern unsigned int console_irq;
 #define SET_CONSOLE_3270	do { console_mode = 3; } while (0)
 #define SET_CONSOLE_VT220	do { console_mode = 4; } while (0)
 #define SET_CONSOLE_HVC		do { console_mode = 5; } while (0)
-
-#ifdef CONFIG_PFAULT
-extern int pfault_init(void);
-extern void pfault_fini(void);
-#else /* CONFIG_PFAULT */
-#define pfault_init()		({-1;})
-#define pfault_fini()		do { } while (0)
-#endif /* CONFIG_PFAULT */
 
 #ifdef CONFIG_VMCP
 void vmcp_cma_reserve(void);
