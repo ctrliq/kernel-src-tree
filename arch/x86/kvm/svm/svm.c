@@ -1525,7 +1525,7 @@ static void svm_prepare_switch_to_guest(struct kvm_vcpu *vcpu)
 	 */
 	vmsave(sd->save_area_pa);
 	if (sev_es_guest(vcpu->kvm))
-		sev_es_prepare_switch_to_guest(sev_es_host_save_area(sd));
+		sev_es_prepare_switch_to_guest(svm, sev_es_host_save_area(sd));
 
 	if (tsc_scaling)
 		__svm_write_tsc_multiplier(vcpu->arch.tsc_scaling_ratio);
