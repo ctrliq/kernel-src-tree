@@ -1691,10 +1691,9 @@ done:
  * For unwritten space on the page, we need to start the conversion to
  * regular allocated space.
  */
-static int
-iomap_do_writepage(struct page *page, struct writeback_control *wbc, void *data)
+static int iomap_do_writepage(struct folio *folio,
+		struct writeback_control *wbc, void *data)
 {
-	struct folio *folio = page_folio(page);
 	struct iomap_writepage_ctx *wpc = data;
 	struct inode *inode = folio->mapping->host;
 	u64 end_pos, isize;
@@ -1794,7 +1793,7 @@ iomap_writepage(struct page *page, struct writeback_control *wbc,
 	int ret;
 
 	wpc->ops = ops;
-	ret = iomap_do_writepage(page, wbc, wpc);
+	ret = iomap_do_writepage(page_folio(page), wbc, wpc);
 	if (!wpc->ioend)
 		return ret;
 	return iomap_submit_ioend(wpc, wpc->ioend, ret);

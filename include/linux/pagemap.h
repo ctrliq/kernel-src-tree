@@ -776,6 +776,8 @@ unsigned filemap_get_folios(struct address_space *mapping, pgoff_t *start,
 		pgoff_t end, struct folio_batch *fbatch);
 unsigned filemap_get_folios_contig(struct address_space *mapping,
 		pgoff_t *start, pgoff_t end, struct folio_batch *fbatch);
+unsigned filemap_get_folios_tag(struct address_space *mapping, pgoff_t *start,
+		pgoff_t end, xa_mark_t tag, struct folio_batch *fbatch);
 unsigned find_get_pages_range_tag(struct address_space *mapping, pgoff_t *index,
 			pgoff_t end, xa_mark_t tag, unsigned int nr_pages,
 			struct page **pages);
@@ -801,6 +803,8 @@ static inline struct page *grab_cache_page(struct address_space *mapping,
 
 struct folio *read_cache_folio(struct address_space *, pgoff_t index,
 		filler_t *filler, struct file *file);
+struct folio *mapping_read_folio_gfp(struct address_space *, pgoff_t index,
+		gfp_t flags);
 struct page *read_cache_page(struct address_space *, pgoff_t index,
 		filler_t *filler, struct file *file);
 extern struct page * read_cache_page_gfp(struct address_space *mapping,
@@ -980,16 +984,6 @@ static inline int folio_lock_killable(struct folio *folio)
 	if (!folio_trylock(folio))
 		return __folio_lock_killable(folio);
 	return 0;
-}
-
-/*
- * lock_page_killable is like lock_page but can be interrupted by fatal
- * signals.  It returns 0 if it locked the page and -EINTR if it was
- * killed while waiting.
- */
-static inline int lock_page_killable(struct page *page)
-{
-	return folio_lock_killable(page_folio(page));
 }
 
 /*
