@@ -2101,6 +2101,9 @@ static int sctp_recvmsg(struct sock *sk, struct msghdr *msg, size_t len,
 		 "addr_len:%p)\n", __func__, sk, msg, len, noblock, flags,
 		 addr_len);
 
+	if (unlikely(flags & MSG_ERRQUEUE))
+		return inet_recv_error(sk, msg, len, addr_len);
+
 	lock_sock(sk);
 
 	if (sctp_style(sk, TCP) && !sctp_sstate(sk, ESTABLISHED) &&
