@@ -55,6 +55,7 @@ get_upstream_version()
 	raw_version="$(git describe "$mergebase")"
 	version="$(git show "$branch":Makefile | sed -ne '/^VERSION\ =\ /{s///;p;q}')"
 	patchlevel="$(git show "$branch":Makefile | sed -ne '/^PATCHLEVEL\ =\ /{s///;p;q}')"
+	rhelrel="$(git show "$branch":Makefile.rhelver | sed -ne '/^RHEL_RELEASE\ =\ /{s///;p;q}')"
 	kver="${version}.${patchlevel}"
 
 	#-rc indicates no tricks necessary, return version
@@ -63,15 +64,27 @@ get_upstream_version()
 		return
 	fi
 
-	#if -gXXX is _not_ there, must be a GA release, use version
-	if ! echo "${raw_version}" | grep -q -- "-g"; then
-		echo "$kver"
+	#must be a post tag release with -g but not -rcX, IOW an rc0.
+	if echo "${raw_version}" | grep -q -- "-g"; then
+		#Add a 1 to the version number
+		echo "${version}.$((patchlevel + 1))"
 		return
 	fi
 
-	#must be a post tag release with -g but not -rcX, IOW an rc0.
-	#Add a 1 to the version number
-	echo "${version}.$((patchlevel + 1))"
+	#if -gXXX is _not_ there, must be a GA release, but there are 2 GA releases:
+	#pre-rebase and post-rebase.
+
+	#post-rebase resets the RHEL_RELEASE
+	#treat like the beginning of rc0 and bump version
+	#7 is arbituary and ties to a minimum of 7 RCs
+	if ((rhelrel < 7)); then
+		#Add a 1 to the version number
+		echo "${version}.$((patchlevel + 1))"
+		return
+	fi
+
+	#pre-rebase
+	echo "$kver"
 }
 
 # To handle missing branches, precalculate previous kernel versions to fetch
