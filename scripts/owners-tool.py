@@ -124,6 +124,74 @@ class CommandVerify(BaseCommand):
         return errors == 0
 
 
+class CommandDoc(BaseCommand):
+    overview = 'Generate documentation from owners.yaml schema.'
+
+    def add_arguments(self):
+        self.add_argument_owners_schema()
+
+    def format_description(self, content, optional=False):
+        description = content.get('description', '')
+        if optional:
+            description = '{}{}Optional.'.format(description, ' ' if description else '')
+        if 'enum' in content:
+            description = '{}{}Allowed values: {}.'.format(
+                            description,
+                            ' ' if description else '',
+                            ', '.join(f'`{c}`' for c in content['enum']))
+        return f' footnote:[{description}]' if description else ''
+
+    def format_properties(self, obj, depth=0, is_array=False):
+        result = []
+        required = obj.get('required', ())
+        for prop, content in obj['properties'].items():
+            description = self.format_description(content, prop not in required)
+            prop_type = content['type']
+            if prop_type == 'string':
+                result.append(f'{prop}: __value__{description}')
+            elif prop_type == 'boolean':
+                result.append(f'{prop}: __true / false__{description}')
+            elif prop_type == 'object':
+                result.append(f'{prop}:{description}')
+                result.extend(self.format_properties(content, depth + 1))
+            elif prop_type == 'array':
+                result.append(f'{prop}:{description}')
+                item_type = content['items']['type']
+                if item_type == 'string':
+                    result.append('  - __value...__' +
+                                  self.format_description(content['items']))
+                elif item_type == 'object':
+                    result.extend(self.format_properties(content['items'], depth + 1, True))
+                else:
+                    eprint(f'Usupported array type: {item_type}')
+                    sys.exit(1)
+            else:
+                eprint(f'Unsupported property type: {prop_type}')
+                sys.exit(1)
+        fmt_result = []
+        indent = '  ' * depth
+        for line in result:
+            if is_array:
+                fmt_result.append(f'{indent}- {line}')
+                indent += '  '
+                is_array = False
+            else:
+                fmt_result.append(indent + line)
+        return fmt_result
+
+    def handle(self, args):
+        print('''---
+title: The Format of owners.yaml
+weight: 100
+---
+
+[subs="+quotes,+macros"]
+----''')
+        print('\n'.join(self.format_properties(args.owners_schema)))
+        print('----')
+        return True
+
+
 parser = argparse.ArgumentParser(description='Verify and convert owners.yaml.')
 subparsers = parser.add_subparsers(dest='command', title='available commands',
                                    metavar='COMMAND')

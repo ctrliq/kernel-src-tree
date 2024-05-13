@@ -1,6 +1,6 @@
 MAKEFLAGS := --no-print-directory
 
-.PHONY: all clean docs-prepare docs
+.PHONY: all clean docs-prepare docs-clean docs
 all:
 	@awk -f scripts/check-multiple-entries.awk info/owners.yaml
 	@$(MAKE) -C scripts fullbuild
@@ -9,16 +9,22 @@ all:
 	scripts/verifySubsystems info/owners.yaml
 	scripts/checks.sh
 
-clean:
+clean: docs-clean
 	@$(MAKE) -C scripts clean
-	rm -rf resources themes
 
 themes/hugo-geekdoc/theme.toml:
 	mkdir -p themes/hugo-geekdoc
 	cd themes/hugo-geekdoc; \
 	wget -q -O - https://github.com/thegeeklab/hugo-geekdoc/releases/download/v0.38.1/hugo-geekdoc.tar.gz | tar -xz
 
-docs-prepare: themes/hugo-geekdoc/theme.toml
+content/docs/owners_yaml_format.adoc: templates/owners-schema.yaml
+	python3 scripts/owners-tool.py doc $< > $@
+
+docs-prepare: themes/hugo-geekdoc/theme.toml content/docs/owners_yaml_format.adoc
+
+docs-clean:
+	rm -rf resources themes
+	rm -f content/docs/owners_yaml_format.adoc
 
 docs: docs-prepare
 	hugo server
