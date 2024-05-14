@@ -79,8 +79,8 @@ get_prev_version()
 {
 	version_str=$1
 
-	version="$(echo "$version_str" | cut -c1)"
-	patchlevel="$(echo "$version_str" | cut -c3)"
+	version="$(echo "$version_str" | cut -d'.' -f1)"
+	patchlevel="$(echo "$version_str" | cut -d'.' -f2)"
 
 	echo "${version}.$((patchlevel - 1))"
 }
