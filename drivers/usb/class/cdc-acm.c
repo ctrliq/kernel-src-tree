@@ -52,7 +52,7 @@ static DEFINE_IDR(acm_minors);
 static DEFINE_MUTEX(acm_minors_lock);
 
 static void acm_tty_set_termios(struct tty_struct *tty,
-				struct ktermios *termios_old);
+				const struct ktermios *termios_old);
 
 /*
  * acm_minors accessors
@@ -662,13 +662,13 @@ static int acm_tty_open(struct tty_struct *tty, struct file *filp)
 	return tty_port_open(&acm->port, tty, filp);
 }
 
-static void acm_port_dtr_rts(struct tty_port *port, int raise)
+static void acm_port_dtr_rts(struct tty_port *port, bool active)
 {
 	struct acm *acm = container_of(port, struct acm, port);
 	int val;
 	int res;
 
-	if (raise)
+	if (active)
 		val = USB_CDC_CTRL_DTR | USB_CDC_CTRL_RTS;
 	else
 		val = 0;
@@ -800,8 +800,8 @@ static void acm_tty_close(struct tty_struct *tty, struct file *filp)
 	tty_port_close(&acm->port, tty, filp);
 }
 
-static int acm_tty_write(struct tty_struct *tty,
-					const unsigned char *buf, int count)
+static ssize_t acm_tty_write(struct tty_struct *tty, const u8 *buf,
+			     size_t count)
 {
 	struct acm *acm = tty->driver_data;
 	int stat;
@@ -812,7 +812,7 @@ static int acm_tty_write(struct tty_struct *tty,
 	if (!count)
 		return 0;
 
-	dev_vdbg(&acm->data->dev, "%d bytes from tty layer\n", count);
+	dev_vdbg(&acm->data->dev, "%zu bytes from tty layer\n", count);
 
 	spin_lock_irqsave(&acm->write_lock, flags);
 	wbn = acm_wb_alloc(acm);
@@ -829,7 +829,7 @@ static int acm_tty_write(struct tty_struct *tty,
 	}
 
 	count = (count > acm->writesize) ? acm->writesize : count;
-	dev_vdbg(&acm->data->dev, "writing %d bytes\n", count);
+	dev_vdbg(&acm->data->dev, "writing %zu bytes\n", count);
 	memcpy(wb->buf, buf, count);
 	wb->len = count;
 
@@ -1073,7 +1073,7 @@ static int acm_tty_ioctl(struct tty_struct *tty,
 }
 
 static void acm_tty_set_termios(struct tty_struct *tty,
-						struct ktermios *termios_old)
+				const struct ktermios *termios_old)
 {
 	struct acm *acm = tty->driver_data;
 	struct ktermios *termios = &tty->termios;
@@ -2078,14 +2078,14 @@ static int __init acm_init(void)
 
 	retval = tty_register_driver(acm_tty_driver);
 	if (retval) {
-		put_tty_driver(acm_tty_driver);
+		tty_driver_kref_put(acm_tty_driver);
 		return retval;
 	}
 
 	retval = usb_register(&acm_driver);
 	if (retval) {
 		tty_unregister_driver(acm_tty_driver);
-		put_tty_driver(acm_tty_driver);
+		tty_driver_kref_put(acm_tty_driver);
 		return retval;
 	}
 
@@ -2098,7 +2098,7 @@ static void __exit acm_exit(void)
 {
 	usb_deregister(&acm_driver);
 	tty_unregister_driver(acm_tty_driver);
-	put_tty_driver(acm_tty_driver);
+	tty_driver_kref_put(acm_tty_driver);
 	idr_destroy(&acm_minors);
 }
 
