@@ -2573,3 +2573,4 @@ static void __exit taprio_module_exit(void)
 module_init(taprio_module_init);
 module_exit(taprio_module_exit);
 MODULE_LICENSE("GPL");
+MODULE_DESCRIPTION("Time Aware Priority qdisc");
