@@ -1,6 +1,6 @@
 MAKEFLAGS := --no-print-directory
 
-.PHONY: all
+.PHONY: all clean docs-prepare docs
 all:
 	@awk -f scripts/check-multiple-entries.awk info/owners.yaml
 	@$(MAKE) -C scripts fullbuild
