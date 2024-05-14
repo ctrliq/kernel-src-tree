@@ -247,7 +247,7 @@ static intel_wakeref_t __intel_runtime_pm_get_if_active(struct intel_runtime_pm 
 		 * atm to the late/early system suspend/resume handlers.
 		 */
 		if (pm_runtime_get_if_active(rpm->kdev, ignore_usecount) <= 0)
-			return 0;
+                        return 0;
 	}
 
 	intel_runtime_pm_acquire(rpm, true);

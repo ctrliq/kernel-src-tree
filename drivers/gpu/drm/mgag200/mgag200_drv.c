@@ -84,7 +84,7 @@ resource_size_t mgag200_probe_vram(void __iomem *mem, resource_size_t size)
 	return offset - 65536;
 }
 
-#if defined(CONFIG_PREEMPT_RT)
+#if defined(CONFIG_DRM_MGAG200_IOBURST_WORKAROUND)
 static struct drm_gem_object *mgag200_create_object(struct drm_device *dev, size_t size)
 {
 	struct drm_gem_shmem_object *shmem;
@@ -113,7 +113,7 @@ static const struct drm_driver mgag200_driver = {
 	.major = DRIVER_MAJOR,
 	.minor = DRIVER_MINOR,
 	.patchlevel = DRIVER_PATCHLEVEL,
-#if defined(CONFIG_PREEMPT_RT)
+#if defined(CONFIG_DRM_MGAG200_IOBURST_WORKAROUND)
 	.gem_create_object = mgag200_create_object,
 #endif
 	DRM_GEM_SHMEM_DRIVER_OPS,
@@ -163,13 +163,12 @@ int mgag200_device_preinit(struct mga_device *mdev)
 	}
 	mdev->vram_res = res;
 
-	/* Don't fail on errors, but performance might be reduced. */
-	devm_arch_io_reserve_memtype_wc(dev->dev, res->start, resource_size(res));
-	devm_arch_phys_wc_add(dev->dev, res->start, resource_size(res));
-
-	mdev->vram = devm_ioremap(dev->dev, res->start, resource_size(res));
+	mdev->vram = devm_ioremap_wc(dev->dev, res->start, resource_size(res));
 	if (!mdev->vram)
 		return -ENOMEM;
+
+	/* Don't fail on errors, but performance might be reduced. */
+	devm_arch_phys_wc_add(dev->dev, res->start, resource_size(res));
 
 	return 0;
 }
