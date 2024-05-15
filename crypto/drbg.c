@@ -143,12 +143,14 @@ static const struct drbg_core drbg_cores[] = {
 		.cra_name = "sha1",
 		.backend_cra_name = "sha1",
 	}, {
+#ifndef CONFIG_CRYPTO_FIPS
 		.flags = DRBG_HASH | DRBG_STRENGTH256,
 		.statelen = 111, /* 888 bits */
 		.blocklen_bytes = 48,
 		.cra_name = "sha384",
 		.backend_cra_name = "sha384",
 	}, {
+#endif /* CONFIG_CRYPTO_FIPS */
 		.flags = DRBG_HASH | DRBG_STRENGTH256,
 		.statelen = 111, /* 888 bits */
 		.blocklen_bytes = 64,
@@ -170,12 +172,14 @@ static const struct drbg_core drbg_cores[] = {
 		.cra_name = "hmac_sha1",
 		.backend_cra_name = "hmac(sha1)",
 	}, {
+#ifndef CONFIG_CRYPTO_FIPS
 		.flags = DRBG_HMAC | DRBG_STRENGTH256,
 		.statelen = 48, /* block length of cipher */
 		.blocklen_bytes = 48,
 		.cra_name = "hmac_sha384",
 		.backend_cra_name = "hmac(sha384)",
 	}, {
+#endif /* CONFIG_CRYPTO_FIPS */
 		.flags = DRBG_HMAC | DRBG_STRENGTH256,
 		.statelen = 32, /* block length of cipher */
 		.blocklen_bytes = 32,
@@ -642,8 +646,10 @@ static int drbg_fini_hash_kernel(struct drbg_state *drbg);
 #define CRYPTO_DRBG_HMAC_STRING "HMAC "
 MODULE_ALIAS_CRYPTO("drbg_pr_hmac_sha512");
 MODULE_ALIAS_CRYPTO("drbg_nopr_hmac_sha512");
+#ifndef CONFIG_CRYPTO_FIPS
 MODULE_ALIAS_CRYPTO("drbg_pr_hmac_sha384");
 MODULE_ALIAS_CRYPTO("drbg_nopr_hmac_sha384");
+#endif /* CONFIG_CRYPTO_FIPS */
 MODULE_ALIAS_CRYPTO("drbg_pr_hmac_sha256");
 MODULE_ALIAS_CRYPTO("drbg_nopr_hmac_sha256");
 MODULE_ALIAS_CRYPTO("drbg_pr_hmac_sha1");
@@ -762,8 +768,10 @@ static const struct drbg_state_ops drbg_hmac_ops = {
 #define CRYPTO_DRBG_HASH_STRING "HASH "
 MODULE_ALIAS_CRYPTO("drbg_pr_sha512");
 MODULE_ALIAS_CRYPTO("drbg_nopr_sha512");
+#ifndef CONFIG_CRYPTO_FIPS
 MODULE_ALIAS_CRYPTO("drbg_pr_sha384");
 MODULE_ALIAS_CRYPTO("drbg_nopr_sha384");
+#endif /* CONFIG_CRYPTO_FIPS */
 MODULE_ALIAS_CRYPTO("drbg_pr_sha256");
 MODULE_ALIAS_CRYPTO("drbg_nopr_sha256");
 MODULE_ALIAS_CRYPTO("drbg_pr_sha1");
