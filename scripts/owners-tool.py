@@ -27,7 +27,7 @@ def import_modules(*args):
         sys.exit(1)
     return result
 
-jsonschema, yaml = import_modules('jsonschema', ('yaml', 'pyyaml'))
+jinja2, jsonschema, yaml = import_modules('jinja2', 'jsonschema', ('yaml', 'pyyaml'))
 
 
 class BaseCommand:
@@ -189,6 +189,27 @@ weight: 100
 ----''')
         print('\n'.join(self.format_properties(args.owners_schema)))
         print('----')
+        return True
+
+
+class CommandConvert(BaseCommand):
+    overview = 'Convert owners.yaml using a template.'
+
+    def add_arguments(self):
+        self.add_argument_owners()
+        self.parser.add_argument('template',
+                                 help='path to the template')
+
+    def handle(self, args):
+        env = jinja2.Environment(loader=jinja2.FileSystemLoader('.'),
+                                 undefined=jinja2.ChainableUndefined,
+                                 trim_blocks=True)
+        try:
+            template = env.get_template(args.template)
+        except jinja2.TemplateNotFound as e:
+            eprint('ERROR: template not found:', str(e))
+            return False
+        print(template.render(args.owners), end='')
         return True
 
 
