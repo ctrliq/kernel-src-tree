@@ -2702,10 +2702,10 @@ out:
 	return err;
 }
 
-static int ext4_writepage_cb(struct page *page, struct writeback_control *wbc,
+static int ext4_writepage_cb(struct folio *folio, struct writeback_control *wbc,
 			     void *data)
 {
-	return ext4_writepage(page, wbc);
+	return ext4_writepage(&folio->page, wbc);
 }
 
 static int ext4_do_writepages(struct mpage_da_data *mpd)
@@ -5410,7 +5410,7 @@ static void ext4_wait_for_tail_page_commit(struct inode *inode)
 	while (1) {
 		struct folio *folio = filemap_lock_folio(inode->i_mapping,
 				      inode->i_size >> PAGE_SHIFT);
-		if (!folio)
+		if (IS_ERR(folio))
 			return;
 		ret = __ext4_journalled_invalidate_folio(folio, offset,
 						folio_size(folio) - offset);

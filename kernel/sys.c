@@ -15,6 +15,7 @@
 #include <linux/highuid.h>
 #include <linux/fs.h>
 #include <linux/kmod.h>
+#include <linux/ksm.h>
 #include <linux/perf_event.h>
 #include <linux/resource.h>
 #include <linux/kernel.h>
@@ -2354,6 +2355,33 @@ static int prctl_set_vma(unsigned long opt, unsigned long start,
 }
 #endif /* CONFIG_ANON_VMA_NAME */
 
+static inline int prctl_set_mdwe(unsigned long bits, unsigned long arg3,
+				 unsigned long arg4, unsigned long arg5)
+{
+	if (arg3 || arg4 || arg5)
+		return -EINVAL;
+
+	if (bits & ~(PR_MDWE_REFUSE_EXEC_GAIN))
+		return -EINVAL;
+
+	if (bits & PR_MDWE_REFUSE_EXEC_GAIN)
+		set_bit(MMF_HAS_MDWE, &current->mm->flags);
+	else if (test_bit(MMF_HAS_MDWE, &current->mm->flags))
+		return -EPERM; /* Cannot unset the flag */
+
+	return 0;
+}
+
+static inline int prctl_get_mdwe(unsigned long arg2, unsigned long arg3,
+				 unsigned long arg4, unsigned long arg5)
+{
+	if (arg2 || arg3 || arg4 || arg5)
+		return -EINVAL;
+
+	return test_bit(MMF_HAS_MDWE, &current->mm->flags) ?
+		PR_MDWE_REFUSE_EXEC_GAIN : 0;
+}
+
 SYSCALL_DEFINE5(prctl, int, option, unsigned long, arg2, unsigned long, arg3,
 		unsigned long, arg4, unsigned long, arg5)
 {
@@ -2629,9 +2657,35 @@ SYSCALL_DEFINE5(prctl, int, option, unsigned long, arg2, unsigned long, arg3,
 		error = sched_core_share_pid(arg2, arg3, arg4, arg5);
 		break;
 #endif
+	case PR_SET_MDWE:
+		error = prctl_set_mdwe(arg2, arg3, arg4, arg5);
+		break;
+	case PR_GET_MDWE:
+		error = prctl_get_mdwe(arg2, arg3, arg4, arg5);
+		break;
 	case PR_SET_VMA:
 		error = prctl_set_vma(arg2, arg3, arg4, arg5);
 		break;
+#ifdef CONFIG_KSM
+	case PR_SET_MEMORY_MERGE:
+		if (arg3 || arg4 || arg5)
+			return -EINVAL;
+		if (mmap_write_lock_killable(me->mm))
+			return -EINTR;
+
+		if (arg2)
+			error = ksm_enable_merge_any(me->mm);
+		else
+			error = ksm_disable_merge_any(me->mm);
+		mmap_write_unlock(me->mm);
+		break;
+	case PR_GET_MEMORY_MERGE:
+		if (arg2 || arg3 || arg4 || arg5)
+			return -EINVAL;
+
+		error = !!test_bit(MMF_VM_MERGE_ANY, &me->mm->flags);
+		break;
+#endif
 	default:
 		error = -EINVAL;
 		break;

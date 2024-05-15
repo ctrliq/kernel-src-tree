@@ -816,15 +816,36 @@ static void __init pmd_swap_soft_dirty_tests(struct pgtable_debug_args *args) { 
 
 static void __init pte_swap_exclusive_tests(struct pgtable_debug_args *args)
 {
-#ifdef __HAVE_ARCH_PTE_SWP_EXCLUSIVE
-	pte_t pte = pfn_pte(args->fixed_pte_pfn, args->page_prot);
+	unsigned long max_swap_offset;
+	swp_entry_t entry, entry2;
+	pte_t pte;
 
 	pr_debug("Validating PTE swap exclusive\n");
+
+	/* See generic_max_swapfile_size(): probe the maximum offset */
+	max_swap_offset = swp_offset(pte_to_swp_entry(swp_entry_to_pte(swp_entry(0, ~0UL))));
+
+	/* Create a swp entry with all possible bits set */
+	entry = swp_entry((1 << MAX_SWAPFILES_SHIFT) - 1, max_swap_offset);
+
+	pte = swp_entry_to_pte(entry);
+	WARN_ON(pte_swp_exclusive(pte));
+	WARN_ON(!is_swap_pte(pte));
+	entry2 = pte_to_swp_entry(pte);
+	WARN_ON(memcmp(&entry, &entry2, sizeof(entry)));
+
 	pte = pte_swp_mkexclusive(pte);
 	WARN_ON(!pte_swp_exclusive(pte));
+	WARN_ON(!is_swap_pte(pte));
+	WARN_ON(pte_swp_soft_dirty(pte));
+	entry2 = pte_to_swp_entry(pte);
+	WARN_ON(memcmp(&entry, &entry2, sizeof(entry)));
+
 	pte = pte_swp_clear_exclusive(pte);
 	WARN_ON(pte_swp_exclusive(pte));
-#endif /* __HAVE_ARCH_PTE_SWP_EXCLUSIVE */
+	WARN_ON(!is_swap_pte(pte));
+	entry2 = pte_to_swp_entry(pte);
+	WARN_ON(memcmp(&entry, &entry2, sizeof(entry)));
 }
 
 static void __init pte_swap_tests(struct pgtable_debug_args *args)
@@ -1033,7 +1054,7 @@ static void __init destroy_args(struct pgtable_debug_args *args)
 
 	if (args->pte_pfn != ULONG_MAX) {
 		page = pfn_to_page(args->pte_pfn);
-		__free_pages(page, 0);
+		__free_page(page);
 
 		args->pte_pfn = ULONG_MAX;
 	}
@@ -1275,7 +1296,7 @@ static int __init init_args(struct pgtable_debug_args *args)
 		}
 	}
 
-	page = alloc_pages(GFP_KERNEL, 0);
+	page = alloc_page(GFP_KERNEL);
 	if (page)
 		args->pte_pfn = page_to_pfn(page);
 

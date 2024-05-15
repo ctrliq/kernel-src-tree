@@ -56,19 +56,6 @@ static void probe_console(void *ignore, const char *buf, size_t len)
 		WRITE_ONCE(test_status.async_fault, true);
 }
 
-static void register_tracepoints(struct tracepoint *tp, void *ignore)
-{
-	check_trace_callback_type_console(probe_console);
-	if (!strcmp(tp->name, "console"))
-		WARN_ON(tracepoint_probe_register(tp, probe_console, NULL));
-}
-
-static void unregister_tracepoints(struct tracepoint *tp, void *ignore)
-{
-	if (!strcmp(tp->name, "console"))
-		tracepoint_probe_unregister(tp, probe_console, NULL);
-}
-
 static int kasan_suite_init(struct kunit_suite *suite)
 {
 	if (!kasan_enabled()) {
@@ -86,12 +73,7 @@ static int kasan_suite_init(struct kunit_suite *suite)
 	 */
 	multishot = kasan_save_enable_multi_shot();
 
-	/*
-	 * Because we want to be able to build the test as a module, we need to
-	 * iterate through all known tracepoints, since the static registration
-	 * won't work here.
-	 */
-	for_each_kernel_tracepoint(register_tracepoints, NULL);
+	register_trace_console(probe_console, NULL);
 	return 0;
 }
 
@@ -99,7 +81,7 @@ static void kasan_suite_exit(struct kunit_suite *suite)
 {
 	kasan_kunit_test_suite_end();
 	kasan_restore_multi_shot(multishot);
-	for_each_kernel_tracepoint(unregister_tracepoints, NULL);
+	unregister_trace_console(probe_console, NULL);
 	tracepoint_synchronize_unregister();
 }
 
@@ -162,6 +144,15 @@ static void kasan_test_exit(struct kunit *test)
 #define KASAN_TEST_NEEDS_CONFIG_OFF(test, config) do {			\
 	if (IS_ENABLED(config))						\
 		kunit_skip((test), "Test requires " #config "=n");	\
+} while (0)
+
+#define KASAN_TEST_NEEDS_CHECKED_MEMINTRINSICS(test) do {		\
+	if (IS_ENABLED(CONFIG_KASAN_HW_TAGS))				\
+		break;  /* No compiler instrumentation. */		\
+	if (IS_ENABLED(CONFIG_CC_HAS_KASAN_MEMINTRINSIC_PREFIX))	\
+		break;  /* Should always be instrumented! */		\
+	if (IS_ENABLED(CONFIG_GENERIC_ENTRY))				\
+		kunit_skip((test), "Test requires checked mem*()");	\
 } while (0)
 
 static void kmalloc_oob_right(struct kunit *test)
@@ -453,6 +444,8 @@ static void kmalloc_oob_16(struct kunit *test)
 		u64 words[2];
 	} *ptr1, *ptr2;
 
+	KASAN_TEST_NEEDS_CHECKED_MEMINTRINSICS(test);
+
 	/* This test is specifically crafted for the generic mode. */
 	KASAN_TEST_NEEDS_CONFIG_ON(test, CONFIG_KASAN_GENERIC);
 
@@ -474,6 +467,8 @@ static void kmalloc_uaf_16(struct kunit *test)
 	struct {
 		u64 words[2];
 	} *ptr1, *ptr2;
+
+	KASAN_TEST_NEEDS_CHECKED_MEMINTRINSICS(test);
 
 	ptr1 = kmalloc(sizeof(*ptr1), GFP_KERNEL);
 	KUNIT_ASSERT_NOT_ERR_OR_NULL(test, ptr1);
@@ -497,6 +492,8 @@ static void kmalloc_oob_memset_2(struct kunit *test)
 	char *ptr;
 	size_t size = 128 - KASAN_GRANULE_SIZE;
 
+	KASAN_TEST_NEEDS_CHECKED_MEMINTRINSICS(test);
+
 	ptr = kmalloc(size, GFP_KERNEL);
 	KUNIT_ASSERT_NOT_ERR_OR_NULL(test, ptr);
 
@@ -509,6 +506,8 @@ static void kmalloc_oob_memset_4(struct kunit *test)
 {
 	char *ptr;
 	size_t size = 128 - KASAN_GRANULE_SIZE;
+
+	KASAN_TEST_NEEDS_CHECKED_MEMINTRINSICS(test);
 
 	ptr = kmalloc(size, GFP_KERNEL);
 	KUNIT_ASSERT_NOT_ERR_OR_NULL(test, ptr);
@@ -523,6 +522,8 @@ static void kmalloc_oob_memset_8(struct kunit *test)
 	char *ptr;
 	size_t size = 128 - KASAN_GRANULE_SIZE;
 
+	KASAN_TEST_NEEDS_CHECKED_MEMINTRINSICS(test);
+
 	ptr = kmalloc(size, GFP_KERNEL);
 	KUNIT_ASSERT_NOT_ERR_OR_NULL(test, ptr);
 
@@ -536,6 +537,8 @@ static void kmalloc_oob_memset_16(struct kunit *test)
 	char *ptr;
 	size_t size = 128 - KASAN_GRANULE_SIZE;
 
+	KASAN_TEST_NEEDS_CHECKED_MEMINTRINSICS(test);
+
 	ptr = kmalloc(size, GFP_KERNEL);
 	KUNIT_ASSERT_NOT_ERR_OR_NULL(test, ptr);
 
@@ -548,6 +551,8 @@ static void kmalloc_oob_in_memset(struct kunit *test)
 {
 	char *ptr;
 	size_t size = 128 - KASAN_GRANULE_SIZE;
+
+	KASAN_TEST_NEEDS_CHECKED_MEMINTRINSICS(test);
 
 	ptr = kmalloc(size, GFP_KERNEL);
 	KUNIT_ASSERT_NOT_ERR_OR_NULL(test, ptr);
@@ -564,6 +569,8 @@ static void kmalloc_memmove_negative_size(struct kunit *test)
 	char *ptr;
 	size_t size = 64;
 	size_t invalid_size = -2;
+
+	KASAN_TEST_NEEDS_CHECKED_MEMINTRINSICS(test);
 
 	/*
 	 * Hardware tag-based mode doesn't check memmove for negative size.
@@ -588,6 +595,8 @@ static void kmalloc_memmove_invalid_size(struct kunit *test)
 	char *ptr;
 	size_t size = 64;
 	size_t invalid_size = size;
+
+	KASAN_TEST_NEEDS_CHECKED_MEMINTRINSICS(test);
 
 	ptr = kmalloc(size, GFP_KERNEL);
 	KUNIT_ASSERT_NOT_ERR_OR_NULL(test, ptr);
@@ -616,6 +625,8 @@ static void kmalloc_uaf_memset(struct kunit *test)
 {
 	char *ptr;
 	size_t size = 33;
+
+	KASAN_TEST_NEEDS_CHECKED_MEMINTRINSICS(test);
 
 	/*
 	 * Only generic KASAN uses quarantine, which is required to avoid a

@@ -97,6 +97,7 @@ struct shrinker_info {
 	struct rcu_head rcu;
 	atomic_long_t *nr_deferred;
 	unsigned long *map;
+	int map_nr_max;
 };
 
 struct lruvec_stats_percpu {
@@ -924,7 +925,7 @@ static inline bool mm_match_cgroup(struct mm_struct *mm,
 	return match;
 }
 
-struct cgroup_subsys_state *mem_cgroup_css_from_page(struct page *page);
+struct cgroup_subsys_state *mem_cgroup_css_from_folio(struct folio *folio);
 ino_t page_cgroup_ino(struct page *page);
 
 static inline bool mem_cgroup_online(struct mem_cgroup *memcg)
@@ -1824,24 +1825,24 @@ static inline bool memcg_bpf_enabled(void)
 	return static_branch_likely(&memcg_bpf_enabled_key);
 }
 
-extern struct static_key_false memcg_kmem_enabled_key;
+extern struct static_key_false memcg_kmem_online_key;
 
-static inline bool memcg_kmem_enabled(void)
+static inline bool memcg_kmem_online(void)
 {
-	return static_branch_likely(&memcg_kmem_enabled_key);
+	return static_branch_likely(&memcg_kmem_online_key);
 }
 
 static inline int memcg_kmem_charge_page(struct page *page, gfp_t gfp,
 					 int order)
 {
-	if (memcg_kmem_enabled())
+	if (memcg_kmem_online())
 		return __memcg_kmem_charge_page(page, gfp, order);
 	return 0;
 }
 
 static inline void memcg_kmem_uncharge_page(struct page *page, int order)
 {
-	if (memcg_kmem_enabled())
+	if (memcg_kmem_online())
 		__memcg_kmem_uncharge_page(page, order);
 }
 
@@ -1862,7 +1863,7 @@ static inline void count_objcg_event(struct obj_cgroup *objcg,
 {
 	struct mem_cgroup *memcg;
 
-	if (!memcg_kmem_enabled())
+	if (!memcg_kmem_online())
 		return;
 
 	rcu_read_lock();
@@ -1907,7 +1908,7 @@ static inline bool memcg_bpf_enabled(void)
 	return false;
 }
 
-static inline bool memcg_kmem_enabled(void)
+static inline bool memcg_kmem_online(void)
 {
 	return false;
 }
