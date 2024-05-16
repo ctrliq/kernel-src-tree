@@ -2562,7 +2562,7 @@ static int update_cpumask(struct cpuset *cs, struct cpuset *trialcs,
 		update_partition_sd_lb(cs, old_prs);
 out_free:
 	free_cpumasks(NULL, &tmp);
-	return retval;
+	return 0;
 }
 
 /**
@@ -2598,6 +2598,9 @@ static int update_exclusive_cpumask(struct cpuset *cs, struct cpuset *trialcs,
 	if (cpumask_equal(cs->exclusive_cpus, trialcs->exclusive_cpus))
 		return 0;
 
+	if (alloc_cpumasks(NULL, &tmp))
+		return -ENOMEM;
+
 	if (*buf)
 		compute_effective_exclusive_cpumask(trialcs, NULL);
 
@@ -2611,9 +2614,6 @@ static int update_exclusive_cpumask(struct cpuset *cs, struct cpuset *trialcs,
 	retval = validate_change(cs, trialcs);
 	if (retval)
 		return retval;
-
-	if (alloc_cpumasks(NULL, &tmp))
-		return -ENOMEM;
 
 	if (old_prs) {
 		if (cpumask_empty(trialcs->effective_xcpus)) {
@@ -4379,16 +4379,17 @@ hotplug_update_tasks_legacy(struct cpuset *cs,
 	is_empty = cpumask_empty(cs->cpus_allowed) ||
 		   nodes_empty(cs->mems_allowed);
 
+	mutex_unlock(&cpuset_mutex);
+
 	/*
 	 * Move tasks to the nearest ancestor with execution resources,
 	 * This is full cgroup operation which will also call back into
 	 * cpuset. Should be done outside any lock.
 	 */
-	if (is_empty) {
-		mutex_unlock(&cpuset_mutex);
+	if (is_empty)
 		remove_tasks_in_empty_cpuset(cs);
-		mutex_lock(&cpuset_mutex);
-	}
+
+	mutex_lock(&cpuset_mutex);
 }
 
 static void
@@ -4558,7 +4559,6 @@ unlock:
 
 /**
  * cpuset_hotplug_workfn - handle CPU/memory hotunplug for a cpuset
- * @work: unused
  *
  * This function is called after either CPU or memory configuration has
  * changed and updates cpuset accordingly.  The top_cpuset is always
@@ -4941,7 +4941,6 @@ bool cpuset_node_allowed(int node, gfp_t gfp_mask)
 
 /**
  * cpuset_spread_node() - On which node to begin search for a page
- * @rotor: round robin rotor
  *
  * If a task is marked PF_SPREAD_PAGE or PF_SPREAD_SLAB (as for
  * tasks in a cpuset with is_spread_page or is_spread_slab set),

@@ -159,6 +159,7 @@ __setup("psi=", setup_psi);
 #define EXP_300s	2034		/* 1/exp(2s/300s) */
 
 /* PSI trigger definitions */
+#define WINDOW_MIN_US 500000	/* Min window size is 500ms */
 #define WINDOW_MAX_US 10000000	/* Max window size is 10s */
 #define UPDATES_PER_WINDOW 10	/* 10 updates per window */
 
@@ -179,7 +180,6 @@ static void group_init(struct psi_group *group)
 {
 	int cpu;
 
-	group->enabled = true;
 	for_each_possible_cpu(cpu)
 		seqcount_init(&per_cpu_ptr(group->pcpu, cpu)->seq);
 	group->avg_last_update = sched_clock();
@@ -483,12 +483,8 @@ static void update_triggers(struct psi_group *group, u64 now,
 			continue;
 
 		/* Generate an event */
-		if (cmpxchg(&t->event, 0, 1) == 0) {
-			if (t->of)
-				kernfs_notify(t->of->kn);
-			else
-				wake_up_interruptible(&t->event_wait);
-		}
+		if (cmpxchg(&t->event, 0, 1) == 0)
+			wake_up_interruptible(&t->event_wait);
 		t->last_event_time = now;
 		/* Reset threshold breach flag once event got generated */
 		t->pending_event = false;
@@ -775,15 +771,16 @@ static void psi_group_change(struct psi_group *group, int cpu,
 	groupc = per_cpu_ptr(group->pcpu, cpu);
 
 	/*
-	 * First we update the task counts according to the state
-	 * change requested through the @clear and @set bits.
-	 *
-	 * Then if the cgroup PSI stats accounting enabled, we
-	 * assess the aggregate resource states this CPU's tasks
-	 * have been in since the last change, and account any
+	 * First we assess the aggregate resource states this CPU's
+	 * tasks have been in since the last change, and account any
 	 * SOME and FULL time these may have resulted in.
+	 *
+	 * Then we update the task counts according to the state
+	 * change requested through the @clear and @set bits.
 	 */
 	write_seqcount_begin(&groupc->seq);
+
+	record_times(groupc, now);
 
 	/*
 	 * Start with TSK_ONCPU, which doesn't have a corresponding
@@ -823,23 +820,6 @@ static void psi_group_change(struct psi_group *group, int cpu,
 		if (set & (1 << t))
 			groupc->tasks[t]++;
 
-	if (!group->enabled) {
-		/*
-		 * On the first group change after disabling PSI, conclude
-		 * the current state and flush its time. This is unlikely
-		 * to matter to the user, but aggregation (get_recent_times)
-		 * may have already incorporated the live state into times_prev;
-		 * avoid a delta sample underflow when PSI is later re-enabled.
-		 */
-		if (unlikely(groupc->state_mask & (1 << PSI_NONIDLE)))
-			record_times(groupc, now);
-
-		groupc->state_mask = state_mask;
-
-		write_seqcount_end(&groupc->seq);
-		return;
-	}
-
 	for (s = 0; s < NR_PSI_STATES; s++) {
 		if (test_state(groupc->tasks, s, state_mask & PSI_ONCPU))
 			state_mask |= (1 << s);
@@ -855,8 +835,6 @@ static void psi_group_change(struct psi_group *group, int cpu,
 	 */
 	if (unlikely((state_mask & PSI_ONCPU) && cpu_curr(cpu)->in_memstall))
 		state_mask |= (1 << PSI_MEM_FULL);
-
-	record_times(groupc, now);
 
 	groupc->state_mask = state_mask;
 
@@ -1007,9 +985,6 @@ void psi_account_irqtime(struct task_struct *task, u32 delta)
 
 	group = task_psi_group(task);
 	do {
-		if (!group->enabled)
-			continue;
-
 		groupc = per_cpu_ptr(group->pcpu, cpu);
 
 		write_seqcount_begin(&groupc->seq);
@@ -1185,40 +1160,6 @@ void cgroup_move_task(struct task_struct *task, struct css_set *to)
 
 	task_rq_unlock(rq, task, &rf);
 }
-
-void psi_cgroup_restart(struct psi_group *group)
-{
-	int cpu;
-
-	/*
-	 * After we disable psi_group->enabled, we don't actually
-	 * stop percpu tasks accounting in each psi_group_cpu,
-	 * instead only stop test_state() loop, record_times()
-	 * and averaging worker, see psi_group_change() for details.
-	 *
-	 * When disable cgroup PSI, this function has nothing to sync
-	 * since cgroup pressure files are hidden and percpu psi_group_cpu
-	 * would see !psi_group->enabled and only do task accounting.
-	 *
-	 * When re-enable cgroup PSI, this function use psi_group_change()
-	 * to get correct state mask from test_state() loop on tasks[],
-	 * and restart groupc->state_start from now, use .clear = .set = 0
-	 * here since no task status really changed.
-	 */
-	if (!group->enabled)
-		return;
-
-	for_each_possible_cpu(cpu) {
-		struct rq *rq = cpu_rq(cpu);
-		struct rq_flags rf;
-		u64 now;
-
-		rq_lock_irq(rq, &rf);
-		now = cpu_clock(cpu);
-		psi_group_change(group, cpu, 0, 0, now, true);
-		rq_unlock_irq(rq, &rf);
-	}
-}
 #endif /* CONFIG_CGROUPS */
 
 int psi_show(struct seq_file *m, struct psi_group *group, enum psi_res res)
@@ -1296,9 +1237,8 @@ static int psi_cpu_open(struct inode *inode, struct file *file)
 	return single_open(file, psi_cpu_show, NULL);
 }
 
-struct psi_trigger *psi_trigger_create(struct psi_group *group, char *buf,
-				       enum psi_res res, struct file *file,
-				       struct kernfs_open_file *of)
+struct psi_trigger *psi_trigger_create(struct psi_group *group,
+			char *buf, enum psi_res res, struct file *file)
 {
 	struct psi_trigger *t;
 	enum psi_states state;
@@ -1330,7 +1270,8 @@ struct psi_trigger *psi_trigger_create(struct psi_group *group, char *buf,
 	if (state >= PSI_NONIDLE)
 		return ERR_PTR(-EINVAL);
 
-	if (window_us == 0 || window_us > WINDOW_MAX_US)
+	if (window_us < WINDOW_MIN_US ||
+		window_us > WINDOW_MAX_US)
 		return ERR_PTR(-EINVAL);
 
 	/*
@@ -1356,9 +1297,7 @@ struct psi_trigger *psi_trigger_create(struct psi_group *group, char *buf,
 
 	t->event = 0;
 	t->last_event_time = 0;
-	t->of = of;
-	if (!of)
-		init_waitqueue_head(&t->event_wait);
+	init_waitqueue_head(&t->event_wait);
 	t->pending_event = false;
 	t->aggregator = privileged ? PSI_POLL : PSI_AVGS;
 
@@ -1415,10 +1354,7 @@ void psi_trigger_destroy(struct psi_trigger *t)
 	 * being accessed later. Can happen if cgroup is deleted from under a
 	 * polling process.
 	 */
-	if (t->of)
-		kernfs_notify(t->of->kn);
-	else
-		wake_up_interruptible(&t->event_wait);
+	wake_up_pollfree(&t->event_wait);
 
 	if (t->aggregator == PSI_AVGS) {
 		mutex_lock(&group->avgs_lock);
@@ -1490,10 +1426,7 @@ __poll_t psi_trigger_poll(void **trigger_ptr,
 	if (!t)
 		return DEFAULT_POLLMASK | EPOLLERR | EPOLLPRI;
 
-	if (t->of)
-		kernfs_generic_poll(t->of, wait);
-	else
-		poll_wait(file, &t->event_wait, wait);
+	poll_wait(file, &t->event_wait, wait);
 
 	if (cmpxchg(&t->event, 1, 0) == 1)
 		ret |= EPOLLPRI;
@@ -1532,7 +1465,7 @@ static ssize_t psi_write(struct file *file, const char __user *user_buf,
 		return -EBUSY;
 	}
 
-	new = psi_trigger_create(&psi_system, buf, res, file, NULL);
+	new = psi_trigger_create(&psi_system, buf, res, file);
 	if (IS_ERR(new)) {
 		mutex_unlock(&seq->lock);
 		return PTR_ERR(new);

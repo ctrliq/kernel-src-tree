@@ -404,7 +404,6 @@ EXPORT_SYMBOL(call_usermodehelper_setup);
  */
 int call_usermodehelper_exec(struct subprocess_info *sub_info, int wait)
 {
-	unsigned int state = TASK_UNINTERRUPTIBLE;
 	DECLARE_COMPLETION_ONSTACK(done);
 	int retval = 0;
 
@@ -439,26 +438,23 @@ int call_usermodehelper_exec(struct subprocess_info *sub_info, int wait)
 		goto unlock;
 
 	if (wait & UMH_FREEZABLE)
-		state |= TASK_FREEZABLE;
+		freezer_do_not_count();
 
 	if (wait & UMH_KILLABLE) {
-		retval = wait_for_completion_state(&done, state | TASK_KILLABLE);
+		retval = wait_for_completion_killable(&done);
 		if (!retval)
 			goto wait_done;
 
 		/* umh_complete() will see NULL and free sub_info */
 		if (xchg(&sub_info->complete, NULL))
 			goto unlock;
-
-		/*
-		 * fallthrough; in case of -ERESTARTSYS now do uninterruptible
-		 * wait_for_completion_state(). Since umh_complete() shall call
-		 * complete() in a moment if xchg() above returned NULL, this
-		 * uninterruptible wait_for_completion_state() will not block
-		 * SIGKILL'ed processes for long.
-		 */
+		/* fallthrough, umh_complete() was already called */
 	}
-	wait_for_completion_state(&done, state);
+
+	wait_for_completion(&done);
+
+	if (wait & UMH_FREEZABLE)
+		freezer_count();
 
 wait_done:
 	retval = sub_info->retval;

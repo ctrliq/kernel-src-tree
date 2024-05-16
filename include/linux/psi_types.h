@@ -136,9 +136,6 @@ struct psi_trigger {
 	/* Wait queue for polling */
 	wait_queue_head_t event_wait;
 
-	/* Kernfs file for cgroup triggers */
-	struct kernfs_open_file *of;
-
 	/* Pending event flag */
 	int event;
 
@@ -160,7 +157,6 @@ struct psi_trigger {
 
 struct psi_group {
 	struct psi_group *parent;
-	bool enabled;
 
 	/* Protects data used by the aggregator */
 	struct mutex avgs_lock;
@@ -207,8 +203,6 @@ struct psi_group {
 };
 
 #else /* CONFIG_PSI */
-
-#define NR_PSI_RESOURCES	0
 
 struct psi_group { };
 
