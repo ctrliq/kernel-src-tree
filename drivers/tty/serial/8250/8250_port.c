@@ -2334,6 +2334,10 @@ int serial8250_do_startup(struct uart_port *port)
 	if (retval)
 		goto out;
 
+	retval = up->ops->setup_irq(up);
+	if (retval)
+		goto out;
+
 	if (port->irq && !(up->port.flags & UPF_NO_THRE_TEST)) {
 		unsigned char iir1;
 
