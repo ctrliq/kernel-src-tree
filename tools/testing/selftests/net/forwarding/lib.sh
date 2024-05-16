@@ -805,6 +805,17 @@ ethtool_stats_get()
 	ethtool -S $dev | grep "^ *$stat:" | head -n 1 | cut -d: -f2
 }
 
+ethtool_std_stats_get()
+{
+	local dev=$1; shift
+	local grp=$1; shift
+	local name=$1; shift
+	local src=$1; shift
+
+	ethtool --json -S $dev --groups $grp -- --src $src | \
+		jq '.[]."'"$grp"'"."'$name'"'
+}
+
 qdisc_stats_get()
 {
 	local dev=$1; shift
@@ -1922,4 +1933,35 @@ mldv1_done_get()
 	local checksum=$(payload_template_calc_checksum ${sudohdr}${icmpv6})
 
 	payload_template_expand_checksum "$hbh$icmpv6" $checksum
+}
+
+bail_on_lldpad()
+{
+	local reason1="$1"; shift
+	local reason2="$1"; shift
+
+	if systemctl is-active --quiet lldpad; then
+
+		cat >/dev/stderr <<-EOF
+		WARNING: lldpad is running
+
+			lldpad will likely $reason1, and this test will
+			$reason2. Both are not supported at the same time,
+			one of them is arbitrarily going to overwrite the
+			other. That will cause spurious failures (or, unlikely,
+			passes) of this test.
+		EOF
+
+		if [[ -z $ALLOW_LLDPAD ]]; then
+			cat >/dev/stderr <<-EOF
+
+				If you want to run the test anyway, please set
+				an environment variable ALLOW_LLDPAD to a
+				non-empty string.
+			EOF
+			exit 1
+		else
+			return
+		fi
+	fi
 }
