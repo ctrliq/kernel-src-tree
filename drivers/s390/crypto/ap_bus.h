@@ -213,7 +213,7 @@ struct ap_queue {
 	bool config;			/* configured state */
 	bool chkstop;			/* checkstop state */
 	ap_qid_t qid;			/* AP queue id. */
-	bool interrupt;			/* indicate if interrupts are enabled */
+	bool se_bound;			/* SE bound state */
 	unsigned int assoc_idx;		/* SE association index */
 	int queue_count;		/* # messages currently on AP queue. */
 	int pendingq_count;		/* # requests on pendingq list. */
@@ -311,6 +311,7 @@ enum ap_sm_wait ap_sm_event_loop(struct ap_queue *aq, enum ap_sm_event event);
 int ap_queue_message(struct ap_queue *aq, struct ap_message *ap_msg);
 void ap_cancel_message(struct ap_queue *aq, struct ap_message *ap_msg);
 void ap_flush_queue(struct ap_queue *aq);
+bool ap_queue_usable(struct ap_queue *aq);
 
 void *ap_airq_ptr(void);
 int ap_sb_available(void);
@@ -327,6 +328,7 @@ struct ap_queue *ap_queue_create(ap_qid_t qid, int device_type);
 void ap_queue_prepare_remove(struct ap_queue *aq);
 void ap_queue_remove(struct ap_queue *aq);
 void ap_queue_init_state(struct ap_queue *aq);
+void _ap_queue_init_state(struct ap_queue *aq);
 
 struct ap_card *ap_card_create(int id, int queue_depth, int raw_type,
 			       int comp_type, unsigned int functions, int ml);
@@ -385,7 +387,7 @@ int ap_apqn_in_matrix_owned_by_def_drv(unsigned long *apm,
  * like "+1-16,-32,-0x40,+128" where only single bits or ranges of
  * bits are cleared or set. Distinction is done based on the very
  * first character which may be '+' or '-' for the relative string
- * and othewise assume to be an absolute value string. If parsing fails
+ * and otherwise assume to be an absolute value string. If parsing fails
  * a negative errno value is returned. All arguments and bitmaps are
  * big endian order.
  */
