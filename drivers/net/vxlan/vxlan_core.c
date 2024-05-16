@@ -139,9 +139,11 @@ static struct vxlan_sock *vxlan_find_sock(struct net *net, sa_family_t family,
 	return NULL;
 }
 
-static struct vxlan_dev *vxlan_vs_find_vni(struct vxlan_sock *vs, int ifindex,
-					   __be32 vni)
+static struct vxlan_dev *vxlan_vs_find_vni(struct vxlan_sock *vs,
+					   int ifindex, __be32 vni,
+					   struct vxlan_vni_node **vninode)
 {
+	struct vxlan_vni_node *vnode;
 	struct vxlan_dev_node *node;
 
 	/* For flow based devices, map all packets to VNI 0 */
@@ -152,8 +154,10 @@ static struct vxlan_dev *vxlan_vs_find_vni(struct vxlan_sock *vs, int ifindex,
 	hlist_for_each_entry_rcu(node, vni_head(vs, vni), hlist) {
 		if (!node->vxlan)
 			continue;
+		vnode = NULL;
 		if (node->vxlan->cfg.flags & VXLAN_F_VNIFILTER) {
-			if (!vxlan_vnifilter_lookup(node->vxlan, vni))
+			vnode = vxlan_vnifilter_lookup(node->vxlan, vni);
+			if (!vnode)
 				continue;
 		} else if (node->vxlan->default_dst.remote_vni != vni) {
 			continue;
@@ -167,6 +171,8 @@ static struct vxlan_dev *vxlan_vs_find_vni(struct vxlan_sock *vs, int ifindex,
 				continue;
 		}
 
+		if (vninode)
+			*vninode = vnode;
 		return node->vxlan;
 	}
 
@@ -184,7 +190,7 @@ static struct vxlan_dev *vxlan_find_vni(struct net *net, int ifindex,
 	if (!vs)
 		return NULL;
 
-	return vxlan_vs_find_vni(vs, ifindex, vni);
+	return vxlan_vs_find_vni(vs, ifindex, vni, NULL);
 }
 
 /* Fill in neighbour message in skbuff. */
@@ -1691,6 +1697,7 @@ static bool vxlan_ecn_decapsulate(struct vxlan_sock *vs, void *oiph,
 /* Callback from net/ipv4/udp.c to receive packets */
 static int vxlan_rcv(struct sock *sk, struct sk_buff *skb)
 {
+	struct vxlan_vni_node *vninode = NULL;
 	struct vxlan_dev *vxlan;
 	struct vxlan_sock *vs;
 	struct vxlanhdr unparsed;
@@ -1723,7 +1730,7 @@ static int vxlan_rcv(struct sock *sk, struct sk_buff *skb)
 
 	vni = vxlan_vni(vxlan_hdr(skb)->vx_vni);
 
-	vxlan = vxlan_vs_find_vni(vs, skb->dev->ifindex, vni);
+	vxlan = vxlan_vs_find_vni(vs, skb->dev->ifindex, vni, &vninode);
 	if (!vxlan)
 		goto drop;
 
@@ -1794,6 +1801,8 @@ static int vxlan_rcv(struct sock *sk, struct sk_buff *skb)
 	if (!vxlan_ecn_decapsulate(vs, oiph, skb)) {
 		++vxlan->dev->stats.rx_frame_errors;
 		++vxlan->dev->stats.rx_errors;
+		vxlan_vnifilter_count(vxlan, vni, vninode,
+				      VXLAN_VNI_STATS_RX_ERRORS, 0);
 		goto drop;
 	}
 
@@ -1802,10 +1811,13 @@ static int vxlan_rcv(struct sock *sk, struct sk_buff *skb)
 	if (unlikely(!(vxlan->dev->flags & IFF_UP))) {
 		rcu_read_unlock();
 		dev_core_stats_rx_dropped_inc(vxlan->dev);
+		vxlan_vnifilter_count(vxlan, vni, vninode,
+				      VXLAN_VNI_STATS_RX_DROPS, 0);
 		goto drop;
 	}
 
 	dev_sw_netstats_rx_add(vxlan->dev, skb->len);
+	vxlan_vnifilter_count(vxlan, vni, vninode, VXLAN_VNI_STATS_RX, skb->len);
 	gro_cells_receive(&vxlan->gro_cells, skb);
 
 	rcu_read_unlock();
@@ -1839,7 +1851,7 @@ static int vxlan_err_lookup(struct sock *sk, struct sk_buff *skb)
 		return -ENOENT;
 
 	vni = vxlan_vni(hdr->vx_vni);
-	vxlan = vxlan_vs_find_vni(vs, skb->dev->ifindex, vni);
+	vxlan = vxlan_vs_find_vni(vs, skb->dev->ifindex, vni, NULL);
 	if (!vxlan)
 		return -ENOENT;
 
@@ -1913,8 +1925,12 @@ static int arp_reduce(struct net_device *dev, struct sk_buff *skb, __be32 vni)
 		reply->ip_summed = CHECKSUM_UNNECESSARY;
 		reply->pkt_type = PACKET_HOST;
 
-		if (netif_rx(reply) == NET_RX_DROP)
+		if (netif_rx(reply) == NET_RX_DROP) {
 			dev->stats.rx_dropped++;
+			vxlan_vnifilter_count(vxlan, vni, NULL,
+					      VXLAN_VNI_STATS_RX_DROPS, 0);
+		}
+
 	} else if (vxlan->cfg.flags & VXLAN_F_L3MISS) {
 		union vxlan_addr ipa = {
 			.sin.sin_addr.s_addr = tip,
@@ -2068,9 +2084,11 @@ static int neigh_reduce(struct net_device *dev, struct sk_buff *skb, __be32 vni)
 		if (reply == NULL)
 			goto out;
 
-		if (netif_rx(reply) == NET_RX_DROP)
+		if (netif_rx(reply) == NET_RX_DROP) {
 			dev->stats.rx_dropped++;
-
+			vxlan_vnifilter_count(vxlan, vni, NULL,
+					      VXLAN_VNI_STATS_RX_DROPS, 0);
+		}
 	} else if (vxlan->cfg.flags & VXLAN_F_L3MISS) {
 		union vxlan_addr ipa = {
 			.sin6.sin6_addr = msg->target,
@@ -2384,15 +2402,20 @@ static void vxlan_encap_bypass(struct sk_buff *skb, struct vxlan_dev *src_vxlan,
 	u64_stats_inc(&tx_stats->tx_packets);
 	u64_stats_add(&tx_stats->tx_bytes, len);
 	u64_stats_update_end(&tx_stats->syncp);
+	vxlan_vnifilter_count(src_vxlan, vni, NULL, VXLAN_VNI_STATS_TX, len);
 
 	if (__netif_rx(skb) == NET_RX_SUCCESS) {
 		u64_stats_update_begin(&rx_stats->syncp);
 		u64_stats_inc(&rx_stats->rx_packets);
 		u64_stats_add(&rx_stats->rx_bytes, len);
 		u64_stats_update_end(&rx_stats->syncp);
+		vxlan_vnifilter_count(dst_vxlan, vni, NULL, VXLAN_VNI_STATS_RX,
+				      len);
 	} else {
 drop:
 		dev->stats.rx_dropped++;
+		vxlan_vnifilter_count(dst_vxlan, vni, NULL,
+				      VXLAN_VNI_STATS_RX_DROPS, 0);
 	}
 	rcu_read_unlock();
 }
@@ -2422,6 +2445,8 @@ static int encap_bypass_if_local(struct sk_buff *skb, struct net_device *dev,
 					   vxlan->cfg.flags);
 		if (!dst_vxlan) {
 			dev->stats.tx_errors++;
+			vxlan_vnifilter_count(vxlan, vni, NULL,
+					      VXLAN_VNI_STATS_TX_ERRORS, 0);
 			kfree_skb(skb);
 
 			return -ENOENT;
@@ -2445,6 +2470,7 @@ static void vxlan_xmit_one(struct sk_buff *skb, struct net_device *dev,
 	union vxlan_addr remote_ip, local_ip;
 	struct vxlan_metadata _md;
 	struct vxlan_metadata *md = &_md;
+	unsigned int pkt_len = skb->len;
 	__be16 src_port = 0, dst_port;
 	struct dst_entry *ndst = NULL;
 	__u8 tos, ttl, flow_flags = 0;
@@ -2674,12 +2700,14 @@ static void vxlan_xmit_one(struct sk_buff *skb, struct net_device *dev,
 				     label, src_port, dst_port, !udp_sum);
 #endif
 	}
+	vxlan_vnifilter_count(vxlan, vni, NULL, VXLAN_VNI_STATS_TX, pkt_len);
 out_unlock:
 	rcu_read_unlock();
 	return;
 
 drop:
 	dev->stats.tx_dropped++;
+	vxlan_vnifilter_count(vxlan, vni, NULL, VXLAN_VNI_STATS_TX_DROPS, 0);
 	dev_kfree_skb(skb);
 	return;
 
@@ -2691,6 +2719,7 @@ tx_error:
 		dev->stats.tx_carrier_errors++;
 	dst_release(ndst);
 	dev->stats.tx_errors++;
+	vxlan_vnifilter_count(vxlan, vni, NULL, VXLAN_VNI_STATS_TX_ERRORS, 0);
 	kfree_skb(skb);
 }
 
@@ -2723,6 +2752,8 @@ static void vxlan_xmit_nh(struct sk_buff *skb, struct net_device *dev,
 
 drop:
 	dev->stats.tx_dropped++;
+	vxlan_vnifilter_count(netdev_priv(dev), vni, NULL,
+			      VXLAN_VNI_STATS_TX_DROPS, 0);
 	dev_kfree_skb(skb);
 }
 
@@ -2797,6 +2828,8 @@ static netdev_tx_t vxlan_xmit(struct sk_buff *skb, struct net_device *dev)
 				vxlan_fdb_miss(vxlan, eth->h_dest);
 
 			dev->stats.tx_dropped++;
+			vxlan_vnifilter_count(vxlan, vni, NULL,
+					      VXLAN_VNI_STATS_TX_DROPS, 0);
 			kfree_skb(skb);
 			return NETDEV_TX_OK;
 		}
