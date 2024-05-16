@@ -1,3 +1,9 @@
+**Attention**
+
+Are you looking to read the RHEL kernel documentation? Be sure to view
+the rendered version [here](https://redhat.gitlab.io/centos-stream/src/kernel/documentation/) instead of the gitlab markdown version to avoid
+broken links!
+
 All changes to this file and directories included at this level must be made
 to the [Red Hat kernel documentation project](https://gitlab.com/redhat/centos-stream/src/kernel/documentation)
 Please see the 'Making Changes' section below for detailed information on
@@ -50,12 +56,12 @@ executed from the top level of documentation:
 Users making changes must include a "Signed-off-by:" tag on all commits that
 acknowledges the DCO, https://developercertificate.org.
 
-*** How to create a git commit ***
+**How to create a git commit**
 
 1. Fork https://gitlab.com/redhat/centos-stream/src/kernel/documentation in Gitlab
 2. Git clone your forked repository and create a private branch for your changes
 3. Don't touch the RHMAINTAINERS & CODEOWNERS files - only edit info/owners.yaml
-4. Run `make` after changing info/onwners.yaml but before before you `git commit`
+4. Run `make` after changing info/owners.yaml but before before you `git commit`
 5. Git push your private branch to Gitlab and create your merge request
 
 ```
@@ -82,14 +88,21 @@ except in the case when the removed engineer is no longer with Red Hat.  While r
 do not require the approve of the maintainer, MR authors are encouraged to add the maintainer for
 an approve.
 
+4.  Any MR adding or modifying other fields (devel-sst, status, jira, etc.) requires the approval
+from the subsystem maintainer.
+
 MR authors, reviewers, and maintainers should discuss disagreements about ownership or role changes
 with their management.
+
+**validSSTNames.go Changes**
+
+These changes include validSSTNames.go changes.  You must ensure the SST names themselves, and the SST name changes in the file are approved by RHEL management.  Changes to this file that have not been verified by management will be removed by reverting commits.
 
 **Project Layout**
 
 The layout is
 
-- docs/ contains the general kernel workflow documentation, links, etc.
+- content/docs/ contains the general kernel workflow documentation, links, etc.
 
 See https://red.ht/kernel_workflow_doc for information on the Red Hat Kernel
 Workflow.

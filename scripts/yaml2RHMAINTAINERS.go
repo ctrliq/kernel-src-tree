@@ -10,9 +10,9 @@ import (
 )
 
 type NameAndEmail struct {
-	Name string
-	Email string
-	Restricted bool
+	Name string `name`
+	Email string `email`
+	Restricted bool `restricted`
 }
 
 type SubSystem struct {
@@ -21,16 +21,15 @@ type SubSystem struct {
 		Name string `name`
 		ReadyForMergeDeps []string `readyForMergeDeps`
 		NewLabels string `newLabels`
-		EmailLabel string `emailLabel`
-	}
+	} `labels`
 	Status string `status`
 	Maintainers []NameAndEmail `maintainers`
 	Reviewers []NameAndEmail `reviewers`
 	Paths struct {
-		Includes []string
-		IncludeRegexes []string
-		Excludes []string
-	}
+		Includes []string `includes`
+		IncludeRegexes []string `includeRegexes`
+		Excludes []string `excludes`
+	} `paths`
 	Scm string `scm`
 	MailingList string `mailingList`
 }
@@ -51,8 +50,8 @@ func RHMAINTAINERS_header() {
 	fmt.Printf("%s","\n")
 	fmt.Printf("%s","Descriptions of section entries:\n")
 	fmt.Printf("%s","\n")
-	fmt.Printf("%s","	P: Person (obsolete)\n")
-	fmt.Printf("%s","	M: Mail patches to: FullName <address@domain>\n")
+	fmt.Printf("%s","	M: Maintainer of the subsystem (Name and email)\n")
+	fmt.Printf("%s","	R: Reviewer of the subsystem (Name and email)\n")
 	fmt.Printf("%s","	L: Mailing list that is relevant to this area\n")
 	fmt.Printf("%s","	W: Web-page with status/info\n")
 	fmt.Printf("%s","	T: SCM tree type and location.	Type is one of: git, hg, quilt, stgit.\n")
@@ -89,7 +88,7 @@ func RHMAINTAINERS_header() {
 	fmt.Printf("%s","	      matches patches or files that contain one or more of the words\n")
 	fmt.Printf("%s","	      printk, pr_info or pr_err\n")
 	fmt.Printf("%s","	   One regex pattern per line.	Multiple K: lines acceptable.\n")
-	fmt.Printf("%s","	I: Additional subject tag for rhkl patch submission.\n")
+	fmt.Printf("%s","	P: Person (obsolete)\n")
 	fmt.Printf("%s","\n")
 	fmt.Printf("%s","Note: For the hard of thinking, this list is meant to remain in alphabetical\n")
 	fmt.Printf("%s","order. If you could add yourselves to it in alphabetical order that would be\n")
@@ -149,9 +148,6 @@ func main() {
 		}
 		for _, file := range entry.Paths.Excludes {
 			fmt.Printf("X:\t%s\n", file)
-		}
-		if entry.Labels.EmailLabel != "" {
-			fmt.Printf("I:\t%s\n", entry.Labels.EmailLabel)
 		}
 		if entry.Scm != "" {
 			fmt.Printf("T:\t%s\n", entry.Scm)
