@@ -578,7 +578,8 @@ static vm_fault_t nfs_vm_page_mkwrite(struct vm_fault *vmf)
 	}
 
 	wait_on_bit_action(&NFS_I(inode)->flags, NFS_INO_INVALIDATING,
-			nfs_wait_bit_killable, TASK_KILLABLE);
+			   nfs_wait_bit_killable,
+			   TASK_KILLABLE|TASK_FREEZABLE_UNSAFE);
 
 	folio_lock(folio);
 	mapping = folio_file_mapping(folio);
