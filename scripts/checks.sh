@@ -10,11 +10,10 @@ function in_names()
 	return 1
 }
 
-if ! git rev-parse --verify main >& /dev/null; then
+if [[ $GITLAB_CI ]]; then
 	git fetch origin main
-	git branch --track main origin/main
 fi
-base=$(git merge-base main HEAD) || {
+base=$(git merge-base origin/main HEAD) || {
 	echo "ERROR: cannot determine merge base for HEAD."
 	echo "This is a BUG in the check script. Please report this."
 	exit 1
