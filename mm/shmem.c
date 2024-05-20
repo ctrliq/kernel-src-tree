@@ -1227,16 +1227,16 @@ static int shmem_setattr(struct user_namespace *mnt_userns,
 		}
 	}
 
-	if (is_quota_modification(&init_user_ns, inode, attr)) {
+	if (is_quota_modification(mnt_userns, inode, attr)) {
 		error = dquot_initialize(inode);
 		if (error)
 			return error;
 	}
 
 	/* Transfer quota accounting */
-	if ((i_uid_needs_update(&init_user_ns, attr, inode)) ||
-	    (i_gid_needs_update(&init_user_ns, attr, inode))) {
-		error = dquot_transfer(&init_user_ns, inode, attr);
+	if ((i_uid_needs_update(mnt_userns, attr, inode)) ||
+	    (i_gid_needs_update(mnt_userns, attr, inode))) {
+		error = dquot_transfer(mnt_userns, inode, attr);
 		if (error)
 			return error;
 	}
