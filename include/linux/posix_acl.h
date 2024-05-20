@@ -104,6 +104,8 @@ int vfs_set_acl(struct user_namespace *mnt_userns, struct dentry *dentry,
 		const char *acl_name, struct posix_acl *kacl);
 struct posix_acl *vfs_get_acl(struct user_namespace *mnt_userns,
 			      struct dentry *dentry, const char *acl_name);
+int vfs_remove_acl(struct user_namespace *mnt_userns, struct dentry *dentry,
+		   const char *acl_name);
 int posix_acl_listxattr(struct inode *inode, char **buffer,
 			ssize_t *remaining_size);
 #else
@@ -146,6 +148,12 @@ static inline struct posix_acl *vfs_get_acl(struct user_namespace *mnt_userns,
 					    const char *acl_name)
 {
 	return ERR_PTR(-EOPNOTSUPP);
+}
+
+static inline int vfs_remove_acl(struct user_namespace *mnt_userns,
+				 struct dentry *dentry, const char *acl_name)
+{
+	return -EOPNOTSUPP;
 }
 static inline int posix_acl_listxattr(struct inode *inode, char **buffer,
 				      ssize_t *remaining_size)
