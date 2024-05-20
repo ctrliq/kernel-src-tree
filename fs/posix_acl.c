@@ -143,8 +143,7 @@ struct posix_acl *get_inode_acl(struct inode *inode, int type)
 	 * to just call ->get_inode_acl to fetch the ACL ourself.  (This is
 	 * going to be an unlikely race.)
 	 */
-	if (cmpxchg(p, ACL_NOT_CACHED, sentinel) != ACL_NOT_CACHED)
-		/* fall through */ ;
+	cmpxchg(p, ACL_NOT_CACHED, sentinel);
 
 	/*
 	 * Normally, the ACL returned by ->get_inode_acl will be cached.
