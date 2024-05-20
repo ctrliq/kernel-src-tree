@@ -895,7 +895,7 @@ int f2fs_setattr(struct user_namespace *mnt_userns, struct dentry *dentry,
 	if (err)
 		return err;
 
-	if (is_quota_modification(inode, attr)) {
+	if (is_quota_modification(&init_user_ns, inode, attr)) {
 		err = dquot_initialize(inode);
 		if (err)
 			return err;
@@ -903,7 +903,7 @@ int f2fs_setattr(struct user_namespace *mnt_userns, struct dentry *dentry,
 	if (i_uid_needs_update(&init_user_ns, attr, inode) ||
 	    i_gid_needs_update(&init_user_ns, attr, inode)) {
 		f2fs_lock_op(F2FS_I_SB(inode));
-		err = dquot_transfer(inode, attr);
+		err = dquot_transfer(&init_user_ns, inode, attr);
 		if (err) {
 			set_sbi_flag(F2FS_I_SB(inode),
 					SBI_QUOTA_NEED_REPAIR);

@@ -1227,7 +1227,7 @@ static int shmem_setattr(struct user_namespace *mnt_userns,
 		}
 	}
 
-	if (is_quota_modification(inode, attr)) {
+	if (is_quota_modification(&init_user_ns, inode, attr)) {
 		error = dquot_initialize(inode);
 		if (error)
 			return error;
@@ -1236,7 +1236,7 @@ static int shmem_setattr(struct user_namespace *mnt_userns,
 	/* Transfer quota accounting */
 	if ((i_uid_needs_update(&init_user_ns, attr, inode)) ||
 	    (i_gid_needs_update(&init_user_ns, attr, inode))) {
-		error = dquot_transfer(inode, attr);
+		error = dquot_transfer(&init_user_ns, inode, attr);
 		if (error)
 			return error;
 	}
