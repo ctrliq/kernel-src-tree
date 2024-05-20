@@ -659,7 +659,7 @@ int ovl_set_nlink_lower(struct dentry *dentry);
 unsigned int ovl_get_nlink(struct ovl_fs *ofs, struct dentry *lowerdentry,
 			   struct dentry *upperdentry,
 			   unsigned int fallback);
-struct posix_acl *ovl_get_acl(struct inode *inode, int type);
+struct posix_acl *ovl_get_acl(struct inode *inode, int type, bool rcu);
 int ovl_update_time(struct inode *inode, struct timespec64 *ts, int flags);
 bool ovl_is_private_xattr(struct super_block *sb, const char *name);
 
