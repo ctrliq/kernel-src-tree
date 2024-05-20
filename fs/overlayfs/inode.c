@@ -340,6 +340,7 @@ static const char *ovl_get_link(struct dentry *dentry,
 	return p;
 }
 
+#ifdef CONFIG_FS_POSIX_ACL
 /*
  * Apply the idmapping of the layer to POSIX ACLs. The caller must pass a clone
  * of the POSIX ACLs retrieved from the lower layer to this function to not
@@ -386,7 +387,7 @@ struct posix_acl *ovl_get_acl(struct inode *inode, int type, bool rcu)
 	struct posix_acl *acl, *clone;
 	struct path realpath;
 
-	if (!IS_ENABLED(CONFIG_FS_POSIX_ACL) || !IS_POSIXACL(realinode))
+	if (!IS_POSIXACL(realinode))
 		return NULL;
 
 	/* Careful in RCU walk mode */
@@ -432,6 +433,7 @@ struct posix_acl *ovl_get_acl(struct inode *inode, int type, bool rcu)
 	posix_acl_release(acl);
 	return clone;
 }
+#endif
 
 int ovl_update_time(struct inode *inode, struct timespec64 *ts, int flags)
 {
