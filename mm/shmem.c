@@ -1243,7 +1243,7 @@ static int shmem_setattr(struct user_namespace *mnt_userns,
 
 	setattr_copy(mnt_userns, inode, attr);
 	if (attr->ia_valid & ATTR_MODE)
-		error = posix_acl_chmod(mnt_userns, inode, inode->i_mode);
+		error = posix_acl_chmod(mnt_userns, dentry, inode->i_mode);
 	if (!error && update_ctime) {
 		inode->i_ctime = current_time(inode);
 		if (update_mtime)

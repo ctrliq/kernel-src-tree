@@ -69,21 +69,21 @@ extern int __posix_acl_create(struct posix_acl **, gfp_t, umode_t *);
 extern int __posix_acl_chmod(struct posix_acl **, gfp_t, umode_t);
 
 extern struct posix_acl *get_posix_acl(struct inode *, int);
-extern int set_posix_acl(struct user_namespace *, struct inode *, int,
-			 struct posix_acl *);
+int set_posix_acl(struct user_namespace *, struct dentry *, int,
+		  struct posix_acl *);
 
 struct posix_acl *get_cached_acl_rcu(struct inode *inode, int type);
 struct posix_acl *posix_acl_clone(const struct posix_acl *acl, gfp_t flags);
 
 #ifdef CONFIG_FS_POSIX_ACL
-int posix_acl_chmod(struct user_namespace *, struct inode *, umode_t);
+int posix_acl_chmod(struct user_namespace *, struct dentry *, umode_t);
 extern int posix_acl_create(struct inode *, umode_t *, struct posix_acl **,
 		struct posix_acl **);
 int posix_acl_update_mode(struct user_namespace *, struct inode *, umode_t *,
 			  struct posix_acl **);
 
-extern int simple_set_acl(struct user_namespace *, struct inode *,
-			  struct posix_acl *, int);
+int simple_set_acl(struct user_namespace *, struct dentry *,
+		   struct posix_acl *, int);
 extern int simple_acl_create(struct inode *, struct inode *);
 
 struct posix_acl *get_cached_acl(struct inode *inode, int type);
@@ -103,7 +103,7 @@ int posix_acl_listxattr(struct inode *inode, char **buffer,
 			ssize_t *remaining_size);
 #else
 static inline int posix_acl_chmod(struct user_namespace *mnt_userns,
-				  struct inode *inode, umode_t mode)
+				  struct dentry *dentry, umode_t mode)
 {
 	return 0;
 }

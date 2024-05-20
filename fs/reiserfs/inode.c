@@ -3418,7 +3418,7 @@ int reiserfs_setattr(struct user_namespace *mnt_userns, struct dentry *dentry,
 
 	if (!error && reiserfs_posixacl(inode->i_sb)) {
 		if (attr->ia_valid & ATTR_MODE)
-			error = reiserfs_acl_chmod(inode);
+			error = reiserfs_acl_chmod(dentry);
 	}
 
 out:
