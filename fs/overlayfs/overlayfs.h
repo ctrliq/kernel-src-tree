@@ -661,9 +661,22 @@ unsigned int ovl_get_nlink(struct ovl_fs *ofs, struct dentry *lowerdentry,
 			   unsigned int fallback);
 
 #ifdef CONFIG_FS_POSIX_ACL
-struct posix_acl *ovl_get_acl(struct inode *inode, int type, bool rcu);
+struct posix_acl *do_ovl_get_acl(struct user_namespace *mnt_userns,
+				 struct inode *inode, int type,
+				 bool rcu, bool noperm);
+static inline struct posix_acl *ovl_get_inode_acl(struct inode *inode, int type,
+						  bool rcu)
+{
+	return do_ovl_get_acl(&init_user_ns, inode, type, rcu, true);
+}
+static inline struct posix_acl *ovl_get_acl(struct user_namespace *mnt_userns,
+					    struct dentry *dentry, int type)
+{
+	return do_ovl_get_acl(mnt_userns, d_inode(dentry), type, false, false);
+}
 #else
-#define ovl_get_acl	NULL
+#define ovl_get_inode_acl	NULL
+#define ovl_get_acl		NULL
 #endif
 
 int ovl_update_time(struct inode *inode, struct timespec64 *ts, int flags);
