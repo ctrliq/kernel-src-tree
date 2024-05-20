@@ -99,6 +99,9 @@ static inline void cache_no_acl(struct inode *inode)
 	inode->i_acl = NULL;
 	inode->i_default_acl = NULL;
 }
+
+int vfs_set_acl(struct user_namespace *mnt_userns, struct dentry *dentry,
+		const char *acl_name, struct posix_acl *kacl);
 int posix_acl_listxattr(struct inode *inode, char **buffer,
 			ssize_t *remaining_size);
 #else
@@ -127,6 +130,13 @@ static inline int posix_acl_create(struct inode *inode, umode_t *mode,
 
 static inline void forget_all_cached_acls(struct inode *inode)
 {
+}
+
+static inline int vfs_set_acl(struct user_namespace *mnt_userns,
+			      struct dentry *dentry, const char *name,
+			      struct posix_acl *acl)
+{
+	return -EOPNOTSUPP;
 }
 static inline int posix_acl_listxattr(struct inode *inode, char **buffer,
 				      ssize_t *remaining_size)
