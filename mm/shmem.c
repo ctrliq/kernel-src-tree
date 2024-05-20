@@ -1234,8 +1234,8 @@ static int shmem_setattr(struct user_namespace *mnt_userns,
 	}
 
 	/* Transfer quota accounting */
-	if ((attr->ia_valid & ATTR_UID && !uid_eq(attr->ia_uid, inode->i_uid)) ||
-	    (attr->ia_valid & ATTR_GID && !gid_eq(attr->ia_gid, inode->i_gid))) {
+	if ((i_uid_needs_update(&init_user_ns, attr, inode)) ||
+	    (i_gid_needs_update(&init_user_ns, attr, inode))) {
 		error = dquot_transfer(inode, attr);
 		if (error)
 			return error;
