@@ -66,7 +66,7 @@ static bool chgrp_ok(struct user_namespace *mnt_userns,
 
 		if (gid_eq(gid, inode->i_gid))
 			return true;
-		mapped_gid = kgid_into_mnt(mnt_userns, gid);
+		mapped_gid = mapped_kgid_fs(mnt_userns, i_user_ns(inode), gid);
 		if (in_group_p(mapped_gid))
 			return true;
 	}
@@ -136,7 +136,8 @@ int setattr_prepare(struct user_namespace *mnt_userns, struct dentry *dentry,
 			return -EPERM;
 
 		if (ia_valid & ATTR_GID)
-			mapped_gid = kgid_into_mnt(mnt_userns, attr->ia_gid);
+			mapped_gid = mapped_kgid_fs(mnt_userns,
+						i_user_ns(inode), attr->ia_gid);
 		else
 			mapped_gid = i_gid_into_mnt(mnt_userns, inode);
 
