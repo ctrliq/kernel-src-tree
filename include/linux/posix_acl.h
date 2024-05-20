@@ -135,6 +135,6 @@ static inline int posix_acl_listxattr(struct inode *inode, char **buffer,
 }
 #endif /* CONFIG_FS_POSIX_ACL */
 
-struct posix_acl *get_acl(struct inode *inode, int type);
+struct posix_acl *get_inode_acl(struct inode *inode, int type);
 
 #endif  /* __LINUX_POSIX_ACL_H */
