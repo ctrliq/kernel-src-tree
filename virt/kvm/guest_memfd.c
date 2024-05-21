@@ -374,13 +374,14 @@ static const struct address_space_operations kvm_gmem_aops = {
 #endif
 };
 
-static int kvm_gmem_getattr(struct user_namespace *user_ns,
-			     const struct path *path, struct kstat *stat,
-			     u32 request_mask, unsigned int query_flags)
+static int kvm_gmem_getattr(struct mnt_idmap *idmap, const struct path *path,
+			    struct kstat *stat, u32 request_mask,
+			    unsigned int query_flags)
+
 {
 	struct inode *inode = path->dentry->d_inode;
 
-	generic_fillattr(user_ns, inode, stat);
+	generic_fillattr(idmap, inode, stat);
 	return 0;
 }
 

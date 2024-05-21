@@ -805,7 +805,7 @@ extern const struct export_operations ovl_export_operations;
 const struct xattr_handler **ovl_xattr_handlers(struct ovl_fs *ofs);
 int ovl_setattr(struct mnt_idmap *idmap, struct dentry *dentry,
 		struct iattr *attr);
-int ovl_getattr(struct user_namespace *mnt_userns, const struct path *path,
+int ovl_getattr(struct mnt_idmap *idmap, const struct path *path,
 		struct kstat *stat, u32 request_mask, unsigned int flags);
 int ovl_permission(struct user_namespace *mnt_userns, struct inode *inode,
 		   int mask);

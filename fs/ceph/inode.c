@@ -2249,14 +2249,14 @@ static const char *ceph_encrypted_get_link(struct dentry *dentry,
 				   done);
 }
 
-static int ceph_encrypted_symlink_getattr(struct user_namespace *mnt_userns,
+static int ceph_encrypted_symlink_getattr(struct mnt_idmap *idmap,
 					  const struct path *path,
 					  struct kstat *stat, u32 request_mask,
 					  unsigned int query_flags)
 {
 	int ret;
 
-	ret = ceph_getattr(mnt_userns, path, stat, request_mask, query_flags);
+	ret = ceph_getattr(idmap, path, stat, request_mask, query_flags);
 	if (ret)
 		return ret;
 	return fscrypt_symlink_getattr(path, stat);
@@ -2955,7 +2955,7 @@ static int statx_to_caps(u32 want, umode_t mode)
  * Get all the attributes. If we have sufficient caps for the requested attrs,
  * then we can avoid talking to the MDS at all.
  */
-int ceph_getattr(struct user_namespace *mnt_userns, const struct path *path,
+int ceph_getattr(struct mnt_idmap *idmap, const struct path *path,
 		 struct kstat *stat, u32 request_mask, unsigned int flags)
 {
 	struct inode *inode = d_inode(path->dentry);
@@ -2976,7 +2976,7 @@ int ceph_getattr(struct user_namespace *mnt_userns, const struct path *path,
 			return err;
 	}
 
-	generic_fillattr(&init_user_ns, inode, stat);
+	generic_fillattr(&nop_mnt_idmap, inode, stat);
 	stat->ino = ceph_present_inode(inode);
 
 	/*

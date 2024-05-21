@@ -1265,7 +1265,7 @@ extern int afs_ilookup5_test_by_fid(struct inode *, void *);
 extern struct inode *afs_iget_pseudo_dir(struct super_block *, bool);
 extern struct inode *afs_iget(struct afs_operation *, struct afs_vnode_param *);
 extern struct inode *afs_root_iget(struct super_block *, struct key *);
-extern int afs_getattr(struct user_namespace *mnt_userns, const struct path *,
+extern int afs_getattr(struct mnt_idmap *idmap, const struct path *,
 		       struct kstat *, u32, unsigned int);
 bool afs_pagecache_valid(struct afs_vnode *);
 extern int afs_setattr(struct mnt_idmap *idmap, struct dentry *, struct iattr *);
