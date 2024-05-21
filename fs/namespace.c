@@ -3940,11 +3940,12 @@ static struct mount *mount_setattr_prepare(struct mount_kattr *kattr,
 
 		last = m;
 
-		if (!mnt_allow_writers(kattr, m)) {
-			*err = mnt_hold_writers(m);
-			if (*err)
-				goto out;
-		}
+		if (mnt_allow_writers(kattr, m))
+			continue;
+
+		*err = mnt_hold_writers(m);
+		if (*err)
+			goto out;
 	} while (kattr->recurse && (m = next_mnt(m, mnt)));
 
 out:
