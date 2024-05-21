@@ -384,7 +384,7 @@ static int kvm_gmem_getattr(struct user_namespace *user_ns,
 	return 0;
 }
 
-static int kvm_gmem_setattr(struct user_namespace *user_ns, struct dentry *dentry,
+static int kvm_gmem_setattr(struct mnt_idmap *idmap, struct dentry *dentry,
 			    struct iattr *attr)
 {
 	return -EINVAL;

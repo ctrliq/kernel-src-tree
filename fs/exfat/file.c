@@ -241,7 +241,7 @@ int exfat_getattr(struct user_namespace *mnt_uerns, const struct path *path,
 	return 0;
 }
 
-int exfat_setattr(struct user_namespace *mnt_userns, struct dentry *dentry,
+int exfat_setattr(struct mnt_idmap *idmap, struct dentry *dentry,
 		  struct iattr *attr)
 {
 	struct exfat_sb_info *sbi = EXFAT_SB(dentry->d_sb);
@@ -265,7 +265,7 @@ int exfat_setattr(struct user_namespace *mnt_userns, struct dentry *dentry,
 				ATTR_TIMES_SET);
 	}
 
-	error = setattr_prepare(&init_user_ns, dentry, attr);
+	error = setattr_prepare(&nop_mnt_idmap, dentry, attr);
 	attr->ia_valid = ia_valid;
 	if (error)
 		goto out;
@@ -292,7 +292,7 @@ int exfat_setattr(struct user_namespace *mnt_userns, struct dentry *dentry,
 	if (attr->ia_valid & ATTR_SIZE)
 		inode->i_mtime = inode->i_ctime = current_time(inode);
 
-	setattr_copy(&init_user_ns, inode, attr);
+	setattr_copy(&nop_mnt_idmap, inode, attr);
 	exfat_truncate_atime(&inode->i_atime);
 
 	if (attr->ia_valid & ATTR_SIZE) {
