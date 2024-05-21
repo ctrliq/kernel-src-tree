@@ -448,7 +448,7 @@ static int __nfsd_setattr(struct dentry *dentry, struct iattr *iap)
 		if (iap->ia_size < 0)
 			return -EFBIG;
 
-		host_err = notify_change(&init_user_ns, dentry, &size_attr, NULL);
+		host_err = notify_change(&nop_mnt_idmap, dentry, &size_attr, NULL);
 		if (host_err)
 			return host_err;
 		iap->ia_valid &= ~ATTR_SIZE;
@@ -466,7 +466,7 @@ static int __nfsd_setattr(struct dentry *dentry, struct iattr *iap)
 		return 0;
 
 	iap->ia_valid |= ATTR_CTIME;
-	return notify_change(&init_user_ns, dentry, iap, NULL);
+	return notify_change(&nop_mnt_idmap, dentry, iap, NULL);
 }
 
 /**
@@ -1479,12 +1479,13 @@ nfsd_create_locked(struct svc_rqst *rqstp, struct svc_fh *fhp,
 	err = 0;
 	switch (type) {
 	case S_IFREG:
-		host_err = vfs_create(&init_user_ns, dirp, dchild, iap->ia_mode, true);
+		host_err = vfs_create(&nop_mnt_idmap, dirp, dchild,
+				      iap->ia_mode, true);
 		if (!host_err)
 			nfsd_check_ignore_resizing(iap);
 		break;
 	case S_IFDIR:
-		host_err = vfs_mkdir(&init_user_ns, dirp, dchild, iap->ia_mode);
+		host_err = vfs_mkdir(&nop_mnt_idmap, dirp, dchild, iap->ia_mode);
 		if (!host_err && unlikely(d_unhashed(dchild))) {
 			struct dentry *d;
 			d = lookup_one_len(dchild->d_name.name,
@@ -1512,7 +1513,7 @@ nfsd_create_locked(struct svc_rqst *rqstp, struct svc_fh *fhp,
 	case S_IFBLK:
 	case S_IFIFO:
 	case S_IFSOCK:
-		host_err = vfs_mknod(&init_user_ns, dirp, dchild,
+		host_err = vfs_mknod(&nop_mnt_idmap, dirp, dchild,
 				     iap->ia_mode, rdev);
 		break;
 	default:
@@ -1677,7 +1678,7 @@ nfsd_symlink(struct svc_rqst *rqstp, struct svc_fh *fhp,
 	err = fh_fill_pre_attrs(fhp);
 	if (err != nfs_ok)
 		goto out_unlock;
-	host_err = vfs_symlink(&init_user_ns, d_inode(dentry), dnew, path);
+	host_err = vfs_symlink(&nop_mnt_idmap, d_inode(dentry), dnew, path);
 	err = nfserrno(host_err);
 	cerr = fh_compose(resfhp, fhp->fh_export, dnew, fhp);
 	if (!err)
@@ -1748,7 +1749,7 @@ nfsd_link(struct svc_rqst *rqstp, struct svc_fh *ffhp,
 	err = fh_fill_pre_attrs(ffhp);
 	if (err != nfs_ok)
 		goto out_dput;
-	host_err = vfs_link(dold, &init_user_ns, dirp, dnew, NULL);
+	host_err = vfs_link(dold, &nop_mnt_idmap, dirp, dnew, NULL);
 	fh_fill_post_attrs(ffhp);
 	inode_unlock(dirp);
 	if (!host_err) {
@@ -1872,10 +1873,10 @@ retry:
 		goto out_dput_old;
 	} else {
 		struct renamedata rd = {
-			.old_mnt_userns	= &init_user_ns,
+			.old_mnt_idmap	= &nop_mnt_idmap,
 			.old_dir	= fdir,
 			.old_dentry	= odentry,
-			.new_mnt_userns	= &init_user_ns,
+			.new_mnt_idmap	= &nop_mnt_idmap,
 			.new_dir	= tdir,
 			.new_dentry	= ndentry,
 		};
@@ -1980,14 +1981,14 @@ nfsd_unlink(struct svc_rqst *rqstp, struct svc_fh *fhp, int type,
 			nfsd_close_cached_files(rdentry);
 
 		for (retries = 1;;) {
-			host_err = vfs_unlink(&init_user_ns, dirp, rdentry, NULL);
+			host_err = vfs_unlink(&nop_mnt_idmap, dirp, rdentry, NULL);
 			if (host_err != -EAGAIN || !retries--)
 				break;
 			if (!nfsd_wait_for_delegreturn(rqstp, rinode))
 				break;
 		}
 	} else {
-		host_err = vfs_rmdir(&init_user_ns, dirp, rdentry);
+		host_err = vfs_rmdir(&nop_mnt_idmap, dirp, rdentry);
 	}
 	fh_fill_post_attrs(fhp);
 
