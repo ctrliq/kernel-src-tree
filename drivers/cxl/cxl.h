@@ -564,7 +564,7 @@ struct cxl_pmem_region {
  * @regions: cxl_region_ref instances, regions mapped by this port
  * @parent_dport: dport that points to this port in the parent
  * @decoder_ida: allocator for decoder ids
- * @comp_map: component register capability mappings
+ * @reg_map: component and ras register mapping parameters
  * @nr_dports: number of entries in @dports
  * @hdm_end: track last allocated HDM decoder instance for allocation ordering
  * @commit_end: cursor to track highest committed decoder for commit ordering
@@ -584,7 +584,7 @@ struct cxl_port {
 	struct xarray regions;
 	struct cxl_dport *parent_dport;
 	struct ida decoder_ida;
-	struct cxl_register_map comp_map;
+	struct cxl_register_map reg_map;
 	int nr_dports;
 	int hdm_end;
 	int commit_end;
@@ -612,7 +612,7 @@ struct cxl_rcrb_info {
 /**
  * struct cxl_dport - CXL downstream port
  * @dport_dev: PCI bridge or firmware device representing the downstream link
- * @comp_map: component register capability mappings
+ * @reg_map: component and ras register mapping parameters
  * @port_id: unique hardware identifier for dport in decoder target list
  * @rcrb: Data about the Root Complex Register Block layout
  * @rch: Indicate whether this dport was enumerated in RCH or VH mode
@@ -620,7 +620,7 @@ struct cxl_rcrb_info {
  */
 struct cxl_dport {
 	struct device *dport_dev;
-	struct cxl_register_map comp_map;
+	struct cxl_register_map reg_map;
 	int port_id;
 	struct cxl_rcrb_info rcrb;
 	bool rch;
