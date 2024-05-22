@@ -732,7 +732,7 @@ static int hostfs_mknod(struct user_namespace *mnt_userns, struct inode *dir,
 	return err;
 }
 
-static int hostfs_rename2(struct user_namespace *mnt_userns,
+static int hostfs_rename2(struct mnt_idmap *idmap,
 			  struct inode *old_dir, struct dentry *old_dentry,
 			  struct inode *new_dir, struct dentry *new_dentry,
 			  unsigned int flags)

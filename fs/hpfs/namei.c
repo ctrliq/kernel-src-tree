@@ -511,7 +511,7 @@ const struct address_space_operations hpfs_symlink_aops = {
 	.readpage	= hpfs_symlink_readpage
 };
 
-static int hpfs_rename(struct user_namespace *mnt_userns, struct inode *old_dir,
+static int hpfs_rename(struct mnt_idmap *idmap, struct inode *old_dir,
 		       struct dentry *old_dentry, struct inode *new_dir,
 		       struct dentry *new_dentry, unsigned int flags)
 {
