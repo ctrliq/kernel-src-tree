@@ -781,6 +781,9 @@ struct fuse_conn {
 	/* Add supplementary group info when creating a new inode */
 	unsigned int create_supp_group:1;
 
+	/* Is tmpfile not implemented by fs? */
+	unsigned int no_tmpfile:1;
+
 	/** The number of requests waiting for completion */
 	atomic_t num_waiting;
 
