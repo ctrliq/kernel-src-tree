@@ -646,7 +646,7 @@ static int ocfs2_mknod_locked(struct ocfs2_super *osb,
 	return status;
 }
 
-static int ocfs2_mkdir(struct user_namespace *mnt_userns,
+static int ocfs2_mkdir(struct mnt_idmap *idmap,
 		       struct inode *dir,
 		       struct dentry *dentry,
 		       umode_t mode)
