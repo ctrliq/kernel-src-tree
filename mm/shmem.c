@@ -3193,9 +3193,10 @@ static int shmem_statfs(struct dentry *dentry, struct kstatfs *buf)
  * File creation. Allocate an inode, and we're done..
  */
 static int
-shmem_mknod(struct user_namespace *mnt_userns, struct inode *dir,
+shmem_mknod(struct mnt_idmap *idmap, struct inode *dir,
 	    struct dentry *dentry, umode_t mode, dev_t dev)
 {
+	struct user_namespace *mnt_userns = mnt_idmap_owner(idmap);
 	struct inode *inode;
 	int error;
 
@@ -3260,10 +3261,9 @@ out_iput:
 static int shmem_mkdir(struct mnt_idmap *idmap, struct inode *dir,
 		       struct dentry *dentry, umode_t mode)
 {
-	struct user_namespace *mnt_userns = mnt_idmap_owner(idmap);
 	int error;
 
-	error = shmem_mknod(mnt_userns, dir, dentry, mode | S_IFDIR, 0);
+	error = shmem_mknod(idmap, dir, dentry, mode | S_IFDIR, 0);
 	if (error)
 		return error;
 	inc_nlink(dir);
@@ -3273,8 +3273,7 @@ static int shmem_mkdir(struct mnt_idmap *idmap, struct inode *dir,
 static int shmem_create(struct mnt_idmap *idmap, struct inode *dir,
 			struct dentry *dentry, umode_t mode, bool excl)
 {
-	struct user_namespace *mnt_userns = mnt_idmap_owner(idmap);
-	return shmem_mknod(mnt_userns, dir, dentry, mode | S_IFREG, 0);
+	return shmem_mknod(idmap, dir, dentry, mode | S_IFREG, 0);
 }
 
 /*
@@ -3337,7 +3336,6 @@ static int shmem_rmdir(struct inode *dir, struct dentry *dentry)
 static int shmem_whiteout(struct mnt_idmap *idmap,
 			  struct inode *old_dir, struct dentry *old_dentry)
 {
-	struct user_namespace *mnt_userns = mnt_idmap_owner(idmap);
 	struct dentry *whiteout;
 	int error;
 
@@ -3345,7 +3343,7 @@ static int shmem_whiteout(struct mnt_idmap *idmap,
 	if (!whiteout)
 		return -ENOMEM;
 
-	error = shmem_mknod(mnt_userns, old_dir, whiteout,
+	error = shmem_mknod(idmap, old_dir, whiteout,
 			    S_IFCHR | WHITEOUT_MODE, WHITEOUT_DEV);
 	dput(whiteout);
 	if (error)

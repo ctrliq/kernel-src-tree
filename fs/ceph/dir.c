@@ -881,7 +881,7 @@ int ceph_handle_notrace_create(struct inode *dir, struct dentry *dentry)
 	return PTR_ERR(result);
 }
 
-static int ceph_mknod(struct user_namespace *mnt_userns, struct inode *dir,
+static int ceph_mknod(struct mnt_idmap *idmap, struct inode *dir,
 		      struct dentry *dentry, umode_t mode, dev_t rdev)
 {
 	struct ceph_mds_client *mdsc = ceph_sb_to_mdsc(dir->i_sb);
@@ -949,8 +949,7 @@ out:
 static int ceph_create(struct mnt_idmap *idmap, struct inode *dir,
 		       struct dentry *dentry, umode_t mode, bool excl)
 {
-	struct user_namespace *mnt_userns = mnt_idmap_owner(idmap);
-	return ceph_mknod(mnt_userns, dir, dentry, mode, 0);
+	return ceph_mknod(idmap, dir, dentry, mode, 0);
 }
 
 #if IS_ENABLED(CONFIG_FS_ENCRYPTION)
