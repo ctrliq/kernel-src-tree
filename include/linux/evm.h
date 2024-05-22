@@ -24,7 +24,7 @@ extern enum integrity_status evm_verifyxattr(struct dentry *dentry,
 extern int evm_inode_setattr(struct mnt_idmap *idmap,
 			     struct dentry *dentry, struct iattr *attr);
 extern void evm_inode_post_setattr(struct dentry *dentry, int ia_valid);
-extern int evm_inode_setxattr(struct user_namespace *mnt_userns,
+extern int evm_inode_setxattr(struct mnt_idmap *idmap,
 			      struct dentry *dentry, const char *name,
 			      const void *value, size_t size);
 extern void evm_inode_post_setxattr(struct dentry *dentry,
@@ -32,7 +32,7 @@ extern void evm_inode_post_setxattr(struct dentry *dentry,
 				    const void *xattr_value,
 				    size_t xattr_value_len);
 extern int evm_inode_copy_up_xattr(const char *name);
-extern int evm_inode_removexattr(struct user_namespace *mnt_userns,
+extern int evm_inode_removexattr(struct mnt_idmap *idmap,
 				 struct dentry *dentry, const char *xattr_name);
 extern void evm_inode_post_removexattr(struct dentry *dentry,
 				       const char *xattr_name);
@@ -102,7 +102,7 @@ static inline void evm_inode_post_setattr(struct dentry *dentry, int ia_valid)
 	return;
 }
 
-static inline int evm_inode_setxattr(struct user_namespace *mnt_userns,
+static inline int evm_inode_setxattr(struct mnt_idmap *idmap,
 				     struct dentry *dentry, const char *name,
 				     const void *value, size_t size)
 {
@@ -117,7 +117,7 @@ static inline void evm_inode_post_setxattr(struct dentry *dentry,
 	return;
 }
 
-static inline int evm_inode_removexattr(struct user_namespace *mnt_userns,
+static inline int evm_inode_removexattr(struct mnt_idmap *idmap,
 					struct dentry *dentry,
 					const char *xattr_name)
 {

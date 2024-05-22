@@ -3189,7 +3189,7 @@ static bool has_cap_mac_admin(bool audit)
 	return true;
 }
 
-static int selinux_inode_setxattr(struct user_namespace *mnt_userns,
+static int selinux_inode_setxattr(struct mnt_idmap *idmap,
 				  struct dentry *dentry, const char *name,
 				  const void *value, size_t size, int flags)
 {
@@ -3198,6 +3198,7 @@ static int selinux_inode_setxattr(struct user_namespace *mnt_userns,
 	struct superblock_security_struct *sbsec;
 	struct common_audit_data ad;
 	u32 newsid, sid = current_sid();
+	struct user_namespace *mnt_userns = mnt_idmap_owner(idmap);
 	int rc = 0;
 
 	if (strcmp(name, XATTR_NAME_SELINUX)) {
@@ -3357,11 +3358,11 @@ static int selinux_inode_listxattr(struct dentry *dentry)
 	return dentry_has_perm(cred, dentry, FILE__GETATTR);
 }
 
-static int selinux_inode_removexattr(struct user_namespace *mnt_userns,
+static int selinux_inode_removexattr(struct mnt_idmap *idmap,
 				     struct dentry *dentry, const char *name)
 {
 	if (strcmp(name, XATTR_NAME_SELINUX)) {
-		int rc = cap_inode_removexattr(mnt_userns, dentry, name);
+		int rc = cap_inode_removexattr(idmap, dentry, name);
 		if (rc)
 			return rc;
 
@@ -6633,7 +6634,7 @@ static int selinux_inode_notifysecctx(struct inode *inode, void *ctx, u32 ctxlen
  */
 static int selinux_inode_setsecctx(struct dentry *dentry, void *ctx, u32 ctxlen)
 {
-	return __vfs_setxattr_noperm(&init_user_ns, dentry, XATTR_NAME_SELINUX,
+	return __vfs_setxattr_noperm(&nop_mnt_idmap, dentry, XATTR_NAME_SELINUX,
 				     ctx, ctxlen, 0);
 }
 
