@@ -133,7 +133,7 @@ static void rtsx_comm_pm_full_on(struct rtsx_pcr *pcr)
 
 	rtsx_disable_aspm(pcr);
 
-	/* Fixes DMA transfer timout issue after disabling ASPM on RTS5260 */
+	/* Fixes DMA transfer timeout issue after disabling ASPM on RTS5260 */
 	msleep(1);
 
 	if (option->ltr_enabled)
@@ -1358,7 +1358,9 @@ static int rtsx_pci_init_hw(struct rtsx_pcr *pcr)
 
 static int rtsx_pci_init_chip(struct rtsx_pcr *pcr)
 {
-	int err;
+	struct rtsx_cr_option *option = &(pcr->option);
+	int err, l1ss;
+	u32 lval;
 	u16 cfg_val;
 	u8 val;
 
@@ -1447,6 +1449,48 @@ static int rtsx_pci_init_chip(struct rtsx_pcr *pcr)
 			pcr->aspm_enabled = true;
 	}
 
+	l1ss = pci_find_ext_capability(pcr->pci, PCI_EXT_CAP_ID_L1SS);
+	if (l1ss) {
+		pci_read_config_dword(pcr->pci, l1ss + PCI_L1SS_CTL1, &lval);
+
+		if (lval & PCI_L1SS_CTL1_ASPM_L1_1)
+			rtsx_set_dev_flag(pcr, ASPM_L1_1_EN);
+		else
+			rtsx_clear_dev_flag(pcr, ASPM_L1_1_EN);
+
+		if (lval & PCI_L1SS_CTL1_ASPM_L1_2)
+			rtsx_set_dev_flag(pcr, ASPM_L1_2_EN);
+		else
+			rtsx_clear_dev_flag(pcr, ASPM_L1_2_EN);
+
+		if (lval & PCI_L1SS_CTL1_PCIPM_L1_1)
+			rtsx_set_dev_flag(pcr, PM_L1_1_EN);
+		else
+			rtsx_clear_dev_flag(pcr, PM_L1_1_EN);
+
+		if (lval & PCI_L1SS_CTL1_PCIPM_L1_2)
+			rtsx_set_dev_flag(pcr, PM_L1_2_EN);
+		else
+			rtsx_clear_dev_flag(pcr, PM_L1_2_EN);
+
+		pcie_capability_read_word(pcr->pci, PCI_EXP_DEVCTL2, &cfg_val);
+		if (cfg_val & PCI_EXP_DEVCTL2_LTR_EN) {
+			option->ltr_enabled = true;
+			option->ltr_active = true;
+		} else {
+			option->ltr_enabled = false;
+		}
+
+		if (rtsx_check_dev_flag(pcr, ASPM_L1_1_EN | ASPM_L1_2_EN
+				| PM_L1_1_EN | PM_L1_2_EN))
+			option->force_clkreq_0 = false;
+		else
+			option->force_clkreq_0 = true;
+	} else {
+		option->ltr_enabled = false;
+		option->force_clkreq_0 = true;
+	}
+
 	if (pcr->ops->fetch_vendor_settings)
 		pcr->ops->fetch_vendor_settings(pcr);
 
@@ -1482,7 +1526,7 @@ static int rtsx_pci_probe(struct pci_dev *pcidev,
 		pci_name(pcidev), (int)pcidev->vendor, (int)pcidev->device,
 		(int)pcidev->revision);
 
-	ret = pci_set_dma_mask(pcidev, DMA_BIT_MASK(32));
+	ret = dma_set_mask(&pcidev->dev, DMA_BIT_MASK(32));
 	if (ret < 0)
 		return ret;
 
@@ -1527,7 +1571,7 @@ static int rtsx_pci_probe(struct pci_dev *pcidev,
 	pcr->remap_addr = ioremap(base, len);
 	if (!pcr->remap_addr) {
 		ret = -ENOMEM;
-		goto free_handle;
+		goto free_idr;
 	}
 
 	pcr->rtsx_resv_buf = dma_alloc_coherent(&(pcidev->dev),
@@ -1590,6 +1634,10 @@ disable_msi:
 			pcr->rtsx_resv_buf, pcr->rtsx_resv_buf_addr);
 unmap:
 	iounmap(pcr->remap_addr);
+free_idr:
+	spin_lock(&rtsx_pci_lock);
+	idr_remove(&rtsx_pci_idr, pcr->id);
+	spin_unlock(&rtsx_pci_lock);
 free_handle:
 	kfree(handle);
 free_pcr:
@@ -1776,8 +1824,6 @@ static int rtsx_pci_runtime_suspend(struct device *device)
 	mutex_lock(&pcr->pcr_mutex);
 	rtsx_pci_power_off(pcr, HOST_ENTER_S3, true);
 
-	free_irq(pcr->irq, (void *)pcr);
-
 	mutex_unlock(&pcr->pcr_mutex);
 
 	return 0;
@@ -1794,8 +1840,6 @@ static int rtsx_pci_runtime_resume(struct device *device)
 	mutex_lock(&pcr->pcr_mutex);
 
 	rtsx_pci_write_register(pcr, HOST_SLEEP_STATE, 0x03, 0x00);
-	rtsx_pci_acquire_irq(pcr);
-	synchronize_irq(pcr->irq);
 
 	rtsx_pci_init_hw(pcr);
 
