@@ -475,7 +475,7 @@ static int blkdev_getgeo(struct block_device *bdev,
 	 */
 	memset(&geo, 0, sizeof(geo));
 	geo.start = get_start_sect(bdev);
-	ret = disk->fops->getgeo(bdev, &geo);
+	ret = disk->fops->getgeo(disk, &geo);
 	if (ret)
 		return ret;
 	if (copy_to_user(argp, &geo, sizeof(geo)))
@@ -509,7 +509,7 @@ static int compat_hdio_getgeo(struct block_device *bdev,
 	 * want to override it.
 	 */
 	geo.start = get_start_sect(bdev);
-	ret = disk->fops->getgeo(bdev, &geo);
+	ret = disk->fops->getgeo(disk, &geo);
 	if (ret)
 		return ret;
 
