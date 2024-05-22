@@ -1244,7 +1244,7 @@ static int shmem_setattr(struct mnt_idmap *idmap,
 
 	setattr_copy(idmap, inode, attr);
 	if (attr->ia_valid & ATTR_MODE)
-		error = posix_acl_chmod(mnt_userns, dentry, inode->i_mode);
+		error = posix_acl_chmod(idmap, dentry, inode->i_mode);
 	if (!error && update_ctime) {
 		inode->i_ctime = current_time(inode);
 		if (update_mtime)

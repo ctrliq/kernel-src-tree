@@ -94,7 +94,7 @@ struct posix_acl *fuse_get_inode_acl(struct inode *inode, int type, bool rcu)
 	return __fuse_get_acl(fc, &nop_mnt_idmap, inode, type, rcu);
 }
 
-int fuse_set_acl(struct user_namespace *mnt_userns, struct dentry *dentry,
+int fuse_set_acl(struct mnt_idmap *idmap, struct dentry *dentry,
 		 struct posix_acl *acl, int type)
 {
 	struct inode *inode = d_inode(dentry);
