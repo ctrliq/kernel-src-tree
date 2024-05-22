@@ -1112,7 +1112,7 @@ retry_deleg:
 	 * We only care about restrictions the inode struct itself places upon
 	 * us otherwise POSIX ACLs aren't subject to any VFS restrictions.
 	 */
-	error = may_write_xattr(mnt_userns, inode);
+	error = may_write_xattr(idmap, inode);
 	if (error)
 		goto out_inode_unlock;
 
@@ -1224,7 +1224,7 @@ retry_deleg:
 	 * We only care about restrictions the inode struct itself places upon
 	 * us otherwise POSIX ACLs aren't subject to any VFS restrictions.
 	 */
-	error = may_write_xattr(mnt_userns, inode);
+	error = may_write_xattr(idmap, inode);
 	if (error)
 		goto out_inode_unlock;
 

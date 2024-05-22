@@ -948,7 +948,7 @@ static int xattr_mount_check(struct super_block *s)
 	return 0;
 }
 
-int reiserfs_permission(struct user_namespace *mnt_userns, struct inode *inode,
+int reiserfs_permission(struct mnt_idmap *idmap, struct inode *inode,
 			int mask)
 {
 	/*
@@ -958,7 +958,7 @@ int reiserfs_permission(struct user_namespace *mnt_userns, struct inode *inode,
 	if (IS_PRIVATE(inode))
 		return 0;
 
-	return generic_permission(&init_user_ns, inode, mask);
+	return generic_permission(&nop_mnt_idmap, inode, mask);
 }
 
 static int xattr_hide_revalidate(struct dentry *dentry, unsigned int flags)

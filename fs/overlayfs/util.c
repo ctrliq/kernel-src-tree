@@ -624,7 +624,8 @@ bool ovl_path_is_whiteout(struct ovl_fs *ofs, const struct path *path)
 struct file *ovl_path_open(const struct path *path, int flags)
 {
 	struct inode *inode = d_inode(path->dentry);
-	struct user_namespace *real_mnt_userns = mnt_user_ns(path->mnt);
+	struct mnt_idmap *real_idmap = mnt_idmap(path->mnt);
+	struct user_namespace *real_mnt_userns = mnt_idmap_owner(real_idmap);
 	int err, acc_mode;
 
 	if (flags & ~(O_ACCMODE | O_LARGEFILE))
@@ -641,7 +642,7 @@ struct file *ovl_path_open(const struct path *path, int flags)
 		BUG();
 	}
 
-	err = inode_permission(real_mnt_userns, inode, acc_mode | MAY_OPEN);
+	err = inode_permission(real_idmap, inode, acc_mode | MAY_OPEN);
 	if (err)
 		return ERR_PTR(err);
 
