@@ -52,7 +52,7 @@ static int minix_mknod(struct mnt_idmap *idmap, struct inode *dir,
 	return error;
 }
 
-static int minix_tmpfile(struct user_namespace *mnt_userns, struct inode *dir,
+static int minix_tmpfile(struct mnt_idmap *idmap, struct inode *dir,
 			 struct dentry *dentry, umode_t mode)
 {
 	int error;

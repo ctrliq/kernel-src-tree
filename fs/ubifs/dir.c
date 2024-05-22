@@ -444,7 +444,7 @@ out_budg:
 	return err;
 }
 
-static int ubifs_tmpfile(struct user_namespace *mnt_userns, struct inode *dir,
+static int ubifs_tmpfile(struct mnt_idmap *idmap, struct inode *dir,
 			 struct dentry *dentry, umode_t mode)
 {
 	return do_tmpfile(dir, dentry, mode, NULL);
