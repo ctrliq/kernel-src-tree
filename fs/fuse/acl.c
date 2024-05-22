@@ -12,7 +12,7 @@
 #include <linux/posix_acl_xattr.h>
 
 static struct posix_acl *__fuse_get_acl(struct fuse_conn *fc,
-					struct user_namespace *mnt_userns,
+					struct mnt_idmap *idmap,
 					struct inode *inode, int type, bool rcu)
 {
 	int size;
@@ -65,7 +65,7 @@ static inline bool fuse_no_acl(const struct fuse_conn *fc,
 	return !fc->posix_acl && (i_user_ns(inode) != &init_user_ns);
 }
 
-struct posix_acl *fuse_get_acl(struct user_namespace *mnt_userns,
+struct posix_acl *fuse_get_acl(struct mnt_idmap *idmap,
 			       struct dentry *dentry, int type)
 {
 	struct inode *inode = d_inode(dentry);
@@ -74,7 +74,7 @@ struct posix_acl *fuse_get_acl(struct user_namespace *mnt_userns,
 	if (fuse_no_acl(fc, inode))
 		return ERR_PTR(-EOPNOTSUPP);
 
-	return __fuse_get_acl(fc, mnt_userns, inode, type, false);
+	return __fuse_get_acl(fc, idmap, inode, type, false);
 }
 
 struct posix_acl *fuse_get_inode_acl(struct inode *inode, int type, bool rcu)
@@ -91,7 +91,7 @@ struct posix_acl *fuse_get_inode_acl(struct inode *inode, int type, bool rcu)
 	if (!fc->posix_acl)
 		return NULL;
 
-	return __fuse_get_acl(fc, &init_user_ns, inode, type, rcu);
+	return __fuse_get_acl(fc, &nop_mnt_idmap, inode, type, rcu);
 }
 
 int fuse_set_acl(struct user_namespace *mnt_userns, struct dentry *dentry,

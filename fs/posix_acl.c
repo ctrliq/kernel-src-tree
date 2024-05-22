@@ -111,7 +111,7 @@ void forget_all_cached_acls(struct inode *inode)
 }
 EXPORT_SYMBOL(forget_all_cached_acls);
 
-static struct posix_acl *__get_acl(struct user_namespace *mnt_userns,
+static struct posix_acl *__get_acl(struct mnt_idmap *idmap,
 				   struct dentry *dentry, struct inode *inode,
 				   int type)
 {
@@ -156,7 +156,7 @@ static struct posix_acl *__get_acl(struct user_namespace *mnt_userns,
 	 * we'll just create the negative cache entry.
 	 */
 	if (dentry && inode->i_op->get_acl) {
-		acl = inode->i_op->get_acl(mnt_userns, dentry, type);
+		acl = inode->i_op->get_acl(idmap, dentry, type);
 	} else if (inode->i_op->get_inode_acl) {
 		acl = inode->i_op->get_inode_acl(inode, type, false);
 	} else {
@@ -183,7 +183,7 @@ static struct posix_acl *__get_acl(struct user_namespace *mnt_userns,
 
 struct posix_acl *get_inode_acl(struct inode *inode, int type)
 {
-	return __get_acl(&init_user_ns, NULL, inode, type);
+	return __get_acl(&nop_mnt_idmap, NULL, inode, type);
 }
 EXPORT_SYMBOL(get_inode_acl);
 
@@ -1148,7 +1148,7 @@ EXPORT_SYMBOL_GPL(vfs_set_acl);
 
 /**
  * vfs_get_acl - get posix acls
- * @mnt_userns: user namespace of the mount
+ * @idmap: idmap of the mount
  * @dentry: the dentry based on which to retrieve the posix acls
  * @acl_name: the name of the posix acl
  *
@@ -1157,9 +1157,10 @@ EXPORT_SYMBOL_GPL(vfs_set_acl);
  *
  * Return: On success POSIX ACLs in VFS format, on error negative errno.
  */
-struct posix_acl *vfs_get_acl(struct user_namespace *mnt_userns,
+struct posix_acl *vfs_get_acl(struct mnt_idmap *idmap,
 			      struct dentry *dentry, const char *acl_name)
 {
+	struct user_namespace *mnt_userns = mnt_idmap_owner(idmap);
 	struct inode *inode = d_inode(dentry);
 	struct posix_acl *acl;
 	int acl_type, error;
@@ -1181,7 +1182,7 @@ struct posix_acl *vfs_get_acl(struct user_namespace *mnt_userns,
 	if (S_ISLNK(inode->i_mode))
 		return ERR_PTR(-EOPNOTSUPP);
 
-	acl = __get_acl(mnt_userns, dentry, inode, acl_type);
+	acl = __get_acl(idmap, dentry, inode, acl_type);
 	if (IS_ERR(acl))
 		return acl;
 	if (!acl)
@@ -1283,7 +1284,7 @@ ssize_t do_get_acl(struct mnt_idmap *idmap, struct dentry *dentry,
 	ssize_t error;
 	struct posix_acl *acl;
 
-	acl = vfs_get_acl(mnt_idmap_owner(idmap), dentry, acl_name);
+	acl = vfs_get_acl(idmap, dentry, acl_name);
 	if (IS_ERR(acl))
 		return PTR_ERR(acl);
 
