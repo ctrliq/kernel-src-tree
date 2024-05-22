@@ -1045,7 +1045,7 @@ static int hugetlbfs_mkdir(struct user_namespace *mnt_userns, struct inode *dir,
 	return retval;
 }
 
-static int hugetlbfs_create(struct user_namespace *mnt_userns,
+static int hugetlbfs_create(struct mnt_idmap *idmap,
 			    struct inode *dir, struct dentry *dentry,
 			    umode_t mode, bool excl)
 {
