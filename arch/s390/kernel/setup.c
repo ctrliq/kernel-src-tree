@@ -880,11 +880,9 @@ static void __init setup_randomness(void)
 {
 	struct sysinfo_3_2_2 *vmms;
 
-	vmms = (struct sysinfo_3_2_2 *) memblock_phys_alloc(PAGE_SIZE,
-							    PAGE_SIZE);
+	vmms = memblock_alloc(PAGE_SIZE, PAGE_SIZE);
 	if (!vmms)
 		panic("Failed to allocate memory for sysinfo structure\n");
-
 	if (stsi(vmms, 3, 2, 2) == 0 && vmms->count)
 		add_device_randomness(&vmms->vm, sizeof(vmms->vm[0]) * vmms->count);
 	memblock_free(vmms, PAGE_SIZE);
