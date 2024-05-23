@@ -207,7 +207,7 @@ static int __init local_init(void)
 	if (r)
 		return r;
 
-	deferred_remove_workqueue = alloc_workqueue("kdmremove", WQ_UNBOUND, 1);
+	deferred_remove_workqueue = alloc_ordered_workqueue("kdmremove", 0);
 	if (!deferred_remove_workqueue) {
 		r = -ENOMEM;
 		goto out_uevent_exit;
@@ -511,11 +511,11 @@ static void dm_io_acct(struct dm_io *io, bool end)
 
 	if (dm_io_flagged(io, DM_IO_BLK_STAT)) {
 		if (!end)
-			bdev_start_io_acct(bio->bi_bdev,
-					   dm_io_sectors(io, bio),
-					   bio_op(bio), io->start_time);
+			bdev_start_io_acct(bio->bi_bdev, bio_op(bio),
+					   io->start_time);
 		else
 			bdev_end_io_acct(bio->bi_bdev, bio_op(bio),
+					 dm_io_sectors(io, bio),
 					 io->start_time);
 	}
 
@@ -723,7 +723,7 @@ static char *_dm_claim_ptr = "I belong to device-mapper";
  * Open a table device so we can use it as a map destination.
  */
 static struct table_device *open_table_device(struct mapped_device *md,
-		dev_t dev, fmode_t mode)
+		dev_t dev, blk_mode_t mode)
 {
 	struct table_device *td;
 	struct file *bdev_file;
@@ -2954,6 +2954,9 @@ static void __dm_internal_suspend(struct mapped_device *md, unsigned int suspend
 
 static void __dm_internal_resume(struct mapped_device *md)
 {
+	int r;
+	struct dm_table *map;
+
 	BUG_ON(!md->internal_suspend_count);
 
 	if (--md->internal_suspend_count)
@@ -2962,12 +2965,23 @@ static void __dm_internal_resume(struct mapped_device *md)
 	if (dm_suspended_md(md))
 		goto done; /* resume from nested suspend */
 
-	/*
-	 * NOTE: existing callers don't need to call dm_table_resume_targets
-	 * (which may fail -- so best to avoid it for now by passing NULL map)
-	 */
-	(void) __dm_resume(md, NULL);
-
+	map = rcu_dereference_protected(md->map, lockdep_is_held(&md->suspend_lock));
+	r = __dm_resume(md, map);
+	if (r) {
+		/*
+		 * If a preresume method of some target failed, we are in a
+		 * tricky situation. We can't return an error to the caller. We
+		 * can't fake success because then the "resume" and
+		 * "postsuspend" methods would not be paired correctly, and it
+		 * would break various targets, for example it would cause list
+		 * corruption in the "origin" target.
+		 *
+		 * So, we fake normal suspend here, to make sure that the
+		 * "resume" and "postsuspend" methods will be paired correctly.
+		 */
+		DMERR("Preresume method failed: %d", r);
+		set_bit(DMF_SUSPENDED, &md->flags);
+	}
 done:
 	clear_bit(DMF_SUSPENDED_INTERNALLY, &md->flags);
 	smp_mb__after_atomic();
@@ -3166,6 +3180,8 @@ struct dm_pr {
 	bool	fail_early;
 	int	ret;
 	enum pr_type type;
+	struct pr_keys *read_keys;
+	struct pr_held_reservation *rsv;
 };
 
 static int dm_call_pr(struct block_device *bdev, iterate_devices_callout_fn fn,
@@ -3398,12 +3414,79 @@ out:
 	return r;
 }
 
+static int __dm_pr_read_keys(struct dm_target *ti, struct dm_dev *dev,
+			     sector_t start, sector_t len, void *data)
+{
+	struct dm_pr *pr = data;
+	const struct pr_ops *ops = dev->bdev->bd_disk->fops->pr_ops;
+
+	if (!ops || !ops->pr_read_keys) {
+		pr->ret = -EOPNOTSUPP;
+		return -1;
+	}
+
+	pr->ret = ops->pr_read_keys(dev->bdev, pr->read_keys);
+	if (!pr->ret)
+		return -1;
+
+	return 0;
+}
+
+static int dm_pr_read_keys(struct block_device *bdev, struct pr_keys *keys)
+{
+	struct dm_pr pr = {
+		.read_keys = keys,
+	};
+	int ret;
+
+	ret = dm_call_pr(bdev, __dm_pr_read_keys, &pr);
+	if (ret)
+		return ret;
+
+	return pr.ret;
+}
+
+static int __dm_pr_read_reservation(struct dm_target *ti, struct dm_dev *dev,
+				    sector_t start, sector_t len, void *data)
+{
+	struct dm_pr *pr = data;
+	const struct pr_ops *ops = dev->bdev->bd_disk->fops->pr_ops;
+
+	if (!ops || !ops->pr_read_reservation) {
+		pr->ret = -EOPNOTSUPP;
+		return -1;
+	}
+
+	pr->ret = ops->pr_read_reservation(dev->bdev, pr->rsv);
+	if (!pr->ret)
+		return -1;
+
+	return 0;
+}
+
+static int dm_pr_read_reservation(struct block_device *bdev,
+				  struct pr_held_reservation *rsv)
+{
+	struct dm_pr pr = {
+		.rsv = rsv,
+	};
+	int ret;
+
+	ret = dm_call_pr(bdev, __dm_pr_read_reservation, &pr);
+	if (ret)
+		return ret;
+
+	return pr.ret;
+}
+
 static const struct pr_ops dm_pr_ops = {
 	.pr_register	= dm_pr_register,
 	.pr_reserve	= dm_pr_reserve,
 	.pr_release	= dm_pr_release,
 	.pr_preempt	= dm_pr_preempt,
 	.pr_clear	= dm_pr_clear,
+	.pr_read_keys	= dm_pr_read_keys,
+	.pr_read_reservation = dm_pr_read_reservation,
 };
 
 static const struct block_device_operations dm_blk_dops = {
