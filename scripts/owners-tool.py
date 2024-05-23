@@ -73,7 +73,7 @@ class CommandVerify(BaseCommand):
     def handle(self, args):
         try:
             jsonschema.validate(args.owners, args.owners_schema,
-                                format_checker=jsonschema.Draft202012Validator.FORMAT_CHECKER)
+                                format_checker=jsonschema.draft4_format_checker)
         except jsonschema.exceptions.ValidationError as e:
             print(e.validator)
             msg = e.message
@@ -192,6 +192,11 @@ weight: 100
         return True
 
 
+class ChainableUndefined(jinja2.Undefined):
+    def __getattr__(self, name):
+        return self
+
+
 class CommandConvert(BaseCommand):
     overview = 'Convert owners.yaml using a template.'
 
@@ -202,7 +207,7 @@ class CommandConvert(BaseCommand):
 
     def handle(self, args):
         env = jinja2.Environment(loader=jinja2.FileSystemLoader('.'),
-                                 undefined=jinja2.ChainableUndefined,
+                                 undefined=ChainableUndefined,
                                  trim_blocks=True)
         try:
             template = env.get_template(args.template)
