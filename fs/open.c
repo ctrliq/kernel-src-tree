@@ -717,7 +717,7 @@ static inline bool setattr_vfsgid(struct iattr *attr, kgid_t kgid)
 int chown_common(const struct path *path, uid_t user, gid_t group)
 {
 	struct mnt_idmap *idmap;
-	struct user_namespace *mnt_userns, *fs_userns;
+	struct user_namespace *fs_userns;
 	struct inode *inode = path->dentry->d_inode;
 	struct inode *delegated_inode = NULL;
 	int error;
@@ -729,7 +729,6 @@ int chown_common(const struct path *path, uid_t user, gid_t group)
 	gid = make_kgid(current_user_ns(), group);
 
 	idmap = mnt_idmap(path->mnt);
-	mnt_userns = mnt_idmap_owner(idmap);
 	fs_userns = i_user_ns(inode);
 
 retry_deleg:
@@ -747,8 +746,8 @@ retry_deleg:
 	/* Continue to send actual fs values, not the mount values. */
 	error = security_path_chown(
 		path,
-		from_vfsuid(mnt_userns, fs_userns, newattrs.ia_vfsuid),
-		from_vfsgid(mnt_userns, fs_userns, newattrs.ia_vfsgid));
+		from_vfsuid(idmap, fs_userns, newattrs.ia_vfsuid),
+		from_vfsgid(idmap, fs_userns, newattrs.ia_vfsgid));
 	if (!error)
 		error = notify_change(idmap, path->dentry, &newattrs,
 				      &delegated_inode);
