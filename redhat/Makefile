@@ -688,6 +688,7 @@ sources-rh: $(TARBALL) $(KABI_TARBALL) $(KABIDW_TARBALL) generate-testpatch-tmp 
 	@cp scripts/kernel-tools/kvm_stat.logrotate \
 		keys/rhel*.x509 \
 		keys/nvidia*.x509 \
+		keys/fedora*.x509 \
 		kabi/check-kabi \
 		configs/$(SPECPACKAGE_NAME)-*.config \
 		configs/partial*.config \
