@@ -1113,7 +1113,6 @@ out:
 int ocfs2_setattr(struct mnt_idmap *idmap, struct dentry *dentry,
 		  struct iattr *attr)
 {
-	struct user_namespace *mnt_userns = mnt_idmap_owner(idmap);
 	int status = 0, size_change;
 	int inode_locked = 0;
 	struct inode *inode = d_inode(dentry);
@@ -1146,7 +1145,7 @@ int ocfs2_setattr(struct mnt_idmap *idmap, struct dentry *dentry,
 	if (status)
 		return status;
 
-	if (is_quota_modification(mnt_userns, inode, attr)) {
+	if (is_quota_modification(&nop_mnt_idmap, inode, attr)) {
 		status = dquot_initialize(inode);
 		if (status)
 			return status;

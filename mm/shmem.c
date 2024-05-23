@@ -1228,7 +1228,7 @@ static int shmem_setattr(struct mnt_idmap *idmap,
 		}
 	}
 
-	if (is_quota_modification(mnt_userns, inode, attr)) {
+	if (is_quota_modification(idmap, inode, attr)) {
 		error = dquot_initialize(inode);
 		if (error)
 			return error;
@@ -1237,7 +1237,7 @@ static int shmem_setattr(struct mnt_idmap *idmap,
 	/* Transfer quota accounting */
 	if ((i_uid_needs_update(mnt_userns, attr, inode)) ||
 	    (i_gid_needs_update(mnt_userns, attr, inode))) {
-		error = dquot_transfer(mnt_userns, inode, attr);
+		error = dquot_transfer(idmap, inode, attr);
 		if (error)
 			return error;
 	}
