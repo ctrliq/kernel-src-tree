@@ -2442,7 +2442,7 @@ static void shmem_set_inode_flags(struct inode *inode, unsigned int fsflags)
 #define shmem_initxattrs NULL
 #endif
 
-static struct inode *__shmem_get_inode(struct user_namespace *mnt_userns,
+static struct inode *__shmem_get_inode(struct mnt_idmap *idmap,
 				       struct super_block *sb,
 				       struct inode *dir, umode_t mode,
 				       dev_t dev, unsigned long flags)
@@ -2464,7 +2464,7 @@ static struct inode *__shmem_get_inode(struct user_namespace *mnt_userns,
 	}
 
 	inode->i_ino = ino;
-	inode_init_owner(mnt_userns, inode, dir, mode);
+	inode_init_owner(idmap, inode, dir, mode);
 	inode->i_blocks = 0;
 	inode->i_atime = inode->i_mtime = inode->i_ctime = current_time(inode);
 	inode->i_generation = get_random_u32();
@@ -2521,14 +2521,14 @@ static struct inode *__shmem_get_inode(struct user_namespace *mnt_userns,
 }
 
 #ifdef CONFIG_TMPFS_QUOTA
-static struct inode *shmem_get_inode(struct user_namespace *mnt_userns,
+static struct inode *shmem_get_inode(struct mnt_idmap *idmap,
 				     struct super_block *sb, struct inode *dir,
 				     umode_t mode, dev_t dev, unsigned long flags)
 {
 	int err;
 	struct inode *inode;
 
-	inode = __shmem_get_inode(mnt_userns, sb, dir, mode, dev, flags);
+	inode = __shmem_get_inode(idmap, sb, dir, mode, dev, flags);
 	if (IS_ERR(inode))
 		return inode;
 
@@ -2549,11 +2549,11 @@ errout:
 	return ERR_PTR(err);
 }
 #else
-static inline struct inode *shmem_get_inode(struct user_namespace *mnt_userns,
+static inline struct inode *shmem_get_inode(struct mnt_idmap *idmap,
 				     struct super_block *sb, struct inode *dir,
 				     umode_t mode, dev_t dev, unsigned long flags)
 {
-	return __shmem_get_inode(mnt_userns, sb, dir, mode, dev, flags);
+	return __shmem_get_inode(idmap, sb, dir, mode, dev, flags);
 }
 #endif /* CONFIG_TMPFS_QUOTA */
 
@@ -3196,12 +3196,10 @@ static int
 shmem_mknod(struct mnt_idmap *idmap, struct inode *dir,
 	    struct dentry *dentry, umode_t mode, dev_t dev)
 {
-	struct user_namespace *mnt_userns = mnt_idmap_owner(idmap);
 	struct inode *inode;
 	int error;
 
-	inode = shmem_get_inode(mnt_userns, dir->i_sb, dir, mode, dev, VM_NORESERVE);
-
+	inode = shmem_get_inode(idmap, dir->i_sb, dir, mode, dev, VM_NORESERVE);
 	if (IS_ERR(inode))
 		return PTR_ERR(inode);
 
@@ -3231,19 +3229,15 @@ static int
 shmem_tmpfile(struct mnt_idmap *idmap, struct inode *dir,
 	      struct file *file, umode_t mode)
 {
-	struct user_namespace *mnt_userns = mnt_idmap_owner(idmap);
 	struct inode *inode;
 	int error;
 
-	inode = shmem_get_inode(mnt_userns, dir->i_sb, dir, mode, 0, VM_NORESERVE);
-
+	inode = shmem_get_inode(idmap, dir->i_sb, dir, mode, 0, VM_NORESERVE);
 	if (IS_ERR(inode)) {
 		error = PTR_ERR(inode);
 		goto err_out;
 	}
-
-	error = security_inode_init_security(inode, dir,
-					     NULL,
+	error = security_inode_init_security(inode, dir, NULL,
 					     shmem_initxattrs, NULL);
 	if (error && error != -EOPNOTSUPP)
 		goto out_iput;
@@ -3416,7 +3410,6 @@ static int shmem_rename2(struct mnt_idmap *idmap,
 static int shmem_symlink(struct mnt_idmap *idmap, struct inode *dir,
 			 struct dentry *dentry, const char *symname)
 {
-	struct user_namespace *mnt_userns = mnt_idmap_owner(idmap);
 	int error;
 	int len;
 	struct inode *inode;
@@ -3426,7 +3419,7 @@ static int shmem_symlink(struct mnt_idmap *idmap, struct inode *dir,
 	if (len > PAGE_SIZE)
 		return -ENAMETOOLONG;
 
-	inode = shmem_get_inode(mnt_userns, dir->i_sb, dir, S_IFLNK | 0777, 0,
+	inode = shmem_get_inode(idmap, dir->i_sb, dir, S_IFLNK | 0777, 0,
 				VM_NORESERVE);
 
 	if (IS_ERR(inode))
@@ -4265,7 +4258,7 @@ static int shmem_fill_super(struct super_block *sb, struct fs_context *fc)
 	}
 #endif /* CONFIG_TMPFS_QUOTA */
 
-	inode = shmem_get_inode(&init_user_ns, sb, NULL, S_IFDIR | sbinfo->mode, 0,
+	inode = shmem_get_inode(&nop_mnt_idmap, sb, NULL, S_IFDIR | sbinfo->mode, 0,
 				VM_NORESERVE);
 	if (IS_ERR(inode)) {
 		error = PTR_ERR(inode);
@@ -4667,7 +4660,7 @@ EXPORT_SYMBOL_GPL(shmem_truncate_range);
 #define shmem_acct_size(flags, size)		0
 #define shmem_unacct_size(flags, size)		do {} while (0)
 
-static inline struct inode *shmem_get_inode(struct user_namespace *mnt_userns, struct super_block *sb, struct inode *dir,
+static inline struct inode *shmem_get_inode(struct mnt_idmap *idmap, struct super_block *sb, struct inode *dir,
 					    umode_t mode, dev_t dev, unsigned long flags)
 {
 	struct inode *inode = ramfs_get_inode(sb, dir, mode, dev);
@@ -4696,7 +4689,7 @@ static struct file *__shmem_file_setup(struct vfsmount *mnt, const char *name, l
 	if (is_idmapped_mnt(mnt))
 		return ERR_PTR(-EINVAL);
 
-	inode = shmem_get_inode(&init_user_ns, mnt->mnt_sb, NULL,
+	inode = shmem_get_inode(&nop_mnt_idmap, mnt->mnt_sb, NULL,
 				S_IFREG | S_IRWXUGO, 0, flags);
 
 	if (IS_ERR(inode)) {
