@@ -1177,7 +1177,6 @@ static int shmem_getattr(struct mnt_idmap *idmap,
 static int shmem_setattr(struct mnt_idmap *idmap,
 			 struct dentry *dentry, struct iattr *attr)
 {
-	struct user_namespace *mnt_userns = mnt_idmap_owner(idmap);
 	struct inode *inode = d_inode(dentry);
 	struct shmem_inode_info *info = SHMEM_I(inode);
 	int error;
@@ -1235,8 +1234,8 @@ static int shmem_setattr(struct mnt_idmap *idmap,
 	}
 
 	/* Transfer quota accounting */
-	if ((i_uid_needs_update(mnt_userns, attr, inode)) ||
-	    (i_gid_needs_update(mnt_userns, attr, inode))) {
+	if (i_uid_needs_update(idmap, attr, inode) ||
+	    i_gid_needs_update(idmap, attr, inode)) {
 		error = dquot_transfer(idmap, inode, attr);
 		if (error)
 			return error;
