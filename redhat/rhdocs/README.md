@@ -50,7 +50,7 @@ CODEOWNERS.  These secondary files can be generated using these commands
 executed from the top level of documentation:
 
 ```
-	make # requires minimum golang version 1.14
+make
 ```
 
 Users making changes must include a "Signed-off-by:" tag on all commits that
@@ -94,9 +94,13 @@ from the subsystem maintainer.
 MR authors, reviewers, and maintainers should discuss disagreements about ownership or role changes
 with their management.
 
-**validSSTNames.go Changes**
+**owners-schema.yaml Changes**
 
-These changes include validSSTNames.go changes.  You must ensure the SST names themselves, and the SST name changes in the file are approved by RHEL management.  Changes to this file that have not been verified by management will be removed by reverting commits.
+If you are changing SST names, you must ensure the SST names themselves, and
+the SST name changes in the file are approved by RHEL management. If you are
+changing the format of owners.yaml, you must ensure the changes have been
+approved by the KWF (Kernel Workflow) group. Changes that have failed to
+meet this will be removed by reverting commits.
 
 **Project Layout**
 
