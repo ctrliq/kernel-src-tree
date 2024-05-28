@@ -98,7 +98,8 @@ class CommandVerify(BaseCommand):
 
         errors = 0
         for subsys in args.owners['subsystems']:
-            if not subsys.get('reviewers'):
+            # The checks below do not apply to the kernel maintainer entries.
+            if subsys['labels']['name'] in ('redhat', 'fedora'):
                 continue
 
             # Check for duplicates between maintainers and reviewers. Also check for
@@ -106,7 +107,7 @@ class CommandVerify(BaseCommand):
             # (or vice versa).
             emails = set()
             glusers = set()
-            for person in itertools.chain(subsys['maintainers'], subsys['reviewers']):
+            for person in itertools.chain(subsys['maintainers'], subsys.get('reviewers', ())):
                 if person['email'] in emails or person['gluser'] in glusers:
                     eprint('ERROR: owners.yaml: subsystem "{}": '.format(subsys['subsystem']), end='')
                     eprint('Duplicate maintainer/reviewer entry for "{}".'.format(person['name']))
