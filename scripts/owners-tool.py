@@ -72,8 +72,13 @@ class CommandVerify(BaseCommand):
 
     def handle(self, args):
         try:
+            format_checker = jsonschema.Draft202012Validator.FORMAT_CHECKER
+        except AttributeError:
+            # An older jsonschema package. Use something that works down to RHEL 8.
+            format_checker = jsonschema.draft4_format_checker
+        try:
             jsonschema.validate(args.owners, args.owners_schema,
-                                format_checker=jsonschema.draft4_format_checker)
+                                format_checker=format_checker)
         except jsonschema.exceptions.ValidationError as e:
             print(e.validator)
             msg = e.message
