@@ -102,7 +102,14 @@ class CommandVerify(BaseCommand):
             return False
 
         errors = 0
+        subsys_names = set()
         for subsys in args.owners['subsystems']:
+            subsys_name = subsys['subsystem'].upper()
+            if subsys_name in subsys_names:
+                eprint('ERROR: owners.yaml: subsystem "{}" is specified multiple times.'.format(subsys_name))
+                errors += 1
+            subsys_names.add(subsys_name)
+
             # The checks below do not apply to the kernel maintainer entries.
             if subsys['labels']['name'] in ('redhat', 'fedora'):
                 continue
