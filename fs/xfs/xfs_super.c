@@ -1655,16 +1655,9 @@ xfs_fs_fill_super(
 		sb->s_flags |= SB_I_VERSION;
 
 	if (xfs_has_dax_always(mp)) {
-		static bool printed = false;
-
 		error = xfs_setup_dax_always(mp);
 		if (error)
 			goto out_filestream_unmount;
-
-		if (!printed) {
-			mark_tech_preview("xfs direct access (dax)", NULL);
-			printed = true;
-		}
 	}
 
 	if (xfs_has_discard(mp) && !bdev_max_discard_sectors(sb->s_bdev)) {

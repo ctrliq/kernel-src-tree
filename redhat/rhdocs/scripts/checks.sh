@@ -10,6 +10,8 @@ function in_names()
 	return 1
 }
 
+python3 scripts/owners-tool.py verify info/owners.yaml templates/owners-schema.yaml
+
 if [[ $GITLAB_CI ]]; then
 	git fetch origin main
 fi
@@ -64,20 +66,19 @@ if in_names info/owners.yaml && \
 	echo "        git config --add owners.warning false"
 	echo "======================================================="
 fi
-if test -n "$(git diff $base | grep "^+" | grep "\s\- rhel-sst-null" )"; then
-	echo "ERROR: New entries cannot set devel-sst to rhel-sst-null."
-	exit 1
-fi
-if in_names scripts/validSSTNames.go && \
-	test "$(git config --get validsstnames.warning)" != "false"; then
+if in_names templates/owners-schema.yaml && \
+	test "$(git config --get ownersschema.warning)" != "false"; then
 	echo "======================================================="
-	echo "These changes include validSSTNames.go changes.  You must ensure"
-	echo "the SST names themselves, and the SST name changes in the file are"
-	echo "approved by RHEL management.  Changes to this file that have"
-	echo "not been verified by management will be removed by reverting commits."
+	echo "These changes include owners-schema modifications.  If you are"
+	echo "changing SST names, you must ensure the SST names themselves, and"
+	echo "the SST name changes in the file are approved by RHEL management."
+	echo "If you are changing the format of owners.yaml, you must ensure"
+	echo "the changes have been approved by the KWF (Kernel Workflow) group."
+	echo "Changes that have failed to meet this will be removed by"
+	echo "reverting commits."
 	echo " "
 	echo "This warning can be disabled by executing:"
-	echo "        git config --add validsstnames.warning false"
+	echo "        git config --add ownersschema.warning false"
 	echo "======================================================="
 fi
 exit 0
