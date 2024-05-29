@@ -816,9 +816,6 @@ dist-check-licenses:
 		echo "dist-check-licenses: The bats package is not installed" ; \
 	fi
 
-dist-maint-update:
-	@cd ..; $(REDHAT)/scripts/merge-subtrees.sh || \
-		(echo "Unable merge documentation subtree"; exit 1)
 dist-help:
 	@echo  'Cleaning targets:'
 	@echo  '  dist-clean          - Clean redhat/configs/ and redhat/rpm/ directories.'
