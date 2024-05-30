@@ -4267,7 +4267,8 @@ static int scarlett2_add_standalone_ctl(struct usb_mixer_interface *mixer)
 {
 	struct scarlett2_data *private = mixer->private_data;
 
-	if (private->info->config_set == SCARLETT2_CONFIG_SET_GEN_3A)
+	if (!scarlett2_has_config_item(private,
+				       SCARLETT2_CONFIG_STANDALONE_SWITCH))
 		return 0;
 
 	/* Add standalone control */
@@ -4535,11 +4536,14 @@ static int scarlett2_read_configs(struct usb_mixer_interface *mixer)
 	if (!scarlett2_has_mixer(private))
 		return 0;
 
-	err = scarlett2_usb_get_config(
-		mixer, SCARLETT2_CONFIG_STANDALONE_SWITCH,
-		1, &private->standalone_switch);
-	if (err < 0)
-		return err;
+	if (scarlett2_has_config_item(private,
+				      SCARLETT2_CONFIG_STANDALONE_SWITCH)) {
+		err = scarlett2_usb_get_config(
+			mixer, SCARLETT2_CONFIG_STANDALONE_SWITCH,
+			1, &private->standalone_switch);
+		if (err < 0)
+			return err;
+	}
 
 	err = scarlett2_update_sync(mixer);
 	if (err < 0)
