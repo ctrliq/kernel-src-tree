@@ -102,7 +102,6 @@ struct htb_class {
 
 	struct tcf_proto __rcu	*filter_list;	/* class attached filters */
 	struct tcf_block	*block;
-	int			filter_cnt;
 
 	int			level;		/* our level (see above) */
 	unsigned int		children;
@@ -1710,7 +1709,7 @@ static int htb_delete(struct Qdisc *sch, unsigned long arg,
 	 * tc subsys guarantee us that in htb_destroy it holds no class
 	 * refs so that we can remove children safely there ?
 	 */
-	if (cl->children || cl->filter_cnt) {
+	if (cl->children || qdisc_class_in_use(&cl->common)) {
 		NL_SET_ERR_MSG(extack, "HTB class in use");
 		return -EBUSY;
 	}
@@ -2109,7 +2108,7 @@ static unsigned long htb_bind_filter(struct Qdisc *sch, unsigned long parent,
 	 * be broken by class during destroy IIUC.
 	 */
 	if (cl)
-		cl->filter_cnt++;
+		qdisc_class_get(&cl->common);
 	return (unsigned long)cl;
 }
 
@@ -2117,8 +2116,7 @@ static void htb_unbind_filter(struct Qdisc *sch, unsigned long arg)
 {
 	struct htb_class *cl = (struct htb_class *)arg;
 
-	if (cl)
-		cl->filter_cnt--;
+	qdisc_class_put(&cl->common);
 }
 
 static void htb_walk(struct Qdisc *sch, struct qdisc_walker *arg)
@@ -2181,3 +2179,4 @@ static void __exit htb_module_exit(void)
 module_init(htb_module_init)
 module_exit(htb_module_exit)
 MODULE_LICENSE("GPL");
+MODULE_DESCRIPTION("Hierarchical Token Bucket scheduler");
