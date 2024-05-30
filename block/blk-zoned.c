@@ -453,6 +453,11 @@ static inline bool disk_zone_is_conv(struct gendisk *disk, sector_t sector)
 	return test_bit(disk_zone_no(disk, sector), disk->conv_zones_bitmap);
 }
 
+static bool disk_zone_is_last(struct gendisk *disk, struct blk_zone *zone)
+{
+	return zone->start + zone->len >= get_capacity(disk);
+}
+
 static bool disk_insert_zone_wplug(struct gendisk *disk,
 				   struct blk_zone_wplug *zwplug)
 {
@@ -1696,11 +1701,13 @@ static int blk_revalidate_seq_zone(struct blk_zone *zone, unsigned int idx,
 
 	/*
 	 * Remember the capacity of the first sequential zone and check
-	 * if it is constant for all zones.
+	 * if it is constant for all zones, ignoring the last zone as it can be
+	 * smaller.
 	 */
 	if (!args->zone_capacity)
 		args->zone_capacity = zone->capacity;
-	if (zone->capacity != args->zone_capacity) {
+	if (!disk_zone_is_last(disk, zone) &&
+	    zone->capacity != args->zone_capacity) {
 		pr_warn("%s: Invalid variable zone capacity\n",
 			disk->disk_name);
 		return -ENODEV;
@@ -1735,7 +1742,6 @@ static int blk_revalidate_zone_cb(struct blk_zone *zone, unsigned int idx,
 {
 	struct blk_revalidate_zone_args *args = data;
 	struct gendisk *disk = args->disk;
-	sector_t capacity = get_capacity(disk);
 	sector_t zone_sectors = disk->queue->limits.chunk_sectors;
 	int ret;
 
@@ -1746,7 +1752,7 @@ static int blk_revalidate_zone_cb(struct blk_zone *zone, unsigned int idx,
 		return -ENODEV;
 	}
 
-	if (zone->start >= capacity || !zone->len) {
+	if (zone->start >= get_capacity(disk) || !zone->len) {
 		pr_warn("%s: Invalid zone start %llu, length %llu\n",
 			disk->disk_name, zone->start, zone->len);
 		return -ENODEV;
@@ -1756,7 +1762,7 @@ static int blk_revalidate_zone_cb(struct blk_zone *zone, unsigned int idx,
 	 * All zones must have the same size, with the exception on an eventual
 	 * smaller last zone.
 	 */
-	if (zone->start + zone->len < capacity) {
+	if (!disk_zone_is_last(disk, zone)) {
 		if (zone->len != zone_sectors) {
 			pr_warn("%s: Invalid zoned device with non constant zone size\n",
 				disk->disk_name);
