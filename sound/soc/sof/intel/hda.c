@@ -1354,7 +1354,7 @@ hdac_bus_unmap:
 	return ret;
 }
 
-int hda_dsp_remove(struct snd_sof_dev *sdev)
+void hda_dsp_remove(struct snd_sof_dev *sdev)
 {
 	struct sof_intel_hda_dev *hda = sdev->pdata->hw_pdata;
 	const struct sof_intel_dsp_desc *chip = hda->desc;
@@ -1407,8 +1407,6 @@ skip_disable_dsp:
 
 	if (!sdev->dspless_mode_selected)
 		iounmap(sdev->bar[HDA_DSP_BAR]);
-
-	return 0;
 }
 
 int hda_dsp_remove_late(struct snd_sof_dev *sdev)
