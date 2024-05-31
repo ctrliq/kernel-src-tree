@@ -12,6 +12,9 @@
  *  Multiple device nodes: Harald Freudenberger <freude@linux.ibm.com>
  */
 
+#define KMSG_COMPONENT "zcrypt"
+#define pr_fmt(fmt) KMSG_COMPONENT ": " fmt
+
 #include <linux/module.h>
 #include <linux/init.h>
 #include <linux/interrupt.h>
@@ -730,8 +733,7 @@ static long zcrypt_rsa_modexpo(struct ap_perms *perms,
 	spin_unlock(&zcrypt_list_lock);
 
 	if (!pref_zq) {
-		ZCRYPT_DBF_DBG("%s no matching queue found => ENODEV\n",
-			       __func__);
+		pr_debug("%s no matching queue found => ENODEV\n", __func__);
 		rc = -ENODEV;
 		goto out;
 	}
@@ -835,8 +837,7 @@ static long zcrypt_rsa_crt(struct ap_perms *perms,
 	spin_unlock(&zcrypt_list_lock);
 
 	if (!pref_zq) {
-		ZCRYPT_DBF_DBG("%s no matching queue found => ENODEV\n",
-			       __func__);
+		pr_debug("%s no matching queue found => ENODEV\n", __func__);
 		rc = -ENODEV;
 		goto out;
 	}
@@ -955,8 +956,8 @@ static long _zcrypt_send_cprb(bool userspace, struct ap_perms *perms,
 	spin_unlock(&zcrypt_list_lock);
 
 	if (!pref_zq) {
-		ZCRYPT_DBF_DBG("%s no match for address %02x.%04x => ENODEV\n",
-			       __func__, xcrb->user_defined, *domain);
+		pr_debug("%s no match for address %02x.%04x => ENODEV\n",
+			 __func__, xcrb->user_defined, *domain);
 		rc = -ENODEV;
 		goto out;
 	}
@@ -1128,15 +1129,15 @@ static long _zcrypt_send_ep11_cprb(bool userspace, struct ap_perms *perms,
 
 	if (!pref_zq) {
 		if (targets && target_num == 1) {
-			ZCRYPT_DBF_DBG("%s no match for address %02x.%04x => ENODEV\n",
-				       __func__, (int)targets->ap_id,
-				       (int)targets->dom_id);
+			pr_debug("%s no match for address %02x.%04x => ENODEV\n",
+				 __func__, (int)targets->ap_id,
+				 (int)targets->dom_id);
 		} else if (targets) {
-			ZCRYPT_DBF_DBG("%s no match for %d target addrs => ENODEV\n",
-				       __func__, (int)target_num);
+			pr_debug("%s no match for %d target addrs => ENODEV\n",
+				 __func__, (int)target_num);
 		} else {
-			ZCRYPT_DBF_DBG("%s no match for address ff.ffff => ENODEV\n",
-				       __func__);
+			pr_debug("%s no match for address ff.ffff => ENODEV\n",
+				 __func__);
 		}
 		rc = -ENODEV;
 		goto out_free;
@@ -1214,8 +1215,7 @@ static long zcrypt_rng(char *buffer)
 	spin_unlock(&zcrypt_list_lock);
 
 	if (!pref_zq) {
-		ZCRYPT_DBF_DBG("%s no matching queue found => ENODEV\n",
-			       __func__);
+		pr_debug("%s no matching queue found => ENODEV\n", __func__);
 		rc = -ENODEV;
 		goto out;
 	}
@@ -1459,7 +1459,7 @@ static int icarsamodexpo_ioctl(struct ap_perms *perms, unsigned long arg)
 	if (rc == -EAGAIN && tr.again_counter >= TRACK_AGAIN_MAX)
 		rc = -EIO;
 	if (rc) {
-		ZCRYPT_DBF_DBG("ioctl ICARSAMODEXPO rc=%d\n", rc);
+		pr_debug("ioctl ICARSAMODEXPO rc=%d\n", rc);
 		return rc;
 	}
 	return put_user(mex.outputdatalength, &umex->outputdatalength);
@@ -1491,7 +1491,7 @@ static int icarsacrt_ioctl(struct ap_perms *perms, unsigned long arg)
 	if (rc == -EAGAIN && tr.again_counter >= TRACK_AGAIN_MAX)
 		rc = -EIO;
 	if (rc) {
-		ZCRYPT_DBF_DBG("ioctl ICARSACRT rc=%d\n", rc);
+		pr_debug("ioctl ICARSACRT rc=%d\n", rc);
 		return rc;
 	}
 	return put_user(crt.outputdatalength, &ucrt->outputdatalength);
@@ -1523,8 +1523,8 @@ static int zsecsendcprb_ioctl(struct ap_perms *perms, unsigned long arg)
 	if (rc == -EAGAIN && tr.again_counter >= TRACK_AGAIN_MAX)
 		rc = -EIO;
 	if (rc)
-		ZCRYPT_DBF_DBG("ioctl ZSENDCPRB rc=%d status=0x%x\n",
-			       rc, xcrb.status);
+		pr_debug("ioctl ZSENDCPRB rc=%d status=0x%x\n",
+			 rc, xcrb.status);
 	if (copy_to_user(uxcrb, &xcrb, sizeof(xcrb)))
 		return -EFAULT;
 	return rc;
@@ -1556,7 +1556,7 @@ static int zsendep11cprb_ioctl(struct ap_perms *perms, unsigned long arg)
 	if (rc == -EAGAIN && tr.again_counter >= TRACK_AGAIN_MAX)
 		rc = -EIO;
 	if (rc)
-		ZCRYPT_DBF_DBG("ioctl ZSENDEP11CPRB rc=%d\n", rc);
+		pr_debug("ioctl ZSENDEP11CPRB rc=%d\n", rc);
 	if (copy_to_user(uxcrb, &xcrb, sizeof(xcrb)))
 		return -EFAULT;
 	return rc;
@@ -1685,7 +1685,7 @@ static long zcrypt_unlocked_ioctl(struct file *filp, unsigned int cmd,
 	}
 	/* unknown ioctl number */
 	default:
-		ZCRYPT_DBF_DBG("unknown ioctl 0x%08x\n", cmd);
+		pr_debug("unknown ioctl 0x%08x\n", cmd);
 		return -ENOIOCTLCMD;
 	}
 }
@@ -2029,8 +2029,8 @@ int zcrypt_wait_api_operational(void)
 			break;
 		default:
 			/* other failure */
-			ZCRYPT_DBF_DBG("%s ap_wait_init_apqn_bindings_complete()=%d\n",
-				       __func__, rc);
+			pr_debug("%s ap_wait_init_apqn_bindings_complete()=%d\n",
+				 __func__, rc);
 			break;
 		}
 		break;
