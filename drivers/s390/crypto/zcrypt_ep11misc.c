@@ -1452,7 +1452,7 @@ int ep11_kblob2protkey(u16 card, u16 dom,
 		u32 pkeybitsize;
 		u64 pkeysize;
 		u8  res2[8];
-		u8  pkey[0];
+		u8  pkey[];
 	} __packed * wki;
 	u8 *wkbuf = NULL;
 	int rc = -EIO;
