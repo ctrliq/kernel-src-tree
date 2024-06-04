@@ -341,6 +341,7 @@ static int geneve_init(struct net_device *dev)
 		gro_cells_destroy(&geneve->gro_cells);
 		return err;
 	}
+	netdev_lockdep_set_classes(dev);
 	return 0;
 }
 
@@ -499,12 +500,9 @@ static struct sk_buff *geneve_gro_receive(struct sock *sk,
 
 	off_gnv = skb_gro_offset(skb);
 	hlen = off_gnv + sizeof(*gh);
-	gh = skb_gro_header_fast(skb, off_gnv);
-	if (skb_gro_header_hard(skb, hlen)) {
-		gh = skb_gro_header_slow(skb, hlen, off_gnv);
-		if (unlikely(!gh))
-			goto out;
-	}
+	gh = skb_gro_header(skb, hlen, off_gnv);
+	if (unlikely(!gh))
+		goto out;
 
 	if (gh->ver != GENEVE_VER || gh->oam)
 		goto out;

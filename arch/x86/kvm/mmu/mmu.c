@@ -271,15 +271,11 @@ static inline unsigned long kvm_mmu_get_guest_pgd(struct kvm_vcpu *vcpu,
 
 static inline bool kvm_available_flush_remote_tlbs_range(void)
 {
+#if IS_ENABLED(CONFIG_HYPERV)
 	return kvm_x86_ops.flush_remote_tlbs_range;
-}
-
-int kvm_arch_flush_remote_tlbs_range(struct kvm *kvm, gfn_t gfn, u64 nr_pages)
-{
-	if (!kvm_x86_ops.flush_remote_tlbs_range)
-		return -EOPNOTSUPP;
-
-	return static_call(kvm_x86_flush_remote_tlbs_range)(kvm, gfn, nr_pages);
+#else
+	return false;
+#endif
 }
 
 static gfn_t kvm_mmu_page_get_gfn(struct kvm_mmu_page *sp, int index);
@@ -1392,7 +1388,7 @@ void kvm_arch_mmu_enable_log_dirty_pt_masked(struct kvm *kvm,
 		gfn_t end = slot->base_gfn + gfn_offset + __fls(mask);
 
 		if (READ_ONCE(eager_page_split))
-			kvm_mmu_try_split_huge_pages(kvm, slot, start, end, PG_LEVEL_4K);
+			kvm_mmu_try_split_huge_pages(kvm, slot, start, end + 1, PG_LEVEL_4K);
 
 		kvm_mmu_slot_gfn_write_protect(kvm, slot, start, PG_LEVEL_2M);
 
@@ -2850,9 +2846,9 @@ int mmu_try_to_unsync_pages(struct kvm *kvm, const struct kvm_memory_slot *slot,
 			/*
 			 * Recheck after taking the spinlock, a different vCPU
 			 * may have since marked the page unsync.  A false
-			 * positive on the unprotected check above is not
+			 * negative on the unprotected check above is not
 			 * possible as clearing sp->unsync _must_ hold mmu_lock
-			 * for write, i.e. unsync cannot transition from 0->1
+			 * for write, i.e. unsync cannot transition from 1->0
 			 * while this CPU holds mmu_lock for read (or write).
 			 */
 			if (READ_ONCE(sp->unsync))
@@ -3579,10 +3575,14 @@ static void mmu_free_root_page(struct kvm *kvm, hpa_t *root_hpa,
 	if (WARN_ON_ONCE(!sp))
 		return;
 
-	if (is_tdp_mmu_page(sp))
-		kvm_tdp_mmu_put_root(kvm, sp, false);
-	else if (!--sp->root_count && sp->role.invalid)
-		kvm_mmu_prepare_zap_page(kvm, sp, invalid_list);
+	if (is_tdp_mmu_page(sp)) {
+		lockdep_assert_held_read(&kvm->mmu_lock);
+		kvm_tdp_mmu_put_root(kvm, sp);
+	} else {
+		lockdep_assert_held_write(&kvm->mmu_lock);
+		if (!--sp->root_count && sp->role.invalid)
+			kvm_mmu_prepare_zap_page(kvm, sp, invalid_list);
+	}
 
 	*root_hpa = INVALID_PAGE;
 }
@@ -3591,6 +3591,7 @@ static void mmu_free_root_page(struct kvm *kvm, hpa_t *root_hpa,
 void kvm_mmu_free_roots(struct kvm *kvm, struct kvm_mmu *mmu,
 			ulong roots_to_free)
 {
+	bool is_tdp_mmu = tdp_mmu_enabled && mmu->root_role.direct;
 	int i;
 	LIST_HEAD(invalid_list);
 	bool free_active_root;
@@ -3613,7 +3614,10 @@ void kvm_mmu_free_roots(struct kvm *kvm, struct kvm_mmu *mmu,
 			return;
 	}
 
-	write_lock(&kvm->mmu_lock);
+	if (is_tdp_mmu)
+		read_lock(&kvm->mmu_lock);
+	else
+		write_lock(&kvm->mmu_lock);
 
 	for (i = 0; i < KVM_MMU_NUM_PREV_ROOTS; i++)
 		if (roots_to_free & KVM_MMU_ROOT_PREVIOUS(i))
@@ -3639,8 +3643,13 @@ void kvm_mmu_free_roots(struct kvm *kvm, struct kvm_mmu *mmu,
 		mmu->root.pgd = 0;
 	}
 
-	kvm_mmu_commit_zap_page(kvm, &invalid_list);
-	write_unlock(&kvm->mmu_lock);
+	if (is_tdp_mmu) {
+		read_unlock(&kvm->mmu_lock);
+		WARN_ON_ONCE(!list_empty(&invalid_list));
+	} else {
+		kvm_mmu_commit_zap_page(kvm, &invalid_list);
+		write_unlock(&kvm->mmu_lock);
+	}
 }
 EXPORT_SYMBOL_GPL(kvm_mmu_free_roots);
 
@@ -3697,15 +3706,15 @@ static int mmu_alloc_direct_roots(struct kvm_vcpu *vcpu)
 	unsigned i;
 	int r;
 
+	if (tdp_mmu_enabled)
+		return kvm_tdp_mmu_alloc_root(vcpu);
+
 	write_lock(&vcpu->kvm->mmu_lock);
 	r = make_mmu_pages_available(vcpu);
 	if (r < 0)
 		goto out_unlock;
 
-	if (tdp_mmu_enabled) {
-		root = kvm_tdp_mmu_get_vcpu_root_hpa(vcpu);
-		mmu->root.hpa = root;
-	} else if (shadow_root_level >= PT64_ROOT_4LEVEL) {
+	if (shadow_root_level >= PT64_ROOT_4LEVEL) {
 		root = mmu_alloc_root(vcpu, 0, 0, shadow_root_level);
 		mmu->root.hpa = root;
 	} else if (shadow_root_level == PT32E_ROOT_LEVEL) {
@@ -3806,7 +3815,7 @@ static int mmu_alloc_shadow_roots(struct kvm_vcpu *vcpu)
 	hpa_t root;
 
 	root_pgd = kvm_mmu_get_guest_pgd(vcpu, mmu);
-	root_gfn = root_pgd >> PAGE_SHIFT;
+	root_gfn = (root_pgd & __PT_BASE_ADDR_MASK) >> PAGE_SHIFT;
 
 	if (!kvm_vcpu_is_visible_gfn(vcpu, root_gfn)) {
 		mmu->root.hpa = kvm_mmu_get_dummy_root();
@@ -4926,7 +4935,7 @@ static void reset_guest_rsvds_bits_mask(struct kvm_vcpu *vcpu,
 				context->cpu_role.base.level, is_efer_nx(context),
 				guest_can_use(vcpu, X86_FEATURE_GBPAGES),
 				is_cr4_pse(context),
-				guest_cpuid_is_amd_or_hygon(vcpu));
+				guest_cpuid_is_amd_compatible(vcpu));
 }
 
 static void __reset_rsvds_bits_mask_ept(struct rsvd_bits_validate *rsvd_check,
@@ -5567,9 +5576,9 @@ void kvm_mmu_after_set_cpuid(struct kvm_vcpu *vcpu)
 	 * that problem is swept under the rug; KVM's CPUID API is horrific and
 	 * it's all but impossible to solve it without introducing a new API.
 	 */
-	vcpu->arch.root_mmu.root_role.word = 0;
-	vcpu->arch.guest_mmu.root_role.word = 0;
-	vcpu->arch.nested_mmu.root_role.word = 0;
+	vcpu->arch.root_mmu.root_role.invalid = 1;
+	vcpu->arch.guest_mmu.root_role.invalid = 1;
+	vcpu->arch.nested_mmu.root_role.invalid = 1;
 	vcpu->arch.root_mmu.cpu_role.ext.valid = 0;
 	vcpu->arch.guest_mmu.cpu_role.ext.valid = 0;
 	vcpu->arch.nested_mmu.cpu_role.ext.valid = 0;
@@ -7047,9 +7056,7 @@ int kvm_mmu_vendor_module_init(void)
 
 	kvm_mmu_reset_all_pte_masks();
 
-	pte_list_desc_cache = kmem_cache_create("pte_list_desc",
-					    sizeof(struct pte_list_desc),
-					    0, SLAB_ACCOUNT, NULL);
+	pte_list_desc_cache = KMEM_CACHE(pte_list_desc, SLAB_ACCOUNT);
 	if (!pte_list_desc_cache)
 		goto out;
 
@@ -7390,7 +7397,8 @@ bool kvm_arch_post_set_memory_attributes(struct kvm *kvm,
 			 * by the memslot, KVM can't use a hugepage due to the
 			 * misaligned address regardless of memory attributes.
 			 */
-			if (gfn >= slot->base_gfn) {
+			if (gfn >= slot->base_gfn &&
+			    gfn + nr_pages <= slot->base_gfn + slot->npages) {
 				if (hugepage_has_attrs(kvm, slot, gfn, level, attrs))
 					hugepage_clear_mixed(slot, gfn, level);
 				else
