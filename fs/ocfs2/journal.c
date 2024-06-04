@@ -883,9 +883,9 @@ int ocfs2_journal_init(struct ocfs2_journal *journal, int *dirty)
 
 	/* call the kernels journal init function now */
 	j_journal = jbd2_journal_init_inode(inode);
-	if (j_journal == NULL) {
+	if (IS_ERR(j_journal)) {
 		mlog(ML_ERROR, "Linux journal layer error\n");
-		status = -EINVAL;
+		status = PTR_ERR(j_journal);
 		goto done;
 	}
 
@@ -1658,9 +1658,9 @@ static int ocfs2_replay_journal(struct ocfs2_super *osb,
 	}
 
 	journal = jbd2_journal_init_inode(inode);
-	if (journal == NULL) {
+	if (IS_ERR(journal)) {
 		mlog(ML_ERROR, "Linux journal layer error\n");
-		status = -EIO;
+		status = PTR_ERR(journal);
 		goto done;
 	}
 
