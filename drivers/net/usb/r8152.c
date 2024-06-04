@@ -888,8 +888,8 @@ struct r8152 {
 		void (*up)(struct r8152 *tp);
 		void (*down)(struct r8152 *tp);
 		void (*unload)(struct r8152 *tp);
-		int (*eee_get)(struct r8152 *tp, struct ethtool_eee *eee);
-		int (*eee_set)(struct r8152 *tp, struct ethtool_eee *eee);
+		int (*eee_get)(struct r8152 *tp, struct ethtool_keee *eee);
+		int (*eee_set)(struct r8152 *tp, struct ethtool_keee *eee);
 		bool (*in_nway)(struct r8152 *tp);
 		void (*hw_phy_cfg)(struct r8152 *tp);
 		void (*autosuspend_en)(struct r8152 *tp, bool enable);
@@ -8776,7 +8776,7 @@ static void rtl8152_get_strings(struct net_device *dev, u32 stringset, u8 *data)
 	}
 }
 
-static int r8152_get_eee(struct r8152 *tp, struct ethtool_eee *eee)
+static int r8152_get_eee(struct r8152 *tp, struct ethtool_keee *eee)
 {
 	u32 lp, adv, supported = 0;
 	u16 val;
@@ -8792,16 +8792,16 @@ static int r8152_get_eee(struct r8152 *tp, struct ethtool_eee *eee)
 
 	eee->eee_enabled = tp->eee_en;
 	eee->eee_active = !!(supported & adv & lp);
-	eee->supported = supported;
-	eee->advertised = tp->eee_adv;
-	eee->lp_advertised = lp;
+	eee->supported_u32 = supported;
+	eee->advertised_u32 = tp->eee_adv;
+	eee->lp_advertised_u32 = lp;
 
 	return 0;
 }
 
-static int r8152_set_eee(struct r8152 *tp, struct ethtool_eee *eee)
+static int r8152_set_eee(struct r8152 *tp, struct ethtool_keee *eee)
 {
-	u16 val = ethtool_adv_to_mmd_eee_adv_t(eee->advertised);
+	u16 val = ethtool_adv_to_mmd_eee_adv_t(eee->advertised_u32);
 
 	tp->eee_en = eee->eee_enabled;
 	tp->eee_adv = val;
@@ -8811,7 +8811,7 @@ static int r8152_set_eee(struct r8152 *tp, struct ethtool_eee *eee)
 	return 0;
 }
 
-static int r8153_get_eee(struct r8152 *tp, struct ethtool_eee *eee)
+static int r8153_get_eee(struct r8152 *tp, struct ethtool_keee *eee)
 {
 	u32 lp, adv, supported = 0;
 	u16 val;
@@ -8827,15 +8827,15 @@ static int r8153_get_eee(struct r8152 *tp, struct ethtool_eee *eee)
 
 	eee->eee_enabled = tp->eee_en;
 	eee->eee_active = !!(supported & adv & lp);
-	eee->supported = supported;
-	eee->advertised = tp->eee_adv;
-	eee->lp_advertised = lp;
+	eee->supported_u32 = supported;
+	eee->advertised_u32 = tp->eee_adv;
+	eee->lp_advertised_u32 = lp;
 
 	return 0;
 }
 
 static int
-rtl_ethtool_get_eee(struct net_device *net, struct ethtool_eee *edata)
+rtl_ethtool_get_eee(struct net_device *net, struct ethtool_keee *edata)
 {
 	struct r8152 *tp = netdev_priv(net);
 	int ret;
@@ -8862,7 +8862,7 @@ out:
 }
 
 static int
-rtl_ethtool_set_eee(struct net_device *net, struct ethtool_eee *edata)
+rtl_ethtool_set_eee(struct net_device *net, struct ethtool_keee *edata)
 {
 	struct r8152 *tp = netdev_priv(net);
 	int ret;
@@ -9872,7 +9872,7 @@ static struct usb_driver rtl8152_driver = {
 	.disable_hub_initiated_lpm = 1,
 };
 
-static int rtl8152_cfgselector_probe(struct usb_device *udev)
+static int rtl8152_cfgselector_choose_configuration(struct usb_device *udev)
 {
 	struct usb_host_config *c;
 	int i, num_configs;
@@ -9881,7 +9881,7 @@ static int rtl8152_cfgselector_probe(struct usb_device *udev)
 	 * driver supports it.
 	 */
 	if (__rtl_get_hw_ver(udev) == RTL_VER_UNKNOWN)
-		return 0;
+		return -ENODEV;
 
 	/* The vendor mode is not always config #1, so to find it out. */
 	c = udev->config;
@@ -9899,19 +9899,13 @@ static int rtl8152_cfgselector_probe(struct usb_device *udev)
 	if (i == num_configs)
 		return -ENODEV;
 
-	if (usb_set_configuration(udev, c->desc.bConfigurationValue)) {
-		dev_err(&udev->dev, "Failed to set configuration %d\n",
-			c->desc.bConfigurationValue);
-		return -ENODEV;
-	}
-
-	return 0;
+	return c->desc.bConfigurationValue;
 }
 
 static struct usb_device_driver rtl8152_cfgselector_driver = {
-	.name =		MODULENAME "-cfgselector",
-	.probe =	rtl8152_cfgselector_probe,
-	.id_table =	rtl8152_table,
+	.name =	MODULENAME "-cfgselector",
+	.choose_configuration = rtl8152_cfgselector_choose_configuration,
+	.id_table = rtl8152_table,
 	.generic_subclass = 1,
 	.supports_autosuspend = 1,
 };

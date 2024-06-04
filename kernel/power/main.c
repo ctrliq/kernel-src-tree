@@ -556,6 +556,12 @@ power_attr_ro(pm_wakeup_irq);
 
 bool pm_debug_messages_on __read_mostly;
 
+bool pm_debug_messages_should_print(void)
+{
+	return pm_debug_messages_on && pm_suspend_target_state != PM_SUSPEND_ON;
+}
+EXPORT_SYMBOL_GPL(pm_debug_messages_should_print);
+
 static ssize_t pm_debug_messages_show(struct kobject *kobj,
 				      struct kobj_attribute *attr, char *buf)
 {
@@ -586,35 +592,6 @@ static int __init pm_debug_messages_setup(char *str)
 	return 1;
 }
 __setup("pm_debug_messages", pm_debug_messages_setup);
-
-/**
- * __pm_pr_dbg - Print a suspend debug message to the kernel log.
- * @defer: Whether or not to use printk_deferred() to print the message.
- * @fmt: Message format.
- *
- * The message will be emitted if enabled through the pm_debug_messages
- * sysfs attribute.
- */
-void __pm_pr_dbg(bool defer, const char *fmt, ...)
-{
-	struct va_format vaf;
-	va_list args;
-
-	if (!pm_debug_messages_on)
-		return;
-
-	va_start(args, fmt);
-
-	vaf.fmt = fmt;
-	vaf.va = &args;
-
-	if (defer)
-		printk_deferred(KERN_DEBUG "PM: %pV", &vaf);
-	else
-		printk(KERN_DEBUG "PM: %pV", &vaf);
-
-	va_end(args);
-}
 
 #else /* !CONFIG_PM_SLEEP_DEBUG */
 static inline void pm_print_times_init(void) {}

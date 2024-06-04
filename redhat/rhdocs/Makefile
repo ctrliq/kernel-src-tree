@@ -2,7 +2,6 @@ MAKEFLAGS := --no-print-directory
 
 .PHONY: all clean docs-prepare docs-clean docs
 all:
-	@awk -f scripts/check-multiple-entries.awk info/owners.yaml
 	scripts/checks.sh
 	python3 scripts/owners-tool.py convert info/owners.yaml templates/RHMAINTAINERS.template > info/RHMAINTAINERS
 	python3 scripts/owners-tool.py convert info/owners.yaml templates/CODEOWNERS.template > info/CODEOWNERS

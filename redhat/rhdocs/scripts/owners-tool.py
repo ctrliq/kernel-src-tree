@@ -72,8 +72,13 @@ class CommandVerify(BaseCommand):
 
     def handle(self, args):
         try:
+            format_checker = jsonschema.Draft202012Validator.FORMAT_CHECKER
+        except AttributeError:
+            # An older jsonschema package. Use something that works down to RHEL 8.
+            format_checker = jsonschema.draft4_format_checker
+        try:
             jsonschema.validate(args.owners, args.owners_schema,
-                                format_checker=jsonschema.draft4_format_checker)
+                                format_checker=format_checker)
         except jsonschema.exceptions.ValidationError as e:
             print(e.validator)
             msg = e.message
@@ -97,8 +102,16 @@ class CommandVerify(BaseCommand):
             return False
 
         errors = 0
+        subsys_names = set()
         for subsys in args.owners['subsystems']:
-            if not subsys.get('reviewers'):
+            subsys_name = subsys['subsystem'].upper()
+            if subsys_name in subsys_names:
+                eprint('ERROR: owners.yaml: subsystem "{}" is specified multiple times.'.format(subsys_name))
+                errors += 1
+            subsys_names.add(subsys_name)
+
+            # The checks below do not apply to the kernel maintainer entries.
+            if subsys['labels']['name'] in ('redhat', 'fedora'):
                 continue
 
             # Check for duplicates between maintainers and reviewers. Also check for
@@ -106,7 +119,7 @@ class CommandVerify(BaseCommand):
             # (or vice versa).
             emails = set()
             glusers = set()
-            for person in itertools.chain(subsys['maintainers'], subsys['reviewers']):
+            for person in itertools.chain(subsys['maintainers'], subsys.get('reviewers', ())):
                 if person['email'] in emails or person['gluser'] in glusers:
                     eprint('ERROR: owners.yaml: subsystem "{}": '.format(subsys['subsystem']), end='')
                     eprint('Duplicate maintainer/reviewer entry for "{}".'.format(person['name']))
