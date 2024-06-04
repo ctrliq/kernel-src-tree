@@ -2486,12 +2486,12 @@ out:
 
 int jbd2_journal_wipe(journal_t *journal, int write)
 {
-	int err = 0;
+	int err;
 
 	J_ASSERT (!(journal->j_flags & JBD2_LOADED));
 
 	if (!journal->j_tail)
-		goto no_recovery;
+		return 0;
 
 	printk(KERN_WARNING "JBD2: %s recovery information on journal\n",
 		write ? "Clearing" : "Ignoring");
@@ -2504,7 +2504,6 @@ int jbd2_journal_wipe(journal_t *journal, int write)
 		mutex_unlock(&journal->j_checkpoint_mutex);
 	}
 
- no_recovery:
 	return err;
 }
 
