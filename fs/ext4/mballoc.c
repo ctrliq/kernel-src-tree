@@ -6749,6 +6749,9 @@ __releases(ext4_group_lock_ptr(sb, e4b->bd_group))
 	ext4_grpblk_t next, count, free_count;
 	void *bitmap;
 
+	if (unlikely(EXT4_MB_GRP_BBITMAP_CORRUPT(e4b->bd_info)))
+		return 0;
+
 	bitmap = e4b->bd_bitmap;
 	start = (e4b->bd_info->bb_first_free > start) ?
 		e4b->bd_info->bb_first_free : start;
