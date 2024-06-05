@@ -1472,10 +1472,7 @@ static int create_sdw_dailink(struct snd_soc_card *card,
 			      struct snd_soc_dai_link **dai_links,
 			      const struct snd_soc_acpi_link_adr *adr_link,
 			      struct snd_soc_codec_conf **codec_conf,
-			      int *be_id, bool *ignore_pch_dmic,
-			      bool append_dai_type,
-			      int adr_index,
-			      int dai_index)
+			      int *be_id, int adr_index, int dai_index)
 {
 	struct mc_private *ctx = snd_soc_card_get_drvdata(card);
 	struct device *dev = card->dev;
@@ -1558,8 +1555,7 @@ static int create_sdw_dailink(struct snd_soc_card *card,
 	if (!codec_info)
 		return -EINVAL;
 
-	if (codec_info->ignore_pch_dmic)
-		*ignore_pch_dmic = true;
+	ctx->ignore_pch_dmic |= codec_info->ignore_pch_dmic;
 
 	for_each_pcm_streams(stream) {
 		char *name, *cpu_name;
@@ -1581,7 +1577,7 @@ static int create_sdw_dailink(struct snd_soc_card *card,
 		}
 
 		/* create stream name according to first link id */
-		if (append_dai_type) {
+		if (ctx->append_dai_type) {
 			name = devm_kasprintf(dev, GFP_KERNEL,
 					      sdw_stream_name[stream + 2], cpu_dai_id[0],
 					      type_strings[codec_info->dais[dai_index].dai_type]);
@@ -1767,8 +1763,6 @@ static int sof_card_dai_links_create(struct snd_soc_card *card)
 	struct snd_soc_codec_conf *codec_conf;
 	struct sof_sdw_codec_info *codec_info;
 	struct sof_sdw_codec_info *ssp_info;
-	bool append_dai_type = false;
-	bool ignore_pch_dmic = false;
 	int codec_conf_num = 0;
 	bool group_generated[SDW_MAX_GROUPS] = { };
 	struct snd_soc_dai_link *dai_links;
@@ -1852,7 +1846,7 @@ static int sof_card_dai_links_create(struct snd_soc_card *card)
 			if (!codec_info)
 				return -EINVAL;
 			if (codec_info->dai_num > 1) {
-				append_dai_type = true;
+				ctx->append_dai_type = true;
 				goto out;
 			}
 			for (j = 0; j < i; j++) {
@@ -1860,7 +1854,7 @@ static int sof_card_dai_links_create(struct snd_soc_card *card)
 				    SDW_PART_ID(adr_link->adr_d[j].adr)) ||
 				    (SDW_MFG_ID(adr_link->adr_d[i].adr) !=
 				    SDW_MFG_ID(adr_link->adr_d[j].adr))) {
-					append_dai_type = true;
+					ctx->append_dai_type = true;
 					goto out;
 				}
 			}
@@ -1890,8 +1884,7 @@ out:
 
 				ret = create_sdw_dailink(card, &dai_links, adr_link,
 							 &codec_conf, &current_be_id,
-							 &ignore_pch_dmic,
-							 append_dai_type, i, j);
+							 i, j);
 				if (ret < 0) {
 					dev_err(dev,
 						"failed to create dai link %d on 0x%x\n",
@@ -1920,7 +1913,7 @@ SSP:
 
 	/* dmic */
 	if (dmic_num > 0) {
-		if (ignore_pch_dmic) {
+		if (ctx->ignore_pch_dmic) {
 			dev_warn(dev, "Ignoring PCH DMIC\n");
 		} else {
 			ret = create_dmic_dailinks(card, &dai_links, &be_id);
