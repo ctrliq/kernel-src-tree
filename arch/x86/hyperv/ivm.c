@@ -597,7 +597,7 @@ void __init hv_vtom_init(void)
 #endif
 
 	case HV_ISOLATION_TYPE_TDX:
-		cc_vendor = CC_VENDOR_AMD;
+		cc_vendor = CC_VENDOR_INTEL;
 		break;
 
 	default:
