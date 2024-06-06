@@ -2,6 +2,8 @@
 #ifndef STICORE_H
 #define STICORE_H
 
+struct device;
+
 /* generic STI structures & functions */
 
 #define MAX_STI_ROMS 4		/* max no. of ROMs which this driver handles */
@@ -231,7 +233,7 @@ struct sti_rom_font {
 	 u8 height;
 	 u8 font_type;		/* language type */
 	 u8 bytes_per_char;
-	u32 next_font;
+	s32 next_font;		/* note: signed int */
 	 u8 underline_height;
 	 u8 underline_pos;
 	 u8 res008[2];
@@ -367,6 +369,9 @@ struct sti_struct {
 
 	/* pointer to the fb_info where this STI device is used */
 	struct fb_info *info;
+
+	/* pointer to the parent device */
+	struct device *dev;
 
 	/* pointer to all internal data */
 	struct sti_all_data *sti_data;
