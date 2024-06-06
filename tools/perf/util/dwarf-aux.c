@@ -1291,6 +1291,9 @@ static bool match_var_offset(Dwarf_Die *die_mem, struct find_var_data *data,
 		return true;
 	}
 
+	if (addr_offset < addr_type)
+		return false;
+
 	if (die_get_real_type(die_mem, &type_die) == NULL)
 		return false;
 
@@ -1365,7 +1368,6 @@ static int __die_find_var_reg_cb(Dwarf_Die *die_mem, void *arg)
 
 		/* Local variables accessed using frame base register */
 		if (data->is_fbreg && ops->atom == DW_OP_fbreg &&
-		    data->offset >= (int)ops->number &&
 		    check_allowed_ops(ops, nops) &&
 		    match_var_offset(die_mem, data, data->offset, ops->number,
 				     /*is_pointer=*/false))
@@ -1454,9 +1456,6 @@ static int __die_find_var_addr_cb(Dwarf_Die *die_mem, void *arg)
 
 	while ((off = dwarf_getlocations(&attr, off, &base, &start, &end, &ops, &nops)) > 0) {
 		if (ops->atom != DW_OP_addr)
-			continue;
-
-		if (data->addr < ops->number)
 			continue;
 
 		if (check_allowed_ops(ops, nops) &&
