@@ -1556,7 +1556,7 @@ xfs_fs_fill_super(
 	if (!xfs_has_crc(mp)) {
 #ifdef CONFIG_XFS_SUPPORT_V4
 		xfs_warn_once(mp,
-	"Deprecated V4 format (crc=0) will not be supported after September 2030.");
+	"Deprecated V4 format (crc=0) will not be supported beginning with RHEL10");
 #else
 		xfs_warn(mp,
 	"Deprecated V4 format (crc=0) not supported by kernel.");
