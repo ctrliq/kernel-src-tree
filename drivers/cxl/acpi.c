@@ -967,6 +967,7 @@ module_init(cxl_acpi_init);
 MODULE_SOFTDEP("pre: cxl_port");
 
 module_exit(cxl_acpi_exit);
+MODULE_DESCRIPTION("CXL ACPI: Platform Support");
 MODULE_LICENSE("GPL v2");
 MODULE_IMPORT_NS(CXL);
 MODULE_IMPORT_NS(ACPI);
