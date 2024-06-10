@@ -21,7 +21,6 @@
 #include <linux/seq_file.h>
 #include <linux/ioport.h>
 #include <linux/console.h>
-#include <linux/screen_info.h>
 #include <linux/root_dev.h>
 #include <linux/notifier.h>
 #include <linux/cpu.h>
@@ -95,21 +94,6 @@ int __initdata boot_core_hwid = -1;
  */
 int dcache_bsize;
 int icache_bsize;
-
-/*
- * This still seems to be needed... -- paulus
- */ 
-struct screen_info screen_info = {
-	.orig_x = 0,
-	.orig_y = 25,
-	.orig_video_cols = 80,
-	.orig_video_lines = 25,
-	.orig_video_isVGA = 1,
-	.orig_video_points = 16
-};
-#if defined(CONFIG_FB_VGA16_MODULE)
-EXPORT_SYMBOL(screen_info);
-#endif
 
 /* Variables required to store legacy IO irq routing */
 int of_i8042_kbd_irq;

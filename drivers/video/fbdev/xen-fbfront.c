@@ -181,8 +181,7 @@ static void xenfb_refresh(struct xenfb_info *info,
 		xenfb_do_update(info, x1, y1, x2 - x1 + 1, y2 - y1 + 1);
 }
 
-static void xenfb_deferred_io(struct fb_info *fb_info,
-			      struct list_head *pagelist)
+static void xenfb_deferred_io(struct fb_info *fb_info, struct list_head *pagereflist)
 {
 	struct xenfb_info *info = fb_info->par;
 	struct fb_deferred_io_pageref *pageref;
@@ -191,7 +190,7 @@ static void xenfb_deferred_io(struct fb_info *fb_info,
 
 	miny = INT_MAX;
 	maxy = 0;
-	list_for_each_entry(pageref, pagelist, list) {
+	list_for_each_entry(pageref, pagereflist, list) {
 		struct page *page = pageref->page;
 		beg = page->index << PAGE_SHIFT;
 		end = beg + PAGE_SIZE - 1;
@@ -456,7 +455,7 @@ static int xenfb_probe(struct xenbus_device *dev,
 	fb_info->fix.type = FB_TYPE_PACKED_PIXELS;
 	fb_info->fix.accel = FB_ACCEL_NONE;
 
-	fb_info->flags = FBINFO_FLAG_DEFAULT | FBINFO_VIRTFB;
+	fb_info->flags = FBINFO_VIRTFB;
 
 	ret = fb_alloc_cmap(&fb_info->cmap, 256, 0);
 	if (ret < 0) {
