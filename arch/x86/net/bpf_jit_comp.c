@@ -3171,6 +3171,32 @@ bool bpf_jit_supports_subprog_tailcalls(void)
 	return true;
 }
 
+bool bpf_jit_supports_exceptions(void)
+{
+	/* We unwind through both kernel frames (starting from within bpf_throw
+	 * call) and BPF frames. Therefore we require ORC unwinder to be enabled
+	 * to walk kernel frames and reach BPF frames in the stack trace.
+	 */
+	return IS_ENABLED(CONFIG_UNWINDER_ORC);
+}
+
+void arch_bpf_stack_walk(bool (*consume_fn)(void *cookie, u64 ip, u64 sp, u64 bp), void *cookie)
+{
+#if defined(CONFIG_UNWINDER_ORC)
+	struct unwind_state state;
+	unsigned long addr;
+
+	for (unwind_start(&state, current, NULL, NULL); !unwind_done(&state);
+	     unwind_next_frame(&state)) {
+		addr = unwind_get_return_address(&state);
+		if (!addr || !consume_fn(cookie, (u64)addr, (u64)state.sp, (u64)state.bp))
+			break;
+	}
+	return;
+#endif
+	WARN(1, "verification of programs using bpf_throw should have failed\n");
+}
+
 void bpf_arch_poke_desc_update(struct bpf_jit_poke_descriptor *poke,
 			       struct bpf_prog *new, struct bpf_prog *old)
 {
@@ -3217,28 +3243,7 @@ void bpf_arch_poke_desc_update(struct bpf_jit_poke_descriptor *poke,
 	}
 }
 
-bool bpf_jit_supports_exceptions(void)
+bool bpf_jit_supports_ptr_xchg(void)
 {
-	/* We unwind through both kernel frames (starting from within bpf_throw
-	 * call) and BPF frames. Therefore we require ORC unwinder to be enabled
-	 * to walk kernel frames and reach BPF frames in the stack trace.
-	 */
-	return IS_ENABLED(CONFIG_UNWINDER_ORC);
-}
-
-void arch_bpf_stack_walk(bool (*consume_fn)(void *cookie, u64 ip, u64 sp, u64 bp), void *cookie)
-{
-#if defined(CONFIG_UNWINDER_ORC)
-	struct unwind_state state;
-	unsigned long addr;
-
-	for (unwind_start(&state, current, NULL, NULL); !unwind_done(&state);
-	     unwind_next_frame(&state)) {
-		addr = unwind_get_return_address(&state);
-		if (!addr || !consume_fn(cookie, (u64)addr, (u64)state.sp, (u64)state.bp))
-			break;
-	}
-	return;
-#endif
-	WARN(1, "verification of programs using bpf_throw should have failed\n");
+	return true;
 }
