@@ -381,16 +381,17 @@ static int bh_get(struct gfs2_quota_data *qd)
 	struct gfs2_sbd *sdp = qd->qd_sbd;
 	struct gfs2_inode *ip = GFS2_I(sdp->sd_qc_inode);
 	unsigned int block, offset;
-	struct buffer_head *bh;
+	struct buffer_head *bh = NULL;
 	int error;
 	struct buffer_head bh_map = { .b_state = 0, .b_blocknr = 0 };
 
-	mutex_lock(&sdp->sd_quota_mutex);
-
-	if (qd->qd_bh_count++) {
-		mutex_unlock(&sdp->sd_quota_mutex);
+	spin_lock(&qd->qd_lockref.lock);
+	if (qd->qd_bh_count) {
+		qd->qd_bh_count++;
+		spin_unlock(&qd->qd_lockref.lock);
 		return 0;
 	}
+	spin_unlock(&qd->qd_lockref.lock);
 
 	block = qd->qd_slot / sdp->sd_qc_per_block;
 	offset = qd->qd_slot % sdp->sd_qc_per_block;
@@ -398,43 +399,45 @@ static int bh_get(struct gfs2_quota_data *qd)
 	bh_map.b_size = BIT(ip->i_inode.i_blkbits);
 	error = gfs2_block_map(&ip->i_inode, block, &bh_map, 0);
 	if (error)
-		goto fail;
+		return error;
 	error = gfs2_meta_read(ip->i_gl, bh_map.b_blocknr, DIO_WAIT, 0, &bh);
 	if (error)
-		goto fail;
+		return error;
 	error = -EIO;
 	if (gfs2_metatype_check(sdp, bh, GFS2_METATYPE_QC))
-		goto fail_brelse;
+		goto out;
 
-	qd->qd_bh = bh;
-	qd->qd_bh_qc = (struct gfs2_quota_change *)
-		(bh->b_data + sizeof(struct gfs2_meta_header) +
-		 offset * sizeof(struct gfs2_quota_change));
+	spin_lock(&qd->qd_lockref.lock);
+	if (qd->qd_bh == NULL) {
+		qd->qd_bh = bh;
+		qd->qd_bh_qc = (struct gfs2_quota_change *)
+			(bh->b_data + sizeof(struct gfs2_meta_header) +
+			 offset * sizeof(struct gfs2_quota_change));
+		bh = NULL;
+	}
+	qd->qd_bh_count++;
+	spin_unlock(&qd->qd_lockref.lock);
+	error = 0;
 
-	mutex_unlock(&sdp->sd_quota_mutex);
-
-	return 0;
-
-fail_brelse:
+out:
 	brelse(bh);
-fail:
-	qd->qd_bh_count--;
-	mutex_unlock(&sdp->sd_quota_mutex);
 	return error;
 }
 
 static void bh_put(struct gfs2_quota_data *qd)
 {
 	struct gfs2_sbd *sdp = qd->qd_sbd;
+	struct buffer_head *bh = NULL;
 
-	mutex_lock(&sdp->sd_quota_mutex);
+	spin_lock(&qd->qd_lockref.lock);
 	gfs2_assert(sdp, qd->qd_bh_count);
 	if (!--qd->qd_bh_count) {
-		brelse(qd->qd_bh);
+		bh = qd->qd_bh;
 		qd->qd_bh = NULL;
 		qd->qd_bh_qc = NULL;
 	}
-	mutex_unlock(&sdp->sd_quota_mutex);
+	spin_unlock(&qd->qd_lockref.lock);
+	brelse(bh);
 }
 
 static bool qd_grab_sync(struct gfs2_sbd *sdp, struct gfs2_quota_data *qd,
@@ -646,7 +649,6 @@ static void do_qc(struct gfs2_quota_data *qd, s64 change)
 	bool needs_put = false;
 	s64 x;
 
-	mutex_lock(&sdp->sd_quota_mutex);
 	gfs2_trans_add_meta(ip->i_gl, qd->qd_bh);
 
 	/*
@@ -690,7 +692,6 @@ static void do_qc(struct gfs2_quota_data *qd, s64 change)
 	}
 	if (change < 0) /* Reset quiet flag if we freed some blocks */
 		clear_bit(QDF_QMSG_QUIET, &qd->qd_flags);
-	mutex_unlock(&sdp->sd_quota_mutex);
 }
 
 static int gfs2_write_buf_to_page(struct gfs2_sbd *sdp, unsigned long index,
