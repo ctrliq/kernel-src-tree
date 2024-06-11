@@ -120,7 +120,6 @@ EXPORT_SYMBOL_GPL(udp_tunnel6_xmit_skb);
  *      @sock: Socket which provides route info
  *      @saddr: Memory to store the src ip address
  *      @info: Tunnel information
- *      @protocol: IP protocol
  *      @use_cache: Flag to enable cache usage
  *      This function performs a route lookup on a UDP tunnel
  *
@@ -134,7 +133,6 @@ struct dst_entry *udp_tunnel6_dst_lookup(struct sk_buff *skb,
 					 struct socket *sock,
 					 struct in6_addr *saddr,
 					 const struct ip_tunnel_info *info,
-					 u8 protocol,
 					 bool use_cache)
 {
 	struct dst_entry *dst = NULL;
@@ -154,7 +152,7 @@ struct dst_entry *udp_tunnel6_dst_lookup(struct sk_buff *skb,
 #endif
 	memset(&fl6, 0, sizeof(fl6));
 	fl6.flowi6_mark = skb->mark;
-	fl6.flowi6_proto = protocol;
+	fl6.flowi6_proto = IPPROTO_UDP;
 	fl6.daddr = info->key.u.ipv6.dst;
 	fl6.saddr = info->key.u.ipv6.src;
 	prio = info->key.tos;
