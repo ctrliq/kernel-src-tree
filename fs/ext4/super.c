@@ -5110,7 +5110,6 @@ static int __ext4_fill_super(struct fs_context *fc, struct super_block *sb)
 	}
 
 	if (sbi->s_mount_opt & EXT4_MOUNT_DAX_ALWAYS) {
-		static bool printed = false;
 		if (ext4_has_feature_inline_data(sb)) {
 			ext4_msg(sb, KERN_ERR, "Cannot use DAX on a filesystem"
 					" that may contain inline data");
@@ -5120,10 +5119,6 @@ static int __ext4_fill_super(struct fs_context *fc, struct super_block *sb)
 			ext4_msg(sb, KERN_ERR,
 				"DAX unsupported by block device.");
 			goto failed_mount;
-		}
-		if (!printed) {
-			mark_tech_preview("ext4 direct access (dax)", NULL);
-			printed = true;
 		}
 	}
 

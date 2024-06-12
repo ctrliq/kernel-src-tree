@@ -62,9 +62,10 @@ TEST_PROGS += io_uring_zerocopy_tx.sh
 TEST_PROGS += test_vxlan_mdb.sh
 TEST_PROGS += test_bridge_neigh_suppress.sh
 TEST_PROGS += test_vxlan_nolocalbypass.sh
+TEST_PROGS += test_bridge_backup_port.sh
 
 TEST_FILES := settings
-TEST_FILES += in_netns.sh net_helper.sh setup_loopback.sh setup_veth.sh
+TEST_FILES += in_netns.sh lib.sh net_helper.sh setup_loopback.sh setup_veth.sh
 
 KSFT_KHDR_INSTALL := 1
 include ../lib.mk
