@@ -835,6 +835,36 @@ static void rh_check_supported(void)
 	 */
 	if (acpi_disabled && !guest)
 		pr_crit("ACPI has been disabled or is not available on this hardware.  This may result in a single cpu boot, incorrect PCI IRQ routing, or boot failure.\n");
+
+	/*
+	 * x86_64 microarchitecture levels:
+	 * 	https://en.wikipedia.org/wiki/X86-64#Microarchitecture_levels
+	 *
+	 * RHEL9 has a minimum of the x86_64-v2 microarchitecture
+	 * RHEL10 has a minimum of the x86_64-v3 microarchitecture
+	 */
+
+	if (!boot_cpu_has(X86_FEATURE_CX16) || /* CMPXCHG16B */
+	    !boot_cpu_has(X86_FEATURE_LAHF_LM) || /* LAHF-SAHF */
+	    !boot_cpu_has(X86_FEATURE_POPCNT) ||
+	    !boot_cpu_has(X86_FEATURE_XMM3) || /* SSE-3 */
+	    !boot_cpu_has(X86_FEATURE_XMM4_1) || /* SSE4_1 */
+	    !boot_cpu_has(X86_FEATURE_XMM4_2) || /* SSE4_2 */
+	    !boot_cpu_has(X86_FEATURE_SSSE3)) {
+		mark_hardware_deprecated("x86_64-v1", "%s:%s",
+					 boot_cpu_data.x86_vendor_id, boot_cpu_data.x86_model_id);
+	} else if (!boot_cpu_has(X86_FEATURE_AVX) ||
+		   !boot_cpu_has(X86_FEATURE_AVX2) ||
+		   !boot_cpu_has(X86_FEATURE_BMI1) ||
+		   !boot_cpu_has(X86_FEATURE_BMI2) ||
+		   !boot_cpu_has(X86_FEATURE_F16C) ||
+		   !boot_cpu_has(X86_FEATURE_FMA) ||
+		   /* LZCNT is not explicitly listed, but appears to be paired with BMI2 */
+		   !boot_cpu_has(X86_FEATURE_MOVBE) ||
+		   !boot_cpu_has(X86_FEATURE_XSAVE)) {
+		mark_hardware_deprecated("x86_64-v2", "%s:%s",
+					 boot_cpu_data.x86_vendor_id, boot_cpu_data.x86_model_id);
+	}
 }
 #else
 #define rh_check_supported()
