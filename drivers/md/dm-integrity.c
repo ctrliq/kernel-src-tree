@@ -3474,6 +3474,17 @@ static void dm_integrity_io_hints(struct dm_target *ti, struct queue_limits *lim
 		blk_limits_io_min(limits, ic->sectors_per_block << SECTOR_SHIFT);
 		limits->dma_alignment = limits->logical_block_size - 1;
 	}
+
+	if (!ic->internal_hash) {
+		struct blk_integrity *bi = &limits->integrity;
+
+		memset(bi, 0, sizeof(*bi));
+		bi->tuple_size = ic->tag_size;
+		bi->tag_size = bi->tuple_size;
+		bi->interval_exp =
+			ic->sb->log2_sectors_per_block + SECTOR_SHIFT;
+	}
+
 	limits->max_integrity_segments = USHRT_MAX;
 }
 
@@ -3628,19 +3639,6 @@ try_smaller_buffer:
 	sb_set_version(ic);
 
 	return 0;
-}
-
-static void dm_integrity_set(struct dm_target *ti, struct dm_integrity_c *ic)
-{
-	struct gendisk *disk = dm_disk(dm_table_get_md(ti->table));
-	struct blk_integrity bi;
-
-	memset(&bi, 0, sizeof(bi));
-	bi.tuple_size = ic->tag_size;
-	bi.tag_size = bi.tuple_size;
-	bi.interval_exp = ic->sb->log2_sectors_per_block + SECTOR_SHIFT;
-
-	blk_integrity_register(disk, &bi);
 }
 
 static void dm_integrity_free_page_list(struct page_list *pl)
@@ -4627,9 +4625,6 @@ try_smaller_buffer:
 				goto bad;
 		}
 	}
-
-	if (!ic->internal_hash)
-		dm_integrity_set(ti, ic);
 
 	ti->num_flush_bios = 1;
 	ti->flush_supported = true;
