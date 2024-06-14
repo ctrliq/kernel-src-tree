@@ -1144,6 +1144,8 @@ void __init setup_arch(char **cmdline_p)
 	early_gart_iommu_check();
 #endif
 
+	topology_apply_cmdline_limits_early();
+
 	/*
 	 * partially used pages are not usable - thus
 	 * we are rounding upwards:
@@ -1340,13 +1342,10 @@ void __init setup_arch(char **cmdline_p)
 	 */
 	get_smp_config();
 
-	/*
-	 * Systems w/o ACPI and mptables might not have it mapped the local
-	 * APIC yet, but prefill_possible_map() might need to access it.
-	 */
+	/* Last opportunity to detect and map the local APIC */
 	init_apic_mappings();
 
-	prefill_possible_map();
+	topology_init_possible_cpus();
 
 	init_cpu_to_node();
 	init_gi_nodes();
