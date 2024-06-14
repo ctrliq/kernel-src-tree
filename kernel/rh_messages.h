@@ -49,6 +49,10 @@
 static const char *rh_deprecated_drivers[] = {
 	"aacraid",
 	"af_key",
+	"bnx2fc",
+	"bnx2i",
+	"bnx2x",
+	"cnic",
 	"firewire-core",
 	"qla4xxx",
 	"team",
@@ -61,6 +65,10 @@ static const char *rh_deprecated_init_fns[] = {
 	"fw_core_init",
 	"ipsec_pfkey_init",
 	"aac_init",
+	"cnic_init",
+	"bnx2x_init",
+	"bnx2fc_mod_init",
+	"bnx2i_mod_init",
 	0     /* Terminating entry */
 };
 
@@ -82,6 +90,7 @@ static const char *rh_unmaintained_drivers[] = {
 	"mptspi",
 	"myri10ge",
 	"netxen_nic",
+	"nfp",
 	"nft_compat",
 	"nicpf",
 	"nicvf",
@@ -123,6 +132,7 @@ static const char *rh_unmaintained_init_fns[] = {
 	"usnic_ib_init",
 	"pvrdma_init",
 	"hfi1_mod_init",
+	"nfp_main_init",
 	0     /* Terminating entry */
 };
 
