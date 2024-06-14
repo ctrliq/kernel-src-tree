@@ -74,8 +74,6 @@ static inline void e820__memblock_alloc_reserved_mpc_new(void) { }
 #define default_get_smp_config x86_init_uint_noop
 #endif
 
-int generic_processor_info(int apicid);
-
 extern DECLARE_BITMAP(phys_cpu_present_map, MAX_LOCAL_APIC);
 
 static inline void reset_phys_cpu_present_map(u32 apicid)
