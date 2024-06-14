@@ -177,6 +177,13 @@ do {                                                            \
 #define mlx5e_state_dereference(priv, p) \
 	rcu_dereference_protected((p), lockdep_is_held(&(priv)->state_lock))
 
+enum mlx5e_devcom_events {
+	MPV_DEVCOM_MASTER_UP,
+	MPV_DEVCOM_MASTER_DOWN,
+	MPV_DEVCOM_IPSEC_MASTER_UP,
+	MPV_DEVCOM_IPSEC_MASTER_DOWN,
+};
+
 static inline u8 mlx5e_get_num_lag_ports(struct mlx5_core_dev *mdev)
 {
 	if (mlx5_lag_is_lacp_owner(mdev))
@@ -935,7 +942,7 @@ struct mlx5e_priv {
 
 	const struct mlx5e_profile *profile;
 	void                      *ppriv;
-#ifdef CONFIG_MLX5_EN_MACSEC
+#ifdef CONFIG_MLX5_MACSEC
 	struct mlx5e_macsec       *macsec;
 #endif
 #ifdef CONFIG_MLX5_EN_IPSEC
@@ -954,6 +961,7 @@ struct mlx5e_priv {
 	struct mlx5e_htb          *htb;
 	struct mlx5e_mqprio_rl    *mqprio_rl;
 	struct dentry             *dfs_root;
+	struct mlx5_devcom_comp_dev *devcom;
 };
 
 struct mlx5e_dev {

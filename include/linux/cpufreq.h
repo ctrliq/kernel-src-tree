@@ -15,7 +15,6 @@
 #include <linux/kobject.h>
 #include <linux/notifier.h>
 #include <linux/of.h>
-#include <linux/of_device.h>
 #include <linux/pm_opp.h>
 #include <linux/pm_qos.h>
 #include <linux/spinlock.h>
@@ -140,6 +139,9 @@ struct cpufreq_policy {
 	 * different cpufreq policies.
 	 */
 	bool			dvfs_possible_from_any_cpu;
+
+	/* Per policy boost enabled flag. */
+	bool			boost_enabled;
 
 	 /* Cached frequency lookup from cpufreq_driver_resolve_freq. */
 	unsigned int cached_target_freq;
@@ -371,7 +373,7 @@ struct cpufreq_driver {
 	int		(*target_intermediate)(struct cpufreq_policy *policy,
 					       unsigned int index);
 
-	/* should be defined, if possible */
+	/* should be defined, if possible, return 0 on error */
 	unsigned int	(*get)(unsigned int cpu);
 
 	/* Called to update policy limits on firmware notifications. */
