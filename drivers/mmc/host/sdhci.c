@@ -2294,7 +2294,7 @@ static bool sdhci_timing_has_preset(unsigned char timing)
 	case MMC_TIMING_UHS_DDR50:
 	case MMC_TIMING_MMC_DDR52:
 		return true;
-	};
+	}
 	return false;
 }
 
