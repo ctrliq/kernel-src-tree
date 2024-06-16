@@ -133,7 +133,23 @@ extern const struct cpumask *cpu_clustergroup_mask(int cpu);
 
 #define topology_amd_node_id(cpu)		(cpu_data(cpu).topo.amd_node_id)
 
-extern unsigned int __max_die_per_package;
+extern unsigned int __max_dies_per_package;
+extern unsigned int __max_logical_packages;
+
+static inline unsigned int topology_max_packages(void)
+{
+	return __max_logical_packages;
+}
+
+static inline unsigned int topology_max_die_per_package(void)
+{
+	return __max_dies_per_package;
+}
+
+static inline unsigned int topology_max_dies_per_package(void)
+{
+	return __max_dies_per_package;
+}
 
 #ifdef CONFIG_SMP
 #define topology_cluster_id(cpu)		(cpu_data(cpu).topo.l2c_id)
@@ -141,19 +157,6 @@ extern unsigned int __max_die_per_package;
 #define topology_cluster_cpumask(cpu)		(cpu_clustergroup_mask(cpu))
 #define topology_core_cpumask(cpu)		(per_cpu(cpu_core_map, cpu))
 #define topology_sibling_cpumask(cpu)		(per_cpu(cpu_sibling_map, cpu))
-
-extern unsigned int __max_logical_packages;
-#define topology_max_packages()			(__max_logical_packages)
-
-static inline int topology_max_die_per_package(void)
-{
-	return __max_die_per_package;
-}
-
-static inline int topology_max_dies_per_package(void)
-{
-	return __max_die_per_package;
-}
 
 extern int __max_smt_threads;
 
