@@ -63,6 +63,7 @@ static async_cookie_t next_cookie = 1;
 static LIST_HEAD(async_global_pending);	/* pending from all registered doms */
 static ASYNC_DOMAIN(async_dfl_domain);
 static DEFINE_SPINLOCK(async_lock);
+static struct workqueue_struct *async_wq;
 
 struct async_entry {
 	struct list_head	domain_list;
@@ -145,6 +146,39 @@ static void async_run_entry_fn(struct work_struct *work)
 	wake_up(&async_done);
 }
 
+static async_cookie_t __async_schedule_node_domain(async_func_t func,
+						   void *data, int node,
+						   struct async_domain *domain,
+						   struct async_entry *entry)
+{
+	async_cookie_t newcookie;
+	unsigned long flags;
+
+	INIT_LIST_HEAD(&entry->domain_list);
+	INIT_LIST_HEAD(&entry->global_list);
+	INIT_WORK(&entry->work, async_run_entry_fn);
+	entry->func = func;
+	entry->data = data;
+	entry->domain = domain;
+
+	spin_lock_irqsave(&async_lock, flags);
+
+	/* allocate cookie and queue */
+	newcookie = entry->cookie = next_cookie++;
+
+	list_add_tail(&entry->domain_list, &domain->pending);
+	if (domain->registered)
+		list_add_tail(&entry->global_list, &async_global_pending);
+
+	atomic_inc(&entry_count);
+	spin_unlock_irqrestore(&async_lock, flags);
+
+	/* schedule for execution */
+	queue_work_node(node, async_wq, &entry->work);
+
+	return newcookie;
+}
+
 /**
  * async_schedule_node_domain - NUMA specific version of async_schedule_domain
  * @func: function to execute asynchronously
@@ -186,32 +220,8 @@ async_cookie_t async_schedule_node_domain(async_func_t func, void *data,
 		func(data, newcookie);
 		return newcookie;
 	}
-	INIT_LIST_HEAD(&entry->domain_list);
-	INIT_LIST_HEAD(&entry->global_list);
-	INIT_WORK(&entry->work, async_run_entry_fn);
-	entry->func = func;
-	entry->data = data;
-	entry->domain = domain;
 
-	spin_lock_irqsave(&async_lock, flags);
-
-	/* allocate cookie and queue */
-	newcookie = entry->cookie = next_cookie++;
-
-	list_add_tail(&entry->domain_list, &domain->pending);
-	if (domain->registered)
-		list_add_tail(&entry->global_list, &async_global_pending);
-
-	atomic_inc(&entry_count);
-	spin_unlock_irqrestore(&async_lock, flags);
-
-	/* mark that this task has queued an async job, used by module init */
-	current->flags |= PF_USED_ASYNC;
-
-	/* schedule for execution */
-	queue_work_node(node, system_unbound_wq, &entry->work);
-
-	return newcookie;
+	return __async_schedule_node_domain(func, data, node, domain, entry);
 }
 EXPORT_SYMBOL_GPL(async_schedule_node_domain);
 
@@ -306,3 +316,17 @@ bool current_is_async(void)
 	return worker && worker->current_func == async_run_entry_fn;
 }
 EXPORT_SYMBOL_GPL(current_is_async);
+
+void __init async_init(void)
+{
+	/*
+	 * Async can schedule a number of interdependent work items. However,
+	 * unbound workqueues can handle only upto min_active interdependent
+	 * work items. The default min_active of 8 isn't sufficient for async
+	 * and can lead to stalls. Let's use a dedicated workqueue with raised
+	 * min_active.
+	 */
+	async_wq = alloc_workqueue("async", WQ_UNBOUND, 0);
+	BUG_ON(!async_wq);
+	workqueue_set_min_active(async_wq, WQ_DFL_ACTIVE);
+}
