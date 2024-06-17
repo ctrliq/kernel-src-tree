@@ -1452,7 +1452,7 @@ static void vnt_bss_info_changed(struct ieee80211_hw *hw,
 
 	if (changed & BSS_CHANGED_TXPOWER)
 		RFbSetPower(priv, priv->wCurrentRate,
-			    conf->chandef.chan->hw_value);
+			    conf->chanreq.oper.chan->hw_value);
 
 	if (changed & BSS_CHANGED_BEACON_ENABLED) {
 		dev_dbg(&priv->pcid->dev,
