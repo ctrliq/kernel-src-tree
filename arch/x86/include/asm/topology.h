@@ -167,6 +167,13 @@ static inline int topology_get_logical_id(u32 apicid, enum x86_topology_domains 
 #define topology_core_cpumask(cpu)		(per_cpu(cpu_core_map, cpu))
 #define topology_sibling_cpumask(cpu)		(per_cpu(cpu_sibling_map, cpu))
 
+
+static inline int topology_phys_to_logical_pkg(unsigned int pkg)
+{
+	return topology_get_logical_id(pkg << x86_topo_system.dom_shifts[TOPO_PKG_DOMAIN],
+				       TOPO_PKG_DOMAIN);
+}
+
 extern int __max_smt_threads;
 
 static inline int topology_max_smt_threads(void)
@@ -175,10 +182,6 @@ static inline int topology_max_smt_threads(void)
 }
 
 #include <linux/cpu_smt.h>
-
-int topology_update_package_map(unsigned int apicid, unsigned int cpu);
-int topology_update_die_map(unsigned int dieid, unsigned int cpu);
-int topology_phys_to_logical_pkg(unsigned int pkg);
 
 extern unsigned int __amd_nodes_per_pkg;
 
