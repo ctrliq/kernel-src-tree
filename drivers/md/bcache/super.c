@@ -897,7 +897,6 @@ static int bcache_device_init(struct bcache_device *d, unsigned int block_size,
 		sector_t sectors, struct block_device *cached_bdev,
 		const struct block_device_operations *ops)
 {
-	struct request_queue *q;
 	const size_t max_stripes = min_t(size_t, INT_MAX,
 					 SIZE_MAX / sizeof(atomic_t));
 	uint64_t n;
