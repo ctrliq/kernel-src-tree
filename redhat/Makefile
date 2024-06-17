@@ -713,7 +713,8 @@ dist-release-changed:
 		$(MAKE) dist-release-finish; \
 	fi
 
-dist-release: dist-clean-sources dist-release-changed
+dist-release: dist-clean-sources
+	@$(MAKE) dist-release-changed
 
 dist-release-tag:
 	@$(GIT) tag -a -m "$(DISTRELEASETAG)" $(DISTRELEASETAG)
@@ -781,7 +782,9 @@ ifeq ("$(RHDISTGIT_BRANCH)", "")
 endif
 	$(REDHAT)/scripts/rh-dist-git.sh
 
-dist-rtg: dist-release dist-release-tag dist-git
+dist-rtg: dist-release
+	@$(MAKE) dist-release-tag
+	@$(MAKE) dist-git
 
 # RH_LATEST returns the value of the latest "known good" kernel from brew.
 # This should not be confused with the latest top-of-tree development tag.
