@@ -2193,4 +2193,5 @@ static void __exit atari_floppy_exit(void)
 module_init(atari_floppy_init)
 module_exit(atari_floppy_exit)
 
+MODULE_DESCRIPTION("Atari floppy driver");
 MODULE_LICENSE("GPL");
