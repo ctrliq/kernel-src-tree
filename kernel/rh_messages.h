@@ -59,6 +59,10 @@ static const char *rh_unmaintained_drivers[] = {
 	"af_key",
 	"arp_tables",
 	"bnx2",
+	"bnx2fc",
+	"bnx2i",
+	"bnx2x",
+	"cnic",
 	"dl2k",
 	"e1000",
 	"ebtables",
@@ -78,7 +82,6 @@ static const char *rh_unmaintained_drivers[] = {
 	"nicvf",
 	"nvmet-fc",
 	"nvmet-tcp",
-	"qla3xxx",
 	"team",
 	0     /* Terminating entry */
 };
@@ -94,7 +97,6 @@ static const char *rh_unmaintained_init_fns[] = {
 	"mptspi_init",
 	"myri10ge_init_module",
 	"netxen_init_module",
-	"ql3xxx_driver_init",
 	"hdlc_fr_init",
 	"nvmet_fc_init_module",
 	"nvmet_tcp_init",
@@ -109,6 +111,10 @@ static const char *rh_unmaintained_init_fns[] = {
 	"nic_init_module",
 	"ipsec_pfkey_init",
 	"aac_init",
+	"cnic_init",
+	"bnx2x_init",
+	"bnx2fc_mod_init",
+	"bnx2i_mod_init",
 	0     /* Terminating entry */
 };
 
