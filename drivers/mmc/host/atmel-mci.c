@@ -206,7 +206,6 @@ enum atmci_pdc_buf {
  * @bus_width: Number of data lines wired up the slot
  * @detect_pin: GPIO pin wired to the card detect switch
  * @wp_pin: GPIO pin wired to the write protect sensor
- * @detect_is_active_high: The state of the detect pin when it is active
  * @non_removable: The slot is not removable, only detect once
  *
  * If a given slot is not present on the board, @bus_width should be
@@ -222,7 +221,6 @@ struct mci_slot_pdata {
 	unsigned int		bus_width;
 	struct gpio_desc        *detect_pin;
 	struct gpio_desc	*wp_pin;
-	bool			detect_is_active_high;
 	bool			non_removable;
 };
 
@@ -402,7 +400,6 @@ struct atmel_mci {
  *	available.
  * @wp_pin: GPIO pin used for card write protect sending, or negative
  *	if not available.
- * @detect_is_active_high: The state of the detect pin when it is active.
  * @detect_timer: Timer used for debouncing @detect_pin interrupts.
  */
 struct atmel_mci_slot {
@@ -423,7 +420,6 @@ struct atmel_mci_slot {
 
 	struct gpio_desc        *detect_pin;
 	struct gpio_desc	*wp_pin;
-	bool			detect_is_active_high;
 
 	struct timer_list	detect_timer;
 };
@@ -640,6 +636,7 @@ static struct mci_platform_data *atmci_of_init(struct device *dev)
 	struct device_node *cnp;
 	struct mci_platform_data *pdata;
 	u32 slot_id;
+	int err;
 
 	if (!np) {
 		dev_err(dev, "device node not found\n");
@@ -670,11 +667,12 @@ static struct mci_platform_data *atmci_of_init(struct device *dev)
 		pdata->slot[slot_id].detect_pin =
 			devm_fwnode_gpiod_get(dev, of_fwnode_handle(cnp),
 					      "cd", GPIOD_IN, "cd-gpios");
-		if (IS_ERR(pdata->slot[slot_id].detect_pin))
+		err = PTR_ERR_OR_ZERO(pdata->slot[slot_id].detect_pin);
+		if (err) {
+			if (err != -ENOENT)
+				return ERR_PTR(err);
 			pdata->slot[slot_id].detect_pin = NULL;
-
-		pdata->slot[slot_id].detect_is_active_high =
-			of_property_read_bool(cnp, "cd-inverted");
+		}
 
 		pdata->slot[slot_id].non_removable =
 			of_property_read_bool(cnp, "non-removable");
@@ -682,8 +680,12 @@ static struct mci_platform_data *atmci_of_init(struct device *dev)
 		pdata->slot[slot_id].wp_pin =
 			devm_fwnode_gpiod_get(dev, of_fwnode_handle(cnp),
 					      "wp", GPIOD_IN, "wp-gpios");
-		if (IS_ERR(pdata->slot[slot_id].wp_pin))
+		err = PTR_ERR_OR_ZERO(pdata->slot[slot_id].wp_pin);
+		if (err) {
+			if (err != -ENOENT)
+				return ERR_PTR(err);
 			pdata->slot[slot_id].wp_pin = NULL;
+		}
 	}
 
 	return pdata;
@@ -1559,8 +1561,7 @@ static int atmci_get_cd(struct mmc_host *mmc)
 	struct atmel_mci_slot	*slot = mmc_priv(mmc);
 
 	if (slot->detect_pin) {
-		present = !(gpiod_get_raw_value(slot->detect_pin) ^
-			    slot->detect_is_active_high);
+		present = gpiod_get_value_cansleep(slot->detect_pin);
 		dev_dbg(&mmc->class_dev, "card is %spresent\n",
 				present ? "" : "not ");
 	}
@@ -1673,8 +1674,7 @@ static void atmci_detect_change(struct timer_list *t)
 		return;
 
 	enable_irq(gpiod_to_irq(slot->detect_pin));
-	present = !(gpiod_get_raw_value(slot->detect_pin) ^
-		    slot->detect_is_active_high);
+	present = gpiod_get_value_cansleep(slot->detect_pin);
 	present_old = test_bit(ATMCI_CARD_PRESENT, &slot->flags);
 
 	dev_vdbg(&slot->mmc->class_dev, "detect change: %d (was %d)\n",
@@ -2263,7 +2263,6 @@ static int atmci_init_slot(struct atmel_mci *host,
 	slot->host = host;
 	slot->detect_pin = slot_data->detect_pin;
 	slot->wp_pin = slot_data->wp_pin;
-	slot->detect_is_active_high = slot_data->detect_is_active_high;
 	slot->sdc_reg = sdc_reg;
 	slot->sdio_irq = sdio_irq;
 
@@ -2271,7 +2270,7 @@ static int atmci_init_slot(struct atmel_mci *host,
 	        "slot[%u]: bus_width=%u, detect_pin=%d, "
 		"detect_is_active_high=%s, wp_pin=%d\n",
 		id, slot_data->bus_width, desc_to_gpio(slot_data->detect_pin),
-		slot_data->detect_is_active_high ? "true" : "false",
+		!gpiod_is_active_low(slot_data->detect_pin) ? "true" : "false",
 		desc_to_gpio(slot_data->wp_pin));
 
 	mmc->ops = &atmci_ops;
@@ -2309,10 +2308,8 @@ static int atmci_init_slot(struct atmel_mci *host,
 	/* Assume card is present initially */
 	set_bit(ATMCI_CARD_PRESENT, &slot->flags);
 	if (slot->detect_pin) {
-		if (gpiod_get_raw_value(slot->detect_pin) ^
-		    slot->detect_is_active_high) {
+		if (!gpiod_get_value_cansleep(slot->detect_pin))
 			clear_bit(ATMCI_CARD_PRESENT, &slot->flags);
-		}
 	} else {
 		dev_dbg(&mmc->class_dev, "no detect pin available\n");
 	}
