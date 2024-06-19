@@ -5,6 +5,7 @@
 
 #include <linux/memory_hotplug.h>
 #include <linux/memblock.h>
+#include <linux/kasan.h>
 #include <linux/pfn.h>
 #include <linux/mm.h>
 #include <linux/init.h>
@@ -668,6 +669,9 @@ static void __init memblock_region_swap(void *a, void *b, int size)
 	swap(*(struct memblock_region *)a, *(struct memblock_region *)b);
 }
 
+#ifdef CONFIG_KASAN
+#define __sha(x)	((unsigned long)kasan_mem_to_shadow((void *)x))
+#endif
 /*
  * map whole physical memory to virtual memory (identity mapping)
  * we reserve enough space in the vmalloc area for vmemmap to hotplug
@@ -736,6 +740,13 @@ void __init vmem_map_init(void)
 			     (end - base) >> PAGE_SHIFT,
 			     SET_MEMORY_RW | SET_MEMORY_NX);
 	}
+
+#ifdef CONFIG_KASAN
+	for_each_mem_range(i, &base, &end)
+		__set_memory(__sha(base),
+			     (__sha(end) - __sha(base)) >> PAGE_SHIFT,
+			     SET_MEMORY_RW | SET_MEMORY_NX);
+#endif
 
 	__set_memory((unsigned long)_stext,
 		     (unsigned long)(_etext - _stext) >> PAGE_SHIFT,
