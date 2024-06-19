@@ -72,10 +72,6 @@ extern unsigned int zlib_dfltcc_support;
 #define ZLIB_DFLTCC_FULL_DEBUG		4
 
 extern unsigned long ident_map_size;
-extern unsigned long pgalloc_pos;
-extern unsigned long pgalloc_end;
-extern unsigned long pgalloc_low;
-extern unsigned long __amode31_base;
 
 /* The Write Back bit position in the physaddr is given by the SLPC PCI */
 extern unsigned long mio_wb_bit_mask;
@@ -139,11 +135,6 @@ static inline unsigned long kaslr_offset(void)
 	return __kaslr_offset;
 }
 
-struct initrd_data {
-	unsigned long start;
-	unsigned long size;
-};
-extern struct initrd_data initrd_data;
 
 struct oldmem_data {
 	unsigned long start;
