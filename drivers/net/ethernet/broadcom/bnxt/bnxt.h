@@ -2165,6 +2165,7 @@ struct bnxt {
 #define BNXT_RSS_CAP_RSS_TCAM			BIT(3)
 
 	u16			max_mtu;
+	u16			tso_max_segs;
 	u8			max_tc;
 	u8			max_lltc;	/* lossless TCs */
 	struct bnxt_queue_info	q_info[BNXT_MAX_QUEUE];
