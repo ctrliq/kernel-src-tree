@@ -5,6 +5,7 @@
  */
 #include <linux/hugetlb.h>
 #include <linux/proc_fs.h>
+#include <linux/vmalloc.h>
 #include <linux/mm.h>
 #include <asm/cacheflush.h>
 #include <asm/facility.h>
@@ -102,6 +103,14 @@ static int walk_pte_level(pmd_t *pmdp, unsigned long addr, unsigned long end,
 			new = set_pte_bit(new, __pgprot(_PAGE_NOEXEC));
 		else if (flags & SET_MEMORY_X)
 			new = clear_pte_bit(new, __pgprot(_PAGE_NOEXEC));
+		if (flags & SET_MEMORY_INV) {
+			new = set_pte_bit(new, __pgprot(_PAGE_INVALID));
+		} else if (flags & SET_MEMORY_DEF) {
+			new = __pte(pte_val(new) & PAGE_MASK);
+			new = set_pte_bit(new, PAGE_KERNEL);
+			if (!MACHINE_HAS_NX)
+				new = clear_pte_bit(new, __pgprot(_PAGE_NOEXEC));
+		}
 		pgt_set((unsigned long *)ptep, pte_val(new), addr, CRDTE_DTT_PAGE);
 		ptep++;
 		addr += PAGE_SIZE;
@@ -152,6 +161,14 @@ static void modify_pmd_page(pmd_t *pmdp, unsigned long addr,
 		new = set_pmd_bit(new, __pgprot(_SEGMENT_ENTRY_NOEXEC));
 	else if (flags & SET_MEMORY_X)
 		new = clear_pmd_bit(new, __pgprot(_SEGMENT_ENTRY_NOEXEC));
+	if (flags & SET_MEMORY_INV) {
+		new = set_pmd_bit(new, __pgprot(_SEGMENT_ENTRY_INVALID));
+	} else if (flags & SET_MEMORY_DEF) {
+		new = __pmd(pmd_val(new) & PMD_MASK);
+		new = set_pmd_bit(new, SEGMENT_KERNEL);
+		if (!MACHINE_HAS_NX)
+			new = clear_pmd_bit(new, __pgprot(_SEGMENT_ENTRY_NOEXEC));
+	}
 	pgt_set((unsigned long *)pmdp, pmd_val(new), addr, CRDTE_DTT_SEGMENT);
 }
 
@@ -233,6 +250,14 @@ static void modify_pud_page(pud_t *pudp, unsigned long addr,
 		new = set_pud_bit(new, __pgprot(_REGION_ENTRY_NOEXEC));
 	else if (flags & SET_MEMORY_X)
 		new = clear_pud_bit(new, __pgprot(_REGION_ENTRY_NOEXEC));
+	if (flags & SET_MEMORY_INV) {
+		new = set_pud_bit(new, __pgprot(_REGION_ENTRY_INVALID));
+	} else if (flags & SET_MEMORY_DEF) {
+		new = __pud(pud_val(new) & PUD_MASK);
+		new = set_pud_bit(new, REGION3_KERNEL);
+		if (!MACHINE_HAS_NX)
+			new = clear_pud_bit(new, __pgprot(_REGION_ENTRY_NOEXEC));
+	}
 	pgt_set((unsigned long *)pudp, pud_val(new), addr, CRDTE_DTT_REGION3);
 }
 
@@ -324,6 +349,16 @@ int __set_memory(unsigned long addr, int numpages, unsigned long flags)
 		return 0;
 	addr &= PAGE_MASK;
 	return change_page_attr(addr, addr + numpages * PAGE_SIZE, flags);
+}
+
+int set_direct_map_invalid_noflush(struct page *page)
+{
+	return __set_memory((unsigned long)page_to_virt(page), 1, SET_MEMORY_INV);
+}
+
+int set_direct_map_default_noflush(struct page *page)
+{
+	return __set_memory((unsigned long)page_to_virt(page), 1, SET_MEMORY_DEF);
 }
 
 #if defined(CONFIG_DEBUG_PAGEALLOC) || defined(CONFIG_KFENCE)
