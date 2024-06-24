@@ -559,6 +559,7 @@ struct dev_msi_info {
  *		and optionall (if the coherent mask is large enough) also
  *		for dma allocations.  This flag is managed by the dma ops
  *		instance from ->dma_supported.
+ * @dma_need_sync: The device needs performing DMA sync operations.
  *
  * At the lowest level, every device in a Linux system is represented by an
  * instance of struct device. The device structure contains the information
@@ -670,6 +671,9 @@ struct device {
 #endif
 #ifdef CONFIG_DMA_OPS_BYPASS
 	bool			dma_ops_bypass : 1;
+#endif
+#ifdef CONFIG_DMA_NEED_SYNC
+	bool			dma_need_sync:1;
 #endif
 };
 
