@@ -215,6 +215,7 @@ struct scsi_device {
 
 	RH_KABI_FILL_HOLE(unsigned use_16_for_sync:1)	/* Use sync (16) over sync (10) */
 	RH_KABI_FILL_HOLE(unsigned no_vpd_size:1)	/* No VPD size reported in header */
+	RH_KABI_FILL_HOLE(unsigned no_start_on_resume:1)/* Do not issue START_STOP_UNIT on resume */
 
 	RH_KABI_FILL_HOLE(unsigned cdl_supported:1)	/* Command duration limits supported */
 	RH_KABI_FILL_HOLE(unsigned cdl_enable:1)	/* Enable/disable Command duration limits */
