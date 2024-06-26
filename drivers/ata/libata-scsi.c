@@ -1063,7 +1063,6 @@ EXPORT_SYMBOL_GPL(ata_scsi_dma_need_drain);
 int ata_scsi_dev_config(struct scsi_device *sdev, struct queue_limits *lim,
 		struct ata_device *dev)
 {
-	struct request_queue *q = sdev->request_queue;
 	int depth = 1;
 
 	if (!ata_id_has_unload(dev->id))
@@ -1077,7 +1076,7 @@ int ata_scsi_dev_config(struct scsi_device *sdev, struct queue_limits *lim,
 		sdev->sector_size = ATA_SECT_SIZE;
 
 		/* set DMA padding */
-		blk_queue_update_dma_pad(q, ATA_DMA_PAD_SZ - 1);
+		lim->dma_pad_mask = ATA_DMA_PAD_SZ - 1;
 
 		/* make room for appending the drain */
 		lim->max_segments--;
