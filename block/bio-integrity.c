@@ -248,6 +248,7 @@ static int bio_integrity_copy_user(struct bio *bio, struct bio_vec *bvec,
 
 	bip->bip_flags |= BIP_COPY_USER;
 	bip->bip_iter.bi_sector = seed;
+	bip->bip_vcnt = nr_vecs;
 	return 0;
 free_bip:
 	bio_integrity_free(bio);
@@ -268,6 +269,7 @@ static int bio_integrity_init_user(struct bio *bio, struct bio_vec *bvec,
 	memcpy(bip->bip_vec, bvec, nr_vecs * sizeof(*bvec));
 	bip->bip_iter.bi_sector = seed;
 	bip->bip_iter.bi_size = len;
+	bip->bip_vcnt = nr_vecs;
 	return 0;
 }
 
