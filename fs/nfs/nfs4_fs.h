@@ -208,6 +208,7 @@ struct nfs4_exception {
 	struct inode *inode;
 	nfs4_stateid *stateid;
 	long timeout;
+	unsigned short retrans;
 	unsigned char task_is_privileged : 1;
 	unsigned char delay : 1,
 		      recovering : 1,
@@ -545,6 +546,7 @@ extern unsigned short max_session_slots;
 extern unsigned short max_session_cb_slots;
 extern unsigned short send_implementation_id;
 extern bool recover_lost_locks;
+extern short nfs_delay_retrans;
 
 #define NFS4_CLIENT_ID_UNIQ_LEN		(64)
 extern char nfs4_client_id_uniquifier[NFS4_CLIENT_ID_UNIQ_LEN];
