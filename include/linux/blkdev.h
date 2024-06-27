@@ -1218,12 +1218,7 @@ bdev_max_zone_append_sectors(struct block_device *bdev)
 
 static inline unsigned queue_logical_block_size(const struct request_queue *q)
 {
-	int retval = 512;
-
-	if (q && q->limits.logical_block_size)
-		retval = q->limits.logical_block_size;
-
-	return retval;
+	return q->limits.logical_block_size;
 }
 
 static inline unsigned int bdev_logical_block_size(struct block_device *bdev)
