@@ -1565,6 +1565,19 @@ xfs_fs_fill_super(
 #endif
 	}
 
+	/* ASCII case insensitivity is undergoing deprecation. */
+	if (xfs_has_asciici(mp)) {
+#ifdef CONFIG_XFS_SUPPORT_ASCII_CI
+		xfs_warn_once(mp,
+	"Deprecated ASCII case-insensitivity feature (ascii-ci=1) will not be supported in RHEL10 forward.");
+#else
+		xfs_warn(mp,
+	"Deprecated ASCII case-insensitivity feature (ascii-ci=1) not supported by kernel.");
+		error = -EINVAL;
+		goto out_free_sb;
+#endif
+	}
+
 	/* Filesystem claims it needs repair, so refuse the mount. */
 	if (xfs_has_needsrepair(mp)) {
 		xfs_warn(mp, "Filesystem needs repair.  Please run xfs_repair.");
@@ -1686,10 +1699,6 @@ xfs_fs_fill_super(
 		error = -EINVAL;
 		goto out_filestream_unmount;
 	}
-
-	if (xfs_has_large_extent_counts(mp))
-		xfs_warn(mp,
-	"EXPERIMENTAL Large extent counts feature in use. Use at your own risk!");
 
 	error = xfs_mountfs(mp);
 	if (error)
