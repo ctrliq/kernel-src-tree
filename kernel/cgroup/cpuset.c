@@ -87,7 +87,7 @@ static const char * const perr_strings[] = {
 	[PERR_NOTEXCL]   = "Cpu list in cpuset.cpus not exclusive",
 	[PERR_NOCPUS]    = "Parent unable to distribute cpu downstream",
 	[PERR_HOTPLUG]   = "No cpu available due to hotplug",
-	[PERR_CPUSEMPTY] = "cpuset.cpus is empty",
+	[PERR_CPUSEMPTY] = "cpuset.cpus and cpuset.cpus.exclusive are empty",
 	[PERR_HKEEPING]  = "partition config conflicts with housekeeping setup",
 };
 
@@ -127,19 +127,28 @@ struct cpuset {
 	/*
 	 * Exclusive CPUs dedicated to current cgroup (default hierarchy only)
 	 *
-	 * This exclusive CPUs must be a subset of cpus_allowed. A parent
-	 * cgroup can only grant exclusive CPUs to one of its children.
+	 * The effective_cpus of a valid partition root comes solely from its
+	 * effective_xcpus and some of the effective_xcpus may be distributed
+	 * to sub-partitions below & hence excluded from its effective_cpus.
+	 * For a valid partition root, its effective_cpus have no relationship
+	 * with cpus_allowed unless its exclusive_cpus isn't set.
 	 *
-	 * When the cgroup becomes a valid partition root, effective_xcpus
-	 * defaults to cpus_allowed if not set. The effective_cpus of a valid
-	 * partition root comes solely from its effective_xcpus and some of the
-	 * effective_xcpus may be distributed to sub-partitions below & hence
-	 * excluded from its effective_cpus.
+	 * This value will only be set if either exclusive_cpus is set or
+	 * when this cpuset becomes a local partition root.
 	 */
 	cpumask_var_t effective_xcpus;
 
 	/*
 	 * Exclusive CPUs as requested by the user (default hierarchy only)
+	 *
+	 * Its value is independent of cpus_allowed and designates the set of
+	 * CPUs that can be granted to the current cpuset or its children when
+	 * it becomes a valid partition root. The effective set of exclusive
+	 * CPUs granted (effective_xcpus) depends on whether those exclusive
+	 * CPUs are passed down by its ancestors and not yet taken up by
+	 * another sibling partition root along the way.
+	 *
+	 * If its value isn't set, it defaults to cpus_allowed.
 	 */
 	cpumask_var_t exclusive_cpus;
 
@@ -169,7 +178,7 @@ struct cpuset {
 	/* for custom sched domain */
 	int relax_domain_level;
 
-	/* number of valid sub-partitions */
+	/* number of valid local child partitions */
 	int nr_subparts;
 
 	/* partition root state */
@@ -202,6 +211,14 @@ struct cpuset {
 };
 
 /*
+ * Legacy hierarchy call to cgroup_transfer_tasks() is handled asynchrously
+ */
+struct cpuset_remove_tasks_struct {
+	struct work_struct work;
+	struct cpuset *cs;
+};
+
+/*
  * Exclusive CPUs distributed out to sub-partitions of top_cpuset
  */
 static cpumask_var_t	subpartitions_cpus;
@@ -222,6 +239,17 @@ static struct list_head remote_children;
  *   2 - partition root without load balancing (isolated)
  *  -1 - invalid partition root
  *  -2 - invalid isolated partition root
+ *
+ *  There are 2 types of partitions - local or remote. Local partitions are
+ *  those whose parents are partition root themselves. Setting of
+ *  cpuset.cpus.exclusive are optional in setting up local partitions.
+ *  Remote partitions are those whose parents are not partition roots. Passing
+ *  down exclusive CPUs by setting cpuset.cpus.exclusive along its ancestor
+ *  nodes are mandatory in creating a remote partition.
+ *
+ *  For simplicity, a local partition can be created under a local or remote
+ *  partition but a remote partition cannot have any partition root in its
+ *  ancestor chain except the cgroup root.
  */
 #define PRS_MEMBER		0
 #define PRS_ROOT		1
@@ -449,12 +477,6 @@ static DEFINE_SPINLOCK(callback_lock);
 
 static struct workqueue_struct *cpuset_migrate_mm_wq;
 
-/*
- * CPU / memory hotplug is handled asynchronously.
- */
-static void cpuset_hotplug_workfn(struct work_struct *work);
-static DECLARE_WORK(cpuset_hotplug_work, cpuset_hotplug_workfn);
-
 static DECLARE_WAIT_QUEUE_HEAD(cpuset_attach_wq);
 
 static inline void check_insane_mems_config(nodemask_t *nodes)
@@ -540,22 +562,10 @@ static void guarantee_online_cpus(struct task_struct *tsk,
 	rcu_read_lock();
 	cs = task_cs(tsk);
 
-	while (!cpumask_intersects(cs->effective_cpus, pmask)) {
+	while (!cpumask_intersects(cs->effective_cpus, pmask))
 		cs = parent_cs(cs);
-		if (unlikely(!cs)) {
-			/*
-			 * The top cpuset doesn't have any online cpu as a
-			 * consequence of a race between cpuset_hotplug_work
-			 * and cpu hotplug notifier.  But we know the top
-			 * cpuset's effective_cpus is on its way to be
-			 * identical to cpu_online_mask.
-			 */
-			goto out_unlock;
-		}
-	}
-	cpumask_and(pmask, pmask, cs->effective_cpus);
 
-out_unlock:
+	cpumask_and(pmask, pmask, cs->effective_cpus);
 	rcu_read_unlock();
 }
 
@@ -718,6 +728,19 @@ static inline void free_cpuset(struct cpuset *cs)
 	kfree(cs);
 }
 
+/* Return user specified exclusive CPUs */
+static inline struct cpumask *user_xcpus(struct cpuset *cs)
+{
+	return cpumask_empty(cs->exclusive_cpus) ? cs->cpus_allowed
+						 : cs->exclusive_cpus;
+}
+
+static inline bool xcpus_empty(struct cpuset *cs)
+{
+	return cpumask_empty(cs->cpus_allowed) &&
+	       cpumask_empty(cs->exclusive_cpus);
+}
+
 static inline struct cpumask *fetch_xcpus(struct cpuset *cs)
 {
 	return !cpumask_empty(cs->exclusive_cpus) ? cs->exclusive_cpus :
@@ -834,17 +857,41 @@ static int validate_change(struct cpuset *cur, struct cpuset *trial)
 
 	/*
 	 * If either I or some sibling (!= me) is exclusive, we can't
-	 * overlap
+	 * overlap. exclusive_cpus cannot overlap with each other if set.
 	 */
 	ret = -EINVAL;
 	cpuset_for_each_child(c, css, par) {
-		if ((is_cpu_exclusive(trial) || is_cpu_exclusive(c)) &&
-		    c != cur) {
+		bool txset, cxset;	/* Are exclusive_cpus set? */
+
+		if (c == cur)
+			continue;
+
+		txset = !cpumask_empty(trial->exclusive_cpus);
+		cxset = !cpumask_empty(c->exclusive_cpus);
+		if (is_cpu_exclusive(trial) || is_cpu_exclusive(c) ||
+		    (txset && cxset)) {
 			if (!cpusets_are_exclusive(trial, c))
+				goto out;
+		} else if (txset || cxset) {
+			struct cpumask *xcpus, *acpus;
+
+			/*
+			 * When just one of the exclusive_cpus's is set,
+			 * cpus_allowed of the other cpuset, if set, cannot be
+			 * a subset of it or none of those CPUs will be
+			 * available if these exclusive CPUs are activated.
+			 */
+			if (txset) {
+				xcpus = trial->exclusive_cpus;
+				acpus = c->cpus_allowed;
+			} else {
+				xcpus = c->exclusive_cpus;
+				acpus = trial->cpus_allowed;
+			}
+			if (!cpumask_empty(acpus) && cpumask_subset(acpus, xcpus))
 				goto out;
 		}
 		if ((is_mem_exclusive(trial) || is_mem_exclusive(c)) &&
-		    c != cur &&
 		    nodes_intersects(trial->mems_allowed, c->mems_allowed))
 			goto out;
 	}
@@ -966,13 +1013,15 @@ static int generate_sched_domains(cpumask_var_t **domains,
 	int nslot;		/* next empty doms[] struct cpumask slot */
 	struct cgroup_subsys_state *pos_css;
 	bool root_load_balance = is_sched_load_balance(&top_cpuset);
+	bool cgrpv2 = cgroup_subsys_on_dfl(cpuset_cgrp_subsys);
 
 	doms = NULL;
 	dattr = NULL;
 	csa = NULL;
 
 	/* Special case for the 99% of systems with one, full, sched domain */
-	if (root_load_balance && !top_cpuset.nr_subparts) {
+	if (root_load_balance && cpumask_empty(subpartitions_cpus)) {
+single_root_domain:
 		ndoms = 1;
 		doms = alloc_sched_domains(ndoms);
 		if (!doms)
@@ -1000,16 +1049,18 @@ static int generate_sched_domains(cpumask_var_t **domains,
 	cpuset_for_each_descendant_pre(cp, pos_css, &top_cpuset) {
 		if (cp == &top_cpuset)
 			continue;
+
+		if (cgrpv2)
+			goto v2;
+
 		/*
+		 * v1:
 		 * Continue traversing beyond @cp iff @cp has some CPUs and
 		 * isn't load balancing.  The former is obvious.  The
 		 * latter: All child cpusets contain a subset of the
 		 * parent's cpus, so just skip them, and then we call
 		 * update_domain_attr_tree() to calc relax_domain_level of
 		 * the corresponding sched domain.
-		 *
-		 * If root is load-balancing, we can skip @cp if it
-		 * is a subset of the root's effective_cpus.
 		 */
 		if (!cpumask_empty(cp->cpus_allowed) &&
 		    !(is_sched_load_balance(cp) &&
@@ -1017,19 +1068,38 @@ static int generate_sched_domains(cpumask_var_t **domains,
 					 housekeeping_cpumask(HK_TYPE_DOMAIN))))
 			continue;
 
-		if (root_load_balance &&
-		    cpumask_subset(cp->cpus_allowed, top_cpuset.effective_cpus))
-			continue;
-
 		if (is_sched_load_balance(cp) &&
 		    !cpumask_empty(cp->effective_cpus))
 			csa[csn++] = cp;
 
-		/* skip @cp's subtree if not a partition root */
-		if (!is_partition_valid(cp))
+		/* skip @cp's subtree */
+		pos_css = css_rightmost_descendant(pos_css);
+		continue;
+
+v2:
+		/*
+		 * Only valid partition roots that are not isolated and with
+		 * non-empty effective_cpus will be saved into csn[].
+		 */
+		if ((cp->partition_root_state == PRS_ROOT) &&
+		    !cpumask_empty(cp->effective_cpus))
+			csa[csn++] = cp;
+
+		/*
+		 * Skip @cp's subtree if not a partition root and has no
+		 * exclusive CPUs to be granted to child cpusets.
+		 */
+		if (!is_partition_valid(cp) && cpumask_empty(cp->exclusive_cpus))
 			pos_css = css_rightmost_descendant(pos_css);
 	}
 	rcu_read_unlock();
+
+	/*
+	 * If there are only isolated partitions underneath the cgroup root,
+	 * we can optimize out unneeded sched domains scanning.
+	 */
+	if (root_load_balance && (csn == 1))
+		goto single_root_domain;
 
 	for (i = 0; i < csn; i++)
 		csa[i]->pn = i;
@@ -1072,6 +1142,20 @@ restart:
 	 */
 	dattr = kmalloc_array(ndoms, sizeof(struct sched_domain_attr),
 			      GFP_KERNEL);
+
+	/*
+	 * Cgroup v2 doesn't support domain attributes, just set all of them
+	 * to SD_ATTR_INIT. Also non-isolating partition root CPUs are a
+	 * subset of HK_TYPE_DOMAIN housekeeping CPUs.
+	 */
+	if (cgrpv2) {
+		for (i = 0; i < ndoms; i++) {
+			cpumask_copy(doms[i], csa[i]->effective_cpus);
+			if (dattr)
+				dattr[i] = SD_ATTR_INIT;
+		}
+		goto done;
+	}
 
 	for (nslot = 0, i = 0; i < csn; i++) {
 		struct cpuset *a = csa[i];
@@ -1217,7 +1301,7 @@ static void rebuild_sched_domains_locked(void)
 	/*
 	 * If we have raced with CPU hotplug, return early to avoid
 	 * passing doms with offlined cpu to partition_sched_domains().
-	 * Anyways, cpuset_hotplug_workfn() will rebuild sched domains.
+	 * Anyways, cpuset_handle_hotplug() will rebuild sched domains.
 	 *
 	 * With no CPUs in any subpartitions, top_cpuset's effective CPUs
 	 * should be the same as the active CPUs, so checking only top_cpuset
@@ -1232,7 +1316,7 @@ static void rebuild_sched_domains_locked(void)
 	 * root should be only a subset of the active CPUs.  Since a CPU in any
 	 * partition root could be offlined, all must be checked.
 	 */
-	if (top_cpuset.nr_subparts) {
+	if (!cpumask_empty(subpartitions_cpus)) {
 		rcu_read_lock();
 		cpuset_for_each_descendant_pre(cs, pos_css, &top_cpuset) {
 			if (!is_partition_valid(cs)) {
@@ -1260,12 +1344,17 @@ static void rebuild_sched_domains_locked(void)
 }
 #endif /* CONFIG_SMP */
 
-void rebuild_sched_domains(void)
+static void rebuild_sched_domains_cpuslocked(void)
 {
-	cpus_read_lock();
 	mutex_lock(&cpuset_mutex);
 	rebuild_sched_domains_locked();
 	mutex_unlock(&cpuset_mutex);
+}
+
+void rebuild_sched_domains(void)
+{
+	cpus_read_lock();
+	rebuild_sched_domains_cpuslocked();
 	cpus_read_unlock();
 }
 
@@ -1342,7 +1431,7 @@ static void update_sibling_cpumasks(struct cpuset *parent, struct cpuset *cs,
  */
 static int update_partition_exclusive(struct cpuset *cs, int new_prs)
 {
-	bool exclusive = (new_prs > 0);
+	bool exclusive = (new_prs > PRS_MEMBER);
 
 	if (exclusive && !is_cpu_exclusive(cs)) {
 		if (update_flag(CS_CPU_EXCLUSIVE, cs, 1))
@@ -1536,7 +1625,7 @@ EXPORT_SYMBOL_GPL(cpuset_cpu_is_isolated);
  * Return: true if xcpus is not empty, false otherwise.
  *
  * Starting with exclusive_cpus (cpus_allowed if exclusive_cpus is not set),
- * it must be a subset of cpus_allowed and parent's effective_xcpus.
+ * it must be a subset of parent's effective_xcpus.
  */
 static bool compute_effective_exclusive_cpumask(struct cpuset *cs,
 						struct cpumask *xcpus)
@@ -1546,12 +1635,7 @@ static bool compute_effective_exclusive_cpumask(struct cpuset *cs,
 	if (!xcpus)
 		xcpus = cs->effective_xcpus;
 
-	if (!cpumask_empty(cs->exclusive_cpus))
-		cpumask_and(xcpus, cs->exclusive_cpus, cs->cpus_allowed);
-	else
-		cpumask_copy(xcpus, cs->cpus_allowed);
-
-	return cpumask_and(xcpus, xcpus, parent->effective_xcpus);
+	return cpumask_and(xcpus, user_xcpus(cs), parent->effective_xcpus);
 }
 
 static inline bool is_remote_partition(struct cpuset *cs)
@@ -1830,8 +1914,7 @@ static int update_parent_effective_cpumask(struct cpuset *cs, int cmd,
 	 */
 	adding = deleting = false;
 	old_prs = new_prs = cs->partition_root_state;
-	xcpus = !cpumask_empty(cs->exclusive_cpus)
-		? cs->effective_xcpus : cs->cpus_allowed;
+	xcpus = user_xcpus(cs);
 
 	if (cmd == partcmd_invalidate) {
 		if (is_prs_invalid(old_prs))
@@ -1859,7 +1942,7 @@ static int update_parent_effective_cpumask(struct cpuset *cs, int cmd,
 		return is_partition_invalid(parent)
 		       ? PERR_INVPARENT : PERR_NOTPART;
 	}
-	if (!newmask && cpumask_empty(cs->cpus_allowed))
+	if (!newmask && xcpus_empty(cs))
 		return PERR_CPUSEMPTY;
 
 	nocpu = tasks_nocpu_error(parent, cs, xcpus);
@@ -2079,14 +2162,11 @@ write_error:
 
 	/*
 	 * For partcmd_update without newmask, it is being called from
-	 * cpuset_hotplug_workfn() where cpus_read_lock() wasn't taken.
-	 * Update the load balance flag and scheduling domain if
-	 * cpus_read_trylock() is successful.
+	 * cpuset_handle_hotplug(). Update the load balance flag and
+	 * scheduling domain accordingly.
 	 */
-	if ((cmd == partcmd_update) && !newmask && cpus_read_trylock()) {
+	if ((cmd == partcmd_update) && !newmask)
 		update_partition_sd_lb(cs, old_prs);
-		cpus_read_unlock();
-	}
 
 	notify_partition_change(cs, old_prs);
 	return 0;
@@ -2590,8 +2670,6 @@ static int update_exclusive_cpumask(struct cpuset *cs, struct cpuset *trialcs,
 		retval = cpulist_parse(buf, trialcs->exclusive_cpus);
 		if (retval < 0)
 			return retval;
-		if (!is_cpu_exclusive(cs))
-			set_bit(CS_CPU_EXCLUSIVE, &trialcs->flags);
 	}
 
 	/* Nothing to do if the CPUs didn't change */
@@ -3078,9 +3156,9 @@ static int update_prstate(struct cpuset *cs, int new_prs)
 				       ? partcmd_enable : partcmd_enablei;
 
 		/*
-		 * cpus_allowed cannot be empty.
+		 * cpus_allowed and exclusive_cpus cannot be both empty.
 		 */
-		if (cpumask_empty(cs->cpus_allowed)) {
+		if (xcpus_empty(cs)) {
 			err = PERR_CPUSEMPTY;
 			goto out;
 		}
@@ -3599,8 +3677,8 @@ static ssize_t cpuset_write_resmask(struct kernfs_open_file *of,
 	 * proceeding, so that we don't end up keep removing tasks added
 	 * after execution capability is restored.
 	 *
-	 * cpuset_hotplug_work calls back into cgroup core via
-	 * cgroup_transfer_tasks() and waiting for it from a cgroupfs
+	 * cpuset_handle_hotplug may call back into cgroup core asynchronously
+	 * via cgroup_transfer_tasks() and waiting for it from a cgroupfs
 	 * operation like this one can lead to a deadlock through kernfs
 	 * active_ref protection.  Let's break the protection.  Losing the
 	 * protection is okay as we check whether @cs is online after
@@ -3609,7 +3687,6 @@ static ssize_t cpuset_write_resmask(struct kernfs_open_file *of,
 	 */
 	css_get(&cs->css);
 	kernfs_break_active_protection(of->kn);
-	flush_work(&cpuset_hotplug_work);
 
 	cpus_read_lock();
 	mutex_lock(&cpuset_mutex);
@@ -4353,6 +4430,16 @@ static void remove_tasks_in_empty_cpuset(struct cpuset *cs)
 	}
 }
 
+static void cpuset_migrate_tasks_workfn(struct work_struct *work)
+{
+	struct cpuset_remove_tasks_struct *s;
+
+	s = container_of(work, struct cpuset_remove_tasks_struct, work);
+	remove_tasks_in_empty_cpuset(s->cs);
+	css_put(&s->cs->css);
+	kfree(s);
+}
+
 static void
 hotplug_update_tasks_legacy(struct cpuset *cs,
 			    struct cpumask *new_cpus, nodemask_t *new_mems,
@@ -4382,12 +4469,21 @@ hotplug_update_tasks_legacy(struct cpuset *cs,
 	/*
 	 * Move tasks to the nearest ancestor with execution resources,
 	 * This is full cgroup operation which will also call back into
-	 * cpuset. Should be done outside any lock.
+	 * cpuset. Execute it asynchronously using workqueue.
 	 */
-	if (is_empty) {
-		mutex_unlock(&cpuset_mutex);
-		remove_tasks_in_empty_cpuset(cs);
-		mutex_lock(&cpuset_mutex);
+	if (is_empty && cs->css.cgroup->nr_populated_csets &&
+	    css_tryget_online(&cs->css)) {
+		struct cpuset_remove_tasks_struct *s;
+
+		s = kzalloc(sizeof(*s), GFP_KERNEL);
+		if (WARN_ON_ONCE(!s)) {
+			css_put(&cs->css);
+			return;
+		}
+
+		s->cs = cs;
+		INIT_WORK(&s->work, cpuset_migrate_tasks_workfn);
+		schedule_work(&s->work);
 	}
 }
 
@@ -4418,30 +4514,6 @@ static bool force_rebuild;
 void cpuset_force_rebuild(void)
 {
 	force_rebuild = true;
-}
-
-/*
- * Attempt to acquire a cpus_read_lock while a hotplug operation may be in
- * progress.
- * Return: true if successful, false otherwise
- *
- * To avoid circular lock dependency between cpuset_mutex and cpus_read_lock,
- * cpus_read_trylock() is used here to acquire the lock.
- */
-static bool cpuset_hotplug_cpus_read_trylock(void)
-{
-	int retries = 0;
-
-	while (!cpus_read_trylock()) {
-		/*
-		 * CPU hotplug still in progress. Retry 5 times
-		 * with a 10ms wait before bailing out.
-		 */
-		if (++retries > 5)
-			return false;
-		msleep(10);
-	}
-	return true;
 }
 
 /**
@@ -4492,13 +4564,11 @@ retry:
 		compute_partition_effective_cpumask(cs, &new_cpus);
 
 	if (remote && cpumask_empty(&new_cpus) &&
-	    partition_is_populated(cs, NULL) &&
-	    cpuset_hotplug_cpus_read_trylock()) {
+	    partition_is_populated(cs, NULL)) {
 		remote_partition_disable(cs, tmp);
 		compute_effective_cpumask(&new_cpus, cs, parent);
 		remote = false;
 		cpuset_force_rebuild();
-		cpus_read_unlock();
 	}
 
 	/*
@@ -4518,18 +4588,8 @@ retry:
 	else if (is_partition_valid(parent) && is_partition_invalid(cs))
 		partcmd = partcmd_update;
 
-	/*
-	 * cpus_read_lock needs to be held before calling
-	 * update_parent_effective_cpumask(). To avoid circular lock
-	 * dependency between cpuset_mutex and cpus_read_lock,
-	 * cpus_read_trylock() is used here to acquire the lock.
-	 */
 	if (partcmd >= 0) {
-		if (!cpuset_hotplug_cpus_read_trylock())
-			goto update_tasks;
-
 		update_parent_effective_cpumask(cs, partcmd, NULL, tmp);
-		cpus_read_unlock();
 		if ((partcmd == partcmd_invalidate) || is_partition_valid(cs)) {
 			compute_partition_effective_cpumask(cs, &new_cpus);
 			cpuset_force_rebuild();
@@ -4557,8 +4617,7 @@ unlock:
 }
 
 /**
- * cpuset_hotplug_workfn - handle CPU/memory hotunplug for a cpuset
- * @work: unused
+ * cpuset_handle_hotplug - handle CPU/memory hot{,un}plug for a cpuset
  *
  * This function is called after either CPU or memory configuration has
  * changed and updates cpuset accordingly.  The top_cpuset is always
@@ -4572,8 +4631,10 @@ unlock:
  *
  * Note that CPU offlining during suspend is ignored.  We don't modify
  * cpusets across suspend/resume cycles at all.
+ *
+ * CPU / memory hotplug is handled synchronously.
  */
-static void cpuset_hotplug_workfn(struct work_struct *work)
+static void cpuset_handle_hotplug(void)
 {
 	static cpumask_t new_cpus;
 	static nodemask_t new_mems;
@@ -4584,6 +4645,7 @@ static void cpuset_hotplug_workfn(struct work_struct *work)
 	if (on_dfl && !alloc_cpumasks(NULL, &tmp))
 		ptmp = &tmp;
 
+	lockdep_assert_cpus_held();
 	mutex_lock(&cpuset_mutex);
 
 	/* fetch the available cpus/mems and find out which changed how */
@@ -4603,7 +4665,7 @@ static void cpuset_hotplug_workfn(struct work_struct *work)
 	 * In the rare case that hotplug removes all the cpus in
 	 * subpartitions_cpus, we assumed that cpus are updated.
 	 */
-	if (!cpus_updated && top_cpuset.nr_subparts)
+	if (!cpus_updated && !cpumask_empty(subpartitions_cpus))
 		cpus_updated = true;
 
 	/* For v1, synchronize cpus_allowed to cpu_active_mask */
@@ -4665,7 +4727,7 @@ static void cpuset_hotplug_workfn(struct work_struct *work)
 	/* rebuild sched domains if cpus_allowed has changed */
 	if (cpus_updated || force_rebuild) {
 		force_rebuild = false;
-		rebuild_sched_domains();
+		rebuild_sched_domains_cpuslocked();
 	}
 
 	free_cpumasks(NULL, ptmp);
@@ -4678,12 +4740,7 @@ void cpuset_update_active_cpus(void)
 	 * inside cgroup synchronization.  Bounce actual hotplug processing
 	 * to a work item to avoid reverse locking order.
 	 */
-	schedule_work(&cpuset_hotplug_work);
-}
-
-void cpuset_wait_for_hotplug(void)
-{
-	flush_work(&cpuset_hotplug_work);
+	cpuset_handle_hotplug();
 }
 
 /*
@@ -4694,7 +4751,7 @@ void cpuset_wait_for_hotplug(void)
 static int cpuset_track_online_nodes(struct notifier_block *self,
 				unsigned long action, void *arg)
 {
-	schedule_work(&cpuset_hotplug_work);
+	cpuset_handle_hotplug();
 	return NOTIFY_OK;
 }
 

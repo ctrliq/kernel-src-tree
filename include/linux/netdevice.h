@@ -1608,6 +1608,8 @@ struct xdp_metadata_ops {
 	int	(*xmo_rx_timestamp)(const struct xdp_md *ctx, u64 *timestamp);
 	int	(*xmo_rx_hash)(const struct xdp_md *ctx, u32 *hash,
 			       enum xdp_rss_hash_type *rss_type);
+	int	(*xmo_rx_vlan_tag)(const struct xdp_md *ctx, __be16 *vlan_proto,
+				   u16 *vlan_tci);
 };
 
 /**
@@ -5069,6 +5071,15 @@ static inline bool netif_is_l3_master(const struct net_device *dev)
 static inline bool netif_is_l3_slave(const struct net_device *dev)
 {
 	return dev->priv_flags & IFF_L3MDEV_SLAVE;
+}
+
+static inline int dev_sdif(const struct net_device *dev)
+{
+#ifdef CONFIG_NET_L3_MASTER_DEV
+	if (netif_is_l3_slave(dev))
+		return dev->ifindex;
+#endif
+	return 0;
 }
 
 static inline bool netif_is_bridge_master(const struct net_device *dev)
