@@ -242,7 +242,7 @@ enum {
 	AHCI_HFLAG_NO_WRITE_TO_RO	= BIT(24), /* don't write to read
 						      only registers */
 	AHCI_HFLAG_USE_LPM_POLICY	= BIT(25), /* chipset that should use
-						      SATA_LPM_POLICY
+						      SATA_MOBILE_LPM_POLICY
 						      as default lpm_policy */
 	AHCI_HFLAG_SUSPEND_PHYS		= BIT(26), /* handle PHYs during
 						      suspend/resume */
