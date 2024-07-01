@@ -239,6 +239,12 @@ struct scsi_device {
 	 */
 	RH_KABI_FILL_HOLE(unsigned manage_shutdown:1)
 
+	/*
+	 * If set and if the device is runtime suspended, ask the high-level
+	 * device driver (sd) to force a runtime resume of the device.
+	 */
+	RH_KABI_FILL_HOLE(unsigned force_runtime_start_on_system_start:1)
+
 	unsigned int queue_stopped;	/* request queue is quiesced */
 	bool offline_already;		/* Device offline message logged */
 
