@@ -315,15 +315,6 @@ __mock_domain_alloc_nested(struct mock_iommu_domain *mock_parent,
 	return &mock_nested->domain;
 }
 
-static struct iommu_domain *mock_domain_alloc(unsigned int iommu_domain_type)
-{
-	if (iommu_domain_type == IOMMU_DOMAIN_BLOCKED)
-		return &mock_blocking_domain;
-	if (iommu_domain_type == IOMMU_DOMAIN_UNMANAGED)
-		return mock_domain_alloc_paging(NULL);
-	return NULL;
-}
-
 static struct iommu_domain *
 mock_domain_alloc_user(struct device *dev, u32 flags,
 		       struct iommu_domain *parent,
