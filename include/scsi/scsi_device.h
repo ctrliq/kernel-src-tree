@@ -158,25 +158,6 @@ struct scsi_device {
 				 * core. */
 	unsigned int eh_timeout; /* Error handling timeout */
 
-	/*
-	 * If true, let the high-level device driver (sd) manage the device
-	 * power state for system suspend/resume (suspend to RAM and
-	 * hibernation) operations.
-	 */
-	bool manage_system_start_stop;
-
-	/*
-	 * If true, let the high-level device driver (sd) manage the device
-	 * power state for runtime device suspand and resume operations.
-	 */
-	bool manage_runtime_start_stop;
-
-	/*
-	 * If true, let the high-level device driver (sd) manage the device
-	 * power state for system shutdown (power off) operations.
-	 */
-	bool manage_shutdown;
-
 	unsigned removable:1;
 	unsigned changed:1;	/* Data invalid due to media change */
 	unsigned busy:1;	/* Used to prevent races */
@@ -238,6 +219,25 @@ struct scsi_device {
 
 	RH_KABI_FILL_HOLE(unsigned cdl_supported:1)	/* Command duration limits supported */
 	RH_KABI_FILL_HOLE(unsigned cdl_enable:1)	/* Enable/disable Command duration limits */
+
+	/*
+	 * If true, let the high-level device driver (sd) manage the device
+	 * power state for system suspend/resume (suspend to RAM and
+	 * hibernation) operations.
+	 */
+	RH_KABI_FILL_HOLE(unsigned manage_system_start_stop:1)
+
+	/*
+	 * If true, let the high-level device driver (sd) manage the device
+	 * power state for runtime device suspand and resume operations.
+	 */
+	RH_KABI_FILL_HOLE(unsigned manage_runtime_start_stop:1)
+
+	/*
+	 * If true, let the high-level device driver (sd) manage the device
+	 * power state for system shutdown (power off) operations.
+	 */
+	RH_KABI_FILL_HOLE(unsigned manage_shutdown:1)
 
 	unsigned int queue_stopped;	/* request queue is quiesced */
 	bool offline_already;		/* Device offline message logged */
