@@ -7,8 +7,9 @@
 #include <linux/fs.h>
 #include <linux/fdtable.h>
 #include <linux/filter.h>
-#include <linux/btf_ids.h>
 #include <linux/bpf_mem_alloc.h>
+#include <linux/btf_ids.h>
+#include <linux/mm_types.h>
 #include "mmap_unlock_work.h"
 
 static const char * const iter_task_type_names[] = {
@@ -69,15 +70,13 @@ static struct task_struct *task_group_seq_get_next(struct bpf_iter_seq_task_comm
 		return NULL;
 
 retry:
-	task = next_thread(task);
+	task = __next_thread(task);
+	if (!task)
+		return NULL;
 
 	next_tid = __task_pid_nr_ns(task, PIDTYPE_PID, common->ns);
-	if (!next_tid || next_tid == common->pid) {
-		/* Run out of tasks of a process.  The tasks of a
-		 * thread_group are linked as circular linked list.
-		 */
-		return NULL;
-	}
+	if (!next_tid)
+		goto retry;
 
 	if (skip_if_dup_files && task->files == task->group_leader->files)
 		goto retry;
@@ -804,6 +803,93 @@ const struct bpf_func_proto bpf_find_vma_proto = {
 	.arg5_type	= ARG_ANYTHING,
 };
 
+struct bpf_iter_task_vma_kern_data {
+	struct task_struct *task;
+	struct mm_struct *mm;
+	struct mmap_unlock_irq_work *work;
+	struct vma_iterator vmi;
+};
+
+struct bpf_iter_task_vma {
+	/* opaque iterator state; having __u64 here allows to preserve correct
+	 * alignment requirements in vmlinux.h, generated from BTF
+	 */
+	__u64 __opaque[1];
+} __attribute__((aligned(8)));
+
+/* Non-opaque version of bpf_iter_task_vma */
+struct bpf_iter_task_vma_kern {
+	struct bpf_iter_task_vma_kern_data *data;
+} __attribute__((aligned(8)));
+
+__bpf_kfunc_start_defs();
+
+__bpf_kfunc int bpf_iter_task_vma_new(struct bpf_iter_task_vma *it,
+				      struct task_struct *task, u64 addr)
+{
+	struct bpf_iter_task_vma_kern *kit = (void *)it;
+	bool irq_work_busy = false;
+	int err;
+
+	BUILD_BUG_ON(sizeof(struct bpf_iter_task_vma_kern) != sizeof(struct bpf_iter_task_vma));
+	BUILD_BUG_ON(__alignof__(struct bpf_iter_task_vma_kern) != __alignof__(struct bpf_iter_task_vma));
+
+	/* is_iter_reg_valid_uninit guarantees that kit hasn't been initialized
+	 * before, so non-NULL kit->data doesn't point to previously
+	 * bpf_mem_alloc'd bpf_iter_task_vma_kern_data
+	 */
+	kit->data = bpf_mem_alloc(&bpf_global_ma, sizeof(struct bpf_iter_task_vma_kern_data));
+	if (!kit->data)
+		return -ENOMEM;
+
+	kit->data->task = get_task_struct(task);
+	kit->data->mm = task->mm;
+	if (!kit->data->mm) {
+		err = -ENOENT;
+		goto err_cleanup_iter;
+	}
+
+	/* kit->data->work == NULL is valid after bpf_mmap_unlock_get_irq_work */
+	irq_work_busy = bpf_mmap_unlock_get_irq_work(&kit->data->work);
+	if (irq_work_busy || !mmap_read_trylock(kit->data->mm)) {
+		err = -EBUSY;
+		goto err_cleanup_iter;
+	}
+
+	vma_iter_init(&kit->data->vmi, kit->data->mm, addr);
+	return 0;
+
+err_cleanup_iter:
+	if (kit->data->task)
+		put_task_struct(kit->data->task);
+	bpf_mem_free(&bpf_global_ma, kit->data);
+	/* NULL kit->data signals failed bpf_iter_task_vma initialization */
+	kit->data = NULL;
+	return err;
+}
+
+__bpf_kfunc struct vm_area_struct *bpf_iter_task_vma_next(struct bpf_iter_task_vma *it)
+{
+	struct bpf_iter_task_vma_kern *kit = (void *)it;
+
+	if (!kit->data) /* bpf_iter_task_vma_new failed */
+		return NULL;
+	return vma_next(&kit->data->vmi);
+}
+
+__bpf_kfunc void bpf_iter_task_vma_destroy(struct bpf_iter_task_vma *it)
+{
+	struct bpf_iter_task_vma_kern *kit = (void *)it;
+
+	if (kit->data) {
+		bpf_mmap_unlock_mm(kit->data->work, kit->data->mm);
+		put_task_struct(kit->data->task);
+		bpf_mem_free(&bpf_global_ma, kit->data);
+	}
+}
+
+__bpf_kfunc_end_defs();
+
 #ifdef CONFIG_CGROUPS
 
 struct bpf_iter_css_task {
@@ -894,7 +980,8 @@ __bpf_kfunc int bpf_iter_task_new(struct bpf_iter_task *it,
 	BUILD_BUG_ON(__alignof__(struct bpf_iter_task_kern) !=
 					__alignof__(struct bpf_iter_task));
 
-	kit->task = kit->pos = NULL;
+	kit->pos = NULL;
+
 	switch (flags) {
 	case BPF_TASK_ITER_ALL_THREADS:
 	case BPF_TASK_ITER_ALL_PROCS:
@@ -931,20 +1018,16 @@ __bpf_kfunc struct task_struct *bpf_iter_task_next(struct bpf_iter_task *it)
 	if (flags == BPF_TASK_ITER_ALL_PROCS)
 		goto get_next_task;
 
-	kit->pos = next_thread(kit->pos);
-	if (kit->pos == kit->task) {
-		if (flags == BPF_TASK_ITER_PROC_THREADS) {
-			kit->pos = NULL;
-			return pos;
-		}
-	} else
+	kit->pos = __next_thread(kit->pos);
+	if (kit->pos || flags == BPF_TASK_ITER_PROC_THREADS)
 		return pos;
 
 get_next_task:
-	kit->pos = next_task(kit->pos);
-	kit->task = kit->pos;
-	if (kit->pos == &init_task)
+	kit->task = next_task(kit->task);
+	if (kit->task == &init_task)
 		kit->pos = NULL;
+	else
+		kit->pos = kit->task;
 
 	return pos;
 }

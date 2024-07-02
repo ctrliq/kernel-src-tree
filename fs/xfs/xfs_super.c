@@ -1556,10 +1556,23 @@ xfs_fs_fill_super(
 	if (!xfs_has_crc(mp)) {
 #ifdef CONFIG_XFS_SUPPORT_V4
 		xfs_warn_once(mp,
-	"Deprecated V4 format (crc=0) will not be supported after September 2030.");
+	"Deprecated V4 format (crc=0) will not be supported beginning with RHEL10");
 #else
 		xfs_warn(mp,
 	"Deprecated V4 format (crc=0) not supported by kernel.");
+		error = -EINVAL;
+		goto out_free_sb;
+#endif
+	}
+
+	/* ASCII case insensitivity is undergoing deprecation. */
+	if (xfs_has_asciici(mp)) {
+#ifdef CONFIG_XFS_SUPPORT_ASCII_CI
+		xfs_warn_once(mp,
+	"Deprecated ASCII case-insensitivity feature (ascii-ci=1) will not be supported in RHEL10 forward.");
+#else
+		xfs_warn(mp,
+	"Deprecated ASCII case-insensitivity feature (ascii-ci=1) not supported by kernel.");
 		error = -EINVAL;
 		goto out_free_sb;
 #endif
@@ -1686,10 +1699,6 @@ xfs_fs_fill_super(
 		error = -EINVAL;
 		goto out_filestream_unmount;
 	}
-
-	if (xfs_has_large_extent_counts(mp))
-		xfs_warn(mp,
-	"EXPERIMENTAL Large extent counts feature in use. Use at your own risk!");
 
 	error = xfs_mountfs(mp);
 	if (error)
