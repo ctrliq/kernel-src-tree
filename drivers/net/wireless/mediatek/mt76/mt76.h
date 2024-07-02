@@ -210,6 +210,8 @@ struct mt76_queue {
 	u16 first;
 	u16 head;
 	u16 tail;
+	u8 hw_idx;
+	u8 ep;
 	int ndesc;
 	int queued;
 	int buf_size;
@@ -217,7 +219,6 @@ struct mt76_queue {
 	bool blocked;
 
 	u8 buf_offset;
-	u8 hw_idx;
 	u16 flags;
 
 	struct mtk_wed_device *wed;
@@ -1470,13 +1471,6 @@ static inline bool mt76u_urb_error(struct urb *urb)
 	       urb->status != -ENOENT;
 }
 
-/* Map hardware queues to usb endpoints */
-static inline u8 q2ep(u8 qid)
-{
-	/* TODO: take management packets to queue 5 */
-	return qid + 1;
-}
-
 static inline int
 mt76u_bulk_msg(struct mt76_dev *dev, void *data, int len, int *actual_len,
 	       int timeout, int ep)
@@ -1597,6 +1591,18 @@ s8 mt76_get_rate_power_limits(struct mt76_phy *phy,
 			      struct ieee80211_channel *chan,
 			      struct mt76_power_limits *dest,
 			      s8 target_power);
+
+static inline bool mt76_queue_is_rx(struct mt76_dev *dev, struct mt76_queue *q)
+{
+	int i;
+
+	for (i = 0; i < ARRAY_SIZE(dev->q_rx); i++) {
+		if (q == &dev->q_rx[i])
+			return true;
+	}
+
+	return false;
+}
 
 static inline bool mt76_queue_is_wed_tx_free(struct mt76_queue *q)
 {
