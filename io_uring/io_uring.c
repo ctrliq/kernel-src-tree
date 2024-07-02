@@ -4083,22 +4083,26 @@ static inline bool io_uring_allowed(void)
 	kgid_t io_uring_group;
 	static bool printed = false;
 
-	if (!printed) {
-		mark_tech_preview("io_uring", NULL);
-		printed = true;
-	}
-
 	if (disabled == 2)
 		return false;
 
 	if (disabled == 0 || capable(CAP_SYS_ADMIN))
-		return true;
+		goto allowed;
 
 	io_uring_group = make_kgid(&init_user_ns, sysctl_io_uring_group);
 	if (!gid_valid(io_uring_group))
 		return false;
 
-	return in_group_p(io_uring_group);
+	if (!in_group_p(io_uring_group))
+		return false;
+
+allowed:
+	if (!printed) {
+		mark_tech_preview("io_uring", NULL);
+		printed = true;
+	}
+
+	return true;
 }
 
 SYSCALL_DEFINE2(io_uring_setup, u32, entries,
