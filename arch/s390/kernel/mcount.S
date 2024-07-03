@@ -9,8 +9,6 @@
 #include <asm/ftrace.h>
 #include <asm/nospec-insn.h>
 #include <asm/ptrace.h>
-#include <asm/export.h>
-
 
 SYM_CODE_START(ftrace_stub_direct_tramp)
 	lgr	%r1, %r0
