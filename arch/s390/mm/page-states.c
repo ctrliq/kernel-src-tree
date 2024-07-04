@@ -162,7 +162,7 @@ static void mark_kernel_pgd(void)
 	 * kernel ASCE. This is required to keep the page table walker
 	 * from accessing non-existent entries.
 	 */
-	max_addr = (S390_lowcore.kernel_asce & _ASCE_TYPE_MASK) >> 2;
+	max_addr = (S390_lowcore.kernel_asce.val & _ASCE_TYPE_MASK) >> 2;
 	max_addr = 1UL << (max_addr * 11 + 31);
 	pgd = pgd_offset_k(addr);
 	do {
