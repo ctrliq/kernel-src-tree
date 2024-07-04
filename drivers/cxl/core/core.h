@@ -6,6 +6,7 @@
 
 extern const struct device_type cxl_nvdimm_bridge_type;
 extern const struct device_type cxl_nvdimm_type;
+extern const struct device_type cxl_pmu_type;
 
 extern struct attribute_group cxl_base_attribute_group;
 
@@ -23,7 +24,12 @@ void cxl_decoder_kill_region(struct cxl_endpoint_decoder *cxled);
 #define CXL_PMEM_REGION_TYPE(x) (&cxl_pmem_region_type)
 int cxl_region_init(void);
 void cxl_region_exit(void);
+int cxl_get_poison_by_endpoint(struct cxl_port *port);
 #else
+static inline int cxl_get_poison_by_endpoint(struct cxl_port *port)
+{
+	return 0;
+}
 static inline void cxl_decoder_kill_region(struct cxl_endpoint_decoder *cxled)
 {
 }
@@ -66,9 +72,16 @@ resource_size_t __rcrb_to_component(struct device *dev,
 				    enum cxl_rcrb which);
 
 extern struct rw_semaphore cxl_dpa_rwsem;
+extern struct rw_semaphore cxl_region_rwsem;
 
 int cxl_memdev_init(void);
 void cxl_memdev_exit(void);
 void cxl_mbox_init(void);
+
+enum cxl_poison_trace_type {
+	CXL_POISON_TRACE_LIST,
+	CXL_POISON_TRACE_INJECT,
+	CXL_POISON_TRACE_CLEAR,
+};
 
 #endif /* __CXL_CORE_H__ */
