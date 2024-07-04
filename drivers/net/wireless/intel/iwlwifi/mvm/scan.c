@@ -241,13 +241,11 @@ iwl_mvm_scan_type _iwl_mvm_get_scan_type(struct iwl_mvm *mvm,
 			return IWL_SCAN_TYPE_FRAGMENTED;
 
 		/*
-		 * in case of DCM with GO where BSS DTIM interval < 220msec
-		 * set all scan requests as fast-balance scan
+		 * in case of DCM with P2P GO set all scan requests as
+		 * fast-balance scan
 		 */
 		if (vif && vif->type == NL80211_IFTYPE_STATION &&
-		    data.is_dcm_with_p2p_go &&
-		    ((vif->bss_conf.beacon_int *
-		      vif->bss_conf.dtim_period) < 220))
+		    data.is_dcm_with_p2p_go)
 			return IWL_SCAN_TYPE_FAST_BALANCE;
 	}
 
@@ -2815,7 +2813,8 @@ static int iwl_mvm_build_scan_cmd(struct iwl_mvm *mvm,
 		if (ver_handler->version != scan_ver)
 			continue;
 
-		return ver_handler->handler(mvm, vif, params, type, uid);
+		err = ver_handler->handler(mvm, vif, params, type, uid);
+		return err ? : uid;
 	}
 
 	err = iwl_mvm_scan_umac(mvm, vif, params, type, uid);
@@ -3172,8 +3171,13 @@ void iwl_mvm_rx_umac_scan_complete_notif(struct iwl_mvm *mvm,
 		struct iwl_mvm_vif_link_info *link_info =
 			scan_vif->link[mvm->scan_link_id];
 
-		if (!WARN_ON(!link_info))
+		/* It is possible that by the time the scan is complete the link
+		 * was already removed and is not valid.
+		 */
+		if (link_info)
 			memcpy(info.tsf_bssid, link_info->bssid, ETH_ALEN);
+		else
+			IWL_DEBUG_SCAN(mvm, "Scan link is no longer valid\n");
 
 		ieee80211_scan_completed(mvm->hw, &info);
 		mvm->scan_vif = NULL;

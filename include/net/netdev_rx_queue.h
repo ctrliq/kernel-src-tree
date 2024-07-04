@@ -21,6 +21,10 @@ struct netdev_rx_queue {
 #ifdef CONFIG_XDP_SOCKETS
 	RH_KABI_EXCLUDE(struct xsk_buff_pool            *pool)
 #endif
+	/* NAPI instance for the queue
+	 * Readers and writers must hold RTNL
+	 */
+	struct napi_struct		*napi;
 
 	RH_KABI_RESERVE(1)
 	RH_KABI_RESERVE(2)

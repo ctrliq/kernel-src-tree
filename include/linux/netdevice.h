@@ -359,11 +359,13 @@ struct napi_struct {
 	struct sk_buff		*skb;
 	struct list_head	rx_list; /* Pending GRO_NORMAL skbs */
 	int			rx_count; /* length of rx_list */
+	unsigned int		napi_id;
 	struct hrtimer		timer;
+	struct task_struct	*thread;
+	/* control-path-only fields follow */
 	struct list_head	dev_list;
 	struct hlist_node	napi_hash_node;
-	unsigned int		napi_id;
-	struct task_struct	*thread;
+	int			irq;
 
 	RH_KABI_RESERVE(1)
 	RH_KABI_RESERVE(2)
@@ -626,6 +628,10 @@ struct netdev_queue {
 #ifdef CONFIG_XDP_SOCKETS
 	RH_KABI_EXCLUDE(struct xsk_buff_pool    *pool)
 #endif
+	/* NAPI instance for the queue
+	 * Readers and writers must hold RTNL
+	 */
+	struct napi_struct      *napi;
 /*
  * write-mostly part
  */
@@ -2624,6 +2630,15 @@ static inline void *netdev_priv(const struct net_device *dev)
  * example Ethernet, Wireless LAN, Bluetooth, WiMAX etc.
  */
 #define SET_NETDEV_DEVTYPE(net, devtype)	((net)->dev.type = (devtype))
+
+void netif_queue_set_napi(struct net_device *dev, unsigned int queue_index,
+			  enum netdev_queue_type type,
+			  struct napi_struct *napi);
+
+static inline void netif_napi_set_irq(struct napi_struct *napi, int irq)
+{
+	napi->irq = irq;
+}
 
 /* Default NAPI poll() weight
  * Device drivers are strongly advised to not use bigger value
