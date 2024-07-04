@@ -57,6 +57,8 @@ struct otx2_cpt_rx_inline_lf_cfg {
 	u16 opcode;
 	u32 credit;
 	u32 reserved;
+	u8 ctx_ilen_valid : 1;
+	u8 ctx_ilen : 7;
 };
 
 /*
