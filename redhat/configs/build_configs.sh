@@ -105,6 +105,8 @@ function merge_configs()
 		echo "# powerpc" > "$name";;
 	"s390x")
 		echo "# s390" > "$name";;
+	"riscv64")
+		echo "# riscv" > "$name";;
 	*)
 		echo "# $arch" > "$name";;
 	esac

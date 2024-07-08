@@ -29,6 +29,7 @@ get_configarch()
         ppc64le )	echo "powerpc" ;;
         s390x )		echo "s390x" ;;
         aarch64 )	echo "arm/aarch64" ;;
+        riscv64 )	echo "riscv/riscv64" ;;
         *)		die "Unsupported arch $arch" ;;
     esac
 }
@@ -62,7 +63,7 @@ find_conflicts()
         }
     }
     # punt all arch specific stuff to the <arch> directory
-    /CONFIG_X86/ || /CONFIG_PPC/ || /CONFIG_ARM/ || /CONFIG_S390/
+    /CONFIG_X86/ || /CONFIG_PPC/ || /CONFIG_ARM/ || /CONFIG_S390/ || /CONFIG_RISCV/
 
   ' $WORK/kernel*.config
 }

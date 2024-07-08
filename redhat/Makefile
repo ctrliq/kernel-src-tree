@@ -72,7 +72,7 @@ SOURCES:=$(RPM)/SOURCES
 TESTPATCH:=$(REDHAT)/linux-kernel-test.patch
 CHANGELOG_EXT:=changelog-$(RHEL_MAJOR).$(RHEL_MINOR)
 SPECCHANGELOG:=$(SPECPACKAGE_NAME).$(CHANGELOG_EXT)
-ARCH_LIST=aarch64 ppc64le s390x x86_64
+ARCH_LIST=aarch64 ppc64le s390x x86_64 riscv64
 
 # save some user selectable values to know later if we can override them
 DISTRO_USERDEF:=$(DISTRO)
