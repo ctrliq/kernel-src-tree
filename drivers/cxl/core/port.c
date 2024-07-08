@@ -717,7 +717,7 @@ static int cxl_port_setup_regs(struct cxl_port *port,
 }
 
 static int cxl_dport_setup_regs(struct device *host, struct cxl_dport *dport,
-				       resource_size_t component_reg_phys)
+				resource_size_t component_reg_phys)
 {
 	int rc;
 
@@ -733,7 +733,6 @@ static int cxl_dport_setup_regs(struct device *host, struct cxl_dport *dport,
 				 component_reg_phys);
 	dport->reg_map.host = host;
 	return rc;
-
 }
 
 static struct cxl_port *__devm_cxl_add_port(struct device *host,

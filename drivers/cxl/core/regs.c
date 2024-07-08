@@ -295,7 +295,7 @@ static bool cxl_decode_regblock(struct pci_dev *pdev, u32 reg_lo, u32 reg_hi,
  * @type: Register Block Indicator id
  * @map: Enumeration output, clobbered on error
  * @index: Index into which particular instance of a regblock wanted in the
- *        order found in register locator DVSEC.
+ *	   order found in register locator DVSEC.
  *
  * Return: 0 if register block enumerated, negative error code otherwise
  *

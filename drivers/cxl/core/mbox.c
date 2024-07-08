@@ -1124,8 +1124,6 @@ static int __cxl_mem_sanitize(struct cxl_memdev_state *mds, u16 cmd)
 	struct cxl_mbox_cmd mbox_cmd = { .opcode = cmd };
 	struct cxl_dev_state *cxlds = &mds->cxlds;
 
-
-
 	if (cmd != CXL_MBOX_OP_SANITIZE && cmd != CXL_MBOX_OP_SECURE_ERASE)
 		return -EINVAL;
 
