@@ -69,6 +69,7 @@
 #include <net/ip.h>
 #include "slab.h"
 #include "swap.h"
+#include <linux/zswap.h>
 
 #include <linux/uaccess.h>
 
@@ -722,6 +723,7 @@ static const unsigned int memcg_vm_event_stat[] = {
 #if defined(CONFIG_MEMCG_KMEM) && defined(CONFIG_ZSWAP)
 	ZSWPIN,
 	ZSWPOUT,
+	ZSWPWB,
 #endif
 #ifdef CONFIG_TRANSPARENT_HUGEPAGE
 	THP_FAULT_ALLOC,
@@ -3132,21 +3134,21 @@ __always_inline struct obj_cgroup *get_obj_cgroup_from_current(void)
 	return objcg;
 }
 
-struct obj_cgroup *get_obj_cgroup_from_page(struct page *page)
+struct obj_cgroup *get_obj_cgroup_from_folio(struct folio *folio)
 {
 	struct obj_cgroup *objcg;
 
 	if (!memcg_kmem_online())
 		return NULL;
 
-	if (PageMemcgKmem(page)) {
-		objcg = __folio_objcg(page_folio(page));
+	if (folio_memcg_kmem(folio)) {
+		objcg = __folio_objcg(folio);
 		obj_cgroup_get(objcg);
 	} else {
 		struct mem_cgroup *memcg;
 
 		rcu_read_lock();
-		memcg = __folio_memcg(page_folio(page));
+		memcg = __folio_memcg(folio);
 		if (memcg)
 			objcg = __get_obj_cgroup_from_memcg(memcg);
 		else
@@ -5638,6 +5640,8 @@ static void mem_cgroup_css_offline(struct cgroup_subsys_state *css)
 
 	page_counter_set_min(&memcg->memory, 0);
 	page_counter_set_low(&memcg->memory, 0);
+
+	zswap_memcg_offline_cleanup(memcg);
 
 	memcg_offline_kmem(memcg);
 	reparent_shrinker_deferred(memcg);
