@@ -14,6 +14,8 @@
 #include <linux/mem_encrypt.h>
 #include <linux/virtio_anchor.h>
 
+#include <asm/sev.h>
+
 /* Override for DMA direct allocation check - ARCH_HAS_FORCE_DMA_UNENCRYPTED */
 bool force_dma_unencrypted(struct device *dev)
 {
@@ -75,6 +77,9 @@ static void print_mem_encrypt_feature_info(void)
 			pr_cont(" SEV-SNP");
 
 		pr_cont("\n");
+
+		sev_show_status();
+
 		break;
 	default:
 		pr_cont("Unknown\n");
@@ -97,6 +102,13 @@ void __init mem_encrypt_setup_arch(void)
 {
 	phys_addr_t total_mem = memblock_phys_mem_size();
 	unsigned long size;
+
+	/*
+	 * Do RMP table fixups after the e820 tables have been setup by
+	 * e820__memory_setup().
+	 */
+	if (cc_platform_has(CC_ATTR_HOST_SEV_SNP))
+		snp_fixup_e820_tables();
 
 	if (!cc_platform_has(CC_ATTR_GUEST_MEM_ENCRYPT))
 		return;
