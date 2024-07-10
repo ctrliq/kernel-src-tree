@@ -705,7 +705,7 @@ sources-rh: $(TARBALL) $(KABI_TARBALL) $(KABIDW_TARBALL) generate-testpatch-tmp 
 		kernel-local \
 		dracut-virt.conf \
 		$(SOURCES)/
-	@cat $$(ls -1 $(SPECPACKAGE_NAME).changelog-* | sort -t '.' -k 3 -n -r) \
+	@cat $$(ls -1 $(SPECPACKAGE_NAME).changelog-* | sort -V -r) \
 		> $(SOURCES)/kernel.changelog
 	cp keys/redhatsecureboot{501,ca5}.cer $(SOURCES)/;
 	@for KABIARCH in $(ARCH_LIST); do \
