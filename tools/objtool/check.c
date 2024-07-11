@@ -3960,7 +3960,7 @@ static int validate_retpoline(struct objtool_file *file)
 			} else
 				continue;
 		} else {
-			WARN_FUNC("indirect %s found in RETPOLINE build",
+			WARN_FUNC("indirect %s found in MITIGATION_RETPOLINE build",
 				  insn->sec, insn->offset,
 				  insn->type == INSN_JUMP_DYNAMIC ? "jump" : "call");
 		}
