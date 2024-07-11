@@ -213,6 +213,8 @@ built as a module).
 
 For more information, see Documentation/dev-tools/kunit/api/test.rst.
 
+.. _kunit-on-non-uml:
+
 Writing Tests For Other Architectures
 -------------------------------------
 
