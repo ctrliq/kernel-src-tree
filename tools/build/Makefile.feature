@@ -86,6 +86,7 @@ FEATURE_TESTS_EXTRA :=                  \
          gtk2-infobar                   \
          hello                          \
          libbabeltrace                  \
+         libcapstone                    \
          libbfd-liberty                 \
          libbfd-liberty-z               \
          libopencsd                     \
@@ -133,6 +134,7 @@ FEATURE_DISPLAY ?=              \
          libcrypto              \
          libunwind              \
          libdw-dwarf-unwind     \
+         libcapstone            \
          zlib                   \
          lzma                   \
          get_cpuid              \
