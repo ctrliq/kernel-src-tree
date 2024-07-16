@@ -251,7 +251,7 @@ static inline void spi_dev_put(struct spi_device *spi)
 }
 
 /* ctldata is for the bus_controller driver's runtime state */
-static inline void *spi_get_ctldata(struct spi_device *spi)
+static inline void *spi_get_ctldata(const struct spi_device *spi)
 {
 	return spi->controller_state;
 }
@@ -268,9 +268,29 @@ static inline void spi_set_drvdata(struct spi_device *spi, void *data)
 	dev_set_drvdata(&spi->dev, data);
 }
 
-static inline void *spi_get_drvdata(struct spi_device *spi)
+static inline void *spi_get_drvdata(const struct spi_device *spi)
 {
 	return dev_get_drvdata(&spi->dev);
+}
+
+static inline u8 spi_get_chipselect(const struct spi_device *spi, u8 idx)
+{
+	return spi->chip_select;
+}
+
+static inline void spi_set_chipselect(struct spi_device *spi, u8 idx, u8 chipselect)
+{
+	spi->chip_select = chipselect;
+}
+
+static inline struct gpio_desc *spi_get_csgpiod(const struct spi_device *spi, u8 idx)
+{
+	return spi->cs_gpiod;
+}
+
+static inline void spi_set_csgpiod(struct spi_device *spi, u8 idx, struct gpio_desc *csgpiod)
+{
+	spi->cs_gpiod = csgpiod;
 }
 
 struct spi_message;
@@ -584,8 +604,7 @@ struct spi_controller {
 	 * to configure specific CS timing through spi_set_cs_timing() after
 	 * spi_setup().
 	 */
-	int (*set_cs_timing)(struct spi_device *spi, struct spi_delay *setup,
-			     struct spi_delay *hold, struct spi_delay *inactive);
+	int (*set_cs_timing)(struct spi_device *spi);
 
 	/* Bidirectional bulk transfers
 	 *
