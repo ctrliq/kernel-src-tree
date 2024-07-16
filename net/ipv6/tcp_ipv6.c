@@ -1052,7 +1052,6 @@ static void tcp_v6_send_reset(const struct sock *sk, struct sk_buff *skb)
 		if (sk_fullsock(sk)) {
 			const struct ipv6_pinfo *np = tcp_inet6_sk(sk);
 
-			trace_tcp_send_reset(sk, skb);
 			if (np->repflow)
 				label = ip6_flowlabel(ipv6h);
 			priority = sk->sk_priority;
@@ -1067,6 +1066,8 @@ static void tcp_v6_send_reset(const struct sock *sk, struct sk_buff *skb)
 		if (net->ipv6.sysctl.flowlabel_reflect & FLOWLABEL_REFLECT_TCP_RESET)
 			label = ip6_flowlabel(ipv6h);
 	}
+
+	trace_tcp_send_reset(sk, skb);
 
 	tcp_v6_send_response(sk, skb, seq, ack_seq, 0, 0, 0, oif, key, 1,
 			     ipv6_get_dsfield(ipv6h), label, priority, txhash);
