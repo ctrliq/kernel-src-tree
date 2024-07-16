@@ -13637,6 +13637,7 @@ static const struct net_device_ops i40e_netdev_ops = {
 	.ndo_xsk_wakeup	        = i40e_xsk_wakeup,
 	.ndo_dfwd_add_station	= i40e_fwd_add,
 	.ndo_dfwd_del_station	= i40e_fwd_del,
+	.__rh_deprecated_ndo_get_devlink_port = i40e_get_devlink_port,
 };
 
 /**

@@ -13,6 +13,7 @@ void i40e_free_pf(struct i40e_pf *pf);
 void i40e_devlink_register(struct i40e_pf *pf);
 void i40e_devlink_unregister(struct i40e_pf *pf);
 int i40e_devlink_create_port(struct i40e_pf *pf);
+struct devlink_port *i40e_get_devlink_port(struct net_device *netdev);
 void i40e_devlink_destroy_port(struct i40e_pf *pf);
 
 #endif /* _I40E_DEVLINK_H_ */

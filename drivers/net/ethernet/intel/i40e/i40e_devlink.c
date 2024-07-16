@@ -106,6 +106,15 @@ int i40e_devlink_create_port(struct i40e_pf *pf)
 }
 
 /**
+ * i40e_get_devlink_port - Get devlink port from netdev
+ * @netdev: the netdevice structure
+ **/
+struct devlink_port *i40e_get_devlink_port(struct net_device *netdev)
+{
+	return NULL;
+}
+
+/**
  * i40e_devlink_destroy_port - Destroy the devlink_port for this PF
  * @pf: the PF to cleanup
  *
