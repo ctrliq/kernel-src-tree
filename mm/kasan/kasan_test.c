@@ -134,6 +134,7 @@ static void kasan_test_exit(struct kunit *test)
 			kasan_enable_hw_tags();				\
 		migrate_enable();					\
 	}								\
+	WRITE_ONCE(test_status.report_found, false);			\
 	WRITE_ONCE(test_status.async_fault, false);			\
 } while (0)
 
