@@ -14,9 +14,7 @@
 static const struct genl_split_ops nfsd_nl_ops[] = {
 	{
 		.cmd	= NFSD_CMD_RPC_STATUS_GET,
-		.start	= nfsd_nl_rpc_status_get_start,
 		.dumpit	= nfsd_nl_rpc_status_get_dumpit,
-		.done	= nfsd_nl_rpc_status_get_done,
 		.flags	= GENL_CMD_CAP_DUMP,
 	},
 };
