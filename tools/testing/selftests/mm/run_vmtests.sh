@@ -353,6 +353,8 @@ CATEGORY="thp" run_test ./split_huge_page_test
 
 CATEGORY="migration" run_test ./migration
 
+CATEGORY="mkdirty" run_test ./mkdirty
+
 echo "SUMMARY: PASS=${count_pass} SKIP=${count_skip} FAIL=${count_fail}"
 
 exit $exitcode

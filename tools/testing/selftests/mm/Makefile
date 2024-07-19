@@ -51,6 +51,7 @@ TEST_GEN_FILES += map_hugetlb
 TEST_GEN_FILES += map_populate
 TEST_GEN_FILES += memfd_secret
 TEST_GEN_FILES += migration
+TEST_GEN_FILES += mkdirty
 TEST_GEN_FILES += mlock-random-test
 TEST_GEN_FILES += mlock2-tests
 TEST_GEN_FILES += mrelease_test
