@@ -112,6 +112,11 @@ TEST_PROGS := run_vmtests.sh
 TEST_FILES := test_vmalloc.sh
 TEST_FILES += test_hmm.sh
 TEST_FILES += va_high_addr_switch.sh
+TEST_FILES += charge_reserved_hugetlb.sh
+TEST_FILES += hugetlb_reparenting_test.sh
+
+# required by charge_reserved_hugetlb.sh
+TEST_FILES += write_hugetlb_memory.sh
 
 KSFT_KHDR_INSTALL := 1
 include ../lib.mk
