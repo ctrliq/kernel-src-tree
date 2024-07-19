@@ -118,7 +118,6 @@ TEST_FILES += hugetlb_reparenting_test.sh
 # required by charge_reserved_hugetlb.sh
 TEST_FILES += write_hugetlb_memory.sh
 
-KSFT_KHDR_INSTALL := 1
 include ../lib.mk
 
 $(TEST_GEN_PROGS): vm_util.c

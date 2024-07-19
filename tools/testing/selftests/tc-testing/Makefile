@@ -3,5 +3,4 @@
 TEST_PROGS += tdc.sh
 TEST_FILES := action-ebpf tdc*.py Tdc*.py plugins plugin-lib tc-tests scripts
 
-KSFT_KHDR_INSTALL := 1
 include ../lib.mk

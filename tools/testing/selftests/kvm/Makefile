@@ -4,7 +4,6 @@ include ../../../build/Build.include
 all:
 
 top_srcdir = ../../../..
-KSFT_KHDR_INSTALL := 1
 include $(top_srcdir)/scripts/subarch.include
 ARCH            ?= $(SUBARCH)
 
