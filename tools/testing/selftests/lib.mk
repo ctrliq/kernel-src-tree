@@ -13,6 +13,7 @@ ifeq (0,$(MAKELEVEL))
     endif
 endif
 selfdir = $(realpath $(dir $(filter %/lib.mk,$(MAKEFILE_LIST))))
+top_srcdir = $(selfdir)/../../..
 
 # In order to use newer items that haven't yet been added to the user's system
 # header files, add $(TOOLS_INCLUDES) to the compiler invocation in each
