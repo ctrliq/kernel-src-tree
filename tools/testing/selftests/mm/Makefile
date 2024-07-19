@@ -63,6 +63,7 @@ TEST_GEN_FILES += userfaultfd
 TEST_GEN_FILES += split_huge_page_test
 TEST_GEN_FILES += ksm_tests
 TEST_GEN_FILES += ksm_functional_tests
+TEST_GEN_PROGS += mdwe_test
 
 ifneq ($(ARCH),arm64)
 TEST_GEN_FILES += soft-dirty
