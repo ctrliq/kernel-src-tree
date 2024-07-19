@@ -5634,6 +5634,13 @@ retry_avoidcopy:
 	/*
 	 * If no-one else is actually using this page, we're the exclusive
 	 * owner and can reuse this page.
+	 *
+	 * Note that we don't rely on the (safer) folio refcount here, because
+	 * copying the hugetlb folio when there are unexpected (temporary)
+	 * folio references could harm simple fork()+exit() users when
+	 * we run out of free hugetlb folios: we would have to kill processes
+	 * in scenarios that used to work. As a side effect, there can still
+	 * be leaks between processes, for example, with FOLL_GET users.
 	 */
 	if (page_mapcount(old_page) == 1 && PageAnon(old_page)) {
 		if (!PageAnonExclusive(old_page))
