@@ -116,6 +116,8 @@ include ../lib.mk
 $(TEST_GEN_PROGS): vm_util.c
 $(TEST_GEN_FILES): vm_util.c
 
+$(OUTPUT)/userfaultfd: uffd-common.c
+
 ifeq ($(ARCH),x86_64)
 BINARIES_32 := $(patsubst %,$(OUTPUT)/%,$(BINARIES_32))
 BINARIES_64 := $(patsubst %,$(OUTPUT)/%,$(BINARIES_64))
