@@ -14,6 +14,15 @@ ifeq (0,$(MAKELEVEL))
 endif
 selfdir = $(realpath $(dir $(filter %/lib.mk,$(MAKEFILE_LIST))))
 
+# In order to use newer items that haven't yet been added to the user's system
+# header files, add $(TOOLS_INCLUDES) to the compiler invocation in each
+# each selftest.
+# You may need to add files to that location, or to refresh an existing file. In
+# order to do that, run "make headers" from $(top_srcdir), then copy the
+# header file that you want from $(top_srcdir)/usr/include/... , to the matching
+# subdir in $(TOOLS_INCLUDE).
+TOOLS_INCLUDES := -isystem $(top_srcdir)/tools/include/uapi
+
 # The following are built by lib.mk common compile rules.
 # TEST_CUSTOM_PROGS should be used by tests that require
 # custom build rule and prevent common build rule use.
