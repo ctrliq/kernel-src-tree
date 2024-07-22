@@ -98,7 +98,6 @@ static void mlx5_sf_dev_remove(struct auxiliary_device *adev)
 	struct devlink *devlink = priv_to_devlink(sf_dev->mdev);
 
 	mlx5_drain_health_wq(sf_dev->mdev);
-	devlink_unregister(devlink);
 	if (mlx5_dev_is_lightweight(sf_dev->mdev))
 		mlx5_uninit_one_light(sf_dev->mdev);
 	else
