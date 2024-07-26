@@ -68,7 +68,7 @@ void rh_print_flags(void)
 EXPORT_SYMBOL(rh_print_flags);
 
 #ifdef CONFIG_SYSCTL
-static int rh_flags_show(struct ctl_table *ctl, int write,
+static int rh_flags_show(const struct ctl_table *ctl, int write,
 			    void __user *buffer, size_t *lenp,
 			    loff_t *ppos)
 {
