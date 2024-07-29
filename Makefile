@@ -9,7 +9,7 @@ NAME = Opossums on Parade
 #
 RHEL_DRM_VERSION = 6
 RHEL_DRM_PATCHLEVEL = 9
-RHEL_DRM_SUBLEVEL = 
+RHEL_DRM_SUBLEVEL = 11
 
 # *DOCUMENTATION*
 # To see a list of typical targets execute "make help"
