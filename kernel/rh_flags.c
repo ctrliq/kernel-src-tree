@@ -102,7 +102,6 @@ static struct ctl_table rh_flags_table[] = {
 		.mode = 0444,
 		.proc_handler = rh_flags_show,
 	},
-	{ }
 };
 #endif
 
