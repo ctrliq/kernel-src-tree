@@ -3955,12 +3955,12 @@ static int validate_retpoline(struct objtool_file *file)
 
 		if (insn->type == INSN_RETURN) {
 			if (opts.rethunk) {
-				WARN_FUNC("'naked' return found in RETHUNK build",
+				WARN_FUNC("'naked' return found in MITIGATION_RETHUNK build",
 					  insn->sec, insn->offset);
 			} else
 				continue;
 		} else {
-			WARN_FUNC("indirect %s found in RETPOLINE build",
+			WARN_FUNC("indirect %s found in MITIGATION_RETPOLINE build",
 				  insn->sec, insn->offset,
 				  insn->type == INSN_JUMP_DYNAMIC ? "jump" : "call");
 		}
