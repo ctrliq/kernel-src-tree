@@ -3179,9 +3179,11 @@ int tcp_disconnect(struct sock *sk, int flags)
 		inet_csk_listen_stop(sk);
 	} else if (unlikely(tp->repair)) {
 		sk->sk_err = ECONNABORTED;
-	} else if (tcp_need_reset(old_state) ||
-		   (tp->snd_nxt != tp->write_seq &&
-		    (1 << old_state) & (TCPF_CLOSING | TCPF_LAST_ACK))) {
+	} else if (tcp_need_reset(old_state)) {
+		tcp_send_active_reset(sk, gfp_any(), SK_RST_REASON_TCP_STATE);
+		sk->sk_err = ECONNRESET;
+	} else if (tp->snd_nxt != tp->write_seq &&
+		   (1 << old_state) & (TCPF_CLOSING | TCPF_LAST_ACK)) {
 		/* The last check adjusts for discrepancy of Linux wrt. RFC
 		 * states
 		 */
@@ -4766,7 +4768,7 @@ int tcp_abort(struct sock *sk, int err)
 	sk_error_report(sk);
 	if (tcp_need_reset(sk->sk_state))
 		tcp_send_active_reset(sk, GFP_ATOMIC,
-				      SK_RST_REASON_NOT_SPECIFIED);
+				      SK_RST_REASON_TCP_STATE);
 	tcp_done(sk);
 
 	bh_unlock_sock(sk);
