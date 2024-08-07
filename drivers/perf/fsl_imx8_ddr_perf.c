@@ -827,7 +827,7 @@ cpuhp_state_err:
 	return ret;
 }
 
-static int ddr_perf_remove(struct platform_device *pdev)
+static void ddr_perf_remove(struct platform_device *pdev)
 {
 	struct ddr_pmu *pmu = platform_get_drvdata(pdev);
 
@@ -837,7 +837,6 @@ static int ddr_perf_remove(struct platform_device *pdev)
 	perf_pmu_unregister(&pmu->pmu);
 
 	ida_free(&ddr_ida, pmu->id);
-	return 0;
 }
 
 static struct platform_driver imx_ddr_pmu_driver = {
@@ -847,7 +846,7 @@ static struct platform_driver imx_ddr_pmu_driver = {
 		.suppress_bind_attrs = true,
 	},
 	.probe          = ddr_perf_probe,
-	.remove         = ddr_perf_remove,
+	.remove_new     = ddr_perf_remove,
 };
 
 module_platform_driver(imx_ddr_pmu_driver);
