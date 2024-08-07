@@ -2,6 +2,8 @@
 #ifndef _LINUX_SHRINKER_H
 #define _LINUX_SHRINKER_H
 
+#include <linux/atomic.h>
+#include <linux/types.h>
 #include <linux/rh_kabi.h>
 
 /*
