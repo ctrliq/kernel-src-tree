@@ -1277,8 +1277,12 @@ static bool kick_pool(struct worker_pool *pool)
 	    !cpumask_test_cpu(p->wake_cpu, pool->attrs->__pod_cpumask)) {
 		struct work_struct *work = list_first_entry(&pool->worklist,
 						struct work_struct, entry);
-		p->wake_cpu = cpumask_any_distribute(pool->attrs->__pod_cpumask);
-		get_work_pwq(work)->stats[PWQ_STAT_REPATRIATED]++;
+		int wake_cpu = cpumask_any_and_distribute(pool->attrs->__pod_cpumask,
+							  cpu_online_mask);
+		if (wake_cpu < nr_cpu_ids) {
+			p->wake_cpu = wake_cpu;
+			get_work_pwq(work)->stats[PWQ_STAT_REPATRIATED]++;
+		}
 	}
 #endif
 	wake_up_process(p);
@@ -1594,6 +1598,15 @@ static void wq_update_node_max_active(struct workqueue_struct *wq, int off_cpu)
 	if (off_cpu >= 0)
 		total_cpus--;
 
+	/* If all CPUs of the wq get offline, use the default values */
+	if (unlikely(!total_cpus)) {
+		for_each_node(node)
+			wq_node_nr_active(wq, node)->max = min_active;
+
+		wq_node_nr_active(wq, NUMA_NO_NODE)->max = max_active;
+		return;
+	}
+
 	for_each_node(node) {
 		int node_cpus;
 
@@ -1606,7 +1619,7 @@ static void wq_update_node_max_active(struct workqueue_struct *wq, int off_cpu)
 			      min_active, max_active);
 	}
 
-	wq_node_nr_active(wq, NUMA_NO_NODE)->max = min_active;
+	wq_node_nr_active(wq, NUMA_NO_NODE)->max = max_active;
 }
 
 /**
@@ -2338,9 +2351,13 @@ retry:
 	 * If @work was previously on a different pool, it might still be
 	 * running there, in which case the work needs to be queued on that
 	 * pool to guarantee non-reentrancy.
+	 *
+	 * For ordered workqueue, work items must be queued on the newest pwq
+	 * for accurate order management.  Guaranteed order also guarantees
+	 * non-reentrancy.  See the comments above unplug_oldest_pwq().
 	 */
 	last_pool = get_work_pool(work);
-	if (last_pool && last_pool != pool) {
+	if (last_pool && last_pool != pool && !(wq->flags & __WQ_ORDERED)) {
 		struct worker *worker;
 
 		raw_spin_lock(&last_pool->lock);
@@ -6759,9 +6776,6 @@ int workqueue_unbound_exclude_cpumask(cpumask_var_t exclude_cpumask)
 	lockdep_assert_cpus_held();
 	mutex_lock(&wq_pool_mutex);
 
-	/* Save the current isolated cpumask & export it via sysfs */
-	cpumask_copy(wq_isolated_cpumask, exclude_cpumask);
-
 	/*
 	 * If the operation fails, it will fall back to
 	 * wq_requested_unbound_cpumask which is initially set to
@@ -6772,6 +6786,10 @@ int workqueue_unbound_exclude_cpumask(cpumask_var_t exclude_cpumask)
 		cpumask_copy(cpumask, wq_requested_unbound_cpumask);
 	if (!cpumask_equal(cpumask, wq_unbound_cpumask))
 		ret = workqueue_apply_unbound_cpumask(cpumask);
+
+	/* Save the current isolated cpumask & export it via sysfs */
+	if (!ret)
+		cpumask_copy(wq_isolated_cpumask, exclude_cpumask);
 
 	mutex_unlock(&wq_pool_mutex);
 	free_cpumask_var(cpumask);
@@ -7108,7 +7126,6 @@ static int workqueue_set_unbound_cpumask(cpumask_var_t cpumask)
 	cpumask_and(cpumask, cpumask, cpu_possible_mask);
 	if (!cpumask_empty(cpumask)) {
 		apply_wqattrs_lock();
-		cpumask_copy(wq_requested_unbound_cpumask, cpumask);
 		if (cpumask_equal(cpumask, wq_unbound_cpumask)) {
 			ret = 0;
 			goto out_unlock;
@@ -7117,6 +7134,8 @@ static int workqueue_set_unbound_cpumask(cpumask_var_t cpumask)
 		ret = workqueue_apply_unbound_cpumask(cpumask);
 
 out_unlock:
+		if (!ret)
+			cpumask_copy(wq_requested_unbound_cpumask, cpumask);
 		apply_wqattrs_unlock();
 	}
 
@@ -7135,25 +7154,27 @@ static ssize_t __wq_cpumask_show(struct device *dev,
 	return written;
 }
 
-static ssize_t wq_unbound_cpumask_show(struct device *dev,
+static ssize_t cpumask_requested_show(struct device *dev,
+		struct device_attribute *attr, char *buf)
+{
+	return __wq_cpumask_show(dev, attr, buf, wq_requested_unbound_cpumask);
+}
+static DEVICE_ATTR_RO(cpumask_requested);
+
+static ssize_t cpumask_isolated_show(struct device *dev,
+		struct device_attribute *attr, char *buf)
+{
+	return __wq_cpumask_show(dev, attr, buf, wq_isolated_cpumask);
+}
+static DEVICE_ATTR_RO(cpumask_isolated);
+
+static ssize_t cpumask_show(struct device *dev,
 		struct device_attribute *attr, char *buf)
 {
 	return __wq_cpumask_show(dev, attr, buf, wq_unbound_cpumask);
 }
 
-static ssize_t wq_requested_cpumask_show(struct device *dev,
-		struct device_attribute *attr, char *buf)
-{
-	return __wq_cpumask_show(dev, attr, buf, wq_requested_unbound_cpumask);
-}
-
-static ssize_t wq_isolated_cpumask_show(struct device *dev,
-		struct device_attribute *attr, char *buf)
-{
-	return __wq_cpumask_show(dev, attr, buf, wq_isolated_cpumask);
-}
-
-static ssize_t wq_unbound_cpumask_store(struct device *dev,
+static ssize_t cpumask_store(struct device *dev,
 		struct device_attribute *attr, const char *buf, size_t count)
 {
 	cpumask_var_t cpumask;
@@ -7169,36 +7190,19 @@ static ssize_t wq_unbound_cpumask_store(struct device *dev,
 	free_cpumask_var(cpumask);
 	return ret ? ret : count;
 }
+static DEVICE_ATTR_RW(cpumask);
 
-static struct device_attribute wq_sysfs_cpumask_attrs[] = {
-	__ATTR(cpumask, 0644, wq_unbound_cpumask_show,
-	       wq_unbound_cpumask_store),
-	__ATTR(cpumask_requested, 0444, wq_requested_cpumask_show, NULL),
-	__ATTR(cpumask_isolated, 0444, wq_isolated_cpumask_show, NULL),
-	__ATTR_NULL,
+static struct attribute *wq_sysfs_cpumask_attrs[] = {
+	&dev_attr_cpumask.attr,
+	&dev_attr_cpumask_requested.attr,
+	&dev_attr_cpumask_isolated.attr,
+	NULL,
 };
+ATTRIBUTE_GROUPS(wq_sysfs_cpumask);
 
 static int __init wq_sysfs_init(void)
 {
-	struct device *dev_root;
-	int err;
-
-	err = subsys_virtual_register(&wq_subsys, NULL);
-	if (err)
-		return err;
-
-	dev_root = bus_get_dev_root(&wq_subsys);
-	if (dev_root) {
-		struct device_attribute *attr;
-
-		for (attr = wq_sysfs_cpumask_attrs; attr->attr.name; attr++) {
-			err = device_create_file(dev_root, attr);
-			if (err)
-				break;
-		}
-		put_device(dev_root);
-	}
-	return err;
+	return subsys_virtual_register(&wq_subsys, wq_sysfs_cpumask_groups);
 }
 core_initcall(wq_sysfs_init);
 
