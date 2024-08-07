@@ -78,6 +78,7 @@ parameters, info versions, and other features it supports.
    :maxdepth: 1
 
    bnxt
+   i40e
    ionic
    ice
    mlx4
