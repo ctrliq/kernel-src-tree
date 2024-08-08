@@ -55,6 +55,7 @@
 #include <linux/suspend.h>
 #include <linux/siphash.h>
 #include <linux/sched/isolation.h>
+#include <linux/fips.h>
 #include <crypto/chacha.h>
 #include <crypto/blake2s.h>
 #ifdef CONFIG_VDSO_GETRANDOM
@@ -741,7 +742,8 @@ static void __cold _credit_init_bits(size_t bits)
 			queue_work(system_unbound_wq, &set_ready);
 		atomic_notifier_call_chain(&random_ready_notifier, 0, NULL);
 #ifdef CONFIG_VDSO_GETRANDOM
-		WRITE_ONCE(_vdso_rng_data.is_ready, true);
+		if (!fips_enabled)
+			WRITE_ONCE(_vdso_rng_data.is_ready, true);
 #endif
 		wake_up_interruptible(&crng_init_wait);
 		kill_fasync(&fasync, SIGIO, POLL_IN);
