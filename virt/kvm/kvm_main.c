@@ -4429,7 +4429,7 @@ static long kvm_vcpu_ioctl(struct file *filp,
 		struct kvm_regs *kvm_regs;
 
 		r = -ENOMEM;
-		kvm_regs = kzalloc(sizeof(struct kvm_regs), GFP_KERNEL_ACCOUNT);
+		kvm_regs = kzalloc(sizeof(struct kvm_regs), GFP_KERNEL);
 		if (!kvm_regs)
 			goto out;
 		r = kvm_arch_vcpu_ioctl_get_regs(vcpu, kvm_regs);
@@ -4456,8 +4456,7 @@ out_free1:
 		break;
 	}
 	case KVM_GET_SREGS: {
-		kvm_sregs = kzalloc(sizeof(struct kvm_sregs),
-				    GFP_KERNEL_ACCOUNT);
+		kvm_sregs = kzalloc(sizeof(struct kvm_sregs), GFP_KERNEL);
 		r = -ENOMEM;
 		if (!kvm_sregs)
 			goto out;
@@ -4549,7 +4548,7 @@ out_free1:
 		break;
 	}
 	case KVM_GET_FPU: {
-		fpu = kzalloc(sizeof(struct kvm_fpu), GFP_KERNEL_ACCOUNT);
+		fpu = kzalloc(sizeof(struct kvm_fpu), GFP_KERNEL);
 		r = -ENOMEM;
 		if (!fpu)
 			goto out;
@@ -6212,7 +6211,7 @@ static void kvm_uevent_notify_change(unsigned int type, struct kvm *kvm)
 	active = kvm_active_vms;
 	mutex_unlock(&kvm_lock);
 
-	env = kzalloc(sizeof(*env), GFP_KERNEL_ACCOUNT);
+	env = kzalloc(sizeof(*env), GFP_KERNEL);
 	if (!env)
 		return;
 
@@ -6228,7 +6227,7 @@ static void kvm_uevent_notify_change(unsigned int type, struct kvm *kvm)
 	add_uevent_var(env, "PID=%d", kvm->userspace_pid);
 
 	if (!IS_ERR(kvm->debugfs_dentry)) {
-		char *tmp, *p = kmalloc(PATH_MAX, GFP_KERNEL_ACCOUNT);
+		char *tmp, *p = kmalloc(PATH_MAX, GFP_KERNEL);
 
 		if (p) {
 			tmp = dentry_path_raw(kvm->debugfs_dentry, p, PATH_MAX);
