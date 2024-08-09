@@ -576,10 +576,6 @@ static bool acpi_dev_irq_override(u32 gsi, u8 triggering, u8 polarity,
 	}
 
 #ifdef CONFIG_X86
-	/* If the override comes from an INT_SRC_OVR MADT entry, honor it. */
-	if (acpi_int_src_ovr[gsi])
-		return true;
-
 	/*
 	 * Always use the MADT override info, except for the i8042 PS/2 ctrl
 	 * IRQs (1 and 12). For these the DSDT IRQ settings should sometimes
