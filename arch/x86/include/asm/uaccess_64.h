@@ -99,9 +99,7 @@ static inline bool __access_ok(const void __user *ptr, unsigned long size)
 
 /* Handles exceptions in both to and from, but doesn't do access_ok */
 __must_check unsigned long
-copy_user_enhanced_fast_string(void *to, const void *from, unsigned len);
-__must_check unsigned long
-copy_user_generic_string(void *to, const void *from, unsigned len);
+copy_user_fast_string(void *to, const void *from, unsigned len);
 __must_check unsigned long
 copy_user_generic_unrolled(void *to, const void *from, unsigned len);
 
@@ -111,15 +109,12 @@ copy_user_generic(void *to, const void *from, unsigned len)
 	unsigned ret;
 
 	/*
-	 * If CPU has ERMS feature, use copy_user_enhanced_fast_string.
-	 * Otherwise, if CPU has rep_good feature, use copy_user_generic_string.
+	 * If CPU has FSRM feature, use 'rep movs'.
 	 * Otherwise, use copy_user_generic_unrolled.
 	 */
-	alternative_call_2(copy_user_generic_unrolled,
-			 copy_user_generic_string,
-			 X86_FEATURE_REP_GOOD,
-			 copy_user_enhanced_fast_string,
-			 X86_FEATURE_ERMS,
+	alternative_call(copy_user_generic_unrolled,
+			 copy_user_fast_string,
+			 X86_FEATURE_FSRM,
 			 ASM_OUTPUT2("=a" (ret), "=D" (to), "=S" (from),
 				     "=d" (len)),
 			 "1" (to), "2" (from), "3" (len)
