@@ -5,8 +5,8 @@
  */
 
 #include <linux/kernel.h>
-#include <asm/ctl_reg.h>
 #include <asm/processor.h>
+#include <asm/ctl_reg.h>
 #include <asm/lowcore.h>
 #include <asm/ebcdic.h>
 #include <asm/irq.h>
