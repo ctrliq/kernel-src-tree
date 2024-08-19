@@ -111,7 +111,7 @@ warnings: $(WARNINGS)
 	$(ERROR_OUT)
 endif
 
-rtla: $(OBJ) doc
+rtla: $(OBJ)
 	$(CC) -o rtla $(LDFLAGS) $(OBJ) $(LIBS)
 
 static: $(OBJ)
