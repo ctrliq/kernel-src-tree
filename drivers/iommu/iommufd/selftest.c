@@ -266,8 +266,8 @@ static int mock_domain_read_and_clear_dirty(struct iommu_domain *domain,
 
 		/* Clear dirty */
 		if (mock_test_and_clear_dirty(mock, head, pgsize, flags))
-			iommu_dirty_bitmap_record(dirty, head, pgsize);
-		iova = head + pgsize;
+			iommu_dirty_bitmap_record(dirty, iova, pgsize);
+		iova += pgsize;
 	} while (iova < end);
 
 	return 0;
@@ -1334,7 +1334,7 @@ static int iommufd_test_dirty(struct iommufd_ucmd *ucmd, unsigned int mockpt_id,
 	}
 
 	max = length / page_size;
-	bitmap_size = max / BITS_PER_BYTE;
+	bitmap_size = DIV_ROUND_UP(max, BITS_PER_BYTE);
 
 	tmp = kvzalloc(bitmap_size, GFP_KERNEL_ACCOUNT);
 	if (!tmp) {
