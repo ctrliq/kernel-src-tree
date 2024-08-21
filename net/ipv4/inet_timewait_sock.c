@@ -93,6 +93,11 @@ static void inet_twsk_add_bind_node(struct inet_timewait_sock *tw,
 	hlist_add_head(&tw->tw_bind_node, list);
 }
 
+static void inet_twsk_schedule(struct inet_timewait_sock *tw, int timeo)
+{
+	__inet_twsk_schedule(tw, timeo, false);
+}
+
 /*
  * Enter the time wait state.
  * Essentially we whip up a timewait bucket, copy the relevant info into it
