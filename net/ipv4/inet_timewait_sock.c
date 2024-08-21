@@ -94,7 +94,7 @@ static void inet_twsk_add_bind_node(struct inet_timewait_sock *tw,
 }
 
 /*
- * Enter the time wait state. This is called with locally disabled BH.
+ * Enter the time wait state.
  * Essentially we whip up a timewait bucket, copy the relevant info into it
  * from the SK, and mess with hash chains and list linkage.
  *
@@ -116,6 +116,7 @@ void inet_twsk_hashdance_schedule(struct inet_timewait_sock *tw,
 	 */
 	bhead = &hashinfo->bhash[inet_bhashfn(twsk_net(tw), inet->inet_num,
 			hashinfo->bhash_size)];
+	local_bh_disable();
 	spin_lock(&bhead->lock);
 	tw->tw_tb = icsk->icsk_bind_hash;
 	WARN_ON(!icsk->icsk_bind_hash);
@@ -149,6 +150,7 @@ void inet_twsk_hashdance_schedule(struct inet_timewait_sock *tw,
 	inet_twsk_schedule(tw, timeo);
 
 	spin_unlock(lock);
+	local_bh_enable();
 }
 EXPORT_SYMBOL_GPL(inet_twsk_hashdance_schedule);
 
@@ -198,7 +200,7 @@ struct inet_timewait_sock *inet_twsk_alloc(const struct sock *sk,
 		tw->tw_prot	    = sk->sk_prot_creator;
 		atomic64_set(&tw->tw_cookie, atomic64_read(&sk->sk_cookie));
 		twsk_net_set(tw, sock_net(sk));
-		timer_setup(&tw->tw_timer, tw_timer_handler, TIMER_PINNED);
+		timer_setup(&tw->tw_timer, tw_timer_handler, 0);
 		/*
 		 * Because we use RCU lookups, we should not set tw_refcnt
 		 * to a non null value before everything is setup for this
