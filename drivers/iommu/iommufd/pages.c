@@ -713,12 +713,9 @@ static void pfn_reader_user_init(struct pfn_reader_user *user,
 	user->upages_end = 0;
 	user->locked = -1;
 
-	if (pages->writable) {
-		user->gup_flags = FOLL_LONGTERM | FOLL_WRITE;
-	} else {
-		/* Still need to break COWs on read */
-		user->gup_flags = FOLL_LONGTERM | FOLL_FORCE | FOLL_WRITE;
-	}
+	user->gup_flags = FOLL_LONGTERM;
+	if (pages->writable)
+		user->gup_flags |= FOLL_WRITE;
 }
 
 static void pfn_reader_user_destroy(struct pfn_reader_user *user,
@@ -788,10 +785,6 @@ static int pfn_reader_user_pin(struct pfn_reader_user *user,
 			mmap_read_lock(pages->source_mm);
 			user->locked = 1;
 		}
-		/*
-		 * FIXME: last NULL can be &pfns->locked once the GUP patch
-		 * is merged.
-		 */
 		rc = pin_user_pages_remote(pages->source_mm, uptr, npages,
 					   user->gup_flags, user->upages,
 					   &user->locked);
