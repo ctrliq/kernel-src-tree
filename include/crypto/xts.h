@@ -24,6 +24,15 @@ static inline int xts_check_key(struct crypto_tfm *tfm,
 		return -EINVAL;
 	}
 
+	/*
+	 * In FIPS mode only a combined key length of either 256 or
+	 * 512 bits is allowed, c.f. FIPS 140-3 IG C.I.
+	 */
+	if (fips_enabled && keylen != 32 && keylen != 64) {
+		crypto_tfm_set_flags(tfm, CRYPTO_TFM_RES_BAD_KEY_LEN);
+		return -EINVAL;
+	}
+
 	/* ensure that the AES and tweak key are not identical */
 	if (fips_enabled &&
 	    !crypto_memneq(key, key + (keylen / 2), keylen / 2)) {
