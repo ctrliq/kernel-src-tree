@@ -29,6 +29,9 @@
 /* use value, which < 0K, to indicate an invalid/uninitialized temperature */
 #define THERMAL_TEMP_INVALID	-274000
 
+#define THERMAL_TRIP_PRIV_TO_INT(_val_)	(uintptr_t)(_val_)
+#define THERMAL_INT_TO_TRIP_PRIV(_val_)	(void *)(uintptr_t)(_val_)
+
 struct thermal_zone_device;
 struct thermal_cooling_device;
 struct thermal_instance;
