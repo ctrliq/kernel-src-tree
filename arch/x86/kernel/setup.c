@@ -7,6 +7,7 @@
  */
 #include <linux/acpi.h>
 #include <linux/console.h>
+#include <linux/cpu.h>
 #include <linux/crash_dump.h>
 #include <linux/dma-map-ops.h>
 #include <linux/efi.h>
@@ -804,7 +805,7 @@ static void rh_check_supported(void)
 	guest = (x86_hyper_type != X86_HYPER_NATIVE || boot_cpu_has(X86_FEATURE_HYPERVISOR));
 
 	/* RHEL supports single cpu on guests only */
-	if (((boot_cpu_data.x86_max_cores * smp_num_siblings) == 1) &&
+	if (((topology_num_threads_per_package() * __max_threads_per_core) == 1) &&
 	    !guest && is_kdump_kernel()) {
 		pr_crit("Detected single cpu native boot.\n");
 		pr_crit("Important:  In this kernel, single threaded, single CPU 64-bit physical systems are unsupported.");
@@ -1144,6 +1145,8 @@ void __init setup_arch(char **cmdline_p)
 	early_gart_iommu_check();
 #endif
 
+	topology_apply_cmdline_limits_early();
+
 	/*
 	 * partially used pages are not usable - thus
 	 * we are rounding upwards:
@@ -1179,10 +1182,8 @@ void __init setup_arch(char **cmdline_p)
 	high_memory = (void *)__va(max_pfn * PAGE_SIZE - 1) + 1;
 #endif
 
-	/*
-	 * Find and reserve possible boot-time SMP configuration:
-	 */
-	find_smp_config();
+	/* Find and reserve MPTABLE area */
+	x86_init.mpparse.find_mptable();
 
 	early_alloc_pgt_buf();
 
@@ -1288,7 +1289,9 @@ void __init setup_arch(char **cmdline_p)
 
 	early_platform_quirks();
 
+	/* Some platforms need the APIC registered for NUMA configuration */
 	early_acpi_boot_init();
+	x86_init.mpparse.early_parse_smp_cfg();
 
 	x86_flattree_get_config();
 
@@ -1330,23 +1333,16 @@ void __init setup_arch(char **cmdline_p)
 	early_quirks();
 
 	/*
-	 * Read APIC and some other early information from ACPI tables.
+	 * Parse SMP configuration. Try ACPI first and then the platform
+	 * specific parser.
 	 */
 	acpi_boot_init();
-	x86_dtb_init();
+	x86_init.mpparse.parse_smp_cfg();
 
-	/*
-	 * get boot-time SMP configuration:
-	 */
-	get_smp_config();
-
-	/*
-	 * Systems w/o ACPI and mptables might not have it mapped the local
-	 * APIC yet, but prefill_possible_map() might need to access it.
-	 */
+	/* Last opportunity to detect and map the local APIC */
 	init_apic_mappings();
 
-	prefill_possible_map();
+	topology_init_possible_cpus();
 
 	init_cpu_to_node();
 	init_gi_nodes();
@@ -1422,3 +1418,10 @@ static int __init register_kernel_offset_dumper(void)
 	return 0;
 }
 __initcall(register_kernel_offset_dumper);
+
+#ifdef CONFIG_HOTPLUG_CPU
+bool arch_cpu_is_hotpluggable(int cpu)
+{
+	return cpu > 0;
+}
+#endif /* CONFIG_HOTPLUG_CPU */

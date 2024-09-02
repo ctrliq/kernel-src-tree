@@ -443,7 +443,7 @@ void native_tss_update_io_bitmap(void)
 	/*
 	 * Make sure that the TSS limit is covering the IO bitmap. It might have
 	 * been cut down by a VMEXIT to 0x67 which would cause a subsequent I/O
-	 * access from user space to trigger a #GP because tbe bitmap is outside
+	 * access from user space to trigger a #GP because the bitmap is outside
 	 * the TSS limit.
 	 */
 	refresh_tss_limit();
@@ -897,7 +897,7 @@ static __cpuidle void mwait_idle(void)
 void select_idle_routine(const struct cpuinfo_x86 *c)
 {
 #ifdef CONFIG_SMP
-	if (boot_option_idle_override == IDLE_POLL && smp_num_siblings > 1)
+	if (boot_option_idle_override == IDLE_POLL && __max_threads_per_core > 1)
 		pr_warn_once("WARNING: polling idle and HT enabled, performance may degrade\n");
 #endif
 	if (x86_idle || boot_option_idle_override == IDLE_POLL)
