@@ -91,61 +91,6 @@
 #define MDIO_C22EXT_STAT_SGMII_TX_FRAME_ALIGN_ERR	0xd31a
 #define MDIO_C22EXT_STAT_SGMII_TX_RUNT_FRAMES		0xd31b
 
-/* Vendor specific 1, MDIO_MMD_VEND1 */
-#define VEND1_GLOBAL_FW_ID			0x0020
-#define VEND1_GLOBAL_FW_ID_MAJOR		GENMASK(15, 8)
-#define VEND1_GLOBAL_FW_ID_MINOR		GENMASK(7, 0)
-
-#define VEND1_GLOBAL_GEN_STAT2			0xc831
-#define VEND1_GLOBAL_GEN_STAT2_OP_IN_PROG	BIT(15)
-
-/* The following registers all have similar layouts; first the registers... */
-#define VEND1_GLOBAL_CFG_10M			0x0310
-#define VEND1_GLOBAL_CFG_100M			0x031b
-#define VEND1_GLOBAL_CFG_1G			0x031c
-#define VEND1_GLOBAL_CFG_2_5G			0x031d
-#define VEND1_GLOBAL_CFG_5G			0x031e
-#define VEND1_GLOBAL_CFG_10G			0x031f
-/* ...and now the fields */
-#define VEND1_GLOBAL_CFG_RATE_ADAPT		GENMASK(8, 7)
-#define VEND1_GLOBAL_CFG_RATE_ADAPT_NONE	0
-#define VEND1_GLOBAL_CFG_RATE_ADAPT_USX		1
-#define VEND1_GLOBAL_CFG_RATE_ADAPT_PAUSE	2
-
-#define VEND1_GLOBAL_RSVD_STAT1			0xc885
-#define VEND1_GLOBAL_RSVD_STAT1_FW_BUILD_ID	GENMASK(7, 4)
-#define VEND1_GLOBAL_RSVD_STAT1_PROV_ID		GENMASK(3, 0)
-
-#define VEND1_GLOBAL_RSVD_STAT9			0xc88d
-#define VEND1_GLOBAL_RSVD_STAT9_MODE		GENMASK(7, 0)
-#define VEND1_GLOBAL_RSVD_STAT9_1000BT2		0x23
-
-#define VEND1_GLOBAL_INT_STD_STATUS		0xfc00
-#define VEND1_GLOBAL_INT_VEND_STATUS		0xfc01
-
-#define VEND1_GLOBAL_INT_STD_MASK		0xff00
-#define VEND1_GLOBAL_INT_STD_MASK_PMA1		BIT(15)
-#define VEND1_GLOBAL_INT_STD_MASK_PMA2		BIT(14)
-#define VEND1_GLOBAL_INT_STD_MASK_PCS1		BIT(13)
-#define VEND1_GLOBAL_INT_STD_MASK_PCS2		BIT(12)
-#define VEND1_GLOBAL_INT_STD_MASK_PCS3		BIT(11)
-#define VEND1_GLOBAL_INT_STD_MASK_PHY_XS1	BIT(10)
-#define VEND1_GLOBAL_INT_STD_MASK_PHY_XS2	BIT(9)
-#define VEND1_GLOBAL_INT_STD_MASK_AN1		BIT(8)
-#define VEND1_GLOBAL_INT_STD_MASK_AN2		BIT(7)
-#define VEND1_GLOBAL_INT_STD_MASK_GBE		BIT(6)
-#define VEND1_GLOBAL_INT_STD_MASK_ALL		BIT(0)
-
-#define VEND1_GLOBAL_INT_VEND_MASK		0xff01
-#define VEND1_GLOBAL_INT_VEND_MASK_PMA		BIT(15)
-#define VEND1_GLOBAL_INT_VEND_MASK_PCS		BIT(14)
-#define VEND1_GLOBAL_INT_VEND_MASK_PHY_XS	BIT(13)
-#define VEND1_GLOBAL_INT_VEND_MASK_AN		BIT(12)
-#define VEND1_GLOBAL_INT_VEND_MASK_GBE		BIT(11)
-#define VEND1_GLOBAL_INT_VEND_MASK_GLOBAL1	BIT(2)
-#define VEND1_GLOBAL_INT_VEND_MASK_GLOBAL2	BIT(1)
-#define VEND1_GLOBAL_INT_VEND_MASK_GLOBAL3	BIT(0)
-
 /* Sleep and timeout for checking if the Processor-Intensive
  * MDIO operation is finished
  */
@@ -711,12 +656,92 @@ static int aqr107_resume(struct phy_device *phydev)
 	return aqr107_wait_processor_intensive_op(phydev);
 }
 
+static const u16 aqr_global_cfg_regs[] = {
+	VEND1_GLOBAL_CFG_10M,
+	VEND1_GLOBAL_CFG_100M,
+	VEND1_GLOBAL_CFG_1G,
+	VEND1_GLOBAL_CFG_2_5G,
+	VEND1_GLOBAL_CFG_5G,
+	VEND1_GLOBAL_CFG_10G
+};
+
+static int aqr107_fill_interface_modes(struct phy_device *phydev)
+{
+	unsigned long *possible = phydev->possible_interfaces;
+	unsigned int serdes_mode, rate_adapt;
+	phy_interface_t interface;
+	int i, val;
+
+	/* Walk the media-speed configuration registers to determine which
+	 * host-side serdes modes may be used by the PHY depending on the
+	 * negotiated media speed.
+	 */
+	for (i = 0; i < ARRAY_SIZE(aqr_global_cfg_regs); i++) {
+		val = phy_read_mmd(phydev, MDIO_MMD_VEND1,
+				   aqr_global_cfg_regs[i]);
+		if (val < 0)
+			return val;
+
+		serdes_mode = FIELD_GET(VEND1_GLOBAL_CFG_SERDES_MODE, val);
+		rate_adapt = FIELD_GET(VEND1_GLOBAL_CFG_RATE_ADAPT, val);
+
+		switch (serdes_mode) {
+		case VEND1_GLOBAL_CFG_SERDES_MODE_XFI:
+			if (rate_adapt == VEND1_GLOBAL_CFG_RATE_ADAPT_USX)
+				interface = PHY_INTERFACE_MODE_USXGMII;
+			else
+				interface = PHY_INTERFACE_MODE_10GBASER;
+			break;
+
+		case VEND1_GLOBAL_CFG_SERDES_MODE_XFI5G:
+			interface = PHY_INTERFACE_MODE_5GBASER;
+			break;
+
+		case VEND1_GLOBAL_CFG_SERDES_MODE_OCSGMII:
+			interface = PHY_INTERFACE_MODE_2500BASEX;
+			break;
+
+		case VEND1_GLOBAL_CFG_SERDES_MODE_SGMII:
+			interface = PHY_INTERFACE_MODE_SGMII;
+			break;
+
+		default:
+			phydev_warn(phydev, "unrecognised serdes mode %u\n",
+				    serdes_mode);
+			interface = PHY_INTERFACE_MODE_NA;
+			break;
+		}
+
+		if (interface != PHY_INTERFACE_MODE_NA)
+			__set_bit(interface, possible);
+	}
+
+	return 0;
+}
+
+static int aqr113c_config_init(struct phy_device *phydev)
+{
+	int ret;
+
+	ret = aqr107_config_init(phydev);
+	if (ret < 0)
+		return ret;
+
+	return aqr107_fill_interface_modes(phydev);
+}
+
 static int aqr107_probe(struct phy_device *phydev)
 {
+	int ret;
+
 	phydev->priv = devm_kzalloc(&phydev->mdio.dev,
 				    sizeof(struct aqr107_priv), GFP_KERNEL);
 	if (!phydev->priv)
 		return -ENOMEM;
+
+	ret = aqr_firmware_load(phydev);
+	if (ret)
+		return ret;
 
 	return aqr_hwmon_probe(phydev);
 }
@@ -843,7 +868,7 @@ static struct phy_driver aqr_driver[] = {
 	.name           = "Aquantia AQR113C",
 	.probe          = aqr107_probe,
 	.get_rate_matching = aqr107_get_rate_matching,
-	.config_init    = aqr107_config_init,
+	.config_init    = aqr113c_config_init,
 	.config_aneg    = aqr_config_aneg,
 	.config_intr    = aqr_config_intr,
 	.handle_interrupt       = aqr_handle_interrupt,
