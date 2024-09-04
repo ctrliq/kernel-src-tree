@@ -1128,8 +1128,6 @@ enum {
 #define PCI_IRQ_MSIX		(1 << 2) /* Allow MSI-X interrupts */
 #define PCI_IRQ_AFFINITY	(1 << 3) /* Auto-assign affinity */
 
-#define PCI_IRQ_LEGACY		PCI_IRQ_INTX /* Deprecated! Use PCI_IRQ_INTX */
-
 /* These external functions are only available when PCI support is enabled */
 #ifdef CONFIG_PCI
 
@@ -1366,7 +1364,6 @@ int pci_user_write_config_word(struct pci_dev *dev, int where, u16 val);
 int pci_user_write_config_dword(struct pci_dev *dev, int where, u32 val);
 
 int __must_check pci_enable_device(struct pci_dev *dev);
-int __must_check pci_enable_device_io(struct pci_dev *dev);
 int __must_check pci_enable_device_mem(struct pci_dev *dev);
 int __must_check pci_reenable_device(struct pci_dev *);
 int __must_check pcim_enable_device(struct pci_dev *pdev);
@@ -1699,8 +1696,7 @@ int pci_set_vga_state(struct pci_dev *pdev, bool decode,
  */
 #define PCI_IRQ_VIRTUAL		(1 << 4)
 
-#define PCI_IRQ_ALL_TYPES \
-	(PCI_IRQ_LEGACY | PCI_IRQ_MSI | PCI_IRQ_MSIX)
+#define PCI_IRQ_ALL_TYPES	(PCI_IRQ_INTX | PCI_IRQ_MSI | PCI_IRQ_MSIX)
 
 #include <linux/dmapool.h>
 
@@ -1763,7 +1759,7 @@ pci_alloc_irq_vectors_affinity(struct pci_dev *dev, unsigned int min_vecs,
 			       unsigned int max_vecs, unsigned int flags,
 			       struct irq_affinity *aff_desc)
 {
-	if ((flags & PCI_IRQ_LEGACY) && min_vecs == 1 && dev->irq)
+	if ((flags & PCI_IRQ_INTX) && min_vecs == 1 && dev->irq)
 		return 1;
 	return -ENOSPC;
 }
@@ -1846,17 +1842,21 @@ extern bool pcie_ports_native;
 #define pcie_ports_native	false
 #endif
 
-#define PCIE_LINK_STATE_L0S		BIT(0)
-#define PCIE_LINK_STATE_L1		BIT(1)
-#define PCIE_LINK_STATE_CLKPM		BIT(2)
-#define PCIE_LINK_STATE_L1_1		BIT(3)
-#define PCIE_LINK_STATE_L1_2		BIT(4)
-#define PCIE_LINK_STATE_L1_1_PCIPM	BIT(5)
-#define PCIE_LINK_STATE_L1_2_PCIPM	BIT(6)
-#define PCIE_LINK_STATE_ALL		(PCIE_LINK_STATE_L0S | PCIE_LINK_STATE_L1 |\
-					 PCIE_LINK_STATE_CLKPM | PCIE_LINK_STATE_L1_1 |\
-					 PCIE_LINK_STATE_L1_2 | PCIE_LINK_STATE_L1_1_PCIPM |\
+#define PCIE_LINK_STATE_L0S		(BIT(0) | BIT(1)) /* Upstr/dwnstr L0s */
+#define PCIE_LINK_STATE_L1		BIT(2)	/* L1 state */
+#define PCIE_LINK_STATE_L1_1		BIT(3)	/* ASPM L1.1 state */
+#define PCIE_LINK_STATE_L1_2		BIT(4)	/* ASPM L1.2 state */
+#define PCIE_LINK_STATE_L1_1_PCIPM	BIT(5)	/* PCI-PM L1.1 state */
+#define PCIE_LINK_STATE_L1_2_PCIPM	BIT(6)	/* PCI-PM L1.2 state */
+#define PCIE_LINK_STATE_ASPM_ALL	(PCIE_LINK_STATE_L0S		|\
+					 PCIE_LINK_STATE_L1		|\
+					 PCIE_LINK_STATE_L1_1		|\
+					 PCIE_LINK_STATE_L1_2		|\
+					 PCIE_LINK_STATE_L1_1_PCIPM	|\
 					 PCIE_LINK_STATE_L1_2_PCIPM)
+#define PCIE_LINK_STATE_CLKPM		BIT(7)
+#define PCIE_LINK_STATE_ALL		(PCIE_LINK_STATE_ASPM_ALL	|\
+					 PCIE_LINK_STATE_CLKPM)
 
 #ifdef CONFIG_PCIEASPM
 int pci_disable_link_state(struct pci_dev *pdev, int state);
@@ -2039,10 +2039,9 @@ static inline int pci_register_driver(struct pci_driver *drv)
 static inline void pci_unregister_driver(struct pci_driver *drv) { }
 static inline u8 pci_find_capability(struct pci_dev *dev, int cap)
 { return 0; }
-static inline int pci_find_next_capability(struct pci_dev *dev, u8 post,
-					   int cap)
+static inline u8 pci_find_next_capability(struct pci_dev *dev, u8 post, int cap)
 { return 0; }
-static inline int pci_find_ext_capability(struct pci_dev *dev, int cap)
+static inline u16 pci_find_ext_capability(struct pci_dev *dev, int cap)
 { return 0; }
 
 static inline u64 pci_get_dsn(struct pci_dev *dev)
@@ -2544,7 +2543,12 @@ static inline struct pci_dev *pcie_find_root_port(struct pci_dev *dev)
 
 static inline bool pci_dev_is_disconnected(const struct pci_dev *dev)
 {
-	return dev->error_state == pci_channel_io_perm_failure;
+	/*
+	 * error_state is set in pci_dev_set_io_state() using xchg/cmpxchg()
+	 * and read w/o common lock. READ_ONCE() ensures compiler cannot cache
+	 * the value (e.g. inside the loop in pci_dev_wait()).
+	 */
+	return READ_ONCE(dev->error_state) == pci_channel_io_perm_failure;
 }
 
 void pci_request_acs(void);
@@ -2718,14 +2722,6 @@ bool pci_rh_check_status(struct pci_dev *pci_dev);
 #if defined(CONFIG_PCIEPORTBUS) || defined(CONFIG_EEH)
 void pci_uevent_ers(struct pci_dev *pdev, enum  pci_ers_result err_type);
 #endif
-
-struct msi_domain_template;
-
-bool pci_create_ims_domain(struct pci_dev *pdev, const struct msi_domain_template *template,
-			   unsigned int hwsize, void *data);
-struct msi_map pci_ims_alloc_irq(struct pci_dev *pdev, union msi_instance_cookie *icookie,
-				 const struct irq_affinity_desc *affdesc);
-void pci_ims_free_irq(struct pci_dev *pdev, struct msi_map map);
 
 /* Provide the legacy pci_dma_* API */
 #include <linux/pci-dma-compat.h>

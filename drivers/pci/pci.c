@@ -142,8 +142,8 @@ enum pcie_bus_config_types pcie_bus_config = PCIE_BUS_DEFAULT;
  * the dfl or actual value as it sees fit.  Don't forget this is
  * measured in 32-bit words, not bytes.
  */
-u8 pci_dfl_cache_line_size = L1_CACHE_BYTES >> 2;
-u8 pci_cache_line_size;
+u8 pci_dfl_cache_line_size __ro_after_init = L1_CACHE_BYTES >> 2;
+u8 pci_cache_line_size __ro_after_init ;
 
 /*
  * If we set up a device for bus mastering, we need to check the latency
@@ -1277,6 +1277,11 @@ static int pci_dev_wait(struct pci_dev *dev, char *reset_type, int timeout)
 	for (;;) {
 		u32 id;
 
+		if (pci_dev_is_disconnected(dev)) {
+			pci_dbg(dev, "disconnected; not waiting\n");
+			return -ENOTTY;
+		}
+
 		pci_read_config_dword(dev, PCI_COMMAND, &id);
 		if (!PCI_POSSIBLE_ERROR(id))
 			break;
@@ -2109,20 +2114,6 @@ static int pci_enable_device_flags(struct pci_dev *dev, unsigned long flags)
 		atomic_dec(&dev->enable_cnt);
 	return err;
 }
-
-/**
- * pci_enable_device_io - Initialize a device for use with IO space
- * @dev: PCI device to be initialized
- *
- * Initialize device before it's used by a driver. Ask low-level code
- * to enable I/O resources. Wake up the device if it was suspended.
- * Beware, this function can fail.
- */
-int pci_enable_device_io(struct pci_dev *dev)
-{
-	return pci_enable_device_flags(dev, IORESOURCE_IO);
-}
-EXPORT_SYMBOL(pci_enable_device_io);
 
 /**
  * pci_enable_device_mem - Initialize a device for use with Memory space
@@ -2960,6 +2951,18 @@ static const struct dmi_system_id bridge_d3_blacklist[] = {
 			DMI_MATCH(DMI_BOARD_VENDOR, "Elo Touch Solutions"),
 			DMI_MATCH(DMI_BOARD_NAME, "Geminilake"),
 			DMI_MATCH(DMI_BOARD_VERSION, "Continental Z2"),
+		},
+	},
+	{
+		/*
+		 * Changing power state of root port dGPU is connected fails
+		 * https://gitlab.freedesktop.org/drm/amd/-/issues/3229
+		 */
+		.ident = "Hewlett-Packard HP Pavilion 17 Notebook PC/1972",
+		.matches = {
+			DMI_MATCH(DMI_BOARD_VENDOR, "Hewlett-Packard"),
+			DMI_MATCH(DMI_BOARD_NAME, "1972"),
+			DMI_MATCH(DMI_BOARD_VERSION, "95.33"),
 		},
 	},
 #endif
@@ -4625,11 +4628,12 @@ int pcie_retrain_link(struct pci_dev *pdev, bool use_lt)
 
 	/*
 	 * Ensure the updated LNKCTL parameters are used during link
-	 * training by checking that there is no ongoing link training to
-	 * avoid LTSSM race as recommended in Implementation Note at the
-	 * end of PCIe r6.0.1 sec 7.5.3.7.
+	 * training by checking that there is no ongoing link training that
+	 * may have started before link parameters were changed, so as to
+	 * avoid LTSSM race as recommended in Implementation Note at the end
+	 * of PCIe r6.1 sec 7.5.3.7.
 	 */
-	rc = pcie_wait_for_link_status(pdev, use_lt, !use_lt);
+	rc = pcie_wait_for_link_status(pdev, true, false);
 	if (rc)
 		return rc;
 
@@ -5245,10 +5249,19 @@ void pci_init_reset_methods(struct pci_dev *dev)
  */
 int pci_reset_function(struct pci_dev *dev)
 {
+	struct pci_dev *bridge;
 	int rc;
 
 	if (!pci_reset_supported(dev))
 		return -ENOTTY;
+
+	/*
+	 * If there's no upstream bridge, no locking is needed since there is
+	 * no upstream bridge configuration to hold consistent.
+	 */
+	bridge = pci_upstream_bridge(dev);
+	if (bridge)
+		pci_dev_lock(bridge);
 
 	pci_dev_lock(dev);
 	pci_dev_save_and_disable(dev);
@@ -5257,6 +5270,9 @@ int pci_reset_function(struct pci_dev *dev)
 
 	pci_dev_restore(dev);
 	pci_dev_unlock(dev);
+
+	if (bridge)
+		pci_dev_unlock(bridge);
 
 	return rc;
 }
@@ -6031,8 +6047,9 @@ EXPORT_SYMBOL(pcie_get_width_cap);
  * and width, multiplying them, and applying encoding overhead.  The result
  * is in Mb/s, i.e., megabits/second of raw bandwidth.
  */
-u32 pcie_bandwidth_capable(struct pci_dev *dev, enum pci_bus_speed *speed,
-			   enum pcie_link_width *width)
+static u32 pcie_bandwidth_capable(struct pci_dev *dev,
+				  enum pci_bus_speed *speed,
+				  enum pcie_link_width *width)
 {
 	*speed = pcie_get_speed_cap(dev);
 	*width = pcie_get_width_cap(dev);
