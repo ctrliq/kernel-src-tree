@@ -2316,8 +2316,6 @@ static void unregister_region(void *_cxlr)
 	struct cxl_region_params *p = &cxlr->params;
 	int i;
 
-	unregister_memory_notifier(&cxlr->memory_notifier);
-	unregister_mt_adistance_algorithm(&cxlr->adist_notifier);
 	device_del(&cxlr->dev);
 
 	/*
@@ -2394,18 +2392,6 @@ static bool cxl_region_update_coordinates(struct cxl_region *cxlr, int nid)
 	return true;
 }
 
-static int cxl_region_nid(struct cxl_region *cxlr)
-{
-	struct cxl_region_params *p = &cxlr->params;
-	struct resource *res;
-
-	guard(rwsem_read)(&cxl_region_rwsem);
-	res = p->res;
-	if (!res)
-		return NUMA_NO_NODE;
-	return phys_to_target_node(res->start);
-}
-
 static int cxl_region_perf_attrs_callback(struct notifier_block *nb,
 					  unsigned long action, void *arg)
 {
@@ -2418,7 +2404,11 @@ static int cxl_region_perf_attrs_callback(struct notifier_block *nb,
 	if (nid == NUMA_NO_NODE || action != MEM_ONLINE)
 		return NOTIFY_DONE;
 
-	region_nid = cxl_region_nid(cxlr);
+	/*
+	 * No need to hold cxl_region_rwsem; region parameters are stable
+	 * within the cxl_region driver.
+	 */
+	region_nid = phys_to_target_node(cxlr->params.res->start);
 	if (nid != region_nid)
 		return NOTIFY_DONE;
 
@@ -2437,7 +2427,11 @@ static int cxl_region_calculate_adistance(struct notifier_block *nb,
 	int *adist = data;
 	int region_nid;
 
-	region_nid = cxl_region_nid(cxlr);
+	/*
+	 * No need to hold cxl_region_rwsem; region parameters are stable
+	 * within the cxl_region driver.
+	 */
+	region_nid = phys_to_target_node(cxlr->params.res->start);
 	if (nid != region_nid)
 		return NOTIFY_OK;
 
@@ -2486,14 +2480,6 @@ static struct cxl_region *devm_cxl_add_region(struct cxl_root_decoder *cxlrd,
 	rc = device_add(dev);
 	if (rc)
 		goto err;
-
-	cxlr->memory_notifier.notifier_call = cxl_region_perf_attrs_callback;
-	cxlr->memory_notifier.priority = CXL_CALLBACK_PRI;
-	register_memory_notifier(&cxlr->memory_notifier);
-
-	cxlr->adist_notifier.notifier_call = cxl_region_calculate_adistance;
-	cxlr->adist_notifier.priority = 100;
-	register_mt_adistance_algorithm(&cxlr->adist_notifier);
 
 	rc = devm_add_action_or_reset(port->uport_dev, unregister_region, cxlr);
 	if (rc)
@@ -3285,6 +3271,14 @@ static int is_system_ram(struct resource *res, void *arg)
 	return 1;
 }
 
+static void shutdown_notifiers(void *_cxlr)
+{
+	struct cxl_region *cxlr = _cxlr;
+
+	unregister_memory_notifier(&cxlr->memory_notifier);
+	unregister_mt_adistance_algorithm(&cxlr->adist_notifier);
+}
+
 static int cxl_region_probe(struct device *dev)
 {
 	struct cxl_region *cxlr = to_cxl_region(dev);
@@ -3317,6 +3311,18 @@ static int cxl_region_probe(struct device *dev)
 out:
 	up_read(&cxl_region_rwsem);
 
+	if (rc)
+		return rc;
+
+	cxlr->memory_notifier.notifier_call = cxl_region_perf_attrs_callback;
+	cxlr->memory_notifier.priority = CXL_CALLBACK_PRI;
+	register_memory_notifier(&cxlr->memory_notifier);
+
+	cxlr->adist_notifier.notifier_call = cxl_region_calculate_adistance;
+	cxlr->adist_notifier.priority = 100;
+	register_mt_adistance_algorithm(&cxlr->adist_notifier);
+
+	rc = devm_add_action_or_reset(&cxlr->dev, shutdown_notifiers, cxlr);
 	if (rc)
 		return rc;
 
