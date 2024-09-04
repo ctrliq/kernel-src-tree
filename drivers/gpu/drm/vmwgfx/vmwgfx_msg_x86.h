@@ -105,24 +105,28 @@
                         flags, magic, bp,		\
                         eax, ebx, ecx, edx, si, di)	\
 ({							\
-        asm volatile ("push %%rbp;"                     \
-                "mov %12, %%rbp;"                       \
-                VMWARE_HYPERCALL_HB_OUT                 \
-                "pop %%rbp;" :                          \
-                "=a"(eax),                              \
-                "=b"(ebx),                              \
-                "=c"(ecx),                              \
-                "=d"(edx),                              \
-                "=S"(si),                               \
-                "=D"(di) :                              \
-                "a"(magic),                             \
-                "b"(cmd),                               \
-                "c"(in_ecx),                            \
-                "d"(flags),                             \
-                "S"(in_si),                             \
-                "D"(in_di),                             \
-                "r"(bp) :                               \
-                "memory", "cc");                        \
+        asm volatile (					\
+		UNWIND_HINT_SAVE			\
+		"push %%rbp;"				\
+		UNWIND_HINT_UNDEFINED			\
+                "mov %12, %%rbp;"			\
+                VMWARE_HYPERCALL_HB_OUT			\
+                "pop %%rbp;"				\
+		UNWIND_HINT_RESTORE :			\
+                "=a"(eax),				\
+                "=b"(ebx),				\
+                "=c"(ecx),				\
+                "=d"(edx),				\
+                "=S"(si),				\
+                "=D"(di) :				\
+                "a"(magic),				\
+                "b"(cmd),				\
+                "c"(in_ecx),				\
+                "d"(flags),				\
+                "S"(in_si),				\
+                "D"(in_di),				\
+                "r"(bp) :				\
+                "memory", "cc");			\
 })
 
 
@@ -130,24 +134,28 @@
                        flags, magic, bp,		\
                        eax, ebx, ecx, edx, si, di)	\
 ({							\
-        asm volatile ("push %%rbp;"                     \
-                "mov %12, %%rbp;"                       \
-                VMWARE_HYPERCALL_HB_IN                  \
-                "pop %%rbp" :                           \
-                "=a"(eax),                              \
-                "=b"(ebx),                              \
-                "=c"(ecx),                              \
-                "=d"(edx),                              \
-                "=S"(si),                               \
-                "=D"(di) :                              \
-                "a"(magic),                             \
-                "b"(cmd),                               \
-                "c"(in_ecx),                            \
-                "d"(flags),                             \
-                "S"(in_si),                             \
-                "D"(in_di),                             \
-                "r"(bp) :                               \
-                "memory", "cc");                        \
+        asm volatile (					\
+		UNWIND_HINT_SAVE			\
+		"push %%rbp;"				\
+		UNWIND_HINT_UNDEFINED			\
+                "mov %12, %%rbp;"			\
+                VMWARE_HYPERCALL_HB_IN			\
+                "pop %%rbp;"				\
+		UNWIND_HINT_RESTORE :			\
+                "=a"(eax),				\
+                "=b"(ebx),				\
+                "=c"(ecx),				\
+                "=d"(edx),				\
+                "=S"(si),				\
+                "=D"(di) :				\
+                "a"(magic),				\
+                "b"(cmd),				\
+                "c"(in_ecx),				\
+                "d"(flags),				\
+                "S"(in_si),				\
+                "D"(in_di),				\
+                "r"(bp) :				\
+                "memory", "cc");			\
 })
 
 #elif defined(__i386__)
