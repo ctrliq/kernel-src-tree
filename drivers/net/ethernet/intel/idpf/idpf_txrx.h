@@ -133,7 +133,7 @@ do {								\
  */
 #define IDPF_TX_COMPLQ_PENDING(txq)	\
 	(((txq)->num_completions_pending >= (txq)->complq->num_completions ? \
-	0 : U64_MAX) + \
+	0 : U32_MAX) + \
 	(txq)->num_completions_pending - (txq)->complq->num_completions)
 
 #define IDPF_TX_SPLITQ_COMPL_TAG_WIDTH	16
@@ -847,7 +847,7 @@ struct idpf_compl_queue {
 
 	struct net_device *netdev;
 	u32 clean_budget;
-	u32 num_completions;
+	aligned_u64 num_completions;
 
 	/* Slowpath */
 	u32 q_id;
@@ -968,7 +968,7 @@ struct idpf_txq_group {
 
 	struct idpf_compl_queue *complq;
 
-	u32 num_completions_pending;
+	aligned_u64 num_completions_pending;
 };
 
 /**
