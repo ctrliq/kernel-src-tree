@@ -2313,9 +2313,6 @@ bool compaction_zonelist_suitable(struct alloc_context *ac, int order,
 		unsigned long available;
 		unsigned long watermark;
 
-		if (is_via_compact_memory(order))
-			return true;
-
 		/* Allocation can already succeed, nothing to do */
 		watermark = wmark_pages(zone, alloc_flags & ALLOC_WMARK_MASK);
 		if (zone_watermark_ok(zone, order, watermark,
@@ -2881,9 +2878,6 @@ static bool kcompactd_node_suitable(pg_data_t *pgdat)
 		if (!populated_zone(zone))
 			continue;
 
-		if (is_via_compact_memory(pgdat->kcompactd_max_order))
-			return true;
-
 		/* Allocation can already succeed, check other zones */
 		if (zone_watermark_ok(zone, pgdat->kcompactd_max_order,
 				      min_wmark_pages(zone),
@@ -2928,9 +2922,6 @@ static void kcompactd_do_work(pg_data_t *pgdat)
 		if (compaction_deferred(zone, cc.order))
 			continue;
 
-		if (is_via_compact_memory(cc.order))
-			goto compact;
-
 		/* Allocation can already succeed, nothing to do */
 		if (zone_watermark_ok(zone, cc.order,
 				      min_wmark_pages(zone), zoneid, 0))
@@ -2939,7 +2930,7 @@ static void kcompactd_do_work(pg_data_t *pgdat)
 		if (compaction_suitable(zone, cc.order,
 					zoneid) != COMPACT_CONTINUE)
 			continue;
-compact:
+
 		if (kthread_should_stop())
 			return;
 
