@@ -2146,7 +2146,7 @@ static unsigned long __init free_low_memory_core_early(void)
 
 static int reset_managed_pages_done __initdata;
 
-void reset_node_managed_pages(pg_data_t *pgdat)
+static void __init reset_node_managed_pages(pg_data_t *pgdat)
 {
 	struct zone *z;
 
