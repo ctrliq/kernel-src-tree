@@ -5377,7 +5377,7 @@ struct vm_area_struct *lock_mm_and_find_vma(struct mm_struct *mm,
 			goto fail;
 	}
 
-	if (expand_stack_locked(vma, addr, true))
+	if (expand_stack_locked(vma, addr))
 		goto fail;
 
 success:
@@ -5737,25 +5737,31 @@ int __access_remote_vm(struct mm_struct *mm, unsigned long addr, void *buf,
 							     gup_flags, &vma);
 
 		if (IS_ERR_OR_NULL(page)) {
-#ifndef CONFIG_HAVE_IOREMAP_PROT
-			break;
-#else
-			int res = 0;
+			/* We might need to expand the stack to access it */
+			vma = vma_lookup(mm, addr);
+			if (!vma) {
+				vma = expand_stack(mm, addr);
+
+				/* mmap_lock was dropped on failure */
+				if (!vma)
+					return buf - old_buf;
+
+				/* Try again if stack expansion worked */
+				continue;
+			}
 
 			/*
 			 * Check if this is a VM_IO | VM_PFNMAP VMA, which
 			 * we can access using slightly different code.
 			 */
-			vma = vma_lookup(mm, addr);
-			if (!vma)
-				break;
+			bytes = 0;
+#ifdef CONFIG_HAVE_IOREMAP_PROT
 			if (vma->vm_ops && vma->vm_ops->access)
-				res = vma->vm_ops->access(vma, addr, buf,
-							  len, write);
-			if (res <= 0)
-				break;
-			bytes = res;
+				bytes = vma->vm_ops->access(vma, addr, buf,
+							    len, write);
 #endif
+			if (bytes <= 0)
+				break;
 		} else {
 			bytes = len;
 			offset = addr & (PAGE_SIZE-1);
