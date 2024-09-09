@@ -36,8 +36,11 @@
 #include <asm/cpu.h>
 
 #ifdef CONFIG_HOTPLUG_CPU
-bool arch_cpu_is_hotpluggable(int cpu)
+int arch_register_cpu(int cpu)
 {
-	return cpu > 0;
+	struct cpu *c = per_cpu_ptr(&cpu_devices, cpu);
+
+	c->hotpluggable = cpu > 0;
+	return register_cpu(c, cpu);
 }
 #endif /* CONFIG_HOTPLUG_CPU */
