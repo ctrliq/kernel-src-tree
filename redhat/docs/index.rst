@@ -79,7 +79,7 @@ commands to install missing packages:
 .. code-block:: sh
 
    # install missing build dependencies
-   yum -y install $(make dist-get-buildreqs | grep "Missing dependencies:" | cut -d":" -f2)
+   sudo dnf -y install $(make dist-get-buildreqs | grep "Missing dependencies:" | cut -d":" -f2-)
 
 Some packages may require the enabling of additional repositories such as the
 system-sb-certs package which can be found in a Centos-Stream or RHEL CodeReady
