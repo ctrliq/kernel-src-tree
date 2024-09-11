@@ -1,0 +1,588 @@
+tipc: introduce Gap ACK blocks for broadcast link
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Tuong Lien <tuong.t.lien@dektech.com.au>
+commit d7626b5acff9227e2a65da636a53e09bdafdc0aa
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/d7626b5a.failed
+
+As achieved through commit 9195948fbf34 ("tipc: improve TIPC throughput
+by Gap ACK blocks"), we apply the same mechanism for the broadcast link
+as well. The 'Gap ACK blocks' data field in a 'PROTOCOL/STATE_MSG' will
+consist of two parts built for both the broadcast and unicast types:
+
+ 31                       16 15                        0
++-------------+-------------+-------------+-------------+
+|  bgack_cnt  |  ugack_cnt  |            len            |
++-------------+-------------+-------------+-------------+  -
+|            gap            |            ack            |   |
++-------------+-------------+-------------+-------------+    > bc gacks
+:                           :                           :   |
++-------------+-------------+-------------+-------------+  -
+|            gap            |            ack            |   |
++-------------+-------------+-------------+-------------+    > uc gacks
+:                           :                           :   |
++-------------+-------------+-------------+-------------+  -
+
+which is "automatically" backward-compatible.
+
+We also increase the max number of Gap ACK blocks to 128, allowing upto
+64 blocks per type (total buffer size = 516 bytes).
+
+Besides, the 'tipc_link_advance_transmq()' function is refactored which
+is applicable for both the unicast and broadcast cases now, so some old
+functions can be removed and the code is optimized.
+
+With the patch, TIPC broadcast is more robust regardless of packet loss
+or disorder, latency, ... in the underlying network. Its performance is
+boost up significantly.
+For example, experiment with a 5% packet loss rate results:
+
+$ time tipc-pipe --mc --rdm --data_size 123 --data_num 1500000
+real    0m 42.46s
+user    0m 1.16s
+sys     0m 17.67s
+
+Without the patch:
+
+$ time tipc-pipe --mc --rdm --data_size 123 --data_num 1500000
+real    8m 27.94s
+user    0m 0.55s
+sys     0m 2.38s
+
+	Acked-by: Ying Xue <ying.xue@windriver.com>
+	Acked-by: Jon Maloy <jmaloy@redhat.com>
+	Signed-off-by: Tuong Lien <tuong.t.lien@dektech.com.au>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit d7626b5acff9227e2a65da636a53e09bdafdc0aa)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/tipc/link.c
+#	net/tipc/link.h
+diff --cc net/tipc/link.c
+index 91be69d1779e,d29b9c531171..000000000000
+--- a/net/tipc/link.c
++++ b/net/tipc/link.c
+@@@ -243,12 -251,16 +245,25 @@@ static int tipc_link_build_nack_msg(str
+  				    struct sk_buff_head *xmitq);
+  static void tipc_link_build_bc_init_msg(struct tipc_link *l,
+  					struct sk_buff_head *xmitq);
+++<<<<<<< HEAD
+ +static bool tipc_link_release_pkts(struct tipc_link *l, u16 to);
+ +static u16 tipc_build_gap_ack_blks(struct tipc_link *l, void *data);
+ +static int tipc_link_advance_transmq(struct tipc_link *l, u16 acked, u16 gap,
+ +				     struct tipc_gap_ack_blks *ga,
+ +				     struct sk_buff_head *xmitq);
+ +
+++=======
++ static u8 __tipc_build_gap_ack_blks(struct tipc_gap_ack_blks *ga,
++ 				    struct tipc_link *l, u8 start_index);
++ static u16 tipc_build_gap_ack_blks(struct tipc_link *l, struct tipc_msg *hdr);
++ static int tipc_link_advance_transmq(struct tipc_link *l, struct tipc_link *r,
++ 				     u16 acked, u16 gap,
++ 				     struct tipc_gap_ack_blks *ga,
++ 				     struct sk_buff_head *xmitq,
++ 				     bool *retransmitted, int *rc);
++ static void tipc_link_update_cwin(struct tipc_link *l, int released,
++ 				  bool retransmitted);
+++>>>>>>> d7626b5acff9 (tipc: introduce Gap ACK blocks for broadcast link)
+  /*
+   *  Simple non-static link routines (i.e. referenced outside this file)
+   */
+@@@ -1118,59 -1197,6 +1136,62 @@@ static bool link_retransmit_failure(str
+  	return true;
+  }
+  
+++<<<<<<< HEAD
+ +/* tipc_link_bc_retrans() - retransmit zero or more packets
+ + * @l: the link to transmit on
+ + * @r: the receiving link ordering the retransmit. Same as l if unicast
+ + * @from: retransmit from (inclusive) this sequence number
+ + * @to: retransmit to (inclusive) this sequence number
+ + * xmitq: queue for accumulating the retransmitted packets
+ + */
+ +static int tipc_link_bc_retrans(struct tipc_link *l, struct tipc_link *r,
+ +				u16 from, u16 to, struct sk_buff_head *xmitq)
+ +{
+ +	struct sk_buff *_skb, *skb = skb_peek(&l->transmq);
+ +	u16 bc_ack = l->bc_rcvlink->rcv_nxt - 1;
+ +	u16 ack = l->rcv_nxt - 1;
+ +	struct tipc_msg *hdr;
+ +	int rc = 0;
+ +
+ +	if (!skb)
+ +		return 0;
+ +	if (less(to, from))
+ +		return 0;
+ +
+ +	trace_tipc_link_retrans(r, from, to, &l->transmq);
+ +
+ +	if (link_retransmit_failure(l, r, &rc))
+ +		return rc;
+ +
+ +	skb_queue_walk(&l->transmq, skb) {
+ +		hdr = buf_msg(skb);
+ +		if (less(msg_seqno(hdr), from))
+ +			continue;
+ +		if (more(msg_seqno(hdr), to))
+ +			break;
+ +
+ +		if (time_before(jiffies, TIPC_SKB_CB(skb)->nxt_retr))
+ +			continue;
+ +		TIPC_SKB_CB(skb)->nxt_retr = TIPC_BC_RETR_LIM;
+ +		_skb = __pskb_copy(skb, LL_MAX_HEADER + MIN_H_SIZE, GFP_ATOMIC);
+ +		if (!_skb)
+ +			return 0;
+ +		hdr = buf_msg(_skb);
+ +		msg_set_ack(hdr, ack);
+ +		msg_set_bcast_ack(hdr, bc_ack);
+ +		_skb->priority = TC_PRIO_CONTROL;
+ +		__skb_queue_tail(xmitq, _skb);
+ +		l->stats.retransmitted++;
+ +
+ +		/* Increase actual retrans counter & mark first time */
+ +		if (!TIPC_SKB_CB(skb)->retr_cnt++)
+ +			TIPC_SKB_CB(skb)->retr_stamp = jiffies;
+ +	}
+ +	return 0;
+ +}
+ +
+++=======
+++>>>>>>> d7626b5acff9 (tipc: introduce Gap ACK blocks for broadcast link)
+  /* tipc_data_input - deliver data and name distr msgs to upper layer
+   *
+   * Consumes buffer if message is of right type
+@@@ -1328,36 -1354,56 +1349,84 @@@ static int tipc_link_tnl_rcv(struct tip
+  	return rc;
+  }
+  
+++<<<<<<< HEAD
+ +static bool tipc_link_release_pkts(struct tipc_link *l, u16 acked)
+ +{
+ +	bool released = false;
+ +	struct sk_buff *skb, *tmp;
+ +
+ +	skb_queue_walk_safe(&l->transmq, skb, tmp) {
+ +		if (more(buf_seqno(skb), acked))
+ +			break;
+ +		__skb_unlink(skb, &l->transmq);
+ +		kfree_skb(skb);
+ +		released = true;
+++=======
++ /**
++  * tipc_get_gap_ack_blks - get Gap ACK blocks from PROTOCOL/STATE_MSG
++  * @ga: returned pointer to the Gap ACK blocks if any
++  * @l: the tipc link
++  * @hdr: the PROTOCOL/STATE_MSG header
++  * @uc: desired Gap ACK blocks type, i.e. unicast (= 1) or broadcast (= 0)
++  *
++  * Return: the total Gap ACK blocks size
++  */
++ u16 tipc_get_gap_ack_blks(struct tipc_gap_ack_blks **ga, struct tipc_link *l,
++ 			  struct tipc_msg *hdr, bool uc)
++ {
++ 	struct tipc_gap_ack_blks *p;
++ 	u16 sz = 0;
++ 
++ 	/* Does peer support the Gap ACK blocks feature? */
++ 	if (l->peer_caps & TIPC_GAP_ACK_BLOCK) {
++ 		p = (struct tipc_gap_ack_blks *)msg_data(hdr);
++ 		sz = ntohs(p->len);
++ 		/* Sanity check */
++ 		if (sz == tipc_gap_ack_blks_sz(p->ugack_cnt + p->bgack_cnt)) {
++ 			/* Good, check if the desired type exists */
++ 			if ((uc && p->ugack_cnt) || (!uc && p->bgack_cnt))
++ 				goto ok;
++ 		/* Backward compatible: peer might not support bc, but uc? */
++ 		} else if (uc && sz == tipc_gap_ack_blks_sz(p->ugack_cnt)) {
++ 			if (p->ugack_cnt) {
++ 				p->bgack_cnt = 0;
++ 				goto ok;
++ 			}
++ 		}
+++>>>>>>> d7626b5acff9 (tipc: introduce Gap ACK blocks for broadcast link)
+  	}
+- 	return released;
++ 	/* Other cases: ignore! */
++ 	p = NULL;
++ 
++ ok:
++ 	*ga = p;
++ 	return sz;
+  }
+  
+++<<<<<<< HEAD
+ +/* tipc_build_gap_ack_blks - build Gap ACK blocks
+ + * @l: tipc link that data have come with gaps in sequence if any
+ + * @data: data buffer to store the Gap ACK blocks after built
+ + *
+ + * returns the actual allocated memory size
+ + */
+ +static u16 tipc_build_gap_ack_blks(struct tipc_link *l, void *data)
+++=======
++ static u8 __tipc_build_gap_ack_blks(struct tipc_gap_ack_blks *ga,
++ 				    struct tipc_link *l, u8 start_index)
+++>>>>>>> d7626b5acff9 (tipc: introduce Gap ACK blocks for broadcast link)
+  {
++ 	struct tipc_gap_ack *gacks = &ga->gacks[start_index];
+  	struct sk_buff *skb = skb_peek(&l->deferdq);
+- 	struct tipc_gap_ack_blks *ga = data;
+- 	u16 len, expect, seqno = 0;
++ 	u16 expect, seqno = 0;
+  	u8 n = 0;
+  
+  	if (!skb)
+++<<<<<<< HEAD
+ +		goto exit;
+++=======
++ 		return 0;
+++>>>>>>> d7626b5acff9 (tipc: introduce Gap ACK blocks for broadcast link)
+  
+  	expect = buf_seqno(skb);
+  	skb_queue_walk(&l->deferdq, skb) {
+@@@ -1396,22 -1478,53 +1501,57 @@@ static u16 tipc_build_gap_ack_blks(stru
+   * @gap: # of gap packets
+   * @ga: buffer pointer to Gap ACK blocks from peer
+   * @xmitq: queue for accumulating the retransmitted packets if any
++  * @retransmitted: returned boolean value if a retransmission is really issued
++  * @rc: returned code e.g. TIPC_LINK_DOWN_EVT if a repeated retransmit failures
++  *      happens (- unlikely case)
+   *
+-  * In case of a repeated retransmit failures, the call will return shortly
+-  * with a returned code (e.g. TIPC_LINK_DOWN_EVT)
++  * Return: the number of packets released from the link transmq
+   */
+- static int tipc_link_advance_transmq(struct tipc_link *l, u16 acked, u16 gap,
++ static int tipc_link_advance_transmq(struct tipc_link *l, struct tipc_link *r,
++ 				     u16 acked, u16 gap,
+  				     struct tipc_gap_ack_blks *ga,
+- 				     struct sk_buff_head *xmitq)
++ 				     struct sk_buff_head *xmitq,
++ 				     bool *retransmitted, int *rc)
+  {
++ 	struct tipc_gap_ack_blks *last_ga = r->last_ga, *this_ga = NULL;
++ 	struct tipc_gap_ack *gacks = NULL;
+  	struct sk_buff *skb, *_skb, *tmp;
+  	struct tipc_msg *hdr;
++ 	u32 qlen = skb_queue_len(&l->transmq);
++ 	u16 nacked = acked, ngap = gap, gack_cnt = 0;
+  	u16 bc_ack = l->bc_rcvlink->rcv_nxt - 1;
+  	u16 ack = l->rcv_nxt - 1;
+++<<<<<<< HEAD
+ +	bool passed = false;
+++=======
+++>>>>>>> d7626b5acff9 (tipc: introduce Gap ACK blocks for broadcast link)
+  	u16 seqno, n = 0;
+- 	int rc = 0;
++ 	u16 end = r->acked, start = end, offset = r->last_gap;
++ 	u16 si = (last_ga) ? last_ga->start_index : 0;
++ 	bool is_uc = !link_is_bc_sndlink(l);
++ 	bool bc_has_acked = false;
++ 
++ 	/* Determine Gap ACK blocks if any for the particular link */
++ 	if (ga && is_uc) {
++ 		/* Get the Gap ACKs, uc part */
++ 		gack_cnt = ga->ugack_cnt;
++ 		gacks = &ga->gacks[ga->bgack_cnt];
++ 	} else if (ga) {
++ 		/* Copy the Gap ACKs, bc part, for later renewal if needed */
++ 		this_ga = kmemdup(ga, tipc_gap_ack_blks_sz(ga->bgack_cnt),
++ 				  GFP_ATOMIC);
++ 		if (likely(this_ga)) {
++ 			this_ga->start_index = 0;
++ 			/* Start with the bc Gap ACKs */
++ 			gack_cnt = this_ga->bgack_cnt;
++ 			gacks = &this_ga->gacks[0];
++ 		} else {
++ 			/* Hmm, we can get in trouble..., simply ignore it */
++ 			pr_warn_ratelimited("Ignoring bc Gap ACKs, no memory\n");
++ 		}
++ 	}
+  
++ 	/* Advance the link transmq */
+  	skb_queue_walk_safe(&l->transmq, skb, tmp) {
+  		seqno = buf_seqno(skb);
+  
+@@@ -1420,18 -1562,21 +1589,36 @@@ release
+  			/* release skb */
+  			__skb_unlink(skb, &l->transmq);
+  			kfree_skb(skb);
+++<<<<<<< HEAD
+ +		} else if (less_eq(seqno, acked + gap)) {
+ +			/* First, check if repeated retrans failures occurs? */
+ +			if (!passed && link_retransmit_failure(l, l, &rc))
+ +				return rc;
+ +			passed = true;
+ +
+ +			/* retransmit skb if unrestricted*/
+ +			if (time_before(jiffies, TIPC_SKB_CB(skb)->nxt_retr))
+ +				continue;
+ +			TIPC_SKB_CB(skb)->nxt_retr = TIPC_UC_RETR_TIME;
+ +			_skb = __pskb_copy(skb, LL_MAX_HEADER + MIN_H_SIZE,
+ +					   GFP_ATOMIC);
+++=======
++ 		} else if (less_eq(seqno, nacked + ngap)) {
++ 			/* First gap: check if repeated retrans failures? */
++ 			if (unlikely(seqno == acked + 1 &&
++ 				     link_retransmit_failure(l, r, rc))) {
++ 				/* Ignore this bc Gap ACKs if any */
++ 				kfree(this_ga);
++ 				this_ga = NULL;
++ 				break;
++ 			}
++ 			/* retransmit skb if unrestricted*/
++ 			if (time_before(jiffies, TIPC_SKB_CB(skb)->nxt_retr))
++ 				continue;
++ 			TIPC_SKB_CB(skb)->nxt_retr = (is_uc) ?
++ 					TIPC_UC_RETR_TIME : TIPC_BC_RETR_LIM;
++ 			_skb = pskb_copy(skb, GFP_ATOMIC);
+++>>>>>>> d7626b5acff9 (tipc: introduce Gap ACK blocks for broadcast link)
+  			if (!_skb)
+  				continue;
+  			hdr = buf_msg(_skb);
+@@@ -1440,7 -1585,7 +1627,11 @@@
+  			_skb->priority = TC_PRIO_CONTROL;
+  			__skb_queue_tail(xmitq, _skb);
+  			l->stats.retransmitted++;
+++<<<<<<< HEAD
+ +
+++=======
++ 			*retransmitted = true;
+++>>>>>>> d7626b5acff9 (tipc: introduce Gap ACK blocks for broadcast link)
+  			/* Increase actual retrans counter & mark first time */
+  			if (!TIPC_SKB_CB(skb)->retr_cnt++)
+  				TIPC_SKB_CB(skb)->retr_stamp = jiffies;
+@@@ -1455,7 -1600,36 +1646,40 @@@
+  		}
+  	}
+  
+++<<<<<<< HEAD
+ +	return 0;
+++=======
++ 	/* Renew last Gap ACK blocks for bc if needed */
++ 	if (bc_has_acked) {
++ 		if (this_ga) {
++ 			kfree(last_ga);
++ 			r->last_ga = this_ga;
++ 			r->last_gap = gap;
++ 		} else if (last_ga) {
++ 			if (less(acked, start)) {
++ 				si--;
++ 				offset = start - acked - 1;
++ 			} else if (less(acked, end)) {
++ 				acked = end;
++ 			}
++ 			if (si < last_ga->bgack_cnt) {
++ 				last_ga->start_index = si;
++ 				r->last_gap = offset;
++ 			} else {
++ 				kfree(last_ga);
++ 				r->last_ga = NULL;
++ 				r->last_gap = 0;
++ 			}
++ 		} else {
++ 			r->last_gap = 0;
++ 		}
++ 		r->acked = acked;
++ 	} else {
++ 		kfree(this_ga);
++ 	}
++ 
++ 	return qlen - skb_queue_len(&l->transmq);
+++>>>>>>> d7626b5acff9 (tipc: introduce Gap ACK blocks for broadcast link)
+  }
+  
+  /* tipc_link_build_state_msg: prepare link state message for transmission
+@@@ -1568,15 -1743,11 +1792,20 @@@ int tipc_link_rcv(struct tipc_link *l, 
+  		/* Drop if outside receive window */
+  		if (unlikely(less(seqno, rcv_nxt) || more(seqno, win_lim))) {
+  			l->stats.duplicates++;
+ -			kfree_skb(skb);
+ -			break;
+ +			goto drop;
+ +		}
+ +
+ +		/* Forward queues and wake up waiting users */
+ +		if (likely(tipc_link_release_pkts(l, msg_ack(hdr)))) {
+ +			tipc_link_advance_backlog(l, xmitq);
+ +			if (unlikely(!skb_queue_empty(&l->wakeupq)))
+ +				link_prepare_wakeup(l);
+  		}
+++<<<<<<< HEAD
+++=======
++ 		released += tipc_link_advance_transmq(l, l, msg_ack(hdr), 0,
++ 						      NULL, NULL, NULL, NULL);
+++>>>>>>> d7626b5acff9 (tipc: introduce Gap ACK blocks for broadcast link)
+  
+  		/* Defer delivery if sequence gap */
+  		if (unlikely(seqno != rcv_nxt)) {
+@@@ -1660,7 -1835,7 +1889,11 @@@ static void tipc_link_build_proto_msg(s
+  		msg_set_probe(hdr, probe);
+  		msg_set_is_keepalive(hdr, probe || probe_reply);
+  		if (l->peer_caps & TIPC_GAP_ACK_BLOCK)
+++<<<<<<< HEAD
+ +			glen = tipc_build_gap_ack_blks(l, data);
+++=======
++ 			glen = tipc_build_gap_ack_blks(l, hdr);
+++>>>>>>> d7626b5acff9 (tipc: introduce Gap ACK blocks for broadcast link)
+  		tipc_mon_prep(l->net, data + glen, &dlen, mstate, l->bearer_id);
+  		msg_set_size(hdr, INT_H_SIZE + glen + dlen);
+  		skb_trim(skb, INT_H_SIZE + glen + dlen);
+@@@ -2080,13 -2246,15 +2306,25 @@@ static int tipc_link_proto_rcv(struct t
+  		if (rcvgap || reply)
+  			tipc_link_build_proto_msg(l, STATE_MSG, 0, reply,
+  						  rcvgap, 0, 0, xmitq);
+++<<<<<<< HEAD
+ +		rc |= tipc_link_advance_transmq(l, ack, gap, ga, xmitq);
+ +
+ +		/* If NACK, retransmit will now start at right position */
+ +		if (gap)
+ +			l->stats.recv_nacks++;
+ +
+ +		tipc_link_advance_backlog(l, xmitq);
+++=======
++ 
++ 		released = tipc_link_advance_transmq(l, l, ack, gap, ga, xmitq,
++ 						     &retransmitted, &rc);
++ 		if (gap)
++ 			l->stats.recv_nacks++;
++ 		if (released || retransmitted)
++ 			tipc_link_update_cwin(l, released, retransmitted);
++ 		if (released)
++ 			tipc_link_advance_backlog(l, xmitq);
+++>>>>>>> d7626b5acff9 (tipc: introduce Gap ACK blocks for broadcast link)
+  		if (unlikely(!skb_queue_empty(&l->wakeupq)))
+  			link_prepare_wakeup(l);
+  	}
+diff --cc net/tipc/link.h
+index adcad65e761c,0a0fa7350722..000000000000
+--- a/net/tipc/link.h
++++ b/net/tipc/link.h
+@@@ -141,8 -142,12 +141,17 @@@ void tipc_link_remove_bc_peer(struct ti
+  int tipc_link_bc_peers(struct tipc_link *l);
+  void tipc_link_set_mtu(struct tipc_link *l, int mtu);
+  int tipc_link_mtu(struct tipc_link *l);
+++<<<<<<< HEAD
+ +void tipc_link_bc_ack_rcv(struct tipc_link *l, u16 acked,
+ +			  struct sk_buff_head *xmitq);
+++=======
++ int tipc_link_mss(struct tipc_link *l);
++ u16 tipc_get_gap_ack_blks(struct tipc_gap_ack_blks **ga, struct tipc_link *l,
++ 			  struct tipc_msg *hdr, bool uc);
++ int tipc_link_bc_ack_rcv(struct tipc_link *l, u16 acked, u16 gap,
++ 			 struct tipc_gap_ack_blks *ga,
++ 			 struct sk_buff_head *xmitq);
+++>>>>>>> d7626b5acff9 (tipc: introduce Gap ACK blocks for broadcast link)
+  void tipc_link_build_bc_sync_msg(struct tipc_link *l,
+  				 struct sk_buff_head *xmitq);
+  void tipc_link_bc_init_rcv(struct tipc_link *l, struct tipc_msg *hdr);
+diff --git a/net/tipc/bcast.c b/net/tipc/bcast.c
+index 588c2709f7d2..4588e2bc94ed 100644
+--- a/net/tipc/bcast.c
++++ b/net/tipc/bcast.c
+@@ -472,7 +472,7 @@ void tipc_bcast_ack_rcv(struct net *net, struct tipc_link *l,
+ 	__skb_queue_head_init(&xmitq);
+ 
+ 	tipc_bcast_lock(net);
+-	tipc_link_bc_ack_rcv(l, acked, &xmitq);
++	tipc_link_bc_ack_rcv(l, acked, 0, NULL, &xmitq);
+ 	tipc_bcast_unlock(net);
+ 
+ 	tipc_bcbase_xmit(net, &xmitq);
+@@ -490,6 +490,7 @@ int tipc_bcast_sync_rcv(struct net *net, struct tipc_link *l,
+ 			struct tipc_msg *hdr)
+ {
+ 	struct sk_buff_head *inputq = &tipc_bc_base(net)->inputq;
++	struct tipc_gap_ack_blks *ga;
+ 	struct sk_buff_head xmitq;
+ 	int rc = 0;
+ 
+@@ -499,8 +500,10 @@ int tipc_bcast_sync_rcv(struct net *net, struct tipc_link *l,
+ 	if (msg_type(hdr) != STATE_MSG) {
+ 		tipc_link_bc_init_rcv(l, hdr);
+ 	} else if (!msg_bc_ack_invalid(hdr)) {
+-		tipc_link_bc_ack_rcv(l, msg_bcast_ack(hdr), &xmitq);
+-		rc = tipc_link_bc_sync_rcv(l, hdr, &xmitq);
++		tipc_get_gap_ack_blks(&ga, l, hdr, false);
++		rc = tipc_link_bc_ack_rcv(l, msg_bcast_ack(hdr),
++					  msg_bc_gap(hdr), ga, &xmitq);
++		rc |= tipc_link_bc_sync_rcv(l, hdr, &xmitq);
+ 	}
+ 	tipc_bcast_unlock(net);
+ 
+* Unmerged path net/tipc/link.c
+* Unmerged path net/tipc/link.h
+diff --git a/net/tipc/msg.h b/net/tipc/msg.h
+index 842e18155758..98a6f9718744 100644
+--- a/net/tipc/msg.h
++++ b/net/tipc/msg.h
+@@ -134,20 +134,39 @@ struct tipc_gap_ack {
+ 
+ /* struct tipc_gap_ack_blks
+  * @len: actual length of the record
+- * @gack_cnt: number of Gap ACK blocks in the record
++ * @ugack_cnt: number of Gap ACK blocks for unicast (following the broadcast
++ *             ones)
++ * @start_index: starting index for "valid" broadcast Gap ACK blocks
++ * @bgack_cnt: number of Gap ACK blocks for broadcast in the record
+  * @gacks: array of Gap ACK blocks
++ *
++ *  31                       16 15                        0
++ * +-------------+-------------+-------------+-------------+
++ * |  bgack_cnt  |  ugack_cnt  |            len            |
++ * +-------------+-------------+-------------+-------------+  -
++ * |            gap            |            ack            |   |
++ * +-------------+-------------+-------------+-------------+    > bc gacks
++ * :                           :                           :   |
++ * +-------------+-------------+-------------+-------------+  -
++ * |            gap            |            ack            |   |
++ * +-------------+-------------+-------------+-------------+    > uc gacks
++ * :                           :                           :   |
++ * +-------------+-------------+-------------+-------------+  -
+  */
+ struct tipc_gap_ack_blks {
+ 	__be16 len;
+-	u8 gack_cnt;
+-	u8 reserved;
++	union {
++		u8 ugack_cnt;
++		u8 start_index;
++	};
++	u8 bgack_cnt;
+ 	struct tipc_gap_ack gacks[];
+ };
+ 
+ #define tipc_gap_ack_blks_sz(n) (sizeof(struct tipc_gap_ack_blks) + \
+ 				 sizeof(struct tipc_gap_ack) * (n))
+ 
+-#define MAX_GAP_ACK_BLKS	32
++#define MAX_GAP_ACK_BLKS	128
+ #define MAX_GAP_ACK_BLKS_SZ	tipc_gap_ack_blks_sz(MAX_GAP_ACK_BLKS)
+ 
+ static inline struct tipc_msg *buf_msg(struct sk_buff *skb)
+diff --git a/net/tipc/node.c b/net/tipc/node.c
+index 3fe27ab13350..699edc9e353a 100644
+--- a/net/tipc/node.c
++++ b/net/tipc/node.c
+@@ -1847,10 +1847,16 @@ void tipc_rcv(struct net *net, struct sk_buff *skb, struct tipc_bearer *b)
+ 	le = &n->links[bearer_id];
+ 
+ 	/* Ensure broadcast reception is in synch with peer's send state */
+-	if (unlikely(usr == LINK_PROTOCOL))
++	if (unlikely(usr == LINK_PROTOCOL)) {
++		if (unlikely(skb_linearize(skb))) {
++			tipc_node_put(n);
++			goto discard;
++		}
++		hdr = buf_msg(skb);
+ 		tipc_node_bc_sync_rcv(n, hdr, bearer_id, &xmitq);
+-	else if (unlikely(tipc_link_acked(n->bc_entry.link) != bc_ack))
++	} else if (unlikely(tipc_link_acked(n->bc_entry.link) != bc_ack)) {
+ 		tipc_bcast_ack_rcv(net, n->bc_entry.link, hdr);
++	}
+ 
+ 	/* Receive packet directly if conditions permit */
+ 	tipc_node_read_lock(n);
