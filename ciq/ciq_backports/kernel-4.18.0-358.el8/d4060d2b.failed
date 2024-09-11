@@ -1,0 +1,83 @@
+nvme-pci: fix controller reset hang when racing with nvme_timeout
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-358.el8
+commit-author Tao Chiu <taochiu@synology.com>
+commit d4060d2be1132596154f31f4d57976bd103e969d
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-358.el8/d4060d2b.failed
+
+reset_work() in nvme-pci may hang forever in the following scenario:
+1) A reset caused by a command timeout occurs due to a controller being
+   temporarily irresponsive.
+2) nvme_reset_work() restarts admin queue at nvme_alloc_admin_tags(). At
+   the same time, a user-submitted admin command is queued and waiting
+   for completion. Then, reset_work() changes its state to CONNECTING,
+   and submits an identify command.
+3) However, the controller does still not respond to any command,
+   causing a timeout being fired at the user-submitted command.
+   Unfortunately, nvme_timeout() does not see the completion on cq, and
+   any timeout that takes place under CONNECTING state causes a
+   controller shutdown.
+4) Normally, the identify command in reset_work() would be canceled with
+   SC_HOST_ABORTED by nvme_dev_disable(), then reset_work can tear down
+   the controller accordingly. But the controller happens to return
+   online and respond the identify command before nvme_dev_disable()
+   should have been reaped it off.
+5) reset_work() continues to setup_io_queues() as it observes no error
+   in init_identify(). However, the admin queue has already been
+   quiesced in dev_disable(). Thus, any following commands would be
+   blocked forever in blk_execute_rq().
+
+This can be fixed by restricting usercmd commands when controller is not
+in a LIVE state in nvme_queue_rq(), as what has been done previously in
+fabrics.
+
+```
+nvme_reset_work():                     |
+    nvme_alloc_admin_tags()            |
+                                       | nvme_submit_user_cmd():
+    nvme_init_identify():              |     ...
+        __nvme_submit_sync_cmd():      |
+            ...                        |     ...
+---------------------------------------> nvme_timeout():
+(Controller starts reponding commands) |     nvme_dev_disable(, true):
+    nvme_setup_io_queues():            |
+        __nvme_submit_sync_cmd():      |
+            (hung in blk_execute_rq    |
+             since run_hw_queue sees   |
+             queue quiesced)           |
+
+```
+
+	Signed-off-by: Tao Chiu <taochiu@synology.com>
+	Signed-off-by: Cody Wong <codywong@synology.com>
+	Reviewed-by: Leon Chien <leonchien@synology.com>
+	Reviewed-by: Keith Busch <kbusch@kernel.org>
+	Signed-off-by: Christoph Hellwig <hch@lst.de>
+(cherry picked from commit d4060d2be1132596154f31f4d57976bd103e969d)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/nvme/host/pci.c
+diff --cc drivers/nvme/host/pci.c
+index a874d55917a5,a29b170701fc..000000000000
+--- a/drivers/nvme/host/pci.c
++++ b/drivers/nvme/host/pci.c
+@@@ -858,7 -933,10 +858,14 @@@ static blk_status_t nvme_queue_rq(struc
+  	if (unlikely(!test_bit(NVMEQ_ENABLED, &nvmeq->flags)))
+  		return BLK_STS_IOERR;
+  
+++<<<<<<< HEAD
+ +	ret = nvme_setup_cmd(ns, req, &cmnd);
+++=======
++ 	if (!nvme_check_ready(&dev->ctrl, req, true))
++ 		return nvme_fail_nonready_command(&dev->ctrl, req);
++ 
++ 	ret = nvme_setup_cmd(ns, req);
+++>>>>>>> d4060d2be113 (nvme-pci: fix controller reset hang when racing with nvme_timeout)
+  	if (ret)
+  		return ret;
+  
+* Unmerged path drivers/nvme/host/pci.c
