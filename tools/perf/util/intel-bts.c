@@ -28,7 +28,6 @@
 #include "evsel.h"
 #include "evlist.h"
 #include "machine.h"
-#include "map.h"
 #include "symbol.h"
 #include "session.h"
 #include "thread.h"
