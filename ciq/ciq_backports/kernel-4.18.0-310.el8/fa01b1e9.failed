@@ -1,0 +1,246 @@
+block: add a bdev_is_partition helper
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-310.el8
+commit-author Christoph Hellwig <hch@lst.de>
+commit fa01b1e9733fd59ecb8b5b6d85dfb481d2025fbf
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-310.el8/fa01b1e9.failed
+
+Add a littler helper to make the somewhat arcane bd_contains checks a
+little more obvious.
+
+	Signed-off-by: Christoph Hellwig <hch@lst.de>
+	Acked-by: Ulf Hansson <ulf.hansson@linaro.org>
+	Signed-off-by: Jens Axboe <axboe@kernel.dk>
+(cherry picked from commit fa01b1e9733fd59ecb8b5b6d85dfb481d2025fbf)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/blkdev.h
+diff --cc include/linux/blkdev.h
+index 69b3d02ca933,33f283885ba5..000000000000
+--- a/include/linux/blkdev.h
++++ b/include/linux/blkdev.h
+@@@ -1314,9 -1351,13 +1314,14 @@@ static inline int sb_issue_zeroout(stru
+  				    gfp_mask, 0);
+  }
+  
+ -extern int blk_verify_command(unsigned char *cmd, fmode_t mode);
+ +extern int blk_verify_command(struct request_queue *q, unsigned char *cmd,
+ +			      fmode_t mode);
+  
++ static inline bool bdev_is_partition(struct block_device *bdev)
++ {
++ 	return bdev->bd_partno;
++ }
++ 
+  enum blk_default_limits {
+  	BLK_MAX_SEGMENTS	= 128,
+  	BLK_SAFE_MAX_SECTORS	= 255,
+@@@ -1433,10 -1474,9 +1438,16 @@@ static inline int bdev_alignment_offset
+  
+  	if (q->limits.misaligned)
+  		return -1;
+++<<<<<<< HEAD
+ +
+ +	if (bdev != bdev->bd_contains)
+ +		return bdev->bd_part->alignment_offset;
+ +
+++=======
++ 	if (bdev_is_partition(bdev))
++ 		return queue_limit_alignment_offset(&q->limits,
++ 				bdev->bd_part->start_sect);
+++>>>>>>> fa01b1e9733f (block: add a bdev_is_partition helper)
+  	return q->limits.alignment_offset;
+  }
+  
+@@@ -1475,9 -1515,9 +1486,15 @@@ static inline int bdev_discard_alignmen
+  {
+  	struct request_queue *q = bdev_get_queue(bdev);
+  
+++<<<<<<< HEAD
+ +	if (bdev != bdev->bd_contains)
+ +		return bdev->bd_part->discard_alignment;
+ +
+++=======
++ 	if (bdev_is_partition(bdev))
++ 		return queue_limit_discard_alignment(&q->limits,
++ 				bdev->bd_part->start_sect);
+++>>>>>>> fa01b1e9733f (block: add a bdev_is_partition helper)
+  	return q->limits.discard_alignment;
+  }
+  
+diff --git a/block/blk-lib.c b/block/blk-lib.c
+index 0d1811e57ac7..e90614fd8d6a 100644
+--- a/block/blk-lib.c
++++ b/block/blk-lib.c
+@@ -64,7 +64,7 @@ int __blkdev_issue_discard(struct block_device *bdev, sector_t sector,
+ 		return -EINVAL;
+ 
+ 	/* In case the discard request is in a partition */
+-	if (bdev->bd_partno)
++	if (bdev_is_partition(bdev))
+ 		part_offset = bdev->bd_part->start_sect;
+ 
+ 	while (nr_sects) {
+diff --git a/block/ioctl.c b/block/ioctl.c
+index d18dcd30d5d7..835475e718f2 100644
+--- a/block/ioctl.c
++++ b/block/ioctl.c
+@@ -21,7 +21,7 @@ static int blkpg_do_ioctl(struct block_device *bdev,
+ 		return -EACCES;
+ 	if (copy_from_user(&p, upart, sizeof(struct blkpg_partition)))
+ 		return -EFAULT;
+-	if (bdev != bdev->bd_contains)
++	if (bdev_is_partition(bdev))
+ 		return -EINVAL;
+ 
+ 	if (p.pno <= 0)
+@@ -92,7 +92,7 @@ static int blkdev_reread_part(struct block_device *bdev)
+ {
+ 	int ret;
+ 
+-	if (!disk_part_scan_enabled(bdev->bd_disk) || bdev != bdev->bd_contains)
++	if (!disk_part_scan_enabled(bdev->bd_disk) || bdev_is_partition(bdev))
+ 		return -EINVAL;
+ 	if (!capable(CAP_SYS_ADMIN))
+ 		return -EACCES;
+diff --git a/block/scsi_ioctl.c b/block/scsi_ioctl.c
+index 429baed25269..26a388dbb54f 100644
+--- a/block/scsi_ioctl.c
++++ b/block/scsi_ioctl.c
+@@ -689,7 +689,7 @@ EXPORT_SYMBOL(scsi_cmd_ioctl);
+ 
+ int scsi_verify_blk_ioctl(struct block_device *bd, unsigned int cmd)
+ {
+-	if (bd && bd == bd->bd_contains)
++	if (bd && !bdev_is_partition(bd))
+ 		return 0;
+ 
+ 	if (capable(CAP_SYS_RAWIO))
+diff --git a/drivers/ide/ide-ioctls.c b/drivers/ide/ide-ioctls.c
+index af5119a73689..4890d33d9ae5 100644
+--- a/drivers/ide/ide-ioctls.c
++++ b/drivers/ide/ide-ioctls.c
+@@ -39,7 +39,7 @@ int ide_setting_ioctl(ide_drive_t *drive, struct block_device *bdev,
+ 	return err >= 0 ? put_user(err, (long __user *)arg) : err;
+ 
+ set_val:
+-	if (bdev != bdev->bd_contains)
++	if (bdev_is_partition(bdev))
+ 		err = -EINVAL;
+ 	else {
+ 		if (!capable(CAP_SYS_ADMIN))
+@@ -244,7 +244,7 @@ int generic_ide_ioctl(ide_drive_t *drive, struct block_device *bdev,
+ 	switch (cmd) {
+ 	case HDIO_OBSOLETE_IDENTITY:
+ 	case HDIO_GET_IDENTITY:
+-		if (bdev != bdev->bd_contains)
++		if (bdev_is_partition(bdev))
+ 			return -EINVAL;
+ 		return ide_get_identity_ioctl(drive, cmd, arg);
+ 	case HDIO_GET_NICE:
+diff --git a/drivers/md/dm-table.c b/drivers/md/dm-table.c
+index 27df037ce2ef..8c2254412c17 100644
+--- a/drivers/md/dm-table.c
++++ b/drivers/md/dm-table.c
+@@ -878,7 +878,7 @@ static int device_is_rq_stackable(struct dm_target *ti, struct dm_dev *dev,
+ 	struct request_queue *q = bdev_get_queue(bdev);
+ 
+ 	/* request-based cannot stack on partitions! */
+-	if (bdev != bdev->bd_contains)
++	if (bdev_is_partition(bdev))
+ 		return false;
+ 
+ 	return queue_is_mq(q);
+diff --git a/drivers/mmc/core/block.c b/drivers/mmc/core/block.c
+index b6ccc24ef164..28ba590d5361 100644
+--- a/drivers/mmc/core/block.c
++++ b/drivers/mmc/core/block.c
+@@ -750,7 +750,7 @@ static int mmc_blk_check_blkdev(struct block_device *bdev)
+ 	 * whole block device, not on a partition.  This prevents overspray
+ 	 * between sibling partitions.
+ 	 */
+-	if ((!capable(CAP_SYS_RAWIO)) || (bdev != bdev->bd_contains))
++	if (!capable(CAP_SYS_RAWIO) || bdev_is_partition(bdev))
+ 		return -EPERM;
+ 	return 0;
+ }
+diff --git a/drivers/s390/block/dasd_ioctl.c b/drivers/s390/block/dasd_ioctl.c
+index 9b7782395c37..7dfeb9795d93 100644
+--- a/drivers/s390/block/dasd_ioctl.c
++++ b/drivers/s390/block/dasd_ioctl.c
+@@ -281,7 +281,7 @@ dasd_ioctl_format(struct block_device *bdev, void __user *argp)
+ 		dasd_put_device(base);
+ 		return -EFAULT;
+ 	}
+-	if (bdev != bdev->bd_contains) {
++	if (bdev_is_partition(bdev)) {
+ 		pr_warn("%s: The specified DASD is a partition and cannot be formatted\n",
+ 			dev_name(&base->cdev->dev));
+ 		dasd_put_device(base);
+@@ -308,7 +308,7 @@ static int dasd_ioctl_check_format(struct block_device *bdev, void __user *argp)
+ 	base = dasd_device_from_gendisk(bdev->bd_disk);
+ 	if (!base)
+ 		return -ENODEV;
+-	if (bdev != bdev->bd_contains) {
++	if (bdev_is_partition(bdev)) {
+ 		pr_warn("%s: The specified DASD is a partition and cannot be checked\n",
+ 			dev_name(&base->cdev->dev));
+ 		rc = -EINVAL;
+@@ -366,7 +366,7 @@ static int dasd_ioctl_release_space(struct block_device *bdev, void __user *argp
+ 		rc = -EROFS;
+ 		goto out_err;
+ 	}
+-	if (bdev != bdev->bd_contains) {
++	if (bdev_is_partition(bdev)) {
+ 		pr_warn("%s: The specified DASD is a partition and tracks cannot be released\n",
+ 			dev_name(&base->cdev->dev));
+ 		rc = -EINVAL;
+@@ -544,7 +544,7 @@ dasd_ioctl_set_ro(struct block_device *bdev, void __user *argp)
+ 
+ 	if (!capable(CAP_SYS_ADMIN))
+ 		return -EACCES;
+-	if (bdev != bdev->bd_contains)
++	if (bdev_is_partition(bdev))
+ 		// ro setting is not allowed for partitions
+ 		return -EINVAL;
+ 	if (get_user(intval, (int __user *)argp))
+diff --git a/fs/nfsd/blocklayout.c b/fs/nfsd/blocklayout.c
+index 66d4c55eb48e..f37ab27217cb 100644
+--- a/fs/nfsd/blocklayout.c
++++ b/fs/nfsd/blocklayout.c
+@@ -169,7 +169,7 @@ nfsd4_block_proc_getdeviceinfo(struct super_block *sb,
+ 		struct nfs4_client *clp,
+ 		struct nfsd4_getdeviceinfo *gdp)
+ {
+-	if (sb->s_bdev != sb->s_bdev->bd_contains)
++	if (bdev_is_partition(sb->s_bdev))
+ 		return nfserr_inval;
+ 	return nfserrno(nfsd4_block_get_device_info_simple(sb, gdp));
+ }
+@@ -381,7 +381,7 @@ nfsd4_scsi_proc_getdeviceinfo(struct super_block *sb,
+ 		struct nfs4_client *clp,
+ 		struct nfsd4_getdeviceinfo *gdp)
+ {
+-	if (sb->s_bdev != sb->s_bdev->bd_contains)
++	if (bdev_is_partition(sb->s_bdev))
+ 		return nfserr_inval;
+ 	return nfserrno(nfsd4_block_get_device_info_scsi(sb, clp, gdp));
+ }
+* Unmerged path include/linux/blkdev.h
+diff --git a/kernel/trace/blktrace.c b/kernel/trace/blktrace.c
+index e2d13b57d20f..d3d432ce240c 100644
+--- a/kernel/trace/blktrace.c
++++ b/kernel/trace/blktrace.c
+@@ -539,7 +539,7 @@ static int do_blk_trace_setup(struct request_queue *q, char *name, dev_t dev,
+ 	 * and scsi-generic block devices we create a temporary new debugfs
+ 	 * directory that will be removed once the trace ends.
+ 	 */
+-	if (bdev && bdev == bdev->bd_contains)
++	if (bdev && !bdev_is_partition(bdev))
+ 		dir = q->debugfs_dir;
+ 	else
+ 		bt->dir = dir = debugfs_create_dir(buts->name, blk_debugfs_root);
