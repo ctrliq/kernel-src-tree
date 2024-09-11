@@ -1,0 +1,465 @@
+net: flow_offload: convert block_ing_cb_list to regular list type
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-193.el8
+Rebuild_CHGLOG: - [net] flow_offload: convert block_ing_cb_list to regular list type (Ivan Vecera) [1739606]
+Rebuild_FUZZ: 96.00%
+commit-author Vlad Buslov <vladbu@mellanox.com>
+commit 607f625b86f9ba4c5c04df190c73010de65f4e91
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-193.el8/607f625b.failed
+
+RCU list block_ing_cb_list is protected by rcu read lock in
+flow_block_ing_cmd() and with flow_indr_block_ing_cb_lock mutex in all
+functions that use it. However, flow_block_ing_cmd() needs to call blocking
+functions while iterating block_ing_cb_list which leads to following
+suspicious RCU usage warning:
+
+[  401.510948] =============================
+[  401.510952] WARNING: suspicious RCU usage
+[  401.510993] 5.3.0-rc3+ #589 Not tainted
+[  401.510996] -----------------------------
+[  401.511001] include/linux/rcupdate.h:265 Illegal context switch in RCU read-side critical section!
+[  401.511004]
+               other info that might help us debug this:
+
+[  401.511008]
+               rcu_scheduler_active = 2, debug_locks = 1
+[  401.511012] 7 locks held by test-ecmp-add-v/7576:
+[  401.511015]  #0: 00000000081d71a5 (sb_writers#4){.+.+}, at: vfs_write+0x166/0x1d0
+[  401.511037]  #1: 000000002bd338c3 (&of->mutex){+.+.}, at: kernfs_fop_write+0xef/0x1b0
+[  401.511051]  #2: 00000000c921c634 (kn->count#317){.+.+}, at: kernfs_fop_write+0xf7/0x1b0
+[  401.511062]  #3: 00000000a19cdd56 (&dev->mutex){....}, at: sriov_numvfs_store+0x6b/0x130
+[  401.511079]  #4: 000000005425fa52 (pernet_ops_rwsem){++++}, at: unregister_netdevice_notifier+0x30/0x140
+[  401.511092]  #5: 00000000c5822793 (rtnl_mutex){+.+.}, at: unregister_netdevice_notifier+0x35/0x140
+[  401.511101]  #6: 00000000c2f3507e (rcu_read_lock){....}, at: flow_block_ing_cmd+0x5/0x130
+[  401.511115]
+               stack backtrace:
+[  401.511121] CPU: 21 PID: 7576 Comm: test-ecmp-add-v Not tainted 5.3.0-rc3+ #589
+[  401.511124] Hardware name: Supermicro SYS-2028TP-DECR/X10DRT-P, BIOS 2.0b 03/30/2017
+[  401.511127] Call Trace:
+[  401.511138]  dump_stack+0x85/0xc0
+[  401.511146]  ___might_sleep+0x100/0x180
+[  401.511154]  __mutex_lock+0x5b/0x960
+[  401.511162]  ? find_held_lock+0x2b/0x80
+[  401.511173]  ? __tcf_get_next_chain+0x1d/0xb0
+[  401.511179]  ? mark_held_locks+0x49/0x70
+[  401.511194]  ? __tcf_get_next_chain+0x1d/0xb0
+[  401.511198]  __tcf_get_next_chain+0x1d/0xb0
+[  401.511251]  ? uplink_rep_async_event+0x70/0x70 [mlx5_core]
+[  401.511261]  tcf_block_playback_offloads+0x39/0x160
+[  401.511276]  tcf_block_setup+0x1b0/0x240
+[  401.511312]  ? mlx5e_rep_indr_setup_tc_cb+0xca/0x290 [mlx5_core]
+[  401.511347]  ? mlx5e_rep_indr_tc_block_unbind+0x50/0x50 [mlx5_core]
+[  401.511359]  tc_indr_block_get_and_ing_cmd+0x11b/0x1e0
+[  401.511404]  ? mlx5e_rep_indr_tc_block_unbind+0x50/0x50 [mlx5_core]
+[  401.511414]  flow_block_ing_cmd+0x7e/0x130
+[  401.511453]  ? mlx5e_rep_indr_tc_block_unbind+0x50/0x50 [mlx5_core]
+[  401.511462]  __flow_indr_block_cb_unregister+0x7f/0xf0
+[  401.511502]  mlx5e_nic_rep_netdevice_event+0x75/0xb0 [mlx5_core]
+[  401.511513]  unregister_netdevice_notifier+0xe9/0x140
+[  401.511554]  mlx5e_cleanup_rep_tx+0x6f/0xe0 [mlx5_core]
+[  401.511597]  mlx5e_detach_netdev+0x4b/0x60 [mlx5_core]
+[  401.511637]  mlx5e_vport_rep_unload+0x71/0xc0 [mlx5_core]
+[  401.511679]  esw_offloads_disable+0x5b/0x90 [mlx5_core]
+[  401.511724]  mlx5_eswitch_disable.cold+0xdf/0x176 [mlx5_core]
+[  401.511759]  mlx5_device_disable_sriov+0xab/0xb0 [mlx5_core]
+[  401.511794]  mlx5_core_sriov_configure+0xaf/0xd0 [mlx5_core]
+[  401.511805]  sriov_numvfs_store+0xf8/0x130
+[  401.511817]  kernfs_fop_write+0x122/0x1b0
+[  401.511826]  vfs_write+0xdb/0x1d0
+[  401.511835]  ksys_write+0x65/0xe0
+[  401.511847]  do_syscall_64+0x5c/0xb0
+[  401.511857]  entry_SYSCALL_64_after_hwframe+0x49/0xbe
+[  401.511862] RIP: 0033:0x7fad892d30f8
+[  401.511868] Code: 89 02 48 c7 c0 ff ff ff ff eb bb 0f 1f 80 00 00 00 00 f3 0f 1e fa 48 8d 05 25 96 0d 00 8b 00 85 c0 75 17 b8 01 00 00 00 0f 05 <48> 3d 00 f0 ff ff 77 60 c3 0f 1f 80 00 00 00 00 48 83
+ ec 28 48 89
+[  401.511871] RSP: 002b:00007ffca2a9fad8 EFLAGS: 00000246 ORIG_RAX: 0000000000000001
+[  401.511875] RAX: ffffffffffffffda RBX: 0000000000000002 RCX: 00007fad892d30f8
+[  401.511878] RDX: 0000000000000002 RSI: 000055afeb072a90 RDI: 0000000000000001
+[  401.511881] RBP: 000055afeb072a90 R08: 00000000ffffffff R09: 000000000000000a
+[  401.511884] R10: 000055afeb058710 R11: 0000000000000246 R12: 0000000000000002
+[  401.511887] R13: 00007fad893a8780 R14: 0000000000000002 R15: 00007fad893a3740
+
+To fix the described incorrect RCU usage, convert block_ing_cb_list from
+RCU list to regular list and protect it with flow_indr_block_ing_cb_lock
+mutex in flow_block_ing_cmd().
+
+Fixes: 1150ab0f1b33 ("flow_offload: support get multi-subsystem block")
+	Signed-off-by: Vlad Buslov <vladbu@mellanox.com>
+	Acked-by: Jakub Kicinski <jakub.kicinski@netronome.com>
+	Acked-by: Jiri Pirko <jiri@mellanox.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 607f625b86f9ba4c5c04df190c73010de65f4e91)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/core/flow_offload.c
+diff --cc net/core/flow_offload.c
+index f52fe0bc4017,cf52d9c422fa..000000000000
+--- a/net/core/flow_offload.c
++++ b/net/core/flow_offload.c
+@@@ -164,3 -166,358 +164,361 @@@ void flow_rule_match_enc_opts(const str
+  	FLOW_DISSECTOR_MATCH(rule, FLOW_DISSECTOR_KEY_ENC_OPTS, out);
+  }
+  EXPORT_SYMBOL(flow_rule_match_enc_opts);
+++<<<<<<< HEAD
+++=======
++ 
++ struct flow_block_cb *flow_block_cb_alloc(flow_setup_cb_t *cb,
++ 					  void *cb_ident, void *cb_priv,
++ 					  void (*release)(void *cb_priv))
++ {
++ 	struct flow_block_cb *block_cb;
++ 
++ 	block_cb = kzalloc(sizeof(*block_cb), GFP_KERNEL);
++ 	if (!block_cb)
++ 		return ERR_PTR(-ENOMEM);
++ 
++ 	block_cb->cb = cb;
++ 	block_cb->cb_ident = cb_ident;
++ 	block_cb->cb_priv = cb_priv;
++ 	block_cb->release = release;
++ 
++ 	return block_cb;
++ }
++ EXPORT_SYMBOL(flow_block_cb_alloc);
++ 
++ void flow_block_cb_free(struct flow_block_cb *block_cb)
++ {
++ 	if (block_cb->release)
++ 		block_cb->release(block_cb->cb_priv);
++ 
++ 	kfree(block_cb);
++ }
++ EXPORT_SYMBOL(flow_block_cb_free);
++ 
++ struct flow_block_cb *flow_block_cb_lookup(struct flow_block *block,
++ 					   flow_setup_cb_t *cb, void *cb_ident)
++ {
++ 	struct flow_block_cb *block_cb;
++ 
++ 	list_for_each_entry(block_cb, &block->cb_list, list) {
++ 		if (block_cb->cb == cb &&
++ 		    block_cb->cb_ident == cb_ident)
++ 			return block_cb;
++ 	}
++ 
++ 	return NULL;
++ }
++ EXPORT_SYMBOL(flow_block_cb_lookup);
++ 
++ void *flow_block_cb_priv(struct flow_block_cb *block_cb)
++ {
++ 	return block_cb->cb_priv;
++ }
++ EXPORT_SYMBOL(flow_block_cb_priv);
++ 
++ void flow_block_cb_incref(struct flow_block_cb *block_cb)
++ {
++ 	block_cb->refcnt++;
++ }
++ EXPORT_SYMBOL(flow_block_cb_incref);
++ 
++ unsigned int flow_block_cb_decref(struct flow_block_cb *block_cb)
++ {
++ 	return --block_cb->refcnt;
++ }
++ EXPORT_SYMBOL(flow_block_cb_decref);
++ 
++ bool flow_block_cb_is_busy(flow_setup_cb_t *cb, void *cb_ident,
++ 			   struct list_head *driver_block_list)
++ {
++ 	struct flow_block_cb *block_cb;
++ 
++ 	list_for_each_entry(block_cb, driver_block_list, driver_list) {
++ 		if (block_cb->cb == cb &&
++ 		    block_cb->cb_ident == cb_ident)
++ 			return true;
++ 	}
++ 
++ 	return false;
++ }
++ EXPORT_SYMBOL(flow_block_cb_is_busy);
++ 
++ int flow_block_cb_setup_simple(struct flow_block_offload *f,
++ 			       struct list_head *driver_block_list,
++ 			       flow_setup_cb_t *cb,
++ 			       void *cb_ident, void *cb_priv,
++ 			       bool ingress_only)
++ {
++ 	struct flow_block_cb *block_cb;
++ 
++ 	if (ingress_only &&
++ 	    f->binder_type != FLOW_BLOCK_BINDER_TYPE_CLSACT_INGRESS)
++ 		return -EOPNOTSUPP;
++ 
++ 	f->driver_block_list = driver_block_list;
++ 
++ 	switch (f->command) {
++ 	case FLOW_BLOCK_BIND:
++ 		if (flow_block_cb_is_busy(cb, cb_ident, driver_block_list))
++ 			return -EBUSY;
++ 
++ 		block_cb = flow_block_cb_alloc(cb, cb_ident, cb_priv, NULL);
++ 		if (IS_ERR(block_cb))
++ 			return PTR_ERR(block_cb);
++ 
++ 		flow_block_cb_add(block_cb, f);
++ 		list_add_tail(&block_cb->driver_list, driver_block_list);
++ 		return 0;
++ 	case FLOW_BLOCK_UNBIND:
++ 		block_cb = flow_block_cb_lookup(f->block, cb, cb_ident);
++ 		if (!block_cb)
++ 			return -ENOENT;
++ 
++ 		flow_block_cb_remove(block_cb, f);
++ 		list_del(&block_cb->driver_list);
++ 		return 0;
++ 	default:
++ 		return -EOPNOTSUPP;
++ 	}
++ }
++ EXPORT_SYMBOL(flow_block_cb_setup_simple);
++ 
++ static LIST_HEAD(block_ing_cb_list);
++ 
++ static struct rhashtable indr_setup_block_ht;
++ 
++ struct flow_indr_block_cb {
++ 	struct list_head list;
++ 	void *cb_priv;
++ 	flow_indr_block_bind_cb_t *cb;
++ 	void *cb_ident;
++ };
++ 
++ struct flow_indr_block_dev {
++ 	struct rhash_head ht_node;
++ 	struct net_device *dev;
++ 	unsigned int refcnt;
++ 	struct list_head cb_list;
++ };
++ 
++ static const struct rhashtable_params flow_indr_setup_block_ht_params = {
++ 	.key_offset	= offsetof(struct flow_indr_block_dev, dev),
++ 	.head_offset	= offsetof(struct flow_indr_block_dev, ht_node),
++ 	.key_len	= sizeof(struct net_device *),
++ };
++ 
++ static struct flow_indr_block_dev *
++ flow_indr_block_dev_lookup(struct net_device *dev)
++ {
++ 	return rhashtable_lookup_fast(&indr_setup_block_ht, &dev,
++ 				      flow_indr_setup_block_ht_params);
++ }
++ 
++ static struct flow_indr_block_dev *
++ flow_indr_block_dev_get(struct net_device *dev)
++ {
++ 	struct flow_indr_block_dev *indr_dev;
++ 
++ 	indr_dev = flow_indr_block_dev_lookup(dev);
++ 	if (indr_dev)
++ 		goto inc_ref;
++ 
++ 	indr_dev = kzalloc(sizeof(*indr_dev), GFP_KERNEL);
++ 	if (!indr_dev)
++ 		return NULL;
++ 
++ 	INIT_LIST_HEAD(&indr_dev->cb_list);
++ 	indr_dev->dev = dev;
++ 	if (rhashtable_insert_fast(&indr_setup_block_ht, &indr_dev->ht_node,
++ 				   flow_indr_setup_block_ht_params)) {
++ 		kfree(indr_dev);
++ 		return NULL;
++ 	}
++ 
++ inc_ref:
++ 	indr_dev->refcnt++;
++ 	return indr_dev;
++ }
++ 
++ static void flow_indr_block_dev_put(struct flow_indr_block_dev *indr_dev)
++ {
++ 	if (--indr_dev->refcnt)
++ 		return;
++ 
++ 	rhashtable_remove_fast(&indr_setup_block_ht, &indr_dev->ht_node,
++ 			       flow_indr_setup_block_ht_params);
++ 	kfree(indr_dev);
++ }
++ 
++ static struct flow_indr_block_cb *
++ flow_indr_block_cb_lookup(struct flow_indr_block_dev *indr_dev,
++ 			  flow_indr_block_bind_cb_t *cb, void *cb_ident)
++ {
++ 	struct flow_indr_block_cb *indr_block_cb;
++ 
++ 	list_for_each_entry(indr_block_cb, &indr_dev->cb_list, list)
++ 		if (indr_block_cb->cb == cb &&
++ 		    indr_block_cb->cb_ident == cb_ident)
++ 			return indr_block_cb;
++ 	return NULL;
++ }
++ 
++ static struct flow_indr_block_cb *
++ flow_indr_block_cb_add(struct flow_indr_block_dev *indr_dev, void *cb_priv,
++ 		       flow_indr_block_bind_cb_t *cb, void *cb_ident)
++ {
++ 	struct flow_indr_block_cb *indr_block_cb;
++ 
++ 	indr_block_cb = flow_indr_block_cb_lookup(indr_dev, cb, cb_ident);
++ 	if (indr_block_cb)
++ 		return ERR_PTR(-EEXIST);
++ 
++ 	indr_block_cb = kzalloc(sizeof(*indr_block_cb), GFP_KERNEL);
++ 	if (!indr_block_cb)
++ 		return ERR_PTR(-ENOMEM);
++ 
++ 	indr_block_cb->cb_priv = cb_priv;
++ 	indr_block_cb->cb = cb;
++ 	indr_block_cb->cb_ident = cb_ident;
++ 	list_add(&indr_block_cb->list, &indr_dev->cb_list);
++ 
++ 	return indr_block_cb;
++ }
++ 
++ static void flow_indr_block_cb_del(struct flow_indr_block_cb *indr_block_cb)
++ {
++ 	list_del(&indr_block_cb->list);
++ 	kfree(indr_block_cb);
++ }
++ 
++ static DEFINE_MUTEX(flow_indr_block_ing_cb_lock);
++ 
++ static void flow_block_ing_cmd(struct net_device *dev,
++ 			       flow_indr_block_bind_cb_t *cb,
++ 			       void *cb_priv,
++ 			       enum flow_block_command command)
++ {
++ 	struct flow_indr_block_ing_entry *entry;
++ 
++ 	mutex_lock(&flow_indr_block_ing_cb_lock);
++ 	list_for_each_entry(entry, &block_ing_cb_list, list) {
++ 		entry->cb(dev, cb, cb_priv, command);
++ 	}
++ 	mutex_unlock(&flow_indr_block_ing_cb_lock);
++ }
++ 
++ int __flow_indr_block_cb_register(struct net_device *dev, void *cb_priv,
++ 				  flow_indr_block_bind_cb_t *cb,
++ 				  void *cb_ident)
++ {
++ 	struct flow_indr_block_cb *indr_block_cb;
++ 	struct flow_indr_block_dev *indr_dev;
++ 	int err;
++ 
++ 	indr_dev = flow_indr_block_dev_get(dev);
++ 	if (!indr_dev)
++ 		return -ENOMEM;
++ 
++ 	indr_block_cb = flow_indr_block_cb_add(indr_dev, cb_priv, cb, cb_ident);
++ 	err = PTR_ERR_OR_ZERO(indr_block_cb);
++ 	if (err)
++ 		goto err_dev_put;
++ 
++ 	flow_block_ing_cmd(dev, indr_block_cb->cb, indr_block_cb->cb_priv,
++ 			   FLOW_BLOCK_BIND);
++ 
++ 	return 0;
++ 
++ err_dev_put:
++ 	flow_indr_block_dev_put(indr_dev);
++ 	return err;
++ }
++ EXPORT_SYMBOL_GPL(__flow_indr_block_cb_register);
++ 
++ int flow_indr_block_cb_register(struct net_device *dev, void *cb_priv,
++ 				flow_indr_block_bind_cb_t *cb,
++ 				void *cb_ident)
++ {
++ 	int err;
++ 
++ 	rtnl_lock();
++ 	err = __flow_indr_block_cb_register(dev, cb_priv, cb, cb_ident);
++ 	rtnl_unlock();
++ 
++ 	return err;
++ }
++ EXPORT_SYMBOL_GPL(flow_indr_block_cb_register);
++ 
++ void __flow_indr_block_cb_unregister(struct net_device *dev,
++ 				     flow_indr_block_bind_cb_t *cb,
++ 				     void *cb_ident)
++ {
++ 	struct flow_indr_block_cb *indr_block_cb;
++ 	struct flow_indr_block_dev *indr_dev;
++ 
++ 	indr_dev = flow_indr_block_dev_lookup(dev);
++ 	if (!indr_dev)
++ 		return;
++ 
++ 	indr_block_cb = flow_indr_block_cb_lookup(indr_dev, cb, cb_ident);
++ 	if (!indr_block_cb)
++ 		return;
++ 
++ 	flow_block_ing_cmd(dev, indr_block_cb->cb, indr_block_cb->cb_priv,
++ 			   FLOW_BLOCK_UNBIND);
++ 
++ 	flow_indr_block_cb_del(indr_block_cb);
++ 	flow_indr_block_dev_put(indr_dev);
++ }
++ EXPORT_SYMBOL_GPL(__flow_indr_block_cb_unregister);
++ 
++ void flow_indr_block_cb_unregister(struct net_device *dev,
++ 				   flow_indr_block_bind_cb_t *cb,
++ 				   void *cb_ident)
++ {
++ 	rtnl_lock();
++ 	__flow_indr_block_cb_unregister(dev, cb, cb_ident);
++ 	rtnl_unlock();
++ }
++ EXPORT_SYMBOL_GPL(flow_indr_block_cb_unregister);
++ 
++ void flow_indr_block_call(struct net_device *dev,
++ 			  struct flow_block_offload *bo,
++ 			  enum flow_block_command command)
++ {
++ 	struct flow_indr_block_cb *indr_block_cb;
++ 	struct flow_indr_block_dev *indr_dev;
++ 
++ 	indr_dev = flow_indr_block_dev_lookup(dev);
++ 	if (!indr_dev)
++ 		return;
++ 
++ 	list_for_each_entry(indr_block_cb, &indr_dev->cb_list, list)
++ 		indr_block_cb->cb(dev, indr_block_cb->cb_priv, TC_SETUP_BLOCK,
++ 				  bo);
++ }
++ EXPORT_SYMBOL_GPL(flow_indr_block_call);
++ 
++ void flow_indr_add_block_ing_cb(struct flow_indr_block_ing_entry *entry)
++ {
++ 	mutex_lock(&flow_indr_block_ing_cb_lock);
++ 	list_add_tail(&entry->list, &block_ing_cb_list);
++ 	mutex_unlock(&flow_indr_block_ing_cb_lock);
++ }
++ EXPORT_SYMBOL_GPL(flow_indr_add_block_ing_cb);
++ 
++ void flow_indr_del_block_ing_cb(struct flow_indr_block_ing_entry *entry)
++ {
++ 	mutex_lock(&flow_indr_block_ing_cb_lock);
++ 	list_del(&entry->list);
++ 	mutex_unlock(&flow_indr_block_ing_cb_lock);
++ }
++ EXPORT_SYMBOL_GPL(flow_indr_del_block_ing_cb);
++ 
++ static int __init init_flow_indr_rhashtable(void)
++ {
++ 	return rhashtable_init(&indr_setup_block_ht,
++ 			       &flow_indr_setup_block_ht_params);
++ }
++ subsys_initcall(init_flow_indr_rhashtable);
+++>>>>>>> 607f625b86f9 (net: flow_offload: convert block_ing_cb_list to regular list type)
+* Unmerged path net/core/flow_offload.c
