@@ -1,0 +1,153 @@
+net: switchdev: avoid infinite recursion from LAG to bridge with port object handler
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-408.el8
+commit-author Vladimir Oltean <vladimir.oltean@nxp.com>
+commit acd8df5880d7c80b0317dce8df3e65b6a6825c88
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-408.el8/acd8df58.failed
+
+The logic from switchdev_handle_port_obj_add_foreign() is directly
+adapted from switchdev_handle_fdb_event_to_device(), which already
+detects events on foreign interfaces and reoffloads them towards the
+switchdev neighbors.
+
+However, when we have a simple br0 <-> bond0 <-> swp0 topology and the
+switchdev_handle_port_obj_add_foreign() gets called on bond0, we get
+stuck into an infinite recursion:
+
+1. bond0 does not pass check_cb(), so we attempt to find switchdev
+   neighbor interfaces. For that, we recursively call
+   __switchdev_handle_port_obj_add() for bond0's bridge, br0.
+
+2. __switchdev_handle_port_obj_add() recurses through br0's lowers,
+   essentially calling __switchdev_handle_port_obj_add() for bond0
+
+3. Go to step 1.
+
+This happens because switchdev_handle_fdb_event_to_device() and
+switchdev_handle_port_obj_add_foreign() are not exactly the same.
+The FDB event helper special-cases LAG interfaces with its lag_mod_cb(),
+so this is why we don't end up in an infinite loop - because it doesn't
+attempt to treat LAG interfaces as potentially foreign bridge ports.
+
+The problem is solved by looking ahead through the bridge's lowers to
+see whether there is any switchdev interface that is foreign to the @dev
+we are currently processing. This stops the recursion described above at
+step 1: __switchdev_handle_port_obj_add(bond0) will not create another
+call to __switchdev_handle_port_obj_add(br0). Going one step upper
+should only happen when we're starting from a bridge port that has been
+determined to be "foreign" to the switchdev driver that passes the
+foreign_dev_check_cb().
+
+Fixes: c4076cdd21f8 ("net: switchdev: introduce switchdev_handle_port_obj_{add,del} for foreign interfaces")
+	Signed-off-by: Vladimir Oltean <vladimir.oltean@nxp.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit acd8df5880d7c80b0317dce8df3e65b6a6825c88)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/switchdev/switchdev.c
+diff --cc net/switchdev/switchdev.c
+index df9f6f6dc3fa,28d2ccfe109c..000000000000
+--- a/net/switchdev/switchdev.c
++++ b/net/switchdev/switchdev.c
+@@@ -646,8 -564,8 +646,12 @@@ static int __switchdev_handle_port_obj_
+  				      struct netlink_ext_ack *extack))
+  {
+  	struct switchdev_notifier_info *info = &port_obj_info->info;
+++<<<<<<< HEAD
+++=======
++ 	struct net_device *br, *lower_dev, *switchdev;
+++>>>>>>> acd8df5880d7 (net: switchdev: avoid infinite recursion from LAG to bridge with port object handler)
+  	struct netlink_ext_ack *extack;
+ +	struct net_device *lower_dev;
+  	struct list_head *iter;
+  	int err = -EOPNOTSUPP;
+  
+@@@ -677,9 -604,31 +681,31 @@@
+  			return err;
+  	}
+  
+++<<<<<<< HEAD
+ +	return err;
+++=======
++ 	/* Event is neither on a bridge nor a LAG. Check whether it is on an
++ 	 * interface that is in a bridge with us.
++ 	 */
++ 	if (!foreign_dev_check_cb)
++ 		return err;
++ 
++ 	br = netdev_master_upper_dev_get(dev);
++ 	if (!br || !netif_is_bridge_master(br))
++ 		return err;
++ 
++ 	switchdev = switchdev_lower_dev_find(br, check_cb, foreign_dev_check_cb);
++ 	if (!switchdev)
++ 		return err;
++ 
++ 	if (!foreign_dev_check_cb(switchdev, dev))
++ 		return err;
++ 
++ 	return __switchdev_handle_port_obj_add(br, port_obj_info, check_cb,
++ 					       foreign_dev_check_cb, add_cb);
+++>>>>>>> acd8df5880d7 (net: switchdev: avoid infinite recursion from LAG to bridge with port object handler)
+  }
+  
+ -/* Pass through a port object addition, if @dev passes @check_cb, or replicate
+ - * it towards all lower interfaces of @dev that pass @check_cb, if @dev is a
+ - * bridge or a LAG.
+ - */
+  int switchdev_handle_port_obj_add(struct net_device *dev,
+  			struct switchdev_notifier_port_obj_info *port_obj_info,
+  			bool (*check_cb)(const struct net_device *dev),
+@@@ -704,7 -678,7 +730,11 @@@ static int __switchdev_handle_port_obj_
+  				      const struct switchdev_obj *obj))
+  {
+  	struct switchdev_notifier_info *info = &port_obj_info->info;
+++<<<<<<< HEAD
+ +	struct net_device *lower_dev;
+++=======
++ 	struct net_device *br, *lower_dev, *switchdev;
+++>>>>>>> acd8df5880d7 (net: switchdev: avoid infinite recursion from LAG to bridge with port object handler)
+  	struct list_head *iter;
+  	int err = -EOPNOTSUPP;
+  
+@@@ -732,9 -715,31 +762,31 @@@
+  			return err;
+  	}
+  
+++<<<<<<< HEAD
+ +	return err;
+++=======
++ 	/* Event is neither on a bridge nor a LAG. Check whether it is on an
++ 	 * interface that is in a bridge with us.
++ 	 */
++ 	if (!foreign_dev_check_cb)
++ 		return err;
++ 
++ 	br = netdev_master_upper_dev_get(dev);
++ 	if (!br || !netif_is_bridge_master(br))
++ 		return err;
++ 
++ 	switchdev = switchdev_lower_dev_find(br, check_cb, foreign_dev_check_cb);
++ 	if (!switchdev)
++ 		return err;
++ 
++ 	if (!foreign_dev_check_cb(switchdev, dev))
++ 		return err;
++ 
++ 	return __switchdev_handle_port_obj_del(br, port_obj_info, check_cb,
++ 					       foreign_dev_check_cb, del_cb);
+++>>>>>>> acd8df5880d7 (net: switchdev: avoid infinite recursion from LAG to bridge with port object handler)
+  }
+  
+ -/* Pass through a port object deletion, if @dev passes @check_cb, or replicate
+ - * it towards all lower interfaces of @dev that pass @check_cb, if @dev is a
+ - * bridge or a LAG.
+ - */
+  int switchdev_handle_port_obj_del(struct net_device *dev,
+  			struct switchdev_notifier_port_obj_info *port_obj_info,
+  			bool (*check_cb)(const struct net_device *dev),
+* Unmerged path net/switchdev/switchdev.c
