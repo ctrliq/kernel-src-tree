@@ -1,0 +1,132 @@
+Bluetooth: L2CAP: Use DEFER_SETUP to group ECRED connections
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Luiz Augusto von Dentz <luiz.von.dentz@intel.com>
+commit da49b602f7f75ccc91386e1274b3ef71676cd092
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/da49b602.failed
+
+This uses the DEFER_SETUP flag to group channels with
+L2CAP_CREDIT_BASED_CONNECTION_REQ.
+
+	Signed-off-by: Luiz Augusto von Dentz <luiz.von.dentz@intel.com>
+	Signed-off-by: Marcel Holtmann <marcel@holtmann.org>
+(cherry picked from commit da49b602f7f75ccc91386e1274b3ef71676cd092)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/bluetooth/l2cap_core.c
+diff --cc net/bluetooth/l2cap_core.c
+index 430c60f9d57f,fd9d0d08f9c9..000000000000
+--- a/net/bluetooth/l2cap_core.c
++++ b/net/bluetooth/l2cap_core.c
+@@@ -1294,6 -1379,81 +1317,84 @@@ static void l2cap_le_connect(struct l2c
+  		       sizeof(req), &req);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ struct l2cap_ecred_conn_data {
++ 	struct {
++ 		struct l2cap_ecred_conn_req req;
++ 		__le16 scid[5];
++ 	} __packed pdu;
++ 	struct l2cap_chan *chan;
++ 	struct pid *pid;
++ 	int count;
++ };
++ 
++ static void l2cap_ecred_defer_connect(struct l2cap_chan *chan, void *data)
++ {
++ 	struct l2cap_ecred_conn_data *conn = data;
++ 	struct pid *pid;
++ 
++ 	if (chan == conn->chan)
++ 		return;
++ 
++ 	if (!test_and_clear_bit(FLAG_DEFER_SETUP, &chan->flags))
++ 		return;
++ 
++ 	pid = chan->ops->get_peer_pid(chan);
++ 
++ 	/* Only add deferred channels with the same PID/PSM */
++ 	if (conn->pid != pid || chan->psm != conn->chan->psm || chan->ident ||
++ 	    chan->mode != L2CAP_MODE_EXT_FLOWCTL || chan->state != BT_CONNECT)
++ 		return;
++ 
++ 	if (test_and_set_bit(FLAG_ECRED_CONN_REQ_SENT, &chan->flags))
++ 		return;
++ 
++ 	l2cap_ecred_init(chan, 0);
++ 
++ 	/* Set the same ident so we can match on the rsp */
++ 	chan->ident = conn->chan->ident;
++ 
++ 	/* Include all channels deferred */
++ 	conn->pdu.scid[conn->count] = cpu_to_le16(chan->scid);
++ 
++ 	conn->count++;
++ }
++ 
++ static void l2cap_ecred_connect(struct l2cap_chan *chan)
++ {
++ 	struct l2cap_conn *conn = chan->conn;
++ 	struct l2cap_ecred_conn_data data;
++ 
++ 	if (test_bit(FLAG_DEFER_SETUP, &chan->flags))
++ 		return;
++ 
++ 	if (test_and_set_bit(FLAG_ECRED_CONN_REQ_SENT, &chan->flags))
++ 		return;
++ 
++ 	l2cap_ecred_init(chan, 0);
++ 
++ 	data.pdu.req.psm     = chan->psm;
++ 	data.pdu.req.mtu     = cpu_to_le16(chan->imtu);
++ 	data.pdu.req.mps     = cpu_to_le16(chan->mps);
++ 	data.pdu.req.credits = cpu_to_le16(chan->rx_credits);
++ 	data.pdu.scid[0]     = cpu_to_le16(chan->scid);
++ 
++ 	chan->ident = l2cap_get_ident(conn);
++ 	data.pid = chan->ops->get_peer_pid(chan);
++ 
++ 	data.count = 1;
++ 	data.chan = chan;
++ 	data.pid = chan->ops->get_peer_pid(chan);
++ 
++ 	__l2cap_chan_list(conn, l2cap_ecred_defer_connect, &data);
++ 
++ 	l2cap_send_cmd(conn, chan->ident, L2CAP_ECRED_CONN_REQ,
++ 		       sizeof(data.pdu.req) + data.count * sizeof(__le16),
++ 		       &data.pdu);
++ }
++ 
+++>>>>>>> da49b602f7f7 (Bluetooth: L2CAP: Use DEFER_SETUP to group ECRED connections)
+  static void l2cap_le_start(struct l2cap_chan *chan)
+  {
+  	struct l2cap_conn *conn = chan->conn;
+diff --git a/include/net/bluetooth/l2cap.h b/include/net/bluetooth/l2cap.h
+index 10e8193d3ec9..9c35b3862e44 100644
+--- a/include/net/bluetooth/l2cap.h
++++ b/include/net/bluetooth/l2cap.h
+@@ -47,6 +47,7 @@
+ #define L2CAP_DEFAULT_ACC_LAT		0xFFFFFFFF
+ #define L2CAP_BREDR_MAX_PAYLOAD		1019    /* 3-DH5 packet */
+ #define L2CAP_LE_MIN_MTU		23
++#define L2CAP_ECRED_CONN_SCID_MAX	5
+ 
+ #define L2CAP_DISC_TIMEOUT		msecs_to_jiffies(100)
+ #define L2CAP_DISC_REJ_TIMEOUT		msecs_to_jiffies(5000)
+@@ -936,6 +937,9 @@ void l2cap_chan_set_defaults(struct l2cap_chan *chan);
+ int l2cap_ertm_init(struct l2cap_chan *chan);
+ void l2cap_chan_add(struct l2cap_conn *conn, struct l2cap_chan *chan);
+ void __l2cap_chan_add(struct l2cap_conn *conn, struct l2cap_chan *chan);
++typedef void (*l2cap_chan_func_t)(struct l2cap_chan *chan, void *data);
++void l2cap_chan_list(struct l2cap_conn *conn, l2cap_chan_func_t func,
++		     void *data);
+ void l2cap_chan_del(struct l2cap_chan *chan, int err);
+ void l2cap_send_conn_req(struct l2cap_chan *chan);
+ void l2cap_move_start(struct l2cap_chan *chan);
+* Unmerged path net/bluetooth/l2cap_core.c
