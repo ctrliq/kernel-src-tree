@@ -1,0 +1,385 @@
+sched/topology: Make Energy Aware Scheduling depend on schedutil
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-193.el8
+commit-author Quentin Perret <quentin.perret@arm.com>
+commit 531b5c9f5cd05ead53324f419b32685a22eebe8b
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-193.el8/531b5c9f.failed
+
+Energy Aware Scheduling (EAS) is designed with the assumption that
+frequencies of CPUs follow their utilization value. When using a CPUFreq
+governor other than schedutil, the chances of this assumption being true
+are small, if any. When schedutil is being used, EAS' predictions are at
+least consistent with the frequency requests. Although those requests
+have no guarantees to be honored by the hardware, they should at least
+guide DVFS in the right direction and provide some hope in regards to the
+EAS model being accurate.
+
+To make sure EAS is only used in a sane configuration, create a strong
+dependency on schedutil being used. Since having sugov compiled-in does
+not provide that guarantee, make CPUFreq call a scheduler function on
+governor changes hence letting it rebuild the scheduling domains, check
+the governors of the online CPUs, and enable/disable EAS accordingly.
+
+	Signed-off-by: Quentin Perret <quentin.perret@arm.com>
+	Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+	Cc: Linus Torvalds <torvalds@linux-foundation.org>
+	Cc: Mike Galbraith <efault@gmx.de>
+	Cc: Peter Zijlstra <peterz@infradead.org>
+	Cc: Rafael J. Wysocki <rjw@rjwysocki.net>
+	Cc: Thomas Gleixner <tglx@linutronix.de>
+	Cc: adharmap@codeaurora.org
+	Cc: chris.redpath@arm.com
+	Cc: currojerez@riseup.net
+	Cc: dietmar.eggemann@arm.com
+	Cc: edubezval@gmail.com
+	Cc: gregkh@linuxfoundation.org
+	Cc: javi.merino@kernel.org
+	Cc: joel@joelfernandes.org
+	Cc: juri.lelli@redhat.com
+	Cc: morten.rasmussen@arm.com
+	Cc: patrick.bellasi@arm.com
+	Cc: pkondeti@codeaurora.org
+	Cc: skannan@codeaurora.org
+	Cc: smuckle@google.com
+	Cc: srinivas.pandruvada@linux.intel.com
+	Cc: thara.gopinath@linaro.org
+	Cc: tkjos@google.com
+	Cc: valentin.schneider@arm.com
+	Cc: vincent.guittot@linaro.org
+	Cc: viresh.kumar@linaro.org
+Link: https://lkml.kernel.org/r/20181203095628.11858-9-quentin.perret@arm.com
+	Signed-off-by: Ingo Molnar <mingo@kernel.org>
+(cherry picked from commit 531b5c9f5cd05ead53324f419b32685a22eebe8b)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	kernel/sched/sched.h
+#	kernel/sched/topology.c
+diff --cc kernel/sched/sched.h
+index 2f0ee3f2ef1e,fd84900b0b21..000000000000
+--- a/kernel/sched/sched.h
++++ b/kernel/sched/sched.h
+@@@ -2301,3 -2290,9 +2301,12 @@@ unsigned long scale_irq_capacity(unsign
+  	return util;
+  }
+  #endif
+++<<<<<<< HEAD
+++=======
++ 
++ #if defined(CONFIG_ENERGY_MODEL) && defined(CONFIG_CPU_FREQ_GOV_SCHEDUTIL)
++ #define perf_domain_span(pd) (to_cpumask(((pd)->em_pd->cpus)))
++ #else
++ #define perf_domain_span(pd) NULL
++ #endif
+++>>>>>>> 531b5c9f5cd0 (sched/topology: Make Energy Aware Scheduling depend on schedutil)
+diff --cc kernel/sched/topology.c
+index 7e6a83289382,0a5a1d3a4eae..000000000000
+--- a/kernel/sched/topology.c
++++ b/kernel/sched/topology.c
+@@@ -201,6 -201,183 +201,186 @@@ sd_parent_degenerate(struct sched_domai
+  	return 1;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ #if defined(CONFIG_ENERGY_MODEL) && defined(CONFIG_CPU_FREQ_GOV_SCHEDUTIL)
++ DEFINE_MUTEX(sched_energy_mutex);
++ bool sched_energy_update;
++ 
++ static void free_pd(struct perf_domain *pd)
++ {
++ 	struct perf_domain *tmp;
++ 
++ 	while (pd) {
++ 		tmp = pd->next;
++ 		kfree(pd);
++ 		pd = tmp;
++ 	}
++ }
++ 
++ static struct perf_domain *find_pd(struct perf_domain *pd, int cpu)
++ {
++ 	while (pd) {
++ 		if (cpumask_test_cpu(cpu, perf_domain_span(pd)))
++ 			return pd;
++ 		pd = pd->next;
++ 	}
++ 
++ 	return NULL;
++ }
++ 
++ static struct perf_domain *pd_init(int cpu)
++ {
++ 	struct em_perf_domain *obj = em_cpu_get(cpu);
++ 	struct perf_domain *pd;
++ 
++ 	if (!obj) {
++ 		if (sched_debug())
++ 			pr_info("%s: no EM found for CPU%d\n", __func__, cpu);
++ 		return NULL;
++ 	}
++ 
++ 	pd = kzalloc(sizeof(*pd), GFP_KERNEL);
++ 	if (!pd)
++ 		return NULL;
++ 	pd->em_pd = obj;
++ 
++ 	return pd;
++ }
++ 
++ static void perf_domain_debug(const struct cpumask *cpu_map,
++ 						struct perf_domain *pd)
++ {
++ 	if (!sched_debug() || !pd)
++ 		return;
++ 
++ 	printk(KERN_DEBUG "root_domain %*pbl:", cpumask_pr_args(cpu_map));
++ 
++ 	while (pd) {
++ 		printk(KERN_CONT " pd%d:{ cpus=%*pbl nr_cstate=%d }",
++ 				cpumask_first(perf_domain_span(pd)),
++ 				cpumask_pr_args(perf_domain_span(pd)),
++ 				em_pd_nr_cap_states(pd->em_pd));
++ 		pd = pd->next;
++ 	}
++ 
++ 	printk(KERN_CONT "\n");
++ }
++ 
++ static void destroy_perf_domain_rcu(struct rcu_head *rp)
++ {
++ 	struct perf_domain *pd;
++ 
++ 	pd = container_of(rp, struct perf_domain, rcu);
++ 	free_pd(pd);
++ }
++ 
++ /*
++  * EAS can be used on a root domain if it meets all the following conditions:
++  *    1. an Energy Model (EM) is available;
++  *    2. the SD_ASYM_CPUCAPACITY flag is set in the sched_domain hierarchy.
++  *    3. the EM complexity is low enough to keep scheduling overheads low;
++  *    4. schedutil is driving the frequency of all CPUs of the rd;
++  *
++  * The complexity of the Energy Model is defined as:
++  *
++  *              C = nr_pd * (nr_cpus + nr_cs)
++  *
++  * with parameters defined as:
++  *  - nr_pd:    the number of performance domains
++  *  - nr_cpus:  the number of CPUs
++  *  - nr_cs:    the sum of the number of capacity states of all performance
++  *              domains (for example, on a system with 2 performance domains,
++  *              with 10 capacity states each, nr_cs = 2 * 10 = 20).
++  *
++  * It is generally not a good idea to use such a model in the wake-up path on
++  * very complex platforms because of the associated scheduling overheads. The
++  * arbitrary constraint below prevents that. It makes EAS usable up to 16 CPUs
++  * with per-CPU DVFS and less than 8 capacity states each, for example.
++  */
++ #define EM_MAX_COMPLEXITY 2048
++ 
++ extern struct cpufreq_governor schedutil_gov;
++ static void build_perf_domains(const struct cpumask *cpu_map)
++ {
++ 	int i, nr_pd = 0, nr_cs = 0, nr_cpus = cpumask_weight(cpu_map);
++ 	struct perf_domain *pd = NULL, *tmp;
++ 	int cpu = cpumask_first(cpu_map);
++ 	struct root_domain *rd = cpu_rq(cpu)->rd;
++ 	struct cpufreq_policy *policy;
++ 	struct cpufreq_governor *gov;
++ 
++ 	/* EAS is enabled for asymmetric CPU capacity topologies. */
++ 	if (!per_cpu(sd_asym_cpucapacity, cpu)) {
++ 		if (sched_debug()) {
++ 			pr_info("rd %*pbl: CPUs do not have asymmetric capacities\n",
++ 					cpumask_pr_args(cpu_map));
++ 		}
++ 		goto free;
++ 	}
++ 
++ 	for_each_cpu(i, cpu_map) {
++ 		/* Skip already covered CPUs. */
++ 		if (find_pd(pd, i))
++ 			continue;
++ 
++ 		/* Do not attempt EAS if schedutil is not being used. */
++ 		policy = cpufreq_cpu_get(i);
++ 		if (!policy)
++ 			goto free;
++ 		gov = policy->governor;
++ 		cpufreq_cpu_put(policy);
++ 		if (gov != &schedutil_gov) {
++ 			if (rd->pd)
++ 				pr_warn("rd %*pbl: Disabling EAS, schedutil is mandatory\n",
++ 						cpumask_pr_args(cpu_map));
++ 			goto free;
++ 		}
++ 
++ 		/* Create the new pd and add it to the local list. */
++ 		tmp = pd_init(i);
++ 		if (!tmp)
++ 			goto free;
++ 		tmp->next = pd;
++ 		pd = tmp;
++ 
++ 		/*
++ 		 * Count performance domains and capacity states for the
++ 		 * complexity check.
++ 		 */
++ 		nr_pd++;
++ 		nr_cs += em_pd_nr_cap_states(pd->em_pd);
++ 	}
++ 
++ 	/* Bail out if the Energy Model complexity is too high. */
++ 	if (nr_pd * (nr_cs + nr_cpus) > EM_MAX_COMPLEXITY) {
++ 		WARN(1, "rd %*pbl: Failed to start EAS, EM complexity is too high\n",
++ 						cpumask_pr_args(cpu_map));
++ 		goto free;
++ 	}
++ 
++ 	perf_domain_debug(cpu_map, pd);
++ 
++ 	/* Attach the new list of performance domains to the root domain. */
++ 	tmp = rd->pd;
++ 	rcu_assign_pointer(rd->pd, pd);
++ 	if (tmp)
++ 		call_rcu(&tmp->rcu, destroy_perf_domain_rcu);
++ 
++ 	return;
++ 
++ free:
++ 	free_pd(pd);
++ 	tmp = rd->pd;
++ 	rcu_assign_pointer(rd->pd, NULL);
++ 	if (tmp)
++ 		call_rcu(&tmp->rcu, destroy_perf_domain_rcu);
++ }
++ #else
++ static void free_pd(struct perf_domain *pd) { }
++ #endif /* CONFIG_ENERGY_MODEL && CONFIG_CPU_FREQ_GOV_SCHEDUTIL*/
++ 
+++>>>>>>> 531b5c9f5cd0 (sched/topology: Make Energy Aware Scheduling depend on schedutil)
+  static void free_rootdomain(struct rcu_head *rcu)
+  {
+  	struct root_domain *rd = container_of(rcu, struct root_domain, rcu);
+@@@ -1994,6 -2172,21 +2174,24 @@@ match2
+  		;
+  	}
+  
+++<<<<<<< HEAD
+++=======
++ #if defined(CONFIG_ENERGY_MODEL) && defined(CONFIG_CPU_FREQ_GOV_SCHEDUTIL)
++ 	/* Build perf. domains: */
++ 	for (i = 0; i < ndoms_new; i++) {
++ 		for (j = 0; j < n && !sched_energy_update; j++) {
++ 			if (cpumask_equal(doms_new[i], doms_cur[j]) &&
++ 			    cpu_rq(cpumask_first(doms_cur[j]))->rd->pd)
++ 				goto match3;
++ 		}
++ 		/* No match - add perf. domains for a new rd */
++ 		build_perf_domains(doms_new[i]);
++ match3:
++ 		;
++ 	}
++ #endif
++ 
+++>>>>>>> 531b5c9f5cd0 (sched/topology: Make Energy Aware Scheduling depend on schedutil)
+  	/* Remember the new sched domains: */
+  	if (doms_cur != &fallback_doms)
+  		free_sched_domains(doms_cur, ndoms_cur);
+diff --git a/drivers/cpufreq/cpufreq.c b/drivers/cpufreq/cpufreq.c
+index 1ddb5ce39882..22dc87874a89 100644
+--- a/drivers/cpufreq/cpufreq.c
++++ b/drivers/cpufreq/cpufreq.c
+@@ -2276,6 +2276,7 @@ static int cpufreq_set_policy(struct cpufreq_policy *policy,
+ 		ret = cpufreq_start_governor(policy);
+ 		if (!ret) {
+ 			pr_debug("cpufreq: governor change\n");
++			sched_cpufreq_governor_change(policy, old_gov);
+ 			return 0;
+ 		}
+ 		cpufreq_exit_governor(policy);
+diff --git a/include/linux/cpufreq.h b/include/linux/cpufreq.h
+index 882a9b9e34bc..c86d6d8bdfed 100644
+--- a/include/linux/cpufreq.h
++++ b/include/linux/cpufreq.h
+@@ -950,6 +950,14 @@ static inline bool policy_has_boost_freq(struct cpufreq_policy *policy)
+ }
+ #endif
+ 
++#if defined(CONFIG_ENERGY_MODEL) && defined(CONFIG_CPU_FREQ_GOV_SCHEDUTIL)
++void sched_cpufreq_governor_change(struct cpufreq_policy *policy,
++			struct cpufreq_governor *old_gov);
++#else
++static inline void sched_cpufreq_governor_change(struct cpufreq_policy *policy,
++			struct cpufreq_governor *old_gov) { }
++#endif
++
+ extern void arch_freq_prepare_all(void);
+ extern unsigned int arch_freq_get_on_cpu(int cpu);
+ 
+diff --git a/kernel/sched/cpufreq_schedutil.c b/kernel/sched/cpufreq_schedutil.c
+index 8571f67b7da9..1154ac707184 100644
+--- a/kernel/sched/cpufreq_schedutil.c
++++ b/kernel/sched/cpufreq_schedutil.c
+@@ -624,7 +624,7 @@ static struct kobj_type sugov_tunables_ktype = {
+ 
+ /********************** cpufreq governor interface *********************/
+ 
+-static struct cpufreq_governor schedutil_gov;
++struct cpufreq_governor schedutil_gov;
+ 
+ static struct sugov_policy *sugov_policy_alloc(struct cpufreq_policy *policy)
+ {
+@@ -884,7 +884,7 @@ static void sugov_limits(struct cpufreq_policy *policy)
+ 	sg_policy->need_freq_update = true;
+ }
+ 
+-static struct cpufreq_governor schedutil_gov = {
++struct cpufreq_governor schedutil_gov = {
+ 	.name			= "schedutil",
+ 	.owner			= THIS_MODULE,
+ 	.dynamic_switching	= true,
+@@ -907,3 +907,36 @@ static int __init sugov_register(void)
+ 	return cpufreq_register_governor(&schedutil_gov);
+ }
+ fs_initcall(sugov_register);
++
++#ifdef CONFIG_ENERGY_MODEL
++extern bool sched_energy_update;
++extern struct mutex sched_energy_mutex;
++
++static void rebuild_sd_workfn(struct work_struct *work)
++{
++	mutex_lock(&sched_energy_mutex);
++	sched_energy_update = true;
++	rebuild_sched_domains();
++	sched_energy_update = false;
++	mutex_unlock(&sched_energy_mutex);
++}
++static DECLARE_WORK(rebuild_sd_work, rebuild_sd_workfn);
++
++/*
++ * EAS shouldn't be attempted without sugov, so rebuild the sched_domains
++ * on governor changes to make sure the scheduler knows about it.
++ */
++void sched_cpufreq_governor_change(struct cpufreq_policy *policy,
++				  struct cpufreq_governor *old_gov)
++{
++	if (old_gov == &schedutil_gov || policy->governor == &schedutil_gov) {
++		/*
++		 * When called from the cpufreq_register_driver() path, the
++		 * cpu_hotplug_lock is already held, so use a work item to
++		 * avoid nested locking in rebuild_sched_domains().
++		 */
++		schedule_work(&rebuild_sd_work);
++	}
++
++}
++#endif
+* Unmerged path kernel/sched/sched.h
+* Unmerged path kernel/sched/topology.c
