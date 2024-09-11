@@ -1,0 +1,215 @@
+locking/rwsem: Add debug check for __down_read*()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-147.el8
+commit-author Waiman Long <longman@redhat.com>
+commit a68e2c4c637918da47b3aa270051545cff7d8245
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-147.el8/a68e2c4c.failed
+
+When rwsem_down_read_failed*() return, the read lock is acquired
+indirectly by others. So debug checks are added in __down_read() and
+__down_read_killable() to make sure the rwsem is really reader-owned.
+
+The other debug check calls in kernel/locking/rwsem.c except the
+one in up_read_non_owner() are also moved over to rwsem-xadd.h.
+
+	Signed-off-by: Waiman Long <longman@redhat.com>
+	Acked-by: Peter Zijlstra <a.p.zijlstra@chello.nl>
+	Acked-by: Davidlohr Bueso <dbueso@suse.de>
+	Cc: Andrew Morton <akpm@linux-foundation.org>
+	Cc: Arnd Bergmann <arnd@arndb.de>
+	Cc: Borislav Petkov <bp@alien8.de>
+	Cc: Davidlohr Bueso <dave@stgolabs.net>
+	Cc: Linus Torvalds <torvalds@linux-foundation.org>
+	Cc: Paul E. McKenney <paulmck@linux.vnet.ibm.com>
+	Cc: Peter Zijlstra <peterz@infradead.org>
+	Cc: Thomas Gleixner <tglx@linutronix.de>
+	Cc: Tim Chen <tim.c.chen@linux.intel.com>
+	Cc: Will Deacon <will.deacon@arm.com>
+Link: http://lkml.kernel.org/r/20190404174320.22416-6-longman@redhat.com
+	Signed-off-by: Ingo Molnar <mingo@kernel.org>
+(cherry picked from commit a68e2c4c637918da47b3aa270051545cff7d8245)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	kernel/locking/rwsem.h
+diff --cc kernel/locking/rwsem.h
+index bad2bca0268b,1d8f722a6761..000000000000
+--- a/kernel/locking/rwsem.h
++++ b/kernel/locking/rwsem.h
+@@@ -132,3 -152,141 +132,144 @@@ static inline void rwsem_clear_reader_o
+  {
+  }
+  #endif
+++<<<<<<< HEAD
+++=======
++ 
++ extern struct rw_semaphore *rwsem_down_read_failed(struct rw_semaphore *sem);
++ extern struct rw_semaphore *rwsem_down_read_failed_killable(struct rw_semaphore *sem);
++ extern struct rw_semaphore *rwsem_down_write_failed(struct rw_semaphore *sem);
++ extern struct rw_semaphore *rwsem_down_write_failed_killable(struct rw_semaphore *sem);
++ extern struct rw_semaphore *rwsem_wake(struct rw_semaphore *sem);
++ extern struct rw_semaphore *rwsem_downgrade_wake(struct rw_semaphore *sem);
++ 
++ /*
++  * lock for reading
++  */
++ static inline void __down_read(struct rw_semaphore *sem)
++ {
++ 	if (unlikely(atomic_long_inc_return_acquire(&sem->count) <= 0)) {
++ 		rwsem_down_read_failed(sem);
++ 		DEBUG_RWSEMS_WARN_ON(!((unsigned long)sem->owner &
++ 					RWSEM_READER_OWNED));
++ 	} else {
++ 		rwsem_set_reader_owned(sem);
++ 	}
++ }
++ 
++ static inline int __down_read_killable(struct rw_semaphore *sem)
++ {
++ 	if (unlikely(atomic_long_inc_return_acquire(&sem->count) <= 0)) {
++ 		if (IS_ERR(rwsem_down_read_failed_killable(sem)))
++ 			return -EINTR;
++ 		DEBUG_RWSEMS_WARN_ON(!((unsigned long)sem->owner &
++ 					RWSEM_READER_OWNED));
++ 	} else {
++ 		rwsem_set_reader_owned(sem);
++ 	}
++ 	return 0;
++ }
++ 
++ static inline int __down_read_trylock(struct rw_semaphore *sem)
++ {
++ 	/*
++ 	 * Optimize for the case when the rwsem is not locked at all.
++ 	 */
++ 	long tmp = RWSEM_UNLOCKED_VALUE;
++ 
++ 	do {
++ 		if (atomic_long_try_cmpxchg_acquire(&sem->count, &tmp,
++ 					tmp + RWSEM_ACTIVE_READ_BIAS)) {
++ 			rwsem_set_reader_owned(sem);
++ 			return 1;
++ 		}
++ 	} while (tmp >= 0);
++ 	return 0;
++ }
++ 
++ /*
++  * lock for writing
++  */
++ static inline void __down_write(struct rw_semaphore *sem)
++ {
++ 	long tmp;
++ 
++ 	tmp = atomic_long_add_return_acquire(RWSEM_ACTIVE_WRITE_BIAS,
++ 					     &sem->count);
++ 	if (unlikely(tmp != RWSEM_ACTIVE_WRITE_BIAS))
++ 		rwsem_down_write_failed(sem);
++ 	rwsem_set_owner(sem);
++ }
++ 
++ static inline int __down_write_killable(struct rw_semaphore *sem)
++ {
++ 	long tmp;
++ 
++ 	tmp = atomic_long_add_return_acquire(RWSEM_ACTIVE_WRITE_BIAS,
++ 					     &sem->count);
++ 	if (unlikely(tmp != RWSEM_ACTIVE_WRITE_BIAS))
++ 		if (IS_ERR(rwsem_down_write_failed_killable(sem)))
++ 			return -EINTR;
++ 	rwsem_set_owner(sem);
++ 	return 0;
++ }
++ 
++ static inline int __down_write_trylock(struct rw_semaphore *sem)
++ {
++ 	long tmp;
++ 
++ 	tmp = atomic_long_cmpxchg_acquire(&sem->count, RWSEM_UNLOCKED_VALUE,
++ 		      RWSEM_ACTIVE_WRITE_BIAS);
++ 	if (tmp == RWSEM_UNLOCKED_VALUE) {
++ 		rwsem_set_owner(sem);
++ 		return true;
++ 	}
++ 	return false;
++ }
++ 
++ /*
++  * unlock after reading
++  */
++ static inline void __up_read(struct rw_semaphore *sem)
++ {
++ 	long tmp;
++ 
++ 	DEBUG_RWSEMS_WARN_ON(!((unsigned long)sem->owner & RWSEM_READER_OWNED));
++ 	rwsem_clear_reader_owned(sem);
++ 	tmp = atomic_long_dec_return_release(&sem->count);
++ 	if (unlikely(tmp < -1 && (tmp & RWSEM_ACTIVE_MASK) == 0))
++ 		rwsem_wake(sem);
++ }
++ 
++ /*
++  * unlock after writing
++  */
++ static inline void __up_write(struct rw_semaphore *sem)
++ {
++ 	DEBUG_RWSEMS_WARN_ON(sem->owner != current);
++ 	rwsem_clear_owner(sem);
++ 	if (unlikely(atomic_long_sub_return_release(RWSEM_ACTIVE_WRITE_BIAS,
++ 						    &sem->count) < 0))
++ 		rwsem_wake(sem);
++ }
++ 
++ /*
++  * downgrade write lock to read lock
++  */
++ static inline void __downgrade_write(struct rw_semaphore *sem)
++ {
++ 	long tmp;
++ 
++ 	/*
++ 	 * When downgrading from exclusive to shared ownership,
++ 	 * anything inside the write-locked region cannot leak
++ 	 * into the read side. In contrast, anything in the
++ 	 * read-locked region is ok to be re-ordered into the
++ 	 * write side. As such, rely on RELEASE semantics.
++ 	 */
++ 	DEBUG_RWSEMS_WARN_ON(sem->owner != current);
++ 	tmp = atomic_long_add_return_release(-RWSEM_WAITING_BIAS, &sem->count);
++ 	rwsem_set_reader_owned(sem);
++ 	if (tmp < 0)
++ 		rwsem_downgrade_wake(sem);
++ }
+++>>>>>>> a68e2c4c6379 (locking/rwsem: Add debug check for __down_read*())
+diff --git a/kernel/locking/rwsem.c b/kernel/locking/rwsem.c
+index e586f0d03ad3..9b38555b1e23 100644
+--- a/kernel/locking/rwsem.c
++++ b/kernel/locking/rwsem.c
+@@ -117,7 +117,6 @@ EXPORT_SYMBOL(down_write_trylock);
+ void up_read(struct rw_semaphore *sem)
+ {
+ 	rwsem_release(&sem->dep_map, 1, _RET_IP_);
+-	DEBUG_RWSEMS_WARN_ON(!((unsigned long)sem->owner & RWSEM_READER_OWNED));
+ 
+ 	rwsem_clear_reader_owned(sem);
+ 	__up_read(sem);
+@@ -131,7 +130,6 @@ EXPORT_SYMBOL(up_read);
+ void up_write(struct rw_semaphore *sem)
+ {
+ 	rwsem_release(&sem->dep_map, 1, _RET_IP_);
+-	DEBUG_RWSEMS_WARN_ON(sem->owner != current);
+ 
+ 	rwsem_clear_owner(sem);
+ 	__up_write(sem);
+@@ -145,7 +143,6 @@ EXPORT_SYMBOL(up_write);
+ void downgrade_write(struct rw_semaphore *sem)
+ {
+ 	lock_downgrade(&sem->dep_map, _RET_IP_);
+-	DEBUG_RWSEMS_WARN_ON(sem->owner != current);
+ 
+ 	rwsem_set_reader_owned(sem);
+ 	__downgrade_write(sem);
+* Unmerged path kernel/locking/rwsem.h
