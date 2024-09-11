@@ -1,0 +1,162 @@
+blk-mq: use bd->last == true for list inserts
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-80.el8
+commit-author Jens Axboe <axboe@kernel.dk>
+commit be94f058f2bde6f0b0ee9059a35daa8e15be308f
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-80.el8/be94f058.failed
+
+If we are issuing a list of requests, we know if we're at the last one.
+If we fail issuing, ensure that we call ->commits_rqs() to flush any
+potential previous requests.
+
+	Reviewed-by: Omar Sandoval <osandov@fb.com>
+	Reviewed-by: Ming Lei <ming.lei@redhat.com>
+	Reviewed-by: Christoph Hellwig <hch@lst.de>
+	Signed-off-by: Jens Axboe <axboe@kernel.dk>
+(cherry picked from commit be94f058f2bde6f0b0ee9059a35daa8e15be308f)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	block/blk-core.c
+diff --cc block/blk-core.c
+index 7df0c1244abd,3f6f5e6c2fe4..000000000000
+--- a/block/blk-core.c
++++ b/block/blk-core.c
+@@@ -2587,38 -1326,15 +2587,42 @@@ blk_status_t blk_insert_cloned_request(
+  	    should_fail_request(&rq->rq_disk->part0, blk_rq_bytes(rq)))
+  		return BLK_STS_IOERR;
+  
+ -	if (blk_queue_io_stat(q))
+ -		blk_account_io_start(rq, true);
+ +	if (q->mq_ops) {
+ +		if (blk_queue_io_stat(q))
+ +			blk_account_io_start(rq, true);
+ +		/*
+ +		 * Since we have a scheduler attached on the top device,
+ +		 * bypass a potential scheduler on the bottom device for
+ +		 * insert.
+ +		 */
+ +		return blk_mq_request_issue_directly(rq);
+ +	}
+ +
+ +	spin_lock_irqsave(q->queue_lock, flags);
+ +	if (unlikely(blk_queue_dying(q))) {
+ +		spin_unlock_irqrestore(q->queue_lock, flags);
+ +		return BLK_STS_IOERR;
+ +	}
+  
+  	/*
+ -	 * Since we have a scheduler attached on the top device,
+ -	 * bypass a potential scheduler on the bottom device for
+ -	 * insert.
+ +	 * Submitting request must be dequeued before calling this function
+ +	 * because it will be linked to another request_queue
+  	 */
+++<<<<<<< HEAD
+ +	BUG_ON(blk_queued_rq(rq));
+ +
+ +	if (op_is_flush(rq->cmd_flags))
+ +		where = ELEVATOR_INSERT_FLUSH;
+ +
+ +	add_acct_request(q, rq, where);
+ +	if (where == ELEVATOR_INSERT_FLUSH)
+ +		__blk_run_queue(q);
+ +	spin_unlock_irqrestore(q->queue_lock, flags);
+ +
+ +	return BLK_STS_OK;
+++=======
++ 	return blk_mq_request_issue_directly(rq, true);
+++>>>>>>> be94f058f2bd (blk-mq: use bd->last == true for list inserts)
+  }
+  EXPORT_SYMBOL_GPL(blk_insert_cloned_request);
+  
+* Unmerged path block/blk-core.c
+diff --git a/block/blk-mq.c b/block/blk-mq.c
+index 519da1c104b3..7c4a2006322a 100644
+--- a/block/blk-mq.c
++++ b/block/blk-mq.c
+@@ -1720,12 +1720,12 @@ static blk_qc_t request_to_qc_t(struct blk_mq_hw_ctx *hctx, struct request *rq)
+ 
+ static blk_status_t __blk_mq_issue_directly(struct blk_mq_hw_ctx *hctx,
+ 					    struct request *rq,
+-					    blk_qc_t *cookie)
++					    blk_qc_t *cookie, bool last)
+ {
+ 	struct request_queue *q = rq->q;
+ 	struct blk_mq_queue_data bd = {
+ 		.rq = rq,
+-		.last = true,
++		.last = last,
+ 	};
+ 	blk_qc_t new_cookie;
+ 	blk_status_t ret;
+@@ -1760,7 +1760,7 @@ static blk_status_t __blk_mq_issue_directly(struct blk_mq_hw_ctx *hctx,
+ static blk_status_t __blk_mq_try_issue_directly(struct blk_mq_hw_ctx *hctx,
+ 						struct request *rq,
+ 						blk_qc_t *cookie,
+-						bool bypass_insert)
++						bool bypass_insert, bool last)
+ {
+ 	struct request_queue *q = rq->q;
+ 	bool run_queue = true;
+@@ -1789,7 +1789,7 @@ static blk_status_t __blk_mq_try_issue_directly(struct blk_mq_hw_ctx *hctx,
+ 		goto insert;
+ 	}
+ 
+-	return __blk_mq_issue_directly(hctx, rq, cookie);
++	return __blk_mq_issue_directly(hctx, rq, cookie, last);
+ insert:
+ 	if (bypass_insert)
+ 		return BLK_STS_RESOURCE;
+@@ -1808,7 +1808,7 @@ static void blk_mq_try_issue_directly(struct blk_mq_hw_ctx *hctx,
+ 
+ 	hctx_lock(hctx, &srcu_idx);
+ 
+-	ret = __blk_mq_try_issue_directly(hctx, rq, cookie, false);
++	ret = __blk_mq_try_issue_directly(hctx, rq, cookie, false, true);
+ 	if (ret == BLK_STS_RESOURCE || ret == BLK_STS_DEV_RESOURCE)
+ 		blk_mq_request_bypass_insert(rq, true);
+ 	else if (ret != BLK_STS_OK)
+@@ -1817,7 +1817,7 @@ static void blk_mq_try_issue_directly(struct blk_mq_hw_ctx *hctx,
+ 	hctx_unlock(hctx, srcu_idx);
+ }
+ 
+-blk_status_t blk_mq_request_issue_directly(struct request *rq)
++blk_status_t blk_mq_request_issue_directly(struct request *rq, bool last)
+ {
+ 	blk_status_t ret;
+ 	int srcu_idx;
+@@ -1826,7 +1826,7 @@ blk_status_t blk_mq_request_issue_directly(struct request *rq)
+ 	struct blk_mq_hw_ctx *hctx = blk_mq_map_queue(rq->q, ctx->cpu);
+ 
+ 	hctx_lock(hctx, &srcu_idx);
+-	ret = __blk_mq_try_issue_directly(hctx, rq, &unused_cookie, true);
++	ret = __blk_mq_try_issue_directly(hctx, rq, &unused_cookie, true, last);
+ 	hctx_unlock(hctx, srcu_idx);
+ 
+ 	return ret;
+@@ -1841,7 +1841,7 @@ void blk_mq_try_issue_list_directly(struct blk_mq_hw_ctx *hctx,
+ 				queuelist);
+ 
+ 		list_del_init(&rq->queuelist);
+-		ret = blk_mq_request_issue_directly(rq);
++		ret = blk_mq_request_issue_directly(rq, list_empty(list));
+ 		if (ret != BLK_STS_OK) {
+ 			if (ret == BLK_STS_RESOURCE ||
+ 					ret == BLK_STS_DEV_RESOURCE) {
+diff --git a/block/blk-mq.h b/block/blk-mq.h
+index 7a8828f8b01e..24c7e05fb1b7 100644
+--- a/block/blk-mq.h
++++ b/block/blk-mq.h
+@@ -69,7 +69,7 @@ void blk_mq_insert_requests(struct blk_mq_hw_ctx *hctx, struct blk_mq_ctx *ctx,
+ 				struct list_head *list);
+ 
+ /* Used by blk_insert_cloned_request() to issue request directly */
+-blk_status_t blk_mq_request_issue_directly(struct request *rq);
++blk_status_t blk_mq_request_issue_directly(struct request *rq, bool last);
+ void blk_mq_try_issue_list_directly(struct blk_mq_hw_ctx *hctx,
+ 				    struct list_head *list);
+ 
