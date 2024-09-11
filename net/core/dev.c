@@ -3517,7 +3517,7 @@ static netdev_features_t gso_features_check(const struct sk_buff *skb,
 {
 	u16 gso_segs = skb_shinfo(skb)->gso_segs;
 
-	if (gso_segs > dev->gso_max_segs)
+	if (gso_segs > READ_ONCE(dev->gso_max_segs))
 		return features & ~NETIF_F_GSO_MASK;
 
 	/* Support for GSO partial features requires software
@@ -4747,7 +4747,7 @@ static u32 netif_receive_generic_xdp(struct sk_buff *skb,
 			skb_metadata_set(skb, metalen);
 		break;
 	default:
-		bpf_warn_invalid_xdp_action(act);
+		bpf_warn_invalid_xdp_action(skb->dev, xdp_prog, act);
 		/* fall through */
 	case XDP_ABORTED:
 		trace_xdp_exception(skb->dev, xdp_prog, act);

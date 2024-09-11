@@ -239,8 +239,10 @@ static inline void set_pte(pte_t *ptep, pte_t pte)
 	 * Only if the new pte is valid and kernel, otherwise TLB maintenance
 	 * or update_mmu_cache() have the necessary barriers.
 	 */
-	if (pte_valid_not_user(pte))
+	if (pte_valid_not_user(pte)) {
 		dsb(ishst);
+		isb();
+	}
 }
 
 extern void __sync_icache_dcache(pte_t pteval);
@@ -381,6 +383,7 @@ static inline int pmd_protnone(pmd_t pmd)
 #define pmd_present(pmd)	pte_present(pmd_pte(pmd))
 #define pmd_dirty(pmd)		pte_dirty(pmd_pte(pmd))
 #define pmd_young(pmd)		pte_young(pmd_pte(pmd))
+#define pmd_valid(pmd)		pte_valid(pmd_pte(pmd))
 #define pmd_wrprotect(pmd)	pte_pmd(pte_wrprotect(pmd_pte(pmd)))
 #define pmd_mkold(pmd)		pte_pmd(pte_mkold(pmd_pte(pmd)))
 #define pmd_mkwrite(pmd)	pte_pmd(pte_mkwrite(pmd_pte(pmd)))
@@ -486,7 +489,11 @@ static inline void set_pmd(pmd_t *pmdp, pmd_t pmd)
 #endif /* __PAGETABLE_PMD_FOLDED */
 
 	WRITE_ONCE(*pmdp, pmd);
-	dsb(ishst);
+
+	if (pmd_valid(pmd)) {
+		dsb(ishst);
+		isb();
+	}
 }
 
 static inline void pmd_clear(pmd_t *pmdp)
@@ -532,6 +539,7 @@ static inline void pte_unmap(pte_t *pte) { }
 #define pud_bad(pud)		(!(pud_val(pud) & PUD_TABLE_BIT))
 #define pud_present(pud)	pte_present(pud_pte(pud))
 #define pud_leaf(pud)		pud_sect(pud)
+#define pud_valid(pud)		pte_valid(pud_pte(pud))
 
 static inline void set_pud(pud_t *pudp, pud_t pud)
 {
@@ -543,7 +551,11 @@ static inline void set_pud(pud_t *pudp, pud_t pud)
 #endif /* __PAGETABLE_PUD_FOLDED */
 
 	WRITE_ONCE(*pudp, pud);
-	dsb(ishst);
+
+	if (pud_valid(pud)) {
+		dsb(ishst);
+		isb();
+	}
 }
 
 static inline void pud_clear(pud_t *pudp)
@@ -660,7 +672,7 @@ static inline phys_addr_t pgd_page_paddr(pgd_t pgd)
 static inline pte_t pte_modify(pte_t pte, pgprot_t newprot)
 {
 	const pteval_t mask = PTE_USER | PTE_PXN | PTE_UXN | PTE_RDONLY |
-			      PTE_PROT_NONE | PTE_VALID | PTE_WRITE;
+			      PTE_PROT_NONE | PTE_VALID | PTE_WRITE | PTE_GP;
 	/* preserve the hardware dirty information */
 	if (pte_hw_dirty(pte))
 		pte = pte_mkdirty(pte);

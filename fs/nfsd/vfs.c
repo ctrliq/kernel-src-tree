@@ -271,6 +271,7 @@ out_nfserr:
  * returned. Otherwise the covered directory is returned.
  * NOTE: this mountpoint crossing is not supported properly by all
  *   clients and is explicitly disallowed for NFSv3
+ *      NeilBrown <neilb@cse.unsw.edu.au>
  */
 __be32
 nfsd_lookup(struct svc_rqst *rqstp, struct svc_fh *fhp, const char *name,
@@ -473,6 +474,10 @@ nfsd_setattr(struct svc_rqst *rqstp, struct svc_fh *fhp, struct iattr *iap,
 			.ia_valid	= ATTR_SIZE | ATTR_CTIME | ATTR_MTIME,
 			.ia_size	= iap->ia_size,
 		};
+
+		host_err = -EFBIG;
+		if (iap->ia_size < 0)
+			goto out_unlock;
 
 		host_err = notify_change(dentry, &size_attr, NULL);
 		if (host_err)
@@ -1138,37 +1143,55 @@ out:
 }
 
 #ifdef CONFIG_NFSD_V3
-/*
- * Commit all pending writes to stable storage.
+/**
+ * nfsd_commit - Commit pending writes to stable storage
+ * @rqstp: RPC request being processed
+ * @fhp: NFS filehandle
+ * @offset: raw offset from beginning of file
+ * @count: raw count of bytes to sync
  *
- * Note: we only guarantee that data that lies within the range specified
- * by the 'offset' and 'count' parameters will be synced.
+ * Note: we guarantee that data that lies within the range specified
+ * by the 'offset' and 'count' parameters will be synced. The server
+ * is permitted to sync data that lies outside this range at the
+ * same time.
  *
  * Unfortunately we cannot lock the file to make sure we return full WCC
  * data to the client, as locking happens lower down in the filesystem.
+ *
+ * Return values:
+ *   An nfsstat value in network byte order.
  */
 __be32
-nfsd_commit(struct svc_rqst *rqstp, struct svc_fh *fhp,
-               loff_t offset, unsigned long count)
+nfsd_commit(struct svc_rqst *rqstp, struct svc_fh *fhp, u64 offset,
+            u32 count)
 {
+	u64		maxbytes;
+	loff_t		start, end;
 	struct file	*file;
-	loff_t		end = LLONG_MAX;
-	__be32		err = nfserr_inval;
-
-	if (offset < 0)
-		goto out;
-	if (count != 0) {
-		end = offset + (loff_t)count - 1;
-		if (end < offset)
-			goto out;
-	}
+	__be32		err;
 
 	err = nfsd_open(rqstp, fhp, S_IFREG,
 			NFSD_MAY_WRITE|NFSD_MAY_NOT_BREAK_LEASE, &file);
 	if (err)
 		goto out;
+
+	/*
+	 * Convert the client-provided (offset, count) range to a
+	 * (start, end) range. If the client-provided range falls
+	 * outside the maximum file size of the underlying FS,
+	 * clamp the sync range appropriately.
+	 */
+	start = 0;
+	end = LLONG_MAX;
+	maxbytes = (u64)fhp->fh_dentry->d_sb->s_maxbytes;
+	if (offset < maxbytes) {
+		start = offset;
+		if (count && (offset + count - 1 < maxbytes))
+			end = offset + count - 1;
+	}
+
 	if (EX_ISSYNC(fhp->fh_export)) {
-		int err2 = vfs_fsync_range(file, offset, end, 0);
+		int err2 = vfs_fsync_range(file, start, end, 0);
 
 		if (err2 != -EINVAL)
 			err = nfserrno(err2);
@@ -1614,9 +1637,9 @@ nfsd_symlink(struct svc_rqst *rqstp, struct svc_fh *fhp,
 
 	host_err = vfs_symlink(d_inode(dentry), dnew, path);
 	err = nfserrno(host_err);
+	fh_unlock(fhp);
 	if (!err)
 		err = nfserrno(commit_metadata(fhp));
-	fh_unlock(fhp);
 
 	fh_drop_write(fhp);
 
@@ -1681,6 +1704,7 @@ nfsd_link(struct svc_rqst *rqstp, struct svc_fh *ffhp,
 	if (d_really_is_negative(dold))
 		goto out_dput;
 	host_err = vfs_link(dold, dirp, dnew, NULL);
+	fh_unlock(ffhp);
 	if (!host_err) {
 		err = nfserrno(commit_metadata(ffhp));
 		if (!err)
@@ -1849,10 +1873,10 @@ nfsd_unlink(struct svc_rqst *rqstp, struct svc_fh *fhp, int type,
 		host_err = vfs_unlink(dirp, rdentry, NULL);
 	else
 		host_err = vfs_rmdir(dirp, rdentry);
+	fh_unlock(fhp);
 	if (!host_err)
 		host_err = commit_metadata(fhp);
 	dput(rdentry);
-	fh_unlock(fhp);
 	iput(rinode);    /* truncate the inode here */
 
 out_drop_write:

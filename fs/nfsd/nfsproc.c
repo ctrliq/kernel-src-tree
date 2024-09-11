@@ -234,8 +234,7 @@ nfsd_proc_write(struct svc_rqst *rqstp)
 		SVCFH_fmt(&argp->fh),
 		argp->len, argp->offset);
 
-	nvecs = svc_fill_write_vector(rqstp, rqstp->rq_arg.pages,
-				      &argp->first, cnt);
+	nvecs = svc_fill_write_vector(rqstp, &argp->payload);
 	if (!nvecs) {
 		resp->status = nfserr_io;
 		goto out;
@@ -555,6 +554,33 @@ nfsd_proc_rmdir(struct svc_rqst *rqstp)
 	return rpc_success;
 }
 
+static void nfsd_init_dirlist_pages(struct svc_rqst *rqstp,
+				    struct nfsd_readdirres *resp,
+				    u32 count)
+{
+	struct xdr_buf *buf = &resp->dirlist;
+	struct xdr_stream *xdr = &resp->xdr;
+
+	count = clamp(count, (u32)(XDR_UNIT * 2), svc_max_payload(rqstp));
+
+	memset(buf, 0, sizeof(*buf));
+
+	/* Reserve room for the NULL ptr & eof flag (-2 words) */
+	buf->buflen = count - XDR_UNIT * 2;
+	buf->pages = rqstp->rq_next_page;
+	rqstp->rq_next_page++;
+
+	/* This is xdr_init_encode(), but it assumes that
+	 * the head kvec has already been consumed. */
+	xdr_set_scratch_buffer(xdr, NULL, 0);
+	xdr->buf = buf;
+	xdr->page_ptr = buf->pages;
+	xdr->iov = NULL;
+	xdr->p = page_address(*buf->pages);
+	xdr->end = (void *)xdr->p + min_t(u32, buf->buflen, PAGE_SIZE);
+	xdr->rqst = NULL;
+}
+
 /*
  * Read a portion of a directory.
  */
@@ -563,33 +589,20 @@ nfsd_proc_readdir(struct svc_rqst *rqstp)
 {
 	struct nfsd_readdirargs *argp = rqstp->rq_argp;
 	struct nfsd_readdirres *resp = rqstp->rq_resp;
-	int		count;
 	loff_t		offset;
 
 	dprintk("nfsd: READDIR  %s %d bytes at %d\n",
 		SVCFH_fmt(&argp->fh),		
 		argp->count, argp->cookie);
 
-	/* Shrink to the client read size */
-	count = (argp->count >> 2) - 2;
+	nfsd_init_dirlist_pages(rqstp, resp, argp->count);
 
-	/* Make sure we've room for the NULL ptr & eof flag */
-	count -= 2;
-	if (count < 0)
-		count = 0;
-
-	resp->buffer = argp->buffer;
-	resp->offset = NULL;
-	resp->buflen = count;
 	resp->common.err = nfs_ok;
-	/* Read directory and encode entries on the fly */
+	resp->cookie_offset = 0;
 	offset = argp->cookie;
 	resp->status = nfsd_readdir(rqstp, &argp->fh, &offset,
 				    &resp->common, nfssvc_encode_entry);
-
-	resp->count = resp->buffer - argp->buffer;
-	if (resp->offset)
-		*resp->offset = htonl(offset);
+	nfssvc_encode_nfscookie(resp, offset);
 
 	fh_put(&argp->fh);
 	return rpc_success;

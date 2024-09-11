@@ -372,9 +372,10 @@ int mlx5_devlink_traps_get_action(struct mlx5_core_dev *dev, int trap_id,
 	return 0;
 }
 
-struct devlink *mlx5_devlink_alloc(void)
+struct devlink *mlx5_devlink_alloc(struct device *dev)
 {
-	return devlink_alloc(&mlx5_devlink_ops, sizeof(struct mlx5_core_dev));
+	return devlink_alloc(&mlx5_devlink_ops, sizeof(struct mlx5_core_dev),
+			     dev);
 }
 
 void mlx5_devlink_free(struct devlink *devlink)
@@ -651,40 +652,33 @@ static void mlx5_devlink_traps_unregister(struct devlink *devlink)
 				       ARRAY_SIZE(mlx5_trap_groups_arr));
 }
 
-int mlx5_devlink_register(struct devlink *devlink, struct device *dev)
+int mlx5_devlink_register(struct devlink *devlink)
 {
 	int err;
-
-	err = devlink_register(devlink, dev);
-	if (err)
-		return err;
 
 	err = devlink_params_register(devlink, mlx5_devlink_params,
 				      ARRAY_SIZE(mlx5_devlink_params));
 	if (err)
-		goto params_reg_err;
+		return err;
+
 	mlx5_devlink_set_params_init_values(devlink);
-	devlink_params_publish(devlink);
 
 	err = mlx5_devlink_traps_register(devlink);
 	if (err)
 		goto traps_reg_err;
 
+	devlink_set_features(devlink, DEVLINK_F_RELOAD);
 	return 0;
 
 traps_reg_err:
 	devlink_params_unregister(devlink, mlx5_devlink_params,
 				  ARRAY_SIZE(mlx5_devlink_params));
-params_reg_err:
-	devlink_unregister(devlink);
 	return err;
 }
 
 void mlx5_devlink_unregister(struct devlink *devlink)
 {
 	mlx5_devlink_traps_unregister(devlink);
-	devlink_params_unpublish(devlink);
 	devlink_params_unregister(devlink, mlx5_devlink_params,
 				  ARRAY_SIZE(mlx5_devlink_params));
-	devlink_unregister(devlink);
 }

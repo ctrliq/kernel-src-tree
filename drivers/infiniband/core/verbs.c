@@ -1191,22 +1191,143 @@ static struct ib_qp *create_xrc_qp_user(struct ib_qp *qp,
 	return qp;
 }
 
+static struct ib_qp *create_qp(struct ib_device *dev, struct ib_pd *pd,
+			       struct ib_qp_init_attr *attr,
+			       struct ib_udata *udata,
+			       struct ib_uqp_object *uobj, const char *caller)
+{
+	struct ib_udata dummy = {};
+	struct ib_qp *qp;
+	int ret;
+
+	if (!dev->ops.create_qp)
+		return ERR_PTR(-EOPNOTSUPP);
+
+	qp = rdma_zalloc_drv_obj_numa(dev, ib_qp);
+	if (!qp)
+		return ERR_PTR(-ENOMEM);
+
+	qp->device = dev;
+	qp->pd = pd;
+	qp->uobject = uobj;
+	qp->real_qp = qp;
+
+	qp->qp_type = attr->qp_type;
+	qp->rwq_ind_tbl = attr->rwq_ind_tbl;
+	qp->srq = attr->srq;
+	qp->event_handler = attr->event_handler;
+	qp->port = attr->port_num;
+	qp->qp_context = attr->qp_context;
+
+	spin_lock_init(&qp->mr_lock);
+	INIT_LIST_HEAD(&qp->rdma_mrs);
+	INIT_LIST_HEAD(&qp->sig_mrs);
+
+	qp->send_cq = attr->send_cq;
+	qp->recv_cq = attr->recv_cq;
+
+	rdma_restrack_new(&qp->res, RDMA_RESTRACK_QP);
+	WARN_ONCE(!udata && !caller, "Missing kernel QP owner");
+	rdma_restrack_set_name(&qp->res, udata ? NULL : caller);
+	ret = dev->ops.create_qp(qp, attr, udata);
+	if (ret)
+		goto err_create;
+
+	/*
+	 * TODO: The mlx4 internally overwrites send_cq and recv_cq.
+	 * Unfortunately, it is not an easy task to fix that driver.
+	 */
+	qp->send_cq = attr->send_cq;
+	qp->recv_cq = attr->recv_cq;
+
+	ret = ib_create_qp_security(qp, dev);
+	if (ret)
+		goto err_security;
+
+	rdma_restrack_add(&qp->res);
+	return qp;
+
+err_security:
+	qp->device->ops.destroy_qp(qp, udata ? &dummy : NULL);
+err_create:
+	rdma_restrack_put(&qp->res);
+	kfree(qp);
+	return ERR_PTR(ret);
+
+}
+
 /**
- * ib_create_named_qp - Creates a kernel QP associated with the specified protection
+ * ib_create_qp_user - Creates a QP associated with the specified protection
  *   domain.
+ * @dev: IB device
  * @pd: The protection domain associated with the QP.
- * @qp_init_attr: A list of initial attributes required to create the
+ * @attr: A list of initial attributes required to create the
  *   QP.  If QP creation succeeds, then the attributes are updated to
  *   the actual capabilities of the created QP.
+ * @udata: User data
+ * @uobj: uverbs obect
  * @caller: caller's build-time module name
- *
- * NOTE: for user qp use ib_create_qp_user with valid udata!
  */
-struct ib_qp *ib_create_named_qp(struct ib_pd *pd,
-				 struct ib_qp_init_attr *qp_init_attr,
-				 const char *caller)
+struct ib_qp *ib_create_qp_user(struct ib_device *dev, struct ib_pd *pd,
+				struct ib_qp_init_attr *attr,
+				struct ib_udata *udata,
+				struct ib_uqp_object *uobj, const char *caller)
 {
-	struct ib_device *device = pd ? pd->device : qp_init_attr->xrcd->device;
+	struct ib_qp *qp, *xrc_qp;
+
+	if (attr->qp_type == IB_QPT_XRC_TGT)
+		qp = create_qp(dev, pd, attr, NULL, NULL, caller);
+	else
+		qp = create_qp(dev, pd, attr, udata, uobj, NULL);
+	if (attr->qp_type != IB_QPT_XRC_TGT || IS_ERR(qp))
+		return qp;
+
+	xrc_qp = create_xrc_qp_user(qp, attr);
+	if (IS_ERR(xrc_qp)) {
+		ib_destroy_qp(qp);
+		return xrc_qp;
+	}
+
+	xrc_qp->uobject = uobj;
+	return xrc_qp;
+}
+EXPORT_SYMBOL(ib_create_qp_user);
+
+void ib_qp_usecnt_inc(struct ib_qp *qp)
+{
+	if (qp->pd)
+		atomic_inc(&qp->pd->usecnt);
+	if (qp->send_cq)
+		atomic_inc(&qp->send_cq->usecnt);
+	if (qp->recv_cq)
+		atomic_inc(&qp->recv_cq->usecnt);
+	if (qp->srq)
+		atomic_inc(&qp->srq->usecnt);
+	if (qp->rwq_ind_tbl)
+		atomic_inc(&qp->rwq_ind_tbl->usecnt);
+}
+EXPORT_SYMBOL(ib_qp_usecnt_inc);
+
+void ib_qp_usecnt_dec(struct ib_qp *qp)
+{
+	if (qp->rwq_ind_tbl)
+		atomic_dec(&qp->rwq_ind_tbl->usecnt);
+	if (qp->srq)
+		atomic_dec(&qp->srq->usecnt);
+	if (qp->recv_cq)
+		atomic_dec(&qp->recv_cq->usecnt);
+	if (qp->send_cq)
+		atomic_dec(&qp->send_cq->usecnt);
+	if (qp->pd)
+		atomic_dec(&qp->pd->usecnt);
+}
+EXPORT_SYMBOL(ib_qp_usecnt_dec);
+
+struct ib_qp *ib_create_qp_kernel(struct ib_pd *pd,
+				  struct ib_qp_init_attr *qp_init_attr,
+				  const char *caller)
+{
+	struct ib_device *device = pd->device;
 	struct ib_qp *qp;
 	int ret;
 
@@ -1219,33 +1340,11 @@ struct ib_qp *ib_create_named_qp(struct ib_pd *pd,
 	if (qp_init_attr->cap.max_rdma_ctxs)
 		rdma_rw_init_qp(device, qp_init_attr);
 
-	qp = _ib_create_qp(device, pd, qp_init_attr, NULL, NULL, caller);
+	qp = create_qp(device, pd, qp_init_attr, NULL, NULL, caller);
 	if (IS_ERR(qp))
 		return qp;
 
-	ret = ib_create_qp_security(qp, device);
-	if (ret)
-		goto err;
-
-	if (qp_init_attr->qp_type == IB_QPT_XRC_TGT) {
-		struct ib_qp *xrc_qp =
-			create_xrc_qp_user(qp, qp_init_attr);
-
-		if (IS_ERR(xrc_qp)) {
-			ret = PTR_ERR(xrc_qp);
-			goto err;
-		}
-		return xrc_qp;
-	}
-
-	if (qp_init_attr->recv_cq)
-		atomic_inc(&qp_init_attr->recv_cq->usecnt);
-	if (qp->srq)
-		atomic_inc(&qp_init_attr->srq->usecnt);
-
-	atomic_inc(&pd->usecnt);
-	if (qp_init_attr->send_cq)
-		atomic_inc(&qp_init_attr->send_cq->usecnt);
+	ib_qp_usecnt_inc(qp);
 
 	if (qp_init_attr->cap.max_rdma_ctxs) {
 		ret = rdma_rw_init_mrs(qp, qp_init_attr);
@@ -1271,7 +1370,7 @@ err:
 	return ERR_PTR(ret);
 
 }
-EXPORT_SYMBOL(ib_create_named_qp);
+EXPORT_SYMBOL(ib_create_qp_kernel);
 
 static const struct {
 	int			valid;
@@ -1903,10 +2002,6 @@ int ib_destroy_qp_user(struct ib_qp *qp, struct ib_udata *udata)
 {
 	const struct ib_gid_attr *alt_path_sgid_attr = qp->alt_path_sgid_attr;
 	const struct ib_gid_attr *av_sgid_attr = qp->av_sgid_attr;
-	struct ib_pd *pd;
-	struct ib_cq *scq, *rcq;
-	struct ib_srq *srq;
-	struct ib_rwq_ind_table *ind_tbl;
 	struct ib_qp_security *sec;
 	int ret;
 
@@ -1918,11 +2013,6 @@ int ib_destroy_qp_user(struct ib_qp *qp, struct ib_udata *udata)
 	if (qp->real_qp != qp)
 		return __ib_destroy_shared_qp(qp);
 
-	pd   = qp->pd;
-	scq  = qp->send_cq;
-	rcq  = qp->recv_cq;
-	srq  = qp->srq;
-	ind_tbl = qp->rwq_ind_tbl;
 	sec  = qp->qp_sec;
 	if (sec)
 		ib_destroy_qp_security_begin(sec);
@@ -1931,30 +2021,24 @@ int ib_destroy_qp_user(struct ib_qp *qp, struct ib_udata *udata)
 		rdma_rw_cleanup_mrs(qp);
 
 	rdma_counter_unbind_qp(qp, true);
-	rdma_restrack_del(&qp->res);
 	ret = qp->device->ops.destroy_qp(qp, udata);
-	if (!ret) {
-		if (alt_path_sgid_attr)
-			rdma_put_gid_attr(alt_path_sgid_attr);
-		if (av_sgid_attr)
-			rdma_put_gid_attr(av_sgid_attr);
-		if (pd)
-			atomic_dec(&pd->usecnt);
-		if (scq)
-			atomic_dec(&scq->usecnt);
-		if (rcq)
-			atomic_dec(&rcq->usecnt);
-		if (srq)
-			atomic_dec(&srq->usecnt);
-		if (ind_tbl)
-			atomic_dec(&ind_tbl->usecnt);
-		if (sec)
-			ib_destroy_qp_security_end(sec);
-	} else {
+	if (ret) {
 		if (sec)
 			ib_destroy_qp_security_abort(sec);
+		return ret;
 	}
 
+	if (alt_path_sgid_attr)
+		rdma_put_gid_attr(alt_path_sgid_attr);
+	if (av_sgid_attr)
+		rdma_put_gid_attr(av_sgid_attr);
+
+	ib_qp_usecnt_dec(qp);
+	if (sec)
+		ib_destroy_qp_security_end(sec);
+
+	rdma_restrack_del(&qp->res);
+	kfree(qp);
 	return ret;
 }
 EXPORT_SYMBOL(ib_destroy_qp_user);

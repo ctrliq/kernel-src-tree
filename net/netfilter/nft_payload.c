@@ -93,7 +93,7 @@ void nft_payload_eval(const struct nft_expr *expr,
 		offset = skb_network_offset(skb);
 		break;
 	case NFT_PAYLOAD_TRANSPORT_HEADER:
-		if (!pkt->tprot_set)
+		if (!pkt->tprot_set || pkt->xt.fragoff)
 			goto err;
 		offset = pkt->xt.thoff;
 		break;
@@ -598,7 +598,7 @@ static void nft_payload_set_eval(const struct nft_expr *expr,
 		offset = skb_network_offset(skb);
 		break;
 	case NFT_PAYLOAD_TRANSPORT_HEADER:
-		if (!pkt->tprot_set)
+		if (!pkt->tprot_set || pkt->xt.fragoff)
 			goto err;
 		offset = pkt->xt.thoff;
 		break;
@@ -631,7 +631,8 @@ static void nft_payload_set_eval(const struct nft_expr *expr,
 	if (priv->csum_type == NFT_PAYLOAD_CSUM_SCTP &&
 	    pkt->tprot == IPPROTO_SCTP &&
 	    skb->ip_summed != CHECKSUM_PARTIAL) {
-		if (nft_payload_csum_sctp(skb, pkt->xt.thoff))
+		if (pkt->xt.fragoff == 0 &&
+		    nft_payload_csum_sctp(skb, pkt->xt.thoff))
 			goto err;
 	}
 

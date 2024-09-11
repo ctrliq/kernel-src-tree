@@ -10,26 +10,6 @@ struct xfs_inode;
 struct xfs_dinode;
 
 /*
- * In memory representation of the XFS inode. This is held in the in-core struct
- * xfs_inode and represents the current on disk values but the structure is not
- * in on-disk format.  That is, this structure is always translated to on-disk
- * format specific structures at the appropriate time.
- */
-struct xfs_icdinode {
-	uint16_t	di_flushiter;	/* incremented on flush */
-	xfs_fsize_t	di_size;	/* number of bytes in file */
-	xfs_rfsblock_t	di_nblocks;	/* # of direct & btree blocks used */
-	xfs_extlen_t	di_extsize;	/* basic/minimum extent size for file */
-	uint8_t		di_forkoff;	/* attr fork offs, <<3 for 64b align */
-	uint16_t	di_flags;	/* random flags, XFS_DIFLAG_... */
-
-	uint64_t	di_flags2;	/* more random flags */
-	uint32_t	di_cowextsize;	/* basic cow extent size for file */
-
-	struct timespec64 di_crtime;	/* time created */
-};
-
-/*
  * Inode location information.  Stored in the inode and passed to
  * xfs_imap_to_bp() to get a buffer and dinode for a given inode.
  */

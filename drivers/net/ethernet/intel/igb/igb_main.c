@@ -2929,7 +2929,7 @@ static int igb_xdp_xmit_back(struct igb_adapter *adapter, struct xdp_buff *xdp)
 	nq = txring_txq(tx_ring);
 	__netif_tx_lock(nq, cpu);
 	/* Avoid transmit queue timeout since we share it with the slow path */
-	nq->trans_start = jiffies;
+	txq_trans_cond_update(nq);
 	ret = igb_xmit_xdp_ring(adapter, tx_ring, xdpf);
 	__netif_tx_unlock(nq);
 
@@ -2963,7 +2963,7 @@ static int igb_xdp_xmit(struct net_device *dev, int n,
 	__netif_tx_lock(nq, cpu);
 
 	/* Avoid transmit queue timeout since we share it with the slow path */
-	nq->trans_start = jiffies;
+	txq_trans_cond_update(nq);
 
 	for (i = 0; i < n; i++) {
 		struct xdp_frame *xdpf = frames[i];
@@ -8431,7 +8431,7 @@ static struct sk_buff *igb_run_xdp(struct igb_adapter *adapter,
 		result = IGB_XDP_REDIR;
 		break;
 	default:
-		bpf_warn_invalid_xdp_action(act);
+		bpf_warn_invalid_xdp_action(adapter->netdev, xdp_prog, act);
 		fallthrough;
 	case XDP_ABORTED:
 out_failure:

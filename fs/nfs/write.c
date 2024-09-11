@@ -287,6 +287,7 @@ static void nfs_grow_file(struct page *page, unsigned int offset, unsigned int c
 	end = page_file_offset(page) + ((loff_t)offset+count);
 	if (i_size >= end)
 		goto out;
+	trace_nfs_size_grow(inode, end);
 	i_size_write(inode, end);
 	NFS_I(inode)->cache_validity &= ~NFS_INO_INVALID_SIZE;
 	nfs_inc_stats(inode, NFSIOS_EXTENDWRITE);
@@ -1283,7 +1284,7 @@ static bool nfs_write_pageuptodate(struct page *page, struct inode *inode,
 	if (nfs_have_delegated_attributes(inode))
 		goto out;
 	if (nfsi->cache_validity &
-	    (NFS_INO_REVAL_PAGECACHE | NFS_INO_INVALID_SIZE))
+	    (NFS_INO_INVALID_CHANGE | NFS_INO_INVALID_SIZE))
 		return false;
 	smp_rmb();
 	if (test_bit(NFS_INO_INVALIDATING, &nfsi->flags) && pagelen != 0)
@@ -1592,7 +1593,7 @@ static int nfs_writeback_done(struct rpc_task *task,
 	/* Deal with the suid/sgid bit corner case */
 	if (nfs_should_remove_suid(inode)) {
 		spin_lock(&inode->i_lock);
-		nfs_set_cache_invalid(inode, NFS_INO_INVALID_OTHER);
+		nfs_set_cache_invalid(inode, NFS_INO_INVALID_MODE);
 		spin_unlock(&inode->i_lock);
 	}
 	return 0;
@@ -1662,10 +1663,13 @@ static void nfs_commit_begin(struct nfs_mds_commit_info *cinfo)
 	atomic_inc(&cinfo->rpcs_out);
 }
 
-static void nfs_commit_end(struct nfs_mds_commit_info *cinfo)
+bool nfs_commit_end(struct nfs_mds_commit_info *cinfo)
 {
-	if (atomic_dec_and_test(&cinfo->rpcs_out))
+	if (atomic_dec_and_test(&cinfo->rpcs_out)) {
 		wake_up_var(&cinfo->rpcs_out);
+		return true;
+	}
+	return false;
 }
 
 void nfs_commitdata_release(struct nfs_commit_data *data)
@@ -1765,6 +1769,7 @@ void nfs_init_commit(struct nfs_commit_data *data,
 	data->res.fattr   = &data->fattr;
 	data->res.verf    = &data->verf;
 	nfs_fattr_init(&data->fattr);
+	nfs_commit_begin(cinfo->mds);
 }
 EXPORT_SYMBOL_GPL(nfs_init_commit);
 
@@ -1810,7 +1815,6 @@ nfs_commit_list(struct inode *inode, struct list_head *head, int how,
 
 	/* Set up the argument struct */
 	nfs_init_commit(data, head, NULL, cinfo);
-	atomic_inc(&cinfo->mds->rpcs_out);
 	return nfs_initiate_commit(NFS_CLIENT(inode), data, NFS_PROTO(inode),
 				   data->mds_ops, how, RPC_TASK_CRED_NOREF);
 }

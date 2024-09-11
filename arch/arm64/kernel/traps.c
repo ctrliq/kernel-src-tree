@@ -46,6 +46,7 @@
 #include <asm/debug-monitors.h>
 #include <asm/esr.h>
 #include <asm/insn.h>
+#include <asm/kprobes.h>
 #include <asm/traps.h>
 #include <asm/smp.h>
 #include <asm/stack_pointer.h>
@@ -419,10 +420,13 @@ exit:
 	return fn ? fn(regs, instr) : 1;
 }
 
-void force_signal_inject(int signal, int code, unsigned long address)
+void force_signal_inject(int signal, int code, unsigned long address, unsigned int err)
 {
 	const char *desc;
 	struct pt_regs *regs = current_pt_regs();
+
+	if (WARN_ON(!user_mode(regs)))
+		return;
 
 	switch (signal) {
 	case SIGILL:
@@ -442,7 +446,7 @@ void force_signal_inject(int signal, int code, unsigned long address)
 		signal = SIGKILL;
 	}
 
-	arm64_notify_die(desc, regs, signal, code, (void __user *)address, 0);
+	arm64_notify_die(desc, regs, signal, code, (void __user *)address, err);
 }
 
 /*
@@ -459,10 +463,10 @@ void arm64_notify_segfault(unsigned long addr)
 		code = SEGV_ACCERR;
 	mmap_read_unlock(current->mm);
 
-	force_signal_inject(SIGSEGV, code, addr);
+	force_signal_inject(SIGSEGV, code, addr, 0);
 }
 
-asmlinkage void __exception do_undefinstr(struct pt_regs *regs)
+void do_undefinstr(struct pt_regs *regs)
 {
 	/* check for AArch32 breakpoint instructions */
 	if (!aarch32_break_handler(regs))
@@ -471,9 +475,28 @@ asmlinkage void __exception do_undefinstr(struct pt_regs *regs)
 	if (call_undef_hook(regs) == 0)
 		return;
 
-	force_signal_inject(SIGILL, ILL_ILLOPC, regs->pc);
 	BUG_ON(!user_mode(regs));
+	force_signal_inject(SIGILL, ILL_ILLOPC, regs->pc, 0);
 }
+NOKPROBE_SYMBOL(do_undefinstr);
+
+void do_bti(struct pt_regs *regs)
+{
+	BUG_ON(!user_mode(regs));
+	force_signal_inject(SIGILL, ILL_ILLOPC, regs->pc, 0);
+}
+NOKPROBE_SYMBOL(do_bti);
+
+void do_ptrauth_fault(struct pt_regs *regs, unsigned int esr)
+{
+	/*
+	 * Unexpected FPAC exception or pointer authentication failure in
+	 * the kernel: kill the task before it does any more harm.
+	 */
+	BUG_ON(!user_mode(regs));
+	force_signal_inject(SIGILL, ILL_ILLOPN, regs->pc, esr);
+}
+NOKPROBE_SYMBOL(do_ptrauth_fault);
 
 #define __user_cache_maint(insn, address, res)			\
 	if (address >= user_addr_max()) {			\
@@ -524,7 +547,7 @@ static void user_cache_maint_handler(unsigned int esr, struct pt_regs *regs)
 		__user_cache_maint("ic ivau", address, ret);
 		break;
 	default:
-		force_signal_inject(SIGILL, ILL_ILLOPC, regs->pc);
+		force_signal_inject(SIGILL, ILL_ILLOPC, regs->pc, 0);
 		return;
 	}
 
@@ -577,7 +600,7 @@ static void mrs_handler(unsigned int esr, struct pt_regs *regs)
 	sysreg = esr_sys64_to_sysreg(esr);
 
 	if (do_emulate_mrs(regs, sysreg, rt) != 0)
-		force_signal_inject(SIGILL, ILL_ILLOPC, regs->pc);
+		force_signal_inject(SIGILL, ILL_ILLOPC, regs->pc, 0);
 }
 
 static void wfi_handler(unsigned int esr, struct pt_regs *regs)
@@ -688,7 +711,7 @@ static const struct sys64_hook cp15_64_hooks[] = {
 	{},
 };
 
-asmlinkage void __exception do_cp15instr(unsigned int esr, struct pt_regs *regs)
+void do_cp15instr(unsigned int esr, struct pt_regs *regs)
 {
 	const struct sys64_hook *hook, *hook_base;
 
@@ -726,9 +749,10 @@ asmlinkage void __exception do_cp15instr(unsigned int esr, struct pt_regs *regs)
 	 */
 	do_undefinstr(regs);
 }
+NOKPROBE_SYMBOL(do_cp15instr);
 #endif
 
-asmlinkage void __exception do_sysinstr(unsigned int esr, struct pt_regs *regs)
+void do_sysinstr(unsigned int esr, struct pt_regs *regs)
 {
 	const struct sys64_hook *hook;
 
@@ -745,6 +769,7 @@ asmlinkage void __exception do_sysinstr(unsigned int esr, struct pt_regs *regs)
 	 */
 	do_undefinstr(regs);
 }
+NOKPROBE_SYMBOL(do_sysinstr);
 
 static const char *esr_class_str[] = {
 	[0 ... ESR_ELx_EC_MAX]		= "UNRECOGNIZED EC",
@@ -758,6 +783,7 @@ static const char *esr_class_str[] = {
 	[ESR_ELx_EC_CP10_ID]		= "CP10 MRC/VMRS",
 	[ESR_ELx_EC_PAC]		= "PAC",
 	[ESR_ELx_EC_CP14_64]		= "CP14 MCRR/MRRC",
+	[ESR_ELx_EC_BTI]		= "BTI",
 	[ESR_ELx_EC_ILL]		= "PSTATE.IL",
 	[ESR_ELx_EC_SVC32]		= "SVC (AArch32)",
 	[ESR_ELx_EC_HVC32]		= "HVC (AArch32)",
@@ -768,6 +794,7 @@ static const char *esr_class_str[] = {
 	[ESR_ELx_EC_SYS64]		= "MSR/MRS (AArch64)",
 	[ESR_ELx_EC_SVE]		= "SVE",
 	[ESR_ELx_EC_ERET]		= "ERET/ERETAA/ERETAB",
+	[ESR_ELx_EC_FPAC]		= "FPAC",
 	[ESR_ELx_EC_IMP_DEF]		= "EL3 IMP DEF",
 	[ESR_ELx_EC_IABT_LOW]		= "IABT (lower EL)",
 	[ESR_ELx_EC_IABT_CUR]		= "IABT (current EL)",
@@ -815,7 +842,7 @@ asmlinkage void bad_mode(struct pt_regs *regs, int reason, unsigned int esr)
  * bad_el0_sync handles unexpected, but potentially recoverable synchronous
  * exceptions taken from EL0. Unlike bad_mode, this returns.
  */
-asmlinkage void bad_el0_sync(struct pt_regs *regs, int reason, unsigned int esr)
+void bad_el0_sync(struct pt_regs *regs, int reason, unsigned int esr)
 {
 	void __user *pc = (void __user *)instruction_pointer(regs);
 

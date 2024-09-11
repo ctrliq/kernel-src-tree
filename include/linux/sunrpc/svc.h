@@ -249,6 +249,7 @@ struct svc_rqst {
 	size_t			rq_xprt_hlen;	/* xprt header len */
 	struct xdr_buf		rq_arg;
 	struct xdr_stream	rq_arg_stream;
+	struct xdr_stream	rq_res_stream;
 	struct page		*rq_scratch_page;
 	struct xdr_buf		rq_res;
 	struct page		*rq_pages[RPCSVC_MAXPAGES + 1];
@@ -452,9 +453,11 @@ struct svc_procedure {
 	/* process the request: */
 	__be32			(*pc_func)(struct svc_rqst *);
 	/* XDR decode args: */
-	int			(*pc_decode)(struct svc_rqst *, __be32 *data);
+	bool			(*pc_decode)(struct svc_rqst *rqstp,
+					     struct xdr_stream *xdr);
 	/* XDR encode result: */
-	int			(*pc_encode)(struct svc_rqst *, __be32 *data);
+	bool			(*pc_encode)(struct svc_rqst *rqstp,
+					     struct xdr_stream *xdr);
 	/* XDR free result: */
 	void			(*pc_release)(struct svc_rqst *);
 	unsigned int		pc_argsize;	/* argument struct size */
@@ -525,8 +528,7 @@ int		   svc_encode_result_payload(struct svc_rqst *rqstp,
 					     unsigned int offset,
 					     unsigned int length);
 unsigned int	   svc_fill_write_vector(struct svc_rqst *rqstp,
-					 struct page **pages,
-					 struct kvec *first, size_t total);
+					 struct xdr_buf *payload);
 char		  *svc_fill_symlink_pathname(struct svc_rqst *rqstp,
 					     struct kvec *first, void *p,
 					     size_t total);
@@ -570,6 +572,30 @@ static inline void svcxdr_init_decode(struct svc_rqst *rqstp)
 
 	xdr_init_decode(xdr, &rqstp->rq_arg, argv->iov_base, NULL);
 	xdr_set_scratch_page(xdr, rqstp->rq_scratch_page);
+}
+
+/**
+ * svcxdr_init_encode - Prepare an xdr_stream for svc Reply encoding
+ * @rqstp: controlling server RPC transaction context
+ *
+ */
+static inline void svcxdr_init_encode(struct svc_rqst *rqstp)
+{
+	struct xdr_stream *xdr = &rqstp->rq_res_stream;
+	struct xdr_buf *buf = &rqstp->rq_res;
+	struct kvec *resv = buf->head;
+
+	xdr_reset_scratch_buffer(xdr);
+
+	xdr->buf = buf;
+	xdr->iov = resv;
+	xdr->p   = resv->iov_base + resv->iov_len;
+	xdr->end = resv->iov_base + PAGE_SIZE - rqstp->rq_auth_slack;
+	buf->len = resv->iov_len;
+	xdr->page_ptr = buf->pages - 1;
+	buf->buflen = PAGE_SIZE * (1 + rqstp->rq_page_end - buf->pages);
+	buf->buflen -= rqstp->rq_auth_slack;
+	xdr->rqst = NULL;
 }
 
 #endif /* SUNRPC_SVC_H */

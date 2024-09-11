@@ -698,9 +698,18 @@ static int nfs_init_server(struct nfs_server *server,
 	/* Initialise the client representation from the mount data */
 	server->flags = ctx->flags;
 	server->options = ctx->options;
-	server->caps |= NFS_CAP_HARDLINKS|NFS_CAP_SYMLINKS|NFS_CAP_FILEID|
-		NFS_CAP_MODE|NFS_CAP_NLINK|NFS_CAP_OWNER|NFS_CAP_OWNER_GROUP|
-		NFS_CAP_ATIME|NFS_CAP_CTIME|NFS_CAP_MTIME;
+	server->caps |= NFS_CAP_HARDLINKS | NFS_CAP_SYMLINKS;
+
+	switch (clp->rpc_ops->version) {
+	case 2:
+		server->fattr_valid = NFS_ATTR_FATTR_V2;
+		break;
+	case 3:
+		server->fattr_valid = NFS_ATTR_FATTR_V3;
+		break;
+	default:
+		server->fattr_valid = NFS_ATTR_FATTR_V4;
+	}
 
 	if (ctx->rsize)
 		server->rsize = nfs_block_size(ctx->rsize, NULL);
@@ -794,6 +803,7 @@ static void nfs_server_set_fsinfo(struct nfs_server *server,
 	server->maxfilesize = fsinfo->maxfilesize;
 
 	server->time_delta = fsinfo->time_delta;
+	server->change_attr_type = fsinfo->change_attr_type;
 
 	server->clone_blksize = fsinfo->clone_blksize;
 	/* We're airborne Set socket buffersize */
@@ -958,6 +968,8 @@ struct nfs_server *nfs_alloc_server(void)
 		return NULL;
 	}
 
+	server->change_attr_type = NFS4_CHANGE_TYPE_IS_UNDEFINED;
+
 	ida_init(&server->openowner_id);
 	ida_init(&server->lockowner_id);
 	pnfs_init_server(server);
@@ -1036,7 +1048,7 @@ struct nfs_server *nfs_create_server(struct fs_context *fc)
 
 	if (!(fattr->valid & NFS_ATTR_FATTR)) {
 		error = ctx->nfs_mod->rpc_ops->getattr(server, ctx->mntfh,
-						       fattr, NULL, NULL);
+						       fattr, NULL);
 		if (error < 0) {
 			dprintk("nfs_create_server: getattr error = %d\n", -error);
 			goto error;

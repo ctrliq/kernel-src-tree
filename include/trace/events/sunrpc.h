@@ -14,6 +14,8 @@
 #include <linux/net.h>
 #include <linux/tracepoint.h>
 
+#include <trace/events/sunrpc_base.h>
+
 TRACE_DEFINE_ENUM(SOCK_STREAM);
 TRACE_DEFINE_ENUM(SOCK_DGRAM);
 TRACE_DEFINE_ENUM(SOCK_RAW);
@@ -80,7 +82,8 @@ DECLARE_EVENT_CLASS(rpc_xdr_buf_class,
 		__entry->msg_len = xdr->len;
 	),
 
-	TP_printk("task:%u@%u head=[%p,%zu] page=%u(%u) tail=[%p,%zu] len=%u",
+	TP_printk(SUNRPC_TRACE_TASK_SPECIFIER
+		  " head=[%p,%zu] page=%u(%u) tail=[%p,%zu] len=%u",
 		__entry->task_id, __entry->client_id,
 		__entry->head_base, __entry->head_len,
 		__entry->page_len, __entry->page_base,
@@ -118,7 +121,7 @@ DECLARE_EVENT_CLASS(rpc_clnt_class,
 		__entry->client_id = clnt->cl_clid;
 	),
 
-	TP_printk("clid=%u", __entry->client_id)
+	TP_printk("client=" SUNRPC_TRACE_CLID_SPECIFIER, __entry->client_id)
 );
 
 #define DEFINE_RPC_CLNT_EVENT(name)					\
@@ -158,11 +161,12 @@ TRACE_EVENT(rpc_clnt_new,
 		__entry->client_id = clnt->cl_clid;
 		__assign_str(addr, xprt->address_strings[RPC_DISPLAY_ADDR]);
 		__assign_str(port, xprt->address_strings[RPC_DISPLAY_PORT]);
-		__assign_str(program, program)
-		__assign_str(server, server)
+		__assign_str(program, program);
+		__assign_str(server, server);
 	),
 
-	TP_printk("client=%u peer=[%s]:%s program=%s server=%s",
+	TP_printk("client=" SUNRPC_TRACE_CLID_SPECIFIER
+		  " peer=[%s]:%s program=%s server=%s",
 		__entry->client_id, __get_str(addr), __get_str(port),
 		__get_str(program), __get_str(server))
 );
@@ -184,8 +188,8 @@ TRACE_EVENT(rpc_clnt_new_err,
 
 	TP_fast_assign(
 		__entry->error = error;
-		__assign_str(program, program)
-		__assign_str(server, server)
+		__assign_str(program, program);
+		__assign_str(server, server);
 	),
 
 	TP_printk("program=%s server=%s error=%d",
@@ -210,7 +214,8 @@ TRACE_EVENT(rpc_clnt_clone_err,
 		__entry->error = error;
 	),
 
-	TP_printk("client=%u error=%d", __entry->client_id, __entry->error)
+	TP_printk("client=" SUNRPC_TRACE_CLID_SPECIFIER " error=%d",
+		__entry->client_id, __entry->error)
 );
 
 
@@ -252,7 +257,7 @@ DECLARE_EVENT_CLASS(rpc_task_status,
 		__entry->status = task->tk_status;
 	),
 
-	TP_printk("task:%u@%u status=%d",
+	TP_printk(SUNRPC_TRACE_TASK_SPECIFIER " status=%d",
 		__entry->task_id, __entry->client_id,
 		__entry->status)
 );
@@ -288,11 +293,11 @@ TRACE_EVENT(rpc_request,
 		__entry->client_id = task->tk_client->cl_clid;
 		__entry->version = task->tk_client->cl_vers;
 		__entry->async = RPC_IS_ASYNC(task);
-		__assign_str(progname, task->tk_client->cl_program->name)
-		__assign_str(procname, rpc_proc_name(task))
+		__assign_str(progname, task->tk_client->cl_program->name);
+		__assign_str(procname, rpc_proc_name(task));
 	),
 
-	TP_printk("task:%u@%u %sv%d %s (%ssync)",
+	TP_printk(SUNRPC_TRACE_TASK_SPECIFIER " %sv%d %s (%ssync)",
 		__entry->task_id, __entry->client_id,
 		__get_str(progname), __entry->version,
 		__get_str(procname), __entry->async ? "a": ""
@@ -351,7 +356,8 @@ DECLARE_EVENT_CLASS(rpc_task_running,
 		__entry->flags = task->tk_flags;
 		),
 
-	TP_printk("task:%u@%d flags=%s runstate=%s status=%d action=%ps",
+	TP_printk(SUNRPC_TRACE_TASK_SPECIFIER
+		  " flags=%s runstate=%s status=%d action=%ps",
 		__entry->task_id, __entry->client_id,
 		rpc_show_task_flags(__entry->flags),
 		rpc_show_runstate(__entry->runstate),
@@ -404,7 +410,8 @@ DECLARE_EVENT_CLASS(rpc_task_queued,
 		__assign_str(q_name, rpc_qname(q));
 		),
 
-	TP_printk("task:%u@%d flags=%s runstate=%s status=%d timeout=%lu queue=%s",
+	TP_printk(SUNRPC_TRACE_TASK_SPECIFIER
+		  " flags=%s runstate=%s status=%d timeout=%lu queue=%s",
 		__entry->task_id, __entry->client_id,
 		rpc_show_task_flags(__entry->flags),
 		rpc_show_runstate(__entry->runstate),
@@ -440,7 +447,7 @@ DECLARE_EVENT_CLASS(rpc_failure,
 		__entry->client_id = task->tk_client->cl_clid;
 	),
 
-	TP_printk("task:%u@%u",
+	TP_printk(SUNRPC_TRACE_TASK_SPECIFIER,
 		__entry->task_id, __entry->client_id)
 );
 
@@ -476,13 +483,14 @@ DECLARE_EVENT_CLASS(rpc_reply_event,
 		__entry->task_id = task->tk_pid;
 		__entry->client_id = task->tk_client->cl_clid;
 		__entry->xid = be32_to_cpu(task->tk_rqstp->rq_xid);
-		__assign_str(progname, task->tk_client->cl_program->name)
+		__assign_str(progname, task->tk_client->cl_program->name);
 		__entry->version = task->tk_client->cl_vers;
-		__assign_str(procname, rpc_proc_name(task))
-		__assign_str(servername, task->tk_xprt->servername)
+		__assign_str(procname, rpc_proc_name(task));
+		__assign_str(servername, task->tk_xprt->servername);
 	),
 
-	TP_printk("task:%u@%d server=%s xid=0x%08x %sv%d %s",
+	TP_printk(SUNRPC_TRACE_TASK_SPECIFIER
+		  " server=%s xid=0x%08x %sv%d %s",
 		__entry->task_id, __entry->client_id, __get_str(servername),
 		__entry->xid, __get_str(progname), __entry->version,
 		__get_str(procname))
@@ -542,7 +550,8 @@ TRACE_EVENT(rpc_buf_alloc,
 		__entry->status = status;
 	),
 
-	TP_printk("task:%u@%u callsize=%zu recvsize=%zu status=%d",
+	TP_printk(SUNRPC_TRACE_TASK_SPECIFIER
+		  " callsize=%zu recvsize=%zu status=%d",
 		__entry->task_id, __entry->client_id,
 		__entry->callsize, __entry->recvsize, __entry->status
 	)
@@ -571,7 +580,8 @@ TRACE_EVENT(rpc_call_rpcerror,
 		__entry->rpc_status = rpc_status;
 	),
 
-	TP_printk("task:%u@%u tk_status=%d rpc_status=%d",
+	TP_printk(SUNRPC_TRACE_TASK_SPECIFIER
+		  " tk_status=%d rpc_status=%d",
 		__entry->task_id, __entry->client_id,
 		__entry->tk_status, __entry->rpc_status)
 );
@@ -604,14 +614,15 @@ TRACE_EVENT(rpc_stats_latency,
 		__entry->task_id = task->tk_pid;
 		__entry->xid = be32_to_cpu(task->tk_rqstp->rq_xid);
 		__entry->version = task->tk_client->cl_vers;
-		__assign_str(progname, task->tk_client->cl_program->name)
-		__assign_str(procname, rpc_proc_name(task))
+		__assign_str(progname, task->tk_client->cl_program->name);
+		__assign_str(procname, rpc_proc_name(task));
 		__entry->backlog = ktime_to_us(backlog);
 		__entry->rtt = ktime_to_us(rtt);
 		__entry->execute = ktime_to_us(execute);
 	),
 
-	TP_printk("task:%u@%d xid=0x%08x %sv%d %s backlog=%lu rtt=%lu execute=%lu",
+	TP_printk(SUNRPC_TRACE_TASK_SPECIFIER
+		  " xid=0x%08x %sv%d %s backlog=%lu rtt=%lu execute=%lu",
 		__entry->task_id, __entry->client_id, __entry->xid,
 		__get_str(progname), __entry->version, __get_str(procname),
 		__entry->backlog, __entry->rtt, __entry->execute)
@@ -651,15 +662,15 @@ TRACE_EVENT(rpc_xdr_overflow,
 			__entry->task_id = task->tk_pid;
 			__entry->client_id = task->tk_client->cl_clid;
 			__assign_str(progname,
-				     task->tk_client->cl_program->name)
+				     task->tk_client->cl_program->name);
 			__entry->version = task->tk_client->cl_vers;
-			__assign_str(procedure, task->tk_msg.rpc_proc->p_name)
+			__assign_str(procedure, task->tk_msg.rpc_proc->p_name);
 		} else {
-			__entry->task_id = 0;
-			__entry->client_id = 0;
-			__assign_str(progname, "unknown")
+			__entry->task_id = -1;
+			__entry->client_id = -1;
+			__assign_str(progname, "unknown");
 			__entry->version = 0;
-			__assign_str(procedure, "unknown")
+			__assign_str(procedure, "unknown");
 		}
 		__entry->requested = requested;
 		__entry->end = xdr->end;
@@ -672,8 +683,8 @@ TRACE_EVENT(rpc_xdr_overflow,
 		__entry->len = xdr->buf->len;
 	),
 
-	TP_printk(
-		"task:%u@%u %sv%d %s requested=%zu p=%p end=%p xdr=[%p,%zu]/%u/[%p,%zu]/%u\n",
+	TP_printk(SUNRPC_TRACE_TASK_SPECIFIER
+		  " %sv%d %s requested=%zu p=%p end=%p xdr=[%p,%zu]/%u/[%p,%zu]/%u\n",
 		__entry->task_id, __entry->client_id,
 		__get_str(progname), __entry->version, __get_str(procedure),
 		__entry->requested, __entry->p, __entry->end,
@@ -717,9 +728,9 @@ TRACE_EVENT(rpc_xdr_alignment,
 		__entry->task_id = task->tk_pid;
 		__entry->client_id = task->tk_client->cl_clid;
 		__assign_str(progname,
-			     task->tk_client->cl_program->name)
+			     task->tk_client->cl_program->name);
 		__entry->version = task->tk_client->cl_vers;
-		__assign_str(procedure, task->tk_msg.rpc_proc->p_name)
+		__assign_str(procedure, task->tk_msg.rpc_proc->p_name);
 
 		__entry->offset = offset;
 		__entry->copied = copied;
@@ -731,8 +742,8 @@ TRACE_EVENT(rpc_xdr_alignment,
 		__entry->len = xdr->buf->len;
 	),
 
-	TP_printk(
-		"task:%u@%u %sv%d %s offset=%zu copied=%u xdr=[%p,%zu]/%u/[%p,%zu]/%u\n",
+	TP_printk(SUNRPC_TRACE_TASK_SPECIFIER
+		  " %sv%d %s offset=%zu copied=%u xdr=[%p,%zu]/%u/[%p,%zu]/%u\n",
 		__entry->task_id, __entry->client_id,
 		__get_str(progname), __entry->version, __get_str(procedure),
 		__entry->offset, __entry->copied,
@@ -933,7 +944,8 @@ TRACE_EVENT(rpc_socket_nospace,
 		__entry->remaining = rqst->rq_slen - transport->xmit.offset;
 	),
 
-	TP_printk("task:%u@%u total=%u remaining=%u",
+	TP_printk(SUNRPC_TRACE_TASK_SPECIFIER
+		  " total=%u remaining=%u",
 		__entry->task_id, __entry->client_id,
 		__entry->total, __entry->remaining
 	)
@@ -941,17 +953,17 @@ TRACE_EVENT(rpc_socket_nospace,
 
 #define rpc_show_xprt_state(x)						\
 	__print_flags(x, "|",						\
-		{ (1UL << XPRT_LOCKED),		"LOCKED"},		\
-		{ (1UL << XPRT_CONNECTED),	"CONNECTED"},		\
-		{ (1UL << XPRT_CONNECTING),	"CONNECTING"},		\
-		{ (1UL << XPRT_CLOSE_WAIT),	"CLOSE_WAIT"},		\
-		{ (1UL << XPRT_BOUND),		"BOUND"},		\
-		{ (1UL << XPRT_BINDING),	"BINDING"},		\
-		{ (1UL << XPRT_CLOSING),	"CLOSING"},		\
-		{ (1UL << XPRT_CONGESTED),	"CONGESTED"},		\
-		{ (1UL << XPRT_CWND_WAIT),	"CWND_WAIT"},		\
-		{ (1UL << XPRT_WRITE_SPACE),	"WRITE_SPACE"},		\
-		{ (1UL << XPRT_SND_IS_COOKIE),	"SND_IS_COOKIE"})
+		{ BIT(XPRT_LOCKED),		"LOCKED"},		\
+		{ BIT(XPRT_CONNECTED),		"CONNECTED"},		\
+		{ BIT(XPRT_CONNECTING),		"CONNECTING"},		\
+		{ BIT(XPRT_CLOSE_WAIT),		"CLOSE_WAIT"},		\
+		{ BIT(XPRT_BOUND),		"BOUND"},		\
+		{ BIT(XPRT_BINDING),		"BINDING"},		\
+		{ BIT(XPRT_CLOSING),		"CLOSING"},		\
+		{ BIT(XPRT_CONGESTED),		"CONGESTED"},		\
+		{ BIT(XPRT_CWND_WAIT),		"CWND_WAIT"},		\
+		{ BIT(XPRT_WRITE_SPACE),	"WRITE_SPACE"},		\
+		{ BIT(XPRT_SND_IS_COOKIE),	"SND_IS_COOKIE"})
 
 DECLARE_EVENT_CLASS(rpc_xprt_lifetime_class,
 	TP_PROTO(
@@ -1057,8 +1069,8 @@ TRACE_EVENT(xprt_transmit,
 		__entry->status = status;
 	),
 
-	TP_printk(
-		"task:%u@%u xid=0x%08x seqno=%u status=%d",
+	TP_printk(SUNRPC_TRACE_TASK_SPECIFIER
+		  " xid=0x%08x seqno=%u status=%d",
 		__entry->task_id, __entry->client_id, __entry->xid,
 		__entry->seqno, __entry->status)
 );
@@ -1076,10 +1088,10 @@ TRACE_EVENT(xprt_retransmit,
 		__field(u32, xid)
 		__field(int, ntrans)
 		__field(int, version)
+		__field(unsigned long, timeout)
 		__string(progname,
 			 rqst->rq_task->tk_client->cl_program->name)
-		__string(procedure,
-			 rqst->rq_task->tk_msg.rpc_proc->p_name)
+		__string(procname, rpc_proc_name(rqst->rq_task))
 	),
 
 	TP_fast_assign(
@@ -1090,17 +1102,19 @@ TRACE_EVENT(xprt_retransmit,
 			task->tk_client->cl_clid : -1;
 		__entry->xid = be32_to_cpu(rqst->rq_xid);
 		__entry->ntrans = rqst->rq_ntrans;
+		__entry->timeout = task->tk_timeout;
 		__assign_str(progname,
-			     task->tk_client->cl_program->name)
+			     task->tk_client->cl_program->name);
 		__entry->version = task->tk_client->cl_vers;
-		__assign_str(procedure, task->tk_msg.rpc_proc->p_name)
+		__assign_str(procname, rpc_proc_name(task));
 	),
 
-	TP_printk(
-		"task:%u@%u xid=0x%08x %sv%d %s ntrans=%d",
+	TP_printk(SUNRPC_TRACE_TASK_SPECIFIER
+		  " xid=0x%08x %sv%d %s ntrans=%d timeout=%lu",
 		__entry->task_id, __entry->client_id, __entry->xid,
-		__get_str(progname), __entry->version, __get_str(procedure),
-		__entry->ntrans)
+		__get_str(progname), __entry->version, __get_str(procname),
+		__entry->ntrans, __entry->timeout
+	)
 );
 
 TRACE_EVENT(xprt_ping,
@@ -1153,7 +1167,8 @@ DECLARE_EVENT_CLASS(xprt_writelock_event,
 			__entry->snd_task_id = -1;
 	),
 
-	TP_printk("task:%u@%u snd_task:%u",
+	TP_printk(SUNRPC_TRACE_TASK_SPECIFIER
+		  " snd_task:" SUNRPC_TRACE_PID_SPECIFIER,
 			__entry->task_id, __entry->client_id,
 			__entry->snd_task_id)
 );
@@ -1205,7 +1220,9 @@ DECLARE_EVENT_CLASS(xprt_cong_event,
 		__entry->wait = test_bit(XPRT_CWND_WAIT, &xprt->state);
 	),
 
-	TP_printk("task:%u@%u snd_task:%u cong=%lu cwnd=%lu%s",
+	TP_printk(SUNRPC_TRACE_TASK_SPECIFIER
+		  " snd_task:" SUNRPC_TRACE_PID_SPECIFIER
+		  " cong=%lu cwnd=%lu%s",
 			__entry->task_id, __entry->client_id,
 			__entry->snd_task_id, __entry->cong, __entry->cwnd,
 			__entry->wait ? " (wait)" : "")
@@ -1243,7 +1260,7 @@ TRACE_EVENT(xprt_reserve,
 		__entry->xid = be32_to_cpu(rqst->rq_xid);
 	),
 
-	TP_printk("task:%u@%u xid=0x%08x",
+	TP_printk(SUNRPC_TRACE_TASK_SPECIFIER " xid=0x%08x",
 		__entry->task_id, __entry->client_id, __entry->xid
 	)
 );
@@ -1332,7 +1349,8 @@ TRACE_EVENT(rpcb_getport,
 		__assign_str(servername, task->tk_xprt->servername);
 	),
 
-	TP_printk("task:%u@%u server=%s program=%u version=%u protocol=%d bind_version=%u",
+	TP_printk(SUNRPC_TRACE_TASK_SPECIFIER
+		  " server=%s program=%u version=%u protocol=%d bind_version=%u",
 		__entry->task_id, __entry->client_id, __get_str(servername),
 		__entry->program, __entry->version, __entry->protocol,
 		__entry->bind_version
@@ -1362,7 +1380,7 @@ TRACE_EVENT(rpcb_setport,
 		__entry->port = port;
 	),
 
-	TP_printk("task:%u@%u status=%d port=%u",
+	TP_printk(SUNRPC_TRACE_TASK_SPECIFIER " status=%d port=%u",
 		__entry->task_id, __entry->client_id,
 		__entry->status, __entry->port
 	)
@@ -1836,7 +1854,7 @@ TRACE_EVENT(svc_xprt_accept,
 
 	TP_fast_assign(
 		__assign_str(addr, xprt->xpt_remotebuf);
-		__assign_str(protocol, xprt->xpt_class->xcl_name)
+		__assign_str(protocol, xprt->xpt_class->xcl_name);
 		__assign_str(service, service);
 	),
 

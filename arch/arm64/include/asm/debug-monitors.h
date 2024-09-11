@@ -16,8 +16,6 @@
 #ifndef __ASM_DEBUG_MONITORS_H
 #define __ASM_DEBUG_MONITORS_H
 
-#ifdef __KERNEL__
-
 #include <linux/errno.h>
 #include <linux/types.h>
 #include <asm/brk-imm.h>
@@ -144,5 +142,4 @@ int aarch32_break_handler(struct pt_regs *regs);
 void debug_traps_init(void);
 
 #endif	/* __ASSEMBLY */
-#endif	/* __KERNEL__ */
 #endif	/* __ASM_DEBUG_MONITORS_H */

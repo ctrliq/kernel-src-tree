@@ -1282,7 +1282,7 @@ int mlx5_init_one(struct mlx5_core_dev *dev)
 
 	set_bit(MLX5_INTERFACE_STATE_UP, &dev->intf_state);
 
-	err = mlx5_devlink_register(priv_to_devlink(dev), dev->device);
+	err = mlx5_devlink_register(priv_to_devlink(dev));
 	if (err)
 		goto err_devlink_reg;
 
@@ -1463,7 +1463,7 @@ static int probe_one(struct pci_dev *pdev, const struct pci_device_id *id)
 	struct devlink *devlink;
 	int err;
 
-	devlink = mlx5_devlink_alloc();
+	devlink = mlx5_devlink_alloc(&pdev->dev);
 	if (!devlink) {
 		dev_err(&pdev->dev, "devlink alloc failed\n");
 		return -ENOMEM;
@@ -1505,8 +1505,7 @@ static int probe_one(struct pci_dev *pdev, const struct pci_device_id *id)
 		dev_err(&pdev->dev, "mlx5_crdump_enable failed with error code %d\n", err);
 
 	pci_save_state(pdev);
-	if (!mlx5_core_is_mp_slave(dev))
-		devlink_reload_enable(devlink);
+	devlink_register(devlink);
 	return 0;
 
 err_init_one:
@@ -1526,7 +1525,7 @@ static void remove_one(struct pci_dev *pdev)
 	struct mlx5_core_dev *dev  = pci_get_drvdata(pdev);
 	struct devlink *devlink = priv_to_devlink(dev);
 
-	devlink_reload_disable(devlink);
+	devlink_unregister(devlink);
 	mlx5_crdump_disable(dev);
 	mlx5_drain_health_wq(dev);
 	mlx5_uninit_one(dev);

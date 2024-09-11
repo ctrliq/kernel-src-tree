@@ -25,6 +25,7 @@
 #include <asm/alternative.h>
 #include <asm/assembler.h>
 #include <asm/asm-offsets.h>
+#include <asm/asm_pointer_auth.h>
 #include <asm/cpufeature.h>
 #include <asm/errno.h>
 #include <asm/esr.h>
@@ -135,23 +136,24 @@ alternative_else_nop_endif
 	add	\dst, \dst, #(\sym - .entry.tramp.text)
 	.endm
 
-	// This macro corrupts x0-x3. It is the caller's duty
-	// to save/restore them if required.
-	.macro	apply_ssbd, state, targ, tmp1, tmp2
-#ifdef CONFIG_ARM64_SSBD
+	/*
+	 * This macro corrupts x0-x3. It is the caller's duty  to save/restore
+	 * them if required.
+	 */
+	.macro	apply_ssbd, state, tmp1, tmp2
 alternative_cb	arm64_enable_wa2_handling
-	b	\targ
+	b	.L__asm_ssbd_skip\@
 alternative_cb_end
 	ldr_this_cpu	\tmp2, arm64_ssbd_callback_required, \tmp1
-	cbz	\tmp2, \targ
+	cbz	\tmp2,	.L__asm_ssbd_skip\@
 	ldr	\tmp2, [tsk, #TSK_TI_FLAGS]
-	tbnz	\tmp2, #TIF_SSBD, \targ
+	tbnz	\tmp2, #TIF_SSBD, .L__asm_ssbd_skip\@
 	mov	w0, #ARM_SMCCC_ARCH_WORKAROUND_2
 	mov	w1, #\state
 alternative_cb	arm64_update_smccc_conduit
 	nop					// Patched to SMC/HVC #0
 alternative_cb_end
-#endif
+.L__asm_ssbd_skip\@:
 	.endm
 
 	.macro	kernel_entry, el, regsize = 64
@@ -180,19 +182,16 @@ alternative_cb_end
 	ldr_this_cpu	tsk, __entry_task, x20
 	msr	sp_el0, tsk
 
-	// Ensure MDSCR_EL1.SS is clear, since we can unmask debug exceptions
-	// when scheduling.
+	/*
+	 * Ensure MDSCR_EL1.SS is clear, since we can unmask debug exceptions
+	 * when scheduling.
+	 */
 	ldr	x19, [tsk, #TSK_TI_FLAGS]
 	disable_step_tsk x19, x20
 
-	apply_ssbd 1, 1f, x22, x23
+	apply_ssbd 1, x22, x23
 
-#ifdef CONFIG_ARM64_SSBD
-	ldp	x0, x1, [sp, #16 * 0]
-	ldp	x2, x3, [sp, #16 * 1]
-#endif
-1:
-
+	ptrauth_keys_install_kernel tsk, x20, x22, x23
 	.else
 	add	x21, sp, #S_FRAME_SIZE
 	get_current_task tsk
@@ -342,23 +341,10 @@ alternative_if ARM64_WORKAROUND_845719
 alternative_else_nop_endif
 #endif
 3:
-#ifdef CONFIG_ARM64_ERRATUM_1418040
-alternative_if_not ARM64_WORKAROUND_1418040
-	b	4f
-alternative_else_nop_endif
-	/*
-	 * if (x22.mode32 == cntkctl_el1.el0vcten)
-	 *     cntkctl_el1.el0vcten = ~cntkctl_el1.el0vcten
-	 */
-	mrs	x1, cntkctl_el1
-	eon	x0, x1, x22, lsr #3
-	tbz	x0, #1, 4f
-	eor	x1, x1, #2	// ARCH_TIMER_USR_VCT_ACCESS_EN
-	msr	cntkctl_el1, x1
-4:
-#endif
-	apply_ssbd 0, 5f, x0, x1
-5:
+	/* No kernel C function calls after this as user keys are set. */
+	ptrauth_keys_install_user tsk, x0, x1, x2
+
+	apply_ssbd 0, x0, x1
 	.endif
 
 	msr	elr_el1, x21			// set up the return data
@@ -384,15 +370,18 @@ alternative_else_nop_endif
 	.if	\el == 0
 alternative_insn eret, nop, ARM64_UNMAP_KERNEL_AT_EL0
 #ifdef CONFIG_UNMAP_KERNEL_AT_EL0
-	bne	5f
+	bne	4f
 	msr	far_el1, x30
 	tramp_alias	x30, tramp_exit_native
 	br	x30
-5:
+4:
 	tramp_alias	x30, tramp_exit_compat
 	br	x30
 #endif
 	.else
+	/* Ensure any device/NC reads complete */
+	alternative_insn nop, "dmb sy", ARM64_WORKAROUND_1508412
+
 	eret
 	.endif
 	sb
@@ -482,7 +471,7 @@ alternative_endif
 	.pushsection ".entry.text", "ax"
 
 	.align	11
-ENTRY(vectors)
+SYM_CODE_START(vectors)
 	kernel_ventry	1, sync_invalid			// Synchronous EL1t
 	kernel_ventry	1, irq_invalid			// IRQ EL1t
 	kernel_ventry	1, fiq_invalid			// FIQ EL1t
@@ -509,7 +498,7 @@ ENTRY(vectors)
 	kernel_ventry	0, fiq_invalid, 32		// FIQ 32-bit EL0
 	kernel_ventry	0, error_invalid, 32		// Error 32-bit EL0
 #endif
-END(vectors)
+SYM_CODE_END(vectors)
 
 #ifdef CONFIG_VMAP_STACK
 	/*
@@ -551,124 +540,57 @@ __bad_stack:
 	ASM_BUG()
 	.endm
 
-el0_sync_invalid:
+SYM_CODE_START_LOCAL(el0_sync_invalid)
 	inv_entry 0, BAD_SYNC
-ENDPROC(el0_sync_invalid)
+SYM_CODE_END(el0_sync_invalid)
 
-el0_irq_invalid:
+SYM_CODE_START_LOCAL(el0_irq_invalid)
 	inv_entry 0, BAD_IRQ
-ENDPROC(el0_irq_invalid)
+SYM_CODE_END(el0_irq_invalid)
 
-el0_fiq_invalid:
+SYM_CODE_START_LOCAL(el0_fiq_invalid)
 	inv_entry 0, BAD_FIQ
-ENDPROC(el0_fiq_invalid)
+SYM_CODE_END(el0_fiq_invalid)
 
-el0_error_invalid:
+SYM_CODE_START_LOCAL(el0_error_invalid)
 	inv_entry 0, BAD_ERROR
-ENDPROC(el0_error_invalid)
+SYM_CODE_END(el0_error_invalid)
 
 #ifdef CONFIG_COMPAT
-el0_fiq_invalid_compat:
+SYM_CODE_START_LOCAL(el0_fiq_invalid_compat)
 	inv_entry 0, BAD_FIQ, 32
-ENDPROC(el0_fiq_invalid_compat)
+SYM_CODE_END(el0_fiq_invalid_compat)
 #endif
 
-el1_sync_invalid:
+SYM_CODE_START_LOCAL(el1_sync_invalid)
 	inv_entry 1, BAD_SYNC
-ENDPROC(el1_sync_invalid)
+SYM_CODE_END(el1_sync_invalid)
 
-el1_irq_invalid:
+SYM_CODE_START_LOCAL(el1_irq_invalid)
 	inv_entry 1, BAD_IRQ
-ENDPROC(el1_irq_invalid)
+SYM_CODE_END(el1_irq_invalid)
 
-el1_fiq_invalid:
+SYM_CODE_START_LOCAL(el1_fiq_invalid)
 	inv_entry 1, BAD_FIQ
-ENDPROC(el1_fiq_invalid)
+SYM_CODE_END(el1_fiq_invalid)
 
-el1_error_invalid:
+SYM_CODE_START_LOCAL(el1_error_invalid)
 	inv_entry 1, BAD_ERROR
-ENDPROC(el1_error_invalid)
+SYM_CODE_END(el1_error_invalid)
 
 /*
  * EL1 mode handlers.
  */
 	.align	6
-el1_sync:
+SYM_CODE_START_LOCAL_NOALIGN(el1_sync)
 	kernel_entry 1
-	mrs	x1, esr_el1			// read the syndrome register
-	lsr	x24, x1, #ESR_ELx_EC_SHIFT	// exception class
-	cmp	x24, #ESR_ELx_EC_DABT_CUR	// data abort in EL1
-	b.eq	el1_da
-	cmp	x24, #ESR_ELx_EC_IABT_CUR	// instruction abort in EL1
-	b.eq	el1_ia
-	cmp	x24, #ESR_ELx_EC_SYS64		// configurable trap
-	b.eq	el1_undef
-	cmp	x24, #ESR_ELx_EC_PC_ALIGN	// pc alignment exception
-	b.eq	el1_pc
-	cmp	x24, #ESR_ELx_EC_UNKNOWN	// unknown exception in EL1
-	b.eq	el1_undef
-	cmp	x24, #ESR_ELx_EC_BREAKPT_CUR	// debug exception in EL1
-	b.ge	el1_dbg
-	b	el1_inv
-
-el1_ia:
-	/*
-	 * Fall through to the Data abort case
-	 */
-el1_da:
-	/*
-	 * Data abort handling
-	 */
-	mrs	x3, far_el1
-	inherit_daif	pstate=x23, tmp=x2
-	untagged_addr	x0, x3
-	mov	x2, sp				// struct pt_regs
-	bl	do_mem_abort
-
-	kernel_exit 1
-el1_pc:
-	/*
-	 * PC alignment exception handling. We don't handle SP alignment faults,
-	 * since we will have hit a recursive exception when trying to push the
-	 * initial pt_regs.
-	 */
-	mrs	x0, far_el1
-	inherit_daif	pstate=x23, tmp=x2
-	mov	x2, sp
-	bl	do_sp_pc_abort
-	ASM_BUG()
-el1_undef:
-	/*
-	 * Undefined instruction
-	 */
-	inherit_daif	pstate=x23, tmp=x2
 	mov	x0, sp
-	bl	do_undefinstr
+	bl	el1_sync_handler
 	kernel_exit 1
-el1_dbg:
-	/*
-	 * Debug exception handling
-	 */
-	cmp	x24, #ESR_ELx_EC_BRK64		// if BRK64
-	cinc	x24, x24, eq			// set bit '0'
-	tbz	x24, #0, el1_inv		// EL1 only
-	gic_prio_kentry_setup tmp=x3
-	mrs	x0, far_el1
-	mov	x2, sp				// struct pt_regs
-	bl	do_debug_exception
-	kernel_exit 1
-el1_inv:
-	// TODO: add support for undefined instructions in kernel mode
-	inherit_daif	pstate=x23, tmp=x2
-	mov	x0, sp
-	mov	x2, x1
-	mov	x1, #BAD_SYNC
-	bl	bad_mode
-	ASM_BUG()
-ENDPROC(el1_sync)
+SYM_CODE_END(el1_sync)
 
 	.align	6
-el1_irq:
+SYM_CODE_START_LOCAL_NOALIGN(el1_irq)
 	kernel_entry 1
 	gic_prio_irq_setup pmr=x20, tmp=x1
 	enable_da_f
@@ -723,224 +645,42 @@ alternative_else_nop_endif
 #endif
 
 	kernel_exit 1
-ENDPROC(el1_irq)
+SYM_CODE_END(el1_irq)
 
 /*
  * EL0 mode handlers.
  */
 	.align	6
-el0_sync:
+SYM_CODE_START_LOCAL_NOALIGN(el0_sync)
 	kernel_entry 0
-	mrs	x25, esr_el1			// read the syndrome register
-	lsr	x24, x25, #ESR_ELx_EC_SHIFT	// exception class
-	cmp	x24, #ESR_ELx_EC_SVC64		// SVC in 64-bit state
-	b.eq	el0_svc
-	cmp	x24, #ESR_ELx_EC_DABT_LOW	// data abort in EL0
-	b.eq	el0_da
-	cmp	x24, #ESR_ELx_EC_IABT_LOW	// instruction abort in EL0
-	b.eq	el0_ia
-	cmp	x24, #ESR_ELx_EC_FP_ASIMD	// FP/ASIMD access
-	b.eq	el0_fpsimd_acc
-	cmp	x24, #ESR_ELx_EC_SVE		// SVE access
-	b.eq	el0_sve_acc
-	cmp	x24, #ESR_ELx_EC_FP_EXC64	// FP/ASIMD exception
-	b.eq	el0_fpsimd_exc
-	cmp	x24, #ESR_ELx_EC_SYS64		// configurable trap
-	ccmp	x24, #ESR_ELx_EC_WFx, #4, ne
-	b.eq	el0_sys
-	cmp	x24, #ESR_ELx_EC_SP_ALIGN	// stack alignment exception
-	b.eq	el0_sp
-	cmp	x24, #ESR_ELx_EC_PC_ALIGN	// pc alignment exception
-	b.eq	el0_pc
-	cmp	x24, #ESR_ELx_EC_UNKNOWN	// unknown exception in EL0
-	b.eq	el0_undef
-	cmp	x24, #ESR_ELx_EC_BREAKPT_LOW	// debug exception in EL0
-	b.ge	el0_dbg
-	b	el0_inv
+	mov	x0, sp
+	bl	el0_sync_handler
+	b	ret_to_user
+SYM_CODE_END(el0_sync)
 
 #ifdef CONFIG_COMPAT
 	.align	6
-el0_sync_compat:
+SYM_CODE_START_LOCAL_NOALIGN(el0_sync_compat)
 	kernel_entry 0, 32
-	mrs	x25, esr_el1			// read the syndrome register
-	lsr	x24, x25, #ESR_ELx_EC_SHIFT	// exception class
-	cmp	x24, #ESR_ELx_EC_SVC32		// SVC in 32-bit state
-	b.eq	el0_svc_compat
-	cmp	x24, #ESR_ELx_EC_DABT_LOW	// data abort in EL0
-	b.eq	el0_da
-	cmp	x24, #ESR_ELx_EC_IABT_LOW	// instruction abort in EL0
-	b.eq	el0_ia
-	cmp	x24, #ESR_ELx_EC_FP_ASIMD	// FP/ASIMD access
-	b.eq	el0_fpsimd_acc
-	cmp	x24, #ESR_ELx_EC_FP_EXC32	// FP/ASIMD exception
-	b.eq	el0_fpsimd_exc
-	cmp	x24, #ESR_ELx_EC_PC_ALIGN	// pc alignment exception
-	b.eq	el0_pc
-	cmp	x24, #ESR_ELx_EC_UNKNOWN	// unknown exception in EL0
-	b.eq	el0_undef
-	cmp	x24, #ESR_ELx_EC_CP15_32	// CP15 MRC/MCR trap
-	b.eq	el0_cp15
-	cmp	x24, #ESR_ELx_EC_CP15_64	// CP15 MRRC/MCRR trap
-	b.eq	el0_cp15
-	cmp	x24, #ESR_ELx_EC_CP14_MR	// CP14 MRC/MCR trap
-	b.eq	el0_undef
-	cmp	x24, #ESR_ELx_EC_CP14_LS	// CP14 LDC/STC trap
-	b.eq	el0_undef
-	cmp	x24, #ESR_ELx_EC_CP14_64	// CP14 MRRC/MCRR trap
-	b.eq	el0_undef
-	cmp	x24, #ESR_ELx_EC_BREAKPT_LOW	// debug exception in EL0
-	b.ge	el0_dbg
-	b	el0_inv
-el0_svc_compat:
-	gic_prio_kentry_setup tmp=x1
 	mov	x0, sp
-	bl	el0_svc_compat_handler
+	bl	el0_sync_compat_handler
 	b	ret_to_user
+SYM_CODE_END(el0_sync_compat)
 
 	.align	6
-el0_irq_compat:
+SYM_CODE_START_LOCAL_NOALIGN(el0_irq_compat)
 	kernel_entry 0, 32
 	b	el0_irq_naked
+SYM_CODE_END(el0_irq_compat)
 
-el0_error_compat:
+SYM_CODE_START_LOCAL_NOALIGN(el0_error_compat)
 	kernel_entry 0, 32
 	b	el0_error_naked
-
-el0_cp15:
-	/*
-	 * Trapped CP15 (MRC, MCR, MRRC, MCRR) instructions
-	 */
-	ct_user_exit_irqoff
-	enable_daif
-	mov	x0, x25
-	mov	x1, sp
-	bl	do_cp15instr
-	b	ret_to_user
+SYM_CODE_END(el0_error_compat)
 #endif
-
-el0_da:
-	/*
-	 * Data abort handling
-	 */
-	mrs	x26, far_el1
-	ct_user_exit_irqoff
-	enable_daif
-	untagged_addr	x0, x26
-	mov	x1, x25
-	mov	x2, sp
-	bl	do_mem_abort
-	b	ret_to_user
-el0_ia:
-	/*
-	 * Instruction abort handling
-	 */
-	mrs	x26, far_el1
-	gic_prio_kentry_setup tmp=x0
-	ct_user_exit_irqoff
-	enable_da_f
-#ifdef CONFIG_TRACE_IRQFLAGS
-	bl	trace_hardirqs_off
-#endif
-	mov	x0, x26
-	mov	x1, x25
-	mov	x2, sp
-	bl	do_el0_ia_bp_hardening
-	b	ret_to_user
-el0_fpsimd_acc:
-	/*
-	 * Floating Point or Advanced SIMD access
-	 */
-	ct_user_exit_irqoff
-	enable_daif
-	mov	x0, x25
-	mov	x1, sp
-	bl	do_fpsimd_acc
-	b	ret_to_user
-el0_sve_acc:
-	/*
-	 * Scalable Vector Extension access
-	 */
-	ct_user_exit_irqoff
-	enable_daif
-	mov	x0, x25
-	mov	x1, sp
-	bl	do_sve_acc
-	b	ret_to_user
-el0_fpsimd_exc:
-	/*
-	 * Floating Point, Advanced SIMD or SVE exception
-	 */
-	ct_user_exit_irqoff
-	enable_daif
-	mov	x0, x25
-	mov	x1, sp
-	bl	do_fpsimd_exc
-	b	ret_to_user
-el0_sp:
-	ldr	x26, [sp, #S_SP]
-	b	el0_sp_pc
-el0_pc:
-	mrs	x26, far_el1
-el0_sp_pc:
-	/*
-	 * Stack or PC alignment exception handling
-	 */
-	gic_prio_kentry_setup tmp=x0
-	ct_user_exit_irqoff
-	enable_da_f
-#ifdef CONFIG_TRACE_IRQFLAGS
-	bl	trace_hardirqs_off
-#endif
-	mov	x0, x26
-	mov	x1, x25
-	mov	x2, sp
-	bl	do_sp_pc_abort
-	b	ret_to_user
-el0_undef:
-	/*
-	 * Undefined instruction
-	 */
-	ct_user_exit_irqoff
-	enable_daif
-	mov	x0, sp
-	bl	do_undefinstr
-	b	ret_to_user
-el0_sys:
-	/*
-	 * System instructions, for trapped cache maintenance instructions
-	 */
-	ct_user_exit_irqoff
-	enable_daif
-	mov	x0, x25
-	mov	x1, sp
-	bl	do_sysinstr
-	b	ret_to_user
-el0_dbg:
-	/*
-	 * Debug exception handling
-	 */
-	tbnz	x24, #0, el0_inv		// EL0 only
-	mrs	x24, far_el1
-	gic_prio_kentry_setup tmp=x3
-	ct_user_exit_irqoff
-	mov	x0, x24
-	mov	x1, x25
-	mov	x2, sp
-	bl	do_debug_exception
-	enable_da_f
-	b	ret_to_user
-el0_inv:
-	ct_user_exit_irqoff
-	enable_daif
-	mov	x0, sp
-	mov	x1, #BAD_SYNC
-	mov	x2, x25
-	bl	bad_el0_sync
-	b	ret_to_user
-ENDPROC(el0_sync)
 
 	.align	6
-el0_irq:
+SYM_CODE_START_LOCAL_NOALIGN(el0_irq)
 	kernel_entry 0
 el0_irq_naked:
 	gic_prio_irq_setup pmr=x20, tmp=x0
@@ -951,20 +691,18 @@ el0_irq_naked:
 	bl	trace_hardirqs_off
 #endif
 
-#ifdef CONFIG_HARDEN_BRANCH_PREDICTOR
 	tbz	x22, #55, 1f
 	bl	do_el0_irq_bp_hardening
 1:
-#endif
 	irq_handler
 
 #ifdef CONFIG_TRACE_IRQFLAGS
 	bl	trace_hardirqs_on
 #endif
 	b	ret_to_user
-ENDPROC(el0_irq)
+SYM_CODE_END(el0_irq)
 
-el1_error:
+SYM_CODE_START_LOCAL(el1_error)
 	kernel_entry 1
 	mrs	x1, esr_el1
 	gic_prio_kentry_setup tmp=x2
@@ -972,9 +710,9 @@ el1_error:
 	mov	x0, sp
 	bl	do_serror
 	kernel_exit 1
-ENDPROC(el1_error)
+SYM_CODE_END(el1_error)
 
-el0_error:
+SYM_CODE_START_LOCAL(el0_error)
 	kernel_entry 0
 el0_error_naked:
 	mrs	x25, esr_el1
@@ -986,7 +724,7 @@ el0_error_naked:
 	bl	do_serror
 	enable_da_f
 	b	ret_to_user
-ENDPROC(el0_error)
+SYM_CODE_END(el0_error)
 
 /*
  * "slow" syscall return path.
@@ -1013,17 +751,6 @@ work_pending:
 	ldr	x1, [tsk, #TSK_TI_FLAGS]	// re-check for single-step
 	b	finish_ret_to_user
 SYM_CODE_END(ret_to_user)
-
-/*
- * SVC handler.
- */
-	.align	6
-el0_svc:
-	gic_prio_kentry_setup tmp=x1
-	mov	x0, sp
-	bl	el0_svc_handler
-	b	ret_to_user
-ENDPROC(el0_svc)
 
 	.popsection				// .entry.text
 
@@ -1170,6 +897,7 @@ SYM_FUNC_START(cpu_switch_to)
 	ldr	lr, [x8]
 	mov	sp, x9
 	msr	sp_el0, x1
+	ptrauth_keys_install_kernel x1, x8, x9, x10
 	ret
 SYM_FUNC_END(cpu_switch_to)
 NOKPROBE(cpu_switch_to)

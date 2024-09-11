@@ -30,6 +30,14 @@
 #define VAS_COPY_PASTE_USER_MODE	0x00000001
 #define VAS_COP_OP_USER_MODE		0x00000010
 
+#define VAS_GZIP_QOS_CAPABILITIES	0x56516F73477A6970
+#define VAS_GZIP_DEFAULT_CAPABILITIES	0x56446566477A6970
+
+enum vas_migrate_action {
+	VAS_SUSPEND,
+	VAS_RESUME,
+};
+
 /*
  * Co-processor feature - GZIP QoS windows or GZIP default windows
  */
@@ -125,4 +133,17 @@ struct pseries_vas_window {
 	char *name;
 	int fault_virq;
 };
+
+int sysfs_add_vas_caps(struct vas_cop_feat_caps *caps);
+int vas_reconfig_capabilties(u8 type);
+int __init sysfs_pseries_vas_init(struct vas_all_caps *vas_caps);
+
+#ifdef CONFIG_PPC_VAS
+int vas_migration_handler(int action);
+#else
+static inline int vas_migration_handler(int action)
+{
+	return 0;
+}
+#endif
 #endif /* _VAS_H */

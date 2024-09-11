@@ -9368,7 +9368,7 @@ static int tg3_set_mac_addr(struct net_device *dev, void *p)
 	if (!is_valid_ether_addr(addr->sa_data))
 		return -EADDRNOTAVAIL;
 
-	memcpy(dev->dev_addr, addr->sa_data, dev->addr_len);
+	eth_hw_addr_set(dev, addr->sa_data);
 
 	if (!netif_running(dev))
 		return 0;
@@ -13802,9 +13802,6 @@ static int tg3_hwtstamp_set(struct net_device *dev, struct ifreq *ifr)
 
 	if (copy_from_user(&stmpconf, ifr->ifr_data, sizeof(stmpconf)))
 		return -EFAULT;
-
-	if (stmpconf.flags)
-		return -EINVAL;
 
 	if (stmpconf.tx_type != HWTSTAMP_TX_ON &&
 	    stmpconf.tx_type != HWTSTAMP_TX_OFF)

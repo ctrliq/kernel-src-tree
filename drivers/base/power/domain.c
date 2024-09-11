@@ -1048,16 +1048,22 @@ late_initcall(genpd_power_off_unused);
 
 static bool genpd_present(const struct generic_pm_domain *genpd)
 {
+	bool ret = false;
 	const struct generic_pm_domain *gpd;
 
 	if (IS_ERR_OR_NULL(genpd))
 		return false;
 
-	list_for_each_entry(gpd, &gpd_list, gpd_list_node)
-		if (gpd == genpd)
-			return true;
+	mutex_lock(&gpd_list_lock);
+	list_for_each_entry(gpd, &gpd_list, gpd_list_node) {
+		if (gpd == genpd) {
+			ret = true;
+			break;
+		}
+	}
+	mutex_unlock(&gpd_list_lock);
 
-	return false;
+	return ret;
 }
 
 #endif
@@ -2039,8 +2045,8 @@ int pm_genpd_init(struct generic_pm_domain *genpd,
 
 	mutex_lock(&gpd_list_lock);
 	list_add(&genpd->gpd_list_node, &gpd_list);
-	genpd_debug_add(genpd);
 	mutex_unlock(&gpd_list_lock);
+	genpd_debug_add(genpd);
 
 	return 0;
 }
@@ -2233,15 +2239,13 @@ static int genpd_add_provider(struct device_node *np, genpd_xlate_t xlate,
 int of_genpd_add_provider_simple(struct device_node *np,
 				 struct generic_pm_domain *genpd)
 {
-	int ret = -EINVAL;
+	int ret;
 
 	if (!np || !genpd)
 		return -EINVAL;
 
-	mutex_lock(&gpd_list_lock);
-
 	if (!genpd_present(genpd))
-		goto unlock;
+		return -EINVAL;
 
 	genpd->dev.of_node = np;
 
@@ -2251,7 +2255,7 @@ int of_genpd_add_provider_simple(struct device_node *np,
 		if (ret) {
 			dev_err(&genpd->dev, "Failed to add OPP table: %d\n",
 				ret);
-			goto unlock;
+			return ret;
 		}
 
 		/*
@@ -2269,16 +2273,13 @@ int of_genpd_add_provider_simple(struct device_node *np,
 			dev_pm_opp_of_remove_table(&genpd->dev);
 		}
 
-		goto unlock;
+		return ret;
 	}
 
 	genpd->provider = &np->fwnode;
 	genpd->has_provider = true;
 
-unlock:
-	mutex_unlock(&gpd_list_lock);
-
-	return ret;
+	return 0;
 }
 EXPORT_SYMBOL_GPL(of_genpd_add_provider_simple);
 
@@ -2296,8 +2297,6 @@ int of_genpd_add_provider_onecell(struct device_node *np,
 
 	if (!np || !data)
 		return -EINVAL;
-
-	mutex_lock(&gpd_list_lock);
 
 	if (!data->xlate)
 		data->xlate = genpd_xlate_onecell;
@@ -2337,8 +2336,6 @@ int of_genpd_add_provider_onecell(struct device_node *np,
 	if (ret < 0)
 		goto error;
 
-	mutex_unlock(&gpd_list_lock);
-
 	return 0;
 
 error:
@@ -2356,8 +2353,6 @@ error:
 			dev_pm_opp_of_remove_table(&genpd->dev);
 		}
 	}
-
-	mutex_unlock(&gpd_list_lock);
 
 	return ret;
 }

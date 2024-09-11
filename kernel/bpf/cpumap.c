@@ -218,7 +218,7 @@ static int cpu_map_bpf_prog_run_xdp(struct bpf_cpu_map_entry *rcpu,
 			}
 			break;
 		default:
-			bpf_warn_invalid_xdp_action(act);
+			bpf_warn_invalid_xdp_action(NULL, rcpu->prog, act);
 			/* fallthrough */
 		case XDP_DROP:
 			xdp_return_frame(xdpf);

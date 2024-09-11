@@ -735,7 +735,7 @@ static struct sk_buff *receive_small(struct net_device *dev,
 			rcu_read_unlock();
 			goto xdp_xmit;
 		default:
-			bpf_warn_invalid_xdp_action(act);
+			bpf_warn_invalid_xdp_action(vi->dev, xdp_prog, act);
 		case XDP_ABORTED:
 			trace_xdp_exception(vi->dev, xdp_prog, act);
 		case XDP_DROP:
@@ -931,7 +931,7 @@ static struct sk_buff *receive_mergeable(struct net_device *dev,
 			rcu_read_unlock();
 			goto xdp_xmit;
 		default:
-			bpf_warn_invalid_xdp_action(act);
+			bpf_warn_invalid_xdp_action(vi->dev, xdp_prog, act);
 		case XDP_ABORTED:
 			trace_xdp_exception(vi->dev, xdp_prog, act);
 		case XDP_DROP:

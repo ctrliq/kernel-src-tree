@@ -890,14 +890,14 @@ struct rq {
 	RH_KABI_DEPRECATE(unsigned long, last_load_update_tick)
 	unsigned long		last_blocked_load_update_tick;
 	unsigned int		has_blocked_load;
-	call_single_data_t	nohz_csd;
 #endif /* CONFIG_SMP */
 	unsigned int		nohz_tick_stopped;
 	atomic_t		nohz_flags;
 #endif /* CONFIG_NO_HZ_COMMON */
 
 	RH_KABI_DEPRECATE(struct load_weight, load)
-	unsigned long		nr_load_updates;
+	RH_KABI_REPLACE(unsigned long nr_load_updates,
+			unsigned int  ttwu_pending)
 	u64			nr_switches;
 
 	struct cfs_rq		cfs;
@@ -944,8 +944,8 @@ struct rq {
 
 	struct callback_head	*balance_callback;
 
-	unsigned char		nohz_idle_balance;
 	unsigned char		idle_balance;
+	RH_KABI_FILL_HOLE(unsigned char nohz_idle_balance)
 
 	/* For active balancing */
 	int			active_balance;
@@ -983,6 +983,7 @@ struct rq {
 
 #ifdef CONFIG_SCHED_HRTICK
 #ifdef CONFIG_SMP
+	RH_KABI_DEPRECATE(int,	hrtick_csd_pending)
 	call_single_data_t	hrtick_csd;
 #endif
 	struct hrtimer		hrtick_timer;
@@ -1007,8 +1008,7 @@ struct rq {
 #endif
 
 #ifdef CONFIG_SMP
-	call_single_data_t	wake_csd;
-	struct llist_head	wake_list;
+	RH_KABI_DEPRECATE(struct llist_head, wake_list)
 #endif
 
 #ifdef CONFIG_CPU_IDLE
@@ -1042,6 +1042,9 @@ struct rq {
 	RH_KABI_EXTEND(u64 clock_pelt)
 	RH_KABI_EXTEND(unsigned long lost_idle_time)
 	RH_KABI_EXTEND(struct cpu_stop_work push_work)
+#ifdef CONFIG_SMP
+	RH_KABI_EXTEND(call_single_data_t nohz_csd)
+#endif
 };
 
 #ifdef CONFIG_FAIR_GROUP_SCHED
@@ -1433,8 +1436,6 @@ queue_balance_callback(struct rq *rq,
 	rq->balance_callback = head;
 }
 
-extern void sched_ttwu_pending(void);
-
 #define rcu_dereference_check_sched_domain(p) \
 	rcu_dereference_check((p), \
 			      lockdep_is_held(&sched_domains_mutex))
@@ -1575,11 +1576,11 @@ static inline void unregister_sched_domain_sysctl(void)
 }
 #endif
 
-#else
+extern void flush_smp_call_function_from_idle(void);
 
-static inline void sched_ttwu_pending(void) { }
-
-#endif /* CONFIG_SMP */
+#else /* !CONFIG_SMP: */
+static inline void flush_smp_call_function_from_idle(void) { }
+#endif
 
 #include "stats.h"
 #include "autogroup.h"

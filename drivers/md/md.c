@@ -5729,7 +5729,7 @@ static int md_alloc(dev_t dev, char *name)
 			    strcmp(mddev2->gendisk->disk_name, name) == 0) {
 				spin_unlock(&all_mddevs_lock);
 				error = -EEXIST;
-				goto abort;
+				goto out_unlock_disks_mutex;
 			}
 		spin_unlock(&all_mddevs_lock);
 	}
@@ -5742,7 +5742,7 @@ static int md_alloc(dev_t dev, char *name)
 	error = -ENOMEM;
 	mddev->queue = blk_alloc_queue_rh(md_make_request, NUMA_NO_NODE);
 	if (!mddev->queue)
-		goto abort;
+		goto out_unlock_disks_mutex;
 
 	blk_set_stacking_limits(&mddev->queue->limits);
 
@@ -5750,7 +5750,7 @@ static int md_alloc(dev_t dev, char *name)
 	if (!disk) {
 		blk_cleanup_queue(mddev->queue);
 		mddev->queue = NULL;
-		goto abort;
+		goto out_cleanup_disk;
 	}
 	disk->major = MAJOR(mddev->unit);
 	disk->first_minor = unit << shift;
@@ -5770,27 +5770,21 @@ static int md_alloc(dev_t dev, char *name)
 	 */
 	disk->flags |= GENHD_FL_EXT_DEVT;
 	mddev->gendisk = disk;
-	error = add_disk(disk);
-	if (error) {
-		blk_cleanup_disk(disk);
-		goto abort;
-	}
+	add_disk(disk);
 
 	error = kobject_add(&mddev->kobj, &disk_to_dev(disk)->kobj, "%s", "md");
-	if (error) {
-		/* This isn't possible, but as kobject_init_and_add is marked
-		 * __must_check, we must do something with the result
-		 */
-		pr_debug("md: cannot register %s/md - name in use\n",
-			 disk->disk_name);
-		error = 0;
-	}
- abort:
-	if (!error && mddev->kobj.sd) {
-		kobject_uevent(&mddev->kobj, KOBJ_ADD);
-		mddev->sysfs_state = sysfs_get_dirent_safe(mddev->kobj.sd, "array_state");
-		mddev->sysfs_level = sysfs_get_dirent_safe(mddev->kobj.sd, "level");
-	}
+	if (error)
+		goto out_del_gendisk;
+
+	kobject_uevent(&mddev->kobj, KOBJ_ADD);
+	mddev->sysfs_state = sysfs_get_dirent_safe(mddev->kobj.sd, "array_state");
+	mddev->sysfs_level = sysfs_get_dirent_safe(mddev->kobj.sd, "level");
+	goto out_unlock_disks_mutex;
+
+out_del_gendisk:
+	del_gendisk(disk);
+out_cleanup_disk:
+out_unlock_disks_mutex:
 	mutex_unlock(&disks_mutex);
 	mddev_put(mddev);
 	return error;

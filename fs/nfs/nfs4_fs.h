@@ -316,6 +316,8 @@ extern int nfs4_set_rw_stateid(nfs4_stateid *stateid,
 		const struct nfs_lock_context *l_ctx,
 		fmode_t fmode);
 
+extern int nfs4_proc_setlease(struct file *file, long arg,
+			      struct file_lock **lease, void **priv);
 extern int nfs4_proc_get_lease_time(struct nfs_client *clp,
 		struct nfs_fsinfo *fsinfo);
 extern void nfs4_update_changeattr(struct inode *dir,

@@ -342,11 +342,6 @@ static inline struct c4iw_dev *to_c4iw_dev(struct ib_device *ibdev)
 	return container_of(ibdev, struct c4iw_dev, ibdev);
 }
 
-static inline struct c4iw_dev *rdev_to_c4iw_dev(struct c4iw_rdev *rdev)
-{
-	return container_of(rdev, struct c4iw_dev, rdev);
-}
-
 static inline struct c4iw_cq *get_chp(struct c4iw_dev *rhp, u32 cqid)
 {
 	return xa_load(&rhp->cqs, cqid);
@@ -714,12 +709,6 @@ static inline u32 c4iw_ib_to_tpt_access(int a)
 	       FW_RI_MEM_ACCESS_LOCAL_READ;
 }
 
-static inline u32 c4iw_ib_to_tpt_bind_access(int acc)
-{
-	return (acc & IB_ACCESS_REMOTE_WRITE ? FW_RI_MEM_ACCESS_REM_WRITE : 0) |
-	       (acc & IB_ACCESS_REMOTE_READ ? FW_RI_MEM_ACCESS_REM_READ : 0);
-}
-
 enum c4iw_mmid_state {
 	C4IW_STAG_STATE_VALID,
 	C4IW_STAG_STATE_INVALID
@@ -1057,9 +1046,8 @@ int c4iw_destroy_srq(struct ib_srq *ib_srq, struct ib_udata *udata);
 int c4iw_create_srq(struct ib_srq *srq, struct ib_srq_init_attr *attrs,
 		    struct ib_udata *udata);
 int c4iw_destroy_qp(struct ib_qp *ib_qp, struct ib_udata *udata);
-struct ib_qp *c4iw_create_qp(struct ib_pd *pd,
-			     struct ib_qp_init_attr *attrs,
-			     struct ib_udata *udata);
+int c4iw_create_qp(struct ib_qp *qp, struct ib_qp_init_attr *attrs,
+		   struct ib_udata *udata);
 int c4iw_ib_modify_qp(struct ib_qp *ibqp, struct ib_qp_attr *attr,
 				 int attr_mask, struct ib_udata *udata);
 int c4iw_ib_query_qp(struct ib_qp *ibqp, struct ib_qp_attr *attr,

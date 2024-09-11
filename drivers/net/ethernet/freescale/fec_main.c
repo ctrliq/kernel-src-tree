@@ -48,7 +48,6 @@
 #include <linux/io.h>
 #include <linux/irq.h>
 #include <linux/clk.h>
-#include <linux/crc32poly.h>
 #include <linux/platform_device.h>
 #include <linux/mdio.h>
 #include <linux/phy.h>
@@ -2951,6 +2950,7 @@ fec_enet_close(struct net_device *ndev)
  */
 
 #define FEC_HASH_BITS	6		/* #bits in hash */
+#define CRC32_POLY	0xEDB88320
 
 static void set_multicast_list(struct net_device *ndev)
 {
@@ -2990,7 +2990,7 @@ static void set_multicast_list(struct net_device *ndev)
 			data = ha->addr[i];
 			for (bit = 0; bit < 8; bit++, data >>= 1) {
 				crc = (crc >> 1) ^
-				(((crc ^ data) & 1) ? CRC32_POLY_LE : 0);
+				(((crc ^ data) & 1) ? CRC32_POLY : 0);
 			}
 		}
 
@@ -3212,7 +3212,7 @@ static int fec_enet_init(struct net_device *ndev)
 		ndev->features |= NETIF_F_HW_VLAN_CTAG_RX;
 
 	if (fep->quirks & FEC_QUIRK_HAS_CSUM) {
-		ndev->gso_max_segs = FEC_MAX_TSO_SEGS;
+		netif_set_gso_max_segs(ndev, FEC_MAX_TSO_SEGS);
 
 		/* enable hw accelerator */
 		ndev->features |= (NETIF_F_IP_CSUM | NETIF_F_IPV6_CSUM

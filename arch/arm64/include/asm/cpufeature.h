@@ -296,6 +296,15 @@ extern struct arm64_ftr_reg arm64_ftr_reg_ctrel0;
 #define ARM64_CPUCAP_STRICT_BOOT_CPU_FEATURE		\
 	(ARM64_CPUCAP_SCOPE_BOOT_CPU | ARM64_CPUCAP_PANIC_ON_CONFLICT)
 
+/*
+ * CPU feature used early in the boot based on the boot CPU. It is safe for a
+ * late CPU to have this feature even though the boot CPU hasn't enabled it,
+ * although the feature will not be used by Linux in this case. If the boot CPU
+ * has enabled this feature already, then every late CPU must have it.
+ */
+#define ARM64_CPUCAP_BOOT_CPU_FEATURE                  \
+	(ARM64_CPUCAP_SCOPE_BOOT_CPU | ARM64_CPUCAP_PERMITTED_FOR_LATE_CPU)
+
 struct arm64_cpu_capabilities {
 	const char *desc;
 	u16 capability;
@@ -681,24 +690,16 @@ static __always_inline bool system_supports_cnp(void)
 		cpus_have_const_cap(ARM64_HAS_CNP);
 }
 
-static inline bool system_supports_tlb_range(void)
-{
-	return IS_ENABLED(CONFIG_ARM64_TLB_RANGE) &&
-		cpus_have_const_cap(ARM64_HAS_TLB_RANGE);
-}
-
 static inline bool system_supports_address_auth(void)
 {
 	return IS_ENABLED(CONFIG_ARM64_PTR_AUTH) &&
-		(cpus_have_const_cap(ARM64_HAS_ADDRESS_AUTH_ARCH) ||
-		 cpus_have_const_cap(ARM64_HAS_ADDRESS_AUTH_IMP_DEF));
+		cpus_have_const_cap(ARM64_HAS_ADDRESS_AUTH);
 }
 
 static inline bool system_supports_generic_auth(void)
 {
 	return IS_ENABLED(CONFIG_ARM64_PTR_AUTH) &&
-		(cpus_have_const_cap(ARM64_HAS_GENERIC_AUTH_ARCH) ||
-		 cpus_have_const_cap(ARM64_HAS_GENERIC_AUTH_IMP_DEF));
+		cpus_have_const_cap(ARM64_HAS_GENERIC_AUTH);
 }
 
 static __always_inline bool system_uses_irq_prio_masking(void)
@@ -707,10 +708,28 @@ static __always_inline bool system_uses_irq_prio_masking(void)
 	       cpus_have_const_cap(ARM64_HAS_IRQ_PRIO_MASKING);
 }
 
+static inline bool system_supports_mte(void)
+{
+	return IS_ENABLED(CONFIG_ARM64_MTE) &&
+		cpus_have_const_cap(ARM64_MTE);
+}
+
 static inline bool system_has_prio_mask_debugging(void)
 {
 	return IS_ENABLED(CONFIG_ARM64_DEBUG_PRIORITY_MASKING) &&
 	       system_uses_irq_prio_masking();
+}
+
+static inline bool system_supports_bti(void)
+{
+	return IS_ENABLED(CONFIG_ARM64_BTI) &&
+		cpus_have_const_cap(ARM64_BTI);
+}
+
+static inline bool system_supports_tlb_range(void)
+{
+	return IS_ENABLED(CONFIG_ARM64_TLB_RANGE) &&
+		cpus_have_const_cap(ARM64_HAS_TLB_RANGE);
 }
 
 #define ARM64_BP_HARDEN_UNKNOWN		-1
@@ -727,15 +746,13 @@ int get_spectre_v2_workaround_state(void);
 
 static inline int arm64_get_ssbd_state(void)
 {
-#ifdef CONFIG_ARM64_SSBD
 	extern int ssbd_state;
 	return ssbd_state;
-#else
-	return ARM64_SSBD_UNKNOWN;
-#endif
 }
 
 void arm64_set_ssbd_mitigation(bool state);
+
+extern int do_emulate_mrs(struct pt_regs *regs, u32 sys_reg, u32 rt);
 
 static inline u32 id_aa64mmfr0_parange_to_phys_shift(int parange)
 {
@@ -758,6 +775,24 @@ static inline u32 id_aa64mmfr0_parange_to_phys_shift(int parange)
 	}
 }
 
+/* Check whether hardware update of the Access flag is supported */
+static inline bool cpu_has_hw_af(void)
+{
+	u64 mmfr1;
+
+	if (!IS_ENABLED(CONFIG_ARM64_HW_AFDBM))
+		return false;
+
+	mmfr1 = read_cpuid(ID_AA64MMFR1_EL1);
+	return cpuid_feature_extract_unsigned_field(mmfr1,
+						ID_AA64MMFR1_HADBS_SHIFT);
+}
+
+#ifdef CONFIG_ARM64_AMU_EXTN
+/* Check whether the cpu supports the Activity Monitors Unit (AMU) */
+extern bool cpu_has_amu_feat(int cpu);
+#endif
+
 static inline unsigned int get_vmid_bits(u64 mmfr1)
 {
 	int vmid_bits;
@@ -776,7 +811,6 @@ static inline unsigned int get_vmid_bits(u64 mmfr1)
 
 u32 get_kvm_ipa_limit(void);
 
-extern int do_emulate_mrs(struct pt_regs *regs, u32 sys_reg, u32 rt);
 #endif /* __ASSEMBLY__ */
 
 #endif

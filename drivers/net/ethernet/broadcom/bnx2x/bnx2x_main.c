@@ -13561,7 +13561,7 @@ static int bnx2x_set_qm_cid_count(struct bnx2x *bp)
 }
 
 /**
- * bnx2x_get_num_none_def_sbs - return the number of none default SBs
+ * bnx2x_get_num_non_def_sbs - return the number of none default SBs
  *
  * @dev:	pci device
  *
@@ -15380,11 +15380,6 @@ static int bnx2x_hwtstamp_ioctl(struct bnx2x *bp, struct ifreq *ifr)
 
 	DP(BNX2X_MSG_PTP, "Requested tx_type: %d, requested rx_filters = %d\n",
 	   config.tx_type, config.rx_filter);
-
-	if (config.flags) {
-		BNX2X_ERR("config.flags is reserved for future use\n");
-		return -EINVAL;
-	}
 
 	bp->hwtstamp_ioctl_called = true;
 	bp->tx_type = config.tx_type;

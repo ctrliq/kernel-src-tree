@@ -291,6 +291,10 @@ enum nfsstat4 {
 	NFS4ERR_XATTR2BIG      = 10096,
 };
 
+/* error codes for internal client use */
+#define NFS4ERR_RESET_TO_MDS   12001
+#define NFS4ERR_RESET_TO_PNFS  12002
+
 static inline bool seqid_mutating_err(u32 err)
 {
 	/* See RFC 7530, section 9.1.7 */
@@ -451,6 +455,7 @@ enum lock_type4 {
 #define FATTR4_WORD2_LAYOUT_BLKSIZE     (1UL << 1)
 #define FATTR4_WORD2_MDSTHRESHOLD       (1UL << 4)
 #define FATTR4_WORD2_CLONE_BLKSIZE	(1UL << 13)
+#define FATTR4_WORD2_CHANGE_ATTR_TYPE	(1UL << 15)
 #define FATTR4_WORD2_SECURITY_LABEL     (1UL << 16)
 #define FATTR4_WORD2_MODE_UMASK		(1UL << 17)
 #define FATTR4_WORD2_XATTR_SUPPORT	(1UL << 18)
@@ -680,6 +685,14 @@ struct nfs4_op_map {
 		unsigned long longs[NFS4_OP_MAP_NUM_LONGS];
 		u32 words[NFS4_OP_MAP_NUM_WORDS];
 	} u;
+};
+
+enum nfs4_change_attr_type {
+	NFS4_CHANGE_TYPE_IS_MONOTONIC_INCR = 0,
+	NFS4_CHANGE_TYPE_IS_VERSION_COUNTER = 1,
+	NFS4_CHANGE_TYPE_IS_VERSION_COUNTER_NOPNFS = 2,
+	NFS4_CHANGE_TYPE_IS_TIME_METADATA = 3,
+	NFS4_CHANGE_TYPE_IS_UNDEFINED = 4,
 };
 
 /*

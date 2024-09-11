@@ -496,7 +496,16 @@ struct sock {
 #ifdef CONFIG_SECURITY
 	void			*sk_security;
 #endif
-	struct sock_cgroup_data	sk_cgrp_data;
+	/*
+	 * RH_KABI: The old sock_cgroup_data is 8 bytes, while the new one
+	 * is 16 bytes. Since sk_cgrp_data is only to be used internally
+	 * by the cgroup subsystem and should not be used by 3rd party
+	 * kernel modules, we are relocating the new sk_cgrp_data down
+	 * to the RH_KABI_RESERVE area while keeping its old location
+	 * with fixed size hole of 8 bytes.
+	 */
+	RH_KABI_BROKEN_REPLACE( struct sock_cgroup_data	sk_cgrp_data,
+				u64 sk_cgrp_data_hole)
 	struct mem_cgroup	*sk_memcg;
 	void			(*sk_state_change)(struct sock *sk);
 	void			(*sk_data_ready)(struct sock *sk);
@@ -518,8 +527,7 @@ struct sock {
 	RH_KABI_USE_SPLIT(3, u8			sk_prefer_busy_poll,
 			     u16		sk_busy_poll_budget)
 	RH_KABI_USE(4, spinlock_t		sk_peer_lock)
-	RH_KABI_RESERVE(5)
-	RH_KABI_RESERVE(6)
+	RH_KABI_USE(5, 6, struct sock_cgroup_data sk_cgrp_data)
 	RH_KABI_RESERVE(7)
 	RH_KABI_RESERVE(8)
 	RH_KABI_RESERVE(9)

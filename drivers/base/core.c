@@ -51,6 +51,7 @@ static LIST_HEAD(deferred_sync);
 static unsigned int defer_sync_state_count = 1;
 static DEFINE_MUTEX(fwnode_link_lock);
 static bool fw_devlink_is_permissive(void);
+static bool fw_devlink_drv_reg_done;
 
 /**
  * fwnode_link_add - Create a link between two fwnode_handles.
@@ -1589,6 +1590,52 @@ static void fw_devlink_parse_fwtree(struct fwnode_handle *fwnode)
 		fw_devlink_parse_fwtree(child);
 }
 
+static void fw_devlink_relax_link(struct device_link *link)
+{
+	if (!(link->flags & DL_FLAG_INFERRED))
+		return;
+
+	if (link->flags == (DL_FLAG_MANAGED | FW_DEVLINK_FLAGS_PERMISSIVE))
+		return;
+
+	pm_runtime_drop_link(link);
+	link->flags = DL_FLAG_MANAGED | FW_DEVLINK_FLAGS_PERMISSIVE;
+	dev_dbg(link->consumer, "Relaxing link with %s\n",
+		dev_name(link->supplier));
+}
+
+static int fw_devlink_no_driver(struct device *dev, void *data)
+{
+	struct device_link *link = to_devlink(dev);
+
+	if (!link->supplier->can_match)
+		fw_devlink_relax_link(link);
+
+	return 0;
+}
+
+void fw_devlink_drivers_done(void)
+{
+	fw_devlink_drv_reg_done = true;
+	device_links_write_lock();
+	class_for_each_device(&devlink_class, NULL, NULL,
+			      fw_devlink_no_driver);
+	device_links_write_unlock();
+}
+
+static void fw_devlink_unblock_consumers(struct device *dev)
+{
+	struct device_link *link;
+
+	if (!fw_devlink_flags || fw_devlink_is_permissive())
+		return;
+
+	device_links_write_lock();
+	list_for_each_entry(link, &dev->links.consumers, s_node)
+		fw_devlink_relax_link(link);
+	device_links_write_unlock();
+}
+
 /**
  * fw_devlink_relax_cycle - Convert cyclic links to SYNC_STATE_ONLY links
  * @con: Device to check dependencies for.
@@ -1625,13 +1672,7 @@ static int fw_devlink_relax_cycle(struct device *con, void *sup)
 
 		ret = 1;
 
-		if (!(link->flags & DL_FLAG_INFERRED))
-			continue;
-
-		pm_runtime_drop_link(link);
-		link->flags = DL_FLAG_MANAGED | FW_DEVLINK_FLAGS_PERMISSIVE;
-		dev_dbg(link->consumer, "Relaxing link with %s\n",
-			dev_name(link->supplier));
+		fw_devlink_relax_link(link);
 	}
 	return ret;
 }
@@ -3284,6 +3325,15 @@ int device_add(struct device *dev)
 	}
 
 	bus_probe_device(dev);
+
+	/*
+	 * If all driver registration is done and a newly added device doesn't
+	 * match with any driver, don't block its consumers from probing in
+	 * case the consumer device is able to operate without this supplier.
+	 */
+	if (dev->fwnode && fw_devlink_drv_reg_done && !dev->can_match)
+		fw_devlink_unblock_consumers(dev);
+
 	if (parent)
 		klist_add_tail(&dev->p->knode_parent,
 			       &parent->p->klist_children);
@@ -4649,6 +4699,13 @@ int device_match_acpi_dev(struct device *dev, const void *adev)
 	return ACPI_COMPANION(dev) == adev;
 }
 EXPORT_SYMBOL(device_match_acpi_dev);
+
+void device_set_node(struct device *dev, struct fwnode_handle *fwnode)
+{
+	dev->fwnode = fwnode;
+	dev->of_node = to_of_node(fwnode);
+}
+EXPORT_SYMBOL_GPL(device_set_node);
 
 int device_match_name(struct device *dev, const void *name)
 {

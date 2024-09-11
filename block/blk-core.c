@@ -973,7 +973,7 @@ static blk_qc_t do_make_request(struct bio *bio)
  * systems and other upper level users of the block layer should use
  * submit_bio() instead.
  */
-blk_qc_t generic_make_request(struct bio *bio)
+blk_qc_t generic_make_request_no_check(struct bio *bio)
 {
 	/*
 	 * bio_list_on_stack[0] contains bios submitted by the current
@@ -984,9 +984,6 @@ blk_qc_t generic_make_request(struct bio *bio)
 	 */
 	struct bio_list bio_list_on_stack[2];
 	blk_qc_t ret = BLK_QC_T_NONE;
-
-	if (!generic_make_request_checks(bio))
-		goto out;
 
 	/*
 	 * We only want one ->make_request_fn to be active at a time, else
@@ -1052,6 +1049,14 @@ blk_qc_t generic_make_request(struct bio *bio)
 
 out:
 	return ret;
+}
+
+blk_qc_t generic_make_request(struct bio *bio)
+{
+	if (!generic_make_request_checks(bio))
+		return BLK_QC_T_NONE;
+
+	return generic_make_request_no_check(bio);
 }
 EXPORT_SYMBOL(generic_make_request);
 

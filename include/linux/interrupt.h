@@ -346,10 +346,7 @@ irq_set_affinity_and_hint(unsigned int irq, const struct cpumask *m)
  * Deprecated. Use irq_update_affinity_hint() or irq_set_affinity_and_hint()
  * instead.
  */
-static inline int irq_set_affinity_hint(unsigned int irq, const struct cpumask *m)
-{
-	return irq_set_affinity_and_hint(irq, m);
-}
+extern int irq_set_affinity_hint(unsigned int irq, const struct cpumask *m);
 
 extern int irq_update_affinity_desc(unsigned int irq,
 				    struct irq_affinity_desc *affinity);

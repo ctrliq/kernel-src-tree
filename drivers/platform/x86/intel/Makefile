@@ -5,3 +5,5 @@
 #
 obj-$(CONFIG_INTEL_PMC_CORE)		+= pmc/
 
+# Intel miscellaneous drivers
+obj-$(CONFIG_INTEL_ISHTP_ECLITE)	+= ishtp_eclite.o

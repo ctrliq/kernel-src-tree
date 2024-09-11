@@ -64,9 +64,9 @@ xfs_inode_alloc(
 	memset(&ip->i_df, 0, sizeof(ip->i_df));
 	ip->i_flags = 0;
 	ip->i_delayed_blks = 0;
-	ip->i_d.di_flags2 = mp->m_ino_geo.new_diflags2;
-	ip->i_d.di_nblocks = 0;
-	ip->i_d.di_forkoff = 0;
+	ip->i_diflags2 = mp->m_ino_geo.new_diflags2;
+	ip->i_nblocks = 0;
+	ip->i_forkoff = 0;
 	ip->i_sick = 0;
 	ip->i_checked = 0;
 	INIT_WORK(&ip->i_ioend_work, xfs_end_io);
@@ -310,7 +310,7 @@ xfs_iget_check_free_state(
 			return -EFSCORRUPTED;
 		}
 
-		if (ip->i_d.di_nblocks != 0) {
+		if (ip->i_nblocks != 0) {
 			xfs_warn(ip->i_mount,
 "Corruption detected! Free inode 0x%llx has blocks allocated!",
 				ip->i_ino);
@@ -497,7 +497,7 @@ xfs_iget_cache_miss(
 	 * simply build the new inode core with a random generation number.
 	 *
 	 * For version 4 (and older) superblocks, log recovery is dependent on
-	 * the di_flushiter field being initialised from the current on-disk
+	 * the i_flushiter field being initialised from the current on-disk
 	 * value and hence we must also read the inode off disk even when
 	 * initializing new inodes.
 	 */
@@ -1336,7 +1336,7 @@ xfs_blockgc_queue(
 {
 	rcu_read_lock();
 	if (radix_tree_tagged(&pag->pag_ici_root, XFS_ICI_BLOCKGC_TAG))
-		queue_delayed_work(pag->pag_mount->m_blockgc_workqueue,
+		queue_delayed_work(pag->pag_mount->m_gc_workqueue,
 				   &pag->pag_blockgc_work,
 				   msecs_to_jiffies(xfs_blockgc_secs * 1000));
 	rcu_read_unlock();

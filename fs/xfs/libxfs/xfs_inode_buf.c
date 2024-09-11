@@ -173,7 +173,6 @@ xfs_inode_from_disk(
 	struct xfs_inode	*ip,
 	struct xfs_dinode	*from)
 {
-	struct xfs_icdinode	*to = &ip->i_d;
 	struct inode		*inode = VFS_I(ip);
 	int			error;
 	xfs_failaddr_t		fa;
@@ -193,7 +192,8 @@ xfs_inode_from_disk(
 	 * inode. If the inode is unused, mode is zero and we shouldn't mess
 	 * with the uninitialized part of it.
 	 */
-	to->di_flushiter = be16_to_cpu(from->di_flushiter);
+	if (!xfs_sb_version_has_v3inode(&ip->i_mount->m_sb))
+		ip->i_flushiter = be16_to_cpu(from->di_flushiter);
 	inode->i_generation = be32_to_cpu(from->di_gen);
 	inode->i_mode = be16_to_cpu(from->di_mode);
 	if (!inode->i_mode)
@@ -226,11 +226,11 @@ xfs_inode_from_disk(
 	inode->i_mtime = xfs_inode_from_disk_ts(from, from->di_mtime);
 	inode->i_ctime = xfs_inode_from_disk_ts(from, from->di_ctime);
 
-	to->di_size = be64_to_cpu(from->di_size);
-	to->di_nblocks = be64_to_cpu(from->di_nblocks);
-	to->di_extsize = be32_to_cpu(from->di_extsize);
-	to->di_forkoff = from->di_forkoff;
-	to->di_flags	= be16_to_cpu(from->di_flags);
+	ip->i_disk_size = be64_to_cpu(from->di_size);
+	ip->i_nblocks = be64_to_cpu(from->di_nblocks);
+	ip->i_extsize = be32_to_cpu(from->di_extsize);
+	ip->i_forkoff = from->di_forkoff;
+	ip->i_diflags	= be16_to_cpu(from->di_flags);
 
 	if (from->di_dmevmask || from->di_dmstate)
 		xfs_iflags_set(ip, XFS_IPRESERVE_DM_FIELDS);
@@ -238,9 +238,9 @@ xfs_inode_from_disk(
 	if (xfs_sb_version_has_v3inode(&ip->i_mount->m_sb)) {
 		inode_set_iversion_queried(inode,
 					   be64_to_cpu(from->di_changecount));
-		to->di_crtime = xfs_inode_from_disk_ts(from, from->di_crtime);
-		to->di_flags2 = be64_to_cpu(from->di_flags2);
-		to->di_cowextsize = be32_to_cpu(from->di_cowextsize);
+		ip->i_crtime = xfs_inode_from_disk_ts(from, from->di_crtime);
+		ip->i_diflags2 = be64_to_cpu(from->di_flags2);
+		ip->i_cowextsize = be32_to_cpu(from->di_cowextsize);
 	}
 
 	error = xfs_iformat_data_fork(ip, from);
@@ -285,7 +285,6 @@ xfs_inode_to_disk(
 	struct xfs_dinode	*to,
 	xfs_lsn_t		lsn)
 {
-	struct xfs_icdinode	*from = &ip->i_d;
 	struct inode		*inode = VFS_I(ip);
 
 	to->di_magic = cpu_to_be16(XFS_DINODE_MAGIC);
@@ -305,21 +304,21 @@ xfs_inode_to_disk(
 	to->di_gen = cpu_to_be32(inode->i_generation);
 	to->di_mode = cpu_to_be16(inode->i_mode);
 
-	to->di_size = cpu_to_be64(from->di_size);
-	to->di_nblocks = cpu_to_be64(from->di_nblocks);
-	to->di_extsize = cpu_to_be32(from->di_extsize);
+	to->di_size = cpu_to_be64(ip->i_disk_size);
+	to->di_nblocks = cpu_to_be64(ip->i_nblocks);
+	to->di_extsize = cpu_to_be32(ip->i_extsize);
 	to->di_nextents = cpu_to_be32(xfs_ifork_nextents(&ip->i_df));
 	to->di_anextents = cpu_to_be16(xfs_ifork_nextents(ip->i_afp));
-	to->di_forkoff = from->di_forkoff;
+	to->di_forkoff = ip->i_forkoff;
 	to->di_aformat = xfs_ifork_format(ip->i_afp);
-	to->di_flags = cpu_to_be16(from->di_flags);
+	to->di_flags = cpu_to_be16(ip->i_diflags);
 
 	if (xfs_sb_version_has_v3inode(&ip->i_mount->m_sb)) {
 		to->di_version = 3;
 		to->di_changecount = cpu_to_be64(inode_peek_iversion(inode));
-		to->di_crtime = xfs_inode_to_disk_ts(ip, from->di_crtime);
-		to->di_flags2 = cpu_to_be64(from->di_flags2);
-		to->di_cowextsize = cpu_to_be32(from->di_cowextsize);
+		to->di_crtime = xfs_inode_to_disk_ts(ip, ip->i_crtime);
+		to->di_flags2 = cpu_to_be64(ip->i_diflags2);
+		to->di_cowextsize = cpu_to_be32(ip->i_cowextsize);
 		to->di_ino = cpu_to_be64(ip->i_ino);
 		to->di_lsn = cpu_to_be64(lsn);
 		memset(to->di_pad2, 0, sizeof(to->di_pad2));
@@ -327,7 +326,7 @@ xfs_inode_to_disk(
 		to->di_flushiter = 0;
 	} else {
 		to->di_version = 2;
-		to->di_flushiter = cpu_to_be16(from->di_flushiter);
+		to->di_flushiter = cpu_to_be16(ip->i_flushiter);
 	}
 }
 
@@ -560,8 +559,17 @@ xfs_dinode_calc_crc(
 /*
  * Validate di_extsize hint.
  *
- * The rules are documented at xfs_ioctl_setattr_check_extsize().
- * These functions must be kept in sync with each other.
+ * 1. Extent size hint is only valid for directories and regular files.
+ * 2. FS_XFLAG_EXTSIZE is only valid for regular files.
+ * 3. FS_XFLAG_EXTSZINHERIT is only valid for directories.
+ * 4. Hint cannot be larger than MAXTEXTLEN.
+ * 5. Can be changed on directories at any time.
+ * 6. Hint value of 0 turns off hints, clears inode flags.
+ * 7. Extent size must be a multiple of the appropriate block size.
+ *    For realtime files, this is the rt extent size.
+ * 8. For non-realtime files, the extent size hint must be limited
+ *    to half the AG size to avoid alignment extending the extent beyond the
+ *    limits of the AG.
  */
 xfs_failaddr_t
 xfs_inode_validate_extsize(
@@ -580,6 +588,32 @@ xfs_inode_validate_extsize(
 	hint_flag = (flags & XFS_DIFLAG_EXTSIZE);
 	inherit_flag = (flags & XFS_DIFLAG_EXTSZINHERIT);
 	extsize_bytes = XFS_FSB_TO_B(mp, extsize);
+
+	/*
+	 * This comment describes a historic gap in this verifier function.
+	 *
+	 * For a directory with both RTINHERIT and EXTSZINHERIT flags set, this
+	 * function has never checked that the extent size hint is an integer
+	 * multiple of the realtime extent size.  Since we allow users to set
+	 * this combination  on non-rt filesystems /and/ to change the rt
+	 * extent size when adding a rt device to a filesystem, the net effect
+	 * is that users can configure a filesystem anticipating one rt
+	 * geometry and change their minds later.  Directories do not use the
+	 * extent size hint, so this is harmless for them.
+	 *
+	 * If a directory with a misaligned extent size hint is allowed to
+	 * propagate that hint into a new regular realtime file, the result
+	 * is that the inode cluster buffer verifier will trigger a corruption
+	 * shutdown the next time it is run, because the verifier has always
+	 * enforced the alignment rule for regular files.
+	 *
+	 * Because we allow administrators to set a new rt extent size when
+	 * adding a rt section, we cannot add a check to this verifier because
+	 * that will result a new source of directory corruption errors when
+	 * reading an existing filesystem.  Instead, we rely on callers to
+	 * decide when alignment checks are appropriate, and fix things up as
+	 * needed.
+	 */
 
 	if (rt_flag)
 		blocksize_bytes = mp->m_sb.sb_rextsize << mp->m_sb.sb_blocklog;
@@ -617,8 +651,15 @@ xfs_inode_validate_extsize(
 /*
  * Validate di_cowextsize hint.
  *
- * The rules are documented at xfs_ioctl_setattr_check_cowextsize().
- * These functions must be kept in sync with each other.
+ * 1. CoW extent size hint can only be set if reflink is enabled on the fs.
+ *    The inode does not have to have any shared blocks, but it must be a v3.
+ * 2. FS_XFLAG_COWEXTSIZE is only valid for directories and regular files;
+ *    for a directory, the hint is propagated to new files.
+ * 3. Can be changed on files & directories at any time.
+ * 4. Hint value of 0 turns off hints, clears inode flags.
+ * 5. Extent size must be a multiple of the appropriate block size.
+ * 6. The extent size hint must be limited to half the AG size to avoid
+ *    alignment extending the extent beyond the limits of the AG.
  */
 xfs_failaddr_t
 xfs_inode_validate_cowextsize(

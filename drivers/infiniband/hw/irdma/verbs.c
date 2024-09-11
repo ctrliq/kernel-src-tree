@@ -21,7 +21,8 @@ static int irdma_query_device(struct ib_device *ibdev,
 		return -EINVAL;
 
 	memset(props, 0, sizeof(*props));
-	ether_addr_copy((u8 *)&props->sys_image_guid, iwdev->netdev->dev_addr);
+	addrconf_addr_eui48((u8 *)&props->sys_image_guid,
+			    iwdev->netdev->dev_addr);
 	props->fw_ver = (u64)irdma_fw_major_ver(&rf->sc_dev) << 32 |
 			irdma_fw_minor_ver(&rf->sc_dev);
 	props->device_cap_flags = iwdev->device_cap_flags;
@@ -789,18 +790,19 @@ static int irdma_validate_qp_attrs(struct ib_qp_init_attr *init_attr,
 
 /**
  * irdma_create_qp - create qp
- * @ibpd: ptr of pd
+ * @ibqp: ptr of qp
  * @init_attr: attributes for qp
  * @udata: user data for create qp
  */
-static struct ib_qp *irdma_create_qp(struct ib_pd *ibpd,
-				     struct ib_qp_init_attr *init_attr,
-				     struct ib_udata *udata)
+static int irdma_create_qp(struct ib_qp *ibqp,
+			   struct ib_qp_init_attr *init_attr,
+			   struct ib_udata *udata)
 {
+	struct ib_pd *ibpd = ibqp->pd;
 	struct irdma_pd *iwpd = to_iwpd(ibpd);
 	struct irdma_device *iwdev = to_iwdev(ibpd->device);
 	struct irdma_pci_f *rf = iwdev->rf;
-	struct irdma_qp *iwqp;
+	struct irdma_qp *iwqp = to_iwqp(ibqp);
 	struct irdma_create_qp_req req;
 	struct irdma_create_qp_resp uresp = {};
 	u32 qp_num = 0;
@@ -816,7 +818,7 @@ static struct ib_qp *irdma_create_qp(struct ib_pd *ibpd,
 
 	err_code = irdma_validate_qp_attrs(init_attr, iwdev);
 	if (err_code)
-		return ERR_PTR(err_code);
+		return err_code;
 
 	sq_size = init_attr->cap.max_send_wr;
 	rq_size = init_attr->cap.max_recv_wr;
@@ -829,10 +831,6 @@ static struct ib_qp *irdma_create_qp(struct ib_pd *ibpd,
 	init_info.qp_uk_init_info.max_rq_frag_cnt = init_attr->cap.max_recv_sge;
 	init_info.qp_uk_init_info.max_inline_data = init_attr->cap.max_inline_data;
 
-	iwqp = kzalloc(sizeof(*iwqp), GFP_KERNEL);
-	if (!iwqp)
-		return ERR_PTR(-ENOMEM);
-
 	qp = &iwqp->sc_qp;
 	qp->qp_uk.back_qp = iwqp;
 	qp->push_idx = IRDMA_INVALID_PUSH_PAGE_INDEX;
@@ -844,10 +842,8 @@ static struct ib_qp *irdma_create_qp(struct ib_pd *ibpd,
 						 iwqp->q2_ctx_mem.size,
 						 &iwqp->q2_ctx_mem.pa,
 						 GFP_KERNEL);
-	if (!iwqp->q2_ctx_mem.va) {
-		err_code = -ENOMEM;
-		goto error;
-	}
+	if (!iwqp->q2_ctx_mem.va)
+		return -ENOMEM;
 
 	init_info.q2 = iwqp->q2_ctx_mem.va;
 	init_info.q2_pa = iwqp->q2_ctx_mem.pa;
@@ -995,17 +991,16 @@ static struct ib_qp *irdma_create_qp(struct ib_pd *ibpd,
 		if (err_code) {
 			ibdev_dbg(&iwdev->ibdev, "VERBS: copy_to_udata failed\n");
 			irdma_destroy_qp(&iwqp->ibqp, udata);
-			return ERR_PTR(err_code);
+			return err_code;
 		}
 	}
 
 	init_completion(&iwqp->free_qp);
-	return &iwqp->ibqp;
+	return 0;
 
 error:
 	irdma_free_qp_rsrc(iwqp);
-
-	return ERR_PTR(err_code);
+	return err_code;
 }
 
 static int irdma_get_ib_acc_flags(struct irdma_qp *iwqp)
@@ -4366,24 +4361,6 @@ static enum rdma_link_layer irdma_get_link_layer(struct ib_device *ibdev,
 	return IB_LINK_LAYER_ETHERNET;
 }
 
-static __be64 irdma_mac_to_guid(struct net_device *ndev)
-{
-	unsigned char *mac = ndev->dev_addr;
-	__be64 guid;
-	unsigned char *dst = (unsigned char *)&guid;
-
-	dst[0] = mac[0] ^ 2;
-	dst[1] = mac[1];
-	dst[2] = mac[2];
-	dst[3] = 0xff;
-	dst[4] = 0xfe;
-	dst[5] = mac[3];
-	dst[6] = mac[4];
-	dst[7] = mac[5];
-
-	return guid;
-}
-
 static const struct ib_device_ops irdma_roce_dev_ops = {
 	.attach_mcast = irdma_attach_mcast,
 	.create_ah = irdma_create_ah,
@@ -4443,6 +4420,7 @@ static const struct ib_device_ops irdma_dev_ops = {
 	INIT_RDMA_OBJ_SIZE(ib_ah, irdma_ah, ibah),
 	INIT_RDMA_OBJ_SIZE(ib_cq, irdma_cq, ibcq),
 	INIT_RDMA_OBJ_SIZE(ib_mw, irdma_mr, ibmw),
+	INIT_RDMA_OBJ_SIZE(ib_qp, irdma_qp, ibqp),
 };
 
 /**
@@ -4452,7 +4430,8 @@ static const struct ib_device_ops irdma_dev_ops = {
 static void irdma_init_roce_device(struct irdma_device *iwdev)
 {
 	iwdev->ibdev.node_type = RDMA_NODE_IB_CA;
-	iwdev->ibdev.node_guid = irdma_mac_to_guid(iwdev->netdev);
+	addrconf_addr_eui48((u8 *)&iwdev->ibdev.node_guid,
+			    iwdev->netdev->dev_addr);
 	ib_set_device_ops(&iwdev->ibdev, &irdma_roce_dev_ops);
 }
 
@@ -4465,7 +4444,8 @@ static int irdma_init_iw_device(struct irdma_device *iwdev)
 	struct net_device *netdev = iwdev->netdev;
 
 	iwdev->ibdev.node_type = RDMA_NODE_RNIC;
-	ether_addr_copy((u8 *)&iwdev->ibdev.node_guid, netdev->dev_addr);
+	addrconf_addr_eui48((u8 *)&iwdev->ibdev.node_guid,
+			    netdev->dev_addr);
 	iwdev->ibdev.ops.iw_add_ref = irdma_qp_add_ref;
 	iwdev->ibdev.ops.iw_rem_ref = irdma_qp_rem_ref;
 	iwdev->ibdev.ops.iw_get_qp = irdma_get_qp;

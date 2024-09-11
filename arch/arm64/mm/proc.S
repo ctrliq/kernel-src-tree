@@ -22,11 +22,14 @@
 #include <linux/linkage.h>
 #include <asm/assembler.h>
 #include <asm/asm-offsets.h>
+#include <asm/asm_pointer_auth.h>
 #include <asm/hwcap.h>
 #include <asm/pgtable.h>
 #include <asm/pgtable-hwdef.h>
 #include <asm/cpufeature.h>
 #include <asm/alternative.h>
+#include <asm/smp.h>
+#include <asm/sysreg.h>
 
 #ifdef CONFIG_ARM64_64K_PAGES
 #define TCR_TG_FLAGS	TCR_TG0_64K | TCR_TG1_64K
@@ -68,7 +71,7 @@
  *
  * x0: virtual address of context pointer
  */
-ENTRY(cpu_do_suspend)
+SYM_FUNC_START(cpu_do_suspend)
 	mrs	x2, tpidr_el0
 	mrs	x3, tpidrro_el0
 	mrs	x4, contextidr_el1
@@ -92,7 +95,7 @@ alternative_endif
 	stp	x10, x11, [x0, #64]
 	stp	x12, x13, [x0, #80]
 	ret
-ENDPROC(cpu_do_suspend)
+SYM_FUNC_END(cpu_do_suspend)
 
 /**
  * cpu_do_resume - restore CPU register context
@@ -100,7 +103,7 @@ ENDPROC(cpu_do_suspend)
  * x0: Address of context pointer
  */
 	.pushsection ".idmap.text", "awx"
-ENTRY(cpu_do_resume)
+SYM_FUNC_START(cpu_do_resume)
 	ldp	x2, x3, [x0]
 	ldp	x4, x5, [x0, #16]
 	ldp	x6, x8, [x0, #32]
@@ -148,39 +151,12 @@ alternative_if ARM64_HAS_RAS_EXTN
 	msr_s	SYS_DISR_EL1, xzr
 alternative_else_nop_endif
 
+	ptrauth_keys_install_kernel_nosync x14, x1, x2, x3
 	isb
 	ret
-ENDPROC(cpu_do_resume)
+SYM_FUNC_END(cpu_do_resume)
 	.popsection
 #endif
-
-/*
- *	cpu_do_switch_mm(pgd_phys, tsk)
- *
- *	Set the translation table base pointer to be pgd_phys.
- *
- *	- pgd_phys - physical address of new TTB
- */
-ENTRY(cpu_do_switch_mm)
-	mrs	x2, ttbr1_el1
-	mmid	x1, x1				// get mm->context.id
-	phys_to_ttbr x3, x0
-
-alternative_if ARM64_HAS_CNP
-	cbz     x1, 1f                          // skip CNP for reserved ASID
-	orr     x3, x3, #TTBR_CNP_BIT
-1:
-alternative_else_nop_endif
-#ifdef CONFIG_ARM64_SW_TTBR0_PAN
-	bfi	x3, x1, #48, #16		// set the ASID field in TTBR0
-#endif
-	bfi	x2, x1, #48, #16		// set the ASID
-	msr	ttbr1_el1, x2			// in TTBR1 (since TCR.A1 is set)
-	isb
-	msr	ttbr0_el1, x3			// now update TTBR0
-	isb
-	b	post_ttbr_update_workaround	// Back to C code...
-ENDPROC(cpu_do_switch_mm)
 
 	.pushsection ".idmap.text", "awx"
 
@@ -201,7 +177,7 @@ ENDPROC(cpu_do_switch_mm)
  * This is the low-level counterpart to cpu_replace_ttbr1, and should not be
  * called by anything else. It can only be executed from a TTBR0 mapping.
  */
-ENTRY(idmap_cpu_replace_ttbr1)
+SYM_FUNC_START(idmap_cpu_replace_ttbr1)
 	save_and_disable_daif flags=x2
 
 	__idmap_cpu_set_reserved_ttbr1 x1, x3
@@ -213,7 +189,7 @@ ENTRY(idmap_cpu_replace_ttbr1)
 	restore_daif x2
 
 	ret
-ENDPROC(idmap_cpu_replace_ttbr1)
+SYM_FUNC_END(idmap_cpu_replace_ttbr1)
 	.popsection
 
 #ifdef CONFIG_UNMAP_KERNEL_AT_EL0
@@ -241,7 +217,7 @@ ENDPROC(idmap_cpu_replace_ttbr1)
  */
 __idmap_kpti_flag:
 	.long	1
-ENTRY(idmap_kpti_install_ng_mappings)
+SYM_FUNC_START(idmap_kpti_install_ng_mappings)
 	cpu		.req	w0
 	num_cpus	.req	w1
 	swapper_pa	.req	x2
@@ -413,39 +389,72 @@ __idmap_kpti_secondary:
 
 	.unreq	swapper_ttb
 	.unreq	flag_ptr
-ENDPROC(idmap_kpti_install_ng_mappings)
+SYM_FUNC_END(idmap_kpti_install_ng_mappings)
 	.popsection
 #endif
 
 /*
  *	__cpu_setup
  *
- *	Initialise the processor for turning the MMU on.  Return in x0 the
- *	value of the SCTLR_EL1 register.
+ *	Initialise the processor for turning the MMU on.
+ *
+ * Output:
+ *	Return in x0 the value of the SCTLR_EL1 register.
  */
 	.pushsection ".idmap.text", "awx"
-ENTRY(__cpu_setup)
+SYM_FUNC_START(__cpu_setup)
 	tlbi	vmalle1				// Invalidate local TLB
 	dsb	nsh
 
-	mov	x0, #3 << 20
-	msr	cpacr_el1, x0			// Enable FP/ASIMD
-	mov	x0, #1 << 12			// Reset mdscr_el1 and disable
-	msr	mdscr_el1, x0			// access to the DCC from EL0
+	mov	x1, #3 << 20
+	msr	cpacr_el1, x1			// Enable FP/ASIMD
+	mov	x1, #1 << 12			// Reset mdscr_el1 and disable
+	msr	mdscr_el1, x1			// access to the DCC from EL0
 	isb					// Unmask debug exceptions now,
 	enable_dbg				// since this is per-cpu
-	reset_pmuserenr_el0 x0			// Disable PMU access from EL0
-	reset_amuserenr_el0 x0			// Disable AMU access from EL0
+	reset_pmuserenr_el0 x1			// Disable PMU access from EL0
+	reset_amuserenr_el0 x1			// Disable AMU access from EL0
 
 	/*
 	 * Memory region attributes
 	 */
 	mov_q	x5, MAIR_EL1_SET
-	msr	mair_el1, x5
+#ifdef CONFIG_ARM64_MTE
 	/*
-	 * Prepare SCTLR
+	 * Update MAIR_EL1, GCR_EL1 and TFSR*_EL1 if MTE is supported
+	 * (ID_AA64PFR1_EL1[11:8] > 1).
 	 */
-	mov_q	x0, SCTLR_EL1_SET
+	mrs	x10, ID_AA64PFR1_EL1
+	ubfx	x10, x10, #ID_AA64PFR1_MTE_SHIFT, #4
+	cmp	x10, #ID_AA64PFR1_MTE
+	b.lt	1f
+
+	/* Normal Tagged memory type at the corresponding MAIR index */
+	mov	x10, #MAIR_ATTR_NORMAL_TAGGED
+	bfi	x5, x10, #(8 *  MT_NORMAL_TAGGED), #8
+
+	/* initialize GCR_EL1: all non-zero tags excluded by default */
+	mov	x10, #(SYS_GCR_EL1_RRND | SYS_GCR_EL1_EXCL_MASK)
+	msr_s	SYS_GCR_EL1, x10
+
+	/*
+	 * If GCR_EL1.RRND=1 is implemented the same way as RRND=0, then
+	 * RGSR_EL1.SEED must be non-zero for IRG to produce
+	 * pseudorandom numbers. As RGSR_EL1 is UNKNOWN out of reset, we
+	 * must initialize it.
+	 */
+	mrs	x10, CNTVCT_EL0
+	ands	x10, x10, #SYS_RGSR_EL1_SEED_MASK
+	csinc	x10, x10, xzr, ne
+	lsl	x10, x10, #SYS_RGSR_EL1_SEED_SHIFT
+	msr_s	SYS_RGSR_EL1, x10
+
+	/* clear any pending tag check faults in TFSR*_EL1 */
+	msr_s	SYS_TFSR_EL1, xzr
+	msr_s	SYS_TFSRE0_EL1, xzr
+1:
+#endif
+	msr	mair_el1, x5
 	/*
 	 * Set/prepare TCR and TTBR. We use 512GB (39-bit) address range for
 	 * both user and kernel.
@@ -482,5 +491,9 @@ ENTRY(__cpu_setup)
 1:
 #endif	/* CONFIG_ARM64_HW_AFDBM */
 	msr	tcr_el1, x10
+	/*
+	 * Prepare SCTLR
+	 */
+	mov_q	x0, SCTLR_EL1_SET
 	ret					// return to head.S
-ENDPROC(__cpu_setup)
+SYM_FUNC_END(__cpu_setup)

@@ -249,11 +249,15 @@ struct nfs4_copy_state {
 				BIT(13)		/* Deferred cache invalidation */
 #define NFS_INO_INVALID_BLOCKS	BIT(14)         /* cached blocks are invalid */
 #define NFS_INO_INVALID_XATTR	BIT(15)		/* xattrs are invalid */
+#define NFS_INO_INVALID_NLINK	BIT(16)		/* cached nlinks is invalid */
+#define NFS_INO_INVALID_MODE	BIT(17)		/* cached mode is invalid */
 
 #define NFS_INO_INVALID_ATTR	(NFS_INO_INVALID_CHANGE \
 		| NFS_INO_INVALID_CTIME \
 		| NFS_INO_INVALID_MTIME \
 		| NFS_INO_INVALID_SIZE \
+		| NFS_INO_INVALID_NLINK \
+		| NFS_INO_INVALID_MODE \
 		| NFS_INO_INVALID_OTHER)	/* inode metadata is invalid */
 
 /*
@@ -377,7 +381,7 @@ extern void nfs_zap_caches(struct inode *);
 extern void nfs_set_inode_stale(struct inode *inode);
 extern void nfs_invalidate_atime(struct inode *);
 extern struct inode *nfs_fhget(struct super_block *, struct nfs_fh *,
-				struct nfs_fattr *, struct nfs4_label *);
+				struct nfs_fattr *);
 struct inode *nfs_ilookup(struct super_block *sb, struct nfs_fattr *, struct nfs_fh *);
 extern int nfs_refresh_inode(struct inode *, struct nfs_fattr *);
 extern int nfs_post_op_update_inode(struct inode *inode, struct nfs_fattr *fattr);
@@ -389,7 +393,7 @@ extern void nfs_access_set_mask(struct nfs_access_entry *, u32);
 extern int nfs_permission(struct inode *, int);
 extern int nfs_open(struct inode *, struct file *);
 extern int nfs_attribute_cache_expired(struct inode *inode);
-extern int nfs_revalidate_inode(struct nfs_server *server, struct inode *inode);
+extern int nfs_revalidate_inode(struct inode *inode, unsigned long flags);
 extern int __nfs_revalidate_inode(struct nfs_server *, struct inode *);
 extern int nfs_clear_invalid_mapping(struct address_space *mapping);
 extern bool nfs_mapping_need_revalidate_inode(struct inode *inode);
@@ -397,8 +401,7 @@ extern int nfs_revalidate_mapping(struct inode *inode, struct address_space *map
 extern int nfs_revalidate_mapping_rcu(struct inode *inode);
 extern int nfs_setattr(struct dentry *, struct iattr *);
 extern void nfs_setattr_update_inode(struct inode *inode, struct iattr *attr, struct nfs_fattr *);
-extern void nfs_setsecurity(struct inode *inode, struct nfs_fattr *fattr,
-				struct nfs4_label *label);
+extern void nfs_setsecurity(struct inode *inode, struct nfs_fattr *fattr);
 extern struct nfs_open_context *get_nfs_open_context(struct nfs_open_context *ctx);
 extern void put_nfs_open_context(struct nfs_open_context *ctx);
 extern struct nfs_open_context *nfs_find_open_context(struct inode *inode, const struct cred *cred, fmode_t mode);
@@ -574,6 +577,7 @@ extern int nfs_wb_page_cancel(struct inode *inode, struct page* page);
 extern int  nfs_commit_inode(struct inode *, int);
 extern struct nfs_commit_data *nfs_commitdata_alloc(bool never_fail);
 extern void nfs_commit_free(struct nfs_commit_data *data);
+bool nfs_commit_end(struct nfs_mds_commit_info *cinfo);
 
 static inline int
 nfs_have_writebacks(struct inode *inode)

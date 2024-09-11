@@ -91,6 +91,7 @@ nfs_proc_get_root(struct nfs_server *server, struct nfs_fh *fhandle,
 	info->dtpref = fsinfo.tsize;
 	info->maxfilesize = 0x7FFFFFFF;
 	info->lease_time = 0;
+	info->change_attr_type = NFS4_CHANGE_TYPE_IS_UNDEFINED;
 	return 0;
 }
 
@@ -99,8 +100,7 @@ nfs_proc_get_root(struct nfs_server *server, struct nfs_fh *fhandle,
  */
 static int
 nfs_proc_getattr(struct nfs_server *server, struct nfs_fh *fhandle,
-		struct nfs_fattr *fattr, struct nfs4_label *label,
-		struct inode *inode)
+		struct nfs_fattr *fattr, struct inode *inode)
 {
 	struct rpc_message msg = {
 		.rpc_proc	= &nfs_procedures[NFSPROC_GETATTR],

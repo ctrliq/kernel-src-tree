@@ -84,7 +84,7 @@ void hfi1_mmu_rb_unregister(struct mmu_rb_handler *handler)
 	struct list_head del_list;
 
 	/* Prevent freeing of mm until we are completely finished. */
-	mmgrab(handler->mn.mm);
+	mmgrab(handler->mm);
 
 	/* Unregister first so we don't get any more notifications. */
 	mmu_notifier_unregister(&handler->mn, handler->mm);
@@ -109,7 +109,7 @@ void hfi1_mmu_rb_unregister(struct mmu_rb_handler *handler)
 	do_remove(handler, &del_list);
 
 	/* Now the mm may be freed. */
-	mmdrop(handler->mn.mm);
+	mmdrop(handler->mm);
 
 	kfree(handler);
 }

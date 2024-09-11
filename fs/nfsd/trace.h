@@ -9,6 +9,7 @@
 #define _NFSD_TRACE_H
 
 #include <linux/tracepoint.h>
+
 #include "export.h"
 #include "nfsfh.h"
 
@@ -489,7 +490,12 @@ DEFINE_EVENT(nfsd_clientid_class, nfsd_clid_##name, \
 	TP_PROTO(const clientid_t *clid), \
 	TP_ARGS(clid))
 
-DEFINE_CLIENTID_EVENT(expired);
+DEFINE_CLIENTID_EVENT(expire_unconf);
+DEFINE_CLIENTID_EVENT(reclaim_complete);
+DEFINE_CLIENTID_EVENT(confirmed);
+DEFINE_CLIENTID_EVENT(destroyed);
+DEFINE_CLIENTID_EVENT(admin_expired);
+DEFINE_CLIENTID_EVENT(replaced);
 DEFINE_CLIENTID_EVENT(purged);
 DEFINE_CLIENTID_EVENT(renew);
 DEFINE_CLIENTID_EVENT(stale);
@@ -574,29 +580,41 @@ TRACE_EVENT(nfsd_clid_verf_mismatch,
 	)
 );
 
-TRACE_EVENT(nfsd_clid_inuse_err,
+DECLARE_EVENT_CLASS(nfsd_clid_class,
 	TP_PROTO(const struct nfs4_client *clp),
 	TP_ARGS(clp),
 	TP_STRUCT__entry(
 		__field(u32, cl_boot)
 		__field(u32, cl_id)
 		__array(unsigned char, addr, sizeof(struct sockaddr_in6))
-		__field(unsigned int, namelen)
-		__dynamic_array(unsigned char, name, clp->cl_name.len)
+		__field(unsigned long, flavor)
+		__array(unsigned char, verifier, NFS4_VERIFIER_SIZE)
+		__string_len(name, name, clp->cl_name.len)
 	),
 	TP_fast_assign(
 		__entry->cl_boot = clp->cl_clientid.cl_boot;
 		__entry->cl_id = clp->cl_clientid.cl_id;
 		memcpy(__entry->addr, &clp->cl_addr,
 			sizeof(struct sockaddr_in6));
-		__entry->namelen = clp->cl_name.len;
-		memcpy(__get_dynamic_array(name), clp->cl_name.data,
-			clp->cl_name.len);
+		__entry->flavor = clp->cl_cred.cr_flavor;
+		memcpy(__entry->verifier, (void *)&clp->cl_verifier,
+		       NFS4_VERIFIER_SIZE);
+		__assign_str_len(name, clp->cl_name.data, clp->cl_name.len);
 	),
-	TP_printk("nfs4_clientid %.*s already in use by %pISpc, client %08x:%08x",
-		__entry->namelen, __get_str(name), __entry->addr,
+	TP_printk("addr=%pISpc name='%s' verifier=0x%s flavor=%s client=%08x:%08x",
+		__entry->addr, __get_str(name),
+		__print_hex_str(__entry->verifier, NFS4_VERIFIER_SIZE),
+		show_nfsd_authflavor(__entry->flavor),
 		__entry->cl_boot, __entry->cl_id)
-)
+);
+
+#define DEFINE_CLID_EVENT(name) \
+DEFINE_EVENT(nfsd_clid_class, nfsd_clid_##name, \
+	TP_PROTO(const struct nfs4_client *clp), \
+	TP_ARGS(clp))
+
+DEFINE_CLID_EVENT(fresh);
+DEFINE_CLID_EVENT(confirmed_r);
 
 #include "cache.h"
 

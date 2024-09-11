@@ -318,7 +318,7 @@ static ssize_t _nfs42_proc_copy(struct file *src,
 
 	status = nfs4_call_sync(server->client, server, &msg,
 				&args->seq_args, &res->seq_res, 0);
-	trace_nfs4_copy(src_inode, dst_inode, args, res, nss, status);
+	trace_nfs4_copy(file_inode(src), dst_inode, args, res, status);
 	if (status == -ENOTSUPP)
 		server->caps &= ~NFS_CAP_COPY;
 	if (status)
@@ -446,6 +446,7 @@ static void nfs42_offload_cancel_done(struct rpc_task *task, void *calldata)
 {
 	struct nfs42_offloadcancel_data *data = calldata;
 
+	trace_nfs4_offload_cancel(&data->args, task->tk_status);
 	nfs41_sequence_done(task, &data->res.osr_seq_res);
 	if (task->tk_status &&
 		nfs4_async_handle_error(task, data->seq_server, NULL,

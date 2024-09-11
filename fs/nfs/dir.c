@@ -681,8 +681,7 @@ again:
 			nfs_set_verifier(dentry, dir_verifier);
 			status = nfs_refresh_inode(d_inode(dentry), entry->fattr);
 			if (!status)
-				nfs_setsecurity(d_inode(dentry), entry->fattr,
-						entry->fattr->label);
+				nfs_setsecurity(d_inode(dentry), entry->fattr);
 			goto out;
 		} else {
 			d_invalidate(dentry);
@@ -696,7 +695,7 @@ again:
 		goto out;
 	}
 
-	inode = nfs_fhget(dentry->d_sb, entry->fh, entry->fattr, entry->fattr->label);
+	inode = nfs_fhget(dentry->d_sb, entry->fh, entry->fattr);
 	alias = d_splice_alias(inode, dentry);
 	d_lookup_done(dentry);
 	if (alias) {
@@ -1522,7 +1521,7 @@ nfs_lookup_revalidate_dentry(struct inode *dir, struct dentry *dentry,
 	if (nfs_refresh_inode(inode, fattr) < 0)
 		goto out;
 
-	nfs_setsecurity(inode, fattr, fattr->label);
+	nfs_setsecurity(inode, fattr);
 	nfs_set_verifier(dentry, dir_verifier);
 
 	/* set a readdirplus hint that we had a cache miss */
@@ -1706,7 +1705,7 @@ static void nfs_drop_nlink(struct inode *inode)
 	NFS_I(inode)->attr_gencount = nfs_inc_attr_generation_counter();
 	nfs_set_cache_invalid(
 		inode, NFS_INO_INVALID_CHANGE | NFS_INO_INVALID_CTIME |
-			       NFS_INO_INVALID_OTHER | NFS_INO_REVAL_FORCED);
+			       NFS_INO_INVALID_NLINK);
 	spin_unlock(&inode->i_lock);
 }
 
@@ -1785,7 +1784,7 @@ struct dentry *nfs_lookup(struct inode *dir, struct dentry * dentry, unsigned in
 		res = ERR_PTR(error);
 		goto out;
 	}
-	inode = nfs_fhget(dentry->d_sb, fhandle, fattr, fattr->label);
+	inode = nfs_fhget(dentry->d_sb, fhandle, fattr);
 	res = ERR_CAST(inode);
 	if (IS_ERR(res))
 		goto out;
@@ -2056,11 +2055,11 @@ nfs_add_or_obtain(struct dentry *dentry, struct nfs_fh *fhandle,
 	if (!(fattr->valid & NFS_ATTR_FATTR)) {
 		struct nfs_server *server = NFS_SB(dentry->d_sb);
 		error = server->nfs_client->rpc_ops->getattr(server, fhandle,
-				fattr, NULL, NULL);
+				fattr, NULL);
 		if (error < 0)
 			goto out_error;
 	}
-	inode = nfs_fhget(dentry->d_sb, fhandle, fattr, fattr->label);
+	inode = nfs_fhget(dentry->d_sb, fhandle, fattr);
 	d = d_splice_alias(inode, dentry);
 out:
 	dput(parent);
@@ -2944,7 +2943,7 @@ static int nfs_execute_ok(struct inode *inode, int mask)
 
 	if (S_ISDIR(inode->i_mode))
 		return 0;
-	if (nfs_check_cache_invalid(inode, NFS_INO_INVALID_OTHER)) {
+	if (nfs_check_cache_invalid(inode, NFS_INO_INVALID_MODE)) {
 		if (mask & MAY_NOT_BLOCK)
 			return -ECHILD;
 		ret = __nfs_revalidate_inode(server, inode);
@@ -3000,7 +2999,8 @@ out_notsup:
 	if (mask & MAY_NOT_BLOCK)
 		return -ECHILD;
 
-	res = nfs_revalidate_inode(NFS_SERVER(inode), inode);
+	res = nfs_revalidate_inode(inode, NFS_INO_INVALID_MODE |
+						  NFS_INO_INVALID_OTHER);
 	if (res == 0)
 		res = generic_permission(inode, mask);
 	goto out;

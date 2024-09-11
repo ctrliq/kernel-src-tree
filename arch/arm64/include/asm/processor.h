@@ -38,19 +38,19 @@
  */
 #define current_text_addr() ({ __label__ _l; _l: &&_l;})
 
-#ifdef __KERNEL__
-
 #include <linux/build_bug.h>
 #include <linux/cache.h>
 #include <linux/init.h>
 #include <linux/stddef.h>
 #include <linux/string.h>
+#include <linux/thread_info.h>
 
 #include <vdso/processor.h>
 
 #include <asm/alternative.h>
 #include <asm/cpufeature.h>
 #include <asm/hw_breakpoint.h>
+#include <asm/kasan.h>
 #include <asm/lse.h>
 #include <asm/pgtable-hwdef.h>
 #include <asm/pointer_auth.h>
@@ -166,6 +166,7 @@ struct thread_struct {
 	struct debug_info	debug;		/* debugging */
 #ifdef CONFIG_ARM64_PTR_AUTH
 	struct ptrauth_keys_user	keys_user;
+	struct ptrauth_keys_kernel	keys_kernel;
 #endif
 };
 
@@ -310,8 +311,6 @@ static inline void spin_lock_prefetch(const void *ptr)
 
 #define HAVE_ARCH_PICK_MMAP_LAYOUT
 
-#endif
-
 extern unsigned long __ro_after_init signal_minsigstksz; /* sigframe size */
 extern void __init minsigstksz_setup(void);
 
@@ -332,6 +331,14 @@ extern void __init minsigstksz_setup(void);
 
 /* PR_PAC_RESET_KEYS prctl */
 #define PAC_RESET_KEYS(tsk, arg)	ptrauth_prctl_reset_keys(tsk, arg)
+
+#ifdef CONFIG_ARM64_TAGGED_ADDR_ABI
+/* PR_{SET,GET}_TAGGED_ADDR_CTRL prctl */
+long set_tagged_addr_ctrl(unsigned long arg);
+long get_tagged_addr_ctrl(void);
+#define SET_TAGGED_ADDR_CTRL(arg)	set_tagged_addr_ctrl(arg)
+#define GET_TAGGED_ADDR_CTRL()		get_tagged_addr_ctrl()
+#endif
 
 #endif /* __ASSEMBLY__ */
 #endif /* __ASM_PROCESSOR_H */

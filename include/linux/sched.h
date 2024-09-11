@@ -312,20 +312,38 @@ struct prev_cputime {
 #endif
 };
 
+/*
+ * RHEL Notes:
+ * Due to dependency of cputime.c code on the exact ordering of
+ * vtime_state enum names, __GENKSYMS__ macro is used directly
+ * here instead of RH_KABI*ENUM* macros.
+ */
+#ifndef __GENKSYMS__
+
 enum vtime_state {
 	/* Task is sleeping or running in a CPU with VTIME inactive: */
 	VTIME_INACTIVE = 0,
-	/* Task runs in userspace in a CPU with VTIME active: */
-	VTIME_USER,
+	/* Task is idle */
+	VTIME_IDLE,
 	/* Task runs in kernelspace in a CPU with VTIME active: */
 	VTIME_SYS,
+	/* Task runs in userspace in a CPU with VTIME active: */
+	VTIME_USER,
+	/* Task runs as guests in a CPU with VTIME active: */
+	VTIME_GUEST,
 };
+
+#else
+enum vtime_state {
+	VTIME_INACTIVE = 0, VTIME_USER, VTIME_SYS,
+};
+#endif
 
 struct vtime {
 	seqcount_t		seqcount;
 	unsigned long long	starttime;
 	enum vtime_state	state;
-	/* cpu is defined in struct task_struct->task_struct_rh->vtime_cpu */
+	RH_KABI_FILL_HOLE(unsigned int cpu)
 	u64			utime;
 	u64			stime;
 	u64			gtime;
@@ -669,7 +687,7 @@ struct task_struct_rh {
 	/* Empty if CONFIG_POSIX_CPUTIMERS=n */
 	struct posix_cputimers posix_cputimers;
 	/* struct vtime->cpu */
-	unsigned int vtime_cpu;
+	RH_KABI_DEPRECATE(unsigned int, vtime_cpu)
 	u64				parent_exec_id;
 	u64				self_exec_id;
 #ifdef CONFIG_COMPACTION
@@ -705,6 +723,7 @@ struct task_struct_rh {
 #if IS_ENABLED(CONFIG_KUNIT)
 	struct kunit			*kunit_test;
 #endif
+	struct timer_list		oom_reaper_timer;
 };
 
 struct task_struct {
@@ -736,7 +755,7 @@ struct task_struct {
 	unsigned int			ptrace;
 
 #ifdef CONFIG_SMP
-	struct llist_node		wake_entry;
+	RH_KABI_DEPRECATE(struct llist_node, wake_entry)
 	int				on_cpu;
 #ifdef CONFIG_THREAD_INFO_IN_TASK
 	/* Current CPU: */
@@ -901,7 +920,7 @@ struct task_struct {
 #endif
 #ifdef CONFIG_PAGE_OWNER
 	/* Used by page_owner=on to detect recursion in page tracking. */
-	unsigned			in_page_owner:1;
+	RH_KABI_FILL_HOLE(unsigned	in_page_owner:1)
 #endif
 
 	unsigned long			atomic_flags; /* Flags requiring atomic access. */
@@ -1020,7 +1039,8 @@ struct task_struct {
 	unsigned long			min_flt;
 	unsigned long			maj_flt;
 
-	RH_KABI_DEPRECATE(struct task_cputime, cputime_expires)
+	RH_KABI_REPLACE_SPLIT(struct task_cputime	cputime_expires,
+			      struct __call_single_node	wake_entry)
 #ifdef CONFIG_FUTEX
 	RH_KABI_REPLACE_SPLIT(struct list_head	cpu_timers[3],
 			      struct mutex	futex_exit_mutex,
@@ -1397,7 +1417,6 @@ struct task_struct {
 	int				pagefault_disabled;
 #ifdef CONFIG_MMU
 	struct task_struct		*oom_reaper_list;
-	struct timer_list		oom_reaper_timer;
 #endif
 #ifdef CONFIG_VMAP_STACK
 	struct vm_struct		*stack_vm_area;
@@ -1858,7 +1877,15 @@ extern char *__get_task_comm(char *to, size_t len, struct task_struct *tsk);
 })
 
 #ifdef CONFIG_SMP
-void scheduler_ipi(void);
+static __always_inline void scheduler_ipi(void)
+{
+	/*
+	 * Fold TIF_NEED_RESCHED into the preempt_count; anybody setting
+	 * TIF_NEED_RESCHED remotely (for the first time) will also send
+	 * this IPI.
+	 */
+	preempt_fold_need_resched();
+}
 extern unsigned long wait_task_inactive(struct task_struct *, unsigned int match_state);
 #else
 static inline void scheduler_ipi(void) { }

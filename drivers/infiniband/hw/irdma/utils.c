@@ -11,7 +11,7 @@
  * @action: modify, delete or add
  */
 int irdma_arp_table(struct irdma_pci_f *rf, u32 *ip_addr, bool ipv4,
-		    u8 *mac_addr, u32 action)
+		    const u8 *mac_addr, u32 action)
 {
 	unsigned long flags;
 	int arp_index;
@@ -77,7 +77,7 @@ int irdma_arp_table(struct irdma_pci_f *rf, u32 *ip_addr, bool ipv4,
  * @ipv4: IPv4 flag
  * @mac: MAC address
  */
-int irdma_add_arp(struct irdma_pci_f *rf, u32 *ip, bool ipv4, u8 *mac)
+int irdma_add_arp(struct irdma_pci_f *rf, u32 *ip, bool ipv4, const u8 *mac)
 {
 	int arpidx;
 
@@ -1134,10 +1134,7 @@ void irdma_free_qp_rsrc(struct irdma_qp *iwqp)
 			  iwqp->kqp.dma_mem.va, iwqp->kqp.dma_mem.pa);
 	iwqp->kqp.dma_mem.va = NULL;
 	kfree(iwqp->kqp.sq_wrid_mem);
-	iwqp->kqp.sq_wrid_mem = NULL;
 	kfree(iwqp->kqp.rq_wrid_mem);
-	iwqp->kqp.rq_wrid_mem = NULL;
-	kfree(iwqp);
 }
 
 /**

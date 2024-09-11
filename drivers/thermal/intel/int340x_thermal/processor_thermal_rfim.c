@@ -9,8 +9,6 @@
 #include <linux/pci.h>
 #include "processor_thermal_device.h"
 
-MODULE_IMPORT_NS(INT340X_THERMAL);
-
 struct mmio_reg {
 	int read_only;
 	u32 offset;

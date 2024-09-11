@@ -745,14 +745,10 @@ static int bnxt_dl_params_register(struct bnxt *bp)
 
 	rc = devlink_params_register(bp->dl, bnxt_dl_params,
 				     ARRAY_SIZE(bnxt_dl_params));
-	if (rc) {
+	if (rc)
 		netdev_warn(bp->dev, "devlink_params_register failed. rc=%d\n",
 			    rc);
-		return rc;
-	}
-	devlink_params_publish(bp->dl);
-
-	return 0;
+	return rc;
 }
 
 static void bnxt_dl_params_unregister(struct bnxt *bp)
@@ -766,15 +762,18 @@ static void bnxt_dl_params_unregister(struct bnxt *bp)
 
 int bnxt_dl_register(struct bnxt *bp)
 {
+	const struct devlink_ops *devlink_ops;
 	struct devlink_port_attrs attrs = {};
 	struct bnxt_dl *bp_dl;
 	struct devlink *dl;
 	int rc;
 
 	if (BNXT_PF(bp))
-		dl = devlink_alloc(&bnxt_dl_ops, sizeof(struct bnxt_dl));
+		devlink_ops = &bnxt_dl_ops;
 	else
-		dl = devlink_alloc(&bnxt_vf_dl_ops, sizeof(struct bnxt_dl));
+		devlink_ops = &bnxt_vf_dl_ops;
+
+	dl = devlink_alloc(devlink_ops, sizeof(struct bnxt_dl), &bp->pdev->dev);
 	if (!dl) {
 		netdev_warn(bp->dev, "devlink_alloc failed\n");
 		return -ENOMEM;
@@ -789,14 +788,8 @@ int bnxt_dl_register(struct bnxt *bp)
 	    bp->hwrm_spec_code > 0x10803)
 		bp->eswitch_mode = DEVLINK_ESWITCH_MODE_LEGACY;
 
-	rc = devlink_register(dl, &bp->pdev->dev);
-	if (rc) {
-		netdev_warn(bp->dev, "devlink_register failed. rc=%d\n", rc);
-		goto err_dl_free;
-	}
-
 	if (!BNXT_PF(bp))
-		return 0;
+		goto out;
 
 	attrs.flavour = DEVLINK_PORT_FLAVOUR_PHYSICAL;
 	attrs.phys.port_number = bp->pf.port_id;
@@ -806,19 +799,19 @@ int bnxt_dl_register(struct bnxt *bp)
 	rc = devlink_port_register(dl, &bp->dl_port, bp->pf.port_id);
 	if (rc) {
 		netdev_err(bp->dev, "devlink_port_register failed\n");
-		goto err_dl_unreg;
+		goto err_dl_free;
 	}
 
 	rc = bnxt_dl_params_register(bp);
 	if (rc)
 		goto err_dl_port_unreg;
 
+out:
+	devlink_register(dl);
 	return 0;
 
 err_dl_port_unreg:
 	devlink_port_unregister(&bp->dl_port);
-err_dl_unreg:
-	devlink_unregister(dl);
 err_dl_free:
 	devlink_free(dl);
 	return rc;
@@ -828,10 +821,10 @@ void bnxt_dl_unregister(struct bnxt *bp)
 {
 	struct devlink *dl = bp->dl;
 
+	devlink_unregister(dl);
 	if (BNXT_PF(bp)) {
 		bnxt_dl_params_unregister(bp);
 		devlink_port_unregister(&bp->dl_port);
 	}
-	devlink_unregister(dl);
 	devlink_free(dl);
 }

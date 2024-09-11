@@ -51,9 +51,8 @@ void vga_put(struct pci_dev *pdev, unsigned int rsrc);
 struct pci_dev *vga_default_device(void);
 void vga_set_default_device(struct pci_dev *pdev);
 int vga_remove_vgacon(struct pci_dev *pdev);
-int vga_client_register(struct pci_dev *pdev, void *cookie,
-			void (*irq_set_state)(void *cookie, bool state),
-			unsigned int (*set_vga_decode)(void *cookie, bool state));
+int vga_client_register(struct pci_dev *pdev,
+		unsigned int (*set_decode)(struct pci_dev *pdev, bool state));
 #else /* CONFIG_VGA_ARB */
 static inline void vga_set_legacy_decoding(struct pci_dev *pdev,
 		unsigned int decodes)
@@ -78,9 +77,8 @@ static inline int vga_remove_vgacon(struct pci_dev *pdev)
 {
 	return 0;
 }
-static inline int vga_client_register(struct pci_dev *pdev, void *cookie,
-				      void (*irq_set_state)(void *cookie, bool state),
-				      unsigned int (*set_vga_decode)(void *cookie, bool state))
+static inline int vga_client_register(struct pci_dev *pdev,
+		unsigned int (*set_decode)(struct pci_dev *pdev, bool state))
 {
 	return 0;
 }
@@ -114,6 +112,11 @@ static inline int vga_get_uninterruptible(struct pci_dev *pdev,
 					  unsigned int rsrc)
 {
        return vga_get(pdev, rsrc, 0);
+}
+
+static inline void vga_client_unregister(struct pci_dev *pdev)
+{
+	vga_client_register(pdev, NULL);
 }
 
 #endif /* LINUX_VGA_H */

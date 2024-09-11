@@ -106,13 +106,13 @@ int processor_thermal_send_mbox_read_cmd(struct pci_dev *pdev, u16 id, u64 *resp
 {
 	return send_mbox_read_cmd(pdev, id, resp);
 }
-EXPORT_SYMBOL_NS_GPL(processor_thermal_send_mbox_read_cmd, INT340X_THERMAL);
+EXPORT_SYMBOL_GPL(processor_thermal_send_mbox_read_cmd);
 
 int processor_thermal_send_mbox_write_cmd(struct pci_dev *pdev, u16 id, u32 data)
 {
 	return send_mbox_write_cmd(pdev, id, data);
 }
-EXPORT_SYMBOL_NS_GPL(processor_thermal_send_mbox_write_cmd, INT340X_THERMAL);
+EXPORT_SYMBOL_GPL(processor_thermal_send_mbox_write_cmd);
 
 /* List of workload types */
 static const char * const workload_types[] = {

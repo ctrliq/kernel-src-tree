@@ -27,6 +27,7 @@ struct clk;
 struct device;
 struct i2c_client;
 struct irq_domain;
+struct mdio_device;
 struct slim_device;
 struct spi_device;
 struct spmi_device;
@@ -488,6 +489,7 @@ typedef void (*regmap_hw_free_context)(void *context);
  *     DEFAULT, BIG is assumed.
  * @max_raw_read: Max raw read size that can be used on the bus.
  * @max_raw_write: Max raw write size that can be used on the bus.
+ * @free_on_exit: kfree this on exit of regmap
  */
 struct regmap_bus {
 	bool fast_io;
@@ -505,6 +507,7 @@ struct regmap_bus {
 	enum regmap_endian val_format_endian_default;
 	size_t max_raw_read;
 	size_t max_raw_write;
+	bool free_on_exit;
 };
 
 /*
@@ -524,6 +527,10 @@ struct regmap *__regmap_init_i2c(struct i2c_client *i2c,
 				 const struct regmap_config *config,
 				 struct lock_class_key *lock_key,
 				 const char *lock_name);
+struct regmap *__regmap_init_mdio(struct mdio_device *mdio_dev,
+				  const struct regmap_config *config,
+ 				  struct lock_class_key *lock_key,
+				  const char *lock_name);
 struct regmap *__regmap_init_slimbus(struct slim_device *slimbus,
 				 const struct regmap_config *config,
 				 struct lock_class_key *lock_key,
@@ -572,6 +579,10 @@ struct regmap *__devm_regmap_init_i2c(struct i2c_client *i2c,
 				      const struct regmap_config *config,
 				      struct lock_class_key *lock_key,
 				      const char *lock_name);
+struct regmap *__devm_regmap_init_mdio(struct mdio_device *mdio_dev,
+				       const struct regmap_config *config,
+				       struct lock_class_key *lock_key,
+				       const char *lock_name);
 struct regmap *__devm_regmap_init_spi(struct spi_device *dev,
 				      const struct regmap_config *config,
 				      struct lock_class_key *lock_key,
@@ -688,6 +699,19 @@ int regmap_attach_dev(struct device *dev, struct regmap *map,
 #define regmap_init_spi(dev, config)					\
 	__regmap_lockdep_wrapper(__regmap_init_spi, #config,		\
 				dev, config)
+
+/**
+ * regmap_init_mdio() - Initialise register map
+ *
+ * @mdio_dev: Device that will be interacted with
+ * @config: Configuration for register map
+ *
+ * The return value will be an ERR_PTR() on error or a valid pointer to
+ * a struct regmap.
+ */
+#define regmap_init_mdio(mdio_dev, config)				\
+	__regmap_lockdep_wrapper(__regmap_init_mdio, #config,		\
+				mdio_dev, config)
 
 /**
  * regmap_init_spmi_base() - Create regmap for the Base register space
@@ -869,6 +893,20 @@ bool regmap_ac97_default_volatile(struct device *dev, unsigned int reg);
 #define devm_regmap_init_spmi_ext(dev, config)				\
 	__regmap_lockdep_wrapper(__devm_regmap_init_spmi_ext, #config,	\
 				dev, config)
+
+/**
+ * devm_regmap_init_mdio() - Initialise managed register map
+ *
+ * @mdio_dev: Device that will be interacted with
+ * @config: Configuration for register map
+ *
+ * The return value will be an ERR_PTR() on error or a valid pointer
+ * to a struct regmap.  The regmap will be automatically freed by the
+ * device management code.
+ */
+#define devm_regmap_init_mdio(mdio_dev, config)				\
+	__regmap_lockdep_wrapper(__devm_regmap_init_mdio, #config,	\
+				mdio_dev, config)
 
 /**
  * devm_regmap_init_w1() - Initialise managed register map
@@ -1114,6 +1152,7 @@ struct regmap_irq {
  * @clear_ack:  Use this to set 1 and 0 or vice-versa to clear interrupts.
  * @wake_invert: Inverted wake register: cleared bits are wake enabled.
  * @type_invert: Invert the type flags.
+ * @status_invert: Inverted status register: cleared bits are active interrupts.
  * @runtime_pm:  Hold a runtime PM lock on the device when accessing it.
  *
  * @num_regs:    Number of registers in each control bank.
@@ -1153,6 +1192,7 @@ struct regmap_irq_chip {
 	bool wake_invert:1;
 	bool runtime_pm:1;
 	bool type_invert:1;
+	bool status_invert:1;
 
 	int num_regs;
 

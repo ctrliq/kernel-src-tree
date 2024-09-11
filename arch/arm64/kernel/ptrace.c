@@ -596,6 +596,13 @@ static int gpr_set(struct task_struct *target, const struct user_regset *regset,
 	return 0;
 }
 
+static int fpr_active(struct task_struct *target, const struct user_regset *regset)
+{
+	if (!system_supports_fpsimd())
+		return -ENODEV;
+	return regset->n;
+}
+
 /*
  * TODO: update fp accessors for lazy context switching (sync/flush hwstate)
  */
@@ -615,6 +622,9 @@ static int __fpr_get(struct task_struct *target,
 static int fpr_get(struct task_struct *target, const struct user_regset *regset,
 		   struct membuf to)
 {
+	if (!system_supports_fpsimd())
+		return -EINVAL;
+
 	if (target == current)
 		fpsimd_preserve_current_state();
 
@@ -653,6 +663,9 @@ static int fpr_set(struct task_struct *target, const struct user_regset *regset,
 		   const void *kbuf, const void __user *ubuf)
 {
 	int ret;
+
+	if (!system_supports_fpsimd())
+		return -EINVAL;
 
 	ret = __fpr_set(target, regset, pos, count, kbuf, ubuf, 0);
 	if (ret)
@@ -1082,6 +1095,7 @@ static const struct user_regset aarch64_regsets[] = {
 		 */
 		.size = sizeof(u32),
 		.align = sizeof(u32),
+		.active = fpr_active,
 		.regset_get = fpr_get,
 		.set = fpr_set
 	},
@@ -1267,6 +1281,9 @@ static int compat_vfp_get(struct task_struct *target,
 	struct user_fpsimd_state *uregs;
 	compat_ulong_t fpscr;
 
+	if (!system_supports_fpsimd())
+		return -EINVAL;
+
 	uregs = &target->thread.uw.fpsimd_state;
 
 	if (target == current)
@@ -1290,6 +1307,9 @@ static int compat_vfp_set(struct task_struct *target,
 	struct user_fpsimd_state *uregs;
 	compat_ulong_t fpscr;
 	int ret, vregs_end_pos;
+
+	if (!system_supports_fpsimd())
+		return -EINVAL;
 
 	uregs = &target->thread.uw.fpsimd_state;
 
@@ -1347,6 +1367,7 @@ static const struct user_regset aarch32_regsets[] = {
 		.n = VFP_STATE_SIZE / sizeof(compat_ulong_t),
 		.size = sizeof(compat_ulong_t),
 		.align = sizeof(compat_ulong_t),
+		.active = fpr_active,
 		.regset_get = compat_vfp_get,
 		.set = compat_vfp_set
 	},
@@ -1717,12 +1738,17 @@ static void tracehook_report_syscall(struct pt_regs *regs,
 
 int syscall_trace_enter(struct pt_regs *regs)
 {
-	if (test_thread_flag(TIF_SYSCALL_TRACE))
+	unsigned long flags = READ_ONCE(current_thread_info()->flags);
+
+	if (flags & (_TIF_SYSCALL_EMU | _TIF_SYSCALL_TRACE)) {
 		tracehook_report_syscall(regs, PTRACE_SYSCALL_ENTER);
+		if (flags & _TIF_SYSCALL_EMU)
+			return NO_SYSCALL;
+	}
 
 	/* Do the secure computing after ptrace; failures should be fast. */
 	if (secure_computing(NULL) == -1)
-		return -1;
+		return NO_SYSCALL;
 
 	if (test_thread_flag(TIF_SYSCALL_TRACEPOINT))
 		trace_sys_enter(regs, regs->syscallno);
@@ -1758,7 +1784,7 @@ void syscall_trace_exit(struct pt_regs *regs)
  */
 #define SPSR_EL1_AARCH64_RES0_BITS \
 	(GENMASK_ULL(63, 32) | GENMASK_ULL(27, 26) | GENMASK_ULL(23, 22) | \
-	 GENMASK_ULL(20, 13) | GENMASK_ULL(11, 10) | GENMASK_ULL(5, 5))
+	 GENMASK_ULL(20, 13) | GENMASK_ULL(5, 5))
 #define SPSR_EL1_AARCH32_RES0_BITS \
 	(GENMASK_ULL(63, 32) | GENMASK_ULL(22, 22) | GENMASK_ULL(20, 20))
 

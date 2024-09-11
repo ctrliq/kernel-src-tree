@@ -25,45 +25,7 @@
 #include <linux/xarray.h>
 #include <linux/firmware.h>
 
-#define DEVLINK_RELOAD_STATS_ARRAY_SIZE \
-	(__DEVLINK_RELOAD_LIMIT_MAX * __DEVLINK_RELOAD_ACTION_MAX)
-
-struct devlink_dev_stats {
-	u32 reload_stats[DEVLINK_RELOAD_STATS_ARRAY_SIZE];
-	u32 remote_reload_stats[DEVLINK_RELOAD_STATS_ARRAY_SIZE];
-};
-
-struct devlink_ops;
-
-struct devlink {
-	struct list_head list;
-	struct list_head port_list;
-	struct list_head rate_list;
-	struct list_head sb_list;
-	struct list_head dpipe_table_list;
-	struct list_head resource_list;
-	struct list_head param_list;
-	struct list_head region_list;
-	struct list_head reporter_list;
-	struct mutex reporters_lock; /* protects reporter_list */
-	struct devlink_dpipe_headers *dpipe_headers;
-	struct list_head trap_list;
-	struct list_head trap_group_list;
-	struct list_head trap_policer_list;
-	const struct devlink_ops *ops;
-	struct xarray snapshot_ids;
-	struct devlink_dev_stats stats;
-	struct device *dev;
-	possible_net_t _net;
-	struct mutex lock; /* Serializes access to devlink instance specific objects such as
-			    * port, sb, dpipe, resource, params, region, traps and more.
-			    */
-	u8 reload_failed:1,
-	   reload_enabled:1;
-	refcount_t refcount;
-	struct completion comp;
-	char priv[0] __aligned(NETDEV_ALIGN);
-};
+struct devlink;
 
 struct devlink_port_phys_attrs {
 	u32 port_number; /* Same value as "split group".
@@ -403,33 +365,6 @@ devlink_resource_size_params_init(struct devlink_resource_size_params *size_para
 
 typedef u64 devlink_resource_occ_get_t(void *priv);
 
-/**
- * struct devlink_resource - devlink resource
- * @name: name of the resource
- * @id: id, per devlink instance
- * @size: size of the resource
- * @size_new: updated size of the resource, reload is needed
- * @size_valid: valid in case the total size of the resource is valid
- *              including its children
- * @parent: parent resource
- * @size_params: size parameters
- * @list: parent list
- * @resource_list: list of child resources
- */
-struct devlink_resource {
-	const char *name;
-	u64 id;
-	u64 size;
-	u64 size_new;
-	bool size_valid;
-	struct devlink_resource *parent;
-	struct devlink_resource_size_params size_params;
-	struct list_head list;
-	struct list_head resource_list;
-	devlink_resource_occ_get_t *occ_get;
-	void *occ_get_priv;
-};
-
 #define DEVLINK_RESOURCE_ID_PARENT_TOP 0
 
 #define DEVLINK_RESOURCE_GENERIC_NAME_PORTS "physical_ports"
@@ -510,7 +445,6 @@ struct devlink_param_item {
 	const struct devlink_param *param;
 	union devlink_param_value driverinit_value;
 	bool driverinit_value_valid;
-	bool published;
 };
 
 enum devlink_param_generic_id {
@@ -1240,6 +1174,11 @@ enum devlink_trap_group_generic_id {
 		.min_burst = _min_burst,				      \
 	}
 
+enum {
+	/* device supports reload operations */
+	DEVLINK_F_RELOAD = 1UL << 0,
+};
+
 struct devlink_ops {
 	/**
 	 * @supported_flash_update_params:
@@ -1536,17 +1475,9 @@ struct devlink_ops {
 				    struct netlink_ext_ack *extack);
 };
 
-static inline void *devlink_priv(struct devlink *devlink)
-{
-	BUG_ON(!devlink);
-	return &devlink->priv;
-}
-
-static inline struct devlink *priv_to_devlink(void *priv)
-{
-	BUG_ON(!priv);
-	return container_of(priv, struct devlink, priv);
-}
+void *devlink_priv(struct devlink *devlink);
+struct devlink *priv_to_devlink(void *priv);
+struct device *devlink_to_dev(const struct devlink *devlink);
 
 struct ib_device;
 
@@ -1557,16 +1488,17 @@ struct net *devlink_net(const struct devlink *devlink);
  * Drivers that operate on real HW must use devlink_alloc() instead.
  */
 struct devlink *devlink_alloc_ns(const struct devlink_ops *ops,
-				 size_t priv_size, struct net *net);
+				 size_t priv_size, struct net *net,
+				 struct device *dev);
 static inline struct devlink *devlink_alloc(const struct devlink_ops *ops,
-					    size_t priv_size)
+					    size_t priv_size,
+					    struct device *dev)
 {
-	return devlink_alloc_ns(ops, priv_size, &init_net);
+	return devlink_alloc_ns(ops, priv_size, &init_net, dev);
 }
-int devlink_register(struct devlink *devlink, struct device *dev);
+void devlink_set_features(struct devlink *devlink, u64 features);
+void devlink_register(struct devlink *devlink);
 void devlink_unregister(struct devlink *devlink);
-void devlink_reload_enable(struct devlink *devlink);
-void devlink_reload_disable(struct devlink *devlink);
 void devlink_free(struct devlink *devlink);
 int devlink_port_register(struct devlink *devlink,
 			  struct devlink_port *devlink_port,
@@ -1624,8 +1556,7 @@ int devlink_resource_register(struct devlink *devlink,
 			      u64 resource_id,
 			      u64 parent_resource_id,
 			      const struct devlink_resource_size_params *size_params);
-void devlink_resources_unregister(struct devlink *devlink,
-				  struct devlink_resource *resource);
+void devlink_resources_unregister(struct devlink *devlink);
 int devlink_resource_size_get(struct devlink *devlink,
 			      u64 resource_id,
 			      u64 *p_resource_size);
@@ -1648,8 +1579,6 @@ int devlink_param_register(struct devlink *devlink,
 			   const struct devlink_param *param);
 void devlink_param_unregister(struct devlink *devlink,
 			      const struct devlink_param *param);
-void devlink_params_publish(struct devlink *devlink);
-void devlink_params_unpublish(struct devlink *devlink);
 int devlink_param_driverinit_value_get(struct devlink *devlink, u32 param_id,
 				       union devlink_param_value *init_val);
 int devlink_param_driverinit_value_set(struct devlink *devlink, u32 param_id,

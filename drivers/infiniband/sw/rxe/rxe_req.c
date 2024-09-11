@@ -49,21 +49,16 @@ static void req_retry(struct rxe_qp *qp)
 	unsigned int cons;
 	unsigned int prod;
 
-	if (qp->is_user) {
-		cons = consumer_index(q, QUEUE_TYPE_FROM_USER);
-		prod = producer_index(q, QUEUE_TYPE_FROM_USER);
-	} else {
-		cons = consumer_index(q, QUEUE_TYPE_KERNEL);
-		prod = producer_index(q, QUEUE_TYPE_KERNEL);
-	}
+	cons = queue_get_consumer(q, QUEUE_TYPE_FROM_CLIENT);
+	prod = queue_get_producer(q, QUEUE_TYPE_FROM_CLIENT);
 
 	qp->req.wqe_index	= cons;
 	qp->req.psn		= qp->comp.psn;
 	qp->req.opcode		= -1;
 
 	for (wqe_index = cons; wqe_index != prod;
-			wqe_index = next_index(q, wqe_index)) {
-		wqe = addr_from_index(qp->sq.queue, wqe_index);
+			wqe_index = queue_next_index(q, wqe_index)) {
+		wqe = queue_addr_from_index(qp->sq.queue, wqe_index);
 		mask = wr_opcode_mask(wqe->wr.opcode, qp);
 
 		if (wqe->state == wqe_state_posted)
@@ -115,45 +110,36 @@ void rnr_nak_timer(struct timer_list *t)
 static struct rxe_send_wqe *req_next_wqe(struct rxe_qp *qp)
 {
 	struct rxe_send_wqe *wqe;
-	unsigned long flags;
 	struct rxe_queue *q = qp->sq.queue;
 	unsigned int index = qp->req.wqe_index;
 	unsigned int cons;
 	unsigned int prod;
 
-	if (qp->is_user) {
-		wqe = queue_head(q, QUEUE_TYPE_FROM_USER);
-		cons = consumer_index(q, QUEUE_TYPE_FROM_USER);
-		prod = producer_index(q, QUEUE_TYPE_FROM_USER);
-	} else {
-		wqe = queue_head(q, QUEUE_TYPE_KERNEL);
-		cons = consumer_index(q, QUEUE_TYPE_KERNEL);
-		prod = producer_index(q, QUEUE_TYPE_KERNEL);
-	}
+	wqe = queue_head(q, QUEUE_TYPE_FROM_CLIENT);
+	cons = queue_get_consumer(q, QUEUE_TYPE_FROM_CLIENT);
+	prod = queue_get_producer(q, QUEUE_TYPE_FROM_CLIENT);
 
 	if (unlikely(qp->req.state == QP_STATE_DRAIN)) {
 		/* check to see if we are drained;
 		 * state_lock used by requester and completer
 		 */
-		spin_lock_irqsave(&qp->state_lock, flags);
+		spin_lock_bh(&qp->state_lock);
 		do {
 			if (qp->req.state != QP_STATE_DRAIN) {
 				/* comp just finished */
-				spin_unlock_irqrestore(&qp->state_lock,
-						       flags);
+				spin_unlock_bh(&qp->state_lock);
 				break;
 			}
 
 			if (wqe && ((index != cons) ||
 				(wqe->state != wqe_state_posted))) {
 				/* comp not done yet */
-				spin_unlock_irqrestore(&qp->state_lock,
-						       flags);
+				spin_unlock_bh(&qp->state_lock);
 				break;
 			}
 
 			qp->req.state = QP_STATE_DRAINED;
-			spin_unlock_irqrestore(&qp->state_lock, flags);
+			spin_unlock_bh(&qp->state_lock);
 
 			if (qp->ibqp.event_handler) {
 				struct ib_event ev;
@@ -170,7 +156,7 @@ static struct rxe_send_wqe *req_next_wqe(struct rxe_qp *qp)
 	if (index == prod)
 		return NULL;
 
-	wqe = addr_from_index(q, index);
+	wqe = queue_addr_from_index(q, index);
 
 	if (unlikely((qp->req.state == QP_STATE_DRAIN ||
 		      qp->req.state == QP_STATE_DRAINED) &&
@@ -547,7 +533,8 @@ static void update_state(struct rxe_qp *qp, struct rxe_send_wqe *wqe,
 	qp->req.opcode = pkt->opcode;
 
 	if (pkt->mask & RXE_END_MASK)
-		qp->req.wqe_index = next_index(qp->sq.queue, qp->req.wqe_index);
+		qp->req.wqe_index = queue_next_index(qp->sq.queue,
+						     qp->req.wqe_index);
 
 	qp->need_req_skb = 0;
 
@@ -597,7 +584,7 @@ static int rxe_do_local_ops(struct rxe_qp *qp, struct rxe_send_wqe *wqe)
 
 	wqe->state = wqe_state_done;
 	wqe->status = IB_WC_SUCCESS;
-	qp->req.wqe_index = next_index(qp->sq.queue, qp->req.wqe_index);
+	qp->req.wqe_index = queue_next_index(qp->sq.queue, qp->req.wqe_index);
 
 	if ((wqe->wr.send_flags & IB_SEND_SIGNALED) ||
 	    qp->sq_sig_type == IB_SIGNAL_ALL_WR)
@@ -624,14 +611,15 @@ int rxe_requester(void *arg)
 	struct rxe_ah *ah;
 	struct rxe_av *av;
 
-	rxe_add_ref(qp);
+	rxe_get(qp);
 
 next_wqe:
 	if (unlikely(!qp->valid || qp->req.state == QP_STATE_ERROR))
 		goto exit;
 
 	if (unlikely(qp->req.state == QP_STATE_RESET)) {
-		qp->req.wqe_index = consumer_index(q, q->type);
+		qp->req.wqe_index = queue_get_consumer(q,
+						QUEUE_TYPE_FROM_CLIENT);
 		qp->req.opcode = -1;
 		qp->req.need_rd_atomic = 0;
 		qp->req.wait_psn = 0;
@@ -697,12 +685,12 @@ next_wqe:
 			wqe->last_psn = qp->req.psn;
 			qp->req.psn = (qp->req.psn + 1) & BTH_PSN_MASK;
 			qp->req.opcode = IB_OPCODE_UD_SEND_ONLY;
-			qp->req.wqe_index = next_index(qp->sq.queue,
+			qp->req.wqe_index = queue_next_index(qp->sq.queue,
 						       qp->req.wqe_index);
 			wqe->state = wqe_state_done;
 			wqe->status = IB_WC_SUCCESS;
 			__rxe_do_task(&qp->comp.task);
-			rxe_drop_ref(qp);
+			rxe_put(qp);
 			return 0;
 		}
 		payload = mtu;
@@ -741,7 +729,7 @@ next_wqe:
 	}
 
 	if (ah)
-		rxe_drop_ref(ah);
+		rxe_put(ah);
 
 	/*
 	 * To prevent a race on wqe access between requester and completer,
@@ -773,12 +761,12 @@ next_wqe:
 
 err_drop_ah:
 	if (ah)
-		rxe_drop_ref(ah);
+		rxe_put(ah);
 err:
 	wqe->state = wqe_state_error;
 	__rxe_do_task(&qp->comp.task);
 
 exit:
-	rxe_drop_ref(qp);
+	rxe_put(qp);
 	return -EAGAIN;
 }

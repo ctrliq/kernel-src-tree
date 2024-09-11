@@ -2379,6 +2379,11 @@ static bool do_nocb_deferred_wakeup(struct rcu_data *rdp)
 	return do_nocb_deferred_wakeup_common(rdp_gp, rdp, RCU_NOCB_WAKE, flags);
 }
 
+void rcu_nocb_flush_deferred_wakeup(void)
+{
+	do_nocb_deferred_wakeup(this_cpu_ptr(&rcu_data));
+}
+
 static int rdp_offload_toggle(struct rcu_data *rdp,
 			       bool offload, unsigned long flags)
 	__releases(rdp->nocb_lock)
@@ -2554,11 +2559,6 @@ int rcu_nocb_cpu_offload(int cpu)
 	return ret;
 }
 EXPORT_SYMBOL_GPL(rcu_nocb_cpu_offload);
-
-void rcu_nocb_flush_deferred_wakeup(void)
-{
-	do_nocb_deferred_wakeup(this_cpu_ptr(&rcu_data));
-}
 
 void __init rcu_init_nohz(void)
 {

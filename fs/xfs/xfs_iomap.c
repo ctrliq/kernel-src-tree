@@ -159,7 +159,7 @@ xfs_iomap_eof_align_last_fsb(
 	struct xfs_bmbt_irec	irec;
 	struct xfs_iext_cursor	icur;
 
-	ASSERT(ifp->if_flags & XFS_IFEXTENTS);
+	ASSERT(!xfs_need_iread_extents(ifp));
 
 	/*
 	 * Always round up the allocation request to the extent hint boundary.
@@ -573,7 +573,7 @@ xfs_iomap_write_unwritten(
 			i_size_write(inode, i_size);
 		i_size = xfs_new_eof(ip, i_size);
 		if (i_size) {
-			ip->i_d.di_size = i_size;
+			ip->i_disk_size = i_size;
 			xfs_trans_log_inode(tp, ip, XFS_ILOG_CORE);
 		}
 
@@ -667,7 +667,7 @@ xfs_ilock_for_iomap(
 	 * is an opencoded xfs_ilock_data_map_shared() call but with
 	 * non-blocking behaviour.
 	 */
-	if (!(ip->i_df.if_flags & XFS_IFEXTENTS)) {
+	if (xfs_need_iread_extents(&ip->i_df)) {
 		if (flags & IOMAP_NOWAIT)
 			return -EAGAIN;
 		mode = XFS_ILOCK_EXCL;

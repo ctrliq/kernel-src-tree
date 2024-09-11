@@ -57,6 +57,8 @@
 #define PSR_Z_BIT	0x40000000
 #define PSR_N_BIT	0x80000000
 
+#define PSR_BTYPE_SHIFT		10
+
 /*
  * Groups of PSR bits
  */
@@ -64,6 +66,12 @@
 #define PSR_s		0x00ff0000	/* Status		*/
 #define PSR_x		0x0000ff00	/* Extension		*/
 #define PSR_c		0x000000ff	/* Control		*/
+
+/* Convenience names for the values of PSTATE.BTYPE */
+#define PSR_BTYPE_NONE		(0b00 << PSR_BTYPE_SHIFT)
+#define PSR_BTYPE_JC		(0b01 << PSR_BTYPE_SHIFT)
+#define PSR_BTYPE_C		(0b10 << PSR_BTYPE_SHIFT)
+#define PSR_BTYPE_J		(0b11 << PSR_BTYPE_SHIFT)
 
 /* syscall emulation path in ptrace */
 #define PTRACE_SYSEMU		  31

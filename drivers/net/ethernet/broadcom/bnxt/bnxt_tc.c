@@ -2056,7 +2056,11 @@ int bnxt_init_tc(struct bnxt *bp)
 
 	tc_info->enabled = true;
 	bp->dev->hw_features |= NETIF_F_HW_TC;
-	bp->dev->features |= NETIF_F_HW_TC;
+	/*
+	 * RHEL-only.  NETIF_F_HW_TC causes extra logging to the console
+	 * which introduces latency.  Do not enable by default.
+	 */
+	/* bp->dev->features |= NETIF_F_HW_TC; */
 	bp->tc_info = tc_info;
 
 	/* init indirect block notifications */

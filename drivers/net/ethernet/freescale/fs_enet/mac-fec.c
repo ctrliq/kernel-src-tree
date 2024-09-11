@@ -18,7 +18,6 @@
 #include <linux/string.h>
 #include <linux/ptrace.h>
 #include <linux/errno.h>
-#include <linux/crc32poly.h>
 #include <linux/ioport.h>
 #include <linux/interrupt.h>
 #include <linux/delay.h>
@@ -188,7 +187,7 @@ static void set_multicast_one(struct net_device *dev, const u8 *mac)
 			msb = crc >> 31;
 			crc <<= 1;
 			if (msb ^ (byte & 0x1))
-				crc ^= CRC32_POLY_BE;
+				crc ^= FEC_CRC_POLY;
 			byte >>= 1;
 		}
 	}

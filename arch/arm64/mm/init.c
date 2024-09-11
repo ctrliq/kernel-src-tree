@@ -215,7 +215,6 @@ static void __init zone_sizes_init(unsigned long min, unsigned long max)
 	free_area_init(max_zone_pfns);
 }
 
-#ifdef CONFIG_HAVE_ARCH_PFN_VALID
 int pfn_valid(unsigned long pfn)
 {
 	phys_addr_t addr = pfn << PAGE_SHIFT;
@@ -233,7 +232,6 @@ int pfn_valid(unsigned long pfn)
 	return memblock_is_map_memory(addr);
 }
 EXPORT_SYMBOL(pfn_valid);
-#endif
 
 #ifndef CONFIG_SPARSEMEM
 static void __init arm64_memory_present(void)
@@ -607,9 +605,14 @@ static int keep_initrd __initdata;
 
 void __init free_initrd_mem(unsigned long start, unsigned long end)
 {
+	unsigned long aligned_start, aligned_end;
+
 	if (!keep_initrd) {
+		aligned_start = __virt_to_phys(start) & PAGE_MASK;
+		aligned_end = PAGE_ALIGN(__virt_to_phys(end));
+
+		memblock_free(aligned_start, aligned_end - aligned_start);
 		free_reserved_area((void *)start, (void *)end, 0, "initrd");
-		memblock_free(__virt_to_phys(start), end - start);
 	}
 }
 

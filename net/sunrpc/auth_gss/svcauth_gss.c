@@ -206,7 +206,7 @@ static int rsi_parse(struct cache_detail *cd,
 	int len;
 	struct rsi rsii, *rsip = NULL;
 	time64_t expiry;
-	int status = -EINVAL;
+	int status;
 
 	memset(&rsii, 0, sizeof(rsii));
 	/* handle */

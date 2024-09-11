@@ -210,7 +210,7 @@ xfs_inode_item_format_data_fork(
 			 */
 			data_bytes = roundup(ip->i_df.if_bytes, 4);
 			ASSERT(ip->i_df.if_u1.if_data != NULL);
-			ASSERT(ip->i_d.di_size > 0);
+			ASSERT(ip->i_disk_size > 0);
 			xlog_copy_iovec(lv, vecp, XLOG_REG_TYPE_ILOCAL,
 					ip->i_df.if_u1.if_data, data_bytes);
 			ilf->ilf_dsize = (unsigned)data_bytes;
@@ -364,7 +364,6 @@ xfs_inode_to_log_dinode(
 	struct xfs_log_dinode	*to,
 	xfs_lsn_t		lsn)
 {
-	struct xfs_icdinode	*from = &ip->i_d;
 	struct inode		*inode = VFS_I(ip);
 
 	to->di_magic = XFS_DINODE_MAGIC;
@@ -383,14 +382,14 @@ xfs_inode_to_log_dinode(
 	to->di_gen = inode->i_generation;
 	to->di_mode = inode->i_mode;
 
-	to->di_size = from->di_size;
-	to->di_nblocks = from->di_nblocks;
-	to->di_extsize = from->di_extsize;
+	to->di_size = ip->i_disk_size;
+	to->di_nblocks = ip->i_nblocks;
+	to->di_extsize = ip->i_extsize;
 	to->di_nextents = xfs_ifork_nextents(&ip->i_df);
 	to->di_anextents = xfs_ifork_nextents(ip->i_afp);
-	to->di_forkoff = from->di_forkoff;
+	to->di_forkoff = ip->i_forkoff;
 	to->di_aformat = xfs_ifork_format(ip->i_afp);
-	to->di_flags = from->di_flags;
+	to->di_flags = ip->i_diflags;
 
 	xfs_copy_dm_fields_to_log_dinode(ip, to);
 
@@ -400,9 +399,9 @@ xfs_inode_to_log_dinode(
 	if (xfs_sb_version_has_v3inode(&ip->i_mount->m_sb)) {
 		to->di_version = 3;
 		to->di_changecount = inode_peek_iversion(inode);
-		to->di_crtime = xfs_inode_to_log_dinode_ts(ip, from->di_crtime);
-		to->di_flags2 = from->di_flags2;
-		to->di_cowextsize = from->di_cowextsize;
+		to->di_crtime = xfs_inode_to_log_dinode_ts(ip, ip->i_crtime);
+		to->di_flags2 = ip->i_diflags2;
+		to->di_cowextsize = ip->i_cowextsize;
 		to->di_ino = ip->i_ino;
 		to->di_lsn = lsn;
 		memset(to->di_pad2, 0, sizeof(to->di_pad2));
@@ -410,7 +409,7 @@ xfs_inode_to_log_dinode(
 		to->di_flushiter = 0;
 	} else {
 		to->di_version = 2;
-		to->di_flushiter = from->di_flushiter;
+		to->di_flushiter = ip->i_flushiter;
 	}
 }
 
