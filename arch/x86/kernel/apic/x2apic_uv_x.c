@@ -43,7 +43,7 @@
 #include <asm/x86_init.h>
 #include <asm/nmi.h>
 
-DEFINE_PER_CPU(int, x2apic_extra_bits);
+static DEFINE_PER_CPU(int, x2apic_extra_bits);
 
 static enum uv_system_type	uv_system_type;
 static int			uv_hubbed_system;
