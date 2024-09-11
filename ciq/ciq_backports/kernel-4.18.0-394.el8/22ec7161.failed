@@ -1,0 +1,96 @@
+arm64: io: Relax implicit barriers in default I/O accessors
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-394.el8
+commit-author Will Deacon <will.deacon@arm.com>
+commit 22ec71615d824f4f11d38d0e55a88d8956b7e45f
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-394.el8/22ec7161.failed
+
+The arm64 implementation of the default I/O accessors requires barrier
+instructions to satisfy the memory ordering requirements documented in
+memory-barriers.txt [1], which are largely derived from the behaviour of
+I/O accesses on x86.
+
+Of particular interest are the requirements that a write to a device
+must be ordered against prior writes to memory, and a read from a device
+must be ordered against subsequent reads from memory. We satisfy these
+requirements using various flavours of DSB: the most expensive barrier
+we have, since it implies completion of prior accesses. This was deemed
+necessary when we first implemented the accessors, since accesses to
+different endpoints could propagate independently and therefore the only
+way to enforce order is to rely on completion guarantees [2].
+
+Since then, the Armv8 memory model has been retrospectively strengthened
+to require "other-multi-copy atomicity", a property that requires memory
+accesses from an observer to become visible to all other observers
+simultaneously [3]. In other words, propagation of accesses is limited
+to transitioning from locally observed to globally observed. It recently
+became apparent that this change also has a subtle impact on our I/O
+accessors for shared peripherals, allowing us to use the cheaper DMB
+instruction instead.
+
+As a concrete example, consider the following:
+
+	memcpy(dma_buffer, data, bufsz);
+	writel(DMA_START, dev->ctrl_reg);
+
+A DMB ST instruction between the final write to the DMA buffer and the
+write to the control register will ensure that the writes to the DMA
+buffer are observed before the write to the control register by all
+observers. Put another way, if an observer can see the write to the
+control register, it can also see the writes to memory. This has always
+been the case and is not sufficient to provide the ordering required by
+Linux, since there is no guarantee that the master interface of the
+DMA-capable device has observed either of the accesses. However, in an
+other-multi-copy atomic world, we can infer two things:
+
+  1. A write arriving at an endpoint shared between multiple CPUs is
+     visible to all CPUs
+
+  2. A write that is visible to all CPUs is also visible to all other
+     observers in the shareability domain
+
+Pieced together, this allows us to use DMB OSHST for our default I/O
+write accessors and DMB OSHLD for our default I/O read accessors (the
+outer-shareability is for handling non-cacheable mappings) for shared
+devices. Memory-mapped, DMA-capable peripherals that are private to a
+CPU (i.e. inaccessible to other CPUs) still require the DSB, however
+these are few and far between and typically require special treatment
+anyway which is outside of the scope of the portable driver API (e.g.
+GIC, page-table walker, SPE profiler).
+
+Note that our mandatory barriers remain as DSBs, since there are cases
+where they are used to flush the store buffer of the CPU, e.g. when
+publishing page table updates to the SMMU.
+
+[1] https://git.kernel.org/linus/4614bbdee357
+[2] https://www.youtube.com/watch?v=i6DayghhA8Q
+[3] https://www.cl.cam.ac.uk/~pes20/armv8-mca/
+
+	Reviewed-by: Catalin Marinas <catalin.marinas@arm.com>
+	Signed-off-by: Will Deacon <will.deacon@arm.com>
+(cherry picked from commit 22ec71615d824f4f11d38d0e55a88d8956b7e45f)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/arm64/include/asm/io.h
+diff --cc arch/arm64/include/asm/io.h
+index 0688d4750754,e9763831186a..000000000000
+--- a/arch/arm64/include/asm/io.h
++++ b/arch/arm64/include/asm/io.h
+@@@ -122,8 -109,7 +122,12 @@@ static inline u64 __raw_readq(const vol
+  })
+  
+  #define __io_par(v)		__iormb(v)
+++<<<<<<< HEAD
+ +#define __iowmb()		wmb()
+ +#define __iomb()		dma_mb()
+++=======
++ #define __iowmb()		dma_wmb()
+++>>>>>>> 22ec71615d82 (arm64: io: Relax implicit barriers in default I/O accessors)
+  
+  /*
+   * Relaxed I/O memory access primitives. These follow the Device memory
+* Unmerged path arch/arm64/include/asm/io.h
