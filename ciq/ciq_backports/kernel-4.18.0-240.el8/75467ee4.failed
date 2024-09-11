@@ -1,0 +1,187 @@
+dma-direct: improve DMA mask overflow reporting
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Christoph Hellwig <hch@lst.de>
+commit 75467ee48a5e04cf3ae3cb39aea6adee73aeff91
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/75467ee4.failed
+
+Remove the unset dma_mask case as that won't get into mapping calls
+anymore, and also report the other errors unconditonally and with a
+slightly improved message.  Remove the now pointless report_addr helper.
+
+	Signed-off-by: Christoph Hellwig <hch@lst.de>
+	Reviewed-by: Konrad Rzeszutek Wilk <konrad@darnok.org>
+(cherry picked from commit 75467ee48a5e04cf3ae3cb39aea6adee73aeff91)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	kernel/dma/direct.c
+diff --cc kernel/dma/direct.c
+index f4581748eeeb,ac7956c38f69..000000000000
+--- a/kernel/dma/direct.c
++++ b/kernel/dma/direct.c
+@@@ -16,25 -17,12 +16,28 @@@
+  #include <linux/swiotlb.h>
+  
+  /*
+ - * Most architectures use ZONE_DMA for the first 16 Megabytes, but some use it
+ - * it for entirely different regions. In that case the arch code needs to
+ - * override the variable below for dma-direct to work properly.
+ + * Most architectures use ZONE_DMA for the first 16 Megabytes, but
+ + * some use it for entirely different regions:
+   */
+ -unsigned int zone_dma_bits __ro_after_init = 24;
+ +#ifndef ARCH_ZONE_DMA_BITS
+ +#define ARCH_ZONE_DMA_BITS 24
+ +#endif
+ +
+++<<<<<<< HEAD
+ +static void report_addr(struct device *dev, dma_addr_t dma_addr, size_t size)
+ +{
+ +	if (!dev->dma_mask) {
+ +		dev_err_once(dev, "DMA map on device without dma_mask\n");
+ +	} else if (*dev->dma_mask >= DMA_BIT_MASK(32) || dev->bus_dma_mask) {
+ +		dev_err_once(dev,
+ +			"overflow %pad+%zu of DMA mask %llx bus mask %llx\n",
+ +			&dma_addr, size, *dev->dma_mask, dev->bus_dma_mask);
+ +	}
+ +	WARN_ON_ONCE(1);
+ +}
+  
+++=======
+++>>>>>>> 75467ee48a5e (dma-direct: improve DMA mask overflow reporting)
+  static inline dma_addr_t phys_to_dma_direct(struct device *dev,
+  		phys_addr_t phys)
+  {
+@@@ -331,9 -352,16 +334,22 @@@ dma_addr_t dma_direct_map_page(struct d
+  	phys_addr_t phys = page_to_phys(page) + offset;
+  	dma_addr_t dma_addr = phys_to_dma(dev, phys);
+  
+++<<<<<<< HEAD
+ +	if (unlikely(!dma_direct_possible(dev, dma_addr, size)) &&
+ +	    !swiotlb_map(dev, &phys, &dma_addr, size, dir, attrs)) {
+ +		report_addr(dev, dma_addr, size);
+++=======
++ 	if (unlikely(swiotlb_force == SWIOTLB_FORCE))
++ 		return swiotlb_map(dev, phys, size, dir, attrs);
++ 
++ 	if (unlikely(!dma_capable(dev, dma_addr, size, true))) {
++ 		if (swiotlb_force != SWIOTLB_NO_FORCE)
++ 			return swiotlb_map(dev, phys, size, dir, attrs);
++ 
++ 		dev_WARN_ONCE(dev, 1,
++ 			     "DMA addr %pad+%zu overflow (mask %llx, bus limit %llx).\n",
++ 			     &dma_addr, size, *dev->dma_mask, dev->bus_dma_limit);
+++>>>>>>> 75467ee48a5e (dma-direct: improve DMA mask overflow reporting)
+  		return DMA_MAPPING_ERROR;
+  	}
+  
+@@@ -365,22 -393,88 +381,95 @@@ out_unmap
+  }
+  EXPORT_SYMBOL(dma_direct_map_sg);
+  
+++<<<<<<< HEAD
+ +/*
+ + * Because 32-bit DMA masks are so common we expect every architecture to be
+ + * able to satisfy them - either by not supporting more physical memory, or by
+ + * providing a ZONE_DMA32.  If neither is the case, the architecture needs to
+ + * use an IOMMU instead of the direct mapping.
+ + */
+++=======
++ dma_addr_t dma_direct_map_resource(struct device *dev, phys_addr_t paddr,
++ 		size_t size, enum dma_data_direction dir, unsigned long attrs)
++ {
++ 	dma_addr_t dma_addr = paddr;
++ 
++ 	if (unlikely(!dma_capable(dev, dma_addr, size, false))) {
++ 		dev_err_once(dev,
++ 			     "DMA addr %pad+%zu overflow (mask %llx, bus limit %llx).\n",
++ 			     &dma_addr, size, *dev->dma_mask, dev->bus_dma_limit);
++ 		WARN_ON_ONCE(1);
++ 		return DMA_MAPPING_ERROR;
++ 	}
++ 
++ 	return dma_addr;
++ }
++ EXPORT_SYMBOL(dma_direct_map_resource);
++ 
++ int dma_direct_get_sgtable(struct device *dev, struct sg_table *sgt,
++ 		void *cpu_addr, dma_addr_t dma_addr, size_t size,
++ 		unsigned long attrs)
++ {
++ 	struct page *page = dma_direct_to_page(dev, dma_addr);
++ 	int ret;
++ 
++ 	ret = sg_alloc_table(sgt, 1, GFP_KERNEL);
++ 	if (!ret)
++ 		sg_set_page(sgt->sgl, page, PAGE_ALIGN(size), 0);
++ 	return ret;
++ }
++ 
++ #ifdef CONFIG_MMU
++ bool dma_direct_can_mmap(struct device *dev)
++ {
++ 	return dev_is_dma_coherent(dev) ||
++ 		IS_ENABLED(CONFIG_DMA_NONCOHERENT_MMAP);
++ }
++ 
++ int dma_direct_mmap(struct device *dev, struct vm_area_struct *vma,
++ 		void *cpu_addr, dma_addr_t dma_addr, size_t size,
++ 		unsigned long attrs)
++ {
++ 	unsigned long user_count = vma_pages(vma);
++ 	unsigned long count = PAGE_ALIGN(size) >> PAGE_SHIFT;
++ 	unsigned long pfn = PHYS_PFN(dma_to_phys(dev, dma_addr));
++ 	int ret = -ENXIO;
++ 
++ 	vma->vm_page_prot = dma_pgprot(dev, vma->vm_page_prot, attrs);
++ 
++ 	if (dma_mmap_from_dev_coherent(dev, vma, cpu_addr, size, &ret))
++ 		return ret;
++ 
++ 	if (vma->vm_pgoff >= count || user_count > count - vma->vm_pgoff)
++ 		return -ENXIO;
++ 	return remap_pfn_range(vma, vma->vm_start, pfn + vma->vm_pgoff,
++ 			user_count << PAGE_SHIFT, vma->vm_page_prot);
++ }
++ #else /* CONFIG_MMU */
++ bool dma_direct_can_mmap(struct device *dev)
++ {
++ 	return false;
++ }
++ 
++ int dma_direct_mmap(struct device *dev, struct vm_area_struct *vma,
++ 		void *cpu_addr, dma_addr_t dma_addr, size_t size,
++ 		unsigned long attrs)
++ {
++ 	return -ENXIO;
++ }
++ #endif /* CONFIG_MMU */
++ 
+++>>>>>>> 75467ee48a5e (dma-direct: improve DMA mask overflow reporting)
+  int dma_direct_supported(struct device *dev, u64 mask)
+  {
+ -	u64 min_mask = (max_pfn - 1) << PAGE_SHIFT;
+ +	u64 min_mask;
+  
+ -	/*
+ -	 * Because 32-bit DMA masks are so common we expect every architecture
+ -	 * to be able to satisfy them - either by not supporting more physical
+ -	 * memory, or by providing a ZONE_DMA32.  If neither is the case, the
+ -	 * architecture needs to use an IOMMU instead of the direct mapping.
+ -	 */
+ -	if (mask >= DMA_BIT_MASK(32))
+ -		return 1;
+ +	if (IS_ENABLED(CONFIG_ZONE_DMA))
+ +		min_mask = DMA_BIT_MASK(ARCH_ZONE_DMA_BITS);
+ +	else
+ +		min_mask = DMA_BIT_MASK(32);
+ +
+ +	min_mask = min_t(u64, min_mask, (max_pfn - 1) << PAGE_SHIFT);
+  
+  	/*
+  	 * This check needs to be against the actual bit mask value, so
+* Unmerged path kernel/dma/direct.c
