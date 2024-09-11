@@ -1,0 +1,281 @@
+libbpf: fix libbpf_print
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-147.el8
+commit-author Stanislav Fomichev <sdf@google.com>
+commit a8a1f7d09cfc7e18874786c7634c9e71384fcd4e
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-147.el8/a8a1f7d0.failed
+
+With the recent print rework we now have the following problem:
+pr_{warning,info,debug} expand to __pr which calls libbpf_print.
+libbpf_print does va_start and calls __libbpf_pr with va_list argument.
+In __base_pr we again do va_start. Because the next argument is a
+va_list, we don't get correct pointer to the argument (and print noting
+in my case, I don't know why it doesn't crash tbh).
+
+Fix this by changing libbpf_print_fn_t signature to accept va_list and
+remove unneeded calls to va_start in the existing users.
+
+Alternatively, this can we solved by exporting __libbpf_pr and
+changing __pr macro to (and killing libbpf_print):
+{
+	if (__libbpf_pr)
+		__libbpf_pr(level, "libbpf: " fmt, ##__VA_ARGS__)
+}
+
+	Signed-off-by: Stanislav Fomichev <sdf@google.com>
+	Acked-by: Yonghong Song <yhs@fb.com>
+	Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+(cherry picked from commit a8a1f7d09cfc7e18874786c7634c9e71384fcd4e)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	tools/lib/bpf/libbpf.c
+#	tools/lib/bpf/libbpf.h
+#	tools/perf/util/bpf-loader.c
+#	tools/testing/selftests/bpf/test_btf.c
+#	tools/testing/selftests/bpf/test_libbpf_open.c
+#	tools/testing/selftests/bpf/test_progs.c
+diff --cc tools/lib/bpf/libbpf.c
+index 0b70ceb786a6,47969aa0faf8..000000000000
+--- a/tools/lib/bpf/libbpf.c
++++ b/tools/lib/bpf/libbpf.c
+@@@ -65,39 -54,33 +65,52 @@@
+  
+  #define __printf(a, b)	__attribute__((format(printf, a, b)))
+  
+++<<<<<<< HEAD
+ +__printf(1, 2)
+ +static int __base_pr(const char *format, ...)
+ +{
+ +	va_list args;
+ +	int err;
+ +
+ +	va_start(args, format);
+ +	err = vfprintf(stderr, format, args);
+ +	va_end(args);
+ +	return err;
+ +}
+ +
+ +static __printf(1, 2) libbpf_print_fn_t __pr_warning = __base_pr;
+ +static __printf(1, 2) libbpf_print_fn_t __pr_info = __base_pr;
+ +static __printf(1, 2) libbpf_print_fn_t __pr_debug;
+++=======
++ static int __base_pr(enum libbpf_print_level level, const char *format,
++ 		     va_list args)
++ {
++ 	if (level == LIBBPF_DEBUG)
++ 		return 0;
++ 
++ 	return vfprintf(stderr, format, args);
++ }
++ 
++ static libbpf_print_fn_t __libbpf_pr = __base_pr;
+++>>>>>>> a8a1f7d09cfc (libbpf: fix libbpf_print)
+  
+ -void libbpf_set_print(libbpf_print_fn_t fn)
+ -{
+ -	__libbpf_pr = fn;
+ -}
+ +#define __pr(func, fmt, ...)	\
+ +do {				\
+ +	if ((func))		\
+ +		(func)("libbpf: " fmt, ##__VA_ARGS__); \
+ +} while (0)
+  
+ -__printf(2, 3)
+ -void libbpf_print(enum libbpf_print_level level, const char *format, ...)
+ -{
+ -	va_list args;
+ -
+ -	if (!__libbpf_pr)
+ -		return;
+ +#define pr_warning(fmt, ...)	__pr(__pr_warning, fmt, ##__VA_ARGS__)
+ +#define pr_info(fmt, ...)	__pr(__pr_info, fmt, ##__VA_ARGS__)
+ +#define pr_debug(fmt, ...)	__pr(__pr_debug, fmt, ##__VA_ARGS__)
+  
+ -	va_start(args, format);
+ -	__libbpf_pr(level, format, args);
+ -	va_end(args);
+ +void libbpf_set_print(libbpf_print_fn_t warn,
+ +		      libbpf_print_fn_t info,
+ +		      libbpf_print_fn_t debug)
+ +{
+ +	__pr_warning = warn;
+ +	__pr_info = info;
+ +	__pr_debug = debug;
+  }
+  
+  #define STRERR_BUFSIZE  128
+diff --cc tools/lib/bpf/libbpf.h
+index c8c168c73302,69a7c25eaccc..000000000000
+--- a/tools/lib/bpf/libbpf.h
++++ b/tools/lib/bpf/libbpf.h
+@@@ -49,19 -44,19 +49,26 @@@ enum libbpf_errno 
+  	__LIBBPF_ERRNO__END,
+  };
+  
+ -LIBBPF_API int libbpf_strerror(int err, char *buf, size_t size);
+ -
+ -enum libbpf_print_level {
+ -        LIBBPF_WARN,
+ -        LIBBPF_INFO,
+ -        LIBBPF_DEBUG,
+ -};
+ +int libbpf_strerror(int err, char *buf, size_t size);
+  
+ +/*
+ + * __printf is defined in include/linux/compiler-gcc.h. However,
+ + * it would be better if libbpf.h didn't depend on Linux header files.
+ + * So instead of __printf, here we use gcc attribute directly.
+ + */
+ +typedef int (*libbpf_print_fn_t)(const char *, ...)
+ +	__attribute__((format(printf, 1, 2)));
+ +
+++<<<<<<< HEAD
+ +void libbpf_set_print(libbpf_print_fn_t warn,
+ +		      libbpf_print_fn_t info,
+ +		      libbpf_print_fn_t debug);
+++=======
++ typedef int (*libbpf_print_fn_t)(enum libbpf_print_level level,
++ 				 const char *, va_list ap);
++ 
++ LIBBPF_API void libbpf_set_print(libbpf_print_fn_t fn);
+++>>>>>>> a8a1f7d09cfc (libbpf: fix libbpf_print)
+  
+  /* Hide internal to user */
+  struct bpf_object;
+diff --cc tools/perf/util/bpf-loader.c
+index f9ae1a993806,037d8ff6a634..000000000000
+--- a/tools/perf/util/bpf-loader.c
++++ b/tools/perf/util/bpf-loader.c
+@@@ -24,22 -24,12 +24,29 @@@
+  #include "llvm-utils.h"
+  #include "c++/clang-c.h"
+  
+++<<<<<<< HEAD
+ +#define DEFINE_PRINT_FN(name, level) \
+ +static int libbpf_##name(const char *fmt, ...)	\
+ +{						\
+ +	va_list args;				\
+ +	int ret;				\
+ +						\
+ +	va_start(args, fmt);			\
+ +	ret = veprintf(level, verbose, pr_fmt(fmt), args);\
+ +	va_end(args);				\
+ +	return ret;				\
+++=======
++ static int libbpf_perf_print(enum libbpf_print_level level __attribute__((unused)),
++ 			      const char *fmt, va_list args)
++ {
++ 	return veprintf(1, verbose, pr_fmt(fmt), args);
+++>>>>>>> a8a1f7d09cfc (libbpf: fix libbpf_print)
+  }
+  
+ +DEFINE_PRINT_FN(warning, 1)
+ +DEFINE_PRINT_FN(info, 1)
+ +DEFINE_PRINT_FN(debug, 1)
+ +
+  struct bpf_prog_priv {
+  	bool is_tp;
+  	char *sys_name;
+diff --cc tools/testing/selftests/bpf/test_btf.c
+index 0a92808bc0e9,5afab823ffbe..000000000000
+--- a/tools/testing/selftests/bpf/test_btf.c
++++ b/tools/testing/selftests/bpf/test_btf.c
+@@@ -50,18 -52,10 +50,17 @@@ static int count_result(int err
+  	return err;
+  }
+  
+++<<<<<<< HEAD
+ +#define __printf(a, b)	__attribute__((format(printf, a, b)))
+ +
+ +__printf(1, 2)
+ +static int __base_pr(const char *format, ...)
+++=======
++ static int __base_pr(enum libbpf_print_level level __attribute__((unused)),
++ 		     const char *format, va_list args)
+++>>>>>>> a8a1f7d09cfc (libbpf: fix libbpf_print)
+  {
+- 	va_list args;
+- 	int err;
+- 
+- 	va_start(args, format);
+- 	err = vfprintf(stderr, format, args);
+- 	va_end(args);
+- 	return err;
++ 	return vfprintf(stderr, format, args);
+  }
+  
+  #define BTF_INFO_ENC(kind, kind_flag, vlen)			\
+diff --cc tools/testing/selftests/bpf/test_libbpf_open.c
+index 8fcd1c076add,1909ecf4d999..000000000000
+--- a/tools/testing/selftests/bpf/test_libbpf_open.c
++++ b/tools/testing/selftests/bpf/test_libbpf_open.c
+@@@ -34,23 -34,16 +34,35 @@@ static void usage(char *argv[]
+  	printf("\n");
+  }
+  
+++<<<<<<< HEAD
+ +#define DEFINE_PRINT_FN(name, enabled) \
+ +static int libbpf_##name(const char *fmt, ...)  	\
+ +{							\
+ +        va_list args;					\
+ +        int ret;					\
+ +							\
+ +        va_start(args, fmt);				\
+ +	if (enabled) {					\
+ +		fprintf(stderr, "[" #name "] ");	\
+ +		ret = vfprintf(stderr, fmt, args);	\
+ +	}						\
+ +        va_end(args);					\
+ +        return ret;					\
+++=======
++ static bool debug = 0;
++ static int libbpf_debug_print(enum libbpf_print_level level,
++ 			      const char *fmt, va_list args)
++ {
++ 	if (level == LIBBPF_DEBUG && !debug)
++ 		return 0;
++ 
++ 	fprintf(stderr, "[%d] ", level);
++ 	return vfprintf(stderr, fmt, args);
+++>>>>>>> a8a1f7d09cfc (libbpf: fix libbpf_print)
+  }
+ +DEFINE_PRINT_FN(warning, 1)
+ +DEFINE_PRINT_FN(info, 1)
+ +DEFINE_PRINT_FN(debug, 1)
+  
+  #define EXIT_FAIL_LIBBPF EXIT_FAILURE
+  #define EXIT_FAIL_OPTION 2
+diff --cc tools/testing/selftests/bpf/test_progs.c
+index 50acaea2cfd4,c52bd90fbb34..000000000000
+--- a/tools/testing/selftests/bpf/test_progs.c
++++ b/tools/testing/selftests/bpf/test_progs.c
+@@@ -1780,6 -1784,15 +1780,18 @@@ static void test_task_fd_query_tp(void
+  				   "sys_enter_read");
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static int libbpf_debug_print(enum libbpf_print_level level,
++ 			      const char *format, va_list args)
++ {
++ 	if (level == LIBBPF_DEBUG)
++ 		return 0;
++ 
++ 	return vfprintf(stderr, format, args);
++ }
++ 
+++>>>>>>> a8a1f7d09cfc (libbpf: fix libbpf_print)
+  static void test_reference_tracking()
+  {
+  	const char *file = "./test_sk_lookup_kern.o";
+* Unmerged path tools/lib/bpf/libbpf.c
+* Unmerged path tools/lib/bpf/libbpf.h
+* Unmerged path tools/perf/util/bpf-loader.c
+* Unmerged path tools/testing/selftests/bpf/test_btf.c
+* Unmerged path tools/testing/selftests/bpf/test_libbpf_open.c
+* Unmerged path tools/testing/selftests/bpf/test_progs.c
