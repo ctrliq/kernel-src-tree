@@ -1,0 +1,579 @@
+KVM: SVM: use .prepare_guest_switch() to handle CPU register save/setup
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-310.el8
+commit-author Michael Roth <michael.roth@amd.com>
+commit a7fc06dd2f14f88e611a968f7efa6532cdd5529a
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-310.el8/a7fc06dd.failed
+
+Currently we save host state like user-visible host MSRs, and do some
+initial guest register setup for MSR_TSC_AUX and MSR_AMD64_TSC_RATIO
+in svm_vcpu_load(). Defer this until just before we enter the guest by
+moving the handling to kvm_x86_ops.prepare_guest_switch() similarly to
+how it is done for the VMX implementation.
+
+Additionally, since handling of saving/restoring host user MSRs is the
+same both with/without SEV-ES enabled, move that handling to common
+code.
+
+	Suggested-by: Sean Christopherson <seanjc@google.com>
+	Signed-off-by: Michael Roth <michael.roth@amd.com>
+Message-Id: <20210202190126.2185715-4-michael.roth@amd.com>
+	Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+(cherry picked from commit a7fc06dd2f14f88e611a968f7efa6532cdd5529a)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kvm/svm/sev.c
+#	arch/x86/kvm/svm/svm.c
+#	arch/x86/kvm/svm/svm.h
+diff --cc arch/x86/kvm/svm/sev.c
+index ee83ab312c36,874ea309279f..000000000000
+--- a/arch/x86/kvm/svm/sev.c
++++ b/arch/x86/kvm/svm/sev.c
+@@@ -1366,3 -1722,387 +1366,390 @@@ void pre_sev_run(struct vcpu_svm *svm, 
+  	svm->vmcb->control.tlb_ctl = TLB_CONTROL_FLUSH_ASID;
+  	vmcb_mark_dirty(svm->vmcb, VMCB_ASID);
+  }
+++<<<<<<< HEAD
+++=======
++ 
++ #define GHCB_SCRATCH_AREA_LIMIT		(16ULL * PAGE_SIZE)
++ static bool setup_vmgexit_scratch(struct vcpu_svm *svm, bool sync, u64 len)
++ {
++ 	struct vmcb_control_area *control = &svm->vmcb->control;
++ 	struct ghcb *ghcb = svm->ghcb;
++ 	u64 ghcb_scratch_beg, ghcb_scratch_end;
++ 	u64 scratch_gpa_beg, scratch_gpa_end;
++ 	void *scratch_va;
++ 
++ 	scratch_gpa_beg = ghcb_get_sw_scratch(ghcb);
++ 	if (!scratch_gpa_beg) {
++ 		pr_err("vmgexit: scratch gpa not provided\n");
++ 		return false;
++ 	}
++ 
++ 	scratch_gpa_end = scratch_gpa_beg + len;
++ 	if (scratch_gpa_end < scratch_gpa_beg) {
++ 		pr_err("vmgexit: scratch length (%#llx) not valid for scratch address (%#llx)\n",
++ 		       len, scratch_gpa_beg);
++ 		return false;
++ 	}
++ 
++ 	if ((scratch_gpa_beg & PAGE_MASK) == control->ghcb_gpa) {
++ 		/* Scratch area begins within GHCB */
++ 		ghcb_scratch_beg = control->ghcb_gpa +
++ 				   offsetof(struct ghcb, shared_buffer);
++ 		ghcb_scratch_end = control->ghcb_gpa +
++ 				   offsetof(struct ghcb, reserved_1);
++ 
++ 		/*
++ 		 * If the scratch area begins within the GHCB, it must be
++ 		 * completely contained in the GHCB shared buffer area.
++ 		 */
++ 		if (scratch_gpa_beg < ghcb_scratch_beg ||
++ 		    scratch_gpa_end > ghcb_scratch_end) {
++ 			pr_err("vmgexit: scratch area is outside of GHCB shared buffer area (%#llx - %#llx)\n",
++ 			       scratch_gpa_beg, scratch_gpa_end);
++ 			return false;
++ 		}
++ 
++ 		scratch_va = (void *)svm->ghcb;
++ 		scratch_va += (scratch_gpa_beg - control->ghcb_gpa);
++ 	} else {
++ 		/*
++ 		 * The guest memory must be read into a kernel buffer, so
++ 		 * limit the size
++ 		 */
++ 		if (len > GHCB_SCRATCH_AREA_LIMIT) {
++ 			pr_err("vmgexit: scratch area exceeds KVM limits (%#llx requested, %#llx limit)\n",
++ 			       len, GHCB_SCRATCH_AREA_LIMIT);
++ 			return false;
++ 		}
++ 		scratch_va = kzalloc(len, GFP_KERNEL);
++ 		if (!scratch_va)
++ 			return false;
++ 
++ 		if (kvm_read_guest(svm->vcpu.kvm, scratch_gpa_beg, scratch_va, len)) {
++ 			/* Unable to copy scratch area from guest */
++ 			pr_err("vmgexit: kvm_read_guest for scratch area failed\n");
++ 
++ 			kfree(scratch_va);
++ 			return false;
++ 		}
++ 
++ 		/*
++ 		 * The scratch area is outside the GHCB. The operation will
++ 		 * dictate whether the buffer needs to be synced before running
++ 		 * the vCPU next time (i.e. a read was requested so the data
++ 		 * must be written back to the guest memory).
++ 		 */
++ 		svm->ghcb_sa_sync = sync;
++ 		svm->ghcb_sa_free = true;
++ 	}
++ 
++ 	svm->ghcb_sa = scratch_va;
++ 	svm->ghcb_sa_len = len;
++ 
++ 	return true;
++ }
++ 
++ static void set_ghcb_msr_bits(struct vcpu_svm *svm, u64 value, u64 mask,
++ 			      unsigned int pos)
++ {
++ 	svm->vmcb->control.ghcb_gpa &= ~(mask << pos);
++ 	svm->vmcb->control.ghcb_gpa |= (value & mask) << pos;
++ }
++ 
++ static u64 get_ghcb_msr_bits(struct vcpu_svm *svm, u64 mask, unsigned int pos)
++ {
++ 	return (svm->vmcb->control.ghcb_gpa >> pos) & mask;
++ }
++ 
++ static void set_ghcb_msr(struct vcpu_svm *svm, u64 value)
++ {
++ 	svm->vmcb->control.ghcb_gpa = value;
++ }
++ 
++ static int sev_handle_vmgexit_msr_protocol(struct vcpu_svm *svm)
++ {
++ 	struct vmcb_control_area *control = &svm->vmcb->control;
++ 	struct kvm_vcpu *vcpu = &svm->vcpu;
++ 	u64 ghcb_info;
++ 	int ret = 1;
++ 
++ 	ghcb_info = control->ghcb_gpa & GHCB_MSR_INFO_MASK;
++ 
++ 	trace_kvm_vmgexit_msr_protocol_enter(svm->vcpu.vcpu_id,
++ 					     control->ghcb_gpa);
++ 
++ 	switch (ghcb_info) {
++ 	case GHCB_MSR_SEV_INFO_REQ:
++ 		set_ghcb_msr(svm, GHCB_MSR_SEV_INFO(GHCB_VERSION_MAX,
++ 						    GHCB_VERSION_MIN,
++ 						    sev_enc_bit));
++ 		break;
++ 	case GHCB_MSR_CPUID_REQ: {
++ 		u64 cpuid_fn, cpuid_reg, cpuid_value;
++ 
++ 		cpuid_fn = get_ghcb_msr_bits(svm,
++ 					     GHCB_MSR_CPUID_FUNC_MASK,
++ 					     GHCB_MSR_CPUID_FUNC_POS);
++ 
++ 		/* Initialize the registers needed by the CPUID intercept */
++ 		vcpu->arch.regs[VCPU_REGS_RAX] = cpuid_fn;
++ 		vcpu->arch.regs[VCPU_REGS_RCX] = 0;
++ 
++ 		ret = svm_invoke_exit_handler(svm, SVM_EXIT_CPUID);
++ 		if (!ret) {
++ 			ret = -EINVAL;
++ 			break;
++ 		}
++ 
++ 		cpuid_reg = get_ghcb_msr_bits(svm,
++ 					      GHCB_MSR_CPUID_REG_MASK,
++ 					      GHCB_MSR_CPUID_REG_POS);
++ 		if (cpuid_reg == 0)
++ 			cpuid_value = vcpu->arch.regs[VCPU_REGS_RAX];
++ 		else if (cpuid_reg == 1)
++ 			cpuid_value = vcpu->arch.regs[VCPU_REGS_RBX];
++ 		else if (cpuid_reg == 2)
++ 			cpuid_value = vcpu->arch.regs[VCPU_REGS_RCX];
++ 		else
++ 			cpuid_value = vcpu->arch.regs[VCPU_REGS_RDX];
++ 
++ 		set_ghcb_msr_bits(svm, cpuid_value,
++ 				  GHCB_MSR_CPUID_VALUE_MASK,
++ 				  GHCB_MSR_CPUID_VALUE_POS);
++ 
++ 		set_ghcb_msr_bits(svm, GHCB_MSR_CPUID_RESP,
++ 				  GHCB_MSR_INFO_MASK,
++ 				  GHCB_MSR_INFO_POS);
++ 		break;
++ 	}
++ 	case GHCB_MSR_TERM_REQ: {
++ 		u64 reason_set, reason_code;
++ 
++ 		reason_set = get_ghcb_msr_bits(svm,
++ 					       GHCB_MSR_TERM_REASON_SET_MASK,
++ 					       GHCB_MSR_TERM_REASON_SET_POS);
++ 		reason_code = get_ghcb_msr_bits(svm,
++ 						GHCB_MSR_TERM_REASON_MASK,
++ 						GHCB_MSR_TERM_REASON_POS);
++ 		pr_info("SEV-ES guest requested termination: %#llx:%#llx\n",
++ 			reason_set, reason_code);
++ 		fallthrough;
++ 	}
++ 	default:
++ 		ret = -EINVAL;
++ 	}
++ 
++ 	trace_kvm_vmgexit_msr_protocol_exit(svm->vcpu.vcpu_id,
++ 					    control->ghcb_gpa, ret);
++ 
++ 	return ret;
++ }
++ 
++ int sev_handle_vmgexit(struct vcpu_svm *svm)
++ {
++ 	struct vmcb_control_area *control = &svm->vmcb->control;
++ 	u64 ghcb_gpa, exit_code;
++ 	struct ghcb *ghcb;
++ 	int ret;
++ 
++ 	/* Validate the GHCB */
++ 	ghcb_gpa = control->ghcb_gpa;
++ 	if (ghcb_gpa & GHCB_MSR_INFO_MASK)
++ 		return sev_handle_vmgexit_msr_protocol(svm);
++ 
++ 	if (!ghcb_gpa) {
++ 		vcpu_unimpl(&svm->vcpu, "vmgexit: GHCB gpa is not set\n");
++ 		return -EINVAL;
++ 	}
++ 
++ 	if (kvm_vcpu_map(&svm->vcpu, ghcb_gpa >> PAGE_SHIFT, &svm->ghcb_map)) {
++ 		/* Unable to map GHCB from guest */
++ 		vcpu_unimpl(&svm->vcpu, "vmgexit: error mapping GHCB [%#llx] from guest\n",
++ 			    ghcb_gpa);
++ 		return -EINVAL;
++ 	}
++ 
++ 	svm->ghcb = svm->ghcb_map.hva;
++ 	ghcb = svm->ghcb_map.hva;
++ 
++ 	trace_kvm_vmgexit_enter(svm->vcpu.vcpu_id, ghcb);
++ 
++ 	exit_code = ghcb_get_sw_exit_code(ghcb);
++ 
++ 	ret = sev_es_validate_vmgexit(svm);
++ 	if (ret)
++ 		return ret;
++ 
++ 	sev_es_sync_from_ghcb(svm);
++ 	ghcb_set_sw_exit_info_1(ghcb, 0);
++ 	ghcb_set_sw_exit_info_2(ghcb, 0);
++ 
++ 	ret = -EINVAL;
++ 	switch (exit_code) {
++ 	case SVM_VMGEXIT_MMIO_READ:
++ 		if (!setup_vmgexit_scratch(svm, true, control->exit_info_2))
++ 			break;
++ 
++ 		ret = kvm_sev_es_mmio_read(&svm->vcpu,
++ 					   control->exit_info_1,
++ 					   control->exit_info_2,
++ 					   svm->ghcb_sa);
++ 		break;
++ 	case SVM_VMGEXIT_MMIO_WRITE:
++ 		if (!setup_vmgexit_scratch(svm, false, control->exit_info_2))
++ 			break;
++ 
++ 		ret = kvm_sev_es_mmio_write(&svm->vcpu,
++ 					    control->exit_info_1,
++ 					    control->exit_info_2,
++ 					    svm->ghcb_sa);
++ 		break;
++ 	case SVM_VMGEXIT_NMI_COMPLETE:
++ 		ret = svm_invoke_exit_handler(svm, SVM_EXIT_IRET);
++ 		break;
++ 	case SVM_VMGEXIT_AP_HLT_LOOP:
++ 		ret = kvm_emulate_ap_reset_hold(&svm->vcpu);
++ 		break;
++ 	case SVM_VMGEXIT_AP_JUMP_TABLE: {
++ 		struct kvm_sev_info *sev = &to_kvm_svm(svm->vcpu.kvm)->sev_info;
++ 
++ 		switch (control->exit_info_1) {
++ 		case 0:
++ 			/* Set AP jump table address */
++ 			sev->ap_jump_table = control->exit_info_2;
++ 			break;
++ 		case 1:
++ 			/* Get AP jump table address */
++ 			ghcb_set_sw_exit_info_2(ghcb, sev->ap_jump_table);
++ 			break;
++ 		default:
++ 			pr_err("svm: vmgexit: unsupported AP jump table request - exit_info_1=%#llx\n",
++ 			       control->exit_info_1);
++ 			ghcb_set_sw_exit_info_1(ghcb, 1);
++ 			ghcb_set_sw_exit_info_2(ghcb,
++ 						X86_TRAP_UD |
++ 						SVM_EVTINJ_TYPE_EXEPT |
++ 						SVM_EVTINJ_VALID);
++ 		}
++ 
++ 		ret = 1;
++ 		break;
++ 	}
++ 	case SVM_VMGEXIT_UNSUPPORTED_EVENT:
++ 		vcpu_unimpl(&svm->vcpu,
++ 			    "vmgexit: unsupported event - exit_info_1=%#llx, exit_info_2=%#llx\n",
++ 			    control->exit_info_1, control->exit_info_2);
++ 		break;
++ 	default:
++ 		ret = svm_invoke_exit_handler(svm, exit_code);
++ 	}
++ 
++ 	return ret;
++ }
++ 
++ int sev_es_string_io(struct vcpu_svm *svm, int size, unsigned int port, int in)
++ {
++ 	if (!setup_vmgexit_scratch(svm, in, svm->vmcb->control.exit_info_2))
++ 		return -EINVAL;
++ 
++ 	return kvm_sev_es_string_io(&svm->vcpu, size, port,
++ 				    svm->ghcb_sa, svm->ghcb_sa_len, in);
++ }
++ 
++ void sev_es_init_vmcb(struct vcpu_svm *svm)
++ {
++ 	struct kvm_vcpu *vcpu = &svm->vcpu;
++ 
++ 	svm->vmcb->control.nested_ctl |= SVM_NESTED_CTL_SEV_ES_ENABLE;
++ 	svm->vmcb->control.virt_ext |= LBR_CTL_ENABLE_MASK;
++ 
++ 	/*
++ 	 * An SEV-ES guest requires a VMSA area that is a separate from the
++ 	 * VMCB page. Do not include the encryption mask on the VMSA physical
++ 	 * address since hardware will access it using the guest key.
++ 	 */
++ 	svm->vmcb->control.vmsa_pa = __pa(svm->vmsa);
++ 
++ 	/* Can't intercept CR register access, HV can't modify CR registers */
++ 	svm_clr_intercept(svm, INTERCEPT_CR0_READ);
++ 	svm_clr_intercept(svm, INTERCEPT_CR4_READ);
++ 	svm_clr_intercept(svm, INTERCEPT_CR8_READ);
++ 	svm_clr_intercept(svm, INTERCEPT_CR0_WRITE);
++ 	svm_clr_intercept(svm, INTERCEPT_CR4_WRITE);
++ 	svm_clr_intercept(svm, INTERCEPT_CR8_WRITE);
++ 
++ 	svm_clr_intercept(svm, INTERCEPT_SELECTIVE_CR0);
++ 
++ 	/* Track EFER/CR register changes */
++ 	svm_set_intercept(svm, TRAP_EFER_WRITE);
++ 	svm_set_intercept(svm, TRAP_CR0_WRITE);
++ 	svm_set_intercept(svm, TRAP_CR4_WRITE);
++ 	svm_set_intercept(svm, TRAP_CR8_WRITE);
++ 
++ 	/* No support for enable_vmware_backdoor */
++ 	clr_exception_intercept(svm, GP_VECTOR);
++ 
++ 	/* Can't intercept XSETBV, HV can't modify XCR0 directly */
++ 	svm_clr_intercept(svm, INTERCEPT_XSETBV);
++ 
++ 	/* Clear intercepts on selected MSRs */
++ 	set_msr_interception(vcpu, svm->msrpm, MSR_EFER, 1, 1);
++ 	set_msr_interception(vcpu, svm->msrpm, MSR_IA32_CR_PAT, 1, 1);
++ 	set_msr_interception(vcpu, svm->msrpm, MSR_IA32_LASTBRANCHFROMIP, 1, 1);
++ 	set_msr_interception(vcpu, svm->msrpm, MSR_IA32_LASTBRANCHTOIP, 1, 1);
++ 	set_msr_interception(vcpu, svm->msrpm, MSR_IA32_LASTINTFROMIP, 1, 1);
++ 	set_msr_interception(vcpu, svm->msrpm, MSR_IA32_LASTINTTOIP, 1, 1);
++ }
++ 
++ void sev_es_create_vcpu(struct vcpu_svm *svm)
++ {
++ 	/*
++ 	 * Set the GHCB MSR value as per the GHCB specification when creating
++ 	 * a vCPU for an SEV-ES guest.
++ 	 */
++ 	set_ghcb_msr(svm, GHCB_MSR_SEV_INFO(GHCB_VERSION_MAX,
++ 					    GHCB_VERSION_MIN,
++ 					    sev_enc_bit));
++ }
++ 
++ void sev_es_prepare_guest_switch(struct vcpu_svm *svm, unsigned int cpu)
++ {
++ 	struct svm_cpu_data *sd = per_cpu(svm_data, cpu);
++ 	struct vmcb_save_area *hostsa;
++ 
++ 	/*
++ 	 * As an SEV-ES guest, hardware will restore the host state on VMEXIT,
++ 	 * of which one step is to perform a VMLOAD. Since hardware does not
++ 	 * perform a VMSAVE on VMRUN, the host savearea must be updated.
++ 	 */
++ 	vmsave(__sme_page_pa(sd->save_area));
++ 
++ 	/* XCR0 is restored on VMEXIT, save the current host value */
++ 	hostsa = (struct vmcb_save_area *)(page_address(sd->save_area) + 0x400);
++ 	hostsa->xcr0 = xgetbv(XCR_XFEATURE_ENABLED_MASK);
++ 
++ 	/* PKRU is restored on VMEXIT, save the curent host value */
++ 	hostsa->pkru = read_pkru();
++ 
++ 	/* MSR_IA32_XSS is restored on VMEXIT, save the currnet host value */
++ 	hostsa->xss = host_xss;
++ }
++ 
++ void sev_vcpu_deliver_sipi_vector(struct kvm_vcpu *vcpu, u8 vector)
++ {
++ 	struct vcpu_svm *svm = to_svm(vcpu);
++ 
++ 	/* First SIPI: Use the values as initially set by the VMM */
++ 	if (!svm->received_first_sipi) {
++ 		svm->received_first_sipi = true;
++ 		return;
++ 	}
++ 
++ 	/*
++ 	 * Subsequent SIPI: Return from an AP Reset Hold VMGEXIT, where
++ 	 * the guest will set the CS and RIP. Set SW_EXIT_INFO_2 to a
++ 	 * non-zero value.
++ 	 */
++ 	ghcb_set_sw_exit_info_2(svm->ghcb, 1);
++ }
+++>>>>>>> a7fc06dd2f14 (KVM: SVM: use .prepare_guest_switch() to handle CPU register save/setup)
+diff --cc arch/x86/kvm/svm/svm.c
+index eca4258a8e0e,645bad5e8e81..000000000000
+--- a/arch/x86/kvm/svm/svm.c
++++ b/arch/x86/kvm/svm/svm.c
+@@@ -1343,7 -1361,12 +1343,8 @@@ static int svm_create_vcpu(struct kvm_v
+  
+  	svm->vmcb = page_address(vmcb_page);
+  	svm->vmcb_pa = __sme_set(page_to_pfn(vmcb_page) << PAGE_SHIFT);
+ -
+ -	if (vmsa_page)
+ -		svm->vmsa = page_address(vmsa_page);
+ -
+  	svm->asid_generation = 0;
++ 	svm->guest_state_loaded = false;
+  	init_vmcb(svm);
+  
+  	svm_init_osvw(vcpu);
+@@@ -1382,26 -1414,32 +1383,44 @@@ static void svm_free_vcpu(struct kvm_vc
+  	__free_pages(virt_to_page(svm->msrpm), MSRPM_ALLOC_ORDER);
+  }
+  
+- static void svm_vcpu_load(struct kvm_vcpu *vcpu, int cpu)
++ static void svm_prepare_guest_switch(struct kvm_vcpu *vcpu)
+  {
+  	struct vcpu_svm *svm = to_svm(vcpu);
+- 	struct svm_cpu_data *sd = per_cpu(svm_data, cpu);
+- 	int i;
++ 	struct svm_cpu_data *sd = per_cpu(svm_data, vcpu->cpu);
++ 	unsigned int i;
+  
+- 	if (unlikely(cpu != vcpu->cpu)) {
+- 		svm->asid_generation = 0;
+- 		vmcb_mark_all_dirty(svm->vmcb);
+- 	}
++ 	if (svm->guest_state_loaded)
++ 		return;
+  
+++<<<<<<< HEAD
+ +#ifdef CONFIG_X86_64
+ +	rdmsrl(MSR_GS_BASE, to_svm(vcpu)->host.gs_base);
+ +#endif
+ +	savesegment(fs, svm->host.fs);
+ +	savesegment(gs, svm->host.gs);
+ +	svm->host.ldt = kvm_read_ldt();
+ +
+ +	for (i = 0; i < NR_HOST_SAVE_USER_MSRS; i++)
+ +		rdmsrl(host_save_user_msrs[i], svm->host_user_msrs[i]);
+++=======
++ 	/*
++ 	 * Certain MSRs are restored on VMEXIT (sev-es), or vmload of host save
++ 	 * area (non-sev-es). Save ones that aren't so we can restore them
++ 	 * individually later.
++ 	 */
++ 	for (i = 0; i < NR_HOST_SAVE_USER_MSRS; i++)
++ 		rdmsrl(host_save_user_msrs[i], svm->host_user_msrs[i]);
++ 
++ 	/*
++ 	 * Save additional host state that will be restored on VMEXIT (sev-es)
++ 	 * or subsequent vmload of host save area.
++ 	 */
++ 	if (sev_es_guest(svm->vcpu.kvm)) {
++ 		sev_es_prepare_guest_switch(svm, vcpu->cpu);
++ 	} else {
++ 		vmsave(__sme_page_pa(sd->save_area));
++ 	}
+++>>>>>>> a7fc06dd2f14 (KVM: SVM: use .prepare_guest_switch() to handle CPU register save/setup)
+  
+  	if (static_cpu_has(X86_FEATURE_TSCRATEMSR)) {
+  		u64 tsc_ratio = vcpu->arch.tsc_scaling_ratio;
+@@@ -1423,24 -1493,10 +1474,25 @@@ static void svm_vcpu_load(struct kvm_vc
+  
+  static void svm_vcpu_put(struct kvm_vcpu *vcpu)
+  {
+- 	struct vcpu_svm *svm = to_svm(vcpu);
+- 	int i;
+- 
+  	avic_vcpu_put(vcpu);
++ 	svm_prepare_host_switch(vcpu);
+  
+  	++vcpu->stat.host_state_reload;
+++<<<<<<< HEAD
+ +	kvm_load_ldt(svm->host.ldt);
+ +#ifdef CONFIG_X86_64
+ +	loadsegment(fs, svm->host.fs);
+ +	wrmsrl(MSR_KERNEL_GS_BASE, current->thread.gsbase);
+ +	load_gs_index(svm->host.gs);
+ +#else
+ +#ifdef CONFIG_X86_32_LAZY_GS
+ +	loadsegment(gs, svm->host.gs);
+ +#endif
+ +#endif
+ +	for (i = 0; i < NR_HOST_SAVE_USER_MSRS; i++)
+ +		wrmsrl(host_save_user_msrs[i], svm->host_user_msrs[i]);
+++=======
+++>>>>>>> a7fc06dd2f14 (KVM: SVM: use .prepare_guest_switch() to handle CPU register save/setup)
+  }
+  
+  static unsigned long svm_get_rflags(struct kvm_vcpu *vcpu)
+diff --cc arch/x86/kvm/svm/svm.h
+index de600f536464,39e071fdab0c..000000000000
+--- a/arch/x86/kvm/svm/svm.h
++++ b/arch/x86/kvm/svm/svm.h
+@@@ -169,6 -160,20 +169,23 @@@ struct vcpu_svm 
+  		DECLARE_BITMAP(read, MAX_DIRECT_ACCESS_MSRS);
+  		DECLARE_BITMAP(write, MAX_DIRECT_ACCESS_MSRS);
+  	} shadow_msr_intercept;
+++<<<<<<< HEAD
+++=======
++ 
++ 	/* SEV-ES support */
++ 	struct vmcb_save_area *vmsa;
++ 	struct ghcb *ghcb;
++ 	struct kvm_host_map ghcb_map;
++ 	bool received_first_sipi;
++ 
++ 	/* SEV-ES scratch area support */
++ 	void *ghcb_sa;
++ 	u64 ghcb_sa_len;
++ 	bool ghcb_sa_sync;
++ 	bool ghcb_sa_free;
++ 
++ 	bool guest_state_loaded;
+++>>>>>>> a7fc06dd2f14 (KVM: SVM: use .prepare_guest_switch() to handle CPU register save/setup)
+  };
+  
+  struct svm_cpu_data {
+@@@ -504,7 -562,19 +521,22 @@@ int svm_register_enc_region(struct kvm 
+  int svm_unregister_enc_region(struct kvm *kvm,
+  			      struct kvm_enc_region *range);
+  void pre_sev_run(struct vcpu_svm *svm, int cpu);
+ -void __init sev_hardware_setup(void);
+ +int __init sev_hardware_setup(void);
+  void sev_hardware_teardown(void);
+++<<<<<<< HEAD
+++=======
++ void sev_free_vcpu(struct kvm_vcpu *vcpu);
++ int sev_handle_vmgexit(struct vcpu_svm *svm);
++ int sev_es_string_io(struct vcpu_svm *svm, int size, unsigned int port, int in);
++ void sev_es_init_vmcb(struct vcpu_svm *svm);
++ void sev_es_create_vcpu(struct vcpu_svm *svm);
++ void sev_vcpu_deliver_sipi_vector(struct kvm_vcpu *vcpu, u8 vector);
++ void sev_es_prepare_guest_switch(struct vcpu_svm *svm, unsigned int cpu);
++ 
++ /* vmenter.S */
++ 
++ void __svm_sev_es_vcpu_run(unsigned long vmcb_pa);
++ void __svm_vcpu_run(unsigned long vmcb_pa, unsigned long *regs);
+++>>>>>>> a7fc06dd2f14 (KVM: SVM: use .prepare_guest_switch() to handle CPU register save/setup)
+  
+  #endif
+* Unmerged path arch/x86/kvm/svm/sev.c
+* Unmerged path arch/x86/kvm/svm/svm.c
+* Unmerged path arch/x86/kvm/svm/svm.h
