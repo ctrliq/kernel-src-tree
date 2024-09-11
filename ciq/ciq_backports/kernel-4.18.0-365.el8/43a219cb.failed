@@ -1,0 +1,152 @@
+kasan: optimize large kmalloc poisoning
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-365.el8
+commit-author Andrey Konovalov <andreyknvl@google.com>
+commit 43a219cbe5a46ec3f6a1874bb2cb2fd4de8322cc
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-365.el8/43a219cb.failed
+
+Similarly to kasan_kmalloc(), kasan_kmalloc_large() doesn't need to
+unpoison the object as it as already unpoisoned by alloc_pages() (or by
+ksize() for krealloc()).
+
+This patch changes kasan_kmalloc_large() to only poison the redzone.
+
+Link: https://lkml.kernel.org/r/33dee5aac0e550ad7f8e26f590c9b02c6129b4a3.1612546384.git.andreyknvl@google.com
+	Signed-off-by: Andrey Konovalov <andreyknvl@google.com>
+	Reviewed-by: Marco Elver <elver@google.com>
+	Cc: Alexander Potapenko <glider@google.com>
+	Cc: Andrey Ryabinin <aryabinin@virtuozzo.com>
+	Cc: Branislav Rankov <Branislav.Rankov@arm.com>
+	Cc: Catalin Marinas <catalin.marinas@arm.com>
+	Cc: Dmitry Vyukov <dvyukov@google.com>
+	Cc: Evgenii Stepanov <eugenis@google.com>
+	Cc: Kevin Brodsky <kevin.brodsky@arm.com>
+	Cc: Peter Collingbourne <pcc@google.com>
+	Cc: Vincenzo Frascino <vincenzo.frascino@arm.com>
+	Cc: Will Deacon <will.deacon@arm.com>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit 43a219cbe5a46ec3f6a1874bb2cb2fd4de8322cc)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	mm/kasan/common.c
+diff --cc mm/kasan/common.c
+index 0d0cb20ec1a4,dcdc92948364..000000000000
+--- a/mm/kasan/common.c
++++ b/mm/kasan/common.c
+@@@ -463,42 -450,50 +463,41 @@@ static void *__kasan_kmalloc(struct kme
+  	if (unlikely(object == NULL))
+  		return NULL;
+  
+ -	if (is_kfence_address(kasan_reset_tag(object)))
+ -		return (void *)object;
+ +	redzone_start = round_up((unsigned long)(object + size),
+ +				KASAN_SHADOW_SCALE_SIZE);
+ +	redzone_end = round_up((unsigned long)object + cache->object_size,
+ +				KASAN_SHADOW_SCALE_SIZE);
+  
+ -	/*
+ -	 * The object has already been unpoisoned by kasan_slab_alloc() for
+ -	 * kmalloc() or by ksize() for krealloc().
+ -	 */
+ +	if (IS_ENABLED(CONFIG_KASAN_SW_TAGS))
+ +		tag = assign_tag(cache, object, false, keep_tag);
+  
+ -	/*
+ -	 * The redzone has byte-level precision for the generic mode.
+ -	 * Partially poison the last object granule to cover the unaligned
+ -	 * part of the redzone.
+ -	 */
+ -	if (IS_ENABLED(CONFIG_KASAN_GENERIC))
+ -		kasan_poison_last_granule((void *)object, size);
+ +	/* Tag is ignored in set_tag without CONFIG_KASAN_SW_TAGS */
+ +	kasan_unpoison_shadow(set_tag(object, tag), size);
+ +	kasan_poison_shadow((void *)redzone_start, redzone_end - redzone_start,
+ +		KASAN_KMALLOC_REDZONE);
+  
+ -	/* Poison the aligned part of the redzone. */
+ -	redzone_start = round_up((unsigned long)(object + size),
+ -				KASAN_GRANULE_SIZE);
+ -	redzone_end = (unsigned long)object + cache->object_size;
+ -	kasan_poison((void *)redzone_start, redzone_end - redzone_start,
+ -			   KASAN_KMALLOC_REDZONE);
+ +	if (cache->flags & SLAB_KASAN)
+ +		kasan_set_track(&get_alloc_info(cache, object)->alloc_track, flags);
+  
+ -	/*
+ -	 * Save alloc info (if possible) for kmalloc() allocations.
+ -	 * This also rewrites the alloc info when called from kasan_krealloc().
+ -	 */
+ -	if (kasan_stack_collection_enabled())
+ -		set_alloc_info(cache, (void *)object, flags, true);
+ +	return set_tag(object, tag);
+ +}
+  
+ -	/* Keep the tag that was set by kasan_slab_alloc(). */
+ -	return (void *)object;
+ +void * __must_check kasan_slab_alloc(struct kmem_cache *cache, void *object,
+ +					gfp_t flags)
+ +{
+ +	return __kasan_kmalloc(cache, object, cache->object_size, flags, false);
+  }
+  
+ -void * __must_check __kasan_kmalloc(struct kmem_cache *cache, const void *object,
+ -					size_t size, gfp_t flags)
+ +void * __must_check kasan_kmalloc(struct kmem_cache *cache, const void *object,
+ +				size_t size, gfp_t flags)
+  {
+ -	return ____kasan_kmalloc(cache, object, size, flags);
+ +	return __kasan_kmalloc(cache, object, size, flags, true);
+  }
+ -EXPORT_SYMBOL(__kasan_kmalloc);
+ +EXPORT_SYMBOL(kasan_kmalloc);
+  
+ -void * __must_check __kasan_kmalloc_large(const void *ptr, size_t size,
+ +void * __must_check kasan_kmalloc_large(const void *ptr, size_t size,
+  						gfp_t flags)
+  {
+- 	struct page *page;
+  	unsigned long redzone_start;
+  	unsigned long redzone_end;
+  
+@@@ -508,14 -503,25 +507,34 @@@
+  	if (unlikely(ptr == NULL))
+  		return NULL;
+  
+- 	page = virt_to_page(ptr);
++ 	/*
++ 	 * The object has already been unpoisoned by kasan_alloc_pages() for
++ 	 * alloc_pages() or by ksize() for krealloc().
++ 	 */
++ 
++ 	/*
++ 	 * The redzone has byte-level precision for the generic mode.
++ 	 * Partially poison the last object granule to cover the unaligned
++ 	 * part of the redzone.
++ 	 */
++ 	if (IS_ENABLED(CONFIG_KASAN_GENERIC))
++ 		kasan_poison_last_granule(ptr, size);
++ 
++ 	/* Poison the aligned part of the redzone. */
+  	redzone_start = round_up((unsigned long)(ptr + size),
+++<<<<<<< HEAD
+ +				KASAN_SHADOW_SCALE_SIZE);
+ +	redzone_end = (unsigned long)ptr + page_size(page);
+ +
+ +	kasan_unpoison_shadow(ptr, size);
+ +	kasan_poison_shadow((void *)redzone_start, redzone_end - redzone_start,
+ +		KASAN_PAGE_REDZONE);
+++=======
++ 				KASAN_GRANULE_SIZE);
++ 	redzone_end = (unsigned long)ptr + page_size(virt_to_page(ptr));
++ 	kasan_poison((void *)redzone_start, redzone_end - redzone_start,
++ 		     KASAN_PAGE_REDZONE);
+++>>>>>>> 43a219cbe5a4 (kasan: optimize large kmalloc poisoning)
+  
+  	return (void *)ptr;
+  }
+* Unmerged path mm/kasan/common.c
