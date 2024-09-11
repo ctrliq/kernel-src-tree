@@ -1,0 +1,123 @@
+ethtool: handle info/flash data copying outside rtnl_lock
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-448.el8
+commit-author Jakub Kicinski <kuba@kernel.org>
+commit 095cfcfe13e5a6599cf0a41fe1e8bbfa76cd1c9d
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-448.el8/095cfcfe.failed
+
+We need to increase the lifetime of the data for .get_info
+and .flash_update beyond their handlers inside rtnl_lock.
+
+Allocate a union on the heap and use it instead.
+
+Note that we now copy the ethcmd before we lookup dev,
+hopefully there is no crazy user space depending on error
+codes.
+
+	Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+	Reviewed-by: Leon Romanovsky <leonro@nvidia.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 095cfcfe13e5a6599cf0a41fe1e8bbfa76cd1c9d)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/ethtool/ioctl.c
+diff --cc net/ethtool/ioctl.c
+index be7380037e8d,1980e37b6472..000000000000
+--- a/net/ethtool/ioctl.c
++++ b/net/ethtool/ioctl.c
+@@@ -2689,19 -2697,18 +2686,30 @@@ static int ethtool_set_fecparam(struct 
+  
+  /* The main entry point in this file.  Called from net/core/dev_ioctl.c */
+  
+++<<<<<<< HEAD
+ +int dev_ethtool(struct net *net, struct ifreq *ifr)
+ +{
+ +	struct net_device *dev = __dev_get_by_name(net, ifr->ifr_name);
+ +	void __user *useraddr = ifr->ifr_data;
+ +	u32 ethcmd, sub_cmd;
+ +	int rc;
+ +	netdev_features_t old_features;
+ +
+ +	if (!dev || !netif_device_present(dev))
+- 		return -ENODEV;
+++=======
++ static int
++ __dev_ethtool(struct net *net, struct ifreq *ifr, void __user *useraddr,
++ 	      u32 ethcmd, struct ethtool_devlink_compat *devlink_state)
++ {
++ 	struct net_device *dev;
++ 	u32 sub_cmd;
++ 	int rc;
++ 	netdev_features_t old_features;
+  
+- 	if (copy_from_user(&ethcmd, useraddr, sizeof(ethcmd)))
+- 		return -EFAULT;
++ 	dev = __dev_get_by_name(net, ifr->ifr_name);
++ 	if (!dev)
+++>>>>>>> 095cfcfe13e5 (ethtool: handle info/flash data copying outside rtnl_lock)
++ 		return -ENODEV;
+  
+  	if (ethcmd == ETHTOOL_PERQUEUE) {
+  		if (copy_from_user(&sub_cmd, useraddr + sizeof(ethcmd), sizeof(sub_cmd)))
+@@@ -2975,7 -2990,53 +2983,56 @@@
+  
+  	if (old_features != dev->features)
+  		netdev_features_change(dev);
+++<<<<<<< HEAD
+++=======
++ out:
++ 	if (dev->dev.parent)
++ 		pm_runtime_put(dev->dev.parent);
++ 
++ 	return rc;
++ }
++ 
++ int dev_ethtool(struct net *net, struct ifreq *ifr, void __user *useraddr)
++ {
++ 	struct ethtool_devlink_compat *state;
++ 	u32 ethcmd;
++ 	int rc;
++ 
++ 	if (copy_from_user(&ethcmd, useraddr, sizeof(ethcmd)))
++ 		return -EFAULT;
+++>>>>>>> 095cfcfe13e5 (ethtool: handle info/flash data copying outside rtnl_lock)
++ 
++ 	state = kzalloc(sizeof(*state), GFP_KERNEL);
++ 	if (!state)
++ 		return -ENOMEM;
++ 
++ 	switch (ethcmd) {
++ 	case ETHTOOL_FLASHDEV:
++ 		if (copy_from_user(&state->efl, useraddr, sizeof(state->efl))) {
++ 			rc = -EFAULT;
++ 			goto exit_free;
++ 		}
++ 		state->efl.data[ETHTOOL_FLASH_MAX_FILENAME - 1] = 0;
++ 		break;
++ 	}
++ 
++ 	rtnl_lock();
++ 	rc = __dev_ethtool(net, ifr, useraddr, ethcmd, state);
++ 	rtnl_unlock();
++ 	if (rc)
++ 		goto exit_free;
++ 
++ 	switch (ethcmd) {
++ 	case ETHTOOL_GDRVINFO:
++ 		if (copy_to_user(useraddr, &state->info, sizeof(state->info))) {
++ 			rc = -EFAULT;
++ 			goto exit_free;
++ 		}
++ 		break;
++ 	}
+  
++ exit_free:
++ 	kfree(state);
+  	return rc;
+  }
+  
+* Unmerged path net/ethtool/ioctl.c
