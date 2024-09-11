@@ -1,0 +1,170 @@
+bpf: Using rcu_read_lock for bpf_sk_storage_map iterator
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-315.el8
+commit-author Yonghong Song <yhs@fb.com>
+commit c69d2ddb2072eb7ffca1a31ee5ddc16dcd414ed9
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-315.el8/c69d2ddb.failed
+
+If a bucket contains a lot of sockets, during bpf_iter traversing
+a bucket, concurrent userspace bpf_map_update_elem() and
+bpf program bpf_sk_storage_{get,delete}() may experience
+some undesirable delays as they will compete with bpf_iter
+for bucket lock.
+
+Note that the number of buckets for bpf_sk_storage_map
+is roughly the same as the number of cpus. So if there
+are lots of sockets in the system, each bucket could
+contain lots of sockets.
+
+Different actual use cases may experience different delays.
+Here, using selftest bpf_iter subtest bpf_sk_storage_map,
+I hacked the kernel with ktime_get_mono_fast_ns()
+to collect the time when a bucket was locked
+during bpf_iter prog traversing that bucket. This way,
+the maximum incurred delay was measured w.r.t. the
+number of elements in a bucket.
+    # elems in each bucket          delay(ns)
+      64                            17000
+      256                           72512
+      2048                          875246
+
+The potential delays will be further increased if
+we have even more elemnts in a bucket. Using rcu_read_lock()
+is a reasonable compromise here. It may lose some precision, e.g.,
+access stale sockets, but it will not hurt performance of
+bpf program or user space application which also tries
+to get/delete or update map elements.
+
+	Signed-off-by: Yonghong Song <yhs@fb.com>
+	Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+	Acked-by: Song Liu <songliubraving@fb.com>
+	Cc: Martin KaFai Lau <kafai@fb.com>
+Link: https://lore.kernel.org/bpf/20200916224645.720172-1-yhs@fb.com
+(cherry picked from commit c69d2ddb2072eb7ffca1a31ee5ddc16dcd414ed9)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/core/bpf_sk_storage.c
+diff --cc net/core/bpf_sk_storage.c
+index 9e9e9328f00b,838efc682cff..000000000000
+--- a/net/core/bpf_sk_storage.c
++++ b/net/core/bpf_sk_storage.c
+@@@ -1259,19 -671,20 +1259,24 @@@ struct bpf_iter_seq_sk_storage_map_inf
+  	unsigned skip_elems;
+  };
+  
+ -static struct bpf_local_storage_elem *
+ +static struct bpf_sk_storage_elem *
+  bpf_sk_storage_map_seq_find_next(struct bpf_iter_seq_sk_storage_map_info *info,
+++<<<<<<< HEAD
+ +				 struct bpf_sk_storage_elem *prev_selem)
+++=======
++ 				 struct bpf_local_storage_elem *prev_selem)
++ 	__acquires(RCU) __releases(RCU)
+++>>>>>>> c69d2ddb2072 (bpf: Using rcu_read_lock for bpf_sk_storage_map iterator)
+  {
+ -	struct bpf_local_storage *sk_storage;
+ -	struct bpf_local_storage_elem *selem;
+ +	struct bpf_sk_storage *sk_storage;
+ +	struct bpf_sk_storage_elem *selem;
+  	u32 skip_elems = info->skip_elems;
+ -	struct bpf_local_storage_map *smap;
+ +	struct bpf_sk_storage_map *smap;
+  	u32 bucket_id = info->bucket_id;
+  	u32 i, count, n_buckets;
+ -	struct bpf_local_storage_map_bucket *b;
+ +	struct bucket *b;
+  
+ -	smap = (struct bpf_local_storage_map *)info->map;
+ +	smap = (struct bpf_sk_storage_map *)info->map;
+  	n_buckets = 1U << smap->bucket_log;
+  	if (bucket_id >= n_buckets)
+  		return NULL;
+@@@ -1280,8 -693,8 +1285,13 @@@
+  	selem = prev_selem;
+  	count = 0;
+  	while (selem) {
+++<<<<<<< HEAD
+ +		selem = hlist_entry_safe(selem->map_node.next,
+ +					 struct bpf_sk_storage_elem, map_node);
+++=======
++ 		selem = hlist_entry_safe(rcu_dereference(hlist_next_rcu(&selem->map_node)),
++ 					 struct bpf_local_storage_elem, map_node);
+++>>>>>>> c69d2ddb2072 (bpf: Using rcu_read_lock for bpf_sk_storage_map iterator)
+  		if (!selem) {
+  			/* not found, unlock and go to the next bucket */
+  			b = &smap->buckets[bucket_id++];
+@@@ -1289,7 -702,7 +1299,11 @@@
+  			skip_elems = 0;
+  			break;
+  		}
+++<<<<<<< HEAD
+ +		sk_storage = rcu_dereference_raw(selem->sk_storage);
+++=======
++ 		sk_storage = rcu_dereference(selem->local_storage);
+++>>>>>>> c69d2ddb2072 (bpf: Using rcu_read_lock for bpf_sk_storage_map iterator)
+  		if (sk_storage) {
+  			info->skip_elems = skip_elems + count;
+  			return selem;
+@@@ -1299,10 -712,10 +1313,15 @@@
+  
+  	for (i = bucket_id; i < (1U << smap->bucket_log); i++) {
+  		b = &smap->buckets[i];
+- 		raw_spin_lock_bh(&b->lock);
++ 		rcu_read_lock();
+  		count = 0;
+++<<<<<<< HEAD
+ +		hlist_for_each_entry(selem, &b->list, map_node) {
+ +			sk_storage = rcu_dereference_raw(selem->sk_storage);
+++=======
++ 		hlist_for_each_entry_rcu(selem, &b->list, map_node) {
++ 			sk_storage = rcu_dereference(selem->local_storage);
+++>>>>>>> c69d2ddb2072 (bpf: Using rcu_read_lock for bpf_sk_storage_map iterator)
+  			if (sk_storage && count >= skip_elems) {
+  				info->bucket_id = i;
+  				info->skip_elems = count;
+@@@ -1369,8 -782,8 +1388,13 @@@ static int __bpf_sk_storage_map_seq_sho
+  		ctx.meta = &meta;
+  		ctx.map = info->map;
+  		if (selem) {
+++<<<<<<< HEAD
+ +			sk_storage = rcu_dereference_raw(selem->sk_storage);
+ +			ctx.sk = sk_storage->sk;
+++=======
++ 			sk_storage = rcu_dereference(selem->local_storage);
++ 			ctx.sk = sk_storage->owner;
+++>>>>>>> c69d2ddb2072 (bpf: Using rcu_read_lock for bpf_sk_storage_map iterator)
+  			ctx.value = SDATA(selem)->data;
+  		}
+  		ret = bpf_iter_run_prog(prog, &ctx);
+@@@ -1385,18 -798,12 +1409,26 @@@ static int bpf_sk_storage_map_seq_show(
+  }
+  
+  static void bpf_sk_storage_map_seq_stop(struct seq_file *seq, void *v)
++ 	__releases(RCU)
+  {
+++<<<<<<< HEAD
+ +	struct bpf_iter_seq_sk_storage_map_info *info = seq->private;
+ +	struct bpf_sk_storage_map *smap;
+ +	struct bucket *b;
+ +
+ +	if (!v) {
+ +		(void)__bpf_sk_storage_map_seq_show(seq, v);
+ +	} else {
+ +		smap = (struct bpf_sk_storage_map *)info->map;
+ +		b = &smap->buckets[info->bucket_id];
+ +		raw_spin_unlock_bh(&b->lock);
+ +	}
+++=======
++ 	if (!v)
++ 		(void)__bpf_sk_storage_map_seq_show(seq, v);
++ 	else
++ 		rcu_read_unlock();
+++>>>>>>> c69d2ddb2072 (bpf: Using rcu_read_lock for bpf_sk_storage_map iterator)
+  }
+  
+  static int bpf_iter_init_sk_storage_map(void *priv_data,
+* Unmerged path net/core/bpf_sk_storage.c
