@@ -1,0 +1,109 @@
+mm, slub: move disabling/enabling irqs to ___slab_alloc()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-358.el8
+commit-author Vlastimil Babka <vbabka@suse.cz>
+commit e500059ba55268e1c5212632e4f21e45f54dc6d9
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-358.el8/e500059b.failed
+
+Currently __slab_alloc() disables irqs around the whole ___slab_alloc().  This
+includes cases where this is not needed, such as when the allocation ends up in
+the page allocator and has to awkwardly enable irqs back based on gfp flags.
+Also the whole kmem_cache_alloc_bulk() is executed with irqs disabled even when
+it hits the __slab_alloc() slow path, and long periods with disabled interrupts
+are undesirable.
+
+As a first step towards reducing irq disabled periods, move irq handling into
+___slab_alloc(). Callers will instead prevent the s->cpu_slab percpu pointer
+from becoming invalid via get_cpu_ptr(), thus preempt_disable(). This does not
+protect against modification by an irq handler, which is still done by disabled
+irq for most of ___slab_alloc(). As a small immediate benefit,
+slab_out_of_memory() from ___slab_alloc() is now called with irqs enabled.
+
+kmem_cache_alloc_bulk() disables irqs for its fastpath and then re-enables them
+before calling ___slab_alloc(), which then disables them at its discretion. The
+whole kmem_cache_alloc_bulk() operation also disables preemption.
+
+When  ___slab_alloc() calls new_slab() to allocate a new page, re-enable
+preemption, because new_slab() will re-enable interrupts in contexts that allow
+blocking (this will be improved by later patches).
+
+The patch itself will thus increase overhead a bit due to disabled preemption
+(on configs where it matters) and increased disabling/enabling irqs in
+kmem_cache_alloc_bulk(), but that will be gradually improved in the following
+patches.
+
+Note in __slab_alloc() we need to change the #ifdef CONFIG_PREEMPT guard to
+CONFIG_PREEMPT_COUNT to make sure preempt disable/enable is properly paired in
+all configurations. On configs without involuntary preemption and debugging
+the re-read of kmem_cache_cpu pointer is still compiled out as it was before.
+
+[ Mike Galbraith <efault@gmx.de>: Fix kmem_cache_alloc_bulk() error path ]
+	Signed-off-by: Vlastimil Babka <vbabka@suse.cz>
+(cherry picked from commit e500059ba55268e1c5212632e4f21e45f54dc6d9)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	mm/slub.c
+diff --cc mm/slub.c
+index 18ea2f53cb90,dda05cc83eef..000000000000
+--- a/mm/slub.c
++++ b/mm/slub.c
+@@@ -3283,12 -3366,18 +3290,12 @@@ int kmem_cache_alloc_bulk(struct kmem_c
+  	 * IRQs, which protects against PREEMPT and interrupts
+  	 * handlers invoking normal fastpath.
+  	 */
++ 	c = get_cpu_ptr(s->cpu_slab);
+  	local_irq_disable();
+- 	c = this_cpu_ptr(s->cpu_slab);
+  
+  	for (i = 0; i < size; i++) {
+ -		void *object = kfence_alloc(s, s->object_size, flags);
+ +		void *object = c->freelist;
+  
+ -		if (unlikely(object)) {
+ -			p[i] = object;
+ -			continue;
+ -		}
+ -
+ -		object = c->freelist;
+  		if (unlikely(!object)) {
+  			/*
+  			 * We may have removed an object from c->freelist using
+@@@ -3319,21 -3412,18 +3330,27 @@@
+  	}
+  	c->tid = next_tid(c->tid);
+  	local_irq_enable();
++ 	put_cpu_ptr(s->cpu_slab);
+  
+ -	/*
+ -	 * memcg and kmem_cache debug support and memory initialization.
+ -	 * Done outside of the IRQ disabled fastpath loop.
+ -	 */
+ -	slab_post_alloc_hook(s, objcg, flags, size, p,
+ -				slab_want_init_on_alloc(flags, s));
+ +	/* Clear memory outside IRQ disabled fastpath loop */
+ +	if (unlikely(slab_want_init_on_alloc(flags, s))) {
+ +		int j;
+ +
+ +		for (j = 0; j < i; j++)
+ +			memset(p[j], 0, s->object_size);
+ +	}
+ +
+ +	/* memcg and kmem_cache debug support */
+ +	slab_post_alloc_hook(s, objcg, flags, size, p);
+  	return i;
+  error:
+++<<<<<<< HEAD
+ +	local_irq_enable();
+ +	slab_post_alloc_hook(s, objcg, flags, i, p);
+++=======
++ 	put_cpu_ptr(s->cpu_slab);
++ 	slab_post_alloc_hook(s, objcg, flags, i, p, false);
+++>>>>>>> e500059ba552 (mm, slub: move disabling/enabling irqs to ___slab_alloc())
+  	__kmem_cache_free_bulk(s, i, p);
+  	return 0;
+  }
+* Unmerged path mm/slub.c
