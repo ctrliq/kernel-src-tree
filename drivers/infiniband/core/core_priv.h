@@ -343,6 +343,7 @@ _ib_create_qp(struct ib_device *dev, struct ib_pd *pd,
 	qp->rwq_ind_tbl = attr->rwq_ind_tbl;
 	qp->event_handler = attr->event_handler;
 	qp->port = attr->port_num;
+	qp->qp_context = attr->qp_context;
 
 	atomic_set(&qp->usecnt, 0);
 	spin_lock_init(&qp->mr_lock);
