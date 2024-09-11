@@ -1,0 +1,182 @@
+KVM: nSVM: implement KVM_GET_NESTED_STATE and KVM_SET_NESTED_STATE
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Paolo Bonzini <pbonzini@redhat.com>
+commit cc440cdad5b7a4c1de12dace725209eb3e0cf663
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/cc440cda.failed
+
+Similar to VMX, the state that is captured through the currently available
+IOCTLs is a mix of L1 and L2 state, dependent on whether the L2 guest was
+running at the moment when the process was interrupted to save its state.
+
+In particular, the SVM-specific state for nested virtualization includes
+the L1 saved state (including the interrupt flag), the cached L2 controls,
+and the GIF.
+
+	Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+(cherry picked from commit cc440cdad5b7a4c1de12dace725209eb3e0cf663)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kvm/cpuid.h
+#	arch/x86/kvm/svm/nested.c
+diff --cc arch/x86/kvm/cpuid.h
+index a2335b92a9a0,05434cd9342f..000000000000
+--- a/arch/x86/kvm/cpuid.h
++++ b/arch/x86/kvm/cpuid.h
+@@@ -223,4 -268,44 +223,47 @@@ static inline bool cpuid_fault_enabled(
+  		  MSR_MISC_FEATURES_ENABLES_CPUID_FAULT;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static __always_inline void kvm_cpu_cap_clear(unsigned int x86_feature)
++ {
++ 	unsigned int x86_leaf = x86_feature / 32;
++ 
++ 	reverse_cpuid_check(x86_leaf);
++ 	kvm_cpu_caps[x86_leaf] &= ~__feature_bit(x86_feature);
++ }
++ 
++ static __always_inline void kvm_cpu_cap_set(unsigned int x86_feature)
++ {
++ 	unsigned int x86_leaf = x86_feature / 32;
++ 
++ 	reverse_cpuid_check(x86_leaf);
++ 	kvm_cpu_caps[x86_leaf] |= __feature_bit(x86_feature);
++ }
++ 
++ static __always_inline u32 kvm_cpu_cap_get(unsigned int x86_feature)
++ {
++ 	unsigned int x86_leaf = x86_feature / 32;
++ 
++ 	reverse_cpuid_check(x86_leaf);
++ 	return kvm_cpu_caps[x86_leaf] & __feature_bit(x86_feature);
++ }
++ 
++ static __always_inline bool kvm_cpu_cap_has(unsigned int x86_feature)
++ {
++ 	return !!kvm_cpu_cap_get(x86_feature);
++ }
++ 
++ static __always_inline void kvm_cpu_cap_check_and_set(unsigned int x86_feature)
++ {
++ 	if (boot_cpu_has(x86_feature))
++ 		kvm_cpu_cap_set(x86_feature);
++ }
++ 
++ static inline bool page_address_valid(struct kvm_vcpu *vcpu, gpa_t gpa)
++ {
++ 	return PAGE_ALIGNED(gpa) && !(gpa >> cpuid_maxphyaddr(vcpu));
++ }
++ 
+++>>>>>>> cc440cdad5b7 (KVM: nSVM: implement KVM_GET_NESTED_STATE and KVM_SET_NESTED_STATE)
+  #endif
+* Unmerged path arch/x86/kvm/svm/nested.c
+diff --git a/arch/x86/include/uapi/asm/kvm.h b/arch/x86/include/uapi/asm/kvm.h
+index 3f3f780c8c65..12075a9de1c1 100644
+--- a/arch/x86/include/uapi/asm/kvm.h
++++ b/arch/x86/include/uapi/asm/kvm.h
+@@ -385,18 +385,22 @@ struct kvm_sync_regs {
+ #define KVM_X86_QUIRK_MISC_ENABLE_NO_MWAIT (1 << 4)
+ 
+ #define KVM_STATE_NESTED_FORMAT_VMX	0
+-#define KVM_STATE_NESTED_FORMAT_SVM	1	/* unused */
++#define KVM_STATE_NESTED_FORMAT_SVM	1
+ 
+ #define KVM_STATE_NESTED_GUEST_MODE	0x00000001
+ #define KVM_STATE_NESTED_RUN_PENDING	0x00000002
+ #define KVM_STATE_NESTED_EVMCS		0x00000004
+ #define KVM_STATE_NESTED_MTF_PENDING	0x00000008
++#define KVM_STATE_NESTED_GIF_SET	0x00000100
+ 
+ #define KVM_STATE_NESTED_SMM_GUEST_MODE	0x00000001
+ #define KVM_STATE_NESTED_SMM_VMXON	0x00000002
+ 
+ #define KVM_STATE_NESTED_VMX_VMCS_SIZE	0x1000
+ 
++#define KVM_STATE_NESTED_SVM_VMCB_SIZE	0x1000
++
++
+ struct kvm_vmx_nested_state_data {
+ 	__u8 vmcs12[KVM_STATE_NESTED_VMX_VMCS_SIZE];
+ 	__u8 shadow_vmcs12[KVM_STATE_NESTED_VMX_VMCS_SIZE];
+@@ -411,6 +415,15 @@ struct kvm_vmx_nested_state_hdr {
+ 	} smm;
+ };
+ 
++struct kvm_svm_nested_state_data {
++	/* Save area only used if KVM_STATE_NESTED_RUN_PENDING.  */
++	__u8 vmcb12[KVM_STATE_NESTED_SVM_VMCB_SIZE];
++};
++
++struct kvm_svm_nested_state_hdr {
++	__u64 vmcb_pa;
++};
++
+ /* for KVM_CAP_NESTED_STATE */
+ struct kvm_nested_state {
+ 	__u16 flags;
+@@ -419,6 +432,7 @@ struct kvm_nested_state {
+ 
+ 	union {
+ 		struct kvm_vmx_nested_state_hdr vmx;
++		struct kvm_svm_nested_state_hdr svm;
+ 
+ 		/* Pad the header to 128 bytes.  */
+ 		__u8 pad[120];
+@@ -431,6 +445,7 @@ struct kvm_nested_state {
+ 	 */
+ 	union {
+ 		struct kvm_vmx_nested_state_data vmx[0];
++		struct kvm_svm_nested_state_data svm[0];
+ 	} data;
+ };
+ 
+* Unmerged path arch/x86/kvm/cpuid.h
+* Unmerged path arch/x86/kvm/svm/nested.c
+diff --git a/arch/x86/kvm/svm/svm.c b/arch/x86/kvm/svm/svm.c
+index 986d068fbec8..dc17cd886144 100644
+--- a/arch/x86/kvm/svm/svm.c
++++ b/arch/x86/kvm/svm/svm.c
+@@ -2292,6 +2292,7 @@ static struct kvm_vcpu *svm_create_vcpu(struct kvm *kvm, unsigned int id)
+ 		svm->avic_is_running = true;
+ 
+ 	svm->nested.hsave = page_address(hsave_page);
++	clear_page(svm->nested.hsave);
+ 
+ 	svm->msrpm = page_address(msrpm_pages);
+ 	svm_vcpu_init_msrpm(svm->msrpm);
+diff --git a/arch/x86/kvm/vmx/nested.c b/arch/x86/kvm/vmx/nested.c
+index 438256cc157c..88b7c1f00814 100644
+--- a/arch/x86/kvm/vmx/nested.c
++++ b/arch/x86/kvm/vmx/nested.c
+@@ -439,11 +439,6 @@ static void vmx_inject_page_fault_nested(struct kvm_vcpu *vcpu,
+ 	}
+ }
+ 
+-static bool page_address_valid(struct kvm_vcpu *vcpu, gpa_t gpa)
+-{
+-	return PAGE_ALIGNED(gpa) && !(gpa >> cpuid_maxphyaddr(vcpu));
+-}
+-
+ static int nested_vmx_check_io_bitmap_controls(struct kvm_vcpu *vcpu,
+ 					       struct vmcs12 *vmcs12)
+ {
+diff --git a/arch/x86/kvm/x86.c b/arch/x86/kvm/x86.c
+index c6d2c69f3cd9..8ed922b78455 100644
+--- a/arch/x86/kvm/x86.c
++++ b/arch/x86/kvm/x86.c
+@@ -4564,7 +4564,8 @@ long kvm_arch_vcpu_ioctl(struct file *filp,
+ 
+ 		if (kvm_state.flags &
+ 		    ~(KVM_STATE_NESTED_RUN_PENDING | KVM_STATE_NESTED_GUEST_MODE
+-		      | KVM_STATE_NESTED_EVMCS | KVM_STATE_NESTED_MTF_PENDING))
++		      | KVM_STATE_NESTED_EVMCS | KVM_STATE_NESTED_MTF_PENDING
++		      | KVM_STATE_NESTED_GIF_SET))
+ 			break;
+ 
+ 		/* nested_run_pending implies guest_mode.  */
