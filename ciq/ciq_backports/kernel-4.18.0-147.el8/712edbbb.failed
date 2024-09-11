@@ -1,0 +1,333 @@
+ice: Limit the ice_add_rx_frag to frag addition
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-147.el8
+commit-author Maciej Fijalkowski <maciej.fijalkowski@intel.com>
+commit 712edbbb67d404bae055d88e162e13980b426663
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-147.el8/712edbbb.failed
+
+Refactor ice_fetch_rx_buf and ice_add_rx_frag in a way that we have
+standalone functions that do either the skb construction or frag
+addition to previously constructed skb.
+
+The skb handling between rx_bufs is spread among various functions. The
+ice_get_rx_buf will retrieve the skb pointer from rx_buf and if it is a
+NULL pointer then we do the ice_construct_skb, otherwise we add a frag
+to the current skb via ice_add_rx_frag. Then, on the ice_put_rx_buf the
+skb pointer that belongs to rx_buf will be cleared. Moving further, if
+the current frame is not EOP frame we assign the current skb to the
+rx_buf that is pointed by updated next_to_clean indicator.
+
+What is more during the buffer reuse let's assign each member of
+ice_rx_buf individually so we avoid the unnecessary copy of skb.
+
+Last but not least, this logic split will allow us for better code reuse
+when adding a support for build_skb.
+
+	Signed-off-by: Maciej Fijalkowski <maciej.fijalkowski@intel.com>
+	Signed-off-by: Anirudh Venkataramanan <anirudh.venkataramanan@intel.com>
+	Tested-by: Andrew Bowers <andrewx.bowers@intel.com>
+	Signed-off-by: Jeff Kirsher <jeffrey.t.kirsher@intel.com>
+(cherry picked from commit 712edbbb67d404bae055d88e162e13980b426663)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/intel/ice/ice_txrx.c
+diff --cc drivers/net/ethernet/intel/ice/ice_txrx.c
+index b0086743621b,63af5af3c3e8..000000000000
+--- a/drivers/net/ethernet/intel/ice/ice_txrx.c
++++ b/drivers/net/ethernet/intel/ice/ice_txrx.c
+@@@ -581,6 -563,33 +581,36 @@@ static bool ice_add_rx_frag(struct ice_
+  }
+  
+  /**
+++<<<<<<< HEAD
+++=======
++  * ice_add_rx_frag - Add contents of Rx buffer to sk_buff as a frag
++  * @rx_buf: buffer containing page to add
++  * @skb: sk_buff to place the data into
++  * @size: packet length from rx_desc
++  *
++  * This function will add the data contained in rx_buf->page to the skb.
++  * It will just attach the page as a frag to the skb.
++  * The function will then update the page offset.
++  */
++ static void
++ ice_add_rx_frag(struct ice_rx_buf *rx_buf, struct sk_buff *skb,
++ 		unsigned int size)
++ {
++ #if (PAGE_SIZE >= 8192)
++ 	unsigned int truesize = SKB_DATA_ALIGN(size);
++ #else
++ 	unsigned int truesize = ICE_RXBUF_2048;
++ #endif
++ 
++ 	skb_add_rx_frag(skb, skb_shinfo(skb)->nr_frags, rx_buf->page,
++ 			rx_buf->page_offset, size, truesize);
++ 
++ 	/* page is being used so we must update the page offset */
++ 	ice_rx_buf_adjust_pg_offset(rx_buf, truesize);
++ }
++ 
++ /**
+++>>>>>>> 712edbbb67d4 (ice: Limit the ice_add_rx_frag to frag addition)
+   * ice_reuse_rx_page - page flip buffer and store it back on the ring
+   * @rx_ring: Rx descriptor ring to store buffers on
+   * @old_buf: donor buffer to have page reused
+@@@ -604,66 -619,109 +640,163 @@@ static void ice_reuse_rx_page(struct ic
+  }
+  
+  /**
+++<<<<<<< HEAD
+ + * ice_fetch_rx_buf - Allocate skb and populate it
+++=======
++  * ice_get_rx_buf - Fetch Rx buffer and synchronize data for use
++  * @rx_ring: Rx descriptor ring to transact packets on
++  * @skb: skb to be used
++  * @size: size of buffer to add to skb
++  *
++  * This function will pull an Rx buffer from the ring and synchronize it
++  * for use by the CPU.
++  */
++ static struct ice_rx_buf *
++ ice_get_rx_buf(struct ice_ring *rx_ring, struct sk_buff **skb,
++ 	       const unsigned int size)
++ {
++ 	struct ice_rx_buf *rx_buf;
++ 
++ 	rx_buf = &rx_ring->rx_buf[rx_ring->next_to_clean];
++ 	prefetchw(rx_buf->page);
++ 	*skb = rx_buf->skb;
++ 
++ 	/* we are reusing so sync this buffer for CPU use */
++ 	dma_sync_single_range_for_cpu(rx_ring->dev, rx_buf->dma,
++ 				      rx_buf->page_offset, size,
++ 				      DMA_FROM_DEVICE);
++ 
++ 	/* We have pulled a buffer for use, so decrement pagecnt_bias */
++ 	rx_buf->pagecnt_bias--;
++ 
++ 	return rx_buf;
++ }
++ 
++ /**
++  * ice_construct_skb - Allocate skb and populate it
+++>>>>>>> 712edbbb67d4 (ice: Limit the ice_add_rx_frag to frag addition)
+   * @rx_ring: Rx descriptor ring to transact packets on
+ - * @rx_buf: Rx buffer to pull data from
+ - * @size: the length of the packet
+ + * @rx_desc: descriptor containing info written by hardware
+   *
+-  * This function allocates an skb on the fly, and populates it with the page
+-  * data from the current receive descriptor, taking care to set up the skb
+-  * correctly, as well as handling calling the page recycle function if
+-  * necessary.
++  * This function allocates an skb. It then populates it with the page
++  * data from the current receive descriptor, taking care to set up the
++  * skb correctly.
+   */
+++<<<<<<< HEAD
+ +static struct sk_buff *ice_fetch_rx_buf(struct ice_ring *rx_ring,
+ +					union ice_32b_rx_flex_desc *rx_desc)
+ +{
+ +	struct ice_rx_buf *rx_buf;
+ +	struct sk_buff *skb;
+ +	struct page *page;
+ +
+ +	rx_buf = &rx_ring->rx_buf[rx_ring->next_to_clean];
+ +	page = rx_buf->page;
+ +	prefetchw(page);
+ +
+ +	skb = rx_buf->skb;
+ +
+ +	if (likely(!skb)) {
+ +		u8 *page_addr = page_address(page) + rx_buf->page_offset;
+ +
+ +		/* prefetch first cache line of first page */
+ +		prefetch(page_addr);
+++=======
++ static struct sk_buff *
++ ice_construct_skb(struct ice_ring *rx_ring, struct ice_rx_buf *rx_buf,
++ 		  unsigned int size)
++ {
++ 	void *va = page_address(rx_buf->page) + rx_buf->page_offset;
++ 	unsigned int headlen;
++ 	struct sk_buff *skb;
++ 
++ 	/* prefetch first cache line of first page */
++ 	prefetch(va);
+++>>>>>>> 712edbbb67d4 (ice: Limit the ice_add_rx_frag to frag addition)
+  #if L1_CACHE_BYTES < 128
+- 		prefetch((void *)(page_addr + L1_CACHE_BYTES));
++ 	prefetch((u8 *)va + L1_CACHE_BYTES);
+  #endif /* L1_CACHE_BYTES */
+  
+++<<<<<<< HEAD
+ +		/* allocate a skb to store the frags */
+ +		skb = __napi_alloc_skb(&rx_ring->q_vector->napi,
+ +				       ICE_RX_HDR_SIZE,
+ +				       GFP_ATOMIC | __GFP_NOWARN);
+ +		if (unlikely(!skb)) {
+ +			rx_ring->rx_stats.alloc_buf_failed++;
+ +			return NULL;
+ +		}
+ +
+ +		/* we will be copying header into skb->data in
+ +		 * pskb_may_pull so it is in our interest to prefetch
+ +		 * it now to avoid a possible cache miss
+ +		 */
+ +		prefetchw(skb->data);
+ +
+ +		skb_record_rx_queue(skb, rx_ring->q_index);
+ +	} else {
+ +		/* we are reusing so sync this buffer for CPU use */
+ +		dma_sync_single_range_for_cpu(rx_ring->dev, rx_buf->dma,
+ +					      rx_buf->page_offset,
+ +					      ICE_RXBUF_2048,
+ +					      DMA_FROM_DEVICE);
+ +
+ +		rx_buf->skb = NULL;
+ +	}
+ +
+ +	/* pull page into skb */
+ +	if (ice_add_rx_frag(rx_buf, rx_desc, skb)) {
+++=======
++ 	/* allocate a skb to store the frags */
++ 	skb = __napi_alloc_skb(&rx_ring->q_vector->napi, ICE_RX_HDR_SIZE,
++ 			       GFP_ATOMIC | __GFP_NOWARN);
++ 	if (unlikely(!skb))
++ 		return NULL;
++ 
++ 	skb_record_rx_queue(skb, rx_ring->q_index);
++ 	/* Determine available headroom for copy */
++ 	headlen = size;
++ 	if (headlen > ICE_RX_HDR_SIZE)
++ 		headlen = eth_get_headlen(va, ICE_RX_HDR_SIZE);
++ 
++ 	/* align pull length to size of long to optimize memcpy performance */
++ 	memcpy(__skb_put(skb, headlen), va, ALIGN(headlen, sizeof(long)));
++ 
++ 	/* if we exhaust the linear part then add what is left as a frag */
++ 	size -= headlen;
++ 	if (size) {
++ #if (PAGE_SIZE >= 8192)
++ 		unsigned int truesize = SKB_DATA_ALIGN(size);
++ #else
++ 		unsigned int truesize = ICE_RXBUF_2048;
++ #endif
++ 		skb_add_rx_frag(skb, 0, rx_buf->page,
++ 				rx_buf->page_offset + headlen, size, truesize);
++ 		/* buffer is used by skb, update page_offset */
++ 		ice_rx_buf_adjust_pg_offset(rx_buf, truesize);
++ 	} else {
++ 		/* buffer is unused, reset bias back to rx_buf; data was copied
++ 		 * onto skb's linear part so there's no need for adjusting
++ 		 * page offset and we can reuse this buffer as-is
++ 		 */
++ 		rx_buf->pagecnt_bias++;
++ 	}
++ 
++ 	return skb;
++ }
++ 
++ /**
++  * ice_put_rx_buf - Clean up used buffer and either recycle or free
++  * @rx_ring: Rx descriptor ring to transact packets on
++  * @rx_buf: Rx buffer to pull data from
++  *
++  * This function will  clean up the contents of the rx_buf. It will
++  * either recycle the buffer or unmap it and free the associated resources.
++  */
++ static void ice_put_rx_buf(struct ice_ring *rx_ring, struct ice_rx_buf *rx_buf)
++ {
+++>>>>>>> 712edbbb67d4 (ice: Limit the ice_add_rx_frag to frag addition)
+  		/* hand second half of page back to the ring */
+ -	if (ice_can_reuse_rx_page(rx_buf)) {
+  		ice_reuse_rx_page(rx_ring, rx_buf);
+  		rx_ring->rx_stats.page_reuse_count++;
+  	} else {
+@@@ -674,46 -733,7 +807,50 @@@
+  
+  	/* clear contents of buffer_info */
+  	rx_buf->page = NULL;
+++<<<<<<< HEAD
+ +
+ +	return skb;
+ +}
+ +
+ +/**
+ + * ice_pull_tail - ice specific version of skb_pull_tail
+ + * @skb: pointer to current skb being adjusted
+ + *
+ + * This function is an ice specific version of __pskb_pull_tail. The
+ + * main difference between this version and the original function is that
+ + * this function can make several assumptions about the state of things
+ + * that allow for significant optimizations versus the standard function.
+ + * As a result we can do things like drop a frag and maintain an accurate
+ + * truesize for the skb.
+ + */
+ +static void ice_pull_tail(struct sk_buff *skb)
+ +{
+ +	struct skb_frag_struct *frag = &skb_shinfo(skb)->frags[0];
+ +	unsigned int pull_len;
+ +	unsigned char *va;
+ +
+ +	/* it is valid to use page_address instead of kmap since we are
+ +	 * working with pages allocated out of the lomem pool per
+ +	 * alloc_page(GFP_ATOMIC)
+ +	 */
+ +	va = skb_frag_address(frag);
+ +
+ +	/* we need the header to contain the greater of either ETH_HLEN or
+ +	 * 60 bytes if the skb->len is less than 60 for skb_pad.
+ +	 */
+ +	pull_len = eth_get_headlen(va, ICE_RX_HDR_SIZE);
+ +
+ +	/* align pull length to size of long to optimize memcpy performance */
+ +	skb_copy_to_linear_data(skb, va, ALIGN(pull_len, sizeof(long)));
+ +
+ +	/* update all of the pointers */
+ +	skb_frag_size_sub(frag, pull_len);
+ +	frag->page_offset += pull_len;
+ +	skb->data_len -= pull_len;
+ +	skb->tail += pull_len;
+++=======
++ 	rx_buf->skb = NULL;
+++>>>>>>> 712edbbb67d4 (ice: Limit the ice_add_rx_frag to frag addition)
+  }
+  
+  /**
+@@@ -991,11 -1011,24 +1128,29 @@@ static int ice_clean_rx_irq(struct ice_
+  		 */
+  		dma_rmb();
+  
+++<<<<<<< HEAD
+ +		/* allocate (if needed) and populate skb */
+ +		skb = ice_fetch_rx_buf(rx_ring, rx_desc);
+ +		if (!skb)
+++=======
++ 		size = le16_to_cpu(rx_desc->wb.pkt_len) &
++ 			ICE_RX_FLX_DESC_PKT_LEN_M;
++ 
++ 		rx_buf = ice_get_rx_buf(rx_ring, &skb, size);
++ 		/* allocate (if needed) and populate skb */
++ 		if (skb)
++ 			ice_add_rx_frag(rx_buf, skb, size);
++ 		else
++ 			skb = ice_construct_skb(rx_ring, rx_buf, size);
++ 
++ 		/* exit if we failed to retrieve a buffer */
++ 		if (!skb) {
++ 			rx_ring->rx_stats.alloc_buf_failed++;
++ 			rx_buf->pagecnt_bias++;
+++>>>>>>> 712edbbb67d4 (ice: Limit the ice_add_rx_frag to frag addition)
+  			break;
++ 		}
+  
+ -		ice_put_rx_buf(rx_ring, rx_buf);
+  		cleaned_count++;
+  
+  		/* skip if it is NOP desc */
+* Unmerged path drivers/net/ethernet/intel/ice/ice_txrx.c
