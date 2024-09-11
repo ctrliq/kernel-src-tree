@@ -1,0 +1,382 @@
+net: switchdev: add a context void pointer to struct switchdev_notifier_info
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-358.el8
+commit-author Vladimir Oltean <vladimir.oltean@nxp.com>
+commit 69bfac968a06aab5927160f8736485f85c3e8ee8
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-358.el8/69bfac96.failed
+
+In the case where the driver asks for a replay of a certain type of
+event (port object or attribute) for a bridge port that is a LAG, it may
+do so because this port has just joined the LAG.
+
+But there might already be other switchdev ports in that LAG, and it is
+preferable that those preexisting switchdev ports do not act upon the
+replayed event.
+
+The solution is to add a context to switchdev events, which is NULL most
+of the time (when the bridge layer initiates the call) but which can be
+set to a value controlled by the switchdev driver when a replay is
+requested. The driver can then check the context to figure out if all
+ports within the LAG should act upon the switchdev event, or just the
+ones that match the context.
+
+We have to modify all switchdev_handle_* helper functions as well as the
+prototypes in the drivers that use these helpers too, because these
+helpers hide the underlying struct switchdev_notifier_info from us and
+there is no way to retrieve the context otherwise.
+
+The context structure will be populated and used in later patches.
+
+	Signed-off-by: Vladimir Oltean <vladimir.oltean@nxp.com>
+	Reviewed-by: Florian Fainelli <f.fainelli@gmail.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 69bfac968a06aab5927160f8736485f85c3e8ee8)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/freescale/dpaa2/dpaa2-switch.c
+#	drivers/net/ethernet/marvell/prestera/prestera_switchdev.c
+#	drivers/net/ethernet/mellanox/mlx5/core/en/rep/bridge.c
+#	drivers/net/ethernet/microchip/sparx5/sparx5_switchdev.c
+#	drivers/net/ethernet/mscc/ocelot_net.c
+#	drivers/net/ethernet/ti/am65-cpsw-switchdev.c
+#	drivers/net/ethernet/ti/cpsw_switchdev.c
+#	net/dsa/slave.c
+#	net/switchdev/switchdev.c
+diff --cc net/dsa/slave.c
+index 24cc4de02bd3,3692259a025f..000000000000
+--- a/net/dsa/slave.c
++++ b/net/dsa/slave.c
+@@@ -274,9 -271,9 +274,9 @@@ static int dsa_slave_ioctl(struct net_d
+  	return phylink_mii_ioctl(p->dp->pl, ifr, cmd);
+  }
+  
+- static int dsa_slave_port_attr_set(struct net_device *dev,
++ static int dsa_slave_port_attr_set(struct net_device *dev, const void *ctx,
+  				   const struct switchdev_attr *attr,
+ -				   struct netlink_ext_ack *extack)
+ +				   struct switchdev_trans *trans)
+  {
+  	struct dsa_port *dp = dsa_slave_to_port(dev);
+  	int ret;
+@@@ -300,9 -325,78 +300,82 @@@
+  	return ret;
+  }
+  
+++<<<<<<< HEAD
+ +static int dsa_slave_port_obj_add(struct net_device *dev,
+++=======
++ /* Must be called under rcu_read_lock() */
++ static int
++ dsa_slave_vlan_check_for_8021q_uppers(struct net_device *slave,
++ 				      const struct switchdev_obj_port_vlan *vlan)
++ {
++ 	struct net_device *upper_dev;
++ 	struct list_head *iter;
++ 
++ 	netdev_for_each_upper_dev_rcu(slave, upper_dev, iter) {
++ 		u16 vid;
++ 
++ 		if (!is_vlan_dev(upper_dev))
++ 			continue;
++ 
++ 		vid = vlan_dev_vlan_id(upper_dev);
++ 		if (vid == vlan->vid)
++ 			return -EBUSY;
++ 	}
++ 
++ 	return 0;
++ }
++ 
++ static int dsa_slave_vlan_add(struct net_device *dev,
++ 			      const struct switchdev_obj *obj,
++ 			      struct netlink_ext_ack *extack)
++ {
++ 	struct net_device *master = dsa_slave_to_master(dev);
++ 	struct dsa_port *dp = dsa_slave_to_port(dev);
++ 	struct switchdev_obj_port_vlan vlan;
++ 	int err;
++ 
++ 	if (dsa_port_skip_vlan_configuration(dp)) {
++ 		NL_SET_ERR_MSG_MOD(extack, "skipping configuration of VLAN");
++ 		return 0;
++ 	}
++ 
++ 	vlan = *SWITCHDEV_OBJ_PORT_VLAN(obj);
++ 
++ 	/* Deny adding a bridge VLAN when there is already an 802.1Q upper with
++ 	 * the same VID.
++ 	 */
++ 	if (br_vlan_enabled(dp->bridge_dev)) {
++ 		rcu_read_lock();
++ 		err = dsa_slave_vlan_check_for_8021q_uppers(dev, &vlan);
++ 		rcu_read_unlock();
++ 		if (err) {
++ 			NL_SET_ERR_MSG_MOD(extack,
++ 					   "Port already has a VLAN upper with this VID");
++ 			return err;
++ 		}
++ 	}
++ 
++ 	err = dsa_port_vlan_add(dp, &vlan, extack);
++ 	if (err)
++ 		return err;
++ 
++ 	/* We need the dedicated CPU port to be a member of the VLAN as well.
++ 	 * Even though drivers often handle CPU membership in special ways,
++ 	 * it doesn't make sense to program a PVID, so clear this flag.
++ 	 */
++ 	vlan.flags &= ~BRIDGE_VLAN_INFO_PVID;
++ 
++ 	err = dsa_port_vlan_add(dp->cpu_dp, &vlan, extack);
++ 	if (err)
++ 		return err;
++ 
++ 	return vlan_vid_add(master, htons(ETH_P_8021Q), vlan.vid);
++ }
++ 
++ static int dsa_slave_port_obj_add(struct net_device *dev, const void *ctx,
+++>>>>>>> 69bfac968a06 (net: switchdev: add a context void pointer to struct switchdev_notifier_info)
+  				  const struct switchdev_obj *obj,
+ -				  struct netlink_ext_ack *extack)
+ +				  struct switchdev_trans *trans)
+  {
+  	struct dsa_port *dp = dsa_slave_to_port(dev);
+  	int err;
+@@@ -335,7 -444,32 +408,36 @@@
+  	return err;
+  }
+  
+++<<<<<<< HEAD
+ +static int dsa_slave_port_obj_del(struct net_device *dev,
+++=======
++ static int dsa_slave_vlan_del(struct net_device *dev,
++ 			      const struct switchdev_obj *obj)
++ {
++ 	struct net_device *master = dsa_slave_to_master(dev);
++ 	struct dsa_port *dp = dsa_slave_to_port(dev);
++ 	struct switchdev_obj_port_vlan *vlan;
++ 	int err;
++ 
++ 	if (dsa_port_skip_vlan_configuration(dp))
++ 		return 0;
++ 
++ 	vlan = SWITCHDEV_OBJ_PORT_VLAN(obj);
++ 
++ 	/* Do not deprogram the CPU port as it may be shared with other user
++ 	 * ports which can be members of this VLAN as well.
++ 	 */
++ 	err = dsa_port_vlan_del(dp, vlan);
++ 	if (err)
++ 		return err;
++ 
++ 	vlan_vid_del(master, htons(ETH_P_8021Q), vlan->vid);
++ 
++ 	return 0;
++ }
++ 
++ static int dsa_slave_port_obj_del(struct net_device *dev, const void *ctx,
+++>>>>>>> 69bfac968a06 (net: switchdev: add a context void pointer to struct switchdev_notifier_info)
+  				  const struct switchdev_obj *obj)
+  {
+  	struct dsa_port *dp = dsa_slave_to_port(dev);
+diff --cc net/switchdev/switchdev.c
+index 09070c250522,070698dd19bc..000000000000
+--- a/net/switchdev/switchdev.c
++++ b/net/switchdev/switchdev.c
+@@@ -451,21 -381,20 +451,26 @@@ EXPORT_SYMBOL_GPL(call_switchdev_blocki
+  static int __switchdev_handle_port_obj_add(struct net_device *dev,
+  			struct switchdev_notifier_port_obj_info *port_obj_info,
+  			bool (*check_cb)(const struct net_device *dev),
+- 			int (*add_cb)(struct net_device *dev,
++ 			int (*add_cb)(struct net_device *dev, const void *ctx,
+  				      const struct switchdev_obj *obj,
+ +				      struct switchdev_trans *trans,
+  				      struct netlink_ext_ack *extack))
+  {
++ 	struct switchdev_notifier_info *info = &port_obj_info->info;
+  	struct netlink_ext_ack *extack;
+  	struct net_device *lower_dev;
+  	struct list_head *iter;
+  	int err = -EOPNOTSUPP;
+  
+- 	extack = switchdev_notifier_info_to_extack(&port_obj_info->info);
++ 	extack = switchdev_notifier_info_to_extack(info);
+  
+  	if (check_cb(dev)) {
+++<<<<<<< HEAD
+ +		err = add_cb(dev, port_obj_info->obj, port_obj_info->trans,
+ +			     extack);
+++=======
++ 		err = add_cb(dev, info->ctx, port_obj_info->obj, extack);
+++>>>>>>> 69bfac968a06 (net: switchdev: add a context void pointer to struct switchdev_notifier_info)
+  		if (err != -EOPNOTSUPP)
+  			port_obj_info->handled = true;
+  		return err;
+@@@ -494,9 -423,8 +499,9 @@@
+  int switchdev_handle_port_obj_add(struct net_device *dev,
+  			struct switchdev_notifier_port_obj_info *port_obj_info,
+  			bool (*check_cb)(const struct net_device *dev),
+- 			int (*add_cb)(struct net_device *dev,
++ 			int (*add_cb)(struct net_device *dev, const void *ctx,
+  				      const struct switchdev_obj *obj,
+ +				      struct switchdev_trans *trans,
+  				      struct netlink_ext_ack *extack))
+  {
+  	int err;
+@@@ -565,16 -494,20 +571,28 @@@ EXPORT_SYMBOL_GPL(switchdev_handle_port
+  static int __switchdev_handle_port_attr_set(struct net_device *dev,
+  			struct switchdev_notifier_port_attr_info *port_attr_info,
+  			bool (*check_cb)(const struct net_device *dev),
+- 			int (*set_cb)(struct net_device *dev,
++ 			int (*set_cb)(struct net_device *dev, const void *ctx,
+  				      const struct switchdev_attr *attr,
+ -				      struct netlink_ext_ack *extack))
+ +				      struct switchdev_trans *trans))
+  {
+++<<<<<<< HEAD
+++=======
++ 	struct switchdev_notifier_info *info = &port_attr_info->info;
++ 	struct netlink_ext_ack *extack;
+++>>>>>>> 69bfac968a06 (net: switchdev: add a context void pointer to struct switchdev_notifier_info)
+  	struct net_device *lower_dev;
+  	struct list_head *iter;
+  	int err = -EOPNOTSUPP;
+  
+++<<<<<<< HEAD
+ +	if (check_cb(dev)) {
+ +		err = set_cb(dev, port_attr_info->attr, port_attr_info->trans);
+++=======
++ 	extack = switchdev_notifier_info_to_extack(info);
++ 
++ 	if (check_cb(dev)) {
++ 		err = set_cb(dev, info->ctx, port_attr_info->attr, extack);
+++>>>>>>> 69bfac968a06 (net: switchdev: add a context void pointer to struct switchdev_notifier_info)
+  		if (err != -EOPNOTSUPP)
+  			port_attr_info->handled = true;
+  		return err;
+@@@ -603,9 -536,9 +621,9 @@@
+  int switchdev_handle_port_attr_set(struct net_device *dev,
+  			struct switchdev_notifier_port_attr_info *port_attr_info,
+  			bool (*check_cb)(const struct net_device *dev),
+- 			int (*set_cb)(struct net_device *dev,
++ 			int (*set_cb)(struct net_device *dev, const void *ctx,
+  				      const struct switchdev_attr *attr,
+ -				      struct netlink_ext_ack *extack))
+ +				      struct switchdev_trans *trans))
+  {
+  	int err;
+  
+* Unmerged path drivers/net/ethernet/freescale/dpaa2/dpaa2-switch.c
+* Unmerged path drivers/net/ethernet/marvell/prestera/prestera_switchdev.c
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/en/rep/bridge.c
+* Unmerged path drivers/net/ethernet/microchip/sparx5/sparx5_switchdev.c
+* Unmerged path drivers/net/ethernet/mscc/ocelot_net.c
+* Unmerged path drivers/net/ethernet/ti/am65-cpsw-switchdev.c
+* Unmerged path drivers/net/ethernet/ti/cpsw_switchdev.c
+* Unmerged path drivers/net/ethernet/freescale/dpaa2/dpaa2-switch.c
+* Unmerged path drivers/net/ethernet/marvell/prestera/prestera_switchdev.c
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/en/rep/bridge.c
+diff --git a/drivers/net/ethernet/mellanox/mlxsw/spectrum_switchdev.c b/drivers/net/ethernet/mellanox/mlxsw/spectrum_switchdev.c
+index 14ce372c3f85..4cbf9ab45a9b 100644
+--- a/drivers/net/ethernet/mellanox/mlxsw/spectrum_switchdev.c
++++ b/drivers/net/ethernet/mellanox/mlxsw/spectrum_switchdev.c
+@@ -924,7 +924,7 @@ mlxsw_sp_port_attr_br_mrouter_set(struct mlxsw_sp_port *mlxsw_sp_port,
+ 	return 0;
+ }
+ 
+-static int mlxsw_sp_port_attr_set(struct net_device *dev,
++static int mlxsw_sp_port_attr_set(struct net_device *dev, const void *ctx,
+ 				  const struct switchdev_attr *attr,
+ 				  struct switchdev_trans *trans)
+ {
+@@ -1815,7 +1815,7 @@ mlxsw_sp_port_mrouter_update_mdb(struct mlxsw_sp_port *mlxsw_sp_port,
+ 	}
+ }
+ 
+-static int mlxsw_sp_port_obj_add(struct net_device *dev,
++static int mlxsw_sp_port_obj_add(struct net_device *dev, const void *ctx,
+ 				 const struct switchdev_obj *obj,
+ 				 struct switchdev_trans *trans,
+ 				 struct netlink_ext_ack *extack)
+@@ -1971,7 +1971,7 @@ mlxsw_sp_bridge_port_mdb_flush(struct mlxsw_sp_port *mlxsw_sp_port,
+ 	}
+ }
+ 
+-static int mlxsw_sp_port_obj_del(struct net_device *dev,
++static int mlxsw_sp_port_obj_del(struct net_device *dev, const void *ctx,
+ 				 const struct switchdev_obj *obj)
+ {
+ 	struct mlxsw_sp_port *mlxsw_sp_port = netdev_priv(dev);
+* Unmerged path drivers/net/ethernet/microchip/sparx5/sparx5_switchdev.c
+* Unmerged path drivers/net/ethernet/mscc/ocelot_net.c
+* Unmerged path drivers/net/ethernet/ti/am65-cpsw-switchdev.c
+* Unmerged path drivers/net/ethernet/ti/cpsw_switchdev.c
+diff --git a/include/net/switchdev.h b/include/net/switchdev.h
+index 4b6737027b82..ba3c6d88147c 100644
+--- a/include/net/switchdev.h
++++ b/include/net/switchdev.h
+@@ -155,6 +155,7 @@ enum switchdev_notifier_type {
+ struct switchdev_notifier_info {
+ 	struct net_device *dev;
+ 	struct netlink_ext_ack *extack;
++	const void *ctx;
+ };
+ 
+ struct switchdev_notifier_fdb_info {
+@@ -222,20 +223,20 @@ void switchdev_port_fwd_mark_set(struct net_device *dev,
+ int switchdev_handle_port_obj_add(struct net_device *dev,
+ 			struct switchdev_notifier_port_obj_info *port_obj_info,
+ 			bool (*check_cb)(const struct net_device *dev),
+-			int (*add_cb)(struct net_device *dev,
++			int (*add_cb)(struct net_device *dev, const void *ctx,
+ 				      const struct switchdev_obj *obj,
+ 				      struct switchdev_trans *trans,
+ 				      struct netlink_ext_ack *extack));
+ int switchdev_handle_port_obj_del(struct net_device *dev,
+ 			struct switchdev_notifier_port_obj_info *port_obj_info,
+ 			bool (*check_cb)(const struct net_device *dev),
+-			int (*del_cb)(struct net_device *dev,
++			int (*del_cb)(struct net_device *dev, const void *ctx,
+ 				      const struct switchdev_obj *obj));
+ 
+ int switchdev_handle_port_attr_set(struct net_device *dev,
+ 			struct switchdev_notifier_port_attr_info *port_attr_info,
+ 			bool (*check_cb)(const struct net_device *dev),
+-			int (*set_cb)(struct net_device *dev,
++			int (*set_cb)(struct net_device *dev, const void *ctx,
+ 				      const struct switchdev_attr *attr,
+ 				      struct switchdev_trans *trans));
+ #else
+@@ -307,7 +308,7 @@ static inline int
+ switchdev_handle_port_obj_add(struct net_device *dev,
+ 			struct switchdev_notifier_port_obj_info *port_obj_info,
+ 			bool (*check_cb)(const struct net_device *dev),
+-			int (*add_cb)(struct net_device *dev,
++			int (*add_cb)(struct net_device *dev, const void *ctx,
+ 				      const struct switchdev_obj *obj,
+ 				      struct switchdev_trans *trans,
+ 				      struct netlink_ext_ack *extack))
+@@ -319,7 +320,7 @@ static inline int
+ switchdev_handle_port_obj_del(struct net_device *dev,
+ 			struct switchdev_notifier_port_obj_info *port_obj_info,
+ 			bool (*check_cb)(const struct net_device *dev),
+-			int (*del_cb)(struct net_device *dev,
++			int (*del_cb)(struct net_device *dev, const void *ctx,
+ 				      const struct switchdev_obj *obj))
+ {
+ 	return 0;
+@@ -329,7 +330,7 @@ static inline int
+ switchdev_handle_port_attr_set(struct net_device *dev,
+ 			struct switchdev_notifier_port_attr_info *port_attr_info,
+ 			bool (*check_cb)(const struct net_device *dev),
+-			int (*set_cb)(struct net_device *dev,
++			int (*set_cb)(struct net_device *dev, const void *ctx,
+ 				      const struct switchdev_attr *attr,
+ 				      struct switchdev_trans *trans))
+ {
+* Unmerged path net/dsa/slave.c
+* Unmerged path net/switchdev/switchdev.c
