@@ -1,0 +1,219 @@
+bnxt_en: Prepare bnxt_init_one() to be called multiple times.
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-193.el8
+Rebuild_CHGLOG: - [netdrv] bnxt_en: Prepare bnxt_init_one() to be called multiple times (Jonathan Toppins) [1724766]
+Rebuild_FUZZ: 99.17%
+commit-author Michael Chan <michael.chan@broadcom.com>
+commit ba642ab773db97c32293547485f562d2dfc06666
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-193.el8/ba642ab7.failed
+
+In preparation for the new firmware reset feature, some of the logic
+in bnxt_init_one() and related functions will be called again after
+firmware has reset.  Reset some of the flags and capabilities so that
+everything that can change can be re-initialized.  Refactor some
+functions to probe firmware versions and capabilities.  Check some
+buffers before allocating as they may have been allocated previously.
+
+	Signed-off-by: Michael Chan <michael.chan@broadcom.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit ba642ab773db97c32293547485f562d2dfc06666)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/broadcom/bnxt/bnxt.c
+diff --cc drivers/net/ethernet/broadcom/bnxt/bnxt.c
+index 73747346c6cf,696a5488d013..000000000000
+--- a/drivers/net/ethernet/broadcom/bnxt/bnxt.c
++++ b/drivers/net/ethernet/broadcom/bnxt/bnxt.c
+@@@ -4831,6 -5022,8 +4837,11 @@@ static int bnxt_hwrm_vnic_qcaps(struct 
+  	struct hwrm_vnic_qcaps_input req = {0};
+  	int rc;
+  
+++<<<<<<< HEAD
+++=======
++ 	bp->hw_ring_stats_size = sizeof(struct ctx_hw_stats);
++ 	bp->flags &= ~(BNXT_FLAG_NEW_RSS_CAP | BNXT_FLAG_ROCE_MIRROR_CAP);
+++>>>>>>> ba642ab773db (bnxt_en: Prepare bnxt_init_one() to be called multiple times.)
+  	if (bp->hwrm_spec_code < 0x10600)
+  		return 0;
+  
+@@@ -9687,6 -9966,115 +9717,118 @@@ static void bnxt_init_dflt_coal(struct 
+  	bp->stats_coal_ticks = BNXT_DEF_STATS_COAL_TICKS;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static int bnxt_fw_init_one_p1(struct bnxt *bp)
++ {
++ 	int rc;
++ 
++ 	bp->fw_cap = 0;
++ 	rc = bnxt_hwrm_ver_get(bp);
++ 	if (rc)
++ 		return rc;
++ 
++ 	if (bp->fw_cap & BNXT_FW_CAP_KONG_MB_CHNL) {
++ 		rc = bnxt_alloc_kong_hwrm_resources(bp);
++ 		if (rc)
++ 			bp->fw_cap &= ~BNXT_FW_CAP_KONG_MB_CHNL;
++ 	}
++ 
++ 	if ((bp->fw_cap & BNXT_FW_CAP_SHORT_CMD) ||
++ 	    bp->hwrm_max_ext_req_len > BNXT_HWRM_MAX_REQ_LEN) {
++ 		rc = bnxt_alloc_hwrm_short_cmd_req(bp);
++ 		if (rc)
++ 			return rc;
++ 	}
++ 	rc = bnxt_hwrm_func_reset(bp);
++ 	if (rc)
++ 		return -ENODEV;
++ 
++ 	bnxt_hwrm_fw_set_time(bp);
++ 	return 0;
++ }
++ 
++ static int bnxt_fw_init_one_p2(struct bnxt *bp)
++ {
++ 	int rc;
++ 
++ 	/* Get the MAX capabilities for this function */
++ 	rc = bnxt_hwrm_func_qcaps(bp);
++ 	if (rc) {
++ 		netdev_err(bp->dev, "hwrm query capability failure rc: %x\n",
++ 			   rc);
++ 		return -ENODEV;
++ 	}
++ 
++ 	rc = bnxt_hwrm_cfa_adv_flow_mgnt_qcaps(bp);
++ 	if (rc)
++ 		netdev_warn(bp->dev, "hwrm query adv flow mgnt failure rc: %d\n",
++ 			    rc);
++ 
++ 	rc = bnxt_hwrm_func_drv_rgtr(bp);
++ 	if (rc)
++ 		return -ENODEV;
++ 
++ 	rc = bnxt_hwrm_func_rgtr_async_events(bp, NULL, 0);
++ 	if (rc)
++ 		return -ENODEV;
++ 
++ 	bnxt_hwrm_func_qcfg(bp);
++ 	bnxt_hwrm_vnic_qcaps(bp);
++ 	bnxt_hwrm_port_led_qcaps(bp);
++ 	bnxt_ethtool_init(bp);
++ 	bnxt_dcb_init(bp);
++ 	return 0;
++ }
++ 
++ static void bnxt_set_dflt_rss_hash_type(struct bnxt *bp)
++ {
++ 	bp->flags &= ~BNXT_FLAG_UDP_RSS_CAP;
++ 	bp->rss_hash_cfg = VNIC_RSS_CFG_REQ_HASH_TYPE_IPV4 |
++ 			   VNIC_RSS_CFG_REQ_HASH_TYPE_TCP_IPV4 |
++ 			   VNIC_RSS_CFG_REQ_HASH_TYPE_IPV6 |
++ 			   VNIC_RSS_CFG_REQ_HASH_TYPE_TCP_IPV6;
++ 	if (BNXT_CHIP_P4(bp) && bp->hwrm_spec_code >= 0x10501) {
++ 		bp->flags |= BNXT_FLAG_UDP_RSS_CAP;
++ 		bp->rss_hash_cfg |= VNIC_RSS_CFG_REQ_HASH_TYPE_UDP_IPV4 |
++ 				    VNIC_RSS_CFG_REQ_HASH_TYPE_UDP_IPV6;
++ 	}
++ }
++ 
++ static void bnxt_set_dflt_rfs(struct bnxt *bp)
++ {
++ 	struct net_device *dev = bp->dev;
++ 
++ 	dev->hw_features &= ~NETIF_F_NTUPLE;
++ 	dev->features &= ~NETIF_F_NTUPLE;
++ 	bp->flags &= ~BNXT_FLAG_RFS;
++ 	if (bnxt_rfs_supported(bp)) {
++ 		dev->hw_features |= NETIF_F_NTUPLE;
++ 		if (bnxt_rfs_capable(bp)) {
++ 			bp->flags |= BNXT_FLAG_RFS;
++ 			dev->features |= NETIF_F_NTUPLE;
++ 		}
++ 	}
++ }
++ 
++ static void bnxt_fw_init_one_p3(struct bnxt *bp)
++ {
++ 	struct pci_dev *pdev = bp->pdev;
++ 
++ 	bnxt_set_dflt_rss_hash_type(bp);
++ 	bnxt_set_dflt_rfs(bp);
++ 
++ 	bnxt_get_wol_settings(bp);
++ 	if (bp->flags & BNXT_FLAG_WOL_CAP)
++ 		device_set_wakeup_enable(&pdev->dev, bp->wol);
++ 	else
++ 		device_set_wakeup_capable(&pdev->dev, false);
++ 
++ 	bnxt_hwrm_set_cache_line_size(bp, cache_line_size());
++ 	bnxt_hwrm_coal_params_qcaps(bp);
++ }
++ 
+++>>>>>>> ba642ab773db (bnxt_en: Prepare bnxt_init_one() to be called multiple times.)
+  static int bnxt_init_board(struct pci_dev *pdev, struct net_device *dev)
+  {
+  	int rc;
+@@@ -10655,7 -11031,9 +10798,13 @@@ static int bnxt_init_one(struct pci_de
+  		goto init_err_pci_clean;
+  
+  	mutex_init(&bp->hwrm_cmd_lock);
+++<<<<<<< HEAD
+ +	rc = bnxt_hwrm_ver_get(bp);
+++=======
++ 	mutex_init(&bp->link_lock);
++ 
++ 	rc = bnxt_fw_init_one_p1(bp);
+++>>>>>>> ba642ab773db (bnxt_en: Prepare bnxt_init_one() to be called multiple times.)
+  	if (rc)
+  		goto init_err_pci_clean;
+  
+* Unmerged path drivers/net/ethernet/broadcom/bnxt/bnxt.c
+diff --git a/drivers/net/ethernet/broadcom/bnxt/bnxt_dcb.c b/drivers/net/ethernet/broadcom/bnxt/bnxt_dcb.c
+index cf7ae45afada..205df4b0027e 100644
+--- a/drivers/net/ethernet/broadcom/bnxt/bnxt_dcb.c
++++ b/drivers/net/ethernet/broadcom/bnxt/bnxt_dcb.c
+@@ -389,6 +389,7 @@ static int bnxt_hwrm_queue_dscp_qcaps(struct bnxt *bp)
+ 	struct hwrm_queue_dscp_qcaps_input req = {0};
+ 	int rc;
+ 
++	bp->max_dscp_value = 0;
+ 	if (bp->hwrm_spec_code < 0x10800 || BNXT_VF(bp))
+ 		return 0;
+ 
+@@ -718,6 +719,7 @@ static const struct dcbnl_rtnl_ops dcbnl_ops = {
+ 
+ void bnxt_dcb_init(struct bnxt *bp)
+ {
++	bp->dcbx_cap = 0;
+ 	if (bp->hwrm_spec_code < 0x10501)
+ 		return;
+ 
+diff --git a/drivers/net/ethernet/broadcom/bnxt/bnxt_ethtool.c b/drivers/net/ethernet/broadcom/bnxt/bnxt_ethtool.c
+index 438737449e72..a6cdf345d4bd 100644
+--- a/drivers/net/ethernet/broadcom/bnxt/bnxt_ethtool.c
++++ b/drivers/net/ethernet/broadcom/bnxt/bnxt_ethtool.c
+@@ -3310,6 +3310,7 @@ void bnxt_ethtool_init(struct bnxt *bp)
+ 
+ 	bnxt_get_pkgver(dev);
+ 
++	bp->num_tests = 0;
+ 	if (bp->hwrm_spec_code < 0x10704 || !BNXT_SINGLE_PF(bp))
+ 		return;
+ 
+@@ -3319,7 +3320,9 @@ void bnxt_ethtool_init(struct bnxt *bp)
+ 	if (rc)
+ 		goto ethtool_init_exit;
+ 
+-	test_info = kzalloc(sizeof(*bp->test_info), GFP_KERNEL);
++	test_info = bp->test_info;
++	if (!test_info)
++		test_info = kzalloc(sizeof(*bp->test_info), GFP_KERNEL);
+ 	if (!test_info)
+ 		goto ethtool_init_exit;
+ 
