@@ -1,0 +1,170 @@
+blkcg: associate a blkg for pages being evicted by swap
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-80.el8
+commit-author Dennis Zhou (Facebook) <dennisszhou@gmail.com>
+commit 74b7c02a9bc124ee3df0d77880ee26db0a325516
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-80.el8/74b7c02a.failed
+
+A prior patch in this series added blkg association to bios issued by
+cgroups. There are two other paths that we want to attribute work back
+to the appropriate cgroup: swap and writeback. Here we modify the way
+swap tags bios to include the blkg. Writeback will be tackle in the next
+patch.
+
+	Signed-off-by: Dennis Zhou <dennisszhou@gmail.com>
+	Reviewed-by: Josef Bacik <josef@toxicpanda.com>
+	Acked-by: Tejun Heo <tj@kernel.org>
+	Signed-off-by: Jens Axboe <axboe@kernel.dk>
+(cherry picked from commit 74b7c02a9bc124ee3df0d77880ee26db0a325516)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/bio.h
+diff --cc include/linux/bio.h
+index 056fb627edb3,c73a870ebc0e..000000000000
+--- a/include/linux/bio.h
++++ b/include/linux/bio.h
+@@@ -512,11 -542,19 +512,25 @@@ static inline int bio_associate_blkg_fr
+  #ifdef CONFIG_BLK_CGROUP
+  int bio_associate_blkcg(struct bio *bio, struct cgroup_subsys_state *blkcg_css);
+  int bio_associate_blkg(struct bio *bio, struct blkcg_gq *blkg);
+++<<<<<<< HEAD
+++=======
++ int bio_associate_blkg_from_css(struct bio *bio,
++ 				struct cgroup_subsys_state *css);
++ int bio_associate_create_blkg(struct request_queue *q, struct bio *bio);
+++>>>>>>> 74b7c02a9bc1 (blkcg: associate a blkg for pages being evicted by swap)
+  void bio_disassociate_task(struct bio *bio);
+  void bio_clone_blkcg_association(struct bio *dst, struct bio *src);
+  #else	/* CONFIG_BLK_CGROUP */
+  static inline int bio_associate_blkcg(struct bio *bio,
+  			struct cgroup_subsys_state *blkcg_css) { return 0; }
+++<<<<<<< HEAD
+++=======
++ static inline int bio_associate_blkg_from_css(struct bio *bio,
++ 					      struct cgroup_subsys_state *css)
++ { return 0; }
++ static inline int bio_associate_create_blkg(struct request_queue *q,
++ 					    struct bio *bio) { return 0; }
+++>>>>>>> 74b7c02a9bc1 (blkcg: associate a blkg for pages being evicted by swap)
+  static inline void bio_disassociate_task(struct bio *bio) { }
+  static inline void bio_clone_blkcg_association(struct bio *dst,
+  			struct bio *src) { }
+diff --git a/block/bio.c b/block/bio.c
+index 8d70c85b6b8f..3b1b1fba26b6 100644
+--- a/block/bio.c
++++ b/block/bio.c
+@@ -1956,30 +1956,6 @@ EXPORT_SYMBOL(bioset_init_from_src);
+ 
+ #ifdef CONFIG_BLK_CGROUP
+ 
+-#ifdef CONFIG_MEMCG
+-/**
+- * bio_associate_blkcg_from_page - associate a bio with the page's blkcg
+- * @bio: target bio
+- * @page: the page to lookup the blkcg from
+- *
+- * Associate @bio with the blkcg from @page's owning memcg.  This works like
+- * every other associate function wrt references.
+- */
+-int bio_associate_blkcg_from_page(struct bio *bio, struct page *page)
+-{
+-	struct cgroup_subsys_state *blkcg_css;
+-
+-	if (unlikely(bio->bi_css))
+-		return -EBUSY;
+-	if (!page->mem_cgroup)
+-		return 0;
+-	blkcg_css = cgroup_get_e_css(page->mem_cgroup->css.cgroup,
+-				     &io_cgrp_subsys);
+-	bio->bi_css = blkcg_css;
+-	return 0;
+-}
+-#endif /* CONFIG_MEMCG */
+-
+ /**
+  * bio_associate_blkcg - associate a bio with the specified blkcg
+  * @bio: target bio
+@@ -2027,6 +2003,65 @@ int bio_associate_blkg(struct bio *bio, struct blkcg_gq *blkg)
+ 	return 0;
+ }
+ 
++static int __bio_associate_blkg_from_css(struct bio *bio,
++					 struct cgroup_subsys_state *css)
++{
++	struct blkcg_gq *blkg;
++
++	rcu_read_lock();
++
++	blkg = blkg_lookup_create(css_to_blkcg(css), bio->bi_disk->queue);
++
++	rcu_read_unlock();
++
++	return bio_associate_blkg(bio, blkg);
++}
++
++/**
++ * bio_associate_blkg_from_css - associate a bio with a specified css
++ * @bio: target bio
++ * @css: target css
++ *
++ * Associate @bio with the blkg found by combining the css's blkg and the
++ * request_queue of the @bio.  This takes a reference on the css that will
++ * be put upon freeing of @bio.
++ */
++int bio_associate_blkg_from_css(struct bio *bio,
++				struct cgroup_subsys_state *css)
++{
++	css_get(css);
++	bio->bi_css = css;
++	return __bio_associate_blkg_from_css(bio, css);
++}
++EXPORT_SYMBOL_GPL(bio_associate_blkg_from_css);
++
++#ifdef CONFIG_MEMCG
++/**
++ * bio_associate_blkg_from_page - associate a bio with the page's blkg
++ * @bio: target bio
++ * @page: the page to lookup the blkcg from
++ *
++ * Associate @bio with the blkg from @page's owning memcg and the respective
++ * request_queue.  This works like every other associate function wrt
++ * references.
++ *
++ * Note: this must be called after bio has an associated device.
++ */
++int bio_associate_blkg_from_page(struct bio *bio, struct page *page)
++{
++	struct cgroup_subsys_state *css;
++
++	if (unlikely(bio->bi_css))
++		return -EBUSY;
++	if (!page->mem_cgroup)
++		return 0;
++	css = cgroup_get_e_css(page->mem_cgroup->css.cgroup, &io_cgrp_subsys);
++	bio->bi_css = css;
++
++	return __bio_associate_blkg_from_css(bio, css);
++}
++#endif /* CONFIG_MEMCG */
++
+ /**
+  * bio_disassociate_task - undo bio_associate_current()
+  * @bio: target bio
+* Unmerged path include/linux/bio.h
+diff --git a/mm/page_io.c b/mm/page_io.c
+index 0bfa51bb9adb..7eba17386dde 100644
+--- a/mm/page_io.c
++++ b/mm/page_io.c
+@@ -339,7 +339,7 @@ int __swap_writepage(struct page *page, struct writeback_control *wbc,
+ 		goto out;
+ 	}
+ 	bio->bi_opf = REQ_OP_WRITE | REQ_SWAP | wbc_to_write_flags(wbc);
+-	bio_associate_blkcg_from_page(bio, page);
++	bio_associate_blkg_from_page(bio, page);
+ 	count_swpout_vm_event(page);
+ 	set_page_writeback(page);
+ 	unlock_page(page);
