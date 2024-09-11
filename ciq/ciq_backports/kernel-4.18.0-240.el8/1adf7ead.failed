@@ -1,0 +1,246 @@
+ice: enable initial devlink support
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Jacob Keller <jacob.e.keller@intel.com>
+commit 1adf7ead8204094516994d18e5aa02e34e4765f2
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/1adf7ead.failed
+
+Begin implementing support for the devlink interface with the ice
+driver.
+
+The pf structure is currently memory managed through devres, via
+a devm_alloc. To mimic this behavior, after allocating the devlink
+pointer, use devm_add_action to add a teardown action for releasing the
+devlink memory on exit.
+
+The ice hardware is a multi-function PCIe device. Thus, each physical
+function will get its own devlink instance. This means that each
+function will be treated independently, with its own parameters and
+configuration. This is done because the ice driver loads a separate
+instance for each function.
+
+Due to this, the implementation does not enable devlink to manage
+device-wide resources or configuration, as each physical function will
+be treated independently. This is done for simplicity, as managing
+a devlink instance across multiple driver instances would significantly
+increase the complexity for minimal gain.
+
+	Signed-off-by: Jacob Keller <jacob.e.keller@intel.com>
+	Reviewed-by: Jesse Brandeburg <jesse.brandeburg@intel.com>
+	Tested-by: Andrew Bowers <andrewx.bowers@intel.com>
+	Signed-off-by: Jeff Kirsher <jeffrey.t.kirsher@intel.com>
+(cherry picked from commit 1adf7ead8204094516994d18e5aa02e34e4765f2)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/intel/ice/ice_main.c
+diff --cc drivers/net/ethernet/intel/ice/ice_main.c
+index 90eb85e68b45,359ff8544773..000000000000
+--- a/drivers/net/ethernet/intel/ice/ice_main.c
++++ b/drivers/net/ethernet/intel/ice/ice_main.c
+@@@ -3364,8 -3413,12 +3386,12 @@@ static void ice_remove(struct pci_dev *
+  	set_bit(__ICE_DOWN, pf->state);
+  	ice_service_task_stop(pf);
+  
+++<<<<<<< HEAD
+ +	if (test_bit(ICE_FLAG_SRIOV_ENA, pf->flags))
+ +		ice_free_vfs(pf);
+++=======
++ 	ice_devlink_destroy_port(pf);
+++>>>>>>> 1adf7ead8204 (ice: enable initial devlink support)
+  	ice_vsi_release_all(pf);
+  	ice_free_irq_msix_misc(pf);
+  	ice_for_each_vsi(pf, i) {
+diff --git a/drivers/net/ethernet/intel/Kconfig b/drivers/net/ethernet/intel/Kconfig
+index 4926bd2ee5c5..309b5771e5f9 100644
+--- a/drivers/net/ethernet/intel/Kconfig
++++ b/drivers/net/ethernet/intel/Kconfig
+@@ -281,6 +281,7 @@ config ICE
+ 	tristate "Intel(R) Ethernet Connection E800 Series Support"
+ 	default n
+ 	depends on PCI_MSI
++	select NET_DEVLINK
+ 	---help---
+ 	  This driver supports Intel(R) Ethernet Connection E800 Series of
+ 	  devices.  For more information on how to identify your adapter, go
+diff --git a/drivers/net/ethernet/intel/ice/Makefile b/drivers/net/ethernet/intel/ice/Makefile
+index 59544b0fc086..29c6c6743450 100644
+--- a/drivers/net/ethernet/intel/ice/Makefile
++++ b/drivers/net/ethernet/intel/ice/Makefile
+@@ -19,6 +19,7 @@ ice-y := ice_main.o	\
+ 	 ice_txrx.o	\
+ 	 ice_flex_pipe.o \
+ 	 ice_flow.o	\
++	 ice_devlink.o	\
+ 	 ice_ethtool.o
+ ice-$(CONFIG_PCI_IOV) += ice_virtchnl_pf.o ice_sriov.o
+ ice-$(CONFIG_DCB) += ice_dcb.o ice_dcb_nl.o ice_dcb_lib.o
+diff --git a/drivers/net/ethernet/intel/ice/ice.h b/drivers/net/ethernet/intel/ice/ice.h
+index e6c226a611f8..6d4198192b0d 100644
+--- a/drivers/net/ethernet/intel/ice/ice.h
++++ b/drivers/net/ethernet/intel/ice/ice.h
+@@ -34,6 +34,7 @@
+ #include <linux/ctype.h>
+ #include <linux/bpf.h>
+ #include <linux/avf/virtchnl.h>
++#include <net/devlink.h>
+ #include <net/ipv6.h>
+ #include <net/xdp_sock.h>
+ #include "ice_devids.h"
+@@ -345,6 +346,9 @@ enum ice_pf_flags {
+ struct ice_pf {
+ 	struct pci_dev *pdev;
+ 
++	/* devlink port data */
++	struct devlink_port devlink_port;
++
+ 	/* OS reserved IRQ details */
+ 	struct msix_entry *msix_entries;
+ 	struct ice_res_tracker *irq_tracker;
+diff --git a/drivers/net/ethernet/intel/ice/ice_devlink.c b/drivers/net/ethernet/intel/ice/ice_devlink.c
+new file mode 100644
+index 000000000000..cedd9d02299e
+--- /dev/null
++++ b/drivers/net/ethernet/intel/ice/ice_devlink.c
+@@ -0,0 +1,117 @@
++// SPDX-License-Identifier: GPL-2.0
++/* Copyright (c) 2020, Intel Corporation. */
++
++#include "ice.h"
++#include "ice_devlink.h"
++
++static const struct devlink_ops ice_devlink_ops = {
++};
++
++static void ice_devlink_free(void *devlink_ptr)
++{
++	devlink_free((struct devlink *)devlink_ptr);
++}
++
++/**
++ * ice_allocate_pf - Allocate devlink and return PF structure pointer
++ * @dev: the device to allocate for
++ *
++ * Allocate a devlink instance for this device and return the private area as
++ * the PF structure. The devlink memory is kept track of through devres by
++ * adding an action to remove it when unwinding.
++ */
++struct ice_pf *ice_allocate_pf(struct device *dev)
++{
++	struct devlink *devlink;
++
++	devlink = devlink_alloc(&ice_devlink_ops, sizeof(struct ice_pf));
++	if (!devlink)
++		return NULL;
++
++	/* Add an action to teardown the devlink when unwinding the driver */
++	if (devm_add_action(dev, ice_devlink_free, devlink)) {
++		devlink_free(devlink);
++		return NULL;
++	}
++
++	return devlink_priv(devlink);
++}
++
++/**
++ * ice_devlink_register - Register devlink interface for this PF
++ * @pf: the PF to register the devlink for.
++ *
++ * Register the devlink instance associated with this physical function.
++ *
++ * Return: zero on success or an error code on failure.
++ */
++int ice_devlink_register(struct ice_pf *pf)
++{
++	struct devlink *devlink = priv_to_devlink(pf);
++	struct device *dev = ice_pf_to_dev(pf);
++	int err;
++
++	err = devlink_register(devlink, dev);
++	if (err) {
++		dev_err(dev, "devlink registration failed: %d\n", err);
++		return err;
++	}
++
++	return 0;
++}
++
++/**
++ * ice_devlink_unregister - Unregister devlink resources for this PF.
++ * @pf: the PF structure to cleanup
++ *
++ * Releases resources used by devlink and cleans up associated memory.
++ */
++void ice_devlink_unregister(struct ice_pf *pf)
++{
++	devlink_unregister(priv_to_devlink(pf));
++}
++
++/**
++ * ice_devlink_create_port - Create a devlink port for this PF
++ * @pf: the PF to create a port for
++ *
++ * Create and register a devlink_port for this PF. Note that although each
++ * physical function is connected to a separate devlink instance, the port
++ * will still be numbered according to the physical function id.
++ *
++ * Return: zero on success or an error code on failure.
++ */
++int ice_devlink_create_port(struct ice_pf *pf)
++{
++	struct devlink *devlink = priv_to_devlink(pf);
++	struct ice_vsi *vsi = ice_get_main_vsi(pf);
++	struct device *dev = ice_pf_to_dev(pf);
++	int err;
++
++	if (!vsi) {
++		dev_err(dev, "%s: unable to find main VSI\n", __func__);
++		return -EIO;
++	}
++
++	devlink_port_attrs_set(&pf->devlink_port, DEVLINK_PORT_FLAVOUR_PHYSICAL,
++			       pf->hw.pf_id, false, 0, NULL, 0);
++	err = devlink_port_register(devlink, &pf->devlink_port, pf->hw.pf_id);
++	if (err) {
++		dev_err(dev, "devlink_port_register failed: %d\n", err);
++		return err;
++	}
++
++	return 0;
++}
++
++/**
++ * ice_devlink_destroy_port - Destroy the devlink_port for this PF
++ * @pf: the PF to cleanup
++ *
++ * Unregisters the devlink_port structure associated with this PF.
++ */
++void ice_devlink_destroy_port(struct ice_pf *pf)
++{
++	devlink_port_type_clear(&pf->devlink_port);
++	devlink_port_unregister(&pf->devlink_port);
++}
+diff --git a/drivers/net/ethernet/intel/ice/ice_devlink.h b/drivers/net/ethernet/intel/ice/ice_devlink.h
+new file mode 100644
+index 000000000000..f94dc93c24c5
+--- /dev/null
++++ b/drivers/net/ethernet/intel/ice/ice_devlink.h
+@@ -0,0 +1,14 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++/* Copyright (c) 2019, Intel Corporation. */
++
++#ifndef _ICE_DEVLINK_H_
++#define _ICE_DEVLINK_H_
++
++struct ice_pf *ice_allocate_pf(struct device *dev);
++
++int ice_devlink_register(struct ice_pf *pf);
++void ice_devlink_unregister(struct ice_pf *pf);
++int ice_devlink_create_port(struct ice_pf *pf);
++void ice_devlink_destroy_port(struct ice_pf *pf);
++
++#endif /* _ICE_DEVLINK_H_ */
+* Unmerged path drivers/net/ethernet/intel/ice/ice_main.c
