@@ -1,0 +1,176 @@
+gfs2: Clean up gfs2_log_reserve
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-331.el8
+commit-author Andreas Gruenbacher <agruenba@redhat.com>
+commit 5ae8fff8d031b5728f4c0e36e971bba42bb78bea
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-331.el8/5ae8fff8.failed
+
+Wake up log waiters in gfs2_log_release when log space has actually become
+available.  This is a much better place for the wakeup than gfs2_logd.
+
+Check if enough log space is immeditely available before anything else.  If
+there isn't, use io_wait_event to wait instead of open-coding it.
+
+	Signed-off-by: Andreas Gruenbacher <agruenba@redhat.com>
+(cherry picked from commit 5ae8fff8d031b5728f4c0e36e971bba42bb78bea)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/gfs2/log.c
+#	fs/gfs2/trans.c
+diff --cc fs/gfs2/log.c
+index 1a5aad0b1fab,ca9fa481913d..000000000000
+--- a/fs/gfs2/log.c
++++ b/fs/gfs2/log.c
+@@@ -376,7 -419,8 +375,12 @@@ void gfs2_log_release(struct gfs2_sbd *
+  	trace_gfs2_log_blocks(sdp, blks);
+  	gfs2_assert_withdraw(sdp, atomic_read(&sdp->sd_log_blks_free) <=
+  				  sdp->sd_jdesc->jd_blocks);
+++<<<<<<< HEAD
+ +	up_read(&sdp->sd_log_flush_lock);
+++=======
++ 	if (atomic_read(&sdp->sd_log_blks_needed))
++ 		wake_up(&sdp->sd_log_waitq);
+++>>>>>>> 5ae8fff8d031 (gfs2: Clean up gfs2_log_reserve)
+  }
+  
+  /**
+@@@ -395,62 -439,40 +399,72 @@@
+   * with queued waiters, we use an exclusive wait. This means that when we
+   * get woken with enough journal space to get our reservation, we need to
+   * wake the next waiter on the list.
+ + *
+ + * Returns: errno
+   */
+  
+ -void gfs2_log_reserve(struct gfs2_sbd *sdp, unsigned int blks)
+ +int gfs2_log_reserve(struct gfs2_sbd *sdp, unsigned int blks)
+  {
+ +	int ret = 0;
+  	unsigned reserved_blks = 7 * (4096 / sdp->sd_vfs->s_blocksize);
+  	unsigned wanted = blks + reserved_blks;
+- 	DEFINE_WAIT(wait);
+- 	int did_wait = 0;
+  	unsigned int free_blocks;
+  
+++<<<<<<< HEAD
+ +	if (gfs2_assert_warn(sdp, blks) ||
+ +	    gfs2_assert_warn(sdp, blks <= sdp->sd_jdesc->jd_blocks))
+ +		return -EINVAL;
+ +	atomic_add(blks, &sdp->sd_log_blks_needed);
+ +retry:
+++=======
+++>>>>>>> 5ae8fff8d031 (gfs2: Clean up gfs2_log_reserve)
+  	free_blocks = atomic_read(&sdp->sd_log_blks_free);
+- 	if (unlikely(free_blocks <= wanted)) {
+- 		do {
+- 			prepare_to_wait_exclusive(&sdp->sd_log_waitq, &wait,
+- 					TASK_UNINTERRUPTIBLE);
+- 			wake_up(&sdp->sd_logd_waitq);
+- 			did_wait = 1;
+- 			if (atomic_read(&sdp->sd_log_blks_free) <= wanted)
+- 				io_schedule();
+- 			free_blocks = atomic_read(&sdp->sd_log_blks_free);
+- 		} while(free_blocks <= wanted);
+- 		finish_wait(&sdp->sd_log_waitq, &wait);
++ 	while (free_blocks >= wanted) {
++ 		if (atomic_try_cmpxchg(&sdp->sd_log_blks_free, &free_blocks,
++ 				       free_blocks - blks))
++ 			return;
+  	}
+++<<<<<<< HEAD
+ +	atomic_inc(&sdp->sd_reserving_log);
+ +	if (atomic_cmpxchg(&sdp->sd_log_blks_free, free_blocks,
+ +				free_blocks - blks) != free_blocks) {
+ +		if (atomic_dec_and_test(&sdp->sd_reserving_log))
+ +			wake_up(&sdp->sd_reserving_log_wait);
+ +		goto retry;
+ +	}
+ +	atomic_sub(blks, &sdp->sd_log_blks_needed);
+ +	trace_gfs2_log_blocks(sdp, -blks);
+++=======
+++>>>>>>> 5ae8fff8d031 (gfs2: Clean up gfs2_log_reserve)
+  
+- 	/*
+- 	 * If we waited, then so might others, wake them up _after_ we get
+- 	 * our share of the log.
+- 	 */
+- 	if (unlikely(did_wait))
++ 	atomic_add(blks, &sdp->sd_log_blks_needed);
++ 	for (;;) {
++ 		if (current != sdp->sd_logd_process)
++ 			wake_up(&sdp->sd_logd_waitq);
++ 		io_wait_event(sdp->sd_log_waitq,
++ 			(free_blocks = atomic_read(&sdp->sd_log_blks_free),
++ 			 free_blocks >= wanted));
++ 		do {
++ 			if (atomic_try_cmpxchg(&sdp->sd_log_blks_free,
++ 					       &free_blocks,
++ 					       free_blocks - blks))
++ 				goto reserved;
++ 		} while (free_blocks >= wanted);
++ 	}
++ 
++ reserved:
++ 	trace_gfs2_log_blocks(sdp, -blks);
++ 	if (atomic_sub_return(blks, &sdp->sd_log_blks_needed))
+  		wake_up(&sdp->sd_log_waitq);
+ +
+ +	down_read(&sdp->sd_log_flush_lock);
+ +	if (unlikely(!test_bit(SDF_JOURNAL_LIVE, &sdp->sd_flags))) {
+ +		gfs2_log_release(sdp, blks);
+ +		ret = -EROFS;
+ +	}
+ +	if (atomic_dec_and_test(&sdp->sd_reserving_log))
+ +		wake_up(&sdp->sd_reserving_log_wait);
+ +	return ret;
+  }
+  
+  /**
+@@@ -1080,10 -1105,8 +1094,15 @@@ static void log_refund(struct gfs2_sbd 
+  	maxres = sdp->sd_log_blks_reserved + tr->tr_reserved;
+  	gfs2_assert_withdraw(sdp, maxres >= reserved);
+  	unused = maxres - reserved;
+++<<<<<<< HEAD
+ +	atomic_add(unused, &sdp->sd_log_blks_free);
+ +	trace_gfs2_log_blocks(sdp, unused);
+ +	gfs2_assert_withdraw(sdp, atomic_read(&sdp->sd_log_blks_free) <=
+ +			     sdp->sd_jdesc->jd_blocks);
+++=======
++ 	if (unused)
++ 		gfs2_log_release(sdp, unused);
+++>>>>>>> 5ae8fff8d031 (gfs2: Clean up gfs2_log_reserve)
+  	sdp->sd_log_blks_reserved = reserved;
+  
+  	gfs2_log_unlock(sdp);
+diff --cc fs/gfs2/trans.c
+index 35084a676633,cac93b2004cf..000000000000
+--- a/fs/gfs2/trans.c
++++ b/fs/gfs2/trans.c
+@@@ -75,9 -64,20 +75,21 @@@ int gfs2_trans_begin(struct gfs2_sbd *s
+  
+  	sb_start_intwrite(sdp->sd_vfs);
+  
+++<<<<<<< HEAD
+ +	error = gfs2_log_reserve(sdp, tr->tr_reserved);
+ +	if (error)
+ +		goto fail;
+++=======
++ 	gfs2_log_reserve(sdp, tr->tr_reserved);
++ 
++ 	down_read(&sdp->sd_log_flush_lock);
++ 	if (unlikely(!test_bit(SDF_JOURNAL_LIVE, &sdp->sd_flags))) {
++ 		up_read(&sdp->sd_log_flush_lock);
++ 		gfs2_log_release(sdp, tr->tr_reserved);
++ 		sb_end_intwrite(sdp->sd_vfs);
++ 		return -EROFS;
++ 	}
+++>>>>>>> 5ae8fff8d031 (gfs2: Clean up gfs2_log_reserve)
+  
+  	current->journal_info = tr;
+  
+* Unmerged path fs/gfs2/log.c
+* Unmerged path fs/gfs2/trans.c
