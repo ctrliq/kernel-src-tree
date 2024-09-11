@@ -1,0 +1,337 @@
+cgroup: take options parsing into ->parse_monolithic()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Al Viro <viro@zeniv.linux.org.uk>
+commit f5dfb5315d340abd71bec523be9b114d5ac410de
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/f5dfb531.failed
+
+Store the results in cgroup_fs_context.  There's a nasty twist caused
+by the enabling/disabling subsystems - we can't do the checks sensitive
+to that until cgroup_mutex gets grabbed.  Frankly, these checks are
+complete bullshit (e.g. all,none combination is accepted if all subsystems
+are disabled; so's cpusets,none and all,cpusets when cpusets is disabled,
+etc.), but touching that would be a userland-visible behaviour change ;-/
+
+So we do parsing in ->parse_monolithic() and have the consistency checks
+done in check_cgroupfs_options(), with the latter called (on already parsed
+options) from cgroup1_get_tree() and cgroup1_reconfigure().
+
+Freeing the strdup'ed strings is done from fs_context destructor, which
+somewhat simplifies the life for cgroup1_{get_tree,reconfigure}().
+
+	Signed-off-by: Al Viro <viro@zeniv.linux.org.uk>
+(cherry picked from commit f5dfb5315d340abd71bec523be9b114d5ac410de)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	kernel/cgroup/cgroup-internal.h
+#	kernel/cgroup/cgroup-v1.c
+#	kernel/cgroup/cgroup.c
+diff --cc kernel/cgroup/cgroup-internal.h
+index ce1c1553c696,e627ff193dba..000000000000
+--- a/kernel/cgroup/cgroup-internal.h
++++ b/kernel/cgroup/cgroup-internal.h
+@@@ -40,6 -38,26 +40,29 @@@ extern void __init enable_debug_cgroup(
+  	} while (0)
+  
+  /*
+++<<<<<<< HEAD
+++=======
++  * The cgroup filesystem superblock creation/mount context.
++  */
++ struct cgroup_fs_context {
++ 	unsigned int	flags;			/* CGRP_ROOT_* flags */
++ 
++ 	/* cgroup1 bits */
++ 	bool		cpuset_clone_children;
++ 	bool		none;			/* User explicitly requested empty subsystem */
++ 	bool		all_ss;			/* Seen 'all' option */
++ 	u16		subsys_mask;		/* Selected subsystems */
++ 	char		*name;			/* Hierarchy name */
++ 	char		*release_agent;		/* Path for release notifications */
++ };
++ 
++ static inline struct cgroup_fs_context *cgroup_fc2context(struct fs_context *fc)
++ {
++ 	return fc->fs_private;
++ }
++ 
++ /*
+++>>>>>>> f5dfb5315d34 (cgroup: take options parsing into ->parse_monolithic())
+   * A cgroup can be associated with multiple css_sets as different tasks may
+   * belong to different cgroups on different hierarchies.  In the other
+   * direction, a css_set is naturally associated with multiple cgroups.
+@@@ -257,8 -263,8 +270,14 @@@ bool cgroup1_ssid_disabled(int ssid)
+  void cgroup1_pidlist_destroy_all(struct cgroup *cgrp);
+  void cgroup1_release_agent(struct work_struct *work);
+  void cgroup1_check_for_release(struct cgroup *cgrp);
+++<<<<<<< HEAD
+ +struct dentry *cgroup1_mount(struct file_system_type *fs_type, int flags,
+ +			     void *data, unsigned long magic,
+ +			     struct cgroup_namespace *ns);
+++=======
++ int cgroup1_get_tree(struct fs_context *fc);
++ int parse_cgroup1_options(char *data, struct cgroup_fs_context *ctx);
++ int cgroup1_reconfigure(struct fs_context *ctx);
+++>>>>>>> f5dfb5315d34 (cgroup: take options parsing into ->parse_monolithic())
+  
+  #endif /* __CGROUP_INTERNAL_H */
+diff --cc kernel/cgroup/cgroup-v1.c
+index dd94e2a4c22e,5c93643090e9..000000000000
+--- a/kernel/cgroup/cgroup-v1.c
++++ b/kernel/cgroup/cgroup-v1.c
+@@@ -1013,17 -1045,18 +1012,24 @@@ static int check_cgroupfs_options(struc
+  	return 0;
+  }
+  
+ -int cgroup1_reconfigure(struct fs_context *fc)
+ +static int cgroup1_remount(struct kernfs_root *kf_root, int *flags, char *data)
+  {
+ -	struct cgroup_fs_context *ctx = cgroup_fc2context(fc);
+ -	struct kernfs_root *kf_root = kernfs_root_from_sb(fc->root->d_sb);
+ -	struct cgroup_root *root = cgroup_root_from_kf(kf_root);
+  	int ret = 0;
+++<<<<<<< HEAD
+ +	struct cgroup_root *root = cgroup_root_from_kf(kf_root);
+ +	struct cgroup_sb_opts opts;
+++=======
+++>>>>>>> f5dfb5315d34 (cgroup: take options parsing into ->parse_monolithic())
+  	u16 added_mask, removed_mask;
+  
+  	cgroup_lock_and_drain_offline(&cgrp_dfl_root.cgrp);
+  
+  	/* See what subsystems are wanted */
+++<<<<<<< HEAD
+ +	ret = parse_cgroupfs_options(data, &opts);
+++=======
++ 	ret = check_cgroupfs_options(ctx);
+++>>>>>>> f5dfb5315d34 (cgroup: take options parsing into ->parse_monolithic())
+  	if (ret)
+  		goto out_unlock;
+  
+@@@ -1079,11 -1109,10 +1083,16 @@@ struct kernfs_syscall_ops cgroup1_kf_sy
+  	.show_path		= cgroup_show_path,
+  };
+  
+ -int cgroup1_get_tree(struct fs_context *fc)
+ +struct dentry *cgroup1_mount(struct file_system_type *fs_type, int flags,
+ +			     void *data, unsigned long magic,
+ +			     struct cgroup_namespace *ns)
+  {
+++<<<<<<< HEAD
+ +	struct cgroup_sb_opts opts;
+++=======
++ 	struct cgroup_namespace *ns = current->nsproxy->cgroup_ns;
++ 	struct cgroup_fs_context *ctx = cgroup_fc2context(fc);
+++>>>>>>> f5dfb5315d34 (cgroup: take options parsing into ->parse_monolithic())
+  	struct cgroup_root *root;
+  	struct cgroup_subsys *ss;
+  	struct dentry *dentry;
+@@@ -1092,7 -1121,11 +1101,11 @@@
+  	cgroup_lock_and_drain_offline(&cgrp_dfl_root.cgrp);
+  
+  	/* First find the desired set of subsystems */
+++<<<<<<< HEAD
+ +	ret = parse_cgroupfs_options(data, &opts);
+++=======
++ 	ret = check_cgroupfs_options(ctx);
+++>>>>>>> f5dfb5315d34 (cgroup: take options parsing into ->parse_monolithic())
+  	if (ret)
+  		goto out_unlock;
+  
+@@@ -1190,16 -1222,15 +1202,13 @@@ out_unlock
+  	}
+  	mutex_unlock(&cgroup_mutex);
+  out_free:
+- 	kfree(opts.release_agent);
+- 	kfree(opts.name);
+- 
+  	if (ret)
+ -		return ret;
+ +		return ERR_PTR(ret);
+  
+ -	dentry = cgroup_do_mount(&cgroup_fs_type, fc->sb_flags, root,
+ +	dentry = cgroup_do_mount(&cgroup_fs_type, flags, root,
+  				 CGROUP_SUPER_MAGIC, ns);
+ -	if (IS_ERR(dentry))
+ -		return PTR_ERR(dentry);
+  
+ -	if (percpu_ref_is_dying(&root->cgrp.self.refcnt)) {
+ +	if (!IS_ERR(dentry) && percpu_ref_is_dying(&root->cgrp.self.refcnt)) {
+  		struct super_block *sb = dentry->d_sb;
+  		dput(dentry);
+  		deactivate_locked_super(sb);
+diff --cc kernel/cgroup/cgroup.c
+index 9e08519ae6db,33da9eef3ef4..000000000000
+--- a/kernel/cgroup/cgroup.c
++++ b/kernel/cgroup/cgroup.c
+@@@ -1853,16 -1811,11 +1853,22 @@@ static int cgroup_show_options(struct s
+  	return 0;
+  }
+  
+ -static int cgroup_reconfigure(struct fs_context *fc)
+ +static int cgroup_remount(struct kernfs_root *kf_root, int *flags, char *data)
+  {
+++<<<<<<< HEAD
+ +	unsigned int root_flags;
+ +	int ret;
+ +
+ +	ret = parse_cgroup_root_flags(data, &root_flags);
+ +	if (ret)
+ +		return ret;
+ +
+ +	apply_cgroup_root_flags(root_flags);
+++=======
++ 	struct cgroup_fs_context *ctx = cgroup_fc2context(fc);
++ 
++ 	apply_cgroup_root_flags(ctx->flags);
+++>>>>>>> f5dfb5315d34 (cgroup: take options parsing into ->parse_monolithic())
+  	return 0;
+  }
+  
+@@@ -2050,45 -2062,97 +2056,134 @@@ struct dentry *cgroup_do_mount(struct f
+  	return dentry;
+  }
+  
+++<<<<<<< HEAD
+ +static struct dentry *cgroup_mount(struct file_system_type *fs_type,
+ +			 int flags, const char *unused_dev_name,
+ +			 void *data)
+ +{
+ +	struct cgroup_namespace *ns = current->nsproxy->cgroup_ns;
+ +	struct dentry *dentry;
+ +	int ret;
+++=======
++ /*
++  * Destroy a cgroup filesystem context.
++  */
++ static void cgroup_fs_context_free(struct fs_context *fc)
++ {
++ 	struct cgroup_fs_context *ctx = cgroup_fc2context(fc);
++ 
++ 	kfree(ctx->name);
++ 	kfree(ctx->release_agent);
++ 	kfree(ctx);
++ }
++ 
++ static int cgroup_parse_monolithic(struct fs_context *fc, void *data)
++ {
++ 	struct cgroup_fs_context *ctx = cgroup_fc2context(fc);
++ 
++ 	if (data)
++ 		security_sb_eat_lsm_opts(data, &fc->security);
++ 	return parse_cgroup_root_flags(data, &ctx->flags);
++ }
++ 
++ static int cgroup1_parse_monolithic(struct fs_context *fc, void *data)
++ {
++ 	struct cgroup_fs_context *ctx = cgroup_fc2context(fc);
++ 
++ 	if (data)
++ 		security_sb_eat_lsm_opts(data, &fc->security);
++ 	return parse_cgroup1_options(data, ctx);
++ }
++ 
++ static int cgroup_get_tree(struct fs_context *fc)
++ {
++ 	struct cgroup_namespace *ns = current->nsproxy->cgroup_ns;
++ 	struct cgroup_fs_context *ctx = cgroup_fc2context(fc);
++ 	struct dentry *root;
+++>>>>>>> f5dfb5315d34 (cgroup: take options parsing into ->parse_monolithic())
+ +
+ +	get_cgroup_ns(ns);
+  
+  	/* Check if the caller has permission to mount. */
+ -	if (!ns_capable(ns->user_ns, CAP_SYS_ADMIN))
+ -		return -EPERM;
+ +	if (!ns_capable(ns->user_ns, CAP_SYS_ADMIN)) {
+ +		put_cgroup_ns(ns);
+ +		return ERR_PTR(-EPERM);
+ +	}
+  
+++<<<<<<< HEAD
+ +	if (fs_type == &cgroup2_fs_type) {
+ +		unsigned int root_flags;
+ +
+ +		ret = parse_cgroup_root_flags(data, &root_flags);
+ +		if (ret) {
+ +			put_cgroup_ns(ns);
+ +			return ERR_PTR(ret);
+ +		}
+++=======
++ 	cgrp_dfl_visible = true;
++ 	cgroup_get_live(&cgrp_dfl_root.cgrp);
+++>>>>>>> f5dfb5315d34 (cgroup: take options parsing into ->parse_monolithic())
+  
+ -	root = cgroup_do_mount(&cgroup2_fs_type, fc->sb_flags, &cgrp_dfl_root,
+ +		cgrp_dfl_visible = true;
+ +		cgroup_get_live(&cgrp_dfl_root.cgrp);
+ +
+ +		dentry = cgroup_do_mount(&cgroup2_fs_type, flags, &cgrp_dfl_root,
+  					 CGROUP2_SUPER_MAGIC, ns);
+ -	if (IS_ERR(root))
+ -		return PTR_ERR(root);
+ +		if (!IS_ERR(dentry))
+ +			apply_cgroup_root_flags(root_flags);
+ +	} else {
+ +		dentry = cgroup1_mount(&cgroup_fs_type, flags, data,
+ +				       CGROUP_SUPER_MAGIC, ns);
+ +	}
+  
+++<<<<<<< HEAD
+ +	put_cgroup_ns(ns);
+ +	return dentry;
+++=======
++ 	apply_cgroup_root_flags(ctx->flags);
++ 	fc->root = root;
++ 	return 0;
++ }
++ 
++ static const struct fs_context_operations cgroup_fs_context_ops = {
++ 	.free		= cgroup_fs_context_free,
++ 	.parse_monolithic = cgroup_parse_monolithic,
++ 	.get_tree	= cgroup_get_tree,
++ 	.reconfigure	= cgroup_reconfigure,
++ };
++ 
++ static const struct fs_context_operations cgroup1_fs_context_ops = {
++ 	.free		= cgroup_fs_context_free,
++ 	.parse_monolithic = cgroup1_parse_monolithic,
++ 	.get_tree	= cgroup1_get_tree,
++ 	.reconfigure	= cgroup1_reconfigure,
++ };
++ 
++ /*
++  * Initialise the cgroup filesystem creation/reconfiguration context.
++  */
++ static int cgroup_init_fs_context(struct fs_context *fc)
++ {
++ 	struct cgroup_fs_context *ctx;
++ 
++ 	ctx = kzalloc(sizeof(struct cgroup_fs_context), GFP_KERNEL);
++ 	if (!ctx)
++ 		return -ENOMEM;
++ 
++ 	/*
++ 	 * The first time anyone tries to mount a cgroup, enable the list
++ 	 * linking each css_set to its tasks and fix up all existing tasks.
++ 	 */
++ 	if (!use_task_css_set_links)
++ 		cgroup_enable_task_cg_lists();
++ 
++ 	fc->fs_private = ctx;
++ 	if (fc->fs_type == &cgroup2_fs_type)
++ 		fc->ops = &cgroup_fs_context_ops;
++ 	else
++ 		fc->ops = &cgroup1_fs_context_ops;
++ 	return 0;
+++>>>>>>> f5dfb5315d34 (cgroup: take options parsing into ->parse_monolithic())
+  }
+  
+  static void cgroup_kill_sb(struct super_block *sb)
+* Unmerged path kernel/cgroup/cgroup-internal.h
+* Unmerged path kernel/cgroup/cgroup-v1.c
+* Unmerged path kernel/cgroup/cgroup.c
