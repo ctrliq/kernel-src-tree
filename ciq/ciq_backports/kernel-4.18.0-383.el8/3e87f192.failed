@@ -1,0 +1,330 @@
+bpf: Add lookup_and_delete_elem support to hashtab
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-383.el8
+commit-author Denis Salopek <denis.salopek@sartura.hr>
+commit 3e87f192b405960c0fe83e0925bd0dadf4f8cf43
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-383.el8/3e87f192.failed
+
+Extend the existing bpf_map_lookup_and_delete_elem() functionality to
+hashtab map types, in addition to stacks and queues.
+Create a new hashtab bpf_map_ops function that does lookup and deletion
+of the element under the same bucket lock and add the created map_ops to
+bpf.h.
+
+	Signed-off-by: Denis Salopek <denis.salopek@sartura.hr>
+	Signed-off-by: Andrii Nakryiko <andrii@kernel.org>
+	Acked-by: Yonghong Song <yhs@fb.com>
+Link: https://lore.kernel.org/bpf/4d18480a3e990ffbf14751ddef0325eed3be2966.1620763117.git.denis.salopek@sartura.hr
+(cherry picked from commit 3e87f192b405960c0fe83e0925bd0dadf4f8cf43)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/bpf.h
+diff --cc include/linux/bpf.h
+index 03b6e29e91cf,1e9a0ff3217b..000000000000
+--- a/include/linux/bpf.h
++++ b/include/linux/bpf.h
+@@@ -66,11 -67,18 +66,26 @@@ struct bpf_map_ops 
+  	void (*map_free)(struct bpf_map *map);
+  	int (*map_get_next_key)(struct bpf_map *map, void *key, void *next_key);
+  	void (*map_release_uref)(struct bpf_map *map);
+++<<<<<<< HEAD
+ +	RH_KABI_BROKEN_INSERT(void *(*map_lookup_elem_sys_only)(struct bpf_map *map, void *key))
+ +	RH_KABI_BROKEN_INSERT(int (*map_lookup_batch)(struct bpf_map *map, const union bpf_attr *attr, union bpf_attr __user *uattr))
+ +	RH_KABI_BROKEN_INSERT(int (*map_lookup_and_delete_batch)(struct bpf_map *map, const union bpf_attr *attr, union bpf_attr __user *uattr))
+ +	RH_KABI_BROKEN_INSERT(int (*map_update_batch)(struct bpf_map *map, const union bpf_attr *attr, union bpf_attr __user *uattr))
+ +	RH_KABI_BROKEN_INSERT(int (*map_delete_batch)(struct bpf_map *map, const union bpf_attr *attr, union bpf_attr __user *uattr))
+++=======
++ 	void *(*map_lookup_elem_sys_only)(struct bpf_map *map, void *key);
++ 	int (*map_lookup_batch)(struct bpf_map *map, const union bpf_attr *attr,
++ 				union bpf_attr __user *uattr);
++ 	int (*map_lookup_and_delete_elem)(struct bpf_map *map, void *key,
++ 					  void *value, u64 flags);
++ 	int (*map_lookup_and_delete_batch)(struct bpf_map *map,
++ 					   const union bpf_attr *attr,
++ 					   union bpf_attr __user *uattr);
++ 	int (*map_update_batch)(struct bpf_map *map, const union bpf_attr *attr,
++ 				union bpf_attr __user *uattr);
++ 	int (*map_delete_batch)(struct bpf_map *map, const union bpf_attr *attr,
++ 				union bpf_attr __user *uattr);
+++>>>>>>> 3e87f192b405 (bpf: Add lookup_and_delete_elem support to hashtab)
+  
+  	/* funcs callable from userspace and from eBPF programs */
+  	void *(*map_lookup_elem)(struct bpf_map *map, void *key);
+* Unmerged path include/linux/bpf.h
+diff --git a/include/uapi/linux/bpf.h b/include/uapi/linux/bpf.h
+index d613063f6429..620b7b46e37b 100644
+--- a/include/uapi/linux/bpf.h
++++ b/include/uapi/linux/bpf.h
+@@ -527,6 +527,15 @@ union bpf_iter_link_info {
+  *		Look up an element with the given *key* in the map referred to
+  *		by the file descriptor *fd*, and if found, delete the element.
+  *
++ *		For **BPF_MAP_TYPE_QUEUE** and **BPF_MAP_TYPE_STACK** map
++ *		types, the *flags* argument needs to be set to 0, but for other
++ *		map types, it may be specified as:
++ *
++ *		**BPF_F_LOCK**
++ *			Look up and delete the value of a spin-locked map
++ *			without returning the lock. This must be specified if
++ *			the elements contain a spinlock.
++ *
+  *		The **BPF_MAP_TYPE_QUEUE** and **BPF_MAP_TYPE_STACK** map types
+  *		implement this command as a "pop" operation, deleting the top
+  *		element rather than one corresponding to *key*.
+@@ -536,6 +545,10 @@ union bpf_iter_link_info {
+  *		This command is only valid for the following map types:
+  *		* **BPF_MAP_TYPE_QUEUE**
+  *		* **BPF_MAP_TYPE_STACK**
++ *		* **BPF_MAP_TYPE_HASH**
++ *		* **BPF_MAP_TYPE_PERCPU_HASH**
++ *		* **BPF_MAP_TYPE_LRU_HASH**
++ *		* **BPF_MAP_TYPE_LRU_PERCPU_HASH**
+  *
+  *	Return
+  *		Returns zero on success. On error, -1 is returned and *errno*
+diff --git a/kernel/bpf/hashtab.c b/kernel/bpf/hashtab.c
+index 83ab5427bf2b..a0085620f11e 100644
+--- a/kernel/bpf/hashtab.c
++++ b/kernel/bpf/hashtab.c
+@@ -1409,6 +1409,100 @@ static void htab_map_seq_show_elem(struct bpf_map *map, void *key,
+ 	rcu_read_unlock();
+ }
+ 
++static int __htab_map_lookup_and_delete_elem(struct bpf_map *map, void *key,
++					     void *value, bool is_lru_map,
++					     bool is_percpu, u64 flags)
++{
++	struct bpf_htab *htab = container_of(map, struct bpf_htab, map);
++	struct hlist_nulls_head *head;
++	unsigned long bflags;
++	struct htab_elem *l;
++	u32 hash, key_size;
++	struct bucket *b;
++	int ret;
++
++	key_size = map->key_size;
++
++	hash = htab_map_hash(key, key_size, htab->hashrnd);
++	b = __select_bucket(htab, hash);
++	head = &b->head;
++
++	ret = htab_lock_bucket(htab, b, hash, &bflags);
++	if (ret)
++		return ret;
++
++	l = lookup_elem_raw(head, hash, key, key_size);
++	if (!l) {
++		ret = -ENOENT;
++	} else {
++		if (is_percpu) {
++			u32 roundup_value_size = round_up(map->value_size, 8);
++			void __percpu *pptr;
++			int off = 0, cpu;
++
++			pptr = htab_elem_get_ptr(l, key_size);
++			for_each_possible_cpu(cpu) {
++				bpf_long_memcpy(value + off,
++						per_cpu_ptr(pptr, cpu),
++						roundup_value_size);
++				off += roundup_value_size;
++			}
++		} else {
++			u32 roundup_key_size = round_up(map->key_size, 8);
++
++			if (flags & BPF_F_LOCK)
++				copy_map_value_locked(map, value, l->key +
++						      roundup_key_size,
++						      true);
++			else
++				copy_map_value(map, value, l->key +
++					       roundup_key_size);
++			check_and_init_map_lock(map, value);
++		}
++
++		hlist_nulls_del_rcu(&l->hash_node);
++		if (!is_lru_map)
++			free_htab_elem(htab, l);
++	}
++
++	htab_unlock_bucket(htab, b, hash, bflags);
++
++	if (is_lru_map && l)
++		bpf_lru_push_free(&htab->lru, &l->lru_node);
++
++	return ret;
++}
++
++static int htab_map_lookup_and_delete_elem(struct bpf_map *map, void *key,
++					   void *value, u64 flags)
++{
++	return __htab_map_lookup_and_delete_elem(map, key, value, false, false,
++						 flags);
++}
++
++static int htab_percpu_map_lookup_and_delete_elem(struct bpf_map *map,
++						  void *key, void *value,
++						  u64 flags)
++{
++	return __htab_map_lookup_and_delete_elem(map, key, value, false, true,
++						 flags);
++}
++
++static int htab_lru_map_lookup_and_delete_elem(struct bpf_map *map, void *key,
++					       void *value, u64 flags)
++{
++	return __htab_map_lookup_and_delete_elem(map, key, value, true, false,
++						 flags);
++}
++
++static int htab_lru_percpu_map_lookup_and_delete_elem(struct bpf_map *map,
++						      void *key, void *value,
++						      u64 flags)
++{
++	return __htab_map_lookup_and_delete_elem(map, key, value, true, true,
++						 flags);
++}
++
+ static int
+ __htab_map_lookup_and_delete_batch(struct bpf_map *map,
+ 				   const union bpf_attr *attr,
+@@ -1942,6 +2036,7 @@ const struct bpf_map_ops htab_map_ops = {
+ 	.map_free = htab_map_free,
+ 	.map_get_next_key = htab_map_get_next_key,
+ 	.map_lookup_elem = htab_map_lookup_elem,
++	.map_lookup_and_delete_elem = htab_map_lookup_and_delete_elem,
+ 	.map_update_elem = htab_map_update_elem,
+ 	.map_delete_elem = htab_map_delete_elem,
+ 	.map_gen_lookup = htab_map_gen_lookup,
+@@ -1962,6 +2057,7 @@ const struct bpf_map_ops htab_lru_map_ops = {
+ 	.map_free = htab_map_free,
+ 	.map_get_next_key = htab_map_get_next_key,
+ 	.map_lookup_elem = htab_lru_map_lookup_elem,
++	.map_lookup_and_delete_elem = htab_lru_map_lookup_and_delete_elem,
+ 	.map_lookup_elem_sys_only = htab_lru_map_lookup_elem_sys,
+ 	.map_update_elem = htab_lru_map_update_elem,
+ 	.map_delete_elem = htab_lru_map_delete_elem,
+@@ -2085,6 +2181,7 @@ const struct bpf_map_ops htab_percpu_map_ops = {
+ 	.map_free = htab_map_free,
+ 	.map_get_next_key = htab_map_get_next_key,
+ 	.map_lookup_elem = htab_percpu_map_lookup_elem,
++	.map_lookup_and_delete_elem = htab_percpu_map_lookup_and_delete_elem,
+ 	.map_update_elem = htab_percpu_map_update_elem,
+ 	.map_delete_elem = htab_map_delete_elem,
+ 	.map_seq_show_elem = htab_percpu_map_seq_show_elem,
+@@ -2104,6 +2201,7 @@ const struct bpf_map_ops htab_lru_percpu_map_ops = {
+ 	.map_free = htab_map_free,
+ 	.map_get_next_key = htab_map_get_next_key,
+ 	.map_lookup_elem = htab_lru_percpu_map_lookup_elem,
++	.map_lookup_and_delete_elem = htab_lru_percpu_map_lookup_and_delete_elem,
+ 	.map_update_elem = htab_lru_percpu_map_update_elem,
+ 	.map_delete_elem = htab_lru_map_delete_elem,
+ 	.map_seq_show_elem = htab_percpu_map_seq_show_elem,
+diff --git a/kernel/bpf/syscall.c b/kernel/bpf/syscall.c
+index 7aed15cc139e..b630155dc2e0 100644
+--- a/kernel/bpf/syscall.c
++++ b/kernel/bpf/syscall.c
+@@ -1494,7 +1494,7 @@ int generic_map_lookup_batch(struct bpf_map *map,
+ 	return err;
+ }
+ 
+-#define BPF_MAP_LOOKUP_AND_DELETE_ELEM_LAST_FIELD value
++#define BPF_MAP_LOOKUP_AND_DELETE_ELEM_LAST_FIELD flags
+ 
+ static int map_lookup_and_delete_elem(union bpf_attr *attr)
+ {
+@@ -1510,6 +1510,9 @@ static int map_lookup_and_delete_elem(union bpf_attr *attr)
+ 	if (CHECK_ATTR(BPF_MAP_LOOKUP_AND_DELETE_ELEM))
+ 		return -EINVAL;
+ 
++	if (attr->flags & ~BPF_F_LOCK)
++		return -EINVAL;
++
+ 	f = fdget(ufd);
+ 	map = __bpf_map_get(f);
+ 	if (IS_ERR(map))
+@@ -1520,24 +1523,47 @@ static int map_lookup_and_delete_elem(union bpf_attr *attr)
+ 		goto err_put;
+ 	}
+ 
++	if (attr->flags &&
++	    (map->map_type == BPF_MAP_TYPE_QUEUE ||
++	     map->map_type == BPF_MAP_TYPE_STACK)) {
++		err = -EINVAL;
++		goto err_put;
++	}
++
++	if ((attr->flags & BPF_F_LOCK) &&
++	    !map_value_has_spin_lock(map)) {
++		err = -EINVAL;
++		goto err_put;
++	}
++
+ 	key = __bpf_copy_key(ukey, map->key_size);
+ 	if (IS_ERR(key)) {
+ 		err = PTR_ERR(key);
+ 		goto err_put;
+ 	}
+ 
+-	value_size = map->value_size;
++	value_size = bpf_map_value_size(map);
+ 
+ 	err = -ENOMEM;
+ 	value = kmalloc(value_size, GFP_USER | __GFP_NOWARN);
+ 	if (!value)
+ 		goto free_key;
+ 
++	err = -ENOTSUPP;
+ 	if (map->map_type == BPF_MAP_TYPE_QUEUE ||
+ 	    map->map_type == BPF_MAP_TYPE_STACK) {
+ 		err = map->ops->map_pop_elem(map, value);
+-	} else {
+-		err = -ENOTSUPP;
++	} else if (map->map_type == BPF_MAP_TYPE_HASH ||
++		   map->map_type == BPF_MAP_TYPE_PERCPU_HASH ||
++		   map->map_type == BPF_MAP_TYPE_LRU_HASH ||
++		   map->map_type == BPF_MAP_TYPE_LRU_PERCPU_HASH) {
++		if (!bpf_map_is_dev_bound(map)) {
++			bpf_disable_instrumentation();
++			rcu_read_lock();
++			err = map->ops->map_lookup_and_delete_elem(map, key, value, attr->flags);
++			rcu_read_unlock();
++			bpf_enable_instrumentation();
++		}
+ 	}
+ 
+ 	if (err)
+diff --git a/tools/include/uapi/linux/bpf.h b/tools/include/uapi/linux/bpf.h
+index ed06cd84257e..b0f088ef0d5c 100644
+--- a/tools/include/uapi/linux/bpf.h
++++ b/tools/include/uapi/linux/bpf.h
+@@ -527,6 +527,15 @@ union bpf_iter_link_info {
+  *		Look up an element with the given *key* in the map referred to
+  *		by the file descriptor *fd*, and if found, delete the element.
+  *
++ *		For **BPF_MAP_TYPE_QUEUE** and **BPF_MAP_TYPE_STACK** map
++ *		types, the *flags* argument needs to be set to 0, but for other
++ *		map types, it may be specified as:
++ *
++ *		**BPF_F_LOCK**
++ *			Look up and delete the value of a spin-locked map
++ *			without returning the lock. This must be specified if
++ *			the elements contain a spinlock.
++ *
+  *		The **BPF_MAP_TYPE_QUEUE** and **BPF_MAP_TYPE_STACK** map types
+  *		implement this command as a "pop" operation, deleting the top
+  *		element rather than one corresponding to *key*.
+@@ -536,6 +545,10 @@ union bpf_iter_link_info {
+  *		This command is only valid for the following map types:
+  *		* **BPF_MAP_TYPE_QUEUE**
+  *		* **BPF_MAP_TYPE_STACK**
++ *		* **BPF_MAP_TYPE_HASH**
++ *		* **BPF_MAP_TYPE_PERCPU_HASH**
++ *		* **BPF_MAP_TYPE_LRU_HASH**
++ *		* **BPF_MAP_TYPE_LRU_PERCPU_HASH**
+  *
+  *	Return
+  *		Returns zero on success. On error, -1 is returned and *errno*
