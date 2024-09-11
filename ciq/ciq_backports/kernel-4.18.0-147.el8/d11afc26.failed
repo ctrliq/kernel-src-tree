@@ -1,0 +1,245 @@
+net/mlx5e: Propagate the filter's net device to mlx5e structures
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-147.el8
+commit-author Oz Shlomo <ozsh@mellanox.com>
+commit d11afc2600377c6775abcbc1fd410f199c5bf458
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-147.el8/d11afc26.failed
+
+Propagate the filter's net_device parameter to the tc flower parsed
+attributes structure so that it can later be used in tunnel decap
+offloading sequences.
+
+Pre-step for replacing egdev logic with the indirect block
+notification mechanism.
+
+	Signed-off-by: Oz Shlomo <ozsh@mellanox.com>
+	Reviewed-by: Eli Britstein <elibr@mellanox.com>
+	Signed-off-by: Saeed Mahameed <saeedm@mellanox.com>
+(cherry picked from commit d11afc2600377c6775abcbc1fd410f199c5bf458)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/mellanox/mlx5/core/en_tc.c
+diff --cc drivers/net/ethernet/mellanox/mlx5/core/en_tc.c
+index c9ee89f4edb1,3271eda8098b..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_tc.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_tc.c
+@@@ -2803,47 -3055,173 +2804,206 @@@ int mlx5e_configure_flower(struct mlx5e
+  	flow->flags = flow_flags;
+  	flow->priv = priv;
+  
+++<<<<<<< HEAD
+ +	err = parse_cls_flower(priv, flow, &parse_attr->spec, f);
+ +	if (err < 0)
+ +		goto err_free;
+ +
+ +	if (flow->flags & MLX5E_TC_FLOW_ESWITCH) {
+ +		err = parse_tc_fdb_actions(priv, f->exts, parse_attr, flow);
+ +		if (err < 0)
+ +			goto err_free;
+ +		flow->rule[0] = mlx5e_tc_add_fdb_flow(priv, parse_attr, flow);
+ +	} else {
+ +		err = parse_tc_nic_actions(priv, f->exts, parse_attr, flow);
+ +		if (err < 0)
+ +			goto err_free;
+ +		flow->rule[0] = mlx5e_tc_add_nic_flow(priv, parse_attr, flow);
+ +	}
+++=======
++ 	*__flow = flow;
++ 	*__parse_attr = parse_attr;
+++>>>>>>> d11afc260037 (net/mlx5e: Propagate the filter's net device to mlx5e structures)
+  
+ -	return 0;
+ +	if (IS_ERR(flow->rule[0])) {
+ +		err = PTR_ERR(flow->rule[0]);
+ +		if (err != -EAGAIN)
+ +			goto err_free;
+ +	}
+  
+ -err_free:
+ -	kfree(flow);
+ -	kvfree(parse_attr);
+ -	return err;
+ -}
+ +	if (err != -EAGAIN)
+ +		flow->flags |= MLX5E_TC_FLOW_OFFLOADED;
+  
+++<<<<<<< HEAD
+ +	if (!(flow->flags & MLX5E_TC_FLOW_ESWITCH) ||
+ +	    !(flow->esw_attr->action &
+ +	      MLX5_FLOW_CONTEXT_ACTION_PACKET_REFORMAT))
+ +		kvfree(parse_attr);
+ +
+ +	err = rhashtable_insert_fast(tc_ht, &flow->node, tc_ht_params);
+ +	if (err) {
+ +		mlx5e_tc_del_flow(priv, flow);
+ +		kfree(flow);
+ +	}
+ +
+ +	return err;
+++=======
++ static int
++ mlx5e_add_fdb_flow(struct mlx5e_priv *priv,
++ 		   struct tc_cls_flower_offload *f,
++ 		   u16 flow_flags,
++ 		   struct net_device *filter_dev,
++ 		   struct mlx5e_tc_flow **__flow)
++ {
++ 	struct netlink_ext_ack *extack = f->common.extack;
++ 	struct mlx5e_tc_flow_parse_attr *parse_attr;
++ 	struct mlx5e_tc_flow *flow;
++ 	int attr_size, err;
++ 
++ 	flow_flags |= MLX5E_TC_FLOW_ESWITCH;
++ 	attr_size  = sizeof(struct mlx5_esw_flow_attr);
++ 	err = mlx5e_alloc_flow(priv, attr_size, f, flow_flags,
++ 			       &parse_attr, &flow);
++ 	if (err)
++ 		goto out;
++ 	parse_attr->filter_dev = filter_dev;
++ 	flow->esw_attr->parse_attr = parse_attr;
++ 	err = parse_cls_flower(flow->priv, flow, &parse_attr->spec, f);
++ 	if (err)
++ 		goto err_free;
++ 
++ 	flow->esw_attr->chain = f->common.chain_index;
++ 	flow->esw_attr->prio = TC_H_MAJ(f->common.prio) >> 16;
++ 	err = parse_tc_fdb_actions(priv, f->exts, parse_attr, flow, extack);
++ 	if (err)
++ 		goto err_free;
++ 
++ 	err = mlx5e_tc_add_fdb_flow(priv, parse_attr, flow, extack);
++ 	if (err)
++ 		goto err_free;
++ 
++ 	if (!(flow->esw_attr->action &
++ 	      MLX5_FLOW_CONTEXT_ACTION_PACKET_REFORMAT))
++ 		kvfree(parse_attr);
++ 
++ 	*__flow = flow;
++ 
++ 	return 0;
++ 
++ err_free:
++ 	kfree(flow);
++ 	kvfree(parse_attr);
++ out:
++ 	return err;
++ }
++ 
++ static int
++ mlx5e_add_nic_flow(struct mlx5e_priv *priv,
++ 		   struct tc_cls_flower_offload *f,
++ 		   u16 flow_flags,
++ 		   struct net_device *filter_dev,
++ 		   struct mlx5e_tc_flow **__flow)
++ {
++ 	struct netlink_ext_ack *extack = f->common.extack;
++ 	struct mlx5e_tc_flow_parse_attr *parse_attr;
++ 	struct mlx5e_tc_flow *flow;
++ 	int attr_size, err;
++ 
++ 	/* multi-chain not supported for NIC rules */
++ 	if (!tc_cls_can_offload_and_chain0(priv->netdev, &f->common))
++ 		return -EOPNOTSUPP;
++ 
++ 	flow_flags |= MLX5E_TC_FLOW_NIC;
++ 	attr_size  = sizeof(struct mlx5_nic_flow_attr);
++ 	err = mlx5e_alloc_flow(priv, attr_size, f, flow_flags,
++ 			       &parse_attr, &flow);
++ 	if (err)
++ 		goto out;
++ 
++ 	parse_attr->filter_dev = filter_dev;
++ 	err = parse_cls_flower(flow->priv, flow, &parse_attr->spec, f);
++ 	if (err)
++ 		goto err_free;
++ 
++ 	err = parse_tc_nic_actions(priv, f->exts, parse_attr, flow, extack);
++ 	if (err)
++ 		goto err_free;
++ 
++ 	err = mlx5e_tc_add_nic_flow(priv, parse_attr, flow, extack);
++ 	if (err)
++ 		goto err_free;
++ 
++ 	flow->flags |= MLX5E_TC_FLOW_OFFLOADED;
++ 	kvfree(parse_attr);
++ 	*__flow = flow;
++ 
++ 	return 0;
++ 
++ err_free:
++ 	kfree(flow);
++ 	kvfree(parse_attr);
++ out:
++ 	return err;
++ }
++ 
++ static int
++ mlx5e_tc_add_flow(struct mlx5e_priv *priv,
++ 		  struct tc_cls_flower_offload *f,
++ 		  int flags,
++ 		  struct net_device *filter_dev,
++ 		  struct mlx5e_tc_flow **flow)
++ {
++ 	struct mlx5_eswitch *esw = priv->mdev->priv.eswitch;
++ 	u16 flow_flags;
++ 	int err;
++ 
++ 	get_flags(flags, &flow_flags);
++ 
++ 	if (!tc_can_offload_extack(priv->netdev, f->common.extack))
++ 		return -EOPNOTSUPP;
++ 
++ 	if (esw && esw->mode == SRIOV_OFFLOADS)
++ 		err = mlx5e_add_fdb_flow(priv, f, flow_flags,
++ 					 filter_dev, flow);
++ 	else
++ 		err = mlx5e_add_nic_flow(priv, f, flow_flags,
++ 					 filter_dev, flow);
++ 
++ 	return err;
++ }
++ 
++ int mlx5e_configure_flower(struct net_device *dev, struct mlx5e_priv *priv,
++ 			   struct tc_cls_flower_offload *f, int flags)
++ {
++ 	struct netlink_ext_ack *extack = f->common.extack;
++ 	struct rhashtable *tc_ht = get_tc_ht(priv);
++ 	struct mlx5e_tc_flow *flow;
++ 	int err = 0;
++ 
++ 	flow = rhashtable_lookup_fast(tc_ht, &f->cookie, tc_ht_params);
++ 	if (flow) {
++ 		NL_SET_ERR_MSG_MOD(extack,
++ 				   "flow cookie already exists, ignoring");
++ 		netdev_warn_once(priv->netdev,
++ 				 "flow cookie %lx already exists, ignoring\n",
++ 				 f->cookie);
++ 		goto out;
++ 	}
++ 
++ 	err = mlx5e_tc_add_flow(priv, f, flags, dev, &flow);
++ 	if (err)
++ 		goto out;
++ 
++ 	err = rhashtable_insert_fast(tc_ht, &flow->node, tc_ht_params);
++ 	if (err)
++ 		goto err_free;
++ 
++ 	return 0;
+++>>>>>>> d11afc260037 (net/mlx5e: Propagate the filter's net device to mlx5e structures)
+  
+  err_free:
+ -	mlx5e_tc_del_flow(priv, flow);
+ +	kvfree(parse_attr);
+  	kfree(flow);
+ -out:
+  	return err;
+  }
+  
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/en_tc.c
