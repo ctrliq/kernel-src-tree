@@ -2999,7 +2999,11 @@ struct ib_mr *qedr_reg_user_mr(struct ib_pd *ibpd, u64 start, u64 len,
 
 	rc = dev->ops->rdma_alloc_tid(dev->rdma_ctx, &mr->hw_mr.itid);
 	if (rc) {
-		DP_ERR(dev, "roce alloc tid returned an error %d\n", rc);
+		if (rc == -EINVAL)
+			DP_ERR(dev, "Out of MR resources\n");
+		else
+			DP_ERR(dev, "roce alloc tid returned error %d\n", rc);
+
 		goto err1;
 	}
 
@@ -3094,7 +3098,11 @@ static struct qedr_mr *__qedr_alloc_mr(struct ib_pd *ibpd,
 
 	rc = dev->ops->rdma_alloc_tid(dev->rdma_ctx, &mr->hw_mr.itid);
 	if (rc) {
-		DP_ERR(dev, "roce alloc tid returned an error %d\n", rc);
+		if (rc == -EINVAL)
+			DP_ERR(dev, "Out of MR resources\n");
+		else
+			DP_ERR(dev, "roce alloc tid returned error %d\n", rc);
+
 		goto err0;
 	}
 
@@ -3224,7 +3232,11 @@ struct ib_mr *qedr_get_dma_mr(struct ib_pd *ibpd, int acc)
 
 	rc = dev->ops->rdma_alloc_tid(dev->rdma_ctx, &mr->hw_mr.itid);
 	if (rc) {
-		DP_ERR(dev, "roce alloc tid returned an error %d\n", rc);
+		if (rc == -EINVAL)
+			DP_ERR(dev, "Out of MR resources\n");
+		else
+			DP_ERR(dev, "roce alloc tid returned error %d\n", rc);
+
 		goto err1;
 	}
 
