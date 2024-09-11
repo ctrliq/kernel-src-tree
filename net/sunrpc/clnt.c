@@ -1919,7 +1919,6 @@ call_bind(struct rpc_task *task)
 	if (!xprt_prepare_transmit(task))
 		return;
 
-	task->tk_timeout = xprt->bind_timeout;
 	xprt->ops->rpcbind(task);
 }
 
