@@ -1,0 +1,182 @@
+powerpc/powernv/npu: Check mmio_atsd array bounds when populating
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-147.el8
+commit-author Alexey Kardashevskiy <aik@ozlabs.ru>
+commit 135ef954051b102870a8d47a8eb822af1f1b1ec1
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-147.el8/135ef954.failed
+
+A broken device tree might contain more than 8 values and introduce hard
+to debug memory corruption bug. This adds the boundary check.
+
+	Signed-off-by: Alexey Kardashevskiy <aik@ozlabs.ru>
+	Signed-off-by: Michael Ellerman <mpe@ellerman.id.au>
+(cherry picked from commit 135ef954051b102870a8d47a8eb822af1f1b1ec1)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/powerpc/platforms/powernv/npu-dma.c
+diff --cc arch/powerpc/platforms/powernv/npu-dma.c
+index 7c8fc584b8ac,b713727663e2..000000000000
+--- a/arch/powerpc/platforms/powernv/npu-dma.c
++++ b/arch/powerpc/platforms/powernv/npu-dma.c
+@@@ -960,38 -1168,123 +960,122 @@@ int pnv_npu2_init(struct pnv_phb *phb
+  {
+  	unsigned int i;
+  	u64 mmio_atsd;
+++<<<<<<< HEAD
+ +	struct device_node *dn;
+++=======
++ 	static int npu_index;
++ 	struct npu *npu;
++ 	int ret;
++ 
++ 	npu = kzalloc(sizeof(*npu), GFP_KERNEL);
++ 	if (!npu)
++ 		return -ENOMEM;
++ 
++ 	npu->nmmu_flush = of_property_read_bool(hose->dn, "ibm,nmmu-flush");
++ 
++ 	for (i = 0; i < ARRAY_SIZE(npu->mmio_atsd_regs) &&
++ 			!of_property_read_u64_index(hose->dn, "ibm,mmio-atsd",
++ 				i, &mmio_atsd); i++)
++ 		npu->mmio_atsd_regs[i] = ioremap(mmio_atsd, 32);
++ 
++ 	pr_info("NPU%d: Found %d MMIO ATSD registers", hose->global_number, i);
++ 	npu->mmio_atsd_count = i;
++ 	npu->mmio_atsd_usage = 0;
++ 	npu_index++;
++ 	if (WARN_ON(npu_index >= NV_MAX_NPUS)) {
++ 		ret = -ENOSPC;
++ 		goto fail_exit;
++ 	}
++ 	max_npu2_index = npu_index;
++ 	npu->index = npu_index;
++ 	hose->npu = npu;
++ 
++ 	return 0;
++ 
++ fail_exit:
++ 	for (i = 0; i < npu->mmio_atsd_count; ++i)
++ 		iounmap(npu->mmio_atsd_regs[i]);
++ 
++ 	kfree(npu);
++ 
++ 	return ret;
++ }
++ 
++ int pnv_npu2_map_lpar_dev(struct pci_dev *gpdev, unsigned int lparid,
++ 		unsigned long msr)
++ {
++ 	int ret;
++ 	struct pci_dev *npdev = pnv_pci_get_npu_dev(gpdev, 0);
++ 	struct pci_controller *hose;
++ 	struct pnv_phb *nphb;
++ 
++ 	if (!npdev)
++ 		return -ENODEV;
++ 
++ 	hose = pci_bus_to_host(npdev->bus);
++ 	nphb = hose->private_data;
++ 
++ 	dev_dbg(&gpdev->dev, "Map LPAR opalid=%llu lparid=%u\n",
++ 			nphb->opal_id, lparid);
++ 	/*
++ 	 * Currently we only support radix and non-zero LPCR only makes sense
++ 	 * for hash tables so skiboot expects the LPCR parameter to be a zero.
++ 	 */
++ 	ret = opal_npu_map_lpar(nphb->opal_id,
++ 			PCI_DEVID(gpdev->bus->number, gpdev->devfn), lparid,
++ 			0 /* LPCR bits */);
++ 	if (ret) {
++ 		dev_err(&gpdev->dev, "Error %d mapping device to LPAR\n", ret);
++ 		return ret;
++ 	}
++ 
++ 	dev_dbg(&gpdev->dev, "init context opalid=%llu msr=%lx\n",
++ 			nphb->opal_id, msr);
++ 	ret = opal_npu_init_context(nphb->opal_id, 0/*__unused*/, msr,
++ 			PCI_DEVID(gpdev->bus->number, gpdev->devfn));
++ 	if (ret < 0)
++ 		dev_err(&gpdev->dev, "Failed to init context: %d\n", ret);
++ 	else
++ 		ret = 0;
++ 
++ 	return 0;
++ }
++ EXPORT_SYMBOL_GPL(pnv_npu2_map_lpar_dev);
++ 
++ void pnv_npu2_map_lpar(struct pnv_ioda_pe *gpe, unsigned long msr)
++ {
+++>>>>>>> 135ef954051b (powerpc/powernv/npu: Check mmio_atsd array bounds when populating)
+  	struct pci_dev *gpdev;
+ -
+ -	list_for_each_entry(gpdev, &gpe->pbus->devices, bus_list)
+ -		pnv_npu2_map_lpar_dev(gpdev, 0, msr);
+ -}
+ -
+ -int pnv_npu2_unmap_lpar_dev(struct pci_dev *gpdev)
+ -{
+ -	int ret;
+ -	struct pci_dev *npdev = pnv_pci_get_npu_dev(gpdev, 0);
+ -	struct pci_controller *hose;
+ -	struct pnv_phb *nphb;
+ -
+ -	if (!npdev)
+ -		return -ENODEV;
+ -
+ -	hose = pci_bus_to_host(npdev->bus);
+ -	nphb = hose->private_data;
+ -
+ -	dev_dbg(&gpdev->dev, "destroy context opalid=%llu\n",
+ -			nphb->opal_id);
+ -	ret = opal_npu_destroy_context(nphb->opal_id, 0/*__unused*/,
+ -			PCI_DEVID(gpdev->bus->number, gpdev->devfn));
+ -	if (ret < 0) {
+ -		dev_err(&gpdev->dev, "Failed to destroy context: %d\n", ret);
+ -		return ret;
+ +	static int npu_index;
+ +	uint64_t rc = 0;
+ +
+ +	phb->npu.nmmu_flush =
+ +		of_property_read_bool(phb->hose->dn, "ibm,nmmu-flush");
+ +	for_each_child_of_node(phb->hose->dn, dn) {
+ +		gpdev = pnv_pci_get_gpu_dev(get_pci_dev(dn));
+ +		if (gpdev) {
+ +			rc = opal_npu_map_lpar(phb->opal_id,
+ +				PCI_DEVID(gpdev->bus->number, gpdev->devfn),
+ +				0, 0);
+ +			if (rc)
+ +				dev_err(&gpdev->dev,
+ +					"Error %lld mapping device to LPAR\n",
+ +					rc);
+ +		}
+  	}
+  
+ -	/* Set LPID to 0 anyway, just to be safe */
+ -	dev_dbg(&gpdev->dev, "Map LPAR opalid=%llu lparid=0\n", nphb->opal_id);
+ -	ret = opal_npu_map_lpar(nphb->opal_id,
+ -			PCI_DEVID(gpdev->bus->number, gpdev->devfn), 0 /*LPID*/,
+ -			0 /* LPCR bits */);
+ -	if (ret)
+ -		dev_err(&gpdev->dev, "Error %d mapping device to LPAR\n", ret);
+ +	for (i = 0; !of_property_read_u64_index(phb->hose->dn, "ibm,mmio-atsd",
+ +							i, &mmio_atsd); i++)
+ +		phb->npu.mmio_atsd_regs[i] = ioremap(mmio_atsd, 32);
+  
+ -	return ret;
+ +	pr_info("NPU%lld: Found %d MMIO ATSD registers", phb->opal_id, i);
+ +	phb->npu.mmio_atsd_count = i;
+ +	phb->npu.mmio_atsd_usage = 0;
+ +	npu_index++;
+ +	if (WARN_ON(npu_index >= NV_MAX_NPUS))
+ +		return -ENOSPC;
+ +	max_npu2_index = npu_index;
+ +	phb->npu.index = npu_index;
+ +
+ +	return 0;
+  }
+ -EXPORT_SYMBOL_GPL(pnv_npu2_unmap_lpar_dev);
+* Unmerged path arch/powerpc/platforms/powernv/npu-dma.c
