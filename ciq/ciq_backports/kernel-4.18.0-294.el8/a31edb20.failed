@@ -1,0 +1,184 @@
+net: improve the user pointer check in init_user_sockptr
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+Rebuild_CHGLOG: - [net] improve the user pointer check in init_user_sockptr (Jiri Benc) [1882709]
+Rebuild_FUZZ: 95.33%
+commit-author Christoph Hellwig <hch@lst.de>
+commit a31edb2059ed4e498f9aa8230c734b59d0ad797a
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/a31edb20.failed
+
+Make sure not just the pointer itself but the whole range lies in
+the user address space.  For that pass the length and then use
+the access_ok helper to do the check.
+
+Fixes: 6d04fe15f78a ("net: optimize the sockptr_t for unified kernel/user address spaces")
+	Reported-by: David Laight <David.Laight@ACULAB.COM>
+	Signed-off-by: Christoph Hellwig <hch@lst.de>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit a31edb2059ed4e498f9aa8230c734b59d0ad797a)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/sockptr.h
+#	net/ipv4/bpfilter/sockopt.c
+#	net/socket.c
+diff --cc include/linux/sockptr.h
+index 7a37a7425b45,96840def9d69..000000000000
+--- a/include/linux/sockptr.h
++++ b/include/linux/sockptr.h
+@@@ -11,6 -11,23 +11,25 @@@
+  #include <linux/slab.h>
+  #include <linux/uaccess.h>
+  
+++<<<<<<< HEAD
+++=======
++ #ifdef CONFIG_ARCH_HAS_NON_OVERLAPPING_ADDRESS_SPACE
++ typedef union {
++ 	void		*kernel;
++ 	void __user	*user;
++ } sockptr_t;
++ 
++ static inline bool sockptr_is_kernel(sockptr_t sockptr)
++ {
++ 	return (unsigned long)sockptr.kernel >= TASK_SIZE;
++ }
++ 
++ static inline sockptr_t KERNEL_SOCKPTR(void *p)
++ {
++ 	return (sockptr_t) { .kernel = p };
++ }
++ #else /* CONFIG_ARCH_HAS_NON_OVERLAPPING_ADDRESS_SPACE */
+++>>>>>>> a31edb2059ed (net: improve the user pointer check in init_user_sockptr)
+  typedef struct {
+  	union {
+  		void		*kernel;
+@@@ -28,10 -45,15 +47,21 @@@ static inline sockptr_t KERNEL_SOCKPTR(
+  {
+  	return (sockptr_t) { .kernel = p, .is_kernel = true };
+  }
++ #endif /* CONFIG_ARCH_HAS_NON_OVERLAPPING_ADDRESS_SPACE */
+  
+++<<<<<<< HEAD
+ +static inline sockptr_t USER_SOCKPTR(void __user *p)
+ +{
+ +	return (sockptr_t) { .user = p };
+++=======
++ static inline int __must_check init_user_sockptr(sockptr_t *sp, void __user *p,
++ 		size_t size)
++ {
++ 	if (!access_ok(p, size))
++ 		return -EFAULT;
++ 	*sp = (sockptr_t) { .user = p };
++ 	return 0;
+++>>>>>>> a31edb2059ed (net: improve the user pointer check in init_user_sockptr)
+  }
+  
+  static inline bool sockptr_is_null(sockptr_t sockptr)
+diff --cc net/ipv4/bpfilter/sockopt.c
+index 1b34cb9a7708,545b2640f019..000000000000
+--- a/net/ipv4/bpfilter/sockopt.c
++++ b/net/ipv4/bpfilter/sockopt.c
+@@@ -64,9 -65,10 +64,16 @@@ int bpfilter_ip_get_sockopt(struct soc
+  
+  	if (get_user(len, optlen))
+  		return -EFAULT;
+++<<<<<<< HEAD
+ +
+ +	return bpfilter_mbox_request(sk, optname, USER_SOCKPTR(optval), len,
+ +				     false);
+++=======
++ 	err = init_user_sockptr(&optval, user_optval, len);
++ 	if (err)
++ 		return err;
++ 	return bpfilter_mbox_request(sk, optname, optval, len, false);
+++>>>>>>> a31edb2059ed (net: improve the user pointer check in init_user_sockptr)
+  }
+  
+  static int __init bpfilter_sockopt_init(void)
+diff --cc net/socket.c
+index 5a1fb545df6d,aff52e81653c..000000000000
+--- a/net/socket.c
++++ b/net/socket.c
+@@@ -2062,44 -2105,41 +2062,51 @@@ static int __sys_setsockopt(int fd, in
+  	if (optlen < 0)
+  		return -EINVAL;
+  
+++<<<<<<< HEAD
+++=======
++ 	err = init_user_sockptr(&optval, user_optval, optlen);
++ 	if (err)
++ 		return err;
++ 
+++>>>>>>> a31edb2059ed (net: improve the user pointer check in init_user_sockptr)
+  	sock = sockfd_lookup_light(fd, &err, &fput_needed);
+ -	if (!sock)
+ -		return err;
+ -
+ -	err = security_socket_setsockopt(sock, level, optname);
+ -	if (err)
+ -		goto out_put;
+ +	if (sock != NULL) {
+ +		err = security_socket_setsockopt(sock, level, optname);
+ +		if (err)
+ +			goto out_put;
+  
+ -	if (!in_compat_syscall())
+ -		err = BPF_CGROUP_RUN_PROG_SETSOCKOPT(sock->sk, &level, &optname,
+ -						     user_optval, &optlen,
+ +		err = BPF_CGROUP_RUN_PROG_SETSOCKOPT(sock->sk, &level,
+ +						     &optname, optval, &optlen,
+  						     &kernel_optval);
+ -	if (err < 0)
+ -		goto out_put;
+ -	if (err > 0) {
+ -		err = 0;
+ -		goto out_put;
+ -	}
+  
+ -	if (kernel_optval)
+ -		optval = KERNEL_SOCKPTR(kernel_optval);
+ -	if (level == SOL_SOCKET && !sock_use_custom_sol_socket(sock))
+ -		err = sock_setsockopt(sock, level, optname, optval, optlen);
+ -	else if (unlikely(!sock->ops->setsockopt))
+ -		err = -EOPNOTSUPP;
+ -	else
+ -		err = sock->ops->setsockopt(sock, level, optname, optval,
+ +		if (err < 0) {
+ +			goto out_put;
+ +		} else if (err > 0) {
+ +			err = 0;
+ +			goto out_put;
+ +		}
+ +
+ +		if (kernel_optval) {
+ +			set_fs(KERNEL_DS);
+ +			optval = (char __user __force *)kernel_optval;
+ +		}
+ +
+ +		if (level == SOL_SOCKET && !sock_use_custom_sol_socket(sock))
+ +			err =
+ +			    sock_setsockopt(sock, level, optname, optval,
+  					    optlen);
+ -	kfree(kernel_optval);
+ +		else
+ +			err =
+ +			    sock->ops->setsockopt(sock, level, optname, optval,
+ +						  optlen);
+ +
+ +		if (kernel_optval) {
+ +			set_fs(oldfs);
+ +			kfree(kernel_optval);
+ +		}
+  out_put:
+ -	fput_light(sock->file, fput_needed);
+ +		fput_light(sock->file, fput_needed);
+ +	}
+  	return err;
+  }
+  
+* Unmerged path include/linux/sockptr.h
+* Unmerged path net/ipv4/bpfilter/sockopt.c
+* Unmerged path net/socket.c
