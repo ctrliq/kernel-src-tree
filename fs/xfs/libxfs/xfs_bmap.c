@@ -797,6 +797,7 @@ out_root_realloc:
  */
 void
 xfs_bmap_local_to_extents_empty(
+	struct xfs_trans	*tp,
 	struct xfs_inode	*ip,
 	int			whichfork)
 {
@@ -813,6 +814,7 @@ xfs_bmap_local_to_extents_empty(
 	ifp->if_u1.if_root = NULL;
 	ifp->if_height = 0;
 	XFS_IFORK_FMT_SET(ip, whichfork, XFS_DINODE_FMT_EXTENTS);
+	xfs_trans_log_inode(tp, ip, XFS_ILOG_CORE);
 }
 
 
@@ -845,7 +847,7 @@ xfs_bmap_local_to_extents(
 	ASSERT(XFS_IFORK_FORMAT(ip, whichfork) == XFS_DINODE_FMT_LOCAL);
 
 	if (!ifp->if_bytes) {
-		xfs_bmap_local_to_extents_empty(ip, whichfork);
+		xfs_bmap_local_to_extents_empty(tp, ip, whichfork);
 		flags = XFS_ILOG_CORE;
 		goto done;
 	}
@@ -892,7 +894,7 @@ xfs_bmap_local_to_extents(
 
 	/* account for the change in fork size */
 	xfs_idata_realloc(ip, -ifp->if_bytes, whichfork);
-	xfs_bmap_local_to_extents_empty(ip, whichfork);
+	xfs_bmap_local_to_extents_empty(tp, ip, whichfork);
 	flags |= XFS_ILOG_CORE;
 
 	ifp->if_u1.if_root = NULL;
