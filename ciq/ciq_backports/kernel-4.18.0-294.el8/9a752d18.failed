@@ -1,0 +1,89 @@
+virtiofs: add logic to free up a memory range
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Vivek Goyal <vgoyal@redhat.com>
+commit 9a752d18c85ae5da28e4a07d52adfd95eacb2495
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/9a752d18.failed
+
+Add logic to free up a busy memory range. Freed memory range will be
+returned to free pool. Add a worker which can be started to select
+and free some busy memory ranges.
+
+Process can also steal one of its busy dax ranges if free range is not
+available. I will refer it to as direct reclaim.
+
+If free range is not available and nothing can't be stolen from same
+inode, caller waits on a waitq for free range to become available.
+
+For reclaiming a range, as of now we need to hold following locks in
+specified order.
+
+	down_write(&fi->i_mmap_sem);
+	down_write(&fi->dax->sem);
+
+We look for a free range in following order.
+
+A. Try to get a free range.
+B. If not, try direct reclaim.
+C. If not, wait for a memory range to become free
+
+	Signed-off-by: Vivek Goyal <vgoyal@redhat.com>
+	Signed-off-by: Liu Bo <bo.liu@linux.alibaba.com>
+	Signed-off-by: Miklos Szeredi <mszeredi@redhat.com>
+(cherry picked from commit 9a752d18c85ae5da28e4a07d52adfd95eacb2495)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/fuse/dax.c
+#	fs/fuse/fuse_i.h
+diff --cc fs/fuse/fuse_i.h
+index 50415774dba0,dbaae2f6c73e..000000000000
+--- a/fs/fuse/fuse_i.h
++++ b/fs/fuse/fuse_i.h
+@@@ -1092,4 -1116,20 +1092,23 @@@ unsigned int fuse_len_args(unsigned in
+  u64 fuse_get_unique(struct fuse_iqueue *fiq);
+  void fuse_free_conn(struct fuse_conn *fc);
+  
+++<<<<<<< HEAD
+++=======
++ /* dax.c */
++ 
++ #define FUSE_IS_DAX(inode) (IS_ENABLED(CONFIG_FUSE_DAX) && IS_DAX(inode))
++ 
++ ssize_t fuse_dax_read_iter(struct kiocb *iocb, struct iov_iter *to);
++ ssize_t fuse_dax_write_iter(struct kiocb *iocb, struct iov_iter *from);
++ int fuse_dax_mmap(struct file *file, struct vm_area_struct *vma);
++ int fuse_dax_break_layouts(struct inode *inode, u64 dmap_start, u64 dmap_end);
++ int fuse_dax_conn_alloc(struct fuse_conn *fc, struct dax_device *dax_dev);
++ void fuse_dax_conn_free(struct fuse_conn *fc);
++ bool fuse_dax_inode_alloc(struct super_block *sb, struct fuse_inode *fi);
++ void fuse_dax_inode_init(struct inode *inode);
++ void fuse_dax_inode_cleanup(struct inode *inode);
++ bool fuse_dax_check_alignment(struct fuse_conn *fc, unsigned int map_alignment);
++ void fuse_dax_cancel_work(struct fuse_conn *fc);
++ 
+++>>>>>>> 9a752d18c85a (virtiofs: add logic to free up a memory range)
+  #endif /* _FS_FUSE_I_H */
+* Unmerged path fs/fuse/dax.c
+* Unmerged path fs/fuse/dax.c
+* Unmerged path fs/fuse/fuse_i.h
+diff --git a/fs/fuse/virtio_fs.c b/fs/fuse/virtio_fs.c
+index 9e1128e7dad6..bd1eba4f7a35 100644
+--- a/fs/fuse/virtio_fs.c
++++ b/fs/fuse/virtio_fs.c
+@@ -1299,6 +1299,12 @@ static void virtio_kill_sb(struct super_block *sb)
+ 	vfs = fc->iq.priv;
+ 	fsvq = &vfs->vqs[VQ_HIPRIO];
+ 
++	/* Stop dax worker. Soon evict_inodes() will be called which will
++	 * free all memory ranges belonging to all inodes.
++	 */
++	if (IS_ENABLED(CONFIG_FUSE_DAX))
++		fuse_dax_cancel_work(fc);
++
+ 	/* Stop forget queue. Soon destroy will be sent */
+ 	spin_lock(&fsvq->lock);
+ 	fsvq->connected = false;
