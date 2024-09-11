@@ -1,0 +1,232 @@
+powerpc/security: Fix link stack flush instruction
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Nicholas Piggin <npiggin@gmail.com>
+commit 792254a77201453d9a77479e63dc216ad90462d2
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/792254a7.failed
+
+The inline execution path for the hardware assisted branch flush
+instruction failed to set CTR to the correct value before bcctr,
+causing a crash when the feature is enabled.
+
+Fixes: 4d24e21cc694 ("powerpc/security: Allow for processors that flush the link stack using the special bcctr")
+	Signed-off-by: Nicholas Piggin <npiggin@gmail.com>
+	Signed-off-by: Michael Ellerman <mpe@ellerman.id.au>
+Link: https://lore.kernel.org/r/20201007080605.64423-1-npiggin@gmail.com
+(cherry picked from commit 792254a77201453d9a77479e63dc216ad90462d2)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/powerpc/include/asm/asm-prototypes.h
+#	arch/powerpc/kernel/entry_64.S
+#	arch/powerpc/kernel/security.c
+diff --cc arch/powerpc/include/asm/asm-prototypes.h
+index 792f29cc222f,d0b832cbbec8..000000000000
+--- a/arch/powerpc/include/asm/asm-prototypes.h
++++ b/arch/powerpc/include/asm/asm-prototypes.h
+@@@ -152,6 -144,18 +152,21 @@@ struct kvm_vcpu
+  void _kvmppc_restore_tm_pr(struct kvm_vcpu *vcpu, u64 guest_msr);
+  void _kvmppc_save_tm_pr(struct kvm_vcpu *vcpu, u64 guest_msr);
+  
+++<<<<<<< HEAD
+++=======
++ /* Patch sites */
++ extern s32 patch__call_flush_branch_caches1;
++ extern s32 patch__call_flush_branch_caches2;
++ extern s32 patch__call_flush_branch_caches3;
++ extern s32 patch__flush_count_cache_return;
++ extern s32 patch__flush_link_stack_return;
++ extern s32 patch__call_kvm_flush_link_stack;
++ extern s32 patch__memset_nocache, patch__memcpy_nocache;
++ 
++ extern long flush_branch_caches;
++ extern long kvm_flush_link_stack;
++ 
+++>>>>>>> 792254a77201 (powerpc/security: Fix link stack flush instruction)
+  #ifdef CONFIG_PPC_TRANSACTIONAL_MEM
+  void kvmppc_save_tm_hv(struct kvm_vcpu *vcpu, u64 msr, bool preserve_nv);
+  void kvmppc_restore_tm_hv(struct kvm_vcpu *vcpu, u64 msr, bool preserve_nv);
+diff --cc arch/powerpc/kernel/entry_64.S
+index 90c486a3d354,2f3846192ec7..000000000000
+--- a/arch/powerpc/kernel/entry_64.S
++++ b/arch/powerpc/kernel/entry_64.S
+@@@ -509,8 -430,11 +509,16 @@@ _GLOBAL(ret_from_kernel_thread
+  
+  #define FLUSH_COUNT_CACHE	\
+  1:	nop;			\
+++<<<<<<< HEAD
+ +	patch_site 1b, patch__call_flush_count_cache
+ +
+++=======
++ 	patch_site 1b, patch__call_flush_branch_caches1; \
++ 1:	nop;			\
++ 	patch_site 1b, patch__call_flush_branch_caches2; \
++ 1:	nop;			\
++ 	patch_site 1b, patch__call_flush_branch_caches3
+++>>>>>>> 792254a77201 (powerpc/security: Fix link stack flush instruction)
+  
+  .macro nops number
+  	.rept \number
+@@@ -591,7 -514,9 +599,13 @@@ _GLOBAL(_switch
+  	std	r23,_CCR(r1)
+  	std	r1,KSP(r3)	/* Set old stack pointer */
+  
+++<<<<<<< HEAD
+ +	FLUSH_COUNT_CACHE
+++=======
++ 	kuap_check_amr r9, r10
++ 
++ 	FLUSH_COUNT_CACHE	/* Clobbers r9, ctr */
+++>>>>>>> 792254a77201 (powerpc/security: Fix link stack flush instruction)
+  
+  	/*
+  	 * On SMP kernels, care must be taken because a task may be
+diff --cc arch/powerpc/kernel/security.c
+index 9203c2cff485,e4e1a94ccf6a..000000000000
+--- a/arch/powerpc/kernel/security.c
++++ b/arch/powerpc/kernel/security.c
+@@@ -413,58 -428,93 +413,111 @@@ static __init int stf_barrier_debugfs_i
+  device_initcall(stf_barrier_debugfs_init);
+  #endif /* CONFIG_DEBUG_FS */
+  
+ -static void update_branch_cache_flush(void)
+ +static void no_count_cache_flush(void)
+  {
+++<<<<<<< HEAD
+ +	count_cache_flush_type = COUNT_CACHE_FLUSH_NONE;
+ +	pr_info("count-cache-flush: software flush disabled.\n");
+++=======
++ 	u32 *site;
++ 
++ #ifdef CONFIG_KVM_BOOK3S_HV_POSSIBLE
++ 	site = &patch__call_kvm_flush_link_stack;
++ 	// This controls the branch from guest_exit_cont to kvm_flush_link_stack
++ 	if (link_stack_flush_type == BRANCH_CACHE_FLUSH_NONE) {
++ 		patch_instruction_site(site, ppc_inst(PPC_INST_NOP));
++ 	} else {
++ 		// Could use HW flush, but that could also flush count cache
++ 		patch_branch_site(site, (u64)&kvm_flush_link_stack, BRANCH_SET_LINK);
++ 	}
++ #endif
++ 
++ 	// Patch out the bcctr first, then nop the rest
++ 	site = &patch__call_flush_branch_caches3;
++ 	patch_instruction_site(site, ppc_inst(PPC_INST_NOP));
++ 	site = &patch__call_flush_branch_caches2;
++ 	patch_instruction_site(site, ppc_inst(PPC_INST_NOP));
++ 	site = &patch__call_flush_branch_caches1;
++ 	patch_instruction_site(site, ppc_inst(PPC_INST_NOP));
++ 
++ 	// This controls the branch from _switch to flush_branch_caches
++ 	if (count_cache_flush_type == BRANCH_CACHE_FLUSH_NONE &&
++ 	    link_stack_flush_type == BRANCH_CACHE_FLUSH_NONE) {
++ 		// Nothing to be done
++ 
++ 	} else if (count_cache_flush_type == BRANCH_CACHE_FLUSH_HW &&
++ 		   link_stack_flush_type == BRANCH_CACHE_FLUSH_HW) {
++ 		// Patch in the bcctr last
++ 		site = &patch__call_flush_branch_caches1;
++ 		patch_instruction_site(site, ppc_inst(0x39207fff)); // li r9,0x7fff
++ 		site = &patch__call_flush_branch_caches2;
++ 		patch_instruction_site(site, ppc_inst(0x7d2903a6)); // mtctr r9
++ 		site = &patch__call_flush_branch_caches3;
++ 		patch_instruction_site(site, ppc_inst(PPC_INST_BCCTR_FLUSH));
++ 
++ 	} else {
++ 		patch_branch_site(site, (u64)&flush_branch_caches, BRANCH_SET_LINK);
++ 
++ 		// If we just need to flush the link stack, early return
++ 		if (count_cache_flush_type == BRANCH_CACHE_FLUSH_NONE) {
++ 			patch_instruction_site(&patch__flush_link_stack_return,
++ 					       ppc_inst(PPC_INST_BLR));
++ 
++ 		// If we have flush instruction, early return
++ 		} else if (count_cache_flush_type == BRANCH_CACHE_FLUSH_HW) {
++ 			patch_instruction_site(&patch__flush_count_cache_return,
++ 					       ppc_inst(PPC_INST_BLR));
++ 		}
++ 	}
+++>>>>>>> 792254a77201 (powerpc/security: Fix link stack flush instruction)
+  }
+  
+ -static void toggle_branch_cache_flush(bool enable)
+ +static void toggle_count_cache_flush(bool enable)
+  {
+ -	if (!enable || !security_ftr_enabled(SEC_FTR_FLUSH_COUNT_CACHE)) {
+ -		if (count_cache_flush_type != BRANCH_CACHE_FLUSH_NONE)
+ -			count_cache_flush_type = BRANCH_CACHE_FLUSH_NONE;
+ +	if (!security_ftr_enabled(SEC_FTR_FLUSH_COUNT_CACHE) &&
+ +	    !security_ftr_enabled(SEC_FTR_FLUSH_LINK_STACK))
+ +		enable = false;
+  
+ -		pr_info("count-cache-flush: flush disabled.\n");
+ -	} else {
+ -		if (security_ftr_enabled(SEC_FTR_BCCTR_FLUSH_ASSIST)) {
+ -			count_cache_flush_type = BRANCH_CACHE_FLUSH_HW;
+ -			pr_info("count-cache-flush: hardware flush enabled.\n");
+ -		} else {
+ -			count_cache_flush_type = BRANCH_CACHE_FLUSH_SW;
+ -			pr_info("count-cache-flush: software flush enabled.\n");
+ -		}
+ +	if (!enable) {
+ +		patch_instruction_site(&patch__call_flush_count_cache, PPC_INST_NOP);
+ +#ifdef CONFIG_KVM_BOOK3S_HV_POSSIBLE
+ +		patch_instruction_site(&patch__call_kvm_flush_link_stack, PPC_INST_NOP);
+ +#endif
+ +		pr_info("link-stack-flush: software flush disabled.\n");
+ +		link_stack_flush_enabled = false;
+ +		no_count_cache_flush();
+ +		return;
+  	}
+  
+ -	if (!enable || !security_ftr_enabled(SEC_FTR_FLUSH_LINK_STACK)) {
+ -		if (link_stack_flush_type != BRANCH_CACHE_FLUSH_NONE)
+ -			link_stack_flush_type = BRANCH_CACHE_FLUSH_NONE;
+ +	// This enables the branch from _switch to flush_count_cache
+ +	patch_branch_site(&patch__call_flush_count_cache,
+ +			  (u64)&flush_count_cache, BRANCH_SET_LINK);
+  
+ -		pr_info("link-stack-flush: flush disabled.\n");
+ -	} else {
+ -		if (security_ftr_enabled(SEC_FTR_BCCTR_LINK_FLUSH_ASSIST)) {
+ -			link_stack_flush_type = BRANCH_CACHE_FLUSH_HW;
+ -			pr_info("link-stack-flush: hardware flush enabled.\n");
+ -		} else {
+ -			link_stack_flush_type = BRANCH_CACHE_FLUSH_SW;
+ -			pr_info("link-stack-flush: software flush enabled.\n");
+ -		}
+ +#ifdef CONFIG_KVM_BOOK3S_HV_POSSIBLE
+ +	// This enables the branch from guest_exit_cont to kvm_flush_link_stack
+ +	patch_branch_site(&patch__call_kvm_flush_link_stack,
+ +			  (u64)&kvm_flush_link_stack, BRANCH_SET_LINK);
+ +#endif
+ +
+ +	pr_info("link-stack-flush: software flush enabled.\n");
+ +	link_stack_flush_enabled = true;
+ +
+ +	// If we just need to flush the link stack, patch an early return
+ +	if (!security_ftr_enabled(SEC_FTR_FLUSH_COUNT_CACHE)) {
+ +		patch_instruction_site(&patch__flush_link_stack_return, PPC_INST_BLR);
+ +		no_count_cache_flush();
+ +		return;
+ +	}
+ +
+ +	if (!security_ftr_enabled(SEC_FTR_BCCTR_FLUSH_ASSIST)) {
+ +		count_cache_flush_type = COUNT_CACHE_FLUSH_SW;
+ +		pr_info("count-cache-flush: full software flush sequence enabled.\n");
+ +		return;
+  	}
+  
+ -	update_branch_cache_flush();
+ +	patch_instruction_site(&patch__flush_count_cache_return, PPC_INST_BLR);
+ +	count_cache_flush_type = COUNT_CACHE_FLUSH_HW;
+ +	pr_info("count-cache-flush: hardware assisted flush sequence enabled\n");
+  }
+  
+  void setup_count_cache_flush(void)
+* Unmerged path arch/powerpc/include/asm/asm-prototypes.h
+* Unmerged path arch/powerpc/kernel/entry_64.S
+* Unmerged path arch/powerpc/kernel/security.c
