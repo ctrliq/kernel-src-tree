@@ -1,0 +1,95 @@
+block: Try to handle busy underlying device on discard
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-310.el8
+commit-author Jan Kara <jack@suse.cz>
+commit 56887cffe946bb0a90c74429fa94d6110a73119d
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-310.el8/56887cff.failed
+
+Commit 384d87ef2c95 ("block: Do not discard buffers under a mounted
+filesystem") made paths issuing discard or zeroout requests to the
+underlying device try to grab block device in exclusive mode. If that
+failed we returned EBUSY to userspace. This however caused unexpected
+fallout in userspace where e.g. FUSE filesystems issue discard requests
+from userspace daemons although the device is open exclusively by the
+kernel. Also shrinking of logical volume by LVM issues discard requests
+to a device which may be claimed exclusively because there's another LV
+on the same PV. So to avoid these userspace regressions, fall back to
+invalidate_inode_pages2_range() instead of returning EBUSY to userspace
+and return EBUSY only of that call fails as well (meaning that there's
+indeed someone using the particular device range we are trying to
+discard).
+
+Link: https://bugzilla.kernel.org/show_bug.cgi?id=211167
+Fixes: 384d87ef2c95 ("block: Do not discard buffers under a mounted filesystem")
+CC: stable@vger.kernel.org
+	Signed-off-by: Jan Kara <jack@suse.cz>
+	Reviewed-by: Christoph Hellwig <hch@lst.de>
+	Signed-off-by: Jens Axboe <axboe@kernel.dk>
+(cherry picked from commit 56887cffe946bb0a90c74429fa94d6110a73119d)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/block_dev.c
+diff --cc fs/block_dev.c
+index d19c1a4a405b,03166b3dea4d..000000000000
+--- a/fs/block_dev.c
++++ b/fs/block_dev.c
+@@@ -104,11 -103,49 +104,47 @@@ void invalidate_bdev(struct block_devic
+  }
+  EXPORT_SYMBOL(invalidate_bdev);
+  
+++<<<<<<< HEAD
+++=======
++ /*
++  * Drop all buffers & page cache for given bdev range. This function bails
++  * with error if bdev has other exclusive owner (such as filesystem).
++  */
++ int truncate_bdev_range(struct block_device *bdev, fmode_t mode,
++ 			loff_t lstart, loff_t lend)
++ {
++ 	/*
++ 	 * If we don't hold exclusive handle for the device, upgrade to it
++ 	 * while we discard the buffer cache to avoid discarding buffers
++ 	 * under live filesystem.
++ 	 */
++ 	if (!(mode & FMODE_EXCL)) {
++ 		int err = bd_prepare_to_claim(bdev, truncate_bdev_range);
++ 		if (err)
++ 			goto invalidate;
++ 	}
++ 
++ 	truncate_inode_pages_range(bdev->bd_inode->i_mapping, lstart, lend);
++ 	if (!(mode & FMODE_EXCL))
++ 		bd_abort_claiming(bdev, truncate_bdev_range);
++ 	return 0;
++ 
++ invalidate:
++ 	/*
++ 	 * Someone else has handle exclusively open. Try invalidating instead.
++ 	 * The 'end' argument is inclusive so the rounding is safe.
++ 	 */
++ 	return invalidate_inode_pages2_range(bdev->bd_inode->i_mapping,
++ 					     lstart >> PAGE_SHIFT,
++ 					     lend >> PAGE_SHIFT);
++ }
++ 
+++>>>>>>> 56887cffe946 (block: Try to handle busy underlying device on discard)
+  static void set_init_blocksize(struct block_device *bdev)
+  {
+ -	unsigned int bsize = bdev_logical_block_size(bdev);
+ -	loff_t size = i_size_read(bdev->bd_inode);
+ +	unsigned bsize = bdev_logical_block_size(bdev);
+  
+ -	while (bsize < PAGE_SIZE) {
+ -		if (size & bsize)
+ -			break;
+ -		bsize <<= 1;
+ -	}
+ +	bdev->bd_block_size = bsize;
+  	bdev->bd_inode->i_blkbits = blksize_bits(bsize);
+  }
+  
+* Unmerged path fs/block_dev.c
