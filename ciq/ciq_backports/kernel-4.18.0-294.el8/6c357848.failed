@@ -1,0 +1,959 @@
+mm: replace hpage_nr_pages with thp_nr_pages
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Matthew Wilcox (Oracle) <willy@infradead.org>
+commit 6c357848b44b4016ca422178aa368a7472245f6f
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/6c357848.failed
+
+The thp prefix is more frequently used than hpage and we should be
+consistent between the various functions.
+
+[akpm@linux-foundation.org: fix mm/migrate.c]
+
+	Signed-off-by: Matthew Wilcox (Oracle) <willy@infradead.org>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Reviewed-by: William Kucharski <william.kucharski@oracle.com>
+	Reviewed-by: Zi Yan <ziy@nvidia.com>
+	Cc: Mike Kravetz <mike.kravetz@oracle.com>
+	Cc: David Hildenbrand <david@redhat.com>
+	Cc: "Kirill A. Shutemov" <kirill.shutemov@linux.intel.com>
+Link: http://lkml.kernel.org/r/20200629151959.15779-6-willy@infradead.org
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit 6c357848b44b4016ca422178aa368a7472245f6f)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/pagemap.h
+#	mm/compaction.c
+#	mm/gup.c
+#	mm/memcontrol.c
+#	mm/memory_hotplug.c
+#	mm/mempolicy.c
+#	mm/migrate.c
+#	mm/mlock.c
+#	mm/swap.c
+#	mm/swap_state.c
+#	mm/swapfile.c
+#	mm/vmscan.c
+#	mm/workingset.c
+diff --cc include/linux/pagemap.h
+index aa04b06417e2,7de11dcd534d..000000000000
+--- a/include/linux/pagemap.h
++++ b/include/linux/pagemap.h
+@@@ -332,6 -371,19 +332,22 @@@ static inline struct page *grab_cache_p
+  			mapping_gfp_mask(mapping));
+  }
+  
+++<<<<<<< HEAD
+++=======
++ /*
++  * Given the page we found in the page cache, return the page corresponding
++  * to this index in the file
++  */
++ static inline struct page *find_subpage(struct page *head, pgoff_t index)
++ {
++ 	/* HugeTLBfs wants the head page regardless */
++ 	if (PageHuge(head))
++ 		return head;
++ 
++ 	return head + (index & (thp_nr_pages(head) - 1));
++ }
++ 
+++>>>>>>> 6c357848b44b (mm: replace hpage_nr_pages with thp_nr_pages)
+  struct page *find_get_entry(struct address_space *mapping, pgoff_t offset);
+  struct page *find_lock_entry(struct address_space *mapping, pgoff_t offset);
+  unsigned find_get_entries(struct address_space *mapping, pgoff_t start,
+@@@ -628,6 -725,146 +644,149 @@@ static inline int add_to_page_cache(str
+  	return error;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ /**
++  * struct readahead_control - Describes a readahead request.
++  *
++  * A readahead request is for consecutive pages.  Filesystems which
++  * implement the ->readahead method should call readahead_page() or
++  * readahead_page_batch() in a loop and attempt to start I/O against
++  * each page in the request.
++  *
++  * Most of the fields in this struct are private and should be accessed
++  * by the functions below.
++  *
++  * @file: The file, used primarily by network filesystems for authentication.
++  *	  May be NULL if invoked internally by the filesystem.
++  * @mapping: Readahead this filesystem object.
++  */
++ struct readahead_control {
++ 	struct file *file;
++ 	struct address_space *mapping;
++ /* private: use the readahead_* accessors instead */
++ 	pgoff_t _index;
++ 	unsigned int _nr_pages;
++ 	unsigned int _batch_count;
++ };
++ 
++ /**
++  * readahead_page - Get the next page to read.
++  * @rac: The current readahead request.
++  *
++  * Context: The page is locked and has an elevated refcount.  The caller
++  * should decreases the refcount once the page has been submitted for I/O
++  * and unlock the page once all I/O to that page has completed.
++  * Return: A pointer to the next page, or %NULL if we are done.
++  */
++ static inline struct page *readahead_page(struct readahead_control *rac)
++ {
++ 	struct page *page;
++ 
++ 	BUG_ON(rac->_batch_count > rac->_nr_pages);
++ 	rac->_nr_pages -= rac->_batch_count;
++ 	rac->_index += rac->_batch_count;
++ 
++ 	if (!rac->_nr_pages) {
++ 		rac->_batch_count = 0;
++ 		return NULL;
++ 	}
++ 
++ 	page = xa_load(&rac->mapping->i_pages, rac->_index);
++ 	VM_BUG_ON_PAGE(!PageLocked(page), page);
++ 	rac->_batch_count = thp_nr_pages(page);
++ 
++ 	return page;
++ }
++ 
++ static inline unsigned int __readahead_batch(struct readahead_control *rac,
++ 		struct page **array, unsigned int array_sz)
++ {
++ 	unsigned int i = 0;
++ 	XA_STATE(xas, &rac->mapping->i_pages, 0);
++ 	struct page *page;
++ 
++ 	BUG_ON(rac->_batch_count > rac->_nr_pages);
++ 	rac->_nr_pages -= rac->_batch_count;
++ 	rac->_index += rac->_batch_count;
++ 	rac->_batch_count = 0;
++ 
++ 	xas_set(&xas, rac->_index);
++ 	rcu_read_lock();
++ 	xas_for_each(&xas, page, rac->_index + rac->_nr_pages - 1) {
++ 		VM_BUG_ON_PAGE(!PageLocked(page), page);
++ 		VM_BUG_ON_PAGE(PageTail(page), page);
++ 		array[i++] = page;
++ 		rac->_batch_count += thp_nr_pages(page);
++ 
++ 		/*
++ 		 * The page cache isn't using multi-index entries yet,
++ 		 * so the xas cursor needs to be manually moved to the
++ 		 * next index.  This can be removed once the page cache
++ 		 * is converted.
++ 		 */
++ 		if (PageHead(page))
++ 			xas_set(&xas, rac->_index + rac->_batch_count);
++ 
++ 		if (i == array_sz)
++ 			break;
++ 	}
++ 	rcu_read_unlock();
++ 
++ 	return i;
++ }
++ 
++ /**
++  * readahead_page_batch - Get a batch of pages to read.
++  * @rac: The current readahead request.
++  * @array: An array of pointers to struct page.
++  *
++  * Context: The pages are locked and have an elevated refcount.  The caller
++  * should decreases the refcount once the page has been submitted for I/O
++  * and unlock the page once all I/O to that page has completed.
++  * Return: The number of pages placed in the array.  0 indicates the request
++  * is complete.
++  */
++ #define readahead_page_batch(rac, array)				\
++ 	__readahead_batch(rac, array, ARRAY_SIZE(array))
++ 
++ /**
++  * readahead_pos - The byte offset into the file of this readahead request.
++  * @rac: The readahead request.
++  */
++ static inline loff_t readahead_pos(struct readahead_control *rac)
++ {
++ 	return (loff_t)rac->_index * PAGE_SIZE;
++ }
++ 
++ /**
++  * readahead_length - The number of bytes in this readahead request.
++  * @rac: The readahead request.
++  */
++ static inline loff_t readahead_length(struct readahead_control *rac)
++ {
++ 	return (loff_t)rac->_nr_pages * PAGE_SIZE;
++ }
++ 
++ /**
++  * readahead_index - The index of the first page in this readahead request.
++  * @rac: The readahead request.
++  */
++ static inline pgoff_t readahead_index(struct readahead_control *rac)
++ {
++ 	return rac->_index;
++ }
++ 
++ /**
++  * readahead_count - The number of pages in this readahead request.
++  * @rac: The readahead request.
++  */
++ static inline unsigned int readahead_count(struct readahead_control *rac)
++ {
++ 	return rac->_nr_pages;
++ }
++ 
+++>>>>>>> 6c357848b44b (mm: replace hpage_nr_pages with thp_nr_pages)
+  static inline unsigned long dir_pages(struct inode *inode)
+  {
+  	return (unsigned long)(inode->i_size + PAGE_SIZE - 1) >>
+diff --cc mm/compaction.c
+index 35fc5ff5f321,176dcded298e..000000000000
+--- a/mm/compaction.c
++++ b/mm/compaction.c
+@@@ -879,8 -1007,9 +879,14 @@@ isolate_migratepages_block(struct compa
+  
+  		/* Successfully isolated */
+  		del_page_from_lru_list(page, lruvec, page_lru(page));
+++<<<<<<< HEAD
+ +		inc_node_page_state(page,
+ +				NR_ISOLATED_ANON + page_is_file_cache(page));
+++=======
++ 		mod_node_page_state(page_pgdat(page),
++ 				NR_ISOLATED_ANON + page_is_file_lru(page),
++ 				thp_nr_pages(page));
+++>>>>>>> 6c357848b44b (mm: replace hpage_nr_pages with thp_nr_pages)
+  
+  isolate_success:
+  		list_add(&page->lru, &cc->migratepages);
+diff --cc mm/gup.c
+index 5fc3013a77c4,ae096ea7583f..000000000000
+--- a/mm/gup.c
++++ b/mm/gup.c
+@@@ -1457,8 -1636,8 +1457,13 @@@ check_again
+  					list_add_tail(&head->lru, &cma_page_list);
+  					mod_node_page_state(page_pgdat(head),
+  							    NR_ISOLATED_ANON +
+++<<<<<<< HEAD
+ +							    page_is_file_cache(head),
+ +							    hpage_nr_pages(head));
+++=======
++ 							    page_is_file_lru(head),
++ 							    thp_nr_pages(head));
+++>>>>>>> 6c357848b44b (mm: replace hpage_nr_pages with thp_nr_pages)
+  				}
+  			}
+  		}
+diff --cc mm/memcontrol.c
+index 406972ba9675,b807952b4d43..000000000000
+--- a/mm/memcontrol.c
++++ b/mm/memcontrol.c
+@@@ -5323,10 -5589,8 +5323,14 @@@ static int mem_cgroup_move_account(stru
+  {
+  	struct lruvec *from_vec, *to_vec;
+  	struct pglist_data *pgdat;
+++<<<<<<< HEAD
+ +	unsigned long flags;
+ +	unsigned int nr_pages = compound ? hpage_nr_pages(page) : 1;
+++=======
++ 	unsigned int nr_pages = compound ? thp_nr_pages(page) : 1;
+++>>>>>>> 6c357848b44b (mm: replace hpage_nr_pages with thp_nr_pages)
+  	int ret;
+ +	bool anon;
+  
+  	VM_BUG_ON(from == to);
+  	VM_BUG_ON_PAGE(PageLRU(page), page);
+@@@ -6339,19 -6678,12 +6343,23 @@@ out
+   * Try to charge @page to the memcg that @mm belongs to, reclaiming
+   * pages according to @gfp_mask if necessary.
+   *
+ - * Returns 0 on success. Otherwise, an error code is returned.
+ + * Returns 0 on success, with *@memcgp pointing to the charged memcg.
+ + * Otherwise, an error code is returned.
+ + *
+ + * After page->mapping has been set up, the caller must finalize the
+ + * charge with mem_cgroup_commit_charge().  Or abort the transaction
+ + * with mem_cgroup_cancel_charge() in case page instantiation fails.
+   */
+ -int mem_cgroup_charge(struct page *page, struct mm_struct *mm, gfp_t gfp_mask)
+ +int mem_cgroup_try_charge(struct page *page, struct mm_struct *mm,
+ +			  gfp_t gfp_mask, struct mem_cgroup **memcgp,
+ +			  bool compound)
+  {
+++<<<<<<< HEAD
+++=======
++ 	unsigned int nr_pages = thp_nr_pages(page);
+++>>>>>>> 6c357848b44b (mm: replace hpage_nr_pages with thp_nr_pages)
+  	struct mem_cgroup *memcg = NULL;
+ +	unsigned int nr_pages = compound ? hpage_nr_pages(page) : 1;
+  	int ret = 0;
+  
+  	if (mem_cgroup_disabled())
+diff --cc mm/memory_hotplug.c
+index b425e9969aa2,e9d5ab5d3ca0..000000000000
+--- a/mm/memory_hotplug.c
++++ b/mm/memory_hotplug.c
+@@@ -1294,10 -1307,10 +1294,15 @@@ do_migrate_range(unsigned long start_pf
+  		if (!pfn_valid(pfn))
+  			continue;
+  		page = pfn_to_page(pfn);
++ 		head = compound_head(page);
+  
+  		if (PageHuge(page)) {
+++<<<<<<< HEAD
+ +			struct page *head = compound_head(page);
+ +			pfn = page_to_pfn(head) + (1<<compound_order(head)) - 1;
+++=======
++ 			pfn = page_to_pfn(head) + compound_nr(head) - 1;
+++>>>>>>> 6c357848b44b (mm: replace hpage_nr_pages with thp_nr_pages)
+  			isolate_huge_page(head, &source);
+  			continue;
+  		} else if (PageTransHuge(page))
+diff --cc mm/mempolicy.c
+index e1941a92f42f,eddbe4e56c73..000000000000
+--- a/mm/mempolicy.c
++++ b/mm/mempolicy.c
+@@@ -980,8 -1048,8 +980,13 @@@ static int migrate_page_add(struct pag
+  		if (!isolate_lru_page(head)) {
+  			list_add_tail(&head->lru, pagelist);
+  			mod_node_page_state(page_pgdat(head),
+++<<<<<<< HEAD
+ +				NR_ISOLATED_ANON + page_is_file_cache(head),
+ +				hpage_nr_pages(head));
+++=======
++ 				NR_ISOLATED_ANON + page_is_file_lru(head),
++ 				thp_nr_pages(head));
+++>>>>>>> 6c357848b44b (mm: replace hpage_nr_pages with thp_nr_pages)
+  		} else if (flags & MPOL_MF_STRICT) {
+  			/*
+  			 * Non-movable page may reach here.  And, there may be
+diff --cc mm/migrate.c
+index 60059875287d,34a842a8eb6a..000000000000
+--- a/mm/migrate.c
++++ b/mm/migrate.c
+@@@ -193,7 -193,7 +193,11 @@@ void putback_movable_pages(struct list_
+  			put_page(page);
+  		} else {
+  			mod_node_page_state(page_pgdat(page), NR_ISOLATED_ANON +
+++<<<<<<< HEAD
+ +					page_is_file_cache(page), -hpage_nr_pages(page));
+++=======
++ 					page_is_file_lru(page), -thp_nr_pages(page));
+++>>>>>>> 6c357848b44b (mm: replace hpage_nr_pages with thp_nr_pages)
+  			putback_lru_page(page);
+  		}
+  	}
+@@@ -545,9 -474,9 +549,9 @@@ int migrate_page_move_mapping(struct ad
+  	 * to one less reference.
+  	 * We know this isn't the last reference.
+  	 */
+- 	page_ref_unfreeze(page, expected_count - hpage_nr_pages(page));
++ 	page_ref_unfreeze(page, expected_count - thp_nr_pages(page));
+  
+ -	xas_unlock(&xas);
+ +	xa_unlock(&mapping->i_pages);
+  	/* Leave irq disabled to prevent preemption while updating stats */
+  
+  	/*
+@@@ -1207,7 -1213,7 +1211,11 @@@ out
+  		 */
+  		if (likely(!__PageMovable(page)))
+  			mod_node_page_state(page_pgdat(page), NR_ISOLATED_ANON +
+++<<<<<<< HEAD
+ +					page_is_file_cache(page), -hpage_nr_pages(page));
+++=======
++ 					page_is_file_lru(page), -thp_nr_pages(page));
+++>>>>>>> 6c357848b44b (mm: replace hpage_nr_pages with thp_nr_pages)
+  	}
+  
+  	/*
+@@@ -1409,6 -1439,14 +1417,16 @@@ int migrate_pages(struct list_head *fro
+  
+  		list_for_each_entry_safe(page, page2, from, lru) {
+  retry:
+++<<<<<<< HEAD
+++=======
++ 			/*
++ 			 * THP statistics is based on the source huge page.
++ 			 * Capture required information that might get lost
++ 			 * during migration.
++ 			 */
++ 			is_thp = PageTransHuge(page);
++ 			nr_subpages = thp_nr_pages(page);
+++>>>>>>> 6c357848b44b (mm: replace hpage_nr_pages with thp_nr_pages)
+  			cond_resched();
+  
+  			if (PageHuge(page))
+@@@ -1564,8 -1669,8 +1582,13 @@@ static int add_page_for_migration(struc
+  		err = 1;
+  		list_add_tail(&head->lru, pagelist);
+  		mod_node_page_state(page_pgdat(head),
+++<<<<<<< HEAD
+ +			NR_ISOLATED_ANON + page_is_file_cache(head),
+ +			hpage_nr_pages(head));
+++=======
++ 			NR_ISOLATED_ANON + page_is_file_lru(head),
++ 			thp_nr_pages(head));
+++>>>>>>> 6c357848b44b (mm: replace hpage_nr_pages with thp_nr_pages)
+  	}
+  out_putpage:
+  	/*
+@@@ -1913,9 -2032,9 +1936,9 @@@ static int numamigrate_isolate_page(pg_
+  		return 0;
+  	}
+  
+ -	page_lru = page_is_file_lru(page);
+ +	page_lru = page_is_file_cache(page);
+  	mod_node_page_state(page_pgdat(page), NR_ISOLATED_ANON + page_lru,
+- 				hpage_nr_pages(page));
++ 				thp_nr_pages(page));
+  
+  	/*
+  	 * Isolating the page has taken another reference, so the
+diff --cc mm/mlock.c
+index 0964aa0dd7bd,93ca2bf30b4f..000000000000
+--- a/mm/mlock.c
++++ b/mm/mlock.c
+@@@ -192,9 -191,9 +191,9 @@@ unsigned int munlock_vma_page(struct pa
+  	/*
+  	 * Serialize with any parallel __split_huge_page_refcount() which
+  	 * might otherwise copy PageMlocked to part of the tail pages before
+- 	 * we clear it in the head page. It also stabilizes hpage_nr_pages().
++ 	 * we clear it in the head page. It also stabilizes thp_nr_pages().
+  	 */
+ -	spin_lock_irq(&pgdat->lru_lock);
+ +	spin_lock_irq(zone_lru_lock(zone));
+  
+  	if (!TestClearPageMlocked(page)) {
+  		/* Potentially, PTE-mapped THP: do not skip the rest PTEs */
+@@@ -202,11 -201,11 +201,16 @@@
+  		goto unlock_out;
+  	}
+  
+++<<<<<<< HEAD
+ +	nr_pages = hpage_nr_pages(page);
+ +	__mod_zone_page_state(zone, NR_MLOCK, -nr_pages);
+++=======
++ 	nr_pages = thp_nr_pages(page);
++ 	__mod_zone_page_state(page_zone(page), NR_MLOCK, -nr_pages);
+++>>>>>>> 6c357848b44b (mm: replace hpage_nr_pages with thp_nr_pages)
+  
+  	if (__munlock_isolate_lru_page(page, true)) {
+ -		spin_unlock_irq(&pgdat->lru_lock);
+ +		spin_unlock_irq(zone_lru_lock(zone));
+  		__munlock_isolated_page(page);
+  		goto out;
+  	}
+diff --cc mm/swap.c
+index 70728521e27e,d26c22baf7c5..000000000000
+--- a/mm/swap.c
++++ b/mm/swap.c
+@@@ -224,7 -241,7 +224,11 @@@ static void pagevec_move_tail_fn(struc
+  		del_page_from_lru_list(page, lruvec, page_lru(page));
+  		ClearPageActive(page);
+  		add_page_to_lru_list_tail(page, lruvec, page_lru(page));
+++<<<<<<< HEAD
+ +		(*pgmoved)++;
+++=======
++ 		(*pgmoved) += thp_nr_pages(page);
+++>>>>>>> 6c357848b44b (mm: replace hpage_nr_pages with thp_nr_pages)
+  	}
+  }
+  
+@@@ -261,22 -278,49 +265,59 @@@ void rotate_reclaimable_page(struct pag
+  	}
+  }
+  
+ -void lru_note_cost(struct lruvec *lruvec, bool file, unsigned int nr_pages)
+ +static void update_page_reclaim_stat(struct lruvec *lruvec,
+ +				     int file, int rotated)
+  {
+ -	do {
+ -		unsigned long lrusize;
+ +	struct zone_reclaim_stat *reclaim_stat = &lruvec->reclaim_stat;
+  
+++<<<<<<< HEAD
+ +	reclaim_stat->recent_scanned[file]++;
+ +	if (rotated)
+ +		reclaim_stat->recent_rotated[file]++;
+++=======
++ 		/* Record cost event */
++ 		if (file)
++ 			lruvec->file_cost += nr_pages;
++ 		else
++ 			lruvec->anon_cost += nr_pages;
++ 
++ 		/*
++ 		 * Decay previous events
++ 		 *
++ 		 * Because workloads change over time (and to avoid
++ 		 * overflow) we keep these statistics as a floating
++ 		 * average, which ends up weighing recent refaults
++ 		 * more than old ones.
++ 		 */
++ 		lrusize = lruvec_page_state(lruvec, NR_INACTIVE_ANON) +
++ 			  lruvec_page_state(lruvec, NR_ACTIVE_ANON) +
++ 			  lruvec_page_state(lruvec, NR_INACTIVE_FILE) +
++ 			  lruvec_page_state(lruvec, NR_ACTIVE_FILE);
++ 
++ 		if (lruvec->file_cost + lruvec->anon_cost > lrusize / 4) {
++ 			lruvec->file_cost /= 2;
++ 			lruvec->anon_cost /= 2;
++ 		}
++ 	} while ((lruvec = parent_lruvec(lruvec)));
++ }
++ 
++ void lru_note_cost_page(struct page *page)
++ {
++ 	lru_note_cost(mem_cgroup_page_lruvec(page, page_pgdat(page)),
++ 		      page_is_file_lru(page), thp_nr_pages(page));
+++>>>>>>> 6c357848b44b (mm: replace hpage_nr_pages with thp_nr_pages)
+  }
+  
+  static void __activate_page(struct page *page, struct lruvec *lruvec,
+  			    void *arg)
+  {
+  	if (PageLRU(page) && !PageActive(page) && !PageUnevictable(page)) {
+ +		int file = page_is_file_cache(page);
+  		int lru = page_lru_base_type(page);
+++<<<<<<< HEAD
+++=======
++ 		int nr_pages = thp_nr_pages(page);
+++>>>>>>> 6c357848b44b (mm: replace hpage_nr_pages with thp_nr_pages)
+  
+  		del_page_from_lru_list(page, lruvec, lru);
+  		SetPageActive(page);
+@@@ -505,8 -530,9 +546,12 @@@ void lru_cache_add_active_or_unevictabl
+  static void lru_deactivate_file_fn(struct page *page, struct lruvec *lruvec,
+  			      void *arg)
+  {
+ -	int lru;
+ +	int lru, file;
+  	bool active;
+++<<<<<<< HEAD
+++=======
++ 	int nr_pages = thp_nr_pages(page);
+++>>>>>>> 6c357848b44b (mm: replace hpage_nr_pages with thp_nr_pages)
+  
+  	if (!PageLRU(page))
+  		return;
+@@@ -552,8 -579,8 +597,12 @@@ static void lru_deactivate_fn(struct pa
+  			    void *arg)
+  {
+  	if (PageLRU(page) && PageActive(page) && !PageUnevictable(page)) {
+ +		int file = page_is_file_cache(page);
+  		int lru = page_lru_base_type(page);
+++<<<<<<< HEAD
+++=======
++ 		int nr_pages = thp_nr_pages(page);
+++>>>>>>> 6c357848b44b (mm: replace hpage_nr_pages with thp_nr_pages)
+  
+  		del_page_from_lru_list(page, lruvec, lru + LRU_ACTIVE);
+  		ClearPageActive(page);
+@@@ -571,6 -599,7 +620,10 @@@ static void lru_lazyfree_fn(struct pag
+  	if (PageLRU(page) && PageAnon(page) && PageSwapBacked(page) &&
+  	    !PageSwapCache(page) && !PageUnevictable(page)) {
+  		bool active = PageActive(page);
+++<<<<<<< HEAD
+++=======
++ 		int nr_pages = thp_nr_pages(page);
+++>>>>>>> 6c357848b44b (mm: replace hpage_nr_pages with thp_nr_pages)
+  
+  		del_page_from_lru_list(page, lruvec,
+  				       LRU_INACTIVE_ANON + active);
+@@@ -910,6 -972,7 +963,10 @@@ static void __pagevec_lru_add_fn(struc
+  {
+  	enum lru_list lru;
+  	int was_unevictable = TestClearPageUnevictable(page);
+++<<<<<<< HEAD
+++=======
++ 	int nr_pages = thp_nr_pages(page);
+++>>>>>>> 6c357848b44b (mm: replace hpage_nr_pages with thp_nr_pages)
+  
+  	VM_BUG_ON_PAGE(PageLRU(page), page);
+  
+diff --cc mm/swap_state.c
+index e2aded84261e,d9d4a49f3241..000000000000
+--- a/mm/swap_state.c
++++ b/mm/swap_state.c
+@@@ -106,15 -106,32 +106,21 @@@ void show_swap_cache_info(void
+  	printk("Total swap = %lukB\n", total_swap_pages << (PAGE_SHIFT - 10));
+  }
+  
+ -void *get_shadow_from_swap_cache(swp_entry_t entry)
+ -{
+ -	struct address_space *address_space = swap_address_space(entry);
+ -	pgoff_t idx = swp_offset(entry);
+ -	struct page *page;
+ -
+ -	page = find_get_entry(address_space, idx);
+ -	if (xa_is_value(page))
+ -		return page;
+ -	if (page)
+ -		put_page(page);
+ -	return NULL;
+ -}
+ -
+  /*
+ - * add_to_swap_cache resembles add_to_page_cache_locked on swapper_space,
+ + * __add_to_swap_cache resembles add_to_page_cache_locked on swapper_space,
+   * but sets SwapCache flag and private instead of mapping and index.
+   */
+ -int add_to_swap_cache(struct page *page, swp_entry_t entry,
+ -			gfp_t gfp, void **shadowp)
+ +int __add_to_swap_cache(struct page *page, swp_entry_t entry)
+  {
+ -	struct address_space *address_space = swap_address_space(entry);
+ +	int error, i, nr = hpage_nr_pages(page);
+ +	struct address_space *address_space;
+  	pgoff_t idx = swp_offset(entry);
+++<<<<<<< HEAD
+++=======
++ 	XA_STATE_ORDER(xas, &address_space->i_pages, idx, compound_order(page));
++ 	unsigned long i, nr = thp_nr_pages(page);
++ 	void *old;
+++>>>>>>> 6c357848b44b (mm: replace hpage_nr_pages with thp_nr_pages)
+  
+  	VM_BUG_ON_PAGE(!PageLocked(page), page);
+  	VM_BUG_ON_PAGE(PageSwapCache(page), page);
+@@@ -173,10 -179,11 +179,10 @@@ int add_to_swap_cache(struct page *page
+   * This must be called only on pages that have
+   * been verified to be in the swap cache.
+   */
+ -void __delete_from_swap_cache(struct page *page,
+ -			swp_entry_t entry, void *shadow)
+ +void __delete_from_swap_cache(struct page *page, swp_entry_t entry)
+  {
+  	struct address_space *address_space = swap_address_space(entry);
+- 	int i, nr = hpage_nr_pages(page);
++ 	int i, nr = thp_nr_pages(page);
+  	pgoff_t idx = swp_offset(entry);
+  	XA_STATE(xas, &address_space->i_pages, idx);
+  
+@@@ -270,9 -278,40 +276,9 @@@ void delete_from_swap_cache(struct pag
+  	xa_unlock_irq(&address_space->i_pages);
+  
+  	put_swap_page(page, entry);
+- 	page_ref_sub(page, hpage_nr_pages(page));
++ 	page_ref_sub(page, thp_nr_pages(page));
+  }
+  
+ -void clear_shadow_from_swap_cache(int type, unsigned long begin,
+ -				unsigned long end)
+ -{
+ -	unsigned long curr = begin;
+ -	void *old;
+ -
+ -	for (;;) {
+ -		unsigned long nr_shadows = 0;
+ -		swp_entry_t entry = swp_entry(type, curr);
+ -		struct address_space *address_space = swap_address_space(entry);
+ -		XA_STATE(xas, &address_space->i_pages, curr);
+ -
+ -		xa_lock_irq(&address_space->i_pages);
+ -		xas_for_each(&xas, old, end) {
+ -			if (!xa_is_value(old))
+ -				continue;
+ -			xas_store(&xas, NULL);
+ -			nr_shadows++;
+ -		}
+ -		address_space->nrexceptional -= nr_shadows;
+ -		xa_unlock_irq(&address_space->i_pages);
+ -
+ -		/* search the next swapcache until we meet end */
+ -		curr >>= SWAP_ADDRESS_SPACE_SHIFT;
+ -		curr++;
+ -		curr <<= SWAP_ADDRESS_SPACE_SHIFT;
+ -		if (curr > end)
+ -			break;
+ -	}
+ -}
+ -
+  /* 
+   * If we are the only user, then try to free up the swap cache. 
+   * 
+diff --cc mm/swapfile.c
+index b77fb155eaf4,eb410d3c8de8..000000000000
+--- a/mm/swapfile.c
++++ b/mm/swapfile.c
+@@@ -1340,6 -1370,7 +1340,10 @@@ static void swapcache_free_cluster(swp_
+  	unsigned char *map;
+  	unsigned int i, free_entries = 0;
+  	unsigned char val;
+++<<<<<<< HEAD
+++=======
++ 	int size = swap_entry_size(thp_nr_pages(page));
+++>>>>>>> 6c357848b44b (mm: replace hpage_nr_pages with thp_nr_pages)
+  
+  	si = _swap_info_get(entry);
+  	if (!si)
+diff --cc mm/vmscan.c
+index d33ed25f0511,99e1796eb833..000000000000
+--- a/mm/vmscan.c
++++ b/mm/vmscan.c
+@@@ -1360,6 -1354,8 +1360,11 @@@ static unsigned long shrink_page_list(s
+  			case PAGE_ACTIVATE:
+  				goto activate_locked;
+  			case PAGE_SUCCESS:
+++<<<<<<< HEAD
+++=======
++ 				stat->nr_pageout += thp_nr_pages(page);
++ 
+++>>>>>>> 6c357848b44b (mm: replace hpage_nr_pages with thp_nr_pages)
+  				if (PageWriteback(page))
+  					goto keep;
+  				if (PageDirty(page))
+@@@ -1842,7 -1861,10 +1847,14 @@@ putback_inactive_pages(struct lruvec *l
+  
+  		SetPageLRU(page);
+  		lru = page_lru(page);
+++<<<<<<< HEAD
+ +		add_page_to_lru_list(page, lruvec, lru);
+++=======
++ 
++ 		nr_pages = thp_nr_pages(page);
++ 		update_lru_size(lruvec, lru, page_zonenum(page), nr_pages);
++ 		list_move(&page->lru, &lruvec->lists[lru]);
+++>>>>>>> 6c357848b44b (mm: replace hpage_nr_pages with thp_nr_pages)
+  
+  		if (put_page_testzero(page)) {
+  			__ClearPageLRU(page);
+@@@ -2106,7 -2064,8 +2118,12 @@@ static void shrink_active_list(unsigne
+  			 * IO, plus JVM can create lots of anon VM_EXEC pages,
+  			 * so we ignore them here.
+  			 */
+++<<<<<<< HEAD
+ +			if ((vm_flags & VM_EXEC) && page_is_file_cache(page)) {
+++=======
++ 			if ((vm_flags & VM_EXEC) && page_is_file_lru(page)) {
++ 				nr_rotated += thp_nr_pages(page);
+++>>>>>>> 6c357848b44b (mm: replace hpage_nr_pages with thp_nr_pages)
+  				list_add(&page->lru, &l_active);
+  				continue;
+  			}
+diff --cc mm/workingset.c
+index 44c5c225f293,92e66113a577..000000000000
+--- a/mm/workingset.c
++++ b/mm/workingset.c
+@@@ -254,12 -262,11 +254,16 @@@ void *workingset_eviction(struct page *
+  	VM_BUG_ON_PAGE(page_count(page), page);
+  	VM_BUG_ON_PAGE(!PageLocked(page), page);
+  
+ +	advance_inactive_age(page_memcg(page), pgdat);
+ +
+  	lruvec = mem_cgroup_lruvec(target_memcg, pgdat);
+++<<<<<<< HEAD
+++=======
++ 	workingset_age_nonresident(lruvec, thp_nr_pages(page));
+++>>>>>>> 6c357848b44b (mm: replace hpage_nr_pages with thp_nr_pages)
+  	/* XXX: target_memcg can be NULL, go through lruvec */
+  	memcgid = mem_cgroup_id(lruvec_memcg(lruvec));
+ -	eviction = atomic_long_read(&lruvec->nonresident_age);
+ +	eviction = atomic_long_read(&lruvec->inactive_age);
+  	return pack_shadow(memcgid, pgdat, eviction, PageWorkingset(page));
+  }
+  
+@@@ -359,8 -374,8 +363,13 @@@ void workingset_refault(struct page *pa
+  		goto out;
+  
+  	SetPageActive(page);
+++<<<<<<< HEAD
+ +	advance_inactive_age(memcg, pgdat);
+ +	inc_lruvec_state(lruvec, WORKINGSET_ACTIVATE);
+++=======
++ 	workingset_age_nonresident(lruvec, thp_nr_pages(page));
++ 	inc_lruvec_state(lruvec, WORKINGSET_ACTIVATE_BASE + file);
+++>>>>>>> 6c357848b44b (mm: replace hpage_nr_pages with thp_nr_pages)
+  
+  	/* Page was active prior to eviction */
+  	if (workingset) {
+@@@ -390,7 -410,8 +399,12 @@@ void workingset_activation(struct page 
+  	memcg = page_memcg_rcu(page);
+  	if (!mem_cgroup_disabled() && !memcg)
+  		goto out;
+++<<<<<<< HEAD
+ +	advance_inactive_age(memcg, page_pgdat(page));
+++=======
++ 	lruvec = mem_cgroup_page_lruvec(page, page_pgdat(page));
++ 	workingset_age_nonresident(lruvec, thp_nr_pages(page));
+++>>>>>>> 6c357848b44b (mm: replace hpage_nr_pages with thp_nr_pages)
+  out:
+  	rcu_read_unlock();
+  }
+diff --git a/include/linux/huge_mm.h b/include/linux/huge_mm.h
+index cb4e18b7bff7..a6f7c057f97f 100644
+--- a/include/linux/huge_mm.h
++++ b/include/linux/huge_mm.h
+@@ -254,9 +254,14 @@ static inline unsigned int thp_order(struct page *page)
+ 	return 0;
+ }
+ 
+-static inline int hpage_nr_pages(struct page *page)
++/**
++ * thp_nr_pages - The number of regular pages in this huge page.
++ * @page: The head page of a huge page.
++ */
++static inline int thp_nr_pages(struct page *page)
+ {
+-	if (unlikely(PageTransHuge(page)))
++	VM_BUG_ON_PGFLAGS(PageTail(page), page);
++	if (PageHead(page))
+ 		return HPAGE_PMD_NR;
+ 	return 1;
+ }
+@@ -310,9 +315,9 @@ static inline unsigned int thp_order(struct page *page)
+ 	return 0;
+ }
+ 
+-static inline int hpage_nr_pages(struct page *page)
++static inline int thp_nr_pages(struct page *page)
+ {
+-	VM_BUG_ON_PAGE(PageTail(page), page);
++	VM_BUG_ON_PGFLAGS(PageTail(page), page);
+ 	return 1;
+ }
+ 
+diff --git a/include/linux/mm_inline.h b/include/linux/mm_inline.h
+index b0e3b4473ff2..0078d4a3a5ed 100644
+--- a/include/linux/mm_inline.h
++++ b/include/linux/mm_inline.h
+@@ -47,14 +47,14 @@ static __always_inline void update_lru_size(struct lruvec *lruvec,
+ static __always_inline void add_page_to_lru_list(struct page *page,
+ 				struct lruvec *lruvec, enum lru_list lru)
+ {
+-	update_lru_size(lruvec, lru, page_zonenum(page), hpage_nr_pages(page));
++	update_lru_size(lruvec, lru, page_zonenum(page), thp_nr_pages(page));
+ 	list_add(&page->lru, &lruvec->lists[lru]);
+ }
+ 
+ static __always_inline void add_page_to_lru_list_tail(struct page *page,
+ 				struct lruvec *lruvec, enum lru_list lru)
+ {
+-	update_lru_size(lruvec, lru, page_zonenum(page), hpage_nr_pages(page));
++	update_lru_size(lruvec, lru, page_zonenum(page), thp_nr_pages(page));
+ 	list_add_tail(&page->lru, &lruvec->lists[lru]);
+ }
+ 
+@@ -62,7 +62,7 @@ static __always_inline void del_page_from_lru_list(struct page *page,
+ 				struct lruvec *lruvec, enum lru_list lru)
+ {
+ 	list_del(&page->lru);
+-	update_lru_size(lruvec, lru, page_zonenum(page), -hpage_nr_pages(page));
++	update_lru_size(lruvec, lru, page_zonenum(page), -thp_nr_pages(page));
+ }
+ 
+ /**
+* Unmerged path include/linux/pagemap.h
+* Unmerged path mm/compaction.c
+diff --git a/mm/filemap.c b/mm/filemap.c
+index efe054d0678b..9adbcb29a53c 100644
+--- a/mm/filemap.c
++++ b/mm/filemap.c
+@@ -196,7 +196,7 @@ static void unaccount_page_cache_page(struct address_space *mapping,
+ 	if (PageHuge(page))
+ 		return;
+ 
+-	nr = hpage_nr_pages(page);
++	nr = thp_nr_pages(page);
+ 
+ 	__mod_node_page_state(page_pgdat(page), NR_FILE_PAGES, -nr);
+ 	if (PageSwapBacked(page)) {
+* Unmerged path mm/gup.c
+diff --git a/mm/internal.h b/mm/internal.h
+index 344bbc72ed9a..b0b392c72547 100644
+--- a/mm/internal.h
++++ b/mm/internal.h
+@@ -320,7 +320,7 @@ extern void clear_page_mlock(struct page *page);
+ static inline void mlock_migrate_page(struct page *newpage, struct page *page)
+ {
+ 	if (TestClearPageMlocked(page)) {
+-		int nr_pages = hpage_nr_pages(page);
++		int nr_pages = thp_nr_pages(page);
+ 
+ 		/* Holding pmd lock, no change in irq context: __mod is safe */
+ 		__mod_zone_page_state(page_zone(page), NR_MLOCK, -nr_pages);
+* Unmerged path mm/memcontrol.c
+* Unmerged path mm/memory_hotplug.c
+* Unmerged path mm/mempolicy.c
+* Unmerged path mm/migrate.c
+* Unmerged path mm/mlock.c
+diff --git a/mm/page_io.c b/mm/page_io.c
+index cc84c071d588..c51ba4c95bc2 100644
+--- a/mm/page_io.c
++++ b/mm/page_io.c
+@@ -274,7 +274,7 @@ static inline void count_swpout_vm_event(struct page *page)
+ 	if (unlikely(PageTransHuge(page)))
+ 		count_vm_event(THP_SWPOUT);
+ #endif
+-	count_vm_events(PSWPOUT, hpage_nr_pages(page));
++	count_vm_events(PSWPOUT, thp_nr_pages(page));
+ }
+ 
+ #if defined(CONFIG_MEMCG) && defined(CONFIG_BLK_CGROUP)
+diff --git a/mm/page_vma_mapped.c b/mm/page_vma_mapped.c
+index f0eea1c2a213..7e322f749a19 100644
+--- a/mm/page_vma_mapped.c
++++ b/mm/page_vma_mapped.c
+@@ -61,7 +61,7 @@ static inline bool pfn_is_match(struct page *page, unsigned long pfn)
+ 		return page_pfn == pfn;
+ 
+ 	/* THP can be referenced by any subpage */
+-	return pfn >= page_pfn && pfn - page_pfn < hpage_nr_pages(page);
++	return pfn >= page_pfn && pfn - page_pfn < thp_nr_pages(page);
+ }
+ 
+ /**
+diff --git a/mm/rmap.c b/mm/rmap.c
+index 884554872969..beb3a4c0a41d 100644
+--- a/mm/rmap.c
++++ b/mm/rmap.c
+@@ -1118,7 +1118,7 @@ void do_page_add_anon_rmap(struct page *page,
+ 	}
+ 
+ 	if (first) {
+-		int nr = compound ? hpage_nr_pages(page) : 1;
++		int nr = compound ? thp_nr_pages(page) : 1;
+ 		/*
+ 		 * We use the irq-unsafe __{inc|mod}_zone_page_stat because
+ 		 * these counters are not modified in interrupt context, and
+@@ -1156,7 +1156,7 @@ void do_page_add_anon_rmap(struct page *page,
+ void page_add_new_anon_rmap(struct page *page,
+ 	struct vm_area_struct *vma, unsigned long address, bool compound)
+ {
+-	int nr = compound ? hpage_nr_pages(page) : 1;
++	int nr = compound ? thp_nr_pages(page) : 1;
+ 
+ 	VM_BUG_ON_VMA(address < vma->vm_start || address >= vma->vm_end, vma);
+ 	__SetPageSwapBacked(page);
+@@ -1831,7 +1831,7 @@ static void rmap_walk_anon(struct page *page, struct rmap_walk_control *rwc,
+ 		return;
+ 
+ 	pgoff_start = page_to_pgoff(page);
+-	pgoff_end = pgoff_start + hpage_nr_pages(page) - 1;
++	pgoff_end = pgoff_start + thp_nr_pages(page) - 1;
+ 	anon_vma_interval_tree_foreach(avc, &anon_vma->rb_root,
+ 			pgoff_start, pgoff_end) {
+ 		struct vm_area_struct *vma = avc->vma;
+@@ -1884,7 +1884,7 @@ static void rmap_walk_file(struct page *page, struct rmap_walk_control *rwc,
+ 		return;
+ 
+ 	pgoff_start = page_to_pgoff(page);
+-	pgoff_end = pgoff_start + hpage_nr_pages(page) - 1;
++	pgoff_end = pgoff_start + thp_nr_pages(page) - 1;
+ 	if (!locked)
+ 		i_mmap_lock_read(mapping);
+ 	vma_interval_tree_foreach(vma, &mapping->i_mmap,
+* Unmerged path mm/swap.c
+* Unmerged path mm/swap_state.c
+* Unmerged path mm/swapfile.c
+* Unmerged path mm/vmscan.c
+* Unmerged path mm/workingset.c
