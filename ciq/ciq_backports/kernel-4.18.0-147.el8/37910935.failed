@@ -1,0 +1,230 @@
+drm/amdgpu: keep stolen memory on picasso
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-147.el8
+commit-author Flora Cui <flora.cui@amd.com>
+commit 379109351f4f6f2405cf54e7a296055f589c3ad1
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-147.el8/37910935.failed
+
+otherwise screen corrupts during modprobe.
+
+	Signed-off-by: Flora Cui <flora.cui@amd.com>
+	Reviewed-by: Feifei Xu <Feifei.Xu@amd.com>
+	Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
+(cherry picked from commit 379109351f4f6f2405cf54e7a296055f589c3ad1)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/gpu/drm/amd/amdgpu/gmc_v9_0.c
+diff --cc drivers/gpu/drm/amd/amdgpu/gmc_v9_0.c
+index 3c0a85d4e4ab,4e6fcaeb1303..000000000000
+--- a/drivers/gpu/drm/amd/amdgpu/gmc_v9_0.c
++++ b/drivers/gpu/drm/amd/amdgpu/gmc_v9_0.c
+@@@ -555,85 -610,131 +555,108 @@@ static int gmc_v9_0_early_init(void *ha
+  	return 0;
+  }
+  
+ -static bool gmc_v9_0_keep_stolen_memory(struct amdgpu_device *adev)
+ +static int gmc_v9_0_ecc_available(struct amdgpu_device *adev)
+  {
+ -
+ +	uint32_t reg_val;
+ +	uint32_t reg_addr;
+ +	uint32_t field_val;
+ +	size_t i;
+ +	uint32_t fv2;
+ +	size_t lost_sheep;
+ +
+++<<<<<<< HEAD
+ +	DRM_DEBUG("ecc: gmc_v9_0_ecc_available()\n");
+++=======
++ 	/*
++ 	 * TODO:
++ 	 * Currently there is a bug where some memory client outside
++ 	 * of the driver writes to first 8M of VRAM on S3 resume,
++ 	 * this overrides GART which by default gets placed in first 8M and
++ 	 * causes VM_FAULTS once GTT is accessed.
++ 	 * Keep the stolen memory reservation until the while this is not solved.
++ 	 * Also check code in gmc_v9_0_get_vbios_fb_size and gmc_v9_0_late_init
++ 	 */
++ 	switch (adev->asic_type) {
++ 	case CHIP_VEGA10:
++ 		return true;
++ 	case CHIP_RAVEN:
++ 		return (adev->pdev->device == 0x15d8);
++ 	case CHIP_VEGA12:
++ 	case CHIP_VEGA20:
++ 	default:
++ 		return false;
++ 	}
++ }
+ -
+ -static int gmc_v9_0_allocate_vm_inv_eng(struct amdgpu_device *adev)
+ -{
+ -	struct amdgpu_ring *ring;
+ -	unsigned vm_inv_engs[AMDGPU_MAX_VMHUBS] =
+ -		{GFXHUB_FREE_VM_INV_ENGS_BITMAP, MMHUB_FREE_VM_INV_ENGS_BITMAP};
+ -	unsigned i;
+ -	unsigned vmhub, inv_eng;
+ -
+ -	for (i = 0; i < adev->num_rings; ++i) {
+ -		ring = adev->rings[i];
+ -		vmhub = ring->funcs->vmhub;
+ -
+ -		inv_eng = ffs(vm_inv_engs[vmhub]);
+ -		if (!inv_eng) {
+ -			dev_err(adev->dev, "no VM inv eng for ring %s\n",
+ -				ring->name);
+ -			return -EINVAL;
+++>>>>>>> 379109351f4f (drm/amdgpu: keep stolen memory on picasso)
+ +
+ +	lost_sheep = 0;
+ +	for (i = 0; i < ARRAY_SIZE(ecc_umclocalcap_addrs); ++i) {
+ +		reg_addr = ecc_umclocalcap_addrs[i];
+ +		DRM_DEBUG("ecc: "
+ +			  "UMCCH_UmcLocalCap[%zu]: reg_addr: 0x%08x\n",
+ +			  i, reg_addr);
+ +		reg_val = RREG32(reg_addr);
+ +		field_val = REG_GET_FIELD(reg_val, UMCCH0_0_UmcLocalCap,
+ +					  EccDis);
+ +		DRM_DEBUG("ecc: "
+ +			  "reg_val: 0x%08x, "
+ +			  "EccDis: 0x%08x, ",
+ +			  reg_val, field_val);
+ +		if (field_val) {
+ +			DRM_ERROR("ecc: UmcLocalCap:EccDis is set.\n");
+ +			++lost_sheep;
+  		}
+ -
+ -		ring->vm_inv_eng = inv_eng - 1;
+ -		vm_inv_engs[vmhub] &= ~(1 << ring->vm_inv_eng);
+ -
+ -		dev_info(adev->dev, "ring %s uses VM inv eng %u on hub %u\n",
+ -			 ring->name, ring->vm_inv_eng, ring->funcs->vmhub);
+  	}
+  
+ -	return 0;
+ -}
+ -
+ -static int gmc_v9_0_ecc_late_init(void *handle)
+ -{
+ -	struct amdgpu_device *adev = (struct amdgpu_device *)handle;
+ -	struct ras_common_if **ras_if = &adev->gmc.ras_if;
+ -	struct ras_ih_if ih_info = {
+ -		.cb = gmc_v9_0_process_ras_data_cb,
+ -	};
+ -	struct ras_fs_if fs_info = {
+ -		.sysfs_name = "umc_err_count",
+ -		.debugfs_name = "umc_err_inject",
+ -	};
+ -	struct ras_common_if ras_block = {
+ -		.block = AMDGPU_RAS_BLOCK__UMC,
+ -		.type = AMDGPU_RAS_ERROR__MULTI_UNCORRECTABLE,
+ -		.sub_block_index = 0,
+ -		.name = "umc",
+ -	};
+ -	int r;
+ -
+ -	if (!amdgpu_ras_is_supported(adev, AMDGPU_RAS_BLOCK__UMC)) {
+ -		amdgpu_ras_feature_enable_on_boot(adev, &ras_block, 0);
+ -		return 0;
+ +	for (i = 0; i < ARRAY_SIZE(ecc_umcch_umc_config_addrs); ++i) {
+ +		reg_addr = ecc_umcch_umc_config_addrs[i];
+ +		DRM_DEBUG("ecc: "
+ +			  "UMCCH0_0_UMC_CONFIG[%zu]: reg_addr: 0x%08x",
+ +			  i, reg_addr);
+ +		reg_val = RREG32(reg_addr);
+ +		field_val = REG_GET_FIELD(reg_val, UMCCH0_0_UMC_CONFIG,
+ +					  DramReady);
+ +		DRM_DEBUG("ecc: "
+ +			  "reg_val: 0x%08x, "
+ +			  "DramReady: 0x%08x\n",
+ +			  reg_val, field_val);
+ +
+ +		if (!field_val) {
+ +			DRM_ERROR("ecc: UMC_CONFIG:DramReady is not set.\n");
+ +			++lost_sheep;
+ +		}
+  	}
+ -	/* handle resume path. */
+ -	if (*ras_if)
+ -		goto resume;
+ -
+ -	*ras_if = kmalloc(sizeof(**ras_if), GFP_KERNEL);
+ -	if (!*ras_if)
+ -		return -ENOMEM;
+ -
+ -	**ras_if = ras_block;
+ -
+ -	r = amdgpu_ras_feature_enable_on_boot(adev, *ras_if, 1);
+ -	if (r)
+ -		goto feature;
+ -
+ -	ih_info.head = **ras_if;
+ -	fs_info.head = **ras_if;
+ -
+ -	r = amdgpu_ras_interrupt_add_handler(adev, &ih_info);
+ -	if (r)
+ -		goto interrupt;
+  
+ -	r = amdgpu_ras_debugfs_create(adev, &fs_info);
+ -	if (r)
+ -		goto debugfs;
+ -
+ -	r = amdgpu_ras_sysfs_create(adev, &fs_info);
+ -	if (r)
+ -		goto sysfs;
+ -resume:
+ -	r = amdgpu_irq_get(adev, &adev->gmc.ecc_irq, 0);
+ -	if (r)
+ -		goto irq;
+ +	for (i = 0; i < ARRAY_SIZE(ecc_umcch_eccctrl_addrs); ++i) {
+ +		reg_addr = ecc_umcch_eccctrl_addrs[i];
+ +		DRM_DEBUG("ecc: "
+ +			  "UMCCH_EccCtrl[%zu]: reg_addr: 0x%08x, ",
+ +			  i, reg_addr);
+ +		reg_val = RREG32(reg_addr);
+ +		field_val = REG_GET_FIELD(reg_val, UMCCH0_0_EccCtrl,
+ +					  WrEccEn);
+ +		fv2 = REG_GET_FIELD(reg_val, UMCCH0_0_EccCtrl,
+ +				    RdEccEn);
+ +		DRM_DEBUG("ecc: "
+ +			  "reg_val: 0x%08x, "
+ +			  "WrEccEn: 0x%08x, "
+ +			  "RdEccEn: 0x%08x\n",
+ +			  reg_val, field_val, fv2);
+ +
+ +		if (!field_val) {
+ +			DRM_DEBUG("ecc: WrEccEn is not set\n");
+ +			++lost_sheep;
+ +		}
+ +		if (!fv2) {
+ +			DRM_DEBUG("ecc: RdEccEn is not set\n");
+ +			++lost_sheep;
+ +		}
+ +	}
+  
+ -	return 0;
+ -irq:
+ -	amdgpu_ras_sysfs_remove(adev, *ras_if);
+ -sysfs:
+ -	amdgpu_ras_debugfs_remove(adev, *ras_if);
+ -debugfs:
+ -	amdgpu_ras_interrupt_remove_handler(adev, &ih_info);
+ -interrupt:
+ -	amdgpu_ras_feature_enable(adev, *ras_if, 0);
+ -feature:
+ -	kfree(*ras_if);
+ -	*ras_if = NULL;
+ -	return -EINVAL;
+ +	DRM_DEBUG("ecc: lost_sheep: %zu\n", lost_sheep);
+ +	return lost_sheep == 0;
+  }
+  
+ -
+  static int gmc_v9_0_late_init(void *handle)
+  {
+  	struct amdgpu_device *adev = (struct amdgpu_device *)handle;
+* Unmerged path drivers/gpu/drm/amd/amdgpu/gmc_v9_0.c
