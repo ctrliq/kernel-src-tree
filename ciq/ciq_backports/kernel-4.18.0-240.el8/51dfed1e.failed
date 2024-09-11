@@ -1,0 +1,247 @@
+ASoC: SOF: Intel: add SoundWire configuration interface
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+Rebuild_CHGLOG: - [sound] ALSA: ASoC: SOF: Intel: add SoundWire configuration interface (Jaroslav Kysela) [1797509]
+Rebuild_FUZZ: 94.83%
+commit-author Pierre-Louis Bossart <pierre-louis.bossart@linux.intel.com>
+commit 51dfed1e178a38202960b98f6e29df009a06050f
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/51dfed1e.failed
+
+Now that the SoundWire core supports the multi-step initialization,
+call the relevant APIs.
+
+The actual hardware enablement can be done in two places, ideally we'd
+want to startup the SoundWire IP as soon as possible (while still
+taking power rail dependencies into account)
+
+However when suspend/resume is implemented, the DSP device will be
+resumed first, and only when the DSP firmware is downloaded/booted
+would the SoundWire child devices be resumed, so there are only
+marginal benefits in starting the IP earlier for the first probe.
+
+	Signed-off-by: Pierre-Louis Bossart <pierre-louis.bossart@linux.intel.com>
+Link: https://lore.kernel.org/r/20200325215027.28716-3-pierre-louis.bossart@linux.intel.com
+	Signed-off-by: Mark Brown <broonie@kernel.org>
+(cherry picked from commit 51dfed1e178a38202960b98f6e29df009a06050f)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	sound/soc/sof/intel/hda.h
+diff --cc sound/soc/sof/intel/hda.h
+index fc0b6afb3d4f,928a3432e9e6..000000000000
+--- a/sound/soc/sof/intel/hda.h
++++ b/sound/soc/sof/intel/hda.h
+@@@ -415,6 -435,15 +417,18 @@@ struct sof_intel_hda_dev 
+  
+  	/* DMIC device */
+  	struct platform_device *dmic_dev;
+++<<<<<<< HEAD
+++=======
++ 
++ 	/* delayed work to enter D0I3 opportunistically */
++ 	struct delayed_work d0i3_work;
++ 
++ 	/* ACPI information stored between scan and probe steps */
++ 	struct sdw_intel_acpi_info info;
++ 
++ 	/* sdw context allocated by SoundWire driver */
++ 	struct sdw_intel_ctx *sdw;
+++>>>>>>> 51dfed1e178a (ASoC: SOF: Intel: add SoundWire configuration interface)
+  };
+  
+  static inline struct hdac_bus *sof_to_bus(struct snd_sof_dev *s)
+diff --git a/sound/soc/sof/intel/hda-loader.c b/sound/soc/sof/intel/hda-loader.c
+index bae7ac3581e5..abe8b29eab97 100644
+--- a/sound/soc/sof/intel/hda-loader.c
++++ b/sound/soc/sof/intel/hda-loader.c
+@@ -397,6 +397,19 @@ int hda_dsp_pre_fw_run(struct snd_sof_dev *sdev)
+ /* post fw run operations */
+ int hda_dsp_post_fw_run(struct snd_sof_dev *sdev)
+ {
++	int ret;
++
++	if (sdev->first_boot) {
++		ret = hda_sdw_startup(sdev);
++		if (ret < 0) {
++			dev_err(sdev->dev,
++				"error: could not startup SoundWire links\n");
++			return ret;
++		}
++	}
++
++	hda_sdw_int_enable(sdev, true);
++
+ 	/* re-enable clock gating and power gating */
+ 	return hda_dsp_ctrl_clock_power_gating(sdev, true);
+ }
+diff --git a/sound/soc/sof/intel/hda.c b/sound/soc/sof/intel/hda.c
+index e20431686d1c..f7ac800bc5db 100644
+--- a/sound/soc/sof/intel/hda.c
++++ b/sound/soc/sof/intel/hda.c
+@@ -18,7 +18,9 @@
+ #include <sound/hdaudio_ext.h>
+ #include <sound/hda_register.h>
+ 
++#include <linux/acpi.h>
+ #include <linux/module.h>
++#include <linux/soundwire/sdw_intel.h>
+ #include <sound/intel-nhlt.h>
+ #include <sound/sof.h>
+ #include <sound/sof/xtensa.h>
+@@ -34,6 +36,98 @@
+ 
+ #define EXCEPT_MAX_HDR_SIZE	0x400
+ 
++#if IS_ENABLED(CONFIG_SND_SOC_SOF_INTEL_SOUNDWIRE)
++
++void hda_sdw_int_enable(struct snd_sof_dev *sdev, bool enable)
++{
++	sdw_intel_enable_irq(sdev->bar[HDA_DSP_BAR], enable);
++}
++
++static int hda_sdw_acpi_scan(struct snd_sof_dev *sdev)
++{
++	struct sof_intel_hda_dev *hdev;
++	acpi_handle handle;
++	int ret;
++
++	handle = ACPI_HANDLE(sdev->dev);
++
++	/* save ACPI info for the probe step */
++	hdev = sdev->pdata->hw_pdata;
++
++	ret = sdw_intel_acpi_scan(handle, &hdev->info);
++	if (ret < 0) {
++		dev_err(sdev->dev, "%s failed\n", __func__);
++		return -EINVAL;
++	}
++
++	return 0;
++}
++
++static int hda_sdw_probe(struct snd_sof_dev *sdev)
++{
++	struct sof_intel_hda_dev *hdev;
++	struct sdw_intel_res res;
++	acpi_handle handle;
++	void *sdw;
++
++	handle = ACPI_HANDLE(sdev->dev);
++
++	hdev = sdev->pdata->hw_pdata;
++
++	memset(&res, 0, sizeof(res));
++
++	res.mmio_base = sdev->bar[HDA_DSP_BAR];
++	res.irq = sdev->ipc_irq;
++	res.handle = hdev->info.handle;
++	res.parent = sdev->dev;
++
++	/*
++	 * ops and arg fields are not populated for now,
++	 * they will be needed when the DAI callbacks are
++	 * provided
++	 */
++
++	/* we could filter links here if needed, e.g for quirks */
++	res.count = hdev->info.count;
++	res.link_mask = hdev->info.link_mask;
++
++	sdw = sdw_intel_probe(&res);
++	if (!sdw) {
++		dev_err(sdev->dev, "error: SoundWire probe failed\n");
++		return -EINVAL;
++	}
++
++	/* save context */
++	hdev->sdw = sdw;
++
++	return 0;
++}
++
++int hda_sdw_startup(struct snd_sof_dev *sdev)
++{
++	struct sof_intel_hda_dev *hdev;
++
++	hdev = sdev->pdata->hw_pdata;
++
++	return sdw_intel_startup(hdev->sdw);
++}
++
++static int hda_sdw_exit(struct snd_sof_dev *sdev)
++{
++	struct sof_intel_hda_dev *hdev;
++
++	hdev = sdev->pdata->hw_pdata;
++
++	hda_sdw_int_enable(sdev, false);
++
++	if (hdev->sdw)
++		sdw_intel_exit(hdev->sdw);
++	hdev->sdw = NULL;
++
++	return 0;
++}
++#endif
++
+ /*
+  * Debug
+  */
+@@ -348,6 +442,7 @@ static const char *fixup_tplg_name(struct snd_sof_dev *sdev,
+ static int hda_init_caps(struct snd_sof_dev *sdev)
+ {
+ 	struct hdac_bus *bus = sof_to_bus(sdev);
++	struct snd_sof_pdata *pdata = sdev->pdata;
+ #if IS_ENABLED(CONFIG_SND_SOC_SOF_HDA)
+ 	struct hdac_ext_link *hlink;
+ 	struct snd_soc_acpi_mach_params *mach_params;
+@@ -361,6 +456,8 @@ static int hda_init_caps(struct snd_sof_dev *sdev)
+ 	int codec_num = 0;
+ 	int i;
+ #endif
++	struct sof_intel_hda_dev *hdev = pdata->hw_pdata;
++	u32 link_mask;
+ 	int ret = 0;
+ 
+ 	device_disable_async_suspend(bus->dev);
+@@ -380,6 +477,27 @@ static int hda_init_caps(struct snd_sof_dev *sdev)
+ 		return ret;
+ 	}
+ 
++	/* scan SoundWire capabilities exposed by DSDT */
++	ret = hda_sdw_acpi_scan(sdev);
++	if (ret < 0) {
++		dev_err(sdev->dev, "error: SoundWire ACPI scan error\n");
++		return ret;
++	}
++
++	link_mask = hdev->info.link_mask;
++	if (!link_mask) {
++		/*
++		 * probe/allocated SoundWire resources.
++		 * The hardware configuration takes place in hda_sdw_startup
++		 * after power rails are enabled.
++		 */
++		ret = hda_sdw_probe(sdev);
++		if (ret < 0) {
++			dev_err(sdev->dev, "error: SoundWire probe error\n");
++			return ret;
++		}
++	}
++
+ #if IS_ENABLED(CONFIG_SND_SOC_SOF_HDA)
+ 	if (bus->mlcap)
+ 		snd_hdac_ext_bus_get_ml_capabilities(bus);
+@@ -722,6 +840,8 @@ int hda_dsp_remove(struct snd_sof_dev *sdev)
+ 	snd_hdac_ext_bus_device_remove(bus);
+ #endif
+ 
++	hda_sdw_exit(sdev);
++
+ 	if (!IS_ERR_OR_NULL(hda->dmic_dev))
+ 		platform_device_unregister(hda->dmic_dev);
+ 
+* Unmerged path sound/soc/sof/intel/hda.h
