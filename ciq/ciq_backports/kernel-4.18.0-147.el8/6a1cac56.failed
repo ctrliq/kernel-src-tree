@@ -1,0 +1,201 @@
+x86/kvm: Use __bss_decrypted attribute in shared variables
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-147.el8
+commit-author Brijesh Singh <brijesh.singh@amd.com>
+commit 6a1cac56f41f9ea94e440dfcc1cac44b41a1b194
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-147.el8/6a1cac56.failed
+
+The recent removal of the memblock dependency from kvmclock caused a SEV
+guest regression because the wall_clock and hv_clock_boot variables are
+no longer mapped decrypted when SEV is active.
+
+Use the __bss_decrypted attribute to put the static wall_clock and
+hv_clock_boot in the .bss..decrypted section so that they are mapped
+decrypted during boot.
+
+In the preparatory stage of CPU hotplug, the per-cpu pvclock data pointer
+assigns either an element of the static array or dynamically allocated
+memory for the pvclock data pointer. The static array are now mapped
+decrypted but the dynamically allocated memory is not mapped decrypted.
+However, when SEV is active this memory range must be mapped decrypted.
+
+Add a function which is called after the page allocator is up, and
+allocate memory for the pvclock data pointers for the all possible cpus.
+Map this memory range as decrypted when SEV is active.
+
+Fixes: 368a540e0232 ("x86/kvmclock: Remove memblock dependency")
+	Suggested-by: Thomas Gleixner <tglx@linutronix.de>
+	Signed-off-by: Brijesh Singh <brijesh.singh@amd.com>
+	Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+	Cc: Tom Lendacky <thomas.lendacky@amd.com>
+	Cc: Borislav Petkov <bp@suse.de>
+	Cc: "H. Peter Anvin" <hpa@zytor.com>
+	Cc: Paolo Bonzini <pbonzini@redhat.com>
+	Cc: Sean Christopherson <sean.j.christopherson@intel.com>
+	Cc: "Radim Krčmář" <rkrcmar@redhat.com>
+	Cc: kvm@vger.kernel.org
+Link: https://lkml.kernel.org/r/1536932759-12905-3-git-send-email-brijesh.singh@amd.com
+
+(cherry picked from commit 6a1cac56f41f9ea94e440dfcc1cac44b41a1b194)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kernel/kvmclock.c
+diff --cc arch/x86/kernel/kvmclock.c
+index 4ac793cbbf14,013fe3d21dbb..000000000000
+--- a/arch/x86/kernel/kvmclock.c
++++ b/arch/x86/kernel/kvmclock.c
+@@@ -26,7 -26,11 +26,12 @@@
+  #include <linux/sched.h>
+  #include <linux/sched/clock.h>
+  #include <linux/mm.h>
+++<<<<<<< HEAD
+++=======
++ #include <linux/slab.h>
++ #include <linux/set_memory.h>
+++>>>>>>> 6a1cac56f41f (x86/kvm: Use __bss_decrypted attribute in shared variables)
+  
+ -#include <asm/hypervisor.h>
+  #include <asm/mem_encrypt.h>
+  #include <asm/x86_init.h>
+  #include <asm/reboot.h>
+@@@ -44,14 -49,33 +49,32 @@@ static int __init parse_no_kvmclock(cha
+  }
+  early_param("no-kvmclock", parse_no_kvmclock);
+  
+ -static int __init parse_no_kvmclock_vsyscall(char *arg)
+ -{
+ -	kvmclock_vsyscall = 0;
+ -	return 0;
+ -}
+ -early_param("no-kvmclock-vsyscall", parse_no_kvmclock_vsyscall);
+ -
+  /* Aligned to page sizes to match whats mapped via vsyscalls to userspace */
+  #define HV_CLOCK_SIZE	(sizeof(struct pvclock_vsyscall_time_info) * NR_CPUS)
+ -#define HVC_BOOT_ARRAY_SIZE \
+ -	(PAGE_SIZE / sizeof(struct pvclock_vsyscall_time_info))
+  
+++<<<<<<< HEAD
+ +static u8 hv_clock_mem[PAGE_ALIGN(HV_CLOCK_SIZE)] __aligned(PAGE_SIZE);
+ +
+ +/* The hypervisor will put information about time periodically here */
+ +static struct pvclock_vsyscall_time_info *hv_clock __ro_after_init;
+ +static struct pvclock_wall_clock wall_clock;
+++=======
++ static struct pvclock_vsyscall_time_info
++ 			hv_clock_boot[HVC_BOOT_ARRAY_SIZE] __bss_decrypted __aligned(PAGE_SIZE);
++ static struct pvclock_wall_clock wall_clock __bss_decrypted;
++ static DEFINE_PER_CPU(struct pvclock_vsyscall_time_info *, hv_clock_per_cpu);
++ static struct pvclock_vsyscall_time_info *hvclock_mem;
++ 
++ static inline struct pvclock_vcpu_time_info *this_cpu_pvti(void)
++ {
++ 	return &this_cpu_read(hv_clock_per_cpu)->pvti;
++ }
++ 
++ static inline struct pvclock_vsyscall_time_info *this_cpu_hvclock(void)
++ {
++ 	return this_cpu_read(hv_clock_per_cpu);
++ }
+++>>>>>>> 6a1cac56f41f (x86/kvm: Use __bss_decrypted attribute in shared variables)
+  
+  /*
+   * The wallclock is the time of day when we booted. Since then, some time may
+@@@ -228,6 -238,90 +251,93 @@@ static void kvm_shutdown(void
+  	native_machine_shutdown();
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static void __init kvmclock_init_mem(void)
++ {
++ 	unsigned long ncpus;
++ 	unsigned int order;
++ 	struct page *p;
++ 	int r;
++ 
++ 	if (HVC_BOOT_ARRAY_SIZE >= num_possible_cpus())
++ 		return;
++ 
++ 	ncpus = num_possible_cpus() - HVC_BOOT_ARRAY_SIZE;
++ 	order = get_order(ncpus * sizeof(*hvclock_mem));
++ 
++ 	p = alloc_pages(GFP_KERNEL, order);
++ 	if (!p) {
++ 		pr_warn("%s: failed to alloc %d pages", __func__, (1U << order));
++ 		return;
++ 	}
++ 
++ 	hvclock_mem = page_address(p);
++ 
++ 	/*
++ 	 * hvclock is shared between the guest and the hypervisor, must
++ 	 * be mapped decrypted.
++ 	 */
++ 	if (sev_active()) {
++ 		r = set_memory_decrypted((unsigned long) hvclock_mem,
++ 					 1UL << order);
++ 		if (r) {
++ 			__free_pages(p, order);
++ 			hvclock_mem = NULL;
++ 			pr_warn("kvmclock: set_memory_decrypted() failed. Disabling\n");
++ 			return;
++ 		}
++ 	}
++ 
++ 	memset(hvclock_mem, 0, PAGE_SIZE << order);
++ }
++ 
++ static int __init kvm_setup_vsyscall_timeinfo(void)
++ {
++ #ifdef CONFIG_X86_64
++ 	u8 flags;
++ 
++ 	if (!per_cpu(hv_clock_per_cpu, 0) || !kvmclock_vsyscall)
++ 		return 0;
++ 
++ 	flags = pvclock_read_flags(&hv_clock_boot[0].pvti);
++ 	if (!(flags & PVCLOCK_TSC_STABLE_BIT))
++ 		return 0;
++ 
++ 	kvm_clock.archdata.vclock_mode = VCLOCK_PVCLOCK;
++ #endif
++ 
++ 	kvmclock_init_mem();
++ 
++ 	return 0;
++ }
++ early_initcall(kvm_setup_vsyscall_timeinfo);
++ 
++ static int kvmclock_setup_percpu(unsigned int cpu)
++ {
++ 	struct pvclock_vsyscall_time_info *p = per_cpu(hv_clock_per_cpu, cpu);
++ 
++ 	/*
++ 	 * The per cpu area setup replicates CPU0 data to all cpu
++ 	 * pointers. So carefully check. CPU0 has been set up in init
++ 	 * already.
++ 	 */
++ 	if (!cpu || (p && p != per_cpu(hv_clock_per_cpu, 0)))
++ 		return 0;
++ 
++ 	/* Use the static page for the first CPUs, allocate otherwise */
++ 	if (cpu < HVC_BOOT_ARRAY_SIZE)
++ 		p = &hv_clock_boot[cpu];
++ 	else if (hvclock_mem)
++ 		p = hvclock_mem + cpu - HVC_BOOT_ARRAY_SIZE;
++ 	else
++ 		return -ENOMEM;
++ 
++ 	per_cpu(hv_clock_per_cpu, cpu) = p;
++ 	return p ? 0 : -ENOMEM;
++ }
++ 
+++>>>>>>> 6a1cac56f41f (x86/kvm: Use __bss_decrypted attribute in shared variables)
+  void __init kvmclock_init(void)
+  {
+  	u8 flags;
+* Unmerged path arch/x86/kernel/kvmclock.c
