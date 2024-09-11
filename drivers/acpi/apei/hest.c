@@ -243,7 +243,7 @@ __setup("hest_disable", setup_hest_disable);
 void __init acpi_hest_init(void)
 {
 	acpi_status status;
-	int rc = -ENODEV;
+	int rc;
 	unsigned int ghes_count = 0;
 
 	if (hest_disable) {
