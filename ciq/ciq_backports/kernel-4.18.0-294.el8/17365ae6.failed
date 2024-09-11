@@ -1,0 +1,175 @@
+nvme: introduce nvme_execute_passthru_rq to call nvme_passthru_[start|end]()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+Rebuild_CHGLOG: - [nvme] nvme: introduce nvme_execute_passthru_rq to call nvme_passthru_() (Gopal Tiwari) [1857052 1857051 1853231]
+Rebuild_FUZZ: 92.20%
+commit-author Logan Gunthorpe <logang@deltatee.com>
+commit 17365ae6975c7f7494a2d1cd0bf18b5ed238e072
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/17365ae6.failed
+
+Introduce a new nvme_execute_passthru_rq() helper which calls
+nvme_passthru_[start|end]() around blk_execute_rq(). This ensures
+all passthru calls (including nvme_submit_io()) will be wrapped
+appropriately.
+
+nvme_execute_passthru_rq() will also be useful for the nvmet passthru
+code and is exported in the NVME_TARGET_PASSTHRU namespace.
+
+	Signed-off-by: Logan Gunthorpe <logang@deltatee.com>
+	Reviewed-by: Keith Busch <kbusch@kernel.org>
+	Signed-off-by: Christoph Hellwig <hch@lst.de>
+(cherry picked from commit 17365ae6975c7f7494a2d1cd0bf18b5ed238e072)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/nvme/host/core.c
+#	drivers/nvme/host/nvme.h
+diff --cc drivers/nvme/host/core.c
+index f58cc90f5be8,8296c1248f87..000000000000
+--- a/drivers/nvme/host/core.c
++++ b/drivers/nvme/host/core.c
+@@@ -959,6 -928,120 +959,123 @@@ out
+  	return ERR_PTR(ret);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static u32 nvme_known_admin_effects(u8 opcode)
++ {
++ 	switch (opcode) {
++ 	case nvme_admin_format_nvm:
++ 		return NVME_CMD_EFFECTS_CSUPP | NVME_CMD_EFFECTS_LBCC |
++ 			NVME_CMD_EFFECTS_CSE_MASK;
++ 	case nvme_admin_sanitize_nvm:
++ 		return NVME_CMD_EFFECTS_CSE_MASK;
++ 	default:
++ 		break;
++ 	}
++ 	return 0;
++ }
++ 
++ u32 nvme_command_effects(struct nvme_ctrl *ctrl, struct nvme_ns *ns, u8 opcode)
++ {
++ 	u32 effects = 0;
++ 
++ 	if (ns) {
++ 		if (ns->head->effects)
++ 			effects = le32_to_cpu(ns->head->effects->iocs[opcode]);
++ 		if (effects & ~(NVME_CMD_EFFECTS_CSUPP | NVME_CMD_EFFECTS_LBCC))
++ 			dev_warn(ctrl->device,
++ 				 "IO command:%02x has unhandled effects:%08x\n",
++ 				 opcode, effects);
++ 		return 0;
++ 	}
++ 
++ 	if (ctrl->effects)
++ 		effects = le32_to_cpu(ctrl->effects->acs[opcode]);
++ 	effects |= nvme_known_admin_effects(opcode);
++ 
++ 	return effects;
++ }
++ EXPORT_SYMBOL_NS_GPL(nvme_command_effects, NVME_TARGET_PASSTHRU);
++ 
++ static u32 nvme_passthru_start(struct nvme_ctrl *ctrl, struct nvme_ns *ns,
++ 			       u8 opcode)
++ {
++ 	u32 effects = nvme_command_effects(ctrl, ns, opcode);
++ 
++ 	/*
++ 	 * For simplicity, IO to all namespaces is quiesced even if the command
++ 	 * effects say only one namespace is affected.
++ 	 */
++ 	if (effects & (NVME_CMD_EFFECTS_LBCC | NVME_CMD_EFFECTS_CSE_MASK)) {
++ 		mutex_lock(&ctrl->scan_lock);
++ 		mutex_lock(&ctrl->subsys->lock);
++ 		nvme_mpath_start_freeze(ctrl->subsys);
++ 		nvme_mpath_wait_freeze(ctrl->subsys);
++ 		nvme_start_freeze(ctrl);
++ 		nvme_wait_freeze(ctrl);
++ 	}
++ 	return effects;
++ }
++ 
++ static void nvme_update_formats(struct nvme_ctrl *ctrl, u32 *effects)
++ {
++ 	struct nvme_ns *ns;
++ 
++ 	down_read(&ctrl->namespaces_rwsem);
++ 	list_for_each_entry(ns, &ctrl->namespaces, list)
++ 		if (_nvme_revalidate_disk(ns->disk))
++ 			nvme_set_queue_dying(ns);
++ 		else if (blk_queue_is_zoned(ns->disk->queue)) {
++ 			/*
++ 			 * IO commands are required to fully revalidate a zoned
++ 			 * device. Force the command effects to trigger rescan
++ 			 * work so report zones can run in a context with
++ 			 * unfrozen IO queues.
++ 			 */
++ 			*effects |= NVME_CMD_EFFECTS_NCC;
++ 		}
++ 	up_read(&ctrl->namespaces_rwsem);
++ }
++ 
++ static void nvme_passthru_end(struct nvme_ctrl *ctrl, u32 effects)
++ {
++ 	/*
++ 	 * Revalidate LBA changes prior to unfreezing. This is necessary to
++ 	 * prevent memory corruption if a logical block size was changed by
++ 	 * this command.
++ 	 */
++ 	if (effects & NVME_CMD_EFFECTS_LBCC)
++ 		nvme_update_formats(ctrl, &effects);
++ 	if (effects & (NVME_CMD_EFFECTS_LBCC | NVME_CMD_EFFECTS_CSE_MASK)) {
++ 		nvme_unfreeze(ctrl);
++ 		nvme_mpath_unfreeze(ctrl->subsys);
++ 		mutex_unlock(&ctrl->subsys->lock);
++ 		nvme_remove_invalid_namespaces(ctrl, NVME_NSID_ALL);
++ 		mutex_unlock(&ctrl->scan_lock);
++ 	}
++ 	if (effects & NVME_CMD_EFFECTS_CCC)
++ 		nvme_init_identify(ctrl);
++ 	if (effects & (NVME_CMD_EFFECTS_NIC | NVME_CMD_EFFECTS_NCC)) {
++ 		nvme_queue_scan(ctrl);
++ 		flush_work(&ctrl->scan_work);
++ 	}
++ }
++ 
++ void nvme_execute_passthru_rq(struct request *rq)
++ {
++ 	struct nvme_command *cmd = nvme_req(rq)->cmd;
++ 	struct nvme_ctrl *ctrl = nvme_req(rq)->ctrl;
++ 	struct nvme_ns *ns = rq->q->queuedata;
++ 	struct gendisk *disk = ns ? ns->disk : NULL;
++ 	u32 effects;
++ 
++ 	effects = nvme_passthru_start(ctrl, ns, cmd->common.opcode);
++ 	blk_execute_rq(rq->q, disk, rq, 0);
++ 	nvme_passthru_end(ctrl, effects);
++ }
++ EXPORT_SYMBOL_NS_GPL(nvme_execute_passthru_rq, NVME_TARGET_PASSTHRU);
++ 
+++>>>>>>> 17365ae6975c (nvme: introduce nvme_execute_passthru_rq to call nvme_passthru_[start|end]())
+  static int nvme_submit_user_cmd(struct request_queue *q,
+  		struct nvme_command *cmd, void __user *ubuffer,
+  		unsigned bufflen, void __user *meta_buffer, unsigned meta_len,
+diff --cc drivers/nvme/host/nvme.h
+index f0db86ea8aa0,4e3bc4b66c57..000000000000
+--- a/drivers/nvme/host/nvme.h
++++ b/drivers/nvme/host/nvme.h
+@@@ -778,4 -790,8 +778,11 @@@ void nvme_hwmon_init(struct nvme_ctrl *
+  static inline void nvme_hwmon_init(struct nvme_ctrl *ctrl) { }
+  #endif
+  
+++<<<<<<< HEAD
+++=======
++ u32 nvme_command_effects(struct nvme_ctrl *ctrl, struct nvme_ns *ns,
++ 			 u8 opcode);
++ void nvme_execute_passthru_rq(struct request *rq);
++ 
+++>>>>>>> 17365ae6975c (nvme: introduce nvme_execute_passthru_rq to call nvme_passthru_[start|end]())
+  #endif /* _NVME_H */
+* Unmerged path drivers/nvme/host/core.c
+* Unmerged path drivers/nvme/host/nvme.h
