@@ -1,0 +1,201 @@
+dmaengine: idxd: Clean up descriptors with fault error
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Dave Jiang <dave.jiang@intel.com>
+commit e4f4d8cdeb9a2fe746411c0b9a7538b5c0232c1e
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/e4f4d8cd.failed
+
+Add code to "complete" a descriptor when the descriptor or its completion
+address hit a fault error when SVA mode is being used. This error can be
+triggered due to bad programming by the user. A lock is introduced in order
+to protect the descriptor completion lists since the fault handler will run
+from the system work queue after being scheduled in the interrupt handler.
+
+	Signed-off-by: Dave Jiang <dave.jiang@intel.com>
+	Reviewed-by: Tony Luck <tony.luck@intel.com>
+	Reviewed-by: Dan Williams <dan.j.williams@intel.com>
+Link: https://lore.kernel.org/r/160382008092.3911367.12766483427643278985.stgit@djiang5-desk3.ch.intel.com
+	Signed-off-by: Vinod Koul <vkoul@kernel.org>
+(cherry picked from commit e4f4d8cdeb9a2fe746411c0b9a7538b5c0232c1e)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/dma/idxd/irq.c
+diff --cc drivers/dma/idxd/irq.c
+index a257ed51ce5f,593a2f6ed16c..000000000000
+--- a/drivers/dma/idxd/irq.c
++++ b/drivers/dma/idxd/irq.c
+@@@ -11,28 -11,31 +11,50 @@@
+  #include "idxd.h"
+  #include "registers.h"
+  
+++<<<<<<< HEAD
+ +void idxd_device_wqs_clear_state(struct idxd_device *idxd)
+++=======
++ enum irq_work_type {
++ 	IRQ_WORK_NORMAL = 0,
++ 	IRQ_WORK_PROCESS_FAULT,
++ };
++ 
++ struct idxd_fault {
++ 	struct work_struct work;
++ 	u64 addr;
++ 	struct idxd_device *idxd;
++ };
++ 
++ static int irq_process_work_list(struct idxd_irq_entry *irq_entry,
++ 				 enum irq_work_type wtype,
++ 				 int *processed, u64 data);
++ static int irq_process_pending_llist(struct idxd_irq_entry *irq_entry,
++ 				     enum irq_work_type wtype,
++ 				     int *processed, u64 data);
++ 
++ static void idxd_device_reinit(struct work_struct *work)
+++>>>>>>> e4f4d8cdeb9a (dmaengine: idxd: Clean up descriptors with fault error)
+  {
+ -	struct idxd_device *idxd = container_of(work, struct idxd_device, work);
+ -	struct device *dev = &idxd->pdev->dev;
+ -	int rc, i;
+ +	int i;
+ +
+ +	lockdep_assert_held(&idxd->dev_lock);
+ +	for (i = 0; i < idxd->max_wqs; i++) {
+ +		struct idxd_wq *wq = &idxd->wqs[i];
+ +
+ +		wq->state = IDXD_WQ_DISABLED;
+ +	}
+ +}
+ +
+ +static int idxd_restart(struct idxd_device *idxd)
+ +{
+ +	int i, rc;
+ +
+ +	lockdep_assert_held(&idxd->dev_lock);
+ +
+ +	rc = __idxd_device_reset(idxd);
+ +	if (rc < 0)
+ +		goto out;
+  
+ -	idxd_device_reset(idxd);
+  	rc = idxd_device_config(idxd);
+  	if (rc < 0)
+  		goto out;
+@@@ -58,10 -60,48 +80,50 @@@
+  
+   out:
+  	idxd_device_wqs_clear_state(idxd);
+ +	idxd->state = IDXD_DEV_HALTED;
+ +	return rc;
+  }
+  
++ static void idxd_device_fault_work(struct work_struct *work)
++ {
++ 	struct idxd_fault *fault = container_of(work, struct idxd_fault, work);
++ 	struct idxd_irq_entry *ie;
++ 	int i;
++ 	int processed;
++ 	int irqcnt = fault->idxd->num_wq_irqs + 1;
++ 
++ 	for (i = 1; i < irqcnt; i++) {
++ 		ie = &fault->idxd->irq_entries[i];
++ 		irq_process_work_list(ie, IRQ_WORK_PROCESS_FAULT,
++ 				      &processed, fault->addr);
++ 		if (processed)
++ 			break;
++ 
++ 		irq_process_pending_llist(ie, IRQ_WORK_PROCESS_FAULT,
++ 					  &processed, fault->addr);
++ 		if (processed)
++ 			break;
++ 	}
++ 
++ 	kfree(fault);
++ }
++ 
++ static int idxd_device_schedule_fault_process(struct idxd_device *idxd,
++ 					      u64 fault_addr)
++ {
++ 	struct idxd_fault *fault;
++ 
++ 	fault = kmalloc(sizeof(*fault), GFP_ATOMIC);
++ 	if (!fault)
++ 		return -ENOMEM;
++ 
++ 	fault->addr = fault_addr;
++ 	fault->idxd = idxd;
++ 	INIT_WORK(&fault->work, idxd_device_fault_work);
++ 	queue_work(idxd->wq, &fault->work);
++ 	return 0;
++ }
++ 
+  irqreturn_t idxd_irq_handler(int vec, void *data)
+  {
+  	struct idxd_irq_entry *irq_entry = data;
+@@@ -143,17 -183,29 +205,26 @@@ irqreturn_t idxd_misc_thread(int vec, v
+  	if (!err)
+  		goto out;
+  
++ 	/*
++ 	 * This case should rarely happen and typically is due to software
++ 	 * programming error by the driver.
++ 	 */
++ 	if (idxd->sw_err.valid &&
++ 	    idxd->sw_err.desc_valid &&
++ 	    idxd->sw_err.fault_addr)
++ 		idxd_device_schedule_fault_process(idxd, idxd->sw_err.fault_addr);
++ 
+  	gensts.bits = ioread32(idxd->reg_base + IDXD_GENSTATS_OFFSET);
+  	if (gensts.state == IDXD_DEVICE_STATE_HALT) {
+ -		idxd->state = IDXD_DEV_HALTED;
+ +		spin_lock_bh(&idxd->dev_lock);
+  		if (gensts.reset_type == IDXD_DEVICE_RESET_SOFTWARE) {
+ -			/*
+ -			 * If we need a software reset, we will throw the work
+ -			 * on a system workqueue in order to allow interrupts
+ -			 * for the device command completions.
+ -			 */
+ -			INIT_WORK(&idxd->work, idxd_device_reinit);
+ -			queue_work(idxd->wq, &idxd->work);
+ +			rc = idxd_restart(idxd);
+ +			if (rc < 0)
+ +				dev_err(&idxd->pdev->dev,
+ +					"idxd restart failed, device halt.");
+  		} else {
+ -			spin_lock_bh(&idxd->dev_lock);
+  			idxd_device_wqs_clear_state(idxd);
+ +			idxd->state = IDXD_DEV_HALTED;
+  			dev_err(&idxd->pdev->dev,
+  				"idxd halted, need %s.\n",
+  				gensts.reset_type == IDXD_DEVICE_RESET_FLR ?
+diff --git a/drivers/dma/idxd/idxd.h b/drivers/dma/idxd/idxd.h
+index dc8d870919ed..d8fe5c8252cb 100644
+--- a/drivers/dma/idxd/idxd.h
++++ b/drivers/dma/idxd/idxd.h
+@@ -34,6 +34,11 @@ struct idxd_irq_entry {
+ 	int id;
+ 	struct llist_head pending_llist;
+ 	struct list_head work_list;
++	/*
++	 * Lock to protect access between irq thread process descriptor
++	 * and irq thread processing error descriptor.
++	 */
++	spinlock_t list_lock;
+ };
+ 
+ struct idxd_group {
+diff --git a/drivers/dma/idxd/init.c b/drivers/dma/idxd/init.c
+index f0b3f34af72b..8914319b18b6 100644
+--- a/drivers/dma/idxd/init.c
++++ b/drivers/dma/idxd/init.c
+@@ -92,6 +92,7 @@ static int idxd_setup_interrupts(struct idxd_device *idxd)
+ 	for (i = 0; i < msixcnt; i++) {
+ 		idxd->irq_entries[i].id = i;
+ 		idxd->irq_entries[i].idxd = idxd;
++		spin_lock_init(&idxd->irq_entries[i].list_lock);
+ 	}
+ 
+ 	msix = &idxd->msix_entries[0];
+* Unmerged path drivers/dma/idxd/irq.c
