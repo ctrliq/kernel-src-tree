@@ -1,0 +1,191 @@
+dm: mark various branches unlikely
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-408.el8
+commit-author Mike Snitzer <snitzer@kernel.org>
+commit fe221db4192cf6c5f6b0be59e09025b05418e226
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-408.el8/fe221db4.failed
+
+	Signed-off-by: Mike Snitzer <snitzer@kernel.org>
+(cherry picked from commit fe221db4192cf6c5f6b0be59e09025b05418e226)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/md/dm.c
+diff --cc drivers/md/dm.c
+index e7cb1b8972bd,34d457cfcb36..000000000000
+--- a/drivers/md/dm.c
++++ b/drivers/md/dm.c
+@@@ -985,17 -991,8 +985,22 @@@ static void clone_endio(struct bio *bio
+  			disable_write_zeroes(md);
+  	}
+  
+++<<<<<<< HEAD
+ +	/*
+ +	 * For zone-append bios get offset in zone of the written
+ +	 * sector and add that to the original bio sector pos.
+ +	 */
+ +	if (bio_op(orig_bio) == REQ_OP_ZONE_APPEND) {
+ +		sector_t written_sector = bio->bi_iter.bi_sector;
+ +		struct request_queue *q = orig_bio->bi_disk->queue;
+ +		u64 mask = (u64)blk_queue_zone_sectors(q) - 1;
+ +
+ +		orig_bio->bi_iter.bi_sector += written_sector & mask;
+ +	}
+++=======
++ 	if (unlikely(blk_queue_is_zoned(q)))
++ 		dm_zone_endio(io, bio);
+++>>>>>>> fe221db4192c (dm: mark various branches unlikely)
+  
+  	if (endio) {
+  		int r = endio(tio->ti, bio, &error);
+@@@ -1295,31 -1283,40 +1300,44 @@@ static blk_qc_t __map_bio(struct dm_tar
+  		down(&md->swap_bios_semaphore);
+  	}
+  
+++<<<<<<< HEAD
+ +	r = ti->type->map(ti, clone);
+++=======
++ 	/*
++ 	 * Check if the IO needs a special mapping due to zone append emulation
++ 	 * on zoned target. In this case, dm_zone_map_bio() calls the target
++ 	 * map operation.
++ 	 */
++ 	if (unlikely(dm_emulate_zone_append(io->md)))
++ 		r = dm_zone_map_bio(tio);
++ 	else
++ 		r = ti->type->map(ti, clone);
++ 
+++>>>>>>> fe221db4192c (dm: mark various branches unlikely)
+  	switch (r) {
+  	case DM_MAPIO_SUBMITTED:
+ -		/* target has assumed ownership of this io */
+ -		if (!ti->accounts_remapped_io)
+ -			dm_io_set_flag(io, DM_IO_START_ACCT);
+  		break;
+  	case DM_MAPIO_REMAPPED:
+ -		/*
+ -		 * the bio has been remapped so dispatch it, but defer
+ -		 * dm_start_io_acct() until after possible bio_split().
+ -		 */
+ -		__dm_submit_bio_remap(clone, disk_devt(io->md->disk),
+ -				      tio->old_sector);
+ -		dm_io_set_flag(io, DM_IO_START_ACCT);
+ +		/* the bio has been remapped so dispatch it */
+ +		trace_block_bio_remap(clone->bi_disk->queue, clone,
+ +				      bio_dev(io->orig_bio), sector);
+ +		ret = generic_make_request(clone);
+  		break;
+  	case DM_MAPIO_KILL:
+ +		if (unlikely(swap_bios_limit(ti, clone))) {
+ +			struct mapped_device *md = io->md;
+ +			up(&md->swap_bios_semaphore);
+ +		}
+ +		free_tio(tio);
+ +		dm_io_dec_pending(io, BLK_STS_IOERR);
+ +		break;
+  	case DM_MAPIO_REQUEUE:
+ -		if (unlikely(swap_bios_limit(ti, clone)))
+ -			up(&io->md->swap_bios_semaphore);
+ -		free_tio(clone);
+ -		if (r == DM_MAPIO_KILL)
+ -			dm_io_dec_pending(io, BLK_STS_IOERR);
+ -		else
+ -			dm_io_dec_pending(io, BLK_STS_DM_REQUEUE);
+ +		if (unlikely(swap_bios_limit(ti, clone))) {
+ +			struct mapped_device *md = io->md;
+ +			up(&md->swap_bios_semaphore);
+ +		}
+ +		free_tio(tio);
+ +		dm_io_dec_pending(io, BLK_STS_DM_REQUEUE);
+  		break;
+  	default:
+  		DMWARN("unimplemented target map return value: %d", r);
+@@@ -1678,34 -1631,62 +1696,39 @@@ static blk_qc_t dm_make_request(struct 
+  	 * Use blk_queue_split() for abnormal IO (e.g. discard, writesame, etc)
+  	 * otherwise associated queue_limits won't be imposed.
+  	 */
+++<<<<<<< HEAD
+ +	if (is_abnormal_io(bio))
+ +		blk_queue_split(md->queue, &bio);
+++=======
++ 	if (unlikely(is_abnormal_io(bio)))
++ 		blk_queue_split(&bio);
+++>>>>>>> fe221db4192c (dm: mark various branches unlikely)
+  
+ -	dm_split_and_process_bio(md, map, bio);
+ +	ret = __split_and_process_bio(md, map, bio);
+  out:
+  	dm_put_live_table(md, srcu_idx);
+ +	return ret;
+  }
+  
+ -static bool dm_poll_dm_io(struct dm_io *io, struct io_comp_batch *iob,
+ -			  unsigned int flags)
+ -{
+ -	WARN_ON_ONCE(!dm_tio_is_normal(&io->tio));
+ -
+ -	/* don't poll if the mapped io is done */
+ -	if (atomic_read(&io->io_count) > 1)
+ -		bio_poll(&io->tio.clone, iob, flags);
+ -
+ -	/* bio_poll holds the last reference */
+ -	return atomic_read(&io->io_count) == 1;
+ -}
+ -
+ -static int dm_poll_bio(struct bio *bio, struct io_comp_batch *iob,
+ -		       unsigned int flags)
+ +static int dm_any_congested(void *congested_data, int bdi_bits)
+  {
+ -	struct hlist_head *head = dm_get_bio_hlist_head(bio);
+ -	struct hlist_head tmp = HLIST_HEAD_INIT;
+ -	struct hlist_node *next;
+ -	struct dm_io *io;
+ -
+ -	/* Only poll normal bio which was marked as REQ_DM_POLL_LIST */
+ -	if (!(bio->bi_opf & REQ_DM_POLL_LIST))
+ -		return 0;
+ -
+ -	WARN_ON_ONCE(hlist_empty(head));
+ -
+ -	hlist_move_list(head, &tmp);
+ -
+ -	/*
+ -	 * Restore .bi_private before possibly completing dm_io.
+ -	 *
+ -	 * bio_poll() is only possible once @bio has been completely
+ -	 * submitted via submit_bio_noacct()'s depth-first submission.
+ -	 * So there is no dm_queue_poll_io() race associated with
+ -	 * clearing REQ_DM_POLL_LIST here.
+ -	 */
+ -	bio->bi_opf &= ~REQ_DM_POLL_LIST;
+ -	bio->bi_private = hlist_entry(tmp.first, struct dm_io, node)->data;
+ +	int r = bdi_bits;
+ +	struct mapped_device *md = congested_data;
+ +	struct dm_table *map;
+  
+ -	hlist_for_each_entry_safe(io, next, &tmp, node) {
+ -		if (dm_poll_dm_io(io, iob, flags)) {
+ -			hlist_del_init(&io->node);
+ +	if (!test_bit(DMF_BLOCK_IO_FOR_SUSPEND, &md->flags)) {
+ +		if (dm_request_based(md)) {
+  			/*
+ -			 * clone_endio() has already occurred, so no
+ -			 * error handling is needed here.
+ +			 * With request-based DM we only need to check the
+ +			 * top-level queue for congestion.
+  			 */
+ -			__dm_io_dec_pending(io);
+ +			struct backing_dev_info *bdi = md->queue->backing_dev_info;
+ +			r = bdi->wb.congested->state & bdi_bits;
+ +		} else {
+ +			map = dm_get_live_table_fast(md);
+ +			if (map)
+ +				r = dm_table_any_congested(map, bdi_bits);
+ +			dm_put_live_table_fast(md);
+  		}
+  	}
+  
+* Unmerged path drivers/md/dm.c
