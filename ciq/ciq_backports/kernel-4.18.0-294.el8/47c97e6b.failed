@@ -1,0 +1,173 @@
+net/mlx5e: Fix multicast counter not up-to-date in "ip -s"
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Ron Diskin <rondi@mellanox.com>
+commit 47c97e6b10a1e3680cad539929da092bfa535446
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/47c97e6b.failed
+
+Currently the FW does not generate events for counters other than error
+counters. Unlike ".get_ethtool_stats", ".ndo_get_stats64" (which ip -s
+uses) might run in atomic context, while the FW interface is non atomic.
+Thus, 'ip' is not allowed to issue FW commands, so it will only display
+cached counters in the driver.
+
+Add a SW counter (mcast_packets) in the driver to count rx multicast
+packets. The counter also counts broadcast packets, as we consider it a
+special case of multicast.
+Use the counter value when calling "ip -s"/"ifconfig".
+
+Fixes: f62b8bb8f2d3 ("net/mlx5: Extend mlx5_core to support ConnectX-4 Ethernet functionality")
+	Signed-off-by: Ron Diskin <rondi@mellanox.com>
+	Reviewed-by: Tariq Toukan <tariqt@mellanox.com>
+	Reviewed-by: Moshe Shemesh <moshe@mellanox.com>
+	Signed-off-by: Saeed Mahameed <saeedm@mellanox.com>
+(cherry picked from commit 47c97e6b10a1e3680cad539929da092bfa535446)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/mellanox/mlx5/core/en/txrx.h
+#	drivers/net/ethernet/mellanox/mlx5/core/en_rx.c
+diff --cc drivers/net/ethernet/mellanox/mlx5/core/en/txrx.h
+index d41a7ece152e,24336c60123a..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en/txrx.h
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en/txrx.h
+@@@ -8,6 -8,49 +8,51 @@@
+  
+  #define INL_HDR_START_SZ (sizeof(((struct mlx5_wqe_eth_seg *)NULL)->inline_hdr.start))
+  
+++<<<<<<< HEAD
+++=======
++ enum mlx5e_icosq_wqe_type {
++ 	MLX5E_ICOSQ_WQE_NOP,
++ 	MLX5E_ICOSQ_WQE_UMR_RX,
++ #ifdef CONFIG_MLX5_EN_TLS
++ 	MLX5E_ICOSQ_WQE_UMR_TLS,
++ 	MLX5E_ICOSQ_WQE_SET_PSV_TLS,
++ 	MLX5E_ICOSQ_WQE_GET_PSV_TLS,
++ #endif
++ };
++ 
++ /* General */
++ static inline bool mlx5e_skb_is_multicast(struct sk_buff *skb)
++ {
++ 	return skb->pkt_type == PACKET_MULTICAST || skb->pkt_type == PACKET_BROADCAST;
++ }
++ 
++ void mlx5e_trigger_irq(struct mlx5e_icosq *sq);
++ void mlx5e_completion_event(struct mlx5_core_cq *mcq, struct mlx5_eqe *eqe);
++ void mlx5e_cq_error_event(struct mlx5_core_cq *mcq, enum mlx5_event event);
++ int mlx5e_napi_poll(struct napi_struct *napi, int budget);
++ int mlx5e_poll_ico_cq(struct mlx5e_cq *cq);
++ 
++ /* RX */
++ void mlx5e_page_dma_unmap(struct mlx5e_rq *rq, struct mlx5e_dma_info *dma_info);
++ void mlx5e_page_release_dynamic(struct mlx5e_rq *rq,
++ 				struct mlx5e_dma_info *dma_info,
++ 				bool recycle);
++ INDIRECT_CALLABLE_DECLARE(bool mlx5e_post_rx_wqes(struct mlx5e_rq *rq));
++ INDIRECT_CALLABLE_DECLARE(bool mlx5e_post_rx_mpwqes(struct mlx5e_rq *rq));
++ int mlx5e_poll_rx_cq(struct mlx5e_cq *cq, int budget);
++ void mlx5e_free_rx_descs(struct mlx5e_rq *rq);
++ void mlx5e_free_rx_in_progress_descs(struct mlx5e_rq *rq);
++ 
++ /* TX */
++ u16 mlx5e_select_queue(struct net_device *dev, struct sk_buff *skb,
++ 		       struct net_device *sb_dev);
++ netdev_tx_t mlx5e_xmit(struct sk_buff *skb, struct net_device *dev);
++ void mlx5e_sq_xmit(struct mlx5e_txqsq *sq, struct sk_buff *skb,
++ 		   struct mlx5e_tx_wqe *wqe, u16 pi, bool xmit_more);
++ bool mlx5e_poll_tx_cq(struct mlx5e_cq *cq, int napi_budget);
++ void mlx5e_free_txqsq_descs(struct mlx5e_txqsq *sq);
++ 
+++>>>>>>> 47c97e6b10a1 (net/mlx5e: Fix multicast counter not up-to-date in "ip -s")
+  static inline bool
+  mlx5e_wqc_has_room_for(struct mlx5_wq_cyc *wq, u16 cc, u16 pc, u16 n)
+  {
+diff --cc drivers/net/ethernet/mellanox/mlx5/core/en_rx.c
+index fb2ab3692827,64c8ac5eabf6..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_rx.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_rx.c
+@@@ -51,6 -52,22 +51,25 @@@
+  #include "en/xdp.h"
+  #include "en/xsk/rx.h"
+  #include "en/health.h"
+++<<<<<<< HEAD
+++=======
++ #include "en/params.h"
++ #include "en/txrx.h"
++ 
++ static struct sk_buff *
++ mlx5e_skb_from_cqe_mpwrq_linear(struct mlx5e_rq *rq, struct mlx5e_mpw_info *wi,
++ 				u16 cqe_bcnt, u32 head_offset, u32 page_idx);
++ static struct sk_buff *
++ mlx5e_skb_from_cqe_mpwrq_nonlinear(struct mlx5e_rq *rq, struct mlx5e_mpw_info *wi,
++ 				   u16 cqe_bcnt, u32 head_offset, u32 page_idx);
++ static void mlx5e_handle_rx_cqe(struct mlx5e_rq *rq, struct mlx5_cqe64 *cqe);
++ static void mlx5e_handle_rx_cqe_mpwrq(struct mlx5e_rq *rq, struct mlx5_cqe64 *cqe);
++ 
++ const struct mlx5e_rx_handlers mlx5e_rx_handlers_nic = {
++ 	.handle_rx_cqe       = mlx5e_handle_rx_cqe,
++ 	.handle_rx_cqe_mpwqe = mlx5e_handle_rx_cqe_mpwrq,
++ };
+++>>>>>>> 47c97e6b10a1 (net/mlx5e: Fix multicast counter not up-to-date in "ip -s")
+  
+  static inline bool mlx5e_rx_hw_stamp(struct hwtstamp_config *config)
+  {
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/en/txrx.h
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/en_main.c b/drivers/net/ethernet/mellanox/mlx5/core/en_main.c
+index 0b699d106e2d..5280984ab397 100644
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_main.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_main.c
+@@ -3620,6 +3620,7 @@ void mlx5e_fold_sw_stats64(struct mlx5e_priv *priv, struct rtnl_link_stats64 *s)
+ 
+ 		s->rx_packets   += rq_stats->packets + xskrq_stats->packets;
+ 		s->rx_bytes     += rq_stats->bytes + xskrq_stats->bytes;
++		s->multicast    += rq_stats->mcast_packets + xskrq_stats->mcast_packets;
+ 
+ 		for (j = 0; j < priv->max_opened_tc; j++) {
+ 			struct mlx5e_sq_stats *sq_stats = &channel_stats->sq[j];
+@@ -3635,7 +3636,6 @@ void
+ mlx5e_get_stats(struct net_device *dev, struct rtnl_link_stats64 *stats)
+ {
+ 	struct mlx5e_priv *priv = netdev_priv(dev);
+-	struct mlx5e_vport_stats *vstats = &priv->stats.vport;
+ 	struct mlx5e_pport_stats *pstats = &priv->stats.pport;
+ 
+ 	/* In switchdev mode, monitor counters doesn't monitor
+@@ -3670,12 +3670,6 @@ mlx5e_get_stats(struct net_device *dev, struct rtnl_link_stats64 *stats)
+ 	stats->rx_errors = stats->rx_length_errors + stats->rx_crc_errors +
+ 			   stats->rx_frame_errors;
+ 	stats->tx_errors = stats->tx_aborted_errors + stats->tx_carrier_errors;
+-
+-	/* vport multicast also counts packets that are dropped due to steering
+-	 * or rx out of buffer
+-	 */
+-	stats->multicast =
+-		VPORT_COUNTER_GET(vstats, received_eth_multicast.packets);
+ }
+ 
+ static void mlx5e_set_rx_mode(struct net_device *dev)
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/en_rx.c
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/en_stats.h b/drivers/net/ethernet/mellanox/mlx5/core/en_stats.h
+index 2b83ba990714..a7e25143d974 100644
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_stats.h
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_stats.h
+@@ -119,6 +119,7 @@ struct mlx5e_sw_stats {
+ 	u64 tx_nop;
+ 	u64 rx_lro_packets;
+ 	u64 rx_lro_bytes;
++	u64 rx_mcast_packets;
+ 	u64 rx_ecn_mark;
+ 	u64 rx_removed_vlan_packets;
+ 	u64 rx_csum_unnecessary;
+@@ -286,6 +287,7 @@ struct mlx5e_rq_stats {
+ 	u64 csum_none;
+ 	u64 lro_packets;
+ 	u64 lro_bytes;
++	u64 mcast_packets;
+ 	u64 ecn_mark;
+ 	u64 removed_vlan_packets;
+ 	u64 xdp_drop;
