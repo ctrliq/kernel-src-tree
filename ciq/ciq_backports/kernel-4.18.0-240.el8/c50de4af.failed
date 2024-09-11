@@ -1,0 +1,239 @@
+net/mlx5e: Generalize tx reporter's functionality
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Aya Levin <ayal@mellanox.com>
+commit c50de4af1d635fab3a5c8bd358f55623c01f7ee5
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/c50de4af.failed
+
+Prepare for code sharing with rx reporter, which is added in the
+following patches in the set. Introduce a generic error_ctx for
+agnostic recovery despatch.
+
+	Signed-off-by: Aya Levin <ayal@mellanox.com>
+	Reviewed-by: Tariq Toukan <tariqt@mellanox.com>
+	Acked-by: Jiri Pirko <jiri@mellanox.com>
+	Signed-off-by: Saeed Mahameed <saeedm@mellanox.com>
+(cherry picked from commit c50de4af1d635fab3a5c8bd358f55623c01f7ee5)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/mellanox/mlx5/core/en/reporter_tx.c
+diff --cc drivers/net/ethernet/mellanox/mlx5/core/en/reporter_tx.c
+index 9ff19d69619f,6f9f42ab3005..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en/reporter_tx.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en/reporter_tx.c
+@@@ -111,58 -82,42 +82,58 @@@ out
+  	return err;
+  }
+  
+++<<<<<<< HEAD
+ +static int mlx5_tx_health_report(struct devlink_health_reporter *tx_reporter,
+ +				 char *err_str,
+ +				 struct mlx5e_tx_err_ctx *err_ctx)
+ +{
+ +	if (!tx_reporter) {
+ +		netdev_err(err_ctx->sq->channel->netdev, err_str);
+ +		return err_ctx->recover(err_ctx->sq);
+ +	}
+ +
+ +	return devlink_health_report(tx_reporter, err_str, err_ctx);
+ +}
+ +
+ +void mlx5e_tx_reporter_err_cqe(struct mlx5e_txqsq *sq)
+++=======
++ void mlx5e_reporter_tx_err_cqe(struct mlx5e_txqsq *sq)
+++>>>>>>> c50de4af1d63 (net/mlx5e: Generalize tx reporter's functionality)
+  {
+- 	char err_str[MLX5E_TX_REPORTER_PER_SQ_MAX_LEN];
+- 	struct mlx5e_tx_err_ctx err_ctx = {0};
++ 	struct mlx5e_priv *priv = sq->channel->priv;
++ 	char err_str[MLX5E_REPORTER_PER_Q_MAX_LEN];
++ 	struct mlx5e_err_ctx err_ctx = {0};
+  
+- 	err_ctx.sq       = sq;
+- 	err_ctx.recover  = mlx5e_tx_reporter_err_cqe_recover;
++ 	err_ctx.ctx = sq;
++ 	err_ctx.recover = mlx5e_tx_reporter_err_cqe_recover;
+  	sprintf(err_str, "ERR CQE on SQ: 0x%x", sq->sqn);
+  
+- 	mlx5_tx_health_report(sq->channel->priv->tx_reporter, err_str,
+- 			      &err_ctx);
++ 	mlx5e_health_report(priv, priv->tx_reporter, err_str, &err_ctx);
+  }
+  
+- static int mlx5e_tx_reporter_timeout_recover(struct mlx5e_txqsq *sq)
++ static int mlx5e_tx_reporter_timeout_recover(void *ctx)
+  {
+- 	struct mlx5_eq_comp *eq = sq->cq.mcq.eq;
+- 	u32 eqe_count;
+- 
+- 	netdev_err(sq->channel->netdev, "EQ 0x%x: Cons = 0x%x, irqn = 0x%x\n",
+- 		   eq->core.eqn, eq->core.cons_index, eq->core.irqn);
++ 	struct mlx5_eq_comp *eq;
++ 	struct mlx5e_txqsq *sq;
++ 	int err;
+  
+- 	eqe_count = mlx5_eq_poll_irq_disabled(eq);
+- 	if (!eqe_count) {
++ 	sq = ctx;
++ 	eq = sq->cq.mcq.eq;
++ 	err = mlx5e_health_channel_eq_recover(eq, sq->channel);
++ 	if (err)
+  		clear_bit(MLX5E_SQ_STATE_ENABLED, &sq->state);
+- 		return -EIO;
+- 	}
+  
+- 	netdev_err(sq->channel->netdev, "Recover %d eqes on EQ 0x%x\n",
+- 		   eqe_count, eq->core.eqn);
+- 	sq->channel->stats->eq_rearm++;
+- 	return 0;
++ 	return err;
+  }
+  
+ -int mlx5e_reporter_tx_timeout(struct mlx5e_txqsq *sq)
+ +int mlx5e_tx_reporter_timeout(struct mlx5e_txqsq *sq)
+  {
+- 	char err_str[MLX5E_TX_REPORTER_PER_SQ_MAX_LEN];
+- 	struct mlx5e_tx_err_ctx err_ctx;
++ 	struct mlx5e_priv *priv = sq->channel->priv;
++ 	char err_str[MLX5E_REPORTER_PER_Q_MAX_LEN];
++ 	struct mlx5e_err_ctx err_ctx;
+  
+- 	err_ctx.sq       = sq;
+- 	err_ctx.recover  = mlx5e_tx_reporter_timeout_recover;
++ 	err_ctx.ctx = sq;
++ 	err_ctx.recover = mlx5e_tx_reporter_timeout_recover;
+  	sprintf(err_str,
+  		"TX timeout on queue: %d, SQ: 0x%x, CQ: 0x%x, SQ Cons: 0x%x SQ Prod: 0x%x, usecs since last trans: %u\n",
+  		sq->channel->ix, sq->sqn, sq->cq.mcq.cqn, sq->cc, sq->pc,
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/Makefile b/drivers/net/ethernet/mellanox/mlx5/core/Makefile
+index 35079e1f1f6f..4369dfd04a34 100644
+--- a/drivers/net/ethernet/mellanox/mlx5/core/Makefile
++++ b/drivers/net/ethernet/mellanox/mlx5/core/Makefile
+@@ -23,8 +23,9 @@ mlx5_core-y :=	main.o cmd.o debugfs.o fw.o eq.o uar.o pagealloc.o \
+ #
+ mlx5_core-$(CONFIG_MLX5_CORE_EN) += en_main.o en_common.o en_fs.o en_ethtool.o \
+ 		en_tx.o en_rx.o en_dim.o en_txrx.o en/xdp.o en_stats.o \
+-		en_selftest.o en/port.o en/monitor_stats.o en/reporter_tx.o \
+-		en/params.o en/xsk/umem.o en/xsk/setup.o en/xsk/rx.o en/xsk/tx.o
++		en_selftest.o en/port.o en/monitor_stats.o en/health.o \
++		en/reporter_tx.o en/params.o en/xsk/umem.o en/xsk/setup.o \
++		en/xsk/rx.o en/xsk/tx.o
+ 
+ #
+ # Netdev extra
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/en/health.c b/drivers/net/ethernet/mellanox/mlx5/core/en/health.c
+new file mode 100644
+index 000000000000..fc3112921bd3
+--- /dev/null
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en/health.c
+@@ -0,0 +1,82 @@
++// SPDX-License-Identifier: GPL-2.0
++// Copyright (c) 2019 Mellanox Technologies.
++
++#include "health.h"
++#include "lib/eq.h"
++
++int mlx5e_health_sq_to_ready(struct mlx5e_channel *channel, u32 sqn)
++{
++	struct mlx5_core_dev *mdev = channel->mdev;
++	struct net_device *dev = channel->netdev;
++	struct mlx5e_modify_sq_param msp = {};
++	int err;
++
++	msp.curr_state = MLX5_SQC_STATE_ERR;
++	msp.next_state = MLX5_SQC_STATE_RST;
++
++	err = mlx5e_modify_sq(mdev, sqn, &msp);
++	if (err) {
++		netdev_err(dev, "Failed to move sq 0x%x to reset\n", sqn);
++		return err;
++	}
++
++	memset(&msp, 0, sizeof(msp));
++	msp.curr_state = MLX5_SQC_STATE_RST;
++	msp.next_state = MLX5_SQC_STATE_RDY;
++
++	err = mlx5e_modify_sq(mdev, sqn, &msp);
++	if (err) {
++		netdev_err(dev, "Failed to move sq 0x%x to ready\n", sqn);
++		return err;
++	}
++
++	return 0;
++}
++
++int mlx5e_health_recover_channels(struct mlx5e_priv *priv)
++{
++	int err = 0;
++
++	rtnl_lock();
++	mutex_lock(&priv->state_lock);
++
++	if (!test_bit(MLX5E_STATE_OPENED, &priv->state))
++		goto out;
++
++	err = mlx5e_safe_reopen_channels(priv);
++
++out:
++	mutex_unlock(&priv->state_lock);
++	rtnl_unlock();
++
++	return err;
++}
++
++int mlx5e_health_channel_eq_recover(struct mlx5_eq_comp *eq, struct mlx5e_channel *channel)
++{
++	u32 eqe_count;
++
++	netdev_err(channel->netdev, "EQ 0x%x: Cons = 0x%x, irqn = 0x%x\n",
++		   eq->core.eqn, eq->core.cons_index, eq->core.irqn);
++
++	eqe_count = mlx5_eq_poll_irq_disabled(eq);
++	if (!eqe_count)
++		return -EIO;
++
++	netdev_err(channel->netdev, "Recovered %d eqes on EQ 0x%x\n",
++		   eqe_count, eq->core.eqn);
++
++	channel->stats->eq_rearm++;
++	return 0;
++}
++
++int mlx5e_health_report(struct mlx5e_priv *priv,
++			struct devlink_health_reporter *reporter, char *err_str,
++			struct mlx5e_err_ctx *err_ctx)
++{
++	if (!reporter) {
++		netdev_err(priv->netdev, err_str);
++		return err_ctx->recover(&err_ctx->ctx);
++	}
++	return devlink_health_report(reporter, err_str, err_ctx);
++}
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/en/health.h b/drivers/net/ethernet/mellanox/mlx5/core/en/health.h
+index cee840e40a05..cac0ba593490 100644
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en/health.h
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en/health.h
+@@ -11,4 +11,18 @@ void mlx5e_tx_reporter_destroy(struct mlx5e_priv *priv);
+ void mlx5e_tx_reporter_err_cqe(struct mlx5e_txqsq *sq);
+ int mlx5e_tx_reporter_timeout(struct mlx5e_txqsq *sq);
+ 
++#define MLX5E_REPORTER_PER_Q_MAX_LEN 256
++
++struct mlx5e_err_ctx {
++	int (*recover)(void *ctx);
++	void *ctx;
++};
++
++int mlx5e_health_sq_to_ready(struct mlx5e_channel *channel, u32 sqn);
++int mlx5e_health_channel_eq_recover(struct mlx5_eq_comp *eq, struct mlx5e_channel *channel);
++int mlx5e_health_recover_channels(struct mlx5e_priv *priv);
++int mlx5e_health_report(struct mlx5e_priv *priv,
++			struct devlink_health_reporter *reporter, char *err_str,
++			struct mlx5e_err_ctx *err_ctx);
++
+ #endif
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/en/reporter_tx.c
