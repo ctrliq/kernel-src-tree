@@ -1,0 +1,168 @@
+bnxt_en: Add a warning message for driver initiated reset
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-193.el8
+commit-author Vasundhara Volam <vasundhara-v.volam@broadcom.com>
+commit a2b31e27f6269af8bbda4be2199c2af7c4dcb5a3
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-193.el8/a2b31e27.failed
+
+During loss of heartbeat, log this warning message.
+
+	Signed-off-by: Vasundhara Volam <vasundhara-v.volam@broadcom.com>
+	Signed-off-by: Michael Chan <michael.chan@broadcom.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit a2b31e27f6269af8bbda4be2199c2af7c4dcb5a3)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/broadcom/bnxt/bnxt.c
+diff --cc drivers/net/ethernet/broadcom/bnxt/bnxt.c
+index c5c10193f545,55e02a947765..000000000000
+--- a/drivers/net/ethernet/broadcom/bnxt/bnxt.c
++++ b/drivers/net/ethernet/broadcom/bnxt/bnxt.c
+@@@ -9546,6 -10061,139 +9546,142 @@@ static void bnxt_reset(struct bnxt *bp
+  	bnxt_rtnl_unlock_sp(bp);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static void bnxt_fw_reset_close(struct bnxt *bp)
++ {
++ 	bnxt_ulp_stop(bp);
++ 	__bnxt_close_nic(bp, true, false);
++ 	bnxt_clear_int_mode(bp);
++ 	bnxt_hwrm_func_drv_unrgtr(bp);
++ 	bnxt_free_ctx_mem(bp);
++ 	kfree(bp->ctx);
++ 	bp->ctx = NULL;
++ }
++ 
++ static bool is_bnxt_fw_ok(struct bnxt *bp)
++ {
++ 	struct bnxt_fw_health *fw_health = bp->fw_health;
++ 	bool no_heartbeat = false, has_reset = false;
++ 	u32 val;
++ 
++ 	val = bnxt_fw_health_readl(bp, BNXT_FW_HEARTBEAT_REG);
++ 	if (val == fw_health->last_fw_heartbeat)
++ 		no_heartbeat = true;
++ 
++ 	val = bnxt_fw_health_readl(bp, BNXT_FW_RESET_CNT_REG);
++ 	if (val != fw_health->last_fw_reset_cnt)
++ 		has_reset = true;
++ 
++ 	if (!no_heartbeat && has_reset)
++ 		return true;
++ 
++ 	return false;
++ }
++ 
++ /* rtnl_lock is acquired before calling this function */
++ static void bnxt_force_fw_reset(struct bnxt *bp)
++ {
++ 	struct bnxt_fw_health *fw_health = bp->fw_health;
++ 	u32 wait_dsecs;
++ 
++ 	if (!test_bit(BNXT_STATE_OPEN, &bp->state) ||
++ 	    test_bit(BNXT_STATE_IN_FW_RESET, &bp->state))
++ 		return;
++ 
++ 	set_bit(BNXT_STATE_IN_FW_RESET, &bp->state);
++ 	bnxt_fw_reset_close(bp);
++ 	wait_dsecs = fw_health->master_func_wait_dsecs;
++ 	if (fw_health->master) {
++ 		if (fw_health->flags & ERROR_RECOVERY_QCFG_RESP_FLAGS_CO_CPU)
++ 			wait_dsecs = 0;
++ 		bp->fw_reset_state = BNXT_FW_RESET_STATE_RESET_FW;
++ 	} else {
++ 		bp->fw_reset_timestamp = jiffies + wait_dsecs * HZ / 10;
++ 		wait_dsecs = fw_health->normal_func_wait_dsecs;
++ 		bp->fw_reset_state = BNXT_FW_RESET_STATE_ENABLE_DEV;
++ 	}
++ 
++ 	bp->fw_reset_min_dsecs = fw_health->post_reset_wait_dsecs;
++ 	bp->fw_reset_max_dsecs = fw_health->post_reset_max_wait_dsecs;
++ 	bnxt_queue_fw_reset_work(bp, wait_dsecs * HZ / 10);
++ }
++ 
++ void bnxt_fw_exception(struct bnxt *bp)
++ {
++ 	netdev_warn(bp->dev, "Detected firmware fatal condition, initiating reset\n");
++ 	set_bit(BNXT_STATE_FW_FATAL_COND, &bp->state);
++ 	bnxt_rtnl_lock_sp(bp);
++ 	bnxt_force_fw_reset(bp);
++ 	bnxt_rtnl_unlock_sp(bp);
++ }
++ 
++ /* Returns the number of registered VFs, or 1 if VF configuration is pending, or
++  * < 0 on error.
++  */
++ static int bnxt_get_registered_vfs(struct bnxt *bp)
++ {
++ #ifdef CONFIG_BNXT_SRIOV
++ 	int rc;
++ 
++ 	if (!BNXT_PF(bp))
++ 		return 0;
++ 
++ 	rc = bnxt_hwrm_func_qcfg(bp);
++ 	if (rc) {
++ 		netdev_err(bp->dev, "func_qcfg cmd failed, rc = %d\n", rc);
++ 		return rc;
++ 	}
++ 	if (bp->pf.registered_vfs)
++ 		return bp->pf.registered_vfs;
++ 	if (bp->sriov_cfg)
++ 		return 1;
++ #endif
++ 	return 0;
++ }
++ 
++ void bnxt_fw_reset(struct bnxt *bp)
++ {
++ 	bnxt_rtnl_lock_sp(bp);
++ 	if (test_bit(BNXT_STATE_OPEN, &bp->state) &&
++ 	    !test_bit(BNXT_STATE_IN_FW_RESET, &bp->state)) {
++ 		int n = 0, tmo;
++ 
++ 		set_bit(BNXT_STATE_IN_FW_RESET, &bp->state);
++ 		if (bp->pf.active_vfs &&
++ 		    !test_bit(BNXT_STATE_FW_FATAL_COND, &bp->state))
++ 			n = bnxt_get_registered_vfs(bp);
++ 		if (n < 0) {
++ 			netdev_err(bp->dev, "Firmware reset aborted, rc = %d\n",
++ 				   n);
++ 			clear_bit(BNXT_STATE_IN_FW_RESET, &bp->state);
++ 			dev_close(bp->dev);
++ 			goto fw_reset_exit;
++ 		} else if (n > 0) {
++ 			u16 vf_tmo_dsecs = n * 10;
++ 
++ 			if (bp->fw_reset_max_dsecs < vf_tmo_dsecs)
++ 				bp->fw_reset_max_dsecs = vf_tmo_dsecs;
++ 			bp->fw_reset_state =
++ 				BNXT_FW_RESET_STATE_POLL_VF;
++ 			bnxt_queue_fw_reset_work(bp, HZ / 10);
++ 			goto fw_reset_exit;
++ 		}
++ 		bnxt_fw_reset_close(bp);
++ 		if (bp->fw_cap & BNXT_FW_CAP_ERR_RECOVER_RELOAD) {
++ 			bp->fw_reset_state = BNXT_FW_RESET_STATE_POLL_FW_DOWN;
++ 			tmo = HZ / 10;
++ 		} else {
++ 			bp->fw_reset_state = BNXT_FW_RESET_STATE_ENABLE_DEV;
++ 			tmo = bp->fw_reset_min_dsecs * HZ / 10;
++ 		}
++ 		bnxt_queue_fw_reset_work(bp, tmo);
++ 	}
++ fw_reset_exit:
++ 	bnxt_rtnl_unlock_sp(bp);
++ }
++ 
+++>>>>>>> a2b31e27f626 (bnxt_en: Add a warning message for driver initiated reset)
+  static void bnxt_chk_missed_irq(struct bnxt *bp)
+  {
+  	int i;
+* Unmerged path drivers/net/ethernet/broadcom/bnxt/bnxt.c
