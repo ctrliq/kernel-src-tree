@@ -1,0 +1,210 @@
+net: bridge: guard the switchdev replay helpers against a NULL notifier block
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-358.el8
+commit-author Vladimir Oltean <vladimir.oltean@nxp.com>
+commit 7105b50b7eecae62cf6175507f9ea9ff60a55816
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-358.el8/7105b50b.failed
+
+There is a desire to make the object and FDB replay helpers optional
+when moving them inside the bridge driver. For example a certain driver
+might not offload host MDBs and there is no case where the replay
+helpers would be of immediate use to it.
+
+So it would be nice if we could allow drivers to pass NULL pointers for
+the atomic and blocking notifier blocks, and the replay helpers to do
+nothing in that case.
+
+	Signed-off-by: Vladimir Oltean <vladimir.oltean@nxp.com>
+	Reviewed-by: Florian Fainelli <f.fainelli@gmail.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 7105b50b7eecae62cf6175507f9ea9ff60a55816)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/bridge/br_mdb.c
+diff --cc net/bridge/br_mdb.c
+index 5621f5510fd4,e58f1a4ac962..000000000000
+--- a/net/bridge/br_mdb.c
++++ b/net/bridge/br_mdb.c
+@@@ -466,6 -551,146 +466,149 @@@ err
+  	kfree(priv);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static void br_switchdev_mdb_populate(struct switchdev_obj_port_mdb *mdb,
++ 				      const struct net_bridge_mdb_entry *mp)
++ {
++ 	if (mp->addr.proto == htons(ETH_P_IP))
++ 		ip_eth_mc_map(mp->addr.dst.ip4, mdb->addr);
++ #if IS_ENABLED(CONFIG_IPV6)
++ 	else if (mp->addr.proto == htons(ETH_P_IPV6))
++ 		ipv6_eth_mc_map(&mp->addr.dst.ip6, mdb->addr);
++ #endif
++ 	else
++ 		ether_addr_copy(mdb->addr, mp->addr.dst.mac_addr);
++ 
++ 	mdb->vid = mp->addr.vid;
++ }
++ 
++ static int br_mdb_replay_one(struct notifier_block *nb, struct net_device *dev,
++ 			     const struct switchdev_obj_port_mdb *mdb,
++ 			     unsigned long action, const void *ctx,
++ 			     struct netlink_ext_ack *extack)
++ {
++ 	struct switchdev_notifier_port_obj_info obj_info = {
++ 		.info = {
++ 			.dev = dev,
++ 			.extack = extack,
++ 			.ctx = ctx,
++ 		},
++ 		.obj = &mdb->obj,
++ 	};
++ 	int err;
++ 
++ 	err = nb->notifier_call(nb, action, &obj_info);
++ 	return notifier_to_errno(err);
++ }
++ 
++ static int br_mdb_queue_one(struct list_head *mdb_list,
++ 			    enum switchdev_obj_id id,
++ 			    const struct net_bridge_mdb_entry *mp,
++ 			    struct net_device *orig_dev)
++ {
++ 	struct switchdev_obj_port_mdb *mdb;
++ 
++ 	mdb = kzalloc(sizeof(*mdb), GFP_ATOMIC);
++ 	if (!mdb)
++ 		return -ENOMEM;
++ 
++ 	mdb->obj.id = id;
++ 	mdb->obj.orig_dev = orig_dev;
++ 	br_switchdev_mdb_populate(mdb, mp);
++ 	list_add_tail(&mdb->obj.list, mdb_list);
++ 
++ 	return 0;
++ }
++ 
++ int br_mdb_replay(struct net_device *br_dev, struct net_device *dev,
++ 		  const void *ctx, bool adding, struct notifier_block *nb,
++ 		  struct netlink_ext_ack *extack)
++ {
++ 	const struct net_bridge_mdb_entry *mp;
++ 	struct switchdev_obj *obj, *tmp;
++ 	struct net_bridge *br;
++ 	unsigned long action;
++ 	LIST_HEAD(mdb_list);
++ 	int err = 0;
++ 
++ 	ASSERT_RTNL();
++ 
++ 	if (!nb)
++ 		return 0;
++ 
++ 	if (!netif_is_bridge_master(br_dev) || !netif_is_bridge_port(dev))
++ 		return -EINVAL;
++ 
++ 	br = netdev_priv(br_dev);
++ 
++ 	if (!br_opt_get(br, BROPT_MULTICAST_ENABLED))
++ 		return 0;
++ 
++ 	/* We cannot walk over br->mdb_list protected just by the rtnl_mutex,
++ 	 * because the write-side protection is br->multicast_lock. But we
++ 	 * need to emulate the [ blocking ] calling context of a regular
++ 	 * switchdev event, so since both br->multicast_lock and RCU read side
++ 	 * critical sections are atomic, we have no choice but to pick the RCU
++ 	 * read side lock, queue up all our events, leave the critical section
++ 	 * and notify switchdev from blocking context.
++ 	 */
++ 	rcu_read_lock();
++ 
++ 	hlist_for_each_entry_rcu(mp, &br->mdb_list, mdb_node) {
++ 		struct net_bridge_port_group __rcu * const *pp;
++ 		const struct net_bridge_port_group *p;
++ 
++ 		if (mp->host_joined) {
++ 			err = br_mdb_queue_one(&mdb_list,
++ 					       SWITCHDEV_OBJ_ID_HOST_MDB,
++ 					       mp, br_dev);
++ 			if (err) {
++ 				rcu_read_unlock();
++ 				goto out_free_mdb;
++ 			}
++ 		}
++ 
++ 		for (pp = &mp->ports; (p = rcu_dereference(*pp)) != NULL;
++ 		     pp = &p->next) {
++ 			if (p->key.port->dev != dev)
++ 				continue;
++ 
++ 			err = br_mdb_queue_one(&mdb_list,
++ 					       SWITCHDEV_OBJ_ID_PORT_MDB,
++ 					       mp, dev);
++ 			if (err) {
++ 				rcu_read_unlock();
++ 				goto out_free_mdb;
++ 			}
++ 		}
++ 	}
++ 
++ 	rcu_read_unlock();
++ 
++ 	if (adding)
++ 		action = SWITCHDEV_PORT_OBJ_ADD;
++ 	else
++ 		action = SWITCHDEV_PORT_OBJ_DEL;
++ 
++ 	list_for_each_entry(obj, &mdb_list, list) {
++ 		err = br_mdb_replay_one(nb, dev, SWITCHDEV_OBJ_PORT_MDB(obj),
++ 					action, ctx, extack);
++ 		if (err)
++ 			goto out_free_mdb;
++ 	}
++ 
++ out_free_mdb:
++ 	list_for_each_entry_safe(obj, tmp, &mdb_list, list) {
++ 		list_del(&obj->list);
++ 		kfree(SWITCHDEV_OBJ_PORT_MDB(obj));
++ 	}
++ 
++ 	return err;
++ }
++ EXPORT_SYMBOL_GPL(br_mdb_replay);
++ 
+++>>>>>>> 7105b50b7eec (net: bridge: guard the switchdev replay helpers against a NULL notifier block)
+  static void br_mdb_switchdev_host_port(struct net_device *dev,
+  				       struct net_device *lower_dev,
+  				       struct net_bridge_mdb_entry *mp,
+diff --git a/net/bridge/br_fdb.c b/net/bridge/br_fdb.c
+index 727e4c29f2d6..47801403d1fc 100644
+--- a/net/bridge/br_fdb.c
++++ b/net/bridge/br_fdb.c
+@@ -731,6 +731,9 @@ int br_fdb_replay(struct net_device *br_dev, struct net_device *dev,
+ 	struct net_bridge *br;
+ 	int err = 0;
+ 
++	if (!nb)
++		return 0;
++
+ 	if (!netif_is_bridge_master(br_dev))
+ 		return -EINVAL;
+ 
+* Unmerged path net/bridge/br_mdb.c
+diff --git a/net/bridge/br_vlan.c b/net/bridge/br_vlan.c
+index b985e572c168..ff378b056721 100644
+--- a/net/bridge/br_vlan.c
++++ b/net/bridge/br_vlan.c
+@@ -1734,6 +1734,9 @@ int br_vlan_replay(struct net_device *br_dev, struct net_device *dev,
+ 
+ 	ASSERT_RTNL();
+ 
++	if (!nb)
++		return 0;
++
+ 	if (!netif_is_bridge_master(br_dev))
+ 		return -EINVAL;
+ 
