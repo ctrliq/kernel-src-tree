@@ -1563,6 +1563,9 @@ int itrace_parse_synth_opts(const struct option *opt, const char *str,
 		case 'a':
 			synth_opts->remote_access = true;
 			break;
+		case 'q':
+			synth_opts->quick += 1;
+			break;
 		case ' ':
 		case ',':
 			break;
