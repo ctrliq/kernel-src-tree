@@ -1,0 +1,136 @@
+bpf: Hoist type checking for nullable arg types
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-315.el8
+commit-author Lorenz Bauer <lmb@cloudflare.com>
+commit fd1b0d604c56e0d9f143b39a92132a2ea9625e6d
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-315.el8/fd1b0d60.failed
+
+check_func_arg has a plethora of weird if statements with empty branches.
+They work around the fact that *_OR_NULL argument types should accept a
+SCALAR_VALUE register, as long as it's value is 0. These statements make
+it difficult to reason about the type checking logic.
+
+Instead, skip more detailed type checking logic iff the register is 0,
+and the function expects a nullable type. This allows simplifying the type
+checking itself.
+
+	Signed-off-by: Lorenz Bauer <lmb@cloudflare.com>
+	Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+	Acked-by: Andrii Nakryiko <andriin@fb.com>
+	Acked-by: Martin KaFai Lau <kafai@fb.com>
+Link: https://lore.kernel.org/bpf/20200921121227.255763-11-lmb@cloudflare.com
+(cherry picked from commit fd1b0d604c56e0d9f143b39a92132a2ea9625e6d)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	kernel/bpf/verifier.c
+diff --cc kernel/bpf/verifier.c
+index 41ae364d39c2,129416ea0256..000000000000
+--- a/kernel/bpf/verifier.c
++++ b/kernel/bpf/verifier.c
+@@@ -4002,14 -4025,8 +4014,19 @@@ static int check_func_arg(struct bpf_ve
+  	} else if (arg_type == ARG_PTR_TO_CTX ||
+  		   arg_type == ARG_PTR_TO_CTX_OR_NULL) {
+  		expected_type = PTR_TO_CTX;
+++<<<<<<< HEAD
+ +		if (!(register_is_null(reg) &&
+ +		      arg_type == ARG_PTR_TO_CTX_OR_NULL)) {
+ +			if (type != expected_type)
+ +				goto err_type;
+ +			err = check_ctx_reg(env, reg, regno);
+ +			if (err < 0)
+ +				return err;
+ +		}
+++=======
++ 		if (type != expected_type)
++ 			goto err_type;
+++>>>>>>> fd1b0d604c56 (bpf: Hoist type checking for nullable arg types)
+  	} else if (arg_type == ARG_PTR_TO_SOCK_COMMON) {
+  		expected_type = PTR_TO_SOCK_COMMON;
+  		/* Any sk pointer can be ARG_PTR_TO_SOCK_COMMON */
+@@@ -4027,14 -4035,9 +4044,11 @@@
+  	} else if (arg_type == ARG_PTR_TO_SOCKET ||
+  		   arg_type == ARG_PTR_TO_SOCKET_OR_NULL) {
+  		expected_type = PTR_TO_SOCKET;
+- 		if (!(register_is_null(reg) &&
+- 		      arg_type == ARG_PTR_TO_SOCKET_OR_NULL)) {
+- 			if (type != expected_type)
+- 				goto err_type;
+- 		}
++ 		if (type != expected_type)
++ 			goto err_type;
+  	} else if (arg_type == ARG_PTR_TO_BTF_ID) {
+ +		bool ids_match = false;
+ +
+  		expected_type = PTR_TO_BTF_ID;
+  		if (type != expected_type)
+  			goto err_type;
+@@@ -4083,18 -4056,8 +4089,15 @@@
+  			goto err_type;
+  	} else if (arg_type_is_alloc_mem_ptr(arg_type)) {
+  		expected_type = PTR_TO_MEM;
+- 		if (register_is_null(reg) &&
+- 		    arg_type == ARG_PTR_TO_ALLOC_MEM_OR_NULL)
+- 			/* final test in check_stack_boundary() */;
+- 		else if (type != expected_type)
++ 		if (type != expected_type)
+  			goto err_type;
+ +		if (meta->ref_obj_id) {
+ +			verbose(env, "verifier internal error: more than one arg with ref_obj_id R%d %u %u\n",
+ +				regno, reg->ref_obj_id,
+ +				meta->ref_obj_id);
+ +			return -EFAULT;
+ +		}
+ +		meta->ref_obj_id = reg->ref_obj_id;
+  	} else if (arg_type_is_int_ptr(arg_type)) {
+  		expected_type = PTR_TO_STACK;
+  		if (!type_is_pkt_pointer(type) &&
+@@@ -4106,6 -4069,41 +4109,44 @@@
+  		return -EFAULT;
+  	}
+  
+++<<<<<<< HEAD
+++=======
++ 	if (type == PTR_TO_BTF_ID) {
++ 		const u32 *btf_id = fn->arg_btf_id[arg];
++ 
++ 		if (!btf_id) {
++ 			verbose(env, "verifier internal error: missing BTF ID\n");
++ 			return -EFAULT;
++ 		}
++ 
++ 		if (!btf_struct_ids_match(&env->log, reg->off, reg->btf_id, *btf_id)) {
++ 			verbose(env, "R%d is of type %s but %s is expected\n",
++ 				regno, kernel_type_name(reg->btf_id), kernel_type_name(*btf_id));
++ 			return -EACCES;
++ 		}
++ 		if (!tnum_is_const(reg->var_off) || reg->var_off.value) {
++ 			verbose(env, "R%d is a pointer to in-kernel struct with non-zero offset\n",
++ 				regno);
++ 			return -EACCES;
++ 		}
++ 	} else if (type == PTR_TO_CTX) {
++ 		err = check_ctx_reg(env, reg, regno);
++ 		if (err < 0)
++ 			return err;
++ 	}
++ 
++ skip_type_check:
++ 	if (reg->ref_obj_id) {
++ 		if (meta->ref_obj_id) {
++ 			verbose(env, "verifier internal error: more than one arg with ref_obj_id R%d %u %u\n",
++ 				regno, reg->ref_obj_id,
++ 				meta->ref_obj_id);
++ 			return -EFAULT;
++ 		}
++ 		meta->ref_obj_id = reg->ref_obj_id;
++ 	}
++ 
+++>>>>>>> fd1b0d604c56 (bpf: Hoist type checking for nullable arg types)
+  	if (arg_type == ARG_CONST_MAP_PTR) {
+  		/* bpf_map_xxx(map_ptr) call: remember that map_ptr */
+  		meta->map_ptr = reg->map_ptr;
+* Unmerged path kernel/bpf/verifier.c
