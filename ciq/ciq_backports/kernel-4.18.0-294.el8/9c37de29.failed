@@ -1,0 +1,302 @@
+dm: remove special-casing of bio-based immutable singleton target on NVMe
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Mike Snitzer <snitzer@redhat.com>
+commit 9c37de297f6590937f95a28bec1b7ac68a38618f
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/9c37de29.failed
+
+Since commit 5a6c35f9af416 ("block: remove direct_make_request") there
+is no benefit to DM special-casing NVMe. Remove all code used to
+establish DM_TYPE_NVME_BIO_BASED.
+
+	Signed-off-by: Mike Snitzer <snitzer@redhat.com>
+(cherry picked from commit 9c37de297f6590937f95a28bec1b7ac68a38618f)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/md/dm.c
+diff --cc drivers/md/dm.c
+index 805a79843c7f,af1bab3a810e..000000000000
+--- a/drivers/md/dm.c
++++ b/drivers/md/dm.c
+@@@ -1677,117 -1626,53 +1677,126 @@@ static blk_qc_t __split_and_process_bio
+  	return ret;
+  }
+  
+ -static blk_qc_t dm_submit_bio(struct bio *bio)
+++<<<<<<< HEAD
+ +/*
+ + * Optimized variant of __split_and_process_bio that leverages the
+ + * fact that targets that use it do _not_ have a need to split bios.
+ + */
+ +static blk_qc_t __process_bio(struct mapped_device *md, struct dm_table *map,
+ +			      struct bio *bio, struct dm_target *ti)
+  {
+ -	struct mapped_device *md = bio->bi_disk->private_data;
+ +	struct clone_info ci;
+  	blk_qc_t ret = BLK_QC_T_NONE;
+ -	int srcu_idx;
+ -	struct dm_table *map;
+ +	int error = 0;
+  
+ -	if (dm_get_md_type(md) == DM_TYPE_REQUEST_BASED) {
+ -		/*
+ -		 * We are called with a live reference on q_usage_counter, but
+ -		 * that one will be released as soon as we return.  Grab an
+ -		 * extra one as blk_mq_submit_bio expects to be able to consume
+ -		 * a reference (which lives until the request is freed in case a
+ -		 * request is allocated).
+ -		 */
+ -		percpu_ref_get(&bio->bi_disk->queue->q_usage_counter);
+ -		return blk_mq_submit_bio(bio);
+ +	init_clone_info(&ci, md, map, bio);
+ +
+ +	if (bio->bi_opf & REQ_PREFLUSH) {
+ +		error = __send_empty_flush(&ci);
+ +		/* dec_pending submits any data associated with flush */
+ +	} else {
+ +		struct dm_target_io *tio;
+ +
+ +		ci.bio = bio;
+ +		ci.sector_count = bio_sectors(bio);
+ +		if (__process_abnormal_io(&ci, ti, &error))
+ +			goto out;
+ +
+ +		tio = alloc_tio(&ci, ti, 0, GFP_NOIO);
+ +		ret = __clone_and_map_simple_bio(&ci, tio, NULL);
+  	}
+ +out:
+ +	/* drop the extra reference count */
+ +	dec_pending(ci.io, errno_to_blk_status(error));
+ +	return ret;
+ +}
+ +
+ +static void dm_queue_split(struct mapped_device *md, struct dm_target *ti, struct bio **bio)
+++=======
+++static blk_qc_t dm_submit_bio(struct bio *bio)
+++>>>>>>> 9c37de297f65 (dm: remove special-casing of bio-based immutable singleton target on NVMe)
+ +{
+ +	unsigned len, sector_count;
+ +
+ +	sector_count = bio_sectors(*bio);
+ +	len = min_t(sector_t, max_io_len((*bio)->bi_iter.bi_sector, ti), sector_count);
+ +
+ +	if (sector_count > len) {
+ +		struct bio *split = bio_split(*bio, len, GFP_NOIO, &md->queue->bio_split);
+ +
+ +		bio_chain(split, *bio);
+ +		trace_block_split(md->queue, split, (*bio)->bi_iter.bi_sector);
+ +		generic_make_request(*bio);
+ +		*bio = split;
+ +	}
+ +}
+ +
+ +static blk_qc_t dm_process_bio(struct mapped_device *md,
+ +			       struct dm_table *map, struct bio *bio)
+ +{
+ +	blk_qc_t ret = BLK_QC_T_NONE;
+ +	struct dm_target *ti = md->immutable_target;
+  
+ -	map = dm_get_live_table(md, &srcu_idx);
+  	if (unlikely(!map)) {
+ -		DMERR_LIMIT("%s: mapping table unavailable, erroring io",
+ -			    dm_device_name(md));
+  		bio_io_error(bio);
+ -		goto out;
+ +		return ret;
+ +	}
+ +
+ +	if (!ti) {
+ +		ti = dm_table_find_target(map, bio->bi_iter.bi_sector);
+ +		if (unlikely(!ti)) {
+ +			bio_io_error(bio);
+ +			return ret;
+ +		}
+  	}
+  
+ -	/* If suspended, queue this IO for later */
+ +	/*
+ +	 * If in ->make_request_fn we need to use blk_queue_split(), otherwise
+ +	 * queue_limits for abnormal requests (e.g. discard, writesame, etc)
+ +	 * won't be imposed.
+ +	 */
+ +	if (current->bio_list) {
+ +		if (is_abnormal_io(bio))
+ +			blk_queue_split(md->queue, &bio);
+ +		else
+ +			dm_queue_split(md, ti, &bio);
+ +	}
+ +
+ +	if (dm_get_md_type(md) == DM_TYPE_NVME_BIO_BASED)
+ +		return __process_bio(md, map, bio, ti);
+ +	else
+ +		return __split_and_process_bio(md, map, bio);
+ +}
+ +
+ +static blk_qc_t dm_make_request(struct request_queue *q, struct bio *bio)
+ +{
+ +	struct mapped_device *md = q->queuedata;
+ +	blk_qc_t ret = BLK_QC_T_NONE;
+ +	int srcu_idx;
+ +	struct dm_table *map;
+ +
+ +	map = dm_get_live_table(md, &srcu_idx);
+ +
+ +	/* if we're suspended, we have to queue this io for later */
+  	if (unlikely(test_bit(DMF_BLOCK_IO_FOR_SUSPEND, &md->flags))) {
+ +		dm_put_live_table(md, srcu_idx);
+ +
+  		if (bio->bi_opf & REQ_NOWAIT)
+  			bio_wouldblock_error(bio);
+ -		else if (bio->bi_opf & REQ_RAHEAD)
+ -			bio_io_error(bio);
+ -		else
+ +		else if (!(bio->bi_opf & REQ_RAHEAD))
+  			queue_io(md, bio);
+ -		goto out;
+ +		else
+ +			bio_io_error(bio);
+ +		return ret;
+  	}
+  
+ -	/*
+ -	 * Use blk_queue_split() for abnormal IO (e.g. discard, writesame, etc)
+ -	 * otherwise associated queue_limits won't be imposed.
+ -	 */
+ -	if (is_abnormal_io(bio))
+ -		blk_queue_split(&bio);
+ +	ret = dm_process_bio(md, map, bio);
+  
+++<<<<<<< HEAD
+++=======
++ 	ret = __split_and_process_bio(md, map, bio);
++ out:
+++>>>>>>> 9c37de297f65 (dm: remove special-casing of bio-based immutable singleton target on NVMe)
+  	dm_put_live_table(md, srcu_idx);
+  	return ret;
+  }
+@@@ -2149,12 -1996,10 +2158,17 @@@ static struct dm_table *__bind(struct m
+  	if (request_based)
+  		dm_stop_queue(q);
+  
+- 	if (request_based || md->type == DM_TYPE_NVME_BIO_BASED) {
++ 	if (request_based) {
+  		/*
+++<<<<<<< HEAD
+ +		 * Leverage the fact that request-based DM targets and
+ +		 * NVMe bio based targets are immutable singletons
+ +		 * - used to optimize both dm_request_fn and dm_mq_queue_rq;
+ +		 *   and __process_bio.
+++=======
++ 		 * Leverage the fact that request-based DM targets are
++ 		 * immutable singletons - used to optimize dm_mq_queue_rq.
+++>>>>>>> 9c37de297f65 (dm: remove special-casing of bio-based immutable singleton target on NVMe)
+  		 */
+  		md->immutable_target = dm_table_get_immutable_target(t);
+  	}
+@@@ -2283,8 -2121,6 +2297,11 @@@ int dm_setup_md_queue(struct mapped_dev
+  		break;
+  	case DM_TYPE_BIO_BASED:
+  	case DM_TYPE_DAX_BIO_BASED:
+++<<<<<<< HEAD
+ +	case DM_TYPE_NVME_BIO_BASED:
+ +		dm_init_congested_fn(md);
+++=======
+++>>>>>>> 9c37de297f65 (dm: remove special-casing of bio-based immutable singleton target on NVMe)
+  		break;
+  	case DM_TYPE_NONE:
+  		WARN_ON_ONCE(true);
+diff --git a/drivers/md/dm-table.c b/drivers/md/dm-table.c
+index e9e7c95707c4..5fb20440d85d 100644
+--- a/drivers/md/dm-table.c
++++ b/drivers/md/dm-table.c
+@@ -847,8 +847,7 @@ EXPORT_SYMBOL(dm_consume_args);
+ static bool __table_type_bio_based(enum dm_queue_mode table_type)
+ {
+ 	return (table_type == DM_TYPE_BIO_BASED ||
+-		table_type == DM_TYPE_DAX_BIO_BASED ||
+-		table_type == DM_TYPE_NVME_BIO_BASED);
++		table_type == DM_TYPE_DAX_BIO_BASED);
+ }
+ 
+ static bool __table_type_request_based(enum dm_queue_mode table_type)
+@@ -893,8 +892,6 @@ bool dm_table_supports_dax(struct dm_table *t, int blocksize)
+ 	return true;
+ }
+ 
+-static bool dm_table_does_not_support_partial_completion(struct dm_table *t);
+-
+ static int device_is_rq_stackable(struct dm_target *ti, struct dm_dev *dev,
+ 				  sector_t start, sector_t len, void *data)
+ {
+@@ -923,7 +920,6 @@ static int dm_table_determine_type(struct dm_table *t)
+ 			goto verify_bio_based;
+ 		}
+ 		BUG_ON(t->type == DM_TYPE_DAX_BIO_BASED);
+-		BUG_ON(t->type == DM_TYPE_NVME_BIO_BASED);
+ 		goto verify_rq_based;
+ 	}
+ 
+@@ -962,15 +958,6 @@ static int dm_table_determine_type(struct dm_table *t)
+ 		if (dm_table_supports_dax(t, PAGE_SIZE) ||
+ 		    (list_empty(devices) && live_md_type == DM_TYPE_DAX_BIO_BASED)) {
+ 			t->type = DM_TYPE_DAX_BIO_BASED;
+-		} else {
+-			/* Check if upgrading to NVMe bio-based is valid or required */
+-			tgt = dm_table_get_immutable_target(t);
+-			if (tgt && !tgt->max_io_len && dm_table_does_not_support_partial_completion(t)) {
+-				t->type = DM_TYPE_NVME_BIO_BASED;
+-				goto verify_rq_based; /* must be stacked directly on NVMe (blk-mq) */
+-			} else if (list_empty(devices) && live_md_type == DM_TYPE_NVME_BIO_BASED) {
+-				t->type = DM_TYPE_NVME_BIO_BASED;
+-			}
+ 		}
+ 		return 0;
+ 	}
+@@ -987,8 +974,7 @@ static int dm_table_determine_type(struct dm_table *t)
+ 	 * (e.g. request completion process for partial completion.)
+ 	 */
+ 	if (t->num_targets > 1) {
+-		DMERR("%s DM doesn't support multiple targets",
+-		      t->type == DM_TYPE_NVME_BIO_BASED ? "nvme bio-based" : "request-based");
++		DMERR("request-based DM doesn't support multiple targets");
+ 		return -EINVAL;
+ 	}
+ 
+@@ -1698,20 +1684,6 @@ static bool dm_table_all_devices_attribute(struct dm_table *t,
+ 	return true;
+ }
+ 
+-static int device_no_partial_completion(struct dm_target *ti, struct dm_dev *dev,
+-					sector_t start, sector_t len, void *data)
+-{
+-	char b[BDEVNAME_SIZE];
+-
+-	/* For now, NVMe devices are the only devices of this class */
+-	return (strncmp(bdevname(dev->bdev, b), "nvme", 4) == 0);
+-}
+-
+-static bool dm_table_does_not_support_partial_completion(struct dm_table *t)
+-{
+-	return dm_table_all_devices_attribute(t, device_no_partial_completion);
+-}
+-
+ static int device_not_write_same_capable(struct dm_target *ti, struct dm_dev *dev,
+ 					 sector_t start, sector_t len, void *data)
+ {
+* Unmerged path drivers/md/dm.c
+diff --git a/include/linux/device-mapper.h b/include/linux/device-mapper.h
+index c40948d58ad9..56ff0527afc8 100644
+--- a/include/linux/device-mapper.h
++++ b/include/linux/device-mapper.h
+@@ -28,7 +28,6 @@ enum dm_queue_mode {
+ 	DM_TYPE_BIO_BASED	 = 1,
+ 	DM_TYPE_REQUEST_BASED	 = 2,
+ 	DM_TYPE_DAX_BIO_BASED	 = 3,
+-	DM_TYPE_NVME_BIO_BASED	 = 4,
+ };
+ 
+ typedef enum { STATUSTYPE_INFO, STATUSTYPE_TABLE } status_type_t;
