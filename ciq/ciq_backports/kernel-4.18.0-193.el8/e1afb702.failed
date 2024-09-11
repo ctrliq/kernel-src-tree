@@ -1,0 +1,105 @@
+bpf: check signal validity in nmi for bpf_send_signal() helper
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-193.el8
+commit-author Yonghong Song <yhs@fb.com>
+commit e1afb70252a8614e1ef7aec05ff1b84fd324b782
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-193.el8/e1afb702.failed
+
+Commit 8b401f9ed244 ("bpf: implement bpf_send_signal() helper")
+introduced bpf_send_signal() helper. If the context is nmi,
+the sending signal work needs to be deferred to irq_work.
+If the signal is invalid, the error will appear in irq_work
+and it won't be propagated to user.
+
+This patch did an early check in the helper itself to notify
+user invalid signal, as suggested by Daniel.
+
+	Suggested-by: Daniel Borkmann <daniel@iogearbox.net>
+	Signed-off-by: Yonghong Song <yhs@fb.com>
+	Signed-off-by: Daniel Borkmann <daniel@iogearbox.net>
+(cherry picked from commit e1afb70252a8614e1ef7aec05ff1b84fd324b782)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	kernel/trace/bpf_trace.c
+diff --cc kernel/trace/bpf_trace.c
+index 3cdf7ed66c34,fe73926a07cd..000000000000
+--- a/kernel/trace/bpf_trace.c
++++ b/kernel/trace/bpf_trace.c
+@@@ -594,6 -567,69 +594,72 @@@ static const struct bpf_func_proto bpf_
+  	.arg3_type	= ARG_ANYTHING,
+  };
+  
+++<<<<<<< HEAD
+++=======
++ struct send_signal_irq_work {
++ 	struct irq_work irq_work;
++ 	struct task_struct *task;
++ 	u32 sig;
++ };
++ 
++ static DEFINE_PER_CPU(struct send_signal_irq_work, send_signal_work);
++ 
++ static void do_bpf_send_signal(struct irq_work *entry)
++ {
++ 	struct send_signal_irq_work *work;
++ 
++ 	work = container_of(entry, struct send_signal_irq_work, irq_work);
++ 	group_send_sig_info(work->sig, SEND_SIG_PRIV, work->task, PIDTYPE_TGID);
++ }
++ 
++ BPF_CALL_1(bpf_send_signal, u32, sig)
++ {
++ 	struct send_signal_irq_work *work = NULL;
++ 
++ 	/* Similar to bpf_probe_write_user, task needs to be
++ 	 * in a sound condition and kernel memory access be
++ 	 * permitted in order to send signal to the current
++ 	 * task.
++ 	 */
++ 	if (unlikely(current->flags & (PF_KTHREAD | PF_EXITING)))
++ 		return -EPERM;
++ 	if (unlikely(uaccess_kernel()))
++ 		return -EPERM;
++ 	if (unlikely(!nmi_uaccess_okay()))
++ 		return -EPERM;
++ 
++ 	if (in_nmi()) {
++ 		/* Do an early check on signal validity. Otherwise,
++ 		 * the error is lost in deferred irq_work.
++ 		 */
++ 		if (unlikely(!valid_signal(sig)))
++ 			return -EINVAL;
++ 
++ 		work = this_cpu_ptr(&send_signal_work);
++ 		if (work->irq_work.flags & IRQ_WORK_BUSY)
++ 			return -EBUSY;
++ 
++ 		/* Add the current task, which is the target of sending signal,
++ 		 * to the irq_work. The current task may change when queued
++ 		 * irq works get executed.
++ 		 */
++ 		work->task = current;
++ 		work->sig = sig;
++ 		irq_work_queue(&work->irq_work);
++ 		return 0;
++ 	}
++ 
++ 	return group_send_sig_info(sig, SEND_SIG_PRIV, current, PIDTYPE_TGID);
++ }
++ 
++ static const struct bpf_func_proto bpf_send_signal_proto = {
++ 	.func		= bpf_send_signal,
++ 	.gpl_only	= false,
++ 	.ret_type	= RET_INTEGER,
++ 	.arg1_type	= ARG_ANYTHING,
++ };
++ 
+++>>>>>>> e1afb70252a8 (bpf: check signal validity in nmi for bpf_send_signal() helper)
+  static const struct bpf_func_proto *
+  tracing_func_proto(enum bpf_func_id func_id, const struct bpf_prog *prog)
+  {
+* Unmerged path kernel/trace/bpf_trace.c
