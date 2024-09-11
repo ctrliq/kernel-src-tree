@@ -467,10 +467,10 @@ static int addr_resolve_neigh(const struct dst_entry *dst,
 	return ret;
 }
 
-static void copy_src_l2_addr(struct rdma_dev_addr *dev_addr,
-			     const struct sockaddr *dst_in,
-			     const struct dst_entry *dst,
-			     const struct net_device *ndev)
+static int copy_src_l2_addr(struct rdma_dev_addr *dev_addr,
+			    const struct sockaddr *dst_in,
+			    const struct dst_entry *dst,
+			    const struct net_device *ndev)
 {
 	int ret = 0;
 
@@ -491,6 +491,8 @@ static void copy_src_l2_addr(struct rdma_dev_addr *dev_addr,
 						RDMA_NETWORK_IPV6;
 	else
 		dev_addr->network = RDMA_NETWORK_IB;
+
+	return ret;
 }
 
 static int rdma_set_src_addr_rcu(struct rdma_dev_addr *dev_addr,
@@ -514,8 +516,7 @@ static int rdma_set_src_addr_rcu(struct rdma_dev_addr *dev_addr,
 			return -ENODEV;
 	}
 
-	copy_src_l2_addr(dev_addr, dst_in, dst, ndev);
-	return 0;
+	return copy_src_l2_addr(dev_addr, dst_in, dst, ndev);
 }
 
 static int addr_resolve(struct sockaddr *src_in,
