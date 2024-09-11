@@ -2641,6 +2641,9 @@ static void ionic_lif_handle_fw_up(struct ionic_lif *lif)
 	netif_device_attach(lif->netdev);
 	dev_info(ionic->dev, "FW Up: LIFs restarted\n");
 
+	/* restore the hardware timestamping queues */
+	ionic_lif_hwstamp_set(lif, NULL);
+
 	return;
 
 err_txrx_free:
