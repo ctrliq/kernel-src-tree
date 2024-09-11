@@ -1,0 +1,219 @@
+IB/core: Fix build failure without hugepages
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Arnd Bergmann <arnd@arndb.de>
+commit 74f75cda754eb69a77f910ceb5bc85f8e9ba56a5
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/74f75cda.failed
+
+HPAGE_SHIFT is only defined on architectures that support hugepages:
+
+drivers/infiniband/core/umem_odp.c: In function 'ib_umem_odp_get':
+drivers/infiniband/core/umem_odp.c:245:26: error: 'HPAGE_SHIFT' undeclared (first use in this function); did you mean 'PAGE_SHIFT'?
+
+Enclose this in an #ifdef.
+
+Fixes: 9ff1b6466a29 ("IB/core: Fix ODP with IB_ACCESS_HUGETLB handling")
+Link: https://lore.kernel.org/r/20200109084740.2872079-1-arnd@arndb.de
+	Signed-off-by: Arnd Bergmann <arnd@arndb.de>
+	Reviewed-by: Jason Gunthorpe <jgg@mellanox.com>
+	Signed-off-by: Jason Gunthorpe <jgg@mellanox.com>
+(cherry picked from commit 74f75cda754eb69a77f910ceb5bc85f8e9ba56a5)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/infiniband/core/umem_odp.c
+diff --cc drivers/infiniband/core/umem_odp.c
+index e93b673104dc,b9baf7d0a5cb..000000000000
+--- a/drivers/infiniband/core/umem_odp.c
++++ b/drivers/infiniband/core/umem_odp.c
+@@@ -339,112 -179,86 +339,173 @@@ struct ib_umem_odp *ib_alloc_odp_umem(s
+  	if (!odp_data)
+  		return ERR_PTR(-ENOMEM);
+  	umem = &odp_data->umem;
+ -	umem->ibdev = root->umem.ibdev;
+ +	umem->context    = ctx;
+  	umem->length     = size;
+  	umem->address    = addr;
+ -	umem->writable   = root->umem.writable;
+ -	umem->owning_mm  = root->umem.owning_mm;
+  	odp_data->page_shift = PAGE_SHIFT;
+ -	odp_data->notifier.ops = ops;
+ +	umem->writable   = root->umem.writable;
+ +	umem->is_odp = 1;
+ +	odp_data->per_mm = per_mm;
+ +	umem->owning_mm  = per_mm->mm;
+ +	mmgrab(umem->owning_mm);
+ +
+ +	mutex_init(&odp_data->umem_mutex);
+ +	init_completion(&odp_data->notifier_completion);
+ +
+ +	odp_data->page_list =
+ +		vzalloc(array_size(pages, sizeof(*odp_data->page_list)));
+ +	if (!odp_data->page_list) {
+ +		ret = -ENOMEM;
+ +		goto out_odp_data;
+ +	}
+  
+ -	odp_data->tgid = get_pid(root->tgid);
+ -	ret = ib_init_umem_odp(odp_data, ops);
+ -	if (ret) {
+ -		put_pid(odp_data->tgid);
+ -		kfree(odp_data);
+ -		return ERR_PTR(ret);
+ +	odp_data->dma_list =
+ +		vzalloc(array_size(pages, sizeof(*odp_data->dma_list)));
+ +	if (!odp_data->dma_list) {
+ +		ret = -ENOMEM;
+ +		goto out_page_list;
+  	}
+ +
+ +	/*
+ +	 * Caller must ensure that the umem_odp that the per_mm came from
+ +	 * cannot be freed during the call to ib_alloc_odp_umem.
+ +	 */
+ +	mutex_lock(&ctx->per_mm_list_lock);
+ +	per_mm->odp_mrs_count++;
+ +	mutex_unlock(&ctx->per_mm_list_lock);
+ +	add_umem_to_per_mm(odp_data);
+ +
+  	return odp_data;
+ -}
+ -EXPORT_SYMBOL(ib_umem_odp_alloc_child);
+  
+++<<<<<<< HEAD
+ +out_page_list:
+ +	vfree(odp_data->page_list);
+ +out_odp_data:
+ +	mmdrop(umem->owning_mm);
+ +	kfree(odp_data);
+++=======
++ /**
++  * ib_umem_odp_get - Create a umem_odp for a userspace va
++  *
++  * @udata: userspace context to pin memory for
++  * @addr: userspace virtual address to start at
++  * @size: length of region to pin
++  * @access: IB_ACCESS_xxx flags for memory being pinned
++  *
++  * The driver should use when the access flags indicate ODP memory. It avoids
++  * pinning, instead, stores the mm for future page fault handling in
++  * conjunction with MMU notifiers.
++  */
++ struct ib_umem_odp *ib_umem_odp_get(struct ib_udata *udata, unsigned long addr,
++ 				    size_t size, int access,
++ 				    const struct mmu_interval_notifier_ops *ops)
++ {
++ 	struct ib_umem_odp *umem_odp;
++ 	struct ib_ucontext *context;
++ 	struct mm_struct *mm;
++ 	int ret;
++ 
++ 	if (!udata)
++ 		return ERR_PTR(-EIO);
++ 
++ 	context = container_of(udata, struct uverbs_attr_bundle, driver_udata)
++ 			  ->context;
++ 	if (!context)
++ 		return ERR_PTR(-EIO);
++ 
++ 	if (WARN_ON_ONCE(!(access & IB_ACCESS_ON_DEMAND)))
++ 		return ERR_PTR(-EINVAL);
++ 
++ 	umem_odp = kzalloc(sizeof(struct ib_umem_odp), GFP_KERNEL);
++ 	if (!umem_odp)
++ 		return ERR_PTR(-ENOMEM);
++ 
++ 	umem_odp->umem.ibdev = context->device;
++ 	umem_odp->umem.length = size;
++ 	umem_odp->umem.address = addr;
++ 	umem_odp->umem.writable = ib_access_writable(access);
++ 	umem_odp->umem.owning_mm = mm = current->mm;
++ 	umem_odp->notifier.ops = ops;
++ 
++ 	umem_odp->page_shift = PAGE_SHIFT;
++ #ifdef CONFIG_HUGETLB_PAGE
++ 	if (access & IB_ACCESS_HUGETLB)
++ 		umem_odp->page_shift = HPAGE_SHIFT;
++ #endif
++ 
++ 	umem_odp->tgid = get_task_pid(current->group_leader, PIDTYPE_PID);
++ 	ret = ib_init_umem_odp(umem_odp, ops);
++ 	if (ret)
++ 		goto err_put_pid;
++ 	return umem_odp;
++ 
++ err_put_pid:
++ 	put_pid(umem_odp->tgid);
++ 	kfree(umem_odp);
+++>>>>>>> 74f75cda754e (IB/core: Fix build failure without hugepages)
+  	return ERR_PTR(ret);
+  }
+ -EXPORT_SYMBOL(ib_umem_odp_get);
+ +EXPORT_SYMBOL(ib_alloc_odp_umem);
+ +
+ +int ib_umem_odp_get(struct ib_umem_odp *umem_odp, int access)
+ +{
+ +	struct ib_umem *umem = &umem_odp->umem;
+ +	/*
+ +	 * NOTE: This must called in a process context where umem->owning_mm
+ +	 * == current->mm
+ +	 */
+ +	struct mm_struct *mm = umem->owning_mm;
+ +	int ret_val;
+ +
+ +	umem_odp->page_shift = PAGE_SHIFT;
+ +	if (access & IB_ACCESS_HUGETLB) {
+ +		struct vm_area_struct *vma;
+ +		struct hstate *h;
+ +
+ +		down_read(&mm->mmap_sem);
+ +		vma = find_vma(mm, ib_umem_start(umem_odp));
+ +		if (!vma || !is_vm_hugetlb_page(vma)) {
+ +			up_read(&mm->mmap_sem);
+ +			return -EINVAL;
+ +		}
+ +		h = hstate_vma(vma);
+ +		umem_odp->page_shift = huge_page_shift(h);
+ +		up_read(&mm->mmap_sem);
+ +	}
+ +
+ +	mutex_init(&umem_odp->umem_mutex);
+ +
+ +	init_completion(&umem_odp->notifier_completion);
+ +
+ +	if (ib_umem_odp_num_pages(umem_odp)) {
+ +		umem_odp->page_list =
+ +			vzalloc(array_size(sizeof(*umem_odp->page_list),
+ +					   ib_umem_odp_num_pages(umem_odp)));
+ +		if (!umem_odp->page_list)
+ +			return -ENOMEM;
+ +
+ +		umem_odp->dma_list =
+ +			vzalloc(array_size(sizeof(*umem_odp->dma_list),
+ +					   ib_umem_odp_num_pages(umem_odp)));
+ +		if (!umem_odp->dma_list) {
+ +			ret_val = -ENOMEM;
+ +			goto out_page_list;
+ +		}
+ +	}
+ +
+ +	ret_val = get_per_mm(umem_odp);
+ +	if (ret_val)
+ +		goto out_dma_list;
+ +	add_umem_to_per_mm(umem_odp);
+ +
+ +	return 0;
+ +
+ +out_dma_list:
+ +	vfree(umem_odp->dma_list);
+ +out_page_list:
+ +	vfree(umem_odp->page_list);
+ +	return ret_val;
+ +}
+  
+  void ib_umem_odp_release(struct ib_umem_odp *umem_odp)
+  {
+* Unmerged path drivers/infiniband/core/umem_odp.c
