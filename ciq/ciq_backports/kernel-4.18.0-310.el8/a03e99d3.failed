@@ -1,0 +1,302 @@
+psample: Encapsulate packet metadata in a struct
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-310.el8
+commit-author Ido Schimmel <idosch@nvidia.com>
+commit a03e99d39f1943ec88f6fd3b0b9f34c20663d401
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-310.el8/a03e99d3.failed
+
+Currently, callers of psample_sample_packet() pass three metadata
+attributes: Ingress port, egress port and truncated size. Subsequent
+patches are going to add more attributes (e.g., egress queue occupancy),
+which also need an indication whether they are valid or not.
+
+Encapsulate packet metadata in a struct in order to keep the number of
+arguments reasonable.
+
+	Signed-off-by: Ido Schimmel <idosch@nvidia.com>
+	Reviewed-by: Jiri Pirko <jiri@nvidia.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit a03e99d39f1943ec88f6fd3b0b9f34c20663d401)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/psample/psample.c
+diff --cc net/psample/psample.c
+index 157348b50da5,065bc887d239..000000000000
+--- a/net/psample/psample.c
++++ b/net/psample/psample.c
+@@@ -210,10 -209,161 +210,18 @@@ void psample_group_put(struct psample_g
+  }
+  EXPORT_SYMBOL_GPL(psample_group_put);
+  
+ -#ifdef CONFIG_INET
+ -static int __psample_ip_tun_to_nlattr(struct sk_buff *skb,
+ -			      struct ip_tunnel_info *tun_info)
+ -{
+ -	unsigned short tun_proto = ip_tunnel_info_af(tun_info);
+ -	const void *tun_opts = ip_tunnel_info_opts(tun_info);
+ -	const struct ip_tunnel_key *tun_key = &tun_info->key;
+ -	int tun_opts_len = tun_info->options_len;
+ -
+ -	if (tun_key->tun_flags & TUNNEL_KEY &&
+ -	    nla_put_be64(skb, PSAMPLE_TUNNEL_KEY_ATTR_ID, tun_key->tun_id,
+ -			 PSAMPLE_TUNNEL_KEY_ATTR_PAD))
+ -		return -EMSGSIZE;
+ -
+ -	if (tun_info->mode & IP_TUNNEL_INFO_BRIDGE &&
+ -	    nla_put_flag(skb, PSAMPLE_TUNNEL_KEY_ATTR_IPV4_INFO_BRIDGE))
+ -		return -EMSGSIZE;
+ -
+ -	switch (tun_proto) {
+ -	case AF_INET:
+ -		if (tun_key->u.ipv4.src &&
+ -		    nla_put_in_addr(skb, PSAMPLE_TUNNEL_KEY_ATTR_IPV4_SRC,
+ -				    tun_key->u.ipv4.src))
+ -			return -EMSGSIZE;
+ -		if (tun_key->u.ipv4.dst &&
+ -		    nla_put_in_addr(skb, PSAMPLE_TUNNEL_KEY_ATTR_IPV4_DST,
+ -				    tun_key->u.ipv4.dst))
+ -			return -EMSGSIZE;
+ -		break;
+ -	case AF_INET6:
+ -		if (!ipv6_addr_any(&tun_key->u.ipv6.src) &&
+ -		    nla_put_in6_addr(skb, PSAMPLE_TUNNEL_KEY_ATTR_IPV6_SRC,
+ -				     &tun_key->u.ipv6.src))
+ -			return -EMSGSIZE;
+ -		if (!ipv6_addr_any(&tun_key->u.ipv6.dst) &&
+ -		    nla_put_in6_addr(skb, PSAMPLE_TUNNEL_KEY_ATTR_IPV6_DST,
+ -				     &tun_key->u.ipv6.dst))
+ -			return -EMSGSIZE;
+ -		break;
+ -	}
+ -	if (tun_key->tos &&
+ -	    nla_put_u8(skb, PSAMPLE_TUNNEL_KEY_ATTR_TOS, tun_key->tos))
+ -		return -EMSGSIZE;
+ -	if (nla_put_u8(skb, PSAMPLE_TUNNEL_KEY_ATTR_TTL, tun_key->ttl))
+ -		return -EMSGSIZE;
+ -	if ((tun_key->tun_flags & TUNNEL_DONT_FRAGMENT) &&
+ -	    nla_put_flag(skb, PSAMPLE_TUNNEL_KEY_ATTR_DONT_FRAGMENT))
+ -		return -EMSGSIZE;
+ -	if ((tun_key->tun_flags & TUNNEL_CSUM) &&
+ -	    nla_put_flag(skb, PSAMPLE_TUNNEL_KEY_ATTR_CSUM))
+ -		return -EMSGSIZE;
+ -	if (tun_key->tp_src &&
+ -	    nla_put_be16(skb, PSAMPLE_TUNNEL_KEY_ATTR_TP_SRC, tun_key->tp_src))
+ -		return -EMSGSIZE;
+ -	if (tun_key->tp_dst &&
+ -	    nla_put_be16(skb, PSAMPLE_TUNNEL_KEY_ATTR_TP_DST, tun_key->tp_dst))
+ -		return -EMSGSIZE;
+ -	if ((tun_key->tun_flags & TUNNEL_OAM) &&
+ -	    nla_put_flag(skb, PSAMPLE_TUNNEL_KEY_ATTR_OAM))
+ -		return -EMSGSIZE;
+ -	if (tun_opts_len) {
+ -		if (tun_key->tun_flags & TUNNEL_GENEVE_OPT &&
+ -		    nla_put(skb, PSAMPLE_TUNNEL_KEY_ATTR_GENEVE_OPTS,
+ -			    tun_opts_len, tun_opts))
+ -			return -EMSGSIZE;
+ -		else if (tun_key->tun_flags & TUNNEL_ERSPAN_OPT &&
+ -			 nla_put(skb, PSAMPLE_TUNNEL_KEY_ATTR_ERSPAN_OPTS,
+ -				 tun_opts_len, tun_opts))
+ -			return -EMSGSIZE;
+ -	}
+ -
+ -	return 0;
+ -}
+ -
+ -static int psample_ip_tun_to_nlattr(struct sk_buff *skb,
+ -			    struct ip_tunnel_info *tun_info)
+ -{
+ -	struct nlattr *nla;
+ -	int err;
+ -
+ -	nla = nla_nest_start_noflag(skb, PSAMPLE_ATTR_TUNNEL);
+ -	if (!nla)
+ -		return -EMSGSIZE;
+ -
+ -	err = __psample_ip_tun_to_nlattr(skb, tun_info);
+ -	if (err) {
+ -		nla_nest_cancel(skb, nla);
+ -		return err;
+ -	}
+ -
+ -	nla_nest_end(skb, nla);
+ -
+ -	return 0;
+ -}
+ -
+ -static int psample_tunnel_meta_len(struct ip_tunnel_info *tun_info)
+ -{
+ -	unsigned short tun_proto = ip_tunnel_info_af(tun_info);
+ -	const struct ip_tunnel_key *tun_key = &tun_info->key;
+ -	int tun_opts_len = tun_info->options_len;
+ -	int sum = nla_total_size(0);	/* PSAMPLE_ATTR_TUNNEL */
+ -
+ -	if (tun_key->tun_flags & TUNNEL_KEY)
+ -		sum += nla_total_size_64bit(sizeof(u64));
+ -
+ -	if (tun_info->mode & IP_TUNNEL_INFO_BRIDGE)
+ -		sum += nla_total_size(0);
+ -
+ -	switch (tun_proto) {
+ -	case AF_INET:
+ -		if (tun_key->u.ipv4.src)
+ -			sum += nla_total_size(sizeof(u32));
+ -		if (tun_key->u.ipv4.dst)
+ -			sum += nla_total_size(sizeof(u32));
+ -		break;
+ -	case AF_INET6:
+ -		if (!ipv6_addr_any(&tun_key->u.ipv6.src))
+ -			sum += nla_total_size(sizeof(struct in6_addr));
+ -		if (!ipv6_addr_any(&tun_key->u.ipv6.dst))
+ -			sum += nla_total_size(sizeof(struct in6_addr));
+ -		break;
+ -	}
+ -	if (tun_key->tos)
+ -		sum += nla_total_size(sizeof(u8));
+ -	sum += nla_total_size(sizeof(u8));	/* TTL */
+ -	if (tun_key->tun_flags & TUNNEL_DONT_FRAGMENT)
+ -		sum += nla_total_size(0);
+ -	if (tun_key->tun_flags & TUNNEL_CSUM)
+ -		sum += nla_total_size(0);
+ -	if (tun_key->tp_src)
+ -		sum += nla_total_size(sizeof(u16));
+ -	if (tun_key->tp_dst)
+ -		sum += nla_total_size(sizeof(u16));
+ -	if (tun_key->tun_flags & TUNNEL_OAM)
+ -		sum += nla_total_size(0);
+ -	if (tun_opts_len) {
+ -		if (tun_key->tun_flags & TUNNEL_GENEVE_OPT)
+ -			sum += nla_total_size(tun_opts_len);
+ -		else if (tun_key->tun_flags & TUNNEL_ERSPAN_OPT)
+ -			sum += nla_total_size(tun_opts_len);
+ -	}
+ -
+ -	return sum;
+ -}
+ -#endif
+ -
+  void psample_sample_packet(struct psample_group *group, struct sk_buff *skb,
+- 			   u32 trunc_size, int in_ifindex, int out_ifindex,
+- 			   u32 sample_rate)
++ 			   u32 sample_rate, const struct psample_metadata *md)
+  {
+++<<<<<<< HEAD
+++=======
++ 	int out_ifindex = md->out_ifindex;
++ 	int in_ifindex = md->in_ifindex;
++ 	u32 trunc_size = md->trunc_size;
++ #ifdef CONFIG_INET
++ 	struct ip_tunnel_info *tun_info;
++ #endif
+++>>>>>>> a03e99d39f19 (psample: Encapsulate packet metadata in a struct)
+  	struct sk_buff *nl_skb;
+  	int data_len;
+  	int meta_len;
+diff --git a/drivers/net/ethernet/mellanox/mlxsw/spectrum.c b/drivers/net/ethernet/mellanox/mlxsw/spectrum.c
+index a73ed95d610c..8f915ae96580 100644
+--- a/drivers/net/ethernet/mellanox/mlxsw/spectrum.c
++++ b/drivers/net/ethernet/mellanox/mlxsw/spectrum.c
+@@ -2162,7 +2162,7 @@ void mlxsw_sp_sample_receive(struct mlxsw_sp *mlxsw_sp, struct sk_buff *skb,
+ {
+ 	struct mlxsw_sp_port *mlxsw_sp_port = mlxsw_sp->ports[local_port];
+ 	struct mlxsw_sp_port_sample *sample;
+-	u32 size;
++	struct psample_metadata md = {};
+ 
+ 	if (unlikely(!mlxsw_sp_port)) {
+ 		dev_warn_ratelimited(mlxsw_sp->bus_info->dev, "Port %d: sample skb received for non-existent port\n",
+@@ -2174,9 +2174,9 @@ void mlxsw_sp_sample_receive(struct mlxsw_sp *mlxsw_sp, struct sk_buff *skb,
+ 	sample = rcu_dereference(mlxsw_sp_port->sample);
+ 	if (!sample)
+ 		goto out_unlock;
+-	size = sample->truncate ? sample->trunc_size : skb->len;
+-	psample_sample_packet(sample->psample_group, skb, size,
+-			      mlxsw_sp_port->dev->ifindex, 0, sample->rate);
++	md.trunc_size = sample->truncate ? sample->trunc_size : skb->len;
++	md.in_ifindex = mlxsw_sp_port->dev->ifindex;
++	psample_sample_packet(sample->psample_group, skb, sample->rate, &md);
+ out_unlock:
+ 	rcu_read_unlock();
+ out:
+diff --git a/include/net/psample.h b/include/net/psample.h
+index 68ae16bb0a4a..ac6dbfb3870d 100644
+--- a/include/net/psample.h
++++ b/include/net/psample.h
+@@ -14,6 +14,12 @@ struct psample_group {
+ 	struct rcu_head rcu;
+ };
+ 
++struct psample_metadata {
++	u32 trunc_size;
++	int in_ifindex;
++	int out_ifindex;
++};
++
+ struct psample_group *psample_group_get(struct net *net, u32 group_num);
+ void psample_group_take(struct psample_group *group);
+ void psample_group_put(struct psample_group *group);
+@@ -21,15 +27,13 @@ void psample_group_put(struct psample_group *group);
+ #if IS_ENABLED(CONFIG_PSAMPLE)
+ 
+ void psample_sample_packet(struct psample_group *group, struct sk_buff *skb,
+-			   u32 trunc_size, int in_ifindex, int out_ifindex,
+-			   u32 sample_rate);
++			   u32 sample_rate, const struct psample_metadata *md);
+ 
+ #else
+ 
+ static inline void psample_sample_packet(struct psample_group *group,
+-					 struct sk_buff *skb, u32 trunc_size,
+-					 int in_ifindex, int out_ifindex,
+-					 u32 sample_rate)
++					 struct sk_buff *skb, u32 sample_rate,
++					 const struct psample_metadata *md)
+ {
+ }
+ 
+* Unmerged path net/psample/psample.c
+diff --git a/net/sched/act_sample.c b/net/sched/act_sample.c
+index 8d772cb23ba7..fce8e9734763 100644
+--- a/net/sched/act_sample.c
++++ b/net/sched/act_sample.c
+@@ -161,10 +161,8 @@ static int tcf_sample_act(struct sk_buff *skb, const struct tc_action *a,
+ {
+ 	struct tcf_sample *s = to_sample(a);
+ 	struct psample_group *psample_group;
++	struct psample_metadata md = {};
+ 	int retval;
+-	int size;
+-	int iif;
+-	int oif;
+ 
+ 	tcf_lastuse_update(&s->tcf_tm);
+ 	bstats_cpu_update(this_cpu_ptr(s->common.cpu_bstats), skb);
+@@ -175,20 +173,18 @@ static int tcf_sample_act(struct sk_buff *skb, const struct tc_action *a,
+ 	/* randomly sample packets according to rate */
+ 	if (psample_group && (prandom_u32() % s->rate == 0)) {
+ 		if (!skb_at_tc_ingress(skb)) {
+-			iif = skb->skb_iif;
+-			oif = skb->dev->ifindex;
++			md.in_ifindex = skb->skb_iif;
++			md.out_ifindex = skb->dev->ifindex;
+ 		} else {
+-			iif = skb->dev->ifindex;
+-			oif = 0;
++			md.in_ifindex = skb->dev->ifindex;
+ 		}
+ 
+ 		/* on ingress, the mac header gets popped, so push it back */
+ 		if (skb_at_tc_ingress(skb) && tcf_sample_dev_ok_push(skb->dev))
+ 			skb_push(skb, skb->mac_len);
+ 
+-		size = s->truncate ? s->trunc_size : skb->len;
+-		psample_sample_packet(psample_group, skb, size, iif, oif,
+-				      s->rate);
++		md.trunc_size = s->truncate ? s->trunc_size : skb->len;
++		psample_sample_packet(psample_group, skb, s->rate, &md);
+ 
+ 		if (skb_at_tc_ingress(skb) && tcf_sample_dev_ok_push(skb->dev))
+ 			skb_pull(skb, skb->mac_len);
