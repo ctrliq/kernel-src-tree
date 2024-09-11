@@ -1831,8 +1831,6 @@ u32 hci_conn_get_phy(struct hci_conn *conn)
 {
 	u32 phys = 0;
 
-	hci_dev_lock(conn->hdev);
-
 	/* BLUETOOTH CORE SPECIFICATION Version 5.2 | Vol 2, Part B page 471:
 	 * Table 6.2: Packets defined for synchronous, asynchronous, and
 	 * CSB logical transport types.
@@ -1928,8 +1926,6 @@ u32 hci_conn_get_phy(struct hci_conn *conn)
 
 		break;
 	}
-
-	hci_dev_unlock(conn->hdev);
 
 	return phys;
 }
