@@ -1,0 +1,165 @@
+ceph: update the auth cap when the async create req is forwarded
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-448.el8
+commit-author Xiubo Li <xiubli@redhat.com>
+commit 0006164589ecc755cd6bbc46e466e32be20fe285
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-448.el8/00061645.failed
+
+For async create we will always try to choose the auth MDS of frag
+the dentry belonged to of the parent directory to send the request
+and ususally this works fine, but if the MDS migrated the directory
+to another MDS before it could be handled the request will be
+forwarded. And then the auth cap will be changed.
+
+We need to update the auth cap in this case before the request is
+forwarded.
+
+Link: https://tracker.ceph.com/issues/55857
+	Signed-off-by: Xiubo Li <xiubli@redhat.com>
+	Signed-off-by: Ilya Dryomov <idryomov@gmail.com>
+(cherry picked from commit 0006164589ecc755cd6bbc46e466e32be20fe285)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/ceph/super.h
+diff --cc fs/ceph/super.h
+index 3bacfea00b20,3b146c0fbb2b..000000000000
+--- a/fs/ceph/super.h
++++ b/fs/ceph/super.h
+@@@ -289,10 -296,14 +289,21 @@@ struct ceph_dentry_info 
+  	u64 offset;
+  };
+  
+++<<<<<<< HEAD
+ +#define CEPH_DENTRY_REFERENCED		1
+ +#define CEPH_DENTRY_LEASE_LIST		2
+ +#define CEPH_DENTRY_SHRINK_LIST		4
+ +#define CEPH_DENTRY_PRIMARY_LINK	8
+++=======
++ #define CEPH_DENTRY_REFERENCED		(1 << 0)
++ #define CEPH_DENTRY_LEASE_LIST		(1 << 1)
++ #define CEPH_DENTRY_SHRINK_LIST		(1 << 2)
++ #define CEPH_DENTRY_PRIMARY_LINK	(1 << 3)
++ #define CEPH_DENTRY_ASYNC_UNLINK_BIT	(4)
++ #define CEPH_DENTRY_ASYNC_UNLINK	(1 << CEPH_DENTRY_ASYNC_UNLINK_BIT)
++ #define CEPH_DENTRY_ASYNC_CREATE_BIT	(5)
++ #define CEPH_DENTRY_ASYNC_CREATE	(1 << CEPH_DENTRY_ASYNC_CREATE_BIT)
+++>>>>>>> 0006164589ec (ceph: update the auth cap when the async create req is forwarded)
+  
+  struct ceph_inode_xattrs_info {
+  	/*
+diff --git a/fs/ceph/file.c b/fs/ceph/file.c
+index 11352195bf50..0d886a800d01 100644
+--- a/fs/ceph/file.c
++++ b/fs/ceph/file.c
+@@ -578,6 +578,7 @@ static int ceph_finish_async_create(struct inode *dir, struct dentry *dentry,
+ 	struct ceph_mds_reply_inode in = { };
+ 	struct ceph_mds_reply_info_in iinfo = { .in = &in };
+ 	struct ceph_inode_info *ci = ceph_inode(dir);
++	struct ceph_dentry_info *di = ceph_dentry(dentry);
+ 	struct inode *inode;
+ 	struct timespec64 now;
+ 	struct ceph_string *pool_ns;
+@@ -674,6 +675,12 @@ static int ceph_finish_async_create(struct inode *dir, struct dentry *dentry,
+ 		*opened |= FILE_CREATED;
+ 		ret = finish_open(file, dentry, ceph_open, opened);
+ 	}
++
++	spin_lock(&dentry->d_lock);
++	di->flags &= ~CEPH_DENTRY_ASYNC_CREATE;
++	wake_up_bit(&di->flags, CEPH_DENTRY_ASYNC_CREATE_BIT);
++	spin_unlock(&dentry->d_lock);
++
+ 	return ret;
+ }
+ 
+@@ -743,9 +750,16 @@ int ceph_atomic_open(struct inode *dir, struct dentry *dentry,
+ 		    (req->r_dir_caps =
+ 		      try_prep_async_create(dir, dentry, &lo,
+ 					    &req->r_deleg_ino))) {
++			struct ceph_dentry_info *di = ceph_dentry(dentry);
++
+ 			set_bit(CEPH_MDS_R_ASYNC, &req->r_req_flags);
+ 			req->r_args.open.flags |= cpu_to_le32(CEPH_O_EXCL);
+ 			req->r_callback = ceph_async_create_cb;
++
++			spin_lock(&dentry->d_lock);
++			di->flags |= CEPH_DENTRY_ASYNC_CREATE;
++			spin_unlock(&dentry->d_lock);
++
+ 			err = ceph_mdsc_submit_request(mdsc, dir, req);
+ 			if (!err) {
+ 				err = ceph_finish_async_create(dir, dentry,
+diff --git a/fs/ceph/mds_client.c b/fs/ceph/mds_client.c
+index 051da0178045..80bf9e92b45b 100644
+--- a/fs/ceph/mds_client.c
++++ b/fs/ceph/mds_client.c
+@@ -2837,6 +2837,64 @@ static void __do_request(struct ceph_mds_client *mdsc,
+ 	if (req->r_request_started == 0)   /* note request start time */
+ 		req->r_request_started = jiffies;
+ 
++	/*
++	 * For async create we will choose the auth MDS of frag in parent
++	 * directory to send the request and ususally this works fine, but
++	 * if the migrated the dirtory to another MDS before it could handle
++	 * it the request will be forwarded.
++	 *
++	 * And then the auth cap will be changed.
++	 */
++	if (test_bit(CEPH_MDS_R_ASYNC, &req->r_req_flags) && req->r_num_fwd) {
++		struct ceph_dentry_info *di = ceph_dentry(req->r_dentry);
++		struct ceph_inode_info *ci;
++		struct ceph_cap *cap;
++
++		/*
++		 * The request maybe handled very fast and the new inode
++		 * hasn't been linked to the dentry yet. We need to wait
++		 * for the ceph_finish_async_create(), which shouldn't be
++		 * stuck too long or fail in thoery, to finish when forwarding
++		 * the request.
++		 */
++		if (!d_inode(req->r_dentry)) {
++			err = wait_on_bit(&di->flags, CEPH_DENTRY_ASYNC_CREATE_BIT,
++					  TASK_KILLABLE);
++			if (err) {
++				mutex_lock(&req->r_fill_mutex);
++				set_bit(CEPH_MDS_R_ABORTED, &req->r_req_flags);
++				mutex_unlock(&req->r_fill_mutex);
++				goto out_session;
++			}
++		}
++
++		ci = ceph_inode(d_inode(req->r_dentry));
++
++		spin_lock(&ci->i_ceph_lock);
++		cap = ci->i_auth_cap;
++		if (ci->i_ceph_flags & CEPH_I_ASYNC_CREATE && mds != cap->mds) {
++			dout("do_request session changed for auth cap %d -> %d\n",
++			     cap->session->s_mds, session->s_mds);
++
++			/* Remove the auth cap from old session */
++			spin_lock(&cap->session->s_cap_lock);
++			cap->session->s_nr_caps--;
++			list_del_init(&cap->session_caps);
++			spin_unlock(&cap->session->s_cap_lock);
++
++			/* Add the auth cap to the new session */
++			cap->mds = mds;
++			cap->session = session;
++			spin_lock(&session->s_cap_lock);
++			session->s_nr_caps++;
++			list_add_tail(&cap->session_caps, &session->s_caps);
++			spin_unlock(&session->s_cap_lock);
++
++			change_auth_cap_ses(ci, session);
++		}
++		spin_unlock(&ci->i_ceph_lock);
++	}
++
+ 	err = __send_request(session, req, false);
+ 
+ out_session:
+* Unmerged path fs/ceph/super.h
