@@ -1,0 +1,180 @@
+RDMA/core: Split gid_attrs related sysfs from add_port()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-358.el8
+commit-author Jason Gunthorpe <jgg@nvidia.com>
+commit a32f433522c97d2f07c060517f1f0f4058aa211b
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-358.el8/a32f4335.failed
+
+The gid_attrs directory is a dedicated kobj nested under the port,
+construct/destruct it with its own pair of functions for
+understandability. This is much more readable than having it weirdly
+inlined out of order into the add_port() function.
+
+Link: https://lore.kernel.org/r/1c9434111b6770a7aef0e644a88a16eee7e325b8.1623427137.git.leonro@nvidia.com
+	Signed-off-by: Leon Romanovsky <leonro@nvidia.com>
+	Signed-off-by: Jason Gunthorpe <jgg@nvidia.com>
+(cherry picked from commit a32f433522c97d2f07c060517f1f0f4058aa211b)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/infiniband/core/sysfs.c
+diff --cc drivers/infiniband/core/sysfs.c
+index 1ae9eecb09be,d2a089a6f666..000000000000
+--- a/drivers/infiniband/core/sysfs.c
++++ b/drivers/infiniband/core/sysfs.c
+@@@ -1044,11 -1172,91 +1044,90 @@@ err_free_stats
+  struct rdma_hw_stats *ib_get_hw_stats_port(struct ib_device *ibdev,
+  					   u32 port_num)
+  {
+ -	if (!ibdev->port_data || !rdma_is_port_valid(ibdev, port_num) ||
+ -	    !ibdev->port_data[port_num].sysfs->hw_stats_data)
+ +	if (!ibdev->port_data || !rdma_is_port_valid(ibdev, port_num))
+  		return NULL;
+ -	return ibdev->port_data[port_num].sysfs->hw_stats_data->stats;
+ +	return ibdev->port_data[port_num].sysfs->hw_stats;
+  }
+  
++ /*
++  * Create the sysfs:
++  *  ibp0s9/ports/XX/gid_attrs/{ndevs,types}/YYY
++  * YYY is the gid table index in decimal
++  */
++ static int setup_gid_attrs(struct ib_port *port,
++ 			   const struct ib_port_attr *attr)
++ {
++ 	struct gid_attr_group *gid_attr_group;
++ 	int ret;
++ 	int i;
++ 
++ 	gid_attr_group = kzalloc(sizeof(*gid_attr_group), GFP_KERNEL);
++ 	if (!gid_attr_group)
++ 		return -ENOMEM;
++ 
++ 	gid_attr_group->port = port;
++ 	ret = kobject_init_and_add(&gid_attr_group->kobj, &gid_attr_type,
++ 				   &port->kobj, "gid_attrs");
++ 	if (ret)
++ 		goto err_put_gid_attrs;
++ 
++ 	gid_attr_group->ndev.name = "ndevs";
++ 	gid_attr_group->ndev.attrs =
++ 		alloc_group_attrs(show_port_gid_attr_ndev, attr->gid_tbl_len);
++ 	if (!gid_attr_group->ndev.attrs) {
++ 		ret = -ENOMEM;
++ 		goto err_put_gid_attrs;
++ 	}
++ 
++ 	ret = sysfs_create_group(&gid_attr_group->kobj, &gid_attr_group->ndev);
++ 	if (ret)
++ 		goto err_free_gid_ndev;
++ 
++ 	gid_attr_group->type.name = "types";
++ 	gid_attr_group->type.attrs = alloc_group_attrs(
++ 		show_port_gid_attr_gid_type, attr->gid_tbl_len);
++ 	if (!gid_attr_group->type.attrs) {
++ 		ret = -ENOMEM;
++ 		goto err_remove_gid_ndev;
++ 	}
++ 
++ 	ret = sysfs_create_group(&gid_attr_group->kobj, &gid_attr_group->type);
++ 	if (ret)
++ 		goto err_free_gid_type;
++ 
++ 	port->gid_attr_group = gid_attr_group;
++ 	return 0;
++ 
++ err_free_gid_type:
++ 	for (i = 0; i < attr->gid_tbl_len; ++i)
++ 		kfree(gid_attr_group->type.attrs[i]);
++ 
++ 	kfree(gid_attr_group->type.attrs);
++ 	gid_attr_group->type.attrs = NULL;
++ err_remove_gid_ndev:
++ 	sysfs_remove_group(&gid_attr_group->kobj, &gid_attr_group->ndev);
++ err_free_gid_ndev:
++ 	for (i = 0; i < attr->gid_tbl_len; ++i)
++ 		kfree(gid_attr_group->ndev.attrs[i]);
++ 
++ 	kfree(gid_attr_group->ndev.attrs);
++ 	gid_attr_group->ndev.attrs = NULL;
++ err_put_gid_attrs:
++ 	kobject_put(&gid_attr_group->kobj);
++ 	return ret;
++ }
++ 
++ static void destroy_gid_attrs(struct ib_port *port)
++ {
++ 	struct gid_attr_group *gid_attr_group = port->gid_attr_group;
++ 
++ 	sysfs_remove_group(&gid_attr_group->kobj,
++ 			   &gid_attr_group->ndev);
++ 	sysfs_remove_group(&gid_attr_group->kobj,
++ 			   &gid_attr_group->type);
++ 	kobject_put(&gid_attr_group->kobj);
++ }
++ 
+  static int add_port(struct ib_core_device *coredev, int port_num)
+  {
+  	struct ib_device *device = rdma_device_to_ibdev(&coredev->dev);
+@@@ -1151,21 -1321,26 +1192,41 @@@
+  			goto err_free_pkey;
+  	}
+  
+++<<<<<<< HEAD
+++=======
++ 	/*
++ 	 * If port == 0, it means hw_counters are per device and not per
++ 	 * port, so holder should be device. Therefore skip per port
++ 	 * counter initialization.
++ 	 */
++ 	if (port_num && is_full_dev) {
++ 		ret = setup_hw_port_stats(p);
++ 		if (ret && ret != -EOPNOTSUPP)
++ 			goto err_remove_pkey;
++ 	}
++ 	ret = setup_gid_attrs(p, &attr);
++ 	if (ret)
++ 		goto err_remove_stats;
+++>>>>>>> a32f433522c9 (RDMA/core: Split gid_attrs related sysfs from add_port())
+  
+  	if (device->ops.init_port && is_full_dev) {
+  		ret = device->ops.init_port(device, port_num, &p->kobj);
+  		if (ret)
+++<<<<<<< HEAD
+ +			goto err_remove_pkey;
+++=======
++ 			goto err_remove_gid_attrs;
+++>>>>>>> a32f433522c9 (RDMA/core: Split gid_attrs related sysfs from add_port())
+  	}
+  
+ +	/*
+ +	 * If port == 0, it means hw_counters are per device and not per
+ +	 * port, so holder should be device. Therefore skip per port conunter
+ +	 * initialization.
+ +	 */
+ +	if (device->ops.alloc_hw_stats && port_num && is_full_dev)
+ +		setup_hw_stats(device, p, port_num);
+ +
+  	list_add_tail(&p->kobj.entry, &coredev->port_list);
+  	if (device->port_data && is_full_dev)
+  		device->port_data[port_num].sysfs = p;
+@@@ -1173,6 -1348,12 +1234,15 @@@
+  	kobject_uevent(&p->kobj, KOBJ_ADD);
+  	return 0;
+  
+++<<<<<<< HEAD
+++=======
++ err_remove_gid_attrs:
++ 	destroy_gid_attrs(p);
++ 
++ err_remove_stats:
++ 	destroy_hw_port_stats(p);
++ 
+++>>>>>>> a32f433522c9 (RDMA/core: Split gid_attrs related sysfs from add_port())
+  err_remove_pkey:
+  	if (p->pkey_group)
+  		sysfs_remove_group(&p->kobj, p->pkey_group);
+* Unmerged path drivers/infiniband/core/sysfs.c
