@@ -1,0 +1,215 @@
+net: rtnetlink: add linkprop commands to add and delete alternative ifnames
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-338.el8
+commit-author Jiri Pirko <jiri@mellanox.com>
+commit 36fbf1e52bd3ff8a5cb604955eedfc9350c2e6cc
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-338.el8/36fbf1e5.failed
+
+Add two commands to add and delete list of link properties. Implement
+the first property type along - alternative ifnames.
+Each net device can have multiple alternative names.
+
+	Signed-off-by: Jiri Pirko <jiri@mellanox.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 36fbf1e52bd3ff8a5cb604955eedfc9350c2e6cc)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/uapi/linux/if_link.h
+#	net/core/rtnetlink.c
+diff --cc include/uapi/linux/if_link.h
+index 4f298d4d3e45,8aec8769d944..000000000000
+--- a/include/uapi/linux/if_link.h
++++ b/include/uapi/linux/if_link.h
+@@@ -366,9 -167,8 +366,14 @@@ enum 
+  	IFLA_NEW_IFINDEX,
+  	IFLA_MIN_MTU,
+  	IFLA_MAX_MTU,
+++<<<<<<< HEAD
+ +	__RH_RESERVED_IFLA_PROP_LIST,
+ +	__RH_RESERVED_IFLA_ALT_IFNAME, /* Alternative ifname */
+ +	IFLA_PERM_ADDRESS,
+++=======
++ 	IFLA_PROP_LIST,
++ 	IFLA_ALT_IFNAME, /* Alternative ifname */
+++>>>>>>> 36fbf1e52bd3 (net: rtnetlink: add linkprop commands to add and delete alternative ifnames)
+  	__IFLA_MAX
+  };
+  
+diff --cc net/core/rtnetlink.c
+index 16222e863501,e13646993d82..000000000000
+--- a/net/core/rtnetlink.c
++++ b/net/core/rtnetlink.c
+@@@ -1795,7 -1750,9 +1795,13 @@@ static const struct nla_policy ifla_pol
+  	[IFLA_CARRIER_DOWN_COUNT] = { .type = NLA_U32 },
+  	[IFLA_MIN_MTU]		= { .type = NLA_U32 },
+  	[IFLA_MAX_MTU]		= { .type = NLA_U32 },
+++<<<<<<< HEAD
+ +	[IFLA_PERM_ADDRESS]	= { .type = NLA_REJECT },
+++=======
++ 	[IFLA_PROP_LIST]	= { .type = NLA_NESTED },
++ 	[IFLA_ALT_IFNAME]	= { .type = NLA_STRING,
++ 				    .len = ALTIFNAMSIZ - 1 },
+++>>>>>>> 36fbf1e52bd3 (net: rtnetlink: add linkprop commands to add and delete alternative ifnames)
+  };
+  
+  static const struct nla_policy ifla_info_policy[IFLA_INFO_MAX+1] = {
+diff --git a/include/linux/netdevice.h b/include/linux/netdevice.h
+index 7bfc66900f20..65c9fc60bc56 100644
+--- a/include/linux/netdevice.h
++++ b/include/linux/netdevice.h
+@@ -1002,10 +1002,14 @@ struct devlink;
+ 
+ struct netdev_name_node {
+ 	struct hlist_node hlist;
++	struct list_head list;
+ 	struct net_device *dev;
+ 	const char *name;
+ };
+ 
++int netdev_name_node_alt_create(struct net_device *dev, const char *name);
++int netdev_name_node_alt_destroy(struct net_device *dev, const char *name);
++
+ /*
+  * This structure defines the management hooks for network devices.
+  * The following hooks can be defined; unless noted otherwise, they are
+diff --git a/include/uapi/linux/if.h b/include/uapi/linux/if.h
+index ca8aa4127894..5f3bc25c0f5d 100644
+--- a/include/uapi/linux/if.h
++++ b/include/uapi/linux/if.h
+@@ -33,6 +33,7 @@
+ #define	IFNAMSIZ	16
+ #endif /* __UAPI_DEF_IF_IFNAMSIZ */
+ #define	IFALIASZ	256
++#define	ALTIFNAMSIZ	128
+ #include <linux/hdlc/ioctl.h>
+ 
+ /* For glibc compatibility. An empty enum does not compile. */
+* Unmerged path include/uapi/linux/if_link.h
+diff --git a/include/uapi/linux/rtnetlink.h b/include/uapi/linux/rtnetlink.h
+index e4e16c182917..24e17d4a25b3 100644
+--- a/include/uapi/linux/rtnetlink.h
++++ b/include/uapi/linux/rtnetlink.h
+@@ -164,6 +164,13 @@ enum {
+ 	RTM_GETNEXTHOP,
+ #define RTM_GETNEXTHOP	RTM_GETNEXTHOP
+ 
++	RTM_NEWLINKPROP = 108,
++#define RTM_NEWLINKPROP	RTM_NEWLINKPROP
++	RTM_DELLINKPROP,
++#define RTM_DELLINKPROP	RTM_DELLINKPROP
++	RTM_GETLINKPROP,
++#define RTM_GETLINKPROP	RTM_GETLINKPROP
++
+ 	__RTM_MAX,
+ #define RTM_MAX		(((__RTM_MAX + 3) & ~3) - 1)
+ };
+diff --git a/net/core/dev.c b/net/core/dev.c
+index 0163ef4280d7..b1fc4875286d 100644
+--- a/net/core/dev.c
++++ b/net/core/dev.c
+@@ -255,7 +255,13 @@ static struct netdev_name_node *netdev_name_node_alloc(struct net_device *dev,
+ static struct netdev_name_node *
+ netdev_name_node_head_alloc(struct net_device *dev)
+ {
+-	return netdev_name_node_alloc(dev, dev->name);
++	struct netdev_name_node *name_node;
++
++	name_node = netdev_name_node_alloc(dev, dev->name);
++	if (!name_node)
++		return NULL;
++	INIT_LIST_HEAD(&name_node->list);
++	return name_node;
+ }
+ 
+ static void netdev_name_node_free(struct netdev_name_node *name_node)
+@@ -299,6 +305,55 @@ static struct netdev_name_node *netdev_name_node_lookup_rcu(struct net *net,
+ 	return NULL;
+ }
+ 
++int netdev_name_node_alt_create(struct net_device *dev, const char *name)
++{
++	struct netdev_name_node *name_node;
++	struct net *net = dev_net(dev);
++
++	name_node = netdev_name_node_lookup(net, name);
++	if (name_node)
++		return -EEXIST;
++	name_node = netdev_name_node_alloc(dev, name);
++	if (!name_node)
++		return -ENOMEM;
++	netdev_name_node_add(net, name_node);
++	/* The node that holds dev->name acts as a head of per-device list. */
++	list_add_tail(&name_node->list, &dev->name_node->list);
++
++	return 0;
++}
++EXPORT_SYMBOL(netdev_name_node_alt_create);
++
++static void __netdev_name_node_alt_destroy(struct netdev_name_node *name_node)
++{
++	list_del(&name_node->list);
++	netdev_name_node_del(name_node);
++	kfree(name_node->name);
++	netdev_name_node_free(name_node);
++}
++
++int netdev_name_node_alt_destroy(struct net_device *dev, const char *name)
++{
++	struct netdev_name_node *name_node;
++	struct net *net = dev_net(dev);
++
++	name_node = netdev_name_node_lookup(net, name);
++	if (!name_node)
++		return -ENOENT;
++	__netdev_name_node_alt_destroy(name_node);
++
++	return 0;
++}
++EXPORT_SYMBOL(netdev_name_node_alt_destroy);
++
++static void netdev_name_node_alt_flush(struct net_device *dev)
++{
++	struct netdev_name_node *name_node, *tmp;
++
++	list_for_each_entry_safe(name_node, tmp, &dev->name_node->list, list)
++		__netdev_name_node_alt_destroy(name_node);
++}
++
+ /* Device list insertion */
+ static void list_netdevice(struct net_device *dev)
+ {
+@@ -9390,6 +9445,7 @@ static void rollback_registered_many(struct list_head *head)
+ 		dev_uc_flush(dev);
+ 		dev_mc_flush(dev);
+ 
++		netdev_name_node_alt_flush(dev);
+ 		netdev_name_node_free(dev->name_node);
+ 
+ 		if (dev->netdev_ops->ndo_uninit)
+* Unmerged path net/core/rtnetlink.c
+diff --git a/security/selinux/nlmsgtab.c b/security/selinux/nlmsgtab.c
+index 2c75d823d8e2..b451f5e41c79 100644
+--- a/security/selinux/nlmsgtab.c
++++ b/security/selinux/nlmsgtab.c
+@@ -86,6 +86,8 @@ static const struct nlmsg_perm nlmsg_route_perms[] =
+ 	{ RTM_NEWNEXTHOP,	NETLINK_ROUTE_SOCKET__NLMSG_WRITE },
+ 	{ RTM_DELNEXTHOP,	NETLINK_ROUTE_SOCKET__NLMSG_WRITE },
+ 	{ RTM_GETNEXTHOP,	NETLINK_ROUTE_SOCKET__NLMSG_READ  },
++	{ RTM_NEWLINKPROP,	NETLINK_ROUTE_SOCKET__NLMSG_WRITE },
++	{ RTM_DELLINKPROP,	NETLINK_ROUTE_SOCKET__NLMSG_WRITE },
+ };
+ 
+ static const struct nlmsg_perm nlmsg_tcpdiag_perms[] =
+@@ -169,7 +171,7 @@ int selinux_nlmsg_lookup(u16 sclass, u16 nlmsg_type, u32 *perm)
+ 		 * structures at the top of this file with the new mappings
+ 		 * before updating the BUILD_BUG_ON() macro!
+ 		 */
+-		BUILD_BUG_ON(RTM_MAX != (RTM_NEWNEXTHOP + 3));
++		BUILD_BUG_ON(RTM_MAX != (RTM_NEWLINKPROP + 3));
+ 		err = nlmsg_perm(nlmsg_type, perm, nlmsg_route_perms,
+ 				 sizeof(nlmsg_route_perms));
+ 		break;
