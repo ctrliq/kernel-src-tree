@@ -1,0 +1,245 @@
+nvme: remove nvme_common command cdw10 array
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-147.el8
+commit-author Chaitanya Kulkarni <chaitanya.kulkarni@wdc.com>
+commit b7c8f3663d0e0773aca3324c26bce3ca8343ec14
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-147.el8/b7c8f366.failed
+
+This is a preparation patch which removes the nvme common command cdw10
+array and replace with individual fields. This is needed for the nvmet
+error log page implementation make is error log page entry offset
+assignment easier.
+
+	Signed-off-by: Chaitanya Kulkarni <chaitanya.kulkarni@wdc.com>
+	Reviewed-by: Sagi Grimberg <sagi@grimberg.me>
+	Signed-off-by: Christoph Hellwig <hch@lst.de>
+(cherry picked from commit b7c8f3663d0e0773aca3324c26bce3ca8343ec14)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/nvme/target/admin-cmd.c
+diff --cc drivers/nvme/target/admin-cmd.c
+index 34c4ad15edb3,721b041a6b3b..000000000000
+--- a/drivers/nvme/target/admin-cmd.c
++++ b/drivers/nvme/target/admin-cmd.c
+@@@ -455,11 -541,80 +455,88 @@@ static void nvmet_execute_abort(struct 
+  	nvmet_req_complete(req, 0);
+  }
+  
+++<<<<<<< HEAD
+ +static void nvmet_execute_set_features(struct nvmet_req *req)
+ +{
+ +	struct nvmet_subsys *subsys = req->sq->ctrl->subsys;
+ +	u32 cdw10 = le32_to_cpu(req->cmd->common.cdw10[0]);
+ +	u32 val32;
+++=======
++ static u16 nvmet_write_protect_flush_sync(struct nvmet_req *req)
++ {
++ 	u16 status;
++ 
++ 	if (req->ns->file)
++ 		status = nvmet_file_flush(req);
++ 	else
++ 		status = nvmet_bdev_flush(req);
++ 
++ 	if (status)
++ 		pr_err("write protect flush failed nsid: %u\n", req->ns->nsid);
++ 	return status;
++ }
++ 
++ static u16 nvmet_set_feat_write_protect(struct nvmet_req *req)
++ {
++ 	u32 write_protect = le32_to_cpu(req->cmd->common.cdw11);
++ 	struct nvmet_subsys *subsys = req->sq->ctrl->subsys;
++ 	u16 status = NVME_SC_FEATURE_NOT_CHANGEABLE;
++ 
++ 	req->ns = nvmet_find_namespace(req->sq->ctrl, req->cmd->rw.nsid);
++ 	if (unlikely(!req->ns))
++ 		return status;
++ 
++ 	mutex_lock(&subsys->lock);
++ 	switch (write_protect) {
++ 	case NVME_NS_WRITE_PROTECT:
++ 		req->ns->readonly = true;
++ 		status = nvmet_write_protect_flush_sync(req);
++ 		if (status)
++ 			req->ns->readonly = false;
++ 		break;
++ 	case NVME_NS_NO_WRITE_PROTECT:
++ 		req->ns->readonly = false;
++ 		status = 0;
++ 		break;
++ 	default:
++ 		break;
++ 	}
++ 
++ 	if (!status)
++ 		nvmet_ns_changed(subsys, req->ns->nsid);
++ 	mutex_unlock(&subsys->lock);
++ 	return status;
++ }
++ 
++ u16 nvmet_set_feat_kato(struct nvmet_req *req)
++ {
++ 	u32 val32 = le32_to_cpu(req->cmd->common.cdw11);
++ 
++ 	req->sq->ctrl->kato = DIV_ROUND_UP(val32, 1000);
++ 
++ 	nvmet_set_result(req, req->sq->ctrl->kato);
++ 
++ 	return 0;
++ }
++ 
++ u16 nvmet_set_feat_async_event(struct nvmet_req *req, u32 mask)
++ {
++ 	u32 val32 = le32_to_cpu(req->cmd->common.cdw11);
++ 
++ 	if (val32 & ~mask)
++ 		return NVME_SC_INVALID_FIELD | NVME_SC_DNR;
++ 
++ 	WRITE_ONCE(req->sq->ctrl->aen_enabled, val32);
++ 	nvmet_set_result(req, val32);
++ 
++ 	return 0;
++ }
++ 
++ static void nvmet_execute_set_features(struct nvmet_req *req)
++ {
++ 	struct nvmet_subsys *subsys = req->sq->ctrl->subsys;
++ 	u32 cdw10 = le32_to_cpu(req->cmd->common.cdw10);
+++>>>>>>> b7c8f3663d0e (nvme: remove nvme_common command cdw10 array)
+  	u16 status = 0;
+  
+  	switch (cdw10 & 0xff) {
+diff --git a/drivers/nvme/host/core.c b/drivers/nvme/host/core.c
+index ce791195c81d..90704b3a482d 100644
+--- a/drivers/nvme/host/core.c
++++ b/drivers/nvme/host/core.c
+@@ -1240,12 +1240,12 @@ static int nvme_user_cmd(struct nvme_ctrl *ctrl, struct nvme_ns *ns,
+ 	c.common.nsid = cpu_to_le32(cmd.nsid);
+ 	c.common.cdw2[0] = cpu_to_le32(cmd.cdw2);
+ 	c.common.cdw2[1] = cpu_to_le32(cmd.cdw3);
+-	c.common.cdw10[0] = cpu_to_le32(cmd.cdw10);
+-	c.common.cdw10[1] = cpu_to_le32(cmd.cdw11);
+-	c.common.cdw10[2] = cpu_to_le32(cmd.cdw12);
+-	c.common.cdw10[3] = cpu_to_le32(cmd.cdw13);
+-	c.common.cdw10[4] = cpu_to_le32(cmd.cdw14);
+-	c.common.cdw10[5] = cpu_to_le32(cmd.cdw15);
++	c.common.cdw10 = cpu_to_le32(cmd.cdw10);
++	c.common.cdw11 = cpu_to_le32(cmd.cdw11);
++	c.common.cdw12 = cpu_to_le32(cmd.cdw12);
++	c.common.cdw13 = cpu_to_le32(cmd.cdw13);
++	c.common.cdw14 = cpu_to_le32(cmd.cdw14);
++	c.common.cdw15 = cpu_to_le32(cmd.cdw15);
+ 
+ 	if (cmd.timeout_ms)
+ 		timeout = msecs_to_jiffies(cmd.timeout_ms);
+@@ -1608,7 +1608,7 @@ static int nvme_pr_command(struct block_device *bdev, u32 cdw10,
+ 	memset(&c, 0, sizeof(c));
+ 	c.common.opcode = op;
+ 	c.common.nsid = cpu_to_le32(ns->head->ns_id);
+-	c.common.cdw10[0] = cpu_to_le32(cdw10);
++	c.common.cdw10 = cpu_to_le32(cdw10);
+ 
+ 	ret = nvme_submit_sync_cmd(ns->queue, &c, data, 16);
+ 	nvme_put_ns_from_disk(head, srcu_idx);
+@@ -1682,8 +1682,8 @@ int nvme_sec_submit(void *data, u16 spsp, u8 secp, void *buffer, size_t len,
+ 	else
+ 		cmd.common.opcode = nvme_admin_security_recv;
+ 	cmd.common.nsid = 0;
+-	cmd.common.cdw10[0] = cpu_to_le32(((u32)secp) << 24 | ((u32)spsp) << 8);
+-	cmd.common.cdw10[1] = cpu_to_le32(len);
++	cmd.common.cdw10 = cpu_to_le32(((u32)secp) << 24 | ((u32)spsp) << 8);
++	cmd.common.cdw11 = cpu_to_le32(len);
+ 
+ 	return __nvme_submit_sync_cmd(ctrl->admin_q, &cmd, NULL, buffer, len,
+ 				      ADMIN_TIMEOUT, NVME_QID_ANY, 1, 0);
+diff --git a/drivers/nvme/host/lightnvm.c b/drivers/nvme/host/lightnvm.c
+index 6fe5923c95d4..5786aed2ae61 100644
+--- a/drivers/nvme/host/lightnvm.c
++++ b/drivers/nvme/host/lightnvm.c
+@@ -926,9 +926,9 @@ static int nvme_nvm_user_vcmd(struct nvme_ns *ns, int admin,
+ 	/* cdw11-12 */
+ 	c.ph_rw.length = cpu_to_le16(vcmd.nppas);
+ 	c.ph_rw.control  = cpu_to_le16(vcmd.control);
+-	c.common.cdw10[3] = cpu_to_le32(vcmd.cdw13);
+-	c.common.cdw10[4] = cpu_to_le32(vcmd.cdw14);
+-	c.common.cdw10[5] = cpu_to_le32(vcmd.cdw15);
++	c.common.cdw13 = cpu_to_le32(vcmd.cdw13);
++	c.common.cdw14 = cpu_to_le32(vcmd.cdw14);
++	c.common.cdw15 = cpu_to_le32(vcmd.cdw15);
+ 
+ 	if (vcmd.timeout_ms)
+ 		timeout = msecs_to_jiffies(vcmd.timeout_ms);
+diff --git a/drivers/nvme/host/trace.h b/drivers/nvme/host/trace.h
+index a490790d6691..06dff78a896f 100644
+--- a/drivers/nvme/host/trace.h
++++ b/drivers/nvme/host/trace.h
+@@ -115,8 +115,8 @@ TRACE_EVENT(nvme_setup_cmd,
+ 		__entry->nsid = le32_to_cpu(cmd->common.nsid);
+ 		__entry->metadata = le64_to_cpu(cmd->common.metadata);
+ 		__assign_disk_name(__entry->disk, req->rq_disk);
+-		memcpy(__entry->cdw10, cmd->common.cdw10,
+-		       sizeof(__entry->cdw10));
++		memcpy(__entry->cdw10, &cmd->common.cdw10,
++			6 * sizeof(__entry->cdw10));
+ 	    ),
+ 	    TP_printk("nvme%d: %sqid=%d, cmdid=%u, nsid=%u, flags=0x%x, meta=0x%llx, cmd=(%s %s)",
+ 		      __entry->ctrl_id, __print_disk_name(__entry->disk),
+* Unmerged path drivers/nvme/target/admin-cmd.c
+diff --git a/drivers/nvme/target/discovery.c b/drivers/nvme/target/discovery.c
+index 60a4baacdfd3..29d656b1011e 100644
+--- a/drivers/nvme/target/discovery.c
++++ b/drivers/nvme/target/discovery.c
+@@ -185,7 +185,7 @@ static void nvmet_execute_identify_disc_ctrl(struct nvmet_req *req)
+ 
+ static void nvmet_execute_disc_set_features(struct nvmet_req *req)
+ {
+-	u32 cdw10 = le32_to_cpu(req->cmd->common.cdw10[0]);
++	u32 cdw10 = le32_to_cpu(req->cmd->common.cdw10);
+ 	u16 stat;
+ 
+ 	switch (cdw10 & 0xff) {
+@@ -206,7 +206,7 @@ static void nvmet_execute_disc_set_features(struct nvmet_req *req)
+ 
+ static void nvmet_execute_disc_get_features(struct nvmet_req *req)
+ {
+-	u32 cdw10 = le32_to_cpu(req->cmd->common.cdw10[0]);
++	u32 cdw10 = le32_to_cpu(req->cmd->common.cdw10);
+ 	u16 stat = 0;
+ 
+ 	switch (cdw10 & 0xff) {
+diff --git a/drivers/nvme/target/nvmet.h b/drivers/nvme/target/nvmet.h
+index 59722d7d726a..f8e962de6920 100644
+--- a/drivers/nvme/target/nvmet.h
++++ b/drivers/nvme/target/nvmet.h
+@@ -319,7 +319,7 @@ struct nvmet_async_event {
+ 
+ static inline void nvmet_clear_aen(struct nvmet_req *req, u32 aen_bit)
+ {
+-	int rae = le32_to_cpu(req->cmd->common.cdw10[0]) & 1 << 15;
++	int rae = le32_to_cpu(req->cmd->common.cdw10) & 1 << 15;
+ 
+ 	if (!rae)
+ 		clear_bit(aen_bit, &req->sq->ctrl->aen_masked);
+diff --git a/include/linux/nvme.h b/include/linux/nvme.h
+index c63e82343303..3dd8963f0569 100644
+--- a/include/linux/nvme.h
++++ b/include/linux/nvme.h
+@@ -648,7 +648,12 @@ struct nvme_common_command {
+ 	__le32			cdw2[2];
+ 	__le64			metadata;
+ 	union nvme_data_ptr	dptr;
+-	__le32			cdw10[6];
++	__le32			cdw10;
++	__le32			cdw11;
++	__le32			cdw12;
++	__le32			cdw13;
++	__le32			cdw14;
++	__le32			cdw15;
+ };
+ 
+ struct nvme_rw_command {
