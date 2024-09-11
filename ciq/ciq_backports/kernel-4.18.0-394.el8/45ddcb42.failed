@@ -1,0 +1,294 @@
+driver core: Don't return EPROBE_DEFER to userspace during sysfs bind
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-394.el8
+commit-author Christoph Hellwig <hch@lst.de>
+commit 45ddcb42949f825f0caa25352e825cede94b6aba
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-394.el8/45ddcb42.failed
+
+EPROBE_DEFER is an internal kernel error code and it should not be leaked
+to userspace via the bind_store() sysfs. Userspace doesn't have this
+constant and cannot understand it.
+
+Further, it doesn't really make sense to have userspace trigger a deferred
+probe via bind_store(), which could eventually succeed, while
+simultaneously returning an error back.
+
+Resolve this by splitting driver_probe_device so that the version used
+by the sysfs binding that turns EPROBE_DEFER into -EAGAIN, while the one
+used for internally binding keeps the error code, and calls
+driver_deferred_probe_add where needed.  This also allows to nicely split
+out the defer_all_probes / probe_count checks so that they actually allow
+for full device_{block,unblock}_probing protection while not bothering
+the sysfs bind case.
+
+	Signed-off-by: Christoph Hellwig <hch@lst.de>
+	Reviewed-by: Cornelia Huck <cohuck@redhat.com>
+	Reviewed-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+Link: https://lore.kernel.org/r/20210617142218.1877096-5-hch@lst.de
+	Signed-off-by: Alex Williamson <alex.williamson@redhat.com>
+(cherry picked from commit 45ddcb42949f825f0caa25352e825cede94b6aba)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/base/dd.c
+diff --cc drivers/base/dd.c
+index 532d8dcbb5eb,1d8012459587..000000000000
+--- a/drivers/base/dd.c
++++ b/drivers/base/dd.c
+@@@ -555,12 -504,43 +546,18 @@@ static ssize_t state_synced_show(struc
+  }
+  static DEVICE_ATTR_RO(state_synced);
+  
+ -
+ -static int call_driver_probe(struct device *dev, struct device_driver *drv)
+ -{
+ -	int ret = 0;
+ -
+ -	if (dev->bus->probe)
+ -		ret = dev->bus->probe(dev);
+ -	else if (drv->probe)
+ -		ret = drv->probe(dev);
+ -
+ -	switch (ret) {
+ -	case 0:
+ -		break;
+ -	case -EPROBE_DEFER:
+ -		/* Driver requested deferred probing */
+ -		dev_dbg(dev, "Driver %s requests probe deferral\n", drv->name);
+ -		break;
+ -	case -ENODEV:
+ -	case -ENXIO:
+ -		pr_debug("%s: probe of %s rejects match %d\n",
+ -			 drv->name, dev_name(dev), ret);
+ -		break;
+ -	default:
+ -		/* driver matched but the probe failed */
+ -		pr_warn("%s: probe of %s failed with error %d\n",
+ -			drv->name, dev_name(dev), ret);
+ -		break;
+ -	}
+ -
+ -	return ret;
+ -}
+ -
+  static int really_probe(struct device *dev, struct device_driver *drv)
+  {
+++<<<<<<< HEAD
+ +	int ret = -EPROBE_DEFER;
+ +	int local_trigger_count = atomic_read(&deferred_trigger_count);
+ +	bool test_remove = IS_ENABLED(CONFIG_DEBUG_TEST_DRIVER_REMOVE) &&
+ +			   !drv->suppress_bind_attrs;
+++=======
++ 	bool test_remove = IS_ENABLED(CONFIG_DEBUG_TEST_DRIVER_REMOVE) &&
++ 			   !drv->suppress_bind_attrs;
++ 	int ret;
+++>>>>>>> 45ddcb42949f (driver core: Don't return EPROBE_DEFER to userspace during sysfs bind)
+  
+  	if (defer_all_probes) {
+  		/*
+@@@ -577,12 -556,13 +573,9 @@@
+  	if (ret)
+  		return ret;
+  
+- 	atomic_inc(&probe_count);
+  	pr_debug("bus: '%s': %s: probing driver %s with device %s\n",
+  		 drv->bus->name, __func__, drv->name, dev_name(dev));
+ -	if (!list_empty(&dev->devres_head)) {
+ -		dev_crit(dev, "Resources present before probing\n");
+ -		ret = -EBUSY;
+ -		goto done;
+ -	}
+ +	WARN_ON(!list_empty(&dev->devres_head));
+  
+  re_probe:
+  	dev->driver = drv;
+@@@ -610,14 -590,14 +603,25 @@@
+  			goto probe_failed;
+  	}
+  
+++<<<<<<< HEAD
+ +	if (dev->bus->probe) {
+ +		ret = dev->bus->probe(dev);
+ +		if (ret)
+ +			goto probe_failed;
+ +	} else if (drv->probe) {
+ +		ret = drv->probe(dev);
+ +		if (ret)
+ +			goto probe_failed;
+++=======
++ 	ret = call_driver_probe(dev, drv);
++ 	if (ret) {
++ 		/*
++ 		 * Return probe errors as positive values so that the callers
++ 		 * can distinguish them from other errors.
++ 		 */
++ 		ret = -ret;
++ 		goto probe_failed;
+++>>>>>>> 45ddcb42949f (driver core: Don't return EPROBE_DEFER to userspace during sysfs bind)
+  	}
+  
+  	if (device_add_groups(dev, drv->dev_groups)) {
+@@@ -688,32 -667,23 +692,52 @@@ pinctrl_bind_failed
+  		dev->pm_domain->dismiss(dev);
+  	pm_runtime_reinit(dev);
+  	dev_pm_set_driver_flags(dev, 0);
+++<<<<<<< HEAD
+ +
+ +	switch (ret) {
+ +	case -EPROBE_DEFER:
+ +		/* Driver requested deferred probing */
+ +		dev_dbg(dev, "Driver %s requests probe deferral\n", drv->name);
+ +		driver_deferred_probe_add_trigger(dev, local_trigger_count);
+ +		break;
+ +	case -ENODEV:
+ +	case -ENXIO:
+ +		pr_debug("%s: probe of %s rejects match %d\n",
+ +			 drv->name, dev_name(dev), ret);
+ +		break;
+ +	default:
+ +		/* driver matched but the probe failed */
+ +		printk(KERN_WARNING
+ +		       "%s: probe of %s failed with error %d\n",
+ +		       drv->name, dev_name(dev), ret);
+ +	}
+ +	/*
+ +	 * Ignore errors returned by ->probe so that the next driver can try
+ +	 * its luck.
+ +	 */
+ +	ret = 0;
+ +done:
+ +	atomic_dec(&probe_count);
+ +	wake_up(&probe_waitqueue);
+++=======
++ done:
++ 	return ret;
++ }
++ 
++ /*
++  * For initcall_debug, show the driver probe time.
++  */
++ static int really_probe_debug(struct device *dev, struct device_driver *drv)
++ {
++ 	ktime_t calltime, rettime;
++ 	int ret;
++ 
++ 	calltime = ktime_get();
++ 	ret = really_probe(dev, drv);
++ 	rettime = ktime_get();
++ 	pr_debug("probe of %s returned %d after %lld usecs\n",
++ 		 dev_name(dev), ret, ktime_us_delta(rettime, calltime));
+++>>>>>>> 45ddcb42949f (driver core: Don't return EPROBE_DEFER to userspace during sysfs bind)
+  	return ret;
+  }
+  
+@@@ -747,21 -721,7 +771,25 @@@ void wait_for_device_probe(void
+  }
+  EXPORT_SYMBOL_GPL(wait_for_device_probe);
+  
+++<<<<<<< HEAD
+ +/**
+ + * driver_probe_device - attempt to bind device & driver together
+ + * @drv: driver to bind a device to
+ + * @dev: device to try to bind to the driver
+ + *
+ + * This function returns -ENODEV if the device is not registered, -EBUSY if it
+ + * already has a driver, and 1 if the device is bound successfully and 0
+ + * otherwise.
+ + *
+ + * This function must be called with @dev lock held.  When called for a
+ + * USB interface, @dev->parent lock must be held as well.
+ + *
+ + * If the device has a parent, runtime-resume the parent before driver probing.
+ + */
+ +static int driver_probe_device(struct device_driver *drv, struct device *dev)
+++=======
++ static int __driver_probe_device(struct device_driver *drv, struct device *dev)
+++>>>>>>> 45ddcb42949f (driver core: Don't return EPROBE_DEFER to userspace during sysfs bind)
+  {
+  	int ret = 0;
+  
+@@@ -788,6 -752,58 +816,61 @@@
+  	return ret;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ /**
++  * driver_probe_device - attempt to bind device & driver together
++  * @drv: driver to bind a device to
++  * @dev: device to try to bind to the driver
++  *
++  * This function returns -ENODEV if the device is not registered, -EBUSY if it
++  * already has a driver, 0 if the device is bound successfully and a positive
++  * (inverted) error code for failures from the ->probe method.
++  *
++  * This function must be called with @dev lock held.  When called for a
++  * USB interface, @dev->parent lock must be held as well.
++  *
++  * If the device has a parent, runtime-resume the parent before driver probing.
++  */
++ static int driver_probe_device(struct device_driver *drv, struct device *dev)
++ {
++ 	int trigger_count = atomic_read(&deferred_trigger_count);
++ 	int ret;
++ 
++ 	atomic_inc(&probe_count);
++ 	ret = __driver_probe_device(drv, dev);
++ 	if (ret == -EPROBE_DEFER || ret == EPROBE_DEFER) {
++ 		driver_deferred_probe_add(dev);
++ 
++ 		/*
++ 		 * Did a trigger occur while probing? Need to re-trigger if yes
++ 		 */
++ 		if (trigger_count != atomic_read(&deferred_trigger_count) &&
++ 		    !defer_all_probes)
++ 			driver_deferred_probe_trigger();
++ 	}
++ 	atomic_dec(&probe_count);
++ 	wake_up_all(&probe_waitqueue);
++ 	return ret;
++ }
++ 
++ static inline bool cmdline_requested_async_probing(const char *drv_name)
++ {
++ 	return parse_option_str(async_probe_drv_names, drv_name);
++ }
++ 
++ /* The option format is "driver_async_probe=drv_name1,drv_name2,..." */
++ static int __init save_async_options(char *buf)
++ {
++ 	if (strlen(buf) >= ASYNC_DRV_NAMES_MAX_LEN)
++ 		pr_warn("Too long list of driver names for 'driver_async_probe'!\n");
++ 
++ 	strlcpy(async_probe_drv_names, buf, ASYNC_DRV_NAMES_MAX_LEN);
++ 	return 0;
++ }
++ __setup("driver_async_probe=", save_async_options);
++ 
+++>>>>>>> 45ddcb42949f (driver core: Don't return EPROBE_DEFER to userspace during sysfs bind)
+  bool driver_allows_async_probing(struct device_driver *drv)
+  {
+  	switch (drv->probe_type) {
+@@@ -1026,9 -1055,14 +1109,17 @@@ int device_driver_attach(struct device_
+  	int ret;
+  
+  	__device_driver_lock(dev, dev->parent);
+- 	ret = driver_probe_device(drv, dev);
++ 	ret = __driver_probe_device(drv, dev);
+  	__device_driver_unlock(dev, dev->parent);
+  
+++<<<<<<< HEAD
+++=======
++ 	/* also return probe errors as normal negative errnos */
++ 	if (ret > 0)
++ 		ret = -ret;
++ 	if (ret == -EPROBE_DEFER)
++ 		return -EAGAIN;
+++>>>>>>> 45ddcb42949f (driver core: Don't return EPROBE_DEFER to userspace during sysfs bind)
+  	return ret;
+  }
+  
+* Unmerged path drivers/base/dd.c
