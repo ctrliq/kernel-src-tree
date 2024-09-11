@@ -1,0 +1,142 @@
+PCI: Remove reset_fn field from pci_dev
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-408.el8
+commit-author Amey Narkhede <ameynarkhede03@gmail.com>
+commit 4ec36dfeb155b72da8d28ab006a46f2f8b981eac
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-408.el8/4ec36dfe.failed
+
+"reset_fn" indicates whether the device supports any reset mechanism.
+Remove the use of reset_fn in favor of the reset_methods array that tracks
+supported reset mechanisms of a device and their ordering.
+
+The octeon driver incorrectly used reset_fn to detect whether the device
+supports FLR or not. Use pcie_reset_flr() to probe whether it supports FLR.
+
+Co-developed-by: Alex Williamson <alex.williamson@redhat.com>
+Link: https://lore.kernel.org/r/20210817180500.1253-5-ameynarkhede03@gmail.com
+	Signed-off-by: Alex Williamson <alex.williamson@redhat.com>
+	Signed-off-by: Amey Narkhede <ameynarkhede03@gmail.com>
+	Signed-off-by: Bjorn Helgaas <bhelgaas@google.com>
+	Reviewed-by: Alex Williamson <alex.williamson@redhat.com>
+	Reviewed-by: Raphael Norwitz <raphael.norwitz@nutanix.com>
+(cherry picked from commit 4ec36dfeb155b72da8d28ab006a46f2f8b981eac)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/pci/probe.c
+diff --cc drivers/pci/probe.c
+index 959ced4f0209,3325d4682cd6..000000000000
+--- a/drivers/pci/probe.c
++++ b/drivers/pci/probe.c
+@@@ -2403,9 -2429,7 +2403,13 @@@ static void pci_init_capabilities(struc
+  	pci_rcec_init(dev);		/* Root Complex Event Collector */
+  
+  	pcie_report_downtraining(dev);
+++<<<<<<< HEAD
+ +
+ +	if (pci_probe_reset_function(dev) == 0)
+ +		dev->reset_fn = 1;
+++=======
++ 	pci_init_reset_methods(dev);
+++>>>>>>> 4ec36dfeb155 (PCI: Remove reset_fn field from pci_dev)
+  }
+  
+  /*
+diff --git a/drivers/net/ethernet/cavium/liquidio/lio_vf_main.c b/drivers/net/ethernet/cavium/liquidio/lio_vf_main.c
+index 5b00e0c6e1eb..dec13a42c5dd 100644
+--- a/drivers/net/ethernet/cavium/liquidio/lio_vf_main.c
++++ b/drivers/net/ethernet/cavium/liquidio/lio_vf_main.c
+@@ -510,7 +510,7 @@ static void octeon_destroy_resources(struct octeon_device *oct)
+ 			oct->irq_name_storage = NULL;
+ 		}
+ 		/* Soft reset the octeon device before exiting */
+-		if (oct->pci_dev->reset_fn)
++		if (!pcie_reset_flr(oct->pci_dev, 1))
+ 			octeon_pci_flr(oct);
+ 		else
+ 			cn23xx_vf_ask_pf_to_do_flr(oct);
+diff --git a/drivers/pci/pci-sysfs.c b/drivers/pci/pci-sysfs.c
+index a5bbcf94e406..57d5f0de29aa 100644
+--- a/drivers/pci/pci-sysfs.c
++++ b/drivers/pci/pci-sysfs.c
+@@ -1353,7 +1353,7 @@ static umode_t pci_dev_reset_attr_is_visible(struct kobject *kobj,
+ {
+ 	struct pci_dev *pdev = to_pci_dev(kobj_to_dev(kobj));
+ 
+-	if (!pdev->reset_fn)
++	if (!pci_reset_supported(pdev))
+ 		return 0;
+ 
+ 	return a->mode;
+diff --git a/drivers/pci/pci.c b/drivers/pci/pci.c
+index c3df2812af1a..25cef1cbd8b0 100644
+--- a/drivers/pci/pci.c
++++ b/drivers/pci/pci.c
+@@ -5192,7 +5192,7 @@ int pci_reset_function(struct pci_dev *dev)
+ {
+ 	int rc;
+ 
+-	if (!dev->reset_fn)
++	if (!pci_reset_supported(dev))
+ 		return -ENOTTY;
+ 
+ 	pci_dev_lock(dev);
+@@ -5228,7 +5228,7 @@ int pci_reset_function_locked(struct pci_dev *dev)
+ {
+ 	int rc;
+ 
+-	if (!dev->reset_fn)
++	if (!pci_reset_supported(dev))
+ 		return -ENOTTY;
+ 
+ 	pci_dev_save_and_disable(dev);
+@@ -5251,7 +5251,7 @@ int pci_try_reset_function(struct pci_dev *dev)
+ {
+ 	int rc;
+ 
+-	if (!dev->reset_fn)
++	if (!pci_reset_supported(dev))
+ 		return -ENOTTY;
+ 
+ 	if (!pci_dev_trylock(dev))
+* Unmerged path drivers/pci/probe.c
+diff --git a/drivers/pci/quirks.c b/drivers/pci/quirks.c
+index 62f27075a735..06d722b15030 100644
+--- a/drivers/pci/quirks.c
++++ b/drivers/pci/quirks.c
+@@ -5555,7 +5555,7 @@ static void quirk_reset_lenovo_thinkpad_p50_nvgpu(struct pci_dev *pdev)
+ 
+ 	if (pdev->subsystem_vendor != PCI_VENDOR_ID_LENOVO ||
+ 	    pdev->subsystem_device != 0x222e ||
+-	    !pdev->reset_fn)
++	    !pci_reset_supported(pdev))
+ 		return;
+ 
+ 	if (pci_enable_device_mem(pdev))
+diff --git a/drivers/pci/remove.c b/drivers/pci/remove.c
+index dd12c2fcc7dc..4c54c75050dc 100644
+--- a/drivers/pci/remove.c
++++ b/drivers/pci/remove.c
+@@ -19,7 +19,6 @@ static void pci_stop_dev(struct pci_dev *dev)
+ 	pci_pme_active(dev, false);
+ 
+ 	if (pci_dev_is_added(dev)) {
+-		dev->reset_fn = 0;
+ 
+ 		device_release_driver(&dev->dev);
+ 		pci_proc_detach_device(dev);
+diff --git a/include/linux/pci.h b/include/linux/pci.h
+index 0b97f3c12e39..0ef45caeeef1 100644
+--- a/include/linux/pci.h
++++ b/include/linux/pci.h
+@@ -441,7 +441,6 @@ struct pci_dev {
+ 	unsigned int	state_saved:1;
+ 	unsigned int	is_physfn:1;
+ 	unsigned int	is_virtfn:1;
+-	unsigned int	reset_fn:1;
+ 	unsigned int	is_hotplug_bridge:1;
+ 	unsigned int	shpc_managed:1;		/* SHPC owned by shpchp */
+ 	unsigned int	is_thunderbolt:1;	/* Thunderbolt controller */
