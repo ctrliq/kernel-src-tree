@@ -1,0 +1,155 @@
+KVM: x86/mmu: Zap only the target TDP MMU shadow page in NX recovery
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-408.el8
+commit-author Sean Christopherson <seanjc@google.com>
+commit c10743a1824b9db449eb631745ed6f2d3cdf9762
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-408.el8/c10743a1.failed
+
+When recovering a potential hugepage that was shattered for the iTLB
+multihit workaround, precisely zap only the target page instead of
+iterating over the TDP MMU to find the SP that was passed in.  This will
+allow future simplification of zap_gfn_range() by having it zap only
+leaf SPTEs.
+
+	Signed-off-by: Sean Christopherson <seanjc@google.com>
+Message-Id: <20220226001546.360188-14-seanjc@google.com>
+	Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+(cherry picked from commit c10743a1824b9db449eb631745ed6f2d3cdf9762)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kvm/mmu/tdp_mmu.c
+diff --cc arch/x86/kvm/mmu/tdp_mmu.c
+index 97bb57fe39ca,dc9db5057f3b..000000000000
+--- a/arch/x86/kvm/mmu/tdp_mmu.c
++++ b/arch/x86/kvm/mmu/tdp_mmu.c
+@@@ -165,15 -195,35 +165,41 @@@ static struct kvm_mmu_page *alloc_tdp_m
+  
+  	sp = kvm_mmu_memory_cache_alloc(&vcpu->arch.mmu_page_header_cache);
+  	sp->spt = kvm_mmu_memory_cache_alloc(&vcpu->arch.mmu_shadow_page_cache);
+++<<<<<<< HEAD
+++=======
++ 
++ 	return sp;
++ }
++ 
++ static void tdp_mmu_init_sp(struct kvm_mmu_page *sp, tdp_ptep_t sptep,
++ 			    gfn_t gfn, union kvm_mmu_page_role role)
++ {
+++>>>>>>> c10743a1824b (KVM: x86/mmu: Zap only the target TDP MMU shadow page in NX recovery)
+  	set_page_private(virt_to_page(sp->spt), (unsigned long)sp);
+  
+ -	sp->role = role;
+ +	sp->role.word = page_role_for_level(vcpu, level).word;
+  	sp->gfn = gfn;
++ 	sp->ptep = sptep;
+  	sp->tdp_mmu_page = true;
+  
+  	trace_kvm_mmu_get_page(sp, true);
+ -}
+  
+++<<<<<<< HEAD
+ +	return sp;
+++=======
++ static void tdp_mmu_init_child_sp(struct kvm_mmu_page *child_sp,
++ 				  struct tdp_iter *iter)
++ {
++ 	struct kvm_mmu_page *parent_sp;
++ 	union kvm_mmu_page_role role;
++ 
++ 	parent_sp = sptep_to_sp(rcu_dereference(iter->sptep));
++ 
++ 	role = parent_sp->role;
++ 	role.level--;
++ 
++ 	tdp_mmu_init_sp(child_sp, iter->sptep, iter->gfn, role);
+++>>>>>>> c10743a1824b (KVM: x86/mmu: Zap only the target TDP MMU shadow page in NX recovery)
+  }
+  
+  hpa_t kvm_tdp_mmu_get_vcpu_root_hpa(struct kvm_vcpu *vcpu)
+@@@ -196,7 -244,9 +222,13 @@@
+  			goto out;
+  	}
+  
+++<<<<<<< HEAD
+ +	root = alloc_tdp_mmu_page(vcpu, 0, vcpu->arch.mmu->shadow_root_level);
+++=======
++ 	root = tdp_mmu_alloc_sp(vcpu);
++ 	tdp_mmu_init_sp(root, NULL, 0, role);
++ 
+++>>>>>>> c10743a1824b (KVM: x86/mmu: Zap only the target TDP MMU shadow page in NX recovery)
+  	refcount_set(&root->tdp_mmu_root_count, 1);
+  
+  	spin_lock(&kvm->arch.tdp_mmu_pages_lock);
+diff --git a/arch/x86/kvm/mmu/mmu_internal.h b/arch/x86/kvm/mmu/mmu_internal.h
+index a81dffc914d9..bcbfcbde87b9 100644
+--- a/arch/x86/kvm/mmu/mmu_internal.h
++++ b/arch/x86/kvm/mmu/mmu_internal.h
+@@ -30,6 +30,8 @@ extern bool dbg;
+ #define INVALID_PAE_ROOT	0
+ #define IS_VALID_PAE_ROOT(x)	(!!(x))
+ 
++typedef u64 __rcu *tdp_ptep_t;
++
+ struct kvm_mmu_page {
+ 	/*
+ 	 * Note, "link" through "spt" fit in a single 64 byte cache line on
+@@ -59,7 +61,10 @@ struct kvm_mmu_page {
+ 		refcount_t tdp_mmu_root_count;
+ 	};
+ 	unsigned int unsync_children;
+-	struct kvm_rmap_head parent_ptes; /* rmap pointers to parent sptes */
++	union {
++		struct kvm_rmap_head parent_ptes; /* rmap pointers to parent sptes */
++		tdp_ptep_t ptep;
++	};
+ 	DECLARE_BITMAP(unsync_child_bitmap, 512);
+ 
+ 	struct list_head lpage_disallowed_link;
+diff --git a/arch/x86/kvm/mmu/tdp_iter.h b/arch/x86/kvm/mmu/tdp_iter.h
+index a8673c625c04..57db3e1a2595 100644
+--- a/arch/x86/kvm/mmu/tdp_iter.h
++++ b/arch/x86/kvm/mmu/tdp_iter.h
+@@ -7,8 +7,6 @@
+ 
+ #include "mmu.h"
+ 
+-typedef u64 __rcu *tdp_ptep_t;
+-
+ /*
+  * TDP MMU SPTEs are RCU protected to allow paging structures (non-leaf SPTEs)
+  * to be zapped while holding mmu_lock for read.  Holding RCU isn't required for
+* Unmerged path arch/x86/kvm/mmu/tdp_mmu.c
+diff --git a/arch/x86/kvm/mmu/tdp_mmu.h b/arch/x86/kvm/mmu/tdp_mmu.h
+index e1f1ae8ec3e2..3eeddfe393c6 100644
+--- a/arch/x86/kvm/mmu/tdp_mmu.h
++++ b/arch/x86/kvm/mmu/tdp_mmu.h
+@@ -22,24 +22,8 @@ static inline bool kvm_tdp_mmu_zap_gfn_range(struct kvm *kvm, int as_id,
+ {
+ 	return __kvm_tdp_mmu_zap_gfn_range(kvm, as_id, start, end, true, flush);
+ }
+-static inline bool kvm_tdp_mmu_zap_sp(struct kvm *kvm, struct kvm_mmu_page *sp)
+-{
+-	gfn_t end = sp->gfn + KVM_PAGES_PER_HPAGE(sp->role.level + 1);
+-
+-	/*
+-	 * Don't allow yielding, as the caller may have a flush pending.  Note,
+-	 * if mmu_lock is held for write, zapping will never yield in this case,
+-	 * but explicitly disallow it for safety.  The TDP MMU does not yield
+-	 * until it has made forward progress (steps sideways), and when zapping
+-	 * a single shadow page that it's guaranteed to see (thus the mmu_lock
+-	 * requirement), its "step sideways" will always step beyond the bounds
+-	 * of the shadow page's gfn range and stop iterating before yielding.
+-	 */
+-	lockdep_assert_held_write(&kvm->mmu_lock);
+-	return __kvm_tdp_mmu_zap_gfn_range(kvm, kvm_mmu_page_as_id(sp),
+-					   sp->gfn, end, false, false);
+-}
+ 
++bool kvm_tdp_mmu_zap_sp(struct kvm *kvm, struct kvm_mmu_page *sp);
+ void kvm_tdp_mmu_zap_all(struct kvm *kvm);
+ void kvm_tdp_mmu_invalidate_all_roots(struct kvm *kvm);
+ void kvm_tdp_mmu_zap_invalidated_roots(struct kvm *kvm);
