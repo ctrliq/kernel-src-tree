@@ -1,0 +1,261 @@
+arm64: KVM: Add support for Stage-2 control of memory types and cacheability
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-147.el8
+commit-author Marc Zyngier <marc.zyngier@arm.com>
+commit e48d53a91f6e90873e21a5ca5e8c0d7a9f8936a4
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-147.el8/e48d53a9.failed
+
+Up to ARMv8.3, the combinaison of Stage-1 and Stage-2 attributes
+results in the strongest attribute of the two stages.  This means
+that the hypervisor has to perform quite a lot of cache maintenance
+just in case the guest has some non-cacheable mappings around.
+
+ARMv8.4 solves this problem by offering a different mode (FWB) where
+Stage-2 has total control over the memory attribute (this is limited
+to systems where both I/O and instruction fetches are coherent with
+the dcache). This is achieved by having a different set of memory
+attributes in the page tables, and a new bit set in HCR_EL2.
+
+On such a system, we can then safely sidestep any form of dcache
+management.
+
+	Acked-by: Catalin Marinas <catalin.marinas@arm.com>
+	Reviewed-by: Christoffer Dall <christoffer.dall@arm.com>
+	Signed-off-by: Marc Zyngier <marc.zyngier@arm.com>
+(cherry picked from commit e48d53a91f6e90873e21a5ca5e8c0d7a9f8936a4)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/arm64/include/asm/cpucaps.h
+#	arch/arm64/include/asm/pgtable-prot.h
+diff --cc arch/arm64/include/asm/cpucaps.h
+index c0f5aa4ec4c9,ed84d6536830..000000000000
+--- a/arch/arm64/include/asm/cpucaps.h
++++ b/arch/arm64/include/asm/cpucaps.h
+@@@ -49,9 -49,8 +49,15 @@@
+  #define ARM64_HAS_CACHE_DIC			28
+  #define ARM64_HW_DBM				29
+  #define ARM64_SSBD				30
+++<<<<<<< HEAD
+ +#define ARM64_HAS_SB				31
+ +#define ARM64_HAS_CNP				32
+ +
+ +#define ARM64_NCAPS				33
+++=======
++ #define ARM64_HAS_STAGE2_FWB			31
++ 
++ #define ARM64_NCAPS				32
+++>>>>>>> e48d53a91f6e (arm64: KVM: Add support for Stage-2 control of memory types and cacheability)
+  
+  #endif /* __ASM_CPUCAPS_H */
+diff --cc arch/arm64/include/asm/pgtable-prot.h
+index 3aacb66789cd,c66c3047400e..000000000000
+--- a/arch/arm64/include/asm/pgtable-prot.h
++++ b/arch/arm64/include/asm/pgtable-prot.h
+@@@ -67,18 -67,18 +67,33 @@@
+  #define PAGE_HYP_RO		__pgprot(_HYP_PAGE_DEFAULT | PTE_HYP | PTE_RDONLY | PTE_HYP_XN)
+  #define PAGE_HYP_DEVICE		__pgprot(PROT_DEVICE_nGnRE | PTE_HYP)
+  
+++<<<<<<< HEAD
+ +#define PAGE_S2_XN							\
+ +	({								\
+ +		u64 __val;						\
+ +		if (cpus_have_const_cap(ARM64_HAS_CACHE_DIC))		\
+ +			__val = 0;					\
+ +		else							\
+ +			__val = PTE_S2_XN;				\
+ +		__val;							\
+ +	})
+ +
+ +#define PAGE_S2			__pgprot(_PROT_DEFAULT | PTE_S2_MEMATTR(MT_S2_NORMAL) | PTE_S2_RDONLY | PAGE_S2_XN)
+ +#define PAGE_S2_DEVICE		__pgprot(_PROT_DEFAULT | PTE_S2_MEMATTR(MT_S2_DEVICE_nGnRE) | PTE_S2_RDONLY | PAGE_S2_XN)
+++=======
++ #define PAGE_S2_MEMATTR(attr)						\
++ 	({								\
++ 		u64 __val;						\
++ 		if (cpus_have_const_cap(ARM64_HAS_STAGE2_FWB))		\
++ 			__val = PTE_S2_MEMATTR(MT_S2_FWB_ ## attr);	\
++ 		else							\
++ 			__val = PTE_S2_MEMATTR(MT_S2_ ## attr);		\
++ 		__val;							\
++ 	 })
++ 
++ #define PAGE_S2			__pgprot(_PROT_DEFAULT | PAGE_S2_MEMATTR(NORMAL) | PTE_S2_RDONLY | PTE_S2_XN)
++ #define PAGE_S2_DEVICE		__pgprot(_PROT_DEFAULT | PAGE_S2_MEMATTR(DEVICE_nGnRE) | PTE_S2_RDONLY | PTE_S2_XN)
+++>>>>>>> e48d53a91f6e (arm64: KVM: Add support for Stage-2 control of memory types and cacheability)
+  
+  #define PAGE_NONE		__pgprot(((_PAGE_DEFAULT) & ~PTE_VALID) | PTE_PROT_NONE | PTE_RDONLY | PTE_NG | PTE_PXN | PTE_UXN)
+  #define PAGE_SHARED		__pgprot(_PAGE_DEFAULT | PTE_USER | PTE_NG | PTE_PXN | PTE_UXN | PTE_WRITE)
+* Unmerged path arch/arm64/include/asm/cpucaps.h
+diff --git a/arch/arm64/include/asm/kvm_arm.h b/arch/arm64/include/asm/kvm_arm.h
+index dd8f6599ede6..9c1a065b78ea 100644
+--- a/arch/arm64/include/asm/kvm_arm.h
++++ b/arch/arm64/include/asm/kvm_arm.h
+@@ -23,6 +23,7 @@
+ #include <asm/types.h>
+ 
+ /* Hyp Configuration Register (HCR) bits */
++#define HCR_FWB		(UL(1) << 46)
+ #define HCR_TEA		(UL(1) << 37)
+ #define HCR_TERR	(UL(1) << 36)
+ #define HCR_TLOR	(UL(1) << 35)
+diff --git a/arch/arm64/include/asm/kvm_emulate.h b/arch/arm64/include/asm/kvm_emulate.h
+index a71e5af816a9..bfefdd9a72eb 100644
+--- a/arch/arm64/include/asm/kvm_emulate.h
++++ b/arch/arm64/include/asm/kvm_emulate.h
+@@ -63,6 +63,8 @@ static inline void vcpu_reset_hcr(struct kvm_vcpu *vcpu)
+ 		/* trap error record accesses */
+ 		vcpu->arch.hcr_el2 |= HCR_TERR;
+ 	}
++	if (cpus_have_const_cap(ARM64_HAS_STAGE2_FWB))
++		vcpu->arch.hcr_el2 |= HCR_FWB;
+ 
+ 	if (test_bit(KVM_ARM_VCPU_EL1_32BIT, vcpu->arch.features))
+ 		vcpu->arch.hcr_el2 &= ~HCR_RW;
+diff --git a/arch/arm64/include/asm/kvm_mmu.h b/arch/arm64/include/asm/kvm_mmu.h
+index 94acbfa0650c..658657367f2f 100644
+--- a/arch/arm64/include/asm/kvm_mmu.h
++++ b/arch/arm64/include/asm/kvm_mmu.h
+@@ -273,6 +273,15 @@ static inline void __clean_dcache_guest_page(kvm_pfn_t pfn, unsigned long size)
+ {
+ 	void *va = page_address(pfn_to_page(pfn));
+ 
++	/*
++	 * With FWB, we ensure that the guest always accesses memory using
++	 * cacheable attributes, and we don't have to clean to PoC when
++	 * faulting in pages. Furthermore, FWB implies IDC, so cleaning to
++	 * PoU is not required either in this case.
++	 */
++	if (cpus_have_const_cap(ARM64_HAS_STAGE2_FWB))
++		return;
++
+ 	kvm_flush_dcache_to_poc(va, size);
+ }
+ 
+@@ -293,20 +302,26 @@ static inline void __invalidate_icache_guest_page(kvm_pfn_t pfn,
+ 
+ static inline void __kvm_flush_dcache_pte(pte_t pte)
+ {
+-	struct page *page = pte_page(pte);
+-	kvm_flush_dcache_to_poc(page_address(page), PAGE_SIZE);
++	if (!cpus_have_const_cap(ARM64_HAS_STAGE2_FWB)) {
++		struct page *page = pte_page(pte);
++		kvm_flush_dcache_to_poc(page_address(page), PAGE_SIZE);
++	}
+ }
+ 
+ static inline void __kvm_flush_dcache_pmd(pmd_t pmd)
+ {
+-	struct page *page = pmd_page(pmd);
+-	kvm_flush_dcache_to_poc(page_address(page), PMD_SIZE);
++	if (!cpus_have_const_cap(ARM64_HAS_STAGE2_FWB)) {
++		struct page *page = pmd_page(pmd);
++		kvm_flush_dcache_to_poc(page_address(page), PMD_SIZE);
++	}
+ }
+ 
+ static inline void __kvm_flush_dcache_pud(pud_t pud)
+ {
+-	struct page *page = pud_page(pud);
+-	kvm_flush_dcache_to_poc(page_address(page), PUD_SIZE);
++	if (!cpus_have_const_cap(ARM64_HAS_STAGE2_FWB)) {
++		struct page *page = pud_page(pud);
++		kvm_flush_dcache_to_poc(page_address(page), PUD_SIZE);
++	}
+ }
+ 
+ #define kvm_virt_to_phys(x)		__pa_symbol(x)
+diff --git a/arch/arm64/include/asm/memory.h b/arch/arm64/include/asm/memory.h
+index 1a0e7a1143b7..b7150fef76ed 100644
+--- a/arch/arm64/include/asm/memory.h
++++ b/arch/arm64/include/asm/memory.h
+@@ -161,6 +161,13 @@
+ #define MT_S2_NORMAL		0xf
+ #define MT_S2_DEVICE_nGnRE	0x1
+ 
++/*
++ * Memory types for Stage-2 translation when ID_AA64MMFR2_EL1.FWB is 0001
++ * Stage-2 enforces Normal-WB and Device-nGnRE
++ */
++#define MT_S2_FWB_NORMAL	6
++#define MT_S2_FWB_DEVICE_nGnRE	1
++
+ #ifdef CONFIG_ARM64_4K_PAGES
+ #define IOREMAP_MAX_ORDER	(PUD_SHIFT)
+ #else
+* Unmerged path arch/arm64/include/asm/pgtable-prot.h
+diff --git a/arch/arm64/include/asm/sysreg.h b/arch/arm64/include/asm/sysreg.h
+index e67315411175..57f985ff73ef 100644
+--- a/arch/arm64/include/asm/sysreg.h
++++ b/arch/arm64/include/asm/sysreg.h
+@@ -584,6 +584,7 @@
+ #define ID_AA64MMFR1_VMIDBITS_16	2
+ 
+ /* id_aa64mmfr2 */
++#define ID_AA64MMFR2_FWB_SHIFT		40
+ #define ID_AA64MMFR2_AT_SHIFT		32
+ #define ID_AA64MMFR2_LVA_SHIFT		16
+ #define ID_AA64MMFR2_IESB_SHIFT		12
+diff --git a/arch/arm64/kernel/cpufeature.c b/arch/arm64/kernel/cpufeature.c
+index 4fd8bef7fbf9..5bf4258142d9 100644
+--- a/arch/arm64/kernel/cpufeature.c
++++ b/arch/arm64/kernel/cpufeature.c
+@@ -195,6 +195,7 @@ static const struct arm64_ftr_bits ftr_id_aa64mmfr1[] = {
+ };
+ 
+ static const struct arm64_ftr_bits ftr_id_aa64mmfr2[] = {
++	ARM64_FTR_BITS(FTR_HIDDEN, FTR_STRICT, FTR_LOWER_SAFE, ID_AA64MMFR2_FWB_SHIFT, 4, 0),
+ 	ARM64_FTR_BITS(FTR_VISIBLE, FTR_STRICT, FTR_LOWER_SAFE, ID_AA64MMFR2_AT_SHIFT, 4, 0),
+ 	ARM64_FTR_BITS(FTR_HIDDEN, FTR_STRICT, FTR_LOWER_SAFE, ID_AA64MMFR2_LVA_SHIFT, 4, 0),
+ 	ARM64_FTR_BITS(FTR_HIDDEN, FTR_STRICT, FTR_LOWER_SAFE, ID_AA64MMFR2_IESB_SHIFT, 4, 0),
+@@ -1043,6 +1044,14 @@ static void cpu_copy_el2regs(const struct arm64_cpu_capabilities *__unused)
+ }
+ #endif
+ 
++static void cpu_has_fwb(const struct arm64_cpu_capabilities *__unused)
++{
++	u64 val = read_sysreg_s(SYS_CLIDR_EL1);
++
++	/* Check that CLIDR_EL1.LOU{U,IS} are both 0 */
++	WARN_ON(val & (7 << 27 | 7 << 21));
++}
++
+ static const struct arm64_cpu_capabilities arm64_features[] = {
+ 	{
+ 		.desc = "GIC system register CPU interface",
+@@ -1199,6 +1208,17 @@ static const struct arm64_cpu_capabilities arm64_features[] = {
+ 		.type = ARM64_CPUCAP_SYSTEM_FEATURE,
+ 		.matches = has_cache_dic,
+ 	},
++	{
++		.desc = "Stage-2 Force Write-Back",
++		.type = ARM64_CPUCAP_SYSTEM_FEATURE,
++		.capability = ARM64_HAS_STAGE2_FWB,
++		.sys_reg = SYS_ID_AA64MMFR2_EL1,
++		.sign = FTR_UNSIGNED,
++		.field_pos = ID_AA64MMFR2_FWB_SHIFT,
++		.min_field_value = 1,
++		.matches = has_cpuid_feature,
++		.cpu_enable = cpu_has_fwb,
++	},
+ #ifdef CONFIG_ARM64_HW_AFDBM
+ 	{
+ 		/*
+diff --git a/virt/kvm/arm/mmu.c b/virt/kvm/arm/mmu.c
+index 64e3ad410529..861ce9a8f3f8 100644
+--- a/virt/kvm/arm/mmu.c
++++ b/virt/kvm/arm/mmu.c
+@@ -224,6 +224,10 @@ static inline void kvm_pgd_populate(pgd_t *pgdp, pud_t *pudp)
+  * This is why right after unmapping a page/section and invalidating
+  * the corresponding TLBs, we call kvm_flush_dcache_p*() to make sure
+  * the IO subsystem will never hit in the cache.
++ *
++ * This is all avoided on systems that have ARM64_HAS_STAGE2_FWB, as
++ * we then fully enforce cacheability of RAM, no matter what the guest
++ * does.
+  */
+ static void unmap_stage2_ptes(struct kvm *kvm, pmd_t *pmd,
+ 		       phys_addr_t addr, phys_addr_t end)
