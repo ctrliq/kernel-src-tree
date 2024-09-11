@@ -1,0 +1,101 @@
+__netif_receive_skb_core: don't untag vlan from skb on DSA master
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-358.el8
+commit-author Vladimir Oltean <olteanv@gmail.com>
+commit b14a9fc45202c37a8540e1afb26b4783666a60c1
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-358.el8/b14a9fc4.failed
+
+A DSA master interface has upper network devices, each representing an
+Ethernet switch port attached to it. Demultiplexing the source ports and
+setting skb->dev accordingly is done through the catch-all ETH_P_XDSA
+packet_type handler. Catch-all because DSA vendors have various header
+implementations, which can be placed anywhere in the frame: before the
+DMAC, before the EtherType, before the FCS, etc. So, the ETH_P_XDSA
+handler acts like an rx_handler more than anything.
+
+It is unlikely for the DSA master interface to have any other upper than
+the DSA switch interfaces themselves. Only maybe a bridge upper*, but it
+is very likely that the DSA master will have no 8021q upper. So
+__netif_receive_skb_core() will try to untag the VLAN, despite the fact
+that the DSA switch interface might have an 8021q upper. So the skb will
+never reach that.
+
+So far, this hasn't been a problem because most of the possible
+placements of the DSA switch header mentioned in the first paragraph
+will displace the VLAN header when the DSA master receives the frame, so
+__netif_receive_skb_core() will not actually execute any VLAN-specific
+code for it. This only becomes a problem when the DSA switch header does
+not displace the VLAN header (for example with a tail tag).
+
+What the patch does is it bypasses the untagging of the skb when there
+is a DSA switch attached to this net device. So, DSA is the only
+packet_type handler which requires seeing the VLAN header. Once skb->dev
+will be changed, __netif_receive_skb_core() will be invoked again and
+untagging, or delivery to an 8021q upper, will happen in the RX of the
+DSA switch interface itself.
+
+*see commit 9eb8eff0cf2f ("net: bridge: allow enslaving some DSA master
+network devices". This is actually the reason why I prefer keeping DSA
+as a packet_type handler of ETH_P_XDSA rather than converting to an
+rx_handler. Currently the rx_handler code doesn't support chaining, and
+this is a problem because a DSA master might be bridged.
+
+	Signed-off-by: Vladimir Oltean <olteanv@gmail.com>
+	Reviewed-by: Florian Fainelli <f.fainelli@gmail.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit b14a9fc45202c37a8540e1afb26b4783666a60c1)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/core/dev.c
+diff --cc net/core/dev.c
+index 9df004389465,10767ce2bf69..000000000000
+--- a/net/core/dev.c
++++ b/net/core/dev.c
+@@@ -5280,9 -5193,37 +5281,18 @@@ skip_classify
+  		}
+  	}
+  
+++<<<<<<< HEAD
+ +	if (unlikely(skb_vlan_tag_present(skb))) {
+ +		if (skb_vlan_tag_get_id(skb))
+++=======
++ 	if (unlikely(skb_vlan_tag_present(skb)) && !netdev_uses_dsa(skb->dev)) {
++ check_vlan_id:
++ 		if (skb_vlan_tag_get_id(skb)) {
++ 			/* Vlan id is non 0 and vlan_do_receive() above couldn't
++ 			 * find vlan device.
++ 			 */
+++>>>>>>> b14a9fc45202 (__netif_receive_skb_core: don't untag vlan from skb on DSA master)
+  			skb->pkt_type = PACKET_OTHERHOST;
+ -		} else if (skb->protocol == cpu_to_be16(ETH_P_8021Q) ||
+ -			   skb->protocol == cpu_to_be16(ETH_P_8021AD)) {
+ -			/* Outer header is 802.1P with vlan 0, inner header is
+ -			 * 802.1Q or 802.1AD and vlan_do_receive() above could
+ -			 * not find vlan dev for vlan id 0.
+ -			 */
+ -			__vlan_hwaccel_clear_tag(skb);
+ -			skb = skb_vlan_untag(skb);
+ -			if (unlikely(!skb))
+ -				goto out;
+ -			if (vlan_do_receive(&skb))
+ -				/* After stripping off 802.1P header with vlan 0
+ -				 * vlan dev is found for inner header.
+ -				 */
+ -				goto another_round;
+ -			else if (unlikely(!skb))
+ -				goto out;
+ -			else
+ -				/* We have stripped outer 802.1P vlan 0 header.
+ -				 * But could not find vlan dev.
+ -				 * check again for vlan id to set OTHERHOST.
+ -				 */
+ -				goto check_vlan_id;
+ -		}
+  		/* Note: we might in the future use prio bits
+  		 * and set skb->priority like in vlan_do_receive()
+  		 * For the time being, just ignore Priority Code Point
+* Unmerged path net/core/dev.c
