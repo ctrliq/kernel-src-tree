@@ -1,0 +1,492 @@
+libbpf: Always specify expected_attach_type on program load if supported
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Andrii Nakryiko <andriin@fb.com>
+commit 25498a1969bf3687c29c29bbac92821d7a0f8b4a
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/25498a19.failed
+
+For some types of BPF programs that utilize expected_attach_type, libbpf won't
+set load_attr.expected_attach_type, even if expected_attach_type is known from
+section definition. This was done to preserve backwards compatibility with old
+kernels that didn't recognize expected_attach_type attribute yet (which was
+added in 5e43f899b03a ("bpf: Check attach type at prog load time"). But this
+is problematic for some BPF programs that utilize newer features that require
+kernel to know specific expected_attach_type (e.g., extended set of return
+codes for cgroup_skb/egress programs).
+
+This patch makes libbpf specify expected_attach_type by default, but also
+detect support for this field in kernel and not set it during program load.
+This allows to have a good metadata for bpf_program
+(e.g., bpf_program__get_extected_attach_type()), but still work with old
+kernels (for cases where it can work at all).
+
+Additionally, due to expected_attach_type being always set for recognized
+program types, bpf_program__attach_cgroup doesn't have to do extra checks to
+determine correct attach type, so remove that additional logic.
+
+Also adjust section_names selftest to account for this change.
+
+More detailed discussion can be found in [0].
+
+  [0] https://lore.kernel.org/bpf/20200412003604.GA15986@rdna-mbp.dhcp.thefacebook.com/
+
+Fixes: 5cf1e9145630 ("bpf: cgroup inet skb programs can return 0 to 3")
+Fixes: 5e43f899b03a ("bpf: Check attach type at prog load time")
+	Reported-by: Andrey Ignatov <rdna@fb.com>
+	Signed-off-by: Andrii Nakryiko <andriin@fb.com>
+	Signed-off-by: Daniel Borkmann <daniel@iogearbox.net>
+	Acked-by: Song Liu <songliubraving@fb.com>
+	Acked-by: Andrey Ignatov <rdna@fb.com>
+Link: https://lore.kernel.org/bpf/20200414182645.1368174-1-andriin@fb.com
+(cherry picked from commit 25498a1969bf3687c29c29bbac92821d7a0f8b4a)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	tools/lib/bpf/libbpf.c
+diff --cc tools/lib/bpf/libbpf.c
+index 7277de638c6d,8f480e29a6b0..000000000000
+--- a/tools/lib/bpf/libbpf.c
++++ b/tools/lib/bpf/libbpf.c
+@@@ -172,6 -176,40 +172,43 @@@ struct bpf_capabilities 
+  	__u32 btf_datasec:1;
+  	/* BPF_F_MMAPABLE is supported for arrays */
+  	__u32 array_mmap:1;
+++<<<<<<< HEAD
+++=======
++ 	/* BTF_FUNC_GLOBAL is supported */
++ 	__u32 btf_func_global:1;
++ 	/* kernel support for expected_attach_type in BPF_PROG_LOAD */
++ 	__u32 exp_attach_type:1;
++ };
++ 
++ enum reloc_type {
++ 	RELO_LD64,
++ 	RELO_CALL,
++ 	RELO_DATA,
++ 	RELO_EXTERN,
++ };
++ 
++ struct reloc_desc {
++ 	enum reloc_type type;
++ 	int insn_idx;
++ 	int map_idx;
++ 	int sym_off;
+++>>>>>>> 25498a1969bf (libbpf: Always specify expected_attach_type on program load if supported)
++ };
++ 
++ struct bpf_sec_def;
++ 
++ typedef struct bpf_link *(*attach_fn_t)(const struct bpf_sec_def *sec,
++ 					struct bpf_program *prog);
++ 
++ struct bpf_sec_def {
++ 	const char *sec;
++ 	size_t len;
++ 	enum bpf_prog_type prog_type;
++ 	enum bpf_attach_type expected_attach_type;
++ 	bool is_exp_attach_type_optional;
++ 	bool is_attachable;
++ 	bool is_attach_btf;
++ 	attach_fn_t attach_fn;
+  };
+  
+  /*
+@@@ -2247,8 -3372,10 +2316,9 @@@ bpf_object__probe_caps(struct bpf_objec
+  		bpf_object__probe_name,
+  		bpf_object__probe_global_data,
+  		bpf_object__probe_btf_func,
+ -		bpf_object__probe_btf_func_global,
+  		bpf_object__probe_btf_datasec,
+  		bpf_object__probe_array_mmap,
++ 		bpf_object__probe_exp_attach_type,
+  	};
+  	int i, ret;
+  
+@@@ -3998,16 -5118,16 +4073,18 @@@ bpf_object__load_progs(struct bpf_objec
+  	return 0;
+  }
+  
++ static const struct bpf_sec_def *find_sec_def(const char *sec_name);
++ 
+  static struct bpf_object *
+  __bpf_object__open(const char *path, const void *obj_buf, size_t obj_buf_sz,
+ -		   const struct bpf_object_open_opts *opts)
+ +		   struct bpf_object_open_opts *opts)
+  {
+ -	const char *obj_name, *kconfig;
+ +	const char *pin_root_path;
+  	struct bpf_program *prog;
+  	struct bpf_object *obj;
+ +	const char *obj_name;
+  	char tmp_name[64];
+ +	bool relaxed_maps;
+  	int err;
+  
+  	if (elf_version(EV_CURRENT) == EV_NONE) {
+@@@ -4048,19 -5175,18 +4125,32 @@@
+  	bpf_object__elf_finish(obj);
+  
+  	bpf_object__for_each_program(prog, obj) {
+++<<<<<<< HEAD
+ +		enum bpf_prog_type prog_type;
+ +		enum bpf_attach_type attach_type;
+ +
+ +		err = libbpf_prog_type_by_name(prog->section_name, &prog_type,
+ +					       &attach_type);
+ +		if (err == -ESRCH)
+++=======
++ 		prog->sec_def = find_sec_def(prog->section_name);
++ 		if (!prog->sec_def)
+++>>>>>>> 25498a1969bf (libbpf: Always specify expected_attach_type on program load if supported)
+  			/* couldn't guess, but user might manually specify */
+  			continue;
+- 		if (err)
+- 			goto out;
+  
+++<<<<<<< HEAD
+ +		bpf_program__set_type(prog, prog_type);
+ +		bpf_program__set_expected_attach_type(prog, attach_type);
+++=======
++ 		bpf_program__set_type(prog, prog->sec_def->prog_type);
++ 		bpf_program__set_expected_attach_type(prog,
++ 				prog->sec_def->expected_attach_type);
++ 
++ 		if (prog->sec_def->prog_type == BPF_PROG_TYPE_TRACING ||
++ 		    prog->sec_def->prog_type == BPF_PROG_TYPE_EXT)
++ 			prog->attach_prog_fd = OPTS_GET(opts, attach_prog_fd, 0);
+++>>>>>>> 25498a1969bf (libbpf: Always specify expected_attach_type on program load if supported)
+  	}
+  
+  	return obj;
+@@@ -5039,30 -6295,43 +5138,57 @@@ void bpf_program__set_expected_attach_t
+  
+  /* Programs that must specify expected attach type at load time. */
+  #define BPF_EAPROG_SEC(string, ptype, eatype) \
+- 	BPF_PROG_SEC_IMPL(string, ptype, eatype, 1, 0, eatype)
++ 	BPF_PROG_SEC_IMPL(string, ptype, eatype, false, 1, 0)
+  
+  /* Programs that use BTF to identify attach point */
+++<<<<<<< HEAD
+ +#define BPF_PROG_BTF(string, ptype) BPF_PROG_SEC_IMPL(string, ptype, 0, 0, 1, 0)
+++=======
++ #define BPF_PROG_BTF(string, ptype, eatype) \
++ 	BPF_PROG_SEC_IMPL(string, ptype, eatype, false, 0, 1)
+++>>>>>>> 25498a1969bf (libbpf: Always specify expected_attach_type on program load if supported)
+  
+  /* Programs that can be attached but attach type can't be identified by section
+   * name. Kept for backward compatibility.
+   */
+  #define BPF_APROG_COMPAT(string, ptype) BPF_PROG_SEC(string, ptype)
+  
+++<<<<<<< HEAD
+ +static const struct {
+ +	const char *sec;
+ +	size_t len;
+ +	enum bpf_prog_type prog_type;
+ +	enum bpf_attach_type expected_attach_type;
+ +	bool is_attachable;
+ +	bool is_attach_btf;
+ +	enum bpf_attach_type attach_type;
+ +} section_names[] = {
+++=======
++ #define SEC_DEF(sec_pfx, ptype, ...) {					    \
++ 	.sec = sec_pfx,							    \
++ 	.len = sizeof(sec_pfx) - 1,					    \
++ 	.prog_type = BPF_PROG_TYPE_##ptype,				    \
++ 	__VA_ARGS__							    \
++ }
++ 
++ static struct bpf_link *attach_kprobe(const struct bpf_sec_def *sec,
++ 				      struct bpf_program *prog);
++ static struct bpf_link *attach_tp(const struct bpf_sec_def *sec,
++ 				  struct bpf_program *prog);
++ static struct bpf_link *attach_raw_tp(const struct bpf_sec_def *sec,
++ 				      struct bpf_program *prog);
++ static struct bpf_link *attach_trace(const struct bpf_sec_def *sec,
++ 				     struct bpf_program *prog);
++ static struct bpf_link *attach_lsm(const struct bpf_sec_def *sec,
++ 				   struct bpf_program *prog);
++ 
++ static const struct bpf_sec_def section_defs[] = {
+++>>>>>>> 25498a1969bf (libbpf: Always specify expected_attach_type on program load if supported)
+  	BPF_PROG_SEC("socket",			BPF_PROG_TYPE_SOCKET_FILTER),
+  	BPF_PROG_SEC("sk_reuseport",		BPF_PROG_TYPE_SK_REUSEPORT),
+ -	SEC_DEF("kprobe/", KPROBE,
+ -		.attach_fn = attach_kprobe),
+ +	BPF_PROG_SEC("kprobe/",			BPF_PROG_TYPE_KPROBE),
+  	BPF_PROG_SEC("uprobe/",			BPF_PROG_TYPE_KPROBE),
+ -	SEC_DEF("kretprobe/", KPROBE,
+ -		.attach_fn = attach_kprobe),
+ +	BPF_PROG_SEC("kretprobe/",		BPF_PROG_TYPE_KPROBE),
+  	BPF_PROG_SEC("uretprobe/",		BPF_PROG_TYPE_KPROBE),
+  	BPF_PROG_SEC("classifier",		BPF_PROG_TYPE_SCHED_CLS),
+  	BPF_PROG_SEC("action",			BPF_PROG_TYPE_SCHED_ACT),
+@@@ -5217,18 -6752,18 +5343,22 @@@ int libbpf_attach_type_by_name(const ch
+  	if (!name)
+  		return -EINVAL;
+  
+ -	for (i = 0; i < ARRAY_SIZE(section_defs); i++) {
+ -		if (strncmp(name, section_defs[i].sec, section_defs[i].len))
+ +	for (i = 0; i < ARRAY_SIZE(section_names); i++) {
+ +		if (strncmp(name, section_names[i].sec, section_names[i].len))
+  			continue;
+ -		if (!section_defs[i].is_attachable)
+ +		if (!section_names[i].is_attachable)
+  			return -EINVAL;
+++<<<<<<< HEAD
+ +		*attach_type = section_names[i].attach_type;
+++=======
++ 		*attach_type = section_defs[i].expected_attach_type;
+++>>>>>>> 25498a1969bf (libbpf: Always specify expected_attach_type on program load if supported)
+  		return 0;
+  	}
+ -	pr_debug("failed to guess attach type based on ELF section name '%s'\n", name);
+ +	pr_warn("failed to guess attach type based on ELF section name '%s'\n", name);
+  	type_names = libbpf_get_type_names(true);
+  	if (type_names != NULL) {
+ -		pr_debug("attachable section(type) names are:%s\n", type_names);
+ +		pr_info("attachable section(type) names are:%s\n", type_names);
+  		free(type_names);
+  	}
+  
+@@@ -5833,6 -7521,164 +5963,127 @@@ struct bpf_link *bpf_program__attach_ra
+  	return (struct bpf_link *)link;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ struct bpf_link *bpf_program__attach_trace(struct bpf_program *prog)
++ {
++ 	return bpf_program__attach_btf_id(prog);
++ }
++ 
++ struct bpf_link *bpf_program__attach_lsm(struct bpf_program *prog)
++ {
++ 	return bpf_program__attach_btf_id(prog);
++ }
++ 
++ static struct bpf_link *attach_trace(const struct bpf_sec_def *sec,
++ 				     struct bpf_program *prog)
++ {
++ 	return bpf_program__attach_trace(prog);
++ }
++ 
++ static struct bpf_link *attach_lsm(const struct bpf_sec_def *sec,
++ 				   struct bpf_program *prog)
++ {
++ 	return bpf_program__attach_lsm(prog);
++ }
++ 
++ struct bpf_link *
++ bpf_program__attach_cgroup(struct bpf_program *prog, int cgroup_fd)
++ {
++ 	enum bpf_attach_type attach_type;
++ 	char errmsg[STRERR_BUFSIZE];
++ 	struct bpf_link *link;
++ 	int prog_fd, link_fd;
++ 
++ 	prog_fd = bpf_program__fd(prog);
++ 	if (prog_fd < 0) {
++ 		pr_warn("program '%s': can't attach before loaded\n",
++ 			bpf_program__title(prog, false));
++ 		return ERR_PTR(-EINVAL);
++ 	}
++ 
++ 	link = calloc(1, sizeof(*link));
++ 	if (!link)
++ 		return ERR_PTR(-ENOMEM);
++ 	link->detach = &bpf_link__detach_fd;
++ 
++ 	attach_type = bpf_program__get_expected_attach_type(prog);
++ 	link_fd = bpf_link_create(prog_fd, cgroup_fd, attach_type, NULL);
++ 	if (link_fd < 0) {
++ 		link_fd = -errno;
++ 		free(link);
++ 		pr_warn("program '%s': failed to attach to cgroup: %s\n",
++ 			bpf_program__title(prog, false),
++ 			libbpf_strerror_r(link_fd, errmsg, sizeof(errmsg)));
++ 		return ERR_PTR(link_fd);
++ 	}
++ 	link->fd = link_fd;
++ 	return link;
++ }
++ 
++ struct bpf_link *bpf_program__attach(struct bpf_program *prog)
++ {
++ 	const struct bpf_sec_def *sec_def;
++ 
++ 	sec_def = find_sec_def(bpf_program__title(prog, false));
++ 	if (!sec_def || !sec_def->attach_fn)
++ 		return ERR_PTR(-ESRCH);
++ 
++ 	return sec_def->attach_fn(sec_def, prog);
++ }
++ 
++ static int bpf_link__detach_struct_ops(struct bpf_link *link)
++ {
++ 	__u32 zero = 0;
++ 
++ 	if (bpf_map_delete_elem(link->fd, &zero))
++ 		return -errno;
++ 
++ 	return 0;
++ }
++ 
++ struct bpf_link *bpf_map__attach_struct_ops(struct bpf_map *map)
++ {
++ 	struct bpf_struct_ops *st_ops;
++ 	struct bpf_link *link;
++ 	__u32 i, zero = 0;
++ 	int err;
++ 
++ 	if (!bpf_map__is_struct_ops(map) || map->fd == -1)
++ 		return ERR_PTR(-EINVAL);
++ 
++ 	link = calloc(1, sizeof(*link));
++ 	if (!link)
++ 		return ERR_PTR(-EINVAL);
++ 
++ 	st_ops = map->st_ops;
++ 	for (i = 0; i < btf_vlen(st_ops->type); i++) {
++ 		struct bpf_program *prog = st_ops->progs[i];
++ 		void *kern_data;
++ 		int prog_fd;
++ 
++ 		if (!prog)
++ 			continue;
++ 
++ 		prog_fd = bpf_program__fd(prog);
++ 		kern_data = st_ops->kern_vdata + st_ops->kern_func_off[i];
++ 		*(unsigned long *)kern_data = prog_fd;
++ 	}
++ 
++ 	err = bpf_map_update_elem(map->fd, &zero, st_ops->kern_vdata, 0);
++ 	if (err) {
++ 		err = -errno;
++ 		free(link);
++ 		return ERR_PTR(err);
++ 	}
++ 
++ 	link->detach = bpf_link__detach_struct_ops;
++ 	link->fd = map->fd;
++ 
++ 	return link;
++ }
++ 
+++>>>>>>> 25498a1969bf (libbpf: Always specify expected_attach_type on program load if supported)
+  enum bpf_perf_event_ret
+  bpf_perf_event_read_simple(void *mmap_mem, size_t mmap_size, size_t page_size,
+  			   void **copy_mem, size_t *copy_size,
+* Unmerged path tools/lib/bpf/libbpf.c
+diff --git a/tools/testing/selftests/bpf/prog_tests/section_names.c b/tools/testing/selftests/bpf/prog_tests/section_names.c
+index 9d9351dc2ded..713167449c98 100644
+--- a/tools/testing/selftests/bpf/prog_tests/section_names.c
++++ b/tools/testing/selftests/bpf/prog_tests/section_names.c
+@@ -43,18 +43,18 @@ static struct sec_name_test tests[] = {
+ 	{"lwt_seg6local", {0, BPF_PROG_TYPE_LWT_SEG6LOCAL, 0}, {-EINVAL, 0} },
+ 	{
+ 		"cgroup_skb/ingress",
+-		{0, BPF_PROG_TYPE_CGROUP_SKB, 0},
++		{0, BPF_PROG_TYPE_CGROUP_SKB, BPF_CGROUP_INET_INGRESS},
+ 		{0, BPF_CGROUP_INET_INGRESS},
+ 	},
+ 	{
+ 		"cgroup_skb/egress",
+-		{0, BPF_PROG_TYPE_CGROUP_SKB, 0},
++		{0, BPF_PROG_TYPE_CGROUP_SKB, BPF_CGROUP_INET_EGRESS},
+ 		{0, BPF_CGROUP_INET_EGRESS},
+ 	},
+ 	{"cgroup/skb", {0, BPF_PROG_TYPE_CGROUP_SKB, 0}, {-EINVAL, 0} },
+ 	{
+ 		"cgroup/sock",
+-		{0, BPF_PROG_TYPE_CGROUP_SOCK, 0},
++		{0, BPF_PROG_TYPE_CGROUP_SOCK, BPF_CGROUP_INET_SOCK_CREATE},
+ 		{0, BPF_CGROUP_INET_SOCK_CREATE},
+ 	},
+ 	{
+@@ -69,26 +69,38 @@ static struct sec_name_test tests[] = {
+ 	},
+ 	{
+ 		"cgroup/dev",
+-		{0, BPF_PROG_TYPE_CGROUP_DEVICE, 0},
++		{0, BPF_PROG_TYPE_CGROUP_DEVICE, BPF_CGROUP_DEVICE},
+ 		{0, BPF_CGROUP_DEVICE},
+ 	},
+-	{"sockops", {0, BPF_PROG_TYPE_SOCK_OPS, 0}, {0, BPF_CGROUP_SOCK_OPS} },
++	{
++		"sockops",
++		{0, BPF_PROG_TYPE_SOCK_OPS, BPF_CGROUP_SOCK_OPS},
++		{0, BPF_CGROUP_SOCK_OPS},
++	},
+ 	{
+ 		"sk_skb/stream_parser",
+-		{0, BPF_PROG_TYPE_SK_SKB, 0},
++		{0, BPF_PROG_TYPE_SK_SKB, BPF_SK_SKB_STREAM_PARSER},
+ 		{0, BPF_SK_SKB_STREAM_PARSER},
+ 	},
+ 	{
+ 		"sk_skb/stream_verdict",
+-		{0, BPF_PROG_TYPE_SK_SKB, 0},
++		{0, BPF_PROG_TYPE_SK_SKB, BPF_SK_SKB_STREAM_VERDICT},
+ 		{0, BPF_SK_SKB_STREAM_VERDICT},
+ 	},
+ 	{"sk_skb", {0, BPF_PROG_TYPE_SK_SKB, 0}, {-EINVAL, 0} },
+-	{"sk_msg", {0, BPF_PROG_TYPE_SK_MSG, 0}, {0, BPF_SK_MSG_VERDICT} },
+-	{"lirc_mode2", {0, BPF_PROG_TYPE_LIRC_MODE2, 0}, {0, BPF_LIRC_MODE2} },
++	{
++		"sk_msg",
++		{0, BPF_PROG_TYPE_SK_MSG, BPF_SK_MSG_VERDICT},
++		{0, BPF_SK_MSG_VERDICT},
++	},
++	{
++		"lirc_mode2",
++		{0, BPF_PROG_TYPE_LIRC_MODE2, BPF_LIRC_MODE2},
++		{0, BPF_LIRC_MODE2},
++	},
+ 	{
+ 		"flow_dissector",
+-		{0, BPF_PROG_TYPE_FLOW_DISSECTOR, 0},
++		{0, BPF_PROG_TYPE_FLOW_DISSECTOR, BPF_FLOW_DISSECTOR},
+ 		{0, BPF_FLOW_DISSECTOR},
+ 	},
+ 	{
+@@ -158,17 +170,17 @@ static void test_prog_type_by_name(const struct sec_name_test *test)
+ 				      &expected_attach_type);
+ 
+ 	CHECK(rc != test->expected_load.rc, "check_code",
+-	      "prog: unexpected rc=%d for %s", rc, test->sec_name);
++	      "prog: unexpected rc=%d for %s\n", rc, test->sec_name);
+ 
+ 	if (rc)
+ 		return;
+ 
+ 	CHECK(prog_type != test->expected_load.prog_type, "check_prog_type",
+-	      "prog: unexpected prog_type=%d for %s",
++	      "prog: unexpected prog_type=%d for %s\n",
+ 	      prog_type, test->sec_name);
+ 
+ 	CHECK(expected_attach_type != test->expected_load.expected_attach_type,
+-	      "check_attach_type", "prog: unexpected expected_attach_type=%d for %s",
++	      "check_attach_type", "prog: unexpected expected_attach_type=%d for %s\n",
+ 	      expected_attach_type, test->sec_name);
+ }
+ 
+@@ -180,13 +192,13 @@ static void test_attach_type_by_name(const struct sec_name_test *test)
+ 	rc = libbpf_attach_type_by_name(test->sec_name, &attach_type);
+ 
+ 	CHECK(rc != test->expected_attach.rc, "check_ret",
+-	      "attach: unexpected rc=%d for %s", rc, test->sec_name);
++	      "attach: unexpected rc=%d for %s\n", rc, test->sec_name);
+ 
+ 	if (rc)
+ 		return;
+ 
+ 	CHECK(attach_type != test->expected_attach.attach_type,
+-	      "check_attach_type", "attach: unexpected attach_type=%d for %s",
++	      "check_attach_type", "attach: unexpected attach_type=%d for %s\n",
+ 	      attach_type, test->sec_name);
+ }
+ 
