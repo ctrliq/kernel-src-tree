@@ -1,0 +1,153 @@
+net: bridge: mcast: Associate the seqcount with its protecting lock.
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-358.el8
+commit-author Thomas Gleixner <tglx@linutronix.de>
+commit f936bb42aeb94a069bec7c9e04100d199c372956
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-358.el8/f936bb42.failed
+
+The sequence count bridge_mcast_querier::seq is protected by
+net_bridge::multicast_lock but seqcount_init() does not associate the
+seqcount with the lock. This leads to a warning on PREEMPT_RT because
+preemption is still enabled.
+
+Let seqcount_init() associate the seqcount with lock that protects the
+write section. Remove lockdep_assert_held_once() because lockdep already checks
+whether the associated lock is held.
+
+Fixes: 67b746f94ff39 ("net: bridge: mcast: make sure querier port/address updates are consistent")
+	Reported-by: Mike Galbraith <efault@gmx.de>
+	Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+	Signed-off-by: Sebastian Andrzej Siewior <bigeasy@linutronix.de>
+	Tested-by: Mike Galbraith <efault@gmx.de>
+	Acked-by: Nikolay Aleksandrov <nikolay@nvidia.com>
+Link: https://lore.kernel.org/r/20210928141049.593833-1-bigeasy@linutronix.de
+	Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+(cherry picked from commit f936bb42aeb94a069bec7c9e04100d199c372956)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/bridge/br_multicast.c
+#	net/bridge/br_private.h
+diff --cc net/bridge/br_multicast.c
+index def6f1840985,f3d751105343..000000000000
+--- a/net/bridge/br_multicast.c
++++ b/net/bridge/br_multicast.c
+@@@ -1073,8 -1659,32 +1073,37 @@@ again_under_lmqt
+  	}
+  }
+  
+++<<<<<<< HEAD
+ +static void br_multicast_send_query(struct net_bridge *br,
+ +				    struct net_bridge_port *port,
+++=======
++ static void br_multicast_read_querier(const struct bridge_mcast_querier *querier,
++ 				      struct bridge_mcast_querier *dest)
++ {
++ 	unsigned int seq;
++ 
++ 	memset(dest, 0, sizeof(*dest));
++ 	do {
++ 		seq = read_seqcount_begin(&querier->seq);
++ 		dest->port_ifidx = querier->port_ifidx;
++ 		memcpy(&dest->addr, &querier->addr, sizeof(struct br_ip));
++ 	} while (read_seqcount_retry(&querier->seq, seq));
++ }
++ 
++ static void br_multicast_update_querier(struct net_bridge_mcast *brmctx,
++ 					struct bridge_mcast_querier *querier,
++ 					int ifindex,
++ 					struct br_ip *saddr)
++ {
++ 	write_seqcount_begin(&querier->seq);
++ 	querier->port_ifidx = ifindex;
++ 	memcpy(&querier->addr, saddr, sizeof(*saddr));
++ 	write_seqcount_end(&querier->seq);
++ }
++ 
++ static void br_multicast_send_query(struct net_bridge_mcast *brmctx,
++ 				    struct net_bridge_mcast_port *pmctx,
+++>>>>>>> f936bb42aeb9 (net: bridge: mcast: Associate the seqcount with its protecting lock.)
+  				    struct bridge_mcast_own_query *own_query)
+  {
+  	struct bridge_mcast_other_query *other_query = NULL;
+@@@ -2794,6 -3846,55 +2823,58 @@@ static void br_multicast_gc_work(struc
+  	br_multicast_gc(&deleted_head);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ void br_multicast_ctx_init(struct net_bridge *br,
++ 			   struct net_bridge_vlan *vlan,
++ 			   struct net_bridge_mcast *brmctx)
++ {
++ 	brmctx->br = br;
++ 	brmctx->vlan = vlan;
++ 	brmctx->multicast_router = MDB_RTR_TYPE_TEMP_QUERY;
++ 	brmctx->multicast_last_member_count = 2;
++ 	brmctx->multicast_startup_query_count = 2;
++ 
++ 	brmctx->multicast_last_member_interval = HZ;
++ 	brmctx->multicast_query_response_interval = 10 * HZ;
++ 	brmctx->multicast_startup_query_interval = 125 * HZ / 4;
++ 	brmctx->multicast_query_interval = 125 * HZ;
++ 	brmctx->multicast_querier_interval = 255 * HZ;
++ 	brmctx->multicast_membership_interval = 260 * HZ;
++ 
++ 	brmctx->ip4_other_query.delay_time = 0;
++ 	brmctx->ip4_querier.port_ifidx = 0;
++ 	seqcount_spinlock_init(&brmctx->ip4_querier.seq, &br->multicast_lock);
++ 	brmctx->multicast_igmp_version = 2;
++ #if IS_ENABLED(CONFIG_IPV6)
++ 	brmctx->multicast_mld_version = 1;
++ 	brmctx->ip6_other_query.delay_time = 0;
++ 	brmctx->ip6_querier.port_ifidx = 0;
++ 	seqcount_spinlock_init(&brmctx->ip6_querier.seq, &br->multicast_lock);
++ #endif
++ 
++ 	timer_setup(&brmctx->ip4_mc_router_timer,
++ 		    br_ip4_multicast_local_router_expired, 0);
++ 	timer_setup(&brmctx->ip4_other_query.timer,
++ 		    br_ip4_multicast_querier_expired, 0);
++ 	timer_setup(&brmctx->ip4_own_query.timer,
++ 		    br_ip4_multicast_query_expired, 0);
++ #if IS_ENABLED(CONFIG_IPV6)
++ 	timer_setup(&brmctx->ip6_mc_router_timer,
++ 		    br_ip6_multicast_local_router_expired, 0);
++ 	timer_setup(&brmctx->ip6_other_query.timer,
++ 		    br_ip6_multicast_querier_expired, 0);
++ 	timer_setup(&brmctx->ip6_own_query.timer,
++ 		    br_ip6_multicast_query_expired, 0);
++ #endif
++ }
++ 
++ void br_multicast_ctx_deinit(struct net_bridge_mcast *brmctx)
++ {
++ 	__br_multicast_stop(brmctx);
++ }
++ 
+++>>>>>>> f936bb42aeb9 (net: bridge: mcast: Associate the seqcount with its protecting lock.)
+  void br_multicast_init(struct net_bridge *br)
+  {
+  	br->hash_max = BR_MULTICAST_DEFAULT_HASH_MAX;
+diff --cc net/bridge/br_private.h
+index 30e07225bc94,e8136db44462..000000000000
+--- a/net/bridge/br_private.h
++++ b/net/bridge/br_private.h
+@@@ -83,7 -81,8 +83,12 @@@ struct bridge_mcast_other_query 
+  /* selected querier */
+  struct bridge_mcast_querier {
+  	struct br_ip addr;
+++<<<<<<< HEAD
+ +	struct net_bridge_port __rcu	*port;
+++=======
++ 	int port_ifidx;
++ 	seqcount_spinlock_t seq;
+++>>>>>>> f936bb42aeb9 (net: bridge: mcast: Associate the seqcount with its protecting lock.)
+  };
+  
+  /* IGMP/MLD statistics */
+* Unmerged path net/bridge/br_multicast.c
+* Unmerged path net/bridge/br_private.h
