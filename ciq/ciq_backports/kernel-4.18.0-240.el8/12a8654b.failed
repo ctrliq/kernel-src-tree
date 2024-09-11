@@ -1,0 +1,190 @@
+libbpf: Add support for prog_tracing
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Alexei Starovoitov <ast@kernel.org>
+commit 12a8654b2e5aab37b22c9608d008f9f0565862c0
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/12a8654b.failed
+
+Cleanup libbpf from expected_attach_type == attach_btf_id hack
+and introduce BPF_PROG_TYPE_TRACING.
+
+	Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+	Signed-off-by: Daniel Borkmann <daniel@iogearbox.net>
+	Acked-by: Andrii Nakryiko <andriin@fb.com>
+	Acked-by: Martin KaFai Lau <kafai@fb.com>
+Link: https://lore.kernel.org/bpf/20191030223212.953010-3-ast@kernel.org
+(cherry picked from commit 12a8654b2e5aab37b22c9608d008f9f0565862c0)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	tools/lib/bpf/libbpf.c
+#	tools/lib/bpf/libbpf.map
+diff --cc tools/lib/bpf/libbpf.c
+index 1e4f23117b77,c80f316f1320..000000000000
+--- a/tools/lib/bpf/libbpf.c
++++ b/tools/lib/bpf/libbpf.c
+@@@ -4942,27 -4692,6 +4956,30 @@@ int libbpf_prog_type_by_name(const cha
+  			continue;
+  		*prog_type = section_names[i].prog_type;
+  		*expected_attach_type = section_names[i].expected_attach_type;
+++<<<<<<< HEAD
+ +		if (section_names[i].is_attach_btf) {
+ +			struct btf *btf = bpf_core_find_kernel_btf();
+ +			char raw_tp_btf_name[128] = "btf_trace_";
+ +			char *dst = raw_tp_btf_name + sizeof("btf_trace_") - 1;
+ +			int ret;
+ +
+ +			if (IS_ERR(btf)) {
+ +				pr_warning("vmlinux BTF is not found\n");
+ +				return -EINVAL;
+ +			}
+ +			/* prepend "btf_trace_" prefix per kernel convention */
+ +			strncat(dst, name + section_names[i].len,
+ +				sizeof(raw_tp_btf_name) - sizeof("btf_trace_"));
+ +			ret = btf__find_by_name(btf, raw_tp_btf_name);
+ +			btf__free(btf);
+ +			if (ret <= 0) {
+ +				pr_warning("%s is not found in vmlinux BTF\n", dst);
+ +				return -EINVAL;
+ +			}
+ +			*expected_attach_type = ret;
+ +		}
+++=======
+++>>>>>>> 12a8654b2e5a (libbpf: Add support for prog_tracing)
+  		return 0;
+  	}
+  	pr_warn("failed to guess program type based on ELF section name '%s'\n", name);
+diff --cc tools/lib/bpf/libbpf.map
+index 3ca7228af37e,69dded5af00b..000000000000
+--- a/tools/lib/bpf/libbpf.map
++++ b/tools/lib/bpf/libbpf.map
+@@@ -183,14 -183,20 +183,20 @@@ LIBBPF_0.0.4 
+  		perf_buffer__new;
+  		perf_buffer__new_raw;
+  		perf_buffer__poll;
+ -		xsk_umem__create;
+ -} LIBBPF_0.0.3;
+ -
+ -LIBBPF_0.0.5 {
+ -	global:
+ -		bpf_btf_get_next_id;
+ -} LIBBPF_0.0.4;
+ -
+ -LIBBPF_0.0.6 {
+ -	global:
+  		bpf_object__open_file;
+  		bpf_object__open_mem;
+ +		bpf_map__get_pin_path;
+ +		bpf_map__is_pinned;
+ +		bpf_map__set_pin_path;
+  		bpf_program__get_expected_attach_type;
+  		bpf_program__get_type;
+++<<<<<<< HEAD
+ +		bpf_get_link_xdp_info;
+ +		bpf_program__size;
+ +		bpf_btf_get_next_id;
+ +} LIBBPF_0.0.3;
+++=======
++ 		bpf_program__is_tracing;
++ 		bpf_program__set_tracing;
++ } LIBBPF_0.0.5;
+++>>>>>>> 12a8654b2e5a (libbpf: Add support for prog_tracing)
+diff --git a/tools/include/uapi/linux/bpf.h b/tools/include/uapi/linux/bpf.h
+index 4c50a38c7288..4e9b705fa47c 100644
+--- a/tools/include/uapi/linux/bpf.h
++++ b/tools/include/uapi/linux/bpf.h
+@@ -173,6 +173,7 @@ enum bpf_prog_type {
+ 	BPF_PROG_TYPE_CGROUP_SYSCTL,
+ 	BPF_PROG_TYPE_RAW_TRACEPOINT_WRITABLE,
+ 	BPF_PROG_TYPE_CGROUP_SOCKOPT,
++	BPF_PROG_TYPE_TRACING,
+ };
+ 
+ enum bpf_attach_type {
+@@ -199,6 +200,7 @@ enum bpf_attach_type {
+ 	BPF_CGROUP_UDP6_RECVMSG,
+ 	BPF_CGROUP_GETSOCKOPT,
+ 	BPF_CGROUP_SETSOCKOPT,
++	BPF_TRACE_RAW_TP,
+ 	__MAX_BPF_ATTACH_TYPE
+ };
+ 
+diff --git a/tools/lib/bpf/bpf.c b/tools/lib/bpf/bpf.c
+index f9124e381f55..b3e3e99a0f28 100644
+--- a/tools/lib/bpf/bpf.c
++++ b/tools/lib/bpf/bpf.c
+@@ -228,9 +228,10 @@ int bpf_load_program_xattr(const struct bpf_load_program_attr *load_attr,
+ 	memset(&attr, 0, sizeof(attr));
+ 	attr.prog_type = load_attr->prog_type;
+ 	attr.expected_attach_type = load_attr->expected_attach_type;
+-	if (attr.prog_type == BPF_PROG_TYPE_RAW_TRACEPOINT)
+-		/* expected_attach_type is ignored for tracing progs */
+-		attr.attach_btf_id = attr.expected_attach_type;
++	if (attr.prog_type == BPF_PROG_TYPE_TRACING)
++		attr.attach_btf_id = load_attr->attach_btf_id;
++	else
++		attr.prog_ifindex = load_attr->prog_ifindex;
+ 	attr.insn_cnt = (__u32)load_attr->insns_cnt;
+ 	attr.insns = ptr_to_u64(load_attr->insns);
+ 	attr.license = ptr_to_u64(load_attr->license);
+@@ -245,7 +246,6 @@ int bpf_load_program_xattr(const struct bpf_load_program_attr *load_attr,
+ 	}
+ 
+ 	attr.kern_version = load_attr->kern_version;
+-	attr.prog_ifindex = load_attr->prog_ifindex;
+ 	attr.prog_btf_fd = load_attr->prog_btf_fd;
+ 	attr.func_info_rec_size = load_attr->func_info_rec_size;
+ 	attr.func_info_cnt = load_attr->func_info_cnt;
+diff --git a/tools/lib/bpf/bpf.h b/tools/lib/bpf/bpf.h
+index 0db01334740f..1c53bc5b4b3c 100644
+--- a/tools/lib/bpf/bpf.h
++++ b/tools/lib/bpf/bpf.h
+@@ -78,7 +78,10 @@ struct bpf_load_program_attr {
+ 	size_t insns_cnt;
+ 	const char *license;
+ 	__u32 kern_version;
+-	__u32 prog_ifindex;
++	union {
++		__u32 prog_ifindex;
++		__u32 attach_btf_id;
++	};
+ 	__u32 prog_btf_fd;
+ 	__u32 func_info_rec_size;
+ 	const void *func_info;
+* Unmerged path tools/lib/bpf/libbpf.c
+diff --git a/tools/lib/bpf/libbpf.h b/tools/lib/bpf/libbpf.h
+index cb530c336c94..5aa27caad6c2 100644
+--- a/tools/lib/bpf/libbpf.h
++++ b/tools/lib/bpf/libbpf.h
+@@ -326,6 +326,7 @@ LIBBPF_API int bpf_program__set_sched_cls(struct bpf_program *prog);
+ LIBBPF_API int bpf_program__set_sched_act(struct bpf_program *prog);
+ LIBBPF_API int bpf_program__set_xdp(struct bpf_program *prog);
+ LIBBPF_API int bpf_program__set_perf_event(struct bpf_program *prog);
++LIBBPF_API int bpf_program__set_tracing(struct bpf_program *prog);
+ 
+ LIBBPF_API enum bpf_prog_type bpf_program__get_type(struct bpf_program *prog);
+ LIBBPF_API void bpf_program__set_type(struct bpf_program *prog,
+@@ -345,6 +346,7 @@ LIBBPF_API bool bpf_program__is_sched_cls(const struct bpf_program *prog);
+ LIBBPF_API bool bpf_program__is_sched_act(const struct bpf_program *prog);
+ LIBBPF_API bool bpf_program__is_xdp(const struct bpf_program *prog);
+ LIBBPF_API bool bpf_program__is_perf_event(const struct bpf_program *prog);
++LIBBPF_API bool bpf_program__is_tracing(const struct bpf_program *prog);
+ 
+ /*
+  * No need for __attribute__((packed)), all members of 'bpf_map_def'
+* Unmerged path tools/lib/bpf/libbpf.map
+diff --git a/tools/lib/bpf/libbpf_probes.c b/tools/lib/bpf/libbpf_probes.c
+index 4b0b0364f5fc..a9eb8b322671 100644
+--- a/tools/lib/bpf/libbpf_probes.c
++++ b/tools/lib/bpf/libbpf_probes.c
+@@ -102,6 +102,7 @@ probe_load(enum bpf_prog_type prog_type, const struct bpf_insn *insns,
+ 	case BPF_PROG_TYPE_FLOW_DISSECTOR:
+ 	case BPF_PROG_TYPE_CGROUP_SYSCTL:
+ 	case BPF_PROG_TYPE_CGROUP_SOCKOPT:
++	case BPF_PROG_TYPE_TRACING:
+ 	default:
+ 		break;
+ 	}
