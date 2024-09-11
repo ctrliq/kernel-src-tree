@@ -1,0 +1,186 @@
+kasan: don't assume percpu shadow allocations will succeed
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Daniel Axtens <dja@axtens.net>
+commit 253a496d8e57275d458eb3c988470525b0b2c545
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/253a496d.failed
+
+syzkaller and the fault injector showed that I was wrong to assume that
+we could ignore percpu shadow allocation failures.
+
+Handle failures properly.  Merge all the allocated areas back into the
+free list and release the shadow, then clean up and return NULL.  The
+shadow is released unconditionally, which relies upon the fact that the
+release function is able to tolerate pages not being present.
+
+Also clean up shadows in the recovery path - currently they are not
+released, which leaks a bit of memory.
+
+Link: http://lkml.kernel.org/r/20191205140407.1874-3-dja@axtens.net
+Fixes: 3c5c3cfb9ef4 ("kasan: support backing vmalloc space with real shadow memory")
+	Signed-off-by: Daniel Axtens <dja@axtens.net>
+	Reported-by: syzbot+82e323920b78d54aaed5@syzkaller.appspotmail.com
+	Reported-by: syzbot+59b7daa4315e07a994f1@syzkaller.appspotmail.com
+	Reviewed-by: Andrey Ryabinin <aryabinin@virtuozzo.com>
+	Cc: Dmitry Vyukov <dvyukov@google.com>
+	Cc: Alexander Potapenko <glider@google.com>
+	Cc: Qian Cai <cai@lca.pw>
+	Cc: Uladzislau Rezki (Sony) <urezki@gmail.com>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit 253a496d8e57275d458eb3c988470525b0b2c545)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	mm/vmalloc.c
+diff --cc mm/vmalloc.c
+index c82a0db1aefc,e9681dc4aa75..000000000000
+--- a/mm/vmalloc.c
++++ b/mm/vmalloc.c
+@@@ -2589,11 -3285,12 +2589,15 @@@ struct vm_struct **pcpu_get_vm_areas(co
+  {
+  	const unsigned long vmalloc_start = ALIGN(VMALLOC_START, align);
+  	const unsigned long vmalloc_end = VMALLOC_END & ~(align - 1);
+ -	struct vmap_area **vas, *va;
+ +	struct vmap_area **vas, *prev, *next;
+  	struct vm_struct **vms;
+  	int area, area2, last_area, term_area;
+++<<<<<<< HEAD
+ +	unsigned long base, start, end, last_end;
+++=======
++ 	unsigned long base, start, size, end, last_end, orig_start, orig_end;
+++>>>>>>> 253a496d8e57 (kasan: don't assume percpu shadow allocations will succeed)
+  	bool purged = false;
+ -	enum fit_type type;
+  
+  	/* verify parameters and allocate data structures */
+  	BUG_ON(offset_in_page(align) || !is_power_of_2(align));
+@@@ -2696,35 -3383,105 +2700,97 @@@ retry
+  		area = (area + nr_vms - 1) % nr_vms;
+  		if (area == term_area)
+  			break;
+ -
+  		start = offsets[area];
+  		end = start + sizes[area];
+ -		va = pvm_find_va_enclose_addr(base + end);
+ +		pvm_find_next_prev(base + end, &next, &prev);
+  	}
+ -
+ +found:
+  	/* we've found a fitting base, insert all va's */
+  	for (area = 0; area < nr_vms; area++) {
+ -		int ret;
+ -
+ -		start = base + offsets[area];
+ -		size = sizes[area];
+ +		struct vmap_area *va = vas[area];
+  
+ -		va = pvm_find_va_enclose_addr(start);
+ -		if (WARN_ON_ONCE(va == NULL))
+ -			/* It is a BUG(), but trigger recovery instead. */
+ -			goto recovery;
+ +		va->va_start = base + offsets[area];
+ +		va->va_end = va->va_start + sizes[area];
+ +		__insert_vmap_area(va);
+ +	}
+  
+ -		type = classify_va_fit_type(va, start, size);
+ -		if (WARN_ON_ONCE(type == NOTHING_FIT))
+ -			/* It is a BUG(), but trigger recovery instead. */
+ -			goto recovery;
+ +	vmap_area_pcpu_hole = base + offsets[last_area];
+  
+ -		ret = adjust_va_to_fit_type(va, start, size, type);
+ -		if (unlikely(ret))
+ -			goto recovery;
+++<<<<<<< HEAD
+ +	spin_unlock(&vmap_area_lock);
+  
+ -		/* Allocated area. */
+ -		va = vas[area];
+ -		va->va_start = start;
+ -		va->va_end = start + size;
+ -	}
+ +	/* insert all vm's */
+ +	for (area = 0; area < nr_vms; area++)
+ +		setup_vmalloc_vm(vms[area], vas[area], VM_ALLOC,
+ +				 pcpu_get_vm_areas);
+  
+ -	spin_unlock(&free_vmap_area_lock);
+ +	kfree(vas);
+ +	return vms;
+  
+++=======
++ 	/* populate the kasan shadow space */
++ 	for (area = 0; area < nr_vms; area++) {
++ 		if (kasan_populate_vmalloc(vas[area]->va_start, sizes[area]))
++ 			goto err_free_shadow;
++ 
++ 		kasan_unpoison_vmalloc((void *)vas[area]->va_start,
++ 				       sizes[area]);
++ 	}
++ 
++ 	/* insert all vm's */
++ 	spin_lock(&vmap_area_lock);
++ 	for (area = 0; area < nr_vms; area++) {
++ 		insert_vmap_area(vas[area], &vmap_area_root, &vmap_area_list);
++ 
++ 		setup_vmalloc_vm_locked(vms[area], vas[area], VM_ALLOC,
++ 				 pcpu_get_vm_areas);
++ 	}
++ 	spin_unlock(&vmap_area_lock);
++ 
++ 	kfree(vas);
++ 	return vms;
++ 
++ recovery:
++ 	/*
++ 	 * Remove previously allocated areas. There is no
++ 	 * need in removing these areas from the busy tree,
++ 	 * because they are inserted only on the final step
++ 	 * and when pcpu_get_vm_areas() is success.
++ 	 */
++ 	while (area--) {
++ 		orig_start = vas[area]->va_start;
++ 		orig_end = vas[area]->va_end;
++ 		va = merge_or_add_vmap_area(vas[area], &free_vmap_area_root,
++ 					    &free_vmap_area_list);
++ 		kasan_release_vmalloc(orig_start, orig_end,
++ 				      va->va_start, va->va_end);
++ 		vas[area] = NULL;
++ 	}
++ 
++ overflow:
++ 	spin_unlock(&free_vmap_area_lock);
++ 	if (!purged) {
++ 		purge_vmap_area_lazy();
++ 		purged = true;
++ 
++ 		/* Before "retry", check if we recover. */
++ 		for (area = 0; area < nr_vms; area++) {
++ 			if (vas[area])
++ 				continue;
++ 
++ 			vas[area] = kmem_cache_zalloc(
++ 				vmap_area_cachep, GFP_KERNEL);
++ 			if (!vas[area])
++ 				goto err_free;
++ 		}
++ 
++ 		goto retry;
++ 	}
++ 
+++>>>>>>> 253a496d8e57 (kasan: don't assume percpu shadow allocations will succeed)
+  err_free:
+  	for (area = 0; area < nr_vms; area++) {
+ -		if (vas[area])
+ -			kmem_cache_free(vmap_area_cachep, vas[area]);
+ -
+ +		kfree(vas[area]);
+  		kfree(vms[area]);
+  	}
+  err_free2:
+* Unmerged path mm/vmalloc.c
