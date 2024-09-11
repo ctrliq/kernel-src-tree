@@ -1,0 +1,689 @@
+mptcp: implement delegated actions
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Paolo Abeni <pabeni@redhat.com>
+commit b19bc2945b40b9fd38e835700907ffe8534ef0de
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/b19bc294.failed
+
+On MPTCP-level ack reception, the packet scheduler
+may select a subflow other then the current one.
+
+Prior to this commit we rely on the workqueue to trigger
+action on such subflow.
+
+This changeset introduces an infrastructure that allows
+any MPTCP subflow to schedule actions (MPTCP xmit) on
+others subflows without resorting to (multiple) process
+reschedule.
+
+A dummy NAPI instance is used instead. When MPTCP needs to
+trigger action an a different subflow, it enqueues the target
+subflow on the NAPI backlog and schedule such instance as needed.
+
+The dummy NAPI poll method walks the sockets backlog and tries
+to acquire the (BH) socket lock on each of them. If the socket
+is owned by the user space, the action will be completed by
+the sock release cb, otherwise push is started.
+
+This change leverages the delegated action infrastructure
+to avoid invoking the MPTCP worker to spool the pending data,
+when the packet scheduler picks a subflow other then the one
+currently processing the incoming MPTCP-level ack.
+
+Additionally we further refine the subflow selection
+invoking the packet scheduler for each chunk of data
+even inside __mptcp_subflow_push_pending().
+
+v1 -> v2:
+ - fix possible UaF at shutdown time, resetting sock ops
+   after removing the ulp context
+
+	Reviewed-by: Mat Martineau <mathew.j.martineau@linux.intel.com>
+	Signed-off-by: Paolo Abeni <pabeni@redhat.com>
+	Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+(cherry picked from commit b19bc2945b40b9fd38e835700907ffe8534ef0de)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/mptcp/protocol.c
+#	net/mptcp/protocol.h
+#	net/mptcp/subflow.c
+diff --cc net/mptcp/protocol.c
+index 509aa48ee70d,a033bf9c26ee..000000000000
+--- a/net/mptcp/protocol.c
++++ b/net/mptcp/protocol.c
+@@@ -39,6 -42,12 +39,15 @@@ struct mptcp_skb_cb 
+  
+  static struct percpu_counter mptcp_sockets_allocated;
+  
+++<<<<<<< HEAD
+++=======
++ static void __mptcp_destroy_sock(struct sock *sk);
++ static void __mptcp_check_send_data_fin(struct sock *sk);
++ 
++ DEFINE_PER_CPU(struct mptcp_delegated_action, mptcp_delegated_actions);
++ static struct net_device mptcp_napi_dev;
++ 
+++>>>>>>> b19bc2945b40 (mptcp: implement delegated actions)
+  /* If msk has an initial subflow socket, and the MP_CAPABLE handshake has not
+   * completed yet or has failed, return the subflow socket.
+   * Otherwise return NULL.
+@@@ -867,61 -1347,237 +876,136 @@@ out
+  	return ret;
+  }
+  
+ -#define MPTCP_SEND_BURST_SIZE		((1 << 16) - \
+ -					 sizeof(struct tcphdr) - \
+ -					 MAX_TCP_OPTION_SPACE - \
+ -					 sizeof(struct ipv6hdr) - \
+ -					 sizeof(struct frag_hdr))
+ -
+ -struct subflow_send_info {
+ -	struct sock *ssk;
+ -	u64 ratio;
+ -};
+ -
+ -static struct sock *mptcp_subflow_get_send(struct mptcp_sock *msk)
+ +static void mptcp_nospace(struct mptcp_sock *msk)
+  {
+ -	struct subflow_send_info send_info[2];
+  	struct mptcp_subflow_context *subflow;
+ -	int i, nr_active = 0;
+ -	struct sock *ssk;
+ -	u64 ratio;
+ -	u32 pace;
+ -
+ -	sock_owned_by_me((struct sock *)msk);
+ -
+ -	if (__mptcp_check_fallback(msk)) {
+ -		if (!msk->first)
+ -			return NULL;
+ -		return sk_stream_memory_free(msk->first) ? msk->first : NULL;
+ -	}
+  
+ -	/* re-use last subflow, if the burst allow that */
+ -	if (msk->last_snd && msk->snd_burst > 0 &&
+ -	    sk_stream_memory_free(msk->last_snd) &&
+ -	    mptcp_subflow_active(mptcp_subflow_ctx(msk->last_snd)))
+ -		return msk->last_snd;
+ +	clear_bit(MPTCP_SEND_SPACE, &msk->flags);
+ +	smp_mb__after_atomic(); /* msk->flags is changed by write_space cb */
+  
+ -	/* pick the subflow with the lower wmem/wspace ratio */
+ -	for (i = 0; i < 2; ++i) {
+ -		send_info[i].ssk = NULL;
+ -		send_info[i].ratio = -1;
+ -	}
+  	mptcp_for_each_subflow(msk, subflow) {
+ -		ssk =  mptcp_subflow_tcp_sock(subflow);
+ -		if (!mptcp_subflow_active(subflow))
+ -			continue;
+ -
+ -		nr_active += !subflow->backup;
+ -		if (!sk_stream_memory_free(subflow->tcp_sock) || !tcp_sk(ssk)->snd_wnd)
+ -			continue;
+ -
+ -		pace = READ_ONCE(ssk->sk_pacing_rate);
+ -		if (!pace)
+ -			continue;
+ -
+ -		ratio = div_u64((u64)READ_ONCE(ssk->sk_wmem_queued) << 32,
+ -				pace);
+ -		if (ratio < send_info[subflow->backup].ratio) {
+ -			send_info[subflow->backup].ssk = ssk;
+ -			send_info[subflow->backup].ratio = ratio;
+ -		}
+ -	}
+ -
+ -	pr_debug("msk=%p nr_active=%d ssk=%p:%lld backup=%p:%lld",
+ -		 msk, nr_active, send_info[0].ssk, send_info[0].ratio,
+ -		 send_info[1].ssk, send_info[1].ratio);
+ -
+ -	/* pick the best backup if no other subflow is active */
+ -	if (!nr_active)
+ -		send_info[0].ssk = send_info[1].ssk;
+ +		struct sock *ssk = mptcp_subflow_tcp_sock(subflow);
+ +		struct socket *sock = READ_ONCE(ssk->sk_socket);
+  
+ -	if (send_info[0].ssk) {
+ -		msk->last_snd = send_info[0].ssk;
+ -		msk->snd_burst = min_t(int, MPTCP_SEND_BURST_SIZE,
+ -				       tcp_sk(msk->last_snd)->snd_wnd);
+ -		return msk->last_snd;
+ +		/* enables ssk->write_space() callbacks */
+ +		if (sock)
+ +			set_bit(SOCK_NOSPACE, &sock->flags);
+  	}
+ -
+ -	return NULL;
+  }
+  
+ -static void mptcp_push_release(struct sock *sk, struct sock *ssk,
+ -			       struct mptcp_sendmsg_info *info)
+ -{
+ -	mptcp_set_timeout(sk, ssk);
+ -	tcp_push(ssk, 0, info->mss_now, tcp_sk(ssk)->nonagle, info->size_goal);
+ -	release_sock(ssk);
+ -}
+ -
+ -static void mptcp_push_pending(struct sock *sk, unsigned int flags)
+ +static struct sock *mptcp_subflow_get_send(struct mptcp_sock *msk)
+  {
+ -	struct sock *prev_ssk = NULL, *ssk = NULL;
+ -	struct mptcp_sock *msk = mptcp_sk(sk);
+ -	struct mptcp_sendmsg_info info = {
+ -				.flags = flags,
+ -	};
+ -	struct mptcp_data_frag *dfrag;
+ -	int len, copied = 0;
+ -
+ -	while ((dfrag = mptcp_send_head(sk))) {
+ -		info.sent = dfrag->already_sent;
+ -		info.limit = dfrag->data_len;
+ -		len = dfrag->data_len - dfrag->already_sent;
+ -		while (len > 0) {
+ -			int ret = 0;
+ +	struct mptcp_subflow_context *subflow;
+ +	struct sock *sk = (struct sock *)msk;
+ +	struct sock *backup = NULL;
+ +	bool free;
+  
+ -			prev_ssk = ssk;
+ -			__mptcp_flush_join_list(msk);
+ -			ssk = mptcp_subflow_get_send(msk);
+ +	sock_owned_by_me(sk);
+  
+ -			/* try to keep the subflow socket lock across
+ -			 * consecutive xmit on the same socket
+ -			 */
+ -			if (ssk != prev_ssk && prev_ssk)
+ -				mptcp_push_release(sk, prev_ssk, &info);
+ -			if (!ssk)
+ -				goto out;
+ +	if (!mptcp_ext_cache_refill(msk))
+ +		return NULL;
+  
+ -			if (ssk != prev_ssk || !prev_ssk)
+ -				lock_sock(ssk);
+ +	mptcp_for_each_subflow(msk, subflow) {
+ +		struct sock *ssk = mptcp_subflow_tcp_sock(subflow);
+  
+ -			/* keep it simple and always provide a new skb for the
+ -			 * subflow, even if we will not use it when collapsing
+ -			 * on the pending one
+ -			 */
+ -			if (!mptcp_alloc_tx_skb(sk, ssk)) {
+ -				mptcp_push_release(sk, ssk, &info);
+ -				goto out;
+ -			}
+ +		free = sk_stream_is_writeable(subflow->tcp_sock);
+ +		if (!free) {
+ +			mptcp_nospace(msk);
+ +			return NULL;
+ +		}
+  
+ -			ret = mptcp_sendmsg_frag(sk, ssk, dfrag, &info);
+ -			if (ret <= 0) {
+ -				mptcp_push_release(sk, ssk, &info);
+ -				goto out;
+ -			}
+ +		if (subflow->backup) {
+ +			if (!backup)
+ +				backup = ssk;
+  
+ -			info.sent += ret;
+ -			dfrag->already_sent += ret;
+ -			msk->snd_nxt += ret;
+ -			msk->snd_burst -= ret;
+ -			msk->tx_pending_data -= ret;
+ -			copied += ret;
+ -			len -= ret;
+ +			continue;
+  		}
+ -		WRITE_ONCE(msk->first_pending, mptcp_send_next(sk));
+ -	}
+ -
+ -	/* at this point we held the socket lock for the last subflow we used */
+ -	if (ssk)
+ -		mptcp_push_release(sk, ssk, &info);
+  
+ -out:
+ -	if (copied) {
+ -		/* start the timer, if it's not pending */
+ -		if (!mptcp_timer_pending(sk))
+ -			mptcp_reset_timer(sk);
+ -		__mptcp_check_send_data_fin(sk);
+ +		return ssk;
+  	}
+ +
+ +	return backup;
+  }
+  
+ -static void __mptcp_subflow_push_pending(struct sock *sk, struct sock *ssk)
+ +static void ssk_check_wmem(struct mptcp_sock *msk)
+  {
+++<<<<<<< HEAD
+ +	if (unlikely(!mptcp_is_writeable(msk)))
+ +		mptcp_nospace(msk);
+++=======
++ 	struct mptcp_sock *msk = mptcp_sk(sk);
++ 	struct mptcp_sendmsg_info info;
++ 	struct mptcp_data_frag *dfrag;
++ 	struct sock *xmit_ssk;
++ 	int len, copied = 0;
++ 	bool first = true;
++ 
++ 	info.flags = 0;
++ 	while ((dfrag = mptcp_send_head(sk))) {
++ 		info.sent = dfrag->already_sent;
++ 		info.limit = dfrag->data_len;
++ 		len = dfrag->data_len - dfrag->already_sent;
++ 		while (len > 0) {
++ 			int ret = 0;
++ 
++ 			/* the caller already invoked the packet scheduler,
++ 			 * check for a different subflow usage only after
++ 			 * spooling the first chunk of data
++ 			 */
++ 			xmit_ssk = first ? ssk : mptcp_subflow_get_send(mptcp_sk(sk));
++ 			if (!xmit_ssk)
++ 				goto out;
++ 			if (xmit_ssk != ssk) {
++ 				mptcp_subflow_delegate(mptcp_subflow_ctx(xmit_ssk));
++ 				goto out;
++ 			}
++ 
++ 			if (unlikely(mptcp_must_reclaim_memory(sk, ssk))) {
++ 				__mptcp_update_wmem(sk);
++ 				sk_mem_reclaim_partial(sk);
++ 			}
++ 			if (!__mptcp_alloc_tx_skb(sk, ssk, GFP_ATOMIC))
++ 				goto out;
++ 
++ 			ret = mptcp_sendmsg_frag(sk, ssk, dfrag, &info);
++ 			if (ret <= 0)
++ 				goto out;
++ 
++ 			info.sent += ret;
++ 			dfrag->already_sent += ret;
++ 			msk->snd_nxt += ret;
++ 			msk->snd_burst -= ret;
++ 			msk->tx_pending_data -= ret;
++ 			copied += ret;
++ 			len -= ret;
++ 			first = false;
++ 		}
++ 		WRITE_ONCE(msk->first_pending, mptcp_send_next(sk));
++ 	}
++ 
++ out:
++ 	/* __mptcp_alloc_tx_skb could have released some wmem and we are
++ 	 * not going to flush it via release_sock()
++ 	 */
++ 	__mptcp_update_wmem(sk);
++ 	if (copied) {
++ 		mptcp_set_timeout(sk, ssk);
++ 		tcp_push(ssk, 0, info.mss_now, tcp_sk(ssk)->nonagle,
++ 			 info.size_goal);
++ 		if (msk->snd_data_fin_enable &&
++ 		    msk->snd_nxt + 1 == msk->write_seq)
++ 			mptcp_schedule_work(sk);
++ 	}
++ }
++ 
++ static void mptcp_set_nospace(struct sock *sk)
++ {
++ 	/* enable autotune */
++ 	set_bit(SOCK_NOSPACE, &sk->sk_socket->flags);
++ 
++ 	/* will be cleared on avail space */
++ 	set_bit(MPTCP_NOSPACE, &mptcp_sk(sk)->flags);
+++>>>>>>> b19bc2945b40 (mptcp: implement delegated actions)
+  }
+  
+  static int mptcp_sendmsg(struct sock *sk, struct msghdr *msg, size_t len)
+@@@ -1429,20 -2250,26 +1513,27 @@@ static void mptcp_worker(struct work_st
+  {
+  	struct mptcp_sock *msk = container_of(work, struct mptcp_sock, work);
+  	struct sock *ssk, *sk = &msk->sk.icsk_inet.sk;
+ -	struct mptcp_sendmsg_info info = {};
+ +	int orig_len, orig_offset, mss_now = 0, size_goal = 0;
+  	struct mptcp_data_frag *dfrag;
+ +	u64 orig_write_seq;
+  	size_t copied = 0;
+ -	int state, ret;
+ +	struct msghdr msg = {
+ +		.msg_flags = MSG_DONTWAIT,
+ +	};
+ +	long timeo = 0;
+  
+  	lock_sock(sk);
+++<<<<<<< HEAD
+ +	mptcp_clean_una_wakeup(sk);
+++=======
++ 	state = sk->sk_state;
++ 	if (unlikely(state == TCP_CLOSE))
++ 		goto unlock;
++ 
+++>>>>>>> b19bc2945b40 (mptcp: implement delegated actions)
+  	mptcp_check_data_fin_ack(sk);
+  	__mptcp_flush_join_list(msk);
+ -
+ -	mptcp_check_fastclose(msk);
+ -
+ -	if (test_and_clear_bit(MPTCP_WORK_CLOSE_SUBFLOW, &msk->flags))
+ -		__mptcp_close_subflow(msk);
+ -
+ -	if (msk->pm.status)
+ -		pm_work(msk);
+ +	__mptcp_move_skbs(msk);
+  
+  	if (test_and_clear_bit(MPTCP_WORK_EOF, &msk->flags))
+  		mptcp_check_for_eof(msk);
+@@@ -1989,12 -2901,37 +2080,39 @@@ static int mptcp_getsockopt(struct soc
+  	return -EOPNOTSUPP;
+  }
+  
+ -void __mptcp_data_acked(struct sock *sk)
+ -{
+ -	if (!sock_owned_by_user(sk))
+ -		__mptcp_clean_una(sk);
+ -	else
+ -		set_bit(MPTCP_CLEAN_UNA, &mptcp_sk(sk)->flags);
+ +#define MPTCP_DEFERRED_ALL (TCPF_DELACK_TIMER_DEFERRED | \
+ +			    TCPF_WRITE_TIMER_DEFERRED)
+  
+++<<<<<<< HEAD
+ +/* this is very alike tcp_release_cb() but we must handle differently a
+ + * different set of events
+ + */
+++=======
++ 	if (mptcp_pending_data_fin_ack(sk))
++ 		mptcp_schedule_work(sk);
++ }
++ 
++ void __mptcp_check_push(struct sock *sk, struct sock *ssk)
++ {
++ 	if (!mptcp_send_head(sk))
++ 		return;
++ 
++ 	if (!sock_owned_by_user(sk)) {
++ 		struct sock *xmit_ssk = mptcp_subflow_get_send(mptcp_sk(sk));
++ 
++ 		if (xmit_ssk == ssk)
++ 			__mptcp_subflow_push_pending(sk, ssk);
++ 		else if (xmit_ssk)
++ 			mptcp_subflow_delegate(mptcp_subflow_ctx(xmit_ssk));
++ 	} else {
++ 		set_bit(MPTCP_PUSH_PENDING, &mptcp_sk(sk)->flags);
++ 	}
++ }
++ 
++ #define MPTCP_DEFERRED_ALL (TCPF_WRITE_TIMER_DEFERRED)
++ 
++ /* processes deferred events and flush wmem */
+++>>>>>>> b19bc2945b40 (mptcp: implement delegated actions)
+  static void mptcp_release_cb(struct sock *sk)
+  {
+  	unsigned long flags, nflags;
+@@@ -2023,6 -2974,34 +2141,37 @@@
+  	}
+  }
+  
+++<<<<<<< HEAD
+++=======
++ void mptcp_subflow_process_delegated(struct sock *ssk)
++ {
++ 	struct mptcp_subflow_context *subflow = mptcp_subflow_ctx(ssk);
++ 	struct sock *sk = subflow->conn;
++ 
++ 	mptcp_data_lock(sk);
++ 	if (!sock_owned_by_user(sk))
++ 		__mptcp_subflow_push_pending(sk, ssk);
++ 	else
++ 		set_bit(MPTCP_PUSH_PENDING, &mptcp_sk(sk)->flags);
++ 	mptcp_data_unlock(sk);
++ 	mptcp_subflow_delegated_done(subflow);
++ }
++ 
++ static int mptcp_hash(struct sock *sk)
++ {
++ 	/* should never be called,
++ 	 * we hash the TCP subflows not the master socket
++ 	 */
++ 	WARN_ON_ONCE(1);
++ 	return 0;
++ }
++ 
++ static void mptcp_unhash(struct sock *sk)
++ {
++ 	/* called from sk_common_release(), but nothing to do here */
++ }
++ 
+++>>>>>>> b19bc2945b40 (mptcp: implement delegated actions)
+  static int mptcp_get_port(struct sock *sk, unsigned short snum)
+  {
+  	struct mptcp_sock *msk = mptcp_sk(sk);
+@@@ -2427,15 -3398,61 +2576,64 @@@ static struct inet_protosw mptcp_protos
+  	.flags		= INET_PROTOSW_ICSK,
+  };
+  
+++<<<<<<< HEAD
+ +void mptcp_proto_init(void)
+++=======
++ static int mptcp_napi_poll(struct napi_struct *napi, int budget)
+  {
++ 	struct mptcp_delegated_action *delegated;
++ 	struct mptcp_subflow_context *subflow;
++ 	int work_done = 0;
++ 
++ 	delegated = container_of(napi, struct mptcp_delegated_action, napi);
++ 	while ((subflow = mptcp_subflow_delegated_next(delegated)) != NULL) {
++ 		struct sock *ssk = mptcp_subflow_tcp_sock(subflow);
++ 
++ 		bh_lock_sock_nested(ssk);
++ 		if (!sock_owned_by_user(ssk) &&
++ 		    mptcp_subflow_has_delegated_action(subflow))
++ 			mptcp_subflow_process_delegated(ssk);
++ 		/* ... elsewhere tcp_release_cb_override already processed
++ 		 * the action or will do at next release_sock().
++ 		 * In both case must dequeue the subflow here - on the same
++ 		 * CPU that scheduled it.
++ 		 */
++ 		bh_unlock_sock(ssk);
++ 		sock_put(ssk);
++ 
++ 		if (++work_done == budget)
++ 			return budget;
++ 	}
++ 
++ 	/* always provide a 0 'work_done' argument, so that napi_complete_done
++ 	 * will not try accessing the NULL napi->dev ptr
++ 	 */
++ 	napi_complete_done(napi, 0);
++ 	return work_done;
++ }
++ 
++ void __init mptcp_proto_init(void)
+++>>>>>>> b19bc2945b40 (mptcp: implement delegated actions)
++ {
++ 	struct mptcp_delegated_action *delegated;
++ 	int cpu;
++ 
+  	mptcp_prot.h.hashinfo = tcp_prot.h.hashinfo;
+  
+  	if (percpu_counter_init(&mptcp_sockets_allocated, 0, GFP_KERNEL))
+  		panic("Failed to allocate MPTCP pcpu counter\n");
+  
++ 	init_dummy_netdev(&mptcp_napi_dev);
++ 	for_each_possible_cpu(cpu) {
++ 		delegated = per_cpu_ptr(&mptcp_delegated_actions, cpu);
++ 		INIT_LIST_HEAD(&delegated->head);
++ 		netif_tx_napi_add(&mptcp_napi_dev, &delegated->napi, mptcp_napi_poll,
++ 				  NAPI_POLL_WEIGHT);
++ 		napi_enable(&delegated->napi);
++ 	}
++ 
+  	mptcp_subflow_init();
+  	mptcp_pm_init();
+ -	mptcp_token_init();
+  
+  	if (proto_register(&mptcp_prot, 1) != 0)
+  		panic("Failed to register MPTCP proto.\n");
+diff --cc net/mptcp/protocol.h
+index 46bdc749922f,1460705aaad0..000000000000
+--- a/net/mptcp/protocol.h
++++ b/net/mptcp/protocol.h
+@@@ -291,6 -372,21 +291,24 @@@ mptcp_subflow_rsk(const struct request_
+  	return (struct mptcp_subflow_request_sock *)rsk;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ enum mptcp_data_avail {
++ 	MPTCP_SUBFLOW_NODATA,
++ 	MPTCP_SUBFLOW_DATA_AVAIL,
++ 	MPTCP_SUBFLOW_OOO_DATA
++ };
++ 
++ struct mptcp_delegated_action {
++ 	struct napi_struct napi;
++ 	struct list_head head;
++ };
++ 
++ DECLARE_PER_CPU(struct mptcp_delegated_action, mptcp_delegated_actions);
++ 
++ #define MPTCP_DELEGATE_SEND		0
++ 
+++>>>>>>> b19bc2945b40 (mptcp: implement delegated actions)
+  /* MPTCP subflow context */
+  struct mptcp_subflow_context {
+  	struct	list_head node;/* conn_list of subflows */
+@@@ -365,7 -466,72 +386,74 @@@ mptcp_subflow_get_mapped_dsn(const stru
+  	return subflow->map_seq + mptcp_subflow_get_map_offset(subflow);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static inline void mptcp_add_pending_subflow(struct mptcp_sock *msk,
++ 					     struct mptcp_subflow_context *subflow)
++ {
++ 	sock_hold(mptcp_subflow_tcp_sock(subflow));
++ 	spin_lock_bh(&msk->join_list_lock);
++ 	list_add_tail(&subflow->node, &msk->join_list);
++ 	spin_unlock_bh(&msk->join_list_lock);
++ }
++ 
++ void mptcp_subflow_process_delegated(struct sock *ssk);
++ 
++ static inline void mptcp_subflow_delegate(struct mptcp_subflow_context *subflow)
++ {
++ 	struct mptcp_delegated_action *delegated;
++ 	bool schedule;
++ 
++ 	/* The implied barrier pairs with mptcp_subflow_delegated_done(), and
++ 	 * ensures the below list check sees list updates done prior to status
++ 	 * bit changes
++ 	 */
++ 	if (!test_and_set_bit(MPTCP_DELEGATE_SEND, &subflow->delegated_status)) {
++ 		/* still on delegated list from previous scheduling */
++ 		if (!list_empty(&subflow->delegated_node))
++ 			return;
++ 
++ 		/* the caller held the subflow bh socket lock */
++ 		lockdep_assert_in_softirq();
++ 
++ 		delegated = this_cpu_ptr(&mptcp_delegated_actions);
++ 		schedule = list_empty(&delegated->head);
++ 		list_add_tail(&subflow->delegated_node, &delegated->head);
++ 		sock_hold(mptcp_subflow_tcp_sock(subflow));
++ 		if (schedule)
++ 			napi_schedule(&delegated->napi);
++ 	}
++ }
++ 
++ static inline struct mptcp_subflow_context *
++ mptcp_subflow_delegated_next(struct mptcp_delegated_action *delegated)
++ {
++ 	struct mptcp_subflow_context *ret;
++ 
++ 	if (list_empty(&delegated->head))
++ 		return NULL;
++ 
++ 	ret = list_first_entry(&delegated->head, struct mptcp_subflow_context, delegated_node);
++ 	list_del_init(&ret->delegated_node);
++ 	return ret;
++ }
++ 
++ static inline bool mptcp_subflow_has_delegated_action(const struct mptcp_subflow_context *subflow)
++ {
++ 	return test_bit(MPTCP_DELEGATE_SEND, &subflow->delegated_status);
++ }
++ 
++ static inline void mptcp_subflow_delegated_done(struct mptcp_subflow_context *subflow)
++ {
++ 	/* pairs with mptcp_subflow_delegate, ensures delegate_node is updated before
++ 	 * touching the status bit
++ 	 */
++ 	smp_wmb();
++ 	clear_bit(MPTCP_DELEGATE_SEND, &subflow->delegated_status);
++ }
++ 
+++>>>>>>> b19bc2945b40 (mptcp: implement delegated actions)
+  int mptcp_is_enabled(struct net *net);
+ -unsigned int mptcp_get_add_addr_timeout(struct net *net);
+  void mptcp_subflow_fully_established(struct mptcp_subflow_context *subflow,
+  				     struct mptcp_options_received *mp_opt);
+  bool mptcp_subflow_data_available(struct sock *sk);
+diff --cc net/mptcp/subflow.c
+index 8dfa18e07548,721059916c96..000000000000
+--- a/net/mptcp/subflow.c
++++ b/net/mptcp/subflow.c
+@@@ -1284,10 -1404,19 +1312,16 @@@ static void subflow_ulp_release(struct 
+  	if (!ctx)
+  		return;
+  
+ -	sk = ctx->conn;
+ -	if (sk) {
+ -		/* if the msk has been orphaned, keep the ctx
+ -		 * alive, will be freed by __mptcp_close_ssk(),
+ -		 * when the subflow is still unaccepted
+ -		 */
+ -		release = ctx->disposable || list_empty(&ctx->node);
+ -		sock_put(sk);
+ -	}
+ +	if (ctx->conn)
+ +		sock_put(ctx->conn);
+  
+++<<<<<<< HEAD
+ +	kfree_rcu(ctx, rcu);
+++=======
++ 	mptcp_subflow_ops_undo_override(ssk);
++ 	if (release)
++ 		kfree_rcu(ctx, rcu);
+++>>>>>>> b19bc2945b40 (mptcp: implement delegated actions)
+  }
+  
+  static void subflow_ulp_clone(const struct request_sock *req,
+@@@ -1377,11 -1517,13 +1421,14 @@@ void mptcp_subflow_init(void
+  	subflow_specific.conn_request = subflow_v4_conn_request;
+  	subflow_specific.syn_recv_sock = subflow_syn_recv_sock;
+  	subflow_specific.sk_rx_dst_set = subflow_finish_connect;
+ +	subflow_specific.rebuild_header = subflow_rebuild_header;
+  
++ 	tcp_prot_override = tcp_prot;
++ 	tcp_prot_override.release_cb = tcp_release_cb_override;
++ 
+  #if IS_ENABLED(CONFIG_MPTCP_IPV6)
+  	subflow_request_sock_ipv6_ops = tcp_request_sock_ipv6_ops;
+ -	subflow_request_sock_ipv6_ops.route_req = subflow_v6_route_req;
+ +	subflow_request_sock_ipv6_ops.init_req = subflow_v6_init_req;
+  
+  	subflow_v6_specific = ipv6_specific;
+  	subflow_v6_specific.conn_request = subflow_v6_conn_request;
+* Unmerged path net/mptcp/protocol.c
+* Unmerged path net/mptcp/protocol.h
+* Unmerged path net/mptcp/subflow.c
