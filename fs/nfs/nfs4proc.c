@@ -4830,7 +4830,7 @@ static int nfs4_do_create(struct inode *dir, struct dentry *dentry, struct nfs4_
 		if (data->arg.ftype == NF4DIR)
 			nfs4_inc_nlink_locked(dir);
 		spin_unlock(&dir->i_lock);
-		status = nfs_instantiate(dentry, data->res.fh, data->res.fattr, data->res.fattr->label);
+		status = nfs_instantiate(dentry, data->res.fh, data->res.fattr);
 	}
 	return status;
 }
