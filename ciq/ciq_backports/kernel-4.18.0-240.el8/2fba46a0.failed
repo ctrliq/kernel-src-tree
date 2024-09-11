@@ -1,0 +1,401 @@
+gfs2: Change inode qa_data to allow multiple users
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Bob Peterson <rpeterso@redhat.com>
+commit 2fba46a04c383f91e7fe837d43bf1ab33ce32b6a
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/2fba46a0.failed
+
+Before this patch, multiple users called gfs2_qa_alloc which allocated
+a qadata structure to the inode, if quotas are turned on. Later, in
+file close or evict, the structure was deleted with gfs2_qa_delete.
+But there can be several competing processes who need access to the
+structure. There were races between file close (release) and the others.
+Thus, a release could delete the structure out from under a process
+that relied upon its existence. For example, chown.
+
+This patch changes the management of the qadata structures to be
+a get/put scheme. Function gfs2_qa_alloc has been changed to gfs2_qa_get
+and if the structure is allocated, the count essentially starts out at
+1. Function gfs2_qa_delete has been renamed to gfs2_qa_put, and the
+last guy to decrement the count to 0 frees the memory.
+
+	Signed-off-by: Bob Peterson <rpeterso@redhat.com>
+(cherry picked from commit 2fba46a04c383f91e7fe837d43bf1ab33ce32b6a)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/gfs2/acl.c
+#	fs/gfs2/bmap.c
+#	fs/gfs2/file.c
+#	fs/gfs2/inode.c
+#	fs/gfs2/quota.c
+#	fs/gfs2/xattr.c
+diff --cc fs/gfs2/acl.c
+index af5f87a493d9,2e939f5fe751..000000000000
+--- a/fs/gfs2/acl.c
++++ b/fs/gfs2/acl.c
+@@@ -119,7 -117,7 +119,11 @@@ int gfs2_set_acl(struct inode *inode, s
+  	if (acl && acl->a_count > GFS2_ACL_MAX_ENTRIES(GFS2_SB(inode)))
+  		return -E2BIG;
+  
+++<<<<<<< HEAD
+ +	ret = gfs2_rsqa_alloc(ip);
+++=======
++ 	ret = gfs2_qa_get(ip);
+++>>>>>>> 2fba46a04c38 (gfs2: Change inode qa_data to allow multiple users)
+  	if (ret)
+  		return ret;
+  
+diff --cc fs/gfs2/bmap.c
+index a469a0138165,d510a453dfa8..000000000000
+--- a/fs/gfs2/bmap.c
++++ b/fs/gfs2/bmap.c
+@@@ -2234,7 -2183,7 +2234,11 @@@ int gfs2_setattr_size(struct inode *ino
+  
+  	inode_dio_wait(inode);
+  
+++<<<<<<< HEAD
+ +	ret = gfs2_rsqa_alloc(ip);
+++=======
++ 	ret = gfs2_qa_get(ip);
+++>>>>>>> 2fba46a04c38 (gfs2: Change inode qa_data to allow multiple users)
+  	if (ret)
+  		goto out;
+  
+diff --cc fs/gfs2/file.c
+index a25b1766d059,f18876cdfb0f..000000000000
+--- a/fs/gfs2/file.c
++++ b/fs/gfs2/file.c
+@@@ -405,7 -458,7 +405,11 @@@ static vm_fault_t gfs2_page_mkwrite(str
+  
+  	sb_start_pagefault(inode->i_sb);
+  
+++<<<<<<< HEAD
+ +	ret = gfs2_rsqa_alloc(ip);
+++=======
++ 	ret = gfs2_qa_get(ip);
+++>>>>>>> 2fba46a04c38 (gfs2: Change inode qa_data to allow multiple users)
+  	if (ret)
+  		goto out;
+  
+@@@ -780,9 -856,9 +793,13 @@@ static ssize_t gfs2_file_write_iter(str
+  	struct file *file = iocb->ki_filp;
+  	struct inode *inode = file_inode(file);
+  	struct gfs2_inode *ip = GFS2_I(inode);
+ -	ssize_t ret;
+ +	ssize_t written = 0, ret;
+  
+++<<<<<<< HEAD
+ +	ret = gfs2_rsqa_alloc(ip);
+++=======
++ 	ret = gfs2_qa_get(ip);
+++>>>>>>> 2fba46a04c38 (gfs2: Change inode qa_data to allow multiple users)
+  	if (ret)
+  		return ret;
+  
+@@@ -830,38 -904,32 +847,44 @@@
+  		/*
+  		 * We need to ensure that the page cache pages are written to
+  		 * disk and invalidated to preserve the expected O_DIRECT
+ -		 * semantics.  If the writeback or invalidate fails, only report
+ -		 * the direct I/O range as we don't know if the buffered pages
+ -		 * made it to disk.
+ +		 * semantics.
+  		 */
+ -		iocb->ki_pos += buffered;
+ -		ret2 = generic_write_sync(iocb, buffered);
+ -		invalidate_mapping_pages(mapping,
+ -				(iocb->ki_pos - buffered) >> PAGE_SHIFT,
+ -				(iocb->ki_pos - 1) >> PAGE_SHIFT);
+ -		if (!ret || ret2 > 0)
+ -			ret += ret2;
+ +		pos = iocb->ki_pos;
+ +		endbyte = pos + buffered - 1;
+ +		ret = filemap_write_and_wait_range(mapping, pos, endbyte);
+ +		if (!ret) {
+ +			iocb->ki_pos += buffered;
+ +			written += buffered;
+ +			invalidate_mapping_pages(mapping,
+ +						 pos >> PAGE_SHIFT,
+ +						 endbyte >> PAGE_SHIFT);
+ +		} else {
+ +			/*
+ +			 * We don't know how much we wrote, so just return
+ +			 * the number of bytes which were direct-written
+ +			 */
+ +		}
+  	} else {
+ -		current->backing_dev_info = inode_to_bdi(inode);
+  		ret = iomap_file_buffered_write(iocb, from, &gfs2_iomap_ops);
+ -		current->backing_dev_info = NULL;
+ -		if (likely(ret > 0)) {
+ +		if (likely(ret > 0))
+  			iocb->ki_pos += ret;
+ -			ret = generic_write_sync(iocb, ret);
+ -		}
+  	}
+  
+ -out_unlock:
+ +out2:
+ +	current->backing_dev_info = NULL;
+ +out:
+  	inode_unlock(inode);
+++<<<<<<< HEAD
+ +	if (likely(ret > 0)) {
+ +		/* Handle various SYNC-type writes */
+ +		ret = generic_write_sync(iocb, ret);
+ +	}
+ +	return written ? written : ret;
+++=======
++ out:
++ 	gfs2_qa_put(ip);
++ 	return ret;
+++>>>>>>> 2fba46a04c38 (gfs2: Change inode qa_data to allow multiple users)
+  }
+  
+  static int fallocate_chunk(struct inode *inode, loff_t offset, loff_t len,
+@@@ -1091,7 -1160,7 +1114,11 @@@ static long gfs2_fallocate(struct file 
+  	if (mode & FALLOC_FL_PUNCH_HOLE) {
+  		ret = __gfs2_punch_hole(file, offset, len);
+  	} else {
+++<<<<<<< HEAD
+ +		ret = gfs2_rsqa_alloc(ip);
+++=======
++ 		ret = gfs2_qa_get(ip);
+++>>>>>>> 2fba46a04c38 (gfs2: Change inode qa_data to allow multiple users)
+  		if (ret)
+  			goto out_putw;
+  
+@@@ -1117,8 -1187,9 +1145,13 @@@ static ssize_t gfs2_file_splice_write(s
+  {
+  	int error;
+  	struct gfs2_inode *ip = GFS2_I(out->f_mapping->host);
++ 	ssize_t ret;
+  
+++<<<<<<< HEAD
+ +	error = gfs2_rsqa_alloc(ip);
+++=======
++ 	error = gfs2_qa_get(ip);
+++>>>>>>> 2fba46a04c38 (gfs2: Change inode qa_data to allow multiple users)
+  	if (error)
+  		return (ssize_t)error;
+  
+diff --cc fs/gfs2/inode.c
+index 867d3237b9a9,d1a24753c55f..000000000000
+--- a/fs/gfs2/inode.c
++++ b/fs/gfs2/inode.c
+@@@ -591,7 -588,7 +591,11 @@@ static int gfs2_create_inode(struct ino
+  	if (!name->len || name->len > GFS2_FNAMESIZE)
+  		return -ENAMETOOLONG;
+  
+++<<<<<<< HEAD
+ +	error = gfs2_rsqa_alloc(dip);
+++=======
++ 	error = gfs2_qa_get(dip);
+++>>>>>>> 2fba46a04c38 (gfs2: Change inode qa_data to allow multiple users)
+  	if (error)
+  		return error;
+  
+@@@ -644,7 -641,7 +648,11 @@@
+  		goto fail_gunlock;
+  
+  	ip = GFS2_I(inode);
+++<<<<<<< HEAD
+ +	error = gfs2_rsqa_alloc(ip);
+++=======
++ 	error = gfs2_qa_get(ip);
+++>>>>>>> 2fba46a04c38 (gfs2: Change inode qa_data to allow multiple users)
+  	if (error)
+  		goto fail_free_acls;
+  
+@@@ -774,11 -772,11 +782,12 @@@
+  fail_gunlock3:
+  	glock_clear_object(io_gl, ip);
+  	gfs2_glock_dq_uninit(&ip->i_iopen_gh);
+ -fail_gunlock2:
+ -	clear_bit(GLF_INODE_CREATING, &io_gl->gl_flags);
+  	gfs2_glock_put(io_gl);
+ +fail_gunlock2:
+ +	if (io_gl)
+ +		clear_bit(GLF_INODE_CREATING, &io_gl->gl_flags);
+  fail_free_inode:
++ 	gfs2_qa_put(ip);
+  	if (ip->i_gl) {
+  		glock_clear_object(ip->i_gl, ip);
+  		gfs2_glock_put(ip->i_gl);
+@@@ -903,7 -901,7 +913,11 @@@ static int gfs2_link(struct dentry *old
+  	if (S_ISDIR(inode->i_mode))
+  		return -EPERM;
+  
+++<<<<<<< HEAD
+ +	error = gfs2_rsqa_alloc(dip);
+++=======
++ 	error = gfs2_qa_get(dip);
+++>>>>>>> 2fba46a04c38 (gfs2: Change inode qa_data to allow multiple users)
+  	if (error)
+  		return error;
+  
+@@@ -1367,7 -1365,7 +1382,11 @@@ static int gfs2_rename(struct inode *od
+  	if (error)
+  		return error;
+  
+++<<<<<<< HEAD
+ +	error = gfs2_rsqa_alloc(ndip);
+++=======
++ 	error = gfs2_qa_get(ndip);
+++>>>>>>> 2fba46a04c38 (gfs2: Change inode qa_data to allow multiple users)
+  	if (error)
+  		return error;
+  
+@@@ -1878,10 -1877,9 +1898,14 @@@ static int setattr_chown(struct inode *
+  		ouid = nuid = NO_UID_QUOTA_CHANGE;
+  	if (!(attr->ia_valid & ATTR_GID) || gid_eq(ogid, ngid))
+  		ogid = ngid = NO_GID_QUOTA_CHANGE;
+++<<<<<<< HEAD
+ +
+ +	error = gfs2_rsqa_alloc(ip);
+++=======
++ 	error = gfs2_qa_get(ip);
+++>>>>>>> 2fba46a04c38 (gfs2: Change inode qa_data to allow multiple users)
+  	if (error)
+- 		goto out;
++ 		return error;
+  
+  	error = gfs2_rindex_update(sdp);
+  	if (error)
+@@@ -1940,7 -1939,7 +1965,11 @@@ static int gfs2_setattr(struct dentry *
+  	struct gfs2_holder i_gh;
+  	int error;
+  
+++<<<<<<< HEAD
+ +	error = gfs2_rsqa_alloc(ip);
+++=======
++ 	error = gfs2_qa_get(ip);
+++>>>>>>> 2fba46a04c38 (gfs2: Change inode qa_data to allow multiple users)
+  	if (error)
+  		return error;
+  
+diff --cc fs/gfs2/quota.c
+index 0efae7a0ee80,cc0c4b5800be..000000000000
+--- a/fs/gfs2/quota.c
++++ b/fs/gfs2/quota.c
+@@@ -569,11 -570,9 +573,17 @@@ int gfs2_quota_hold(struct gfs2_inode *
+  	if (sdp->sd_args.ar_quota == GFS2_QUOTA_OFF)
+  		return 0;
+  
+++<<<<<<< HEAD
+ +	if (ip->i_qadata == NULL) {
+ +		error = gfs2_rsqa_alloc(ip);
+ +		if (error)
+ +			return error;
+ +	}
+++=======
++ 	error = gfs2_qa_get(ip);
++ 	if (error)
++ 		return error;
+++>>>>>>> 2fba46a04c38 (gfs2: Change inode qa_data to allow multiple users)
+  
+  	qd = ip->i_qadata->qa_qd;
+  
+@@@ -879,7 -883,7 +894,11 @@@ static int do_sync(unsigned int num_qd
+  	unsigned int nalloc = 0, blocks;
+  	int error;
+  
+++<<<<<<< HEAD
+ +	error = gfs2_rsqa_alloc(ip);
+++=======
++ 	error = gfs2_qa_get(ip);
+++>>>>>>> 2fba46a04c38 (gfs2: Change inode qa_data to allow multiple users)
+  	if (error)
+  		return error;
+  
+@@@ -1677,7 -1689,7 +1701,11 @@@ static int gfs2_set_dqblk(struct super_
+  	if (error)
+  		return error;
+  
+++<<<<<<< HEAD
+ +	error = gfs2_rsqa_alloc(ip);
+++=======
++ 	error = gfs2_qa_get(ip);
+++>>>>>>> 2fba46a04c38 (gfs2: Change inode qa_data to allow multiple users)
+  	if (error)
+  		goto out_put;
+  
+diff --cc fs/gfs2/xattr.c
+index 38515988aaf7,9d7667bc4292..000000000000
+--- a/fs/gfs2/xattr.c
++++ b/fs/gfs2/xattr.c
+@@@ -1225,7 -1222,7 +1225,11 @@@ static int gfs2_xattr_set(const struct 
+  	struct gfs2_holder gh;
+  	int ret;
+  
+++<<<<<<< HEAD
+ +	ret = gfs2_rsqa_alloc(ip);
+++=======
++ 	ret = gfs2_qa_get(ip);
+++>>>>>>> 2fba46a04c38 (gfs2: Change inode qa_data to allow multiple users)
+  	if (ret)
+  		return ret;
+  
+* Unmerged path fs/gfs2/acl.c
+* Unmerged path fs/gfs2/bmap.c
+* Unmerged path fs/gfs2/file.c
+diff --git a/fs/gfs2/incore.h b/fs/gfs2/incore.h
+index bfd74134b369..c7622c2c59f0 100644
+--- a/fs/gfs2/incore.h
++++ b/fs/gfs2/incore.h
+@@ -297,6 +297,7 @@ struct gfs2_qadata { /* quota allocation data */
+ 	struct gfs2_quota_data *qa_qd[2 * GFS2_MAXQUOTAS];
+ 	struct gfs2_holder qa_qd_ghs[2 * GFS2_MAXQUOTAS];
+ 	unsigned int qa_qd_num;
++	int qa_ref;
+ };
+ 
+ /* Resource group multi-block reservation, in order of appearance:
+* Unmerged path fs/gfs2/inode.c
+* Unmerged path fs/gfs2/quota.c
+diff --git a/fs/gfs2/quota.h b/fs/gfs2/quota.h
+index 836f29480be6..deadec556896 100644
+--- a/fs/gfs2/quota.h
++++ b/fs/gfs2/quota.h
+@@ -18,8 +18,8 @@ struct gfs2_sbd;
+ #define NO_UID_QUOTA_CHANGE INVALID_UID
+ #define NO_GID_QUOTA_CHANGE INVALID_GID
+ 
+-extern int gfs2_qa_alloc(struct gfs2_inode *ip);
+-extern void gfs2_qa_delete(struct gfs2_inode *ip, atomic_t *wcount);
++extern int gfs2_qa_get(struct gfs2_inode *ip);
++extern void gfs2_qa_put(struct gfs2_inode *ip);
+ extern int gfs2_quota_hold(struct gfs2_inode *ip, kuid_t uid, kgid_t gid);
+ extern void gfs2_quota_unhold(struct gfs2_inode *ip);
+ 
+diff --git a/fs/gfs2/rgrp.c b/fs/gfs2/rgrp.c
+index 211781482cc9..2d4596d2d7ac 100644
+--- a/fs/gfs2/rgrp.c
++++ b/fs/gfs2/rgrp.c
+@@ -700,7 +700,7 @@ void gfs2_rsqa_delete(struct gfs2_inode *ip, atomic_t *wcount)
+ 	if ((wcount == NULL) || (atomic_read(wcount) <= 1))
+ 		gfs2_rs_deltree(&ip->i_res);
+ 	up_write(&ip->i_rw_mutex);
+-	gfs2_qa_delete(ip, wcount);
++	gfs2_qa_put(ip);
+ }
+ 
+ /**
+diff --git a/fs/gfs2/super.c b/fs/gfs2/super.c
+index 54e9fed68925..c6dac5508ebd 100644
+--- a/fs/gfs2/super.c
++++ b/fs/gfs2/super.c
+@@ -1695,6 +1695,8 @@ static void gfs2_evict_inode(struct inode *inode)
+ out:
+ 	/* Case 3 starts here */
+ 	truncate_inode_pages_final(&inode->i_data);
++	if (ip->i_qadata)
++		gfs2_assert_warn(sdp, ip->i_qadata->qa_ref == 0);
+ 	gfs2_rsqa_delete(ip, NULL);
+ 	gfs2_ordered_del_inode(ip);
+ 	clear_inode(inode);
+* Unmerged path fs/gfs2/xattr.c
