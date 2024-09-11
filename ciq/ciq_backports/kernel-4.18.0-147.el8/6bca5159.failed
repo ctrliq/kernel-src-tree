@@ -1,0 +1,205 @@
+powerpc/powernv/npu: Fix oops in pnv_try_setup_npu_table_group()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-147.el8
+commit-author Frederic Barrat <fbarrat@linux.ibm.com>
+commit 6bca515917515b66b7e1dfc1d1d3b7bd8058315c
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-147.el8/6bca5159.failed
+
+With a recent change around IOMMU group, a system with an opencapi
+adapter is no longer booting and we get a kernel oops:
+
+  BUG: Kernel NULL pointer dereference at 0x00000028
+  Faulting instruction address: 0xc0000000000aa38c
+  ...
+  NIP pnv_try_setup_npu_table_group+0x1c/0x1a0
+  LR  pnv_pci_ioda_fixup+0x1f8/0x660
+  Call Trace:
+    pnv_try_setup_npu_table_group+0x60/0x
+    pnv_pci_ioda_fixup+0x20c/0x660
+    pcibios_resource_survey+0x2c8/0x31c
+    pcibios_init+0xb0/0xe4
+    do_one_initcall+0x64/0x264
+    kernel_init_freeable+0x36c/0x468
+    kernel_init+0x2c/0x148
+    ret_from_kernel_thread+0x5c/0x68
+
+An opencapi device is using a device PE, so the current code breaks
+because pe->pbus is not defined.
+
+More generally, there's no need to define an IOMMU group for opencapi,
+as the device sends real addresses directly (admittedly, the
+virtualization story is yet to be written). So let's fix it by
+skipping the IOMMU group setup for opencapi PHBs.
+
+Fixes: 0bd971676e68 ("powerpc/powernv/npu: Add compound IOMMU groups")
+	Signed-off-by: Frederic Barrat <fbarrat@linux.ibm.com>
+	Reviewed-by: Greg Kurz <groug@kaod.org>
+	Reviewed-by: Andrew Donnellan <andrew.donnellan@au1.ibm.com>
+	Signed-off-by: Michael Ellerman <mpe@ellerman.id.au>
+(cherry picked from commit 6bca515917515b66b7e1dfc1d1d3b7bd8058315c)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/powerpc/platforms/powernv/pci-ioda.c
+diff --cc arch/powerpc/platforms/powernv/pci-ioda.c
+index ef463c498398,7db3119f8a5b..000000000000
+--- a/arch/powerpc/platforms/powernv/pci-ioda.c
++++ b/arch/powerpc/platforms/powernv/pci-ioda.c
+@@@ -2642,91 -2629,79 +2642,97 @@@ static struct iommu_table_group_ops pnv
+  	.release_ownership = pnv_ioda2_release_ownership,
+  };
+  
+ -static void pnv_ioda_setup_bus_iommu_group_add_devices(struct pnv_ioda_pe *pe,
+ -		struct iommu_table_group *table_group,
+ -		struct pci_bus *bus)
+ +static int gpe_table_group_to_npe_cb(struct device *dev, void *opaque)
+  {
+ -	struct pci_dev *dev;
+ +	struct pci_controller *hose;
+ +	struct pnv_phb *phb;
+ +	struct pnv_ioda_pe **ptmppe = opaque;
+ +	struct pci_dev *pdev = container_of(dev, struct pci_dev, dev);
+ +	struct pci_dn *pdn = pci_get_pdn(pdev);
+  
+ -	list_for_each_entry(dev, &bus->devices, bus_list) {
+ -		iommu_add_device(table_group, &dev->dev);
+ +	if (!pdn || pdn->pe_number == IODA_INVALID_PE)
+ +		return 0;
+  
+ -		if ((pe->flags & PNV_IODA_PE_BUS_ALL) && dev->subordinate)
+ -			pnv_ioda_setup_bus_iommu_group_add_devices(pe,
+ -					table_group, dev->subordinate);
+ -	}
+++<<<<<<< HEAD
+ +	hose = pci_bus_to_host(pdev->bus);
+ +	phb = hose->private_data;
+ +	if (phb->type != PNV_PHB_NPU_NVLINK)
+ +		return 0;
+++=======
+++		if (phb->type == PNV_PHB_NPU_NVLINK ||
+++		    phb->type == PNV_PHB_NPU_OCAPI)
+++			continue;
+++>>>>>>> 6bca51591751 (powerpc/powernv/npu: Fix oops in pnv_try_setup_npu_table_group())
+ +
+ +	*ptmppe = &phb->ioda.pe_array[pdn->pe_number];
+ +
+ +	return 1;
+  }
+  
+ -static void pnv_ioda_setup_bus_iommu_group(struct pnv_ioda_pe *pe,
+ -		struct iommu_table_group *table_group, struct pci_bus *bus)
+ +/*
+ + * This returns PE of associated NPU.
+ + * This assumes that NPU is in the same IOMMU group with GPU and there is
+ + * no other PEs.
+ + */
+ +static struct pnv_ioda_pe *gpe_table_group_to_npe(
+ +		struct iommu_table_group *table_group)
+  {
+ +	struct pnv_ioda_pe *npe = NULL;
+ +	int ret = iommu_group_for_each_dev(table_group->group, &npe,
+ +			gpe_table_group_to_npe_cb);
+  
+ -	if (pe->flags & PNV_IODA_PE_DEV)
+ -		iommu_add_device(table_group, &pe->pdev->dev);
+ +	BUG_ON(!ret || !npe);
+  
+ -	if ((pe->flags & (PNV_IODA_PE_BUS | PNV_IODA_PE_BUS_ALL)) || bus)
+ -		pnv_ioda_setup_bus_iommu_group_add_devices(pe, table_group,
+ -				bus);
+ +	return npe;
+  }
+  
+ -static unsigned long pnv_ioda_parse_tce_sizes(struct pnv_phb *phb);
+ +static long pnv_pci_ioda2_npu_set_window(struct iommu_table_group *table_group,
+ +		int num, struct iommu_table *tbl)
+ +{
+ +	long ret = pnv_pci_ioda2_set_window(table_group, num, tbl);
+ +
+ +	if (ret)
+ +		return ret;
+  
+ -static void pnv_pci_ioda_setup_iommu_api(void)
+ +	ret = pnv_npu_set_window(gpe_table_group_to_npe(table_group), num, tbl);
+ +	if (ret)
+ +		pnv_pci_ioda2_unset_window(table_group, num);
+ +
+ +	return ret;
+ +}
+ +
+ +static long pnv_pci_ioda2_npu_unset_window(
+ +		struct iommu_table_group *table_group,
+ +		int num)
+  {
+ -	struct pci_controller *hose;
+ -	struct pnv_phb *phb;
+ -	struct pnv_ioda_pe *pe;
+ +	long ret = pnv_pci_ioda2_unset_window(table_group, num);
+  
+ -	/*
+ -	 * There are 4 types of PEs:
+ -	 * - PNV_IODA_PE_BUS: a downstream port with an adapter,
+ -	 *   created from pnv_pci_setup_bridge();
+ -	 * - PNV_IODA_PE_BUS_ALL: a PCI-PCIX bridge with devices behind it,
+ -	 *   created from pnv_pci_setup_bridge();
+ -	 * - PNV_IODA_PE_VF: a SRIOV virtual function,
+ -	 *   created from pnv_pcibios_sriov_enable();
+ -	 * - PNV_IODA_PE_DEV: an NPU or OCAPI device,
+ -	 *   created from pnv_pci_ioda_fixup().
+ -	 *
+ -	 * Normally a PE is represented by an IOMMU group, however for
+ -	 * devices with side channels the groups need to be more strict.
+ -	 */
+ -	list_for_each_entry(hose, &hose_list, list_node) {
+ -		phb = hose->private_data;
+ +	if (ret)
+ +		return ret;
+  
+ -		if (phb->type == PNV_PHB_NPU_NVLINK ||
+ -		    phb->type == PNV_PHB_NPU_OCAPI)
+ -			continue;
+ +	return pnv_npu_unset_window(gpe_table_group_to_npe(table_group), num);
+ +}
+  
+ -		list_for_each_entry(pe, &phb->ioda.pe_list, list) {
+ -			struct iommu_table_group *table_group;
+ +static void pnv_ioda2_npu_take_ownership(struct iommu_table_group *table_group)
+ +{
+ +	pnv_npu_take_ownership(gpe_table_group_to_npe(table_group));
+ +	pnv_ioda2_take_ownership(table_group);
+ +}
+  
+ -			table_group = pnv_try_setup_npu_table_group(pe);
+ -			if (!table_group) {
+ -				if (!pnv_pci_ioda_pe_dma_weight(pe))
+ -					continue;
+ +static struct iommu_table_group_ops pnv_pci_ioda2_npu_ops = {
+ +	.get_table_size = pnv_pci_ioda2_get_table_size,
+ +	.create_table = pnv_pci_ioda2_create_table_userspace,
+ +	.set_window = pnv_pci_ioda2_npu_set_window,
+ +	.unset_window = pnv_pci_ioda2_npu_unset_window,
+ +	.take_ownership = pnv_ioda2_npu_take_ownership,
+ +	.release_ownership = pnv_ioda2_release_ownership,
+ +};
+  
+ -				table_group = &pe->table_group;
+ -				iommu_register_group(&pe->table_group,
+ -						pe->phb->hose->global_number,
+ -						pe->pe_number);
+ -			}
+ -			pnv_ioda_setup_bus_iommu_group(pe, table_group,
+ -					pe->pbus);
+ -		}
+ -	}
+ +static void pnv_pci_ioda_setup_iommu_api(void)
+ +{
+ +	struct pci_controller *hose, *tmp;
+ +	struct pnv_phb *phb;
+ +	struct pnv_ioda_pe *pe, *gpe;
+  
+  	/*
+  	 * Now we have all PHBs discovered, time to add NPU devices to
+* Unmerged path arch/powerpc/platforms/powernv/pci-ioda.c
