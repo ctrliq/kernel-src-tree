@@ -2559,6 +2559,7 @@ static int kvm_pv_enable_async_pf(struct kvm_vcpu *vcpu, u64 data)
 static void kvmclock_reset(struct kvm_vcpu *vcpu)
 {
 	vcpu->arch.pv_time_enabled = false;
+	vcpu->arch.time = 0;
 }
 
 static void kvm_vcpu_flush_tlb(struct kvm_vcpu *vcpu, bool invalidate_gpa)
@@ -2724,8 +2725,6 @@ int kvm_set_msr_common(struct kvm_vcpu *vcpu, struct msr_data *msr_info)
 	case MSR_KVM_SYSTEM_TIME: {
 		struct kvm_arch *ka = &vcpu->kvm->arch;
 
-		kvmclock_reset(vcpu);
-
 		if (vcpu->vcpu_id == 0 && !msr_info->host_initiated) {
 			bool tmp = (msr == MSR_KVM_SYSTEM_TIME);
 
@@ -2739,14 +2738,13 @@ int kvm_set_msr_common(struct kvm_vcpu *vcpu, struct msr_data *msr_info)
 		kvm_make_request(KVM_REQ_GLOBAL_CLOCK_UPDATE, vcpu);
 
 		/* we verify if the enable bit is set... */
+		vcpu->arch.pv_time_enabled = false;
 		if (!(data & 1))
 			break;
 
-		if (kvm_gfn_to_hva_cache_init(vcpu->kvm,
+		if (!kvm_gfn_to_hva_cache_init(vcpu->kvm,
 		     &vcpu->arch.pv_time, data & ~1ULL,
 		     sizeof(struct pvclock_vcpu_time_info)))
-			vcpu->arch.pv_time_enabled = false;
-		else
 			vcpu->arch.pv_time_enabled = true;
 
 		break;
