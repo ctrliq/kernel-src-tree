@@ -1,0 +1,214 @@
+drm/i915: Extract skl SAGV checking
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Stanislav Lisovskiy <stanislav.lisovskiy@intel.com>
+commit 1d0a6c8486aa53f7545e80f5f0293ed99e48ffc0
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/1d0a6c84.failed
+
+Introduce platform dependent SAGV checking in
+combination with bandwidth state pipe SAGV mask.
+
+This is preparation to adding TGL support, which
+requires different way of SAGV checking.
+
+v2, v3, v4, v5, v6: Fix rebase conflict
+
+v7: - Nuke icl specific function, use skl
+      for icl as well, gen specific active_pipes
+      check to be added in the next patch(Ville)
+
+v8: - Use more generic intel_crtc_can_enable_sagv
+      for checking(Ville)
+
+	Signed-off-by: Stanislav Lisovskiy <stanislav.lisovskiy@intel.com>
+	Signed-off-by: Ville Syrjälä <ville.syrjala@linux.intel.com>
+Link: https://patchwork.freedesktop.org/patch/msgid/20200513093816.11466-3-stanislav.lisovskiy@intel.com
+(cherry picked from commit 1d0a6c8486aa53f7545e80f5f0293ed99e48ffc0)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/gpu/drm/i915/intel_pm.c
+diff --cc drivers/gpu/drm/i915/intel_pm.c
+index 8862271193ca,3df8e60c6153..000000000000
+--- a/drivers/gpu/drm/i915/intel_pm.c
++++ b/drivers/gpu/drm/i915/intel_pm.c
+@@@ -3744,17 -3758,59 +3744,68 @@@ intel_disable_sagv(struct drm_i915_priv
+  	return 0;
+  }
+  
+ -void intel_sagv_pre_plane_update(struct intel_atomic_state *state)
+ +bool intel_can_enable_sagv(struct drm_atomic_state *state)
+  {
+++<<<<<<< HEAD
+ +	struct drm_device *dev = state->dev;
+ +	struct drm_i915_private *dev_priv = to_i915(dev);
+ +	struct intel_atomic_state *intel_state = to_intel_atomic_state(state);
+ +	struct intel_crtc *crtc;
+++=======
++ 	struct drm_i915_private *dev_priv = to_i915(state->base.dev);
++ 	const struct intel_bw_state *new_bw_state;
++ 
++ 	/*
++ 	 * Just return if we can't control SAGV or don't have it.
++ 	 * This is different from situation when we have SAGV but just can't
++ 	 * afford it due to DBuf limitation - in case if SAGV is completely
++ 	 * disabled in a BIOS, we are not even allowed to send a PCode request,
++ 	 * as it will throw an error. So have to check it here.
++ 	 */
++ 	if (!intel_has_sagv(dev_priv))
++ 		return;
++ 
++ 	new_bw_state = intel_atomic_get_new_bw_state(state);
++ 	if (!new_bw_state)
++ 		return;
++ 
++ 	if (!intel_can_enable_sagv(new_bw_state))
++ 		intel_disable_sagv(dev_priv);
++ }
++ 
++ void intel_sagv_post_plane_update(struct intel_atomic_state *state)
++ {
++ 	struct drm_i915_private *dev_priv = to_i915(state->base.dev);
++ 	const struct intel_bw_state *new_bw_state;
++ 
++ 	/*
++ 	 * Just return if we can't control SAGV or don't have it.
++ 	 * This is different from situation when we have SAGV but just can't
++ 	 * afford it due to DBuf limitation - in case if SAGV is completely
++ 	 * disabled in a BIOS, we are not even allowed to send a PCode request,
++ 	 * as it will throw an error. So have to check it here.
++ 	 */
++ 	if (!intel_has_sagv(dev_priv))
++ 		return;
++ 
++ 	new_bw_state = intel_atomic_get_new_bw_state(state);
++ 	if (!new_bw_state)
++ 		return;
++ 
++ 	if (intel_can_enable_sagv(new_bw_state))
++ 		intel_enable_sagv(dev_priv);
++ }
++ 
++ static bool skl_crtc_can_enable_sagv(const struct intel_crtc_state *crtc_state)
++ {
++ 	struct intel_crtc *crtc = to_intel_crtc(crtc_state->uapi.crtc);
++ 	struct drm_i915_private *dev_priv = to_i915(crtc->base.dev);
+++>>>>>>> 1d0a6c8486aa (drm/i915: Extract skl SAGV checking)
+  	struct intel_plane *plane;
+ -	const struct intel_plane_state *plane_state;
+ +	struct intel_crtc_state *cstate;
+ +	enum pipe pipe;
+  	int level, latency;
+ +	int sagv_block_time_us;
+  
+  	if (!intel_has_sagv(dev_priv))
+  		return false;
+@@@ -3819,17 -3853,93 +3870,103 @@@
+  	return true;
+  }
+  
+++<<<<<<< HEAD
+ +static u16 intel_get_ddb_size(struct drm_i915_private *dev_priv,
+ +			      const struct intel_crtc_state *cstate,
+ +			      const u64 total_data_rate,
+ +			      const int num_active,
+ +			      struct skl_ddb_allocation *ddb)
+++=======
++ static bool intel_crtc_can_enable_sagv(const struct intel_crtc_state *crtc_state)
++ {
++ 	return skl_crtc_can_enable_sagv(crtc_state);
++ }
++ 
++ bool intel_can_enable_sagv(const struct intel_bw_state *bw_state)
++ {
++ 	if (bw_state->active_pipes && !is_power_of_2(bw_state->active_pipes))
++ 		return false;
++ 
++ 	return bw_state->pipe_sagv_reject == 0;
++ }
++ 
++ static int intel_compute_sagv_mask(struct intel_atomic_state *state)
++ {
++ 	int ret;
++ 	struct intel_crtc *crtc;
++ 	const struct intel_crtc_state *new_crtc_state;
++ 	struct intel_bw_state *new_bw_state = NULL;
++ 	const struct intel_bw_state *old_bw_state = NULL;
++ 	int i;
++ 
++ 	for_each_new_intel_crtc_in_state(state, crtc,
++ 					 new_crtc_state, i) {
++ 		new_bw_state = intel_atomic_get_bw_state(state);
++ 		if (IS_ERR(new_bw_state))
++ 			return PTR_ERR(new_bw_state);
++ 
++ 		old_bw_state = intel_atomic_get_old_bw_state(state);
++ 
++ 		if (intel_crtc_can_enable_sagv(new_crtc_state))
++ 			new_bw_state->pipe_sagv_reject &= ~BIT(crtc->pipe);
++ 		else
++ 			new_bw_state->pipe_sagv_reject |= BIT(crtc->pipe);
++ 	}
++ 
++ 	if (!new_bw_state)
++ 		return 0;
++ 
++ 	new_bw_state->active_pipes =
++ 		intel_calc_active_pipes(state, old_bw_state->active_pipes);
++ 
++ 	if (new_bw_state->active_pipes != old_bw_state->active_pipes) {
++ 		ret = intel_atomic_lock_global_state(&new_bw_state->base);
++ 		if (ret)
++ 			return ret;
++ 	}
++ 
++ 	if (intel_can_enable_sagv(new_bw_state) != intel_can_enable_sagv(old_bw_state)) {
++ 		ret = intel_atomic_serialize_global_state(&new_bw_state->base);
++ 		if (ret)
++ 			return ret;
++ 	} else if (new_bw_state->pipe_sagv_reject != old_bw_state->pipe_sagv_reject) {
++ 		ret = intel_atomic_lock_global_state(&new_bw_state->base);
++ 		if (ret)
++ 			return ret;
++ 	}
++ 
++ 	return 0;
++ }
++ 
++ /*
++  * Calculate initial DBuf slice offset, based on slice size
++  * and mask(i.e if slice size is 1024 and second slice is enabled
++  * offset would be 1024)
++  */
++ static unsigned int
++ icl_get_first_dbuf_slice_offset(u32 dbuf_slice_mask,
++ 				u32 slice_size,
++ 				u32 ddb_size)
++ {
++ 	unsigned int offset = 0;
++ 
++ 	if (!dbuf_slice_mask)
++ 		return 0;
++ 
++ 	offset = (ffs(dbuf_slice_mask) - 1) * slice_size;
++ 
++ 	WARN_ON(offset >= ddb_size);
++ 	return offset;
++ }
++ 
++ static u16 intel_get_ddb_size(struct drm_i915_private *dev_priv)
+++>>>>>>> 1d0a6c8486aa (drm/i915: Extract skl SAGV checking)
+  {
+ +	const struct drm_display_mode *adjusted_mode;
+ +	u64 total_data_bw;
+  	u16 ddb_size = INTEL_INFO(dev_priv)->ddb_size;
+  
+ -	drm_WARN_ON(&dev_priv->drm, ddb_size == 0);
+ +	WARN_ON(ddb_size == 0);
+  
+  	if (INTEL_GEN(dev_priv) < 11)
+  		return ddb_size - 4; /* 4 blocks for bypass path allocation */
+* Unmerged path drivers/gpu/drm/i915/intel_pm.c
