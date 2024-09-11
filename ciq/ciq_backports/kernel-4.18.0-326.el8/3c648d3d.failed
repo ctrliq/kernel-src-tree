@@ -1,0 +1,160 @@
+xhci: handle halting transfer event properly after endpoint stop and halt raced.
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-326.el8
+commit-author Mathias Nyman <mathias.nyman@linux.intel.com>
+commit 3c648d3deb0f95c360c9b91f49c0f313db0cef31
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-326.el8/3c648d3d.failed
+
+If we receive a transfer event indicating that an endpoint should be
+halted, but current endpoint state doesn't match it, then the halt might
+be just resolved by the stop endpoint completion handler that detects the
+halted endpoint due to a context state error.
+
+In this case the TD we halted on is already moved to the cancelled TD list,
+and should not be successfully completed and given back anymore.
+Let the stop endpoint completion handler reset the endpoint, and then let
+the reset endpoint handler give back the cancelled TD among all other
+ones on the cancelled TD list
+
+	Signed-off-by: Mathias Nyman <mathias.nyman@linux.intel.com>
+Link: https://lore.kernel.org/r/20210129130044.206855-28-mathias.nyman@linux.intel.com
+	Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+(cherry picked from commit 3c648d3deb0f95c360c9b91f49c0f313db0cef31)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/usb/host/xhci-ring.c
+diff --cc drivers/usb/host/xhci-ring.c
+index bd30ef5cce7a,1c0466922523..000000000000
+--- a/drivers/usb/host/xhci-ring.c
++++ b/drivers/usb/host/xhci-ring.c
+@@@ -1971,75 -2124,24 +1971,77 @@@ int xhci_is_vendor_info_code(struct xhc
+  	return 0;
+  }
+  
+ +static int xhci_td_cleanup(struct xhci_hcd *xhci, struct xhci_td *td,
+ +		struct xhci_ring *ep_ring, int *status)
+ +{
+ +	struct urb *urb = NULL;
+ +
+ +	/* Clean up the endpoint's TD list */
+ +	urb = td->urb;
+ +
+ +	/* if a bounce buffer was used to align this td then unmap it */
+ +	xhci_unmap_td_bounce_buffer(xhci, ep_ring, td);
+ +
+ +	/* Do one last check of the actual transfer length.
+ +	 * If the host controller said we transferred more data than the buffer
+ +	 * length, urb->actual_length will be a very big number (since it's
+ +	 * unsigned).  Play it safe and say we didn't transfer anything.
+ +	 */
+ +	if (urb->actual_length > urb->transfer_buffer_length) {
+ +		xhci_warn(xhci, "URB req %u and actual %u transfer length mismatch\n",
+ +			  urb->transfer_buffer_length, urb->actual_length);
+ +		urb->actual_length = 0;
+ +		*status = 0;
+ +	}
+ +	list_del_init(&td->td_list);
+ +	/* Was this TD slated to be cancelled but completed anyway? */
+ +	if (!list_empty(&td->cancelled_td_list))
+ +		list_del_init(&td->cancelled_td_list);
+ +
+ +	inc_td_cnt(urb);
+ +	/* Giveback the urb when all the tds are completed */
+ +	if (last_td_in_urb(td)) {
+ +		if ((urb->actual_length != urb->transfer_buffer_length &&
+ +		     (urb->transfer_flags & URB_SHORT_NOT_OK)) ||
+ +		    (*status != 0 && !usb_endpoint_xfer_isoc(&urb->ep->desc)))
+ +			xhci_dbg(xhci, "Giveback URB %p, len = %d, expected = %d, status = %d\n",
+ +				 urb, urb->actual_length,
+ +				 urb->transfer_buffer_length, *status);
+ +
+ +		/* set isoc urb status to 0 just as EHCI, UHCI, and OHCI */
+ +		if (usb_pipetype(urb->pipe) == PIPE_ISOCHRONOUS)
+ +			*status = 0;
+ +		xhci_giveback_urb_in_irq(xhci, td, *status);
+ +	}
+ +
+ +	return 0;
+ +}
+ +
+  static int finish_td(struct xhci_hcd *xhci, struct xhci_td *td,
+ -	struct xhci_transfer_event *event, struct xhci_virt_ep *ep)
+ +	struct xhci_transfer_event *event,
+ +	struct xhci_virt_ep *ep, int *status)
+  {
+ +	struct xhci_virt_device *xdev;
+  	struct xhci_ep_ctx *ep_ctx;
+  	struct xhci_ring *ep_ring;
+ +	unsigned int slot_id;
+  	u32 trb_comp_code;
+ +	int ep_index;
+  
+ +	slot_id = TRB_TO_SLOT_ID(le32_to_cpu(event->flags));
+ +	xdev = xhci->devs[slot_id];
+ +	ep_index = TRB_TO_EP_ID(le32_to_cpu(event->flags)) - 1;
+  	ep_ring = xhci_dma_to_transfer_ring(ep, le64_to_cpu(event->buffer));
+ -	ep_ctx = xhci_get_ep_ctx(xhci, ep->vdev->out_ctx, ep->ep_index);
+ +	ep_ctx = xhci_get_ep_ctx(xhci, xdev->out_ctx, ep_index);
+  	trb_comp_code = GET_COMP_CODE(le32_to_cpu(event->transfer_len));
+  
+- 	if (trb_comp_code == COMP_STOPPED_LENGTH_INVALID ||
+- 			trb_comp_code == COMP_STOPPED ||
+- 			trb_comp_code == COMP_STOPPED_SHORT_PACKET) {
+- 		/* The Endpoint Stop Command completion will take care of any
+- 		 * stopped TDs.  A stopped TD may be restarted, so don't update
++ 	switch (trb_comp_code) {
++ 	case COMP_STOPPED_LENGTH_INVALID:
++ 	case COMP_STOPPED_SHORT_PACKET:
++ 	case COMP_STOPPED:
++ 		/*
++ 		 * The "Stop Endpoint" completion will take care of any
++ 		 * stopped TDs. A stopped TD may be restarted, so don't update
+  		 * the ring dequeue pointer or take this TD off any lists yet.
+  		 */
+  		return 0;
+@@@ -2057,19 -2191,24 +2091,40 @@@
+  		 * stall later. Hub TT buffer should only be cleared for FS/LS
+  		 * devices behind HS hubs for functional stalls.
+  		 */
+++<<<<<<< HEAD
+ +		if ((ep_index != 0) || (trb_comp_code != COMP_STALL_ERROR))
+ +			xhci_clear_hub_tt_buffer(xhci, td, ep);
+ +		xhci_cleanup_halted_endpoint(xhci, slot_id, ep_index,
+ +					ep_ring->stream_id, td, EP_HARD_RESET);
+ +	} else {
+ +		/* Update ring dequeue pointer */
+ +		ep_ring->dequeue = td->last_trb;
+ +		ep_ring->deq_seg = td->last_trb_seg;
+ +		ep_ring->num_trbs_free += td->num_trbs - 1;
+ +		inc_deq(xhci, ep_ring);
+ +	}
+ +
+ +	return xhci_td_cleanup(xhci, td, ep_ring, status);
+++=======
++ 		if (ep->ep_index != 0)
++ 			xhci_clear_hub_tt_buffer(xhci, td, ep);
++ 
++ 		xhci_handle_halted_endpoint(xhci, ep, ep_ring->stream_id, td,
++ 					    EP_HARD_RESET);
++ 
++ 		return 0; /* xhci_handle_halted_endpoint marked td cancelled */
++ 	default:
++ 		break;
++ 	}
++ 
++ 	/* Update ring dequeue pointer */
++ 	ep_ring->dequeue = td->last_trb;
++ 	ep_ring->deq_seg = td->last_trb_seg;
++ 	ep_ring->num_trbs_free += td->num_trbs - 1;
++ 	inc_deq(xhci, ep_ring);
++ 
++ 	return xhci_td_cleanup(xhci, td, ep_ring, td->status);
+++>>>>>>> 3c648d3deb0f (xhci: handle halting transfer event properly after endpoint stop and halt raced.)
+  }
+  
+  /* sum trb lengths from ring dequeue up to stop_trb, _excluding_ stop_trb */
+* Unmerged path drivers/usb/host/xhci-ring.c
