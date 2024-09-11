@@ -1,0 +1,359 @@
+xdp: support simultaneous driver and hw XDP attachment
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-80.el8
+commit-author Jakub Kicinski <jakub.kicinski@netronome.com>
+commit a25717d2b604347d9af8da81deea7b08e8c94220
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-80.el8/a25717d2.failed
+
+Split the query of HW-attached program from the software one.
+Introduce new .ndo_bpf command to query HW-attached program.
+This will allow drivers to install different programs in HW
+and SW at the same time.  Netlink can now also carry multiple
+programs on dump (in which case mode will be set to
+XDP_ATTACHED_MULTI and user has to check per-attachment point
+attributes, IFLA_XDP_PROG_ID will not be present).  We reuse
+IFLA_XDP_PROG_ID skb space for second mode, so rtnl_xdp_size()
+doesn't need to be updated.
+
+Note that the installation side is still not there, since all
+drivers currently reject installing more than one program at
+the time.
+
+	Signed-off-by: Jakub Kicinski <jakub.kicinski@netronome.com>
+	Reviewed-by: Quentin Monnet <quentin.monnet@netronome.com>
+	Signed-off-by: Daniel Borkmann <daniel@iogearbox.net>
+(cherry picked from commit a25717d2b604347d9af8da81deea7b08e8c94220)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/netronome/nfp/nfp_net_common.c
+#	drivers/net/netdevsim/bpf.c
+diff --cc drivers/net/ethernet/netronome/nfp/nfp_net_common.c
+index c22435a9f494,bb1e72e8dbc2..000000000000
+--- a/drivers/net/ethernet/netronome/nfp/nfp_net_common.c
++++ b/drivers/net/ethernet/netronome/nfp/nfp_net_common.c
+@@@ -3463,12 -3451,15 +3463,22 @@@ static int nfp_net_xdp(struct net_devic
+  	switch (xdp->command) {
+  	case XDP_SETUP_PROG:
+  	case XDP_SETUP_PROG_HW:
+ -		return nfp_net_xdp_setup(nn, xdp);
+ +		return nfp_net_xdp_setup(nn, xdp->prog, xdp->flags,
+ +					 xdp->extack);
+  	case XDP_QUERY_PROG:
+++<<<<<<< HEAD
+ +		xdp->prog_id = nn->xdp_prog ? nn->xdp_prog->aux->id : 0;
+ +		xdp->prog_flags = nn->xdp_prog ? nn->xdp_flags : 0;
+ +		return 0;
+++=======
++ 		if (nn->dp.bpf_offload_xdp)
++ 			return 0;
++ 		return xdp_attachment_query(&nn->xdp, xdp);
++ 	case XDP_QUERY_PROG_HW:
++ 		if (!nn->dp.bpf_offload_xdp)
++ 			return 0;
++ 		return xdp_attachment_query(&nn->xdp, xdp);
+++>>>>>>> a25717d2b604 (xdp: support simultaneous driver and hw XDP attachment)
+  	default:
+  		return nfp_app_bpf(nn->app, nn, xdp);
+  	}
+diff --cc drivers/net/netdevsim/bpf.c
+index 712e6f918065,5544c9b51173..000000000000
+--- a/drivers/net/netdevsim/bpf.c
++++ b/drivers/net/netdevsim/bpf.c
+@@@ -567,9 -561,13 +567,19 @@@ int nsim_bpf(struct net_device *dev, st
+  		nsim_bpf_destroy_prog(bpf->offload.prog);
+  		return 0;
+  	case XDP_QUERY_PROG:
+++<<<<<<< HEAD
+ +		bpf->prog_id = ns->xdp_prog ? ns->xdp_prog->aux->id : 0;
+ +		bpf->prog_flags = ns->xdp_prog ? ns->xdp_flags : 0;
+ +		return 0;
+++=======
++ 		if (ns->xdp_prog_mode != XDP_ATTACHED_DRV)
++ 			return 0;
++ 		return xdp_attachment_query(&ns->xdp, bpf);
++ 	case XDP_QUERY_PROG_HW:
++ 		if (ns->xdp_prog_mode != XDP_ATTACHED_HW)
++ 			return 0;
++ 		return xdp_attachment_query(&ns->xdp, bpf);
+++>>>>>>> a25717d2b604 (xdp: support simultaneous driver and hw XDP attachment)
+  	case XDP_SETUP_PROG:
+  		err = nsim_setup_prog_checks(ns, bpf);
+  		if (err)
+* Unmerged path drivers/net/ethernet/netronome/nfp/nfp_net_common.c
+* Unmerged path drivers/net/netdevsim/bpf.c
+diff --git a/include/linux/netdevice.h b/include/linux/netdevice.h
+index a9cb7ef72bbc..4d84b94ab99c 100644
+--- a/include/linux/netdevice.h
++++ b/include/linux/netdevice.h
+@@ -808,6 +808,7 @@ enum bpf_netdev_command {
+ 	XDP_SETUP_PROG,
+ 	XDP_SETUP_PROG_HW,
+ 	XDP_QUERY_PROG,
++	XDP_QUERY_PROG_HW,
+ 	/* BPF program for offload callbacks, invoked at program load time. */
+ 	BPF_OFFLOAD_VERIFIER_PREP,
+ 	BPF_OFFLOAD_TRANSLATE,
+@@ -831,7 +832,7 @@ struct netdev_bpf {
+ 			struct bpf_prog *prog;
+ 			struct netlink_ext_ack *extack;
+ 		};
+-		/* XDP_QUERY_PROG */
++		/* XDP_QUERY_PROG, XDP_QUERY_PROG_HW */
+ 		struct {
+ 			u32 prog_id;
+ 			/* flags with which program was installed */
+@@ -3430,8 +3431,8 @@ struct sk_buff *dev_hard_start_xmit(struct sk_buff *skb, struct net_device *dev,
+ typedef int (*bpf_op_t)(struct net_device *dev, struct netdev_bpf *bpf);
+ int dev_change_xdp_fd(struct net_device *dev, struct netlink_ext_ack *extack,
+ 		      int fd, u32 flags);
+-void __dev_xdp_query(struct net_device *dev, bpf_op_t xdp_op,
+-		     struct netdev_bpf *xdp);
++u32 __dev_xdp_query(struct net_device *dev, bpf_op_t xdp_op,
++		    enum bpf_netdev_command cmd);
+ 
+ int __dev_forward_skb(struct net_device *dev, struct sk_buff *skb);
+ int dev_forward_skb(struct net_device *dev, struct sk_buff *skb);
+diff --git a/include/uapi/linux/if_link.h b/include/uapi/linux/if_link.h
+index bc86c2b105ec..8759cfb8aa2e 100644
+--- a/include/uapi/linux/if_link.h
++++ b/include/uapi/linux/if_link.h
+@@ -920,6 +920,7 @@ enum {
+ 	XDP_ATTACHED_DRV,
+ 	XDP_ATTACHED_SKB,
+ 	XDP_ATTACHED_HW,
++	XDP_ATTACHED_MULTI,
+ };
+ 
+ enum {
+diff --git a/net/core/dev.c b/net/core/dev.c
+index ba86962f1695..fc15c6d6a987 100644
+--- a/net/core/dev.c
++++ b/net/core/dev.c
+@@ -7278,21 +7278,19 @@ int dev_change_proto_down(struct net_device *dev, bool proto_down)
+ }
+ EXPORT_SYMBOL(dev_change_proto_down);
+ 
+-void __dev_xdp_query(struct net_device *dev, bpf_op_t bpf_op,
+-		     struct netdev_bpf *xdp)
++u32 __dev_xdp_query(struct net_device *dev, bpf_op_t bpf_op,
++		    enum bpf_netdev_command cmd)
+ {
+-	memset(xdp, 0, sizeof(*xdp));
+-	xdp->command = XDP_QUERY_PROG;
++	struct netdev_bpf xdp;
+ 
+-	/* Query must always succeed. */
+-	WARN_ON(bpf_op(dev, xdp) < 0);
+-}
++	if (!bpf_op)
++		return 0;
+ 
+-static bool __dev_xdp_attached(struct net_device *dev, bpf_op_t bpf_op)
+-{
+-	struct netdev_bpf xdp;
++	memset(&xdp, 0, sizeof(xdp));
++	xdp.command = cmd;
+ 
+-	__dev_xdp_query(dev, bpf_op, &xdp);
++	/* Query must always succeed. */
++	WARN_ON(bpf_op(dev, &xdp) < 0 && cmd == XDP_QUERY_PROG);
+ 
+ 	return xdp.prog_id;
+ }
+@@ -7328,12 +7326,19 @@ static void dev_xdp_uninstall(struct net_device *dev)
+ 	if (!ndo_bpf)
+ 		return;
+ 
+-	__dev_xdp_query(dev, ndo_bpf, &xdp);
+-	if (!xdp.prog_id)
+-		return;
++	memset(&xdp, 0, sizeof(xdp));
++	xdp.command = XDP_QUERY_PROG;
++	WARN_ON(ndo_bpf(dev, &xdp));
++	if (xdp.prog_id)
++		WARN_ON(dev_xdp_install(dev, ndo_bpf, NULL, xdp.prog_flags,
++					NULL));
+ 
+-	/* Program removal should always succeed */
+-	WARN_ON(dev_xdp_install(dev, ndo_bpf, NULL, xdp.prog_flags, NULL));
++	/* Remove HW offload */
++	memset(&xdp, 0, sizeof(xdp));
++	xdp.command = XDP_QUERY_PROG_HW;
++	if (!ndo_bpf(dev, &xdp) && xdp.prog_id)
++		WARN_ON(dev_xdp_install(dev, ndo_bpf, NULL, xdp.prog_flags,
++					NULL));
+ }
+ 
+ /**
+@@ -7349,12 +7354,15 @@ int dev_change_xdp_fd(struct net_device *dev, struct netlink_ext_ack *extack,
+ 		      int fd, u32 flags)
+ {
+ 	const struct net_device_ops *ops = dev->netdev_ops;
++	enum bpf_netdev_command query;
+ 	struct bpf_prog *prog = NULL;
+ 	bpf_op_t bpf_op, bpf_chk;
+ 	int err;
+ 
+ 	ASSERT_RTNL();
+ 
++	query = flags & XDP_FLAGS_HW_MODE ? XDP_QUERY_PROG_HW : XDP_QUERY_PROG;
++
+ 	bpf_op = bpf_chk = ops->ndo_bpf;
+ 	if (!bpf_op && (flags & (XDP_FLAGS_DRV_MODE | XDP_FLAGS_HW_MODE)))
+ 		return -EOPNOTSUPP;
+@@ -7364,10 +7372,11 @@ int dev_change_xdp_fd(struct net_device *dev, struct netlink_ext_ack *extack,
+ 		bpf_chk = generic_xdp_install;
+ 
+ 	if (fd >= 0) {
+-		if (bpf_chk && __dev_xdp_attached(dev, bpf_chk))
++		if (__dev_xdp_query(dev, bpf_chk, XDP_QUERY_PROG) ||
++		    __dev_xdp_query(dev, bpf_chk, XDP_QUERY_PROG_HW))
+ 			return -EEXIST;
+ 		if ((flags & XDP_FLAGS_UPDATE_IF_NOEXIST) &&
+-		    __dev_xdp_attached(dev, bpf_op))
++		    __dev_xdp_query(dev, bpf_op, query))
+ 			return -EBUSY;
+ 
+ 		prog = bpf_prog_get_type_dev(fd, BPF_PROG_TYPE_XDP,
+diff --git a/net/core/rtnetlink.c b/net/core/rtnetlink.c
+index 9dc7e359ad09..e03258e954c8 100644
+--- a/net/core/rtnetlink.c
++++ b/net/core/rtnetlink.c
+@@ -964,7 +964,7 @@ static size_t rtnl_xdp_size(void)
+ {
+ 	size_t xdp_size = nla_total_size(0) +	/* nest IFLA_XDP */
+ 			  nla_total_size(1) +	/* XDP_ATTACHED */
+-			  nla_total_size(4) +	/* XDP_PROG_ID */
++			  nla_total_size(4) +	/* XDP_PROG_ID (or 1st mode) */
+ 			  nla_total_size(4);	/* XDP_<mode>_PROG_ID */
+ 
+ 	return xdp_size;
+@@ -1354,37 +1354,57 @@ static int rtnl_fill_link_ifmap(struct sk_buff *skb, struct net_device *dev)
+ 	return 0;
+ }
+ 
+-static u8 rtnl_xdp_attached_mode(struct net_device *dev, u32 *prog_id)
++static u32 rtnl_xdp_prog_skb(struct net_device *dev)
+ {
+-	const struct net_device_ops *ops = dev->netdev_ops;
+ 	const struct bpf_prog *generic_xdp_prog;
+-	struct netdev_bpf xdp;
+ 
+ 	ASSERT_RTNL();
+ 
+-	*prog_id = 0;
+ 	generic_xdp_prog = rtnl_dereference(dev->xdp_prog);
+-	if (generic_xdp_prog) {
+-		*prog_id = generic_xdp_prog->aux->id;
+-		return XDP_ATTACHED_SKB;
+-	}
+-	if (!ops->ndo_bpf)
+-		return XDP_ATTACHED_NONE;
++	if (!generic_xdp_prog)
++		return 0;
++	return generic_xdp_prog->aux->id;
++}
++
++static u32 rtnl_xdp_prog_drv(struct net_device *dev)
++{
++	return __dev_xdp_query(dev, dev->netdev_ops->ndo_bpf, XDP_QUERY_PROG);
++}
++
++static u32 rtnl_xdp_prog_hw(struct net_device *dev)
++{
++	return __dev_xdp_query(dev, dev->netdev_ops->ndo_bpf,
++			       XDP_QUERY_PROG_HW);
++}
++
++static int rtnl_xdp_report_one(struct sk_buff *skb, struct net_device *dev,
++			       u32 *prog_id, u8 *mode, u8 tgt_mode, u32 attr,
++			       u32 (*get_prog_id)(struct net_device *dev))
++{
++	u32 curr_id;
++	int err;
++
++	curr_id = get_prog_id(dev);
++	if (!curr_id)
++		return 0;
++
++	*prog_id = curr_id;
++	err = nla_put_u32(skb, attr, curr_id);
++	if (err)
++		return err;
+ 
+-	__dev_xdp_query(dev, ops->ndo_bpf, &xdp);
+-	if (!xdp.prog_id)
+-		return XDP_ATTACHED_NONE;
++	if (*mode != XDP_ATTACHED_NONE)
++		*mode = XDP_ATTACHED_MULTI;
++	else
++		*mode = tgt_mode;
+ 
+-	*prog_id = xdp.prog_id;
+-	if (xdp.prog_flags & XDP_FLAGS_HW_MODE)
+-		return XDP_ATTACHED_HW;
+-	return XDP_ATTACHED_DRV;
++	return 0;
+ }
+ 
+ static int rtnl_xdp_fill(struct sk_buff *skb, struct net_device *dev)
+ {
+-	u32 prog_attr, prog_id;
+ 	struct nlattr *xdp;
++	u32 prog_id;
+ 	int err;
+ 	u8 mode;
+ 
+@@ -1392,35 +1412,26 @@ static int rtnl_xdp_fill(struct sk_buff *skb, struct net_device *dev)
+ 	if (!xdp)
+ 		return -EMSGSIZE;
+ 
+-	mode = rtnl_xdp_attached_mode(dev, &prog_id);
++	prog_id = 0;
++	mode = XDP_ATTACHED_NONE;
++	if (rtnl_xdp_report_one(skb, dev, &prog_id, &mode, XDP_ATTACHED_SKB,
++				IFLA_XDP_SKB_PROG_ID, rtnl_xdp_prog_skb))
++		goto err_cancel;
++	if (rtnl_xdp_report_one(skb, dev, &prog_id, &mode, XDP_ATTACHED_DRV,
++				IFLA_XDP_DRV_PROG_ID, rtnl_xdp_prog_drv))
++		goto err_cancel;
++	if (rtnl_xdp_report_one(skb, dev, &prog_id, &mode, XDP_ATTACHED_HW,
++				IFLA_XDP_HW_PROG_ID, rtnl_xdp_prog_hw))
++		goto err_cancel;
++
+ 	err = nla_put_u8(skb, IFLA_XDP_ATTACHED, mode);
+ 	if (err)
+ 		goto err_cancel;
+ 
+-	if (prog_id) {
++	if (prog_id && mode != XDP_ATTACHED_MULTI) {
+ 		err = nla_put_u32(skb, IFLA_XDP_PROG_ID, prog_id);
+ 		if (err)
+ 			goto err_cancel;
+-
+-		switch (mode) {
+-		case XDP_ATTACHED_DRV:
+-			prog_attr = IFLA_XDP_DRV_PROG_ID;
+-			break;
+-		case XDP_ATTACHED_SKB:
+-			prog_attr = IFLA_XDP_SKB_PROG_ID;
+-			break;
+-		case XDP_ATTACHED_HW:
+-			prog_attr = IFLA_XDP_HW_PROG_ID;
+-			break;
+-		case XDP_ATTACHED_NONE:
+-		default:
+-			err = -EINVAL;
+-			goto err_cancel;
+-		}
+-
+-		err = nla_put_u32(skb, prog_attr, prog_id);
+-		if (err)
+-			goto err_cancel;
+ 	}
+ 
+ 	nla_nest_end(skb, xdp);
