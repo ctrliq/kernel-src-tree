@@ -1,0 +1,221 @@
+net: bridge: multicast: make tracked EHT hosts limit configurable
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-358.el8
+commit-author Nikolay Aleksandrov <nikolay@nvidia.com>
+commit 2dba407f994e5b0eb3b70a8cb280e014ec4a7ff3
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-358.el8/2dba407f.failed
+
+Add two new port attributes which make EHT hosts limit configurable and
+export the current number of tracked EHT hosts:
+ - IFLA_BRPORT_MCAST_EHT_HOSTS_LIMIT: configure/retrieve current limit
+ - IFLA_BRPORT_MCAST_EHT_HOSTS_CNT: current number of tracked hosts
+Setting IFLA_BRPORT_MCAST_EHT_HOSTS_LIMIT to 0 is currently not allowed.
+
+Note that we have to increase RTNL_SLAVE_MAX_TYPE to 38 minimum, I've
+increased it to 40 to have space for two more future entries.
+
+v2: move br_multicast_eht_set_hosts_limit() to br_multicast_eht.c,
+    no functional change
+
+	Signed-off-by: Nikolay Aleksandrov <nikolay@nvidia.com>
+	Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+(cherry picked from commit 2dba407f994e5b0eb3b70a8cb280e014ec4a7ff3)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/bridge/br_multicast_eht.c
+#	net/bridge/br_private_mcast_eht.h
+diff --cc net/bridge/br_private_mcast_eht.h
+index 0c9c4267969d,f89049f4892c..000000000000
+--- a/net/bridge/br_private_mcast_eht.h
++++ b/net/bridge/br_private_mcast_eht.h
+@@@ -47,4 -49,45 +47,48 @@@ struct net_bridge_group_eht_set 
+  	struct net_bridge_mcast_gc	mcast_gc;
+  };
+  
+++<<<<<<< HEAD
+++=======
++ #ifdef CONFIG_BRIDGE_IGMP_SNOOPING
++ void br_multicast_eht_clean_sets(struct net_bridge_port_group *pg);
++ bool br_multicast_eht_handle(struct net_bridge_port_group *pg,
++ 			     void *h_addr,
++ 			     void *srcs,
++ 			     u32 nsrcs,
++ 			     size_t addr_size,
++ 			     int grec_type);
++ int br_multicast_eht_set_hosts_limit(struct net_bridge_port *p,
++ 				     u32 eht_hosts_limit);
++ 
++ static inline bool
++ br_multicast_eht_should_del_pg(const struct net_bridge_port_group *pg)
++ {
++ 	return !!((pg->key.port->flags & BR_MULTICAST_FAST_LEAVE) &&
++ 		  RB_EMPTY_ROOT(&pg->eht_host_tree));
++ }
++ 
++ static inline bool
++ br_multicast_eht_hosts_over_limit(const struct net_bridge_port_group *pg)
++ {
++ 	const struct net_bridge_port *p = pg->key.port;
++ 
++ 	return !!(p->multicast_eht_hosts_cnt >= p->multicast_eht_hosts_limit);
++ }
++ 
++ static inline void br_multicast_eht_hosts_inc(struct net_bridge_port_group *pg)
++ {
++ 	struct net_bridge_port *p = pg->key.port;
++ 
++ 	p->multicast_eht_hosts_cnt++;
++ }
++ 
++ static inline void br_multicast_eht_hosts_dec(struct net_bridge_port_group *pg)
++ {
++ 	struct net_bridge_port *p = pg->key.port;
++ 
++ 	p->multicast_eht_hosts_cnt--;
++ }
++ #endif /* CONFIG_BRIDGE_IGMP_SNOOPING */
++ 
+++>>>>>>> 2dba407f994e (net: bridge: multicast: make tracked EHT hosts limit configurable)
+  #endif /* _BR_PRIVATE_MCAST_EHT_H_ */
+* Unmerged path net/bridge/br_multicast_eht.c
+diff --git a/include/uapi/linux/if_link.h b/include/uapi/linux/if_link.h
+index 33671c807b5c..81e181b3cd37 100644
+--- a/include/uapi/linux/if_link.h
++++ b/include/uapi/linux/if_link.h
+@@ -544,6 +544,8 @@ enum {
+ 	IFLA_BRPORT_BACKUP_PORT,
+ 	IFLA_BRPORT_MRP_RING_OPEN,
+ 	IFLA_BRPORT_MRP_IN_OPEN,
++	IFLA_BRPORT_MCAST_EHT_HOSTS_LIMIT,
++	IFLA_BRPORT_MCAST_EHT_HOSTS_CNT,
+ 	__IFLA_BRPORT_MAX
+ };
+ #define IFLA_BRPORT_MAX (__IFLA_BRPORT_MAX - 1)
+* Unmerged path net/bridge/br_multicast_eht.c
+diff --git a/net/bridge/br_netlink.c b/net/bridge/br_netlink.c
+index 669d9316bdf1..7fc0a653d162 100644
+--- a/net/bridge/br_netlink.c
++++ b/net/bridge/br_netlink.c
+@@ -22,6 +22,7 @@
+ #include "br_private_stp.h"
+ #include "br_private_cfm.h"
+ #include "br_private_tunnel.h"
++#include "br_private_mcast_eht.h"
+ 
+ static int __get_num_vlan_infos(struct net_bridge_vlan_group *vg,
+ 				u32 filter_mask)
+@@ -203,6 +204,8 @@ static inline size_t br_port_info_size(void)
+ 		+ nla_total_size(sizeof(u16))	/* IFLA_BRPORT_GROUP_FWD_MASK */
+ 		+ nla_total_size(sizeof(u8))	/* IFLA_BRPORT_MRP_RING_OPEN */
+ 		+ nla_total_size(sizeof(u8))	/* IFLA_BRPORT_MRP_IN_OPEN */
++		+ nla_total_size(sizeof(u32))	/* IFLA_BRPORT_MCAST_EHT_HOSTS_LIMIT */
++		+ nla_total_size(sizeof(u32))	/* IFLA_BRPORT_MCAST_EHT_HOSTS_CNT */
+ 		+ 0;
+ }
+ 
+@@ -287,7 +290,11 @@ static int br_port_fill_attrs(struct sk_buff *skb,
+ 
+ #ifdef CONFIG_BRIDGE_IGMP_SNOOPING
+ 	if (nla_put_u8(skb, IFLA_BRPORT_MULTICAST_ROUTER,
+-		       p->multicast_router))
++		       p->multicast_router) ||
++	    nla_put_u32(skb, IFLA_BRPORT_MCAST_EHT_HOSTS_LIMIT,
++			p->multicast_eht_hosts_limit) ||
++	    nla_put_u32(skb, IFLA_BRPORT_MCAST_EHT_HOSTS_CNT,
++			p->multicast_eht_hosts_cnt))
+ 		return -EMSGSIZE;
+ #endif
+ 
+@@ -803,6 +810,7 @@ static const struct nla_policy br_port_policy[IFLA_BRPORT_MAX + 1] = {
+ 	[IFLA_BRPORT_NEIGH_SUPPRESS] = { .type = NLA_U8 },
+ 	[IFLA_BRPORT_ISOLATED]	= { .type = NLA_U8 },
+ 	[IFLA_BRPORT_BACKUP_PORT] = { .type = NLA_U32 },
++	[IFLA_BRPORT_MCAST_EHT_HOSTS_LIMIT] = { .type = NLA_U32 },
+ };
+ 
+ /* Change the state of the port and notify spanning tree */
+@@ -938,6 +946,15 @@ static int br_setport(struct net_bridge_port *p, struct nlattr *tb[])
+ 		if (err)
+ 			return err;
+ 	}
++
++	if (tb[IFLA_BRPORT_MCAST_EHT_HOSTS_LIMIT]) {
++		u32 hlimit;
++
++		hlimit = nla_get_u32(tb[IFLA_BRPORT_MCAST_EHT_HOSTS_LIMIT]);
++		err = br_multicast_eht_set_hosts_limit(p, hlimit);
++		if (err)
++			return err;
++	}
+ #endif
+ 
+ 	if (tb[IFLA_BRPORT_GROUP_FWD_MASK]) {
+* Unmerged path net/bridge/br_private_mcast_eht.h
+diff --git a/net/bridge/br_sysfs_if.c b/net/bridge/br_sysfs_if.c
+index 9474e3182164..6b4a7ea9bffc 100644
+--- a/net/bridge/br_sysfs_if.c
++++ b/net/bridge/br_sysfs_if.c
+@@ -20,6 +20,7 @@
+ #include <linux/sched/signal.h>
+ 
+ #include "br_private.h"
++#include "br_private_mcast_eht.h"
+ 
+ struct brport_attribute {
+ 	struct attribute	attr;
+@@ -252,6 +253,29 @@ static int store_multicast_router(struct net_bridge_port *p,
+ static BRPORT_ATTR(multicast_router, 0644, show_multicast_router,
+ 		   store_multicast_router);
+ 
++static ssize_t show_multicast_eht_hosts_limit(struct net_bridge_port *p,
++					      char *buf)
++{
++	return sprintf(buf, "%u\n", p->multicast_eht_hosts_limit);
++}
++
++static int store_multicast_eht_hosts_limit(struct net_bridge_port *p,
++					   unsigned long v)
++{
++	return br_multicast_eht_set_hosts_limit(p, v);
++}
++static BRPORT_ATTR(multicast_eht_hosts_limit, 0644,
++		   show_multicast_eht_hosts_limit,
++		   store_multicast_eht_hosts_limit);
++
++static ssize_t show_multicast_eht_hosts_cnt(struct net_bridge_port *p,
++					    char *buf)
++{
++	return sprintf(buf, "%u\n", p->multicast_eht_hosts_cnt);
++}
++static BRPORT_ATTR(multicast_eht_hosts_cnt, 0444, show_multicast_eht_hosts_cnt,
++		   NULL);
++
+ BRPORT_ATTR_FLAG(multicast_fast_leave, BR_MULTICAST_FAST_LEAVE);
+ BRPORT_ATTR_FLAG(multicast_to_unicast, BR_MULTICAST_TO_UNICAST);
+ #endif
+@@ -281,6 +305,8 @@ static const struct brport_attribute *brport_attrs[] = {
+ 	&brport_attr_multicast_router,
+ 	&brport_attr_multicast_fast_leave,
+ 	&brport_attr_multicast_to_unicast,
++	&brport_attr_multicast_eht_hosts_limit,
++	&brport_attr_multicast_eht_hosts_cnt,
+ #endif
+ 	&brport_attr_proxyarp,
+ 	&brport_attr_proxyarp_wifi,
+diff --git a/net/core/rtnetlink.c b/net/core/rtnetlink.c
+index 5ff8c1cc75fb..756546fbf98a 100644
+--- a/net/core/rtnetlink.c
++++ b/net/core/rtnetlink.c
+@@ -59,7 +59,7 @@
+ #include <net/net_namespace.h>
+ 
+ #define RTNL_MAX_TYPE		50
+-#define RTNL_SLAVE_MAX_TYPE	36
++#define RTNL_SLAVE_MAX_TYPE	40
+ 
+ struct rtnl_link {
+ 	rtnl_doit_func		doit;
