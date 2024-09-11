@@ -1,0 +1,161 @@
+RDMA/efa: Expose RDMA read related attributes
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Daniel Kranzdorf <dkkranzd@amazon.com>
+commit 666e8ff535d401eb286fa20446e55ae984d91049
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/666e8ff5.failed
+
+Query the device attributes for RDMA operations, including maximum
+transfer size and maximum number of SGEs per RDMA WR, and report them
+back to the userspace library.
+
+Link: https://lore.kernel.org/r/20191121141509.59297-4-galpress@amazon.com
+	Signed-off-by: Daniel Kranzdorf <dkkranzd@amazon.com>
+	Reviewed-by: Yossi Leybovich <sleybo@amazon.com>
+	Signed-off-by: Gal Pressman <galpress@amazon.com>
+	Signed-off-by: Jason Gunthorpe <jgg@mellanox.com>
+(cherry picked from commit 666e8ff535d401eb286fa20446e55ae984d91049)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/infiniband/hw/efa/efa_verbs.c
+diff --cc drivers/infiniband/hw/efa/efa_verbs.c
+index 96834fe1448f,c9d294caa27a..000000000000
+--- a/drivers/infiniband/hw/efa/efa_verbs.c
++++ b/drivers/infiniband/hw/efa/efa_verbs.c
+@@@ -121,8 -133,19 +118,22 @@@ static inline struct efa_ah *to_eah(str
+  	return container_of(ibah, struct efa_ah, ibah);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static inline struct efa_user_mmap_entry *
++ to_emmap(struct rdma_user_mmap_entry *rdma_entry)
++ {
++ 	return container_of(rdma_entry, struct efa_user_mmap_entry, rdma_entry);
++ }
++ 
++ static inline bool is_rdma_read_cap(struct efa_dev *dev)
++ {
++ 	return dev->dev_attr.device_caps & EFA_ADMIN_FEATURE_DEVICE_ATTR_DESC_RDMA_READ_MASK;
++ }
++ 
+++>>>>>>> 666e8ff535d4 (RDMA/efa: Expose RDMA read related attributes)
+  #define field_avail(x, fld, sz) (offsetof(typeof(x), fld) + \
+ -				 FIELD_SIZEOF(typeof(x), fld) <= (sz))
+ +				 sizeof(((typeof(x) *)0)->fld) <= (sz))
+  
+  #define is_reserved_cleared(reserved) \
+  	!memchr_inv(reserved, 0, sizeof(reserved))
+diff --git a/drivers/infiniband/hw/efa/efa_admin_cmds_defs.h b/drivers/infiniband/hw/efa/efa_admin_cmds_defs.h
+index 7fa9d532db61..e96bcb16bd2b 100644
+--- a/drivers/infiniband/hw/efa/efa_admin_cmds_defs.h
++++ b/drivers/infiniband/hw/efa/efa_admin_cmds_defs.h
+@@ -562,6 +562,16 @@ struct efa_admin_feature_device_attr_desc {
+ 
+ 	/* Indicates how many bits are used virtual address access */
+ 	u8 virt_addr_width;
++
++	/*
++	 * 0 : rdma_read - If set, RDMA Read is supported on
++	 *    TX queues
++	 * 31:1 : reserved - MBZ
++	 */
++	u32 device_caps;
++
++	/* Max RDMA transfer size in bytes */
++	u32 max_rdma_size;
+ };
+ 
+ struct efa_admin_feature_queue_attr_desc {
+@@ -608,6 +618,9 @@ struct efa_admin_feature_queue_attr_desc {
+ 
+ 	/* The maximum size of LLQ in bytes */
+ 	u32 max_llq_size;
++
++	/* Maximum number of SGEs for a single RDMA read WQE */
++	u16 max_wr_rdma_sges;
+ };
+ 
+ struct efa_admin_feature_aenq_desc {
+@@ -622,6 +635,7 @@ struct efa_admin_feature_network_attr_desc {
+ 	/* Raw address data in network byte order */
+ 	u8 addr[16];
+ 
++	/* max packet payload size in bytes */
+ 	u32 mtu;
+ };
+ 
+@@ -797,4 +811,7 @@ struct efa_admin_mmio_req_read_less_resp {
+ /* get_set_feature_common_desc */
+ #define EFA_ADMIN_GET_SET_FEATURE_COMMON_DESC_SELECT_MASK   GENMASK(1, 0)
+ 
++/* feature_device_attr_desc */
++#define EFA_ADMIN_FEATURE_DEVICE_ATTR_DESC_RDMA_READ_MASK   BIT(0)
++
+ #endif /* _EFA_ADMIN_CMDS_H_ */
+diff --git a/drivers/infiniband/hw/efa/efa_com_cmd.c b/drivers/infiniband/hw/efa/efa_com_cmd.c
+index bfbb1fdf97c8..36f4606261ee 100644
+--- a/drivers/infiniband/hw/efa/efa_com_cmd.c
++++ b/drivers/infiniband/hw/efa/efa_com_cmd.c
+@@ -453,6 +453,8 @@ int efa_com_get_device_attr(struct efa_com_dev *edev,
+ 	result->phys_addr_width = resp.u.device_attr.phys_addr_width;
+ 	result->virt_addr_width = resp.u.device_attr.virt_addr_width;
+ 	result->db_bar = resp.u.device_attr.db_bar;
++	result->max_rdma_size = resp.u.device_attr.max_rdma_size;
++	result->device_caps = resp.u.device_attr.device_caps;
+ 
+ 	if (result->admin_api_version < 1) {
+ 		ibdev_err(edev->efa_dev,
+@@ -484,6 +486,7 @@ int efa_com_get_device_attr(struct efa_com_dev *edev,
+ 	result->max_ah = resp.u.queue_attr.max_ah;
+ 	result->max_llq_size = resp.u.queue_attr.max_llq_size;
+ 	result->sub_cqs_per_cq = resp.u.queue_attr.sub_cqs_per_cq;
++	result->max_wr_rdma_sge = resp.u.queue_attr.max_wr_rdma_sges;
+ 
+ 	return 0;
+ }
+diff --git a/drivers/infiniband/hw/efa/efa_com_cmd.h b/drivers/infiniband/hw/efa/efa_com_cmd.h
+index 5304e26b47ae..0011302ebdb2 100644
+--- a/drivers/infiniband/hw/efa/efa_com_cmd.h
++++ b/drivers/infiniband/hw/efa/efa_com_cmd.h
+@@ -124,9 +124,12 @@ struct efa_com_get_device_attr_result {
+ 	u32 max_pd;
+ 	u32 max_ah;
+ 	u32 max_llq_size;
++	u32 max_rdma_size;
++	u32 device_caps;
+ 	u16 sub_cqs_per_cq;
+ 	u16 max_sq_sge;
+ 	u16 max_rq_sge;
++	u16 max_wr_rdma_sge;
+ 	u8 db_bar;
+ };
+ 
+* Unmerged path drivers/infiniband/hw/efa/efa_verbs.c
+diff --git a/include/uapi/rdma/efa-abi.h b/include/uapi/rdma/efa-abi.h
+index 9599a2a62be8..53b6e2036a9b 100644
+--- a/include/uapi/rdma/efa-abi.h
++++ b/include/uapi/rdma/efa-abi.h
+@@ -90,12 +90,18 @@ struct efa_ibv_create_ah_resp {
+ 	__u8 reserved_30[2];
+ };
+ 
++enum {
++	EFA_QUERY_DEVICE_CAPS_RDMA_READ = 1 << 0,
++};
++
+ struct efa_ibv_ex_query_device_resp {
+ 	__u32 comp_mask;
+ 	__u32 max_sq_wr;
+ 	__u32 max_rq_wr;
+ 	__u16 max_sq_sge;
+ 	__u16 max_rq_sge;
++	__u32 max_rdma_size;
++	__u32 device_caps;
+ };
+ 
+ #endif /* EFA_ABI_USER_H */
