@@ -3,6 +3,7 @@
 #include <linux/ethtool_netlink.h>
 #include <linux/net_tstamp.h>
 #include <linux/phy.h>
+#include <linux/rtnetlink.h>
 
 #include "common.h"
 
@@ -384,3 +385,13 @@ int __ethtool_get_ts_info(struct net_device *dev, struct ethtool_ts_info *info)
 
 	return 0;
 }
+
+const struct ethtool_phy_ops *ethtool_phy_ops;
+
+void ethtool_set_ethtool_phy_ops(const struct ethtool_phy_ops *ops)
+{
+	rtnl_lock();
+	ethtool_phy_ops = ops;
+	rtnl_unlock();
+}
+EXPORT_SYMBOL_GPL(ethtool_set_ethtool_phy_ops);
