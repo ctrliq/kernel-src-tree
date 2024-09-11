@@ -1,0 +1,125 @@
+mm/filemap: fix storing to a THP shadow entry
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Matthew Wilcox (Oracle) <willy@infradead.org>
+commit 198b62f83eef1d605d70eca32759c92cdcc14175
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/198b62f8.failed
+
+When a THP is removed from the page cache by reclaim, we replace it with a
+shadow entry that occupies all slots of the XArray previously occupied by
+the THP.  If the user then accesses that page again, we only allocate a
+single page, but storing it into the shadow entry replaces all entries
+with that one page.  That leads to bugs like
+
+page dumped because: VM_BUG_ON_PAGE(page_to_pgoff(page) != offset)
+------------[ cut here ]------------
+kernel BUG at mm/filemap.c:2529!
+
+https://bugzilla.kernel.org/show_bug.cgi?id=206569
+
+This is hard to reproduce with mainline, but happens regularly with the
+THP patchset (as so many more THPs are created).  This solution is take
+from the THP patchset.  It splits the shadow entry into order-0 pieces at
+the time that we bring a new page into cache.
+
+Fixes: 99cb0dbd47a1 ("mm,thp: add read-only THP support for (non-shmem) FS")
+	Signed-off-by: Matthew Wilcox (Oracle) <willy@infradead.org>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Cc: Song Liu <songliubraving@fb.com>
+	Cc: "Kirill A . Shutemov" <kirill@shutemov.name>
+	Cc: Qian Cai <cai@lca.pw>
+Link: https://lkml.kernel.org/r/20200903183029.14930-4-willy@infradead.org
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit 198b62f83eef1d605d70eca32759c92cdcc14175)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	mm/filemap.c
+diff --cc mm/filemap.c
+index efe054d0678b,3b76d79fd0cf..000000000000
+--- a/mm/filemap.c
++++ b/mm/filemap.c
+@@@ -824,9 -834,7 +824,8 @@@ static int __add_to_page_cache_locked(s
+  {
+  	XA_STATE(xas, &mapping->i_pages, offset);
+  	int huge = PageHuge(page);
+ +	struct mem_cgroup *memcg;
+  	int error;
+- 	void *old;
+  
+  	VM_BUG_ON_PAGE(!PageLocked(page), page);
+  	VM_BUG_ON_PAGE(PageSwapBacked(page), page);
+@@@ -843,11 -844,41 +842,44 @@@
+  	page->mapping = mapping;
+  	page->index = offset;
+  
+++<<<<<<< HEAD
+++=======
++ 	if (!huge) {
++ 		error = mem_cgroup_charge(page, current->mm, gfp);
++ 		if (error)
++ 			goto error;
++ 	}
++ 
++ 	gfp &= GFP_RECLAIM_MASK;
++ 
+++>>>>>>> 198b62f83eef (mm/filemap: fix storing to a THP shadow entry)
+  	do {
++ 		unsigned int order = xa_get_order(xas.xa, xas.xa_index);
++ 		void *entry, *old = NULL;
++ 
++ 		if (order > thp_order(page))
++ 			xas_split_alloc(&xas, xa_load(xas.xa, xas.xa_index),
++ 					order, gfp);
+  		xas_lock_irq(&xas);
+- 		old = xas_load(&xas);
+- 		if (old && !xa_is_value(old))
+- 			xas_set_err(&xas, -EEXIST);
++ 		xas_for_each_conflict(&xas, entry) {
++ 			old = entry;
++ 			if (!xa_is_value(entry)) {
++ 				xas_set_err(&xas, -EEXIST);
++ 				goto unlock;
++ 			}
++ 		}
++ 
++ 		if (old) {
++ 			if (shadowp)
++ 				*shadowp = old;
++ 			/* entry may have been split before we acquired lock */
++ 			order = xa_get_order(xas.xa, xas.xa_index);
++ 			if (order > thp_order(page)) {
++ 				xas_split(&xas, old, order);
++ 				xas_reset(&xas);
++ 			}
++ 		}
++ 
+  		xas_store(&xas, page);
+  		if (xas_error(&xas))
+  			goto unlock;
+@@@ -861,16 -889,16 +890,16 @@@
+  
+  		/* hugetlb pages do not participate in page cache accounting */
+  		if (!huge)
+ -			__inc_lruvec_page_state(page, NR_FILE_PAGES);
+ +			__inc_node_page_state(page, NR_FILE_PAGES);
+  unlock:
+  		xas_unlock_irq(&xas);
+- 	} while (xas_nomem(&xas, gfp_mask & GFP_RECLAIM_MASK));
++ 	} while (xas_nomem(&xas, gfp));
+  
+ -	if (xas_error(&xas)) {
+ -		error = xas_error(&xas);
+ +	if (xas_error(&xas))
+  		goto error;
+ -	}
+  
+ +	if (!huge)
+ +		mem_cgroup_commit_charge(page, memcg, false, false);
+  	trace_mm_filemap_add_to_page_cache(page);
+  	return 0;
+  error:
+* Unmerged path mm/filemap.c
