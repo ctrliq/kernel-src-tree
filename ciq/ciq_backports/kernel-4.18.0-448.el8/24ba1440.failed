@@ -1,0 +1,154 @@
+route: Add multipath_hash in flowi_common to make user-define hash
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-448.el8
+commit-author wenxu <wenxu@ucloud.cn>
+commit 24ba14406c5c8e33fcbe064f77b3ab01b84ec830
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-448.el8/24ba1440.failed
+
+Current fib_multipath_hash_policy can make hash based on the L3 or
+L4. But it only work on the outer IP. So a specific tunnel always
+has the same hash value. But a specific tunnel may contain so many
+inner connections.
+
+This patch provide a generic multipath_hash in floi_common. It can
+make a user-define hash which can mix with L3 or L4 hash.
+
+	Signed-off-by: wenxu <wenxu@ucloud.cn>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 24ba14406c5c8e33fcbe064f77b3ab01b84ec830)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/net/flow.h
+#	net/ipv4/ip_gre.c
+diff --cc include/net/flow.h
+index 1c4d6583790f,a50fb77a0b27..000000000000
+--- a/include/net/flow.h
++++ b/include/net/flow.h
+@@@ -40,11 -38,9 +40,15 @@@ struct flowi_common 
+  #define FLOWI_FLAG_KNOWN_NH		0x02
+  #define FLOWI_FLAG_SKIP_NH_OIF		0x04
+  	__u32	flowic_secid;
+ -	kuid_t  flowic_uid;
+  	struct flowi_tunnel flowic_tun_key;
+++<<<<<<< HEAD
+ +	kuid_t  flowic_uid;
+ +
+ +	RH_KABI_RESERVE(1)
+ +	RH_KABI_RESERVE(2)
+++=======
++ 	__u32		flowic_multipath_hash;
+++>>>>>>> 24ba14406c5c (route: Add multipath_hash in flowi_common to make user-define hash)
+  };
+  
+  union flowi_uli {
+diff --cc net/ipv4/ip_gre.c
+index e9551d029259,fd219f7bd3ea..000000000000
+--- a/net/ipv4/ip_gre.c
++++ b/net/ipv4/ip_gre.c
+@@@ -585,8 -577,8 +585,13 @@@ static int gre_fill_metadata_dst(struc
+  
+  	key = &info->key;
+  	ip_tunnel_init_flow(&fl4, IPPROTO_GRE, key->u.ipv4.dst, key->u.ipv4.src,
+++<<<<<<< HEAD
+ +			    tunnel_id_to_key32(key->tun_id),
+ +			    key->tos & ~INET_ECN_MASK, 0, skb->mark);
+++=======
++ 			    tunnel_id_to_key32(key->tun_id), key->tos, 0,
++ 			    skb->mark, skb_get_hash(skb));
+++>>>>>>> 24ba14406c5c (route: Add multipath_hash in flowi_common to make user-define hash)
+  	rt = ip_route_output_key(dev_net(dev), &fl4);
+  	if (IS_ERR(rt))
+  		return PTR_ERR(rt);
+diff --git a/drivers/net/ethernet/mellanox/mlxsw/spectrum_span.c b/drivers/net/ethernet/mellanox/mlxsw/spectrum_span.c
+index 06b2601e5cc3..33be95bd22e6 100644
+--- a/drivers/net/ethernet/mellanox/mlxsw/spectrum_span.c
++++ b/drivers/net/ethernet/mellanox/mlxsw/spectrum_span.c
+@@ -424,7 +424,7 @@ mlxsw_sp_span_gretap4_route(const struct net_device *to_dev,
+ 
+ 	parms = mlxsw_sp_ipip_netdev_parms4(to_dev);
+ 	ip_tunnel_init_flow(&fl4, parms.iph.protocol, *daddrp, *saddrp,
+-			    0, 0, parms.link, tun->fwmark);
++			    0, 0, parms.link, tun->fwmark, 0);
+ 
+ 	rt = ip_route_output_key(tun->net, &fl4);
+ 	if (IS_ERR(rt))
+* Unmerged path include/net/flow.h
+diff --git a/include/net/ip_tunnels.h b/include/net/ip_tunnels.h
+index 1578aca19cd8..aa78279eee46 100644
+--- a/include/net/ip_tunnels.h
++++ b/include/net/ip_tunnels.h
+@@ -241,7 +241,7 @@ static inline void ip_tunnel_init_flow(struct flowi4 *fl4,
+ 				       int proto,
+ 				       __be32 daddr, __be32 saddr,
+ 				       __be32 key, __u8 tos, int oif,
+-				       __u32 mark)
++				       __u32 mark, __u32 tun_inner_hash)
+ {
+ 	memset(fl4, 0, sizeof(*fl4));
+ 	fl4->flowi4_oif = oif;
+@@ -251,6 +251,7 @@ static inline void ip_tunnel_init_flow(struct flowi4 *fl4,
+ 	fl4->flowi4_proto = proto;
+ 	fl4->fl4_gre_key = key;
+ 	fl4->flowi4_mark = mark;
++	fl4->flowi4_multipath_hash = tun_inner_hash;
+ }
+ 
+ int ip_tunnel_init(struct net_device *dev);
+* Unmerged path net/ipv4/ip_gre.c
+diff --git a/net/ipv4/ip_tunnel.c b/net/ipv4/ip_tunnel.c
+index 7f801f0f1d06..cc790f94d686 100644
+--- a/net/ipv4/ip_tunnel.c
++++ b/net/ipv4/ip_tunnel.c
+@@ -308,7 +308,7 @@ static int ip_tunnel_bind_dev(struct net_device *dev)
+ 		ip_tunnel_init_flow(&fl4, iph->protocol, iph->daddr,
+ 				    iph->saddr, tunnel->parms.o_key,
+ 				    RT_TOS(iph->tos), tunnel->parms.link,
+-				    tunnel->fwmark);
++				    tunnel->fwmark, 0);
+ 		rt = ip_route_output_key(tunnel->net, &fl4);
+ 
+ 		if (!IS_ERR(rt)) {
+@@ -585,7 +585,7 @@ void ip_md_tunnel_xmit(struct sk_buff *skb, struct net_device *dev,
+ 	}
+ 	ip_tunnel_init_flow(&fl4, proto, key->u.ipv4.dst, key->u.ipv4.src,
+ 			    tunnel_id_to_key32(key->tun_id), RT_TOS(tos),
+-			    0, skb->mark);
++			    0, skb->mark, skb_get_hash(skb));
+ 	if (tunnel->encap.type != TUNNEL_ENCAP_NONE)
+ 		goto tx_error;
+ 
+@@ -730,7 +730,7 @@ void ip_tunnel_xmit(struct sk_buff *skb, struct net_device *dev,
+ 
+ 	ip_tunnel_init_flow(&fl4, protocol, dst, tnl_params->saddr,
+ 			    tunnel->parms.o_key, RT_TOS(tos), tunnel->parms.link,
+-			    tunnel->fwmark);
++			    tunnel->fwmark, skb_get_hash(skb));
+ 
+ 	if (ip_tunnel_encap(skb, tunnel, &protocol, &fl4) < 0)
+ 		goto tx_error;
+diff --git a/net/ipv4/route.c b/net/ipv4/route.c
+index bcc6e8bbf742..985b4c5eadc3 100644
+--- a/net/ipv4/route.c
++++ b/net/ipv4/route.c
+@@ -1898,6 +1898,7 @@ static void ip_multipath_l3_keys(const struct sk_buff *skb,
+ int fib_multipath_hash(const struct net *net, const struct flowi4 *fl4,
+ 		       const struct sk_buff *skb, struct flow_keys *flkeys)
+ {
++	u32 multipath_hash = fl4->flowi4_multipath_hash;
+ 	struct flow_keys hash_keys;
+ 	u32 mhash;
+ 
+@@ -1948,6 +1949,9 @@ int fib_multipath_hash(const struct net *net, const struct flowi4 *fl4,
+ 	}
+ 	mhash = flow_hash_from_keys(&hash_keys);
+ 
++	if (multipath_hash)
++		mhash = jhash_2words(mhash, multipath_hash, 0);
++
+ 	return mhash >> 1;
+ }
+ #endif /* CONFIG_IP_ROUTE_MULTIPATH */
