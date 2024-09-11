@@ -1,0 +1,243 @@
+net: bridge: mcast: add rt_protocol field to the port group struct
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-358.el8
+commit-author Nikolay Aleksandrov <nikolay@nvidia.com>
+commit 8f8cb77e0b22d9044d8d57ab3bb18ea8d0474752
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-358.el8/8f8cb77e.failed
+
+We need to be able to differentiate between pg entries created by
+user-space and the kernel when we start generating S,G entries for
+IGMPv3/MLDv2's fast path. User-space entries are created by default as
+RTPROT_STATIC and the kernel entries are RTPROT_KERNEL. Later we can
+allow user-space to provide the entry rt_protocol so we can
+differentiate between who added the entries specifically (e.g. clag,
+admin, frr etc).
+
+	Signed-off-by: Nikolay Aleksandrov <nikolay@nvidia.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 8f8cb77e0b22d9044d8d57ab3bb18ea8d0474752)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/uapi/linux/if_bridge.h
+#	net/bridge/br_mdb.c
+diff --cc include/uapi/linux/if_bridge.h
+index c424bb8708cd,1054f151078d..000000000000
+--- a/include/uapi/linux/if_bridge.h
++++ b/include/uapi/linux/if_bridge.h
+@@@ -400,6 -457,8 +400,11 @@@ enum 
+  	MDBA_MDB_EATTR_TIMER,
+  	MDBA_MDB_EATTR_SRC_LIST,
+  	MDBA_MDB_EATTR_GROUP_MODE,
+++<<<<<<< HEAD
+++=======
++ 	MDBA_MDB_EATTR_SOURCE,
++ 	MDBA_MDB_EATTR_RTPROT,
+++>>>>>>> 8f8cb77e0b22 (net: bridge: mcast: add rt_protocol field to the port group struct)
+  	__MDBA_MDB_EATTR_MAX
+  };
+  #define MDBA_MDB_EATTR_MAX (__MDBA_MDB_EATTR_MAX - 1)
+diff --cc net/bridge/br_mdb.c
+index 40754c5e5bdc,b386a5e07698..000000000000
+--- a/net/bridge/br_mdb.c
++++ b/net/bridge/br_mdb.c
+@@@ -172,13 -182,18 +172,19 @@@ static int __mdb_fill_info(struct sk_bu
+  	if (nla_put_nohdr(skb, sizeof(e), &e) ||
+  	    nla_put_u32(skb,
+  			MDBA_MDB_EATTR_TIMER,
+++<<<<<<< HEAD
+ +			br_timer_value(mtimer))) {
+ +		nla_nest_cancel(skb, nest_ent);
+ +		return -EMSGSIZE;
+ +	}
+++=======
++ 			br_timer_value(mtimer)))
++ 		goto nest_err;
++ 
+++>>>>>>> 8f8cb77e0b22 (net: bridge: mcast: add rt_protocol field to the port group struct)
+  	switch (mp->addr.proto) {
+  	case htons(ETH_P_IP):
+ -		dump_srcs_mode = !!(mp->br->multicast_igmp_version == 3);
+ -		if (mp->addr.src.ip4) {
+ -			if (nla_put_in_addr(skb, MDBA_MDB_EATTR_SOURCE,
+ -					    mp->addr.src.ip4))
+ -				goto nest_err;
+ -			break;
+ -		}
+ +		dump_srcs_mode = !!(p && mp->br->multicast_igmp_version == 3);
+  		break;
+  #if IS_ENABLED(CONFIG_IPV6)
+  	case htons(ETH_P_IPV6):
+@@@ -186,13 -207,15 +192,25 @@@
+  		break;
+  #endif
+  	}
+++<<<<<<< HEAD
+ +	if (dump_srcs_mode &&
+ +	    (__mdb_fill_srcs(skb, p) ||
+ +	     nla_put_u8(skb, MDBA_MDB_EATTR_GROUP_MODE, p->filter_mode))) {
+ +		nla_nest_cancel(skb, nest_ent);
+ +		return -EMSGSIZE;
+ +	}
+ +
+++=======
++ 	if (p) {
++ 		if (nla_put_u8(skb, MDBA_MDB_EATTR_RTPROT, p->rt_protocol))
++ 			goto nest_err;
++ 		if (dump_srcs_mode &&
++ 		    (__mdb_fill_srcs(skb, p) ||
++ 		     nla_put_u8(skb, MDBA_MDB_EATTR_GROUP_MODE,
++ 				p->filter_mode)))
++ 			goto nest_err;
++ 	}
+++>>>>>>> 8f8cb77e0b22 (net: bridge: mcast: add rt_protocol field to the port group struct)
+  	nla_nest_end(skb, nest_ent);
+  
+  	return 0;
+@@@ -393,8 -420,14 +411,11 @@@ static size_t rtnl_mdb_nlmsg_size(struc
+  	if (!pg)
+  		goto out;
+  
++ 	/* MDBA_MDB_EATTR_RTPROT */
++ 	nlmsg_size += nla_total_size(sizeof(u8));
++ 
+  	switch (pg->addr.proto) {
+  	case htons(ETH_P_IP):
+ -		/* MDBA_MDB_EATTR_SOURCE */
+ -		if (pg->addr.src.ip4)
+ -			nlmsg_size += nla_total_size(sizeof(__be32));
+  		if (pg->port->br->multicast_igmp_version == 2)
+  			goto out;
+  		addr_size = sizeof(__be32);
+@@@ -744,11 -826,28 +766,34 @@@ static int br_mdb_add_group(struct net_
+  	struct net_bridge_port_group *p;
+  	struct net_bridge_port_group __rcu **pp;
+  	unsigned long now = jiffies;
+++<<<<<<< HEAD
+ +	int err;
+ +
+ +	mp = br_mdb_ip_get(br, group);
+++=======
++ 	struct br_ip group;
++ 	u8 filter_mode;
++ 	int err;
++ 
++ 	__mdb_entry_to_br_ip(entry, &group, mdb_attrs);
++ 
++ 	/* host join errors which can happen before creating the group */
++ 	if (!port) {
++ 		/* don't allow any flags for host-joined groups */
++ 		if (entry->state) {
++ 			NL_SET_ERR_MSG_MOD(extack, "Flags are not allowed for host groups");
++ 			return -EINVAL;
++ 		}
++ 		if (!br_multicast_is_star_g(&group)) {
++ 			NL_SET_ERR_MSG_MOD(extack, "Groups with sources cannot be manually host joined");
++ 			return -EINVAL;
++ 		}
++ 	}
++ 
++ 	mp = br_mdb_ip_get(br, &group);
+++>>>>>>> 8f8cb77e0b22 (net: bridge: mcast: add rt_protocol field to the port group struct)
+  	if (!mp) {
+- 		mp = br_multicast_new_group(br, group);
++ 		mp = br_multicast_new_group(br, &group);
+  		err = PTR_ERR_OR_ZERO(mp);
+  		if (err)
+  			return err;
+@@@ -783,8 -877,11 +828,16 @@@
+  			break;
+  	}
+  
+++<<<<<<< HEAD
+ +	p = br_multicast_new_port_group(port, group, *pp, entry->state, NULL,
+ +					MCAST_EXCLUDE);
+++=======
++ 	filter_mode = br_multicast_is_star_g(&group) ? MCAST_EXCLUDE :
++ 						       MCAST_INCLUDE;
++ 
++ 	p = br_multicast_new_port_group(port, &group, *pp, entry->state, NULL,
++ 					filter_mode, RTPROT_STATIC);
+++>>>>>>> 8f8cb77e0b22 (net: bridge: mcast: add rt_protocol field to the port group struct)
+  	if (unlikely(!p)) {
+  		NL_SET_ERR_MSG_MOD(extack, "Couldn't allocate new port group");
+  		return -ENOMEM;
+@@@ -800,15 -897,13 +853,17 @@@
+  static int __br_mdb_add(struct net *net, struct net_bridge *br,
+  			struct net_bridge_port *p,
+  			struct br_mdb_entry *entry,
+ -			struct nlattr **mdb_attrs,
+  			struct netlink_ext_ack *extack)
+  {
+- 	struct br_ip ip;
+  	int ret;
+  
+++<<<<<<< HEAD
+ +	__mdb_entry_to_br_ip(entry, &ip);
+ +
+++=======
+++>>>>>>> 8f8cb77e0b22 (net: bridge: mcast: add rt_protocol field to the port group struct)
+  	spin_lock_bh(&br->multicast_lock);
+- 	ret = br_mdb_add_group(br, p, &ip, entry, extack);
++ 	ret = br_mdb_add_group(br, p, entry, mdb_attrs, extack);
+  	spin_unlock_bh(&br->multicast_lock);
+  
+  	return ret;
+* Unmerged path include/uapi/linux/if_bridge.h
+* Unmerged path net/bridge/br_mdb.c
+diff --git a/net/bridge/br_multicast.c b/net/bridge/br_multicast.c
+index 28b757a17768..7759fb11467f 100644
+--- a/net/bridge/br_multicast.c
++++ b/net/bridge/br_multicast.c
+@@ -783,7 +783,8 @@ struct net_bridge_port_group *br_multicast_new_port_group(
+ 			struct net_bridge_port_group __rcu *next,
+ 			unsigned char flags,
+ 			const unsigned char *src,
+-			u8 filter_mode)
++			u8 filter_mode,
++			u8 rt_protocol)
+ {
+ 	struct net_bridge_port_group *p;
+ 
+@@ -795,6 +796,7 @@ struct net_bridge_port_group *br_multicast_new_port_group(
+ 	p->port = port;
+ 	p->flags = flags;
+ 	p->filter_mode = filter_mode;
++	p->rt_protocol = rt_protocol;
+ 	p->mcast_gc.destroy = br_multicast_destroy_port_group;
+ 	INIT_HLIST_HEAD(&p->src_list);
+ 	rcu_assign_pointer(p->next, next);
+@@ -880,7 +882,8 @@ static int br_multicast_add_group(struct net_bridge *br,
+ 			break;
+ 	}
+ 
+-	p = br_multicast_new_port_group(port, group, *pp, 0, src, filter_mode);
++	p = br_multicast_new_port_group(port, group, *pp, 0, src, filter_mode,
++					RTPROT_KERNEL);
+ 	if (unlikely(!p))
+ 		goto err;
+ 	rcu_assign_pointer(*pp, p);
+diff --git a/net/bridge/br_private.h b/net/bridge/br_private.h
+index 26b3cc8b3453..cdf52c081ec1 100644
+--- a/net/bridge/br_private.h
++++ b/net/bridge/br_private.h
+@@ -246,6 +246,7 @@ struct net_bridge_port_group {
+ 	unsigned char			flags;
+ 	unsigned char			filter_mode;
+ 	unsigned char			grp_query_rexmit_cnt;
++	unsigned char			rt_protocol;
+ 
+ 	struct hlist_head		src_list;
+ 	unsigned int			src_ents;
+@@ -735,7 +736,7 @@ struct net_bridge_port_group *
+ br_multicast_new_port_group(struct net_bridge_port *port, struct br_ip *group,
+ 			    struct net_bridge_port_group __rcu *next,
+ 			    unsigned char flags, const unsigned char *src,
+-			    u8 filter_mode);
++			    u8 filter_mode, u8 rt_protocol);
+ int br_mdb_hash_init(struct net_bridge *br);
+ void br_mdb_hash_fini(struct net_bridge *br);
+ void br_mdb_notify(struct net_device *dev, struct net_bridge_mdb_entry *mp,
