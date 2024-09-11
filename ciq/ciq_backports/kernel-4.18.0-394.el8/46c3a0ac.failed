@@ -1,0 +1,163 @@
+mm/damon/vaddr: separate commonly usable functions
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-394.el8
+commit-author SeongJae Park <sj@kernel.org>
+commit 46c3a0accdc48c86928157fd073e66807f338485
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-394.el8/46c3a0ac.failed
+
+This moves functions in the default virtual address spaces monitoring
+primitives that commonly usable from other address spaces like physical
+address space into a header file.  Those will be reused by the physical
+address space monitoring primitives which will be implemented by the
+following commit.
+
+[sj@kernel.org: include 'highmem.h' to fix a build failure]
+  Link: https://lkml.kernel.org/r/20211014110848.5204-1-sj@kernel.org
+
+Link: https://lkml.kernel.org/r/20211012205711.29216-5-sj@kernel.org
+	Signed-off-by: SeongJae Park <sj@kernel.org>
+	Cc: Amit Shah <amit@kernel.org>
+	Cc: Benjamin Herrenschmidt <benh@kernel.crashing.org>
+	Cc: Brendan Higgins <brendanhiggins@google.com>
+	Cc: David Hildenbrand <david@redhat.com>
+	Cc: David Rienjes <rientjes@google.com>
+	Cc: David Woodhouse <dwmw@amazon.com>
+	Cc: Greg Thelen <gthelen@google.com>
+	Cc: Jonathan Cameron <Jonathan.Cameron@huawei.com>
+	Cc: Jonathan Corbet <corbet@lwn.net>
+	Cc: Leonard Foerster <foersleo@amazon.de>
+	Cc: Marco Elver <elver@google.com>
+	Cc: Markus Boehme <markubo@amazon.de>
+	Cc: Shakeel Butt <shakeelb@google.com>
+	Cc: Shuah Khan <shuah@kernel.org>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit 46c3a0accdc48c86928157fd073e66807f338485)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	mm/damon/Makefile
+#	mm/damon/vaddr.c
+* Unmerged path mm/damon/Makefile
+* Unmerged path mm/damon/vaddr.c
+* Unmerged path mm/damon/Makefile
+diff --git a/mm/damon/prmtv-common.c b/mm/damon/prmtv-common.c
+new file mode 100644
+index 000000000000..7e62ee54fb54
+--- /dev/null
++++ b/mm/damon/prmtv-common.c
+@@ -0,0 +1,87 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * Common Primitives for Data Access Monitoring
++ *
++ * Author: SeongJae Park <sj@kernel.org>
++ */
++
++#include <linux/mmu_notifier.h>
++#include <linux/page_idle.h>
++#include <linux/pagemap.h>
++#include <linux/rmap.h>
++
++#include "prmtv-common.h"
++
++/*
++ * Get an online page for a pfn if it's in the LRU list.  Otherwise, returns
++ * NULL.
++ *
++ * The body of this function is stolen from the 'page_idle_get_page()'.  We
++ * steal rather than reuse it because the code is quite simple.
++ */
++struct page *damon_get_page(unsigned long pfn)
++{
++	struct page *page = pfn_to_online_page(pfn);
++
++	if (!page || !PageLRU(page) || !get_page_unless_zero(page))
++		return NULL;
++
++	if (unlikely(!PageLRU(page))) {
++		put_page(page);
++		page = NULL;
++	}
++	return page;
++}
++
++void damon_ptep_mkold(pte_t *pte, struct mm_struct *mm, unsigned long addr)
++{
++	bool referenced = false;
++	struct page *page = damon_get_page(pte_pfn(*pte));
++
++	if (!page)
++		return;
++
++	if (pte_young(*pte)) {
++		referenced = true;
++		*pte = pte_mkold(*pte);
++	}
++
++#ifdef CONFIG_MMU_NOTIFIER
++	if (mmu_notifier_clear_young(mm, addr, addr + PAGE_SIZE))
++		referenced = true;
++#endif /* CONFIG_MMU_NOTIFIER */
++
++	if (referenced)
++		set_page_young(page);
++
++	set_page_idle(page);
++	put_page(page);
++}
++
++void damon_pmdp_mkold(pmd_t *pmd, struct mm_struct *mm, unsigned long addr)
++{
++#ifdef CONFIG_TRANSPARENT_HUGEPAGE
++	bool referenced = false;
++	struct page *page = damon_get_page(pmd_pfn(*pmd));
++
++	if (!page)
++		return;
++
++	if (pmd_young(*pmd)) {
++		referenced = true;
++		*pmd = pmd_mkold(*pmd);
++	}
++
++#ifdef CONFIG_MMU_NOTIFIER
++	if (mmu_notifier_clear_young(mm, addr,
++				addr + ((1UL) << HPAGE_PMD_SHIFT)))
++		referenced = true;
++#endif /* CONFIG_MMU_NOTIFIER */
++
++	if (referenced)
++		set_page_young(page);
++
++	set_page_idle(page);
++	put_page(page);
++#endif /* CONFIG_TRANSPARENT_HUGEPAGE */
++}
+diff --git a/mm/damon/prmtv-common.h b/mm/damon/prmtv-common.h
+new file mode 100644
+index 000000000000..7093d19e5d42
+--- /dev/null
++++ b/mm/damon/prmtv-common.h
+@@ -0,0 +1,17 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++/*
++ * Common Primitives for Data Access Monitoring
++ *
++ * Author: SeongJae Park <sj@kernel.org>
++ */
++
++#include <linux/damon.h>
++#include <linux/random.h>
++
++/* Get a random number in [l, r) */
++#define damon_rand(l, r) (l + prandom_u32_max(r - l))
++
++struct page *damon_get_page(unsigned long pfn);
++
++void damon_ptep_mkold(pte_t *pte, struct mm_struct *mm, unsigned long addr);
++void damon_pmdp_mkold(pmd_t *pmd, struct mm_struct *mm, unsigned long addr);
+* Unmerged path mm/damon/vaddr.c
