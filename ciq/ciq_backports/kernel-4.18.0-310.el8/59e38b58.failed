@@ -1,0 +1,316 @@
+KVM: SVM: Create trace events for VMGEXIT MSR protocol processing
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-310.el8
+commit-author Tom Lendacky <thomas.lendacky@amd.com>
+commit 59e38b58de283f76c533a2da416abf93bfd9ea41
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-310.el8/59e38b58.failed
+
+Add trace events for entry to and exit from VMGEXIT MSR protocol
+processing. The vCPU will be common for the trace events. The MSR
+protocol processing is guided by the GHCB GPA in the VMCB, so the GHCB
+GPA will represent the input and output values for the entry and exit
+events, respectively. Additionally, the exit event will contain the
+return code for the event.
+
+	Signed-off-by: Tom Lendacky <thomas.lendacky@amd.com>
+Message-Id: <c5b3b440c3e0db43ff2fc02813faa94fa54896b0.1607620209.git.thomas.lendacky@amd.com>
+	Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+(cherry picked from commit 59e38b58de283f76c533a2da416abf93bfd9ea41)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kvm/svm/sev.c
+#	arch/x86/kvm/trace.h
+#	arch/x86/kvm/x86.c
+diff --cc arch/x86/kvm/svm/sev.c
+index e32b3ec356a9,2a36efadf9a3..000000000000
+--- a/arch/x86/kvm/svm/sev.c
++++ b/arch/x86/kvm/svm/sev.c
+@@@ -1184,3 -1503,152 +1184,155 @@@ void pre_sev_run(struct vcpu_svm *svm, 
+  	svm->vmcb->control.tlb_ctl = TLB_CONTROL_FLUSH_ASID;
+  	vmcb_mark_dirty(svm->vmcb, VMCB_ASID);
+  }
+++<<<<<<< HEAD
+++=======
++ 
++ static void set_ghcb_msr_bits(struct vcpu_svm *svm, u64 value, u64 mask,
++ 			      unsigned int pos)
++ {
++ 	svm->vmcb->control.ghcb_gpa &= ~(mask << pos);
++ 	svm->vmcb->control.ghcb_gpa |= (value & mask) << pos;
++ }
++ 
++ static u64 get_ghcb_msr_bits(struct vcpu_svm *svm, u64 mask, unsigned int pos)
++ {
++ 	return (svm->vmcb->control.ghcb_gpa >> pos) & mask;
++ }
++ 
++ static void set_ghcb_msr(struct vcpu_svm *svm, u64 value)
++ {
++ 	svm->vmcb->control.ghcb_gpa = value;
++ }
++ 
++ static int sev_handle_vmgexit_msr_protocol(struct vcpu_svm *svm)
++ {
++ 	struct vmcb_control_area *control = &svm->vmcb->control;
++ 	struct kvm_vcpu *vcpu = &svm->vcpu;
++ 	u64 ghcb_info;
++ 	int ret = 1;
++ 
++ 	ghcb_info = control->ghcb_gpa & GHCB_MSR_INFO_MASK;
++ 
++ 	trace_kvm_vmgexit_msr_protocol_enter(svm->vcpu.vcpu_id,
++ 					     control->ghcb_gpa);
++ 
++ 	switch (ghcb_info) {
++ 	case GHCB_MSR_SEV_INFO_REQ:
++ 		set_ghcb_msr(svm, GHCB_MSR_SEV_INFO(GHCB_VERSION_MAX,
++ 						    GHCB_VERSION_MIN,
++ 						    sev_enc_bit));
++ 		break;
++ 	case GHCB_MSR_CPUID_REQ: {
++ 		u64 cpuid_fn, cpuid_reg, cpuid_value;
++ 
++ 		cpuid_fn = get_ghcb_msr_bits(svm,
++ 					     GHCB_MSR_CPUID_FUNC_MASK,
++ 					     GHCB_MSR_CPUID_FUNC_POS);
++ 
++ 		/* Initialize the registers needed by the CPUID intercept */
++ 		vcpu->arch.regs[VCPU_REGS_RAX] = cpuid_fn;
++ 		vcpu->arch.regs[VCPU_REGS_RCX] = 0;
++ 
++ 		ret = svm_invoke_exit_handler(svm, SVM_EXIT_CPUID);
++ 		if (!ret) {
++ 			ret = -EINVAL;
++ 			break;
++ 		}
++ 
++ 		cpuid_reg = get_ghcb_msr_bits(svm,
++ 					      GHCB_MSR_CPUID_REG_MASK,
++ 					      GHCB_MSR_CPUID_REG_POS);
++ 		if (cpuid_reg == 0)
++ 			cpuid_value = vcpu->arch.regs[VCPU_REGS_RAX];
++ 		else if (cpuid_reg == 1)
++ 			cpuid_value = vcpu->arch.regs[VCPU_REGS_RBX];
++ 		else if (cpuid_reg == 2)
++ 			cpuid_value = vcpu->arch.regs[VCPU_REGS_RCX];
++ 		else
++ 			cpuid_value = vcpu->arch.regs[VCPU_REGS_RDX];
++ 
++ 		set_ghcb_msr_bits(svm, cpuid_value,
++ 				  GHCB_MSR_CPUID_VALUE_MASK,
++ 				  GHCB_MSR_CPUID_VALUE_POS);
++ 
++ 		set_ghcb_msr_bits(svm, GHCB_MSR_CPUID_RESP,
++ 				  GHCB_MSR_INFO_MASK,
++ 				  GHCB_MSR_INFO_POS);
++ 		break;
++ 	}
++ 	case GHCB_MSR_TERM_REQ: {
++ 		u64 reason_set, reason_code;
++ 
++ 		reason_set = get_ghcb_msr_bits(svm,
++ 					       GHCB_MSR_TERM_REASON_SET_MASK,
++ 					       GHCB_MSR_TERM_REASON_SET_POS);
++ 		reason_code = get_ghcb_msr_bits(svm,
++ 						GHCB_MSR_TERM_REASON_MASK,
++ 						GHCB_MSR_TERM_REASON_POS);
++ 		pr_info("SEV-ES guest requested termination: %#llx:%#llx\n",
++ 			reason_set, reason_code);
++ 		fallthrough;
++ 	}
++ 	default:
++ 		ret = -EINVAL;
++ 	}
++ 
++ 	trace_kvm_vmgexit_msr_protocol_exit(svm->vcpu.vcpu_id,
++ 					    control->ghcb_gpa, ret);
++ 
++ 	return ret;
++ }
++ 
++ int sev_handle_vmgexit(struct vcpu_svm *svm)
++ {
++ 	struct vmcb_control_area *control = &svm->vmcb->control;
++ 	u64 ghcb_gpa, exit_code;
++ 	struct ghcb *ghcb;
++ 	int ret;
++ 
++ 	/* Validate the GHCB */
++ 	ghcb_gpa = control->ghcb_gpa;
++ 	if (ghcb_gpa & GHCB_MSR_INFO_MASK)
++ 		return sev_handle_vmgexit_msr_protocol(svm);
++ 
++ 	if (!ghcb_gpa) {
++ 		vcpu_unimpl(&svm->vcpu, "vmgexit: GHCB gpa is not set\n");
++ 		return -EINVAL;
++ 	}
++ 
++ 	if (kvm_vcpu_map(&svm->vcpu, ghcb_gpa >> PAGE_SHIFT, &svm->ghcb_map)) {
++ 		/* Unable to map GHCB from guest */
++ 		vcpu_unimpl(&svm->vcpu, "vmgexit: error mapping GHCB [%#llx] from guest\n",
++ 			    ghcb_gpa);
++ 		return -EINVAL;
++ 	}
++ 
++ 	svm->ghcb = svm->ghcb_map.hva;
++ 	ghcb = svm->ghcb_map.hva;
++ 
++ 	trace_kvm_vmgexit_enter(svm->vcpu.vcpu_id, ghcb);
++ 
++ 	exit_code = ghcb_get_sw_exit_code(ghcb);
++ 
++ 	ret = sev_es_validate_vmgexit(svm);
++ 	if (ret)
++ 		return ret;
++ 
++ 	sev_es_sync_from_ghcb(svm);
++ 	ghcb_set_sw_exit_info_1(ghcb, 0);
++ 	ghcb_set_sw_exit_info_2(ghcb, 0);
++ 
++ 	ret = -EINVAL;
++ 	switch (exit_code) {
++ 	case SVM_VMGEXIT_UNSUPPORTED_EVENT:
++ 		vcpu_unimpl(&svm->vcpu,
++ 			    "vmgexit: unsupported event - exit_info_1=%#llx, exit_info_2=%#llx\n",
++ 			    control->exit_info_1, control->exit_info_2);
++ 		break;
++ 	default:
++ 		ret = svm_invoke_exit_handler(svm, exit_code);
++ 	}
++ 
++ 	return ret;
++ }
+++>>>>>>> 59e38b58de28 (KVM: SVM: Create trace events for VMGEXIT MSR protocol processing)
+diff --cc arch/x86/kvm/trace.h
+index aef960f90f26,2de30c20bc26..000000000000
+--- a/arch/x86/kvm/trace.h
++++ b/arch/x86/kvm/trace.h
+@@@ -1578,6 -1578,103 +1578,106 @@@ TRACE_EVENT(kvm_hv_syndbg_get_msr
+  		  __entry->vcpu_id, __entry->vp_index, __entry->msr,
+  		  __entry->data)
+  );
+++<<<<<<< HEAD
+++=======
++ 
++ /*
++  * Tracepoint for the start of VMGEXIT processing
++  */
++ TRACE_EVENT(kvm_vmgexit_enter,
++ 	TP_PROTO(unsigned int vcpu_id, struct ghcb *ghcb),
++ 	TP_ARGS(vcpu_id, ghcb),
++ 
++ 	TP_STRUCT__entry(
++ 		__field(unsigned int, vcpu_id)
++ 		__field(u64, exit_reason)
++ 		__field(u64, info1)
++ 		__field(u64, info2)
++ 	),
++ 
++ 	TP_fast_assign(
++ 		__entry->vcpu_id     = vcpu_id;
++ 		__entry->exit_reason = ghcb->save.sw_exit_code;
++ 		__entry->info1       = ghcb->save.sw_exit_info_1;
++ 		__entry->info2       = ghcb->save.sw_exit_info_2;
++ 	),
++ 
++ 	TP_printk("vcpu %u, exit_reason %llx, exit_info1 %llx, exit_info2 %llx",
++ 		  __entry->vcpu_id, __entry->exit_reason,
++ 		  __entry->info1, __entry->info2)
++ );
++ 
++ /*
++  * Tracepoint for the end of VMGEXIT processing
++  */
++ TRACE_EVENT(kvm_vmgexit_exit,
++ 	TP_PROTO(unsigned int vcpu_id, struct ghcb *ghcb),
++ 	TP_ARGS(vcpu_id, ghcb),
++ 
++ 	TP_STRUCT__entry(
++ 		__field(unsigned int, vcpu_id)
++ 		__field(u64, exit_reason)
++ 		__field(u64, info1)
++ 		__field(u64, info2)
++ 	),
++ 
++ 	TP_fast_assign(
++ 		__entry->vcpu_id     = vcpu_id;
++ 		__entry->exit_reason = ghcb->save.sw_exit_code;
++ 		__entry->info1       = ghcb->save.sw_exit_info_1;
++ 		__entry->info2       = ghcb->save.sw_exit_info_2;
++ 	),
++ 
++ 	TP_printk("vcpu %u, exit_reason %llx, exit_info1 %llx, exit_info2 %llx",
++ 		  __entry->vcpu_id, __entry->exit_reason,
++ 		  __entry->info1, __entry->info2)
++ );
++ 
++ /*
++  * Tracepoint for the start of VMGEXIT MSR procotol processing
++  */
++ TRACE_EVENT(kvm_vmgexit_msr_protocol_enter,
++ 	TP_PROTO(unsigned int vcpu_id, u64 ghcb_gpa),
++ 	TP_ARGS(vcpu_id, ghcb_gpa),
++ 
++ 	TP_STRUCT__entry(
++ 		__field(unsigned int, vcpu_id)
++ 		__field(u64, ghcb_gpa)
++ 	),
++ 
++ 	TP_fast_assign(
++ 		__entry->vcpu_id  = vcpu_id;
++ 		__entry->ghcb_gpa = ghcb_gpa;
++ 	),
++ 
++ 	TP_printk("vcpu %u, ghcb_gpa %016llx",
++ 		  __entry->vcpu_id, __entry->ghcb_gpa)
++ );
++ 
++ /*
++  * Tracepoint for the end of VMGEXIT MSR procotol processing
++  */
++ TRACE_EVENT(kvm_vmgexit_msr_protocol_exit,
++ 	TP_PROTO(unsigned int vcpu_id, u64 ghcb_gpa, int result),
++ 	TP_ARGS(vcpu_id, ghcb_gpa, result),
++ 
++ 	TP_STRUCT__entry(
++ 		__field(unsigned int, vcpu_id)
++ 		__field(u64, ghcb_gpa)
++ 		__field(int, result)
++ 	),
++ 
++ 	TP_fast_assign(
++ 		__entry->vcpu_id  = vcpu_id;
++ 		__entry->ghcb_gpa = ghcb_gpa;
++ 		__entry->result   = result;
++ 	),
++ 
++ 	TP_printk("vcpu %u, ghcb_gpa %016llx, result %d",
++ 		  __entry->vcpu_id, __entry->ghcb_gpa, __entry->result)
++ );
++ 
+++>>>>>>> 59e38b58de28 (KVM: SVM: Create trace events for VMGEXIT MSR protocol processing)
+  #endif /* _TRACE_KVM_H */
+  
+  #undef TRACE_INCLUDE_PATH
+diff --cc arch/x86/kvm/x86.c
+index 599480cda70f,02c6fb166fc3..000000000000
+--- a/arch/x86/kvm/x86.c
++++ b/arch/x86/kvm/x86.c
+@@@ -11337,3 -11314,7 +11337,10 @@@ EXPORT_TRACEPOINT_SYMBOL_GPL(kvm_avic_u
+  EXPORT_TRACEPOINT_SYMBOL_GPL(kvm_avic_incomplete_ipi);
+  EXPORT_TRACEPOINT_SYMBOL_GPL(kvm_avic_ga_log);
+  EXPORT_TRACEPOINT_SYMBOL_GPL(kvm_apicv_update_request);
+++<<<<<<< HEAD
+++=======
++ EXPORT_TRACEPOINT_SYMBOL_GPL(kvm_vmgexit_enter);
++ EXPORT_TRACEPOINT_SYMBOL_GPL(kvm_vmgexit_exit);
++ EXPORT_TRACEPOINT_SYMBOL_GPL(kvm_vmgexit_msr_protocol_enter);
++ EXPORT_TRACEPOINT_SYMBOL_GPL(kvm_vmgexit_msr_protocol_exit);
+++>>>>>>> 59e38b58de28 (KVM: SVM: Create trace events for VMGEXIT MSR protocol processing)
+* Unmerged path arch/x86/kvm/svm/sev.c
+* Unmerged path arch/x86/kvm/trace.h
+* Unmerged path arch/x86/kvm/x86.c
