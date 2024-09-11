@@ -1,0 +1,198 @@
+tipc: fix missing Name entries due to half-failover
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-147.el8
+commit-author Tuong Lien <tuong.t.lien@dektech.com.au>
+commit c0b14a0854fab0a0164aabfe49a76aae9216fe97
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-147.el8/c0b14a08.failed
+
+TIPC link can temporarily fall into "half-establish" that only one of
+the link endpoints is ESTABLISHED and starts to send traffic, PROTOCOL
+messages, whereas the other link endpoint is not up (e.g. immediately
+when the endpoint receives ACTIVATE_MSG, the network interface goes
+down...).
+
+This is a normal situation and will be settled because the link
+endpoint will be eventually brought down after the link tolerance time.
+
+However, the situation will become worse when the second link is
+established before the first link endpoint goes down,
+For example:
+
+   1. Both links <1A-2A>, <1B-2B> down
+   2. Link endpoint 2A up, but 1A still down (e.g. due to network
+      disturbance, wrong session, etc.)
+   3. Link <1B-2B> up
+   4. Link endpoint 2A down (e.g. due to link tolerance timeout)
+   5. Node B starts failover onto link <1B-2B>
+
+   ==> Node A does never start link failover.
+
+When the "half-failover" situation happens, two consequences have been
+observed:
+
+a) Peer link/node gets stuck in FAILINGOVER state;
+b) Traffic or user messages that peer node is trying to failover onto
+the second link can be partially or completely dropped by this node.
+
+The consequence a) was actually solved by commit c140eb166d68 ("tipc:
+fix failover problem"), but that commit didn't cover the b). It's due
+to the fact that the tunnel link endpoint has never been prepared for a
+failover, so the 'l->drop_point' (and the other data...) is not set
+correctly. When a TUNNEL_MSG from peer node arrives on the link,
+depending on the inner message's seqno and the current 'l->drop_point'
+value, the message can be dropped (- treated as a duplicate message) or
+processed.
+At this early stage, the traffic messages from peer are likely to be
+NAME_DISTRIBUTORs, this means some name table entries will be missed on
+the node forever!
+
+The commit resolves the issue by starting the FAILOVER process on this
+node as well. Another benefit from this solution is that we ensure the
+link will not be re-established until the failover ends.
+
+	Acked-by: Jon Maloy <jon.maloy@ericsson.com>
+	Signed-off-by: Tuong Lien <tuong.t.lien@dektech.com.au>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit c0b14a0854fab0a0164aabfe49a76aae9216fe97)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/tipc/link.c
+#	net/tipc/node.c
+diff --cc net/tipc/link.c
+index 8043d0e17ef3,f5cd986e1e50..000000000000
+--- a/net/tipc/link.c
++++ b/net/tipc/link.c
+@@@ -1567,6 -1705,82 +1567,85 @@@ tnl
+  	}
+  }
+  
+++<<<<<<< HEAD
+++=======
++ /**
++  * tipc_link_failover_prepare() - prepare tnl for link failover
++  *
++  * This is a special version of the precursor - tipc_link_tnl_prepare(),
++  * see the tipc_node_link_failover() for details
++  *
++  * @l: failover link
++  * @tnl: tunnel link
++  * @xmitq: queue for messages to be xmited
++  */
++ void tipc_link_failover_prepare(struct tipc_link *l, struct tipc_link *tnl,
++ 				struct sk_buff_head *xmitq)
++ {
++ 	struct sk_buff_head *fdefq = &tnl->failover_deferdq;
++ 
++ 	tipc_link_create_dummy_tnl_msg(tnl, xmitq);
++ 
++ 	/* This failover link enpoint was never established before,
++ 	 * so it has not received anything from peer.
++ 	 * Otherwise, it must be a normal failover situation or the
++ 	 * node has entered SELF_DOWN_PEER_LEAVING and both peer nodes
++ 	 * would have to start over from scratch instead.
++ 	 */
++ 	WARN_ON(l && tipc_link_is_up(l));
++ 	tnl->drop_point = 1;
++ 	tnl->failover_reasm_skb = NULL;
++ 
++ 	/* Initiate the link's failover deferdq */
++ 	if (unlikely(!skb_queue_empty(fdefq))) {
++ 		pr_warn("Link failover deferdq not empty: %d!\n",
++ 			skb_queue_len(fdefq));
++ 		__skb_queue_purge(fdefq);
++ 	}
++ }
++ 
++ /* tipc_link_validate_msg(): validate message against current link state
++  * Returns true if message should be accepted, otherwise false
++  */
++ bool tipc_link_validate_msg(struct tipc_link *l, struct tipc_msg *hdr)
++ {
++ 	u16 curr_session = l->peer_session;
++ 	u16 session = msg_session(hdr);
++ 	int mtyp = msg_type(hdr);
++ 
++ 	if (msg_user(hdr) != LINK_PROTOCOL)
++ 		return true;
++ 
++ 	switch (mtyp) {
++ 	case RESET_MSG:
++ 		if (!l->in_session)
++ 			return true;
++ 		/* Accept only RESET with new session number */
++ 		return more(session, curr_session);
++ 	case ACTIVATE_MSG:
++ 		if (!l->in_session)
++ 			return true;
++ 		/* Accept only ACTIVATE with new or current session number */
++ 		return !less(session, curr_session);
++ 	case STATE_MSG:
++ 		/* Accept only STATE with current session number */
++ 		if (!l->in_session)
++ 			return false;
++ 		if (session != curr_session)
++ 			return false;
++ 		/* Extra sanity check */
++ 		if (!link_is_up(l) && msg_ack(hdr))
++ 			return false;
++ 		if (!(l->peer_caps & TIPC_LINK_PROTO_SEQNO))
++ 			return true;
++ 		/* Accept only STATE with new sequence number */
++ 		return !less(msg_seqno(hdr), l->rcv_nxt_state);
++ 	default:
++ 		return false;
++ 	}
++ }
++ 
+++>>>>>>> c0b14a0854fa (tipc: fix missing Name entries due to half-failover)
+  /* tipc_link_proto_rcv(): receive link level protocol message :
+   * Note that network plane id propagates through the network, and may
+   * change at any time. The node with lowest numerical id determines
+diff --cc net/tipc/node.c
+index 5adcf66d6d90,9e106d3ed187..000000000000
+--- a/net/tipc/node.c
++++ b/net/tipc/node.c
+@@@ -1631,14 -1711,17 +1669,22 @@@ static bool tipc_node_check_state(struc
+  			tipc_skb_queue_splice_tail_init(tipc_link_inputq(pl),
+  							tipc_link_inputq(l));
+  		}
++ 
+  		/* If parallel link was already down, and this happened before
+- 		 * the tunnel link came up, FAILOVER was never sent. Ensure that
+- 		 * FAILOVER is sent to get peer out of NODE_FAILINGOVER state.
++ 		 * the tunnel link came up, node failover was never started.
++ 		 * Ensure that a FAILOVER_MSG is sent to get peer out of
++ 		 * NODE_FAILINGOVER state, also this node must accept
++ 		 * TUNNEL_MSGs from peer.
+  		 */
+++<<<<<<< HEAD
+ +		if (n->state != NODE_FAILINGOVER && !n->failover_sent) {
+ +			tipc_link_create_dummy_tnl_msg(l, xmitq);
+ +			n->failover_sent = true;
+ +		}
+++=======
++ 		if (n->state != NODE_FAILINGOVER)
++ 			tipc_node_link_failover(n, pl, l, xmitq);
+++>>>>>>> c0b14a0854fa (tipc: fix missing Name entries due to half-failover)
+  
+  		/* If pkts arrive out of order, use lowest calculated syncpt */
+  		if (less(syncpt, n->sync_point))
+* Unmerged path net/tipc/link.c
+diff --git a/net/tipc/link.h b/net/tipc/link.h
+index 8477d66526e6..3c03524fc0f9 100644
+--- a/net/tipc/link.h
++++ b/net/tipc/link.h
+@@ -90,6 +90,8 @@ void tipc_link_tnl_prepare(struct tipc_link *l, struct tipc_link *tnl,
+ 			   int mtyp, struct sk_buff_head *xmitq);
+ void tipc_link_create_dummy_tnl_msg(struct tipc_link *tnl,
+ 				    struct sk_buff_head *xmitq);
++void tipc_link_failover_prepare(struct tipc_link *l, struct tipc_link *tnl,
++				struct sk_buff_head *xmitq);
+ void tipc_link_build_reset_msg(struct tipc_link *l, struct sk_buff_head *xmitq);
+ int tipc_link_fsm_evt(struct tipc_link *l, int evt);
+ bool tipc_link_is_up(struct tipc_link *l);
+* Unmerged path net/tipc/node.c
