@@ -1,0 +1,263 @@
+netfilter: nf_tables: memleak in hw offload abort path
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-338.el8
+commit-author Pablo Neira Ayuso <pablo@netfilter.org>
+commit 3c5e44622011b9ea21bd425875dcccfc9a158f5f
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-338.el8/3c5e4462.failed
+
+Release flow from the abort path, this is easy to reproduce since
+b72920f6e4a9 ("netfilter: nftables: counter hardware offload support").
+If the preparation phase fails, then the abort path is exercised without
+releasing the flow rule object.
+
+unreferenced object 0xffff8881f0fa7700 (size 128):
+  comm "nft", pid 1335, jiffies 4294931120 (age 4163.740s)
+  hex dump (first 32 bytes):
+    08 e4 de 13 82 88 ff ff 98 e4 de 13 82 88 ff ff  ................
+    48 e4 de 13 82 88 ff ff 01 00 00 00 00 00 00 00  H...............
+  backtrace:
+    [<00000000634547e7>] flow_rule_alloc+0x26/0x80
+    [<00000000c8426156>] nft_flow_rule_create+0xc9/0x3f0 [nf_tables]
+    [<0000000075ff8e46>] nf_tables_newrule+0xc79/0x10a0 [nf_tables]
+    [<00000000ba65e40e>] nfnetlink_rcv_batch+0xaac/0xf90 [nfnetlink]
+    [<00000000505c614a>] nfnetlink_rcv+0x1bb/0x1f0 [nfnetlink]
+    [<00000000eb78e1fe>] netlink_unicast+0x34b/0x480
+    [<00000000a8f72c94>] netlink_sendmsg+0x3af/0x690
+    [<000000009cb1ddf4>] sock_sendmsg+0x96/0xa0
+    [<0000000039d06e44>] ____sys_sendmsg+0x3fe/0x440
+    [<00000000137e82ca>] ___sys_sendmsg+0xd8/0x140
+    [<000000000c6bf6a6>] __sys_sendmsg+0xb3/0x130
+    [<0000000043bd6268>] do_syscall_64+0x40/0xb0
+    [<00000000afdebc2d>] entry_SYSCALL_64_after_hwframe+0x44/0xae
+
+Remove flow rule release from the offload commit path, otherwise error
+from the offload commit phase might trigger a double-free due to the
+execution of the abort_offload -> abort. After this patch, the abort
+path takes care of releasing the flow rule.
+
+This fix also needs to move the nft_flow_rule_create() call before the
+transaction object is added otherwise the abort path might find a NULL
+pointer to the flow rule object for the NFT_CHAIN_HW_OFFLOAD case.
+
+While at it, rename BASIC-like goto tags to slightly more meaningful
+names rather than adding a new "err3" tag.
+
+Fixes: 63b48c73ff56 ("netfilter: nf_tables_offload: undo updates if transaction fails")
+	Signed-off-by: Pablo Neira Ayuso <pablo@netfilter.org>
+(cherry picked from commit 3c5e44622011b9ea21bd425875dcccfc9a158f5f)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/netfilter/nf_tables_api.c
+#	net/netfilter/nf_tables_offload.c
+diff --cc net/netfilter/nf_tables_api.c
+index 7ef71dac0666,ca9ec8721e6c..000000000000
+--- a/net/netfilter/nf_tables_api.c
++++ b/net/netfilter/nf_tables_api.c
+@@@ -3021,21 -3233,24 +3021,35 @@@ static struct nft_rule *nft_rule_lookup
+  
+  #define NFT_RULE_MAXEXPRS	128
+  
+ -static int nf_tables_newrule(struct sk_buff *skb, const struct nfnl_info *info,
+ -			     const struct nlattr * const nla[])
+ +static int nf_tables_newrule(struct net *net, struct sock *nlsk,
+ +			     struct sk_buff *skb, const struct nlmsghdr *nlh,
+ +			     const struct nlattr * const nla[],
+ +			     struct netlink_ext_ack *extack)
+  {
+++<<<<<<< HEAD
+ +	const struct nfgenmsg *nfmsg = nlmsg_data(nlh);
+ +	u8 genmask = nft_genmask_next(net);
+ +	struct nft_expr_info *info = NULL;
+ +	int family = nfmsg->nfgen_family;
+ +	struct nft_flow_rule *flow;
+++=======
++ 	struct nftables_pernet *nft_net = nft_pernet(info->net);
++ 	const struct nfgenmsg *nfmsg = nlmsg_data(info->nlh);
++ 	struct netlink_ext_ack *extack = info->extack;
++ 	unsigned int size, i, n, ulen = 0, usize = 0;
++ 	u8 genmask = nft_genmask_next(info->net);
++ 	struct nft_rule *rule, *old_rule = NULL;
++ 	struct nft_expr_info *expr_info = NULL;
++ 	struct nft_flow_rule *flow = NULL;
++ 	int family = nfmsg->nfgen_family;
++ 	struct net *net = info->net;
++ 	struct nft_userdata *udata;
+++>>>>>>> 3c5e44622011 (netfilter: nf_tables: memleak in hw offload abort path)
+  	struct nft_table *table;
+  	struct nft_chain *chain;
+ -	struct nft_trans *trans;
+ -	u64 handle, pos_handle;
+ +	struct nft_rule *rule, *old_rule = NULL;
+ +	struct nft_userdata *udata;
+ +	struct nft_trans *trans = NULL;
+  	struct nft_expr *expr;
+  	struct nft_ctx ctx;
+  	struct nlattr *tmp;
+@@@ -3112,13 -3340,15 +3126,23 @@@
+  		nla_for_each_nested(tmp, nla[NFTA_RULE_EXPRESSIONS], rem) {
+  			err = -EINVAL;
+  			if (nla_type(tmp) != NFTA_LIST_ELEM)
+- 				goto err1;
++ 				goto err_release_expr;
+  			if (n == NFT_RULE_MAXEXPRS)
+++<<<<<<< HEAD
+ +				goto err1;
+ +			err = nf_tables_expr_parse(&ctx, tmp, &info[n]);
+ +			if (err < 0)
+ +				goto err1;
+ +			size += info[n].ops->size;
+++=======
++ 				goto err_release_expr;
++ 			err = nf_tables_expr_parse(&ctx, tmp, &expr_info[n]);
++ 			if (err < 0) {
++ 				NL_SET_BAD_ATTR(extack, tmp);
++ 				goto err_release_expr;
++ 			}
++ 			size += expr_info[n].ops->size;
+++>>>>>>> 3c5e44622011 (netfilter: nf_tables: memleak in hw offload abort path)
+  			n++;
+  		}
+  	}
+@@@ -3152,18 -3382,28 +3176,38 @@@
+  
+  	expr = nft_expr_first(rule);
+  	for (i = 0; i < n; i++) {
+++<<<<<<< HEAD
+ +		err = nf_tables_newexpr(&ctx, &info[i], expr);
+ +		if (err < 0)
+ +			goto err2;
+++=======
++ 		err = nf_tables_newexpr(&ctx, &expr_info[i], expr);
++ 		if (err < 0) {
++ 			NL_SET_BAD_ATTR(extack, expr_info[i].attr);
++ 			goto err_release_rule;
++ 		}
+++>>>>>>> 3c5e44622011 (netfilter: nf_tables: memleak in hw offload abort path)
+  
+ -		if (expr_info[i].ops->validate)
+ +		if (info[i].ops->validate)
+  			nft_validate_state_update(net, NFT_VALIDATE_NEED);
+  
+ -		expr_info[i].ops = NULL;
+ +		info[i].ops = NULL;
+  		expr = nft_expr_next(expr);
+  	}
+  
+++<<<<<<< HEAD
+ +	if (nlh->nlmsg_flags & NLM_F_REPLACE) {
+++=======
++ 	if (chain->flags & NFT_CHAIN_HW_OFFLOAD) {
++ 		flow = nft_flow_rule_create(net, rule);
++ 		if (IS_ERR(flow)) {
++ 			err = PTR_ERR(flow);
++ 			goto err_release_rule;
++ 		}
++ 	}
++ 
++ 	if (info->nlh->nlmsg_flags & NLM_F_REPLACE) {
+++>>>>>>> 3c5e44622011 (netfilter: nf_tables: memleak in hw offload abort path)
+  		trans = nft_trans_rule_add(&ctx, NFT_MSG_NEWRULE, rule);
+  		if (trans == NULL) {
+  			err = -ENOMEM;
+@@@ -3180,10 -3420,10 +3224,10 @@@
+  		trans = nft_trans_rule_add(&ctx, NFT_MSG_NEWRULE, rule);
+  		if (!trans) {
+  			err = -ENOMEM;
+- 			goto err2;
++ 			goto err_destroy_flow_rule;
+  		}
+  
+ -		if (info->nlh->nlmsg_flags & NLM_F_APPEND) {
+ +		if (nlh->nlmsg_flags & NLM_F_APPEND) {
+  			if (old_rule)
+  				list_add_rcu(&rule->list, &old_rule->list);
+  			else
+@@@ -3195,32 -3435,31 +3239,34 @@@
+  				list_add_rcu(&rule->list, &chain->rules);
+  		}
+  	}
+ -	kvfree(expr_info);
+ +	kvfree(info);
+  	chain->use++;
+  
+++<<<<<<< HEAD
+ +	if (net->nft.validate_state == NFT_VALIDATE_DO)
+- 		return nft_table_validate(net, table);
+- 
+- 	if (chain->flags & NFT_CHAIN_HW_OFFLOAD) {
+- 		flow = nft_flow_rule_create(net, rule);
+- 		if (IS_ERR(flow))
+- 			return PTR_ERR(flow);
+- 
+++=======
++ 	if (flow)
+  		nft_trans_flow_rule(trans) = flow;
+- 	}
++ 
++ 	if (nft_net->validate_state == NFT_VALIDATE_DO)
+++>>>>>>> 3c5e44622011 (netfilter: nf_tables: memleak in hw offload abort path)
++ 		return nft_table_validate(net, table);
+  
+  	return 0;
+- err2:
++ 
++ err_destroy_flow_rule:
++ 	nft_flow_rule_destroy(flow);
++ err_release_rule:
+  	nf_tables_rule_release(&ctx, rule);
+- err1:
++ err_release_expr:
+  	for (i = 0; i < n; i++) {
+ -		if (expr_info[i].ops) {
+ -			module_put(expr_info[i].ops->type->owner);
+ -			if (expr_info[i].ops->type->release_ops)
+ -				expr_info[i].ops->type->release_ops(expr_info[i].ops);
+ +		if (info[i].ops) {
+ +			module_put(info[i].ops->type->owner);
+ +			if (info[i].ops->type->release_ops)
+ +				info[i].ops->type->release_ops(info[i].ops);
+  		}
+  	}
+ -	kvfree(expr_info);
+ -
+ +	kvfree(info);
+  	return err;
+  }
+  
+diff --cc net/netfilter/nf_tables_offload.c
+index 88c12ce7063b,ec701b84844f..000000000000
+--- a/net/netfilter/nf_tables_offload.c
++++ b/net/netfilter/nf_tables_offload.c
+@@@ -559,23 -594,6 +559,26 @@@ int nft_flow_rule_offload_commit(struc
+  		}
+  	}
+  
+++<<<<<<< HEAD
+ +	list_for_each_entry(trans, &net->nft.commit_list, list) {
+ +		if (trans->ctx.family != NFPROTO_NETDEV)
+ +			continue;
+ +
+ +		switch (trans->msg_type) {
+ +		case NFT_MSG_NEWRULE:
+ +		case NFT_MSG_DELRULE:
+ +			if (!(trans->ctx.chain->flags & NFT_CHAIN_HW_OFFLOAD))
+ +				continue;
+ +
+ +			nft_flow_rule_destroy(nft_trans_flow_rule(trans));
+ +			break;
+ +		default:
+ +			break;
+ +		}
+ +	}
+ +
+++=======
+++>>>>>>> 3c5e44622011 (netfilter: nf_tables: memleak in hw offload abort path)
+  	return err;
+  }
+  
+* Unmerged path net/netfilter/nf_tables_api.c
+* Unmerged path net/netfilter/nf_tables_offload.c
