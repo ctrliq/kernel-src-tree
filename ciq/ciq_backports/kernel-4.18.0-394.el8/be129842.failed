@@ -1,0 +1,211 @@
+arm64: install user ptrauth keys at kernel exit time
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-394.el8
+commit-author Kristina Martsenko <kristina.martsenko@arm.com>
+commit be129842566599f2c6f8fbba277c098802cd4b3d
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-394.el8/be129842.failed
+
+As we're going to enable pointer auth within the kernel and use a
+different APIAKey for the kernel itself, so move the user APIAKey
+switch to EL0 exception return.
+
+The other 4 keys could remain switched during task switch, but are also
+moved to keep things consistent.
+
+	Reviewed-by: Kees Cook <keescook@chromium.org>
+	Reviewed-by: James Morse <james.morse@arm.com>
+	Reviewed-by: Vincenzo Frascino <Vincenzo.Frascino@arm.com>
+	Signed-off-by: Kristina Martsenko <kristina.martsenko@arm.com>
+[Amit: commit msg, re-positioned the patch, comments]
+	Signed-off-by: Amit Daniel Kachhap <amit.kachhap@arm.com>
+	Signed-off-by: Catalin Marinas <catalin.marinas@arm.com>
+(cherry picked from commit be129842566599f2c6f8fbba277c098802cd4b3d)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/arm64/kernel/entry.S
+diff --cc arch/arm64/kernel/entry.S
+index 2ca4c88164f6,684e475bfda0..000000000000
+--- a/arch/arm64/kernel/entry.S
++++ b/arch/arm64/kernel/entry.S
+@@@ -357,8 -342,9 +358,14 @@@ alternative_else_nop_endi
+  	msr	cntkctl_el1, x1
+  4:
+  #endif
+++<<<<<<< HEAD
+ +	apply_ssbd 0, 5f, x0, x1
+ +5:
+++=======
++ 	ptrauth_keys_install_user tsk, x0, x1, x2
++ 
++ 	apply_ssbd 0, x0, x1
+++>>>>>>> be1298425665 (arm64: install user ptrauth keys at kernel exit time)
+  	.endif
+  
+  	msr	elr_el1, x21			// set up the return data
+diff --git a/arch/arm64/include/asm/asm_pointer_auth.h b/arch/arm64/include/asm/asm_pointer_auth.h
+new file mode 100644
+index 000000000000..3482348ec07f
+--- /dev/null
++++ b/arch/arm64/include/asm/asm_pointer_auth.h
+@@ -0,0 +1,49 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++#ifndef __ASM_ASM_POINTER_AUTH_H
++#define __ASM_ASM_POINTER_AUTH_H
++
++#include <asm/alternative.h>
++#include <asm/asm-offsets.h>
++#include <asm/cpufeature.h>
++#include <asm/sysreg.h>
++
++#ifdef CONFIG_ARM64_PTR_AUTH
++/*
++ * thread.keys_user.ap* as offset exceeds the #imm offset range
++ * so use the base value of ldp as thread.keys_user and offset as
++ * thread.keys_user.ap*.
++ */
++	.macro ptrauth_keys_install_user tsk, tmp1, tmp2, tmp3
++	mov	\tmp1, #THREAD_KEYS_USER
++	add	\tmp1, \tsk, \tmp1
++alternative_if_not ARM64_HAS_ADDRESS_AUTH
++	b	.Laddr_auth_skip_\@
++alternative_else_nop_endif
++	ldp	\tmp2, \tmp3, [\tmp1, #PTRAUTH_USER_KEY_APIA]
++	msr_s	SYS_APIAKEYLO_EL1, \tmp2
++	msr_s	SYS_APIAKEYHI_EL1, \tmp3
++	ldp	\tmp2, \tmp3, [\tmp1, #PTRAUTH_USER_KEY_APIB]
++	msr_s	SYS_APIBKEYLO_EL1, \tmp2
++	msr_s	SYS_APIBKEYHI_EL1, \tmp3
++	ldp	\tmp2, \tmp3, [\tmp1, #PTRAUTH_USER_KEY_APDA]
++	msr_s	SYS_APDAKEYLO_EL1, \tmp2
++	msr_s	SYS_APDAKEYHI_EL1, \tmp3
++	ldp	\tmp2, \tmp3, [\tmp1, #PTRAUTH_USER_KEY_APDB]
++	msr_s	SYS_APDBKEYLO_EL1, \tmp2
++	msr_s	SYS_APDBKEYHI_EL1, \tmp3
++.Laddr_auth_skip_\@:
++alternative_if ARM64_HAS_GENERIC_AUTH
++	ldp	\tmp2, \tmp3, [\tmp1, #PTRAUTH_USER_KEY_APGA]
++	msr_s	SYS_APGAKEYLO_EL1, \tmp2
++	msr_s	SYS_APGAKEYHI_EL1, \tmp3
++alternative_else_nop_endif
++	.endm
++
++#else /* CONFIG_ARM64_PTR_AUTH */
++
++	.macro ptrauth_keys_install_user tsk, tmp1, tmp2, tmp3
++	.endm
++
++#endif /* CONFIG_ARM64_PTR_AUTH */
++
++#endif /* __ASM_ASM_POINTER_AUTH_H */
+diff --git a/arch/arm64/include/asm/pointer_auth.h b/arch/arm64/include/asm/pointer_auth.h
+index 1e1215eb8d01..546bc8b15e04 100644
+--- a/arch/arm64/include/asm/pointer_auth.h
++++ b/arch/arm64/include/asm/pointer_auth.h
+@@ -50,19 +50,6 @@ do {								\
+ 	write_sysreg_s(__pki_v.hi, SYS_ ## k ## KEYHI_EL1);	\
+ } while (0)
+ 
+-static inline void ptrauth_keys_switch_user(struct ptrauth_keys_user *keys)
+-{
+-	if (system_supports_address_auth()) {
+-		__ptrauth_key_install(APIA, keys->apia);
+-		__ptrauth_key_install(APIB, keys->apib);
+-		__ptrauth_key_install(APDA, keys->apda);
+-		__ptrauth_key_install(APDB, keys->apdb);
+-	}
+-
+-	if (system_supports_generic_auth())
+-		__ptrauth_key_install(APGA, keys->apga);
+-}
+-
+ extern int ptrauth_prctl_reset_keys(struct task_struct *tsk, unsigned long arg);
+ 
+ /*
+@@ -78,20 +65,12 @@ static inline unsigned long ptrauth_strip_insn_pac(unsigned long ptr)
+ }
+ 
+ #define ptrauth_thread_init_user(tsk)					\
+-do {									\
+-	struct task_struct *__ptiu_tsk = (tsk);				\
+-	ptrauth_keys_init_user(&__ptiu_tsk->thread.keys_user);		\
+-	ptrauth_keys_switch_user(&__ptiu_tsk->thread.keys_user);		\
+-} while (0)
+-
+-#define ptrauth_thread_switch(tsk)	\
+-	ptrauth_keys_switch_user(&(tsk)->thread.keys_user)
++	ptrauth_keys_init_user(&(tsk)->thread.keys_user)
+ 
+ #else /* CONFIG_ARM64_PTR_AUTH */
+ #define ptrauth_prctl_reset_keys(tsk, arg)	(-EINVAL)
+ #define ptrauth_strip_insn_pac(lr)	(lr)
+ #define ptrauth_thread_init_user(tsk)
+-#define ptrauth_thread_switch(tsk)
+ #endif /* CONFIG_ARM64_PTR_AUTH */
+ 
+ #endif /* __ASM_POINTER_AUTH_H */
+diff --git a/arch/arm64/kernel/asm-offsets.c b/arch/arm64/kernel/asm-offsets.c
+index 513e9a22c07a..34ea2c06ec9f 100644
+--- a/arch/arm64/kernel/asm-offsets.c
++++ b/arch/arm64/kernel/asm-offsets.c
+@@ -51,6 +51,9 @@ int main(void)
+ #endif
+   BLANK();
+   DEFINE(THREAD_CPU_CONTEXT,	offsetof(struct task_struct, thread.cpu_context));
++#ifdef CONFIG_ARM64_PTR_AUTH
++  DEFINE(THREAD_KEYS_USER,	offsetof(struct task_struct, thread.keys_user));
++#endif
+   BLANK();
+   DEFINE(S_X0,			offsetof(struct pt_regs, regs[0]));
+   DEFINE(S_X2,			offsetof(struct pt_regs, regs[2]));
+@@ -145,6 +148,14 @@ int main(void)
+ #ifdef CONFIG_ARM_SDE_INTERFACE
+   DEFINE(SDEI_EVENT_INTREGS,	offsetof(struct sdei_registered_event, interrupted_regs));
+   DEFINE(SDEI_EVENT_PRIORITY,	offsetof(struct sdei_registered_event, priority));
++#endif
++#ifdef CONFIG_ARM64_PTR_AUTH
++  DEFINE(PTRAUTH_USER_KEY_APIA,		offsetof(struct ptrauth_keys_user, apia));
++  DEFINE(PTRAUTH_USER_KEY_APIB,		offsetof(struct ptrauth_keys_user, apib));
++  DEFINE(PTRAUTH_USER_KEY_APDA,		offsetof(struct ptrauth_keys_user, apda));
++  DEFINE(PTRAUTH_USER_KEY_APDB,		offsetof(struct ptrauth_keys_user, apdb));
++  DEFINE(PTRAUTH_USER_KEY_APGA,		offsetof(struct ptrauth_keys_user, apga));
++  BLANK();
+ #endif
+   return 0;
+ }
+* Unmerged path arch/arm64/kernel/entry.S
+diff --git a/arch/arm64/kernel/pointer_auth.c b/arch/arm64/kernel/pointer_auth.c
+index af5a638207f8..1e77736a4f66 100644
+--- a/arch/arm64/kernel/pointer_auth.c
++++ b/arch/arm64/kernel/pointer_auth.c
+@@ -19,7 +19,6 @@ int ptrauth_prctl_reset_keys(struct task_struct *tsk, unsigned long arg)
+ 
+ 	if (!arg) {
+ 		ptrauth_keys_init_user(keys);
+-		ptrauth_keys_switch_user(keys);
+ 		return 0;
+ 	}
+ 
+@@ -41,7 +40,5 @@ int ptrauth_prctl_reset_keys(struct task_struct *tsk, unsigned long arg)
+ 	if (arg & PR_PAC_APGAKEY)
+ 		get_random_bytes(&keys->apga, sizeof(keys->apga));
+ 
+-	ptrauth_keys_switch_user(keys);
+-
+ 	return 0;
+ }
+diff --git a/arch/arm64/kernel/process.c b/arch/arm64/kernel/process.c
+index f8b247d2b055..4cd3dda8b3b0 100644
+--- a/arch/arm64/kernel/process.c
++++ b/arch/arm64/kernel/process.c
+@@ -512,7 +512,6 @@ __notrace_funcgraph struct task_struct *__switch_to(struct task_struct *prev,
+ 	contextidr_thread_switch(next);
+ 	entry_task_switch(next);
+ 	uao_thread_switch(next);
+-	ptrauth_thread_switch(next);
+ 	ssbs_thread_switch(next);
+ 
+ 	/*
