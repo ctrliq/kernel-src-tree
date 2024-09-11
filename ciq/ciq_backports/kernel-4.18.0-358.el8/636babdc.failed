@@ -1,0 +1,245 @@
+printk: add syslog_lock
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-358.el8
+commit-author John Ogness <john.ogness@linutronix.de>
+commit 636babdc06961f173696cb664550b4cc239dde2e
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-358.el8/636babdc.failed
+
+The global variables @syslog_seq, @syslog_partial, @syslog_time
+and write access to @clear_seq are protected by @logbuf_lock.
+Once @logbuf_lock is removed, these variables will need their
+own synchronization method. Introduce @syslog_lock for this
+purpose.
+
+@syslog_lock is a raw_spin_lock for now. This simplifies the
+transition to removing @logbuf_lock. Once @logbuf_lock and the
+safe buffers are removed, @syslog_lock can change to spin_lock.
+
+	Signed-off-by: John Ogness <john.ogness@linutronix.de>
+	Reviewed-by: Petr Mladek <pmladek@suse.com>
+	Signed-off-by: Petr Mladek <pmladek@suse.com>
+Link: https://lore.kernel.org/r/20210303101528.29901-11-john.ogness@linutronix.de
+(cherry picked from commit 636babdc06961f173696cb664550b4cc239dde2e)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	kernel/printk/printk.c
+diff --cc kernel/printk/printk.c
+index 9c33249065a6,e794a08de00f..000000000000
+--- a/kernel/printk/printk.c
++++ b/kernel/printk/printk.c
+@@@ -417,30 -390,37 +417,52 @@@ DEFINE_RAW_SPINLOCK(logbuf_lock)
+  		printk_safe_exit_irqrestore(flags);	\
+  	} while (0)
+  
++ /* syslog_lock protects syslog_* variables and write access to clear_seq. */
++ static DEFINE_RAW_SPINLOCK(syslog_lock);
++ 
+  #ifdef CONFIG_PRINTK
+  DECLARE_WAIT_QUEUE_HEAD(log_wait);
++ /* All 3 protected by @syslog_lock. */
+  /* the next printk record to read by syslog(READ) or /proc/kmsg */
+  static u64 syslog_seq;
+ +static u32 syslog_idx;
+  static size_t syslog_partial;
+  static bool syslog_time;
+  
+ +/* index and sequence number of the first record stored in the buffer */
+ +static u64 log_first_seq;
+ +static u32 log_first_idx;
+ +
+ +/* index and sequence number of the next record to store in the buffer */
+ +static u64 log_next_seq;
+ +static u32 log_next_idx;
+ +
+  /* the next printk record to write to the console */
+  static u64 console_seq;
+ +static u32 console_idx;
+  static u64 exclusive_console_stop_seq;
+ -static unsigned long console_dropped;
+  
+++<<<<<<< HEAD
+ +/* the next printk record to read after the last 'clear' command */
+ +static u64 clear_seq;
+ +static u32 clear_idx;
+++=======
++ struct latched_seq {
++ 	seqcount_latch_t	latch;
++ 	u64			val[2];
++ };
++ 
++ /*
++  * The next printk record to read after the last 'clear' command. There are
++  * two copies (updated with seqcount_latch) so that reads can locklessly
++  * access a valid value. Writers are synchronized by @syslog_lock.
++  */
++ static struct latched_seq clear_seq = {
++ 	.latch		= SEQCNT_LATCH_ZERO(clear_seq.latch),
++ 	.val[0]		= 0,
++ 	.val[1]		= 0,
++ };
+++>>>>>>> 636babdc0696 (printk: add syslog_lock)
+  
+  #ifdef CONFIG_PRINTK_CALLER
+  #define PREFIX_MAX		48
+@@@ -472,6 -474,31 +494,34 @@@ bool printk_percpu_data_ready(void
+  	return __printk_percpu_data_ready;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ /* Must be called under syslog_lock. */
++ static void latched_seq_write(struct latched_seq *ls, u64 val)
++ {
++ 	raw_write_seqcount_latch(&ls->latch);
++ 	ls->val[0] = val;
++ 	raw_write_seqcount_latch(&ls->latch);
++ 	ls->val[1] = val;
++ }
++ 
++ /* Can be called from any context. */
++ static u64 latched_seq_read_nolock(struct latched_seq *ls)
++ {
++ 	unsigned int seq;
++ 	unsigned int idx;
++ 	u64 val;
++ 
++ 	do {
++ 		seq = raw_read_seqcount_latch(&ls->latch);
++ 		idx = seq & 0x1;
++ 		val = ls->val[idx];
++ 	} while (read_seqcount_latch_retry(&ls->latch, seq));
++ 
++ 	return val;
++ }
++ 
+++>>>>>>> 636babdc0696 (printk: add syslog_lock)
+  /* Return log buffer address */
+  char *log_buf_addr_get(void)
+  {
+@@@ -1396,13 -1533,9 +1446,19 @@@ static int syslog_print(char __user *bu
+  		size_t skip;
+  
+  		logbuf_lock_irq();
+++<<<<<<< HEAD
+ +		if (syslog_seq < log_first_seq) {
+ +			/* messages are gone, move to first one */
+ +			syslog_seq = log_first_seq;
+ +			syslog_idx = log_first_idx;
+ +			syslog_partial = 0;
+ +		}
+ +		if (syslog_seq == log_next_seq) {
+++=======
++ 		raw_spin_lock(&syslog_lock);
++ 		if (!prb_read_valid(prb, syslog_seq, &r)) {
++ 			raw_spin_unlock(&syslog_lock);
+++>>>>>>> 636babdc0696 (printk: add syslog_lock)
+  			logbuf_unlock_irq();
+  			break;
+  		}
+@@@ -1517,8 -1633,9 +1574,14 @@@ static int syslog_print_all(char __use
+  	}
+  
+  	if (clear) {
+++<<<<<<< HEAD
+ +		clear_seq = log_next_seq;
+ +		clear_idx = log_next_idx;
+++=======
++ 		raw_spin_lock(&syslog_lock);
++ 		latched_seq_write(&clear_seq, seq);
++ 		raw_spin_unlock(&syslog_lock);
+++>>>>>>> 636babdc0696 (printk: add syslog_lock)
+  	}
+  	logbuf_unlock_irq();
+  
+@@@ -1529,13 -1646,27 +1592,31 @@@
+  static void syslog_clear(void)
+  {
+  	logbuf_lock_irq();
+++<<<<<<< HEAD
+ +	clear_seq = log_next_seq;
+ +	clear_idx = log_next_idx;
+++=======
++ 	raw_spin_lock(&syslog_lock);
++ 	latched_seq_write(&clear_seq, prb_next_seq(prb));
++ 	raw_spin_unlock(&syslog_lock);
+++>>>>>>> 636babdc0696 (printk: add syslog_lock)
+  	logbuf_unlock_irq();
+  }
+  
++ /* Return a consistent copy of @syslog_seq. */
++ static u64 read_syslog_seq_irq(void)
++ {
++ 	u64 seq;
++ 
++ 	raw_spin_lock_irq(&syslog_lock);
++ 	seq = syslog_seq;
++ 	raw_spin_unlock_irq(&syslog_lock);
++ 
++ 	return seq;
++ }
++ 
+  int do_syslog(int type, char __user *buf, int len, int source)
+  {
+ -	struct printk_info info;
+  	bool clear = false;
+  	static int saved_console_loglevel = LOGLEVEL_DEFAULT;
+  	int error;
+@@@ -1556,8 -1687,9 +1637,13 @@@
+  			return 0;
+  		if (!access_ok(buf, len))
+  			return -EFAULT;
++ 
+  		error = wait_event_interruptible(log_wait,
+++<<<<<<< HEAD
+ +						 syslog_seq != log_next_seq);
+++=======
++ 				prb_read_valid(prb, read_syslog_seq_irq(), NULL));
+++>>>>>>> 636babdc0696 (printk: add syslog_lock)
+  		if (error)
+  			return error;
+  		error = syslog_print(buf, len);
+@@@ -1606,10 -1738,16 +1692,21 @@@
+  	/* Number of chars in the log buffer */
+  	case SYSLOG_ACTION_SIZE_UNREAD:
+  		logbuf_lock_irq();
+++<<<<<<< HEAD
+ +		if (syslog_seq < log_first_seq) {
+++=======
++ 		raw_spin_lock(&syslog_lock);
++ 		if (!prb_read_valid_info(prb, syslog_seq, &info, NULL)) {
++ 			/* No unread messages. */
++ 			raw_spin_unlock(&syslog_lock);
++ 			logbuf_unlock_irq();
++ 			return 0;
++ 		}
++ 		if (info.seq != syslog_seq) {
+++>>>>>>> 636babdc0696 (printk: add syslog_lock)
+  			/* messages are gone, move to first one */
+ -			syslog_seq = info.seq;
+ +			syslog_seq = log_first_seq;
+ +			syslog_idx = log_first_idx;
+  			syslog_partial = 0;
+  		}
+  		if (source == SYSLOG_FROM_PROC) {
+@@@ -2843,8 -3020,12 +2941,16 @@@ void register_console(struct console *n
+  		 */
+  		exclusive_console = newcon;
+  		exclusive_console_stop_seq = console_seq;
++ 
++ 		/* Get a consistent copy of @syslog_seq. */
++ 		raw_spin_lock(&syslog_lock);
+  		console_seq = syslog_seq;
+++<<<<<<< HEAD
+ +		console_idx = syslog_idx;
+++=======
++ 		raw_spin_unlock(&syslog_lock);
++ 
+++>>>>>>> 636babdc0696 (printk: add syslog_lock)
+  		logbuf_unlock_irqrestore(flags);
+  	}
+  	console_unlock();
+* Unmerged path kernel/printk/printk.c
