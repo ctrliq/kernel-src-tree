@@ -1,0 +1,561 @@
+xarray: Define struct xa_node
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-147.el8
+commit-author Matthew Wilcox <willy@infradead.org>
+commit 01959dfe771c6893365482ec78dc1d9cbbbe6de8
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-147.el8/01959dfe.failed
+
+This is a direct replacement for struct radix_tree_node.  A couple of
+struct members have changed name, so convert those.  Use a #define so
+that radix tree users continue to work without change.
+
+	Signed-off-by: Matthew Wilcox <willy@infradead.org>
+	Reviewed-by: Josef Bacik <jbacik@fb.com>
+(cherry picked from commit 01959dfe771c6893365482ec78dc1d9cbbbe6de8)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/radix-tree.h
+#	include/linux/xarray.h
+#	lib/radix-tree.c
+#	tools/testing/radix-tree/multiorder.c
+diff --cc include/linux/radix-tree.h
+index 8e57792d07fb,15388b7e38b9..000000000000
+--- a/include/linux/radix-tree.h
++++ b/include/linux/radix-tree.h
+@@@ -28,7 -28,11 +28,15 @@@
+  #include <linux/rcupdate.h>
+  #include <linux/spinlock.h>
+  #include <linux/types.h>
+++<<<<<<< HEAD
+ +#include <linux/rh_kabi.h>
+++=======
++ #include <linux/xarray.h>
++ 
++ /* Keep unconverted code working */
++ #define radix_tree_root		xarray
++ #define radix_tree_node		xa_node
+++>>>>>>> 01959dfe771c (xarray: Define struct xa_node)
+  
+  /*
+   * The bottom two bits of the slot determine how the remaining bits in the
+@@@ -66,12 -61,7 +74,16 @@@ static inline bool radix_tree_is_intern
+  
+  /*** radix-tree API starts here ***/
+  
+++<<<<<<< HEAD
+ +#define RADIX_TREE_MAX_TAGS 3
+ +
+ +#ifndef RADIX_TREE_MAP_SHIFT
+ +#define RADIX_TREE_MAP_SHIFT	(CONFIG_BASE_SMALL ? 4 : 6)
+ +#endif
+ +
+++=======
++ #define RADIX_TREE_MAP_SHIFT	XA_CHUNK_SHIFT
+++>>>>>>> 01959dfe771c (xarray: Define struct xa_node)
+  #define RADIX_TREE_MAP_SIZE	(1UL << RADIX_TREE_MAP_SHIFT)
+  #define RADIX_TREE_MAP_MASK	(RADIX_TREE_MAP_SIZE-1)
+  
+@@@ -82,59 -72,12 +94,63 @@@
+  #define RADIX_TREE_MAX_PATH (DIV_ROUND_UP(RADIX_TREE_INDEX_BITS, \
+  					  RADIX_TREE_MAP_SHIFT))
+  
+++<<<<<<< HEAD
+ +/**
+ + * struct radix_tree_node_rh  - Red Hat KABI extension struct
+ + */
+ +struct radix_tree_node_rh {
+ +};
+ +
+ +/*
+ + * @count is the count of every non-NULL element in the ->slots array
+ + * whether that is an exceptional entry, a retry entry, a user pointer,
+ + * a sibling entry or a pointer to the next level of the tree.
+ + * @exceptional is the count of every element in ->slots which is
+ + * either radix_tree_exceptional_entry() or is a sibling entry for an
+ + * exceptional entry.
+ + */
+ +struct radix_tree_node {
+ +	unsigned char	shift;		/* Bits remaining in each slot */
+ +	unsigned char	offset;		/* Slot offset in parent */
+ +	unsigned char	count;		/* Total entry count */
+ +	unsigned char	exceptional;	/* Exceptional entry count */
+ +	struct radix_tree_node *parent;		/* Used when ascending tree */
+ +	struct radix_tree_root *root;		/* The tree we belong to */
+ +	union {
+ +		struct list_head private_list;	/* For tree user */
+ +		struct rcu_head	rcu_head;	/* Used when freeing node */
+ +	};
+ +	void __rcu	*slots[RADIX_TREE_MAP_SIZE];
+ +	unsigned long	tags[RADIX_TREE_MAX_TAGS][RADIX_TREE_TAG_LONGS];
+ +	RH_KABI_SIZE_AND_EXTEND(radix_tree_node);
+ +};
+ +
+ +/* The IDR tag is stored in the low bits of the GFP flags */
+++=======
++ /* The IDR tag is stored in the low bits of xa_flags */
+++>>>>>>> 01959dfe771c (xarray: Define struct xa_node)
+  #define ROOT_IS_IDR	((__force gfp_t)4)
+ -/* The top bits of xa_flags are used to store the root tags */
+ +/* The top bits of gfp_mask are used to store the root tags */
+  #define ROOT_TAG_SHIFT	(__GFP_BITS_SHIFT)
+  
+ -#define RADIX_TREE_INIT(name, mask)	XARRAY_INIT(name, mask)
+ +/**
+ + * struct radix_tree_root_rh  - Red Hat KABI extension struct
+ + */
+ +struct radix_tree_root_rh {
+ +};
+ +
+ +struct radix_tree_root {
+ +	spinlock_t		xa_lock;
+ +	gfp_t			gfp_mask;
+ +	struct radix_tree_node	__rcu *rnode;
+ +	RH_KABI_SIZE_AND_EXTEND(radix_tree_root);
+ +};
+ +
+ +#define RADIX_TREE_INIT(name, mask)	{				\
+ +	.xa_lock = __SPIN_LOCK_UNLOCKED(name.xa_lock),			\
+ +	.gfp_mask = (mask),						\
+ +	.rnode = NULL,							\
+ +}
+  
+  #define RADIX_TREE(name, mask) \
+  	struct radix_tree_root name = RADIX_TREE_INIT(name, mask)
+diff --cc include/linux/xarray.h
+index 2dfc8006fe64,52141dfc5a90..000000000000
+--- a/include/linux/xarray.h
++++ b/include/linux/xarray.h
+@@@ -21,4 -235,81 +21,84 @@@
+  #define xa_unlock_irqrestore(xa, flags) \
+  				spin_unlock_irqrestore(&(xa)->xa_lock, flags)
+  
+++<<<<<<< HEAD
+++=======
++ /* Everything below here is the Advanced API.  Proceed with caution. */
++ 
++ /*
++  * The xarray is constructed out of a set of 'chunks' of pointers.  Choosing
++  * the best chunk size requires some tradeoffs.  A power of two recommends
++  * itself so that we can walk the tree based purely on shifts and masks.
++  * Generally, the larger the better; as the number of slots per level of the
++  * tree increases, the less tall the tree needs to be.  But that needs to be
++  * balanced against the memory consumption of each node.  On a 64-bit system,
++  * xa_node is currently 576 bytes, and we get 7 of them per 4kB page.  If we
++  * doubled the number of slots per node, we'd get only 3 nodes per 4kB page.
++  */
++ #ifndef XA_CHUNK_SHIFT
++ #define XA_CHUNK_SHIFT		(CONFIG_BASE_SMALL ? 4 : 6)
++ #endif
++ #define XA_CHUNK_SIZE		(1UL << XA_CHUNK_SHIFT)
++ #define XA_CHUNK_MASK		(XA_CHUNK_SIZE - 1)
++ #define XA_MAX_MARKS		3
++ #define XA_MARK_LONGS		DIV_ROUND_UP(XA_CHUNK_SIZE, BITS_PER_LONG)
++ 
++ /*
++  * @count is the count of every non-NULL element in the ->slots array
++  * whether that is a value entry, a retry entry, a user pointer,
++  * a sibling entry or a pointer to the next level of the tree.
++  * @nr_values is the count of every element in ->slots which is
++  * either a value entry or a sibling of a value entry.
++  */
++ struct xa_node {
++ 	unsigned char	shift;		/* Bits remaining in each slot */
++ 	unsigned char	offset;		/* Slot offset in parent */
++ 	unsigned char	count;		/* Total entry count */
++ 	unsigned char	nr_values;	/* Value entry count */
++ 	struct xa_node __rcu *parent;	/* NULL at top of tree */
++ 	struct xarray	*array;		/* The array we belong to */
++ 	union {
++ 		struct list_head private_list;	/* For tree user */
++ 		struct rcu_head	rcu_head;	/* Used when freeing node */
++ 	};
++ 	void __rcu	*slots[XA_CHUNK_SIZE];
++ 	union {
++ 		unsigned long	tags[XA_MAX_MARKS][XA_MARK_LONGS];
++ 		unsigned long	marks[XA_MAX_MARKS][XA_MARK_LONGS];
++ 	};
++ };
++ 
++ /* Private */
++ static inline bool xa_is_node(const void *entry)
++ {
++ 	return xa_is_internal(entry) && (unsigned long)entry > 4096;
++ }
++ 
++ /* Private */
++ static inline void *xa_mk_sibling(unsigned int offset)
++ {
++ 	return xa_mk_internal(offset);
++ }
++ 
++ /* Private */
++ static inline unsigned long xa_to_sibling(const void *entry)
++ {
++ 	return xa_to_internal(entry);
++ }
++ 
++ /**
++  * xa_is_sibling() - Is the entry a sibling entry?
++  * @entry: Entry retrieved from the XArray
++  *
++  * Return: %true if the entry is a sibling entry.
++  */
++ static inline bool xa_is_sibling(const void *entry)
++ {
++ 	return IS_ENABLED(CONFIG_XARRAY_MULTI) && xa_is_internal(entry) &&
++ 		(entry < xa_mk_sibling(XA_CHUNK_SIZE - 1));
++ }
++ 
++ #define XA_RETRY_ENTRY		xa_mk_internal(256)
++ 
+++>>>>>>> 01959dfe771c (xarray: Define struct xa_node)
+  #endif /* _LINUX_XARRAY_H */
+diff --cc lib/radix-tree.c
+index a904a8ddd174,8a568cea1237..000000000000
+--- a/lib/radix-tree.c
++++ b/lib/radix-tree.c
+@@@ -656,9 -632,9 +656,15 @@@ static int radix_tree_extend(struct rad
+  		BUG_ON(shift > BITS_PER_LONG);
+  		if (radix_tree_is_internal_node(entry)) {
+  			entry_to_node(entry)->parent = node;
+++<<<<<<< HEAD
+ +		} else if (radix_tree_exceptional_entry(entry)) {
+ +			/* Moving an exceptional root->rnode to a node */
+ +			node->exceptional = 1;
+++=======
++ 		} else if (xa_is_value(entry)) {
++ 			/* Moving a value entry root->xa_head to a node */
++ 			node->nr_values = 1;
+++>>>>>>> 01959dfe771c (xarray: Define struct xa_node)
+  		}
+  		/*
+  		 * entry was already in the radix tree, so we do not need
+@@@ -951,17 -925,15 +957,27 @@@ static inline int insert_entries(struc
+  				if (tags & (1 << tag))
+  					tag_set(node, tag, offset);
+  		}
+ -		if (xa_is_node(old))
+ +		if (radix_tree_is_internal_node(old) &&
+ +					!is_sibling_entry(node, old) &&
+ +					(old != RADIX_TREE_RETRY))
+  			radix_tree_free_nodes(old);
+++<<<<<<< HEAD
+ +		if (radix_tree_exceptional_entry(old))
+ +			node->exceptional--;
+ +	}
+ +	if (node) {
+ +		node->count += n;
+ +		if (radix_tree_exceptional_entry(item))
+ +			node->exceptional += n;
+++=======
++ 		if (xa_is_value(old))
++ 			node->nr_values--;
++ 	}
++ 	if (node) {
++ 		node->count += n;
++ 		if (xa_is_value(item))
++ 			node->nr_values += n;
+++>>>>>>> 01959dfe771c (xarray: Define struct xa_node)
+  	}
+  	return n;
+  }
+@@@ -974,8 -946,8 +990,13 @@@ static inline int insert_entries(struc
+  	rcu_assign_pointer(*slot, item);
+  	if (node) {
+  		node->count++;
+++<<<<<<< HEAD
+ +		if (radix_tree_exceptional_entry(item))
+ +			node->exceptional++;
+++=======
++ 		if (xa_is_value(item))
++ 			node->nr_values++;
+++>>>>>>> 01959dfe771c (xarray: Define struct xa_node)
+  	}
+  	return 1;
+  }
+@@@ -1111,21 -1083,20 +1132,25 @@@ void *radix_tree_lookup(const struct ra
+  EXPORT_SYMBOL(radix_tree_lookup);
+  
+  static inline void replace_sibling_entries(struct radix_tree_node *node,
+- 				void __rcu **slot, int count, int exceptional)
++ 				void __rcu **slot, int count, int values)
+  {
+  #ifdef CONFIG_RADIX_TREE_MULTIORDER
+ -	unsigned offset = get_slot_offset(node, slot);
+ -	void *ptr = xa_mk_sibling(offset);
+ +	void *ptr = node_to_entry(slot);
+ +	unsigned offset = get_slot_offset(node, slot) + 1;
+  
+ -	while (++offset < RADIX_TREE_MAP_SIZE) {
+ +	while (offset < RADIX_TREE_MAP_SIZE) {
+  		if (rcu_dereference_raw(node->slots[offset]) != ptr)
+  			break;
+  		if (count < 0) {
+  			node->slots[offset] = NULL;
+  			node->count--;
+  		}
+++<<<<<<< HEAD
+ +		node->exceptional += exceptional;
+ +		offset++;
+++=======
++ 		node->nr_values += values;
+++>>>>>>> 01959dfe771c (xarray: Define struct xa_node)
+  	}
+  #endif
+  }
+@@@ -1190,18 -1161,17 +1215,28 @@@ void __radix_tree_replace(struct radix_
+  			  radix_tree_update_node_t update_node)
+  {
+  	void *old = rcu_dereference_raw(*slot);
+++<<<<<<< HEAD
+ +	int exceptional = !!radix_tree_exceptional_entry(item) -
+ +				!!radix_tree_exceptional_entry(old);
+++=======
++ 	int values = !!xa_is_value(item) - !!xa_is_value(old);
+++>>>>>>> 01959dfe771c (xarray: Define struct xa_node)
+  	int count = calculate_count(root, node, slot, item, old);
+  
+  	/*
+- 	 * This function supports replacing exceptional entries and
++ 	 * This function supports replacing value entries and
+  	 * deleting entries, but that needs accounting against the
+ -	 * node unless the slot is root->xa_head.
+ +	 * node unless the slot is root->rnode.
+  	 */
+++<<<<<<< HEAD
+ +	WARN_ON_ONCE(!node && (slot != (void __rcu **)&root->rnode) &&
+ +			(count || exceptional));
+ +	replace_slot(slot, item, node, count, exceptional);
+++=======
++ 	WARN_ON_ONCE(!node && (slot != (void __rcu **)&root->xa_head) &&
++ 			(count || values));
++ 	replace_slot(slot, item, node, count, values);
+++>>>>>>> 01959dfe771c (xarray: Define struct xa_node)
+  
+  	if (!node)
+  		return;
+@@@ -1992,7 -1961,7 +2027,11 @@@ static bool __radix_tree_delete(struct 
+  				struct radix_tree_node *node, void __rcu **slot)
+  {
+  	void *old = rcu_dereference_raw(*slot);
+++<<<<<<< HEAD
+ +	int exceptional = radix_tree_exceptional_entry(old) ? -1 : 0;
+++=======
++ 	int values = xa_is_value(old) ? -1 : 0;
+++>>>>>>> 01959dfe771c (xarray: Define struct xa_node)
+  	unsigned offset = get_slot_offset(node, slot);
+  	int tag;
+  
+diff --cc tools/testing/radix-tree/multiorder.c
+index 7bf405638b0b,60786fa55302..000000000000
+--- a/tools/testing/radix-tree/multiorder.c
++++ b/tools/testing/radix-tree/multiorder.c
+@@@ -391,10 -390,10 +391,15 @@@ static void multiorder_join2(unsigned o
+  	void *item2;
+  
+  	item_insert_order(&tree, 0, order2);
+ -	radix_tree_insert(&tree, 1 << order2, xa_mk_value(5));
+ +	radix_tree_insert(&tree, 1 << order2, (void *)0x12UL);
+  	item2 = __radix_tree_lookup(&tree, 1 << order2, &node, NULL);
+++<<<<<<< HEAD
+ +	assert(item2 == (void *)0x12UL);
+ +	assert(node->exceptional == 1);
+++=======
++ 	assert(item2 == xa_mk_value(5));
++ 	assert(node->nr_values == 1);
+++>>>>>>> 01959dfe771c (xarray: Define struct xa_node)
+  
+  	item2 = radix_tree_lookup(&tree, 0);
+  	free(item2);
+@@@ -407,10 -406,10 +412,10 @@@
+  }
+  
+  /*
+ - * This test revealed an accounting bug for value entries at one point.
+ + * This test revealed an accounting bug for exceptional entries at one point.
+   * Nodes were being freed back into the pool with an elevated exception count
+   * by radix_tree_join() and then radix_tree_split() was failing to zero the
+-  * count of exceptional entries.
++  * count of value entries.
+   */
+  static void multiorder_join3(unsigned int order)
+  {
+@@@ -517,11 -516,11 +522,16 @@@ static void __multiorder_split2(int old
+  	struct radix_tree_node *node;
+  	void *item;
+  
+ -	__radix_tree_insert(&tree, 0, old_order, xa_mk_value(5));
+ +	__radix_tree_insert(&tree, 0, old_order, (void *)0x12);
+  
+  	item = __radix_tree_lookup(&tree, 0, &node, NULL);
+++<<<<<<< HEAD
+ +	assert(item == (void *)0x12);
+ +	assert(node->exceptional > 0);
+++=======
++ 	assert(item == xa_mk_value(5));
++ 	assert(node->nr_values > 0);
+++>>>>>>> 01959dfe771c (xarray: Define struct xa_node)
+  
+  	radix_tree_split(&tree, 0, new_order);
+  	radix_tree_for_each_slot(slot, &tree, &iter, 0) {
+@@@ -530,8 -529,8 +540,13 @@@
+  	}
+  
+  	item = __radix_tree_lookup(&tree, 0, &node, NULL);
+++<<<<<<< HEAD
+ +	assert(item != (void *)0x12);
+ +	assert(node->exceptional == 0);
+++=======
++ 	assert(item != xa_mk_value(5));
++ 	assert(node->nr_values == 0);
+++>>>>>>> 01959dfe771c (xarray: Define struct xa_node)
+  
+  	item_kill_tree(&tree);
+  }
+@@@ -544,11 -543,11 +559,16 @@@ static void __multiorder_split3(int old
+  	struct radix_tree_node *node;
+  	void *item;
+  
+ -	__radix_tree_insert(&tree, 0, old_order, xa_mk_value(5));
+ +	__radix_tree_insert(&tree, 0, old_order, (void *)0x12);
+  
+  	item = __radix_tree_lookup(&tree, 0, &node, NULL);
+++<<<<<<< HEAD
+ +	assert(item == (void *)0x12);
+ +	assert(node->exceptional > 0);
+++=======
++ 	assert(item == xa_mk_value(5));
++ 	assert(node->nr_values > 0);
+++>>>>>>> 01959dfe771c (xarray: Define struct xa_node)
+  
+  	radix_tree_split(&tree, 0, new_order);
+  	radix_tree_for_each_slot(slot, &tree, &iter, 0) {
+@@@ -556,16 -555,16 +576,26 @@@
+  	}
+  
+  	item = __radix_tree_lookup(&tree, 0, &node, NULL);
+++<<<<<<< HEAD
+ +	assert(item == (void *)0x16);
+ +	assert(node->exceptional > 0);
+++=======
++ 	assert(item == xa_mk_value(7));
++ 	assert(node->nr_values > 0);
+++>>>>>>> 01959dfe771c (xarray: Define struct xa_node)
+  
+  	item_kill_tree(&tree);
+  
+ -	__radix_tree_insert(&tree, 0, old_order, xa_mk_value(5));
+ +	__radix_tree_insert(&tree, 0, old_order, (void *)0x12);
+  
+  	item = __radix_tree_lookup(&tree, 0, &node, NULL);
+++<<<<<<< HEAD
+ +	assert(item == (void *)0x12);
+ +	assert(node->exceptional > 0);
+++=======
++ 	assert(item == xa_mk_value(5));
++ 	assert(node->nr_values > 0);
+++>>>>>>> 01959dfe771c (xarray: Define struct xa_node)
+  
+  	radix_tree_split(&tree, 0, new_order);
+  	radix_tree_for_each_slot(slot, &tree, &iter, 0) {
+@@@ -577,8 -576,8 +607,13 @@@
+  	}
+  
+  	item = __radix_tree_lookup(&tree, 1 << new_order, &node, NULL);
+++<<<<<<< HEAD
+ +	assert(item == (void *)0x16);
+ +	assert(node->count == node->exceptional);
+++=======
++ 	assert(item == xa_mk_value(7));
++ 	assert(node->count == node->nr_values);
+++>>>>>>> 01959dfe771c (xarray: Define struct xa_node)
+  	do {
+  		node = node->parent;
+  		if (!node)
+@@@ -610,17 -609,17 +645,17 @@@ static void multiorder_account(void
+  
+  	item_insert_order(&tree, 0, 5);
+  
+ -	__radix_tree_insert(&tree, 1 << 5, 5, xa_mk_value(5));
+ +	__radix_tree_insert(&tree, 1 << 5, 5, (void *)0x12);
+  	__radix_tree_lookup(&tree, 0, &node, NULL);
+- 	assert(node->count == node->exceptional * 2);
++ 	assert(node->count == node->nr_values * 2);
+  	radix_tree_delete(&tree, 1 << 5);
+- 	assert(node->exceptional == 0);
++ 	assert(node->nr_values == 0);
+  
+ -	__radix_tree_insert(&tree, 1 << 5, 5, xa_mk_value(5));
+ +	__radix_tree_insert(&tree, 1 << 5, 5, (void *)0x12);
+  	__radix_tree_lookup(&tree, 1 << 5, &node, &slot);
+- 	assert(node->count == node->exceptional * 2);
++ 	assert(node->count == node->nr_values * 2);
+  	__radix_tree_replace(&tree, node, slot, NULL, NULL);
+- 	assert(node->exceptional == 0);
++ 	assert(node->nr_values == 0);
+  
+  	item_kill_tree(&tree);
+  }
+* Unmerged path include/linux/radix-tree.h
+* Unmerged path include/linux/xarray.h
+* Unmerged path lib/radix-tree.c
+diff --git a/mm/workingset.c b/mm/workingset.c
+index 40ee02c83978..3e043ec6315a 100644
+--- a/mm/workingset.c
++++ b/mm/workingset.c
+@@ -350,7 +350,7 @@ void workingset_update_node(struct radix_tree_node *node)
+ 	 * already where they should be. The list_empty() test is safe
+ 	 * as node->private_list is protected by the i_pages lock.
+ 	 */
+-	if (node->count && node->count == node->exceptional) {
++	if (node->count && node->count == node->nr_values) {
+ 		if (list_empty(&node->private_list))
+ 			list_lru_add(&shadow_nodes, &node->private_list);
+ 	} else {
+@@ -429,8 +429,8 @@ static enum lru_status shadow_lru_isolate(struct list_head *item,
+ 	 * to reclaim, take the node off-LRU, and drop the lru_lock.
+ 	 */
+ 
+-	node = container_of(item, struct radix_tree_node, private_list);
+-	mapping = container_of(node->root, struct address_space, i_pages);
++	node = container_of(item, struct xa_node, private_list);
++	mapping = container_of(node->array, struct address_space, i_pages);
+ 
+ 	/* Coming from the list, invert the lock order */
+ 	if (!xa_trylock(&mapping->i_pages)) {
+@@ -447,25 +447,25 @@ static enum lru_status shadow_lru_isolate(struct list_head *item,
+ 	 * no pages, so we expect to be able to remove them all and
+ 	 * delete and free the empty node afterwards.
+ 	 */
+-	if (WARN_ON_ONCE(!node->exceptional))
++	if (WARN_ON_ONCE(!node->nr_values))
+ 		goto out_invalid;
+-	if (WARN_ON_ONCE(node->count != node->exceptional))
++	if (WARN_ON_ONCE(node->count != node->nr_values))
+ 		goto out_invalid;
+ 	for (i = 0; i < RADIX_TREE_MAP_SIZE; i++) {
+ 		if (node->slots[i]) {
+ 			if (WARN_ON_ONCE(!radix_tree_exceptional_entry(node->slots[i])))
+ 				goto out_invalid;
+-			if (WARN_ON_ONCE(!node->exceptional))
++			if (WARN_ON_ONCE(!node->nr_values))
+ 				goto out_invalid;
+ 			if (WARN_ON_ONCE(!mapping->nrexceptional))
+ 				goto out_invalid;
+ 			node->slots[i] = NULL;
+-			node->exceptional--;
++			node->nr_values--;
+ 			node->count--;
+ 			mapping->nrexceptional--;
+ 		}
+ 	}
+-	if (WARN_ON_ONCE(node->exceptional))
++	if (WARN_ON_ONCE(node->nr_values))
+ 		goto out_invalid;
+ 	inc_lruvec_page_state(virt_to_page(node), WORKINGSET_NODERECLAIM);
+ 	__radix_tree_delete_node(&mapping->i_pages, node,
+* Unmerged path tools/testing/radix-tree/multiorder.c
