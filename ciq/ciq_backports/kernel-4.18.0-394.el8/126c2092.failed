@@ -1,0 +1,120 @@
+sched: Add rq::ttwu_pending
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-394.el8
+commit-author Peter Zijlstra <peterz@infradead.org>
+commit 126c2092e5c8b28623cb890cd2930aa292410676
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-394.el8/126c2092.failed
+
+In preparation of removing rq->wake_list, replace the
+!list_empty(rq->wake_list) with rq->ttwu_pending. This is not fully
+equivalent as this new variable is racy.
+
+	Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+	Signed-off-by: Ingo Molnar <mingo@kernel.org>
+Link: https://lore.kernel.org/r/20200526161908.070399698@infradead.org
+(cherry picked from commit 126c2092e5c8b28623cb890cd2930aa292410676)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	kernel/sched/sched.h
+diff --cc kernel/sched/sched.h
+index 018da337e9e4,c86fc94c54e5..000000000000
+--- a/kernel/sched/sched.h
++++ b/kernel/sched/sched.h
+@@@ -896,10 -895,18 +896,16 @@@ struct rq 
+  	atomic_t		nohz_flags;
+  #endif /* CONFIG_NO_HZ_COMMON */
+  
+++<<<<<<< HEAD
+ +	RH_KABI_DEPRECATE(struct load_weight, load)
+ +	unsigned long		nr_load_updates;
+++=======
++ #ifdef CONFIG_SMP
++ 	unsigned int		ttwu_pending;
++ #endif
+++>>>>>>> 126c2092e5c8 (sched: Add rq::ttwu_pending)
+  	u64			nr_switches;
+  
+ -#ifdef CONFIG_UCLAMP_TASK
+ -	/* Utilization clamp values based on CPU's RUNNABLE tasks */
+ -	struct uclamp_rq	uclamp[UCLAMP_CNT] ____cacheline_aligned;
+ -	unsigned int		uclamp_flags;
+ -#define UCLAMP_FLAG_IDLE 0x01
+ -#endif
+ -
+  	struct cfs_rq		cfs;
+  	struct rt_rq		rt;
+  	struct dl_rq		dl;
+diff --git a/kernel/sched/core.c b/kernel/sched/core.c
+index 631f3e8030ae..f5e03650a05d 100644
+--- a/kernel/sched/core.c
++++ b/kernel/sched/core.c
+@@ -2368,13 +2368,21 @@ static int ttwu_runnable(struct task_struct *p, int wake_flags)
+ void sched_ttwu_pending(void)
+ {
+ 	struct rq *rq = this_rq();
+-	struct llist_node *llist = llist_del_all(&rq->wake_list);
++	struct llist_node *llist;
+ 	struct task_struct *p, *t;
+ 	struct rq_flags rf;
+ 
++	llist = llist_del_all(&rq->wake_list);
+ 	if (!llist)
+ 		return;
+ 
++	/*
++	 * rq::ttwu_pending racy indication of out-standing wakeups.
++	 * Races such that false-negatives are possible, since they
++	 * are shorter lived that false-positives would be.
++	 */
++	WRITE_ONCE(rq->ttwu_pending, 0);
++
+ 	rq_lock_irqsave(rq, &rf);
+ 	update_rq_clock(rq);
+ 
+@@ -2418,6 +2426,7 @@ static void __ttwu_queue_wakelist(struct task_struct *p, int cpu, int wake_flags
+ 
+ 	p->sched_remote_wakeup = !!(wake_flags & WF_MIGRATED);
+ 
++	WRITE_ONCE(rq->ttwu_pending, 1);
+ 	if (llist_add(&p->wake_entry, &rq->wake_list)) {
+ 		if (!set_nr_if_polling(rq->idle))
+ 			smp_call_function_single_async(cpu, &rq->wake_csd);
+@@ -5046,7 +5055,7 @@ int idle_cpu(int cpu)
+ 		return 0;
+ 
+ #ifdef CONFIG_SMP
+-	if (!llist_empty(&rq->wake_list))
++	if (rq->ttwu_pending)
+ 		return 0;
+ #endif
+ 
+diff --git a/kernel/sched/debug.c b/kernel/sched/debug.c
+index 06e0ea8b7e82..71fe73df0055 100644
+--- a/kernel/sched/debug.c
++++ b/kernel/sched/debug.c
+@@ -661,7 +661,6 @@ do {									\
+ 
+ 	P(nr_running);
+ 	P(nr_switches);
+-	P(nr_load_updates);
+ 	P(nr_uninterruptible);
+ 	PN(next_balance);
+ 	SEQ_printf(m, "  .%-30s: %ld\n", "curr->pid", (long)(task_pid_nr(rq->curr)));
+diff --git a/kernel/sched/fair.c b/kernel/sched/fair.c
+index 245d0ecaa81a..07d040d7e5b0 100644
+--- a/kernel/sched/fair.c
++++ b/kernel/sched/fair.c
+@@ -8784,7 +8784,7 @@ static int idle_cpu_without(int cpu, struct task_struct *p)
+ 	 */
+ 
+ #ifdef CONFIG_SMP
+-	if (!llist_empty(&rq->wake_list))
++	if (rq->ttwu_pending)
+ 		return 0;
+ #endif
+ 
+* Unmerged path kernel/sched/sched.h
