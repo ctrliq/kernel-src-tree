@@ -1,0 +1,119 @@
+selinux: fix error handling bugs in security_load_policy()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-408.el8
+commit-author Dan Carpenter <dan.carpenter@oracle.com>
+commit 0256b0aa8019d937a0bdce3584c6b8b47f618202
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-408.el8/0256b0aa.failed
+
+There are a few bugs in the error handling for security_load_policy().
+
+1) If the newpolicy->sidtab allocation fails then it leads to a NULL
+   dereference.  Also the error code was not set to -ENOMEM on that
+   path.
+2) If policydb_read() failed then we call policydb_destroy() twice
+   which meands we call kvfree(p->sym_val_to_name[i]) twice.
+3) If policydb_load_isids() failed then we call sidtab_destroy() twice
+   and that results in a double free in the sidtab_destroy_tree()
+   function because entry.ptr_inner and entry.ptr_leaf are not set to
+   NULL.
+
+One thing that makes this code nice to deal with is that none of the
+functions return partially allocated data.  In other words, the
+policydb_read() either allocates everything successfully or it frees
+all the data it allocates.  It never returns a mix of allocated and
+not allocated data.
+
+I re-wrote this to only free the successfully allocated data which
+avoids the double frees.  I also re-ordered selinux_policy_free() so
+it's in the reverse order of the allocation function.
+
+Fixes: c7c556f1e81b ("selinux: refactor changing booleans")
+	Acked-by: Stephen Smalley <stephen.smalley.work@gmail.com>
+	Signed-off-by: Dan Carpenter <dan.carpenter@oracle.com>
+[PM: partially merged by hand due to merge fuzz]
+	Signed-off-by: Paul Moore <paul@paul-moore.com>
+(cherry picked from commit 0256b0aa8019d937a0bdce3584c6b8b47f618202)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	security/selinux/ss/services.c
+diff --cc security/selinux/ss/services.c
+index 45cded883bbc,e730204f060b..000000000000
+--- a/security/selinux/ss/services.c
++++ b/security/selinux/ss/services.c
+@@@ -2138,9 -2145,10 +2138,15 @@@ static void selinux_policy_free(struct 
+  	if (!policy)
+  		return;
+  
+++<<<<<<< HEAD
+ +	policydb_destroy(&policy->policydb);
+ +	sidtab_destroy(&policy->sidtab);
+++=======
++ 	sidtab_destroy(policy->sidtab);
+++>>>>>>> 0256b0aa8019 (selinux: fix error handling bugs in security_load_policy())
+  	kfree(policy->map.mapping);
++ 	policydb_destroy(&policy->policydb);
++ 	kfree(policy->sidtab);
+  	kfree(policy);
+  }
+  
+@@@ -2227,20 -2262,26 +2233,29 @@@ int security_load_policy(struct selinux
+  	if (!newpolicy)
+  		return -ENOMEM;
+  
+++<<<<<<< HEAD
+++=======
++ 	newpolicy->sidtab = kzalloc(sizeof(*newpolicy->sidtab), GFP_KERNEL);
++ 	if (!newpolicy->sidtab) {
++ 		rc = -ENOMEM;
++ 		goto err_policy;
++ 	}
++ 
+++>>>>>>> 0256b0aa8019 (selinux: fix error handling bugs in security_load_policy())
+  	rc = policydb_read(&newpolicy->policydb, fp);
+  	if (rc)
+- 		goto err;
++ 		goto err_sidtab;
+  
+  	newpolicy->policydb.len = len;
+  	rc = selinux_set_mapping(&newpolicy->policydb, secclass_map,
+  				&newpolicy->map);
+  	if (rc)
+- 		goto err;
++ 		goto err_policydb;
+  
+ -	rc = policydb_load_isids(&newpolicy->policydb, newpolicy->sidtab);
+ +	rc = policydb_load_isids(&newpolicy->policydb, &newpolicy->sidtab);
+  	if (rc) {
+  		pr_err("SELinux:  unable to load the initial SIDs\n");
+- 		goto err;
++ 		goto err_mapping;
+  	}
+  
+  
+@@@ -2250,11 -2291,19 +2265,11 @@@
+  		return 0;
+  	}
+  
+ -	/*
+ -	 * NOTE: We do not need to take the rcu read lock
+ -	 * around the code below because other policy-modifying
+ -	 * operations are already excluded by selinuxfs via
+ -	 * fsi->mutex.
+ -	 */
+ -	oldpolicy = rcu_dereference_check(state->policy, 1);
+ -
+  	/* Preserve active boolean values from the old policy */
+ -	rc = security_preserve_bools(oldpolicy, newpolicy);
+ +	rc = security_preserve_bools(state, &newpolicy->policydb);
+  	if (rc) {
+  		pr_err("SELinux:  unable to preserve booleans\n");
+- 		goto err;
++ 		goto err_free_isids;
+  	}
+  
+  	/*
+* Unmerged path security/selinux/ss/services.c
