@@ -1,0 +1,170 @@
+net: atlantic: use u64_stats_update_* to protect access to 64-bit stats
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Mark Starovoytov <mstarovoitov@marvell.com>
+commit d7d8bb9286134bcc57941c38ed2d69c50fc59511
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/d7d8bb92.failed
+
+This patch adds u64_stats_update_* usage to protect access to 64-bit stats,
+where necessary.
+
+This is necessary for per-ring stats, because they are updated by the
+driver directly, so there is a possibility for a partial read.
+
+Other stats require no additional protection, e.g.:
+ * all MACSec stats are fetched directly from HW (under semaphore);
+ * nic/ndev stats (aq_stats_s) are fetched directly from FW (under mutex).
+
+	Signed-off-by: Mark Starovoytov <mstarovoitov@marvell.com>
+	Signed-off-by: Igor Russkikh <irusskikh@marvell.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit d7d8bb9286134bcc57941c38ed2d69c50fc59511)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/aquantia/atlantic/aq_ptp.c
+#	drivers/net/ethernet/aquantia/atlantic/aq_ring.c
+#	drivers/net/ethernet/aquantia/atlantic/aq_ring.h
+diff --cc drivers/net/ethernet/aquantia/atlantic/aq_ring.c
+index 26476a262015,b51ab2dbf6fe..000000000000
+--- a/drivers/net/ethernet/aquantia/atlantic/aq_ring.c
++++ b/drivers/net/ethernet/aquantia/atlantic/aq_ring.c
+@@@ -185,6 -217,13 +191,16 @@@ int aq_ring_init(struct aq_ring_s *self
+  	self->hw_head = 0;
+  	self->sw_head = 0;
+  	self->sw_tail = 0;
+++<<<<<<< HEAD
+++=======
++ 	self->ring_type = ring_type;
++ 
++ 	if (self->ring_type == ATL_RING_RX)
++ 		u64_stats_init(&self->stats.rx.syncp);
++ 	else
++ 		u64_stats_init(&self->stats.tx.syncp);
++ 
+++>>>>>>> d7d8bb928613 (net: atlantic: use u64_stats_update_* to protect access to 64-bit stats)
+  	return 0;
+  }
+  
+@@@ -206,9 -245,14 +222,19 @@@ void aq_ring_queue_wake(struct aq_ring_
+  {
+  	struct net_device *ndev = aq_nic_get_ndev(ring->aq_nic);
+  
+++<<<<<<< HEAD
+ +	if (__netif_subqueue_stopped(ndev, ring->idx)) {
+ +		netif_wake_subqueue(ndev, ring->idx);
+++=======
++ 	if (__netif_subqueue_stopped(ndev,
++ 				     AQ_NIC_RING2QMAP(ring->aq_nic,
++ 						      ring->idx))) {
++ 		netif_wake_subqueue(ndev,
++ 				    AQ_NIC_RING2QMAP(ring->aq_nic, ring->idx));
++ 		u64_stats_update_begin(&ring->stats.tx.syncp);
+++>>>>>>> d7d8bb928613 (net: atlantic: use u64_stats_update_* to protect access to 64-bit stats)
+  		ring->stats.tx.queue_restarts++;
++ 		u64_stats_update_end(&ring->stats.tx.syncp);
+  	}
+  }
+  
+@@@ -247,8 -294,10 +273,14 @@@ bool aq_ring_tx_clean(struct aq_ring_s 
+  		}
+  
+  		if (unlikely(buff->is_eop)) {
+++<<<<<<< HEAD
+ +			++self->stats.rx.packets;
+++=======
++ 			u64_stats_update_begin(&self->stats.tx.syncp);
++ 			++self->stats.tx.packets;
+++>>>>>>> d7d8bb928613 (net: atlantic: use u64_stats_update_* to protect access to 64-bit stats)
+  			self->stats.tx.bytes += buff->skb->len;
++ 			u64_stats_update_end(&self->stats.tx.syncp);
+  
+  			dev_kfree_skb_any(buff->skb);
+  		}
+@@@ -423,11 -494,16 +461,13 @@@ int aq_ring_rx_clean(struct aq_ring_s *
+  		skb_set_hash(skb, buff->rss_hash,
+  			     buff->is_hash_l4 ? PKT_HASH_TYPE_L4 :
+  			     PKT_HASH_TYPE_NONE);
+ -		/* Send all PTP traffic to 0 queue */
+ -		skb_record_rx_queue(skb,
+ -				    is_ptp_ring ? 0
+ -						: AQ_NIC_RING2QMAP(self->aq_nic,
+ -								   self->idx));
+ +
+ +		skb_record_rx_queue(skb, self->idx);
+  
++ 		u64_stats_update_begin(&self->stats.rx.syncp);
+  		++self->stats.rx.packets;
+  		self->stats.rx.bytes += skb->len;
++ 		u64_stats_update_end(&self->stats.rx.syncp);
+  
+  		napi_gro_receive(napi, skb);
+  	}
+@@@ -492,6 -583,32 +532,37 @@@ void aq_ring_free(struct aq_ring_s *sel
+  		dma_free_coherent(aq_nic_get_dev(self->aq_nic),
+  				  self->size * self->dx_size, self->dx_ring,
+  				  self->dx_ring_pa);
+++<<<<<<< HEAD
+ +
+ +err_exit:;
+++=======
++ }
++ 
++ unsigned int aq_ring_fill_stats_data(struct aq_ring_s *self, u64 *data)
++ {
++ 	unsigned int count;
++ 	unsigned int start;
++ 
++ 	if (self->ring_type == ATL_RING_RX) {
++ 		/* This data should mimic aq_ethtool_queue_rx_stat_names structure */
++ 		do {
++ 			count = 0;
++ 			start = u64_stats_fetch_begin_irq(&self->stats.rx.syncp);
++ 			data[count] = self->stats.rx.packets;
++ 			data[++count] = self->stats.rx.jumbo_packets;
++ 			data[++count] = self->stats.rx.lro_packets;
++ 			data[++count] = self->stats.rx.errors;
++ 		} while (u64_stats_fetch_retry_irq(&self->stats.rx.syncp, start));
++ 	} else {
++ 		/* This data should mimic aq_ethtool_queue_tx_stat_names structure */
++ 		do {
++ 			count = 0;
++ 			start = u64_stats_fetch_begin_irq(&self->stats.tx.syncp);
++ 			data[count] = self->stats.tx.packets;
++ 			data[++count] = self->stats.tx.queue_restarts;
++ 		} while (u64_stats_fetch_retry_irq(&self->stats.tx.syncp, start));
++ 	}
++ 
++ 	return ++count;
+++>>>>>>> d7d8bb928613 (net: atlantic: use u64_stats_update_* to protect access to 64-bit stats)
+  }
+diff --cc drivers/net/ethernet/aquantia/atlantic/aq_ring.h
+index cfffc301e746,c92c3a0651a9..000000000000
+--- a/drivers/net/ethernet/aquantia/atlantic/aq_ring.h
++++ b/drivers/net/ethernet/aquantia/atlantic/aq_ring.h
+@@@ -1,10 -1,8 +1,18 @@@
+++<<<<<<< HEAD
+ +/*
+ + * aQuantia Corporation Network Driver
+ + * Copyright (C) 2014-2017 aQuantia Corporation. All rights reserved
+ + *
+ + * This program is free software; you can redistribute it and/or modify it
+ + * under the terms and conditions of the GNU General Public License,
+ + * version 2, as published by the Free Software Foundation.
+++=======
++ /* SPDX-License-Identifier: GPL-2.0-only */
++ /* Atlantic Network Driver
++  *
++  * Copyright (C) 2014-2019 aQuantia Corporation
++  * Copyright (C) 2019-2020 Marvell International Ltd.
+++>>>>>>> d7d8bb928613 (net: atlantic: use u64_stats_update_* to protect access to 64-bit stats)
+   */
+  
+  /* File aq_ring.h: Declaration of functions for Rx/Tx rings. */
+* Unmerged path drivers/net/ethernet/aquantia/atlantic/aq_ptp.c
+* Unmerged path drivers/net/ethernet/aquantia/atlantic/aq_ptp.c
+* Unmerged path drivers/net/ethernet/aquantia/atlantic/aq_ring.c
+* Unmerged path drivers/net/ethernet/aquantia/atlantic/aq_ring.h
