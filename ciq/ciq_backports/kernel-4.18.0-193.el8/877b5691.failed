@@ -1,0 +1,2511 @@
+crypto: shash - remove shash_desc::flags
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-193.el8
+commit-author Eric Biggers <ebiggers@google.com>
+commit 877b5691f27a1aec0d9b53095a323e45c30069e2
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-193.el8/877b5691.failed
+
+The flags field in 'struct shash_desc' never actually does anything.
+The only ostensibly supported flag is CRYPTO_TFM_REQ_MAY_SLEEP.
+However, no shash algorithm ever sleeps, making this flag a no-op.
+
+With this being the case, inevitably some users who can't sleep wrongly
+pass MAY_SLEEP.  These would all need to be fixed if any shash algorithm
+actually started sleeping.  For example, the shash_ahash_*() functions,
+which wrap a shash algorithm with the ahash API, pass through MAY_SLEEP
+from the ahash API to the shash API.  However, the shash functions are
+called under kmap_atomic(), so actually they're assumed to never sleep.
+
+Even if it turns out that some users do need preemption points while
+hashing large buffers, we could easily provide a helper function
+crypto_shash_update_large() which divides the data into smaller chunks
+and calls crypto_shash_update() and cond_resched() for each chunk.  It's
+not necessary to have a flag in 'struct shash_desc', nor is it necessary
+to make individual shash algorithms aware of this at all.
+
+Therefore, remove shash_desc::flags, and document that the
+crypto_shash_*() functions can be called from any context.
+
+	Signed-off-by: Eric Biggers <ebiggers@google.com>
+	Signed-off-by: Herbert Xu <herbert@gondor.apana.org.au>
+(cherry picked from commit 877b5691f27a1aec0d9b53095a323e45c30069e2)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/power/hibernate.c
+#	crypto/adiantum.c
+#	crypto/testmgr.c
+#	drivers/block/drbd/drbd_worker.c
+#	drivers/crypto/vmx/ghash.c
+#	drivers/net/ppp/ppp_mppe.c
+#	drivers/staging/ks7010/ks_hostif.c
+#	drivers/staging/rtl8192e/rtllib_crypt_tkip.c
+#	drivers/staging/rtl8192u/ieee80211/ieee80211_crypt_tkip.c
+#	fs/ubifs/auth.c
+#	fs/ubifs/replay.c
+diff --cc crypto/testmgr.c
+index 263b28c6a083,2bd89a65e9e7..000000000000
+--- a/crypto/testmgr.c
++++ b/crypto/testmgr.c
+@@@ -172,315 -181,691 +172,440 @@@ static void testmgr_free_buf(char *buf[
+  	int i;
+  
+  	for (i = 0; i < XBUFSIZE; i++)
+ -		free_pages((unsigned long)buf[i], order);
+ -}
+ -
+ -static void testmgr_free_buf(char *buf[XBUFSIZE])
+ -{
+ -	__testmgr_free_buf(buf, 0);
+ -}
+ -
+ -#define TESTMGR_POISON_BYTE	0xfe
+ -#define TESTMGR_POISON_LEN	16
+ -
+ -static inline void testmgr_poison(void *addr, size_t len)
+ -{
+ -	memset(addr, TESTMGR_POISON_BYTE, len);
+ +		free_page((unsigned long)buf[i]);
+  }
+  
+ -/* Is the memory region still fully poisoned? */
+ -static inline bool testmgr_is_poison(const void *addr, size_t len)
+ +static int ahash_guard_result(char *result, char c, int size)
+  {
+ -	return memchr_inv(addr, TESTMGR_POISON_BYTE, len) == NULL;
+ -}
+ -
+ -/* flush type for hash algorithms */
+ -enum flush_type {
+ -	/* merge with update of previous buffer(s) */
+ -	FLUSH_TYPE_NONE = 0,
+ -
+ -	/* update with previous buffer(s) before doing this one */
+ -	FLUSH_TYPE_FLUSH,
+ -
+ -	/* likewise, but also export and re-import the intermediate state */
+ -	FLUSH_TYPE_REIMPORT,
+ -};
+ -
+ -/* finalization function for hash algorithms */
+ -enum finalization_type {
+ -	FINALIZATION_TYPE_FINAL,	/* use final() */
+ -	FINALIZATION_TYPE_FINUP,	/* use finup() */
+ -	FINALIZATION_TYPE_DIGEST,	/* use digest() */
+ -};
+ -
+ -#define TEST_SG_TOTAL	10000
+ -
+ -/**
+ - * struct test_sg_division - description of a scatterlist entry
+ - *
+ - * This struct describes one entry of a scatterlist being constructed to check a
+ - * crypto test vector.
+ - *
+ - * @proportion_of_total: length of this chunk relative to the total length,
+ - *			 given as a proportion out of TEST_SG_TOTAL so that it
+ - *			 scales to fit any test vector
+ - * @offset: byte offset into a 2-page buffer at which this chunk will start
+ - * @offset_relative_to_alignmask: if true, add the algorithm's alignmask to the
+ - *				  @offset
+ - * @flush_type: for hashes, whether an update() should be done now vs.
+ - *		continuing to accumulate data
+ - * @nosimd: if doing the pending update(), do it with SIMD disabled?
+ - */
+ -struct test_sg_division {
+ -	unsigned int proportion_of_total;
+ -	unsigned int offset;
+ -	bool offset_relative_to_alignmask;
+ -	enum flush_type flush_type;
+ -	bool nosimd;
+ -};
+ -
+ -/**
+ - * struct testvec_config - configuration for testing a crypto test vector
+ - *
+ - * This struct describes the data layout and other parameters with which each
+ - * crypto test vector can be tested.
+ - *
+ - * @name: name of this config, logged for debugging purposes if a test fails
+ - * @inplace: operate on the data in-place, if applicable for the algorithm type?
+ - * @req_flags: extra request_flags, e.g. CRYPTO_TFM_REQ_MAY_SLEEP
+ - * @src_divs: description of how to arrange the source scatterlist
+ - * @dst_divs: description of how to arrange the dst scatterlist, if applicable
+ - *	      for the algorithm type.  Defaults to @src_divs if unset.
+ - * @iv_offset: misalignment of the IV in the range [0..MAX_ALGAPI_ALIGNMASK+1],
+ - *	       where 0 is aligned to a 2*(MAX_ALGAPI_ALIGNMASK+1) byte boundary
+ - * @iv_offset_relative_to_alignmask: if true, add the algorithm's alignmask to
+ - *				     the @iv_offset
+ - * @finalization_type: what finalization function to use for hashes
+ - * @nosimd: execute with SIMD disabled?  Requires !CRYPTO_TFM_REQ_MAY_SLEEP.
+ - */
+ -struct testvec_config {
+ -	const char *name;
+ -	bool inplace;
+ -	u32 req_flags;
+ -	struct test_sg_division src_divs[XBUFSIZE];
+ -	struct test_sg_division dst_divs[XBUFSIZE];
+ -	unsigned int iv_offset;
+ -	bool iv_offset_relative_to_alignmask;
+ -	enum finalization_type finalization_type;
+ -	bool nosimd;
+ -};
+ -
+ -#define TESTVEC_CONFIG_NAMELEN	192
+ -
+ -/*
+ - * The following are the lists of testvec_configs to test for each algorithm
+ - * type when the basic crypto self-tests are enabled, i.e. when
+ - * CONFIG_CRYPTO_MANAGER_DISABLE_TESTS is unset.  They aim to provide good test
+ - * coverage, while keeping the test time much shorter than the full fuzz tests
+ - * so that the basic tests can be enabled in a wider range of circumstances.
+ - */
+ -
+ -/* Configs for skciphers and aeads */
+ -static const struct testvec_config default_cipher_testvec_configs[] = {
+ -	{
+ -		.name = "in-place",
+ -		.inplace = true,
+ -		.src_divs = { { .proportion_of_total = 10000 } },
+ -	}, {
+ -		.name = "out-of-place",
+ -		.src_divs = { { .proportion_of_total = 10000 } },
+ -	}, {
+ -		.name = "unaligned buffer, offset=1",
+ -		.src_divs = { { .proportion_of_total = 10000, .offset = 1 } },
+ -		.iv_offset = 1,
+ -	}, {
+ -		.name = "buffer aligned only to alignmask",
+ -		.src_divs = {
+ -			{
+ -				.proportion_of_total = 10000,
+ -				.offset = 1,
+ -				.offset_relative_to_alignmask = true,
+ -			},
+ -		},
+ -		.iv_offset = 1,
+ -		.iv_offset_relative_to_alignmask = true,
+ -	}, {
+ -		.name = "two even aligned splits",
+ -		.src_divs = {
+ -			{ .proportion_of_total = 5000 },
+ -			{ .proportion_of_total = 5000 },
+ -		},
+ -	}, {
+ -		.name = "uneven misaligned splits, may sleep",
+ -		.req_flags = CRYPTO_TFM_REQ_MAY_SLEEP,
+ -		.src_divs = {
+ -			{ .proportion_of_total = 1900, .offset = 33 },
+ -			{ .proportion_of_total = 3300, .offset = 7  },
+ -			{ .proportion_of_total = 4800, .offset = 18 },
+ -		},
+ -		.iv_offset = 3,
+ -	}, {
+ -		.name = "misaligned splits crossing pages, inplace",
+ -		.inplace = true,
+ -		.src_divs = {
+ -			{
+ -				.proportion_of_total = 7500,
+ -				.offset = PAGE_SIZE - 32
+ -			}, {
+ -				.proportion_of_total = 2500,
+ -				.offset = PAGE_SIZE - 7
+ -			},
+ -		},
+ -	}
+ -};
+ +	int i;
+  
+ -static const struct testvec_config default_hash_testvec_configs[] = {
+ -	{
+ -		.name = "init+update+final aligned buffer",
+ -		.src_divs = { { .proportion_of_total = 10000 } },
+ -		.finalization_type = FINALIZATION_TYPE_FINAL,
+ -	}, {
+ -		.name = "init+finup aligned buffer",
+ -		.src_divs = { { .proportion_of_total = 10000 } },
+ -		.finalization_type = FINALIZATION_TYPE_FINUP,
+ -	}, {
+ -		.name = "digest aligned buffer",
+ -		.src_divs = { { .proportion_of_total = 10000 } },
+ -		.finalization_type = FINALIZATION_TYPE_DIGEST,
+ -	}, {
+ -		.name = "init+update+final misaligned buffer",
+ -		.src_divs = { { .proportion_of_total = 10000, .offset = 1 } },
+ -		.finalization_type = FINALIZATION_TYPE_FINAL,
+ -	}, {
+ -		.name = "digest buffer aligned only to alignmask",
+ -		.src_divs = {
+ -			{
+ -				.proportion_of_total = 10000,
+ -				.offset = 1,
+ -				.offset_relative_to_alignmask = true,
+ -			},
+ -		},
+ -		.finalization_type = FINALIZATION_TYPE_DIGEST,
+ -	}, {
+ -		.name = "init+update+update+final two even splits",
+ -		.src_divs = {
+ -			{ .proportion_of_total = 5000 },
+ -			{
+ -				.proportion_of_total = 5000,
+ -				.flush_type = FLUSH_TYPE_FLUSH,
+ -			},
+ -		},
+ -		.finalization_type = FINALIZATION_TYPE_FINAL,
+ -	}, {
+ -		.name = "digest uneven misaligned splits, may sleep",
+ -		.req_flags = CRYPTO_TFM_REQ_MAY_SLEEP,
+ -		.src_divs = {
+ -			{ .proportion_of_total = 1900, .offset = 33 },
+ -			{ .proportion_of_total = 3300, .offset = 7  },
+ -			{ .proportion_of_total = 4800, .offset = 18 },
+ -		},
+ -		.finalization_type = FINALIZATION_TYPE_DIGEST,
+ -	}, {
+ -		.name = "digest misaligned splits crossing pages",
+ -		.src_divs = {
+ -			{
+ -				.proportion_of_total = 7500,
+ -				.offset = PAGE_SIZE - 32,
+ -			}, {
+ -				.proportion_of_total = 2500,
+ -				.offset = PAGE_SIZE - 7,
+ -			},
+ -		},
+ -		.finalization_type = FINALIZATION_TYPE_DIGEST,
+ -	}, {
+ -		.name = "import/export",
+ -		.src_divs = {
+ -			{
+ -				.proportion_of_total = 6500,
+ -				.flush_type = FLUSH_TYPE_REIMPORT,
+ -			}, {
+ -				.proportion_of_total = 3500,
+ -				.flush_type = FLUSH_TYPE_REIMPORT,
+ -			},
+ -		},
+ -		.finalization_type = FINALIZATION_TYPE_FINAL,
+ +	for (i = 0; i < size; i++) {
+ +		if (result[i] != c)
+ +			return -EINVAL;
+  	}
+ -};
+ -
+ -static unsigned int count_test_sg_divisions(const struct test_sg_division *divs)
+ -{
+ -	unsigned int remaining = TEST_SG_TOTAL;
+ -	unsigned int ndivs = 0;
+ -
+ -	do {
+ -		remaining -= divs[ndivs++].proportion_of_total;
+ -	} while (remaining);
+  
+ -	return ndivs;
+ +	return 0;
+  }
+  
+ -#define SGDIVS_HAVE_FLUSHES	BIT(0)
+ -#define SGDIVS_HAVE_NOSIMD	BIT(1)
+ +static int ahash_partial_update(struct ahash_request **preq,
+ +	struct crypto_ahash *tfm, const struct hash_testvec *template,
+ +	void *hash_buff, int k, int temp, struct scatterlist *sg,
+ +	const char *algo, char *result, struct crypto_wait *wait)
+ +{
+ +	char *state;
+ +	struct ahash_request *req;
+ +	int statesize, ret = -EINVAL;
+ +	static const unsigned char guard[] = { 0x00, 0xba, 0xad, 0x00 };
+ +	int digestsize = crypto_ahash_digestsize(tfm);
+ +
+ +	req = *preq;
+ +	statesize = crypto_ahash_statesize(
+ +			crypto_ahash_reqtfm(req));
+ +	state = kmalloc(statesize + sizeof(guard), GFP_KERNEL);
+ +	if (!state) {
+ +		pr_err("alg: hash: Failed to alloc state for %s\n", algo);
+ +		goto out_nostate;
+ +	}
+++<<<<<<< HEAD
+ +	memcpy(state + statesize, guard, sizeof(guard));
+ +	memset(result, 1, digestsize);
+ +	ret = crypto_ahash_export(req, state);
+ +	WARN_ON(memcmp(state + statesize, guard, sizeof(guard)));
+ +	if (ret) {
+ +		pr_err("alg: hash: Failed to export() for %s\n", algo);
+++=======
++ 
+ -static bool valid_sg_divisions(const struct test_sg_division *divs,
+ -			       unsigned int count, int *flags_ret)
+ -{
+ -	unsigned int total = 0;
+ -	unsigned int i;
+++#ifdef CONFIG_CRYPTO_MANAGER_EXTRA_TESTS
+++	if (!noextratests) {
+++		struct testvec_config cfg;
+++		char cfgname[TESTVEC_CONFIG_NAMELEN];
++ 
+ -	for (i = 0; i < count && total != TEST_SG_TOTAL; i++) {
+ -		if (divs[i].proportion_of_total <= 0 ||
+ -		    divs[i].proportion_of_total > TEST_SG_TOTAL - total)
+ -			return false;
+ -		total += divs[i].proportion_of_total;
+ -		if (divs[i].flush_type != FLUSH_TYPE_NONE)
+ -			*flags_ret |= SGDIVS_HAVE_FLUSHES;
+ -		if (divs[i].nosimd)
+ -			*flags_ret |= SGDIVS_HAVE_NOSIMD;
+++		for (i = 0; i < fuzz_iterations; i++) {
+++			generate_random_testvec_config(&cfg, cfgname,
+++						       sizeof(cfgname));
+++			err = test_hash_vec_cfg(driver, vec, vec_name, &cfg,
+++						req, tsgl, hashstate);
+++			if (err)
+++				return err;
+++		}
++ 	}
+ -	return total == TEST_SG_TOTAL &&
+ -		memchr_inv(&divs[i], 0, (count - i) * sizeof(divs[0])) == NULL;
+++#endif
+++	return 0;
++ }
++ 
+++#ifdef CONFIG_CRYPTO_MANAGER_EXTRA_TESTS
++ /*
+ - * Check whether the given testvec_config is valid.  This isn't strictly needed
+ - * since every testvec_config should be valid, but check anyway so that people
+ - * don't unknowingly add broken configs that don't do what they wanted.
+++ * Generate a hash test vector from the given implementation.
+++ * Assumes the buffers in 'vec' were already allocated.
++  */
+ -static bool valid_testvec_config(const struct testvec_config *cfg)
+++static void generate_random_hash_testvec(struct crypto_shash *tfm,
+++					 struct hash_testvec *vec,
+++					 unsigned int maxkeysize,
+++					 unsigned int maxdatasize,
+++					 char *name, size_t max_namelen)
++ {
+ -	int flags = 0;
+++	SHASH_DESC_ON_STACK(desc, tfm);
++ 
+ -	if (cfg->name == NULL)
+ -		return false;
+++	/* Data */
+++	vec->psize = generate_random_length(maxdatasize);
+++	generate_random_bytes((u8 *)vec->plaintext, vec->psize);
++ 
+ -	if (!valid_sg_divisions(cfg->src_divs, ARRAY_SIZE(cfg->src_divs),
+ -				&flags))
+ -		return false;
+++	/*
+++	 * Key: length in range [1, maxkeysize], but usually choose maxkeysize.
+++	 * If algorithm is unkeyed, then maxkeysize == 0 and set ksize = 0.
+++	 */
+++	vec->setkey_error = 0;
+++	vec->ksize = 0;
+++	if (maxkeysize) {
+++		vec->ksize = maxkeysize;
+++		if (prandom_u32() % 4 == 0)
+++			vec->ksize = 1 + (prandom_u32() % maxkeysize);
+++		generate_random_bytes((u8 *)vec->key, vec->ksize);
++ 
+ -	if (cfg->dst_divs[0].proportion_of_total) {
+ -		if (!valid_sg_divisions(cfg->dst_divs,
+ -					ARRAY_SIZE(cfg->dst_divs), &flags))
+ -			return false;
+ -	} else {
+ -		if (memchr_inv(cfg->dst_divs, 0, sizeof(cfg->dst_divs)))
+ -			return false;
+ -		/* defaults to dst_divs=src_divs */
+++		vec->setkey_error = crypto_shash_setkey(tfm, vec->key,
+++							vec->ksize);
+++		/* If the key couldn't be set, no need to continue to digest. */
+++		if (vec->setkey_error)
+++			goto done;
++ 	}
++ 
+ -	if (cfg->iv_offset +
+ -	    (cfg->iv_offset_relative_to_alignmask ? MAX_ALGAPI_ALIGNMASK : 0) >
+ -	    MAX_ALGAPI_ALIGNMASK + 1)
+ -		return false;
+ -
+ -	if ((flags & (SGDIVS_HAVE_FLUSHES | SGDIVS_HAVE_NOSIMD)) &&
+ -	    cfg->finalization_type == FINALIZATION_TYPE_DIGEST)
+ -		return false;
+ -
+ -	if ((cfg->nosimd || (flags & SGDIVS_HAVE_NOSIMD)) &&
+ -	    (cfg->req_flags & CRYPTO_TFM_REQ_MAY_SLEEP))
+ -		return false;
+ -
+ -	return true;
+ -}
+ -
+ -struct test_sglist {
+ -	char *bufs[XBUFSIZE];
+ -	struct scatterlist sgl[XBUFSIZE];
+ -	struct scatterlist sgl_saved[XBUFSIZE];
+ -	struct scatterlist *sgl_ptr;
+ -	unsigned int nents;
+ -};
+ -
+ -static int init_test_sglist(struct test_sglist *tsgl)
+ -{
+ -	return __testmgr_alloc_buf(tsgl->bufs, 1 /* two pages per buffer */);
+ -}
+ -
+ -static void destroy_test_sglist(struct test_sglist *tsgl)
+ -{
+ -	return __testmgr_free_buf(tsgl->bufs, 1 /* two pages per buffer */);
+++	/* Digest */
+++	desc->tfm = tfm;
+++	vec->digest_error = crypto_shash_digest(desc, vec->plaintext,
+++						vec->psize, (u8 *)vec->digest);
+++done:
+++	snprintf(name, max_namelen, "\"random: psize=%u ksize=%u\"",
+++		 vec->psize, vec->ksize);
++ }
++ 
+ -/**
+ - * build_test_sglist() - build a scatterlist for a crypto test
+ - *
+ - * @tsgl: the scatterlist to build.  @tsgl->bufs[] contains an array of 2-page
+ - *	  buffers which the scatterlist @tsgl->sgl[] will be made to point into.
+ - * @divs: the layout specification on which the scatterlist will be based
+ - * @alignmask: the algorithm's alignmask
+ - * @total_len: the total length of the scatterlist to build in bytes
+ - * @data: if non-NULL, the buffers will be filled with this data until it ends.
+ - *	  Otherwise the buffers will be poisoned.  In both cases, some bytes
+ - *	  past the end of each buffer will be poisoned to help detect overruns.
+ - * @out_divs: if non-NULL, the test_sg_division to which each scatterlist entry
+ - *	      corresponds will be returned here.  This will match @divs except
+ - *	      that divisions resolving to a length of 0 are omitted as they are
+ - *	      not included in the scatterlist.
+ - *
+ - * Return: 0 or a -errno value
+++/*
+++ * Test the hash algorithm represented by @req against the corresponding generic
+++ * implementation, if one is available.
++  */
+ -static int build_test_sglist(struct test_sglist *tsgl,
+ -			     const struct test_sg_division *divs,
+ -			     const unsigned int alignmask,
+ -			     const unsigned int total_len,
+ -			     struct iov_iter *data,
+ -			     const struct test_sg_division *out_divs[XBUFSIZE])
+++static int test_hash_vs_generic_impl(const char *driver,
+++				     const char *generic_driver,
+++				     unsigned int maxkeysize,
+++				     struct ahash_request *req,
+++				     struct test_sglist *tsgl,
+++				     u8 *hashstate)
++ {
+ -	struct {
+ -		const struct test_sg_division *div;
+ -		size_t length;
+ -	} partitions[XBUFSIZE];
+ -	const unsigned int ndivs = count_test_sg_divisions(divs);
+ -	unsigned int len_remaining = total_len;
+++	struct crypto_ahash *tfm = crypto_ahash_reqtfm(req);
+++	const unsigned int digestsize = crypto_ahash_digestsize(tfm);
+++	const unsigned int blocksize = crypto_ahash_blocksize(tfm);
+++	const unsigned int maxdatasize = (2 * PAGE_SIZE) - TESTMGR_POISON_LEN;
+++	const char *algname = crypto_hash_alg_common(tfm)->base.cra_name;
+++	char _generic_driver[CRYPTO_MAX_ALG_NAME];
+++	struct crypto_shash *generic_tfm = NULL;
++ 	unsigned int i;
+++	struct hash_testvec vec = { 0 };
+++	char vec_name[64];
+++	struct testvec_config cfg;
+++	char cfgname[TESTVEC_CONFIG_NAMELEN];
+++	int err;
++ 
+ -	BUILD_BUG_ON(ARRAY_SIZE(partitions) != ARRAY_SIZE(tsgl->sgl));
+ -	if (WARN_ON(ndivs > ARRAY_SIZE(partitions)))
+ -		return -EINVAL;
+ -
+ -	/* Calculate the (div, length) pairs */
+ -	tsgl->nents = 0;
+ -	for (i = 0; i < ndivs; i++) {
+ -		unsigned int len_this_sg =
+ -			min(len_remaining,
+ -			    (total_len * divs[i].proportion_of_total +
+ -			     TEST_SG_TOTAL / 2) / TEST_SG_TOTAL);
+++	if (noextratests)
+++		return 0;
++ 
+ -		if (len_this_sg != 0) {
+ -			partitions[tsgl->nents].div = &divs[i];
+ -			partitions[tsgl->nents].length = len_this_sg;
+ -			tsgl->nents++;
+ -			len_remaining -= len_this_sg;
+ -		}
+ -	}
+ -	if (tsgl->nents == 0) {
+ -		partitions[tsgl->nents].div = &divs[0];
+ -		partitions[tsgl->nents].length = 0;
+ -		tsgl->nents++;
+++	if (!generic_driver) { /* Use default naming convention? */
+++		err = build_generic_driver_name(algname, _generic_driver);
+++		if (err)
+++			return err;
+++		generic_driver = _generic_driver;
++ 	}
+ -	partitions[tsgl->nents - 1].length += len_remaining;
+ -
+ -	/* Set up the sgl entries and fill the data or poison */
+ -	sg_init_table(tsgl->sgl, tsgl->nents);
+ -	for (i = 0; i < tsgl->nents; i++) {
+ -		unsigned int offset = partitions[i].div->offset;
+ -		void *addr;
++ 
+ -		if (partitions[i].div->offset_relative_to_alignmask)
+ -			offset += alignmask;
+++	if (strcmp(generic_driver, driver) == 0) /* Already the generic impl? */
+++		return 0;
++ 
+ -		while (offset + partitions[i].length + TESTMGR_POISON_LEN >
+ -		       2 * PAGE_SIZE) {
+ -			if (WARN_ON(offset <= 0))
+ -				return -EINVAL;
+ -			offset /= 2;
+++	generic_tfm = crypto_alloc_shash(generic_driver, 0, 0);
+++	if (IS_ERR(generic_tfm)) {
+++		err = PTR_ERR(generic_tfm);
+++		if (err == -ENOENT) {
+++			pr_warn("alg: hash: skipping comparison tests for %s because %s is unavailable\n",
+++				driver, generic_driver);
+++			return 0;
++ 		}
+++		pr_err("alg: hash: error allocating %s (generic impl of %s): %d\n",
+++		       generic_driver, algname, err);
+++		return err;
+++	}
++ 
+ -		addr = &tsgl->bufs[i][offset];
+ -		sg_set_buf(&tsgl->sgl[i], addr, partitions[i].length);
+ -
+ -		if (out_divs)
+ -			out_divs[i] = partitions[i].div;
+ -
+ -		if (data) {
+ -			size_t copy_len, copied;
+++	/* Check the algorithm properties for consistency. */
++ 
+ -			copy_len = min(partitions[i].length, data->count);
+ -			copied = copy_from_iter(addr, copy_len, data);
+ -			if (WARN_ON(copied != copy_len))
+ -				return -EINVAL;
+ -			testmgr_poison(addr + copy_len, partitions[i].length +
+ -				       TESTMGR_POISON_LEN - copy_len);
+ -		} else {
+ -			testmgr_poison(addr, partitions[i].length +
+ -				       TESTMGR_POISON_LEN);
+ -		}
+++	if (digestsize != crypto_shash_digestsize(generic_tfm)) {
+++		pr_err("alg: hash: digestsize for %s (%u) doesn't match generic impl (%u)\n",
+++		       driver, digestsize,
+++		       crypto_shash_digestsize(generic_tfm));
+++		err = -EINVAL;
+++>>>>>>> 877b5691f27a (crypto: shash - remove shash_desc::flags)
+ +		goto out;
+  	}
+ -
+ -	sg_mark_end(&tsgl->sgl[tsgl->nents - 1]);
+ -	tsgl->sgl_ptr = tsgl->sgl;
+ -	memcpy(tsgl->sgl_saved, tsgl->sgl, tsgl->nents * sizeof(tsgl->sgl[0]));
+ -	return 0;
+ +	ret = ahash_guard_result(result, 1, digestsize);
+ +	if (ret) {
+ +		pr_err("alg: hash: Failed, export used req->result for %s\n",
+ +		       algo);
+ +		goto out;
+ +	}
+ +	ahash_request_free(req);
+ +	req = ahash_request_alloc(tfm, GFP_KERNEL);
+ +	if (!req) {
+ +		pr_err("alg: hash: Failed to alloc request for %s\n", algo);
+ +		goto out_noreq;
+ +	}
+ +	ahash_request_set_callback(req,
+ +		CRYPTO_TFM_REQ_MAY_BACKLOG,
+ +		crypto_req_done, wait);
+ +
+ +	memcpy(hash_buff, template->plaintext + temp,
+ +		template->tap[k]);
+ +	sg_init_one(&sg[0], hash_buff, template->tap[k]);
+ +	ahash_request_set_crypt(req, sg, result, template->tap[k]);
+ +	ret = crypto_ahash_import(req, state);
+ +	if (ret) {
+ +		pr_err("alg: hash: Failed to import() for %s\n", algo);
+ +		goto out;
+ +	}
+ +	ret = ahash_guard_result(result, 1, digestsize);
+ +	if (ret) {
+ +		pr_err("alg: hash: Failed, import used req->result for %s\n",
+ +		       algo);
+ +		goto out;
+ +	}
+ +	ret = crypto_wait_req(crypto_ahash_update(req), wait);
+ +	if (ret)
+ +		goto out;
+ +	*preq = req;
+ +	ret = 0;
+ +	goto out_noreq;
+ +out:
+ +	ahash_request_free(req);
+ +out_noreq:
+ +	kfree(state);
+ +out_nostate:
+ +	return ret;
+  }
+  
+ -/*
+ - * Verify that a scatterlist crypto operation produced the correct output.
+ - *
+ - * @tsgl: scatterlist containing the actual output
+ - * @expected_output: buffer containing the expected output
+ - * @len_to_check: length of @expected_output in bytes
+ - * @unchecked_prefix_len: number of ignored bytes in @tsgl prior to real result
+ - * @check_poison: verify that the poison bytes after each chunk are intact?
+ - *
+ - * Return: 0 if correct, -EINVAL if incorrect, -EOVERFLOW if buffer overrun.
+ - */
+ -static int verify_correct_output(const struct test_sglist *tsgl,
+ -				 const char *expected_output,
+ -				 unsigned int len_to_check,
+ -				 unsigned int unchecked_prefix_len,
+ -				 bool check_poison)
+ +static int __test_hash(struct crypto_ahash *tfm,
+ +		       const struct hash_testvec *template, unsigned int tcount,
+ +		       bool use_digest, const int align_offset)
+  {
+ -	unsigned int i;
+ -
+ -	for (i = 0; i < tsgl->nents; i++) {
+ -		struct scatterlist *sg = &tsgl->sgl_ptr[i];
+ -		unsigned int len = sg->length;
+ -		unsigned int offset = sg->offset;
+ -		const char *actual_output;
+ +	const char *algo = crypto_tfm_alg_driver_name(crypto_ahash_tfm(tfm));
+ +	size_t digest_size = crypto_ahash_digestsize(tfm);
+ +	unsigned int i, j, k, temp;
+ +	struct scatterlist sg[8];
+ +	char *result;
+ +	char *key;
+ +	struct ahash_request *req;
+ +	struct crypto_wait wait;
+ +	void *hash_buff;
+ +	char *xbuf[XBUFSIZE];
+ +	int ret = -ENOMEM;
+  
+ -		if (unchecked_prefix_len) {
+ -			if (unchecked_prefix_len >= len) {
+ -				unchecked_prefix_len -= len;
+ -				continue;
+ -			}
+ -			offset += unchecked_prefix_len;
+ -			len -= unchecked_prefix_len;
+ -			unchecked_prefix_len = 0;
+ -		}
+ -		len = min(len, len_to_check);
+ -		actual_output = page_address(sg_page(sg)) + offset;
+ -		if (memcmp(expected_output, actual_output, len) != 0)
+ -			return -EINVAL;
+ -		if (check_poison &&
+ -		    !testmgr_is_poison(actual_output + len, TESTMGR_POISON_LEN))
+ -			return -EOVERFLOW;
+ -		len_to_check -= len;
+ -		expected_output += len;
+ -	}
+ -	if (WARN_ON(len_to_check != 0))
+ -		return -EINVAL;
+ -	return 0;
+ -}
+ +	result = kmalloc(digest_size, GFP_KERNEL);
+ +	if (!result)
+ +		return ret;
+ +	key = kmalloc(MAX_KEYLEN, GFP_KERNEL);
+ +	if (!key)
+ +		goto out_nobuf;
+ +	if (testmgr_alloc_buf(xbuf))
+ +		goto out_nobuf;
+  
+ -static bool is_test_sglist_corrupted(const struct test_sglist *tsgl)
+ -{
+ -	unsigned int i;
+ +	crypto_init_wait(&wait);
+  
+ -	for (i = 0; i < tsgl->nents; i++) {
+ -		if (tsgl->sgl[i].page_link != tsgl->sgl_saved[i].page_link)
+ -			return true;
+ -		if (tsgl->sgl[i].offset != tsgl->sgl_saved[i].offset)
+ -			return true;
+ -		if (tsgl->sgl[i].length != tsgl->sgl_saved[i].length)
+ -			return true;
+ +	req = ahash_request_alloc(tfm, GFP_KERNEL);
+ +	if (!req) {
+ +		printk(KERN_ERR "alg: hash: Failed to allocate request for "
+ +		       "%s\n", algo);
+ +		goto out_noreq;
+  	}
+ -	return false;
+ -}
+ +	ahash_request_set_callback(req, CRYPTO_TFM_REQ_MAY_BACKLOG,
+ +				   crypto_req_done, &wait);
+  
+ -struct cipher_test_sglists {
+ -	struct test_sglist src;
+ -	struct test_sglist dst;
+ -};
+ +	j = 0;
+ +	for (i = 0; i < tcount; i++) {
+ +		if (template[i].np)
+ +			continue;
+  
+ -static struct cipher_test_sglists *alloc_cipher_test_sglists(void)
+ -{
+ -	struct cipher_test_sglists *tsgls;
+ +		ret = -EINVAL;
+ +		if (WARN_ON(align_offset + template[i].psize > PAGE_SIZE))
+ +			goto out;
+  
+ -	tsgls = kmalloc(sizeof(*tsgls), GFP_KERNEL);
+ -	if (!tsgls)
+ -		return NULL;
+ +		j++;
+ +		memset(result, 0, digest_size);
+  
+ -	if (init_test_sglist(&tsgls->src) != 0)
+ -		goto fail_kfree;
+ -	if (init_test_sglist(&tsgls->dst) != 0)
+ -		goto fail_destroy_src;
+ +		hash_buff = xbuf[0];
+ +		hash_buff += align_offset;
+  
+ -	return tsgls;
+ +		memcpy(hash_buff, template[i].plaintext, template[i].psize);
+ +		sg_init_one(&sg[0], hash_buff, template[i].psize);
+  
+ -fail_destroy_src:
+ -	destroy_test_sglist(&tsgls->src);
+ -fail_kfree:
+ -	kfree(tsgls);
+ -	return NULL;
+ -}
+ +		if (template[i].ksize) {
+ +			crypto_ahash_clear_flags(tfm, ~0);
+ +			if (template[i].ksize > MAX_KEYLEN) {
+ +				pr_err("alg: hash: setkey failed on test %d for %s: key size %d > %d\n",
+ +				       j, algo, template[i].ksize, MAX_KEYLEN);
+ +				ret = -EINVAL;
+ +				goto out;
+ +			}
+ +			memcpy(key, template[i].key, template[i].ksize);
+ +			ret = crypto_ahash_setkey(tfm, key, template[i].ksize);
+ +			if (ret) {
+ +				printk(KERN_ERR "alg: hash: setkey failed on "
+ +				       "test %d for %s: ret=%d\n", j, algo,
+ +				       -ret);
+ +				goto out;
+ +			}
+ +		}
+  
+ -static void free_cipher_test_sglists(struct cipher_test_sglists *tsgls)
+ -{
+ -	if (tsgls) {
+ -		destroy_test_sglist(&tsgls->src);
+ -		destroy_test_sglist(&tsgls->dst);
+ -		kfree(tsgls);
+ -	}
+ -}
+ -
+ -/* Build the src and dst scatterlists for an skcipher or AEAD test */
+ -static int build_cipher_test_sglists(struct cipher_test_sglists *tsgls,
+ -				     const struct testvec_config *cfg,
+ -				     unsigned int alignmask,
+ -				     unsigned int src_total_len,
+ -				     unsigned int dst_total_len,
+ -				     const struct kvec *inputs,
+ -				     unsigned int nr_inputs)
+ -{
+ -	struct iov_iter input;
+ -	int err;
+ -
+ -	iov_iter_kvec(&input, WRITE, inputs, nr_inputs, src_total_len);
+ -	err = build_test_sglist(&tsgls->src, cfg->src_divs, alignmask,
+ -				cfg->inplace ?
+ -					max(dst_total_len, src_total_len) :
+ -					src_total_len,
+ -				&input, NULL);
+ -	if (err)
+ -		return err;
+ +		ahash_request_set_crypt(req, sg, result, template[i].psize);
+ +		if (use_digest) {
+ +			ret = crypto_wait_req(crypto_ahash_digest(req), &wait);
+ +			if (ret) {
+ +				pr_err("alg: hash: digest failed on test %d "
+ +				       "for %s: ret=%d\n", j, algo, -ret);
+ +				goto out;
+ +			}
+ +		} else {
+ +			memset(result, 1, digest_size);
+ +			ret = crypto_wait_req(crypto_ahash_init(req), &wait);
+ +			if (ret) {
+ +				pr_err("alg: hash: init failed on test %d "
+ +				       "for %s: ret=%d\n", j, algo, -ret);
+ +				goto out;
+ +			}
+ +			ret = ahash_guard_result(result, 1, digest_size);
+ +			if (ret) {
+ +				pr_err("alg: hash: init failed on test %d "
+ +				       "for %s: used req->result\n", j, algo);
+ +				goto out;
+ +			}
+ +			ret = crypto_wait_req(crypto_ahash_update(req), &wait);
+ +			if (ret) {
+ +				pr_err("alg: hash: update failed on test %d "
+ +				       "for %s: ret=%d\n", j, algo, -ret);
+ +				goto out;
+ +			}
+ +			ret = ahash_guard_result(result, 1, digest_size);
+ +			if (ret) {
+ +				pr_err("alg: hash: update failed on test %d "
+ +				       "for %s: used req->result\n", j, algo);
+ +				goto out;
+ +			}
+ +			ret = crypto_wait_req(crypto_ahash_final(req), &wait);
+ +			if (ret) {
+ +				pr_err("alg: hash: final failed on test %d "
+ +				       "for %s: ret=%d\n", j, algo, -ret);
+ +				goto out;
+ +			}
+ +		}
+  
+ -	if (cfg->inplace) {
+ -		tsgls->dst.sgl_ptr = tsgls->src.sgl;
+ -		tsgls->dst.nents = tsgls->src.nents;
+ -		return 0;
+ +		if (memcmp(result, template[i].digest,
+ +			   crypto_ahash_digestsize(tfm))) {
+ +			printk(KERN_ERR "alg: hash: Test %d failed for %s\n",
+ +			       j, algo);
+ +			hexdump(result, crypto_ahash_digestsize(tfm));
+ +			ret = -EINVAL;
+ +			goto out;
+ +		}
+  	}
+ -	return build_test_sglist(&tsgls->dst,
+ -				 cfg->dst_divs[0].proportion_of_total ?
+ -					cfg->dst_divs : cfg->src_divs,
+ -				 alignmask, dst_total_len, NULL, NULL);
+ -}
+  
+ -#ifdef CONFIG_CRYPTO_MANAGER_EXTRA_TESTS
+ +	j = 0;
+ +	for (i = 0; i < tcount; i++) {
+ +		/* alignment tests are only done with continuous buffers */
+ +		if (align_offset != 0)
+ +			break;
+  
+ -/* Generate a random length in range [0, max_len], but prefer smaller values */
+ -static unsigned int generate_random_length(unsigned int max_len)
+ -{
+ -	unsigned int len = prandom_u32() % (max_len + 1);
+ -
+ -	switch (prandom_u32() % 4) {
+ -	case 0:
+ -		return len % 64;
+ -	case 1:
+ -		return len % 256;
+ -	case 2:
+ -		return len % 1024;
+ -	default:
+ -		return len;
+ -	}
+ -}
+ +		if (!template[i].np)
+ +			continue;
+  
+ -/* Sometimes make some random changes to the given data buffer */
+ -static void mutate_buffer(u8 *buf, size_t count)
+ -{
+ -	size_t num_flips;
+ -	size_t i;
+ -	size_t pos;
+ +		j++;
+ +		memset(result, 0, digest_size);
+  
+ -	/* Sometimes flip some bits */
+ -	if (prandom_u32() % 4 == 0) {
+ -		num_flips = min_t(size_t, 1 << (prandom_u32() % 8), count * 8);
+ -		for (i = 0; i < num_flips; i++) {
+ -			pos = prandom_u32() % (count * 8);
+ -			buf[pos / 8] ^= 1 << (pos % 8);
+ +		temp = 0;
+ +		sg_init_table(sg, template[i].np);
+ +		ret = -EINVAL;
+ +		for (k = 0; k < template[i].np; k++) {
+ +			if (WARN_ON(offset_in_page(IDX[k]) +
+ +				    template[i].tap[k] > PAGE_SIZE))
+ +				goto out;
+ +			sg_set_buf(&sg[k],
+ +				   memcpy(xbuf[IDX[k] >> PAGE_SHIFT] +
+ +					  offset_in_page(IDX[k]),
+ +					  template[i].plaintext + temp,
+ +					  template[i].tap[k]),
+ +				   template[i].tap[k]);
+ +			temp += template[i].tap[k];
+ +		}
+ +
+ +		if (template[i].ksize) {
+ +			if (template[i].ksize > MAX_KEYLEN) {
+ +				pr_err("alg: hash: setkey failed on test %d for %s: key size %d > %d\n",
+ +				       j, algo, template[i].ksize, MAX_KEYLEN);
+ +				ret = -EINVAL;
+ +				goto out;
+ +			}
+ +			crypto_ahash_clear_flags(tfm, ~0);
+ +			memcpy(key, template[i].key, template[i].ksize);
+ +			ret = crypto_ahash_setkey(tfm, key, template[i].ksize);
+ +
+ +			if (ret) {
+ +				printk(KERN_ERR "alg: hash: setkey "
+ +				       "failed on chunking test %d "
+ +				       "for %s: ret=%d\n", j, algo, -ret);
+ +				goto out;
+ +			}
+  		}
+ -	}
+ -
+ -	/* Sometimes flip some bytes */
+ -	if (prandom_u32() % 4 == 0) {
+ -		num_flips = min_t(size_t, 1 << (prandom_u32() % 8), count);
+ -		for (i = 0; i < num_flips; i++)
+ -			buf[prandom_u32() % count] ^= 0xff;
+ -	}
+ -}
+  
+ -/* Randomly generate 'count' bytes, but sometimes make them "interesting" */
+ -static void generate_random_bytes(u8 *buf, size_t count)
+ -{
+ -	u8 b;
+ -	u8 increment;
+ -	size_t i;
+ -
+ -	if (count == 0)
+ -		return;
+ +		ahash_request_set_crypt(req, sg, result, template[i].psize);
+ +		ret = crypto_wait_req(crypto_ahash_digest(req), &wait);
+ +		if (ret) {
+ +			pr_err("alg: hash: digest failed on chunking test %d for %s: ret=%d\n",
+ +			       j, algo, -ret);
+ +			goto out;
+ +		}
+  
+ -	switch (prandom_u32() % 8) { /* Choose a generation strategy */
+ -	case 0:
+ -	case 1:
+ -		/* All the same byte, plus optional mutations */
+ -		switch (prandom_u32() % 4) {
+ -		case 0:
+ -			b = 0x00;
+ -			break;
+ -		case 1:
+ -			b = 0xff;
+ -			break;
+ -		default:
+ -			b = (u8)prandom_u32();
+ -			break;
+ +		if (memcmp(result, template[i].digest,
+ +			   crypto_ahash_digestsize(tfm))) {
+ +			printk(KERN_ERR "alg: hash: Chunking test %d "
+ +			       "failed for %s\n", j, algo);
+ +			hexdump(result, crypto_ahash_digestsize(tfm));
+ +			ret = -EINVAL;
+ +			goto out;
+  		}
+ -		memset(buf, b, count);
+ -		mutate_buffer(buf, count);
+ -		break;
+ -	case 2:
+ -		/* Ascending or descending bytes, plus optional mutations */
+ -		increment = (u8)prandom_u32();
+ -		b = (u8)prandom_u32();
+ -		for (i = 0; i < count; i++, b += increment)
+ -			buf[i] = b;
+ -		mutate_buffer(buf, count);
+ -		break;
+ -	default:
+ -		/* Fully random bytes */
+ -		for (i = 0; i < count; i++)
+ -			buf[i] = (u8)prandom_u32();
+  	}
+ -}
+  
+ -static char *generate_random_sgl_divisions(struct test_sg_division *divs,
+ -					   size_t max_divs, char *p, char *end,
+ -					   bool gen_flushes, u32 req_flags)
+ -{
+ -	struct test_sg_division *div = divs;
+ -	unsigned int remaining = TEST_SG_TOTAL;
+ +	/* partial update exercise */
+ +	j = 0;
+ +	for (i = 0; i < tcount; i++) {
+ +		/* alignment tests are only done with continuous buffers */
+ +		if (align_offset != 0)
+ +			break;
+  
+ -	do {
+ -		unsigned int this_len;
+ -		const char *flushtype_str;
+ +		if (template[i].np < 2)
+ +			continue;
+  
+ -		if (div == &divs[max_divs - 1] || prandom_u32() % 2 == 0)
+ -			this_len = remaining;
+ -		else
+ -			this_len = 1 + (prandom_u32() % remaining);
+ -		div->proportion_of_total = this_len;
+ +		j++;
+ +		memset(result, 0, digest_size);
+  
+ -		if (prandom_u32() % 4 == 0)
+ -			div->offset = (PAGE_SIZE - 128) + (prandom_u32() % 128);
+ -		else if (prandom_u32() % 2 == 0)
+ -			div->offset = prandom_u32() % 32;
+ -		else
+ -			div->offset = prandom_u32() % PAGE_SIZE;
+ -		if (prandom_u32() % 8 == 0)
+ -			div->offset_relative_to_alignmask = true;
+ -
+ -		div->flush_type = FLUSH_TYPE_NONE;
+ -		if (gen_flushes) {
+ -			switch (prandom_u32() % 4) {
+ -			case 0:
+ -				div->flush_type = FLUSH_TYPE_REIMPORT;
+ -				break;
+ -			case 1:
+ -				div->flush_type = FLUSH_TYPE_FLUSH;
+ -				break;
+ +		ret = -EINVAL;
+ +		hash_buff = xbuf[0];
+ +		memcpy(hash_buff, template[i].plaintext,
+ +			template[i].tap[0]);
+ +		sg_init_one(&sg[0], hash_buff, template[i].tap[0]);
+ +
+ +		if (template[i].ksize) {
+ +			crypto_ahash_clear_flags(tfm, ~0);
+ +			if (template[i].ksize > MAX_KEYLEN) {
+ +				pr_err("alg: hash: setkey failed on test %d for %s: key size %d > %d\n",
+ +					j, algo, template[i].ksize, MAX_KEYLEN);
+ +				ret = -EINVAL;
+ +				goto out;
+ +			}
+ +			memcpy(key, template[i].key, template[i].ksize);
+ +			ret = crypto_ahash_setkey(tfm, key, template[i].ksize);
+ +			if (ret) {
+ +				pr_err("alg: hash: setkey failed on test %d for %s: ret=%d\n",
+ +					j, algo, -ret);
+ +				goto out;
+  			}
+  		}
+  
+@@@ -1872,9 -3026,8 +1997,8 @@@ static int alg_test_crc32c(const struc
+  		u32 *ctx = (u32 *)shash_desc_ctx(shash);
+  
+  		shash->tfm = tfm;
+- 		shash->flags = 0;
+  
+ -		*ctx = 420553207;
+ +		*ctx = le32_to_cpu(420553207);
+  		err = crypto_shash_final(shash, (u8 *)&val);
+  		if (err) {
+  			printk(KERN_ERR "alg: crc32c: Operation failed for "
+diff --cc drivers/block/drbd/drbd_worker.c
+index 98e8c9f8fa03,6781bcf3ec26..000000000000
+--- a/drivers/block/drbd/drbd_worker.c
++++ b/drivers/block/drbd/drbd_worker.c
+@@@ -302,19 -301,19 +302,23 @@@ void drbd_csum_ee(struct crypto_ahash *
+  	struct page *page = peer_req->pages;
+  	struct page *tmp;
+  	unsigned len;
+ -	void *src;
+  
+++<<<<<<< HEAD
+ +	ahash_request_set_tfm(req, tfm);
+ +	ahash_request_set_callback(req, 0, NULL, NULL);
+++=======
++ 	desc->tfm = tfm;
+++>>>>>>> 877b5691f27a (crypto: shash - remove shash_desc::flags)
+  
+ -	crypto_shash_init(desc);
+ +	sg_init_table(&sg, 1);
+ +	crypto_ahash_init(req);
+  
+ -	src = kmap_atomic(page);
+  	while ((tmp = page_chain_next(page))) {
+  		/* all but the last page will be fully used */
+ -		crypto_shash_update(desc, src, PAGE_SIZE);
+ -		kunmap_atomic(src);
+ +		sg_set_page(&sg, page, PAGE_SIZE, 0);
+ +		ahash_request_set_crypt(req, &sg, NULL, sg.length);
+ +		crypto_ahash_update(req);
+  		page = tmp;
+ -		src = kmap_atomic(page);
+  	}
+  	/* and now the last, possibly only partially used page */
+  	len = peer_req->i.size & (PAGE_SIZE - 1);
+@@@ -331,16 -330,17 +335,20 @@@ void drbd_csum_bio(struct crypto_ahash 
+  	struct bio_vec bvec;
+  	struct bvec_iter iter;
+  
+++<<<<<<< HEAD
+ +	ahash_request_set_tfm(req, tfm);
+ +	ahash_request_set_callback(req, 0, NULL, NULL);
+++=======
++ 	desc->tfm = tfm;
+++>>>>>>> 877b5691f27a (crypto: shash - remove shash_desc::flags)
+  
+ -	crypto_shash_init(desc);
+ +	sg_init_table(&sg, 1);
+ +	crypto_ahash_init(req);
+  
+  	bio_for_each_segment(bvec, bio, iter) {
+ -		u8 *src;
+ -
+ -		src = kmap_atomic(bvec.bv_page);
+ -		crypto_shash_update(desc, src + bvec.bv_offset, bvec.bv_len);
+ -		kunmap_atomic(src);
+ -
+ +		sg_set_page(&sg, bvec.bv_page, bvec.bv_len, bvec.bv_offset);
+ +		ahash_request_set_crypt(req, &sg, NULL, sg.length);
+ +		crypto_ahash_update(req);
+  		/* REQ_OP_WRITE_SAME has only one segment,
+  		 * checksum the payload only once. */
+  		if (bio_op(bio) == REQ_OP_WRITE_SAME)
+diff --cc drivers/crypto/vmx/ghash.c
+index 2d1a8cd35509,b5a6883bb09e..000000000000
+--- a/drivers/crypto/vmx/ghash.c
++++ b/drivers/crypto/vmx/ghash.c
+@@@ -49,7 -100,8 +49,12 @@@ static int p8_ghash_init(struct shash_d
+  
+  	dctx->bytes = 0;
+  	memset(dctx->shash, 0, GHASH_DIGEST_SIZE);
+++<<<<<<< HEAD
+ +	return 0;
+++=======
++ 	dctx->fallback_desc.tfm = ctx->fallback;
++ 	return crypto_shash_init(&dctx->fallback_desc);
+++>>>>>>> 877b5691f27a (crypto: shash - remove shash_desc::flags)
+  }
+  
+  static int p8_ghash_setkey(struct crypto_shash *tfm, const u8 *key,
+diff --cc drivers/net/ppp/ppp_mppe.c
+index 6c7fd98cb00a,ff61dd8748de..000000000000
+--- a/drivers/net/ppp/ppp_mppe.c
++++ b/drivers/net/ppp/ppp_mppe.c
+@@@ -217,13 -210,20 +217,17 @@@ static void *mppe_alloc(unsigned char *
+  		goto out_free;
+  	}
+  
+ -	shash = crypto_alloc_shash("sha1", 0, 0);
+ -	if (IS_ERR(shash))
+ -		goto out_free;
+ -
+ -	state->sha1 = kmalloc(sizeof(*state->sha1) +
+ -				     crypto_shash_descsize(shash),
+ -			      GFP_KERNEL);
+ -	if (!state->sha1) {
+ -		crypto_free_shash(shash);
+ +	state->sha1 = crypto_alloc_ahash("sha1", 0, CRYPTO_ALG_ASYNC);
+ +	if (IS_ERR(state->sha1)) {
+ +		state->sha1 = NULL;
+  		goto out_free;
+  	}
+++<<<<<<< HEAD
+++=======
++ 	state->sha1->tfm = shash;
+++>>>>>>> 877b5691f27a (crypto: shash - remove shash_desc::flags)
+  
+ -	digestsize = crypto_shash_digestsize(shash);
+ +	digestsize = crypto_ahash_digestsize(state->sha1);
+  	if (digestsize < MPPE_MAX_KEY_LEN)
+  		goto out_free;
+  
+diff --cc drivers/staging/ks7010/ks_hostif.c
+index abdaf7cf8162,122d4c0af363..000000000000
+--- a/drivers/staging/ks7010/ks_hostif.c
++++ b/drivers/staging/ks7010/ks_hostif.c
+@@@ -191,6 -194,66 +191,69 @@@ static u8 read_ie(unsigned char *bp, u
+  	return size;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static int
++ michael_mic(u8 *key, u8 *data, unsigned int len, u8 priority, u8 *result)
++ {
++ 	u8 pad_data[4] = { priority, 0, 0, 0 };
++ 	struct crypto_shash *tfm = NULL;
++ 	struct shash_desc *desc = NULL;
++ 	int ret;
++ 
++ 	tfm = crypto_alloc_shash("michael_mic", 0, 0);
++ 	if (IS_ERR(tfm)) {
++ 		ret = PTR_ERR(tfm);
++ 		goto err;
++ 	}
++ 
++ 	ret = crypto_shash_setkey(tfm, key, MICHAEL_MIC_KEY_LEN);
++ 	if (ret < 0)
++ 		goto err_free_tfm;
++ 
++ 	desc = kmalloc(sizeof(*desc) + crypto_shash_descsize(tfm), GFP_KERNEL);
++ 	if (!desc) {
++ 		ret = -ENOMEM;
++ 		goto err_free_tfm;
++ 	}
++ 
++ 	desc->tfm = tfm;
++ 
++ 	ret = crypto_shash_init(desc);
++ 	if (ret < 0)
++ 		goto err_free_desc;
++ 
++ 	// Compute the MIC value
++ 	/*
++ 	 * IEEE802.11i  page 47
++ 	 * Figure 43g TKIP MIC processing format
++ 	 * +--+--+--------+--+----+--+--+--+--+--+--+--+--+
++ 	 * |6 |6 |1       |3 |M   |1 |1 |1 |1 |1 |1 |1 |1 | Octet
++ 	 * +--+--+--------+--+----+--+--+--+--+--+--+--+--+
++ 	 * |DA|SA|Priority|0 |Data|M0|M1|M2|M3|M4|M5|M6|M7|
++ 	 * +--+--+--------+--+----+--+--+--+--+--+--+--+--+
++ 	 */
++ 
++ 	ret = crypto_shash_update(desc, data, 12);
++ 	if (ret < 0)
++ 		goto err_free_desc;
++ 
++ 	ret = crypto_shash_update(desc, pad_data, 4);
++ 	if (ret < 0)
++ 		goto err_free_desc;
++ 
++ 	ret = crypto_shash_finup(desc, data + 12, len - 12, result);
++ 
++ err_free_desc:
++ 	kzfree(desc);
++ 
++ err_free_tfm:
++ 	crypto_free_shash(tfm);
++ 
++ err:
++ 	return ret;
++ }
+++>>>>>>> 877b5691f27a (crypto: shash - remove shash_desc::flags)
+  
+  static
+  int get_ap_information(struct ks_wlan_private *priv, struct ap_info *ap_info,
+diff --cc drivers/staging/rtl8192e/rtllib_crypt_tkip.c
+index ae103b0b7a2a,a084e1501f9d..000000000000
+--- a/drivers/staging/rtl8192e/rtllib_crypt_tkip.c
++++ b/drivers/staging/rtl8192e/rtllib_crypt_tkip.c
+@@@ -504,29 -500,30 +504,33 @@@ static int rtllib_tkip_decrypt(struct s
+  }
+  
+  
+ -static int michael_mic(struct crypto_shash *tfm_michael, u8 *key, u8 *hdr,
+ +static int michael_mic(struct crypto_ahash *tfm_michael, u8 *key, u8 *hdr,
+  		       u8 *data, size_t data_len, u8 *mic)
+  {
+ -	SHASH_DESC_ON_STACK(desc, tfm_michael);
+ +	AHASH_REQUEST_ON_STACK(req, tfm_michael);
+ +	struct scatterlist sg[2];
+  	int err;
+  
+++<<<<<<< HEAD
+ +	if (tfm_michael == NULL) {
+ +		pr_warn("michael_mic: tfm_michael == NULL\n");
+ +		return -1;
+ +	}
+ +	sg_init_table(sg, 2);
+ +	sg_set_buf(&sg[0], hdr, 16);
+ +	sg_set_buf(&sg[1], data, data_len);
+++=======
++ 	desc->tfm = tfm_michael;
+++>>>>>>> 877b5691f27a (crypto: shash - remove shash_desc::flags)
+  
+ -	if (crypto_shash_setkey(tfm_michael, key, 8))
+ +	if (crypto_ahash_setkey(tfm_michael, key, 8))
+  		return -1;
+  
+ -	err = crypto_shash_init(desc);
+ -	if (err)
+ -		goto out;
+ -	err = crypto_shash_update(desc, hdr, 16);
+ -	if (err)
+ -		goto out;
+ -	err = crypto_shash_update(desc, data, data_len);
+ -	if (err)
+ -		goto out;
+ -	err = crypto_shash_final(desc, mic);
+ -
+ -out:
+ -	shash_desc_zero(desc);
+ +	ahash_request_set_tfm(req, tfm_michael);
+ +	ahash_request_set_callback(req, 0, NULL, NULL);
+ +	ahash_request_set_crypt(req, sg, mic, data_len + 16);
+ +	err = crypto_ahash_digest(req);
+ +	ahash_request_zero(req);
+  	return err;
+  }
+  
+diff --cc drivers/staging/rtl8192u/ieee80211/ieee80211_crypt_tkip.c
+index a7efaae4e25a,d67bb57994c4..000000000000
+--- a/drivers/staging/rtl8192u/ieee80211/ieee80211_crypt_tkip.c
++++ b/drivers/staging/rtl8192u/ieee80211/ieee80211_crypt_tkip.c
+@@@ -500,30 -496,30 +500,34 @@@ static int ieee80211_tkip_decrypt(struc
+  	return keyidx;
+  }
+  
+ -static int michael_mic(struct crypto_shash *tfm_michael, u8 *key, u8 *hdr,
+ +static int michael_mic(struct crypto_ahash *tfm_michael, u8 *key, u8 *hdr,
+  		       u8 *data, size_t data_len, u8 *mic)
+  {
+ -	SHASH_DESC_ON_STACK(desc, tfm_michael);
+ +	AHASH_REQUEST_ON_STACK(req, tfm_michael);
+ +	struct scatterlist sg[2];
+  	int err;
+  
+++<<<<<<< HEAD
+ +	if (tfm_michael == NULL) {
+ +		printk(KERN_WARNING "michael_mic: tfm_michael == NULL\n");
+ +		return -1;
+ +	}
+++=======
++ 	desc->tfm = tfm_michael;
+++>>>>>>> 877b5691f27a (crypto: shash - remove shash_desc::flags)
+ +
+ +	sg_init_table(sg, 2);
+ +	sg_set_buf(&sg[0], hdr, 16);
+ +	sg_set_buf(&sg[1], data, data_len);
+  
+ -	if (crypto_shash_setkey(tfm_michael, key, 8))
+ +	if (crypto_ahash_setkey(tfm_michael, key, 8))
+  		return -1;
+  
+ -	err = crypto_shash_init(desc);
+ -	if (err)
+ -		goto out;
+ -	err = crypto_shash_update(desc, hdr, 16);
+ -	if (err)
+ -		goto out;
+ -	err = crypto_shash_update(desc, data, data_len);
+ -	if (err)
+ -		goto out;
+ -	err = crypto_shash_final(desc, mic);
+ -
+ -out:
+ -	shash_desc_zero(desc);
+ +	ahash_request_set_tfm(req, tfm_michael);
+ +	ahash_request_set_callback(req, 0, NULL, NULL);
+ +	ahash_request_set_crypt(req, sg, mic, data_len + 16);
+ +	err = crypto_ahash_digest(req);
+ +	ahash_request_zero(req);
+  	return err;
+  }
+  
+diff --cc fs/ubifs/replay.c
+index 85c2a43082b7,5c8a81a019a4..000000000000
+--- a/fs/ubifs/replay.c
++++ b/fs/ubifs/replay.c
+@@@ -526,6 -570,116 +526,119 @@@ static int is_last_bud(struct ubifs_inf
+  	return data == 0xFFFFFFFF;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ /* authenticate_sleb_hash and authenticate_sleb_hmac are split out for stack usage */
++ static int authenticate_sleb_hash(struct ubifs_info *c, struct shash_desc *log_hash, u8 *hash)
++ {
++ 	SHASH_DESC_ON_STACK(hash_desc, c->hash_tfm);
++ 
++ 	hash_desc->tfm = c->hash_tfm;
++ 
++ 	ubifs_shash_copy_state(c, log_hash, hash_desc);
++ 	return crypto_shash_final(hash_desc, hash);
++ }
++ 
++ static int authenticate_sleb_hmac(struct ubifs_info *c, u8 *hash, u8 *hmac)
++ {
++ 	SHASH_DESC_ON_STACK(hmac_desc, c->hmac_tfm);
++ 
++ 	hmac_desc->tfm = c->hmac_tfm;
++ 
++ 	return crypto_shash_digest(hmac_desc, hash, c->hash_len, hmac);
++ }
++ 
++ /**
++  * authenticate_sleb - authenticate one scan LEB
++  * @c: UBIFS file-system description object
++  * @sleb: the scan LEB to authenticate
++  * @log_hash:
++  * @is_last: if true, this is is the last LEB
++  *
++  * This function iterates over the buds of a single LEB authenticating all buds
++  * with the authentication nodes on this LEB. Authentication nodes are written
++  * after some buds and contain a HMAC covering the authentication node itself
++  * and the buds between the last authentication node and the current
++  * authentication node. It can happen that the last buds cannot be authenticated
++  * because a powercut happened when some nodes were written but not the
++  * corresponding authentication node. This function returns the number of nodes
++  * that could be authenticated or a negative error code.
++  */
++ static int authenticate_sleb(struct ubifs_info *c, struct ubifs_scan_leb *sleb,
++ 			     struct shash_desc *log_hash, int is_last)
++ {
++ 	int n_not_auth = 0;
++ 	struct ubifs_scan_node *snod;
++ 	int n_nodes = 0;
++ 	int err;
++ 	u8 *hash, *hmac;
++ 
++ 	if (!ubifs_authenticated(c))
++ 		return sleb->nodes_cnt;
++ 
++ 	hash = kmalloc(crypto_shash_descsize(c->hash_tfm), GFP_NOFS);
++ 	hmac = kmalloc(c->hmac_desc_len, GFP_NOFS);
++ 	if (!hash || !hmac) {
++ 		err = -ENOMEM;
++ 		goto out;
++ 	}
++ 
++ 	list_for_each_entry(snod, &sleb->nodes, list) {
++ 
++ 		n_nodes++;
++ 
++ 		if (snod->type == UBIFS_AUTH_NODE) {
++ 			struct ubifs_auth_node *auth = snod->node;
++ 
++ 			err = authenticate_sleb_hash(c, log_hash, hash);
++ 			if (err)
++ 				goto out;
++ 
++ 			err = authenticate_sleb_hmac(c, hash, hmac);
++ 			if (err)
++ 				goto out;
++ 
++ 			err = ubifs_check_hmac(c, auth->hmac, hmac);
++ 			if (err) {
++ 				err = -EPERM;
++ 				goto out;
++ 			}
++ 			n_not_auth = 0;
++ 		} else {
++ 			err = crypto_shash_update(log_hash, snod->node,
++ 						  snod->len);
++ 			if (err)
++ 				goto out;
++ 			n_not_auth++;
++ 		}
++ 	}
++ 
++ 	/*
++ 	 * A powercut can happen when some nodes were written, but not yet
++ 	 * the corresponding authentication node. This may only happen on
++ 	 * the last bud though.
++ 	 */
++ 	if (n_not_auth) {
++ 		if (is_last) {
++ 			dbg_mnt("%d unauthenticated nodes found on LEB %d, Ignoring them",
++ 				n_not_auth, sleb->lnum);
++ 			err = 0;
++ 		} else {
++ 			dbg_mnt("%d unauthenticated nodes found on non-last LEB %d",
++ 				n_not_auth, sleb->lnum);
++ 			err = -EPERM;
++ 		}
++ 	} else {
++ 		err = 0;
++ 	}
++ out:
++ 	kfree(hash);
++ 	kfree(hmac);
++ 
++ 	return err ? err : n_nodes - n_not_auth;
++ }
++ 
+++>>>>>>> 877b5691f27a (crypto: shash - remove shash_desc::flags)
+  /**
+   * replay_bud - replay a bud logical eraseblock.
+   * @c: UBIFS file-system description object
+* Unmerged path arch/x86/power/hibernate.c
+* Unmerged path crypto/adiantum.c
+* Unmerged path fs/ubifs/auth.c
+diff --git a/Documentation/crypto/api-samples.rst b/Documentation/crypto/api-samples.rst
+index 006827e30d06..bb4cf2e9c04c 100644
+--- a/Documentation/crypto/api-samples.rst
++++ b/Documentation/crypto/api-samples.rst
+@@ -133,7 +133,6 @@ Code Example For Use of Operational State Memory With SHASH
+         if (!sdesc)
+             return ERR_PTR(-ENOMEM);
+         sdesc->shash.tfm = alg;
+-        sdesc->shash.flags = 0x0;
+         return sdesc;
+     }
+ 
+diff --git a/arch/arm/crypto/ghash-ce-glue.c b/arch/arm/crypto/ghash-ce-glue.c
+index d9bb52cae2ac..3b6a3df4b86f 100644
+--- a/arch/arm/crypto/ghash-ce-glue.c
++++ b/arch/arm/crypto/ghash-ce-glue.c
+@@ -169,7 +169,6 @@ static int ghash_async_init(struct ahash_request *req)
+ 	struct crypto_shash *child = cryptd_ahash_child(cryptd_tfm);
+ 
+ 	desc->tfm = child;
+-	desc->flags = req->base.flags;
+ 	return crypto_shash_init(desc);
+ }
+ 
+@@ -226,7 +225,6 @@ static int ghash_async_digest(struct ahash_request *req)
+ 		struct crypto_shash *child = cryptd_ahash_child(cryptd_tfm);
+ 
+ 		desc->tfm = child;
+-		desc->flags = req->base.flags;
+ 		return shash_ahash_digest(req, desc);
+ 	}
+ }
+@@ -239,7 +237,6 @@ static int ghash_async_import(struct ahash_request *req, const void *in)
+ 	struct shash_desc *desc = cryptd_shash_desc(cryptd_req);
+ 
+ 	desc->tfm = cryptd_ahash_child(ctx->cryptd_tfm);
+-	desc->flags = req->base.flags;
+ 
+ 	return crypto_shash_import(desc, in);
+ }
+diff --git a/arch/x86/crypto/ghash-clmulni-intel_glue.c b/arch/x86/crypto/ghash-clmulni-intel_glue.c
+index 2ddbe3a1868b..c27af4361932 100644
+--- a/arch/x86/crypto/ghash-clmulni-intel_glue.c
++++ b/arch/x86/crypto/ghash-clmulni-intel_glue.c
+@@ -172,7 +172,6 @@ static int ghash_async_init(struct ahash_request *req)
+ 	struct crypto_shash *child = cryptd_ahash_child(cryptd_tfm);
+ 
+ 	desc->tfm = child;
+-	desc->flags = req->base.flags;
+ 	return crypto_shash_init(desc);
+ }
+ 
+@@ -252,7 +251,6 @@ static int ghash_async_digest(struct ahash_request *req)
+ 		struct crypto_shash *child = cryptd_ahash_child(cryptd_tfm);
+ 
+ 		desc->tfm = child;
+-		desc->flags = req->base.flags;
+ 		return shash_ahash_digest(req, desc);
+ 	}
+ }
+* Unmerged path arch/x86/power/hibernate.c
+* Unmerged path crypto/adiantum.c
+diff --git a/crypto/asymmetric_keys/pkcs7_verify.c b/crypto/asymmetric_keys/pkcs7_verify.c
+index 97c77f66b20d..f7b0980bf02d 100644
+--- a/crypto/asymmetric_keys/pkcs7_verify.c
++++ b/crypto/asymmetric_keys/pkcs7_verify.c
+@@ -56,7 +56,6 @@ static int pkcs7_digest(struct pkcs7_message *pkcs7,
+ 		goto error_no_desc;
+ 
+ 	desc->tfm   = tfm;
+-	desc->flags = CRYPTO_TFM_REQ_MAY_SLEEP;
+ 
+ 	/* Digest the message [RFC2315 9.3] */
+ 	ret = crypto_shash_digest(desc, pkcs7->data, pkcs7->data_len,
+diff --git a/crypto/asymmetric_keys/verify_pefile.c b/crypto/asymmetric_keys/verify_pefile.c
+index d178650fd524..f8e4a932bcfb 100644
+--- a/crypto/asymmetric_keys/verify_pefile.c
++++ b/crypto/asymmetric_keys/verify_pefile.c
+@@ -354,7 +354,6 @@ static int pefile_digest_pe(const void *pebuf, unsigned int pelen,
+ 		goto error_no_desc;
+ 
+ 	desc->tfm   = tfm;
+-	desc->flags = CRYPTO_TFM_REQ_MAY_SLEEP;
+ 	ret = crypto_shash_init(desc);
+ 	if (ret < 0)
+ 		goto error;
+diff --git a/crypto/asymmetric_keys/x509_public_key.c b/crypto/asymmetric_keys/x509_public_key.c
+index 9338b4558cdc..bd96683d8cde 100644
+--- a/crypto/asymmetric_keys/x509_public_key.c
++++ b/crypto/asymmetric_keys/x509_public_key.c
+@@ -77,7 +77,6 @@ int x509_get_sig_params(struct x509_certificate *cert)
+ 		goto error;
+ 
+ 	desc->tfm = tfm;
+-	desc->flags = CRYPTO_TFM_REQ_MAY_SLEEP;
+ 
+ 	ret = crypto_shash_digest(desc, cert->tbs, cert->tbs_size, sig->digest);
+ 	if (ret < 0)
+diff --git a/crypto/cryptd.c b/crypto/cryptd.c
+index addca7bae33f..592eecaf0e08 100644
+--- a/crypto/cryptd.c
++++ b/crypto/cryptd.c
+@@ -738,7 +738,6 @@ static void cryptd_hash_init(struct crypto_async_request *req_async, int err)
+ 		goto out;
+ 
+ 	desc->tfm = child;
+-	desc->flags = CRYPTO_TFM_REQ_MAY_SLEEP;
+ 
+ 	err = crypto_shash_init(desc);
+ 
+@@ -830,7 +829,6 @@ static void cryptd_hash_digest(struct crypto_async_request *req_async, int err)
+ 		goto out;
+ 
+ 	desc->tfm = child;
+-	desc->flags = CRYPTO_TFM_REQ_MAY_SLEEP;
+ 
+ 	err = shash_ahash_digest(req, desc);
+ 
+@@ -859,7 +857,6 @@ static int cryptd_hash_import(struct ahash_request *req, const void *in)
+ 	struct shash_desc *desc = cryptd_shash_desc(req);
+ 
+ 	desc->tfm = ctx->child;
+-	desc->flags = req->base.flags;
+ 
+ 	return crypto_shash_import(desc, in);
+ }
+diff --git a/crypto/drbg.c b/crypto/drbg.c
+index 4259a34eb6cd..32153669b002 100644
+--- a/crypto/drbg.c
++++ b/crypto/drbg.c
+@@ -1677,7 +1677,6 @@ static int drbg_init_hash_kernel(struct drbg_state *drbg)
+ 	}
+ 
+ 	sdesc->shash.tfm = tfm;
+-	sdesc->shash.flags = 0;
+ 	drbg->priv_data = sdesc;
+ 
+ 	return crypto_shash_alignmask(tfm);
+diff --git a/crypto/hmac.c b/crypto/hmac.c
+index e74730224f0a..ab84027abe38 100644
+--- a/crypto/hmac.c
++++ b/crypto/hmac.c
+@@ -57,8 +57,6 @@ static int hmac_setkey(struct crypto_shash *parent,
+ 	unsigned int i;
+ 
+ 	shash->tfm = hash;
+-	shash->flags = crypto_shash_get_flags(parent)
+-		& CRYPTO_TFM_REQ_MAY_SLEEP;
+ 
+ 	if (keylen > bs) {
+ 		int err;
+@@ -91,8 +89,6 @@ static int hmac_export(struct shash_desc *pdesc, void *out)
+ {
+ 	struct shash_desc *desc = shash_desc_ctx(pdesc);
+ 
+-	desc->flags = pdesc->flags & CRYPTO_TFM_REQ_MAY_SLEEP;
+-
+ 	return crypto_shash_export(desc, out);
+ }
+ 
+@@ -102,7 +98,6 @@ static int hmac_import(struct shash_desc *pdesc, const void *in)
+ 	struct hmac_ctx *ctx = hmac_ctx(pdesc->tfm);
+ 
+ 	desc->tfm = ctx->hash;
+-	desc->flags = pdesc->flags & CRYPTO_TFM_REQ_MAY_SLEEP;
+ 
+ 	return crypto_shash_import(desc, in);
+ }
+@@ -117,8 +112,6 @@ static int hmac_update(struct shash_desc *pdesc,
+ {
+ 	struct shash_desc *desc = shash_desc_ctx(pdesc);
+ 
+-	desc->flags = pdesc->flags & CRYPTO_TFM_REQ_MAY_SLEEP;
+-
+ 	return crypto_shash_update(desc, data, nbytes);
+ }
+ 
+@@ -130,8 +123,6 @@ static int hmac_final(struct shash_desc *pdesc, u8 *out)
+ 	char *opad = crypto_shash_ctx_aligned(parent) + ss;
+ 	struct shash_desc *desc = shash_desc_ctx(pdesc);
+ 
+-	desc->flags = pdesc->flags & CRYPTO_TFM_REQ_MAY_SLEEP;
+-
+ 	return crypto_shash_final(desc, out) ?:
+ 	       crypto_shash_import(desc, opad) ?:
+ 	       crypto_shash_finup(desc, out, ds, out);
+@@ -147,8 +138,6 @@ static int hmac_finup(struct shash_desc *pdesc, const u8 *data,
+ 	char *opad = crypto_shash_ctx_aligned(parent) + ss;
+ 	struct shash_desc *desc = shash_desc_ctx(pdesc);
+ 
+-	desc->flags = pdesc->flags & CRYPTO_TFM_REQ_MAY_SLEEP;
+-
+ 	return crypto_shash_finup(desc, data, nbytes, out) ?:
+ 	       crypto_shash_import(desc, opad) ?:
+ 	       crypto_shash_finup(desc, out, ds, out);
+diff --git a/crypto/shash.c b/crypto/shash.c
+index 86d76b5c626c..e4aef498c285 100644
+--- a/crypto/shash.c
++++ b/crypto/shash.c
+@@ -224,7 +224,6 @@ static int shash_async_init(struct ahash_request *req)
+ 	struct shash_desc *desc = ahash_request_ctx(req);
+ 
+ 	desc->tfm = *ctx;
+-	desc->flags = req->base.flags;
+ 
+ 	return crypto_shash_init(desc);
+ }
+@@ -279,7 +278,6 @@ static int shash_async_finup(struct ahash_request *req)
+ 	struct shash_desc *desc = ahash_request_ctx(req);
+ 
+ 	desc->tfm = *ctx;
+-	desc->flags = req->base.flags;
+ 
+ 	return shash_ahash_finup(req, desc);
+ }
+@@ -315,7 +313,6 @@ static int shash_async_digest(struct ahash_request *req)
+ 	struct shash_desc *desc = ahash_request_ctx(req);
+ 
+ 	desc->tfm = *ctx;
+-	desc->flags = req->base.flags;
+ 
+ 	return shash_ahash_digest(req, desc);
+ }
+@@ -331,7 +328,6 @@ static int shash_async_import(struct ahash_request *req, const void *in)
+ 	struct shash_desc *desc = ahash_request_ctx(req);
+ 
+ 	desc->tfm = *ctx;
+-	desc->flags = req->base.flags;
+ 
+ 	return crypto_shash_import(desc, in);
+ }
+* Unmerged path crypto/testmgr.c
+diff --git a/drivers/block/drbd/drbd_receiver.c b/drivers/block/drbd/drbd_receiver.c
+index 75f6b47169e6..af3c959f4b0d 100644
+--- a/drivers/block/drbd/drbd_receiver.c
++++ b/drivers/block/drbd/drbd_receiver.c
+@@ -5253,7 +5253,6 @@ static int drbd_do_auth(struct drbd_connection *connection)
+ 	rcu_read_unlock();
+ 
+ 	desc->tfm = connection->cram_hmac_tfm;
+-	desc->flags = 0;
+ 
+ 	rv = crypto_shash_setkey(connection->cram_hmac_tfm, (u8 *)secret, key_len);
+ 	if (rv) {
+* Unmerged path drivers/block/drbd/drbd_worker.c
+diff --git a/drivers/crypto/axis/artpec6_crypto.c b/drivers/crypto/axis/artpec6_crypto.c
+index 0fb8bbf41a8d..babd5e2d36df 100644
+--- a/drivers/crypto/axis/artpec6_crypto.c
++++ b/drivers/crypto/axis/artpec6_crypto.c
+@@ -2229,8 +2229,6 @@ artpec6_crypto_hash_set_key(struct crypto_ahash *tfm,
+ 		SHASH_DESC_ON_STACK(hdesc, tfm_ctx->child_hash);
+ 
+ 		hdesc->tfm = tfm_ctx->child_hash;
+-		hdesc->flags = crypto_ahash_get_flags(tfm) &
+-			       CRYPTO_TFM_REQ_MAY_SLEEP;
+ 
+ 		tfm_ctx->hmac_key_length = blocksize;
+ 		ret = crypto_shash_digest(hdesc, key, keylen,
+diff --git a/drivers/crypto/bcm/cipher.c b/drivers/crypto/bcm/cipher.c
+index 281af5b4cad8..02c48253a96f 100644
+--- a/drivers/crypto/bcm/cipher.c
++++ b/drivers/crypto/bcm/cipher.c
+@@ -2144,7 +2144,6 @@ static int ahash_init(struct ahash_request *req)
+ 			goto err_hash;
+ 		}
+ 		ctx->shash->tfm = hash;
+-		ctx->shash->flags = 0;
+ 
+ 		/* Set the key using data we already have from setkey */
+ 		if (ctx->authkeylen > 0) {
+diff --git a/drivers/crypto/bcm/util.c b/drivers/crypto/bcm/util.c
+index a912c6ad3e85..4f48555ed7b6 100644
+--- a/drivers/crypto/bcm/util.c
++++ b/drivers/crypto/bcm/util.c
+@@ -282,7 +282,6 @@ int do_shash(unsigned char *name, unsigned char *result,
+ 		goto do_shash_err;
+ 	}
+ 	sdesc->shash.tfm = hash;
+-	sdesc->shash.flags = 0x0;
+ 
+ 	if (key_len > 0) {
+ 		rc = crypto_shash_setkey(hash, key, key_len);
+diff --git a/drivers/crypto/ccp/ccp-crypto-sha.c b/drivers/crypto/ccp/ccp-crypto-sha.c
+index 268132dc0d84..13c911d75fde 100644
+--- a/drivers/crypto/ccp/ccp-crypto-sha.c
++++ b/drivers/crypto/ccp/ccp-crypto-sha.c
+@@ -290,8 +290,6 @@ static int ccp_sha_setkey(struct crypto_ahash *tfm, const u8 *key,
+ 	if (key_len > block_size) {
+ 		/* Must hash the input key */
+ 		sdesc->tfm = shash;
+-		sdesc->flags = crypto_ahash_get_flags(tfm) &
+-			CRYPTO_TFM_REQ_MAY_SLEEP;
+ 
+ 		ret = crypto_shash_digest(sdesc, key, key_len,
+ 					  ctx->u.sha.key);
+diff --git a/drivers/crypto/chelsio/chcr_algo.c b/drivers/crypto/chelsio/chcr_algo.c
+index 221e80097813..30ccdb82a927 100644
+--- a/drivers/crypto/chelsio/chcr_algo.c
++++ b/drivers/crypto/chelsio/chcr_algo.c
+@@ -2122,7 +2122,6 @@ static int chcr_ahash_setkey(struct crypto_ahash *tfm, const u8 *key,
+ 	 * ipad in hmacctx->ipad and opad in hmacctx->opad location
+ 	 */
+ 	shash->tfm = hmacctx->base_hash;
+-	shash->flags = crypto_shash_get_flags(hmacctx->base_hash);
+ 	if (keylen > bs) {
+ 		err = crypto_shash_digest(shash, key, keylen,
+ 					  hmacctx->ipad);
+@@ -3509,7 +3508,6 @@ static int chcr_authenc_setkey(struct crypto_aead *authenc, const u8 *key,
+ 		SHASH_DESC_ON_STACK(shash, base_hash);
+ 
+ 		shash->tfm = base_hash;
+-		shash->flags = crypto_shash_get_flags(base_hash);
+ 		bs = crypto_shash_blocksize(base_hash);
+ 		align = KEYCTX_ALIGN_PAD(max_authsize);
+ 		o_ptr =  actx->h_iopad + param.result_size + align;
+diff --git a/drivers/crypto/mediatek/mtk-sha.c b/drivers/crypto/mediatek/mtk-sha.c
+index 5f4f845adbb8..a0806ba40c68 100644
+--- a/drivers/crypto/mediatek/mtk-sha.c
++++ b/drivers/crypto/mediatek/mtk-sha.c
+@@ -365,7 +365,6 @@ static int mtk_sha_finish_hmac(struct ahash_request *req)
+ 	SHASH_DESC_ON_STACK(shash, bctx->shash);
+ 
+ 	shash->tfm = bctx->shash;
+-	shash->flags = 0; /* not CRYPTO_TFM_REQ_MAY_SLEEP */
+ 
+ 	return crypto_shash_init(shash) ?:
+ 	       crypto_shash_update(shash, bctx->opad, ctx->bs) ?:
+@@ -810,8 +809,6 @@ static int mtk_sha_setkey(struct crypto_ahash *tfm, const u8 *key,
+ 	SHASH_DESC_ON_STACK(shash, bctx->shash);
+ 
+ 	shash->tfm = bctx->shash;
+-	shash->flags = crypto_shash_get_flags(bctx->shash) &
+-		       CRYPTO_TFM_REQ_MAY_SLEEP;
+ 
+ 	if (keylen > bs) {
+ 		err = crypto_shash_digest(shash, key, keylen, bctx->ipad);
+diff --git a/drivers/crypto/n2_core.c b/drivers/crypto/n2_core.c
+index 8030bb60fb1c..94f7034fa506 100644
+--- a/drivers/crypto/n2_core.c
++++ b/drivers/crypto/n2_core.c
+@@ -469,8 +469,6 @@ static int n2_hmac_async_setkey(struct crypto_ahash *tfm, const u8 *key,
+ 		return err;
+ 
+ 	shash->tfm = child_shash;
+-	shash->flags = crypto_ahash_get_flags(tfm) &
+-		CRYPTO_TFM_REQ_MAY_SLEEP;
+ 
+ 	bs = crypto_shash_blocksize(child_shash);
+ 	ds = crypto_shash_digestsize(child_shash);
+diff --git a/drivers/crypto/omap-sham.c b/drivers/crypto/omap-sham.c
+index d1a1c74fb56a..16c40f488809 100644
+--- a/drivers/crypto/omap-sham.c
++++ b/drivers/crypto/omap-sham.c
+@@ -1055,7 +1055,6 @@ static int omap_sham_finish_hmac(struct ahash_request *req)
+ 	SHASH_DESC_ON_STACK(shash, bctx->shash);
+ 
+ 	shash->tfm = bctx->shash;
+-	shash->flags = 0; /* not CRYPTO_TFM_REQ_MAY_SLEEP */
+ 
+ 	return crypto_shash_init(shash) ?:
+ 	       crypto_shash_update(shash, bctx->opad, bs) ?:
+@@ -1226,7 +1225,6 @@ static int omap_sham_shash_digest(struct crypto_shash *tfm, u32 flags,
+ 	SHASH_DESC_ON_STACK(shash, tfm);
+ 
+ 	shash->tfm = tfm;
+-	shash->flags = flags & CRYPTO_TFM_REQ_MAY_SLEEP;
+ 
+ 	return crypto_shash_digest(shash, data, len, out);
+ }
+diff --git a/drivers/crypto/padlock-sha.c b/drivers/crypto/padlock-sha.c
+index d32c79328876..5a8a498f38bb 100644
+--- a/drivers/crypto/padlock-sha.c
++++ b/drivers/crypto/padlock-sha.c
+@@ -39,7 +39,6 @@ static int padlock_sha_init(struct shash_desc *desc)
+ 	struct padlock_sha_ctx *ctx = crypto_shash_ctx(desc->tfm);
+ 
+ 	dctx->fallback.tfm = ctx->fallback;
+-	dctx->fallback.flags = desc->flags & CRYPTO_TFM_REQ_MAY_SLEEP;
+ 	return crypto_shash_init(&dctx->fallback);
+ }
+ 
+@@ -48,7 +47,6 @@ static int padlock_sha_update(struct shash_desc *desc,
+ {
+ 	struct padlock_sha_desc *dctx = shash_desc_ctx(desc);
+ 
+-	dctx->fallback.flags = desc->flags & CRYPTO_TFM_REQ_MAY_SLEEP;
+ 	return crypto_shash_update(&dctx->fallback, data, length);
+ }
+ 
+@@ -65,7 +63,6 @@ static int padlock_sha_import(struct shash_desc *desc, const void *in)
+ 	struct padlock_sha_ctx *ctx = crypto_shash_ctx(desc->tfm);
+ 
+ 	dctx->fallback.tfm = ctx->fallback;
+-	dctx->fallback.flags = desc->flags & CRYPTO_TFM_REQ_MAY_SLEEP;
+ 	return crypto_shash_import(&dctx->fallback, in);
+ }
+ 
+@@ -91,7 +88,6 @@ static int padlock_sha1_finup(struct shash_desc *desc, const u8 *in,
+ 	unsigned int leftover;
+ 	int err;
+ 
+-	dctx->fallback.flags = desc->flags & CRYPTO_TFM_REQ_MAY_SLEEP;
+ 	err = crypto_shash_export(&dctx->fallback, &state);
+ 	if (err)
+ 		goto out;
+@@ -153,7 +149,6 @@ static int padlock_sha256_finup(struct shash_desc *desc, const u8 *in,
+ 	unsigned int leftover;
+ 	int err;
+ 
+-	dctx->fallback.flags = desc->flags & CRYPTO_TFM_REQ_MAY_SLEEP;
+ 	err = crypto_shash_export(&dctx->fallback, &state);
+ 	if (err)
+ 		goto out;
+diff --git a/drivers/crypto/qat/qat_common/qat_algs.c b/drivers/crypto/qat/qat_common/qat_algs.c
+index 975c75198f56..c8d401646902 100644
+--- a/drivers/crypto/qat/qat_common/qat_algs.c
++++ b/drivers/crypto/qat/qat_common/qat_algs.c
+@@ -164,7 +164,6 @@ static int qat_alg_do_precomputes(struct icp_qat_hw_auth_algo_blk *hash,
+ 	memset(ctx->ipad, 0, block_size);
+ 	memset(ctx->opad, 0, block_size);
+ 	shash->tfm = ctx->hash_tfm;
+-	shash->flags = 0x0;
+ 
+ 	if (auth_keylen > block_size) {
+ 		int ret = crypto_shash_digest(shash, auth_key,
+diff --git a/drivers/crypto/s5p-sss.c b/drivers/crypto/s5p-sss.c
+index bf7163042569..efa563f0fd62 100644
+--- a/drivers/crypto/s5p-sss.c
++++ b/drivers/crypto/s5p-sss.c
+@@ -1528,7 +1528,6 @@ static int s5p_hash_shash_digest(struct crypto_shash *tfm, u32 flags,
+ 	SHASH_DESC_ON_STACK(shash, tfm);
+ 
+ 	shash->tfm = tfm;
+-	shash->flags = flags & ~CRYPTO_TFM_REQ_MAY_SLEEP;
+ 
+ 	return crypto_shash_digest(shash, data, len, out);
+ }
+* Unmerged path drivers/crypto/vmx/ghash.c
+diff --git a/drivers/infiniband/sw/rxe/rxe.h b/drivers/infiniband/sw/rxe/rxe.h
+index 2b875875962f..1bcc124bab57 100644
+--- a/drivers/infiniband/sw/rxe/rxe.h
++++ b/drivers/infiniband/sw/rxe/rxe.h
+@@ -80,7 +80,6 @@ static inline u32 rxe_crc32(struct rxe_dev *rxe,
+ 	SHASH_DESC_ON_STACK(shash, rxe->tfm);
+ 
+ 	shash->tfm = rxe->tfm;
+-	shash->flags = 0;
+ 	*(u32 *)shash_desc_ctx(shash) = crc;
+ 	err = crypto_shash_update(shash, next, len);
+ 	if (unlikely(err)) {
+diff --git a/drivers/md/dm-crypt.c b/drivers/md/dm-crypt.c
+index 93902cb15f57..3dba38657cf7 100644
+--- a/drivers/md/dm-crypt.c
++++ b/drivers/md/dm-crypt.c
+@@ -329,7 +329,6 @@ static int crypt_iv_essiv_init(struct crypt_config *cc)
+ 	int err;
+ 
+ 	desc->tfm = essiv->hash_tfm;
+-	desc->flags = 0;
+ 
+ 	err = crypto_shash_digest(desc, cc->key, cc->key_size, essiv->salt);
+ 	shash_desc_zero(desc);
+@@ -603,7 +602,6 @@ static int crypt_iv_lmk_one(struct crypt_config *cc, u8 *iv,
+ 	int i, r;
+ 
+ 	desc->tfm = lmk->hash_tfm;
+-	desc->flags = 0;
+ 
+ 	r = crypto_shash_init(desc);
+ 	if (r)
+@@ -765,7 +763,6 @@ static int crypt_iv_tcw_whitening(struct crypt_config *cc,
+ 
+ 	/* calculate crc32 for every 32bit part and xor it */
+ 	desc->tfm = tcw->crc32_tfm;
+-	desc->flags = 0;
+ 	for (i = 0; i < 4; i++) {
+ 		r = crypto_shash_init(desc);
+ 		if (r)
+diff --git a/drivers/md/dm-integrity.c b/drivers/md/dm-integrity.c
+index 387202f58069..b5db27f76eb6 100644
+--- a/drivers/md/dm-integrity.c
++++ b/drivers/md/dm-integrity.c
+@@ -528,7 +528,6 @@ static void section_mac(struct dm_integrity_c *ic, unsigned section, __u8 result
+ 	unsigned j, size;
+ 
+ 	desc->tfm = ic->journal_mac;
+-	desc->flags = 0;
+ 
+ 	r = crypto_shash_init(desc);
+ 	if (unlikely(r)) {
+@@ -1272,7 +1271,6 @@ static void integrity_sector_checksum(struct dm_integrity_c *ic, sector_t sector
+ 	unsigned digest_size;
+ 
+ 	req->tfm = ic->internal_hash;
+-	req->flags = 0;
+ 
+ 	r = crypto_shash_init(req);
+ 	if (unlikely(r < 0)) {
+* Unmerged path drivers/net/ppp/ppp_mppe.c
+diff --git a/drivers/net/wireless/intersil/orinoco/mic.c b/drivers/net/wireless/intersil/orinoco/mic.c
+index 08bc7822f820..2cd826fb0f85 100644
+--- a/drivers/net/wireless/intersil/orinoco/mic.c
++++ b/drivers/net/wireless/intersil/orinoco/mic.c
+@@ -67,7 +67,6 @@ int orinoco_mic(struct crypto_shash *tfm_michael, u8 *key,
+ 	hdr[ETH_ALEN * 2 + 3] = 0;
+ 
+ 	desc->tfm = tfm_michael;
+-	desc->flags = 0;
+ 
+ 	err = crypto_shash_setkey(tfm_michael, key, MIC_KEYLEN);
+ 	if (err)
+diff --git a/drivers/nfc/s3fwrn5/firmware.c b/drivers/nfc/s3fwrn5/firmware.c
+index b7828fb252f2..b681073ae8ba 100644
+--- a/drivers/nfc/s3fwrn5/firmware.c
++++ b/drivers/nfc/s3fwrn5/firmware.c
+@@ -449,7 +449,6 @@ int s3fwrn5_fw_download(struct s3fwrn5_fw_info *fw_info)
+ 		SHASH_DESC_ON_STACK(desc, tfm);
+ 
+ 		desc->tfm = tfm;
+-		desc->flags = CRYPTO_TFM_REQ_MAY_SLEEP;
+ 
+ 		ret = crypto_shash_digest(desc, fw->image, image_size,
+ 					  hash_data);
+* Unmerged path drivers/staging/ks7010/ks_hostif.c
+* Unmerged path drivers/staging/rtl8192e/rtllib_crypt_tkip.c
+* Unmerged path drivers/staging/rtl8192u/ieee80211/ieee80211_crypt_tkip.c
+diff --git a/drivers/target/iscsi/iscsi_target_auth.c b/drivers/target/iscsi/iscsi_target_auth.c
+index 1fa4870a51fd..859bf4f2d4a0 100644
+--- a/drivers/target/iscsi/iscsi_target_auth.c
++++ b/drivers/target/iscsi/iscsi_target_auth.c
+@@ -332,7 +332,6 @@ static int chap_server_compute_hash(
+ 	}
+ 
+ 	desc->tfm = tfm;
+-	desc->flags = 0;
+ 
+ 	ret = crypto_shash_init(desc);
+ 	if (ret < 0) {
+diff --git a/drivers/thunderbolt/domain.c b/drivers/thunderbolt/domain.c
+index 7416bdbd8576..b7980c856898 100644
+--- a/drivers/thunderbolt/domain.c
++++ b/drivers/thunderbolt/domain.c
+@@ -678,7 +678,6 @@ int tb_domain_challenge_switch_key(struct tb *tb, struct tb_switch *sw)
+ 	}
+ 
+ 	shash->tfm = tfm;
+-	shash->flags = CRYPTO_TFM_REQ_MAY_SLEEP;
+ 
+ 	memset(hmac, 0, sizeof(hmac));
+ 	ret = crypto_shash_digest(shash, challenge, sizeof(hmac), hmac);
+diff --git a/fs/cifs/misc.c b/fs/cifs/misc.c
+index 2e680ebc73cb..65c308164166 100644
+--- a/fs/cifs/misc.c
++++ b/fs/cifs/misc.c
+@@ -960,7 +960,6 @@ cifs_alloc_hash(const char *name,
+ 	}
+ 
+ 	(*sdesc)->shash.tfm = *shash;
+-	(*sdesc)->shash.flags = 0x0;
+ 	return 0;
+ }
+ 
+diff --git a/fs/crypto/keyinfo.c b/fs/crypto/keyinfo.c
+index e997ca51192f..815dfb7d5851 100644
+--- a/fs/crypto/keyinfo.c
++++ b/fs/crypto/keyinfo.c
+@@ -243,7 +243,6 @@ static int derive_essiv_salt(const u8 *key, int keysize, u8 *salt)
+ 	{
+ 		SHASH_DESC_ON_STACK(desc, tfm);
+ 		desc->tfm = tfm;
+-		desc->flags = 0;
+ 
+ 		return crypto_shash_digest(desc, key, keysize, salt);
+ 	}
+diff --git a/fs/ecryptfs/crypto.c b/fs/ecryptfs/crypto.c
+index 4dd842f72846..c40f41ae36fd 100644
+--- a/fs/ecryptfs/crypto.c
++++ b/fs/ecryptfs/crypto.c
+@@ -68,7 +68,6 @@ static int ecryptfs_hash_digest(struct crypto_shash *tfm,
+ 	int err;
+ 
+ 	desc->tfm = tfm;
+-	desc->flags = CRYPTO_TFM_REQ_MAY_SLEEP;
+ 	err = crypto_shash_digest(desc, src, len, dst);
+ 	shash_desc_zero(desc);
+ 	return err;
+diff --git a/fs/ecryptfs/keystore.c b/fs/ecryptfs/keystore.c
+index e74fe84d0886..90fbac5d485b 100644
+--- a/fs/ecryptfs/keystore.c
++++ b/fs/ecryptfs/keystore.c
+@@ -769,7 +769,6 @@ ecryptfs_write_tag_70_packet(char *dest, size_t *remaining_bytes,
+ 	}
+ 
+ 	s->hash_desc->tfm = s->hash_tfm;
+-	s->hash_desc->flags = CRYPTO_TFM_REQ_MAY_SLEEP;
+ 
+ 	rc = crypto_shash_digest(s->hash_desc,
+ 				 (u8 *)s->auth_tok->token.password.session_key_encryption_key,
+diff --git a/fs/ext4/ext4.h b/fs/ext4/ext4.h
+index 7cd74705e70e..cd43f012a885 100644
+--- a/fs/ext4/ext4.h
++++ b/fs/ext4/ext4.h
+@@ -2020,7 +2020,6 @@ static inline u32 ext4_chksum(struct ext4_sb_info *sbi, u32 crc,
+ 	BUG_ON(crypto_shash_descsize(sbi->s_chksum_driver)!=sizeof(desc.ctx));
+ 
+ 	desc.shash.tfm = sbi->s_chksum_driver;
+-	desc.shash.flags = 0;
+ 	*(u32 *)desc.ctx = crc;
+ 
+ 	BUG_ON(crypto_shash_update(&desc.shash, address, length));
+diff --git a/fs/f2fs/f2fs.h b/fs/f2fs/f2fs.h
+index 2f6775e2be4b..568f6ba2f36d 100644
+--- a/fs/f2fs/f2fs.h
++++ b/fs/f2fs/f2fs.h
+@@ -1337,7 +1337,6 @@ static inline u32 __f2fs_crc32(struct f2fs_sb_info *sbi, u32 crc,
+ 	BUG_ON(crypto_shash_descsize(sbi->s_chksum_driver) != sizeof(desc.ctx));
+ 
+ 	desc.shash.tfm = sbi->s_chksum_driver;
+-	desc.shash.flags = 0;
+ 	*(u32 *)desc.ctx = crc;
+ 
+ 	err = crypto_shash_update(&desc.shash, address, length);
+diff --git a/fs/nfsd/nfs4recover.c b/fs/nfsd/nfs4recover.c
+index 5188f9f70c78..8c8563441208 100644
+--- a/fs/nfsd/nfs4recover.c
++++ b/fs/nfsd/nfs4recover.c
+@@ -126,7 +126,6 @@ nfs4_make_rec_clidname(char *dname, const struct xdr_netobj *clname)
+ 		SHASH_DESC_ON_STACK(desc, tfm);
+ 
+ 		desc->tfm = tfm;
+-		desc->flags = CRYPTO_TFM_REQ_MAY_SLEEP;
+ 
+ 		status = crypto_shash_digest(desc, clname->data, clname->len,
+ 					     cksum.data);
+* Unmerged path fs/ubifs/auth.c
+* Unmerged path fs/ubifs/replay.c
+diff --git a/include/crypto/hash.h b/include/crypto/hash.h
+index 21587011ab0f..ab3f0c474aaa 100644
+--- a/include/crypto/hash.h
++++ b/include/crypto/hash.h
+@@ -146,8 +146,6 @@ struct ahash_alg {
+ 
+ struct shash_desc {
+ 	struct crypto_shash *tfm;
+-	u32 flags;
+-
+ 	void *__ctx[] CRYPTO_MINALIGN_ATTR;
+ };
+ 
+@@ -811,6 +809,7 @@ static inline void *shash_desc_ctx(struct shash_desc *desc)
+  * cipher handle must point to a keyed message digest cipher in order for this
+  * function to succeed.
+  *
++ * Context: Any context.
+  * Return: 0 if the setting of the key was successful; < 0 if an error occurred
+  */
+ int crypto_shash_setkey(struct crypto_shash *tfm, const u8 *key,
+@@ -827,6 +826,7 @@ int crypto_shash_setkey(struct crypto_shash *tfm, const u8 *key,
+  * crypto_shash_update and crypto_shash_final. The parameters have the same
+  * meaning as discussed for those separate three functions.
+  *
++ * Context: Any context.
+  * Return: 0 if the message digest creation was successful; < 0 if an error
+  *	   occurred
+  */
+@@ -842,6 +842,7 @@ int crypto_shash_digest(struct shash_desc *desc, const u8 *data,
+  * caller-allocated output buffer out which must have sufficient size (e.g. by
+  * calling crypto_shash_descsize).
+  *
++ * Context: Any context.
+  * Return: 0 if the export creation was successful; < 0 if an error occurred
+  */
+ static inline int crypto_shash_export(struct shash_desc *desc, void *out)
+@@ -858,6 +859,7 @@ static inline int crypto_shash_export(struct shash_desc *desc, void *out)
+  * the input buffer. That buffer should have been generated with the
+  * crypto_ahash_export function.
+  *
++ * Context: Any context.
+  * Return: 0 if the import was successful; < 0 if an error occurred
+  */
+ static inline int crypto_shash_import(struct shash_desc *desc, const void *in)
+@@ -878,6 +880,7 @@ static inline int crypto_shash_import(struct shash_desc *desc, const void *in)
+  * operational state handle. Any potentially existing state created by
+  * previous operations is discarded.
+  *
++ * Context: Any context.
+  * Return: 0 if the message digest initialization was successful; < 0 if an
+  *	   error occurred
+  */
+@@ -899,6 +902,7 @@ static inline int crypto_shash_init(struct shash_desc *desc)
+  *
+  * Updates the message digest state of the operational state handle.
+  *
++ * Context: Any context.
+  * Return: 0 if the message digest update was successful; < 0 if an error
+  *	   occurred
+  */
+@@ -915,6 +919,7 @@ int crypto_shash_update(struct shash_desc *desc, const u8 *data,
+  * into the output buffer. The caller must ensure that the output buffer is
+  * large enough by using crypto_shash_digestsize.
+  *
++ * Context: Any context.
+  * Return: 0 if the message digest creation was successful; < 0 if an error
+  *	   occurred
+  */
+@@ -931,6 +936,7 @@ int crypto_shash_final(struct shash_desc *desc, u8 *out);
+  * crypto_shash_update and crypto_shash_final. The parameters have the same
+  * meaning as discussed for those separate functions.
+  *
++ * Context: Any context.
+  * Return: 0 if the message digest creation was successful; < 0 if an error
+  *	   occurred
+  */
+diff --git a/include/linux/jbd2.h b/include/linux/jbd2.h
+index e5b81a07ccb6..e51c23fcb80f 100644
+--- a/include/linux/jbd2.h
++++ b/include/linux/jbd2.h
+@@ -1630,7 +1630,6 @@ static inline u32 jbd2_chksum(journal_t *journal, u32 crc,
+ 		JBD_MAX_CHECKSUM_SIZE);
+ 
+ 	desc.shash.tfm = journal->j_chksum_driver;
+-	desc.shash.flags = 0;
+ 	*(u32 *)desc.ctx = crc;
+ 
+ 	err = crypto_shash_update(&desc.shash, address, length);
+diff --git a/kernel/kexec_file.c b/kernel/kexec_file.c
+index 80f8af3c1ebb..f6cc2224e9cc 100644
+--- a/kernel/kexec_file.c
++++ b/kernel/kexec_file.c
+@@ -690,7 +690,6 @@ static int kexec_calculate_store_digests(struct kimage *image)
+ 		goto out_free_desc;
+ 
+ 	desc->tfm   = tfm;
+-	desc->flags = 0;
+ 
+ 	ret = crypto_shash_init(desc);
+ 	if (ret < 0)
+diff --git a/lib/crc-t10dif.c b/lib/crc-t10dif.c
+index 4d0d47c1ffbd..e89ebfdbb0fc 100644
+--- a/lib/crc-t10dif.c
++++ b/lib/crc-t10dif.c
+@@ -69,7 +69,6 @@ __u16 crc_t10dif_update(__u16 crc, const unsigned char *buffer, size_t len)
+ 
+ 	rcu_read_lock();
+ 	desc.shash.tfm = rcu_dereference(crct10dif_tfm);
+-	desc.shash.flags = 0;
+ 	*(__u16 *)desc.ctx = crc;
+ 
+ 	err = crypto_shash_update(&desc.shash, buffer, len);
+diff --git a/lib/digsig.c b/lib/digsig.c
+index 1ca9399239a0..3cf89c775ab2 100644
+--- a/lib/digsig.c
++++ b/lib/digsig.c
+@@ -237,7 +237,6 @@ int digsig_verify(struct key *keyring, const char *sig, int siglen,
+ 		goto err;
+ 
+ 	desc->tfm = shash;
+-	desc->flags = CRYPTO_TFM_REQ_MAY_SLEEP;
+ 
+ 	crypto_shash_init(desc);
+ 	crypto_shash_update(desc, data, datalen);
+diff --git a/lib/libcrc32c.c b/lib/libcrc32c.c
+index f0a2934605bf..4e9829c4d64c 100644
+--- a/lib/libcrc32c.c
++++ b/lib/libcrc32c.c
+@@ -47,7 +47,6 @@ u32 crc32c(u32 crc, const void *address, unsigned int length)
+ 	int err;
+ 
+ 	shash->tfm = tfm;
+-	shash->flags = 0;
+ 	*ctx = crc;
+ 
+ 	err = crypto_shash_update(shash, address, length);
+diff --git a/net/bluetooth/amp.c b/net/bluetooth/amp.c
+index 78bec8df8525..aaa39409eeb7 100644
+--- a/net/bluetooth/amp.c
++++ b/net/bluetooth/amp.c
+@@ -161,7 +161,6 @@ static int hmac_sha256(u8 *key, u8 ksize, char *plaintext, u8 psize, u8 *output)
+ 	}
+ 
+ 	shash->tfm = tfm;
+-	shash->flags = CRYPTO_TFM_REQ_MAY_SLEEP;
+ 
+ 	ret = crypto_shash_digest(shash, plaintext, psize, output);
+ 
+diff --git a/net/bluetooth/smp.c b/net/bluetooth/smp.c
+index ae91e2d40056..aeb6be7d8367 100644
+--- a/net/bluetooth/smp.c
++++ b/net/bluetooth/smp.c
+@@ -185,7 +185,6 @@ static int aes_cmac(struct crypto_shash *tfm, const u8 k[16], const u8 *m,
+ 	}
+ 
+ 	desc->tfm = tfm;
+-	desc->flags = 0;
+ 
+ 	/* Swap key and message from LSB to MSB */
+ 	swap_buf(k, tmp, 16);
+diff --git a/net/sctp/auth.c b/net/sctp/auth.c
+index 530e602e9298..20d82cb7747f 100644
+--- a/net/sctp/auth.c
++++ b/net/sctp/auth.c
+@@ -760,7 +760,6 @@ void sctp_auth_calculate_hmac(const struct sctp_association *asoc,
+ 		SHASH_DESC_ON_STACK(desc, tfm);
+ 
+ 		desc->tfm = tfm;
+-		desc->flags = 0;
+ 		crypto_shash_digest(desc, (u8 *)auth,
+ 				    end - (unsigned char *)auth, digest);
+ 		shash_desc_zero(desc);
+diff --git a/net/sctp/sm_make_chunk.c b/net/sctp/sm_make_chunk.c
+index 4997823ac12c..3bf39c2613b9 100644
+--- a/net/sctp/sm_make_chunk.c
++++ b/net/sctp/sm_make_chunk.c
+@@ -1686,7 +1686,6 @@ static struct sctp_cookie_param *sctp_pack_cookie(
+ 
+ 		/* Sign the message.  */
+ 		desc->tfm = sctp_sk(ep->base.sk)->hmac;
+-		desc->flags = 0;
+ 
+ 		err = crypto_shash_setkey(desc->tfm, ep->secret_key,
+ 					  sizeof(ep->secret_key)) ?:
+@@ -1757,7 +1756,6 @@ struct sctp_association *sctp_unpack_cookie(
+ 		int err;
+ 
+ 		desc->tfm = sctp_sk(ep->base.sk)->hmac;
+-		desc->flags = 0;
+ 
+ 		err = crypto_shash_setkey(desc->tfm, ep->secret_key,
+ 					  sizeof(ep->secret_key)) ?:
+diff --git a/net/sunrpc/auth_gss/gss_krb5_crypto.c b/net/sunrpc/auth_gss/gss_krb5_crypto.c
+index 0220e1ca5280..00ac23e974df 100644
+--- a/net/sunrpc/auth_gss/gss_krb5_crypto.c
++++ b/net/sunrpc/auth_gss/gss_krb5_crypto.c
+@@ -974,7 +974,6 @@ krb5_rc4_setup_seq_key(struct krb5_ctx *kctx, struct crypto_skcipher *cipher,
+ 	}
+ 
+ 	desc->tfm = hmac;
+-	desc->flags = 0;
+ 
+ 	/* Compute intermediate Kseq from session key */
+ 	err = crypto_shash_setkey(hmac, kctx->Ksess, kctx->gk5e->keylength);
+@@ -1041,7 +1040,6 @@ krb5_rc4_setup_enc_key(struct krb5_ctx *kctx, struct crypto_skcipher *cipher,
+ 	}
+ 
+ 	desc->tfm = hmac;
+-	desc->flags = 0;
+ 
+ 	/* Compute intermediate Kcrypt from session key */
+ 	for (i = 0; i < kctx->gk5e->keylength; i++)
+diff --git a/net/sunrpc/auth_gss/gss_krb5_mech.c b/net/sunrpc/auth_gss/gss_krb5_mech.c
+index 5ae60f1213f8..0e8fb393e3bc 100644
+--- a/net/sunrpc/auth_gss/gss_krb5_mech.c
++++ b/net/sunrpc/auth_gss/gss_krb5_mech.c
+@@ -464,7 +464,6 @@ context_derive_keys_rc4(struct krb5_ctx *ctx)
+ 	}
+ 
+ 	desc->tfm = hmac;
+-	desc->flags = 0;
+ 
+ 	err = crypto_shash_digest(desc, sigkeyconstant, slen, ctx->cksum);
+ 	kzfree(desc);
+diff --git a/security/apparmor/crypto.c b/security/apparmor/crypto.c
+index 6c62d719a944..023d66e32a2f 100644
+--- a/security/apparmor/crypto.c
++++ b/security/apparmor/crypto.c
+@@ -39,7 +39,6 @@ char *aa_calc_hash(void *data, size_t len)
+ 		goto fail;
+ 
+ 	desc->tfm = apparmor_tfm;
+-	desc->flags = 0;
+ 
+ 	error = crypto_shash_init(desc);
+ 	if (error)
+@@ -77,7 +76,6 @@ int aa_calc_profile_hash(struct aa_profile *profile, u32 version, void *start,
+ 		goto fail;
+ 
+ 	desc->tfm = apparmor_tfm;
+-	desc->flags = 0;
+ 
+ 	error = crypto_shash_init(desc);
+ 	if (error)
+diff --git a/security/integrity/evm/evm_crypto.c b/security/integrity/evm/evm_crypto.c
+index 14900ab1a4cb..2d209b70fe97 100644
+--- a/security/integrity/evm/evm_crypto.c
++++ b/security/integrity/evm/evm_crypto.c
+@@ -121,7 +121,6 @@ static struct shash_desc *init_desc(char type)
+ 		return ERR_PTR(-ENOMEM);
+ 
+ 	desc->tfm = *tfm;
+-	desc->flags = CRYPTO_TFM_REQ_MAY_SLEEP;
+ 
+ 	rc = crypto_shash_init(desc);
+ 	if (rc) {
+diff --git a/security/integrity/ima/ima_crypto.c b/security/integrity/ima/ima_crypto.c
+index 58dc8e73b83e..d9eb6748f3b1 100644
+--- a/security/integrity/ima/ima_crypto.c
++++ b/security/integrity/ima/ima_crypto.c
+@@ -337,7 +337,6 @@ static int ima_calc_file_hash_tfm(struct file *file,
+ 	SHASH_DESC_ON_STACK(shash, tfm);
+ 
+ 	shash->tfm = tfm;
+-	shash->flags = 0;
+ 
+ 	hash->length = crypto_shash_digestsize(tfm);
+ 
+@@ -452,7 +451,6 @@ static int ima_calc_field_array_hash_tfm(struct ima_field_data *field_data,
+ 	int rc, i;
+ 
+ 	shash->tfm = tfm;
+-	shash->flags = 0;
+ 
+ 	hash->length = crypto_shash_digestsize(tfm);
+ 
+@@ -574,7 +572,6 @@ static int calc_buffer_shash_tfm(const void *buf, loff_t size,
+ 	int rc;
+ 
+ 	shash->tfm = tfm;
+-	shash->flags = 0;
+ 
+ 	hash->length = crypto_shash_digestsize(tfm);
+ 
+@@ -647,7 +644,6 @@ static int __init ima_calc_boot_aggregate_tfm(char *digest,
+ 	SHASH_DESC_ON_STACK(shash, tfm);
+ 
+ 	shash->tfm = tfm;
+-	shash->flags = 0;
+ 
+ 	rc = crypto_shash_init(shash);
+ 	if (rc != 0)
+diff --git a/security/keys/dh.c b/security/keys/dh.c
+index b203f7758f97..a9d9a6d4367c 100644
+--- a/security/keys/dh.c
++++ b/security/keys/dh.c
+@@ -112,7 +112,6 @@ static int kdf_alloc(struct kdf_sdesc **sdesc_ret, char *hashname)
+ 	if (!sdesc)
+ 		goto out_free_tfm;
+ 	sdesc->shash.tfm = tfm;
+-	sdesc->shash.flags = 0x0;
+ 
+ 	*sdesc_ret = sdesc;
+ 
+diff --git a/security/keys/encrypted-keys/encrypted.c b/security/keys/encrypted-keys/encrypted.c
+index 7a96749d7a90..9d7d6204ecd7 100644
+--- a/security/keys/encrypted-keys/encrypted.c
++++ b/security/keys/encrypted-keys/encrypted.c
+@@ -330,7 +330,6 @@ static int calc_hash(struct crypto_shash *tfm, u8 *digest,
+ 	int err;
+ 
+ 	desc->tfm = tfm;
+-	desc->flags = 0;
+ 
+ 	err = crypto_shash_digest(desc, buf, buflen, digest);
+ 	shash_desc_zero(desc);
+diff --git a/security/keys/trusted.c b/security/keys/trusted.c
+index 63fa3a8d9d66..d4f860d790c7 100644
+--- a/security/keys/trusted.c
++++ b/security/keys/trusted.c
+@@ -52,7 +52,6 @@ static struct sdesc *init_sdesc(struct crypto_shash *alg)
+ 	if (!sdesc)
+ 		return ERR_PTR(-ENOMEM);
+ 	sdesc->shash.tfm = alg;
+-	sdesc->shash.flags = 0x0;
+ 	return sdesc;
+ }
+ 
