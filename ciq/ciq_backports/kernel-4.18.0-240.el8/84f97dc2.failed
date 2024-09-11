@@ -1,0 +1,229 @@
+io_uring: make io_cqring_events() take 'ctx' as argument
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Jens Axboe <axboe@kernel.dk>
+commit 84f97dc2333c626979bb547fce343a1003544dcc
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/84f97dc2.failed
+
+The rings can be derived from the ctx, and we need the ctx there for
+a future change.
+
+No functional changes in this patch.
+
+	Reviewed-by: Pavel Begunkov <asml.silence@gmail.com>
+	Signed-off-by: Jens Axboe <axboe@kernel.dk>
+(cherry picked from commit 84f97dc2333c626979bb547fce343a1003544dcc)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/io_uring.c
+diff --cc fs/io_uring.c
+index fca9cdc96d77,d8e15cce936e..000000000000
+--- a/fs/io_uring.c
++++ b/fs/io_uring.c
+@@@ -690,17 -839,48 +690,36 @@@ static void io_free_req(struct io_kioc
+  	__io_free_req(req);
+  }
+  
+ -/*
+ - * Drop reference to request, return next in chain (if there is one) if this
+ - * was the last reference to this request.
+ - */
+ -static struct io_kiocb *io_put_req_find_next(struct io_kiocb *req)
+ +static void io_put_req(struct io_kiocb *req)
+  {
+ -	struct io_kiocb *nxt = NULL;
+ -
+  	if (refcount_dec_and_test(&req->refs))
+ -		io_free_req(req, &nxt);
+ -
+ -	return nxt;
+ +		io_free_req(req);
+  }
+  
+++<<<<<<< HEAD
+ +static unsigned io_cqring_events(struct io_cq_ring *ring)
+++=======
++ static void io_put_req(struct io_kiocb *req, struct io_kiocb **nxtptr)
+  {
++ 	struct io_kiocb *nxt;
++ 
++ 	nxt = io_put_req_find_next(req);
++ 	if (nxt) {
++ 		if (nxtptr)
++ 			*nxtptr = nxt;
++ 		else
++ 			io_queue_async_work(nxt->ctx, nxt);
++ 	}
++ }
++ 
++ static unsigned io_cqring_events(struct io_ring_ctx *ctx)
+++>>>>>>> 84f97dc2333c (io_uring: make io_cqring_events() take 'ctx' as argument)
++ {
++ 	struct io_rings *rings = ctx->rings;
++ 
+  	/* See comment at the top of this file */
+  	smp_rmb();
+ -	return READ_ONCE(rings->cq.tail) - READ_ONCE(rings->cq.head);
+ -}
+ -
+ -static inline unsigned int io_sqring_entries(struct io_ring_ctx *ctx)
+ -{
+ -	struct io_rings *rings = ctx->rings;
+ -
+ -	/* make sure SQ entry isn't read before tail */
+ -	return smp_load_acquire(&rings->sq.tail) - ctx->cached_sq_head;
+ +	return READ_ONCE(ring->r.tail) - READ_ONCE(ring->r.head);
+  }
+  
+  /*
+@@@ -845,7 -1025,7 +864,11 @@@ static int __io_iopoll_check(struct io_
+  		 * If we do, we can potentially be spinning for commands that
+  		 * already triggered a CQE (eg in error).
+  		 */
+++<<<<<<< HEAD
+ +		if (io_cqring_events(ctx->cq_ring))
+++=======
++ 		if (io_cqring_events(ctx))
+++>>>>>>> 84f97dc2333c (io_uring: make io_cqring_events() take 'ctx' as argument)
+  			break;
+  
+  		/*
+@@@ -2605,78 -3062,36 +2628,89 @@@ static int io_sq_thread(void *data
+  	return 0;
+  }
+  
+ -struct io_wait_queue {
+ -	struct wait_queue_entry wq;
+ -	struct io_ring_ctx *ctx;
+ -	unsigned to_wait;
+ -	unsigned nr_timeouts;
+ -};
+ -
+ -static inline bool io_should_wake(struct io_wait_queue *iowq)
+ +static int io_ring_submit(struct io_ring_ctx *ctx, unsigned int to_submit,
+ +			  bool block_for_last)
+  {
+ -	struct io_ring_ctx *ctx = iowq->ctx;
+ +	struct io_submit_state state, *statep = NULL;
+ +	struct io_kiocb *link = NULL;
+ +	struct io_kiocb *shadow_req = NULL;
+ +	bool prev_was_link = false;
+ +	int i, submit = 0;
+  
+++<<<<<<< HEAD
+ +	if (to_submit > IO_PLUG_THRESHOLD) {
+ +		io_submit_state_start(&state, ctx, to_submit);
+ +		statep = &state;
+ +	}
+++=======
++ 	/*
++ 	 * Wake up if we have enough events, or if a timeout occured since we
++ 	 * started waiting. For timeouts, we always want to return to userspace,
++ 	 * regardless of event count.
++ 	 */
++ 	return io_cqring_events(ctx) >= iowq->to_wait ||
++ 			atomic_read(&ctx->cq_timeouts) != iowq->nr_timeouts;
++ }
+++>>>>>>> 84f97dc2333c (io_uring: make io_cqring_events() take 'ctx' as argument)
+  
+ -static int io_wake_function(struct wait_queue_entry *curr, unsigned int mode,
+ -			    int wake_flags, void *key)
+ -{
+ -	struct io_wait_queue *iowq = container_of(curr, struct io_wait_queue,
+ -							wq);
+ +	for (i = 0; i < to_submit; i++) {
+ +		bool force_nonblock = true;
+ +		struct sqe_submit s;
+ +
+ +		if (!io_get_sqring(ctx, &s))
+ +			break;
+ +
+ +		/*
+ +		 * If previous wasn't linked and we have a linked command,
+ +		 * that's the end of the chain. Submit the previous link.
+ +		 */
+ +		if (!prev_was_link && link) {
+ +			io_queue_link_head(ctx, link, &link->submit, shadow_req,
+ +						force_nonblock);
+ +			link = NULL;
+ +			shadow_req = NULL;
+ +		}
+ +		prev_was_link = (s.sqe->flags & IOSQE_IO_LINK) != 0;
+ +
+ +		if (link && (s.sqe->flags & IOSQE_IO_DRAIN)) {
+ +			if (!shadow_req) {
+ +				shadow_req = io_get_req(ctx, NULL);
+ +				if (unlikely(!shadow_req))
+ +					goto out;
+ +				shadow_req->flags |= (REQ_F_IO_DRAIN | REQ_F_SHADOW_DRAIN);
+ +				refcount_dec(&shadow_req->refs);
+ +			}
+ +			shadow_req->sequence = s.sequence;
+ +		}
+  
+ -	if (!io_should_wake(iowq))
+ -		return -1;
+ +out:
+ +		s.has_user = true;
+ +		s.needs_lock = false;
+ +		s.needs_fixed_file = false;
+ +		submit++;
+ +
+ +		/*
+ +		 * The caller will block for events after submit, submit the
+ +		 * last IO non-blocking. This is either the only IO it's
+ +		 * submitting, or it already submitted the previous ones. This
+ +		 * improves performance by avoiding an async punt that we don't
+ +		 * need to do.
+ +		 */
+ +		if (block_for_last && submit == to_submit)
+ +			force_nonblock = false;
+ +
+ +		io_submit_sqe(ctx, &s, statep, &link, force_nonblock);
+ +	}
+ +
+ +	if (link)
+ +		io_queue_link_head(ctx, link, &link->submit, shadow_req,
+ +					!block_for_last);
+ +	if (statep)
+ +		io_submit_state_end(statep);
+ +
+ +	io_commit_sqring(ctx);
+  
+ -	return autoremove_wake_function(curr, mode, wake_flags, key);
+ +	return submit;
+  }
+  
+  /*
+@@@ -2686,11 -3101,19 +2720,15 @@@
+  static int io_cqring_wait(struct io_ring_ctx *ctx, int min_events,
+  			  const sigset_t __user *sig, size_t sigsz)
+  {
+ -	struct io_wait_queue iowq = {
+ -		.wq = {
+ -			.private	= current,
+ -			.func		= io_wake_function,
+ -			.entry		= LIST_HEAD_INIT(iowq.wq.entry),
+ -		},
+ -		.ctx		= ctx,
+ -		.to_wait	= min_events,
+ -	};
+ -	struct io_rings *rings = ctx->rings;
+ -	int ret = 0;
+ +	struct io_cq_ring *ring = ctx->cq_ring;
+ +	sigset_t ksigmask, sigsaved;
+ +	int ret;
+  
+++<<<<<<< HEAD
+ +	if (io_cqring_events(ring) >= min_events)
+++=======
++ 	if (io_cqring_events(ctx) >= min_events)
+++>>>>>>> 84f97dc2333c (io_uring: make io_cqring_events() take 'ctx' as argument)
+  		return 0;
+  
+  	if (sig) {
+* Unmerged path fs/io_uring.c
