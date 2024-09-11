@@ -1,0 +1,201 @@
+locking/rwsem: Move rwsem internal function declarations to rwsem-xadd.h
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-147.el8
+commit-author Waiman Long <longman@redhat.com>
+commit 12a30a7fc142a123c61da9623bd824d95d36c12e
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-147.el8/12a30a7f.failed
+
+We don't need to expose rwsem internal functions which are not supposed
+to be called directly from other kernel code.
+
+	Signed-off-by: Waiman Long <longman@redhat.com>
+	Acked-by: Peter Zijlstra <a.p.zijlstra@chello.nl>
+	Acked-by: Will Deacon <will.deacon@arm.com>
+	Acked-by: Davidlohr Bueso <dbueso@suse.de>
+	Cc: Andrew Morton <akpm@linux-foundation.org>
+	Cc: Arnd Bergmann <arnd@arndb.de>
+	Cc: Borislav Petkov <bp@alien8.de>
+	Cc: Davidlohr Bueso <dave@stgolabs.net>
+	Cc: Linus Torvalds <torvalds@linux-foundation.org>
+	Cc: Paul E. McKenney <paulmck@linux.vnet.ibm.com>
+	Cc: Peter Zijlstra <peterz@infradead.org>
+	Cc: Thomas Gleixner <tglx@linutronix.de>
+	Cc: Tim Chen <tim.c.chen@linux.intel.com>
+Link: http://lkml.kernel.org/r/20190404174320.22416-4-longman@redhat.com
+	Signed-off-by: Ingo Molnar <mingo@kernel.org>
+(cherry picked from commit 12a30a7fc142a123c61da9623bd824d95d36c12e)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/rwsem.h
+#	kernel/locking/rwsem.h
+diff --cc include/linux/rwsem.h
+index 67dbb57508b1,b44e533235c7..000000000000
+--- a/include/linux/rwsem.h
++++ b/include/linux/rwsem.h
+@@@ -50,16 -46,6 +50,19 @@@ struct rw_semaphore 
+   */
+  #define RWSEM_OWNER_UNKNOWN	((struct task_struct *)-2L)
+  
+++<<<<<<< HEAD
+ +extern struct rw_semaphore *rwsem_down_read_failed(struct rw_semaphore *sem);
+ +extern struct rw_semaphore *rwsem_down_read_failed_killable(struct rw_semaphore *sem);
+ +extern struct rw_semaphore *rwsem_down_write_failed(struct rw_semaphore *sem);
+ +extern struct rw_semaphore *rwsem_down_write_failed_killable(struct rw_semaphore *sem);
+ +extern struct rw_semaphore *rwsem_wake(struct rw_semaphore *);
+ +extern struct rw_semaphore *rwsem_downgrade_wake(struct rw_semaphore *sem);
+ +
+ +/* Include the arch specific part */
+ +#include <asm/rwsem.h>
+ +
+++=======
+++>>>>>>> 12a30a7fc142 (locking/rwsem: Move rwsem internal function declarations to rwsem-xadd.h)
+  /* In all implementations count != 0 means locked */
+  static inline int rwsem_is_locked(struct rw_semaphore *sem)
+  {
+diff --cc kernel/locking/rwsem.h
+index bad2bca0268b,19997c82270b..000000000000
+--- a/kernel/locking/rwsem.h
++++ b/kernel/locking/rwsem.h
+@@@ -132,3 -152,133 +132,136 @@@ static inline void rwsem_clear_reader_o
+  {
+  }
+  #endif
+++<<<<<<< HEAD
+++=======
++ 
++ extern struct rw_semaphore *rwsem_down_read_failed(struct rw_semaphore *sem);
++ extern struct rw_semaphore *rwsem_down_read_failed_killable(struct rw_semaphore *sem);
++ extern struct rw_semaphore *rwsem_down_write_failed(struct rw_semaphore *sem);
++ extern struct rw_semaphore *rwsem_down_write_failed_killable(struct rw_semaphore *sem);
++ extern struct rw_semaphore *rwsem_wake(struct rw_semaphore *sem);
++ extern struct rw_semaphore *rwsem_downgrade_wake(struct rw_semaphore *sem);
++ 
++ /*
++  * lock for reading
++  */
++ static inline void __down_read(struct rw_semaphore *sem)
++ {
++ 	if (unlikely(atomic_long_inc_return_acquire(&sem->count) <= 0))
++ 		rwsem_down_read_failed(sem);
++ 	else
++ 		rwsem_set_reader_owned(sem);
++ }
++ 
++ static inline int __down_read_killable(struct rw_semaphore *sem)
++ {
++ 	if (unlikely(atomic_long_inc_return_acquire(&sem->count) <= 0)) {
++ 		if (IS_ERR(rwsem_down_read_failed_killable(sem)))
++ 			return -EINTR;
++ 	} else {
++ 		rwsem_set_reader_owned(sem);
++ 	}
++ 	return 0;
++ }
++ 
++ static inline int __down_read_trylock(struct rw_semaphore *sem)
++ {
++ 	/*
++ 	 * Optimize for the case when the rwsem is not locked at all.
++ 	 */
++ 	long tmp = RWSEM_UNLOCKED_VALUE;
++ 
++ 	do {
++ 		if (atomic_long_try_cmpxchg_acquire(&sem->count, &tmp,
++ 					tmp + RWSEM_ACTIVE_READ_BIAS)) {
++ 			rwsem_set_reader_owned(sem);
++ 			return 1;
++ 		}
++ 	} while (tmp >= 0);
++ 	return 0;
++ }
++ 
++ /*
++  * lock for writing
++  */
++ static inline void __down_write(struct rw_semaphore *sem)
++ {
++ 	long tmp;
++ 
++ 	tmp = atomic_long_add_return_acquire(RWSEM_ACTIVE_WRITE_BIAS,
++ 					     &sem->count);
++ 	if (unlikely(tmp != RWSEM_ACTIVE_WRITE_BIAS))
++ 		rwsem_down_write_failed(sem);
++ 	rwsem_set_owner(sem);
++ }
++ 
++ static inline int __down_write_killable(struct rw_semaphore *sem)
++ {
++ 	long tmp;
++ 
++ 	tmp = atomic_long_add_return_acquire(RWSEM_ACTIVE_WRITE_BIAS,
++ 					     &sem->count);
++ 	if (unlikely(tmp != RWSEM_ACTIVE_WRITE_BIAS))
++ 		if (IS_ERR(rwsem_down_write_failed_killable(sem)))
++ 			return -EINTR;
++ 	rwsem_set_owner(sem);
++ 	return 0;
++ }
++ 
++ static inline int __down_write_trylock(struct rw_semaphore *sem)
++ {
++ 	long tmp;
++ 
++ 	tmp = atomic_long_cmpxchg_acquire(&sem->count, RWSEM_UNLOCKED_VALUE,
++ 		      RWSEM_ACTIVE_WRITE_BIAS);
++ 	if (tmp == RWSEM_UNLOCKED_VALUE) {
++ 		rwsem_set_owner(sem);
++ 		return true;
++ 	}
++ 	return false;
++ }
++ 
++ /*
++  * unlock after reading
++  */
++ static inline void __up_read(struct rw_semaphore *sem)
++ {
++ 	long tmp;
++ 
++ 	rwsem_clear_reader_owned(sem);
++ 	tmp = atomic_long_dec_return_release(&sem->count);
++ 	if (unlikely(tmp < -1 && (tmp & RWSEM_ACTIVE_MASK) == 0))
++ 		rwsem_wake(sem);
++ }
++ 
++ /*
++  * unlock after writing
++  */
++ static inline void __up_write(struct rw_semaphore *sem)
++ {
++ 	rwsem_clear_owner(sem);
++ 	if (unlikely(atomic_long_sub_return_release(RWSEM_ACTIVE_WRITE_BIAS,
++ 						    &sem->count) < 0))
++ 		rwsem_wake(sem);
++ }
++ 
++ /*
++  * downgrade write lock to read lock
++  */
++ static inline void __downgrade_write(struct rw_semaphore *sem)
++ {
++ 	long tmp;
++ 
++ 	/*
++ 	 * When downgrading from exclusive to shared ownership,
++ 	 * anything inside the write-locked region cannot leak
++ 	 * into the read side. In contrast, anything in the
++ 	 * read-locked region is ok to be re-ordered into the
++ 	 * write side. As such, rely on RELEASE semantics.
++ 	 */
++ 	tmp = atomic_long_add_return_release(-RWSEM_WAITING_BIAS, &sem->count);
++ 	rwsem_set_reader_owned(sem);
++ 	if (tmp < 0)
++ 		rwsem_downgrade_wake(sem);
++ }
+++>>>>>>> 12a30a7fc142 (locking/rwsem: Move rwsem internal function declarations to rwsem-xadd.h)
+* Unmerged path include/linux/rwsem.h
+* Unmerged path kernel/locking/rwsem.h
