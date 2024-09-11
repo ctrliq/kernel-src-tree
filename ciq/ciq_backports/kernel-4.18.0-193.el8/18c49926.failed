@@ -1,0 +1,129 @@
+cpufreq: Add QoS requests for userspace constraints
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-193.el8
+Rebuild_CHGLOG: - [cpufreq] Add QoS requests for userspace constraints (Al Stone) [1739729 1725581]
+Rebuild_FUZZ: 90.32%
+commit-author Viresh Kumar <viresh.kumar@linaro.org>
+commit 18c49926c4bf4915e5194d1de3299c0537229f9f
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-193.el8/18c49926.failed
+
+This implements QoS requests to manage userspace configuration of min
+and max frequency.
+
+	Reviewed-by: Matthias Kaehlcke <mka@chromium.org>
+	Reviewed-by: Ulf Hansson <ulf.hansson@linaro.org>
+	Signed-off-by: Viresh Kumar <viresh.kumar@linaro.org>
+	Tested-by: syzbot <syzbot+de771ae9390dffed7266@syzkaller.appspotmail.com>
+	Signed-off-by: Rafael J. Wysocki <rafael.j.wysocki@intel.com>
+(cherry picked from commit 18c49926c4bf4915e5194d1de3299c0537229f9f)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/cpufreq/cpufreq.c
+diff --cc drivers/cpufreq/cpufreq.c
+index 3bb6013f5a6f,99aa7d20b458..000000000000
+--- a/drivers/cpufreq/cpufreq.c
++++ b/drivers/cpufreq/cpufreq.c
+@@@ -1117,14 -1110,14 +1109,19 @@@ static int cpufreq_add_policy_cpu(struc
+  
+  void refresh_frequency_limits(struct cpufreq_policy *policy)
+  {
+ -	struct cpufreq_policy new_policy;
+ +	struct cpufreq_policy new_policy = *policy;
+  
+ -	if (!policy_is_inactive(policy)) {
+ -		new_policy = *policy;
+ -		pr_debug("updating policy for CPU %u\n", policy->cpu);
+ +	pr_debug("updating policy for CPU %u\n", policy->cpu);
+  
+++<<<<<<< HEAD
+ +	new_policy.min = policy->user_policy.min;
+ +	new_policy.max = policy->user_policy.max;
+ +
+ +	cpufreq_set_policy(policy, &new_policy);
+++=======
++ 		cpufreq_set_policy(policy, &new_policy);
++ 	}
+++>>>>>>> 18c49926c4bf (cpufreq: Add QoS requests for userspace constraints)
+  }
+  EXPORT_SYMBOL(refresh_frequency_limits);
+  
+@@@ -1219,6 -1267,14 +1216,17 @@@ static void cpufreq_policy_free(struct 
+  		per_cpu(cpufreq_cpu_data, cpu) = NULL;
+  	write_unlock_irqrestore(&cpufreq_driver_lock, flags);
+  
+++<<<<<<< HEAD
+++=======
++ 	dev_pm_qos_remove_notifier(dev, &policy->nb_max,
++ 				   DEV_PM_QOS_MAX_FREQUENCY);
++ 	dev_pm_qos_remove_notifier(dev, &policy->nb_min,
++ 				   DEV_PM_QOS_MIN_FREQUENCY);
++ 	dev_pm_qos_remove_request(policy->max_freq_req);
++ 	dev_pm_qos_remove_request(policy->min_freq_req);
++ 	kfree(policy->min_freq_req);
++ 
+++>>>>>>> 18c49926c4bf (cpufreq: Add QoS requests for userspace constraints)
+  	cpufreq_policy_put_kobj(policy);
+  	free_cpumask_var(policy->real_cpus);
+  	free_cpumask_var(policy->related_cpus);
+@@@ -2278,6 -2368,7 +2320,10 @@@ int cpufreq_set_policy(struct cpufreq_p
+  		       struct cpufreq_policy *new_policy)
+  {
+  	struct cpufreq_governor *old_gov;
+++<<<<<<< HEAD
+++=======
++ 	struct device *cpu_dev = get_cpu_device(policy->cpu);
+++>>>>>>> 18c49926c4bf (cpufreq: Add QoS requests for userspace constraints)
+  	int ret;
+  
+  	pr_debug("setting new policy for CPU %u: %u - %u kHz\n",
+@@@ -2286,11 -2377,11 +2332,19 @@@
+  	memcpy(&new_policy->cpuinfo, &policy->cpuinfo, sizeof(policy->cpuinfo));
+  
+  	/*
+++<<<<<<< HEAD
+ +	* This check works well when we store new min/max freq attributes,
+ +	* because new_policy is a copy of policy with one field updated.
+ +	*/
+ +	if (new_policy->min > new_policy->max)
+ +		return -EINVAL;
+++=======
++ 	 * PM QoS framework collects all the requests from users and provide us
++ 	 * the final aggregated value here.
++ 	 */
++ 	new_policy->min = dev_pm_qos_read_value(cpu_dev, DEV_PM_QOS_MIN_FREQUENCY);
++ 	new_policy->max = dev_pm_qos_read_value(cpu_dev, DEV_PM_QOS_MAX_FREQUENCY);
+++>>>>>>> 18c49926c4bf (cpufreq: Add QoS requests for userspace constraints)
+  
+  	/* verify the cpu speed can be set within this limit */
+  	ret = cpufreq_driver->verify(new_policy);
+* Unmerged path drivers/cpufreq/cpufreq.c
+diff --git a/include/linux/cpufreq.h b/include/linux/cpufreq.h
+index 3c29c4526032..81f8b5279ac8 100644
+--- a/include/linux/cpufreq.h
++++ b/include/linux/cpufreq.h
+@@ -50,11 +50,6 @@ struct cpufreq_cpuinfo {
+ 	unsigned int		transition_latency;
+ };
+ 
+-struct cpufreq_user_policy {
+-	unsigned int		min;    /* in kHz */
+-	unsigned int		max;    /* in kHz */
+-};
+-
+ struct cpufreq_policy {
+ 	/* CPUs sharing clock, require sw coordination */
+ 	cpumask_var_t		cpus;	/* Online CPUs only */
+@@ -84,7 +79,8 @@ struct cpufreq_policy {
+ 	struct work_struct	update; /* if update_policy() needs to be
+ 					 * called, but you're in IRQ context */
+ 
+-	struct cpufreq_user_policy user_policy;
++	struct dev_pm_qos_request *min_freq_req;
++	struct dev_pm_qos_request *max_freq_req;
+ 	struct cpufreq_frequency_table	*freq_table;
+ 	enum cpufreq_table_sorting freq_table_sorted;
+ 
