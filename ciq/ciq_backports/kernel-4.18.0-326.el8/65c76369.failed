@@ -1,0 +1,192 @@
+blk-mq: pass request queue into get/put budget callback
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-326.el8
+commit-author Ming Lei <ming.lei@redhat.com>
+commit 65c763694398a2de63803b264dcf906b47f9d4c1
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-326.el8/65c76369.failed
+
+blk-mq budget is abstract from scsi's device queue depth, and it is
+always per-request-queue instead of hctx.
+
+It can be quite absurd to get a budget from one hctx, then dequeue a
+request from scheduler queue, and this request may not belong to this
+hctx, at least for bfq and deadline.
+
+So fix the mess and always pass request queue to get/put budget
+callback.
+
+	Signed-off-by: Ming Lei <ming.lei@redhat.com>
+	Tested-by: Baolin Wang <baolin.wang7@gmail.com>
+	Reviewed-by: Johannes Thumshirn <johannes.thumshirn@wdc.com>
+	Reviewed-by: Christoph Hellwig <hch@lst.de>
+	Reviewed-by: Douglas Anderson <dianders@chromium.org>
+	Reviewed-by: Sagi Grimberg <sagi@grimberg.me>
+	Cc: Sagi Grimberg <sagi@grimberg.me>
+	Cc: Baolin Wang <baolin.wang7@gmail.com>
+	Cc: Christoph Hellwig <hch@infradead.org>
+	Cc: Douglas Anderson <dianders@chromium.org>
+	Signed-off-by: Jens Axboe <axboe@kernel.dk>
+(cherry picked from commit 65c763694398a2de63803b264dcf906b47f9d4c1)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	block/blk-mq.c
+diff --cc block/blk-mq.c
+index 2c7e4bee30bc,8cdc868f4249..000000000000
+--- a/block/blk-mq.c
++++ b/block/blk-mq.c
+@@@ -1384,10 -1283,32 +1384,39 @@@ bool blk_mq_dispatch_rq_list(struct blk
+  
+  		rq = list_first_entry(list, struct request, queuelist);
+  
+++<<<<<<< HEAD
+ +		WARN_ON_ONCE(hctx != rq->mq_hctx);
+ +		prep = blk_mq_prep_dispatch_rq(rq, !nr_budgets);
+ +		if (prep != PREP_DISPATCH_OK)
+ +			break;
+++=======
++ 		hctx = rq->mq_hctx;
++ 		if (!got_budget && !blk_mq_get_dispatch_budget(q)) {
++ 			blk_mq_put_driver_tag(rq);
++ 			no_budget_avail = true;
++ 			break;
++ 		}
++ 
++ 		if (!blk_mq_get_driver_tag(rq)) {
++ 			/*
++ 			 * The initial allocation attempt failed, so we need to
++ 			 * rerun the hardware queue when a tag is freed. The
++ 			 * waitqueue takes care of that. If the queue is run
++ 			 * before we add this entry back on the dispatch list,
++ 			 * we'll re-run it below.
++ 			 */
++ 			if (!blk_mq_mark_tag_wait(hctx, rq)) {
++ 				blk_mq_put_dispatch_budget(q);
++ 				/*
++ 				 * For non-shared tags, the RESTART check
++ 				 * will suffice.
++ 				 */
++ 				if (hctx->flags & BLK_MQ_F_TAG_SHARED)
++ 					no_tag = true;
++ 				break;
++ 			}
++ 		}
+++>>>>>>> 65c763694398 (blk-mq: pass request queue into get/put budget callback)
+  
+  		list_del_init(&rq->queuelist);
+  
+diff --git a/block/blk-mq-sched.c b/block/blk-mq-sched.c
+index 7c86fdd65b44..72708e7e3ca2 100644
+--- a/block/blk-mq-sched.c
++++ b/block/blk-mq-sched.c
+@@ -141,12 +141,12 @@ static int __blk_mq_do_dispatch_sched(struct blk_mq_hw_ctx *hctx)
+ 			break;
+ 		}
+ 
+-		if (!blk_mq_get_dispatch_budget(hctx))
++		if (!blk_mq_get_dispatch_budget(q))
+ 			break;
+ 
+ 		rq = e->type->ops.dispatch_request(hctx);
+ 		if (!rq) {
+-			blk_mq_put_dispatch_budget(hctx);
++			blk_mq_put_dispatch_budget(q);
+ 			/*
+ 			 * We're releasing without dispatching. Holding the
+ 			 * budget could have blocked any "hctx"s with the
+@@ -239,12 +239,12 @@ static int blk_mq_do_dispatch_ctx(struct blk_mq_hw_ctx *hctx)
+ 		if (!sbitmap_any_bit_set(&hctx->ctx_map))
+ 			break;
+ 
+-		if (!blk_mq_get_dispatch_budget(hctx))
++		if (!blk_mq_get_dispatch_budget(q))
+ 			break;
+ 
+ 		rq = blk_mq_dequeue_from_ctx(hctx, ctx);
+ 		if (!rq) {
+-			blk_mq_put_dispatch_budget(hctx);
++			blk_mq_put_dispatch_budget(q);
+ 			/*
+ 			 * We're releasing without dispatching. Holding the
+ 			 * budget could have blocked any "hctx"s with the
+* Unmerged path block/blk-mq.c
+diff --git a/block/blk-mq.h b/block/blk-mq.h
+index db1f5f2293f7..dda405c7528f 100644
+--- a/block/blk-mq.h
++++ b/block/blk-mq.h
+@@ -192,20 +192,16 @@ unsigned int blk_mq_in_flight(struct request_queue *q, struct hd_struct *part);
+ void blk_mq_in_flight_rw(struct request_queue *q, struct hd_struct *part,
+ 			 unsigned int inflight[2]);
+ 
+-static inline void blk_mq_put_dispatch_budget(struct blk_mq_hw_ctx *hctx)
++static inline void blk_mq_put_dispatch_budget(struct request_queue *q)
+ {
+-	struct request_queue *q = hctx->queue;
+-
+ 	if (q->mq_ops->put_budget)
+-		q->mq_ops->put_budget(hctx);
++		q->mq_ops->put_budget(q);
+ }
+ 
+-static inline bool blk_mq_get_dispatch_budget(struct blk_mq_hw_ctx *hctx)
++static inline bool blk_mq_get_dispatch_budget(struct request_queue *q)
+ {
+-	struct request_queue *q = hctx->queue;
+-
+ 	if (q->mq_ops->get_budget)
+-		return q->mq_ops->get_budget(hctx);
++		return q->mq_ops->get_budget(q);
+ 	return true;
+ }
+ 
+diff --git a/drivers/scsi/scsi_lib.c b/drivers/scsi/scsi_lib.c
+index 31348ae4746b..a34bd7dc4829 100644
+--- a/drivers/scsi/scsi_lib.c
++++ b/drivers/scsi/scsi_lib.c
+@@ -1582,17 +1582,15 @@ static void scsi_mq_done(struct scsi_cmnd *cmd)
+ 	blk_mq_complete_request(cmd->request);
+ }
+ 
+-static void scsi_mq_put_budget(struct blk_mq_hw_ctx *hctx)
++static void scsi_mq_put_budget(struct request_queue *q)
+ {
+-	struct request_queue *q = hctx->queue;
+ 	struct scsi_device *sdev = q->queuedata;
+ 
+ 	atomic_dec(&sdev->device_busy);
+ }
+ 
+-static bool scsi_mq_get_budget(struct blk_mq_hw_ctx *hctx)
++static bool scsi_mq_get_budget(struct request_queue *q)
+ {
+-	struct request_queue *q = hctx->queue;
+ 	struct scsi_device *sdev = q->queuedata;
+ 
+ 	if (scsi_dev_queue_ready(q, sdev))
+@@ -1686,7 +1684,7 @@ static blk_status_t scsi_queue_rq(struct blk_mq_hw_ctx *hctx,
+ 	if (scsi_target(sdev)->can_queue > 0)
+ 		atomic_dec(&scsi_target(sdev)->target_busy);
+ out_put_budget:
+-	scsi_mq_put_budget(hctx);
++	scsi_mq_put_budget(q);
+ 	switch (ret) {
+ 	case BLK_STS_OK:
+ 		break;
+diff --git a/include/linux/blk-mq.h b/include/linux/blk-mq.h
+index f9f05156519e..69e0be9422e2 100644
+--- a/include/linux/blk-mq.h
++++ b/include/linux/blk-mq.h
+@@ -187,8 +187,8 @@ struct blk_mq_queue_data {
+ typedef blk_status_t (queue_rq_fn)(struct blk_mq_hw_ctx *,
+ 		const struct blk_mq_queue_data *);
+ typedef void (commit_rqs_fn)(struct blk_mq_hw_ctx *);
+-typedef bool (get_budget_fn)(struct blk_mq_hw_ctx *);
+-typedef void (put_budget_fn)(struct blk_mq_hw_ctx *);
++typedef bool (get_budget_fn)(struct request_queue *);
++typedef void (put_budget_fn)(struct request_queue *);
+ typedef enum blk_eh_timer_return (timeout_fn)(struct request *, bool);
+ typedef int (init_hctx_fn)(struct blk_mq_hw_ctx *, void *, unsigned int);
+ typedef void (exit_hctx_fn)(struct blk_mq_hw_ctx *, unsigned int);
