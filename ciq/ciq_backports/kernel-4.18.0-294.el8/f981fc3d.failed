@@ -1,0 +1,125 @@
+net: openvswitch: fix to make sure flow_lookup() is not preempted
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+Rebuild_CHGLOG: - [net] openvswitch: fix to make sure flow_lookup() is not preempted (Eelco Chaudron) [1888237]
+Rebuild_FUZZ: 96.00%
+commit-author Eelco Chaudron <echaudro@redhat.com>
+commit f981fc3d515a588c389242b7e3a71487b40571a5
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/f981fc3d.failed
+
+The flow_lookup() function uses per CPU variables, which must be called
+with BH disabled. However, this is fine in the general NAPI use case
+where the local BH is disabled. But, it's also called from the netlink
+context. The below patch makes sure that even in the netlink path, the
+BH is disabled.
+
+In addition, u64_stats_update_begin() requires a lock to ensure one writer
+which is not ensured here. Making it per-CPU and disabling NAPI (softirq)
+ensures that there is always only one writer.
+
+Fixes: eac87c413bf9 ("net: openvswitch: reorder masks array based on usage")
+	Reported-by: Juri Lelli <jlelli@redhat.com>
+	Signed-off-by: Eelco Chaudron <echaudro@redhat.com>
+Link: https://lore.kernel.org/r/160295903253.7789.826736662555102345.stgit@ebuild
+	Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+(cherry picked from commit f981fc3d515a588c389242b7e3a71487b40571a5)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/openvswitch/flow_table.c
+diff --cc net/openvswitch/flow_table.c
+index aff660fe3a14,f3486a37361a..000000000000
+--- a/net/openvswitch/flow_table.c
++++ b/net/openvswitch/flow_table.c
+@@@ -704,9 -731,10 +707,9 @@@ static struct sw_flow *flow_lookup(stru
+  				   struct mask_array *ma,
+  				   const struct sw_flow_key *key,
+  				   u32 *n_mask_hit,
+ -				   u32 *n_cache_hit,
+  				   u32 *index)
+  {
+- 	u64 *usage_counters = this_cpu_ptr(ma->masks_usage_cntr);
++ 	struct mask_array_stats *stats = this_cpu_ptr(ma->masks_usage_stats);
+  	struct sw_flow *flow;
+  	struct sw_flow_mask *mask;
+  	int i;
+@@@ -716,9 -744,10 +719,16 @@@
+  		if (mask) {
+  			flow = masked_flow_lookup(ti, key, mask, n_mask_hit);
+  			if (flow) {
+++<<<<<<< HEAD
+ +				u64_stats_update_begin(&ma->syncp);
+ +				usage_counters[*index]++;
+ +				u64_stats_update_end(&ma->syncp);
+++=======
++ 				u64_stats_update_begin(&stats->syncp);
++ 				stats->usage_cntrs[*index]++;
++ 				u64_stats_update_end(&stats->syncp);
++ 				(*n_cache_hit)++;
+++>>>>>>> f981fc3d515a (net: openvswitch: fix to make sure flow_lookup() is not preempted)
+  				return flow;
+  			}
+  		}
+@@@ -816,9 -852,18 +826,24 @@@ struct sw_flow *ovs_flow_tbl_lookup(str
+  	struct table_instance *ti = rcu_dereference_ovsl(tbl->ti);
+  	struct mask_array *ma = rcu_dereference_ovsl(tbl->mask_array);
+  	u32 __always_unused n_mask_hit;
+++<<<<<<< HEAD
+ +	u32 index = 0;
+ +
+ +	return flow_lookup(tbl, ti, ma, key, &n_mask_hit, &index);
+++=======
++ 	u32 __always_unused n_cache_hit;
++ 	struct sw_flow *flow;
++ 	u32 index = 0;
++ 
++ 	/* This function gets called trough the netlink interface and therefore
++ 	 * is preemptible. However, flow_lookup() function needs to be called
++ 	 * with BH disabled due to CPU specific variables.
++ 	 */
++ 	local_bh_disable();
++ 	flow = flow_lookup(tbl, ti, ma, key, &n_mask_hit, &n_cache_hit, &index);
++ 	local_bh_enable();
++ 	return flow;
+++>>>>>>> f981fc3d515a (net: openvswitch: fix to make sure flow_lookup() is not preempted)
+  }
+  
+  struct sw_flow *ovs_flow_tbl_lookup_exact(struct flow_table *tbl,
+@@@ -1064,9 -1118,8 +1089,8 @@@ void ovs_flow_masks_rebalance(struct fl
+  	if (!masks_and_count)
+  		return;
+  
+ -	for (i = 0; i < ma->max; i++) {
+ +	for (i = 0; i < ma->max; i++)  {
+  		struct sw_flow_mask *mask;
+- 		unsigned int start;
+  		int cpu;
+  
+  		mask = rcu_dereference_ovsl(ma->masks[i]);
+* Unmerged path net/openvswitch/flow_table.c
+diff --git a/net/openvswitch/flow_table.h b/net/openvswitch/flow_table.h
+index c0203670c5bf..8ab68def4eff 100644
+--- a/net/openvswitch/flow_table.h
++++ b/net/openvswitch/flow_table.h
+@@ -46,12 +46,16 @@ struct mask_count {
+ 	u64 counter;
+ };
+ 
++struct mask_array_stats {
++	struct u64_stats_sync syncp;
++	u64 usage_cntrs[];
++};
++
+ struct mask_array {
+ 	struct rcu_head rcu;
+ 	int count, max;
+-	u64 __percpu *masks_usage_cntr;
++	struct mask_array_stats __percpu *masks_usage_stats;
+ 	u64 *masks_usage_zero_cntr;
+-	struct u64_stats_sync syncp;
+ 	struct sw_flow_mask __rcu *masks[];
+ };
+ 
