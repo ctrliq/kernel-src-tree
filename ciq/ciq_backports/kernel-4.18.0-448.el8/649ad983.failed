@@ -1,0 +1,167 @@
+iommu/iova: Squash flush_cb abstraction
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-448.el8
+commit-author Robin Murphy <robin.murphy@arm.com>
+commit 649ad9835a3783bcb6c69368fa939e0010abb2c6
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-448.el8/649ad983.failed
+
+Once again, with iommu-dma now being the only flush queue user, we no
+longer need the extra level of indirection through flush_cb. Squash that
+and let the flush queue code call the domain method directly. This does
+mean temporarily having to carry an additional copy of the IOMMU domain
+pointer around instead, but only until a later patch untangles it again.
+
+	Reviewed-by: John Garry <john.garry@huawei.com>
+	Reviewed-by: Christoph Hellwig <hch@lst.de>
+	Signed-off-by: Robin Murphy <robin.murphy@arm.com>
+Link: https://lore.kernel.org/r/e3f9b4acdd6640012ef4fbc819ac868d727b64a9.1639753638.git.robin.murphy@arm.com
+	Signed-off-by: Joerg Roedel <jroedel@suse.de>
+(cherry picked from commit 649ad9835a3783bcb6c69368fa939e0010abb2c6)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/iommu/dma-iommu.c
+#	drivers/iommu/iova.c
+#	include/linux/iova.h
+diff --cc drivers/iommu/dma-iommu.c
+index 223a46c79116,c63d93581a4e..000000000000
+--- a/drivers/iommu/dma-iommu.c
++++ b/drivers/iommu/dma-iommu.c
+@@@ -327,6 -292,29 +316,32 @@@ static bool dev_use_swiotlb(struct devi
+  	return IS_ENABLED(CONFIG_SWIOTLB) && dev_is_untrusted(dev);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ /* sysfs updates are serialised by the mutex of the group owning @domain */
++ int iommu_dma_init_fq(struct iommu_domain *domain)
++ {
++ 	struct iommu_dma_cookie *cookie = domain->iova_cookie;
++ 	int ret;
++ 
++ 	if (cookie->fq_domain)
++ 		return 0;
++ 
++ 	ret = init_iova_flush_queue(&cookie->iovad, domain);
++ 	if (ret) {
++ 		pr_warn("iova flush queue initialization failed\n");
++ 		return ret;
++ 	}
++ 	/*
++ 	 * Prevent incomplete iovad->fq being observable. Pairs with path from
++ 	 * __iommu_dma_unmap() through iommu_dma_free_iova() to queue_iova()
++ 	 */
++ 	smp_wmb();
++ 	WRITE_ONCE(cookie->fq_domain, domain);
++ 	return 0;
++ }
++ 
+++>>>>>>> 649ad9835a37 (iommu/iova: Squash flush_cb abstraction)
+  /**
+   * iommu_dma_init_domain - Initialise a DMA mapping domain
+   * @domain: IOMMU domain previously prepared by iommu_get_dma_cookie()
+diff --cc drivers/iommu/iova.c
+index 1c18cdc4d102,bbf642940988..000000000000
+--- a/drivers/iommu/iova.c
++++ b/drivers/iommu/iova.c
+@@@ -102,12 -90,10 +102,19 @@@ static void free_iova_flush_queue(struc
+  	free_percpu(iovad->fq);
+  
+  	iovad->fq         = NULL;
+++<<<<<<< HEAD
+ +	iovad->flush_cb   = NULL;
+ +	iovad->entry_dtor = NULL;
+ +}
+ +
+ +int init_iova_flush_queue(struct iova_domain *iovad,
+ +			  iova_flush_cb flush_cb, iova_entry_dtor entry_dtor)
+++=======
++ 	iovad->fq_domain  = NULL;
++ }
++ 
++ int init_iova_flush_queue(struct iova_domain *iovad, struct iommu_domain *fq_domain)
+++>>>>>>> 649ad9835a37 (iommu/iova: Squash flush_cb abstraction)
+  {
+  	struct iova_fq __percpu *queue;
+  	int cpu;
+@@@ -119,9 -105,6 +126,12 @@@
+  	if (!queue)
+  		return -ENOMEM;
+  
+++<<<<<<< HEAD
+ +	iovad->flush_cb   = flush_cb;
+ +	iovad->entry_dtor = entry_dtor;
+ +
+++=======
+++>>>>>>> 649ad9835a37 (iommu/iova: Squash flush_cb abstraction)
+  	for_each_possible_cpu(cpu) {
+  		struct iova_fq *fq;
+  
+@@@ -132,8 -115,7 +142,12 @@@
+  		spin_lock_init(&fq->lock);
+  	}
+  
+++<<<<<<< HEAD
+ +	smp_wmb();
+ +
+++=======
++ 	iovad->fq_domain = fq_domain;
+++>>>>>>> 649ad9835a37 (iommu/iova: Squash flush_cb abstraction)
+  	iovad->fq = queue;
+  
+  	timer_setup(&iovad->fq_timer, fq_flush_timeout, 0);
+diff --cc include/linux/iova.h
+index 4512ea4f00b8,99be4fcea4f3..000000000000
+--- a/include/linux/iova.h
++++ b/include/linux/iova.h
+@@@ -37,14 -36,6 +38,17 @@@ struct iova_rcache 
+  	struct iova_cpu_rcache __percpu *cpu_rcaches;
+  };
+  
+++<<<<<<< HEAD
+ +struct iova_domain;
+ +
+ +/* Call-Back from IOVA code into IOMMU drivers */
+ +typedef void (* iova_flush_cb)(struct iova_domain *domain);
+ +
+ +/* Destructor for per-entry data */
+ +typedef void (* iova_entry_dtor)(unsigned long data);
+ +
+++=======
+++>>>>>>> 649ad9835a37 (iommu/iova: Squash flush_cb abstraction)
+  /* Number of entries per Flush Queue */
+  #define IOVA_FQ_SIZE	256
+  
+@@@ -87,12 -78,8 +91,11 @@@ struct iova_domain 
+  	struct iova	anchor;		/* rbtree lookup anchor */
+  	struct iova_rcache rcaches[IOVA_RANGE_CACHE_MAX_SIZE];	/* IOVA range caches */
+  
+- 	iova_flush_cb	flush_cb;	/* Call-Back function to flush IOMMU
+- 					   TLBs */
++ 	struct iommu_domain *fq_domain;
+  
+ +	iova_entry_dtor entry_dtor;	/* IOMMU driver specific destructor for
+ +					   iova entry */
+ +
+  	struct timer_list fq_timer;		/* Timer to regularily empty the
+  						   flush-queues */
+  	atomic_t fq_timer_on;			/* 1 when timer is active, 0
+@@@ -155,8 -142,7 +158,12 @@@ struct iova *reserve_iova(struct iova_d
+  	unsigned long pfn_hi);
+  void init_iova_domain(struct iova_domain *iovad, unsigned long granule,
+  	unsigned long start_pfn);
+++<<<<<<< HEAD
+ +int init_iova_flush_queue(struct iova_domain *iovad,
+ +			  iova_flush_cb flush_cb, iova_entry_dtor entry_dtor);
+++=======
++ int init_iova_flush_queue(struct iova_domain *iovad, struct iommu_domain *fq_domain);
+++>>>>>>> 649ad9835a37 (iommu/iova: Squash flush_cb abstraction)
+  struct iova *find_iova(struct iova_domain *iovad, unsigned long pfn);
+  void put_iova_domain(struct iova_domain *iovad);
+  #else
+* Unmerged path drivers/iommu/dma-iommu.c
+* Unmerged path drivers/iommu/iova.c
+* Unmerged path include/linux/iova.h
