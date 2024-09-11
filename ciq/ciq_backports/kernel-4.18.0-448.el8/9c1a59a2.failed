@@ -1,0 +1,175 @@
+gve: DQO: Add ring allocation and initialization
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-448.el8
+commit-author Bailey Forrest <bcf@google.com>
+commit 9c1a59a2f4bcf9926ac5814ae0ce53e449ee0b95
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-448.el8/9c1a59a2.failed
+
+Allocate the buffer and completion ring structures. Do not populate the
+rings yet. That will happen in the respective rx and tx datapath
+follow-on patches
+
+	Signed-off-by: Bailey Forrest <bcf@google.com>
+	Reviewed-by: Willem de Bruijn <willemb@google.com>
+	Reviewed-by: Catherine Sullivan <csully@google.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 9c1a59a2f4bcf9926ac5814ae0ce53e449ee0b95)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/google/gve/gve_dqo.h
+#	drivers/net/ethernet/google/gve/gve_main.c
+#	drivers/net/ethernet/google/gve/gve_rx_dqo.c
+#	drivers/net/ethernet/google/gve/gve_tx_dqo.c
+diff --cc drivers/net/ethernet/google/gve/gve_main.c
+index 676d46e093fe,cddf19c8cf0b..000000000000
+--- a/drivers/net/ethernet/google/gve/gve_main.c
++++ b/drivers/net/ethernet/google/gve/gve_main.c
+@@@ -488,11 -590,42 +496,47 @@@ static int gve_create_rings(struct gve_
+  	return 0;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static void add_napi_init_sync_stats(struct gve_priv *priv,
++ 				     int (*napi_poll)(struct napi_struct *napi,
++ 						      int budget))
++ {
++ 	int i;
++ 
++ 	/* Add tx napi & init sync stats*/
++ 	for (i = 0; i < priv->tx_cfg.num_queues; i++) {
++ 		int ntfy_idx = gve_tx_idx_to_ntfy(priv, i);
++ 
++ 		u64_stats_init(&priv->tx[i].statss);
++ 		priv->tx[i].ntfy_id = ntfy_idx;
++ 		gve_add_napi(priv, ntfy_idx, napi_poll);
++ 	}
++ 	/* Add rx napi  & init sync stats*/
++ 	for (i = 0; i < priv->rx_cfg.num_queues; i++) {
++ 		int ntfy_idx = gve_rx_idx_to_ntfy(priv, i);
++ 
++ 		u64_stats_init(&priv->rx[i].statss);
++ 		priv->rx[i].ntfy_id = ntfy_idx;
++ 		gve_add_napi(priv, ntfy_idx, napi_poll);
++ 	}
++ }
++ 
++ static void gve_tx_free_rings(struct gve_priv *priv)
++ {
++ 	if (gve_is_gqi(priv)) {
++ 		gve_tx_free_rings_gqi(priv);
++ 	} else {
++ 		gve_tx_free_rings_dqo(priv);
++ 	}
++ }
++ 
+++>>>>>>> 9c1a59a2f4bc (gve: DQO: Add ring allocation and initialization)
+  static int gve_alloc_rings(struct gve_priv *priv)
+  {
+ +	int ntfy_idx;
+  	int err;
+ +	int i;
+  
+  	/* Setup tx rings */
+  	priv->tx = kvzalloc(priv->tx_cfg.num_queues * sizeof(*priv->tx),
+@@@ -509,21 -647,18 +558,25 @@@
+  		err = -ENOMEM;
+  		goto free_tx_queue;
+  	}
+- 	err = gve_rx_alloc_rings(priv);
++ 
++ 	if (gve_is_gqi(priv))
++ 		err = gve_rx_alloc_rings(priv);
++ 	else
++ 		err = gve_rx_alloc_rings_dqo(priv);
+  	if (err)
+  		goto free_rx;
+ -
+ -	if (gve_is_gqi(priv))
+ -		add_napi_init_sync_stats(priv, gve_napi_poll);
+ -	else
+ -		add_napi_init_sync_stats(priv, gve_napi_poll_dqo);
+ +	/* Add tx napi & init sync stats*/
+ +	for (i = 0; i < priv->tx_cfg.num_queues; i++) {
+ +		u64_stats_init(&priv->tx[i].statss);
+ +		ntfy_idx = gve_tx_idx_to_ntfy(priv, i);
+ +		gve_add_napi(priv, ntfy_idx);
+ +	}
+ +	/* Add rx napi  & init sync stats*/
+ +	for (i = 0; i < priv->rx_cfg.num_queues; i++) {
+ +		u64_stats_init(&priv->rx[i].statss);
+ +		ntfy_idx = gve_rx_idx_to_ntfy(priv, i);
+ +		gve_add_napi(priv, ntfy_idx);
+ +	}
+  
+  	return 0;
+  
+* Unmerged path drivers/net/ethernet/google/gve/gve_dqo.h
+* Unmerged path drivers/net/ethernet/google/gve/gve_rx_dqo.c
+* Unmerged path drivers/net/ethernet/google/gve/gve_tx_dqo.c
+diff --git a/drivers/net/ethernet/google/gve/gve.h b/drivers/net/ethernet/google/gve/gve.h
+index c3c095d645bd..8097e06e20bb 100644
+--- a/drivers/net/ethernet/google/gve/gve.h
++++ b/drivers/net/ethernet/google/gve/gve.h
+@@ -198,6 +198,10 @@ struct gve_rx_ring {
+ 	struct gve_queue_resources *q_resources; /* head and tail pointer idx */
+ 	dma_addr_t q_resources_bus; /* dma address for the queue resources */
+ 	struct u64_stats_sync statss; /* sync stats for 32bit archs */
++
++	/* head and tail of skb chain for the current packet or NULL if none */
++	struct sk_buff *skb_head;
++	struct sk_buff *skb_tail;
+ };
+ 
+ /* A TX desc ring entry */
+@@ -753,14 +757,14 @@ void gve_free_page(struct device *dev, struct page *page, dma_addr_t dma,
+ netdev_tx_t gve_tx(struct sk_buff *skb, struct net_device *dev);
+ bool gve_tx_poll(struct gve_notify_block *block, int budget);
+ int gve_tx_alloc_rings(struct gve_priv *priv);
+-void gve_tx_free_rings(struct gve_priv *priv);
++void gve_tx_free_rings_gqi(struct gve_priv *priv);
+ __be32 gve_tx_load_event_counter(struct gve_priv *priv,
+ 				 struct gve_tx_ring *tx);
+ /* rx handling */
+ void gve_rx_write_doorbell(struct gve_priv *priv, struct gve_rx_ring *rx);
+ bool gve_rx_poll(struct gve_notify_block *block, int budget);
+ int gve_rx_alloc_rings(struct gve_priv *priv);
+-void gve_rx_free_rings(struct gve_priv *priv);
++void gve_rx_free_rings_gqi(struct gve_priv *priv);
+ bool gve_clean_rx_done(struct gve_rx_ring *rx, int budget,
+ 		       netdev_features_t feat);
+ /* Reset */
+* Unmerged path drivers/net/ethernet/google/gve/gve_dqo.h
+* Unmerged path drivers/net/ethernet/google/gve/gve_main.c
+diff --git a/drivers/net/ethernet/google/gve/gve_rx.c b/drivers/net/ethernet/google/gve/gve_rx.c
+index af30f1e5806c..29658bc8455a 100644
+--- a/drivers/net/ethernet/google/gve/gve_rx.c
++++ b/drivers/net/ethernet/google/gve/gve_rx.c
+@@ -238,7 +238,7 @@ int gve_rx_alloc_rings(struct gve_priv *priv)
+ 	return err;
+ }
+ 
+-void gve_rx_free_rings(struct gve_priv *priv)
++void gve_rx_free_rings_gqi(struct gve_priv *priv)
+ {
+ 	int i;
+ 
+* Unmerged path drivers/net/ethernet/google/gve/gve_rx_dqo.c
+diff --git a/drivers/net/ethernet/google/gve/gve_tx.c b/drivers/net/ethernet/google/gve/gve_tx.c
+index 6559c232a86a..de1550f352fa 100644
+--- a/drivers/net/ethernet/google/gve/gve_tx.c
++++ b/drivers/net/ethernet/google/gve/gve_tx.c
+@@ -245,7 +245,7 @@ int gve_tx_alloc_rings(struct gve_priv *priv)
+ 	return err;
+ }
+ 
+-void gve_tx_free_rings(struct gve_priv *priv)
++void gve_tx_free_rings_gqi(struct gve_priv *priv)
+ {
+ 	int i;
+ 
+* Unmerged path drivers/net/ethernet/google/gve/gve_tx_dqo.c
