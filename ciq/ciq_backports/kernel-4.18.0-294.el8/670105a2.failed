@@ -1,0 +1,97 @@
+mm: compaction: avoid 100% CPU usage during compaction when a task is killed
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+Rebuild_CHGLOG: - [mm] mm: compaction: avoid 100 CPU usage during compaction when a task is killed (Rafael Aquini) [1862175]
+Rebuild_FUZZ: 99.34%
+commit-author Mel Gorman <mgorman@techsingularity.net>
+commit 670105a25608affe01cb0ccdc2a1f4bd2327172b
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/670105a2.failed
+
+"howaboutsynergy" reported via kernel buzilla number 204165 that
+compact_zone_order was consuming 100% CPU during a stress test for
+prolonged periods of time.  Specifically the following command, which
+should exit in 10 seconds, was taking an excessive time to finish while
+the CPU was pegged at 100%.
+
+  stress -m 220 --vm-bytes 1000000000 --timeout 10
+
+Tracing indicated a pattern as follows
+
+          stress-3923  [007]   519.106208: mm_compaction_isolate_migratepages: range=(0x70bb80 ~ 0x70bb80) nr_scanned=0 nr_taken=0
+          stress-3923  [007]   519.106212: mm_compaction_isolate_migratepages: range=(0x70bb80 ~ 0x70bb80) nr_scanned=0 nr_taken=0
+          stress-3923  [007]   519.106216: mm_compaction_isolate_migratepages: range=(0x70bb80 ~ 0x70bb80) nr_scanned=0 nr_taken=0
+          stress-3923  [007]   519.106219: mm_compaction_isolate_migratepages: range=(0x70bb80 ~ 0x70bb80) nr_scanned=0 nr_taken=0
+          stress-3923  [007]   519.106223: mm_compaction_isolate_migratepages: range=(0x70bb80 ~ 0x70bb80) nr_scanned=0 nr_taken=0
+          stress-3923  [007]   519.106227: mm_compaction_isolate_migratepages: range=(0x70bb80 ~ 0x70bb80) nr_scanned=0 nr_taken=0
+          stress-3923  [007]   519.106231: mm_compaction_isolate_migratepages: range=(0x70bb80 ~ 0x70bb80) nr_scanned=0 nr_taken=0
+          stress-3923  [007]   519.106235: mm_compaction_isolate_migratepages: range=(0x70bb80 ~ 0x70bb80) nr_scanned=0 nr_taken=0
+          stress-3923  [007]   519.106238: mm_compaction_isolate_migratepages: range=(0x70bb80 ~ 0x70bb80) nr_scanned=0 nr_taken=0
+          stress-3923  [007]   519.106242: mm_compaction_isolate_migratepages: range=(0x70bb80 ~ 0x70bb80) nr_scanned=0 nr_taken=0
+
+Note that compaction is entered in rapid succession while scanning and
+isolating nothing.  The problem is that when a task that is compacting
+receives a fatal signal, it retries indefinitely instead of exiting
+while making no progress as a fatal signal is pending.
+
+It's not easy to trigger this condition although enabling zswap helps on
+the basis that the timing is altered.  A very small window has to be hit
+for the problem to occur (signal delivered while compacting and
+isolating a PFN for migration that is not aligned to SWAP_CLUSTER_MAX).
+
+This was reproduced locally -- 16G single socket system, 8G swap, 30%
+zswap configured, vm-bytes 22000000000 using Colin Kings stress-ng
+implementation from github running in a loop until the problem hits).
+Tracing recorded the problem occurring almost 200K times in a short
+window.  With this patch, the problem hit 4 times but the task existed
+normally instead of consuming CPU.
+
+This problem has existed for some time but it was made worse by commit
+cf66f0700c8f ("mm, compaction: do not consider a need to reschedule as
+contention").  Before that commit, if the same condition was hit then
+locks would be quickly contended and compaction would exit that way.
+
+Bugzilla: https://bugzilla.kernel.org/show_bug.cgi?id=204165
+Link: http://lkml.kernel.org/r/20190718085708.GE24383@techsingularity.net
+Fixes: cf66f0700c8f ("mm, compaction: do not consider a need to reschedule as contention")
+	Signed-off-by: Mel Gorman <mgorman@techsingularity.net>
+	Reviewed-by: Vlastimil Babka <vbabka@suse.cz>
+	Cc: <stable@vger.kernel.org>	[5.1+]
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit 670105a25608affe01cb0ccdc2a1f4bd2327172b)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	mm/compaction.c
+diff --cc mm/compaction.c
+index 79db11f23bf2,952dc2fb24e5..000000000000
+--- a/mm/compaction.c
++++ b/mm/compaction.c
+@@@ -754,13 -842,15 +754,21 @@@ isolate_migratepages_block(struct compa
+  
+  		/*
+  		 * Periodically drop the lock (if held) regardless of its
+- 		 * contention, to give chance to IRQs. Abort async compaction
+- 		 * if contended.
++ 		 * contention, to give chance to IRQs. Abort completely if
++ 		 * a fatal signal is pending.
+  		 */
+  		if (!(low_pfn % SWAP_CLUSTER_MAX)
+++<<<<<<< HEAD
+ +		    && compact_unlock_should_abort(zone_lru_lock(zone), flags,
+ +								&locked, cc))
+ +			break;
+++=======
++ 		    && compact_unlock_should_abort(&pgdat->lru_lock,
++ 					    flags, &locked, cc)) {
++ 			low_pfn = 0;
++ 			goto fatal_pending;
++ 		}
+++>>>>>>> 670105a25608 (mm: compaction: avoid 100% CPU usage during compaction when a task is killed)
+  
+  		if (!pfn_valid_within(low_pfn))
+  			goto isolate_fail;
+* Unmerged path mm/compaction.c
