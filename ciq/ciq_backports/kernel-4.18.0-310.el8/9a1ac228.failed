@@ -1,0 +1,192 @@
+mm/memcontrol:rewrite mem_cgroup_page_lruvec()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-310.el8
+commit-author Hui Su <sh_def@163.com>
+commit 9a1ac2288cf16f9406ca54ef221bfcf262393b15
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-310.el8/9a1ac228.failed
+
+mem_cgroup_page_lruvec() in memcontrol.c and mem_cgroup_lruvec() in
+memcontrol.h is very similar except for the param(page and memcg) which
+also can be convert to each other.
+
+So rewrite mem_cgroup_page_lruvec() with mem_cgroup_lruvec().
+
+[alex.shi@linux.alibaba.com: add missed warning in mem_cgroup_lruvec]
+  Link: https://lkml.kernel.org/r/94f17bb7-ec61-5b72-3555-fabeb5a4d73b@linux.alibaba.com
+[lstoakes@gmail.com: warn on missing memcg on mem_cgroup_page_lruvec()]
+  Link: https://lkml.kernel.org/r/20201125112202.387009-1-lstoakes@gmail.com
+
+Link: https://lkml.kernel.org/r/20201108143731.GA74138@rlk
+	Signed-off-by: Hui Su <sh_def@163.com>
+	Signed-off-by: Alex Shi <alex.shi@linux.alibaba.com>
+	Signed-off-by: Lorenzo Stoakes <lstoakes@gmail.com>
+	Acked-by: Michal Hocko <mhocko@suse.com>
+	Acked-by: Johannes Weiner <hannes@cmpxchg.org>
+	Reviewed-by: Shakeel Butt <shakeelb@google.com>
+	Acked-by: Roman Gushchin <guro@fb.com>
+	Cc: Vladimir Davydov <vdavydov.dev@gmail.com>
+	Cc: Yafang Shao <laoar.shao@gmail.com>
+	Cc: Chris Down <chris@chrisdown.name>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit 9a1ac2288cf16f9406ca54ef221bfcf262393b15)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	mm/memcontrol.c
+diff --cc mm/memcontrol.c
+index 4d65b541b4a3,605f671203ef..000000000000
+--- a/mm/memcontrol.c
++++ b/mm/memcontrol.c
+@@@ -1314,43 -1325,74 +1314,96 @@@ int mem_cgroup_scan_tasks(struct mem_cg
+  	return ret;
+  }
+  
+ -#ifdef CONFIG_DEBUG_VM
+ -void lruvec_memcg_debug(struct lruvec *lruvec, struct page *page)
+ +/**
+++<<<<<<< HEAD
+ + * mem_cgroup_page_lruvec - return lruvec for isolating/putting an LRU page
+ + * @page: the page
+ + * @pgdat: pgdat of the page
+ + *
+ + * This function relies on page's memcg being stable - see the
+ + * access rules in commit_charge().
+ + */
+ +struct lruvec *mem_cgroup_page_lruvec(struct page *page, struct pglist_data *pgdat)
+  {
+ +	struct mem_cgroup_per_node *mz;
+  	struct mem_cgroup *memcg;
+ +	struct lruvec *lruvec;
+  
+ -	if (mem_cgroup_disabled())
+ -		return;
+ -
+ -	memcg = page_memcg(page);
+ +	if (mem_cgroup_disabled()) {
+ +		lruvec = &pgdat->__lruvec;
+ +		goto out;
+ +	}
+  
+ +	memcg = page->mem_cgroup;
+ +	/*
+ +	 * Swapcache readahead pages are added to the LRU - and
+ +	 * possibly migrated - before they are charged.
+ +	 */
+  	if (!memcg)
+ -		VM_BUG_ON_PAGE(lruvec_memcg(lruvec) != root_mem_cgroup, page);
+ -	else
+ -		VM_BUG_ON_PAGE(lruvec_memcg(lruvec) != memcg, page);
+ -}
+ -#endif
+ +		memcg = root_mem_cgroup;
+  
+ -/**
+ +	mz = mem_cgroup_page_nodeinfo(memcg, page);
+ +	lruvec = &mz->lruvec;
+ +out:
+ +	/*
+ +	 * Since a node can be onlined after the mem_cgroup was created,
+ +	 * we have to be prepared to initialize lruvec->zone here;
+ +	 * and if offlined then reonlined, we need to reinitialize it.
+ +	 */
+ +	if (unlikely(lruvec->pgdat != pgdat))
+ +		lruvec->pgdat = pgdat;
+++=======
++  * lock_page_lruvec - lock and return lruvec for a given page.
++  * @page: the page
++  *
++  * This series functions should be used in either conditions:
++  * PageLRU is cleared or unset
++  * or page->_refcount is zero
++  * or page is locked.
++  */
++ struct lruvec *lock_page_lruvec(struct page *page)
++ {
++ 	struct lruvec *lruvec;
++ 	struct pglist_data *pgdat = page_pgdat(page);
++ 
++ 	rcu_read_lock();
++ 	lruvec = mem_cgroup_page_lruvec(page, pgdat);
++ 	spin_lock(&lruvec->lru_lock);
++ 	rcu_read_unlock();
++ 
++ 	lruvec_memcg_debug(lruvec, page);
++ 
++ 	return lruvec;
++ }
++ 
++ struct lruvec *lock_page_lruvec_irq(struct page *page)
++ {
++ 	struct lruvec *lruvec;
++ 	struct pglist_data *pgdat = page_pgdat(page);
++ 
++ 	rcu_read_lock();
++ 	lruvec = mem_cgroup_page_lruvec(page, pgdat);
++ 	spin_lock_irq(&lruvec->lru_lock);
++ 	rcu_read_unlock();
++ 
++ 	lruvec_memcg_debug(lruvec, page);
++ 
++ 	return lruvec;
++ }
++ 
++ struct lruvec *lock_page_lruvec_irqsave(struct page *page, unsigned long *flags)
++ {
++ 	struct lruvec *lruvec;
++ 	struct pglist_data *pgdat = page_pgdat(page);
++ 
++ 	rcu_read_lock();
++ 	lruvec = mem_cgroup_page_lruvec(page, pgdat);
++ 	spin_lock_irqsave(&lruvec->lru_lock, *flags);
++ 	rcu_read_unlock();
++ 
++ 	lruvec_memcg_debug(lruvec, page);
++ 
+++>>>>>>> 9a1ac2288cf1 (mm/memcontrol:rewrite mem_cgroup_page_lruvec())
+  	return lruvec;
+  }
+  
+diff --git a/include/linux/memcontrol.h b/include/linux/memcontrol.h
+index da9b4f3ccbfd..453be4ff389a 100644
+--- a/include/linux/memcontrol.h
++++ b/include/linux/memcontrol.h
+@@ -493,9 +493,10 @@ mem_cgroup_nodeinfo(struct mem_cgroup *memcg, int nid)
+ /**
+  * mem_cgroup_lruvec - get the lru list vector for a memcg & node
+  * @memcg: memcg of the wanted lruvec
++ * @pgdat: pglist_data
+  *
+  * Returns the lru list vector holding pages for a given @memcg &
+- * @node combination. This can be the node lruvec, if the memory
++ * @pgdat combination. This can be the node lruvec, if the memory
+  * controller is disabled.
+  */
+ static inline struct lruvec *mem_cgroup_lruvec(struct mem_cgroup *memcg,
+@@ -525,7 +526,21 @@ static inline struct lruvec *mem_cgroup_lruvec(struct mem_cgroup *memcg,
+ 	return lruvec;
+ }
+ 
+-struct lruvec *mem_cgroup_page_lruvec(struct page *, struct pglist_data *);
++/**
++ * mem_cgroup_page_lruvec - return lruvec for isolating/putting an LRU page
++ * @page: the page
++ * @pgdat: pgdat of the page
++ *
++ * This function relies on page->mem_cgroup being stable.
++ */
++static inline struct lruvec *mem_cgroup_page_lruvec(struct page *page,
++						struct pglist_data *pgdat)
++{
++	struct mem_cgroup *memcg = page_memcg(page);
++
++	VM_WARN_ON_ONCE_PAGE(!memcg, page);
++	return mem_cgroup_lruvec(memcg, pgdat);
++}
+ 
+ struct mem_cgroup *mem_cgroup_from_task(struct task_struct *p);
+ 
+* Unmerged path mm/memcontrol.c
