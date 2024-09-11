@@ -2594,7 +2594,7 @@ send_done:
 	if (!nlh) {
 		err = devlink_dpipe_send_and_alloc_skb(&skb, info);
 		if (err)
-			goto err_skb_send_alloc;
+			return err;
 		goto send_done;
 	}
 	return genlmsg_reply(skb, info);
@@ -2602,7 +2602,6 @@ send_done:
 nla_put_failure:
 	err = -EMSGSIZE;
 err_resource_put:
-err_skb_send_alloc:
 	nlmsg_free(skb);
 	return err;
 }
