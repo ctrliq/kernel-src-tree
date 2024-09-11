@@ -1,0 +1,91 @@
+net/mlx5e: Protect mod header entry flows list with spinlock
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-193.el8
+Rebuild_CHGLOG: - [netdrv] mlx5e: Protect mod header entry flows list with spinlock (Alaa Hleihel) [1663231 1724336]
+Rebuild_FUZZ: 96.55%
+commit-author Vlad Buslov <vladbu@mellanox.com>
+commit 83a52f0d525587de65b2bc979a12b4dfad9ea82a
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-193.el8/83a52f0d.failed
+
+To remove dependency on rtnl lock, extend mod header entry with spinlock
+and use it to protect list of flows attached to mod header entry from
+concurrent modifications.
+
+	Signed-off-by: Vlad Buslov <vladbu@mellanox.com>
+	Reviewed-by: Jianbo Liu <jianbol@mellanox.com>
+	Reviewed-by: Roi Dayan <roid@mellanox.com>
+	Signed-off-by: Saeed Mahameed <saeedm@mellanox.com>
+(cherry picked from commit 83a52f0d525587de65b2bc979a12b4dfad9ea82a)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/mellanox/mlx5/core/en_tc.c
+diff --cc drivers/net/ethernet/mellanox/mlx5/core/en_tc.c
+index c033e0d4fc59,09d5cc700297..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_tc.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_tc.c
+@@@ -249,7 -360,9 +251,8 @@@ static int mlx5e_attach_mod_hdr(struct 
+  	mh->key.actions = (void *)mh + sizeof(*mh);
+  	memcpy(mh->key.actions, key.actions, actions_size);
+  	mh->key.num_actions = num_actions;
++ 	spin_lock_init(&mh->flows_lock);
+  	INIT_LIST_HEAD(&mh->flows);
+ -	refcount_set(&mh->refcnt, 1);
+  
+  	err = mlx5_modify_header_alloc(priv->mdev, namespace,
+  				       mh->key.num_actions,
+@@@ -258,14 -371,14 +261,22 @@@
+  	if (err)
+  		goto out_err;
+  
+ -	hash_add(tbl->hlist, &mh->mod_hdr_hlist, hash_key);
+ +	if (flow->flags & MLX5E_TC_FLOW_ESWITCH)
+ +		hash_add(esw->offloads.mod_hdr_tbl, &mh->mod_hdr_hlist, hash_key);
+ +	else
+ +		hash_add(priv->fs.tc.mod_hdr_tbl, &mh->mod_hdr_hlist, hash_key);
+  
+  attach_flow:
+++<<<<<<< HEAD
+ +	list_add(&flow->mod_hdr, &mh->flows);
+ +	if (flow->flags & MLX5E_TC_FLOW_ESWITCH)
+++=======
++ 	flow->mh = mh;
++ 	spin_lock(&mh->flows_lock);
++ 	list_add(&flow->mod_hdr, &mh->flows);
++ 	spin_unlock(&mh->flows_lock);
++ 	if (is_eswitch_flow)
+++>>>>>>> 83a52f0d5255 (net/mlx5e: Protect mod header entry flows list with spinlock)
+  		flow->esw_attr->mod_hdr_id = mh->mod_hdr_id;
+  	else
+  		flow->nic_attr->mod_hdr_id = mh->mod_hdr_id;
+@@@ -280,19 -393,16 +291,21 @@@ out_err
+  static void mlx5e_detach_mod_hdr(struct mlx5e_priv *priv,
+  				 struct mlx5e_tc_flow *flow)
+  {
+ -	/* flow wasn't fully initialized */
+ -	if (!flow->mh)
+ -		return;
+ +	struct list_head *next = flow->mod_hdr.next;
+  
++ 	spin_lock(&flow->mh->flows_lock);
+  	list_del(&flow->mod_hdr);
++ 	spin_unlock(&flow->mh->flows_lock);
+  
+ -	mlx5e_mod_hdr_put(priv, flow->mh);
+ -	flow->mh = NULL;
+ +	if (list_empty(next)) {
+ +		struct mlx5e_mod_hdr_entry *mh;
+ +
+ +		mh = list_entry(next, struct mlx5e_mod_hdr_entry, flows);
+ +
+ +		mlx5_modify_header_dealloc(priv->mdev, mh->mod_hdr_id);
+ +		hash_del(&mh->mod_hdr_hlist);
+ +		kfree(mh);
+ +	}
+  }
+  
+  static
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/en_tc.c
