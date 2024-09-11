@@ -1,0 +1,110 @@
+io_uring: fix possible race condition against REQ_F_NEED_CLEANUP
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Xiaoguang Wang <xiaoguang.wang@linux.alibaba.com>
+commit 6f2cc1664db20676069cff27a461ccc97dbfd114
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/6f2cc166.failed
+
+In io_read() or io_write(), when io request is submitted successfully,
+it'll go through the below sequence:
+
+    kfree(iovec);
+    req->flags &= ~REQ_F_NEED_CLEANUP;
+    return ret;
+
+But clearing REQ_F_NEED_CLEANUP might be unsafe. The io request may
+already have been completed, and then io_complete_rw_iopoll()
+and io_complete_rw() will be called, both of which will also modify
+req->flags if needed. This causes a race condition, with concurrent
+non-atomic modification of req->flags.
+
+To eliminate this race, in io_read() or io_write(), if io request is
+submitted successfully, we don't remove REQ_F_NEED_CLEANUP flag. If
+REQ_F_NEED_CLEANUP is set, we'll leave __io_req_aux_free() to the
+iovec cleanup work correspondingly.
+
+	Cc: stable@vger.kernel.org
+	Signed-off-by: Xiaoguang Wang <xiaoguang.wang@linux.alibaba.com>
+	Signed-off-by: Jens Axboe <axboe@kernel.dk>
+(cherry picked from commit 6f2cc1664db20676069cff27a461ccc97dbfd114)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/io_uring.c
+diff --cc fs/io_uring.c
+index 0b681a205810,a78201b96179..000000000000
+--- a/fs/io_uring.c
++++ b/fs/io_uring.c
+@@@ -1373,35 -2648,30 +1373,41 @@@ static int io_read(struct io_kiocb *req
+  	if (!ret) {
+  		ssize_t ret2;
+  
+ -		if (req->file->f_op->read_iter)
+ -			ret2 = call_read_iter(req->file, kiocb, &iter);
+ +		if (file->f_op->read_iter)
+ +			ret2 = call_read_iter(file, kiocb, &iter);
+  		else
+ -			ret2 = loop_rw_iter(READ, req->file, kiocb, &iter);
+ +			ret2 = loop_rw_iter(READ, file, kiocb, &iter);
+  
+ +		/*
+ +		 * In case of a short read, punt to async. This can happen
+ +		 * if we have data partially cached. Alternatively we can
+ +		 * return the short read, in which case the application will
+ +		 * need to issue another SQE and wait for it. That SQE will
+ +		 * need async punt anyway, so it's more efficient to do it
+ +		 * here.
+ +		 */
+ +		if (force_nonblock && ret2 > 0 && ret2 < read_size)
+ +			ret2 = -EAGAIN;
+  		/* Catch -EAGAIN return for forced non-blocking submission */
+  		if (!force_nonblock || ret2 != -EAGAIN) {
+ -			kiocb_done(kiocb, ret2);
+ +			io_rw_done(kiocb, ret2);
+  		} else {
+ -copy_iov:
+ -			ret = io_setup_async_rw(req, io_size, iovec,
+ -						inline_vecs, &iter);
+ -			if (ret)
+ -				goto out_free;
+ -			/* any defer here is final, must blocking retry */
+ -			if (!(req->flags & REQ_F_NOWAIT) &&
+ -			    !file_can_poll(req->file))
+ -				req->flags |= REQ_F_MUST_PUNT;
+ -			return -EAGAIN;
+ +			/*
+ +			 * If ->needs_lock is true, we're already in async
+ +			 * context.
+ +			 */
+ +			if (!s->needs_lock)
+ +				io_async_list_note(READ, req, iov_count);
+ +			ret = -EAGAIN;
+  		}
+  	}
+++<<<<<<< HEAD
+ +	kfree(iovec);
+++=======
++ out_free:
++ 	if (!(req->flags & REQ_F_NEED_CLEANUP))
++ 		kfree(iovec);
+++>>>>>>> 6f2cc1664db2 (io_uring: fix possible race condition against REQ_F_NEED_CLEANUP)
+  	return ret;
+  }
+  
+@@@ -1476,7 -2793,8 +1482,12 @@@ static int io_write(struct io_kiocb *re
+  		}
+  	}
+  out_free:
+++<<<<<<< HEAD
+ +	kfree(iovec);
+++=======
++ 	if (!(req->flags & REQ_F_NEED_CLEANUP))
++ 		kfree(iovec);
+++>>>>>>> 6f2cc1664db2 (io_uring: fix possible race condition against REQ_F_NEED_CLEANUP)
+  	return ret;
+  }
+  
+* Unmerged path fs/io_uring.c
