@@ -129,7 +129,6 @@ nfp_flower_calculate_key_layers(struct nfp_app *app,
 				struct net_device *netdev,
 				struct nfp_fl_key_ls *ret_key_ls,
 				struct tc_cls_flower_offload *flow,
-				bool egress,
 				enum nfp_flower_tun_type *tun_type)
 {
 	struct flow_dissector_key_basic *mask_basic = NULL;
@@ -251,9 +250,6 @@ nfp_flower_calculate_key_layers(struct nfp_app *app,
 		/* Ensure the ingress netdev matches the expected tun type. */
 		if (!nfp_fl_netdev_is_tunnel_type(netdev, *tun_type))
 			return -EOPNOTSUPP;
-	} else if (egress) {
-		/* Reject non tunnel matches offloaded to egress repr. */
-		return -EOPNOTSUPP;
 	}
 
 	if (dissector_uses_key(flow->dissector, FLOW_DISSECTOR_KEY_BASIC)) {
@@ -374,7 +370,7 @@ nfp_flower_calculate_key_layers(struct nfp_app *app,
 }
 
 static struct nfp_fl_payload *
-nfp_flower_allocate_new(struct nfp_fl_key_ls *key_layer, bool egress)
+nfp_flower_allocate_new(struct nfp_fl_key_ls *key_layer)
 {
 	struct nfp_fl_payload *flow_pay;
 
@@ -398,7 +394,6 @@ nfp_flower_allocate_new(struct nfp_fl_key_ls *key_layer, bool egress)
 
 	flow_pay->nfp_tun_ipv4_addr = 0;
 	flow_pay->meta.flags = 0;
-	flow_pay->ingress_offload = !egress;
 
 	return flow_pay;
 
@@ -416,7 +411,6 @@ err_free_flow:
  * @app:	Pointer to the APP handle
  * @netdev:	netdev structure.
  * @flow:	TC flower classifier offload structure.
- * @egress:	NFP netdev is the egress.
  *
  * Adds a new flow to the repeated hash structure and action payload.
  *
@@ -424,46 +418,32 @@ err_free_flow:
  */
 static int
 nfp_flower_add_offload(struct nfp_app *app, struct net_device *netdev,
-		       struct tc_cls_flower_offload *flow, bool egress)
+		       struct tc_cls_flower_offload *flow)
 {
 	enum nfp_flower_tun_type tun_type = NFP_FL_TUNNEL_NONE;
 	struct nfp_flower_priv *priv = app->priv;
 	struct nfp_fl_payload *flow_pay;
 	struct nfp_fl_key_ls *key_layer;
 	struct nfp_port *port = NULL;
-	struct net_device *ingr_dev;
 	int err;
 
 	if (nfp_netdev_is_nfp_repr(netdev))
 		port = nfp_port_from_netdev(netdev);
-
-	ingr_dev = egress ? NULL : netdev;
-	flow_pay = nfp_flower_search_fl_table(app, flow->cookie, ingr_dev,
-					      NFP_FL_STATS_CTX_DONT_CARE);
-	if (flow_pay) {
-		/* Ignore as duplicate if it has been added by different cb. */
-		if (flow_pay->ingress_offload && egress)
-			return 0;
-		else
-			return -EOPNOTSUPP;
-	}
 
 	key_layer = kmalloc(sizeof(*key_layer), GFP_KERNEL);
 	if (!key_layer)
 		return -ENOMEM;
 
 	err = nfp_flower_calculate_key_layers(app, netdev, key_layer, flow,
-					      egress, &tun_type);
+					      &tun_type);
 	if (err)
 		goto err_free_key_ls;
 
-	flow_pay = nfp_flower_allocate_new(key_layer, egress);
+	flow_pay = nfp_flower_allocate_new(key_layer);
 	if (!flow_pay) {
 		err = -ENOMEM;
 		goto err_free_key_ls;
 	}
-
-	flow_pay->ingress_dev = egress ? NULL : netdev;
 
 	err = nfp_flower_compile_flow_match(app, flow, key_layer, netdev,
 					    flow_pay, tun_type);
@@ -474,8 +454,7 @@ nfp_flower_add_offload(struct nfp_app *app, struct net_device *netdev,
 	if (err)
 		goto err_destroy_flow;
 
-	err = nfp_compile_flow_metadata(app, flow, flow_pay,
-					flow_pay->ingress_dev);
+	err = nfp_compile_flow_metadata(app, flow, flow_pay, netdev);
 	if (err)
 		goto err_destroy_flow;
 
@@ -513,7 +492,6 @@ err_free_key_ls:
  * @app:	Pointer to the APP handle
  * @netdev:	netdev structure.
  * @flow:	TC flower classifier offload structure
- * @egress:	Netdev is the egress dev.
  *
  * Removes a flow from the repeated hash structure and clears the
  * action payload.
@@ -522,22 +500,20 @@ err_free_key_ls:
  */
 static int
 nfp_flower_del_offload(struct nfp_app *app, struct net_device *netdev,
-		       struct tc_cls_flower_offload *flow, bool egress)
+		       struct tc_cls_flower_offload *flow)
 {
 	struct nfp_flower_priv *priv = app->priv;
 	struct nfp_fl_payload *nfp_flow;
 	struct nfp_port *port = NULL;
-	struct net_device *ingr_dev;
 	int err;
 
 	if (nfp_netdev_is_nfp_repr(netdev))
 		port = nfp_port_from_netdev(netdev);
 
-	ingr_dev = egress ? NULL : netdev;
-	nfp_flow = nfp_flower_search_fl_table(app, flow->cookie, ingr_dev,
+	nfp_flow = nfp_flower_search_fl_table(app, flow->cookie, netdev,
 					      NFP_FL_STATS_CTX_DONT_CARE);
 	if (!nfp_flow)
-		return egress ? 0 : -ENOENT;
+		return -ENOENT;
 
 	err = nfp_modify_flow_metadata(app, nfp_flow);
 	if (err)
@@ -569,7 +545,6 @@ err_free_flow:
  * @app:	Pointer to the APP handle
  * @netdev:	Netdev structure.
  * @flow:	TC flower classifier offload structure
- * @egress:	Netdev is the egress dev.
  *
  * Populates a flow statistics structure which which corresponds to a
  * specific flow.
@@ -578,21 +553,16 @@ err_free_flow:
  */
 static int
 nfp_flower_get_stats(struct nfp_app *app, struct net_device *netdev,
-		     struct tc_cls_flower_offload *flow, bool egress)
+		     struct tc_cls_flower_offload *flow)
 {
 	struct nfp_flower_priv *priv = app->priv;
 	struct nfp_fl_payload *nfp_flow;
-	struct net_device *ingr_dev;
 	u32 ctx_id;
 
-	ingr_dev = egress ? NULL : netdev;
-	nfp_flow = nfp_flower_search_fl_table(app, flow->cookie, ingr_dev,
+	nfp_flow = nfp_flower_search_fl_table(app, flow->cookie, netdev,
 					      NFP_FL_STATS_CTX_DONT_CARE);
 	if (!nfp_flow)
 		return -EINVAL;
-
-	if (nfp_flow->ingress_offload && egress)
-		return 0;
 
 	ctx_id = be32_to_cpu(nfp_flow->meta.host_ctx_id);
 
@@ -610,35 +580,18 @@ nfp_flower_get_stats(struct nfp_app *app, struct net_device *netdev,
 
 static int
 nfp_flower_repr_offload(struct nfp_app *app, struct net_device *netdev,
-			struct tc_cls_flower_offload *flower, bool egress)
+			struct tc_cls_flower_offload *flower)
 {
 	if (!eth_proto_is_802_3(flower->common.protocol))
 		return -EOPNOTSUPP;
 
 	switch (flower->command) {
 	case TC_CLSFLOWER_REPLACE:
-		return nfp_flower_add_offload(app, netdev, flower, egress);
+		return nfp_flower_add_offload(app, netdev, flower);
 	case TC_CLSFLOWER_DESTROY:
-		return nfp_flower_del_offload(app, netdev, flower, egress);
+		return nfp_flower_del_offload(app, netdev, flower);
 	case TC_CLSFLOWER_STATS:
-		return nfp_flower_get_stats(app, netdev, flower, egress);
-	default:
-		return -EOPNOTSUPP;
-	}
-}
-
-int nfp_flower_setup_tc_egress_cb(enum tc_setup_type type, void *type_data,
-				  void *cb_priv)
-{
-	struct nfp_repr *repr = cb_priv;
-
-	if (!tc_cls_can_offload_and_chain0(repr->netdev, type_data))
-		return -EOPNOTSUPP;
-
-	switch (type) {
-	case TC_SETUP_CLSFLOWER:
-		return nfp_flower_repr_offload(repr->app, repr->netdev,
-					       type_data, true);
+		return nfp_flower_get_stats(app, netdev, flower);
 	default:
 		return -EOPNOTSUPP;
 	}
@@ -655,7 +608,7 @@ static int nfp_flower_setup_tc_block_cb(enum tc_setup_type type,
 	switch (type) {
 	case TC_SETUP_CLSFLOWER:
 		return nfp_flower_repr_offload(repr->app, repr->netdev,
-					       type_data, false);
+					       type_data);
 	default:
 		return -EOPNOTSUPP;
 	}
@@ -730,7 +683,7 @@ static int nfp_flower_setup_indr_block_cb(enum tc_setup_type type,
 	switch (type) {
 	case TC_SETUP_CLSFLOWER:
 		return nfp_flower_repr_offload(priv->app, priv->netdev,
-					       type_data, false);
+					       type_data);
 	default:
 		return -EOPNOTSUPP;
 	}
