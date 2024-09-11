@@ -1,0 +1,264 @@
+ice: Introduce bulk update for page count
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-147.el8
+commit-author Maciej Fijalkowski <maciej.fijalkowski@intel.com>
+commit 03c66a1376616015b04b6783feadfcf02ba37c3f
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-147.el8/03c66a13.failed
+
+{get,put}_page are atomic operations which we use for page count
+handling. The current logic for refcount handling is that we increment
+it when passing a skb with the data from the first half of page up to
+netstack and recycle the second half of page. This operation protects us
+from losing a page since the network stack can decrement the refcount of
+page from skb.
+
+The performance can be gently improved by doing the bulk updates of
+refcount instead of doing it one by one. During the buffer initialization,
+maximize the page's refcount and don't allow the refcount to become
+less than two.
+
+	Signed-off-by: Maciej Fijalkowski <maciej.fijalkowski@intel.com>
+	Signed-off-by: Anirudh Venkataramanan <anirudh.venkataramanan@intel.com>
+	Tested-by: Andrew Bowers <andrewx.bowers@intel.com>
+	Signed-off-by: Jeff Kirsher <jeffrey.t.kirsher@intel.com>
+(cherry picked from commit 03c66a1376616015b04b6783feadfcf02ba37c3f)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/intel/ice/ice_txrx.c
+diff --cc drivers/net/ethernet/intel/ice/ice_txrx.c
+index b0086743621b,d003f4d49ae6..000000000000
+--- a/drivers/net/ethernet/intel/ice/ice_txrx.c
++++ b/drivers/net/ethernet/intel/ice/ice_txrx.c
+@@@ -497,61 -499,20 +499,66 @@@ static bool ice_page_is_reserved(struc
+  }
+  
+  /**
+ - * ice_can_reuse_rx_page - Determine if page can be reused for another Rx
+ - * @rx_buf: buffer containing the page
+ - * @truesize: the offset that needs to be applied to page
+ + * ice_add_rx_frag - Add contents of Rx buffer to sk_buff
+ + * @rx_buf: buffer containing page to add
+ + * @rx_desc: descriptor containing length of buffer written by hardware
+ + * @skb: sk_buf to place the data into
+ + *
+ + * This function will add the data contained in rx_buf->page to the skb.
+ + * This is done either through a direct copy if the data in the buffer is
+ + * less than the skb header size, otherwise it will just attach the page as
+ + * a frag to the skb.
+   *
+ - * If page is reusable, we have a green light for calling ice_reuse_rx_page,
+ - * which will assign the current buffer to the buffer that next_to_alloc is
+ - * pointing to; otherwise, the DMA mapping needs to be destroyed and
+ - * page freed
+ + * The function will then update the page offset if necessary and return
+ + * true if the buffer can be reused by the adapter.
+   */
+ -static bool ice_can_reuse_rx_page(struct ice_rx_buf *rx_buf,
+ -				  unsigned int truesize)
+ +static bool ice_add_rx_frag(struct ice_rx_buf *rx_buf,
+ +			    union ice_32b_rx_flex_desc *rx_desc,
+ +			    struct sk_buff *skb)
+  {
+++<<<<<<< HEAD
+ +#if (PAGE_SIZE < 8192)
+ +	unsigned int truesize = ICE_RXBUF_2048;
+ +#else
+ +	unsigned int last_offset = PAGE_SIZE - ICE_RXBUF_2048;
+ +	unsigned int truesize;
+ +#endif /* PAGE_SIZE < 8192) */
+ +
+ +	struct page *page;
+ +	unsigned int size;
+ +
+ +	size = le16_to_cpu(rx_desc->wb.pkt_len) &
+ +		ICE_RX_FLX_DESC_PKT_LEN_M;
+ +
+ +	page = rx_buf->page;
+ +
+ +#if (PAGE_SIZE >= 8192)
+ +	truesize = ALIGN(size, L1_CACHE_BYTES);
+ +#endif /* PAGE_SIZE >= 8192) */
+ +
+ +	/* will the data fit in the skb we allocated? if so, just
+ +	 * copy it as it is pretty small anyway
+ +	 */
+ +	if (size <= ICE_RX_HDR_SIZE && !skb_is_nonlinear(skb)) {
+ +		unsigned char *va = page_address(page) + rx_buf->page_offset;
+ +
+ +		memcpy(__skb_put(skb, size), va, ALIGN(size, sizeof(long)));
+ +
+ +		/* page is not reserved, we can reuse buffer as-is */
+ +		if (likely(!ice_page_is_reserved(page)))
+ +			return true;
+ +
+ +		/* this page cannot be reused so discard it */
+ +		__free_pages(page, 0);
+ +		return false;
+ +	}
+ +
+ +	skb_add_rx_frag(skb, skb_shinfo(skb)->nr_frags, page,
+ +			rx_buf->page_offset, size, truesize);
+++=======
++ 	unsigned int pagecnt_bias = rx_buf->pagecnt_bias;
++ 	struct page *page = rx_buf->page;
+++>>>>>>> 03c66a137661 (ice: Introduce bulk update for page count)
+  
+  	/* avoid re-using remote pages */
+  	if (unlikely(ice_page_is_reserved(page)))
+@@@ -572,15 -533,88 +579,95 @@@
+  		return false;
+  #endif /* PAGE_SIZE < 8192) */
+  
+- 	/* Even if we own the page, we are not allowed to use atomic_set()
+- 	 * This would break get_page_unless_zero() users.
++ 	/* If we have drained the page fragment pool we need to update
++ 	 * the pagecnt_bias and page count so that we fully restock the
++ 	 * number of references the driver holds.
+  	 */
+++<<<<<<< HEAD
+ +	get_page(rx_buf->page);
+++=======
++ 	if (unlikely(pagecnt_bias == 1)) {
++ 		page_ref_add(page, USHRT_MAX - 1);
++ 		rx_buf->pagecnt_bias = USHRT_MAX;
++ 	}
+++>>>>>>> 03c66a137661 (ice: Introduce bulk update for page count)
+  
+  	return true;
+  }
+  
+  /**
+++<<<<<<< HEAD
+++=======
++  * ice_add_rx_frag - Add contents of Rx buffer to sk_buff
++  * @rx_buf: buffer containing page to add
++  * @skb: sk_buf to place the data into
++  * @size: the length of the packet
++  *
++  * This function will add the data contained in rx_buf->page to the skb.
++  * This is done either through a direct copy if the data in the buffer is
++  * less than the skb header size, otherwise it will just attach the page as
++  * a frag to the skb.
++  *
++  * The function will then update the page offset if necessary and return
++  * true if the buffer can be reused by the adapter.
++  */
++ static bool
++ ice_add_rx_frag(struct ice_rx_buf *rx_buf, struct sk_buff *skb,
++ 		unsigned int size)
++ {
++ #if (PAGE_SIZE < 8192)
++ 	unsigned int truesize = ICE_RXBUF_2048;
++ #else
++ 	unsigned int truesize = ALIGN(size, L1_CACHE_BYTES);
++ #endif /* PAGE_SIZE < 8192) */
++ 	struct page *page = rx_buf->page;
++ 	unsigned int pull_len;
++ 	unsigned char *va;
++ 
++ 	va = page_address(page) + rx_buf->page_offset;
++ 	if (unlikely(skb_is_nonlinear(skb)))
++ 		goto add_tail_frag;
++ 
++ 	/* will the data fit in the skb we allocated? if so, just
++ 	 * copy it as it is pretty small anyway
++ 	 */
++ 	if (size <= ICE_RX_HDR_SIZE) {
++ 		memcpy(__skb_put(skb, size), va, ALIGN(size, sizeof(long)));
++ 
++ 		/* page is not reserved, we can reuse buffer as-is */
++ 		if (likely(!ice_page_is_reserved(page))) {
++ 			rx_buf->pagecnt_bias++;
++ 			return true;
++ 		}
++ 
++ 		/* this page cannot be reused so discard it */
++ 		return false;
++ 	}
++ 
++ 	/* we need the header to contain the greater of either ETH_HLEN or
++ 	 * 60 bytes if the skb->len is less than 60 for skb_pad.
++ 	 */
++ 	pull_len = eth_get_headlen(va, ICE_RX_HDR_SIZE);
++ 
++ 	/* align pull length to size of long to optimize memcpy performance */
++ 	memcpy(__skb_put(skb, pull_len), va, ALIGN(pull_len, sizeof(long)));
++ 
++ 	/* the header from the frame that we're adding as a frag was added to
++ 	 * linear part of skb so move the pointer past that header and
++ 	 * reduce the size of data
++ 	 */
++ 	va += pull_len;
++ 	size -= pull_len;
++ 
++ add_tail_frag:
++ 	skb_add_rx_frag(skb, skb_shinfo(skb)->nr_frags, page,
++ 			(unsigned long)va & ~PAGE_MASK, size, truesize);
++ 
++ 	return ice_can_reuse_rx_page(rx_buf, truesize);
++ }
++ 
++ /**
+++>>>>>>> 03c66a137661 (ice: Introduce bulk update for page count)
+   * ice_reuse_rx_page - page flip buffer and store it back on the ring
+   * @rx_ring: Rx descriptor ring to store buffers on
+   * @old_buf: donor buffer to have page reused
+@@@ -604,9 -638,37 +691,39 @@@ static void ice_reuse_rx_page(struct ic
+  }
+  
+  /**
+++<<<<<<< HEAD
+++=======
++  * ice_get_rx_buf - Fetch Rx buffer and synchronize data for use
++  * @rx_ring: Rx descriptor ring to transact packets on
++  * @size: size of buffer to add to skb
++  *
++  * This function will pull an Rx buffer from the ring and synchronize it
++  * for use by the CPU.
++  */
++ static struct ice_rx_buf *
++ ice_get_rx_buf(struct ice_ring *rx_ring, const unsigned int size)
++ {
++ 	struct ice_rx_buf *rx_buf;
++ 
++ 	rx_buf = &rx_ring->rx_buf[rx_ring->next_to_clean];
++ 	prefetchw(rx_buf->page);
++ 
++ 	/* we are reusing so sync this buffer for CPU use */
++ 	dma_sync_single_range_for_cpu(rx_ring->dev, rx_buf->dma,
++ 				      rx_buf->page_offset, size,
++ 				      DMA_FROM_DEVICE);
++ 
++ 	/* We have pulled a buffer for use, so decrement pagecnt_bias */
++ 	rx_buf->pagecnt_bias--;
++ 
++ 	return rx_buf;
++ }
++ 
++ /**
+++>>>>>>> 03c66a137661 (ice: Introduce bulk update for page count)
+   * ice_fetch_rx_buf - Allocate skb and populate it
+   * @rx_ring: Rx descriptor ring to transact packets on
+ - * @rx_buf: Rx buffer to pull data from
+ - * @size: the length of the packet
+ + * @rx_desc: descriptor containing info written by hardware
+   *
+   * This function allocates an skb on the fly, and populates it with the page
+   * data from the current receive descriptor, taking care to set up the skb
+* Unmerged path drivers/net/ethernet/intel/ice/ice_txrx.c
+diff --git a/drivers/net/ethernet/intel/ice/ice_txrx.h b/drivers/net/ethernet/intel/ice/ice_txrx.h
+index 75d0eaf6c9dd..e73d27163316 100644
+--- a/drivers/net/ethernet/intel/ice/ice_txrx.h
++++ b/drivers/net/ethernet/intel/ice/ice_txrx.h
+@@ -73,6 +73,7 @@ struct ice_rx_buf {
+ 	dma_addr_t dma;
+ 	struct page *page;
+ 	unsigned int page_offset;
++	u16 pagecnt_bias;
+ };
+ 
+ struct ice_q_stats {
