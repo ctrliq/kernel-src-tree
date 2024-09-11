@@ -1,0 +1,238 @@
+Bluetooth: Update background scan and report device based on advertisement monitors
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-358.el8
+commit-author Miao-chen Chou <mcchou@chromium.org>
+commit 8208f5a9d435e58ee7f53a24d9ccbe7787944537
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-358.el8/8208f5a9.failed
+
+This calls hci_update_background_scan() when there is any update on the
+advertisement monitors. If there is at least one advertisement monitor,
+the filtering policy of scan parameters should be 0x00. This also reports
+device found mgmt events if there is at least one monitor.
+
+The following cases were tested with btmgmt advmon-* commands.
+(1) add a ADV monitor and observe that the passive scanning is
+triggered.
+(2) remove the last ADV monitor and observe that the passive scanning is
+terminated.
+(3) with a LE peripheral paired, repeat (1) and observe the passive
+scanning continues.
+(4) with a LE peripheral paired, repeat (2) and observe the passive
+scanning continues.
+(5) with a ADV monitor, suspend/resume the host and observe the passive
+scanning continues.
+
+	Signed-off-by: Miao-chen Chou <mcchou@chromium.org>
+	Signed-off-by: Marcel Holtmann <marcel@holtmann.org>
+	Signed-off-by: Johan Hedberg <johan.hedberg@intel.com>
+(cherry picked from commit 8208f5a9d435e58ee7f53a24d9ccbe7787944537)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/net/bluetooth/hci_core.h
+#	net/bluetooth/hci_core.c
+diff --cc include/net/bluetooth/hci_core.h
+index 7a4a7a86d423,524057598ffd..000000000000
+--- a/include/net/bluetooth/hci_core.h
++++ b/include/net/bluetooth/hci_core.h
+@@@ -1261,6 -1280,12 +1261,15 @@@ int hci_add_adv_instance(struct hci_de
+  int hci_remove_adv_instance(struct hci_dev *hdev, u8 instance);
+  void hci_adv_instances_set_rpa_expired(struct hci_dev *hdev, bool rpa_expired);
+  
+++<<<<<<< HEAD
+++=======
++ void hci_adv_monitors_clear(struct hci_dev *hdev);
++ void hci_free_adv_monitor(struct adv_monitor *monitor);
++ int hci_add_adv_monitor(struct hci_dev *hdev, struct adv_monitor *monitor);
++ int hci_remove_adv_monitor(struct hci_dev *hdev, u16 handle);
++ bool hci_is_adv_monitoring(struct hci_dev *hdev);
++ 
+++>>>>>>> 8208f5a9d435 (Bluetooth: Update background scan and report device based on advertisement monitors)
+  void hci_event_packet(struct hci_dev *hdev, struct sk_buff *skb);
+  
+  void hci_init_sysfs(struct hci_dev *hdev);
+diff --cc net/bluetooth/hci_core.c
+index 666cd966baa4,7959b851cc63..000000000000
+--- a/net/bluetooth/hci_core.c
++++ b/net/bluetooth/hci_core.c
+@@@ -2995,6 -2995,96 +2995,99 @@@ int hci_add_adv_instance(struct hci_de
+  	return 0;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ /* This function requires the caller holds hdev->lock */
++ void hci_adv_monitors_clear(struct hci_dev *hdev)
++ {
++ 	struct adv_monitor *monitor;
++ 	int handle;
++ 
++ 	idr_for_each_entry(&hdev->adv_monitors_idr, monitor, handle)
++ 		hci_free_adv_monitor(monitor);
++ 
++ 	idr_destroy(&hdev->adv_monitors_idr);
++ 
++ 	hci_update_background_scan(hdev);
++ }
++ 
++ void hci_free_adv_monitor(struct adv_monitor *monitor)
++ {
++ 	struct adv_pattern *pattern;
++ 	struct adv_pattern *tmp;
++ 
++ 	if (!monitor)
++ 		return;
++ 
++ 	list_for_each_entry_safe(pattern, tmp, &monitor->patterns, list)
++ 		kfree(pattern);
++ 
++ 	kfree(monitor);
++ }
++ 
++ /* This function requires the caller holds hdev->lock */
++ int hci_add_adv_monitor(struct hci_dev *hdev, struct adv_monitor *monitor)
++ {
++ 	int min, max, handle;
++ 
++ 	if (!monitor)
++ 		return -EINVAL;
++ 
++ 	min = HCI_MIN_ADV_MONITOR_HANDLE;
++ 	max = HCI_MIN_ADV_MONITOR_HANDLE + HCI_MAX_ADV_MONITOR_NUM_HANDLES;
++ 	handle = idr_alloc(&hdev->adv_monitors_idr, monitor, min, max,
++ 			   GFP_KERNEL);
++ 	if (handle < 0)
++ 		return handle;
++ 
++ 	hdev->adv_monitors_cnt++;
++ 	monitor->handle = handle;
++ 
++ 	hci_update_background_scan(hdev);
++ 
++ 	return 0;
++ }
++ 
++ static int free_adv_monitor(int id, void *ptr, void *data)
++ {
++ 	struct hci_dev *hdev = data;
++ 	struct adv_monitor *monitor = ptr;
++ 
++ 	idr_remove(&hdev->adv_monitors_idr, monitor->handle);
++ 	hci_free_adv_monitor(monitor);
++ 
++ 	return 0;
++ }
++ 
++ /* This function requires the caller holds hdev->lock */
++ int hci_remove_adv_monitor(struct hci_dev *hdev, u16 handle)
++ {
++ 	struct adv_monitor *monitor;
++ 
++ 	if (handle) {
++ 		monitor = idr_find(&hdev->adv_monitors_idr, handle);
++ 		if (!monitor)
++ 			return -ENOENT;
++ 
++ 		idr_remove(&hdev->adv_monitors_idr, monitor->handle);
++ 		hci_free_adv_monitor(monitor);
++ 	} else {
++ 		/* Remove all monitors if handle is 0. */
++ 		idr_for_each(&hdev->adv_monitors_idr, &free_adv_monitor, hdev);
++ 	}
++ 
++ 	hci_update_background_scan(hdev);
++ 
++ 	return 0;
++ }
++ 
++ /* This function requires the caller holds hdev->lock */
++ bool hci_is_adv_monitoring(struct hci_dev *hdev)
++ {
++ 	return !idr_is_empty(&hdev->adv_monitors_idr);
++ }
++ 
+++>>>>>>> 8208f5a9d435 (Bluetooth: Update background scan and report device based on advertisement monitors)
+  struct bdaddr_list *hci_bdaddr_list_lookup(struct list_head *bdaddr_list,
+  					 bdaddr_t *bdaddr, u8 type)
+  {
+* Unmerged path include/net/bluetooth/hci_core.h
+* Unmerged path net/bluetooth/hci_core.c
+diff --git a/net/bluetooth/hci_event.c b/net/bluetooth/hci_event.c
+index 1c69d0b6cc23..82f97edf5f9b 100644
+--- a/net/bluetooth/hci_event.c
++++ b/net/bluetooth/hci_event.c
+@@ -5469,14 +5469,15 @@ static void process_adv_report(struct hci_dev *hdev, u8 type, bdaddr_t *bdaddr,
+ 
+ 	/* Passive scanning shouldn't trigger any device found events,
+ 	 * except for devices marked as CONN_REPORT for which we do send
+-	 * device found events.
++	 * device found events, or advertisement monitoring requested.
+ 	 */
+ 	if (hdev->le_scan_type == LE_SCAN_PASSIVE) {
+ 		if (type == LE_ADV_DIRECT_IND)
+ 			return;
+ 
+ 		if (!hci_pend_le_action_lookup(&hdev->pend_le_reports,
+-					       bdaddr, bdaddr_type))
++					       bdaddr, bdaddr_type) &&
++		    idr_is_empty(&hdev->adv_monitors_idr))
+ 			return;
+ 
+ 		if (type == LE_ADV_NONCONN_IND || type == LE_ADV_SCAN_IND)
+diff --git a/net/bluetooth/hci_request.c b/net/bluetooth/hci_request.c
+index a264c68956c3..583fa61b766f 100644
+--- a/net/bluetooth/hci_request.c
++++ b/net/bluetooth/hci_request.c
+@@ -417,11 +417,15 @@ static void __hci_update_background_scan(struct hci_request *req)
+ 	 */
+ 	hci_discovery_filter_clear(hdev);
+ 
++	BT_DBG("%s ADV monitoring is %s", hdev->name,
++	       hci_is_adv_monitoring(hdev) ? "on" : "off");
++
+ 	if (list_empty(&hdev->pend_le_conns) &&
+-	    list_empty(&hdev->pend_le_reports)) {
++	    list_empty(&hdev->pend_le_reports) &&
++	    !hci_is_adv_monitoring(hdev)) {
+ 		/* If there is no pending LE connections or devices
+-		 * to be scanned for, we should stop the background
+-		 * scanning.
++		 * to be scanned for or no ADV monitors, we should stop the
++		 * background scanning.
+ 		 */
+ 
+ 		/* If controller is not scanning we are done. */
+@@ -798,6 +802,13 @@ static u8 update_white_list(struct hci_request *req)
+ 			return 0x00;
+ 	}
+ 
++	/* Once the controller offloading of advertisement monitor is in place,
++	 * the if condition should include the support of MSFT extension
++	 * support.
++	 */
++	if (!idr_is_empty(&hdev->adv_monitors_idr))
++		return 0x00;
++
+ 	/* Select filter policy to use white list */
+ 	return 0x01;
+ }
+diff --git a/net/bluetooth/mgmt.c b/net/bluetooth/mgmt.c
+index 46a1d1b65411..7b73983131dc 100644
+--- a/net/bluetooth/mgmt.c
++++ b/net/bluetooth/mgmt.c
+@@ -8020,8 +8020,11 @@ void mgmt_device_found(struct hci_dev *hdev, bdaddr_t *bdaddr, u8 link_type,
+ 	if (!hci_discovery_active(hdev)) {
+ 		if (link_type == ACL_LINK)
+ 			return;
+-		if (link_type == LE_LINK && list_empty(&hdev->pend_le_reports))
++		if (link_type == LE_LINK &&
++		    list_empty(&hdev->pend_le_reports) &&
++		    !hci_is_adv_monitoring(hdev)) {
+ 			return;
++		}
+ 	}
+ 
+ 	if (hdev->discovery.result_filtering) {
