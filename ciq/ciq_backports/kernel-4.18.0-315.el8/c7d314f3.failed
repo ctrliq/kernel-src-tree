@@ -1,0 +1,274 @@
+x86/MCE: Make the number of MCA banks a per-CPU variable
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-315.el8
+commit-author Yazen Ghannam <yazen.ghannam@amd.com>
+commit c7d314f386e987be8b51eeb7dd947756ae23f6b6
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-315.el8/c7d314f3.failed
+
+The number of MCA banks is provided per logical CPU. Historically, this
+number has been the same across all CPUs, but this is not an
+architectural guarantee. Future AMD systems may have MCA bank counts
+that vary between logical CPUs in a system.
+
+This issue was partially addressed in
+
+  006c077041dc ("x86/mce: Handle varying MCA bank counts")
+
+by allocating structures using the maximum number of MCA banks and by
+saving the maximum MCA bank count in a system as the global count. This
+means that some extra structures are allocated. Also, this means that
+CPUs will spend more time in the #MC and other handlers checking extra
+MCA banks.
+
+Thus, define the number of MCA banks as a per-CPU variable.
+
+ [ bp: Make mce_num_banks an unsigned int. ]
+
+	Signed-off-by: Yazen Ghannam <yazen.ghannam@amd.com>
+	Signed-off-by: Borislav Petkov <bp@suse.de>
+	Cc: "H. Peter Anvin" <hpa@zytor.com>
+	Cc: Ingo Molnar <mingo@redhat.com>
+	Cc: "linux-edac@vger.kernel.org" <linux-edac@vger.kernel.org>
+	Cc: Thomas Gleixner <tglx@linutronix.de>
+	Cc: Tony Luck <tony.luck@intel.com>
+	Cc: "x86@kernel.org" <x86@kernel.org>
+Link: https://lkml.kernel.org/r/20190607201752.221446-5-Yazen.Ghannam@amd.com
+(cherry picked from commit c7d314f386e987be8b51eeb7dd947756ae23f6b6)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kernel/cpu/mce/amd.c
+diff --cc arch/x86/kernel/cpu/mce/amd.c
+index 7ff416ee2f4d,fb5c935af2c5..000000000000
+--- a/arch/x86/kernel/cpu/mce/amd.c
++++ b/arch/x86/kernel/cpu/mce/amd.c
+@@@ -603,13 -627,12 +603,18 @@@ void disable_err_thresholding(struct cp
+  /* cpu init entry point, called from mce.c with preempt off */
+  void mce_amd_feature_init(struct cpuinfo_x86 *c)
+  {
+- 	u32 low = 0, high = 0, address = 0;
+  	unsigned int bank, block, cpu = smp_processor_id();
++ 	u32 low = 0, high = 0, address = 0;
+  	int offset = -1;
+  
+++<<<<<<< HEAD
+ +	disable_err_thresholding(c);
+ +
+ +	for (bank = 0; bank < mca_cfg.banks; ++bank) {
+++=======
++ 
++ 	for (bank = 0; bank < this_cpu_read(mce_num_banks); ++bank) {
+++>>>>>>> c7d314f386e9 (x86/MCE: Make the number of MCA banks a per-CPU variable)
+  		if (mce_flags.smca)
+  			smca_configure(bank, cpu);
+  
+* Unmerged path arch/x86/kernel/cpu/mce/amd.c
+diff --git a/arch/x86/kernel/cpu/mce/core.c b/arch/x86/kernel/cpu/mce/core.c
+index b3544aaf4973..336f6ee1274e 100644
+--- a/arch/x86/kernel/cpu/mce/core.c
++++ b/arch/x86/kernel/cpu/mce/core.c
+@@ -68,6 +68,8 @@ static DEFINE_MUTEX(mce_sysfs_mutex);
+ 
+ DEFINE_PER_CPU(unsigned, mce_exception_count);
+ 
++DEFINE_PER_CPU_READ_MOSTLY(unsigned int, mce_num_banks);
++
+ struct mce_bank {
+ 	u64			ctl;			/* subevents to enable */
+ 	bool			init;			/* initialise bank? */
+@@ -730,7 +732,7 @@ bool machine_check_poll(enum mcp_flags flags, mce_banks_t *b)
+ 	if (flags & MCP_TIMESTAMP)
+ 		m.tsc = rdtsc();
+ 
+-	for (i = 0; i < mca_cfg.banks; i++) {
++	for (i = 0; i < this_cpu_read(mce_num_banks); i++) {
+ 		if (!mce_banks[i].ctl || !test_bit(i, *b))
+ 			continue;
+ 
+@@ -802,7 +804,7 @@ static int mce_no_way_out(struct mce *m, char **msg, unsigned long *validp,
+ 	char *tmp;
+ 	int i;
+ 
+-	for (i = 0; i < mca_cfg.banks; i++) {
++	for (i = 0; i < this_cpu_read(mce_num_banks); i++) {
+ 		m->status = mce_rdmsrl(msr_ops.status(i));
+ 		if (!(m->status & MCI_STATUS_VAL))
+ 			continue;
+@@ -1082,7 +1084,7 @@ static void mce_clear_state(unsigned long *toclear)
+ {
+ 	int i;
+ 
+-	for (i = 0; i < mca_cfg.banks; i++) {
++	for (i = 0; i < this_cpu_read(mce_num_banks); i++) {
+ 		if (test_bit(i, toclear))
+ 			mce_wrmsrl(msr_ops.status(i), 0);
+ 	}
+@@ -1141,7 +1143,7 @@ static void __mc_scan_banks(struct mce *m, struct mce *final,
+ 	struct mca_config *cfg = &mca_cfg;
+ 	int severity, i;
+ 
+-	for (i = 0; i < cfg->banks; i++) {
++	for (i = 0; i < this_cpu_read(mce_num_banks); i++) {
+ 		__clear_bit(i, toclear);
+ 		if (!test_bit(i, valid_banks))
+ 			continue;
+@@ -1486,9 +1488,10 @@ EXPORT_SYMBOL_GPL(mce_notify_irq);
+ static void __mcheck_cpu_mce_banks_init(void)
+ {
+ 	struct mce_bank *mce_banks = this_cpu_ptr(mce_banks_array);
++	u8 n_banks = this_cpu_read(mce_num_banks);
+ 	int i;
+ 
+-	for (i = 0; i < MAX_NR_BANKS; i++) {
++	for (i = 0; i < n_banks; i++) {
+ 		struct mce_bank *b = &mce_banks[i];
+ 
+ 		b->ctl = -1ULL;
+@@ -1507,10 +1510,14 @@ static void __mcheck_cpu_cap_init(void)
+ 	rdmsrl(MSR_IA32_MCG_CAP, cap);
+ 
+ 	b = cap & MCG_BANKCNT_MASK;
+-	if (WARN_ON_ONCE(b > MAX_NR_BANKS))
++
++	if (b > MAX_NR_BANKS) {
++		pr_warn("CPU%d: Using only %u machine check banks out of %u\n",
++			smp_processor_id(), MAX_NR_BANKS, b);
+ 		b = MAX_NR_BANKS;
++	}
+ 
+-	mca_cfg.banks = max(mca_cfg.banks, b);
++	this_cpu_write(mce_num_banks, b);
+ 
+ 	__mcheck_cpu_mce_banks_init();
+ 
+@@ -1549,7 +1556,7 @@ static void __mcheck_cpu_init_clear_banks(void)
+ 	struct mce_bank *mce_banks = this_cpu_ptr(mce_banks_array);
+ 	int i;
+ 
+-	for (i = 0; i < mca_cfg.banks; i++) {
++	for (i = 0; i < this_cpu_read(mce_num_banks); i++) {
+ 		struct mce_bank *b = &mce_banks[i];
+ 
+ 		if (!b->init)
+@@ -1600,7 +1607,7 @@ static int __mcheck_cpu_apply_quirks(struct cpuinfo_x86 *c)
+ 
+ 	/* This should be disabled by the BIOS, but isn't always */
+ 	if (c->x86_vendor == X86_VENDOR_AMD) {
+-		if (c->x86 == 15 && cfg->banks > 4) {
++		if (c->x86 == 15 && this_cpu_read(mce_num_banks) > 4) {
+ 			/*
+ 			 * disable GART TBL walk error reporting, which
+ 			 * trips off incorrectly with the IOMMU & 3ware
+@@ -1619,7 +1626,7 @@ static int __mcheck_cpu_apply_quirks(struct cpuinfo_x86 *c)
+ 		 * Various K7s with broken bank 0 around. Always disable
+ 		 * by default.
+ 		 */
+-		if (c->x86 == 6 && cfg->banks > 0)
++		if (c->x86 == 6 && this_cpu_read(mce_num_banks) > 0)
+ 			mce_banks[0].ctl = 0;
+ 
+ 		/*
+@@ -1641,7 +1648,7 @@ static int __mcheck_cpu_apply_quirks(struct cpuinfo_x86 *c)
+ 		 * valid event later, merely don't write CTL0.
+ 		 */
+ 
+-		if (c->x86 == 6 && c->x86_model < 0x1A && cfg->banks > 0)
++		if (c->x86 == 6 && c->x86_model < 0x1A && this_cpu_read(mce_num_banks) > 0)
+ 			mce_banks[0].init = 0;
+ 
+ 		/*
+@@ -1872,7 +1879,7 @@ static void __mce_disable_bank(void *arg)
+ 
+ void mce_disable_bank(int bank)
+ {
+-	if (bank >= mca_cfg.banks) {
++	if (bank >= this_cpu_read(mce_num_banks)) {
+ 		pr_warn(FW_BUG
+ 			"Ignoring request to disable invalid MCA bank %d.\n",
+ 			bank);
+@@ -1961,7 +1968,7 @@ static void mce_disable_error_reporting(void)
+ 	struct mce_bank *mce_banks = this_cpu_ptr(mce_banks_array);
+ 	int i;
+ 
+-	for (i = 0; i < mca_cfg.banks; i++) {
++	for (i = 0; i < this_cpu_read(mce_num_banks); i++) {
+ 		struct mce_bank *b = &mce_banks[i];
+ 
+ 		if (b->init)
+@@ -2070,7 +2077,7 @@ static ssize_t show_bank(struct device *s, struct device_attribute *attr,
+ 	u8 bank = attr_to_bank(attr)->bank;
+ 	struct mce_bank *b;
+ 
+-	if (bank >= mca_cfg.banks)
++	if (bank >= per_cpu(mce_num_banks, s->id))
+ 		return -EINVAL;
+ 
+ 	b = &per_cpu(mce_banks_array, s->id)[bank];
+@@ -2088,7 +2095,7 @@ static ssize_t set_bank(struct device *s, struct device_attribute *attr,
+ 	if (kstrtou64(buf, 0, &new) < 0)
+ 		return -EINVAL;
+ 
+-	if (bank >= mca_cfg.banks)
++	if (bank >= per_cpu(mce_num_banks, s->id))
+ 		return -EINVAL;
+ 
+ 	b = &per_cpu(mce_banks_array, s->id)[bank];
+@@ -2240,7 +2247,7 @@ static int mce_device_create(unsigned int cpu)
+ 		if (err)
+ 			goto error;
+ 	}
+-	for (j = 0; j < mca_cfg.banks; j++) {
++	for (j = 0; j < per_cpu(mce_num_banks, cpu); j++) {
+ 		err = device_create_file(dev, &mce_bank_devs[j].attr);
+ 		if (err)
+ 			goto error2;
+@@ -2272,7 +2279,7 @@ static void mce_device_remove(unsigned int cpu)
+ 	for (i = 0; mce_device_attrs[i]; i++)
+ 		device_remove_file(dev, mce_device_attrs[i]);
+ 
+-	for (i = 0; i < mca_cfg.banks; i++)
++	for (i = 0; i < per_cpu(mce_num_banks, cpu); i++)
+ 		device_remove_file(dev, &mce_bank_devs[i].attr);
+ 
+ 	device_unregister(dev);
+@@ -2302,7 +2309,7 @@ static void mce_reenable_cpu(void)
+ 
+ 	if (!cpuhp_tasks_frozen)
+ 		cmci_reenable();
+-	for (i = 0; i < mca_cfg.banks; i++) {
++	for (i = 0; i < this_cpu_read(mce_num_banks); i++) {
+ 		struct mce_bank *b = &mce_banks[i];
+ 
+ 		if (b->init)
+@@ -2490,8 +2497,6 @@ EXPORT_SYMBOL_GPL(mcsafe_key);
+ 
+ static int __init mcheck_late_init(void)
+ {
+-	pr_info("Using %d MCE banks\n", mca_cfg.banks);
+-
+ 	if (mca_cfg.recovery)
+ 		static_branch_inc(&mcsafe_key);
+ 
+diff --git a/arch/x86/kernel/cpu/mce/internal.h b/arch/x86/kernel/cpu/mce/internal.h
+index e74ca1ba8c73..508be940b737 100644
+--- a/arch/x86/kernel/cpu/mce/internal.h
++++ b/arch/x86/kernel/cpu/mce/internal.h
+@@ -117,7 +117,6 @@ struct mca_config {
+ 	      bios_cmci_threshold	: 1,
+ 	      __reserved		: 59;
+ 
+-	u8 banks;
+ 	s8 bootlog;
+ 	int tolerant;
+ 	int monarch_timeout;
+@@ -126,6 +125,7 @@ struct mca_config {
+ };
+ 
+ extern struct mca_config mca_cfg;
++DECLARE_PER_CPU_READ_MOSTLY(unsigned int, mce_num_banks);
+ 
+ struct mce_vendor_flags {
+ 	/*
