@@ -1,0 +1,506 @@
+mm: clean up and clarify lruvec lookup procedure
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Johannes Weiner <hannes@cmpxchg.org>
+commit 867e5e1de14b2b2bde324cdfeec3f3f83eb21424
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/867e5e1d.failed
+
+There is a per-memcg lruvec and a NUMA node lruvec.  Which one is being
+used is somewhat confusing right now, and it's easy to make mistakes -
+especially when it comes to global reclaim.
+
+How it works: when memory cgroups are enabled, we always use the
+root_mem_cgroup's per-node lruvecs.  When memory cgroups are not compiled
+in or disabled at runtime, we use pgdat->lruvec.
+
+Document that in a comment.
+
+Due to the way the reclaim code is generalized, all lookups use the
+mem_cgroup_lruvec() helper function, and nobody should have to find the
+right lruvec manually right now.  But to avoid future mistakes, rename the
+pgdat->lruvec member to pgdat->__lruvec and delete the convenience wrapper
+that suggests it's a commonly accessed member.
+
+While in this area, swap the mem_cgroup_lruvec() argument order.  The name
+suggests a memcg operation, yet it takes a pgdat first and a memcg second.
+I have to double take every time I call this.  Fix that.
+
+Link: http://lkml.kernel.org/r/20191022144803.302233-3-hannes@cmpxchg.org
+	Signed-off-by: Johannes Weiner <hannes@cmpxchg.org>
+	Acked-by: Michal Hocko <mhocko@suse.com>
+	Reviewed-by: Shakeel Butt <shakeelb@google.com>
+	Cc: Roman Gushchin <guro@fb.com>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit 867e5e1de14b2b2bde324cdfeec3f3f83eb21424)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/memcontrol.h
+#	mm/memcontrol.c
+#	mm/page_alloc.c
+#	mm/vmscan.c
+#	mm/workingset.c
+diff --cc include/linux/memcontrol.h
+index bad9fdcee44a,feeb2c76f568..000000000000
+--- a/include/linux/memcontrol.h
++++ b/include/linux/memcontrol.h
+@@@ -363,16 -385,15 +363,21 @@@ mem_cgroup_nodeinfo(struct mem_cgroup *
+  }
+  
+  /**
+-  * mem_cgroup_lruvec - get the lru list vector for a node or a memcg zone
+-  * @node: node of the wanted lruvec
++  * mem_cgroup_lruvec - get the lru list vector for a memcg & node
+   * @memcg: memcg of the wanted lruvec
+   *
+++<<<<<<< HEAD
+ + * Returns the lru list vector holding pages for a given @node or a given
+ + * @memcg and @zone. This can be the node lruvec, if the memory controller
+ + * is disabled.
+++=======
++  * Returns the lru list vector holding pages for a given @memcg &
++  * @node combination. This can be the node lruvec, if the memory
++  * controller is disabled.
+++>>>>>>> 867e5e1de14b (mm: clean up and clarify lruvec lookup procedure)
+   */
+- static inline struct lruvec *mem_cgroup_lruvec(struct pglist_data *pgdat,
+- 				struct mem_cgroup *memcg)
++ static inline struct lruvec *mem_cgroup_lruvec(struct mem_cgroup *memcg,
++ 					       struct pglist_data *pgdat)
+  {
+  	struct mem_cgroup_per_node *mz;
+  	struct lruvec *lruvec;
+diff --cc mm/memcontrol.c
+index 3741e4fb725e,bc01423277c5..000000000000
+--- a/mm/memcontrol.c
++++ b/mm/memcontrol.c
+@@@ -683,10 -679,153 +683,152 @@@ mem_cgroup_largest_soft_limit_node(stru
+  	return mz;
+  }
+  
+ -/**
+ - * __mod_memcg_state - update cgroup memory statistics
+ - * @memcg: the memory cgroup
+ - * @idx: the stat item - can be enum memcg_stat_item or enum node_stat_item
+ - * @val: delta to add to the counter, can be negative
+ - */
+ -void __mod_memcg_state(struct mem_cgroup *memcg, int idx, int val)
+ +static unsigned long memcg_sum_events(struct mem_cgroup *memcg,
+ +				      int event)
+  {
+++<<<<<<< HEAD
+ +	return atomic_long_read(&memcg->events[event]);
+++=======
++ 	long x;
++ 
++ 	if (mem_cgroup_disabled())
++ 		return;
++ 
++ 	x = val + __this_cpu_read(memcg->vmstats_percpu->stat[idx]);
++ 	if (unlikely(abs(x) > MEMCG_CHARGE_BATCH)) {
++ 		struct mem_cgroup *mi;
++ 
++ 		/*
++ 		 * Batch local counters to keep them in sync with
++ 		 * the hierarchical ones.
++ 		 */
++ 		__this_cpu_add(memcg->vmstats_local->stat[idx], x);
++ 		for (mi = memcg; mi; mi = parent_mem_cgroup(mi))
++ 			atomic_long_add(x, &mi->vmstats[idx]);
++ 		x = 0;
++ 	}
++ 	__this_cpu_write(memcg->vmstats_percpu->stat[idx], x);
++ }
++ 
++ static struct mem_cgroup_per_node *
++ parent_nodeinfo(struct mem_cgroup_per_node *pn, int nid)
++ {
++ 	struct mem_cgroup *parent;
++ 
++ 	parent = parent_mem_cgroup(pn->memcg);
++ 	if (!parent)
++ 		return NULL;
++ 	return mem_cgroup_nodeinfo(parent, nid);
++ }
++ 
++ /**
++  * __mod_lruvec_state - update lruvec memory statistics
++  * @lruvec: the lruvec
++  * @idx: the stat item
++  * @val: delta to add to the counter, can be negative
++  *
++  * The lruvec is the intersection of the NUMA node and a cgroup. This
++  * function updates the all three counters that are affected by a
++  * change of state at this level: per-node, per-cgroup, per-lruvec.
++  */
++ void __mod_lruvec_state(struct lruvec *lruvec, enum node_stat_item idx,
++ 			int val)
++ {
++ 	pg_data_t *pgdat = lruvec_pgdat(lruvec);
++ 	struct mem_cgroup_per_node *pn;
++ 	struct mem_cgroup *memcg;
++ 	long x;
++ 
++ 	/* Update node */
++ 	__mod_node_page_state(pgdat, idx, val);
++ 
++ 	if (mem_cgroup_disabled())
++ 		return;
++ 
++ 	pn = container_of(lruvec, struct mem_cgroup_per_node, lruvec);
++ 	memcg = pn->memcg;
++ 
++ 	/* Update memcg */
++ 	__mod_memcg_state(memcg, idx, val);
++ 
++ 	/* Update lruvec */
++ 	__this_cpu_add(pn->lruvec_stat_local->count[idx], val);
++ 
++ 	x = val + __this_cpu_read(pn->lruvec_stat_cpu->count[idx]);
++ 	if (unlikely(abs(x) > MEMCG_CHARGE_BATCH)) {
++ 		struct mem_cgroup_per_node *pi;
++ 
++ 		for (pi = pn; pi; pi = parent_nodeinfo(pi, pgdat->node_id))
++ 			atomic_long_add(x, &pi->lruvec_stat[idx]);
++ 		x = 0;
++ 	}
++ 	__this_cpu_write(pn->lruvec_stat_cpu->count[idx], x);
++ }
++ 
++ void __mod_lruvec_slab_state(void *p, enum node_stat_item idx, int val)
++ {
++ 	struct page *page = virt_to_head_page(p);
++ 	pg_data_t *pgdat = page_pgdat(page);
++ 	struct mem_cgroup *memcg;
++ 	struct lruvec *lruvec;
++ 
++ 	rcu_read_lock();
++ 	memcg = memcg_from_slab_page(page);
++ 
++ 	/* Untracked pages have no memcg, no lruvec. Update only the node */
++ 	if (!memcg || memcg == root_mem_cgroup) {
++ 		__mod_node_page_state(pgdat, idx, val);
++ 	} else {
++ 		lruvec = mem_cgroup_lruvec(memcg, pgdat);
++ 		__mod_lruvec_state(lruvec, idx, val);
++ 	}
++ 	rcu_read_unlock();
++ }
++ 
++ /**
++  * __count_memcg_events - account VM events in a cgroup
++  * @memcg: the memory cgroup
++  * @idx: the event item
++  * @count: the number of events that occured
++  */
++ void __count_memcg_events(struct mem_cgroup *memcg, enum vm_event_item idx,
++ 			  unsigned long count)
++ {
++ 	unsigned long x;
++ 
++ 	if (mem_cgroup_disabled())
++ 		return;
++ 
++ 	x = count + __this_cpu_read(memcg->vmstats_percpu->events[idx]);
++ 	if (unlikely(x > MEMCG_CHARGE_BATCH)) {
++ 		struct mem_cgroup *mi;
++ 
++ 		/*
++ 		 * Batch local counters to keep them in sync with
++ 		 * the hierarchical ones.
++ 		 */
++ 		__this_cpu_add(memcg->vmstats_local->events[idx], x);
++ 		for (mi = memcg; mi; mi = parent_mem_cgroup(mi))
++ 			atomic_long_add(x, &mi->vmevents[idx]);
++ 		x = 0;
++ 	}
++ 	__this_cpu_write(memcg->vmstats_percpu->events[idx], x);
++ }
++ 
++ static unsigned long memcg_events(struct mem_cgroup *memcg, int event)
++ {
++ 	return atomic_long_read(&memcg->vmevents[event]);
++ }
++ 
++ static unsigned long memcg_events_local(struct mem_cgroup *memcg, int event)
++ {
++ 	long x = 0;
++ 	int cpu;
++ 
++ 	for_each_possible_cpu(cpu)
++ 		x += per_cpu(memcg->vmstats_local->events[event], cpu);
++ 	return x;
+++>>>>>>> 867e5e1de14b (mm: clean up and clarify lruvec lookup procedure)
+  }
+  
+  static void mem_cgroup_charge_statistics(struct mem_cgroup *memcg,
+@@@ -3376,6 -3626,42 +3518,45 @@@ static int mem_cgroup_move_charge_write
+  #endif
+  
+  #ifdef CONFIG_NUMA
+++<<<<<<< HEAD
+++=======
++ 
++ #define LRU_ALL_FILE (BIT(LRU_INACTIVE_FILE) | BIT(LRU_ACTIVE_FILE))
++ #define LRU_ALL_ANON (BIT(LRU_INACTIVE_ANON) | BIT(LRU_ACTIVE_ANON))
++ #define LRU_ALL	     ((1 << NR_LRU_LISTS) - 1)
++ 
++ static unsigned long mem_cgroup_node_nr_lru_pages(struct mem_cgroup *memcg,
++ 					   int nid, unsigned int lru_mask)
++ {
++ 	struct lruvec *lruvec = mem_cgroup_lruvec(memcg, NODE_DATA(nid));
++ 	unsigned long nr = 0;
++ 	enum lru_list lru;
++ 
++ 	VM_BUG_ON((unsigned)nid >= nr_node_ids);
++ 
++ 	for_each_lru(lru) {
++ 		if (!(BIT(lru) & lru_mask))
++ 			continue;
++ 		nr += lruvec_page_state_local(lruvec, NR_LRU_BASE + lru);
++ 	}
++ 	return nr;
++ }
++ 
++ static unsigned long mem_cgroup_nr_lru_pages(struct mem_cgroup *memcg,
++ 					     unsigned int lru_mask)
++ {
++ 	unsigned long nr = 0;
++ 	enum lru_list lru;
++ 
++ 	for_each_lru(lru) {
++ 		if (!(BIT(lru) & lru_mask))
++ 			continue;
++ 		nr += memcg_page_state_local(memcg, NR_LRU_BASE + lru);
++ 	}
++ 	return nr;
++ }
++ 
+++>>>>>>> 867e5e1de14b (mm: clean up and clarify lruvec lookup procedure)
+  static int memcg_numa_stat_show(struct seq_file *m, void *v)
+  {
+  	struct numa_stat {
+@@@ -4864,6 -5337,10 +5045,13 @@@ static int mem_cgroup_move_account(stru
+  
+  	anon = PageAnon(page);
+  
+++<<<<<<< HEAD
+++=======
++ 	pgdat = page_pgdat(page);
++ 	from_vec = mem_cgroup_lruvec(from, pgdat);
++ 	to_vec = mem_cgroup_lruvec(to, pgdat);
++ 
+++>>>>>>> 867e5e1de14b (mm: clean up and clarify lruvec lookup procedure)
+  	spin_lock_irqsave(&from->move_lock, flags);
+  
+  	if (!anon && page_mapped(page)) {
+diff --cc mm/page_alloc.c
+index b6838fbdf305,4785a8a2040e..000000000000
+--- a/mm/page_alloc.c
++++ b/mm/page_alloc.c
+@@@ -6310,6 -6679,74 +6310,77 @@@ static unsigned long __paginginit calc_
+  	return PAGE_ALIGN(pages * sizeof(struct page)) >> PAGE_SHIFT;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ #ifdef CONFIG_TRANSPARENT_HUGEPAGE
++ static void pgdat_init_split_queue(struct pglist_data *pgdat)
++ {
++ 	struct deferred_split *ds_queue = &pgdat->deferred_split_queue;
++ 
++ 	spin_lock_init(&ds_queue->split_queue_lock);
++ 	INIT_LIST_HEAD(&ds_queue->split_queue);
++ 	ds_queue->split_queue_len = 0;
++ }
++ #else
++ static void pgdat_init_split_queue(struct pglist_data *pgdat) {}
++ #endif
++ 
++ #ifdef CONFIG_COMPACTION
++ static void pgdat_init_kcompactd(struct pglist_data *pgdat)
++ {
++ 	init_waitqueue_head(&pgdat->kcompactd_wait);
++ }
++ #else
++ static void pgdat_init_kcompactd(struct pglist_data *pgdat) {}
++ #endif
++ 
++ static void __meminit pgdat_init_internals(struct pglist_data *pgdat)
++ {
++ 	pgdat_resize_init(pgdat);
++ 
++ 	pgdat_init_split_queue(pgdat);
++ 	pgdat_init_kcompactd(pgdat);
++ 
++ 	init_waitqueue_head(&pgdat->kswapd_wait);
++ 	init_waitqueue_head(&pgdat->pfmemalloc_wait);
++ 
++ 	pgdat_page_ext_init(pgdat);
++ 	spin_lock_init(&pgdat->lru_lock);
++ 	lruvec_init(&pgdat->__lruvec);
++ }
++ 
++ static void __meminit zone_init_internals(struct zone *zone, enum zone_type idx, int nid,
++ 							unsigned long remaining_pages)
++ {
++ 	atomic_long_set(&zone->managed_pages, remaining_pages);
++ 	zone_set_nid(zone, nid);
++ 	zone->name = zone_names[idx];
++ 	zone->zone_pgdat = NODE_DATA(nid);
++ 	spin_lock_init(&zone->lock);
++ 	zone_seqlock_init(zone);
++ 	zone_pcp_init(zone);
++ }
++ 
++ /*
++  * Set up the zone data structures
++  * - init pgdat internals
++  * - init all zones belonging to this node
++  *
++  * NOTE: this function is only called during memory hotplug
++  */
++ #ifdef CONFIG_MEMORY_HOTPLUG
++ void __ref free_area_init_core_hotplug(int nid)
++ {
++ 	enum zone_type z;
++ 	pg_data_t *pgdat = NODE_DATA(nid);
++ 
++ 	pgdat_init_internals(pgdat);
++ 	for (z = 0; z < MAX_NR_ZONES; z++)
++ 		zone_init_internals(&pgdat->node_zones[z], z, nid, 0);
++ }
++ #endif
++ 
+++>>>>>>> 867e5e1de14b (mm: clean up and clarify lruvec lookup procedure)
+  /*
+   * Set up the zone data structures:
+   *   - mark all pages reserved
+diff --cc mm/vmscan.c
+index 52e40eb6d6d4,94d73725813d..000000000000
+--- a/mm/vmscan.c
++++ b/mm/vmscan.c
+@@@ -2474,9 -2543,9 +2474,9 @@@ out
+   * This is a basic per-node page freer.  Used by both kswapd and direct reclaim.
+   */
+  static void shrink_node_memcg(struct pglist_data *pgdat, struct mem_cgroup *memcg,
+ -			      struct scan_control *sc)
+ +			      struct scan_control *sc, unsigned long *lru_pages)
+  {
+- 	struct lruvec *lruvec = mem_cgroup_lruvec(pgdat, memcg);
++ 	struct lruvec *lruvec = mem_cgroup_lruvec(memcg, pgdat);
+  	unsigned long nr[NR_LRU_LISTS];
+  	unsigned long targets[NR_LRU_LISTS];
+  	unsigned long nr_to_scan;
+@@@ -2950,8 -3023,8 +2950,13 @@@ static void snapshot_refaults(struct me
+  		unsigned long refaults;
+  		struct lruvec *lruvec;
+  
+++<<<<<<< HEAD
+ +		lruvec = mem_cgroup_lruvec(pgdat, memcg);
+ +		refaults = lruvec_page_state(lruvec, WORKINGSET_ACTIVATE);
+++=======
++ 		lruvec = mem_cgroup_lruvec(memcg, pgdat);
++ 		refaults = lruvec_page_state_local(lruvec, WORKINGSET_ACTIVATE);
+++>>>>>>> 867e5e1de14b (mm: clean up and clarify lruvec lookup procedure)
+  		lruvec->refaults = refaults;
+  	} while ((memcg = mem_cgroup_iter(root_memcg, memcg, NULL)));
+  }
+diff --cc mm/workingset.c
+index 0f2aa579e95f,e8212123c1c3..000000000000
+--- a/mm/workingset.c
++++ b/mm/workingset.c
+@@@ -419,12 -424,14 +419,21 @@@ static unsigned long count_shadow_nodes
+  #ifdef CONFIG_MEMCG
+  	if (sc->memcg) {
+  		struct lruvec *lruvec;
+ -		int i;
+  
+++<<<<<<< HEAD
+ +		pages = mem_cgroup_node_nr_lru_pages(sc->memcg, sc->nid,
+ +						     LRU_ALL);
+ +		lruvec = mem_cgroup_lruvec(NODE_DATA(sc->nid), sc->memcg);
+ +		pages += lruvec_page_state(lruvec, NR_SLAB_RECLAIMABLE);
+ +		pages += lruvec_page_state(lruvec, NR_SLAB_UNRECLAIMABLE);
+++=======
++ 		lruvec = mem_cgroup_lruvec(sc->memcg, NODE_DATA(sc->nid));
++ 		for (pages = 0, i = 0; i < NR_LRU_LISTS; i++)
++ 			pages += lruvec_page_state_local(lruvec,
++ 							 NR_LRU_BASE + i);
++ 		pages += lruvec_page_state_local(lruvec, NR_SLAB_RECLAIMABLE);
++ 		pages += lruvec_page_state_local(lruvec, NR_SLAB_UNRECLAIMABLE);
+++>>>>>>> 867e5e1de14b (mm: clean up and clarify lruvec lookup procedure)
+  	} else
+  #endif
+  		pages = node_present_pages(sc->nid);
+* Unmerged path include/linux/memcontrol.h
+diff --git a/include/linux/mmzone.h b/include/linux/mmzone.h
+index 4ae1cde8d1f0..3e3862c0ee2e 100644
+--- a/include/linux/mmzone.h
++++ b/include/linux/mmzone.h
+@@ -792,7 +792,13 @@ typedef struct pglist_data {
+ #endif
+ 
+ 	/* Fields commonly accessed by the page reclaim scanner */
+-	struct lruvec		lruvec;
++
++	/*
++	 * NOTE: THIS IS UNUSED IF MEMCG IS ENABLED.
++	 *
++	 * Use mem_cgroup_lruvec() to look up lruvecs.
++	 */
++	struct lruvec		__lruvec;
+ 
+ 	unsigned long		flags;
+ 
+@@ -822,11 +828,6 @@ static inline spinlock_t *zone_lru_lock(struct zone *zone)
+ 	return &zone->zone_pgdat->lru_lock;
+ }
+ 
+-static inline struct lruvec *node_lruvec(struct pglist_data *pgdat)
+-{
+-	return &pgdat->lruvec;
+-}
+-
+ static inline unsigned long pgdat_end_pfn(pg_data_t *pgdat)
+ {
+ 	return pgdat->node_start_pfn + pgdat->node_spanned_pages;
+@@ -871,7 +872,7 @@ static inline struct pglist_data *lruvec_pgdat(struct lruvec *lruvec)
+ #ifdef CONFIG_MEMCG
+ 	return lruvec->pgdat;
+ #else
+-	return container_of(lruvec, struct pglist_data, lruvec);
++	return container_of(lruvec, struct pglist_data, __lruvec);
+ #endif
+ }
+ 
+* Unmerged path mm/memcontrol.c
+* Unmerged path mm/page_alloc.c
+diff --git a/mm/slab.h b/mm/slab.h
+index 77fd31ea6877..cf2d16fee330 100644
+--- a/mm/slab.h
++++ b/mm/slab.h
+@@ -305,7 +305,7 @@ static __always_inline int memcg_charge_slab(struct page *page,
+ 	if (ret)
+ 		goto out;
+ 
+-	lruvec = mem_cgroup_lruvec(page_pgdat(page), memcg);
++	lruvec = mem_cgroup_lruvec(memcg, page_pgdat(page));
+ 	mod_lruvec_state(lruvec, cache_vmstat_idx(s), 1 << order);
+ 
+ 	/* transer try_charge() page references to kmem_cache */
+@@ -329,7 +329,7 @@ static __always_inline void memcg_uncharge_slab(struct page *page, int order,
+ 	rcu_read_lock();
+ 	memcg = READ_ONCE(s->memcg_params.memcg);
+ 	if (likely(!mem_cgroup_is_root(memcg))) {
+-		lruvec = mem_cgroup_lruvec(page_pgdat(page), memcg);
++		lruvec = mem_cgroup_lruvec(memcg, page_pgdat(page));
+ 		mod_lruvec_state(lruvec, cache_vmstat_idx(s), -(1 << order));
+ 		memcg_kmem_uncharge_memcg(page, order, memcg);
+ 	} else {
+* Unmerged path mm/vmscan.c
+* Unmerged path mm/workingset.c
