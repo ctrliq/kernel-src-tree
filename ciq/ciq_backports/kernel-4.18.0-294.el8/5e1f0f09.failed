@@ -1,0 +1,351 @@
+mm, compaction: capture a page under direct compaction
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Mel Gorman <mgorman@techsingularity.net>
+commit 5e1f0f098b4649fad53011246bcaeff011ffdf5d
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/5e1f0f09.failed
+
+Compaction is inherently race-prone as a suitable page freed during
+compaction can be allocated by any parallel task.  This patch uses a
+capture_control structure to isolate a page immediately when it is freed
+by a direct compactor in the slow path of the page allocator.  The
+intent is to avoid redundant scanning.
+
+                                     5.0.0-rc1              5.0.0-rc1
+                               selective-v3r17          capture-v3r19
+Amean     fault-both-1         0.00 (   0.00%)        0.00 *   0.00%*
+Amean     fault-both-3      2582.11 (   0.00%)     2563.68 (   0.71%)
+Amean     fault-both-5      4500.26 (   0.00%)     4233.52 (   5.93%)
+Amean     fault-both-7      5819.53 (   0.00%)     6333.65 (  -8.83%)
+Amean     fault-both-12     9321.18 (   0.00%)     9759.38 (  -4.70%)
+Amean     fault-both-18     9782.76 (   0.00%)    10338.76 (  -5.68%)
+Amean     fault-both-24    15272.81 (   0.00%)    13379.55 *  12.40%*
+Amean     fault-both-30    15121.34 (   0.00%)    16158.25 (  -6.86%)
+Amean     fault-both-32    18466.67 (   0.00%)    18971.21 (  -2.73%)
+
+Latency is only moderately affected but the devil is in the details.  A
+closer examination indicates that base page fault latency is reduced but
+latency of huge pages is increased as it takes creater care to succeed.
+Part of the "problem" is that allocation success rates are close to 100%
+even when under pressure and compaction gets harder
+
+                                5.0.0-rc1              5.0.0-rc1
+                          selective-v3r17          capture-v3r19
+Percentage huge-3        96.70 (   0.00%)       98.23 (   1.58%)
+Percentage huge-5        96.99 (   0.00%)       95.30 (  -1.75%)
+Percentage huge-7        94.19 (   0.00%)       97.24 (   3.24%)
+Percentage huge-12       94.95 (   0.00%)       97.35 (   2.53%)
+Percentage huge-18       96.74 (   0.00%)       97.30 (   0.58%)
+Percentage huge-24       97.07 (   0.00%)       97.55 (   0.50%)
+Percentage huge-30       95.69 (   0.00%)       98.50 (   2.95%)
+Percentage huge-32       96.70 (   0.00%)       99.27 (   2.65%)
+
+And scan rates are reduced as expected by 6% for the migration scanner
+and 29% for the free scanner indicating that there is less redundant
+work.
+
+Compaction migrate scanned    20815362    19573286
+Compaction free scanned       16352612    11510663
+
+[mgorman@techsingularity.net: remove redundant check]
+  Link: http://lkml.kernel.org/r/20190201143853.GH9565@techsingularity.net
+Link: http://lkml.kernel.org/r/20190118175136.31341-23-mgorman@techsingularity.net
+	Signed-off-by: Mel Gorman <mgorman@techsingularity.net>
+	Acked-by: Vlastimil Babka <vbabka@suse.cz>
+	Cc: Andrea Arcangeli <aarcange@redhat.com>
+	Cc: Dan Carpenter <dan.carpenter@oracle.com>
+	Cc: David Rientjes <rientjes@google.com>
+	Cc: YueHaibing <yuehaibing@huawei.com>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit 5e1f0f098b4649fad53011246bcaeff011ffdf5d)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	mm/compaction.c
+diff --cc mm/compaction.c
+index 79db11f23bf2,1cc871da3fda..000000000000
+--- a/mm/compaction.c
++++ b/mm/compaction.c
+@@@ -1529,11 -2056,12 +1529,16 @@@ bool compaction_zonelist_suitable(struc
+  	return false;
+  }
+  
+++<<<<<<< HEAD
+ +static enum compact_result compact_zone(struct zone *zone, struct compact_control *cc)
+++=======
++ static enum compact_result
++ compact_zone(struct compact_control *cc, struct capture_control *capc)
+++>>>>>>> 5e1f0f098b46 (mm, compaction: capture a page under direct compaction)
+  {
+  	enum compact_result ret;
+ -	unsigned long start_pfn = cc->zone->zone_start_pfn;
+ -	unsigned long end_pfn = zone_end_pfn(cc->zone);
+ +	unsigned long start_pfn = zone->zone_start_pfn;
+ +	unsigned long end_pfn = zone_end_pfn(zone);
+  	unsigned long last_migrated_pfn;
+  	const bool sync = cc->mode != MIGRATE_ASYNC;
+  	bool update_cached;
+@@@ -1743,8 -2286,17 +1754,22 @@@ static enum compact_result compact_zone
+  		.ignore_skip_hint = (prio == MIN_COMPACT_PRIORITY),
+  		.ignore_block_suitable = (prio == MIN_COMPACT_PRIORITY)
+  	};
+++<<<<<<< HEAD
+ +
+ +	ret = compact_zone(zone, &cc);
+++=======
++ 	struct capture_control capc = {
++ 		.cc = &cc,
++ 		.page = NULL,
++ 	};
++ 
++ 	if (capture)
++ 		current->capture_control = &capc;
++ 	INIT_LIST_HEAD(&cc.freepages);
++ 	INIT_LIST_HEAD(&cc.migratepages);
++ 
++ 	ret = compact_zone(&cc, &capc);
+++>>>>>>> 5e1f0f098b46 (mm, compaction: capture a page under direct compaction)
+  
+  	VM_BUG_ON(!list_empty(&cc.freepages));
+  	VM_BUG_ON(!list_empty(&cc.migratepages));
+@@@ -1854,9 -2411,13 +1882,13 @@@ static void compact_node(int nid
+  		if (!populated_zone(zone))
+  			continue;
+  
+ -		cc.nr_freepages = 0;
+ -		cc.nr_migratepages = 0;
+  		cc.zone = zone;
+ -		INIT_LIST_HEAD(&cc.freepages);
+ -		INIT_LIST_HEAD(&cc.migratepages);
+  
+++<<<<<<< HEAD
+ +		compact_zone(zone, &cc);
+++=======
++ 		compact_zone(&cc, NULL);
+++>>>>>>> 5e1f0f098b46 (mm, compaction: capture a page under direct compaction)
+  
+  		VM_BUG_ON(!list_empty(&cc.freepages));
+  		VM_BUG_ON(!list_empty(&cc.migratepages));
+@@@ -1978,11 -2542,17 +2010,15 @@@ static void kcompactd_do_work(pg_data_
+  							COMPACT_CONTINUE)
+  			continue;
+  
+ -		cc.nr_freepages = 0;
+ -		cc.nr_migratepages = 0;
+ -		cc.total_migrate_scanned = 0;
+ -		cc.total_free_scanned = 0;
+ -		cc.zone = zone;
+ -		INIT_LIST_HEAD(&cc.freepages);
+ -		INIT_LIST_HEAD(&cc.migratepages);
+ -
+  		if (kthread_should_stop())
+  			return;
+++<<<<<<< HEAD
+ +
+ +		cc.zone = zone;
+ +		status = compact_zone(zone, &cc);
+++=======
++ 		status = compact_zone(&cc, NULL);
+++>>>>>>> 5e1f0f098b46 (mm, compaction: capture a page under direct compaction)
+  
+  		if (status == COMPACT_SUCCESS) {
+  			compaction_defer_reset(zone, cc.order, false);
+diff --git a/include/linux/compaction.h b/include/linux/compaction.h
+index 2184076d18b0..8d9750cb81c4 100644
+--- a/include/linux/compaction.h
++++ b/include/linux/compaction.h
+@@ -93,7 +93,8 @@ extern int sysctl_compact_unevictable_allowed;
+ extern int fragmentation_index(struct zone *zone, unsigned int order);
+ extern enum compact_result try_to_compact_pages(gfp_t gfp_mask,
+ 		unsigned int order, unsigned int alloc_flags,
+-		const struct alloc_context *ac, enum compact_priority prio);
++		const struct alloc_context *ac, enum compact_priority prio,
++		struct page **page);
+ extern void reset_isolation_suitable(pg_data_t *pgdat);
+ extern enum compact_result compaction_suitable(struct zone *zone, int order,
+ 		unsigned int alloc_flags, int classzone_idx);
+diff --git a/include/linux/sched.h b/include/linux/sched.h
+index 52eb9c8aa465..317df0919eb7 100644
+--- a/include/linux/sched.h
++++ b/include/linux/sched.h
+@@ -50,6 +50,7 @@ struct pid_namespace;
+ struct pipe_inode_info;
+ struct rcu_node;
+ struct reclaim_state;
++struct capture_control;
+ struct robust_list_head;
+ struct rq;
+ struct sched_attr;
+@@ -982,6 +983,9 @@ struct task_struct {
+ 
+ 	struct io_context		*io_context;
+ 
++#ifdef CONFIG_COMPACTION
++	struct capture_control		*capture_control;
++#endif
+ 	/* Ptrace state: */
+ 	unsigned long			ptrace_message;
+ 	RH_KABI_REPLACE(siginfo_t	*last_siginfo,
+diff --git a/kernel/sched/core.c b/kernel/sched/core.c
+index 288dd69ea072..e7d18855b9aa 100644
+--- a/kernel/sched/core.c
++++ b/kernel/sched/core.c
+@@ -2259,6 +2259,9 @@ static void __sched_fork(unsigned long clone_flags, struct task_struct *p)
+ 	INIT_HLIST_HEAD(&p->preempt_notifiers);
+ #endif
+ 
++#ifdef CONFIG_COMPACTION
++	p->capture_control = NULL;
++#endif
+ 	init_numa_balancing(clone_flags, p);
+ }
+ 
+* Unmerged path mm/compaction.c
+diff --git a/mm/internal.h b/mm/internal.h
+index 9193c2ad54f9..6f73a30ca667 100644
+--- a/mm/internal.h
++++ b/mm/internal.h
+@@ -205,6 +205,15 @@ struct compact_control {
+ 	bool contended;			/* Signal lock or sched contention */
+ };
+ 
++/*
++ * Used in direct compaction when a page should be taken from the freelists
++ * immediately when one is created during the free path.
++ */
++struct capture_control {
++	struct compact_control *cc;
++	struct page *page;
++};
++
+ unsigned long
+ isolate_freepages_range(struct compact_control *cc,
+ 			unsigned long start_pfn, unsigned long end_pfn);
+diff --git a/mm/page_alloc.c b/mm/page_alloc.c
+index 2e8629750b09..fcea728d67a5 100644
+--- a/mm/page_alloc.c
++++ b/mm/page_alloc.c
+@@ -772,6 +772,57 @@ static inline int page_is_buddy(struct page *page, struct page *buddy,
+ 	return 0;
+ }
+ 
++#ifdef CONFIG_COMPACTION
++static inline struct capture_control *task_capc(struct zone *zone)
++{
++	struct capture_control *capc = current->capture_control;
++
++	return capc &&
++		!(current->flags & PF_KTHREAD) &&
++		!capc->page &&
++		capc->cc->zone == zone &&
++		capc->cc->direct_compaction ? capc : NULL;
++}
++
++static inline bool
++compaction_capture(struct capture_control *capc, struct page *page,
++		   int order, int migratetype)
++{
++	if (!capc || order != capc->cc->order)
++		return false;
++
++	/* Do not accidentally pollute CMA or isolated regions*/
++	if (is_migrate_cma(migratetype) ||
++	    is_migrate_isolate(migratetype))
++		return false;
++
++	/*
++	 * Do not let lower order allocations polluate a movable pageblock.
++	 * This might let an unmovable request use a reclaimable pageblock
++	 * and vice-versa but no more than normal fallback logic which can
++	 * have trouble finding a high-order free page.
++	 */
++	if (order < pageblock_order && migratetype == MIGRATE_MOVABLE)
++		return false;
++
++	capc->page = page;
++	return true;
++}
++
++#else
++static inline struct capture_control *task_capc(struct zone *zone)
++{
++	return NULL;
++}
++
++static inline bool
++compaction_capture(struct capture_control *capc, struct page *page,
++		   int order, int migratetype)
++{
++	return false;
++}
++#endif /* CONFIG_COMPACTION */
++
+ /*
+  * Freeing function for a buddy system allocator.
+  *
+@@ -805,6 +856,7 @@ static inline void __free_one_page(struct page *page,
+ 	unsigned long uninitialized_var(buddy_pfn);
+ 	struct page *buddy;
+ 	unsigned int max_order;
++	struct capture_control *capc = task_capc(zone);
+ 
+ 	max_order = min_t(unsigned int, MAX_ORDER, pageblock_order + 1);
+ 
+@@ -820,6 +872,11 @@ static inline void __free_one_page(struct page *page,
+ 
+ continue_merging:
+ 	while (order < max_order - 1) {
++		if (compaction_capture(capc, page, order, migratetype)) {
++			__mod_zone_freepage_state(zone, -(1 << order),
++								migratetype);
++			return;
++		}
+ 		buddy_pfn = __find_buddy_pfn(pfn, order);
+ 		buddy = page + (buddy_pfn - pfn);
+ 
+@@ -3644,7 +3701,7 @@ __alloc_pages_direct_compact(gfp_t gfp_mask, unsigned int order,
+ 		unsigned int alloc_flags, const struct alloc_context *ac,
+ 		enum compact_priority prio, enum compact_result *compact_result)
+ {
+-	struct page *page;
++	struct page *page = NULL;
+ 	unsigned long pflags;
+ 	unsigned int noreclaim_flag;
+ 
+@@ -3655,13 +3712,15 @@ __alloc_pages_direct_compact(gfp_t gfp_mask, unsigned int order,
+ 	noreclaim_flag = memalloc_noreclaim_save();
+ 
+ 	*compact_result = try_to_compact_pages(gfp_mask, order, alloc_flags, ac,
+-									prio);
++								prio, &page);
+ 
+ 	memalloc_noreclaim_restore(noreclaim_flag);
+ 	psi_memstall_leave(&pflags);
+ 
+-	if (*compact_result <= COMPACT_INACTIVE)
++	if (*compact_result <= COMPACT_INACTIVE) {
++		WARN_ON_ONCE(page);
+ 		return NULL;
++	}
+ 
+ 	/*
+ 	 * At least in one zone compaction wasn't deferred or skipped, so let's
+@@ -3669,7 +3728,13 @@ __alloc_pages_direct_compact(gfp_t gfp_mask, unsigned int order,
+ 	 */
+ 	count_vm_event(COMPACTSTALL);
+ 
+-	page = get_page_from_freelist(gfp_mask, order, alloc_flags, ac);
++	/* Prep a captured page if available */
++	if (page)
++		prep_new_page(page, order, gfp_mask, alloc_flags);
++
++	/* Try get a page from the freelist if available */
++	if (!page)
++		page = get_page_from_freelist(gfp_mask, order, alloc_flags, ac);
+ 
+ 	if (page) {
+ 		struct zone *zone = page_zone(page);
