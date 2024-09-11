@@ -1,0 +1,259 @@
+net: aquantia: Add renegotiate ethtool operation support
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-80.el8
+commit-author Anton Mikaev <amikaev@aquantia.com>
+commit b8d68b62d99355c827243c62f00de70168e1661f
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-80.el8/b8d68b62.failed
+
+Adds ethtool -r|--negotiate operation support. It triggers special
+control bit on FW interface causing FW to restart link negotiation.
+
+	Signed-off-by: Igor Russkikh <igor.russkikh@aquantia.com>
+	Signed-off-by: Anton Mikaev <amikaev@aquantia.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit b8d68b62d99355c827243c62f00de70168e1661f)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/aquantia/atlantic/aq_ethtool.c
+#	drivers/net/ethernet/aquantia/atlantic/hw_atl/hw_atl_utils_fw2x.c
+diff --cc drivers/net/ethernet/aquantia/atlantic/aq_ethtool.c
+index f2d8063a2cef,08c9fa6ca71f..000000000000
+--- a/drivers/net/ethernet/aquantia/atlantic/aq_ethtool.c
++++ b/drivers/net/ethernet/aquantia/atlantic/aq_ethtool.c
+@@@ -284,6 -285,117 +284,120 @@@ static int aq_ethtool_set_coalesce(stru
+  	return aq_nic_update_interrupt_moderation_settings(aq_nic);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static int aq_ethtool_nway_reset(struct net_device *ndev)
++ {
++ 	struct aq_nic_s *aq_nic = netdev_priv(ndev);
++ 
++ 	if (unlikely(!aq_nic->aq_fw_ops->renegotiate))
++ 		return -EOPNOTSUPP;
++ 
++ 	if (netif_running(ndev))
++ 		return aq_nic->aq_fw_ops->renegotiate(aq_nic->aq_hw);
++ 
++ 	return 0;
++ }
++ 
++ static void aq_ethtool_get_pauseparam(struct net_device *ndev,
++ 				      struct ethtool_pauseparam *pause)
++ {
++ 	struct aq_nic_s *aq_nic = netdev_priv(ndev);
++ 
++ 	pause->autoneg = 0;
++ 
++ 	if (aq_nic->aq_hw->aq_nic_cfg->flow_control & AQ_NIC_FC_RX)
++ 		pause->rx_pause = 1;
++ 	if (aq_nic->aq_hw->aq_nic_cfg->flow_control & AQ_NIC_FC_TX)
++ 		pause->tx_pause = 1;
++ }
++ 
++ static int aq_ethtool_set_pauseparam(struct net_device *ndev,
++ 				     struct ethtool_pauseparam *pause)
++ {
++ 	struct aq_nic_s *aq_nic = netdev_priv(ndev);
++ 	int err = 0;
++ 
++ 	if (!aq_nic->aq_fw_ops->set_flow_control)
++ 		return -EOPNOTSUPP;
++ 
++ 	if (pause->autoneg == AUTONEG_ENABLE)
++ 		return -EOPNOTSUPP;
++ 
++ 	if (pause->rx_pause)
++ 		aq_nic->aq_hw->aq_nic_cfg->flow_control |= AQ_NIC_FC_RX;
++ 	else
++ 		aq_nic->aq_hw->aq_nic_cfg->flow_control &= ~AQ_NIC_FC_RX;
++ 
++ 	if (pause->tx_pause)
++ 		aq_nic->aq_hw->aq_nic_cfg->flow_control |= AQ_NIC_FC_TX;
++ 	else
++ 		aq_nic->aq_hw->aq_nic_cfg->flow_control &= ~AQ_NIC_FC_TX;
++ 
++ 	err = aq_nic->aq_fw_ops->set_flow_control(aq_nic->aq_hw);
++ 
++ 	return err;
++ }
++ 
++ static void aq_get_ringparam(struct net_device *ndev,
++ 			     struct ethtool_ringparam *ring)
++ {
++ 	struct aq_nic_s *aq_nic = netdev_priv(ndev);
++ 	struct aq_nic_cfg_s *aq_nic_cfg = aq_nic_get_cfg(aq_nic);
++ 
++ 	ring->rx_pending = aq_nic_cfg->rxds;
++ 	ring->tx_pending = aq_nic_cfg->txds;
++ 
++ 	ring->rx_max_pending = aq_nic_cfg->aq_hw_caps->rxds_max;
++ 	ring->tx_max_pending = aq_nic_cfg->aq_hw_caps->txds_max;
++ }
++ 
++ static int aq_set_ringparam(struct net_device *ndev,
++ 			    struct ethtool_ringparam *ring)
++ {
++ 	int err = 0;
++ 	bool ndev_running = false;
++ 	struct aq_nic_s *aq_nic = netdev_priv(ndev);
++ 	struct aq_nic_cfg_s *aq_nic_cfg = aq_nic_get_cfg(aq_nic);
++ 	const struct aq_hw_caps_s *hw_caps = aq_nic_cfg->aq_hw_caps;
++ 
++ 	if (ring->rx_mini_pending || ring->rx_jumbo_pending) {
++ 		err = -EOPNOTSUPP;
++ 		goto err_exit;
++ 	}
++ 
++ 	if (netif_running(ndev)) {
++ 		ndev_running = true;
++ 		dev_close(ndev);
++ 	}
++ 
++ 	aq_nic_free_vectors(aq_nic);
++ 
++ 	aq_nic_cfg->rxds = max(ring->rx_pending, hw_caps->rxds_min);
++ 	aq_nic_cfg->rxds = min(aq_nic_cfg->rxds, hw_caps->rxds_max);
++ 	aq_nic_cfg->rxds = ALIGN(aq_nic_cfg->rxds, AQ_HW_RXD_MULTIPLE);
++ 
++ 	aq_nic_cfg->txds = max(ring->tx_pending, hw_caps->txds_min);
++ 	aq_nic_cfg->txds = min(aq_nic_cfg->txds, hw_caps->txds_max);
++ 	aq_nic_cfg->txds = ALIGN(aq_nic_cfg->txds, AQ_HW_TXD_MULTIPLE);
++ 
++ 	for (aq_nic->aq_vecs = 0; aq_nic->aq_vecs < aq_nic_cfg->vecs;
++ 	     aq_nic->aq_vecs++) {
++ 		aq_nic->aq_vec[aq_nic->aq_vecs] =
++ 		    aq_vec_alloc(aq_nic, aq_nic->aq_vecs, aq_nic_cfg);
++ 		if (unlikely(!aq_nic->aq_vec[aq_nic->aq_vecs])) {
++ 			err = -ENOMEM;
++ 			goto err_exit;
++ 		}
++ 	}
++ 	if (ndev_running)
++ 		err = dev_open(ndev);
++ 
++ err_exit:
++ 	return err;
++ }
++ 
+++>>>>>>> b8d68b62d993 (net: aquantia: Add renegotiate ethtool operation support)
+  const struct ethtool_ops aq_ethtool_ops = {
+  	.get_link            = aq_ethtool_get_link,
+  	.get_regs_len        = aq_ethtool_get_regs_len,
+@@@ -291,6 -403,11 +405,14 @@@
+  	.get_drvinfo         = aq_ethtool_get_drvinfo,
+  	.get_strings         = aq_ethtool_get_strings,
+  	.get_rxfh_indir_size = aq_ethtool_get_rss_indir_size,
+++<<<<<<< HEAD
+++=======
++ 	.nway_reset          = aq_ethtool_nway_reset,
++ 	.get_ringparam       = aq_get_ringparam,
++ 	.set_ringparam       = aq_set_ringparam,
++ 	.get_pauseparam      = aq_ethtool_get_pauseparam,
++ 	.set_pauseparam      = aq_ethtool_set_pauseparam,
+++>>>>>>> b8d68b62d993 (net: aquantia: Add renegotiate ethtool operation support)
+  	.get_rxfh_key_size   = aq_ethtool_get_rss_key_size,
+  	.get_rxfh            = aq_ethtool_get_rss,
+  	.get_rxnfc           = aq_ethtool_get_rxnfc,
+diff --cc drivers/net/ethernet/aquantia/atlantic/hw_atl/hw_atl_utils_fw2x.c
+index a3e95f076bf0,e37943760a58..000000000000
+--- a/drivers/net/ethernet/aquantia/atlantic/hw_atl/hw_atl_utils_fw2x.c
++++ b/drivers/net/ethernet/aquantia/atlantic/hw_atl/hw_atl_utils_fw2x.c
+@@@ -201,6 -215,28 +201,31 @@@ static int aq_fw2x_update_stats(struct 
+  	return hw_atl_utils_update_stats(self);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static int aq_fw2x_renegotiate(struct aq_hw_s *self)
++ {
++ 	u32 mpi_opts = aq_hw_read_reg(self, HW_ATL_FW2X_MPI_CONTROL2_ADDR);
++ 
++ 	mpi_opts |= BIT(CTRL_FORCE_RECONNECT);
++ 
++ 	aq_hw_write_reg(self, HW_ATL_FW2X_MPI_CONTROL2_ADDR, mpi_opts);
++ 
++ 	return 0;
++ }
++ 
++ static int aq_fw2x_set_flow_control(struct aq_hw_s *self)
++ {
++ 	u32 mpi_state = aq_hw_read_reg(self, HW_ATL_FW2X_MPI_CONTROL2_ADDR);
++ 
++ 	aq_fw2x_set_mpi_flow_control(self, &mpi_state);
++ 
++ 	aq_hw_write_reg(self, HW_ATL_FW2X_MPI_CONTROL2_ADDR, mpi_state);
++ 
++ 	return 0;
++ }
++ 
+++>>>>>>> b8d68b62d993 (net: aquantia: Add renegotiate ethtool operation support)
+  const struct aq_fw_ops aq_fw_2x_ops = {
+  	.init = aq_fw2x_init,
+  	.deinit = aq_fw2x_deinit,
+* Unmerged path drivers/net/ethernet/aquantia/atlantic/aq_ethtool.c
+diff --git a/drivers/net/ethernet/aquantia/atlantic/aq_hw.h b/drivers/net/ethernet/aquantia/atlantic/aq_hw.h
+index 1cf486d813e0..c0d9c4c8e58d 100644
+--- a/drivers/net/ethernet/aquantia/atlantic/aq_hw.h
++++ b/drivers/net/ethernet/aquantia/atlantic/aq_hw.h
+@@ -209,6 +209,8 @@ struct aq_fw_ops {
+ 
+ 	int (*reset)(struct aq_hw_s *self);
+ 
++	int (*renegotiate)(struct aq_hw_s *self);
++
+ 	int (*get_mac_permanent)(struct aq_hw_s *self, u8 *mac);
+ 
+ 	int (*set_link_speed)(struct aq_hw_s *self, u32 speed);
+diff --git a/drivers/net/ethernet/aquantia/atlantic/hw_atl/hw_atl_utils.h b/drivers/net/ethernet/aquantia/atlantic/hw_atl/hw_atl_utils.h
+index cd8f18f39c61..b875590efcbd 100644
+--- a/drivers/net/ethernet/aquantia/atlantic/hw_atl/hw_atl_utils.h
++++ b/drivers/net/ethernet/aquantia/atlantic/hw_atl/hw_atl_utils.h
+@@ -239,6 +239,41 @@ enum hw_atl_fw2x_caps_hi {
+ 	CAPS_HI_TRANSACTION_ID,
+ };
+ 
++enum hw_atl_fw2x_ctrl {
++	CTRL_RESERVED1 = 0x00,
++	CTRL_RESERVED2,
++	CTRL_RESERVED3,
++	CTRL_PAUSE,
++	CTRL_ASYMMETRIC_PAUSE,
++	CTRL_RESERVED4,
++	CTRL_RESERVED5,
++	CTRL_RESERVED6,
++	CTRL_1GBASET_FD_EEE,
++	CTRL_2P5GBASET_FD_EEE,
++	CTRL_5GBASET_FD_EEE,
++	CTRL_10GBASET_FD_EEE,
++	CTRL_THERMAL_SHUTDOWN,
++	CTRL_PHY_LOGS,
++	CTRL_EEE_AUTO_DISABLE,
++	CTRL_PFC,
++	CTRL_WAKE_ON_LINK,
++	CTRL_CABLE_DIAG,
++	CTRL_TEMPERATURE,
++	CTRL_DOWNSHIFT,
++	CTRL_PTP_AVB,
++	CTRL_RESERVED7,
++	CTRL_LINK_DROP,
++	CTRL_SLEEP_PROXY,
++	CTRL_WOL,
++	CTRL_MAC_STOP,
++	CTRL_EXT_LOOPBACK,
++	CTRL_INT_LOOPBACK,
++	CTRL_RESERVED8,
++	CTRL_WOL_TIMER,
++	CTRL_STATISTICS,
++	CTRL_FORCE_RECONNECT,
++};
++
+ struct aq_hw_s;
+ struct aq_fw_ops;
+ struct aq_hw_caps_s;
+* Unmerged path drivers/net/ethernet/aquantia/atlantic/hw_atl/hw_atl_utils_fw2x.c
