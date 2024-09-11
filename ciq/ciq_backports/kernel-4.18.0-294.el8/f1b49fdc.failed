@@ -1,0 +1,272 @@
+blk-mq: Record active_queues_shared_sbitmap per tag_set for when using shared sbitmap
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author John Garry <john.garry@huawei.com>
+commit f1b49fdc1c64db110aa1315831e5fe0f8599fa56
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/f1b49fdc.failed
+
+For when using a shared sbitmap, no longer should the number of active
+request queues per hctx be relied on for when judging how to share the tag
+bitmap.
+
+Instead maintain the number of active request queues per tag_set, and make
+the judgement based on that.
+
+Originally-from: Kashyap Desai <kashyap.desai@broadcom.com>
+	Signed-off-by: John Garry <john.garry@huawei.com>
+	Tested-by: Don Brace<don.brace@microsemi.com> #SCSI resv cmds patches used
+	Tested-by: Douglas Gilbert <dgilbert@interlog.com>
+	Signed-off-by: Jens Axboe <axboe@kernel.dk>
+(cherry picked from commit f1b49fdc1c64db110aa1315831e5fe0f8599fa56)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	block/blk-mq.c
+#	block/blk-mq.h
+#	include/linux/blkdev.h
+diff --cc block/blk-mq.c
+index 7330c42c292b,eff9d987f85b..000000000000
+--- a/block/blk-mq.c
++++ b/block/blk-mq.c
+@@@ -3305,6 -3441,15 +3305,18 @@@ int blk_mq_alloc_tag_set(struct blk_mq_
+  	if (ret)
+  		goto out_free_mq_map;
+  
+++<<<<<<< HEAD
+++=======
++ 	if (blk_mq_is_sbitmap_shared(set->flags)) {
++ 		atomic_set(&set->active_queues_shared_sbitmap, 0);
++ 
++ 		if (blk_mq_init_shared_sbitmap(set, set->flags)) {
++ 			ret = -ENOMEM;
++ 			goto out_free_mq_rq_maps;
++ 		}
++ 	}
++ 
+++>>>>>>> f1b49fdc1c64 (blk-mq: Record active_queues_shared_sbitmap per tag_set for when using shared sbitmap)
+  	mutex_init(&set->tag_list_lock);
+  	INIT_LIST_HEAD(&set->tag_list);
+  
+diff --cc block/blk-mq.h
+index ddd814f1bef1,a52703c98b77..000000000000
+--- a/block/blk-mq.h
++++ b/block/blk-mq.h
+@@@ -262,4 -281,46 +262,49 @@@ static inline struct blk_plug *blk_mq_p
+  	return NULL;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ /*
++  * For shared tag users, we track the number of currently active users
++  * and attempt to provide a fair share of the tag depth for each of them.
++  */
++ static inline bool hctx_may_queue(struct blk_mq_hw_ctx *hctx,
++ 				  struct sbitmap_queue *bt)
++ {
++ 	unsigned int depth, users;
++ 
++ 	if (!hctx || !(hctx->flags & BLK_MQ_F_TAG_QUEUE_SHARED))
++ 		return true;
++ 
++ 	/*
++ 	 * Don't try dividing an ant
++ 	 */
++ 	if (bt->sb.depth == 1)
++ 		return true;
++ 
++ 	if (blk_mq_is_sbitmap_shared(hctx->flags)) {
++ 		struct request_queue *q = hctx->queue;
++ 		struct blk_mq_tag_set *set = q->tag_set;
++ 
++ 		if (!test_bit(BLK_MQ_S_TAG_ACTIVE, &q->queue_flags))
++ 			return true;
++ 		users = atomic_read(&set->active_queues_shared_sbitmap);
++ 	} else {
++ 		if (!test_bit(BLK_MQ_S_TAG_ACTIVE, &hctx->state))
++ 			return true;
++ 		users = atomic_read(&hctx->tags->active_queues);
++ 	}
++ 
++ 	if (!users)
++ 		return true;
++ 
++ 	/*
++ 	 * Allow at least some tags
++ 	 */
++ 	depth = max((bt->sb.depth + users - 1) / users, 4U);
++ 	return __blk_mq_active_requests(hctx) < depth;
++ }
++ 
++ 
+++>>>>>>> f1b49fdc1c64 (blk-mq: Record active_queues_shared_sbitmap per tag_set for when using shared sbitmap)
+  #endif
+diff --cc include/linux/blkdev.h
+index 43b1486e0588,7d82959e7b86..000000000000
+--- a/include/linux/blkdev.h
++++ b/include/linux/blkdev.h
+@@@ -585,63 -586,39 +585,95 @@@ struct request_queue 
+  
+  	size_t			cmd_size;
+  
+ +	RH_KABI_DEPRECATE(struct work_struct,      release_work)
+ +
+  #define BLK_MAX_WRITE_HINTS	5
+  	u64			write_hints[BLK_MAX_WRITE_HINTS];
+ +
+ +	/*
+ +	 * for reusing dead hctx instance in case of updating
+ +	 * nr_hw_queues
+ +	 */
+ +	RH_KABI_EXTEND(struct list_head	unused_hctx_list)
+ +	RH_KABI_EXTEND(spinlock_t	unused_hctx_lock)
+ +	/*
+ +	 * Protect concurrent access to q_usage_counter by
+ +	 * percpu_ref_kill() and percpu_ref_reinit().
+ +	 */
+ +	RH_KABI_EXTEND(struct mutex		mq_freeze_lock)
+ +
+ +	RH_KABI_EXTEND(struct mutex		sysfs_dir_lock)
+ +
+ +	RH_KABI_EXTEND(struct dentry		*rqos_debugfs_dir)
+ +
+ +	RH_KABI_EXTEND(unsigned int	required_elevator_features)
+  };
+  
+++<<<<<<< HEAD
+ +#define QUEUE_FLAG_STOPPED	1	/* queue is stopped */
+ +#define QUEUE_FLAG_DYING	2	/* queue being torn down */
+ +#define QUEUE_FLAG_NOMERGES     5	/* disable merge attempts */
+ +#define QUEUE_FLAG_SAME_COMP	6	/* complete on same CPU-group */
+ +#define QUEUE_FLAG_FAIL_IO	7	/* fake timeout */
+ +#define QUEUE_FLAG_UNPRIV_SGIO  8	/* SG_IO free for unprivileged users */
+ +#define QUEUE_FLAG_NONROT	9	/* non-rotational device (SSD) */
+ +#define QUEUE_FLAG_VIRT        QUEUE_FLAG_NONROT /* paravirt device */
+ +#define QUEUE_FLAG_IO_STAT     10	/* do IO stats */
+ +#define QUEUE_FLAG_DISCARD     11	/* supports DISCARD */
+ +#define QUEUE_FLAG_NOXMERGES   12	/* No extended merges */
+ +#define QUEUE_FLAG_ADD_RANDOM  13	/* Contributes to random pool */
+ +#define QUEUE_FLAG_SECERASE    14	/* supports secure erase */
+ +#define QUEUE_FLAG_SAME_FORCE  15	/* force complete on same CPU */
+ +#define QUEUE_FLAG_DEAD        16	/* queue tear-down finished */
+ +#define QUEUE_FLAG_INIT_DONE   17	/* queue is initialized */
+ +#define QUEUE_FLAG_NO_SG_MERGE 18	/* don't attempt to merge SG segments (obsolete) */
+ +#define QUEUE_FLAG_POLL	       19	/* IO polling enabled if set */
+ +#define QUEUE_FLAG_WC	       20	/* Write back caching */
+ +#define QUEUE_FLAG_FUA	       21	/* device supports FUA writes */
+ +#define QUEUE_FLAG_RQ_ALLOC_TIME 22	/* record rq->alloc_time_ns */
+ +#define QUEUE_FLAG_DAX         23	/* device supports DAX */
+ +#define QUEUE_FLAG_STATS       24	/* track rq completion times */
+ +#define QUEUE_FLAG_POLL_STATS  25	/* collecting stats for hybrid polling */
+ +#define QUEUE_FLAG_REGISTERED  26	/* queue has been registered to a disk */
+ +#define QUEUE_FLAG_SCSI_PASSTHROUGH 27	/* queue supports SCSI commands */
+ +#define QUEUE_FLAG_QUIESCED    28	/* queue has been quiesced */
+ +#define QUEUE_FLAG_PCI_P2PDMA  29	/* device supports PCI p2p requests */
+ +#define QUEUE_FLAG_ZONE_RESETALL 30	/* supports Zone Reset All */
+ +
+ +#define QUEUE_FLAG_DEFAULT	((1 << QUEUE_FLAG_IO_STAT) |		\
+ +				 (1 << QUEUE_FLAG_SAME_COMP)	|	\
+ +				 (1 << QUEUE_FLAG_ADD_RANDOM))
+++=======
++ /* Keep blk_queue_flag_name[] in sync with the definitions below */
++ #define QUEUE_FLAG_STOPPED	0	/* queue is stopped */
++ #define QUEUE_FLAG_DYING	1	/* queue being torn down */
++ #define QUEUE_FLAG_NOMERGES     3	/* disable merge attempts */
++ #define QUEUE_FLAG_SAME_COMP	4	/* complete on same CPU-group */
++ #define QUEUE_FLAG_FAIL_IO	5	/* fake timeout */
++ #define QUEUE_FLAG_NONROT	6	/* non-rotational device (SSD) */
++ #define QUEUE_FLAG_VIRT		QUEUE_FLAG_NONROT /* paravirt device */
++ #define QUEUE_FLAG_IO_STAT	7	/* do disk/partitions IO accounting */
++ #define QUEUE_FLAG_DISCARD	8	/* supports DISCARD */
++ #define QUEUE_FLAG_NOXMERGES	9	/* No extended merges */
++ #define QUEUE_FLAG_ADD_RANDOM	10	/* Contributes to random pool */
++ #define QUEUE_FLAG_SECERASE	11	/* supports secure erase */
++ #define QUEUE_FLAG_SAME_FORCE	12	/* force complete on same CPU */
++ #define QUEUE_FLAG_DEAD		13	/* queue tear-down finished */
++ #define QUEUE_FLAG_INIT_DONE	14	/* queue is initialized */
++ #define QUEUE_FLAG_POLL		16	/* IO polling enabled if set */
++ #define QUEUE_FLAG_WC		17	/* Write back caching */
++ #define QUEUE_FLAG_FUA		18	/* device supports FUA writes */
++ #define QUEUE_FLAG_DAX		19	/* device supports DAX */
++ #define QUEUE_FLAG_STATS	20	/* track IO start and completion times */
++ #define QUEUE_FLAG_POLL_STATS	21	/* collecting stats for hybrid polling */
++ #define QUEUE_FLAG_REGISTERED	22	/* queue has been registered to a disk */
++ #define QUEUE_FLAG_SCSI_PASSTHROUGH 23	/* queue supports SCSI commands */
++ #define QUEUE_FLAG_QUIESCED	24	/* queue has been quiesced */
++ #define QUEUE_FLAG_PCI_P2PDMA	25	/* device supports PCI p2p requests */
++ #define QUEUE_FLAG_ZONE_RESETALL 26	/* supports Zone Reset All */
++ #define QUEUE_FLAG_RQ_ALLOC_TIME 27	/* record rq->alloc_time_ns */
++ #define QUEUE_FLAG_HCTX_ACTIVE 28	/* at least one blk-mq hctx is active */
+++>>>>>>> f1b49fdc1c64 (blk-mq: Record active_queues_shared_sbitmap per tag_set for when using shared sbitmap)
+  
+  #define QUEUE_FLAG_MQ_DEFAULT	((1 << QUEUE_FLAG_IO_STAT) |		\
+  				 (1 << QUEUE_FLAG_SAME_COMP))
+diff --git a/block/blk-mq-tag.c b/block/blk-mq-tag.c
+index d27a57ba5c0b..d174d66e179a 100644
+--- a/block/blk-mq-tag.c
++++ b/block/blk-mq-tag.c
+@@ -22,9 +22,18 @@
+  */
+ bool __blk_mq_tag_busy(struct blk_mq_hw_ctx *hctx)
+ {
+-	if (!test_bit(BLK_MQ_S_TAG_ACTIVE, &hctx->state) &&
+-	    !test_and_set_bit(BLK_MQ_S_TAG_ACTIVE, &hctx->state))
+-		atomic_inc(&hctx->tags->active_queues);
++	if (blk_mq_is_sbitmap_shared(hctx->flags)) {
++		struct request_queue *q = hctx->queue;
++		struct blk_mq_tag_set *set = q->tag_set;
++
++		if (!test_bit(QUEUE_FLAG_HCTX_ACTIVE, &q->queue_flags) &&
++		    !test_and_set_bit(QUEUE_FLAG_HCTX_ACTIVE, &q->queue_flags))
++			atomic_inc(&set->active_queues_shared_sbitmap);
++	} else {
++		if (!test_bit(BLK_MQ_S_TAG_ACTIVE, &hctx->state) &&
++		    !test_and_set_bit(BLK_MQ_S_TAG_ACTIVE, &hctx->state))
++			atomic_inc(&hctx->tags->active_queues);
++	}
+ 
+ 	return true;
+ }
+@@ -46,11 +55,19 @@ void blk_mq_tag_wakeup_all(struct blk_mq_tags *tags, bool include_reserve)
+ void __blk_mq_tag_idle(struct blk_mq_hw_ctx *hctx)
+ {
+ 	struct blk_mq_tags *tags = hctx->tags;
+-
+-	if (!test_and_clear_bit(BLK_MQ_S_TAG_ACTIVE, &hctx->state))
+-		return;
+-
+-	atomic_dec(&tags->active_queues);
++	struct request_queue *q = hctx->queue;
++	struct blk_mq_tag_set *set = q->tag_set;
++
++	if (blk_mq_is_sbitmap_shared(hctx->flags)) {
++		if (!test_and_clear_bit(QUEUE_FLAG_HCTX_ACTIVE,
++					&q->queue_flags))
++			return;
++		atomic_dec(&set->active_queues_shared_sbitmap);
++	} else {
++		if (!test_and_clear_bit(BLK_MQ_S_TAG_ACTIVE, &hctx->state))
++			return;
++		atomic_dec(&tags->active_queues);
++	}
+ 
+ 	blk_mq_tag_wakeup_all(tags, false);
+ }
+* Unmerged path block/blk-mq.c
+* Unmerged path block/blk-mq.h
+diff --git a/include/linux/blk-mq.h b/include/linux/blk-mq.h
+index 200eeffcb439..5c44c37ececb 100644
+--- a/include/linux/blk-mq.h
++++ b/include/linux/blk-mq.h
+@@ -150,6 +150,7 @@ struct blk_mq_tag_set {
+ 	unsigned int		timeout;
+ 	unsigned int		flags;
+ 	void			*driver_data;
++	atomic_t		active_queues_shared_sbitmap;
+ 
+ 	struct blk_mq_tags	**tags;
+ 
+* Unmerged path include/linux/blkdev.h
