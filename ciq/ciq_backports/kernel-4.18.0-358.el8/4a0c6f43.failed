@@ -1,0 +1,118 @@
+scsi: scsi_debug: Add new defer type for mq_poll
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-358.el8
+commit-author Douglas Gilbert <dgilbert@interlog.com>
+commit 4a0c6f432d153156f8f73078c4e6fa43bd3a1752
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-358.el8/4a0c6f43.failed
+
+Add a new sdeb_defer_type enumeration: SDEB_DEFER_POLL for requests that
+have REQ_HIPRI set in cmd_flags field. It is expected that these requests
+will be polled via the mq_poll entry point which is driven by calls to
+blk_poll() in the block layer. Therefore timer events are not 'wired up' in
+the normal fashion.
+
+There are still cases with short delays (e.g. < 10 microseconds) where by
+the time the command response processing occurs, the delay is already
+exceeded in which case the code calls scsi_done() directly. In such cases
+there is no window for mq_poll() to be called.
+
+Add 'mq_polls' counter that increments on each scsi_done() called via the
+mq_poll entry point. Can be used to show (with 'cat
+/proc/scsi/scsi_debug/<host_id>') that blk_poll() is causing completions
+rather than some other mechanism.
+
+Link: https://lore.kernel.org/r/20210215074048.19424-5-kashyap.desai@broadcom.com
+	Tested-by: Kashyap Desai <kashyap.desai@broadcom.com>
+	Signed-off-by: Douglas Gilbert <dgilbert@interlog.com>
+	Signed-off-by: Kashyap Desai <kashyap.desai@broadcom.com>
+	Signed-off-by: Martin K. Petersen <martin.petersen@oracle.com>
+(cherry picked from commit 4a0c6f432d153156f8f73078c4e6fa43bd3a1752)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/scsi/scsi_debug.c
+diff --cc drivers/scsi/scsi_debug.c
+index 6b348700fb44,2ef77b980904..000000000000
+--- a/drivers/scsi/scsi_debug.c
++++ b/drivers/scsi/scsi_debug.c
+@@@ -5489,31 -5494,53 +5485,40 @@@ static int schedule_resp(struct scsi_cm
+  		} else {	/* ndelay has a 4.2 second max */
+  			kt = sdebug_random ? prandom_u32_max((u32)ndelay) :
+  					     (u32)ndelay;
+ -			if (ndelay < INCLUSIVE_TIMING_MAX_NS) {
+ -				u64 d = ktime_get_boottime_ns() - ns_from_boot;
+ -
+ -				if (kt <= d) {	/* elapsed duration >= kt */
+ -					spin_lock_irqsave(&sqp->qc_lock, iflags);
+ -					sqcp->a_cmnd = NULL;
+ -					atomic_dec(&devip->num_in_q);
+ -					clear_bit(k, sqp->in_use_bm);
+ -					spin_unlock_irqrestore(&sqp->qc_lock, iflags);
+ -					if (new_sd_dp)
+ -						kfree(sd_dp);
+ -					/* call scsi_done() from this thread */
+ -					cmnd->scsi_done(cmnd);
+ -					return 0;
+ -				}
+ -				/* otherwise reduce kt by elapsed time */
+ -				kt -= d;
+ -			}
+  		}
+- 		if (!sd_dp->init_hrt) {
+- 			sd_dp->init_hrt = true;
+- 			sqcp->sd_dp = sd_dp;
+- 			hrtimer_init(&sd_dp->hrt, CLOCK_MONOTONIC,
+- 				     HRTIMER_MODE_REL_PINNED);
+- 			sd_dp->hrt.function = sdebug_q_cmd_hrt_complete;
+- 			sd_dp->sqa_idx = sqp - sdebug_q_arr;
+- 			sd_dp->qc_idx = k;
++ 		sd_dp->cmpl_ts = ktime_add(ns_to_ktime(ns_from_boot), kt);
++ 		if (cmnd->request->cmd_flags & REQ_HIPRI) {
++ 			spin_lock_irqsave(&sqp->qc_lock, iflags);
++ 			if (!sd_dp->init_poll) {
++ 				sd_dp->init_poll = true;
++ 				sqcp->sd_dp = sd_dp;
++ 				sd_dp->sqa_idx = sqp - sdebug_q_arr;
++ 				sd_dp->qc_idx = k;
++ 			}
++ 			sd_dp->defer_t = SDEB_DEFER_POLL;
++ 			spin_unlock_irqrestore(&sqp->qc_lock, iflags);
++ 		} else {
++ 			if (!sd_dp->init_hrt) {
++ 				sd_dp->init_hrt = true;
++ 				sqcp->sd_dp = sd_dp;
++ 				hrtimer_init(&sd_dp->hrt, CLOCK_MONOTONIC,
++ 					     HRTIMER_MODE_REL_PINNED);
++ 				sd_dp->hrt.function = sdebug_q_cmd_hrt_complete;
++ 				sd_dp->sqa_idx = sqp - sdebug_q_arr;
++ 				sd_dp->qc_idx = k;
++ 			}
++ 			sd_dp->defer_t = SDEB_DEFER_HRT;
++ 			/* schedule the invocation of scsi_done() for a later time */
++ 			hrtimer_start(&sd_dp->hrt, kt, HRTIMER_MODE_REL_PINNED);
+  		}
+  		if (sdebug_statistics)
+  			sd_dp->issuing_cpu = raw_smp_processor_id();
+++<<<<<<< HEAD
+ +		sd_dp->defer_t = SDEB_DEFER_HRT;
+ +		hrtimer_start(&sd_dp->hrt, kt, HRTIMER_MODE_REL_PINNED);
+++=======
+++>>>>>>> 4a0c6f432d15 (scsi: scsi_debug: Add new defer type for mq_poll)
+  	} else {	/* jdelay < 0, use work queue */
+- 		if (!sd_dp->init_wq) {
+- 			sd_dp->init_wq = true;
+- 			sqcp->sd_dp = sd_dp;
+- 			sd_dp->sqa_idx = sqp - sdebug_q_arr;
+- 			sd_dp->qc_idx = k;
+- 			INIT_WORK(&sd_dp->ew.work, sdebug_q_cmd_wq_complete);
+- 		}
+- 		if (sdebug_statistics)
+- 			sd_dp->issuing_cpu = raw_smp_processor_id();
+- 		sd_dp->defer_t = SDEB_DEFER_WQ;
+  		if (unlikely((sdebug_opts & SDEBUG_OPT_CMD_ABORT) &&
+  			     atomic_read(&sdeb_inject_pending)))
+  			sd_dp->aborted = true;
+* Unmerged path drivers/scsi/scsi_debug.c
