@@ -1,0 +1,151 @@
+KVM: x86: Explicitly pass an exception struct to check_intercept
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Sean Christopherson <sean.j.christopherson@intel.com>
+commit 21f1b8f29ea5b2301af7f2cc41a20b7b87a22bec
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/21f1b8f2.failed
+
+Explicitly pass an exception struct when checking for intercept from
+the emulator, which eliminates the last reference to arch.emulate_ctxt
+in vendor specific code.
+
+	Signed-off-by: Sean Christopherson <sean.j.christopherson@intel.com>
+	Reviewed-by: Vitaly Kuznetsov <vkuznets@redhat.com>
+	Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+(cherry picked from commit 21f1b8f29ea5b2301af7f2cc41a20b7b87a22bec)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kvm/vmx/vmx.c
+diff --cc arch/x86/kvm/vmx/vmx.c
+index fc5efa486c0c,57742ddfd854..000000000000
+--- a/arch/x86/kvm/vmx/vmx.c
++++ b/arch/x86/kvm/vmx/vmx.c
+@@@ -7262,25 -7139,70 +7262,45 @@@ static void vmx_request_immediate_exit(
+  	to_vmx(vcpu)->req_immediate_exit = true;
+  }
+  
+ -static int vmx_check_intercept_io(struct kvm_vcpu *vcpu,
+ -				  struct x86_instruction_info *info)
+ -{
+ -	struct vmcs12 *vmcs12 = get_vmcs12(vcpu);
+ -	unsigned short port;
+ -	bool intercept;
+ -	int size;
+ -
+ -	if (info->intercept == x86_intercept_in ||
+ -	    info->intercept == x86_intercept_ins) {
+ -		port = info->src_val;
+ -		size = info->dst_bytes;
+ -	} else {
+ -		port = info->dst_val;
+ -		size = info->src_bytes;
+ -	}
+ -
+ -	/*
+ -	 * If the 'use IO bitmaps' VM-execution control is 0, IO instruction
+ -	 * VM-exits depend on the 'unconditional IO exiting' VM-execution
+ -	 * control.
+ -	 *
+ -	 * Otherwise, IO instruction VM-exits are controlled by the IO bitmaps.
+ -	 */
+ -	if (!nested_cpu_has(vmcs12, CPU_BASED_USE_IO_BITMAPS))
+ -		intercept = nested_cpu_has(vmcs12,
+ -					   CPU_BASED_UNCOND_IO_EXITING);
+ -	else
+ -		intercept = nested_vmx_check_io_bitmaps(vcpu, port, size);
+ -
+ -	return intercept ? X86EMUL_UNHANDLEABLE : X86EMUL_CONTINUE;
+ -}
+ -
+  static int vmx_check_intercept(struct kvm_vcpu *vcpu,
+  			       struct x86_instruction_info *info,
+- 			       enum x86_intercept_stage stage)
++ 			       enum x86_intercept_stage stage,
++ 			       struct x86_exception *exception)
+  {
+  	struct vmcs12 *vmcs12 = get_vmcs12(vcpu);
+- 	struct x86_emulate_ctxt *ctxt = &vcpu->arch.emulate_ctxt;
+  
+ -	switch (info->intercept) {
+  	/*
+  	 * RDPID causes #UD if disabled through secondary execution controls.
+  	 * Because it is marked as EmulateOnUD, we need to intercept it here.
+  	 */
+++<<<<<<< HEAD
+ +	if (info->intercept == x86_intercept_rdtscp &&
+ +	    !nested_cpu_has2(vmcs12, SECONDARY_EXEC_RDTSCP)) {
+ +		ctxt->exception.vector = UD_VECTOR;
+ +		ctxt->exception.error_code_valid = false;
+ +		return X86EMUL_PROPAGATE_FAULT;
+++=======
++ 	case x86_intercept_rdtscp:
++ 		if (!nested_cpu_has2(vmcs12, SECONDARY_EXEC_RDTSCP)) {
++ 			exception->vector = UD_VECTOR;
++ 			exception->error_code_valid = false;
++ 			return X86EMUL_PROPAGATE_FAULT;
++ 		}
++ 		break;
++ 
++ 	case x86_intercept_in:
++ 	case x86_intercept_ins:
++ 	case x86_intercept_out:
++ 	case x86_intercept_outs:
++ 		return vmx_check_intercept_io(vcpu, info);
++ 
++ 	/* TODO: check more intercepts... */
++ 	default:
++ 		break;
+++>>>>>>> 21f1b8f29ea5 (KVM: x86: Explicitly pass an exception struct to check_intercept)
+  	}
+  
+ +	/* TODO: check more intercepts... */
+  	return X86EMUL_UNHANDLEABLE;
+  }
+  
+diff --git a/arch/x86/include/asm/kvm_host.h b/arch/x86/include/asm/kvm_host.h
+index 5dfa212d1e49..45d9bec6600d 100644
+--- a/arch/x86/include/asm/kvm_host.h
++++ b/arch/x86/include/asm/kvm_host.h
+@@ -1162,7 +1162,8 @@ struct kvm_x86_ops {
+ 
+ 	int (*check_intercept)(struct kvm_vcpu *vcpu,
+ 			       struct x86_instruction_info *info,
+-			       enum x86_intercept_stage stage);
++			       enum x86_intercept_stage stage,
++			       struct x86_exception *exception);
+ 	void (*handle_exit_irqoff)(struct kvm_vcpu *vcpu,
+ 		enum exit_fastpath_completion *exit_fastpath);
+ 	bool (*mpx_supported)(void);
+diff --git a/arch/x86/kvm/svm.c b/arch/x86/kvm/svm.c
+index 2c7c88ef7253..a62cf22750c3 100644
+--- a/arch/x86/kvm/svm.c
++++ b/arch/x86/kvm/svm.c
+@@ -6192,7 +6192,8 @@ static const struct __x86_intercept {
+ 
+ static int svm_check_intercept(struct kvm_vcpu *vcpu,
+ 			       struct x86_instruction_info *info,
+-			       enum x86_intercept_stage stage)
++			       enum x86_intercept_stage stage,
++			       struct x86_exception *exception)
+ {
+ 	struct vcpu_svm *svm = to_svm(vcpu);
+ 	int vmexit, ret = X86EMUL_CONTINUE;
+* Unmerged path arch/x86/kvm/vmx/vmx.c
+diff --git a/arch/x86/kvm/x86.c b/arch/x86/kvm/x86.c
+index f8b28602562f..8d4c8fda3986 100644
+--- a/arch/x86/kvm/x86.c
++++ b/arch/x86/kvm/x86.c
+@@ -6184,7 +6184,8 @@ static int emulator_intercept(struct x86_emulate_ctxt *ctxt,
+ 			      struct x86_instruction_info *info,
+ 			      enum x86_intercept_stage stage)
+ {
+-	return kvm_x86_ops->check_intercept(emul_to_vcpu(ctxt), info, stage);
++	return kvm_x86_ops->check_intercept(emul_to_vcpu(ctxt), info, stage,
++					    &ctxt->exception);
+ }
+ 
+ static bool emulator_get_cpuid(struct x86_emulate_ctxt *ctxt,
