@@ -302,7 +302,6 @@ static void qeth_l2_stop_card(struct qeth_card *card, int recovery_mode)
 			dev_close(card->dev);
 			rtnl_unlock();
 		}
-		card->info.mac_bits &= ~QETH_LAYER2_MAC_REGISTERED;
 		card->state = CARD_STATE_SOFTSETUP;
 	}
 	if (card->state == CARD_STATE_SOFTSETUP) {
@@ -322,6 +321,7 @@ static void qeth_l2_stop_card(struct qeth_card *card, int recovery_mode)
 	}
 
 	flush_workqueue(card->event_wq);
+	card->info.mac_bits &= ~QETH_LAYER2_MAC_REGISTERED;
 }
 
 static int qeth_l2_process_inbound_buffer(struct qeth_card *card,
