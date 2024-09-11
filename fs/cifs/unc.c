@@ -46,7 +46,6 @@ char *extract_sharename(const char *unc)
 {
 	const char *src;
 	char *delim, *dst;
-	int len;
 
 	/* skip double chars at the beginning */
 	src = unc + 2;
@@ -56,10 +55,9 @@ char *extract_sharename(const char *unc)
 	if (!delim)
 		return ERR_PTR(-EINVAL);
 	delim++;
-	len = strlen(delim);
 
 	/* caller has to free the memory */
-	dst = kstrndup(delim, len, GFP_KERNEL);
+	dst = kstrdup(delim, GFP_KERNEL);
 	if (!dst)
 		return ERR_PTR(-ENOMEM);
 
