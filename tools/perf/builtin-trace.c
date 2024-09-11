@@ -2440,7 +2440,7 @@ static int trace__event_handler(struct trace *trace, struct perf_evsel *evsel,
 		 */
 	}
 
-	fprintf(trace->output, "%s:", evsel->name);
+	fprintf(trace->output, "%s(", evsel->name);
 
 	if (perf_evsel__is_bpf_output(evsel)) {
 		bpf_output__fprintf(trace, sample);
@@ -2460,7 +2460,7 @@ static int trace__event_handler(struct trace *trace, struct perf_evsel *evsel,
 	}
 
 newline:
-	fprintf(trace->output, "\n");
+	fprintf(trace->output, ")\n");
 
 	if (callchain_ret > 0)
 		trace__fprintf_callchain(trace, sample);
