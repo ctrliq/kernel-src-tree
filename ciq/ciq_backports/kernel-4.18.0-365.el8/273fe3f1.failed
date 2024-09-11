@@ -1,0 +1,216 @@
+netfilter: nf_tables: bogus EBUSY when deleting set after flush
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-365.el8
+commit-author Pablo Neira Ayuso <pablo@netfilter.org>
+commit 273fe3f1006ea5ebc63d6729e43e8e45e32b256a
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-365.el8/273fe3f1.failed
+
+Set deletion after flush coming in the same batch results in EBUSY. Add
+set use counter to track the number of references to this set from
+rules. We cannot rely on the list of bindings for this since such list
+is still populated from the preparation phase.
+
+	Reported-by: Václav Zindulka <vaclav.zindulka@tlapnet.cz>
+	Signed-off-by: Pablo Neira Ayuso <pablo@netfilter.org>
+(cherry picked from commit 273fe3f1006ea5ebc63d6729e43e8e45e32b256a)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/net/netfilter/nf_tables.h
+diff --cc include/net/netfilter/nf_tables.h
+index 4256c4e85870,3e9ab643eedf..000000000000
+--- a/include/net/netfilter/nf_tables.h
++++ b/include/net/netfilter/nf_tables.h
+@@@ -407,8 -382,7 +407,12 @@@ void nft_unregister_set(struct nft_set_
+   * 	@dtype: data type (verdict or numeric type defined by userspace)
+   * 	@objtype: object type (see NFT_OBJECT_* definitions)
+   * 	@size: maximum set size
+++<<<<<<< HEAD
+ + *	@field_len: length of each field in concatenation, bytes
+ + *	@field_count: number of concatenated fields in element
+++=======
++  *	@use: number of rules references to this set
+++>>>>>>> 273fe3f1006e (netfilter: nf_tables: bogus EBUSY when deleting set after flush)
+   * 	@nelems: number of elements
+   * 	@ndeact: number of deactivated elements queued for removal
+   *	@timeout: default timeout value in jiffies
+@@@ -434,8 -408,7 +438,12 @@@ struct nft_set 
+  	u32				dtype;
+  	u32				objtype;
+  	u32				size;
+++<<<<<<< HEAD
+ +	u8				field_len[NFT_REG32_COUNT];
+ +	u8				field_count;
+++=======
++ 	u32				use;
+++>>>>>>> 273fe3f1006e (netfilter: nf_tables: bogus EBUSY when deleting set after flush)
+  	atomic_t			nelems;
+  	u32				ndeact;
+  	u64				timeout;
+* Unmerged path include/net/netfilter/nf_tables.h
+diff --git a/net/netfilter/nf_tables_api.c b/net/netfilter/nf_tables_api.c
+index 13b98da99069..fb14e768f5fb 100644
+--- a/net/netfilter/nf_tables_api.c
++++ b/net/netfilter/nf_tables_api.c
+@@ -4196,6 +4196,9 @@ static int nf_tables_newset(struct net *net, struct sock *nlsk,
+ 
+ static void nft_set_destroy(const struct nft_ctx *ctx, struct nft_set *set)
+ {
++	if (WARN_ON(set->use > 0))
++		return;
++
+ 	set->ops->destroy(set);
+ 	module_put(to_set_type(set->ops)->owner);
+ 	kfree(set->name);
+@@ -4236,7 +4239,7 @@ static int nf_tables_delset(struct net *net, struct sock *nlsk,
+ 		NL_SET_BAD_ATTR(extack, attr);
+ 		return PTR_ERR(set);
+ 	}
+-	if (!list_empty(&set->bindings) ||
++	if (set->use ||
+ 	    (nlh->nlmsg_flags & NLM_F_NONREC && atomic_read(&set->nelems) > 0)) {
+ 		NL_SET_BAD_ATTR(extack, attr);
+ 		return -EBUSY;
+@@ -4266,6 +4269,9 @@ int nf_tables_bind_set(const struct nft_ctx *ctx, struct nft_set *set,
+ 	struct nft_set_binding *i;
+ 	struct nft_set_iter iter;
+ 
++	if (set->use == UINT_MAX)
++		return -EOVERFLOW;
++
+ 	if (!list_empty(&set->bindings) && nft_set_is_anonymous(set))
+ 		return -EBUSY;
+ 
+@@ -4293,6 +4299,7 @@ int nf_tables_bind_set(const struct nft_ctx *ctx, struct nft_set *set,
+ 	binding->chain = ctx->chain;
+ 	list_add_tail_rcu(&binding->list, &set->bindings);
+ 	nft_set_trans_bind(ctx, set);
++	set->use++;
+ 
+ 	return 0;
+ }
+@@ -4312,6 +4319,25 @@ void nf_tables_unbind_set(const struct nft_ctx *ctx, struct nft_set *set,
+ }
+ EXPORT_SYMBOL_GPL(nf_tables_unbind_set);
+ 
++void nf_tables_deactivate_set(const struct nft_ctx *ctx, struct nft_set *set,
++			      struct nft_set_binding *binding,
++			      enum nft_trans_phase phase)
++{
++	switch (phase) {
++	case NFT_TRANS_PREPARE:
++		set->use--;
++		return;
++	case NFT_TRANS_ABORT:
++	case NFT_TRANS_RELEASE:
++		set->use--;
++		/* fall through */
++	default:
++		nf_tables_unbind_set(ctx, set, binding,
++				     phase == NFT_TRANS_COMMIT);
++	}
++}
++EXPORT_SYMBOL_GPL(nf_tables_deactivate_set);
++
+ void nf_tables_destroy_set(const struct nft_ctx *ctx, struct nft_set *set)
+ {
+ 	if (list_empty(&set->bindings) && nft_set_is_anonymous(set))
+diff --git a/net/netfilter/nft_dynset.c b/net/netfilter/nft_dynset.c
+index 60ef0b707cbb..7f57ce253ad0 100644
+--- a/net/netfilter/nft_dynset.c
++++ b/net/netfilter/nft_dynset.c
+@@ -229,11 +229,15 @@ static void nft_dynset_deactivate(const struct nft_ctx *ctx,
+ {
+ 	struct nft_dynset *priv = nft_expr_priv(expr);
+ 
+-	if (phase == NFT_TRANS_PREPARE)
+-		return;
++	nf_tables_deactivate_set(ctx, priv->set, &priv->binding, phase);
++}
++
++static void nft_dynset_activate(const struct nft_ctx *ctx,
++				const struct nft_expr *expr)
++{
++	struct nft_dynset *priv = nft_expr_priv(expr);
+ 
+-	nf_tables_unbind_set(ctx, priv->set, &priv->binding,
+-			     phase == NFT_TRANS_COMMIT);
++	priv->set->use++;
+ }
+ 
+ static void nft_dynset_destroy(const struct nft_ctx *ctx,
+@@ -281,6 +285,7 @@ static const struct nft_expr_ops nft_dynset_ops = {
+ 	.eval		= nft_dynset_eval,
+ 	.init		= nft_dynset_init,
+ 	.destroy	= nft_dynset_destroy,
++	.activate	= nft_dynset_activate,
+ 	.deactivate	= nft_dynset_deactivate,
+ 	.dump		= nft_dynset_dump,
+ };
+diff --git a/net/netfilter/nft_lookup.c b/net/netfilter/nft_lookup.c
+index bd8831172159..c5c8044013c2 100644
+--- a/net/netfilter/nft_lookup.c
++++ b/net/netfilter/nft_lookup.c
+@@ -125,11 +125,15 @@ static void nft_lookup_deactivate(const struct nft_ctx *ctx,
+ {
+ 	struct nft_lookup *priv = nft_expr_priv(expr);
+ 
+-	if (phase == NFT_TRANS_PREPARE)
+-		return;
++	nf_tables_deactivate_set(ctx, priv->set, &priv->binding, phase);
++}
++
++static void nft_lookup_activate(const struct nft_ctx *ctx,
++				const struct nft_expr *expr)
++{
++	struct nft_lookup *priv = nft_expr_priv(expr);
+ 
+-	nf_tables_unbind_set(ctx, priv->set, &priv->binding,
+-			     phase == NFT_TRANS_COMMIT);
++	priv->set->use++;
+ }
+ 
+ static void nft_lookup_destroy(const struct nft_ctx *ctx,
+@@ -220,6 +224,7 @@ static const struct nft_expr_ops nft_lookup_ops = {
+ 	.size		= NFT_EXPR_SIZE(sizeof(struct nft_lookup)),
+ 	.eval		= nft_lookup_eval,
+ 	.init		= nft_lookup_init,
++	.activate	= nft_lookup_activate,
+ 	.deactivate	= nft_lookup_deactivate,
+ 	.destroy	= nft_lookup_destroy,
+ 	.dump		= nft_lookup_dump,
+diff --git a/net/netfilter/nft_objref.c b/net/netfilter/nft_objref.c
+index 1ec1a43e284c..8dfa798ea683 100644
+--- a/net/netfilter/nft_objref.c
++++ b/net/netfilter/nft_objref.c
+@@ -175,11 +175,15 @@ static void nft_objref_map_deactivate(const struct nft_ctx *ctx,
+ {
+ 	struct nft_objref_map *priv = nft_expr_priv(expr);
+ 
+-	if (phase == NFT_TRANS_PREPARE)
+-		return;
++	nf_tables_deactivate_set(ctx, priv->set, &priv->binding, phase);
++}
++
++static void nft_objref_map_activate(const struct nft_ctx *ctx,
++				    const struct nft_expr *expr)
++{
++	struct nft_objref_map *priv = nft_expr_priv(expr);
+ 
+-	nf_tables_unbind_set(ctx, priv->set, &priv->binding,
+-			     phase == NFT_TRANS_COMMIT);
++	priv->set->use++;
+ }
+ 
+ static void nft_objref_map_destroy(const struct nft_ctx *ctx,
+@@ -196,6 +200,7 @@ static const struct nft_expr_ops nft_objref_map_ops = {
+ 	.size		= NFT_EXPR_SIZE(sizeof(struct nft_objref_map)),
+ 	.eval		= nft_objref_map_eval,
+ 	.init		= nft_objref_map_init,
++	.activate	= nft_objref_map_activate,
+ 	.deactivate	= nft_objref_map_deactivate,
+ 	.destroy	= nft_objref_map_destroy,
+ 	.dump		= nft_objref_map_dump,
