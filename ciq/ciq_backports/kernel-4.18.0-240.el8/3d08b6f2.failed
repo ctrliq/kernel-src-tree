@@ -1,0 +1,223 @@
+bpf: Add selftests for BPF_MODIFY_RETURN
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author KP Singh <kpsingh@google.com>
+commit 3d08b6f29cf33aeaf301553d8d3805f0aa609df7
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/3d08b6f2.failed
+
+Test for two scenarios:
+
+  * When the fmod_ret program returns 0, the original function should
+    be called along with fentry and fexit programs.
+  * When the fmod_ret program returns a non-zero value, the original
+    function should not be called, no side effect should be observed and
+    fentry and fexit programs should be called.
+
+The result from the kernel function call and whether a side-effect is
+observed is returned via the retval attr of the BPF_PROG_TEST_RUN (bpf)
+syscall.
+
+	Signed-off-by: KP Singh <kpsingh@google.com>
+	Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+	Acked-by: Andrii Nakryiko <andriin@fb.com>
+	Acked-by: Daniel Borkmann <daniel@iogearbox.net>
+Link: https://lore.kernel.org/bpf/20200304191853.1529-8-kpsingh@chromium.org
+(cherry picked from commit 3d08b6f29cf33aeaf301553d8d3805f0aa609df7)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/bpf/test_run.c
+diff --cc net/bpf/test_run.c
+index d17321193b1d,4c921f5154e0..000000000000
+--- a/net/bpf/test_run.c
++++ b/net/bpf/test_run.c
+@@@ -163,16 -169,46 +172,59 @@@ static void *bpf_test_init(const union 
+  		kfree(data);
+  		return ERR_PTR(-EFAULT);
+  	}
+++<<<<<<< HEAD
+ +	if (bpf_fentry_test1(1) != 2 ||
+ +	    bpf_fentry_test2(2, 3) != 5 ||
+ +	    bpf_fentry_test3(4, 5, 6) != 15 ||
+ +	    bpf_fentry_test4((void *)7, 8, 9, 10) != 34 ||
+ +	    bpf_fentry_test5(11, (void *)12, 13, 14, 15) != 65 ||
+ +	    bpf_fentry_test6(16, (void *)17, 18, 19, (void *)20, 21) != 111) {
+ +		kfree(data);
+ +		return ERR_PTR(-EFAULT);
+ +	}
+ +	return data;
+++=======
++ 
++ 	return data;
++ }
++ 
++ int bpf_prog_test_run_tracing(struct bpf_prog *prog,
++ 			      const union bpf_attr *kattr,
++ 			      union bpf_attr __user *uattr)
++ {
++ 	u16 side_effect = 0, ret = 0;
++ 	int b = 2, err = -EFAULT;
++ 	u32 retval = 0;
++ 
++ 	switch (prog->expected_attach_type) {
++ 	case BPF_TRACE_FENTRY:
++ 	case BPF_TRACE_FEXIT:
++ 		if (bpf_fentry_test1(1) != 2 ||
++ 		    bpf_fentry_test2(2, 3) != 5 ||
++ 		    bpf_fentry_test3(4, 5, 6) != 15 ||
++ 		    bpf_fentry_test4((void *)7, 8, 9, 10) != 34 ||
++ 		    bpf_fentry_test5(11, (void *)12, 13, 14, 15) != 65 ||
++ 		    bpf_fentry_test6(16, (void *)17, 18, 19, (void *)20, 21) != 111)
++ 			goto out;
++ 		break;
++ 	case BPF_MODIFY_RETURN:
++ 		ret = bpf_modify_return_test(1, &b);
++ 		if (b != 2)
++ 			side_effect = 1;
++ 		break;
++ 	default:
++ 		goto out;
++ 	}
++ 
++ 	retval = ((u32)side_effect << 16) | ret;
++ 	if (copy_to_user(&uattr->test.retval, &retval, sizeof(retval)))
++ 		goto out;
++ 
++ 	err = 0;
++ out:
++ 	trace_bpf_test_finish(&err);
++ 	return err;
+++>>>>>>> 3d08b6f29cf3 (bpf: Add selftests for BPF_MODIFY_RETURN)
+  }
+  
+  static void *bpf_ctx_init(const union bpf_attr *kattr, u32 max_size)
+* Unmerged path net/bpf/test_run.c
+diff --git a/tools/testing/selftests/bpf/prog_tests/modify_return.c b/tools/testing/selftests/bpf/prog_tests/modify_return.c
+new file mode 100644
+index 000000000000..97fec70c600b
+--- /dev/null
++++ b/tools/testing/selftests/bpf/prog_tests/modify_return.c
+@@ -0,0 +1,65 @@
++// SPDX-License-Identifier: GPL-2.0
++
++/*
++ * Copyright 2020 Google LLC.
++ */
++
++#include <test_progs.h>
++#include "modify_return.skel.h"
++
++#define LOWER(x) ((x) & 0xffff)
++#define UPPER(x) ((x) >> 16)
++
++
++static void run_test(__u32 input_retval, __u16 want_side_effect, __s16 want_ret)
++{
++	struct modify_return *skel = NULL;
++	int err, prog_fd;
++	__u32 duration = 0, retval;
++	__u16 side_effect;
++	__s16 ret;
++
++	skel = modify_return__open_and_load();
++	if (CHECK(!skel, "skel_load", "modify_return skeleton failed\n"))
++		goto cleanup;
++
++	err = modify_return__attach(skel);
++	if (CHECK(err, "modify_return", "attach failed: %d\n", err))
++		goto cleanup;
++
++	skel->bss->input_retval = input_retval;
++	prog_fd = bpf_program__fd(skel->progs.fmod_ret_test);
++	err = bpf_prog_test_run(prog_fd, 1, NULL, 0, NULL, 0,
++				&retval, &duration);
++
++	CHECK(err, "test_run", "err %d errno %d\n", err, errno);
++
++	side_effect = UPPER(retval);
++	ret  = LOWER(retval);
++
++	CHECK(ret != want_ret, "test_run",
++	      "unexpected ret: %d, expected: %d\n", ret, want_ret);
++	CHECK(side_effect != want_side_effect, "modify_return",
++	      "unexpected side_effect: %d\n", side_effect);
++
++	CHECK(skel->bss->fentry_result != 1, "modify_return",
++	      "fentry failed\n");
++	CHECK(skel->bss->fexit_result != 1, "modify_return",
++	      "fexit failed\n");
++	CHECK(skel->bss->fmod_ret_result != 1, "modify_return",
++	      "fmod_ret failed\n");
++
++cleanup:
++	modify_return__destroy(skel);
++}
++
++void test_modify_return(void)
++{
++	run_test(0 /* input_retval */,
++		 1 /* want_side_effect */,
++		 4 /* want_ret */);
++	run_test(-EINVAL /* input_retval */,
++		 0 /* want_side_effect */,
++		 -EINVAL /* want_ret */);
++}
++
+diff --git a/tools/testing/selftests/bpf/progs/modify_return.c b/tools/testing/selftests/bpf/progs/modify_return.c
+new file mode 100644
+index 000000000000..8b7466a15c6b
+--- /dev/null
++++ b/tools/testing/selftests/bpf/progs/modify_return.c
+@@ -0,0 +1,49 @@
++// SPDX-License-Identifier: GPL-2.0
++
++/*
++ * Copyright 2020 Google LLC.
++ */
++
++#include <linux/bpf.h>
++#include <bpf/bpf_helpers.h>
++#include <bpf/bpf_tracing.h>
++
++char _license[] SEC("license") = "GPL";
++
++static int sequence = 0;
++__s32 input_retval = 0;
++
++__u64 fentry_result = 0;
++SEC("fentry/bpf_modify_return_test")
++int BPF_PROG(fentry_test, int a, __u64 b)
++{
++	sequence++;
++	fentry_result = (sequence == 1);
++	return 0;
++}
++
++__u64 fmod_ret_result = 0;
++SEC("fmod_ret/bpf_modify_return_test")
++int BPF_PROG(fmod_ret_test, int a, int *b, int ret)
++{
++	sequence++;
++	/* This is the first fmod_ret program, the ret passed should be 0 */
++	fmod_ret_result = (sequence == 2 && ret == 0);
++	return input_retval;
++}
++
++__u64 fexit_result = 0;
++SEC("fexit/bpf_modify_return_test")
++int BPF_PROG(fexit_test, int a, __u64 b, int ret)
++{
++	sequence++;
++	/* If the input_reval is non-zero a successful modification should have
++	 * occurred.
++	 */
++	if (input_retval)
++		fexit_result = (sequence == 3 && ret == input_retval);
++	else
++		fexit_result = (sequence == 3 && ret == 4);
++
++	return 0;
++}
