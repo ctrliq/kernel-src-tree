@@ -1,0 +1,142 @@
+KVM: PPC: Book3S HV: Fix handling for interrupted H_ENTER_NESTED
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-80.el8
+commit-author Michael Roth <mdroth@linux.vnet.ibm.com>
+commit 6c08ec1216b7b2f84b9755f339d6009768599256
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-80.el8/6c08ec12.failed
+
+While running a nested guest VCPU on L0 via H_ENTER_NESTED hcall, a
+pending signal in the L0 QEMU process can generate the following
+sequence:
+
+  ret0 = kvmppc_pseries_do_hcall()
+    ret1 = kvmhv_enter_nested_guest()
+      ret2 = kvmhv_run_single_vcpu()
+      if (ret2 == -EINTR)
+        return H_INTERRUPT
+    if (ret1 == H_INTERRUPT)
+      kvmppc_set_gpr(vcpu, 3, 0)
+      return -EINTR
+    /* skipped: */
+    kvmppc_set_gpr(vcpu, 3, ret)
+    vcpu->arch.hcall_needed = 0
+    return RESUME_GUEST
+
+which causes an exit to L0 userspace with ret0 == -EINTR.
+
+The intention seems to be to set the hcall return value to 0 (via
+VCPU r3) so that L1 will see a successful return from H_ENTER_NESTED
+once we resume executing the VCPU. However, because we don't set
+vcpu->arch.hcall_needed = 0, we do the following once userspace
+resumes execution via kvm_arch_vcpu_ioctl_run():
+
+  ...
+  } else if (vcpu->arch.hcall_needed) {
+    int i
+
+    kvmppc_set_gpr(vcpu, 3, run->papr_hcall.ret);
+    for (i = 0; i < 9; ++i)
+           kvmppc_set_gpr(vcpu, 4 + i, run->papr_hcall.args[i]);
+    vcpu->arch.hcall_needed = 0;
+
+since vcpu->arch.hcall_needed == 1 indicates that userspace should
+have handled the hcall and stored the return value in
+run->papr_hcall.ret. Since that's not the case here, we can get an
+unexpected value in VCPU r3, which can result in
+kvmhv_p9_guest_entry() reporting an unexpected trap value when it
+returns from H_ENTER_NESTED, causing the following register dump to
+console via subsequent call to kvmppc_handle_exit_hv() in L1:
+
+  [  350.612854] vcpu 00000000f9564cf8 (0):
+  [  350.612915] pc  = c00000000013eb98  msr = 8000000000009033  trap = 1
+  [  350.613020] r 0 = c0000000004b9044  r16 = 0000000000000000
+  [  350.613075] r 1 = c00000007cffba30  r17 = 0000000000000000
+  [  350.613120] r 2 = c00000000178c100  r18 = 00007fffc24f3b50
+  [  350.613166] r 3 = c00000007ef52480  r19 = 00007fffc24fff58
+  [  350.613212] r 4 = 0000000000000000  r20 = 00000a1e96ece9d0
+  [  350.613253] r 5 = 70616d00746f6f72  r21 = 00000a1ea117c9b0
+  [  350.613295] r 6 = 0000000000000020  r22 = 00000a1ea1184360
+  [  350.613338] r 7 = c0000000783be440  r23 = 0000000000000003
+  [  350.613380] r 8 = fffffffffffffffc  r24 = 00000a1e96e9e124
+  [  350.613423] r 9 = c00000007ef52490  r25 = 00000000000007ff
+  [  350.613469] r10 = 0000000000000004  r26 = c00000007eb2f7a0
+  [  350.613513] r11 = b0616d0009eccdb2  r27 = c00000007cffbb10
+  [  350.613556] r12 = c0000000004b9000  r28 = c00000007d83a2c0
+  [  350.613597] r13 = c000000001b00000  r29 = c0000000783cdf68
+  [  350.613639] r14 = 0000000000000000  r30 = 0000000000000000
+  [  350.613681] r15 = 0000000000000000  r31 = c00000007cffbbf0
+  [  350.613723] ctr = c0000000004b9000  lr  = c0000000004b9044
+  [  350.613765] srr0 = 0000772f954dd48c srr1 = 800000000280f033
+  [  350.613808] sprg0 = 0000000000000000 sprg1 = c000000001b00000
+  [  350.613859] sprg2 = 0000772f9565a280 sprg3 = 0000000000000000
+  [  350.613911] cr = 88002848  xer = 0000000020040000  dsisr = 42000000
+  [  350.613962] dar = 0000772f95390000
+  [  350.614031] fault dar = c000000244b278c0 dsisr = 00000000
+  [  350.614073] SLB (0 entries):
+  [  350.614157] lpcr = 0040000003d40413 sdr1 = 0000000000000000 last_inst = ffffffff
+  [  350.614252] trap=0x1 | pc=0xc00000000013eb98 | msr=0x8000000000009033
+
+followed by L1's QEMU reporting the following before stopping execution
+of the nested guest:
+
+  KVM: unknown exit, hardware reason 1
+  NIP c00000000013eb98   LR c0000000004b9044 CTR c0000000004b9000 XER 0000000020040000 CPU#0
+  MSR 8000000000009033 HID0 0000000000000000  HF 8000000000000000 iidx 3 didx 3
+  TB 00000000 00000000 DECR 00000000
+  GPR00 c0000000004b9044 c00000007cffba30 c00000000178c100 c00000007ef52480
+  GPR04 0000000000000000 70616d00746f6f72 0000000000000020 c0000000783be440
+  GPR08 fffffffffffffffc c00000007ef52490 0000000000000004 b0616d0009eccdb2
+  GPR12 c0000000004b9000 c000000001b00000 0000000000000000 0000000000000000
+  GPR16 0000000000000000 0000000000000000 00007fffc24f3b50 00007fffc24fff58
+  GPR20 00000a1e96ece9d0 00000a1ea117c9b0 00000a1ea1184360 0000000000000003
+  GPR24 00000a1e96e9e124 00000000000007ff c00000007eb2f7a0 c00000007cffbb10
+  GPR28 c00000007d83a2c0 c0000000783cdf68 0000000000000000 c00000007cffbbf0
+  CR 88002848  [ L  L  -  -  E  L  G  L  ]             RES ffffffffffffffff
+   SRR0 0000772f954dd48c  SRR1 800000000280f033    PVR 00000000004e1202 VRSAVE 0000000000000000
+  SPRG0 0000000000000000 SPRG1 c000000001b00000  SPRG2 0000772f9565a280  SPRG3 0000000000000000
+  SPRG4 0000000000000000 SPRG5 0000000000000000  SPRG6 0000000000000000  SPRG7 0000000000000000
+  HSRR0 0000000000000000 HSRR1 0000000000000000
+   CFAR 0000000000000000
+   LPCR 0000000003d40413
+   PTCR 0000000000000000   DAR 0000772f95390000  DSISR 0000000042000000
+
+Fix this by setting vcpu->arch.hcall_needed = 0 to indicate completion
+of H_ENTER_NESTED before we exit to L0 userspace.
+
+Fixes: 360cae313702 ("KVM: PPC: Book3S HV: Nested guest entry via hypercall")
+	Cc: linuxppc-dev@ozlabs.org
+	Cc: David Gibson <david@gibson.dropbear.id.au>
+	Signed-off-by: Michael Roth <mdroth@linux.vnet.ibm.com>
+	Reviewed-by: Suraj Jitindar Singh <sjitindarsingh@gmail.com>
+	Signed-off-by: Paul Mackerras <paulus@ozlabs.org>
+(cherry picked from commit 6c08ec1216b7b2f84b9755f339d6009768599256)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/powerpc/kvm/book3s_hv.c
+diff --cc arch/powerpc/kvm/book3s_hv.c
+index 5275029b47c2,a56f8413758a..000000000000
+--- a/arch/powerpc/kvm/book3s_hv.c
++++ b/arch/powerpc/kvm/book3s_hv.c
+@@@ -946,6 -978,14 +946,17 @@@ int kvmppc_pseries_do_hcall(struct kvm_
+  		break;
+  	case H_ENTER_NESTED:
+  		ret = H_FUNCTION;
+++<<<<<<< HEAD
+++=======
++ 		if (!nesting_enabled(vcpu->kvm))
++ 			break;
++ 		ret = kvmhv_enter_nested_guest(vcpu);
++ 		if (ret == H_INTERRUPT) {
++ 			kvmppc_set_gpr(vcpu, 3, 0);
++ 			vcpu->arch.hcall_needed = 0;
++ 			return -EINTR;
++ 		}
+++>>>>>>> 6c08ec1216b7 (KVM: PPC: Book3S HV: Fix handling for interrupted H_ENTER_NESTED)
+  		break;
+  	case H_TLB_INVALIDATE:
+  		ret = H_FUNCTION;
+* Unmerged path arch/powerpc/kvm/book3s_hv.c
