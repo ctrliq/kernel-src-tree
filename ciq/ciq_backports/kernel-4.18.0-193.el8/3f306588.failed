@@ -1,0 +1,460 @@
+selftests: bpf: break up test_progs - preparations
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-193.el8
+commit-author Stanislav Fomichev <sdf@google.com>
+commit 3f30658830f3a133ba2136237ea9c8e589344a3b
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-193.el8/3f306588.failed
+
+Add new prog_tests directory where tests are supposed to land.
+Each prog_tests/<filename>.c is expected to have a global function
+with signature 'void test_<filename>(void)'. Makefile automatically
+generates prog_tests/tests.h file with entry for each prog_tests file:
+
+	#ifdef DECLARE
+	extern void test_<filename>(void);
+	...
+	#endif
+
+	#ifdef CALL
+	test_<filename>();
+	...
+	#endif
+
+prog_tests/tests.h is included in test_progs.c in two places with
+appropriate defines. This scheme allows us to move each function with
+a separate patch without breaking anything.
+
+Compared to the recent verifier split, each separate file here is
+a compilation unit and test_progs.[ch] is now used as a place to put
+some common routines that might be used by multiple tests.
+
+	Signed-off-by: Stanislav Fomichev <sdf@google.com>
+	Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+(cherry picked from commit 3f30658830f3a133ba2136237ea9c8e589344a3b)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	tools/testing/selftests/bpf/Makefile
+#	tools/testing/selftests/bpf/test_progs.c
+diff --cc tools/testing/selftests/bpf/Makefile
+index 37b01554670e,518cd587cd63..000000000000
+--- a/tools/testing/selftests/bpf/Makefile
++++ b/tools/testing/selftests/bpf/Makefile
+@@@ -153,9 -153,38 +153,41 @@@ endi
+  endif
+  endif
+  
+++<<<<<<< HEAD
+++=======
++ ifneq ($(SUBREG_CODEGEN),)
++ ALU32_BUILD_DIR = $(OUTPUT)/alu32
++ TEST_CUSTOM_PROGS += $(ALU32_BUILD_DIR)/test_progs_32
++ $(ALU32_BUILD_DIR):
++ 	mkdir -p $@
++ 
++ $(ALU32_BUILD_DIR)/urandom_read: $(OUTPUT)/urandom_read
++ 	cp $< $@
++ 
++ $(ALU32_BUILD_DIR)/test_progs_32: test_progs.c $(ALU32_BUILD_DIR) \
++ 						$(ALU32_BUILD_DIR)/urandom_read
++ 	$(CC) $(CFLAGS) -o $(ALU32_BUILD_DIR)/test_progs_32 $< \
++ 		trace_helpers.c prog_tests/*.c $(OUTPUT)/libbpf.a $(LDLIBS)
++ 
++ $(ALU32_BUILD_DIR)/test_progs_32: $(PROG_TESTS_H)
++ $(ALU32_BUILD_DIR)/test_progs_32: CFLAGS += -I$(OUTPUT)
++ $(ALU32_BUILD_DIR)/test_progs_32: prog_tests/*.c
++ 
++ $(ALU32_BUILD_DIR)/%.o: progs/%.c $(ALU32_BUILD_DIR) \
++ 					$(ALU32_BUILD_DIR)/test_progs_32
++ 	$(CLANG) $(CLANG_FLAGS) \
++ 		 -O2 -target bpf -emit-llvm -c $< -o - |      \
++ 	$(LLC) -march=bpf -mattr=+alu32 -mcpu=$(CPU) $(LLC_FLAGS) \
++ 		-filetype=obj -o $@
++ ifeq ($(DWARF2BTF),y)
++ 	$(BTF_PAHOLE) -J $@
++ endif
++ endif
++ 
+++>>>>>>> 3f30658830f3 (selftests: bpf: break up test_progs - preparations)
+  # Have one program compiled without "-target bpf" to test whether libbpf loads
+  # it successfully
+ -$(OUTPUT)/test_xdp.o: progs/test_xdp.c
+ +$(OUTPUT)/test_xdp.o: test_xdp.c
+  	$(CLANG) $(CLANG_FLAGS) \
+  		-O2 -emit-llvm -c $< -o - | \
+  	$(LLC) -march=bpf -mcpu=$(CPU) $(LLC_FLAGS) -filetype=obj -o $@
+@@@ -171,4 -200,38 +203,42 @@@ ifeq ($(DWARF2BTF),y
+  	$(BTF_PAHOLE) -J $@
+  endif
+  
+++<<<<<<< HEAD
+ +EXTRA_CLEAN := $(TEST_CUSTOM_PROGS)
+++=======
++ PROG_TESTS_H := $(OUTPUT)/prog_tests/tests.h
++ $(OUTPUT)/test_progs: $(PROG_TESTS_H)
++ $(OUTPUT)/test_progs: CFLAGS += -I$(OUTPUT)
++ $(OUTPUT)/test_progs: prog_tests/*.c
++ 
++ PROG_TESTS_FILES := $(wildcard prog_tests/*.c)
++ $(PROG_TESTS_H): $(PROG_TESTS_FILES)
++ 	$(shell ( cd prog_tests/
++ 		  echo '/* Generated header, do not edit */'; \
++ 		  echo '#ifdef DECLARE'; \
++ 		  ls *.c 2> /dev/null | \
++ 			sed -e 's@\([^\.]*\)\.c@extern void test_\1(void);@'; \
++ 		  echo '#endif'; \
++ 		  echo '#ifdef CALL'; \
++ 		  ls *.c 2> /dev/null | \
++ 			sed -e 's@\([^\.]*\)\.c@test_\1();@'; \
++ 		  echo '#endif' \
++ 		 ) > $(PROG_TESTS_H))
++ 
++ VERIFIER_TESTS_H := $(OUTPUT)/verifier/tests.h
++ $(OUTPUT)/test_verifier: $(VERIFIER_TESTS_H)
++ $(OUTPUT)/test_verifier: CFLAGS += -I$(OUTPUT)
++ 
++ VERIFIER_TEST_FILES := $(wildcard verifier/*.c)
++ $(OUTPUT)/verifier/tests.h: $(VERIFIER_TEST_FILES)
++ 	$(shell ( cd verifier/
++ 		  echo '/* Generated header, do not edit */'; \
++ 		  echo '#ifdef FILL_ARRAY'; \
++ 		  ls *.c 2> /dev/null | \
++ 			sed -e 's@\(.*\)@#include \"\1\"@'; \
++ 		  echo '#endif' \
++ 		 ) > $(VERIFIER_TESTS_H))
++ 
++ EXTRA_CLEAN := $(TEST_CUSTOM_PROGS) $(ALU32_BUILD_DIR) \
++ 	$(VERIFIER_TESTS_H) $(PROG_TESTS_H)
+++>>>>>>> 3f30658830f3 (selftests: bpf: break up test_progs - preparations)
+diff --cc tools/testing/selftests/bpf/test_progs.c
+index da24416535c6,e3f74fb617c1..000000000000
+--- a/tools/testing/selftests/bpf/test_progs.c
++++ b/tools/testing/selftests/bpf/test_progs.c
+@@@ -4,55 -4,13 +4,50 @@@
+   * modify it under the terms of version 2 of the GNU General Public
+   * License as published by the Free Software Foundation.
+   */
+++<<<<<<< HEAD
+ +#include <stdio.h>
+ +#include <unistd.h>
+ +#include <errno.h>
+ +#include <string.h>
+ +#include <assert.h>
+ +#include <stdlib.h>
+ +#include <stdarg.h>
+ +#include <time.h>
+ +
+ +#include <linux/types.h>
+ +typedef __u16 __sum16;
+ +#include <arpa/inet.h>
+ +#include <linux/if_ether.h>
+ +#include <linux/if_packet.h>
+ +#include <linux/ip.h>
+ +#include <linux/ipv6.h>
+ +#include <linux/tcp.h>
+ +#include <linux/filter.h>
+ +#include <linux/perf_event.h>
+ +#include <linux/unistd.h>
+ +
+ +#include <sys/ioctl.h>
+ +#include <sys/wait.h>
+ +#include <sys/types.h>
+ +#include <fcntl.h>
+ +
+ +#include <linux/bpf.h>
+ +#include <linux/err.h>
+ +#include <bpf/bpf.h>
+ +#include <bpf/libbpf.h>
+ +
+ +#include "test_iptunnel_common.h"
+ +#include "bpf_util.h"
+ +#include "bpf_endian.h"
+++=======
++ #include "test_progs.h"
+++>>>>>>> 3f30658830f3 (selftests: bpf: break up test_progs - preparations)
+  #include "bpf_rlimit.h"
+- #include "trace_helpers.h"
+- #include "flow_dissector_load.h"
+  
+- static int error_cnt, pass_cnt;
+- static bool jit_enabled;
++ int error_cnt, pass_cnt;
++ bool jit_enabled;
+  
+- #define MAGIC_BYTES 123
+- 
+- /* ipv4 test vector */
+- static struct {
+- 	struct ethhdr eth;
+- 	struct iphdr iph;
+- 	struct tcphdr tcp;
+- } __packed pkt_v4 = {
++ struct ipv4_packet pkt_v4 = {
+  	.eth.h_proto = __bpf_constant_htons(ETH_P_IP),
+  	.iph.ihl = 5,
+  	.iph.protocol = IPPROTO_TCP,
+@@@ -1995,6 -1929,163 +1966,166 @@@ static void test_flow_dissector(void
+  	bpf_object__close(obj);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static void *test_spin_lock(void *arg)
++ {
++ 	__u32 duration, retval;
++ 	int err, prog_fd = *(u32 *) arg;
++ 
++ 	err = bpf_prog_test_run(prog_fd, 10000, &pkt_v4, sizeof(pkt_v4),
++ 				NULL, NULL, &retval, &duration);
++ 	CHECK(err || retval, "",
++ 	      "err %d errno %d retval %d duration %d\n",
++ 	      err, errno, retval, duration);
++ 	pthread_exit(arg);
++ }
++ 
++ static void test_spinlock(void)
++ {
++ 	const char *file = "./test_spin_lock.o";
++ 	pthread_t thread_id[4];
++ 	struct bpf_object *obj;
++ 	int prog_fd;
++ 	int err = 0, i;
++ 	void *ret;
++ 
++ 	err = bpf_prog_load(file, BPF_PROG_TYPE_CGROUP_SKB, &obj, &prog_fd);
++ 	if (err) {
++ 		printf("test_spin_lock:bpf_prog_load errno %d\n", errno);
++ 		goto close_prog;
++ 	}
++ 	for (i = 0; i < 4; i++)
++ 		assert(pthread_create(&thread_id[i], NULL,
++ 				      &test_spin_lock, &prog_fd) == 0);
++ 	for (i = 0; i < 4; i++)
++ 		assert(pthread_join(thread_id[i], &ret) == 0 &&
++ 		       ret == (void *)&prog_fd);
++ 	goto close_prog_noerr;
++ close_prog:
++ 	error_cnt++;
++ close_prog_noerr:
++ 	bpf_object__close(obj);
++ }
++ 
++ static void *parallel_map_access(void *arg)
++ {
++ 	int err, map_fd = *(u32 *) arg;
++ 	int vars[17], i, j, rnd, key = 0;
++ 
++ 	for (i = 0; i < 10000; i++) {
++ 		err = bpf_map_lookup_elem_flags(map_fd, &key, vars, BPF_F_LOCK);
++ 		if (err) {
++ 			printf("lookup failed\n");
++ 			error_cnt++;
++ 			goto out;
++ 		}
++ 		if (vars[0] != 0) {
++ 			printf("lookup #%d var[0]=%d\n", i, vars[0]);
++ 			error_cnt++;
++ 			goto out;
++ 		}
++ 		rnd = vars[1];
++ 		for (j = 2; j < 17; j++) {
++ 			if (vars[j] == rnd)
++ 				continue;
++ 			printf("lookup #%d var[1]=%d var[%d]=%d\n",
++ 			       i, rnd, j, vars[j]);
++ 			error_cnt++;
++ 			goto out;
++ 		}
++ 	}
++ out:
++ 	pthread_exit(arg);
++ }
++ 
++ static void test_map_lock(void)
++ {
++ 	const char *file = "./test_map_lock.o";
++ 	int prog_fd, map_fd[2], vars[17] = {};
++ 	pthread_t thread_id[6];
++ 	struct bpf_object *obj;
++ 	int err = 0, key = 0, i;
++ 	void *ret;
++ 
++ 	err = bpf_prog_load(file, BPF_PROG_TYPE_CGROUP_SKB, &obj, &prog_fd);
++ 	if (err) {
++ 		printf("test_map_lock:bpf_prog_load errno %d\n", errno);
++ 		goto close_prog;
++ 	}
++ 	map_fd[0] = bpf_find_map(__func__, obj, "hash_map");
++ 	if (map_fd[0] < 0)
++ 		goto close_prog;
++ 	map_fd[1] = bpf_find_map(__func__, obj, "array_map");
++ 	if (map_fd[1] < 0)
++ 		goto close_prog;
++ 
++ 	bpf_map_update_elem(map_fd[0], &key, vars, BPF_F_LOCK);
++ 
++ 	for (i = 0; i < 4; i++)
++ 		assert(pthread_create(&thread_id[i], NULL,
++ 				      &test_spin_lock, &prog_fd) == 0);
++ 	for (i = 4; i < 6; i++)
++ 		assert(pthread_create(&thread_id[i], NULL,
++ 				      &parallel_map_access, &map_fd[i - 4]) == 0);
++ 	for (i = 0; i < 4; i++)
++ 		assert(pthread_join(thread_id[i], &ret) == 0 &&
++ 		       ret == (void *)&prog_fd);
++ 	for (i = 4; i < 6; i++)
++ 		assert(pthread_join(thread_id[i], &ret) == 0 &&
++ 		       ret == (void *)&map_fd[i - 4]);
++ 	goto close_prog_noerr;
++ close_prog:
++ 	error_cnt++;
++ close_prog_noerr:
++ 	bpf_object__close(obj);
++ }
++ 
++ static void sigalrm_handler(int s) {}
++ static struct sigaction sigalrm_action = {
++ 	.sa_handler = sigalrm_handler,
++ };
++ 
++ static void test_signal_pending(enum bpf_prog_type prog_type)
++ {
++ 	struct bpf_insn prog[4096];
++ 	struct itimerval timeo = {
++ 		.it_value.tv_usec = 100000, /* 100ms */
++ 	};
++ 	__u32 duration, retval;
++ 	int prog_fd;
++ 	int err;
++ 	int i;
++ 
++ 	for (i = 0; i < ARRAY_SIZE(prog); i++)
++ 		prog[i] = BPF_ALU64_IMM(BPF_MOV, BPF_REG_0, 0);
++ 	prog[ARRAY_SIZE(prog) - 1] = BPF_EXIT_INSN();
++ 
++ 	prog_fd = bpf_load_program(prog_type, prog, ARRAY_SIZE(prog),
++ 				   "GPL", 0, NULL, 0);
++ 	CHECK(prog_fd < 0, "test-run", "errno %d\n", errno);
++ 
++ 	err = sigaction(SIGALRM, &sigalrm_action, NULL);
++ 	CHECK(err, "test-run-signal-sigaction", "errno %d\n", errno);
++ 
++ 	err = setitimer(ITIMER_REAL, &timeo, NULL);
++ 	CHECK(err, "test-run-signal-timer", "errno %d\n", errno);
++ 
++ 	err = bpf_prog_test_run(prog_fd, 0xffffffff, &pkt_v4, sizeof(pkt_v4),
++ 				NULL, NULL, &retval, &duration);
++ 	CHECK(duration > 500000000, /* 500ms */
++ 	      "test-run-signal-duration",
++ 	      "duration %dns > 500ms\n",
++ 	      duration);
++ 
++ 	signal(SIGALRM, SIG_DFL);
++ }
++ 
++ #define DECLARE
++ #include <prog_tests/tests.h>
++ #undef DECLARE
++ 
+++>>>>>>> 3f30658830f3 (selftests: bpf: break up test_progs - preparations)
+  int main(void)
+  {
+  	srand(time(NULL));
+* Unmerged path tools/testing/selftests/bpf/Makefile
+diff --git a/tools/testing/selftests/bpf/prog_tests/.gitignore b/tools/testing/selftests/bpf/prog_tests/.gitignore
+new file mode 100644
+index 000000000000..45984a364647
+--- /dev/null
++++ b/tools/testing/selftests/bpf/prog_tests/.gitignore
+@@ -0,0 +1 @@
++tests.h
+* Unmerged path tools/testing/selftests/bpf/test_progs.c
+diff --git a/tools/testing/selftests/bpf/test_progs.h b/tools/testing/selftests/bpf/test_progs.h
+new file mode 100644
+index 000000000000..658efa080fc0
+--- /dev/null
++++ b/tools/testing/selftests/bpf/test_progs.h
+@@ -0,0 +1,80 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++#include <stdio.h>
++#include <unistd.h>
++#include <errno.h>
++#include <string.h>
++#include <assert.h>
++#include <stdlib.h>
++#include <stdarg.h>
++#include <time.h>
++#include <signal.h>
++
++#include <linux/types.h>
++typedef __u16 __sum16;
++#include <arpa/inet.h>
++#include <linux/if_ether.h>
++#include <linux/if_packet.h>
++#include <linux/ip.h>
++#include <linux/ipv6.h>
++#include <linux/tcp.h>
++#include <linux/filter.h>
++#include <linux/perf_event.h>
++#include <linux/unistd.h>
++
++#include <sys/ioctl.h>
++#include <sys/wait.h>
++#include <sys/types.h>
++#include <sys/time.h>
++#include <fcntl.h>
++#include <pthread.h>
++#include <linux/bpf.h>
++#include <linux/err.h>
++#include <bpf/bpf.h>
++#include <bpf/libbpf.h>
++
++#include "test_iptunnel_common.h"
++#include "bpf_util.h"
++#include "bpf_endian.h"
++#include "trace_helpers.h"
++#include "flow_dissector_load.h"
++
++extern int error_cnt, pass_cnt;
++extern bool jit_enabled;
++
++#define MAGIC_BYTES 123
++
++/* ipv4 test vector */
++struct ipv4_packet {
++	struct ethhdr eth;
++	struct iphdr iph;
++	struct tcphdr tcp;
++} __packed;
++extern struct ipv4_packet pkt_v4;
++
++/* ipv6 test vector */
++struct ipv6_packet {
++	struct ethhdr eth;
++	struct ipv6hdr iph;
++	struct tcphdr tcp;
++} __packed;
++extern struct ipv6_packet pkt_v6;
++
++#define _CHECK(condition, tag, duration, format...) ({			\
++	int __ret = !!(condition);					\
++	if (__ret) {							\
++		error_cnt++;						\
++		printf("%s:FAIL:%s ", __func__, tag);			\
++		printf(format);						\
++	} else {							\
++		pass_cnt++;						\
++		printf("%s:PASS:%s %d nsec\n", __func__, tag, duration);\
++	}								\
++	__ret;								\
++})
++
++#define CHECK(condition, tag, format...) \
++	_CHECK(condition, tag, duration, format)
++#define CHECK_ATTR(condition, tag, format...) \
++	_CHECK(condition, tag, tattr.duration, format)
++
++int bpf_find_map(const char *test, struct bpf_object *obj, const char *name);
