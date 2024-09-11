@@ -1,0 +1,677 @@
+net/mlx5: E-Switch, Use xarray for vport number to vport and rep mapping
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-326.el8
+commit-author Parav Pandit <parav@nvidia.com>
+commit 47dd7e609f6957437b721af4d027737b63b217b8
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-326.el8/47dd7e60.failed
+
+Currently vport number to vport and its representor are mapped using an
+array and an index.
+
+Vport numbers of different types of functions are not contiguous. Adding
+new such discontiguous range using index and number mapping is increasingly
+complex and hard to maintain.
+
+Hence, maintain an xarray of vport and rep whose lookup is done based on
+the vport number.
+Each VF and SF entry is marked with a xarray mark to identify the function
+type. Additionally PF and VF needs special handling for legacy inline
+mode. They are additionally marked as host function using additional
+HOST_FN mark.
+
+	Signed-off-by: Parav Pandit <parav@nvidia.com>
+	Reviewed-by: Roi Dayan <roid@nvidia.com>
+	Reviewed-by: Vu Pham <vuhuong@nvidia.com>
+	Signed-off-by: Saeed Mahameed <saeedm@nvidia.com>
+(cherry picked from commit 47dd7e609f6957437b721af4d027737b63b217b8)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/mellanox/mlx5/core/esw/legacy.c
+#	drivers/net/ethernet/mellanox/mlx5/core/eswitch.c
+#	drivers/net/ethernet/mellanox/mlx5/core/eswitch.h
+#	drivers/net/ethernet/mellanox/mlx5/core/eswitch_offloads.c
+diff --cc drivers/net/ethernet/mellanox/mlx5/core/eswitch.c
+index 6f56131481bc,90d8bda87579..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx5/core/eswitch.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/eswitch.c
+@@@ -1751,14 -1666,6 +1844,17 @@@ int mlx5_eswitch_init(struct mlx5_core_
+  	if (!MLX5_VPORT_MANAGER(dev))
+  		return 0;
+  
+++<<<<<<< HEAD
+ +	total_vports = mlx5_eswitch_get_total_vports(dev);
+ +
+ +	esw_info(dev,
+ +		 "Total vports %d, per vport: max uc(%d) max mc(%d)\n",
+ +		 total_vports,
+ +		 MLX5_MAX_UC_PER_VPORT(dev),
+ +		 MLX5_MAX_MC_PER_VPORT(dev));
+ +
+++=======
+++>>>>>>> 47dd7e609f69 (net/mlx5: E-Switch, Use xarray for vport number to vport and rep mapping)
+  	esw = kzalloc(sizeof(*esw), GFP_KERNEL);
+  	if (!esw)
+  		return -ENOMEM;
+@@@ -1809,7 -1704,17 +1892,20 @@@
+  	esw->offloads.inline_mode = MLX5_INLINE_MODE_NONE;
+  
+  	dev->priv.eswitch = esw;
+++<<<<<<< HEAD
+++=======
++ 	BLOCKING_INIT_NOTIFIER_HEAD(&esw->n_head);
++ 
++ 	esw_info(dev,
++ 		 "Total vports %d, per vport: max uc(%d) max mc(%d)\n",
++ 		 esw->total_vports,
++ 		 MLX5_MAX_UC_PER_VPORT(dev),
++ 		 MLX5_MAX_MC_PER_VPORT(dev));
+++>>>>>>> 47dd7e609f69 (net/mlx5: E-Switch, Use xarray for vport number to vport and rep mapping)
+  	return 0;
++ 
++ reps_err:
++ 	mlx5_esw_vports_cleanup(esw);
+  abort:
+  	if (esw->work_queue)
+  		destroy_workqueue(esw->work_queue);
+diff --cc drivers/net/ethernet/mellanox/mlx5/core/eswitch.h
+index f8d344738e70,7b5f9b8dc7df..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx5/core/eswitch.h
++++ b/drivers/net/ethernet/mellanox/mlx5/core/eswitch.h
+@@@ -155,8 -173,10 +155,9 @@@ struct mlx5_vport 
+  		u32 max_rate;
+  	} qos;
+  
+ -	u16 vport;
+  	bool                    enabled;
+  	enum mlx5_eswitch_vport_event enabled_events;
++ 	int index;
+  	struct devlink_port *dl_port;
+  };
+  
+@@@ -521,164 -546,56 +522,147 @@@ static inline u16 mlx5_eswitch_first_ho
+  		MLX5_VPORT_PF : MLX5_VPORT_FIRST_VF;
+  }
+  
+++<<<<<<< HEAD
+ +static inline int mlx5_esw_sf_start_idx(const struct mlx5_eswitch *esw)
+ +{
+ +	/* PF and VF vports indices start from 0 to max_vfs */
+ +	return MLX5_VPORT_PF_PLACEHOLDER + mlx5_core_max_vfs(esw->dev);
+ +}
+ +
+ +static inline int mlx5_esw_sf_end_idx(const struct mlx5_eswitch *esw)
+ +{
+ +	return mlx5_esw_sf_start_idx(esw) + mlx5_sf_max_functions(esw->dev);
+ +}
+ +
+ +static inline int
+ +mlx5_esw_sf_vport_num_to_index(const struct mlx5_eswitch *esw, u16 vport_num)
+ +{
+ +	return vport_num - mlx5_sf_start_function_id(esw->dev) +
+ +	       MLX5_VPORT_PF_PLACEHOLDER + mlx5_core_max_vfs(esw->dev);
+ +}
+ +
+ +static inline u16
+ +mlx5_esw_sf_vport_index_to_num(const struct mlx5_eswitch *esw, int idx)
+ +{
+ +	return mlx5_sf_start_function_id(esw->dev) + idx -
+ +	       (MLX5_VPORT_PF_PLACEHOLDER + mlx5_core_max_vfs(esw->dev));
+ +}
+ +
+ +static inline bool
+ +mlx5_esw_is_sf_vport(const struct mlx5_eswitch *esw, u16 vport_num)
+ +{
+ +	return mlx5_sf_supported(esw->dev) &&
+ +	       vport_num >= mlx5_sf_start_function_id(esw->dev) &&
+ +	       (vport_num < (mlx5_sf_start_function_id(esw->dev) +
+ +			     mlx5_sf_max_functions(esw->dev)));
+ +}
+ +
+++=======
+++>>>>>>> 47dd7e609f69 (net/mlx5: E-Switch, Use xarray for vport number to vport and rep mapping)
+  static inline bool mlx5_eswitch_is_funcs_handler(const struct mlx5_core_dev *dev)
+  {
+  	return mlx5_core_is_ecpf_esw_manager(dev);
+  }
+  
+++<<<<<<< HEAD
+ +static inline int mlx5_eswitch_uplink_idx(struct mlx5_eswitch *esw)
+ +{
+ +	/* Uplink always locate at the last element of the array.*/
+ +	return esw->total_vports - 1;
+ +}
+ +
+ +static inline int mlx5_eswitch_ecpf_idx(struct mlx5_eswitch *esw)
+ +{
+ +	return esw->total_vports - 2;
+ +}
+ +
+ +static inline int mlx5_eswitch_vport_num_to_index(struct mlx5_eswitch *esw,
+ +						  u16 vport_num)
+ +{
+ +	if (vport_num == MLX5_VPORT_ECPF) {
+ +		if (!mlx5_ecpf_vport_exists(esw->dev))
+ +			esw_warn(esw->dev, "ECPF vport doesn't exist!\n");
+ +		return mlx5_eswitch_ecpf_idx(esw);
+ +	}
+ +
+ +	if (vport_num == MLX5_VPORT_UPLINK)
+ +		return mlx5_eswitch_uplink_idx(esw);
+ +
+ +	if (mlx5_esw_is_sf_vport(esw, vport_num))
+ +		return mlx5_esw_sf_vport_num_to_index(esw, vport_num);
+ +
+ +	/* PF and VF vports start from 0 to max_vfs */
+ +	return vport_num;
+ +}
+ +
+ +static inline u16 mlx5_eswitch_index_to_vport_num(struct mlx5_eswitch *esw,
+ +						  int index)
+ +{
+ +	if (index == mlx5_eswitch_ecpf_idx(esw) &&
+ +	    mlx5_ecpf_vport_exists(esw->dev))
+ +		return MLX5_VPORT_ECPF;
+ +
+ +	if (index == mlx5_eswitch_uplink_idx(esw))
+ +		return MLX5_VPORT_UPLINK;
+ +
+ +	/* SF vports indices are after VFs and before ECPF */
+ +	if (mlx5_sf_supported(esw->dev) &&
+ +	    index > mlx5_core_max_vfs(esw->dev))
+ +		return mlx5_esw_sf_vport_index_to_num(esw, index);
+ +
+ +	/* PF and VF vports start from 0 to max_vfs */
+ +	return index;
+ +}
+ +
+ +/* The vport getter/iterator are only valid after esw->total_vports
+ + * and vport->vport are initialized in mlx5_eswitch_init.
+++=======
++ static inline unsigned int
++ mlx5_esw_vport_to_devlink_port_index(const struct mlx5_core_dev *dev,
++ 				     u16 vport_num)
++ {
++ 	return (MLX5_CAP_GEN(dev, vhca_id) << 16) | vport_num;
++ }
++ 
++ static inline u16
++ mlx5_esw_devlink_port_index_to_vport_num(unsigned int dl_port_index)
++ {
++ 	return dl_port_index & 0xffff;
++ }
++ 
++ /* TODO: This mlx5e_tc function shouldn't be called by eswitch */
++ void mlx5e_tc_clean_fdb_peer_flows(struct mlx5_eswitch *esw);
++ 
++ /* Each mark identifies eswitch vport type.
++  * MLX5_ESW_VPT_HOST_FN is used to identify both PF and VF ports using
++  * a single mark.
++  * MLX5_ESW_VPT_VF identifies a SRIOV VF vport.
++  * MLX5_ESW_VPT_SF identifies SF vport.
+++>>>>>>> 47dd7e609f69 (net/mlx5: E-Switch, Use xarray for vport number to vport and rep mapping)
+   */
+- #define mlx5_esw_for_all_vports(esw, i, vport)		\
+- 	for ((i) = MLX5_VPORT_PF;			\
+- 	     (vport) = &(esw)->vports[i],		\
+- 	     (i) < (esw)->total_vports; (i)++)
+- 
+- #define mlx5_esw_for_all_vports_reverse(esw, i, vport)	\
+- 	for ((i) = (esw)->total_vports - 1;		\
+- 	     (vport) = &(esw)->vports[i],		\
+- 	     (i) >= MLX5_VPORT_PF; (i)--)
+- 
+- #define mlx5_esw_for_each_vf_vport(esw, i, vport, nvfs)	\
+- 	for ((i) = MLX5_VPORT_FIRST_VF;			\
+- 	     (vport) = &(esw)->vports[(i)],		\
+- 	     (i) <= (nvfs); (i)++)
+- 
+- #define mlx5_esw_for_each_vf_vport_reverse(esw, i, vport, nvfs)	\
+- 	for ((i) = (nvfs);					\
+- 	     (vport) = &(esw)->vports[(i)],			\
+- 	     (i) >= MLX5_VPORT_FIRST_VF; (i)--)
+- 
+- /* The rep getter/iterator are only valid after esw->total_vports
+-  * and vport->vport are initialized in mlx5_eswitch_init.
++ #define MLX5_ESW_VPT_HOST_FN XA_MARK_0
++ #define MLX5_ESW_VPT_VF XA_MARK_1
++ #define MLX5_ESW_VPT_SF XA_MARK_2
++ 
++ /* The vport iterator is valid only after vport are initialized in mlx5_eswitch_init.
++  * Borrowed the idea from xa_for_each_marked() but with support for desired last element.
+   */
+- #define mlx5_esw_for_all_reps(esw, i, rep)			\
+- 	for ((i) = MLX5_VPORT_PF;				\
+- 	     (rep) = &(esw)->offloads.vport_reps[i],		\
+- 	     (i) < (esw)->total_vports; (i)++)
+- 
+- #define mlx5_esw_for_each_vf_rep(esw, i, rep, nvfs)		\
+- 	for ((i) = MLX5_VPORT_FIRST_VF;				\
+- 	     (rep) = &(esw)->offloads.vport_reps[i],		\
+- 	     (i) <= (nvfs); (i)++)
+- 
+- #define mlx5_esw_for_each_vf_rep_reverse(esw, i, rep, nvfs)	\
+- 	for ((i) = (nvfs);					\
+- 	     (rep) = &(esw)->offloads.vport_reps[i],		\
+- 	     (i) >= MLX5_VPORT_FIRST_VF; (i)--)
+- 
+- #define mlx5_esw_for_each_vf_vport_num(esw, vport, nvfs)	\
+- 	for ((vport) = MLX5_VPORT_FIRST_VF; (vport) <= (nvfs); (vport)++)
+- 
+- #define mlx5_esw_for_each_vf_vport_num_reverse(esw, vport, nvfs)	\
+- 	for ((vport) = (nvfs); (vport) >= MLX5_VPORT_FIRST_VF; (vport)--)
+- 
+- /* Includes host PF (vport 0) if it's not esw manager. */
+- #define mlx5_esw_for_each_host_func_rep(esw, i, rep, nvfs)	\
+- 	for ((i) = (esw)->first_host_vport;			\
+- 	     (rep) = &(esw)->offloads.vport_reps[i],		\
+- 	     (i) <= (nvfs); (i)++)
+- 
+- #define mlx5_esw_for_each_host_func_rep_reverse(esw, i, rep, nvfs)	\
+- 	for ((i) = (nvfs);						\
+- 	     (rep) = &(esw)->offloads.vport_reps[i],			\
+- 	     (i) >= (esw)->first_host_vport; (i)--)
+- 
+- #define mlx5_esw_for_each_host_func_vport(esw, vport, nvfs)	\
+- 	for ((vport) = (esw)->first_host_vport;			\
+- 	     (vport) <= (nvfs); (vport)++)
+- 
+- #define mlx5_esw_for_each_host_func_vport_reverse(esw, vport, nvfs)	\
+- 	for ((vport) = (nvfs);						\
+- 	     (vport) >= (esw)->first_host_vport; (vport)--)
+- 
+- #define mlx5_esw_for_each_sf_rep(esw, i, rep)		\
+- 	for ((i) = mlx5_esw_sf_start_idx(esw);		\
+- 	     (rep) = &(esw)->offloads.vport_reps[(i)],	\
+- 	     (i) < mlx5_esw_sf_end_idx(esw); (i++))
++ 
++ #define mlx5_esw_for_each_vport(esw, index, vport) \
++ 	xa_for_each(&((esw)->vports), index, vport)
++ 
++ #define mlx5_esw_for_each_entry_marked(xa, index, entry, last, filter)	\
++ 	for (index = 0, entry = xa_find(xa, &index, last, filter); \
++ 	     entry; entry = xa_find_after(xa, &index, last, filter))
++ 
++ #define mlx5_esw_for_each_vport_marked(esw, index, vport, last, filter)	\
++ 	mlx5_esw_for_each_entry_marked(&((esw)->vports), index, vport, last, filter)
++ 
++ #define mlx5_esw_for_each_vf_vport(esw, index, vport, last)	\
++ 	mlx5_esw_for_each_vport_marked(esw, index, vport, last, MLX5_ESW_VPT_VF)
++ 
++ #define mlx5_esw_for_each_host_func_vport(esw, index, vport, last)	\
++ 	mlx5_esw_for_each_vport_marked(esw, index, vport, last, MLX5_ESW_VPT_HOST_FN)
+  
+  struct mlx5_eswitch *mlx5_devlink_eswitch_get(struct devlink *devlink);
+  struct mlx5_vport *__must_check
+diff --cc drivers/net/ethernet/mellanox/mlx5/core/eswitch_offloads.c
+index ff63d3681390,a1dd66540ba0..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx5/core/eswitch_offloads.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/eswitch_offloads.c
+@@@ -47,7 -47,18 +47,17 @@@
+  #include "lib/eq.h"
+  #include "lib/fs_chains.h"
+  #include "en_tc.h"
+ -#include "en/mapping.h"
+  
++ #define mlx5_esw_for_each_rep(esw, i, rep) \
++ 	xa_for_each(&((esw)->offloads.vport_reps), i, rep)
++ 
++ #define mlx5_esw_for_each_sf_rep(esw, i, rep) \
++ 	xa_for_each_marked(&((esw)->offloads.vport_reps), i, rep, MLX5_ESW_VPT_SF)
++ 
++ #define mlx5_esw_for_each_vf_rep(esw, index, rep)	\
++ 	mlx5_esw_for_each_entry_marked(&((esw)->offloads.vport_reps), index, \
++ 				       rep, (esw)->esw_funcs.num_vfs, MLX5_ESW_VPT_VF)
++ 
+  /* There are two match-all miss flows, one for unicast dst mac and
+   * one for multicast.
+   */
+@@@ -57,13 -68,18 +67,10 @@@
+  static struct mlx5_eswitch_rep *mlx5_eswitch_get_rep(struct mlx5_eswitch *esw,
+  						     u16 vport_num)
+  {
+- 	int idx = mlx5_eswitch_vport_num_to_index(esw, vport_num);
+- 
+- 	WARN_ON(idx > esw->total_vports - 1);
+- 	return &esw->offloads.vport_reps[idx];
++ 	return xa_load(&esw->offloads.vport_reps, vport_num);
+  }
+  
+ +
+  static void
+  mlx5_eswitch_set_rule_flow_source(struct mlx5_eswitch *esw,
+  				  struct mlx5_flow_spec *spec,
+@@@ -707,6 -977,85 +715,88 @@@ void mlx5_eswitch_del_send_to_vport_rul
+  	mlx5_del_flow_rules(rule);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static void mlx5_eswitch_del_send_to_vport_meta_rules(struct mlx5_eswitch *esw)
++ {
++ 	struct mlx5_flow_handle **flows = esw->fdb_table.offloads.send_to_vport_meta_rules;
++ 	int i = 0, num_vfs = esw->esw_funcs.num_vfs;
++ 
++ 	if (!num_vfs || !flows)
++ 		return;
++ 
++ 	for (i = 0; i < num_vfs; i++)
++ 		mlx5_del_flow_rules(flows[i]);
++ 
++ 	kvfree(flows);
++ }
++ 
++ static int
++ mlx5_eswitch_add_send_to_vport_meta_rules(struct mlx5_eswitch *esw)
++ {
++ 	struct mlx5_flow_destination dest = {};
++ 	struct mlx5_flow_act flow_act = {0};
++ 	int num_vfs, rule_idx = 0, err = 0;
++ 	struct mlx5_flow_handle *flow_rule;
++ 	struct mlx5_flow_handle **flows;
++ 	struct mlx5_flow_spec *spec;
++ 	struct mlx5_vport *vport;
++ 	unsigned long i;
++ 	u16 vport_num;
++ 
++ 	num_vfs = esw->esw_funcs.num_vfs;
++ 	flows = kvzalloc(num_vfs * sizeof(*flows), GFP_KERNEL);
++ 	if (!flows)
++ 		return -ENOMEM;
++ 
++ 	spec = kvzalloc(sizeof(*spec), GFP_KERNEL);
++ 	if (!spec) {
++ 		err = -ENOMEM;
++ 		goto alloc_err;
++ 	}
++ 
++ 	MLX5_SET(fte_match_param, spec->match_criteria,
++ 		 misc_parameters_2.metadata_reg_c_0, mlx5_eswitch_get_vport_metadata_mask());
++ 	MLX5_SET(fte_match_param, spec->match_criteria,
++ 		 misc_parameters_2.metadata_reg_c_1, ESW_TUN_MASK);
++ 	MLX5_SET(fte_match_param, spec->match_value, misc_parameters_2.metadata_reg_c_1,
++ 		 ESW_TUN_SLOW_TABLE_GOTO_VPORT_MARK);
++ 
++ 	spec->match_criteria_enable = MLX5_MATCH_MISC_PARAMETERS_2;
++ 	dest.type = MLX5_FLOW_DESTINATION_TYPE_VPORT;
++ 	flow_act.action = MLX5_FLOW_CONTEXT_ACTION_FWD_DEST;
++ 
++ 	mlx5_esw_for_each_vf_vport(esw, i, vport, num_vfs) {
++ 		vport_num = vport->vport;
++ 		MLX5_SET(fte_match_param, spec->match_value, misc_parameters_2.metadata_reg_c_0,
++ 			 mlx5_eswitch_get_vport_metadata_for_match(esw, vport_num));
++ 		dest.vport.num = vport_num;
++ 
++ 		flow_rule = mlx5_add_flow_rules(esw->fdb_table.offloads.slow_fdb,
++ 						spec, &flow_act, &dest, 1);
++ 		if (IS_ERR(flow_rule)) {
++ 			err = PTR_ERR(flow_rule);
++ 			esw_warn(esw->dev, "FDB: Failed to add send to vport meta rule idx %d, err %ld\n",
++ 				 rule_idx, PTR_ERR(flow_rule));
++ 			goto rule_err;
++ 		}
++ 		flows[rule_idx++] = flow_rule;
++ 	}
++ 
++ 	esw->fdb_table.offloads.send_to_vport_meta_rules = flows;
++ 	kvfree(spec);
++ 	return 0;
++ 
++ rule_err:
++ 	while (--rule_idx >= 0)
++ 		mlx5_del_flow_rules(flows[rule_idx]);
++ 	kvfree(spec);
++ alloc_err:
++ 	kvfree(flows);
++ 	return err;
++ }
++ 
+++>>>>>>> 47dd7e609f69 (net/mlx5: E-Switch, Use xarray for vport number to vport and rep mapping)
+  static bool mlx5_eswitch_reg_c1_loopback_supported(struct mlx5_eswitch *esw)
+  {
+  	return MLX5_CAP_ESW_FLOWTABLE(esw->dev, fdb_to_vport_reg_c_id) &
+@@@ -1074,9 -1429,10 +1176,9 @@@ static void mlx5_esw_vport_tbl_put(stru
+  
+  	attr.chain = 0;
+  	attr.prio = 1;
+- 	mlx5_esw_for_all_vports(esw, i, vport) {
++ 	mlx5_esw_for_each_vport(esw, i, vport) {
+  		attr.vport = vport->vport;
+ -		attr.vport_ns = &mlx5_esw_vport_tbl_mirror_ns;
+ -		mlx5_esw_vporttbl_put(esw, &attr);
+ +		esw_vport_tbl_put(esw, &attr);
+  	}
+  }
+  
+@@@ -1089,9 -1445,10 +1191,9 @@@ static int mlx5_esw_vport_tbl_get(struc
+  
+  	attr.chain = 0;
+  	attr.prio = 1;
+- 	mlx5_esw_for_all_vports(esw, i, vport) {
++ 	mlx5_esw_for_each_vport(esw, i, vport) {
+  		attr.vport = vport->vport;
+ -		attr.vport_ns = &mlx5_esw_vport_tbl_mirror_ns;
+ -		fdb = mlx5_esw_vporttbl_get(esw, &attr);
+ +		fdb = esw_vport_tbl_get(esw, &attr);
+  		if (IS_ERR(fdb))
+  			goto out;
+  	}
+@@@ -1525,6 -1933,44 +1627,47 @@@ out
+  	return flow_rule;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static int mlx5_eswitch_inline_mode_get(struct mlx5_eswitch *esw, u8 *mode)
++ {
++ 	u8 prev_mlx5_mode, mlx5_mode = MLX5_INLINE_MODE_L2;
++ 	struct mlx5_core_dev *dev = esw->dev;
++ 	struct mlx5_vport *vport;
++ 	unsigned long i;
++ 
++ 	if (!MLX5_CAP_GEN(dev, vport_group_manager))
++ 		return -EOPNOTSUPP;
++ 
++ 	if (esw->mode == MLX5_ESWITCH_NONE)
++ 		return -EOPNOTSUPP;
++ 
++ 	switch (MLX5_CAP_ETH(dev, wqe_inline_mode)) {
++ 	case MLX5_CAP_INLINE_MODE_NOT_REQUIRED:
++ 		mlx5_mode = MLX5_INLINE_MODE_NONE;
++ 		goto out;
++ 	case MLX5_CAP_INLINE_MODE_L2:
++ 		mlx5_mode = MLX5_INLINE_MODE_L2;
++ 		goto out;
++ 	case MLX5_CAP_INLINE_MODE_VPORT_CONTEXT:
++ 		goto query_vports;
++ 	}
++ 
++ query_vports:
++ 	mlx5_query_nic_vport_min_inline(dev, esw->first_host_vport, &prev_mlx5_mode);
++ 	mlx5_esw_for_each_host_func_vport(esw, i, vport, esw->esw_funcs.num_vfs) {
++ 		mlx5_query_nic_vport_min_inline(dev, vport->vport, &mlx5_mode);
++ 		if (prev_mlx5_mode != mlx5_mode)
++ 			return -EINVAL;
++ 		prev_mlx5_mode = mlx5_mode;
++ 	}
++ 
++ out:
++ 	*mode = mlx5_mode;
++ 	return 0;
++ }
++ 
+++>>>>>>> 47dd7e609f69 (net/mlx5: E-Switch, Use xarray for vport number to vport and rep mapping)
+  static void esw_destroy_restore_table(struct mlx5_eswitch *esw)
+  {
+  	struct mlx5_esw_offload *offloads = &esw->offloads;
+@@@ -2264,8 -2749,10 +2455,9 @@@ static int mlx5_esw_host_number_init(st
+  
+  int esw_offloads_enable(struct mlx5_eswitch *esw)
+  {
+ -	struct mapping_ctx *reg_c0_obj_pool;
+  	struct mlx5_vport *vport;
+- 	int err, i;
++ 	unsigned long i;
++ 	int err;
+  
+  	if (MLX5_CAP_ESW_FLOWTABLE_FDB(esw->dev, reformat) &&
+  	    MLX5_CAP_ESW_FLOWTABLE_FDB(esw->dev, decap))
+@@@ -2688,11 -3208,12 +2900,17 @@@ void mlx5_eswitch_register_vport_reps(s
+  {
+  	struct mlx5_eswitch_rep_data *rep_data;
+  	struct mlx5_eswitch_rep *rep;
+- 	int i;
++ 	unsigned long i;
+  
+  	esw->offloads.rep_ops[rep_type] = ops;
+++<<<<<<< HEAD
+ +	mlx5_esw_for_all_reps(esw, i, rep) {
+ +		if (likely(mlx5_eswitch_vport_has_rep(esw, i))) {
+++=======
++ 	mlx5_esw_for_each_rep(esw, i, rep) {
++ 		if (likely(mlx5_eswitch_vport_has_rep(esw, rep->vport))) {
++ 			rep->esw = esw;
+++>>>>>>> 47dd7e609f69 (net/mlx5: E-Switch, Use xarray for vport number to vport and rep mapping)
+  			rep_data = &rep->rep_data[rep_type];
+  			atomic_set(&rep_data->state, REP_REGISTERED);
+  		}
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/esw/legacy.c
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/esw/acl/egress_lgcy.c b/drivers/net/ethernet/mellanox/mlx5/core/esw/acl/egress_lgcy.c
+index 3e19b1721303..0399a396d166 100644
+--- a/drivers/net/ethernet/mellanox/mlx5/core/esw/acl/egress_lgcy.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/esw/acl/egress_lgcy.c
+@@ -96,7 +96,7 @@ int esw_acl_egress_lgcy_setup(struct mlx5_eswitch *esw,
+ 	}
+ 
+ 	if (!vport->egress.acl) {
+-		vport->egress.acl = esw_acl_table_create(esw, vport->vport,
++		vport->egress.acl = esw_acl_table_create(esw, vport,
+ 							 MLX5_FLOW_NAMESPACE_ESW_EGRESS,
+ 							 table_size);
+ 		if (IS_ERR(vport->egress.acl)) {
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/esw/acl/egress_ofld.c b/drivers/net/ethernet/mellanox/mlx5/core/esw/acl/egress_ofld.c
+index 26b37a0f8762..505bf811984a 100644
+--- a/drivers/net/ethernet/mellanox/mlx5/core/esw/acl/egress_ofld.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/esw/acl/egress_ofld.c
+@@ -148,7 +148,7 @@ static void esw_acl_egress_ofld_groups_destroy(struct mlx5_vport *vport)
+ 	esw_acl_egress_vlan_grp_destroy(vport);
+ }
+ 
+-static bool esw_acl_egress_needed(const struct mlx5_eswitch *esw, u16 vport_num)
++static bool esw_acl_egress_needed(struct mlx5_eswitch *esw, u16 vport_num)
+ {
+ 	return mlx5_eswitch_is_vf_vport(esw, vport_num) || mlx5_esw_is_sf_vport(esw, vport_num);
+ }
+@@ -171,7 +171,7 @@ int esw_acl_egress_ofld_setup(struct mlx5_eswitch *esw, struct mlx5_vport *vport
+ 		table_size++;
+ 	if (MLX5_CAP_GEN(esw->dev, prio_tag_required))
+ 		table_size++;
+-	vport->egress.acl = esw_acl_table_create(esw, vport->vport,
++	vport->egress.acl = esw_acl_table_create(esw, vport,
+ 						 MLX5_FLOW_NAMESPACE_ESW_EGRESS, table_size);
+ 	if (IS_ERR(vport->egress.acl)) {
+ 		err = PTR_ERR(vport->egress.acl);
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/esw/acl/helper.c b/drivers/net/ethernet/mellanox/mlx5/core/esw/acl/helper.c
+index 4a369669e51e..45b839116212 100644
+--- a/drivers/net/ethernet/mellanox/mlx5/core/esw/acl/helper.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/esw/acl/helper.c
+@@ -6,14 +6,14 @@
+ #include "helper.h"
+ 
+ struct mlx5_flow_table *
+-esw_acl_table_create(struct mlx5_eswitch *esw, u16 vport_num, int ns, int size)
++esw_acl_table_create(struct mlx5_eswitch *esw, struct mlx5_vport *vport, int ns, int size)
+ {
+ 	struct mlx5_flow_table_attr ft_attr = {};
+ 	struct mlx5_core_dev *dev = esw->dev;
+ 	struct mlx5_flow_namespace *root_ns;
+ 	struct mlx5_flow_table *acl;
+ 	int acl_supported;
+-	int vport_index;
++	u16 vport_num;
+ 	int err;
+ 
+ 	acl_supported = (ns == MLX5_FLOW_NAMESPACE_ESW_INGRESS) ?
+@@ -23,11 +23,11 @@ esw_acl_table_create(struct mlx5_eswitch *esw, u16 vport_num, int ns, int size)
+ 	if (!acl_supported)
+ 		return ERR_PTR(-EOPNOTSUPP);
+ 
++	vport_num = vport->vport;
+ 	esw_debug(dev, "Create vport[%d] %s ACL table\n", vport_num,
+ 		  ns == MLX5_FLOW_NAMESPACE_ESW_INGRESS ? "ingress" : "egress");
+ 
+-	vport_index = mlx5_eswitch_vport_num_to_index(esw, vport_num);
+-	root_ns = mlx5_get_flow_vport_acl_namespace(dev, ns, vport_index);
++	root_ns = mlx5_get_flow_vport_acl_namespace(dev, ns, vport->index);
+ 	if (!root_ns) {
+ 		esw_warn(dev, "Failed to get E-Switch root namespace for vport (%d)\n",
+ 			 vport_num);
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/esw/acl/helper.h b/drivers/net/ethernet/mellanox/mlx5/core/esw/acl/helper.h
+index 8dc4cab66a71..a47063fab57e 100644
+--- a/drivers/net/ethernet/mellanox/mlx5/core/esw/acl/helper.h
++++ b/drivers/net/ethernet/mellanox/mlx5/core/esw/acl/helper.h
+@@ -8,7 +8,7 @@
+ 
+ /* General acl helper functions */
+ struct mlx5_flow_table *
+-esw_acl_table_create(struct mlx5_eswitch *esw, u16 vport_num, int ns, int size);
++esw_acl_table_create(struct mlx5_eswitch *esw, struct mlx5_vport *vport, int ns, int size);
+ 
+ /* Egress acl helper functions */
+ void esw_acl_egress_table_destroy(struct mlx5_vport *vport);
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/esw/acl/ingress_lgcy.c b/drivers/net/ethernet/mellanox/mlx5/core/esw/acl/ingress_lgcy.c
+index d64fad2823e7..f75b86abaf1c 100644
+--- a/drivers/net/ethernet/mellanox/mlx5/core/esw/acl/ingress_lgcy.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/esw/acl/ingress_lgcy.c
+@@ -177,7 +177,7 @@ int esw_acl_ingress_lgcy_setup(struct mlx5_eswitch *esw,
+ 	}
+ 
+ 	if (!vport->ingress.acl) {
+-		vport->ingress.acl = esw_acl_table_create(esw, vport->vport,
++		vport->ingress.acl = esw_acl_table_create(esw, vport,
+ 							  MLX5_FLOW_NAMESPACE_ESW_INGRESS,
+ 							  table_size);
+ 		if (IS_ERR(vport->ingress.acl)) {
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/esw/acl/ingress_ofld.c b/drivers/net/ethernet/mellanox/mlx5/core/esw/acl/ingress_ofld.c
+index 548c005ea633..39e948bc1204 100644
+--- a/drivers/net/ethernet/mellanox/mlx5/core/esw/acl/ingress_ofld.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/esw/acl/ingress_ofld.c
+@@ -7,7 +7,7 @@
+ #include "ofld.h"
+ 
+ static bool
+-esw_acl_ingress_prio_tag_enabled(const struct mlx5_eswitch *esw,
++esw_acl_ingress_prio_tag_enabled(struct mlx5_eswitch *esw,
+ 				 const struct mlx5_vport *vport)
+ {
+ 	return (MLX5_CAP_GEN(esw->dev, prio_tag_required) &&
+@@ -255,7 +255,7 @@ int esw_acl_ingress_ofld_setup(struct mlx5_eswitch *esw,
+ 	if (esw_acl_ingress_prio_tag_enabled(esw, vport))
+ 		num_ftes++;
+ 
+-	vport->ingress.acl = esw_acl_table_create(esw, vport->vport,
++	vport->ingress.acl = esw_acl_table_create(esw, vport,
+ 						  MLX5_FLOW_NAMESPACE_ESW_INGRESS,
+ 						  num_ftes);
+ 	if (IS_ERR(vport->ingress.acl)) {
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/esw/devlink_port.c b/drivers/net/ethernet/mellanox/mlx5/core/esw/devlink_port.c
+index cb1e181f4c6a..086093207ae6 100644
+--- a/drivers/net/ethernet/mellanox/mlx5/core/esw/devlink_port.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/esw/devlink_port.c
+@@ -14,8 +14,7 @@ mlx5_esw_get_port_parent_id(struct mlx5_core_dev *dev, struct netdev_phys_item_i
+ 	memcpy(ppid->id, &parent_id, sizeof(parent_id));
+ }
+ 
+-static bool
+-mlx5_esw_devlink_port_supported(const struct mlx5_eswitch *esw, u16 vport_num)
++static bool mlx5_esw_devlink_port_supported(struct mlx5_eswitch *esw, u16 vport_num)
+ {
+ 	return vport_num == MLX5_VPORT_UPLINK ||
+ 	       (mlx5_core_is_ecpf(esw->dev) && vport_num == MLX5_VPORT_PF) ||
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/esw/legacy.c
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/eswitch.c
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/eswitch.h
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/eswitch_offloads.c
