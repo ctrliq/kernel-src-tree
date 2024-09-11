@@ -1,0 +1,163 @@
+mm/mmu_notifier: define the header pre-processor parts even if disabled
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Jason Gunthorpe <jgg@ziepe.ca>
+commit 56f434f40f059eb3769d50b9c244a850096c3d6f
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/56f434f4.failed
+
+Now that we have KERNEL_HEADER_TEST all headers are generally compile
+tested, so relying on makefile tricks to avoid compiling code that depends
+on CONFIG_MMU_NOTIFIER is more annoying.
+
+Instead follow the usual pattern and provide most of the header with only
+the functions stubbed out when CONFIG_MMU_NOTIFIER is disabled. This
+ensures code compiles no matter what the config setting is.
+
+While here, struct mmu_notifier_mm is private to mmu_notifier.c, move it.
+
+Link: https://lore.kernel.org/r/20191112202231.3856-2-jgg@ziepe.ca
+	Reviewed-by: Jérôme Glisse <jglisse@redhat.com>
+	Tested-by: Ralph Campbell <rcampbell@nvidia.com>
+	Reviewed-by: John Hubbard <jhubbard@nvidia.com>
+	Reviewed-by: Christoph Hellwig <hch@lst.de>
+	Signed-off-by: Jason Gunthorpe <jgg@mellanox.com>
+(cherry picked from commit 56f434f40f059eb3769d50b9c244a850096c3d6f)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/mmu_notifier.h
+diff --cc include/linux/mmu_notifier.h
+index 2684ed8b98c2,12bd603d318c..000000000000
+--- a/include/linux/mmu_notifier.h
++++ b/include/linux/mmu_notifier.h
+@@@ -7,39 -6,44 +7,44 @@@
+  #include <linux/spinlock.h>
+  #include <linux/mm_types.h>
+  #include <linux/srcu.h>
+ +#include <linux/rh_kabi.h>
+  
++ struct mmu_notifier_mm;
+  struct mmu_notifier;
+- struct mmu_notifier_ops;
++ struct mmu_notifier_range;
+  
+ -/**
+ - * enum mmu_notifier_event - reason for the mmu notifier callback
+ - * @MMU_NOTIFY_UNMAP: either munmap() that unmap the range or a mremap() that
+ - * move the range
+ - *
+ - * @MMU_NOTIFY_CLEAR: clear page table entry (many reasons for this like
+ - * madvise() or replacing a page by another one, ...).
+ - *
+ - * @MMU_NOTIFY_PROTECTION_VMA: update is due to protection change for the range
+ - * ie using the vma access permission (vm_page_prot) to update the whole range
+ - * is enough no need to inspect changes to the CPU page table (mprotect()
+ - * syscall)
+ - *
+ - * @MMU_NOTIFY_PROTECTION_PAGE: update is due to change in read/write flag for
+ - * pages in the range so to mirror those changes the user must inspect the CPU
+ - * page table (from the end callback).
+ - *
+ - * @MMU_NOTIFY_SOFT_DIRTY: soft dirty accounting (still same page and same
+ - * access flags). User should soft dirty the page in the end callback to make
+ - * sure that anyone relying on soft dirtyness catch pages that might be written
+ - * through non CPU mappings.
+ +/* mmu_notifier_ops flags */
+ +#define MMU_INVALIDATE_DOES_NOT_BLOCK	(0x01)
+ +
+++<<<<<<< HEAD
+ +#ifdef CONFIG_MMU_NOTIFIER
+ +
+ +/*
+ + * The mmu notifier_mm structure is allocated and installed in
+ + * mm->mmu_notifier_mm inside the mm_take_all_locks() protected
+ + * critical section and it's released only when mm_count reaches zero
+ + * in mmdrop().
+   */
+ -enum mmu_notifier_event {
+ -	MMU_NOTIFY_UNMAP = 0,
+ -	MMU_NOTIFY_CLEAR,
+ -	MMU_NOTIFY_PROTECTION_VMA,
+ -	MMU_NOTIFY_PROTECTION_PAGE,
+ -	MMU_NOTIFY_SOFT_DIRTY,
+ +struct mmu_notifier_mm {
+ +	/* all mmu notifiers registerd in this mm are queued in this list */
+ +	struct hlist_head list;
+ +	/* to serialize the list modifications and hlist_unhashed */
+ +	spinlock_t lock;
+  };
+ -
+++=======
++ #define MMU_NOTIFIER_RANGE_BLOCKABLE (1 << 0)
+++>>>>>>> 56f434f40f05 (mm/mmu_notifier: define the header pre-processor parts even if disabled)
+  
+  struct mmu_notifier_ops {
+ +	/*
+ +	 * Flags to specify behavior of callbacks for this MMU notifier.
+ +	 * Used to determine which context an operation may be called.
+ +	 *
+ +	 * MMU_INVALIDATE_DOES_NOT_BLOCK: invalidate_range_* callbacks do not
+ +	 *	block
+ +	 */
+ +	int flags;
+ +
+  	/*
+  	 * Called either by mmu_notifier_unregister or when the mm is
+  	 * being destroyed by exit_mmap, always before all pages are
+@@@ -208,10 -217,26 +213,25 @@@
+  struct mmu_notifier {
+  	struct hlist_node hlist;
+  	const struct mmu_notifier_ops *ops;
+ -	struct mm_struct *mm;
+ -	struct rcu_head rcu;
+ -	unsigned int users;
+ +	RH_KABI_RESERVE(1)
+ +	RH_KABI_RESERVE(2)
+  };
+  
++ #ifdef CONFIG_MMU_NOTIFIER
++ 
++ #ifdef CONFIG_LOCKDEP
++ extern struct lockdep_map __mmu_notifier_invalidate_range_start_map;
++ #endif
++ 
++ struct mmu_notifier_range {
++ 	struct vm_area_struct *vma;
++ 	struct mm_struct *mm;
++ 	unsigned long start;
++ 	unsigned long end;
++ 	unsigned flags;
++ 	enum mmu_notifier_event event;
++ };
++ 
+  static inline int mm_has_notifiers(struct mm_struct *mm)
+  {
+  	return unlikely(mm->mmu_notifier_mm);
+* Unmerged path include/linux/mmu_notifier.h
+diff --git a/mm/mmu_notifier.c b/mm/mmu_notifier.c
+index e6c07a8c4021..9ede2003ebba 100644
+--- a/mm/mmu_notifier.c
++++ b/mm/mmu_notifier.c
+@@ -35,6 +35,19 @@ void mmu_notifier_call_srcu(struct rcu_head *rcu,
+ }
+ EXPORT_SYMBOL_GPL(mmu_notifier_call_srcu);
+ 
++/*
++ * The mmu notifier_mm structure is allocated and installed in
++ * mm->mmu_notifier_mm inside the mm_take_all_locks() protected
++ * critical section and it's released only when mm_count reaches zero
++ * in mmdrop().
++ */
++struct mmu_notifier_mm {
++	/* all mmu notifiers registered in this mm are queued in this list */
++	struct hlist_head list;
++	/* to serialize the list modifications and hlist_unhashed */
++	spinlock_t lock;
++};
++
+ /*
+  * This function can't run concurrently against mmu_notifier_register
+  * because mm->mm_users > 0 during mmu_notifier_register and exit_mmap
