@@ -1,0 +1,115 @@
+xfs: preserve rmapbt swapext block reservation from freed blocks
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Brian Foster <bfoster@redhat.com>
+commit f74681ba2006434be195402e0b15fc5763cddd7e
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/f74681ba.failed
+
+The rmapbt extent swap algorithm remaps individual extents between
+the source inode and the target to trigger reverse mapping metadata
+updates. If either inode straddles a format or other bmap allocation
+boundary, the individual unmap and map cycles can trigger repeated
+bmap block allocations and frees as the extent count bounces back
+and forth across the boundary. While net block usage is bound across
+the swap operation, this behavior can prematurely exhaust the
+transaction block reservation because it continuously drains as the
+transaction rolls. Each allocation accounts against the reservation
+and each free returns to global free space on transaction roll.
+
+The previous workaround to this problem attempted to detect this
+boundary condition and provide surplus block reservation to
+acommodate it. This is insufficient because more remaps can occur
+than implied by the extent counts; if start offset boundaries are
+not aligned between the two inodes, for example.
+
+To address this problem more generically and dynamically, add a
+transaction accounting mode that returns freed blocks to the
+transaction reservation instead of the superblock counters on
+transaction roll and use it when the rmapbt based algorithm is
+active. This allows the chain of remap transactions to preserve the
+block reservation based own its own frees and prevent premature
+exhaustion regardless of the remap pattern. Note that this is only
+safe for superblocks with lazy sb accounting, but the latter is
+required for v5 supers and the rmap feature depends on v5.
+
+Fixes: b3fed434822d0 ("xfs: account format bouncing into rmapbt swapext tx reservation")
+Root-caused-by: Darrick J. Wong <darrick.wong@oracle.com>
+	Signed-off-by: Brian Foster <bfoster@redhat.com>
+	Reviewed-by: Darrick J. Wong <darrick.wong@oracle.com>
+	Signed-off-by: Darrick J. Wong <darrick.wong@oracle.com>
+(cherry picked from commit f74681ba2006434be195402e0b15fc5763cddd7e)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/xfs/xfs_trans.c
+diff --cc fs/xfs/xfs_trans.c
+index a65dc227e40d,0ad72a83edac..000000000000
+--- a/fs/xfs/xfs_trans.c
++++ b/fs/xfs/xfs_trans.c
+@@@ -273,7 -273,8 +274,12 @@@ xfs_trans_alloc
+  	 */
+  	WARN_ON(resp->tr_logres > 0 &&
+  		mp->m_super->s_writers.frozen == SB_FREEZE_COMPLETE);
+++<<<<<<< HEAD
+ +	atomic_inc(&mp->m_active_trans);
+++=======
++ 	ASSERT(!(flags & XFS_TRANS_RES_FDBLKS) ||
++ 	       xfs_sb_version_haslazysbcount(&mp->m_sb));
+++>>>>>>> f74681ba2006 (xfs: preserve rmapbt swapext block reservation from freed blocks)
+  
+  	tp->t_magic = XFS_TRANS_HEADER_MAGIC;
+  	tp->t_flags = flags;
+diff --git a/fs/xfs/libxfs/xfs_shared.h b/fs/xfs/libxfs/xfs_shared.h
+index c45acbd3add9..708feb8eac76 100644
+--- a/fs/xfs/libxfs/xfs_shared.h
++++ b/fs/xfs/libxfs/xfs_shared.h
+@@ -65,6 +65,7 @@ void	xfs_log_get_max_trans_res(struct xfs_mount *mp,
+ #define XFS_TRANS_DQ_DIRTY	0x10	/* at least one dquot in trx dirty */
+ #define XFS_TRANS_RESERVE	0x20    /* OK to use reserved data blocks */
+ #define XFS_TRANS_NO_WRITECOUNT 0x40	/* do not elevate SB writecount */
++#define XFS_TRANS_RES_FDBLKS	0x80	/* reserve newly freed blocks */
+ /*
+  * LOWMODE is used by the allocator to activate the lowspace algorithm - when
+  * free space is running low the extent allocator may choose to allocate an
+diff --git a/fs/xfs/xfs_bmap_util.c b/fs/xfs/xfs_bmap_util.c
+index 80ea5b517f0b..dffa2250e121 100644
+--- a/fs/xfs/xfs_bmap_util.c
++++ b/fs/xfs/xfs_bmap_util.c
+@@ -1556,6 +1556,7 @@ xfs_swap_extents(
+ 	int			lock_flags;
+ 	uint64_t		f;
+ 	int			resblks = 0;
++	unsigned int		flags = 0;
+ 
+ 	/*
+ 	 * Lock the inodes against other IO, page faults and truncate to
+@@ -1619,17 +1620,16 @@ xfs_swap_extents(
+ 		resblks +=  XFS_SWAP_RMAP_SPACE_RES(mp, tipnext, w);
+ 
+ 		/*
+-		 * Handle the corner case where either inode might straddle the
+-		 * btree format boundary. If so, the inode could bounce between
+-		 * btree <-> extent format on unmap -> remap cycles, freeing and
+-		 * allocating a bmapbt block each time.
++		 * If either inode straddles a bmapbt block allocation boundary,
++		 * the rmapbt algorithm triggers repeated allocs and frees as
++		 * extents are remapped. This can exhaust the block reservation
++		 * prematurely and cause shutdown. Return freed blocks to the
++		 * transaction reservation to counter this behavior.
+ 		 */
+-		if (ipnext == (XFS_IFORK_MAXEXT(ip, w) + 1))
+-			resblks += XFS_IFORK_MAXEXT(ip, w);
+-		if (tipnext == (XFS_IFORK_MAXEXT(tip, w) + 1))
+-			resblks += XFS_IFORK_MAXEXT(tip, w);
++		flags |= XFS_TRANS_RES_FDBLKS;
+ 	}
+-	error = xfs_trans_alloc(mp, &M_RES(mp)->tr_write, resblks, 0, 0, &tp);
++	error = xfs_trans_alloc(mp, &M_RES(mp)->tr_write, resblks, 0, flags,
++				&tp);
+ 	if (error)
+ 		goto out_unlock;
+ 
+* Unmerged path fs/xfs/xfs_trans.c
