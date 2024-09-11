@@ -1,0 +1,276 @@
+libbpf: Skip well-known ELF sections when iterating ELF
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-315.el8
+commit-author Andrii Nakryiko <andriin@fb.com>
+commit 50e09460d9f8dee9fbaaa3194c7921753d75cd96
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-315.el8/50e09460.failed
+
+Skip and don't log ELF sections that libbpf knows about and ignores during ELF
+processing. This allows to not unnecessarily log details about those ELF
+sections and cleans up libbpf debug log. Ignored sections include DWARF data,
+string table, empty .text section and few special (e.g., .llvm_addrsig)
+useless sections.
+
+With such ELF sections out of the way, log unrecognized ELF sections at
+pr_info level to increase visibility.
+
+	Signed-off-by: Andrii Nakryiko <andriin@fb.com>
+	Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+Link: https://lore.kernel.org/bpf/20200820231250.1293069-5-andriin@fb.com
+(cherry picked from commit 50e09460d9f8dee9fbaaa3194c7921753d75cd96)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	tools/lib/bpf/libbpf.c
+diff --cc tools/lib/bpf/libbpf.c
+index e8a159519d3d,2ae89b84a2be..000000000000
+--- a/tools/lib/bpf/libbpf.c
++++ b/tools/lib/bpf/libbpf.c
+@@@ -2594,6 -2559,159 +2594,162 @@@ report
+  	return err;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static const char *elf_sym_str(const struct bpf_object *obj, size_t off)
++ {
++ 	const char *name;
++ 
++ 	name = elf_strptr(obj->efile.elf, obj->efile.strtabidx, off);
++ 	if (!name) {
++ 		pr_warn("elf: failed to get section name string at offset %zu from %s: %s\n",
++ 			off, obj->path, elf_errmsg(-1));
++ 		return NULL;
++ 	}
++ 
++ 	return name;
++ }
++ 
++ static const char *elf_sec_str(const struct bpf_object *obj, size_t off)
++ {
++ 	const char *name;
++ 
++ 	name = elf_strptr(obj->efile.elf, obj->efile.shstrndx, off);
++ 	if (!name) {
++ 		pr_warn("elf: failed to get section name string at offset %zu from %s: %s\n",
++ 			off, obj->path, elf_errmsg(-1));
++ 		return NULL;
++ 	}
++ 
++ 	return name;
++ }
++ 
++ static Elf_Scn *elf_sec_by_idx(const struct bpf_object *obj, size_t idx)
++ {
++ 	Elf_Scn *scn;
++ 
++ 	scn = elf_getscn(obj->efile.elf, idx);
++ 	if (!scn) {
++ 		pr_warn("elf: failed to get section(%zu) from %s: %s\n",
++ 			idx, obj->path, elf_errmsg(-1));
++ 		return NULL;
++ 	}
++ 	return scn;
++ }
++ 
++ static Elf_Scn *elf_sec_by_name(const struct bpf_object *obj, const char *name)
++ {
++ 	Elf_Scn *scn = NULL;
++ 	Elf *elf = obj->efile.elf;
++ 	const char *sec_name;
++ 
++ 	while ((scn = elf_nextscn(elf, scn)) != NULL) {
++ 		sec_name = elf_sec_name(obj, scn);
++ 		if (!sec_name)
++ 			return NULL;
++ 
++ 		if (strcmp(sec_name, name) != 0)
++ 			continue;
++ 
++ 		return scn;
++ 	}
++ 	return NULL;
++ }
++ 
++ static int elf_sec_hdr(const struct bpf_object *obj, Elf_Scn *scn, GElf_Shdr *hdr)
++ {
++ 	if (!scn)
++ 		return -EINVAL;
++ 
++ 	if (gelf_getshdr(scn, hdr) != hdr) {
++ 		pr_warn("elf: failed to get section(%zu) header from %s: %s\n",
++ 			elf_ndxscn(scn), obj->path, elf_errmsg(-1));
++ 		return -EINVAL;
++ 	}
++ 
++ 	return 0;
++ }
++ 
++ static const char *elf_sec_name(const struct bpf_object *obj, Elf_Scn *scn)
++ {
++ 	const char *name;
++ 	GElf_Shdr sh;
++ 
++ 	if (!scn)
++ 		return NULL;
++ 
++ 	if (elf_sec_hdr(obj, scn, &sh))
++ 		return NULL;
++ 
++ 	name = elf_sec_str(obj, sh.sh_name);
++ 	if (!name) {
++ 		pr_warn("elf: failed to get section(%zu) name from %s: %s\n",
++ 			elf_ndxscn(scn), obj->path, elf_errmsg(-1));
++ 		return NULL;
++ 	}
++ 
++ 	return name;
++ }
++ 
++ static Elf_Data *elf_sec_data(const struct bpf_object *obj, Elf_Scn *scn)
++ {
++ 	Elf_Data *data;
++ 
++ 	if (!scn)
++ 		return NULL;
++ 
++ 	data = elf_getdata(scn, 0);
++ 	if (!data) {
++ 		pr_warn("elf: failed to get section(%zu) %s data from %s: %s\n",
++ 			elf_ndxscn(scn), elf_sec_name(obj, scn) ?: "<?>",
++ 			obj->path, elf_errmsg(-1));
++ 		return NULL;
++ 	}
++ 
++ 	return data;
++ }
++ 
++ static bool is_sec_name_dwarf(const char *name)
++ {
++ 	/* approximation, but the actual list is too long */
++ 	return strncmp(name, ".debug_", sizeof(".debug_") - 1) == 0;
++ }
++ 
++ static bool ignore_elf_section(GElf_Shdr *hdr, const char *name)
++ {
++ 	/* no special handling of .strtab */
++ 	if (hdr->sh_type == SHT_STRTAB)
++ 		return true;
++ 
++ 	/* ignore .llvm_addrsig section as well */
++ 	if (hdr->sh_type == 0x6FFF4C03 /* SHT_LLVM_ADDRSIG */)
++ 		return true;
++ 
++ 	/* no subprograms will lead to an empty .text section, ignore it */
++ 	if (hdr->sh_type == SHT_PROGBITS && hdr->sh_size == 0 &&
++ 	    strcmp(name, ".text") == 0)
++ 		return true;
++ 
++ 	/* DWARF sections */
++ 	if (is_sec_name_dwarf(name))
++ 		return true;
++ 
++ 	if (strncmp(name, ".rel", sizeof(".rel") - 1) == 0) {
++ 		name += sizeof(".rel") - 1;
++ 		/* DWARF section relocations */
++ 		if (is_sec_name_dwarf(name))
++ 			return true;
++ 
++ 		/* .BTF and .BTF.ext don't need relocations */
++ 		if (strcmp(name, BTF_ELF_SEC) == 0 ||
++ 		    strcmp(name, BTF_EXT_ELF_SEC) == 0)
++ 			return true;
++ 	}
++ 
++ 	return false;
++ }
++ 
+++>>>>>>> 50e09460d9f8 (libbpf: Skip well-known ELF sections when iterating ELF)
+  static int bpf_object__elf_collect(struct bpf_object *obj)
+  {
+  	Elf *elf = obj->efile.elf;
+@@@ -2615,26 -2726,22 +2771,34 @@@
+  		Elf_Data *data;
+  
+  		idx++;
+ -
+ -		if (elf_sec_hdr(obj, scn, &sh))
+ +		if (gelf_getshdr(scn, &sh) != &sh) {
+ +			pr_warn("failed to get section(%d) header from %s\n",
+ +				idx, obj->path);
+  			return -LIBBPF_ERRNO__FORMAT;
+ +		}
+  
+ -		name = elf_sec_str(obj, sh.sh_name);
+ -		if (!name)
+ +		name = elf_strptr(elf, ep->e_shstrndx, sh.sh_name);
+ +		if (!name) {
+ +			pr_warn("failed to get section(%d) name from %s\n",
+ +				idx, obj->path);
+  			return -LIBBPF_ERRNO__FORMAT;
+ +		}
+  
+++<<<<<<< HEAD
+ +		data = elf_getdata(scn, 0);
+ +		if (!data) {
+ +			pr_warn("failed to get section(%d) data from %s(%s)\n",
+ +				idx, name, obj->path);
+++=======
++ 		if (ignore_elf_section(&sh, name))
++ 			continue;
++ 
++ 		data = elf_sec_data(obj, scn);
++ 		if (!data)
+++>>>>>>> 50e09460d9f8 (libbpf: Skip well-known ELF sections when iterating ELF)
+  			return -LIBBPF_ERRNO__FORMAT;
+ -
+ -		pr_debug("elf: section(%d) %s, size %ld, link %d, flags %lx, type=%d\n",
+ +		}
+ +		pr_debug("section(%d) %s, size %ld, link %d, flags %lx, type=%d\n",
+  			 idx, name, (unsigned long)data->d_size,
+  			 (int)sh.sh_link, (unsigned long)sh.sh_flags,
+  			 (int)sh.sh_type);
+@@@ -2695,7 -2789,8 +2859,12 @@@
+  				obj->efile.st_ops_data = data;
+  				obj->efile.st_ops_shndx = idx;
+  			} else {
+++<<<<<<< HEAD
+ +				pr_debug("skip section(%d) %s\n", idx, name);
+++=======
++ 				pr_info("elf: skipping unrecognized data section(%d) %s\n",
++ 					idx, name);
+++>>>>>>> 50e09460d9f8 (libbpf: Skip well-known ELF sections when iterating ELF)
+  			}
+  		} else if (sh.sh_type == SHT_REL) {
+  			int nr_sects = obj->efile.nr_reloc_sects;
+@@@ -2706,8 -2801,9 +2875,14 @@@
+  			if (!section_have_execinstr(obj, sec) &&
+  			    strcmp(name, ".rel" STRUCT_OPS_SEC) &&
+  			    strcmp(name, ".rel" MAPS_ELF_SEC)) {
+++<<<<<<< HEAD
+ +				pr_debug("skip relo %s(%d) for section(%d)\n",
+ +					 name, idx, sec);
+++=======
++ 				pr_info("elf: skipping relo section(%d) %s for section(%d) %s\n",
++ 					idx, name, sec,
++ 					elf_sec_name(obj, elf_sec_by_idx(obj, sec)) ?: "<?>");
+++>>>>>>> 50e09460d9f8 (libbpf: Skip well-known ELF sections when iterating ELF)
+  				continue;
+  			}
+  
+@@@ -2728,7 -2821,7 +2903,11 @@@
+  			obj->efile.bss = data;
+  			obj->efile.bss_shndx = idx;
+  		} else {
+++<<<<<<< HEAD
+ +			pr_debug("skip section(%d) %s\n", idx, name);
+++=======
++ 			pr_info("elf: skipping section(%d) %s (size %zu)\n", idx, name, sh.sh_size);
+++>>>>>>> 50e09460d9f8 (libbpf: Skip well-known ELF sections when iterating ELF)
+  		}
+  	}
+  
+* Unmerged path tools/lib/bpf/libbpf.c
