@@ -1,0 +1,156 @@
+asm-generic/tlb: Provide generic tlb_flush() based on flush_tlb_mm()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Peter Zijlstra <peterz@infradead.org>
+commit a30e32bd79e924f460b8b83408d88af34a402f6d
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/a30e32bd.failed
+
+When an architecture does not have (an efficient) flush_tlb_range(),
+but instead always uses full TLB invalidates, the current generic
+tlb_flush() is sub-optimal, for it will generate extra flushes in
+order to keep the range small.
+
+But if we cannot do range flushes, that is a moot concern. Optionally
+provide this simplified default.
+
+No change in behavior intended.
+
+	Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+	Acked-by: Will Deacon <will.deacon@arm.com>
+	Cc: Andrew Morton <akpm@linux-foundation.org>
+	Cc: Andy Lutomirski <luto@kernel.org>
+	Cc: Borislav Petkov <bp@alien8.de>
+	Cc: Dave Hansen <dave.hansen@linux.intel.com>
+	Cc: H. Peter Anvin <hpa@zytor.com>
+	Cc: Linus Torvalds <torvalds@linux-foundation.org>
+	Cc: Peter Zijlstra <peterz@infradead.org>
+	Cc: Rik van Riel <riel@surriel.com>
+	Cc: Thomas Gleixner <tglx@linutronix.de>
+	Signed-off-by: Ingo Molnar <mingo@kernel.org>
+(cherry picked from commit a30e32bd79e924f460b8b83408d88af34a402f6d)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/asm-generic/tlb.h
+diff --cc include/asm-generic/tlb.h
+index 7ff197a1e7a9,6850d8bab6d3..000000000000
+--- a/include/asm-generic/tlb.h
++++ b/include/asm-generic/tlb.h
+@@@ -119,7 -111,11 +119,15 @@@
+   *
+   *  - tlb_get_unmap_shift() / tlb_get_unmap_size()
+   *
+++<<<<<<< HEAD
+ + *    returns the smallest TLB entry size unmapped in this range
+++=======
++  *    returns the smallest TLB entry size unmapped in this range.
++  *
++  * If an architecture does not provide tlb_flush() a default implementation
++  * based on flush_tlb_range() will be used, unless MMU_GATHER_NO_RANGE is
++  * specified, in which case we'll default to flush_tlb_mm().
+++>>>>>>> a30e32bd79e9 (asm-generic/tlb: Provide generic tlb_flush() based on flush_tlb_mm())
+   *
+   * Additionally there are a few opt-in features:
+   *
+@@@ -284,8 -299,94 +295,92 @@@ static inline void __tlb_reset_range(st
+  	tlb->cleared_pmds = 0;
+  	tlb->cleared_puds = 0;
+  	tlb->cleared_p4ds = 0;
+ -	/*
+ -	 * Do not reset mmu_gather::vma_* fields here, we do not
+ -	 * call into tlb_start_vma() again to set them if there is an
+ -	 * intermediate flush.
+ -	 */
+  }
+  
+++<<<<<<< HEAD
+++=======
++ #ifdef CONFIG_MMU_GATHER_NO_RANGE
++ 
++ #if defined(tlb_flush) || defined(tlb_start_vma) || defined(tlb_end_vma)
++ #error MMU_GATHER_NO_RANGE relies on default tlb_flush(), tlb_start_vma() and tlb_end_vma()
++ #endif
++ 
++ /*
++  * When an architecture does not have efficient means of range flushing TLBs
++  * there is no point in doing intermediate flushes on tlb_end_vma() to keep the
++  * range small. We equally don't have to worry about page granularity or other
++  * things.
++  *
++  * All we need to do is issue a full flush for any !0 range.
++  */
++ static inline void tlb_flush(struct mmu_gather *tlb)
++ {
++ 	if (tlb->end)
++ 		flush_tlb_mm(tlb->mm);
++ }
++ 
++ static inline void
++ tlb_update_vma_flags(struct mmu_gather *tlb, struct vm_area_struct *vma) { }
++ 
++ #define tlb_end_vma tlb_end_vma
++ static inline void tlb_end_vma(struct mmu_gather *tlb, struct vm_area_struct *vma) { }
++ 
++ #else /* CONFIG_MMU_GATHER_NO_RANGE */
++ 
++ #ifndef tlb_flush
++ 
++ #if defined(tlb_start_vma) || defined(tlb_end_vma)
++ #error Default tlb_flush() relies on default tlb_start_vma() and tlb_end_vma()
++ #endif
++ 
++ /*
++  * When an architecture does not provide its own tlb_flush() implementation
++  * but does have a reasonably efficient flush_vma_range() implementation
++  * use that.
++  */
++ static inline void tlb_flush(struct mmu_gather *tlb)
++ {
++ 	if (tlb->fullmm || tlb->need_flush_all) {
++ 		flush_tlb_mm(tlb->mm);
++ 	} else if (tlb->end) {
++ 		struct vm_area_struct vma = {
++ 			.vm_mm = tlb->mm,
++ 			.vm_flags = (tlb->vma_exec ? VM_EXEC    : 0) |
++ 				    (tlb->vma_huge ? VM_HUGETLB : 0),
++ 		};
++ 
++ 		flush_tlb_range(&vma, tlb->start, tlb->end);
++ 	}
++ }
++ 
++ static inline void
++ tlb_update_vma_flags(struct mmu_gather *tlb, struct vm_area_struct *vma)
++ {
++ 	/*
++ 	 * flush_tlb_range() implementations that look at VM_HUGETLB (tile,
++ 	 * mips-4k) flush only large pages.
++ 	 *
++ 	 * flush_tlb_range() implementations that flush I-TLB also flush D-TLB
++ 	 * (tile, xtensa, arm), so it's ok to just add VM_EXEC to an existing
++ 	 * range.
++ 	 *
++ 	 * We rely on tlb_end_vma() to issue a flush, such that when we reset
++ 	 * these values the batch is empty.
++ 	 */
++ 	tlb->vma_huge = !!(vma->vm_flags & VM_HUGETLB);
++ 	tlb->vma_exec = !!(vma->vm_flags & VM_EXEC);
++ }
++ 
++ #else
++ 
++ static inline void
++ tlb_update_vma_flags(struct mmu_gather *tlb, struct vm_area_struct *vma) { }
++ 
++ #endif
++ 
++ #endif /* CONFIG_MMU_GATHER_NO_RANGE */
++ 
+++>>>>>>> a30e32bd79e9 (asm-generic/tlb: Provide generic tlb_flush() based on flush_tlb_mm())
+  static inline void tlb_flush_mmu_tlbonly(struct mmu_gather *tlb)
+  {
+  	if (!tlb->end)
+* Unmerged path include/asm-generic/tlb.h
