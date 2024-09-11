@@ -1,0 +1,371 @@
+xfs: don't fail unwritten extent conversion on writeback due to edquot
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Darrick J. Wong <darrick.wong@oracle.com>
+commit 1edd2c055dff9710b1e29d4df01902abb0a55f1f
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/1edd2c05.failed
+
+During writeback, it's possible for the quota block reservation in
+xfs_iomap_write_unwritten to fail with EDQUOT because we hit the quota
+limit.  This causes writeback errors for data that was already written
+to disk, when it's not even guaranteed that the bmbt will expand to
+exceed the quota limit.  Irritatingly, this condition is reported to
+userspace as EIO by fsync, which is confusing.
+
+We wrote the data, so allow the reservation.  That might put us slightly
+above the hard limit, but it's better than losing data after a write.
+
+	Signed-off-by: Darrick J. Wong <darrick.wong@oracle.com>
+	Reviewed-by: Brian Foster <bfoster@redhat.com>
+	Reviewed-by: Christoph Hellwig <hch@lst.de>
+(cherry picked from commit 1edd2c055dff9710b1e29d4df01902abb0a55f1f)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/xfs/xfs_iomap.c
+diff --cc fs/xfs/xfs_iomap.c
+index 045a38e7c8c4,7d8966ce630a..000000000000
+--- a/fs/xfs/xfs_iomap.c
++++ b/fs/xfs/xfs_iomap.c
+@@@ -525,8 -502,333 +525,171 @@@ check_writeio
+  	return alloc_blocks;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ int
++ xfs_iomap_write_unwritten(
++ 	xfs_inode_t	*ip,
++ 	xfs_off_t	offset,
++ 	xfs_off_t	count,
++ 	bool		update_isize)
++ {
++ 	xfs_mount_t	*mp = ip->i_mount;
++ 	xfs_fileoff_t	offset_fsb;
++ 	xfs_filblks_t	count_fsb;
++ 	xfs_filblks_t	numblks_fsb;
++ 	int		nimaps;
++ 	xfs_trans_t	*tp;
++ 	xfs_bmbt_irec_t imap;
++ 	struct inode	*inode = VFS_I(ip);
++ 	xfs_fsize_t	i_size;
++ 	uint		resblks;
++ 	int		error;
++ 
++ 	trace_xfs_unwritten_convert(ip, offset, count);
++ 
++ 	offset_fsb = XFS_B_TO_FSBT(mp, offset);
++ 	count_fsb = XFS_B_TO_FSB(mp, (xfs_ufsize_t)offset + count);
++ 	count_fsb = (xfs_filblks_t)(count_fsb - offset_fsb);
++ 
++ 	/*
++ 	 * Reserve enough blocks in this transaction for two complete extent
++ 	 * btree splits.  We may be converting the middle part of an unwritten
++ 	 * extent and in this case we will insert two new extents in the btree
++ 	 * each of which could cause a full split.
++ 	 *
++ 	 * This reservation amount will be used in the first call to
++ 	 * xfs_bmbt_split() to select an AG with enough space to satisfy the
++ 	 * rest of the operation.
++ 	 */
++ 	resblks = XFS_DIOSTRAT_SPACE_RES(mp, 0) << 1;
++ 
++ 	/* Attach dquots so that bmbt splits are accounted correctly. */
++ 	error = xfs_qm_dqattach(ip);
++ 	if (error)
++ 		return error;
++ 
++ 	do {
++ 		/*
++ 		 * Set up a transaction to convert the range of extents
++ 		 * from unwritten to real. Do allocations in a loop until
++ 		 * we have covered the range passed in.
++ 		 *
++ 		 * Note that we can't risk to recursing back into the filesystem
++ 		 * here as we might be asked to write out the same inode that we
++ 		 * complete here and might deadlock on the iolock.
++ 		 */
++ 		error = xfs_trans_alloc(mp, &M_RES(mp)->tr_write, resblks, 0,
++ 				XFS_TRANS_RESERVE, &tp);
++ 		if (error)
++ 			return error;
++ 
++ 		xfs_ilock(ip, XFS_ILOCK_EXCL);
++ 		xfs_trans_ijoin(tp, ip, 0);
++ 
++ 		error = xfs_trans_reserve_quota_nblks(tp, ip, resblks, 0,
++ 				XFS_QMOPT_RES_REGBLKS | XFS_QMOPT_FORCE_RES);
++ 		if (error)
++ 			goto error_on_bmapi_transaction;
++ 
++ 		/*
++ 		 * Modify the unwritten extent state of the buffer.
++ 		 */
++ 		nimaps = 1;
++ 		error = xfs_bmapi_write(tp, ip, offset_fsb, count_fsb,
++ 					XFS_BMAPI_CONVERT, resblks, &imap,
++ 					&nimaps);
++ 		if (error)
++ 			goto error_on_bmapi_transaction;
++ 
++ 		/*
++ 		 * Log the updated inode size as we go.  We have to be careful
++ 		 * to only log it up to the actual write offset if it is
++ 		 * halfway into a block.
++ 		 */
++ 		i_size = XFS_FSB_TO_B(mp, offset_fsb + count_fsb);
++ 		if (i_size > offset + count)
++ 			i_size = offset + count;
++ 		if (update_isize && i_size > i_size_read(inode))
++ 			i_size_write(inode, i_size);
++ 		i_size = xfs_new_eof(ip, i_size);
++ 		if (i_size) {
++ 			ip->i_d.di_size = i_size;
++ 			xfs_trans_log_inode(tp, ip, XFS_ILOG_CORE);
++ 		}
++ 
++ 		error = xfs_trans_commit(tp);
++ 		xfs_iunlock(ip, XFS_ILOCK_EXCL);
++ 		if (error)
++ 			return error;
++ 
++ 		if (unlikely(!xfs_valid_startblock(ip, imap.br_startblock)))
++ 			return xfs_alert_fsblock_zero(ip, &imap);
++ 
++ 		if ((numblks_fsb = imap.br_blockcount) == 0) {
++ 			/*
++ 			 * The numblks_fsb value should always get
++ 			 * smaller, otherwise the loop is stuck.
++ 			 */
++ 			ASSERT(imap.br_blockcount);
++ 			break;
++ 		}
++ 		offset_fsb += numblks_fsb;
++ 		count_fsb -= numblks_fsb;
++ 	} while (count_fsb > 0);
++ 
++ 	return 0;
++ 
++ error_on_bmapi_transaction:
++ 	xfs_trans_cancel(tp);
++ 	xfs_iunlock(ip, XFS_ILOCK_EXCL);
++ 	return error;
++ }
++ 
++ static inline bool
++ imap_needs_alloc(
++ 	struct inode		*inode,
++ 	unsigned		flags,
++ 	struct xfs_bmbt_irec	*imap,
++ 	int			nimaps)
++ {
++ 	/* don't allocate blocks when just zeroing */
++ 	if (flags & IOMAP_ZERO)
++ 		return false;
++ 	if (!nimaps ||
++ 	    imap->br_startblock == HOLESTARTBLOCK ||
++ 	    imap->br_startblock == DELAYSTARTBLOCK)
++ 		return true;
++ 	/* we convert unwritten extents before copying the data for DAX */
++ 	if (IS_DAX(inode) && imap->br_state == XFS_EXT_UNWRITTEN)
++ 		return true;
++ 	return false;
++ }
++ 
++ static inline bool
++ imap_needs_cow(
++ 	struct xfs_inode	*ip,
++ 	unsigned int		flags,
++ 	struct xfs_bmbt_irec	*imap,
++ 	int			nimaps)
++ {
++ 	if (!xfs_is_cow_inode(ip))
++ 		return false;
++ 
++ 	/* when zeroing we don't have to COW holes or unwritten extents */
++ 	if (flags & IOMAP_ZERO) {
++ 		if (!nimaps ||
++ 		    imap->br_startblock == HOLESTARTBLOCK ||
++ 		    imap->br_state == XFS_EXT_UNWRITTEN)
++ 			return false;
++ 	}
++ 
++ 	return true;
++ }
++ 
+++>>>>>>> 1edd2c055dff (xfs: don't fail unwritten extent conversion on writeback due to edquot)
+  static int
+ -xfs_ilock_for_iomap(
+ -	struct xfs_inode	*ip,
+ -	unsigned		flags,
+ -	unsigned		*lockmode)
+ -{
+ -	unsigned		mode = XFS_ILOCK_SHARED;
+ -	bool			is_write = flags & (IOMAP_WRITE | IOMAP_ZERO);
+ -
+ -	/*
+ -	 * COW writes may allocate delalloc space or convert unwritten COW
+ -	 * extents, so we need to make sure to take the lock exclusively here.
+ -	 */
+ -	if (xfs_is_cow_inode(ip) && is_write)
+ -		mode = XFS_ILOCK_EXCL;
+ -
+ -	/*
+ -	 * Extents not yet cached requires exclusive access, don't block.  This
+ -	 * is an opencoded xfs_ilock_data_map_shared() call but with
+ -	 * non-blocking behaviour.
+ -	 */
+ -	if (!(ip->i_df.if_flags & XFS_IFEXTENTS)) {
+ -		if (flags & IOMAP_NOWAIT)
+ -			return -EAGAIN;
+ -		mode = XFS_ILOCK_EXCL;
+ -	}
+ -
+ -relock:
+ -	if (flags & IOMAP_NOWAIT) {
+ -		if (!xfs_ilock_nowait(ip, mode))
+ -			return -EAGAIN;
+ -	} else {
+ -		xfs_ilock(ip, mode);
+ -	}
+ -
+ -	/*
+ -	 * The reflink iflag could have changed since the earlier unlocked
+ -	 * check, so if we got ILOCK_SHARED for a write and but we're now a
+ -	 * reflink inode we have to switch to ILOCK_EXCL and relock.
+ -	 */
+ -	if (mode == XFS_ILOCK_SHARED && is_write && xfs_is_cow_inode(ip)) {
+ -		xfs_iunlock(ip, mode);
+ -		mode = XFS_ILOCK_EXCL;
+ -		goto relock;
+ -	}
+ -
+ -	*lockmode = mode;
+ -	return 0;
+ -}
+ -
+ -static int
+ -xfs_direct_write_iomap_begin(
+ -	struct inode		*inode,
+ -	loff_t			offset,
+ -	loff_t			length,
+ -	unsigned		flags,
+ -	struct iomap		*iomap,
+ -	struct iomap		*srcmap)
+ -{
+ -	struct xfs_inode	*ip = XFS_I(inode);
+ -	struct xfs_mount	*mp = ip->i_mount;
+ -	struct xfs_bmbt_irec	imap, cmap;
+ -	xfs_fileoff_t		offset_fsb = XFS_B_TO_FSBT(mp, offset);
+ -	xfs_fileoff_t		end_fsb = xfs_iomap_end_fsb(mp, offset, length);
+ -	int			nimaps = 1, error = 0;
+ -	bool			shared = false;
+ -	u16			iomap_flags = 0;
+ -	unsigned		lockmode;
+ -
+ -	ASSERT(flags & (IOMAP_WRITE | IOMAP_ZERO));
+ -
+ -	if (XFS_FORCED_SHUTDOWN(mp))
+ -		return -EIO;
+ -
+ -	/*
+ -	 * Writes that span EOF might trigger an IO size update on completion,
+ -	 * so consider them to be dirty for the purposes of O_DSYNC even if
+ -	 * there is no other metadata changes pending or have been made here.
+ -	 */
+ -	if (offset + length > i_size_read(inode))
+ -		iomap_flags |= IOMAP_F_DIRTY;
+ -
+ -	error = xfs_ilock_for_iomap(ip, flags, &lockmode);
+ -	if (error)
+ -		return error;
+ -
+ -	error = xfs_bmapi_read(ip, offset_fsb, end_fsb - offset_fsb, &imap,
+ -			       &nimaps, 0);
+ -	if (error)
+ -		goto out_unlock;
+ -
+ -	if (imap_needs_cow(ip, flags, &imap, nimaps)) {
+ -		error = -EAGAIN;
+ -		if (flags & IOMAP_NOWAIT)
+ -			goto out_unlock;
+ -
+ -		/* may drop and re-acquire the ilock */
+ -		error = xfs_reflink_allocate_cow(ip, &imap, &cmap, &shared,
+ -				&lockmode, flags & IOMAP_DIRECT);
+ -		if (error)
+ -			goto out_unlock;
+ -		if (shared)
+ -			goto out_found_cow;
+ -		end_fsb = imap.br_startoff + imap.br_blockcount;
+ -		length = XFS_FSB_TO_B(mp, end_fsb) - offset;
+ -	}
+ -
+ -	if (imap_needs_alloc(inode, flags, &imap, nimaps))
+ -		goto allocate_blocks;
+ -
+ -	xfs_iunlock(ip, lockmode);
+ -	trace_xfs_iomap_found(ip, offset, length, XFS_DATA_FORK, &imap);
+ -	return xfs_bmbt_to_iomap(ip, iomap, &imap, iomap_flags);
+ -
+ -allocate_blocks:
+ -	error = -EAGAIN;
+ -	if (flags & IOMAP_NOWAIT)
+ -		goto out_unlock;
+ -
+ -	/*
+ -	 * We cap the maximum length we map to a sane size  to keep the chunks
+ -	 * of work done where somewhat symmetric with the work writeback does.
+ -	 * This is a completely arbitrary number pulled out of thin air as a
+ -	 * best guess for initial testing.
+ -	 *
+ -	 * Note that the values needs to be less than 32-bits wide until the
+ -	 * lower level functions are updated.
+ -	 */
+ -	length = min_t(loff_t, length, 1024 * PAGE_SIZE);
+ -	end_fsb = xfs_iomap_end_fsb(mp, offset, length);
+ -
+ -	if (offset + length > XFS_ISIZE(ip))
+ -		end_fsb = xfs_iomap_eof_align_last_fsb(ip, end_fsb);
+ -	else if (nimaps && imap.br_startblock == HOLESTARTBLOCK)
+ -		end_fsb = min(end_fsb, imap.br_startoff + imap.br_blockcount);
+ -	xfs_iunlock(ip, lockmode);
+ -
+ -	error = xfs_iomap_write_direct(ip, offset_fsb, end_fsb - offset_fsb,
+ -			&imap);
+ -	if (error)
+ -		return error;
+ -
+ -	trace_xfs_iomap_alloc(ip, offset, length, XFS_DATA_FORK, &imap);
+ -	return xfs_bmbt_to_iomap(ip, iomap, &imap, iomap_flags | IOMAP_F_NEW);
+ -
+ -out_found_cow:
+ -	xfs_iunlock(ip, lockmode);
+ -	length = XFS_FSB_TO_B(mp, cmap.br_startoff + cmap.br_blockcount);
+ -	trace_xfs_iomap_found(ip, offset, length - offset, XFS_COW_FORK, &cmap);
+ -	if (imap.br_startblock != HOLESTARTBLOCK) {
+ -		error = xfs_bmbt_to_iomap(ip, srcmap, &imap, 0);
+ -		if (error)
+ -			return error;
+ -	}
+ -	return xfs_bmbt_to_iomap(ip, iomap, &cmap, IOMAP_F_SHARED);
+ -
+ -out_unlock:
+ -	xfs_iunlock(ip, lockmode);
+ -	return error;
+ -}
+ -
+ -const struct iomap_ops xfs_direct_write_iomap_ops = {
+ -	.iomap_begin		= xfs_direct_write_iomap_begin,
+ -};
+ -
+ -static int
+ -xfs_buffered_write_iomap_begin(
+ +xfs_file_iomap_begin_delay(
+  	struct inode		*inode,
+  	loff_t			offset,
+  	loff_t			count,
+* Unmerged path fs/xfs/xfs_iomap.c
