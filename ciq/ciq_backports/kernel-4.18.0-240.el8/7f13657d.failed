@@ -1,0 +1,114 @@
+io_uring: handle -EFAULT properly in io_uring_setup()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Xiaoguang Wang <xiaoguang.wang@linux.alibaba.com>
+commit 7f13657d141346125f4d0bb93eab4777f40c406e
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/7f13657d.failed
+
+If copy_to_user() in io_uring_setup() failed, we'll leak many kernel
+resources, which will be recycled until process terminates. This bug
+can be reproduced by using mprotect to set params to PROT_READ. To fix
+this issue, refactor io_uring_create() a bit to add a new 'struct
+io_uring_params __user *params' parameter and move the copy_to_user()
+in io_uring_setup() to io_uring_setup(), if copy_to_user() failed,
+we can free kernel resource properly.
+
+	Suggested-by: Jens Axboe <axboe@kernel.dk>
+	Signed-off-by: Xiaoguang Wang <xiaoguang.wang@linux.alibaba.com>
+	Signed-off-by: Jens Axboe <axboe@kernel.dk>
+(cherry picked from commit 7f13657d141346125f4d0bb93eab4777f40c406e)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/io_uring.c
+diff --cc fs/io_uring.c
+index 2afa3b27779e,dd680eb153cb..000000000000
+--- a/fs/io_uring.c
++++ b/fs/io_uring.c
+@@@ -3939,26 -7836,40 +3940,62 @@@ static int io_uring_create(unsigned ent
+  	if (ret)
+  		goto err;
+  
+++<<<<<<< HEAD
+++=======
++ 	memset(&p->sq_off, 0, sizeof(p->sq_off));
++ 	p->sq_off.head = offsetof(struct io_rings, sq.head);
++ 	p->sq_off.tail = offsetof(struct io_rings, sq.tail);
++ 	p->sq_off.ring_mask = offsetof(struct io_rings, sq_ring_mask);
++ 	p->sq_off.ring_entries = offsetof(struct io_rings, sq_ring_entries);
++ 	p->sq_off.flags = offsetof(struct io_rings, sq_flags);
++ 	p->sq_off.dropped = offsetof(struct io_rings, sq_dropped);
++ 	p->sq_off.array = (char *)ctx->sq_array - (char *)ctx->rings;
++ 
++ 	memset(&p->cq_off, 0, sizeof(p->cq_off));
++ 	p->cq_off.head = offsetof(struct io_rings, cq.head);
++ 	p->cq_off.tail = offsetof(struct io_rings, cq.tail);
++ 	p->cq_off.ring_mask = offsetof(struct io_rings, cq_ring_mask);
++ 	p->cq_off.ring_entries = offsetof(struct io_rings, cq_ring_entries);
++ 	p->cq_off.overflow = offsetof(struct io_rings, cq_overflow);
++ 	p->cq_off.cqes = offsetof(struct io_rings, cqes);
++ 
++ 	p->features = IORING_FEAT_SINGLE_MMAP | IORING_FEAT_NODROP |
++ 			IORING_FEAT_SUBMIT_STABLE | IORING_FEAT_RW_CUR_POS |
++ 			IORING_FEAT_CUR_PERSONALITY | IORING_FEAT_FAST_POLL;
++ 
++ 	if (copy_to_user(params, p, sizeof(*p))) {
++ 		ret = -EFAULT;
++ 		goto err;
++ 	}
++ 	/*
++ 	 * Install ring fd as the very last thing, so we don't risk someone
++ 	 * having closed it before we finish setup
++ 	 */
+++>>>>>>> 7f13657d1413 (io_uring: handle -EFAULT properly in io_uring_setup())
+  	ret = io_uring_get_fd(ctx);
+  	if (ret < 0)
+  		goto err;
+  
+++<<<<<<< HEAD
+ +	memset(&p->sq_off, 0, sizeof(p->sq_off));
+ +	p->sq_off.head = offsetof(struct io_sq_ring, r.head);
+ +	p->sq_off.tail = offsetof(struct io_sq_ring, r.tail);
+ +	p->sq_off.ring_mask = offsetof(struct io_sq_ring, ring_mask);
+ +	p->sq_off.ring_entries = offsetof(struct io_sq_ring, ring_entries);
+ +	p->sq_off.flags = offsetof(struct io_sq_ring, flags);
+ +	p->sq_off.dropped = offsetof(struct io_sq_ring, dropped);
+ +	p->sq_off.array = offsetof(struct io_sq_ring, array);
+ +
+ +	memset(&p->cq_off, 0, sizeof(p->cq_off));
+ +	p->cq_off.head = offsetof(struct io_cq_ring, r.head);
+ +	p->cq_off.tail = offsetof(struct io_cq_ring, r.tail);
+ +	p->cq_off.ring_mask = offsetof(struct io_cq_ring, ring_mask);
+ +	p->cq_off.ring_entries = offsetof(struct io_cq_ring, ring_entries);
+ +	p->cq_off.overflow = offsetof(struct io_cq_ring, overflow);
+ +	p->cq_off.cqes = offsetof(struct io_cq_ring, cqes);
+++=======
++ 	trace_io_uring_create(ret, ctx, p->sq_entries, p->cq_entries, p->flags);
+++>>>>>>> 7f13657d1413 (io_uring: handle -EFAULT properly in io_uring_setup())
+  	return ret;
+  err:
+  	io_ring_ctx_wait_and_kill(ctx);
+@@@ -3985,17 -7895,10 +4021,10 @@@ static long io_uring_setup(u32 entries
+  
+  	if (p.flags & ~(IORING_SETUP_IOPOLL | IORING_SETUP_SQPOLL |
+  			IORING_SETUP_SQ_AFF | IORING_SETUP_CQSIZE |
+ -			IORING_SETUP_CLAMP | IORING_SETUP_ATTACH_WQ))
+ +			IORING_SETUP_CLAMP))
+  		return -EINVAL;
+  
+- 	ret = io_uring_create(entries, &p);
+- 	if (ret < 0)
+- 		return ret;
+- 
+- 	if (copy_to_user(params, &p, sizeof(p)))
+- 		return -EFAULT;
+- 
+- 	return ret;
++ 	return  io_uring_create(entries, &p, params);
+  }
+  
+  SYSCALL_DEFINE2(io_uring_setup, u32, entries,
+* Unmerged path fs/io_uring.c
