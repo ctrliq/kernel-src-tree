@@ -1,0 +1,298 @@
+block: refactor rescan_partitions
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Christoph Hellwig <hch@lst.de>
+commit f902b02600028dfc0c9df811eb711ac7d7fca09f
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/f902b026.failed
+
+Split out a helper that adds one single partition, and another one
+calling that dealing with the parsed_partitions state.  This makes
+it much more obvious how we clean up all state and start again when
+using the rescan label.
+
+	Signed-off-by: Christoph Hellwig <hch@lst.de>
+	Reviewed-by: Jan Kara <jack@suse.cz>
+	Reviewed-by: Hannes Reinecke <hare@suse.de>
+	Signed-off-by: Jens Axboe <axboe@kernel.dk>
+(cherry picked from commit f902b02600028dfc0c9df811eb711ac7d7fca09f)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	block/partition-generic.c
+diff --cc block/partition-generic.c
+index aee643ce13d1,7eabb67f99b5..000000000000
+--- a/block/partition-generic.c
++++ b/block/partition-generic.c
+@@@ -459,76 -459,63 +459,117 @@@ static int drop_partitions(struct gendi
+  	return 0;
+  }
+  
+++<<<<<<< HEAD
+ +static bool part_zone_aligned(struct gendisk *disk,
+ +			      struct block_device *bdev,
+ +			      sector_t from, sector_t size)
+ +{
+ +	unsigned int zone_sectors = bdev_zone_sectors(bdev);
+ +
+ +	/*
+ +	 * If this function is called, then the disk is a zoned block device
+ +	 * (host-aware or host-managed). This can be detected even if the
+ +	 * zoned block device support is disabled (CONFIG_BLK_DEV_ZONED not
+ +	 * set). In this case, however, only host-aware devices will be seen
+ +	 * as a block device is not created for host-managed devices. Without
+ +	 * zoned block device support, host-aware drives can still be used as
+ +	 * regular block devices (no zone operation) and their zone size will
+ +	 * be reported as 0. Allow this case.
+ +	 */
+ +	if (!zone_sectors)
+ +		return true;
+ +
+ +	/*
+ +	 * Check partition start and size alignement. If the drive has a
+ +	 * smaller last runt zone, ignore it and allow the partition to
+ +	 * use it. Check the zone size too: it should be a power of 2 number
+ +	 * of sectors.
+ +	 */
+ +	if (WARN_ON_ONCE(!is_power_of_2(zone_sectors))) {
+ +		u32 rem;
+ +
+ +		div_u64_rem(from, zone_sectors, &rem);
+ +		if (rem)
+ +			return false;
+ +		if ((from + size) < get_capacity(disk)) {
+ +			div_u64_rem(size, zone_sectors, &rem);
+ +			if (rem)
+ +				return false;
+ +		}
+ +
+ +	} else {
+ +
+ +		if (from & (zone_sectors - 1))
+ +			return false;
+ +		if ((from + size) < get_capacity(disk) &&
+ +		    (size & (zone_sectors - 1)))
+ +			return false;
+ +
+ +	}
+ +
+ +	return true;
+ +}
+ +
+ +int rescan_partitions(struct gendisk *disk, struct block_device *bdev)
+++=======
++ static bool blk_add_partition(struct gendisk *disk, struct block_device *bdev,
++ 		struct parsed_partitions *state, int p)
+++>>>>>>> f902b0260002 (block: refactor rescan_partitions)
+  {
+- 	struct parsed_partitions *state = NULL;
++ 	sector_t size = state->parts[p].size;
++ 	sector_t from = state->parts[p].from;
+  	struct hd_struct *part;
+- 	int p, highest, res;
+- rescan:
+- 	if (state && !IS_ERR(state)) {
+- 		free_partitions(state);
+- 		state = NULL;
++ 
++ 	if (!size)
++ 		return true;
++ 
++ 	if (from >= get_capacity(disk)) {
++ 		printk(KERN_WARNING
++ 		       "%s: p%d start %llu is beyond EOD, ",
++ 		       disk->disk_name, p, (unsigned long long) from);
++ 		if (disk_unlock_native_capacity(disk))
++ 			return false;
++ 		return true;
+  	}
+  
+- 	res = drop_partitions(disk, bdev);
+- 	if (res)
+- 		return res;
++ 	if (from + size > get_capacity(disk)) {
++ 		printk(KERN_WARNING
++ 		       "%s: p%d size %llu extends beyond EOD, ",
++ 		       disk->disk_name, p, (unsigned long long) size);
+  
+- 	if (disk->fops->revalidate_disk)
+- 		disk->fops->revalidate_disk(disk);
+- 	check_disk_size_change(disk, bdev, true);
+- 	bdev->bd_invalidated = 0;
+- 	if (!get_capacity(disk) || !(state = check_partition(disk, bdev)))
++ 		if (disk_unlock_native_capacity(disk))
++ 			return false;
++ 
++ 		/*
++ 		 * We can not ignore partitions of broken tables created by for
++ 		 * example camera firmware, but we limit them to the end of the
++ 		 * disk to avoid creating invalid block devices.
++ 		 */
++ 		size = get_capacity(disk) - from;
++ 	}
++ 
++ 	part = add_partition(disk, p, from, size, state->parts[p].flags,
++ 			     &state->parts[p].info);
++ 	if (IS_ERR(part)) {
++ 		printk(KERN_ERR " %s: p%d could not be added: %ld\n",
++ 		       disk->disk_name, p, -PTR_ERR(part));
++ 		return true;
++ 	}
++ 
++ #ifdef CONFIG_BLK_DEV_MD
++ 	if (state->parts[p].flags & ADDPART_FLAG_RAID)
++ 		md_autodetect_dev(part_to_dev(part)->devt);
++ #endif
++ 	return true;
++ }
++ 
++ static int blk_add_partitions(struct gendisk *disk, struct block_device *bdev)
++ {
++ 	struct parsed_partitions *state;
++ 	int ret = -EAGAIN, p, highest;
++ 
++ 	state = check_partition(disk, bdev);
++ 	if (!state)
+  		return 0;
+  	if (IS_ERR(state)) {
+  		/*
+@@@ -544,10 -530,21 +584,24 @@@
+  		}
+  		return -EIO;
+  	}
+++<<<<<<< HEAD
+++=======
++ 
++ 	/*
++ 	 * Partitions are not supported on zoned block devices.
++ 	 */
++ 	if (bdev_is_zoned(bdev)) {
++ 		pr_warn("%s: ignoring partition table on zoned block device\n",
++ 			disk->disk_name);
++ 		ret = 0;
++ 		goto out_free_state;
++ 	}
++ 
+++>>>>>>> f902b0260002 (block: refactor rescan_partitions)
+  	/*
+- 	 * If any partition code tried to read beyond EOD, try
+- 	 * unlocking native capacity even if partition table is
+- 	 * successfully read as we could be missing some partitions.
++ 	 * If we read beyond EOD, try unlocking native capacity even if the
++ 	 * partition table was successfully read as we could be missing some
++ 	 * partitions.
+  	 */
+  	if (state->access_beyond_eod) {
+  		printk(KERN_WARNING
+@@@ -567,76 -564,39 +621,103 @@@
+  	for (p = 1, highest = 0; p < state->limit; p++)
+  		if (state->parts[p].size)
+  			highest = p;
+- 
+  	disk_expand_part_tbl(disk, highest);
+  
+- 	/* add partitions */
+- 	for (p = 1; p < state->limit; p++) {
+- 		sector_t size, from;
++ 	for (p = 1; p < state->limit; p++)
++ 		if (!blk_add_partition(disk, bdev, state, p))
++ 			goto out_free_state;
+  
+++<<<<<<< HEAD
+ +		size = state->parts[p].size;
+ +		if (!size)
+ +			continue;
+ +
+ +		from = state->parts[p].from;
+ +		if (from >= get_capacity(disk)) {
+ +			printk(KERN_WARNING
+ +			       "%s: p%d start %llu is beyond EOD, ",
+ +			       disk->disk_name, p, (unsigned long long) from);
+ +			if (disk_unlock_native_capacity(disk))
+ +				goto rescan;
+ +			continue;
+ +		}
+ +
+ +		if (from + size > get_capacity(disk)) {
+ +			printk(KERN_WARNING
+ +			       "%s: p%d size %llu extends beyond EOD, ",
+ +			       disk->disk_name, p, (unsigned long long) size);
+ +
+ +			if (disk_unlock_native_capacity(disk)) {
+ +				/* free state and restart */
+ +				goto rescan;
+ +			} else {
+ +				/*
+ +				 * we can not ignore partitions of broken tables
+ +				 * created by for example camera firmware, but
+ +				 * we limit them to the end of the disk to avoid
+ +				 * creating invalid block devices
+ +				 */
+ +				size = get_capacity(disk) - from;
+ +			}
+ +		}
+ +
+ +		/*
+ +		 * On a zoned block device, partitions should be aligned on the
+ +		 * device zone size (i.e. zone boundary crossing not allowed).
+ +		 * Otherwise, resetting the write pointer of the last zone of
+ +		 * one partition may impact the following partition.
+ +		 */
+ +		if (bdev_is_zoned(bdev) &&
+ +		    !part_zone_aligned(disk, bdev, from, size)) {
+ +			printk(KERN_WARNING
+ +			       "%s: p%d start %llu+%llu is not zone aligned\n",
+ +			       disk->disk_name, p, (unsigned long long) from,
+ +			       (unsigned long long) size);
+ +			continue;
+ +		}
+ +
+ +		part = add_partition(disk, p, from, size,
+ +				     state->parts[p].flags,
+ +				     &state->parts[p].info);
+ +		if (IS_ERR(part)) {
+ +			printk(KERN_ERR " %s: p%d could not be added: %ld\n",
+ +			       disk->disk_name, p, -PTR_ERR(part));
+ +			continue;
+ +		}
+ +#ifdef CONFIG_BLK_DEV_MD
+ +		if (state->parts[p].flags & ADDPART_FLAG_RAID)
+ +			md_autodetect_dev(part_to_dev(part)->devt);
+ +#endif
+ +	}
+++=======
++ 	ret = 0;
++ out_free_state:
+++>>>>>>> f902b0260002 (block: refactor rescan_partitions)
+  	free_partitions(state);
+- 	return 0;
++ 	return ret;
++ }
++ 
++ int rescan_partitions(struct gendisk *disk, struct block_device *bdev)
++ {
++ 	int ret;
++ 
++ rescan:
++ 	ret = drop_partitions(disk, bdev);
++ 	if (ret)
++ 		return ret;
++ 
++ 	if (disk->fops->revalidate_disk)
++ 		disk->fops->revalidate_disk(disk);
++ 	check_disk_size_change(disk, bdev, true);
++ 	bdev->bd_invalidated = 0;
++ 
++ 	if (!get_capacity(disk))
++ 		return 0;
++ 
++ 	ret = blk_add_partitions(disk, bdev);
++ 	if (ret == -EAGAIN)
++ 		goto rescan;
++ 	return ret;
+  }
+  
+  int invalidate_partitions(struct gendisk *disk, struct block_device *bdev)
+* Unmerged path block/partition-generic.c
