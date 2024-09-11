@@ -1,0 +1,110 @@
+scsi: sd: sd_zbc: Don't pass GFP_NOIO to kvcalloc
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-310.el8
+commit-author Johannes Thumshirn <johannes.thumshirn@wdc.com>
+commit 9acced3f58ad24407c1f9ebf53a8892c1e24cdb5
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-310.el8/9acced3f.failed
+
+Dan reported we're passing in GFP_NOIO to kvmalloc() which will then
+fallback to doing kmalloc() instead of an optional vmalloc() if the size
+exceeds kmalloc()s limits. This will break with drives that have zone
+numbers exceeding PAGE_SIZE/sizeof(u32).
+
+Instead of passing in GFP_NOIO, enter an implicit GFP_NOIO allocation
+scope.
+
+Link: https://lore.kernel.org/r/YCuvSfKw4qEQBr/t@mwanda
+Link: https://lore.kernel.org/r/5a6345e2989fd06c049ac4e4627f6acb492c15b8.1613569821.git.johannes.thumshirn@wdc.com
+Fixes: 5795eb443060: ("scsi: sd_zbc: emulate ZONE_APPEND commands")
+	Cc: Damien Le Moal <Damien.LeMoal@wdc.com>
+	Reported-by: Dan Carpenter <dan.carpenter@oracle.com>
+	Reviewed-by: Damien Le Moal <damien.lemoal@wdc.com>
+	Signed-off-by: Johannes Thumshirn <johannes.thumshirn@wdc.com>
+	Signed-off-by: Martin K. Petersen <martin.petersen@oracle.com>
+(cherry picked from commit 9acced3f58ad24407c1f9ebf53a8892c1e24cdb5)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/scsi/sd_zbc.c
+diff --cc drivers/scsi/sd_zbc.c
+index 03ce186ae933,87a7274e4632..000000000000
+--- a/drivers/scsi/sd_zbc.c
++++ b/drivers/scsi/sd_zbc.c
+@@@ -663,15 -677,18 +663,16 @@@ static void sd_zbc_revalidate_zones_cb(
+  {
+  	struct scsi_disk *sdkp = scsi_disk(disk);
+  
+ -	swap(sdkp->zones_wp_offset, sdkp->rev_wp_offset);
+ +	swap(sdkp->aux->zones_wp_offset, sdkp->aux->rev_wp_offset);
+  }
+  
+ -int sd_zbc_revalidate_zones(struct scsi_disk *sdkp)
+ +static int sd_zbc_revalidate_zones(struct scsi_disk *sdkp,
+ +				   u32 zone_blocks,
+ +				   unsigned int nr_zones)
+  {
+  	struct gendisk *disk = sdkp->disk;
+ -	struct request_queue *q = disk->queue;
+ -	u32 zone_blocks = sdkp->rev_zone_blocks;
+ -	unsigned int nr_zones = sdkp->rev_nr_zones;
+ -	u32 max_append;
+  	int ret = 0;
++ 	unsigned int flags;
+  
+  	/*
+  	 * For all zoned disks, initialize zone append emulation data if not
+@@@ -709,19 -721,39 +710,49 @@@
+  	    disk->queue->nr_zones == nr_zones)
+  		goto unlock;
+  
+++<<<<<<< HEAD
+ +	sdkp->aux->rev_wp_offset = kvcalloc(nr_zones, sizeof(u32), GFP_NOIO);
+ +	if (!sdkp->aux->rev_wp_offset) {
+++=======
++ 	flags = memalloc_noio_save();
++ 	sdkp->zone_blocks = zone_blocks;
++ 	sdkp->nr_zones = nr_zones;
++ 	sdkp->rev_wp_offset = kvcalloc(nr_zones, sizeof(u32), GFP_KERNEL);
++ 	if (!sdkp->rev_wp_offset) {
+++>>>>>>> 9acced3f58ad (scsi: sd: sd_zbc: Don't pass GFP_NOIO to kvcalloc)
+  		ret = -ENOMEM;
++ 		memalloc_noio_restore(flags);
+  		goto unlock;
+  	}
+  
+  	ret = blk_revalidate_disk_zones(disk, sd_zbc_revalidate_zones_cb);
+  
+++<<<<<<< HEAD
+ +	kvfree(sdkp->aux->rev_wp_offset);
+ +	sdkp->aux->rev_wp_offset = NULL;
+++=======
++ 	memalloc_noio_restore(flags);
++ 	kvfree(sdkp->rev_wp_offset);
++ 	sdkp->rev_wp_offset = NULL;
++ 
++ 	if (ret) {
++ 		sdkp->zone_blocks = 0;
++ 		sdkp->nr_zones = 0;
++ 		sdkp->capacity = 0;
++ 		goto unlock;
++ 	}
++ 
++ 	max_append = min_t(u32, logical_to_sectors(sdkp->device, zone_blocks),
++ 			   q->limits.max_segments << (PAGE_SHIFT - 9));
++ 	max_append = min_t(u32, max_append, queue_max_hw_sectors(q));
++ 
++ 	blk_queue_max_zone_append_sectors(q, max_append);
++ 
++ 	sd_zbc_print_zones(sdkp);
+++>>>>>>> 9acced3f58ad (scsi: sd: sd_zbc: Don't pass GFP_NOIO to kvcalloc)
+  
+  unlock:
+ -	mutex_unlock(&sdkp->rev_mutex);
+ +	mutex_unlock(&sdkp->aux->rev_mutex);
+  
+  	return ret;
+  }
+* Unmerged path drivers/scsi/sd_zbc.c
