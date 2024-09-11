@@ -1,0 +1,161 @@
+vfs_get_tree(): evict the call of security_sb_kern_mount()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Al Viro <viro@zeniv.linux.org.uk>
+commit c9ce29ed795fae86e594844857fad1b0d3be85f4
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/c9ce29ed.failed
+
+Right now vfs_get_tree() calls security_sb_kern_mount() (i.e.
+mount MAC) unless it gets MS_KERNMOUNT or MS_SUBMOUNT in flags.
+Doing it that way is both clumsy and imprecise.
+
+Consider the callers' tree of vfs_get_tree():
+vfs_get_tree()
+        <- do_new_mount()
+	<- vfs_kern_mount()
+		<- simple_pin_fs()
+		<- vfs_submount()
+		<- kern_mount_data()
+		<- init_mount_tree()
+		<- btrfs_mount()
+			<- vfs_get_tree()
+		<- nfs_do_root_mount()
+			<- nfs4_try_mount()
+				<- nfs_fs_mount()
+					<- vfs_get_tree()
+			<- nfs4_referral_mount()
+
+do_new_mount() always does need MAC (we are guaranteed that neither
+MS_KERNMOUNT nor MS_SUBMOUNT will be passed there).
+
+simple_pin_fs(), vfs_submount() and kern_mount_data() pass explicit
+flags inhibiting that check.  So does nfs4_referral_mount() (the
+flags there are ulimately coming from vfs_submount()).
+
+init_mount_tree() is called too early for anything LSM-related; it
+doesn't matter whether we attempt those checks, they'll do nothing.
+
+Finally, in case of btrfs_mount() and nfs_fs_mount(), doing MAC
+is pointless - either the caller will do it, or the flags are
+such that we wouldn't have done it either.
+
+In other words, the one and only case when we want that check
+done is when we are called from do_new_mount(), and there we
+want it unconditionally.
+
+So let's simply move it there.  The superblock is still locked,
+so nobody is going to get access to it (via ustat(2), etc.)
+until we get a chance to apply the checks - we are free to
+move them to any point up to where we drop ->s_umount (in
+do_new_mount_fc()).
+
+	Signed-off-by: Al Viro <viro@zeniv.linux.org.uk>
+(cherry picked from commit c9ce29ed795fae86e594844857fad1b0d3be85f4)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/fs_context.c
+#	fs/internal.h
+#	fs/super.c
+diff --cc fs/internal.h
+index 172c0652a6e5,6af26d897034..000000000000
+--- a/fs/internal.h
++++ b/fs/internal.h
+@@@ -50,10 -53,15 +50,20 @@@ extern int __block_write_begin_int(stru
+  extern void __init chrdev_init(void);
+  
+  /*
+++<<<<<<< HEAD
+++=======
++  * fs_context.c
++  */
++ extern int legacy_get_tree(struct fs_context *fc);
++ extern int parse_monolithic_mount_data(struct fs_context *, void *);
++ extern void fc_drop_locked(struct fs_context *);
++ 
++ /*
+++>>>>>>> c9ce29ed795f (vfs_get_tree(): evict the call of security_sb_kern_mount())
+   * namei.c
+   */
+ +extern int filename_lookup(int dfd, struct filename *name, unsigned flags,
+ +			   struct path *path, struct path *root);
+  extern int user_path_mountpoint_at(int, const char __user *, unsigned int, struct path *);
+  extern int vfs_path_lookup(struct dentry *, struct vfsmount *,
+  			   const char *, unsigned int, struct path *);
+diff --cc fs/super.c
+index 9be3be2154ec,11e2a6cb3baf..000000000000
+--- a/fs/super.c
++++ b/fs/super.c
+@@@ -1283,9 -1276,11 +1283,17 @@@ mount_fs(struct file_system_type *type
+  	smp_wmb();
+  	sb->s_flags |= SB_BORN;
+  
+++<<<<<<< HEAD
+ +	error = security_sb_kern_mount(sb, flags, &opts);
+ +	if (error)
+ +		goto out_sb;
+++=======
++ 	error = security_sb_set_mnt_opts(sb, fc->security, 0, NULL);
++ 	if (unlikely(error)) {
++ 		fc_drop_locked(fc);
++ 		return error;
++ 	}
+++>>>>>>> c9ce29ed795f (vfs_get_tree(): evict the call of security_sb_kern_mount())
+  
+  	/*
+  	 * filesystems should never set s_maxbytes larger than MAX_LFS_FILESIZE
+@@@ -1294,18 -1289,11 +1302,22 @@@
+  	 * violate this rule.
+  	 */
+  	WARN((sb->s_maxbytes < 0), "%s set sb->s_maxbytes to "
+ -		"negative value (%lld)\n", fc->fs_type->name, sb->s_maxbytes);
+ +		"negative value (%lld)\n", type->name, sb->s_maxbytes);
+  
+++<<<<<<< HEAD
+ +	up_write(&sb->s_umount);
+ +	security_free_mnt_opts(&opts);
+ +	return root;
+ +out_sb:
+ +	dput(root);
+ +	deactivate_locked_super(sb);
+ +out_free_secdata:
+ +	security_free_mnt_opts(&opts);
+ +	return ERR_PTR(error);
+++=======
++ 	return 0;
+++>>>>>>> c9ce29ed795f (vfs_get_tree(): evict the call of security_sb_kern_mount())
+  }
+ -EXPORT_SYMBOL(vfs_get_tree);
+  
+  /*
+   * Setup private BDI for given superblock. It gets automatically cleaned up
+* Unmerged path fs/fs_context.c
+* Unmerged path fs/fs_context.c
+* Unmerged path fs/internal.h
+diff --git a/fs/namespace.c b/fs/namespace.c
+index d4be8b82f7bd..d105aeec5aff 100644
+--- a/fs/namespace.c
++++ b/fs/namespace.c
+@@ -2478,11 +2478,13 @@ static int do_new_mount_fc(struct fs_context *fc, struct path *mountpoint,
+ 	struct super_block *sb = fc->root->d_sb;
+ 	int error;
+ 
+-	if (mount_too_revealing(sb, &mnt_flags)) {
+-		dput(fc->root);
+-		fc->root = NULL;
+-		deactivate_locked_super(sb);
+-		return -EPERM;
++	error = security_sb_kern_mount(sb);
++	if (!error && mount_too_revealing(sb, &mnt_flags))
++		error = -EPERM;
++
++	if (unlikely(error)) {
++		fc_drop_locked(fc);
++		return error;
+ 	}
+ 
+ 	up_write(&sb->s_umount);
+* Unmerged path fs/super.c
