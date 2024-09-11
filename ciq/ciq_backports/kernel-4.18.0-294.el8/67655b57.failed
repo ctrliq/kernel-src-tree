@@ -1,0 +1,466 @@
+x86/sgx: Clarify 'laundry_list' locking
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Dave Hansen <dave.hansen@linux.intel.com>
+commit 67655b57f8f59467506463055d9a8398d2836377
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/67655b57.failed
+
+Short Version:
+
+The SGX section->laundry_list structure is effectively thread-local, but
+declared next to some shared structures. Its semantics are clear as mud.
+Fix that. No functional changes. Compile tested only.
+
+Long Version:
+
+The SGX hardware keeps per-page metadata. This can provide things like
+permissions, integrity and replay protection. It also prevents things
+like having an enclave page mapped multiple times or shared between
+enclaves.
+
+But, that presents a problem for kexec()'d kernels (or any other kernel
+that does not run immediately after a hardware reset). This is because
+the last kernel may have been rude and forgotten to reset pages, which
+would trigger the "shared page" sanity check.
+
+To fix this, the SGX code "launders" the pages by running the EREMOVE
+instruction on all pages at boot. This is slow and can take a long
+time, so it is performed off in the SGX-specific ksgxd instead of being
+synchronous at boot. The init code hands the list of pages to launder in
+a per-SGX-section list: ->laundry_list. The only code to touch this list
+is the init code and ksgxd. This means that no locking is necessary for
+->laundry_list.
+
+However, a lock is required for section->page_list, which is accessed
+while creating enclaves and by ksgxd. This lock (section->lock) is
+acquired by ksgxd while also processing ->laundry_list. It is easy to
+confuse the purpose of the locking as being for ->laundry_list and
+->page_list.
+
+Rename ->laundry_list to ->init_laundry_list to make it clear that this
+is not normally used at runtime. Also add some comments clarifying the
+locking, and reorganize 'sgx_epc_section' to put 'lock' near the things
+it protects.
+
+Note: init_laundry_list is 128 bytes of wasted space at runtime. It
+could theoretically be dynamically allocated and then freed after
+the laundering process. But it would take nearly 128 bytes of extra
+instructions to do that.
+
+	Signed-off-by: Jarkko Sakkinen <jarkko@kernel.org>
+	Signed-off-by: Dave Hansen <dave.hansen@linux.intel.com>
+	Signed-off-by: Borislav Petkov <bp@suse.de>
+Link: https://lkml.kernel.org/r/20201116222531.4834-1-dave.hansen@intel.com
+(cherry picked from commit 67655b57f8f59467506463055d9a8398d2836377)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kernel/cpu/sgx/main.c
+#	arch/x86/kernel/cpu/sgx/sgx.h
+diff --cc arch/x86/kernel/cpu/sgx/main.c
+index 38f2e80cc31a,c519fc5f6948..000000000000
+--- a/arch/x86/kernel/cpu/sgx/main.c
++++ b/arch/x86/kernel/cpu/sgx/main.c
+@@@ -47,9 -58,351 +49,9 @@@ static void sgx_sanitize_section(struc
+  		cond_resched();
+  	}
+  
+- 	list_splice(&dirty, &section->laundry_list);
++ 	list_splice(&dirty, &section->init_laundry_list);
+  }
+  
+ -static bool sgx_reclaimer_age(struct sgx_epc_page *epc_page)
+ -{
+ -	struct sgx_encl_page *page = epc_page->owner;
+ -	struct sgx_encl *encl = page->encl;
+ -	struct sgx_encl_mm *encl_mm;
+ -	bool ret = true;
+ -	int idx;
+ -
+ -	idx = srcu_read_lock(&encl->srcu);
+ -
+ -	list_for_each_entry_rcu(encl_mm, &encl->mm_list, list) {
+ -		if (!mmget_not_zero(encl_mm->mm))
+ -			continue;
+ -
+ -		mmap_read_lock(encl_mm->mm);
+ -		ret = !sgx_encl_test_and_clear_young(encl_mm->mm, page);
+ -		mmap_read_unlock(encl_mm->mm);
+ -
+ -		mmput_async(encl_mm->mm);
+ -
+ -		if (!ret)
+ -			break;
+ -	}
+ -
+ -	srcu_read_unlock(&encl->srcu, idx);
+ -
+ -	if (!ret)
+ -		return false;
+ -
+ -	return true;
+ -}
+ -
+ -static void sgx_reclaimer_block(struct sgx_epc_page *epc_page)
+ -{
+ -	struct sgx_encl_page *page = epc_page->owner;
+ -	unsigned long addr = page->desc & PAGE_MASK;
+ -	struct sgx_encl *encl = page->encl;
+ -	unsigned long mm_list_version;
+ -	struct sgx_encl_mm *encl_mm;
+ -	struct vm_area_struct *vma;
+ -	int idx, ret;
+ -
+ -	do {
+ -		mm_list_version = encl->mm_list_version;
+ -
+ -		/* Pairs with smp_rmb() in sgx_encl_mm_add(). */
+ -		smp_rmb();
+ -
+ -		idx = srcu_read_lock(&encl->srcu);
+ -
+ -		list_for_each_entry_rcu(encl_mm, &encl->mm_list, list) {
+ -			if (!mmget_not_zero(encl_mm->mm))
+ -				continue;
+ -
+ -			mmap_read_lock(encl_mm->mm);
+ -
+ -			ret = sgx_encl_find(encl_mm->mm, addr, &vma);
+ -			if (!ret && encl == vma->vm_private_data)
+ -				zap_vma_ptes(vma, addr, PAGE_SIZE);
+ -
+ -			mmap_read_unlock(encl_mm->mm);
+ -
+ -			mmput_async(encl_mm->mm);
+ -		}
+ -
+ -		srcu_read_unlock(&encl->srcu, idx);
+ -	} while (unlikely(encl->mm_list_version != mm_list_version));
+ -
+ -	mutex_lock(&encl->lock);
+ -
+ -	ret = __eblock(sgx_get_epc_virt_addr(epc_page));
+ -	if (encls_failed(ret))
+ -		ENCLS_WARN(ret, "EBLOCK");
+ -
+ -	mutex_unlock(&encl->lock);
+ -}
+ -
+ -static int __sgx_encl_ewb(struct sgx_epc_page *epc_page, void *va_slot,
+ -			  struct sgx_backing *backing)
+ -{
+ -	struct sgx_pageinfo pginfo;
+ -	int ret;
+ -
+ -	pginfo.addr = 0;
+ -	pginfo.secs = 0;
+ -
+ -	pginfo.contents = (unsigned long)kmap_atomic(backing->contents);
+ -	pginfo.metadata = (unsigned long)kmap_atomic(backing->pcmd) +
+ -			  backing->pcmd_offset;
+ -
+ -	ret = __ewb(&pginfo, sgx_get_epc_virt_addr(epc_page), va_slot);
+ -
+ -	kunmap_atomic((void *)(unsigned long)(pginfo.metadata -
+ -					      backing->pcmd_offset));
+ -	kunmap_atomic((void *)(unsigned long)pginfo.contents);
+ -
+ -	return ret;
+ -}
+ -
+ -static void sgx_ipi_cb(void *info)
+ -{
+ -}
+ -
+ -static const cpumask_t *sgx_encl_ewb_cpumask(struct sgx_encl *encl)
+ -{
+ -	cpumask_t *cpumask = &encl->cpumask;
+ -	struct sgx_encl_mm *encl_mm;
+ -	int idx;
+ -
+ -	/*
+ -	 * Can race with sgx_encl_mm_add(), but ETRACK has already been
+ -	 * executed, which means that the CPUs running in the new mm will enter
+ -	 * into the enclave with a fresh epoch.
+ -	 */
+ -	cpumask_clear(cpumask);
+ -
+ -	idx = srcu_read_lock(&encl->srcu);
+ -
+ -	list_for_each_entry_rcu(encl_mm, &encl->mm_list, list) {
+ -		if (!mmget_not_zero(encl_mm->mm))
+ -			continue;
+ -
+ -		cpumask_or(cpumask, cpumask, mm_cpumask(encl_mm->mm));
+ -
+ -		mmput_async(encl_mm->mm);
+ -	}
+ -
+ -	srcu_read_unlock(&encl->srcu, idx);
+ -
+ -	return cpumask;
+ -}
+ -
+ -/*
+ - * Swap page to the regular memory transformed to the blocked state by using
+ - * EBLOCK, which means that it can no loger be referenced (no new TLB entries).
+ - *
+ - * The first trial just tries to write the page assuming that some other thread
+ - * has reset the count for threads inside the enlave by using ETRACK, and
+ - * previous thread count has been zeroed out. The second trial calls ETRACK
+ - * before EWB. If that fails we kick all the HW threads out, and then do EWB,
+ - * which should be guaranteed the succeed.
+ - */
+ -static void sgx_encl_ewb(struct sgx_epc_page *epc_page,
+ -			 struct sgx_backing *backing)
+ -{
+ -	struct sgx_encl_page *encl_page = epc_page->owner;
+ -	struct sgx_encl *encl = encl_page->encl;
+ -	struct sgx_va_page *va_page;
+ -	unsigned int va_offset;
+ -	void *va_slot;
+ -	int ret;
+ -
+ -	encl_page->desc &= ~SGX_ENCL_PAGE_BEING_RECLAIMED;
+ -
+ -	va_page = list_first_entry(&encl->va_pages, struct sgx_va_page,
+ -				   list);
+ -	va_offset = sgx_alloc_va_slot(va_page);
+ -	va_slot = sgx_get_epc_virt_addr(va_page->epc_page) + va_offset;
+ -	if (sgx_va_page_full(va_page))
+ -		list_move_tail(&va_page->list, &encl->va_pages);
+ -
+ -	ret = __sgx_encl_ewb(epc_page, va_slot, backing);
+ -	if (ret == SGX_NOT_TRACKED) {
+ -		ret = __etrack(sgx_get_epc_virt_addr(encl->secs.epc_page));
+ -		if (ret) {
+ -			if (encls_failed(ret))
+ -				ENCLS_WARN(ret, "ETRACK");
+ -		}
+ -
+ -		ret = __sgx_encl_ewb(epc_page, va_slot, backing);
+ -		if (ret == SGX_NOT_TRACKED) {
+ -			/*
+ -			 * Slow path, send IPIs to kick cpus out of the
+ -			 * enclave.  Note, it's imperative that the cpu
+ -			 * mask is generated *after* ETRACK, else we'll
+ -			 * miss cpus that entered the enclave between
+ -			 * generating the mask and incrementing epoch.
+ -			 */
+ -			on_each_cpu_mask(sgx_encl_ewb_cpumask(encl),
+ -					 sgx_ipi_cb, NULL, 1);
+ -			ret = __sgx_encl_ewb(epc_page, va_slot, backing);
+ -		}
+ -	}
+ -
+ -	if (ret) {
+ -		if (encls_failed(ret))
+ -			ENCLS_WARN(ret, "EWB");
+ -
+ -		sgx_free_va_slot(va_page, va_offset);
+ -	} else {
+ -		encl_page->desc |= va_offset;
+ -		encl_page->va_page = va_page;
+ -	}
+ -}
+ -
+ -static void sgx_reclaimer_write(struct sgx_epc_page *epc_page,
+ -				struct sgx_backing *backing)
+ -{
+ -	struct sgx_encl_page *encl_page = epc_page->owner;
+ -	struct sgx_encl *encl = encl_page->encl;
+ -	struct sgx_backing secs_backing;
+ -	int ret;
+ -
+ -	mutex_lock(&encl->lock);
+ -
+ -	sgx_encl_ewb(epc_page, backing);
+ -	encl_page->epc_page = NULL;
+ -	encl->secs_child_cnt--;
+ -
+ -	if (!encl->secs_child_cnt && test_bit(SGX_ENCL_INITIALIZED, &encl->flags)) {
+ -		ret = sgx_encl_get_backing(encl, PFN_DOWN(encl->size),
+ -					   &secs_backing);
+ -		if (ret)
+ -			goto out;
+ -
+ -		sgx_encl_ewb(encl->secs.epc_page, &secs_backing);
+ -
+ -		sgx_free_epc_page(encl->secs.epc_page);
+ -		encl->secs.epc_page = NULL;
+ -
+ -		sgx_encl_put_backing(&secs_backing, true);
+ -	}
+ -
+ -out:
+ -	mutex_unlock(&encl->lock);
+ -}
+ -
+ -/*
+ - * Take a fixed number of pages from the head of the active page pool and
+ - * reclaim them to the enclave's private shmem files. Skip the pages, which have
+ - * been accessed since the last scan. Move those pages to the tail of active
+ - * page pool so that the pages get scanned in LRU like fashion.
+ - *
+ - * Batch process a chunk of pages (at the moment 16) in order to degrade amount
+ - * of IPI's and ETRACK's potentially required. sgx_encl_ewb() does degrade a bit
+ - * among the HW threads with three stage EWB pipeline (EWB, ETRACK + EWB and IPI
+ - * + EWB) but not sufficiently. Reclaiming one page at a time would also be
+ - * problematic as it would increase the lock contention too much, which would
+ - * halt forward progress.
+ - */
+ -static void sgx_reclaim_pages(void)
+ -{
+ -	struct sgx_epc_page *chunk[SGX_NR_TO_SCAN];
+ -	struct sgx_backing backing[SGX_NR_TO_SCAN];
+ -	struct sgx_epc_section *section;
+ -	struct sgx_encl_page *encl_page;
+ -	struct sgx_epc_page *epc_page;
+ -	pgoff_t page_index;
+ -	int cnt = 0;
+ -	int ret;
+ -	int i;
+ -
+ -	spin_lock(&sgx_reclaimer_lock);
+ -	for (i = 0; i < SGX_NR_TO_SCAN; i++) {
+ -		if (list_empty(&sgx_active_page_list))
+ -			break;
+ -
+ -		epc_page = list_first_entry(&sgx_active_page_list,
+ -					    struct sgx_epc_page, list);
+ -		list_del_init(&epc_page->list);
+ -		encl_page = epc_page->owner;
+ -
+ -		if (kref_get_unless_zero(&encl_page->encl->refcount) != 0)
+ -			chunk[cnt++] = epc_page;
+ -		else
+ -			/* The owner is freeing the page. No need to add the
+ -			 * page back to the list of reclaimable pages.
+ -			 */
+ -			epc_page->flags &= ~SGX_EPC_PAGE_RECLAIMER_TRACKED;
+ -	}
+ -	spin_unlock(&sgx_reclaimer_lock);
+ -
+ -	for (i = 0; i < cnt; i++) {
+ -		epc_page = chunk[i];
+ -		encl_page = epc_page->owner;
+ -
+ -		if (!sgx_reclaimer_age(epc_page))
+ -			goto skip;
+ -
+ -		page_index = PFN_DOWN(encl_page->desc - encl_page->encl->base);
+ -		ret = sgx_encl_get_backing(encl_page->encl, page_index, &backing[i]);
+ -		if (ret)
+ -			goto skip;
+ -
+ -		mutex_lock(&encl_page->encl->lock);
+ -		encl_page->desc |= SGX_ENCL_PAGE_BEING_RECLAIMED;
+ -		mutex_unlock(&encl_page->encl->lock);
+ -		continue;
+ -
+ -skip:
+ -		spin_lock(&sgx_reclaimer_lock);
+ -		list_add_tail(&epc_page->list, &sgx_active_page_list);
+ -		spin_unlock(&sgx_reclaimer_lock);
+ -
+ -		kref_put(&encl_page->encl->refcount, sgx_encl_release);
+ -
+ -		chunk[i] = NULL;
+ -	}
+ -
+ -	for (i = 0; i < cnt; i++) {
+ -		epc_page = chunk[i];
+ -		if (epc_page)
+ -			sgx_reclaimer_block(epc_page);
+ -	}
+ -
+ -	for (i = 0; i < cnt; i++) {
+ -		epc_page = chunk[i];
+ -		if (!epc_page)
+ -			continue;
+ -
+ -		encl_page = epc_page->owner;
+ -		sgx_reclaimer_write(epc_page, &backing[i]);
+ -		sgx_encl_put_backing(&backing[i], true);
+ -
+ -		kref_put(&encl_page->encl->refcount, sgx_encl_release);
+ -		epc_page->flags &= ~SGX_EPC_PAGE_RECLAIMER_TRACKED;
+ -
+ -		section = &sgx_epc_sections[epc_page->section];
+ -		spin_lock(&section->lock);
+ -		list_add_tail(&epc_page->list, &section->page_list);
+ -		section->free_cnt++;
+ -		spin_unlock(&section->lock);
+ -	}
+ -}
+ -
+ -static unsigned long sgx_nr_free_pages(void)
+ -{
+ -	unsigned long cnt = 0;
+ -	int i;
+ -
+ -	for (i = 0; i < sgx_nr_epc_sections; i++)
+ -		cnt += sgx_epc_sections[i].free_cnt;
+ -
+ -	return cnt;
+ -}
+ -
+ -static bool sgx_should_reclaim(unsigned long watermark)
+ -{
+ -	return sgx_nr_free_pages() < watermark &&
+ -	       !list_empty(&sgx_active_page_list);
+ -}
+ -
+  static int ksgxd(void *p)
+  {
+  	int i;
+@@@ -176,9 -641,12 +178,15 @@@ static bool __init sgx_setup_epc_sectio
+  
+  	for (i = 0; i < nr_pages; i++) {
+  		section->pages[i].section = index;
+++<<<<<<< HEAD
+ +		list_add_tail(&section->pages[i].list, &section->laundry_list);
+++=======
++ 		section->pages[i].flags = 0;
++ 		section->pages[i].owner = NULL;
++ 		list_add_tail(&section->pages[i].list, &section->init_laundry_list);
+++>>>>>>> 67655b57f8f5 (x86/sgx: Clarify 'laundry_list' locking)
+  	}
+  
+ -	section->free_cnt = nr_pages;
+  	return true;
+  }
+  
+diff --cc arch/x86/kernel/cpu/sgx/sgx.h
+index bd9dcb1ffcfa,5fa42d143feb..000000000000
+--- a/arch/x86/kernel/cpu/sgx/sgx.h
++++ b/arch/x86/kernel/cpu/sgx/sgx.h
+@@@ -29,10 -40,18 +31,21 @@@ struct sgx_epc_page 
+  struct sgx_epc_section {
+  	unsigned long phys_addr;
+  	void *virt_addr;
+- 	struct list_head page_list;
+- 	struct list_head laundry_list;
+  	struct sgx_epc_page *pages;
+++<<<<<<< HEAD
+++=======
++ 
+++>>>>>>> 67655b57f8f5 (x86/sgx: Clarify 'laundry_list' locking)
+  	spinlock_t lock;
++ 	struct list_head page_list;
++ 	unsigned long free_cnt;
++ 
++ 	/*
++ 	 * Pages which need EREMOVE run on them before they can be
++ 	 * used.  Only safe to be accessed in ksgxd and init code.
++ 	 * Not protected by locks.
++ 	 */
++ 	struct list_head init_laundry_list;
+  };
+  
+  extern struct sgx_epc_section sgx_epc_sections[SGX_MAX_EPC_SECTIONS];
+* Unmerged path arch/x86/kernel/cpu/sgx/main.c
+* Unmerged path arch/x86/kernel/cpu/sgx/sgx.h
