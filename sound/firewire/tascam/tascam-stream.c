@@ -268,13 +268,6 @@ static int begin_session(struct snd_tscm *tscm)
 				  &reg, sizeof(reg), 0);
 }
 
-static void release_resources(struct snd_tscm *tscm)
-{
-	// Release isochronous resources.
-	fw_iso_resources_free(&tscm->tx_resources);
-	fw_iso_resources_free(&tscm->rx_resources);
-}
-
 static int keep_resources(struct snd_tscm *tscm, unsigned int rate,
 			  struct amdtp_stream *stream)
 {
@@ -373,7 +366,8 @@ int snd_tscm_stream_start_duplex(struct snd_tscm *tscm, unsigned int rate)
 		amdtp_stream_stop(&tscm->rx_stream);
 		amdtp_stream_stop(&tscm->tx_stream);
 
-		release_resources(tscm);
+		fw_iso_resources_free(&tscm->tx_resources);
+		fw_iso_resources_free(&tscm->rx_resources);
 	}
 
 	if (!amdtp_stream_running(&tscm->rx_stream)) {
@@ -426,7 +420,9 @@ error:
 	amdtp_stream_stop(&tscm->tx_stream);
 
 	finish_session(tscm);
-	release_resources(tscm);
+
+	fw_iso_resources_free(&tscm->tx_resources);
+	fw_iso_resources_free(&tscm->rx_resources);
 
 	return err;
 }
@@ -440,7 +436,9 @@ void snd_tscm_stream_stop_duplex(struct snd_tscm *tscm)
 	amdtp_stream_stop(&tscm->rx_stream);
 
 	finish_session(tscm);
-	release_resources(tscm);
+
+	fw_iso_resources_free(&tscm->tx_resources);
+	fw_iso_resources_free(&tscm->rx_resources);
 }
 
 void snd_tscm_stream_lock_changed(struct snd_tscm *tscm)
