@@ -1,0 +1,251 @@
+mlxsw: spectrum_acl: assign vregion->region by the newly created region
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-147.el8
+commit-author Jiri Pirko <jiri@mellanox.com>
+commit a86838e46b1dc1f7ecc2eb769ea1966380409025
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-147.el8/a86838e4.failed
+
+Make the vregion->region contain pointer of a new region we migrate to.
+In case of a rollback, it contains the original region.
+
+	Signed-off-by: Jiri Pirko <jiri@mellanox.com>
+	Signed-off-by: Ido Schimmel <idosch@mellanox.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit a86838e46b1dc1f7ecc2eb769ea1966380409025)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/mellanox/mlxsw/spectrum_acl_tcam.c
+diff --cc drivers/net/ethernet/mellanox/mlxsw/spectrum_acl_tcam.c
+index c607c62a43ae,72734ee60a1e..000000000000
+--- a/drivers/net/ethernet/mellanox/mlxsw/spectrum_acl_tcam.c
++++ b/drivers/net/ethernet/mellanox/mlxsw/spectrum_acl_tcam.c
+@@@ -958,6 -1172,221 +958,224 @@@ mlxsw_sp_acl_tcam_ventry_activity_get(s
+  						    ventry->entry, activity);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static int
++ mlxsw_sp_acl_tcam_ventry_migrate(struct mlxsw_sp *mlxsw_sp,
++ 				 struct mlxsw_sp_acl_tcam_ventry *ventry,
++ 				 struct mlxsw_sp_acl_tcam_chunk *chunk2)
++ {
++ 	struct mlxsw_sp_acl_tcam_entry *entry2;
++ 
++ 	/* First check if the entry is not already where we want it to be. */
++ 	if (ventry->entry->chunk == chunk2)
++ 		return 0;
++ 
++ 	entry2 = mlxsw_sp_acl_tcam_entry_create(mlxsw_sp, ventry, chunk2);
++ 	if (IS_ERR(entry2))
++ 		return PTR_ERR(entry2);
++ 	mlxsw_sp_acl_tcam_entry_destroy(mlxsw_sp, ventry->entry);
++ 	ventry->entry = entry2;
++ 	return 0;
++ }
++ 
++ static int
++ mlxsw_sp_acl_tcam_vchunk_migrate_one(struct mlxsw_sp *mlxsw_sp,
++ 				     struct mlxsw_sp_acl_tcam_vchunk *vchunk,
++ 				     struct mlxsw_sp_acl_tcam_region *region,
++ 				     bool this_is_rollback)
++ {
++ 	struct mlxsw_sp_acl_tcam_ventry *ventry;
++ 	struct mlxsw_sp_acl_tcam_chunk *chunk2;
++ 	int err;
++ 	int err2;
++ 
++ 	chunk2 = mlxsw_sp_acl_tcam_chunk_create(mlxsw_sp, vchunk, region);
++ 	if (IS_ERR(chunk2)) {
++ 		if (this_is_rollback)
++ 			vchunk->vregion->failed_rollback = true;
++ 		return PTR_ERR(chunk2);
++ 	}
++ 	vchunk->chunk2 = chunk2;
++ 	list_for_each_entry(ventry, &vchunk->ventry_list, list) {
++ 		err = mlxsw_sp_acl_tcam_ventry_migrate(mlxsw_sp, ventry,
++ 						       vchunk->chunk2);
++ 		if (err) {
++ 			if (this_is_rollback) {
++ 				vchunk->vregion->failed_rollback = true;
++ 				return err;
++ 			}
++ 			goto rollback;
++ 		}
++ 	}
++ 	mlxsw_sp_acl_tcam_chunk_destroy(mlxsw_sp, vchunk->chunk);
++ 	vchunk->chunk = chunk2;
++ 	vchunk->chunk2 = NULL;
++ 	return 0;
++ 
++ rollback:
++ 	/* Migrate the entries back to the original chunk. If some entry
++ 	 * migration fails, there's no good way how to proceed. Set the
++ 	 * vregion with "failed_rollback" flag.
++ 	 */
++ 	list_for_each_entry_continue_reverse(ventry, &vchunk->ventry_list,
++ 					     list) {
++ 		err2 = mlxsw_sp_acl_tcam_ventry_migrate(mlxsw_sp, ventry,
++ 							vchunk->chunk);
++ 		if (err2) {
++ 			vchunk->vregion->failed_rollback = true;
++ 			goto err_rollback;
++ 		}
++ 	}
++ 
++ 	mlxsw_sp_acl_tcam_chunk_destroy(mlxsw_sp, vchunk->chunk2);
++ 	vchunk->chunk2 = NULL;
++ 
++ err_rollback:
++ 	return err;
++ }
++ 
++ static int
++ mlxsw_sp_acl_tcam_vchunk_migrate_all(struct mlxsw_sp *mlxsw_sp,
++ 				     struct mlxsw_sp_acl_tcam_vregion *vregion)
++ {
++ 	struct mlxsw_sp_acl_tcam_vchunk *vchunk;
++ 	int err;
++ 
++ 	list_for_each_entry(vchunk, &vregion->vchunk_list, list) {
++ 		err = mlxsw_sp_acl_tcam_vchunk_migrate_one(mlxsw_sp, vchunk,
++ 							   vregion->region,
++ 							   false);
++ 		if (err)
++ 			goto rollback;
++ 	}
++ 	return 0;
++ 
++ rollback:
++ 	/* In case migration was not successful, we need to swap
++ 	 * so the original region pointer is assigned again to vregion->region.
++ 	 */
++ 	swap(vregion->region, vregion->region2);
++ 	list_for_each_entry_continue_reverse(vchunk, &vregion->vchunk_list,
++ 					     list) {
++ 		mlxsw_sp_acl_tcam_vchunk_migrate_one(mlxsw_sp, vchunk,
++ 						     vregion->region, true);
++ 	}
++ 	return err;
++ }
++ 
++ static int
++ mlxsw_sp_acl_tcam_vregion_migrate(struct mlxsw_sp *mlxsw_sp,
++ 				  struct mlxsw_sp_acl_tcam_vregion *vregion,
++ 				  struct mlxsw_sp_acl_tcam_rehash_ctx *ctx)
++ {
++ 	int err;
++ 
++ 	trace_mlxsw_sp_acl_tcam_vregion_migrate(mlxsw_sp, vregion);
++ 	mutex_lock(&vregion->lock);
++ 	err = mlxsw_sp_acl_tcam_vchunk_migrate_all(mlxsw_sp, vregion);
++ 	mutex_unlock(&vregion->lock);
++ 	trace_mlxsw_sp_acl_tcam_vregion_migrate_end(mlxsw_sp, vregion);
++ 	return err;
++ }
++ 
++ static int
++ mlxsw_sp_acl_tcam_vregion_rehash_start(struct mlxsw_sp *mlxsw_sp,
++ 				       struct mlxsw_sp_acl_tcam_vregion *vregion,
++ 				       struct mlxsw_sp_acl_tcam_rehash_ctx *ctx)
++ {
++ 	const struct mlxsw_sp_acl_tcam_ops *ops = mlxsw_sp->acl_tcam_ops;
++ 	unsigned int priority = mlxsw_sp_acl_tcam_vregion_prio(vregion);
++ 	struct mlxsw_sp_acl_tcam_region *new_region;
++ 	void *hints_priv;
++ 	int err;
++ 
++ 	trace_mlxsw_sp_acl_tcam_vregion_rehash(mlxsw_sp, vregion);
++ 	if (vregion->failed_rollback)
++ 		return -EBUSY;
++ 
++ 	hints_priv = ops->region_rehash_hints_get(vregion->region->priv);
++ 	if (IS_ERR(hints_priv))
++ 		return PTR_ERR(hints_priv);
++ 
++ 	new_region = mlxsw_sp_acl_tcam_region_create(mlxsw_sp, vregion->tcam,
++ 						     vregion, hints_priv);
++ 	if (IS_ERR(new_region)) {
++ 		err = PTR_ERR(new_region);
++ 		goto err_region_create;
++ 	}
++ 
++ 	/* vregion->region contains the pointer to the new region
++ 	 * we are going to migrate to.
++ 	 */
++ 	vregion->region2 = vregion->region;
++ 	vregion->region = new_region;
++ 	err = mlxsw_sp_acl_tcam_group_region_attach(mlxsw_sp,
++ 						    vregion->region2->group,
++ 						    new_region, priority,
++ 						    vregion->region2);
++ 	if (err)
++ 		goto err_group_region_attach;
++ 
++ 	ctx->hints_priv = hints_priv;
++ 
++ 	return 0;
++ 
++ err_group_region_attach:
++ 	vregion->region = vregion->region2;
++ 	vregion->region2 = NULL;
++ 	mlxsw_sp_acl_tcam_region_destroy(mlxsw_sp, new_region);
++ err_region_create:
++ 	ops->region_rehash_hints_put(hints_priv);
++ 	return err;
++ }
++ 
++ static void
++ mlxsw_sp_acl_tcam_vregion_rehash_end(struct mlxsw_sp *mlxsw_sp,
++ 				     struct mlxsw_sp_acl_tcam_vregion *vregion,
++ 				     struct mlxsw_sp_acl_tcam_rehash_ctx *ctx)
++ {
++ 	struct mlxsw_sp_acl_tcam_region *unused_region = vregion->region2;
++ 	const struct mlxsw_sp_acl_tcam_ops *ops = mlxsw_sp->acl_tcam_ops;
++ 
++ 	if (!vregion->failed_rollback) {
++ 		vregion->region2 = NULL;
++ 		mlxsw_sp_acl_tcam_group_region_detach(mlxsw_sp, unused_region);
++ 		mlxsw_sp_acl_tcam_region_destroy(mlxsw_sp, unused_region);
++ 	}
++ 	ops->region_rehash_hints_put(ctx->hints_priv);
++ 	ctx->hints_priv = NULL;
++ }
++ 
++ static int
++ mlxsw_sp_acl_tcam_vregion_rehash(struct mlxsw_sp *mlxsw_sp,
++ 				 struct mlxsw_sp_acl_tcam_vregion *vregion)
++ {
++ 	struct mlxsw_sp_acl_tcam_rehash_ctx *ctx = &vregion->rehash.ctx;
++ 	int err;
++ 
++ 	err = mlxsw_sp_acl_tcam_vregion_rehash_start(mlxsw_sp, vregion, ctx);
++ 	if (err) {
++ 		if (err != -EAGAIN)
++ 			dev_err(mlxsw_sp->bus_info->dev, "Failed get rehash hints\n");
++ 		return err;
++ 	}
++ 
++ 	err = mlxsw_sp_acl_tcam_vregion_migrate(mlxsw_sp, vregion, ctx);
++ 	if (err) {
++ 		dev_err(mlxsw_sp->bus_info->dev, "Failed to migrate vregion\n");
++ 		if (vregion->failed_rollback) {
++ 			trace_mlxsw_sp_acl_tcam_vregion_rehash_dis(mlxsw_sp,
++ 								   vregion);
++ 			dev_err(mlxsw_sp->bus_info->dev, "Failed to rollback during vregion migration fail\n");
++ 		}
++ 	}
++ 
++ 	mlxsw_sp_acl_tcam_vregion_rehash_end(mlxsw_sp, vregion, ctx);
++ 	return err;
++ }
++ 
+++>>>>>>> a86838e46b1d (mlxsw: spectrum_acl: assign vregion->region by the newly created region)
+  static const enum mlxsw_afk_element mlxsw_sp_acl_tcam_pattern_ipv4[] = {
+  	MLXSW_AFK_ELEMENT_SRC_SYS_PORT,
+  	MLXSW_AFK_ELEMENT_DMAC_32_47,
+* Unmerged path drivers/net/ethernet/mellanox/mlxsw/spectrum_acl_tcam.c
