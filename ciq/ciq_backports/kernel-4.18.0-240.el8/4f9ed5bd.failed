@@ -1,0 +1,197 @@
+Bluetooth: hci_qca: Not send vendor pre-shutdown command for QCA Rome
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Rocky Liao <rjliao@codeaurora.org>
+commit 4f9ed5bd63dc16d061cdeb00eeff9d56e86a6beb
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/4f9ed5bd.failed
+
+QCA Rome doesn't support the pre-shutdown vendor hci command, this patch
+will check the soc type in qca_power_off() and only send this command
+for wcn399x.
+
+Fixes: ae563183b647 ("Bluetooth: hci_qca: Enable power off/on support during hci down/up for QCA Rome")
+	Signed-off-by: Rocky Liao <rjliao@codeaurora.org>
+	Signed-off-by: Marcel Holtmann <marcel@holtmann.org>
+(cherry picked from commit 4f9ed5bd63dc16d061cdeb00eeff9d56e86a6beb)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/bluetooth/hci_qca.c
+diff --cc drivers/bluetooth/hci_qca.c
+index c7723b08787d,bf436d6e638e..000000000000
+--- a/drivers/bluetooth/hci_qca.c
++++ b/drivers/bluetooth/hci_qca.c
+@@@ -988,6 -1686,166 +988,169 @@@ static const struct hci_uart_proto qca_
+  	.dequeue	= qca_dequeue,
+  };
+  
+++<<<<<<< HEAD
+++=======
++ static const struct qca_vreg_data qca_soc_data_wcn3990 = {
++ 	.soc_type = QCA_WCN3990,
++ 	.vregs = (struct qca_vreg []) {
++ 		{ "vddio", 15000  },
++ 		{ "vddxo", 80000  },
++ 		{ "vddrf", 300000 },
++ 		{ "vddch0", 450000 },
++ 	},
++ 	.num_vregs = 4,
++ };
++ 
++ static const struct qca_vreg_data qca_soc_data_wcn3991 = {
++ 	.soc_type = QCA_WCN3991,
++ 	.vregs = (struct qca_vreg []) {
++ 		{ "vddio", 15000  },
++ 		{ "vddxo", 80000  },
++ 		{ "vddrf", 300000 },
++ 		{ "vddch0", 450000 },
++ 	},
++ 	.num_vregs = 4,
++ };
++ 
++ static const struct qca_vreg_data qca_soc_data_wcn3998 = {
++ 	.soc_type = QCA_WCN3998,
++ 	.vregs = (struct qca_vreg []) {
++ 		{ "vddio", 10000  },
++ 		{ "vddxo", 80000  },
++ 		{ "vddrf", 300000 },
++ 		{ "vddch0", 450000 },
++ 	},
++ 	.num_vregs = 4,
++ };
++ 
++ static void qca_power_shutdown(struct hci_uart *hu)
++ {
++ 	struct qca_serdev *qcadev;
++ 	struct qca_data *qca = hu->priv;
++ 	unsigned long flags;
++ 	enum qca_btsoc_type soc_type = qca_soc_type(hu);
++ 
++ 	qcadev = serdev_device_get_drvdata(hu->serdev);
++ 
++ 	/* From this point we go into power off state. But serial port is
++ 	 * still open, stop queueing the IBS data and flush all the buffered
++ 	 * data in skb's.
++ 	 */
++ 	spin_lock_irqsave(&qca->hci_ibs_lock, flags);
++ 	clear_bit(QCA_IBS_ENABLED, &qca->flags);
++ 	qca_flush(hu);
++ 	spin_unlock_irqrestore(&qca->hci_ibs_lock, flags);
++ 
++ 	hu->hdev->hw_error = NULL;
++ 	hu->hdev->cmd_timeout = NULL;
++ 
++ 	/* Non-serdev device usually is powered by external power
++ 	 * and don't need additional action in driver for power down
++ 	 */
++ 	if (!hu->serdev)
++ 		return;
++ 
++ 	if (qca_is_wcn399x(soc_type)) {
++ 		host_set_baudrate(hu, 2400);
++ 		qca_send_power_pulse(hu, false);
++ 		qca_regulator_disable(qcadev);
++ 	} else {
++ 		gpiod_set_value_cansleep(qcadev->bt_en, 0);
++ 	}
++ }
++ 
++ static int qca_power_off(struct hci_dev *hdev)
++ {
++ 	struct hci_uart *hu = hci_get_drvdata(hdev);
++ 	struct qca_data *qca = hu->priv;
++ 	enum qca_btsoc_type soc_type = qca_soc_type(hu);
++ 
++ 	/* Stop sending shutdown command if soc crashes. */
++ 	if (qca_is_wcn399x(soc_type)
++ 		&& qca->memdump_state == QCA_MEMDUMP_IDLE) {
++ 		qca_send_pre_shutdown_cmd(hdev);
++ 		usleep_range(8000, 10000);
++ 	}
++ 
++ 	qca->memdump_state = QCA_MEMDUMP_IDLE;
++ 	qca_power_shutdown(hu);
++ 	return 0;
++ }
++ 
++ static int qca_regulator_enable(struct qca_serdev *qcadev)
++ {
++ 	struct qca_power *power = qcadev->bt_power;
++ 	int ret;
++ 
++ 	/* Already enabled */
++ 	if (power->vregs_on)
++ 		return 0;
++ 
++ 	BT_DBG("enabling %d regulators)", power->num_vregs);
++ 
++ 	ret = regulator_bulk_enable(power->num_vregs, power->vreg_bulk);
++ 	if (ret)
++ 		return ret;
++ 
++ 	power->vregs_on = true;
++ 
++ 	ret = clk_prepare_enable(qcadev->susclk);
++ 	if (ret)
++ 		qca_regulator_disable(qcadev);
++ 
++ 	return ret;
++ }
++ 
++ static void qca_regulator_disable(struct qca_serdev *qcadev)
++ {
++ 	struct qca_power *power;
++ 
++ 	if (!qcadev)
++ 		return;
++ 
++ 	power = qcadev->bt_power;
++ 
++ 	/* Already disabled? */
++ 	if (!power->vregs_on)
++ 		return;
++ 
++ 	regulator_bulk_disable(power->num_vregs, power->vreg_bulk);
++ 	power->vregs_on = false;
++ 
++ 	clk_disable_unprepare(qcadev->susclk);
++ }
++ 
++ static int qca_init_regulators(struct qca_power *qca,
++ 				const struct qca_vreg *vregs, size_t num_vregs)
++ {
++ 	struct regulator_bulk_data *bulk;
++ 	int ret;
++ 	int i;
++ 
++ 	bulk = devm_kcalloc(qca->dev, num_vregs, sizeof(*bulk), GFP_KERNEL);
++ 	if (!bulk)
++ 		return -ENOMEM;
++ 
++ 	for (i = 0; i < num_vregs; i++)
++ 		bulk[i].supply = vregs[i].name;
++ 
++ 	ret = devm_regulator_bulk_get(qca->dev, num_vregs, bulk);
++ 	if (ret < 0)
++ 		return ret;
++ 
++ 	for (i = 0; i < num_vregs; i++) {
++ 		ret = regulator_set_load(bulk[i].consumer, vregs[i].load_uA);
++ 		if (ret)
++ 			return ret;
++ 	}
++ 
++ 	qca->vreg_bulk = bulk;
++ 	qca->num_vregs = num_vregs;
++ 
++ 	return 0;
++ }
++ 
+++>>>>>>> 4f9ed5bd63dc (Bluetooth: hci_qca: Not send vendor pre-shutdown command for QCA Rome)
+  static int qca_serdev_probe(struct serdev_device *serdev)
+  {
+  	struct qca_serdev *qcadev;
+* Unmerged path drivers/bluetooth/hci_qca.c
