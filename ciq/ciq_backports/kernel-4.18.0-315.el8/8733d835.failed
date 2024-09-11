@@ -1,0 +1,112 @@
+ath11k: htc: implement suspend handling
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-315.el8
+commit-author Carl Huang <cjhuang@codeaurora.org>
+commit 8733d835ec433b8ba85c90761003437a8f4c1d4e
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-315.el8/8733d835.failed
+
+When ath11k sends suspend command to firmware, firmware will
+return suspend_complete events and add handlers for those.
+
+Tested-on: QCA6390 hw2.0 PCI WLAN.HST.1.0.1-01740-QCAHSTSWPLZ_V2_TO_X86-1
+
+	Signed-off-by: Carl Huang <cjhuang@codeaurora.org>
+	Signed-off-by: Kalle Valo <kvalo@codeaurora.org>
+Link: https://lore.kernel.org/r/1607708150-21066-6-git-send-email-kvalo@codeaurora.org
+(cherry picked from commit 8733d835ec433b8ba85c90761003437a8f4c1d4e)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/wireless/ath/ath11k/core.h
+diff --cc drivers/net/wireless/ath/ath11k/core.h
+index 3b78b6425a3d,689aa24fe28f..000000000000
+--- a/drivers/net/wireless/ath/ath11k/core.h
++++ b/drivers/net/wireless/ath/ath11k/core.h
+@@@ -729,6 -732,10 +730,13 @@@ struct ath11k_base 
+  	struct ath11k_dbring_cap *db_caps;
+  	u32 num_db_cap;
+  
+++<<<<<<< HEAD
+++=======
++ 	struct timer_list mon_reap_timer;
++ 
++ 	struct completion htc_suspend;
++ 
+++>>>>>>> 8733d835ec43 (ath11k: htc: implement suspend handling)
+  	/* must be last */
+  	u8 drv_priv[0] __aligned(sizeof(void *));
+  };
+diff --git a/drivers/net/wireless/ath/ath11k/core.c b/drivers/net/wireless/ath/ath11k/core.c
+index 3c28e7ad7d51..1c2789ce6239 100644
+--- a/drivers/net/wireless/ath/ath11k/core.c
++++ b/drivers/net/wireless/ath/ath11k/core.c
+@@ -968,6 +968,8 @@ struct ath11k_base *ath11k_core_alloc(struct device *dev, size_t priv_size,
+ 	init_waitqueue_head(&ab->qmi.cold_boot_waitq);
+ 	INIT_WORK(&ab->restart_work, ath11k_core_restart);
+ 	timer_setup(&ab->rx_replenish_retry, ath11k_ce_rx_replenish_retry, 0);
++	init_completion(&ab->htc_suspend);
++
+ 	ab->dev = dev;
+ 	ab->bus_params = *bus_params;
+ 	ab->hif.bus = bus;
+* Unmerged path drivers/net/wireless/ath/ath11k/core.h
+diff --git a/drivers/net/wireless/ath/ath11k/htc.c b/drivers/net/wireless/ath/ath11k/htc.c
+index 6b57dc273e0b..059b48ded5cc 100644
+--- a/drivers/net/wireless/ath/ath11k/htc.c
++++ b/drivers/net/wireless/ath/ath11k/htc.c
+@@ -231,6 +231,18 @@ static int ath11k_htc_process_trailer(struct ath11k_htc *htc,
+ 	return status;
+ }
+ 
++static void ath11k_htc_suspend_complete(struct ath11k_base *ab, bool ack)
++{
++	ath11k_dbg(ab, ATH11K_DBG_BOOT, "boot suspend complete %d\n", ack);
++
++	if (ack)
++		set_bit(ATH11K_FLAG_HTC_SUSPEND_COMPLETE, &ab->dev_flags);
++	else
++		clear_bit(ATH11K_FLAG_HTC_SUSPEND_COMPLETE, &ab->dev_flags);
++
++	complete(&ab->htc_suspend);
++}
++
+ void ath11k_htc_rx_completion_handler(struct ath11k_base *ab,
+ 				      struct sk_buff *skb)
+ {
+@@ -328,8 +340,17 @@ void ath11k_htc_rx_completion_handler(struct ath11k_base *ab,
+ 
+ 			complete(&htc->ctl_resp);
+ 			break;
++		case ATH11K_HTC_MSG_SEND_SUSPEND_COMPLETE:
++			ath11k_htc_suspend_complete(ab, true);
++			break;
++		case ATH11K_HTC_MSG_NACK_SUSPEND:
++			ath11k_htc_suspend_complete(ab, false);
++			break;
++		case ATH11K_HTC_MSG_WAKEUP_FROM_SUSPEND_ID:
++			break;
+ 		default:
+-			ath11k_warn(ab, "ignoring unsolicited htc ep0 event\n");
++			ath11k_warn(ab, "ignoring unsolicited htc ep0 event %ld\n",
++				    FIELD_GET(HTC_MSG_MESSAGEID, msg->msg_svc_id));
+ 			break;
+ 		}
+ 		goto out;
+diff --git a/drivers/net/wireless/ath/ath11k/htc.h b/drivers/net/wireless/ath/ath11k/htc.h
+index 848147cf81ee..6c8a469d7f9d 100644
+--- a/drivers/net/wireless/ath/ath11k/htc.h
++++ b/drivers/net/wireless/ath/ath11k/htc.h
+@@ -65,7 +65,9 @@ enum ath11k_htc_msg_id {
+ 	ATH11K_HTC_MSG_CONNECT_SERVICE_RESP_ID = 3,
+ 	ATH11K_HTC_MSG_SETUP_COMPLETE_ID       = 4,
+ 	ATH11K_HTC_MSG_SETUP_COMPLETE_EX_ID    = 5,
+-	ATH11K_HTC_MSG_SEND_SUSPEND_COMPLETE   = 6
++	ATH11K_HTC_MSG_SEND_SUSPEND_COMPLETE   = 6,
++	ATH11K_HTC_MSG_NACK_SUSPEND	       = 7,
++	ATH11K_HTC_MSG_WAKEUP_FROM_SUSPEND_ID  = 8,
+ };
+ 
+ enum ath11k_htc_version {
