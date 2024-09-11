@@ -1,0 +1,337 @@
+net/mlx5: Split irq_pool_affinity logic to new file
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-448.el8
+commit-author Shay Drory <shayd@nvidia.com>
+commit 424544df97b0197b1d87d2fd1c18c6b936aa02b1
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-448.el8/424544df.failed
+
+The downstream patches add more functionality to irq_pool_affinity.
+Move the irq_pool_affinity logic to a new file in order to ease the
+coding and maintenance of it.
+
+	Signed-off-by: Shay Drory <shayd@nvidia.com>
+	Reviewed-by: Moshe Shemesh <moshe@nvidia.com>
+	Signed-off-by: Saeed Mahameed <saeedm@nvidia.com>
+(cherry picked from commit 424544df97b0197b1d87d2fd1c18c6b936aa02b1)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/mellanox/mlx5/core/pci_irq.c
+diff --cc drivers/net/ethernet/mellanox/mlx5/core/pci_irq.c
+index 4a06fb0b287d,496826a7a88b..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx5/core/pci_irq.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/pci_irq.c
+@@@ -163,6 -150,31 +149,34 @@@ static void irq_put(struct mlx5_irq *ir
+  	mutex_unlock(&pool->lock);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ int mlx5_irq_read_locked(struct mlx5_irq *irq)
++ {
++ 	lockdep_assert_held(&irq->pool->lock);
++ 	return irq->refcount;
++ }
++ 
++ int mlx5_irq_get_locked(struct mlx5_irq *irq)
++ {
++ 	lockdep_assert_held(&irq->pool->lock);
++ 	if (WARN_ON_ONCE(!irq->refcount))
++ 		return 0;
++ 	irq->refcount++;
++ 	return 1;
++ }
++ 
++ static int irq_get(struct mlx5_irq *irq)
++ {
++ 	int err;
++ 
++ 	mutex_lock(&irq->pool->lock);
++ 	err = mlx5_irq_get_locked(irq);
++ 	mutex_unlock(&irq->pool->lock);
++ 	return err;
++ }
++ 
+++>>>>>>> 424544df97b0 (net/mlx5: Split irq_pool_affinity logic to new file)
+  static irqreturn_t irq_int_handler(int irq, void *nh)
+  {
+  	atomic_notifier_call_chain(nh, 0, NULL);
+@@@ -286,80 -298,6 +300,83 @@@ int mlx5_irq_get_index(struct mlx5_irq 
+  
+  /* irq_pool API */
+  
+++<<<<<<< HEAD
+ +/* creating an irq from irq_pool */
+ +static struct mlx5_irq *irq_pool_create_irq(struct mlx5_irq_pool *pool,
+ +					    struct cpumask *affinity)
+ +{
+ +	u32 irq_index;
+ +	int err;
+ +
+ +	err = xa_alloc(&pool->irqs, &irq_index, NULL, pool->xa_num_irqs,
+ +		       GFP_KERNEL);
+ +	if (err)
+ +		return ERR_PTR(err);
+ +	return irq_request(pool, irq_index, affinity);
+ +}
+ +
+ +/* looking for the irq with the smallest refcount and the same affinity */
+ +static struct mlx5_irq *irq_pool_find_least_loaded(struct mlx5_irq_pool *pool,
+ +						   struct cpumask *affinity)
+ +{
+ +	int start = pool->xa_num_irqs.min;
+ +	int end = pool->xa_num_irqs.max;
+ +	struct mlx5_irq *irq = NULL;
+ +	struct mlx5_irq *iter;
+ +	unsigned long index;
+ +
+ +	lockdep_assert_held(&pool->lock);
+ +	xa_for_each_range(&pool->irqs, index, iter, start, end) {
+ +		if (!cpumask_equal(iter->mask, affinity))
+ +			continue;
+ +		if (kref_read(&iter->kref) < pool->min_threshold)
+ +			return iter;
+ +		if (!irq || kref_read(&iter->kref) <
+ +		    kref_read(&irq->kref))
+ +			irq = iter;
+ +	}
+ +	return irq;
+ +}
+ +
+ +/* requesting an irq from a given pool according to given affinity */
+ +static struct mlx5_irq *irq_pool_request_affinity(struct mlx5_irq_pool *pool,
+ +						  struct cpumask *affinity)
+ +{
+ +	struct mlx5_irq *least_loaded_irq, *new_irq;
+ +
+ +	mutex_lock(&pool->lock);
+ +	least_loaded_irq = irq_pool_find_least_loaded(pool, affinity);
+ +	if (least_loaded_irq &&
+ +	    kref_read(&least_loaded_irq->kref) < pool->min_threshold)
+ +		goto out;
+ +	new_irq = irq_pool_create_irq(pool, affinity);
+ +	if (IS_ERR(new_irq)) {
+ +		if (!least_loaded_irq) {
+ +			mlx5_core_err(pool->dev, "Didn't find a matching IRQ. err = %ld\n",
+ +				      PTR_ERR(new_irq));
+ +			mutex_unlock(&pool->lock);
+ +			return new_irq;
+ +		}
+ +		/* We failed to create a new IRQ for the requested affinity,
+ +		 * sharing existing IRQ.
+ +		 */
+ +		goto out;
+ +	}
+ +	least_loaded_irq = new_irq;
+ +	goto unlock;
+ +out:
+ +	kref_get(&least_loaded_irq->kref);
+ +	if (kref_read(&least_loaded_irq->kref) > pool->max_threshold)
+ +		mlx5_core_dbg(pool->dev, "IRQ %u overloaded, pool_name: %s, %u EQs on this irq\n",
+ +			      least_loaded_irq->irqn, pool->name,
+ +			      kref_read(&least_loaded_irq->kref) / MLX5_EQ_REFS_PER_IRQ);
+ +unlock:
+ +	mutex_unlock(&pool->lock);
+ +	return least_loaded_irq;
+ +}
+ +
+++=======
+++>>>>>>> 424544df97b0 (net/mlx5: Split irq_pool_affinity logic to new file)
+  /* requesting an irq from a given pool according to given index */
+  static struct mlx5_irq *
+  irq_pool_request_vector(struct mlx5_irq_pool *pool, int vecidx,
+@@@ -370,10 -308,10 +387,14 @@@
+  	mutex_lock(&pool->lock);
+  	irq = xa_load(&pool->irqs, vecidx);
+  	if (irq) {
+++<<<<<<< HEAD
+ +		kref_get(&irq->kref);
+++=======
++ 		mlx5_irq_get_locked(irq);
+++>>>>>>> 424544df97b0 (net/mlx5: Split irq_pool_affinity logic to new file)
+  		goto unlock;
+  	}
+- 	irq = irq_request(pool, vecidx, affinity);
++ 	irq = mlx5_irq_alloc(pool, vecidx, affinity);
+  unlock:
+  	mutex_unlock(&pool->lock);
+  	return irq;
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/Makefile b/drivers/net/ethernet/mellanox/mlx5/core/Makefile
+index 7ad3b9a2a46b..d388e157802e 100644
+--- a/drivers/net/ethernet/mellanox/mlx5/core/Makefile
++++ b/drivers/net/ethernet/mellanox/mlx5/core/Makefile
+@@ -100,7 +100,7 @@ mlx5_core-$(CONFIG_MLX5_SW_STEERING) += steering/dr_domain.o steering/dr_table.o
+ #
+ # SF device
+ #
+-mlx5_core-$(CONFIG_MLX5_SF) += sf/vhca_event.o sf/dev/dev.o sf/dev/driver.o
++mlx5_core-$(CONFIG_MLX5_SF) += sf/vhca_event.o sf/dev/dev.o sf/dev/driver.o irq_affinity.o
+ 
+ #
+ # SF manager
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/irq_affinity.c b/drivers/net/ethernet/mellanox/mlx5/core/irq_affinity.c
+new file mode 100644
+index 000000000000..4ff0af0fc58a
+--- /dev/null
++++ b/drivers/net/ethernet/mellanox/mlx5/core/irq_affinity.c
+@@ -0,0 +1,99 @@
++// SPDX-License-Identifier: GPL-2.0 OR Linux-OpenIB
++/* Copyright (c) 2021, NVIDIA CORPORATION & AFFILIATES. All rights reserved. */
++
++#include "mlx5_core.h"
++#include "mlx5_irq.h"
++#include "pci_irq.h"
++
++/* Creating an IRQ from irq_pool */
++static struct mlx5_irq *
++irq_pool_request_irq(struct mlx5_irq_pool *pool, const struct cpumask *req_mask)
++{
++	u32 irq_index;
++	int err;
++
++	err = xa_alloc(&pool->irqs, &irq_index, NULL, pool->xa_num_irqs,
++		       GFP_KERNEL);
++	if (err)
++		return ERR_PTR(err);
++	return mlx5_irq_alloc(pool, irq_index, req_mask);
++}
++
++/* Looking for the IRQ with the smallest refcount and the same mask */
++static struct mlx5_irq *
++irq_pool_find_least_loaded(struct mlx5_irq_pool *pool, const struct cpumask *req_mask)
++{
++	int start = pool->xa_num_irqs.min;
++	int end = pool->xa_num_irqs.max;
++	struct mlx5_irq *irq = NULL;
++	struct mlx5_irq *iter;
++	int irq_refcount = 0;
++	unsigned long index;
++
++	lockdep_assert_held(&pool->lock);
++	xa_for_each_range(&pool->irqs, index, iter, start, end) {
++		struct cpumask *iter_mask = mlx5_irq_get_affinity_mask(iter);
++		int iter_refcount = mlx5_irq_read_locked(iter);
++
++		if (!cpumask_equal(iter_mask, req_mask))
++			/* If a user request a mask, skip IRQs that's aren't a match */
++			continue;
++		if (iter_refcount < pool->min_threshold)
++			/* If we found an IRQ with less than min_thres, return it */
++			return iter;
++		if (!irq || iter_refcount < irq_refcount) {
++			/* In case we won't find an IRQ with less than min_thres,
++			 * keep a pointer to the least used IRQ
++			 */
++			irq_refcount = iter_refcount;
++			irq = iter;
++		}
++	}
++	return irq;
++}
++
++/**
++ * mlx5_irq_affinity_request - request an IRQ according to the given mask.
++ * @pool: IRQ pool to request from.
++ * @req_mask: cpumask requested for this IRQ.
++ *
++ * This function returns a pointer to IRQ, or ERR_PTR in case of error.
++ */
++struct mlx5_irq *
++mlx5_irq_affinity_request(struct mlx5_irq_pool *pool, const struct cpumask *req_mask)
++{
++	struct mlx5_irq *least_loaded_irq, *new_irq;
++
++	mutex_lock(&pool->lock);
++	least_loaded_irq = irq_pool_find_least_loaded(pool, req_mask);
++	if (least_loaded_irq &&
++	    mlx5_irq_read_locked(least_loaded_irq) < pool->min_threshold)
++		goto out;
++	/* We didn't find an IRQ with less than min_thres, try to allocate a new IRQ */
++	new_irq = irq_pool_request_irq(pool, req_mask);
++	if (IS_ERR(new_irq)) {
++		if (!least_loaded_irq) {
++			/* We failed to create an IRQ and we didn't find an IRQ */
++			mlx5_core_err(pool->dev, "Didn't find a matching IRQ. err = %ld\n",
++				      PTR_ERR(new_irq));
++			mutex_unlock(&pool->lock);
++			return new_irq;
++		}
++		/* We failed to create a new IRQ for the requested affinity,
++		 * sharing existing IRQ.
++		 */
++		goto out;
++	}
++	least_loaded_irq = new_irq;
++	goto unlock;
++out:
++	mlx5_irq_get_locked(least_loaded_irq);
++	if (mlx5_irq_read_locked(least_loaded_irq) > pool->max_threshold)
++		mlx5_core_dbg(pool->dev, "IRQ %u overloaded, pool_name: %s, %u EQs on this irq\n",
++			      pci_irq_vector(pool->dev->pdev,
++					     mlx5_irq_get_index(least_loaded_irq)), pool->name,
++			      mlx5_irq_read_locked(least_loaded_irq) / MLX5_EQ_REFS_PER_IRQ);
++unlock:
++	mutex_unlock(&pool->lock);
++	return least_loaded_irq;
++}
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/mlx5_irq.h b/drivers/net/ethernet/mellanox/mlx5/core/mlx5_irq.h
+index 7028e4b43837..db58f5e3f457 100644
+--- a/drivers/net/ethernet/mellanox/mlx5/core/mlx5_irq.h
++++ b/drivers/net/ethernet/mellanox/mlx5/core/mlx5_irq.h
+@@ -31,4 +31,15 @@ int mlx5_irq_detach_nb(struct mlx5_irq *irq, struct notifier_block *nb);
+ struct cpumask *mlx5_irq_get_affinity_mask(struct mlx5_irq *irq);
+ int mlx5_irq_get_index(struct mlx5_irq *irq);
+ 
++struct mlx5_irq_pool;
++#ifdef CONFIG_MLX5_SF
++struct mlx5_irq *mlx5_irq_affinity_request(struct mlx5_irq_pool *pool,
++					   const struct cpumask *req_mask);
++#else
++static inline struct mlx5_irq *
++mlx5_irq_affinity_request(struct mlx5_irq_pool *pool, const struct cpumask *req_mask)
++{
++	return ERR_PTR(-EOPNOTSUPP);
++}
++#endif
+ #endif /* __MLX5_IRQ_H__ */
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/pci_irq.c
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/pci_irq.h b/drivers/net/ethernet/mellanox/mlx5/core/pci_irq.h
+new file mode 100644
+index 000000000000..5fee4ce57d6c
+--- /dev/null
++++ b/drivers/net/ethernet/mellanox/mlx5/core/pci_irq.h
+@@ -0,0 +1,31 @@
++/* SPDX-License-Identifier: GPL-2.0 OR Linux-OpenIB */
++/* Copyright (c) 2021, NVIDIA CORPORATION & AFFILIATES. All rights reserved. */
++
++#ifndef __PCI_IRQ_H__
++#define __PCI_IRQ_H__
++
++#include <linux/mlx5/driver.h>
++
++#define MLX5_MAX_IRQ_NAME (32)
++/* max irq_index is 2047, so four chars */
++#define MLX5_MAX_IRQ_IDX_CHARS (4)
++#define MLX5_EQ_REFS_PER_IRQ (2)
++
++struct mlx5_irq;
++
++struct mlx5_irq_pool {
++	char name[MLX5_MAX_IRQ_NAME - MLX5_MAX_IRQ_IDX_CHARS];
++	struct xa_limit xa_num_irqs;
++	struct mutex lock; /* sync IRQs creations */
++	struct xarray irqs;
++	u32 max_threshold;
++	u32 min_threshold;
++	struct mlx5_core_dev *dev;
++};
++
++struct mlx5_irq *mlx5_irq_alloc(struct mlx5_irq_pool *pool, int i,
++				const struct cpumask *affinity);
++int mlx5_irq_get_locked(struct mlx5_irq *irq);
++int mlx5_irq_read_locked(struct mlx5_irq *irq);
++
++#endif /* __PCI_IRQ_H__ */
