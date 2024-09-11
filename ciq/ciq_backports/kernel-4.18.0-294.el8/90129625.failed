@@ -1,0 +1,253 @@
+cgroup: start switching to fs_context
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Al Viro <viro@zeniv.linux.org.uk>
+commit 90129625d9203a917fc1d3e4768976ba90d71b44
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/90129625.failed
+
+Unfortunately, cgroup is tangled into kernfs infrastructure.
+To avoid converting all kernfs-based filesystems at once,
+we need to untangle the remount part of things, instead of
+having it go through kernfs_sop_remount_fs().  Fortunately,
+it's not hard to do.
+
+This commit just gets cgroup/cgroup1 to use fs_context to
+deliver options on mount and remount paths.  Parsing those
+is going to be done in the next commits; for now we do
+pretty much what legacy case does.
+
+	Signed-off-by: Al Viro <viro@zeniv.linux.org.uk>
+(cherry picked from commit 90129625d9203a917fc1d3e4768976ba90d71b44)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	kernel/cgroup/cgroup.c
+diff --cc kernel/cgroup/cgroup.c
+index 9e08519ae6db,7f7db5f967e3..000000000000
+--- a/kernel/cgroup/cgroup.c
++++ b/kernel/cgroup/cgroup.c
+@@@ -2050,45 -2068,112 +2051,138 @@@ struct dentry *cgroup_do_mount(struct f
+  	return dentry;
+  }
+  
+- static struct dentry *cgroup_mount(struct file_system_type *fs_type,
+- 			 int flags, const char *unused_dev_name,
+- 			 void *data)
++ /*
++  * Destroy a cgroup filesystem context.
++  */
++ static void cgroup_fs_context_free(struct fs_context *fc)
++ {
++ 	struct cgroup_fs_context *ctx = cgroup_fc2context(fc);
++ 
++ 	kfree(ctx);
++ }
++ 
++ static int cgroup_parse_monolithic(struct fs_context *fc, void *data)
++ {
++ 	struct cgroup_fs_context *ctx = cgroup_fc2context(fc);
++ 
++ 	ctx->data = data;
++ 	if (ctx->data)
++ 		security_sb_eat_lsm_opts(ctx->data, &fc->security);
++ 	return 0;
++ }
++ 
++ static int cgroup_get_tree(struct fs_context *fc)
+  {
+  	struct cgroup_namespace *ns = current->nsproxy->cgroup_ns;
+- 	struct dentry *dentry;
++ 	struct cgroup_fs_context *ctx = cgroup_fc2context(fc);
++ 	unsigned int root_flags;
++ 	struct dentry *root;
+  	int ret;
+  
+- 	get_cgroup_ns(ns);
++ 	/* Check if the caller has permission to mount. */
++ 	if (!ns_capable(ns->user_ns, CAP_SYS_ADMIN))
++ 		return -EPERM;
++ 
++ 	ret = parse_cgroup_root_flags(ctx->data, &root_flags);
++ 	if (ret)
++ 		return ret;
++ 
++ 	cgrp_dfl_visible = true;
++ 	cgroup_get_live(&cgrp_dfl_root.cgrp);
++ 
++ 	root = cgroup_do_mount(&cgroup2_fs_type, fc->sb_flags, &cgrp_dfl_root,
++ 					 CGROUP2_SUPER_MAGIC, ns);
++ 	if (IS_ERR(root))
++ 		return PTR_ERR(root);
++ 
++ 	apply_cgroup_root_flags(root_flags);
++ 	fc->root = root;
++ 	return 0;
++ }
++ 
++ static int cgroup1_get_tree(struct fs_context *fc)
++ {
++ 	struct cgroup_namespace *ns = current->nsproxy->cgroup_ns;
++ 	struct cgroup_fs_context *ctx = cgroup_fc2context(fc);
++ 	struct dentry *root;
+  
+  	/* Check if the caller has permission to mount. */
+- 	if (!ns_capable(ns->user_ns, CAP_SYS_ADMIN)) {
+- 		put_cgroup_ns(ns);
+- 		return ERR_PTR(-EPERM);
+- 	}
++ 	if (!ns_capable(ns->user_ns, CAP_SYS_ADMIN))
++ 		return -EPERM;
++ 
++ 	root = cgroup1_mount(&cgroup_fs_type, fc->sb_flags, ctx->data,
++ 				       CGROUP_SUPER_MAGIC, ns);
++ 	if (IS_ERR(root))
++ 		return PTR_ERR(root);
+  
++ 	fc->root = root;
++ 	return 0;
++ }
++ 
++ static const struct fs_context_operations cgroup_fs_context_ops = {
++ 	.free		= cgroup_fs_context_free,
++ 	.parse_monolithic = cgroup_parse_monolithic,
++ 	.get_tree	= cgroup_get_tree,
++ 	.reconfigure	= cgroup_reconfigure,
++ };
++ 
++ static const struct fs_context_operations cgroup1_fs_context_ops = {
++ 	.free		= cgroup_fs_context_free,
++ 	.parse_monolithic = cgroup_parse_monolithic,
++ 	.get_tree	= cgroup1_get_tree,
++ 	.reconfigure	= cgroup1_reconfigure,
++ };
++ 
++ /*
++  * Initialise the cgroup filesystem creation/reconfiguration context.
++  */
++ static int cgroup_init_fs_context(struct fs_context *fc)
++ {
++ 	struct cgroup_fs_context *ctx;
++ 
++ 	ctx = kzalloc(sizeof(struct cgroup_fs_context), GFP_KERNEL);
++ 	if (!ctx)
++ 		return -ENOMEM;
++ 
+++<<<<<<< HEAD
+ +	if (fs_type == &cgroup2_fs_type) {
+ +		unsigned int root_flags;
+ +
+ +		ret = parse_cgroup_root_flags(data, &root_flags);
+ +		if (ret) {
+ +			put_cgroup_ns(ns);
+ +			return ERR_PTR(ret);
+ +		}
+ +
+ +		cgrp_dfl_visible = true;
+ +		cgroup_get_live(&cgrp_dfl_root.cgrp);
+ +
+ +		dentry = cgroup_do_mount(&cgroup2_fs_type, flags, &cgrp_dfl_root,
+ +					 CGROUP2_SUPER_MAGIC, ns);
+ +		if (!IS_ERR(dentry))
+ +			apply_cgroup_root_flags(root_flags);
+ +	} else {
+ +		dentry = cgroup1_mount(&cgroup_fs_type, flags, data,
+ +				       CGROUP_SUPER_MAGIC, ns);
+ +	}
+ +
+ +	put_cgroup_ns(ns);
+ +	return dentry;
+++=======
++ 	/*
++ 	 * The first time anyone tries to mount a cgroup, enable the list
++ 	 * linking each css_set to its tasks and fix up all existing tasks.
++ 	 */
++ 	if (!use_task_css_set_links)
++ 		cgroup_enable_task_cg_lists();
++ 
++ 	fc->fs_private = ctx;
++ 	if (fc->fs_type == &cgroup2_fs_type)
++ 		fc->ops = &cgroup_fs_context_ops;
++ 	else
++ 		fc->ops = &cgroup1_fs_context_ops;
++ 	return 0;
+++>>>>>>> 90129625d920 (cgroup: start switching to fs_context)
+  }
+  
+  static void cgroup_kill_sb(struct super_block *sb)
+diff --git a/kernel/cgroup/cgroup-internal.h b/kernel/cgroup/cgroup-internal.h
+index ce1c1553c696..bae064cbeedf 100644
+--- a/kernel/cgroup/cgroup-internal.h
++++ b/kernel/cgroup/cgroup-internal.h
+@@ -7,6 +7,7 @@
+ #include <linux/workqueue.h>
+ #include <linux/list.h>
+ #include <linux/refcount.h>
++#include <linux/fs_context.h>
+ 
+ #define TRACE_CGROUP_PATH_LEN 1024
+ extern spinlock_t trace_cgroup_path_lock;
+@@ -39,6 +40,18 @@ extern void __init enable_debug_cgroup(void);
+ 		}							\
+ 	} while (0)
+ 
++/*
++ * The cgroup filesystem superblock creation/mount context.
++ */
++struct cgroup_fs_context {
++	char *data;
++};
++
++static inline struct cgroup_fs_context *cgroup_fc2context(struct fs_context *fc)
++{
++	return fc->fs_private;
++}
++
+ /*
+  * A cgroup can be associated with multiple css_sets as different tasks may
+  * belong to different cgroups on different hierarchies.  In the other
+@@ -260,5 +273,6 @@ void cgroup1_check_for_release(struct cgroup *cgrp);
+ struct dentry *cgroup1_mount(struct file_system_type *fs_type, int flags,
+ 			     void *data, unsigned long magic,
+ 			     struct cgroup_namespace *ns);
++int cgroup1_reconfigure(struct fs_context *ctx);
+ 
+ #endif /* __CGROUP_INTERNAL_H */
+diff --git a/kernel/cgroup/cgroup-v1.c b/kernel/cgroup/cgroup-v1.c
+index dd94e2a4c22e..d660bf153153 100644
+--- a/kernel/cgroup/cgroup-v1.c
++++ b/kernel/cgroup/cgroup-v1.c
+@@ -1013,17 +1013,19 @@ static int parse_cgroupfs_options(char *data, struct cgroup_sb_opts *opts)
+ 	return 0;
+ }
+ 
+-static int cgroup1_remount(struct kernfs_root *kf_root, int *flags, char *data)
++int cgroup1_reconfigure(struct fs_context *fc)
+ {
+-	int ret = 0;
++	struct cgroup_fs_context *ctx = cgroup_fc2context(fc);
++	struct kernfs_root *kf_root = kernfs_root_from_sb(fc->root->d_sb);
+ 	struct cgroup_root *root = cgroup_root_from_kf(kf_root);
++	int ret = 0;
+ 	struct cgroup_sb_opts opts;
+ 	u16 added_mask, removed_mask;
+ 
+ 	cgroup_lock_and_drain_offline(&cgrp_dfl_root.cgrp);
+ 
+ 	/* See what subsystems are wanted */
+-	ret = parse_cgroupfs_options(data, &opts);
++	ret = parse_cgroupfs_options(ctx->data, &opts);
+ 	if (ret)
+ 		goto out_unlock;
+ 
+@@ -1073,7 +1075,6 @@ static int cgroup1_remount(struct kernfs_root *kf_root, int *flags, char *data)
+ struct kernfs_syscall_ops cgroup1_kf_syscall_ops = {
+ 	.rename			= cgroup1_rename,
+ 	.show_options		= cgroup1_show_options,
+-	.remount_fs		= cgroup1_remount,
+ 	.mkdir			= cgroup_mkdir,
+ 	.rmdir			= cgroup_rmdir,
+ 	.show_path		= cgroup_show_path,
+* Unmerged path kernel/cgroup/cgroup.c
