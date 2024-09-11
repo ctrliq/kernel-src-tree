@@ -1,0 +1,117 @@
+ftrace: Fix modify_ftrace_direct.
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-338.el8
+commit-author Alexei Starovoitov <ast@kernel.org>
+commit 8a141dd7f7060d1e64c14a5257e0babae20ac99b
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-338.el8/8a141dd7.failed
+
+The following sequence of commands:
+  register_ftrace_direct(ip, addr1);
+  modify_ftrace_direct(ip, addr1, addr2);
+  unregister_ftrace_direct(ip, addr2);
+will cause the kernel to warn:
+[   30.179191] WARNING: CPU: 2 PID: 1961 at kernel/trace/ftrace.c:5223 unregister_ftrace_direct+0x130/0x150
+[   30.180556] CPU: 2 PID: 1961 Comm: test_progs    W  O      5.12.0-rc2-00378-g86bc10a0a711-dirty #3246
+[   30.182453] RIP: 0010:unregister_ftrace_direct+0x130/0x150
+
+When modify_ftrace_direct() changes the addr from old to new it should update
+the addr stored in ftrace_direct_funcs. Otherwise the final
+unregister_ftrace_direct() won't find the address and will cause the splat.
+
+Fixes: 0567d6809182 ("ftrace: Add modify_ftrace_direct()")
+	Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+	Signed-off-by: Daniel Borkmann <daniel@iogearbox.net>
+	Reviewed-by: Steven Rostedt (VMware) <rostedt@goodmis.org>
+Link: https://lore.kernel.org/bpf/20210316195815.34714-1-alexei.starovoitov@gmail.com
+(cherry picked from commit 8a141dd7f7060d1e64c14a5257e0babae20ac99b)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	kernel/trace/ftrace.c
+diff --cc kernel/trace/ftrace.c
+index 0c63878a55d2,b7e29db127fa..000000000000
+--- a/kernel/trace/ftrace.c
++++ b/kernel/trace/ftrace.c
+@@@ -5170,7 -5339,9 +5180,8 @@@ static struct ftrace_ops stub_ops = 
+  int modify_ftrace_direct(unsigned long ip,
+  			 unsigned long old_addr, unsigned long new_addr)
+  {
++ 	struct ftrace_direct_func *direct, *new_direct = NULL;
+  	struct ftrace_func_entry *entry;
+ -	struct dyn_ftrace *rec;
+  	int ret = -ENODEV;
+  
+  	mutex_lock(&direct_mutex);
+@@@ -5183,34 -5355,43 +5194,58 @@@
+  	if (entry->direct != old_addr)
+  		goto out_unlock;
+  
++ 	direct = ftrace_find_direct_func(old_addr);
++ 	if (WARN_ON(!direct))
++ 		goto out_unlock;
++ 	if (direct->count > 1) {
++ 		ret = -ENOMEM;
++ 		new_direct = ftrace_alloc_direct_func(new_addr);
++ 		if (!new_direct)
++ 			goto out_unlock;
++ 		direct->count--;
++ 		new_direct->count++;
++ 	} else {
++ 		direct->addr = new_addr;
++ 	}
++ 
+  	/*
+ -	 * If there's no other ftrace callback on the rec->ip location,
+ -	 * then it can be changed directly by the architecture.
+ -	 * If there is another caller, then we just need to change the
+ -	 * direct caller helper to point to @new_addr.
+ +	 * By setting a stub function at the same address, we force
+ +	 * the code to call the iterator and the direct_ops helper.
+ +	 * This means that @ip does not call the direct call, and
+ +	 * we can simply modify it.
+  	 */
+ -	if (ftrace_rec_count(rec) == 1) {
+ -		ret = ftrace_modify_direct_caller(entry, rec, old_addr, new_addr);
+ -	} else {
+ -		entry->direct = new_addr;
+ -		ret = 0;
+ +	ret = ftrace_set_filter_ip(&stub_ops, ip, 0, 0);
+ +	if (ret)
+ +		goto out_unlock;
+ +
+ +	ret = register_ftrace_function(&stub_ops);
+ +	if (ret) {
+ +		ftrace_set_filter_ip(&stub_ops, ip, 1, 0);
+ +		goto out_unlock;
+  	}
+  
+++<<<<<<< HEAD
+ +	entry->direct = new_addr;
+ +
+ +	/*
+ +	 * By removing the stub, we put back the direct call, calling
+ +	 * the @new_addr.
+ +	 */
+ +	unregister_ftrace_function(&stub_ops);
+ +	ftrace_set_filter_ip(&stub_ops, ip, 1, 0);
+ +
+ +	ret = 0;
+++=======
++ 	if (unlikely(ret && new_direct)) {
++ 		direct->count++;
++ 		list_del_rcu(&new_direct->next);
++ 		synchronize_rcu_tasks();
++ 		kfree(new_direct);
++ 		ftrace_direct_func_count--;
++ 	}
+++>>>>>>> 8a141dd7f706 (ftrace: Fix modify_ftrace_direct.)
+  
+   out_unlock:
+ -	mutex_unlock(&ftrace_lock);
+  	mutex_unlock(&direct_mutex);
+  	return ret;
+  }
+* Unmerged path kernel/trace/ftrace.c
