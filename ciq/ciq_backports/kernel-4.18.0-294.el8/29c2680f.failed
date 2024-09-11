@@ -1,0 +1,408 @@
+s390/ap: fix ap devices reference counting
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Harald Freudenberger <freude@linux.ibm.com>
+commit 29c2680fd2bf3862ff5cf2957f198512493156f9
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/29c2680f.failed
+
+With the last rework of the AP bus scan function one get_device() is
+missing causing the reference counter to be one instance too
+low. Together with binding/unbinding device drivers to an ap device it
+may end up in an segfault because the ap device is freed but a device
+driver still assumes it's pointer to the ap device is valid:
+
+Unable to handle kernel pointer dereference in virtual kernel address space
+Failing address: 6b6b6b6b6b6b6000 TEID: 6b6b6b6b6b6b6803
+Fault in home space mode while using kernel ASCE.
+Krnl PSW : 0404e00180000000 000000001472f3b6 (klist_next+0x7e/0x180)
+           R:0 T:1 IO:0 EX:0 Key:0 M:1 W:0 P:0 AS:3 CC:2 PM:0 RI:0 EA:3
+Call Trace:
+ [<000000001472f3b6>] klist_next+0x7e/0x180
+([<000000001472f36a>] klist_next+0x32/0x180)
+ [<00000000147c14de>] bus_for_each_dev+0x66/0xb8
+ [<0000000014aab0d4>] ap_scan_adapter+0xcc/0x6c0
+ [<0000000014aab74a>] ap_scan_bus+0x82/0x140
+ [<0000000013f3b654>] process_one_work+0x27c/0x478
+ [<0000000013f3b8b6>] worker_thread+0x66/0x368
+ [<0000000013f44e32>] kthread+0x17a/0x1a0
+ [<0000000014af23e4>] ret_from_fork+0x24/0x2c
+Kernel panic - not syncing: Fatal exception: panic_on_oops
+
+Fixed by adjusting the reference count with get_device() on the right
+place. Also now the device drivers don't need to adjust the ap
+device's reference counting any more. This is now done in the ap bus
+probe and remove functions.
+
+	Reported-by: Marc Hartmayer <mhartmay@linux.ibm.com>
+Fixes: 4f2fcccdb547 ("s390/ap: add card/queue deconfig state")
+	Signed-off-by: Harald Freudenberger <freude@linux.ibm.com>
+	Signed-off-by: Heiko Carstens <hca@linux.ibm.com>
+(cherry picked from commit 29c2680fd2bf3862ff5cf2957f198512493156f9)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/s390/crypto/ap_bus.c
+diff --cc drivers/s390/crypto/ap_bus.c
+index 70b945ce5806,ef738b42a092..000000000000
+--- a/drivers/s390/crypto/ap_bus.c
++++ b/drivers/s390/crypto/ap_bus.c
+@@@ -1478,68 -1347,235 +1486,249 @@@ static void _ap_scan_bus_adapter(int id
+  			}
+  			continue;
+  		}
+ -		/* domain is valid, get info from this APQN */
+ -		if (!ap_queue_info(qid, &type, &func, &depth, &decfg)) {
+ -			if (aq) {
+ -				AP_DBF_INFO(
+ -					"%s(%d,%d) ap_queue_info() not successful, rm queue device\n",
+ -					__func__, ac->id, dom);
+ +		/* try to fetch infos about this queue */
+ +		rc = ap_query_queue(qid, &depth, &type, &func);
+ +		if (dev) {
+ +			if (rc == -ENODEV)
+ +				borked = 1;
+ +			else {
+ +				spin_lock_bh(&aq->lock);
+ +				borked = aq->state == AP_STATE_BORKED;
+ +				spin_unlock_bh(&aq->lock);
+ +			}
+ +			if (borked) {
+ +				/* Remove broken device */
+ +				AP_DBF(DBF_DEBUG,
+ +				       "removing broken queue=%02x.%04x\n",
+ +				       id, dom);
+  				device_unregister(dev);
+ -				put_device(dev);
+  			}
+ +			put_device(dev);
+  			continue;
+  		}
+++<<<<<<< HEAD
+ +		if (rc)
+ +			continue;
+ +		/* a new queue device is needed, check out comp type */
+++=======
++ 		/* if no queue device exists, create a new one */
++ 		if (!aq) {
++ 			aq = ap_queue_create(qid, ac->ap_dev.device_type);
++ 			if (!aq) {
++ 				AP_DBF_WARN("%s(%d,%d) ap_queue_create() failed\n",
++ 					    __func__, ac->id, dom);
++ 				continue;
++ 			}
++ 			aq->card = ac;
++ 			aq->config = !decfg;
++ 			dev = &aq->ap_dev.device;
++ 			dev->bus = &ap_bus_type;
++ 			dev->parent = &ac->ap_dev.device;
++ 			dev_set_name(dev, "%02x.%04x", ac->id, dom);
++ 			/* register queue device */
++ 			rc = device_register(dev);
++ 			if (rc) {
++ 				AP_DBF_WARN("%s(%d,%d) device_register() failed\n",
++ 					    __func__, ac->id, dom);
++ 				goto put_dev_and_continue;
++ 			}
++ 			/* get it and thus adjust reference counter */
++ 			get_device(dev);
++ 			if (decfg)
++ 				AP_DBF_INFO("%s(%d,%d) new (decfg) queue device created\n",
++ 					    __func__, ac->id, dom);
++ 			else
++ 				AP_DBF_INFO("%s(%d,%d) new queue device created\n",
++ 					    __func__, ac->id, dom);
++ 			goto put_dev_and_continue;
++ 		}
++ 		/* Check config state on the already existing queue device */
++ 		spin_lock_bh(&aq->lock);
++ 		if (decfg && aq->config) {
++ 			/* config off this queue device */
++ 			aq->config = false;
++ 			if (aq->dev_state > AP_DEV_STATE_UNINITIATED) {
++ 				aq->dev_state = AP_DEV_STATE_ERROR;
++ 				aq->last_err_rc = AP_RESPONSE_DECONFIGURED;
++ 			}
++ 			spin_unlock_bh(&aq->lock);
++ 			AP_DBF_INFO("%s(%d,%d) queue device config off\n",
++ 				    __func__, ac->id, dom);
++ 			/* 'receive' pending messages with -EAGAIN */
++ 			ap_flush_queue(aq);
++ 			goto put_dev_and_continue;
++ 		}
++ 		if (!decfg && !aq->config) {
++ 			/* config on this queue device */
++ 			aq->config = true;
++ 			if (aq->dev_state > AP_DEV_STATE_UNINITIATED) {
++ 				aq->dev_state = AP_DEV_STATE_OPERATING;
++ 				aq->sm_state = AP_SM_STATE_RESET_START;
++ 			}
++ 			spin_unlock_bh(&aq->lock);
++ 			AP_DBF_INFO("%s(%d,%d) queue device config on\n",
++ 				    __func__, ac->id, dom);
++ 			goto put_dev_and_continue;
++ 		}
++ 		/* handle other error states */
++ 		if (!decfg && aq->dev_state == AP_DEV_STATE_ERROR) {
++ 			spin_unlock_bh(&aq->lock);
++ 			/* 'receive' pending messages with -EAGAIN */
++ 			ap_flush_queue(aq);
++ 			/* re-init (with reset) the queue device */
++ 			ap_queue_init_state(aq);
++ 			AP_DBF_INFO("%s(%d,%d) queue device reinit enforced\n",
++ 				    __func__, ac->id, dom);
++ 			goto put_dev_and_continue;
++ 		}
++ 		spin_unlock_bh(&aq->lock);
++ put_dev_and_continue:
++ 		put_device(dev);
++ 	}
++ }
++ 
++ /*
++  * Helper function for ap_scan_bus().
++  * Does the scan bus job for the given adapter id.
++  */
++ static inline void ap_scan_adapter(int ap)
++ {
++ 	bool decfg;
++ 	ap_qid_t qid;
++ 	unsigned int func;
++ 	struct device *dev;
++ 	struct ap_card *ac;
++ 	int rc, dom, depth, type, comp_type;
++ 
++ 	/* Is there currently a card device for this adapter ? */
++ 	dev = bus_find_device(&ap_bus_type, NULL,
++ 			      (void *)(long) ap,
++ 			      __match_card_device_with_id);
++ 	ac = dev ? to_ap_card(dev) : NULL;
++ 
++ 	/* Adapter not in configuration ? */
++ 	if (!ap_test_config_card_id(ap)) {
++ 		if (ac) {
++ 			AP_DBF_INFO("%s(%d) ap not in config any more, rm card and queue devices\n",
++ 				    __func__, ap);
++ 			ap_scan_rm_card_dev_and_queue_devs(ac);
++ 			put_device(dev);
++ 		}
++ 		return;
++ 	}
++ 
++ 	/*
++ 	 * Adapter ap is valid in the current configuration. So do some checks:
++ 	 * If no card device exists, build one. If a card device exists, check
++ 	 * for type and functions changed. For all this we need to find a valid
++ 	 * APQN first.
++ 	 */
++ 
++ 	for (dom = 0; dom <= ap_max_domain_id; dom++)
++ 		if (ap_test_config_usage_domain(dom)) {
++ 			qid = AP_MKQID(ap, dom);
++ 			if (ap_queue_info(qid, &type, &func, &depth, &decfg))
++ 				break;
++ 		}
++ 	if (dom > ap_max_domain_id) {
++ 		/* Could not find a valid APQN for this adapter */
++ 		if (ac) {
++ 			AP_DBF_INFO(
++ 				"%s(%d) no type info (no APQN found), rm card and queue devices\n",
++ 				__func__, ap);
++ 			ap_scan_rm_card_dev_and_queue_devs(ac);
++ 			put_device(dev);
++ 		} else {
++ 			AP_DBF_DBG("%s(%d) no type info (no APQN found), ignored\n",
++ 				   __func__, ap);
++ 		}
++ 		return;
++ 	}
++ 	if (!type) {
++ 		/* No apdater type info available, an unusable adapter */
++ 		if (ac) {
++ 			AP_DBF_INFO("%s(%d) no valid type (0) info, rm card and queue devices\n",
++ 				    __func__, ap);
++ 			ap_scan_rm_card_dev_and_queue_devs(ac);
++ 			put_device(dev);
++ 		} else {
++ 			AP_DBF_DBG("%s(%d) no valid type (0) info, ignored\n",
++ 				   __func__, ap);
++ 		}
++ 		return;
++ 	}
++ 
++ 	if (ac) {
++ 		/* Check APQN against existing card device for changes */
++ 		if (ac->raw_hwtype != type) {
++ 			AP_DBF_INFO("%s(%d) hwtype %d changed, rm card and queue devices\n",
++ 				    __func__, ap, type);
++ 			ap_scan_rm_card_dev_and_queue_devs(ac);
++ 			put_device(dev);
++ 			ac = NULL;
++ 		} else if (ac->functions != func) {
++ 			AP_DBF_INFO("%s(%d) functions 0x%08x changed, rm card and queue devices\n",
++ 				    __func__, ap, type);
++ 			ap_scan_rm_card_dev_and_queue_devs(ac);
++ 			put_device(dev);
++ 			ac = NULL;
++ 		} else {
++ 			if (decfg && ac->config) {
++ 				ac->config = false;
++ 				AP_DBF_INFO("%s(%d) card device config off\n",
++ 					    __func__, ap);
++ 
++ 			}
++ 			if (!decfg && !ac->config) {
++ 				ac->config = true;
++ 				AP_DBF_INFO("%s(%d) card device config on\n",
++ 					    __func__, ap);
++ 			}
++ 		}
++ 	}
++ 
++ 	if (!ac) {
++ 		/* Build a new card device */
+++>>>>>>> 29c2680fd2bf (s390/ap: fix ap devices reference counting)
+  		comp_type = ap_get_compatible_type(qid, type, func);
+ -		if (!comp_type) {
+ -			AP_DBF_WARN("%s(%d) type %d, can't get compatibility type\n",
+ -				    __func__, ap, type);
+ -			return;
+ -		}
+ -		ac = ap_card_create(ap, depth, type, comp_type, func);
+ +		if (!comp_type)
+ +			continue;
+ +		/* maybe a card device needs to be created first */
+  		if (!ac) {
+ -			AP_DBF_WARN("%s(%d) ap_card_create() failed\n",
+ -				    __func__, ap);
+ -			return;
+ +			ac = ap_card_create(id, depth, type, comp_type, func);
+ +			if (!ac)
+ +				continue;
+ +			ac->ap_dev.device.bus = &ap_bus_type;
+ +			ac->ap_dev.device.parent = ap_root_device;
+ +			dev_set_name(&ac->ap_dev.device, "card%02x", id);
+ +			/* Register card device with AP bus */
+ +			rc = device_register(&ac->ap_dev.device);
+ +			if (rc) {
+ +				put_device(&ac->ap_dev.device);
+ +				ac = NULL;
+ +				break;
+ +			}
+ +			/* get it and thus adjust reference counter */
+ +			get_device(&ac->ap_dev.device);
+  		}
+ -		ac->config = !decfg;
+ -		dev = &ac->ap_dev.device;
+ -		dev->bus = &ap_bus_type;
+ -		dev->parent = ap_root_device;
+ -		dev_set_name(dev, "card%02x", ap);
+ -		/* Register the new card device with AP bus */
+ -		rc = device_register(dev);
+ +		/* now create the new queue device */
+ +		aq = ap_queue_create(qid, comp_type);
+ +		if (!aq)
+ +			continue;
+ +		aq->card = ac;
+ +		aq->ap_dev.device.bus = &ap_bus_type;
+ +		aq->ap_dev.device.parent = &ac->ap_dev.device;
+ +		dev_set_name(&aq->ap_dev.device, "%02x.%04x", id, dom);
+ +		/* Register queue device */
+ +		rc = device_register(&aq->ap_dev.device);
+  		if (rc) {
+ -			AP_DBF_WARN("%s(%d) device_register() failed\n",
+ -				    __func__, ap);
+ -			put_device(dev);
+ -			return;
+ +			put_device(&aq->ap_dev.device);
+ +			continue;
+  		}
+ -		/* get it and thus adjust reference counter */
+ -		get_device(dev);
+ -		if (decfg)
+ -			AP_DBF_INFO("%s(%d) new (decfg) card device type=%d func=0x%08x created\n",
+ -				    __func__, ap, type, func);
+ -		else
+ -			AP_DBF_INFO("%s(%d) new card device type=%d func=0x%08x created\n",
+ -				    __func__, ap, type, func);
+ -	}
+ -
+ -	/* Verify the domains and the queue devices for this card */
+ -	ap_scan_domains(ac);
+ +	} /* end domain loop */
+  
+ -	/* release the card device */
+ -	put_device(&ac->ap_dev.device);
+ +	if (ac)
+ +		put_device(&ac->ap_dev.device);
+  }
+  
+  /**
+* Unmerged path drivers/s390/crypto/ap_bus.c
+diff --git a/drivers/s390/crypto/zcrypt_card.c b/drivers/s390/crypto/zcrypt_card.c
+index c53cab4b0c9e..8f8ba5067224 100644
+--- a/drivers/s390/crypto/zcrypt_card.c
++++ b/drivers/s390/crypto/zcrypt_card.c
+@@ -151,11 +151,6 @@ int zcrypt_card_register(struct zcrypt_card *zc)
+ {
+ 	int rc;
+ 
+-	rc = sysfs_create_group(&zc->card->ap_dev.device.kobj,
+-				&zcrypt_card_attr_group);
+-	if (rc)
+-		return rc;
+-
+ 	spin_lock(&zcrypt_list_lock);
+ 	list_add_tail(&zc->list, &zcrypt_card_list);
+ 	spin_unlock(&zcrypt_list_lock);
+@@ -164,6 +159,14 @@ int zcrypt_card_register(struct zcrypt_card *zc)
+ 
+ 	ZCRYPT_DBF(DBF_INFO, "card=%02x register online=1\n", zc->card->id);
+ 
++	rc = sysfs_create_group(&zc->card->ap_dev.device.kobj,
++				&zcrypt_card_attr_group);
++	if (rc) {
++		spin_lock(&zcrypt_list_lock);
++		list_del_init(&zc->list);
++		spin_unlock(&zcrypt_list_lock);
++	}
++
+ 	return rc;
+ }
+ EXPORT_SYMBOL(zcrypt_card_register);
+diff --git a/drivers/s390/crypto/zcrypt_queue.c b/drivers/s390/crypto/zcrypt_queue.c
+index 8bae6ad159a7..4c8ecc7fbafe 100644
+--- a/drivers/s390/crypto/zcrypt_queue.c
++++ b/drivers/s390/crypto/zcrypt_queue.c
+@@ -175,7 +175,6 @@ int zcrypt_queue_register(struct zcrypt_queue *zq)
+ 				&zcrypt_queue_attr_group);
+ 	if (rc)
+ 		goto out;
+-	get_device(&zq->queue->ap_dev.device);
+ 
+ 	if (zq->ops->rng) {
+ 		rc = zcrypt_rng_device_add();
+@@ -187,7 +186,6 @@ int zcrypt_queue_register(struct zcrypt_queue *zq)
+ out_unregister:
+ 	sysfs_remove_group(&zq->queue->ap_dev.device.kobj,
+ 			   &zcrypt_queue_attr_group);
+-	put_device(&zq->queue->ap_dev.device);
+ out:
+ 	spin_lock(&zcrypt_list_lock);
+ 	list_del_init(&zq->list);
+@@ -215,12 +213,10 @@ void zcrypt_queue_unregister(struct zcrypt_queue *zq)
+ 	list_del_init(&zq->list);
+ 	zcrypt_device_count--;
+ 	spin_unlock(&zcrypt_list_lock);
+-	zcrypt_card_put(zc);
+ 	if (zq->ops->rng)
+ 		zcrypt_rng_device_remove();
+ 	sysfs_remove_group(&zq->queue->ap_dev.device.kobj,
+ 			   &zcrypt_queue_attr_group);
+-	put_device(&zq->queue->ap_dev.device);
+-	zcrypt_queue_put(zq);
++	zcrypt_card_put(zc);
+ }
+ EXPORT_SYMBOL(zcrypt_queue_unregister);
