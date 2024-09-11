@@ -1,0 +1,220 @@
+gfs2: factor evict_linked_inode out of gfs2_evict_inode
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Bob Peterson <rpeterso@redhat.com>
+commit d90be6ab9ad76d4f5492e15b73b9cca5cbb03f91
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/d90be6ab.failed
+
+Now that we've factored out the delete-dinode case to simplify
+gfs2_evict_inode, we take it a step further and factor out the other
+case: where we don't delete the inode.
+
+	Signed-off-by: Bob Peterson <rpeterso@redhat.com>
+	Signed-off-by: Andreas Gruenbacher <agruenba@redhat.com>
+(cherry picked from commit d90be6ab9ad76d4f5492e15b73b9cca5cbb03f91)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/gfs2/super.c
+diff --cc fs/gfs2/super.c
+index 7ef6d48f35a7,ba31952e21b9..000000000000
+--- a/fs/gfs2/super.c
++++ b/fs/gfs2/super.c
+@@@ -1306,6 -1317,145 +1306,148 @@@ static bool gfs2_upgrade_iopen_glock(st
+  }
+  
+  /**
+++<<<<<<< HEAD
+++=======
++  * evict_should_delete - determine whether the inode is eligible for deletion
++  * @inode: The inode to evict
++  *
++  * This function determines whether the evicted inode is eligible to be deleted
++  * and locks the inode glock.
++  *
++  * Returns: the fate of the dinode
++  */
++ static enum dinode_demise evict_should_delete(struct inode *inode,
++ 					      struct gfs2_holder *gh)
++ {
++ 	struct gfs2_inode *ip = GFS2_I(inode);
++ 	struct super_block *sb = inode->i_sb;
++ 	struct gfs2_sbd *sdp = sb->s_fs_info;
++ 	int ret;
++ 
++ 	if (test_bit(GIF_ALLOC_FAILED, &ip->i_flags)) {
++ 		BUG_ON(!gfs2_glock_is_locked_by_me(ip->i_gl));
++ 		goto should_delete;
++ 	}
++ 
++ 	if (test_bit(GIF_DEFERRED_DELETE, &ip->i_flags))
++ 		return SHOULD_DEFER_EVICTION;
++ 
++ 	/* Deletes should never happen under memory pressure anymore.  */
++ 	if (WARN_ON_ONCE(current->flags & PF_MEMALLOC))
++ 		return SHOULD_DEFER_EVICTION;
++ 
++ 	/* Must not read inode block until block type has been verified */
++ 	ret = gfs2_glock_nq_init(ip->i_gl, LM_ST_EXCLUSIVE, GL_SKIP, gh);
++ 	if (unlikely(ret)) {
++ 		glock_clear_object(ip->i_iopen_gh.gh_gl, ip);
++ 		ip->i_iopen_gh.gh_flags |= GL_NOCACHE;
++ 		gfs2_glock_dq_uninit(&ip->i_iopen_gh);
++ 		return SHOULD_DEFER_EVICTION;
++ 	}
++ 
++ 	if (gfs2_inode_already_deleted(ip->i_gl, ip->i_no_formal_ino))
++ 		return SHOULD_NOT_DELETE_DINODE;
++ 	ret = gfs2_check_blk_type(sdp, ip->i_no_addr, GFS2_BLKST_UNLINKED);
++ 	if (ret)
++ 		return SHOULD_NOT_DELETE_DINODE;
++ 
++ 	if (test_bit(GIF_INVALID, &ip->i_flags)) {
++ 		ret = gfs2_inode_refresh(ip);
++ 		if (ret)
++ 			return SHOULD_NOT_DELETE_DINODE;
++ 	}
++ 
++ 	/*
++ 	 * The inode may have been recreated in the meantime.
++ 	 */
++ 	if (inode->i_nlink)
++ 		return SHOULD_NOT_DELETE_DINODE;
++ 
++ should_delete:
++ 	if (gfs2_holder_initialized(&ip->i_iopen_gh) &&
++ 	    test_bit(HIF_HOLDER, &ip->i_iopen_gh.gh_iflags)) {
++ 		if (!gfs2_upgrade_iopen_glock(inode)) {
++ 			gfs2_holder_uninit(&ip->i_iopen_gh);
++ 			return SHOULD_NOT_DELETE_DINODE;
++ 		}
++ 	}
++ 	return SHOULD_DELETE_DINODE;
++ }
++ 
++ /**
++  * evict_unlinked_inode - delete the pieces of an unlinked evicted inode
++  * @inode: The inode to evict
++  */
++ static int evict_unlinked_inode(struct inode *inode)
++ {
++ 	struct gfs2_inode *ip = GFS2_I(inode);
++ 	int ret;
++ 
++ 	if (S_ISDIR(inode->i_mode) &&
++ 	    (ip->i_diskflags & GFS2_DIF_EXHASH)) {
++ 		ret = gfs2_dir_exhash_dealloc(ip);
++ 		if (ret)
++ 			goto out;
++ 	}
++ 
++ 	if (ip->i_eattr) {
++ 		ret = gfs2_ea_dealloc(ip);
++ 		if (ret)
++ 			goto out;
++ 	}
++ 
++ 	if (!gfs2_is_stuffed(ip)) {
++ 		ret = gfs2_file_dealloc(ip);
++ 		if (ret)
++ 			goto out;
++ 	}
++ 
++ 	/* We're about to clear the bitmap for the dinode, but as soon as we
++ 	   do, gfs2_create_inode can create another inode at the same block
++ 	   location and try to set gl_object again. We clear gl_object here so
++ 	   that subsequent inode creates don't see an old gl_object. */
++ 	glock_clear_object(ip->i_gl, ip);
++ 	ret = gfs2_dinode_dealloc(ip);
++ 	gfs2_inode_remember_delete(ip->i_gl, ip->i_no_formal_ino);
++ out:
++ 	return ret;
++ }
++ 
++ /*
++  * evict_linked_inode - evict an inode whose dinode has not been unlinked
++  * @inode: The inode to evict
++  */
++ static int evict_linked_inode(struct inode *inode)
++ {
++ 	struct super_block *sb = inode->i_sb;
++ 	struct gfs2_sbd *sdp = sb->s_fs_info;
++ 	struct gfs2_inode *ip = GFS2_I(inode);
++ 	struct address_space *metamapping;
++ 	int ret;
++ 
++ 	gfs2_log_flush(sdp, ip->i_gl, GFS2_LOG_HEAD_FLUSH_NORMAL |
++ 		       GFS2_LFC_EVICT_INODE);
++ 	metamapping = gfs2_glock2aspace(ip->i_gl);
++ 	if (test_bit(GLF_DIRTY, &ip->i_gl->gl_flags)) {
++ 		filemap_fdatawrite(metamapping);
++ 		filemap_fdatawait(metamapping);
++ 	}
++ 	write_inode_now(inode, 1);
++ 	gfs2_ail_flush(ip->i_gl, 0);
++ 
++ 	ret = gfs2_trans_begin(sdp, 0, sdp->sd_jdesc->jd_blocks);
++ 	if (ret)
++ 		return ret;
++ 
++ 	/* Needs to be done before glock release & also in a transaction */
++ 	truncate_inode_pages(&inode->i_data, 0);
++ 	truncate_inode_pages(metamapping, 0);
++ 	gfs2_trans_end(sdp);
++ 	return 0;
++ }
++ 
++ /**
+++>>>>>>> d90be6ab9ad7 (gfs2: factor evict_linked_inode out of gfs2_evict_inode)
+   * gfs2_evict_inode - Remove an inode from cache
+   * @inode: The inode to evict
+   *
+@@@ -1332,8 -1482,7 +1474,12 @@@ static void gfs2_evict_inode(struct ino
+  	struct gfs2_sbd *sdp = sb->s_fs_info;
+  	struct gfs2_inode *ip = GFS2_I(inode);
+  	struct gfs2_holder gh;
+++<<<<<<< HEAD
+ +	struct address_space *metamapping;
+ +	int error;
+++=======
++ 	int ret;
+++>>>>>>> d90be6ab9ad7 (gfs2: factor evict_linked_inode out of gfs2_evict_inode)
+  
+  	if (test_bit(GIF_FREE_VFS_INODE, &ip->i_flags)) {
+  		clear_inode(inode);
+@@@ -1423,27 -1503,9 +1569,31 @@@ out_delete
+  	goto out_unlock;
+  
+  out_truncate:
+++<<<<<<< HEAD
+ +	gfs2_log_flush(sdp, ip->i_gl, GFS2_LOG_HEAD_FLUSH_NORMAL |
+ +		       GFS2_LFC_EVICT_INODE);
+ +	metamapping = gfs2_glock2aspace(ip->i_gl);
+ +	if (test_bit(GLF_DIRTY, &ip->i_gl->gl_flags)) {
+ +		filemap_fdatawrite(metamapping);
+ +		filemap_fdatawait(metamapping);
+ +	}
+ +	write_inode_now(inode, 1);
+ +	gfs2_ail_flush(ip->i_gl, 0);
+ +
+ +	/* Case 2 starts here */
+ +	error = gfs2_trans_begin(sdp, 0, sdp->sd_jdesc->jd_blocks);
+ +	if (error)
+ +		goto out_unlock;
+ +	/* Needs to be done before glock release & also in a transaction */
+ +	truncate_inode_pages(&inode->i_data, 0);
+ +	truncate_inode_pages(metamapping, 0);
+ +	gfs2_trans_end(sdp);
+++=======
++ 	ret = evict_linked_inode(inode);
+++>>>>>>> d90be6ab9ad7 (gfs2: factor evict_linked_inode out of gfs2_evict_inode)
+  
+  out_unlock:
+ +	/* Error path for case 1 */
+  	if (gfs2_rs_active(&ip->i_res))
+  		gfs2_rs_deltree(&ip->i_res);
+  
+* Unmerged path fs/gfs2/super.c
