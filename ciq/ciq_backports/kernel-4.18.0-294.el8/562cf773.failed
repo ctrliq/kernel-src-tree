@@ -1,0 +1,154 @@
+s390/qeth: support configurable RX copybreak
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Julian Wiedmann <jwi@linux.ibm.com>
+commit 562cf7736363c0b8a98f482cc7f6a19177d8fcea
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/562cf773.failed
+
+Implement the ethtool hooks for the ETHTOOL_RX_COPYBREAK tunable.
+
+The copybreak is stored into netdev_priv, so that we automatically go
+back to the default value if the netdev is re-allocated.
+
+	Signed-off-by: Julian Wiedmann <jwi@linux.ibm.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 562cf7736363c0b8a98f482cc7f6a19177d8fcea)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/s390/net/qeth_core.h
+diff --cc drivers/s390/net/qeth_core.h
+index 16a2bb86acb6,b7d64690ea38..000000000000
+--- a/drivers/s390/net/qeth_core.h
++++ b/drivers/s390/net/qeth_core.h
+@@@ -219,10 -221,6 +221,13 @@@ struct qeth_vnicc_info 
+  #define QETH_HIGH_WATERMARK_PACK 5
+  #define QETH_WATERMARK_PACK_FUZZ 1
+  
+++<<<<<<< HEAD
+ +/* large receive scatter gather copy break */
+ +#define QETH_RX_SG_CB (PAGE_SIZE >> 1)
+ +#define QETH_RX_PULL_LEN 256
+ +
+++=======
+++>>>>>>> 562cf7736363 (s390/qeth: support configurable RX copybreak)
+  struct qeth_hdr_layer3 {
+  	__u8  id;
+  	__u8  flags;
+* Unmerged path drivers/s390/net/qeth_core.h
+diff --git a/drivers/s390/net/qeth_core_main.c b/drivers/s390/net/qeth_core_main.c
+index 2a0afd269224..2e5d10c7b5e8 100644
+--- a/drivers/s390/net/qeth_core_main.c
++++ b/drivers/s390/net/qeth_core_main.c
+@@ -1347,7 +1347,6 @@ static void qeth_set_initial_options(struct qeth_card *card)
+ {
+ 	card->options.route4.type = NO_ROUTER;
+ 	card->options.route6.type = NO_ROUTER;
+-	card->options.rx_sg_cb = QETH_RX_SG_CB;
+ 	card->options.isolation = ISOLATION_MODE_NONE;
+ 	card->options.cq = QETH_CQ_DISABLED;
+ 	card->options.layer = QETH_DISCIPLINE_UNDETERMINED;
+@@ -5141,6 +5140,7 @@ struct sk_buff *qeth_core_get_next_skb(struct qeth_card *card,
+ 		struct qeth_hdr **hdr)
+ {
+ 	struct qdio_buffer_element *element = *__element;
++	struct qeth_priv *priv = netdev_priv(card->dev);
+ 	struct qdio_buffer *buffer = qethbuffer->buffer;
+ 	unsigned int linear_len = 0;
+ 	int offset = *__offset;
+@@ -5213,7 +5213,7 @@ struct sk_buff *qeth_core_get_next_skb(struct qeth_card *card,
+ 	}
+ 
+ 	use_rx_sg = (card->options.cq == QETH_CQ_ENABLED) ||
+-		    (skb_len > card->options.rx_sg_cb &&
++		    (skb_len > READ_ONCE(priv->rx_copybreak) &&
+ 		     !atomic_read(&card->force_alloc_skb) &&
+ 		     !IS_OSN(card));
+ 
+@@ -5721,25 +5721,30 @@ static void qeth_clear_dbf_list(void)
+ static struct net_device *qeth_alloc_netdev(struct qeth_card *card)
+ {
+ 	struct net_device *dev;
++	struct qeth_priv *priv;
+ 
+ 	switch (card->info.type) {
+ 	case QETH_CARD_TYPE_IQD:
+-		dev = alloc_netdev_mqs(0, "hsi%d", NET_NAME_UNKNOWN,
++		dev = alloc_netdev_mqs(sizeof(*priv), "hsi%d", NET_NAME_UNKNOWN,
+ 				       ether_setup, QETH_MAX_QUEUES, 1);
+ 		break;
+ 	case QETH_CARD_TYPE_OSM:
+-		dev = alloc_etherdev(0);
++		dev = alloc_etherdev(sizeof(*priv));
+ 		break;
+ 	case QETH_CARD_TYPE_OSN:
+-		dev = alloc_netdev(0, "osn%d", NET_NAME_UNKNOWN, ether_setup);
++		dev = alloc_netdev(sizeof(*priv), "osn%d", NET_NAME_UNKNOWN,
++				   ether_setup);
+ 		break;
+ 	default:
+-		dev = alloc_etherdev_mqs(0, QETH_MAX_QUEUES, 1);
++		dev = alloc_etherdev_mqs(sizeof(*priv), QETH_MAX_QUEUES, 1);
+ 	}
+ 
+ 	if (!dev)
+ 		return NULL;
+ 
++	priv = netdev_priv(dev);
++	priv->rx_copybreak = QETH_RX_COPYBREAK;
++
+ 	dev->ml_priv = card;
+ 	dev->watchdog_timeo = QETH_TX_TIMEOUT;
+ 	dev->min_mtu = IS_OSN(card) ? 64 : 576;
+diff --git a/drivers/s390/net/qeth_ethtool.c b/drivers/s390/net/qeth_ethtool.c
+index ab59bc975719..9052c72d5b8f 100644
+--- a/drivers/s390/net/qeth_ethtool.c
++++ b/drivers/s390/net/qeth_ethtool.c
+@@ -175,6 +175,35 @@ static void qeth_get_channels(struct net_device *dev,
+ 	channels->combined_count = 0;
+ }
+ 
++static int qeth_get_tunable(struct net_device *dev,
++			    const struct ethtool_tunable *tuna, void *data)
++{
++	struct qeth_priv *priv = netdev_priv(dev);
++
++	switch (tuna->id) {
++	case ETHTOOL_RX_COPYBREAK:
++		*(u32 *)data = priv->rx_copybreak;
++		return 0;
++	default:
++		return -EOPNOTSUPP;
++	}
++}
++
++static int qeth_set_tunable(struct net_device *dev,
++			    const struct ethtool_tunable *tuna,
++			    const void *data)
++{
++	struct qeth_priv *priv = netdev_priv(dev);
++
++	switch (tuna->id) {
++	case ETHTOOL_RX_COPYBREAK:
++		WRITE_ONCE(priv->rx_copybreak, *(u32 *)data);
++		return 0;
++	default:
++		return -EOPNOTSUPP;
++	}
++}
++
+ /* Helper function to fill 'advertising' and 'supported' which are the same. */
+ /* Autoneg and full-duplex are supported and advertised unconditionally.     */
+ /* Always advertise and support all speeds up to specified, and only one     */
+@@ -381,6 +410,8 @@ const struct ethtool_ops qeth_ethtool_ops = {
+ 	.get_sset_count = qeth_get_sset_count,
+ 	.get_drvinfo = qeth_get_drvinfo,
+ 	.get_channels = qeth_get_channels,
++	.get_tunable = qeth_get_tunable,
++	.set_tunable = qeth_set_tunable,
+ 	.get_link_ksettings = qeth_get_link_ksettings,
+ };
+ 
