@@ -110,7 +110,7 @@ static int __vlan_vid_add(struct net_device *dev, struct net_bridge *br,
 	/* Try switchdev op first. In case it is not supported, fallback to
 	 * 8021q add.
 	 */
-	err = br_switchdev_port_vlan_add(dev, v->vid, flags, extack);
+	err = br_switchdev_port_vlan_add(dev, v->vid, flags, false, extack);
 	if (err == -EOPNOTSUPP)
 		return vlan_vid_add(dev, br->vlan_proto, v->vid);
 	v->priv_flags |= BR_VLFLAG_ADDED_BY_SWITCHDEV;
@@ -304,7 +304,7 @@ static int __vlan_add(struct net_bridge_vlan *v, u16 flags,
 	} else {
 		if (br_vlan_should_use(v)) {
 			err = br_switchdev_port_vlan_add(dev, v->vid, flags,
-							 extack);
+							 false, extack);
 			if (err && err != -EOPNOTSUPP)
 				goto out;
 		}
@@ -715,7 +715,7 @@ static int br_vlan_add_existing(struct net_bridge *br,
 	 */
 	if (becomes_brentry || would_change) {
 		err = br_switchdev_port_vlan_add(br->dev, vlan->vid, flags,
-						 extack);
+						 would_change, extack);
 		if (err && err != -EOPNOTSUPP)
 			return err;
 	}
@@ -1290,8 +1290,8 @@ int nbp_vlan_add(struct net_bridge_port *port, u16 vid, u16 flags,
 
 		if (would_change) {
 			/* Pass the flags to the hardware bridge */
-			ret = br_switchdev_port_vlan_add(port->dev, vid,
-							 flags, extack);
+			ret = br_switchdev_port_vlan_add(port->dev, vid, flags,
+							 true, extack);
 			if (ret && ret != -EOPNOTSUPP)
 				return ret;
 		}
