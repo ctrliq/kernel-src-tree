@@ -1,0 +1,233 @@
+net: bridge: extend the process of special frames
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-358.el8
+commit-author Henrik Bjoernlund <henrik.bjoernlund@microchip.com>
+commit 90c628dd47ff4178f645b34938470bf43d02d123
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-358.el8/90c628dd.failed
+
+This patch extends the processing of frames in the bridge. Currently MRP
+frames needs special processing and the current implementation doesn't
+allow a nice way to process different frame types. Therefore try to
+improve this by adding a list that contains frame types that need
+special processing. This list is iterated for each input frame and if
+there is a match based on frame type then these functions will be called
+and decide what to do with the frame. It can process the frame then the
+bridge doesn't need to do anything or don't process so then the bridge
+will do normal forwarding.
+
+	Signed-off-by: Henrik Bjoernlund  <henrik.bjoernlund@microchip.com>
+	Reviewed-by: Horatiu Vultur  <horatiu.vultur@microchip.com>
+	Acked-by: Nikolay Aleksandrov <nikolay@nvidia.com>
+	Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+(cherry picked from commit 90c628dd47ff4178f645b34938470bf43d02d123)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/bridge/br_mrp.c
+diff --cc net/bridge/br_mrp.c
+index d673550412b4,f94d72bb7c32..000000000000
+--- a/net/bridge/br_mrp.c
++++ b/net/bridge/br_mrp.c
+@@@ -4,6 -4,34 +4,37 @@@
+  #include "br_private_mrp.h"
+  
+  static const u8 mrp_test_dmac[ETH_ALEN] = { 0x1, 0x15, 0x4e, 0x0, 0x0, 0x1 };
+++<<<<<<< HEAD
+++=======
++ static const u8 mrp_in_test_dmac[ETH_ALEN] = { 0x1, 0x15, 0x4e, 0x0, 0x0, 0x3 };
++ 
++ static int br_mrp_process(struct net_bridge_port *p, struct sk_buff *skb);
++ 
++ static struct br_frame_type mrp_frame_type __read_mostly = {
++ 	.type = cpu_to_be16(ETH_P_MRP),
++ 	.frame_handler = br_mrp_process,
++ };
++ 
++ static bool br_mrp_is_ring_port(struct net_bridge_port *p_port,
++ 				struct net_bridge_port *s_port,
++ 				struct net_bridge_port *port)
++ {
++ 	if (port == p_port ||
++ 	    port == s_port)
++ 		return true;
++ 
++ 	return false;
++ }
++ 
++ static bool br_mrp_is_in_port(struct net_bridge_port *i_port,
++ 			      struct net_bridge_port *port)
++ {
++ 	if (port == i_port)
++ 		return true;
++ 
++ 	return false;
++ }
+++>>>>>>> 90c628dd47ff (net: bridge: extend the process of special frames)
+  
+  static struct net_bridge_port *br_mrp_get_port(struct net_bridge *br,
+  					       u32 ifindex)
+@@@ -256,8 -438,23 +287,11 @@@ static void br_mrp_del_impl(struct net_
+  		rcu_assign_pointer(mrp->s_port, NULL);
+  	}
+  
+ -	p = rtnl_dereference(mrp->i_port);
+ -	if (p) {
+ -		spin_lock_bh(&br->lock);
+ -		state = netif_running(br->dev) ?
+ -				BR_STATE_FORWARDING : BR_STATE_DISABLED;
+ -		p->state = state;
+ -		p->flags &= ~BR_MRP_AWARE;
+ -		spin_unlock_bh(&br->lock);
+ -		br_mrp_port_switchdev_set_state(p, state);
+ -		rcu_assign_pointer(mrp->i_port, NULL);
+ -	}
+ -
+  	list_del_rcu(&mrp->list);
+  	kfree_rcu(mrp, rcu);
++ 
++ 	if (list_empty(&br->mrp_list))
++ 		br_del_frame(br, &mrp_frame_type);
+  }
+  
+  /* Adds a new MRP instance.
+@@@ -305,7 -503,11 +339,10 @@@ int br_mrp_add(struct net_bridge *br, s
+  	spin_unlock_bh(&br->lock);
+  	rcu_assign_pointer(mrp->s_port, p);
+  
++ 	if (list_empty(&br->mrp_list))
++ 		br_add_frame(br, &mrp_frame_type);
++ 
+  	INIT_DELAYED_WORK(&mrp->test_work, br_mrp_test_work_expired);
+ -	INIT_DELAYED_WORK(&mrp->in_test_work, br_mrp_in_test_work_expired);
+  	list_add_tail_rcu(&mrp->list, &br->mrp_list);
+  
+  	err = br_mrp_switchdev_add(br, mrp);
+diff --git a/net/bridge/br_device.c b/net/bridge/br_device.c
+index 54836c00fca8..c0f0e021d386 100644
+--- a/net/bridge/br_device.c
++++ b/net/bridge/br_device.c
+@@ -458,6 +458,7 @@ void br_dev_setup(struct net_device *dev)
+ 	spin_lock_init(&br->lock);
+ 	INIT_LIST_HEAD(&br->port_list);
+ 	INIT_HLIST_HEAD(&br->fdb_list);
++	INIT_HLIST_HEAD(&br->frame_type_list);
+ #if IS_ENABLED(CONFIG_BRIDGE_MRP)
+ 	INIT_LIST_HEAD(&br->mrp_list);
+ #endif
+diff --git a/net/bridge/br_input.c b/net/bridge/br_input.c
+index 9d0b5a313f16..441497441d26 100644
+--- a/net/bridge/br_input.c
++++ b/net/bridge/br_input.c
+@@ -255,6 +255,21 @@ static int nf_hook_bridge_pre(struct sk_buff *skb, struct sk_buff **pskb)
+ 	return RX_HANDLER_CONSUMED;
+ }
+ 
++/* Return 0 if the frame was not processed otherwise 1
++ * note: already called with rcu_read_lock
++ */
++static int br_process_frame_type(struct net_bridge_port *p,
++				 struct sk_buff *skb)
++{
++	struct br_frame_type *tmp;
++
++	hlist_for_each_entry_rcu(tmp, &p->br->frame_type_list, list)
++		if (unlikely(tmp->type == skb->protocol))
++			return tmp->frame_handler(p, skb);
++
++	return 0;
++}
++
+ /*
+  * Return NULL if skb is handled
+  * note: already called with rcu_read_lock
+@@ -345,7 +360,7 @@ static rx_handler_result_t br_handle_frame(struct sk_buff **pskb)
+ 		}
+ 	}
+ 
+-	if (unlikely(br_mrp_process(p, skb)))
++	if (unlikely(br_process_frame_type(p, skb)))
+ 		return RX_HANDLER_PASS;
+ 
+ forward:
+@@ -391,3 +406,19 @@ rx_handler_func_t *br_get_rx_handler(const struct net_device *dev)
+ 
+ 	return br_handle_frame;
+ }
++
++void br_add_frame(struct net_bridge *br, struct br_frame_type *ft)
++{
++	hlist_add_head_rcu(&ft->list, &br->frame_type_list);
++}
++
++void br_del_frame(struct net_bridge *br, struct br_frame_type *ft)
++{
++	struct br_frame_type *tmp;
++
++	hlist_for_each_entry(tmp, &br->frame_type_list, list)
++		if (ft == tmp) {
++			hlist_del_rcu(&ft->list);
++			return;
++		}
++}
+* Unmerged path net/bridge/br_mrp.c
+diff --git a/net/bridge/br_private.h b/net/bridge/br_private.h
+index 26b3cc8b3453..8f5e858d588f 100644
+--- a/net/bridge/br_private.h
++++ b/net/bridge/br_private.h
+@@ -373,7 +373,7 @@ enum net_bridge_opts {
+ struct net_bridge {
+ 	spinlock_t			lock;
+ 	spinlock_t			hash_lock;
+-	struct list_head		port_list;
++	struct hlist_head		frame_type_list;
+ 	struct net_device		*dev;
+ 	struct pcpu_sw_netstats		__percpu *stats;
+ 	unsigned long			options;
+@@ -385,6 +385,7 @@ struct net_bridge {
+ #endif
+ 
+ 	struct rhashtable		fdb_hash_tbl;
++	struct list_head		port_list;
+ #if IS_ENABLED(CONFIG_BRIDGE_NETFILTER)
+ 	union {
+ 		struct rtable		fake_rtable;
+@@ -676,6 +677,16 @@ int nbp_backup_change(struct net_bridge_port *p, struct net_device *backup_dev);
+ int br_handle_frame_finish(struct net *net, struct sock *sk, struct sk_buff *skb);
+ rx_handler_func_t *br_get_rx_handler(const struct net_device *dev);
+ 
++struct br_frame_type {
++	__be16			type;
++	int			(*frame_handler)(struct net_bridge_port *port,
++						 struct sk_buff *skb);
++	struct hlist_node	list;
++};
++
++void br_add_frame(struct net_bridge *br, struct br_frame_type *ft);
++void br_del_frame(struct net_bridge *br, struct br_frame_type *ft);
++
+ static inline bool br_rx_handler_check_rcu(const struct net_device *dev)
+ {
+ 	return rcu_dereference(dev->rx_handler) == br_get_rx_handler(dev);
+@@ -1305,7 +1316,6 @@ extern int (*br_fdb_test_addr_hook)(struct net_device *dev, unsigned char *addr)
+ #if IS_ENABLED(CONFIG_BRIDGE_MRP)
+ int br_mrp_parse(struct net_bridge *br, struct net_bridge_port *p,
+ 		 struct nlattr *attr, int cmd, struct netlink_ext_ack *extack);
+-int br_mrp_process(struct net_bridge_port *p, struct sk_buff *skb);
+ bool br_mrp_enabled(struct net_bridge *br);
+ void br_mrp_port_del(struct net_bridge *br, struct net_bridge_port *p);
+ int br_mrp_fill_info(struct sk_buff *skb, struct net_bridge *br);
+@@ -1317,11 +1327,6 @@ static inline int br_mrp_parse(struct net_bridge *br, struct net_bridge_port *p,
+ 	return -EOPNOTSUPP;
+ }
+ 
+-static inline int br_mrp_process(struct net_bridge_port *p, struct sk_buff *skb)
+-{
+-	return 0;
+-}
+-
+ static inline bool br_mrp_enabled(struct net_bridge *br)
+ {
+ 	return false;
