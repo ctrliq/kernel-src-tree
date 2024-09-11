@@ -1,0 +1,128 @@
+ch_ktls: do not send snd_una update to TCB in middle
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-338.el8
+commit-author Vinay Kumar Yadav <vinay.yadav@chelsio.com>
+commit e8a4155567b3c903f49cbf89b8017e9cc22c4fe4
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-338.el8/e8a41555.failed
+
+snd_una update should not be done when the same skb is being
+sent out.chcr_short_record_handler() sends it again even
+though SND_UNA update is already sent for the skb in
+chcr_ktls_xmit(), which causes mismatch in un-acked
+TCP seq number, later causes problem in sending out
+complete record.
+
+Fixes: 429765a149f1 ("chcr: handle partial end part of a record")
+	Signed-off-by: Vinay Kumar Yadav <vinay.yadav@chelsio.com>
+	Signed-off-by: Rohit Maheshwari <rohitm@chelsio.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit e8a4155567b3c903f49cbf89b8017e9cc22c4fe4)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/crypto/chelsio/chcr_ktls.c
+diff --cc drivers/crypto/chelsio/chcr_ktls.c
+index 887ecc2060e8,a3f5b80888e5..000000000000
+--- a/drivers/crypto/chelsio/chcr_ktls.c
++++ b/drivers/crypto/chelsio/chcr_ktls.c
+@@@ -1563,56 -1639,11 +1563,8 @@@ static void chcr_ktls_copy_record_in_sk
+  	nskb->data_len = record->len;
+  	nskb->len += record->len;
+  	nskb->truesize += record->len;
+ -	nskb->sk = skb->sk;
+ -	nskb->destructor = skb->destructor;
+ -	refcount_add(nskb->truesize, &nskb->sk->sk_wmem_alloc);
+  }
+  
+- /*
+-  * chcr_ktls_update_snd_una:  Reset the SEND_UNA. It will be done to avoid
+-  * sending the same segment again. It will discard the segment which is before
+-  * the current tx max.
+-  * @tx_info - driver specific tls info.
+-  * @q - TX queue.
+-  * return: NET_TX_OK/NET_XMIT_DROP.
+-  */
+- static int chcr_ktls_update_snd_una(struct chcr_ktls_info *tx_info,
+- 				    struct sge_eth_txq *q)
+- {
+- 	struct fw_ulptx_wr *wr;
+- 	unsigned int ndesc;
+- 	int credits;
+- 	void *pos;
+- 	u32 len;
+- 
+- 	len = sizeof(*wr) + roundup(CHCR_SET_TCB_FIELD_LEN, 16);
+- 	ndesc = DIV_ROUND_UP(len, 64);
+- 
+- 	credits = chcr_txq_avail(&q->q) - ndesc;
+- 	if (unlikely(credits < 0)) {
+- 		chcr_eth_txq_stop(q);
+- 		return NETDEV_TX_BUSY;
+- 	}
+- 
+- 	pos = &q->q.desc[q->q.pidx];
+- 
+- 	wr = pos;
+- 	/* ULPTX wr */
+- 	wr->op_to_compl = htonl(FW_WR_OP_V(FW_ULPTX_WR));
+- 	wr->cookie = 0;
+- 	/* fill len in wr field */
+- 	wr->flowid_len16 = htonl(FW_WR_LEN16_V(DIV_ROUND_UP(len, 16)));
+- 
+- 	pos += sizeof(*wr);
+- 
+- 	pos = chcr_write_cpl_set_tcb_ulp(tx_info, q, tx_info->tid, pos,
+- 					 TCB_SND_UNA_RAW_W,
+- 					 TCB_SND_UNA_RAW_V(TCB_SND_UNA_RAW_M),
+- 					 TCB_SND_UNA_RAW_V(0), 0);
+- 
+- 	chcr_txq_advance(&q->q, ndesc);
+- 	cxgb4_ring_tx_db(tx_info->adap, &q->q, ndesc);
+- 
+- 	return 0;
+- }
+- 
+  /*
+   * chcr_end_part_handler: This handler will handle the record which
+   * is complete or if record's end part is received. T6 adapter has a issue that
+@@@ -1793,31 -1843,10 +1745,35 @@@ static int chcr_short_record_handler(st
+  			}
+  			/* reset tcp_seq as per the prior_data_required len */
+  			tcp_seq -= prior_data_len;
+ +			/* include prio_data_len for  further calculation.
+ +			 */
+ +			data_len += prior_data_len;
+  		}
+++<<<<<<< HEAD:drivers/crypto/chelsio/chcr_ktls.c
+ +		/* reset snd una, so the middle record won't send the already
+ +		 * sent part.
+ +		 */
+ +		if (chcr_ktls_update_snd_una(tx_info, q))
+ +			goto out;
+ +		atomic64_inc(&tx_info->adap->chcr_stats.ktls_tx_middle_pkts);
+++=======
++ 		atomic64_inc(&tx_info->adap->ch_ktls_stats.ktls_tx_middle_pkts);
+++>>>>>>> e8a4155567b3 (ch_ktls: do not send snd_una update to TCB in middle):drivers/net/ethernet/chelsio/inline_crypto/ch_ktls/chcr_ktls.c
+  	} else {
+ -		atomic64_inc(&tx_info->adap->ch_ktls_stats.ktls_tx_start_pkts);
+ +		/* Else means, its a partial first part of the record. Check if
+ +		 * its only the header, don't need to send for encryption then.
+ +		 */
+ +		if (data_len <= TLS_HEADER_SIZE + tx_info->iv_size) {
+ +			if (chcr_ktls_tx_plaintxt(tx_info, skb, tcp_seq, mss,
+ +						  tcp_push_no_fin, q,
+ +						  tx_info->port_id,
+ +						  prior_data,
+ +						  prior_data_len)) {
+ +				goto out;
+ +			}
+ +			return 0;
+ +		}
+ +		atomic64_inc(&tx_info->adap->chcr_stats.ktls_tx_start_pkts);
+  	}
+  
+  	if (chcr_ktls_xmit_wr_short(skb, tx_info, q, tcp_seq, tcp_push_no_fin,
+* Unmerged path drivers/crypto/chelsio/chcr_ktls.c
