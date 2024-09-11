@@ -1,0 +1,238 @@
+net: bridge: multicast: use non-bh rcu flavor
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+Rebuild_CHGLOG: - [net] bridge: multicast: use non-bh rcu flavor (Ivan Vecera) [1859244]
+Rebuild_FUZZ: 94.12%
+commit-author Nikolay Aleksandrov <nikolay@cumulusnetworks.com>
+commit 4329596cb10d23c9e22c78e676a3667ef28ed62f
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/4329596c.failed
+
+The bridge multicast code has been using a mix of RCU and RCU-bh flavors
+sometimes in questionable way. Since we've moved to rhashtable just use
+non-bh RCU everywhere. In addition this simplifies freeing of objects
+and allows us to remove some unnecessary callback functions.
+
+v3: new patch
+
+	Signed-off-by: Nikolay Aleksandrov <nikolay@cumulusnetworks.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 4329596cb10d23c9e22c78e676a3667ef28ed62f)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/bridge/br_mdb.c
+#	net/bridge/br_multicast.c
+#	net/bridge/br_private.h
+diff --cc net/bridge/br_mdb.c
+index b629ecde1ced,79d4c9d253e0..000000000000
+--- a/net/bridge/br_mdb.c
++++ b/net/bridge/br_mdb.c
+@@@ -728,7 -710,7 +728,11 @@@ static int __br_mdb_del(struct net_brid
+  		rcu_assign_pointer(*pp, p->next);
+  		hlist_del_init(&p->mglist);
+  		del_timer(&p->timer);
+++<<<<<<< HEAD
+ +		call_rcu(&p->rcu, br_multicast_free_pg);
+++=======
++ 		kfree_rcu(p, rcu);
+++>>>>>>> 4329596cb10d (net: bridge: multicast: use non-bh rcu flavor)
+  		err = 0;
+  
+  		if (!mp->ports && !mp->host_joined &&
+diff --cc net/bridge/br_multicast.c
+index 24aa4991cef4,5b8cfef8bc4d..000000000000
+--- a/net/bridge/br_multicast.c
++++ b/net/bridge/br_multicast.c
+@@@ -180,65 -157,9 +180,49 @@@ struct net_bridge_mdb_entry *br_mdb_get
+  		return NULL;
+  	}
+  
+ -	return br_mdb_ip_get_rcu(br, &ip);
+ +	return br_mdb_ip_get(mdb, &ip);
+ +}
+ +
+ +static void br_mdb_free(struct rcu_head *head)
+ +{
+ +	struct net_bridge_mdb_htable *mdb =
+ +		container_of(head, struct net_bridge_mdb_htable, rcu);
+ +	struct net_bridge_mdb_htable *old = mdb->old;
+ +
+ +	mdb->old = NULL;
+ +	kfree(old->mhash);
+ +	kfree(old);
+ +}
+ +
+ +static int br_mdb_copy(struct net_bridge_mdb_htable *new,
+ +		       struct net_bridge_mdb_htable *old,
+ +		       int elasticity)
+ +{
+ +	struct net_bridge_mdb_entry *mp;
+ +	int maxlen;
+ +	int len;
+ +	int i;
+ +
+ +	for (i = 0; i < old->max; i++)
+ +		hlist_for_each_entry(mp, &old->mhash[i], hlist[old->ver])
+ +			hlist_add_head(&mp->hlist[new->ver],
+ +				       &new->mhash[br_ip_hash(new, &mp->addr)]);
+ +
+ +	if (!elasticity)
+ +		return 0;
+ +
+ +	maxlen = 0;
+ +	for (i = 0; i < new->max; i++) {
+ +		len = 0;
+ +		hlist_for_each_entry(mp, &new->mhash[i], hlist[new->ver])
+ +			len++;
+ +		if (len > maxlen)
+ +			maxlen = len;
+ +	}
+ +
+ +	return maxlen > elasticity ? -EINVAL : 0;
+  }
+  
+- void br_multicast_free_pg(struct rcu_head *head)
+- {
+- 	struct net_bridge_port_group *p =
+- 		container_of(head, struct net_bridge_port_group, rcu);
+- 
+- 	kfree(p);
+- }
+- 
+- static void br_multicast_free_group(struct rcu_head *head)
+- {
+- 	struct net_bridge_mdb_entry *mp =
+- 		container_of(head, struct net_bridge_mdb_entry, rcu);
+- 
+- 	kfree(mp);
+- }
+- 
+  static void br_multicast_group_expired(struct timer_list *t)
+  {
+  	struct net_bridge_mdb_entry *mp = from_timer(mp, t, timer);
+@@@ -255,12 -175,11 +239,16 @@@
+  	if (mp->ports)
+  		goto out;
+  
+ -	rhashtable_remove_fast(&br->mdb_hash_tbl, &mp->rhnode,
+ -			       br_mdb_rht_params);
+ -	hlist_del_rcu(&mp->mdb_node);
+ +	mdb = mlock_dereference(br->mdb, br);
+  
+++<<<<<<< HEAD
+ +	hlist_del_rcu(&mp->hlist[mdb->ver]);
+ +	mdb->size--;
+ +
+ +	call_rcu(&mp->rcu, br_multicast_free_group);
+++=======
++ 	kfree_rcu(mp, rcu);
+++>>>>>>> 4329596cb10d (net: bridge: multicast: use non-bh rcu flavor)
+  
+  out:
+  	spin_unlock(&br->multicast_lock);
+@@@ -291,7 -207,7 +279,11 @@@ static void br_multicast_del_pg(struct 
+  		del_timer(&p->timer);
+  		br_mdb_notify(br->dev, p->port, &pg->addr, RTM_DELMDB,
+  			      p->flags);
+++<<<<<<< HEAD
+ +		call_rcu(&p->rcu, br_multicast_free_pg);
+++=======
++ 		kfree_rcu(p, rcu);
+++>>>>>>> 4329596cb10d (net: bridge: multicast: use non-bh rcu flavor)
+  
+  		if (!mp->ports && !mp->host_joined &&
+  		    netif_running(br->dev))
+@@@ -1634,7 -1409,7 +1626,11 @@@ br_multicast_leave_group(struct net_bri
+  			rcu_assign_pointer(*pp, p->next);
+  			hlist_del_init(&p->mglist);
+  			del_timer(&p->timer);
+++<<<<<<< HEAD
+ +			call_rcu(&p->rcu, br_multicast_free_pg);
+++=======
++ 			kfree_rcu(p, rcu);
+++>>>>>>> 4329596cb10d (net: bridge: multicast: use non-bh rcu flavor)
+  			br_mdb_notify(br->dev, port, group, RTM_DELMDB,
+  				      p->flags);
+  
+@@@ -2030,40 -1814,20 +2026,53 @@@ void br_multicast_stop(struct net_bridg
+  
+  void br_multicast_dev_del(struct net_bridge *br)
+  {
+ +	struct net_bridge_mdb_htable *mdb;
+  	struct net_bridge_mdb_entry *mp;
+ -	struct hlist_node *tmp;
+ +	struct hlist_node *n;
+ +	u32 ver;
+ +	int i;
+  
+  	spin_lock_bh(&br->multicast_lock);
+++<<<<<<< HEAD
+ +	mdb = mlock_dereference(br->mdb, br);
+ +	if (!mdb)
+ +		goto out;
+ +
+ +	br->mdb = NULL;
+ +
+ +	ver = mdb->ver;
+ +	for (i = 0; i < mdb->max; i++) {
+ +		hlist_for_each_entry_safe(mp, n, &mdb->mhash[i],
+ +					  hlist[ver]) {
+ +			del_timer(&mp->timer);
+ +			call_rcu(&mp->rcu, br_multicast_free_group);
+ +		}
+ +	}
+ +
+ +	if (mdb->old) {
+ +		spin_unlock_bh(&br->multicast_lock);
+ +		rcu_barrier();
+ +		spin_lock_bh(&br->multicast_lock);
+ +		WARN_ON(mdb->old);
+ +	}
+ +
+ +	mdb->old = mdb;
+ +	call_rcu(&mdb->rcu, br_mdb_free);
+ +
+ +out:
+ +	spin_unlock_bh(&br->multicast_lock);
+++=======
++ 	hlist_for_each_entry_safe(mp, tmp, &br->mdb_list, mdb_node) {
++ 		del_timer(&mp->timer);
++ 		rhashtable_remove_fast(&br->mdb_hash_tbl, &mp->rhnode,
++ 				       br_mdb_rht_params);
++ 		hlist_del_rcu(&mp->mdb_node);
++ 		kfree_rcu(mp, rcu);
++ 	}
++ 	spin_unlock_bh(&br->multicast_lock);
++ 
++ 	rcu_barrier();
+++>>>>>>> 4329596cb10d (net: bridge: multicast: use non-bh rcu flavor)
+  }
+  
+  int br_multicast_set_router(struct net_bridge *br, unsigned long val)
+diff --cc net/bridge/br_private.h
+index 315031269bb0,cf1f7365deb3..000000000000
+--- a/net/bridge/br_private.h
++++ b/net/bridge/br_private.h
+@@@ -672,11 -676,9 +672,15 @@@ int br_multicast_set_igmp_version(struc
+  int br_multicast_set_mld_version(struct net_bridge *br, unsigned long val);
+  #endif
+  struct net_bridge_mdb_entry *
+ -br_mdb_ip_get(struct net_bridge *br, struct br_ip *dst);
+ +br_mdb_ip_get(struct net_bridge_mdb_htable *mdb, struct br_ip *dst);
+  struct net_bridge_mdb_entry *
+++<<<<<<< HEAD
+ +br_multicast_new_group(struct net_bridge *br, struct net_bridge_port *port,
+ +		       struct br_ip *group);
+ +void br_multicast_free_pg(struct rcu_head *head);
+++=======
++ br_multicast_new_group(struct net_bridge *br, struct br_ip *group);
+++>>>>>>> 4329596cb10d (net: bridge: multicast: use non-bh rcu flavor)
+  struct net_bridge_port_group *
+  br_multicast_new_port_group(struct net_bridge_port *port, struct br_ip *group,
+  			    struct net_bridge_port_group __rcu *next,
+* Unmerged path net/bridge/br_mdb.c
+* Unmerged path net/bridge/br_multicast.c
+* Unmerged path net/bridge/br_private.h
