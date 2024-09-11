@@ -1,0 +1,116 @@
+x86/head/64: Install startup GDT
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+Rebuild_CHGLOG: - [x86] head/64: Install startup GDT (Vitaly Kuznetsov) [1868080]
+Rebuild_FUZZ: 93.33%
+commit-author Joerg Roedel <jroedel@suse.de>
+commit 866b556efa1295934ed0bc20c2f208c93a873fb0
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/866b556e.failed
+
+Handling exceptions during boot requires a working GDT. The kernel GDT
+can't be used on the direct mapping, so load a startup GDT and setup
+segments.
+
+	Signed-off-by: Joerg Roedel <jroedel@suse.de>
+	Signed-off-by: Borislav Petkov <bp@suse.de>
+Link: https://lkml.kernel.org/r/20200907131613.12703-30-joro@8bytes.org
+(cherry picked from commit 866b556efa1295934ed0bc20c2f208c93a873fb0)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/include/asm/setup.h
+diff --cc arch/x86/include/asm/setup.h
+index ae13bc974416,5c2fd05bd52c..000000000000
+--- a/arch/x86/include/asm/setup.h
++++ b/arch/x86/include/asm/setup.h
+@@@ -46,6 -46,10 +46,13 @@@ extern unsigned long saved_video_mode
+  
+  extern void reserve_standard_io_resources(void);
+  extern void i386_reserve_resources(void);
+++<<<<<<< HEAD
+++=======
++ extern unsigned long __startup_64(unsigned long physaddr, struct boot_params *bp);
++ extern unsigned long __startup_secondary_64(void);
++ extern void startup_64_setup_env(unsigned long physbase);
++ extern int early_make_pgtable(unsigned long address);
+++>>>>>>> 866b556efa12 (x86/head/64: Install startup GDT)
+  
+  #ifdef CONFIG_X86_INTEL_MID
+  extern void x86_intel_mid_early_setup(void);
+* Unmerged path arch/x86/include/asm/setup.h
+diff --git a/arch/x86/kernel/head64.c b/arch/x86/kernel/head64.c
+index d68a9e3968b3..f782a6dab02a 100644
+--- a/arch/x86/kernel/head64.c
++++ b/arch/x86/kernel/head64.c
+@@ -61,6 +61,24 @@ unsigned long vmemmap_base __ro_after_init = __VMEMMAP_BASE_L4;
+ EXPORT_SYMBOL(vmemmap_base);
+ #endif
+ 
++/*
++ * GDT used on the boot CPU before switching to virtual addresses.
++ */
++static struct desc_struct startup_gdt[GDT_ENTRIES] = {
++	[GDT_ENTRY_KERNEL32_CS]         = GDT_ENTRY_INIT(0xc09b, 0, 0xfffff),
++	[GDT_ENTRY_KERNEL_CS]           = GDT_ENTRY_INIT(0xa09b, 0, 0xfffff),
++	[GDT_ENTRY_KERNEL_DS]           = GDT_ENTRY_INIT(0xc093, 0, 0xfffff),
++};
++
++/*
++ * Address needs to be set at runtime because it references the startup_gdt
++ * while the kernel still uses a direct mapping.
++ */
++static struct desc_ptr startup_gdt_descr = {
++	.size = sizeof(startup_gdt),
++	.address = 0,
++};
++
+ #define __head	__section(.head.text)
+ 
+ static void __head *fixup_pointer(void *ptr, unsigned long physaddr)
+@@ -487,3 +505,18 @@ void __init x86_64_start_reservations(char *real_mode_data)
+ 
+ 	start_kernel();
+ }
++
++/*
++ * Setup boot CPU state needed before kernel switches to virtual addresses.
++ */
++void __head startup_64_setup_env(unsigned long physbase)
++{
++	/* Load GDT */
++	startup_gdt_descr.address = (unsigned long)fixup_pointer(startup_gdt, physbase);
++	native_load_gdt(&startup_gdt_descr);
++
++	/* New GDT is live - reload data segment registers */
++	asm volatile("movl %%eax, %%ds\n"
++		     "movl %%eax, %%ss\n"
++		     "movl %%eax, %%es\n" : : "a"(__KERNEL_DS) : "memory");
++}
+diff --git a/arch/x86/kernel/head_64.S b/arch/x86/kernel/head_64.S
+index 71d0e0d7c055..5ada2dad71c6 100644
+--- a/arch/x86/kernel/head_64.S
++++ b/arch/x86/kernel/head_64.S
+@@ -75,6 +75,20 @@ startup_64:
+ 	/* Set up the stack for verify_cpu(), similar to initial_stack below */
+ 	leaq	(__end_init_task - SIZEOF_PTREGS)(%rip), %rsp
+ 
++	leaq	_text(%rip), %rdi
++	pushq	%rsi
++	call	startup_64_setup_env
++	popq	%rsi
++
++	/* Now switch to __KERNEL_CS so IRET works reliably */
++	pushq	$__KERNEL_CS
++	leaq	.Lon_kernel_cs(%rip), %rax
++	pushq	%rax
++	lretq
++
++.Lon_kernel_cs:
++	UNWIND_HINT_EMPTY
++
+ 	/* Sanitize CPU configuration */
+ 	call verify_cpu
+ 
