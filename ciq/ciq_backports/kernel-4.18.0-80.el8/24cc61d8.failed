@@ -1,0 +1,101 @@
+arm64: memblock: don't permit memblock resizing until linear mapping is up
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-80.el8
+commit-author Ard Biesheuvel <ard.biesheuvel@linaro.org>
+commit 24cc61d8cb5a9232fadf21a830061853c1268fdd
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-80.el8/24cc61d8.failed
+
+Bhupesh reports that having numerous memblock reservations at early
+boot may result in the following crash:
+
+  Unable to handle kernel paging request at virtual address ffff80003ffe0000
+  ...
+  Call trace:
+   __memcpy+0x110/0x180
+   memblock_add_range+0x134/0x2e8
+   memblock_reserve+0x70/0xb8
+   memblock_alloc_base_nid+0x6c/0x88
+   __memblock_alloc_base+0x3c/0x4c
+   memblock_alloc_base+0x28/0x4c
+   memblock_alloc+0x2c/0x38
+   early_pgtable_alloc+0x20/0xb0
+   paging_init+0x28/0x7f8
+
+This is caused by the fact that we permit memblock resizing before the
+linear mapping is up, and so the memblock_reserved() array is moved
+into memory that is not mapped yet.
+
+So let's ensure that this crash can no longer occur, by deferring to
+call to memblock_allow_resize() to after the linear mapping has been
+created.
+
+	Reported-by: Bhupesh Sharma <bhsharma@redhat.com>
+	Acked-by: Will Deacon <will.deacon@arm.com>
+	Tested-by: Marc Zyngier <marc.zyngier@arm.com>
+	Signed-off-by: Ard Biesheuvel <ard.biesheuvel@linaro.org>
+	Signed-off-by: Catalin Marinas <catalin.marinas@arm.com>
+(cherry picked from commit 24cc61d8cb5a9232fadf21a830061853c1268fdd)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/arm64/mm/mmu.c
+diff --cc arch/arm64/mm/mmu.c
+index 493ff75670ff,d1d6601b385d..000000000000
+--- a/arch/arm64/mm/mmu.c
++++ b/arch/arm64/mm/mmu.c
+@@@ -634,28 -652,15 +634,35 @@@ void __init paging_init(void
+  	map_kernel(pgdp);
+  	map_mem(pgdp);
+  
+ -	pgd_clear_fixmap();
+ -
+ +	/*
+ +	 * We want to reuse the original swapper_pg_dir so we don't have to
+ +	 * communicate the new address to non-coherent secondaries in
+ +	 * secondary_entry, and so cpu_switch_mm can generate the address with
+ +	 * adrp+add rather than a load from some global variable.
+ +	 *
+ +	 * To do this we need to go via a temporary pgd.
+ +	 */
+ +	cpu_replace_ttbr1(__va(pgd_phys));
+ +	memcpy(swapper_pg_dir, pgdp, PGD_SIZE);
+  	cpu_replace_ttbr1(lm_alias(swapper_pg_dir));
+ -	init_mm.pgd = swapper_pg_dir;
+  
+++<<<<<<< HEAD
+ +	pgd_clear_fixmap();
+ +	memblock_free(pgd_phys, PAGE_SIZE);
+ +
+ +	/*
+ +	 * We only reuse the PGD from the swapper_pg_dir, not the pud + pmd
+ +	 * allocated with it.
+ +	 */
+ +	memblock_free(__pa_symbol(swapper_pg_dir) + PAGE_SIZE,
+ +		      __pa_symbol(swapper_pg_end) - __pa_symbol(swapper_pg_dir)
+ +		      - PAGE_SIZE);
+++=======
++ 	memblock_free(__pa_symbol(init_pg_dir),
++ 		      __pa_symbol(init_pg_end) - __pa_symbol(init_pg_dir));
++ 
++ 	memblock_allow_resize();
+++>>>>>>> 24cc61d8cb5a (arm64: memblock: don't permit memblock resizing until linear mapping is up)
+  }
+  
+  /*
+diff --git a/arch/arm64/mm/init.c b/arch/arm64/mm/init.c
+index 9abf8a1e7b25..5440cda05385 100644
+--- a/arch/arm64/mm/init.c
++++ b/arch/arm64/mm/init.c
+@@ -482,8 +482,6 @@ void __init arm64_memblock_init(void)
+ 	high_memory = __va(memblock_end_of_DRAM() - 1) + 1;
+ 
+ 	dma_contiguous_reserve(arm64_dma_phys_limit);
+-
+-	memblock_allow_resize();
+ }
+ 
+ void __init bootmem_init(void)
+* Unmerged path arch/arm64/mm/mmu.c
