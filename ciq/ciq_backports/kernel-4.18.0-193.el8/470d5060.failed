@@ -1,0 +1,368 @@
+net: sched: use get_dev() action API in flow_action infra
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-193.el8
+Rebuild_CHGLOG: - [net] sched: use get_dev() action API in flow_action infra (Ivan Vecera) [1739606]
+Rebuild_FUZZ: 95.41%
+commit-author Vlad Buslov <vladbu@mellanox.com>
+commit 470d5060e6b3b8fae47d944601855e9ece7a2470
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-193.el8/470d5060.failed
+
+When filling in hardware intermediate representation tc_setup_flow_action()
+directly obtains, checks and takes reference to dev used by mirred action,
+instead of using act->ops->get_dev() API created specifically for this
+purpose. In order to remove code duplication, refactor flow_action infra to
+use action API when obtaining mirred action target dev. Extend get_dev()
+with additional argument that is used to provide dev destructor to the
+user.
+
+Fixes: 5a6ff4b13d59 ("net: sched: take reference to action dev before calling offloads")
+	Signed-off-by: Vlad Buslov <vladbu@mellanox.com>
+	Acked-by: Jiri Pirko <jiri@mellanox.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 470d5060e6b3b8fae47d944601855e9ece7a2470)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/net/act_api.h
+#	net/sched/cls_api.c
+diff --cc include/net/act_api.h
+index c61a1bf4e3de,b18c699681ca..000000000000
+--- a/include/net/act_api.h
++++ b/include/net/act_api.h
+@@@ -98,8 -101,11 +98,16 @@@ struct tc_action_ops 
+  			struct netlink_ext_ack *);
+  	void	(*stats_update)(struct tc_action *, u64, u32, u64, bool);
+  	size_t  (*get_fill_size)(const struct tc_action *act);
+++<<<<<<< HEAD
+ +	struct net_device *(*get_dev)(const struct tc_action *a);
+ +	void	(*put_dev)(struct net_device *dev);
+++=======
++ 	struct net_device *(*get_dev)(const struct tc_action *a,
++ 				      tc_action_priv_destructor *destructor);
++ 	struct psample_group *
++ 	(*get_psample_group)(const struct tc_action *a,
++ 			     tc_action_priv_destructor *destructor);
+++>>>>>>> 470d5060e6b3 (net: sched: use get_dev() action API in flow_action infra)
+  };
+  
+  struct tc_action_net {
+diff --cc net/sched/cls_api.c
+index 081ac3d0fb50,32577c248968..000000000000
+--- a/net/sched/cls_api.c
++++ b/net/sched/cls_api.c
+@@@ -3266,13 -3084,254 +3266,229 @@@ int tc_setup_cb_call(struct tcf_block *
+  	}
+  	return ok_count;
+  }
+ -
+ -int tc_setup_cb_call(struct tcf_block *block, enum tc_setup_type type,
+ -		     void *type_data, bool err_stop, bool rtnl_held)
+ -{
+ -	bool take_rtnl = READ_ONCE(block->lockeddevcnt) && !rtnl_held;
+ -	int ok_count;
+ -
+ -retry:
+ -	if (take_rtnl)
+ -		rtnl_lock();
+ -	down_read(&block->cb_lock);
+ -	/* Need to obtain rtnl lock if block is bound to devs that require it.
+ -	 * In block bind code cb_lock is obtained while holding rtnl, so we must
+ -	 * obtain the locks in same order here.
+ -	 */
+ -	if (!rtnl_held && !take_rtnl && block->lockeddevcnt) {
+ -		up_read(&block->cb_lock);
+ -		take_rtnl = true;
+ -		goto retry;
+ -	}
+ -
+ -	ok_count = __tc_setup_cb_call(block, type, type_data, err_stop);
+ -
+ -	up_read(&block->cb_lock);
+ -	if (take_rtnl)
+ -		rtnl_unlock();
+ -	return ok_count;
+ -}
+  EXPORT_SYMBOL(tc_setup_cb_call);
+  
+++<<<<<<< HEAD
+++=======
++ /* Non-destructive filter add. If filter that wasn't already in hardware is
++  * successfully offloaded, increment block offloads counter. On failure,
++  * previously offloaded filter is considered to be intact and offloads counter
++  * is not decremented.
++  */
++ 
++ int tc_setup_cb_add(struct tcf_block *block, struct tcf_proto *tp,
++ 		    enum tc_setup_type type, void *type_data, bool err_stop,
++ 		    u32 *flags, unsigned int *in_hw_count, bool rtnl_held)
++ {
++ 	bool take_rtnl = READ_ONCE(block->lockeddevcnt) && !rtnl_held;
++ 	int ok_count;
++ 
++ retry:
++ 	if (take_rtnl)
++ 		rtnl_lock();
++ 	down_read(&block->cb_lock);
++ 	/* Need to obtain rtnl lock if block is bound to devs that require it.
++ 	 * In block bind code cb_lock is obtained while holding rtnl, so we must
++ 	 * obtain the locks in same order here.
++ 	 */
++ 	if (!rtnl_held && !take_rtnl && block->lockeddevcnt) {
++ 		up_read(&block->cb_lock);
++ 		take_rtnl = true;
++ 		goto retry;
++ 	}
++ 
++ 	/* Make sure all netdevs sharing this block are offload-capable. */
++ 	if (block->nooffloaddevcnt && err_stop) {
++ 		ok_count = -EOPNOTSUPP;
++ 		goto err_unlock;
++ 	}
++ 
++ 	ok_count = __tc_setup_cb_call(block, type, type_data, err_stop);
++ 	if (ok_count < 0)
++ 		goto err_unlock;
++ 
++ 	if (tp->ops->hw_add)
++ 		tp->ops->hw_add(tp, type_data);
++ 	if (ok_count > 0)
++ 		tc_cls_offload_cnt_update(block, tp, in_hw_count, flags,
++ 					  ok_count, true);
++ err_unlock:
++ 	up_read(&block->cb_lock);
++ 	if (take_rtnl)
++ 		rtnl_unlock();
++ 	return ok_count < 0 ? ok_count : 0;
++ }
++ EXPORT_SYMBOL(tc_setup_cb_add);
++ 
++ /* Destructive filter replace. If filter that wasn't already in hardware is
++  * successfully offloaded, increment block offload counter. On failure,
++  * previously offloaded filter is considered to be destroyed and offload counter
++  * is decremented.
++  */
++ 
++ int tc_setup_cb_replace(struct tcf_block *block, struct tcf_proto *tp,
++ 			enum tc_setup_type type, void *type_data, bool err_stop,
++ 			u32 *old_flags, unsigned int *old_in_hw_count,
++ 			u32 *new_flags, unsigned int *new_in_hw_count,
++ 			bool rtnl_held)
++ {
++ 	bool take_rtnl = READ_ONCE(block->lockeddevcnt) && !rtnl_held;
++ 	int ok_count;
++ 
++ retry:
++ 	if (take_rtnl)
++ 		rtnl_lock();
++ 	down_read(&block->cb_lock);
++ 	/* Need to obtain rtnl lock if block is bound to devs that require it.
++ 	 * In block bind code cb_lock is obtained while holding rtnl, so we must
++ 	 * obtain the locks in same order here.
++ 	 */
++ 	if (!rtnl_held && !take_rtnl && block->lockeddevcnt) {
++ 		up_read(&block->cb_lock);
++ 		take_rtnl = true;
++ 		goto retry;
++ 	}
++ 
++ 	/* Make sure all netdevs sharing this block are offload-capable. */
++ 	if (block->nooffloaddevcnt && err_stop) {
++ 		ok_count = -EOPNOTSUPP;
++ 		goto err_unlock;
++ 	}
++ 
++ 	tc_cls_offload_cnt_reset(block, tp, old_in_hw_count, old_flags);
++ 	if (tp->ops->hw_del)
++ 		tp->ops->hw_del(tp, type_data);
++ 
++ 	ok_count = __tc_setup_cb_call(block, type, type_data, err_stop);
++ 	if (ok_count < 0)
++ 		goto err_unlock;
++ 
++ 	if (tp->ops->hw_add)
++ 		tp->ops->hw_add(tp, type_data);
++ 	if (ok_count > 0)
++ 		tc_cls_offload_cnt_update(block, tp, new_in_hw_count,
++ 					  new_flags, ok_count, true);
++ err_unlock:
++ 	up_read(&block->cb_lock);
++ 	if (take_rtnl)
++ 		rtnl_unlock();
++ 	return ok_count < 0 ? ok_count : 0;
++ }
++ EXPORT_SYMBOL(tc_setup_cb_replace);
++ 
++ /* Destroy filter and decrement block offload counter, if filter was previously
++  * offloaded.
++  */
++ 
++ int tc_setup_cb_destroy(struct tcf_block *block, struct tcf_proto *tp,
++ 			enum tc_setup_type type, void *type_data, bool err_stop,
++ 			u32 *flags, unsigned int *in_hw_count, bool rtnl_held)
++ {
++ 	bool take_rtnl = READ_ONCE(block->lockeddevcnt) && !rtnl_held;
++ 	int ok_count;
++ 
++ retry:
++ 	if (take_rtnl)
++ 		rtnl_lock();
++ 	down_read(&block->cb_lock);
++ 	/* Need to obtain rtnl lock if block is bound to devs that require it.
++ 	 * In block bind code cb_lock is obtained while holding rtnl, so we must
++ 	 * obtain the locks in same order here.
++ 	 */
++ 	if (!rtnl_held && !take_rtnl && block->lockeddevcnt) {
++ 		up_read(&block->cb_lock);
++ 		take_rtnl = true;
++ 		goto retry;
++ 	}
++ 
++ 	ok_count = __tc_setup_cb_call(block, type, type_data, err_stop);
++ 
++ 	tc_cls_offload_cnt_reset(block, tp, in_hw_count, flags);
++ 	if (tp->ops->hw_del)
++ 		tp->ops->hw_del(tp, type_data);
++ 
++ 	up_read(&block->cb_lock);
++ 	if (take_rtnl)
++ 		rtnl_unlock();
++ 	return ok_count < 0 ? ok_count : 0;
++ }
++ EXPORT_SYMBOL(tc_setup_cb_destroy);
++ 
++ int tc_setup_cb_reoffload(struct tcf_block *block, struct tcf_proto *tp,
++ 			  bool add, flow_setup_cb_t *cb,
++ 			  enum tc_setup_type type, void *type_data,
++ 			  void *cb_priv, u32 *flags, unsigned int *in_hw_count)
++ {
++ 	int err = cb(type, type_data, cb_priv);
++ 
++ 	if (err) {
++ 		if (add && tc_skip_sw(*flags))
++ 			return err;
++ 	} else {
++ 		tc_cls_offload_cnt_update(block, tp, in_hw_count, flags, 1,
++ 					  add);
++ 	}
++ 
++ 	return 0;
++ }
++ EXPORT_SYMBOL(tc_setup_cb_reoffload);
++ 
++ void tc_cleanup_flow_action(struct flow_action *flow_action)
++ {
++ 	struct flow_action_entry *entry;
++ 	int i;
++ 
++ 	flow_action_for_each(i, entry, flow_action)
++ 		if (entry->destructor)
++ 			entry->destructor(entry->destructor_priv);
++ }
++ EXPORT_SYMBOL(tc_cleanup_flow_action);
++ 
++ static void tcf_mirred_get_dev(struct flow_action_entry *entry,
++ 			       const struct tc_action *act)
++ {
++ #ifdef CONFIG_NET_CLS_ACT
++ 	entry->dev = act->ops->get_dev(act, &entry->destructor);
++ 	if (!entry->dev)
++ 		return;
++ 	entry->destructor_priv = entry->dev;
++ #endif
++ }
++ 
++ static void tcf_tunnel_encap_put_tunnel(void *priv)
++ {
++ 	struct ip_tunnel_info *tunnel = priv;
++ 
++ 	kfree(tunnel);
++ }
++ 
++ static int tcf_tunnel_encap_get_tunnel(struct flow_action_entry *entry,
++ 				       const struct tc_action *act)
++ {
++ 	entry->tunnel = tcf_tunnel_info_copy(act);
++ 	if (!entry->tunnel)
++ 		return -ENOMEM;
++ 	entry->destructor = tcf_tunnel_encap_put_tunnel;
++ 	entry->destructor_priv = entry->tunnel;
++ 	return 0;
++ }
++ 
++ static void tcf_sample_get_group(struct flow_action_entry *entry,
++ 				 const struct tc_action *act)
++ {
++ #ifdef CONFIG_NET_CLS_ACT
++ 	entry->sample.psample_group =
++ 		act->ops->get_psample_group(act, &entry->destructor);
++ 	entry->destructor_priv = entry->sample.psample_group;
++ #endif
++ }
++ 
+++>>>>>>> 470d5060e6b3 (net: sched: use get_dev() action API in flow_action infra)
+  int tc_setup_flow_action(struct flow_action *flow_action,
+ -			 const struct tcf_exts *exts, bool rtnl_held)
+ +			 const struct tcf_exts *exts)
+  {
+  	const struct tc_action *act;
+ -	int i, j, k, err = 0;
+ +	int i, j, k;
+  
+  	if (!exts)
+  		return 0;
+* Unmerged path include/net/act_api.h
+diff --git a/net/sched/act_mirred.c b/net/sched/act_mirred.c
+index e6cee7103d5b..90ca57ff2d86 100644
+--- a/net/sched/act_mirred.c
++++ b/net/sched/act_mirred.c
+@@ -412,25 +412,31 @@ static struct notifier_block mirred_device_notifier = {
+ 	.notifier_call = mirred_device_event,
+ };
+ 
+-static struct net_device *tcf_mirred_get_dev(const struct tc_action *a)
++static void tcf_mirred_dev_put(void *priv)
++{
++	struct net_device *dev = priv;
++
++	dev_put(dev);
++}
++
++static struct net_device *
++tcf_mirred_get_dev(const struct tc_action *a,
++		   tc_action_priv_destructor *destructor)
+ {
+ 	struct tcf_mirred *m = to_mirred(a);
+ 	struct net_device *dev;
+ 
+ 	rcu_read_lock();
+ 	dev = rcu_dereference(m->tcfm_dev);
+-	if (dev)
++	if (dev) {
+ 		dev_hold(dev);
++		*destructor = tcf_mirred_dev_put;
++	}
+ 	rcu_read_unlock();
+ 
+ 	return dev;
+ }
+ 
+-static void tcf_mirred_put_dev(struct net_device *dev)
+-{
+-	dev_put(dev);
+-}
+-
+ static size_t tcf_mirred_get_fill_size(const struct tc_action *act)
+ {
+ 	return nla_total_size(sizeof(struct tc_mirred));
+@@ -450,7 +456,6 @@ static struct tc_action_ops act_mirred_ops = {
+ 	.get_fill_size	=	tcf_mirred_get_fill_size,
+ 	.size		=	sizeof(struct tcf_mirred),
+ 	.get_dev	=	tcf_mirred_get_dev,
+-	.put_dev	=	tcf_mirred_put_dev,
+ };
+ 
+ static __net_init int mirred_init_net(struct net *net)
+* Unmerged path net/sched/cls_api.c
