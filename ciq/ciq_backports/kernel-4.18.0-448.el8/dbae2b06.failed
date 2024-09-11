@@ -1,0 +1,135 @@
+net: skb: introduce and use a single page frag cache
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-448.el8
+commit-author Paolo Abeni <pabeni@redhat.com>
+commit dbae2b062824fc2d35ae2d5df2f500626c758e80
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-448.el8/dbae2b06.failed
+
+After commit 3226b158e67c ("net: avoid 32 x truesize under-estimation
+for tiny skbs") we are observing 10-20% regressions in performance
+tests with small packets. The perf trace points to high pressure on
+the slab allocator.
+
+This change tries to improve the allocation schema for small packets
+using an idea originally suggested by Eric: a new per CPU page frag is
+introduced and used in __napi_alloc_skb to cope with small allocation
+requests.
+
+To ensure that the above does not lead to excessive truesize
+underestimation, the frag size for small allocation is inflated to 1K
+and all the above is restricted to build with 4K page size.
+
+Note that we need to update accordingly the run-time check introduced
+with commit fd9ea57f4e95 ("net: add napi_get_frags_check() helper").
+
+Alex suggested a smart page refcount schema to reduce the number
+of atomic operations and deal properly with pfmemalloc pages.
+
+Under small packet UDP flood, I measure a 15% peak tput increases.
+
+	Suggested-by: Eric Dumazet <eric.dumazet@gmail.com>
+	Suggested-by: Alexander H Duyck <alexanderduyck@fb.com>
+	Signed-off-by: Paolo Abeni <pabeni@redhat.com>
+	Reviewed-by: Eric Dumazet <edumazet@google.com>
+	Reviewed-by: Alexander Duyck <alexanderduyck@fb.com>
+Link: https://lore.kernel.org/r/6b6f65957c59f86a353fc09a5127e83a32ab5999.1664350652.git.pabeni@redhat.com
+	Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+(cherry picked from commit dbae2b062824fc2d35ae2d5df2f500626c758e80)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/core/dev.c
+#	net/core/skbuff.c
+diff --cc net/core/dev.c
+index 45aadd118414,fa53830d0683..000000000000
+--- a/net/core/dev.c
++++ b/net/core/dev.c
+@@@ -6657,8 -6358,8 +6657,13 @@@ int dev_set_threaded(struct net_device 
+  }
+  EXPORT_SYMBOL(dev_set_threaded);
+  
+++<<<<<<< HEAD
+ +void netif_napi_add(struct net_device *dev, struct napi_struct *napi,
+ +		    int (*poll)(struct napi_struct *, int), int weight)
+++=======
++ void netif_napi_add_weight(struct net_device *dev, struct napi_struct *napi,
++ 			   int (*poll)(struct napi_struct *, int), int weight)
+++>>>>>>> dbae2b062824 (net: skb: introduce and use a single page frag cache)
+  {
+  	if (WARN_ON(test_and_set_bit(NAPI_STATE_LISTED, &napi->state)))
+  		return;
+diff --cc net/core/skbuff.c
+index 521e8dd22ff3,1d9719e72f9d..000000000000
+--- a/net/core/skbuff.c
++++ b/net/core/skbuff.c
+@@@ -137,8 -201,24 +195,29 @@@ struct napi_alloc_cache 
+  static DEFINE_PER_CPU(struct page_frag_cache, netdev_alloc_cache);
+  static DEFINE_PER_CPU(struct napi_alloc_cache, napi_alloc_cache);
+  
+++<<<<<<< HEAD
+ +static void *__alloc_frag_align(unsigned int fragsz, gfp_t gfp_mask,
+ +				unsigned int align_mask)
+++=======
++ /* Double check that napi_get_frags() allocates skbs with
++  * skb->head being backed by slab, not a page fragment.
++  * This is to make sure bug fixed in 3226b158e67c
++  * ("net: avoid 32 x truesize under-estimation for tiny skbs")
++  * does not accidentally come back.
++  */
++ void napi_get_frags_check(struct napi_struct *napi)
++ {
++ 	struct sk_buff *skb;
++ 
++ 	local_bh_disable();
++ 	skb = napi_get_frags(napi);
++ 	WARN_ON_ONCE(!NAPI_HAS_SMALL_PAGE_FRAG && skb && skb->head_frag);
++ 	napi_free_frags(napi);
++ 	local_bh_enable();
++ }
++ 
++ void *__napi_alloc_frag_align(unsigned int fragsz, unsigned int align_mask)
+++>>>>>>> dbae2b062824 (net: skb: introduce and use a single page frag cache)
+  {
+  	struct napi_alloc_cache *nc = this_cpu_ptr(&napi_alloc_cache);
+  
+@@@ -556,8 -636,10 +635,9 @@@ struct sk_buff *__napi_alloc_skb(struc
+  {
+  	struct napi_alloc_cache *nc;
+  	struct sk_buff *skb;
++ 	bool pfmemalloc;
+  	void *data;
+  
+ -	DEBUG_NET_WARN_ON_ONCE(!in_softirq());
+  	len += NET_SKB_PAD + NET_IP_ALIGN;
+  
+  	/* If requested length is either too small or too big,
+@@@ -590,8 -694,7 +692,12 @@@
+  		return NULL;
+  	}
+  
+++<<<<<<< HEAD
+ +	/* use OR instead of assignment to avoid clearing of bits in mask */
+ +	if (nc->page.pfmemalloc)
+++=======
++ 	if (pfmemalloc)
+++>>>>>>> dbae2b062824 (net: skb: introduce and use a single page frag cache)
+  		skb->pfmemalloc = 1;
+  	skb->head_frag = 1;
+  
+diff --git a/include/linux/netdevice.h b/include/linux/netdevice.h
+index 379d8bad852d..3cfeb6a3fa64 100644
+--- a/include/linux/netdevice.h
++++ b/include/linux/netdevice.h
+@@ -3972,6 +3972,7 @@ void netif_receive_skb_list(struct list_head *head);
+ gro_result_t napi_gro_receive(struct napi_struct *napi, struct sk_buff *skb);
+ void napi_gro_flush(struct napi_struct *napi, bool flush_old);
+ struct sk_buff *napi_get_frags(struct napi_struct *napi);
++void napi_get_frags_check(struct napi_struct *napi);
+ gro_result_t napi_gro_frags(struct napi_struct *napi);
+ struct packet_offload *gro_find_receive_by_type(__be16 type);
+ struct packet_offload *gro_find_complete_by_type(__be16 type);
+* Unmerged path net/core/dev.c
+* Unmerged path net/core/skbuff.c
