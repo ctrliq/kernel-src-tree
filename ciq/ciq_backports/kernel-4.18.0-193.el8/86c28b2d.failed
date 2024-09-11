@@ -1,0 +1,80 @@
+nfp: bpf: fix latency bug when updating stack index register
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-193.el8
+commit-author Jiong Wang <jiong.wang@netronome.com>
+commit 86c28b2d69f93a218a9a5cef146ed0097a98687f
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-193.el8/86c28b2d.failed
+
+NFP is using Local Memory to model stack. LM_addr could be used as base of
+a 16 32-bit word region of Local Memory. Then, if the stack offset is
+beyond the current region, the local index needs to be updated. The update
+needs at least three cycles to take effect, therefore the sequence normally
+looks like:
+
+  local_csr_wr[ActLMAddr3, gprB_5]
+  nop
+  nop
+  nop
+
+If the local index switch happens on a narrow loads, then the instruction
+preparing value to zero high 32-bit of the destination register could be
+counted as one cycle, the sequence then could be something like:
+
+  local_csr_wr[ActLMAddr3, gprB_5]
+  nop
+  nop
+  immed[gprB_5, 0]
+
+However, we have zero extension optimization that zeroing high 32-bit could
+be eliminated, therefore above IMMED insn won't be available for which case
+the first sequence needs to be generated.
+
+Fixes: 0b4de1ff19bf ("nfp: bpf: eliminate zero extension code-gen")
+	Signed-off-by: Jiong Wang <jiong.wang@netronome.com>
+	Reviewed-by: Jakub Kicinski <jakub.kicinski@netronome.com>
+	Signed-off-by: Jakub Kicinski <jakub.kicinski@netronome.com>
+	Signed-off-by: Daniel Borkmann <daniel@iogearbox.net>
+(cherry picked from commit 86c28b2d69f93a218a9a5cef146ed0097a98687f)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/netronome/nfp/bpf/jit.c
+diff --cc drivers/net/ethernet/netronome/nfp/bpf/jit.c
+index 73e94815a52e,5afcb3c4c2ef..000000000000
+--- a/drivers/net/ethernet/netronome/nfp/bpf/jit.c
++++ b/drivers/net/ethernet/netronome/nfp/bpf/jit.c
+@@@ -1197,14 -1209,23 +1197,28 @@@ mem_op_stack(struct nfp_prog *nfp_prog
+  
+  		needs_inc = true;
+  	}
++ 
++ 	narrow_ld = clr_gpr && size < 8;
++ 
+  	if (lm3) {
++ 		unsigned int nop_cnt;
++ 
+  		emit_csr_wr(nfp_prog, imm_b(nfp_prog), NFP_CSR_ACT_LM_ADDR3);
+- 		/* For size < 4 one slot will be filled by zeroing of upper. */
+- 		wrp_nops(nfp_prog, clr_gpr && size < 8 ? 2 : 3);
++ 		/* For size < 4 one slot will be filled by zeroing of upper,
++ 		 * but be careful, that zeroing could be eliminated by zext
++ 		 * optimization.
++ 		 */
++ 		nop_cnt = narrow_ld && meta->flags & FLAG_INSN_DO_ZEXT ? 2 : 3;
++ 		wrp_nops(nfp_prog, nop_cnt);
+  	}
+  
+++<<<<<<< HEAD
+ +	if (clr_gpr && size < 8)
+ +		wrp_immed(nfp_prog, reg_both(gpr + 1), 0);
+++=======
++ 	if (narrow_ld)
++ 		wrp_zext(nfp_prog, meta, gpr);
+++>>>>>>> 86c28b2d69f9 (nfp: bpf: fix latency bug when updating stack index register)
+  
+  	while (size) {
+  		u32 slice_end;
+* Unmerged path drivers/net/ethernet/netronome/nfp/bpf/jit.c
