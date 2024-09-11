@@ -1,0 +1,136 @@
+tcp: Only init congestion control if not initialized already
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-315.el8
+commit-author Neal Cardwell <ncardwell@google.com>
+commit 8919a9b31eb4fb4c0a93e5fb350a626924302aa6
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-315.el8/8919a9b3.failed
+
+Change tcp_init_transfer() to only initialize congestion control if it
+has not been initialized already.
+
+With this new approach, we can arrange things so that if the EBPF code
+sets the congestion control by calling setsockopt(TCP_CONGESTION) then
+tcp_init_transfer() will not re-initialize the CC module.
+
+This is an approach that has the following beneficial properties:
+
+(1) This allows CC module customizations made by the EBPF called in
+    tcp_init_transfer() to persist, and not be wiped out by a later
+    call to tcp_init_congestion_control() in tcp_init_transfer().
+
+(2) Does not flip the order of EBPF and CC init, to avoid causing bugs
+    for existing code upstream that depends on the current order.
+
+(3) Does not cause 2 initializations for for CC in the case where the
+    EBPF called in tcp_init_transfer() wants to set the CC to a new CC
+    algorithm.
+
+(4) Allows follow-on simplifications to the code in net/core/filter.c
+    and net/ipv4/tcp_cong.c, which currently both have some complexity
+    to special-case CC initialization to avoid double CC
+    initialization if EBPF sets the CC.
+
+	Signed-off-by: Neal Cardwell <ncardwell@google.com>
+	Signed-off-by: Eric Dumazet <edumazet@google.com>
+	Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+	Acked-by: Yuchung Cheng <ycheng@google.com>
+	Acked-by: Kevin Yang <yyd@google.com>
+	Cc: Lawrence Brakmo <brakmo@fb.com>
+(cherry picked from commit 8919a9b31eb4fb4c0a93e5fb350a626924302aa6)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/ipv4/tcp_input.c
+diff --cc net/ipv4/tcp_input.c
+index 0a07f42fdf6f,0e5ac0d33fd3..000000000000
+--- a/net/ipv4/tcp_input.c
++++ b/net/ipv4/tcp_input.c
+@@@ -5751,6 -5873,34 +5751,37 @@@ discard
+  }
+  EXPORT_SYMBOL(tcp_rcv_established);
+  
+++<<<<<<< HEAD
+++=======
++ void tcp_init_transfer(struct sock *sk, int bpf_op, struct sk_buff *skb)
++ {
++ 	struct inet_connection_sock *icsk = inet_csk(sk);
++ 	struct tcp_sock *tp = tcp_sk(sk);
++ 
++ 	tcp_mtup_init(sk);
++ 	icsk->icsk_af_ops->rebuild_header(sk);
++ 	tcp_init_metrics(sk);
++ 
++ 	/* Initialize the congestion window to start the transfer.
++ 	 * Cut cwnd down to 1 per RFC5681 if SYN or SYN-ACK has been
++ 	 * retransmitted. In light of RFC6298 more aggressive 1sec
++ 	 * initRTO, we only reset cwnd when more than 1 SYN/SYN-ACK
++ 	 * retransmission has occurred.
++ 	 */
++ 	if (tp->total_retrans > 1 && tp->undo_marker)
++ 		tp->snd_cwnd = 1;
++ 	else
++ 		tp->snd_cwnd = tcp_init_cwnd(tp, __sk_dst_get(sk));
++ 	tp->snd_cwnd_stamp = tcp_jiffies32;
++ 
++ 	icsk->icsk_ca_initialized = 0;
++ 	bpf_skops_established(sk, bpf_op, skb);
++ 	if (!icsk->icsk_ca_initialized)
++ 		tcp_init_congestion_control(sk);
++ 	tcp_init_buffer_space(sk);
++ }
++ 
+++>>>>>>> 8919a9b31eb4 (tcp: Only init congestion control if not initialized already)
+  void tcp_finish_connect(struct sock *sk, struct sk_buff *skb)
+  {
+  	struct tcp_sock *tp = tcp_sk(sk);
+diff --git a/include/net/inet_connection_sock.h b/include/net/inet_connection_sock.h
+index f6b97ed521dc..71b74c5549b6 100644
+--- a/include/net/inet_connection_sock.h
++++ b/include/net/inet_connection_sock.h
+@@ -106,7 +106,8 @@ struct inet_connection_sock {
+ 	void (*icsk_clean_acked)(struct sock *sk, u32 acked_seq);
+ 	struct hlist_node         icsk_listen_portaddr_node;
+ 	unsigned int		  (*icsk_sync_mss)(struct sock *sk, u32 pmtu);
+-	__u8			  icsk_ca_state:6,
++	__u8			  icsk_ca_state:5,
++				  icsk_ca_initialized:1,
+ 				  icsk_ca_setsockopt:1,
+ 				  icsk_ca_dst_locked:1;
+ 	__u8			  icsk_retransmits;
+diff --git a/net/ipv4/tcp.c b/net/ipv4/tcp.c
+index c801d90c5543..a21045418144 100644
+--- a/net/ipv4/tcp.c
++++ b/net/ipv4/tcp.c
+@@ -2638,6 +2638,7 @@ int tcp_disconnect(struct sock *sk, int flags)
+ 	if (icsk->icsk_ca_ops->release)
+ 		icsk->icsk_ca_ops->release(sk);
+ 	memset(icsk->icsk_ca_priv, 0, sizeof(icsk->icsk_ca_priv));
++	icsk->icsk_ca_initialized = 0;
+ 	tcp_set_ca_state(sk, TCP_CA_Open);
+ 	tp->is_sack_reneg = 0;
+ 	tcp_clear_retrans(tp);
+diff --git a/net/ipv4/tcp_cong.c b/net/ipv4/tcp_cong.c
+index 18b3bd3738bb..e565b1e9d54a 100644
+--- a/net/ipv4/tcp_cong.c
++++ b/net/ipv4/tcp_cong.c
+@@ -175,7 +175,7 @@ void tcp_assign_congestion_control(struct sock *sk)
+ 
+ void tcp_init_congestion_control(struct sock *sk)
+ {
+-	const struct inet_connection_sock *icsk = inet_csk(sk);
++	struct inet_connection_sock *icsk = inet_csk(sk);
+ 
+ 	tcp_sk(sk)->prior_ssthresh = 0;
+ 	if (icsk->icsk_ca_ops->init)
+@@ -184,6 +184,7 @@ void tcp_init_congestion_control(struct sock *sk)
+ 		INET_ECN_xmit(sk);
+ 	else
+ 		INET_ECN_dontxmit(sk);
++	icsk->icsk_ca_initialized = 1;
+ }
+ 
+ static void tcp_reinit_congestion_control(struct sock *sk,
+* Unmerged path net/ipv4/tcp_input.c
