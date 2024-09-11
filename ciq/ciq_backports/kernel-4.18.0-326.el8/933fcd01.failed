@@ -1,0 +1,192 @@
+iommu/vt-d: Add iotlb_sync_map callback
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-326.el8
+commit-author Lu Baolu <baolu.lu@linux.intel.com>
+commit 933fcd01e97e2ba29880dd5f1239365e40094950
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-326.el8/933fcd01.failed
+
+Some Intel VT-d hardware implementations don't support memory coherency
+for page table walk (presented by the Page-Walk-coherency bit in the
+ecap register), so that software must flush the corresponding CPU cache
+lines explicitly after each page table entry update.
+
+The iommu_map_sg() code iterates through the given scatter-gather list
+and invokes iommu_map() for each element in the scatter-gather list,
+which calls into the vendor IOMMU driver through iommu_ops callback. As
+the result, a single sg mapping may lead to multiple cache line flushes,
+which leads to the degradation of I/O performance after the commit
+<c588072bba6b5> ("iommu/vt-d: Convert intel iommu driver to the iommu
+ops").
+
+Fix this by adding iotlb_sync_map callback and centralizing the clflush
+operations after all sg mappings.
+
+Fixes: c588072bba6b5 ("iommu/vt-d: Convert intel iommu driver to the iommu ops")
+	Reported-by: Chuck Lever <chuck.lever@oracle.com>
+Link: https://lore.kernel.org/linux-iommu/D81314ED-5673-44A6-B597-090E3CB83EB0@oracle.com/
+	Signed-off-by: Lu Baolu <baolu.lu@linux.intel.com>
+	Cc: Robin Murphy <robin.murphy@arm.com>
+[ cel: removed @first_pte, which is no longer used ]
+	Signed-off-by: Chuck Lever <chuck.lever@oracle.com>
+Link: https://lore.kernel.org/linux-iommu/161177763962.1311.15577661784296014186.stgit@manet.1015granger.net
+Link: https://lore.kernel.org/r/20210204014401.2846425-5-baolu.lu@linux.intel.com
+	Signed-off-by: Joerg Roedel <jroedel@suse.de>
+(cherry picked from commit 933fcd01e97e2ba29880dd5f1239365e40094950)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/iommu/intel/iommu.c
+diff --cc drivers/iommu/intel/iommu.c
+index a56d6223fe08,761c1b251c1e..000000000000
+--- a/drivers/iommu/intel/iommu.c
++++ b/drivers/iommu/intel/iommu.c
+@@@ -2342,15 -2279,14 +2342,22 @@@ static inline int hardware_largepage_ca
+  	return level;
+  }
+  
+ -static int
+ -__domain_mapping(struct dmar_domain *domain, unsigned long iov_pfn,
+ -		 unsigned long phys_pfn, unsigned long nr_pages, int prot)
+ +static int __domain_mapping(struct dmar_domain *domain, unsigned long iov_pfn,
+ +			    struct scatterlist *sg, unsigned long phys_pfn,
+ +			    unsigned long nr_pages, int prot)
+  {
+++<<<<<<< HEAD
+ +	struct dma_pte *first_pte = NULL, *pte = NULL;
+ +	phys_addr_t pteval;
+ +	unsigned long sg_res = 0;
+ +	unsigned int largepage_lvl = 0;
+ +	unsigned long lvl_pages = 0;
+++=======
++ 	unsigned int largepage_lvl = 0;
++ 	unsigned long lvl_pages = 0;
++ 	struct dma_pte *pte = NULL;
++ 	phys_addr_t pteval;
+++>>>>>>> 933fcd01e97e (iommu/vt-d: Add iotlb_sync_map callback)
+  	u64 attr;
+  
+  	BUG_ON(!domain_pfn_supported(domain, iov_pfn + nr_pages - 1));
+@@@ -2370,20 -2308,13 +2377,20 @@@
+  	while (nr_pages > 0) {
+  		uint64_t tmp;
+  
+ +		if (!sg_res) {
+ +			unsigned int pgoff = sg->offset & ~PAGE_MASK;
+ +
+ +			sg_res = aligned_nrpages(sg->offset, sg->length);
+ +			sg->dma_address = ((dma_addr_t)iov_pfn << VTD_PAGE_SHIFT) + pgoff;
+ +			sg->dma_length = sg->length;
+ +			pteval = (sg_phys(sg) - pgoff) | attr;
+ +			phys_pfn = pteval >> VTD_PAGE_SHIFT;
+ +		}
+ +
+  		if (!pte) {
+ -			largepage_lvl = hardware_largepage_caps(domain, iov_pfn,
+ -					phys_pfn, nr_pages);
+ +			largepage_lvl = hardware_largepage_caps(domain, iov_pfn, phys_pfn, sg_res);
+  
+- 			first_pte = pte = pfn_to_dma_pte(domain, iov_pfn, &largepage_lvl);
++ 			pte = pfn_to_dma_pte(domain, iov_pfn, &largepage_lvl);
+  			if (!pte)
+  				return -ENOMEM;
+  			/* It is large page*/
+@@@ -2433,48 -2363,26 +2440,69 @@@
+  		iov_pfn += lvl_pages;
+  		phys_pfn += lvl_pages;
+  		pteval += lvl_pages * VTD_PAGE_SIZE;
+ +		sg_res -= lvl_pages;
+  
+  		/* If the next PTE would be the first in a new page, then we
+++<<<<<<< HEAD
+ +		   need to flush the cache on the entries we've just written.
+ +		   And then we'll need to recalculate 'pte', so clear it and
+ +		   let it get set again in the if (!pte) block above.
+ +
+ +		   If we're done (!nr_pages) we need to flush the cache too.
+ +
+ +		   Also if we've been setting superpages, we may need to
+ +		   recalculate 'pte' and switch back to smaller pages for the
+ +		   end of the mapping, if the trailing size is not enough to
+ +		   use another superpage (i.e. sg_res < lvl_pages). */
+ +		pte++;
+ +		if (!nr_pages || first_pte_in_page(pte) ||
+ +		    (largepage_lvl > 1 && sg_res < lvl_pages)) {
+ +			domain_flush_cache(domain, first_pte,
+ +					   (void *)pte - (void *)first_pte);
+ +			pte = NULL;
+ +		}
+ +
+ +		if (!sg_res && nr_pages)
+ +			sg = sg_next(sg);
+ +	}
+ +	return 0;
+ +}
+ +
+ +static int domain_mapping(struct dmar_domain *domain, unsigned long iov_pfn,
+ +			  struct scatterlist *sg, unsigned long phys_pfn,
+ +			  unsigned long nr_pages, int prot)
+ +{
+ +	int iommu_id, ret;
+ +	struct intel_iommu *iommu;
+ +
+ +	/* Do the real mapping first */
+ +	ret = __domain_mapping(domain, iov_pfn, sg, phys_pfn, nr_pages, prot);
+ +	if (ret)
+ +		return ret;
+ +
+ +	for_each_domain_iommu(iommu_id, domain) {
+ +		iommu = g_iommus[iommu_id];
+ +		__mapping_notify_one(iommu, domain, iov_pfn, nr_pages);
+++=======
++ 		 * need to flush the cache on the entries we've just written.
++ 		 * And then we'll need to recalculate 'pte', so clear it and
++ 		 * let it get set again in the if (!pte) block above.
++ 		 *
++ 		 * If we're done (!nr_pages) we need to flush the cache too.
++ 		 *
++ 		 * Also if we've been setting superpages, we may need to
++ 		 * recalculate 'pte' and switch back to smaller pages for the
++ 		 * end of the mapping, if the trailing size is not enough to
++ 		 * use another superpage (i.e. nr_pages < lvl_pages).
++ 		 *
++ 		 * We leave clflush for the leaf pte changes to iotlb_sync_map()
++ 		 * callback.
++ 		 */
++ 		pte++;
++ 		if (!nr_pages || first_pte_in_page(pte) ||
++ 		    (largepage_lvl > 1 && nr_pages < lvl_pages))
++ 			pte = NULL;
+++>>>>>>> 933fcd01e97e (iommu/vt-d: Add iotlb_sync_map callback)
+  	}
+  
+  	return 0;
+@@@ -5669,9 -4948,8 +5696,14 @@@ static int intel_iommu_map(struct iommu
+  	/* Round up size to next multiple of PAGE_SIZE, if it and
+  	   the low bits of hpa would take us onto the next page */
+  	size = aligned_nrpages(hpa, size);
+++<<<<<<< HEAD
+ +	ret = domain_pfn_mapping(dmar_domain, iova >> VTD_PAGE_SHIFT,
+ +				 hpa >> VTD_PAGE_SHIFT, size, prot);
+ +	return ret;
+++=======
++ 	return __domain_mapping(dmar_domain, iova >> VTD_PAGE_SHIFT,
++ 				hpa >> VTD_PAGE_SHIFT, size, prot);
+++>>>>>>> 933fcd01e97e (iommu/vt-d: Add iotlb_sync_map callback)
+  }
+  
+  static size_t intel_iommu_unmap(struct iommu_domain *domain,
+@@@ -6114,7 -5465,10 +6197,8 @@@ const struct iommu_ops intel_iommu_ops 
+  	.aux_detach_dev		= intel_iommu_aux_detach_device,
+  	.aux_get_pasid		= intel_iommu_aux_get_pasid,
+  	.map			= intel_iommu_map,
++ 	.iotlb_sync_map		= intel_iommu_iotlb_sync_map,
+  	.unmap			= intel_iommu_unmap,
+ -	.flush_iotlb_all        = intel_flush_iotlb_all,
+ -	.iotlb_sync		= intel_iommu_tlb_sync,
+  	.iova_to_phys		= intel_iommu_iova_to_phys,
+  	.probe_device		= intel_iommu_probe_device,
+  	.probe_finalize		= intel_iommu_probe_finalize,
+* Unmerged path drivers/iommu/intel/iommu.c
