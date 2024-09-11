@@ -1,0 +1,229 @@
+net: bridge: switchdev: include local flag in FDB notifications
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-310.el8
+commit-author Vladimir Oltean <vladimir.oltean@nxp.com>
+commit 2c4eca3ef7161f6632959c00c8eae182f4398901
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-310.el8/2c4eca3e.failed
+
+As explained in bugfix commit 6ab4c3117aec ("net: bridge: don't notify
+switchdev for local FDB addresses") as well as in this discussion:
+https://lore.kernel.org/netdev/20210117193009.io3nungdwuzmo5f7@skbuf/
+
+the switchdev notifiers for FDB entries managed to have a zero-day bug,
+which was that drivers would not know what to do with local FDB entries,
+because they were not told that they are local. The bug fix was to
+simply not notify them of those addresses.
+
+Let us now add the 'is_local' bit to bridge FDB entries, and make all
+drivers ignore these entries by their own choice.
+
+Co-developed-by: Tobias Waldekranz <tobias@waldekranz.com>
+	Signed-off-by: Tobias Waldekranz <tobias@waldekranz.com>
+	Signed-off-by: Vladimir Oltean <vladimir.oltean@nxp.com>
+	Reviewed-by: Grygorii Strashko <grygorii.strashko@ti.com>
+	Reviewed-by: Ido Schimmel <idosch@nvidia.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 2c4eca3ef7161f6632959c00c8eae182f4398901)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/freescale/dpaa2/dpaa2-switch.c
+#	drivers/net/ethernet/marvell/prestera/prestera_switchdev.c
+#	drivers/net/ethernet/ti/am65-cpsw-switchdev.c
+#	drivers/net/ethernet/ti/cpsw_switchdev.c
+#	net/dsa/slave.c
+diff --cc net/dsa/slave.c
+index 24cc4de02bd3,3ae67202fda2..000000000000
+--- a/net/dsa/slave.c
++++ b/net/dsa/slave.c
+@@@ -1523,29 -2313,82 +1523,93 @@@ static int dsa_slave_switchdev_event(st
+  				     unsigned long event, void *ptr)
+  {
+  	struct net_device *dev = switchdev_notifier_info_to_dev(ptr);
+ -	const struct switchdev_notifier_fdb_info *fdb_info;
+  	struct dsa_switchdev_event_work *switchdev_work;
+ -	struct dsa_port *dp;
+ -	int err;
+ +
+ +	if (!dsa_slave_dev_check(dev))
+ +		return NOTIFY_DONE;
+ +
+ +	switchdev_work = kzalloc(sizeof(*switchdev_work), GFP_ATOMIC);
+ +	if (!switchdev_work)
+ +		return NOTIFY_BAD;
+ +
+ +	INIT_WORK(&switchdev_work->work,
+ +		  dsa_slave_switchdev_event_work);
+ +	switchdev_work->dev = dev;
+ +	switchdev_work->event = event;
+  
+  	switch (event) {
+ -	case SWITCHDEV_PORT_ATTR_SET:
+ -		err = switchdev_handle_port_attr_set(dev, ptr,
+ -						     dsa_slave_dev_check,
+ -						     dsa_slave_port_attr_set);
+ -		return notifier_from_errno(err);
+ -	case SWITCHDEV_FDB_ADD_TO_DEVICE:
+ +	case SWITCHDEV_FDB_ADD_TO_DEVICE: /* fall through */
+  	case SWITCHDEV_FDB_DEL_TO_DEVICE:
+++<<<<<<< HEAD
+ +		if (dsa_slave_switchdev_fdb_work_init(switchdev_work, ptr))
+ +			goto err_fdb_work_init;
+ +		dev_hold(dev);
+++=======
++ 		fdb_info = ptr;
++ 
++ 		if (dsa_slave_dev_check(dev)) {
++ 			if (!fdb_info->added_by_user || fdb_info->is_local)
++ 				return NOTIFY_OK;
++ 
++ 			dp = dsa_slave_to_port(dev);
++ 		} else {
++ 			/* Snoop addresses learnt on foreign interfaces
++ 			 * bridged with us, for switches that don't
++ 			 * automatically learn SA from CPU-injected traffic
++ 			 */
++ 			struct net_device *br_dev;
++ 			struct dsa_slave_priv *p;
++ 
++ 			br_dev = netdev_master_upper_dev_get_rcu(dev);
++ 			if (!br_dev)
++ 				return NOTIFY_DONE;
++ 
++ 			if (!netif_is_bridge_master(br_dev))
++ 				return NOTIFY_DONE;
++ 
++ 			p = dsa_slave_dev_lower_find(br_dev);
++ 			if (!p)
++ 				return NOTIFY_DONE;
++ 
++ 			dp = p->dp->cpu_dp;
++ 
++ 			if (!dp->ds->assisted_learning_on_cpu_port)
++ 				return NOTIFY_DONE;
++ 
++ 			/* When the bridge learns an address on an offloaded
++ 			 * LAG we don't want to send traffic to the CPU, the
++ 			 * other ports bridged with the LAG should be able to
++ 			 * autonomously forward towards it.
++ 			 */
++ 			if (dsa_tree_offloads_bridge_port(dp->ds->dst, dev))
++ 				return NOTIFY_DONE;
++ 		}
++ 
++ 		if (!dp->ds->ops->port_fdb_add || !dp->ds->ops->port_fdb_del)
++ 			return NOTIFY_DONE;
++ 
++ 		switchdev_work = kzalloc(sizeof(*switchdev_work), GFP_ATOMIC);
++ 		if (!switchdev_work)
++ 			return NOTIFY_BAD;
++ 
++ 		INIT_WORK(&switchdev_work->work,
++ 			  dsa_slave_switchdev_event_work);
++ 		switchdev_work->ds = dp->ds;
++ 		switchdev_work->port = dp->index;
++ 		switchdev_work->event = event;
++ 
++ 		ether_addr_copy(switchdev_work->addr,
++ 				fdb_info->addr);
++ 		switchdev_work->vid = fdb_info->vid;
++ 
++ 		/* Hold a reference on the slave for dsa_fdb_offload_notify */
++ 		if (dsa_is_user_port(dp->ds, dp->index))
++ 			dev_hold(dev);
++ 		dsa_schedule_work(&switchdev_work->work);
+++>>>>>>> 2c4eca3ef716 (net: bridge: switchdev: include local flag in FDB notifications)
+  		break;
+  	default:
+ +		kfree(switchdev_work);
+  		return NOTIFY_DONE;
+  	}
+  
+* Unmerged path drivers/net/ethernet/freescale/dpaa2/dpaa2-switch.c
+* Unmerged path drivers/net/ethernet/marvell/prestera/prestera_switchdev.c
+* Unmerged path drivers/net/ethernet/ti/am65-cpsw-switchdev.c
+* Unmerged path drivers/net/ethernet/ti/cpsw_switchdev.c
+* Unmerged path drivers/net/ethernet/freescale/dpaa2/dpaa2-switch.c
+* Unmerged path drivers/net/ethernet/marvell/prestera/prestera_switchdev.c
+diff --git a/drivers/net/ethernet/mellanox/mlxsw/spectrum_switchdev.c b/drivers/net/ethernet/mellanox/mlxsw/spectrum_switchdev.c
+index 72912afa6f72..2800b6d8b76b 100644
+--- a/drivers/net/ethernet/mellanox/mlxsw/spectrum_switchdev.c
++++ b/drivers/net/ethernet/mellanox/mlxsw/spectrum_switchdev.c
+@@ -2802,7 +2802,8 @@ mlxsw_sp_switchdev_bridge_nve_fdb_event(struct mlxsw_sp_switchdev_event_work *
+ 		return;
+ 
+ 	if (switchdev_work->event == SWITCHDEV_FDB_ADD_TO_DEVICE &&
+-	    !switchdev_work->fdb_info.added_by_user)
++	    (!switchdev_work->fdb_info.added_by_user ||
++	     switchdev_work->fdb_info.is_local))
+ 		return;
+ 
+ 	if (!netif_running(dev))
+@@ -2857,7 +2858,7 @@ static void mlxsw_sp_switchdev_bridge_fdb_event_work(struct work_struct *work)
+ 	switch (switchdev_work->event) {
+ 	case SWITCHDEV_FDB_ADD_TO_DEVICE:
+ 		fdb_info = &switchdev_work->fdb_info;
+-		if (!fdb_info->added_by_user)
++		if (!fdb_info->added_by_user || fdb_info->is_local)
+ 			break;
+ 		err = mlxsw_sp_port_fdb_set(mlxsw_sp_port, fdb_info, true);
+ 		if (err)
+diff --git a/drivers/net/ethernet/rocker/rocker_main.c b/drivers/net/ethernet/rocker/rocker_main.c
+index 339d0ac62fdc..27ce94203073 100644
+--- a/drivers/net/ethernet/rocker/rocker_main.c
++++ b/drivers/net/ethernet/rocker/rocker_main.c
+@@ -2750,7 +2750,7 @@ static void rocker_switchdev_event_work(struct work_struct *work)
+ 	switch (switchdev_work->event) {
+ 	case SWITCHDEV_FDB_ADD_TO_DEVICE:
+ 		fdb_info = &switchdev_work->fdb_info;
+-		if (!fdb_info->added_by_user)
++		if (!fdb_info->added_by_user || fdb_info->is_local)
+ 			break;
+ 		err = rocker_world_port_fdb_add(rocker_port, fdb_info);
+ 		if (err) {
+@@ -2761,7 +2761,7 @@ static void rocker_switchdev_event_work(struct work_struct *work)
+ 		break;
+ 	case SWITCHDEV_FDB_DEL_TO_DEVICE:
+ 		fdb_info = &switchdev_work->fdb_info;
+-		if (!fdb_info->added_by_user)
++		if (!fdb_info->added_by_user || fdb_info->is_local)
+ 			break;
+ 		err = rocker_world_port_fdb_del(rocker_port, fdb_info);
+ 		if (err)
+* Unmerged path drivers/net/ethernet/ti/am65-cpsw-switchdev.c
+* Unmerged path drivers/net/ethernet/ti/cpsw_switchdev.c
+diff --git a/include/net/switchdev.h b/include/net/switchdev.h
+index 95beba433e93..7814d13e0ec4 100644
+--- a/include/net/switchdev.h
++++ b/include/net/switchdev.h
+@@ -186,6 +186,7 @@ struct switchdev_notifier_fdb_info {
+ 	const unsigned char *addr;
+ 	u16 vid;
+ 	u8 added_by_user:1,
++	   is_local:1,
+ 	   offloaded:1;
+ };
+ 
+diff --git a/net/bridge/br_switchdev.c b/net/bridge/br_switchdev.c
+index a69fa464f089..3439dba24831 100644
+--- a/net/bridge/br_switchdev.c
++++ b/net/bridge/br_switchdev.c
+@@ -109,13 +109,12 @@ br_switchdev_fdb_notify(const struct net_bridge_fdb_entry *fdb, int type)
+ 		.addr = fdb->key.addr.addr,
+ 		.vid = fdb->key.vlan_id,
+ 		.added_by_user = test_bit(BR_FDB_ADDED_BY_USER, &fdb->flags),
++		.is_local = test_bit(BR_FDB_LOCAL, &fdb->flags),
+ 		.offloaded = test_bit(BR_FDB_OFFLOADED, &fdb->flags),
+ 	};
+ 
+ 	if (!fdb->dst)
+ 		return;
+-	if (test_bit(BR_FDB_LOCAL, &fdb->flags))
+-		return;
+ 
+ 	switch (type) {
+ 	case RTM_DELNEIGH:
+* Unmerged path net/dsa/slave.c
