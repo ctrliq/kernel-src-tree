@@ -1,0 +1,138 @@
+PM: QoS: Make CPU latency QoS depend on CONFIG_CPU_IDLE
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Rafael J. Wysocki <rafael.j.wysocki@intel.com>
+commit 814d51f8889bc4afa75f647eeffd5ff0a5620e8d
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/814d51f8.failed
+
+Because cpuidle is the only user of the effective constraint coming
+from the CPU latency QoS, add #ifdef CONFIG_CPU_IDLE around that code
+to avoid building it unnecessarily.
+
+	Signed-off-by: Rafael J. Wysocki <rafael.j.wysocki@intel.com>
+	Reviewed-by: Ulf Hansson <ulf.hansson@linaro.org>
+	Reviewed-by: Amit Kucheria <amit.kucheria@linaro.org>
+	Tested-by: Amit Kucheria <amit.kucheria@linaro.org>
+(cherry picked from commit 814d51f8889bc4afa75f647eeffd5ff0a5620e8d)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/pm_qos.h
+#	kernel/power/qos.c
+diff --cc include/linux/pm_qos.h
+index b9923327089f,4a69d4af3ff8..000000000000
+--- a/include/linux/pm_qos.h
++++ b/include/linux/pm_qos.h
+@@@ -120,17 -142,25 +120,38 @@@ int pm_qos_update_target(struct pm_qos_
+  bool pm_qos_update_flags(struct pm_qos_flags *pqf,
+  			 struct pm_qos_flags_request *req,
+  			 enum pm_qos_req_action action, s32 val);
+ -
+ +void pm_qos_add_request(struct pm_qos_request *req, int pm_qos_class,
+ +			s32 value);
+ +void pm_qos_update_request(struct pm_qos_request *req,
+ +			   s32 new_value);
+ +void pm_qos_remove_request(struct pm_qos_request *req);
+ +
+++<<<<<<< HEAD
+ +int pm_qos_request(int pm_qos_class);
+ +int pm_qos_add_notifier(int pm_qos_class, struct notifier_block *notifier);
+ +int pm_qos_remove_notifier(int pm_qos_class, struct notifier_block *notifier);
+ +int pm_qos_request_active(struct pm_qos_request *req);
+ +s32 pm_qos_read_value(struct pm_qos_constraints *c);
+++=======
++ #ifdef CONFIG_CPU_IDLE
++ s32 cpu_latency_qos_limit(void);
++ bool cpu_latency_qos_request_active(struct pm_qos_request *req);
++ void cpu_latency_qos_add_request(struct pm_qos_request *req, s32 value);
++ void cpu_latency_qos_update_request(struct pm_qos_request *req, s32 new_value);
++ void cpu_latency_qos_remove_request(struct pm_qos_request *req);
++ #else
++ static inline s32 cpu_latency_qos_limit(void) { return INT_MAX; }
++ static inline bool cpu_latency_qos_request_active(struct pm_qos_request *req)
++ {
++ 	return false;
++ }
++ static inline void cpu_latency_qos_add_request(struct pm_qos_request *req,
++ 					       s32 value) {}
++ static inline void cpu_latency_qos_update_request(struct pm_qos_request *req,
++ 						  s32 new_value) {}
++ static inline void cpu_latency_qos_remove_request(struct pm_qos_request *req) {}
++ #endif
+++>>>>>>> 814d51f8889b (PM: QoS: Make CPU latency QoS depend on CONFIG_CPU_IDLE)
+  
+  #ifdef CONFIG_PM
+  enum pm_qos_flags_status __dev_pm_qos_flags(struct device *dev, s32 mask);
+diff --cc kernel/power/qos.c
+index ab4c77e26eb9,32927682bcc4..000000000000
+--- a/kernel/power/qos.c
++++ b/kernel/power/qos.c
+@@@ -235,33 -209,23 +235,47 @@@ bool pm_qos_update_flags(struct pm_qos_
+  	return prev_value != curr_value;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ #ifdef CONFIG_CPU_IDLE
++ /* Definitions related to the CPU latency QoS. */
++ 
++ static struct pm_qos_constraints cpu_latency_constraints = {
++ 	.list = PLIST_HEAD_INIT(cpu_latency_constraints.list),
++ 	.target_value = PM_QOS_CPU_LATENCY_DEFAULT_VALUE,
++ 	.default_value = PM_QOS_CPU_LATENCY_DEFAULT_VALUE,
++ 	.no_constraint_value = PM_QOS_CPU_LATENCY_DEFAULT_VALUE,
++ 	.type = PM_QOS_MIN,
++ };
++ 
+++>>>>>>> 814d51f8889b (PM: QoS: Make CPU latency QoS depend on CONFIG_CPU_IDLE)
+  /**
+ - * cpu_latency_qos_limit - Return current system-wide CPU latency QoS limit.
+ + * pm_qos_request - returns current system wide qos expectation
+ + * @pm_qos_class: identification of which qos value is requested
+ + *
+ + * This function returns the current target value.
+   */
+ -s32 cpu_latency_qos_limit(void)
+ +int pm_qos_request(int pm_qos_class)
+ +{
+ +	return pm_qos_read_value(pm_qos_array[pm_qos_class]->constraints);
+ +}
+ +EXPORT_SYMBOL_GPL(pm_qos_request);
+ +
+ +int pm_qos_request_active(struct pm_qos_request *req)
+ +{
+ +	return req->pm_qos_class != 0;
+ +}
+ +EXPORT_SYMBOL_GPL(pm_qos_request_active);
+ +
+ +static void __pm_qos_update_request(struct pm_qos_request *req,
+ +			   s32 new_value)
+  {
+ -	return pm_qos_read_value(&cpu_latency_constraints);
+ +	trace_pm_qos_update_request(req->pm_qos_class, new_value);
+ +
+ +	if (new_value != req->node.prio)
+ +		pm_qos_update_target(
+ +			pm_qos_array[req->pm_qos_class]->constraints,
+ +			&req->node, PM_QOS_UPDATE_REQ, new_value);
+  }
+  
+  /**
+@@@ -482,7 -421,8 +496,12 @@@ static int __init pm_qos_power_init(voi
+  
+  	return ret;
+  }
+++<<<<<<< HEAD
+ +late_initcall(pm_qos_power_init);
+++=======
++ late_initcall(cpu_latency_qos_init);
++ #endif /* CONFIG_CPU_IDLE */
+++>>>>>>> 814d51f8889b (PM: QoS: Make CPU latency QoS depend on CONFIG_CPU_IDLE)
+  
+  /* Definitions related to the frequency QoS below. */
+  
+* Unmerged path include/linux/pm_qos.h
+* Unmerged path kernel/power/qos.c
