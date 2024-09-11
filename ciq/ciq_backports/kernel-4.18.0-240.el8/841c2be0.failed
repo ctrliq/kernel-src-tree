@@ -1,0 +1,161 @@
+kvm: x86: replace kvm_spec_ctrl_test_value with runtime test on the host
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Maxim Levitsky <mlevitsk@redhat.com>
+commit 841c2be09fe4f495fe5224952a419bd8c7e5b455
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/841c2be0.failed
+
+To avoid complex and in some cases incorrect logic in
+kvm_spec_ctrl_test_value, just try the guest's given value on the host
+processor instead, and if it doesn't #GP, allow the guest to set it.
+
+One such case is when host CPU supports STIBP mitigation
+but doesn't support IBRS (as is the case with some Zen2 AMD cpus),
+and in this case we were giving guest #GP when it tried to use STIBP
+
+The reason why can can do the host test is that IA32_SPEC_CTRL msr is
+passed to the guest, after the guest sets it to a non zero value
+for the first time (due to performance reasons),
+and as as result of this, it is pointless to emulate #GP condition on
+this first access, in a different way than what the host CPU does.
+
+This is based on a patch from Sean Christopherson, who suggested this idea.
+
+Fixes: 6441fa6178f5 ("KVM: x86: avoid incorrect writes to host MSR_IA32_SPEC_CTRL")
+	Cc: stable@vger.kernel.org
+	Suggested-by: Sean Christopherson <sean.j.christopherson@intel.com>
+	Signed-off-by: Maxim Levitsky <mlevitsk@redhat.com>
+Message-Id: <20200708115731.180097-1-mlevitsk@redhat.com>
+	Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+(cherry picked from commit 841c2be09fe4f495fe5224952a419bd8c7e5b455)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kvm/x86.h
+diff --cc arch/x86/kvm/x86.h
+index 60c017efee96,3308c3ccc0fd..000000000000
+--- a/arch/x86/kvm/x86.h
++++ b/arch/x86/kvm/x86.h
+@@@ -355,8 -363,38 +355,13 @@@ static inline bool kvm_dr7_valid(u64 da
+  
+  void kvm_load_guest_xsave_state(struct kvm_vcpu *vcpu);
+  void kvm_load_host_xsave_state(struct kvm_vcpu *vcpu);
+++<<<<<<< HEAD
+ +
+ +u64 kvm_spec_ctrl_valid_bits(struct kvm_vcpu *vcpu);
+++=======
++ int kvm_spec_ctrl_test_value(u64 value);
++ int kvm_valid_cr4(struct kvm_vcpu *vcpu, unsigned long cr4);
+++>>>>>>> 841c2be09fe4 (kvm: x86: replace kvm_spec_ctrl_test_value with runtime test on the host)
+  bool kvm_vcpu_exit_request(struct kvm_vcpu *vcpu);
+  
+ -#define  KVM_MSR_RET_INVALID  2
+ -
+ -#define __cr4_reserved_bits(__cpu_has, __c)             \
+ -({                                                      \
+ -	u64 __reserved_bits = CR4_RESERVED_BITS;        \
+ -                                                        \
+ -	if (!__cpu_has(__c, X86_FEATURE_XSAVE))         \
+ -		__reserved_bits |= X86_CR4_OSXSAVE;     \
+ -	if (!__cpu_has(__c, X86_FEATURE_SMEP))          \
+ -		__reserved_bits |= X86_CR4_SMEP;        \
+ -	if (!__cpu_has(__c, X86_FEATURE_SMAP))          \
+ -		__reserved_bits |= X86_CR4_SMAP;        \
+ -	if (!__cpu_has(__c, X86_FEATURE_FSGSBASE))      \
+ -		__reserved_bits |= X86_CR4_FSGSBASE;    \
+ -	if (!__cpu_has(__c, X86_FEATURE_PKU))           \
+ -		__reserved_bits |= X86_CR4_PKE;         \
+ -	if (!__cpu_has(__c, X86_FEATURE_LA57))          \
+ -		__reserved_bits |= X86_CR4_LA57;        \
+ -	if (!__cpu_has(__c, X86_FEATURE_UMIP))          \
+ -		__reserved_bits |= X86_CR4_UMIP;        \
+ -	if (!__cpu_has(__c, X86_FEATURE_VMX))           \
+ -		__reserved_bits |= X86_CR4_VMXE;        \
+ -	__reserved_bits;                                \
+ -})
+ -
+  #endif
+diff --git a/arch/x86/kvm/svm/svm.c b/arch/x86/kvm/svm/svm.c
+index 986d068fbec8..46b04282fc65 100644
+--- a/arch/x86/kvm/svm/svm.c
++++ b/arch/x86/kvm/svm/svm.c
+@@ -4419,7 +4419,7 @@ static int svm_set_msr(struct kvm_vcpu *vcpu, struct msr_data *msr)
+ 		    !guest_cpuid_has(vcpu, X86_FEATURE_AMD_SSBD))
+ 			return 1;
+ 
+-		if (data & ~kvm_spec_ctrl_valid_bits(vcpu))
++		if (kvm_spec_ctrl_test_value(data))
+ 			return 1;
+ 
+ 		svm->spec_ctrl = data;
+diff --git a/arch/x86/kvm/vmx/vmx.c b/arch/x86/kvm/vmx/vmx.c
+index 17efa7f8e722..177e778b1821 100644
+--- a/arch/x86/kvm/vmx/vmx.c
++++ b/arch/x86/kvm/vmx/vmx.c
+@@ -2115,7 +2115,7 @@ static int vmx_set_msr(struct kvm_vcpu *vcpu, struct msr_data *msr_info)
+ 		    !guest_cpuid_has(vcpu, X86_FEATURE_SPEC_CTRL))
+ 			return 1;
+ 
+-		if (data & ~kvm_spec_ctrl_valid_bits(vcpu))
++		if (kvm_spec_ctrl_test_value(data))
+ 			return 1;
+ 
+ 		vmx->spec_ctrl = data;
+diff --git a/arch/x86/kvm/x86.c b/arch/x86/kvm/x86.c
+index 603372755e5d..038ef6f60d49 100644
+--- a/arch/x86/kvm/x86.c
++++ b/arch/x86/kvm/x86.c
+@@ -10413,28 +10413,32 @@ bool kvm_arch_no_poll(struct kvm_vcpu *vcpu)
+ }
+ EXPORT_SYMBOL_GPL(kvm_arch_no_poll);
+ 
+-u64 kvm_spec_ctrl_valid_bits(struct kvm_vcpu *vcpu)
++
++int kvm_spec_ctrl_test_value(u64 value)
+ {
+-	uint64_t bits = SPEC_CTRL_IBRS | SPEC_CTRL_STIBP | SPEC_CTRL_SSBD;
++	/*
++	 * test that setting IA32_SPEC_CTRL to given value
++	 * is allowed by the host processor
++	 */
+ 
+-	/* The STIBP bit doesn't fault even if it's not advertised */
+-	if (!guest_cpuid_has(vcpu, X86_FEATURE_SPEC_CTRL) &&
+-	    !guest_cpuid_has(vcpu, X86_FEATURE_AMD_IBRS))
+-		bits &= ~(SPEC_CTRL_IBRS | SPEC_CTRL_STIBP);
+-	if (!boot_cpu_has(X86_FEATURE_SPEC_CTRL) &&
+-	    !boot_cpu_has(X86_FEATURE_AMD_IBRS))
+-		bits &= ~(SPEC_CTRL_IBRS | SPEC_CTRL_STIBP);
++	u64 saved_value;
++	unsigned long flags;
++	int ret = 0;
+ 
+-	if (!guest_cpuid_has(vcpu, X86_FEATURE_SPEC_CTRL_SSBD) &&
+-	    !guest_cpuid_has(vcpu, X86_FEATURE_AMD_SSBD))
+-		bits &= ~SPEC_CTRL_SSBD;
+-	if (!boot_cpu_has(X86_FEATURE_SPEC_CTRL_SSBD) &&
+-	    !boot_cpu_has(X86_FEATURE_AMD_SSBD))
+-		bits &= ~SPEC_CTRL_SSBD;
++	local_irq_save(flags);
+ 
+-	return bits;
++	if (rdmsrl_safe(MSR_IA32_SPEC_CTRL, &saved_value))
++		ret = 1;
++	else if (wrmsrl_safe(MSR_IA32_SPEC_CTRL, value))
++		ret = 1;
++	else
++		wrmsrl(MSR_IA32_SPEC_CTRL, saved_value);
++
++	local_irq_restore(flags);
++
++	return ret;
+ }
+-EXPORT_SYMBOL_GPL(kvm_spec_ctrl_valid_bits);
++EXPORT_SYMBOL_GPL(kvm_spec_ctrl_test_value);
+ 
+ EXPORT_TRACEPOINT_SYMBOL_GPL(kvm_exit);
+ EXPORT_TRACEPOINT_SYMBOL_GPL(kvm_fast_mmio);
+* Unmerged path arch/x86/kvm/x86.h
