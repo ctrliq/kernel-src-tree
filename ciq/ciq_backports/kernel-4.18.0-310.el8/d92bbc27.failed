@@ -1,0 +1,163 @@
+mm/hugetlb: unify migration callbacks
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-310.el8
+commit-author Joonsoo Kim <iamjoonsoo.kim@lge.com>
+commit d92bbc2719bd2be237ee336113b63492a6baca3b
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-310.el8/d92bbc27.failed
+
+There is no difference between two migration callback functions,
+alloc_huge_page_node() and alloc_huge_page_nodemask(), except
+__GFP_THISNODE handling.  It's redundant to have two almost similar
+functions in order to handle this flag.  So, this patch tries to remove
+one by introducing a new argument, gfp_mask, to
+alloc_huge_page_nodemask().
+
+After introducing gfp_mask argument, it's caller's job to provide correct
+gfp_mask.  So, every callsites for alloc_huge_page_nodemask() are changed
+to provide gfp_mask.
+
+Note that it's safe to remove a node id check in alloc_huge_page_node()
+since there is no caller passing NUMA_NO_NODE as a node id.
+
+	Signed-off-by: Joonsoo Kim <iamjoonsoo.kim@lge.com>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Reviewed-by: Mike Kravetz <mike.kravetz@oracle.com>
+	Reviewed-by: Vlastimil Babka <vbabka@suse.cz>
+	Acked-by: Michal Hocko <mhocko@suse.com>
+	Cc: Christoph Hellwig <hch@infradead.org>
+	Cc: Naoya Horiguchi <n-horiguchi@ah.jp.nec.com>
+	Cc: Roman Gushchin <guro@fb.com>
+Link: http://lkml.kernel.org/r/1594622517-20681-4-git-send-email-iamjoonsoo.kim@lge.com
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit d92bbc2719bd2be237ee336113b63492a6baca3b)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/hugetlb.h
+diff --cc include/linux/hugetlb.h
+index cd86e23fcb9f,3517edde681e..000000000000
+--- a/include/linux/hugetlb.h
++++ b/include/linux/hugetlb.h
+@@@ -9,7 -9,8 +9,12 @@@
+  #include <linux/cgroup.h>
+  #include <linux/list.h>
+  #include <linux/kref.h>
+++<<<<<<< HEAD
+ +#include <asm/pgtable.h>
+++=======
++ #include <linux/pgtable.h>
++ #include <linux/gfp.h>
+++>>>>>>> d92bbc2719bd (mm/hugetlb: unify migration callbacks)
+  
+  struct ctl_table;
+  struct user_struct;
+* Unmerged path include/linux/hugetlb.h
+diff --git a/mm/hugetlb.c b/mm/hugetlb.c
+index 5899c1f83920..46af7ff99598 100644
+--- a/mm/hugetlb.c
++++ b/mm/hugetlb.c
+@@ -918,15 +918,6 @@ static struct page *dequeue_huge_page_nodemask(struct hstate *h, gfp_t gfp_mask,
+ 	return NULL;
+ }
+ 
+-/* Movability of hugepages depends on migration support. */
+-static inline gfp_t htlb_alloc_mask(struct hstate *h)
+-{
+-	if (hugepage_movable_supported(h))
+-		return GFP_HIGHUSER_MOVABLE;
+-	else
+-		return GFP_HIGHUSER;
+-}
+-
+ static struct page *dequeue_huge_page_vma(struct hstate *h,
+ 				struct vm_area_struct *vma,
+ 				unsigned long address, int avoid_reserve,
+@@ -1719,32 +1710,10 @@ struct page *alloc_buddy_huge_page_with_mpol(struct hstate *h,
+ 	return page;
+ }
+ 
+-/* page migration callback function */
+-struct page *alloc_huge_page_node(struct hstate *h, int nid)
+-{
+-	gfp_t gfp_mask = htlb_alloc_mask(h);
+-	struct page *page = NULL;
+-
+-	if (nid != NUMA_NO_NODE)
+-		gfp_mask |= __GFP_THISNODE;
+-
+-	spin_lock(&hugetlb_lock);
+-	if (h->free_huge_pages - h->resv_huge_pages > 0)
+-		page = dequeue_huge_page_nodemask(h, gfp_mask, nid, NULL);
+-	spin_unlock(&hugetlb_lock);
+-
+-	if (!page)
+-		page = alloc_migrate_huge_page(h, gfp_mask, nid, NULL);
+-
+-	return page;
+-}
+-
+ /* page migration callback function */
+ struct page *alloc_huge_page_nodemask(struct hstate *h, int preferred_nid,
+-		nodemask_t *nmask)
++		nodemask_t *nmask, gfp_t gfp_mask)
+ {
+-	gfp_t gfp_mask = htlb_alloc_mask(h);
+-
+ 	spin_lock(&hugetlb_lock);
+ 	if (h->free_huge_pages - h->resv_huge_pages > 0) {
+ 		struct page *page;
+@@ -1772,7 +1741,7 @@ struct page *alloc_huge_page_vma(struct hstate *h, struct vm_area_struct *vma,
+ 
+ 	gfp_mask = htlb_alloc_mask(h);
+ 	node = huge_node(vma, address, gfp_mask, &mpol, &nodemask);
+-	page = alloc_huge_page_nodemask(h, node, nodemask);
++	page = alloc_huge_page_nodemask(h, node, nodemask, gfp_mask);
+ 	mpol_cond_put(mpol);
+ 
+ 	return page;
+diff --git a/mm/mempolicy.c b/mm/mempolicy.c
+index d7fe3c1d5457..61ba2d0fb63f 100644
+--- a/mm/mempolicy.c
++++ b/mm/mempolicy.c
+@@ -1033,10 +1033,12 @@ static int migrate_page_add(struct page *page, struct list_head *pagelist,
+ /* page allocation callback for NUMA node migration */
+ struct page *alloc_new_node_page(struct page *page, unsigned long node)
+ {
+-	if (PageHuge(page))
+-		return alloc_huge_page_node(page_hstate(compound_head(page)),
+-					node);
+-	else if (PageTransHuge(page)) {
++	if (PageHuge(page)) {
++		struct hstate *h = page_hstate(compound_head(page));
++		gfp_t gfp_mask = htlb_alloc_mask(h) | __GFP_THISNODE;
++
++		return alloc_huge_page_nodemask(h, node, NULL, gfp_mask);
++	} else if (PageTransHuge(page)) {
+ 		struct page *thp;
+ 
+ 		thp = alloc_pages_node(node,
+diff --git a/mm/migrate.c b/mm/migrate.c
+index f2ed1e90a525..aa483d71eea7 100644
+--- a/mm/migrate.c
++++ b/mm/migrate.c
+@@ -1490,10 +1490,13 @@ struct page *new_page_nodemask(struct page *page,
+ 	unsigned int order = 0;
+ 	struct page *new_page = NULL;
+ 
+-	if (PageHuge(page))
+-		return alloc_huge_page_nodemask(
+-				page_hstate(compound_head(page)),
+-				preferred_nid, nodemask);
++	if (PageHuge(page)) {
++		struct hstate *h = page_hstate(compound_head(page));
++
++		gfp_mask = htlb_alloc_mask(h);
++		return alloc_huge_page_nodemask(h, preferred_nid,
++						nodemask, gfp_mask);
++	}
+ 
+ 	if (PageTransHuge(page)) {
+ 		gfp_mask |= GFP_TRANSHUGE;
