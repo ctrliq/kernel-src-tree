@@ -1,0 +1,154 @@
+tipc: make legacy address flag readable over netlink
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author John Rutherford <john.rutherford@dektech.com.au>
+commit e1b5e598e5a51b453328879682b178b4acc15105
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/e1b5e598.failed
+
+To enable iproute2/tipc to generate backwards compatible
+printouts and validate command parameters for nodes using a
+<z.c.n> node address, it needs to be able to read the legacy
+address flag from the kernel.  The legacy address flag records
+the way in which the node identity was originally specified.
+
+The legacy address flag is requested by the netlink message
+TIPC_NL_ADDR_LEGACY_GET.  If the flag is set the attribute
+TIPC_NLA_NET_ADDR_LEGACY is set in the return message.
+
+	Signed-off-by: John Rutherford <john.rutherford@dektech.com.au>
+	Acked-by: Jon Maloy <jon.maloy@ericsson.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit e1b5e598e5a51b453328879682b178b4acc15105)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/uapi/linux/tipc_netlink.h
+#	net/tipc/netlink.c
+diff --cc include/uapi/linux/tipc_netlink.h
+index efb958fd167d,dc0d23a50e69..000000000000
+--- a/include/uapi/linux/tipc_netlink.h
++++ b/include/uapi/linux/tipc_netlink.h
+@@@ -63,6 -63,9 +63,12 @@@ enum 
+  	TIPC_NL_PEER_REMOVE,
+  	TIPC_NL_BEARER_ADD,
+  	TIPC_NL_UDP_GET_REMOTEIP,
+++<<<<<<< HEAD
+++=======
++ 	TIPC_NL_KEY_SET,
++ 	TIPC_NL_KEY_FLUSH,
++ 	TIPC_NL_ADDR_LEGACY_GET,
+++>>>>>>> e1b5e598e5a5 (tipc: make legacy address flag readable over netlink)
+  
+  	__TIPC_NL_CMD_MAX,
+  	TIPC_NL_CMD_MAX = __TIPC_NL_CMD_MAX - 1
+diff --cc net/tipc/netlink.c
+index d6165ad384c0,7c35094c20b8..000000000000
+--- a/net/tipc/netlink.c
++++ b/net/tipc/netlink.c
+@@@ -254,6 -262,23 +255,26 @@@ static const struct genl_ops tipc_genl_
+  		.dumpit	= tipc_udp_nl_dump_remoteip,
+  	},
+  #endif
+++<<<<<<< HEAD
+++=======
++ #ifdef CONFIG_TIPC_CRYPTO
++ 	{
++ 		.cmd	= TIPC_NL_KEY_SET,
++ 		.validate = GENL_DONT_VALIDATE_STRICT | GENL_DONT_VALIDATE_DUMP,
++ 		.doit	= tipc_nl_node_set_key,
++ 	},
++ 	{
++ 		.cmd	= TIPC_NL_KEY_FLUSH,
++ 		.validate = GENL_DONT_VALIDATE_STRICT | GENL_DONT_VALIDATE_DUMP,
++ 		.doit	= tipc_nl_node_flush_key,
++ 	},
++ #endif
++ 	{
++ 		.cmd	= TIPC_NL_ADDR_LEGACY_GET,
++ 		.validate = GENL_DONT_VALIDATE_STRICT | GENL_DONT_VALIDATE_DUMP,
++ 		.doit	= tipc_nl_net_addr_legacy_get,
++ 	},
+++>>>>>>> e1b5e598e5a5 (tipc: make legacy address flag readable over netlink)
+  };
+  
+  struct genl_family tipc_genl_family __ro_after_init = {
+* Unmerged path include/uapi/linux/tipc_netlink.h
+diff --git a/net/tipc/net.c b/net/tipc/net.c
+index 2de3cec9929d..85400e4242de 100644
+--- a/net/tipc/net.c
++++ b/net/tipc/net.c
+@@ -302,3 +302,59 @@ int tipc_nl_net_set(struct sk_buff *skb, struct genl_info *info)
+ 
+ 	return err;
+ }
++
++static int __tipc_nl_addr_legacy_get(struct net *net, struct tipc_nl_msg *msg)
++{
++	struct tipc_net *tn = tipc_net(net);
++	struct nlattr *attrs;
++	void *hdr;
++
++	hdr = genlmsg_put(msg->skb, msg->portid, msg->seq, &tipc_genl_family,
++			  0, TIPC_NL_ADDR_LEGACY_GET);
++	if (!hdr)
++		return -EMSGSIZE;
++
++	attrs = nla_nest_start(msg->skb, TIPC_NLA_NET);
++	if (!attrs)
++		goto msg_full;
++
++	if (tn->legacy_addr_format)
++		if (nla_put_flag(msg->skb, TIPC_NLA_NET_ADDR_LEGACY))
++			goto attr_msg_full;
++
++	nla_nest_end(msg->skb, attrs);
++	genlmsg_end(msg->skb, hdr);
++
++	return 0;
++
++attr_msg_full:
++	nla_nest_cancel(msg->skb, attrs);
++msg_full:
++	genlmsg_cancel(msg->skb, hdr);
++
++	return -EMSGSIZE;
++}
++
++int tipc_nl_net_addr_legacy_get(struct sk_buff *skb, struct genl_info *info)
++{
++	struct net *net = sock_net(skb->sk);
++	struct tipc_nl_msg msg;
++	struct sk_buff *rep;
++	int err;
++
++	rep = nlmsg_new(NLMSG_GOODSIZE, GFP_KERNEL);
++	if (!rep)
++		return -ENOMEM;
++
++	msg.skb = rep;
++	msg.portid = info->snd_portid;
++	msg.seq = info->snd_seq;
++
++	err = __tipc_nl_addr_legacy_get(net, &msg);
++	if (err) {
++		nlmsg_free(msg.skb);
++		return err;
++	}
++
++	return genlmsg_reply(msg.skb, info);
++}
+diff --git a/net/tipc/net.h b/net/tipc/net.h
+index b7f2e364eb99..6740d97c706e 100644
+--- a/net/tipc/net.h
++++ b/net/tipc/net.h
+@@ -47,5 +47,6 @@ void tipc_net_stop(struct net *net);
+ int tipc_nl_net_dump(struct sk_buff *skb, struct netlink_callback *cb);
+ int tipc_nl_net_set(struct sk_buff *skb, struct genl_info *info);
+ int __tipc_nl_net_set(struct sk_buff *skb, struct genl_info *info);
++int tipc_nl_net_addr_legacy_get(struct sk_buff *skb, struct genl_info *info);
+ 
+ #endif
+* Unmerged path net/tipc/netlink.c
