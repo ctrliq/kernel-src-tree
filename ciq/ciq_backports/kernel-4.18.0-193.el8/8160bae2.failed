@@ -1,0 +1,1074 @@
+selftests/bpf: add test selectors by number and name to test_progs
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-193.el8
+commit-author Andrii Nakryiko <andriin@fb.com>
+commit 8160bae21fc29de0ec795abcd209cdd7cc144e8e
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-193.el8/8160bae2.failed
+
+Add ability to specify either test number or test name substring to
+narrow down a set of test to run.
+
+Usage:
+sudo ./test_progs -n 1
+sudo ./test_progs -t attach_probe
+
+	Signed-off-by: Andrii Nakryiko <andriin@fb.com>
+	Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+(cherry picked from commit 8160bae21fc29de0ec795abcd209cdd7cc144e8e)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	tools/testing/selftests/bpf/test_progs.c
+diff --cc tools/testing/selftests/bpf/test_progs.c
+index da24416535c6,6e04b9f83777..000000000000
+--- a/tools/testing/selftests/bpf/test_progs.c
++++ b/tools/testing/selftests/bpf/test_progs.c
+@@@ -1,58 -1,16 +1,63 @@@
+ -// SPDX-License-Identifier: GPL-2.0-only
+  /* Copyright (c) 2017 Facebook
+ + *
+ + * This program is free software; you can redistribute it and/or
+ + * modify it under the terms of version 2 of the GNU General Public
+ + * License as published by the Free Software Foundation.
+   */
+ -#include "test_progs.h"
+ +#include <stdio.h>
+ +#include <unistd.h>
+ +#include <errno.h>
+ +#include <string.h>
+ +#include <assert.h>
+ +#include <stdlib.h>
+ +#include <stdarg.h>
+ +#include <time.h>
+ +
+ +#include <linux/types.h>
+ +typedef __u16 __sum16;
+ +#include <arpa/inet.h>
+ +#include <linux/if_ether.h>
+ +#include <linux/if_packet.h>
+ +#include <linux/ip.h>
+ +#include <linux/ipv6.h>
+ +#include <linux/tcp.h>
+ +#include <linux/filter.h>
+ +#include <linux/perf_event.h>
+ +#include <linux/unistd.h>
+ +
+ +#include <sys/ioctl.h>
+ +#include <sys/wait.h>
+ +#include <sys/types.h>
+ +#include <fcntl.h>
+ +
+ +#include <linux/bpf.h>
+ +#include <linux/err.h>
+ +#include <bpf/bpf.h>
+ +#include <bpf/libbpf.h>
+ +
+ +#include "test_iptunnel_common.h"
+ +#include "bpf_util.h"
+ +#include "bpf_endian.h"
+  #include "bpf_rlimit.h"
+++<<<<<<< HEAD
+ +#include "trace_helpers.h"
+ +#include "flow_dissector_load.h"
+++=======
++ #include <argp.h>
++ #include <string.h>
+++>>>>>>> 8160bae21fc2 (selftests/bpf: add test selectors by number and name to test_progs)
+ +
+ +static int error_cnt, pass_cnt;
+ +static bool jit_enabled;
+  
+ -int error_cnt, pass_cnt;
+ -bool jit_enabled;
+ -bool verifier_stats = false;
+ +#define MAGIC_BYTES 123
+  
+ -struct ipv4_packet pkt_v4 = {
+ +/* ipv4 test vector */
+ +static struct {
+ +	struct ethhdr eth;
+ +	struct iphdr iph;
+ +	struct tcphdr tcp;
+ +} __packed pkt_v4 = {
+  	.eth.h_proto = __bpf_constant_htons(ETH_P_IP),
+  	.iph.ihl = 5,
+  	.iph.protocol = IPPROTO_TCP,
+@@@ -1180,849 -145,136 +1185,936 @@@ err
+  	return -1;
+  }
+  
+ -void *spin_lock_thread(void *arg)
+ +static void test_stacktrace_build_id(void)
+  {
+ -	__u32 duration, retval;
+ -	int err, prog_fd = *(u32 *) arg;
+ +	int control_map_fd, stackid_hmap_fd, stackmap_fd, stack_amap_fd;
+ +	const char *file = "./test_stacktrace_build_id.o";
+ +	int bytes, efd, err, pmu_fd, prog_fd, stack_trace_len;
+ +	struct perf_event_attr attr = {};
+ +	__u32 key, previous_key, val, duration = 0;
+ +	struct bpf_object *obj;
+ +	char buf[256];
+ +	int i, j;
+ +	struct bpf_stack_build_id id_offs[PERF_MAX_STACK_DEPTH];
+ +	int build_id_matches = 0;
+ +	int retry = 1;
+  
+ -	err = bpf_prog_test_run(prog_fd, 10000, &pkt_v4, sizeof(pkt_v4),
+ -				NULL, NULL, &retval, &duration);
+ -	CHECK(err || retval, "",
+ -	      "err %d errno %d retval %d duration %d\n",
+ -	      err, errno, retval, duration);
+ -	pthread_exit(arg);
+ -}
+ +retry:
+ +	err = bpf_prog_load(file, BPF_PROG_TYPE_TRACEPOINT, &obj, &prog_fd);
+ +	if (CHECK(err, "prog_load", "err %d errno %d\n", err, errno))
+ +		goto out;
+  
+ -/* extern declarations for test funcs */
+ -#define DEFINE_TEST(name) extern void test_##name();
+ -#include <prog_tests/tests.h>
+ -#undef DEFINE_TEST
+ +	/* Get the ID for the sched/sched_switch tracepoint */
+ +	snprintf(buf, sizeof(buf),
+ +		 "/sys/kernel/debug/tracing/events/random/urandom_read/id");
+ +	efd = open(buf, O_RDONLY, 0);
+ +	if (CHECK(efd < 0, "open", "err %d errno %d\n", efd, errno))
+ +		goto close_prog;
+  
+++<<<<<<< HEAD
+ +	bytes = read(efd, buf, sizeof(buf));
+ +	close(efd);
+ +	if (CHECK(bytes <= 0 || bytes >= sizeof(buf),
+ +		  "read", "bytes %d errno %d\n", bytes, errno))
+ +		goto close_prog;
+++=======
++ struct prog_test_def {
++ 	const char *test_name;
++ 	int test_num;
++ 	void (*run_test)(void);
++ };
+++>>>>>>> 8160bae21fc2 (selftests/bpf: add test selectors by number and name to test_progs)
+  
+ -static struct prog_test_def prog_test_defs[] = {
+ -#define DEFINE_TEST(name) {	      \
+ -	.test_name = #name,	      \
+ -	.run_test = &test_##name,   \
+ -},
+ -#include <prog_tests/tests.h>
+ -#undef DEFINE_TEST
+ -};
+ +	/* Open the perf event and attach bpf progrram */
+ +	attr.config = strtol(buf, NULL, 0);
+ +	attr.type = PERF_TYPE_TRACEPOINT;
+ +	attr.sample_type = PERF_SAMPLE_RAW | PERF_SAMPLE_CALLCHAIN;
+ +	attr.sample_period = 1;
+ +	attr.wakeup_events = 1;
+ +	pmu_fd = syscall(__NR_perf_event_open, &attr, -1 /* pid */,
+ +			 0 /* cpu 0 */, -1 /* group id */,
+ +			 0 /* flags */);
+ +	if (CHECK(pmu_fd < 0, "perf_event_open", "err %d errno %d\n",
+ +		  pmu_fd, errno))
+ +		goto close_prog;
+ +
+ +	err = ioctl(pmu_fd, PERF_EVENT_IOC_ENABLE, 0);
+ +	if (CHECK(err, "perf_event_ioc_enable", "err %d errno %d\n",
+ +		  err, errno))
+ +		goto close_pmu;
+ +
+++<<<<<<< HEAD
+ +	err = ioctl(pmu_fd, PERF_EVENT_IOC_SET_BPF, prog_fd);
+ +	if (CHECK(err, "perf_event_ioc_set_bpf", "err %d errno %d\n",
+ +		  err, errno))
+ +		goto disable_pmu;
+  
+ -const char *argp_program_version = "test_progs 0.1";
+ -const char *argp_program_bug_address = "<bpf@vger.kernel.org>";
+ -const char argp_program_doc[] = "BPF selftests test runner";
+ +	/* find map fds */
+ +	control_map_fd = bpf_find_map(__func__, obj, "control_map");
+ +	if (CHECK(control_map_fd < 0, "bpf_find_map control_map",
+ +		  "err %d errno %d\n", err, errno))
+ +		goto disable_pmu;
+  
+ +	stackid_hmap_fd = bpf_find_map(__func__, obj, "stackid_hmap");
+ +	if (CHECK(stackid_hmap_fd < 0, "bpf_find_map stackid_hmap",
+ +		  "err %d errno %d\n", err, errno))
+ +		goto disable_pmu;
+++=======
++ enum ARG_KEYS {
++ 	ARG_TEST_NUM = 'n',
++ 	ARG_TEST_NAME = 't',
++ 	ARG_VERIFIER_STATS = 's',
++ };
++ 	
++ static const struct argp_option opts[] = {
++ 	{ "num", ARG_TEST_NUM, "NUM", 0,
++ 	  "Run test number NUM only " },
++ 	{ "name", ARG_TEST_NAME, "NAME", 0,
++ 	  "Run tests with names containing NAME" },
++ 	{ "verifier-stats", ARG_VERIFIER_STATS, NULL, 0,
++ 	  "Output verifier statistics", },
++ 	{},
++ };
++ 
++ struct test_env {
++ 	int test_num_selector;
++ 	const char *test_name_selector;
++ 	bool verifier_stats;
++ };
++ 
++ static struct test_env env = {
++ 	.test_num_selector = -1,
++ };
+++>>>>>>> 8160bae21fc2 (selftests/bpf: add test selectors by number and name to test_progs)
+  
+ -static error_t parse_arg(int key, char *arg, struct argp_state *state)
+ -{
+ -	struct test_env *env = state->input;
+ +	stackmap_fd = bpf_find_map(__func__, obj, "stackmap");
+ +	if (CHECK(stackmap_fd < 0, "bpf_find_map stackmap", "err %d errno %d\n",
+ +		  err, errno))
+ +		goto disable_pmu;
+ +
+++<<<<<<< HEAD
+ +	stack_amap_fd = bpf_find_map(__func__, obj, "stack_amap");
+ +	if (CHECK(stack_amap_fd < 0, "bpf_find_map stack_amap",
+ +		  "err %d errno %d\n", err, errno))
+ +		goto disable_pmu;
+ +
+ +	assert(system("dd if=/dev/urandom of=/dev/zero count=4 2> /dev/null")
+ +	       == 0);
+ +	assert(system("./urandom_read") == 0);
+ +	/* disable stack trace collection */
+ +	key = 0;
+ +	val = 1;
+ +	bpf_map_update_elem(control_map_fd, &key, &val, 0);
+  
+ +	/* for every element in stackid_hmap, we can find a corresponding one
+ +	 * in stackmap, and vise versa.
+ +	 */
+ +	err = compare_map_keys(stackid_hmap_fd, stackmap_fd);
+ +	if (CHECK(err, "compare_map_keys stackid_hmap vs. stackmap",
+ +		  "err %d errno %d\n", err, errno))
+ +		goto disable_pmu;
+ +
+ +	err = compare_map_keys(stackmap_fd, stackid_hmap_fd);
+ +	if (CHECK(err, "compare_map_keys stackmap vs. stackid_hmap",
+ +		  "err %d errno %d\n", err, errno))
+ +		goto disable_pmu;
+ +
+ +	err = extract_build_id(buf, 256);
+ +
+ +	if (CHECK(err, "get build_id with readelf",
+ +		  "err %d errno %d\n", err, errno))
+ +		goto disable_pmu;
+ +
+ +	err = bpf_map_get_next_key(stackmap_fd, NULL, &key);
+ +	if (CHECK(err, "get_next_key from stackmap",
+ +		  "err %d, errno %d\n", err, errno))
+ +		goto disable_pmu;
+ +
+ +	do {
+ +		char build_id[64];
+ +
+ +		err = bpf_map_lookup_elem(stackmap_fd, &key, id_offs);
+ +		if (CHECK(err, "lookup_elem from stackmap",
+ +			  "err %d, errno %d\n", err, errno))
+ +			goto disable_pmu;
+ +		for (i = 0; i < PERF_MAX_STACK_DEPTH; ++i)
+ +			if (id_offs[i].status == BPF_STACK_BUILD_ID_VALID &&
+ +			    id_offs[i].offset != 0) {
+ +				for (j = 0; j < 20; ++j)
+ +					sprintf(build_id + 2 * j, "%02x",
+ +						id_offs[i].build_id[j] & 0xff);
+ +				if (strstr(buf, build_id) != NULL)
+ +					build_id_matches = 1;
+ +			}
+ +		previous_key = key;
+ +	} while (bpf_map_get_next_key(stackmap_fd, &previous_key, &key) == 0);
+ +
+ +	/* stack_map_get_build_id_offset() is racy and sometimes can return
+ +	 * BPF_STACK_BUILD_ID_IP instead of BPF_STACK_BUILD_ID_VALID;
+ +	 * try it one more time.
+ +	 */
+ +	if (build_id_matches < 1 && retry--) {
+ +		ioctl(pmu_fd, PERF_EVENT_IOC_DISABLE);
+ +		close(pmu_fd);
+ +		bpf_object__close(obj);
+ +		printf("%s:WARN:Didn't find expected build ID from the map, retrying\n",
+ +		       __func__);
+ +		goto retry;
+++=======
++ 	switch (key) {
++ 	case ARG_TEST_NUM: {
++ 		int test_num;
++ 
++ 		errno = 0;
++ 		test_num = strtol(arg, NULL, 10);
++ 		if (errno)
++ 			return -errno;
++ 		env->test_num_selector = test_num;
++ 		break;
++ 	}
++ 	case ARG_TEST_NAME:
++ 		env->test_name_selector = arg;
++ 		break;
++ 	case ARG_VERIFIER_STATS:
++ 		env->verifier_stats = true;
++ 		break;
++ 	case ARGP_KEY_ARG:
++ 		argp_usage(state);
++ 		break;
++ 	case ARGP_KEY_END:
++ 		break;
++ 	default:
++ 		return ARGP_ERR_UNKNOWN;
+++>>>>>>> 8160bae21fc2 (selftests/bpf: add test selectors by number and name to test_progs)
+  	}
+ -	return 0;
+ -}
+  
+ +	if (CHECK(build_id_matches < 1, "build id match",
+ +		  "Didn't find expected build ID from the map\n"))
+ +		goto disable_pmu;
+ +
+ +	stack_trace_len = PERF_MAX_STACK_DEPTH
+ +		* sizeof(struct bpf_stack_build_id);
+ +	err = compare_stack_ips(stackmap_fd, stack_amap_fd, stack_trace_len);
+ +	CHECK(err, "compare_stack_ips stackmap vs. stack_amap",
+ +	      "err %d errno %d\n", err, errno);
+ +
+ +disable_pmu:
+ +	ioctl(pmu_fd, PERF_EVENT_IOC_DISABLE);
+  
+ -int main(int argc, char **argv)
+ +close_pmu:
+ +	close(pmu_fd);
+ +
+ +close_prog:
+ +	bpf_object__close(obj);
+ +
+ +out:
+ +	return;
+ +}
+ +
+ +static void test_stacktrace_build_id_nmi(void)
+  {
+ -	static const struct argp argp = {
+ -		.options = opts,
+ -		.parser = parse_arg,
+ -		.doc = argp_program_doc,
+ +	int control_map_fd, stackid_hmap_fd, stackmap_fd, stack_amap_fd;
+ +	const char *file = "./test_stacktrace_build_id.o";
+ +	int err, pmu_fd, prog_fd;
+ +	struct perf_event_attr attr = {
+ +		.sample_freq = 5000,
+ +		.freq = 1,
+ +		.type = PERF_TYPE_HARDWARE,
+ +		.config = PERF_COUNT_HW_CPU_CYCLES,
+  	};
+++<<<<<<< HEAD
+ +	__u32 key, previous_key, val, duration = 0;
+ +	struct bpf_object *obj;
+ +	char buf[256];
+ +	int i, j;
+ +	struct bpf_stack_build_id id_offs[PERF_MAX_STACK_DEPTH];
+ +	int build_id_matches = 0;
+ +	int retry = 1;
+++=======
++ 	struct prog_test_def *test;
++ 	int err, i;
+++>>>>>>> 8160bae21fc2 (selftests/bpf: add test selectors by number and name to test_progs)
+  
+ -	err = argp_parse(&argp, argc, argv, 0, NULL, &env);
+ -	if (err)
+ -		return err;
+ +retry:
+ +	err = bpf_prog_load(file, BPF_PROG_TYPE_PERF_EVENT, &obj, &prog_fd);
+ +	if (CHECK(err, "prog_load", "err %d errno %d\n", err, errno))
+ +		return;
+ +
+ +	pmu_fd = syscall(__NR_perf_event_open, &attr, -1 /* pid */,
+ +			 0 /* cpu 0 */, -1 /* group id */,
+ +			 0 /* flags */);
+ +	if (CHECK(pmu_fd < 0, "perf_event_open",
+ +		  "err %d errno %d. Does the test host support PERF_COUNT_HW_CPU_CYCLES?\n",
+ +		  pmu_fd, errno))
+ +		goto close_prog;
+ +
+ +	err = ioctl(pmu_fd, PERF_EVENT_IOC_ENABLE, 0);
+ +	if (CHECK(err, "perf_event_ioc_enable", "err %d errno %d\n",
+ +		  err, errno))
+ +		goto close_pmu;
+ +
+ +	err = ioctl(pmu_fd, PERF_EVENT_IOC_SET_BPF, prog_fd);
+ +	if (CHECK(err, "perf_event_ioc_set_bpf", "err %d errno %d\n",
+ +		  err, errno))
+ +		goto disable_pmu;
+ +
+ +	/* find map fds */
+ +	control_map_fd = bpf_find_map(__func__, obj, "control_map");
+ +	if (CHECK(control_map_fd < 0, "bpf_find_map control_map",
+ +		  "err %d errno %d\n", err, errno))
+ +		goto disable_pmu;
+ +
+ +	stackid_hmap_fd = bpf_find_map(__func__, obj, "stackid_hmap");
+ +	if (CHECK(stackid_hmap_fd < 0, "bpf_find_map stackid_hmap",
+ +		  "err %d errno %d\n", err, errno))
+ +		goto disable_pmu;
+ +
+ +	stackmap_fd = bpf_find_map(__func__, obj, "stackmap");
+ +	if (CHECK(stackmap_fd < 0, "bpf_find_map stackmap", "err %d errno %d\n",
+ +		  err, errno))
+ +		goto disable_pmu;
+ +
+ +	stack_amap_fd = bpf_find_map(__func__, obj, "stack_amap");
+ +	if (CHECK(stack_amap_fd < 0, "bpf_find_map stack_amap",
+ +		  "err %d errno %d\n", err, errno))
+ +		goto disable_pmu;
+ +
+ +	assert(system("dd if=/dev/urandom of=/dev/zero count=4 2> /dev/null")
+ +	       == 0);
+ +	assert(system("taskset 0x1 ./urandom_read 100000") == 0);
+ +	/* disable stack trace collection */
+ +	key = 0;
+ +	val = 1;
+ +	bpf_map_update_elem(control_map_fd, &key, &val, 0);
+ +
+ +	/* for every element in stackid_hmap, we can find a corresponding one
+ +	 * in stackmap, and vise versa.
+ +	 */
+ +	err = compare_map_keys(stackid_hmap_fd, stackmap_fd);
+ +	if (CHECK(err, "compare_map_keys stackid_hmap vs. stackmap",
+ +		  "err %d errno %d\n", err, errno))
+ +		goto disable_pmu;
+ +
+ +	err = compare_map_keys(stackmap_fd, stackid_hmap_fd);
+ +	if (CHECK(err, "compare_map_keys stackmap vs. stackid_hmap",
+ +		  "err %d errno %d\n", err, errno))
+ +		goto disable_pmu;
+ +
+ +	err = extract_build_id(buf, 256);
+ +
+ +	if (CHECK(err, "get build_id with readelf",
+ +		  "err %d errno %d\n", err, errno))
+ +		goto disable_pmu;
+ +
+ +	err = bpf_map_get_next_key(stackmap_fd, NULL, &key);
+ +	if (CHECK(err, "get_next_key from stackmap",
+ +		  "err %d, errno %d\n", err, errno))
+ +		goto disable_pmu;
+ +
+ +	do {
+ +		char build_id[64];
+ +
+ +		err = bpf_map_lookup_elem(stackmap_fd, &key, id_offs);
+ +		if (CHECK(err, "lookup_elem from stackmap",
+ +			  "err %d, errno %d\n", err, errno))
+ +			goto disable_pmu;
+ +		for (i = 0; i < PERF_MAX_STACK_DEPTH; ++i)
+ +			if (id_offs[i].status == BPF_STACK_BUILD_ID_VALID &&
+ +			    id_offs[i].offset != 0) {
+ +				for (j = 0; j < 20; ++j)
+ +					sprintf(build_id + 2 * j, "%02x",
+ +						id_offs[i].build_id[j] & 0xff);
+ +				if (strstr(buf, build_id) != NULL)
+ +					build_id_matches = 1;
+ +			}
+ +		previous_key = key;
+ +	} while (bpf_map_get_next_key(stackmap_fd, &previous_key, &key) == 0);
+ +
+ +	/* stack_map_get_build_id_offset() is racy and sometimes can return
+ +	 * BPF_STACK_BUILD_ID_IP instead of BPF_STACK_BUILD_ID_VALID;
+ +	 * try it one more time.
+ +	 */
+ +	if (build_id_matches < 1 && retry--) {
+ +		ioctl(pmu_fd, PERF_EVENT_IOC_DISABLE);
+ +		close(pmu_fd);
+ +		bpf_object__close(obj);
+ +		printf("%s:WARN:Didn't find expected build ID from the map, retrying\n",
+ +		       __func__);
+ +		goto retry;
+ +	}
+ +
+ +	if (CHECK(build_id_matches < 1, "build id match",
+ +		  "Didn't find expected build ID from the map\n"))
+ +		goto disable_pmu;
+ +
+ +	/*
+ +	 * We intentionally skip compare_stack_ips(). This is because we
+ +	 * only support one in_nmi() ips-to-build_id translation per cpu
+ +	 * at any time, thus stack_amap here will always fallback to
+ +	 * BPF_STACK_BUILD_ID_IP;
+ +	 */
+ +
+ +disable_pmu:
+ +	ioctl(pmu_fd, PERF_EVENT_IOC_DISABLE);
+ +
+ +close_pmu:
+ +	close(pmu_fd);
+ +
+ +close_prog:
+ +	bpf_object__close(obj);
+ +}
+ +
+ +#define MAX_CNT_RAWTP	10ull
+ +#define MAX_STACK_RAWTP	100
+ +struct get_stack_trace_t {
+ +	int pid;
+ +	int kern_stack_size;
+ +	int user_stack_size;
+ +	int user_stack_buildid_size;
+ +	__u64 kern_stack[MAX_STACK_RAWTP];
+ +	__u64 user_stack[MAX_STACK_RAWTP];
+ +	struct bpf_stack_build_id user_stack_buildid[MAX_STACK_RAWTP];
+ +};
+ +
+ +static int get_stack_print_output(void *data, int size)
+ +{
+ +	bool good_kern_stack = false, good_user_stack = false;
+ +	const char *nonjit_func = "___bpf_prog_run";
+ +	struct get_stack_trace_t *e = data;
+ +	int i, num_stack;
+ +	static __u64 cnt;
+ +	struct ksym *ks;
+ +
+ +	cnt++;
+ +
+ +	if (size < sizeof(struct get_stack_trace_t)) {
+ +		__u64 *raw_data = data;
+ +		bool found = false;
+ +
+ +		num_stack = size / sizeof(__u64);
+ +		/* If jit is enabled, we do not have a good way to
+ +		 * verify the sanity of the kernel stack. So we
+ +		 * just assume it is good if the stack is not empty.
+ +		 * This could be improved in the future.
+ +		 */
+ +		if (jit_enabled) {
+ +			found = num_stack > 0;
+ +		} else {
+ +			for (i = 0; i < num_stack; i++) {
+ +				ks = ksym_search(raw_data[i]);
+ +				if (strcmp(ks->name, nonjit_func) == 0) {
+ +					found = true;
+ +					break;
+ +				}
+ +			}
+ +		}
+ +		if (found) {
+ +			good_kern_stack = true;
+ +			good_user_stack = true;
+ +		}
+ +	} else {
+ +		num_stack = e->kern_stack_size / sizeof(__u64);
+ +		if (jit_enabled) {
+ +			good_kern_stack = num_stack > 0;
+ +		} else {
+ +			for (i = 0; i < num_stack; i++) {
+ +				ks = ksym_search(e->kern_stack[i]);
+ +				if (strcmp(ks->name, nonjit_func) == 0) {
+ +					good_kern_stack = true;
+ +					break;
+ +				}
+ +			}
+ +		}
+ +		if (e->user_stack_size > 0 && e->user_stack_buildid_size > 0)
+ +			good_user_stack = true;
+ +	}
+ +	if (!good_kern_stack || !good_user_stack)
+ +		return LIBBPF_PERF_EVENT_ERROR;
+ +
+ +	if (cnt == MAX_CNT_RAWTP)
+ +		return LIBBPF_PERF_EVENT_DONE;
+ +
+ +	return LIBBPF_PERF_EVENT_CONT;
+ +}
+ +
+ +static void test_get_stack_raw_tp(void)
+ +{
+ +	const char *file = "./test_get_stack_rawtp.o";
+ +	int i, efd, err, prog_fd, pmu_fd, perfmap_fd;
+ +	struct perf_event_attr attr = {};
+ +	struct timespec tv = {0, 10};
+ +	__u32 key = 0, duration = 0;
+ +	struct bpf_object *obj;
+  
+ +	err = bpf_prog_load(file, BPF_PROG_TYPE_RAW_TRACEPOINT, &obj, &prog_fd);
+ +	if (CHECK(err, "prog_load raw tp", "err %d errno %d\n", err, errno))
+ +		return;
+ +
+ +	efd = bpf_raw_tracepoint_open("sys_enter", prog_fd);
+ +	if (CHECK(efd < 0, "raw_tp_open", "err %d errno %d\n", efd, errno))
+ +		goto close_prog;
+ +
+ +	perfmap_fd = bpf_find_map(__func__, obj, "perfmap");
+ +	if (CHECK(perfmap_fd < 0, "bpf_find_map", "err %d errno %d\n",
+ +		  perfmap_fd, errno))
+ +		goto close_prog;
+ +
+ +	err = load_kallsyms();
+ +	if (CHECK(err < 0, "load_kallsyms", "err %d errno %d\n", err, errno))
+ +		goto close_prog;
+ +
+ +	attr.sample_type = PERF_SAMPLE_RAW;
+ +	attr.type = PERF_TYPE_SOFTWARE;
+ +	attr.config = PERF_COUNT_SW_BPF_OUTPUT;
+ +	pmu_fd = syscall(__NR_perf_event_open, &attr, getpid()/*pid*/, -1/*cpu*/,
+ +			 -1/*group_fd*/, 0);
+ +	if (CHECK(pmu_fd < 0, "perf_event_open", "err %d errno %d\n", pmu_fd,
+ +		  errno))
+ +		goto close_prog;
+ +
+ +	err = bpf_map_update_elem(perfmap_fd, &key, &pmu_fd, BPF_ANY);
+ +	if (CHECK(err < 0, "bpf_map_update_elem", "err %d errno %d\n", err,
+ +		  errno))
+ +		goto close_prog;
+ +
+ +	err = ioctl(pmu_fd, PERF_EVENT_IOC_ENABLE, 0);
+ +	if (CHECK(err < 0, "ioctl PERF_EVENT_IOC_ENABLE", "err %d errno %d\n",
+ +		  err, errno))
+ +		goto close_prog;
+ +
+ +	err = perf_event_mmap(pmu_fd);
+ +	if (CHECK(err < 0, "perf_event_mmap", "err %d errno %d\n", err, errno))
+ +		goto close_prog;
+ +
+ +	/* trigger some syscall action */
+ +	for (i = 0; i < MAX_CNT_RAWTP; i++)
+ +		nanosleep(&tv, NULL);
+ +
+ +	err = perf_event_poller(pmu_fd, get_stack_print_output);
+ +	if (CHECK(err < 0, "perf_event_poller", "err %d errno %d\n", err, errno))
+ +		goto close_prog;
+ +
+ +	goto close_prog_noerr;
+ +close_prog:
+ +	error_cnt++;
+ +close_prog_noerr:
+ +	bpf_object__close(obj);
+ +}
+ +
+ +static void test_task_fd_query_rawtp(void)
+ +{
+ +	const char *file = "./test_get_stack_rawtp.o";
+ +	__u64 probe_offset, probe_addr;
+ +	__u32 len, prog_id, fd_type;
+ +	struct bpf_object *obj;
+ +	int efd, err, prog_fd;
+ +	__u32 duration = 0;
+ +	char buf[256];
+ +
+ +	err = bpf_prog_load(file, BPF_PROG_TYPE_RAW_TRACEPOINT, &obj, &prog_fd);
+ +	if (CHECK(err, "prog_load raw tp", "err %d errno %d\n", err, errno))
+ +		return;
+ +
+ +	efd = bpf_raw_tracepoint_open("sys_enter", prog_fd);
+ +	if (CHECK(efd < 0, "raw_tp_open", "err %d errno %d\n", efd, errno))
+ +		goto close_prog;
+ +
+ +	/* query (getpid(), efd) */
+ +	len = sizeof(buf);
+ +	err = bpf_task_fd_query(getpid(), efd, 0, buf, &len, &prog_id,
+ +				&fd_type, &probe_offset, &probe_addr);
+ +	if (CHECK(err < 0, "bpf_task_fd_query", "err %d errno %d\n", err,
+ +		  errno))
+ +		goto close_prog;
+ +
+ +	err = fd_type == BPF_FD_TYPE_RAW_TRACEPOINT &&
+ +	      strcmp(buf, "sys_enter") == 0;
+ +	if (CHECK(!err, "check_results", "fd_type %d tp_name %s\n",
+ +		  fd_type, buf))
+ +		goto close_prog;
+ +
+ +	/* test zero len */
+ +	len = 0;
+ +	err = bpf_task_fd_query(getpid(), efd, 0, buf, &len, &prog_id,
+ +				&fd_type, &probe_offset, &probe_addr);
+ +	if (CHECK(err < 0, "bpf_task_fd_query (len = 0)", "err %d errno %d\n",
+ +		  err, errno))
+ +		goto close_prog;
+ +	err = fd_type == BPF_FD_TYPE_RAW_TRACEPOINT &&
+ +	      len == strlen("sys_enter");
+ +	if (CHECK(!err, "check_results", "fd_type %d len %u\n", fd_type, len))
+ +		goto close_prog;
+ +
+ +	/* test empty buffer */
+ +	len = sizeof(buf);
+ +	err = bpf_task_fd_query(getpid(), efd, 0, 0, &len, &prog_id,
+ +				&fd_type, &probe_offset, &probe_addr);
+ +	if (CHECK(err < 0, "bpf_task_fd_query (buf = 0)", "err %d errno %d\n",
+ +		  err, errno))
+ +		goto close_prog;
+ +	err = fd_type == BPF_FD_TYPE_RAW_TRACEPOINT &&
+ +	      len == strlen("sys_enter");
+ +	if (CHECK(!err, "check_results", "fd_type %d len %u\n", fd_type, len))
+ +		goto close_prog;
+ +
+ +	/* test smaller buffer */
+ +	len = 3;
+ +	err = bpf_task_fd_query(getpid(), efd, 0, buf, &len, &prog_id,
+ +				&fd_type, &probe_offset, &probe_addr);
+ +	if (CHECK(err >= 0 || errno != ENOSPC, "bpf_task_fd_query (len = 3)",
+ +		  "err %d errno %d\n", err, errno))
+ +		goto close_prog;
+ +	err = fd_type == BPF_FD_TYPE_RAW_TRACEPOINT &&
+ +	      len == strlen("sys_enter") &&
+ +	      strcmp(buf, "sy") == 0;
+ +	if (CHECK(!err, "check_results", "fd_type %d len %u\n", fd_type, len))
+ +		goto close_prog;
+ +
+ +	goto close_prog_noerr;
+ +close_prog:
+ +	error_cnt++;
+ +close_prog_noerr:
+ +	bpf_object__close(obj);
+ +}
+ +
+ +static void test_task_fd_query_tp_core(const char *probe_name,
+ +				       const char *tp_name)
+ +{
+ +	const char *file = "./test_tracepoint.o";
+ +	int err, bytes, efd, prog_fd, pmu_fd;
+ +	struct perf_event_attr attr = {};
+ +	__u64 probe_offset, probe_addr;
+ +	__u32 len, prog_id, fd_type;
+ +	struct bpf_object *obj;
+ +	__u32 duration = 0;
+ +	char buf[256];
+ +
+ +	err = bpf_prog_load(file, BPF_PROG_TYPE_TRACEPOINT, &obj, &prog_fd);
+ +	if (CHECK(err, "bpf_prog_load", "err %d errno %d\n", err, errno))
+ +		goto close_prog;
+ +
+ +	snprintf(buf, sizeof(buf),
+ +		 "/sys/kernel/debug/tracing/events/%s/id", probe_name);
+ +	efd = open(buf, O_RDONLY, 0);
+ +	if (CHECK(efd < 0, "open", "err %d errno %d\n", efd, errno))
+ +		goto close_prog;
+ +	bytes = read(efd, buf, sizeof(buf));
+ +	close(efd);
+ +	if (CHECK(bytes <= 0 || bytes >= sizeof(buf), "read",
+ +		  "bytes %d errno %d\n", bytes, errno))
+ +		goto close_prog;
+ +
+ +	attr.config = strtol(buf, NULL, 0);
+ +	attr.type = PERF_TYPE_TRACEPOINT;
+ +	attr.sample_type = PERF_SAMPLE_RAW;
+ +	attr.sample_period = 1;
+ +	attr.wakeup_events = 1;
+ +	pmu_fd = syscall(__NR_perf_event_open, &attr, -1 /* pid */,
+ +			 0 /* cpu 0 */, -1 /* group id */,
+ +			 0 /* flags */);
+ +	if (CHECK(err, "perf_event_open", "err %d errno %d\n", err, errno))
+ +		goto close_pmu;
+ +
+ +	err = ioctl(pmu_fd, PERF_EVENT_IOC_ENABLE, 0);
+ +	if (CHECK(err, "perf_event_ioc_enable", "err %d errno %d\n", err,
+ +		  errno))
+ +		goto close_pmu;
+ +
+ +	err = ioctl(pmu_fd, PERF_EVENT_IOC_SET_BPF, prog_fd);
+ +	if (CHECK(err, "perf_event_ioc_set_bpf", "err %d errno %d\n", err,
+ +		  errno))
+ +		goto close_pmu;
+ +
+ +	/* query (getpid(), pmu_fd) */
+ +	len = sizeof(buf);
+ +	err = bpf_task_fd_query(getpid(), pmu_fd, 0, buf, &len, &prog_id,
+ +				&fd_type, &probe_offset, &probe_addr);
+ +	if (CHECK(err < 0, "bpf_task_fd_query", "err %d errno %d\n", err,
+ +		  errno))
+ +		goto close_pmu;
+ +
+ +	err = (fd_type == BPF_FD_TYPE_TRACEPOINT) && !strcmp(buf, tp_name);
+ +	if (CHECK(!err, "check_results", "fd_type %d tp_name %s\n",
+ +		  fd_type, buf))
+ +		goto close_pmu;
+ +
+ +	close(pmu_fd);
+ +	goto close_prog_noerr;
+ +
+ +close_pmu:
+ +	close(pmu_fd);
+ +close_prog:
+ +	error_cnt++;
+ +close_prog_noerr:
+ +	bpf_object__close(obj);
+ +}
+ +
+ +static void test_task_fd_query_tp(void)
+ +{
+ +	test_task_fd_query_tp_core("sched/sched_switch",
+ +				   "sched_switch");
+ +	test_task_fd_query_tp_core("syscalls/sys_enter_read",
+ +				   "sys_enter_read");
+ +}
+ +
+ +static int libbpf_debug_print(enum libbpf_print_level level,
+ +			      const char *format, va_list args)
+ +{
+ +	if (level == LIBBPF_DEBUG)
+ +		return 0;
+ +
+ +	return vfprintf(stderr, format, args);
+ +}
+ +
+ +static void test_reference_tracking()
+ +{
+ +	const char *file = "./test_sk_lookup_kern.o";
+ +	struct bpf_object *obj;
+ +	struct bpf_program *prog;
+ +	__u32 duration = 0;
+ +	int err = 0;
+ +
+ +	obj = bpf_object__open(file);
+ +	if (IS_ERR(obj)) {
+ +		error_cnt++;
+ +		return;
+ +	}
+ +
+ +	bpf_object__for_each_program(prog, obj) {
+ +		const char *title;
+ +
+ +		/* Ignore .text sections */
+ +		title = bpf_program__title(prog, false);
+ +		if (strstr(title, ".text") != NULL)
+ +			continue;
+ +
+ +		bpf_program__set_type(prog, BPF_PROG_TYPE_SCHED_CLS);
+ +
+ +		/* Expect verifier failure if test name has 'fail' */
+ +		if (strstr(title, "fail") != NULL) {
+ +			libbpf_set_print(NULL);
+ +			err = !bpf_program__load(prog, "GPL", 0);
+ +			libbpf_set_print(libbpf_debug_print);
+ +		} else {
+ +			err = bpf_program__load(prog, "GPL", 0);
+ +		}
+ +		CHECK(err, title, "\n");
+ +	}
+ +	bpf_object__close(obj);
+ +}
+ +
+ +enum {
+ +	QUEUE,
+ +	STACK,
+ +};
+ +
+ +static void test_queue_stack_map(int type)
+ +{
+ +	const int MAP_SIZE = 32;
+ +	__u32 vals[MAP_SIZE], duration, retval, size, val;
+ +	int i, err, prog_fd, map_in_fd, map_out_fd;
+ +	char file[32], buf[128];
+ +	struct bpf_object *obj;
+ +	struct iphdr *iph = (void *)buf + sizeof(struct ethhdr);
+ +
+ +	/* Fill test values to be used */
+ +	for (i = 0; i < MAP_SIZE; i++)
+ +		vals[i] = rand();
+ +
+ +	if (type == QUEUE)
+ +		strncpy(file, "./test_queue_map.o", sizeof(file));
+ +	else if (type == STACK)
+ +		strncpy(file, "./test_stack_map.o", sizeof(file));
+ +	else
+ +		return;
+ +
+ +	err = bpf_prog_load(file, BPF_PROG_TYPE_SCHED_CLS, &obj, &prog_fd);
+ +	if (err) {
+ +		error_cnt++;
+ +		return;
+ +	}
+ +
+ +	map_in_fd = bpf_find_map(__func__, obj, "map_in");
+ +	if (map_in_fd < 0)
+ +		goto out;
+ +
+ +	map_out_fd = bpf_find_map(__func__, obj, "map_out");
+ +	if (map_out_fd < 0)
+ +		goto out;
+ +
+ +	/* Push 32 elements to the input map */
+ +	for (i = 0; i < MAP_SIZE; i++) {
+ +		err = bpf_map_update_elem(map_in_fd, NULL, &vals[i], 0);
+ +		if (err) {
+ +			error_cnt++;
+ +			goto out;
+ +		}
+ +	}
+ +
+ +	/* The eBPF program pushes iph.saddr in the output map,
+ +	 * pops the input map and saves this value in iph.daddr
+ +	 */
+ +	for (i = 0; i < MAP_SIZE; i++) {
+ +		if (type == QUEUE) {
+ +			val = vals[i];
+ +			pkt_v4.iph.saddr = vals[i] * 5;
+ +		} else if (type == STACK) {
+ +			val = vals[MAP_SIZE - 1 - i];
+ +			pkt_v4.iph.saddr = vals[MAP_SIZE - 1 - i] * 5;
+ +		}
+ +
+ +		err = bpf_prog_test_run(prog_fd, 1, &pkt_v4, sizeof(pkt_v4),
+ +					buf, &size, &retval, &duration);
+ +		if (err || retval || size != sizeof(pkt_v4) ||
+ +		    iph->daddr != val)
+ +			break;
+ +	}
+ +
+ +	CHECK(err || retval || size != sizeof(pkt_v4) || iph->daddr != val,
+ +	      "bpf_map_pop_elem",
+ +	      "err %d errno %d retval %d size %d iph->daddr %u\n",
+ +	      err, errno, retval, size, iph->daddr);
+ +
+ +	/* Queue is empty, program should return TC_ACT_SHOT */
+ +	err = bpf_prog_test_run(prog_fd, 1, &pkt_v4, sizeof(pkt_v4),
+ +				buf, &size, &retval, &duration);
+ +	CHECK(err || retval != 2 /* TC_ACT_SHOT */|| size != sizeof(pkt_v4),
+ +	      "check-queue-stack-map-empty",
+ +	      "err %d errno %d retval %d size %d\n",
+ +	      err, errno, retval, size);
+ +
+ +	/* Check that the program pushed elements correctly */
+ +	for (i = 0; i < MAP_SIZE; i++) {
+ +		err = bpf_map_lookup_and_delete_elem(map_out_fd, NULL, &val);
+ +		if (err || val != vals[i] * 5)
+ +			break;
+ +	}
+ +
+ +	CHECK(i != MAP_SIZE && (err || val != vals[i] * 5),
+ +	      "bpf_map_push_elem", "err %d value %u\n", err, val);
+ +
+ +out:
+ +	pkt_v4.iph.saddr = 0;
+ +	bpf_object__close(obj);
+ +}
+ +
+ +#define CHECK_FLOW_KEYS(desc, got, expected)				\
+ +	CHECK(memcmp(&got, &expected, sizeof(got)) != 0,		\
+ +	      desc,							\
+ +	      "nhoff=%u/%u "						\
+ +	      "thoff=%u/%u "						\
+ +	      "addr_proto=0x%x/0x%x "					\
+ +	      "is_frag=%u/%u "						\
+ +	      "is_first_frag=%u/%u "					\
+ +	      "is_encap=%u/%u "						\
+ +	      "n_proto=0x%x/0x%x "					\
+ +	      "sport=%u/%u "						\
+ +	      "dport=%u/%u\n",						\
+ +	      got.nhoff, expected.nhoff,				\
+ +	      got.thoff, expected.thoff,				\
+ +	      got.addr_proto, expected.addr_proto,			\
+ +	      got.is_frag, expected.is_frag,				\
+ +	      got.is_first_frag, expected.is_first_frag,		\
+ +	      got.is_encap, expected.is_encap,				\
+ +	      got.n_proto, expected.n_proto,				\
+ +	      got.sport, expected.sport,				\
+ +	      got.dport, expected.dport)
+ +
+ +static struct bpf_flow_keys pkt_v4_flow_keys = {
+ +	.nhoff = 0,
+ +	.thoff = sizeof(struct iphdr),
+ +	.addr_proto = ETH_P_IP,
+ +	.ip_proto = IPPROTO_TCP,
+ +	.n_proto = __bpf_constant_htons(ETH_P_IP),
+ +};
+ +
+ +static struct bpf_flow_keys pkt_v6_flow_keys = {
+ +	.nhoff = 0,
+ +	.thoff = sizeof(struct ipv6hdr),
+ +	.addr_proto = ETH_P_IPV6,
+ +	.ip_proto = IPPROTO_TCP,
+ +	.n_proto = __bpf_constant_htons(ETH_P_IPV6),
+ +};
+ +
+ +static void test_flow_dissector(void)
+ +{
+ +	struct bpf_flow_keys flow_keys;
+ +	struct bpf_object *obj;
+ +	__u32 duration, retval;
+ +	int err, prog_fd;
+ +	__u32 size;
+ +
+ +	err = bpf_flow_load(&obj, "./bpf_flow.o", "flow_dissector",
+ +			    "jmp_table", &prog_fd);
+ +	if (err) {
+ +		error_cnt++;
+ +		return;
+ +	}
+ +
+ +	err = bpf_prog_test_run(prog_fd, 10, &pkt_v4, sizeof(pkt_v4),
+ +				&flow_keys, &size, &retval, &duration);
+ +	CHECK(size != sizeof(flow_keys) || err || retval != 1, "ipv4",
+ +	      "err %d errno %d retval %d duration %d size %u/%lu\n",
+ +	      err, errno, retval, duration, size, sizeof(flow_keys));
+ +	CHECK_FLOW_KEYS("ipv4_flow_keys", flow_keys, pkt_v4_flow_keys);
+ +
+ +	err = bpf_prog_test_run(prog_fd, 10, &pkt_v6, sizeof(pkt_v6),
+ +				&flow_keys, &size, &retval, &duration);
+ +	CHECK(size != sizeof(flow_keys) || err || retval != 1, "ipv6",
+ +	      "err %d errno %d retval %d duration %d size %u/%lu\n",
+ +	      err, errno, retval, duration, size, sizeof(flow_keys));
+ +	CHECK_FLOW_KEYS("ipv6_flow_keys", flow_keys, pkt_v6_flow_keys);
+ +
+ +	bpf_object__close(obj);
+ +}
+ +
+ +int main(void)
+ +{
+  	srand(time(NULL));
+  
+  	jit_enabled = is_jit_enabled();
+  
+++<<<<<<< HEAD
+ +	test_pkt_access();
+ +	test_prog_run_xattr();
+ +	test_xdp();
+ +	test_xdp_adjust_tail();
+ +	test_l4lb_all();
+ +	test_xdp_noinline();
+ +	test_tcp_estats();
+ +	test_bpf_obj_id();
+ +	test_pkt_md_access();
+ +	test_obj_name();
+ +	test_tp_attach_query();
+ +	test_stacktrace_map();
+ +	test_stacktrace_build_id();
+ +	test_stacktrace_build_id_nmi();
+ +	test_stacktrace_map_raw_tp();
+ +	test_get_stack_raw_tp();
+ +	test_task_fd_query_rawtp();
+ +	test_task_fd_query_tp();
+ +	test_reference_tracking();
+ +	test_queue_stack_map(QUEUE);
+ +	test_queue_stack_map(STACK);
+ +	test_flow_dissector();
+++=======
++ 	verifier_stats = env.verifier_stats;
++ 
++ 	for (i = 0; i < ARRAY_SIZE(prog_test_defs); i++) {
++ 		test = &prog_test_defs[i];
++ 
++ 		test->test_num = i + 1;
++ 
++ 		if (env.test_num_selector >= 0 &&
++ 		    test->test_num != env.test_num_selector)
++ 			continue;
++ 		if (env.test_name_selector &&
++ 		    !strstr(test->test_name, env.test_name_selector))
++ 			continue;
++ 
++ 		test->run_test();
++ 	}
+++>>>>>>> 8160bae21fc2 (selftests/bpf: add test selectors by number and name to test_progs)
+  
+  	printf("Summary: %d PASSED, %d FAILED\n", pass_cnt, error_cnt);
+  	return error_cnt ? EXIT_FAILURE : EXIT_SUCCESS;
+* Unmerged path tools/testing/selftests/bpf/test_progs.c
