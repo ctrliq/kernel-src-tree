@@ -1,0 +1,102 @@
+bpf: fix null pointer dereference on pointer offload
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-147.el8
+commit-author Colin Ian King <colin.king@canonical.com>
+commit 592ee43faf860c1f2c0a4c11838db6fdb974bb78
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-147.el8/592ee43f.failed
+
+Pointer offload is being null checked however the following statement
+dereferences the potentially null pointer offload when assigning
+offload->dev_state.  Fix this by only assigning it if offload is not
+null.
+
+Detected by CoverityScan, CID#1475437 ("Dereference after null check")
+
+Fixes: 00db12c3d141 ("bpf: call verifier_prep from its callback in struct bpf_offload_dev")
+	Signed-off-by: Colin Ian King <colin.king@canonical.com>
+	Acked-by: Jakub Kicinski <jakub.kicinski@netronome.com>
+	Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+(cherry picked from commit 592ee43faf860c1f2c0a4c11838db6fdb974bb78)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	kernel/bpf/offload.c
+diff --cc kernel/bpf/offload.c
+index 0f27092482fe,54cf2b9c44a4..000000000000
+--- a/kernel/bpf/offload.c
++++ b/kernel/bpf/offload.c
+@@@ -122,44 -123,39 +122,54 @@@ err_maybe_put
+  	return err;
+  }
+  
+ -int bpf_prog_offload_verifier_prep(struct bpf_prog *prog)
+ +static int __bpf_offload_ndo(struct bpf_prog *prog, enum bpf_netdev_command cmd,
+ +			     struct netdev_bpf *data)
+  {
+ -	struct bpf_prog_offload *offload;
+ -	int ret = -ENODEV;
+ +	struct bpf_prog_offload *offload = prog->aux->offload;
+ +	struct net_device *netdev;
+  
+++<<<<<<< HEAD
+ +	ASSERT_RTNL();
+++=======
++ 	down_read(&bpf_devs_lock);
++ 	offload = prog->aux->offload;
++ 	if (offload) {
++ 		ret = offload->offdev->ops->prepare(prog);
++ 		offload->dev_state = !ret;
++ 	}
++ 	up_read(&bpf_devs_lock);
+++>>>>>>> 592ee43faf86 (bpf: fix null pointer dereference on pointer offload)
+  
+ -	return ret;
+ +	if (!offload)
+ +		return -ENODEV;
+ +	netdev = offload->netdev;
+ +
+ +	data->command = cmd;
+ +
+ +	return netdev->netdev_ops->ndo_bpf(netdev, data);
+  }
+  
+ -int bpf_prog_offload_verify_insn(struct bpf_verifier_env *env,
+ -				 int insn_idx, int prev_insn_idx)
+ +int bpf_prog_offload_verifier_prep(struct bpf_verifier_env *env)
+  {
+ -	struct bpf_prog_offload *offload;
+ -	int ret = -ENODEV;
+ +	struct netdev_bpf data = {};
+ +	int err;
+  
+ -	down_read(&bpf_devs_lock);
+ -	offload = env->prog->aux->offload;
+ -	if (offload)
+ -		ret = offload->offdev->ops->insn_hook(env, insn_idx,
+ -						      prev_insn_idx);
+ -	up_read(&bpf_devs_lock);
+ +	data.verifier.prog = env->prog;
+  
+ -	return ret;
+ +	rtnl_lock();
+ +	err = __bpf_offload_ndo(env->prog, BPF_OFFLOAD_VERIFIER_PREP, &data);
+ +	if (err)
+ +		goto exit_unlock;
+ +
+ +	env->prog->aux->offload->dev_ops = data.verifier.ops;
+ +	env->prog->aux->offload->dev_state = true;
+ +exit_unlock:
+ +	rtnl_unlock();
+ +	return err;
+  }
+  
+ -int bpf_prog_offload_finalize(struct bpf_verifier_env *env)
+ +int bpf_prog_offload_verify_insn(struct bpf_verifier_env *env,
+ +				 int insn_idx, int prev_insn_idx)
+  {
+  	struct bpf_prog_offload *offload;
+  	int ret = -ENODEV;
+* Unmerged path kernel/bpf/offload.c
