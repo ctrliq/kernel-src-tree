@@ -1,0 +1,236 @@
+PCI/ERR: Recover from RCEC AER errors
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-315.el8
+commit-author Sean V Kelley <sean.v.kelley@intel.com>
+commit a175102b0a82fc57853a9e611c42d1d6172e5180
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-315.el8/a175102b.failed
+
+A Root Complex Event Collector (RCEC) collects and signals AER errors that
+were detected by Root Complex Integrated Endpoints (RCiEPs), but it may
+also signal errors it detects itself.  This is analogous to errors detected
+and signaled by a Root Port.
+
+Update the AER service driver to claim RCECs in addition to Root Ports.
+Add support for handling RCEC-detected AER errors.  This does not
+include handling RCiEP-detected errors that are signaled by the RCEC.
+
+Note that we expect these errors only from the native AER and APEI paths,
+not from DPC or EDR.
+
+[bhelgaas: split from combined RCEC/RCiEP patch, commit log]
+	Signed-off-by: Sean V Kelley <sean.v.kelley@intel.com>
+	Signed-off-by: Bjorn Helgaas <bhelgaas@google.com>
+(cherry picked from commit a175102b0a82fc57853a9e611c42d1d6172e5180)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/pci/pcie/err.c
+diff --cc drivers/pci/pcie/err.c
+index c74d622dbbc4,87a2dc8d17f8..000000000000
+--- a/drivers/pci/pcie/err.c
++++ b/drivers/pci/pcie/err.c
+@@@ -146,29 -146,60 +146,72 @@@ out
+  	return 0;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ /**
++  * pci_walk_bridge - walk bridges potentially AER affected
++  * @bridge:	bridge which may be a Port or an RCEC
++  * @cb:		callback to be called for each device found
++  * @userdata:	arbitrary pointer to be passed to callback
++  *
++  * If the device provided is a bridge, walk the subordinate bus, including
++  * any bridged devices on buses under this bus.  Call the provided callback
++  * on each device found.
++  *
++  * If the device provided has no subordinate bus, e.g., an RCEC, call the
++  * callback on the device itself.
++  */
++ static void pci_walk_bridge(struct pci_dev *bridge,
++ 			    int (*cb)(struct pci_dev *, void *),
++ 			    void *userdata)
++ {
++ 	if (bridge->subordinate)
++ 		pci_walk_bus(bridge->subordinate, cb, userdata);
++ 	else
++ 		cb(bridge, userdata);
++ }
++ 
+++>>>>>>> a175102b0a82 (PCI/ERR: Recover from RCEC AER errors)
+  pci_ers_result_t pcie_do_recovery(struct pci_dev *dev,
+ -		pci_channel_state_t state,
+ -		pci_ers_result_t (*reset_subordinates)(struct pci_dev *pdev))
+ +			enum pci_channel_state state,
+ +			pci_ers_result_t (*reset_link)(struct pci_dev *pdev))
+  {
+  	int type = pci_pcie_type(dev);
+ -	struct pci_dev *bridge;
+  	pci_ers_result_t status = PCI_ERS_RESULT_CAN_RECOVER;
+ -	struct pci_host_bridge *host = pci_find_host_bridge(dev->bus);
+ +	struct pci_bus *bus;
+  
+  	/*
+++<<<<<<< HEAD
+ +	 * Error recovery runs on all subordinates of the first downstream port.
+ +	 * If the downstream port detected the error, it is cleared at the end.
+ +	 */
+ +	if (!(type == PCI_EXP_TYPE_ROOT_PORT ||
+ +	      type == PCI_EXP_TYPE_DOWNSTREAM))
+ +		dev = pci_upstream_bridge(dev);
+ +	bus = dev->subordinate;
+++=======
++ 	 * If the error was detected by a Root Port, Downstream Port, or
++ 	 * RCEC, recovery runs on the device itself.  For Ports, that also
++ 	 * includes any subordinate devices.
++ 	 *
++ 	 * If it was detected by another device (Endpoint, etc), recovery
++ 	 * runs on the device and anything else under the same Port, i.e.,
++ 	 * everything under "bridge".
++ 	 */
++ 	if (type == PCI_EXP_TYPE_ROOT_PORT ||
++ 	    type == PCI_EXP_TYPE_DOWNSTREAM ||
++ 	    type == PCI_EXP_TYPE_RC_EC)
++ 		bridge = dev;
++ 	else
++ 		bridge = pci_upstream_bridge(dev);
+++>>>>>>> a175102b0a82 (PCI/ERR: Recover from RCEC AER errors)
+  
+ -	pci_dbg(bridge, "broadcast error_detected message\n");
+ +	pci_dbg(dev, "broadcast error_detected message\n");
+  	if (state == pci_channel_io_frozen) {
+ -		pci_walk_bridge(bridge, report_frozen_detected, &status);
+ -		status = reset_subordinates(bridge);
+ +		pci_walk_bus(bus, report_frozen_detected, &status);
+ +		status = reset_link(dev);
+  		if (status != PCI_ERS_RESULT_RECOVERED) {
+ -			pci_warn(bridge, "subordinate device reset failed\n");
+ +			pci_warn(dev, "link reset failed\n");
+  			goto failed;
+  		}
+  	} else {
+diff --git a/drivers/pci/pcie/aer.c b/drivers/pci/pcie/aer.c
+index b4939eeb60df..8cf67cd04dce 100644
+--- a/drivers/pci/pcie/aer.c
++++ b/drivers/pci/pcie/aer.c
+@@ -300,7 +300,8 @@ int pci_aer_raw_clear_status(struct pci_dev *dev)
+ 		return -EIO;
+ 
+ 	port_type = pci_pcie_type(dev);
+-	if (port_type == PCI_EXP_TYPE_ROOT_PORT) {
++	if (port_type == PCI_EXP_TYPE_ROOT_PORT ||
++	    port_type == PCI_EXP_TYPE_RC_EC) {
+ 		pci_read_config_dword(dev, aer + PCI_ERR_ROOT_STATUS, &status);
+ 		pci_write_config_dword(dev, aer + PCI_ERR_ROOT_STATUS, status);
+ 	}
+@@ -595,7 +596,8 @@ static umode_t aer_stats_attrs_are_visible(struct kobject *kobj,
+ 	if ((a == &dev_attr_aer_rootport_total_err_cor.attr ||
+ 	     a == &dev_attr_aer_rootport_total_err_fatal.attr ||
+ 	     a == &dev_attr_aer_rootport_total_err_nonfatal.attr) &&
+-	    pci_pcie_type(pdev) != PCI_EXP_TYPE_ROOT_PORT)
++	    ((pci_pcie_type(pdev) != PCI_EXP_TYPE_ROOT_PORT) &&
++	     (pci_pcie_type(pdev) != PCI_EXP_TYPE_RC_EC)))
+ 		return 0;
+ 
+ 	return a->mode;
+@@ -1206,6 +1208,7 @@ static int set_device_error_reporting(struct pci_dev *dev, void *data)
+ 	int type = pci_pcie_type(dev);
+ 
+ 	if ((type == PCI_EXP_TYPE_ROOT_PORT) ||
++	    (type == PCI_EXP_TYPE_RC_EC) ||
+ 	    (type == PCI_EXP_TYPE_UPSTREAM) ||
+ 	    (type == PCI_EXP_TYPE_DOWNSTREAM)) {
+ 		if (enable)
+@@ -1330,6 +1333,11 @@ static int aer_probe(struct pcie_device *dev)
+ 	struct device *device = &dev->device;
+ 	struct pci_dev *port = dev->port;
+ 
++	/* Limit to Root Ports or Root Complex Event Collectors */
++	if ((pci_pcie_type(port) != PCI_EXP_TYPE_RC_EC) &&
++	    (pci_pcie_type(port) != PCI_EXP_TYPE_ROOT_PORT))
++		return -ENODEV;
++
+ 	rpc = devm_kzalloc(device, sizeof(struct aer_rpc), GFP_KERNEL);
+ 	if (!rpc)
+ 		return -ENOMEM;
+@@ -1351,36 +1359,52 @@ static int aer_probe(struct pcie_device *dev)
+ }
+ 
+ /**
+- * aer_root_reset - reset link on Root Port
+- * @dev: pointer to Root Port's pci_dev data structure
++ * aer_root_reset - reset Root Port hierarchy or RCEC
++ * @dev: pointer to Root Port or RCEC
+  *
+- * Invoked by Port Bus driver when performing link reset at Root Port.
++ * Invoked by Port Bus driver when performing reset.
+  */
+ static pci_ers_result_t aer_root_reset(struct pci_dev *dev)
+ {
+-	int aer = dev->aer_cap;
++	int type = pci_pcie_type(dev);
++	struct pci_dev *root;
++	int aer;
++	struct pci_host_bridge *host = pci_find_host_bridge(dev->bus);
+ 	u32 reg32;
+ 	int rc;
+ 
+-	if (pcie_aer_is_native(dev)) {
++	root = dev;	/* device with Root Error registers */
++	aer = root->aer_cap;
++
++	if ((host->native_aer || pcie_ports_native) && aer) {
+ 		/* Disable Root's interrupt in response to error messages */
+-		pci_read_config_dword(dev, aer + PCI_ERR_ROOT_COMMAND, &reg32);
++		pci_read_config_dword(root, aer + PCI_ERR_ROOT_COMMAND, &reg32);
+ 		reg32 &= ~ROOT_PORT_INTR_ON_MESG_MASK;
+-		pci_write_config_dword(dev, aer + PCI_ERR_ROOT_COMMAND, reg32);
++		pci_write_config_dword(root, aer + PCI_ERR_ROOT_COMMAND, reg32);
+ 	}
+ 
+-	rc = pci_bus_error_reset(dev);
+-	pci_info(dev, "Root Port link has been reset (%d)\n", rc);
++	if (type == PCI_EXP_TYPE_RC_EC) {
++		if (pcie_has_flr(dev)) {
++			rc = pcie_flr(dev);
++			pci_info(dev, "has been reset (%d)\n", rc);
++		} else {
++			pci_info(dev, "not reset (no FLR support)\n");
++			rc = -ENOTTY;
++		}
++	} else {
++		rc = pci_bus_error_reset(dev);
++		pci_info(dev, "Root Port link has been reset (%d)\n", rc);
++	}
+ 
+-	if (pcie_aer_is_native(dev)) {
++	if ((host->native_aer || pcie_ports_native) && aer) {
+ 		/* Clear Root Error Status */
+-		pci_read_config_dword(dev, aer + PCI_ERR_ROOT_STATUS, &reg32);
+-		pci_write_config_dword(dev, aer + PCI_ERR_ROOT_STATUS, reg32);
++		pci_read_config_dword(root, aer + PCI_ERR_ROOT_STATUS, &reg32);
++		pci_write_config_dword(root, aer + PCI_ERR_ROOT_STATUS, reg32);
+ 
+ 		/* Enable Root Port's interrupt in response to error messages */
+-		pci_read_config_dword(dev, aer + PCI_ERR_ROOT_COMMAND, &reg32);
++		pci_read_config_dword(root, aer + PCI_ERR_ROOT_COMMAND, &reg32);
+ 		reg32 |= ROOT_PORT_INTR_ON_MESG_MASK;
+-		pci_write_config_dword(dev, aer + PCI_ERR_ROOT_COMMAND, reg32);
++		pci_write_config_dword(root, aer + PCI_ERR_ROOT_COMMAND, reg32);
+ 	}
+ 
+ 	return rc ? PCI_ERS_RESULT_DISCONNECT : PCI_ERS_RESULT_RECOVERED;
+@@ -1388,7 +1412,7 @@ static pci_ers_result_t aer_root_reset(struct pci_dev *dev)
+ 
+ static struct pcie_port_service_driver aerdriver = {
+ 	.name		= "aer",
+-	.port_type	= PCI_EXP_TYPE_ROOT_PORT,
++	.port_type	= PCIE_ANY_PORT,
+ 	.service	= PCIE_PORT_SERVICE_AER,
+ 
+ 	.probe		= aer_probe,
+* Unmerged path drivers/pci/pcie/err.c
