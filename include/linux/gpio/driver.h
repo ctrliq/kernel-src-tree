@@ -18,6 +18,9 @@ struct seq_file;
 struct gpio_device;
 struct module;
 
+#define GPIO_LINE_DIRECTION_IN	1
+#define GPIO_LINE_DIRECTION_OUT	0
+
 /**
  * struct gpio_irq_chip - GPIO interrupt controller
  */
