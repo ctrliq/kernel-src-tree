@@ -1,0 +1,869 @@
+scsi: scsi_debug: Disallow zone sizes that are not powers of 2
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Damien Le Moal <damien.lemoal@wdc.com>
+commit 108e36f0d8bf91839613d8053a6d1354965801b0
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/108e36f0.failed
+
+Allowing a non-power-of-2 zone size forces the use of direct division
+operations of 64-bit sector values to obtain a zone number or number of
+zones. Doing so without using do_div() leads to compilation errors on
+32-bit architectures.
+
+Devices with a zone size that is not a power of 2 do not exist today so
+allowing their emulation is of limited interest as the sd driver will not
+support them anyway. To fix this compilation error, instead of using
+do_div() for sector values divisions, simply disallow zone size values that
+are not a power of 2.
+
+[mkp: commit desc]
+
+Link: https://lore.kernel.org/r/20200507023526.221574-1-damien.lemoal@wdc.com
+Fixes: 98e0a689868c ("scsi: scsi_debug: Add zone_size_mb module parameter")
+Fixes: f0d1cf9378bd ("scsi: scsi_debug: Add ZBC zone commands")
+	Reviewed-by: Johannes Thumshirn <johannes.thumshirn@wdc.com>
+	Acked-by: Geert Uytterhoeven <geert@linux-m68k.org>
+	Signed-off-by: Damien Le Moal <damien.lemoal@wdc.com>
+	Signed-off-by: Martin K. Petersen <martin.petersen@oracle.com>
+(cherry picked from commit 108e36f0d8bf91839613d8053a6d1354965801b0)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/scsi/scsi_debug.c
+diff --cc drivers/scsi/scsi_debug.c
+index 8a8e70143123,105e563d87b4..000000000000
+--- a/drivers/scsi/scsi_debug.c
++++ b/drivers/scsi/scsi_debug.c
+@@@ -2487,14 -2644,217 +2487,221 @@@ static int resp_log_sense(struct scsi_c
+  		mk_sense_invalid_fld(scp, SDEB_IN_CDB, 3, -1);
+  		return check_condition_result;
+  	}
+ -	len = min_t(int, get_unaligned_be16(arr + 2) + 4, alloc_len);
+ +	len = min(get_unaligned_be16(arr + 2) + 4, alloc_len);
+  	return fill_from_dev_buffer(scp, arr,
+ -		    min_t(int, len, SDEBUG_MAX_INQ_ARR_SZ));
+ +		    min(len, SDEBUG_MAX_INQ_ARR_SZ));
+  }
+  
+ -static inline bool sdebug_dev_is_zoned(struct sdebug_dev_info *devip)
+ +static inline int check_device_access_params(struct scsi_cmnd *scp,
+ +	unsigned long long lba, unsigned int num, bool write)
+  {
+++<<<<<<< HEAD
+++=======
++ 	return devip->nr_zones != 0;
++ }
++ 
++ static struct sdeb_zone_state *zbc_zone(struct sdebug_dev_info *devip,
++ 					unsigned long long lba)
++ {
++ 	return &devip->zstate[lba >> devip->zsize_shift];
++ }
++ 
++ static inline bool zbc_zone_is_conv(struct sdeb_zone_state *zsp)
++ {
++ 	return zsp->z_type == ZBC_ZONE_TYPE_CNV;
++ }
++ 
++ static void zbc_close_zone(struct sdebug_dev_info *devip,
++ 			   struct sdeb_zone_state *zsp)
++ {
++ 	enum sdebug_z_cond zc;
++ 
++ 	if (zbc_zone_is_conv(zsp))
++ 		return;
++ 
++ 	zc = zsp->z_cond;
++ 	if (!(zc == ZC2_IMPLICIT_OPEN || zc == ZC3_EXPLICIT_OPEN))
++ 		return;
++ 
++ 	if (zc == ZC2_IMPLICIT_OPEN)
++ 		devip->nr_imp_open--;
++ 	else
++ 		devip->nr_exp_open--;
++ 
++ 	if (zsp->z_wp == zsp->z_start) {
++ 		zsp->z_cond = ZC1_EMPTY;
++ 	} else {
++ 		zsp->z_cond = ZC4_CLOSED;
++ 		devip->nr_closed++;
++ 	}
++ }
++ 
++ static void zbc_close_imp_open_zone(struct sdebug_dev_info *devip)
++ {
++ 	struct sdeb_zone_state *zsp = &devip->zstate[0];
++ 	unsigned int i;
++ 
++ 	for (i = 0; i < devip->nr_zones; i++, zsp++) {
++ 		if (zsp->z_cond == ZC2_IMPLICIT_OPEN) {
++ 			zbc_close_zone(devip, zsp);
++ 			return;
++ 		}
++ 	}
++ }
++ 
++ static void zbc_open_zone(struct sdebug_dev_info *devip,
++ 			  struct sdeb_zone_state *zsp, bool explicit)
++ {
++ 	enum sdebug_z_cond zc;
++ 
++ 	if (zbc_zone_is_conv(zsp))
++ 		return;
++ 
++ 	zc = zsp->z_cond;
++ 	if ((explicit && zc == ZC3_EXPLICIT_OPEN) ||
++ 	    (!explicit && zc == ZC2_IMPLICIT_OPEN))
++ 		return;
++ 
++ 	/* Close an implicit open zone if necessary */
++ 	if (explicit && zsp->z_cond == ZC2_IMPLICIT_OPEN)
++ 		zbc_close_zone(devip, zsp);
++ 	else if (devip->max_open &&
++ 		 devip->nr_imp_open + devip->nr_exp_open >= devip->max_open)
++ 		zbc_close_imp_open_zone(devip);
++ 
++ 	if (zsp->z_cond == ZC4_CLOSED)
++ 		devip->nr_closed--;
++ 	if (explicit) {
++ 		zsp->z_cond = ZC3_EXPLICIT_OPEN;
++ 		devip->nr_exp_open++;
++ 	} else {
++ 		zsp->z_cond = ZC2_IMPLICIT_OPEN;
++ 		devip->nr_imp_open++;
++ 	}
++ }
++ 
++ static void zbc_inc_wp(struct sdebug_dev_info *devip,
++ 		       unsigned long long lba, unsigned int num)
++ {
++ 	struct sdeb_zone_state *zsp = zbc_zone(devip, lba);
++ 	unsigned long long n, end, zend = zsp->z_start + zsp->z_size;
++ 
++ 	if (zbc_zone_is_conv(zsp))
++ 		return;
++ 
++ 	if (zsp->z_type == ZBC_ZONE_TYPE_SWR) {
++ 		zsp->z_wp += num;
++ 		if (zsp->z_wp >= zend)
++ 			zsp->z_cond = ZC5_FULL;
++ 		return;
++ 	}
++ 
++ 	while (num) {
++ 		if (lba != zsp->z_wp)
++ 			zsp->z_non_seq_resource = true;
++ 
++ 		end = lba + num;
++ 		if (end >= zend) {
++ 			n = zend - lba;
++ 			zsp->z_wp = zend;
++ 		} else if (end > zsp->z_wp) {
++ 			n = num;
++ 			zsp->z_wp = end;
++ 		} else {
++ 			n = num;
++ 		}
++ 		if (zsp->z_wp >= zend)
++ 			zsp->z_cond = ZC5_FULL;
++ 
++ 		num -= n;
++ 		lba += n;
++ 		if (num) {
++ 			zsp++;
++ 			zend = zsp->z_start + zsp->z_size;
++ 		}
++ 	}
++ }
++ 
++ static int check_zbc_access_params(struct scsi_cmnd *scp,
++ 			unsigned long long lba, unsigned int num, bool write)
++ {
++ 	struct scsi_device *sdp = scp->device;
++ 	struct sdebug_dev_info *devip = (struct sdebug_dev_info *)sdp->hostdata;
++ 	struct sdeb_zone_state *zsp = zbc_zone(devip, lba);
++ 	struct sdeb_zone_state *zsp_end = zbc_zone(devip, lba + num - 1);
++ 
++ 	if (!write) {
++ 		if (devip->zmodel == BLK_ZONED_HA)
++ 			return 0;
++ 		/* For host-managed, reads cannot cross zone types boundaries */
++ 		if (zsp_end != zsp &&
++ 		    zbc_zone_is_conv(zsp) &&
++ 		    !zbc_zone_is_conv(zsp_end)) {
++ 			mk_sense_buffer(scp, ILLEGAL_REQUEST,
++ 					LBA_OUT_OF_RANGE,
++ 					READ_INVDATA_ASCQ);
++ 			return check_condition_result;
++ 		}
++ 		return 0;
++ 	}
++ 
++ 	/* No restrictions for writes within conventional zones */
++ 	if (zbc_zone_is_conv(zsp)) {
++ 		if (!zbc_zone_is_conv(zsp_end)) {
++ 			mk_sense_buffer(scp, ILLEGAL_REQUEST,
++ 					LBA_OUT_OF_RANGE,
++ 					WRITE_BOUNDARY_ASCQ);
++ 			return check_condition_result;
++ 		}
++ 		return 0;
++ 	}
++ 
++ 	if (zsp->z_type == ZBC_ZONE_TYPE_SWR) {
++ 		/* Writes cannot cross sequential zone boundaries */
++ 		if (zsp_end != zsp) {
++ 			mk_sense_buffer(scp, ILLEGAL_REQUEST,
++ 					LBA_OUT_OF_RANGE,
++ 					WRITE_BOUNDARY_ASCQ);
++ 			return check_condition_result;
++ 		}
++ 		/* Cannot write full zones */
++ 		if (zsp->z_cond == ZC5_FULL) {
++ 			mk_sense_buffer(scp, ILLEGAL_REQUEST,
++ 					INVALID_FIELD_IN_CDB, 0);
++ 			return check_condition_result;
++ 		}
++ 		/* Writes must be aligned to the zone WP */
++ 		if (lba != zsp->z_wp) {
++ 			mk_sense_buffer(scp, ILLEGAL_REQUEST,
++ 					LBA_OUT_OF_RANGE,
++ 					UNALIGNED_WRITE_ASCQ);
++ 			return check_condition_result;
++ 		}
++ 	}
++ 
++ 	/* Handle implicit open of closed and empty zones */
++ 	if (zsp->z_cond == ZC1_EMPTY || zsp->z_cond == ZC4_CLOSED) {
++ 		if (devip->max_open &&
++ 		    devip->nr_exp_open >= devip->max_open) {
++ 			mk_sense_buffer(scp, DATA_PROTECT,
++ 					INSUFF_RES_ASC,
++ 					INSUFF_ZONE_ASCQ);
++ 			return check_condition_result;
++ 		}
++ 		zbc_open_zone(devip, zsp, false);
++ 	}
++ 
++ 	return 0;
++ }
++ 
++ static inline int check_device_access_params
++ 			(struct scsi_cmnd *scp, unsigned long long lba,
++ 			 unsigned int num, bool write)
++ {
++ 	struct scsi_device *sdp = scp->device;
++ 	struct sdebug_dev_info *devip = (struct sdebug_dev_info *)sdp->hostdata;
++ 
+++>>>>>>> 108e36f0d8bf (scsi: scsi_debug: Disallow zone sizes that are not powers of 2)
+  	if (lba + num > sdebug_capacity) {
+  		mk_sense_buffer(scp, ILLEGAL_REQUEST, LBA_OUT_OF_RANGE, 0);
+  		return check_condition_result;
+@@@ -3730,6 -4194,504 +3937,507 @@@ static int resp_report_luns(struct scsi
+  	return res;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static int resp_verify(struct scsi_cmnd *scp, struct sdebug_dev_info *devip)
++ {
++ 	bool is_bytchk3 = false;
++ 	u8 bytchk;
++ 	int ret, j;
++ 	u32 vnum, a_num, off;
++ 	const u32 lb_size = sdebug_sector_size;
++ 	u64 lba;
++ 	u8 *arr;
++ 	u8 *cmd = scp->cmnd;
++ 	struct sdeb_store_info *sip = devip2sip(devip);
++ 	rwlock_t *macc_lckp = sip ? &sip->macc_lck : &sdeb_fake_rw_lck;
++ 
++ 	bytchk = (cmd[1] >> 1) & 0x3;
++ 	if (bytchk == 0) {
++ 		return 0;	/* always claim internal verify okay */
++ 	} else if (bytchk == 2) {
++ 		mk_sense_invalid_fld(scp, SDEB_IN_CDB, 2, 2);
++ 		return check_condition_result;
++ 	} else if (bytchk == 3) {
++ 		is_bytchk3 = true;	/* 1 block sent, compared repeatedly */
++ 	}
++ 	switch (cmd[0]) {
++ 	case VERIFY_16:
++ 		lba = get_unaligned_be64(cmd + 2);
++ 		vnum = get_unaligned_be32(cmd + 10);
++ 		break;
++ 	case VERIFY:		/* is VERIFY(10) */
++ 		lba = get_unaligned_be32(cmd + 2);
++ 		vnum = get_unaligned_be16(cmd + 7);
++ 		break;
++ 	default:
++ 		mk_sense_invalid_opcode(scp);
++ 		return check_condition_result;
++ 	}
++ 	a_num = is_bytchk3 ? 1 : vnum;
++ 	/* Treat following check like one for read (i.e. no write) access */
++ 	ret = check_device_access_params(scp, lba, a_num, false);
++ 	if (ret)
++ 		return ret;
++ 
++ 	arr = kcalloc(lb_size, vnum, GFP_ATOMIC);
++ 	if (!arr) {
++ 		mk_sense_buffer(scp, ILLEGAL_REQUEST, INSUFF_RES_ASC,
++ 				INSUFF_RES_ASCQ);
++ 		return check_condition_result;
++ 	}
++ 	/* Not changing store, so only need read access */
++ 	read_lock(macc_lckp);
++ 
++ 	ret = do_dout_fetch(scp, a_num, arr);
++ 	if (ret == -1) {
++ 		ret = DID_ERROR << 16;
++ 		goto cleanup;
++ 	} else if (sdebug_verbose && (ret < (a_num * lb_size))) {
++ 		sdev_printk(KERN_INFO, scp->device,
++ 			    "%s: %s: cdb indicated=%u, IO sent=%d bytes\n",
++ 			    my_name, __func__, a_num * lb_size, ret);
++ 	}
++ 	if (is_bytchk3) {
++ 		for (j = 1, off = lb_size; j < vnum; ++j, off += lb_size)
++ 			memcpy(arr + off, arr, lb_size);
++ 	}
++ 	ret = 0;
++ 	if (!comp_write_worker(sip, lba, vnum, arr, true)) {
++ 		mk_sense_buffer(scp, MISCOMPARE, MISCOMPARE_VERIFY_ASC, 0);
++ 		ret = check_condition_result;
++ 		goto cleanup;
++ 	}
++ cleanup:
++ 	read_unlock(macc_lckp);
++ 	kfree(arr);
++ 	return ret;
++ }
++ 
++ #define RZONES_DESC_HD 64
++ 
++ /* Report zones depending on start LBA nad reporting options */
++ static int resp_report_zones(struct scsi_cmnd *scp,
++ 			     struct sdebug_dev_info *devip)
++ {
++ 	unsigned int i, max_zones, rep_max_zones, nrz = 0;
++ 	int ret = 0;
++ 	u32 alloc_len, rep_opts, rep_len;
++ 	bool partial;
++ 	u64 lba, zs_lba;
++ 	u8 *arr = NULL, *desc;
++ 	u8 *cmd = scp->cmnd;
++ 	struct sdeb_zone_state *zsp;
++ 	struct sdeb_store_info *sip = devip2sip(devip);
++ 	rwlock_t *macc_lckp = sip ? &sip->macc_lck : &sdeb_fake_rw_lck;
++ 
++ 	if (!sdebug_dev_is_zoned(devip)) {
++ 		mk_sense_invalid_opcode(scp);
++ 		return check_condition_result;
++ 	}
++ 	zs_lba = get_unaligned_be64(cmd + 2);
++ 	alloc_len = get_unaligned_be32(cmd + 10);
++ 	rep_opts = cmd[14] & 0x3f;
++ 	partial = cmd[14] & 0x80;
++ 
++ 	if (zs_lba >= sdebug_capacity) {
++ 		mk_sense_buffer(scp, ILLEGAL_REQUEST, LBA_OUT_OF_RANGE, 0);
++ 		return check_condition_result;
++ 	}
++ 
++ 	max_zones = devip->nr_zones - (zs_lba >> devip->zsize_shift);
++ 	rep_max_zones = min((alloc_len - 64) >> ilog2(RZONES_DESC_HD),
++ 			    max_zones);
++ 
++ 	arr = kcalloc(RZONES_DESC_HD, alloc_len, GFP_ATOMIC);
++ 	if (!arr) {
++ 		mk_sense_buffer(scp, ILLEGAL_REQUEST, INSUFF_RES_ASC,
++ 				INSUFF_RES_ASCQ);
++ 		return check_condition_result;
++ 	}
++ 
++ 	read_lock(macc_lckp);
++ 
++ 	desc = arr + 64;
++ 	for (i = 0; i < max_zones; i++) {
++ 		lba = zs_lba + devip->zsize * i;
++ 		if (lba > sdebug_capacity)
++ 			break;
++ 		zsp = zbc_zone(devip, lba);
++ 		switch (rep_opts) {
++ 		case 0x00:
++ 			/* All zones */
++ 			break;
++ 		case 0x01:
++ 			/* Empty zones */
++ 			if (zsp->z_cond != ZC1_EMPTY)
++ 				continue;
++ 			break;
++ 		case 0x02:
++ 			/* Implicit open zones */
++ 			if (zsp->z_cond != ZC2_IMPLICIT_OPEN)
++ 				continue;
++ 			break;
++ 		case 0x03:
++ 			/* Explicit open zones */
++ 			if (zsp->z_cond != ZC3_EXPLICIT_OPEN)
++ 				continue;
++ 			break;
++ 		case 0x04:
++ 			/* Closed zones */
++ 			if (zsp->z_cond != ZC4_CLOSED)
++ 				continue;
++ 			break;
++ 		case 0x05:
++ 			/* Full zones */
++ 			if (zsp->z_cond != ZC5_FULL)
++ 				continue;
++ 			break;
++ 		case 0x06:
++ 		case 0x07:
++ 		case 0x10:
++ 			/*
++ 			 * Read-only, offline, reset WP recommended are
++ 			 * not emulated: no zones to report;
++ 			 */
++ 			continue;
++ 		case 0x11:
++ 			/* non-seq-resource set */
++ 			if (!zsp->z_non_seq_resource)
++ 				continue;
++ 			break;
++ 		case 0x3f:
++ 			/* Not write pointer (conventional) zones */
++ 			if (!zbc_zone_is_conv(zsp))
++ 				continue;
++ 			break;
++ 		default:
++ 			mk_sense_buffer(scp, ILLEGAL_REQUEST,
++ 					INVALID_FIELD_IN_CDB, 0);
++ 			ret = check_condition_result;
++ 			goto fini;
++ 		}
++ 
++ 		if (nrz < rep_max_zones) {
++ 			/* Fill zone descriptor */
++ 			desc[0] = zsp->z_type;
++ 			desc[1] = zsp->z_cond << 4;
++ 			if (zsp->z_non_seq_resource)
++ 				desc[1] |= 1 << 1;
++ 			put_unaligned_be64((u64)zsp->z_size, desc + 8);
++ 			put_unaligned_be64((u64)zsp->z_start, desc + 16);
++ 			put_unaligned_be64((u64)zsp->z_wp, desc + 24);
++ 			desc += 64;
++ 		}
++ 
++ 		if (partial && nrz >= rep_max_zones)
++ 			break;
++ 
++ 		nrz++;
++ 	}
++ 
++ 	/* Report header */
++ 	put_unaligned_be32(nrz * RZONES_DESC_HD, arr + 0);
++ 	put_unaligned_be64(sdebug_capacity - 1, arr + 8);
++ 
++ 	rep_len = (unsigned long)desc - (unsigned long)arr;
++ 	ret = fill_from_dev_buffer(scp, arr, min_t(int, alloc_len, rep_len));
++ 
++ fini:
++ 	read_unlock(macc_lckp);
++ 	kfree(arr);
++ 	return ret;
++ }
++ 
++ /* Logic transplanted from tcmu-runner, file_zbc.c */
++ static void zbc_open_all(struct sdebug_dev_info *devip)
++ {
++ 	struct sdeb_zone_state *zsp = &devip->zstate[0];
++ 	unsigned int i;
++ 
++ 	for (i = 0; i < devip->nr_zones; i++, zsp++) {
++ 		if (zsp->z_cond == ZC4_CLOSED)
++ 			zbc_open_zone(devip, &devip->zstate[i], true);
++ 	}
++ }
++ 
++ static int resp_open_zone(struct scsi_cmnd *scp, struct sdebug_dev_info *devip)
++ {
++ 	int res = 0;
++ 	u64 z_id;
++ 	enum sdebug_z_cond zc;
++ 	u8 *cmd = scp->cmnd;
++ 	struct sdeb_zone_state *zsp;
++ 	bool all = cmd[14] & 0x01;
++ 	struct sdeb_store_info *sip = devip2sip(devip);
++ 	rwlock_t *macc_lckp = sip ? &sip->macc_lck : &sdeb_fake_rw_lck;
++ 
++ 	if (!sdebug_dev_is_zoned(devip)) {
++ 		mk_sense_invalid_opcode(scp);
++ 		return check_condition_result;
++ 	}
++ 
++ 	write_lock(macc_lckp);
++ 
++ 	if (all) {
++ 		/* Check if all closed zones can be open */
++ 		if (devip->max_open &&
++ 		    devip->nr_exp_open + devip->nr_closed > devip->max_open) {
++ 			mk_sense_buffer(scp, DATA_PROTECT, INSUFF_RES_ASC,
++ 					INSUFF_ZONE_ASCQ);
++ 			res = check_condition_result;
++ 			goto fini;
++ 		}
++ 		/* Open all closed zones */
++ 		zbc_open_all(devip);
++ 		goto fini;
++ 	}
++ 
++ 	/* Open the specified zone */
++ 	z_id = get_unaligned_be64(cmd + 2);
++ 	if (z_id >= sdebug_capacity) {
++ 		mk_sense_buffer(scp, ILLEGAL_REQUEST, LBA_OUT_OF_RANGE, 0);
++ 		res = check_condition_result;
++ 		goto fini;
++ 	}
++ 
++ 	zsp = zbc_zone(devip, z_id);
++ 	if (z_id != zsp->z_start) {
++ 		mk_sense_buffer(scp, ILLEGAL_REQUEST, INVALID_FIELD_IN_CDB, 0);
++ 		res = check_condition_result;
++ 		goto fini;
++ 	}
++ 	if (zbc_zone_is_conv(zsp)) {
++ 		mk_sense_buffer(scp, ILLEGAL_REQUEST, INVALID_FIELD_IN_CDB, 0);
++ 		res = check_condition_result;
++ 		goto fini;
++ 	}
++ 
++ 	zc = zsp->z_cond;
++ 	if (zc == ZC3_EXPLICIT_OPEN || zc == ZC5_FULL)
++ 		goto fini;
++ 
++ 	if (devip->max_open && devip->nr_exp_open >= devip->max_open) {
++ 		mk_sense_buffer(scp, DATA_PROTECT, INSUFF_RES_ASC,
++ 				INSUFF_ZONE_ASCQ);
++ 		res = check_condition_result;
++ 		goto fini;
++ 	}
++ 
++ 	if (zc == ZC2_IMPLICIT_OPEN)
++ 		zbc_close_zone(devip, zsp);
++ 	zbc_open_zone(devip, zsp, true);
++ fini:
++ 	write_unlock(macc_lckp);
++ 	return res;
++ }
++ 
++ static void zbc_close_all(struct sdebug_dev_info *devip)
++ {
++ 	unsigned int i;
++ 
++ 	for (i = 0; i < devip->nr_zones; i++)
++ 		zbc_close_zone(devip, &devip->zstate[i]);
++ }
++ 
++ static int resp_close_zone(struct scsi_cmnd *scp,
++ 			   struct sdebug_dev_info *devip)
++ {
++ 	int res = 0;
++ 	u64 z_id;
++ 	u8 *cmd = scp->cmnd;
++ 	struct sdeb_zone_state *zsp;
++ 	bool all = cmd[14] & 0x01;
++ 	struct sdeb_store_info *sip = devip2sip(devip);
++ 	rwlock_t *macc_lckp = sip ? &sip->macc_lck : &sdeb_fake_rw_lck;
++ 
++ 	if (!sdebug_dev_is_zoned(devip)) {
++ 		mk_sense_invalid_opcode(scp);
++ 		return check_condition_result;
++ 	}
++ 
++ 	write_lock(macc_lckp);
++ 
++ 	if (all) {
++ 		zbc_close_all(devip);
++ 		goto fini;
++ 	}
++ 
++ 	/* Close specified zone */
++ 	z_id = get_unaligned_be64(cmd + 2);
++ 	if (z_id >= sdebug_capacity) {
++ 		mk_sense_buffer(scp, ILLEGAL_REQUEST, LBA_OUT_OF_RANGE, 0);
++ 		res = check_condition_result;
++ 		goto fini;
++ 	}
++ 
++ 	zsp = zbc_zone(devip, z_id);
++ 	if (z_id != zsp->z_start) {
++ 		mk_sense_buffer(scp, ILLEGAL_REQUEST, INVALID_FIELD_IN_CDB, 0);
++ 		res = check_condition_result;
++ 		goto fini;
++ 	}
++ 	if (zbc_zone_is_conv(zsp)) {
++ 		mk_sense_buffer(scp, ILLEGAL_REQUEST, INVALID_FIELD_IN_CDB, 0);
++ 		res = check_condition_result;
++ 		goto fini;
++ 	}
++ 
++ 	zbc_close_zone(devip, zsp);
++ fini:
++ 	write_unlock(macc_lckp);
++ 	return res;
++ }
++ 
++ static void zbc_finish_zone(struct sdebug_dev_info *devip,
++ 			    struct sdeb_zone_state *zsp, bool empty)
++ {
++ 	enum sdebug_z_cond zc = zsp->z_cond;
++ 
++ 	if (zc == ZC4_CLOSED || zc == ZC2_IMPLICIT_OPEN ||
++ 	    zc == ZC3_EXPLICIT_OPEN || (empty && zc == ZC1_EMPTY)) {
++ 		if (zc == ZC2_IMPLICIT_OPEN || zc == ZC3_EXPLICIT_OPEN)
++ 			zbc_close_zone(devip, zsp);
++ 		if (zsp->z_cond == ZC4_CLOSED)
++ 			devip->nr_closed--;
++ 		zsp->z_wp = zsp->z_start + zsp->z_size;
++ 		zsp->z_cond = ZC5_FULL;
++ 	}
++ }
++ 
++ static void zbc_finish_all(struct sdebug_dev_info *devip)
++ {
++ 	unsigned int i;
++ 
++ 	for (i = 0; i < devip->nr_zones; i++)
++ 		zbc_finish_zone(devip, &devip->zstate[i], false);
++ }
++ 
++ static int resp_finish_zone(struct scsi_cmnd *scp,
++ 			    struct sdebug_dev_info *devip)
++ {
++ 	struct sdeb_zone_state *zsp;
++ 	int res = 0;
++ 	u64 z_id;
++ 	u8 *cmd = scp->cmnd;
++ 	bool all = cmd[14] & 0x01;
++ 	struct sdeb_store_info *sip = devip2sip(devip);
++ 	rwlock_t *macc_lckp = sip ? &sip->macc_lck : &sdeb_fake_rw_lck;
++ 
++ 	if (!sdebug_dev_is_zoned(devip)) {
++ 		mk_sense_invalid_opcode(scp);
++ 		return check_condition_result;
++ 	}
++ 
++ 	write_lock(macc_lckp);
++ 
++ 	if (all) {
++ 		zbc_finish_all(devip);
++ 		goto fini;
++ 	}
++ 
++ 	/* Finish the specified zone */
++ 	z_id = get_unaligned_be64(cmd + 2);
++ 	if (z_id >= sdebug_capacity) {
++ 		mk_sense_buffer(scp, ILLEGAL_REQUEST, LBA_OUT_OF_RANGE, 0);
++ 		res = check_condition_result;
++ 		goto fini;
++ 	}
++ 
++ 	zsp = zbc_zone(devip, z_id);
++ 	if (z_id != zsp->z_start) {
++ 		mk_sense_buffer(scp, ILLEGAL_REQUEST, INVALID_FIELD_IN_CDB, 0);
++ 		res = check_condition_result;
++ 		goto fini;
++ 	}
++ 	if (zbc_zone_is_conv(zsp)) {
++ 		mk_sense_buffer(scp, ILLEGAL_REQUEST, INVALID_FIELD_IN_CDB, 0);
++ 		res = check_condition_result;
++ 		goto fini;
++ 	}
++ 
++ 	zbc_finish_zone(devip, zsp, true);
++ fini:
++ 	write_unlock(macc_lckp);
++ 	return res;
++ }
++ 
++ static void zbc_rwp_zone(struct sdebug_dev_info *devip,
++ 			 struct sdeb_zone_state *zsp)
++ {
++ 	enum sdebug_z_cond zc;
++ 
++ 	if (zbc_zone_is_conv(zsp))
++ 		return;
++ 
++ 	zc = zsp->z_cond;
++ 	if (zc == ZC2_IMPLICIT_OPEN || zc == ZC3_EXPLICIT_OPEN)
++ 		zbc_close_zone(devip, zsp);
++ 
++ 	if (zsp->z_cond == ZC4_CLOSED)
++ 		devip->nr_closed--;
++ 
++ 	zsp->z_non_seq_resource = false;
++ 	zsp->z_wp = zsp->z_start;
++ 	zsp->z_cond = ZC1_EMPTY;
++ }
++ 
++ static void zbc_rwp_all(struct sdebug_dev_info *devip)
++ {
++ 	unsigned int i;
++ 
++ 	for (i = 0; i < devip->nr_zones; i++)
++ 		zbc_rwp_zone(devip, &devip->zstate[i]);
++ }
++ 
++ static int resp_rwp_zone(struct scsi_cmnd *scp, struct sdebug_dev_info *devip)
++ {
++ 	struct sdeb_zone_state *zsp;
++ 	int res = 0;
++ 	u64 z_id;
++ 	u8 *cmd = scp->cmnd;
++ 	bool all = cmd[14] & 0x01;
++ 	struct sdeb_store_info *sip = devip2sip(devip);
++ 	rwlock_t *macc_lckp = sip ? &sip->macc_lck : &sdeb_fake_rw_lck;
++ 
++ 	if (!sdebug_dev_is_zoned(devip)) {
++ 		mk_sense_invalid_opcode(scp);
++ 		return check_condition_result;
++ 	}
++ 
++ 	write_lock(macc_lckp);
++ 
++ 	if (all) {
++ 		zbc_rwp_all(devip);
++ 		goto fini;
++ 	}
++ 
++ 	z_id = get_unaligned_be64(cmd + 2);
++ 	if (z_id >= sdebug_capacity) {
++ 		mk_sense_buffer(scp, ILLEGAL_REQUEST, LBA_OUT_OF_RANGE, 0);
++ 		res = check_condition_result;
++ 		goto fini;
++ 	}
++ 
++ 	zsp = zbc_zone(devip, z_id);
++ 	if (z_id != zsp->z_start) {
++ 		mk_sense_buffer(scp, ILLEGAL_REQUEST, INVALID_FIELD_IN_CDB, 0);
++ 		res = check_condition_result;
++ 		goto fini;
++ 	}
++ 	if (zbc_zone_is_conv(zsp)) {
++ 		mk_sense_buffer(scp, ILLEGAL_REQUEST, INVALID_FIELD_IN_CDB, 0);
++ 		res = check_condition_result;
++ 		goto fini;
++ 	}
++ 
++ 	zbc_rwp_zone(devip, zsp);
++ fini:
++ 	write_unlock(macc_lckp);
++ 	return res;
++ }
++ 
+++>>>>>>> 108e36f0d8bf (scsi: scsi_debug: Disallow zone sizes that are not powers of 2)
+  static struct sdebug_queue *get_queue(struct scsi_cmnd *cmnd)
+  {
+  	u32 tag = blk_mq_unique_tag(cmnd->request);
+@@@ -3835,6 -4797,92 +4543,95 @@@ static void sdebug_q_cmd_wq_complete(st
+  static bool got_shared_uuid;
+  static uuid_t shared_uuid;
+  
+++<<<<<<< HEAD
+++=======
++ static int sdebug_device_create_zones(struct sdebug_dev_info *devip)
++ {
++ 	struct sdeb_zone_state *zsp;
++ 	sector_t capacity = get_sdebug_capacity();
++ 	sector_t zstart = 0;
++ 	unsigned int i;
++ 
++ 	/*
++ 	 * Set the zone size: if sdeb_zbc_zone_size_mb is not set, figure out
++ 	 * a zone size allowing for at least 4 zones on the device. Otherwise,
++ 	 * use the specified zone size checking that at least 2 zones can be
++ 	 * created for the device.
++ 	 */
++ 	if (!sdeb_zbc_zone_size_mb) {
++ 		devip->zsize = (DEF_ZBC_ZONE_SIZE_MB * SZ_1M)
++ 			>> ilog2(sdebug_sector_size);
++ 		while (capacity < devip->zsize << 2 && devip->zsize >= 2)
++ 			devip->zsize >>= 1;
++ 		if (devip->zsize < 2) {
++ 			pr_err("Device capacity too small\n");
++ 			return -EINVAL;
++ 		}
++ 	} else {
++ 		if (!is_power_of_2(sdeb_zbc_zone_size_mb)) {
++ 			pr_err("Zone size is not a power of 2\n");
++ 			return -EINVAL;
++ 		}
++ 		devip->zsize = (sdeb_zbc_zone_size_mb * SZ_1M)
++ 			>> ilog2(sdebug_sector_size);
++ 		if (devip->zsize >= capacity) {
++ 			pr_err("Zone size too large for device capacity\n");
++ 			return -EINVAL;
++ 		}
++ 	}
++ 
++ 	devip->zsize_shift = ilog2(devip->zsize);
++ 	devip->nr_zones = (capacity + devip->zsize - 1) >> devip->zsize_shift;
++ 
++ 	if (sdeb_zbc_nr_conv >= devip->nr_zones) {
++ 		pr_err("Number of conventional zones too large\n");
++ 		return -EINVAL;
++ 	}
++ 	devip->nr_conv_zones = sdeb_zbc_nr_conv;
++ 
++ 	if (devip->zmodel == BLK_ZONED_HM) {
++ 		/* zbc_max_open_zones can be 0, meaning "not reported" */
++ 		if (sdeb_zbc_max_open >= devip->nr_zones - 1)
++ 			devip->max_open = (devip->nr_zones - 1) / 2;
++ 		else
++ 			devip->max_open = sdeb_zbc_max_open;
++ 	}
++ 
++ 	devip->zstate = kcalloc(devip->nr_zones,
++ 				sizeof(struct sdeb_zone_state), GFP_KERNEL);
++ 	if (!devip->zstate)
++ 		return -ENOMEM;
++ 
++ 	for (i = 0; i < devip->nr_zones; i++) {
++ 		zsp = &devip->zstate[i];
++ 
++ 		zsp->z_start = zstart;
++ 
++ 		if (i < devip->nr_conv_zones) {
++ 			zsp->z_type = ZBC_ZONE_TYPE_CNV;
++ 			zsp->z_cond = ZBC_NOT_WRITE_POINTER;
++ 			zsp->z_wp = (sector_t)-1;
++ 		} else {
++ 			if (devip->zmodel == BLK_ZONED_HM)
++ 				zsp->z_type = ZBC_ZONE_TYPE_SWR;
++ 			else
++ 				zsp->z_type = ZBC_ZONE_TYPE_SWP;
++ 			zsp->z_cond = ZC1_EMPTY;
++ 			zsp->z_wp = zsp->z_start;
++ 		}
++ 
++ 		if (zsp->z_start + devip->zsize < capacity)
++ 			zsp->z_size = devip->zsize;
++ 		else
++ 			zsp->z_size = capacity - zsp->z_start;
++ 
++ 		zstart += zsp->z_size;
++ 	}
++ 
++ 	return 0;
++ }
++ 
+++>>>>>>> 108e36f0d8bf (scsi: scsi_debug: Disallow zone sizes that are not powers of 2)
+  static struct sdebug_dev_info *sdebug_device_create(
+  			struct sdebug_host_info *sdbg_host, gfp_t flags)
+  {
+* Unmerged path drivers/scsi/scsi_debug.c
