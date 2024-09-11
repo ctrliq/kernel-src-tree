@@ -1,0 +1,136 @@
+mmc: core: Rework cd-gpio handling
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Michał Mirosław <mirq-linux@rere.qmqm.pl>
+commit 0f7c815d83a20dbae8b736331eb1ffd0bc0497d7
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/0f7c815d.failed
+
+There are a few places around the code that invert inverted and possibly
+inverted CD line. That's really confusing. Squash them all into one place
+in mmc_gpiod_request_cd(). MMC_CAP2_CD_ACTIVE_HIGH is used analogously to
+WP line: in GPIO mode it is used only at probe time to switch polarity, for
+native mode it is left as is.
+
+	Signed-off-by: Michał Mirosław <mirq-linux@rere.qmqm.pl>
+Link: https://lore.kernel.org/r/db189b715596d63caf8c6a088bddc71dd69a879b.1576031637.git.mirq-linux@rere.qmqm.pl
+	Signed-off-by: Ulf Hansson <ulf.hansson@linaro.org>
+(cherry picked from commit 0f7c815d83a20dbae8b736331eb1ffd0bc0497d7)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/gpio/gpiolib-of.c
+#	drivers/mmc/core/host.c
+#	drivers/mmc/core/slot-gpio.c
+diff --cc drivers/gpio/gpiolib-of.c
+index f90ba3c6ac6b,8310da48ba01..000000000000
+--- a/drivers/gpio/gpiolib-of.c
++++ b/drivers/gpio/gpiolib-of.c
+@@@ -59,27 -105,6 +59,30 @@@ static void of_gpio_flags_quirks(struc
+  				 int index)
+  {
+  	/*
+++<<<<<<< HEAD
+ +	 * Handle MMC "cd-inverted" and "wp-inverted" semantics.
+ +	 */
+ +	if (IS_ENABLED(CONFIG_MMC)) {
+ +		/*
+ +		 * Active low is the default according to the
+ +		 * SDHCI specification and the device tree
+ +		 * bindings. However the code in the current
+ +		 * kernel was written such that the phandle
+ +		 * flags were always respected, and "cd-inverted"
+ +		 * would invert the flag from the device phandle.
+ +		 */
+ +		if (!strcmp(propname, "cd-gpios")) {
+ +			if (of_property_read_bool(np, "cd-inverted"))
+ +				*flags ^= OF_GPIO_ACTIVE_LOW;
+ +		}
+ +		if (!strcmp(propname, "wp-gpios")) {
+ +			if (of_property_read_bool(np, "wp-inverted"))
+ +				*flags ^= OF_GPIO_ACTIVE_LOW;
+ +		}
+ +	}
+ +	/*
+++=======
+++>>>>>>> 0f7c815d83a2 (mmc: core: Rework cd-gpio handling)
+  	 * Some GPIO fixed regulator quirks.
+  	 * Note that active low is the default.
+  	 */
+diff --cc drivers/mmc/core/host.c
+index abf9e884386c,e655dc1b5b85..000000000000
+--- a/drivers/mmc/core/host.c
++++ b/drivers/mmc/core/host.c
+@@@ -178,8 -175,6 +178,11 @@@ int mmc_of_parse(struct mmc_host *host
+  	struct device *dev = host->parent;
+  	u32 bus_width, drv_type, cd_debounce_delay_ms;
+  	int ret;
+++<<<<<<< HEAD
+ +	bool cd_cap_invert, cd_gpio_invert = false;
+ +	bool ro_cap_invert, ro_gpio_invert = false;
+++=======
+++>>>>>>> 0f7c815d83a2 (mmc: core: Rework cd-gpio handling)
+  
+  	if (!dev || !dev_fwnode(dev))
+  		return 0;
+@@@ -234,9 -231,9 +239,15 @@@
+  		if (device_property_read_bool(dev, "broken-cd"))
+  			host->caps |= MMC_CAP_NEEDS_POLL;
+  
+++<<<<<<< HEAD
+ +		ret = mmc_gpiod_request_cd(host, "cd", 0, true,
+ +					   cd_debounce_delay_ms,
+ +					   &cd_gpio_invert);
+++=======
++ 		ret = mmc_gpiod_request_cd(host, "cd", 0, false,
++ 					   cd_debounce_delay_ms * 1000,
++ 					   NULL);
+++>>>>>>> 0f7c815d83a2 (mmc: core: Rework cd-gpio handling)
+  		if (!ret)
+  			dev_info(host->parent, "Got CD GPIO\n");
+  		else if (ret != -ENOENT && ret != -ENOSYS)
+diff --cc drivers/mmc/core/slot-gpio.c
+index 2a833686784b,303e825ecfd8..000000000000
+--- a/drivers/mmc/core/slot-gpio.c
++++ b/drivers/mmc/core/slot-gpio.c
+@@@ -23,12 -19,10 +23,15 @@@
+  struct mmc_gpio {
+  	struct gpio_desc *ro_gpio;
+  	struct gpio_desc *cd_gpio;
+++<<<<<<< HEAD
+ +	bool override_ro_active_level;
+ +	bool override_cd_active_level;
+++=======
+++>>>>>>> 0f7c815d83a2 (mmc: core: Rework cd-gpio handling)
+  	irqreturn_t (*cd_gpio_isr)(int irq, void *dev_id);
+  	char *ro_label;
+ -	char *cd_label;
+  	u32 cd_debounce_delay_ms;
+ +	char cd_label[];
+  };
+  
+  static irqreturn_t mmc_gpio_cd_irqt(int irq, void *dev_id)
+@@@ -271,9 -183,17 +267,17 @@@ int mmc_gpiod_request_cd(struct mmc_hos
+  	if (debounce) {
+  		ret = gpiod_set_debounce(desc, debounce);
+  		if (ret < 0)
+ -			ctx->cd_debounce_delay_ms = debounce / 1000;
+ +			ctx->cd_debounce_delay_ms = debounce;
+  	}
+  
++ 	/* override forces default (active-low) polarity ... */
++ 	if (override_active_level && !gpiod_is_active_low(desc))
++ 		gpiod_toggle_active_low(desc);
++ 
++ 	/* ... or active-high */
++ 	if (host->caps2 & MMC_CAP2_CD_ACTIVE_HIGH)
++ 		gpiod_toggle_active_low(desc);
++ 
+  	if (gpio_invert)
+  		*gpio_invert = !gpiod_is_active_low(desc);
+  
+* Unmerged path drivers/gpio/gpiolib-of.c
+* Unmerged path drivers/mmc/core/host.c
+* Unmerged path drivers/mmc/core/slot-gpio.c
