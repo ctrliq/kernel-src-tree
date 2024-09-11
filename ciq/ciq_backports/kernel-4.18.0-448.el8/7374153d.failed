@@ -1,0 +1,127 @@
+swiotlb: provide swiotlb_init variants that remap the buffer
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-448.el8
+commit-author Christoph Hellwig <hch@lst.de>
+commit 7374153d294eb51de5a81ac38ff1c4fef8927bec
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-448.el8/7374153d.failed
+
+To shared more code between swiotlb and xen-swiotlb, offer a
+swiotlb_init_remap interface and add a remap callback to
+swiotlb_init_late that will allow Xen to remap the buffer without
+duplicating much of the logic.
+
+	Signed-off-by: Christoph Hellwig <hch@lst.de>
+	Reviewed-by: Konrad Rzeszutek Wilk <konrad.wilk@oracle.com>
+	Tested-by: Boris Ostrovsky <boris.ostrovsky@oracle.com>
+(cherry picked from commit 7374153d294eb51de5a81ac38ff1c4fef8927bec)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	kernel/dma/swiotlb.c
+diff --cc kernel/dma/swiotlb.c
+index eb8c08292910,f6acfc7a41bf..000000000000
+--- a/kernel/dma/swiotlb.c
++++ b/kernel/dma/swiotlb.c
+@@@ -257,20 -256,41 +257,52 @@@ int __init swiotlb_init_with_tbl(char *
+   * Statically reserve bounce buffer space and initialize bounce buffer data
+   * structures for the software IO TLB used to implement the DMA API.
+   */
+++<<<<<<< HEAD
+ +void  __init
+ +swiotlb_init(int verbose)
+++=======
++ void __init swiotlb_init_remap(bool addressing_limit, unsigned int flags,
++ 		int (*remap)(void *tlb, unsigned long nslabs))
+++>>>>>>> 7374153d294e (swiotlb: provide swiotlb_init variants that remap the buffer)
+  {
+- 	size_t bytes = PAGE_ALIGN(default_nslabs << IO_TLB_SHIFT);
++ 	unsigned long nslabs = default_nslabs;
++ 	size_t bytes;
+  	void *tlb;
+  
+ -	if (!addressing_limit && !swiotlb_force_bounce)
+ -		return;
+ -	if (swiotlb_force_disable)
+ +	if (swiotlb_force == SWIOTLB_NO_FORCE)
+  		return;
+  
+++<<<<<<< HEAD
+ +	/* Get IO TLB memory from the low pages */
+ +	tlb = memblock_alloc_low_nopanic(bytes, PAGE_SIZE);
+ +	if (!tlb)
+ +		goto fail;
+ +	if (swiotlb_init_with_tbl(tlb, default_nslabs, verbose))
+++=======
++ 	/*
++ 	 * By default allocate the bounce buffer memory from low memory, but
++ 	 * allow to pick a location everywhere for hypervisors with guest
++ 	 * memory encryption.
++ 	 */
++ retry:
++ 	bytes = PAGE_ALIGN(default_nslabs << IO_TLB_SHIFT);
++ 	if (flags & SWIOTLB_ANY)
++ 		tlb = memblock_alloc(bytes, PAGE_SIZE);
++ 	else
++ 		tlb = memblock_alloc_low(bytes, PAGE_SIZE);
++ 	if (!tlb)
++ 		goto fail;
++ 	if (remap && remap(tlb, nslabs) < 0) {
++ 		memblock_free(tlb, PAGE_ALIGN(bytes));
++ 
++ 		nslabs = ALIGN(nslabs >> 1, IO_TLB_SEGSIZE);
++ 		if (nslabs < IO_TLB_MIN_SLABS)
++ 			panic("%s: Failed to remap %zu bytes\n",
++ 			      __func__, bytes);
++ 		goto retry;
++ 	}
++ 	if (swiotlb_init_with_tbl(tlb, default_nslabs, flags))
+++>>>>>>> 7374153d294e (swiotlb: provide swiotlb_init variants that remap the buffer)
+  		goto fail_free_mem;
+  	return;
+  
+@@@ -293,9 -319,10 +331,10 @@@ int swiotlb_init_late(size_t size, gfp_
+  	unsigned int order;
+  	int rc = 0;
+  
+ -	if (swiotlb_force_disable)
+ +	if (swiotlb_force == SWIOTLB_NO_FORCE)
+  		return 0;
+  
++ retry:
+  	order = get_order(nslabs << IO_TLB_SHIFT);
+  	nslabs = SLABS_PER_PAGE << order;
+  	bytes = nslabs << IO_TLB_SHIFT;
+diff --git a/arch/x86/pci/sta2x11-fixup.c b/arch/x86/pci/sta2x11-fixup.c
+index a3e466f6ed09..c3d799fea57b 100644
+--- a/arch/x86/pci/sta2x11-fixup.c
++++ b/arch/x86/pci/sta2x11-fixup.c
+@@ -72,7 +72,7 @@ static void sta2x11_new_instance(struct pci_dev *pdev)
+ 		int size = STA2X11_SWIOTLB_SIZE;
+ 		/* First instance: register your own swiotlb area */
+ 		dev_info(&pdev->dev, "Using SWIOTLB (size %i)\n", size);
+-		if (swiotlb_init_late(size, GFP_DMA))
++		if (swiotlb_init_late(size, GFP_DMA, NULL))
+ 			dev_emerg(&pdev->dev, "init swiotlb failed\n");
+ 	}
+ 	list_add(&instance->list, &sta2x11_instance_list);
+diff --git a/include/linux/swiotlb.h b/include/linux/swiotlb.h
+index 1befd6b2ccf5..652e8b6a09b0 100644
+--- a/include/linux/swiotlb.h
++++ b/include/linux/swiotlb.h
+@@ -39,8 +39,11 @@ enum swiotlb_force {
+ extern void swiotlb_init(int verbose);
+ int swiotlb_init_with_tbl(char *tlb, unsigned long nslabs, int verbose);
+ unsigned long swiotlb_size_or_default(void);
++void __init swiotlb_init_remap(bool addressing_limit, unsigned int flags,
++	int (*remap)(void *tlb, unsigned long nslabs));
++int swiotlb_init_late(size_t size, gfp_t gfp_mask,
++	int (*remap)(void *tlb, unsigned long nslabs));
+ extern int swiotlb_late_init_with_tbl(char *tlb, unsigned long nslabs);
+-int swiotlb_init_late(size_t size, gfp_t gfp_mask);
+ extern void __init swiotlb_update_mem_attributes(void);
+ 
+ phys_addr_t swiotlb_tbl_map_single(struct device *hwdev, phys_addr_t phys,
+* Unmerged path kernel/dma/swiotlb.c
