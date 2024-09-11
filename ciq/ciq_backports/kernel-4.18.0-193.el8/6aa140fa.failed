@@ -1,0 +1,260 @@
+sched/topology: Reference the Energy Model of CPUs when available
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-193.el8
+commit-author Quentin Perret <quentin.perret@arm.com>
+commit 6aa140fa4508933a6ac6717d65a403eb904d6c02
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-193.el8/6aa140fa.failed
+
+The existing scheduling domain hierarchy is defined to map to the cache
+topology of the system. However, Energy Aware Scheduling (EAS) requires
+more knowledge about the platform, and specifically needs to know about
+the span of Performance Domains (PD), which do not always align with
+caches.
+
+To address this issue, use the Energy Model (EM) of the system to extend
+the scheduler topology code with a representation of the PDs, alongside
+the scheduling domains. More specifically, a linked list of PDs is
+attached to each root domain. When multiple root domains are in use,
+each list contains only the PDs covering the CPUs of its root domain. If
+a PD spans over CPUs of multiple different root domains, it will be
+duplicated in all lists.
+
+The lists are fully maintained by the scheduler from
+partition_sched_domains() in order to cope with hotplug and cpuset
+changes. As for scheduling domains, the list are protected by RCU to
+ensure safe concurrent updates.
+
+	Signed-off-by: Quentin Perret <quentin.perret@arm.com>
+	Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+	Cc: Linus Torvalds <torvalds@linux-foundation.org>
+	Cc: Mike Galbraith <efault@gmx.de>
+	Cc: Peter Zijlstra <peterz@infradead.org>
+	Cc: Thomas Gleixner <tglx@linutronix.de>
+	Cc: adharmap@codeaurora.org
+	Cc: chris.redpath@arm.com
+	Cc: currojerez@riseup.net
+	Cc: dietmar.eggemann@arm.com
+	Cc: edubezval@gmail.com
+	Cc: gregkh@linuxfoundation.org
+	Cc: javi.merino@kernel.org
+	Cc: joel@joelfernandes.org
+	Cc: juri.lelli@redhat.com
+	Cc: morten.rasmussen@arm.com
+	Cc: patrick.bellasi@arm.com
+	Cc: pkondeti@codeaurora.org
+	Cc: rjw@rjwysocki.net
+	Cc: skannan@codeaurora.org
+	Cc: smuckle@google.com
+	Cc: srinivas.pandruvada@linux.intel.com
+	Cc: thara.gopinath@linaro.org
+	Cc: tkjos@google.com
+	Cc: valentin.schneider@arm.com
+	Cc: vincent.guittot@linaro.org
+	Cc: viresh.kumar@linaro.org
+Link: https://lkml.kernel.org/r/20181203095628.11858-6-quentin.perret@arm.com
+	Signed-off-by: Ingo Molnar <mingo@kernel.org>
+(cherry picked from commit 6aa140fa4508933a6ac6717d65a403eb904d6c02)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	kernel/sched/sched.h
+diff --cc kernel/sched/sched.h
+index c26f02d434d1,808a565187b1..000000000000
+--- a/kernel/sched/sched.h
++++ b/kernel/sched/sched.h
+@@@ -765,10 -769,11 +772,18 @@@ struct root_domain 
+  
+  	unsigned long		max_cpu_capacity;
+  
+++<<<<<<< HEAD
+ +	RH_KABI_RESERVE(1)
+ +	RH_KABI_RESERVE(2)
+ +	RH_KABI_RESERVE(3)
+ +	RH_KABI_RESERVE(4)
+++=======
++ 	/*
++ 	 * NULL-terminated list of performance domains intersecting with the
++ 	 * CPUs of the rd. Protected by RCU.
++ 	 */
++ 	struct perf_domain	*pd;
+++>>>>>>> 6aa140fa4508 (sched/topology: Reference the Energy Model of CPUs when available)
+  };
+  
+  extern struct root_domain def_root_domain;
+* Unmerged path kernel/sched/sched.h
+diff --git a/kernel/sched/topology.c b/kernel/sched/topology.c
+index 89c27efaf577..1c1e3a03f523 100644
+--- a/kernel/sched/topology.c
++++ b/kernel/sched/topology.c
+@@ -201,6 +201,116 @@ sd_parent_degenerate(struct sched_domain *sd, struct sched_domain *parent)
+ 	return 1;
+ }
+ 
++#ifdef CONFIG_ENERGY_MODEL
++static void free_pd(struct perf_domain *pd)
++{
++	struct perf_domain *tmp;
++
++	while (pd) {
++		tmp = pd->next;
++		kfree(pd);
++		pd = tmp;
++	}
++}
++
++static struct perf_domain *find_pd(struct perf_domain *pd, int cpu)
++{
++	while (pd) {
++		if (cpumask_test_cpu(cpu, perf_domain_span(pd)))
++			return pd;
++		pd = pd->next;
++	}
++
++	return NULL;
++}
++
++static struct perf_domain *pd_init(int cpu)
++{
++	struct em_perf_domain *obj = em_cpu_get(cpu);
++	struct perf_domain *pd;
++
++	if (!obj) {
++		if (sched_debug())
++			pr_info("%s: no EM found for CPU%d\n", __func__, cpu);
++		return NULL;
++	}
++
++	pd = kzalloc(sizeof(*pd), GFP_KERNEL);
++	if (!pd)
++		return NULL;
++	pd->em_pd = obj;
++
++	return pd;
++}
++
++static void perf_domain_debug(const struct cpumask *cpu_map,
++						struct perf_domain *pd)
++{
++	if (!sched_debug() || !pd)
++		return;
++
++	printk(KERN_DEBUG "root_domain %*pbl:", cpumask_pr_args(cpu_map));
++
++	while (pd) {
++		printk(KERN_CONT " pd%d:{ cpus=%*pbl nr_cstate=%d }",
++				cpumask_first(perf_domain_span(pd)),
++				cpumask_pr_args(perf_domain_span(pd)),
++				em_pd_nr_cap_states(pd->em_pd));
++		pd = pd->next;
++	}
++
++	printk(KERN_CONT "\n");
++}
++
++static void destroy_perf_domain_rcu(struct rcu_head *rp)
++{
++	struct perf_domain *pd;
++
++	pd = container_of(rp, struct perf_domain, rcu);
++	free_pd(pd);
++}
++
++static void build_perf_domains(const struct cpumask *cpu_map)
++{
++	struct perf_domain *pd = NULL, *tmp;
++	int cpu = cpumask_first(cpu_map);
++	struct root_domain *rd = cpu_rq(cpu)->rd;
++	int i;
++
++	for_each_cpu(i, cpu_map) {
++		/* Skip already covered CPUs. */
++		if (find_pd(pd, i))
++			continue;
++
++		/* Create the new pd and add it to the local list. */
++		tmp = pd_init(i);
++		if (!tmp)
++			goto free;
++		tmp->next = pd;
++		pd = tmp;
++	}
++
++	perf_domain_debug(cpu_map, pd);
++
++	/* Attach the new list of performance domains to the root domain. */
++	tmp = rd->pd;
++	rcu_assign_pointer(rd->pd, pd);
++	if (tmp)
++		call_rcu(&tmp->rcu, destroy_perf_domain_rcu);
++
++	return;
++
++free:
++	free_pd(pd);
++	tmp = rd->pd;
++	rcu_assign_pointer(rd->pd, NULL);
++	if (tmp)
++		call_rcu(&tmp->rcu, destroy_perf_domain_rcu);
++}
++#else
++static void free_pd(struct perf_domain *pd) { }
++#endif /* CONFIG_ENERGY_MODEL */
++
+ static void free_rootdomain(struct rcu_head *rcu)
+ {
+ 	struct root_domain *rd = container_of(rcu, struct root_domain, rcu);
+@@ -211,6 +321,7 @@ static void free_rootdomain(struct rcu_head *rcu)
+ 	free_cpumask_var(rd->rto_mask);
+ 	free_cpumask_var(rd->online);
+ 	free_cpumask_var(rd->span);
++	free_pd(rd->pd);
+ 	kfree(rd);
+ }
+ 
+@@ -1959,8 +2070,8 @@ void partition_sched_domains(int ndoms_new, cpumask_var_t doms_new[],
+ 	/* Destroy deleted domains: */
+ 	for (i = 0; i < ndoms_cur; i++) {
+ 		for (j = 0; j < n && !new_topology; j++) {
+-			if (cpumask_equal(doms_cur[i], doms_new[j])
+-			    && dattrs_equal(dattr_cur, i, dattr_new, j))
++			if (cpumask_equal(doms_cur[i], doms_new[j]) &&
++			    dattrs_equal(dattr_cur, i, dattr_new, j))
+ 				goto match1;
+ 		}
+ 		/* No match - a current sched domain not in new doms_new[] */
+@@ -1980,8 +2091,8 @@ void partition_sched_domains(int ndoms_new, cpumask_var_t doms_new[],
+ 	/* Build new domains: */
+ 	for (i = 0; i < ndoms_new; i++) {
+ 		for (j = 0; j < n && !new_topology; j++) {
+-			if (cpumask_equal(doms_new[i], doms_cur[j])
+-			    && dattrs_equal(dattr_new, i, dattr_cur, j))
++			if (cpumask_equal(doms_new[i], doms_cur[j]) &&
++			    dattrs_equal(dattr_new, i, dattr_cur, j))
+ 				goto match2;
+ 		}
+ 		/* No match - add a new doms_new */
+@@ -1990,6 +2101,21 @@ void partition_sched_domains(int ndoms_new, cpumask_var_t doms_new[],
+ 		;
+ 	}
+ 
++#ifdef CONFIG_ENERGY_MODEL
++	/* Build perf. domains: */
++	for (i = 0; i < ndoms_new; i++) {
++		for (j = 0; j < n; j++) {
++			if (cpumask_equal(doms_new[i], doms_cur[j]) &&
++			    cpu_rq(cpumask_first(doms_cur[j]))->rd->pd)
++				goto match3;
++		}
++		/* No match - add perf. domains for a new rd */
++		build_perf_domains(doms_new[i]);
++match3:
++		;
++	}
++#endif
++
+ 	/* Remember the new sched domains: */
+ 	if (doms_cur != &fallback_doms)
+ 		free_sched_domains(doms_cur, ndoms_cur);
