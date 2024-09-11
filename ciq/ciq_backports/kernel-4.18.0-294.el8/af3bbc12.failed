@@ -1,0 +1,136 @@
+mm: add thp_size
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Matthew Wilcox (Oracle) <willy@infradead.org>
+commit af3bbc12df80e8c279b94c752b6edca29841f4f5
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/af3bbc12.failed
+
+This function returns the number of bytes in a THP.  It is like
+page_size(), but compiles to just PAGE_SIZE if CONFIG_TRANSPARENT_HUGEPAGE
+is disabled.
+
+	Signed-off-by: Matthew Wilcox (Oracle) <willy@infradead.org>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Reviewed-by: William Kucharski <william.kucharski@oracle.com>
+	Reviewed-by: Zi Yan <ziy@nvidia.com>
+	Cc: David Hildenbrand <david@redhat.com>
+	Cc: Mike Kravetz <mike.kravetz@oracle.com>
+	Cc: "Kirill A. Shutemov" <kirill.shutemov@linux.intel.com>
+Link: http://lkml.kernel.org/r/20200629151959.15779-5-willy@infradead.org
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit af3bbc12df80e8c279b94c752b6edca29841f4f5)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	mm/page_io.c
+diff --cc mm/page_io.c
+index cc84c071d588,f5e8bec8a8c7..000000000000
+--- a/mm/page_io.c
++++ b/mm/page_io.c
+@@@ -41,9 -40,7 +41,13 @@@ static struct bio *get_swap_bio(gfp_t g
+  		bio->bi_iter.bi_sector <<= PAGE_SHIFT - 9;
+  		bio->bi_end_io = end_io;
+  
+++<<<<<<< HEAD
+ +		for (i = 0; i < nr; i++)
+ +			bio_add_page(bio, page + i, PAGE_SIZE, 0);
+ +		VM_BUG_ON(bio->bi_iter.bi_size != PAGE_SIZE * nr);
+++=======
++ 		bio_add_page(bio, page, thp_size(page), 0);
+++>>>>>>> af3bbc12df80 (mm: add thp_size)
+  	}
+  	return bio;
+  }
+diff --git a/drivers/nvdimm/btt.c b/drivers/nvdimm/btt.c
+index 4183d27e64a4..bdf3d8d2b246 100644
+--- a/drivers/nvdimm/btt.c
++++ b/drivers/nvdimm/btt.c
+@@ -1498,10 +1498,8 @@ static int btt_rw_page(struct block_device *bdev, sector_t sector,
+ {
+ 	struct btt *btt = bdev->bd_disk->private_data;
+ 	int rc;
+-	unsigned int len;
+ 
+-	len = hpage_nr_pages(page) * PAGE_SIZE;
+-	rc = btt_do_bvec(btt, NULL, page, len, 0, op, sector);
++	rc = btt_do_bvec(btt, NULL, page, thp_size(page), 0, op, sector);
+ 	if (rc == 0)
+ 		page_endio(page, op_is_write(op), 0);
+ 
+diff --git a/drivers/nvdimm/pmem.c b/drivers/nvdimm/pmem.c
+index f436195b9358..85b0c7d49854 100644
+--- a/drivers/nvdimm/pmem.c
++++ b/drivers/nvdimm/pmem.c
+@@ -242,11 +242,9 @@ static int pmem_rw_page(struct block_device *bdev, sector_t sector,
+ 	blk_status_t rc;
+ 
+ 	if (op_is_write(op))
+-		rc = pmem_do_write(pmem, page, 0, sector,
+-				   hpage_nr_pages(page) * PAGE_SIZE);
++		rc = pmem_do_write(pmem, page, 0, sector, thp_size(page));
+ 	else
+-		rc = pmem_do_read(pmem, page, 0, sector,
+-				   hpage_nr_pages(page) * PAGE_SIZE);
++		rc = pmem_do_read(pmem, page, 0, sector, thp_size(page));
+ 	/*
+ 	 * The ->rw_page interface is subtle and tricky.  The core
+ 	 * retries on any error, so we can only invoke page_endio() in
+diff --git a/include/linux/huge_mm.h b/include/linux/huge_mm.h
+index cb4e18b7bff7..30e1a23748fa 100644
+--- a/include/linux/huge_mm.h
++++ b/include/linux/huge_mm.h
+@@ -425,4 +425,15 @@ static inline bool thp_migration_supported(void)
+ }
+ #endif /* CONFIG_TRANSPARENT_HUGEPAGE */
+ 
++/**
++ * thp_size - Size of a transparent huge page.
++ * @page: Head page of a transparent huge page.
++ *
++ * Return: Number of bytes in this page.
++ */
++static inline unsigned long thp_size(struct page *page)
++{
++	return PAGE_SIZE << thp_order(page);
++}
++
+ #endif /* _LINUX_HUGE_MM_H */
+diff --git a/mm/internal.h b/mm/internal.h
+index 344bbc72ed9a..f7b586e34d3c 100644
+--- a/mm/internal.h
++++ b/mm/internal.h
+@@ -347,7 +347,7 @@ vma_address(struct page *page, struct vm_area_struct *vma)
+ 	unsigned long start, end;
+ 
+ 	start = __vma_address(page, vma);
+-	end = start + PAGE_SIZE * (hpage_nr_pages(page) - 1);
++	end = start + thp_size(page) - PAGE_SIZE;
+ 
+ 	/* page should be within @vma mapping range */
+ 	VM_BUG_ON_VMA(end < vma->vm_start || start >= vma->vm_end, vma);
+* Unmerged path mm/page_io.c
+diff --git a/mm/page_vma_mapped.c b/mm/page_vma_mapped.c
+index f0eea1c2a213..d00c90579a83 100644
+--- a/mm/page_vma_mapped.c
++++ b/mm/page_vma_mapped.c
+@@ -228,7 +228,7 @@ bool page_vma_mapped_walk(struct page_vma_mapped_walk *pvmw)
+ 			if (pvmw->address >= pvmw->vma->vm_end ||
+ 			    pvmw->address >=
+ 					__vma_address(pvmw->page, pvmw->vma) +
+-					hpage_nr_pages(pvmw->page) * PAGE_SIZE)
++					thp_size(pvmw->page))
+ 				return not_found(pvmw);
+ 			/* Did we cross page table boundary? */
+ 			if (pvmw->address % PMD_SIZE == 0) {
+@@ -269,7 +269,7 @@ int page_mapped_in_vma(struct page *page, struct vm_area_struct *vma)
+ 	unsigned long start, end;
+ 
+ 	start = __vma_address(page, vma);
+-	end = start + PAGE_SIZE * (hpage_nr_pages(page) - 1);
++	end = start + thp_size(page) - PAGE_SIZE;
+ 
+ 	if (unlikely(end < vma->vm_start || start >= vma->vm_end))
+ 		return 0;
