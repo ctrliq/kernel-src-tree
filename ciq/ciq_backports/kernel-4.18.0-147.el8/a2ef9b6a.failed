@@ -1,0 +1,254 @@
+net: tls: Refactor tls aad space size calculation
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-147.el8
+Rebuild_CHGLOG: - [net] tls: Refactor tls aad space size calculation (Sabrina Dubroca) [1711821]
+Rebuild_FUZZ: 94.62%
+commit-author Dave Watson <davejwatson@fb.com>
+commit a2ef9b6a22bd22841bde53e52cc50476fb4d1a5d
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-147.el8/a2ef9b6a.failed
+
+TLS 1.3 has a different AAD size, use a variable in the code to
+make TLS 1.3 support easy.
+
+	Signed-off-by: Dave Watson <davejwatson@fb.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit a2ef9b6a22bd22841bde53e52cc50476fb4d1a5d)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/net/tls.h
+#	net/tls/tls_sw.c
+diff --cc include/net/tls.h
+index d1f6db15d1de,754b130672f0..000000000000
+--- a/include/net/tls.h
++++ b/include/net/tls.h
+@@@ -195,25 -202,15 +195,29 @@@ struct cipher_context 
+  	char *iv;
+  	u16 rec_seq_size;
+  	char *rec_seq;
+++<<<<<<< HEAD
+ +
+ +	RH_KABI_RESERVE(1)
+ +	RH_KABI_RESERVE(2)
+ +	RH_KABI_RESERVE(3)
+ +	RH_KABI_RESERVE(4)
+++=======
++ 	u16 aad_size;
+++>>>>>>> a2ef9b6a22bd (net: tls: Refactor tls aad space size calculation)
+  };
+  
+ +/* Note: this sizeof(struct tls12_crypto_info_aes_gcm_128) + 32 at rhel8 GA */
+ +#define RH_KABI_TLS_CRYPT_CONTEXT_SIZE		72
+ +
+  union tls_crypto_context {
+  	struct tls_crypto_info info;
+ -	union {
+ -		struct tls12_crypto_info_aes_gcm_128 aes_gcm_128;
+ -		struct tls12_crypto_info_aes_gcm_256 aes_gcm_256;
+ -	};
+ +	struct tls12_crypto_info_aes_gcm_128 aes_gcm_128;
+ +
+ +	/* RHEL: new alternative ciphers must be added under KABI_EXTEND(),
+ +	 * build time checks in tls_register() will ensure tls_crypto_context
+ +	 * does not exceed the padding storage
+ +	 */
+ +	char rh_kabi_padding[RH_KABI_TLS_CRYPT_CONTEXT_SIZE];
+  };
+  
+  struct tls_context {
+diff --cc net/tls/tls_sw.c
+index 3f443983a6b3,7b6386f4c685..000000000000
+--- a/net/tls/tls_sw.c
++++ b/net/tls/tls_sw.c
+@@@ -286,80 -249,62 +286,113 @@@ static int move_to_plaintext_sg(struct 
+  	struct tls_context *tls_ctx = tls_get_ctx(sk);
+  	struct tls_sw_context_tx *ctx = tls_sw_ctx_tx(tls_ctx);
+  	struct tls_rec *rec = ctx->open_rec;
+ -	struct sk_msg *msg_pl = &rec->msg_plaintext;
+ -	struct sk_msg *msg_en = &rec->msg_encrypted;
+ +	struct scatterlist *plain_sg = &rec->sg_plaintext_data[1];
+ +	struct scatterlist *enc_sg = &rec->sg_encrypted_data[1];
+ +	int enc_sg_idx = 0;
+  	int skip, len;
+  
+ -	/* We add page references worth len bytes from encrypted sg
+ -	 * at the end of plaintext sg. It is guaranteed that msg_en
+ +	if (rec->sg_plaintext_num_elem == MAX_SKB_FRAGS)
+ +		return -ENOSPC;
+ +
+ +	/* We add page references worth len bytes from enc_sg at the
+ +	 * end of plain_sg. It is guaranteed that sg_encrypted_data
+  	 * has enough required room (ensured by caller).
+  	 */
+ -	len = required - msg_pl->sg.size;
+ +	len = required_size - rec->sg_plaintext_size;
+  
+ -	/* Skip initial bytes in msg_en's data to be able to use
+ -	 * same offset of both plain and encrypted data.
+ +	/* Skip initial bytes in sg_encrypted_data to be able
+ +	 * to use same offset of both plain and encrypted data.
+  	 */
+ -	skip = tls_ctx->tx.prepend_size + msg_pl->sg.size;
+ +	skip = tls_ctx->tx.prepend_size + rec->sg_plaintext_size;
+ +
+ +	while (enc_sg_idx < rec->sg_encrypted_num_elem) {
+ +		if (enc_sg[enc_sg_idx].length > skip)
+ +			break;
+ +
+ +		skip -= enc_sg[enc_sg_idx].length;
+ +		enc_sg_idx++;
+ +	}
+ +
+ +	/* unmark the end of plain_sg*/
+ +	sg_unmark_end(plain_sg + rec->sg_plaintext_num_elem - 1);
+ +
+ +	while (len) {
+ +		struct page *page = sg_page(&enc_sg[enc_sg_idx]);
+ +		int bytes = enc_sg[enc_sg_idx].length - skip;
+ +		int offset = enc_sg[enc_sg_idx].offset + skip;
+ +
+ +		if (bytes > len)
+ +			bytes = len;
+ +		else
+ +			enc_sg_idx++;
+ +
+ +		/* Skipping is required only one time */
+ +		skip = 0;
+ +
+ +		/* Increment page reference */
+ +		get_page(page);
+ +
+ +		sg_set_page(&plain_sg[rec->sg_plaintext_num_elem], page,
+ +			    bytes, offset);
+ +
+ +		sk_mem_charge(sk, bytes);
+  
+ -	return sk_msg_clone(sk, msg_pl, msg_en, skip, len);
+ +		len -= bytes;
+ +		rec->sg_plaintext_size += bytes;
+ +
+ +		rec->sg_plaintext_num_elem++;
+ +
+ +		if (rec->sg_plaintext_num_elem == MAX_SKB_FRAGS)
+ +			return -ENOSPC;
+ +	}
+ +
+ +	return 0;
+  }
+  
+ -static struct tls_rec *tls_get_rec(struct sock *sk)
+ +static void free_sg(struct sock *sk, struct scatterlist *sg,
+ +		    int *sg_num_elem, unsigned int *sg_size)
+  {
+ -	struct tls_context *tls_ctx = tls_get_ctx(sk);
+ -	struct tls_sw_context_tx *ctx = tls_sw_ctx_tx(tls_ctx);
+ -	struct sk_msg *msg_pl, *msg_en;
+ -	struct tls_rec *rec;
+ -	int mem_size;
+ +	int i, n = *sg_num_elem;
+  
+++<<<<<<< HEAD
+ +	for (i = 0; i < n; ++i) {
+ +		sk_mem_uncharge(sk, sg[i].length);
+ +		put_page(sg_page(&sg[i]));
+ +	}
+ +	*sg_num_elem = 0;
+ +	*sg_size = 0;
+++=======
++ 	mem_size = sizeof(struct tls_rec) + crypto_aead_reqsize(ctx->aead_send);
++ 
++ 	rec = kzalloc(mem_size, sk->sk_allocation);
++ 	if (!rec)
++ 		return NULL;
++ 
++ 	msg_pl = &rec->msg_plaintext;
++ 	msg_en = &rec->msg_encrypted;
++ 
++ 	sk_msg_init(msg_pl);
++ 	sk_msg_init(msg_en);
++ 
++ 	sg_init_table(rec->sg_aead_in, 2);
++ 	sg_set_buf(&rec->sg_aead_in[0], rec->aad_space,
++ 		   tls_ctx->tx.aad_size);
++ 	sg_unmark_end(&rec->sg_aead_in[1]);
++ 
++ 	sg_init_table(rec->sg_aead_out, 2);
++ 	sg_set_buf(&rec->sg_aead_out[0], rec->aad_space,
++ 		   tls_ctx->tx.aad_size);
++ 	sg_unmark_end(&rec->sg_aead_out[1]);
++ 
++ 	return rec;
++ }
++ 
++ static void tls_free_rec(struct sock *sk, struct tls_rec *rec)
++ {
++ 	sk_msg_free(sk, &rec->msg_encrypted);
++ 	sk_msg_free(sk, &rec->msg_plaintext);
++ 	kfree(rec);
+++>>>>>>> a2ef9b6a22bd (net: tls: Refactor tls aad space size calculation)
+  }
+  
+  static void tls_free_open_rec(struct sock *sk)
+@@@ -504,25 -440,25 +537,32 @@@ static int tls_do_encryption(struct soc
+  			     struct tls_context *tls_ctx,
+  			     struct tls_sw_context_tx *ctx,
+  			     struct aead_request *aead_req,
+ -			     size_t data_len, u32 start)
+ +			     size_t data_len)
+  {
+  	struct tls_rec *rec = ctx->open_rec;
+ -	struct sk_msg *msg_en = &rec->msg_encrypted;
+ -	struct scatterlist *sge = sk_msg_elem(msg_en, start);
+ +	struct scatterlist *plain_sg = rec->sg_plaintext_data;
+ +	struct scatterlist *enc_sg = rec->sg_encrypted_data;
+  	int rc;
+  
+ -	memcpy(rec->iv_data, tls_ctx->tx.iv, sizeof(rec->iv_data));
+ +	/* Skip the first index as it contains AAD data */
+ +	rec->sg_encrypted_data[1].offset += tls_ctx->tx.prepend_size;
+ +	rec->sg_encrypted_data[1].length -= tls_ctx->tx.prepend_size;
+  
+ -	sge->offset += tls_ctx->tx.prepend_size;
+ -	sge->length -= tls_ctx->tx.prepend_size;
+ -
+ -	msg_en->sg.curr = start;
+ +	/* If it is inplace crypto, then pass same SG list as both src, dst */
+ +	if (rec->inplace_crypto)
+ +		plain_sg = enc_sg;
+  
+  	aead_request_set_tfm(aead_req, ctx->aead_send);
+++<<<<<<< HEAD
+ +	aead_request_set_ad(aead_req, TLS_AAD_SPACE_SIZE);
+ +	aead_request_set_crypt(aead_req, plain_sg, enc_sg,
+ +			       data_len, tls_ctx->tx.iv);
+++=======
++ 	aead_request_set_ad(aead_req, tls_ctx->tx.aad_size);
++ 	aead_request_set_crypt(aead_req, rec->sg_aead_in,
++ 			       rec->sg_aead_out,
++ 			       data_len, rec->iv_data);
+++>>>>>>> a2ef9b6a22bd (net: tls: Refactor tls aad space size calculation)
+  
+  	aead_request_set_callback(aead_req, CRYPTO_TFM_REQ_MAY_BACKLOG,
+  				  tls_encrypt_done, sk);
+@@@ -1186,12 -1364,12 +1226,12 @@@ static int decrypt_internal(struct soc
+  	if (n_sgout) {
+  		if (out_iov) {
+  			sg_init_table(sgout, n_sgout);
+- 			sg_set_buf(&sgout[0], aad, TLS_AAD_SPACE_SIZE);
++ 			sg_set_buf(&sgout[0], aad, tls_ctx->rx.aad_size);
+  
+  			*chunk = 0;
+ -			err = tls_setup_from_iter(sk, out_iov, data_len,
+ -						  &pages, chunk, &sgout[1],
+ -						  (n_sgout - 1));
+ +			err = zerocopy_from_iter(sk, out_iov, data_len, &pages,
+ +						 chunk, &sgout[1],
+ +						 (n_sgout - 1), false);
+  			if (err < 0)
+  				goto fallback_to_reg_recv;
+  		} else if (out_sg) {
+* Unmerged path include/net/tls.h
+* Unmerged path net/tls/tls_sw.c
