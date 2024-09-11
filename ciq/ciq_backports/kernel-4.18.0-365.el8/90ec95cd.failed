@@ -1,0 +1,138 @@
+arm64: mm: Introduce VA_BITS_MIN
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-365.el8
+commit-author Steve Capper <steve.capper@arm.com>
+commit 90ec95cda91a021d82351c976896a63aa364ebf1
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-365.el8/90ec95cd.failed
+
+In order to support 52-bit kernel addresses detectable at boot time, the
+kernel needs to know the most conservative VA_BITS possible should it
+need to fall back to this quantity due to lack of hardware support.
+
+A new compile time constant VA_BITS_MIN is introduced in this patch and
+it is employed in the KASAN end address, KASLR, and EFI stub.
+
+For Arm, if 52-bit VA support is unavailable the fallback is to 48-bits.
+
+In other words: VA_BITS_MIN = min (48, VA_BITS)
+
+	Reviewed-by: Catalin Marinas <catalin.marinas@arm.com>
+	Signed-off-by: Steve Capper <steve.capper@arm.com>
+	Signed-off-by: Will Deacon <will@kernel.org>
+(cherry picked from commit 90ec95cda91a021d82351c976896a63aa364ebf1)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/arm64/include/asm/memory.h
+diff --cc arch/arm64/include/asm/memory.h
+index 4f7a83123dad,79e75e45d560..000000000000
+--- a/arch/arm64/include/asm/memory.h
++++ b/arch/arm64/include/asm/memory.h
+@@@ -88,11 -75,13 +95,15 @@@
+   * significantly, so double the (minimum) stack size when they are in use.
+   */
+  #ifdef CONFIG_KASAN
+ -#define KASAN_SHADOW_OFFSET	_AC(CONFIG_KASAN_SHADOW_OFFSET, UL)
+ -#define KASAN_SHADOW_END	((UL(1) << (64 - KASAN_SHADOW_SCALE_SHIFT)) \
+ -					+ KASAN_SHADOW_OFFSET)
+ +#define KASAN_SHADOW_SIZE	(UL(1) << (VA_BITS - KASAN_SHADOW_SCALE_SHIFT))
+  #define KASAN_THREAD_SHIFT	1
+  #else
+ +#define KASAN_SHADOW_SIZE	(0)
+  #define KASAN_THREAD_SHIFT	0
+++<<<<<<< HEAD
+++=======
++ #define KASAN_SHADOW_END	(_VA_START(VA_BITS_MIN))
+++>>>>>>> 90ec95cda91a (arm64: mm: Introduce VA_BITS_MIN)
+  #endif
+  
+  #define MIN_THREAD_SHIFT	(14 + KASAN_THREAD_SHIFT)
+diff --git a/arch/arm64/include/asm/efi.h b/arch/arm64/include/asm/efi.h
+index 975a3d8c6eae..591f4a06e821 100644
+--- a/arch/arm64/include/asm/efi.h
++++ b/arch/arm64/include/asm/efi.h
+@@ -79,7 +79,7 @@ static inline unsigned long efi_get_max_fdt_addr(unsigned long dram_base)
+ 
+ /*
+  * On arm64, we have to ensure that the initrd ends up in the linear region,
+- * which is a 1 GB aligned region of size '1UL << (VA_BITS - 1)' that is
++ * which is a 1 GB aligned region of size '1UL << (VA_BITS_MIN - 1)' that is
+  * guaranteed to cover the kernel Image.
+  *
+  * Since the EFI stub is part of the kernel Image, we can relax the
+@@ -90,7 +90,7 @@ static inline unsigned long efi_get_max_fdt_addr(unsigned long dram_base)
+ static inline unsigned long efi_get_max_initrd_addr(unsigned long dram_base,
+ 						    unsigned long image_addr)
+ {
+-	return (image_addr & ~(SZ_1G - 1UL)) + (1UL << (VA_BITS - 1));
++	return (image_addr & ~(SZ_1G - 1UL)) + (1UL << (VA_BITS_MIN - 1));
+ }
+ 
+ #define efi_call_early(f, ...)		sys_table_arg->boottime->f(__VA_ARGS__)
+* Unmerged path arch/arm64/include/asm/memory.h
+diff --git a/arch/arm64/include/asm/processor.h b/arch/arm64/include/asm/processor.h
+index 2d679c4f5884..34511498cb5b 100644
+--- a/arch/arm64/include/asm/processor.h
++++ b/arch/arm64/include/asm/processor.h
+@@ -54,7 +54,7 @@
+  * TASK_UNMAPPED_BASE - the lower boundary of the mmap VM area.
+  */
+ 
+-#define DEFAULT_MAP_WINDOW_64	(UL(1) << VA_BITS)
++#define DEFAULT_MAP_WINDOW_64	(UL(1) << VA_BITS_MIN)
+ #define TASK_SIZE_64		(UL(1) << vabits_user)
+ 
+ #ifdef CONFIG_COMPAT
+diff --git a/arch/arm64/kernel/head.S b/arch/arm64/kernel/head.S
+index 04d29898ce46..dcdf9cbbc882 100644
+--- a/arch/arm64/kernel/head.S
++++ b/arch/arm64/kernel/head.S
+@@ -325,7 +325,7 @@ __create_page_tables:
+ 	mov	x5, #52
+ 	cbnz	x6, 1f
+ #endif
+-	mov	x5, #VA_BITS
++	mov	x5, #VA_BITS_MIN
+ 1:
+ 	adr_l	x6, vabits_user
+ 	str	x5, [x6]
+diff --git a/arch/arm64/kernel/kaslr.c b/arch/arm64/kernel/kaslr.c
+index ce7c985c3f9f..47f93d06f7b9 100644
+--- a/arch/arm64/kernel/kaslr.c
++++ b/arch/arm64/kernel/kaslr.c
+@@ -144,15 +144,15 @@ u64 __init kaslr_early_init(u64 dt_phys)
+ 	/*
+ 	 * OK, so we are proceeding with KASLR enabled. Calculate a suitable
+ 	 * kernel image offset from the seed. Let's place the kernel in the
+-	 * middle half of the VMALLOC area (VA_BITS - 2), and stay clear of
++	 * middle half of the VMALLOC area (VA_BITS_MIN - 2), and stay clear of
+ 	 * the lower and upper quarters to avoid colliding with other
+ 	 * allocations.
+ 	 * Even if we could randomize at page granularity for 16k and 64k pages,
+ 	 * let's always round to 2 MB so we don't interfere with the ability to
+ 	 * map using contiguous PTEs
+ 	 */
+-	mask = ((1UL << (VA_BITS - 2)) - 1) & ~(SZ_2M - 1);
+-	offset = BIT(VA_BITS - 3) + (seed & mask);
++	mask = ((1UL << (VA_BITS_MIN - 2)) - 1) & ~(SZ_2M - 1);
++	offset = BIT(VA_BITS_MIN - 3) + (seed & mask);
+ 
+ 	/* use the top 16 bits to randomize the linear region */
+ 	memstart_offset_seed = seed >> 48;
+diff --git a/arch/arm64/mm/kasan_init.c b/arch/arm64/mm/kasan_init.c
+index b6bb51a47354..84b41f1697af 100644
+--- a/arch/arm64/mm/kasan_init.c
++++ b/arch/arm64/mm/kasan_init.c
+@@ -160,7 +160,8 @@ asmlinkage void __init kasan_early_init(void)
+ {
+ 	BUILD_BUG_ON(KASAN_SHADOW_OFFSET !=
+ 		KASAN_SHADOW_END - (1UL << (64 - KASAN_SHADOW_SCALE_SHIFT)));
+-	BUILD_BUG_ON(!IS_ALIGNED(KASAN_SHADOW_START, PGDIR_SIZE));
++	BUILD_BUG_ON(!IS_ALIGNED(_KASAN_SHADOW_START(VA_BITS), PGDIR_SIZE));
++	BUILD_BUG_ON(!IS_ALIGNED(_KASAN_SHADOW_START(VA_BITS_MIN), PGDIR_SIZE));
+ 	BUILD_BUG_ON(!IS_ALIGNED(KASAN_SHADOW_END, PGDIR_SIZE));
+ 	kasan_pgd_populate(KASAN_SHADOW_START, KASAN_SHADOW_END, NUMA_NO_NODE,
+ 			   true);
