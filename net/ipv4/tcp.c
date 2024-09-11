@@ -995,12 +995,12 @@ ssize_t do_tcp_sendpages(struct sock *sk, struct page *page, int offset,
 		    !tcp_skb_can_collapse_to(skb)) {
 new_segment:
 			if (!sk_stream_memory_free(sk))
-				goto wait_for_sndbuf;
+				goto wait_for_space;
 
 			skb = sk_stream_alloc_skb(sk, 0, sk->sk_allocation,
 					tcp_rtx_and_write_queues_empty(sk));
 			if (!skb)
-				goto wait_for_memory;
+				goto wait_for_space;
 
 #ifdef CONFIG_TLS_DEVICE
 			skb->decrypted = !!(flags & MSG_SENDPAGE_DECRYPTED);
@@ -1019,7 +1019,7 @@ new_segment:
 			goto new_segment;
 		}
 		if (!sk_wmem_schedule(sk, copy))
-			goto wait_for_memory;
+			goto wait_for_space;
 
 		if (can_coalesce) {
 			skb_frag_size_add(&skb_shinfo(skb)->frags[i - 1], copy);
@@ -1060,9 +1060,8 @@ new_segment:
 			tcp_push_one(sk, mss_now);
 		continue;
 
-wait_for_sndbuf:
+wait_for_space:
 		set_bit(SOCK_NOSPACE, &sk->sk_socket->flags);
-wait_for_memory:
 		tcp_push(sk, flags & ~MSG_MORE, mss_now,
 			 TCP_NAGLE_PUSH, size_goal);
 
@@ -1304,7 +1303,7 @@ new_segment:
 			 * allocate skb fitting to single page.
 			 */
 			if (!sk_stream_memory_free(sk))
-				goto wait_for_sndbuf;
+				goto wait_for_space;
 
 			if (process_backlog && sk_flush_backlog(sk)) {
 				process_backlog = false;
@@ -1315,7 +1314,7 @@ new_segment:
 			skb = sk_stream_alloc_skb(sk, linear, sk->sk_allocation,
 						  first_skb);
 			if (!skb)
-				goto wait_for_memory;
+				goto wait_for_space;
 
 			process_backlog = true;
 			skb->ip_summed = CHECKSUM_PARTIAL;
@@ -1348,7 +1347,7 @@ new_segment:
 			struct page_frag *pfrag = sk_page_frag(sk);
 
 			if (!sk_page_frag_refill(sk, pfrag))
-				goto wait_for_memory;
+				goto wait_for_space;
 
 			if (!skb_can_coalesce(skb, i, pfrag->page,
 					      pfrag->offset)) {
@@ -1362,7 +1361,7 @@ new_segment:
 			copy = min_t(int, copy, pfrag->size - pfrag->offset);
 
 			if (!sk_wmem_schedule(sk, copy))
-				goto wait_for_memory;
+				goto wait_for_space;
 
 			err = skb_copy_to_page_nocache(sk, &msg->msg_iter, skb,
 						       pfrag->page,
@@ -1415,9 +1414,8 @@ new_segment:
 			tcp_push_one(sk, mss_now);
 		continue;
 
-wait_for_sndbuf:
+wait_for_space:
 		set_bit(SOCK_NOSPACE, &sk->sk_socket->flags);
-wait_for_memory:
 		if (copied)
 			tcp_push(sk, flags & ~MSG_MORE, mss_now,
 				 TCP_NAGLE_PUSH, size_goal);
