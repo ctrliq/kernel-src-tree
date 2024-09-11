@@ -1,0 +1,188 @@
+x86/debug: Allow a single level of #DB recursion
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+Rebuild_CHGLOG: - [x86] debug: Allow a single level of #DB recursion (Vitaly Kuznetsov) [1868080]
+Rebuild_FUZZ: 95.65%
+commit-author Andy Lutomirski <luto@kernel.org>
+commit d5c678aed5eddb944b8e7ce451b107b39245962d
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/d5c678ae.failed
+
+Trying to clear DR7 around a #DB from usermode malfunctions if the tasks
+schedules when delivering SIGTRAP.
+
+Rather than trying to define a special no-recursion region, just allow a
+single level of recursion.  The same mechanism is used for NMI, and it
+hasn't caused any problems yet.
+
+Fixes: 9f58fdde95c9 ("x86/db: Split out dr6/7 handling")
+	Reported-by: Kyle Huey <me@kylehuey.com>
+	Debugged-by: Josh Poimboeuf <jpoimboe@redhat.com>
+	Signed-off-by: Andy Lutomirski <luto@kernel.org>
+	Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+	Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+	Tested-by: Daniel Thompson <daniel.thompson@linaro.org>
+	Cc: stable@vger.kernel.org
+Link: https://lkml.kernel.org/r/8b9bd05f187231df008d48cf818a6a311cbd5c98.1597882384.git.luto@kernel.org
+Link: https://lore.kernel.org/r/20200902133200.726584153@infradead.org
+
+(cherry picked from commit d5c678aed5eddb944b8e7ce451b107b39245962d)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kernel/traps.c
+diff --cc arch/x86/kernel/traps.c
+index bceb85be1c08,81a2fb711091..000000000000
+--- a/arch/x86/kernel/traps.c
++++ b/arch/x86/kernel/traps.c
+@@@ -707,6 -729,29 +707,32 @@@ static bool is_sysenter_singlestep(stru
+  #endif
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static __always_inline unsigned long debug_read_clear_dr6(void)
++ {
++ 	unsigned long dr6;
++ 
++ 	/*
++ 	 * The Intel SDM says:
++ 	 *
++ 	 *   Certain debug exceptions may clear bits 0-3. The remaining
++ 	 *   contents of the DR6 register are never cleared by the
++ 	 *   processor. To avoid confusion in identifying debug
++ 	 *   exceptions, debug handlers should clear the register before
++ 	 *   returning to the interrupted task.
++ 	 *
++ 	 * Keep it simple: clear DR6 immediately.
++ 	 */
++ 	get_debugreg(dr6, 6);
++ 	set_debugreg(0, 6);
++ 	/* Filter out all the reserved bits which are preset to 1 */
++ 	dr6 &= ~DR6_RESERVED;
++ 
++ 	return dr6;
++ }
++ 
+++>>>>>>> d5c678aed5ed (x86/debug: Allow a single level of #DB recursion)
+  /*
+   * Our handling of the processor debug registers is non-trivial.
+   * We do not clear them on entry and exit from the kernel. Therefore
+@@@ -824,16 -837,105 +850,110 @@@ dotraplinkage void do_debug(struct pt_r
+  		set_tsk_thread_flag(tsk, TIF_SINGLESTEP);
+  		regs->flags &= ~X86_EFLAGS_TF;
+  	}
+ -
+  	si_code = get_si_code(tsk->thread.debugreg6);
+  	if (tsk->thread.debugreg6 & (DR_STEP | DR_TRAP_BITS) || user_icebp)
+ -		send_sigtrap(regs, 0, si_code);
+ -
+ -out:
+ +		send_sigtrap(tsk, regs, error_code, si_code);
+  	cond_local_irq_disable(regs);
+ +	debug_stack_usage_dec();
+ +
+ +exit:
+ +	ist_exit(regs);
+  }
+++<<<<<<< HEAD
+ +NOKPROBE_SYMBOL(do_debug);
+++=======
++ 
++ static __always_inline void exc_debug_kernel(struct pt_regs *regs,
++ 					     unsigned long dr6)
++ {
++ 	/*
++ 	 * Disable breakpoints during exception handling; recursive exceptions
++ 	 * are exceedingly 'fun'.
++ 	 *
++ 	 * Since this function is NOKPROBE, and that also applies to
++ 	 * HW_BREAKPOINT_X, we can't hit a breakpoint before this (XXX except a
++ 	 * HW_BREAKPOINT_W on our stack)
++ 	 *
++ 	 * Entry text is excluded for HW_BP_X and cpu_entry_area, which
++ 	 * includes the entry stack is excluded for everything.
++ 	 */
++ 	unsigned long dr7 = local_db_save();
++ 	bool irq_state = idtentry_enter_nmi(regs);
++ 	instrumentation_begin();
++ 
++ 	/*
++ 	 * If something gets miswired and we end up here for a user mode
++ 	 * #DB, we will malfunction.
++ 	 */
++ 	WARN_ON_ONCE(user_mode(regs));
++ 
++ 	/*
++ 	 * Catch SYSENTER with TF set and clear DR_STEP. If this hit a
++ 	 * watchpoint at the same time then that will still be handled.
++ 	 */
++ 	if ((dr6 & DR_STEP) && is_sysenter_singlestep(regs))
++ 		dr6 &= ~DR_STEP;
++ 
++ 	handle_debug(regs, dr6, false);
++ 
++ 	instrumentation_end();
++ 	idtentry_exit_nmi(regs, irq_state);
++ 
++ 	local_db_restore(dr7);
++ }
++ 
++ static __always_inline void exc_debug_user(struct pt_regs *regs,
++ 					   unsigned long dr6)
++ {
++ 	/*
++ 	 * If something gets miswired and we end up here for a kernel mode
++ 	 * #DB, we will malfunction.
++ 	 */
++ 	WARN_ON_ONCE(!user_mode(regs));
++ 
++ 	/*
++ 	 * NB: We can't easily clear DR7 here because
++ 	 * idtentry_exit_to_usermode() can invoke ptrace, schedule, access
++ 	 * user memory, etc.  This means that a recursive #DB is possible.  If
++ 	 * this happens, that #DB will hit exc_debug_kernel() and clear DR7.
++ 	 * Since we're not on the IST stack right now, everything will be
++ 	 * fine.
++ 	 */
++ 
++ 	irqentry_enter_from_user_mode(regs);
++ 	instrumentation_begin();
++ 
++ 	handle_debug(regs, dr6, true);
++ 
++ 	instrumentation_end();
++ 	irqentry_exit_to_user_mode(regs);
++ }
++ 
++ #ifdef CONFIG_X86_64
++ /* IST stack entry */
++ DEFINE_IDTENTRY_DEBUG(exc_debug)
++ {
++ 	exc_debug_kernel(regs, debug_read_clear_dr6());
++ }
++ 
++ /* User entry, runs on regular task stack */
++ DEFINE_IDTENTRY_DEBUG_USER(exc_debug)
++ {
++ 	exc_debug_user(regs, debug_read_clear_dr6());
++ }
++ #else
++ /* 32 bit does not have separate entry points. */
++ DEFINE_IDTENTRY_RAW(exc_debug)
++ {
++ 	unsigned long dr6 = debug_read_clear_dr6();
++ 
++ 	if (user_mode(regs))
++ 		exc_debug_user(regs, dr6);
++ 	else
++ 		exc_debug_kernel(regs, dr6);
++ }
++ #endif
+++>>>>>>> d5c678aed5ed (x86/debug: Allow a single level of #DB recursion)
+  
+  /*
+   * Note that we play around with the 'TS' bit in an attempt to get
+* Unmerged path arch/x86/kernel/traps.c
