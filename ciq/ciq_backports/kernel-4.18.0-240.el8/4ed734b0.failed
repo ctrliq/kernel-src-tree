@@ -1,0 +1,326 @@
+io_uring: honor original task RLIMIT_FSIZE
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Jens Axboe <axboe@kernel.dk>
+commit 4ed734b0d0913e566a9d871e15d24eb240f269f7
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/4ed734b0.failed
+
+With the previous fixes for number of files open checking, I added some
+debug code to see if we had other spots where we're checking rlimit()
+against the async io-wq workers. The only one I found was file size
+checking, which we should also honor.
+
+During write and fallocate prep, store the max file size and override
+that for the current ask if we're in io-wq worker context.
+
+	Cc: stable@vger.kernel.org # 5.1+
+	Signed-off-by: Jens Axboe <axboe@kernel.dk>
+(cherry picked from commit 4ed734b0d0913e566a9d871e15d24eb240f269f7)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/io_uring.c
+diff --cc fs/io_uring.c
+index 7842c6de7135,05260ed485ad..000000000000
+--- a/fs/io_uring.c
++++ b/fs/io_uring.c
+@@@ -325,18 -602,12 +325,25 @@@ struct io_kiocb 
+  
+  	struct io_ring_ctx	*ctx;
+  	struct list_head	list;
+ +	struct list_head	link_list;
+  	unsigned int		flags;
+  	refcount_t		refs;
+++<<<<<<< HEAD
+ +#define REQ_F_NOWAIT		1	/* must not punt to workers */
+ +#define REQ_F_IOPOLL_COMPLETED	2	/* polled IO has completed */
+ +#define REQ_F_FIXED_FILE	4	/* ctx owns file */
+ +#define REQ_F_IO_DRAIN		16	/* drain existing IO first */
+ +#define REQ_F_IO_DRAINED	32	/* drain done */
+ +#define REQ_F_LINK		64	/* linked sqes */
+ +#define REQ_F_LINK_DONE		128	/* linked sqes done */
+ +#define REQ_F_FAIL_LINK		256	/* fail rest of links */
+ +#define REQ_F_SHADOW_DRAIN	512	/* link-drain shadow req */
+++=======
++ 	union {
++ 		struct task_struct	*task;
++ 		unsigned long		fsize;
++ 	};
+++>>>>>>> 4ed734b0d091 (io_uring: honor original task RLIMIT_FSIZE)
+  	u64			user_data;
+  	u32			result;
+  	u32			sequence;
+@@@ -1395,11 -2593,20 +1402,25 @@@ static int io_write(struct io_kiocb *re
+  	if (ret)
+  		return ret;
+  
+ -	if (unlikely(!(req->file->f_mode & FMODE_WRITE)))
+ +	file = kiocb->ki_filp;
+ +	if (unlikely(!(file->f_mode & FMODE_WRITE)))
+  		return -EBADF;
+  
+++<<<<<<< HEAD
+ +	ret = io_import_iovec(req->ctx, WRITE, s, &iovec, &iter);
+++=======
++ 	req->fsize = rlimit(RLIMIT_FSIZE);
++ 
++ 	/* either don't need iovec imported or already have it */
++ 	if (!req->io || req->flags & REQ_F_NEED_CLEANUP)
++ 		return 0;
++ 
++ 	io = req->io;
++ 	io->rw.iov = io->rw.fast_iov;
++ 	req->io = NULL;
++ 	ret = io_import_iovec(WRITE, req, &io->rw.iov, &iter, !force_nonblock);
++ 	req->io = io;
+++>>>>>>> 4ed734b0d091 (io_uring: honor original task RLIMIT_FSIZE)
+  	if (ret < 0)
+  		return ret;
+  
+@@@ -1435,20 -2667,34 +1456,40 @@@
+  		}
+  		kiocb->ki_flags |= IOCB_WRITE;
+  
+++<<<<<<< HEAD
+ +		if (file->f_op->write_iter)
+ +			ret2 = call_write_iter(file, kiocb, &iter);
+ +		else
+ +			ret2 = loop_rw_iter(WRITE, file, kiocb, &iter);
+++=======
++ 		if (!force_nonblock)
++ 			current->signal->rlim[RLIMIT_FSIZE].rlim_cur = req->fsize;
++ 
++ 		if (req->file->f_op->write_iter)
++ 			ret2 = call_write_iter(req->file, kiocb, &iter);
++ 		else
++ 			ret2 = loop_rw_iter(WRITE, req->file, kiocb, &iter);
++ 
++ 		if (!force_nonblock)
++ 			current->signal->rlim[RLIMIT_FSIZE].rlim_cur = RLIM_INFINITY;
++ 
++ 		/*
++ 		 * Raw bdev writes will -EOPNOTSUPP for IOCB_NOWAIT. Just
++ 		 * retry them without IOCB_NOWAIT.
++ 		 */
++ 		if (ret2 == -EOPNOTSUPP && (kiocb->ki_flags & IOCB_NOWAIT))
++ 			ret2 = -EAGAIN;
+++>>>>>>> 4ed734b0d091 (io_uring: honor original task RLIMIT_FSIZE)
+  		if (!force_nonblock || ret2 != -EAGAIN) {
+ -			kiocb_done(kiocb, ret2);
+ +			io_rw_done(kiocb, ret2);
+  		} else {
+ -copy_iov:
+ -			ret = io_setup_async_rw(req, io_size, iovec,
+ -						inline_vecs, &iter);
+ -			if (ret)
+ -				goto out_free;
+ -			/* any defer here is final, must blocking retry */
+ -			req->flags |= REQ_F_MUST_PUNT;
+ -			return -EAGAIN;
+ +			/*
+ +			 * If ->needs_lock is true, we're already in async
+ +			 * context.
+ +			 */
+ +			if (!s->needs_lock)
+ +				io_async_list_note(WRITE, req, iov_count);
+ +			ret = -EAGAIN;
+  		}
+  	}
+  out_free:
+@@@ -1487,24 -2803,183 +1528,159 @@@ static int io_prep_fsync(struct io_kioc
+  	return 0;
+  }
+  
+ -static bool io_req_cancelled(struct io_kiocb *req)
+ -{
+ -	if (req->work.flags & IO_WQ_WORK_CANCEL) {
+ -		req_set_fail_links(req);
+ -		io_cqring_add_event(req, -ECANCELED);
+ -		io_put_req(req);
+ -		return true;
+ -	}
+ -
+ -	return false;
+ -}
+ -
+ -static void __io_fsync(struct io_kiocb *req)
+ +static int io_fsync(struct io_kiocb *req, const struct io_uring_sqe *sqe,
+ +		    bool force_nonblock)
+  {
+ -	loff_t end = req->sync.off + req->sync.len;
+ +	loff_t sqe_off = READ_ONCE(sqe->off);
+ +	loff_t sqe_len = READ_ONCE(sqe->len);
+ +	loff_t end = sqe_off + sqe_len;
+ +	unsigned fsync_flags;
+  	int ret;
+  
+ -	ret = vfs_fsync_range(req->file, req->sync.off,
+ -				end > 0 ? end : LLONG_MAX,
+ -				req->sync.flags & IORING_FSYNC_DATASYNC);
+ -	if (ret < 0)
+ -		req_set_fail_links(req);
+ -	io_cqring_add_event(req, ret);
+ -	io_put_req(req);
+ -}
+ -
+ -static void io_fsync_finish(struct io_wq_work **workptr)
+ -{
+ -	struct io_kiocb *req = container_of(*workptr, struct io_kiocb, work);
+ +	fsync_flags = READ_ONCE(sqe->fsync_flags);
+ +	if (unlikely(fsync_flags & ~IORING_FSYNC_DATASYNC))
+ +		return -EINVAL;
+  
+ -	if (io_req_cancelled(req))
+ -		return;
+ -	__io_fsync(req);
+ -	io_steal_work(req, workptr);
+ -}
+ +	ret = io_prep_fsync(req, sqe);
+ +	if (ret)
+ +		return ret;
+  
+ -static int io_fsync(struct io_kiocb *req, bool force_nonblock)
+ -{
+  	/* fsync always requires a blocking context */
+++<<<<<<< HEAD
+++=======
++ 	if (force_nonblock) {
++ 		req->work.func = io_fsync_finish;
++ 		return -EAGAIN;
++ 	}
++ 	__io_fsync(req);
++ 	return 0;
++ }
++ 
++ static void __io_fallocate(struct io_kiocb *req)
++ {
++ 	int ret;
++ 
++ 	current->signal->rlim[RLIMIT_FSIZE].rlim_cur = req->fsize;
++ 	ret = vfs_fallocate(req->file, req->sync.mode, req->sync.off,
++ 				req->sync.len);
++ 	current->signal->rlim[RLIMIT_FSIZE].rlim_cur = RLIM_INFINITY;
++ 	if (ret < 0)
++ 		req_set_fail_links(req);
++ 	io_cqring_add_event(req, ret);
++ 	io_put_req(req);
++ }
++ 
++ static void io_fallocate_finish(struct io_wq_work **workptr)
++ {
++ 	struct io_kiocb *req = container_of(*workptr, struct io_kiocb, work);
++ 
++ 	if (io_req_cancelled(req))
++ 		return;
++ 	__io_fallocate(req);
++ 	io_steal_work(req, workptr);
++ }
++ 
++ static int io_fallocate_prep(struct io_kiocb *req,
++ 			     const struct io_uring_sqe *sqe)
++ {
++ 	if (sqe->ioprio || sqe->buf_index || sqe->rw_flags)
++ 		return -EINVAL;
++ 
++ 	req->sync.off = READ_ONCE(sqe->off);
++ 	req->sync.len = READ_ONCE(sqe->addr);
++ 	req->sync.mode = READ_ONCE(sqe->len);
++ 	req->fsize = rlimit(RLIMIT_FSIZE);
++ 	return 0;
++ }
++ 
++ static int io_fallocate(struct io_kiocb *req, bool force_nonblock)
++ {
++ 	/* fallocate always requiring blocking context */
++ 	if (force_nonblock) {
++ 		req->work.func = io_fallocate_finish;
++ 		return -EAGAIN;
++ 	}
++ 
++ 	__io_fallocate(req);
++ 	return 0;
++ }
++ 
++ static int io_openat_prep(struct io_kiocb *req, const struct io_uring_sqe *sqe)
++ {
++ 	const char __user *fname;
++ 	int ret;
++ 
++ 	if (sqe->ioprio || sqe->buf_index)
++ 		return -EINVAL;
++ 	if (sqe->flags & IOSQE_FIXED_FILE)
++ 		return -EBADF;
++ 	if (req->flags & REQ_F_NEED_CLEANUP)
++ 		return 0;
++ 
++ 	req->open.dfd = READ_ONCE(sqe->fd);
++ 	req->open.how.mode = READ_ONCE(sqe->len);
++ 	fname = u64_to_user_ptr(READ_ONCE(sqe->addr));
++ 	req->open.how.flags = READ_ONCE(sqe->open_flags);
++ 
++ 	req->open.filename = getname(fname);
++ 	if (IS_ERR(req->open.filename)) {
++ 		ret = PTR_ERR(req->open.filename);
++ 		req->open.filename = NULL;
++ 		return ret;
++ 	}
++ 
++ 	req->flags |= REQ_F_NEED_CLEANUP;
++ 	return 0;
++ }
++ 
++ static int io_openat2_prep(struct io_kiocb *req, const struct io_uring_sqe *sqe)
++ {
++ 	struct open_how __user *how;
++ 	const char __user *fname;
++ 	size_t len;
++ 	int ret;
++ 
++ 	if (sqe->ioprio || sqe->buf_index)
++ 		return -EINVAL;
++ 	if (sqe->flags & IOSQE_FIXED_FILE)
++ 		return -EBADF;
++ 	if (req->flags & REQ_F_NEED_CLEANUP)
++ 		return 0;
++ 
++ 	req->open.dfd = READ_ONCE(sqe->fd);
++ 	fname = u64_to_user_ptr(READ_ONCE(sqe->addr));
++ 	how = u64_to_user_ptr(READ_ONCE(sqe->addr2));
++ 	len = READ_ONCE(sqe->len);
++ 
++ 	if (len < OPEN_HOW_SIZE_VER0)
++ 		return -EINVAL;
++ 
++ 	ret = copy_struct_from_user(&req->open.how, sizeof(req->open.how), how,
++ 					len);
++ 	if (ret)
++ 		return ret;
++ 
++ 	if (!(req->open.how.flags & O_PATH) && force_o_largefile())
++ 		req->open.how.flags |= O_LARGEFILE;
++ 
++ 	req->open.filename = getname(fname);
++ 	if (IS_ERR(req->open.filename)) {
++ 		ret = PTR_ERR(req->open.filename);
++ 		req->open.filename = NULL;
++ 		return ret;
++ 	}
++ 
++ 	req->flags |= REQ_F_NEED_CLEANUP;
++ 	return 0;
++ }
++ 
++ static int io_openat2(struct io_kiocb *req, bool force_nonblock)
++ {
++ 	struct open_flags op;
++ 	struct file *file;
++ 	int ret;
++ 
+++>>>>>>> 4ed734b0d091 (io_uring: honor original task RLIMIT_FSIZE)
+  	if (force_nonblock)
+  		return -EAGAIN;
+  
+* Unmerged path fs/io_uring.c
