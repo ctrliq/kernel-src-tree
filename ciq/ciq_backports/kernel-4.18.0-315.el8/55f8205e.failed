@@ -1,0 +1,540 @@
+mac80211: Allow concurrent monitor iface and ethernet rx decap
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-315.el8
+commit-author Sriram R <srirrama@codeaurora.org>
+commit 55f8205e7dddb2151def733cefbbf63deba9e1a5
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-315.el8/55f8205e.failed
+
+Some HW/driver can support passing ethernet rx decap frames and
+raw 802.11 frames for the monitor interface concurrently and
+via separate RX calls to mac80211. Packets going to the monitor
+interface(s) would be in 802.11 format and thus not have the
+RX_FLAG_8023 set, and 802.11 format monitoring frames should have
+RX_FLAG_ONLY_MONITOR set.
+
+Drivers doing such can enable the SUPPORTS_CONC_MON_RX_DECAP to
+allow using ethernet decap offload while a monitor interface is
+active, currently RX decapsulation offload gets disabled when a
+monitor interface is added.
+
+	Signed-off-by: Sriram R <srirrama@codeaurora.org>
+Link: https://lore.kernel.org/r/1617068116-32253-1-git-send-email-srirrama@codeaurora.org
+[add proper documentation, rewrite commit message]
+	Signed-off-by: Johannes Berg <johannes.berg@intel.com>
+(cherry picked from commit 55f8205e7dddb2151def733cefbbf63deba9e1a5)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/net/mac80211.h
+#	net/mac80211/debugfs.c
+#	net/mac80211/iface.c
+diff --cc include/net/mac80211.h
+index f9b01c0dbd18,c21a0e27b35e..000000000000
+--- a/include/net/mac80211.h
++++ b/include/net/mac80211.h
+@@@ -2389,6 -2396,15 +2389,18 @@@ struct ieee80211_txq 
+   * @IEEE80211_HW_SUPPORTS_TX_ENCAP_OFFLOAD: Hardware supports tx encapsulation
+   *	offload
+   *
+++<<<<<<< HEAD
+++=======
++  * @IEEE80211_HW_SUPPORTS_RX_DECAP_OFFLOAD: Hardware supports rx decapsulation
++  *	offload
++  *
++  * @IEEE80211_HW_SUPPORTS_CONC_MON_RX_DECAP: Hardware supports concurrent rx
++  *	decapsulation offload and passing raw 802.11 frames for monitor iface.
++  *	If this is supported, the driver must pass both 802.3 frames for real
++  *	usage and 802.11 frames with %RX_FLAG_ONLY_MONITOR set for monitor to
++  *	the stack.
++  *
+++>>>>>>> 55f8205e7ddd (mac80211: Allow concurrent monitor iface and ethernet rx decap)
+   * @NUM_IEEE80211_HW_FLAGS: number of hardware flags, used for sizing arrays
+   */
+  enum ieee80211_hw_flags {
+@@@ -2442,6 -2458,8 +2454,11 @@@
+  	IEEE80211_HW_SUPPORTS_ONLY_HE_MULTI_BSSID,
+  	IEEE80211_HW_AMPDU_KEYBORDER_SUPPORT,
+  	IEEE80211_HW_SUPPORTS_TX_ENCAP_OFFLOAD,
+++<<<<<<< HEAD
+++=======
++ 	IEEE80211_HW_SUPPORTS_RX_DECAP_OFFLOAD,
++ 	IEEE80211_HW_SUPPORTS_CONC_MON_RX_DECAP,
+++>>>>>>> 55f8205e7ddd (mac80211: Allow concurrent monitor iface and ethernet rx decap)
+  
+  	/* keep last, obviously */
+  	NUM_IEEE80211_HW_FLAGS
+diff --cc net/mac80211/debugfs.c
+index 3ac226db12f9,9245c0421bda..000000000000
+--- a/net/mac80211/debugfs.c
++++ b/net/mac80211/debugfs.c
+@@@ -455,6 -455,8 +455,11 @@@ static const char *hw_flag_names[] = 
+  	FLAG(SUPPORTS_ONLY_HE_MULTI_BSSID),
+  	FLAG(AMPDU_KEYBORDER_SUPPORT),
+  	FLAG(SUPPORTS_TX_ENCAP_OFFLOAD),
+++<<<<<<< HEAD
+++=======
++ 	FLAG(SUPPORTS_RX_DECAP_OFFLOAD),
++ 	FLAG(SUPPORTS_CONC_MON_RX_DECAP),
+++>>>>>>> 55f8205e7ddd (mac80211: Allow concurrent monitor iface and ethernet rx decap)
+  #undef FLAG
+  };
+  
+diff --cc net/mac80211/iface.c
+index eb59e2ecf674,b1c170939e44..000000000000
+--- a/net/mac80211/iface.c
++++ b/net/mac80211/iface.c
+@@@ -349,184 -344,305 +349,198 @@@ static int ieee80211_check_queues(struc
+  	return 0;
+  }
+  
+ -static int ieee80211_open(struct net_device *dev)
+ +static bool ieee80211_iftype_supports_encap_offload(enum nl80211_iftype iftype)
+  {
+ -	struct ieee80211_sub_if_data *sdata = IEEE80211_DEV_TO_SUB_IF(dev);
+ -	int err;
+ -
+ -	/* fail early if user set an invalid address */
+ -	if (!is_valid_ether_addr(dev->dev_addr))
+ -		return -EADDRNOTAVAIL;
+ -
+ -	err = ieee80211_check_concurrent_iface(sdata, sdata->vif.type);
+ -	if (err)
+ -		return err;
+ -
+ -	wiphy_lock(sdata->local->hw.wiphy);
+ -	err = ieee80211_do_open(&sdata->wdev, true);
+ -	wiphy_unlock(sdata->local->hw.wiphy);
+ -
+ -	return err;
+ +	switch (iftype) {
+ +	/* P2P GO and client are mapped to AP/STATION types */
+ +	case NL80211_IFTYPE_AP:
+ +	case NL80211_IFTYPE_STATION:
+ +		return true;
+ +	default:
+ +		return false;
+ +	}
+  }
+  
+ -static void ieee80211_do_stop(struct ieee80211_sub_if_data *sdata, bool going_down)
+ +static bool ieee80211_set_sdata_offload_flags(struct ieee80211_sub_if_data *sdata)
+  {
+  	struct ieee80211_local *local = sdata->local;
+ -	unsigned long flags;
+ -	struct sk_buff *skb, *tmp;
+ -	u32 hw_reconf_flags = 0;
+ -	int i, flushed;
+ -	struct ps_data *ps;
+ -	struct cfg80211_chan_def chandef;
+ -	bool cancel_scan;
+ -	struct cfg80211_nan_func *func;
+ +	u32 flags;
+  
+ -	clear_bit(SDATA_STATE_RUNNING, &sdata->state);
+ +	flags = sdata->vif.offload_flags;
+  
+ -	cancel_scan = rcu_access_pointer(local->scan_sdata) == sdata;
+ -	if (cancel_scan)
+ -		ieee80211_scan_cancel(local);
+ +	if (ieee80211_hw_check(&local->hw, SUPPORTS_TX_ENCAP_OFFLOAD) &&
+ +	    ieee80211_iftype_supports_encap_offload(sdata->vif.type)) {
+ +		flags |= IEEE80211_OFFLOAD_ENCAP_ENABLED;
+  
+ -	/*
+ -	 * Stop TX on this interface first.
+ -	 */
+ -	if (sdata->dev)
+ -		netif_tx_stop_all_queues(sdata->dev);
+ +		if (!ieee80211_hw_check(&local->hw, SUPPORTS_TX_FRAG) &&
+ +		    local->hw.wiphy->frag_threshold != (u32)-1)
+ +			flags &= ~IEEE80211_OFFLOAD_ENCAP_ENABLED;
+  
+ -	ieee80211_roc_purge(local, sdata);
+ +		if (local->monitors)
+ +			flags &= ~IEEE80211_OFFLOAD_ENCAP_ENABLED;
+ +	} else {
+ +		flags &= ~IEEE80211_OFFLOAD_ENCAP_ENABLED;
+ +	}
+  
+ -	switch (sdata->vif.type) {
+ -	case NL80211_IFTYPE_STATION:
+ -		ieee80211_mgd_stop(sdata);
+ -		break;
+ -	case NL80211_IFTYPE_ADHOC:
+ -		ieee80211_ibss_stop(sdata);
+ -		break;
+ -	case NL80211_IFTYPE_MONITOR:
+ -		if (sdata->u.mntr.flags & MONITOR_FLAG_COOK_FRAMES)
+ -			break;
+ -		list_del_rcu(&sdata->u.mntr.list);
+ -		break;
+ -	default:
+ -		break;
+++<<<<<<< HEAD
+++=======
+++	if (ieee80211_hw_check(&local->hw, SUPPORTS_RX_DECAP_OFFLOAD) &&
+++	    ieee80211_iftype_supports_hdr_offload(sdata->vif.type)) {
+++		flags |= IEEE80211_OFFLOAD_DECAP_ENABLED;
+++
+++		if (local->monitors &&
+++		    !ieee80211_hw_check(&local->hw, SUPPORTS_CONC_MON_RX_DECAP))
+++			flags &= ~IEEE80211_OFFLOAD_DECAP_ENABLED;
+++	} else {
+++		flags &= ~IEEE80211_OFFLOAD_DECAP_ENABLED;
++ 	}
++ 
+ -	/*
+ -	 * Remove all stations associated with this interface.
+ -	 *
+ -	 * This must be done before calling ops->remove_interface()
+ -	 * because otherwise we can later invoke ops->sta_notify()
+ -	 * whenever the STAs are removed, and that invalidates driver
+ -	 * assumptions about always getting a vif pointer that is valid
+ -	 * (because if we remove a STA after ops->remove_interface()
+ -	 * the driver will have removed the vif info already!)
+ -	 *
+ -	 * For AP_VLANs stations may exist since there's nothing else that
+ -	 * would have removed them, but in other modes there shouldn't
+ -	 * be any stations.
+ -	 */
+ -	flushed = sta_info_flush(sdata);
+ -	WARN_ON_ONCE(sdata->vif.type != NL80211_IFTYPE_AP_VLAN && flushed > 0);
+++>>>>>>> 55f8205e7ddd (mac80211: Allow concurrent monitor iface and ethernet rx decap)
+ +	if (sdata->vif.offload_flags == flags)
+ +		return false;
+  
+ -	/* don't count this interface for allmulti while it is down */
+ -	if (sdata->flags & IEEE80211_SDATA_ALLMULTI)
+ -		atomic_dec(&local->iff_allmultis);
+ +	sdata->vif.offload_flags = flags;
+ +	return true;
+ +}
+  
+ -	if (sdata->vif.type == NL80211_IFTYPE_AP) {
+ -		local->fif_pspoll--;
+ -		local->fif_probe_req--;
+ -	} else if (sdata->vif.type == NL80211_IFTYPE_ADHOC) {
+ -		local->fif_probe_req--;
+ -	}
+  
+ -	if (sdata->dev) {
+ -		netif_addr_lock_bh(sdata->dev);
+ -		spin_lock_bh(&local->filter_lock);
+ -		__hw_addr_unsync(&local->mc_list, &sdata->dev->mc,
+ -				 sdata->dev->addr_len);
+ -		spin_unlock_bh(&local->filter_lock);
+ -		netif_addr_unlock_bh(sdata->dev);
+ +static void ieee80211_recalc_sdata_offload(struct ieee80211_sub_if_data *sdata)
+ +{
+ +	struct ieee80211_local *local = sdata->local;
+ +	struct ieee80211_sub_if_data *vsdata;
+ +
+ +	if (ieee80211_set_sdata_offload_flags(sdata)) {
+ +		drv_update_vif_offload(local, sdata);
+ +		ieee80211_set_vif_encap_ops(sdata);
+  	}
+  
+ -	del_timer_sync(&local->dynamic_ps_timer);
+ -	cancel_work_sync(&local->dynamic_ps_enable_work);
+ +	list_for_each_entry(vsdata, &local->interfaces, list) {
+ +		if (vsdata->vif.type != NL80211_IFTYPE_AP_VLAN ||
+ +		    vsdata->bss != &sdata->u.ap)
+ +			continue;
+  
+ -	cancel_work_sync(&sdata->recalc_smps);
+ -	sdata_lock(sdata);
+ -	mutex_lock(&local->mtx);
+ -	sdata->vif.csa_active = false;
+ -	if (sdata->vif.type == NL80211_IFTYPE_STATION)
+ -		sdata->u.mgd.csa_waiting_bcn = false;
+ -	if (sdata->csa_block_tx) {
+ -		ieee80211_wake_vif_queues(local, sdata,
+ -					  IEEE80211_QUEUE_STOP_REASON_CSA);
+ -		sdata->csa_block_tx = false;
+ +		ieee80211_set_vif_encap_ops(vsdata);
+  	}
+ -	mutex_unlock(&local->mtx);
+ -	sdata_unlock(sdata);
+ -
+ -	cancel_work_sync(&sdata->csa_finalize_work);
+ +}
+  
+ -	cancel_delayed_work_sync(&sdata->dfs_cac_timer_work);
+ +void ieee80211_recalc_offload(struct ieee80211_local *local)
+ +{
+ +	struct ieee80211_sub_if_data *sdata;
+  
+ -	if (sdata->wdev.cac_started) {
+ -		chandef = sdata->vif.bss_conf.chandef;
+ -		WARN_ON(local->suspended);
+ -		mutex_lock(&local->mtx);
+ -		ieee80211_vif_release_channel(sdata);
+ -		mutex_unlock(&local->mtx);
+ -		cfg80211_cac_event(sdata->dev, &chandef,
+ -				   NL80211_RADAR_CAC_ABORTED,
+ -				   GFP_KERNEL);
+ -	}
+ +	if (!ieee80211_hw_check(&local->hw, SUPPORTS_TX_ENCAP_OFFLOAD))
+ +		return;
+  
+ -	/* APs need special treatment */
+ -	if (sdata->vif.type == NL80211_IFTYPE_AP) {
+ -		struct ieee80211_sub_if_data *vlan, *tmpsdata;
+ +	mutex_lock(&local->iflist_mtx);
+  
+ -		/* down all dependent devices, that is VLANs */
+ -		list_for_each_entry_safe(vlan, tmpsdata, &sdata->u.ap.vlans,
+ -					 u.vlan.list)
+ -			dev_close(vlan->dev);
+ -		WARN_ON(!list_empty(&sdata->u.ap.vlans));
+ -	} else if (sdata->vif.type == NL80211_IFTYPE_AP_VLAN) {
+ -		/* remove all packets in parent bc_buf pointing to this dev */
+ -		ps = &sdata->bss->ps;
+ +	list_for_each_entry(sdata, &local->interfaces, list) {
+ +		if (!ieee80211_sdata_running(sdata))
+ +			continue;
+  
+ -		spin_lock_irqsave(&ps->bc_buf.lock, flags);
+ -		skb_queue_walk_safe(&ps->bc_buf, skb, tmp) {
+ -			if (skb->dev == sdata->dev) {
+ -				__skb_unlink(skb, &ps->bc_buf);
+ -				local->total_ps_buffered--;
+ -				ieee80211_free_txskb(&local->hw, skb);
+ -			}
+ -		}
+ -		spin_unlock_irqrestore(&ps->bc_buf.lock, flags);
+ +		ieee80211_recalc_sdata_offload(sdata);
+  	}
+  
+ -	if (going_down)
+ -		local->open_count--;
+ +	mutex_unlock(&local->iflist_mtx);
+ +}
+  
+ -	switch (sdata->vif.type) {
+ -	case NL80211_IFTYPE_AP_VLAN:
+ -		mutex_lock(&local->mtx);
+ -		list_del(&sdata->u.vlan.list);
+ -		mutex_unlock(&local->mtx);
+ -		RCU_INIT_POINTER(sdata->vif.chanctx_conf, NULL);
+ -		/* see comment in the default case below */
+ -		ieee80211_free_keys(sdata, true);
+ -		/* no need to tell driver */
+ -		break;
+ -	case NL80211_IFTYPE_MONITOR:
+ -		if (sdata->u.mntr.flags & MONITOR_FLAG_COOK_FRAMES) {
+ -			local->cooked_mntrs--;
+ -			break;
+ -		}
+ +void ieee80211_adjust_monitor_flags(struct ieee80211_sub_if_data *sdata,
+ +				    const int offset)
+ +{
+ +	struct ieee80211_local *local = sdata->local;
+ +	u32 flags = sdata->u.mntr.flags;
+  
+ -		local->monitors--;
+ -		if (local->monitors == 0) {
+ -			local->hw.conf.flags &= ~IEEE80211_CONF_MONITOR;
+ -			hw_reconf_flags |= IEEE80211_CONF_CHANGE_MONITOR;
+ -		}
+ +#define ADJUST(_f, _s)	do {					\
+ +	if (flags & MONITOR_FLAG_##_f)				\
+ +		local->fif_##_s += offset;			\
+ +	} while (0)
+  
+ -		ieee80211_adjust_monitor_flags(sdata, -1);
+ -		break;
+ -	case NL80211_IFTYPE_NAN:
+ -		/* clean all the functions */
+ -		spin_lock_bh(&sdata->u.nan.func_lock);
+ +	ADJUST(FCSFAIL, fcsfail);
+ +	ADJUST(PLCPFAIL, plcpfail);
+ +	ADJUST(CONTROL, control);
+ +	ADJUST(CONTROL, pspoll);
+ +	ADJUST(OTHER_BSS, other_bss);
+  
+ -		idr_for_each_entry(&sdata->u.nan.function_inst_ids, func, i) {
+ -			idr_remove(&sdata->u.nan.function_inst_ids, i);
+ -			cfg80211_free_nan_func(func);
+ -		}
+ -		idr_destroy(&sdata->u.nan.function_inst_ids);
+ +#undef ADJUST
+ +}
+  
+ -		spin_unlock_bh(&sdata->u.nan.func_lock);
+ -		break;
+ -	case NL80211_IFTYPE_P2P_DEVICE:
+ -		/* relies on synchronize_rcu() below */
+ -		RCU_INIT_POINTER(local->p2p_sdata, NULL);
+ -		fallthrough;
+ -	default:
+ -		cancel_work_sync(&sdata->work);
+ -		/*
+ -		 * When we get here, the interface is marked down.
+ -		 * Free the remaining keys, if there are any
+ -		 * (which can happen in AP mode if userspace sets
+ -		 * keys before the interface is operating)
+ -		 *
+ -		 * Force the key freeing to always synchronize_net()
+ -		 * to wait for the RX path in case it is using this
+ -		 * interface enqueuing frames at this very time on
+ -		 * another CPU.
+ -		 */
+ -		ieee80211_free_keys(sdata, true);
+ -		skb_queue_purge(&sdata->skb_queue);
+ -	}
+ +static void ieee80211_set_default_queues(struct ieee80211_sub_if_data *sdata)
+ +{
+ +	struct ieee80211_local *local = sdata->local;
+ +	int i;
+  
+ -	spin_lock_irqsave(&local->queue_stop_reason_lock, flags);
+ -	for (i = 0; i < IEEE80211_MAX_QUEUES; i++) {
+ -		skb_queue_walk_safe(&local->pending[i], skb, tmp) {
+ -			struct ieee80211_tx_info *info = IEEE80211_SKB_CB(skb);
+ -			if (info->control.vif == &sdata->vif) {
+ -				__skb_unlink(skb, &local->pending[i]);
+ -				ieee80211_free_txskb(&local->hw, skb);
+ -			}
+ -		}
+ +	for (i = 0; i < IEEE80211_NUM_ACS; i++) {
+ +		if (ieee80211_hw_check(&local->hw, QUEUE_CONTROL))
+ +			sdata->vif.hw_queue[i] = IEEE80211_INVAL_HW_QUEUE;
+ +		else if (local->hw.queues >= IEEE80211_NUM_ACS)
+ +			sdata->vif.hw_queue[i] = i;
+ +		else
+ +			sdata->vif.hw_queue[i] = 0;
+  	}
+ -	spin_unlock_irqrestore(&local->queue_stop_reason_lock, flags);
+ +	sdata->vif.cab_queue = IEEE80211_INVAL_HW_QUEUE;
+ +}
+  
+ -	if (sdata->vif.type == NL80211_IFTYPE_AP_VLAN)
+ -		ieee80211_txq_remove_vlan(local, sdata);
+ +int ieee80211_add_virtual_monitor(struct ieee80211_local *local)
+ +{
+ +	struct ieee80211_sub_if_data *sdata;
+ +	int ret;
+  
+ -	sdata->bss = NULL;
+ +	if (!ieee80211_hw_check(&local->hw, WANT_MONITOR_VIF))
+ +		return 0;
+  
+ -	if (local->open_count == 0)
+ -		ieee80211_clear_tx_pending(local);
+ +	ASSERT_RTNL();
+  
+ -	sdata->vif.bss_conf.beacon_int = 0;
+ +	if (local->monitor_sdata)
+ +		return 0;
+  
+ -	/*
+ -	 * If the interface goes down while suspended, presumably because
+ -	 * the device was unplugged and that happens before our resume,
+ -	 * then the driver is already unconfigured and the remainder of
+ -	 * this function isn't needed.
+ -	 * XXX: what about WoWLAN? If the device has software state, e.g.
+ -	 *	memory allocated, it might expect teardown commands from
+ -	 *	mac80211 here?
+ -	 */
+ -	if (local->suspended) {
+ -		WARN_ON(local->wowlan);
+ -		WARN_ON(rtnl_dereference(local->monitor_sdata));
+ -		return;
+ -	}
+ +	sdata = kzalloc(sizeof(*sdata) + local->hw.vif_data_size, GFP_KERNEL);
+ +	if (!sdata)
+ +		return -ENOMEM;
+  
+ -	switch (sdata->vif.type) {
+ -	case NL80211_IFTYPE_AP_VLAN:
+ -		break;
+ -	case NL80211_IFTYPE_MONITOR:
+ -		if (local->monitors == 0)
+ -			ieee80211_del_virtual_monitor(local);
+ +	/* set up data */
+ +	sdata->local = local;
+ +	sdata->vif.type = NL80211_IFTYPE_MONITOR;
+ +	snprintf(sdata->name, IFNAMSIZ, "%s-monitor",
+ +		 wiphy_name(local->hw.wiphy));
+ +	sdata->wdev.iftype = NL80211_IFTYPE_MONITOR;
+  
+ -		mutex_lock(&local->mtx);
+ -		ieee80211_recalc_idle(local);
+ -		mutex_unlock(&local->mtx);
+ +	sdata->encrypt_headroom = IEEE80211_ENCRYPT_HEADROOM;
+  
+ -		if (!(sdata->u.mntr.flags & MONITOR_FLAG_ACTIVE))
+ -			break;
+ +	ieee80211_set_default_queues(sdata);
+  
+ -		fallthrough;
+ -	default:
+ -		if (going_down)
+ -			drv_remove_interface(local, sdata);
+ +	ret = drv_add_interface(local, sdata);
+ +	if (WARN_ON(ret)) {
+ +		/* ok .. stupid driver, it asked for this! */
+ +		kfree(sdata);
+ +		return ret;
+  	}
+  
+ -	ieee80211_recalc_ps(local);
+ -
+ -	if (cancel_scan)
+ -		flush_delayed_work(&local->scan_work);
+ -
+ -	if (local->open_count == 0) {
+ -		ieee80211_stop_device(local);
+ +	set_bit(SDATA_STATE_RUNNING, &sdata->state);
+  
+ -		/* no reconfiguring after stop! */
+ -		return;
+ +	ret = ieee80211_check_queues(sdata, NL80211_IFTYPE_MONITOR);
+ +	if (ret) {
+ +		kfree(sdata);
+ +		return ret;
+  	}
+  
+ -	/* do after stop to avoid reconfiguring when we stop anyway */
+ -	ieee80211_configure_filter(local);
+ -	ieee80211_hw_config(local, hw_reconf_flags);
+ -
+ -	if (local->monitors == local->open_count)
+ -		ieee80211_add_virtual_monitor(local);
+ -}
+ +	mutex_lock(&local->iflist_mtx);
+ +	rcu_assign_pointer(local->monitor_sdata, sdata);
+ +	mutex_unlock(&local->iflist_mtx);
+  
+ -static int ieee80211_stop(struct net_device *dev)
+ -{
+ -	struct ieee80211_sub_if_data *sdata = IEEE80211_DEV_TO_SUB_IF(dev);
+ +	mutex_lock(&local->mtx);
+ +	ret = ieee80211_vif_use_channel(sdata, &local->monitor_chandef,
+ +					IEEE80211_CHANCTX_EXCLUSIVE);
+ +	mutex_unlock(&local->mtx);
+ +	if (ret) {
+ +		mutex_lock(&local->iflist_mtx);
+ +		RCU_INIT_POINTER(local->monitor_sdata, NULL);
+ +		mutex_unlock(&local->iflist_mtx);
+ +		synchronize_net();
+ +		drv_remove_interface(local, sdata);
+ +		kfree(sdata);
+ +		return ret;
+ +	}
+  
+ -	wiphy_lock(sdata->local->hw.wiphy);
+ -	ieee80211_do_stop(sdata, true);
+ -	wiphy_unlock(sdata->local->hw.wiphy);
+ +	skb_queue_head_init(&sdata->skb_queue);
+ +	INIT_WORK(&sdata->work, ieee80211_iface_work);
+  
+  	return 0;
+  }
+* Unmerged path include/net/mac80211.h
+* Unmerged path net/mac80211/debugfs.c
+* Unmerged path net/mac80211/iface.c
