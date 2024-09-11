@@ -1,0 +1,107 @@
+nfp: flower: allow matching on ipv4 UDP tunnel tos and ttl
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-147.el8
+commit-author John Hurley <john.hurley@netronome.com>
+commit d7ff7ec573860dc654fa4c8641684ba3db03004e
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-147.el8/d7ff7ec5.failed
+
+The addition of FLOW_DISSECTOR_KEY_ENC_IP to TC flower means that the ToS
+and TTL of the tunnel header can now be matched on.
+
+Extend the NFP tunnel match function to include these new fields.
+
+	Signed-off-by: John Hurley <john.hurley@netronome.com>
+	Reviewed-by: Jakub Kicinski <jakub.kicinski@netronome.com>
+	Signed-off-by: Simon Horman <simon.horman@netronome.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit d7ff7ec573860dc654fa4c8641684ba3db03004e)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/netronome/nfp/flower/offload.c
+diff --cc drivers/net/ethernet/netronome/nfp/flower/offload.c
+index 2106c1e4333e,d2230a0e49b9..000000000000
+--- a/drivers/net/ethernet/netronome/nfp/flower/offload.c
++++ b/drivers/net/ethernet/netronome/nfp/flower/offload.c
+@@@ -66,7 -66,7 +66,11 @@@
+  	 BIT(FLOW_DISSECTOR_KEY_ENC_IPV6_ADDRS) | \
+  	 BIT(FLOW_DISSECTOR_KEY_ENC_CONTROL) | \
+  	 BIT(FLOW_DISSECTOR_KEY_ENC_PORTS) | \
+++<<<<<<< HEAD
+ +	 BIT(FLOW_DISSECTOR_KEY_ENC_OPTS) | \
+++=======
++ 	 BIT(FLOW_DISSECTOR_KEY_ENC_IP) | \
+++>>>>>>> d7ff7ec57386 (nfp: flower: allow matching on ipv4 UDP tunnel tos and ttl)
+  	 BIT(FLOW_DISSECTOR_KEY_MPLS) | \
+  	 BIT(FLOW_DISSECTOR_KEY_IP))
+  
+@@@ -75,8 -75,8 +79,13 @@@
+  	 BIT(FLOW_DISSECTOR_KEY_ENC_KEYID) | \
+  	 BIT(FLOW_DISSECTOR_KEY_ENC_IPV4_ADDRS) | \
+  	 BIT(FLOW_DISSECTOR_KEY_ENC_IPV6_ADDRS) | \
+++<<<<<<< HEAD
+ +	 BIT(FLOW_DISSECTOR_KEY_ENC_OPTS) | \
+ +	 BIT(FLOW_DISSECTOR_KEY_ENC_PORTS))
+++=======
++ 	 BIT(FLOW_DISSECTOR_KEY_ENC_PORTS) | \
++ 	 BIT(FLOW_DISSECTOR_KEY_ENC_IP))
+++>>>>>>> d7ff7ec57386 (nfp: flower: allow matching on ipv4 UDP tunnel tos and ttl)
+  
+  #define NFP_FLOWER_WHITELIST_TUN_DISSECTOR_R \
+  	(BIT(FLOW_DISSECTOR_KEY_ENC_CONTROL) | \
+diff --git a/drivers/net/ethernet/netronome/nfp/flower/cmsg.h b/drivers/net/ethernet/netronome/nfp/flower/cmsg.h
+index 18aa1a7bdeb0..a28f003098bd 100644
+--- a/drivers/net/ethernet/netronome/nfp/flower/cmsg.h
++++ b/drivers/net/ethernet/netronome/nfp/flower/cmsg.h
+@@ -390,7 +390,7 @@ struct nfp_flower_ipv6 {
+  * +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+  * |                         ipv4_addr_dst                         |
+  * +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+- * |                            Reserved                           |
++ * |           Reserved            |      tos      |      ttl      |
+  * +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+  * |                            Reserved                           |
+  * +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+@@ -400,7 +400,10 @@ struct nfp_flower_ipv6 {
+ struct nfp_flower_ipv4_udp_tun {
+ 	__be32 ip_src;
+ 	__be32 ip_dst;
+-	__be32 reserved[2];
++	__be16 reserved1;
++	u8 tos;
++	u8 ttl;
++	__be32 reserved2;
+ 	__be32 tun_id;
+ };
+ 
+diff --git a/drivers/net/ethernet/netronome/nfp/flower/match.c b/drivers/net/ethernet/netronome/nfp/flower/match.c
+index 44475d68c1a8..17acb8cc6044 100644
+--- a/drivers/net/ethernet/netronome/nfp/flower/match.c
++++ b/drivers/net/ethernet/netronome/nfp/flower/match.c
+@@ -285,6 +285,7 @@ nfp_flower_compile_ipv4_udp_tun(struct nfp_flower_ipv4_udp_tun *frame,
+ 	struct fl_flow_key *target = mask_version ? flow->mask : flow->key;
+ 	struct flow_dissector_key_ipv4_addrs *tun_ips;
+ 	struct flow_dissector_key_keyid *vni;
++	struct flow_dissector_key_ip *ip;
+ 
+ 	memset(frame, 0, sizeof(struct nfp_flower_ipv4_udp_tun));
+ 
+@@ -308,6 +309,14 @@ nfp_flower_compile_ipv4_udp_tun(struct nfp_flower_ipv4_udp_tun *frame,
+ 		frame->ip_src = tun_ips->src;
+ 		frame->ip_dst = tun_ips->dst;
+ 	}
++
++	if (dissector_uses_key(flow->dissector, FLOW_DISSECTOR_KEY_ENC_IP)) {
++		ip = skb_flow_dissector_target(flow->dissector,
++					       FLOW_DISSECTOR_KEY_ENC_IP,
++					       target);
++		frame->tos = ip->tos;
++		frame->ttl = ip->ttl;
++	}
+ }
+ 
+ int nfp_flower_compile_flow_match(struct tc_cls_flower_offload *flow,
+* Unmerged path drivers/net/ethernet/netronome/nfp/flower/offload.c
