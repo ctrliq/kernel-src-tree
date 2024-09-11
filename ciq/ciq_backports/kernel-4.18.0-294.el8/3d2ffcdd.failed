@@ -1,0 +1,293 @@
+powerpc/watchpoint: Workaround P10 DD1 issue with VSX-32 byte instructions
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Ravi Bangoria <ravi.bangoria@linux.ibm.com>
+commit 3d2ffcdd2a982e8bbe65fa0f94fb21bf304c281e
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/3d2ffcdd.failed
+
+POWER10 DD1 has an issue where it generates watchpoint exceptions when
+it shouldn't. The conditions where this occur are:
+
+ - octword op
+ - ending address of DAWR range is less than starting address of op
+ - those addresses need to be in the same or in two consecutive 512B
+   blocks
+ - 'op address + 64B' generates an address that has a carry into bit
+   52 (crosses 2K boundary)
+
+Handle such spurious exception by considering them as extraneous and
+emulating/single-steeping instruction without generating an event.
+
+[ravi: Fixed build warning reported by lkp@intel.com]
+	Signed-off-by: Ravi Bangoria <ravi.bangoria@linux.ibm.com>
+	Signed-off-by: Michael Ellerman <mpe@ellerman.id.au>
+Link: https://lore.kernel.org/r/20201106045650.278987-1-ravi.bangoria@linux.ibm.com
+(cherry picked from commit 3d2ffcdd2a982e8bbe65fa0f94fb21bf304c281e)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/powerpc/kernel/hw_breakpoint.c
+diff --cc arch/powerpc/kernel/hw_breakpoint.c
+index 90c5c77a5704,8fc7a14e4d71..000000000000
+--- a/arch/powerpc/kernel/hw_breakpoint.c
++++ b/arch/powerpc/kernel/hw_breakpoint.c
+@@@ -421,58 -477,57 +421,63 @@@ int hw_breakpoint_arch_parse(struct per
+  void thread_change_pc(struct task_struct *tsk, struct pt_regs *regs)
+  {
+  	struct arch_hw_breakpoint *info;
+ -	int i;
+  
+ -	for (i = 0; i < nr_wp_slots(); i++) {
+ -		if (unlikely(tsk->thread.last_hit_ubp[i]))
+ -			goto reset;
+ -	}
+ -	return;
+ +	if (likely(!tsk->thread.last_hit_ubp))
+ +		return;
+  
+ -reset:
+ +	info = counter_arch_bp(tsk->thread.last_hit_ubp);
+  	regs->msr &= ~MSR_SE;
+ -	for (i = 0; i < nr_wp_slots(); i++) {
+ -		info = counter_arch_bp(__this_cpu_read(bp_per_reg[i]));
+ -		__set_breakpoint(i, info);
+ -		tsk->thread.last_hit_ubp[i] = NULL;
+ -	}
+ +	__set_breakpoint(info);
+ +	tsk->thread.last_hit_ubp = NULL;
+  }
+  
+ -static bool is_larx_stcx_instr(int type)
+ +static bool dar_within_range(unsigned long dar, struct arch_hw_breakpoint *info)
+  {
+ -	return type == LARX || type == STCX;
+ +	return ((info->address <= dar) && (dar - info->address < info->len));
+ +}
+ +
+ +static bool
+ +dar_range_overlaps(unsigned long dar, int size, struct arch_hw_breakpoint *info)
+ +{
+ +	return ((dar <= info->address + info->len - 1) &&
+ +		(dar + size - 1 >= info->address));
+  }
+  
++ static bool is_octword_vsx_instr(int type, int size)
++ {
++ 	return ((type == LOAD_VSX || type == STORE_VSX) && size == 32);
++ }
++ 
+  /*
+ - * We've failed in reliably handling the hw-breakpoint. Unregister
+ - * it and throw a warning message to let the user know about it.
+ + * Handle debug exception notifications.
+   */
+ -static void handler_error(struct perf_event *bp, struct arch_hw_breakpoint *info)
+ +static bool stepping_handler(struct pt_regs *regs, struct perf_event *bp,
+ +			     struct arch_hw_breakpoint *info)
+  {
+ -	WARN(1, "Unable to handle hardware breakpoint. Breakpoint at 0x%lx will be disabled.",
+ -	     info->address);
+ -	perf_event_disable_inatomic(bp);
+ -}
+ +	unsigned int instr = 0;
+ +	int ret, type, size;
+ +	struct instruction_op op;
+ +	unsigned long addr = info->address;
+  
+ -static void larx_stcx_err(struct perf_event *bp, struct arch_hw_breakpoint *info)
+ -{
+ -	printk_ratelimited("Breakpoint hit on instruction that can't be emulated. Breakpoint at 0x%lx will be disabled.\n",
+ -			   info->address);
+ -	perf_event_disable_inatomic(bp);
+ -}
+ +	if (__get_user_inatomic(instr, (unsigned int *)regs->nip))
+ +		goto fail;
+  
+ -static bool stepping_handler(struct pt_regs *regs, struct perf_event **bp,
+ -			     struct arch_hw_breakpoint **info, int *hit,
+ -			     struct ppc_inst instr)
+ -{
+ -	int i;
+ -	int stepped;
+ +	ret = analyse_instr(&op, regs, instr);
+ +	type = GETTYPE(op.type);
+ +	size = GETSIZE(op.type);
+ +
+ +	if (!ret && (type == LARX || type == STCX)) {
+ +		printk_ratelimited("Breakpoint hit on instruction that can't be emulated."
+ +				   " Breakpoint at 0x%lx will be disabled.\n", addr);
+ +		goto disable;
+ +	}
+ +
+ +	/*
+ +	 * If it's extraneous event, we still need to emulate/single-
+ +	 * step the instruction, but we don't generate an event.
+ +	 */
+ +	if (size && !dar_range_overlaps(regs->dar, size, info))
+ +		info->type |= HW_BRK_TYPE_EXTRANEOUS_IRQ;
+  
+  	/* Do not emulate user-space instructions, instead single-step them */
+  	if (user_mode(regs)) {
+@@@ -481,30 -541,86 +486,82 @@@
+  		return false;
+  	}
+  
+ -	stepped = emulate_step(regs, instr);
+ -	if (!stepped) {
+ -		for (i = 0; i < nr_wp_slots(); i++) {
+ -			if (!hit[i])
+ -				continue;
+ -			handler_error(bp[i], info[i]);
+ -			info[i] = NULL;
+ -		}
+ -		return false;
+ -	}
+ +	if (!emulate_step(regs, instr))
+ +		goto fail;
+ +
+  	return true;
+ +
+ +fail:
+ +	/*
+ +	 * We've failed in reliably handling the hw-breakpoint. Unregister
+ +	 * it and throw a warning message to let the user know about it.
+ +	 */
+ +	WARN(1, "Unable to handle hardware breakpoint. Breakpoint at "
+ +		"0x%lx will be disabled.", addr);
+ +
+ +disable:
+ +	perf_event_disable_inatomic(bp);
+ +	return false;
+  }
+  
++ static void handle_p10dd1_spurious_exception(struct arch_hw_breakpoint **info,
++ 					     int *hit, unsigned long ea)
++ {
++ 	int i;
++ 	unsigned long hw_end_addr;
++ 
++ 	/*
++ 	 * Handle spurious exception only when any bp_per_reg is set.
++ 	 * Otherwise this might be created by xmon and not actually a
++ 	 * spurious exception.
++ 	 */
++ 	for (i = 0; i < nr_wp_slots(); i++) {
++ 		if (!info[i])
++ 			continue;
++ 
++ 		hw_end_addr = ALIGN(info[i]->address + info[i]->len, HW_BREAKPOINT_SIZE);
++ 
++ 		/*
++ 		 * Ending address of DAWR range is less than starting
++ 		 * address of op.
++ 		 */
++ 		if ((hw_end_addr - 1) >= ea)
++ 			continue;
++ 
++ 		/*
++ 		 * Those addresses need to be in the same or in two
++ 		 * consecutive 512B blocks;
++ 		 */
++ 		if (((hw_end_addr - 1) >> 10) != (ea >> 10))
++ 			continue;
++ 
++ 		/*
++ 		 * 'op address + 64B' generates an address that has a
++ 		 * carry into bit 52 (crosses 2K boundary).
++ 		 */
++ 		if ((ea & 0x800) == ((ea + 64) & 0x800))
++ 			continue;
++ 
++ 		break;
++ 	}
++ 
++ 	if (i == nr_wp_slots())
++ 		return;
++ 
++ 	for (i = 0; i < nr_wp_slots(); i++) {
++ 		if (info[i]) {
++ 			hit[i] = 1;
++ 			info[i]->type |= HW_BRK_TYPE_EXTRANEOUS_IRQ;
++ 		}
++ 	}
++ }
++ 
+  int hw_breakpoint_handler(struct die_args *args)
+  {
+ -	bool err = false;
+  	int rc = NOTIFY_STOP;
+ -	struct perf_event *bp[HBP_NUM_MAX] = { NULL };
+ +	struct perf_event *bp;
+  	struct pt_regs *regs = args->regs;
+ -	struct arch_hw_breakpoint *info[HBP_NUM_MAX] = { NULL };
+ -	int i;
+ -	int hit[HBP_NUM_MAX] = {0};
+ -	int nr_hit = 0;
+ -	bool ptrace_bp = false;
+ -	struct ppc_inst instr = ppc_inst(0);
+ -	int type = 0;
+ -	int size = 0;
+ -	unsigned long ea;
+ +	struct arch_hw_breakpoint *info;
+  
+  	/* Disable breakpoints during exception handling */
+  	hw_breakpoint_disable();
+@@@ -517,12 -633,46 +574,54 @@@
+  	 */
+  	rcu_read_lock();
+  
+++<<<<<<< HEAD
+ +	bp = __this_cpu_read(bp_per_reg);
+ +	if (!bp) {
+ +		rc = NOTIFY_DONE;
+ +		goto out;
+++=======
++ 	if (!IS_ENABLED(CONFIG_PPC_8xx))
++ 		wp_get_instr_detail(regs, &instr, &type, &size, &ea);
++ 
++ 	for (i = 0; i < nr_wp_slots(); i++) {
++ 		bp[i] = __this_cpu_read(bp_per_reg[i]);
++ 		if (!bp[i])
++ 			continue;
++ 
++ 		info[i] = counter_arch_bp(bp[i]);
++ 		info[i]->type &= ~HW_BRK_TYPE_EXTRANEOUS_IRQ;
++ 
++ 		if (wp_check_constraints(regs, instr, ea, type, size, info[i])) {
++ 			if (!IS_ENABLED(CONFIG_PPC_8xx) &&
++ 			    ppc_inst_equal(instr, ppc_inst(0))) {
++ 				handler_error(bp[i], info[i]);
++ 				info[i] = NULL;
++ 				err = 1;
++ 				continue;
++ 			}
++ 
++ 			if (is_ptrace_bp(bp[i]))
++ 				ptrace_bp = true;
++ 			hit[i] = 1;
++ 			nr_hit++;
++ 		}
++ 	}
++ 
++ 	if (err)
++ 		goto reset;
++ 
++ 	if (!nr_hit) {
++ 		/* Workaround for Power10 DD1 */
++ 		if (!IS_ENABLED(CONFIG_PPC_8xx) && mfspr(SPRN_PVR) == 0x800100 &&
++ 		    is_octword_vsx_instr(type, size)) {
++ 			handle_p10dd1_spurious_exception(info, hit, ea);
++ 		} else {
++ 			rc = NOTIFY_DONE;
++ 			goto out;
++ 		}
+++>>>>>>> 3d2ffcdd2a98 (powerpc/watchpoint: Workaround P10 DD1 issue with VSX-32 byte instructions)
+  	}
+ +	info = counter_arch_bp(bp);
+  
+  	/*
+  	 * Return early after invoking user-callback function without restoring
+* Unmerged path arch/powerpc/kernel/hw_breakpoint.c
