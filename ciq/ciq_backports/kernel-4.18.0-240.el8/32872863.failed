@@ -1,0 +1,142 @@
+scsi: core: avoid host-wide host_busy counter for scsi_mq
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Ming Lei <ming.lei@redhat.com>
+commit 328728630d9f2bf14b82ca30b5e47489beefe361
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/32872863.failed
+
+It isn't necessary to check the host depth in scsi_queue_rq() any more
+since it has been respected by blk-mq before calling scsi_queue_rq() via
+getting driver tag.
+
+Lots of LUNs may attach to same host and per-host IOPS may reach millions,
+so we should avoid expensive atomic operations on the host-wide counter in
+the IO path.
+
+This patch implements scsi_host_busy() via blk_mq_tagset_busy_iter() for
+reading the count of busy IOs for scsi_mq.
+
+It is observed that IOPS is increased by 15% in IO test on scsi_debug (32
+LUNs, 32 submit queues, 1024 can_queue, libaio/dio) in a dual-socket
+system.
+
+[mkp: clarified commit message]
+
+	Cc: Omar Sandoval <osandov@fb.com>,
+	Cc: "Martin K. Petersen" <martin.petersen@oracle.com>,
+	Cc: James Bottomley <james.bottomley@hansenpartnership.com>,
+	Cc: Christoph Hellwig <hch@lst.de>,
+	Cc: Don Brace <don.brace@microsemi.com>
+	Cc: Kashyap Desai <kashyap.desai@broadcom.com>
+	Cc: Mike Snitzer <snitzer@redhat.com>
+	Cc: Hannes Reinecke <hare@suse.de>
+	Cc: Laurence Oberman <loberman@redhat.com>
+	Cc: Bart Van Assche <bart.vanassche@wdc.com>
+	Signed-off-by: Ming Lei <ming.lei@redhat.com>
+	Reviewed-by: Bart Van Assche <bart.vanassche@wdc.com>
+	Signed-off-by: Martin K. Petersen <martin.petersen@oracle.com>
+(cherry picked from commit 328728630d9f2bf14b82ca30b5e47489beefe361)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/scsi/scsi_lib.c
+diff --cc drivers/scsi/scsi_lib.c
+index 37307e4f6ee0,600c78065d62..000000000000
+--- a/drivers/scsi/scsi_lib.c
++++ b/drivers/scsi/scsi_lib.c
+@@@ -1494,9 -1679,45 +1503,49 @@@ static bool scsi_mq_lld_busy(struct req
+  	 * in SCSI layer.
+  	 */
+  	if (scsi_host_in_recovery(shost) || scsi_device_is_busy(sdev))
+ -		return 1;
+ +		return true;
+  
+++<<<<<<< HEAD
+ +	return false;
+++=======
++ 	return 0;
++ }
++ 
++ /*
++  * Kill a request for a dead device
++  */
++ static void scsi_kill_request(struct request *req, struct request_queue *q)
++ {
++ 	struct scsi_cmnd *cmd = blk_mq_rq_to_pdu(req);
++ 	struct scsi_device *sdev;
++ 	struct scsi_target *starget;
++ 	struct Scsi_Host *shost;
++ 
++ 	blk_start_request(req);
++ 
++ 	scmd_printk(KERN_INFO, cmd, "killing request\n");
++ 
++ 	sdev = cmd->device;
++ 	starget = scsi_target(sdev);
++ 	shost = sdev->host;
++ 	scsi_init_cmd_errh(cmd);
++ 	cmd->result = DID_NO_CONNECT << 16;
++ 	atomic_inc(&cmd->device->iorequest_cnt);
++ 
++ 	/*
++ 	 * SCSI request completion path will do scsi_device_unbusy(),
++ 	 * bump busy counts.  To bump the counters, we need to dance
++ 	 * with the locks as normal issue path does.
++ 	 */
++ 	atomic_inc(&sdev->device_busy);
++ 
++ 	if (!shost->use_blk_mq)
++ 		atomic_inc(&shost->host_busy);
++ 	if (starget->can_queue > 0)
++ 		atomic_inc(&starget->target_busy);
++ 
++ 	blk_complete_request(req);
+++>>>>>>> 328728630d9f (scsi: core: avoid host-wide host_busy counter for scsi_mq)
+  }
+  
+  static void scsi_softirq_done(struct request *rq)
+diff --git a/drivers/scsi/hosts.c b/drivers/scsi/hosts.c
+index 785222e88c58..a2dae0adea28 100644
+--- a/drivers/scsi/hosts.c
++++ b/drivers/scsi/hosts.c
+@@ -547,13 +547,35 @@ struct Scsi_Host *scsi_host_get(struct Scsi_Host *shost)
+ }
+ EXPORT_SYMBOL(scsi_host_get);
+ 
++struct scsi_host_mq_in_flight {
++	int cnt;
++};
++
++static void scsi_host_check_in_flight(struct request *rq, void *data,
++		bool reserved)
++{
++	struct scsi_host_mq_in_flight *in_flight = data;
++
++	if (blk_mq_request_started(rq))
++		in_flight->cnt++;
++}
++
+ /**
+  * scsi_host_busy - Return the host busy counter
+  * @shost:	Pointer to Scsi_Host to inc.
+  **/
+ int scsi_host_busy(struct Scsi_Host *shost)
+ {
+-	return atomic_read(&shost->host_busy);
++	struct scsi_host_mq_in_flight in_flight = {
++		.cnt = 0,
++	};
++
++	if (!shost->use_blk_mq)
++		return atomic_read(&shost->host_busy);
++
++	blk_mq_tagset_busy_iter(&shost->tag_set, scsi_host_check_in_flight,
++			&in_flight);
++	return in_flight.cnt;
+ }
+ EXPORT_SYMBOL(scsi_host_busy);
+ 
+* Unmerged path drivers/scsi/scsi_lib.c
