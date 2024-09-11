@@ -1,0 +1,247 @@
+arm64: entry: convert el1_sync to C
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-394.el8
+commit-author Mark Rutland <mark.rutland@arm.com>
+commit ed3768db588291ddb5dc794daed12cc751373566
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-394.el8/ed3768db.failed
+
+This patch converts the EL1 sync entry assembly logic to C code.
+
+Doing this will allow us to make changes in a slightly more
+readable way. A case in point is supporting kernel-first RAS.
+do_sea() should be called on the CPU that took the fault.
+
+Largely the assembly code is converted to C in a relatively
+straightforward manner.
+
+Since all sync sites share a common asm entry point, the ASM_BUG()
+instances are no longer required for effective backtraces back to
+assembly, and we don't need similar BUG() entries.
+
+The ESR_ELx.EC codes for all (supported) debug exceptions are now
+checked in the el1_sync_handler's switch statement, which renders the
+check in el1_dbg redundant. This both simplifies the el1_dbg handler,
+and makes the EL1 exception handling more robust to
+currently-unallocated ESR_ELx.EC encodings.
+
+	Signed-off-by: Mark Rutland <mark.rutland@arm.com>
+[split out of a bigger series, added nokprobes, moved prototypes]
+	Signed-off-by: James Morse <james.morse@arm.com>
+	Reviewed-by: Mark Rutland <mark.rutland@arm.com>
+	Cc: Julien Thierry <julien.thierry.kdev@gmail.com>
+	Signed-off-by: Catalin Marinas <catalin.marinas@arm.com>
+(cherry picked from commit ed3768db588291ddb5dc794daed12cc751373566)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/arm64/kernel/entry.S
+diff --cc arch/arm64/kernel/entry.S
+index 72d2069e52b9,5d7f42eb0e89..000000000000
+--- a/arch/arm64/kernel/entry.S
++++ b/arch/arm64/kernel/entry.S
+@@@ -597,76 -578,9 +597,59 @@@ ENDPROC(el1_error_invalid
+  	.align	6
+  el1_sync:
+  	kernel_entry 1
+++<<<<<<< HEAD
+ +	mrs	x1, esr_el1			// read the syndrome register
+ +	lsr	x24, x1, #ESR_ELx_EC_SHIFT	// exception class
+ +	cmp	x24, #ESR_ELx_EC_DABT_CUR	// data abort in EL1
+ +	b.eq	el1_da
+ +	cmp	x24, #ESR_ELx_EC_IABT_CUR	// instruction abort in EL1
+ +	b.eq	el1_ia
+ +	cmp	x24, #ESR_ELx_EC_SYS64		// configurable trap
+ +	b.eq	el1_undef
+ +	cmp	x24, #ESR_ELx_EC_PC_ALIGN	// pc alignment exception
+ +	b.eq	el1_pc
+ +	cmp	x24, #ESR_ELx_EC_UNKNOWN	// unknown exception in EL1
+ +	b.eq	el1_undef
+ +	cmp	x24, #ESR_ELx_EC_BREAKPT_CUR	// debug exception in EL1
+ +	b.ge	el1_dbg
+ +	b	el1_inv
+ +
+ +el1_ia:
+ +	/*
+ +	 * Fall through to the Data abort case
+ +	 */
+ +el1_da:
+ +	/*
+ +	 * Data abort handling
+ +	 */
+ +	mrs	x3, far_el1
+ +	inherit_daif	pstate=x23, tmp=x2
+ +	untagged_addr	x0, x3
+ +	mov	x2, sp				// struct pt_regs
+ +	bl	do_mem_abort
+ +
+ +	kernel_exit 1
+ +el1_pc:
+ +	/*
+ +	 * PC alignment exception handling. We don't handle SP alignment faults,
+ +	 * since we will have hit a recursive exception when trying to push the
+ +	 * initial pt_regs.
+ +	 */
+ +	mrs	x0, far_el1
+ +	inherit_daif	pstate=x23, tmp=x2
+ +	mov	x2, sp
+ +	bl	do_sp_pc_abort
+ +	ASM_BUG()
+ +el1_undef:
+ +	/*
+ +	 * Undefined instruction
+ +	 */
+ +	inherit_daif	pstate=x23, tmp=x2
+++=======
+++>>>>>>> ed3768db5882 (arm64: entry: convert el1_sync to C)
+  	mov	x0, sp
+- 	bl	do_undefinstr
++ 	bl	el1_sync_handler
+  	kernel_exit 1
+- el1_dbg:
+- 	/*
+- 	 * Debug exception handling
+- 	 */
+- 	cmp	x24, #ESR_ELx_EC_BRK64		// if BRK64
+- 	cinc	x24, x24, eq			// set bit '0'
+- 	tbz	x24, #0, el1_inv		// EL1 only
+- 	gic_prio_kentry_setup tmp=x3
+- 	mrs	x0, far_el1
+- 	mov	x2, sp				// struct pt_regs
+- 	bl	do_debug_exception
+- 	kernel_exit 1
+- el1_inv:
+- 	// TODO: add support for undefined instructions in kernel mode
+- 	inherit_daif	pstate=x23, tmp=x2
+- 	mov	x0, sp
+- 	mov	x2, x1
+- 	mov	x1, #BAD_SYNC
+- 	bl	bad_mode
+- 	ASM_BUG()
+  ENDPROC(el1_sync)
+  
+  	.align	6
+diff --git a/arch/arm64/kernel/Makefile b/arch/arm64/kernel/Makefile
+index 725881e7691b..80518804403f 100644
+--- a/arch/arm64/kernel/Makefile
++++ b/arch/arm64/kernel/Makefile
+@@ -13,9 +13,9 @@ CFLAGS_REMOVE_return_address.o = -pg
+ 
+ # Object file lists.
+ obj-y			:= debug-monitors.o entry.o irq.o fpsimd.o		\
+-			   entry-fpsimd.o process.o ptrace.o setup.o signal.o	\
+-			   sys.o stacktrace.o time.o traps.o io.o vdso.o	\
+-			   hyp-stub.o psci.o cpu_ops.o insn.o	\
++			   entry-common.o entry-fpsimd.o process.o ptrace.o	\
++			   setup.o signal.o sys.o stacktrace.o time.o traps.o	\
++			   io.o vdso.o hyp-stub.o psci.o cpu_ops.o insn.o	\
+ 			   return_address.o cpuinfo.o cpu_errata.o		\
+ 			   cpufeature.o alternative.o cacheinfo.o		\
+ 			   smp.o smp_spin_table.o topology.o smccc-call.o	\
+diff --git a/arch/arm64/kernel/entry-common.c b/arch/arm64/kernel/entry-common.c
+new file mode 100644
+index 000000000000..e726d1f4b9e9
+--- /dev/null
++++ b/arch/arm64/kernel/entry-common.c
+@@ -0,0 +1,98 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * Exception handling code
++ *
++ * Copyright (C) 2019 ARM Ltd.
++ */
++
++#include <linux/context_tracking.h>
++#include <linux/ptrace.h>
++#include <linux/thread_info.h>
++
++#include <asm/cpufeature.h>
++#include <asm/daifflags.h>
++#include <asm/esr.h>
++#include <asm/exception.h>
++#include <asm/kprobes.h>
++#include <asm/sysreg.h>
++
++static void notrace el1_abort(struct pt_regs *regs, unsigned long esr)
++{
++	unsigned long far = read_sysreg(far_el1);
++
++	local_daif_inherit(regs);
++	far = untagged_addr(far);
++	do_mem_abort(far, esr, regs);
++}
++NOKPROBE_SYMBOL(el1_abort);
++
++static void notrace el1_pc(struct pt_regs *regs, unsigned long esr)
++{
++	unsigned long far = read_sysreg(far_el1);
++
++	local_daif_inherit(regs);
++	do_sp_pc_abort(far, esr, regs);
++}
++NOKPROBE_SYMBOL(el1_pc);
++
++static void el1_undef(struct pt_regs *regs)
++{
++	local_daif_inherit(regs);
++	do_undefinstr(regs);
++}
++NOKPROBE_SYMBOL(el1_undef);
++
++static void el1_inv(struct pt_regs *regs, unsigned long esr)
++{
++	local_daif_inherit(regs);
++	bad_mode(regs, 0, esr);
++}
++NOKPROBE_SYMBOL(el1_inv);
++
++static void notrace el1_dbg(struct pt_regs *regs, unsigned long esr)
++{
++	unsigned long far = read_sysreg(far_el1);
++
++	/*
++	 * The CPU masked interrupts, and we are leaving them masked during
++	 * do_debug_exception(). Update PMR as if we had called
++	 * local_mask_daif().
++	 */
++	if (system_uses_irq_prio_masking())
++		gic_write_pmr(GIC_PRIO_IRQON | GIC_PRIO_PSR_I_SET);
++
++	do_debug_exception(far, esr, regs);
++}
++NOKPROBE_SYMBOL(el1_dbg);
++
++asmlinkage void notrace el1_sync_handler(struct pt_regs *regs)
++{
++	unsigned long esr = read_sysreg(esr_el1);
++
++	switch (ESR_ELx_EC(esr)) {
++	case ESR_ELx_EC_DABT_CUR:
++	case ESR_ELx_EC_IABT_CUR:
++		el1_abort(regs, esr);
++		break;
++	/*
++	 * We don't handle ESR_ELx_EC_SP_ALIGN, since we will have hit a
++	 * recursive exception when trying to push the initial pt_regs.
++	 */
++	case ESR_ELx_EC_PC_ALIGN:
++		el1_pc(regs, esr);
++		break;
++	case ESR_ELx_EC_SYS64:
++	case ESR_ELx_EC_UNKNOWN:
++		el1_undef(regs);
++		break;
++	case ESR_ELx_EC_BREAKPT_CUR:
++	case ESR_ELx_EC_SOFTSTP_CUR:
++	case ESR_ELx_EC_WATCHPT_CUR:
++	case ESR_ELx_EC_BRK64:
++		el1_dbg(regs, esr);
++		break;
++	default:
++		el1_inv(regs, esr);
++	};
++}
++NOKPROBE_SYMBOL(el1_sync_handler);
+* Unmerged path arch/arm64/kernel/entry.S
