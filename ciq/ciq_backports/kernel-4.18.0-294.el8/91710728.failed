@@ -1,0 +1,222 @@
+locking: Introduce local_lock()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Thomas Gleixner <tglx@linutronix.de>
+commit 91710728d1725de51d06b40674abf6e860d592c7
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/91710728.failed
+
+preempt_disable() and local_irq_disable/save() are in principle per CPU big
+kernel locks. This has several downsides:
+
+  - The protection scope is unknown
+
+  - Violation of protection rules is hard to detect by instrumentation
+
+  - For PREEMPT_RT such sections, unless in low level critical code, can
+    violate the preemptability constraints.
+
+To address this PREEMPT_RT introduced the concept of local_locks which are
+strictly per CPU.
+
+The lock operations map to preempt_disable(), local_irq_disable/save() and
+the enabling counterparts on non RT enabled kernels.
+
+If lockdep is enabled local locks gain a lock map which tracks the usage
+context. This will catch cases where an area is protected by
+preempt_disable() but the access also happens from interrupt context. local
+locks have identified quite a few such issues over the years, the most
+recent example is:
+
+  b7d5dc21072cd ("random: add a spinlock_t to struct batched_entropy")
+
+Aside of the lockdep coverage this also improves code readability as it
+precisely annotates the protection scope.
+
+PREEMPT_RT substitutes these local locks with 'sleeping' spinlocks to
+protect such sections while maintaining preemtability and CPU locality.
+
+local locks can replace:
+
+  - preempt_enable()/disable() pairs
+  - local_irq_disable/enable() pairs
+  - local_irq_save/restore() pairs
+
+They are also used to replace code which implicitly disables preemption
+like:
+
+  - get_cpu()/put_cpu()
+  - get_cpu_var()/put_cpu_var()
+
+with PREEMPT_RT friendly constructs.
+
+	Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+	Signed-off-by: Sebastian Andrzej Siewior <bigeasy@linutronix.de>
+	Signed-off-by: Ingo Molnar <mingo@kernel.org>
+	Acked-by: Peter Zijlstra <peterz@infradead.org>
+Link: https://lore.kernel.org/r/20200527201119.1692513-2-bigeasy@linutronix.de
+(cherry picked from commit 91710728d1725de51d06b40674abf6e860d592c7)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	Documentation/locking/locktypes.rst
+* Unmerged path Documentation/locking/locktypes.rst
+* Unmerged path Documentation/locking/locktypes.rst
+diff --git a/include/linux/local_lock.h b/include/linux/local_lock.h
+new file mode 100644
+index 000000000000..e55010fa7329
+--- /dev/null
++++ b/include/linux/local_lock.h
+@@ -0,0 +1,54 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++#ifndef _LINUX_LOCAL_LOCK_H
++#define _LINUX_LOCAL_LOCK_H
++
++#include <linux/local_lock_internal.h>
++
++/**
++ * local_lock_init - Runtime initialize a lock instance
++ */
++#define local_lock_init(lock)		__local_lock_init(lock)
++
++/**
++ * local_lock - Acquire a per CPU local lock
++ * @lock:	The lock variable
++ */
++#define local_lock(lock)		__local_lock(lock)
++
++/**
++ * local_lock_irq - Acquire a per CPU local lock and disable interrupts
++ * @lock:	The lock variable
++ */
++#define local_lock_irq(lock)		__local_lock_irq(lock)
++
++/**
++ * local_lock_irqsave - Acquire a per CPU local lock, save and disable
++ *			 interrupts
++ * @lock:	The lock variable
++ * @flags:	Storage for interrupt flags
++ */
++#define local_lock_irqsave(lock, flags)				\
++	__local_lock_irqsave(lock, flags)
++
++/**
++ * local_unlock - Release a per CPU local lock
++ * @lock:	The lock variable
++ */
++#define local_unlock(lock)		__local_unlock(lock)
++
++/**
++ * local_unlock_irq - Release a per CPU local lock and enable interrupts
++ * @lock:	The lock variable
++ */
++#define local_unlock_irq(lock)		__local_unlock_irq(lock)
++
++/**
++ * local_unlock_irqrestore - Release a per CPU local lock and restore
++ *			      interrupt flags
++ * @lock:	The lock variable
++ * @flags:      Interrupt flags to restore
++ */
++#define local_unlock_irqrestore(lock, flags)			\
++	__local_unlock_irqrestore(lock, flags)
++
++#endif
+diff --git a/include/linux/local_lock_internal.h b/include/linux/local_lock_internal.h
+new file mode 100644
+index 000000000000..4a8795b21d77
+--- /dev/null
++++ b/include/linux/local_lock_internal.h
+@@ -0,0 +1,90 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++#ifndef _LINUX_LOCAL_LOCK_H
++# error "Do not include directly, include linux/local_lock.h"
++#endif
++
++#include <linux/percpu-defs.h>
++#include <linux/lockdep.h>
++
++typedef struct {
++#ifdef CONFIG_DEBUG_LOCK_ALLOC
++	struct lockdep_map	dep_map;
++	struct task_struct	*owner;
++#endif
++} local_lock_t;
++
++#ifdef CONFIG_DEBUG_LOCK_ALLOC
++# define LL_DEP_MAP_INIT(lockname)			\
++	.dep_map = {					\
++		.name = #lockname,			\
++		.wait_type_inner = LD_WAIT_CONFIG,	\
++	}
++#else
++# define LL_DEP_MAP_INIT(lockname)
++#endif
++
++#define INIT_LOCAL_LOCK(lockname)	{ LL_DEP_MAP_INIT(lockname) }
++
++#define __local_lock_init(lock)					\
++do {								\
++	static struct lock_class_key __key;			\
++								\
++	debug_check_no_locks_freed((void *)lock, sizeof(*lock));\
++	lockdep_init_map_wait(&(lock)->dep_map, #lock, &__key, 0, LD_WAIT_CONFIG);\
++} while (0)
++
++#ifdef CONFIG_DEBUG_LOCK_ALLOC
++static inline void local_lock_acquire(local_lock_t *l)
++{
++	lock_map_acquire(&l->dep_map);
++	DEBUG_LOCKS_WARN_ON(l->owner);
++	l->owner = current;
++}
++
++static inline void local_lock_release(local_lock_t *l)
++{
++	DEBUG_LOCKS_WARN_ON(l->owner != current);
++	l->owner = NULL;
++	lock_map_release(&l->dep_map);
++}
++
++#else /* CONFIG_DEBUG_LOCK_ALLOC */
++static inline void local_lock_acquire(local_lock_t *l) { }
++static inline void local_lock_release(local_lock_t *l) { }
++#endif /* !CONFIG_DEBUG_LOCK_ALLOC */
++
++#define __local_lock(lock)					\
++	do {							\
++		preempt_disable();				\
++		local_lock_acquire(this_cpu_ptr(lock));		\
++	} while (0)
++
++#define __local_lock_irq(lock)					\
++	do {							\
++		local_irq_disable();				\
++		local_lock_acquire(this_cpu_ptr(lock));		\
++	} while (0)
++
++#define __local_lock_irqsave(lock, flags)			\
++	do {							\
++		local_irq_save(flags);				\
++		local_lock_acquire(this_cpu_ptr(lock));		\
++	} while (0)
++
++#define __local_unlock(lock)					\
++	do {							\
++		local_lock_release(this_cpu_ptr(lock));		\
++		preempt_enable();				\
++	} while (0)
++
++#define __local_unlock_irq(lock)				\
++	do {							\
++		local_lock_release(this_cpu_ptr(lock));		\
++		local_irq_enable();				\
++	} while (0)
++
++#define __local_unlock_irqrestore(lock, flags)			\
++	do {							\
++		local_lock_release(this_cpu_ptr(lock));		\
++		local_irq_restore(flags);			\
++	} while (0)
