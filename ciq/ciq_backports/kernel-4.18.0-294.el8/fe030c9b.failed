@@ -1,0 +1,208 @@
+powerpc/pseries/cmm: Implement balloon compaction
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author David Hildenbrand <david@redhat.com>
+commit fe030c9b85e6783bc52fe86449c0a4b8aa16c753
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/fe030c9b.failed
+
+We can now get rid of the cmm_lock and completely rely on the balloon
+compaction internals, which now also manage the page list and the
+lock.
+
+Inflated/"loaned" pages are now movable. Memory blocks that contain
+such pages can get offlined. Also, all such pages will be marked
+PageOffline() and can therefore be excluded in memory dumps using
+recent versions of makedumpfile.
+
+Don't switch to balloon_page_alloc() yet (due to the GFP_NOIO). Will
+do that separately to discuss this change in detail.
+
+	Signed-off-by: David Hildenbrand <david@redhat.com>
+[mpe: Add isolated_pages-- in cmm_migratepage() as suggested by David]
+	Signed-off-by: Michael Ellerman <mpe@ellerman.id.au>
+Link: https://lore.kernel.org/r/20191031142933.10779-9-david@redhat.com
+(cherry picked from commit fe030c9b85e6783bc52fe86449c0a4b8aa16c753)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/powerpc/platforms/pseries/cmm.c
+#	include/uapi/linux/magic.h
+diff --cc arch/powerpc/platforms/pseries/cmm.c
+index 317181692fcb,0663ddad964a..000000000000
+--- a/arch/powerpc/platforms/pseries/cmm.c
++++ b/arch/powerpc/platforms/pseries/cmm.c
+@@@ -103,16 -81,15 +107,20 @@@ static unsigned long loaned_pages
+  static unsigned long loaned_pages_target;
+  static unsigned long oom_freed_pages;
+  
+++<<<<<<< HEAD
+ +static struct cmm_page_array *cmm_page_list;
+ +static DEFINE_SPINLOCK(cmm_lock);
+ +
+++=======
+++>>>>>>> fe030c9b85e6 (powerpc/pseries/cmm: Implement balloon compaction)
+  static DEFINE_MUTEX(hotplug_mutex);
+  static int hotplug_occurred; /* protected by the hotplug mutex */
+  
+  static struct task_struct *cmm_thread_ptr;
++ static struct balloon_dev_info b_dev_info;
+  
+ -static long plpar_page_set_loaned(struct page *page)
+ +static long plpar_page_set_loaned(unsigned long vpa)
+  {
+ -	const unsigned long vpa = page_to_phys(page);
+  	unsigned long cmo_page_sz = cmo_get_page_size();
+  	long rc = 0;
+  	int i;
+@@@ -170,46 -147,20 +178,59 @@@ static long cmm_alloc_pages(long nr
+  			break;
+  		}
+  
+ -		page = alloc_page(GFP_NOIO | __GFP_NOWARN | __GFP_NORETRY |
+ -				  __GFP_NOMEMALLOC);
+ -		if (!page)
+ +		addr = __get_free_page(GFP_NOIO | __GFP_NOWARN |
+ +				       __GFP_NORETRY | __GFP_NOMEMALLOC);
+ +		if (!addr)
+ +			break;
+++<<<<<<< HEAD
+ +		spin_lock(&cmm_lock);
+ +		pa = cmm_page_list;
+ +		if (!pa || pa->index >= CMM_NR_PAGES) {
+ +			/* Need a new page for the page list. */
+ +			spin_unlock(&cmm_lock);
+ +			npa = (struct cmm_page_array *)__get_free_page(
+ +					GFP_NOIO | __GFP_NOWARN |
+ +					__GFP_NORETRY | __GFP_NOMEMALLOC);
+ +			if (!npa) {
+ +				pr_info("%s: Can not allocate new page list\n", __func__);
+ +				free_page(addr);
+ +				break;
+ +			}
+ +			spin_lock(&cmm_lock);
+ +			pa = cmm_page_list;
+ +
+ +			if (!pa || pa->index >= CMM_NR_PAGES) {
+ +				npa->next = pa;
+ +				npa->index = 0;
+ +				pa = npa;
+ +				cmm_page_list = pa;
+ +			} else
+ +				free_page((unsigned long) npa);
+ +		}
+ +
+ +		if ((rc = plpar_page_set_loaned(__pa(addr)))) {
+ +			pr_err("%s: Can not set page to loaned. rc=%ld\n", __func__, rc);
+ +			spin_unlock(&cmm_lock);
+ +			free_page(addr);
+  			break;
+ +		}
+ +
+ +		pa->page[pa->index++] = addr;
+ +		loaned_pages++;
+ +		totalram_pages--;
+ +		spin_unlock(&cmm_lock);
+++=======
++ 		rc = plpar_page_set_loaned(page);
++ 		if (rc) {
++ 			pr_err("%s: Can not set page to loaned. rc=%ld\n", __func__, rc);
++ 			__free_page(page);
++ 			break;
++ 		}
++ 
++ 		balloon_page_enqueue(&b_dev_info, page);
++ 		atomic_long_inc(&loaned_pages);
++ 		adjust_managed_page_count(page, -1);
+++>>>>>>> fe030c9b85e6 (powerpc/pseries/cmm: Implement balloon compaction)
+  		nr--;
+  	}
+  
+@@@ -226,30 -177,19 +247,43 @@@
+   **/
+  static long cmm_free_pages(long nr)
+  {
+++<<<<<<< HEAD
+ +	struct cmm_page_array *pa;
+ +	unsigned long addr;
+ +
+ +	cmm_dbg("Begin free of %ld pages.\n", nr);
+ +	spin_lock(&cmm_lock);
+ +	pa = cmm_page_list;
+ +	while (nr) {
+ +		if (!pa || pa->index <= 0)
+ +			break;
+ +		addr = pa->page[--pa->index];
+ +
+ +		if (pa->index == 0) {
+ +			pa = pa->next;
+ +			free_page((unsigned long) cmm_page_list);
+ +			cmm_page_list = pa;
+ +		}
+ +
+ +		plpar_page_set_active(__pa(addr));
+ +		free_page(addr);
+ +		loaned_pages--;
+++=======
++ 	struct page *page;
++ 
++ 	cmm_dbg("Begin free of %ld pages.\n", nr);
++ 	while (nr) {
++ 		page = balloon_page_dequeue(&b_dev_info);
++ 		if (!page)
++ 			break;
++ 		plpar_page_set_active(page);
++ 		adjust_managed_page_count(page, 1);
++ 		__free_page(page);
++ 		atomic_long_dec(&loaned_pages);
+++>>>>>>> fe030c9b85e6 (powerpc/pseries/cmm: Implement balloon compaction)
+  		nr--;
+ +		totalram_pages++;
+  	}
+- 	spin_unlock(&cmm_lock);
+  	cmm_dbg("End request with %ld pages unfulfilled\n", nr);
+  	return nr;
+  }
+@@@ -739,9 -647,9 +880,10 @@@ static void cmm_exit(void
+  	unregister_oom_notifier(&cmm_oom_nb);
+  	unregister_reboot_notifier(&cmm_reboot_nb);
+  	unregister_memory_notifier(&cmm_mem_nb);
+ -	cmm_free_pages(atomic_long_read(&loaned_pages));
+ +	unregister_memory_isolate_notifier(&cmm_mem_isolate_nb);
+ +	cmm_free_pages(loaned_pages);
+  	cmm_unregister_sysfs(&cmm_dev);
++ 	cmm_balloon_compaction_deinit();
+  }
+  
+  /**
+diff --cc include/uapi/linux/magic.h
+index b04be8706349,3ac436376d79..000000000000
+--- a/include/uapi/linux/magic.h
++++ b/include/uapi/linux/magic.h
+@@@ -91,5 -93,7 +91,10 @@@
+  #define BALLOON_KVM_MAGIC	0x13661366
+  #define ZSMALLOC_MAGIC		0x58295829
+  #define DMA_BUF_MAGIC		0x444d4142	/* "DMAB" */
+++<<<<<<< HEAD
+++=======
++ #define Z3FOLD_MAGIC		0x33
++ #define PPC_CMM_MAGIC		0xc7571590
+++>>>>>>> fe030c9b85e6 (powerpc/pseries/cmm: Implement balloon compaction)
+  
+  #endif /* __LINUX_MAGIC_H__ */
+diff --git a/arch/powerpc/platforms/pseries/Kconfig b/arch/powerpc/platforms/pseries/Kconfig
+index 75e29f4e81e9..c1e488715db5 100644
+--- a/arch/powerpc/platforms/pseries/Kconfig
++++ b/arch/powerpc/platforms/pseries/Kconfig
+@@ -110,6 +110,7 @@ config PPC_SMLPAR
+ config CMM
+ 	tristate "Collaborative memory management"
+ 	depends on PPC_SMLPAR
++	select MEMORY_BALLOON
+ 	default y
+ 	help
+ 	  Select this option, if you want to enable the kernel interface
+* Unmerged path arch/powerpc/platforms/pseries/cmm.c
+* Unmerged path include/uapi/linux/magic.h
