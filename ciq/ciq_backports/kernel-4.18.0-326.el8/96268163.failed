@@ -1,0 +1,374 @@
+mm/hmm: remove the unused HMM_FAULT_ALLOW_RETRY flag
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-326.el8
+commit-author Christoph Hellwig <hch@lst.de>
+commit 96268163f9c9443e7f73a202253f68566f93dc79
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-326.el8/96268163.failed
+
+The HMM_FAULT_ALLOW_RETRY isn't used anywhere in the tree.  Remove it and
+the weird -EAGAIN handling where handle_mm_fault() drops the mmap_sem.
+
+Link: https://lore.kernel.org/r/20200316135310.899364-3-hch@lst.de
+	Signed-off-by: Christoph Hellwig <hch@lst.de>
+	Reviewed-by: Jason Gunthorpe <jgg@mellanox.com>
+	Signed-off-by: Jason Gunthorpe <jgg@mellanox.com>
+(cherry picked from commit 96268163f9c9443e7f73a202253f68566f93dc79)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/hmm.h
+#	mm/hmm.c
+diff --cc include/linux/hmm.h
+index 6a8157d67186,4bf8d6997b12..000000000000
+--- a/include/linux/hmm.h
++++ b/include/linux/hmm.h
+@@@ -308,171 -217,8 +308,176 @@@ static inline uint64_t hmm_device_entry
+  		range->flags[HMM_PFN_VALID];
+  }
+  
+++<<<<<<< HEAD
+ +/*
+ + * Old API:
+ + * hmm_pfn_to_page()
+ + * hmm_pfn_to_pfn()
+ + * hmm_pfn_from_page()
+ + * hmm_pfn_from_pfn()
+ + *
+ + * This are the OLD API please use new API, it is here to avoid cross-tree
+ + * merge painfullness ie we convert things to new API in stages.
+ + */
+ +static inline struct page *hmm_pfn_to_page(const struct hmm_range *range,
+ +					   uint64_t pfn)
+ +{
+ +	return hmm_device_entry_to_page(range, pfn);
+ +}
+ +
+ +static inline unsigned long hmm_pfn_to_pfn(const struct hmm_range *range,
+ +					   uint64_t pfn)
+ +{
+ +	return hmm_device_entry_to_pfn(range, pfn);
+ +}
+ +
+ +static inline uint64_t hmm_pfn_from_page(const struct hmm_range *range,
+ +					 struct page *page)
+ +{
+ +	return hmm_device_entry_from_page(range, page);
+ +}
+ +
+ +static inline uint64_t hmm_pfn_from_pfn(const struct hmm_range *range,
+ +					unsigned long pfn)
+ +{
+ +	return hmm_device_entry_from_pfn(range, pfn);
+ +}
+ +
+ +
+ +
+ +#if IS_ENABLED(CONFIG_HMM_MIRROR)
+ +/*
+ + * Mirroring: how to synchronize device page table with CPU page table.
+ + *
+ + * A device driver that is participating in HMM mirroring must always
+ + * synchronize with CPU page table updates. For this, device drivers can either
+ + * directly use mmu_notifier APIs or they can use the hmm_mirror API. Device
+ + * drivers can decide to register one mirror per device per process, or just
+ + * one mirror per process for a group of devices. The pattern is:
+ + *
+ + *      int device_bind_address_space(..., struct mm_struct *mm, ...)
+ + *      {
+ + *          struct device_address_space *das;
+ + *
+ + *          // Device driver specific initialization, and allocation of das
+ + *          // which contains an hmm_mirror struct as one of its fields.
+ + *          ...
+ + *
+ + *          ret = hmm_mirror_register(&das->mirror, mm, &device_mirror_ops);
+ + *          if (ret) {
+ + *              // Cleanup on error
+ + *              return ret;
+ + *          }
+ + *
+ + *          // Other device driver specific initialization
+ + *          ...
+ + *      }
+ + *
+ + * Once an hmm_mirror is registered for an address space, the device driver
+ + * will get callbacks through sync_cpu_device_pagetables() operation (see
+ + * hmm_mirror_ops struct).
+ + *
+ + * Device driver must not free the struct containing the hmm_mirror struct
+ + * before calling hmm_mirror_unregister(). The expected usage is to do that when
+ + * the device driver is unbinding from an address space.
+ + *
+ + *
+ + *      void device_unbind_address_space(struct device_address_space *das)
+ + *      {
+ + *          // Device driver specific cleanup
+ + *          ...
+ + *
+ + *          hmm_mirror_unregister(&das->mirror);
+ + *
+ + *          // Other device driver specific cleanup, and now das can be freed
+ + *          ...
+ + *      }
+ + */
+ +
+ +struct hmm_mirror;
+ +
+ +/*
+ + * enum hmm_update_event - type of update
+ + * @HMM_UPDATE_INVALIDATE: invalidate range (no indication as to why)
+ + */
+ +enum hmm_update_event {
+ +	HMM_UPDATE_INVALIDATE,
+ +};
+ +
+ +/*
+ + * struct hmm_update - HMM update information for callback
+ + *
+ + * @start: virtual start address of the range to update
+ + * @end: virtual end address of the range to update
+ + * @event: event triggering the update (what is happening)
+ + * @blockable: can the callback block/sleep ?
+ + */
+ +struct hmm_update {
+ +	unsigned long start;
+ +	unsigned long end;
+ +	enum hmm_update_event event;
+ +	bool blockable;
+ +};
+ +
+ +/*
+ + * struct hmm_mirror_ops - HMM mirror device operations callback
+ + *
+ + * @update: callback to update range on a device
+ + */
+ +struct hmm_mirror_ops {
+ +	/* release() - release hmm_mirror
+ +	 *
+ +	 * @mirror: pointer to struct hmm_mirror
+ +	 *
+ +	 * This is called when the mm_struct is being released.
+ +	 * The callback should make sure no references to the mirror occur
+ +	 * after the callback returns.
+ +	 */
+ +	void (*release)(struct hmm_mirror *mirror);
+ +
+ +	/* sync_cpu_device_pagetables() - synchronize page tables
+ +	 *
+ +	 * @mirror: pointer to struct hmm_mirror
+ +	 * @update: update information (see struct hmm_update)
+ +	 * Return: -EAGAIN if update.blockable false and callback need to
+ +	 *          block, 0 otherwise.
+ +	 *
+ +	 * This callback ultimately originates from mmu_notifiers when the CPU
+ +	 * page table is updated. The device driver must update its page table
+ +	 * in response to this callback. The update argument tells what action
+ +	 * to perform.
+ +	 *
+ +	 * The device driver must not return from this callback until the device
+ +	 * page tables are completely updated (TLBs flushed, etc); this is a
+ +	 * synchronous call.
+ +	 */
+ +	int (*sync_cpu_device_pagetables)(struct hmm_mirror *mirror,
+ +					  const struct hmm_update *update);
+ +};
+ +
+ +/*
+ + * struct hmm_mirror - mirror struct for a device driver
+ + *
+ + * @hmm: pointer to struct hmm (which is unique per mm_struct)
+ + * @ops: device driver callback for HMM mirror operations
+ + * @list: for list of mirrors of a given mm
+ + *
+ + * Each address space (mm_struct) being mirrored by a device must register one
+ + * instance of an hmm_mirror struct with HMM. HMM will track the list of all
+ + * mirrors for each mm_struct.
+ + */
+ +struct hmm_mirror {
+ +	struct hmm			*hmm;
+ +	const struct hmm_mirror_ops	*ops;
+ +	struct list_head		list;
+ +};
+ +
+ +int hmm_mirror_register(struct hmm_mirror *mirror, struct mm_struct *mm);
+ +void hmm_mirror_unregister(struct hmm_mirror *mirror);
+++=======
++ /* Don't fault in missing PTEs, just snapshot the current state. */
++ #define HMM_FAULT_SNAPSHOT		(1 << 1)
+++>>>>>>> 96268163f9c9 (mm/hmm: remove the unused HMM_FAULT_ALLOW_RETRY flag)
+  
+  /*
+   * Please see Documentation/vm/hmm.rst for how to use the range API.
+diff --cc mm/hmm.c
+index 0031a5d7b75b,df98297afe80..000000000000
+--- a/mm/hmm.c
++++ b/mm/hmm.c
+@@@ -310,27 -42,26 +310,39 @@@ static int hmm_vma_do_fault(struct mm_w
+  	struct vm_area_struct *vma = walk->vma;
+  	vm_fault_t ret;
+  
+++<<<<<<< HEAD
+ +	flags |= hmm_vma_walk->block ? 0 : FAULT_FLAG_ALLOW_RETRY;
+ +	flags |= write_fault ? FAULT_FLAG_WRITE : 0;
+ +	ret = handle_mm_fault(vma, addr, flags);
+ +	if (ret & VM_FAULT_RETRY) {
+ +		/* Note, handle_mm_fault did up_read(&mm->mmap_sem)) */
+ +		return -EAGAIN;
+ +	}
+ +	if (ret & VM_FAULT_ERROR) {
+ +		*pfn = range->values[HMM_PFN_ERROR];
+ +		return -EFAULT;
+ +	}
+++=======
++ 	if (!vma)
++ 		goto err;
++ 
++ 	if (write_fault)
++ 		flags |= FAULT_FLAG_WRITE;
++ 
++ 	ret = handle_mm_fault(vma, addr, flags);
++ 	if (ret & VM_FAULT_ERROR)
++ 		goto err;
+++>>>>>>> 96268163f9c9 (mm/hmm: remove the unused HMM_FAULT_ALLOW_RETRY flag)
+  
+  	return -EBUSY;
+ -
+ -err:
+ -	*pfn = range->values[HMM_PFN_ERROR];
+ -	return -EFAULT;
+  }
+  
+ -static int hmm_pfns_fill(unsigned long addr, unsigned long end,
+ -		struct hmm_range *range, enum hmm_pfn_value_e value)
+ +static int hmm_pfns_bad(unsigned long addr,
+ +			unsigned long end,
+ +			struct mm_walk *walk)
+  {
+ +	struct hmm_vma_walk *hmm_vma_walk = walk->private;
+ +	struct hmm_range *range = hmm_vma_walk->range;
+  	uint64_t *pfns = range->pfns;
+  	unsigned long i;
+  
+@@@ -972,96 -639,28 +984,109 @@@ static const struct mm_walk_ops hmm_wal
+  	.pmd_entry	= hmm_vma_walk_pmd,
+  	.pte_hole	= hmm_vma_walk_hole,
+  	.hugetlb_entry	= hmm_vma_walk_hugetlb_entry,
+ -	.test_walk	= hmm_vma_walk_test,
+  };
+  
+ -/**
+ - * hmm_range_fault - try to fault some address in a virtual address range
+ - * @range:	range being faulted
+ - * @flags:	HMM_FAULT_* flags
+ +/*
+ + * hmm_range_snapshot() - snapshot CPU page table for a range
+ + * @range: range
+ + * Return: -EINVAL if invalid argument, -ENOMEM out of memory, -EPERM invalid
+ + *          permission (for instance asking for write and range is read only),
+ + *          -EBUSY if you need to retry, -EFAULT invalid (ie either no valid
+ + *          vma or it is illegal to access that range), number of valid pages
+ + *          in range->pfns[] (from range start address).
+   *
+ - * Return: the number of valid pages in range->pfns[] (from range start
+ - * address), which may be zero.  On error one of the following status codes
+ - * can be returned:
+ + * This snapshots the CPU page table for a range of virtual addresses. Snapshot
+ + * validity is tracked by range struct. See in include/linux/hmm.h for example
+ + * on how to use.
+ + */
+ +long hmm_range_snapshot(struct hmm_range *range)
+ +{
+ +	const unsigned long device_vma = VM_IO | VM_PFNMAP | VM_MIXEDMAP;
+ +	unsigned long start = range->start, end;
+ +	struct hmm_vma_walk hmm_vma_walk;
+ +	struct hmm *hmm = range->hmm;
+ +	struct vm_area_struct *vma;
+ +
+ +	lockdep_assert_held(&hmm->mm->mmap_sem);
+ +	do {
+ +		/* If range is no longer valid force retry. */
+ +		if (!range->valid)
+ +			return -EBUSY;
+ +
+ +		vma = find_vma(hmm->mm, start);
+ +		if (vma == NULL || (vma->vm_flags & device_vma))
+ +			return -EFAULT;
+ +
+ +		if (is_vm_hugetlb_page(vma)) {
+ +			if (huge_page_shift(hstate_vma(vma)) !=
+ +				    range->page_shift &&
+ +			    range->page_shift != PAGE_SHIFT)
+ +				return -EINVAL;
+ +		} else {
+ +			if (range->page_shift != PAGE_SHIFT)
+ +				return -EINVAL;
+ +		}
+ +
+ +		if (!(vma->vm_flags & VM_READ)) {
+ +			/*
+ +			 * If vma do not allow read access, then assume that it
+ +			 * does not allow write access, either. HMM does not
+ +			 * support architecture that allow write without read.
+ +			 */
+ +			hmm_pfns_clear(range, range->pfns,
+ +				range->start, range->end);
+ +			return -EPERM;
+ +		}
+ +
+ +		range->vma = vma;
+ +		hmm_vma_walk.pgmap = NULL;
+ +		hmm_vma_walk.last = start;
+ +		hmm_vma_walk.fault = false;
+ +		hmm_vma_walk.range = range;
+ +		end = min(range->end, vma->vm_end);
+ +
+ +		walk_page_range(vma->vm_mm, 0, end, &hmm_walk_ops,
+ +				&hmm_vma_walk);
+ +		start = end;
+ +	} while (start < range->end);
+ +
+ +	return (hmm_vma_walk.last - range->start) >> PAGE_SHIFT;
+ +}
+ +EXPORT_SYMBOL(hmm_range_snapshot);
+ +
+ +/*
+ + * hmm_range_fault() - try to fault some address in a virtual address range
+ + * @range: range being faulted
+ + * @block: allow blocking on fault (if true it sleeps and do not drop mmap_sem)
+ + * Return: number of valid pages in range->pfns[] (from range start
+ + *          address). This may be zero. If the return value is negative,
+ + *          then one of the following values may be returned:
+   *
+++<<<<<<< HEAD
+ + *           -EINVAL  invalid arguments or mm or virtual address are in an
+ + *                    invalid vma (for instance device file vma).
+ + *           -ENOMEM: Out of memory.
+ + *           -EPERM:  Invalid permission (for instance asking for write and
+ + *                    range is read only).
+ + *           -EAGAIN: If you need to retry and mmap_sem was drop. This can only
+ + *                    happens if block argument is false.
+ + *           -EBUSY:  If the the range is being invalidated and you should wait
+ + *                    for invalidation to finish.
+ + *           -EFAULT: Invalid (ie either no valid vma or it is illegal to access
+ + *                    that range), number of valid pages in range->pfns[] (from
+ + *                    range start address).
+++=======
++  * -EINVAL:	Invalid arguments or mm or virtual address is in an invalid vma
++  *		(e.g., device file vma).
++  * -ENOMEM:	Out of memory.
++  * -EPERM:	Invalid permission (e.g., asking for write and range is read
++  *		only).
++  * -EBUSY:	The range has been invalidated and the caller needs to wait for
++  *		the invalidation to finish.
++  * -EFAULT:	Invalid (i.e., either no valid vma or it is illegal to access
++  *		that range) number of valid pages in range->pfns[] (from
++  *              range start address).
+++>>>>>>> 96268163f9c9 (mm/hmm: remove the unused HMM_FAULT_ALLOW_RETRY flag)
+   *
+   * This is similar to a regular CPU page fault except that it will not trigger
+   * any memory migration if the memory being faulted is not accessible by CPUs
+* Unmerged path include/linux/hmm.h
+* Unmerged path mm/hmm.c
