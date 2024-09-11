@@ -1,0 +1,245 @@
+mt76: mt7663: introduce coredump support
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-315.el8
+commit-author Lorenzo Bianconi <lorenzo@kernel.org>
+commit d2bf7959d9c0f631ef860edaf834d55773fdedff
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-315.el8/d2bf7959.failed
+
+Similar to mt7921 devices, introduce coredump support for mt7663 chipset
+
+Co-developed-by: Sean Wang <sean.wang@mediatek.com>
+	Signed-off-by: Sean Wang <sean.wang@mediatek.com>
+	Signed-off-by: Lorenzo Bianconi <lorenzo@kernel.org>
+	Signed-off-by: Felix Fietkau <nbd@nbd.name>
+(cherry picked from commit d2bf7959d9c0f631ef860edaf834d55773fdedff)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/wireless/mediatek/mt76/mt7615/Kconfig
+#	drivers/net/wireless/mediatek/mt76/mt7615/mt7615.h
+diff --cc drivers/net/wireless/mediatek/mt76/mt7615/Kconfig
+index f372fb629caf,30fba36ff46b..000000000000
+--- a/drivers/net/wireless/mediatek/mt76/mt7615/Kconfig
++++ b/drivers/net/wireless/mediatek/mt76/mt7615/Kconfig
+@@@ -2,7 -2,8 +2,12 @@@
+  
+  config MT7615_COMMON
+  	tristate
+++<<<<<<< HEAD
+ +	select MT76_CORE
+++=======
++ 	select WANT_DEV_COREDUMP
++ 	select MT76_CONNAC_LIB
+++>>>>>>> d2bf7959d9c0 (mt76: mt7663: introduce coredump support)
+  
+  config MT7615E
+  	tristate "MediaTek MT7615E and MT7663E (PCIe) support"
+diff --cc drivers/net/wireless/mediatek/mt76/mt7615/mt7615.h
+index 8e80331c345e,491841bc6291..000000000000
+--- a/drivers/net/wireless/mediatek/mt76/mt7615/mt7615.h
++++ b/drivers/net/wireless/mediatek/mt76/mt7615/mt7615.h
+@@@ -8,7 -8,7 +8,11 @@@
+  #include <linux/interrupt.h>
+  #include <linux/ktime.h>
+  #include <linux/regmap.h>
+++<<<<<<< HEAD
+ +#include "../mt76.h"
+++=======
++ #include "../mt76_connac_mcu.h"
+++>>>>>>> d2bf7959d9c0 (mt76: mt7663: introduce coredump support)
+  #include "regs.h"
+  
+  #define MT7615_MAX_INTERFACES		16
+@@@ -281,33 -276,8 +285,38 @@@ struct mt7615_dev 
+  
+  	u32 muar_mask;
+  
+++<<<<<<< HEAD
+ +#ifdef CONFIG_NL80211_TESTMODE
+ +	struct {
+ +		u32 *reg_backup;
+ +
+ +		s16 last_freq_offset;
+ +		u8 last_rcpi[4];
+ +		s8 last_ib_rssi[4];
+ +		s8 last_wb_rssi[4];
+ +	} test;
+ +#endif
+ +
+ +	struct {
+ +		bool enable;
+ +
+ +		spinlock_t txq_lock;
+ +		struct {
+ +			struct mt7615_sta *msta;
+ +			struct sk_buff *skb;
+ +		} tx_q[IEEE80211_NUM_ACS];
+ +
+ +		struct work_struct wake_work;
+ +		struct completion wake_cmpl;
+ +
+ +		struct delayed_work ps_work;
+ +		unsigned long last_activity;
+ +		unsigned long idle_timeout;
+ +	} pm;
+++=======
++ 	struct mt76_connac_pm pm;
++ 	struct mt76_connac_coredump coredump;
+++>>>>>>> d2bf7959d9c0 (mt76: mt7663: introduce coredump support)
+  };
+  
+  enum tx_pkt_queue_idx {
+* Unmerged path drivers/net/wireless/mediatek/mt76/mt7615/Kconfig
+diff --git a/drivers/net/wireless/mediatek/mt76/mt7615/debugfs.c b/drivers/net/wireless/mediatek/mt76/mt7615/debugfs.c
+index c5090cf0e472..2fc22ac88e41 100644
+--- a/drivers/net/wireless/mediatek/mt76/mt7615/debugfs.c
++++ b/drivers/net/wireless/mediatek/mt76/mt7615/debugfs.c
+@@ -21,6 +21,20 @@ mt7615_radar_pattern_set(void *data, u64 val)
+ DEFINE_DEBUGFS_ATTRIBUTE(fops_radar_pattern, NULL,
+ 			 mt7615_radar_pattern_set, "%lld\n");
+ 
++static int mt7615_config(void *data, u64 val)
++{
++	struct mt7615_dev *dev = data;
++	int ret;
++
++	mt7615_mutex_acquire(dev);
++	ret = mt76_connac_mcu_chip_config(&dev->mt76);
++	mt7615_mutex_release(dev);
++
++	return ret;
++}
++
++DEFINE_DEBUGFS_ATTRIBUTE(fops_config, NULL, mt7615_config, "%lld\n");
++
+ static int
+ mt7615_scs_set(void *data, u64 val)
+ {
+@@ -536,6 +550,9 @@ int mt7615_init_debugfs(struct mt7615_dev *dev)
+ 	debugfs_create_u32("rf_regidx", 0600, dir, &dev->debugfs_rf_reg);
+ 	debugfs_create_file_unsafe("rf_regval", 0600, dir, dev,
+ 				   &fops_rf_reg);
++	if (is_mt7663(&dev->mt76))
++		debugfs_create_file("chip_config", 0600, dir, dev,
++				    &fops_config);
+ 	if (mt76_is_sdio(&dev->mt76))
+ 		debugfs_create_devm_seqfile(dev->mt76.dev, "sched-quota", dir,
+ 					    mt7663s_sched_quota_read);
+diff --git a/drivers/net/wireless/mediatek/mt76/mt7615/init.c b/drivers/net/wireless/mediatek/mt76/mt7615/init.c
+index 14ddfc27f0d6..9c270143274e 100644
+--- a/drivers/net/wireless/mediatek/mt76/mt7615/init.c
++++ b/drivers/net/wireless/mediatek/mt76/mt7615/init.c
+@@ -478,7 +478,9 @@ void mt7615_init_device(struct mt7615_dev *dev)
+ 	set_bit(MT76_STATE_PM, &dev->mphy.state);
+ 	INIT_DELAYED_WORK(&dev->phy.mac_work, mt7615_mac_work);
+ 	INIT_DELAYED_WORK(&dev->phy.scan_work, mt7615_scan_work);
++	INIT_DELAYED_WORK(&dev->coredump.work, mt7615_coredump_work);
+ 	skb_queue_head_init(&dev->phy.scan_event_list);
++	skb_queue_head_init(&dev->coredump.msg_list);
+ 	INIT_LIST_HEAD(&dev->sta_poll_list);
+ 	spin_lock_init(&dev->sta_poll_lock);
+ 	init_waitqueue_head(&dev->reset_wait);
+diff --git a/drivers/net/wireless/mediatek/mt76/mt7615/mac.c b/drivers/net/wireless/mediatek/mt76/mt7615/mac.c
+index 433d4c941a48..06959c6334aa 100644
+--- a/drivers/net/wireless/mediatek/mt76/mt7615/mac.c
++++ b/drivers/net/wireless/mediatek/mt76/mt7615/mac.c
+@@ -7,6 +7,7 @@
+  *         Lorenzo Bianconi <lorenzo@kernel.org>
+  */
+ 
++#include <linux/devcoredump.h>
+ #include <linux/etherdevice.h>
+ #include <linux/timekeeping.h>
+ #include "mt7615.h"
+@@ -14,6 +15,7 @@
+ #include "../dma.h"
+ #include "mt7615_trace.h"
+ #include "mac.h"
++#include "mcu.h"
+ 
+ #define to_rssi(field, rxv)		((FIELD_GET(field, rxv) - 220) / 2)
+ 
+@@ -2348,3 +2350,44 @@ int mt7615_mac_set_beacon_filter(struct mt7615_phy *phy,
+ 
+ 	return 0;
+ }
++
++void mt7615_coredump_work(struct work_struct *work)
++{
++	struct mt7615_dev *dev;
++	char *dump, *data;
++
++	dev = (struct mt7615_dev *)container_of(work, struct mt7615_dev,
++						coredump.work.work);
++
++	if (time_is_after_jiffies(dev->coredump.last_activity +
++				  4 * MT76_CONNAC_COREDUMP_TIMEOUT)) {
++		queue_delayed_work(dev->mt76.wq, &dev->coredump.work,
++				   MT76_CONNAC_COREDUMP_TIMEOUT);
++		return;
++	}
++
++	dump = vzalloc(MT76_CONNAC_COREDUMP_SZ);
++	data = dump;
++
++	while (true) {
++		struct sk_buff *skb;
++
++		spin_lock_bh(&dev->mt76.lock);
++		skb = __skb_dequeue(&dev->coredump.msg_list);
++		spin_unlock_bh(&dev->mt76.lock);
++
++		if (!skb)
++			break;
++
++		skb_pull(skb, sizeof(struct mt7615_mcu_rxd));
++		if (data + skb->len - dump > MT76_CONNAC_COREDUMP_SZ)
++			break;
++
++		memcpy(data, skb->data, skb->len);
++		data += skb->len;
++
++		dev_kfree_skb(skb);
++	}
++	dev_coredumpv(dev->mt76.dev, dump, MT76_CONNAC_COREDUMP_SZ,
++		      GFP_KERNEL);
++}
+diff --git a/drivers/net/wireless/mediatek/mt76/mt7615/mcu.c b/drivers/net/wireless/mediatek/mt76/mt7615/mcu.c
+index bb481662d3c5..617d60201f44 100644
+--- a/drivers/net/wireless/mediatek/mt76/mt7615/mcu.c
++++ b/drivers/net/wireless/mediatek/mt76/mt7615/mcu.c
+@@ -557,6 +557,10 @@ mt7615_mcu_rx_unsolicited_event(struct mt7615_dev *dev, struct sk_buff *skb)
+ 	case MCU_EVENT_BSS_ABSENCE:
+ 		mt7615_mcu_bss_event(dev, skb);
+ 		break;
++	case MCU_EVENT_COREDUMP:
++		mt76_connac_mcu_coredump_event(&dev->mt76, skb,
++					       &dev->coredump);
++		return;
+ 	default:
+ 		break;
+ 	}
+@@ -575,6 +579,7 @@ void mt7615_mcu_rx_event(struct mt7615_dev *dev, struct sk_buff *skb)
+ 	    rxd->eid == MCU_EVENT_SCHED_SCAN_DONE ||
+ 	    rxd->eid == MCU_EVENT_BSS_ABSENCE ||
+ 	    rxd->eid == MCU_EVENT_SCAN_DONE ||
++	    rxd->eid == MCU_EVENT_COREDUMP ||
+ 	    rxd->eid == MCU_EVENT_ROC ||
+ 	    !rxd->seq)
+ 		mt7615_mcu_rx_unsolicited_event(dev, skb);
+diff --git a/drivers/net/wireless/mediatek/mt76/mt7615/mcu.h b/drivers/net/wireless/mediatek/mt76/mt7615/mcu.h
+index 6ef5670211d1..47c91c76c31f 100644
+--- a/drivers/net/wireless/mediatek/mt76/mt7615/mcu.h
++++ b/drivers/net/wireless/mediatek/mt76/mt7615/mcu.h
+@@ -90,6 +90,7 @@ enum {
+ 	MCU_EVENT_SCHED_SCAN_DONE = 0x23,
+ 	MCU_EVENT_EXT = 0xed,
+ 	MCU_EVENT_RESTART_DL = 0xef,
++	MCU_EVENT_COREDUMP = 0xf0,
+ };
+ 
+ /* ext event table */
+* Unmerged path drivers/net/wireless/mediatek/mt76/mt7615/mt7615.h
