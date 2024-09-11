@@ -3962,7 +3962,7 @@ static int trace__run(struct trace *trace, int argc, const char **argv)
 		goto out_delete_evlist;
 	}
 
-	perf_evlist__config(evlist, &trace->opts, &callchain_param);
+	evlist__config(evlist, &trace->opts, &callchain_param);
 
 	if (forks) {
 		err = evlist__prepare_workload(evlist, &trace->opts.target, argv, false, NULL);
