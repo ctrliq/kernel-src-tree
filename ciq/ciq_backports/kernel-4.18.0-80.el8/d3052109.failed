@@ -1,0 +1,109 @@
+rcu: More aggressively enlist scheduler aid for nohz_full CPUs
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-80.el8
+commit-author Paul E. McKenney <paulmck@linux.vnet.ibm.com>
+commit d3052109c0bc9e536d17d627ae628ed8ceb6928c
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-80.el8/d3052109.failed
+
+Because nohz_full CPUs can leave the scheduler-clock interrupt disabled
+even when in kernel mode, RCU cannot rely on rcu_check_callbacks() to
+enlist the scheduler's aid in extracting a quiescent state from such CPUs.
+This commit therefore more aggressively uses resched_cpu() on nohz_full
+CPUs that fail to pass through a quiescent state in a timely manner.
+By default, the resched_cpu() beating starts 300 milliseconds into the
+quiescent state.
+
+While in the neighborhood, add a ->last_fqs_resched field to the rcu_data
+structure in order to rate-limit resched_cpu() calls from the RCU
+grace-period kthread.
+
+	Signed-off-by: Paul E. McKenney <paulmck@linux.vnet.ibm.com>
+(cherry picked from commit d3052109c0bc9e536d17d627ae628ed8ceb6928c)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	kernel/rcu/tree.c
+diff --cc kernel/rcu/tree.c
+index 19ff444b5603,96731f62594a..000000000000
+--- a/kernel/rcu/tree.c
++++ b/kernel/rcu/tree.c
+@@@ -1094,17 -1089,38 +1095,47 @@@ static int rcu_implicit_dynticks_qs(str
+  		WRITE_ONCE(*rnhqp, true);
+  		/* Store rcu_need_heavy_qs before rcu_urgent_qs. */
+  		smp_store_release(ruqp, true);
+++<<<<<<< HEAD
+ +		rdp->rsp->jiffies_resched += jtsq; /* Re-enable beating. */
+++=======
++ 	} else if (time_after(jiffies, rcu_state.gp_start + jtsq)) {
++ 		WRITE_ONCE(*ruqp, true);
+++>>>>>>> d3052109c0bc (rcu: More aggressively enlist scheduler aid for nohz_full CPUs)
+  	}
+  
+  	/*
+- 	 * If more than halfway to RCU CPU stall-warning time, do a
+- 	 * resched_cpu() to try to loosen things up a bit.  Also check to
+- 	 * see if the CPU is getting hammered with interrupts, but only
+- 	 * once per grace period, just to keep the IPIs down to a dull roar.
++ 	 * NO_HZ_FULL CPUs can run in-kernel without rcu_check_callbacks!
++ 	 * The above code handles this, but only for straight cond_resched().
++ 	 * And some in-kernel loops check need_resched() before calling
++ 	 * cond_resched(), which defeats the above code for CPUs that are
++ 	 * running in-kernel with scheduling-clock interrupts disabled.
++ 	 * So hit them over the head with the resched_cpu() hammer!
+  	 */
++ 	if (tick_nohz_full_cpu(rdp->cpu) &&
++ 		   time_after(jiffies,
++ 			      READ_ONCE(rdp->last_fqs_resched) + jtsq * 3)) {
++ 		resched_cpu(rdp->cpu);
++ 		WRITE_ONCE(rdp->last_fqs_resched, jiffies);
++ 	}
++ 
++ 	/*
++ 	 * If more than halfway to RCU CPU stall-warning time, invoke
++ 	 * resched_cpu() more frequently to try to loosen things up a bit.
++ 	 * Also check to see if the CPU is getting hammered with interrupts,
++ 	 * but only once per grace period, just to keep the IPIs down to
++ 	 * a dull roar.
++ 	 */
+++<<<<<<< HEAD
+ +	if (jiffies - rdp->rsp->gp_start > rcu_jiffies_till_stall_check() / 2) {
+ +		resched_cpu(rdp->cpu);
+++=======
++ 	if (time_after(jiffies, rcu_state.jiffies_resched)) {
++ 		if (time_after(jiffies,
++ 			       READ_ONCE(rdp->last_fqs_resched) + jtsq)) {
++ 			resched_cpu(rdp->cpu);
++ 			WRITE_ONCE(rdp->last_fqs_resched, jiffies);
++ 		}
+++>>>>>>> d3052109c0bc (rcu: More aggressively enlist scheduler aid for nohz_full CPUs)
+  		if (IS_ENABLED(CONFIG_IRQ_WORK) &&
+  		    !rdp->rcu_iw_pending && rdp->rcu_iw_gp_seq != rnp->gp_seq &&
+  		    (rnp->ffmask & rdp->grpmask)) {
+* Unmerged path kernel/rcu/tree.c
+diff --git a/kernel/rcu/tree.h b/kernel/rcu/tree.h
+index 7c6033d71e9d..c54321068289 100644
+--- a/kernel/rcu/tree.h
++++ b/kernel/rcu/tree.h
+@@ -264,6 +264,7 @@ struct rcu_data {
+ 	short rcu_ofl_gp_flags;		/* ->gp_flags at last offline. */
+ 	unsigned long rcu_onl_gp_seq;	/* ->gp_seq at last online. */
+ 	short rcu_onl_gp_flags;		/* ->gp_flags at last online. */
++	unsigned long last_fqs_resched;	/* Time of last rcu_resched(). */
+ 
+ 	int cpu;
+ 	struct rcu_state *rsp;
+diff --git a/kernel/rcu/tree_plugin.h b/kernel/rcu/tree_plugin.h
+index 05c430d4a698..048199faaa05 100644
+--- a/kernel/rcu/tree_plugin.h
++++ b/kernel/rcu/tree_plugin.h
+@@ -1858,6 +1858,7 @@ static void zero_cpu_stall_ticks(struct rcu_data *rdp)
+ {
+ 	rdp->ticks_this_gp = 0;
+ 	rdp->softirq_snap = kstat_softirqs_cpu(RCU_SOFTIRQ, smp_processor_id());
++	WRITE_ONCE(rdp->last_fqs_resched, jiffies);
+ }
+ 
+ /* Increment ->ticks_this_gp for all flavors of RCU. */
