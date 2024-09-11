@@ -1,0 +1,263 @@
+mm: swapoff: shmem_unuse() stop eviction without igrab()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Hugh Dickins <hughd@google.com>
+commit af53d3e9e04024885de5b4fda51e5fa362ae2bd8
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/af53d3e9.failed
+
+The igrab() in shmem_unuse() looks good, but we forgot that it gives no
+protection against concurrent unmounting: a point made by Konstantin
+Khlebnikov eight years ago, and then fixed in 2.6.39 by 778dd893ae78
+("tmpfs: fix race between umount and swapoff").  The current 5.1-rc
+swapoff is liable to hit "VFS: Busy inodes after unmount of tmpfs.
+Self-destruct in 5 seconds.  Have a nice day..." followed by GPF.
+
+Once again, give up on using igrab(); but don't go back to making such
+heavy-handed use of shmem_swaplist_mutex as last time: that would spoil
+the new design, and I expect could deadlock inside shmem_swapin_page().
+
+Instead, shmem_unuse() just raise a "stop_eviction" count in the shmem-
+specific inode, and shmem_evict_inode() wait for that to go down to 0.
+Call it "stop_eviction" rather than "swapoff_busy" because it can be put
+to use for others later (huge tmpfs patches expect to use it).
+
+That simplifies shmem_unuse(), protecting it from both unlink and
+unmount; and in practice lets it locate all the swap in its first try.
+But do not rely on that: there's still a theoretical case, when
+shmem_writepage() might have been preempted after its get_swap_page(),
+before making the swap entry visible to swapoff.
+
+[hughd@google.com: remove incorrect list_del()]
+  Link: http://lkml.kernel.org/r/alpine.LSU.2.11.1904091133570.1898@eggly.anvils
+Link: http://lkml.kernel.org/r/alpine.LSU.2.11.1904081259400.1523@eggly.anvils
+Fixes: b56a2d8af914 ("mm: rid swapoff of quadratic complexity")
+	Signed-off-by: Hugh Dickins <hughd@google.com>
+	Cc: "Alex Xu (Hello71)" <alex_y_xu@yahoo.ca>
+	Cc: Huang Ying <ying.huang@intel.com>
+	Cc: Kelley Nielsen <kelleynnn@gmail.com>
+	Cc: Konstantin Khlebnikov <khlebnikov@yandex-team.ru>
+	Cc: Rik van Riel <riel@surriel.com>
+	Cc: Vineeth Pillai <vpillai@digitalocean.com>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit af53d3e9e04024885de5b4fda51e5fa362ae2bd8)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	mm/shmem.c
+#	mm/swapfile.c
+diff --cc mm/shmem.c
+index fd519560c907,2275a0ff7c30..000000000000
+--- a/mm/shmem.c
++++ b/mm/shmem.c
+@@@ -1216,57 -1178,95 +1221,95 @@@ static int shmem_unuse_inode(struct shm
+  }
+  
+  /*
+ - * If swap found in inode, free it and move page from swapcache to filecache.
+ + * Search through swapped inodes to find and replace swap by page.
+   */
+ -static int shmem_unuse_inode(struct inode *inode, unsigned int type,
+ -			     bool frontswap, unsigned long *fs_pages_to_unuse)
+ +int shmem_unuse(swp_entry_t swap, struct page *page)
+  {
+ -	struct address_space *mapping = inode->i_mapping;
+ -	pgoff_t start = 0;
+ -	struct pagevec pvec;
+ -	pgoff_t indices[PAGEVEC_SIZE];
+ -	bool frontswap_partial = (frontswap && *fs_pages_to_unuse > 0);
+ -	int ret = 0;
+ -
+ -	pagevec_init(&pvec);
+ -	do {
+ -		unsigned int nr_entries = PAGEVEC_SIZE;
+ -
+ -		if (frontswap_partial && *fs_pages_to_unuse < PAGEVEC_SIZE)
+ -			nr_entries = *fs_pages_to_unuse;
+ -
+ -		pvec.nr = shmem_find_swap_entries(mapping, start, nr_entries,
+ -						  pvec.pages, indices,
+ -						  type, frontswap);
+ -		if (pvec.nr == 0) {
+ -			ret = 0;
+ -			break;
+ -		}
+ -
+ -		ret = shmem_unuse_swap_entries(inode, pvec, indices);
+ -		if (ret < 0)
+ -			break;
+ -
+ -		if (frontswap_partial) {
+ -			*fs_pages_to_unuse -= ret;
+ -			if (*fs_pages_to_unuse == 0) {
+ -				ret = FRONTSWAP_PAGES_UNUSED;
+ -				break;
+ -			}
+ -		}
+++<<<<<<< HEAD
+ +	struct list_head *this, *next;
+ +	struct shmem_inode_info *info;
+ +	struct mem_cgroup *memcg;
+ +	int error = 0;
+  
+ -		start = indices[pvec.nr - 1];
+ -	} while (true);
+ +	/*
+ +	 * There's a faint possibility that swap page was replaced before
+ +	 * caller locked it: caller will come back later with the right page.
+ +	 */
+ +	if (unlikely(!PageSwapCache(page) || page_private(page) != swap.val))
+ +		goto out;
+  
+ -	return ret;
+ -}
+ +	/*
+ +	 * Charge page using GFP_KERNEL while we can wait, before taking
+ +	 * the shmem_swaplist_mutex which might hold up shmem_writepage().
+ +	 * Charged back to the user (not to caller) when swap account is used.
+ +	 */
+ +	error = mem_cgroup_try_charge_delay(page, current->mm, GFP_KERNEL,
+ +					    &memcg, false);
+ +	if (error)
+ +		goto out;
+ +	/* No memory allocation: swap entry occupies the slot for the page */
+ +	error = -EAGAIN;
+  
+ -/*
+ - * Read all the shared memory data that resides in the swap
+ - * device 'type' back into memory, so the swap device can be
+ - * unused.
+ - */
+ -int shmem_unuse(unsigned int type, bool frontswap,
+ -		unsigned long *fs_pages_to_unuse)
+ -{
+ +	mutex_lock(&shmem_swaplist_mutex);
+ +	list_for_each_safe(this, next, &shmem_swaplist) {
+ +		info = list_entry(this, struct shmem_inode_info, swaplist);
+ +		if (info->swapped)
+ +			error = shmem_unuse_inode(info, swap, &page);
+ +		else
+ +			list_del_init(&info->swaplist);
+ +		cond_resched();
+ +		if (error != -EAGAIN)
+++=======
++ 	struct shmem_inode_info *info, *next;
++ 	int error = 0;
++ 
++ 	if (list_empty(&shmem_swaplist))
++ 		return 0;
++ 
++ 	mutex_lock(&shmem_swaplist_mutex);
++ 	list_for_each_entry_safe(info, next, &shmem_swaplist, swaplist) {
++ 		if (!info->swapped) {
++ 			list_del_init(&info->swaplist);
++ 			continue;
++ 		}
++ 		/*
++ 		 * Drop the swaplist mutex while searching the inode for swap;
++ 		 * but before doing so, make sure shmem_evict_inode() will not
++ 		 * remove placeholder inode from swaplist, nor let it be freed
++ 		 * (igrab() would protect from unlink, but not from unmount).
++ 		 */
++ 		atomic_inc(&info->stop_eviction);
++ 		mutex_unlock(&shmem_swaplist_mutex);
++ 
++ 		error = shmem_unuse_inode(&info->vfs_inode, type, frontswap,
++ 					  fs_pages_to_unuse);
++ 		cond_resched();
++ 
++ 		mutex_lock(&shmem_swaplist_mutex);
++ 		next = list_next_entry(info, swaplist);
++ 		if (!info->swapped)
++ 			list_del_init(&info->swaplist);
++ 		if (atomic_dec_and_test(&info->stop_eviction))
++ 			wake_up_var(&info->stop_eviction);
++ 		if (error)
+++>>>>>>> af53d3e9e040 (mm: swapoff: shmem_unuse() stop eviction without igrab())
+  			break;
+ +		/* found nothing in this: move on to search the next */
+  	}
+  	mutex_unlock(&shmem_swaplist_mutex);
+  
+++<<<<<<< HEAD
+ +	if (error) {
+ +		if (error != -ENOMEM)
+ +			error = 0;
+ +		mem_cgroup_cancel_charge(page, memcg, false);
+ +	} else
+ +		mem_cgroup_commit_charge(page, memcg, true, false);
+ +out:
+ +	unlock_page(page);
+ +	put_page(page);
+++=======
+++>>>>>>> af53d3e9e040 (mm: swapoff: shmem_unuse() stop eviction without igrab())
+  	return error;
+  }
+  
+diff --cc mm/swapfile.c
+index b77fb155eaf4,cf63b5f01adf..000000000000
+--- a/mm/swapfile.c
++++ b/mm/swapfile.c
+@@@ -2382,18 -2102,33 +2382,40 @@@ int try_to_unuse(unsigned int type, boo
+  		put_page(page);
+  
+  		/*
+ -		 * For frontswap, we just need to unuse pages_to_unuse, if
+ -		 * it was specified. Need not check frontswap again here as
+ -		 * we already zeroed out pages_to_unuse if not frontswap.
+ +		 * Make sure that we aren't completely killing
+ +		 * interactive performance.
+  		 */
+ -		if (pages_to_unuse && --pages_to_unuse == 0)
+ -			goto out;
+ +		cond_resched();
+ +		if (frontswap && pages_to_unuse > 0) {
+ +			if (!--pages_to_unuse)
+ +				break;
+ +		}
+  	}
+  
+++<<<<<<< HEAD
+ +	mmput(start_mm);
+ +	return retval;
+++=======
++ 	/*
++ 	 * Lets check again to see if there are still swap entries in the map.
++ 	 * If yes, we would need to do retry the unuse logic again.
++ 	 * Under global memory pressure, swap entries can be reinserted back
++ 	 * into process space after the mmlist loop above passes over them.
++ 	 *
++ 	 * Limit the number of retries? No: when mmget_not_zero() above fails,
++ 	 * that mm is likely to be freeing swap from exit_mmap(), which proceeds
++ 	 * at its own independent pace; and even shmem_writepage() could have
++ 	 * been preempted after get_swap_page(), temporarily hiding that swap.
++ 	 * It's easy and robust (though cpu-intensive) just to keep retrying.
++ 	 */
++ 	if (si->inuse_pages) {
++ 		if (!signal_pending(current))
++ 			goto retry;
++ 		retval = -EINTR;
++ 	}
++ out:
++ 	return (retval == FRONTSWAP_PAGES_UNUSED) ? 0 : retval;
+++>>>>>>> af53d3e9e040 (mm: swapoff: shmem_unuse() stop eviction without igrab())
+  }
+  
+  /*
+diff --git a/include/linux/shmem_fs.h b/include/linux/shmem_fs.h
+index c4a8a0f1d6db..94c0b9c29af3 100644
+--- a/include/linux/shmem_fs.h
++++ b/include/linux/shmem_fs.h
+@@ -21,6 +21,7 @@ struct shmem_inode_info {
+ 	struct list_head	swaplist;	/* chain of maybes on swap */
+ 	struct shared_policy	policy;		/* NUMA memory alloc policy */
+ 	struct simple_xattrs	xattrs;		/* list of xattrs */
++	atomic_t		stop_eviction;	/* hold when working on inode */
+ 	struct inode		vfs_inode;
+ };
+ 
+* Unmerged path mm/shmem.c
+* Unmerged path mm/swapfile.c
