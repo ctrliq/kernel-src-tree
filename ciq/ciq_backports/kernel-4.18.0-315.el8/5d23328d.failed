@@ -1,0 +1,236 @@
+libbpf: Add BPF_PROG_BIND_MAP syscall and use it on .rodata section
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-315.el8
+commit-author YiFei Zhu <zhuyifei@google.com>
+commit 5d23328dccd93c47e2719cb9d2ae303c235d277d
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-315.el8/5d23328d.failed
+
+The patch adds a simple wrapper bpf_prog_bind_map around the syscall.
+When the libbpf tries to load a program, it will probe the kernel for
+the support of this syscall and unconditionally bind .rodata section
+to the program.
+
+	Signed-off-by: YiFei Zhu <zhuyifei@google.com>
+	Signed-off-by: Stanislav Fomichev <sdf@google.com>
+	Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+	Cc: YiFei Zhu <zhuyifei1999@gmail.com>
+Link: https://lore.kernel.org/bpf/20200915234543.3220146-4-sdf@google.com
+(cherry picked from commit 5d23328dccd93c47e2719cb9d2ae303c235d277d)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	tools/lib/bpf/libbpf.map
+diff --cc tools/lib/bpf/libbpf.map
+index 0db77fbd2de9,5f054dadf082..000000000000
+--- a/tools/lib/bpf/libbpf.map
++++ b/tools/lib/bpf/libbpf.map
+@@@ -334,30 -302,11 +334,40 @@@ LIBBPF_0.1.0 
+  
+  LIBBPF_0.2.0 {
+  	global:
+++<<<<<<< HEAD
+ +		bpf_program__attach_freplace;
+ +		btf__add_array;
+ +		btf__add_const;
+ +		btf__add_enum;
+ +		btf__add_enum_value;
+ +		btf__add_datasec;
+ +		btf__add_datasec_var_info;
+ +		btf__add_field;
+ +		btf__add_func;
+ +		btf__add_func_param;
+ +		btf__add_func_proto;
+ +		btf__add_fwd;
+ +		btf__add_int;
+ +		btf__add_ptr;
+ +		btf__add_restrict;
+ +		btf__add_str;
+ +		btf__add_struct;
+ +		btf__add_typedef;
+ +		btf__add_union;
+ +		btf__add_var;
+ +		btf__add_volatile;
+ +		btf__endianness;
+ +		btf__find_str;
+ +		btf__new_empty;
+ +		btf__set_endianness;
+ +		btf__str_by_offset;
+++=======
++ 		bpf_prog_bind_map;
++ 		bpf_program__section_name;
++ 		perf_buffer__buffer_cnt;
++ 		perf_buffer__buffer_fd;
++ 		perf_buffer__epoll_fd;
++ 		perf_buffer__consume_buffer;
++ 		xsk_socket__create_shared;
+++>>>>>>> 5d23328dccd9 (libbpf: Add BPF_PROG_BIND_MAP syscall and use it on .rodata section)
+  } LIBBPF_0.1.0;
+diff --git a/tools/lib/bpf/bpf.c b/tools/lib/bpf/bpf.c
+index faa51231d17d..df4cf7eb7293 100644
+--- a/tools/lib/bpf/bpf.c
++++ b/tools/lib/bpf/bpf.c
+@@ -892,3 +892,19 @@ int bpf_enable_stats(enum bpf_stats_type type)
+ 
+ 	return sys_bpf(BPF_ENABLE_STATS, &attr, sizeof(attr));
+ }
++
++int bpf_prog_bind_map(int prog_fd, int map_fd,
++		      const struct bpf_prog_bind_opts *opts)
++{
++	union bpf_attr attr;
++
++	if (!OPTS_VALID(opts, bpf_prog_bind_opts))
++		return -EINVAL;
++
++	memset(&attr, 0, sizeof(attr));
++	attr.prog_bind_map.prog_fd = prog_fd;
++	attr.prog_bind_map.map_fd = map_fd;
++	attr.prog_bind_map.flags = OPTS_GET(opts, flags, 0);
++
++	return sys_bpf(BPF_PROG_BIND_MAP, &attr, sizeof(attr));
++}
+diff --git a/tools/lib/bpf/bpf.h b/tools/lib/bpf/bpf.h
+index 8e520707e745..e7b89b9a9724 100644
+--- a/tools/lib/bpf/bpf.h
++++ b/tools/lib/bpf/bpf.h
+@@ -246,6 +246,14 @@ LIBBPF_API int bpf_task_fd_query(int pid, int fd, __u32 flags, char *buf,
+ enum bpf_stats_type; /* defined in up-to-date linux/bpf.h */
+ LIBBPF_API int bpf_enable_stats(enum bpf_stats_type type);
+ 
++struct bpf_prog_bind_opts {
++	size_t sz; /* size of this struct for forward/backward compatibility */
++	__u32 flags;
++};
++#define bpf_prog_bind_opts__last_field flags
++
++LIBBPF_API int bpf_prog_bind_map(int prog_fd, int map_fd,
++				 const struct bpf_prog_bind_opts *opts);
+ #ifdef __cplusplus
+ } /* extern "C" */
+ #endif
+diff --git a/tools/lib/bpf/libbpf.c b/tools/lib/bpf/libbpf.c
+index 133c0050e689..7d2614e18b94 100644
+--- a/tools/lib/bpf/libbpf.c
++++ b/tools/lib/bpf/libbpf.c
+@@ -174,6 +174,8 @@ enum kern_feature_id {
+ 	FEAT_EXP_ATTACH_TYPE,
+ 	/* bpf_probe_read_{kernel,user}[_str] helpers */
+ 	FEAT_PROBE_READ_KERN,
++	/* BPF_PROG_BIND_MAP is supported */
++	FEAT_PROG_BIND_MAP,
+ 	__FEAT_CNT,
+ };
+ 
+@@ -380,6 +382,7 @@ struct bpf_object {
+ 	struct extern_desc *externs;
+ 	int nr_extern;
+ 	int kconfig_map_idx;
++	int rodata_map_idx;
+ 
+ 	bool loaded;
+ 	bool has_pseudo_calls;
+@@ -1028,6 +1031,7 @@ static struct bpf_object *bpf_object__new(const char *path,
+ 	obj->efile.bss_shndx = -1;
+ 	obj->efile.st_ops_shndx = -1;
+ 	obj->kconfig_map_idx = -1;
++	obj->rodata_map_idx = -1;
+ 
+ 	obj->kern_version = get_kernel_version();
+ 	obj->loaded = false;
+@@ -1414,6 +1418,8 @@ static int bpf_object__init_global_data_maps(struct bpf_object *obj)
+ 						    obj->efile.rodata->d_size);
+ 		if (err)
+ 			return err;
++
++		obj->rodata_map_idx = obj->nr_maps - 1;
+ 	}
+ 	if (obj->efile.bss_shndx >= 0) {
+ 		err = bpf_object__init_internal_map(obj, LIBBPF_MAP_BSS,
+@@ -3652,6 +3658,52 @@ static int probe_kern_probe_read_kernel(void)
+ 	return probe_fd(bpf_load_program_xattr(&attr, NULL, 0));
+ }
+ 
++static int probe_prog_bind_map(void)
++{
++	struct bpf_load_program_attr prg_attr;
++	struct bpf_create_map_attr map_attr;
++	char *cp, errmsg[STRERR_BUFSIZE];
++	struct bpf_insn insns[] = {
++		BPF_MOV64_IMM(BPF_REG_0, 0),
++		BPF_EXIT_INSN(),
++	};
++	int ret, map, prog;
++
++	memset(&map_attr, 0, sizeof(map_attr));
++	map_attr.map_type = BPF_MAP_TYPE_ARRAY;
++	map_attr.key_size = sizeof(int);
++	map_attr.value_size = 32;
++	map_attr.max_entries = 1;
++
++	map = bpf_create_map_xattr(&map_attr);
++	if (map < 0) {
++		ret = -errno;
++		cp = libbpf_strerror_r(ret, errmsg, sizeof(errmsg));
++		pr_warn("Error in %s():%s(%d). Couldn't create simple array map.\n",
++			__func__, cp, -ret);
++		return ret;
++	}
++
++	memset(&prg_attr, 0, sizeof(prg_attr));
++	prg_attr.prog_type = BPF_PROG_TYPE_SOCKET_FILTER;
++	prg_attr.insns = insns;
++	prg_attr.insns_cnt = ARRAY_SIZE(insns);
++	prg_attr.license = "GPL";
++
++	prog = bpf_load_program_xattr(&prg_attr, NULL, 0);
++	if (prog < 0) {
++		close(map);
++		return 0;
++	}
++
++	ret = bpf_prog_bind_map(prog, map, NULL);
++
++	close(map);
++	close(prog);
++
++	return ret >= 0;
++}
++
+ enum kern_feature_result {
+ 	FEAT_UNKNOWN = 0,
+ 	FEAT_SUPPORTED = 1,
+@@ -3692,6 +3744,9 @@ static struct kern_feature_desc {
+ 	},
+ 	[FEAT_PROBE_READ_KERN] = {
+ 		"bpf_probe_read_kernel() helper", probe_kern_probe_read_kernel,
++	},
++	[FEAT_PROG_BIND_MAP] = {
++		"BPF_PROG_BIND_MAP support", probe_prog_bind_map,
+ 	}
+ };
+ 
+@@ -5949,6 +6004,20 @@ load_program(struct bpf_program *prog, struct bpf_insn *insns, int insns_cnt,
+ 	if (ret >= 0) {
+ 		if (log_buf && load_attr.log_level)
+ 			pr_debug("verifier log:\n%s", log_buf);
++
++		if (prog->obj->rodata_map_idx >= 0 &&
++		    kernel_supports(FEAT_PROG_BIND_MAP)) {
++			struct bpf_map *rodata_map =
++				&prog->obj->maps[prog->obj->rodata_map_idx];
++
++			if (bpf_prog_bind_map(ret, bpf_map__fd(rodata_map), NULL)) {
++				cp = libbpf_strerror_r(errno, errmsg, sizeof(errmsg));
++				pr_warn("prog '%s': failed to bind .rodata map: %s\n",
++					prog->name, cp);
++				/* Don't fail hard if can't bind rodata. */
++			}
++		}
++
+ 		*pfd = ret;
+ 		ret = 0;
+ 		goto out;
+* Unmerged path tools/lib/bpf/libbpf.map
