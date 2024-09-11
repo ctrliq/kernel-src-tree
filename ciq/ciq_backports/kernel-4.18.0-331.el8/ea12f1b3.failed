@@ -1,0 +1,128 @@
+s390/qeth: clean up load/remove code for disciplines
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-331.el8
+commit-author Julian Wiedmann <jwi@linux.ibm.com>
+commit ea12f1b3c8289102620d3030de3547eedce6d9e8
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-331.el8/ea12f1b3.failed
+
+We have two usage patterns:
+1. get & ->setup() a new discipline, or
+2. ->remove() & put the currently loaded one.
+
+Add corresponding helpers that hide the internals & error handling.
+
+	Signed-off-by: Julian Wiedmann <jwi@linux.ibm.com>
+	Reviewed-by: Alexandra Winter <wintera@linux.ibm.com>
+	Acked-by: Willem de Bruijn <willemb@google.com>
+	Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+(cherry picked from commit ea12f1b3c8289102620d3030de3547eedce6d9e8)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/s390/net/qeth_core_main.c
+diff --cc drivers/s390/net/qeth_core_main.c
+index df4f9c49c6d3,0a65213ab606..000000000000
+--- a/drivers/s390/net/qeth_core_main.c
++++ b/drivers/s390/net/qeth_core_main.c
+@@@ -6579,9 -6600,10 +6594,14 @@@ static int qeth_core_probe_device(struc
+  		break;
+  	default:
+  		card->info.layer_enforced = true;
+++<<<<<<< HEAD
+ +		rc = qeth_core_load_discipline(card, enforced_disc);
+++=======
++ 		/* It's so early that we don't need the discipline_mutex yet. */
++ 		rc = qeth_setup_discipline(card, enforced_disc);
+++>>>>>>> ea12f1b3c828 (s390/qeth: clean up load/remove code for disciplines)
+  		if (rc)
+- 			goto err_load;
++ 			goto err_setup_disc;
+  
+  		gdev->dev.type = IS_OSN(card) ? &qeth_osn_devtype :
+  						card->discipline->devtype;
+@@@ -6611,10 -6628,10 +6626,17 @@@ static void qeth_core_remove_device(str
+  
+  	QETH_CARD_TEXT(card, 2, "removedv");
+  
+++<<<<<<< HEAD
+ +	if (card->discipline) {
+ +		card->discipline->remove(gdev);
+ +		qeth_core_free_discipline(card);
+ +	}
+++=======
++ 	mutex_lock(&card->discipline_mutex);
++ 	if (card->discipline)
++ 		qeth_remove_discipline(card);
++ 	mutex_unlock(&card->discipline_mutex);
+++>>>>>>> ea12f1b3c828 (s390/qeth: clean up load/remove code for disciplines)
+  
+  	qeth_free_qdio_queues(card);
+  
+@@@ -6632,18 -6649,16 +6654,13 @@@ static int qeth_core_set_online(struct 
+  	if (!card->discipline) {
+  		def_discipline = IS_IQD(card) ? QETH_DISCIPLINE_LAYER3 :
+  						QETH_DISCIPLINE_LAYER2;
+- 		rc = qeth_core_load_discipline(card, def_discipline);
++ 		rc = qeth_setup_discipline(card, def_discipline);
+  		if (rc)
+  			goto err;
+- 		rc = card->discipline->setup(card->gdev);
+- 		if (rc) {
+- 			qeth_core_free_discipline(card);
+- 			goto err;
+- 		}
+  	}
+  
+ -	rc = qeth_set_online(card, card->discipline);
+ -
+ +	rc = qeth_set_online(card);
+  err:
+ -	mutex_unlock(&card->discipline_mutex);
+  	return rc;
+  }
+  
+diff --git a/drivers/s390/net/qeth_core.h b/drivers/s390/net/qeth_core.h
+index 1253c108a9a2..28c860da3521 100644
+--- a/drivers/s390/net/qeth_core.h
++++ b/drivers/s390/net/qeth_core.h
+@@ -1028,8 +1028,8 @@ extern const struct device_type qeth_generic_devtype;
+ 
+ const char *qeth_get_cardname_short(struct qeth_card *);
+ int qeth_resize_buffer_pool(struct qeth_card *card, unsigned int count);
+-int qeth_core_load_discipline(struct qeth_card *, enum qeth_discipline_id);
+-void qeth_core_free_discipline(struct qeth_card *);
++int qeth_setup_discipline(struct qeth_card *card, enum qeth_discipline_id disc);
++void qeth_remove_discipline(struct qeth_card *card);
+ 
+ /* exports for qeth discipline device drivers */
+ extern struct kmem_cache *qeth_core_header_cache;
+* Unmerged path drivers/s390/net/qeth_core_main.c
+diff --git a/drivers/s390/net/qeth_core_sys.c b/drivers/s390/net/qeth_core_sys.c
+index 74c70364edc1..5867f8db578b 100644
+--- a/drivers/s390/net/qeth_core_sys.c
++++ b/drivers/s390/net/qeth_core_sys.c
+@@ -382,19 +382,13 @@ static ssize_t qeth_dev_layer2_store(struct device *dev,
+ 			goto out;
+ 		}
+ 
+-		card->discipline->remove(card->gdev);
+-		qeth_core_free_discipline(card);
++		qeth_remove_discipline(card);
+ 		free_netdev(card->dev);
+ 		card->dev = ndev;
+ 	}
+ 
+-	rc = qeth_core_load_discipline(card, newdis);
+-	if (rc)
+-		goto out;
++	rc = qeth_setup_discipline(card, newdis);
+ 
+-	rc = card->discipline->setup(card->gdev);
+-	if (rc)
+-		qeth_core_free_discipline(card);
+ out:
+ 	mutex_unlock(&card->discipline_mutex);
+ 	return rc ? rc : count;
