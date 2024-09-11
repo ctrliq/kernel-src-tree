@@ -1,0 +1,272 @@
+skmsg: Extract __tcp_bpf_recvmsg() and tcp_bpf_wait_data()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-365.el8
+commit-author Cong Wang <cong.wang@bytedance.com>
+commit 2bc793e3272a13e337416c057cb81c5396ad91d1
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-365.el8/2bc793e3.failed
+
+Although these two functions are only used by TCP, they are not
+specific to TCP at all, both operate on skmsg and ingress_msg,
+so fit in net/core/skmsg.c very well.
+
+And we will need them for non-TCP, so rename and move them to
+skmsg.c and export them to modules.
+
+	Signed-off-by: Cong Wang <cong.wang@bytedance.com>
+	Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+Link: https://lore.kernel.org/bpf/20210331023237.41094-13-xiyou.wangcong@gmail.com
+(cherry picked from commit 2bc793e3272a13e337416c057cb81c5396ad91d1)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/ipv4/tcp_bpf.c
+diff --cc net/ipv4/tcp_bpf.c
+index bc7d2a586e18,3d622a0d0753..000000000000
+--- a/net/ipv4/tcp_bpf.c
++++ b/net/ipv4/tcp_bpf.c
+@@@ -10,86 -10,6 +10,89 @@@
+  #include <net/inet_common.h>
+  #include <net/tls.h>
+  
+++<<<<<<< HEAD
+ +int __tcp_bpf_recvmsg(struct sock *sk, struct sk_psock *psock,
+ +		      struct msghdr *msg, int len, int flags)
+ +{
+ +	struct iov_iter *iter = &msg->msg_iter;
+ +	int peek = flags & MSG_PEEK;
+ +	struct sk_msg *msg_rx;
+ +	int i, copied = 0;
+ +
+ +	msg_rx = list_first_entry_or_null(&psock->ingress_msg,
+ +					  struct sk_msg, list);
+ +
+ +	while (copied != len) {
+ +		struct scatterlist *sge;
+ +
+ +		if (unlikely(!msg_rx))
+ +			break;
+ +
+ +		i = msg_rx->sg.start;
+ +		do {
+ +			struct page *page;
+ +			int copy;
+ +
+ +			sge = sk_msg_elem(msg_rx, i);
+ +			copy = sge->length;
+ +			page = sg_page(sge);
+ +			if (copied + copy > len)
+ +				copy = len - copied;
+ +			copy = copy_page_to_iter(page, sge->offset, copy, iter);
+ +			if (!copy)
+ +				return copied ? copied : -EFAULT;
+ +
+ +			copied += copy;
+ +			if (likely(!peek)) {
+ +				sge->offset += copy;
+ +				sge->length -= copy;
+ +				if (!msg_rx->skb)
+ +					sk_mem_uncharge(sk, copy);
+ +				msg_rx->sg.size -= copy;
+ +
+ +				if (!sge->length) {
+ +					sk_msg_iter_var_next(i);
+ +					if (!msg_rx->skb)
+ +						put_page(page);
+ +				}
+ +			} else {
+ +				/* Lets not optimize peek case if copy_page_to_iter
+ +				 * didn't copy the entire length lets just break.
+ +				 */
+ +				if (copy != sge->length)
+ +					return copied;
+ +				sk_msg_iter_var_next(i);
+ +			}
+ +
+ +			if (copied == len)
+ +				break;
+ +		} while (i != msg_rx->sg.end);
+ +
+ +		if (unlikely(peek)) {
+ +			if (msg_rx == list_last_entry(&psock->ingress_msg,
+ +						      struct sk_msg, list))
+ +				break;
+ +			msg_rx = list_next_entry(msg_rx, list);
+ +			continue;
+ +		}
+ +
+ +		msg_rx->sg.start = i;
+ +		if (!sge->length && msg_rx->sg.start == msg_rx->sg.end) {
+ +			list_del(&msg_rx->list);
+ +			if (msg_rx->skb)
+ +				consume_skb(msg_rx->skb);
+ +			kfree(msg_rx);
+ +		}
+ +		msg_rx = list_first_entry_or_null(&psock->ingress_msg,
+ +						  struct sk_msg, list);
+ +	}
+ +
+ +	return copied;
+ +}
+ +EXPORT_SYMBOL_GPL(__tcp_bpf_recvmsg);
+ +
+++=======
+++>>>>>>> 2bc793e3272a (skmsg: Extract __tcp_bpf_recvmsg() and tcp_bpf_wait_data())
+  static int bpf_tcp_ingress(struct sock *sk, struct sk_psock *psock,
+  			   struct sk_msg *msg, u32 apply_bytes, int flags)
+  {
+diff --git a/include/linux/skmsg.h b/include/linux/skmsg.h
+index a85cacd89635..cc3c61d2faf4 100644
+--- a/include/linux/skmsg.h
++++ b/include/linux/skmsg.h
+@@ -127,6 +127,10 @@ int sk_msg_zerocopy_from_iter(struct sock *sk, struct iov_iter *from,
+ 			      struct sk_msg *msg, u32 bytes);
+ int sk_msg_memcopy_from_iter(struct sock *sk, struct iov_iter *from,
+ 			     struct sk_msg *msg, u32 bytes);
++int sk_msg_wait_data(struct sock *sk, struct sk_psock *psock, int flags,
++		     long timeo, int *err);
++int sk_msg_recvmsg(struct sock *sk, struct sk_psock *psock, struct msghdr *msg,
++		   int len, int flags);
+ 
+ static inline void sk_msg_check_to_free(struct sk_msg *msg, u32 i, u32 bytes)
+ {
+diff --git a/include/net/tcp.h b/include/net/tcp.h
+index 94a5d2fb0393..571e20ff6443 100644
+--- a/include/net/tcp.h
++++ b/include/net/tcp.h
+@@ -2205,8 +2205,6 @@ static inline void tcp_bpf_clone(const struct sock *sk, struct sock *newsk)
+ #ifdef CONFIG_NET_SOCK_MSG
+ int tcp_bpf_sendmsg_redir(struct sock *sk, struct sk_msg *msg, u32 bytes,
+ 			  int flags);
+-int __tcp_bpf_recvmsg(struct sock *sk, struct sk_psock *psock,
+-		      struct msghdr *msg, int len, int flags);
+ #endif /* CONFIG_NET_SOCK_MSG */
+ 
+ #ifdef CONFIG_CGROUP_BPF
+diff --git a/net/core/skmsg.c b/net/core/skmsg.c
+index cfa6fc7cc1e0..0bcececd1899 100644
+--- a/net/core/skmsg.c
++++ b/net/core/skmsg.c
+@@ -399,6 +399,104 @@ int sk_msg_memcopy_from_iter(struct sock *sk, struct iov_iter *from,
+ }
+ EXPORT_SYMBOL_GPL(sk_msg_memcopy_from_iter);
+ 
++int sk_msg_wait_data(struct sock *sk, struct sk_psock *psock, int flags,
++		     long timeo, int *err)
++{
++	DEFINE_WAIT_FUNC(wait, woken_wake_function);
++	int ret = 0;
++
++	if (sk->sk_shutdown & RCV_SHUTDOWN)
++		return 1;
++
++	if (!timeo)
++		return ret;
++
++	add_wait_queue(sk_sleep(sk), &wait);
++	sk_set_bit(SOCKWQ_ASYNC_WAITDATA, sk);
++	ret = sk_wait_event(sk, &timeo,
++			    !list_empty(&psock->ingress_msg) ||
++			    !skb_queue_empty(&sk->sk_receive_queue), &wait);
++	sk_clear_bit(SOCKWQ_ASYNC_WAITDATA, sk);
++	remove_wait_queue(sk_sleep(sk), &wait);
++	return ret;
++}
++EXPORT_SYMBOL_GPL(sk_msg_wait_data);
++
++/* Receive sk_msg from psock->ingress_msg to @msg. */
++int sk_msg_recvmsg(struct sock *sk, struct sk_psock *psock, struct msghdr *msg,
++		   int len, int flags)
++{
++	struct iov_iter *iter = &msg->msg_iter;
++	int peek = flags & MSG_PEEK;
++	struct sk_msg *msg_rx;
++	int i, copied = 0;
++
++	msg_rx = sk_psock_peek_msg(psock);
++	while (copied != len) {
++		struct scatterlist *sge;
++
++		if (unlikely(!msg_rx))
++			break;
++
++		i = msg_rx->sg.start;
++		do {
++			struct page *page;
++			int copy;
++
++			sge = sk_msg_elem(msg_rx, i);
++			copy = sge->length;
++			page = sg_page(sge);
++			if (copied + copy > len)
++				copy = len - copied;
++			copy = copy_page_to_iter(page, sge->offset, copy, iter);
++			if (!copy)
++				return copied ? copied : -EFAULT;
++
++			copied += copy;
++			if (likely(!peek)) {
++				sge->offset += copy;
++				sge->length -= copy;
++				if (!msg_rx->skb)
++					sk_mem_uncharge(sk, copy);
++				msg_rx->sg.size -= copy;
++
++				if (!sge->length) {
++					sk_msg_iter_var_next(i);
++					if (!msg_rx->skb)
++						put_page(page);
++				}
++			} else {
++				/* Lets not optimize peek case if copy_page_to_iter
++				 * didn't copy the entire length lets just break.
++				 */
++				if (copy != sge->length)
++					return copied;
++				sk_msg_iter_var_next(i);
++			}
++
++			if (copied == len)
++				break;
++		} while (i != msg_rx->sg.end);
++
++		if (unlikely(peek)) {
++			msg_rx = sk_psock_next_msg(psock, msg_rx);
++			if (!msg_rx)
++				break;
++			continue;
++		}
++
++		msg_rx->sg.start = i;
++		if (!sge->length && msg_rx->sg.start == msg_rx->sg.end) {
++			msg_rx = sk_psock_dequeue_msg(psock);
++			kfree_sk_msg(msg_rx);
++		}
++		msg_rx = sk_psock_peek_msg(psock);
++	}
++
++	return copied;
++}
++EXPORT_SYMBOL_GPL(sk_msg_recvmsg);
++
+ static struct sk_msg *sk_psock_create_ingress_msg(struct sock *sk,
+ 						  struct sk_buff *skb)
+ {
+* Unmerged path net/ipv4/tcp_bpf.c
+diff --git a/net/tls/tls_sw.c b/net/tls/tls_sw.c
+index 1c4f4f690b5c..0894bc9478e1 100644
+--- a/net/tls/tls_sw.c
++++ b/net/tls/tls_sw.c
+@@ -1800,8 +1800,8 @@ int tls_sw_recvmsg(struct sock *sk,
+ 		skb = tls_wait_data(sk, psock, flags & MSG_DONTWAIT, timeo, &err);
+ 		if (!skb) {
+ 			if (psock) {
+-				int ret = __tcp_bpf_recvmsg(sk, psock,
+-							    msg, len, flags);
++				int ret = sk_msg_recvmsg(sk, psock, msg, len,
++							 flags);
+ 
+ 				if (ret > 0) {
+ 					decrypted += ret;
