@@ -1,0 +1,307 @@
+mm/gup: remove the vma allocation from gup_longterm_locked()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-448.el8
+commit-author Jason Gunthorpe <jgg@nvidia.com>
+commit 52650c8b466bac399aec213c61d74bfe6f7af1a4
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-448.el8/52650c8b.failed
+
+Long ago there wasn't a FOLL_LONGTERM flag so this DAX check was done by
+post-processing the VMA list.
+
+These days it is trivial to just check each VMA to see if it is DAX before
+processing it inside __get_user_pages() and return failure if a DAX VMA is
+encountered with FOLL_LONGTERM.
+
+Removing the allocation of the VMA list is a significant speed up for many
+call sites.
+
+Add an IS_ENABLED to vma_is_fsdax so that code generation is unchanged
+when DAX is compiled out.
+
+Remove the dummy version of __gup_longterm_locked() as !CONFIG_CMA already
+makes memalloc_nocma_save(), check_and_migrate_cma_pages(), and
+memalloc_nocma_restore() into a NOP.
+
+Link: https://lkml.kernel.org/r/0-v1-5551df3ed12e+b8-gup_dax_speedup_jgg@nvidia.com
+	Signed-off-by: Jason Gunthorpe <jgg@nvidia.com>
+	Reviewed-by: Ira Weiny <ira.weiny@intel.com>
+	Cc: Dan Williams <dan.j.williams@intel.com>
+	Cc: John Hubbard <jhubbard@nvidia.com>
+	Cc: Pavel Tatashin <pasha.tatashin@soleen.com>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit 52650c8b466bac399aec213c61d74bfe6f7af1a4)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	mm/gup.c
+diff --cc mm/gup.c
+index b6ca92e3db6b,311a44ff41ff..000000000000
+--- a/mm/gup.c
++++ b/mm/gup.c
+@@@ -1809,145 -1543,39 +1816,125 @@@ finish_or_fault
+  #endif /* !CONFIG_MMU */
+  
+  /**
+ - * get_dump_page() - pin user page in memory while writing it to core dump
+ - * @addr: user address
+ + * fault_in_writeable - fault in userspace address range for writing
+ + * @uaddr: start of address range
+ + * @size: size of address range
+   *
+ - * Returns struct page pointer of user page pinned for dump,
+ - * to be freed afterwards by put_page().
+ + * Returns the number of bytes not faulted in (like copy_to_user() and
+ + * copy_from_user()).
+ + */
+ +size_t fault_in_writeable(char __user *uaddr, size_t size)
+ +{
+ +	char __user *start = uaddr, *end;
+ +
+ +	if (unlikely(size == 0))
+ +		return 0;
+ +	if (!PAGE_ALIGNED(uaddr)) {
+ +		if (unlikely(__put_user(0, uaddr) != 0))
+ +			return size;
+ +		uaddr = (char __user *)PAGE_ALIGN((unsigned long)uaddr);
+ +	}
+ +	end = (char __user *)PAGE_ALIGN((unsigned long)start + size);
+ +	if (unlikely(end < start))
+ +		end = NULL;
+ +	while (uaddr != end) {
+ +		if (unlikely(__put_user(0, uaddr) != 0))
+ +			goto out;
+ +		uaddr += PAGE_SIZE;
+ +	}
+ +
+ +out:
+ +	if (size > uaddr - start)
+ +		return size - (uaddr - start);
+ +	return 0;
+ +}
+ +EXPORT_SYMBOL(fault_in_writeable);
+ +
+ +/*
+ + * fault_in_safe_writeable - fault in an address range for writing
+ + * @uaddr: start of address range
+ + * @size: length of address range
+   *
+ - * Returns NULL on any kind of failure - a hole must then be inserted into
+ - * the corefile, to preserve alignment with its headers; and also returns
+ - * NULL wherever the ZERO_PAGE, or an anonymous pte_none, has been found -
+ - * allowing a hole to be left in the corefile to save diskspace.
+ + * Faults in an address range for writing.  This is primarily useful when we
+ + * already know that some or all of the pages in the address range aren't in
+ + * memory.
+   *
+ - * Called without mmap_lock (takes and releases the mmap_lock by itself).
+ + * Unlike fault_in_writeable(), this function is non-destructive.
+ + *
+ + * Note that we don't pin or otherwise hold the pages referenced that we fault
+ + * in.  There's no guarantee that they'll stay in memory for any duration of
+ + * time.
+ + *
+ + * Returns the number of bytes not faulted in, like copy_to_user() and
+ + * copy_from_user().
+   */
+ -#ifdef CONFIG_ELF_CORE
+ -struct page *get_dump_page(unsigned long addr)
+ +size_t fault_in_safe_writeable(const char __user *uaddr, size_t size)
+  {
+ +	unsigned long start = (unsigned long)uaddr, end;
+  	struct mm_struct *mm = current->mm;
+ -	struct page *page;
+ -	int locked = 1;
+ -	int ret;
+ +	bool unlocked = false;
+  
+ -	if (mmap_read_lock_killable(mm))
+ -		return NULL;
+ -	ret = __get_user_pages_locked(mm, addr, 1, &page, NULL, &locked,
+ -				      FOLL_FORCE | FOLL_DUMP | FOLL_GET);
+ -	if (locked)
+ -		mmap_read_unlock(mm);
+ -	return (ret == 1) ? page : NULL;
+ +	if (unlikely(size == 0))
+ +		return 0;
+ +	end = PAGE_ALIGN(start + size);
+ +	if (end < start)
+ +		end = 0;
+ +
+ +	mmap_read_lock(mm);
+ +	do {
+ +		if (fixup_user_fault(current, mm, start, FAULT_FLAG_WRITE,
+ +				     &unlocked))
+ +			break;
+ +		start = (start + PAGE_SIZE) & PAGE_MASK;
+ +	} while (start != end);
+ +	mmap_read_unlock(mm);
+ +
+ +	if (size > (unsigned long)uaddr - start)
+ +		return size - ((unsigned long)uaddr - start);
+ +	return 0;
+  }
+ -#endif /* CONFIG_ELF_CORE */
+ +EXPORT_SYMBOL(fault_in_safe_writeable);
+ +
+ +/**
+ + * fault_in_readable - fault in userspace address range for reading
+ + * @uaddr: start of user address range
+ + * @size: size of user address range
+ + *
+ + * Returns the number of bytes not faulted in (like copy_to_user() and
+ + * copy_from_user()).
+ + */
+ +size_t fault_in_readable(const char __user *uaddr, size_t size)
+ +{
+ +	const char __user *start = uaddr, *end;
+ +	volatile char c;
+ +
+ +	if (unlikely(size == 0))
+ +		return 0;
+ +	if (!PAGE_ALIGNED(uaddr)) {
+ +		if (unlikely(__get_user(c, uaddr) != 0))
+ +			return size;
+ +		uaddr = (const char __user *)PAGE_ALIGN((unsigned long)uaddr);
+ +	}
+ +	end = (const char __user *)PAGE_ALIGN((unsigned long)start + size);
+ +	if (unlikely(end < start))
+ +		end = NULL;
+ +	while (uaddr != end) {
+ +		if (unlikely(__get_user(c, uaddr) != 0))
+ +			goto out;
+ +		uaddr += PAGE_SIZE;
+ +	}
+ +
+ +out:
+ +	(void)c;
+ +	if (size > uaddr - start)
+ +		return size - (uaddr - start);
+ +	return 0;
+ +}
+ +EXPORT_SYMBOL(fault_in_readable);
+  
+- #if defined(CONFIG_FS_DAX) || defined (CONFIG_CMA)
+- static bool check_dax_vmas(struct vm_area_struct **vmas, long nr_pages)
+- {
+- 	long i;
+- 	struct vm_area_struct *vma_prev = NULL;
+- 
+- 	for (i = 0; i < nr_pages; i++) {
+- 		struct vm_area_struct *vma = vmas[i];
+- 
+- 		if (vma == vma_prev)
+- 			continue;
+- 
+- 		vma_prev = vma;
+- 
+- 		if (vma_is_fsdax(vma))
+- 			return true;
+- 	}
+- 	return false;
+- }
+- 
+  #ifdef CONFIG_CMA
+ -static long check_and_migrate_cma_pages(struct mm_struct *mm,
+ +static long check_and_migrate_cma_pages(struct task_struct *tsk,
+ +					struct mm_struct *mm,
+  					unsigned long start,
+  					unsigned long nr_pages,
+  					struct page **pages,
+@@@ -2066,64 -1692,23 +2053,62 @@@ static long __gup_longterm_locked(struc
+  				  struct vm_area_struct **vmas,
+  				  unsigned int gup_flags)
+  {
+- 	struct vm_area_struct **vmas_tmp = vmas;
+  	unsigned long flags = 0;
+- 	long rc, i;
++ 	long rc;
+  
+- 	if (gup_flags & FOLL_LONGTERM) {
+- 		if (!pages)
+- 			return -EINVAL;
+- 
+- 		if (!vmas_tmp) {
+- 			vmas_tmp = kcalloc(nr_pages,
+- 					   sizeof(struct vm_area_struct *),
+- 					   GFP_KERNEL);
+- 			if (!vmas_tmp)
+- 				return -ENOMEM;
+- 		}
++ 	if (gup_flags & FOLL_LONGTERM)
+  		flags = memalloc_nocma_save();
+- 	}
+  
+++<<<<<<< HEAD
+ +	rc = __get_user_pages_locked(tsk, mm, start, nr_pages, pages,
+ +				     vmas_tmp, NULL, gup_flags);
+ +
+ +	if (gup_flags & FOLL_LONGTERM) {
+ +		if (rc < 0)
+ +			goto out;
+ +
+ +		if (check_dax_vmas(vmas_tmp, rc)) {
+ +			if (gup_flags & FOLL_PIN)
+ +				unpin_user_pages(pages, rc);
+ +			else
+ +				for (i = 0; i < rc; i++)
+ +					put_page(pages[i]);
+ +			rc = -EOPNOTSUPP;
+ +			goto out;
+ +		}
+ +
+ +		rc = check_and_migrate_cma_pages(tsk, mm, start, rc, pages,
+ +						 vmas_tmp, gup_flags);
+ +out:
+++=======
++ 	rc = __get_user_pages_locked(mm, start, nr_pages, pages, vmas, NULL,
++ 				     gup_flags);
++ 
++ 	if (gup_flags & FOLL_LONGTERM) {
++ 		if (rc > 0)
++ 			rc = check_and_migrate_cma_pages(mm, start, rc, pages,
++ 							 vmas, gup_flags);
+++>>>>>>> 52650c8b466b (mm/gup: remove the vma allocation from gup_longterm_locked())
+  		memalloc_nocma_restore(flags);
+  	}
+- 
+- 	if (vmas_tmp != vmas)
+- 		kfree(vmas_tmp);
+  	return rc;
+  }
+++<<<<<<< HEAD
+ +#else /* !CONFIG_FS_DAX && !CONFIG_CMA */
+ +static __always_inline long __gup_longterm_locked(struct task_struct *tsk,
+ +						  struct mm_struct *mm,
+ +						  unsigned long start,
+ +						  unsigned long nr_pages,
+ +						  struct page **pages,
+ +						  struct vm_area_struct **vmas,
+ +						  unsigned int flags)
+ +{
+ +	return __get_user_pages_locked(tsk, mm, start, nr_pages, pages, vmas,
+ +				       NULL, flags);
+ +}
+ +#endif /* CONFIG_FS_DAX || CONFIG_CMA */
+++=======
+++>>>>>>> 52650c8b466b (mm/gup: remove the vma allocation from gup_longterm_locked())
+  
+  static bool is_valid_gup_flags(unsigned int gup_flags)
+  {
+diff --git a/include/linux/fs.h b/include/linux/fs.h
+index 70c53a05e306..a7d1230fe088 100644
+--- a/include/linux/fs.h
++++ b/include/linux/fs.h
+@@ -3316,7 +3316,7 @@ static inline bool vma_is_fsdax(struct vm_area_struct *vma)
+ {
+ 	struct inode *inode;
+ 
+-	if (!vma->vm_file)
++	if (!IS_ENABLED(CONFIG_FS_DAX) || !vma->vm_file)
+ 		return false;
+ 	if (!vma_is_dax(vma))
+ 		return false;
+* Unmerged path mm/gup.c
