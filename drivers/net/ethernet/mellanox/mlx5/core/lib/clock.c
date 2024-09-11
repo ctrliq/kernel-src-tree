@@ -383,13 +383,13 @@ static int mlx5_perout_configure(struct ptp_clock_info *ptp,
 		return -EINVAL;
 
 	field_select = MLX5_MTPPS_FS_ENABLE;
+	pin = ptp_find_pin(clock->ptp, PTP_PF_PEROUT, rq->perout.index);
+	if (pin < 0)
+		return -EBUSY;
+
 	if (on) {
 		u32 nsec;
 		s64 sec;
-
-		pin = ptp_find_pin(clock->ptp, PTP_PF_PEROUT, rq->perout.index);
-		if (pin < 0)
-			return -EBUSY;
 
 		pin_mode = MLX5_PIN_MODE_OUT;
 		pattern = MLX5_OUT_PATTERN_PERIODIC;
