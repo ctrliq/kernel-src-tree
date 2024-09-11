@@ -1341,11 +1341,6 @@ static long int __kvmhv_nested_page_fault(struct kvm_run *run,
 		}
 
 		/* passthrough of emulated MMIO case */
-		if (kvmhv_on_pseries()) {
-			pr_err("emulated MMIO passthrough?\n");
-			return -EINVAL;
-		}
-
 		return kvmppc_hv_emulate_mmio(run, vcpu, gpa, ea, writing);
 	}
 	if (memslot->flags & KVM_MEM_READONLY) {
