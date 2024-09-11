@@ -100,6 +100,8 @@ int flow_offload_route_init(struct flow_offload *flow,
 int flow_offload_add(struct nf_flowtable *flow_table, struct flow_offload *flow);
 struct flow_offload_tuple_rhash *flow_offload_lookup(struct nf_flowtable *flow_table,
 						     struct flow_offload_tuple *tuple);
+void nf_flow_table_gc_cleanup(struct nf_flowtable *flowtable,
+			      struct net_device *dev);
 void nf_flow_table_cleanup(struct net_device *dev);
 
 int nf_flow_table_init(struct nf_flowtable *flow_table);
