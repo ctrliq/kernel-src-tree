@@ -1,0 +1,140 @@
+KVM: SVM: Nullify vcpu_(un)blocking() hooks if AVIC is disabled
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-408.el8
+commit-author Sean Christopherson <seanjc@google.com>
+commit a3c19d5beaad25fcaa703b251c72c3a22fc09100
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-408.el8/a3c19d5b.failed
+
+Nullify svm_x86_ops.vcpu_(un)blocking if AVIC/APICv is disabled as the
+hooks are necessary only to clear the vCPU's IsRunning entry in the
+Physical APIC and to update IRTE entries if the VM has a pass-through
+device attached.
+
+Opportunistically rename the helpers to clarify their AVIC relationship.
+
+	Signed-off-by: Sean Christopherson <seanjc@google.com>
+Message-Id: <20211208015236.1616697-24-seanjc@google.com>
+	Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+(cherry picked from commit a3c19d5beaad25fcaa703b251c72c3a22fc09100)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kvm/svm/avic.c
+diff --cc arch/x86/kvm/svm/avic.c
+index ea2456874260,90364d02f22a..000000000000
+--- a/arch/x86/kvm/svm/avic.c
++++ b/arch/x86/kvm/svm/avic.c
+@@@ -1009,32 -1027,42 +1009,36 @@@ void avic_vcpu_put(struct kvm_vcpu *vcp
+  	WRITE_ONCE(*(svm->avic_physical_id_cache), entry);
+  }
+  
+ -void avic_vcpu_blocking(struct kvm_vcpu *vcpu)
+++<<<<<<< HEAD
+ +/*
+ + * This function is called during VCPU halt/unhalt.
+ + */
+ +static void avic_set_running(struct kvm_vcpu *vcpu, bool is_run)
+  {
+ -	if (!kvm_vcpu_apicv_active(vcpu))
+ -		return;
+ +	struct vcpu_svm *svm = to_svm(vcpu);
+ +	int cpu = get_cpu();
+ +
+ +	WARN_ON(cpu != vcpu->cpu);
+ +	svm->avic_is_running = is_run;
+  
+ -	preempt_disable();
+ -
+ -       /*
+ -        * Unload the AVIC when the vCPU is about to block, _before_
+ -        * the vCPU actually blocks.
+ -        *
+ -        * Any IRQs that arrive before IsRunning=0 will not cause an
+ -        * incomplete IPI vmexit on the source, therefore vIRR will also
+ -        * be checked by kvm_vcpu_check_block() before blocking.  The
+ -        * memory barrier implicit in set_current_state orders writing
+ -        * IsRunning=0 before reading the vIRR.  The processor needs a
+ -        * matching memory barrier on interrupt delivery between writing
+ -        * IRR and reading IsRunning; the lack of this barrier might be
+ -        * the cause of errata #1235).
+ -        */
+ -	avic_vcpu_put(vcpu);
+ -
+ -	preempt_enable();
+ +	if (kvm_vcpu_apicv_active(vcpu)) {
+ +		if (is_run)
+ +			avic_vcpu_load(vcpu, cpu);
+ +		else
+ +			avic_vcpu_put(vcpu);
+ +	}
+ +	put_cpu();
+  }
+  
+ -void avic_vcpu_unblocking(struct kvm_vcpu *vcpu)
+ +void svm_vcpu_blocking(struct kvm_vcpu *vcpu)
+++=======
+++void avic_vcpu_blocking(struct kvm_vcpu *vcpu)
+++>>>>>>> a3c19d5beaad (KVM: SVM: Nullify vcpu_(un)blocking() hooks if AVIC is disabled)
+  {
+ -	int cpu;
+ -
+ -	if (!kvm_vcpu_apicv_active(vcpu))
+ -		return;
+ -
+ -	cpu = get_cpu();
+ -	WARN_ON(cpu != vcpu->cpu);
+ -
+ -	avic_vcpu_load(vcpu, cpu);
+ +	avic_set_running(vcpu, false);
+ +}
+  
+- void svm_vcpu_unblocking(struct kvm_vcpu *vcpu)
+ -	put_cpu();
+++void avic_vcpu_unblocking(struct kvm_vcpu *vcpu)
+ +{
+ +	avic_set_running(vcpu, true);
+  }
+* Unmerged path arch/x86/kvm/svm/avic.c
+diff --git a/arch/x86/kvm/svm/svm.c b/arch/x86/kvm/svm/svm.c
+index 71757e7fc083..41244a528e73 100644
+--- a/arch/x86/kvm/svm/svm.c
++++ b/arch/x86/kvm/svm/svm.c
+@@ -4396,8 +4396,8 @@ static struct kvm_x86_ops svm_x86_ops __initdata = {
+ 	.prepare_guest_switch = svm_prepare_guest_switch,
+ 	.vcpu_load = svm_vcpu_load,
+ 	.vcpu_put = svm_vcpu_put,
+-	.vcpu_blocking = svm_vcpu_blocking,
+-	.vcpu_unblocking = svm_vcpu_unblocking,
++	.vcpu_blocking = avic_vcpu_blocking,
++	.vcpu_unblocking = avic_vcpu_unblocking,
+ 
+ 	.update_exception_bitmap = svm_update_exception_bitmap,
+ 	.get_msr_feature = svm_get_msr_feature,
+@@ -4686,6 +4686,9 @@ static __init int svm_hardware_setup(void)
+ 		pr_info("AVIC enabled\n");
+ 
+ 		amd_iommu_register_ga_log_notifier(&avic_ga_log_notifier);
++	} else {
++		svm_x86_ops.vcpu_blocking = NULL;
++		svm_x86_ops.vcpu_unblocking = NULL;
+ 	}
+ 
+ 	if (vls) {
+diff --git a/arch/x86/kvm/svm/svm.h b/arch/x86/kvm/svm/svm.h
+index d621bc4d7ea8..7d63a3888970 100644
+--- a/arch/x86/kvm/svm/svm.h
++++ b/arch/x86/kvm/svm/svm.h
+@@ -591,8 +591,8 @@ int svm_deliver_avic_intr(struct kvm_vcpu *vcpu, int vec);
+ bool svm_dy_apicv_has_pending_interrupt(struct kvm_vcpu *vcpu);
+ int svm_update_pi_irte(struct kvm *kvm, unsigned int host_irq,
+ 		       uint32_t guest_irq, bool set);
+-void svm_vcpu_blocking(struct kvm_vcpu *vcpu);
+-void svm_vcpu_unblocking(struct kvm_vcpu *vcpu);
++void avic_vcpu_blocking(struct kvm_vcpu *vcpu);
++void avic_vcpu_unblocking(struct kvm_vcpu *vcpu);
+ 
+ /* sev.c */
+ 
