@@ -1,0 +1,206 @@
+nfsd: clients don't need to break their own delegations
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author J. Bruce Fields <bfields@redhat.com>
+commit 28df3d1539de5090f7916f6fff03891b67f366f4
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/28df3d15.failed
+
+We currently revoke read delegations on any write open or any operation
+that modifies file data or metadata (including rename, link, and
+unlink).  But if the delegation in question is the only read delegation
+and is held by the client performing the operation, that's not really
+necessary.
+
+It's not always possible to prevent this in the NFSv4.0 case, because
+there's not always a way to determine which client an NFSv4.0 delegation
+came from.  (In theory we could try to guess this from the transport
+layer, e.g., by assuming all traffic on a given TCP connection comes
+from the same client.  But that's not really correct.)
+
+In the NFSv4.1 case the session layer always tells us the client.
+
+This patch should remove such self-conflicts in all cases where we can
+reliably determine the client from the compound.
+
+To do that we need to track "who" is performing a given (possibly
+lease-breaking) file operation.  We're doing that by storing the
+information in the svc_rqst and using kthread_data() to map the current
+task back to a svc_rqst.
+
+	Signed-off-by: J. Bruce Fields <bfields@redhat.com>
+(cherry picked from commit 28df3d1539de5090f7916f6fff03891b67f366f4)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	Documentation/filesystems/Locking
+#	fs/nfsd/nfsd.h
+#	include/linux/fs.h
+diff --cc Documentation/filesystems/Locking
+index 1255412c78ca,9fdcec416614..000000000000
+--- a/Documentation/filesystems/Locking
++++ b/Documentation/filesystems/Locking
+@@@ -375,19 -436,14 +376,24 @@@ lm_notify:		yes		yes			n
+  lm_grant:		no		no			no
+  lm_break:		yes		no			no
+  lm_change		yes		no			no
+++<<<<<<< HEAD:Documentation/filesystems/Locking
+++=======
++ lm_breaker_owns_lease:	no		no			no
++ ==========		=============	=================	=========
+ -
+ -buffer_head
+ -===========
+ -
+ -prototypes::
+ -
+++>>>>>>> 28df3d1539de (nfsd: clients don't need to break their own delegations):Documentation/filesystems/locking.rst
+ +
+ +[1]:	->lm_compare_owner and ->lm_owner_key are generally called with
+ +*an* inode->i_lock held. It may not be the i_lock of the inode
+ +associated with either file_lock argument! This is the case with deadlock
+ +detection, since the code has to chase down the owners of locks that may
+ +be entirely unrelated to the one on which the lock is being acquired.
+ +For deadlock detection however, the blocked_lock_lock is also held. The
+ +fact that these locks are held ensures that the file_locks do not
+ +disappear out from under you while doing the comparison or generating an
+ +owner key.
+ +
+ +--------------------------- buffer_head -----------------------------------
+ +prototypes:
+  	void (*b_end_io)(struct buffer_head *bh, int uptodate);
+  
+  locking rules:
+diff --cc fs/nfsd/nfsd.h
+index 8dec7b05da66,36cdd81b6688..000000000000
+--- a/fs/nfsd/nfsd.h
++++ b/fs/nfsd/nfsd.h
+@@@ -87,7 -88,7 +87,11 @@@ int		nfsd_pool_stats_release(struct ino
+  
+  void		nfsd_destroy(struct net *net);
+  
+++<<<<<<< HEAD
+ +int get_nfsdfs(struct net *);
+++=======
++ bool		i_am_nfsd(void);
+++>>>>>>> 28df3d1539de (nfsd: clients don't need to break their own delegations)
+  
+  struct nfsdfs_client {
+  	struct kref cl_ref;
+diff --cc include/linux/fs.h
+index 2fcb144c2f59,4b784560ffaf..000000000000
+--- a/include/linux/fs.h
++++ b/include/linux/fs.h
+@@@ -998,8 -1045,7 +998,12 @@@ struct lock_manager_operations 
+  	bool (*lm_break)(struct file_lock *);
+  	int (*lm_change)(struct file_lock *, int, struct list_head *);
+  	void (*lm_setup)(struct file_lock *, void **);
+++<<<<<<< HEAD
+ +	RH_KABI_RESERVE(1)
+ +	RH_KABI_RESERVE(2)
+++=======
++ 	bool (*lm_breaker_owns_lease)(struct file_lock *);
+++>>>>>>> 28df3d1539de (nfsd: clients don't need to break their own delegations)
+  };
+  
+  struct lock_manager {
+* Unmerged path Documentation/filesystems/Locking
+diff --git a/fs/locks.c b/fs/locks.c
+index 184c12e20ec1..347260eff1b7 100644
+--- a/fs/locks.c
++++ b/fs/locks.c
+@@ -1411,6 +1411,9 @@ static bool leases_conflict(struct file_lock *lease, struct file_lock *breaker)
+ {
+ 	bool rc;
+ 
++	if (lease->fl_lmops->lm_breaker_owns_lease
++			&& lease->fl_lmops->lm_breaker_owns_lease(lease))
++		return false;
+ 	if ((breaker->fl_flags & FL_LAYOUT) != (lease->fl_flags & FL_LAYOUT)) {
+ 		rc = false;
+ 		goto trace;
+diff --git a/fs/nfsd/nfs4proc.c b/fs/nfsd/nfs4proc.c
+index 3b8e1548e6e2..9f7d64d1de24 100644
+--- a/fs/nfsd/nfs4proc.c
++++ b/fs/nfsd/nfs4proc.c
+@@ -1960,6 +1960,8 @@ nfsd4_proc_compound(struct svc_rqst *rqstp)
+ 		goto encode_op;
+ 	}
+ 
++	rqstp->rq_lease_breaker = (void **)&cstate->clp;
++
+ 	trace_nfsd_compound(rqstp, args->opcnt);
+ 	while (!status && resp->opcnt < args->opcnt) {
+ 		op = &args->ops[resp->opcnt++];
+diff --git a/fs/nfsd/nfs4state.c b/fs/nfsd/nfs4state.c
+index adda3cec83e9..fea4a1fff164 100644
+--- a/fs/nfsd/nfs4state.c
++++ b/fs/nfsd/nfs4state.c
+@@ -4515,6 +4515,19 @@ nfsd_break_deleg_cb(struct file_lock *fl)
+ 	return ret;
+ }
+ 
++static bool nfsd_breaker_owns_lease(struct file_lock *fl)
++{
++	struct nfs4_delegation *dl = fl->fl_owner;
++	struct svc_rqst *rqst;
++	struct nfs4_client *clp;
++
++	if (!i_am_nfsd())
++		return NULL;
++	rqst = kthread_data(current);
++	clp = *(rqst->rq_lease_breaker);
++	return dl->dl_stid.sc_client == clp;
++}
++
+ static int
+ nfsd_change_deleg_cb(struct file_lock *onlist, int arg,
+ 		     struct list_head *dispose)
+@@ -4526,6 +4539,7 @@ nfsd_change_deleg_cb(struct file_lock *onlist, int arg,
+ }
+ 
+ static const struct lock_manager_operations nfsd_lease_mng_ops = {
++	.lm_breaker_owns_lease = nfsd_breaker_owns_lease,
+ 	.lm_break = nfsd_break_deleg_cb,
+ 	.lm_change = nfsd_change_deleg_cb,
+ };
+* Unmerged path fs/nfsd/nfsd.h
+diff --git a/fs/nfsd/nfssvc.c b/fs/nfsd/nfssvc.c
+index 9447c6237803..f344eedddb7d 100644
+--- a/fs/nfsd/nfssvc.c
++++ b/fs/nfsd/nfssvc.c
+@@ -593,6 +593,11 @@ static const struct svc_serv_ops nfsd_thread_sv_ops = {
+ 	.svo_module		= THIS_MODULE,
+ };
+ 
++bool i_am_nfsd()
++{
++	return kthread_func(current) == nfsd;
++}
++
+ int nfsd_create_serv(struct net *net)
+ {
+ 	int error;
+@@ -1003,6 +1008,7 @@ nfsd_dispatch(struct svc_rqst *rqstp, __be32 *statp)
+ 		*statp = rpc_garbage_args;
+ 		return 1;
+ 	}
++	rqstp->rq_lease_breaker = NULL;
+ 	/*
+ 	 * Give the xdr decoder a chance to change this if it wants
+ 	 * (necessary in the NFSv4.0 compound case)
+* Unmerged path include/linux/fs.h
+diff --git a/include/linux/sunrpc/svc.h b/include/linux/sunrpc/svc.h
+index 05da19a0516d..386628b36bc7 100644
+--- a/include/linux/sunrpc/svc.h
++++ b/include/linux/sunrpc/svc.h
+@@ -300,6 +300,7 @@ struct svc_rqst {
+ 	struct net		*rq_bc_net;	/* pointer to backchannel's
+ 						 * net namespace
+ 						 */
++	void **			rq_lease_breaker; /* The v4 client breaking a lease */
+ };
+ 
+ #define SVC_NET(rqst) (rqst->rq_xprt ? rqst->rq_xprt->xpt_net : rqst->rq_bc_net)
