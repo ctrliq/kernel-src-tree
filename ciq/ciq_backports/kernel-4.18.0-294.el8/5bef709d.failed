@@ -1,0 +1,337 @@
+net/mlx5: Enable host PF HCA after eswitch is initialized
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Parav Pandit <parav@nvidia.com>
+commit 5bef709d76a28a50a5beaac9f1af1facf66af7f3
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/5bef709d.failed
+
+Currently ECPF enables external host PF too early in the initialization
+sequence for Ethernet links when ECPF is eswitch manager.
+
+Due to this, when external host PF driver is loaded, host PF's HCA CAP has
+inner_ip_version supported by NIC RX flow table.
+This capability is later updated by firmware after ECPF driver enables
+ENCAP/DECAP as eswitch manager.
+
+This results into a timing race condition, where CREATE_TIR command
+fails with a below syndrome on host PF.
+
+mlx5_cmd_check:775:(pid 510): CREATE_TIR(0x900) op_mod(0x0) failed,
+status bad parameter(0x3), syndrome (0x562b00)
+
+Hence, enable the external host PF after necessary eswitch and per vport
+initialization is completed.
+Continue to enable host PF when eswitch manager capability is off for a
+ECPF.
+
+	Signed-off-by: Parav Pandit <parav@nvidia.com>
+	Reviewed-by: Bodong Wang <bodong@nvidia.com>
+	Signed-off-by: Saeed Mahameed <saeedm@nvidia.com>
+(cherry picked from commit 5bef709d76a28a50a5beaac9f1af1facf66af7f3)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/mellanox/mlx5/core/eswitch.c
+diff --cc drivers/net/ethernet/mellanox/mlx5/core/eswitch.c
+index 5ad4c0400fe4,dcd8946a843c..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx5/core/eswitch.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/eswitch.c
+@@@ -1436,6 -1416,79 +1436,82 @@@ static void mlx5_eswitch_clear_vf_vport
+  /* Public E-Switch API */
+  #define ESW_ALLOWED(esw) ((esw) && MLX5_ESWITCH_MANAGER((esw)->dev))
+  
+++<<<<<<< HEAD
+++=======
++ int mlx5_eswitch_load_vport(struct mlx5_eswitch *esw, u16 vport_num,
++ 			    enum mlx5_eswitch_vport_event enabled_events)
++ {
++ 	int err;
++ 
++ 	err = esw_enable_vport(esw, vport_num, enabled_events);
++ 	if (err)
++ 		return err;
++ 
++ 	err = esw_offloads_load_rep(esw, vport_num);
++ 	if (err)
++ 		goto err_rep;
++ 
++ 	return err;
++ 
++ err_rep:
++ 	esw_disable_vport(esw, vport_num);
++ 	return err;
++ }
++ 
++ void mlx5_eswitch_unload_vport(struct mlx5_eswitch *esw, u16 vport_num)
++ {
++ 	esw_offloads_unload_rep(esw, vport_num);
++ 	esw_disable_vport(esw, vport_num);
++ }
++ 
++ void mlx5_eswitch_unload_vf_vports(struct mlx5_eswitch *esw, u16 num_vfs)
++ {
++ 	int i;
++ 
++ 	mlx5_esw_for_each_vf_vport_num_reverse(esw, i, num_vfs)
++ 		mlx5_eswitch_unload_vport(esw, i);
++ }
++ 
++ int mlx5_eswitch_load_vf_vports(struct mlx5_eswitch *esw, u16 num_vfs,
++ 				enum mlx5_eswitch_vport_event enabled_events)
++ {
++ 	int err;
++ 	int i;
++ 
++ 	mlx5_esw_for_each_vf_vport_num(esw, i, num_vfs) {
++ 		err = mlx5_eswitch_load_vport(esw, i, enabled_events);
++ 		if (err)
++ 			goto vf_err;
++ 	}
++ 
++ 	return 0;
++ 
++ vf_err:
++ 	mlx5_eswitch_unload_vf_vports(esw, i - 1);
++ 	return err;
++ }
++ 
++ static int host_pf_enable_hca(struct mlx5_core_dev *dev)
++ {
++ 	if (!mlx5_core_is_ecpf(dev))
++ 		return 0;
++ 
++ 	/* Once vport and representor are ready, take out the external host PF
++ 	 * out of initializing state. Enabling HCA clears the iser->initializing
++ 	 * bit and host PF driver loading can progress.
++ 	 */
++ 	return mlx5_cmd_host_pf_enable_hca(dev);
++ }
++ 
++ static void host_pf_disable_hca(struct mlx5_core_dev *dev)
++ {
++ 	if (!mlx5_core_is_ecpf(dev))
++ 		return;
++ 
++ 	mlx5_cmd_host_pf_disable_hca(dev);
++ }
++ 
+++>>>>>>> 5bef709d76a2 (net/mlx5: Enable host PF HCA after eswitch is initialized)
+  /* mlx5_eswitch_enable_pf_vf_vports() enables vports of PF, ECPF and VFs
+   * whichever are present on the eswitch.
+   */
+@@@ -1454,10 -1503,14 +1530,15 @@@ mlx5_eswitch_enable_pf_vf_vports(struc
+  	if (ret)
+  		return ret;
+  
++ 	/* Enable external host PF HCA */
++ 	ret = host_pf_enable_hca(esw->dev);
++ 	if (ret)
++ 		goto pf_hca_err;
++ 
+  	/* Enable ECPF vport */
+  	if (mlx5_ecpf_vport_exists(esw->dev)) {
+ -		ret = mlx5_eswitch_load_vport(esw, MLX5_VPORT_ECPF, enabled_events);
+ +		vport = mlx5_eswitch_get_vport(esw, MLX5_VPORT_ECPF);
+ +		ret = esw_enable_vport(esw, vport, enabled_events);
+  		if (ret)
+  			goto ecpf_err;
+  	}
+@@@ -1471,18 -1523,12 +1552,27 @@@
+  	return 0;
+  
+  vf_err:
+++<<<<<<< HEAD
+ +	num_vfs = i - 1;
+ +	mlx5_esw_for_each_vf_vport_reverse(esw, i, vport, num_vfs)
+ +		esw_disable_vport(esw, vport);
+ +
+ +	if (mlx5_ecpf_vport_exists(esw->dev)) {
+ +		vport = mlx5_eswitch_get_vport(esw, MLX5_VPORT_ECPF);
+ +		esw_disable_vport(esw, vport);
+ +	}
+ +
+ +ecpf_err:
+ +	vport = mlx5_eswitch_get_vport(esw, MLX5_VPORT_PF);
+ +	esw_disable_vport(esw, vport);
+++=======
++ 	if (mlx5_ecpf_vport_exists(esw->dev))
++ 		mlx5_eswitch_unload_vport(esw, MLX5_VPORT_ECPF);
++ ecpf_err:
++ 	host_pf_disable_hca(esw->dev);
++ pf_hca_err:
++ 	mlx5_eswitch_unload_vport(esw, MLX5_VPORT_PF);
+++>>>>>>> 5bef709d76a2 (net/mlx5: Enable host PF HCA after eswitch is initialized)
+  	return ret;
+  }
+  
+@@@ -1491,11 -1537,13 +1581,19 @@@
+   */
+  void mlx5_eswitch_disable_pf_vf_vports(struct mlx5_eswitch *esw)
+  {
+ -	mlx5_eswitch_unload_vf_vports(esw, esw->esw_funcs.num_vfs);
+ +	struct mlx5_vport *vport;
+ +	int i;
+  
+++<<<<<<< HEAD
+ +	mlx5_esw_for_all_vports_reverse(esw, i, vport)
+ +		esw_disable_vport(esw, vport);
+++=======
++ 	if (mlx5_ecpf_vport_exists(esw->dev))
++ 		mlx5_eswitch_unload_vport(esw, MLX5_VPORT_ECPF);
++ 
++ 	host_pf_disable_hca(esw->dev);
++ 	mlx5_eswitch_unload_vport(esw, MLX5_VPORT_PF);
+++>>>>>>> 5bef709d76a2 (net/mlx5: Enable host PF HCA after eswitch is initialized)
+  }
+  
+  static void mlx5_eswitch_get_devlink_param(struct mlx5_eswitch *esw)
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/ecpf.c b/drivers/net/ethernet/mellanox/mlx5/core/ecpf.c
+index 68ca0e2b26cd..464eb3a18450 100644
+--- a/drivers/net/ethernet/mellanox/mlx5/core/ecpf.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/ecpf.c
+@@ -8,7 +8,16 @@ bool mlx5_read_embedded_cpu(struct mlx5_core_dev *dev)
+ 	return (ioread32be(&dev->iseg->initializing) >> MLX5_ECPU_BIT_NUM) & 1;
+ }
+ 
+-static int mlx5_cmd_host_pf_enable_hca(struct mlx5_core_dev *dev)
++static bool mlx5_ecpf_esw_admins_host_pf(const struct mlx5_core_dev *dev)
++{
++	/* In separate host mode, PF enables itself.
++	 * When ECPF is eswitch manager, eswitch enables host PF after
++	 * eswitch is setup.
++	 */
++	return mlx5_core_is_ecpf_esw_manager(dev);
++}
++
++int mlx5_cmd_host_pf_enable_hca(struct mlx5_core_dev *dev)
+ {
+ 	u32 out[MLX5_ST_SZ_DW(enable_hca_out)] = {};
+ 	u32 in[MLX5_ST_SZ_DW(enable_hca_in)]   = {};
+@@ -19,7 +28,7 @@ static int mlx5_cmd_host_pf_enable_hca(struct mlx5_core_dev *dev)
+ 	return mlx5_cmd_exec(dev, &in, sizeof(in), &out, sizeof(out));
+ }
+ 
+-static int mlx5_cmd_host_pf_disable_hca(struct mlx5_core_dev *dev)
++int mlx5_cmd_host_pf_disable_hca(struct mlx5_core_dev *dev)
+ {
+ 	u32 out[MLX5_ST_SZ_DW(disable_hca_out)] = {};
+ 	u32 in[MLX5_ST_SZ_DW(disable_hca_in)]   = {};
+@@ -34,6 +43,12 @@ static int mlx5_host_pf_init(struct mlx5_core_dev *dev)
+ {
+ 	int err;
+ 
++	if (mlx5_ecpf_esw_admins_host_pf(dev))
++		return 0;
++
++	/* ECPF shall enable HCA for host PF in the same way a PF
++	 * does this for its VFs when ECPF is not a eswitch manager.
++	 */
+ 	err = mlx5_cmd_host_pf_enable_hca(dev);
+ 	if (err)
+ 		mlx5_core_err(dev, "Failed to enable external host PF HCA err(%d)\n", err);
+@@ -45,15 +60,14 @@ static void mlx5_host_pf_cleanup(struct mlx5_core_dev *dev)
+ {
+ 	int err;
+ 
++	if (mlx5_ecpf_esw_admins_host_pf(dev))
++		return;
++
+ 	err = mlx5_cmd_host_pf_disable_hca(dev);
+ 	if (err) {
+ 		mlx5_core_err(dev, "Failed to disable external host PF HCA err(%d)\n", err);
+ 		return;
+ 	}
+-
+-	err = mlx5_wait_for_pages(dev, &dev->priv.host_pf_pages);
+-	if (err)
+-		mlx5_core_warn(dev, "Timeout reclaiming external host PF pages err(%d)\n", err);
+ }
+ 
+ int mlx5_ec_init(struct mlx5_core_dev *dev)
+@@ -61,16 +75,19 @@ int mlx5_ec_init(struct mlx5_core_dev *dev)
+ 	if (!mlx5_core_is_ecpf(dev))
+ 		return 0;
+ 
+-	/* ECPF shall enable HCA for host PF in the same way a PF
+-	 * does this for its VFs.
+-	 */
+ 	return mlx5_host_pf_init(dev);
+ }
+ 
+ void mlx5_ec_cleanup(struct mlx5_core_dev *dev)
+ {
++	int err;
++
+ 	if (!mlx5_core_is_ecpf(dev))
+ 		return;
+ 
+ 	mlx5_host_pf_cleanup(dev);
++
++	err = mlx5_wait_for_pages(dev, &dev->priv.host_pf_pages);
++	if (err)
++		mlx5_core_warn(dev, "Timeout reclaiming external host PF pages err(%d)\n", err);
+ }
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/ecpf.h b/drivers/net/ethernet/mellanox/mlx5/core/ecpf.h
+index d3d7a00a02ac..40b6ad76dca6 100644
+--- a/drivers/net/ethernet/mellanox/mlx5/core/ecpf.h
++++ b/drivers/net/ethernet/mellanox/mlx5/core/ecpf.h
+@@ -17,6 +17,9 @@ bool mlx5_read_embedded_cpu(struct mlx5_core_dev *dev);
+ int mlx5_ec_init(struct mlx5_core_dev *dev);
+ void mlx5_ec_cleanup(struct mlx5_core_dev *dev);
+ 
++int mlx5_cmd_host_pf_enable_hca(struct mlx5_core_dev *dev);
++int mlx5_cmd_host_pf_disable_hca(struct mlx5_core_dev *dev);
++
+ #else  /* CONFIG_MLX5_ESWITCH */
+ 
+ static inline bool
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/eswitch.c
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/main.c b/drivers/net/ethernet/mellanox/mlx5/core/main.c
+index 712ca4fea58d..8d79b9dfec1c 100644
+--- a/drivers/net/ethernet/mellanox/mlx5/core/main.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/main.c
+@@ -1145,23 +1145,23 @@ static int mlx5_load(struct mlx5_core_dev *dev)
+ 		goto err_sriov;
+ 	}
+ 
+-	err = mlx5_sriov_attach(dev);
+-	if (err) {
+-		mlx5_core_err(dev, "sriov init failed %d\n", err);
+-		goto err_sriov;
+-	}
+-
+ 	err = mlx5_ec_init(dev);
+ 	if (err) {
+ 		mlx5_core_err(dev, "Failed to init embedded CPU\n");
+ 		goto err_ec;
+ 	}
+ 
++	err = mlx5_sriov_attach(dev);
++	if (err) {
++		mlx5_core_err(dev, "sriov init failed %d\n", err);
++		goto err_sriov;
++	}
++
+ 	return 0;
+ 
+-err_ec:
+-	mlx5_sriov_detach(dev);
+ err_sriov:
++	mlx5_ec_cleanup(dev);
++err_ec:
+ 	mlx5_cleanup_fs(dev);
+ err_fs:
+ 	mlx5_accel_tls_cleanup(dev);
+@@ -1186,8 +1186,8 @@ static int mlx5_load(struct mlx5_core_dev *dev)
+ 
+ static void mlx5_unload(struct mlx5_core_dev *dev)
+ {
+-	mlx5_ec_cleanup(dev);
+ 	mlx5_sriov_detach(dev);
++	mlx5_ec_cleanup(dev);
+ 	mlx5_cleanup_fs(dev);
+ 	mlx5_accel_ipsec_cleanup(dev);
+ 	mlx5_accel_tls_cleanup(dev);
