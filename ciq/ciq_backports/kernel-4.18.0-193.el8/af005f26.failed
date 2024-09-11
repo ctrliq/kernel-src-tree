@@ -1,0 +1,726 @@
+mt76: introduce mt76_sw_queue data structure
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-193.el8
+commit-author Lorenzo Bianconi <lorenzo@kernel.org>
+commit af005f2605956e596b335b40bce364963f0575a0
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-193.el8/af005f26.failed
+
+Introduce mt76_sw_queue data structure in order to support new
+chipsets (e.g. mt7615) that have a shared hardware queue for all traffic
+identifiers. mt76_sw_queue will be used to track outstanding packets
+
+	Signed-off-by: Lorenzo Bianconi <lorenzo@kernel.org>
+	Signed-off-by: Felix Fietkau <nbd@nbd.name>
+(cherry picked from commit af005f2605956e596b335b40bce364963f0575a0)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/wireless/mediatek/mt76/dma.c
+#	drivers/net/wireless/mediatek/mt76/mt76.h
+#	drivers/net/wireless/mediatek/mt76/mt7603/dma.c
+#	drivers/net/wireless/mediatek/mt76/mt7603/mac.c
+#	drivers/net/wireless/mediatek/mt76/mt76x02_usb_core.c
+#	drivers/net/wireless/mediatek/mt76/tx.c
+#	drivers/net/wireless/mediatek/mt76/usb.c
+diff --cc drivers/net/wireless/mediatek/mt76/dma.c
+index 4381155375e1,3bd277ec99f0..000000000000
+--- a/drivers/net/wireless/mediatek/mt76/dma.c
++++ b/drivers/net/wireless/mediatek/mt76/dma.c
+@@@ -161,40 -158,35 +161,50 @@@ mt76_dma_tx_cleanup(struct mt76_dev *de
+  	if (flush)
+  		last = -1;
+  	else
+ -		last = ioread32(&q->regs->dma_idx);
+ +		last = readl(&q->regs->dma_idx);
+  
+ -	while (q->queued && q->tail != last) {
+ +	while ((q->queued > n_queued) && q->tail != last) {
+  		mt76_dma_tx_cleanup_idx(dev, q, q->tail, &entry);
+  		if (entry.schedule)
+++<<<<<<< HEAD
+ +			n_swq_queued[entry.qid]++;
+++=======
++ 			dev->q_tx[qid].swq_queued--;
+++>>>>>>> af005f260595 (mt76: introduce mt76_sw_queue data structure)
+  
+  		q->tail = (q->tail + 1) % q->ndesc;
+ -		q->queued--;
+ +		n_queued++;
+  
+ -		if (entry.skb) {
+ -			spin_unlock_bh(&q->lock);
+ +		if (entry.skb)
+  			dev->drv->tx_complete_skb(dev, qid, &entry);
+ -			spin_lock_bh(&q->lock);
+ -		}
+  
+  		if (entry.txwi) {
+ -			mt76_put_txwi(dev, entry.txwi);
+ +			if (!(dev->drv->txwi_flags & MT_TXWI_NO_FREE))
+ +				mt76_put_txwi(dev, entry.txwi);
+  			wake = !flush;
+  		}
+  
+  		if (!flush && q->tail == last)
+ -			last = ioread32(&q->regs->dma_idx);
+ +			last = readl(&q->regs->dma_idx);
+  	}
+  
+++<<<<<<< HEAD
+ +	spin_lock_bh(&q->lock);
+ +
+ +	q->queued -= n_queued;
+ +	for (i = 0; i < ARRAY_SIZE(n_swq_queued); i++) {
+ +		if (!n_swq_queued[i])
+ +			continue;
+ +
+ +		dev->q_tx[i].swq_queued -= n_swq_queued[i];
+ +	}
+ +
+ +	if (flush)
+++=======
++ 	if (!flush)
++ 		mt76_txq_schedule(dev, sq);
++ 	else
+++>>>>>>> af005f260595 (mt76: introduce mt76_sw_queue data structure)
+  		mt76_dma_sync_idx(dev, q);
+  
+  	wake = wake && q->stopped &&
+@@@ -286,21 -278,19 +296,24 @@@ mt76_dma_tx_queue_skb_raw(struct mt76_d
+  	return 0;
+  }
+  
+ -int mt76_dma_tx_queue_skb(struct mt76_dev *dev, enum mt76_txq_id qid,
+ -			  struct sk_buff *skb, struct mt76_wcid *wcid,
+ -			  struct ieee80211_sta *sta)
+ +static int
+ +mt76_dma_tx_queue_skb(struct mt76_dev *dev, enum mt76_txq_id qid,
+ +		      struct sk_buff *skb, struct mt76_wcid *wcid,
+ +		      struct ieee80211_sta *sta)
+  {
+  	struct mt76_queue *q = dev->q_tx[qid].q;
+++<<<<<<< HEAD
+ +	struct mt76_tx_info tx_info = {
+ +		.skb = skb,
+ +	};
+ +	int len, n = 0, ret = -ENOMEM;
+++=======
+++>>>>>>> af005f260595 (mt76: introduce mt76_sw_queue data structure)
+  	struct mt76_queue_entry e;
+  	struct mt76_txwi_cache *t;
+ -	struct mt76_queue_buf buf[32];
+  	struct sk_buff *iter;
+  	dma_addr_t addr;
+ -	int len;
+ -	u32 tx_info = 0;
+ -	int n, ret;
+ +	u8 *txwi;
+  
+  	t = mt76_get_txwi(dev);
+  	if (!t) {
+diff --cc drivers/net/wireless/mediatek/mt76/mt76.h
+index 1c8ddf9c225d,e53d89e9c450..000000000000
+--- a/drivers/net/wireless/mediatek/mt76/mt76.h
++++ b/drivers/net/wireless/mediatek/mt76/mt76.h
+@@@ -134,15 -131,16 +134,22 @@@ struct mt76_queue 
+  	dma_addr_t desc_dma;
+  	struct sk_buff *rx_head;
+  	struct page_frag_cache rx_page;
+ -	spinlock_t rx_page_lock;
+ +};
+ +
+ +struct mt76_sw_queue {
+ +	struct mt76_queue *q;
+ +
+ +	struct list_head swq;
+ +	int swq_queued;
+  };
+  
++ struct mt76_sw_queue {
++ 	struct mt76_queue *q;
++ 
++ 	struct list_head swq;
++ 	int swq_queued;
++ };
++ 
+  struct mt76_mcu_ops {
+  	int (*mcu_send_msg)(struct mt76_dev *dev, int cmd, const void *data,
+  			    int len, bool wait_resp);
+@@@ -221,6 -217,7 +228,10 @@@ struct mt76_wcid 
+  };
+  
+  struct mt76_txq {
+++<<<<<<< HEAD
+++=======
++ 	struct list_head list;
+++>>>>>>> af005f260595 (mt76: introduce mt76_sw_queue data structure)
+  	struct mt76_sw_queue *swq;
+  	struct mt76_wcid *wcid;
+  
+@@@ -706,7 -663,7 +717,11 @@@ void mt76_txq_remove(struct mt76_dev *d
+  void mt76_wake_tx_queue(struct ieee80211_hw *hw, struct ieee80211_txq *txq);
+  void mt76_stop_tx_queues(struct mt76_dev *dev, struct ieee80211_sta *sta,
+  			 bool send_bar);
+++<<<<<<< HEAD
+ +void mt76_txq_schedule(struct mt76_dev *dev, enum mt76_txq_id qid);
+++=======
++ void mt76_txq_schedule(struct mt76_dev *dev, struct mt76_sw_queue *sq);
+++>>>>>>> af005f260595 (mt76: introduce mt76_sw_queue data structure)
+  void mt76_txq_schedule_all(struct mt76_dev *dev);
+  void mt76_release_buffered_frames(struct ieee80211_hw *hw,
+  				  struct ieee80211_sta *sta,
+diff --cc drivers/net/wireless/mediatek/mt76/mt7603/dma.c
+index b3ae0aaea62a,37cedfcedce4..000000000000
+--- a/drivers/net/wireless/mediatek/mt76/mt7603/dma.c
++++ b/drivers/net/wireless/mediatek/mt76/mt7603/dma.c
+@@@ -5,18 -5,22 +5,34 @@@
+  #include "../dma.h"
+  
+  static int
+- mt7603_init_tx_queue(struct mt7603_dev *dev, struct mt76_queue *q,
++ mt7603_init_tx_queue(struct mt7603_dev *dev, struct mt76_sw_queue *q,
+  		     int idx, int n_desc)
+  {
+++<<<<<<< HEAD
+ +	int ret;
+ +
+ +	q->hw_idx = idx;
+ +	q->regs = dev->mt76.mmio.regs + MT_TX_RING_BASE + idx * MT_RING_SIZE;
+ +	q->ndesc = n_desc;
+ +
+ +	ret = mt76_queue_alloc(dev, q);
+ +	if (ret)
+ +		return ret;
+++=======
++ 	struct mt76_queue *hwq;
++ 	int err;
++ 
++ 	hwq = devm_kzalloc(dev->mt76.dev, sizeof(*hwq), GFP_KERNEL);
++ 	if (!hwq)
++ 		return -ENOMEM;
++ 
++ 	err = mt76_queue_alloc(dev, hwq, idx, n_desc, 0, MT_TX_RING_BASE);
++ 	if (err < 0)
++ 		return err;
+++>>>>>>> af005f260595 (mt76: introduce mt76_sw_queue data structure)
++ 
++ 	INIT_LIST_HEAD(&q->swq);
++ 	q->q = hwq;
+  
+  	mt7603_irq_enable(dev, MT_INT_TX_DONE(idx));
+  
+diff --cc drivers/net/wireless/mediatek/mt76/mt7603/mac.c
+index 5abc02b57818,d65c8e8d8cee..000000000000
+--- a/drivers/net/wireless/mediatek/mt76/mt7603/mac.c
++++ b/drivers/net/wireless/mediatek/mt76/mt7603/mac.c
+@@@ -792,6 -792,7 +792,10 @@@ mt7603_mac_write_txwi(struct mt7603_de
+  	struct ieee80211_hdr *hdr = (struct ieee80211_hdr *)skb->data;
+  	struct ieee80211_bar *bar = (struct ieee80211_bar *)skb->data;
+  	struct ieee80211_vif *vif = info->control.vif;
+++<<<<<<< HEAD
+++=======
++ 	struct mt76_queue *q = dev->mt76.q_tx[qid].q;
+++>>>>>>> af005f260595 (mt76: introduce mt76_sw_queue data structure)
+  	struct mt7603_vif *mvif;
+  	int wlan_idx;
+  	int hdr_len = ieee80211_get_hdrlen_from_skb(skb);
+diff --cc drivers/net/wireless/mediatek/mt76/mt76x02_usb_core.c
+index 5e4f3a8c5784,8ab63255ba6f..000000000000
+--- a/drivers/net/wireless/mediatek/mt76/mt76x02_usb_core.c
++++ b/drivers/net/wireless/mediatek/mt76/mt76x02_usb_core.c
+@@@ -72,14 -72,13 +72,18 @@@ int mt76x02u_skb_dma_info(struct sk_buf
+  }
+  
+  int mt76x02u_tx_prepare_skb(struct mt76_dev *mdev, void *data,
+ -			    struct sk_buff *skb, enum mt76_txq_id qid,
+ -			    struct mt76_wcid *wcid, struct ieee80211_sta *sta,
+ -			    u32 *tx_info)
+ +			    enum mt76_txq_id qid, struct mt76_wcid *wcid,
+ +			    struct ieee80211_sta *sta,
+ +			    struct mt76_tx_info *tx_info)
+  {
+  	struct mt76x02_dev *dev = container_of(mdev, struct mt76x02_dev, mt76);
+++<<<<<<< HEAD
+ +	int pid, len = tx_info->skb->len, ep = q2ep(mdev->q_tx[qid].q->hw_idx);
+++=======
++ 	int pid, len = skb->len, ep = q2ep(mdev->q_tx[qid].q->hw_idx);
+++>>>>>>> af005f260595 (mt76: introduce mt76_sw_queue data structure)
+  	struct mt76x02_txwi *txwi;
+ +	bool ampdu = IEEE80211_SKB_CB(tx_info->skb)->flags & IEEE80211_TX_CTL_AMPDU;
+  	enum mt76_qsel qsel;
+  	u32 flags;
+  
+diff --cc drivers/net/wireless/mediatek/mt76/tx.c
+index 5397827668b9,d3d4d87fadb5..000000000000
+--- a/drivers/net/wireless/mediatek/mt76/tx.c
++++ b/drivers/net/wireless/mediatek/mt76/tx.c
+@@@ -471,7 -468,6 +471,10 @@@ mt76_txq_send_burst(struct mt76_dev *de
+  	} while (n_frames < limit);
+  
+  	if (!probe) {
+++<<<<<<< HEAD
+ +		hwq->entry[idx].qid = sq - dev->q_tx;
+++=======
+++>>>>>>> af005f260595 (mt76: introduce mt76_sw_queue data structure)
+  		hwq->entry[idx].schedule = true;
+  		sq->swq_queued++;
+  	}
+@@@ -482,37 -478,23 +485,53 @@@
+  }
+  
+  static int
+++<<<<<<< HEAD
+ +mt76_txq_schedule_list(struct mt76_dev *dev, enum mt76_txq_id qid)
+ +{
+ +	struct mt76_sw_queue *sq = &dev->q_tx[qid];
+ +	struct mt76_queue *hwq = sq->q;
+ +	struct ieee80211_txq *txq;
+ +	struct mt76_txq *mtxq;
+ +	struct mt76_wcid *wcid;
+ +	int ret = 0;
+ +
+ +	spin_lock_bh(&hwq->lock);
+ +	while (1) {
+++=======
++ mt76_txq_schedule_list(struct mt76_dev *dev, struct mt76_sw_queue *sq)
++ {
++ 	struct mt76_queue *hwq = sq->q;
++ 	struct mt76_txq *mtxq, *mtxq_last;
++ 	int len = 0;
++ 
++ restart:
++ 	mtxq_last = list_last_entry(&sq->swq, struct mt76_txq, list);
++ 	while (!list_empty(&sq->swq)) {
+++>>>>>>> af005f260595 (mt76: introduce mt76_sw_queue data structure)
+  		bool empty = false;
+ -		int cur;
+ +
+ +		if (sq->swq_queued >= 4)
+ +			break;
+  
+  		if (test_bit(MT76_OFFCHANNEL, &dev->state) ||
+ -		    test_bit(MT76_RESET, &dev->state))
+ -			return -EBUSY;
+ +		    test_bit(MT76_RESET, &dev->state)) {
+ +			ret = -EBUSY;
+ +			break;
+ +		}
+  
+ +		txq = ieee80211_next_txq(dev->hw, qid);
+ +		if (!txq)
+ +			break;
+ +
+ +		mtxq = (struct mt76_txq *)txq->drv_priv;
+ +		wcid = mtxq->wcid;
+ +		if (wcid && test_bit(MT_WCID_FLAG_PS, &wcid->flags))
+ +			continue;
+ +
+++<<<<<<< HEAD
+++=======
++ 		mtxq = list_first_entry(&sq->swq, struct mt76_txq, list);
+++>>>>>>> af005f260595 (mt76: introduce mt76_sw_queue data structure)
+  		if (mtxq->send_bar && mtxq->aggr) {
+  			struct ieee80211_txq *txq = mtxq_to_txq(mtxq);
+  			struct ieee80211_sta *sta = txq->sta;
+@@@ -524,37 -506,38 +543,66 @@@
+  			spin_unlock_bh(&hwq->lock);
+  			ieee80211_send_bar(vif, sta->addr, tid, agg_ssn);
+  			spin_lock_bh(&hwq->lock);
+ -			goto restart;
+  		}
+  
+++<<<<<<< HEAD
+ +		ret += mt76_txq_send_burst(dev, sq, mtxq, &empty);
+ +		if (skb_queue_empty(&mtxq->retry_q))
+ +			empty = true;
+ +		ieee80211_return_txq(dev->hw, txq, !empty);
+++=======
++ 		list_del_init(&mtxq->list);
++ 
++ 		cur = mt76_txq_send_burst(dev, sq, mtxq, &empty);
++ 		if (!empty)
++ 			list_add_tail(&mtxq->list, &sq->swq);
++ 
++ 		if (cur < 0)
++ 			return cur;
++ 
++ 		len += cur;
++ 
++ 		if (mtxq == mtxq_last)
++ 			break;
+++>>>>>>> af005f260595 (mt76: introduce mt76_sw_queue data structure)
+  	}
+ +	spin_unlock_bh(&hwq->lock);
+  
+ -	return len;
+ +	return ret;
+  }
+  
+++<<<<<<< HEAD
+ +void mt76_txq_schedule(struct mt76_dev *dev, enum mt76_txq_id qid)
+++=======
++ void mt76_txq_schedule(struct mt76_dev *dev, struct mt76_sw_queue *sq)
+++>>>>>>> af005f260595 (mt76: introduce mt76_sw_queue data structure)
+  {
+ +	struct mt76_sw_queue *sq = &dev->q_tx[qid];
+  	int len;
+  
+++<<<<<<< HEAD
+ +	if (qid >= 4)
+ +		return;
+ +
+ +	if (sq->swq_queued >= 4)
+ +		return;
+ +
+ +	rcu_read_lock();
+ +
+ +	do {
+ +		ieee80211_txq_schedule_start(dev->hw, qid);
+ +		len = mt76_txq_schedule_list(dev, qid);
+ +		ieee80211_txq_schedule_end(dev->hw, qid);
+++=======
++ 	rcu_read_lock();
++ 	do {
++ 		if (sq->swq_queued >= 4 || list_empty(&sq->swq))
++ 			break;
++ 
++ 		len = mt76_txq_schedule_list(dev, sq);
+++>>>>>>> af005f260595 (mt76: introduce mt76_sw_queue data structure)
+  	} while (len > 0);
+ +
+  	rcu_read_unlock();
+  }
+  EXPORT_SYMBOL_GPL(mt76_txq_schedule);
+@@@ -563,8 -546,13 +611,18 @@@ void mt76_txq_schedule_all(struct mt76_
+  {
+  	int i;
+  
+++<<<<<<< HEAD
+ +	for (i = 0; i <= MT_TXQ_BK; i++)
+ +		mt76_txq_schedule(dev, i);
+++=======
++ 	for (i = 0; i <= MT_TXQ_BK; i++) {
++ 		struct mt76_queue *q = dev->q_tx[i].q;
++ 
++ 		spin_lock_bh(&q->lock);
++ 		mt76_txq_schedule(dev, &dev->q_tx[i]);
++ 		spin_unlock_bh(&q->lock);
++ 	}
+++>>>>>>> af005f260595 (mt76: introduce mt76_sw_queue data structure)
+  }
+  EXPORT_SYMBOL_GPL(mt76_txq_schedule_all);
+  
+@@@ -586,6 -574,8 +644,11 @@@ void mt76_stop_tx_queues(struct mt76_de
+  
+  		spin_lock_bh(&hwq->lock);
+  		mtxq->send_bar = mtxq->aggr && send_bar;
+++<<<<<<< HEAD
+++=======
++ 		if (!list_empty(&mtxq->list))
++ 			list_del_init(&mtxq->list);
+++>>>>>>> af005f260595 (mt76: introduce mt76_sw_queue data structure)
+  		spin_unlock_bh(&hwq->lock);
+  	}
+  }
+@@@ -594,16 -584,24 +657,34 @@@ EXPORT_SYMBOL_GPL(mt76_stop_tx_queues)
+  void mt76_wake_tx_queue(struct ieee80211_hw *hw, struct ieee80211_txq *txq)
+  {
+  	struct mt76_dev *dev = hw->priv;
+++<<<<<<< HEAD
+++=======
++ 	struct mt76_txq *mtxq = (struct mt76_txq *)txq->drv_priv;
++ 	struct mt76_sw_queue *sq = mtxq->swq;
++ 	struct mt76_queue *hwq = sq->q;
+++>>>>>>> af005f260595 (mt76: introduce mt76_sw_queue data structure)
+  
+  	if (!test_bit(MT76_STATE_RUNNING, &dev->state))
+  		return;
+  
+++<<<<<<< HEAD
+ +	tasklet_schedule(&dev->tx_tasklet);
+++=======
++ 	spin_lock_bh(&hwq->lock);
++ 	if (list_empty(&mtxq->list))
++ 		list_add_tail(&mtxq->list, &sq->swq);
++ 	mt76_txq_schedule(dev, sq);
++ 	spin_unlock_bh(&hwq->lock);
+++>>>>>>> af005f260595 (mt76: introduce mt76_sw_queue data structure)
+  }
+  EXPORT_SYMBOL_GPL(mt76_wake_tx_queue);
+  
+  void mt76_txq_remove(struct mt76_dev *dev, struct ieee80211_txq *txq)
+  {
+++<<<<<<< HEAD
+++=======
++ 	struct mt76_queue *hwq;
+++>>>>>>> af005f260595 (mt76: introduce mt76_sw_queue data structure)
+  	struct mt76_txq *mtxq;
+  	struct sk_buff *skb;
+  
+@@@ -611,6 -609,12 +692,15 @@@
+  		return;
+  
+  	mtxq = (struct mt76_txq *) txq->drv_priv;
+++<<<<<<< HEAD
+++=======
++ 	hwq = mtxq->swq->q;
++ 
++ 	spin_lock_bh(&hwq->lock);
++ 	if (!list_empty(&mtxq->list))
++ 		list_del_init(&mtxq->list);
++ 	spin_unlock_bh(&hwq->lock);
+++>>>>>>> af005f260595 (mt76: introduce mt76_sw_queue data structure)
+  
+  	while ((skb = skb_dequeue(&mtxq->retry_q)) != NULL)
+  		ieee80211_free_txskb(dev->hw, skb);
+diff --cc drivers/net/wireless/mediatek/mt76/usb.c
+index fb87ce7fbdf6,65b0c244307f..000000000000
+--- a/drivers/net/wireless/mediatek/mt76/usb.c
++++ b/drivers/net/wireless/mediatek/mt76/usb.c
+@@@ -663,37 -628,35 +663,54 @@@ static void mt76u_tx_tasklet(unsigned l
+  	struct mt76_dev *dev = (struct mt76_dev *)data;
+  	struct mt76_queue_entry entry;
+  	struct mt76_sw_queue *sq;
+++<<<<<<< HEAD
+++=======
++ 	struct mt76u_buf *buf;
+++>>>>>>> af005f260595 (mt76: introduce mt76_sw_queue data structure)
+  	struct mt76_queue *q;
+  	bool wake;
+  	int i;
+  
+  	for (i = 0; i < IEEE80211_NUM_ACS; i++) {
+++<<<<<<< HEAD
+ +		u32 n_dequeued = 0, n_sw_dequeued = 0;
+++=======
++ 		sq = &dev->q_tx[i];
++ 		q = sq->q;
+++>>>>>>> af005f260595 (mt76: introduce mt76_sw_queue data structure)
+  
+ -		spin_lock_bh(&q->lock);
+ -		while (true) {
+ -			buf = &q->entry[q->head].ubuf;
+ -			if (!buf->done || !q->queued)
+ +		sq = &dev->q_tx[i];
+ +		q = sq->q;
+ +
+ +		while (q->queued > n_dequeued) {
+ +			if (!q->entry[q->head].done)
+  				break;
+  
+  			if (q->entry[q->head].schedule) {
+  				q->entry[q->head].schedule = false;
+++<<<<<<< HEAD
+ +				n_sw_dequeued++;
+++=======
++ 				sq->swq_queued--;
+++>>>>>>> af005f260595 (mt76: introduce mt76_sw_queue data structure)
+  			}
+  
+  			entry = q->entry[q->head];
+ +			q->entry[q->head].done = false;
+  			q->head = (q->head + 1) % q->ndesc;
+ -			q->queued--;
+ +			n_dequeued++;
+  
+ -			spin_unlock_bh(&q->lock);
+  			dev->drv->tx_complete_skb(dev, i, &entry);
+ -			spin_lock_bh(&q->lock);
+  		}
+++<<<<<<< HEAD
+ +
+ +		spin_lock_bh(&q->lock);
+ +
+ +		sq->swq_queued -= n_sw_dequeued;
+ +		q->queued -= n_dequeued;
+++=======
++ 		mt76_txq_schedule(dev, sq);
+++>>>>>>> af005f260595 (mt76: introduce mt76_sw_queue data structure)
+  
+  		wake = q->stopped && q->queued < q->ndesc - 8;
+  		if (wake)
+@@@ -778,9 -733,7 +795,13 @@@ mt76u_tx_queue_skb(struct mt76_dev *dev
+  		   struct ieee80211_sta *sta)
+  {
+  	struct mt76_queue *q = dev->q_tx[qid].q;
+++<<<<<<< HEAD
+ +	struct mt76_tx_info tx_info = {
+ +		.skb = skb,
+ +	};
+++=======
++ 	struct mt76u_buf *buf;
+++>>>>>>> af005f260595 (mt76: introduce mt76_sw_queue data structure)
+  	u16 idx = q->tail;
+  	int err;
+  
+@@@ -831,21 -788,17 +852,31 @@@ static void mt76u_tx_kick(struct mt76_d
+  
+  static int mt76u_alloc_tx(struct mt76_dev *dev)
+  {
+ -	struct mt76u_buf *buf;
+  	struct mt76_queue *q;
+ -	int i, j;
+ +	int i, j, err;
+ +
+ +	for (i = 0; i <= MT_TXQ_PSD; i++) {
+ +		INIT_LIST_HEAD(&dev->q_tx[i].swq);
+ +
+ +		if (i >= IEEE80211_NUM_ACS) {
+ +			dev->q_tx[i].q = dev->q_tx[0].q;
+ +			continue;
+ +		}
+ +
+ +		q = devm_kzalloc(dev->dev, sizeof(*q), GFP_KERNEL);
+ +		if (!q)
+ +			return -ENOMEM;
+  
+++<<<<<<< HEAD
+++=======
++ 	for (i = 0; i < IEEE80211_NUM_ACS; i++) {
++ 		INIT_LIST_HEAD(&dev->q_tx[i].swq);
++ 
++ 		q = devm_kzalloc(dev->dev, sizeof(*q), GFP_KERNEL);
++ 		if (!q)
++ 			return -ENOMEM;
++ 
+++>>>>>>> af005f260595 (mt76: introduce mt76_sw_queue data structure)
+  		spin_lock_init(&q->lock);
+  		q->hw_idx = mt76_ac_to_hwq(i);
+  		dev->q_tx[i].q = q;
+@@@ -879,49 -844,34 +910,56 @@@ static void mt76u_free_tx(struct mt76_d
+  	}
+  }
+  
+ -static void mt76u_stop_tx(struct mt76_dev *dev)
+ +void mt76u_stop_tx(struct mt76_dev *dev)
+  {
+ +	struct mt76_queue_entry entry;
+  	struct mt76_queue *q;
+ -	int i, j;
+ +	int i, j, ret;
+ +
+++<<<<<<< HEAD
+ +	ret = wait_event_timeout(dev->tx_wait, !mt76_has_tx_pending(dev), HZ/5);
+ +	if (!ret) {
+ +		dev_err(dev->dev, "timed out waiting for pending tx\n");
+ +
+ +		for (i = 0; i < IEEE80211_NUM_ACS; i++) {
+ +			q = dev->q_tx[i].q;
+ +			for (j = 0; j < q->ndesc; j++)
+ +				usb_kill_urb(q->entry[j].urb);
+ +		}
+ +
+ +		tasklet_kill(&dev->tx_tasklet);
+ +
+ +		/* On device removal we maight queue skb's, but mt76u_tx_kick()
+ +		 * will fail to submit urb, cleanup those skb's manually.
+ +		 */
+ +		for (i = 0; i < IEEE80211_NUM_ACS; i++) {
+ +			q = dev->q_tx[i].q;
+ +
+ +			/* Assure we are in sync with killed tasklet. */
+ +			spin_lock_bh(&q->lock);
+ +			while (q->queued) {
+ +				entry = q->entry[q->head];
+ +				q->head = (q->head + 1) % q->ndesc;
+ +				q->queued--;
+  
+ +				dev->drv->tx_complete_skb(dev, i, &entry);
+ +			}
+ +			spin_unlock_bh(&q->lock);
+ +		}
+++=======
++ 	for (i = 0; i < IEEE80211_NUM_ACS; i++) {
++ 		q = dev->q_tx[i].q;
++ 		for (j = 0; j < q->ndesc; j++)
++ 			usb_kill_urb(q->entry[j].ubuf.urb);
+++>>>>>>> af005f260595 (mt76: introduce mt76_sw_queue data structure)
+  	}
+ -}
+ -
+ -void mt76u_stop_queues(struct mt76_dev *dev)
+ -{
+ -	tasklet_disable(&dev->usb.rx_tasklet);
+ -	tasklet_disable(&dev->usb.tx_tasklet);
+  
+ -	mt76u_stop_rx(dev);
+ -	mt76u_stop_tx(dev);
+ -}
+ -EXPORT_SYMBOL_GPL(mt76u_stop_queues);
+ -
+ -void mt76u_stop_stat_wk(struct mt76_dev *dev)
+ -{
+  	cancel_delayed_work_sync(&dev->usb.stat_work);
+  	clear_bit(MT76_READING_STATS, &dev->state);
+ +
+ +	mt76_tx_status_check(dev, NULL, true);
+  }
+ -EXPORT_SYMBOL_GPL(mt76u_stop_stat_wk);
+ +EXPORT_SYMBOL_GPL(mt76u_stop_tx);
+  
+  void mt76u_queues_deinit(struct mt76_dev *dev)
+  {
+* Unmerged path drivers/net/wireless/mediatek/mt76/dma.c
+* Unmerged path drivers/net/wireless/mediatek/mt76/mt76.h
+diff --git a/drivers/net/wireless/mediatek/mt76/mt7603/beacon.c b/drivers/net/wireless/mediatek/mt76/mt7603/beacon.c
+index 4dcb465095d1..e180d0c37405 100644
+--- a/drivers/net/wireless/mediatek/mt76/mt7603/beacon.c
++++ b/drivers/net/wireless/mediatek/mt76/mt7603/beacon.c
+@@ -30,7 +30,7 @@ mt7603_update_beacon_iter(void *priv, u8 *mac, struct ieee80211_vif *vif)
+ 	mt76_wr(dev, MT_DMA_FQCR0, MT_DMA_FQCR0_BUSY |
+ 		FIELD_PREP(MT_DMA_FQCR0_TARGET_WCID, mvif->sta.wcid.idx) |
+ 		FIELD_PREP(MT_DMA_FQCR0_TARGET_QID,
+-			   dev->mt76.q_tx[MT_TXQ_CAB].hw_idx) |
++			   dev->mt76.q_tx[MT_TXQ_CAB].q->hw_idx) |
+ 		FIELD_PREP(MT_DMA_FQCR0_DEST_PORT_ID, 3) |
+ 		FIELD_PREP(MT_DMA_FQCR0_DEST_QUEUE_ID, 8));
+ 
+@@ -76,7 +76,7 @@ void mt7603_pre_tbtt_tasklet(unsigned long arg)
+ 	data.dev = dev;
+ 	__skb_queue_head_init(&data.q);
+ 
+-	q = &dev->mt76.q_tx[MT_TXQ_BEACON];
++	q = dev->mt76.q_tx[MT_TXQ_BEACON].q;
+ 	spin_lock_bh(&q->lock);
+ 	ieee80211_iterate_active_interfaces_atomic(mt76_hw(dev),
+ 		IEEE80211_IFACE_ITER_RESUME_ALL,
+@@ -93,7 +93,7 @@ void mt7603_pre_tbtt_tasklet(unsigned long arg)
+ 	if (dev->mt76.csa_complete)
+ 		goto out;
+ 
+-	q = &dev->mt76.q_tx[MT_TXQ_CAB];
++	q = dev->mt76.q_tx[MT_TXQ_CAB].q;
+ 	do {
+ 		nframes = skb_queue_len(&data.q);
+ 		ieee80211_iterate_active_interfaces_atomic(mt76_hw(dev),
+@@ -135,7 +135,8 @@ void mt7603_pre_tbtt_tasklet(unsigned long arg)
+ 
+ out:
+ 	mt76_queue_tx_cleanup(dev, MT_TXQ_BEACON, false);
+-	if (dev->mt76.q_tx[MT_TXQ_BEACON].queued > hweight8(dev->beacon_mask))
++	if (dev->mt76.q_tx[MT_TXQ_BEACON].q->queued >
++	    hweight8(dev->beacon_mask))
+ 		dev->beacon_check++;
+ }
+ 
+* Unmerged path drivers/net/wireless/mediatek/mt76/mt7603/dma.c
+* Unmerged path drivers/net/wireless/mediatek/mt76/mt7603/mac.c
+diff --git a/drivers/net/wireless/mediatek/mt76/mt7603/main.c b/drivers/net/wireless/mediatek/mt76/mt7603/main.c
+index a3c4ef198bfe..917acf5f0981 100644
+--- a/drivers/net/wireless/mediatek/mt76/mt7603/main.c
++++ b/drivers/net/wireless/mediatek/mt76/mt7603/main.c
+@@ -492,7 +492,7 @@ mt7603_conf_tx(struct ieee80211_hw *hw, struct ieee80211_vif *vif, u16 queue,
+ 	u16 cw_max = (1 << 10) - 1;
+ 	u32 val;
+ 
+-	queue = dev->mt76.q_tx[queue].hw_idx;
++	queue = dev->mt76.q_tx[queue].q->hw_idx;
+ 
+ 	if (params->cw_min)
+ 		cw_min = params->cw_min;
+* Unmerged path drivers/net/wireless/mediatek/mt76/mt76x02_usb_core.c
+* Unmerged path drivers/net/wireless/mediatek/mt76/tx.c
+* Unmerged path drivers/net/wireless/mediatek/mt76/usb.c
