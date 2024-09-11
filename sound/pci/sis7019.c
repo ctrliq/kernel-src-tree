@@ -1337,6 +1337,7 @@ static int sis_chip_create(struct snd_card *card,
 	}
 
 	sis->irq = pci->irq;
+	card->sync_irq = sis->irq;
 	pci_set_master(pci);
 
 	for (i = 0; i < 64; i++) {
