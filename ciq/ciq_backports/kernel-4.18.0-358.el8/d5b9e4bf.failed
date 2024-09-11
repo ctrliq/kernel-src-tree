@@ -1,0 +1,184 @@
+iommu/vt-d: Report prq to io-pgfault framework
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-358.el8
+commit-author Lu Baolu <baolu.lu@linux.intel.com>
+commit d5b9e4bfe0d8848aaf428bb4bbcc270fecadef35
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-358.el8/d5b9e4bf.failed
+
+Let the IO page fault requests get handled through the io-pgfault
+framework.
+
+	Signed-off-by: Lu Baolu <baolu.lu@linux.intel.com>
+Link: https://lore.kernel.org/r/20210520031531.712333-1-baolu.lu@linux.intel.com
+Link: https://lore.kernel.org/r/20210610020115.1637656-12-baolu.lu@linux.intel.com
+	Signed-off-by: Joerg Roedel <jroedel@suse.de>
+(cherry picked from commit d5b9e4bfe0d8848aaf428bb4bbcc270fecadef35)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/iommu/intel/svm.c
+diff --cc drivers/iommu/intel/svm.c
+index f4c78a5e53a1,ade157b64ce7..000000000000
+--- a/drivers/iommu/intel/svm.c
++++ b/drivers/iommu/intel/svm.c
+@@@ -898,6 -875,41 +884,44 @@@ intel_svm_prq_report(struct device *dev
+  	return iommu_report_device_fault(dev, &event);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static void handle_bad_prq_event(struct intel_iommu *iommu,
++ 				 struct page_req_dsc *req, int result)
++ {
++ 	struct qi_desc desc;
++ 
++ 	pr_err("%s: Invalid page request: %08llx %08llx\n",
++ 	       iommu->name, ((unsigned long long *)req)[0],
++ 	       ((unsigned long long *)req)[1]);
++ 
++ 	/*
++ 	 * Per VT-d spec. v3.0 ch7.7, system software must
++ 	 * respond with page group response if private data
++ 	 * is present (PDP) or last page in group (LPIG) bit
++ 	 * is set. This is an additional VT-d feature beyond
++ 	 * PCI ATS spec.
++ 	 */
++ 	if (!req->lpig && !req->priv_data_present)
++ 		return;
++ 
++ 	desc.qw0 = QI_PGRP_PASID(req->pasid) |
++ 			QI_PGRP_DID(req->rid) |
++ 			QI_PGRP_PASID_P(req->pasid_present) |
++ 			QI_PGRP_PDP(req->priv_data_present) |
++ 			QI_PGRP_RESP_CODE(result) |
++ 			QI_PGRP_RESP_TYPE;
++ 	desc.qw1 = QI_PGRP_IDX(req->prg_index) |
++ 			QI_PGRP_LPIG(req->lpig);
++ 	desc.qw2 = 0;
++ 	desc.qw3 = 0;
++ 
++ 	if (req->priv_data_present)
++ 		memcpy(&desc.qw2, req->priv_data, sizeof(req->priv_data));
++ 	qi_submit_sync(iommu, &desc, 1, 0);
++ }
++ 
+++>>>>>>> d5b9e4bfe0d8 (iommu/vt-d: Report prq to io-pgfault framework)
+  static irqreturn_t prq_event_thread(int irq, void *d)
+  {
+  	struct intel_svm_dev *sdev = NULL;
+@@@ -972,67 -980,8 +996,72 @@@
+  		 * If prq is to be handled outside iommu driver via receiver of
+  		 * the fault notifiers, we skip the page response here.
+  		 */
+++<<<<<<< HEAD
+ +		if (svm->flags & SVM_FLAG_GUEST_MODE) {
+ +			if (sdev && !intel_svm_prq_report(sdev->dev, req))
+ +				goto prq_advance;
+ +			else
+ +				goto bad_req;
+ +		}
+ +
+ +		/* If the mm is already defunct, don't handle faults. */
+ +		if (!mmget_not_zero(svm->mm))
+ +			goto bad_req;
+ +
+ +		mmap_read_lock(svm->mm);
+ +		vma = find_extend_vma(svm->mm, address);
+ +		if (!vma || address < vma->vm_start)
+ +			goto invalid;
+ +
+ +		if (access_error(vma, req))
+ +			goto invalid;
+ +
+ +		flags = FAULT_FLAG_USER | FAULT_FLAG_REMOTE;
+ +		if (req->wr_req)
+ +			flags |= FAULT_FLAG_WRITE;
+ +
+ +		ret = handle_mm_fault(vma, address, flags);
+ +		if (ret & VM_FAULT_ERROR)
+ +			goto invalid;
+ +
+ +		result = QI_RESP_SUCCESS;
+ +invalid:
+ +		mmap_read_unlock(svm->mm);
+ +		mmput(svm->mm);
+ +bad_req:
+ +		/* We get here in the error case where the PASID lookup failed,
+ +		   and these can be NULL. Do not use them below this point! */
+ +		sdev = NULL;
+ +		svm = NULL;
+ +no_pasid:
+ +		if (req->lpig || req->priv_data_present) {
+ +			/*
+ +			 * Per VT-d spec. v3.0 ch7.7, system software must
+ +			 * respond with page group response if private data
+ +			 * is present (PDP) or last page in group (LPIG) bit
+ +			 * is set. This is an additional VT-d feature beyond
+ +			 * PCI ATS spec.
+ +			 */
+ +			resp.qw0 = QI_PGRP_PASID(req->pasid) |
+ +				QI_PGRP_DID(req->rid) |
+ +				QI_PGRP_PASID_P(req->pasid_present) |
+ +				QI_PGRP_PDP(req->priv_data_present) |
+ +				QI_PGRP_RESP_CODE(result) |
+ +				QI_PGRP_RESP_TYPE;
+ +			resp.qw1 = QI_PGRP_IDX(req->prg_index) |
+ +				QI_PGRP_LPIG(req->lpig);
+ +			resp.qw2 = 0;
+ +			resp.qw3 = 0;
+ +
+ +			if (req->priv_data_present)
+ +				memcpy(&resp.qw2, req->priv_data,
+ +				       sizeof(req->priv_data));
+ +			qi_submit_sync(iommu, &resp, 1, 0);
+ +		}
+++=======
++ 		if (intel_svm_prq_report(sdev->dev, req))
++ 			handle_bad_prq_event(iommu, req, QI_RESP_INVALID);
+++>>>>>>> d5b9e4bfe0d8 (iommu/vt-d: Report prq to io-pgfault framework)
+  prq_advance:
+  		head = (head + sizeof(*req)) & PRQ_RING_MASK;
+  	}
+diff --git a/drivers/iommu/intel/iommu.c b/drivers/iommu/intel/iommu.c
+index 405e386bcfa3..8a1c7555f086 100644
+--- a/drivers/iommu/intel/iommu.c
++++ b/drivers/iommu/intel/iommu.c
+@@ -5246,6 +5246,7 @@ static int intel_iommu_enable_sva(struct device *dev)
+ {
+ 	struct device_domain_info *info = get_domain_info(dev);
+ 	struct intel_iommu *iommu = info->iommu;
++	int ret;
+ 
+ 	if (!info || !iommu || dmar_disabled)
+ 		return -EINVAL;
+@@ -5259,15 +5260,24 @@ static int intel_iommu_enable_sva(struct device *dev)
+ 	if (!info->pasid_enabled || !info->pri_enabled || !info->ats_enabled)
+ 		return -EINVAL;
+ 
+-	return iopf_queue_add_device(iommu->iopf_queue, dev);
++	ret = iopf_queue_add_device(iommu->iopf_queue, dev);
++	if (!ret)
++		ret = iommu_register_device_fault_handler(dev, iommu_queue_iopf, dev);
++
++	return ret;
+ }
+ 
+ static int intel_iommu_disable_sva(struct device *dev)
+ {
+ 	struct device_domain_info *info = get_domain_info(dev);
+ 	struct intel_iommu *iommu = info->iommu;
++	int ret;
++
++	ret = iommu_unregister_device_fault_handler(dev);
++	if (!ret)
++		ret = iopf_queue_remove_device(iommu->iopf_queue, dev);
+ 
+-	return iopf_queue_remove_device(iommu->iopf_queue, dev);
++	return ret;
+ }
+ 
+ /*
+* Unmerged path drivers/iommu/intel/svm.c
