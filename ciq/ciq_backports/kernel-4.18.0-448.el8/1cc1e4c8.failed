@@ -1,0 +1,240 @@
+objtool: Add straight-line-speculation validation
+
+jira LE-1907
+cve CVE-2021-26341
+Rebuild_History Non-Buildable kernel-4.18.0-448.el8
+commit-author Peter Zijlstra <peterz@infradead.org>
+commit 1cc1e4c8aab4213bd4e6353dec2620476a233d6d
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-448.el8/1cc1e4c8.failed
+
+Teach objtool to validate the straight-line-speculation constraints:
+
+ - speculation trap after indirect calls
+ - speculation trap after RET
+
+Notable: when an instruction is annotated RETPOLINE_SAFE, indicating
+  speculation isn't a problem, also don't care about sls for that
+  instruction.
+
+	Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+	Signed-off-by: Borislav Petkov <bp@suse.de>
+Link: https://lore.kernel.org/r/20211204134908.023037659@infradead.org
+(cherry picked from commit 1cc1e4c8aab4213bd4e6353dec2620476a233d6d)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	tools/objtool/arch/x86/decode.c
+#	tools/objtool/builtin-check.c
+#	tools/objtool/include/objtool/builtin.h
+diff --cc tools/objtool/arch/x86/decode.c
+index f90f0a167e68,c10ef78df050..000000000000
+--- a/tools/objtool/arch/x86/decode.c
++++ b/tools/objtool/arch/x86/decode.c
+@@@ -436,11 -518,24 +436,16 @@@ int arch_decode_instruction(struct elf 
+  		 * mov bp, sp
+  		 * pop bp
+  		 */
+ -		ADD_OP(op) {
+ -			op->src.type = OP_SRC_REG;
+ -			op->src.reg = CFI_BP;
+ -			op->dest.type = OP_DEST_REG;
+ -			op->dest.reg = CFI_SP;
+ -		}
+ -		ADD_OP(op) {
+ -			op->src.type = OP_SRC_POP;
+ -			op->dest.type = OP_DEST_REG;
+ -			op->dest.reg = CFI_BP;
+ -		}
+ +		*type = INSN_STACK;
+ +		op->dest.type = OP_DEST_LEAVE;
+ +
+  		break;
+  
++ 	case 0xcc:
++ 		/* int3 */
++ 		*type = INSN_TRAP;
++ 		break;
++ 
+  	case 0xe3:
+  		/* jecxz/jrcxz */
+  		*type = INSN_JUMP_CONDITIONAL;
+@@@ -526,6 -674,83 +531,88 @@@ void arch_initial_func_cfi_state(struc
+  	state->cfa.offset = 8;
+  
+  	/* initial RA (return address) */
+++<<<<<<< HEAD
+ +	state->regs[16].base = CFI_CFA;
+ +	state->regs[16].offset = -8;
+++=======
++ 	state->regs[CFI_RA].base = CFI_CFA;
++ 	state->regs[CFI_RA].offset = -8;
++ }
++ 
++ const char *arch_nop_insn(int len)
++ {
++ 	static const char nops[5][5] = {
++ 		{ BYTES_NOP1 },
++ 		{ BYTES_NOP2 },
++ 		{ BYTES_NOP3 },
++ 		{ BYTES_NOP4 },
++ 		{ BYTES_NOP5 },
++ 	};
++ 
++ 	if (len < 1 || len > 5) {
++ 		WARN("invalid NOP size: %d\n", len);
++ 		return NULL;
++ 	}
++ 
++ 	return nops[len-1];
++ }
++ 
++ #define BYTE_RET	0xC3
++ 
++ const char *arch_ret_insn(int len)
++ {
++ 	static const char ret[5][5] = {
++ 		{ BYTE_RET },
++ 		{ BYTE_RET, 0xcc },
++ 		{ BYTE_RET, 0xcc, BYTES_NOP1 },
++ 		{ BYTE_RET, 0xcc, BYTES_NOP2 },
++ 		{ BYTE_RET, 0xcc, BYTES_NOP3 },
++ 	};
++ 
++ 	if (len < 1 || len > 5) {
++ 		WARN("invalid RET size: %d\n", len);
++ 		return NULL;
++ 	}
++ 
++ 	return ret[len-1];
++ }
++ 
++ int arch_decode_hint_reg(u8 sp_reg, int *base)
++ {
++ 	switch (sp_reg) {
++ 	case ORC_REG_UNDEFINED:
++ 		*base = CFI_UNDEFINED;
++ 		break;
++ 	case ORC_REG_SP:
++ 		*base = CFI_SP;
++ 		break;
++ 	case ORC_REG_BP:
++ 		*base = CFI_BP;
++ 		break;
++ 	case ORC_REG_SP_INDIRECT:
++ 		*base = CFI_SP_INDIRECT;
++ 		break;
++ 	case ORC_REG_R10:
++ 		*base = CFI_R10;
++ 		break;
++ 	case ORC_REG_R13:
++ 		*base = CFI_R13;
++ 		break;
++ 	case ORC_REG_DI:
++ 		*base = CFI_DI;
++ 		break;
++ 	case ORC_REG_DX:
++ 		*base = CFI_DX;
++ 		break;
++ 	default:
++ 		return -1;
++ 	}
++ 
++ 	return 0;
++ }
++ 
++ bool arch_is_retpoline(struct symbol *sym)
++ {
++ 	return !strncmp(sym->name, "__x86_indirect_", 15);
+++>>>>>>> 1cc1e4c8aab4 (objtool: Add straight-line-speculation validation)
+  }
+diff --cc tools/objtool/builtin-check.c
+index f3b378126011,38070f26105b..000000000000
+--- a/tools/objtool/builtin-check.c
++++ b/tools/objtool/builtin-check.c
+@@@ -26,10 -14,13 +26,15 @@@
+   */
+  
+  #include <subcmd/parse-options.h>
+ -#include <string.h>
+ -#include <stdlib.h>
+ -#include <objtool/builtin.h>
+ -#include <objtool/objtool.h>
+ +#include "builtin.h"
+ +#include "check.h"
+  
+++<<<<<<< HEAD
+ +bool no_fp, no_unreachable, retpoline, module, backtrace, uaccess;
+++=======
++ bool no_fp, no_unreachable, retpoline, module, backtrace, uaccess, stats,
++      validate_dup, vmlinux, mcount, noinstr, backup, sls;
+++>>>>>>> 1cc1e4c8aab4 (objtool: Add straight-line-speculation validation)
+  
+  static const char * const check_usage[] = {
+  	"objtool check [<options>] file.o",
+@@@ -43,6 -39,13 +48,16 @@@ const struct option check_options[] = 
+  	OPT_BOOLEAN('m', "module", &module, "Indicates the object will be part of a kernel module"),
+  	OPT_BOOLEAN('b', "backtrace", &backtrace, "unwind on error"),
+  	OPT_BOOLEAN('a', "uaccess", &uaccess, "enable uaccess checking"),
+++<<<<<<< HEAD
+++=======
++ 	OPT_BOOLEAN('s', "stats", &stats, "print statistics"),
++ 	OPT_BOOLEAN('d', "duplicate", &validate_dup, "duplicate validation for vmlinux.o"),
++ 	OPT_BOOLEAN('n', "noinstr", &noinstr, "noinstr validation for vmlinux.o"),
++ 	OPT_BOOLEAN('l', "vmlinux", &vmlinux, "vmlinux.o validation"),
++ 	OPT_BOOLEAN('M', "mcount", &mcount, "generate __mcount_loc"),
++ 	OPT_BOOLEAN('B', "backup", &backup, "create .orig files before modification"),
++ 	OPT_BOOLEAN('S', "sls", &sls, "validate straight-line-speculation"),
+++>>>>>>> 1cc1e4c8aab4 (objtool: Add straight-line-speculation validation)
+  	OPT_END(),
+  };
+  
+* Unmerged path tools/objtool/include/objtool/builtin.h
+diff --git a/tools/objtool/arch.h b/tools/objtool/arch.h
+index 7f2149037c3b..6c5062a71d4d 100644
+--- a/tools/objtool/arch.h
++++ b/tools/objtool/arch.h
+@@ -39,6 +39,7 @@ enum insn_type {
+ 	INSN_CLAC,
+ 	INSN_STD,
+ 	INSN_CLD,
++	INSN_TRAP,
+ 	INSN_OTHER,
+ };
+ 
+* Unmerged path tools/objtool/arch/x86/decode.c
+* Unmerged path tools/objtool/builtin-check.c
+diff --git a/tools/objtool/check.c b/tools/objtool/check.c
+index 6ee6ff2f6fbf..d26c89704507 100644
+--- a/tools/objtool/check.c
++++ b/tools/objtool/check.c
+@@ -2140,6 +2140,12 @@ static int validate_branch(struct objtool_file *file, struct symbol *func,
+ 		switch (insn->type) {
+ 
+ 		case INSN_RETURN:
++			if (next_insn && next_insn->type == INSN_TRAP) {
++				next_insn->ignore = true;
++			} else if (sls && !insn->retpoline_safe) {
++				WARN_FUNC("missing int3 after ret",
++					  insn->sec, insn->offset);
++			}
+ 			return validate_return(func, insn, &state);
+ 
+ 		case INSN_CALL:
+@@ -2186,6 +2192,14 @@ static int validate_branch(struct objtool_file *file, struct symbol *func,
+ 			break;
+ 
+ 		case INSN_JUMP_DYNAMIC:
++			if (next_insn && next_insn->type == INSN_TRAP) {
++				next_insn->ignore = true;
++			} else if (sls && !insn->retpoline_safe) {
++				WARN_FUNC("missing int3 after indirect jump",
++					  insn->sec, insn->offset);
++			}
++
++			/* fallthrough */
+ 		case INSN_JUMP_DYNAMIC_CONDITIONAL:
+ 			if (func && is_sibling_call(insn)) {
+ 				ret = validate_sibling_call(insn, &state);
+* Unmerged path tools/objtool/include/objtool/builtin.h
