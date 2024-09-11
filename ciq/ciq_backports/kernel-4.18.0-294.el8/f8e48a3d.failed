@@ -1,0 +1,170 @@
+lockdep: Fix preemption WARN for spurious IRQ-enable
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Peter Zijlstra <peterz@infradead.org>
+commit f8e48a3dca060e80f672d398d181db1298fbc86c
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/f8e48a3d.failed
+
+It is valid (albeit uncommon) to call local_irq_enable() without first
+having called local_irq_disable(). In this case we enter
+lockdep_hardirqs_on*() with IRQs enabled and trip a preemption warning
+for using __this_cpu_read().
+
+Use this_cpu_read() instead to avoid the warning.
+
+Fixes: 4d004099a6 ("lockdep: Fix lockdep recursion")
+	Reported-by: syzbot+53f8ce8bbc07924b6417@syzkaller.appspotmail.com
+	Reported-by: kernel test robot <lkp@intel.com>
+	Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+(cherry picked from commit f8e48a3dca060e80f672d398d181db1298fbc86c)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	kernel/locking/lockdep.c
+diff --cc kernel/locking/lockdep.c
+index 5607d115b751,fc206aefa970..000000000000
+--- a/kernel/locking/lockdep.c
++++ b/kernel/locking/lockdep.c
+@@@ -3641,22 -4034,33 +3641,35 @@@ static void __trace_hardirqs_on_caller(
+  	 * this bit from being set before)
+  	 */
+  	if (curr->softirqs_enabled)
+ -		mark_held_locks(curr, LOCK_ENABLED_SOFTIRQ);
+ +		if (!mark_held_locks(curr, LOCK_ENABLED_SOFTIRQ))
+ +			return;
+ +
+ +	curr->hardirq_enable_ip = ip;
+ +	curr->hardirq_enable_event = ++curr->irq_events;
+ +	debug_atomic_inc(hardirqs_on_events);
+  }
+  
+ -/**
+ - * lockdep_hardirqs_on_prepare - Prepare for enabling interrupts
+ - * @ip:		Caller address
+ - *
+ - * Invoked before a possible transition to RCU idle from exit to user or
+ - * guest mode. This ensures that all RCU operations are done before RCU
+ - * stops watching. After the RCU transition lockdep_hardirqs_on() has to be
+ - * invoked to set the final state.
+ - */
+ -void lockdep_hardirqs_on_prepare(unsigned long ip)
+ +__visible void trace_hardirqs_on_caller(unsigned long ip)
+  {
+ -	if (unlikely(!debug_locks))
+ +	time_hardirqs_on(CALLER_ADDR0, ip);
+ +
+ +	if (unlikely(!debug_locks || current->lockdep_recursion))
+  		return;
+  
+++<<<<<<< HEAD
+ +	if (unlikely(current->hardirqs_enabled)) {
+++=======
++ 	/*
++ 	 * NMIs do not (and cannot) track lock dependencies, nothing to do.
++ 	 */
++ 	if (unlikely(in_nmi()))
++ 		return;
++ 
++ 	if (unlikely(this_cpu_read(lockdep_recursion)))
++ 		return;
++ 
++ 	if (unlikely(lockdep_hardirqs_enabled())) {
+++>>>>>>> f8e48a3dca06 (lockdep: Fix preemption WARN for spurious IRQ-enable)
+  		/*
+  		 * Neither irq nor preemption are disabled here
+  		 * so this is racy by nature but losing one hit
+@@@ -3684,20 -4088,80 +3697,82 @@@
+  	 * Can't allow enabling interrupts while in an interrupt handler,
+  	 * that's general bad form and such. Recursion, limited stack etc..
+  	 */
+ -	if (DEBUG_LOCKS_WARN_ON(lockdep_hardirq_context()))
+ +	if (DEBUG_LOCKS_WARN_ON(current->hardirq_context))
+  		return;
+  
+ -	current->hardirq_chain_key = current->curr_chain_key;
+ -
+ -	lockdep_recursion_inc();
+ -	__trace_hardirqs_on_caller();
+ +	current->lockdep_recursion++;
+ +	__trace_hardirqs_on_caller(ip);
+  	lockdep_recursion_finish();
+  }
+ -EXPORT_SYMBOL_GPL(lockdep_hardirqs_on_prepare);
+ +EXPORT_SYMBOL(trace_hardirqs_on_caller);
+  
+ -void noinstr lockdep_hardirqs_on(unsigned long ip)
+ +void trace_hardirqs_on(void)
+  {
+++<<<<<<< HEAD
+ +	trace_hardirqs_on_caller(CALLER_ADDR0);
+++=======
++ 	struct irqtrace_events *trace = &current->irqtrace;
++ 
++ 	if (unlikely(!debug_locks))
++ 		return;
++ 
++ 	/*
++ 	 * NMIs can happen in the middle of local_irq_{en,dis}able() where the
++ 	 * tracking state and hardware state are out of sync.
++ 	 *
++ 	 * NMIs must save lockdep_hardirqs_enabled() to restore IRQ state from,
++ 	 * and not rely on hardware state like normal interrupts.
++ 	 */
++ 	if (unlikely(in_nmi())) {
++ 		if (!IS_ENABLED(CONFIG_TRACE_IRQFLAGS_NMI))
++ 			return;
++ 
++ 		/*
++ 		 * Skip:
++ 		 *  - recursion check, because NMI can hit lockdep;
++ 		 *  - hardware state check, because above;
++ 		 *  - chain_key check, see lockdep_hardirqs_on_prepare().
++ 		 */
++ 		goto skip_checks;
++ 	}
++ 
++ 	if (unlikely(this_cpu_read(lockdep_recursion)))
++ 		return;
++ 
++ 	if (lockdep_hardirqs_enabled()) {
++ 		/*
++ 		 * Neither irq nor preemption are disabled here
++ 		 * so this is racy by nature but losing one hit
++ 		 * in a stat is not a big deal.
++ 		 */
++ 		__debug_atomic_inc(redundant_hardirqs_on);
++ 		return;
++ 	}
++ 
++ 	/*
++ 	 * We're enabling irqs and according to our state above irqs weren't
++ 	 * already enabled, yet we find the hardware thinks they are in fact
++ 	 * enabled.. someone messed up their IRQ state tracing.
++ 	 */
++ 	if (DEBUG_LOCKS_WARN_ON(!irqs_disabled()))
++ 		return;
++ 
++ 	/*
++ 	 * Ensure the lock stack remained unchanged between
++ 	 * lockdep_hardirqs_on_prepare() and lockdep_hardirqs_on().
++ 	 */
++ 	DEBUG_LOCKS_WARN_ON(current->hardirq_chain_key !=
++ 			    current->curr_chain_key);
++ 
++ skip_checks:
++ 	/* we'll do an OFF -> ON transition: */
++ 	__this_cpu_write(hardirqs_enabled, 1);
++ 	trace->hardirq_enable_ip = ip;
++ 	trace->hardirq_enable_event = ++trace->irq_events;
++ 	debug_atomic_inc(hardirqs_on_events);
+++>>>>>>> f8e48a3dca06 (lockdep: Fix preemption WARN for spurious IRQ-enable)
+  }
+ -EXPORT_SYMBOL_GPL(lockdep_hardirqs_on);
+ +EXPORT_SYMBOL(trace_hardirqs_on);
+  
+  /*
+   * Hardirqs were disabled:
+* Unmerged path kernel/locking/lockdep.c
