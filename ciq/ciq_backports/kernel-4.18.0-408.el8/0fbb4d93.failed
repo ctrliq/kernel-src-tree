@@ -1,0 +1,352 @@
+dm: add dm_submit_bio_remap interface
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-408.el8
+commit-author Mike Snitzer <snitzer@redhat.com>
+commit 0fbb4d93b38bce1f8235aacfa37e90ad8f011473
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-408.el8/0fbb4d93.failed
+
+Where possible, switch from early bio-based IO accounting (at the time
+DM clones each incoming bio) to late IO accounting just before each
+remapped bio is issued to underlying device via submit_bio_noacct().
+
+Allows more precise bio-based IO accounting for DM targets that use
+their own workqueues to perform additional processing of each bio in
+conjunction with their DM_MAPIO_SUBMITTED return from their map
+function. When a target is updated to use dm_submit_bio_remap() they
+must also set ti->accounts_remapped_io to true.
+
+Use xchg() in start_io_acct(), as suggested by Mikulas, to ensure each
+IO is only started once.  The xchg race only happens if
+__send_duplicate_bios() sends multiple bios -- that case is reflected
+via tio->is_duplicate_bio.  Given the niche nature of this race, it is
+best to avoid any xchg performance penalty for normal IO.
+
+For IO that was never submitted with dm_bio_submit_remap(), but the
+target completes the clone with bio_endio, accounting is started then
+ended and pending_io counter decremented.
+
+	Reviewed-by: Mikulas Patocka <mpatocka@redhat.com>
+	Signed-off-by: Mike Snitzer <snitzer@redhat.com>
+(cherry picked from commit 0fbb4d93b38bce1f8235aacfa37e90ad8f011473)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/md/dm.c
+#	include/linux/device-mapper.h
+#	include/uapi/linux/dm-ioctl.h
+diff --cc drivers/md/dm.c
+index b06624dd4339,082366d0ad49..000000000000
+--- a/drivers/md/dm.c
++++ b/drivers/md/dm.c
+@@@ -584,15 -518,33 +584,44 @@@ static void dm_io_acct(bool end, struc
+  		bio->bi_iter.bi_size = bi_size;
+  }
+  
+++<<<<<<< HEAD
+ +static void start_io_acct(struct dm_io *io)
+++=======
++ static void __dm_start_io_acct(struct dm_io *io, struct bio *bio)
+++>>>>>>> 0fbb4d93b38b (dm: add dm_submit_bio_remap interface)
+  {
+- 	dm_io_acct(false, io->md, io->orig_bio, io->start_time, &io->stats_aux);
++ 	dm_io_acct(false, io->md, bio, io->start_time, &io->stats_aux);
+  }
+  
+++<<<<<<< HEAD
+ +static void end_io_acct(struct mapped_device *md, struct bio *bio,
+ +			unsigned long start_time, struct dm_stats_aux *stats_aux)
+ +{
+ +	dm_io_acct(true, md, bio, start_time, stats_aux);
+++=======
++ static void dm_start_io_acct(struct dm_io *io, struct bio *clone)
++ {
++ 	/* Must account IO to DM device in terms of orig_bio */
++ 	struct bio *bio = io->orig_bio;
++ 
++ 	/*
++ 	 * Ensure IO accounting is only ever started once.
++ 	 * Expect no possibility for race unless is_duplicate_bio.
++ 	 */
++ 	if (!clone || likely(!clone_to_tio(clone)->is_duplicate_bio)) {
++ 		if (WARN_ON(io->was_accounted))
++ 			return;
++ 		io->was_accounted = 1;
++ 	} else if (xchg(&io->was_accounted, 1) == 1)
++ 		return;
++ 
++ 	__dm_start_io_acct(io, bio);
++ }
++ 
++ static void dm_end_io_acct(struct dm_io *io, struct bio *bio)
++ {
++ 	dm_io_acct(true, io->md, bio, io->start_time, &io->stats_aux);
+++>>>>>>> 0fbb4d93b38b (dm: add dm_submit_bio_remap interface)
+  }
+  
+  static struct dm_io *alloc_io(struct mapped_device *md, struct bio *bio)
+@@@ -903,11 -870,17 +934,25 @@@ void dm_io_dec_pending(struct dm_io *io
+  		}
+  
+  		io_error = io->status;
+++<<<<<<< HEAD
+ +		bio = io->orig_bio;
+ +		start_time = io->start_time;
+ +		stats_aux = io->stats_aux;
+ +		free_io(md, io);
+ +		end_io_acct(md, bio, start_time, &stats_aux);
+++=======
++ 		if (io->was_accounted)
++ 			dm_end_io_acct(io, bio);
++ 		else if (!io_error) {
++ 			/*
++ 			 * Must handle target that DM_MAPIO_SUBMITTED only to
++ 			 * then bio_endio() rather than dm_submit_bio_remap()
++ 			 */
++ 			__dm_start_io_acct(io, bio);
++ 			dm_end_io_acct(io, bio);
++ 		}
++ 		free_io(io);
+++>>>>>>> 0fbb4d93b38b (dm: add dm_submit_bio_remap interface)
+  		smp_wmb();
+  		this_cpu_dec(*md->pending_io);
+  
+@@@ -1280,12 -1237,10 +1375,10 @@@ static blk_qc_t __map_bio(struct dm_tar
+  	clone->bi_end_io = clone_endio;
+  
+  	/*
+- 	 * Map the clone.  If r == 0 we don't need to do
+- 	 * anything, the target has assumed ownership of
+- 	 * this io.
++ 	 * Map the clone.
+  	 */
+  	dm_io_inc_pending(io);
+ -	tio->old_sector = clone->bi_iter.bi_sector;
+ +	sector = clone->bi_iter.bi_sector;
+  
+  	if (unlikely(swap_bios_limit(ti, clone))) {
+  		struct mapped_device *md = io->md;
+@@@ -1295,31 -1250,40 +1388,44 @@@
+  		down(&md->swap_bios_semaphore);
+  	}
+  
+ -	/*
+ -	 * Check if the IO needs a special mapping due to zone append emulation
+ -	 * on zoned target. In this case, dm_zone_map_bio() calls the target
+ -	 * map operation.
+ -	 */
+ -	if (dm_emulate_zone_append(io->md))
+ -		r = dm_zone_map_bio(tio);
+ -	else
+ -		r = ti->type->map(ti, clone);
+ -
+ +	r = ti->type->map(ti, clone);
+  	switch (r) {
+  	case DM_MAPIO_SUBMITTED:
++ 		/* target has assumed ownership of this io */
++ 		if (!ti->accounts_remapped_io)
++ 			io->start_io_acct = true;
+  		break;
+  	case DM_MAPIO_REMAPPED:
+++<<<<<<< HEAD
+ +		/* the bio has been remapped so dispatch it */
+ +		trace_block_bio_remap(clone->bi_disk->queue, clone,
+ +				      bio_dev(io->orig_bio), sector);
+ +		ret = generic_make_request(clone);
+++=======
++ 		/*
++ 		 * the bio has been remapped so dispatch it, but defer
++ 		 * dm_start_io_acct() until after possible bio_split().
++ 		 */
++ 		__dm_submit_bio_remap(clone, disk_devt(io->md->disk),
++ 				      tio->old_sector);
++ 		io->start_io_acct = true;
+++>>>>>>> 0fbb4d93b38b (dm: add dm_submit_bio_remap interface)
+  		break;
+  	case DM_MAPIO_KILL:
+ +		if (unlikely(swap_bios_limit(ti, clone))) {
+ +			struct mapped_device *md = io->md;
+ +			up(&md->swap_bios_semaphore);
+ +		}
+ +		free_tio(tio);
+ +		dm_io_dec_pending(io, BLK_STS_IOERR);
+ +		break;
+  	case DM_MAPIO_REQUEUE:
+ -		if (unlikely(swap_bios_limit(ti, clone)))
+ -			up(&io->md->swap_bios_semaphore);
+ -		free_tio(clone);
+ -		if (r == DM_MAPIO_KILL)
+ -			dm_io_dec_pending(io, BLK_STS_IOERR);
+ -		else
+ -			dm_io_dec_pending(io, BLK_STS_DM_REQUEUE);
+ +		if (unlikely(swap_bios_limit(ti, clone))) {
+ +			struct mapped_device *md = io->md;
+ +			up(&md->swap_bios_semaphore);
+ +		}
+ +		free_tio(tio);
+ +		dm_io_dec_pending(io, BLK_STS_DM_REQUEUE);
+  		break;
+  	default:
+  		DMWARN("unimplemented target map return value: %d", r);
+@@@ -1608,11 -1484,11 +1714,15 @@@ static void init_clone_info(struct clon
+  /*
+   * Entry point to split a bio into clones and submit them to the targets.
+   */
+ -static void dm_split_and_process_bio(struct mapped_device *md,
+ -				     struct dm_table *map, struct bio *bio)
+ +static blk_qc_t __split_and_process_bio(struct mapped_device *md,
+ +					struct dm_table *map, struct bio *bio)
+  {
+  	struct clone_info ci;
+++<<<<<<< HEAD
+ +	blk_qc_t ret = BLK_QC_T_NONE;
+++=======
++ 	struct bio *orig_bio = NULL;
+++>>>>>>> 0fbb4d93b38b (dm: add dm_submit_bio_remap interface)
+  	int error = 0;
+  
+  	init_clone_info(&ci, md, map, bio);
+@@@ -1620,43 -1496,39 +1730,69 @@@
+  	if (bio->bi_opf & REQ_PREFLUSH) {
+  		error = __send_empty_flush(&ci);
+  		/* dm_io_dec_pending submits any data associated with flush */
+ -		goto out;
+ +	} else if (op_is_zone_mgmt(bio_op(bio))) {
+ +		ci.bio = bio;
+ +		ci.sector_count = 0;
+ +		error = __split_and_process_non_flush(&ci);
+ +	} else {
+ +		ci.bio = bio;
+ +		ci.sector_count = bio_sectors(bio);
+ +		error = __split_and_process_non_flush(&ci);
+ +		if (ci.sector_count && !error) {
+ +			/*
+ +			 * Remainder must be passed to generic_make_request()
+ +			 * so that it gets handled *after* bios already submitted
+ +			 * have been completely processed.
+ +			 * We take a clone of the original to store in
+ +			 * ci.io->orig_bio to be used by end_io_acct() and
+ +			 * for dec_pending to use for completion handling.
+ +			 */
+ +			struct bio *b = bio_split(bio, bio_sectors(bio) - ci.sector_count,
+ +						  GFP_NOIO, &md->queue->bio_split);
+ +			ci.io->orig_bio = b;
+ +
+ +			bio_chain(b, bio);
+ +			trace_block_split(md->queue, b, bio->bi_iter.bi_sector);
+ +			ret = generic_make_request(bio);
+ +		}
+  	}
+ +	start_io_acct(ci.io);
+  
+++<<<<<<< HEAD
+++=======
++ 	error = __split_and_process_bio(&ci);
++ 	if (error || !ci.sector_count)
++ 		goto out;
++ 
++ 	/*
++ 	 * Remainder must be passed to submit_bio_noacct() so it gets handled
++ 	 * *after* bios already submitted have been completely processed.
++ 	 * We take a clone of the original to store in ci.io->orig_bio to be
++ 	 * used by dm_end_io_acct() and for dm_io_dec_pending() to use for
++ 	 * completion handling.
++ 	 */
++ 	orig_bio = bio_split(bio, bio_sectors(bio) - ci.sector_count,
++ 			     GFP_NOIO, &md->queue->bio_split);
++ 	bio_chain(orig_bio, bio);
++ 	trace_block_split(orig_bio, bio->bi_iter.bi_sector);
++ 	submit_bio_noacct(bio);
++ out:
++ 	if (!orig_bio)
++ 		orig_bio = bio;
++ 	smp_store_release(&ci.io->orig_bio, orig_bio);
++ 	if (ci.io->start_io_acct)
++ 		dm_start_io_acct(ci.io, NULL);
++ 
+++>>>>>>> 0fbb4d93b38b (dm: add dm_submit_bio_remap interface)
+  	/* drop the extra reference count */
+  	dm_io_dec_pending(ci.io, errno_to_blk_status(error));
+ +	return ret;
+  }
+  
+ -static void dm_submit_bio(struct bio *bio)
+ +static blk_qc_t dm_make_request(struct request_queue *q, struct bio *bio)
+  {
+ -	struct mapped_device *md = bio->bi_bdev->bd_disk->private_data;
+ +	struct mapped_device *md = q->queuedata;
+ +	blk_qc_t ret = BLK_QC_T_NONE;
+  	int srcu_idx;
+  	struct dm_table *map;
+  
+diff --cc include/linux/device-mapper.h
+index 8546b303c08e,7752d14d13f8..000000000000
+--- a/include/linux/device-mapper.h
++++ b/include/linux/device-mapper.h
+@@@ -356,16 -358,16 +356,26 @@@ struct dm_target 
+  	bool limit_swap_bios:1;
+  
+  	/*
+ -	 * Set if this target implements a a zoned device and needs emulation of
+ -	 * zone append operations using regular writes.
+ +	 * Set if the target required discard bios to be split
+ +	 * on max_io_len boundary.
+  	 */
+++<<<<<<< HEAD
+ +	bool split_discard_bios:1;
+ +};
+ +
+ +/* Each target can link one of these into the table */
+ +struct dm_target_callbacks {
+ +	struct list_head list;
+ +	int (*congested_fn) (struct dm_target_callbacks *, int);
+++=======
++ 	bool emulate_zone_append:1;
++ 
++ 	/*
++ 	 * Set if the target will submit IO using dm_submit_bio_remap()
++ 	 * after returning DM_MAPIO_SUBMITTED from its map function.
++ 	 */
++ 	bool accounts_remapped_io:1;
+++>>>>>>> 0fbb4d93b38b (dm: add dm_submit_bio_remap interface)
+  };
+  
+  void *dm_per_bio_data(struct bio *bio, size_t data_size);
+diff --cc include/uapi/linux/dm-ioctl.h
+index 4933b6b67b85,2e9550fef90f..000000000000
+--- a/include/uapi/linux/dm-ioctl.h
++++ b/include/uapi/linux/dm-ioctl.h
+@@@ -272,9 -286,9 +272,15 @@@ enum 
+  #define DM_DEV_SET_GEOMETRY	_IOWR(DM_IOCTL, DM_DEV_SET_GEOMETRY_CMD, struct dm_ioctl)
+  
+  #define DM_VERSION_MAJOR	4
+++<<<<<<< HEAD
+ +#define DM_VERSION_MINOR	43
+ +#define DM_VERSION_PATCHLEVEL	0
+ +#define DM_VERSION_EXTRA	"-ioctl (2020-10-01)"
+++=======
++ #define DM_VERSION_MINOR	46
++ #define DM_VERSION_PATCHLEVEL	0
++ #define DM_VERSION_EXTRA	"-ioctl (2022-02-22)"
+++>>>>>>> 0fbb4d93b38b (dm: add dm_submit_bio_remap interface)
+  
+  /* Status bits */
+  #define DM_READONLY_FLAG	(1 << 0) /* In/Out */
+diff --git a/drivers/md/dm-core.h b/drivers/md/dm-core.h
+index a9c78c74b3c7..d91ac2f5a1bf 100644
+--- a/drivers/md/dm-core.h
++++ b/drivers/md/dm-core.h
+@@ -217,6 +217,8 @@ struct dm_io {
+ 	struct mapped_device *md;
+ 	struct bio *orig_bio;
+ 	blk_status_t status;
++	bool start_io_acct:1;
++	int was_accounted;
+ 	unsigned long start_time;
+ 	spinlock_t endio_lock;
+ 	struct dm_stats_aux stats_aux;
+* Unmerged path drivers/md/dm.c
+* Unmerged path include/linux/device-mapper.h
+* Unmerged path include/uapi/linux/dm-ioctl.h
