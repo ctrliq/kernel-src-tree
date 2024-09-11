@@ -1,0 +1,721 @@
+mt76: mt76_connac: move WoW and suspend code in mt76_connac_mcu module
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-315.el8
+commit-author Lorenzo Bianconi <lorenzo@kernel.org>
+commit 55d4c19c93190b59c5caecb042ae92a9fd80a288
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-315.el8/55d4c19c.failed
+
+Move WoW and suspend code in mt76_connac_mcu module in order to be reused in
+mt7615 and mt7921 drivers
+
+	Signed-off-by: Lorenzo Bianconi <lorenzo@kernel.org>
+	Signed-off-by: Felix Fietkau <nbd@nbd.name>
+(cherry picked from commit 55d4c19c93190b59c5caecb042ae92a9fd80a288)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/wireless/mediatek/mt76/mt7615/mcu.c
+#	drivers/net/wireless/mediatek/mt76/mt7615/mcu.h
+#	drivers/net/wireless/mediatek/mt76/mt76_connac_mcu.c
+#	drivers/net/wireless/mediatek/mt76/mt76_connac_mcu.h
+diff --cc drivers/net/wireless/mediatek/mt76/mt7615/mcu.c
+index bb481662d3c5,af2979c294e0..000000000000
+--- a/drivers/net/wireless/mediatek/mt76/mt7615/mcu.c
++++ b/drivers/net/wireless/mediatek/mt76/mt7615/mcu.c
+@@@ -3572,300 -2532,6 +3563,303 @@@ int mt7615_mcu_set_bss_pm(struct mt7615
+  				 sizeof(req), false);
+  }
+  
+++<<<<<<< HEAD
+ +#ifdef CONFIG_PM
+ +int mt7615_mcu_set_hif_suspend(struct mt7615_dev *dev, bool suspend)
+ +{
+ +	struct {
+ +		struct {
+ +			u8 hif_type; /* 0x0: HIF_SDIO
+ +				      * 0x1: HIF_USB
+ +				      * 0x2: HIF_PCIE
+ +				      */
+ +			u8 pad[3];
+ +		} __packed hdr;
+ +		struct hif_suspend_tlv {
+ +			__le16 tag;
+ +			__le16 len;
+ +			u8 suspend;
+ +		} __packed hif_suspend;
+ +	} req = {
+ +		.hif_suspend = {
+ +			.tag = cpu_to_le16(0), /* 0: UNI_HIF_CTRL_BASIC */
+ +			.len = cpu_to_le16(sizeof(struct hif_suspend_tlv)),
+ +			.suspend = suspend,
+ +		},
+ +	};
+ +
+ +	if (mt76_is_mmio(&dev->mt76))
+ +		req.hdr.hif_type = 2;
+ +	else if (mt76_is_usb(&dev->mt76))
+ +		req.hdr.hif_type = 1;
+ +	else if (mt76_is_sdio(&dev->mt76))
+ +		req.hdr.hif_type = 0;
+ +
+ +	return mt76_mcu_send_msg(&dev->mt76, MCU_UNI_CMD_HIF_CTRL, &req,
+ +				 sizeof(req), true);
+ +}
+ +EXPORT_SYMBOL_GPL(mt7615_mcu_set_hif_suspend);
+ +
+ +static int
+ +mt7615_mcu_set_wow_ctrl(struct mt7615_phy *phy, struct ieee80211_vif *vif,
+ +			bool suspend, struct cfg80211_wowlan *wowlan)
+ +{
+ +	struct mt7615_vif *mvif = (struct mt7615_vif *)vif->drv_priv;
+ +	struct mt7615_dev *dev = phy->dev;
+ +	struct {
+ +		struct {
+ +			u8 bss_idx;
+ +			u8 pad[3];
+ +		} __packed hdr;
+ +		struct mt7615_wow_ctrl_tlv wow_ctrl_tlv;
+ +		struct mt7615_wow_gpio_param_tlv gpio_tlv;
+ +	} req = {
+ +		.hdr = {
+ +			.bss_idx = mvif->idx,
+ +		},
+ +		.wow_ctrl_tlv = {
+ +			.tag = cpu_to_le16(UNI_SUSPEND_WOW_CTRL),
+ +			.len = cpu_to_le16(sizeof(struct mt7615_wow_ctrl_tlv)),
+ +			.cmd = suspend ? 1 : 2,
+ +		},
+ +		.gpio_tlv = {
+ +			.tag = cpu_to_le16(UNI_SUSPEND_WOW_GPIO_PARAM),
+ +			.len = cpu_to_le16(sizeof(struct mt7615_wow_gpio_param_tlv)),
+ +			.gpio_pin = 0xff, /* follow fw about GPIO pin */
+ +		},
+ +	};
+ +
+ +	if (wowlan->magic_pkt)
+ +		req.wow_ctrl_tlv.trigger |= BIT(0);
+ +	if (wowlan->disconnect)
+ +		req.wow_ctrl_tlv.trigger |= BIT(2);
+ +	if (wowlan->nd_config) {
+ +		mt7615_mcu_sched_scan_req(phy, vif, wowlan->nd_config);
+ +		req.wow_ctrl_tlv.trigger |= BIT(5);
+ +		mt7615_mcu_sched_scan_enable(phy, vif, suspend);
+ +	}
+ +
+ +	if (mt76_is_mmio(&dev->mt76))
+ +		req.wow_ctrl_tlv.wakeup_hif = WOW_PCIE;
+ +	else if (mt76_is_usb(&dev->mt76))
+ +		req.wow_ctrl_tlv.wakeup_hif = WOW_USB;
+ +	else if (mt76_is_sdio(&dev->mt76))
+ +		req.wow_ctrl_tlv.wakeup_hif = WOW_GPIO;
+ +
+ +	return mt76_mcu_send_msg(&dev->mt76, MCU_UNI_CMD_SUSPEND, &req,
+ +				 sizeof(req), true);
+ +}
+ +
+ +static int
+ +mt7615_mcu_set_wow_pattern(struct mt7615_dev *dev,
+ +			   struct ieee80211_vif *vif,
+ +			   u8 index, bool enable,
+ +			   struct cfg80211_pkt_pattern *pattern)
+ +{
+ +	struct mt7615_vif *mvif = (struct mt7615_vif *)vif->drv_priv;
+ +	struct mt7615_wow_pattern_tlv *ptlv;
+ +	struct sk_buff *skb;
+ +	struct req_hdr {
+ +		u8 bss_idx;
+ +		u8 pad[3];
+ +	} __packed hdr = {
+ +		.bss_idx = mvif->idx,
+ +	};
+ +
+ +	skb = mt76_mcu_msg_alloc(&dev->mt76, NULL,
+ +				 sizeof(hdr) + sizeof(*ptlv));
+ +	if (!skb)
+ +		return -ENOMEM;
+ +
+ +	skb_put_data(skb, &hdr, sizeof(hdr));
+ +	ptlv = (struct mt7615_wow_pattern_tlv *)skb_put(skb, sizeof(*ptlv));
+ +	ptlv->tag = cpu_to_le16(UNI_SUSPEND_WOW_PATTERN);
+ +	ptlv->len = cpu_to_le16(sizeof(*ptlv));
+ +	ptlv->data_len = pattern->pattern_len;
+ +	ptlv->enable = enable;
+ +	ptlv->index = index;
+ +
+ +	memcpy(ptlv->pattern, pattern->pattern, pattern->pattern_len);
+ +	memcpy(ptlv->mask, pattern->mask, pattern->pattern_len / 8);
+ +
+ +	return mt76_mcu_skb_send_msg(&dev->mt76, skb, MCU_UNI_CMD_SUSPEND,
+ +				     true);
+ +}
+ +
+ +static int
+ +mt7615_mcu_set_suspend_mode(struct mt7615_dev *dev,
+ +			    struct ieee80211_vif *vif,
+ +			    bool enable, u8 mdtim, bool wow_suspend)
+ +{
+ +	struct mt7615_vif *mvif = (struct mt7615_vif *)vif->drv_priv;
+ +	struct {
+ +		struct {
+ +			u8 bss_idx;
+ +			u8 pad[3];
+ +		} __packed hdr;
+ +		struct mt7615_suspend_tlv suspend_tlv;
+ +	} req = {
+ +		.hdr = {
+ +			.bss_idx = mvif->idx,
+ +		},
+ +		.suspend_tlv = {
+ +			.tag = cpu_to_le16(UNI_SUSPEND_MODE_SETTING),
+ +			.len = cpu_to_le16(sizeof(struct mt7615_suspend_tlv)),
+ +			.enable = enable,
+ +			.mdtim = mdtim,
+ +			.wow_suspend = wow_suspend,
+ +		},
+ +	};
+ +
+ +	return mt76_mcu_send_msg(&dev->mt76, MCU_UNI_CMD_SUSPEND, &req,
+ +				 sizeof(req), true);
+ +}
+ +
+ +static int
+ +mt7615_mcu_set_gtk_rekey(struct mt7615_dev *dev,
+ +			 struct ieee80211_vif *vif,
+ +			 bool suspend)
+ +{
+ +	struct mt7615_vif *mvif = (struct mt7615_vif *)vif->drv_priv;
+ +	struct {
+ +		struct {
+ +			u8 bss_idx;
+ +			u8 pad[3];
+ +		} __packed hdr;
+ +		struct mt7615_gtk_rekey_tlv gtk_tlv;
+ +	} __packed req = {
+ +		.hdr = {
+ +			.bss_idx = mvif->idx,
+ +		},
+ +		.gtk_tlv = {
+ +			.tag = cpu_to_le16(UNI_OFFLOAD_OFFLOAD_GTK_REKEY),
+ +			.len = cpu_to_le16(sizeof(struct mt7615_gtk_rekey_tlv)),
+ +			.rekey_mode = !suspend,
+ +		},
+ +	};
+ +
+ +	return mt76_mcu_send_msg(&dev->mt76, MCU_UNI_CMD_OFFLOAD, &req,
+ +				 sizeof(req), true);
+ +}
+ +
+ +static int
+ +mt7615_mcu_set_arp_filter(struct mt7615_dev *dev, struct ieee80211_vif *vif,
+ +			  bool suspend)
+ +{
+ +	struct mt7615_vif *mvif = (struct mt7615_vif *)vif->drv_priv;
+ +	struct {
+ +		struct {
+ +			u8 bss_idx;
+ +			u8 pad[3];
+ +		} __packed hdr;
+ +		struct mt7615_arpns_tlv arpns;
+ +	} req = {
+ +		.hdr = {
+ +			.bss_idx = mvif->idx,
+ +		},
+ +		.arpns = {
+ +			.tag = cpu_to_le16(UNI_OFFLOAD_OFFLOAD_ARP),
+ +			.len = cpu_to_le16(sizeof(struct mt7615_arpns_tlv)),
+ +			.mode = suspend,
+ +		},
+ +	};
+ +
+ +	return mt76_mcu_send_msg(&dev->mt76, MCU_UNI_CMD_OFFLOAD, &req,
+ +				 sizeof(req), true);
+ +}
+ +
+ +void mt7615_mcu_set_suspend_iter(void *priv, u8 *mac,
+ +				 struct ieee80211_vif *vif)
+ +{
+ +	struct mt7615_phy *phy = priv;
+ +	bool suspend = test_bit(MT76_STATE_SUSPEND, &phy->mt76->state);
+ +	struct ieee80211_hw *hw = phy->mt76->hw;
+ +	struct cfg80211_wowlan *wowlan = hw->wiphy->wowlan_config;
+ +	int i;
+ +
+ +	mt7615_mcu_set_gtk_rekey(phy->dev, vif, suspend);
+ +	mt7615_mcu_set_arp_filter(phy->dev, vif, suspend);
+ +
+ +	mt7615_mcu_set_suspend_mode(phy->dev, vif, suspend, 1, true);
+ +
+ +	for (i = 0; i < wowlan->n_patterns; i++)
+ +		mt7615_mcu_set_wow_pattern(phy->dev, vif, i, suspend,
+ +					   &wowlan->patterns[i]);
+ +	mt7615_mcu_set_wow_ctrl(phy, vif, suspend, wowlan);
+ +}
+ +
+ +static void
+ +mt7615_mcu_key_iter(struct ieee80211_hw *hw, struct ieee80211_vif *vif,
+ +		    struct ieee80211_sta *sta, struct ieee80211_key_conf *key,
+ +		    void *data)
+ +{
+ +	struct mt7615_gtk_rekey_tlv *gtk_tlv = data;
+ +	u32 cipher;
+ +
+ +	if (key->cipher != WLAN_CIPHER_SUITE_AES_CMAC &&
+ +	    key->cipher != WLAN_CIPHER_SUITE_CCMP &&
+ +	    key->cipher != WLAN_CIPHER_SUITE_TKIP)
+ +		return;
+ +
+ +	if (key->cipher == WLAN_CIPHER_SUITE_TKIP) {
+ +		gtk_tlv->proto = cpu_to_le32(NL80211_WPA_VERSION_1);
+ +		cipher = BIT(3);
+ +	} else {
+ +		gtk_tlv->proto = cpu_to_le32(NL80211_WPA_VERSION_2);
+ +		cipher = BIT(4);
+ +	}
+ +
+ +	/* we are assuming here to have a single pairwise key */
+ +	if (key->flags & IEEE80211_KEY_FLAG_PAIRWISE) {
+ +		gtk_tlv->pairwise_cipher = cpu_to_le32(cipher);
+ +		gtk_tlv->group_cipher = cpu_to_le32(cipher);
+ +		gtk_tlv->keyid = key->keyidx;
+ +	}
+ +}
+ +
+ +int mt7615_mcu_update_gtk_rekey(struct ieee80211_hw *hw,
+ +				struct ieee80211_vif *vif,
+ +				struct cfg80211_gtk_rekey_data *key)
+ +{
+ +	struct mt7615_vif *mvif = (struct mt7615_vif *)vif->drv_priv;
+ +	struct mt7615_dev *dev = mt7615_hw_dev(hw);
+ +	struct mt7615_gtk_rekey_tlv *gtk_tlv;
+ +	struct sk_buff *skb;
+ +	struct {
+ +		u8 bss_idx;
+ +		u8 pad[3];
+ +	} __packed hdr = {
+ +		.bss_idx = mvif->idx,
+ +	};
+ +
+ +	skb = mt76_mcu_msg_alloc(&dev->mt76, NULL,
+ +				 sizeof(hdr) + sizeof(*gtk_tlv));
+ +	if (!skb)
+ +		return -ENOMEM;
+ +
+ +	skb_put_data(skb, &hdr, sizeof(hdr));
+ +	gtk_tlv = (struct mt7615_gtk_rekey_tlv *)skb_put(skb,
+ +							 sizeof(*gtk_tlv));
+ +	gtk_tlv->tag = cpu_to_le16(UNI_OFFLOAD_OFFLOAD_GTK_REKEY);
+ +	gtk_tlv->len = cpu_to_le16(sizeof(*gtk_tlv));
+ +	gtk_tlv->rekey_mode = 2;
+ +	gtk_tlv->option = 1;
+ +
+ +	rcu_read_lock();
+ +	ieee80211_iter_keys_rcu(hw, vif, mt7615_mcu_key_iter, gtk_tlv);
+ +	rcu_read_unlock();
+ +
+ +	memcpy(gtk_tlv->kek, key->kek, NL80211_KEK_LEN);
+ +	memcpy(gtk_tlv->kck, key->kck, NL80211_KCK_LEN);
+ +	memcpy(gtk_tlv->replay_ctr, key->replay_ctr, NL80211_REPLAY_CTR_LEN);
+ +
+ +	return mt76_mcu_skb_send_msg(&dev->mt76, skb, MCU_UNI_CMD_OFFLOAD,
+ +				     true);
+ +}
+ +#endif /* CONFIG_PM */
+ +
+++=======
+++>>>>>>> 55d4c19c9319 (mt76: mt76_connac: move WoW and suspend code in mt76_connac_mcu module)
+  int mt7615_mcu_set_roc(struct mt7615_phy *phy, struct ieee80211_vif *vif,
+  		       struct ieee80211_channel *chan, int duration)
+  {
+@@@ -3900,10 -2566,10 +3894,10 @@@ int mt7615_mcu_update_arp_filter(struc
+  			u8 bss_idx;
+  			u8 pad[3];
+  		} __packed hdr;
+- 		struct mt7615_arpns_tlv arp;
++ 		struct mt76_connac_arpns_tlv arp;
+  	} req_hdr = {
+  		.hdr = {
+ -			.bss_idx = mvif->mt76.idx,
+ +			.bss_idx = mvif->idx,
+  		},
+  		.arp = {
+  			.tag = cpu_to_le16(UNI_OFFLOAD_OFFLOAD_ARP),
+diff --cc drivers/net/wireless/mediatek/mt76/mt7615/mcu.h
+index 6ef5670211d1,446c6abf44d8..000000000000
+--- a/drivers/net/wireless/mediatek/mt76/mt7615/mcu.h
++++ b/drivers/net/wireless/mediatek/mt76/mt7615/mcu.h
+@@@ -438,136 -254,6 +438,139 @@@ struct mt7615_mcu_reg_event 
+  	__le32 val;
+  } __packed;
+  
+++<<<<<<< HEAD
+ +struct mt7615_mcu_bss_event {
+ +	u8 bss_idx;
+ +	u8 is_absent;
+ +	u8 free_quota;
+ +	u8 pad;
+ +} __packed;
+ +
+ +struct mt7615_bss_basic_tlv {
+ +	__le16 tag;
+ +	__le16 len;
+ +	u8 active;
+ +	u8 omac_idx;
+ +	u8 hw_bss_idx;
+ +	u8 band_idx;
+ +	__le32 conn_type;
+ +	u8 conn_state;
+ +	u8 wmm_idx;
+ +	u8 bssid[ETH_ALEN];
+ +	__le16 bmc_tx_wlan_idx;
+ +	__le16 bcn_interval;
+ +	u8 dtim_period;
+ +	u8 phymode; /* bit(0): A
+ +		     * bit(1): B
+ +		     * bit(2): G
+ +		     * bit(3): GN
+ +		     * bit(4): AN
+ +		     * bit(5): AC
+ +		     */
+ +	__le16 sta_idx;
+ +	u8 nonht_basic_phy;
+ +	u8 pad[3];
+ +} __packed;
+ +
+ +struct mt7615_bss_qos_tlv {
+ +	__le16 tag;
+ +	__le16 len;
+ +	u8 qos;
+ +	u8 pad[3];
+ +} __packed;
+ +
+ +enum {
+ +	WOW_USB = 1,
+ +	WOW_PCIE = 2,
+ +	WOW_GPIO = 3,
+ +};
+ +
+ +struct mt7615_wow_ctrl_tlv {
+ +	__le16 tag;
+ +	__le16 len;
+ +	u8 cmd; /* 0x1: PM_WOWLAN_REQ_START
+ +		 * 0x2: PM_WOWLAN_REQ_STOP
+ +		 * 0x3: PM_WOWLAN_PARAM_CLEAR
+ +		 */
+ +	u8 trigger; /* 0: NONE
+ +		     * BIT(0): NL80211_WOWLAN_TRIG_MAGIC_PKT
+ +		     * BIT(1): NL80211_WOWLAN_TRIG_ANY
+ +		     * BIT(2): NL80211_WOWLAN_TRIG_DISCONNECT
+ +		     * BIT(3): NL80211_WOWLAN_TRIG_GTK_REKEY_FAILURE
+ +		     * BIT(4): BEACON_LOST
+ +		     * BIT(5): NL80211_WOWLAN_TRIG_NET_DETECT
+ +		     */
+ +	u8 wakeup_hif; /* 0x0: HIF_SDIO
+ +			* 0x1: HIF_USB
+ +			* 0x2: HIF_PCIE
+ +			* 0x3: HIF_GPIO
+ +			*/
+ +	u8 pad;
+ +	u8 rsv[4];
+ +} __packed;
+ +
+ +struct mt7615_wow_gpio_param_tlv {
+ +	__le16 tag;
+ +	__le16 len;
+ +	u8 gpio_pin;
+ +	u8 trigger_lvl;
+ +	u8 pad[2];
+ +	__le32 gpio_interval;
+ +	u8 rsv[4];
+ +} __packed;
+ +
+ +#define MT7615_WOW_MASK_MAX_LEN		16
+ +#define MT7615_WOW_PATTEN_MAX_LEN	128
+ +struct mt7615_wow_pattern_tlv {
+ +	__le16 tag;
+ +	__le16 len;
+ +	u8 index; /* pattern index */
+ +	u8 enable; /* 0: disable
+ +		    * 1: enable
+ +		    */
+ +	u8 data_len; /* pattern length */
+ +	u8 pad;
+ +	u8 mask[MT7615_WOW_MASK_MAX_LEN];
+ +	u8 pattern[MT7615_WOW_PATTEN_MAX_LEN];
+ +	u8 rsv[4];
+ +} __packed;
+ +
+ +struct mt7615_suspend_tlv {
+ +	__le16 tag;
+ +	__le16 len;
+ +	u8 enable; /* 0: suspend mode disabled
+ +		    * 1: suspend mode enabled
+ +		    */
+ +	u8 mdtim; /* LP parameter */
+ +	u8 wow_suspend; /* 0: update by origin policy
+ +			 * 1: update by wow dtim
+ +			 */
+ +	u8 pad[5];
+ +} __packed;
+ +
+ +struct mt7615_gtk_rekey_tlv {
+ +	__le16 tag;
+ +	__le16 len;
+ +	u8 kek[NL80211_KEK_LEN];
+ +	u8 kck[NL80211_KCK_LEN];
+ +	u8 replay_ctr[NL80211_REPLAY_CTR_LEN];
+ +	u8 rekey_mode; /* 0: rekey offload enable
+ +			* 1: rekey offload disable
+ +			* 2: rekey update
+ +			*/
+ +	u8 keyid;
+ +	u8 pad[2];
+ +	__le32 proto; /* WPA-RSN-WAPI-OPSN */
+ +	__le32 pairwise_cipher;
+ +	__le32 group_cipher;
+ +	__le32 key_mgmt; /* NONE-PSK-IEEE802.1X */
+ +	__le32 mgmt_group_cipher;
+ +	u8 option; /* 1: rekey data update without enabling offload */
+ +	u8 reserverd[3];
+ +} __packed;
+ +
+++=======
+++>>>>>>> 55d4c19c9319 (mt76: mt76_connac: move WoW and suspend code in mt76_connac_mcu module)
+  struct mt7615_roc_tlv {
+  	u8 bss_idx;
+  	u8 token;
+@@@ -585,65 -271,6 +588,68 @@@
+  	u8 rsv1[8];
+  } __packed;
+  
+++<<<<<<< HEAD
+ +struct mt7615_arpns_tlv {
+ +	__le16 tag;
+ +	__le16 len;
+ +	u8 mode;
+ +	u8 ips_num;
+ +	u8 option;
+ +	u8 pad[1];
+ +} __packed;
+ +
+ +/* offload mcu commands */
+ +enum {
+ +	MCU_CMD_START_HW_SCAN = MCU_CE_PREFIX | 0x03,
+ +	MCU_CMD_SET_PS_PROFILE = MCU_CE_PREFIX | 0x05,
+ +	MCU_CMD_SET_CHAN_DOMAIN = MCU_CE_PREFIX | 0x0f,
+ +	MCU_CMD_SET_BSS_CONNECTED = MCU_CE_PREFIX | 0x16,
+ +	MCU_CMD_SET_BSS_ABORT = MCU_CE_PREFIX | 0x17,
+ +	MCU_CMD_CANCEL_HW_SCAN = MCU_CE_PREFIX | 0x1b,
+ +	MCU_CMD_SET_ROC = MCU_CE_PREFIX | 0x1c,
+ +	MCU_CMD_SET_P2P_OPPPS = MCU_CE_PREFIX | 0x33,
+ +	MCU_CMD_SCHED_SCAN_ENABLE = MCU_CE_PREFIX | 0x61,
+ +	MCU_CMD_SCHED_SCAN_REQ = MCU_CE_PREFIX | 0x62,
+ +	MCU_CMD_REG_WRITE = MCU_CE_PREFIX | 0xc0,
+ +	MCU_CMD_REG_READ = MCU_CE_PREFIX | MCU_QUERY_MASK | 0xc0,
+ +};
+ +
+ +#define MCU_CMD_ACK		BIT(0)
+ +#define MCU_CMD_UNI		BIT(1)
+ +#define MCU_CMD_QUERY		BIT(2)
+ +
+ +#define MCU_CMD_UNI_EXT_ACK	(MCU_CMD_ACK | MCU_CMD_UNI | MCU_CMD_QUERY)
+ +
+ +enum {
+ +	UNI_BSS_INFO_BASIC = 0,
+ +	UNI_BSS_INFO_RLM = 2,
+ +	UNI_BSS_INFO_BCN_CONTENT = 7,
+ +	UNI_BSS_INFO_QBSS = 15,
+ +	UNI_BSS_INFO_UAPSD = 19,
+ +};
+ +
+ +enum {
+ +	UNI_SUSPEND_MODE_SETTING,
+ +	UNI_SUSPEND_WOW_CTRL,
+ +	UNI_SUSPEND_WOW_GPIO_PARAM,
+ +	UNI_SUSPEND_WOW_WAKEUP_PORT,
+ +	UNI_SUSPEND_WOW_PATTERN,
+ +};
+ +
+ +enum {
+ +	UNI_OFFLOAD_OFFLOAD_ARP,
+ +	UNI_OFFLOAD_OFFLOAD_ND,
+ +	UNI_OFFLOAD_OFFLOAD_GTK_REKEY,
+ +	UNI_OFFLOAD_OFFLOAD_BMC_RPY_DETECT,
+ +};
+ +
+++=======
+++>>>>>>> 55d4c19c9319 (mt76: mt76_connac: move WoW and suspend code in mt76_connac_mcu module)
+ +enum {
+ +	PATCH_SEM_RELEASE = 0x0,
+ +	PATCH_SEM_GET	  = 0x1
+ +};
+ +
+  enum {
+  	PATCH_NOT_DL_SEM_FAIL	 = 0x0,
+  	PATCH_IS_DL		 = 0x1,
+* Unmerged path drivers/net/wireless/mediatek/mt76/mt76_connac_mcu.c
+* Unmerged path drivers/net/wireless/mediatek/mt76/mt76_connac_mcu.h
+diff --git a/drivers/net/wireless/mediatek/mt76/mt7615/main.c b/drivers/net/wireless/mediatek/mt76/mt7615/main.c
+index 56dd0b4e4460..45cb7cccb42b 100644
+--- a/drivers/net/wireless/mediatek/mt76/mt7615/main.c
++++ b/drivers/net/wireless/mediatek/mt76/mt7615/main.c
+@@ -1101,8 +1101,8 @@ static int mt7615_cancel_remain_on_channel(struct ieee80211_hw *hw,
+ static int mt7615_suspend(struct ieee80211_hw *hw,
+ 			  struct cfg80211_wowlan *wowlan)
+ {
+-	struct mt7615_dev *dev = mt7615_hw_dev(hw);
+ 	struct mt7615_phy *phy = mt7615_hw_phy(hw);
++	struct mt7615_dev *dev = mt7615_hw_dev(hw);
+ 	int err = 0;
+ 
+ 	cancel_delayed_work_sync(&dev->pm.ps_work);
+@@ -1117,10 +1117,11 @@ static int mt7615_suspend(struct ieee80211_hw *hw,
+ 	set_bit(MT76_STATE_SUSPEND, &phy->mt76->state);
+ 	ieee80211_iterate_active_interfaces(hw,
+ 					    IEEE80211_IFACE_ITER_RESUME_ALL,
+-					    mt7615_mcu_set_suspend_iter, phy);
++					    mt76_connac_mcu_set_suspend_iter,
++					    phy->mt76);
+ 
+ 	if (!mt7615_dev_running(dev))
+-		err = mt7615_mcu_set_hif_suspend(dev, true);
++		err = mt76_connac_mcu_set_hif_suspend(&dev->mt76, true);
+ 
+ 	mt7615_mutex_release(dev);
+ 
+@@ -1129,8 +1130,8 @@ static int mt7615_suspend(struct ieee80211_hw *hw,
+ 
+ static int mt7615_resume(struct ieee80211_hw *hw)
+ {
+-	struct mt7615_dev *dev = mt7615_hw_dev(hw);
+ 	struct mt7615_phy *phy = mt7615_hw_phy(hw);
++	struct mt7615_dev *dev = mt7615_hw_dev(hw);
+ 	bool running;
+ 
+ 	mt7615_mutex_acquire(dev);
+@@ -1141,7 +1142,7 @@ static int mt7615_resume(struct ieee80211_hw *hw)
+ 	if (!running) {
+ 		int err;
+ 
+-		err = mt7615_mcu_set_hif_suspend(dev, false);
++		err = mt76_connac_mcu_set_hif_suspend(&dev->mt76, false);
+ 		if (err < 0) {
+ 			mt7615_mutex_release(dev);
+ 			return err;
+@@ -1151,7 +1152,8 @@ static int mt7615_resume(struct ieee80211_hw *hw)
+ 	clear_bit(MT76_STATE_SUSPEND, &phy->mt76->state);
+ 	ieee80211_iterate_active_interfaces(hw,
+ 					    IEEE80211_IFACE_ITER_RESUME_ALL,
+-					    mt7615_mcu_set_suspend_iter, phy);
++					    mt76_connac_mcu_set_suspend_iter,
++					    phy->mt76);
+ 
+ 	ieee80211_queue_delayed_work(hw, &phy->mac_work,
+ 				     MT7615_WATCHDOG_TIME);
+@@ -1176,7 +1178,7 @@ static void mt7615_set_rekey_data(struct ieee80211_hw *hw,
+ 	struct mt7615_dev *dev = mt7615_hw_dev(hw);
+ 
+ 	mt7615_mutex_acquire(dev);
+-	mt7615_mcu_update_gtk_rekey(hw, vif, data);
++	mt76_connac_mcu_update_gtk_rekey(hw, vif, data);
+ 	mt7615_mutex_release(dev);
+ }
+ #endif /* CONFIG_PM */
+* Unmerged path drivers/net/wireless/mediatek/mt76/mt7615/mcu.c
+* Unmerged path drivers/net/wireless/mediatek/mt76/mt7615/mcu.h
+diff --git a/drivers/net/wireless/mediatek/mt76/mt7615/mt7615.h b/drivers/net/wireless/mediatek/mt76/mt7615/mt7615.h
+index 8e80331c345e..f5812b76a93c 100644
+--- a/drivers/net/wireless/mediatek/mt76/mt7615/mt7615.h
++++ b/drivers/net/wireless/mediatek/mt76/mt7615/mt7615.h
+@@ -618,12 +618,6 @@ int mt7615_mac_set_beacon_filter(struct mt7615_phy *phy,
+ 				 bool enable);
+ int mt7615_mcu_set_bss_pm(struct mt7615_dev *dev, struct ieee80211_vif *vif,
+ 			  bool enable);
+-int mt7615_mcu_set_hif_suspend(struct mt7615_dev *dev, bool suspend);
+-void mt7615_mcu_set_suspend_iter(void *priv, u8 *mac,
+-				 struct ieee80211_vif *vif);
+-int mt7615_mcu_update_gtk_rekey(struct ieee80211_hw *hw,
+-				struct ieee80211_vif *vif,
+-				struct cfg80211_gtk_rekey_data *key);
+ int mt7615_mcu_update_arp_filter(struct ieee80211_hw *hw,
+ 				 struct ieee80211_vif *vif,
+ 				 struct ieee80211_bss_conf *info);
+diff --git a/drivers/net/wireless/mediatek/mt76/mt7615/pci.c b/drivers/net/wireless/mediatek/mt76/mt7615/pci.c
+index dbd29d897b29..7aa3d629d43c 100644
+--- a/drivers/net/wireless/mediatek/mt76/mt7615/pci.c
++++ b/drivers/net/wireless/mediatek/mt76/mt7615/pci.c
+@@ -82,7 +82,7 @@ static int mt7615_pci_suspend(struct pci_dev *pdev, pm_message_t state)
+ 	hif_suspend = !test_bit(MT76_STATE_SUSPEND, &dev->mphy.state) &&
+ 		      mt7615_firmware_offload(dev);
+ 	if (hif_suspend) {
+-		err = mt7615_mcu_set_hif_suspend(dev, true);
++		err = mt76_connac_mcu_set_hif_suspend(mdev, true);
+ 		if (err)
+ 			return err;
+ 	}
+@@ -130,7 +130,7 @@ static int mt7615_pci_suspend(struct pci_dev *pdev, pm_message_t state)
+ 	}
+ 	napi_enable(&mdev->tx_napi);
+ 	if (hif_suspend)
+-		mt7615_mcu_set_hif_suspend(dev, false);
++		mt76_connac_mcu_set_hif_suspend(mdev, false);
+ 
+ 	return err;
+ }
+@@ -172,7 +172,7 @@ static int mt7615_pci_resume(struct pci_dev *pdev)
+ 
+ 	if (!test_bit(MT76_STATE_SUSPEND, &dev->mphy.state) &&
+ 	    mt7615_firmware_offload(dev))
+-		err = mt7615_mcu_set_hif_suspend(dev, false);
++		err = mt76_connac_mcu_set_hif_suspend(mdev, false);
+ 
+ 	return err;
+ }
+diff --git a/drivers/net/wireless/mediatek/mt76/mt7615/sdio.c b/drivers/net/wireless/mediatek/mt76/mt7615/sdio.c
+index 26b29115c16f..19ab91c5afc0 100644
+--- a/drivers/net/wireless/mediatek/mt76/mt7615/sdio.c
++++ b/drivers/net/wireless/mediatek/mt76/mt7615/sdio.c
+@@ -413,7 +413,7 @@ static int mt7663s_suspend(struct device *dev)
+ 	    mt7615_firmware_offload(mdev)) {
+ 		int err;
+ 
+-		err = mt7615_mcu_set_hif_suspend(mdev, true);
++		err = mt76_connac_mcu_set_hif_suspend(&mdev->mt76, true);
+ 		if (err < 0)
+ 			return err;
+ 	}
+@@ -452,7 +452,7 @@ static int mt7663s_resume(struct device *dev)
+ 
+ 	if (!test_bit(MT76_STATE_SUSPEND, &mdev->mphy.state) &&
+ 	    mt7615_firmware_offload(mdev))
+-		err = mt7615_mcu_set_hif_suspend(mdev, false);
++		err = mt76_connac_mcu_set_hif_suspend(&mdev->mt76, false);
+ 
+ 	return err;
+ }
+diff --git a/drivers/net/wireless/mediatek/mt76/mt7615/usb.c b/drivers/net/wireless/mediatek/mt76/mt7615/usb.c
+index 362d767eafb6..8510289ce2e0 100644
+--- a/drivers/net/wireless/mediatek/mt76/mt7615/usb.c
++++ b/drivers/net/wireless/mediatek/mt76/mt7615/usb.c
+@@ -170,7 +170,7 @@ static int mt7663u_suspend(struct usb_interface *intf, pm_message_t state)
+ 	    mt7615_firmware_offload(dev)) {
+ 		int err;
+ 
+-		err = mt7615_mcu_set_hif_suspend(dev, true);
++		err = mt76_connac_mcu_set_hif_suspend(&dev->mt76, true);
+ 		if (err < 0)
+ 			return err;
+ 	}
+@@ -198,7 +198,7 @@ static int mt7663u_resume(struct usb_interface *intf)
+ 
+ 	if (!test_bit(MT76_STATE_SUSPEND, &dev->mphy.state) &&
+ 	    mt7615_firmware_offload(dev))
+-		err = mt7615_mcu_set_hif_suspend(dev, false);
++		err = mt76_connac_mcu_set_hif_suspend(&dev->mt76, false);
+ 
+ 	return err;
+ }
+* Unmerged path drivers/net/wireless/mediatek/mt76/mt76_connac_mcu.c
+* Unmerged path drivers/net/wireless/mediatek/mt76/mt76_connac_mcu.h
