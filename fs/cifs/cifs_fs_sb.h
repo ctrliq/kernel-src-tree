@@ -64,7 +64,6 @@ struct cifs_sb_info {
 	unsigned int bsize;
 	unsigned int rsize;
 	unsigned int wsize;
-	unsigned long actimeo; /* attribute cache timeout (jiffies) */
 	atomic_t active;
 	unsigned int mnt_cifs_flags;
 	char   *mountdata; /* options received at mount time or via DFS refs */
