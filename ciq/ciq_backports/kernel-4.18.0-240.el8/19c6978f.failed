@@ -1,0 +1,147 @@
+iommu/amd: Update Device Table in increase_address_space()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Joerg Roedel <jroedel@suse.de>
+commit 19c6978fba68a2cdedee7d55fb8c3063d47982d9
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/19c6978f.failed
+
+The Device Table needs to be updated before the new page-table root
+can be published in domain->pt_root. Otherwise a concurrent call to
+fetch_pte might fetch a PTE which is not reachable through the Device
+Table Entry.
+
+Fixes: 92d420ec028d ("iommu/amd: Relax locking in dma_ops path")
+	Reported-by: Qian Cai <cai@lca.pw>
+	Signed-off-by: Joerg Roedel <jroedel@suse.de>
+	Tested-by: Qian Cai <cai@lca.pw>
+Link: https://lore.kernel.org/r/20200504125413.16798-5-joro@8bytes.org
+	Signed-off-by: Joerg Roedel <jroedel@suse.de>
+(cherry picked from commit 19c6978fba68a2cdedee7d55fb8c3063d47982d9)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/iommu/amd_iommu.c
+diff --cc drivers/iommu/amd_iommu.c
+index 96814d8279f3,2ae1daac888a..000000000000
+--- a/drivers/iommu/amd_iommu.c
++++ b/drivers/iommu/amd_iommu.c
+@@@ -114,21 -101,8 +114,26 @@@ struct kmem_cache *amd_iommu_irq_cache
+  static void update_domain(struct protection_domain *domain);
+  static int protection_domain_init(struct protection_domain *domain);
+  static void detach_device(struct device *dev);
+++<<<<<<< HEAD
+ +static void iova_domain_flush_tlb(struct iova_domain *iovad);
+ +
+ +/*
+ + * Data container for a dma_ops specific protection domain
+ + */
+ +struct dma_ops_domain {
+ +	/* generic protection domain information */
+ +	struct protection_domain domain;
+ +
+ +	/* IOVA RB-Tree */
+ +	struct iova_domain iovad;
+ +};
+ +
+ +static struct iova_domain reserved_iova_ranges;
+ +static struct lock_class_key reserved_rbtree_key;
+++=======
++ static void update_and_flush_device_table(struct protection_domain *domain,
++ 					  struct domain_pgtable *pgtable);
+++>>>>>>> 19c6978fba68 (iommu/amd: Update Device Table in increase_address_space())
+  
+  /****************************************************************************
+   *
+@@@ -1494,10 -1461,19 +1499,26 @@@ static bool increase_address_space(stru
+  	if (!pte)
+  		goto out;
+  
+++<<<<<<< HEAD
+ +	*pte             = PM_LEVEL_PDE(domain->mode,
+ +					iommu_virt_to_phys(domain->pt_root));
+ +	domain->pt_root  = pte;
+ +	domain->mode    += 1;
+++=======
++ 	*pte = PM_LEVEL_PDE(pgtable.mode, iommu_virt_to_phys(pgtable.root));
++ 
++ 	pgtable.root  = pte;
++ 	pgtable.mode += 1;
++ 	update_and_flush_device_table(domain, &pgtable);
++ 	domain_flush_complete(domain);
++ 
++ 	/*
++ 	 * Device Table needs to be updated and flushed before the new root can
++ 	 * be published.
++ 	 */
++ 	root = amd_iommu_domain_encode_pgtable(pte, pgtable.mode);
++ 	atomic64_set(&domain->pt_root, root);
+++>>>>>>> 19c6978fba68 (iommu/amd: Update Device Table in increase_address_space())
+  
+  	ret = true;
+  
+@@@ -1971,10 -1910,10 +1993,17 @@@ static void set_dte_entry(u16 devid, st
+  	u64 flags = 0;
+  	u32 old_domid;
+  
+++<<<<<<< HEAD
+ +	if (domain->mode != PAGE_MODE_NONE)
+ +		pte_root = iommu_virt_to_phys(domain->pt_root);
+ +
+ +	pte_root |= (domain->mode & DEV_ENTRY_MODE_MASK)
+++=======
++ 	if (pgtable->mode != PAGE_MODE_NONE)
++ 		pte_root = iommu_virt_to_phys(pgtable->root);
++ 
++ 	pte_root |= (pgtable->mode & DEV_ENTRY_MODE_MASK)
+++>>>>>>> 19c6978fba68 (iommu/amd: Update Device Table in increase_address_space())
+  		    << DEV_ENTRY_MODE_SHIFT;
+  	pte_root |= DTE_FLAG_IR | DTE_FLAG_IW | DTE_FLAG_V | DTE_FLAG_TV;
+  
+@@@ -2353,38 -2315,8 +2385,43 @@@ static struct iommu_group *amd_iommu_de
+   *
+   *****************************************************************************/
+  
+++<<<<<<< HEAD
+ +/*
+ + * In the dma_ops path we only have the struct device. This function
+ + * finds the corresponding IOMMU, the protection domain and the
+ + * requestor id for a given device.
+ + * If the device is not yet associated with a domain this is also done
+ + * in this function.
+ + */
+ +static struct protection_domain *get_domain(struct device *dev)
+ +{
+ +	struct protection_domain *domain;
+ +	struct iommu_domain *io_domain;
+ +
+ +	if (!check_device(dev))
+ +		return ERR_PTR(-EINVAL);
+ +
+ +	domain = get_dev_data(dev)->domain;
+ +	if (domain == NULL && get_dev_data(dev)->defer_attach) {
+ +		get_dev_data(dev)->defer_attach = false;
+ +		io_domain = iommu_get_domain_for_dev(dev);
+ +		domain = to_pdomain(io_domain);
+ +		attach_device(dev, domain);
+ +	}
+ +	if (domain == NULL)
+ +		return ERR_PTR(-EBUSY);
+ +
+ +	if (!dma_ops_domain(domain))
+ +		return ERR_PTR(-EBUSY);
+ +
+ +	return domain;
+ +}
+ +
+ +static void update_device_table(struct protection_domain *domain)
+++=======
++ static void update_device_table(struct protection_domain *domain,
++ 				struct domain_pgtable *pgtable)
+++>>>>>>> 19c6978fba68 (iommu/amd: Update Device Table in increase_address_space())
+  {
+  	struct iommu_dev_data *dev_data;
+  
+* Unmerged path drivers/iommu/amd_iommu.c
