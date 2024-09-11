@@ -1,0 +1,124 @@
+iommu/arm-smmu-v3: Use device properties for pasid-num-bits
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-358.el8
+commit-author Jean-Philippe Brucker <jean-philippe@linaro.org>
+commit 434b73e61cc65cdd26618af6fa4736c2ba1eb29b
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-358.el8/434b73e6.failed
+
+The pasid-num-bits property shouldn't need a dedicated fwspec field,
+it's a job for device properties. Add properties for IORT, and access
+the number of PASID bits using device_property_read_u32().
+
+	Suggested-by: Robin Murphy <robin.murphy@arm.com>
+	Acked-by: Jonathan Cameron <Jonathan.Cameron@huawei.com>
+	Acked-by: Will Deacon <will@kernel.org>
+	Reviewed-by: Eric Auger <eric.auger@redhat.com>
+	Signed-off-by: Jean-Philippe Brucker <jean-philippe@linaro.org>
+	Acked-by: Hanjun Guo <guohanjun@huawei.com>
+Link: https://lore.kernel.org/r/20210401154718.307519-3-jean-philippe@linaro.org
+	Signed-off-by: Joerg Roedel <jroedel@suse.de>
+(cherry picked from commit 434b73e61cc65cdd26618af6fa4736c2ba1eb29b)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/iommu/of_iommu.c
+#	include/linux/iommu.h
+diff --cc drivers/iommu/of_iommu.c
+index 1f2baa27b42c,a9d2df001149..000000000000
+--- a/drivers/iommu/of_iommu.c
++++ b/drivers/iommu/of_iommu.c
+@@@ -183,23 -209,7 +183,27 @@@ const struct iommu_ops *of_iommu_config
+  		err = pci_for_each_dma_alias(to_pci_dev(dev),
+  					     of_pci_iommu_init, &info);
+  	} else {
+++<<<<<<< HEAD
+ +		struct of_phandle_args iommu_spec;
+ +		int idx = 0;
+ +
+ +		while (!of_parse_phandle_with_args(master_np, "iommus",
+ +						   "#iommu-cells",
+ +						   idx, &iommu_spec)) {
+ +			err = of_iommu_xlate(dev, &iommu_spec);
+ +			of_node_put(iommu_spec.np);
+ +			idx++;
+ +			if (err)
+ +				break;
+ +		}
+ +
+ +		fwspec = dev_iommu_fwspec_get(dev);
+ +		if (!err && fwspec)
+ +			of_property_read_u32(master_np, "pasid-num-bits",
+ +					     &fwspec->num_pasid_bits);
+++=======
++ 		err = of_iommu_configure_device(master_np, dev, id);
+++>>>>>>> 434b73e61cc6 (iommu/arm-smmu-v3: Use device properties for pasid-num-bits)
+  	}
+  
+  	/*
+diff --cc include/linux/iommu.h
+index 09dff5a2beac,16ce75693d83..000000000000
+--- a/include/linux/iommu.h
++++ b/include/linux/iommu.h
+@@@ -608,11 -578,9 +607,15 @@@ extern struct iommu_group *generic_devi
+  struct iommu_fwspec {
+  	const struct iommu_ops	*ops;
+  	struct fwnode_handle	*iommu_fwnode;
+++<<<<<<< HEAD
+ +	RH_KABI_BROKEN_REMOVE(void *iommu_priv)
+ +	RH_KABI_BROKEN_INSERT(u32 flags)
+ +	RH_KABI_BROKEN_INSERT(u32 num_pasid_bits)
+++=======
++ 	u32			flags;
+++>>>>>>> 434b73e61cc6 (iommu/arm-smmu-v3: Use device properties for pasid-num-bits)
+  	unsigned int		num_ids;
+ -	u32			ids[];
+ +	RH_KABI_BROKEN_REPLACE(u32 ids[1], u32 ids[])
+  };
+  
+  /* ATS is supported */
+diff --git a/drivers/acpi/arm64/iort.c b/drivers/acpi/arm64/iort.c
+index c928060f50f7..3d97fe5cdf30 100644
+--- a/drivers/acpi/arm64/iort.c
++++ b/drivers/acpi/arm64/iort.c
+@@ -975,15 +975,16 @@ static int iort_pci_iommu_init(struct pci_dev *pdev, u16 alias, void *data)
+ static void iort_named_component_init(struct device *dev,
+ 				      struct acpi_iort_node *node)
+ {
++	struct property_entry props[2] = {};
+ 	struct acpi_iort_named_component *nc;
+-	struct iommu_fwspec *fwspec = dev_iommu_fwspec_get(dev);
+-
+-	if (!fwspec)
+-		return;
+ 
+ 	nc = (struct acpi_iort_named_component *)node->node_data;
+-	fwspec->num_pasid_bits = FIELD_GET(ACPI_IORT_NC_PASID_BITS,
+-					   nc->node_flags);
++	props[0] = PROPERTY_ENTRY_U32("pasid-num-bits",
++				      FIELD_GET(ACPI_IORT_NC_PASID_BITS,
++						nc->node_flags));
++
++	if (device_add_properties(dev, props))
++		dev_warn(dev, "Could not add device properties\n");
+ }
+ 
+ static int iort_nc_iommu_map(struct device *dev, struct acpi_iort_node *node)
+diff --git a/drivers/iommu/arm/arm-smmu-v3/arm-smmu-v3.c b/drivers/iommu/arm/arm-smmu-v3/arm-smmu-v3.c
+index b9552120b708..efb729f37536 100644
+--- a/drivers/iommu/arm/arm-smmu-v3/arm-smmu-v3.c
++++ b/drivers/iommu/arm/arm-smmu-v3/arm-smmu-v3.c
+@@ -2393,7 +2393,8 @@ static struct iommu_device *arm_smmu_probe_device(struct device *dev)
+ 		}
+ 	}
+ 
+-	master->ssid_bits = min(smmu->ssid_bits, fwspec->num_pasid_bits);
++	device_property_read_u32(dev, "pasid-num-bits", &master->ssid_bits);
++	master->ssid_bits = min(smmu->ssid_bits, master->ssid_bits);
+ 
+ 	/*
+ 	 * Note that PASID must be enabled before, and disabled after ATS:
+* Unmerged path drivers/iommu/of_iommu.c
+* Unmerged path include/linux/iommu.h
