@@ -1,0 +1,126 @@
+iommu/arm-smmu: Drop IOVA cookie management
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-358.el8
+commit-author Robin Murphy <robin.murphy@arm.com>
+commit 229496a0eb088b34849fcc3ab25f0f9e3f90794a
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-358.el8/229496a0.failed
+
+The core code bakes its own cookies now.
+
+	Signed-off-by: Robin Murphy <robin.murphy@arm.com>
+Link: https://lore.kernel.org/r/7ae3680dad9735cc69c3618866666896bd11e031.1628682048.git.robin.murphy@arm.com
+	Signed-off-by: Joerg Roedel <jroedel@suse.de>
+(cherry picked from commit 229496a0eb088b34849fcc3ab25f0f9e3f90794a)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/iommu/arm/arm-smmu/qcom_iommu.c
+diff --cc drivers/iommu/arm/arm-smmu/qcom_iommu.c
+index b5746f5072df,b91874cb6cf3..000000000000
+--- a/drivers/iommu/arm/arm-smmu/qcom_iommu.c
++++ b/drivers/iommu/arm/arm-smmu/qcom_iommu.c
+@@@ -346,21 -344,17 +339,35 @@@ static void qcom_iommu_domain_free(stru
+  {
+  	struct qcom_iommu_domain *qcom_domain = to_qcom_iommu_domain(domain);
+  
+++<<<<<<< HEAD
+ +	if (WARN_ON(qcom_domain->iommu))    /* forgot to detach? */
+ +		return;
+ +
+ +	iommu_put_dma_cookie(domain);
+ +
+ +	/* NOTE: unmap can be called after client device is powered off,
+ +	 * for example, with GPUs or anything involving dma-buf.  So we
+ +	 * cannot rely on the device_link.  Make sure the IOMMU is on to
+ +	 * avoid unclocked accesses in the TLB inv path:
+ +	 */
+ +	pm_runtime_get_sync(qcom_domain->iommu->dev);
+ +
+ +	free_io_pgtable_ops(qcom_domain->pgtbl_ops);
+ +
+ +	pm_runtime_put_sync(qcom_domain->iommu->dev);
+++=======
++ 	if (qcom_domain->iommu) {
++ 		/*
++ 		 * NOTE: unmap can be called after client device is powered
++ 		 * off, for example, with GPUs or anything involving dma-buf.
++ 		 * So we cannot rely on the device_link.  Make sure the IOMMU
++ 		 * is on to avoid unclocked accesses in the TLB inv path:
++ 		 */
++ 		pm_runtime_get_sync(qcom_domain->iommu->dev);
++ 		free_io_pgtable_ops(qcom_domain->pgtbl_ops);
++ 		pm_runtime_put_sync(qcom_domain->iommu->dev);
++ 	}
+++>>>>>>> 229496a0eb08 (iommu/arm-smmu: Drop IOVA cookie management)
+  
+  	kfree(qcom_domain);
+  }
+diff --git a/drivers/iommu/arm/arm-smmu-v3/arm-smmu-v3.c b/drivers/iommu/arm/arm-smmu-v3/arm-smmu-v3.c
+index f71d663c97a4..9c1aa02e7f2e 100644
+--- a/drivers/iommu/arm/arm-smmu-v3/arm-smmu-v3.c
++++ b/drivers/iommu/arm/arm-smmu-v3/arm-smmu-v3.c
+@@ -1864,12 +1864,6 @@ static struct iommu_domain *arm_smmu_domain_alloc(unsigned type)
+ 	if (!smmu_domain)
+ 		return NULL;
+ 
+-	if (type == IOMMU_DOMAIN_DMA &&
+-	    iommu_get_dma_cookie(&smmu_domain->domain)) {
+-		kfree(smmu_domain);
+-		return NULL;
+-	}
+-
+ 	mutex_init(&smmu_domain->init_mutex);
+ 	INIT_LIST_HEAD(&smmu_domain->devices);
+ 	spin_lock_init(&smmu_domain->devices_lock);
+@@ -1901,7 +1895,6 @@ static void arm_smmu_domain_free(struct iommu_domain *domain)
+ 	struct arm_smmu_domain *smmu_domain = to_smmu_domain(domain);
+ 	struct arm_smmu_device *smmu = smmu_domain->smmu;
+ 
+-	iommu_put_dma_cookie(domain);
+ 	free_io_pgtable_ops(smmu_domain->pgtbl_ops);
+ 
+ 	/* Free the CD and ASID, if we allocated them */
+diff --git a/drivers/iommu/arm/arm-smmu/arm-smmu.c b/drivers/iommu/arm/arm-smmu/arm-smmu.c
+index bf9efdef2a68..48be45c188c4 100644
+--- a/drivers/iommu/arm/arm-smmu/arm-smmu.c
++++ b/drivers/iommu/arm/arm-smmu/arm-smmu.c
+@@ -873,10 +873,10 @@ static struct iommu_domain *arm_smmu_domain_alloc(unsigned type)
+ {
+ 	struct arm_smmu_domain *smmu_domain;
+ 
+-	if (type != IOMMU_DOMAIN_UNMANAGED &&
+-	    type != IOMMU_DOMAIN_DMA &&
+-	    type != IOMMU_DOMAIN_IDENTITY)
+-		return NULL;
++	if (type != IOMMU_DOMAIN_UNMANAGED && type != IOMMU_DOMAIN_IDENTITY) {
++		if (using_legacy_binding || type != IOMMU_DOMAIN_DMA)
++			return NULL;
++	}
+ 	/*
+ 	 * Allocate the domain and initialise some of its data structures.
+ 	 * We can't really do anything meaningful until we've added a
+@@ -886,12 +886,6 @@ static struct iommu_domain *arm_smmu_domain_alloc(unsigned type)
+ 	if (!smmu_domain)
+ 		return NULL;
+ 
+-	if (type == IOMMU_DOMAIN_DMA && (using_legacy_binding ||
+-	    iommu_get_dma_cookie(&smmu_domain->domain))) {
+-		kfree(smmu_domain);
+-		return NULL;
+-	}
+-
+ 	mutex_init(&smmu_domain->init_mutex);
+ 	spin_lock_init(&smmu_domain->cb_lock);
+ 
+@@ -906,7 +900,6 @@ static void arm_smmu_domain_free(struct iommu_domain *domain)
+ 	 * Free the domain resources. We assume that all devices have
+ 	 * already been detached.
+ 	 */
+-	iommu_put_dma_cookie(domain);
+ 	arm_smmu_destroy_domain_context(domain);
+ 	kfree(smmu_domain);
+ }
+* Unmerged path drivers/iommu/arm/arm-smmu/qcom_iommu.c
