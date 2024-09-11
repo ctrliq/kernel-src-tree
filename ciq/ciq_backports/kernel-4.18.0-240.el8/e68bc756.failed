@@ -1,0 +1,159 @@
+net: page_pool: add the possibility to sync DMA memory for device
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+Rebuild_CHGLOG: - [net] page_pool: add the possibility to sync DMA memory for device (Jiri Benc) [1819631]
+Rebuild_FUZZ: 96.00%
+commit-author Lorenzo Bianconi <lorenzo@kernel.org>
+commit e68bc75691cc3de608c2c7505057c948d13ae587
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/e68bc756.failed
+
+Introduce the following parameters in order to add the possibility to sync
+DMA memory for device before putting allocated pages in the page_pool
+caches:
+- PP_FLAG_DMA_SYNC_DEV: if set in page_pool_params flags, all pages that
+  the driver gets from page_pool will be DMA-synced-for-device according
+  to the length provided by the device driver. Please note DMA-sync-for-CPU
+  is still device driver responsibility
+- offset: DMA address offset where the DMA engine starts copying rx data
+- max_len: maximum DMA memory size page_pool is allowed to flush. This
+  is currently used in __page_pool_alloc_pages_slow routine when pages
+  are allocated from page allocator
+These parameters are supposed to be set by device drivers.
+
+This optimization reduces the length of the DMA-sync-for-device.
+The optimization is valid because pages are initially
+DMA-synced-for-device as defined via max_len. At RX time, the driver
+will perform a DMA-sync-for-CPU on the memory for the packet length.
+What is important is the memory occupied by packet payload, because
+this is the area CPU is allowed to read and modify. As we don't track
+cache-lines written into by the CPU, simply use the packet payload length
+as dma_sync_size at page_pool recycle time. This also take into account
+any tail-extend.
+
+	Tested-by: Matteo Croce <mcroce@redhat.com>
+	Signed-off-by: Lorenzo Bianconi <lorenzo@kernel.org>
+	Signed-off-by: Jesper Dangaard Brouer <brouer@redhat.com>
+	Acked-by: Ilias Apalodimas <ilias.apalodimas@linaro.org>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit e68bc75691cc3de608c2c7505057c948d13ae587)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/core/page_pool.c
+diff --cc net/core/page_pool.c
+index 57bc3cc2f25a,a6aefe989043..000000000000
+--- a/net/core/page_pool.c
++++ b/net/core/page_pool.c
+@@@ -135,20 -130,14 +150,31 @@@ static struct page *page_pool_refill_al
+  	return page;
+  }
+  
+++<<<<<<< HEAD
+ +/* fast path */
+ +static struct page *__page_pool_get_cached(struct page_pool *pool)
+ +{
+ +	struct page *page;
+ +
+ +	/* Caller MUST guarantee safe non-concurrent access, e.g. softirq */
+ +	if (likely(pool->alloc.count)) {
+ +		/* Fast-path */
+ +		page = pool->alloc.cache[--pool->alloc.count];
+ +	} else {
+ +		page = page_pool_refill_alloc_cache(pool);
+ +	}
+ +
+ +	return page;
+++=======
++ static void page_pool_dma_sync_for_device(struct page_pool *pool,
++ 					  struct page *page,
++ 					  unsigned int dma_sync_size)
++ {
++ 	dma_sync_size = min(dma_sync_size, pool->p.max_len);
++ 	dma_sync_single_range_for_device(pool->p.dev, page->dma_addr,
++ 					 pool->p.offset, dma_sync_size,
++ 					 pool->p.dma_dir);
+++>>>>>>> e68bc75691cc (net: page_pool: add the possibility to sync DMA memory for device)
+  }
+  
+  /* slow path */
+@@@ -326,11 -314,14 +355,11 @@@ static bool __page_pool_recycle_direct(
+   */
+  static bool pool_page_reusable(struct page_pool *pool, struct page *page)
+  {
+ -	return !page_is_pfmemalloc(page) && page_to_nid(page) == pool->p.nid;
+ +	return !page_is_pfmemalloc(page);
+  }
+  
+- void __page_pool_put_page(struct page_pool *pool,
+- 			  struct page *page, bool allow_direct)
++ void __page_pool_put_page(struct page_pool *pool, struct page *page,
++ 			  unsigned int dma_sync_size, bool allow_direct)
+  {
+  	/* This allocator is optimized for the XDP mode that uses
+  	 * one-frame-per-page, but have fallbacks that act like the
+diff --git a/include/net/page_pool.h b/include/net/page_pool.h
+index e2e1b7b1e8ba..cfbed00ba7ee 100644
+--- a/include/net/page_pool.h
++++ b/include/net/page_pool.h
+@@ -34,8 +34,18 @@
+ #include <linux/ptr_ring.h>
+ #include <linux/dma-direction.h>
+ 
+-#define PP_FLAG_DMA_MAP 1 /* Should page_pool do the DMA map/unmap */
+-#define PP_FLAG_ALL	PP_FLAG_DMA_MAP
++#define PP_FLAG_DMA_MAP		BIT(0) /* Should page_pool do the DMA
++					* map/unmap
++					*/
++#define PP_FLAG_DMA_SYNC_DEV	BIT(1) /* If set all pages that the driver gets
++					* from page_pool will be
++					* DMA-synced-for-device according to
++					* the length provided by the device
++					* driver.
++					* Please note DMA-sync-for-CPU is still
++					* device driver responsibility
++					*/
++#define PP_FLAG_ALL		(PP_FLAG_DMA_MAP | PP_FLAG_DMA_SYNC_DEV)
+ 
+ /*
+  * Fast allocation side cache array/stack
+@@ -65,6 +75,8 @@ struct page_pool_params {
+ 	int		nid;  /* Numa node id to allocate from pages from */
+ 	struct device	*dev; /* device, for DMA pre-mapping purposes */
+ 	enum dma_data_direction dma_dir; /* DMA mapping direction */
++	unsigned int	max_len; /* max DMA sync memory size */
++	unsigned int	offset;  /* DMA addr offset */
+ };
+ 
+ struct page_pool {
+@@ -151,8 +163,8 @@ static inline void page_pool_use_xdp_mem(struct page_pool *pool,
+ #endif
+ 
+ /* Never call this directly, use helpers below */
+-void __page_pool_put_page(struct page_pool *pool,
+-			  struct page *page, bool allow_direct);
++void __page_pool_put_page(struct page_pool *pool, struct page *page,
++			  unsigned int dma_sync_size, bool allow_direct);
+ 
+ static inline void page_pool_put_page(struct page_pool *pool,
+ 				      struct page *page, bool allow_direct)
+@@ -161,14 +173,14 @@ static inline void page_pool_put_page(struct page_pool *pool,
+ 	 * allow registering MEM_TYPE_PAGE_POOL, but shield linker.
+ 	 */
+ #ifdef CONFIG_PAGE_POOL
+-	__page_pool_put_page(pool, page, allow_direct);
++	__page_pool_put_page(pool, page, -1, allow_direct);
+ #endif
+ }
+ /* Very limited use-cases allow recycle direct */
+ static inline void page_pool_recycle_direct(struct page_pool *pool,
+ 					    struct page *page)
+ {
+-	__page_pool_put_page(pool, page, true);
++	__page_pool_put_page(pool, page, -1, true);
+ }
+ 
+ /* Disconnects a page (from a page_pool).  API users can have a need
+* Unmerged path net/core/page_pool.c
