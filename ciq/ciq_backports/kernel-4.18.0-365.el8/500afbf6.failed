@@ -1,0 +1,526 @@
+x86/fpu/xstate: Add fpstate_realloc()/free()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-365.el8
+commit-author Chang S. Bae <chang.seok.bae@intel.com>
+commit 500afbf645a040a39e1af0dba2fdf6ebf224bd47
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-365.el8/500afbf6.failed
+
+The fpstate embedded in struct fpu is the default state for storing the FPU
+registers. It's sized so that the default supported features can be stored.
+For dynamically enabled features the register buffer is too small.
+
+The #NM handler detects first use of a feature which is disabled in the
+XFD MSR. After handling permission checks it recalculates the size for
+kernel space and user space state and invokes fpstate_realloc() which
+tries to reallocate fpstate and install it.
+
+Provide the allocator function which checks whether the current buffer size
+is sufficient and if not allocates one. If allocation is successful the new
+fpstate is initialized with the new features and sizes and the now enabled
+features is removed from the task's XFD mask.
+
+realloc_fpstate() uses vzalloc(). If use of this mechanism grows to
+re-allocate buffers larger than 64KB, a more sophisticated allocation
+scheme that includes purpose-built reclaim capability might be justified.
+
+	Signed-off-by: Chang S. Bae <chang.seok.bae@intel.com>
+	Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+	Signed-off-by: Borislav Petkov <bp@suse.de>
+Link: https://lore.kernel.org/r/20211021225527.10184-19-chang.seok.bae@intel.com
+(cherry picked from commit 500afbf645a040a39e1af0dba2fdf6ebf224bd47)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/include/asm/fpu/api.h
+#	arch/x86/kernel/fpu/xstate.c
+diff --cc arch/x86/include/asm/fpu/api.h
+index 9833eb36228b,b7267b9e452f..000000000000
+--- a/arch/x86/include/asm/fpu/api.h
++++ b/arch/x86/include/asm/fpu/api.h
+@@@ -95,13 -110,56 +95,43 @@@ extern int cpu_has_xfeatures(u64 xfeatu
+  
+  static inline void update_pasid(void) { }
+  
+++<<<<<<< HEAD
+++=======
++ /* Trap handling */
++ extern int  fpu__exception_code(struct fpu *fpu, int trap_nr);
++ extern void fpu_sync_fpstate(struct fpu *fpu);
++ extern void fpu_reset_from_exception_fixup(void);
++ 
++ /* Boot, hotplug and resume */
++ extern void fpu__init_cpu(void);
++ extern void fpu__init_system(struct cpuinfo_x86 *c);
++ extern void fpu__init_check_bugs(void);
++ extern void fpu__resume_cpu(void);
++ 
++ #ifdef CONFIG_MATH_EMULATION
++ extern void fpstate_init_soft(struct swregs_state *soft);
++ #else
++ static inline void fpstate_init_soft(struct swregs_state *soft) {}
++ #endif
++ 
++ /* State tracking */
++ DECLARE_PER_CPU(struct fpu *, fpu_fpregs_owner_ctx);
++ 
++ /* Process cleanup */
++ #ifdef CONFIG_X86_64
++ extern void fpstate_free(struct fpu *fpu);
++ #else
++ static inline void fpstate_free(struct fpu *fpu) { }
++ #endif
++ 
+++>>>>>>> 500afbf645a0 (x86/fpu/xstate: Add fpstate_realloc()/free())
+  /* fpstate-related functions which are exported to KVM */
+ -extern void fpstate_clear_xstate_component(struct fpstate *fps, unsigned int xfeature);
+ +extern void fpu_init_fpstate_user(struct fpu *fpu);
+  
+  /* KVM specific functions */
+ -extern bool fpu_alloc_guest_fpstate(struct fpu_guest *gfpu);
+ -extern void fpu_free_guest_fpstate(struct fpu_guest *gfpu);
+ -extern int fpu_swap_kvm_fpstate(struct fpu_guest *gfpu, bool enter_guest);
+ -
+ -extern void fpu_copy_guest_fpstate_to_uabi(struct fpu_guest *gfpu, void *buf, unsigned int size, u32 pkru);
+ -extern int fpu_copy_uabi_to_guest_fpstate(struct fpu_guest *gfpu, const void *buf, u64 xcr0, u32 *vpkru);
+ -
+ -static inline void fpstate_set_confidential(struct fpu_guest *gfpu)
+ -{
+ -	gfpu->fpstate->is_confidential = true;
+ -}
+ -
+ -static inline bool fpstate_is_confidential(struct fpu_guest *gfpu)
+ -{
+ -	return gfpu->fpstate->is_confidential;
+ -}
+ +extern void fpu_swap_kvm_fpu(struct fpu *save, struct fpu *rstor, u64 restore_mask);
+  
+ -/* prctl */
+ -struct task_struct;
+ -extern long fpu_xstate_prctl(struct task_struct *tsk, int option, unsigned long arg2);
+ +extern int fpu_copy_kvm_uabi_to_fpstate(struct fpu *fpu, const void *buf, u64 xcr0, u32 *pkru);
+ +extern void fpu_copy_fpstate_to_kvm_uabi(struct fpu *fpu, void *buf, unsigned int size, u32 pkru);
+  
+  #endif /* _ASM_X86_FPU_API_H */
+diff --cc arch/x86/kernel/fpu/xstate.c
+index f744359fb635,db0bfc2db8bf..000000000000
+--- a/arch/x86/kernel/fpu/xstate.c
++++ b/arch/x86/kernel/fpu/xstate.c
+@@@ -11,15 -11,21 +11,17 @@@
+  #include <linux/pkeys.h>
+  #include <linux/seq_file.h>
+  #include <linux/proc_fs.h>
++ #include <linux/vmalloc.h>
+  
+  #include <asm/fpu/api.h>
+ -#include <asm/fpu/regset.h>
+ +#include <asm/fpu/internal.h>
+  #include <asm/fpu/signal.h>
+ -#include <asm/fpu/xcr.h>
+ +#include <asm/fpu/regset.h>
+  
+  #include <asm/tlbflush.h>
+ -#include <asm/prctl.h>
+ -#include <asm/elf.h>
+  
++ #include "context.h"
+  #include "internal.h"
+ -#include "legacy.h"
+  #include "xstate.h"
+  
+  #define for_each_extended_xfeature(bit, mask)				\
+@@@ -1288,8 -1303,355 +1290,359 @@@ void xrstors(struct xregs_state *xstate
+  	WARN_ON_ONCE(err);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ #if IS_ENABLED(CONFIG_KVM)
++ void fpstate_clear_xstate_component(struct fpstate *fps, unsigned int xfeature)
++ {
++ 	void *addr = get_xsave_addr(&fps->regs.xsave, xfeature);
++ 
++ 	if (addr)
++ 		memset(addr, 0, xstate_sizes[xfeature]);
++ }
++ EXPORT_SYMBOL_GPL(fpstate_clear_xstate_component);
++ #endif
++ 
++ #ifdef CONFIG_X86_64
++ 
++ #ifdef CONFIG_X86_DEBUG_FPU
++ /*
++  * Ensure that a subsequent XSAVE* or XRSTOR* instruction with RFBM=@mask
++  * can safely operate on the @fpstate buffer.
++  */
++ static bool xstate_op_valid(struct fpstate *fpstate, u64 mask, bool rstor)
++ {
++ 	u64 xfd = __this_cpu_read(xfd_state);
++ 
++ 	if (fpstate->xfd == xfd)
++ 		return true;
++ 
++ 	 /*
++ 	  * The XFD MSR does not match fpstate->xfd. That's invalid when
++ 	  * the passed in fpstate is current's fpstate.
++ 	  */
++ 	if (fpstate->xfd == current->thread.fpu.fpstate->xfd)
++ 		return false;
++ 
++ 	/*
++ 	 * XRSTOR(S) from init_fpstate are always correct as it will just
++ 	 * bring all components into init state and not read from the
++ 	 * buffer. XSAVE(S) raises #PF after init.
++ 	 */
++ 	if (fpstate == &init_fpstate)
++ 		return rstor;
++ 
++ 	/*
++ 	 * XSAVE(S): clone(), fpu_swap_kvm_fpu()
++ 	 * XRSTORS(S): fpu_swap_kvm_fpu()
++ 	 */
++ 
++ 	/*
++ 	 * No XSAVE/XRSTOR instructions (except XSAVE itself) touch
++ 	 * the buffer area for XFD-disabled state components.
++ 	 */
++ 	mask &= ~xfd;
++ 
++ 	/*
++ 	 * Remove features which are valid in fpstate. They
++ 	 * have space allocated in fpstate.
++ 	 */
++ 	mask &= ~fpstate->xfeatures;
++ 
++ 	/*
++ 	 * Any remaining state components in 'mask' might be written
++ 	 * by XSAVE/XRSTOR. Fail validation it found.
++ 	 */
++ 	return !mask;
++ }
++ 
++ void xfd_validate_state(struct fpstate *fpstate, u64 mask, bool rstor)
++ {
++ 	WARN_ON_ONCE(!xstate_op_valid(fpstate, mask, rstor));
++ }
++ #endif /* CONFIG_X86_DEBUG_FPU */
++ 
++ void fpstate_free(struct fpu *fpu)
++ {
++ 	if (fpu->fpstate || fpu->fpstate != &fpu->__fpstate)
++ 		vfree(fpu->fpstate);
++ }
++ 
++ /**
++  * fpu_install_fpstate - Update the active fpstate in the FPU
++  *
++  * @fpu:	A struct fpu * pointer
++  * @newfps:	A struct fpstate * pointer
++  *
++  * Returns:	A null pointer if the last active fpstate is the embedded
++  *		one or the new fpstate is already installed;
++  *		otherwise, a pointer to the old fpstate which has to
++  *		be freed by the caller.
++  */
++ static struct fpstate *fpu_install_fpstate(struct fpu *fpu,
++ 					   struct fpstate *newfps)
++ {
++ 	struct fpstate *oldfps = fpu->fpstate;
++ 
++ 	if (fpu->fpstate == newfps)
++ 		return NULL;
++ 
++ 	fpu->fpstate = newfps;
++ 	return oldfps != &fpu->__fpstate ? oldfps : NULL;
++ }
++ 
++ /**
++  * fpstate_realloc - Reallocate struct fpstate for the requested new features
++  *
++  * @xfeatures:	A bitmap of xstate features which extend the enabled features
++  *		of that task
++  * @ksize:	The required size for the kernel buffer
++  * @usize:	The required size for user space buffers
++  *
++  * Note vs. vmalloc(): If the task with a vzalloc()-allocated buffer
++  * terminates quickly, vfree()-induced IPIs may be a concern, but tasks
++  * with large states are likely to live longer.
++  *
++  * Returns: 0 on success, -ENOMEM on allocation error.
++  */
++ static int fpstate_realloc(u64 xfeatures, unsigned int ksize,
++ 			   unsigned int usize)
++ {
++ 	struct fpu *fpu = &current->thread.fpu;
++ 	struct fpstate *curfps, *newfps = NULL;
++ 	unsigned int fpsize;
++ 
++ 	curfps = fpu->fpstate;
++ 	fpsize = ksize + ALIGN(offsetof(struct fpstate, regs), 64);
++ 
++ 	newfps = vzalloc(fpsize);
++ 	if (!newfps)
++ 		return -ENOMEM;
++ 	newfps->size = ksize;
++ 	newfps->user_size = usize;
++ 	newfps->is_valloc = true;
++ 
++ 	fpregs_lock();
++ 	/*
++ 	 * Ensure that the current state is in the registers before
++ 	 * swapping fpstate as that might invalidate it due to layout
++ 	 * changes.
++ 	 */
++ 	if (test_thread_flag(TIF_NEED_FPU_LOAD))
++ 		fpregs_restore_userregs();
++ 
++ 	newfps->xfeatures = curfps->xfeatures | xfeatures;
++ 	newfps->user_xfeatures = curfps->user_xfeatures | xfeatures;
++ 	newfps->xfd = curfps->xfd & ~xfeatures;
++ 
++ 	curfps = fpu_install_fpstate(fpu, newfps);
++ 
++ 	/* Do the final updates within the locked region */
++ 	xstate_init_xcomp_bv(&newfps->regs.xsave, newfps->xfeatures);
++ 	xfd_update_state(newfps);
++ 
++ 	fpregs_unlock();
++ 
++ 	vfree(curfps);
++ 	return 0;
++ }
++ 
++ static int validate_sigaltstack(unsigned int usize)
++ {
++ 	struct task_struct *thread, *leader = current->group_leader;
++ 	unsigned long framesize = get_sigframe_size();
++ 
++ 	lockdep_assert_held(&current->sighand->siglock);
++ 
++ 	/* get_sigframe_size() is based on fpu_user_cfg.max_size */
++ 	framesize -= fpu_user_cfg.max_size;
++ 	framesize += usize;
++ 	for_each_thread(leader, thread) {
++ 		if (thread->sas_ss_size && thread->sas_ss_size < framesize)
++ 			return -ENOSPC;
++ 	}
++ 	return 0;
++ }
++ 
++ static int __xstate_request_perm(u64 permitted, u64 requested)
++ {
++ 	/*
++ 	 * This deliberately does not exclude !XSAVES as we still might
++ 	 * decide to optionally context switch XCR0 or talk the silicon
++ 	 * vendors into extending XFD for the pre AMX states, especially
++ 	 * AVX512.
++ 	 */
++ 	bool compacted = cpu_feature_enabled(X86_FEATURE_XSAVES);
++ 	struct fpu *fpu = &current->group_leader->thread.fpu;
++ 	unsigned int ksize, usize;
++ 	u64 mask;
++ 	int ret;
++ 
++ 	/* Check whether fully enabled */
++ 	if ((permitted & requested) == requested)
++ 		return 0;
++ 
++ 	/* Calculate the resulting kernel state size */
++ 	mask = permitted | requested;
++ 	ksize = xstate_calculate_size(mask, compacted);
++ 
++ 	/* Calculate the resulting user state size */
++ 	mask &= XFEATURE_MASK_USER_SUPPORTED;
++ 	usize = xstate_calculate_size(mask, false);
++ 
++ 	ret = validate_sigaltstack(usize);
++ 	if (ret)
++ 		return ret;
++ 
++ 	/* Pairs with the READ_ONCE() in xstate_get_group_perm() */
++ 	WRITE_ONCE(fpu->perm.__state_perm, requested);
++ 	/* Protected by sighand lock */
++ 	fpu->perm.__state_size = ksize;
++ 	fpu->perm.__user_state_size = usize;
++ 	return ret;
++ }
++ 
++ /*
++  * Permissions array to map facilities with more than one component
++  */
++ static const u64 xstate_prctl_req[XFEATURE_MAX] = {
++ 	/* [XFEATURE_XTILE_DATA] = XFEATURE_MASK_XTILE, */
++ };
++ 
++ static int xstate_request_perm(unsigned long idx)
++ {
++ 	u64 permitted, requested;
++ 	int ret;
++ 
++ 	if (idx >= XFEATURE_MAX)
++ 		return -EINVAL;
++ 
++ 	/*
++ 	 * Look up the facility mask which can require more than
++ 	 * one xstate component.
++ 	 */
++ 	idx = array_index_nospec(idx, ARRAY_SIZE(xstate_prctl_req));
++ 	requested = xstate_prctl_req[idx];
++ 	if (!requested)
++ 		return -EOPNOTSUPP;
++ 
++ 	if ((fpu_user_cfg.max_features & requested) != requested)
++ 		return -EOPNOTSUPP;
++ 
++ 	/* Lockless quick check */
++ 	permitted = xstate_get_host_group_perm();
++ 	if ((permitted & requested) == requested)
++ 		return 0;
++ 
++ 	/* Protect against concurrent modifications */
++ 	spin_lock_irq(&current->sighand->siglock);
++ 	permitted = xstate_get_host_group_perm();
++ 	ret = __xstate_request_perm(permitted, requested);
++ 	spin_unlock_irq(&current->sighand->siglock);
++ 	return ret;
++ }
++ 
++ int xfd_enable_feature(u64 xfd_err)
++ {
++ 	u64 xfd_event = xfd_err & XFEATURE_MASK_USER_DYNAMIC;
++ 	unsigned int ksize, usize;
++ 	struct fpu *fpu;
++ 
++ 	if (!xfd_event) {
++ 		pr_err_once("XFD: Invalid xfd error: %016llx\n", xfd_err);
++ 		return 0;
++ 	}
++ 
++ 	/* Protect against concurrent modifications */
++ 	spin_lock_irq(&current->sighand->siglock);
++ 
++ 	/* If not permitted let it die */
++ 	if ((xstate_get_host_group_perm() & xfd_event) != xfd_event) {
++ 		spin_unlock_irq(&current->sighand->siglock);
++ 		return -EPERM;
++ 	}
++ 
++ 	fpu = &current->group_leader->thread.fpu;
++ 	ksize = fpu->perm.__state_size;
++ 	usize = fpu->perm.__user_state_size;
++ 	/*
++ 	 * The feature is permitted. State size is sufficient.  Dropping
++ 	 * the lock is safe here even if more features are added from
++ 	 * another task, the retrieved buffer sizes are valid for the
++ 	 * currently requested feature(s).
++ 	 */
++ 	spin_unlock_irq(&current->sighand->siglock);
++ 
++ 	/*
++ 	 * Try to allocate a new fpstate. If that fails there is no way
++ 	 * out.
++ 	 */
++ 	if (fpstate_realloc(xfd_event, ksize, usize))
++ 		return -EFAULT;
++ 	return 0;
++ }
++ #else /* CONFIG_X86_64 */
++ static inline int xstate_request_perm(unsigned long idx)
++ {
++ 	return -EPERM;
++ }
++ #endif  /* !CONFIG_X86_64 */
++ 
++ /**
++  * fpu_xstate_prctl - xstate permission operations
++  * @tsk:	Redundant pointer to current
++  * @option:	A subfunction of arch_prctl()
++  * @arg2:	option argument
++  * Return:	0 if successful; otherwise, an error code
++  *
++  * Option arguments:
++  *
++  * ARCH_GET_XCOMP_SUPP: Pointer to user space u64 to store the info
++  * ARCH_GET_XCOMP_PERM: Pointer to user space u64 to store the info
++  * ARCH_REQ_XCOMP_PERM: Facility number requested
++  *
++  * For facilities which require more than one XSTATE component, the request
++  * must be the highest state component number related to that facility,
++  * e.g. for AMX which requires XFEATURE_XTILE_CFG(17) and
++  * XFEATURE_XTILE_DATA(18) this would be XFEATURE_XTILE_DATA(18).
++  */
++ long fpu_xstate_prctl(struct task_struct *tsk, int option, unsigned long arg2)
++ {
++ 	u64 __user *uptr = (u64 __user *)arg2;
++ 	u64 permitted, supported;
++ 	unsigned long idx = arg2;
++ 
++ 	if (tsk != current)
++ 		return -EPERM;
++ 
++ 	switch (option) {
++ 	case ARCH_GET_XCOMP_SUPP:
++ 		supported = fpu_user_cfg.max_features |	fpu_user_cfg.legacy_features;
++ 		return put_user(supported, uptr);
++ 
++ 	case ARCH_GET_XCOMP_PERM:
++ 		/*
++ 		 * Lockless snapshot as it can also change right after the
++ 		 * dropping the lock.
++ 		 */
++ 		permitted = xstate_get_host_group_perm();
++ 		permitted &= XFEATURE_MASK_USER_SUPPORTED;
++ 		return put_user(permitted, uptr);
++ 
++ 	case ARCH_REQ_XCOMP_PERM:
++ 		if (!IS_ENABLED(CONFIG_X86_64))
++ 			return -EOPNOTSUPP;
++ 
++ 		return xstate_request_perm(idx);
++ 
++ 	default:
++ 		return -EINVAL;
++ 	}
++ }
++ 
+++>>>>>>> 500afbf645a0 (x86/fpu/xstate: Add fpstate_realloc()/free())
+  #ifdef CONFIG_PROC_PID_ARCH_STATUS
+ +
+  /*
+   * Report the amount of time elapsed in millisecond since last AVX512
+   * use in the task.
+* Unmerged path arch/x86/include/asm/fpu/api.h
+* Unmerged path arch/x86/kernel/fpu/xstate.c
+diff --git a/arch/x86/kernel/process.c b/arch/x86/kernel/process.c
+index bb26f23ff9f8..1e01c502d4f3 100644
+--- a/arch/x86/kernel/process.c
++++ b/arch/x86/kernel/process.c
+@@ -32,6 +32,7 @@
+ #include <linux/uaccess.h>
+ #include <asm/mwait.h>
+ #include <asm/fpu/sched.h>
++#include <asm/fpu/xstate.h>
+ #include <asm/debugreg.h>
+ #include <asm/nmi.h>
+ #include <asm/tlbflush.h>
+@@ -103,9 +104,18 @@ int arch_dup_task_struct(struct task_struct *dst, struct task_struct *src)
+ #endif
+ 	/* Drop the copied pointer to current's fpstate */
+ 	dst->thread.fpu.fpstate = NULL;
++
+ 	return 0;
+ }
+ 
++#ifdef CONFIG_X86_64
++void arch_release_task_struct(struct task_struct *tsk)
++{
++	if (fpu_state_size_dynamic())
++		fpstate_free(&tsk->thread.fpu);
++}
++#endif
++
+ /*
+  * Free current thread data structures etc..
+  */
