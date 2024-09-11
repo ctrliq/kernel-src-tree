@@ -105,9 +105,9 @@ static int kvmppc_xive_native_create(struct kvm_device *dev, u32 type)
 	xive->single_escalation = xive_native_has_single_escalation();
 
 	if (ret)
-		kfree(xive);
+		return ret;
 
-	return ret;
+	return 0;
 }
 
 static int xive_native_debug_show(struct seq_file *m, void *private)
