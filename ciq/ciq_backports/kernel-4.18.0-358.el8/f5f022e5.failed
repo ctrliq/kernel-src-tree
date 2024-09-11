@@ -1,0 +1,148 @@
+printk: reimplement log_cont using record extension
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-358.el8
+commit-author John Ogness <john.ogness@linutronix.de>
+commit f5f022e53b874f978dda23847173cbf2589b07f5
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-358.el8/f5f022e5.failed
+
+Use the record extending feature of the ringbuffer to implement
+continuous messages. This preserves the existing continuous message
+behavior.
+
+	Signed-off-by: John Ogness <john.ogness@linutronix.de>
+	Reviewed-by: Petr Mladek <pmladek@suse.com>
+	Signed-off-by: Petr Mladek <pmladek@suse.com>
+Link: https://lore.kernel.org/r/20200914123354.832-7-john.ogness@linutronix.de
+(cherry picked from commit f5f022e53b874f978dda23847173cbf2589b07f5)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	kernel/printk/printk.c
+diff --cc kernel/printk/printk.c
+index c1fedccb5ed4,9a2e23191576..000000000000
+--- a/kernel/printk/printk.c
++++ b/kernel/printk/printk.c
+@@@ -634,44 -516,31 +634,51 @@@ static int log_store(u32 caller_id, in
+  			return 0;
+  	}
+  
+ +	if (log_next_idx + size + sizeof(struct printk_log) > log_buf_len) {
+ +		/*
+ +		 * This message + an additional empty header does not fit
+ +		 * at the end of the buffer. Add an empty header with len == 0
+ +		 * to signify a wrap around.
+ +		 */
+ +		memset(log_buf + log_next_idx, 0, sizeof(struct printk_log));
+ +		log_next_idx = 0;
+ +	}
+ +
+  	/* fill message */
+ -	memcpy(&r.text_buf[0], text, text_len);
+ -	if (trunc_msg_len)
+ -		memcpy(&r.text_buf[text_len], trunc_msg, trunc_msg_len);
+ -	r.info->text_len = text_len + trunc_msg_len;
+ -	if (r.dict_buf) {
+ -		memcpy(&r.dict_buf[0], dict, dict_len);
+ -		r.info->dict_len = dict_len;
+ -	}
+ -	r.info->facility = facility;
+ -	r.info->level = level & 7;
+ -	r.info->flags = flags & 0x1f;
+ +	msg = (struct printk_log *)(log_buf + log_next_idx);
+ +	memcpy(log_text(msg), text, text_len);
+ +	msg->text_len = text_len;
+ +	if (trunc_msg_len) {
+ +		memcpy(log_text(msg) + text_len, trunc_msg, trunc_msg_len);
+ +		msg->text_len += trunc_msg_len;
+ +	}
+ +	memcpy(log_dict(msg), dict, dict_len);
+ +	msg->dict_len = dict_len;
+ +	msg->facility = facility;
+ +	msg->level = level & 7;
+ +	msg->flags = flags & 0x1f;
+  	if (ts_nsec > 0)
+ -		r.info->ts_nsec = ts_nsec;
+ +		msg->ts_nsec = ts_nsec;
+  	else
+ -		r.info->ts_nsec = local_clock();
+ -	r.info->caller_id = caller_id;
+ +		msg->ts_nsec = local_clock();
+ +#ifdef CONFIG_PRINTK_CALLER
+ +	msg->caller_id = caller_id;
+ +#endif
+ +	memset(log_dict(msg) + dict_len, 0, pad_len);
+ +	msg->len = size;
+  
+  	/* insert message */
+++<<<<<<< HEAD
+ +	log_next_idx += msg->len;
+ +	log_next_seq++;
+++=======
++ 	if ((flags & LOG_CONT) || !(flags & LOG_NEWLINE))
++ 		prb_commit(&e);
++ 	else
++ 		prb_final_commit(&e);
+++>>>>>>> f5f022e53b87 (printk: reimplement log_cont using record extension)
+  
+ -	return (text_len + trunc_msg_len);
+ +	return msg->text_len;
+  }
+  
+  int dmesg_restrict = IS_ENABLED(CONFIG_SECURITY_DMESG_RESTRICT);
+@@@ -1166,11 -1064,49 +1173,45 @@@ static void __init set_percpu_data_read
+  	__printk_percpu_data_ready = true;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static unsigned int __init add_to_rb(struct printk_ringbuffer *rb,
++ 				     struct printk_record *r)
++ {
++ 	struct prb_reserved_entry e;
++ 	struct printk_record dest_r;
++ 
++ 	prb_rec_init_wr(&dest_r, r->info->text_len, r->info->dict_len);
++ 
++ 	if (!prb_reserve(&e, rb, &dest_r))
++ 		return 0;
++ 
++ 	memcpy(&dest_r.text_buf[0], &r->text_buf[0], r->info->text_len);
++ 	dest_r.info->text_len = r->info->text_len;
++ 	if (dest_r.dict_buf) {
++ 		memcpy(&dest_r.dict_buf[0], &r->dict_buf[0], r->info->dict_len);
++ 		dest_r.info->dict_len = r->info->dict_len;
++ 	}
++ 	dest_r.info->facility = r->info->facility;
++ 	dest_r.info->level = r->info->level;
++ 	dest_r.info->flags = r->info->flags;
++ 	dest_r.info->ts_nsec = r->info->ts_nsec;
++ 	dest_r.info->caller_id = r->info->caller_id;
++ 
++ 	prb_final_commit(&e);
++ 
++ 	return prb_record_text_space(&e);
++ }
++ 
++ static char setup_text_buf[CONSOLE_EXT_LOG_MAX] __initdata;
++ static char setup_dict_buf[CONSOLE_EXT_LOG_MAX] __initdata;
++ 
+++>>>>>>> f5f022e53b87 (printk: reimplement log_cont using record extension)
+  void __init setup_log_buf(int early)
+  {
+ -	unsigned int new_descs_count;
+ -	struct prb_desc *new_descs;
+ -	struct printk_info info;
+ -	struct printk_record r;
+ -	size_t new_descs_size;
+  	unsigned long flags;
+ -	char *new_dict_buf;
+  	char *new_log_buf;
+  	unsigned int free;
+ -	u64 seq;
+  
+  	/*
+  	 * Some archs call setup_log_buf() multiple times - first is very
+* Unmerged path kernel/printk/printk.c
