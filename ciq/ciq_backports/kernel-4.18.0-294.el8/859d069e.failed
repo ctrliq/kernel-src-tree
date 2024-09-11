@@ -1,0 +1,176 @@
+lockdep: Prepare for NMI IRQ state tracking
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Peter Zijlstra <peterz@infradead.org>
+commit 859d069ee1ddd87862e1d6a356a82ed417dbeb67
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/859d069e.failed
+
+There is no reason not to always, accurately, track IRQ state.
+
+This change also makes IRQ state tracking ignore lockdep_off().
+
+	Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+	Reviewed-by: Ingo Molnar <mingo@kernel.org>
+Link: https://lkml.kernel.org/r/20200623083721.155449112@infradead.org
+(cherry picked from commit 859d069ee1ddd87862e1d6a356a82ed417dbeb67)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	kernel/locking/lockdep.c
+diff --cc kernel/locking/lockdep.c
+index d02c793ed862,d595623c4b34..000000000000
+--- a/kernel/locking/lockdep.c
++++ b/kernel/locking/lockdep.c
+@@@ -3639,19 -3632,30 +3639,32 @@@ static void __trace_hardirqs_on_caller(
+  	 * this bit from being set before)
+  	 */
+  	if (curr->softirqs_enabled)
+ -		mark_held_locks(curr, LOCK_ENABLED_SOFTIRQ);
+ +		if (!mark_held_locks(curr, LOCK_ENABLED_SOFTIRQ))
+ +			return;
+ +
+ +	curr->hardirq_enable_ip = ip;
+ +	curr->hardirq_enable_event = ++curr->irq_events;
+ +	debug_atomic_inc(hardirqs_on_events);
+  }
+  
+ -/**
+ - * lockdep_hardirqs_on_prepare - Prepare for enabling interrupts
+ - * @ip:		Caller address
+ - *
+ - * Invoked before a possible transition to RCU idle from exit to user or
+ - * guest mode. This ensures that all RCU operations are done before RCU
+ - * stops watching. After the RCU transition lockdep_hardirqs_on() has to be
+ - * invoked to set the final state.
+ - */
+ -void lockdep_hardirqs_on_prepare(unsigned long ip)
+ +__visible void trace_hardirqs_on_caller(unsigned long ip)
+  {
+++<<<<<<< HEAD
+ +	time_hardirqs_on(CALLER_ADDR0, ip);
+ +
+ +	if (unlikely(!debug_locks || current->lockdep_recursion))
+++=======
++ 	if (unlikely(!debug_locks))
++ 		return;
++ 
++ 	/*
++ 	 * NMIs do not (and cannot) track lock dependencies, nothing to do.
++ 	 */
++ 	if (unlikely(in_nmi()))
++ 		return;
++ 
++ 	if (unlikely(current->lockdep_recursion & LOCKDEP_RECURSION_MASK))
+++>>>>>>> 859d069ee1dd (lockdep: Prepare for NMI IRQ state tracking)
+  		return;
+  
+  	if (unlikely(current->hardirqs_enabled)) {
+@@@ -3685,17 -3689,74 +3698,76 @@@
+  	if (DEBUG_LOCKS_WARN_ON(current->hardirq_context))
+  		return;
+  
+ -	current->hardirq_chain_key = current->curr_chain_key;
+ -
+  	current->lockdep_recursion++;
+ -	__trace_hardirqs_on_caller();
+ +	__trace_hardirqs_on_caller(ip);
+  	lockdep_recursion_finish();
+  }
+ -EXPORT_SYMBOL_GPL(lockdep_hardirqs_on_prepare);
+ +EXPORT_SYMBOL(trace_hardirqs_on_caller);
+  
+ -void noinstr lockdep_hardirqs_on(unsigned long ip)
+ +void trace_hardirqs_on(void)
+  {
+++<<<<<<< HEAD
+ +	trace_hardirqs_on_caller(CALLER_ADDR0);
+++=======
++ 	struct task_struct *curr = current;
++ 
++ 	if (unlikely(!debug_locks))
++ 		return;
++ 
++ 	/*
++ 	 * NMIs can happen in the middle of local_irq_{en,dis}able() where the
++ 	 * tracking state and hardware state are out of sync.
++ 	 *
++ 	 * NMIs must save lockdep_hardirqs_enabled() to restore IRQ state from,
++ 	 * and not rely on hardware state like normal interrupts.
++ 	 */
++ 	if (unlikely(in_nmi())) {
++ 		/*
++ 		 * Skip:
++ 		 *  - recursion check, because NMI can hit lockdep;
++ 		 *  - hardware state check, because above;
++ 		 *  - chain_key check, see lockdep_hardirqs_on_prepare().
++ 		 */
++ 		goto skip_checks;
++ 	}
++ 
++ 	if (unlikely(current->lockdep_recursion & LOCKDEP_RECURSION_MASK))
++ 		return;
++ 
++ 	if (curr->hardirqs_enabled) {
++ 		/*
++ 		 * Neither irq nor preemption are disabled here
++ 		 * so this is racy by nature but losing one hit
++ 		 * in a stat is not a big deal.
++ 		 */
++ 		__debug_atomic_inc(redundant_hardirqs_on);
++ 		return;
++ 	}
++ 
++ 	/*
++ 	 * We're enabling irqs and according to our state above irqs weren't
++ 	 * already enabled, yet we find the hardware thinks they are in fact
++ 	 * enabled.. someone messed up their IRQ state tracing.
++ 	 */
++ 	if (DEBUG_LOCKS_WARN_ON(!irqs_disabled()))
++ 		return;
++ 
++ 	/*
++ 	 * Ensure the lock stack remained unchanged between
++ 	 * lockdep_hardirqs_on_prepare() and lockdep_hardirqs_on().
++ 	 */
++ 	DEBUG_LOCKS_WARN_ON(current->hardirq_chain_key !=
++ 			    current->curr_chain_key);
++ 
++ skip_checks:
++ 	/* we'll do an OFF -> ON transition: */
++ 	curr->hardirqs_enabled = 1;
++ 	curr->hardirq_enable_ip = ip;
++ 	curr->hardirq_enable_event = ++curr->irq_events;
++ 	debug_atomic_inc(hardirqs_on_events);
+++>>>>>>> 859d069ee1dd (lockdep: Prepare for NMI IRQ state tracking)
+  }
+ -EXPORT_SYMBOL_GPL(lockdep_hardirqs_on);
+ +EXPORT_SYMBOL(trace_hardirqs_on);
+  
+  /*
+   * Hardirqs were disabled:
+@@@ -3704,9 -3765,15 +3776,21 @@@ __visible void trace_hardirqs_off_calle
+  {
+  	struct task_struct *curr = current;
+  
+++<<<<<<< HEAD
+ +	time_hardirqs_off(CALLER_ADDR0, ip);
+ +
+ +	if (unlikely(!debug_locks || current->lockdep_recursion))
+++=======
++ 	if (unlikely(!debug_locks))
++ 		return;
++ 
++ 	/*
++ 	 * Matching lockdep_hardirqs_on(), allow NMIs in the middle of lockdep;
++ 	 * they will restore the software state. This ensures the software
++ 	 * state is consistent inside NMIs as well.
++ 	 */
++ 	if (unlikely(!in_nmi() && (current->lockdep_recursion & LOCKDEP_RECURSION_MASK)))
+++>>>>>>> 859d069ee1dd (lockdep: Prepare for NMI IRQ state tracking)
+  		return;
+  
+  	/*
+* Unmerged path kernel/locking/lockdep.c
