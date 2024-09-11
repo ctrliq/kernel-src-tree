@@ -1,0 +1,439 @@
+block: use an on-stack bio in blkdev_issue_flush
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-358.el8
+commit-author Christoph Hellwig <hch@lst.de>
+commit c6bf3f0e25f4c0f0ecce6cf8d1c589bd9d74d3cf
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-358.el8/c6bf3f0e.failed
+
+There is no point in allocating memory for a synchronous flush.
+
+	Signed-off-by: Christoph Hellwig <hch@lst.de>
+	Reviewed-by: Johannes Thumshirn <johannes.thumshirn@wdc.com>
+	Reviewed-by: Chaitanya Kulkarni <chaitanya.kulkarni@wdc.com>
+	Acked-by: Damien Le Moal <damien.lemoal@wdc.com>
+	Signed-off-by: Jens Axboe <axboe@kernel.dk>
+(cherry picked from commit c6bf3f0e25f4c0f0ecce6cf8d1c589bd9d74d3cf)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/md/dm-zoned-metadata.c
+#	fs/exfat/file.c
+#	fs/ext4/fast_commit.c
+#	fs/ext4/fsync.c
+#	fs/fat/file.c
+#	fs/zonefs/super.c
+#	include/linux/blkdev.h
+diff --cc drivers/md/dm-zoned-metadata.c
+index b9ca8c031266,039d17b28938..000000000000
+--- a/drivers/md/dm-zoned-metadata.c
++++ b/drivers/md/dm-zoned-metadata.c
+@@@ -624,9 -816,10 +624,13 @@@ static int dmz_write_sb(struct dmz_meta
+  	sb->crc = 0;
+  	sb->crc = cpu_to_le32(crc32_le(sb_gen, (unsigned char *)sb, DMZ_BLOCK_SIZE));
+  
+ -	ret = dmz_rdwr_block(dev, REQ_OP_WRITE, zmd->sb[set].block,
+ -			     mblk->page);
+ +	ret = dmz_rdwr_block(zmd, REQ_OP_WRITE, block, mblk->page);
+  	if (ret == 0)
+++<<<<<<< HEAD
+ +		ret = blkdev_issue_flush(zmd->dev->bdev, GFP_NOIO);
+++=======
++ 		ret = blkdev_issue_flush(dev->bdev);
+++>>>>>>> c6bf3f0e25f4 (block: use an on-stack bio in blkdev_issue_flush)
+  
+  	return ret;
+  }
+@@@ -660,7 -862,7 +664,11 @@@ static int dmz_write_dirty_mblocks(stru
+  
+  	/* Flush drive cache (this will also sync data) */
+  	if (ret == 0)
+++<<<<<<< HEAD
+ +		ret = blkdev_issue_flush(zmd->dev->bdev, GFP_NOIO);
+++=======
++ 		ret = blkdev_issue_flush(dev->bdev);
+++>>>>>>> c6bf3f0e25f4 (block: use an on-stack bio in blkdev_issue_flush)
+  
+  	return ret;
+  }
+@@@ -724,8 -933,8 +732,13 @@@ int dmz_flush_metadata(struct dmz_metad
+  
+  	/* If there are no dirty metadata blocks, just flush the device cache */
+  	if (list_empty(&write_list)) {
+++<<<<<<< HEAD
+ +		ret = blkdev_issue_flush(zmd->dev->bdev, GFP_NOIO);
+ +		goto out;
+++=======
++ 		ret = blkdev_issue_flush(dev->bdev);
++ 		goto err;
+++>>>>>>> c6bf3f0e25f4 (block: use an on-stack bio in blkdev_issue_flush)
+  	}
+  
+  	/*
+diff --cc fs/ext4/fsync.c
+index 96d0db6f350b,027a7d7037a0..000000000000
+--- a/fs/ext4/fsync.c
++++ b/fs/ext4/fsync.c
+@@@ -140,19 -166,15 +140,23 @@@ int ext4_sync_file(struct file *file, l
+  	 *  (they were dirtied by commit).  But that's OK - the blocks are
+  	 *  safe in-journal, which is all fsync() needs to ensure.
+  	 */
+ -	if (!sbi->s_journal)
+ -		ret = ext4_fsync_nojournal(inode, datasync, &needs_barrier);
+ -	else if (ext4_should_journal_data(inode))
+ +	if (ext4_should_journal_data(inode)) {
+  		ret = ext4_force_commit(inode->i_sb);
+ -	else
+ -		ret = ext4_fsync_journal(inode, datasync, &needs_barrier);
+ +		goto out;
+ +	}
+  
+ +	commit_tid = datasync ? ei->i_datasync_tid : ei->i_sync_tid;
+ +	if (journal->j_flags & JBD2_BARRIER &&
+ +	    !jbd2_trans_will_send_data_barrier(journal, commit_tid))
+ +		needs_barrier = true;
+ +	ret = jbd2_complete_transaction(journal, commit_tid);
+  	if (needs_barrier) {
+++<<<<<<< HEAD
+ +	issue_flush:
+ +		err = blkdev_issue_flush(inode->i_sb->s_bdev, GFP_KERNEL);
+++=======
++ 		err = blkdev_issue_flush(inode->i_sb->s_bdev);
+++>>>>>>> c6bf3f0e25f4 (block: use an on-stack bio in blkdev_issue_flush)
+  		if (!ret)
+  			ret = err;
+  	}
+diff --cc fs/fat/file.c
+index c60d5f650912,5fee74f1ad61..000000000000
+--- a/fs/fat/file.c
++++ b/fs/fat/file.c
+@@@ -151,12 -185,17 +151,16 @@@ static int fat_file_release(struct inod
+  int fat_file_fsync(struct file *filp, loff_t start, loff_t end, int datasync)
+  {
+  	struct inode *inode = filp->f_mapping->host;
+ -	int err;
+ -
+ -	err = __generic_file_fsync(filp, start, end, datasync);
+ -	if (err)
+ -		return err;
+ +	int res, err;
+  
+ +	res = generic_file_fsync(filp, start, end, datasync);
+  	err = sync_mapping_buffers(MSDOS_SB(inode->i_sb)->fat_inode->i_mapping);
+ -	if (err)
+ -		return err;
+  
+++<<<<<<< HEAD
+ +	return res ? res : err;
+++=======
++ 	return blkdev_issue_flush(inode->i_sb->s_bdev);
+++>>>>>>> c6bf3f0e25f4 (block: use an on-stack bio in blkdev_issue_flush)
+  }
+  
+  
+diff --cc include/linux/blkdev.h
+index a64dfa63d799,0dea268bd61b..000000000000
+--- a/include/linux/blkdev.h
++++ b/include/linux/blkdev.h
+@@@ -1280,9 -1288,47 +1280,51 @@@ static inline bool blk_needs_flush_plug
+  		 !list_empty(&plug->cb_list));
+  }
+  
+++<<<<<<< HEAD
+++=======
++ int blkdev_issue_flush(struct block_device *bdev);
++ long nr_blockdev_pages(void);
++ #else /* CONFIG_BLOCK */
++ struct blk_plug {
++ };
++ 
++ static inline void blk_start_plug(struct blk_plug *plug)
++ {
++ }
++ 
++ static inline void blk_finish_plug(struct blk_plug *plug)
++ {
++ }
++ 
++ static inline void blk_flush_plug(struct task_struct *task)
++ {
++ }
++ 
++ static inline void blk_schedule_flush_plug(struct task_struct *task)
++ {
++ }
++ 
++ 
++ static inline bool blk_needs_flush_plug(struct task_struct *tsk)
++ {
++ 	return false;
++ }
++ 
++ static inline int blkdev_issue_flush(struct block_device *bdev)
++ {
++ 	return 0;
++ }
++ 
++ static inline long nr_blockdev_pages(void)
++ {
++ 	return 0;
++ }
++ #endif /* CONFIG_BLOCK */
++ 
+++>>>>>>> c6bf3f0e25f4 (block: use an on-stack bio in blkdev_issue_flush)
+  extern void blk_io_schedule(void);
+  
+ +int blkdev_issue_flush(struct block_device *, gfp_t);
+  extern int blkdev_issue_write_same(struct block_device *bdev, sector_t sector,
+  		sector_t nr_sects, gfp_t gfp_mask, struct page *page);
+  
+* Unmerged path fs/exfat/file.c
+* Unmerged path fs/ext4/fast_commit.c
+* Unmerged path fs/zonefs/super.c
+diff --git a/block/blk-flush.c b/block/blk-flush.c
+index e46725cd94a9..807e99171f12 100644
+--- a/block/blk-flush.c
++++ b/block/blk-flush.c
+@@ -433,23 +433,18 @@ void blk_insert_flush(struct request *rq)
+ /**
+  * blkdev_issue_flush - queue a flush
+  * @bdev:	blockdev to issue flush for
+- * @gfp_mask:	memory allocation flags (for bio_alloc)
+  *
+  * Description:
+  *    Issue a flush for the block device in question.
+  */
+-int blkdev_issue_flush(struct block_device *bdev, gfp_t gfp_mask)
++int blkdev_issue_flush(struct block_device *bdev)
+ {
+-	struct bio *bio;
+-	int ret = 0;
++	struct bio bio;
+ 
+-	bio = bio_alloc(gfp_mask, 0);
+-	bio_set_dev(bio, bdev);
+-	bio->bi_opf = REQ_OP_WRITE | REQ_PREFLUSH;
+-
+-	ret = submit_bio_wait(bio);
+-	bio_put(bio);
+-	return ret;
++	bio_init(&bio, NULL, 0);
++	bio_set_dev(&bio, bdev);
++	bio.bi_opf = REQ_OP_WRITE | REQ_PREFLUSH;
++	return submit_bio_wait(&bio);
+ }
+ EXPORT_SYMBOL(blkdev_issue_flush);
+ 
+* Unmerged path drivers/md/dm-zoned-metadata.c
+diff --git a/drivers/md/raid5-ppl.c b/drivers/md/raid5-ppl.c
+index 3cecdab8e0b8..2507a7b12e2d 100644
+--- a/drivers/md/raid5-ppl.c
++++ b/drivers/md/raid5-ppl.c
+@@ -1045,7 +1045,7 @@ static int ppl_recover(struct ppl_log *log, struct ppl_header *pplhdr,
+ 	}
+ 
+ 	/* flush the disk cache after recovery if necessary */
+-	ret = blkdev_issue_flush(rdev->bdev, GFP_KERNEL);
++	ret = blkdev_issue_flush(rdev->bdev);
+ out:
+ 	__free_page(page);
+ 	return ret;
+diff --git a/drivers/nvme/target/io-cmd-bdev.c b/drivers/nvme/target/io-cmd-bdev.c
+index 4fe7fd8065f3..376042ee42d5 100644
+--- a/drivers/nvme/target/io-cmd-bdev.c
++++ b/drivers/nvme/target/io-cmd-bdev.c
+@@ -341,7 +341,7 @@ static void nvmet_bdev_execute_flush(struct nvmet_req *req)
+ 
+ u16 nvmet_bdev_flush(struct nvmet_req *req)
+ {
+-	if (blkdev_issue_flush(req->ns->bdev, GFP_KERNEL))
++	if (blkdev_issue_flush(req->ns->bdev))
+ 		return NVME_SC_INTERNAL | NVME_SC_DNR;
+ 	return 0;
+ }
+diff --git a/fs/block_dev.c b/fs/block_dev.c
+index 6b356a70c502..75a9ceb567cc 100644
+--- a/fs/block_dev.c
++++ b/fs/block_dev.c
+@@ -723,7 +723,7 @@ int blkdev_fsync(struct file *filp, loff_t start, loff_t end, int datasync)
+ 	 * i_mutex and doing so causes performance issues with concurrent
+ 	 * O_SYNC writers to a block device.
+ 	 */
+-	error = blkdev_issue_flush(bdev, GFP_KERNEL);
++	error = blkdev_issue_flush(bdev);
+ 	if (error == -EOPNOTSUPP)
+ 		error = 0;
+ 
+* Unmerged path fs/exfat/file.c
+* Unmerged path fs/ext4/fast_commit.c
+* Unmerged path fs/ext4/fsync.c
+diff --git a/fs/ext4/ialloc.c b/fs/ext4/ialloc.c
+index ddba152ff0b3..f183fb96c85f 100644
+--- a/fs/ext4/ialloc.c
++++ b/fs/ext4/ialloc.c
+@@ -1461,7 +1461,7 @@ int ext4_init_inode_table(struct super_block *sb, ext4_group_t group,
+ 	if (ret < 0)
+ 		goto err_out;
+ 	if (barrier)
+-		blkdev_issue_flush(sb->s_bdev, GFP_NOFS);
++		blkdev_issue_flush(sb->s_bdev);
+ 
+ skip_zeroout:
+ 	ext4_lock_group(sb, group);
+diff --git a/fs/ext4/super.c b/fs/ext4/super.c
+index 8467c8b6608a..92750402ffcb 100644
+--- a/fs/ext4/super.c
++++ b/fs/ext4/super.c
+@@ -5252,7 +5252,7 @@ static int ext4_sync_fs(struct super_block *sb, int wait)
+ 		needs_barrier = true;
+ 	if (needs_barrier) {
+ 		int err;
+-		err = blkdev_issue_flush(sb->s_bdev, GFP_KERNEL);
++		err = blkdev_issue_flush(sb->s_bdev);
+ 		if (!ret)
+ 			ret = err;
+ 	}
+* Unmerged path fs/fat/file.c
+diff --git a/fs/hfsplus/inode.c b/fs/hfsplus/inode.c
+index 3513d973e4a4..da6fb4e83bfd 100644
+--- a/fs/hfsplus/inode.c
++++ b/fs/hfsplus/inode.c
+@@ -326,7 +326,7 @@ int hfsplus_file_fsync(struct file *file, loff_t start, loff_t end,
+ 	}
+ 
+ 	if (!test_bit(HFSPLUS_SB_NOBARRIER, &sbi->flags))
+-		blkdev_issue_flush(inode->i_sb->s_bdev, GFP_KERNEL);
++		blkdev_issue_flush(inode->i_sb->s_bdev);
+ 
+ 	inode_unlock(inode);
+ 
+diff --git a/fs/hfsplus/super.c b/fs/hfsplus/super.c
+index 15b6b37284d7..cd7ea57f5685 100644
+--- a/fs/hfsplus/super.c
++++ b/fs/hfsplus/super.c
+@@ -238,7 +238,7 @@ static int hfsplus_sync_fs(struct super_block *sb, int wait)
+ 	mutex_unlock(&sbi->vh_mutex);
+ 
+ 	if (!test_bit(HFSPLUS_SB_NOBARRIER, &sbi->flags))
+-		blkdev_issue_flush(sb->s_bdev, GFP_KERNEL);
++		blkdev_issue_flush(sb->s_bdev);
+ 
+ 	return error;
+ }
+diff --git a/fs/jbd2/checkpoint.c b/fs/jbd2/checkpoint.c
+index 472932b9e6bc..63b526d44886 100644
+--- a/fs/jbd2/checkpoint.c
++++ b/fs/jbd2/checkpoint.c
+@@ -416,7 +416,7 @@ int jbd2_cleanup_journal_tail(journal_t *journal)
+ 	 * jbd2_cleanup_journal_tail() doesn't get called all that often.
+ 	 */
+ 	if (journal->j_flags & JBD2_BARRIER)
+-		blkdev_issue_flush(journal->j_fs_dev, GFP_NOFS);
++		blkdev_issue_flush(journal->j_fs_dev);
+ 
+ 	return __jbd2_update_log_tail(journal, first_tid, blocknr);
+ }
+diff --git a/fs/jbd2/commit.c b/fs/jbd2/commit.c
+index 7600d975b071..825bb26e28b9 100644
+--- a/fs/jbd2/commit.c
++++ b/fs/jbd2/commit.c
+@@ -775,7 +775,7 @@ void jbd2_journal_commit_transaction(journal_t *journal)
+ 	if (commit_transaction->t_need_data_flush &&
+ 	    (journal->j_fs_dev != journal->j_dev) &&
+ 	    (journal->j_flags & JBD2_BARRIER))
+-		blkdev_issue_flush(journal->j_fs_dev, GFP_NOFS);
++		blkdev_issue_flush(journal->j_fs_dev);
+ 
+ 	/* Done it all: now write the commit record asynchronously. */
+ 	if (jbd2_has_feature_async_commit(journal)) {
+@@ -882,7 +882,7 @@ void jbd2_journal_commit_transaction(journal_t *journal)
+ 	stats.run.rs_blocks_logged++;
+ 	if (jbd2_has_feature_async_commit(journal) &&
+ 	    journal->j_flags & JBD2_BARRIER) {
+-		blkdev_issue_flush(journal->j_dev, GFP_NOFS);
++		blkdev_issue_flush(journal->j_dev);
+ 	}
+ 
+ 	if (err)
+diff --git a/fs/jbd2/recovery.c b/fs/jbd2/recovery.c
+index 2ed278f0dced..c19a5bc376cc 100644
+--- a/fs/jbd2/recovery.c
++++ b/fs/jbd2/recovery.c
+@@ -286,7 +286,7 @@ int jbd2_journal_recover(journal_t *journal)
+ 		err = err2;
+ 	/* Make sure all replayed data is on permanent storage */
+ 	if (journal->j_flags & JBD2_BARRIER) {
+-		err2 = blkdev_issue_flush(journal->j_fs_dev, GFP_KERNEL);
++		err2 = blkdev_issue_flush(journal->j_fs_dev);
+ 		if (!err)
+ 			err = err2;
+ 	}
+diff --git a/fs/libfs.c b/fs/libfs.c
+index d4543222bcf8..b728bbb0081d 100644
+--- a/fs/libfs.c
++++ b/fs/libfs.c
+@@ -1040,7 +1040,7 @@ int generic_file_fsync(struct file *file, loff_t start, loff_t end,
+ 	err = __generic_file_fsync(file, start, end, datasync);
+ 	if (err)
+ 		return err;
+-	return blkdev_issue_flush(inode->i_sb->s_bdev, GFP_KERNEL);
++	return blkdev_issue_flush(inode->i_sb->s_bdev);
+ }
+ EXPORT_SYMBOL(generic_file_fsync);
+ 
+diff --git a/fs/nilfs2/the_nilfs.h b/fs/nilfs2/the_nilfs.h
+index 1e4da0f52c60..f435db0e6fb4 100644
+--- a/fs/nilfs2/the_nilfs.h
++++ b/fs/nilfs2/the_nilfs.h
+@@ -384,7 +384,7 @@ static inline int nilfs_flush_device(struct the_nilfs *nilfs)
+ 	 */
+ 	smp_wmb();
+ 
+-	err = blkdev_issue_flush(nilfs->ns_bdev, GFP_KERNEL);
++	err = blkdev_issue_flush(nilfs->ns_bdev);
+ 	if (err != -EIO)
+ 		err = 0;
+ 	return err;
+diff --git a/fs/ocfs2/file.c b/fs/ocfs2/file.c
+index ad2e2e816d94..02450f92f24c 100644
+--- a/fs/ocfs2/file.c
++++ b/fs/ocfs2/file.c
+@@ -208,7 +208,7 @@ static int ocfs2_sync_file(struct file *file, loff_t start, loff_t end,
+ 		needs_barrier = true;
+ 	err = jbd2_complete_transaction(journal, commit_tid);
+ 	if (needs_barrier) {
+-		ret = blkdev_issue_flush(inode->i_sb->s_bdev, GFP_KERNEL);
++		ret = blkdev_issue_flush(inode->i_sb->s_bdev);
+ 		if (!err)
+ 			err = ret;
+ 	}
+diff --git a/fs/reiserfs/file.c b/fs/reiserfs/file.c
+index 3f57c091ae2b..208bacbfcefb 100644
+--- a/fs/reiserfs/file.c
++++ b/fs/reiserfs/file.c
+@@ -165,7 +165,7 @@ static int reiserfs_sync_file(struct file *filp, loff_t start, loff_t end,
+ 	barrier_done = reiserfs_commit_for_inode(inode);
+ 	reiserfs_write_unlock(inode->i_sb);
+ 	if (barrier_done != 1 && reiserfs_barrier_flush(inode->i_sb))
+-		blkdev_issue_flush(inode->i_sb->s_bdev, GFP_KERNEL);
++		blkdev_issue_flush(inode->i_sb->s_bdev);
+ 	inode_unlock(inode);
+ 	if (barrier_done < 0)
+ 		return barrier_done;
+diff --git a/fs/xfs/xfs_super.c b/fs/xfs/xfs_super.c
+index cc6f681674a0..d55f3534ab2c 100644
+--- a/fs/xfs/xfs_super.c
++++ b/fs/xfs/xfs_super.c
+@@ -341,7 +341,7 @@ void
+ xfs_blkdev_issue_flush(
+ 	xfs_buftarg_t		*buftarg)
+ {
+-	blkdev_issue_flush(buftarg->bt_bdev, GFP_NOFS);
++	blkdev_issue_flush(buftarg->bt_bdev);
+ }
+ 
+ STATIC void
+* Unmerged path fs/zonefs/super.c
+* Unmerged path include/linux/blkdev.h
