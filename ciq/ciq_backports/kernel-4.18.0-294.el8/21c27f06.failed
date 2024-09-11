@@ -1,0 +1,297 @@
+driver core: Fix SYNC_STATE_ONLY device link implementation
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Saravana Kannan <saravanak@google.com>
+commit 21c27f06587d2c18150d27ca2382a509ec55c482
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/21c27f06.failed
+
+When SYNC_STATE_ONLY support was added in commit 05ef983e0d65 ("driver
+core: Add device link support for SYNC_STATE_ONLY flag"),
+device_link_add() incorrectly skipped adding the new SYNC_STATE_ONLY
+device link to the supplier's and consumer's "device link" list.
+
+This causes multiple issues:
+- The device link is lost forever from driver core if the caller
+  didn't keep track of it (caller typically isn't expected to). This is
+  a memory leak.
+- The device link is also never visible to any other code path after
+  device_link_add() returns.
+
+If we fix the "device link" list handling, that exposes a bunch of
+issues.
+
+1. The device link "status" state management code rightfully doesn't
+handle the case where a DL_FLAG_MANAGED device link exists between a
+supplier and consumer, but the consumer manages to probe successfully
+before the supplier. The addition of DL_FLAG_SYNC_STATE_ONLY links break
+this assumption. This causes device_links_driver_bound() to throw a
+warning when this happens.
+
+Since DL_FLAG_SYNC_STATE_ONLY device links are mainly used for creating
+proxy device links for child device dependencies and aren't useful once
+the consumer device probes successfully, this patch just deletes
+DL_FLAG_SYNC_STATE_ONLY device links once its consumer device probes.
+This way, we avoid the warning, free up some memory and avoid
+complicating the device links "status" state management code.
+
+2. Creating a DL_FLAG_STATELESS device link between two devices that
+already have a DL_FLAG_SYNC_STATE_ONLY device link will result in the
+DL_FLAG_STATELESS flag not getting set correctly. This patch also fixes
+this.
+
+Lastly, this patch also fixes minor whitespace issues.
+
+	Cc: stable@vger.kernel.org
+Fixes: 05ef983e0d65 ("driver core: Add device link support for SYNC_STATE_ONLY flag")
+	Signed-off-by: Saravana Kannan <saravanak@google.com>
+	Reviewed-by: Rafael J. Wysocki <rafael.j.wysocki@intel.com>
+Link: https://lore.kernel.org/r/20200519063000.128819-1-saravanak@google.com
+	Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+(cherry picked from commit 21c27f06587d2c18150d27ca2382a509ec55c482)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/base/core.c
+diff --cc drivers/base/core.c
+index a7a93bf98225,4e0e430315d9..000000000000
+--- a/drivers/base/core.c
++++ b/drivers/base/core.c
+@@@ -603,6 -700,143 +603,146 @@@ int device_links_check_suppliers(struc
+  }
+  
+  /**
+++<<<<<<< HEAD
+++=======
++  * __device_links_queue_sync_state - Queue a device for sync_state() callback
++  * @dev: Device to call sync_state() on
++  * @list: List head to queue the @dev on
++  *
++  * Queues a device for a sync_state() callback when the device links write lock
++  * isn't held. This allows the sync_state() execution flow to use device links
++  * APIs.  The caller must ensure this function is called with
++  * device_links_write_lock() held.
++  *
++  * This function does a get_device() to make sure the device is not freed while
++  * on this list.
++  *
++  * So the caller must also ensure that device_links_flush_sync_list() is called
++  * as soon as the caller releases device_links_write_lock().  This is necessary
++  * to make sure the sync_state() is called in a timely fashion and the
++  * put_device() is called on this device.
++  */
++ static void __device_links_queue_sync_state(struct device *dev,
++ 					    struct list_head *list)
++ {
++ 	struct device_link *link;
++ 
++ 	if (!dev_has_sync_state(dev))
++ 		return;
++ 	if (dev->state_synced)
++ 		return;
++ 
++ 	list_for_each_entry(link, &dev->links.consumers, s_node) {
++ 		if (!(link->flags & DL_FLAG_MANAGED))
++ 			continue;
++ 		if (link->status != DL_STATE_ACTIVE)
++ 			return;
++ 	}
++ 
++ 	/*
++ 	 * Set the flag here to avoid adding the same device to a list more
++ 	 * than once. This can happen if new consumers get added to the device
++ 	 * and probed before the list is flushed.
++ 	 */
++ 	dev->state_synced = true;
++ 
++ 	if (WARN_ON(!list_empty(&dev->links.defer_sync)))
++ 		return;
++ 
++ 	get_device(dev);
++ 	list_add_tail(&dev->links.defer_sync, list);
++ }
++ 
++ /**
++  * device_links_flush_sync_list - Call sync_state() on a list of devices
++  * @list: List of devices to call sync_state() on
++  * @dont_lock_dev: Device for which lock is already held by the caller
++  *
++  * Calls sync_state() on all the devices that have been queued for it. This
++  * function is used in conjunction with __device_links_queue_sync_state(). The
++  * @dont_lock_dev parameter is useful when this function is called from a
++  * context where a device lock is already held.
++  */
++ static void device_links_flush_sync_list(struct list_head *list,
++ 					 struct device *dont_lock_dev)
++ {
++ 	struct device *dev, *tmp;
++ 
++ 	list_for_each_entry_safe(dev, tmp, list, links.defer_sync) {
++ 		list_del_init(&dev->links.defer_sync);
++ 
++ 		if (dev != dont_lock_dev)
++ 			device_lock(dev);
++ 
++ 		if (dev->bus->sync_state)
++ 			dev->bus->sync_state(dev);
++ 		else if (dev->driver && dev->driver->sync_state)
++ 			dev->driver->sync_state(dev);
++ 
++ 		if (dev != dont_lock_dev)
++ 			device_unlock(dev);
++ 
++ 		put_device(dev);
++ 	}
++ }
++ 
++ void device_links_supplier_sync_state_pause(void)
++ {
++ 	device_links_write_lock();
++ 	defer_sync_state_count++;
++ 	device_links_write_unlock();
++ }
++ 
++ void device_links_supplier_sync_state_resume(void)
++ {
++ 	struct device *dev, *tmp;
++ 	LIST_HEAD(sync_list);
++ 
++ 	device_links_write_lock();
++ 	if (!defer_sync_state_count) {
++ 		WARN(true, "Unmatched sync_state pause/resume!");
++ 		goto out;
++ 	}
++ 	defer_sync_state_count--;
++ 	if (defer_sync_state_count)
++ 		goto out;
++ 
++ 	list_for_each_entry_safe(dev, tmp, &deferred_sync, links.defer_sync) {
++ 		/*
++ 		 * Delete from deferred_sync list before queuing it to
++ 		 * sync_list because defer_sync is used for both lists.
++ 		 */
++ 		list_del_init(&dev->links.defer_sync);
++ 		__device_links_queue_sync_state(dev, &sync_list);
++ 	}
++ out:
++ 	device_links_write_unlock();
++ 
++ 	device_links_flush_sync_list(&sync_list, NULL);
++ }
++ 
++ static int sync_state_resume_initcall(void)
++ {
++ 	device_links_supplier_sync_state_resume();
++ 	return 0;
++ }
++ late_initcall(sync_state_resume_initcall);
++ 
++ static void __device_links_supplier_defer_sync(struct device *sup)
++ {
++ 	if (list_empty(&sup->links.defer_sync) && dev_has_sync_state(sup))
++ 		list_add_tail(&sup->links.defer_sync, &deferred_sync);
++ }
++ 
++ static void device_link_drop_managed(struct device_link *link)
++ {
++ 	link->flags &= ~DL_FLAG_MANAGED;
++ 	WRITE_ONCE(link->status, DL_STATE_NONE);
++ 	kref_put(&link->kref, __device_link_del);
++ }
++ 
++ /**
+++>>>>>>> 21c27f06587d (driver core: Fix SYNC_STATE_ONLY device link implementation)
+   * device_links_driver_bound - Update device links after probing its driver.
+   * @dev: Device to update the links for.
+   *
+@@@ -615,7 -849,17 +755,21 @@@
+   */
+  void device_links_driver_bound(struct device *dev)
+  {
+++<<<<<<< HEAD
+ +	struct device_link *link;
+++=======
++ 	struct device_link *link, *ln;
++ 	LIST_HEAD(sync_list);
++ 
++ 	/*
++ 	 * If a device probes successfully, it's expected to have created all
++ 	 * the device links it needs to or make new device links as it needs
++ 	 * them. So, it no longer needs to wait on any suppliers.
++ 	 */
++ 	mutex_lock(&wfs_lock);
++ 	list_del_init(&dev->links.needs_suppliers);
++ 	mutex_unlock(&wfs_lock);
+++>>>>>>> 21c27f06587d (driver core: Fix SYNC_STATE_ONLY device link implementation)
+  
+  	device_links_write_lock();
+  
+@@@ -640,26 -884,49 +794,56 @@@
+  			driver_deferred_probe_add(link->consumer);
+  	}
+  
+++<<<<<<< HEAD
+ +	list_for_each_entry(link, &dev->links.suppliers, c_node) {
+ +		if (!(link->flags & DL_FLAG_MANAGED))
+ +			continue;
+ +
+ +		WARN_ON(link->status != DL_STATE_CONSUMER_PROBE);
+ +		WRITE_ONCE(link->status, DL_STATE_ACTIVE);
+++=======
++ 	if (defer_sync_state_count)
++ 		__device_links_supplier_defer_sync(dev);
++ 	else
++ 		__device_links_queue_sync_state(dev, &sync_list);
++ 
++ 	list_for_each_entry_safe(link, ln, &dev->links.suppliers, c_node) {
++ 		struct device *supplier;
++ 
++ 		if (!(link->flags & DL_FLAG_MANAGED))
++ 			continue;
++ 
++ 		supplier = link->supplier;
++ 		if (link->flags & DL_FLAG_SYNC_STATE_ONLY) {
++ 			/*
++ 			 * When DL_FLAG_SYNC_STATE_ONLY is set, it means no
++ 			 * other DL_MANAGED_LINK_FLAGS have been set. So, it's
++ 			 * save to drop the managed link completely.
++ 			 */
++ 			device_link_drop_managed(link);
++ 		} else {
++ 			WARN_ON(link->status != DL_STATE_CONSUMER_PROBE);
++ 			WRITE_ONCE(link->status, DL_STATE_ACTIVE);
++ 		}
++ 
++ 		/*
++ 		 * This needs to be done even for the deleted
++ 		 * DL_FLAG_SYNC_STATE_ONLY device link in case it was the last
++ 		 * device link that was preventing the supplier from getting a
++ 		 * sync_state() call.
++ 		 */
++ 		if (defer_sync_state_count)
++ 			__device_links_supplier_defer_sync(supplier);
++ 		else
++ 			__device_links_queue_sync_state(supplier, &sync_list);
+++>>>>>>> 21c27f06587d (driver core: Fix SYNC_STATE_ONLY device link implementation)
+  	}
+  
+  	dev->links.status = DL_DEV_DRIVER_BOUND;
+  
+  	device_links_write_unlock();
+ -
+ -	device_links_flush_sync_list(&sync_list, dev);
+  }
+  
+- static void device_link_drop_managed(struct device_link *link)
+- {
+- 	link->flags &= ~DL_FLAG_MANAGED;
+- 	WRITE_ONCE(link->status, DL_STATE_NONE);
+- 	kref_put(&link->kref, __device_link_del);
+- }
+- 
+  /**
+   * __device_links_no_driver - Update links of a device without a driver.
+   * @dev: Device without a drvier.
+* Unmerged path drivers/base/core.c
