@@ -1,0 +1,367 @@
+RDMA/core: Add module param to disable device sharing among net ns
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-193.el8
+commit-author Parav Pandit <parav@mellanox.com>
+commit a56bc45b27b92954d99c811cb047e789b6cc5a81
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-193.el8/a56bc45b.failed
+
+Add module parameter to change a sharing mode of ib_core early in the
+boot process. This parameter helps to those systems where modern up
+to date rdma tool (iproute2) package may not be available during
+kernel upgrade cycle.
+
+	Signed-off-by: Parav Pandit <parav@mellanox.com>
+	Signed-off-by: Leon Romanovsky <leonro@mellanox.com>
+	Signed-off-by: Jason Gunthorpe <jgg@mellanox.com>
+(cherry picked from commit a56bc45b27b92954d99c811cb047e789b6cc5a81)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/infiniband/core/device.c
+diff --cc drivers/infiniband/core/device.c
+index 3aa933cc02d9,ebc0b0e58eca..000000000000
+--- a/drivers/infiniband/core/device.c
++++ b/drivers/infiniband/core/device.c
+@@@ -72,21 -96,82 +72,92 @@@ static LIST_HEAD(device_list)
+  static LIST_HEAD(client_list);
+  #define CLIENT_REGISTERED XA_MARK_1
+  static DEFINE_XARRAY_FLAGS(clients, XA_FLAGS_ALLOC);
+ -static DECLARE_RWSEM(clients_rwsem);
+  
+  /*
+ - * If client_data is registered then the corresponding client must also still
+ - * be registered.
+ + * device_mutex and lists_rwsem protect access to both device_list and
+ + * clients.  device_mutex protects writer access by device and client
+ + * registration / de-registration.  lists_rwsem protects reader access to
+ + * these lists.  Iterators of these lists must lock it for read, while updates
+ + * to the lists must be done with a write lock. A special case is when the
+ + * device_mutex is locked. In this case locking the lists for read access is
+ + * not necessary as the device_mutex implies it.
+ + *
+ + * lists_rwsem also protects access to the client data list.
+   */
+ -#define CLIENT_DATA_REGISTERED XA_MARK_1
+ +static DEFINE_MUTEX(device_mutex);
+ +static DECLARE_RWSEM(lists_rwsem);
+  
+++<<<<<<< HEAD
+++=======
++ /**
++  * struct rdma_dev_net - rdma net namespace metadata for a net
++  * @net:	Pointer to owner net namespace
++  * @id:		xarray id to identify the net namespace.
++  */
++ struct rdma_dev_net {
++ 	possible_net_t net;
++ 	u32 id;
++ };
++ 
++ static unsigned int rdma_dev_net_id;
++ 
++ /*
++  * A list of net namespaces is maintained in an xarray. This is necessary
++  * because we can't get the locking right using the existing net ns list. We
++  * would require a init_net callback after the list is updated.
++  */
++ static DEFINE_XARRAY_FLAGS(rdma_nets, XA_FLAGS_ALLOC);
++ /*
++  * rwsem to protect accessing the rdma_nets xarray entries.
++  */
++ static DECLARE_RWSEM(rdma_nets_rwsem);
++ 
++ static bool ib_devices_shared_netns = true;
++ module_param_named(netns_mode, ib_devices_shared_netns, bool, 0444);
++ MODULE_PARM_DESC(netns_mode,
++ 		 "Share device among net namespaces; default=1 (shared)");
++ /*
++  * xarray has this behavior where it won't iterate over NULL values stored in
++  * allocated arrays.  So we need our own iterator to see all values stored in
++  * the array. This does the same thing as xa_for_each except that it also
++  * returns NULL valued entries if the array is allocating. Simplified to only
++  * work on simple xarrays.
++  */
++ static void *xan_find_marked(struct xarray *xa, unsigned long *indexp,
++ 			     xa_mark_t filter)
++ {
++ 	XA_STATE(xas, xa, *indexp);
++ 	void *entry;
++ 
++ 	rcu_read_lock();
++ 	do {
++ 		entry = xas_find_marked(&xas, ULONG_MAX, filter);
++ 		if (xa_is_zero(entry))
++ 			break;
++ 	} while (xas_retry(&xas, entry));
++ 	rcu_read_unlock();
++ 
++ 	if (entry) {
++ 		*indexp = xas.xa_index;
++ 		if (xa_is_zero(entry))
++ 			return NULL;
++ 		return entry;
++ 	}
++ 	return XA_ERROR(-ENOENT);
++ }
++ #define xan_for_each_marked(xa, index, entry, filter)                          \
++ 	for (index = 0, entry = xan_find_marked(xa, &(index), filter);         \
++ 	     !xa_is_err(entry);                                                \
++ 	     (index)++, entry = xan_find_marked(xa, &(index), filter))
++ 
++ /* RCU hash table mapping netdevice pointers to struct ib_port_data */
++ static DEFINE_SPINLOCK(ndev_hash_lock);
++ static DECLARE_HASHTABLE(ndev_hash, 5);
++ 
++ static void free_netdevs(struct ib_device *ib_dev);
++ static void ib_unregister_work(struct work_struct *work);
++ static void __ib_unregister_device(struct ib_device *device);
+++>>>>>>> a56bc45b27b9 (RDMA/core: Add module param to disable device sharing among net ns)
+  static int ib_security_change(struct notifier_block *nb, unsigned long event,
+  			      void *lsm_data);
+  static void ib_policy_change_task(struct work_struct *work);
+@@@ -469,28 -726,221 +540,217 @@@ static int ib_security_change(struct no
+  	return NOTIFY_OK;
+  }
+  
+++<<<<<<< HEAD
+ +/**
+ + *	__dev_new_index	-	allocate an device index
+ + *
+ + *	Returns a suitable unique value for a new device interface
+ + *	number.  It assumes that there are less than 2^32-1 ib devices
+ + *	will be present in the system.
+++=======
++ static void compatdev_release(struct device *dev)
++ {
++ 	struct ib_core_device *cdev =
++ 		container_of(dev, struct ib_core_device, dev);
++ 
++ 	kfree(cdev);
++ }
++ 
++ static int add_one_compat_dev(struct ib_device *device,
++ 			      struct rdma_dev_net *rnet)
++ {
++ 	struct ib_core_device *cdev;
++ 	int ret;
++ 
++ 	if (!ib_devices_shared_netns)
++ 		return 0;
++ 
++ 	/*
++ 	 * Create and add compat device in all namespaces other than where it
++ 	 * is currently bound to.
++ 	 */
++ 	if (net_eq(read_pnet(&rnet->net),
++ 		   read_pnet(&device->coredev.rdma_net)))
++ 		return 0;
++ 
++ 	/*
++ 	 * The first of init_net() or ib_register_device() to take the
++ 	 * compat_devs_mutex wins and gets to add the device. Others will wait
++ 	 * for completion here.
++ 	 */
++ 	mutex_lock(&device->compat_devs_mutex);
++ 	cdev = xa_load(&device->compat_devs, rnet->id);
++ 	if (cdev) {
++ 		ret = 0;
++ 		goto done;
++ 	}
++ 	ret = xa_reserve(&device->compat_devs, rnet->id, GFP_KERNEL);
++ 	if (ret)
++ 		goto done;
++ 
++ 	cdev = kzalloc(sizeof(*cdev), GFP_KERNEL);
++ 	if (!cdev) {
++ 		ret = -ENOMEM;
++ 		goto cdev_err;
++ 	}
++ 
++ 	cdev->dev.parent = device->dev.parent;
++ 	rdma_init_coredev(cdev, device, read_pnet(&rnet->net));
++ 	cdev->dev.release = compatdev_release;
++ 	dev_set_name(&cdev->dev, "%s", dev_name(&device->dev));
++ 
++ 	ret = device_add(&cdev->dev);
++ 	if (ret)
++ 		goto add_err;
++ 	ret = ib_setup_port_attrs(cdev, false);
++ 	if (ret)
++ 		goto port_err;
++ 
++ 	ret = xa_err(xa_store(&device->compat_devs, rnet->id,
++ 			      cdev, GFP_KERNEL));
++ 	if (ret)
++ 		goto insert_err;
++ 
++ 	mutex_unlock(&device->compat_devs_mutex);
++ 	return 0;
++ 
++ insert_err:
++ 	ib_free_port_attrs(cdev);
++ port_err:
++ 	device_del(&cdev->dev);
++ add_err:
++ 	put_device(&cdev->dev);
++ cdev_err:
++ 	xa_release(&device->compat_devs, rnet->id);
++ done:
++ 	mutex_unlock(&device->compat_devs_mutex);
++ 	return ret;
++ }
++ 
++ static void remove_one_compat_dev(struct ib_device *device, u32 id)
++ {
++ 	struct ib_core_device *cdev;
++ 
++ 	mutex_lock(&device->compat_devs_mutex);
++ 	cdev = xa_erase(&device->compat_devs, id);
++ 	mutex_unlock(&device->compat_devs_mutex);
++ 	if (cdev) {
++ 		ib_free_port_attrs(cdev);
++ 		device_del(&cdev->dev);
++ 		put_device(&cdev->dev);
++ 	}
++ }
++ 
++ static void remove_compat_devs(struct ib_device *device)
++ {
++ 	struct ib_core_device *cdev;
++ 	unsigned long index;
++ 
++ 	xa_for_each (&device->compat_devs, index, cdev)
++ 		remove_one_compat_dev(device, index);
++ }
++ 
++ static int add_compat_devs(struct ib_device *device)
++ {
++ 	struct rdma_dev_net *rnet;
++ 	unsigned long index;
++ 	int ret = 0;
++ 
++ 	down_read(&rdma_nets_rwsem);
++ 	xa_for_each (&rdma_nets, index, rnet) {
++ 		ret = add_one_compat_dev(device, rnet);
++ 		if (ret)
++ 			break;
++ 	}
++ 	up_read(&rdma_nets_rwsem);
++ 	return ret;
++ }
++ 
++ static void rdma_dev_exit_net(struct net *net)
++ {
++ 	struct rdma_dev_net *rnet = net_generic(net, rdma_dev_net_id);
++ 	struct ib_device *dev;
++ 	unsigned long index;
++ 	int ret;
++ 
++ 	down_write(&rdma_nets_rwsem);
++ 	/*
++ 	 * Prevent the ID from being re-used and hide the id from xa_for_each.
++ 	 */
++ 	ret = xa_err(xa_store(&rdma_nets, rnet->id, NULL, GFP_KERNEL));
++ 	WARN_ON(ret);
++ 	up_write(&rdma_nets_rwsem);
++ 
++ 	down_read(&devices_rwsem);
++ 	xa_for_each (&devices, index, dev) {
++ 		get_device(&dev->dev);
++ 		/*
++ 		 * Release the devices_rwsem so that pontentially blocking
++ 		 * device_del, doesn't hold the devices_rwsem for too long.
++ 		 */
++ 		up_read(&devices_rwsem);
++ 
++ 		remove_one_compat_dev(dev, rnet->id);
++ 
++ 		put_device(&dev->dev);
++ 		down_read(&devices_rwsem);
++ 	}
++ 	up_read(&devices_rwsem);
++ 
++ 	xa_erase(&rdma_nets, rnet->id);
++ }
++ 
++ static __net_init int rdma_dev_init_net(struct net *net)
++ {
++ 	struct rdma_dev_net *rnet = net_generic(net, rdma_dev_net_id);
++ 	unsigned long index;
++ 	struct ib_device *dev;
++ 	int ret;
++ 
++ 	/* No need to create any compat devices in default init_net. */
++ 	if (net_eq(net, &init_net))
++ 		return 0;
++ 
++ 	write_pnet(&rnet->net, net);
++ 
++ 	ret = xa_alloc(&rdma_nets, &rnet->id, rnet, xa_limit_32b, GFP_KERNEL);
++ 	if (ret)
++ 		return ret;
++ 
++ 	down_read(&devices_rwsem);
++ 	xa_for_each_marked (&devices, index, dev, DEVICE_REGISTERED) {
++ 		ret = add_one_compat_dev(dev, rnet);
++ 		if (ret)
++ 			break;
++ 	}
++ 	up_read(&devices_rwsem);
++ 
++ 	if (ret)
++ 		rdma_dev_exit_net(net);
++ 
++ 	return ret;
++ }
++ 
++ /*
++  * Assign the unique string device name and the unique device index. This is
++  * undone by ib_dealloc_device.
+++>>>>>>> a56bc45b27b9 (RDMA/core: Add module param to disable device sharing among net ns)
+   */
+ -static int assign_name(struct ib_device *device, const char *name)
+ +static u32 __dev_new_index(void)
+  {
+ -	static u32 last_id;
+ -	int ret;
+ +	/*
+ +	 * The device index to allow stable naming.
+ +	 * Similar to struct net -> ifindex.
+ +	 */
+ +	static u32 index;
+  
+ -	down_write(&devices_rwsem);
+ -	/* Assign a unique name to the device */
+ -	if (strchr(name, '%'))
+ -		ret = alloc_name(device, name);
+ -	else
+ -		ret = dev_set_name(&device->dev, name);
+ -	if (ret)
+ -		goto out;
+ +	for (;;) {
+ +		if (!(++index))
+ +			index = 1;
+  
+ -	if (__ib_device_get_by_name(dev_name(&device->dev))) {
+ -		ret = -ENFILE;
+ -		goto out;
+ +		if (!__ib_device_get_by_index(index))
+ +			return index;
+  	}
+ -	strlcpy(device->name, dev_name(&device->dev), IB_DEVICE_NAME_MAX);
+ -
+ -	ret = xa_alloc_cyclic(&devices, &device->index, device, xa_limit_31b,
+ -			&last_id, GFP_KERNEL);
+ -	if (ret > 0)
+ -		ret = 0;
+ -
+ -out:
+ -	up_write(&devices_rwsem);
+ -	return ret;
+  }
+  
+  static void setup_dma_device(struct ib_device *device)
+* Unmerged path drivers/infiniband/core/device.c
