@@ -1,0 +1,215 @@
+x86/entry/64: Handle FSGSBASE enabled paranoid entry/exit
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Chang S. Bae <chang.seok.bae@intel.com>
+commit 708078f65721b46d82d9934a3f0b36a2b8ad0656
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/708078f6.failed
+
+Without FSGSBASE, user space cannot change GSBASE other than through a
+PRCTL. The kernel enforces that the user space GSBASE value is postive as
+negative values are used for detecting the kernel space GSBASE value in the
+paranoid entry code.
+
+If FSGSBASE is enabled, user space can set arbitrary GSBASE values without
+kernel intervention, including negative ones, which breaks the paranoid
+entry assumptions.
+
+To avoid this, paranoid entry needs to unconditionally save the current
+GSBASE value independent of the interrupted context, retrieve and write the
+kernel GSBASE and unconditionally restore the saved value on exit. The
+restore happens either in paranoid_exit or in the special exit path of the
+NMI low level code.
+
+All other entry code pathes which use unconditional SWAPGS are not affected
+as they do not depend on the actual content.
+
+[ tglx: Massaged changelogs and comments ]
+
+	Suggested-by: H. Peter Anvin <hpa@zytor.com>
+	Suggested-by: Andy Lutomirski <luto@kernel.org>
+	Suggested-by: Thomas Gleixner <tglx@linutronix.de>
+	Signed-off-by: Chang S. Bae <chang.seok.bae@intel.com>
+	Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+	Cc: Andi Kleen <ak@linux.intel.com>
+	Cc: Ravi Shankar <ravi.v.shankar@intel.com>
+	Cc: Dave Hansen <dave.hansen@linux.intel.com>
+Link: https://lkml.kernel.org/r/1557309753-24073-13-git-send-email-chang.seok.bae@intel.com
+
+(cherry picked from commit 708078f65721b46d82d9934a3f0b36a2b8ad0656)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/entry/entry_64.S
+diff --cc arch/x86/entry/entry_64.S
+index 955c9ec809bc,7f9f5119d6b1..000000000000
+--- a/arch/x86/entry/entry_64.S
++++ b/arch/x86/entry/entry_64.S
+@@@ -38,7 -38,7 +38,11 @@@
+  #include <asm/export.h>
+  #include <asm/frame.h>
+  #include <asm/nospec-branch.h>
+++<<<<<<< HEAD
+ +#include <asm/spec_ctrl.h>
+++=======
++ #include <asm/fsgsbase.h>
+++>>>>>>> 708078f65721 (x86/entry/64: Handle FSGSBASE enabled paranoid entry/exit)
+  #include <linux/err.h>
+  
+  #include "calling.h"
+@@@ -977,10 -945,9 +981,9 @@@ ENTRY(\sym
+  	call	\do_sym
+  
+  	.if \shift_ist != -1
+ -	addq	$\ist_offset, CPU_TSS_IST(\shift_ist)
+ +	addq	$EXCEPTION_STKSZ, CPU_TSS_IST(\shift_ist)
+  	.endif
+  
+- 	/* these procedures expect "no swapgs" flag in ebx */
+  	.if \paranoid
+  	jmp	paranoid_exit
+  	.else
+@@@ -1206,7 -1178,49 +1214,48 @@@ ENTRY(paranoid_entry
+  	cld
+  	PUSH_AND_CLEAR_REGS save_ret=1
+  	ENCODE_FRAME_POINTER 8
+++<<<<<<< HEAD
+++=======
++ 
++ 	/*
++ 	 * Always stash CR3 in %r14.  This value will be restored,
++ 	 * verbatim, at exit.  Needed if paranoid_entry interrupted
++ 	 * another entry that already switched to the user CR3 value
++ 	 * but has not yet returned to userspace.
++ 	 *
++ 	 * This is also why CS (stashed in the "iret frame" by the
++ 	 * hardware at entry) can not be used: this may be a return
++ 	 * to kernel code, but with a user CR3 value.
++ 	 *
++ 	 * Switching CR3 does not depend on kernel GSBASE so it can
++ 	 * be done before switching to the kernel GSBASE. This is
++ 	 * required for FSGSBASE because the kernel GSBASE has to
++ 	 * be retrieved from a kernel internal table.
++ 	 */
++ 	SAVE_AND_SWITCH_TO_KERNEL_CR3 scratch_reg=%rax save_reg=%r14
++ 
++         /*
++ 	 * Handling GSBASE depends on the availability of FSGSBASE.
++ 	 *
++ 	 * Without FSGSBASE the kernel enforces that negative GSBASE
++ 	 * values indicate kernel GSBASE. With FSGSBASE no assumptions
++ 	 * can be made about the GSBASE value when entering from user
++ 	 * space.
++ 	*/
++ 	ALTERNATIVE "jmp .Lparanoid_entry_checkgs", "", X86_FEATURE_FSGSBASE
++ 
++ 	/*
++ 	 * Read the current GSBASE and store it in in %rbx unconditionally,
++ 	 * retrieve and set the current CPUs kernel GSBASE. The stored value
++ 	 * has to be restored in paranoid_exit unconditionally.
++ 	 */
++ 	SAVE_AND_SET_GSBASE scratch_reg=%rax save_reg=%rbx
++ 	ret
++ 
++ .Lparanoid_entry_checkgs:
++ 	/* EBX = 1 -> kernel GSBASE active, no restore required */
+++>>>>>>> 708078f65721 (x86/entry/64: Handle FSGSBASE enabled paranoid entry/exit)
+  	movl	$1, %ebx
+ -	/*
+ -	 * The kernel-enforced convention is a negative GSBASE indicates
+ -	 * a kernel value. No SWAPGS needed on entry and exit.
+ -	 */
+  	movl	$MSR_GS_BASE, %ecx
+  	rdmsr
+  	testl	%edx, %edx
+@@@ -1244,18 -1257,31 +1300,34 @@@ ENTRY(paranoid_exit
+  	UNWIND_HINT_REGS
+  	DISABLE_INTERRUPTS(CLBR_ANY)
+  	TRACE_IRQS_OFF_DEBUG
+++<<<<<<< HEAD
+ +	IBRS_EXIT_RESTORE_CLOBBER save_reg=%r13d
+ +	testl	%ebx, %ebx			/* swapgs needed? */
+++=======
++ 
++ 	/* Handle GS depending on FSGSBASE availability */
++ 	ALTERNATIVE "jmp .Lparanoid_exit_checkgs", "nop",X86_FEATURE_FSGSBASE
++ 
++ 	/* With FSGSBASE enabled, unconditionally restore GSBASE */
++ 	wrgsbase	%rbx
++ 	jmp	.Lparanoid_exit_no_swapgs;
++ 
++ .Lparanoid_exit_checkgs:
++ 	/* On non-FSGSBASE systems, conditionally do SWAPGS */
++ 	testl	%ebx, %ebx
+++>>>>>>> 708078f65721 (x86/entry/64: Handle FSGSBASE enabled paranoid entry/exit)
+  	jnz	.Lparanoid_exit_no_swapgs
+  	TRACE_IRQS_IRETQ
+ -	/* Always restore stashed CR3 value (see paranoid_entry) */
+  	RESTORE_CR3	scratch_reg=%rbx save_reg=%r14
+  	SWAPGS_UNSAFE_STACK
+  	jmp	.Lparanoid_exit_restore
++ 
+  .Lparanoid_exit_no_swapgs:
+  	TRACE_IRQS_IRETQ_DEBUG
+ -	/* Always restore stashed CR3 value (see paranoid_entry) */
+  	RESTORE_CR3	scratch_reg=%rbx save_reg=%r14
++ 
+  .Lparanoid_exit_restore:
+- 	jmp restore_regs_and_return_to_kernel
++ 	jmp	restore_regs_and_return_to_kernel
+  END(paranoid_exit)
+  
+  /*
+@@@ -1673,13 -1689,30 +1745,30 @@@ end_repeat_nmi
+  	movq	$-1, %rsi
+  	call	do_nmi
+  
+ -	/* Always restore stashed CR3 value (see paranoid_entry) */
+ +	IBRS_EXIT_RESTORE_CLOBBER save_reg=%r13d
+  	RESTORE_CR3 scratch_reg=%r15 save_reg=%r14
+  
+- 	testl	%ebx, %ebx			/* swapgs needed? */
++ 	/*
++ 	 * The above invocation of paranoid_entry stored the GSBASE
++ 	 * related information in R/EBX depending on the availability
++ 	 * of FSGSBASE.
++ 	 *
++ 	 * If FSGSBASE is enabled, restore the saved GSBASE value
++ 	 * unconditionally, otherwise take the conditional SWAPGS path.
++ 	 */
++ 	ALTERNATIVE "jmp nmi_no_fsgsbase", "", X86_FEATURE_FSGSBASE
++ 
++ 	wrgsbase	%rbx
++ 	jmp	nmi_restore
++ 
++ nmi_no_fsgsbase:
++ 	/* EBX == 0 -> invoke SWAPGS */
++ 	testl	%ebx, %ebx
+  	jnz	nmi_restore
++ 
+  nmi_swapgs:
+  	SWAPGS_UNSAFE_STACK
++ 
+  nmi_restore:
+  	POP_REGS
+  
+diff --git a/arch/x86/entry/calling.h b/arch/x86/entry/calling.h
+index 7c56a2af8492..cfeaa43eef15 100644
+--- a/arch/x86/entry/calling.h
++++ b/arch/x86/entry/calling.h
+@@ -333,6 +333,12 @@ For 32-bit we have the following conventions - kernel is built with
+ 	ALTERNATIVE "", "lfence", X86_FEATURE_FENCE_SWAPGS_KERNEL
+ .endm
+ 
++.macro SAVE_AND_SET_GSBASE scratch_reg:req save_reg:req
++	rdgsbase \save_reg
++	GET_PERCPU_BASE \scratch_reg
++	wrgsbase \scratch_reg
++.endm
++
+ #endif /* CONFIG_X86_64 */
+ 
+ /*
+* Unmerged path arch/x86/entry/entry_64.S
