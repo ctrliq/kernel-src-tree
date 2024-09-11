@@ -1,0 +1,262 @@
+dmaengine: Fix doc strings to satisfy validation script
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Andy Shevchenko <andriy.shevchenko@linux.intel.com>
+commit 9872e23d6879ee04c7fe8372328195d12e977071
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/9872e23d.failed
+
+The validation kernel doc script complains about undescribed
+function parameters
+
+.../dmaengine.c:155: warning: Function parameter or member 'dev' not descr ibed in 'dev_to_dma_chan'
+.../dmaengine.c:251: warning: cannot understand function prototype: 'dma_cap_mask_t dma_cap_mask_all; '
+.../dmaengine.c:257: warning: cannot understand function prototype: 'struct dma_chan_tbl_ent '
+.../dmaengine.c:264: warning: cannot understand function prototype: 'struct dma_chan_tbl_ent __percpu *channel_table[DMA_TX_TYPE_END]; '
+.../dmaengine.c:304: warning: Function parameter or member 'chan' not described in 'dma_chan_is_local'
+.../dmaengine.c:304: warning: Function parameter or member 'cpu' not described in 'dma_chan_is_local'
+.../dmaengine.c:414: warning: Function parameter or member 'chan' not described in 'balance_ref_count'
+.../dmaengine.c:447: warning: Function parameter or member 'chan' not described in 'dma_chan_get'
+.../dmaengine.c:494: warning: Function parameter or member 'chan' not described in 'dma_chan_put'
+
+Add descriptions to the function parameters and in some cases update
+existing text as well.
+
+	Signed-off-by: Andy Shevchenko <andriy.shevchenko@linux.intel.com>
+Link: https://lore.kernel.org/r/20200429122151.50989-2-andriy.shevchenko@linux.intel.com
+	Signed-off-by: Vinod Koul <vkoul@kernel.org>
+(cherry picked from commit 9872e23d6879ee04c7fe8372328195d12e977071)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/dma/dmaengine.c
+diff --cc drivers/dma/dmaengine.c
+index 27fb2db71a8d,4e07a74fb2af..000000000000
+--- a/drivers/dma/dmaengine.c
++++ b/drivers/dma/dmaengine.c
+@@@ -244,11 -249,152 +244,160 @@@ static struct class dma_devclass = 
+  
+  /* --- client and device registration --- */
+  
+++<<<<<<< HEAD
+ +#define dma_device_satisfies_mask(device, mask) \
+ +	__dma_device_satisfies_mask((device), &(mask))
+ +static int
+ +__dma_device_satisfies_mask(struct dma_device *device,
+ +			    const dma_cap_mask_t *want)
+++=======
++ /* enable iteration over all operation types */
++ static dma_cap_mask_t dma_cap_mask_all;
++ 
++ /**
++  * struct dma_chan_tbl_ent - tracks channel allocations per core/operation
++  * @chan:	associated channel for this entry
++  */
++ struct dma_chan_tbl_ent {
++ 	struct dma_chan *chan;
++ };
++ 
++ /* percpu lookup table for memory-to-memory offload providers */
++ static struct dma_chan_tbl_ent __percpu *channel_table[DMA_TX_TYPE_END];
++ 
++ static int __init dma_channel_table_init(void)
++ {
++ 	enum dma_transaction_type cap;
++ 	int err = 0;
++ 
++ 	bitmap_fill(dma_cap_mask_all.bits, DMA_TX_TYPE_END);
++ 
++ 	/* 'interrupt', 'private', and 'slave' are channel capabilities,
++ 	 * but are not associated with an operation so they do not need
++ 	 * an entry in the channel_table
++ 	 */
++ 	clear_bit(DMA_INTERRUPT, dma_cap_mask_all.bits);
++ 	clear_bit(DMA_PRIVATE, dma_cap_mask_all.bits);
++ 	clear_bit(DMA_SLAVE, dma_cap_mask_all.bits);
++ 
++ 	for_each_dma_cap_mask(cap, dma_cap_mask_all) {
++ 		channel_table[cap] = alloc_percpu(struct dma_chan_tbl_ent);
++ 		if (!channel_table[cap]) {
++ 			err = -ENOMEM;
++ 			break;
++ 		}
++ 	}
++ 
++ 	if (err) {
++ 		pr_err("dmaengine dma_channel_table_init failure: %d\n", err);
++ 		for_each_dma_cap_mask(cap, dma_cap_mask_all)
++ 			free_percpu(channel_table[cap]);
++ 	}
++ 
++ 	return err;
++ }
++ arch_initcall(dma_channel_table_init);
++ 
++ /**
++  * dma_chan_is_local - checks if the channel is in the same NUMA-node as the CPU
++  * @chan:	DMA channel to test
++  * @cpu:	CPU index which the channel should be close to
++  *
++  * Returns true if the channel is in the same NUMA-node as the CPU.
++  */
++ static bool dma_chan_is_local(struct dma_chan *chan, int cpu)
++ {
++ 	int node = dev_to_node(chan->device->dev);
++ 	return node == NUMA_NO_NODE ||
++ 		cpumask_test_cpu(cpu, cpumask_of_node(node));
++ }
++ 
++ /**
++  * min_chan - finds the channel with min count and in the same NUMA-node as the CPU
++  * @cap:	capability to match
++  * @cpu:	CPU index which the channel should be close to
++  *
++  * If some channels are close to the given CPU, the one with the lowest
++  * reference count is returned. Otherwise, CPU is ignored and only the
++  * reference count is taken into account.
++  *
++  * Must be called under dma_list_mutex.
++  */
++ static struct dma_chan *min_chan(enum dma_transaction_type cap, int cpu)
++ {
++ 	struct dma_device *device;
++ 	struct dma_chan *chan;
++ 	struct dma_chan *min = NULL;
++ 	struct dma_chan *localmin = NULL;
++ 
++ 	list_for_each_entry(device, &dma_device_list, global_node) {
++ 		if (!dma_has_cap(cap, device->cap_mask) ||
++ 		    dma_has_cap(DMA_PRIVATE, device->cap_mask))
++ 			continue;
++ 		list_for_each_entry(chan, &device->channels, device_node) {
++ 			if (!chan->client_count)
++ 				continue;
++ 			if (!min || chan->table_count < min->table_count)
++ 				min = chan;
++ 
++ 			if (dma_chan_is_local(chan, cpu))
++ 				if (!localmin ||
++ 				    chan->table_count < localmin->table_count)
++ 					localmin = chan;
++ 		}
++ 	}
++ 
++ 	chan = localmin ? localmin : min;
++ 
++ 	if (chan)
++ 		chan->table_count++;
++ 
++ 	return chan;
++ }
++ 
++ /**
++  * dma_channel_rebalance - redistribute the available channels
++  *
++  * Optimize for CPU isolation (each CPU gets a dedicated channel for an
++  * operation type) in the SMP case, and operation isolation (avoid
++  * multi-tasking channels) in the non-SMP case.
++  *
++  * Must be called under dma_list_mutex.
++  */
++ static void dma_channel_rebalance(void)
++ {
++ 	struct dma_chan *chan;
++ 	struct dma_device *device;
++ 	int cpu;
++ 	int cap;
++ 
++ 	/* undo the last distribution */
++ 	for_each_dma_cap_mask(cap, dma_cap_mask_all)
++ 		for_each_possible_cpu(cpu)
++ 			per_cpu_ptr(channel_table[cap], cpu)->chan = NULL;
++ 
++ 	list_for_each_entry(device, &dma_device_list, global_node) {
++ 		if (dma_has_cap(DMA_PRIVATE, device->cap_mask))
++ 			continue;
++ 		list_for_each_entry(chan, &device->channels, device_node)
++ 			chan->table_count = 0;
++ 	}
++ 
++ 	/* don't populate the channel_table if no clients are available */
++ 	if (!dmaengine_ref_count)
++ 		return;
++ 
++ 	/* redistribute available channels */
++ 	for_each_dma_cap_mask(cap, dma_cap_mask_all)
++ 		for_each_online_cpu(cpu) {
++ 			chan = min_chan(cap, cpu);
++ 			per_cpu_ptr(channel_table[cap], cpu)->chan = chan;
++ 		}
++ }
++ 
++ static int dma_device_satisfies_mask(struct dma_device *device,
++ 				     const dma_cap_mask_t *want)
+++>>>>>>> 9872e23d6879 (dmaengine: Fix doc strings to satisfy validation script)
+  {
+  	dma_cap_mask_t has;
+  
+@@@ -395,60 -541,9 +544,60 @@@ enum dma_status dma_sync_wait(struct dm
+  }
+  EXPORT_SYMBOL(dma_sync_wait);
+  
+ +/**
+ + * dma_cap_mask_all - enable iteration over all operation types
+ + */
+ +static dma_cap_mask_t dma_cap_mask_all;
+ +
+ +/**
+ + * dma_chan_tbl_ent - tracks channel allocations per core/operation
+ + * @chan - associated channel for this entry
+ + */
+ +struct dma_chan_tbl_ent {
+ +	struct dma_chan *chan;
+ +};
+ +
+ +/**
+ + * channel_table - percpu lookup table for memory-to-memory offload providers
+ + */
+ +static struct dma_chan_tbl_ent __percpu *channel_table[DMA_TX_TYPE_END];
+ +
+ +static int __init dma_channel_table_init(void)
+ +{
+ +	enum dma_transaction_type cap;
+ +	int err = 0;
+ +
+ +	bitmap_fill(dma_cap_mask_all.bits, DMA_TX_TYPE_END);
+ +
+ +	/* 'interrupt', 'private', and 'slave' are channel capabilities,
+ +	 * but are not associated with an operation so they do not need
+ +	 * an entry in the channel_table
+ +	 */
+ +	clear_bit(DMA_INTERRUPT, dma_cap_mask_all.bits);
+ +	clear_bit(DMA_PRIVATE, dma_cap_mask_all.bits);
+ +	clear_bit(DMA_SLAVE, dma_cap_mask_all.bits);
+ +
+ +	for_each_dma_cap_mask(cap, dma_cap_mask_all) {
+ +		channel_table[cap] = alloc_percpu(struct dma_chan_tbl_ent);
+ +		if (!channel_table[cap]) {
+ +			err = -ENOMEM;
+ +			break;
+ +		}
+ +	}
+ +
+ +	if (err) {
+ +		pr_err("initialization failure\n");
+ +		for_each_dma_cap_mask(cap, dma_cap_mask_all)
+ +			free_percpu(channel_table[cap]);
+ +	}
+ +
+ +	return err;
+ +}
+ +arch_initcall(dma_channel_table_init);
+ +
+  /**
+   * dma_find_channel - find a channel to carry out the operation
+-  * @tx_type: transaction type
++  * @tx_type:	transaction type
+   */
+  struct dma_chan *dma_find_channel(enum dma_transaction_type tx_type)
+  {
+* Unmerged path drivers/dma/dmaengine.c
