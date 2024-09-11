@@ -922,6 +922,9 @@ struct task_struct {
 	/* Used by page_owner=on to detect recursion in page tracking. */
 	RH_KABI_FILL_HOLE(unsigned	in_page_owner:1)
 #endif
+#ifdef CONFIG_IOMMU_SVA
+	unsigned			pasid_activated:1;
+#endif
 
 	unsigned long			atomic_flags; /* Flags requiring atomic access. */
 
