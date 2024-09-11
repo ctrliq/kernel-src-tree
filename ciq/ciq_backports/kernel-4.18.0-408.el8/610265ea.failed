@@ -1,0 +1,135 @@
+KVM: x86/mmu: Rename slot_handle_leaf to slot_handle_level_4k
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-408.el8
+commit-author David Matlack <dmatlack@google.com>
+commit 610265ea3da117db435868bd109f1861534a5634
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-408.el8/610265ea.failed
+
+slot_handle_leaf is a misnomer because it only operates on 4K SPTEs
+whereas "leaf" is used to describe any valid terminal SPTE (4K or
+large page). Rename slot_handle_leaf to slot_handle_level_4k to
+avoid confusion.
+
+Making this change makes it more obvious there is a benign discrepency
+between the legacy MMU and the TDP MMU when it comes to dirty logging.
+The legacy MMU only iterates through 4K SPTEs when zapping for
+collapsing and when clearing D-bits. The TDP MMU, on the other hand,
+iterates through SPTEs on all levels.
+
+The TDP MMU behavior of zapping SPTEs at all levels is technically
+overkill for its current dirty logging implementation, which always
+demotes to 4k SPTES, but both the TDP MMU and legacy MMU zap if and only
+if the SPTE can be replaced by a larger page, i.e. will not spuriously
+zap 2m (or larger) SPTEs. Opportunistically add comments to explain this
+discrepency in the code.
+
+	Signed-off-by: David Matlack <dmatlack@google.com>
+Message-Id: <20211019162223.3935109-1-dmatlack@google.com>
+	Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+(cherry picked from commit 610265ea3da117db435868bd109f1861534a5634)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kvm/mmu/mmu.c
+diff --cc arch/x86/kvm/mmu/mmu.c
+index 8ec545b124be,0460301d0285..000000000000
+--- a/arch/x86/kvm/mmu/mmu.c
++++ b/arch/x86/kvm/mmu/mmu.c
+@@@ -5413,8 -5440,8 +5413,13 @@@ slot_handle_level(struct kvm *kvm, stru
+  }
+  
+  static __always_inline bool
+++<<<<<<< HEAD
+ +slot_handle_leaf(struct kvm *kvm, struct kvm_memory_slot *memslot,
+ +		 slot_level_handler fn, bool flush_on_yield)
+++=======
++ slot_handle_level_4k(struct kvm *kvm, const struct kvm_memory_slot *memslot,
++ 		     slot_level_handler fn, bool flush_on_yield)
+++>>>>>>> 610265ea3da1 (KVM: x86/mmu: Rename slot_handle_leaf to slot_handle_level_4k)
+  {
+  	return slot_handle_level(kvm, memslot, fn, PG_LEVEL_4K,
+  				 PG_LEVEL_4K, flush_on_yield);
+@@@ -5767,22 -5815,30 +5772,37 @@@ restart
+  }
+  
+  void kvm_mmu_zap_collapsible_sptes(struct kvm *kvm,
+ -				   const struct kvm_memory_slot *slot)
+ +				   const struct kvm_memory_slot *memslot)
+  {
+ +	/* FIXME: const-ify all uses of struct kvm_memory_slot.  */
+ +	struct kvm_memory_slot *slot = (struct kvm_memory_slot *)memslot;
+  	bool flush = false;
+  
+++<<<<<<< HEAD
+ +	write_lock(&kvm->mmu_lock);
+ +	flush = slot_handle_leaf(kvm, slot, kvm_mmu_zap_collapsible_spte, true);
+++=======
++ 	if (kvm_memslots_have_rmaps(kvm)) {
++ 		write_lock(&kvm->mmu_lock);
++ 		/*
++ 		 * Zap only 4k SPTEs since the legacy MMU only supports dirty
++ 		 * logging at a 4k granularity and never creates collapsible
++ 		 * 2m SPTEs during dirty logging.
++ 		 */
++ 		flush = slot_handle_level_4k(kvm, slot, kvm_mmu_zap_collapsible_spte, true);
++ 		if (flush)
++ 			kvm_arch_flush_remote_tlbs_memslot(kvm, slot);
++ 		write_unlock(&kvm->mmu_lock);
++ 	}
+++>>>>>>> 610265ea3da1 (KVM: x86/mmu: Rename slot_handle_leaf to slot_handle_level_4k)
+  
+ -	if (is_tdp_mmu_enabled(kvm)) {
+ -		read_lock(&kvm->mmu_lock);
+ +	if (is_tdp_mmu_enabled(kvm))
+  		flush = kvm_tdp_mmu_zap_collapsible_sptes(kvm, slot, flush);
+ -		if (flush)
+ -			kvm_arch_flush_remote_tlbs_memslot(kvm, slot);
+ -		read_unlock(&kvm->mmu_lock);
+ -	}
+ +
+ +	if (flush)
+ +		kvm_arch_flush_remote_tlbs_memslot(kvm, slot);
+ +
+ +	write_unlock(&kvm->mmu_lock);
+  }
+  
+  void kvm_arch_flush_remote_tlbs_memslot(struct kvm *kvm,
+@@@ -5801,15 -5857,25 +5821,30 @@@
+  }
+  
+  void kvm_mmu_slot_leaf_clear_dirty(struct kvm *kvm,
+ -				   const struct kvm_memory_slot *memslot)
+ +				   struct kvm_memory_slot *memslot)
+  {
+ -	bool flush = false;
+ +	bool flush;
+  
+++<<<<<<< HEAD
+ +	write_lock(&kvm->mmu_lock);
+ +	flush = slot_handle_leaf(kvm, memslot, __rmap_clear_dirty, false);
+ +	if (is_tdp_mmu_enabled(kvm))
+++=======
++ 	if (kvm_memslots_have_rmaps(kvm)) {
++ 		write_lock(&kvm->mmu_lock);
++ 		/*
++ 		 * Clear dirty bits only on 4k SPTEs since the legacy MMU only
++ 		 * support dirty logging at a 4k granularity.
++ 		 */
++ 		flush = slot_handle_level_4k(kvm, memslot, __rmap_clear_dirty, false);
++ 		write_unlock(&kvm->mmu_lock);
++ 	}
++ 
++ 	if (is_tdp_mmu_enabled(kvm)) {
++ 		read_lock(&kvm->mmu_lock);
+++>>>>>>> 610265ea3da1 (KVM: x86/mmu: Rename slot_handle_leaf to slot_handle_level_4k)
+  		flush |= kvm_tdp_mmu_clear_dirty_slot(kvm, memslot);
+ -		read_unlock(&kvm->mmu_lock);
+ -	}
+ +	write_unlock(&kvm->mmu_lock);
+  
+  	/*
+  	 * It's also safe to flush TLBs out of mmu lock here as currently this
+* Unmerged path arch/x86/kvm/mmu/mmu.c
