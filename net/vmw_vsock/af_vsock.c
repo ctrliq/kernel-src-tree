@@ -2074,7 +2074,7 @@ static long vsock_dev_do_ioctl(struct file *filp,
 		break;
 
 	default:
-		retval = -EINVAL;
+		retval = -ENOIOCTLCMD;
 	}
 
 	return retval;
