@@ -1,0 +1,567 @@
+generic radix trees
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-326.el8
+commit-author Kent Overstreet <kent.overstreet@gmail.com>
+commit ba20ba2e3743bac786dff777954c11930256075e
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-326.el8/ba20ba2e.failed
+
+Very simple radix tree implementation that supports storing arbitrary
+size entries, up to PAGE_SIZE - upcoming patches will convert existing
+flex_array users to genradixes.  The new genradix code has a much
+simpler API and implementation, and doesn't have a hard limit on the
+number of elements like flex_array does.
+
+Link: http://lkml.kernel.org/r/20181217131929.11727-5-kent.overstreet@gmail.com
+	Signed-off-by: Kent Overstreet <kent.overstreet@gmail.com>
+	Cc: Alexey Dobriyan <adobriyan@gmail.com>
+	Cc: Al Viro <viro@zeniv.linux.org.uk>
+	Cc: Dave Hansen <dave.hansen@intel.com>
+	Cc: Eric Paris <eparis@parisplace.org>
+	Cc: Marcelo Ricardo Leitner <marcelo.leitner@gmail.com>
+	Cc: Matthew Wilcox <willy@infradead.org>
+	Cc: Neil Horman <nhorman@tuxdriver.com>
+	Cc: Paul Moore <paul@paul-moore.com>
+	Cc: Pravin B Shelar <pshelar@ovn.org>
+	Cc: Shaohua Li <shli@kernel.org>
+	Cc: Stephen Smalley <sds@tycho.nsa.gov>
+	Cc: Vlad Yasevich <vyasevich@gmail.com>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit ba20ba2e3743bac786dff777954c11930256075e)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	Documentation/core-api/index.rst
+#	lib/Makefile
+diff --cc Documentation/core-api/index.rst
+index 228438206ba2,6870baffef82..000000000000
+--- a/Documentation/core-api/index.rst
++++ b/Documentation/core-api/index.rst
+@@@ -32,9 -28,14 +32,15 @@@ Core utilitie
+     errseq
+     printk-formats
+     circular-buffers
+++<<<<<<< HEAD
+ +   pin_user_pages
+++=======
++    generic-radix-tree
++    memory-allocation
++    mm-api
+++>>>>>>> ba20ba2e3743 (generic radix trees)
+     gfp_mask-from-fs-io
+ -   timekeeping
+ -   boot-time-mm
+ -   memory-hotplug
+ -
+ +   padata
+  
+  Interfaces for kernel debugging
+  ===============================
+diff --cc lib/Makefile
+index 028e9d7630dd,b798b41d01ae..000000000000
+--- a/lib/Makefile
++++ b/lib/Makefile
+@@@ -44,12 -33,13 +44,18 @@@ lib-$(CONFIG_SMP) += cpumask.
+  lib-y	+= kobject.o klist.o
+  obj-y	+= lockref.o
+  
+ -obj-y += bcd.o div64.o sort.o parser.o debug_locks.o random32.o \
+ +obj-y += bcd.o sort.o parser.o debug_locks.o random32.o \
+  	 bust_spinlocks.o kasprintf.o bitmap.o scatterlist.o \
+ -	 gcd.o lcm.o list_sort.o uuid.o flex_array.o iov_iter.o clz_ctz.o \
+ +	 list_sort.o uuid.o flex_array.o iov_iter.o clz_ctz.o \
+  	 bsearch.o find_bit.o llist.o memweight.o kfifo.o \
+++<<<<<<< HEAD
+ +	 percpu-refcount.o rhashtable.o \
+ +	 once.o refcount.o usercopy.o errseq.o bucket_locks.o
+++=======
++ 	 percpu-refcount.o rhashtable.o reciprocal_div.o \
++ 	 once.o refcount.o usercopy.o errseq.o bucket_locks.o \
++ 	 generic-radix-tree.o
+++>>>>>>> ba20ba2e3743 (generic radix trees)
+  obj-$(CONFIG_STRING_SELFTEST) += test_string.o
+  obj-y += string_helpers.o
+  obj-$(CONFIG_TEST_STRING_HELPERS) += test-string_helpers.o
+diff --git a/Documentation/core-api/generic-radix-tree.rst b/Documentation/core-api/generic-radix-tree.rst
+new file mode 100644
+index 000000000000..ed42839ae42f
+--- /dev/null
++++ b/Documentation/core-api/generic-radix-tree.rst
+@@ -0,0 +1,12 @@
++=================================
++Generic radix trees/sparse arrays
++=================================
++
++.. kernel-doc:: include/linux/generic-radix-tree.h
++   :doc: Generic radix trees/sparse arrays
++
++generic radix tree functions
++----------------------------
++
++.. kernel-doc:: include/linux/generic-radix-tree.h
++   :functions:
+* Unmerged path Documentation/core-api/index.rst
+diff --git a/include/linux/generic-radix-tree.h b/include/linux/generic-radix-tree.h
+new file mode 100644
+index 000000000000..3a91130a4fbd
+--- /dev/null
++++ b/include/linux/generic-radix-tree.h
+@@ -0,0 +1,231 @@
++#ifndef _LINUX_GENERIC_RADIX_TREE_H
++#define _LINUX_GENERIC_RADIX_TREE_H
++
++/**
++ * DOC: Generic radix trees/sparse arrays:
++ *
++ * Very simple and minimalistic, supporting arbitrary size entries up to
++ * PAGE_SIZE.
++ *
++ * A genradix is defined with the type it will store, like so:
++ *
++ * static GENRADIX(struct foo) foo_genradix;
++ *
++ * The main operations are:
++ *
++ * - genradix_init(radix) - initialize an empty genradix
++ *
++ * - genradix_free(radix) - free all memory owned by the genradix and
++ *   reinitialize it
++ *
++ * - genradix_ptr(radix, idx) - gets a pointer to the entry at idx, returning
++ *   NULL if that entry does not exist
++ *
++ * - genradix_ptr_alloc(radix, idx, gfp) - gets a pointer to an entry,
++ *   allocating it if necessary
++ *
++ * - genradix_for_each(radix, iter, p) - iterate over each entry in a genradix
++ *
++ * The radix tree allocates one page of entries at a time, so entries may exist
++ * that were never explicitly allocated - they will be initialized to all
++ * zeroes.
++ *
++ * Internally, a genradix is just a radix tree of pages, and indexing works in
++ * terms of byte offsets. The wrappers in this header file use sizeof on the
++ * type the radix contains to calculate a byte offset from the index - see
++ * __idx_to_offset.
++ */
++
++#include <asm/page.h>
++#include <linux/bug.h>
++#include <linux/kernel.h>
++#include <linux/log2.h>
++
++struct genradix_root;
++
++struct __genradix {
++	struct genradix_root __rcu	*root;
++};
++
++/*
++ * NOTE: currently, sizeof(_type) must not be larger than PAGE_SIZE:
++ */
++
++#define __GENRADIX_INITIALIZER					\
++	{							\
++		.tree = {					\
++			.root = NULL,				\
++		}						\
++	}
++
++/*
++ * We use a 0 size array to stash the type we're storing without taking any
++ * space at runtime - then the various accessor macros can use typeof() to get
++ * to it for casts/sizeof - we also force the alignment so that storing a type
++ * with a ridiculous alignment doesn't blow up the alignment or size of the
++ * genradix.
++ */
++
++#define GENRADIX(_type)						\
++struct {							\
++	struct __genradix	tree;				\
++	_type			type[0] __aligned(1);		\
++}
++
++#define DEFINE_GENRADIX(_name, _type)				\
++	GENRADIX(_type) _name = __GENRADIX_INITIALIZER
++
++/**
++ * genradix_init - initialize a genradix
++ * @_radix:	genradix to initialize
++ *
++ * Does not fail
++ */
++#define genradix_init(_radix)					\
++do {								\
++	*(_radix) = (typeof(*_radix)) __GENRADIX_INITIALIZER;	\
++} while (0)
++
++void __genradix_free(struct __genradix *);
++
++/**
++ * genradix_free: free all memory owned by a genradix
++ * @_radix: the genradix to free
++ *
++ * After freeing, @_radix will be reinitialized and empty
++ */
++#define genradix_free(_radix)	__genradix_free(&(_radix)->tree)
++
++static inline size_t __idx_to_offset(size_t idx, size_t obj_size)
++{
++	if (__builtin_constant_p(obj_size))
++		BUILD_BUG_ON(obj_size > PAGE_SIZE);
++	else
++		BUG_ON(obj_size > PAGE_SIZE);
++
++	if (!is_power_of_2(obj_size)) {
++		size_t objs_per_page = PAGE_SIZE / obj_size;
++
++		return (idx / objs_per_page) * PAGE_SIZE +
++			(idx % objs_per_page) * obj_size;
++	} else {
++		return idx * obj_size;
++	}
++}
++
++#define __genradix_cast(_radix)		(typeof((_radix)->type[0]) *)
++#define __genradix_obj_size(_radix)	sizeof((_radix)->type[0])
++#define __genradix_idx_to_offset(_radix, _idx)			\
++	__idx_to_offset(_idx, __genradix_obj_size(_radix))
++
++void *__genradix_ptr(struct __genradix *, size_t);
++
++/**
++ * genradix_ptr - get a pointer to a genradix entry
++ * @_radix:	genradix to access
++ * @_idx:	index to fetch
++ *
++ * Returns a pointer to entry at @_idx, or NULL if that entry does not exist.
++ */
++#define genradix_ptr(_radix, _idx)				\
++	(__genradix_cast(_radix)				\
++	 __genradix_ptr(&(_radix)->tree,			\
++			__genradix_idx_to_offset(_radix, _idx)))
++
++void *__genradix_ptr_alloc(struct __genradix *, size_t, gfp_t);
++
++/**
++ * genradix_ptr_alloc - get a pointer to a genradix entry, allocating it
++ *			if necessary
++ * @_radix:	genradix to access
++ * @_idx:	index to fetch
++ * @_gfp:	gfp mask
++ *
++ * Returns a pointer to entry at @_idx, or NULL on allocation failure
++ */
++#define genradix_ptr_alloc(_radix, _idx, _gfp)			\
++	(__genradix_cast(_radix)				\
++	 __genradix_ptr_alloc(&(_radix)->tree,			\
++			__genradix_idx_to_offset(_radix, _idx),	\
++			_gfp))
++
++struct genradix_iter {
++	size_t			offset;
++	size_t			pos;
++};
++
++/**
++ * genradix_iter_init - initialize a genradix_iter
++ * @_radix:	genradix that will be iterated over
++ * @_idx:	index to start iterating from
++ */
++#define genradix_iter_init(_radix, _idx)			\
++	((struct genradix_iter) {				\
++		.pos	= (_idx),				\
++		.offset	= __genradix_idx_to_offset((_radix), (_idx)),\
++	})
++
++void *__genradix_iter_peek(struct genradix_iter *, struct __genradix *, size_t);
++
++/**
++ * genradix_iter_peek - get first entry at or above iterator's current
++ *			position
++ * @_iter:	a genradix_iter
++ * @_radix:	genradix being iterated over
++ *
++ * If no more entries exist at or above @_iter's current position, returns NULL
++ */
++#define genradix_iter_peek(_iter, _radix)			\
++	(__genradix_cast(_radix)				\
++	 __genradix_iter_peek(_iter, &(_radix)->tree,		\
++			      PAGE_SIZE / __genradix_obj_size(_radix)))
++
++static inline void __genradix_iter_advance(struct genradix_iter *iter,
++					   size_t obj_size)
++{
++	iter->offset += obj_size;
++
++	if (!is_power_of_2(obj_size) &&
++	    (iter->offset & (PAGE_SIZE - 1)) + obj_size > PAGE_SIZE)
++		iter->offset = round_up(iter->offset, PAGE_SIZE);
++
++	iter->pos++;
++}
++
++#define genradix_iter_advance(_iter, _radix)			\
++	__genradix_iter_advance(_iter, __genradix_obj_size(_radix))
++
++#define genradix_for_each_from(_radix, _iter, _p, _start)	\
++	for (_iter = genradix_iter_init(_radix, _start);	\
++	     (_p = genradix_iter_peek(&_iter, _radix)) != NULL;	\
++	     genradix_iter_advance(&_iter, _radix))
++
++/**
++ * genradix_for_each - iterate over entry in a genradix
++ * @_radix:	genradix to iterate over
++ * @_iter:	a genradix_iter to track current position
++ * @_p:		pointer to genradix entry type
++ *
++ * On every iteration, @_p will point to the current entry, and @_iter.pos
++ * will be the current entry's index.
++ */
++#define genradix_for_each(_radix, _iter, _p)			\
++	genradix_for_each_from(_radix, _iter, _p, 0)
++
++int __genradix_prealloc(struct __genradix *, size_t, gfp_t);
++
++/**
++ * genradix_prealloc - preallocate entries in a generic radix tree
++ * @_radix:	genradix to preallocate
++ * @_nr:	number of entries to preallocate
++ * @_gfp:	gfp mask
++ *
++ * Returns 0 on success, -ENOMEM on failure
++ */
++#define genradix_prealloc(_radix, _nr, _gfp)			\
++	 __genradix_prealloc(&(_radix)->tree,			\
++			__genradix_idx_to_offset(_radix, _nr + 1),\
++			_gfp)
++
++
++#endif /* _LINUX_GENERIC_RADIX_TREE_H */
+* Unmerged path lib/Makefile
+diff --git a/lib/generic-radix-tree.c b/lib/generic-radix-tree.c
+new file mode 100644
+index 000000000000..a7bafc413730
+--- /dev/null
++++ b/lib/generic-radix-tree.c
+@@ -0,0 +1,217 @@
++
++#include <linux/export.h>
++#include <linux/generic-radix-tree.h>
++#include <linux/gfp.h>
++
++#define GENRADIX_ARY		(PAGE_SIZE / sizeof(struct genradix_node *))
++#define GENRADIX_ARY_SHIFT	ilog2(GENRADIX_ARY)
++
++struct genradix_node {
++	union {
++		/* Interior node: */
++		struct genradix_node	*children[GENRADIX_ARY];
++
++		/* Leaf: */
++		u8			data[PAGE_SIZE];
++	};
++};
++
++static inline int genradix_depth_shift(unsigned depth)
++{
++	return PAGE_SHIFT + GENRADIX_ARY_SHIFT * depth;
++}
++
++/*
++ * Returns size (of data, in bytes) that a tree of a given depth holds:
++ */
++static inline size_t genradix_depth_size(unsigned depth)
++{
++	return 1UL << genradix_depth_shift(depth);
++}
++
++/* depth that's needed for a genradix that can address up to ULONG_MAX: */
++#define GENRADIX_MAX_DEPTH	\
++	DIV_ROUND_UP(BITS_PER_LONG - PAGE_SHIFT, GENRADIX_ARY_SHIFT)
++
++#define GENRADIX_DEPTH_MASK				\
++	((unsigned long) (roundup_pow_of_two(GENRADIX_MAX_DEPTH + 1) - 1))
++
++unsigned genradix_root_to_depth(struct genradix_root *r)
++{
++	return (unsigned long) r & GENRADIX_DEPTH_MASK;
++}
++
++struct genradix_node *genradix_root_to_node(struct genradix_root *r)
++{
++	return (void *) ((unsigned long) r & ~GENRADIX_DEPTH_MASK);
++}
++
++/*
++ * Returns pointer to the specified byte @offset within @radix, or NULL if not
++ * allocated
++ */
++void *__genradix_ptr(struct __genradix *radix, size_t offset)
++{
++	struct genradix_root *r = READ_ONCE(radix->root);
++	struct genradix_node *n = genradix_root_to_node(r);
++	unsigned level		= genradix_root_to_depth(r);
++
++	if (ilog2(offset) >= genradix_depth_shift(level))
++		return NULL;
++
++	while (1) {
++		if (!n)
++			return NULL;
++		if (!level)
++			break;
++
++		level--;
++
++		n = n->children[offset >> genradix_depth_shift(level)];
++		offset &= genradix_depth_size(level) - 1;
++	}
++
++	return &n->data[offset];
++}
++EXPORT_SYMBOL(__genradix_ptr);
++
++/*
++ * Returns pointer to the specified byte @offset within @radix, allocating it if
++ * necessary - newly allocated slots are always zeroed out:
++ */
++void *__genradix_ptr_alloc(struct __genradix *radix, size_t offset,
++			   gfp_t gfp_mask)
++{
++	struct genradix_root *v = READ_ONCE(radix->root);
++	struct genradix_node *n, *new_node = NULL;
++	unsigned level;
++
++	/* Increase tree depth if necessary: */
++	while (1) {
++		struct genradix_root *r = v, *new_root;
++
++		n	= genradix_root_to_node(r);
++		level	= genradix_root_to_depth(r);
++
++		if (n && ilog2(offset) < genradix_depth_shift(level))
++			break;
++
++		if (!new_node) {
++			new_node = (void *)
++				__get_free_page(gfp_mask|__GFP_ZERO);
++			if (!new_node)
++				return NULL;
++		}
++
++		new_node->children[0] = n;
++		new_root = ((struct genradix_root *)
++			    ((unsigned long) new_node | (n ? level + 1 : 0)));
++
++		if ((v = cmpxchg_release(&radix->root, r, new_root)) == r) {
++			v = new_root;
++			new_node = NULL;
++		}
++	}
++
++	while (level--) {
++		struct genradix_node **p =
++			&n->children[offset >> genradix_depth_shift(level)];
++		offset &= genradix_depth_size(level) - 1;
++
++		n = READ_ONCE(*p);
++		if (!n) {
++			if (!new_node) {
++				new_node = (void *)
++					__get_free_page(gfp_mask|__GFP_ZERO);
++				if (!new_node)
++					return NULL;
++			}
++
++			if (!(n = cmpxchg_release(p, NULL, new_node)))
++				swap(n, new_node);
++		}
++	}
++
++	if (new_node)
++		free_page((unsigned long) new_node);
++
++	return &n->data[offset];
++}
++EXPORT_SYMBOL(__genradix_ptr_alloc);
++
++void *__genradix_iter_peek(struct genradix_iter *iter,
++			   struct __genradix *radix,
++			   size_t objs_per_page)
++{
++	struct genradix_root *r;
++	struct genradix_node *n;
++	unsigned level, i;
++restart:
++	r = READ_ONCE(radix->root);
++	if (!r)
++		return NULL;
++
++	n	= genradix_root_to_node(r);
++	level	= genradix_root_to_depth(r);
++
++	if (ilog2(iter->offset) >= genradix_depth_shift(level))
++		return NULL;
++
++	while (level) {
++		level--;
++
++		i = (iter->offset >> genradix_depth_shift(level)) &
++			(GENRADIX_ARY - 1);
++
++		while (!n->children[i]) {
++			i++;
++			iter->offset = round_down(iter->offset +
++					   genradix_depth_size(level),
++					   genradix_depth_size(level));
++			iter->pos = (iter->offset >> PAGE_SHIFT) *
++				objs_per_page;
++			if (i == GENRADIX_ARY)
++				goto restart;
++		}
++
++		n = n->children[i];
++	}
++
++	return &n->data[iter->offset & (PAGE_SIZE - 1)];
++}
++EXPORT_SYMBOL(__genradix_iter_peek);
++
++static void genradix_free_recurse(struct genradix_node *n, unsigned level)
++{
++	if (level) {
++		unsigned i;
++
++		for (i = 0; i < GENRADIX_ARY; i++)
++			if (n->children[i])
++				genradix_free_recurse(n->children[i], level - 1);
++	}
++
++	free_page((unsigned long) n);
++}
++
++int __genradix_prealloc(struct __genradix *radix, size_t size,
++			gfp_t gfp_mask)
++{
++	size_t offset;
++
++	for (offset = 0; offset < size; offset += PAGE_SIZE)
++		if (!__genradix_ptr_alloc(radix, offset, gfp_mask))
++			return -ENOMEM;
++
++	return 0;
++}
++EXPORT_SYMBOL(__genradix_prealloc);
++
++void __genradix_free(struct __genradix *radix)
++{
++	struct genradix_root *r = xchg(&radix->root, NULL);
++
++	genradix_free_recurse(genradix_root_to_node(r),
++			      genradix_root_to_depth(r));
++}
++EXPORT_SYMBOL(__genradix_free);
