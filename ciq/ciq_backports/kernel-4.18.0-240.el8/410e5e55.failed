@@ -1,0 +1,113 @@
+ASoC: SOF: core: release resources on errors in probe_continue
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+Rebuild_CHGLOG: - [sound] ALSA: ASoC: SOF: core: release resources on errors in probe_continue (Jaroslav Kysela) [1797509]
+Rebuild_FUZZ: 95.38%
+commit-author Pierre-Louis Bossart <pierre-louis.bossart@linux.intel.com>
+commit 410e5e55c9c1c9c0d452ac5b9adb37b933a7747e
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/410e5e55.failed
+
+The initial intent of releasing resources in the .remove does not work
+well with HDaudio codecs. If the probe_continue() fails in a work
+queue, e.g. due to missing firmware or authentication issues, we don't
+release any resources, and as a result the kernel oopses during
+suspend operations.
+
+The suggested fix is to release all resources during errors in
+probe_continue(), and use fw_state to track resource allocation
+state, so that .remove does not attempt to release the same
+hardware resources twice. PM operations are also modified so that
+no action is done if DSP resources have been freed due to
+an error at probe.
+
+	Reported-by: Takashi Iwai <tiwai@suse.de>
+Co-developed-by: Kai Vehmanen <kai.vehmanen@linux.intel.com>
+	Signed-off-by: Kai Vehmanen <kai.vehmanen@linux.intel.com>
+Bugzilla:  http://bugzilla.suse.com/show_bug.cgi?id=1161246
+	Signed-off-by: Pierre-Louis Bossart <pierre-louis.bossart@linux.intel.com>
+	Reviewed-by: Takashi Iwai <tiwai@suse.de>
+Link: https://lore.kernel.org/r/20200124213625.30186-4-pierre-louis.bossart@linux.intel.com
+	Signed-off-by: Mark Brown <broonie@kernel.org>
+	Cc: stable@vger.kernel.org
+(cherry picked from commit 410e5e55c9c1c9c0d452ac5b9adb37b933a7747e)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	sound/soc/sof/core.c
+diff --cc sound/soc/sof/core.c
+index d8446fb9fdde,34cefbaf2d2a..000000000000
+--- a/sound/soc/sof/core.c
++++ b/sound/soc/sof/core.c
+@@@ -368,7 -244,8 +368,12 @@@ static int sof_probe_continue(struct sn
+  
+  	return 0;
+  
+++<<<<<<< HEAD
+ +#if !IS_ENABLED(CONFIG_SND_SOC_SOF_PROBE_WORK_QUEUE)
+++=======
++ fw_trace_err:
++ 	snd_sof_free_trace(sdev);
+++>>>>>>> 410e5e55c9c1 (ASoC: SOF: core: release resources on errors in probe_continue)
+  fw_run_err:
+  	snd_sof_fw_unload(sdev);
+  fw_load_err:
+@@@ -377,21 -254,10 +382,26 @@@ ipc_err
+  	snd_sof_free_debug(sdev);
+  dbg_err:
+  	snd_sof_remove(sdev);
+- #else
+  
+++<<<<<<< HEAD
+ +	/*
+ +	 * when the probe_continue is handled in a work queue, the
+ +	 * probe does not fail so we don't release resources here.
+ +	 * They will be released with an explicit call to
+ +	 * snd_sof_device_remove() when the PCI/ACPI device is removed
+ +	 */
+ +
+ +fw_run_err:
+ +fw_load_err:
+ +ipc_err:
+ +dbg_err:
+ +
+ +#endif
+++=======
++ 	/* all resources freed, update state to match */
++ 	sdev->fw_state = SOF_FW_BOOT_NOT_STARTED;
++ 	sdev->first_boot = true;
+++>>>>>>> 410e5e55c9c1 (ASoC: SOF: core: release resources on errors in probe_continue)
+  
+  	return ret;
+  }
+@@@ -483,8 -352,7 +495,12 @@@ int snd_sof_device_remove(struct devic
+  	 * will remove the component driver and unload the topology
+  	 * before freeing the snd_card.
+  	 */
+++<<<<<<< HEAD
+ +	if (!IS_ERR_OR_NULL(pdata->pdev_mach))
+ +		platform_device_unregister(pdata->pdev_mach);
+++=======
++ 	snd_sof_machine_unregister(sdev, pdata);
+++>>>>>>> 410e5e55c9c1 (ASoC: SOF: core: release resources on errors in probe_continue)
+  
+  	/*
+  	 * Unregistering the machine driver results in unloading the topology.
+* Unmerged path sound/soc/sof/core.c
+diff --git a/sound/soc/sof/pm.c b/sound/soc/sof/pm.c
+index 0fd5567237a8..bf9efea99bda 100644
+--- a/sound/soc/sof/pm.c
++++ b/sound/soc/sof/pm.c
+@@ -269,6 +269,10 @@ static int sof_resume(struct device *dev, bool runtime_resume)
+ 	if (!sof_ops(sdev)->resume || !sof_ops(sdev)->runtime_resume)
+ 		return 0;
+ 
++	/* DSP was never successfully started, nothing to resume */
++	if (sdev->first_boot)
++		return 0;
++
+ 	/*
+ 	 * if the runtime_resume flag is set, call the runtime_resume routine
+ 	 * or else call the system resume routine
