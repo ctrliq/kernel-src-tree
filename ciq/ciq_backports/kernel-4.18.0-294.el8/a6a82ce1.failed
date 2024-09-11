@@ -1,0 +1,183 @@
+rcu/tree: Count number of batched kfree_rcu() locklessly
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Joel Fernandes (Google) <joel@joelfernandes.org>
+commit a6a82ce18ba443186545d3fefbee8b9419a859dc
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/a6a82ce1.failed
+
+We can relax the correctness of counting of number of queued objects in
+favor of not hurting performance, by locklessly sampling per-cpu
+counters. This should be Ok since under high memory pressure, it should not
+matter if we are off by a few objects while counting. The shrinker will
+still do the reclaim.
+
+	Signed-off-by: Joel Fernandes (Google) <joel@joelfernandes.org>
+[ paulmck: Remove unused "flags" variable. ]
+	Signed-off-by: Paul E. McKenney <paulmck@kernel.org>
+(cherry picked from commit a6a82ce18ba443186545d3fefbee8b9419a859dc)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	kernel/rcu/tree.c
+diff --cc kernel/rcu/tree.c
+index 4aa7b6bbcde6,3f1f57411fe1..000000000000
+--- a/kernel/rcu/tree.c
++++ b/kernel/rcu/tree.c
+@@@ -2757,26 -2909,50 +2757,64 @@@ static void kfree_rcu_work(struct work_
+   */
+  static inline bool queue_kfree_rcu_work(struct kfree_rcu_cpu *krcp)
+  {
+ -	struct kfree_rcu_cpu_work *krwp;
+ -	bool queued = false;
+  	int i;
+ +	struct kfree_rcu_cpu_work *krwp = NULL;
+  
+  	lockdep_assert_held(&krcp->lock);
+++<<<<<<< HEAD
+ +	for (i = 0; i < KFREE_N_BATCHES; i++)
+ +		if (!krcp->krw_arr[i].head_free) {
+ +			krwp = &(krcp->krw_arr[i]);
+ +			break;
+++=======
++ 
++ 	for (i = 0; i < KFREE_N_BATCHES; i++) {
++ 		krwp = &(krcp->krw_arr[i]);
++ 
++ 		/*
++ 		 * Try to detach bhead or head and attach it over any
++ 		 * available corresponding free channel. It can be that
++ 		 * a previous RCU batch is in progress, it means that
++ 		 * immediately to queue another one is not possible so
++ 		 * return false to tell caller to retry.
++ 		 */
++ 		if ((krcp->bhead && !krwp->bhead_free) ||
++ 				(krcp->head && !krwp->head_free)) {
++ 			/* Channel 1. */
++ 			if (!krwp->bhead_free) {
++ 				krwp->bhead_free = krcp->bhead;
++ 				krcp->bhead = NULL;
++ 			}
++ 
++ 			/* Channel 2. */
++ 			if (!krwp->head_free) {
++ 				krwp->head_free = krcp->head;
++ 				krcp->head = NULL;
++ 			}
++ 
++ 			WRITE_ONCE(krcp->count, 0);
++ 
++ 			/*
++ 			 * One work is per one batch, so there are two "free channels",
++ 			 * "bhead_free" and "head_free" the batch can handle. It can be
++ 			 * that the work is in the pending state when two channels have
++ 			 * been detached following each other, one by one.
++ 			 */
++ 			queue_rcu_work(system_wq, &krwp->rcu_work);
++ 			queued = true;
+++>>>>>>> a6a82ce18ba4 (rcu/tree: Count number of batched kfree_rcu() locklessly)
+  		}
+ -	}
+  
+ -	return queued;
+ +	// If a previous RCU batch is in progress, we cannot immediately
+ +	// queue another one, so return false to tell caller to retry.
+ +	if (!krwp)
+ +		return false;
+ +
+ +	krwp->head_free = krcp->head;
+ +	krcp->head = NULL;
+ +	INIT_RCU_WORK(&krwp->rcu_work, kfree_rcu_work);
+ +	queue_rcu_work(system_wq, &krwp->rcu_work);
+ +	return true;
+  }
+  
+  static inline void kfree_rcu_drain_unlock(struct kfree_rcu_cpu *krcp,
+@@@ -2856,9 -3066,18 +2894,24 @@@ void kfree_call_rcu(struct rcu_head *he
+  			  __func__, head);
+  		goto unlock_return;
+  	}
+++<<<<<<< HEAD
+ +	head->func = func;
+ +	head->next = krcp->head;
+ +	krcp->head = head;
+++=======
++ 
++ 	/*
++ 	 * Under high memory pressure GFP_NOWAIT can fail,
++ 	 * in that case the emergency path is maintained.
++ 	 */
++ 	if (unlikely(!kfree_call_rcu_add_ptr_to_bulk(krcp, head, func))) {
++ 		head->func = func;
++ 		head->next = krcp->head;
++ 		krcp->head = head;
++ 	}
++ 
++ 	WRITE_ONCE(krcp->count, krcp->count + 1);
+++>>>>>>> a6a82ce18ba4 (rcu/tree: Count number of batched kfree_rcu() locklessly)
+  
+  	// Set timer to drain after KFREE_DRAIN_JIFFIES.
+  	if (rcu_scheduler_active == RCU_SCHEDULER_RUNNING &&
+@@@ -2874,6 -3093,56 +2927,59 @@@ unlock_return
+  }
+  EXPORT_SYMBOL_GPL(kfree_call_rcu);
+  
+++<<<<<<< HEAD
+++=======
++ static unsigned long
++ kfree_rcu_shrink_count(struct shrinker *shrink, struct shrink_control *sc)
++ {
++ 	int cpu;
++ 	unsigned long count = 0;
++ 
++ 	/* Snapshot count of all CPUs */
++ 	for_each_online_cpu(cpu) {
++ 		struct kfree_rcu_cpu *krcp = per_cpu_ptr(&krc, cpu);
++ 
++ 		count += READ_ONCE(krcp->count);
++ 	}
++ 
++ 	return count;
++ }
++ 
++ static unsigned long
++ kfree_rcu_shrink_scan(struct shrinker *shrink, struct shrink_control *sc)
++ {
++ 	int cpu, freed = 0;
++ 	unsigned long flags;
++ 
++ 	for_each_online_cpu(cpu) {
++ 		int count;
++ 		struct kfree_rcu_cpu *krcp = per_cpu_ptr(&krc, cpu);
++ 
++ 		count = krcp->count;
++ 		spin_lock_irqsave(&krcp->lock, flags);
++ 		if (krcp->monitor_todo)
++ 			kfree_rcu_drain_unlock(krcp, flags);
++ 		else
++ 			spin_unlock_irqrestore(&krcp->lock, flags);
++ 
++ 		sc->nr_to_scan -= count;
++ 		freed += count;
++ 
++ 		if (sc->nr_to_scan <= 0)
++ 			break;
++ 	}
++ 
++ 	return freed;
++ }
++ 
++ static struct shrinker kfree_rcu_shrinker = {
++ 	.count_objects = kfree_rcu_shrink_count,
++ 	.scan_objects = kfree_rcu_shrink_scan,
++ 	.batch = 0,
++ 	.seeks = DEFAULT_SEEKS,
++ };
++ 
+++>>>>>>> a6a82ce18ba4 (rcu/tree: Count number of batched kfree_rcu() locklessly)
+  void __init kfree_rcu_scheduler_running(void)
+  {
+  	int cpu;
+* Unmerged path kernel/rcu/tree.c
