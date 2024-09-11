@@ -52,6 +52,7 @@ TEST_PROGS := test_kmod.sh \
 	test_skb_cgroup_id.sh
 
 TEST_PROGS_EXTENDED := with_addr.sh \
+	with_tunnels.sh \
 	tcp_client.py \
 	tcp_server.py
 
