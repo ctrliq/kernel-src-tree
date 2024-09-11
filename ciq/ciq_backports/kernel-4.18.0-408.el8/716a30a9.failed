@@ -1,0 +1,497 @@
+net: switchdev: merge switchdev_handle_fdb_{add,del}_to_device
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-408.el8
+commit-author Vladimir Oltean <vladimir.oltean@nxp.com>
+commit 716a30a97a52aa78afd70db48d522855f624e7e0
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-408.el8/716a30a9.failed
+
+To reduce code churn, the same patch makes multiple changes, since they
+all touch the same lines:
+
+1. The implementations for these two are identical, just with different
+   function pointers. Reduce duplications and name the function pointers
+   "mod_cb" instead of "add_cb" and "del_cb". Pass the event as argument.
+
+2. Drop the "const" attribute from "orig_dev". If the driver needs to
+   check whether orig_dev belongs to itself and then
+   call_switchdev_notifiers(orig_dev, SWITCHDEV_FDB_OFFLOADED), it
+   can't, because call_switchdev_notifiers takes a non-const struct
+   net_device *.
+
+	Signed-off-by: Vladimir Oltean <vladimir.oltean@nxp.com>
+	Reviewed-by: Ido Schimmel <idosch@nvidia.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 716a30a97a52aa78afd70db48d522855f624e7e0)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/dsa/slave.c
+diff --cc net/dsa/slave.c
+index 24cc4de02bd3,db066f0da4b5..000000000000
+--- a/net/dsa/slave.c
++++ b/net/dsa/slave.c
+@@@ -1484,37 -2432,95 +1484,88 @@@ static void dsa_slave_switchdev_event_w
+  		break;
+  
+  	case SWITCHDEV_FDB_DEL_TO_DEVICE:
+ -		if (switchdev_work->host_addr)
+ -			err = dsa_port_host_fdb_del(dp, switchdev_work->addr,
+ -						    switchdev_work->vid);
+ -		else
+ -			err = dsa_port_fdb_del(dp, switchdev_work->addr,
+ -					       switchdev_work->vid);
+ +		fdb_info = &switchdev_work->fdb_info;
+ +		if (!fdb_info->added_by_user)
+ +			break;
+ +
+ +		err = dsa_port_fdb_del(dp, fdb_info->addr, fdb_info->vid);
+  		if (err) {
+ -			dev_err(ds->dev,
+ -				"port %d failed to delete %pM vid %d from fdb: %d\n",
+ -				dp->index, switchdev_work->addr,
+ -				switchdev_work->vid, err);
+ +			netdev_dbg(dev, "fdb del failed err=%d\n", err);
+ +			dev_close(dev);
+  		}
+ -
+  		break;
+  	}
+ +	rtnl_unlock();
+  
+ +	kfree(switchdev_work->fdb_info.addr);
+  	kfree(switchdev_work);
+ +	dev_put(dev);
+  }
+  
+ -static bool dsa_foreign_dev_check(const struct net_device *dev,
+ -				  const struct net_device *foreign_dev)
+ -{
+ +static int
+ +dsa_slave_switchdev_fdb_work_init(struct dsa_switchdev_event_work *
+ +				  switchdev_work,
+ +				  const struct switchdev_notifier_fdb_info *
+ +				  fdb_info)
+ +{
+++<<<<<<< HEAD
+ +	memcpy(&switchdev_work->fdb_info, fdb_info,
+ +	       sizeof(switchdev_work->fdb_info));
+ +	switchdev_work->fdb_info.addr = kzalloc(ETH_ALEN, GFP_ATOMIC);
+ +	if (!switchdev_work->fdb_info.addr)
+++=======
++ 	const struct dsa_port *dp = dsa_slave_to_port(dev);
++ 	struct dsa_switch_tree *dst = dp->ds->dst;
++ 
++ 	if (netif_is_bridge_master(foreign_dev))
++ 		return !dsa_tree_offloads_bridge(dst, foreign_dev);
++ 
++ 	if (netif_is_bridge_port(foreign_dev))
++ 		return !dsa_tree_offloads_bridge_port(dst, foreign_dev);
++ 
++ 	/* Everything else is foreign */
++ 	return true;
++ }
++ 
++ static int dsa_slave_fdb_event(struct net_device *dev,
++ 			       struct net_device *orig_dev,
++ 			       unsigned long event, const void *ctx,
++ 			       const struct switchdev_notifier_fdb_info *fdb_info)
++ {
++ 	struct dsa_switchdev_event_work *switchdev_work;
++ 	struct dsa_port *dp = dsa_slave_to_port(dev);
++ 	bool host_addr = fdb_info->is_local;
++ 	struct dsa_switch *ds = dp->ds;
++ 
++ 	if (ctx && ctx != dp)
++ 		return 0;
++ 
++ 	if (!ds->ops->port_fdb_add || !ds->ops->port_fdb_del)
++ 		return -EOPNOTSUPP;
++ 
++ 	if (dsa_slave_dev_check(orig_dev) &&
++ 	    switchdev_fdb_is_dynamically_learned(fdb_info))
++ 		return 0;
++ 
++ 	/* FDB entries learned by the software bridge should be installed as
++ 	 * host addresses only if the driver requests assisted learning.
++ 	 */
++ 	if (switchdev_fdb_is_dynamically_learned(fdb_info) &&
++ 	    !ds->assisted_learning_on_cpu_port)
++ 		return 0;
++ 
++ 	/* Also treat FDB entries on foreign interfaces bridged with us as host
++ 	 * addresses.
++ 	 */
++ 	if (dsa_foreign_dev_check(dev, orig_dev))
++ 		host_addr = true;
++ 
++ 	switchdev_work = kzalloc(sizeof(*switchdev_work), GFP_ATOMIC);
++ 	if (!switchdev_work)
+++>>>>>>> 716a30a97a52 (net: switchdev: merge switchdev_handle_fdb_{add,del}_to_device)
+  		return -ENOMEM;
+ -
+ -	netdev_dbg(dev, "%s FDB entry towards %s, addr %pM vid %d%s\n",
+ -		   event == SWITCHDEV_FDB_ADD_TO_DEVICE ? "Adding" : "Deleting",
+ -		   orig_dev->name, fdb_info->addr, fdb_info->vid,
+ -		   host_addr ? " as host address" : "");
+ -
+ -	INIT_WORK(&switchdev_work->work, dsa_slave_switchdev_event_work);
+ -	switchdev_work->ds = ds;
+ -	switchdev_work->port = dp->index;
+ -	switchdev_work->event = event;
+ -	switchdev_work->dev = dev;
+ -
+ -	ether_addr_copy(switchdev_work->addr, fdb_info->addr);
+ -	switchdev_work->vid = fdb_info->vid;
+ -	switchdev_work->host_addr = host_addr;
+ -
+ -	dsa_schedule_work(&switchdev_work->work);
+ -
+ +	ether_addr_copy((u8 *)switchdev_work->fdb_info.addr,
+ +			fdb_info->addr);
+  	return 0;
+  }
+  
+@@@ -1523,29 -2529,23 +1574,45 @@@ static int dsa_slave_switchdev_event(st
+  				     unsigned long event, void *ptr)
+  {
+  	struct net_device *dev = switchdev_notifier_info_to_dev(ptr);
+ -	int err;
+ +	struct dsa_switchdev_event_work *switchdev_work;
+ +
+ +	if (!dsa_slave_dev_check(dev))
+ +		return NOTIFY_DONE;
+ +
+ +	switchdev_work = kzalloc(sizeof(*switchdev_work), GFP_ATOMIC);
+ +	if (!switchdev_work)
+ +		return NOTIFY_BAD;
+ +
+ +	INIT_WORK(&switchdev_work->work,
+ +		  dsa_slave_switchdev_event_work);
+ +	switchdev_work->dev = dev;
+ +	switchdev_work->event = event;
+  
+  	switch (event) {
+++<<<<<<< HEAD
+ +	case SWITCHDEV_FDB_ADD_TO_DEVICE: /* fall through */
+ +	case SWITCHDEV_FDB_DEL_TO_DEVICE:
+ +		if (dsa_slave_switchdev_fdb_work_init(switchdev_work, ptr))
+ +			goto err_fdb_work_init;
+ +		dev_hold(dev);
+ +		break;
+++=======
++ 	case SWITCHDEV_PORT_ATTR_SET:
++ 		err = switchdev_handle_port_attr_set(dev, ptr,
++ 						     dsa_slave_dev_check,
++ 						     dsa_slave_port_attr_set);
++ 		return notifier_from_errno(err);
++ 	case SWITCHDEV_FDB_ADD_TO_DEVICE:
++ 	case SWITCHDEV_FDB_DEL_TO_DEVICE:
++ 		err = switchdev_handle_fdb_event_to_device(dev, event, ptr,
++ 							   dsa_slave_dev_check,
++ 							   dsa_foreign_dev_check,
++ 							   dsa_slave_fdb_event,
++ 							   NULL);
++ 		return notifier_from_errno(err);
+++>>>>>>> 716a30a97a52 (net: switchdev: merge switchdev_handle_fdb_{add,del}_to_device)
+  	default:
+ +		kfree(switchdev_work);
+  		return NOTIFY_DONE;
+  	}
+  
+diff --git a/include/net/switchdev.h b/include/net/switchdev.h
+index bba0f4670f17..768d9b604483 100644
+--- a/include/net/switchdev.h
++++ b/include/net/switchdev.h
+@@ -362,28 +362,16 @@ void switchdev_port_fwd_mark_set(struct net_device *dev,
+ 				 struct net_device *group_dev,
+ 				 bool joining);
+ 
+-int switchdev_handle_fdb_add_to_device(struct net_device *dev,
++int switchdev_handle_fdb_event_to_device(struct net_device *dev, unsigned long event,
+ 		const struct switchdev_notifier_fdb_info *fdb_info,
+ 		bool (*check_cb)(const struct net_device *dev),
+ 		bool (*foreign_dev_check_cb)(const struct net_device *dev,
+ 					     const struct net_device *foreign_dev),
+-		int (*add_cb)(struct net_device *dev,
+-			      const struct net_device *orig_dev, const void *ctx,
++		int (*mod_cb)(struct net_device *dev, struct net_device *orig_dev,
++			      unsigned long event, const void *ctx,
+ 			      const struct switchdev_notifier_fdb_info *fdb_info),
+-		int (*lag_add_cb)(struct net_device *dev,
+-				  const struct net_device *orig_dev, const void *ctx,
+-				  const struct switchdev_notifier_fdb_info *fdb_info));
+-
+-int switchdev_handle_fdb_del_to_device(struct net_device *dev,
+-		const struct switchdev_notifier_fdb_info *fdb_info,
+-		bool (*check_cb)(const struct net_device *dev),
+-		bool (*foreign_dev_check_cb)(const struct net_device *dev,
+-					     const struct net_device *foreign_dev),
+-		int (*del_cb)(struct net_device *dev,
+-			      const struct net_device *orig_dev, const void *ctx,
+-			      const struct switchdev_notifier_fdb_info *fdb_info),
+-		int (*lag_del_cb)(struct net_device *dev,
+-				  const struct net_device *orig_dev, const void *ctx,
++		int (*lag_mod_cb)(struct net_device *dev, struct net_device *orig_dev,
++				  unsigned long event, const void *ctx,
+ 				  const struct switchdev_notifier_fdb_info *fdb_info));
+ 
+ int switchdev_handle_port_obj_add(struct net_device *dev,
+@@ -490,32 +478,16 @@ call_switchdev_blocking_notifiers(unsigned long val,
+ }
+ 
+ static inline int
+-switchdev_handle_fdb_add_to_device(struct net_device *dev,
+-		const struct switchdev_notifier_fdb_info *fdb_info,
+-		bool (*check_cb)(const struct net_device *dev),
+-		bool (*foreign_dev_check_cb)(const struct net_device *dev,
+-					     const struct net_device *foreign_dev),
+-		int (*add_cb)(struct net_device *dev,
+-			      const struct net_device *orig_dev, const void *ctx,
+-			      const struct switchdev_notifier_fdb_info *fdb_info),
+-		int (*lag_add_cb)(struct net_device *dev,
+-				  const struct net_device *orig_dev, const void *ctx,
+-				  const struct switchdev_notifier_fdb_info *fdb_info))
+-{
+-	return 0;
+-}
+-
+-static inline int
+-switchdev_handle_fdb_del_to_device(struct net_device *dev,
++switchdev_handle_fdb_event_to_device(struct net_device *dev, unsigned long event,
+ 		const struct switchdev_notifier_fdb_info *fdb_info,
+ 		bool (*check_cb)(const struct net_device *dev),
+ 		bool (*foreign_dev_check_cb)(const struct net_device *dev,
+ 					     const struct net_device *foreign_dev),
+-		int (*del_cb)(struct net_device *dev,
+-			      const struct net_device *orig_dev, const void *ctx,
++		int (*mod_cb)(struct net_device *dev, struct net_device *orig_dev,
++			      unsigned long event, const void *ctx,
+ 			      const struct switchdev_notifier_fdb_info *fdb_info),
+-		int (*lag_del_cb)(struct net_device *dev,
+-				  const struct net_device *orig_dev, const void *ctx,
++		int (*lag_mod_cb)(struct net_device *dev, struct net_device *orig_dev,
++				  unsigned long event, const void *ctx,
+ 				  const struct switchdev_notifier_fdb_info *fdb_info))
+ {
+ 	return 0;
+* Unmerged path net/dsa/slave.c
+diff --git a/net/switchdev/switchdev.c b/net/switchdev/switchdev.c
+index 0b2c18efc079..83460470e883 100644
+--- a/net/switchdev/switchdev.c
++++ b/net/switchdev/switchdev.c
+@@ -428,17 +428,17 @@ switchdev_lower_dev_find(struct net_device *dev,
+ 	return switchdev_priv.lower_dev;
+ }
+ 
+-static int __switchdev_handle_fdb_add_to_device(struct net_device *dev,
+-		const struct net_device *orig_dev,
++static int __switchdev_handle_fdb_event_to_device(struct net_device *dev,
++		struct net_device *orig_dev, unsigned long event,
+ 		const struct switchdev_notifier_fdb_info *fdb_info,
+ 		bool (*check_cb)(const struct net_device *dev),
+ 		bool (*foreign_dev_check_cb)(const struct net_device *dev,
+ 					     const struct net_device *foreign_dev),
+-		int (*add_cb)(struct net_device *dev,
+-			      const struct net_device *orig_dev, const void *ctx,
++		int (*mod_cb)(struct net_device *dev, struct net_device *orig_dev,
++			      unsigned long event, const void *ctx,
+ 			      const struct switchdev_notifier_fdb_info *fdb_info),
+-		int (*lag_add_cb)(struct net_device *dev,
+-				  const struct net_device *orig_dev, const void *ctx,
++		int (*lag_mod_cb)(struct net_device *dev, struct net_device *orig_dev,
++				  unsigned long event, const void *ctx,
+ 				  const struct switchdev_notifier_fdb_info *fdb_info))
+ {
+ 	const struct switchdev_notifier_info *info = &fdb_info->info;
+@@ -447,17 +447,17 @@ static int __switchdev_handle_fdb_add_to_device(struct net_device *dev,
+ 	int err = -EOPNOTSUPP;
+ 
+ 	if (check_cb(dev))
+-		return add_cb(dev, orig_dev, info->ctx, fdb_info);
++		return mod_cb(dev, orig_dev, event, info->ctx, fdb_info);
+ 
+ 	if (netif_is_lag_master(dev)) {
+ 		if (!switchdev_lower_dev_find(dev, check_cb, foreign_dev_check_cb))
+ 			goto maybe_bridged_with_us;
+ 
+ 		/* This is a LAG interface that we offload */
+-		if (!lag_add_cb)
++		if (!lag_mod_cb)
+ 			return -EOPNOTSUPP;
+ 
+-		return lag_add_cb(dev, orig_dev, info->ctx, fdb_info);
++		return lag_mod_cb(dev, orig_dev, event, info->ctx, fdb_info);
+ 	}
+ 
+ 	/* Recurse through lower interfaces in case the FDB entry is pointing
+@@ -481,10 +481,10 @@ static int __switchdev_handle_fdb_add_to_device(struct net_device *dev,
+ 						      foreign_dev_check_cb))
+ 				continue;
+ 
+-			err = __switchdev_handle_fdb_add_to_device(lower_dev, orig_dev,
+-								   fdb_info, check_cb,
+-								   foreign_dev_check_cb,
+-								   add_cb, lag_add_cb);
++			err = __switchdev_handle_fdb_event_to_device(lower_dev, orig_dev,
++								     event, fdb_info, check_cb,
++								     foreign_dev_check_cb,
++								     mod_cb, lag_mod_cb);
+ 			if (err && err != -EOPNOTSUPP)
+ 				return err;
+ 		}
+@@ -503,140 +503,34 @@ static int __switchdev_handle_fdb_add_to_device(struct net_device *dev,
+ 	if (!switchdev_lower_dev_find(br, check_cb, foreign_dev_check_cb))
+ 		return 0;
+ 
+-	return __switchdev_handle_fdb_add_to_device(br, orig_dev, fdb_info,
+-						    check_cb, foreign_dev_check_cb,
+-						    add_cb, lag_add_cb);
++	return __switchdev_handle_fdb_event_to_device(br, orig_dev, event, fdb_info,
++						      check_cb, foreign_dev_check_cb,
++						      mod_cb, lag_mod_cb);
+ }
+ 
+-int switchdev_handle_fdb_add_to_device(struct net_device *dev,
++int switchdev_handle_fdb_event_to_device(struct net_device *dev, unsigned long event,
+ 		const struct switchdev_notifier_fdb_info *fdb_info,
+ 		bool (*check_cb)(const struct net_device *dev),
+ 		bool (*foreign_dev_check_cb)(const struct net_device *dev,
+ 					     const struct net_device *foreign_dev),
+-		int (*add_cb)(struct net_device *dev,
+-			      const struct net_device *orig_dev, const void *ctx,
++		int (*mod_cb)(struct net_device *dev, struct net_device *orig_dev,
++			      unsigned long event, const void *ctx,
+ 			      const struct switchdev_notifier_fdb_info *fdb_info),
+-		int (*lag_add_cb)(struct net_device *dev,
+-				  const struct net_device *orig_dev, const void *ctx,
++		int (*lag_mod_cb)(struct net_device *dev, struct net_device *orig_dev,
++				  unsigned long event, const void *ctx,
+ 				  const struct switchdev_notifier_fdb_info *fdb_info))
+ {
+ 	int err;
+ 
+-	err = __switchdev_handle_fdb_add_to_device(dev, dev, fdb_info,
+-						   check_cb,
+-						   foreign_dev_check_cb,
+-						   add_cb, lag_add_cb);
++	err = __switchdev_handle_fdb_event_to_device(dev, dev, event, fdb_info,
++						     check_cb, foreign_dev_check_cb,
++						     mod_cb, lag_mod_cb);
+ 	if (err == -EOPNOTSUPP)
+ 		err = 0;
+ 
+ 	return err;
+ }
+-EXPORT_SYMBOL_GPL(switchdev_handle_fdb_add_to_device);
+-
+-static int __switchdev_handle_fdb_del_to_device(struct net_device *dev,
+-		const struct net_device *orig_dev,
+-		const struct switchdev_notifier_fdb_info *fdb_info,
+-		bool (*check_cb)(const struct net_device *dev),
+-		bool (*foreign_dev_check_cb)(const struct net_device *dev,
+-					     const struct net_device *foreign_dev),
+-		int (*del_cb)(struct net_device *dev,
+-			      const struct net_device *orig_dev, const void *ctx,
+-			      const struct switchdev_notifier_fdb_info *fdb_info),
+-		int (*lag_del_cb)(struct net_device *dev,
+-				  const struct net_device *orig_dev, const void *ctx,
+-				  const struct switchdev_notifier_fdb_info *fdb_info))
+-{
+-	const struct switchdev_notifier_info *info = &fdb_info->info;
+-	struct net_device *br, *lower_dev;
+-	struct list_head *iter;
+-	int err = -EOPNOTSUPP;
+-
+-	if (check_cb(dev))
+-		return del_cb(dev, orig_dev, info->ctx, fdb_info);
+-
+-	if (netif_is_lag_master(dev)) {
+-		if (!switchdev_lower_dev_find(dev, check_cb, foreign_dev_check_cb))
+-			goto maybe_bridged_with_us;
+-
+-		/* This is a LAG interface that we offload */
+-		if (!lag_del_cb)
+-			return -EOPNOTSUPP;
+-
+-		return lag_del_cb(dev, orig_dev, info->ctx, fdb_info);
+-	}
+-
+-	/* Recurse through lower interfaces in case the FDB entry is pointing
+-	 * towards a bridge device.
+-	 */
+-	if (netif_is_bridge_master(dev)) {
+-		if (!switchdev_lower_dev_find(dev, check_cb, foreign_dev_check_cb))
+-			return 0;
+-
+-		/* This is a bridge interface that we offload */
+-		netdev_for_each_lower_dev(dev, lower_dev, iter) {
+-			/* Do not propagate FDB entries across bridges */
+-			if (netif_is_bridge_master(lower_dev))
+-				continue;
+-
+-			/* Bridge ports might be either us, or LAG interfaces
+-			 * that we offload.
+-			 */
+-			if (!check_cb(lower_dev) &&
+-			    !switchdev_lower_dev_find(lower_dev, check_cb,
+-						      foreign_dev_check_cb))
+-				continue;
+-
+-			err = __switchdev_handle_fdb_del_to_device(lower_dev, orig_dev,
+-								   fdb_info, check_cb,
+-								   foreign_dev_check_cb,
+-								   del_cb, lag_del_cb);
+-			if (err && err != -EOPNOTSUPP)
+-				return err;
+-		}
+-
+-		return 0;
+-	}
+-
+-maybe_bridged_with_us:
+-	/* Event is neither on a bridge nor a LAG. Check whether it is on an
+-	 * interface that is in a bridge with us.
+-	 */
+-	br = netdev_master_upper_dev_get_rcu(dev);
+-	if (!br || !netif_is_bridge_master(br))
+-		return 0;
+-
+-	if (!switchdev_lower_dev_find(br, check_cb, foreign_dev_check_cb))
+-		return 0;
+-
+-	return __switchdev_handle_fdb_del_to_device(br, orig_dev, fdb_info,
+-						    check_cb, foreign_dev_check_cb,
+-						    del_cb, lag_del_cb);
+-}
+-
+-int switchdev_handle_fdb_del_to_device(struct net_device *dev,
+-		const struct switchdev_notifier_fdb_info *fdb_info,
+-		bool (*check_cb)(const struct net_device *dev),
+-		bool (*foreign_dev_check_cb)(const struct net_device *dev,
+-					     const struct net_device *foreign_dev),
+-		int (*del_cb)(struct net_device *dev,
+-			      const struct net_device *orig_dev, const void *ctx,
+-			      const struct switchdev_notifier_fdb_info *fdb_info),
+-		int (*lag_del_cb)(struct net_device *dev,
+-				  const struct net_device *orig_dev, const void *ctx,
+-				  const struct switchdev_notifier_fdb_info *fdb_info))
+-{
+-	int err;
+-
+-	err = __switchdev_handle_fdb_del_to_device(dev, dev, fdb_info,
+-						   check_cb,
+-						   foreign_dev_check_cb,
+-						   del_cb, lag_del_cb);
+-	if (err == -EOPNOTSUPP)
+-		err = 0;
+-
+-	return err;
+-}
+-EXPORT_SYMBOL_GPL(switchdev_handle_fdb_del_to_device);
++EXPORT_SYMBOL_GPL(switchdev_handle_fdb_event_to_device);
+ 
+ static int __switchdev_handle_port_obj_add(struct net_device *dev,
+ 			struct switchdev_notifier_port_obj_info *port_obj_info,
