@@ -1,0 +1,419 @@
+scs: Add support for Clang's Shadow Call Stack (SCS)
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-310.el8
+commit-author Sami Tolvanen <samitolvanen@google.com>
+commit d08b9f0ca6605e13dcb48f04e55a30545b3c71eb
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-310.el8/d08b9f0c.failed
+
+This change adds generic support for Clang's Shadow Call Stack,
+which uses a shadow stack to protect return addresses from being
+overwritten by an attacker. Details are available here:
+
+  https://clang.llvm.org/docs/ShadowCallStack.html
+
+Note that security guarantees in the kernel differ from the ones
+documented for user space. The kernel must store addresses of
+shadow stacks in memory, which means an attacker capable reading
+and writing arbitrary memory may be able to locate them and hijack
+control flow by modifying the stacks.
+
+	Signed-off-by: Sami Tolvanen <samitolvanen@google.com>
+	Reviewed-by: Kees Cook <keescook@chromium.org>
+	Reviewed-by: Miguel Ojeda <miguel.ojeda.sandonis@gmail.com>
+[will: Numerous cosmetic changes]
+	Signed-off-by: Will Deacon <will@kernel.org>
+(cherry picked from commit d08b9f0ca6605e13dcb48f04e55a30545b3c71eb)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/compiler-clang.h
+#	include/linux/compiler_types.h
+#	init/init_task.c
+#	kernel/Makefile
+#	kernel/fork.c
+diff --cc include/linux/compiler-clang.h
+index 2753bfd00dca,790c0c6b8552..000000000000
+--- a/include/linux/compiler-clang.h
++++ b/include/linux/compiler-clang.h
+@@@ -59,3 -36,13 +59,16 @@@
+      __has_builtin(__builtin_sub_overflow)
+  #define COMPILER_HAS_GENERIC_BUILTIN_OVERFLOW 1
+  #endif
+++<<<<<<< HEAD
+++=======
++ 
++ /* The following are for compatibility with GCC, from compiler-gcc.h,
++  * and may be redefined here because they should not be shared with other
++  * compilers, like ICC.
++  */
++ #define barrier() __asm__ __volatile__("" : : : "memory")
++ 
++ #if __has_feature(shadow_call_stack)
++ # define __noscs	__attribute__((__no_sanitize__("shadow-call-stack")))
++ #endif
+++>>>>>>> d08b9f0ca660 (scs: Add support for Clang's Shadow Call Stack (SCS))
+diff --cc include/linux/compiler_types.h
+index 874b5e3e8a2b,97b62f47a80d..000000000000
+--- a/include/linux/compiler_types.h
++++ b/include/linux/compiler_types.h
+@@@ -235,36 -193,20 +235,45 @@@ struct ftrace_likely_data 
+  # define randomized_struct_fields_end
+  #endif
+  
+++<<<<<<< HEAD
+ +/*
+ + * Tell gcc if a function is cold. The compiler will assume any path
+ + * directly leading to the call is unlikely.
+ + */
+ +
+ +#ifndef __cold
+ +#define __cold
+++=======
++ #ifndef __noscs
++ # define __noscs
++ #endif
++ 
++ #ifndef asm_volatile_goto
++ #define asm_volatile_goto(x...) asm goto(x)
+++>>>>>>> d08b9f0ca660 (scs: Add support for Clang's Shadow Call Stack (SCS))
+  #endif
+  
+ -#ifdef CONFIG_CC_HAS_ASM_INLINE
+ -#define asm_inline asm __inline
+ -#else
+ -#define asm_inline asm
+ +/* Simple shorthand for a section definition */
+ +#ifndef __section
+ +# define __section(S) __attribute__ ((__section__(#S)))
+ +#endif
+ +
+ +#ifndef __visible
+ +#define __visible
+  #endif
+  
+ +#ifndef __nostackprotector
+ +# define __nostackprotector
+ +#endif
+ +
+ +/*
+ + * Assume alignment of return value.
+ + */
+ +#ifndef __assume_aligned
+ +#define __assume_aligned(a, ...)
+ +#endif
+ +
+ +
+  #ifndef __no_fgcse
+  # define __no_fgcse
+  #endif
+diff --cc init/init_task.c
+index 156eca11f768,169e34066d35..000000000000
+--- a/init/init_task.c
++++ b/init/init_task.c
+@@@ -49,9 -51,12 +50,18 @@@ static struct sighand_struct init_sigha
+  	.signalfd_wqh	= __WAIT_QUEUE_HEAD_INITIALIZER(init_sighand.signalfd_wqh),
+  };
+  
+++<<<<<<< HEAD
+ +static struct task_struct_rh init_task_struct_rh = {
+ +	INIT_CPU_TIMERS(init_task_struct_rh)
+ +};
+++=======
++ #ifdef CONFIG_SHADOW_CALL_STACK
++ unsigned long init_shadow_call_stack[SCS_SIZE / sizeof(long)]
++ 		__init_task_data = {
++ 	[(SCS_SIZE / sizeof(long)) - 1] = SCS_END_MAGIC
++ };
++ #endif
+++>>>>>>> d08b9f0ca660 (scs: Add support for Clang's Shadow Call Stack (SCS))
+  
+  /*
+   * Set up the first task table, touch at your own risk!. Base=0,
+diff --cc kernel/Makefile
+index 216702bab79f,c332eb9d4841..000000000000
+--- a/kernel/Makefile
++++ b/kernel/Makefile
+@@@ -102,7 -103,7 +102,11 @@@ obj-$(CONFIG_TRACEPOINTS) += trace
+  obj-$(CONFIG_IRQ_WORK) += irq_work.o
+  obj-$(CONFIG_CPU_PM) += cpu_pm.o
+  obj-$(CONFIG_BPF) += bpf/
+++<<<<<<< HEAD
+ +obj-$(CONFIG_KCSAN) += kcsan/
+++=======
++ obj-$(CONFIG_SHADOW_CALL_STACK) += scs.o
+++>>>>>>> d08b9f0ca660 (scs: Add support for Clang's Shadow Call Stack (SCS))
+  
+  obj-$(CONFIG_PERF_EVENTS) += events/
+  
+diff --cc kernel/fork.c
+index 9a2ad5adca15,f6339f9d232d..000000000000
+--- a/kernel/fork.c
++++ b/kernel/fork.c
+@@@ -91,6 -92,9 +91,12 @@@
+  #include <linux/kcov.h>
+  #include <linux/livepatch.h>
+  #include <linux/thread_info.h>
+++<<<<<<< HEAD
+++=======
++ #include <linux/stackleak.h>
++ #include <linux/kasan.h>
++ #include <linux/scs.h>
+++>>>>>>> d08b9f0ca660 (scs: Add support for Clang's Shadow Call Stack (SCS))
+  
+  #include <asm/pgtable.h>
+  #include <asm/pgalloc.h>
+@@@ -825,7 -843,10 +833,9 @@@ void __init fork_init(void
+  			  NULL, free_vm_stack_cache);
+  #endif
+  
++ 	scs_init();
++ 
+  	lockdep_init_task(&init_task);
+ -	uprobes_init();
+  }
+  
+  int __weak arch_dup_task_struct(struct task_struct *dst,
+@@@ -903,12 -898,16 +913,16 @@@ static struct task_struct *dup_task_str
+  	tsk->stack_vm_area = stack_vm_area;
+  #endif
+  #ifdef CONFIG_THREAD_INFO_IN_TASK
+ -	refcount_set(&tsk->stack_refcount, 1);
+ +	atomic_set(&tsk->stack_refcount, 1);
+  #endif
+  
+ -	if (err)
+ +	if (err || !dup_rh_task_struct(tsk, orig, node))
+  		goto free_stack;
+  
++ 	err = scs_prepare(tsk, node);
++ 	if (err)
++ 		goto free_stack;
++ 
+  #ifdef CONFIG_SECCOMP
+  	/*
+  	 * We must handle setting up seccomp filters once we're under
+diff --git a/Makefile b/Makefile
+index 5d886c6a26d6..7d96a462ab2c 100644
+--- a/Makefile
++++ b/Makefile
+@@ -808,6 +808,12 @@ KBUILD_CFLAGS_KERNEL	+= $(call cc-option,-ffunction-sections,)
+ KBUILD_CFLAGS_KERNEL	+= $(call cc-option,-fdata-sections,)
+ endif
+ 
++ifdef CONFIG_SHADOW_CALL_STACK
++CC_FLAGS_SCS	:= -fsanitize=shadow-call-stack
++KBUILD_CFLAGS	+= $(CC_FLAGS_SCS)
++export CC_FLAGS_SCS
++endif
++
+ # arch Makefile may override CC so keep this after arch Makefile is included
+ NOSTDINC_FLAGS += -nostdinc -isystem $(shell $(CC) -print-file-name=include)
+ 
+diff --git a/arch/Kconfig b/arch/Kconfig
+index 22d411480ecd..132dff1a08af 100644
+--- a/arch/Kconfig
++++ b/arch/Kconfig
+@@ -645,6 +645,30 @@ config STACKPROTECTOR_STRONG
+ 	  about 20% of all kernel functions, which increases the kernel code
+ 	  size by about 2%.
+ 
++config ARCH_SUPPORTS_SHADOW_CALL_STACK
++	bool
++	help
++	  An architecture should select this if it supports Clang's Shadow
++	  Call Stack, has asm/scs.h, and implements runtime support for shadow
++	  stack switching.
++
++config SHADOW_CALL_STACK
++	bool "Clang Shadow Call Stack"
++	depends on CC_IS_CLANG && ARCH_SUPPORTS_SHADOW_CALL_STACK
++	help
++	  This option enables Clang's Shadow Call Stack, which uses a
++	  shadow stack to protect function return addresses from being
++	  overwritten by an attacker. More information can be found in
++	  Clang's documentation:
++
++	    https://clang.llvm.org/docs/ShadowCallStack.html
++
++	  Note that security guarantees in the kernel differ from the
++	  ones documented for user space. The kernel must store addresses
++	  of shadow stacks in memory, which means an attacker capable of
++	  reading and writing arbitrary memory may be able to locate them
++	  and hijack control flow by modifying the stacks.
++
+ config HAVE_ARCH_WITHIN_STACK_FRAMES
+ 	bool
+ 	help
+* Unmerged path include/linux/compiler-clang.h
+* Unmerged path include/linux/compiler_types.h
+diff --git a/include/linux/scs.h b/include/linux/scs.h
+new file mode 100644
+index 000000000000..3f3662621a27
+--- /dev/null
++++ b/include/linux/scs.h
+@@ -0,0 +1,68 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++/*
++ * Shadow Call Stack support.
++ *
++ * Copyright (C) 2019 Google LLC
++ */
++
++#ifndef _LINUX_SCS_H
++#define _LINUX_SCS_H
++
++#include <linux/gfp.h>
++#include <linux/poison.h>
++#include <linux/sched.h>
++#include <linux/sizes.h>
++
++#ifdef CONFIG_SHADOW_CALL_STACK
++
++/*
++ * In testing, 1 KiB shadow stack size (i.e. 128 stack frames on a 64-bit
++ * architecture) provided ~40% safety margin on stack usage while keeping
++ * memory allocation overhead reasonable.
++ */
++#define SCS_SIZE		SZ_1K
++#define GFP_SCS			(GFP_KERNEL | __GFP_ZERO)
++
++/* An illegal pointer value to mark the end of the shadow stack. */
++#define SCS_END_MAGIC		(0x5f6UL + POISON_POINTER_DELTA)
++
++#define task_scs(tsk)		(task_thread_info(tsk)->scs_base)
++#define task_scs_offset(tsk)	(task_thread_info(tsk)->scs_offset)
++
++void scs_init(void);
++int scs_prepare(struct task_struct *tsk, int node);
++void scs_release(struct task_struct *tsk);
++
++static inline void scs_task_reset(struct task_struct *tsk)
++{
++	/*
++	 * Reset the shadow stack to the base address in case the task
++	 * is reused.
++	 */
++	task_scs_offset(tsk) = 0;
++}
++
++static inline unsigned long *__scs_magic(void *s)
++{
++	return (unsigned long *)(s + SCS_SIZE) - 1;
++}
++
++static inline bool scs_corrupted(struct task_struct *tsk)
++{
++	unsigned long *magic = __scs_magic(task_scs(tsk));
++
++	return (task_scs_offset(tsk) >= SCS_SIZE - 1 ||
++		READ_ONCE_NOCHECK(*magic) != SCS_END_MAGIC);
++}
++
++#else /* CONFIG_SHADOW_CALL_STACK */
++
++static inline void scs_init(void) {}
++static inline void scs_task_reset(struct task_struct *tsk) {}
++static inline int scs_prepare(struct task_struct *tsk, int node) { return 0; }
++static inline bool scs_corrupted(struct task_struct *tsk) { return false; }
++static inline void scs_release(struct task_struct *tsk) {}
++
++#endif /* CONFIG_SHADOW_CALL_STACK */
++
++#endif /* _LINUX_SCS_H */
+* Unmerged path init/init_task.c
+* Unmerged path kernel/Makefile
+* Unmerged path kernel/fork.c
+diff --git a/kernel/sched/core.c b/kernel/sched/core.c
+index 2d6c222ab302..e014eef0dc31 100644
+--- a/kernel/sched/core.c
++++ b/kernel/sched/core.c
+@@ -14,6 +14,7 @@
+ #include <linux/nospec.h>
+ 
+ #include <linux/kcov.h>
++#include <linux/scs.h>
+ 
+ #include <asm/switch_to.h>
+ #include <asm/tlb.h>
+@@ -5850,6 +5851,7 @@ void init_idle(struct task_struct *idle, int cpu)
+ 	idle->se.exec_start = sched_clock();
+ 	idle->flags |= PF_IDLE;
+ 
++	scs_task_reset(idle);
+ 	kasan_unpoison_task_stack(idle);
+ 
+ #ifdef CONFIG_SMP
+diff --git a/kernel/scs.c b/kernel/scs.c
+new file mode 100644
+index 000000000000..38f8f31c9451
+--- /dev/null
++++ b/kernel/scs.c
+@@ -0,0 +1,65 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * Shadow Call Stack support.
++ *
++ * Copyright (C) 2019 Google LLC
++ */
++
++#include <linux/kasan.h>
++#include <linux/scs.h>
++#include <linux/slab.h>
++#include <asm/scs.h>
++
++static struct kmem_cache *scs_cache;
++
++static void *scs_alloc(int node)
++{
++	void *s;
++
++	s = kmem_cache_alloc_node(scs_cache, GFP_SCS, node);
++	if (s) {
++		*__scs_magic(s) = SCS_END_MAGIC;
++		/*
++		 * Poison the allocation to catch unintentional accesses to
++		 * the shadow stack when KASAN is enabled.
++		 */
++		kasan_poison_object_data(scs_cache, s);
++	}
++
++	return s;
++}
++
++static void scs_free(void *s)
++{
++	kasan_unpoison_object_data(scs_cache, s);
++	kmem_cache_free(scs_cache, s);
++}
++
++void __init scs_init(void)
++{
++	scs_cache = kmem_cache_create("scs_cache", SCS_SIZE, 0, 0, NULL);
++}
++
++int scs_prepare(struct task_struct *tsk, int node)
++{
++	void *s = scs_alloc(node);
++
++	if (!s)
++		return -ENOMEM;
++
++	task_scs(tsk) = s;
++	task_scs_offset(tsk) = 0;
++
++	return 0;
++}
++
++void scs_release(struct task_struct *tsk)
++{
++	void *s = task_scs(tsk);
++
++	if (!s)
++		return;
++
++	WARN(scs_corrupted(tsk), "corrupted shadow stack detected when freeing task\n");
++	scs_free(s);
++}
