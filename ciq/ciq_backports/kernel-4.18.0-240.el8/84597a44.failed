@@ -1,0 +1,228 @@
+dm integrity: add optional discard support
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Mikulas Patocka <mpatocka@redhat.com>
+commit 84597a44a9d86ac949900441cea7da0af0f2f473
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/84597a44.failed
+
+Add an argument "allow_discards" that enables discard processing on
+dm-integrity device. Discards are only allowed to devices using
+internal hash.
+
+When a block is discarded the integrity tag is filled with
+DISCARD_FILLER (0xf6) bytes.
+
+	Signed-off-by: Mikulas Patocka <mpatocka@redhat.com>
+	Signed-off-by: Mike Snitzer <snitzer@redhat.com>
+(cherry picked from commit 84597a44a9d86ac949900441cea7da0af0f2f473)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/md/dm-integrity.c
+diff --cc drivers/md/dm-integrity.c
+index cb7c54aa4969,21eb35c606be..000000000000
+--- a/drivers/md/dm-integrity.c
++++ b/drivers/md/dm-integrity.c
+@@@ -33,6 -37,9 +33,12 @@@
+  #define METADATA_WORKQUEUE_MAX_ACTIVE	16
+  #define RECALC_SECTORS			8192
+  #define RECALC_WRITE_SUPER		16
+++<<<<<<< HEAD
+++=======
++ #define BITMAP_BLOCK_SIZE		4096	/* don't change it */
++ #define BITMAP_FLUSH_INTERVAL		(10 * HZ)
++ #define DISCARD_FILLER			0xf6
+++>>>>>>> 84597a44a9d8 (dm integrity: add optional discard support)
+  
+  /*
+   * Warning - DEBUG_PRINT prints security-sensitive data to the log,
+@@@ -232,6 -256,9 +238,12 @@@ struct dm_integrity_c 
+  
+  	bool journal_uptodate;
+  	bool just_formatted;
+++<<<<<<< HEAD
+++=======
++ 	bool recalculate_flag;
++ 	bool fix_padding;
++ 	bool discard;
+++>>>>>>> 84597a44a9d8 (dm integrity: add optional discard support)
+  
+  	struct alg_spec internal_hash_alg;
+  	struct alg_spec journal_crypt_alg;
+@@@ -1341,7 -1573,44 +1387,48 @@@ static void integrity_metadata(struct w
+  			}
+  		}
+  
+++<<<<<<< HEAD
+ +		__bio_for_each_segment(bv, bio, iter, dio->orig_bi_iter) {
+++=======
++ 		if (unlikely(dio->op == REQ_OP_DISCARD)) {
++ 			sector_t bi_sector = dio->bio_details.bi_iter.bi_sector;
++ 			unsigned bi_size = dio->bio_details.bi_iter.bi_size;
++ 			unsigned max_size = likely(checksums != checksums_onstack) ? PAGE_SIZE : HASH_MAX_DIGESTSIZE;
++ 			unsigned max_blocks = max_size / ic->tag_size;
++ 			memset(checksums, DISCARD_FILLER, max_size);
++ 
++ 			while (bi_size) {
++ 				unsigned this_step_blocks = bi_size >> (SECTOR_SHIFT + ic->sb->log2_sectors_per_block);
++ 				this_step_blocks = min(this_step_blocks, max_blocks);
++ 				r = dm_integrity_rw_tag(ic, checksums, &dio->metadata_block, &dio->metadata_offset,
++ 							this_step_blocks * ic->tag_size, TAG_WRITE);
++ 				if (unlikely(r)) {
++ 					if (likely(checksums != checksums_onstack))
++ 						kfree(checksums);
++ 					goto error;
++ 				}
++ 
++ 				/*if (bi_size < this_step_blocks << (SECTOR_SHIFT + ic->sb->log2_sectors_per_block)) {
++ 					printk("BUGG: bi_sector: %llx, bi_size: %u\n", bi_sector, bi_size);
++ 					printk("BUGG: this_step_blocks: %u\n", this_step_blocks);
++ 					BUG();
++ 				}*/
++ 				bi_size -= this_step_blocks << (SECTOR_SHIFT + ic->sb->log2_sectors_per_block);
++ 				bi_sector += this_step_blocks << ic->sb->log2_sectors_per_block;
++ 			}
++ 
++ 			if (likely(checksums != checksums_onstack))
++ 				kfree(checksums);
++ 			goto skip_io;
++ 		}
++ 
++ 		save_metadata_block = dio->metadata_block;
++ 		save_metadata_offset = dio->metadata_offset;
++ 		sector = dio->range.logical_sector;
++ 		sectors_to_process = dio->range.n_sectors;
++ 
++ 		__bio_for_each_segment(bv, bio, iter, dio->bio_details.bi_iter) {
+++>>>>>>> 84597a44a9d8 (dm integrity: add optional discard support)
+  			unsigned pos;
+  			char *mem, *checksums_ptr;
+  
+@@@ -1767,6 -2067,20 +1869,23 @@@ offload_to_thread
+  		goto journal_read_write;
+  	}
+  
+++<<<<<<< HEAD
+++=======
++ 	if (ic->mode == 'B' && (dio->op == REQ_OP_WRITE || unlikely(dio->op == REQ_OP_DISCARD))) {
++ 		if (!block_bitmap_op(ic, ic->may_write_bitmap, dio->range.logical_sector,
++ 				     dio->range.n_sectors, BITMAP_OP_TEST_ALL_SET)) {
++ 			struct bitmap_block_status *bbs;
++ 
++ 			bbs = sector_to_bitmap_block(ic, dio->range.logical_sector);
++ 			spin_lock(&bbs->bio_queue_lock);
++ 			bio_list_add(&bbs->bio_queue, bio);
++ 			spin_unlock(&bbs->bio_queue_lock);
++ 			queue_work(ic->writer_wq, &bbs->work);
++ 			return;
++ 		}
++ 	}
++ 
+++>>>>>>> 84597a44a9d8 (dm integrity: add optional discard support)
+  	dio->in_flight = (atomic_t)ATOMIC_INIT(2);
+  
+  	if (need_sync_io) {
+@@@ -1775,20 -2089,25 +1894,35 @@@
+  	} else
+  		dio->completion = NULL;
+  
+ -	dm_bio_record(&dio->bio_details, bio);
+ +	dio->orig_bi_iter = bio->bi_iter;
+ +
+ +	dio->orig_bi_disk = bio->bi_disk;
+ +	dio->orig_bi_partno = bio->bi_partno;
+  	bio_set_dev(bio, ic->dev->bdev);
+ +
+ +	dio->orig_bi_integrity = bio_integrity(bio);
+  	bio->bi_integrity = NULL;
+  	bio->bi_opf &= ~REQ_INTEGRITY;
+ +
+++<<<<<<< HEAD
+ +	dio->orig_bi_end_io = bio->bi_end_io;
+  	bio->bi_end_io = integrity_end_io;
+ -	bio->bi_iter.bi_size = dio->range.n_sectors << SECTOR_SHIFT;
+  
+ +	bio->bi_iter.bi_size = dio->range.n_sectors << SECTOR_SHIFT;
+++=======
++ 	if (unlikely(dio->op == REQ_OP_DISCARD) && likely(ic->mode != 'D')) {
++ 		integrity_metadata(&dio->work);
++ 		dm_integrity_flush_buffers(ic);
++ 
++ 		dio->in_flight = (atomic_t)ATOMIC_INIT(1);
++ 		dio->completion = NULL;
++ 
++ 		generic_make_request(bio);
++ 
++ 		return;
++ 	}
++ 
+++>>>>>>> 84597a44a9d8 (dm integrity: add optional discard support)
+  	generic_make_request(bio);
+  
+  	if (need_sync_io) {
+@@@ -2473,8 -3069,11 +2607,9 @@@ static void dm_integrity_status(struct 
+  		arg_count += !!ic->meta_dev;
+  		arg_count += ic->sectors_per_block != 1;
+  		arg_count += !!(ic->sb->flags & cpu_to_le32(SB_FLAG_RECALCULATING));
++ 		arg_count += ic->discard;
+  		arg_count += ic->mode == 'J';
+  		arg_count += ic->mode == 'J';
+ -		arg_count += ic->mode == 'B';
+ -		arg_count += ic->mode == 'B';
+  		arg_count += !!ic->internal_hash_alg.alg_string;
+  		arg_count += !!ic->journal_crypt_alg.alg_string;
+  		arg_count += !!ic->journal_mac_alg.alg_string;
+@@@ -3238,7 -3873,11 +3375,15 @@@ static int dm_integrity_ctr(struct dm_t
+  			if (r)
+  				goto bad;
+  		} else if (!strcmp(opt_string, "recalculate")) {
+++<<<<<<< HEAD
+ +			recalculate = true;
+++=======
++ 			ic->recalculate_flag = true;
++ 		} else if (!strcmp(opt_string, "allow_discards")) {
++ 			ic->discard = true;
++ 		} else if (!strcmp(opt_string, "fix_padding")) {
++ 			ic->fix_padding = true;
+++>>>>>>> 84597a44a9d8 (dm integrity: add optional discard support)
+  		} else {
+  			r = -EINVAL;
+  			ti->error = "Invalid argument";
+@@@ -3289,6 -3928,18 +3434,21 @@@
+  	else
+  		ic->log2_tag_size = -1;
+  
+++<<<<<<< HEAD
+++=======
++ 	if (ic->mode == 'B' && !ic->internal_hash) {
++ 		r = -EINVAL;
++ 		ti->error = "Bitmap mode can be only used with internal hash";
++ 		goto bad;
++ 	}
++ 
++ 	if (ic->discard && !ic->internal_hash) {
++ 		r = -EINVAL;
++ 		ti->error = "Discard can be only used with internal hash";
++ 		goto bad;
++ 	}
++ 
+++>>>>>>> 84597a44a9d8 (dm integrity: add optional discard support)
+  	ic->autocommit_jiffies = msecs_to_jiffies(sync_msec);
+  	ic->autocommit_msec = sync_msec;
+  	timer_setup(&ic->autocommit_timer, autocommit_fn, 0);
+@@@ -3544,8 -4269,11 +3704,10 @@@ try_smaller_buffer
+  
+  	ti->num_flush_bios = 1;
+  	ti->flush_supported = true;
++ 	if (ic->discard)
++ 		ti->num_discard_bios = 1;
+  
+  	return 0;
+ -
+  bad:
+  	dm_integrity_dtr(ti);
+  	return r;
+* Unmerged path drivers/md/dm-integrity.c
