@@ -1,0 +1,100 @@
+x86/sev-es: Introduce ip_within_syscall_gap() helper
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-383.el8
+commit-author Joerg Roedel <jroedel@suse.de>
+commit 78a81d88f60ba773cbe890205e1ee67f00502948
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-383.el8/78a81d88.failed
+
+Introduce a helper to check whether an exception came from the syscall
+gap and use it in the SEV-ES code. Extend the check to also cover the
+compatibility SYSCALL entry path.
+
+Fixes: 315562c9af3d5 ("x86/sev-es: Adjust #VC IST Stack on entering NMI handler")
+	Signed-off-by: Joerg Roedel <jroedel@suse.de>
+	Signed-off-by: Borislav Petkov <bp@suse.de>
+	Cc: stable@vger.kernel.org # 5.10+
+Link: https://lkml.kernel.org/r/20210303141716.29223-2-joro@8bytes.org
+(cherry picked from commit 78a81d88f60ba773cbe890205e1ee67f00502948)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/entry/entry_64_compat.S
+diff --cc arch/x86/entry/entry_64_compat.S
+index 8ea9c49ab0f3,0051cf5c792d..000000000000
+--- a/arch/x86/entry/entry_64_compat.S
++++ b/arch/x86/entry/entry_64_compat.S
+@@@ -212,7 -210,7 +212,11 @@@ SYM_CODE_START(entry_SYSCALL_compat
+  	/* Switch to the kernel stack */
+  	movq	PER_CPU_VAR(cpu_current_top_of_stack), %rsp
+  
+++<<<<<<< HEAD
+ +	IBRS_ENTRY
+++=======
++ SYM_INNER_LABEL(entry_SYSCALL_compat_safe_stack, SYM_L_GLOBAL)
+++>>>>>>> 78a81d88f60b (x86/sev-es: Introduce ip_within_syscall_gap() helper)
+  
+  	/* Construct struct pt_regs on stack */
+  	pushq	$__USER32_DS		/* pt_regs->ss */
+* Unmerged path arch/x86/entry/entry_64_compat.S
+diff --git a/arch/x86/include/asm/proto.h b/arch/x86/include/asm/proto.h
+index a85190d97dab..1392eaf5df19 100644
+--- a/arch/x86/include/asm/proto.h
++++ b/arch/x86/include/asm/proto.h
+@@ -25,6 +25,7 @@ void __end_SYSENTER_singlestep_region(void);
+ void entry_SYSENTER_compat(void);
+ void __end_entry_SYSENTER_compat(void);
+ void entry_SYSCALL_compat(void);
++void entry_SYSCALL_compat_safe_stack(void);
+ void entry_INT80_compat(void);
+ #if defined(CONFIG_X86_64) && defined(CONFIG_XEN_PV)
+ void xen_entry_INT80_compat(void);
+diff --git a/arch/x86/include/asm/ptrace.h b/arch/x86/include/asm/ptrace.h
+index dc47b91d7fd7..24360c74d995 100644
+--- a/arch/x86/include/asm/ptrace.h
++++ b/arch/x86/include/asm/ptrace.h
+@@ -92,6 +92,8 @@ struct pt_regs {
+ #include <asm/paravirt_types.h>
+ #endif
+ 
++#include <asm/proto.h>
++
+ struct cpuinfo_x86;
+ struct task_struct;
+ 
+@@ -175,6 +177,19 @@ static inline bool any_64bit_mode(struct pt_regs *regs)
+ #ifdef CONFIG_X86_64
+ #define current_user_stack_pointer()	current_pt_regs()->sp
+ #define compat_user_stack_pointer()	current_pt_regs()->sp
++
++static inline bool ip_within_syscall_gap(struct pt_regs *regs)
++{
++	bool ret = (regs->ip >= (unsigned long)entry_SYSCALL_64 &&
++		    regs->ip <  (unsigned long)entry_SYSCALL_64_safe_stack);
++
++#ifdef CONFIG_IA32_EMULATION
++	ret = ret || (regs->ip >= (unsigned long)entry_SYSCALL_compat &&
++		      regs->ip <  (unsigned long)entry_SYSCALL_compat_safe_stack);
++#endif
++
++	return ret;
++}
+ #endif
+ 
+ static inline unsigned long kernel_stack_pointer(struct pt_regs *regs)
+diff --git a/arch/x86/kernel/traps.c b/arch/x86/kernel/traps.c
+index 2e12f0335c46..7927259107ca 100644
+--- a/arch/x86/kernel/traps.c
++++ b/arch/x86/kernel/traps.c
+@@ -593,8 +593,7 @@ asmlinkage __visible noinstr struct pt_regs *vc_switch_off_ist(struct pt_regs *r
+ 	 * In the SYSCALL entry path the RSP value comes from user-space - don't
+ 	 * trust it and switch to the current kernel stack
+ 	 */
+-	if (regs->ip >= (unsigned long)entry_SYSCALL_64 &&
+-	    regs->ip <  (unsigned long)entry_SYSCALL_64_safe_stack) {
++	if (ip_within_syscall_gap(regs)) {
+ 		sp = this_cpu_read(cpu_current_top_of_stack);
+ 		goto sync;
+ 	}
