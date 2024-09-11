@@ -1,0 +1,299 @@
+ethtool: provide UAPI for PHY master/slave configuration.
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+Rebuild_CHGLOG: - [uapi] ethtool: provide UAPI for PHY master/slave configuration (Petr Oros) [1878147]
+Rebuild_FUZZ: 99.12%
+commit-author Oleksij Rempel <o.rempel@pengutronix.de>
+commit bdbdac7649fac05f88c9f7ab18121a17fb591687
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/bdbdac76.failed
+
+This UAPI is needed for BroadR-Reach 100BASE-T1 devices. Due to lack of
+auto-negotiation support, we needed to be able to configure the
+MASTER-SLAVE role of the port manually or from an application in user
+space.
+
+The same UAPI can be used for 1000BASE-T or MultiGBASE-T devices to
+force MASTER or SLAVE role. See IEEE 802.3-2018:
+22.2.4.3.7 MASTER-SLAVE control register (Register 9)
+22.2.4.3.8 MASTER-SLAVE status register (Register 10)
+40.5.2 MASTER-SLAVE configuration resolution
+45.2.1.185.1 MASTER-SLAVE config value (1.2100.14)
+45.2.7.10 MultiGBASE-T AN control 1 register (Register 7.32)
+
+The MASTER-SLAVE role affects the clock configuration:
+
+-------------------------------------------------------------------------------
+When the  PHY is configured as MASTER, the PMA Transmit function shall
+source TX_TCLK from a local clock source. When configured as SLAVE, the
+PMA Transmit function shall source TX_TCLK from the clock recovered from
+data stream provided by MASTER.
+
+iMX6Q                     KSZ9031                XXX
+------\                /-----------\        /------------\
+      |                |           |        |            |
+ MAC  |<----RGMII----->| PHY Slave |<------>| PHY Master |
+      |<--- 125 MHz ---+-<------/  |        | \          |
+------/                \-----------/        \------------/
+                                               ^
+                                                \-TX_TCLK
+
+-------------------------------------------------------------------------------
+
+Since some clock or link related issues are only reproducible in a
+specific MASTER-SLAVE-role, MAC and PHY configuration, it is beneficial
+to provide generic (not 100BASE-T1 specific) interface to the user space
+for configuration flexibility and trouble shooting.
+
+	Signed-off-by: Oleksij Rempel <o.rempel@pengutronix.de>
+	Reviewed-by: Andrew Lunn <andrew@lunn.ch>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit bdbdac7649fac05f88c9f7ab18121a17fb591687)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	Documentation/networking/ethtool-netlink.rst
+#	include/uapi/linux/ethtool_netlink.h
+#	net/ethtool/ioctl.c
+#	net/ethtool/linkmodes.c
+diff --cc net/ethtool/ioctl.c
+index 52ef0b15de9b,52102ab1709b..000000000000
+--- a/net/ethtool/ioctl.c
++++ b/net/ethtool/ioctl.c
+@@@ -821,7 -591,16 +823,20 @@@ static int ethtool_set_link_ksettings(s
+  	    != link_ksettings.base.link_mode_masks_nwords)
+  		return -EINVAL;
+  
+++<<<<<<< HEAD
+ +	return __rh_call_set_link_ksettings(dev, &link_ksettings);
+++=======
++ 	if (link_ksettings.base.master_slave_cfg ||
++ 	    link_ksettings.base.master_slave_state)
++ 		return -EINVAL;
++ 
++ 	err = dev->ethtool_ops->set_link_ksettings(dev, &link_ksettings);
++ 	if (err >= 0) {
++ 		ethtool_notify(dev, ETHTOOL_MSG_LINKINFO_NTF, NULL);
++ 		ethtool_notify(dev, ETHTOOL_MSG_LINKMODES_NTF, NULL);
++ 	}
++ 	return err;
+++>>>>>>> bdbdac7649fa (ethtool: provide UAPI for PHY master/slave configuration.)
+  }
+  
+  int ethtool_virtdev_set_link_ksettings(struct net_device *dev,
+* Unmerged path Documentation/networking/ethtool-netlink.rst
+* Unmerged path include/uapi/linux/ethtool_netlink.h
+* Unmerged path net/ethtool/linkmodes.c
+* Unmerged path Documentation/networking/ethtool-netlink.rst
+diff --git a/drivers/net/phy/phy.c b/drivers/net/phy/phy.c
+index 1937020a1750..cc5de9613ec4 100644
+--- a/drivers/net/phy/phy.c
++++ b/drivers/net/phy/phy.c
+@@ -295,7 +295,7 @@ int phy_ethtool_ksettings_set(struct phy_device *phydev,
+ 			 phydev->advertising, autoneg == AUTONEG_ENABLE);
+ 
+ 	phydev->duplex = duplex;
+-
++	phydev->master_slave_set = cmd->base.master_slave_cfg;
+ 	phydev->mdix_ctrl = cmd->base.eth_tp_mdix_ctrl;
+ 
+ 	/* Restart the PHY */
+@@ -314,6 +314,8 @@ void phy_ethtool_ksettings_get(struct phy_device *phydev,
+ 
+ 	cmd->base.speed = phydev->speed;
+ 	cmd->base.duplex = phydev->duplex;
++	cmd->base.master_slave_cfg = phydev->master_slave_get;
++	cmd->base.master_slave_state = phydev->master_slave_state;
+ 	if (phydev->interface == PHY_INTERFACE_MODE_MOCA)
+ 		cmd->base.port = PORT_BNC;
+ 	else
+diff --git a/drivers/net/phy/phy_device.c b/drivers/net/phy/phy_device.c
+index edd049f1d9b6..35c22e526fb3 100644
+--- a/drivers/net/phy/phy_device.c
++++ b/drivers/net/phy/phy_device.c
+@@ -1775,6 +1775,90 @@ int genphy_setup_forced(struct phy_device *phydev)
+ }
+ EXPORT_SYMBOL(genphy_setup_forced);
+ 
++static int genphy_setup_master_slave(struct phy_device *phydev)
++{
++	u16 ctl = 0;
++
++	if (!phydev->is_gigabit_capable)
++		return 0;
++
++	switch (phydev->master_slave_set) {
++	case MASTER_SLAVE_CFG_MASTER_PREFERRED:
++		ctl |= CTL1000_PREFER_MASTER;
++		break;
++	case MASTER_SLAVE_CFG_SLAVE_PREFERRED:
++		break;
++	case MASTER_SLAVE_CFG_MASTER_FORCE:
++		ctl |= CTL1000_AS_MASTER;
++		/* fallthrough */
++	case MASTER_SLAVE_CFG_SLAVE_FORCE:
++		ctl |= CTL1000_ENABLE_MASTER;
++		break;
++	case MASTER_SLAVE_CFG_UNKNOWN:
++	case MASTER_SLAVE_CFG_UNSUPPORTED:
++		return 0;
++	default:
++		phydev_warn(phydev, "Unsupported Master/Slave mode\n");
++		return -EOPNOTSUPP;
++	}
++
++	return phy_modify_changed(phydev, MII_CTRL1000,
++				  (CTL1000_ENABLE_MASTER | CTL1000_AS_MASTER |
++				   CTL1000_PREFER_MASTER), ctl);
++}
++
++static int genphy_read_master_slave(struct phy_device *phydev)
++{
++	int cfg, state;
++	u16 val;
++
++	if (!phydev->is_gigabit_capable) {
++		phydev->master_slave_get = MASTER_SLAVE_CFG_UNSUPPORTED;
++		phydev->master_slave_state = MASTER_SLAVE_STATE_UNSUPPORTED;
++		return 0;
++	}
++
++	phydev->master_slave_get = MASTER_SLAVE_CFG_UNKNOWN;
++	phydev->master_slave_state = MASTER_SLAVE_STATE_UNKNOWN;
++
++	val = phy_read(phydev, MII_CTRL1000);
++	if (val < 0)
++		return val;
++
++	if (val & CTL1000_ENABLE_MASTER) {
++		if (val & CTL1000_AS_MASTER)
++			cfg = MASTER_SLAVE_CFG_MASTER_FORCE;
++		else
++			cfg = MASTER_SLAVE_CFG_SLAVE_FORCE;
++	} else {
++		if (val & CTL1000_PREFER_MASTER)
++			cfg = MASTER_SLAVE_CFG_MASTER_PREFERRED;
++		else
++			cfg = MASTER_SLAVE_CFG_SLAVE_PREFERRED;
++	}
++
++	val = phy_read(phydev, MII_STAT1000);
++	if (val < 0)
++		return val;
++
++	if (val & LPA_1000MSFAIL) {
++		state = MASTER_SLAVE_STATE_ERR;
++	} else if (phydev->link) {
++		/* this bits are valid only for active link */
++		if (val & LPA_1000MSRES)
++			state = MASTER_SLAVE_STATE_MASTER;
++		else
++			state = MASTER_SLAVE_STATE_SLAVE;
++	} else {
++		state = MASTER_SLAVE_STATE_UNKNOWN;
++	}
++
++	phydev->master_slave_get = cfg;
++	phydev->master_slave_state = state;
++
++	return 0;
++}
++
+ /**
+  * genphy_restart_aneg - Enable and Restart Autonegotiation
+  * @phydev: target phy_device struct
+@@ -1833,6 +1917,12 @@ int __genphy_config_aneg(struct phy_device *phydev, bool changed)
+ 	if (genphy_config_eee_advert(phydev))
+ 		changed = true;
+ 
++	err = genphy_setup_master_slave(phydev);
++	if (err < 0)
++		return err;
++	else if (err)
++		changed = true;
++
+ 	if (AUTONEG_ENABLE != phydev->autoneg)
+ 		return genphy_setup_forced(phydev);
+ 
+@@ -2067,6 +2157,10 @@ int genphy_read_status(struct phy_device *phydev)
+ 	phydev->pause = 0;
+ 	phydev->asym_pause = 0;
+ 
++	err = genphy_read_master_slave(phydev);
++	if (err < 0)
++		return err;
++
+ 	err = genphy_read_lpa(phydev);
+ 	if (err < 0)
+ 		return err;
+diff --git a/include/linux/phy.h b/include/linux/phy.h
+index c0575e63e491..c01a262547b8 100644
+--- a/include/linux/phy.h
++++ b/include/linux/phy.h
+@@ -475,6 +475,9 @@ struct phy_device {
+ 	int duplex;
+ 	int pause;
+ 	int asym_pause;
++	u8 master_slave_get;
++	u8 master_slave_set;
++	u8 master_slave_state;
+ 
+ 	/* RHEL: changed to a bit flag with the same name */
+ 	RH_KABI_DEPRECATE(u32, interrupts)
+diff --git a/include/uapi/linux/ethtool.h b/include/uapi/linux/ethtool.h
+index 30dc4eb925a3..06ae80ea9a73 100644
+--- a/include/uapi/linux/ethtool.h
++++ b/include/uapi/linux/ethtool.h
+@@ -1671,6 +1671,18 @@ static inline int ethtool_validate_duplex(__u8 duplex)
+ 	return 0;
+ }
+ 
++#define MASTER_SLAVE_CFG_UNSUPPORTED		0
++#define MASTER_SLAVE_CFG_UNKNOWN		1
++#define MASTER_SLAVE_CFG_MASTER_PREFERRED	2
++#define MASTER_SLAVE_CFG_SLAVE_PREFERRED	3
++#define MASTER_SLAVE_CFG_MASTER_FORCE		4
++#define MASTER_SLAVE_CFG_SLAVE_FORCE		5
++#define MASTER_SLAVE_STATE_UNSUPPORTED		0
++#define MASTER_SLAVE_STATE_UNKNOWN		1
++#define MASTER_SLAVE_STATE_MASTER		2
++#define MASTER_SLAVE_STATE_SLAVE		3
++#define MASTER_SLAVE_STATE_ERR			4
++
+ /* Which connector port. */
+ #define PORT_TP			0x00
+ #define PORT_AUI		0x01
+@@ -1912,7 +1924,9 @@ struct ethtool_link_settings {
+ 	__u8	eth_tp_mdix_ctrl;
+ 	__s8	link_mode_masks_nwords;
+ 	__u8	transceiver;
+-	__u8	reserved1[3];
++	__u8	master_slave_cfg;
++	__u8	master_slave_state;
++	__u8	reserved1[1];
+ 	__u32	reserved[7];
+ 	__u32	link_mode_masks[0];
+ 	/* layout of link_mode_masks fields:
+* Unmerged path include/uapi/linux/ethtool_netlink.h
+diff --git a/include/uapi/linux/mii.h b/include/uapi/linux/mii.h
+index 90f9b4e1ba27..39f7c44baf53 100644
+--- a/include/uapi/linux/mii.h
++++ b/include/uapi/linux/mii.h
+@@ -151,11 +151,13 @@
+ /* 1000BASE-T Control register */
+ #define ADVERTISE_1000FULL	0x0200  /* Advertise 1000BASE-T full duplex */
+ #define ADVERTISE_1000HALF	0x0100  /* Advertise 1000BASE-T half duplex */
++#define CTL1000_PREFER_MASTER	0x0400  /* prefer to operate as master */
+ #define CTL1000_AS_MASTER	0x0800
+ #define CTL1000_ENABLE_MASTER	0x1000
+ 
+ /* 1000BASE-T Status register */
+ #define LPA_1000MSFAIL		0x8000	/* Master/Slave resolution failure */
++#define LPA_1000MSRES		0x4000	/* Master/Slave resolution status */
+ #define LPA_1000LOCALRXOK	0x2000	/* Link partner local receiver status */
+ #define LPA_1000REMRXOK		0x1000	/* Link partner remote receiver status */
+ #define LPA_1000FULL		0x0800	/* Link partner 1000BASE-T full duplex */
+* Unmerged path net/ethtool/ioctl.c
+* Unmerged path net/ethtool/linkmodes.c
