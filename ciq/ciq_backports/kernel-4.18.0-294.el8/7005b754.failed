@@ -1,0 +1,123 @@
+s390/qeth: return error when starting a reset fails
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Julian Wiedmann <jwi@linux.ibm.com>
+commit 7005b7547680963ad127c5069c6be082272105bc
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/7005b754.failed
+
+When starting the reset worker via sysfs is unsuccessful, return an
+error to the user.
+Modernize the sysfs input parsing while at it.
+
+	Signed-off-by: Julian Wiedmann <jwi@linux.ibm.com>
+	Reviewed-by: Alexandra Winter <wintera@linux.ibm.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 7005b7547680963ad127c5069c6be082272105bc)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/s390/net/qeth_core.h
+diff --cc drivers/s390/net/qeth_core.h
+index 37711dff7476,51ea56b73a97..000000000000
+--- a/drivers/s390/net/qeth_core.h
++++ b/drivers/s390/net/qeth_core.h
+@@@ -1046,10 -1053,7 +1046,14 @@@ struct qeth_cmd_buffer *qeth_get_diag_c
+  void qeth_notify_cmd(struct qeth_cmd_buffer *iob, int reason);
+  void qeth_put_cmd(struct qeth_cmd_buffer *iob);
+  
+++<<<<<<< HEAD
+ +struct sk_buff *qeth_core_get_next_skb(struct qeth_card *,
+ +		struct qeth_qdio_buffer *, struct qdio_buffer_element **, int *,
+ +		struct qeth_hdr **);
+ +void qeth_schedule_recovery(struct qeth_card *);
+++=======
++ int qeth_schedule_recovery(struct qeth_card *card);
+++>>>>>>> 7005b7547680 (s390/qeth: return error when starting a reset fails)
+  void qeth_flush_local_addrs(struct qeth_card *card);
+  int qeth_poll(struct napi_struct *napi, int budget);
+  void qeth_clear_ipacmd_list(struct qeth_card *);
+* Unmerged path drivers/s390/net/qeth_core.h
+diff --git a/drivers/s390/net/qeth_core_main.c b/drivers/s390/net/qeth_core_main.c
+index b22d45f3231c..af865201f0c9 100644
+--- a/drivers/s390/net/qeth_core_main.c
++++ b/drivers/s390/net/qeth_core_main.c
+@@ -1071,16 +1071,18 @@ static int qeth_set_thread_start_bit(struct qeth_card *card,
+ 		unsigned long thread)
+ {
+ 	unsigned long flags;
++	int rc = 0;
+ 
+ 	spin_lock_irqsave(&card->thread_mask_lock, flags);
+-	if (!(card->thread_allowed_mask & thread) ||
+-	      (card->thread_start_mask & thread)) {
+-		spin_unlock_irqrestore(&card->thread_mask_lock, flags);
+-		return -EPERM;
+-	}
+-	card->thread_start_mask |= thread;
++	if (!(card->thread_allowed_mask & thread))
++		rc = -EPERM;
++	else if (card->thread_start_mask & thread)
++		rc = -EBUSY;
++	else
++		card->thread_start_mask |= thread;
+ 	spin_unlock_irqrestore(&card->thread_mask_lock, flags);
+-	return 0;
++
++	return rc;
+ }
+ 
+ void qeth_clear_thread_start_bit(struct qeth_card *card, unsigned long thread)
+@@ -1134,11 +1136,17 @@ int qeth_do_run_thread(struct qeth_card *card, unsigned long thread)
+ }
+ EXPORT_SYMBOL_GPL(qeth_do_run_thread);
+ 
+-void qeth_schedule_recovery(struct qeth_card *card)
++int qeth_schedule_recovery(struct qeth_card *card)
+ {
++	int rc;
++
+ 	QETH_CARD_TEXT(card, 2, "startrec");
+-	if (qeth_set_thread_start_bit(card, QETH_RECOVER_THREAD) == 0)
++
++	rc = qeth_set_thread_start_bit(card, QETH_RECOVER_THREAD);
++	if (!rc)
+ 		schedule_work(&card->kernel_thread_starter);
++
++	return rc;
+ }
+ EXPORT_SYMBOL_GPL(qeth_schedule_recovery);
+ 
+diff --git a/drivers/s390/net/qeth_core_sys.c b/drivers/s390/net/qeth_core_sys.c
+index baf27152141b..b93c8d2b11d2 100644
+--- a/drivers/s390/net/qeth_core_sys.c
++++ b/drivers/s390/net/qeth_core_sys.c
+@@ -277,17 +277,20 @@ static ssize_t qeth_dev_recover_store(struct device *dev,
+ 		struct device_attribute *attr, const char *buf, size_t count)
+ {
+ 	struct qeth_card *card = dev_get_drvdata(dev);
+-	char *tmp;
+-	int i;
++	bool reset;
++	int rc;
++
++	rc = kstrtobool(buf, &reset);
++	if (rc)
++		return rc;
+ 
+ 	if (!qeth_card_hw_is_reachable(card))
+ 		return -EPERM;
+ 
+-	i = simple_strtoul(buf, &tmp, 16);
+-	if (i == 1)
+-		qeth_schedule_recovery(card);
++	if (reset)
++		rc = qeth_schedule_recovery(card);
+ 
+-	return count;
++	return rc ? rc : count;
+ }
+ 
+ static DEVICE_ATTR(recover, 0200, NULL, qeth_dev_recover_store);
