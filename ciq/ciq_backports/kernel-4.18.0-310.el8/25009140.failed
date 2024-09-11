@@ -1,0 +1,362 @@
+KVM: SVM: Unconditionally sync GPRs to GHCB on VMRUN of SEV-ES guest
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-310.el8
+commit-author Sean Christopherson <seanjc@google.com>
+commit 250091409a4ac567581c1f929eb39139b57b56ec
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-310.el8/25009140.failed
+
+Drop the per-GPR dirty checks when synchronizing GPRs to the GHCB, the
+GRPs' dirty bits are set from time zero and never cleared, i.e. will
+always be seen as dirty.  The obvious alternative would be to clear
+the dirty bits when appropriate, but removing the dirty checks is
+desirable as it allows reverting GPR dirty+available tracking, which
+adds overhead to all flavors of x86 VMs.
+
+Note, unconditionally writing the GPRs in the GHCB is tacitly allowed
+by the GHCB spec, which allows the hypervisor (or guest) to provide
+unnecessary info; it's the guest's responsibility to consume only what
+it needs (the hypervisor is untrusted after all).
+
+  The guest and hypervisor can supply additional state if desired but
+  must not rely on that additional state being provided.
+
+	Cc: Brijesh Singh <brijesh.singh@amd.com>
+	Cc: Tom Lendacky <thomas.lendacky@amd.com>
+Fixes: 291bd20d5d88 ("KVM: SVM: Add initial support for a VMGEXIT VMEXIT")
+	Signed-off-by: Sean Christopherson <seanjc@google.com>
+Message-Id: <20210122235049.3107620-2-seanjc@google.com>
+	Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+(cherry picked from commit 250091409a4ac567581c1f929eb39139b57b56ec)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kvm/svm/sev.c
+diff --cc arch/x86/kvm/svm/sev.c
+index 25075c56c3af,ac652bc476ae..000000000000
+--- a/arch/x86/kvm/svm/sev.c
++++ b/arch/x86/kvm/svm/sev.c
+@@@ -1270,6 -1311,317 +1270,320 @@@ void sev_hardware_teardown(void
+  	sev_flush_asids();
+  }
+  
+++<<<<<<< HEAD
+++=======
++ /*
++  * Pages used by hardware to hold guest encrypted state must be flushed before
++  * returning them to the system.
++  */
++ static void sev_flush_guest_memory(struct vcpu_svm *svm, void *va,
++ 				   unsigned long len)
++ {
++ 	/*
++ 	 * If hardware enforced cache coherency for encrypted mappings of the
++ 	 * same physical page is supported, nothing to do.
++ 	 */
++ 	if (boot_cpu_has(X86_FEATURE_SME_COHERENT))
++ 		return;
++ 
++ 	/*
++ 	 * If the VM Page Flush MSR is supported, use it to flush the page
++ 	 * (using the page virtual address and the guest ASID).
++ 	 */
++ 	if (boot_cpu_has(X86_FEATURE_VM_PAGE_FLUSH)) {
++ 		struct kvm_sev_info *sev;
++ 		unsigned long va_start;
++ 		u64 start, stop;
++ 
++ 		/* Align start and stop to page boundaries. */
++ 		va_start = (unsigned long)va;
++ 		start = (u64)va_start & PAGE_MASK;
++ 		stop = PAGE_ALIGN((u64)va_start + len);
++ 
++ 		if (start < stop) {
++ 			sev = &to_kvm_svm(svm->vcpu.kvm)->sev_info;
++ 
++ 			while (start < stop) {
++ 				wrmsrl(MSR_AMD64_VM_PAGE_FLUSH,
++ 				       start | sev->asid);
++ 
++ 				start += PAGE_SIZE;
++ 			}
++ 
++ 			return;
++ 		}
++ 
++ 		WARN(1, "Address overflow, using WBINVD\n");
++ 	}
++ 
++ 	/*
++ 	 * Hardware should always have one of the above features,
++ 	 * but if not, use WBINVD and issue a warning.
++ 	 */
++ 	WARN_ONCE(1, "Using WBINVD to flush guest memory\n");
++ 	wbinvd_on_all_cpus();
++ }
++ 
++ void sev_free_vcpu(struct kvm_vcpu *vcpu)
++ {
++ 	struct vcpu_svm *svm;
++ 
++ 	if (!sev_es_guest(vcpu->kvm))
++ 		return;
++ 
++ 	svm = to_svm(vcpu);
++ 
++ 	if (vcpu->arch.guest_state_protected)
++ 		sev_flush_guest_memory(svm, svm->vmsa, PAGE_SIZE);
++ 	__free_page(virt_to_page(svm->vmsa));
++ 
++ 	if (svm->ghcb_sa_free)
++ 		kfree(svm->ghcb_sa);
++ }
++ 
++ static void dump_ghcb(struct vcpu_svm *svm)
++ {
++ 	struct ghcb *ghcb = svm->ghcb;
++ 	unsigned int nbits;
++ 
++ 	/* Re-use the dump_invalid_vmcb module parameter */
++ 	if (!dump_invalid_vmcb) {
++ 		pr_warn_ratelimited("set kvm_amd.dump_invalid_vmcb=1 to dump internal KVM state.\n");
++ 		return;
++ 	}
++ 
++ 	nbits = sizeof(ghcb->save.valid_bitmap) * 8;
++ 
++ 	pr_err("GHCB (GPA=%016llx):\n", svm->vmcb->control.ghcb_gpa);
++ 	pr_err("%-20s%016llx is_valid: %u\n", "sw_exit_code",
++ 	       ghcb->save.sw_exit_code, ghcb_sw_exit_code_is_valid(ghcb));
++ 	pr_err("%-20s%016llx is_valid: %u\n", "sw_exit_info_1",
++ 	       ghcb->save.sw_exit_info_1, ghcb_sw_exit_info_1_is_valid(ghcb));
++ 	pr_err("%-20s%016llx is_valid: %u\n", "sw_exit_info_2",
++ 	       ghcb->save.sw_exit_info_2, ghcb_sw_exit_info_2_is_valid(ghcb));
++ 	pr_err("%-20s%016llx is_valid: %u\n", "sw_scratch",
++ 	       ghcb->save.sw_scratch, ghcb_sw_scratch_is_valid(ghcb));
++ 	pr_err("%-20s%*pb\n", "valid_bitmap", nbits, ghcb->save.valid_bitmap);
++ }
++ 
++ static void sev_es_sync_to_ghcb(struct vcpu_svm *svm)
++ {
++ 	struct kvm_vcpu *vcpu = &svm->vcpu;
++ 	struct ghcb *ghcb = svm->ghcb;
++ 
++ 	/*
++ 	 * The GHCB protocol so far allows for the following data
++ 	 * to be returned:
++ 	 *   GPRs RAX, RBX, RCX, RDX
++ 	 *
++ 	 * Copy their values, even if they may not have been written during the
++ 	 * VM-Exit.  It's the guest's responsibility to not consume random data.
++ 	 */
++ 	ghcb_set_rax(ghcb, vcpu->arch.regs[VCPU_REGS_RAX]);
++ 	ghcb_set_rbx(ghcb, vcpu->arch.regs[VCPU_REGS_RBX]);
++ 	ghcb_set_rcx(ghcb, vcpu->arch.regs[VCPU_REGS_RCX]);
++ 	ghcb_set_rdx(ghcb, vcpu->arch.regs[VCPU_REGS_RDX]);
++ }
++ 
++ static void sev_es_sync_from_ghcb(struct vcpu_svm *svm)
++ {
++ 	struct vmcb_control_area *control = &svm->vmcb->control;
++ 	struct kvm_vcpu *vcpu = &svm->vcpu;
++ 	struct ghcb *ghcb = svm->ghcb;
++ 	u64 exit_code;
++ 
++ 	/*
++ 	 * The GHCB protocol so far allows for the following data
++ 	 * to be supplied:
++ 	 *   GPRs RAX, RBX, RCX, RDX
++ 	 *   XCR0
++ 	 *   CPL
++ 	 *
++ 	 * VMMCALL allows the guest to provide extra registers. KVM also
++ 	 * expects RSI for hypercalls, so include that, too.
++ 	 *
++ 	 * Copy their values to the appropriate location if supplied.
++ 	 */
++ 	memset(vcpu->arch.regs, 0, sizeof(vcpu->arch.regs));
++ 
++ 	vcpu->arch.regs[VCPU_REGS_RAX] = ghcb_get_rax_if_valid(ghcb);
++ 	vcpu->arch.regs[VCPU_REGS_RBX] = ghcb_get_rbx_if_valid(ghcb);
++ 	vcpu->arch.regs[VCPU_REGS_RCX] = ghcb_get_rcx_if_valid(ghcb);
++ 	vcpu->arch.regs[VCPU_REGS_RDX] = ghcb_get_rdx_if_valid(ghcb);
++ 	vcpu->arch.regs[VCPU_REGS_RSI] = ghcb_get_rsi_if_valid(ghcb);
++ 
++ 	svm->vmcb->save.cpl = ghcb_get_cpl_if_valid(ghcb);
++ 
++ 	if (ghcb_xcr0_is_valid(ghcb)) {
++ 		vcpu->arch.xcr0 = ghcb_get_xcr0(ghcb);
++ 		kvm_update_cpuid_runtime(vcpu);
++ 	}
++ 
++ 	/* Copy the GHCB exit information into the VMCB fields */
++ 	exit_code = ghcb_get_sw_exit_code(ghcb);
++ 	control->exit_code = lower_32_bits(exit_code);
++ 	control->exit_code_hi = upper_32_bits(exit_code);
++ 	control->exit_info_1 = ghcb_get_sw_exit_info_1(ghcb);
++ 	control->exit_info_2 = ghcb_get_sw_exit_info_2(ghcb);
++ 
++ 	/* Clear the valid entries fields */
++ 	memset(ghcb->save.valid_bitmap, 0, sizeof(ghcb->save.valid_bitmap));
++ }
++ 
++ static int sev_es_validate_vmgexit(struct vcpu_svm *svm)
++ {
++ 	struct kvm_vcpu *vcpu;
++ 	struct ghcb *ghcb;
++ 	u64 exit_code = 0;
++ 
++ 	ghcb = svm->ghcb;
++ 
++ 	/* Only GHCB Usage code 0 is supported */
++ 	if (ghcb->ghcb_usage)
++ 		goto vmgexit_err;
++ 
++ 	/*
++ 	 * Retrieve the exit code now even though is may not be marked valid
++ 	 * as it could help with debugging.
++ 	 */
++ 	exit_code = ghcb_get_sw_exit_code(ghcb);
++ 
++ 	if (!ghcb_sw_exit_code_is_valid(ghcb) ||
++ 	    !ghcb_sw_exit_info_1_is_valid(ghcb) ||
++ 	    !ghcb_sw_exit_info_2_is_valid(ghcb))
++ 		goto vmgexit_err;
++ 
++ 	switch (ghcb_get_sw_exit_code(ghcb)) {
++ 	case SVM_EXIT_READ_DR7:
++ 		break;
++ 	case SVM_EXIT_WRITE_DR7:
++ 		if (!ghcb_rax_is_valid(ghcb))
++ 			goto vmgexit_err;
++ 		break;
++ 	case SVM_EXIT_RDTSC:
++ 		break;
++ 	case SVM_EXIT_RDPMC:
++ 		if (!ghcb_rcx_is_valid(ghcb))
++ 			goto vmgexit_err;
++ 		break;
++ 	case SVM_EXIT_CPUID:
++ 		if (!ghcb_rax_is_valid(ghcb) ||
++ 		    !ghcb_rcx_is_valid(ghcb))
++ 			goto vmgexit_err;
++ 		if (ghcb_get_rax(ghcb) == 0xd)
++ 			if (!ghcb_xcr0_is_valid(ghcb))
++ 				goto vmgexit_err;
++ 		break;
++ 	case SVM_EXIT_INVD:
++ 		break;
++ 	case SVM_EXIT_IOIO:
++ 		if (ghcb_get_sw_exit_info_1(ghcb) & SVM_IOIO_STR_MASK) {
++ 			if (!ghcb_sw_scratch_is_valid(ghcb))
++ 				goto vmgexit_err;
++ 		} else {
++ 			if (!(ghcb_get_sw_exit_info_1(ghcb) & SVM_IOIO_TYPE_MASK))
++ 				if (!ghcb_rax_is_valid(ghcb))
++ 					goto vmgexit_err;
++ 		}
++ 		break;
++ 	case SVM_EXIT_MSR:
++ 		if (!ghcb_rcx_is_valid(ghcb))
++ 			goto vmgexit_err;
++ 		if (ghcb_get_sw_exit_info_1(ghcb)) {
++ 			if (!ghcb_rax_is_valid(ghcb) ||
++ 			    !ghcb_rdx_is_valid(ghcb))
++ 				goto vmgexit_err;
++ 		}
++ 		break;
++ 	case SVM_EXIT_VMMCALL:
++ 		if (!ghcb_rax_is_valid(ghcb) ||
++ 		    !ghcb_cpl_is_valid(ghcb))
++ 			goto vmgexit_err;
++ 		break;
++ 	case SVM_EXIT_RDTSCP:
++ 		break;
++ 	case SVM_EXIT_WBINVD:
++ 		break;
++ 	case SVM_EXIT_MONITOR:
++ 		if (!ghcb_rax_is_valid(ghcb) ||
++ 		    !ghcb_rcx_is_valid(ghcb) ||
++ 		    !ghcb_rdx_is_valid(ghcb))
++ 			goto vmgexit_err;
++ 		break;
++ 	case SVM_EXIT_MWAIT:
++ 		if (!ghcb_rax_is_valid(ghcb) ||
++ 		    !ghcb_rcx_is_valid(ghcb))
++ 			goto vmgexit_err;
++ 		break;
++ 	case SVM_VMGEXIT_MMIO_READ:
++ 	case SVM_VMGEXIT_MMIO_WRITE:
++ 		if (!ghcb_sw_scratch_is_valid(ghcb))
++ 			goto vmgexit_err;
++ 		break;
++ 	case SVM_VMGEXIT_NMI_COMPLETE:
++ 	case SVM_VMGEXIT_AP_HLT_LOOP:
++ 	case SVM_VMGEXIT_AP_JUMP_TABLE:
++ 	case SVM_VMGEXIT_UNSUPPORTED_EVENT:
++ 		break;
++ 	default:
++ 		goto vmgexit_err;
++ 	}
++ 
++ 	return 0;
++ 
++ vmgexit_err:
++ 	vcpu = &svm->vcpu;
++ 
++ 	if (ghcb->ghcb_usage) {
++ 		vcpu_unimpl(vcpu, "vmgexit: ghcb usage %#x is not valid\n",
++ 			    ghcb->ghcb_usage);
++ 	} else {
++ 		vcpu_unimpl(vcpu, "vmgexit: exit reason %#llx is not valid\n",
++ 			    exit_code);
++ 		dump_ghcb(svm);
++ 	}
++ 
++ 	vcpu->run->exit_reason = KVM_EXIT_INTERNAL_ERROR;
++ 	vcpu->run->internal.suberror = KVM_INTERNAL_ERROR_UNEXPECTED_EXIT_REASON;
++ 	vcpu->run->internal.ndata = 2;
++ 	vcpu->run->internal.data[0] = exit_code;
++ 	vcpu->run->internal.data[1] = vcpu->arch.last_vmentry_cpu;
++ 
++ 	return -EINVAL;
++ }
++ 
++ static void pre_sev_es_run(struct vcpu_svm *svm)
++ {
++ 	if (!svm->ghcb)
++ 		return;
++ 
++ 	if (svm->ghcb_sa_free) {
++ 		/*
++ 		 * The scratch area lives outside the GHCB, so there is a
++ 		 * buffer that, depending on the operation performed, may
++ 		 * need to be synced, then freed.
++ 		 */
++ 		if (svm->ghcb_sa_sync) {
++ 			kvm_write_guest(svm->vcpu.kvm,
++ 					ghcb_get_sw_scratch(svm->ghcb),
++ 					svm->ghcb_sa, svm->ghcb_sa_len);
++ 			svm->ghcb_sa_sync = false;
++ 		}
++ 
++ 		kfree(svm->ghcb_sa);
++ 		svm->ghcb_sa = NULL;
++ 		svm->ghcb_sa_free = false;
++ 	}
++ 
++ 	trace_kvm_vmgexit_exit(svm->vcpu.vcpu_id, svm->ghcb);
++ 
++ 	sev_es_sync_to_ghcb(svm);
++ 
++ 	kvm_vcpu_unmap(&svm->vcpu, &svm->ghcb_map, true);
++ 	svm->ghcb = NULL;
++ }
++ 
+++>>>>>>> 250091409a4a (KVM: SVM: Unconditionally sync GPRs to GHCB on VMRUN of SEV-ES guest)
+  void pre_sev_run(struct vcpu_svm *svm, int cpu)
+  {
+  	struct svm_cpu_data *sd = per_cpu(svm_data, cpu);
+* Unmerged path arch/x86/kvm/svm/sev.c
