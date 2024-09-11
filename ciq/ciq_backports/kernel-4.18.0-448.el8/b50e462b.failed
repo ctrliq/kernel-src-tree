@@ -1,0 +1,138 @@
+net/sched: act_police: Add extack messages for offload failure
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-448.el8
+commit-author Ido Schimmel <idosch@nvidia.com>
+commit b50e462bc22df4488ec04d85606646e3db5952b8
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-448.el8/b50e462b.failed
+
+For better error reporting to user space, add extack messages when
+police action offload fails.
+
+Example:
+
+ # echo 1 > /sys/kernel/tracing/events/netlink/netlink_extack/enable
+
+ # tc filter add dev dummy0 ingress pref 1 proto all matchall skip_sw action police rate 100Mbit burst 10000
+ Error: cls_matchall: Failed to setup flow action.
+ We have an error talking to the kernel
+
+ # cat /sys/kernel/tracing/trace_pipe
+       tc-182     [000] b..1.    21.592969: netlink_extack: msg=act_police: Offload not supported when conform/exceed action is "reclassify"
+       tc-182     [000] .....    21.592982: netlink_extack: msg=cls_matchall: Failed to setup flow action
+
+ # tc filter add dev dummy0 ingress pref 1 proto all matchall skip_sw action police rate 100Mbit burst 10000 conform-exceed drop/continue
+ Error: cls_matchall: Failed to setup flow action.
+ We have an error talking to the kernel
+
+ # cat /sys/kernel/tracing/trace_pipe
+       tc-184     [000] b..1.    38.882579: netlink_extack: msg=act_police: Offload not supported when conform/exceed action is "continue"
+       tc-184     [000] .....    38.882593: netlink_extack: msg=cls_matchall: Failed to setup flow action
+
+	Signed-off-by: Ido Schimmel <idosch@nvidia.com>
+	Reviewed-by: Petr Machata <petrm@nvidia.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit b50e462bc22df4488ec04d85606646e3db5952b8)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/sched/act_police.c
+diff --cc net/sched/act_police.c
+index ff539596b715,79c8901f66ab..000000000000
+--- a/net/sched/act_police.c
++++ b/net/sched/act_police.c
+@@@ -423,6 -419,88 +423,91 @@@ static int tcf_police_search(struct ne
+  	return tcf_idr_search(tn, a, index);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static int tcf_police_act_to_flow_act(int tc_act, u32 *extval,
++ 				      struct netlink_ext_ack *extack)
++ {
++ 	int act_id = -EOPNOTSUPP;
++ 
++ 	if (!TC_ACT_EXT_OPCODE(tc_act)) {
++ 		if (tc_act == TC_ACT_OK)
++ 			act_id = FLOW_ACTION_ACCEPT;
++ 		else if (tc_act ==  TC_ACT_SHOT)
++ 			act_id = FLOW_ACTION_DROP;
++ 		else if (tc_act == TC_ACT_PIPE)
++ 			act_id = FLOW_ACTION_PIPE;
++ 		else if (tc_act == TC_ACT_RECLASSIFY)
++ 			NL_SET_ERR_MSG_MOD(extack, "Offload not supported when conform/exceed action is \"reclassify\"");
++ 		else
++ 			NL_SET_ERR_MSG_MOD(extack, "Unsupported conform/exceed action offload");
++ 	} else if (TC_ACT_EXT_CMP(tc_act, TC_ACT_GOTO_CHAIN)) {
++ 		act_id = FLOW_ACTION_GOTO;
++ 		*extval = tc_act & TC_ACT_EXT_VAL_MASK;
++ 	} else if (TC_ACT_EXT_CMP(tc_act, TC_ACT_JUMP)) {
++ 		act_id = FLOW_ACTION_JUMP;
++ 		*extval = tc_act & TC_ACT_EXT_VAL_MASK;
++ 	} else if (tc_act == TC_ACT_UNSPEC) {
++ 		NL_SET_ERR_MSG_MOD(extack, "Offload not supported when conform/exceed action is \"continue\"");
++ 	} else {
++ 		NL_SET_ERR_MSG_MOD(extack, "Unsupported conform/exceed action offload");
++ 	}
++ 
++ 	return act_id;
++ }
++ 
++ static int tcf_police_offload_act_setup(struct tc_action *act, void *entry_data,
++ 					u32 *index_inc, bool bind,
++ 					struct netlink_ext_ack *extack)
++ {
++ 	if (bind) {
++ 		struct flow_action_entry *entry = entry_data;
++ 		struct tcf_police *police = to_police(act);
++ 		struct tcf_police_params *p;
++ 		int act_id;
++ 
++ 		p = rcu_dereference_protected(police->params,
++ 					      lockdep_is_held(&police->tcf_lock));
++ 
++ 		entry->id = FLOW_ACTION_POLICE;
++ 		entry->police.burst = tcf_police_burst(act);
++ 		entry->police.rate_bytes_ps =
++ 			tcf_police_rate_bytes_ps(act);
++ 		entry->police.peakrate_bytes_ps = tcf_police_peakrate_bytes_ps(act);
++ 		entry->police.avrate = tcf_police_tcfp_ewma_rate(act);
++ 		entry->police.overhead = tcf_police_rate_overhead(act);
++ 		entry->police.burst_pkt = tcf_police_burst_pkt(act);
++ 		entry->police.rate_pkt_ps =
++ 			tcf_police_rate_pkt_ps(act);
++ 		entry->police.mtu = tcf_police_tcfp_mtu(act);
++ 
++ 		act_id = tcf_police_act_to_flow_act(police->tcf_action,
++ 						    &entry->police.exceed.extval,
++ 						    extack);
++ 		if (act_id < 0)
++ 			return act_id;
++ 
++ 		entry->police.exceed.act_id = act_id;
++ 
++ 		act_id = tcf_police_act_to_flow_act(p->tcfp_result,
++ 						    &entry->police.notexceed.extval,
++ 						    extack);
++ 		if (act_id < 0)
++ 			return act_id;
++ 
++ 		entry->police.notexceed.act_id = act_id;
++ 
++ 		*index_inc = 1;
++ 	} else {
++ 		struct flow_offload_action *fl_action = entry_data;
++ 
++ 		fl_action->id = FLOW_ACTION_POLICE;
++ 	}
++ 
++ 	return 0;
++ }
++ 
+++>>>>>>> b50e462bc22d (net/sched: act_police: Add extack messages for offload failure)
+  MODULE_AUTHOR("Alexey Kuznetsov");
+  MODULE_DESCRIPTION("Policing actions");
+  MODULE_LICENSE("GPL");
+* Unmerged path net/sched/act_police.c
