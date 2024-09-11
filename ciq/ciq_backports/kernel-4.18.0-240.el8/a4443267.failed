@@ -1,0 +1,121 @@
+KVM: nVMX: clear PIN_BASED_POSTED_INTR from nested pinbased_ctls only when apicv is globally disabled
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Vitaly Kuznetsov <vkuznets@redhat.com>
+commit a4443267800af240072280c44521caab61924e55
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/a4443267.failed
+
+When apicv is disabled on a vCPU (e.g. by enabling KVM_CAP_HYPERV_SYNIC*),
+nothing happens to VMX MSRs on the already existing vCPUs, however, all new
+ones are created with PIN_BASED_POSTED_INTR filtered out. This is very
+confusing and results in the following picture inside the guest:
+
+$ rdmsr -ax 0x48d
+ff00000016
+7f00000016
+7f00000016
+7f00000016
+
+This is observed with QEMU and 4-vCPU guest: QEMU creates vCPU0, does
+KVM_CAP_HYPERV_SYNIC2 and then creates the remaining three.
+
+L1 hypervisor may only check CPU0's controls to find out what features
+are available and it will be very confused later. Switch to setting
+PIN_BASED_POSTED_INTR control based on global 'enable_apicv' setting.
+
+	Signed-off-by: Vitaly Kuznetsov <vkuznets@redhat.com>
+	Cc: stable@vger.kernel.org
+	Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+(cherry picked from commit a4443267800af240072280c44521caab61924e55)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kvm/vmx/capabilities.h
+#	arch/x86/kvm/vmx/vmx.c
+diff --cc arch/x86/kvm/vmx/capabilities.h
+index 23d252ff18cd,f486e2606247..000000000000
+--- a/arch/x86/kvm/vmx/capabilities.h
++++ b/arch/x86/kvm/vmx/capabilities.h
+@@@ -13,7 -13,6 +13,10 @@@ extern bool __read_mostly enable_unrest
+  extern bool __read_mostly enable_ept_ad_bits;
+  extern bool __read_mostly enable_pml;
+  extern bool __read_mostly enable_apicv;
+++<<<<<<< HEAD
+ +extern int __read_mostly nested;
+++=======
+++>>>>>>> a4443267800a (KVM: nVMX: clear PIN_BASED_POSTED_INTR from nested pinbased_ctls only when apicv is globally disabled)
+  extern int __read_mostly pt_mode;
+  
+  #define PT_MODE_SYSTEM		0
+diff --cc arch/x86/kvm/vmx/vmx.c
+index bd30a45cd465,404dafedd778..000000000000
+--- a/arch/x86/kvm/vmx/vmx.c
++++ b/arch/x86/kvm/vmx/vmx.c
+@@@ -6856,8 -6769,7 +6856,12 @@@ static struct kvm_vcpu *vmx_create_vcpu
+  
+  	if (nested)
+  		nested_vmx_setup_ctls_msrs(&vmx->nested.msrs,
+++<<<<<<< HEAD
+ +					   vmx_capability.ept,
+ +					   kvm_vcpu_apicv_active(&vmx->vcpu));
+++=======
++ 					   vmx_capability.ept);
+++>>>>>>> a4443267800a (KVM: nVMX: clear PIN_BASED_POSTED_INTR from nested pinbased_ctls only when apicv is globally disabled)
+  	else
+  		memset(&vmx->nested.msrs, 0, sizeof(vmx->nested.msrs));
+  
+@@@ -7806,6 -7711,9 +7809,12 @@@ static __init int hardware_setup(void
+  		pt_mode = PT_MODE_SYSTEM;
+  
+  	if (nested) {
+++<<<<<<< HEAD
+++=======
++ 		nested_vmx_setup_ctls_msrs(&vmcs_config.nested,
++ 					   vmx_capability.ept);
++ 
+++>>>>>>> a4443267800a (KVM: nVMX: clear PIN_BASED_POSTED_INTR from nested pinbased_ctls only when apicv is globally disabled)
+  		r = nested_vmx_hardware_setup(kvm_vmx_exit_handlers);
+  		if (r)
+  			return r;
+* Unmerged path arch/x86/kvm/vmx/capabilities.h
+diff --git a/arch/x86/kvm/vmx/nested.c b/arch/x86/kvm/vmx/nested.c
+index f2e63bf9b73c..24e888be5b29 100644
+--- a/arch/x86/kvm/vmx/nested.c
++++ b/arch/x86/kvm/vmx/nested.c
+@@ -5949,8 +5949,7 @@ void nested_vmx_set_vmcs_shadowing_bitmap(void)
+  * bit in the high half is on if the corresponding bit in the control field
+  * may be on. See also vmx_control_verify().
+  */
+-void nested_vmx_setup_ctls_msrs(struct nested_vmx_msrs *msrs, u32 ept_caps,
+-				bool apicv)
++void nested_vmx_setup_ctls_msrs(struct nested_vmx_msrs *msrs, u32 ept_caps)
+ {
+ 	/*
+ 	 * Note that as a general rule, the high half of the MSRs (bits in
+@@ -5977,7 +5976,7 @@ void nested_vmx_setup_ctls_msrs(struct nested_vmx_msrs *msrs, u32 ept_caps,
+ 		PIN_BASED_EXT_INTR_MASK |
+ 		PIN_BASED_NMI_EXITING |
+ 		PIN_BASED_VIRTUAL_NMIS |
+-		(apicv ? PIN_BASED_POSTED_INTR : 0);
++		(enable_apicv ? PIN_BASED_POSTED_INTR : 0);
+ 	msrs->pinbased_ctls_high |=
+ 		PIN_BASED_ALWAYSON_WITHOUT_TRUE_MSR |
+ 		PIN_BASED_VMX_PREEMPTION_TIMER;
+diff --git a/arch/x86/kvm/vmx/nested.h b/arch/x86/kvm/vmx/nested.h
+index fc874d4ead0f..1c5fbff45d69 100644
+--- a/arch/x86/kvm/vmx/nested.h
++++ b/arch/x86/kvm/vmx/nested.h
+@@ -17,8 +17,7 @@ enum nvmx_vmentry_status {
+ };
+ 
+ void vmx_leave_nested(struct kvm_vcpu *vcpu);
+-void nested_vmx_setup_ctls_msrs(struct nested_vmx_msrs *msrs, u32 ept_caps,
+-				bool apicv);
++void nested_vmx_setup_ctls_msrs(struct nested_vmx_msrs *msrs, u32 ept_caps);
+ void nested_vmx_hardware_unsetup(void);
+ __init int nested_vmx_hardware_setup(int (*exit_handlers[])(struct kvm_vcpu *));
+ void nested_vmx_set_vmcs_shadowing_bitmap(void);
+* Unmerged path arch/x86/kvm/vmx/vmx.c
