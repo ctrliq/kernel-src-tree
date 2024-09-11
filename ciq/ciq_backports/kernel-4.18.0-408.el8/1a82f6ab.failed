@@ -1,0 +1,420 @@
+s390/uaccess: Add copy_from/to_user_key functions
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-408.el8
+commit-author Janis Schoetterl-Glausch <scgl@linux.ibm.com>
+commit 1a82f6ab23659aa01a796d9d444ec9cc63ded26c
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-408.el8/1a82f6ab.failed
+
+Add copy_from/to_user_key functions, which perform storage key checking.
+These functions can be used by KVM for emulating instructions that need
+to be key checked.
+These functions differ from their non _key counterparts in
+include/linux/uaccess.h only in the additional key argument and must be
+kept in sync with those.
+
+Since the existing uaccess implementation on s390 makes use of move
+instructions that support having an additional access key supplied,
+we can implement raw_copy_from/to_user_key by enhancing the
+existing implementation.
+
+	Signed-off-by: Janis Schoetterl-Glausch <scgl@linux.ibm.com>
+	Acked-by: Heiko Carstens <hca@linux.ibm.com>
+	Reviewed-by: Christian Borntraeger <borntraeger@linux.ibm.com>
+	Acked-by: Janosch Frank <frankja@linux.ibm.com>
+Link: https://lore.kernel.org/r/20220211182215.2730017-2-scgl@linux.ibm.com
+	Signed-off-by: Christian Borntraeger <borntraeger@linux.ibm.com>
+(cherry picked from commit 1a82f6ab23659aa01a796d9d444ec9cc63ded26c)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/s390/include/asm/uaccess.h
+#	arch/s390/lib/uaccess.c
+diff --cc arch/s390/include/asm/uaccess.h
+index 21ece00e3129,ba1bcb91af95..000000000000
+--- a/arch/s390/include/asm/uaccess.h
++++ b/arch/s390/include/asm/uaccess.h
+@@@ -61,32 -44,90 +61,82 @@@ raw_copy_to_user(void __user *to, cons
+  #define INLINE_COPY_TO_USER
+  #endif
+  
+++<<<<<<< HEAD
+++=======
++ unsigned long __must_check
++ _copy_from_user_key(void *to, const void __user *from, unsigned long n, unsigned long key);
++ 
++ static __always_inline unsigned long __must_check
++ copy_from_user_key(void *to, const void __user *from, unsigned long n, unsigned long key)
++ {
++ 	if (likely(check_copy_size(to, n, false)))
++ 		n = _copy_from_user_key(to, from, n, key);
++ 	return n;
++ }
++ 
++ unsigned long __must_check
++ _copy_to_user_key(void __user *to, const void *from, unsigned long n, unsigned long key);
++ 
++ static __always_inline unsigned long __must_check
++ copy_to_user_key(void __user *to, const void *from, unsigned long n, unsigned long key)
++ {
++ 	if (likely(check_copy_size(from, n, true)))
++ 		n = _copy_to_user_key(to, from, n, key);
++ 	return n;
++ }
++ 
++ int __put_user_bad(void) __attribute__((noreturn));
++ int __get_user_bad(void) __attribute__((noreturn));
++ 
++ union oac {
++ 	unsigned int val;
++ 	struct {
++ 		struct {
++ 			unsigned short key : 4;
++ 			unsigned short	   : 4;
++ 			unsigned short as  : 2;
++ 			unsigned short	   : 4;
++ 			unsigned short k   : 1;
++ 			unsigned short a   : 1;
++ 		} oac1;
++ 		struct {
++ 			unsigned short key : 4;
++ 			unsigned short	   : 4;
++ 			unsigned short as  : 2;
++ 			unsigned short	   : 4;
++ 			unsigned short k   : 1;
++ 			unsigned short a   : 1;
++ 		} oac2;
++ 	};
++ };
++ 
+++>>>>>>> 1a82f6ab2365 (s390/uaccess: Add copy_from/to_user_key functions)
+  #ifdef CONFIG_HAVE_MARCH_Z10_FEATURES
+  
+ -#define __put_get_user_asm(to, from, size, oac_spec)			\
+ -({									\
+ -	int __rc;							\
+ -									\
+ -	asm volatile(							\
+ -		"	lr	0,%[spec]\n"				\
+ -		"0:	mvcos	%[_to],%[_from],%[_size]\n"		\
+ -		"1:	xr	%[rc],%[rc]\n"				\
+ -		"2:\n"							\
+ -		".pushsection .fixup, \"ax\"\n"				\
+ -		"3:	lhi	%[rc],%[retval]\n"			\
+ -		"	jg	2b\n"					\
+ -		".popsection\n"						\
+ -		EX_TABLE(0b,3b) EX_TABLE(1b,3b)				\
+ -		: [rc] "=&d" (__rc), [_to] "+Q" (*(to))			\
+ -		: [_size] "d" (size), [_from] "Q" (*(from)),		\
+ -		  [retval] "K" (-EFAULT), [spec] "d" (oac_spec.val)	\
+ -		: "cc", "0");						\
+ -	__rc;								\
+ +#define __put_get_user_asm(to, from, size, spec)		\
+ +({								\
+ +	register unsigned long __reg0 asm("0") = spec;		\
+ +	int __rc;						\
+ +								\
+ +	asm volatile(						\
+ +		"0:	mvcos	%1,%3,%2\n"			\
+ +		"1:	xr	%0,%0\n"			\
+ +		"2:\n"						\
+ +		".pushsection .fixup, \"ax\"\n"			\
+ +		"3:	lhi	%0,%5\n"			\
+ +		"	jg	2b\n"				\
+ +		".popsection\n"					\
+ +		EX_TABLE(0b,3b) EX_TABLE(1b,3b)			\
+ +		: "=d" (__rc), "+Q" (*(to))			\
+ +		: "d" (size), "Q" (*(from)),			\
+ +		  "d" (__reg0), "K" (-EFAULT)			\
+ +		: "cc");					\
+ +	__rc;							\
+  })
+  
+ -#define __put_user_asm(to, from, size)				\
+ -	__put_get_user_asm(to, from, size, ((union oac) {	\
+ -		.oac1.as = PSW_BITS_AS_SECONDARY,		\
+ -		.oac1.a = 1					\
+ -	}))
+ -
+ -#define __get_user_asm(to, from, size)				\
+ -	__put_get_user_asm(to, from, size, ((union oac) {	\
+ -		.oac2.as = PSW_BITS_AS_SECONDARY,		\
+ -		.oac2.a = 1					\
+ -	}))							\
+ -
+ -static __always_inline int __put_user_fn(void *x, void __user *ptr, unsigned long size)
+ +static inline int __put_user_fn(void *x, void __user *ptr, unsigned long size)
+  {
+ +	unsigned long spec = 0x010000UL;
+  	int rc;
+  
+  	switch (size) {
+diff --cc arch/s390/lib/uaccess.c
+index 0267405ab7c6,b709239feb5d..000000000000
+--- a/arch/s390/lib/uaccess.c
++++ b/arch/s390/lib/uaccess.c
+@@@ -40,72 -58,16 +40,81 @@@ static inline int copy_with_mvcos(void
+  }
+  #endif
+  
+ +void set_fs(mm_segment_t fs)
+ +{
+ +	current->thread.mm_segment = fs;
+ +	if (fs == USER_DS) {
+ +		__ctl_load(S390_lowcore.user_asce, 1, 1);
+ +		clear_cpu_flag(CIF_ASCE_PRIMARY);
+ +	} else {
+ +		__ctl_load(S390_lowcore.kernel_asce, 1, 1);
+ +		set_cpu_flag(CIF_ASCE_PRIMARY);
+ +	}
+ +	if (fs & 1) {
+ +		if (fs == USER_DS_SACF)
+ +			__ctl_load(S390_lowcore.user_asce, 7, 7);
+ +		else
+ +			__ctl_load(S390_lowcore.kernel_asce, 7, 7);
+ +		set_cpu_flag(CIF_ASCE_SECONDARY);
+ +	}
+ +}
+ +EXPORT_SYMBOL(set_fs);
+ +
+ +mm_segment_t enable_sacf_uaccess(void)
+ +{
+ +	mm_segment_t old_fs;
+ +	unsigned long asce, cr;
+ +	unsigned long flags;
+ +
+ +	old_fs = current->thread.mm_segment;
+ +	if (old_fs & 1)
+ +		return old_fs;
+ +	/* protect against a concurrent page table upgrade */
+ +	local_irq_save(flags);
+ +	current->thread.mm_segment |= 1;
+ +	asce = S390_lowcore.kernel_asce;
+ +	if (likely(old_fs == USER_DS)) {
+ +		__ctl_store(cr, 1, 1);
+ +		if (cr != S390_lowcore.kernel_asce) {
+ +			__ctl_load(S390_lowcore.kernel_asce, 1, 1);
+ +			set_cpu_flag(CIF_ASCE_PRIMARY);
+ +		}
+ +		asce = S390_lowcore.user_asce;
+ +	}
+ +	__ctl_store(cr, 7, 7);
+ +	if (cr != asce) {
+ +		__ctl_load(asce, 7, 7);
+ +		set_cpu_flag(CIF_ASCE_SECONDARY);
+ +	}
+ +	local_irq_restore(flags);
+ +	return old_fs;
+ +}
+ +EXPORT_SYMBOL(enable_sacf_uaccess);
+ +
+ +void disable_sacf_uaccess(mm_segment_t old_fs)
+ +{
+ +	current->thread.mm_segment = old_fs;
+ +	if (old_fs == USER_DS && test_facility(27)) {
+ +		__ctl_load(S390_lowcore.user_asce, 1, 1);
+ +		clear_cpu_flag(CIF_ASCE_PRIMARY);
+ +	}
+ +}
+ +EXPORT_SYMBOL(disable_sacf_uaccess);
+ +
+  static inline unsigned long copy_from_user_mvcos(void *x, const void __user *ptr,
+- 						 unsigned long size)
++ 						 unsigned long size, unsigned long key)
+  {
+ +	register unsigned long reg0 asm("0") = 0x01UL;
+  	unsigned long tmp1, tmp2;
+++<<<<<<< HEAD
+++=======
++ 	union oac spec = {
++ 		.oac2.key = key,
++ 		.oac2.as = PSW_BITS_AS_SECONDARY,
++ 		.oac2.k = 1,
++ 		.oac2.a = 1,
++ 	};
+++>>>>>>> 1a82f6ab2365 (s390/uaccess: Add copy_from/to_user_key functions)
+  
+  	tmp1 = -4096UL;
+  	asm volatile(
+@@@ -132,12 -96,10 +141,12 @@@
+  }
+  
+  static inline unsigned long copy_from_user_mvcp(void *x, const void __user *ptr,
+- 						unsigned long size)
++ 						unsigned long size, unsigned long key)
+  {
+  	unsigned long tmp1, tmp2;
+ +	mm_segment_t old_fs;
+  
+ +	old_fs = enable_sacf_uaccess();
+  	tmp1 = -256UL;
+  	asm volatile(
+  		"   sacf  0\n"
+@@@ -163,8 -125,8 +172,13 @@@
+  		EX_TABLE(0b,3b) EX_TABLE(2b,3b) EX_TABLE(4b,6b)
+  		EX_TABLE(7b,3b) EX_TABLE(8b,3b) EX_TABLE(9b,6b)
+  		: "+a" (size), "+a" (ptr), "+a" (x), "+a" (tmp1), "=a" (tmp2)
+++<<<<<<< HEAD
+ +		: : "cc", "memory");
+ +	disable_sacf_uaccess(old_fs);
+++=======
++ 		: [key] "d" (key << 4)
++ 		: "cc", "memory");
+++>>>>>>> 1a82f6ab2365 (s390/uaccess: Add copy_from/to_user_key functions)
+  	return size;
+  }
+  
+@@@ -176,11 -144,32 +196,36 @@@ unsigned long raw_copy_from_user(void *
+  }
+  EXPORT_SYMBOL(raw_copy_from_user);
+  
++ unsigned long _copy_from_user_key(void *to, const void __user *from,
++ 				  unsigned long n, unsigned long key)
++ {
++ 	unsigned long res = n;
++ 
++ 	might_fault();
++ 	if (!should_fail_usercopy()) {
++ 		instrument_copy_from_user(to, from, n);
++ 		res = raw_copy_from_user_key(to, from, n, key);
++ 	}
++ 	if (unlikely(res))
++ 		memset(to + (n - res), 0, res);
++ 	return res;
++ }
++ EXPORT_SYMBOL(_copy_from_user_key);
++ 
+  static inline unsigned long copy_to_user_mvcos(void __user *ptr, const void *x,
+- 					       unsigned long size)
++ 					       unsigned long size, unsigned long key)
+  {
+ +	register unsigned long reg0 asm("0") = 0x010000UL;
+  	unsigned long tmp1, tmp2;
+++<<<<<<< HEAD
+++=======
++ 	union oac spec = {
++ 		.oac1.key = key,
++ 		.oac1.as = PSW_BITS_AS_SECONDARY,
++ 		.oac1.k = 1,
++ 		.oac1.a = 1,
++ 	};
+++>>>>>>> 1a82f6ab2365 (s390/uaccess: Add copy_from/to_user_key functions)
+  
+  	tmp1 = -4096UL;
+  	asm volatile(
+@@@ -207,12 -198,10 +252,12 @@@
+  }
+  
+  static inline unsigned long copy_to_user_mvcs(void __user *ptr, const void *x,
+- 					      unsigned long size)
++ 					      unsigned long size, unsigned long key)
+  {
+  	unsigned long tmp1, tmp2;
+ +	mm_segment_t old_fs;
+  
+ +	old_fs = enable_sacf_uaccess();
+  	tmp1 = -256UL;
+  	asm volatile(
+  		"   sacf  0\n"
+@@@ -238,8 -227,8 +283,13 @@@
+  		EX_TABLE(0b,3b) EX_TABLE(2b,3b) EX_TABLE(4b,6b)
+  		EX_TABLE(7b,3b) EX_TABLE(8b,3b) EX_TABLE(9b,6b)
+  		: "+a" (size), "+a" (ptr), "+a" (x), "+a" (tmp1), "=a" (tmp2)
+++<<<<<<< HEAD
+ +		: : "cc", "memory");
+ +	disable_sacf_uaccess(old_fs);
+++=======
++ 		: [key] "d" (key << 4)
++ 		: "cc", "memory");
+++>>>>>>> 1a82f6ab2365 (s390/uaccess: Add copy_from/to_user_key functions)
+  	return size;
+  }
+  
+@@@ -251,70 -246,16 +307,83 @@@ unsigned long raw_copy_to_user(void __u
+  }
+  EXPORT_SYMBOL(raw_copy_to_user);
+  
+++<<<<<<< HEAD
+ +static inline unsigned long copy_in_user_mvcos(void __user *to, const void __user *from,
+ +					       unsigned long size)
+ +{
+ +	register unsigned long reg0 asm("0") = 0x010001UL;
+ +	unsigned long tmp1, tmp2;
+ +
+ +	tmp1 = -4096UL;
+ +	/* FIXME: copy with reduced length. */
+ +	asm volatile(
+ +		"0: .insn ss,0xc80000000000,0(%0,%1),0(%2),0\n"
+ +		"   jz	  2f\n"
+ +		"1: algr  %0,%3\n"
+ +		"   slgr  %1,%3\n"
+ +		"   slgr  %2,%3\n"
+ +		"   j	  0b\n"
+ +		"2:slgr  %0,%0\n"
+ +		"3: \n"
+ +		EX_TABLE(0b,3b)
+ +		: "+a" (size), "+a" (to), "+a" (from), "+a" (tmp1), "=a" (tmp2)
+ +		: "d" (reg0) : "cc", "memory");
+ +	return size;
+ +}
+ +
+ +static inline unsigned long copy_in_user_mvc(void __user *to, const void __user *from,
+ +					     unsigned long size)
+ +{
+ +	mm_segment_t old_fs;
+ +	unsigned long tmp1;
+ +
+ +	old_fs = enable_sacf_uaccess();
+ +	asm volatile(
+ +		"   sacf  256\n"
+ +		"   aghi  %0,-1\n"
+ +		"   jo	  5f\n"
+ +		"   bras  %3,3f\n"
+ +		"0: aghi  %0,257\n"
+ +		"1: mvc	  0(1,%1),0(%2)\n"
+ +		"   la	  %1,1(%1)\n"
+ +		"   la	  %2,1(%2)\n"
+ +		"   aghi  %0,-1\n"
+ +		"   jnz	  1b\n"
+ +		"   j	  5f\n"
+ +		"2: mvc	  0(256,%1),0(%2)\n"
+ +		"   la	  %1,256(%1)\n"
+ +		"   la	  %2,256(%2)\n"
+ +		"3: aghi  %0,-256\n"
+ +		"   jnm	  2b\n"
+ +		"4: ex	  %0,1b-0b(%3)\n"
+ +		"5: slgr  %0,%0\n"
+ +		"6: sacf  768\n"
+ +		EX_TABLE(1b,6b) EX_TABLE(2b,0b) EX_TABLE(4b,0b)
+ +		: "+a" (size), "+a" (to), "+a" (from), "=a" (tmp1)
+ +		: : "cc", "memory");
+ +	disable_sacf_uaccess(old_fs);
+ +	return size;
+ +}
+ +
+ +unsigned long raw_copy_in_user(void __user *to, const void __user *from, unsigned long n)
+ +{
+ +	if (copy_with_mvcos())
+ +		return copy_in_user_mvcos(to, from, n);
+ +	return copy_in_user_mvc(to, from, n);
+ +}
+ +EXPORT_SYMBOL(raw_copy_in_user);
+++=======
++ unsigned long _copy_to_user_key(void __user *to, const void *from,
++ 				unsigned long n, unsigned long key)
++ {
++ 	might_fault();
++ 	if (should_fail_usercopy())
++ 		return n;
++ 	instrument_copy_to_user(to, from, n);
++ 	return raw_copy_to_user_key(to, from, n, key);
++ }
++ EXPORT_SYMBOL(_copy_to_user_key);
+++>>>>>>> 1a82f6ab2365 (s390/uaccess: Add copy_from/to_user_key functions)
+  
+  static inline unsigned long clear_user_mvcos(void __user *to, unsigned long size)
+  {
+* Unmerged path arch/s390/include/asm/uaccess.h
+* Unmerged path arch/s390/lib/uaccess.c
