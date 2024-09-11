@@ -1,0 +1,117 @@
+KVM: x86: More precisely identify NMI from guest when handling PMI
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-408.el8
+commit-author Sean Christopherson <seanjc@google.com>
+commit db215756ae5970aec8ad50257d2eb1678b552b91
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-408.el8/db215756.failed
+
+Differentiate between IRQ and NMI for KVM's PMC overflow callback, which
+was originally invoked in response to an NMI that arrived while the guest
+was running, but was inadvertantly changed to fire on IRQs as well when
+support for perf without PMU/NMI was added to KVM.  In practice, this
+should be a nop as the PMC overflow callback shouldn't be reached, but
+it's a cheap and easy fix that also better documents the situation.
+
+Note, this also doesn't completely prevent false positives if perf
+somehow ends up calling into KVM, e.g. an NMI can arrive in host after
+KVM sets its flag.
+
+Fixes: dd60d217062f ("KVM: x86: Fix perf timer mode IP reporting")
+	Signed-off-by: Sean Christopherson <seanjc@google.com>
+	Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+	Reviewed-by: Paolo Bonzini <pbonzini@redhat.com>
+Link: https://lore.kernel.org/r/20211111020738.2512932-12-seanjc@google.com
+(cherry picked from commit db215756ae5970aec8ad50257d2eb1678b552b91)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kvm/x86.h
+diff --cc arch/x86/kvm/x86.h
+index 072bc69d2fd3,f8d2c58feadc..000000000000
+--- a/arch/x86/kvm/x86.h
++++ b/arch/x86/kvm/x86.h
+@@@ -385,18 -385,27 +385,38 @@@ static inline bool kvm_cstate_in_guest(
+  	return kvm->arch.cstate_in_guest;
+  }
+  
+++<<<<<<< HEAD
+ +DECLARE_PER_CPU(struct kvm_vcpu *, current_vcpu);
+ +
+ +static inline void kvm_before_interrupt(struct kvm_vcpu *vcpu)
+ +{
+ +	__this_cpu_write(current_vcpu, vcpu);
+++=======
++ enum kvm_intr_type {
++ 	/* Values are arbitrary, but must be non-zero. */
++ 	KVM_HANDLING_IRQ = 1,
++ 	KVM_HANDLING_NMI,
++ };
++ 
++ static inline void kvm_before_interrupt(struct kvm_vcpu *vcpu,
++ 					enum kvm_intr_type intr)
++ {
++ 	WRITE_ONCE(vcpu->arch.handling_intr_from_guest, (u8)intr);
+++>>>>>>> db215756ae59 (KVM: x86: More precisely identify NMI from guest when handling PMI)
+  }
+  
+  static inline void kvm_after_interrupt(struct kvm_vcpu *vcpu)
+  {
+ -	WRITE_ONCE(vcpu->arch.handling_intr_from_guest, 0);
+ +	__this_cpu_write(current_vcpu, NULL);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static inline bool kvm_handling_nmi_from_guest(struct kvm_vcpu *vcpu)
++ {
++ 	return vcpu->arch.handling_intr_from_guest == KVM_HANDLING_NMI;
++ }
+++>>>>>>> db215756ae59 (KVM: x86: More precisely identify NMI from guest when handling PMI)
+  
+  static inline bool kvm_pat_valid(u64 data)
+  {
+diff --git a/arch/x86/kvm/svm/svm.c b/arch/x86/kvm/svm/svm.c
+index 76e9a76063b5..6bc4560a6b9c 100644
+--- a/arch/x86/kvm/svm/svm.c
++++ b/arch/x86/kvm/svm/svm.c
+@@ -3930,7 +3930,7 @@ static fastpath_t svm_vcpu_run(struct kvm_vcpu *vcpu)
+ 	}
+ 
+ 	if (unlikely(svm->vmcb->control.exit_code == SVM_EXIT_NMI))
+-		kvm_before_interrupt(vcpu);
++		kvm_before_interrupt(vcpu, KVM_HANDLING_NMI);
+ 
+ 	kvm_load_host_xsave_state(vcpu);
+ 	stgi();
+diff --git a/arch/x86/kvm/vmx/vmx.c b/arch/x86/kvm/vmx/vmx.c
+index d518f34a1bf5..15052c8fc660 100644
+--- a/arch/x86/kvm/vmx/vmx.c
++++ b/arch/x86/kvm/vmx/vmx.c
+@@ -6332,7 +6332,9 @@ void vmx_do_interrupt_nmi_irqoff(unsigned long entry);
+ static void handle_interrupt_nmi_irqoff(struct kvm_vcpu *vcpu,
+ 					unsigned long entry)
+ {
+-	kvm_before_interrupt(vcpu);
++	bool is_nmi = entry == (unsigned long)asm_exc_nmi_noist;
++
++	kvm_before_interrupt(vcpu, is_nmi ? KVM_HANDLING_NMI : KVM_HANDLING_IRQ);
+ 	vmx_do_interrupt_nmi_irqoff(entry);
+ 	kvm_after_interrupt(vcpu);
+ }
+diff --git a/arch/x86/kvm/x86.c b/arch/x86/kvm/x86.c
+index fa9a4666a113..6d12993eb00f 100644
+--- a/arch/x86/kvm/x86.c
++++ b/arch/x86/kvm/x86.c
+@@ -10025,7 +10025,7 @@ static int vcpu_enter_guest(struct kvm_vcpu *vcpu)
+ 	 * interrupts on processors that implement an interrupt shadow, the
+ 	 * stat.exits increment will do nicely.
+ 	 */
+-	kvm_before_interrupt(vcpu);
++	kvm_before_interrupt(vcpu, KVM_HANDLING_IRQ);
+ 	local_irq_enable();
+ 	++vcpu->stat.exits;
+ 	local_irq_disable();
+* Unmerged path arch/x86/kvm/x86.h
