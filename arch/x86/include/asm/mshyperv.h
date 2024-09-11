@@ -49,8 +49,6 @@ void hv_stimer0_callback_vector(void);
 extern int hyperv_init_cpuhp;
 
 extern void *hv_hypercall_pg;
-extern void  __percpu  **hyperv_pcpu_input_arg;
-extern void  __percpu  **hyperv_pcpu_output_arg;
 
 extern u64 hv_current_partition_id;
 
@@ -182,8 +180,6 @@ int hyperv_flush_guest_mapping_range(u64 as,
 int hyperv_fill_flush_guest_mapping_list(
 		struct hv_guest_mapping_flush_list *flush,
 		u64 start_gfn, u64 end_gfn);
-
-extern bool hv_root_partition;
 
 #ifdef CONFIG_X86_64
 void hv_apic_init(void);
