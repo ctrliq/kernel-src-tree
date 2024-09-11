@@ -256,7 +256,10 @@ static bool hw_support_mmap(struct snd_pcm_substream *substream)
 		dmabuf = &substream->dma_buffer;
 	switch (dmabuf->dev.type) {
 	case SNDRV_DMA_TYPE_UNKNOWN:
-		return false;
+		/* we can't know the device, so just assume that the driver does
+		 * everything right
+		 */
+		return true;
 	case SNDRV_DMA_TYPE_CONTINUOUS:
 	case SNDRV_DMA_TYPE_VMALLOC:
 		return true;
