@@ -1,0 +1,189 @@
+mm: fix swap cache node allocation mask
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Hugh Dickins <hughd@google.com>
+commit 243bce09c91b0145aeaedd5afba799d81841c030
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/243bce09.failed
+
+Chris Murphy reports that a slightly overcommitted load, testing swap
+and zram along with i915, splats and keeps on splatting, when it had
+better fail less noisily:
+
+  gnome-shell: page allocation failure: order:0,
+  mode:0x400d0(__GFP_IO|__GFP_FS|__GFP_COMP|__GFP_RECLAIMABLE),
+  nodemask=(null),cpuset=/,mems_allowed=0
+  CPU: 2 PID: 1155 Comm: gnome-shell Not tainted 5.7.0-1.fc33.x86_64 #1
+  Call Trace:
+    dump_stack+0x64/0x88
+    warn_alloc.cold+0x75/0xd9
+    __alloc_pages_slowpath.constprop.0+0xcfa/0xd30
+    __alloc_pages_nodemask+0x2df/0x320
+    alloc_slab_page+0x195/0x310
+    allocate_slab+0x3c5/0x440
+    ___slab_alloc+0x40c/0x5f0
+    __slab_alloc+0x1c/0x30
+    kmem_cache_alloc+0x20e/0x220
+    xas_nomem+0x28/0x70
+    add_to_swap_cache+0x321/0x400
+    __read_swap_cache_async+0x105/0x240
+    swap_cluster_readahead+0x22c/0x2e0
+    shmem_swapin+0x8e/0xc0
+    shmem_swapin_page+0x196/0x740
+    shmem_getpage_gfp+0x3a2/0xa60
+    shmem_read_mapping_page_gfp+0x32/0x60
+    shmem_get_pages+0x155/0x5e0 [i915]
+    __i915_gem_object_get_pages+0x68/0xa0 [i915]
+    i915_vma_pin+0x3fe/0x6c0 [i915]
+    eb_add_vma+0x10b/0x2c0 [i915]
+    i915_gem_do_execbuffer+0x704/0x3430 [i915]
+    i915_gem_execbuffer2_ioctl+0x1ea/0x3e0 [i915]
+    drm_ioctl_kernel+0x86/0xd0 [drm]
+    drm_ioctl+0x206/0x390 [drm]
+    ksys_ioctl+0x82/0xc0
+    __x64_sys_ioctl+0x16/0x20
+    do_syscall_64+0x5b/0xf0
+    entry_SYSCALL_64_after_hwframe+0x44/0xa9
+
+Reported on 5.7, but it goes back really to 3.1: when
+shmem_read_mapping_page_gfp() was implemented for use by i915, and
+allowed for __GFP_NORETRY and __GFP_NOWARN flags in most places, but
+missed swapin's "& GFP_KERNEL" mask for page tree node allocation in
+__read_swap_cache_async() - that was to mask off HIGHUSER_MOVABLE bits
+from what page cache uses, but GFP_RECLAIM_MASK is now what's needed.
+
+Link: https://bugzilla.kernel.org/show_bug.cgi?id=208085
+Link: http://lkml.kernel.org/r/alpine.LSU.2.11.2006151330070.11064@eggly.anvils
+Fixes: 68da9f055755 ("tmpfs: pass gfp to shmem_getpage_gfp")
+	Signed-off-by: Hugh Dickins <hughd@google.com>
+	Reviewed-by: Vlastimil Babka <vbabka@suse.cz>
+	Reviewed-by: Matthew Wilcox (Oracle) <willy@infradead.org>
+	Reported-by: Chris Murphy <lists@colorremedies.com>
+Analyzed-by: Vlastimil Babka <vbabka@suse.cz>
+Analyzed-by: Matthew Wilcox <willy@infradead.org>
+	Tested-by: Chris Murphy <lists@colorremedies.com>
+	Cc: <stable@vger.kernel.org>	[3.1+]
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit 243bce09c91b0145aeaedd5afba799d81841c030)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	mm/swap_state.c
+diff --cc mm/swap_state.c
+index e2aded84261e,05889e8e3c97..000000000000
+--- a/mm/swap_state.c
++++ b/mm/swap_state.c
+@@@ -21,8 -21,7 +21,12 @@@
+  #include <linux/vmalloc.h>
+  #include <linux/swap_slots.h>
+  #include <linux/huge_mm.h>
+++<<<<<<< HEAD
+ +
+ +#include <asm/pgtable.h>
+++=======
++ #include "internal.h"
+++>>>>>>> 243bce09c91b (mm: fix swap cache node allocation mask)
+  
+  /*
+   * swapper_space is a fiction, retained to simplify the path through
+@@@ -430,47 -404,56 +434,83 @@@ struct page *__read_swap_cache_async(sw
+  		 * Swap entry may have been freed since our caller observed it.
+  		 */
+  		err = swapcache_prepare(entry);
+ -		if (!err)
+ +		if (err == -EEXIST) {
+ +			radix_tree_preload_end();
+ +			/*
+ +			 * We might race against get_swap_page() and stumble
+ +			 * across a SWAP_HAS_CACHE swap_map entry whose page
+ +			 * has not been brought into the swapcache yet.
+ +			 */
+ +			cond_resched();
+ +			continue;
+ +		}
+ +		if (err) {		/* swp entry is obsolete ? */
+ +			radix_tree_preload_end();
+  			break;
+ +		}
+  
+ -		put_page(page);
+ -		if (err != -EEXIST)
+ -			return NULL;
+ -
+ +		/* May fail (-ENOMEM) if radix-tree node allocation failed. */
+ +		__SetPageLocked(new_page);
+ +		__SetPageSwapBacked(new_page);
+ +		err = __add_to_swap_cache(new_page, entry);
+ +		if (likely(!err)) {
+ +			radix_tree_preload_end();
+ +			/*
+ +			 * Initiate read into locked page and return.
+ +			 */
+ +			SetPageWorkingset(new_page);
+ +			lru_cache_add_anon(new_page);
+ +			*new_page_allocated = true;
+ +			return new_page;
+ +		}
+ +		radix_tree_preload_end();
+ +		__ClearPageLocked(new_page);
+  		/*
+ -		 * We might race against __delete_from_swap_cache(), and
+ -		 * stumble across a swap_map entry whose SWAP_HAS_CACHE
+ -		 * has not yet been cleared.  Or race against another
+ -		 * __read_swap_cache_async(), which has set SWAP_HAS_CACHE
+ -		 * in swap_map, but not yet added its page to swap cache.
+ +		 * add_to_swap_cache() doesn't return -EEXIST, so we can safely
+ +		 * clear SWAP_HAS_CACHE flag.
+  		 */
+ -		cond_resched();
+ -	}
+ -
+ +		put_swap_page(new_page, entry);
+ +	} while (err != -ENOMEM);
+ +
+++<<<<<<< HEAD
+ +	if (new_page)
+ +		put_page(new_page);
+ +	return found_page;
+++=======
++ 	/*
++ 	 * The swap entry is ours to swap in. Prepare the new page.
++ 	 */
++ 
++ 	__SetPageLocked(page);
++ 	__SetPageSwapBacked(page);
++ 
++ 	/* May fail (-ENOMEM) if XArray node allocation failed. */
++ 	if (add_to_swap_cache(page, entry, gfp_mask & GFP_RECLAIM_MASK)) {
++ 		put_swap_page(page, entry);
++ 		goto fail_unlock;
++ 	}
++ 
++ 	if (mem_cgroup_charge(page, NULL, gfp_mask)) {
++ 		delete_from_swap_cache(page);
++ 		goto fail_unlock;
++ 	}
++ 
++ 	/* XXX: Move to lru_cache_add() when it supports new vs putback */
++ 	spin_lock_irq(&page_pgdat(page)->lru_lock);
++ 	lru_note_cost_page(page);
++ 	spin_unlock_irq(&page_pgdat(page)->lru_lock);
++ 
++ 	/* Caller will initiate read into locked page */
++ 	SetPageWorkingset(page);
++ 	lru_cache_add(page);
++ 	*new_page_allocated = true;
++ 	return page;
++ 
++ fail_unlock:
++ 	unlock_page(page);
++ 	put_page(page);
++ 	return NULL;
+++>>>>>>> 243bce09c91b (mm: fix swap cache node allocation mask)
+  }
+  
+  /*
+* Unmerged path mm/swap_state.c
