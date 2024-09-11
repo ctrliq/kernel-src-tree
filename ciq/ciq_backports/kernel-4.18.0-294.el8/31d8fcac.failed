@@ -1,0 +1,230 @@
+mm: workingset: age nonresident information alongside anonymous pages
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Johannes Weiner <hannes@cmpxchg.org>
+commit 31d8fcac00fcf4007f3921edc69ab4dcb3abcd4d
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/31d8fcac.failed
+
+Patch series "fix for "mm: balance LRU lists based on relative
+thrashing" patchset"
+
+This patchset fixes some problems of the patchset, "mm: balance LRU
+lists based on relative thrashing", which is now merged on the mainline.
+
+Patch "mm: workingset: let cache workingset challenge anon fix" is the
+result of discussion with Johannes.  See following link.
+
+  http://lkml.kernel.org/r/20200520232525.798933-6-hannes@cmpxchg.org
+
+And, the other two are minor things which are found when I try to rebase
+my patchset.
+
+This patch (of 3):
+
+After ("mm: workingset: let cache workingset challenge anon fix"), we
+compare refault distances to active_file + anon.  But age of the
+non-resident information is only driven by the file LRU.  As a result,
+we may overestimate the recency of any incoming refaults and activate
+them too eagerly, causing unnecessary LRU churn in certain situations.
+
+Make anon aging drive nonresident age as well to address that.
+
+Link: http://lkml.kernel.org/r/1592288204-27734-1-git-send-email-iamjoonsoo.kim@lge.com
+Link: http://lkml.kernel.org/r/1592288204-27734-2-git-send-email-iamjoonsoo.kim@lge.com
+Fixes: 34e58cac6d8f2a ("mm: workingset: let cache workingset challenge anon")
+	Reported-by: Joonsoo Kim <js1304@gmail.com>
+	Signed-off-by: Johannes Weiner <hannes@cmpxchg.org>
+	Signed-off-by: Joonsoo Kim <iamjoonsoo.kim@lge.com>
+	Cc: Rik van Riel <riel@surriel.com>
+	Cc: Minchan Kim <minchan.kim@gmail.com>
+	Cc: Michal Hocko <mhocko@suse.com>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit 31d8fcac00fcf4007f3921edc69ab4dcb3abcd4d)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/mmzone.h
+#	mm/vmscan.c
+diff --cc include/linux/mmzone.h
+index 142aaa10ed9e,f6f884970511..000000000000
+--- a/include/linux/mmzone.h
++++ b/include/linux/mmzone.h
+@@@ -328,11 -250,19 +328,23 @@@ struct zone_reclaim_stat 
+  
+  struct lruvec {
+  	struct list_head		lists[NR_LRU_LISTS];
+++<<<<<<< HEAD
+ +	struct zone_reclaim_stat	reclaim_stat;
+ +	/* Evictions & activations on the inactive file list */
+ +	atomic_long_t			inactive_age;
+++=======
++ 	/*
++ 	 * These track the cost of reclaiming one LRU - file or anon -
++ 	 * over the other. As the observed cost of reclaiming one LRU
++ 	 * increases, the reclaim scan balance tips toward the other.
++ 	 */
++ 	unsigned long			anon_cost;
++ 	unsigned long			file_cost;
++ 	/* Non-resident age, driven by LRU movement */
++ 	atomic_long_t			nonresident_age;
+++>>>>>>> 31d8fcac00fc (mm: workingset: age nonresident information alongside anonymous pages)
+  	/* Refaults at the time of last reclaim cycle */
+  	unsigned long			refaults;
+ -	/* Various lruvec state flags (enum lruvec_flags) */
+ -	unsigned long			flags;
+  #ifdef CONFIG_MEMCG
+  	struct pglist_data *pgdat;
+  #endif
+diff --cc mm/vmscan.c
+index d33ed25f0511,749d239c62b2..000000000000
+--- a/mm/vmscan.c
++++ b/mm/vmscan.c
+@@@ -1855,6 -1883,10 +1856,13 @@@ putback_inactive_pages(struct lruvec *l
+  				spin_lock_irq(&pgdat->lru_lock);
+  			} else
+  				list_add(&page->lru, &pages_to_free);
+++<<<<<<< HEAD
+++=======
++ 		} else {
++ 			nr_moved += nr_pages;
++ 			if (PageActive(page))
++ 				workingset_age_nonresident(lruvec, nr_pages);
+++>>>>>>> 31d8fcac00fc (mm: workingset: age nonresident information alongside anonymous pages)
+  		}
+  	}
+  
+* Unmerged path include/linux/mmzone.h
+diff --git a/include/linux/swap.h b/include/linux/swap.h
+index 8552871db183..b03e3c94a760 100644
+--- a/include/linux/swap.h
++++ b/include/linux/swap.h
+@@ -303,6 +303,7 @@ struct vma_swap_readahead {
+ };
+ 
+ /* linux/mm/workingset.c */
++void workingset_age_nonresident(struct lruvec *lruvec, unsigned long nr_pages);
+ void *workingset_eviction(struct page *page, struct mem_cgroup *target_memcg);
+ void workingset_refault(struct page *page, void *shadow);
+ void workingset_activation(struct page *page);
+* Unmerged path mm/vmscan.c
+diff --git a/mm/workingset.c b/mm/workingset.c
+index 44c5c225f293..cc778f8d1330 100644
+--- a/mm/workingset.c
++++ b/mm/workingset.c
+@@ -156,8 +156,8 @@
+  *
+  *		Implementation
+  *
+- * For each node's file LRU lists, a counter for inactive evictions
+- * and activations is maintained (node->inactive_age).
++ * For each node's LRU lists, a counter for inactive evictions and
++ * activations is maintained (node->nonresident_age).
+  *
+  * On eviction, a snapshot of this counter (along with some bits to
+  * identify the node) is stored in the now empty page cache
+@@ -213,7 +213,17 @@ static void unpack_shadow(void *shadow, int *memcgidp, pg_data_t **pgdat,
+ 	*workingsetp = workingset;
+ }
+ 
+-static void advance_inactive_age(struct mem_cgroup *memcg, pg_data_t *pgdat)
++/**
++ * workingset_age_nonresident - age non-resident entries as LRU ages
++ * @memcg: the lruvec that was aged
++ * @nr_pages: the number of pages to count
++ *
++ * As in-memory pages are aged, non-resident pages need to be aged as
++ * well, in order for the refault distances later on to be comparable
++ * to the in-memory dimensions. This function allows reclaim and LRU
++ * operations to drive the non-resident aging along in parallel.
++ */
++void workingset_age_nonresident(struct lruvec *lruvec, unsigned long nr_pages)
+ {
+ 	/*
+ 	 * Reclaiming a cgroup means reclaiming all its children in a
+@@ -227,11 +237,8 @@ static void advance_inactive_age(struct mem_cgroup *memcg, pg_data_t *pgdat)
+ 	 * the root cgroup's, age as well.
+ 	 */
+ 	do {
+-		struct lruvec *lruvec;
+-
+-		lruvec = mem_cgroup_lruvec(memcg, pgdat);
+-		atomic_long_inc(&lruvec->inactive_age);
+-	} while (memcg && (memcg = parent_mem_cgroup(memcg)));
++		atomic_long_add(nr_pages, &lruvec->nonresident_age);
++	} while ((lruvec = parent_lruvec(lruvec)));
+ }
+ 
+ /**
+@@ -254,12 +261,11 @@ void *workingset_eviction(struct page *page, struct mem_cgroup *target_memcg)
+ 	VM_BUG_ON_PAGE(page_count(page), page);
+ 	VM_BUG_ON_PAGE(!PageLocked(page), page);
+ 
+-	advance_inactive_age(page_memcg(page), pgdat);
+-
+ 	lruvec = mem_cgroup_lruvec(target_memcg, pgdat);
++	workingset_age_nonresident(lruvec, hpage_nr_pages(page));
+ 	/* XXX: target_memcg can be NULL, go through lruvec */
+ 	memcgid = mem_cgroup_id(lruvec_memcg(lruvec));
+-	eviction = atomic_long_read(&lruvec->inactive_age);
++	eviction = atomic_long_read(&lruvec->nonresident_age);
+ 	return pack_shadow(memcgid, pgdat, eviction, PageWorkingset(page));
+ }
+ 
+@@ -309,20 +315,20 @@ void workingset_refault(struct page *page, void *shadow)
+ 	if (!mem_cgroup_disabled() && !eviction_memcg)
+ 		goto out;
+ 	eviction_lruvec = mem_cgroup_lruvec(eviction_memcg, pgdat);
+-	refault = atomic_long_read(&eviction_lruvec->inactive_age);
++	refault = atomic_long_read(&eviction_lruvec->nonresident_age);
+ 
+ 	/*
+ 	 * Calculate the refault distance
+ 	 *
+ 	 * The unsigned subtraction here gives an accurate distance
+-	 * across inactive_age overflows in most cases. There is a
++	 * across nonresident_age overflows in most cases. There is a
+ 	 * special case: usually, shadow entries have a short lifetime
+ 	 * and are either refaulted or reclaimed along with the inode
+ 	 * before they get too old.  But it is not impossible for the
+-	 * inactive_age to lap a shadow entry in the field, which can
+-	 * then result in a false small refault distance, leading to a
+-	 * false activation should this old entry actually refault
+-	 * again.  However, earlier kernels used to deactivate
++	 * nonresident_age to lap a shadow entry in the field, which
++	 * can then result in a false small refault distance, leading
++	 * to a false activation should this old entry actually
++	 * refault again.  However, earlier kernels used to deactivate
+ 	 * unconditionally with *every* reclaim invocation for the
+ 	 * longest time, so the occasional inappropriate activation
+ 	 * leading to pressure on the active list is not a problem.
+@@ -359,7 +365,7 @@ void workingset_refault(struct page *page, void *shadow)
+ 		goto out;
+ 
+ 	SetPageActive(page);
+-	advance_inactive_age(memcg, pgdat);
++	workingset_age_nonresident(lruvec, hpage_nr_pages(page));
+ 	inc_lruvec_state(lruvec, WORKINGSET_ACTIVATE);
+ 
+ 	/* Page was active prior to eviction */
+@@ -378,6 +384,7 @@ void workingset_refault(struct page *page, void *shadow)
+ void workingset_activation(struct page *page)
+ {
+ 	struct mem_cgroup *memcg;
++	struct lruvec *lruvec;
+ 
+ 	rcu_read_lock();
+ 	/*
+@@ -390,7 +397,8 @@ void workingset_activation(struct page *page)
+ 	memcg = page_memcg_rcu(page);
+ 	if (!mem_cgroup_disabled() && !memcg)
+ 		goto out;
+-	advance_inactive_age(memcg, page_pgdat(page));
++	lruvec = mem_cgroup_page_lruvec(page, page_pgdat(page));
++	workingset_age_nonresident(lruvec, hpage_nr_pages(page));
+ out:
+ 	rcu_read_unlock();
+ }
