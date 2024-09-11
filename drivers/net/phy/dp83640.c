@@ -1197,6 +1197,10 @@ static int dp83640_config_intr(struct phy_device *phydev)
 	int err;
 
 	if (phydev->interrupts == PHY_INTERRUPT_ENABLED) {
+		err = dp83640_ack_interrupt(phydev);
+		if (err)
+			return err;
+
 		misr = phy_read(phydev, MII_DP83640_MISR);
 		if (misr < 0)
 			return misr;
@@ -1235,7 +1239,11 @@ static int dp83640_config_intr(struct phy_device *phydev)
 			MII_DP83640_MISR_DUP_INT_EN |
 			MII_DP83640_MISR_SPD_INT_EN |
 			MII_DP83640_MISR_LINK_INT_EN);
-		return phy_write(phydev, MII_DP83640_MISR, misr);
+		err = phy_write(phydev, MII_DP83640_MISR, misr);
+		if (err)
+			return err;
+
+		return dp83640_ack_interrupt(phydev);
 	}
 }
 
@@ -1579,7 +1587,6 @@ static struct phy_driver dp83640_driver = {
 	.remove		= dp83640_remove,
 	.soft_reset	= dp83640_soft_reset,
 	.config_init	= dp83640_config_init,
-	.ack_interrupt  = dp83640_ack_interrupt,
 	.config_intr    = dp83640_config_intr,
 	.handle_interrupt = dp83640_handle_interrupt,
 };
