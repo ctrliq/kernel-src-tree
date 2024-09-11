@@ -1,0 +1,117 @@
+{net, RDMA}/mlx5: Fix override of log_max_qp by other device
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-326.el8
+commit-author Maor Gottlieb <maorg@nvidia.com>
+commit 3410fbcd47dc6479af4309febf760ccaa5efb472
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-326.el8/3410fbcd.failed
+
+mlx5_core_dev holds pointer to static profile, hence when the
+log_max_qp of the profile is override by some device, then it
+effect all other mlx5 devices that share the same profile.
+Fix it by having a profile instance for every mlx5 device.
+
+Fixes: 883371c453b9 ("net/mlx5: Check FW limitations on log_max_qp before setting it")
+	Signed-off-by: Maor Gottlieb <maorg@nvidia.com>
+	Reviewed-by: Mark Bloch <mbloch@nvidia.com>
+	Signed-off-by: Saeed Mahameed <saeedm@nvidia.com>
+(cherry picked from commit 3410fbcd47dc6479af4309febf760ccaa5efb472)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/mlx5/driver.h
+diff --cc include/linux/mlx5/driver.h
+index b18812a7ef39,020a8f7fdbdd..000000000000
+--- a/include/linux/mlx5/driver.h
++++ b/include/linux/mlx5/driver.h
+@@@ -1060,20 -1104,17 +1081,27 @@@ static inline u8 mlx5_mkey_variant(u32 
+  	return mkey & 0xff;
+  }
+  
+++<<<<<<< HEAD
+ +enum {
+ +	MLX5_PROF_MASK_QP_SIZE		= (u64)1 << 0,
+ +	MLX5_PROF_MASK_MR_CACHE		= (u64)1 << 1,
+ +};
+ +
+ +enum {
+ +	MR_CACHE_LAST_STD_ENTRY = 20,
+ +	MLX5_IMR_MTT_CACHE_ENTRY,
+ +	MLX5_IMR_KSM_CACHE_ENTRY,
+ +	MAX_MR_CACHE_ENTRIES
+ +};
+ +
+++=======
++ /* Async-atomic event notifier used by mlx5 core to forward FW
++  * evetns recived from event queue to mlx5 consumers.
++  * Optimise event queue dipatching.
++  */
+++>>>>>>> 3410fbcd47dc ({net, RDMA}/mlx5: Fix override of log_max_qp by other device)
+  int mlx5_notifier_register(struct mlx5_core_dev *dev, struct notifier_block *nb);
+  int mlx5_notifier_unregister(struct mlx5_core_dev *dev, struct notifier_block *nb);
+ -
+ -/* Async-atomic event notifier used for forwarding
+ - * evetns from the event queue into the to mlx5 events dispatcher,
+ - * eswitch, clock and others.
+ - */
+  int mlx5_eq_notifier_register(struct mlx5_core_dev *dev, struct mlx5_nb *nb);
+  int mlx5_eq_notifier_unregister(struct mlx5_core_dev *dev, struct mlx5_nb *nb);
+  
+diff --git a/drivers/infiniband/hw/mlx5/mr.c b/drivers/infiniband/hw/mlx5/mr.c
+index d1c1a16be30f..e02c123c4bb2 100644
+--- a/drivers/infiniband/hw/mlx5/mr.c
++++ b/drivers/infiniband/hw/mlx5/mr.c
+@@ -766,10 +766,10 @@ int mlx5_mr_cache_init(struct mlx5_ib_dev *dev)
+ 		ent->xlt = (1 << ent->order) * sizeof(struct mlx5_mtt) /
+ 			   MLX5_IB_UMR_OCTOWORD;
+ 		ent->access_mode = MLX5_MKC_ACCESS_MODE_MTT;
+-		if ((dev->mdev->profile->mask & MLX5_PROF_MASK_MR_CACHE) &&
++		if ((dev->mdev->profile.mask & MLX5_PROF_MASK_MR_CACHE) &&
+ 		    !dev->is_rep && mlx5_core_is_pf(dev->mdev) &&
+ 		    mlx5_ib_can_load_pas_with_umr(dev, 0))
+-			ent->limit = dev->mdev->profile->mr_cache[i].limit;
++			ent->limit = dev->mdev->profile.mr_cache[i].limit;
+ 		else
+ 			ent->limit = 0;
+ 		spin_lock_irq(&ent->lock);
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/main.c b/drivers/net/ethernet/mellanox/mlx5/core/main.c
+index c11d8b42508a..7e76febafbe2 100644
+--- a/drivers/net/ethernet/mellanox/mlx5/core/main.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/main.c
+@@ -501,7 +501,7 @@ static int handle_hca_cap_odp(struct mlx5_core_dev *dev, void *set_ctx)
+ 
+ static int handle_hca_cap(struct mlx5_core_dev *dev, void *set_ctx)
+ {
+-	struct mlx5_profile *prof = dev->profile;
++	struct mlx5_profile *prof = &dev->profile;
+ 	void *set_hca_cap;
+ 	int err;
+ 
+@@ -522,11 +522,11 @@ static int handle_hca_cap(struct mlx5_core_dev *dev, void *set_ctx)
+ 		 to_fw_pkey_sz(dev, 128));
+ 
+ 	/* Check log_max_qp from HCA caps to set in current profile */
+-	if (MLX5_CAP_GEN_MAX(dev, log_max_qp) < profile[prof_sel].log_max_qp) {
++	if (MLX5_CAP_GEN_MAX(dev, log_max_qp) < prof->log_max_qp) {
+ 		mlx5_core_warn(dev, "log_max_qp value in current profile is %d, changing it to HCA capability limit (%d)\n",
+-			       profile[prof_sel].log_max_qp,
++			       prof->log_max_qp,
+ 			       MLX5_CAP_GEN_MAX(dev, log_max_qp));
+-		profile[prof_sel].log_max_qp = MLX5_CAP_GEN_MAX(dev, log_max_qp);
++		prof->log_max_qp = MLX5_CAP_GEN_MAX(dev, log_max_qp);
+ 	}
+ 	if (prof->mask & MLX5_PROF_MASK_QP_SIZE)
+ 		MLX5_SET(cmd_hca_cap, set_hca_cap, log_max_qp,
+@@ -1322,8 +1322,7 @@ static int mlx5_mdev_init(struct mlx5_core_dev *dev, int profile_idx)
+ 	struct mlx5_priv *priv = &dev->priv;
+ 	int err;
+ 
+-	dev->profile = &profile[profile_idx];
+-
++	memcpy(&dev->profile, &profile[profile_idx], sizeof(dev->profile));
+ 	INIT_LIST_HEAD(&priv->ctx_list);
+ 	spin_lock_init(&priv->ctx_lock);
+ 	mutex_init(&dev->intf_state_mutex);
+* Unmerged path include/linux/mlx5/driver.h
