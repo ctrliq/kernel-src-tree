@@ -1,0 +1,171 @@
+xhci: Check for pending reset endpoint command before queueing a new one.
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-326.el8
+commit-author Mathias Nyman <mathias.nyman@linux.intel.com>
+commit 51ee4a84300200c51303ef15b84981b2edb6ec47
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-326.el8/51ee4a84.failed
+
+A halted endpoint can be detected both when transfer events complete, and
+in stop endpoint command completion. Both these handlers will start
+clearing up the halted endpoint and queue a reset endpoint command.
+
+It's possible to get both events for the same halted endpoint if right
+after a URB cancel queues a stop endpoint command the endpoint stalls.
+Use the EP_HALTED flag to prevent resetting the endpoint twice.
+
+	Signed-off-by: Mathias Nyman <mathias.nyman@linux.intel.com>
+Link: https://lore.kernel.org/r/20210129130044.206855-27-mathias.nyman@linux.intel.com
+	Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+(cherry picked from commit 51ee4a84300200c51303ef15b84981b2edb6ec47)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/usb/host/xhci-ring.c
+diff --cc drivers/usb/host/xhci-ring.c
+index bd30ef5cce7a,26f5557ed7c6..000000000000
+--- a/drivers/usb/host/xhci-ring.c
++++ b/drivers/usb/host/xhci-ring.c
+@@@ -749,6 -766,136 +749,139 @@@ static void xhci_unmap_td_bounce_buffer
+  	seg->bounce_offs = 0;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static int xhci_td_cleanup(struct xhci_hcd *xhci, struct xhci_td *td,
++ 			   struct xhci_ring *ep_ring, int status)
++ {
++ 	struct urb *urb = NULL;
++ 
++ 	/* Clean up the endpoint's TD list */
++ 	urb = td->urb;
++ 
++ 	/* if a bounce buffer was used to align this td then unmap it */
++ 	xhci_unmap_td_bounce_buffer(xhci, ep_ring, td);
++ 
++ 	/* Do one last check of the actual transfer length.
++ 	 * If the host controller said we transferred more data than the buffer
++ 	 * length, urb->actual_length will be a very big number (since it's
++ 	 * unsigned).  Play it safe and say we didn't transfer anything.
++ 	 */
++ 	if (urb->actual_length > urb->transfer_buffer_length) {
++ 		xhci_warn(xhci, "URB req %u and actual %u transfer length mismatch\n",
++ 			  urb->transfer_buffer_length, urb->actual_length);
++ 		urb->actual_length = 0;
++ 		status = 0;
++ 	}
++ 	/* TD might be removed from td_list if we are giving back a cancelled URB */
++ 	if (!list_empty(&td->td_list))
++ 		list_del_init(&td->td_list);
++ 	/* Giving back a cancelled URB, or if a slated TD completed anyway */
++ 	if (!list_empty(&td->cancelled_td_list))
++ 		list_del_init(&td->cancelled_td_list);
++ 
++ 	inc_td_cnt(urb);
++ 	/* Giveback the urb when all the tds are completed */
++ 	if (last_td_in_urb(td)) {
++ 		if ((urb->actual_length != urb->transfer_buffer_length &&
++ 		     (urb->transfer_flags & URB_SHORT_NOT_OK)) ||
++ 		    (status != 0 && !usb_endpoint_xfer_isoc(&urb->ep->desc)))
++ 			xhci_dbg(xhci, "Giveback URB %p, len = %d, expected = %d, status = %d\n",
++ 				 urb, urb->actual_length,
++ 				 urb->transfer_buffer_length, status);
++ 
++ 		/* set isoc urb status to 0 just as EHCI, UHCI, and OHCI */
++ 		if (usb_pipetype(urb->pipe) == PIPE_ISOCHRONOUS)
++ 			status = 0;
++ 		xhci_giveback_urb_in_irq(xhci, td, status);
++ 	}
++ 
++ 	return 0;
++ }
++ 
++ 
++ /* Complete the cancelled URBs we unlinked from td_list. */
++ static void xhci_giveback_invalidated_tds(struct xhci_virt_ep *ep)
++ {
++ 	struct xhci_ring *ring;
++ 	struct xhci_td *td, *tmp_td;
++ 
++ 	list_for_each_entry_safe(td, tmp_td, &ep->cancelled_td_list,
++ 				 cancelled_td_list) {
++ 
++ 		/*
++ 		 * Doesn't matter what we pass for status, since the core will
++ 		 * just overwrite it (because the URB has been unlinked).
++ 		 */
++ 		ring = xhci_urb_to_transfer_ring(ep->xhci, td->urb);
++ 
++ 		if (td->cancel_status == TD_CLEARED)
++ 			xhci_td_cleanup(ep->xhci, td, ring, 0);
++ 
++ 		if (ep->xhci->xhc_state & XHCI_STATE_DYING)
++ 			return;
++ 	}
++ }
++ 
++ static int xhci_reset_halted_ep(struct xhci_hcd *xhci, unsigned int slot_id,
++ 				unsigned int ep_index, enum xhci_ep_reset_type reset_type)
++ {
++ 	struct xhci_command *command;
++ 	int ret = 0;
++ 
++ 	command = xhci_alloc_command(xhci, false, GFP_ATOMIC);
++ 	if (!command) {
++ 		ret = -ENOMEM;
++ 		goto done;
++ 	}
++ 
++ 	ret = xhci_queue_reset_ep(xhci, command, slot_id, ep_index, reset_type);
++ done:
++ 	if (ret)
++ 		xhci_err(xhci, "ERROR queuing reset endpoint for slot %d ep_index %d, %d\n",
++ 			 slot_id, ep_index, ret);
++ 	return ret;
++ }
++ 
++ static void xhci_handle_halted_endpoint(struct xhci_hcd *xhci,
++ 				struct xhci_virt_ep *ep, unsigned int stream_id,
++ 				struct xhci_td *td,
++ 				enum xhci_ep_reset_type reset_type)
++ {
++ 	unsigned int slot_id = ep->vdev->slot_id;
++ 	int err;
++ 
++ 	/*
++ 	 * Avoid resetting endpoint if link is inactive. Can cause host hang.
++ 	 * Device will be reset soon to recover the link so don't do anything
++ 	 */
++ 	if (ep->vdev->flags & VDEV_PORT_ERROR)
++ 		return;
++ 
++ 	/* add td to cancelled list and let reset ep handler take care of it */
++ 	if (reset_type == EP_HARD_RESET) {
++ 		ep->ep_state |= EP_HARD_CLEAR_TOGGLE;
++ 		if (td && list_empty(&td->cancelled_td_list)) {
++ 			list_add_tail(&td->cancelled_td_list, &ep->cancelled_td_list);
++ 			td->cancel_status = TD_HALTED;
++ 		}
++ 	}
++ 
++ 	if (ep->ep_state & EP_HALTED) {
++ 		xhci_dbg(xhci, "Reset ep command already pending\n");
++ 		return;
++ 	}
++ 
++ 	err = xhci_reset_halted_ep(xhci, slot_id, ep->ep_index, reset_type);
++ 	if (err)
++ 		return;
++ 
++ 	ep->ep_state |= EP_HALTED;
++ 
++ 	xhci_ring_cmd_db(xhci);
++ }
++ 
+++>>>>>>> 51ee4a843002 (xhci: Check for pending reset endpoint command before queueing a new one.)
+  /*
+   * Fix up the ep ring first, so HW stops executing cancelled TDs.
+   * We have the xHCI lock, so nothing can modify this list until we drop it.
+* Unmerged path drivers/usb/host/xhci-ring.c
