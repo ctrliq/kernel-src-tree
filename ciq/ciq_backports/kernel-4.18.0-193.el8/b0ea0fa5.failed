@@ -1,0 +1,1129 @@
+IB/{core,hw}: Have ib_umem_get extract the ib_ucontext from ib_udata
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-193.el8
+Rebuild_CHGLOG: - [infiniband] IB/{core, hw}: Have ib_umem_get extract the ib_ucontext from ib_udata (Kamal Heib) [1720888]
+Rebuild_FUZZ: 99.27%
+commit-author Jason Gunthorpe <jgg@ziepe.ca>
+commit b0ea0fa5435f9df7213a9af098558f7dd584d8e8
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-193.el8/b0ea0fa5.failed
+
+ib_umem_get() can only be called in a method callback, which always has a
+udata parameter. This allows ib_umem_get() to derive the ucontext pointer
+directly from the udata without requiring the drivers to find it in some
+way or another.
+
+	Signed-off-by: Jason Gunthorpe <jgg@mellanox.com>
+	Signed-off-by: Shamir Rabinovitch <shamir.rabinovitch@oracle.com>
+(cherry picked from commit b0ea0fa5435f9df7213a9af098558f7dd584d8e8)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/infiniband/hw/hns/hns_roce_srq.c
+#	include/rdma/ib_verbs.h
+diff --cc include/rdma/ib_verbs.h
+index fed898be371b,aa1f126d3383..000000000000
+--- a/include/rdma/ib_verbs.h
++++ b/include/rdma/ib_verbs.h
+@@@ -4225,6 -4199,11 +4225,14 @@@ ib_get_vector_affinity(struct ib_devic
+  void rdma_roce_rescan_device(struct ib_device *ibdev);
+  
+  struct ib_ucontext *ib_uverbs_get_ucontext_file(struct ib_uverbs_file *ufile);
+++<<<<<<< HEAD
+++=======
++ 
++ struct ib_ucontext *rdma_get_ucontext(struct ib_udata *udata);
++ 
++ int uverbs_destroy_def_handler(struct uverbs_attr_bundle *attrs);
++ 
+++>>>>>>> b0ea0fa5435f (IB/{core,hw}: Have ib_umem_get extract the ib_ucontext from ib_udata)
+  struct net_device *rdma_alloc_netdev(struct ib_device *device, u8 port_num,
+  				     enum rdma_netdev_t type, const char *name,
+  				     unsigned char name_assign_type,
+* Unmerged path drivers/infiniband/hw/hns/hns_roce_srq.c
+diff --git a/drivers/infiniband/core/umem.c b/drivers/infiniband/core/umem.c
+index 643d541b8154..678abe1afcba 100644
+--- a/drivers/infiniband/core/umem.c
++++ b/drivers/infiniband/core/umem.c
+@@ -72,15 +72,16 @@ static void __ib_umem_release(struct ib_device *dev, struct ib_umem *umem, int d
+  * If access flags indicate ODP memory, avoid pinning. Instead, stores
+  * the mm for future page fault handling in conjunction with MMU notifiers.
+  *
+- * @context: userspace context to pin memory for
++ * @udata: userspace context to pin memory for
+  * @addr: userspace virtual address to start at
+  * @size: length of region to pin
+  * @access: IB_ACCESS_xxx flags for memory being pinned
+  * @dmasync: flush in-flight DMA when the memory region is written
+  */
+-struct ib_umem *ib_umem_get(struct ib_ucontext *context, unsigned long addr,
++struct ib_umem *ib_umem_get(struct ib_udata *udata, unsigned long addr,
+ 			    size_t size, int access, int dmasync)
+ {
++	struct ib_ucontext *context;
+ 	struct ib_umem *umem;
+ 	struct page **page_list;
+ 	struct vm_area_struct **vma_list;
+@@ -95,6 +96,10 @@ struct ib_umem *ib_umem_get(struct ib_ucontext *context, unsigned long addr,
+ 	struct scatterlist *sg, *sg_list_start;
+ 	unsigned int gup_flags = FOLL_WRITE;
+ 
++	context = rdma_get_ucontext(udata);
++	if (IS_ERR(context))
++		return ERR_CAST(context);
++
+ 	if (dmasync)
+ 		dma_attrs |= DMA_ATTR_WRITE_BARRIER;
+ 
+diff --git a/drivers/infiniband/core/uverbs_main.c b/drivers/infiniband/core/uverbs_main.c
+index 27ca4022ca70..59b59b3a5450 100644
+--- a/drivers/infiniband/core/uverbs_main.c
++++ b/drivers/infiniband/core/uverbs_main.c
+@@ -101,6 +101,30 @@ struct ib_ucontext *ib_uverbs_get_ucontext_file(struct ib_uverbs_file *ufile)
+ }
+ EXPORT_SYMBOL(ib_uverbs_get_ucontext_file);
+ 
++/* rdma_get_ucontext - Return the ucontext from a udata
++ * @udata: The udata to get the context from
++ *
++ * This can only be called from within a uapi method that was passed ib_udata
++ * as a parameter. It returns the ucontext associated with the udata, or ERR_PTR
++ * if the udata is NULL or the ucontext has been disassociated.
++ */
++struct ib_ucontext *rdma_get_ucontext(struct ib_udata *udata)
++{
++	if (!udata)
++		return ERR_PTR(-EIO);
++
++	/*
++	 * FIXME: Really all cases that get here with a udata will have
++	 * already called ib_uverbs_get_ucontext_file, or located a uobject
++	 * that points to a ucontext. We could store that result in the udata
++	 * so this function can't fail.
++	 */
++	return ib_uverbs_get_ucontext_file(
++		container_of(udata, struct uverbs_attr_bundle, driver_udata)
++			->ufile);
++}
++EXPORT_SYMBOL(rdma_get_ucontext);
++
+ int uverbs_dealloc_mw(struct ib_mw *mw)
+ {
+ 	struct ib_pd *pd = mw->pd;
+diff --git a/drivers/infiniband/hw/bnxt_re/ib_verbs.c b/drivers/infiniband/hw/bnxt_re/ib_verbs.c
+index bfcab22666c5..de5cb9a61a78 100644
+--- a/drivers/infiniband/hw/bnxt_re/ib_verbs.c
++++ b/drivers/infiniband/hw/bnxt_re/ib_verbs.c
+@@ -901,8 +901,7 @@ static int bnxt_re_init_user_qp(struct bnxt_re_dev *rdev, struct bnxt_re_pd *pd,
+ 		bytes += (qplib_qp->sq.max_wqe * psn_sz);
+ 	}
+ 	bytes = PAGE_ALIGN(bytes);
+-	umem = ib_umem_get(context, ureq.qpsva, bytes,
+-			   IB_ACCESS_LOCAL_WRITE, 1);
++	umem = ib_umem_get(udata, ureq.qpsva, bytes, IB_ACCESS_LOCAL_WRITE, 1);
+ 	if (IS_ERR(umem))
+ 		return PTR_ERR(umem);
+ 
+@@ -914,7 +913,7 @@ static int bnxt_re_init_user_qp(struct bnxt_re_dev *rdev, struct bnxt_re_pd *pd,
+ 	if (!qp->qplib_qp.srq) {
+ 		bytes = (qplib_qp->rq.max_wqe * BNXT_QPLIB_MAX_RQE_ENTRY_SIZE);
+ 		bytes = PAGE_ALIGN(bytes);
+-		umem = ib_umem_get(context, ureq.qprva, bytes,
++		umem = ib_umem_get(udata, ureq.qprva, bytes,
+ 				   IB_ACCESS_LOCAL_WRITE, 1);
+ 		if (IS_ERR(umem))
+ 			goto rqfail;
+@@ -1382,8 +1381,7 @@ static int bnxt_re_init_user_srq(struct bnxt_re_dev *rdev,
+ 
+ 	bytes = (qplib_srq->max_wqe * BNXT_QPLIB_MAX_RQE_ENTRY_SIZE);
+ 	bytes = PAGE_ALIGN(bytes);
+-	umem = ib_umem_get(context, ureq.srqva, bytes,
+-			   IB_ACCESS_LOCAL_WRITE, 1);
++	umem = ib_umem_get(udata, ureq.srqva, bytes, IB_ACCESS_LOCAL_WRITE, 1);
+ 	if (IS_ERR(umem))
+ 		return PTR_ERR(umem);
+ 
+@@ -2639,7 +2637,7 @@ struct ib_cq *bnxt_re_create_cq(struct ib_device *ibdev,
+ 			goto fail;
+ 		}
+ 
+-		cq->umem = ib_umem_get(context, req.cq_va,
++		cq->umem = ib_umem_get(udata, req.cq_va,
+ 				       entries * sizeof(struct cq_base),
+ 				       IB_ACCESS_LOCAL_WRITE, 1);
+ 		if (IS_ERR(cq->umem)) {
+@@ -3620,8 +3618,7 @@ struct ib_mr *bnxt_re_reg_user_mr(struct ib_pd *ib_pd, u64 start, u64 length,
+ 	/* The fixed portion of the rkey is the same as the lkey */
+ 	mr->ib_mr.rkey = mr->qplib_mr.rkey;
+ 
+-	umem = ib_umem_get(ib_pd->uobject->context, start, length,
+-			   mr_access_flags, 0);
++	umem = ib_umem_get(udata, start, length, mr_access_flags, 0);
+ 	if (IS_ERR(umem)) {
+ 		dev_err(rdev_to_dev(rdev), "Failed to get umem");
+ 		rc = -EFAULT;
+diff --git a/drivers/infiniband/hw/cxgb3/iwch_provider.c b/drivers/infiniband/hw/cxgb3/iwch_provider.c
+index b9185b92ad09..5d05259adf70 100644
+--- a/drivers/infiniband/hw/cxgb3/iwch_provider.c
++++ b/drivers/infiniband/hw/cxgb3/iwch_provider.c
+@@ -540,7 +540,7 @@ static struct ib_mr *iwch_reg_user_mr(struct ib_pd *pd, u64 start, u64 length,
+ 
+ 	mhp->rhp = rhp;
+ 
+-	mhp->umem = ib_umem_get(pd->uobject->context, start, length, acc, 0);
++	mhp->umem = ib_umem_get(udata, start, length, acc, 0);
+ 	if (IS_ERR(mhp->umem)) {
+ 		err = PTR_ERR(mhp->umem);
+ 		kfree(mhp);
+diff --git a/drivers/infiniband/hw/cxgb4/mem.c b/drivers/infiniband/hw/cxgb4/mem.c
+index 864d0facf3cc..0399d4149da1 100644
+--- a/drivers/infiniband/hw/cxgb4/mem.c
++++ b/drivers/infiniband/hw/cxgb4/mem.c
+@@ -537,7 +537,7 @@ struct ib_mr *c4iw_reg_user_mr(struct ib_pd *pd, u64 start, u64 length,
+ 
+ 	mhp->rhp = rhp;
+ 
+-	mhp->umem = ib_umem_get(pd->uobject->context, start, length, acc, 0);
++	mhp->umem = ib_umem_get(udata, start, length, acc, 0);
+ 	if (IS_ERR(mhp->umem))
+ 		goto err_free_skb;
+ 
+diff --git a/drivers/infiniband/hw/hns/hns_roce_cq.c b/drivers/infiniband/hw/hns/hns_roce_cq.c
+index 3a485f50fede..1dfe5627006c 100644
+--- a/drivers/infiniband/hw/hns/hns_roce_cq.c
++++ b/drivers/infiniband/hw/hns/hns_roce_cq.c
+@@ -215,7 +215,7 @@ void hns_roce_free_cq(struct hns_roce_dev *hr_dev, struct hns_roce_cq *hr_cq)
+ EXPORT_SYMBOL_GPL(hns_roce_free_cq);
+ 
+ static int hns_roce_ib_get_cq_umem(struct hns_roce_dev *hr_dev,
+-				   struct ib_ucontext *context,
++				   struct ib_udata *udata,
+ 				   struct hns_roce_cq_buf *buf,
+ 				   struct ib_umem **umem, u64 buf_addr, int cqe)
+ {
+@@ -223,7 +223,7 @@ static int hns_roce_ib_get_cq_umem(struct hns_roce_dev *hr_dev,
+ 	u32 page_shift;
+ 	u32 npages;
+ 
+-	*umem = ib_umem_get(context, buf_addr, cqe * hr_dev->caps.cq_entry_sz,
++	*umem = ib_umem_get(udata, buf_addr, cqe * hr_dev->caps.cq_entry_sz,
+ 			    IB_ACCESS_LOCAL_WRITE, 1);
+ 	if (IS_ERR(*umem))
+ 		return PTR_ERR(*umem);
+@@ -347,7 +347,7 @@ struct ib_cq *hns_roce_ib_create_cq(struct ib_device *ib_dev,
+ 		}
+ 
+ 		/* Get user space address, write it into mtt table */
+-		ret = hns_roce_ib_get_cq_umem(hr_dev, context, &hr_cq->hr_buf,
++		ret = hns_roce_ib_get_cq_umem(hr_dev, udata, &hr_cq->hr_buf,
+ 					      &hr_cq->umem, ucmd.buf_addr,
+ 					      cq_entries);
+ 		if (ret) {
+@@ -358,7 +358,8 @@ struct ib_cq *hns_roce_ib_create_cq(struct ib_device *ib_dev,
+ 		if ((hr_dev->caps.flags & HNS_ROCE_CAP_FLAG_RECORD_DB) &&
+ 		    (udata->outlen >= sizeof(resp))) {
+ 			ret = hns_roce_db_map_user(to_hr_ucontext(context),
+-						   ucmd.db_addr, &hr_cq->db);
++						   udata, ucmd.db_addr,
++						   &hr_cq->db);
+ 			if (ret) {
+ 				dev_err(dev, "cq record doorbell map failed!\n");
+ 				goto err_mtt;
+diff --git a/drivers/infiniband/hw/hns/hns_roce_db.c b/drivers/infiniband/hw/hns/hns_roce_db.c
+index e2f93c1ce86a..0c6c1fe87705 100644
+--- a/drivers/infiniband/hw/hns/hns_roce_db.c
++++ b/drivers/infiniband/hw/hns/hns_roce_db.c
+@@ -8,7 +8,8 @@
+ #include <rdma/ib_umem.h>
+ #include "hns_roce_device.h"
+ 
+-int hns_roce_db_map_user(struct hns_roce_ucontext *context, unsigned long virt,
++int hns_roce_db_map_user(struct hns_roce_ucontext *context,
++			 struct ib_udata *udata, unsigned long virt,
+ 			 struct hns_roce_db *db)
+ {
+ 	struct hns_roce_user_db_page *page;
+@@ -28,8 +29,7 @@ int hns_roce_db_map_user(struct hns_roce_ucontext *context, unsigned long virt,
+ 
+ 	refcount_set(&page->refcount, 1);
+ 	page->user_virt = (virt & PAGE_MASK);
+-	page->umem = ib_umem_get(&context->ibucontext, virt & PAGE_MASK,
+-				 PAGE_SIZE, 0, 0);
++	page->umem = ib_umem_get(udata, virt & PAGE_MASK, PAGE_SIZE, 0, 0);
+ 	if (IS_ERR(page->umem)) {
+ 		ret = PTR_ERR(page->umem);
+ 		kfree(page);
+diff --git a/drivers/infiniband/hw/hns/hns_roce_device.h b/drivers/infiniband/hw/hns/hns_roce_device.h
+index 5996c474cbe8..e3c5168f34e3 100644
+--- a/drivers/infiniband/hw/hns/hns_roce_device.h
++++ b/drivers/infiniband/hw/hns/hns_roce_device.h
+@@ -1019,7 +1019,8 @@ struct ib_cq *hns_roce_ib_create_cq(struct ib_device *ib_dev,
+ int hns_roce_ib_destroy_cq(struct ib_cq *ib_cq);
+ void hns_roce_free_cq(struct hns_roce_dev *hr_dev, struct hns_roce_cq *hr_cq);
+ 
+-int hns_roce_db_map_user(struct hns_roce_ucontext *context, unsigned long virt,
++int hns_roce_db_map_user(struct hns_roce_ucontext *context,
++			 struct ib_udata *udata, unsigned long virt,
+ 			 struct hns_roce_db *db);
+ void hns_roce_db_unmap_user(struct hns_roce_ucontext *context,
+ 			    struct hns_roce_db *db);
+diff --git a/drivers/infiniband/hw/hns/hns_roce_mr.c b/drivers/infiniband/hw/hns/hns_roce_mr.c
+index d066659b382b..d2eb74abc477 100644
+--- a/drivers/infiniband/hw/hns/hns_roce_mr.c
++++ b/drivers/infiniband/hw/hns/hns_roce_mr.c
+@@ -999,8 +999,7 @@ struct ib_mr *hns_roce_reg_user_mr(struct ib_pd *pd, u64 start, u64 length,
+ 	if (!mr)
+ 		return ERR_PTR(-ENOMEM);
+ 
+-	mr->umem = ib_umem_get(pd->uobject->context, start, length,
+-			       access_flags, 0);
++	mr->umem = ib_umem_get(udata, start, length, access_flags, 0);
+ 	if (IS_ERR(mr->umem)) {
+ 		ret = PTR_ERR(mr->umem);
+ 		goto err_free;
+@@ -1107,8 +1106,8 @@ int hns_roce_rereg_user_mr(struct ib_mr *ibmr, int flags, u64 start, u64 length,
+ 		}
+ 		ib_umem_release(mr->umem);
+ 
+-		mr->umem = ib_umem_get(ibmr->uobject->context, start, length,
+-				       mr_access_flags, 0);
++		mr->umem =
++			ib_umem_get(udata, start, length, mr_access_flags, 0);
+ 		if (IS_ERR(mr->umem)) {
+ 			ret = PTR_ERR(mr->umem);
+ 			mr->umem = NULL;
+diff --git a/drivers/infiniband/hw/hns/hns_roce_qp.c b/drivers/infiniband/hw/hns/hns_roce_qp.c
+index 21ec4d28079a..28fb4e330edb 100644
+--- a/drivers/infiniband/hw/hns/hns_roce_qp.c
++++ b/drivers/infiniband/hw/hns/hns_roce_qp.c
+@@ -607,9 +607,8 @@ static int hns_roce_create_qp_common(struct hns_roce_dev *hr_dev,
+ 			goto err_rq_sge_list;
+ 		}
+ 
+-		hr_qp->umem = ib_umem_get(ib_pd->uobject->context,
+-					  ucmd.buf_addr, hr_qp->buff_size, 0,
+-					  0);
++		hr_qp->umem = ib_umem_get(udata, ucmd.buf_addr,
++					  hr_qp->buff_size, 0, 0);
+ 		if (IS_ERR(hr_qp->umem)) {
+ 			dev_err(dev, "ib_umem_get error for create qp\n");
+ 			ret = PTR_ERR(hr_qp->umem);
+@@ -648,8 +647,8 @@ static int hns_roce_create_qp_common(struct hns_roce_dev *hr_dev,
+ 		    (udata->outlen >= sizeof(resp)) &&
+ 		    hns_roce_qp_has_sq(init_attr)) {
+ 			ret = hns_roce_db_map_user(
+-					to_hr_ucontext(ib_pd->uobject->context),
+-					ucmd.sdb_addr, &hr_qp->sdb);
++				to_hr_ucontext(ib_pd->uobject->context), udata,
++				ucmd.sdb_addr, &hr_qp->sdb);
+ 			if (ret) {
+ 				dev_err(dev, "sq record doorbell map failed!\n");
+ 				goto err_mtt;
+@@ -664,8 +663,8 @@ static int hns_roce_create_qp_common(struct hns_roce_dev *hr_dev,
+ 		    (udata->outlen >= sizeof(resp)) &&
+ 		    hns_roce_qp_has_rq(init_attr)) {
+ 			ret = hns_roce_db_map_user(
+-					to_hr_ucontext(ib_pd->uobject->context),
+-					ucmd.db_addr, &hr_qp->rdb);
++				to_hr_ucontext(ib_pd->uobject->context), udata,
++				ucmd.db_addr, &hr_qp->rdb);
+ 			if (ret) {
+ 				dev_err(dev, "rq record doorbell map failed!\n");
+ 				goto err_sq_dbmap;
+* Unmerged path drivers/infiniband/hw/hns/hns_roce_srq.c
+diff --git a/drivers/infiniband/hw/i40iw/i40iw_verbs.c b/drivers/infiniband/hw/i40iw/i40iw_verbs.c
+index 9ba50de2fd77..8ba487506a27 100644
+--- a/drivers/infiniband/hw/i40iw/i40iw_verbs.c
++++ b/drivers/infiniband/hw/i40iw/i40iw_verbs.c
+@@ -1852,7 +1852,7 @@ static struct ib_mr *i40iw_reg_user_mr(struct ib_pd *pd,
+ 
+ 	if (length > I40IW_MAX_MR_SIZE)
+ 		return ERR_PTR(-EINVAL);
+-	region = ib_umem_get(pd->uobject->context, start, length, acc, 0);
++	region = ib_umem_get(udata, start, length, acc, 0);
+ 	if (IS_ERR(region))
+ 		return (struct ib_mr *)region;
+ 
+diff --git a/drivers/infiniband/hw/mlx4/cq.c b/drivers/infiniband/hw/mlx4/cq.c
+index 43512347b4f0..db936c12b5bd 100644
+--- a/drivers/infiniband/hw/mlx4/cq.c
++++ b/drivers/infiniband/hw/mlx4/cq.c
+@@ -134,16 +134,16 @@ static void mlx4_ib_free_cq_buf(struct mlx4_ib_dev *dev, struct mlx4_ib_cq_buf *
+ 	mlx4_buf_free(dev->dev, (cqe + 1) * buf->entry_size, &buf->buf);
+ }
+ 
+-static int mlx4_ib_get_cq_umem(struct mlx4_ib_dev *dev, struct ib_ucontext *context,
+-			       struct mlx4_ib_cq_buf *buf, struct ib_umem **umem,
+-			       u64 buf_addr, int cqe)
++static int mlx4_ib_get_cq_umem(struct mlx4_ib_dev *dev, struct ib_udata *udata,
++			       struct mlx4_ib_cq_buf *buf,
++			       struct ib_umem **umem, u64 buf_addr, int cqe)
+ {
+ 	int err;
+ 	int cqe_size = dev->dev->caps.cqe_size;
+ 	int shift;
+ 	int n;
+ 
+-	*umem = ib_umem_get(context, buf_addr, cqe * cqe_size,
++	*umem = ib_umem_get(udata, buf_addr, cqe * cqe_size,
+ 			    IB_ACCESS_LOCAL_WRITE, 1);
+ 	if (IS_ERR(*umem))
+ 		return PTR_ERR(*umem);
+@@ -213,14 +213,13 @@ struct ib_cq *mlx4_ib_create_cq(struct ib_device *ibdev,
+ 		}
+ 
+ 		buf_addr = (void *)(unsigned long)ucmd.buf_addr;
+-
+-		err = mlx4_ib_get_cq_umem(dev, context, &cq->buf, &cq->umem,
++		err = mlx4_ib_get_cq_umem(dev, udata, &cq->buf, &cq->umem,
+ 					  ucmd.buf_addr, entries);
+ 		if (err)
+ 			goto err_cq;
+ 
+-		err = mlx4_ib_db_map_user(to_mucontext(context), ucmd.db_addr,
+-					  &cq->db);
++		err = mlx4_ib_db_map_user(to_mucontext(context), udata,
++					  ucmd.db_addr, &cq->db);
+ 		if (err)
+ 			goto err_mtt;
+ 
+@@ -336,7 +335,7 @@ static int mlx4_alloc_resize_umem(struct mlx4_ib_dev *dev, struct mlx4_ib_cq *cq
+ 	if (!cq->resize_buf)
+ 		return -ENOMEM;
+ 
+-	err = mlx4_ib_get_cq_umem(dev, cq->umem->context, &cq->resize_buf->buf,
++	err = mlx4_ib_get_cq_umem(dev, udata, &cq->resize_buf->buf,
+ 				  &cq->resize_umem, ucmd.buf_addr, entries);
+ 	if (err) {
+ 		kfree(cq->resize_buf);
+diff --git a/drivers/infiniband/hw/mlx4/doorbell.c b/drivers/infiniband/hw/mlx4/doorbell.c
+index c51740986367..3aab71b29ce8 100644
+--- a/drivers/infiniband/hw/mlx4/doorbell.c
++++ b/drivers/infiniband/hw/mlx4/doorbell.c
+@@ -41,7 +41,8 @@ struct mlx4_ib_user_db_page {
+ 	int			refcnt;
+ };
+ 
+-int mlx4_ib_db_map_user(struct mlx4_ib_ucontext *context, unsigned long virt,
++int mlx4_ib_db_map_user(struct mlx4_ib_ucontext *context,
++			struct ib_udata *udata, unsigned long virt,
+ 			struct mlx4_db *db)
+ {
+ 	struct mlx4_ib_user_db_page *page;
+@@ -61,8 +62,7 @@ int mlx4_ib_db_map_user(struct mlx4_ib_ucontext *context, unsigned long virt,
+ 
+ 	page->user_virt = (virt & PAGE_MASK);
+ 	page->refcnt    = 0;
+-	page->umem      = ib_umem_get(&context->ibucontext, virt & PAGE_MASK,
+-				      PAGE_SIZE, 0, 0);
++	page->umem = ib_umem_get(udata, virt & PAGE_MASK, PAGE_SIZE, 0, 0);
+ 	if (IS_ERR(page->umem)) {
+ 		err = PTR_ERR(page->umem);
+ 		kfree(page);
+diff --git a/drivers/infiniband/hw/mlx4/mlx4_ib.h b/drivers/infiniband/hw/mlx4/mlx4_ib.h
+index e491f3eda6e7..60dc1347c5ab 100644
+--- a/drivers/infiniband/hw/mlx4/mlx4_ib.h
++++ b/drivers/infiniband/hw/mlx4/mlx4_ib.h
+@@ -722,7 +722,8 @@ static inline u8 mlx4_ib_bond_next_port(struct mlx4_ib_dev *dev)
+ int mlx4_ib_init_sriov(struct mlx4_ib_dev *dev);
+ void mlx4_ib_close_sriov(struct mlx4_ib_dev *dev);
+ 
+-int mlx4_ib_db_map_user(struct mlx4_ib_ucontext *context, unsigned long virt,
++int mlx4_ib_db_map_user(struct mlx4_ib_ucontext *context,
++			struct ib_udata *udata, unsigned long virt,
+ 			struct mlx4_db *db);
+ void mlx4_ib_db_unmap_user(struct mlx4_ib_ucontext *context, struct mlx4_db *db);
+ 
+diff --git a/drivers/infiniband/hw/mlx4/mr.c b/drivers/infiniband/hw/mlx4/mr.c
+index c7c85c22e4e3..56639ecd53ad 100644
+--- a/drivers/infiniband/hw/mlx4/mr.c
++++ b/drivers/infiniband/hw/mlx4/mr.c
+@@ -367,7 +367,8 @@ int mlx4_ib_umem_calc_optimal_mtt_size(struct ib_umem *umem, u64 start_va,
+ 	return block_shift;
+ }
+ 
+-static struct ib_umem *mlx4_get_umem_mr(struct ib_ucontext *context, u64 start,
++static struct ib_umem *mlx4_get_umem_mr(struct ib_ucontext *context,
++					struct ib_udata *udata, u64 start,
+ 					u64 length, u64 virt_addr,
+ 					int access_flags)
+ {
+@@ -398,7 +399,7 @@ static struct ib_umem *mlx4_get_umem_mr(struct ib_ucontext *context, u64 start,
+ 		up_read(&current->mm->mmap_sem);
+ 	}
+ 
+-	return ib_umem_get(context, start, length, access_flags, 0);
++	return ib_umem_get(udata, start, length, access_flags, 0);
+ }
+ 
+ struct ib_mr *mlx4_ib_reg_user_mr(struct ib_pd *pd, u64 start, u64 length,
+@@ -415,7 +416,7 @@ struct ib_mr *mlx4_ib_reg_user_mr(struct ib_pd *pd, u64 start, u64 length,
+ 	if (!mr)
+ 		return ERR_PTR(-ENOMEM);
+ 
+-	mr->umem = mlx4_get_umem_mr(pd->uobject->context, start, length,
++	mr->umem = mlx4_get_umem_mr(pd->uobject->context, udata, start, length,
+ 				    virt_addr, access_flags);
+ 	if (IS_ERR(mr->umem)) {
+ 		err = PTR_ERR(mr->umem);
+@@ -506,8 +507,8 @@ int mlx4_ib_rereg_user_mr(struct ib_mr *mr, int flags,
+ 		mlx4_mr_rereg_mem_cleanup(dev->dev, &mmr->mmr);
+ 		ib_umem_release(mmr->umem);
+ 		mmr->umem =
+-			mlx4_get_umem_mr(mr->uobject->context, start, length,
+-					 virt_addr, mr_access_flags);
++			mlx4_get_umem_mr(mr->uobject->context, udata, start,
++					 length, virt_addr, mr_access_flags);
+ 		if (IS_ERR(mmr->umem)) {
+ 			err = PTR_ERR(mmr->umem);
+ 			/* Prevent mlx4_ib_dereg_mr from free'ing invalid pointer */
+diff --git a/drivers/infiniband/hw/mlx4/qp.c b/drivers/infiniband/hw/mlx4/qp.c
+index 971e9a9ebdaf..e38bab50cecf 100644
+--- a/drivers/infiniband/hw/mlx4/qp.c
++++ b/drivers/infiniband/hw/mlx4/qp.c
+@@ -1015,9 +1015,11 @@ static int create_qp_common(struct mlx4_ib_dev *dev, struct ib_pd *pd,
+ 				(qp->sq.wqe_cnt << qp->sq.wqe_shift);
+ 		}
+ 
+-		qp->umem = ib_umem_get(pd->uobject->context,
+-				(src == MLX4_IB_QP_SRC) ? ucmd.qp.buf_addr :
+-				ucmd.wq.buf_addr, qp->buf_size, 0, 0);
++		qp->umem =
++			ib_umem_get(udata,
++				    (src == MLX4_IB_QP_SRC) ? ucmd.qp.buf_addr :
++							      ucmd.wq.buf_addr,
++				    qp->buf_size, 0, 0);
+ 		if (IS_ERR(qp->umem)) {
+ 			err = PTR_ERR(qp->umem);
+ 			goto err;
+@@ -1035,9 +1037,11 @@ static int create_qp_common(struct mlx4_ib_dev *dev, struct ib_pd *pd,
+ 			goto err_mtt;
+ 
+ 		if (qp_has_rq(init_attr)) {
+-			err = mlx4_ib_db_map_user(to_mucontext(pd->uobject->context),
++			err = mlx4_ib_db_map_user(
++				to_mucontext(pd->uobject->context), udata,
+ 				(src == MLX4_IB_QP_SRC) ? ucmd.qp.db_addr :
+-				ucmd.wq.db_addr, &qp->db);
++							  ucmd.wq.db_addr,
++				&qp->db);
+ 			if (err)
+ 				goto err_mtt;
+ 		}
+diff --git a/drivers/infiniband/hw/mlx4/srq.c b/drivers/infiniband/hw/mlx4/srq.c
+index 4456f1b8921d..498588eac051 100644
+--- a/drivers/infiniband/hw/mlx4/srq.c
++++ b/drivers/infiniband/hw/mlx4/srq.c
+@@ -113,8 +113,7 @@ struct ib_srq *mlx4_ib_create_srq(struct ib_pd *pd,
+ 			goto err_srq;
+ 		}
+ 
+-		srq->umem = ib_umem_get(pd->uobject->context, ucmd.buf_addr,
+-					buf_size, 0, 0);
++		srq->umem = ib_umem_get(udata, ucmd.buf_addr, buf_size, 0, 0);
+ 		if (IS_ERR(srq->umem)) {
+ 			err = PTR_ERR(srq->umem);
+ 			goto err_srq;
+@@ -130,7 +129,7 @@ struct ib_srq *mlx4_ib_create_srq(struct ib_pd *pd,
+ 			goto err_mtt;
+ 
+ 		err = mlx4_ib_db_map_user(to_mucontext(pd->uobject->context),
+-					  ucmd.db_addr, &srq->db);
++					  udata, ucmd.db_addr, &srq->db);
+ 		if (err)
+ 			goto err_mtt;
+ 	} else {
+diff --git a/drivers/infiniband/hw/mlx5/cq.c b/drivers/infiniband/hw/mlx5/cq.c
+index 6bfa574fa013..18704e503508 100644
+--- a/drivers/infiniband/hw/mlx5/cq.c
++++ b/drivers/infiniband/hw/mlx5/cq.c
+@@ -707,15 +707,15 @@ static int create_cq_user(struct mlx5_ib_dev *dev, struct ib_udata *udata,
+ 
+ 	*cqe_size = ucmd.cqe_size;
+ 
+-	cq->buf.umem = ib_umem_get(context, ucmd.buf_addr,
+-				   entries * ucmd.cqe_size,
+-				   IB_ACCESS_LOCAL_WRITE, 1);
++	cq->buf.umem =
++		ib_umem_get(udata, ucmd.buf_addr, entries * ucmd.cqe_size,
++			    IB_ACCESS_LOCAL_WRITE, 1);
+ 	if (IS_ERR(cq->buf.umem)) {
+ 		err = PTR_ERR(cq->buf.umem);
+ 		return err;
+ 	}
+ 
+-	err = mlx5_ib_db_map_user(to_mucontext(context), ucmd.db_addr,
++	err = mlx5_ib_db_map_user(to_mucontext(context), udata, ucmd.db_addr,
+ 				  &cq->db);
+ 	if (err)
+ 		goto err_umem;
+@@ -1111,7 +1111,6 @@ static int resize_user(struct mlx5_ib_dev *dev, struct mlx5_ib_cq *cq,
+ 	struct ib_umem *umem;
+ 	int err;
+ 	int npages;
+-	struct ib_ucontext *context = cq->buf.umem->context;
+ 
+ 	err = ib_copy_from_udata(&ucmd, udata, sizeof(ucmd));
+ 	if (err)
+@@ -1124,7 +1123,7 @@ static int resize_user(struct mlx5_ib_dev *dev, struct mlx5_ib_cq *cq,
+ 	if (ucmd.cqe_size && SIZE_MAX / ucmd.cqe_size <= entries - 1)
+ 		return -EINVAL;
+ 
+-	umem = ib_umem_get(context, ucmd.buf_addr,
++	umem = ib_umem_get(udata, ucmd.buf_addr,
+ 			   (size_t)ucmd.cqe_size * entries,
+ 			   IB_ACCESS_LOCAL_WRITE, 1);
+ 	if (IS_ERR(umem)) {
+diff --git a/drivers/infiniband/hw/mlx5/devx.c b/drivers/infiniband/hw/mlx5/devx.c
+index 6e26f01a124c..63c55d46753c 100644
+--- a/drivers/infiniband/hw/mlx5/devx.c
++++ b/drivers/infiniband/hw/mlx5/devx.c
+@@ -1333,7 +1333,7 @@ static int devx_umem_get(struct mlx5_ib_dev *dev, struct ib_ucontext *ucontext,
+ 	if (err)
+ 		return err;
+ 
+-	obj->umem = ib_umem_get(ucontext, addr, size, access, 0);
++	obj->umem = ib_umem_get(&attrs->driver_udata, addr, size, access, 0);
+ 	if (IS_ERR(obj->umem))
+ 		return PTR_ERR(obj->umem);
+ 
+diff --git a/drivers/infiniband/hw/mlx5/doorbell.c b/drivers/infiniband/hw/mlx5/doorbell.c
+index a0e4e6ddb71a..8f4e5f22b84c 100644
+--- a/drivers/infiniband/hw/mlx5/doorbell.c
++++ b/drivers/infiniband/hw/mlx5/doorbell.c
+@@ -43,7 +43,8 @@ struct mlx5_ib_user_db_page {
+ 	int			refcnt;
+ };
+ 
+-int mlx5_ib_db_map_user(struct mlx5_ib_ucontext *context, unsigned long virt,
++int mlx5_ib_db_map_user(struct mlx5_ib_ucontext *context,
++			struct ib_udata *udata, unsigned long virt,
+ 			struct mlx5_db *db)
+ {
+ 	struct mlx5_ib_user_db_page *page;
+@@ -63,8 +64,7 @@ int mlx5_ib_db_map_user(struct mlx5_ib_ucontext *context, unsigned long virt,
+ 
+ 	page->user_virt = (virt & PAGE_MASK);
+ 	page->refcnt    = 0;
+-	page->umem      = ib_umem_get(&context->ibucontext, virt & PAGE_MASK,
+-				      PAGE_SIZE, 0, 0);
++	page->umem = ib_umem_get(udata, virt & PAGE_MASK, PAGE_SIZE, 0, 0);
+ 	if (IS_ERR(page->umem)) {
+ 		err = PTR_ERR(page->umem);
+ 		kfree(page);
+diff --git a/drivers/infiniband/hw/mlx5/mlx5_ib.h b/drivers/infiniband/hw/mlx5/mlx5_ib.h
+index 8120f808023d..99b17d2c7c1d 100644
+--- a/drivers/infiniband/hw/mlx5/mlx5_ib.h
++++ b/drivers/infiniband/hw/mlx5/mlx5_ib.h
+@@ -1045,7 +1045,8 @@ to_mflow_act(struct ib_flow_action *ibact)
+ 	return container_of(ibact, struct mlx5_ib_flow_action, ib_action);
+ }
+ 
+-int mlx5_ib_db_map_user(struct mlx5_ib_ucontext *context, unsigned long virt,
++int mlx5_ib_db_map_user(struct mlx5_ib_ucontext *context,
++			struct ib_udata *udata, unsigned long virt,
+ 			struct mlx5_db *db);
+ void mlx5_ib_db_unmap_user(struct mlx5_ib_ucontext *context, struct mlx5_db *db);
+ void __mlx5_ib_cq_clean(struct mlx5_ib_cq *cq, u32 qpn, struct mlx5_ib_srq *srq);
+@@ -1111,6 +1112,7 @@ int mlx5_ib_dealloc_mw(struct ib_mw *mw);
+ int mlx5_ib_update_xlt(struct mlx5_ib_mr *mr, u64 idx, int npages,
+ 		       int page_shift, int flags);
+ struct mlx5_ib_mr *mlx5_ib_alloc_implicit_mr(struct mlx5_ib_pd *pd,
++					     struct ib_udata *udata,
+ 					     int access_flags);
+ void mlx5_ib_free_implicit_mr(struct mlx5_ib_mr *mr);
+ int mlx5_ib_rereg_user_mr(struct ib_mr *ib_mr, int flags, u64 start,
+diff --git a/drivers/infiniband/hw/mlx5/mr.c b/drivers/infiniband/hw/mlx5/mr.c
+index 117463d43c3b..39fa827536ce 100644
+--- a/drivers/infiniband/hw/mlx5/mr.c
++++ b/drivers/infiniband/hw/mlx5/mr.c
+@@ -818,18 +818,17 @@ static int mr_cache_max_order(struct mlx5_ib_dev *dev)
+ 	return MLX5_MAX_UMR_SHIFT;
+ }
+ 
+-static int mr_umem_get(struct ib_pd *pd, u64 start, u64 length,
+-		       int access_flags, struct ib_umem **umem,
+-		       int *npages, int *page_shift, int *ncont,
+-		       int *order)
++static int mr_umem_get(struct mlx5_ib_dev *dev, struct ib_udata *udata,
++		       u64 start, u64 length, int access_flags,
++		       struct ib_umem **umem, int *npages, int *page_shift,
++		       int *ncont, int *order)
+ {
+-	struct mlx5_ib_dev *dev = to_mdev(pd->device);
+ 	struct ib_umem *u;
+ 	int err;
+ 
+ 	*umem = NULL;
+ 
+-	u = ib_umem_get(pd->uobject->context, start, length, access_flags, 0);
++	u = ib_umem_get(udata, start, length, access_flags, 0);
+ 	err = PTR_ERR_OR_ZERO(u);
+ 	if (err) {
+ 		mlx5_ib_dbg(dev, "umem get failed (%d)\n", err);
+@@ -1308,14 +1307,14 @@ struct ib_mr *mlx5_ib_reg_user_mr(struct ib_pd *pd, u64 start, u64 length,
+ 		    !(dev->odp_caps.general_caps & IB_ODP_SUPPORT_IMPLICIT))
+ 			return ERR_PTR(-EINVAL);
+ 
+-		mr = mlx5_ib_alloc_implicit_mr(to_mpd(pd), access_flags);
++		mr = mlx5_ib_alloc_implicit_mr(to_mpd(pd), udata, access_flags);
+ 		if (IS_ERR(mr))
+ 			return ERR_CAST(mr);
+ 		return &mr->ibmr;
+ 	}
+ 
+-	err = mr_umem_get(pd, start, length, access_flags, &umem, &npages,
+-			   &page_shift, &ncont, &order);
++	err = mr_umem_get(dev, udata, start, length, access_flags, &umem,
++			  &npages, &page_shift, &ncont, &order);
+ 
+ 	if (err < 0)
+ 		return ERR_PTR(err);
+@@ -1465,8 +1464,9 @@ int mlx5_ib_rereg_user_mr(struct ib_mr *ib_mr, int flags, u64 start,
+ 		flags |= IB_MR_REREG_TRANS;
+ 		ib_umem_release(mr->umem);
+ 		mr->umem = NULL;
+-		err = mr_umem_get(pd, addr, len, access_flags, &mr->umem,
+-				  &npages, &page_shift, &ncont, &order);
++		err = mr_umem_get(dev, udata, addr, len, access_flags,
++				  &mr->umem, &npages, &page_shift, &ncont,
++				  &order);
+ 		if (err)
+ 			goto err;
+ 	}
+diff --git a/drivers/infiniband/hw/mlx5/odp.c b/drivers/infiniband/hw/mlx5/odp.c
+index 4cde959436d3..deb2999239e0 100644
+--- a/drivers/infiniband/hw/mlx5/odp.c
++++ b/drivers/infiniband/hw/mlx5/odp.c
+@@ -492,13 +492,13 @@ static struct ib_umem_odp *implicit_mr_get_data(struct mlx5_ib_mr *mr,
+ }
+ 
+ struct mlx5_ib_mr *mlx5_ib_alloc_implicit_mr(struct mlx5_ib_pd *pd,
++					     struct ib_udata *udata,
+ 					     int access_flags)
+ {
+-	struct ib_ucontext *ctx = pd->ibpd.uobject->context;
+ 	struct mlx5_ib_mr *imr;
+ 	struct ib_umem *umem;
+ 
+-	umem = ib_umem_get(ctx, 0, 0, IB_ACCESS_ON_DEMAND, 0);
++	umem = ib_umem_get(udata, 0, 0, IB_ACCESS_ON_DEMAND, 0);
+ 	if (IS_ERR(umem))
+ 		return ERR_CAST(umem);
+ 
+diff --git a/drivers/infiniband/hw/mlx5/qp.c b/drivers/infiniband/hw/mlx5/qp.c
+index 7927d666efe8..b0219633ef3a 100644
+--- a/drivers/infiniband/hw/mlx5/qp.c
++++ b/drivers/infiniband/hw/mlx5/qp.c
+@@ -645,16 +645,14 @@ int bfregn_to_uar_index(struct mlx5_ib_dev *dev,
+ 	return bfregi->sys_pages[index_of_sys_page] + offset;
+ }
+ 
+-static int mlx5_ib_umem_get(struct mlx5_ib_dev *dev,
+-			    struct ib_pd *pd,
++static int mlx5_ib_umem_get(struct mlx5_ib_dev *dev, struct ib_udata *udata,
+ 			    unsigned long addr, size_t size,
+-			    struct ib_umem **umem,
+-			    int *npages, int *page_shift, int *ncont,
+-			    u32 *offset)
++			    struct ib_umem **umem, int *npages, int *page_shift,
++			    int *ncont, u32 *offset)
+ {
+ 	int err;
+ 
+-	*umem = ib_umem_get(pd->uobject->context, addr, size, 0, 0);
++	*umem = ib_umem_get(udata, addr, size, 0, 0);
+ 	if (IS_ERR(*umem)) {
+ 		mlx5_ib_dbg(dev, "umem_get failed\n");
+ 		return PTR_ERR(*umem);
+@@ -695,10 +693,9 @@ static void destroy_user_rq(struct mlx5_ib_dev *dev, struct ib_pd *pd,
+ }
+ 
+ static int create_user_rq(struct mlx5_ib_dev *dev, struct ib_pd *pd,
+-			  struct mlx5_ib_rwq *rwq,
++			  struct ib_udata *udata, struct mlx5_ib_rwq *rwq,
+ 			  struct mlx5_ib_create_wq *ucmd)
+ {
+-	struct mlx5_ib_ucontext *context;
+ 	int page_shift = 0;
+ 	int npages;
+ 	u32 offset = 0;
+@@ -708,9 +705,7 @@ static int create_user_rq(struct mlx5_ib_dev *dev, struct ib_pd *pd,
+ 	if (!ucmd->buf_addr)
+ 		return -EINVAL;
+ 
+-	context = to_mucontext(pd->uobject->context);
+-	rwq->umem = ib_umem_get(pd->uobject->context, ucmd->buf_addr,
+-			       rwq->buf_size, 0, 0);
++	rwq->umem = ib_umem_get(udata, ucmd->buf_addr, rwq->buf_size, 0, 0);
+ 	if (IS_ERR(rwq->umem)) {
+ 		mlx5_ib_dbg(dev, "umem_get failed\n");
+ 		err = PTR_ERR(rwq->umem);
+@@ -735,7 +730,8 @@ static int create_user_rq(struct mlx5_ib_dev *dev, struct ib_pd *pd,
+ 		    (unsigned long long)ucmd->buf_addr, rwq->buf_size,
+ 		    npages, page_shift, ncont, offset);
+ 
+-	err = mlx5_ib_db_map_user(context, ucmd->db_addr, &rwq->db);
++	err = mlx5_ib_db_map_user(to_mucontext(pd->uobject->context), udata,
++				  ucmd->db_addr, &rwq->db);
+ 	if (err) {
+ 		mlx5_ib_dbg(dev, "map failed\n");
+ 		goto err_umem;
+@@ -819,10 +815,9 @@ static int create_user_qp(struct mlx5_ib_dev *dev, struct ib_pd *pd,
+ 
+ 	if (ucmd.buf_addr && ubuffer->buf_size) {
+ 		ubuffer->buf_addr = ucmd.buf_addr;
+-		err = mlx5_ib_umem_get(dev, pd, ubuffer->buf_addr,
+-				       ubuffer->buf_size,
+-				       &ubuffer->umem, &npages, &page_shift,
+-				       &ncont, &offset);
++		err = mlx5_ib_umem_get(dev, udata, ubuffer->buf_addr,
++				       ubuffer->buf_size, &ubuffer->umem,
++				       &npages, &page_shift, &ncont, &offset);
+ 		if (err)
+ 			goto err_bfreg;
+ 	} else {
+@@ -856,7 +851,7 @@ static int create_user_qp(struct mlx5_ib_dev *dev, struct ib_pd *pd,
+ 		resp->bfreg_index = MLX5_IB_INVALID_BFREG;
+ 	qp->bfregn = bfregn;
+ 
+-	err = mlx5_ib_db_map_user(context, ucmd.db_addr, &qp->db);
++	err = mlx5_ib_db_map_user(context, udata, ucmd.db_addr, &qp->db);
+ 	if (err) {
+ 		mlx5_ib_dbg(dev, "map failed\n");
+ 		goto err_free;
+@@ -1119,6 +1114,7 @@ static void destroy_flow_rule_vport_sq(struct mlx5_ib_dev *dev,
+ }
+ 
+ static int create_raw_packet_qp_sq(struct mlx5_ib_dev *dev,
++				   struct ib_udata *udata,
+ 				   struct mlx5_ib_sq *sq, void *qpin,
+ 				   struct ib_pd *pd)
+ {
+@@ -1135,9 +1131,9 @@ static int create_raw_packet_qp_sq(struct mlx5_ib_dev *dev,
+ 	int ncont = 0;
+ 	u32 offset = 0;
+ 
+-	err = mlx5_ib_umem_get(dev, pd, ubuffer->buf_addr, ubuffer->buf_size,
+-			       &sq->ubuffer.umem, &npages, &page_shift,
+-			       &ncont, &offset);
++	err = mlx5_ib_umem_get(dev, udata, ubuffer->buf_addr, ubuffer->buf_size,
++			       &sq->ubuffer.umem, &npages, &page_shift, &ncont,
++			       &offset);
+ 	if (err)
+ 		return err;
+ 
+@@ -1374,7 +1370,7 @@ static int create_raw_packet_qp(struct mlx5_ib_dev *dev, struct mlx5_ib_qp *qp,
+ 		if (err)
+ 			return err;
+ 
+-		err = create_raw_packet_qp_sq(dev, sq, in, pd);
++		err = create_raw_packet_qp_sq(dev, udata, sq, in, pd);
+ 		if (err)
+ 			goto err_destroy_tis;
+ 
+@@ -5799,7 +5795,7 @@ static int prepare_user_rq(struct ib_pd *pd,
+ 		return err;
+ 	}
+ 
+-	err = create_user_rq(dev, pd, rwq, &ucmd);
++	err = create_user_rq(dev, pd, udata, rwq, &ucmd);
+ 	if (err) {
+ 		mlx5_ib_dbg(dev, "err %d\n", err);
+ 		return err;
+diff --git a/drivers/infiniband/hw/mlx5/srq.c b/drivers/infiniband/hw/mlx5/srq.c
+index 4e8d18009f58..22bd774e0b4e 100644
+--- a/drivers/infiniband/hw/mlx5/srq.c
++++ b/drivers/infiniband/hw/mlx5/srq.c
+@@ -79,8 +79,7 @@ static int create_srq_user(struct ib_pd *pd, struct mlx5_ib_srq *srq,
+ 
+ 	srq->wq_sig = !!(ucmd.flags & MLX5_SRQ_FLAG_SIGNATURE);
+ 
+-	srq->umem = ib_umem_get(pd->uobject->context, ucmd.buf_addr, buf_size,
+-				0, 0);
++	srq->umem = ib_umem_get(udata, ucmd.buf_addr, buf_size, 0, 0);
+ 	if (IS_ERR(srq->umem)) {
+ 		mlx5_ib_dbg(dev, "failed umem get, size %d\n", buf_size);
+ 		err = PTR_ERR(srq->umem);
+@@ -104,7 +103,7 @@ static int create_srq_user(struct ib_pd *pd, struct mlx5_ib_srq *srq,
+ 
+ 	mlx5_ib_populate_pas(dev, srq->umem, page_shift, in->pas, 0);
+ 
+-	err = mlx5_ib_db_map_user(to_mucontext(pd->uobject->context),
++	err = mlx5_ib_db_map_user(to_mucontext(pd->uobject->context), udata,
+ 				  ucmd.db_addr, &srq->db);
+ 	if (err) {
+ 		mlx5_ib_dbg(dev, "map doorbell failed\n");
+diff --git a/drivers/infiniband/hw/mthca/mthca_provider.c b/drivers/infiniband/hw/mthca/mthca_provider.c
+index 1a53997523c9..b1c15bcafa33 100644
+--- a/drivers/infiniband/hw/mthca/mthca_provider.c
++++ b/drivers/infiniband/hw/mthca/mthca_provider.c
+@@ -931,7 +931,7 @@ static struct ib_mr *mthca_reg_user_mr(struct ib_pd *pd, u64 start, u64 length,
+ 	if (!mr)
+ 		return ERR_PTR(-ENOMEM);
+ 
+-	mr->umem = ib_umem_get(pd->uobject->context, start, length, acc,
++	mr->umem = ib_umem_get(udata, start, length, acc,
+ 			       ucmd.mr_attrs & MTHCA_MR_DMASYNC);
+ 
+ 	if (IS_ERR(mr->umem)) {
+diff --git a/drivers/infiniband/hw/nes/nes_verbs.c b/drivers/infiniband/hw/nes/nes_verbs.c
+index 0be251946c46..76caac7689c3 100644
+--- a/drivers/infiniband/hw/nes/nes_verbs.c
++++ b/drivers/infiniband/hw/nes/nes_verbs.c
+@@ -2134,7 +2134,7 @@ static struct ib_mr *nes_reg_user_mr(struct ib_pd *pd, u64 start, u64 length,
+ 	u8 stag_key;
+ 	int first_page = 1;
+ 
+-	region = ib_umem_get(pd->uobject->context, start, length, acc, 0);
++	region = ib_umem_get(udata, start, length, acc, 0);
+ 	if (IS_ERR(region)) {
+ 		return (struct ib_mr *)region;
+ 	}
+diff --git a/drivers/infiniband/hw/ocrdma/ocrdma_verbs.c b/drivers/infiniband/hw/ocrdma/ocrdma_verbs.c
+index 7b11cd679ea0..3c227a27384e 100644
+--- a/drivers/infiniband/hw/ocrdma/ocrdma_verbs.c
++++ b/drivers/infiniband/hw/ocrdma/ocrdma_verbs.c
+@@ -916,7 +916,7 @@ struct ib_mr *ocrdma_reg_user_mr(struct ib_pd *ibpd, u64 start, u64 len,
+ 	mr = kzalloc(sizeof(*mr), GFP_KERNEL);
+ 	if (!mr)
+ 		return ERR_PTR(status);
+-	mr->umem = ib_umem_get(ibpd->uobject->context, start, len, acc, 0);
++	mr->umem = ib_umem_get(udata, start, len, acc, 0);
+ 	if (IS_ERR(mr->umem)) {
+ 		status = -EFAULT;
+ 		goto umem_err;
+diff --git a/drivers/infiniband/hw/qedr/verbs.c b/drivers/infiniband/hw/qedr/verbs.c
+index 43aa4c21ae7f..8bdace934875 100644
+--- a/drivers/infiniband/hw/qedr/verbs.c
++++ b/drivers/infiniband/hw/qedr/verbs.c
+@@ -729,11 +729,10 @@ static inline int qedr_align_cq_entries(int entries)
+ 	return aligned_size / QEDR_CQE_SIZE;
+ }
+ 
+-static inline int qedr_init_user_queue(struct ib_ucontext *ib_ctx,
++static inline int qedr_init_user_queue(struct ib_udata *udata,
+ 				       struct qedr_dev *dev,
+-				       struct qedr_userq *q,
+-				       u64 buf_addr, size_t buf_len,
+-				       int access, int dmasync,
++				       struct qedr_userq *q, u64 buf_addr,
++				       size_t buf_len, int access, int dmasync,
+ 				       int alloc_and_init)
+ {
+ 	u32 fw_pages;
+@@ -741,7 +740,7 @@ static inline int qedr_init_user_queue(struct ib_ucontext *ib_ctx,
+ 
+ 	q->buf_addr = buf_addr;
+ 	q->buf_len = buf_len;
+-	q->umem = ib_umem_get(ib_ctx, q->buf_addr, q->buf_len, access, dmasync);
++	q->umem = ib_umem_get(udata, q->buf_addr, q->buf_len, access, dmasync);
+ 	if (IS_ERR(q->umem)) {
+ 		DP_ERR(dev, "create user queue: failed ib_umem_get, got %ld\n",
+ 		       PTR_ERR(q->umem));
+@@ -898,9 +897,9 @@ struct ib_cq *qedr_create_cq(struct ib_device *ibdev,
+ 
+ 		cq->cq_type = QEDR_CQ_TYPE_USER;
+ 
+-		rc = qedr_init_user_queue(ib_ctx, dev, &cq->q, ureq.addr,
+-					  ureq.len, IB_ACCESS_LOCAL_WRITE,
+-					  1, 1);
++		rc = qedr_init_user_queue(udata, dev, &cq->q, ureq.addr,
++					  ureq.len, IB_ACCESS_LOCAL_WRITE, 1,
++					  1);
+ 		if (rc)
+ 			goto err0;
+ 
+@@ -1337,7 +1336,7 @@ static void qedr_free_srq_kernel_params(struct qedr_srq *srq)
+ 			  hw_srq->phy_prod_pair_addr);
+ }
+ 
+-static int qedr_init_srq_user_params(struct ib_ucontext *ib_ctx,
++static int qedr_init_srq_user_params(struct ib_udata *udata,
+ 				     struct qedr_srq *srq,
+ 				     struct qedr_create_srq_ureq *ureq,
+ 				     int access, int dmasync)
+@@ -1345,14 +1344,14 @@ static int qedr_init_srq_user_params(struct ib_ucontext *ib_ctx,
+ 	struct scatterlist *sg;
+ 	int rc;
+ 
+-	rc = qedr_init_user_queue(ib_ctx, srq->dev, &srq->usrq, ureq->srq_addr,
++	rc = qedr_init_user_queue(udata, srq->dev, &srq->usrq, ureq->srq_addr,
+ 				  ureq->srq_len, access, dmasync, 1);
+ 	if (rc)
+ 		return rc;
+ 
+-	srq->prod_umem = ib_umem_get(ib_ctx, ureq->prod_pair_addr,
+-				     sizeof(struct rdma_srq_producers),
+-				     access, dmasync);
++	srq->prod_umem =
++		ib_umem_get(udata, ureq->prod_pair_addr,
++			    sizeof(struct rdma_srq_producers), access, dmasync);
+ 	if (IS_ERR(srq->prod_umem)) {
+ 		qedr_free_pbl(srq->dev, &srq->usrq.pbl_info, srq->usrq.pbl_tbl);
+ 		ib_umem_release(srq->usrq.umem);
+@@ -1461,7 +1460,7 @@ struct ib_srq *qedr_create_srq(struct ib_pd *ibpd,
+ 			goto err0;
+ 		}
+ 
+-		rc = qedr_init_srq_user_params(ib_ctx, srq, &ureq, 0, 0);
++		rc = qedr_init_srq_user_params(udata, srq, &ureq, 0, 0);
+ 		if (rc)
+ 			goto err0;
+ 
+@@ -1707,14 +1706,14 @@ static int qedr_create_user_qp(struct qedr_dev *dev,
+ 	}
+ 
+ 	/* SQ - read access only (0), dma sync not required (0) */
+-	rc = qedr_init_user_queue(ib_ctx, dev, &qp->usq, ureq.sq_addr,
++	rc = qedr_init_user_queue(udata, dev, &qp->usq, ureq.sq_addr,
+ 				  ureq.sq_len, 0, 0, alloc_and_init);
+ 	if (rc)
+ 		return rc;
+ 
+ 	if (!qp->srq) {
+ 		/* RQ - read access only (0), dma sync not required (0) */
+-		rc = qedr_init_user_queue(ib_ctx, dev, &qp->urq, ureq.rq_addr,
++		rc = qedr_init_user_queue(udata, dev, &qp->urq, ureq.rq_addr,
+ 					  ureq.rq_len, 0, 0, alloc_and_init);
+ 		if (rc)
+ 			return rc;
+@@ -2712,7 +2711,7 @@ struct ib_mr *qedr_reg_user_mr(struct ib_pd *ibpd, u64 start, u64 len,
+ 
+ 	mr->type = QEDR_MR_USER;
+ 
+-	mr->umem = ib_umem_get(ibpd->uobject->context, start, len, acc, 0);
++	mr->umem = ib_umem_get(udata, start, len, acc, 0);
+ 	if (IS_ERR(mr->umem)) {
+ 		rc = -EFAULT;
+ 		goto err0;
+diff --git a/drivers/infiniband/hw/vmw_pvrdma/pvrdma_cq.c b/drivers/infiniband/hw/vmw_pvrdma/pvrdma_cq.c
+index 0f004c737620..104c7db4704f 100644
+--- a/drivers/infiniband/hw/vmw_pvrdma/pvrdma_cq.c
++++ b/drivers/infiniband/hw/vmw_pvrdma/pvrdma_cq.c
+@@ -141,7 +141,7 @@ struct ib_cq *pvrdma_create_cq(struct ib_device *ibdev,
+ 			goto err_cq;
+ 		}
+ 
+-		cq->umem = ib_umem_get(context, ucmd.buf_addr, ucmd.buf_size,
++		cq->umem = ib_umem_get(udata, ucmd.buf_addr, ucmd.buf_size,
+ 				       IB_ACCESS_LOCAL_WRITE, 1);
+ 		if (IS_ERR(cq->umem)) {
+ 			ret = PTR_ERR(cq->umem);
+diff --git a/drivers/infiniband/hw/vmw_pvrdma/pvrdma_mr.c b/drivers/infiniband/hw/vmw_pvrdma/pvrdma_mr.c
+index fa96fa4fb829..a85884e90e84 100644
+--- a/drivers/infiniband/hw/vmw_pvrdma/pvrdma_mr.c
++++ b/drivers/infiniband/hw/vmw_pvrdma/pvrdma_mr.c
+@@ -126,8 +126,7 @@ struct ib_mr *pvrdma_reg_user_mr(struct ib_pd *pd, u64 start, u64 length,
+ 		return ERR_PTR(-EINVAL);
+ 	}
+ 
+-	umem = ib_umem_get(pd->uobject->context, start,
+-			   length, access_flags, 0);
++	umem = ib_umem_get(udata, start, length, access_flags, 0);
+ 	if (IS_ERR(umem)) {
+ 		dev_warn(&dev->pdev->dev,
+ 			 "could not get umem for mem region\n");
+diff --git a/drivers/infiniband/hw/vmw_pvrdma/pvrdma_qp.c b/drivers/infiniband/hw/vmw_pvrdma/pvrdma_qp.c
+index 1ec3646087ba..08f4257169bd 100644
+--- a/drivers/infiniband/hw/vmw_pvrdma/pvrdma_qp.c
++++ b/drivers/infiniband/hw/vmw_pvrdma/pvrdma_qp.c
+@@ -262,8 +262,7 @@ struct ib_qp *pvrdma_create_qp(struct ib_pd *pd,
+ 
+ 			if (!is_srq) {
+ 				/* set qp->sq.wqe_cnt, shift, buf_size.. */
+-				qp->rumem = ib_umem_get(pd->uobject->context,
+-							ucmd.rbuf_addr,
++				qp->rumem = ib_umem_get(udata, ucmd.rbuf_addr,
+ 							ucmd.rbuf_size, 0, 0);
+ 				if (IS_ERR(qp->rumem)) {
+ 					ret = PTR_ERR(qp->rumem);
+@@ -275,8 +274,7 @@ struct ib_qp *pvrdma_create_qp(struct ib_pd *pd,
+ 				qp->srq = to_vsrq(init_attr->srq);
+ 			}
+ 
+-			qp->sumem = ib_umem_get(pd->uobject->context,
+-						ucmd.sbuf_addr,
++			qp->sumem = ib_umem_get(udata, ucmd.sbuf_addr,
+ 						ucmd.sbuf_size, 0, 0);
+ 			if (IS_ERR(qp->sumem)) {
+ 				if (!is_srq)
+diff --git a/drivers/infiniband/hw/vmw_pvrdma/pvrdma_srq.c b/drivers/infiniband/hw/vmw_pvrdma/pvrdma_srq.c
+index 06ba7c7a2235..951d9d68107a 100644
+--- a/drivers/infiniband/hw/vmw_pvrdma/pvrdma_srq.c
++++ b/drivers/infiniband/hw/vmw_pvrdma/pvrdma_srq.c
+@@ -153,9 +153,7 @@ struct ib_srq *pvrdma_create_srq(struct ib_pd *pd,
+ 		goto err_srq;
+ 	}
+ 
+-	srq->umem = ib_umem_get(pd->uobject->context,
+-				ucmd.buf_addr,
+-				ucmd.buf_size, 0, 0);
++	srq->umem = ib_umem_get(udata, ucmd.buf_addr, ucmd.buf_size, 0, 0);
+ 	if (IS_ERR(srq->umem)) {
+ 		ret = PTR_ERR(srq->umem);
+ 		goto err_srq;
+diff --git a/drivers/infiniband/sw/rdmavt/mr.c b/drivers/infiniband/sw/rdmavt/mr.c
+index e63e21783840..0bb6e39dd03a 100644
+--- a/drivers/infiniband/sw/rdmavt/mr.c
++++ b/drivers/infiniband/sw/rdmavt/mr.c
+@@ -388,8 +388,7 @@ struct ib_mr *rvt_reg_user_mr(struct ib_pd *pd, u64 start, u64 length,
+ 	if (length == 0)
+ 		return ERR_PTR(-EINVAL);
+ 
+-	umem = ib_umem_get(pd->uobject->context, start, length,
+-			   mr_access_flags, 0);
++	umem = ib_umem_get(udata, start, length, mr_access_flags, 0);
+ 	if (IS_ERR(umem))
+ 		return (void *)umem;
+ 
+diff --git a/drivers/infiniband/sw/rxe/rxe_mr.c b/drivers/infiniband/sw/rxe/rxe_mr.c
+index 37e43f1e1480..42f0f25e396c 100644
+--- a/drivers/infiniband/sw/rxe/rxe_mr.c
++++ b/drivers/infiniband/sw/rxe/rxe_mr.c
+@@ -170,7 +170,7 @@ int rxe_mem_init_user(struct rxe_pd *pd, u64 start,
+ 	void			*vaddr;
+ 	int err;
+ 
+-	umem = ib_umem_get(pd->ibpd.uobject->context, start, length, access, 0);
++	umem = ib_umem_get(udata, start, length, access, 0);
+ 	if (IS_ERR(umem)) {
+ 		pr_warn("err %d from rxe_umem_get\n",
+ 			(int)PTR_ERR(umem));
+diff --git a/include/rdma/ib_umem.h b/include/rdma/ib_umem.h
+index 5d3755ec5afa..73af05db04c7 100644
+--- a/include/rdma/ib_umem.h
++++ b/include/rdma/ib_umem.h
+@@ -36,6 +36,7 @@
+ #include <linux/list.h>
+ #include <linux/scatterlist.h>
+ #include <linux/workqueue.h>
++#include <rdma/ib_verbs.h>
+ 
+ struct ib_ucontext;
+ struct ib_umem_odp;
+@@ -80,7 +81,7 @@ static inline size_t ib_umem_num_pages(struct ib_umem *umem)
+ 
+ #ifdef CONFIG_INFINIBAND_USER_MEM
+ 
+-struct ib_umem *ib_umem_get(struct ib_ucontext *context, unsigned long addr,
++struct ib_umem *ib_umem_get(struct ib_udata *udata, unsigned long addr,
+ 			    size_t size, int access, int dmasync);
+ void ib_umem_release(struct ib_umem *umem);
+ int ib_umem_page_count(struct ib_umem *umem);
+@@ -91,9 +92,10 @@ int ib_umem_copy_from(void *dst, struct ib_umem *umem, size_t offset,
+ 
+ #include <linux/err.h>
+ 
+-static inline struct ib_umem *ib_umem_get(struct ib_ucontext *context,
++static inline struct ib_umem *ib_umem_get(struct ib_udata *udata,
+ 					  unsigned long addr, size_t size,
+-					  int access, int dmasync) {
++					  int access, int dmasync)
++{
+ 	return ERR_PTR(-EINVAL);
+ }
+ static inline void ib_umem_release(struct ib_umem *umem) { }
+* Unmerged path include/rdma/ib_verbs.h
