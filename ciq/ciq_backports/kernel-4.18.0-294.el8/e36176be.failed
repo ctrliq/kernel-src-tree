@@ -1,0 +1,414 @@
+mm/vmalloc: rework vmap_area_lock
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Uladzislau Rezki (Sony) <urezki@gmail.com>
+commit e36176be1c3920a487681e37158849b9f50189c4
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/e36176be.failed
+
+With the new allocation approach introduced in the 5.2 kernel, it
+becomes possible to get rid of one global spinlock.  By doing that we
+can further improve the KVA from the performance point of view.
+
+Basically we can have two independent locks, one for allocation part and
+another one for deallocation, because of two different entities: "free
+data structures" and "busy data structures".
+
+As a result, allocation/deallocation operations can still interfere
+between each other in case of running simultaneously on different CPUs,
+it means there is still dependency, but with two locks it becomes lower.
+
+Summarizing:
+  - it reduces the high lock contention
+  - it allows to perform operations on "free" and "busy"
+    trees in parallel on different CPUs. Please note it
+    does not solve scalability issue.
+
+Test results:
+
+In order to evaluate this patch, we can run "vmalloc test driver" to see
+how many CPU cycles it takes to complete all test cases running
+sequentially.  All online CPUs run it so it will cause a high lock
+contention.
+
+HiKey 960, ARM64, 8xCPUs, big.LITTLE:
+
+<snip>
+    sudo ./test_vmalloc.sh sequential_test_order=1
+<snip>
+
+<default>
+[  390.950557] All test took CPU0=457126382 cycles
+[  391.046690] All test took CPU1=454763452 cycles
+[  391.128586] All test took CPU2=454539334 cycles
+[  391.222669] All test took CPU3=455649517 cycles
+[  391.313946] All test took CPU4=388272196 cycles
+[  391.410425] All test took CPU5=384036264 cycles
+[  391.492219] All test took CPU6=387432964 cycles
+[  391.578433] All test took CPU7=387201996 cycles
+<default>
+
+<patched>
+[  304.721224] All test took CPU0=391521310 cycles
+[  304.821219] All test took CPU1=393533002 cycles
+[  304.917120] All test took CPU2=392243032 cycles
+[  305.008986] All test took CPU3=392353853 cycles
+[  305.108944] All test took CPU4=297630721 cycles
+[  305.196406] All test took CPU5=297548736 cycles
+[  305.288602] All test took CPU6=297092392 cycles
+[  305.381088] All test took CPU7=297293597 cycles
+<patched>
+
+~14%-23% patched variant is better.
+
+Link: http://lkml.kernel.org/r/20191022155800.20468-1-urezki@gmail.com
+	Signed-off-by: Uladzislau Rezki (Sony) <urezki@gmail.com>
+	Acked-by: Andrew Morton <akpm@linux-foundation.org>
+	Cc: Hillf Danton <hdanton@sina.com>
+	Cc: Michal Hocko <mhocko@suse.com>
+	Cc: Matthew Wilcox <willy@infradead.org>
+	Cc: Oleksiy Avramchenko <oleksiy.avramchenko@sonymobile.com>
+	Cc: Steven Rostedt <rostedt@goodmis.org>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit e36176be1c3920a487681e37158849b9f50189c4)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	mm/vmalloc.c
+diff --cc mm/vmalloc.c
+index c82a0db1aefc,33e245ebe70c..000000000000
+--- a/mm/vmalloc.c
++++ b/mm/vmalloc.c
+@@@ -327,10 -326,12 +327,11 @@@ EXPORT_SYMBOL(vmalloc_to_pfn)
+  
+  /*** Global kva allocator ***/
+  
+ -#define DEBUG_AUGMENT_PROPAGATE_CHECK 0
+ -#define DEBUG_AUGMENT_LOWEST_MATCH_CHECK 0
+ -
+ +#define VM_LAZY_FREE	0x02
+ +#define VM_VM_AREA	0x04
+  
+  static DEFINE_SPINLOCK(vmap_area_lock);
++ static DEFINE_SPINLOCK(free_vmap_area_lock);
+  /* Export for kexec only */
+  LIST_HEAD(vmap_area_list);
+  static LLIST_HEAD(vmap_purge_list);
+@@@ -429,87 -1087,55 +430,134 @@@ static struct vmap_area *alloc_vmap_are
+  	 * Only scan the relevant parts containing pointers to other objects
+  	 * to avoid false negatives.
+  	 */
+ -	kmemleak_scan_area(&va->rb_node, SIZE_MAX, gfp_mask);
+ +	kmemleak_scan_area(&va->rb_node, SIZE_MAX, gfp_mask & GFP_RECLAIM_MASK);
+  
+  retry:
+++<<<<<<< HEAD
+ +	spin_lock(&vmap_area_lock);
+++=======
++ 	/*
++ 	 * Preload this CPU with one extra vmap_area object. It is used
++ 	 * when fit type of free area is NE_FIT_TYPE. Please note, it
++ 	 * does not guarantee that an allocation occurs on a CPU that
++ 	 * is preloaded, instead we minimize the case when it is not.
++ 	 * It can happen because of cpu migration, because there is a
++ 	 * race until the below spinlock is taken.
++ 	 *
++ 	 * The preload is done in non-atomic context, thus it allows us
++ 	 * to use more permissive allocation masks to be more stable under
++ 	 * low memory condition and high memory pressure. In rare case,
++ 	 * if not preloaded, GFP_NOWAIT is used.
++ 	 *
++ 	 * Set "pva" to NULL here, because of "retry" path.
++ 	 */
++ 	pva = NULL;
++ 
++ 	if (!this_cpu_read(ne_fit_preload_node))
++ 		/*
++ 		 * Even if it fails we do not really care about that.
++ 		 * Just proceed as it is. If needed "overflow" path
++ 		 * will refill the cache we allocate from.
++ 		 */
++ 		pva = kmem_cache_alloc_node(vmap_area_cachep, gfp_mask, node);
++ 
++ 	spin_lock(&free_vmap_area_lock);
++ 
++ 	if (pva && __this_cpu_cmpxchg(ne_fit_preload_node, NULL, pva))
++ 		kmem_cache_free(vmap_area_cachep, pva);
++ 
+++>>>>>>> e36176be1c39 (mm/vmalloc: rework vmap_area_lock)
+  	/*
+ -	 * If an allocation fails, the "vend" address is
+ -	 * returned. Therefore trigger the overflow path.
+ +	 * Invalidate cache if we have more permissive parameters.
+ +	 * cached_hole_size notes the largest hole noticed _below_
+ +	 * the vmap_area cached in free_vmap_cache: if size fits
+ +	 * into that hole, we want to scan from vstart to reuse
+ +	 * the hole instead of allocating above free_vmap_cache.
+ +	 * Note that __free_vmap_area may update free_vmap_cache
+ +	 * without updating cached_hole_size or cached_align.
+  	 */
+++<<<<<<< HEAD
+ +	if (!free_vmap_cache ||
+ +			size < cached_hole_size ||
+ +			vstart < cached_vstart ||
+ +			align < cached_align) {
+ +nocache:
+ +		cached_hole_size = 0;
+ +		free_vmap_cache = NULL;
+ +	}
+ +	/* record if we encounter less permissive parameters */
+ +	cached_vstart = vstart;
+ +	cached_align = align;
+ +
+ +	/* find starting point for our search */
+ +	if (free_vmap_cache) {
+ +		first = rb_entry(free_vmap_cache, struct vmap_area, rb_node);
+ +		addr = ALIGN(first->va_end, align);
+ +		if (addr < vstart)
+ +			goto nocache;
+ +		if (addr + size < addr)
+ +			goto overflow;
+ +
+ +	} else {
+ +		addr = ALIGN(vstart, align);
+ +		if (addr + size < addr)
+ +			goto overflow;
+ +
+ +		n = vmap_area_root.rb_node;
+ +		first = NULL;
+ +
+ +		while (n) {
+ +			struct vmap_area *tmp;
+ +			tmp = rb_entry(n, struct vmap_area, rb_node);
+ +			if (tmp->va_end >= addr) {
+ +				first = tmp;
+ +				if (tmp->va_start <= addr)
+ +					break;
+ +				n = n->rb_left;
+ +			} else
+ +				n = n->rb_right;
+ +		}
+ +
+ +		if (!first)
+ +			goto found;
+ +	}
+ +
+ +	/* from the starting point, walk areas until a suitable hole is found */
+ +	while (addr + size > first->va_start && addr + size <= vend) {
+ +		if (addr + cached_hole_size < first->va_start)
+ +			cached_hole_size = first->va_start - addr;
+ +		addr = ALIGN(first->va_end, align);
+ +		if (addr + size < addr)
+ +			goto overflow;
+ +
+ +		if (list_is_last(&first->list, &vmap_area_list))
+ +			goto found;
+ +
+ +		first = list_next_entry(first, list);
+ +	}
+ +
+ +found:
+ +	if (addr + size > vend)
+++=======
++ 	addr = __alloc_vmap_area(size, align, vstart, vend);
++ 	spin_unlock(&free_vmap_area_lock);
++ 
++ 	if (unlikely(addr == vend))
+++>>>>>>> e36176be1c39 (mm/vmalloc: rework vmap_area_lock)
+  		goto overflow;
+  
+  	va->va_start = addr;
+  	va->va_end = addr + size;
+++<<<<<<< HEAD
+ +	va->flags = 0;
+ +	__insert_vmap_area(va);
+ +	free_vmap_cache = &va->rb_node;
+++=======
++ 	va->vm = NULL;
++ 
++ 	spin_lock(&vmap_area_lock);
++ 	insert_vmap_area(va, &vmap_area_root, &vmap_area_list);
+++>>>>>>> e36176be1c39 (mm/vmalloc: rework vmap_area_lock)
+  	spin_unlock(&vmap_area_lock);
+  
+  	BUG_ON(!IS_ALIGNED(va->va_start, align));
+@@@ -554,41 -1180,6 +601,44 @@@ int unregister_vmap_purge_notifier(stru
+  }
+  EXPORT_SYMBOL_GPL(unregister_vmap_purge_notifier);
+  
+++<<<<<<< HEAD
+ +static void __free_vmap_area(struct vmap_area *va)
+ +{
+ +	BUG_ON(RB_EMPTY_NODE(&va->rb_node));
+ +
+ +	if (free_vmap_cache) {
+ +		if (va->va_end < cached_vstart) {
+ +			free_vmap_cache = NULL;
+ +		} else {
+ +			struct vmap_area *cache;
+ +			cache = rb_entry(free_vmap_cache, struct vmap_area, rb_node);
+ +			if (va->va_start <= cache->va_start) {
+ +				free_vmap_cache = rb_prev(&va->rb_node);
+ +				/*
+ +				 * We don't try to update cached_hole_size or
+ +				 * cached_align, but it won't go very wrong.
+ +				 */
+ +			}
+ +		}
+ +	}
+ +	rb_erase(&va->rb_node, &vmap_area_root);
+ +	RB_CLEAR_NODE(&va->rb_node);
+ +	list_del_rcu(&va->list);
+ +
+ +	/*
+ +	 * Track the highest possible candidate for pcpu area
+ +	 * allocation.  Areas outside of vmalloc area can be returned
+ +	 * here too, consider only end addresses which fall inside
+ +	 * vmalloc area proper.
+ +	 */
+ +	if (va->va_end > VMALLOC_START && va->va_end <= VMALLOC_END)
+ +		vmap_area_pcpu_hole = max(vmap_area_pcpu_hole, va->va_end);
+ +
+ +	kfree_rcu(va, rcu_head);
+ +}
+ +
+++=======
+++>>>>>>> e36176be1c39 (mm/vmalloc: rework vmap_area_lock)
+  /*
+   * Free a region of KVA allocated by alloc_vmap_area
+   */
+@@@ -1377,7 -2038,13 +1437,17 @@@ static inline void setup_vmalloc_vm_loc
+  	vm->size = va->va_end - va->va_start;
+  	vm->caller = caller;
+  	va->vm = vm;
+++<<<<<<< HEAD
+ +	va->flags |= VM_VM_AREA;
+++=======
++ }
++ 
++ static void setup_vmalloc_vm(struct vm_struct *vm, struct vmap_area *va,
++ 			      unsigned long flags, const void *caller)
++ {
++ 	spin_lock(&vmap_area_lock);
++ 	setup_vmalloc_vm_locked(vm, va, flags, caller);
+++>>>>>>> e36176be1c39 (mm/vmalloc: rework vmap_area_lock)
+  	spin_unlock(&vmap_area_lock);
+  }
+  
+@@@ -2696,35 -3355,92 +2766,103 @@@ retry
+  		area = (area + nr_vms - 1) % nr_vms;
+  		if (area == term_area)
+  			break;
+ -
+  		start = offsets[area];
+  		end = start + sizes[area];
+ -		va = pvm_find_va_enclose_addr(base + end);
+ +		pvm_find_next_prev(base + end, &next, &prev);
+  	}
+ -
+ +found:
+  	/* we've found a fitting base, insert all va's */
+  	for (area = 0; area < nr_vms; area++) {
+ -		int ret;
+ +		struct vmap_area *va = vas[area];
+ +
+++<<<<<<< HEAD
+ +		va->va_start = base + offsets[area];
+ +		va->va_end = va->va_start + sizes[area];
+ +		__insert_vmap_area(va);
+ +	}
+  
+ +	vmap_area_pcpu_hole = base + offsets[last_area];
+ +
+ +	spin_unlock(&vmap_area_lock);
+++=======
++ 		start = base + offsets[area];
++ 		size = sizes[area];
++ 
++ 		va = pvm_find_va_enclose_addr(start);
++ 		if (WARN_ON_ONCE(va == NULL))
++ 			/* It is a BUG(), but trigger recovery instead. */
++ 			goto recovery;
++ 
++ 		type = classify_va_fit_type(va, start, size);
++ 		if (WARN_ON_ONCE(type == NOTHING_FIT))
++ 			/* It is a BUG(), but trigger recovery instead. */
++ 			goto recovery;
++ 
++ 		ret = adjust_va_to_fit_type(va, start, size, type);
++ 		if (unlikely(ret))
++ 			goto recovery;
++ 
++ 		/* Allocated area. */
++ 		va = vas[area];
++ 		va->va_start = start;
++ 		va->va_end = start + size;
++ 	}
++ 
++ 	spin_unlock(&free_vmap_area_lock);
+++>>>>>>> e36176be1c39 (mm/vmalloc: rework vmap_area_lock)
+  
+  	/* insert all vm's */
+- 	for (area = 0; area < nr_vms; area++)
+- 		setup_vmalloc_vm(vms[area], vas[area], VM_ALLOC,
++ 	spin_lock(&vmap_area_lock);
++ 	for (area = 0; area < nr_vms; area++) {
++ 		insert_vmap_area(vas[area], &vmap_area_root, &vmap_area_list);
++ 
++ 		setup_vmalloc_vm_locked(vms[area], vas[area], VM_ALLOC,
+  				 pcpu_get_vm_areas);
++ 	}
++ 	spin_unlock(&vmap_area_lock);
+  
+  	kfree(vas);
+  	return vms;
+  
+++<<<<<<< HEAD
+++=======
++ recovery:
++ 	/*
++ 	 * Remove previously allocated areas. There is no
++ 	 * need in removing these areas from the busy tree,
++ 	 * because they are inserted only on the final step
++ 	 * and when pcpu_get_vm_areas() is success.
++ 	 */
++ 	while (area--) {
++ 		merge_or_add_vmap_area(vas[area],
++ 			&free_vmap_area_root, &free_vmap_area_list);
++ 		vas[area] = NULL;
++ 	}
++ 
++ overflow:
++ 	spin_unlock(&free_vmap_area_lock);
++ 	if (!purged) {
++ 		purge_vmap_area_lazy();
++ 		purged = true;
++ 
++ 		/* Before "retry", check if we recover. */
++ 		for (area = 0; area < nr_vms; area++) {
++ 			if (vas[area])
++ 				continue;
++ 
++ 			vas[area] = kmem_cache_zalloc(
++ 				vmap_area_cachep, GFP_KERNEL);
++ 			if (!vas[area])
++ 				goto err_free;
++ 		}
++ 
++ 		goto retry;
++ 	}
++ 
+++>>>>>>> e36176be1c39 (mm/vmalloc: rework vmap_area_lock)
+  err_free:
+  	for (area = 0; area < nr_vms; area++) {
+ -		if (vas[area])
+ -			kmem_cache_free(vmap_area_cachep, vas[area]);
+ -
+ +		kfree(vas[area]);
+  		kfree(vms[area]);
+  	}
+  err_free2:
+* Unmerged path mm/vmalloc.c
