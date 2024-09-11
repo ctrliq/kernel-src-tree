@@ -4230,12 +4230,10 @@ static int trace__replay(struct trace *trace)
 	if (err)
 		goto out;
 
-	evsel = perf_evlist__find_tracepoint_by_name(session->evlist,
-						     "raw_syscalls:sys_enter");
+	evsel = evlist__find_tracepoint_by_name(session->evlist, "raw_syscalls:sys_enter");
 	/* older kernels have syscalls tp versus raw_syscalls */
 	if (evsel == NULL)
-		evsel = perf_evlist__find_tracepoint_by_name(session->evlist,
-							     "syscalls:sys_enter");
+		evsel = evlist__find_tracepoint_by_name(session->evlist, "syscalls:sys_enter");
 
 	if (evsel &&
 	    (evsel__init_raw_syscall_tp(evsel, trace__sys_enter) < 0 ||
@@ -4244,11 +4242,9 @@ static int trace__replay(struct trace *trace)
 		goto out;
 	}
 
-	evsel = perf_evlist__find_tracepoint_by_name(session->evlist,
-						     "raw_syscalls:sys_exit");
+	evsel = evlist__find_tracepoint_by_name(session->evlist, "raw_syscalls:sys_exit");
 	if (evsel == NULL)
-		evsel = perf_evlist__find_tracepoint_by_name(session->evlist,
-							     "syscalls:sys_exit");
+		evsel = evlist__find_tracepoint_by_name(session->evlist, "syscalls:sys_exit");
 	if (evsel &&
 	    (evsel__init_raw_syscall_tp(evsel, trace__sys_exit) < 0 ||
 	    perf_evsel__init_sc_tp_uint_field(evsel, ret))) {
@@ -4908,7 +4904,7 @@ int cmd_trace(int argc, const char **argv)
 	if (evsel) {
 		trace.syscalls.events.augmented = evsel;
 
-		evsel = perf_evlist__find_tracepoint_by_name(trace.evlist, "raw_syscalls:sys_enter");
+		evsel = evlist__find_tracepoint_by_name(trace.evlist, "raw_syscalls:sys_enter");
 		if (evsel == NULL) {
 			pr_err("ERROR: raw_syscalls:sys_enter not found in the augmented BPF object\n");
 			goto out;
