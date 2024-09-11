@@ -1,0 +1,369 @@
+RDMA/netdev: Hoist alloc_netdev_mqs out of the driver
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-80.el8
+commit-author Denis Drozdov <denisd@mellanox.com>
+commit f6a8a19bb11b46d60250ddc4e3e1ba6aa166f488
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-80.el8/f6a8a19b.failed
+
+netdev has several interfaces that expect to call alloc_netdev_mqs from
+the core code, with the driver only providing the arguments.  This is
+incompatible with the rdma_netdev interface that returns the netdev
+directly.
+
+Thus re-organize the API used by ipoib so that the verbs core code calls
+alloc_netdev_mqs for the driver. This is done by allowing the drivers to
+provide the allocation parameters via a 'get_params' callback and then
+initializing an allocated netdev as a second step.
+
+Fixes: cd565b4b51e5 ("IB/IPoIB: Support acceleration options callbacks")
+	Signed-off-by: Jason Gunthorpe <jgg@mellanox.com>
+	Signed-off-by: Denis Drozdov <denisd@mellanox.com>
+	Signed-off-by: Saeed Mahameed <saeedm@mellanox.com>
+(cherry picked from commit f6a8a19bb11b46d60250ddc4e3e1ba6aa166f488)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/infiniband/hw/mlx5/main.c
+#	drivers/net/ethernet/mellanox/mlx5/core/ipoib/ipoib.c
+#	include/linux/mlx5/driver.h
+#	include/rdma/ib_verbs.h
+diff --cc drivers/infiniband/hw/mlx5/main.c
+index 04ebdfad018d,5d9b7f62a0ba..000000000000
+--- a/drivers/infiniband/hw/mlx5/main.c
++++ b/drivers/infiniband/hw/mlx5/main.c
+@@@ -4898,32 -5163,14 +4898,43 @@@ done
+  	return num_counters;
+  }
+  
+++<<<<<<< HEAD
+ +static void mlx5_ib_free_rdma_netdev(struct net_device *netdev)
+ +{
+ +	return mlx5_rdma_netdev_free(netdev);
+ +}
+ +
+ +static struct net_device*
+ +mlx5_ib_alloc_rdma_netdev(struct ib_device *hca,
+ +			  u8 port_num,
+ +			  enum rdma_netdev_t type,
+ +			  const char *name,
+ +			  unsigned char name_assign_type,
+ +			  void (*setup)(struct net_device *))
+ +{
+ +	struct net_device *netdev;
+ +	struct rdma_netdev *rn;
+ +
+++=======
++ static int mlx5_ib_rn_get_params(struct ib_device *device, u8 port_num,
++ 				 enum rdma_netdev_t type,
++ 				 struct rdma_netdev_alloc_params *params)
++ {
+++>>>>>>> f6a8a19bb11b (RDMA/netdev: Hoist alloc_netdev_mqs out of the driver)
+  	if (type != RDMA_NETDEV_IPOIB)
+- 		return ERR_PTR(-EOPNOTSUPP);
++ 		return -EOPNOTSUPP;
+  
+++<<<<<<< HEAD
+ +	netdev = mlx5_rdma_netdev_alloc(to_mdev(hca)->mdev, hca,
+ +					name, setup);
+ +	if (likely(!IS_ERR_OR_NULL(netdev))) {
+ +		rn = netdev_priv(netdev);
+ +		rn->free_rdma_netdev = mlx5_ib_free_rdma_netdev;
+ +	}
+ +	return netdev;
+++=======
++ 	return mlx5_rdma_rn_get_params(to_mdev(device)->mdev, device, params);
+++>>>>>>> f6a8a19bb11b (RDMA/netdev: Hoist alloc_netdev_mqs out of the driver)
+  }
+  
+  static void delay_drop_debugfs_cleanup(struct mlx5_ib_dev *dev)
+diff --cc drivers/net/ethernet/mellanox/mlx5/core/ipoib/ipoib.c
+index 0e07e0bb17d3,af1a95f80404..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx5/core/ipoib/ipoib.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/ipoib/ipoib.c
+@@@ -627,44 -642,43 +627,50 @@@ static int mlx5i_check_required_hca_cap
+  	return 0;
+  }
+  
+++<<<<<<< HEAD
+ +struct net_device *mlx5_rdma_netdev_alloc(struct mlx5_core_dev *mdev,
+ +					  struct ib_device *ibdev,
+ +					  const char *name,
+ +					  void (*setup)(struct net_device *))
+++=======
++ static void mlx5_rdma_netdev_free(struct net_device *netdev)
+  {
+- 	const struct mlx5e_profile *profile;
+- 	struct net_device *netdev;
+- 	struct mlx5i_priv *ipriv;
+- 	struct mlx5e_priv *epriv;
+- 	struct rdma_netdev *rn;
+- 	bool sub_interface;
+- 	int nch;
+- 	int err;
++ 	struct mlx5e_priv *priv = mlx5i_epriv(netdev);
++ 	struct mlx5i_priv *ipriv = priv->ppriv;
++ 	const struct mlx5e_profile *profile = priv->profile;
+  
+- 	if (mlx5i_check_required_hca_cap(mdev)) {
+- 		mlx5_core_warn(mdev, "Accelerated mode is not supported\n");
+- 		return ERR_PTR(-EOPNOTSUPP);
+- 	}
++ 	mlx5e_detach_netdev(priv);
++ 	profile->cleanup(priv);
++ 	destroy_workqueue(priv->wq);
+  
+- 	/* TODO: Need to find a better way to check if child device*/
+- 	sub_interface = (mdev->mlx5e_res.pdn != 0);
++ 	if (!ipriv->sub_interface) {
++ 		mlx5i_pkey_qpn_ht_cleanup(netdev);
++ 		mlx5e_destroy_mdev_resources(priv->mdev);
++ 	}
++ }
+  
+- 	if (sub_interface)
+- 		profile = mlx5i_pkey_get_profile();
+- 	else
+- 		profile = &mlx5i_nic_profile;
++ static bool mlx5_is_sub_interface(struct mlx5_core_dev *mdev)
+++>>>>>>> f6a8a19bb11b (RDMA/netdev: Hoist alloc_netdev_mqs out of the driver)
++ {
++ 	return mdev->mlx5e_res.pdn != 0;
++ }
+  
+- 	nch = profile->max_nch(mdev);
++ static const struct mlx5e_profile *mlx5_get_profile(struct mlx5_core_dev *mdev)
++ {
++ 	if (mlx5_is_sub_interface(mdev))
++ 		return mlx5i_pkey_get_profile();
++ 	return &mlx5i_nic_profile;
++ }
+  
+- 	netdev = alloc_netdev_mqs(sizeof(struct mlx5i_priv) + sizeof(struct mlx5e_priv),
+- 				  name, NET_NAME_UNKNOWN,
+- 				  setup,
+- 				  nch * MLX5E_MAX_NUM_TC,
+- 				  nch);
+- 	if (!netdev) {
+- 		mlx5_core_warn(mdev, "alloc_netdev_mqs failed\n");
+- 		return NULL;
+- 	}
++ static int mlx5_rdma_setup_rn(struct ib_device *ibdev, u8 port_num,
++ 			      struct net_device *netdev, void *param)
++ {
++ 	struct mlx5_core_dev *mdev = (struct mlx5_core_dev *)param;
++ 	const struct mlx5e_profile *prof = mlx5_get_profile(mdev);
++ 	struct mlx5i_priv *ipriv;
++ 	struct mlx5e_priv *epriv;
++ 	struct rdma_netdev *rn;
++ 	int err;
+  
+  	ipriv = netdev_priv(netdev);
+  	epriv = mlx5i_epriv(netdev);
+@@@ -700,33 -714,40 +706,66 @@@
+  	rn->detach_mcast = mlx5i_detach_mcast;
+  	rn->set_id = mlx5i_set_pkey_index;
+  
+++<<<<<<< HEAD
+ +	return netdev;
+++=======
++ 	netdev->priv_destructor = mlx5_rdma_netdev_free;
++ 	netdev->needs_free_netdev = 1;
++ 
++ 	return 0;
+++>>>>>>> f6a8a19bb11b (RDMA/netdev: Hoist alloc_netdev_mqs out of the driver)
+  
+  destroy_ht:
+  	mlx5i_pkey_qpn_ht_cleanup(netdev);
+  destroy_wq:
+  	destroy_workqueue(epriv->wq);
+- err_free_netdev:
+- 	free_netdev(netdev);
+- 
+- 	return NULL;
++ 	return err;
+  }
+++<<<<<<< HEAD
+ +EXPORT_SYMBOL(mlx5_rdma_netdev_alloc);
+ +
+ +void mlx5_rdma_netdev_free(struct net_device *netdev)
+ +{
+ +	struct mlx5e_priv *priv = mlx5i_epriv(netdev);
+ +	struct mlx5i_priv *ipriv = priv->ppriv;
+ +	const struct mlx5e_profile *profile = priv->profile;
+ +
+ +	mlx5e_detach_netdev(priv);
+ +	profile->cleanup(priv);
+ +	destroy_workqueue(priv->wq);
+ +
+ +	if (!ipriv->sub_interface) {
+ +		mlx5i_pkey_qpn_ht_cleanup(netdev);
+ +		mlx5e_destroy_mdev_resources(priv->mdev);
+ +	}
+ +	free_netdev(netdev);
+ +}
+ +EXPORT_SYMBOL(mlx5_rdma_netdev_free);
+++=======
++ 
++ int mlx5_rdma_rn_get_params(struct mlx5_core_dev *mdev,
++ 			    struct ib_device *device,
++ 			    struct rdma_netdev_alloc_params *params)
++ {
++ 	int nch;
++ 	int rc;
++ 
++ 	rc = mlx5i_check_required_hca_cap(mdev);
++ 	if (rc)
++ 		return rc;
++ 
++ 	nch = mlx5_get_profile(mdev)->max_nch(mdev);
++ 
++ 	*params = (struct rdma_netdev_alloc_params){
++ 		.sizeof_priv = sizeof(struct mlx5i_priv) +
++ 			       sizeof(struct mlx5e_priv),
++ 		.txqs = nch * MLX5E_MAX_NUM_TC,
++ 		.rxqs = nch,
++ 		.param = mdev,
++ 		.initialize_rdma_netdev = mlx5_rdma_setup_rn,
++ 	};
++ 
++ 	return 0;
++ }
++ EXPORT_SYMBOL(mlx5_rdma_rn_get_params);
+++>>>>>>> f6a8a19bb11b (RDMA/netdev: Hoist alloc_netdev_mqs out of the driver)
+diff --cc include/linux/mlx5/driver.h
+index 367b6f4dfc69,4b75796cac23..000000000000
+--- a/include/linux/mlx5/driver.h
++++ b/include/linux/mlx5/driver.h
+@@@ -1227,24 -1228,15 +1227,31 @@@ int mlx5_lag_query_cong_counters(struc
+  struct mlx5_uars_page *mlx5_get_uars_page(struct mlx5_core_dev *mdev);
+  void mlx5_put_uars_page(struct mlx5_core_dev *mdev, struct mlx5_uars_page *up);
+  
+++<<<<<<< HEAD
+ +#ifndef CONFIG_MLX5_CORE_IPOIB
+ +static inline
+ +struct net_device *mlx5_rdma_netdev_alloc(struct mlx5_core_dev *mdev,
+ +					  struct ib_device *ibdev,
+ +					  const char *name,
+ +					  void (*setup)(struct net_device *))
+ +{
+ +	return ERR_PTR(-EOPNOTSUPP);
+ +}
+ +
+ +static inline void mlx5_rdma_netdev_free(struct net_device *netdev) {}
+ +#else
+++=======
++ #ifdef CONFIG_MLX5_CORE_IPOIB
+++>>>>>>> f6a8a19bb11b (RDMA/netdev: Hoist alloc_netdev_mqs out of the driver)
+  struct net_device *mlx5_rdma_netdev_alloc(struct mlx5_core_dev *mdev,
+  					  struct ib_device *ibdev,
+  					  const char *name,
+  					  void (*setup)(struct net_device *));
+ +void mlx5_rdma_netdev_free(struct net_device *netdev);
+  #endif /* CONFIG_MLX5_CORE_IPOIB */
++ int mlx5_rdma_rn_get_params(struct mlx5_core_dev *mdev,
++ 			    struct ib_device *device,
++ 			    struct rdma_netdev_alloc_params *params);
+  
+  struct mlx5_profile {
+  	u64	mask;
+diff --cc include/rdma/ib_verbs.h
+index 1760f50c20d6,020216cee8f1..000000000000
+--- a/include/rdma/ib_verbs.h
++++ b/include/rdma/ib_verbs.h
+@@@ -4086,4 -4189,13 +4100,16 @@@ ib_get_vector_affinity(struct ib_devic
+   */
+  void rdma_roce_rescan_device(struct ib_device *ibdev);
+  
+++<<<<<<< HEAD
+++=======
++ struct ib_ucontext *ib_uverbs_get_ucontext(struct ib_uverbs_file *ufile);
++ 
++ int uverbs_destroy_def_handler(struct ib_uverbs_file *file,
++ 			       struct uverbs_attr_bundle *attrs);
++ 
++ struct net_device *rdma_alloc_netdev(struct ib_device *device, u8 port_num,
++ 				     enum rdma_netdev_t type, const char *name,
++ 				     unsigned char name_assign_type,
++ 				     void (*setup)(struct net_device *));
+++>>>>>>> f6a8a19bb11b (RDMA/netdev: Hoist alloc_netdev_mqs out of the driver)
+  #endif /* IB_VERBS_H */
+diff --git a/drivers/infiniband/core/verbs.c b/drivers/infiniband/core/verbs.c
+index 9d6beb948535..ecbe532bd3f1 100644
+--- a/drivers/infiniband/core/verbs.c
++++ b/drivers/infiniband/core/verbs.c
+@@ -2344,3 +2344,35 @@ void ib_drain_qp(struct ib_qp *qp)
+ 		ib_drain_rq(qp);
+ }
+ EXPORT_SYMBOL(ib_drain_qp);
++
++struct net_device *rdma_alloc_netdev(struct ib_device *device, u8 port_num,
++				     enum rdma_netdev_t type, const char *name,
++				     unsigned char name_assign_type,
++				     void (*setup)(struct net_device *))
++{
++	struct rdma_netdev_alloc_params params;
++	struct net_device *netdev;
++	int rc;
++
++	if (!device->rdma_netdev_get_params)
++		return ERR_PTR(-EOPNOTSUPP);
++
++	rc = device->rdma_netdev_get_params(device, port_num, type, &params);
++	if (rc)
++		return ERR_PTR(rc);
++
++	netdev = alloc_netdev_mqs(params.sizeof_priv, name, name_assign_type,
++				  setup, params.txqs, params.rxqs);
++	if (!netdev)
++		return ERR_PTR(-ENOMEM);
++
++	rc = params.initialize_rdma_netdev(device, port_num, netdev,
++					   params.param);
++	if (rc) {
++		free_netdev(netdev);
++		return ERR_PTR(rc);
++	}
++
++	return netdev;
++}
++EXPORT_SYMBOL(rdma_alloc_netdev);
+* Unmerged path drivers/infiniband/hw/mlx5/main.c
+diff --git a/drivers/infiniband/ulp/ipoib/ipoib_main.c b/drivers/infiniband/ulp/ipoib/ipoib_main.c
+index 94512d9e8358..6bbb8155b366 100644
+--- a/drivers/infiniband/ulp/ipoib/ipoib_main.c
++++ b/drivers/infiniband/ulp/ipoib/ipoib_main.c
+@@ -2022,20 +2022,15 @@ static struct net_device *ipoib_get_netdev(struct ib_device *hca, u8 port,
+ {
+ 	struct net_device *dev;
+ 
+-	if (hca->alloc_rdma_netdev) {
+-		dev = hca->alloc_rdma_netdev(hca, port,
+-					     RDMA_NETDEV_IPOIB, name,
+-					     NET_NAME_UNKNOWN,
+-					     ipoib_setup_common);
+-		if (IS_ERR_OR_NULL(dev) && PTR_ERR(dev) != -EOPNOTSUPP)
+-			return NULL;
+-	}
+-
+-	if (!hca->alloc_rdma_netdev || PTR_ERR(dev) == -EOPNOTSUPP)
+-		dev = ipoib_create_netdev_default(hca, name, NET_NAME_UNKNOWN,
+-						  ipoib_setup_common);
++	dev = rdma_alloc_netdev(hca, port, RDMA_NETDEV_IPOIB, name,
++				NET_NAME_UNKNOWN, ipoib_setup_common);
++	if (!IS_ERR(dev))
++		return dev;
++	if (PTR_ERR(dev) != -EOPNOTSUPP)
++		return NULL;
+ 
+-	return dev;
++	return ipoib_create_netdev_default(hca, name, NET_NAME_UNKNOWN,
++					   ipoib_setup_common);
+ }
+ 
+ struct ipoib_dev_priv *ipoib_intf_alloc(struct ib_device *hca, u8 port,
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/ipoib/ipoib.c
+* Unmerged path include/linux/mlx5/driver.h
+* Unmerged path include/rdma/ib_verbs.h
