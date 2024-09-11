@@ -1,0 +1,130 @@
+Bluetooth: btusb: Add workaround for remote-wakeup issues with Barrot 8041a02 fake CSR controllers
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-310.el8
+commit-author Hans de Goede <hdegoede@redhat.com>
+commit 0671c0662383eefc272e107364cba7fe229dee44
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-310.el8/0671c066.failed
+
+With the recent btusb change to detect and deal with more fake CSR
+controllers, I decided to see if fake CSR controllers with Barrot
+8041a02 chips would now work.
+
+After much experimentation I came to the conclusion that it works, if I
+have autosuspend enabled initially and then disable it after the device
+has suspended at least once. Yes this is very weird, but I've tried many
+things, like manually clearing the remote-wakeup feature. Doing a
+runtime-resume + runtime suspend is the only way to get the receiver
+to actually report received data (and/or pairing info) through its
+bulk rx endpoint.
+
+But the funkyness of the bulk-endpoint does not stop there, I mainly
+found out about this problem, because with autosuspend enabled
+(which usually ensures the suspend at least once condition is met),
+the receiver stops reporting received data through its bulk rx endpoint
+as soon as autosuspend kicks in. So I initially just disabled
+autosuspend, but then the receiver does not work at all.
+
+This was with a fake CSR receiver with a Barrot 8041a02 chip with a
+bcdDevice value of 0x8891, a lmp_subver of 0x1012, a hci_rev of 0x0810
+and a hci_ver of BLUETOOTH_VER_4_0.
+
+Summarizing this specific fake CSR receiver has the following 2 issues:
+
+1. The bulk rx endpoint will never report any data unless
+the device was suspended at least once.
+
+2. They will not wakeup when autosuspended and receiving data on their
+bulk rx endpoint from e.g. a keyboard or mouse (IOW remote-wakeup support
+is broken for the bulk endpoint).
+
+Add a workaround for 1. which enables runtime-suspend, force-suspends
+the hci and then wakes-it up by disabling runtime-suspend again.
+
+Add a workaround for 2. which clears the hci's can_wake flag, this way
+the hci will still be autosuspended when it is not open.
+
+	Signed-off-by: Hans de Goede <hdegoede@redhat.com>
+	Signed-off-by: Marcel Holtmann <marcel@holtmann.org>
+	Signed-off-by: Johan Hedberg <johan.hedberg@intel.com>
+(cherry picked from commit 0671c0662383eefc272e107364cba7fe229dee44)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/bluetooth/btusb.c
+diff --cc drivers/bluetooth/btusb.c
+index fa942ef1d752,03b83aa91277..000000000000
+--- a/drivers/bluetooth/btusb.c
++++ b/drivers/bluetooth/btusb.c
+@@@ -1798,8 -1789,12 +1798,13 @@@ static int btusb_setup_bcm92035(struct 
+  
+  static int btusb_setup_csr(struct hci_dev *hdev)
+  {
+ -	struct btusb_data *data = hci_get_drvdata(hdev);
+ -	u16 bcdDevice = le16_to_cpu(data->udev->descriptor.bcdDevice);
+  	struct hci_rp_read_local_version *rp;
+  	struct sk_buff *skb;
+++<<<<<<< HEAD
+++=======
++ 	bool is_fake = false;
++ 	int ret;
+++>>>>>>> 0671c0662383 (Bluetooth: btusb: Add workaround for remote-wakeup issues with Barrot 8041a02 fake CSR controllers)
+  
+  	BT_DBG("%s", hdev->name);
+  
+@@@ -1826,11 -1882,44 +1831,52 @@@
+  		 * early Bluetooth 1.1 device from CSR.
+  		 */
+  		clear_bit(HCI_QUIRK_RESET_ON_CLOSE, &hdev->quirks);
+++<<<<<<< HEAD
+ +
+ +		/* These fake CSR controllers have all a broken
+ +		 * stored link key handling and so just disable it.
+ +		 */
+ +		set_bit(HCI_QUIRK_BROKEN_STORED_LINK_KEY, &hdev->quirks);
+++=======
++ 		clear_bit(HCI_QUIRK_SIMULTANEOUS_DISCOVERY, &hdev->quirks);
++ 
++ 		/*
++ 		 * Special workaround for clones with a Barrot 8041a02 chip,
++ 		 * these clones are really messed-up:
++ 		 * 1. Their bulk rx endpoint will never report any data unless
++ 		 * the device was suspended at least once (yes really).
++ 		 * 2. They will not wakeup when autosuspended and receiving data
++ 		 * on their bulk rx endpoint from e.g. a keyboard or mouse
++ 		 * (IOW remote-wakeup support is broken for the bulk endpoint).
++ 		 *
++ 		 * To fix 1. enable runtime-suspend, force-suspend the
++ 		 * hci and then wake-it up by disabling runtime-suspend.
++ 		 *
++ 		 * To fix 2. clear the hci's can_wake flag, this way the hci
++ 		 * will still be autosuspended when it is not open.
++ 		 */
++ 		if (bcdDevice == 0x8891 &&
++ 		    le16_to_cpu(rp->lmp_subver) == 0x1012 &&
++ 		    le16_to_cpu(rp->hci_rev) == 0x0810 &&
++ 		    le16_to_cpu(rp->hci_ver) == BLUETOOTH_VER_4_0) {
++ 			bt_dev_warn(hdev, "CSR: detected a fake CSR dongle using a Barrot 8041a02 chip, this chip is very buggy and may have issues\n");
++ 
++ 			pm_runtime_allow(&data->udev->dev);
++ 
++ 			ret = pm_runtime_suspend(&data->udev->dev);
++ 			if (ret >= 0)
++ 				msleep(200);
++ 			else
++ 				bt_dev_err(hdev, "Failed to suspend the device for Barrot 8041a02 receive-issue workaround\n");
++ 
++ 			pm_runtime_forbid(&data->udev->dev);
++ 
++ 			device_set_wakeup_capable(&data->udev->dev, false);
++ 			/* Re-enable autosuspend if this was requested */
++ 			if (enable_autosuspend)
++ 				usb_enable_autosuspend(data->udev);
++ 		}
+++>>>>>>> 0671c0662383 (Bluetooth: btusb: Add workaround for remote-wakeup issues with Barrot 8041a02 fake CSR controllers)
+  	}
+  
+  	kfree_skb(skb);
+* Unmerged path drivers/bluetooth/btusb.c
