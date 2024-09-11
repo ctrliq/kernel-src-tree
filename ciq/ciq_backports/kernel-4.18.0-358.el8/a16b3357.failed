@@ -1,0 +1,108 @@
+exec: Allow load_misc_binary to call prepare_binprm unconditionally
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-358.el8
+commit-author Eric W. Biederman <ebiederm@xmission.com>
+commit a16b3357b2b8e910bb614254d8a7e84d2bd59b4c
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-358.el8/a16b3357.failed
+
+Add a flag preserve_creds that binfmt_misc can set to prevent
+credentials from being updated.  This allows binfmt_misc to always
+call prepare_binprm.  Allowing the credential computation logic to be
+consolidated.
+
+Not replacing the credentials with the interpreters credentials is
+safe because because an open file descriptor to the executable is
+passed to the interpreter.   As the interpreter does not need to
+reopen the executable it is guaranteed to see the same file that
+exec sees.
+
+Ref: c407c033de84 ("[PATCH] binfmt_misc: improve calculation of interpreter's credentials")
+Link: https://lkml.kernel.org/r/87imgszrwo.fsf_-_@x220.int.ebiederm.org
+	Acked-by: Linus Torvalds <torvalds@linux-foundation.org>
+	Reviewed-by: Kees Cook <keescook@chromium.org>
+	Signed-off-by: "Eric W. Biederman" <ebiederm@xmission.com>
+(cherry picked from commit a16b3357b2b8e910bb614254d8a7e84d2bd59b4c)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/exec.c
+diff --cc fs/exec.c
+index 267f61b63004,028e0e323af5..000000000000
+--- a/fs/exec.c
++++ b/fs/exec.c
+@@@ -1596,16 -1631,20 +1596,30 @@@ static void bprm_fill_uid(struct linux_
+   */
+  int prepare_binprm(struct linux_binprm *bprm)
+  {
+- 	int retval;
+  	loff_t pos = 0;
+  
+++<<<<<<< HEAD
+ +	bprm_fill_uid(bprm);
+ +
+ +	/* fill in binprm security blob */
+ +	retval = security_bprm_set_creds(bprm);
+ +	if (retval)
+ +		return retval;
+ +	bprm->called_set_creds = 1;
+++=======
++ 	/* Can the interpreter get to the executable without races? */
++ 	if (!bprm->preserve_creds) {
++ 		int retval;
++ 
++ 		/* Recompute parts of bprm->cred based on bprm->file */
++ 		bprm->active_secureexec = 0;
++ 		bprm_fill_uid(bprm);
++ 		retval = security_bprm_repopulate_creds(bprm);
++ 		if (retval)
++ 			return retval;
++ 	}
++ 	bprm->preserve_creds = 0;
+++>>>>>>> a16b3357b2b8 (exec: Allow load_misc_binary to call prepare_binprm unconditionally)
+  
+  	memset(bprm->buf, 0, BINPRM_BUF_SIZE);
+  	return kernel_read(bprm->file, bprm->buf, BINPRM_BUF_SIZE, &pos);
+diff --git a/fs/binfmt_misc.c b/fs/binfmt_misc.c
+index 46a3d149bb7f..96c43f403ced 100644
+--- a/fs/binfmt_misc.c
++++ b/fs/binfmt_misc.c
+@@ -217,19 +217,10 @@ static int load_misc_binary(struct linux_binprm *bprm)
+ 		goto error;
+ 
+ 	bprm->file = interp_file;
+-	if (fmt->flags & MISC_FMT_CREDENTIALS) {
+-		loff_t pos = 0;
+-
+-		/*
+-		 * No need to call prepare_binprm(), it's already been
+-		 * done.  bprm->buf is stale, update from interp_file.
+-		 */
+-		memset(bprm->buf, 0, BINPRM_BUF_SIZE);
+-		retval = kernel_read(bprm->file, bprm->buf, BINPRM_BUF_SIZE,
+-				&pos);
+-	} else
+-		retval = prepare_binprm(bprm);
++	if (fmt->flags & MISC_FMT_CREDENTIALS)
++		bprm->preserve_creds = 1;
+ 
++	retval = prepare_binprm(bprm);
+ 	if (retval < 0)
+ 		goto error;
+ 
+* Unmerged path fs/exec.c
+diff --git a/include/linux/binfmts.h b/include/linux/binfmts.h
+index 8c12228326b0..8366d025c16d 100644
+--- a/include/linux/binfmts.h
++++ b/include/linux/binfmts.h
+@@ -26,6 +26,8 @@ struct linux_binprm {
+ 	struct mm_struct *mm;
+ 	unsigned long p; /* current top of mem */
+ 	unsigned int
++		/* It is safe to use the creds of a script (see binfmt_misc) */
++		preserve_creds:1,
+ 		/*
+ 		 * True after the bprm_set_creds hook has been called once
+ 		 * (multiple calls can be made via prepare_binprm() for
