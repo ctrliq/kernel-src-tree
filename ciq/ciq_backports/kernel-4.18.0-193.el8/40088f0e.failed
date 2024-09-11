@@ -1,0 +1,113 @@
+xprtrdma: Add mechanism to place MRs back on the free list
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-193.el8
+commit-author Chuck Lever <chuck.lever@oracle.com>
+commit 40088f0e9b62d7fa033918b54ef45f8bf7d1ad1c
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-193.el8/40088f0e.failed
+
+When a marshal operation fails, any MRs that were already set up for
+that request are recycled. Recycling releases MRs and creates new
+ones, which is expensive.
+
+Since commit f2877623082b ("xprtrdma: Chain Send to FastReg WRs")
+was merged, recycling FRWRs is unnecessary. This is because before
+that commit, frwr_map had already posted FAST_REG Work Requests,
+so ownership of the MRs had already been passed to the NIC and thus
+dealing with them had to be delayed until they completed.
+
+Since that commit, however, FAST_REG WRs are posted at the same time
+as the Send WR. This means that if marshaling fails, we are certain
+the MRs are safe to simply unmap and place back on the free list
+because neither the Send nor the FAST_REG WRs have been posted yet.
+The kernel still has ownership of the MRs at this point.
+
+This reduces the total number of MRs that the xprt has to create
+under heavy workloads and makes the marshaling logic less brittle.
+
+	Signed-off-by: Chuck Lever <chuck.lever@oracle.com>
+	Signed-off-by: Anna Schumaker <Anna.Schumaker@Netapp.com>
+(cherry picked from commit 40088f0e9b62d7fa033918b54ef45f8bf7d1ad1c)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/sunrpc/xprtrdma/rpc_rdma.c
+#	net/sunrpc/xprtrdma/xprt_rdma.h
+diff --cc net/sunrpc/xprtrdma/rpc_rdma.c
+index 2469b4d91dbb,67d72d68ca6c..000000000000
+--- a/net/sunrpc/xprtrdma/rpc_rdma.c
++++ b/net/sunrpc/xprtrdma/rpc_rdma.c
+@@@ -872,15 -883,8 +872,20 @@@ rpcrdma_marshal_req(struct rpcrdma_xpr
+  
+  out_err:
+  	trace_xprtrdma_marshal_failed(rqst, ret);
+++<<<<<<< HEAD
+ +	switch (ret) {
+ +	case -EAGAIN:
+ +		xprt_wait_for_buffer_space(rqst->rq_task, NULL);
+ +		break;
+ +	case -ENOBUFS:
+ +		break;
+ +	default:
+ +		r_xprt->rx_stats.failed_marshal_count++;
+ +	}
+++=======
++ 	r_xprt->rx_stats.failed_marshal_count++;
++ 	frwr_reset(req);
+++>>>>>>> 40088f0e9b62 (xprtrdma: Add mechanism to place MRs back on the free list)
+  	return ret;
+  }
+  
+diff --cc net/sunrpc/xprtrdma/xprt_rdma.h
+index cc5a576b0242,a39652884308..000000000000
+--- a/net/sunrpc/xprtrdma/xprt_rdma.h
++++ b/net/sunrpc/xprtrdma/xprt_rdma.h
+@@@ -575,8 -549,8 +575,13 @@@ rpcrdma_data_dir(bool writing
+  /* Memory registration calls xprtrdma/frwr_ops.c
+   */
+  bool frwr_is_supported(struct ib_device *device);
+++<<<<<<< HEAD
+ +int frwr_open(struct rpcrdma_ia *ia, struct rpcrdma_ep *ep,
+ +	      struct rpcrdma_create_data_internal *cdata);
+++=======
++ void frwr_reset(struct rpcrdma_req *req);
++ int frwr_open(struct rpcrdma_ia *ia, struct rpcrdma_ep *ep);
+++>>>>>>> 40088f0e9b62 (xprtrdma: Add mechanism to place MRs back on the free list)
+  int frwr_init_mr(struct rpcrdma_ia *ia, struct rpcrdma_mr *mr);
+  void frwr_release_mr(struct rpcrdma_mr *mr);
+  size_t frwr_maxpages(struct rpcrdma_xprt *r_xprt);
+diff --git a/net/sunrpc/xprtrdma/frwr_ops.c b/net/sunrpc/xprtrdma/frwr_ops.c
+index 4f4311900f93..06835152bab2 100644
+--- a/net/sunrpc/xprtrdma/frwr_ops.c
++++ b/net/sunrpc/xprtrdma/frwr_ops.c
+@@ -144,6 +144,26 @@ frwr_mr_recycle_worker(struct work_struct *work)
+ 	frwr_release_mr(mr);
+ }
+ 
++/* frwr_reset - Place MRs back on the free list
++ * @req: request to reset
++ *
++ * Used after a failed marshal. For FRWR, this means the MRs
++ * don't have to be fully released and recreated.
++ *
++ * NB: This is safe only as long as none of @req's MRs are
++ * involved with an ongoing asynchronous FAST_REG or LOCAL_INV
++ * Work Request.
++ */
++void frwr_reset(struct rpcrdma_req *req)
++{
++	while (!list_empty(&req->rl_registered)) {
++		struct rpcrdma_mr *mr;
++
++		mr = rpcrdma_mr_pop(&req->rl_registered);
++		rpcrdma_mr_unmap_and_put(mr);
++	}
++}
++
+ /**
+  * frwr_init_mr - Initialize one MR
+  * @ia: interface adapter
+* Unmerged path net/sunrpc/xprtrdma/rpc_rdma.c
+* Unmerged path net/sunrpc/xprtrdma/xprt_rdma.h
