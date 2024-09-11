@@ -1835,7 +1835,7 @@ lpfc_debugfs_disc_trc_open(struct inode *inode, struct file *file)
 	int rc = -ENOMEM;
 
 	if (!lpfc_debugfs_max_disc_trc) {
-		 rc = -ENOSPC;
+		rc = -ENOSPC;
 		goto out;
 	}
 
@@ -1885,7 +1885,7 @@ lpfc_debugfs_slow_ring_trc_open(struct inode *inode, struct file *file)
 	int rc = -ENOMEM;
 
 	if (!lpfc_debugfs_max_slow_ring_trc) {
-		 rc = -ENOSPC;
+		rc = -ENOSPC;
 		goto out;
 	}
 
