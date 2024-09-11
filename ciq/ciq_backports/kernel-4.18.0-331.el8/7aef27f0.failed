@@ -1,0 +1,144 @@
+svm/sev: Register SEV and SEV-ES ASIDs to the misc controller
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-331.el8
+commit-author Vipin Sharma <vipinsh@google.com>
+commit 7aef27f0b2a8a58c28578d3e0caf3f27e1a1c39c
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-331.el8/7aef27f0.failed
+
+Secure Encrypted Virtualization (SEV) and Secure Encrypted
+Virtualization - Encrypted State (SEV-ES) ASIDs are used to encrypt KVMs
+on AMD platform. These ASIDs are available in the limited quantities on
+a host.
+
+Register their capacity and usage to the misc controller for tracking
+via cgroups.
+
+	Signed-off-by: Vipin Sharma <vipinsh@google.com>
+	Reviewed-by: David Rientjes <rientjes@google.com>
+	Signed-off-by: Tejun Heo <tj@kernel.org>
+(cherry picked from commit 7aef27f0b2a8a58c28578d3e0caf3f27e1a1c39c)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kvm/svm/sev.c
+diff --cc arch/x86/kvm/svm/sev.c
+index 28b7ba774299,214eefb20414..000000000000
+--- a/arch/x86/kvm/svm/sev.c
++++ b/arch/x86/kvm/svm/sev.c
+@@@ -88,10 -103,21 +104,21 @@@ static bool __sev_recycle_asids(int min
+  	return true;
+  }
+  
+ -static int sev_asid_new(struct kvm_sev_info *sev)
+ +static int sev_asid_new(bool es_active)
+  {
+- 	int pos, min_asid, max_asid;
++ 	int pos, min_asid, max_asid, ret;
+  	bool retry = true;
++ 	enum misc_res_type type;
++ 
++ 	type = sev->es_active ? MISC_CG_RES_SEV_ES : MISC_CG_RES_SEV;
++ 	WARN_ON(sev->misc_cg);
++ 	sev->misc_cg = get_current_misc_cg();
++ 	ret = misc_cg_try_charge(type, sev->misc_cg, 1);
++ 	if (ret) {
++ 		put_misc_cg(sev->misc_cg);
++ 		sev->misc_cg = NULL;
++ 		return ret;
++ 	}
+  
+  	mutex_lock(&sev_bitmap_lock);
+  
+@@@ -177,17 -224,16 +216,21 @@@ static int sev_guest_init(struct kvm *k
+  	if (unlikely(sev->active))
+  		return ret;
+  
+ -	asid = sev_asid_new(sev);
+ +	asid = sev_asid_new(es_active);
+  	if (asid < 0)
+  		return ret;
++ 	sev->asid = asid;
+  
+  	ret = sev_platform_init(&argp->error);
+  	if (ret)
+  		goto e_free;
+  
+  	sev->active = true;
+++<<<<<<< HEAD
+ +	sev->es_active = es_active;
+ +	sev->asid = asid;
+++=======
+++>>>>>>> 7aef27f0b2a8 (svm/sev: Register SEV and SEV-ES ASIDs to the misc controller)
+  	INIT_LIST_HEAD(&sev->regions_list);
+  
+  	return 0;
+@@@ -1699,13 -1389,14 +1743,17 @@@ void __init sev_hardware_setup(void
+  		goto out;
+  
+  	sev_reclaim_asid_bitmap = bitmap_zalloc(max_sev_asid, GFP_KERNEL);
+ -	if (!sev_reclaim_asid_bitmap)
+ +	if (!sev_reclaim_asid_bitmap) {
+ +		bitmap_free(sev_asid_bitmap);
+ +		sev_asid_bitmap = NULL;
+  		goto out;
+ +	}
+  
+- 	pr_info("SEV supported: %u ASIDs\n", max_sev_asid - min_sev_asid + 1);
++ 	sev_asid_count = max_sev_asid - min_sev_asid + 1;
++ 	if (misc_cg_set_capacity(MISC_CG_RES_SEV, sev_asid_count))
++ 		goto out;
++ 
++ 	pr_info("SEV supported: %u ASIDs\n", sev_asid_count);
+  	sev_supported = true;
+  
+  	/* SEV-ES support requested? */
+* Unmerged path arch/x86/kvm/svm/sev.c
+diff --git a/arch/x86/kvm/svm/svm.h b/arch/x86/kvm/svm/svm.h
+index 19770a2a52d4..5a6cf660d6d9 100644
+--- a/arch/x86/kvm/svm/svm.h
++++ b/arch/x86/kvm/svm/svm.h
+@@ -63,6 +63,7 @@ struct kvm_sev_info {
+ 	unsigned long pages_locked; /* Number of pages locked */
+ 	struct list_head regions_list;  /* List of registered regions */
+ 	u64 ap_jump_table;	/* SEV-ES AP Jump Table address */
++	struct misc_cg *misc_cg; /* For misc cgroup accounting */
+ };
+ 
+ struct kvm_svm {
+diff --git a/include/linux/misc_cgroup.h b/include/linux/misc_cgroup.h
+index 1195d36558b4..c5af592481c0 100644
+--- a/include/linux/misc_cgroup.h
++++ b/include/linux/misc_cgroup.h
+@@ -12,6 +12,12 @@
+  * Types of misc cgroup entries supported by the host.
+  */
+ enum misc_res_type {
++#ifdef CONFIG_KVM_AMD_SEV
++	/* AMD SEV ASIDs resource */
++	MISC_CG_RES_SEV,
++	/* AMD SEV-ES ASIDs resource */
++	MISC_CG_RES_SEV_ES,
++#endif
+ 	MISC_CG_RES_TYPES
+ };
+ 
+diff --git a/kernel/cgroup/misc.c b/kernel/cgroup/misc.c
+index 4352bc4a3bd5..ec02d963cad1 100644
+--- a/kernel/cgroup/misc.c
++++ b/kernel/cgroup/misc.c
+@@ -18,6 +18,12 @@
+ 
+ /* Miscellaneous res name, keep it in sync with enum misc_res_type */
+ static const char *const misc_res_name[] = {
++#ifdef CONFIG_KVM_AMD_SEV
++	/* AMD SEV ASIDs resource */
++	"sev",
++	/* AMD SEV-ES ASIDs resource */
++	"sev_es",
++#endif
+ };
+ 
+ /* Root misc cgroup */
