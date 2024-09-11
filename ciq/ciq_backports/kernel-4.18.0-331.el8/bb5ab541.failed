@@ -1,0 +1,464 @@
+s390/qeth: keep track of wanted TX queues
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-331.el8
+commit-author Julian Wiedmann <jwi@linux.ibm.com>
+commit bb5ab541942eaee4c5e175a4667df38cfc7da371
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-331.el8/bb5ab541.failed
+
+When re-initializing a device, we can hit a situation where
+qeth_osa_set_output_queues() detects that it supports more or less
+HW TX queues than before. Right now we adjust dev->real_num_tx_queues
+from right there, but
+1. it's getting more & more complicated to cover all cases, and
+2. we can't re-enable the actually expected number of TX queues later
+because we lost the needed information.
+
+So keep track of the wanted TX queues (on initial setup, and whenever
+its changed via .set_channels), and later use that information when
+re-enabling the netdevice.
+
+	Signed-off-by: Julian Wiedmann <jwi@linux.ibm.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit bb5ab541942eaee4c5e175a4667df38cfc7da371)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/s390/net/qeth_l2_main.c
+diff --cc drivers/s390/net/qeth_l2_main.c
+index c683634669dd,290389fc7e79..000000000000
+--- a/drivers/s390/net/qeth_l2_main.c
++++ b/drivers/s390/net/qeth_l2_main.c
+@@@ -2359,6 -2185,182 +2353,185 @@@ static void qeth_l2_vnicc_set_defaults(
+  	card->options.vnicc.wanted_chars = QETH_VNICC_DEFAULT;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static const struct device_type qeth_l2_devtype = {
++ 	.name = "qeth_layer2",
++ 	.groups = qeth_l2_attr_groups,
++ };
++ 
++ static int qeth_l2_probe_device(struct ccwgroup_device *gdev)
++ {
++ 	struct qeth_card *card = dev_get_drvdata(&gdev->dev);
++ 	int rc;
++ 
++ 	if (IS_OSN(card))
++ 		dev_notice(&gdev->dev, "OSN support will be dropped in 2021\n");
++ 
++ 	qeth_l2_vnicc_set_defaults(card);
++ 	mutex_init(&card->sbp_lock);
++ 
++ 	if (gdev->dev.type == &qeth_generic_devtype) {
++ 		rc = qeth_l2_create_device_attributes(&gdev->dev);
++ 		if (rc)
++ 			return rc;
++ 	}
++ 
++ 	INIT_WORK(&card->rx_mode_work, qeth_l2_rx_mode_work);
++ 	return 0;
++ }
++ 
++ static void qeth_l2_remove_device(struct ccwgroup_device *gdev)
++ {
++ 	struct qeth_card *card = dev_get_drvdata(&gdev->dev);
++ 
++ 	if (gdev->dev.type == &qeth_generic_devtype)
++ 		qeth_l2_remove_device_attributes(&gdev->dev);
++ 	qeth_set_allowed_threads(card, 0, 1);
++ 	wait_event(card->wait_q, qeth_threads_running(card, 0xffffffff) == 0);
++ 
++ 	if (gdev->state == CCWGROUP_ONLINE)
++ 		qeth_set_offline(card, false);
++ 
++ 	cancel_work_sync(&card->close_dev_work);
++ 	if (card->dev->reg_state == NETREG_REGISTERED)
++ 		unregister_netdev(card->dev);
++ }
++ 
++ static int qeth_l2_set_online(struct qeth_card *card, bool carrier_ok)
++ {
++ 	struct net_device *dev = card->dev;
++ 	int rc = 0;
++ 
++ 	/* query before bridgeport_notification may be enabled */
++ 	qeth_l2_detect_dev2br_support(card);
++ 
++ 	mutex_lock(&card->sbp_lock);
++ 	qeth_bridgeport_query_support(card);
++ 	if (card->options.sbp.supported_funcs) {
++ 		qeth_l2_setup_bridgeport_attrs(card);
++ 		dev_info(&card->gdev->dev,
++ 			 "The device represents a Bridge Capable Port\n");
++ 	}
++ 	mutex_unlock(&card->sbp_lock);
++ 
++ 	qeth_l2_register_dev_addr(card);
++ 
++ 	/* for the rx_bcast characteristic, init VNICC after setmac */
++ 	qeth_l2_vnicc_init(card);
++ 
++ 	qeth_l2_trace_features(card);
++ 
++ 	/* softsetup */
++ 	QETH_CARD_TEXT(card, 2, "softsetp");
++ 
++ 	card->state = CARD_STATE_SOFTSETUP;
++ 
++ 	qeth_set_allowed_threads(card, 0xffffffff, 0);
++ 
++ 	if (dev->reg_state != NETREG_REGISTERED) {
++ 		rc = qeth_l2_setup_netdev(card);
++ 		if (rc)
++ 			goto err_setup;
++ 
++ 		if (carrier_ok)
++ 			netif_carrier_on(dev);
++ 	} else {
++ 		rtnl_lock();
++ 		rc = qeth_set_real_num_tx_queues(card,
++ 						 qeth_tx_actual_queues(card));
++ 		if (rc) {
++ 			rtnl_unlock();
++ 			goto err_set_queues;
++ 		}
++ 
++ 		if (carrier_ok)
++ 			netif_carrier_on(dev);
++ 		else
++ 			netif_carrier_off(dev);
++ 
++ 		netif_device_attach(dev);
++ 		qeth_enable_hw_features(dev);
++ 		qeth_l2_enable_brport_features(card);
++ 
++ 		if (card->info.open_when_online) {
++ 			card->info.open_when_online = 0;
++ 			dev_open(dev, NULL);
++ 		}
++ 		rtnl_unlock();
++ 	}
++ 	return 0;
++ 
++ err_set_queues:
++ err_setup:
++ 	qeth_set_allowed_threads(card, 0, 1);
++ 	card->state = CARD_STATE_DOWN;
++ 	return rc;
++ }
++ 
++ static void qeth_l2_set_offline(struct qeth_card *card)
++ {
++ 	struct qeth_priv *priv = netdev_priv(card->dev);
++ 
++ 	qeth_set_allowed_threads(card, 0, 1);
++ 	qeth_l2_drain_rx_mode_cache(card);
++ 
++ 	if (card->state == CARD_STATE_SOFTSETUP)
++ 		card->state = CARD_STATE_DOWN;
++ 
++ 	qeth_l2_set_pnso_mode(card, QETH_PNSO_NONE);
++ 	if (priv->brport_features & BR_LEARNING_SYNC) {
++ 		rtnl_lock();
++ 		qeth_l2_dev2br_fdb_flush(card);
++ 		rtnl_unlock();
++ 	}
++ }
++ 
++ /* Returns zero if the command is successfully "consumed" */
++ static int qeth_l2_control_event(struct qeth_card *card,
++ 				 struct qeth_ipa_cmd *cmd)
++ {
++ 	switch (cmd->hdr.command) {
++ 	case IPA_CMD_SETBRIDGEPORT_OSA:
++ 	case IPA_CMD_SETBRIDGEPORT_IQD:
++ 		if (cmd->data.sbp.hdr.command_code ==
++ 		    IPA_SBP_BRIDGE_PORT_STATE_CHANGE) {
++ 			qeth_bridge_state_change(card, cmd);
++ 			return 0;
++ 		}
++ 
++ 		return 1;
++ 	case IPA_CMD_ADDRESS_CHANGE_NOTIF:
++ 		qeth_addr_change_event(card, cmd);
++ 		return 0;
++ 	default:
++ 		return 1;
++ 	}
++ }
++ 
++ struct qeth_discipline qeth_l2_discipline = {
++ 	.devtype = &qeth_l2_devtype,
++ 	.setup = qeth_l2_probe_device,
++ 	.remove = qeth_l2_remove_device,
++ 	.set_online = qeth_l2_set_online,
++ 	.set_offline = qeth_l2_set_offline,
++ 	.do_ioctl = NULL,
++ 	.control_event_handler = qeth_l2_control_event,
++ };
++ EXPORT_SYMBOL_GPL(qeth_l2_discipline);
++ 
++ static int __init qeth_l2_init(void)
++ {
++ 	pr_info("register layer 2 discipline\n");
++ 	return 0;
++ }
++ 
++ static void __exit qeth_l2_exit(void)
++ {
++ 	pr_info("unregister layer 2 discipline\n");
++ }
++ 
+++>>>>>>> bb5ab541942e (s390/qeth: keep track of wanted TX queues)
+  module_init(qeth_l2_init);
+  module_exit(qeth_l2_exit);
+  MODULE_AUTHOR("Frank Blaschka <frank.blaschka@de.ibm.com>");
+diff --git a/drivers/s390/net/qeth_core.h b/drivers/s390/net/qeth_core.h
+index 4550380cb5d0..ce24b27f8327 100644
+--- a/drivers/s390/net/qeth_core.h
++++ b/drivers/s390/net/qeth_core.h
+@@ -538,7 +538,7 @@ struct qeth_qdio_info {
+ 	int in_buf_size;
+ 
+ 	/* output */
+-	int no_out_queues;
++	unsigned int no_out_queues;
+ 	struct qeth_qdio_out_q *out_qs[QETH_MAX_OUT_QUEUES];
+ 	struct qdio_outbuf_state *out_bufstates;
+ 
+@@ -788,6 +788,7 @@ struct qeth_switch_info {
+ 
+ struct qeth_priv {
+ 	unsigned int rx_copybreak;
++	unsigned int tx_wanted_queues;
+ 	u32 brport_hw_features;
+ 	u32 brport_features;
+ };
+@@ -873,6 +874,13 @@ struct qeth_trap_id {
+ /*some helper functions*/
+ #define QETH_CARD_IFNAME(card) (((card)->dev)? (card)->dev->name : "")
+ 
++static inline unsigned int qeth_tx_actual_queues(struct qeth_card *card)
++{
++	struct qeth_priv *priv = netdev_priv(card->dev);
++
++	return min(priv->tx_wanted_queues, card->qdio.no_out_queues);
++}
++
+ static inline u16 qeth_iqd_translate_txq(struct net_device *dev, u16 txq)
+ {
+ 	if (txq == QETH_IQD_MCAST_TXQ)
+@@ -1087,7 +1095,6 @@ void qeth_dbf_longtext(debug_info_t *id, int level, char *text, ...);
+ int qeth_configure_cq(struct qeth_card *, enum qeth_cq);
+ int qeth_hw_trap(struct qeth_card *, enum qeth_diags_trap_action);
+ int qeth_setassparms_cb(struct qeth_card *, struct qeth_reply *, unsigned long);
+-int qeth_setup_netdev(struct qeth_card *card);
+ int qeth_set_features(struct net_device *, netdev_features_t);
+ void qeth_enable_hw_features(struct net_device *dev);
+ netdev_features_t qeth_fix_features(struct net_device *, netdev_features_t);
+diff --git a/drivers/s390/net/qeth_core_main.c b/drivers/s390/net/qeth_core_main.c
+index d384629799fe..13ee6952514f 100644
+--- a/drivers/s390/net/qeth_core_main.c
++++ b/drivers/s390/net/qeth_core_main.c
+@@ -1512,23 +1512,12 @@ static void qeth_drain_output_queues(struct qeth_card *card)
+ 	}
+ }
+ 
+-static int qeth_osa_set_output_queues(struct qeth_card *card, bool single)
++static void qeth_osa_set_output_queues(struct qeth_card *card, bool single)
+ {
+ 	unsigned int max = single ? 1 : card->dev->num_tx_queues;
+-	unsigned int count;
+-	int rc;
+-
+-	count = IS_VM_NIC(card) ? min(max, card->dev->real_num_tx_queues) : max;
+-
+-	rtnl_lock();
+-	rc = netif_set_real_num_tx_queues(card->dev, count);
+-	rtnl_unlock();
+-
+-	if (rc)
+-		return rc;
+ 
+ 	if (card->qdio.no_out_queues == max)
+-		return 0;
++		return;
+ 
+ 	if (atomic_read(&card->qdio.state) != QETH_QDIO_UNINITIALIZED)
+ 		qeth_free_qdio_queues(card);
+@@ -1537,14 +1526,12 @@ static int qeth_osa_set_output_queues(struct qeth_card *card, bool single)
+ 		dev_info(&card->gdev->dev, "Priority Queueing not supported\n");
+ 
+ 	card->qdio.no_out_queues = max;
+-	return 0;
+ }
+ 
+ static int qeth_update_from_chp_desc(struct qeth_card *card)
+ {
+ 	struct ccw_device *ccwdev;
+ 	struct channel_path_desc_fmt0 *chp_dsc;
+-	int rc = 0;
+ 
+ 	QETH_CARD_TEXT(card, 2, "chp_desc");
+ 
+@@ -1557,12 +1544,12 @@ static int qeth_update_from_chp_desc(struct qeth_card *card)
+ 
+ 	if (IS_OSD(card) || IS_OSX(card))
+ 		/* CHPP field bit 6 == 1 -> single queue */
+-		rc = qeth_osa_set_output_queues(card, chp_dsc->chpp & 0x02);
++		qeth_osa_set_output_queues(card, chp_dsc->chpp & 0x02);
+ 
+ 	kfree(chp_dsc);
+ 	QETH_CARD_TEXT_(card, 2, "nr:%x", card->qdio.no_out_queues);
+ 	QETH_CARD_TEXT_(card, 2, "lvl:%02x", card->info.func_level);
+-	return rc;
++	return 0;
+ }
+ 
+ static void qeth_init_qdio_info(struct qeth_card *card)
+@@ -5317,6 +5304,20 @@ static int qeth_set_online(struct qeth_card *card)
+ 
+ 	qeth_print_status_message(card);
+ 
++	if (card->dev->reg_state != NETREG_REGISTERED) {
++		struct qeth_priv *priv = netdev_priv(card->dev);
++
++		if (IS_IQD(card))
++			priv->tx_wanted_queues = QETH_IQD_MIN_TXQ;
++		else if (IS_VM_NIC(card))
++			priv->tx_wanted_queues = 1;
++		else
++			priv->tx_wanted_queues = card->dev->num_tx_queues;
++
++		/* no need for locking / error handling at this early stage: */
++		qeth_set_real_num_tx_queues(card, qeth_tx_actual_queues(card));
++	}
++
+ 	rc = card->discipline->set_online(card, carrier_ok);
+ 	if (rc)
+ 		goto err_online;
+@@ -6252,8 +6253,16 @@ static struct net_device *qeth_alloc_netdev(struct qeth_card *card)
+ 	SET_NETDEV_DEV(dev, &card->gdev->dev);
+ 	netif_carrier_off(dev);
+ 
+-	dev->ethtool_ops = IS_OSN(card) ? &qeth_osn_ethtool_ops :
+-					  &qeth_ethtool_ops;
++	if (IS_OSN(card)) {
++		dev->ethtool_ops = &qeth_osn_ethtool_ops;
++	} else {
++		dev->ethtool_ops = &qeth_ethtool_ops;
++		dev->priv_flags &= ~IFF_TX_SKB_SHARING;
++		dev->hw_features |= NETIF_F_SG;
++		dev->vlan_features |= NETIF_F_SG;
++		if (IS_IQD(card))
++			dev->features |= NETIF_F_SG;
++	}
+ 
+ 	return dev;
+ }
+@@ -6269,28 +6278,6 @@ struct net_device *qeth_clone_netdev(struct net_device *orig)
+ 	return clone;
+ }
+ 
+-int qeth_setup_netdev(struct qeth_card *card)
+-{
+-	struct net_device *dev = card->dev;
+-	unsigned int num_tx_queues;
+-
+-	dev->priv_flags &= ~IFF_TX_SKB_SHARING;
+-	dev->hw_features |= NETIF_F_SG;
+-	dev->vlan_features |= NETIF_F_SG;
+-
+-	if (IS_IQD(card)) {
+-		dev->features |= NETIF_F_SG;
+-		num_tx_queues = QETH_IQD_MIN_TXQ;
+-	} else if (IS_VM_NIC(card)) {
+-		num_tx_queues = 1;
+-	} else {
+-		num_tx_queues = dev->real_num_tx_queues;
+-	}
+-
+-	return qeth_set_real_num_tx_queues(card, num_tx_queues);
+-}
+-EXPORT_SYMBOL_GPL(qeth_setup_netdev);
+-
+ static int qeth_core_probe_device(struct ccwgroup_device *gdev)
+ {
+ 	struct qeth_card *card;
+@@ -6992,6 +6979,7 @@ int qeth_set_real_num_tx_queues(struct qeth_card *card, unsigned int count)
+ 
+ 	return rc;
+ }
++EXPORT_SYMBOL_GPL(qeth_set_real_num_tx_queues);
+ 
+ u16 qeth_iqd_select_queue(struct net_device *dev, struct sk_buff *skb,
+ 			  u8 cast_type, struct net_device *sb_dev,
+diff --git a/drivers/s390/net/qeth_ethtool.c b/drivers/s390/net/qeth_ethtool.c
+index ebdc03210608..65a539fe047a 100644
+--- a/drivers/s390/net/qeth_ethtool.c
++++ b/drivers/s390/net/qeth_ethtool.c
+@@ -211,7 +211,9 @@ static void qeth_get_channels(struct net_device *dev,
+ static int qeth_set_channels(struct net_device *dev,
+ 			     struct ethtool_channels *channels)
+ {
++	struct qeth_priv *priv = netdev_priv(dev);
+ 	struct qeth_card *card = dev->ml_priv;
++	int rc;
+ 
+ 	if (channels->rx_count == 0 || channels->tx_count == 0)
+ 		return -EINVAL;
+@@ -234,7 +236,11 @@ static int qeth_set_channels(struct net_device *dev,
+ 			return -EOPNOTSUPP;
+ 	}
+ 
+-	return qeth_set_real_num_tx_queues(card, channels->tx_count);
++	rc = qeth_set_real_num_tx_queues(card, channels->tx_count);
++	if (!rc)
++		priv->tx_wanted_queues = channels->tx_count;
++
++	return rc;
+ }
+ 
+ static int qeth_get_ts_info(struct net_device *dev,
+* Unmerged path drivers/s390/net/qeth_l2_main.c
+diff --git a/drivers/s390/net/qeth_l3_main.c b/drivers/s390/net/qeth_l3_main.c
+index 7d591f3bc4ee..0cba382a0dc8 100644
+--- a/drivers/s390/net/qeth_l3_main.c
++++ b/drivers/s390/net/qeth_l3_main.c
+@@ -1878,10 +1878,6 @@ static int qeth_l3_setup_netdev(struct qeth_card *card)
+ 	unsigned int headroom;
+ 	int rc;
+ 
+-	rc = qeth_setup_netdev(card);
+-	if (rc)
+-		return rc;
+-
+ 	if (IS_OSD(card) || IS_OSX(card)) {
+ 		card->dev->netdev_ops = &qeth_l3_osa_netdev_ops;
+ 
+@@ -2025,6 +2021,13 @@ static int qeth_l3_set_online(struct qeth_card *card, bool carrier_ok)
+ 			netif_carrier_on(dev);
+ 	} else {
+ 		rtnl_lock();
++		rc = qeth_set_real_num_tx_queues(card,
++						 qeth_tx_actual_queues(card));
++		if (rc) {
++			rtnl_unlock();
++			goto err_set_queues;
++		}
++
+ 		if (carrier_ok)
+ 			netif_carrier_on(dev);
+ 		else
+@@ -2041,6 +2044,7 @@ static int qeth_l3_set_online(struct qeth_card *card, bool carrier_ok)
+ 	}
+ 	return 0;
+ 
++err_set_queues:
+ err_setup:
+ 	qeth_set_allowed_threads(card, 0, 1);
+ 	card->state = CARD_STATE_DOWN;
