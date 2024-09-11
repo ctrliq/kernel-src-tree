@@ -592,8 +592,9 @@ static int nvme_nvm_get_chk_meta(struct nvm_dev *ndev,
 	while (left) {
 		len = min_t(unsigned int, left, ctrl->max_hw_sectors << 9);
 
-		ret = nvme_get_log_ext(ctrl, ns, NVME_NVM_LOG_REPORT_CHUNK,
-				dev_meta, len, offset);
+		ret = nvme_get_log(ctrl, ns->head->ns_id,
+				NVME_NVM_LOG_REPORT_CHUNK, 0, dev_meta, len,
+				offset);
 		if (ret) {
 			dev_err(ctrl->device, "Get REPORT CHUNK log error\n");
 			break;
