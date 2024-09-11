@@ -1,0 +1,194 @@
+x86/fpu: Rework restore_regs_from_fpstate()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-365.el8
+commit-author Thomas Gleixner <tglx@linutronix.de>
+commit eda32f4f93b452c5fe3c352523e7f7cc085c8205
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-365.el8/eda32f4f.failed
+
+xfeatures_mask_fpstate() is no longer valid when dynamically enabled
+features come into play.
+
+Rework restore_regs_from_fpstate() so it takes a constant mask which will
+then be applied against the maximum feature set so that the restore
+operation brings all features which are not in the xsave buffer xfeature
+bitmap into init state.
+
+This ensures that if the previous task used a dynamically enabled feature
+that the task which restores has all unused components properly initialized.
+
+Cleanup the last user of xfeatures_mask_fpstate() as well and remove it.
+
+	Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+	Signed-off-by: Borislav Petkov <bp@suse.de>
+Link: https://lkml.kernel.org/r/20211014230739.461348278@linutronix.de
+(cherry picked from commit eda32f4f93b452c5fe3c352523e7f7cc085c8205)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/include/asm/fpu/xstate.h
+#	arch/x86/kernel/fpu/context.h
+#	arch/x86/kernel/fpu/core.c
+diff --cc arch/x86/include/asm/fpu/xstate.h
+index 2df5bd667a43,61ae396bc6e7..000000000000
+--- a/arch/x86/include/asm/fpu/xstate.h
++++ b/arch/x86/include/asm/fpu/xstate.h
+@@@ -78,49 -78,19 +78,62 @@@
+  				      XFEATURE_MASK_INDEPENDENT | \
+  				      XFEATURE_MASK_SUPERVISOR_UNSUPPORTED)
+  
+++<<<<<<< HEAD
+ +#ifdef CONFIG_X86_64
+ +#define REX_PREFIX	"0x48, "
+ +#else
+ +#define REX_PREFIX
+ +#endif
+ +
+ +extern u64 xfeatures_mask_all;
+++=======
++ /*
++  * The feature mask required to restore FPU state:
++  * - All user states which are not eagerly switched in switch_to()/exec()
++  * - The suporvisor states
++  */
++ #define XFEATURE_MASK_FPSTATE	(XFEATURE_MASK_USER_RESTORE | \
++ 				 XFEATURE_MASK_SUPERVISOR_SUPPORTED)
+++>>>>>>> eda32f4f93b4 (x86/fpu: Rework restore_regs_from_fpstate())
+  
+  static inline u64 xfeatures_mask_supervisor(void)
+  {
+ -	return fpu_kernel_cfg.max_features & XFEATURE_MASK_SUPERVISOR_SUPPORTED;
+ +	return xfeatures_mask_all & XFEATURE_MASK_SUPERVISOR_SUPPORTED;
+ +}
+ +
+ +/*
+ + * The xfeatures which are enabled in XCR0 and expected to be in ptrace
+ + * buffers and signal frames.
+ + */
+ +static inline u64 xfeatures_mask_uabi(void)
+ +{
+ +	return xfeatures_mask_all & XFEATURE_MASK_USER_SUPPORTED;
+  }
+  
+++<<<<<<< HEAD
+ +/*
+ + * The xfeatures which are restored by the kernel when returning to user
+ + * mode. This is not necessarily the same as xfeatures_mask_uabi() as the
+ + * kernel does not manage all XCR0 enabled features via xsave/xrstor as
+ + * some of them have to be switched eagerly on context switch and exec().
+ + */
+ +static inline u64 xfeatures_mask_restore_user(void)
+ +{
+ +	return xfeatures_mask_all & XFEATURE_MASK_USER_RESTORE;
+ +}
+ +
+ +/*
+ + * Like xfeatures_mask_restore_user() but additionally restors the
+ + * supported supervisor states.
+ + */
+ +static inline u64 xfeatures_mask_fpstate(void)
+ +{
+ +	return xfeatures_mask_all & \
+ +		(XFEATURE_MASK_USER_RESTORE | XFEATURE_MASK_SUPERVISOR_SUPPORTED);
+ +}
+ +
+++=======
+++>>>>>>> eda32f4f93b4 (x86/fpu: Rework restore_regs_from_fpstate())
+  static inline u64 xfeatures_mask_independent(void)
+  {
+  	if (!boot_cpu_has(X86_FEATURE_ARCH_LBR))
+diff --cc arch/x86/kernel/fpu/context.h
+index e652282842c8,a06ebf315d83..000000000000
+--- a/arch/x86/kernel/fpu/context.h
++++ b/arch/x86/kernel/fpu/context.h
+@@@ -72,9 -70,7 +70,13 @@@ static inline void fpregs_restore_userr
+  		 * flush_thread(). So it is excluded because it might be
+  		 * not up to date in current->thread.fpu.xsave state.
+  		 */
+++<<<<<<< HEAD
+ +		mask = xfeatures_mask_restore_user() |
+ +			xfeatures_mask_supervisor();
+ +		restore_fpregs_from_fpstate(&fpu->state, mask);
+++=======
++ 		restore_fpregs_from_fpstate(fpu->fpstate, XFEATURE_MASK_FPSTATE);
+++>>>>>>> eda32f4f93b4 (x86/fpu: Rework restore_regs_from_fpstate())
+  
+  		fpregs_activate(fpu);
+  		fpu->last_cpu = cpu;
+diff --cc arch/x86/kernel/fpu/core.c
+index 2859edb41245,0fb9defaba47..000000000000
+--- a/arch/x86/kernel/fpu/core.c
++++ b/arch/x86/kernel/fpu/core.c
+@@@ -142,15 -150,31 +142,38 @@@ void restore_fpregs_from_fpstate(union 
+  	}
+  
+  	if (use_xsave()) {
+++<<<<<<< HEAD
+ +		os_xrstor(&fpstate->xsave, mask);
+++=======
++ 		/*
++ 		 * Restoring state always needs to modify all features
++ 		 * which are in @mask even if the current task cannot use
++ 		 * extended features.
++ 		 *
++ 		 * So fpstate->xfeatures cannot be used here, because then
++ 		 * a feature for which the task has no permission but was
++ 		 * used by the previous task would not go into init state.
++ 		 */
++ 		mask = fpu_kernel_cfg.max_features & mask;
++ 
++ 		os_xrstor(&fpstate->regs.xsave, mask);
+++>>>>>>> eda32f4f93b4 (x86/fpu: Rework restore_regs_from_fpstate())
+  	} else {
+  		if (use_fxsr())
+ -			fxrstor(&fpstate->regs.fxsave);
+ +			fxrstor(&fpstate->fxsave);
+  		else
+ -			frstor(&fpstate->regs.fsave);
+ +			frstor(&fpstate->fsave);
+  	}
+  }
+  
+++<<<<<<< HEAD
+++=======
++ void fpu_reset_from_exception_fixup(void)
++ {
++ 	restore_fpregs_from_fpstate(&init_fpstate, XFEATURE_MASK_FPSTATE);
++ }
++ 
+++>>>>>>> eda32f4f93b4 (x86/fpu: Rework restore_regs_from_fpstate())
+  #if IS_ENABLED(CONFIG_KVM)
+  void fpu_swap_kvm_fpu(struct fpu *save, struct fpu *rstor, u64 restore_mask)
+  {
+@@@ -166,8 -190,8 +189,13 @@@
+  	}
+  
+  	if (rstor) {
+++<<<<<<< HEAD
+ +		restore_mask &= xfeatures_mask_fpstate();
+ +		restore_fpregs_from_fpstate(&rstor->state, restore_mask);
+++=======
++ 		restore_mask &= XFEATURE_MASK_FPSTATE;
++ 		restore_fpregs_from_fpstate(rstor->fpstate, restore_mask);
+++>>>>>>> eda32f4f93b4 (x86/fpu: Rework restore_regs_from_fpstate())
+  	}
+  
+  	fpregs_mark_activate();
+* Unmerged path arch/x86/include/asm/fpu/xstate.h
+* Unmerged path arch/x86/kernel/fpu/context.h
+* Unmerged path arch/x86/kernel/fpu/core.c
+diff --git a/arch/x86/kernel/fpu/xstate.c b/arch/x86/kernel/fpu/xstate.c
+index bffa08a391ba..b476f65dc2e0 100644
+--- a/arch/x86/kernel/fpu/xstate.c
++++ b/arch/x86/kernel/fpu/xstate.c
+@@ -356,7 +356,7 @@ static void __init print_xstate_offset_size(void)
+  */
+ static __init void os_xrstor_booting(struct xregs_state *xstate)
+ {
+-	u64 mask = xfeatures_mask_fpstate();
++	u64 mask = fpu_kernel_cfg.max_features & XFEATURE_MASK_FPSTATE;
+ 	u32 lmask = mask;
+ 	u32 hmask = mask >> 32;
+ 	int err;
