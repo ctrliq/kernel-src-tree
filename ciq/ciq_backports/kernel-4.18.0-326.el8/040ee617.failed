@@ -1,0 +1,103 @@
+net/mlx5e: Disable TX MPWQE in kdump mode
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-326.el8
+commit-author Alaa Hleihel <alaa@nvidia.com>
+commit 040ee6172e77b2366d0c622f75eba26e4e49481f
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-326.el8/040ee617.failed
+
+Under kdump environment we want to use the smallest possible amount
+of resources, that includes setting SQ size to minimum.
+However, when running on a device that supports TX MPWQE, then the SQ stop
+room becomes larger than with non-capable device and requires increasing
+the SQ size.
+
+Since TX MPWQE offload is not necessary in kdump mode, disable it to
+reduce the memory requirements for capable devices.
+
+With this change, the needed SQ stop room size drops by 31.
+
+	Signed-off-by: Alaa Hleihel <alaa@nvidia.com>
+	Signed-off-by: Saeed Mahameed <saeedm@nvidia.com>
+(cherry picked from commit 040ee6172e77b2366d0c622f75eba26e4e49481f)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/mellanox/mlx5/core/en.h
+diff --cc drivers/net/ethernet/mellanox/mlx5/core/en.h
+index 9b2636b23a6c,b1b51bbba054..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en.h
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en.h
+@@@ -1082,15 -1156,25 +1082,37 @@@ int mlx5e_ethtool_set_pauseparam(struc
+  				 struct ethtool_pauseparam *pauseparam);
+  
+  /* mlx5e generic netdev management API */
+++<<<<<<< HEAD
+ +int mlx5e_netdev_init(struct net_device *netdev,
+ +		      struct mlx5e_priv *priv,
+ +		      struct mlx5_core_dev *mdev,
+ +		      const struct mlx5e_profile *profile,
+ +		      void *ppriv);
+ +void mlx5e_netdev_cleanup(struct net_device *netdev, struct mlx5e_priv *priv);
+ +struct net_device*
+ +mlx5e_create_netdev(struct mlx5_core_dev *mdev, const struct mlx5e_profile *profile,
+ +		    int nch, void *ppriv);
+++=======
++ static inline unsigned int
++ mlx5e_calc_max_nch(struct mlx5e_priv *priv, const struct mlx5e_profile *profile)
++ {
++ 	return priv->netdev->num_rx_queues / max_t(u8, profile->rq_groups, 1);
++ }
++ 
++ static inline bool
++ mlx5e_tx_mpwqe_supported(struct mlx5_core_dev *mdev)
++ {
++ 	return !is_kdump_kernel() &&
++ 		MLX5_CAP_ETH(mdev, enhanced_multi_pkt_send_wqe);
++ }
++ 
++ int mlx5e_priv_init(struct mlx5e_priv *priv,
++ 		    struct net_device *netdev,
++ 		    struct mlx5_core_dev *mdev);
++ void mlx5e_priv_cleanup(struct mlx5e_priv *priv);
++ struct net_device *
++ mlx5e_create_netdev(struct mlx5_core_dev *mdev, unsigned int txqs, unsigned int rxqs);
+++>>>>>>> 040ee6172e77 (net/mlx5e: Disable TX MPWQE in kdump mode)
+  int mlx5e_attach_netdev(struct mlx5e_priv *priv);
+  void mlx5e_detach_netdev(struct mlx5e_priv *priv);
+  void mlx5e_destroy_netdev(struct mlx5e_priv *priv);
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/en.h
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/en_ethtool.c b/drivers/net/ethernet/mellanox/mlx5/core/en_ethtool.c
+index e1b97cf1b84f..8d92f298b7aa 100644
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_ethtool.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_ethtool.c
+@@ -1954,7 +1954,7 @@ static int set_pflag_tx_mpwqe_common(struct net_device *netdev, u32 flag, bool e
+ 	struct mlx5e_channels new_channels = {};
+ 	int err;
+ 
+-	if (enable && !MLX5_CAP_ETH(mdev, enhanced_multi_pkt_send_wqe))
++	if (enable && !mlx5e_tx_mpwqe_supported(mdev))
+ 		return -EOPNOTSUPP;
+ 
+ 	new_channels.params = priv->channels.params;
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/en_main.c b/drivers/net/ethernet/mellanox/mlx5/core/en_main.c
+index 237d6c6a22d1..14d99c9c29dd 100644
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_main.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_main.c
+@@ -4861,12 +4861,10 @@ void mlx5e_build_nic_params(struct mlx5e_priv *priv,
+ 	params->log_sq_size = is_kdump_kernel() ?
+ 		MLX5E_PARAMS_MINIMUM_LOG_SQ_SIZE :
+ 		MLX5E_PARAMS_DEFAULT_LOG_SQ_SIZE;
+-	MLX5E_SET_PFLAG(params, MLX5E_PFLAG_SKB_TX_MPWQE,
+-			MLX5_CAP_ETH(mdev, enhanced_multi_pkt_send_wqe));
++	MLX5E_SET_PFLAG(params, MLX5E_PFLAG_SKB_TX_MPWQE, mlx5e_tx_mpwqe_supported(mdev));
+ 
+ 	/* XDP SQ */
+-	MLX5E_SET_PFLAG(params, MLX5E_PFLAG_XDP_TX_MPWQE,
+-			MLX5_CAP_ETH(mdev, enhanced_multi_pkt_send_wqe));
++	MLX5E_SET_PFLAG(params, MLX5E_PFLAG_XDP_TX_MPWQE, mlx5e_tx_mpwqe_supported(mdev));
+ 
+ 	/* set CQE compression */
+ 	params->rx_cqe_compress_def = false;
