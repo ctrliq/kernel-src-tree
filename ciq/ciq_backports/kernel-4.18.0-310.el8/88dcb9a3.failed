@@ -1,0 +1,206 @@
+mm/thp: move lru_add_page_tail() to huge_memory.c
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-310.el8
+commit-author Alex Shi <alex.shi@linux.alibaba.com>
+commit 88dcb9a3fb48c67ec345f1cdbc2a26119d3cb57d
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-310.el8/88dcb9a3.failed
+
+Patch series "per memcg lru lock", v21.
+
+This patchset includes 3 parts:
+
+ 1) some code cleanup and minimum optimization as preparation
+
+ 2) use TestCleanPageLRU as page isolation's precondition
+
+ 3) replace per node lru_lock with per memcg per node lru_lock
+
+Current lru_lock is one for each of node, pgdat->lru_lock, that guard
+for lru lists, but now we had moved the lru lists into memcg for long
+time.  Still using per node lru_lock is clearly unscalable, pages on
+each of memcgs have to compete each others for a whole lru_lock.  This
+patchset try to use per lruvec/memcg lru_lock to repleace per node lru
+lock to guard lru lists, make it scalable for memcgs and get performance
+gain.
+
+Currently lru_lock still guards both lru list and page's lru bit, that's
+ok.  but if we want to use specific lruvec lock on the page, we need to
+pin down the page's lruvec/memcg during locking.  Just taking lruvec
+lock first may be undermined by the page's memcg charge/migration.  To
+fix this problem, we could take out the page's lru bit clear and use it
+as pin down action to block the memcg changes.  That's the reason for
+new atomic func TestClearPageLRU.  So now isolating a page need both
+actions: TestClearPageLRU and hold the lru_lock.
+
+The typical usage of this is isolate_migratepages_block() in
+compaction.c we have to take lru bit before lru lock, that serialized
+the page isolation in memcg page charge/migration which will change
+page's lruvec and new lru_lock in it.
+
+The above solution suggested by Johannes Weiner, and based on his new
+memcg charge path, then have this patchset.  (Hugh Dickins tested and
+contributed much code from compaction fix to general code polish, thanks
+a lot!).
+
+Daniel Jordan's testing show 62% improvement on modified readtwice case
+on his 2P * 10 core * 2 HT broadwell box on v18, which has no much
+different with this v20.
+
+ https://lore.kernel.org/lkml/20200915165807.kpp7uhiw7l3loofu@ca-dmjordan1.us.oracle.com/
+
+Thanks to Hugh Dickins and Konstantin Khlebnikov, they both brought this
+idea 8 years ago, and others who gave comments as well: Daniel Jordan,
+Mel Gorman, Shakeel Butt, Matthew Wilcox, Alexander Duyck etc.
+
+Thanks for Testing support from Intel 0day and Rong Chen, Fengguang Wu,
+and Yun Wang.  Hugh Dickins also shared his kbuild-swap case.
+
+This patch (of 19):
+
+lru_add_page_tail() is only used in huge_memory.c, defining it in other
+file with a CONFIG_TRANSPARENT_HUGEPAGE macro restrict just looks weird.
+
+Let's move it THP. And make it static as Hugh Dickins suggested.
+
+Link: https://lkml.kernel.org/r/1604566549-62481-1-git-send-email-alex.shi@linux.alibaba.com
+Link: https://lkml.kernel.org/r/1604566549-62481-2-git-send-email-alex.shi@linux.alibaba.com
+	Signed-off-by: Alex Shi <alex.shi@linux.alibaba.com>
+	Reviewed-by: Kirill A. Shutemov <kirill.shutemov@linux.intel.com>
+	Acked-by: Hugh Dickins <hughd@google.com>
+	Acked-by: Johannes Weiner <hannes@cmpxchg.org>
+	Cc: Matthew Wilcox <willy@infradead.org>
+	Cc: Mel Gorman <mgorman@techsingularity.net>
+	Cc: Tejun Heo <tj@kernel.org>
+	Cc: Konstantin Khlebnikov <khlebnikov@yandex-team.ru>
+	Cc: Daniel Jordan <daniel.m.jordan@oracle.com>
+	Cc: Shakeel Butt <shakeelb@google.com>
+	Cc: Joonsoo Kim <iamjoonsoo.kim@lge.com>
+	Cc: Wei Yang <richard.weiyang@gmail.com>
+	Cc: Alexander Duyck <alexander.duyck@gmail.com>
+	Cc: "Chen, Rong A" <rong.a.chen@intel.com>
+	Cc: Michal Hocko <mhocko@suse.com>
+	Cc: Vladimir Davydov <vdavydov.dev@gmail.com>
+	Cc: Andrea Arcangeli <aarcange@redhat.com>
+	Cc: Andrey Ryabinin <aryabinin@virtuozzo.com>
+	Cc: "Huang, Ying" <ying.huang@intel.com>
+	Cc: Jann Horn <jannh@google.com>
+	Cc: Kirill A. Shutemov <kirill@shutemov.name>
+	Cc: Michal Hocko <mhocko@kernel.org>
+	Cc: Mika Penttilä <mika.penttila@nextfour.com>
+	Cc: Minchan Kim <minchan@kernel.org>
+	Cc: Thomas Gleixner <tglx@linutronix.de>
+	Cc: Vlastimil Babka <vbabka@suse.cz>
+	Cc: Yang Shi <yang.shi@linux.alibaba.com>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit 88dcb9a3fb48c67ec345f1cdbc2a26119d3cb57d)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/swap.h
+diff --cc include/linux/swap.h
+index c9e934b74fab,5e1e967c225f..000000000000
+--- a/include/linux/swap.h
++++ b/include/linux/swap.h
+@@@ -329,9 -338,6 +329,12 @@@ extern void lru_note_cost(struct lruve
+  			  unsigned int nr_pages);
+  extern void lru_note_cost_page(struct page *);
+  extern void lru_cache_add(struct page *);
+++<<<<<<< HEAD
+ +extern void lru_add_page_tail(struct page *page, struct page *page_tail,
+ +			 struct lruvec *lruvec, struct list_head *head);
+ +extern void activate_page(struct page *);
+++=======
+++>>>>>>> 88dcb9a3fb48 (mm/thp: move lru_add_page_tail() to huge_memory.c)
+  extern void mark_page_accessed(struct page *);
+  extern void lru_add_drain(void);
+  extern void lru_add_drain_cpu(int cpu);
+* Unmerged path include/linux/swap.h
+diff --git a/mm/huge_memory.c b/mm/huge_memory.c
+index f8f2e337b025..d885cb03942e 100644
+--- a/mm/huge_memory.c
++++ b/mm/huge_memory.c
+@@ -2275,6 +2275,36 @@ static void remap_page(struct page *page)
+ 	}
+ }
+ 
++static void lru_add_page_tail(struct page *page, struct page *page_tail,
++		struct lruvec *lruvec, struct list_head *list)
++{
++	VM_BUG_ON_PAGE(!PageHead(page), page);
++	VM_BUG_ON_PAGE(PageCompound(page_tail), page);
++	VM_BUG_ON_PAGE(PageLRU(page_tail), page);
++	lockdep_assert_held(&lruvec_pgdat(lruvec)->lru_lock);
++
++	if (!list)
++		SetPageLRU(page_tail);
++
++	if (likely(PageLRU(page)))
++		list_add_tail(&page_tail->lru, &page->lru);
++	else if (list) {
++		/* page reclaim is reclaiming a huge page */
++		get_page(page_tail);
++		list_add_tail(&page_tail->lru, list);
++	} else {
++		/*
++		 * Head page has not yet been counted, as an hpage,
++		 * so we must account for each subpage individually.
++		 *
++		 * Put page_tail on the list at the correct position
++		 * so they all end up in order.
++		 */
++		add_page_to_lru_list_tail(page_tail, lruvec,
++					  page_lru(page_tail));
++	}
++}
++
+ static void __split_huge_page_tail(struct page *head, int tail,
+ 		struct lruvec *lruvec, struct list_head *list)
+ {
+diff --git a/mm/swap.c b/mm/swap.c
+index cb800c9dc782..8fa3448d2ed9 100644
+--- a/mm/swap.c
++++ b/mm/swap.c
+@@ -917,39 +917,6 @@ void __pagevec_release(struct pagevec *pvec)
+ }
+ EXPORT_SYMBOL(__pagevec_release);
+ 
+-#ifdef CONFIG_TRANSPARENT_HUGEPAGE
+-/* used by __split_huge_page_refcount() */
+-void lru_add_page_tail(struct page *page, struct page *page_tail,
+-		       struct lruvec *lruvec, struct list_head *list)
+-{
+-	VM_BUG_ON_PAGE(!PageHead(page), page);
+-	VM_BUG_ON_PAGE(PageCompound(page_tail), page);
+-	VM_BUG_ON_PAGE(PageLRU(page_tail), page);
+-	lockdep_assert_held(&lruvec_pgdat(lruvec)->lru_lock);
+-
+-	if (!list)
+-		SetPageLRU(page_tail);
+-
+-	if (likely(PageLRU(page)))
+-		list_add_tail(&page_tail->lru, &page->lru);
+-	else if (list) {
+-		/* page reclaim is reclaiming a huge page */
+-		get_page(page_tail);
+-		list_add_tail(&page_tail->lru, list);
+-	} else {
+-		/*
+-		 * Head page has not yet been counted, as an hpage,
+-		 * so we must account for each subpage individually.
+-		 *
+-		 * Put page_tail on the list at the correct position
+-		 * so they all end up in order.
+-		 */
+-		add_page_to_lru_list_tail(page_tail, lruvec,
+-					  page_lru(page_tail));
+-	}
+-}
+-#endif /* CONFIG_TRANSPARENT_HUGEPAGE */
+-
+ static void __pagevec_lru_add_fn(struct page *page, struct lruvec *lruvec,
+ 				 void *arg)
+ {
