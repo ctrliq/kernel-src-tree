@@ -1,0 +1,141 @@
+ext4: clear buffer verified flag if read meta block from disk
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author zhangyi (F) <yi.zhang@huawei.com>
+commit d9befedaafcf3a111428baa7c45b02923eab2d87
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/d9befeda.failed
+
+The metadata buffer is no longer trusted after we read it from disk
+again because it is not uptodate for some reasons (e.g. failed to write
+back). Otherwise we may get below memory corruption problem in
+ext4_ext_split()->memset() if we read stale data from the newly
+allocated extent block on disk which has been failed to async write
+out but miss verify again since the verified bit has already been set
+on the buffer.
+
+[   29.774674] BUG: unable to handle kernel paging request at ffff88841949d000
+...
+[   29.783317] Oops: 0002 [#2] SMP
+[   29.784219] R10: 00000000000f4240 R11: 0000000000002e28 R12: ffff88842fa1c800
+[   29.784627] CPU: 1 PID: 126 Comm: kworker/u4:3 Tainted: G      D W
+[   29.785546] R13: ffffffff9cddcc20 R14: ffffffff9cddd420 R15: ffff88842fa1c2f8
+[   29.786679] Hardware name: QEMU Standard PC (i440FX + PIIX, 1996),BIOS ?-20190727_0738364
+[   29.787588] FS:  0000000000000000(0000) GS:ffff88842fa00000(0000) knlGS:0000000000000000
+[   29.789288] Workqueue: writeback wb_workfn
+[   29.790319] CS:  0010 DS: 0000 ES: 0000 CR0: 0000000080050033
+[   29.790321]  (flush-8:0)
+[   29.790844] CR2: 0000000000000008 CR3: 00000004234f2000 CR4: 00000000000006f0
+[   29.791924] DR0: 0000000000000000 DR1: 0000000000000000 DR2: 0000000000000000
+[   29.792839] RIP: 0010:__memset+0x24/0x30
+[   29.793739] DR3: 0000000000000000 DR6: 00000000fffe0ff0 DR7: 0000000000000400
+[   29.794256] Code: 90 90 90 90 90 90 0f 1f 44 00 00 49 89 f9 48 89 d1 83 e2 07 48 c1 e9 033
+[   29.795161] Kernel panic - not syncing: Fatal exception in interrupt
+...
+[   29.808149] Call Trace:
+[   29.808475]  ext4_ext_insert_extent+0x102e/0x1be0
+[   29.809085]  ext4_ext_map_blocks+0xa89/0x1bb0
+[   29.809652]  ext4_map_blocks+0x290/0x8a0
+[   29.809085]  ext4_ext_map_blocks+0xa89/0x1bb0
+[   29.809652]  ext4_map_blocks+0x290/0x8a0
+[   29.810161]  ext4_writepages+0xc85/0x17c0
+...
+
+Fix this by clearing buffer's verified bit if we read meta block from
+disk again.
+
+	Signed-off-by: zhangyi (F) <yi.zhang@huawei.com>
+	Cc: stable@vger.kernel.org
+Link: https://lore.kernel.org/r/20200924073337.861472-2-yi.zhang@huawei.com
+	Signed-off-by: Theodore Ts'o <tytso@mit.edu>
+(cherry picked from commit d9befedaafcf3a111428baa7c45b02923eab2d87)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/ext4/balloc.c
+diff --cc fs/ext4/balloc.c
+index 96dd3acd7204,8e7e9715cde9..000000000000
+--- a/fs/ext4/balloc.c
++++ b/fs/ext4/balloc.c
+@@@ -486,10 -494,12 +486,15 @@@ ext4_read_block_bitmap_nowait(struct su
+  	 * submit the buffer_head for reading
+  	 */
+  	set_buffer_new(bh);
+++<<<<<<< HEAD
+ +	trace_ext4_read_block_bitmap_load(sb, block_group);
+++=======
++ 	clear_buffer_verified(bh);
++ 	trace_ext4_read_block_bitmap_load(sb, block_group, ignore_locked);
+++>>>>>>> d9befedaafcf (ext4: clear buffer verified flag if read meta block from disk)
+  	bh->b_end_io = ext4_end_bitmap_read;
+  	get_bh(bh);
+ -	submit_bh(REQ_OP_READ, REQ_META | REQ_PRIO |
+ -		  (ignore_locked ? REQ_RAHEAD : 0), bh);
+ +	submit_bh(REQ_OP_READ, REQ_META | REQ_PRIO, bh);
+  	return bh;
+  verify:
+  	err = ext4_validate_block_bitmap(sb, desc, block_group, bh);
+* Unmerged path fs/ext4/balloc.c
+diff --git a/fs/ext4/extents.c b/fs/ext4/extents.c
+index 0b1bdbdfb505..a18ed730eb39 100644
+--- a/fs/ext4/extents.c
++++ b/fs/ext4/extents.c
+@@ -553,6 +553,7 @@ __read_extent_tree_block(const char *function, unsigned int line,
+ 
+ 	if (!bh_uptodate_or_lock(bh)) {
+ 		trace_ext4_ext_load_extent(inode, pblk, _RET_IP_);
++		clear_buffer_verified(bh);
+ 		err = bh_submit_read(bh);
+ 		if (err < 0)
+ 			goto errout;
+diff --git a/fs/ext4/ialloc.c b/fs/ext4/ialloc.c
+index e451ffb37ca1..33e8954c70e1 100644
+--- a/fs/ext4/ialloc.c
++++ b/fs/ext4/ialloc.c
+@@ -187,6 +187,7 @@ ext4_read_inode_bitmap(struct super_block *sb, ext4_group_t block_group)
+ 	/*
+ 	 * submit the buffer_head for reading
+ 	 */
++	clear_buffer_verified(bh);
+ 	trace_ext4_load_inode_bitmap(sb, block_group);
+ 	bh->b_end_io = ext4_end_bitmap_read;
+ 	get_bh(bh);
+diff --git a/fs/ext4/inode.c b/fs/ext4/inode.c
+index 61de8a5507d3..1622c118b7a8 100644
+--- a/fs/ext4/inode.c
++++ b/fs/ext4/inode.c
+@@ -1018,6 +1018,7 @@ struct buffer_head *ext4_bread(handle_t *handle, struct inode *inode,
+ 		return bh;
+ 	if (!bh || ext4_buffer_uptodate(bh))
+ 		return bh;
++	clear_buffer_verified(bh);
+ 	ll_rw_block(REQ_OP_READ, REQ_META | REQ_PRIO, 1, &bh);
+ 	wait_on_buffer(bh);
+ 	if (buffer_uptodate(bh))
+@@ -1043,9 +1044,11 @@ int ext4_bread_batch(struct inode *inode, ext4_lblk_t block, int bh_count,
+ 
+ 	for (i = 0; i < bh_count; i++)
+ 		/* Note that NULL bhs[i] is valid because of holes. */
+-		if (bhs[i] && !ext4_buffer_uptodate(bhs[i]))
++		if (bhs[i] && !ext4_buffer_uptodate(bhs[i])) {
++			clear_buffer_verified(bhs[i]);
+ 			ll_rw_block(REQ_OP_READ, REQ_META | REQ_PRIO, 1,
+ 				    &bhs[i]);
++		}
+ 
+ 	if (!wait)
+ 		return 0;
+diff --git a/fs/ext4/super.c b/fs/ext4/super.c
+index 176786ade29a..5370808ad365 100644
+--- a/fs/ext4/super.c
++++ b/fs/ext4/super.c
+@@ -155,6 +155,7 @@ ext4_sb_bread(struct super_block *sb, sector_t block, int op_flags)
+ 		return ERR_PTR(-ENOMEM);
+ 	if (ext4_buffer_uptodate(bh))
+ 		return bh;
++	clear_buffer_verified(bh);
+ 	ll_rw_block(REQ_OP_READ, REQ_META | op_flags, 1, &bh);
+ 	wait_on_buffer(bh);
+ 	if (buffer_uptodate(bh))
