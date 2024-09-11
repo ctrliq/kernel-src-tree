@@ -1,0 +1,511 @@
+drm/dp: Introduce EDID-based quirks
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-193.el8
+commit-author Lyude Paul <lyude@redhat.com>
+commit 0883ce8146ed6074c76399f4e70dbed788582e12
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-193.el8/0883ce81.failed
+
+The whole point of using OUIs is so that we can recognize certain
+devices and potentially apply quirks for them. Normally this should work
+quite well, but there appears to be quite a number of laptop panels out
+there that will fill the OUI but not the device ID. As such, for devices
+like this I can't imagine it's a very good idea to try relying on OUIs
+for applying quirks. As well, some laptop vendors have confirmed to us
+that their panels have this exact issue.
+
+So, let's introduce the ability to apply DP quirks based on EDID
+identification. We reuse the same quirk bits for OUI-based quirks, so
+that callers can simply check all possible quirks using
+drm_dp_has_quirk().
+
+	Signed-off-by: Lyude Paul <lyude@redhat.com>
+	Cc: Jani Nikula <jani.nikula@intel.com>
+	Reviewed-by: Adam Jackson <ajax@redhat.com>
+Link: https://patchwork.freedesktop.org/patch/msgid/20200211183358.157448-2-lyude@redhat.com
+(cherry picked from commit 0883ce8146ed6074c76399f4e70dbed788582e12)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/gpu/drm/drm_dp_mst_topology.c
+#	drivers/gpu/drm/i915/display/intel_display_types.h
+#	drivers/gpu/drm/i915/intel_dp.c
+#	drivers/gpu/drm/i915/intel_dp_mst.c
+#	drivers/gpu/drm/i915/intel_psr.c
+diff --cc drivers/gpu/drm/drm_dp_mst_topology.c
+index 01c068bb9fa4,68247670427a..000000000000
+--- a/drivers/gpu/drm/drm_dp_mst_topology.c
++++ b/drivers/gpu/drm/drm_dp_mst_topology.c
+@@@ -4014,3 -5316,174 +4014,177 @@@ static void drm_dp_mst_unregister_i2c_b
+  {
+  	i2c_del_adapter(&aux->ddc);
+  }
+++<<<<<<< HEAD
+++=======
++ 
++ /**
++  * drm_dp_mst_is_virtual_dpcd() - Is the given port a virtual DP Peer Device
++  * @port: The port to check
++  *
++  * A single physical MST hub object can be represented in the topology
++  * by multiple branches, with virtual ports between those branches.
++  *
++  * As of DP1.4, An MST hub with internal (virtual) ports must expose
++  * certain DPCD registers over those ports. See sections 2.6.1.1.1
++  * and 2.6.1.1.2 of Display Port specification v1.4 for details.
++  *
++  * May acquire mgr->lock
++  *
++  * Returns:
++  * true if the port is a virtual DP peer device, false otherwise
++  */
++ static bool drm_dp_mst_is_virtual_dpcd(struct drm_dp_mst_port *port)
++ {
++ 	struct drm_dp_mst_port *downstream_port;
++ 
++ 	if (!port || port->dpcd_rev < DP_DPCD_REV_14)
++ 		return false;
++ 
++ 	/* Virtual DP Sink (Internal Display Panel) */
++ 	if (port->port_num >= 8)
++ 		return true;
++ 
++ 	/* DP-to-HDMI Protocol Converter */
++ 	if (port->pdt == DP_PEER_DEVICE_DP_LEGACY_CONV &&
++ 	    !port->mcs &&
++ 	    port->ldps)
++ 		return true;
++ 
++ 	/* DP-to-DP */
++ 	mutex_lock(&port->mgr->lock);
++ 	if (port->pdt == DP_PEER_DEVICE_MST_BRANCHING &&
++ 	    port->mstb &&
++ 	    port->mstb->num_ports == 2) {
++ 		list_for_each_entry(downstream_port, &port->mstb->ports, next) {
++ 			if (downstream_port->pdt == DP_PEER_DEVICE_SST_SINK &&
++ 			    !downstream_port->input) {
++ 				mutex_unlock(&port->mgr->lock);
++ 				return true;
++ 			}
++ 		}
++ 	}
++ 	mutex_unlock(&port->mgr->lock);
++ 
++ 	return false;
++ }
++ 
++ /**
++  * drm_dp_mst_dsc_aux_for_port() - Find the correct aux for DSC
++  * @port: The port to check. A leaf of the MST tree with an attached display.
++  *
++  * Depending on the situation, DSC may be enabled via the endpoint aux,
++  * the immediately upstream aux, or the connector's physical aux.
++  *
++  * This is both the correct aux to read DSC_CAPABILITY and the
++  * correct aux to write DSC_ENABLED.
++  *
++  * This operation can be expensive (up to four aux reads), so
++  * the caller should cache the return.
++  *
++  * Returns:
++  * NULL if DSC cannot be enabled on this port, otherwise the aux device
++  */
++ struct drm_dp_aux *drm_dp_mst_dsc_aux_for_port(struct drm_dp_mst_port *port)
++ {
++ 	struct drm_dp_mst_port *immediate_upstream_port;
++ 	struct drm_dp_mst_port *fec_port;
++ 	struct drm_dp_desc desc = { 0 };
++ 	u8 endpoint_fec;
++ 	u8 endpoint_dsc;
++ 
++ 	if (!port)
++ 		return NULL;
++ 
++ 	if (port->parent->port_parent)
++ 		immediate_upstream_port = port->parent->port_parent;
++ 	else
++ 		immediate_upstream_port = NULL;
++ 
++ 	fec_port = immediate_upstream_port;
++ 	while (fec_port) {
++ 		/*
++ 		 * Each physical link (i.e. not a virtual port) between the
++ 		 * output and the primary device must support FEC
++ 		 */
++ 		if (!drm_dp_mst_is_virtual_dpcd(fec_port) &&
++ 		    !fec_port->fec_capable)
++ 			return NULL;
++ 
++ 		fec_port = fec_port->parent->port_parent;
++ 	}
++ 
++ 	/* DP-to-DP peer device */
++ 	if (drm_dp_mst_is_virtual_dpcd(immediate_upstream_port)) {
++ 		u8 upstream_dsc;
++ 
++ 		if (drm_dp_dpcd_read(&port->aux,
++ 				     DP_DSC_SUPPORT, &endpoint_dsc, 1) != 1)
++ 			return NULL;
++ 		if (drm_dp_dpcd_read(&port->aux,
++ 				     DP_FEC_CAPABILITY, &endpoint_fec, 1) != 1)
++ 			return NULL;
++ 		if (drm_dp_dpcd_read(&immediate_upstream_port->aux,
++ 				     DP_DSC_SUPPORT, &upstream_dsc, 1) != 1)
++ 			return NULL;
++ 
++ 		/* Enpoint decompression with DP-to-DP peer device */
++ 		if ((endpoint_dsc & DP_DSC_DECOMPRESSION_IS_SUPPORTED) &&
++ 		    (endpoint_fec & DP_FEC_CAPABLE) &&
++ 		    (upstream_dsc & 0x2) /* DSC passthrough */)
++ 			return &port->aux;
++ 
++ 		/* Virtual DPCD decompression with DP-to-DP peer device */
++ 		return &immediate_upstream_port->aux;
++ 	}
++ 
++ 	/* Virtual DPCD decompression with DP-to-HDMI or Virtual DP Sink */
++ 	if (drm_dp_mst_is_virtual_dpcd(port))
++ 		return &port->aux;
++ 
++ 	/*
++ 	 * Synaptics quirk
++ 	 * Applies to ports for which:
++ 	 * - Physical aux has Synaptics OUI
++ 	 * - DPv1.4 or higher
++ 	 * - Port is on primary branch device
++ 	 * - Not a VGA adapter (DP_DWN_STRM_PORT_TYPE_ANALOG)
++ 	 */
++ 	if (drm_dp_read_desc(port->mgr->aux, &desc, true))
++ 		return NULL;
++ 
++ 	if (drm_dp_has_quirk(&desc, 0,
++ 			     DP_DPCD_QUIRK_DSC_WITHOUT_VIRTUAL_DPCD) &&
++ 	    port->mgr->dpcd[DP_DPCD_REV] >= DP_DPCD_REV_14 &&
++ 	    port->parent == port->mgr->mst_primary) {
++ 		u8 downstreamport;
++ 
++ 		if (drm_dp_dpcd_read(&port->aux, DP_DOWNSTREAMPORT_PRESENT,
++ 				     &downstreamport, 1) < 0)
++ 			return NULL;
++ 
++ 		if ((downstreamport & DP_DWN_STRM_PORT_PRESENT) &&
++ 		   ((downstreamport & DP_DWN_STRM_PORT_TYPE_MASK)
++ 		     != DP_DWN_STRM_PORT_TYPE_ANALOG))
++ 			return port->mgr->aux;
++ 	}
++ 
++ 	/*
++ 	 * The check below verifies if the MST sink
++ 	 * connected to the GPU is capable of DSC -
++ 	 * therefore the endpoint needs to be
++ 	 * both DSC and FEC capable.
++ 	 */
++ 	if (drm_dp_dpcd_read(&port->aux,
++ 	   DP_DSC_SUPPORT, &endpoint_dsc, 1) != 1)
++ 		return NULL;
++ 	if (drm_dp_dpcd_read(&port->aux,
++ 	   DP_FEC_CAPABILITY, &endpoint_fec, 1) != 1)
++ 		return NULL;
++ 	if ((endpoint_dsc & DP_DSC_DECOMPRESSION_IS_SUPPORTED) &&
++ 	   (endpoint_fec & DP_FEC_CAPABLE))
++ 		return &port->aux;
++ 
++ 	return NULL;
++ }
++ EXPORT_SYMBOL(drm_dp_mst_dsc_aux_for_port);
+++>>>>>>> 0883ce8146ed (drm/dp: Introduce EDID-based quirks)
+diff --cc drivers/gpu/drm/i915/intel_dp.c
+index 48da4a969a0a,0a417cd2af2b..000000000000
+--- a/drivers/gpu/drm/i915/intel_dp.c
++++ b/drivers/gpu/drm/i915/intel_dp.c
+@@@ -2072,9 -2398,9 +2072,9 @@@ intel_dp_compute_config(struct intel_en
+  	struct intel_connector *intel_connector = intel_dp->attached_connector;
+  	struct intel_digital_connector_state *intel_conn_state =
+  		to_intel_digital_connector_state(conn_state);
+- 	bool constant_n = drm_dp_has_quirk(&intel_dp->desc,
++ 	bool constant_n = drm_dp_has_quirk(&intel_dp->desc, 0,
+  					   DP_DPCD_QUIRK_CONSTANT_N);
+ -	int ret = 0, output_bpp;
+ +	int ret;
+  
+  	if (HAS_PCH_SPLIT(dev_priv) && !HAS_DDI(dev_priv) && port != PORT_A)
+  		pipe_config->has_pch_encoder = true;
+@@@ -4150,7 -4513,9 +4150,13 @@@ intel_dp_get_dpcd(struct intel_dp *inte
+  	 * Some eDP panels do not set a valid value for sink count, that is why
+  	 * it don't care about read it here and in intel_edp_init_dpcd().
+  	 */
+++<<<<<<< HEAD:drivers/gpu/drm/i915/intel_dp.c
+ +	if (!intel_dp_is_edp(intel_dp)) {
+++=======
++ 	if (!intel_dp_is_edp(intel_dp) &&
++ 	    !drm_dp_has_quirk(&intel_dp->desc, 0,
++ 			      DP_DPCD_QUIRK_NO_SINK_COUNT)) {
+++>>>>>>> 0883ce8146ed (drm/dp: Introduce EDID-based quirks):drivers/gpu/drm/i915/display/intel_dp.c
+  		u8 count;
+  		ssize_t r;
+  
+diff --cc drivers/gpu/drm/i915/intel_dp_mst.c
+index fb67cd931117,39f5de9a8c7c..000000000000
+--- a/drivers/gpu/drm/i915/intel_dp_mst.c
++++ b/drivers/gpu/drm/i915/intel_dp_mst.c
+@@@ -29,6 -27,112 +29,115 @@@
+  #include <drm/drm_edid.h>
+  #include <drm/drm_probe_helper.h>
+  
+++<<<<<<< HEAD:drivers/gpu/drm/i915/intel_dp_mst.c
+++=======
++ #include "i915_drv.h"
++ #include "intel_atomic.h"
++ #include "intel_audio.h"
++ #include "intel_connector.h"
++ #include "intel_ddi.h"
++ #include "intel_display_types.h"
++ #include "intel_dp.h"
++ #include "intel_dp_mst.h"
++ #include "intel_dpio_phy.h"
++ 
++ static int intel_dp_mst_compute_link_config(struct intel_encoder *encoder,
++ 					    struct intel_crtc_state *crtc_state,
++ 					    struct drm_connector_state *conn_state,
++ 					    struct link_config_limits *limits)
++ {
++ 	struct drm_atomic_state *state = crtc_state->uapi.state;
++ 	struct intel_dp_mst_encoder *intel_mst = enc_to_mst(encoder);
++ 	struct intel_dp *intel_dp = &intel_mst->primary->dp;
++ 	struct intel_connector *connector =
++ 		to_intel_connector(conn_state->connector);
++ 	const struct drm_display_mode *adjusted_mode =
++ 		&crtc_state->hw.adjusted_mode;
++ 	void *port = connector->port;
++ 	bool constant_n = drm_dp_has_quirk(&intel_dp->desc, 0,
++ 					   DP_DPCD_QUIRK_CONSTANT_N);
++ 	int bpp, slots = -EINVAL;
++ 
++ 	crtc_state->lane_count = limits->max_lane_count;
++ 	crtc_state->port_clock = limits->max_clock;
++ 
++ 	for (bpp = limits->max_bpp; bpp >= limits->min_bpp; bpp -= 2 * 3) {
++ 		crtc_state->pipe_bpp = bpp;
++ 
++ 		crtc_state->pbn = drm_dp_calc_pbn_mode(adjusted_mode->crtc_clock,
++ 						       crtc_state->pipe_bpp,
++ 						       false);
++ 
++ 		slots = drm_dp_atomic_find_vcpi_slots(state, &intel_dp->mst_mgr,
++ 						      port, crtc_state->pbn, 0);
++ 		if (slots == -EDEADLK)
++ 			return slots;
++ 		if (slots >= 0)
++ 			break;
++ 	}
++ 
++ 	if (slots < 0) {
++ 		DRM_DEBUG_KMS("failed finding vcpi slots:%d\n", slots);
++ 		return slots;
++ 	}
++ 
++ 	intel_link_compute_m_n(crtc_state->pipe_bpp,
++ 			       crtc_state->lane_count,
++ 			       adjusted_mode->crtc_clock,
++ 			       crtc_state->port_clock,
++ 			       &crtc_state->dp_m_n,
++ 			       constant_n, crtc_state->fec_enable);
++ 	crtc_state->dp_m_n.tu = slots;
++ 
++ 	return 0;
++ }
++ 
++ /*
++  * Iterate over all connectors and return the smallest transcoder in the MST
++  * stream
++  */
++ static enum transcoder
++ intel_dp_mst_master_trans_compute(struct intel_atomic_state *state,
++ 				  struct intel_dp *mst_port)
++ {
++ 	struct drm_i915_private *dev_priv = to_i915(state->base.dev);
++ 	struct intel_digital_connector_state *conn_state;
++ 	struct intel_connector *connector;
++ 	enum pipe ret = I915_MAX_PIPES;
++ 	int i;
++ 
++ 	if (INTEL_GEN(dev_priv) < 12)
++ 		return INVALID_TRANSCODER;
++ 
++ 	for_each_new_intel_connector_in_state(state, connector, conn_state, i) {
++ 		struct intel_crtc_state *crtc_state;
++ 		struct intel_crtc *crtc;
++ 
++ 		if (connector->mst_port != mst_port || !conn_state->base.crtc)
++ 			continue;
++ 
++ 		crtc = to_intel_crtc(conn_state->base.crtc);
++ 		crtc_state = intel_atomic_get_new_crtc_state(state, crtc);
++ 		if (!crtc_state->uapi.active)
++ 			continue;
++ 
++ 		/*
++ 		 * Using crtc->pipe because crtc_state->cpu_transcoder is
++ 		 * computed, so others CRTCs could have non-computed
++ 		 * cpu_transcoder
++ 		 */
++ 		if (crtc->pipe < ret)
++ 			ret = crtc->pipe;
++ 	}
++ 
++ 	if (ret == I915_MAX_PIPES)
++ 		return INVALID_TRANSCODER;
++ 
++ 	/* Simple cast works because TGL don't have a eDP transcoder */
++ 	return (enum transcoder)ret;
++ }
++ 
+++>>>>>>> 0883ce8146ed (drm/dp: Introduce EDID-based quirks):drivers/gpu/drm/i915/display/intel_dp_mst.c
+  static int intel_dp_mst_compute_config(struct intel_encoder *encoder,
+  				       struct intel_crtc_state *pipe_config,
+  				       struct drm_connector_state *conn_state)
+diff --cc drivers/gpu/drm/i915/intel_psr.c
+index 0b4071b4e01d,fd9b146e3aba..000000000000
+--- a/drivers/gpu/drm/i915/intel_psr.c
++++ b/drivers/gpu/drm/i915/intel_psr.c
+@@@ -296,11 -301,12 +296,17 @@@ void intel_psr_init_dpcd(struct intel_d
+  
+  	if (!intel_dp->psr_dpcd[0])
+  		return;
+ -	drm_dbg_kms(&dev_priv->drm, "eDP panel supports PSR version %x\n",
+ -		    intel_dp->psr_dpcd[0]);
+ +	DRM_DEBUG_KMS("eDP panel supports PSR version %x\n",
+ +		      intel_dp->psr_dpcd[0]);
+  
+++<<<<<<< HEAD:drivers/gpu/drm/i915/intel_psr.c
+ +	if (drm_dp_has_quirk(&intel_dp->desc, DP_DPCD_QUIRK_NO_PSR)) {
+ +		DRM_DEBUG_KMS("PSR support not currently available for this panel\n");
+++=======
++ 	if (drm_dp_has_quirk(&intel_dp->desc, 0, DP_DPCD_QUIRK_NO_PSR)) {
++ 		drm_dbg_kms(&dev_priv->drm,
++ 			    "PSR support not currently available for this panel\n");
+++>>>>>>> 0883ce8146ed (drm/dp: Introduce EDID-based quirks):drivers/gpu/drm/i915/display/intel_psr.c
+  		return;
+  	}
+  
+* Unmerged path drivers/gpu/drm/i915/display/intel_display_types.h
+diff --git a/drivers/gpu/drm/drm_dp_helper.c b/drivers/gpu/drm/drm_dp_helper.c
+index 54a6414c5d96..bb4e8df18b6b 100644
+--- a/drivers/gpu/drm/drm_dp_helper.c
++++ b/drivers/gpu/drm/drm_dp_helper.c
+@@ -1321,6 +1321,67 @@ drm_dp_get_quirks(const struct drm_dp_dpcd_ident *ident, bool is_branch)
+ #undef DEVICE_ID_ANY
+ #undef DEVICE_ID
+ 
++struct edid_quirk {
++	u8 mfg_id[2];
++	u8 prod_id[2];
++	u32 quirks;
++};
++
++#define MFG(first, second) { (first), (second) }
++#define PROD_ID(first, second) { (first), (second) }
++
++/*
++ * Some devices have unreliable OUIDs where they don't set the device ID
++ * correctly, and as a result we need to use the EDID for finding additional
++ * DP quirks in such cases.
++ */
++static const struct edid_quirk edid_quirk_list[] = {
++};
++
++#undef MFG
++#undef PROD_ID
++
++/**
++ * drm_dp_get_edid_quirks() - Check the EDID of a DP device to find additional
++ * DP-specific quirks
++ * @edid: The EDID to check
++ *
++ * While OUIDs are meant to be used to recognize a DisplayPort device, a lot
++ * of manufacturers don't seem to like following standards and neglect to fill
++ * the dev-ID in, making it impossible to only use OUIDs for determining
++ * quirks in some cases. This function can be used to check the EDID and look
++ * up any additional DP quirks. The bits returned by this function correspond
++ * to the quirk bits in &drm_dp_quirk.
++ *
++ * Returns: a bitmask of quirks, if any. The driver can check this using
++ * drm_dp_has_quirk().
++ */
++u32 drm_dp_get_edid_quirks(const struct edid *edid)
++{
++	const struct edid_quirk *quirk;
++	u32 quirks = 0;
++	int i;
++
++	if (!edid)
++		return 0;
++
++	for (i = 0; i < ARRAY_SIZE(edid_quirk_list); i++) {
++		quirk = &edid_quirk_list[i];
++		if (memcmp(quirk->mfg_id, edid->mfg_id,
++			   sizeof(edid->mfg_id)) == 0 &&
++		    memcmp(quirk->prod_id, edid->prod_code,
++			   sizeof(edid->prod_code)) == 0)
++			quirks |= quirk->quirks;
++	}
++
++	DRM_DEBUG_KMS("DP sink: EDID mfg %*phD prod-ID %*phD quirks: 0x%04x\n",
++		      (int)sizeof(edid->mfg_id), edid->mfg_id,
++		      (int)sizeof(edid->prod_code), edid->prod_code, quirks);
++
++	return quirks;
++}
++EXPORT_SYMBOL(drm_dp_get_edid_quirks);
++
+ /**
+  * drm_dp_read_desc - read sink/branch descriptor from DPCD
+  * @aux: DisplayPort AUX channel
+* Unmerged path drivers/gpu/drm/drm_dp_mst_topology.c
+* Unmerged path drivers/gpu/drm/i915/display/intel_display_types.h
+* Unmerged path drivers/gpu/drm/i915/intel_dp.c
+* Unmerged path drivers/gpu/drm/i915/intel_dp_mst.c
+* Unmerged path drivers/gpu/drm/i915/intel_psr.c
+diff --git a/include/drm/drm_dp_helper.h b/include/drm/drm_dp_helper.h
+index 97ce790a5b5a..7be415b7f3fa 100644
+--- a/include/drm/drm_dp_helper.h
++++ b/include/drm/drm_dp_helper.h
+@@ -1378,13 +1378,16 @@ struct drm_dp_desc {
+ 
+ int drm_dp_read_desc(struct drm_dp_aux *aux, struct drm_dp_desc *desc,
+ 		     bool is_branch);
++u32 drm_dp_get_edid_quirks(const struct edid *edid);
+ 
+ /**
+  * enum drm_dp_quirk - Display Port sink/branch device specific quirks
+  *
+  * Display Port sink and branch devices in the wild have a variety of bugs, try
+  * to collect them here. The quirks are shared, but it's up to the drivers to
+- * implement workarounds for them.
++ * implement workarounds for them. Note that because some devices have
++ * unreliable OUIDs, the EDID of sinks should also be checked for quirks using
++ * drm_dp_get_edid_quirks().
+  */
+ enum drm_dp_quirk {
+ 	/**
+@@ -1406,14 +1409,16 @@ enum drm_dp_quirk {
+ /**
+  * drm_dp_has_quirk() - does the DP device have a specific quirk
+  * @desc: Device decriptor filled by drm_dp_read_desc()
++ * @edid_quirks: Optional quirk bitmask filled by drm_dp_get_edid_quirks()
+  * @quirk: Quirk to query for
+  *
+  * Return true if DP device identified by @desc has @quirk.
+  */
+ static inline bool
+-drm_dp_has_quirk(const struct drm_dp_desc *desc, enum drm_dp_quirk quirk)
++drm_dp_has_quirk(const struct drm_dp_desc *desc, u32 edid_quirks,
++		 enum drm_dp_quirk quirk)
+ {
+-	return desc->quirks & BIT(quirk);
++	return (desc->quirks | edid_quirks) & BIT(quirk);
+ }
+ 
+ #ifdef CONFIG_DRM_DP_CEC
