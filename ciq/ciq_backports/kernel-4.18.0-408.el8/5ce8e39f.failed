@@ -1,0 +1,308 @@
+x86/sgx: Remove .fixup usage
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-408.el8
+commit-author Peter Zijlstra <peterz@infradead.org>
+commit 5ce8e39f55521c762f0e6d1bba9597284b1f2e69
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-408.el8/5ce8e39f.failed
+
+Create EX_TYPE_FAULT_SGX which does as EX_TYPE_FAULT does, except adds
+this extra bit that SGX really fancies having.
+
+	Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+	Reviewed-by: Josh Poimboeuf <jpoimboe@redhat.com>
+Link: https://lore.kernel.org/r/20211110101325.961246679@infradead.org
+(cherry picked from commit 5ce8e39f55521c762f0e6d1bba9597284b1f2e69)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/include/asm/extable_fixup_types.h
+#	arch/x86/mm/extable.c
+diff --cc arch/x86/mm/extable.c
+index 16a4b264961b,c869f43e8a2e..000000000000
+--- a/arch/x86/mm/extable.c
++++ b/arch/x86/mm/extable.c
+@@@ -7,85 -9,52 +7,97 @@@
+  #include <asm/sev.h>
+  #include <asm/traps.h>
+  #include <asm/kdebug.h>
+++<<<<<<< HEAD
+++=======
++ #include <asm/insn-eval.h>
++ #include <asm/sgx.h>
+++>>>>>>> 5ce8e39f5552 (x86/sgx: Remove .fixup usage)
+  
+ -static inline unsigned long *pt_regs_nr(struct pt_regs *regs, int nr)
+ -{
+ -	int reg_offset = pt_regs_offset(regs, nr);
+ -	static unsigned long __dummy;
+ -
+ -	if (WARN_ON_ONCE(reg_offset < 0))
+ -		return &__dummy;
+ -
+ -	return (unsigned long *)((unsigned long)regs + reg_offset);
+ -}
+ +typedef bool (*ex_handler_t)(const struct exception_table_entry *,
+ +			    struct pt_regs *, int);
+  
+  static inline unsigned long
+  ex_fixup_addr(const struct exception_table_entry *x)
+  {
+  	return (unsigned long)&x->fixup + x->fixup;
+  }
+ -
+ -static bool ex_handler_default(const struct exception_table_entry *e,
+ -			       struct pt_regs *regs)
+ +static inline ex_handler_t
+ +ex_fixup_handler(const struct exception_table_entry *x)
+  {
+ -	if (e->data & EX_FLAG_CLEAR_AX)
+ -		regs->ax = 0;
+ -	if (e->data & EX_FLAG_CLEAR_DX)
+ -		regs->dx = 0;
+ +	return (ex_handler_t)((unsigned long)&x->handler + x->handler);
+ +}
+  
+ -	regs->ip = ex_fixup_addr(e);
+ +__visible bool ex_handler_default(const struct exception_table_entry *fixup,
+ +				  struct pt_regs *regs, int trapnr)
+ +{
+ +	regs->ip = ex_fixup_addr(fixup);
+  	return true;
+  }
+ +EXPORT_SYMBOL(ex_handler_default);
+  
+ -static bool ex_handler_fault(const struct exception_table_entry *fixup,
+ -			     struct pt_regs *regs, int trapnr)
+ +__visible bool ex_handler_fault(const struct exception_table_entry *fixup,
+ +				struct pt_regs *regs, int trapnr)
+  {
+ +	regs->ip = ex_fixup_addr(fixup);
+  	regs->ax = trapnr;
+ -	return ex_handler_default(fixup, regs);
+ +	return true;
+  }
+ +EXPORT_SYMBOL_GPL(ex_handler_fault);
+ +
+ +/*
+ + * Handler for UD0 exception following a failed test against the
+ + * result of a refcount inc/dec/add/sub.
+ + */
+ +__visible bool ex_handler_refcount(const struct exception_table_entry *fixup,
+ +				   struct pt_regs *regs, int trapnr)
+ +{
+ +	/* First unconditionally saturate the refcount. */
+ +	*(int *)regs->cx = INT_MIN / 2;
+ +
+ +	/*
+ +	 * Strictly speaking, this reports the fixup destination, not
+ +	 * the fault location, and not the actually overflowing
+ +	 * instruction, which is the instruction before the "js", but
+ +	 * since that instruction could be a variety of lengths, just
+ +	 * report the location after the overflow, which should be close
+ +	 * enough for finding the overflow, as it's at least back in
+ +	 * the function, having returned from .text.unlikely.
+ +	 */
+ +	regs->ip = ex_fixup_addr(fixup);
+ +
+ +	/*
+ +	 * This function has been called because either a negative refcount
+ +	 * value was seen by any of the refcount functions, or a zero
+ +	 * refcount value was seen by refcount_dec().
+ +	 *
+ +	 * If we crossed from INT_MAX to INT_MIN, OF (Overflow Flag: result
+ +	 * wrapped around) will be set. Additionally, seeing the refcount
+ +	 * reach 0 will set ZF (Zero Flag: result was zero). In each of
+ +	 * these cases we want a report, since it's a boundary condition.
+ +	 * The SF case is not reported since it indicates post-boundary
+ +	 * manipulations below zero or above INT_MAX. And if none of the
+ +	 * flags are set, something has gone very wrong, so report it.
+ +	 */
+ +	if (regs->flags & (X86_EFLAGS_OF | X86_EFLAGS_ZF)) {
+ +		bool zero = regs->flags & X86_EFLAGS_ZF;
+ +
+ +		refcount_error_report(regs, zero ? "hit zero" : "overflow");
+ +	} else if ((regs->flags & X86_EFLAGS_SF) == 0) {
+ +		/* Report if none of OF, ZF, nor SF are set. */
+ +		refcount_error_report(regs, "unexpected saturation");
+ +	}
+ +
+ +	return true;
+ +}
+ +EXPORT_SYMBOL(ex_handler_refcount);
+  
++ static bool ex_handler_sgx(const struct exception_table_entry *fixup,
++ 			   struct pt_regs *regs, int trapnr)
++ {
++ 	regs->ax = trapnr | SGX_ENCLS_FAULT_FLAG;
++ 	return ex_handler_default(fixup, regs);
++ }
++ 
+  /*
+   * Handler for when we fail to restore a task's FPU state.  We should never get
+   * here because the FPU state of a task using the FPU (task->thread.fpu.state)
+@@@ -202,8 -176,49 +214,54 @@@ int fixup_exception(struct pt_regs *reg
+  	if (!e)
+  		return 0;
+  
+++<<<<<<< HEAD
+ +	handler = ex_fixup_handler(e);
+ +	return handler(e, regs, trapnr);
+++=======
++ 	type = FIELD_GET(EX_DATA_TYPE_MASK, e->data);
++ 	reg  = FIELD_GET(EX_DATA_REG_MASK,  e->data);
++ 	imm  = FIELD_GET(EX_DATA_IMM_MASK,  e->data);
++ 
++ 	switch (type) {
++ 	case EX_TYPE_DEFAULT:
++ 	case EX_TYPE_DEFAULT_MCE_SAFE:
++ 		return ex_handler_default(e, regs);
++ 	case EX_TYPE_FAULT:
++ 	case EX_TYPE_FAULT_MCE_SAFE:
++ 		return ex_handler_fault(e, regs, trapnr);
++ 	case EX_TYPE_UACCESS:
++ 		return ex_handler_uaccess(e, regs, trapnr);
++ 	case EX_TYPE_COPY:
++ 		return ex_handler_copy(e, regs, trapnr);
++ 	case EX_TYPE_CLEAR_FS:
++ 		return ex_handler_clear_fs(e, regs);
++ 	case EX_TYPE_FPU_RESTORE:
++ 		return ex_handler_fprestore(e, regs);
++ 	case EX_TYPE_BPF:
++ 		return ex_handler_bpf(e, regs);
++ 	case EX_TYPE_WRMSR:
++ 		return ex_handler_msr(e, regs, true, false, reg);
++ 	case EX_TYPE_RDMSR:
++ 		return ex_handler_msr(e, regs, false, false, reg);
++ 	case EX_TYPE_WRMSR_SAFE:
++ 		return ex_handler_msr(e, regs, true, true, reg);
++ 	case EX_TYPE_RDMSR_SAFE:
++ 		return ex_handler_msr(e, regs, false, true, reg);
++ 	case EX_TYPE_WRMSR_IN_MCE:
++ 		ex_handler_msr_mce(regs, true);
++ 		break;
++ 	case EX_TYPE_RDMSR_IN_MCE:
++ 		ex_handler_msr_mce(regs, false);
++ 		break;
++ 	case EX_TYPE_POP_ZERO:
++ 		return ex_handler_pop_zero(e, regs);
++ 	case EX_TYPE_IMM_REG:
++ 		return ex_handler_imm_reg(e, regs, reg, imm);
++ 	case EX_TYPE_FAULT_SGX:
++ 		return ex_handler_sgx(e, regs, trapnr);
++ 	}
++ 	BUG();
+++>>>>>>> 5ce8e39f5552 (x86/sgx: Remove .fixup usage)
+  }
+  
+  extern unsigned int early_recursion_flag;
+* Unmerged path arch/x86/include/asm/extable_fixup_types.h
+* Unmerged path arch/x86/include/asm/extable_fixup_types.h
+diff --git a/arch/x86/include/asm/sgx.h b/arch/x86/include/asm/sgx.h
+index 6ed6621287d9..fe3220e9484a 100644
+--- a/arch/x86/include/asm/sgx.h
++++ b/arch/x86/include/asm/sgx.h
+@@ -45,6 +45,24 @@ enum sgx_encls_function {
+ 	EMODT	= 0x0F,
+ };
+ 
++/**
++ * SGX_ENCLS_FAULT_FLAG - flag signifying an ENCLS return code is a trapnr
++ *
++ * ENCLS has its own (positive value) error codes and also generates
++ * ENCLS specific #GP and #PF faults.  And the ENCLS values get munged
++ * with system error codes as everything percolates back up the stack.
++ * Unfortunately (for us), we need to precisely identify each unique
++ * error code, e.g. the action taken if EWB fails varies based on the
++ * type of fault and on the exact SGX error code, i.e. we can't simply
++ * convert all faults to -EFAULT.
++ *
++ * To make all three error types coexist, we set bit 30 to identify an
++ * ENCLS fault.  Bit 31 (technically bits N:31) is used to differentiate
++ * between positive (faults and SGX error codes) and negative (system
++ * error codes) values.
++ */
++#define SGX_ENCLS_FAULT_FLAG 0x40000000
++
+ /**
+  * enum sgx_return_code - The return code type for ENCLS, ENCLU and ENCLV
+  * %SGX_NOT_TRACKED:		Previous ETRACK's shootdown sequence has not
+diff --git a/arch/x86/kernel/cpu/sgx/encls.h b/arch/x86/kernel/cpu/sgx/encls.h
+index 9b204843b78d..fa04a73daf9c 100644
+--- a/arch/x86/kernel/cpu/sgx/encls.h
++++ b/arch/x86/kernel/cpu/sgx/encls.h
+@@ -11,26 +11,8 @@
+ #include <asm/traps.h>
+ #include "sgx.h"
+ 
+-/**
+- * ENCLS_FAULT_FLAG - flag signifying an ENCLS return code is a trapnr
+- *
+- * ENCLS has its own (positive value) error codes and also generates
+- * ENCLS specific #GP and #PF faults.  And the ENCLS values get munged
+- * with system error codes as everything percolates back up the stack.
+- * Unfortunately (for us), we need to precisely identify each unique
+- * error code, e.g. the action taken if EWB fails varies based on the
+- * type of fault and on the exact SGX error code, i.e. we can't simply
+- * convert all faults to -EFAULT.
+- *
+- * To make all three error types coexist, we set bit 30 to identify an
+- * ENCLS fault.  Bit 31 (technically bits N:31) is used to differentiate
+- * between positive (faults and SGX error codes) and negative (system
+- * error codes) values.
+- */
+-#define ENCLS_FAULT_FLAG 0x40000000
+-
+ /* Retrieve the encoded trapnr from the specified return code. */
+-#define ENCLS_TRAPNR(r) ((r) & ~ENCLS_FAULT_FLAG)
++#define ENCLS_TRAPNR(r) ((r) & ~SGX_ENCLS_FAULT_FLAG)
+ 
+ /* Issue a WARN() about an ENCLS function. */
+ #define ENCLS_WARN(r, name) {						  \
+@@ -50,7 +32,7 @@
+  */
+ static inline bool encls_faulted(int ret)
+ {
+-	return ret & ENCLS_FAULT_FLAG;
++	return ret & SGX_ENCLS_FAULT_FLAG;
+ }
+ 
+ /**
+@@ -88,11 +70,7 @@ static inline bool encls_failed(int ret)
+ 	asm volatile(						\
+ 	"1: .byte 0x0f, 0x01, 0xcf;\n\t"			\
+ 	"2:\n"							\
+-	".section .fixup,\"ax\"\n"				\
+-	"3: orl $"__stringify(ENCLS_FAULT_FLAG)",%%eax\n"	\
+-	"   jmp 2b\n"						\
+-	".previous\n"						\
+-	_ASM_EXTABLE_FAULT(1b, 3b)				\
++	_ASM_EXTABLE_TYPE(1b, 2b, EX_TYPE_FAULT_SGX)		\
+ 	: "=a"(ret)						\
+ 	: "a"(rax), inputs					\
+ 	: "memory", "cc");					\
+@@ -127,7 +105,7 @@ static inline bool encls_failed(int ret)
+  *
+  * Return:
+  *   0 on success,
+- *   trapnr with ENCLS_FAULT_FLAG set on fault
++ *   trapnr with SGX_ENCLS_FAULT_FLAG set on fault
+  */
+ #define __encls_N(rax, rbx_out, inputs...)			\
+ 	({							\
+@@ -136,11 +114,7 @@ static inline bool encls_failed(int ret)
+ 	"1: .byte 0x0f, 0x01, 0xcf;\n\t"			\
+ 	"   xor %%eax,%%eax;\n"					\
+ 	"2:\n"							\
+-	".section .fixup,\"ax\"\n"				\
+-	"3: orl $"__stringify(ENCLS_FAULT_FLAG)",%%eax\n"	\
+-	"   jmp 2b\n"						\
+-	".previous\n"						\
+-	_ASM_EXTABLE_FAULT(1b, 3b)				\
++	_ASM_EXTABLE_TYPE(1b, 2b, EX_TYPE_FAULT_SGX)		\
+ 	: "=a"(ret), "=b"(rbx_out)				\
+ 	: "a"(rax), inputs					\
+ 	: "memory");						\
+* Unmerged path arch/x86/mm/extable.c
