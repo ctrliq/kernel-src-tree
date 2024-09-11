@@ -1,0 +1,170 @@
+selftests/bpf: add auto-detach test
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-193.el8
+commit-author Roman Gushchin <guro@fb.com>
+commit d5506591d54b915aaa9d489c9289af2cc88f47a4
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-193.el8/d5506591.failed
+
+Add a kselftest to cover bpf auto-detachment functionality.
+The test creates a cgroup, associates some resources with it,
+attaches a couple of bpf programs and deletes the cgroup.
+
+Then it checks that bpf programs are going away in 5 seconds.
+
+Expected output:
+  $ ./test_cgroup_attach
+  #override:PASS
+  #multi:PASS
+  #autodetach:PASS
+  test_cgroup_attach:PASS
+
+On a kernel without auto-detaching:
+  $ ./test_cgroup_attach
+  #override:PASS
+  #multi:PASS
+  #autodetach:FAIL
+  test_cgroup_attach:FAIL
+
+	Signed-off-by: Roman Gushchin <guro@fb.com>
+	Acked-by: Yonghong Song <yhs@fb.com>
+	Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+(cherry picked from commit d5506591d54b915aaa9d489c9289af2cc88f47a4)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	samples/bpf/test_cgrp2_attach2.c
+diff --cc samples/bpf/test_cgrp2_attach2.c
+index 0bb6507256b7,7671909ee1cb..000000000000
+--- a/samples/bpf/test_cgrp2_attach2.c
++++ b/samples/bpf/test_cgrp2_attach2.c
+@@@ -447,13 -456,116 +447,117 @@@ out
+  	return rc;
+  }
+  
+++<<<<<<< HEAD:samples/bpf/test_cgrp2_attach2.c
+ +int main(int argc, char **argv)
+ +{
+ +	int rc = 0;
+++=======
++ static int test_autodetach(void)
++ {
++ 	__u32 prog_cnt = 4, attach_flags;
++ 	int allow_prog[2] = {0};
++ 	__u32 prog_ids[2] = {0};
++ 	int cg = 0, i, rc = -1;
++ 	void *ptr = NULL;
++ 	int attempts;
++ 
++ 	for (i = 0; i < ARRAY_SIZE(allow_prog); i++) {
++ 		allow_prog[i] = prog_load_cnt(1, 1 << i);
++ 		if (!allow_prog[i])
++ 			goto err;
++ 	}
++ 
++ 	if (setup_cgroup_environment())
++ 		goto err;
++ 
++ 	/* create a cgroup, attach two programs and remember their ids */
++ 	cg = create_and_get_cgroup("/cg_autodetach");
++ 	if (cg < 0)
++ 		goto err;
++ 
++ 	if (join_cgroup("/cg_autodetach"))
++ 		goto err;
++ 
++ 	for (i = 0; i < ARRAY_SIZE(allow_prog); i++) {
++ 		if (bpf_prog_attach(allow_prog[i], cg, BPF_CGROUP_INET_EGRESS,
++ 				    BPF_F_ALLOW_MULTI)) {
++ 			log_err("Attaching prog[%d] to cg:egress", i);
++ 			goto err;
++ 		}
++ 	}
++ 
++ 	/* make sure that programs are attached and run some traffic */
++ 	assert(bpf_prog_query(cg, BPF_CGROUP_INET_EGRESS, 0, &attach_flags,
++ 			      prog_ids, &prog_cnt) == 0);
++ 	assert(system(PING_CMD) == 0);
++ 
++ 	/* allocate some memory (4Mb) to pin the original cgroup */
++ 	ptr = malloc(4 * (1 << 20));
++ 	if (!ptr)
++ 		goto err;
++ 
++ 	/* close programs and cgroup fd */
++ 	for (i = 0; i < ARRAY_SIZE(allow_prog); i++) {
++ 		close(allow_prog[i]);
++ 		allow_prog[i] = 0;
++ 	}
++ 
++ 	close(cg);
++ 	cg = 0;
++ 
++ 	/* leave the cgroup and remove it. don't detach programs */
++ 	cleanup_cgroup_environment();
++ 
++ 	/* wait for the asynchronous auto-detachment.
++ 	 * wait for no more than 5 sec and give up.
++ 	 */
++ 	for (i = 0; i < ARRAY_SIZE(prog_ids); i++) {
++ 		for (attempts = 5; attempts >= 0; attempts--) {
++ 			int fd = bpf_prog_get_fd_by_id(prog_ids[i]);
++ 
++ 			if (fd < 0)
++ 				break;
++ 
++ 			/* don't leave the fd open */
++ 			close(fd);
++ 
++ 			if (!attempts)
++ 				goto err;
++ 
++ 			sleep(1);
++ 		}
++ 	}
++ 
++ 	rc = 0;
++ err:
++ 	for (i = 0; i < ARRAY_SIZE(allow_prog); i++)
++ 		if (allow_prog[i] > 0)
++ 			close(allow_prog[i]);
++ 	if (cg)
++ 		close(cg);
++ 	free(ptr);
++ 	cleanup_cgroup_environment();
++ 	if (!rc)
++ 		printf("#autodetach:PASS\n");
++ 	else
++ 		printf("#autodetach:FAIL\n");
++ 	return rc;
++ }
++ 
++ int main(void)
++ {
++ 	int (*tests[])(void) = {
++ 		test_foo_bar,
++ 		test_multiprog,
++ 		test_autodetach,
++ 	};
++ 	int errors = 0;
++ 	int i;
+++>>>>>>> d5506591d54b (selftests/bpf: add auto-detach test):tools/testing/selftests/bpf/test_cgroup_attach.c
+  
+ -	for (i = 0; i < ARRAY_SIZE(tests); i++)
+ -		if (tests[i]())
+ -			errors++;
+ -
+ -	if (errors)
+ -		printf("test_cgroup_attach:FAIL\n");
+ -	else
+ -		printf("test_cgroup_attach:PASS\n");
+ +	rc = test_foo_bar();
+ +	if (rc)
+ +		return rc;
+  
+ -	return errors ? EXIT_FAILURE : EXIT_SUCCESS;
+ +	return test_multiprog();
+  }
+* Unmerged path samples/bpf/test_cgrp2_attach2.c
