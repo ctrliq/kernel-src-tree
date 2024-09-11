@@ -1,0 +1,581 @@
+SUNRPC: Clean up - rename xs_tcp_data_receive() to xs_stream_data_receive()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-193.el8
+commit-author Trond Myklebust <trond.myklebust@hammerspace.com>
+commit c50b8ee02f1cb9506ac06d22e8414e9fef7d6890
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-193.el8/c50b8ee0.failed
+
+In preparation for sharing with AF_LOCAL.
+
+	Signed-off-by: Trond Myklebust <trond.myklebust@hammerspace.com>
+(cherry picked from commit c50b8ee02f1cb9506ac06d22e8414e9fef7d6890)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/trace/events/sunrpc.h
+#	net/sunrpc/xprtsock.c
+diff --cc include/trace/events/sunrpc.h
+index ebc5391bc56d,28e384186c35..000000000000
+--- a/include/trace/events/sunrpc.h
++++ b/include/trace/events/sunrpc.h
+@@@ -497,17 -497,7 +497,21 @@@ TRACE_EVENT(xs_stream_read_data
+  			__get_str(port), __entry->err, __entry->total)
+  );
+  
+++<<<<<<< HEAD
+ +#define rpc_show_sock_xprt_flags(flags) \
+ +	__print_flags(flags, "|", \
+ +		{ TCP_RCV_LAST_FRAG, "TCP_RCV_LAST_FRAG" }, \
+ +		{ TCP_RCV_COPY_FRAGHDR, "TCP_RCV_COPY_FRAGHDR" }, \
+ +		{ TCP_RCV_COPY_XID, "TCP_RCV_COPY_XID" }, \
+ +		{ TCP_RCV_COPY_DATA, "TCP_RCV_COPY_DATA" }, \
+ +		{ TCP_RCV_READ_CALLDIR, "TCP_RCV_READ_CALLDIR" }, \
+ +		{ TCP_RCV_COPY_CALLDIR, "TCP_RCV_COPY_CALLDIR" }, \
+ +		{ TCP_RPC_REPLY, "TCP_RPC_REPLY" })
+ +
+ +TRACE_EVENT(xs_tcp_data_recv,
+++=======
++ TRACE_EVENT(xs_stream_read_request,
+++>>>>>>> c50b8ee02f1c (SUNRPC: Clean up - rename xs_tcp_data_receive() to xs_stream_data_receive())
+  	TP_PROTO(struct sock_xprt *xs),
+  
+  	TP_ARGS(xs),
+@@@ -516,10 -506,9 +520,10 @@@
+  		__string(addr, xs->xprt.address_strings[RPC_DISPLAY_ADDR])
+  		__string(port, xs->xprt.address_strings[RPC_DISPLAY_PORT])
+  		__field(u32, xid)
+ +		__field(unsigned long, flags)
+  		__field(unsigned long, copied)
+  		__field(unsigned int, reclen)
+- 		__field(unsigned long, offset)
++ 		__field(unsigned int, offset)
+  	),
+  
+  	TP_fast_assign(
+@@@ -532,9 -520,8 +536,13 @@@
+  		__entry->offset = xs->recv.offset;
+  	),
+  
+++<<<<<<< HEAD
+ +	TP_printk("peer=[%s]:%s xid=0x%08x flags=%s copied=%lu reclen=%u offset=%lu",
+++=======
++ 	TP_printk("peer=[%s]:%s xid=0x%08x copied=%lu reclen=%u offset=%u",
+++>>>>>>> c50b8ee02f1c (SUNRPC: Clean up - rename xs_tcp_data_receive() to xs_stream_data_receive())
+  			__get_str(addr), __get_str(port), __entry->xid,
+ +			rpc_show_sock_xprt_flags(__entry->flags),
+  			__entry->copied, __entry->reclen, __entry->offset)
+  );
+  
+diff --cc net/sunrpc/xprtsock.c
+index b3c742fe8073,55df1fadab27..000000000000
+--- a/net/sunrpc/xprtsock.c
++++ b/net/sunrpc/xprtsock.c
+@@@ -325,6 -325,351 +325,354 @@@ static void xs_free_peer_addresses(stru
+  		}
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static size_t
++ xs_alloc_sparse_pages(struct xdr_buf *buf, size_t want, gfp_t gfp)
++ {
++ 	size_t i,n;
++ 
++ 	if (!(buf->flags & XDRBUF_SPARSE_PAGES))
++ 		return want;
++ 	if (want > buf->page_len)
++ 		want = buf->page_len;
++ 	n = (buf->page_base + want + PAGE_SIZE - 1) >> PAGE_SHIFT;
++ 	for (i = 0; i < n; i++) {
++ 		if (buf->pages[i])
++ 			continue;
++ 		buf->bvec[i].bv_page = buf->pages[i] = alloc_page(gfp);
++ 		if (!buf->pages[i]) {
++ 			buf->page_len = (i * PAGE_SIZE) - buf->page_base;
++ 			return buf->page_len;
++ 		}
++ 	}
++ 	return want;
++ }
++ 
++ static ssize_t
++ xs_sock_recvmsg(struct socket *sock, struct msghdr *msg, int flags, size_t seek)
++ {
++ 	ssize_t ret;
++ 	if (seek != 0)
++ 		iov_iter_advance(&msg->msg_iter, seek);
++ 	ret = sock_recvmsg(sock, msg, flags);
++ 	return ret > 0 ? ret + seek : ret;
++ }
++ 
++ static ssize_t
++ xs_read_kvec(struct socket *sock, struct msghdr *msg, int flags,
++ 		struct kvec *kvec, size_t count, size_t seek)
++ {
++ 	iov_iter_kvec(&msg->msg_iter, READ | ITER_KVEC, kvec, 1, count);
++ 	return xs_sock_recvmsg(sock, msg, flags, seek);
++ }
++ 
++ static ssize_t
++ xs_read_bvec(struct socket *sock, struct msghdr *msg, int flags,
++ 		struct bio_vec *bvec, unsigned long nr, size_t count,
++ 		size_t seek)
++ {
++ 	iov_iter_bvec(&msg->msg_iter, READ | ITER_BVEC, bvec, nr, count);
++ 	return xs_sock_recvmsg(sock, msg, flags, seek);
++ }
++ 
++ static ssize_t
++ xs_read_discard(struct socket *sock, struct msghdr *msg, int flags,
++ 		size_t count)
++ {
++ 	struct kvec kvec = { 0 };
++ 	return xs_read_kvec(sock, msg, flags | MSG_TRUNC, &kvec, count, 0);
++ }
++ 
++ static ssize_t
++ xs_read_xdr_buf(struct socket *sock, struct msghdr *msg, int flags,
++ 		struct xdr_buf *buf, size_t count, size_t seek, size_t *read)
++ {
++ 	size_t want, seek_init = seek, offset = 0;
++ 	ssize_t ret;
++ 
++ 	if (seek < buf->head[0].iov_len) {
++ 		want = min_t(size_t, count, buf->head[0].iov_len);
++ 		ret = xs_read_kvec(sock, msg, flags, &buf->head[0], want, seek);
++ 		if (ret <= 0)
++ 			goto sock_err;
++ 		offset += ret;
++ 		if (offset == count || msg->msg_flags & (MSG_EOR|MSG_TRUNC))
++ 			goto out;
++ 		if (ret != want)
++ 			goto eagain;
++ 		seek = 0;
++ 	} else {
++ 		seek -= buf->head[0].iov_len;
++ 		offset += buf->head[0].iov_len;
++ 	}
++ 	if (seek < buf->page_len) {
++ 		want = xs_alloc_sparse_pages(buf,
++ 				min_t(size_t, count - offset, buf->page_len),
++ 				GFP_NOWAIT);
++ 		ret = xs_read_bvec(sock, msg, flags, buf->bvec,
++ 				xdr_buf_pagecount(buf),
++ 				want + buf->page_base,
++ 				seek + buf->page_base);
++ 		if (ret <= 0)
++ 			goto sock_err;
++ 		offset += ret - buf->page_base;
++ 		if (offset == count || msg->msg_flags & (MSG_EOR|MSG_TRUNC))
++ 			goto out;
++ 		if (ret != want)
++ 			goto eagain;
++ 		seek = 0;
++ 	} else {
++ 		seek -= buf->page_len;
++ 		offset += buf->page_len;
++ 	}
++ 	if (seek < buf->tail[0].iov_len) {
++ 		want = min_t(size_t, count - offset, buf->tail[0].iov_len);
++ 		ret = xs_read_kvec(sock, msg, flags, &buf->tail[0], want, seek);
++ 		if (ret <= 0)
++ 			goto sock_err;
++ 		offset += ret;
++ 		if (offset == count || msg->msg_flags & (MSG_EOR|MSG_TRUNC))
++ 			goto out;
++ 		if (ret != want)
++ 			goto eagain;
++ 	} else
++ 		offset += buf->tail[0].iov_len;
++ 	ret = -EMSGSIZE;
++ 	msg->msg_flags |= MSG_TRUNC;
++ out:
++ 	*read = offset - seek_init;
++ 	return ret;
++ eagain:
++ 	ret = -EAGAIN;
++ 	goto out;
++ sock_err:
++ 	offset += seek;
++ 	goto out;
++ }
++ 
++ static void
++ xs_read_header(struct sock_xprt *transport, struct xdr_buf *buf)
++ {
++ 	if (!transport->recv.copied) {
++ 		if (buf->head[0].iov_len >= transport->recv.offset)
++ 			memcpy(buf->head[0].iov_base,
++ 					&transport->recv.xid,
++ 					transport->recv.offset);
++ 		transport->recv.copied = transport->recv.offset;
++ 	}
++ }
++ 
++ static bool
++ xs_read_stream_request_done(struct sock_xprt *transport)
++ {
++ 	return transport->recv.fraghdr & cpu_to_be32(RPC_LAST_STREAM_FRAGMENT);
++ }
++ 
++ static ssize_t
++ xs_read_stream_request(struct sock_xprt *transport, struct msghdr *msg,
++ 		int flags, struct rpc_rqst *req)
++ {
++ 	struct xdr_buf *buf = &req->rq_private_buf;
++ 	size_t want, read;
++ 	ssize_t ret;
++ 
++ 	xs_read_header(transport, buf);
++ 
++ 	want = transport->recv.len - transport->recv.offset;
++ 	ret = xs_read_xdr_buf(transport->sock, msg, flags, buf,
++ 			transport->recv.copied + want, transport->recv.copied,
++ 			&read);
++ 	transport->recv.offset += read;
++ 	transport->recv.copied += read;
++ 	if (transport->recv.offset == transport->recv.len) {
++ 		if (xs_read_stream_request_done(transport))
++ 			msg->msg_flags |= MSG_EOR;
++ 		return transport->recv.copied;
++ 	}
++ 
++ 	switch (ret) {
++ 	case -EMSGSIZE:
++ 		return transport->recv.copied;
++ 	case 0:
++ 		return -ESHUTDOWN;
++ 	default:
++ 		if (ret < 0)
++ 			return ret;
++ 	}
++ 	return -EAGAIN;
++ }
++ 
++ static size_t
++ xs_read_stream_headersize(bool isfrag)
++ {
++ 	if (isfrag)
++ 		return sizeof(__be32);
++ 	return 3 * sizeof(__be32);
++ }
++ 
++ static ssize_t
++ xs_read_stream_header(struct sock_xprt *transport, struct msghdr *msg,
++ 		int flags, size_t want, size_t seek)
++ {
++ 	struct kvec kvec = {
++ 		.iov_base = &transport->recv.fraghdr,
++ 		.iov_len = want,
++ 	};
++ 	return xs_read_kvec(transport->sock, msg, flags, &kvec, want, seek);
++ }
++ 
++ #if defined(CONFIG_SUNRPC_BACKCHANNEL)
++ static ssize_t
++ xs_read_stream_call(struct sock_xprt *transport, struct msghdr *msg, int flags)
++ {
++ 	struct rpc_xprt *xprt = &transport->xprt;
++ 	struct rpc_rqst *req;
++ 	ssize_t ret;
++ 
++ 	/* Look up and lock the request corresponding to the given XID */
++ 	req = xprt_lookup_bc_request(xprt, transport->recv.xid);
++ 	if (!req) {
++ 		printk(KERN_WARNING "Callback slot table overflowed\n");
++ 		return -ESHUTDOWN;
++ 	}
++ 
++ 	ret = xs_read_stream_request(transport, msg, flags, req);
++ 	if (msg->msg_flags & (MSG_EOR|MSG_TRUNC))
++ 		xprt_complete_bc_request(req, ret);
++ 
++ 	return ret;
++ }
++ #else /* CONFIG_SUNRPC_BACKCHANNEL */
++ static ssize_t
++ xs_read_stream_call(struct sock_xprt *transport, struct msghdr *msg, int flags)
++ {
++ 	return -ESHUTDOWN;
++ }
++ #endif /* CONFIG_SUNRPC_BACKCHANNEL */
++ 
++ static ssize_t
++ xs_read_stream_reply(struct sock_xprt *transport, struct msghdr *msg, int flags)
++ {
++ 	struct rpc_xprt *xprt = &transport->xprt;
++ 	struct rpc_rqst *req;
++ 	ssize_t ret = 0;
++ 
++ 	/* Look up and lock the request corresponding to the given XID */
++ 	spin_lock(&xprt->queue_lock);
++ 	req = xprt_lookup_rqst(xprt, transport->recv.xid);
++ 	if (!req) {
++ 		msg->msg_flags |= MSG_TRUNC;
++ 		goto out;
++ 	}
++ 	xprt_pin_rqst(req);
++ 	spin_unlock(&xprt->queue_lock);
++ 
++ 	ret = xs_read_stream_request(transport, msg, flags, req);
++ 
++ 	spin_lock(&xprt->queue_lock);
++ 	if (msg->msg_flags & (MSG_EOR|MSG_TRUNC))
++ 		xprt_complete_rqst(req->rq_task, ret);
++ 	xprt_unpin_rqst(req);
++ out:
++ 	spin_unlock(&xprt->queue_lock);
++ 	return ret;
++ }
++ 
++ static ssize_t
++ xs_read_stream(struct sock_xprt *transport, int flags)
++ {
++ 	struct msghdr msg = { 0 };
++ 	size_t want, read = 0;
++ 	ssize_t ret = 0;
++ 
++ 	if (transport->recv.len == 0) {
++ 		want = xs_read_stream_headersize(transport->recv.copied != 0);
++ 		ret = xs_read_stream_header(transport, &msg, flags, want,
++ 				transport->recv.offset);
++ 		if (ret <= 0)
++ 			goto out_err;
++ 		transport->recv.offset = ret;
++ 		if (ret != want) {
++ 			ret = -EAGAIN;
++ 			goto out_err;
++ 		}
++ 		transport->recv.len = be32_to_cpu(transport->recv.fraghdr) &
++ 			RPC_FRAGMENT_SIZE_MASK;
++ 		transport->recv.offset -= sizeof(transport->recv.fraghdr);
++ 		read = ret;
++ 	}
++ 
++ 	switch (be32_to_cpu(transport->recv.calldir)) {
++ 	case RPC_CALL:
++ 		ret = xs_read_stream_call(transport, &msg, flags);
++ 		break;
++ 	case RPC_REPLY:
++ 		ret = xs_read_stream_reply(transport, &msg, flags);
++ 	}
++ 	if (msg.msg_flags & MSG_TRUNC) {
++ 		transport->recv.calldir = cpu_to_be32(-1);
++ 		transport->recv.copied = -1;
++ 	}
++ 	if (ret < 0)
++ 		goto out_err;
++ 	read += ret;
++ 	if (transport->recv.offset < transport->recv.len) {
++ 		ret = xs_read_discard(transport->sock, &msg, flags,
++ 				transport->recv.len - transport->recv.offset);
++ 		if (ret <= 0)
++ 			goto out_err;
++ 		transport->recv.offset += ret;
++ 		read += ret;
++ 		if (transport->recv.offset != transport->recv.len)
++ 			return -EAGAIN;
++ 	}
++ 	if (xs_read_stream_request_done(transport)) {
++ 		trace_xs_stream_read_request(transport);
++ 		transport->recv.copied = 0;
++ 	}
++ 	transport->recv.offset = 0;
++ 	transport->recv.len = 0;
++ 	return read;
++ out_err:
++ 	switch (ret) {
++ 	case 0:
++ 	case -ESHUTDOWN:
++ 		xprt_force_disconnect(&transport->xprt);
++ 		return -ESHUTDOWN;
++ 	}
++ 	return ret;
++ }
++ 
++ static void xs_stream_data_receive(struct sock_xprt *transport)
++ {
++ 	size_t read = 0;
++ 	ssize_t ret = 0;
++ 
++ 	mutex_lock(&transport->recv_mutex);
++ 	if (transport->sock == NULL)
++ 		goto out;
++ 	clear_bit(XPRT_SOCK_DATA_READY, &transport->sock_state);
++ 	for (;;) {
++ 		ret = xs_read_stream(transport, MSG_DONTWAIT);
++ 		if (ret <= 0)
++ 			break;
++ 		read += ret;
++ 		cond_resched();
++ 	}
++ out:
++ 	mutex_unlock(&transport->recv_mutex);
++ 	trace_xs_stream_read_data(&transport->xprt, ret, read);
++ }
++ 
++ static void xs_stream_data_receive_workfn(struct work_struct *work)
++ {
++ 	struct sock_xprt *transport =
++ 		container_of(work, struct sock_xprt, recv_worker);
++ 	xs_stream_data_receive(transport);
++ }
++ 
+++>>>>>>> c50b8ee02f1c (SUNRPC: Clean up - rename xs_tcp_data_receive() to xs_stream_data_receive())
+  #define XS_SENDMSG_FLAGS	(MSG_DONTWAIT | MSG_NOSIGNAL)
+  
+  static int xs_send_kvec(struct socket *sock, struct sockaddr *addr, int addrlen, struct kvec *vec, unsigned int base, int more)
+@@@ -1445,145 -1524,8 +1793,148 @@@ static size_t xs_tcp_bc_maxpayload(stru
+  {
+  	return PAGE_SIZE;
+  }
+ +#else
+ +static inline int _xs_tcp_read_data(struct rpc_xprt *xprt,
+ +					struct xdr_skb_reader *desc)
+ +{
+ +	return xs_tcp_read_reply(xprt, desc);
+ +}
+  #endif /* CONFIG_SUNRPC_BACKCHANNEL */
+  
+++<<<<<<< HEAD
+ +/*
+ + * Read data off the transport.  This can be either an RPC_CALL or an
+ + * RPC_REPLY.  Relay the processing to helper functions.
+ + */
+ +static void xs_tcp_read_data(struct rpc_xprt *xprt,
+ +				    struct xdr_skb_reader *desc)
+ +{
+ +	struct sock_xprt *transport =
+ +				container_of(xprt, struct sock_xprt, xprt);
+ +
+ +	if (_xs_tcp_read_data(xprt, desc) == 0)
+ +		xs_tcp_check_fraghdr(transport);
+ +	else {
+ +		/*
+ +		 * The transport_lock protects the request handling.
+ +		 * There's no need to hold it to update the recv.flags.
+ +		 */
+ +		transport->recv.flags &= ~TCP_RCV_COPY_DATA;
+ +	}
+ +}
+ +
+ +static inline void xs_tcp_read_discard(struct sock_xprt *transport, struct xdr_skb_reader *desc)
+ +{
+ +	size_t len;
+ +
+ +	len = transport->recv.len - transport->recv.offset;
+ +	if (len > desc->count)
+ +		len = desc->count;
+ +	desc->count -= len;
+ +	desc->offset += len;
+ +	transport->recv.offset += len;
+ +	dprintk("RPC:       discarded %zu bytes\n", len);
+ +	xs_tcp_check_fraghdr(transport);
+ +}
+ +
+ +static int xs_tcp_data_recv(read_descriptor_t *rd_desc, struct sk_buff *skb, unsigned int offset, size_t len)
+ +{
+ +	struct rpc_xprt *xprt = rd_desc->arg.data;
+ +	struct sock_xprt *transport = container_of(xprt, struct sock_xprt, xprt);
+ +	struct xdr_skb_reader desc = {
+ +		.skb	= skb,
+ +		.offset	= offset,
+ +		.count	= len,
+ +	};
+ +	size_t ret;
+ +
+ +	dprintk("RPC:       xs_tcp_data_recv started\n");
+ +	do {
+ +		trace_xs_tcp_data_recv(transport);
+ +		/* Read in a new fragment marker if necessary */
+ +		/* Can we ever really expect to get completely empty fragments? */
+ +		if (transport->recv.flags & TCP_RCV_COPY_FRAGHDR) {
+ +			xs_tcp_read_fraghdr(xprt, &desc);
+ +			continue;
+ +		}
+ +		/* Read in the xid if necessary */
+ +		if (transport->recv.flags & TCP_RCV_COPY_XID) {
+ +			xs_tcp_read_xid(transport, &desc);
+ +			continue;
+ +		}
+ +		/* Read in the call/reply flag */
+ +		if (transport->recv.flags & TCP_RCV_READ_CALLDIR) {
+ +			xs_tcp_read_calldir(transport, &desc);
+ +			continue;
+ +		}
+ +		/* Read in the request data */
+ +		if (transport->recv.flags & TCP_RCV_COPY_DATA) {
+ +			xs_tcp_read_data(xprt, &desc);
+ +			continue;
+ +		}
+ +		/* Skip over any trailing bytes on short reads */
+ +		xs_tcp_read_discard(transport, &desc);
+ +	} while (desc.count);
+ +	ret = len - desc.count;
+ +	if (ret < rd_desc->count)
+ +		rd_desc->count -= ret;
+ +	else
+ +		rd_desc->count = 0;
+ +	trace_xs_tcp_data_recv(transport);
+ +	dprintk("RPC:       xs_tcp_data_recv done\n");
+ +	return ret;
+ +}
+ +
+ +static void xs_tcp_data_receive(struct sock_xprt *transport)
+ +{
+ +	struct rpc_xprt *xprt = &transport->xprt;
+ +	struct sock *sk;
+ +	read_descriptor_t rd_desc = {
+ +		.arg.data = xprt,
+ +	};
+ +	unsigned long total = 0;
+ +	int read = 0;
+ +
+ +restart:
+ +	mutex_lock(&transport->recv_mutex);
+ +	sk = transport->inet;
+ +	if (sk == NULL)
+ +		goto out;
+ +
+ +	/* We use rd_desc to pass struct xprt to xs_tcp_data_recv */
+ +	for (;;) {
+ +		rd_desc.count = RPC_TCP_READ_CHUNK_SZ;
+ +		lock_sock(sk);
+ +		read = tcp_read_sock(sk, &rd_desc, xs_tcp_data_recv);
+ +		if (rd_desc.count != 0 || read < 0) {
+ +			clear_bit(XPRT_SOCK_DATA_READY, &transport->sock_state);
+ +			release_sock(sk);
+ +			break;
+ +		}
+ +		release_sock(sk);
+ +		total += read;
+ +		if (need_resched()) {
+ +			mutex_unlock(&transport->recv_mutex);
+ +			cond_resched();
+ +			goto restart;
+ +		}
+ +	}
+ +	if (test_bit(XPRT_SOCK_DATA_READY, &transport->sock_state))
+ +		queue_work(xprtiod_workqueue, &transport->recv_worker);
+ +out:
+ +	mutex_unlock(&transport->recv_mutex);
+ +	trace_xs_tcp_data_ready(xprt, read, total);
+ +}
+ +
+ +static void xs_tcp_data_receive_workfn(struct work_struct *work)
+ +{
+ +	struct sock_xprt *transport =
+ +		container_of(work, struct sock_xprt, recv_worker);
+ +	xs_tcp_data_receive(transport);
+ +}
+ +
+++=======
+++>>>>>>> c50b8ee02f1c (SUNRPC: Clean up - rename xs_tcp_data_receive() to xs_stream_data_receive())
+  /**
+   * xs_tcp_state_change - callback to handle TCP socket state changes
+   * @sk: socket whose state has changed
+* Unmerged path include/trace/events/sunrpc.h
+* Unmerged path net/sunrpc/xprtsock.c
