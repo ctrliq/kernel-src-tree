@@ -1,0 +1,301 @@
+bonding/xfrm: use real_dev instead of slave_dev
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Jarod Wilson <jarod@redhat.com>
+commit bdfd2d1fa79acd03e18d1683419572f3682b39fd
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/bdfd2d1f.failed
+
+Rather than requiring every hw crypto capable NIC driver to do a check for
+slave_dev being set, set real_dev in the xfrm layer and xso init time, and
+then override it in the bonding driver as needed. Then NIC drivers can
+always use real_dev, and at the same time, we eliminate the use of a
+variable name that probably shouldn't have been used in the first place,
+particularly given recent current events.
+
+CC: Boris Pismenny <borisp@mellanox.com>
+CC: Saeed Mahameed <saeedm@mellanox.com>
+CC: Leon Romanovsky <leon@kernel.org>
+CC: Jay Vosburgh <j.vosburgh@gmail.com>
+CC: Veaceslav Falico <vfalico@gmail.com>
+CC: Andy Gospodarek <andy@greyhouse.net>
+CC: "David S. Miller" <davem@davemloft.net>
+CC: Jeff Kirsher <jeffrey.t.kirsher@intel.com>
+CC: Jakub Kicinski <kuba@kernel.org>
+CC: Steffen Klassert <steffen.klassert@secunet.com>
+CC: Herbert Xu <herbert@gondor.apana.org.au>
+CC: netdev@vger.kernel.org
+	Suggested-by: Saeed Mahameed <saeedm@mellanox.com>
+	Signed-off-by: Jarod Wilson <jarod@redhat.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit bdfd2d1fa79acd03e18d1683419572f3682b39fd)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/bonding/bond_main.c
+#	include/net/xfrm.h
+#	net/xfrm/xfrm_device.c
+diff --cc drivers/net/bonding/bond_main.c
+index 704bda02a80a,4ef99efc37f6..000000000000
+--- a/drivers/net/bonding/bond_main.c
++++ b/drivers/net/bonding/bond_main.c
+@@@ -372,6 -373,84 +372,87 @@@ static int bond_vlan_rx_kill_vid(struc
+  	return 0;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ /*---------------------------------- XFRM -----------------------------------*/
++ 
++ #ifdef CONFIG_XFRM_OFFLOAD
++ /**
++  * bond_ipsec_add_sa - program device with a security association
++  * @xs: pointer to transformer state struct
++  **/
++ static int bond_ipsec_add_sa(struct xfrm_state *xs)
++ {
++ 	struct net_device *bond_dev = xs->xso.dev;
++ 	struct bonding *bond = netdev_priv(bond_dev);
++ 	struct slave *slave = rtnl_dereference(bond->curr_active_slave);
++ 
++ 	xs->xso.real_dev = slave->dev;
++ 	bond->xs = xs;
++ 
++ 	if (!(slave->dev->xfrmdev_ops
++ 	      && slave->dev->xfrmdev_ops->xdo_dev_state_add)) {
++ 		slave_warn(bond_dev, slave->dev, "Slave does not support ipsec offload\n");
++ 		return -EINVAL;
++ 	}
++ 
++ 	return slave->dev->xfrmdev_ops->xdo_dev_state_add(xs);
++ }
++ 
++ /**
++  * bond_ipsec_del_sa - clear out this specific SA
++  * @xs: pointer to transformer state struct
++  **/
++ static void bond_ipsec_del_sa(struct xfrm_state *xs)
++ {
++ 	struct net_device *bond_dev = xs->xso.dev;
++ 	struct bonding *bond = netdev_priv(bond_dev);
++ 	struct slave *slave = rtnl_dereference(bond->curr_active_slave);
++ 
++ 	if (!slave)
++ 		return;
++ 
++ 	xs->xso.real_dev = slave->dev;
++ 
++ 	if (!(slave->dev->xfrmdev_ops
++ 	      && slave->dev->xfrmdev_ops->xdo_dev_state_delete)) {
++ 		slave_warn(bond_dev, slave->dev, "%s: no slave xdo_dev_state_delete\n", __func__);
++ 		return;
++ 	}
++ 
++ 	slave->dev->xfrmdev_ops->xdo_dev_state_delete(xs);
++ }
++ 
++ /**
++  * bond_ipsec_offload_ok - can this packet use the xfrm hw offload
++  * @skb: current data packet
++  * @xs: pointer to transformer state struct
++  **/
++ static bool bond_ipsec_offload_ok(struct sk_buff *skb, struct xfrm_state *xs)
++ {
++ 	struct net_device *bond_dev = xs->xso.dev;
++ 	struct bonding *bond = netdev_priv(bond_dev);
++ 	struct slave *curr_active = rtnl_dereference(bond->curr_active_slave);
++ 	struct net_device *slave_dev = curr_active->dev;
++ 
++ 	if (!(slave_dev->xfrmdev_ops
++ 	      && slave_dev->xfrmdev_ops->xdo_dev_offload_ok)) {
++ 		slave_warn(bond_dev, slave_dev, "%s: no slave xdo_dev_offload_ok\n", __func__);
++ 		return false;
++ 	}
++ 
++ 	xs->xso.real_dev = slave_dev;
++ 	return slave_dev->xfrmdev_ops->xdo_dev_offload_ok(skb, xs);
++ }
++ 
++ static const struct xfrmdev_ops bond_xfrmdev_ops = {
++ 	.xdo_dev_state_add = bond_ipsec_add_sa,
++ 	.xdo_dev_state_delete = bond_ipsec_del_sa,
++ 	.xdo_dev_offload_ok = bond_ipsec_offload_ok,
++ };
++ #endif /* CONFIG_XFRM_OFFLOAD */
++ 
+++>>>>>>> bdfd2d1fa79a (bonding/xfrm: use real_dev instead of slave_dev)
+  /*------------------------------- Link status -------------------------------*/
+  
+  /* Set the carrier state for the master according to the state of its
+diff --cc include/net/xfrm.h
+index e8f972e90d6f,e648c9e6c919..000000000000
+--- a/include/net/xfrm.h
++++ b/include/net/xfrm.h
+@@@ -132,6 -127,7 +132,10 @@@ struct xfrm_state_walk 
+  
+  struct xfrm_state_offload {
+  	struct net_device	*dev;
+++<<<<<<< HEAD
+++=======
++ 	struct net_device	*real_dev;
+++>>>>>>> bdfd2d1fa79a (bonding/xfrm: use real_dev instead of slave_dev)
+  	unsigned long		offload_handle;
+  	unsigned int		num_exthdrs;
+  	u8			flags;
+diff --cc net/xfrm/xfrm_device.c
+index d74b15b58f38,7b64bb64c822..000000000000
+--- a/net/xfrm/xfrm_device.c
++++ b/net/xfrm/xfrm_device.c
+@@@ -121,6 -120,10 +121,13 @@@ struct sk_buff *validate_xmit_xfrm(stru
+  	if (xo->flags & XFRM_GRO || x->xso.flags & XFRM_OFFLOAD_INBOUND)
+  		return skb;
+  
+++<<<<<<< HEAD
+++=======
++ 	/* This skb was already validated on the upper/virtual dev */
++ 	if ((x->xso.dev != dev) && (x->xso.real_dev == dev))
++ 		return skb;
++ 
+++>>>>>>> bdfd2d1fa79a (bonding/xfrm: use real_dev instead of slave_dev)
+  	local_irq_save(flags);
+  	sd = this_cpu_ptr(&softnet_data);
+  	err = !skb_queue_empty(&sd->xfrm_backlog);
+* Unmerged path drivers/net/bonding/bond_main.c
+diff --git a/drivers/net/ethernet/intel/ixgbe/ixgbe_ipsec.c b/drivers/net/ethernet/intel/ixgbe/ixgbe_ipsec.c
+index 94663c2213da..e91c036f98a2 100644
+--- a/drivers/net/ethernet/intel/ixgbe/ixgbe_ipsec.c
++++ b/drivers/net/ethernet/intel/ixgbe/ixgbe_ipsec.c
+@@ -427,14 +427,11 @@ static struct xfrm_state *ixgbe_ipsec_find_rx_state(struct ixgbe_ipsec *ipsec,
+ static int ixgbe_ipsec_parse_proto_keys(struct xfrm_state *xs,
+ 					u32 *mykey, u32 *mysalt)
+ {
+-	struct net_device *dev = xs->xso.dev;
++	struct net_device *dev = xs->xso.real_dev;
+ 	unsigned char *key_data;
+ 	char *alg_name = NULL;
+ 	int key_len;
+ 
+-	if (xs->xso.slave_dev)
+-		dev = xs->xso.slave_dev;
+-
+ 	if (!xs->aead) {
+ 		netdev_err(dev, "Unsupported IPsec algorithm\n");
+ 		return -EINVAL;
+@@ -480,9 +477,9 @@ static int ixgbe_ipsec_parse_proto_keys(struct xfrm_state *xs,
+  **/
+ static int ixgbe_ipsec_check_mgmt_ip(struct xfrm_state *xs)
+ {
+-	struct net_device *dev = xs->xso.dev;
+-	struct ixgbe_adapter *adapter;
+-	struct ixgbe_hw *hw;
++	struct net_device *dev = xs->xso.real_dev;
++	struct ixgbe_adapter *adapter = netdev_priv(dev);
++	struct ixgbe_hw *hw = &adapter->hw;
+ 	u32 mfval, manc, reg;
+ 	int num_filters = 4;
+ 	bool manc_ipv4;
+@@ -500,12 +497,6 @@ static int ixgbe_ipsec_check_mgmt_ip(struct xfrm_state *xs)
+ #define BMCIP_V6                 0x3
+ #define BMCIP_MASK               0x3
+ 
+-	if (xs->xso.slave_dev)
+-		dev = xs->xso.slave_dev;
+-
+-	adapter = netdev_priv(dev);
+-	hw = &adapter->hw;
+-
+ 	manc = IXGBE_READ_REG(hw, IXGBE_MANC);
+ 	manc_ipv4 = !!(manc & MANC_EN_IPV4_FILTER);
+ 	mfval = IXGBE_READ_REG(hw, IXGBE_MFVAL);
+@@ -569,22 +560,15 @@ static int ixgbe_ipsec_check_mgmt_ip(struct xfrm_state *xs)
+  **/
+ static int ixgbe_ipsec_add_sa(struct xfrm_state *xs)
+ {
+-	struct net_device *dev = xs->xso.dev;
+-	struct ixgbe_adapter *adapter;
+-	struct ixgbe_ipsec *ipsec;
+-	struct ixgbe_hw *hw;
++	struct net_device *dev = xs->xso.real_dev;
++	struct ixgbe_adapter *adapter = netdev_priv(dev);
++	struct ixgbe_ipsec *ipsec = adapter->ipsec;
++	struct ixgbe_hw *hw = &adapter->hw;
+ 	int checked, match, first;
+ 	u16 sa_idx;
+ 	int ret;
+ 	int i;
+ 
+-	if (xs->xso.slave_dev)
+-		dev = xs->xso.slave_dev;
+-
+-	adapter = netdev_priv(dev);
+-	ipsec = adapter->ipsec;
+-	hw = &adapter->hw;
+-
+ 	if (xs->id.proto != IPPROTO_ESP && xs->id.proto != IPPROTO_AH) {
+ 		netdev_err(dev, "Unsupported protocol 0x%04x for ipsec offload\n",
+ 			   xs->id.proto);
+@@ -761,20 +745,13 @@ static int ixgbe_ipsec_add_sa(struct xfrm_state *xs)
+  **/
+ static void ixgbe_ipsec_del_sa(struct xfrm_state *xs)
+ {
+-	struct net_device *dev = xs->xso.dev;
+-	struct ixgbe_adapter *adapter;
+-	struct ixgbe_ipsec *ipsec;
+-	struct ixgbe_hw *hw;
++	struct net_device *dev = xs->xso.real_dev;
++	struct ixgbe_adapter *adapter = netdev_priv(dev);
++	struct ixgbe_ipsec *ipsec = adapter->ipsec;
++	struct ixgbe_hw *hw = &adapter->hw;
+ 	u32 zerobuf[4] = {0, 0, 0, 0};
+ 	u16 sa_idx;
+ 
+-	if (xs->xso.slave_dev)
+-		dev = xs->xso.slave_dev;
+-
+-	adapter = netdev_priv(dev);
+-	ipsec = adapter->ipsec;
+-	hw = &adapter->hw;
+-
+ 	if (xs->xso.flags & XFRM_OFFLOAD_INBOUND) {
+ 		struct rx_sa *rsa;
+ 		u8 ipi;
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/en_accel/ipsec.c b/drivers/net/ethernet/mellanox/mlx5/core/en_accel/ipsec.c
+index 9fbe7367ae6c..f9deb5447266 100644
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_accel/ipsec.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_accel/ipsec.c
+@@ -203,12 +203,9 @@ mlx5e_ipsec_build_accel_xfrm_attrs(struct mlx5e_ipsec_sa_entry *sa_entry,
+ 
+ static inline int mlx5e_xfrm_validate_state(struct xfrm_state *x)
+ {
+-	struct net_device *netdev = x->xso.dev;
++	struct net_device *netdev = x->xso.real_dev;
+ 	struct mlx5e_priv *priv;
+ 
+-	if (x->xso.slave_dev)
+-		netdev = x->xso.slave_dev;
+-
+ 	priv = netdev_priv(netdev);
+ 
+ 	if (x->props.aalgo != SADB_AALG_NONE) {
+@@ -284,16 +281,13 @@ static inline int mlx5e_xfrm_validate_state(struct xfrm_state *x)
+ static int mlx5e_xfrm_add_state(struct xfrm_state *x)
+ {
+ 	struct mlx5e_ipsec_sa_entry *sa_entry = NULL;
+-	struct net_device *netdev = x->xso.dev;
++	struct net_device *netdev = x->xso.real_dev;
+ 	struct mlx5_accel_esp_xfrm_attrs attrs;
+ 	struct mlx5e_priv *priv;
+ 	__be32 saddr[4] = {0}, daddr[4] = {0}, spi;
+ 	bool is_ipv6 = false;
+ 	int err;
+ 
+-	if (x->xso.slave_dev)
+-		netdev = x->xso.slave_dev;
+-
+ 	priv = netdev_priv(netdev);
+ 
+ 	err = mlx5e_xfrm_validate_state(x);
+* Unmerged path include/net/xfrm.h
+* Unmerged path net/xfrm/xfrm_device.c
