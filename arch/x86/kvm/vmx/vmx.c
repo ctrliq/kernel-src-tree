@@ -1559,8 +1559,7 @@ static void vmx_queue_exception(struct kvm_vcpu *vcpu)
 		int inc_eip = 0;
 		if (kvm_exception_is_soft(nr))
 			inc_eip = vcpu->arch.event_exit_inst_len;
-		if (kvm_inject_realmode_interrupt(vcpu, nr, inc_eip) != EMULATE_DONE)
-			kvm_make_request(KVM_REQ_TRIPLE_FAULT, vcpu);
+		kvm_inject_realmode_interrupt(vcpu, nr, inc_eip);
 		return;
 	}
 
@@ -4303,8 +4302,7 @@ static void vmx_inject_irq(struct kvm_vcpu *vcpu)
 		int inc_eip = 0;
 		if (vcpu->arch.interrupt.soft)
 			inc_eip = vcpu->arch.event_exit_inst_len;
-		if (kvm_inject_realmode_interrupt(vcpu, irq, inc_eip) != EMULATE_DONE)
-			kvm_make_request(KVM_REQ_TRIPLE_FAULT, vcpu);
+		kvm_inject_realmode_interrupt(vcpu, irq, inc_eip);
 		return;
 	}
 	intr = irq | INTR_INFO_VALID_MASK;
@@ -4340,8 +4338,7 @@ static void vmx_inject_nmi(struct kvm_vcpu *vcpu)
 	vmx->loaded_vmcs->nmi_known_unmasked = false;
 
 	if (vmx->rmode.vm86_active) {
-		if (kvm_inject_realmode_interrupt(vcpu, NMI_VECTOR, 0) != EMULATE_DONE)
-			kvm_make_request(KVM_REQ_TRIPLE_FAULT, vcpu);
+		kvm_inject_realmode_interrupt(vcpu, NMI_VECTOR, 0);
 		return;
 	}
 
