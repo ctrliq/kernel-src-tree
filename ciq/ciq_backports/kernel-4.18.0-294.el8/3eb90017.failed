@@ -1,0 +1,365 @@
+KVM: x86: VMX: Prevent MSR passthrough when MSR access is denied
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Alexander Graf <graf@amazon.com>
+commit 3eb900173c71392087f4b0ada66f67ceae7e75f0
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/3eb90017.failed
+
+We will introduce the concept of MSRs that may not be handled in kernel
+space soon. Some MSRs are directly passed through to the guest, effectively
+making them handled by KVM from user space's point of view.
+
+This patch introduces all logic required to ensure that MSRs that
+user space wants trapped are not marked as direct access for guests.
+
+	Signed-off-by: Alexander Graf <graf@amazon.com>
+Message-Id: <20200925143422.21718-7-graf@amazon.com>
+[Replace "_idx" with "_slot". - Paolo]
+	Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+(cherry picked from commit 3eb900173c71392087f4b0ada66f67ceae7e75f0)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kvm/vmx/vmx.c
+#	arch/x86/kvm/vmx/vmx.h
+diff --cc arch/x86/kvm/vmx/vmx.c
+index 985a4bfb7517,4551a7e80ebc..000000000000
+--- a/arch/x86/kvm/vmx/vmx.c
++++ b/arch/x86/kvm/vmx/vmx.c
+@@@ -611,7 -631,42 +631,46 @@@ static inline bool report_flexpriority(
+  	return flexpriority_enabled;
+  }
+  
+++<<<<<<< HEAD
+ +static inline int __find_msr_index(struct vcpu_vmx *vmx, u32 msr)
+++=======
++ static int possible_passthrough_msr_slot(u32 msr)
++ {
++ 	u32 i;
++ 
++ 	for (i = 0; i < ARRAY_SIZE(vmx_possible_passthrough_msrs); i++)
++ 		if (vmx_possible_passthrough_msrs[i] == msr)
++ 			return i;
++ 
++ 	return -ENOENT;
++ }
++ 
++ static bool is_valid_passthrough_msr(u32 msr)
++ {
++ 	bool r;
++ 
++ 	switch (msr) {
++ 	case 0x800 ... 0x8ff:
++ 		/* x2APIC MSRs. These are handled in vmx_update_msr_bitmap_x2apic() */
++ 		return true;
++ 	case MSR_IA32_RTIT_STATUS:
++ 	case MSR_IA32_RTIT_OUTPUT_BASE:
++ 	case MSR_IA32_RTIT_OUTPUT_MASK:
++ 	case MSR_IA32_RTIT_CR3_MATCH:
++ 	case MSR_IA32_RTIT_ADDR0_A ... MSR_IA32_RTIT_ADDR3_B:
++ 		/* PT MSRs. These are handled in pt_update_intercept_for_msr() */
++ 		return true;
++ 	}
++ 
++ 	r = possible_passthrough_msr_slot(msr) != -ENOENT;
++ 
++ 	WARN(!r, "Invalid MSR %x, please adapt vmx_possible_passthrough_msrs[]", msr);
++ 
++ 	return r;
++ }
++ 
++ static inline int __vmx_find_uret_msr(struct vcpu_vmx *vmx, u32 msr)
+++>>>>>>> 3eb900173c71 (KVM: x86: VMX: Prevent MSR passthrough when MSR access is denied)
+  {
+  	int i;
+  
+@@@ -3594,10 -3638,51 +3653,58 @@@ void free_vpid(int vpid
+  	spin_unlock(&vmx_vpid_lock);
+  }
+  
+++<<<<<<< HEAD
+ +static __always_inline void vmx_disable_intercept_for_msr(unsigned long *msr_bitmap,
+ +							  u32 msr, int type)
+ +{
+ +	int f = sizeof(unsigned long);
+++=======
++ static void vmx_clear_msr_bitmap_read(ulong *msr_bitmap, u32 msr)
++ {
++ 	int f = sizeof(unsigned long);
++ 
++ 	if (msr <= 0x1fff)
++ 		__clear_bit(msr, msr_bitmap + 0x000 / f);
++ 	else if ((msr >= 0xc0000000) && (msr <= 0xc0001fff))
++ 		__clear_bit(msr & 0x1fff, msr_bitmap + 0x400 / f);
++ }
++ 
++ static void vmx_clear_msr_bitmap_write(ulong *msr_bitmap, u32 msr)
++ {
++ 	int f = sizeof(unsigned long);
++ 
++ 	if (msr <= 0x1fff)
++ 		__clear_bit(msr, msr_bitmap + 0x800 / f);
++ 	else if ((msr >= 0xc0000000) && (msr <= 0xc0001fff))
++ 		__clear_bit(msr & 0x1fff, msr_bitmap + 0xc00 / f);
++ }
++ 
++ static void vmx_set_msr_bitmap_read(ulong *msr_bitmap, u32 msr)
++ {
++ 	int f = sizeof(unsigned long);
++ 
++ 	if (msr <= 0x1fff)
++ 		__set_bit(msr, msr_bitmap + 0x000 / f);
++ 	else if ((msr >= 0xc0000000) && (msr <= 0xc0001fff))
++ 		__set_bit(msr & 0x1fff, msr_bitmap + 0x400 / f);
++ }
++ 
++ static void vmx_set_msr_bitmap_write(ulong *msr_bitmap, u32 msr)
++ {
++ 	int f = sizeof(unsigned long);
++ 
++ 	if (msr <= 0x1fff)
++ 		__set_bit(msr, msr_bitmap + 0x800 / f);
++ 	else if ((msr >= 0xc0000000) && (msr <= 0xc0001fff))
++ 		__set_bit(msr & 0x1fff, msr_bitmap + 0xc00 / f);
++ }
++ 
++ static __always_inline void vmx_disable_intercept_for_msr(struct kvm_vcpu *vcpu,
++ 							  u32 msr, int type)
++ {
++ 	struct vcpu_vmx *vmx = to_vmx(vcpu);
++ 	unsigned long *msr_bitmap = vmx->vmcs01.msr_bitmap;
+++>>>>>>> 3eb900173c71 (KVM: x86: VMX: Prevent MSR passthrough when MSR access is denied)
+  
+  	if (!cpu_has_vmx_msr_bitmap())
+  		return;
+@@@ -3606,36 -3691,44 +3713,48 @@@
+  		evmcs_touch_msr_bitmap();
+  
+  	/*
+- 	 * See Intel PRM Vol. 3, 20.6.9 (MSR-Bitmap Address). Early manuals
+- 	 * have the write-low and read-high bitmap offsets the wrong way round.
+- 	 * We can control MSRs 0x00000000-0x00001fff and 0xc0000000-0xc0001fff.
+- 	 */
+- 	if (msr <= 0x1fff) {
+- 		if (type & MSR_TYPE_R)
+- 			/* read-low */
+- 			__clear_bit(msr, msr_bitmap + 0x000 / f);
++ 	 * Mark the desired intercept state in shadow bitmap, this is needed
++ 	 * for resync when the MSR filters change.
++ 	*/
++ 	if (is_valid_passthrough_msr(msr)) {
++ 		int idx = possible_passthrough_msr_slot(msr);
++ 
++ 		if (idx != -ENOENT) {
++ 			if (type & MSR_TYPE_R)
++ 				clear_bit(idx, vmx->shadow_msr_intercept.read);
++ 			if (type & MSR_TYPE_W)
++ 				clear_bit(idx, vmx->shadow_msr_intercept.write);
++ 		}
++ 	}
+  
+- 		if (type & MSR_TYPE_W)
+- 			/* write-low */
+- 			__clear_bit(msr, msr_bitmap + 0x800 / f);
++ 	if ((type & MSR_TYPE_R) &&
++ 	    !kvm_msr_allowed(vcpu, msr, KVM_MSR_FILTER_READ)) {
++ 		vmx_set_msr_bitmap_read(msr_bitmap, msr);
++ 		type &= ~MSR_TYPE_R;
++ 	}
+  
+- 	} else if ((msr >= 0xc0000000) && (msr <= 0xc0001fff)) {
+- 		msr &= 0x1fff;
+- 		if (type & MSR_TYPE_R)
+- 			/* read-high */
+- 			__clear_bit(msr, msr_bitmap + 0x400 / f);
++ 	if ((type & MSR_TYPE_W) &&
++ 	    !kvm_msr_allowed(vcpu, msr, KVM_MSR_FILTER_WRITE)) {
++ 		vmx_set_msr_bitmap_write(msr_bitmap, msr);
++ 		type &= ~MSR_TYPE_W;
++ 	}
+  
+- 		if (type & MSR_TYPE_W)
+- 			/* write-high */
+- 			__clear_bit(msr, msr_bitmap + 0xc00 / f);
++ 	if (type & MSR_TYPE_R)
++ 		vmx_clear_msr_bitmap_read(msr_bitmap, msr);
+  
+- 	}
++ 	if (type & MSR_TYPE_W)
++ 		vmx_clear_msr_bitmap_write(msr_bitmap, msr);
+  }
+  
+ -static __always_inline void vmx_enable_intercept_for_msr(struct kvm_vcpu *vcpu,
+ +static __always_inline void vmx_enable_intercept_for_msr(unsigned long *msr_bitmap,
+  							 u32 msr, int type)
+  {
+++<<<<<<< HEAD
+ +	int f = sizeof(unsigned long);
+++=======
++ 	struct vcpu_vmx *vmx = to_vmx(vcpu);
++ 	unsigned long *msr_bitmap = vmx->vmcs01.msr_bitmap;
+++>>>>>>> 3eb900173c71 (KVM: x86: VMX: Prevent MSR passthrough when MSR access is denied)
+  
+  	if (!cpu_has_vmx_msr_bitmap())
+  		return;
+@@@ -3644,39 -3737,34 +3763,34 @@@
+  		evmcs_touch_msr_bitmap();
+  
+  	/*
+- 	 * See Intel PRM Vol. 3, 20.6.9 (MSR-Bitmap Address). Early manuals
+- 	 * have the write-low and read-high bitmap offsets the wrong way round.
+- 	 * We can control MSRs 0x00000000-0x00001fff and 0xc0000000-0xc0001fff.
+- 	 */
+- 	if (msr <= 0x1fff) {
+- 		if (type & MSR_TYPE_R)
+- 			/* read-low */
+- 			__set_bit(msr, msr_bitmap + 0x000 / f);
+- 
+- 		if (type & MSR_TYPE_W)
+- 			/* write-low */
+- 			__set_bit(msr, msr_bitmap + 0x800 / f);
+- 
+- 	} else if ((msr >= 0xc0000000) && (msr <= 0xc0001fff)) {
+- 		msr &= 0x1fff;
+- 		if (type & MSR_TYPE_R)
+- 			/* read-high */
+- 			__set_bit(msr, msr_bitmap + 0x400 / f);
++ 	 * Mark the desired intercept state in shadow bitmap, this is needed
++ 	 * for resync when the MSR filter changes.
++ 	*/
++ 	if (is_valid_passthrough_msr(msr)) {
++ 		int idx = possible_passthrough_msr_slot(msr);
++ 
++ 		if (idx != -ENOENT) {
++ 			if (type & MSR_TYPE_R)
++ 				set_bit(idx, vmx->shadow_msr_intercept.read);
++ 			if (type & MSR_TYPE_W)
++ 				set_bit(idx, vmx->shadow_msr_intercept.write);
++ 		}
++ 	}
+  
+- 		if (type & MSR_TYPE_W)
+- 			/* write-high */
+- 			__set_bit(msr, msr_bitmap + 0xc00 / f);
++ 	if (type & MSR_TYPE_R)
++ 		vmx_set_msr_bitmap_read(msr_bitmap, msr);
+  
+- 	}
++ 	if (type & MSR_TYPE_W)
++ 		vmx_set_msr_bitmap_write(msr_bitmap, msr);
+  }
+  
+ -static __always_inline void vmx_set_intercept_for_msr(struct kvm_vcpu *vcpu,
+ -						      u32 msr, int type, bool value)
+ +static __always_inline void vmx_set_intercept_for_msr(unsigned long *msr_bitmap,
+ +			     			      u32 msr, int type, bool value)
+  {
+  	if (value)
+ -		vmx_enable_intercept_for_msr(vcpu, msr, type);
+ +		vmx_enable_intercept_for_msr(msr_bitmap, msr, type);
+  	else
+ -		vmx_disable_intercept_for_msr(vcpu, msr, type);
+ +		vmx_disable_intercept_for_msr(msr_bitmap, msr, type);
+  }
+  
+  static u8 vmx_msr_bitmap_mode(struct kvm_vcpu *vcpu)
+@@@ -3694,8 -3782,7 +3808,12 @@@
+  	return mode;
+  }
+  
+++<<<<<<< HEAD
+ +static void vmx_update_msr_bitmap_x2apic(unsigned long *msr_bitmap,
+ +					 u8 mode)
+++=======
++ static void vmx_update_msr_bitmap_x2apic(struct kvm_vcpu *vcpu, u8 mode)
+++>>>>>>> 3eb900173c71 (KVM: x86: VMX: Prevent MSR passthrough when MSR access is denied)
+  {
+  	int msr;
+  
+@@@ -3730,7 -3816,7 +3847,11 @@@ void vmx_update_msr_bitmap(struct kvm_v
+  		return;
+  
+  	if (changed & (MSR_BITMAP_MODE_X2APIC | MSR_BITMAP_MODE_X2APIC_APICV))
+++<<<<<<< HEAD
+ +		vmx_update_msr_bitmap_x2apic(msr_bitmap, mode);
+++=======
++ 		vmx_update_msr_bitmap_x2apic(vcpu, mode);
+++>>>>>>> 3eb900173c71 (KVM: x86: VMX: Prevent MSR passthrough when MSR access is denied)
+  
+  	vmx->msr_bitmap_mode = mode;
+  }
+@@@ -6811,19 -6865,23 +6955,23 @@@ static int vmx_create_vcpu(struct kvm_v
+  	if (err < 0)
+  		goto free_pml;
+  
++ 	/* The MSR bitmap starts with all ones */
++ 	bitmap_fill(vmx->shadow_msr_intercept.read, MAX_POSSIBLE_PASSTHROUGH_MSRS);
++ 	bitmap_fill(vmx->shadow_msr_intercept.write, MAX_POSSIBLE_PASSTHROUGH_MSRS);
++ 
+  	msr_bitmap = vmx->vmcs01.msr_bitmap;
+ -	vmx_disable_intercept_for_msr(vcpu, MSR_IA32_TSC, MSR_TYPE_R);
+ -	vmx_disable_intercept_for_msr(vcpu, MSR_FS_BASE, MSR_TYPE_RW);
+ -	vmx_disable_intercept_for_msr(vcpu, MSR_GS_BASE, MSR_TYPE_RW);
+ -	vmx_disable_intercept_for_msr(vcpu, MSR_KERNEL_GS_BASE, MSR_TYPE_RW);
+ -	vmx_disable_intercept_for_msr(vcpu, MSR_IA32_SYSENTER_CS, MSR_TYPE_RW);
+ -	vmx_disable_intercept_for_msr(vcpu, MSR_IA32_SYSENTER_ESP, MSR_TYPE_RW);
+ -	vmx_disable_intercept_for_msr(vcpu, MSR_IA32_SYSENTER_EIP, MSR_TYPE_RW);
+ +	vmx_disable_intercept_for_msr(msr_bitmap, MSR_IA32_TSC, MSR_TYPE_R);
+ +	vmx_disable_intercept_for_msr(msr_bitmap, MSR_FS_BASE, MSR_TYPE_RW);
+ +	vmx_disable_intercept_for_msr(msr_bitmap, MSR_GS_BASE, MSR_TYPE_RW);
+ +	vmx_disable_intercept_for_msr(msr_bitmap, MSR_KERNEL_GS_BASE, MSR_TYPE_RW);
+ +	vmx_disable_intercept_for_msr(msr_bitmap, MSR_IA32_SYSENTER_CS, MSR_TYPE_RW);
+ +	vmx_disable_intercept_for_msr(msr_bitmap, MSR_IA32_SYSENTER_ESP, MSR_TYPE_RW);
+ +	vmx_disable_intercept_for_msr(msr_bitmap, MSR_IA32_SYSENTER_EIP, MSR_TYPE_RW);
+  	if (kvm_cstate_in_guest(vcpu->kvm)) {
+ -		vmx_disable_intercept_for_msr(vcpu, MSR_CORE_C1_RES, MSR_TYPE_R);
+ -		vmx_disable_intercept_for_msr(vcpu, MSR_CORE_C3_RESIDENCY, MSR_TYPE_R);
+ -		vmx_disable_intercept_for_msr(vcpu, MSR_CORE_C6_RESIDENCY, MSR_TYPE_R);
+ -		vmx_disable_intercept_for_msr(vcpu, MSR_CORE_C7_RESIDENCY, MSR_TYPE_R);
+ +		vmx_disable_intercept_for_msr(msr_bitmap, MSR_CORE_C1_RES, MSR_TYPE_R);
+ +		vmx_disable_intercept_for_msr(msr_bitmap, MSR_CORE_C3_RESIDENCY, MSR_TYPE_R);
+ +		vmx_disable_intercept_for_msr(msr_bitmap, MSR_CORE_C6_RESIDENCY, MSR_TYPE_R);
+ +		vmx_disable_intercept_for_msr(msr_bitmap, MSR_CORE_C7_RESIDENCY, MSR_TYPE_R);
+  	}
+  	vmx->msr_bitmap_mode = 0;
+  
+@@@ -7627,9 -7680,11 +7775,11 @@@ static struct kvm_x86_ops vmx_x86_ops _
+  	.pre_leave_smm = vmx_pre_leave_smm,
+  	.enable_smi_window = enable_smi_window,
+  
+ -	.can_emulate_instruction = vmx_can_emulate_instruction,
+ +	.need_emulation_on_page_fault = vmx_need_emulation_on_page_fault,
+  	.apic_init_signal_blocked = vmx_apic_init_signal_blocked,
+  	.migrate_timers = vmx_migrate_timers,
++ 
++ 	.msr_filter_changed = vmx_msr_filter_changed,
+  };
+  
+  static __init int hardware_setup(void)
+diff --cc arch/x86/kvm/vmx/vmx.h
+index 131d638ba270,5961cb897125..000000000000
+--- a/arch/x86/kvm/vmx/vmx.h
++++ b/arch/x86/kvm/vmx/vmx.h
+@@@ -279,8 -280,12 +279,17 @@@ struct vcpu_vmx 
+  
+  	struct pt_desc pt_desc;
+  
+++<<<<<<< HEAD
+ +	/* which host CPU was used for running this vcpu */
+ +	unsigned int last_cpu;
+++=======
++ 	/* Save desired MSR intercept (read: pass-through) state */
++ #define MAX_POSSIBLE_PASSTHROUGH_MSRS	13
++ 	struct {
++ 		DECLARE_BITMAP(read, MAX_POSSIBLE_PASSTHROUGH_MSRS);
++ 		DECLARE_BITMAP(write, MAX_POSSIBLE_PASSTHROUGH_MSRS);
++ 	} shadow_msr_intercept;
+++>>>>>>> 3eb900173c71 (KVM: x86: VMX: Prevent MSR passthrough when MSR access is denied)
+  };
+  
+  enum ept_pointers_status {
+* Unmerged path arch/x86/kvm/vmx/vmx.c
+* Unmerged path arch/x86/kvm/vmx/vmx.h
