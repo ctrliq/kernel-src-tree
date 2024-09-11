@@ -1,0 +1,348 @@
+bnxt_en: Do not send firmware messages if firmware is in error state.
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-193.el8
+Rebuild_CHGLOG: - [netdrv] bnxt_en: Do not send firmware messages if firmware is in error state (Jonathan Toppins) [1724766]
+Rebuild_FUZZ: 99.27%
+commit-author Michael Chan <michael.chan@broadcom.com>
+commit b4fff2079d1080af7dcad8ad0e80cc89e1ee000c
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-193.el8/b4fff207.failed
+
+Add a flag to mark that the firmware has encountered fatal condition.
+The driver will not send any more firmware messages and will return
+error to the caller.  Fix up some clean up functions to continue
+and not abort when the firmware message function returns error.
+
+This is preparation work to fully handle firmware error recovery
+under fatal conditions.
+
+	Signed-off-by: Michael Chan <michael.chan@broadcom.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit b4fff2079d1080af7dcad8ad0e80cc89e1ee000c)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/broadcom/bnxt/bnxt.c
+#	drivers/net/ethernet/broadcom/bnxt/bnxt.h
+diff --cc drivers/net/ethernet/broadcom/bnxt/bnxt.c
+index 5b5a34df2263,f584a6ba3cad..000000000000
+--- a/drivers/net/ethernet/broadcom/bnxt/bnxt.c
++++ b/drivers/net/ethernet/broadcom/bnxt/bnxt.c
+@@@ -9537,6 -9992,54 +9539,57 @@@ static void bnxt_reset(struct bnxt *bp
+  	bnxt_rtnl_unlock_sp(bp);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static void bnxt_fw_reset_close(struct bnxt *bp)
++ {
++ 	__bnxt_close_nic(bp, true, false);
++ 	bnxt_ulp_irq_stop(bp);
++ 	bnxt_clear_int_mode(bp);
++ 	bnxt_hwrm_func_drv_unrgtr(bp);
++ 	bnxt_free_ctx_mem(bp);
++ 	kfree(bp->ctx);
++ 	bp->ctx = NULL;
++ }
++ 
++ void bnxt_fw_reset(struct bnxt *bp)
++ {
++ 	int rc;
++ 
++ 	bnxt_rtnl_lock_sp(bp);
++ 	if (test_bit(BNXT_STATE_OPEN, &bp->state) &&
++ 	    !test_bit(BNXT_STATE_IN_FW_RESET, &bp->state)) {
++ 		set_bit(BNXT_STATE_IN_FW_RESET, &bp->state);
++ 		if (BNXT_PF(bp) && bp->pf.active_vfs &&
++ 		    !test_bit(BNXT_STATE_FW_FATAL_COND, &bp->state)) {
++ 			rc = bnxt_hwrm_func_qcfg(bp);
++ 			if (rc) {
++ 				netdev_err(bp->dev, "Firmware reset aborted, first func_qcfg cmd failed, rc = %d\n",
++ 					   rc);
++ 				clear_bit(BNXT_STATE_IN_FW_RESET, &bp->state);
++ 				dev_close(bp->dev);
++ 				goto fw_reset_exit;
++ 			}
++ 			if (bp->pf.registered_vfs || bp->sriov_cfg) {
++ 				u16 vf_tmo_dsecs = bp->pf.registered_vfs * 10;
++ 
++ 				if (bp->fw_reset_max_dsecs < vf_tmo_dsecs)
++ 					bp->fw_reset_max_dsecs = vf_tmo_dsecs;
++ 				bp->fw_reset_state =
++ 					BNXT_FW_RESET_STATE_POLL_VF;
++ 				bnxt_queue_fw_reset_work(bp, HZ / 10);
++ 				goto fw_reset_exit;
++ 			}
++ 		}
++ 		bnxt_fw_reset_close(bp);
++ 		bp->fw_reset_state = BNXT_FW_RESET_STATE_ENABLE_DEV;
++ 		bnxt_queue_fw_reset_work(bp, bp->fw_reset_min_dsecs * HZ / 10);
++ 	}
++ fw_reset_exit:
++ 	bnxt_rtnl_unlock_sp(bp);
++ }
++ 
+++>>>>>>> b4fff2079d10 (bnxt_en: Do not send firmware messages if firmware is in error state.)
+  static void bnxt_chk_missed_irq(struct bnxt *bp)
+  {
+  	int i;
+@@@ -9760,6 -10267,234 +9813,237 @@@ static void bnxt_init_dflt_coal(struct 
+  	bp->stats_coal_ticks = BNXT_DEF_STATS_COAL_TICKS;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static int bnxt_fw_init_one_p1(struct bnxt *bp)
++ {
++ 	int rc;
++ 
++ 	bp->fw_cap = 0;
++ 	rc = bnxt_hwrm_ver_get(bp);
++ 	if (rc)
++ 		return rc;
++ 
++ 	if (bp->fw_cap & BNXT_FW_CAP_KONG_MB_CHNL) {
++ 		rc = bnxt_alloc_kong_hwrm_resources(bp);
++ 		if (rc)
++ 			bp->fw_cap &= ~BNXT_FW_CAP_KONG_MB_CHNL;
++ 	}
++ 
++ 	if ((bp->fw_cap & BNXT_FW_CAP_SHORT_CMD) ||
++ 	    bp->hwrm_max_ext_req_len > BNXT_HWRM_MAX_REQ_LEN) {
++ 		rc = bnxt_alloc_hwrm_short_cmd_req(bp);
++ 		if (rc)
++ 			return rc;
++ 	}
++ 	rc = bnxt_hwrm_func_reset(bp);
++ 	if (rc)
++ 		return -ENODEV;
++ 
++ 	bnxt_hwrm_fw_set_time(bp);
++ 	return 0;
++ }
++ 
++ static int bnxt_fw_init_one_p2(struct bnxt *bp)
++ {
++ 	int rc;
++ 
++ 	/* Get the MAX capabilities for this function */
++ 	rc = bnxt_hwrm_func_qcaps(bp);
++ 	if (rc) {
++ 		netdev_err(bp->dev, "hwrm query capability failure rc: %x\n",
++ 			   rc);
++ 		return -ENODEV;
++ 	}
++ 
++ 	rc = bnxt_hwrm_cfa_adv_flow_mgnt_qcaps(bp);
++ 	if (rc)
++ 		netdev_warn(bp->dev, "hwrm query adv flow mgnt failure rc: %d\n",
++ 			    rc);
++ 
++ 	rc = bnxt_hwrm_error_recovery_qcfg(bp);
++ 	if (rc)
++ 		netdev_warn(bp->dev, "hwrm query error recovery failure rc: %d\n",
++ 			    rc);
++ 
++ 	rc = bnxt_hwrm_func_drv_rgtr(bp);
++ 	if (rc)
++ 		return -ENODEV;
++ 
++ 	rc = bnxt_hwrm_func_rgtr_async_events(bp, NULL, 0);
++ 	if (rc)
++ 		return -ENODEV;
++ 
++ 	bnxt_hwrm_func_qcfg(bp);
++ 	bnxt_hwrm_vnic_qcaps(bp);
++ 	bnxt_hwrm_port_led_qcaps(bp);
++ 	bnxt_ethtool_init(bp);
++ 	bnxt_dcb_init(bp);
++ 	return 0;
++ }
++ 
++ static void bnxt_set_dflt_rss_hash_type(struct bnxt *bp)
++ {
++ 	bp->flags &= ~BNXT_FLAG_UDP_RSS_CAP;
++ 	bp->rss_hash_cfg = VNIC_RSS_CFG_REQ_HASH_TYPE_IPV4 |
++ 			   VNIC_RSS_CFG_REQ_HASH_TYPE_TCP_IPV4 |
++ 			   VNIC_RSS_CFG_REQ_HASH_TYPE_IPV6 |
++ 			   VNIC_RSS_CFG_REQ_HASH_TYPE_TCP_IPV6;
++ 	if (BNXT_CHIP_P4(bp) && bp->hwrm_spec_code >= 0x10501) {
++ 		bp->flags |= BNXT_FLAG_UDP_RSS_CAP;
++ 		bp->rss_hash_cfg |= VNIC_RSS_CFG_REQ_HASH_TYPE_UDP_IPV4 |
++ 				    VNIC_RSS_CFG_REQ_HASH_TYPE_UDP_IPV6;
++ 	}
++ }
++ 
++ static void bnxt_set_dflt_rfs(struct bnxt *bp)
++ {
++ 	struct net_device *dev = bp->dev;
++ 
++ 	dev->hw_features &= ~NETIF_F_NTUPLE;
++ 	dev->features &= ~NETIF_F_NTUPLE;
++ 	bp->flags &= ~BNXT_FLAG_RFS;
++ 	if (bnxt_rfs_supported(bp)) {
++ 		dev->hw_features |= NETIF_F_NTUPLE;
++ 		if (bnxt_rfs_capable(bp)) {
++ 			bp->flags |= BNXT_FLAG_RFS;
++ 			dev->features |= NETIF_F_NTUPLE;
++ 		}
++ 	}
++ }
++ 
++ static void bnxt_fw_init_one_p3(struct bnxt *bp)
++ {
++ 	struct pci_dev *pdev = bp->pdev;
++ 
++ 	bnxt_set_dflt_rss_hash_type(bp);
++ 	bnxt_set_dflt_rfs(bp);
++ 
++ 	bnxt_get_wol_settings(bp);
++ 	if (bp->flags & BNXT_FLAG_WOL_CAP)
++ 		device_set_wakeup_enable(&pdev->dev, bp->wol);
++ 	else
++ 		device_set_wakeup_capable(&pdev->dev, false);
++ 
++ 	bnxt_hwrm_set_cache_line_size(bp, cache_line_size());
++ 	bnxt_hwrm_coal_params_qcaps(bp);
++ }
++ 
++ static int bnxt_fw_init_one(struct bnxt *bp)
++ {
++ 	int rc;
++ 
++ 	rc = bnxt_fw_init_one_p1(bp);
++ 	if (rc) {
++ 		netdev_err(bp->dev, "Firmware init phase 1 failed\n");
++ 		return rc;
++ 	}
++ 	rc = bnxt_fw_init_one_p2(bp);
++ 	if (rc) {
++ 		netdev_err(bp->dev, "Firmware init phase 2 failed\n");
++ 		return rc;
++ 	}
++ 	rc = bnxt_approve_mac(bp, bp->dev->dev_addr, false);
++ 	if (rc)
++ 		return rc;
++ 	bnxt_fw_init_one_p3(bp);
++ 	return 0;
++ }
++ 
++ static void bnxt_fw_reset_task(struct work_struct *work)
++ {
++ 	struct bnxt *bp = container_of(work, struct bnxt, fw_reset_task.work);
++ 	int rc;
++ 
++ 	if (!test_bit(BNXT_STATE_IN_FW_RESET, &bp->state)) {
++ 		netdev_err(bp->dev, "bnxt_fw_reset_task() called when not in fw reset mode!\n");
++ 		return;
++ 	}
++ 
++ 	switch (bp->fw_reset_state) {
++ 	case BNXT_FW_RESET_STATE_POLL_VF:
++ 		rc = bnxt_hwrm_func_qcfg(bp);
++ 		if (rc) {
++ 			netdev_err(bp->dev, "Firmware reset aborted, subsequent func_qcfg cmd failed, rc = %d, %d msecs since reset timestamp\n",
++ 				   rc, jiffies_to_msecs(jiffies -
++ 				   bp->fw_reset_timestamp));
++ 			goto fw_reset_abort;
++ 		}
++ 		if (bp->pf.registered_vfs || bp->sriov_cfg) {
++ 			if (time_after(jiffies, bp->fw_reset_timestamp +
++ 				       (bp->fw_reset_max_dsecs * HZ / 10))) {
++ 				clear_bit(BNXT_STATE_IN_FW_RESET, &bp->state);
++ 				bp->fw_reset_state = 0;
++ 				netdev_err(bp->dev, "Firmware reset aborted, %d VFs still registered, sriov_cfg %d\n",
++ 					   bp->pf.registered_vfs,
++ 					   bp->sriov_cfg);
++ 				return;
++ 			}
++ 			bnxt_queue_fw_reset_work(bp, HZ / 10);
++ 			return;
++ 		}
++ 		bp->fw_reset_timestamp = jiffies;
++ 		rtnl_lock();
++ 		bnxt_fw_reset_close(bp);
++ 		bp->fw_reset_state = BNXT_FW_RESET_STATE_ENABLE_DEV;
++ 		rtnl_unlock();
++ 		bnxt_queue_fw_reset_work(bp, bp->fw_reset_min_dsecs * HZ / 10);
++ 		return;
++ 	case BNXT_FW_RESET_STATE_ENABLE_DEV:
++ 		clear_bit(BNXT_STATE_FW_FATAL_COND, &bp->state);
++ 		if (pci_enable_device(bp->pdev)) {
++ 			netdev_err(bp->dev, "Cannot re-enable PCI device\n");
++ 			goto fw_reset_abort;
++ 		}
++ 		pci_set_master(bp->pdev);
++ 		bp->fw_reset_state = BNXT_FW_RESET_STATE_POLL_FW;
++ 		/* fall through */
++ 	case BNXT_FW_RESET_STATE_POLL_FW:
++ 		bp->hwrm_cmd_timeout = SHORT_HWRM_CMD_TIMEOUT;
++ 		rc = __bnxt_hwrm_ver_get(bp, true);
++ 		if (rc) {
++ 			if (time_after(jiffies, bp->fw_reset_timestamp +
++ 				       (bp->fw_reset_max_dsecs * HZ / 10))) {
++ 				netdev_err(bp->dev, "Firmware reset aborted\n");
++ 				goto fw_reset_abort;
++ 			}
++ 			bnxt_queue_fw_reset_work(bp, HZ / 5);
++ 			return;
++ 		}
++ 		bp->hwrm_cmd_timeout = DFLT_HWRM_CMD_TIMEOUT;
++ 		bp->fw_reset_state = BNXT_FW_RESET_STATE_OPENING;
++ 		/* fall through */
++ 	case BNXT_FW_RESET_STATE_OPENING:
++ 		while (!rtnl_trylock()) {
++ 			bnxt_queue_fw_reset_work(bp, HZ / 10);
++ 			return;
++ 		}
++ 		rc = bnxt_open(bp->dev);
++ 		if (rc) {
++ 			netdev_err(bp->dev, "bnxt_open_nic() failed\n");
++ 			clear_bit(BNXT_STATE_IN_FW_RESET, &bp->state);
++ 			dev_close(bp->dev);
++ 		}
++ 		bnxt_ulp_irq_restart(bp, rc);
++ 		rtnl_unlock();
++ 
++ 		bp->fw_reset_state = 0;
++ 		/* Make sure fw_reset_state is 0 before clearing the flag */
++ 		smp_mb__before_atomic();
++ 		clear_bit(BNXT_STATE_IN_FW_RESET, &bp->state);
++ 		break;
++ 	}
++ 	return;
++ 
++ fw_reset_abort:
++ 	clear_bit(BNXT_STATE_IN_FW_RESET, &bp->state);
++ 	bp->fw_reset_state = 0;
++ 	rtnl_lock();
++ 	dev_close(bp->dev);
++ 	rtnl_unlock();
++ }
++ 
+++>>>>>>> b4fff2079d10 (bnxt_en: Do not send firmware messages if firmware is in error state.)
+  static int bnxt_init_board(struct pci_dev *pdev, struct net_device *dev)
+  {
+  	int rc;
+diff --cc drivers/net/ethernet/broadcom/bnxt/bnxt.h
+index bd05f81be6ab,f3a6aadb83ed..000000000000
+--- a/drivers/net/ethernet/broadcom/bnxt/bnxt.h
++++ b/drivers/net/ethernet/broadcom/bnxt/bnxt.h
+@@@ -1544,6 -1614,10 +1544,13 @@@ struct bnxt 
+  #define BNXT_STATE_OPEN		0
+  #define BNXT_STATE_IN_SP_TASK	1
+  #define BNXT_STATE_READ_STATS	2
+++<<<<<<< HEAD
+++=======
++ #define BNXT_STATE_FW_RESET_DET 3
++ #define BNXT_STATE_IN_FW_RESET	4
++ #define BNXT_STATE_ABORT_ERR	5
++ #define BNXT_STATE_FW_FATAL_COND	6
+++>>>>>>> b4fff2079d10 (bnxt_en: Do not send firmware messages if firmware is in error state.)
+  
+  	struct bnxt_irq	*irq_tbl;
+  	int			total_irqs;
+* Unmerged path drivers/net/ethernet/broadcom/bnxt/bnxt.c
+* Unmerged path drivers/net/ethernet/broadcom/bnxt/bnxt.h
