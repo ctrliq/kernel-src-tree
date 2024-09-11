@@ -1,0 +1,135 @@
+x86/sgx: Add SGX_IOC_ENCLAVE_INIT
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Jarkko Sakkinen <jarkko@kernel.org>
+commit 9d0c151b41fed7b879030f4e533143d098781701
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/9d0c151b.failed
+
+Enclaves have two basic states. They are either being built and are
+malleable and can be modified by doing things like adding pages. Or,
+they are locked down and not accepting changes. They can only be run
+after they have been locked down. The ENCLS[EINIT] function induces the
+transition from being malleable to locked-down.
+
+Add an ioctl() that performs ENCLS[EINIT]. After this, new pages can
+no longer be added with ENCLS[EADD]. This is also the time where the
+enclave can be measured to verify its integrity.
+
+Co-developed-by: Sean Christopherson <sean.j.christopherson@intel.com>
+	Signed-off-by: Sean Christopherson <sean.j.christopherson@intel.com>
+	Signed-off-by: Jarkko Sakkinen <jarkko@kernel.org>
+	Signed-off-by: Borislav Petkov <bp@suse.de>
+	Tested-by: Jethro Beekman <jethro@fortanix.com>
+Link: https://lkml.kernel.org/r/20201112220135.165028-15-jarkko@kernel.org
+(cherry picked from commit 9d0c151b41fed7b879030f4e533143d098781701)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/include/uapi/asm/sgx.h
+#	arch/x86/kernel/cpu/sgx/driver.h
+#	arch/x86/kernel/cpu/sgx/encl.h
+#	arch/x86/kernel/cpu/sgx/ioctl.c
+diff --cc arch/x86/kernel/cpu/sgx/driver.h
+index cda9c43b7543,6b0063221659..000000000000
+--- a/arch/x86/kernel/cpu/sgx/driver.h
++++ b/arch/x86/kernel/cpu/sgx/driver.h
+@@@ -9,8 -9,19 +9,21 @@@
+  #include <linux/rwsem.h>
+  #include <linux/sched.h>
+  #include <linux/workqueue.h>
+ -#include <uapi/asm/sgx.h>
+  #include "sgx.h"
+  
+++<<<<<<< HEAD
+++=======
++ #define SGX_EINIT_SPIN_COUNT	20
++ #define SGX_EINIT_SLEEP_COUNT	50
++ #define SGX_EINIT_SLEEP_TIME	20
++ 
++ extern u64 sgx_attributes_reserved_mask;
++ extern u64 sgx_xfrm_reserved_mask;
++ extern u32 sgx_misc_reserved_mask;
++ 
++ long sgx_ioctl(struct file *filep, unsigned int cmd, unsigned long arg);
++ 
+++>>>>>>> 9d0c151b41fe (x86/sgx: Add SGX_IOC_ENCLAVE_INIT)
+  int sgx_drv_init(void);
+  
+  #endif /* __ARCH_X86_SGX_DRIVER_H__ */
+diff --cc arch/x86/kernel/cpu/sgx/encl.h
+index 1df8011fa23d,8a4d1edded68..000000000000
+--- a/arch/x86/kernel/cpu/sgx/encl.h
++++ b/arch/x86/kernel/cpu/sgx/encl.h
+@@@ -26,6 -26,13 +26,16 @@@ struct sgx_encl_page 
+  	struct sgx_encl *encl;
+  };
+  
+++<<<<<<< HEAD
+++=======
++ enum sgx_encl_flags {
++ 	SGX_ENCL_IOCTL		= BIT(0),
++ 	SGX_ENCL_DEBUG		= BIT(1),
++ 	SGX_ENCL_CREATED	= BIT(2),
++ 	SGX_ENCL_INITIALIZED	= BIT(3),
++ };
++ 
+++>>>>>>> 9d0c151b41fe (x86/sgx: Add SGX_IOC_ENCLAVE_INIT)
+  struct sgx_encl {
+  	unsigned long base;
+  	unsigned long size;
+* Unmerged path arch/x86/include/uapi/asm/sgx.h
+* Unmerged path arch/x86/kernel/cpu/sgx/ioctl.c
+* Unmerged path arch/x86/include/uapi/asm/sgx.h
+diff --git a/arch/x86/kernel/cpu/sgx/driver.c b/arch/x86/kernel/cpu/sgx/driver.c
+index c2810e1c7cf1..83d3b6d558a4 100644
+--- a/arch/x86/kernel/cpu/sgx/driver.c
++++ b/arch/x86/kernel/cpu/sgx/driver.c
+@@ -10,6 +10,10 @@
+ #include "driver.h"
+ #include "encl.h"
+ 
++u64 sgx_attributes_reserved_mask;
++u64 sgx_xfrm_reserved_mask = ~0x3;
++u32 sgx_misc_reserved_mask;
++
+ static int sgx_open(struct inode *inode, struct file *file)
+ {
+ 	struct sgx_encl *encl;
+@@ -105,8 +109,31 @@ static struct miscdevice sgx_dev_enclave = {
+ 
+ int __init sgx_drv_init(void)
+ {
++	unsigned int eax, ebx, ecx, edx;
++	u64 attr_mask;
++	u64 xfrm_mask;
++
+ 	if (!cpu_feature_enabled(X86_FEATURE_SGX_LC))
+ 		return -ENODEV;
+ 
++	cpuid_count(SGX_CPUID, 0, &eax, &ebx, &ecx, &edx);
++
++	if (!(eax & 1))  {
++		pr_err("SGX disabled: SGX1 instruction support not available.\n");
++		return -ENODEV;
++	}
++
++	sgx_misc_reserved_mask = ~ebx | SGX_MISC_RESERVED_MASK;
++
++	cpuid_count(SGX_CPUID, 1, &eax, &ebx, &ecx, &edx);
++
++	attr_mask = (((u64)ebx) << 32) + (u64)eax;
++	sgx_attributes_reserved_mask = ~attr_mask | SGX_ATTR_RESERVED_MASK;
++
++	if (cpu_feature_enabled(X86_FEATURE_OSXSAVE)) {
++		xfrm_mask = (((u64)edx) << 32) + (u64)ecx;
++		sgx_xfrm_reserved_mask = ~xfrm_mask;
++	}
++
+ 	return misc_register(&sgx_dev_enclave);
+ }
+* Unmerged path arch/x86/kernel/cpu/sgx/driver.h
+* Unmerged path arch/x86/kernel/cpu/sgx/encl.h
+* Unmerged path arch/x86/kernel/cpu/sgx/ioctl.c
