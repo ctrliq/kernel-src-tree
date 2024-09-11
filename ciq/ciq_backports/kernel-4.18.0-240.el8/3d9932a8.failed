@@ -1,0 +1,159 @@
+io_uring: cleanup io_alloc_async_ctx()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Xiaoguang Wang <xiaoguang.wang@linux.alibaba.com>
+commit 3d9932a8b240c9019f48358e8a6928c53c2c7f6b
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/3d9932a8.failed
+
+Cleanup io_alloc_async_ctx() a bit, add a new __io_alloc_async_ctx(),
+so io_setup_async_rw() won't need to check whether async_ctx is true
+or false again.
+
+	Reviewed-by: Stefano Garzarella <sgarzare@redhat.com>
+	Signed-off-by: Xiaoguang Wang <xiaoguang.wang@linux.alibaba.com>
+	Signed-off-by: Jens Axboe <axboe@kernel.dk>
+(cherry picked from commit 3d9932a8b240c9019f48358e8a6928c53c2c7f6b)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/io_uring.c
+diff --cc fs/io_uring.c
+index 7842c6de7135,b12d33b12bc7..000000000000
+--- a/fs/io_uring.c
++++ b/fs/io_uring.c
+@@@ -1318,34 -2453,111 +1318,113 @@@ static ssize_t loop_rw_iter(int rw, str
+  	return ret;
+  }
+  
+++<<<<<<< HEAD
+ +static int io_read(struct io_kiocb *req, const struct sqe_submit *s,
+ +		   bool force_nonblock)
+++=======
++ static void io_req_map_rw(struct io_kiocb *req, ssize_t io_size,
++ 			  struct iovec *iovec, struct iovec *fast_iov,
++ 			  struct iov_iter *iter)
++ {
++ 	req->io->rw.nr_segs = iter->nr_segs;
++ 	req->io->rw.size = io_size;
++ 	req->io->rw.iov = iovec;
++ 	if (!req->io->rw.iov) {
++ 		req->io->rw.iov = req->io->rw.fast_iov;
++ 		memcpy(req->io->rw.iov, fast_iov,
++ 			sizeof(struct iovec) * iter->nr_segs);
++ 	} else {
++ 		req->flags |= REQ_F_NEED_CLEANUP;
++ 	}
++ }
++ 
++ static inline int __io_alloc_async_ctx(struct io_kiocb *req)
++ {
++ 	req->io = kmalloc(sizeof(*req->io), GFP_KERNEL);
++ 	return req->io == NULL;
++ }
++ 
++ static int io_alloc_async_ctx(struct io_kiocb *req)
++ {
++ 	if (!io_op_defs[req->opcode].async_ctx)
++ 		return 0;
++ 
++ 	return  __io_alloc_async_ctx(req);
++ }
++ 
++ static int io_setup_async_rw(struct io_kiocb *req, ssize_t io_size,
++ 			     struct iovec *iovec, struct iovec *fast_iov,
++ 			     struct iov_iter *iter)
++ {
++ 	if (!io_op_defs[req->opcode].async_ctx)
++ 		return 0;
++ 	if (!req->io) {
++ 		if (__io_alloc_async_ctx(req))
++ 			return -ENOMEM;
++ 
++ 		io_req_map_rw(req, io_size, iovec, fast_iov, iter);
++ 	}
++ 	return 0;
++ }
++ 
++ static int io_read_prep(struct io_kiocb *req, const struct io_uring_sqe *sqe,
++ 			bool force_nonblock)
++ {
++ 	struct io_async_ctx *io;
++ 	struct iov_iter iter;
++ 	ssize_t ret;
++ 
++ 	ret = io_prep_rw(req, sqe, force_nonblock);
++ 	if (ret)
++ 		return ret;
++ 
++ 	if (unlikely(!(req->file->f_mode & FMODE_READ)))
++ 		return -EBADF;
++ 
++ 	/* either don't need iovec imported or already have it */
++ 	if (!req->io || req->flags & REQ_F_NEED_CLEANUP)
++ 		return 0;
++ 
++ 	io = req->io;
++ 	io->rw.iov = io->rw.fast_iov;
++ 	req->io = NULL;
++ 	ret = io_import_iovec(READ, req, &io->rw.iov, &iter, !force_nonblock);
++ 	req->io = io;
++ 	if (ret < 0)
++ 		return ret;
++ 
++ 	io_req_map_rw(req, ret, io->rw.iov, io->rw.fast_iov, &iter);
++ 	return 0;
++ }
++ 
++ static int io_read(struct io_kiocb *req, bool force_nonblock)
+++>>>>>>> 3d9932a8b240 (io_uring: cleanup io_alloc_async_ctx())
+  {
+  	struct iovec inline_vecs[UIO_FASTIOV], *iovec = inline_vecs;
+ -	struct kiocb *kiocb = &req->rw.kiocb;
+ +	struct kiocb *kiocb = &req->rw;
+  	struct iov_iter iter;
+ +	struct file *file;
+  	size_t iov_count;
+ -	ssize_t io_size, ret;
+ +	ssize_t read_size, ret;
+  
+ -	ret = io_import_iovec(READ, req, &iovec, &iter, !force_nonblock);
+ -	if (ret < 0)
+ +	ret = io_prep_rw(req, s, force_nonblock);
+ +	if (ret)
+  		return ret;
+ +	file = kiocb->ki_filp;
+  
+ -	/* Ensure we clear previously set non-block flag */
+ -	if (!force_nonblock)
+ -		kiocb->ki_flags &= ~IOCB_NOWAIT;
+ +	if (unlikely(!(file->f_mode & FMODE_READ)))
+ +		return -EBADF;
+  
+ -	req->result = 0;
+ -	io_size = ret;
+ -	if (req->flags & REQ_F_LINK)
+ -		req->result = io_size;
+ +	ret = io_import_iovec(req->ctx, READ, s, &iovec, &iter);
+ +	if (ret < 0)
+ +		return ret;
+  
+ -	/*
+ -	 * If the file doesn't support async, mark it as REQ_F_MUST_PUNT so
+ -	 * we know to async punt it even if it was opened O_NONBLOCK
+ -	 */
+ -	if (force_nonblock && !io_file_supports_async(req->file))
+ -		goto copy_iov;
+ +	read_size = ret;
+ +	if (req->flags & REQ_F_LINK)
+ +		req->result = read_size;
+  
+  	iov_count = iov_iter_count(&iter);
+ -	ret = rw_verify_area(READ, req->file, &kiocb->ki_pos, iov_count);
+ +	ret = rw_verify_area(READ, file, &kiocb->ki_pos, iov_count);
+  	if (!ret) {
+  		ssize_t ret2;
+  
+* Unmerged path fs/io_uring.c
