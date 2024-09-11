@@ -1,0 +1,213 @@
+gfs2: clean_journal improperly set sd_log_flush_head
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-147.el8
+commit-author Bob Peterson <rpeterso@redhat.com>
+commit 7c70b896951c84d63e6d71b82668f9c8b8bbd440
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-147.el8/7c70b896.failed
+
+This patch fixes regressions in 588bff95c94efc05f9e1a0b19015c9408ed7c0ef.
+Due to that patch, function clean_journal was setting the value of
+sd_log_flush_head, but that's only valid if it is replaying the node's
+own journal. If it's replaying another node's journal, that's completely
+wrong and will lead to multiple problems. This patch tries to clean up
+the mess by passing the value of the logical journal block number into
+gfs2_write_log_header so the function can treat non-owned journals
+generically. For the local journal, the journal extent map is used for
+best performance. For other nodes from other journals, new function
+gfs2_lblk_to_dblk is called to figure it out using gfs2_iomap_get.
+
+This patch also tries to establish more consistency when passing journal
+block parameters by changing several unsigned int types to a consistent
+u32.
+
+Fixes: 588bff95c94e ("GFS2: Reduce code redundancy writing log headers")
+	Signed-off-by: Bob Peterson <rpeterso@redhat.com>
+	Signed-off-by: Andreas Gruenbacher <agruenba@redhat.com>
+(cherry picked from commit 7c70b896951c84d63e6d71b82668f9c8b8bbd440)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/gfs2/log.c
+diff --cc fs/gfs2/log.c
+index 99dd58694ba1,ebbc68dca145..000000000000
+--- a/fs/gfs2/log.c
++++ b/fs/gfs2/log.c
+@@@ -733,8 -740,8 +741,13 @@@ void gfs2_write_log_header(struct gfs2_
+  		     sb->s_blocksize - LH_V1_SIZE - 4);
+  	lh->lh_crc = cpu_to_be32(crc);
+  
+++<<<<<<< HEAD
+ +	gfs2_log_write(sdp, page, sb->s_blocksize, 0, addr);
+ +	gfs2_log_flush_bio(sdp, REQ_OP_WRITE, op_flags);
+++=======
++ 	gfs2_log_write(sdp, page, sb->s_blocksize, 0, dblock);
++ 	gfs2_log_submit_bio(&sdp->sd_log_bio, REQ_OP_WRITE, op_flags);
+++>>>>>>> 7c70b896951c (gfs2: clean_journal improperly set sd_log_flush_head)
+  	log_flush_wait(sdp);
+  }
+  
+diff --git a/fs/gfs2/bmap.c b/fs/gfs2/bmap.c
+index 17a2a7d1b44e..58ac514b4895 100644
+--- a/fs/gfs2/bmap.c
++++ b/fs/gfs2/bmap.c
+@@ -924,6 +924,32 @@ static int gfs2_iomap_get(struct inode *inode, loff_t pos, loff_t length,
+ 	goto out;
+ }
+ 
++/**
++ * gfs2_lblk_to_dblk - convert logical block to disk block
++ * @inode: the inode of the file we're mapping
++ * @lblock: the block relative to the start of the file
++ * @dblock: the returned dblock, if no error
++ *
++ * This function maps a single block from a file logical block (relative to
++ * the start of the file) to a file system absolute block using iomap.
++ *
++ * Returns: the absolute file system block, or an error
++ */
++int gfs2_lblk_to_dblk(struct inode *inode, u32 lblock, u64 *dblock)
++{
++	struct iomap iomap = { };
++	struct metapath mp = { .mp_aheight = 1, };
++	loff_t pos = (loff_t)lblock << inode->i_blkbits;
++	int ret;
++
++	ret = gfs2_iomap_get(inode, pos, i_blocksize(inode), 0, &iomap, &mp);
++	release_metapath(&mp);
++	if (ret == 0)
++		*dblock = iomap.addr >> inode->i_blkbits;
++
++	return ret;
++}
++
+ static int gfs2_write_lock(struct inode *inode)
+ {
+ 	struct gfs2_inode *ip = GFS2_I(inode);
+diff --git a/fs/gfs2/bmap.h b/fs/gfs2/bmap.h
+index 6b18fb323f0a..19a1fd772c61 100644
+--- a/fs/gfs2/bmap.h
++++ b/fs/gfs2/bmap.h
+@@ -64,5 +64,6 @@ extern int gfs2_write_alloc_required(struct gfs2_inode *ip, u64 offset,
+ extern int gfs2_map_journal_extents(struct gfs2_sbd *sdp, struct gfs2_jdesc *jd);
+ extern void gfs2_free_journal_extents(struct gfs2_jdesc *jd);
+ extern int __gfs2_punch_hole(struct file *file, loff_t offset, loff_t length);
++extern int gfs2_lblk_to_dblk(struct inode *inode, u32 lblock, u64 *dblock);
+ 
+ #endif /* __BMAP_DOT_H__ */
+diff --git a/fs/gfs2/incore.h b/fs/gfs2/incore.h
+index 1df0dfa6fba6..1443f26b76b2 100644
+--- a/fs/gfs2/incore.h
++++ b/fs/gfs2/incore.h
+@@ -538,7 +538,7 @@ struct gfs2_jdesc {
+ 	unsigned long jd_flags;
+ #define JDF_RECOVERY 1
+ 	unsigned int jd_jid;
+-	unsigned int jd_blocks;
++	u32 jd_blocks;
+ 	int jd_recover_error;
+ 	/* Replay stuff */
+ 
+* Unmerged path fs/gfs2/log.c
+diff --git a/fs/gfs2/log.h b/fs/gfs2/log.h
+index 20241436126d..4aee8801c16d 100644
+--- a/fs/gfs2/log.h
++++ b/fs/gfs2/log.h
+@@ -71,7 +71,8 @@ extern unsigned int gfs2_struct2blk(struct gfs2_sbd *sdp, unsigned int nstruct,
+ extern void gfs2_log_release(struct gfs2_sbd *sdp, unsigned int blks);
+ extern int gfs2_log_reserve(struct gfs2_sbd *sdp, unsigned int blks);
+ extern void gfs2_write_log_header(struct gfs2_sbd *sdp, struct gfs2_jdesc *jd,
+-				  u64 seq, u32 tail, u32 flags, int op_flags);
++				  u64 seq, u32 tail, u32 lblock, u32 flags,
++				  int op_flags);
+ extern void gfs2_log_flush(struct gfs2_sbd *sdp, struct gfs2_glock *gl,
+ 			   u32 type);
+ extern void gfs2_log_commit(struct gfs2_sbd *sdp, struct gfs2_trans *trans);
+diff --git a/fs/gfs2/lops.c b/fs/gfs2/lops.c
+index 4c7069b8f3c1..dfac677e2663 100644
+--- a/fs/gfs2/lops.c
++++ b/fs/gfs2/lops.c
+@@ -523,7 +523,7 @@ static void buf_lo_before_scan(struct gfs2_jdesc *jd,
+ 	jd->jd_replayed_blocks = 0;
+ }
+ 
+-static int buf_lo_scan_elements(struct gfs2_jdesc *jd, unsigned int start,
++static int buf_lo_scan_elements(struct gfs2_jdesc *jd, u32 start,
+ 				struct gfs2_log_descriptor *ld, __be64 *ptr,
+ 				int pass)
+ {
+@@ -678,7 +678,7 @@ static void revoke_lo_before_scan(struct gfs2_jdesc *jd,
+ 	jd->jd_replay_tail = head->lh_tail;
+ }
+ 
+-static int revoke_lo_scan_elements(struct gfs2_jdesc *jd, unsigned int start,
++static int revoke_lo_scan_elements(struct gfs2_jdesc *jd, u32 start,
+ 				   struct gfs2_log_descriptor *ld, __be64 *ptr,
+ 				   int pass)
+ {
+@@ -760,7 +760,7 @@ static void databuf_lo_before_commit(struct gfs2_sbd *sdp, struct gfs2_trans *tr
+ 	gfs2_before_commit(sdp, limit, nbuf, &tr->tr_databuf, 1);
+ }
+ 
+-static int databuf_lo_scan_elements(struct gfs2_jdesc *jd, unsigned int start,
++static int databuf_lo_scan_elements(struct gfs2_jdesc *jd, u32 start,
+ 				    struct gfs2_log_descriptor *ld,
+ 				    __be64 *ptr, int pass)
+ {
+diff --git a/fs/gfs2/lops.h b/fs/gfs2/lops.h
+index e4949394f054..7deadcf9fbb9 100644
+--- a/fs/gfs2/lops.h
++++ b/fs/gfs2/lops.h
+@@ -77,7 +77,7 @@ static inline void lops_before_scan(struct gfs2_jdesc *jd,
+ 			gfs2_log_ops[x]->lo_before_scan(jd, head, pass);
+ }
+ 
+-static inline int lops_scan_elements(struct gfs2_jdesc *jd, unsigned int start,
++static inline int lops_scan_elements(struct gfs2_jdesc *jd, u32 start,
+ 				     struct gfs2_log_descriptor *ld,
+ 				     __be64 *ptr,
+ 				     unsigned int pass)
+diff --git a/fs/gfs2/recovery.c b/fs/gfs2/recovery.c
+index 0f501f938d1c..1acf12286719 100644
+--- a/fs/gfs2/recovery.c
++++ b/fs/gfs2/recovery.c
+@@ -305,7 +305,7 @@ int gfs2_find_jhead(struct gfs2_jdesc *jd, struct gfs2_log_header_host *head)
+  * Returns: errno
+  */
+ 
+-static int foreach_descriptor(struct gfs2_jdesc *jd, unsigned int start,
++static int foreach_descriptor(struct gfs2_jdesc *jd, u32 start,
+ 			      unsigned int end, int pass)
+ {
+ 	struct gfs2_sbd *sdp = GFS2_SB(jd->jd_inode);
+@@ -375,10 +375,12 @@ static void clean_journal(struct gfs2_jdesc *jd,
+ 			  struct gfs2_log_header_host *head)
+ {
+ 	struct gfs2_sbd *sdp = GFS2_SB(jd->jd_inode);
++	u32 lblock = head->lh_blkno;
+ 
+-	sdp->sd_log_flush_head = head->lh_blkno;
+-	gfs2_replay_incr_blk(jd, &sdp->sd_log_flush_head);
+-	gfs2_write_log_header(sdp, jd, head->lh_sequence + 1, 0,
++	gfs2_replay_incr_blk(jd, &lblock);
++	if (jd->jd_jid == sdp->sd_lockstruct.ls_jid)
++		sdp->sd_log_flush_head = lblock;
++	gfs2_write_log_header(sdp, jd, head->lh_sequence + 1, 0, lblock,
+ 			      GFS2_LOG_HEAD_UNMOUNT | GFS2_LOG_HEAD_RECOVERY,
+ 			      REQ_PREFLUSH | REQ_FUA | REQ_META | REQ_SYNC);
+ }
+diff --git a/fs/gfs2/recovery.h b/fs/gfs2/recovery.h
+index 11fdfab4bf99..1dd7c3fada7c 100644
+--- a/fs/gfs2/recovery.h
++++ b/fs/gfs2/recovery.h
+@@ -14,7 +14,7 @@
+ 
+ extern struct workqueue_struct *gfs_recovery_wq;
+ 
+-static inline void gfs2_replay_incr_blk(struct gfs2_jdesc *jd, unsigned int *blk)
++static inline void gfs2_replay_incr_blk(struct gfs2_jdesc *jd, u32 *blk)
+ {
+ 	if (++*blk == jd->jd_blocks)
+ 	        *blk = 0;
