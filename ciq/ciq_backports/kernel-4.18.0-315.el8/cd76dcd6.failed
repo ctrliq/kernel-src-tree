@@ -1,0 +1,147 @@
+devlink: Support add and delete devlink port
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-315.el8
+commit-author Parav Pandit <parav@nvidia.com>
+commit cd76dcd68d96aa5bbc63b7ef25a87a1dbea3d73c
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-315.el8/cd76dcd6.failed
+
+Extended devlink interface for the user to add and delete a port.
+Extend devlink to connect user requests to driver to add/delete
+a port in the device.
+
+Driver routines are invoked without holding devlink instance lock.
+This enables driver to perform several devlink objects registration,
+unregistration such as (port, health reporter, resource etc) by using
+existing devlink APIs.
+This also helps to uniformly use the code for port unregistration
+during driver unload and during port deletion initiated by user.
+
+Examples of add, show and delete commands:
+$ devlink dev eswitch set pci/0000:06:00.0 mode switchdev
+
+$ devlink port show
+pci/0000:06:00.0/65535: type eth netdev ens2f0np0 flavour physical port 0 splittable false
+
+$ devlink port add pci/0000:06:00.0 flavour pcisf pfnum 0 sfnum 88
+pci/0000:06:00.0/32768: type eth netdev eth6 flavour pcisf controller 0 pfnum 0 sfnum 88 external false splittable false
+  function:
+    hw_addr 00:00:00:00:00:00 state inactive opstate detached
+
+$ devlink port show pci/0000:06:00.0/32768
+pci/0000:06:00.0/32768: type eth netdev eth6 flavour pcisf controller 0 pfnum 0 sfnum 88 external false splittable false
+  function:
+    hw_addr 00:00:00:00:00:00 state inactive opstate detached
+
+$ udevadm test-builtin net_id /sys/class/net/eth6
+Load module index
+Parsed configuration file /usr/lib/systemd/network/99-default.link
+Created link configuration context.
+Using default interface naming scheme 'v245'.
+ID_NET_NAMING_SCHEME=v245
+ID_NET_NAME_PATH=enp6s0f0npf0sf88
+ID_NET_NAME_SLOT=ens2f0npf0sf88
+Unload module index
+Unloaded link configuration context.
+
+	Signed-off-by: Parav Pandit <parav@nvidia.com>
+	Reviewed-by: Vu Pham <vuhuong@nvidia.com>
+	Signed-off-by: Saeed Mahameed <saeedm@nvidia.com>
+(cherry picked from commit cd76dcd68d96aa5bbc63b7ef25a87a1dbea3d73c)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/core/devlink.c
+diff --cc net/core/devlink.c
+index c9ff69b87ef6,541b5f549274..000000000000
+--- a/net/core/devlink.c
++++ b/net/core/devlink.c
+@@@ -7460,7 -7709,11 +7565,15 @@@ static const struct nla_policy devlink_
+  	[DEVLINK_ATTR_PORT_FUNCTION] = { .type = NLA_NESTED },
+  	[DEVLINK_ATTR_RELOAD_ACTION] = NLA_POLICY_RANGE(NLA_U8, DEVLINK_RELOAD_ACTION_DRIVER_REINIT,
+  							DEVLINK_RELOAD_ACTION_MAX),
+++<<<<<<< HEAD
+ +	[DEVLINK_ATTR_RELOAD_LIMITS] = NLA_POLICY_BITFIELD32_PTR(&reload_limits_valid_mask),
+++=======
++ 	[DEVLINK_ATTR_RELOAD_LIMITS] = NLA_POLICY_BITFIELD32(DEVLINK_RELOAD_LIMITS_VALID_MASK),
++ 	[DEVLINK_ATTR_PORT_FLAVOUR] = { .type = NLA_U16 },
++ 	[DEVLINK_ATTR_PORT_PCI_PF_NUMBER] = { .type = NLA_U16 },
++ 	[DEVLINK_ATTR_PORT_PCI_SF_NUMBER] = { .type = NLA_U32 },
++ 	[DEVLINK_ATTR_PORT_CONTROLLER_NUMBER] = { .type = NLA_U32 },
+++>>>>>>> cd76dcd68d96 (devlink: Support add and delete devlink port)
+  };
+  
+  static const struct genl_small_ops devlink_nl_ops[] = {
+diff --git a/include/net/devlink.h b/include/net/devlink.h
+index 8196d015ec57..0a74c34badba 100644
+--- a/include/net/devlink.h
++++ b/include/net/devlink.h
+@@ -155,6 +155,17 @@ struct devlink_port {
+ 	struct mutex reporters_lock; /* Protects reporter_list */
+ };
+ 
++struct devlink_port_new_attrs {
++	enum devlink_port_flavour flavour;
++	unsigned int port_index;
++	u32 controller;
++	u32 sfnum;
++	u16 pfnum;
++	u8 port_index_valid:1,
++	   controller_valid:1,
++	   sfnum_valid:1;
++};
++
+ struct devlink_sb_pool_info {
+ 	enum devlink_sb_pool_type pool_type;
+ 	u32 size;
+@@ -1343,6 +1354,47 @@ struct devlink_ops {
+ 	int (*port_function_hw_addr_set)(struct devlink *devlink, struct devlink_port *port,
+ 					 const u8 *hw_addr, int hw_addr_len,
+ 					 struct netlink_ext_ack *extack);
++	/**
++	 * port_new() - Add a new port function of a specified flavor
++	 * @devlink: Devlink instance
++	 * @attrs: attributes of the new port
++	 * @extack: extack for reporting error messages
++	 * @new_port_index: index of the new port
++	 *
++	 * Devlink core will call this device driver function upon user request
++	 * to create a new port function of a specified flavor and optional
++	 * attributes
++	 *
++	 * Notes:
++	 *	- Called without devlink instance lock being held. Drivers must
++	 *	  implement own means of synchronization
++	 *	- On success, drivers must register a port with devlink core
++	 *
++	 * Return: 0 on success, negative value otherwise.
++	 */
++	int (*port_new)(struct devlink *devlink,
++			const struct devlink_port_new_attrs *attrs,
++			struct netlink_ext_ack *extack,
++			unsigned int *new_port_index);
++	/**
++	 * port_del() - Delete a port function
++	 * @devlink: Devlink instance
++	 * @port_index: port function index to delete
++	 * @extack: extack for reporting error messages
++	 *
++	 * Devlink core will call this device driver function upon user request
++	 * to delete a previously created port function
++	 *
++	 * Notes:
++	 *	- Called without devlink instance lock being held. Drivers must
++	 *	  implement own means of synchronization
++	 *	- On success, drivers must unregister the corresponding devlink
++	 *	  port
++	 *
++	 * Return: 0 on success, negative value otherwise.
++	 */
++	int (*port_del)(struct devlink *devlink, unsigned int port_index,
++			struct netlink_ext_ack *extack);
+ };
+ 
+ static inline void *devlink_priv(struct devlink *devlink)
+* Unmerged path net/core/devlink.c
