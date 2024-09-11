@@ -1,0 +1,358 @@
+mptcp: let MPTCP create max size skbs
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Paolo Abeni <pabeni@redhat.com>
+commit 15e6ca974b14c2dc4221738ef81b23ef694c9160
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/15e6ca97.failed
+
+Currently the xmit path of the MPTCP protocol creates smaller-
+than-max-size skbs, which is suboptimal for the performances.
+
+There are a few things to improve:
+- when coalescing to an existing skb, must clear the PUSH flag
+- tcp_build_frag() expect the available space as an argument.
+  When coalescing is enable MPTCP already subtracted the
+  to-be-coalesced skb len. We must increment said argument
+  accordingly.
+
+Before:
+./use_mptcp.sh netperf -H 127.0.0.1 -t TCP_STREAM
+[...]
+131072  16384  16384    30.00    24414.86
+
+After:
+./use_mptcp.sh netperf -H 127.0.0.1 -t TCP_STREAM
+[...]
+131072  16384  16384    30.05    28357.69
+
+	Signed-off-by: Paolo Abeni <pabeni@redhat.com>
+	Signed-off-by: Mat Martineau <mathew.j.martineau@linux.intel.com>
+	Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+(cherry picked from commit 15e6ca974b14c2dc4221738ef81b23ef694c9160)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/mptcp/protocol.c
+diff --cc net/mptcp/protocol.c
+index 75ee5f9fd199,b812aaae8044..000000000000
+--- a/net/mptcp/protocol.c
++++ b/net/mptcp/protocol.c
+@@@ -709,104 -1099,212 +709,133 @@@ mptcp_carve_data_frag(const struct mptc
+  	return dfrag;
+  }
+  
+ -struct mptcp_sendmsg_info {
+ -	int mss_now;
+ -	int size_goal;
+ -	u16 limit;
+ -	u16 sent;
+ -	unsigned int flags;
+ -};
+ -
+ -static int mptcp_check_allowed_size(struct mptcp_sock *msk, u64 data_seq,
+ -				    int avail_size)
+ -{
+ -	u64 window_end = mptcp_wnd_end(msk);
+ -
+ -	if (__mptcp_check_fallback(msk))
+ -		return avail_size;
+ -
+ -	if (!before64(data_seq + avail_size, window_end)) {
+ -		u64 allowed_size = window_end - data_seq;
+ -
+ -		return min_t(unsigned int, allowed_size, avail_size);
+ -	}
+ -
+ -	return avail_size;
+ -}
+ -
+ -static bool __mptcp_add_ext(struct sk_buff *skb, gfp_t gfp)
+ -{
+ -	struct skb_ext *mpext = __skb_ext_alloc(gfp);
+ -
+ -	if (!mpext)
+ -		return false;
+ -	__skb_ext_set(skb, SKB_EXT_MPTCP, mpext);
+ -	return true;
+ -}
+ -
+ -static struct sk_buff *__mptcp_do_alloc_tx_skb(struct sock *sk, gfp_t gfp)
+ -{
+ -	struct sk_buff *skb;
+ -
+ -	skb = alloc_skb_fclone(MAX_TCP_HEADER, gfp);
+ -	if (likely(skb)) {
+ -		if (likely(__mptcp_add_ext(skb, gfp))) {
+ -			skb_reserve(skb, MAX_TCP_HEADER);
+ -			skb->reserved_tailroom = skb->end - skb->tail;
+ -			return skb;
+ -		}
+ -		__kfree_skb(skb);
+ -	} else {
+ -		mptcp_enter_memory_pressure(sk);
+ -	}
+ -	return NULL;
+ -}
+ -
+ -static bool mptcp_tx_cache_refill(struct sock *sk, int size,
+ -				  struct sk_buff_head *skbs, int *total_ts)
+ -{
+ -	struct mptcp_sock *msk = mptcp_sk(sk);
+ -	struct sk_buff *skb;
+ -	int space_needed;
+ -
+ -	if (unlikely(tcp_under_memory_pressure(sk))) {
+ -		mptcp_mem_reclaim_partial(sk);
+ -
+ -		/* under pressure pre-allocate at most a single skb */
+ -		if (msk->skb_tx_cache.qlen)
+ -			return true;
+ -		space_needed = msk->size_goal_cache;
+ -	} else {
+ -		space_needed = msk->tx_pending_data + size -
+ -			       msk->skb_tx_cache.qlen * msk->size_goal_cache;
+ -	}
+ -
+ -	while (space_needed > 0) {
+ -		skb = __mptcp_do_alloc_tx_skb(sk, sk->sk_allocation);
+ -		if (unlikely(!skb)) {
+ -			/* under memory pressure, try to pass the caller a
+ -			 * single skb to allow forward progress
+ -			 */
+ -			while (skbs->qlen > 1) {
+ -				skb = __skb_dequeue_tail(skbs);
+ -				__kfree_skb(skb);
+ -			}
+ -			return skbs->qlen > 0;
+ -		}
+ -
+ -		*total_ts += skb->truesize;
+ -		__skb_queue_tail(skbs, skb);
+ -		space_needed -= msk->size_goal_cache;
+ -	}
+ -	return true;
+ -}
+ -
+ -static bool __mptcp_alloc_tx_skb(struct sock *sk, struct sock *ssk, gfp_t gfp)
+ -{
+ -	struct mptcp_sock *msk = mptcp_sk(sk);
+ -	struct sk_buff *skb;
+ -
+ -	if (ssk->sk_tx_skb_cache) {
+ -		skb = ssk->sk_tx_skb_cache;
+ -		if (unlikely(!skb_ext_find(skb, SKB_EXT_MPTCP) &&
+ -			     !__mptcp_add_ext(skb, gfp)))
+ -			return false;
+ -		return true;
+ -	}
+ -
+ -	skb = skb_peek(&msk->skb_tx_cache);
+ -	if (skb) {
+ -		if (likely(sk_wmem_schedule(ssk, skb->truesize))) {
+ -			skb = __skb_dequeue(&msk->skb_tx_cache);
+ -			if (WARN_ON_ONCE(!skb))
+ -				return false;
+ -
+ -			mptcp_wmem_uncharge(sk, skb->truesize);
+ -			ssk->sk_tx_skb_cache = skb;
+ -			return true;
+ -		}
+ -
+ -		/* over memory limit, no point to try to allocate a new skb */
+ -		return false;
+ -	}
+ -
+ -	skb = __mptcp_do_alloc_tx_skb(sk, gfp);
+ -	if (!skb)
+ -		return false;
+ -
+ -	if (likely(sk_wmem_schedule(ssk, skb->truesize))) {
+ -		ssk->sk_tx_skb_cache = skb;
+ -		return true;
+ -	}
+ -	kfree_skb(skb);
+ -	return false;
+ -}
+ -
+ -static bool mptcp_must_reclaim_memory(struct sock *sk, struct sock *ssk)
+ -{
+ -	return !ssk->sk_tx_skb_cache &&
+ -	       !skb_peek(&mptcp_sk(sk)->skb_tx_cache) &&
+ -	       tcp_under_memory_pressure(sk);
+ -}
+ -
+ -static bool mptcp_alloc_tx_skb(struct sock *sk, struct sock *ssk)
+ -{
+ -	if (unlikely(mptcp_must_reclaim_memory(sk, ssk)))
+ -		mptcp_mem_reclaim_partial(sk);
+ -	return __mptcp_alloc_tx_skb(sk, ssk, sk->sk_allocation);
+ -}
+ -
+  static int mptcp_sendmsg_frag(struct sock *sk, struct sock *ssk,
+ -			      struct mptcp_data_frag *dfrag,
+ -			      struct mptcp_sendmsg_info *info)
+ +			      struct msghdr *msg, struct mptcp_data_frag *dfrag,
+ +			      long *timeo, int *pmss_now,
+ +			      int *ps_goal)
+  {
+ -	u64 data_seq = dfrag->data_seq + info->sent;
+ +	int mss_now, avail_size, size_goal, offset, ret, frag_truesize = 0;
+ +	bool dfrag_collapsed, can_collapse = false;
+  	struct mptcp_sock *msk = mptcp_sk(sk);
+ -	bool zero_window_probe = false;
+  	struct mptcp_ext *mpext = NULL;
+ +	bool retransmission = !!dfrag;
+  	struct sk_buff *skb, *tail;
+++<<<<<<< HEAD
+ +	struct page_frag *pfrag;
+ +	struct page *page;
+ +	u64 *write_seq;
+ +	size_t psize;
+++=======
++ 	bool can_collapse = false;
++ 	int size_bias = 0;
++ 	int avail_size;
++ 	size_t ret = 0;
+++>>>>>>> 15e6ca974b14 (mptcp: let MPTCP create max size skbs)
+  
+ -	pr_debug("msk=%p ssk=%p sending dfrag at seq=%lld len=%d already sent=%d",
+ -		 msk, ssk, dfrag->data_seq, dfrag->data_len, info->sent);
+ +	/* use the mptcp page cache so that we can easily move the data
+ +	 * from one substream to another, but do per subflow memory accounting
+ +	 * Note: pfrag is used only !retransmission, but the compiler if
+ +	 * fooled into a warning if we don't init here
+ +	 */
+ +	pfrag = sk_page_frag(sk);
+ +	while ((!retransmission && !mptcp_page_frag_refill(ssk, pfrag)) ||
+ +	       !mptcp_ext_cache_refill(msk)) {
+ +		ret = sk_stream_wait_memory(ssk, timeo);
+ +		if (ret)
+ +			return ret;
+  
+ -	/* compute send limit */
+ -	info->mss_now = tcp_send_mss(ssk, &info->size_goal, info->flags);
+ -	avail_size = info->size_goal;
+ -	msk->size_goal_cache = info->size_goal;
+ +		/* if sk_stream_wait_memory() sleeps snd_una can change
+ +		 * significantly, refresh the rtx queue
+ +		 */
+ +		mptcp_clean_una(sk);
+ +	}
+ +	if (!retransmission) {
+ +		write_seq = &msk->write_seq;
+ +		page = pfrag->page;
+ +	} else {
+ +		write_seq = &dfrag->data_seq;
+ +		page = dfrag->page;
+ +	}
+ +
+ +	/* compute copy limit */
+ +	mss_now = tcp_send_mss(ssk, &size_goal, msg->msg_flags);
+ +	*pmss_now = mss_now;
+ +	*ps_goal = size_goal;
+ +	avail_size = size_goal;
+  	skb = tcp_write_queue_tail(ssk);
+  	if (skb) {
+ +		mpext = skb_ext_find(skb, SKB_EXT_MPTCP);
+ +
+  		/* Limit the write to the size available in the
+  		 * current skb, if any, so that we create at most a new skb.
+  		 * Explicitly tells TCP internals to avoid collapsing on later
+  		 * queue management operation, to avoid breaking the ext <->
+  		 * SSN association set here
+  		 */
+++<<<<<<< HEAD
+ +		can_collapse = (size_goal - skb->len > 0) &&
+ +			      mptcp_skb_can_collapse_to(*write_seq, skb, mpext);
+ +		if (!can_collapse)
+ +			TCP_SKB_CB(skb)->eor = 1;
+ +		else
+ +			avail_size = size_goal - skb->len;
+++=======
++ 		mpext = skb_ext_find(skb, SKB_EXT_MPTCP);
++ 		can_collapse = (info->size_goal - skb->len > 0) &&
++ 			 mptcp_skb_can_collapse_to(data_seq, skb, mpext);
++ 		if (!can_collapse) {
++ 			TCP_SKB_CB(skb)->eor = 1;
++ 		} else {
++ 			size_bias = skb->len;
++ 			avail_size = info->size_goal - skb->len;
++ 		}
+++>>>>>>> 15e6ca974b14 (mptcp: let MPTCP create max size skbs)
+  	}
+  
+ -	/* Zero window and all data acked? Probe. */
+ -	avail_size = mptcp_check_allowed_size(msk, data_seq, avail_size);
+ -	if (avail_size == 0) {
+ -		u64 snd_una = READ_ONCE(msk->snd_una);
+ +	if (!retransmission) {
+ +		/* reuse tail pfrag, if possible, or carve a new one from the
+ +		 * page allocator
+ +		 */
+ +		dfrag = mptcp_rtx_tail(sk);
+ +		offset = pfrag->offset;
+ +		dfrag_collapsed = mptcp_frag_can_collapse_to(msk, pfrag, dfrag);
+ +		if (!dfrag_collapsed) {
+ +			dfrag = mptcp_carve_data_frag(msk, pfrag, offset);
+ +			offset = dfrag->offset;
+ +			frag_truesize = dfrag->overhead;
+ +		}
+ +		psize = min_t(size_t, pfrag->size - offset, avail_size);
+ +
+ +		/* Copy to page */
+ +		pr_debug("left=%zu", msg_data_left(msg));
+ +		psize = copy_page_from_iter(pfrag->page, offset,
+ +					    min_t(size_t, msg_data_left(msg),
+ +						  psize),
+ +					    &msg->msg_iter);
+ +		pr_debug("left=%zu", msg_data_left(msg));
+ +		if (!psize)
+ +			return -EINVAL;
+  
+ -		if (skb || snd_una != msk->snd_nxt)
+ -			return 0;
+ -		zero_window_probe = true;
+ -		data_seq = snd_una - 1;
+ -		avail_size = 1;
+ +		if (!sk_wmem_schedule(sk, psize + dfrag->overhead)) {
+ +			iov_iter_revert(&msg->msg_iter, psize);
+ +			return -ENOMEM;
+ +		}
+ +	} else {
+ +		offset = dfrag->offset;
+ +		psize = min_t(size_t, dfrag->data_len, avail_size);
+  	}
+  
+++<<<<<<< HEAD
+ +	tail = tcp_build_frag(ssk, psize, msg->msg_flags, page, offset, &psize);
+++=======
++ 	if (WARN_ON_ONCE(info->sent > info->limit ||
++ 			 info->limit > dfrag->data_len))
++ 		return 0;
++ 
++ 	ret = info->limit - info->sent;
++ 	tail = tcp_build_frag(ssk, avail_size + size_bias, info->flags,
++ 			      dfrag->page, dfrag->offset + info->sent, &ret);
+++>>>>>>> 15e6ca974b14 (mptcp: let MPTCP create max size skbs)
+  	if (!tail) {
+  		tcp_remove_empty_skb(sk, tcp_write_queue_tail(ssk));
+  		return -ENOMEM;
+@@@ -839,8 -1313,10 +868,13 @@@
+  	/* if the tail skb is still the cached one, collapsing really happened.
+  	 */
+  	if (skb == tail) {
+- 		WARN_ON_ONCE(!can_collapse);
++ 		TCP_SKB_CB(tail)->tcp_flags &= ~TCPHDR_PSH;
+  		mpext->data_len += ret;
+++<<<<<<< HEAD
+++=======
++ 		WARN_ON_ONCE(!can_collapse);
++ 		WARN_ON_ONCE(zero_window_probe);
+++>>>>>>> 15e6ca974b14 (mptcp: let MPTCP create max size skbs)
+  		goto out;
+  	}
+  
+* Unmerged path net/mptcp/protocol.c
