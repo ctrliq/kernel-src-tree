@@ -1,0 +1,272 @@
+kvm: x86: Add exception payload fields to kvm_vcpu_events
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-147.el8
+commit-author Jim Mattson <jmattson@google.com>
+commit 59073aaf6de0d2dacc2603cee6d1d6cd5592ac08
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-147.el8/59073aaf.failed
+
+The per-VM capability KVM_CAP_EXCEPTION_PAYLOAD (to be introduced in a
+later commit) adds the following fields to struct kvm_vcpu_events:
+exception_has_payload, exception_payload, and exception.pending.
+
+With this capability set, all of the details of vcpu->arch.exception,
+including the payload for a pending exception, are reported to
+userspace in response to KVM_GET_VCPU_EVENTS.
+
+With this capability clear, the original ABI is preserved, and the
+exception.injected field is set for either pending or injected
+exceptions.
+
+When userspace calls KVM_SET_VCPU_EVENTS with
+KVM_CAP_EXCEPTION_PAYLOAD clear, exception.injected is no longer
+translated to exception.pending. KVM_SET_VCPU_EVENTS can now only
+establish a pending exception when KVM_CAP_EXCEPTION_PAYLOAD is set.
+
+	Reported-by: Jim Mattson <jmattson@google.com>
+	Suggested-by: Paolo Bonzini <pbonzini@redhat.com>
+	Signed-off-by: Jim Mattson <jmattson@google.com>
+	Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+(cherry picked from commit 59073aaf6de0d2dacc2603cee6d1d6cd5592ac08)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	Documentation/virtual/kvm/api.txt
+diff --cc Documentation/virtual/kvm/api.txt
+index d581b945e19e,e900ac31501c..000000000000
+--- a/Documentation/virtual/kvm/api.txt
++++ b/Documentation/virtual/kvm/api.txt
+@@@ -904,18 -873,25 +904,25 @@@ struct kvm_vcpu_events 
+  		__u8 smm_inside_nmi;
+  		__u8 latched_init;
+  	} smi;
+- 	__u32 reserved[9];
++ 	__u8 reserved[27];
++ 	__u8 exception_has_payload;
++ 	__u64 exception_payload;
+  };
+  
+- Only two fields are defined in the flags field:
++ The following bits are defined in the flags field:
+  
+- - KVM_VCPUEVENT_VALID_SHADOW may be set in the flags field to signal that
++ - KVM_VCPUEVENT_VALID_SHADOW may be set to signal that
+    interrupt.shadow contains a valid state.
+  
+- - KVM_VCPUEVENT_VALID_SMM may be set in the flags field to signal that
+-   smi contains a valid state.
++ - KVM_VCPUEVENT_VALID_SMM may be set to signal that smi contains a
++   valid state.
++ 
++ - KVM_VCPUEVENT_VALID_PAYLOAD may be set to signal that the
++   exception_has_payload, exception_payload, and exception.pending
++   fields contain a valid state. This bit will be set whenever
++   KVM_CAP_EXCEPTION_PAYLOAD is enabled.
+  
+ -ARM/ARM64:
+ +ARM64:
+  
+  If the guest accesses a device that is being emulated by the host kernel in
+  such a way that a real device would generate a physical SError, KVM may make
+@@@ -981,7 -969,12 +988,16 @@@ shall be written into the VCPU
+  
+  KVM_VCPUEVENT_VALID_SMM can only be set if KVM_CAP_X86_SMM is available.
+  
+++<<<<<<< HEAD
+ +ARM64:
+++=======
++ If KVM_CAP_EXCEPTION_PAYLOAD is enabled, KVM_VCPUEVENT_VALID_PAYLOAD
++ can be set in the flags field to signal that the
++ exception_has_payload, exception_payload, and exception.pending fields
++ contain a valid state and shall be written into the VCPU.
++ 
++ ARM/ARM64:
+++>>>>>>> 59073aaf6de0 (kvm: x86: Add exception payload fields to kvm_vcpu_events)
+  
+  Set the pending SError exception state for this VCPU. It is not possible to
+  'cancel' an Serror that has been made pending.
+* Unmerged path Documentation/virtual/kvm/api.txt
+diff --git a/arch/x86/include/asm/kvm_host.h b/arch/x86/include/asm/kvm_host.h
+index 4f4c34f2efda..965ee4eb3d04 100644
+--- a/arch/x86/include/asm/kvm_host.h
++++ b/arch/x86/include/asm/kvm_host.h
+@@ -900,6 +900,7 @@ struct kvm_arch {
+ 	bool x2apic_broadcast_quirk_disabled;
+ 
+ 	bool guest_can_read_msr_platform_info;
++	bool exception_payload_enabled;
+ };
+ 
+ struct kvm_vm_stat {
+diff --git a/arch/x86/include/uapi/asm/kvm.h b/arch/x86/include/uapi/asm/kvm.h
+index fd23d5778ea1..b3a1d75be030 100644
+--- a/arch/x86/include/uapi/asm/kvm.h
++++ b/arch/x86/include/uapi/asm/kvm.h
+@@ -288,6 +288,7 @@ struct kvm_reinject_control {
+ #define KVM_VCPUEVENT_VALID_SIPI_VECTOR	0x00000002
+ #define KVM_VCPUEVENT_VALID_SHADOW	0x00000004
+ #define KVM_VCPUEVENT_VALID_SMM		0x00000008
++#define KVM_VCPUEVENT_VALID_PAYLOAD	0x00000010
+ 
+ /* Interrupt shadow states */
+ #define KVM_X86_SHADOW_INT_MOV_SS	0x01
+@@ -299,7 +300,7 @@ struct kvm_vcpu_events {
+ 		__u8 injected;
+ 		__u8 nr;
+ 		__u8 has_error_code;
+-		__u8 pad;
++		__u8 pending;
+ 		__u32 error_code;
+ 	} exception;
+ 	struct {
+@@ -322,7 +323,9 @@ struct kvm_vcpu_events {
+ 		__u8 smm_inside_nmi;
+ 		__u8 latched_init;
+ 	} smi;
+-	__u32 reserved[9];
++	__u8 reserved[27];
++	__u8 exception_has_payload;
++	__u64 exception_payload;
+ };
+ 
+ /* for KVM_GET/SET_DEBUGREGS */
+diff --git a/arch/x86/kvm/x86.c b/arch/x86/kvm/x86.c
+index e665b1c80c6b..73a72ea6b0fd 100644
+--- a/arch/x86/kvm/x86.c
++++ b/arch/x86/kvm/x86.c
+@@ -3373,19 +3373,33 @@ static void kvm_vcpu_ioctl_x86_get_vcpu_events(struct kvm_vcpu *vcpu,
+ 					       struct kvm_vcpu_events *events)
+ {
+ 	process_nmi(vcpu);
++
+ 	/*
+-	 * FIXME: pass injected and pending separately.  This is only
+-	 * needed for nested virtualization, whose state cannot be
+-	 * migrated yet.  For now we can combine them.
++	 * The API doesn't provide the instruction length for software
++	 * exceptions, so don't report them. As long as the guest RIP
++	 * isn't advanced, we should expect to encounter the exception
++	 * again.
+ 	 */
+-	events->exception.injected =
+-		(vcpu->arch.exception.pending ||
+-		 vcpu->arch.exception.injected) &&
+-		!kvm_exception_is_soft(vcpu->arch.exception.nr);
++	if (kvm_exception_is_soft(vcpu->arch.exception.nr)) {
++		events->exception.injected = 0;
++		events->exception.pending = 0;
++	} else {
++		events->exception.injected = vcpu->arch.exception.injected;
++		events->exception.pending = vcpu->arch.exception.pending;
++		/*
++		 * For ABI compatibility, deliberately conflate
++		 * pending and injected exceptions when
++		 * KVM_CAP_EXCEPTION_PAYLOAD isn't enabled.
++		 */
++		if (!vcpu->kvm->arch.exception_payload_enabled)
++			events->exception.injected |=
++				vcpu->arch.exception.pending;
++	}
+ 	events->exception.nr = vcpu->arch.exception.nr;
+ 	events->exception.has_error_code = vcpu->arch.exception.has_error_code;
+-	events->exception.pad = 0;
+ 	events->exception.error_code = vcpu->arch.exception.error_code;
++	events->exception_has_payload = vcpu->arch.exception.has_payload;
++	events->exception_payload = vcpu->arch.exception.payload;
+ 
+ 	events->interrupt.injected =
+ 		vcpu->arch.interrupt.injected && !vcpu->arch.interrupt.soft;
+@@ -3409,6 +3423,9 @@ static void kvm_vcpu_ioctl_x86_get_vcpu_events(struct kvm_vcpu *vcpu,
+ 	events->flags = (KVM_VCPUEVENT_VALID_NMI_PENDING
+ 			 | KVM_VCPUEVENT_VALID_SHADOW
+ 			 | KVM_VCPUEVENT_VALID_SMM);
++	if (vcpu->kvm->arch.exception_payload_enabled)
++		events->flags |= KVM_VCPUEVENT_VALID_PAYLOAD;
++
+ 	memset(&events->reserved, 0, sizeof(events->reserved));
+ }
+ 
+@@ -3420,12 +3437,24 @@ static int kvm_vcpu_ioctl_x86_set_vcpu_events(struct kvm_vcpu *vcpu,
+ 	if (events->flags & ~(KVM_VCPUEVENT_VALID_NMI_PENDING
+ 			      | KVM_VCPUEVENT_VALID_SIPI_VECTOR
+ 			      | KVM_VCPUEVENT_VALID_SHADOW
+-			      | KVM_VCPUEVENT_VALID_SMM))
++			      | KVM_VCPUEVENT_VALID_SMM
++			      | KVM_VCPUEVENT_VALID_PAYLOAD))
+ 		return -EINVAL;
+ 
+-	if (events->exception.injected &&
+-	    (events->exception.nr > 31 || events->exception.nr == NMI_VECTOR ||
+-	     is_guest_mode(vcpu)))
++	if (events->flags & KVM_VCPUEVENT_VALID_PAYLOAD) {
++		if (!vcpu->kvm->arch.exception_payload_enabled)
++			return -EINVAL;
++		if (events->exception.pending)
++			events->exception.injected = 0;
++		else
++			events->exception_has_payload = 0;
++	} else {
++		events->exception.pending = 0;
++		events->exception_has_payload = 0;
++	}
++
++	if ((events->exception.injected || events->exception.pending) &&
++	    (events->exception.nr > 31 || events->exception.nr == NMI_VECTOR))
+ 		return -EINVAL;
+ 
+ 	/* INITs are latched while in SMM */
+@@ -3435,13 +3464,13 @@ static int kvm_vcpu_ioctl_x86_set_vcpu_events(struct kvm_vcpu *vcpu,
+ 		return -EINVAL;
+ 
+ 	process_nmi(vcpu);
+-	vcpu->arch.exception.injected = false;
+-	vcpu->arch.exception.pending = events->exception.injected;
++	vcpu->arch.exception.injected = events->exception.injected;
++	vcpu->arch.exception.pending = events->exception.pending;
+ 	vcpu->arch.exception.nr = events->exception.nr;
+ 	vcpu->arch.exception.has_error_code = events->exception.has_error_code;
+ 	vcpu->arch.exception.error_code = events->exception.error_code;
+-	vcpu->arch.exception.has_payload = false;
+-	vcpu->arch.exception.payload = 0;
++	vcpu->arch.exception.has_payload = events->exception_has_payload;
++	vcpu->arch.exception.payload = events->exception_payload;
+ 
+ 	vcpu->arch.interrupt.injected = events->interrupt.injected;
+ 	vcpu->arch.interrupt.nr = events->interrupt.nr;
+diff --git a/tools/arch/x86/include/uapi/asm/kvm.h b/tools/arch/x86/include/uapi/asm/kvm.h
+index c535c2fdea13..663807e0d51f 100644
+--- a/tools/arch/x86/include/uapi/asm/kvm.h
++++ b/tools/arch/x86/include/uapi/asm/kvm.h
+@@ -288,6 +288,7 @@ struct kvm_reinject_control {
+ #define KVM_VCPUEVENT_VALID_SIPI_VECTOR	0x00000002
+ #define KVM_VCPUEVENT_VALID_SHADOW	0x00000004
+ #define KVM_VCPUEVENT_VALID_SMM		0x00000008
++#define KVM_VCPUEVENT_VALID_PAYLOAD	0x00000010
+ 
+ /* Interrupt shadow states */
+ #define KVM_X86_SHADOW_INT_MOV_SS	0x01
+@@ -299,7 +300,10 @@ struct kvm_vcpu_events {
+ 		__u8 injected;
+ 		__u8 nr;
+ 		__u8 has_error_code;
+-		__u8 pad;
++		union {
++			__u8 pad;
++			__u8 pending;
++		};
+ 		__u32 error_code;
+ 	} exception;
+ 	struct {
+@@ -322,7 +326,9 @@ struct kvm_vcpu_events {
+ 		__u8 smm_inside_nmi;
+ 		__u8 latched_init;
+ 	} smi;
+-	__u32 reserved[9];
++	__u8 reserved[27];
++	__u8 exception_has_payload;
++	__u64 exception_payload;
+ };
+ 
+ /* for KVM_GET/SET_DEBUGREGS */
