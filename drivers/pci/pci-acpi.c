@@ -946,9 +946,7 @@ static bool acpi_pci_power_manageable(struct pci_dev *dev)
 {
 	struct acpi_device *adev = ACPI_COMPANION(&dev->dev);
 
-	if (!adev)
-		return false;
-	return acpi_device_power_manageable(adev);
+	return adev && acpi_device_power_manageable(adev);
 }
 
 static bool acpi_pci_bridge_d3(struct pci_dev *dev)
