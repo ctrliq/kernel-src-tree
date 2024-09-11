@@ -1,0 +1,159 @@
+printk: refactor kmsg_dump_get_buffer()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-358.el8
+commit-author John Ogness <john.ogness@linutronix.de>
+commit 726b5097701a8d46f5354be780e1a11fc4ca1187
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-358.el8/726b5097.failed
+
+kmsg_dump_get_buffer() requires nearly the same logic as
+syslog_print_all(), but uses different variable names and
+does not make use of the ringbuffer loop macros. Modify
+kmsg_dump_get_buffer() so that the implementation is as similar
+to syslog_print_all() as possible.
+
+A follow-up commit will move this common logic into a
+separate helper function.
+
+	Signed-off-by: John Ogness <john.ogness@linutronix.de>
+	Reviewed-by: Petr Mladek <pmladek@suse.com>
+	Signed-off-by: Petr Mladek <pmladek@suse.com>
+Link: https://lore.kernel.org/r/20210303101528.29901-6-john.ogness@linutronix.de
+(cherry picked from commit 726b5097701a8d46f5354be780e1a11fc4ca1187)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	kernel/printk/printk.c
+diff --cc kernel/printk/printk.c
+index 9c33249065a6,ed678d84dc51..000000000000
+--- a/kernel/printk/printk.c
++++ b/kernel/printk/printk.c
+@@@ -3311,18 -3424,19 +3311,26 @@@ EXPORT_SYMBOL_GPL(kmsg_dump_get_line)
+   * read.
+   */
+  bool kmsg_dump_get_buffer(struct kmsg_dumper *dumper, bool syslog,
+- 			  char *buf, size_t size, size_t *len)
++ 			  char *buf, size_t size, size_t *len_out)
+  {
+ -	struct printk_info info;
+ -	unsigned int line_count;
+ -	struct printk_record r;
+  	unsigned long flags;
+  	u64 seq;
+ +	u32 idx;
+  	u64 next_seq;
+++<<<<<<< HEAD
+ +	u32 next_idx;
+ +	size_t l = 0;
+ +	bool ret = false;
+ +	bool time = printk_time;
+ +
+ +	if (!dumper->active)
+++=======
++ 	size_t len = 0;
++ 	bool ret = false;
++ 	bool time = printk_time;
++ 
++ 	if (!dumper->active || !buf || !size)
+++>>>>>>> 726b5097701a (printk: refactor kmsg_dump_get_buffer())
+  		goto out;
+  
+  	logbuf_lock_irqsave(flags);
+@@@ -3338,39 -3453,46 +3346,80 @@@
+  		goto out;
+  	}
+  
+++<<<<<<< HEAD
+ +	/* calculate length of entire buffer */
+ +	seq = dumper->cur_seq;
+ +	idx = dumper->cur_idx;
+ +	while (seq < dumper->next_seq) {
+ +		struct printk_log *msg = log_from_idx(idx);
+ +
+ +		l += msg_print_text(msg, true, time, NULL, 0);
+ +		idx = log_next(idx);
+ +		seq++;
+ +	}
+ +
+ +	/* move first record forward until length fits into the buffer */
+ +	seq = dumper->cur_seq;
+ +	idx = dumper->cur_idx;
+ +	while (l >= size && seq < dumper->next_seq) {
+ +		struct printk_log *msg = log_from_idx(idx);
+ +
+ +		l -= msg_print_text(msg, true, time, NULL, 0);
+ +		idx = log_next(idx);
+ +		seq++;
+++=======
++ 	/*
++ 	 * Find first record that fits, including all following records,
++ 	 * into the user-provided buffer for this dump.
++ 	 */
++ 
++ 	prb_for_each_info(dumper->cur_seq, prb, seq, &info, &line_count) {
++ 		if (info.seq >= dumper->next_seq)
++ 			break;
++ 		len += get_record_print_text_size(&info, line_count, syslog, time);
+  	}
+  
+- 	/* last message in next interation */
++ 	/*
++ 	 * Move first record forward until length fits into the buffer. Ignore
++ 	 * newest messages that were not counted in the above cycle. Messages
++ 	 * might appear and get lost in the meantime. This is the best effort
++ 	 * that prevents an infinite loop.
++ 	 */
++ 	prb_for_each_info(dumper->cur_seq, prb, seq, &info, &line_count) {
++ 		if (len < size || info.seq >= dumper->next_seq)
++ 			break;
++ 		len -= get_record_print_text_size(&info, line_count, syslog, time);
+++>>>>>>> 726b5097701a (printk: refactor kmsg_dump_get_buffer())
++ 	}
++ 
++ 	/*
++ 	 * Next kmsg_dump_get_buffer() invocation will dump block of
++ 	 * older records stored right before this one.
++ 	 */
+  	next_seq = seq;
+ +	next_idx = idx;
+ +
+++<<<<<<< HEAD
+ +	l = 0;
+ +	while (seq < dumper->next_seq) {
+ +		struct printk_log *msg = log_from_idx(idx);
+  
+ +		l += msg_print_text(msg, syslog, time, buf + l, size - l);
+ +		idx = log_next(idx);
+ +		seq++;
+++=======
++ 	prb_rec_init_rd(&r, &info, buf, size);
++ 
++ 	len = 0;
++ 	prb_for_each_record(seq, prb, seq, &r) {
++ 		if (r.info->seq >= dumper->next_seq)
++ 			break;
++ 
++ 		len += record_print_text(&r, syslog, time);
++ 
++ 		/* Adjust record to store to remaining buffer space. */
++ 		prb_rec_init_rd(&r, &info, buf + len, size - len);
+++>>>>>>> 726b5097701a (printk: refactor kmsg_dump_get_buffer())
+  	}
+  
+  	dumper->next_seq = next_seq;
+diff --git a/include/linux/kmsg_dump.h b/include/linux/kmsg_dump.h
+index b833daa05587..4db74aca9bfc 100644
+--- a/include/linux/kmsg_dump.h
++++ b/include/linux/kmsg_dump.h
+@@ -63,7 +63,7 @@ bool kmsg_dump_get_line(struct kmsg_dumper *dumper, bool syslog,
+ 			char *line, size_t size, size_t *len);
+ 
+ bool kmsg_dump_get_buffer(struct kmsg_dumper *dumper, bool syslog,
+-			  char *buf, size_t size, size_t *len);
++			  char *buf, size_t size, size_t *len_out);
+ 
+ void kmsg_dump_rewind_nolock(struct kmsg_dumper *dumper);
+ 
+* Unmerged path kernel/printk/printk.c
