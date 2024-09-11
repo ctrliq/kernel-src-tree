@@ -1,0 +1,109 @@
+md/raid5: Drop unnecessary call to r5c_check_stripe_cache_usage()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-448.el8
+commit-author Logan Gunthorpe <logang@deltatee.com>
+commit 9734fe7bd53f85206edee58e0271dbf214c2059c
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-448.el8/9734fe7b.failed
+
+Now that raid5_get_active_stripe() has been refactored it is appearant
+that r5c_check_stripe_cache_usage() doesn't need to be called in
+the wait_for_stripe branch.
+
+r5c_check_stripe_cache_usage() will only conditionally call
+r5l_wake_reclaim(), but that function is called two lines later.
+
+Drop the call for cleanup.
+
+	Reported-by: Martin Oliveira <martin.oliveira@eideticom.com>
+	Signed-off-by: Logan Gunthorpe <logang@deltatee.com>
+	Signed-off-by: Song Liu <song@kernel.org>
+	Signed-off-by: Jens Axboe <axboe@kernel.dk>
+(cherry picked from commit 9734fe7bd53f85206edee58e0271dbf214c2059c)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/md/raid5.c
+diff --cc drivers/md/raid5.c
+index 402cdd6bb213,6a0abcb153b0..000000000000
+--- a/drivers/md/raid5.c
++++ b/drivers/md/raid5.c
+@@@ -774,41 -784,41 +774,60 @@@ raid5_get_active_stripe(struct r5conf *
+  
+  	spin_lock_irq(conf->hash_locks + hash);
+  
+ -retry:
+ -	wait_event_lock_irq(conf->wait_for_quiescent,
+ -			    conf->quiesce == 0 || noquiesce,
+ -			    *(conf->hash_locks + hash));
+ -	sh = find_get_stripe(conf, sector, conf->generation - previous, hash);
+ -	if (sh)
+ -		goto out;
+ +	do {
+ +		wait_event_lock_irq(conf->wait_for_quiescent,
+ +				    conf->quiesce == 0 || noquiesce,
+ +				    *(conf->hash_locks + hash));
+ +		sh = find_get_stripe(conf, sector, conf->generation - previous,
+ +				     hash);
+ +		if (sh)
+ +			break;
+  
+ -	if (test_bit(R5_INACTIVE_BLOCKED, &conf->cache_state))
+ -		goto wait_for_stripe;
+ +		if (!test_bit(R5_INACTIVE_BLOCKED, &conf->cache_state)) {
+ +			sh = get_free_stripe(conf, hash);
+ +			if (!sh && !test_bit(R5_DID_ALLOC, &conf->cache_state))
+ +				set_bit(R5_ALLOC_MORE, &conf->cache_state);
+ +		}
+ +		if (noblock && !sh)
+ +			break;
+  
+ -	sh = get_free_stripe(conf, hash);
+ -	if (sh) {
+  		r5c_check_stripe_cache_usage(conf);
+ -		init_stripe(sh, sector, previous);
+ -		atomic_inc(&sh->count);
+ -		goto out;
+ -	}
+ +		if (!sh) {
+ +			set_bit(R5_INACTIVE_BLOCKED, &conf->cache_state);
+ +			r5l_wake_reclaim(conf->log, 0);
+ +			wait_event_lock_irq(conf->wait_for_stripe,
+ +					!list_empty(conf->inactive_list + hash) &&
+ +					(atomic_read(&conf->active_stripes)
+ +					 < (conf->max_nr_stripes * 3 / 4)
+ +					 || !test_bit(R5_INACTIVE_BLOCKED,
+ +						      &conf->cache_state)),
+ +					*(conf->hash_locks + hash));
+ +			clear_bit(R5_INACTIVE_BLOCKED, &conf->cache_state);
+ +		} else {
+ +			init_stripe(sh, sector, previous);
+ +			atomic_inc(&sh->count);
+ +		}
+ +	} while (sh == NULL);
+  
+++<<<<<<< HEAD
+++=======
++ 	if (!test_bit(R5_DID_ALLOC, &conf->cache_state))
++ 		set_bit(R5_ALLOC_MORE, &conf->cache_state);
++ 
++ wait_for_stripe:
++ 	if (noblock)
++ 		goto out;
++ 
++ 	set_bit(R5_INACTIVE_BLOCKED, &conf->cache_state);
++ 	r5l_wake_reclaim(conf->log, 0);
++ 	wait_event_lock_irq(conf->wait_for_stripe,
++ 			    is_inactive_blocked(conf, hash),
++ 			    *(conf->hash_locks + hash));
++ 	clear_bit(R5_INACTIVE_BLOCKED, &conf->cache_state);
++ 	goto retry;
++ 
++ out:
+++>>>>>>> 9734fe7bd53f (md/raid5: Drop unnecessary call to r5c_check_stripe_cache_usage())
+  	spin_unlock_irq(conf->hash_locks + hash);
+  	return sh;
+  }
+* Unmerged path drivers/md/raid5.c
