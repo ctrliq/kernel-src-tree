@@ -138,7 +138,10 @@ struct ipmi_smi_handlers {
 	 * timeouts for just watchdog checking or faster timeouts when
 	 * waiting for the message queue.
 	 */
-	void (*set_need_watch)(void *send_info, unsigned int watch_mask);
+	RH_KABI_REPLACE(
+	void (*set_need_watch)(void *send_info, bool enable),
+	void (*set_need_watch)(void *send_info, unsigned int watch_mask)
+	)
 
 	/*
 	 * Called when flushing all pending messages.

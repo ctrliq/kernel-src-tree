@@ -456,31 +456,31 @@ static noinline int check_support(struct rvt_dev_info *rdi, int verb)
 		 * rdmavt does not support modify device currently drivers must
 		 * provide.
 		 */
-		if (!rdi->ibdev.modify_device)
+		if (!rdi->ibdev.ops.modify_device)
 			return -EOPNOTSUPP;
 		break;
 
 	case QUERY_PORT:
-		if (!rdi->ibdev.query_port)
+		if (!rdi->ibdev.ops.query_port)
 			if (!rdi->driver_f.query_port_state)
 				return -EINVAL;
 		break;
 
 	case MODIFY_PORT:
-		if (!rdi->ibdev.modify_port)
+		if (!rdi->ibdev.ops.modify_port)
 			if (!rdi->driver_f.cap_mask_chg ||
 			    !rdi->driver_f.shut_down_port)
 				return -EINVAL;
 		break;
 
 	case QUERY_GID:
-		if (!rdi->ibdev.query_gid)
+		if (!rdi->ibdev.ops.query_gid)
 			if (!rdi->driver_f.get_guid_be)
 				return -EINVAL;
 		break;
 
 	case CREATE_QP:
-		if (!rdi->ibdev.create_qp)
+		if (!rdi->ibdev.ops.create_qp)
 			if (!rdi->driver_f.qp_priv_alloc ||
 			    !rdi->driver_f.qp_priv_free ||
 			    !rdi->driver_f.notify_qp_reset ||
@@ -491,7 +491,7 @@ static noinline int check_support(struct rvt_dev_info *rdi, int verb)
 		break;
 
 	case MODIFY_QP:
-		if (!rdi->ibdev.modify_qp)
+		if (!rdi->ibdev.ops.modify_qp)
 			if (!rdi->driver_f.notify_qp_reset ||
 			    !rdi->driver_f.schedule_send ||
 			    !rdi->driver_f.get_pmtu_from_attr ||
@@ -505,7 +505,7 @@ static noinline int check_support(struct rvt_dev_info *rdi, int verb)
 		break;
 
 	case DESTROY_QP:
-		if (!rdi->ibdev.destroy_qp)
+		if (!rdi->ibdev.ops.destroy_qp)
 			if (!rdi->driver_f.qp_priv_free ||
 			    !rdi->driver_f.notify_qp_reset ||
 			    !rdi->driver_f.flush_qp_waiters ||
@@ -515,7 +515,7 @@ static noinline int check_support(struct rvt_dev_info *rdi, int verb)
 		break;
 
 	case POST_SEND:
-		if (!rdi->ibdev.post_send)
+		if (!rdi->ibdev.ops.post_send)
 			if (!rdi->driver_f.schedule_send ||
 			    !rdi->driver_f.do_send ||
 			    !rdi->post_parms)
@@ -583,6 +583,13 @@ int rvt_register_device(struct rvt_dev_info *rdi, u32 driver_id)
 		goto bail_no_mr;
 	}
 
+	/* Memory Working Set Size */
+	ret = rvt_wss_init(rdi);
+	if (ret) {
+		rvt_pr_err(rdi, "Error in WSS init.\n");
+		goto bail_mr;
+	}
+
 	/* Completion queues */
 	spin_lock_init(&rdi->n_cqs_lock);
 
@@ -637,10 +644,11 @@ int rvt_register_device(struct rvt_dev_info *rdi, u32 driver_id)
 
 	rdi->ibdev.driver_id = driver_id;
 	/* We are now good to announce we exist */
-	ret =  ib_register_device(&rdi->ibdev, rdi->driver_f.port_callback);
+	ret = ib_register_device(&rdi->ibdev, dev_name(&rdi->ibdev.dev),
+				 rdi->driver_f.port_callback);
 	if (ret) {
 		rvt_pr_err(rdi, "Failed to register driver with ib core.\n");
-		goto bail_mr;
+		goto bail_wss;
 	}
 
 	rvt_create_mad_agents(rdi);
@@ -648,6 +656,8 @@ int rvt_register_device(struct rvt_dev_info *rdi, u32 driver_id)
 	rvt_pr_info(rdi, "Registration with rdmavt done.\n");
 	return ret;
 
+bail_wss:
+	rvt_wss_exit(rdi);
 bail_mr:
 	rvt_mr_exit(rdi);
 
@@ -671,6 +681,7 @@ void rvt_unregister_device(struct rvt_dev_info *rdi)
 	rvt_free_mad_agents(rdi);
 
 	ib_unregister_device(&rdi->ibdev);
+	rvt_wss_exit(rdi);
 	rvt_mr_exit(rdi);
 	rvt_qp_exit(rdi);
 }

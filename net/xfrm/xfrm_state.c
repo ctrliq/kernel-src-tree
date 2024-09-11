@@ -1576,11 +1576,13 @@ out:
 		if (x1->curlft.use_time)
 			xfrm_state_check_expire(x1);
 
-		if (x->props.smark.m || x->props.smark.v || x->if_id) {
+		if (x->output_mark_mask || x->props.output_mark || x->if_id) {
 			spin_lock_bh(&net->xfrm.xfrm_state_lock);
 
-			if (x->props.smark.m || x->props.smark.v)
-				x1->props.smark = x->props.smark;
+			if (x->output_mark_mask || x->props.output_mark) {
+				x1->props.output_mark = x->props.output_mark;
+				x1->output_mark_mask = x->output_mark_mask;
+			}
 
 			if (x->if_id)
 				x1->if_id = x->if_id;

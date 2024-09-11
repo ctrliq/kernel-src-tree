@@ -503,14 +503,14 @@ void __ip_select_ident(struct net *net, struct iphdr *iph, int segs)
 	u32 hash, id;
 
 	/* Note the following code is not safe, but this is okay. */
-	if (unlikely(siphash_key_is_zero(&net->ipv4.ip_id_key)))
-		get_random_bytes(&net->ipv4.ip_id_key,
-				 sizeof(net->ipv4.ip_id_key));
+	if (unlikely(siphash_key_is_zero(&net->ipv4_ip_id_key)))
+		get_random_bytes(&net->ipv4_ip_id_key,
+				 sizeof(net->ipv4_ip_id_key));
 
 	hash = siphash_3u32((__force u32)iph->daddr,
 			    (__force u32)iph->saddr,
 			    iph->protocol,
-			    &net->ipv4.ip_id_key);
+			    &net->ipv4_ip_id_key);
 	id = ip_idents_reserve(hash, segs);
 	iph->id = htons(id);
 }
@@ -1932,7 +1932,7 @@ static int ip_route_input_slow(struct sk_buff *skb, __be32 daddr, __be32 saddr,
 	u32		itag = 0;
 	struct rtable	*rth;
 	struct flowi4	fl4;
-	bool do_cache;
+	bool do_cache = true;
 
 	/* IP on this device is disabled. */
 
@@ -2006,8 +2006,14 @@ static int ip_route_input_slow(struct sk_buff *skb, __be32 daddr, __be32 saddr,
 		goto no_route;
 	}
 
-	if (res->type == RTN_BROADCAST)
+	if (res->type == RTN_BROADCAST) {
+		if (IN_DEV_BFORWARD(in_dev))
+			goto make_route;
+		/* not do cache if bc_forwarding is enabled */
+		if (IPV4_DEVCONF_ALL(net, BC_FORWARDING))
+			do_cache = false;
 		goto brd_input;
+	}
 
 	if (res->type == RTN_LOCAL) {
 		err = fib_validate_source(skb, saddr, daddr, tos,
@@ -2024,6 +2030,7 @@ static int ip_route_input_slow(struct sk_buff *skb, __be32 daddr, __be32 saddr,
 	if (res->type != RTN_UNICAST)
 		goto martian_destination;
 
+make_route:
 	err = ip_mkroute_input(skb, res, in_dev, daddr, saddr, tos, flkeys);
 out:	return err;
 
@@ -2042,16 +2049,13 @@ brd_input:
 	RT_CACHE_STAT_INC(in_brd);
 
 local_input:
-	do_cache = false;
-	if (res->fi) {
-		if (!itag) {
-			rth = rcu_dereference(FIB_RES_NH(*res).nh_rth_input);
-			if (rt_cache_valid(rth)) {
-				skb_dst_set_noref(skb, &rth->dst);
-				err = 0;
-				goto out;
-			}
-			do_cache = true;
+	do_cache &= res->fi && !itag;
+	if (do_cache) {
+		rth = rcu_dereference(FIB_RES_NH(*res).nh_rth_input);
+		if (rt_cache_valid(rth)) {
+			skb_dst_set_noref(skb, &rth->dst);
+			err = 0;
+			goto out;
 		}
 	}
 
@@ -2776,16 +2780,16 @@ int fib_dump_info_fnhe(struct sk_buff *skb, struct netlink_callback *cb,
 	struct net *net = sock_net(cb->skb->sk);
 	int nhsel, genid = fnhe_genid(net);
 
-	for (nhsel = 0; nhsel < fib_info_num_path(fi); nhsel++) {
-		struct fib_nh_common *nhc = fib_info_nhc(fi, nhsel);
+	for (nhsel = 0; nhsel < fi->fib_nhs; nhsel++) {
+		struct fib_nh *nh = &fi->fib_nh[nhsel];
 		struct fnhe_hash_bucket *bucket;
 		int err;
 
-		if (nhc->nhc_flags & RTNH_F_DEAD)
+		if (nh->nh_flags & RTNH_F_DEAD)
 			continue;
 
 		rcu_read_lock();
-		bucket = rcu_dereference(nhc->nhc_exceptions);
+		bucket = rcu_dereference(nh->nh_exceptions);
 		err = 0;
 		if (bucket)
 			err = fnhe_dump_bucket(net, skb, cb, table_id, bucket,

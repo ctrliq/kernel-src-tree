@@ -132,7 +132,7 @@ MODULE_PARM_DESC(dev_loss_tmo,
 		 " if fast_io_fail_tmo has not been set. \"off\" means that"
 		 " this functionality is disabled.");
 
-static bool srp_use_imm_data = true;
+static bool srp_use_imm_data = false;
 module_param_named(use_imm_data, srp_use_imm_data, bool, 0644);
 MODULE_PARM_DESC(use_imm_data,
 		 "Whether or not to request permission to use immediate data during SRP login.");
@@ -151,7 +151,8 @@ static void srp_remove_one(struct ib_device *device, void *client_data);
 static void srp_recv_done(struct ib_cq *cq, struct ib_wc *wc);
 static void srp_handle_qp_err(struct ib_cq *cq, struct ib_wc *wc,
 		const char *opname);
-static int srp_ib_cm_handler(struct ib_cm_id *cm_id, struct ib_cm_event *event);
+static int srp_ib_cm_handler(struct ib_cm_id *cm_id,
+			     const struct ib_cm_event *event);
 static int srp_rdma_cm_handler(struct rdma_cm_id *cm_id,
 			       struct rdma_cm_event *event);
 
@@ -2632,7 +2633,7 @@ error:
 }
 
 static void srp_ib_cm_rej_handler(struct ib_cm_id *cm_id,
-				  struct ib_cm_event *event,
+				  const struct ib_cm_event *event,
 				  struct srp_rdma_ch *ch)
 {
 	struct srp_target_port *target = ch->target;
@@ -2717,7 +2718,8 @@ static void srp_ib_cm_rej_handler(struct ib_cm_id *cm_id,
 	}
 }
 
-static int srp_ib_cm_handler(struct ib_cm_id *cm_id, struct ib_cm_event *event)
+static int srp_ib_cm_handler(struct ib_cm_id *cm_id,
+			     const struct ib_cm_event *event)
 {
 	struct srp_rdma_ch *ch = cm_id->context;
 	struct srp_target_port *target = ch->target;
@@ -3912,7 +3914,7 @@ static ssize_t srp_create_target(struct device *dev,
 	INIT_WORK(&target->tl_err_work, srp_tl_err_work);
 	INIT_WORK(&target->remove_work, srp_remove_work);
 	spin_lock_init(&target->lock);
-	ret = ib_query_gid(ibdev, host->port, 0, &target->sgid, NULL);
+	ret = rdma_query_gid(ibdev, host->port, 0, &target->sgid);
 	if (ret)
 		goto out;
 
@@ -4143,8 +4145,10 @@ static void srp_add_one(struct ib_device *device)
 	srp_dev->max_pages_per_mr = min_t(u64, SRP_MAX_PAGES_PER_MR,
 					  max_pages_per_mr);
 
-	srp_dev->has_fmr = (device->alloc_fmr && device->dealloc_fmr &&
-			    device->map_phys_fmr && device->unmap_fmr);
+	srp_dev->has_fmr = (device->ops.alloc_fmr &&
+			    device->ops.dealloc_fmr &&
+			    device->ops.map_phys_fmr &&
+			    device->ops.unmap_fmr);
 	srp_dev->has_fr = (attr->device_cap_flags &
 			   IB_DEVICE_MEM_MGT_EXTENSIONS);
 	if (!never_register && !srp_dev->has_fmr && !srp_dev->has_fr) {

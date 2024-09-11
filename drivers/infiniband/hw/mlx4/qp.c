@@ -323,7 +323,7 @@ static int send_wqe_overhead(enum mlx4_ib_qp_type type, u32 flags)
 }
 
 static int set_rq_size(struct mlx4_ib_dev *dev, struct ib_qp_cap *cap,
-		       int is_user, int has_rq, struct mlx4_ib_qp *qp,
+		       bool is_user, int has_rq, struct mlx4_ib_qp *qp,
 		       u32 inl_recv_sz)
 {
 	/* Sanity check RQ size before proceeding */
@@ -942,7 +942,7 @@ static int create_qp_common(struct mlx4_ib_dev *dev, struct ib_pd *pd,
 		qp->sq_signal_bits = cpu_to_be32(MLX4_WQE_CTRL_CQ_UPDATE);
 
 
-	if (pd->uobject) {
+	if (udata) {
 		union {
 			struct mlx4_ib_create_qp qp;
 			struct mlx4_ib_create_wq wq;
@@ -991,7 +991,7 @@ static int create_qp_common(struct mlx4_ib_dev *dev, struct ib_pd *pd,
 			qp->flags |= MLX4_IB_QP_SCATTER_FCS;
 		}
 
-		err = set_rq_size(dev, &init_attr->cap, !!pd->uobject,
+		err = set_rq_size(dev, &init_attr->cap, udata,
 				  qp_has_rq(init_attr), qp, qp->inl_recv_sz);
 		if (err)
 			goto err;
@@ -1043,7 +1043,7 @@ static int create_qp_common(struct mlx4_ib_dev *dev, struct ib_pd *pd,
 		}
 		qp->mqp.usage = MLX4_RES_USAGE_USER_VERBS;
 	} else {
-		err = set_rq_size(dev, &init_attr->cap, !!pd->uobject,
+		err = set_rq_size(dev, &init_attr->cap, udata,
 				  qp_has_rq(init_attr), qp, 0);
 		if (err)
 			goto err;
@@ -1189,7 +1189,7 @@ err_proxy:
 	if (qp->mlx4_ib_qp_type == MLX4_IB_QPT_PROXY_GSI)
 		free_proxy_bufs(pd->device, qp);
 err_wrid:
-	if (pd->uobject) {
+	if (udata) {
 		if (qp_has_rq(init_attr))
 			mlx4_ib_db_unmap_user(to_mucontext(pd->uobject->context), &qp->db);
 	} else {
@@ -1201,13 +1201,13 @@ err_mtt:
 	mlx4_mtt_cleanup(dev->dev, &qp->mtt);
 
 err_buf:
-	if (pd->uobject)
+	if (qp->umem)
 		ib_umem_release(qp->umem);
 	else
 		mlx4_buf_free(dev->dev, qp->buf_size, &qp->buf);
 
 err_db:
-	if (!pd->uobject && qp_has_rq(init_attr))
+	if (!udata && qp_has_rq(init_attr))
 		mlx4_db_free(dev->dev, &qp->db);
 
 err:
@@ -1332,7 +1332,7 @@ static void destroy_qp_rss(struct mlx4_ib_dev *dev, struct mlx4_ib_qp *qp)
 }
 
 static void destroy_qp_common(struct mlx4_ib_dev *dev, struct mlx4_ib_qp *qp,
-			      enum mlx4_ib_source_type src, int is_user)
+			      enum mlx4_ib_source_type src, bool is_user)
 {
 	struct mlx4_ib_cq *send_cq, *recv_cq;
 	unsigned long flags;
@@ -1609,10 +1609,7 @@ static int _mlx4_ib_destroy_qp(struct ib_qp *qp)
 	if (qp->rwq_ind_tbl) {
 		destroy_qp_rss(dev, mqp);
 	} else {
-		struct mlx4_ib_pd *pd;
-
-		pd = get_pd(mqp);
-		destroy_qp_common(dev, mqp, MLX4_IB_QP_SRC, !!pd->ibpd.uobject);
+		destroy_qp_common(dev, mqp, MLX4_IB_QP_SRC, qp->uobject);
 	}
 
 	if (is_sqp(dev, mqp))
@@ -3432,8 +3429,8 @@ static void add_zero_len_inline(void *wqe)
 	inl->byte_count = cpu_to_be32(1 << 31);
 }
 
-static int _mlx4_ib_post_send(struct ib_qp *ibqp, struct ib_send_wr *wr,
-			      struct ib_send_wr **bad_wr, bool drain)
+static int _mlx4_ib_post_send(struct ib_qp *ibqp, const struct ib_send_wr *wr,
+			      const struct ib_send_wr **bad_wr, bool drain)
 {
 	struct mlx4_ib_qp *qp = to_mqp(ibqp);
 	void *wqe;
@@ -3754,14 +3751,14 @@ out:
 	return err;
 }
 
-int mlx4_ib_post_send(struct ib_qp *ibqp, struct ib_send_wr *wr,
-		      struct ib_send_wr **bad_wr)
+int mlx4_ib_post_send(struct ib_qp *ibqp, const struct ib_send_wr *wr,
+		      const struct ib_send_wr **bad_wr)
 {
 	return _mlx4_ib_post_send(ibqp, wr, bad_wr, false);
 }
 
-static int _mlx4_ib_post_recv(struct ib_qp *ibqp, struct ib_recv_wr *wr,
-			      struct ib_recv_wr **bad_wr, bool drain)
+static int _mlx4_ib_post_recv(struct ib_qp *ibqp, const struct ib_recv_wr *wr,
+			      const struct ib_recv_wr **bad_wr, bool drain)
 {
 	struct mlx4_ib_qp *qp = to_mqp(ibqp);
 	struct mlx4_wqe_data_seg *scat;
@@ -3848,8 +3845,8 @@ out:
 	return err;
 }
 
-int mlx4_ib_post_recv(struct ib_qp *ibqp, struct ib_recv_wr *wr,
-		      struct ib_recv_wr **bad_wr)
+int mlx4_ib_post_recv(struct ib_qp *ibqp, const struct ib_recv_wr *wr,
+		      const struct ib_recv_wr **bad_wr)
 {
 	return _mlx4_ib_post_recv(ibqp, wr, bad_wr, false);
 }
@@ -4044,7 +4041,7 @@ struct ib_wq *mlx4_ib_create_wq(struct ib_pd *pd,
 	struct mlx4_ib_create_wq ucmd;
 	int err, required_cmd_sz;
 
-	if (!(udata && pd->uobject))
+	if (!udata)
 		return ERR_PTR(-EINVAL);
 
 	required_cmd_sz = offsetof(typeof(ucmd), comp_mask) +
@@ -4389,7 +4386,7 @@ void mlx4_ib_drain_sq(struct ib_qp *qp)
 	struct ib_cq *cq = qp->send_cq;
 	struct ib_qp_attr attr = { .qp_state = IB_QPS_ERR };
 	struct mlx4_ib_drain_cqe sdrain;
-	struct ib_send_wr *bad_swr;
+	const struct ib_send_wr *bad_swr;
 	struct ib_rdma_wr swr = {
 		.wr = {
 			.next = NULL,
@@ -4424,7 +4421,8 @@ void mlx4_ib_drain_rq(struct ib_qp *qp)
 	struct ib_cq *cq = qp->recv_cq;
 	struct ib_qp_attr attr = { .qp_state = IB_QPS_ERR };
 	struct mlx4_ib_drain_cqe rdrain;
-	struct ib_recv_wr rwr = {}, *bad_rwr;
+	struct ib_recv_wr rwr = {};
+	const struct ib_recv_wr *bad_rwr;
 	int ret;
 	struct mlx4_ib_dev *dev = to_mdev(qp->device);
 	struct mlx4_dev *mdev = dev->dev;

@@ -2225,13 +2225,11 @@ static int e100_poll(struct napi_struct *napi, int budget)
 	e100_rx_clean(nic, &work_done, budget);
 	e100_tx_clean(nic);
 
-	/* If budget fully consumed, continue polling */
-	if (work_done == budget)
-		return budget;
-
-	/* only re-enable interrupt if stack agrees polling is really done */
-	if (likely(napi_complete_done(napi, work_done)))
+	/* If budget not fully consumed, exit the polling mode */
+	if (work_done < budget) {
+		napi_complete_done(napi, work_done);
 		e100_enable_irq(nic);
+	}
 
 	return work_done;
 }
@@ -2797,7 +2795,7 @@ static int e100_set_features(struct net_device *netdev,
 
 	netdev->features = features;
 	e100_exec_cb(nic, NULL, e100_configure);
-	return 1;
+	return 0;
 }
 
 static const struct net_device_ops e100_netdev_ops = {

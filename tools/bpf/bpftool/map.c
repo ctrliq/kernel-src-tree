@@ -4,6 +4,7 @@
 #include <assert.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <linux/err.h>
 #include <linux/kernel.h>
 #include <net/if.h>
 #include <stdbool.h>
@@ -16,9 +17,11 @@
 
 #include <bpf.h>
 
+#include "btf.h"
+#include "json_writer.h"
 #include "main.h"
 
-static const char * const map_type_name[] = {
+const char * const map_type_name[] = {
 	[BPF_MAP_TYPE_UNSPEC]			= "unspec",
 	[BPF_MAP_TYPE_HASH]			= "hash",
 	[BPF_MAP_TYPE_ARRAY]			= "array",
@@ -44,6 +47,8 @@ static const char * const map_type_name[] = {
 	[BPF_MAP_TYPE_QUEUE]			= "queue",
 	[BPF_MAP_TYPE_STACK]			= "stack",
 };
+
+const size_t map_type_name_size = ARRAY_SIZE(map_type_name);
 
 static bool map_is_per_cpu(__u32 type)
 {
@@ -139,8 +144,64 @@ int map_parse_fd_and_info(int *argc, char ***argv, void *info, __u32 *info_len)
 	return fd;
 }
 
+static int do_dump_btf(const struct btf_dumper *d,
+		       struct bpf_map_info *map_info, void *key,
+		       void *value)
+{
+	int ret;
+
+	/* start of key-value pair */
+	jsonw_start_object(d->jw);
+
+	jsonw_name(d->jw, "key");
+
+	ret = btf_dumper_type(d, map_info->btf_key_type_id, key);
+	if (ret)
+		goto err_end_obj;
+
+	if (!map_is_per_cpu(map_info->type)) {
+		jsonw_name(d->jw, "value");
+		ret = btf_dumper_type(d, map_info->btf_value_type_id, value);
+	} else {
+		unsigned int i, n, step;
+
+		jsonw_name(d->jw, "values");
+		jsonw_start_array(d->jw);
+		n = get_possible_cpus();
+		step = round_up(map_info->value_size, 8);
+		for (i = 0; i < n; i++) {
+			jsonw_start_object(d->jw);
+			jsonw_int_field(d->jw, "cpu", i);
+			jsonw_name(d->jw, "value");
+			ret = btf_dumper_type(d, map_info->btf_value_type_id,
+					      value + i * step);
+			jsonw_end_object(d->jw);
+			if (ret)
+				break;
+		}
+		jsonw_end_array(d->jw);
+	}
+
+err_end_obj:
+	/* end of key-value pair */
+	jsonw_end_object(d->jw);
+
+	return ret;
+}
+
+static json_writer_t *get_btf_writer(void)
+{
+	json_writer_t *jw = jsonw_new(stdout);
+
+	if (!jw)
+		return NULL;
+	jsonw_pretty(jw, true);
+
+	return jw;
+}
+
 static void print_entry_json(struct bpf_map_info *info, unsigned char *key,
-			     unsigned char *value)
+			     unsigned char *value, struct btf *btf)
 {
 	jsonw_start_object(json_wtr);
 
@@ -149,6 +210,16 @@ static void print_entry_json(struct bpf_map_info *info, unsigned char *key,
 		print_hex_data_json(key, info->key_size);
 		jsonw_name(json_wtr, "value");
 		print_hex_data_json(value, info->value_size);
+		if (btf) {
+			struct btf_dumper d = {
+				.btf = btf,
+				.jw = json_wtr,
+				.is_plain_text = false,
+			};
+
+			jsonw_name(json_wtr, "formatted");
+			do_dump_btf(&d, info, key, value);
+		}
 	} else {
 		unsigned int i, n, step;
 
@@ -172,9 +243,38 @@ static void print_entry_json(struct bpf_map_info *info, unsigned char *key,
 			jsonw_end_object(json_wtr);
 		}
 		jsonw_end_array(json_wtr);
+		if (btf) {
+			struct btf_dumper d = {
+				.btf = btf,
+				.jw = json_wtr,
+				.is_plain_text = false,
+			};
+
+			jsonw_name(json_wtr, "formatted");
+			do_dump_btf(&d, info, key, value);
+		}
 	}
 
 	jsonw_end_object(json_wtr);
+}
+
+static void print_entry_error(struct bpf_map_info *info, unsigned char *key,
+			      const char *value)
+{
+	int value_size = strlen(value);
+	bool single_line, break_names;
+
+	break_names = info->key_size > 16 || value_size > 16;
+	single_line = info->key_size + value_size <= 24 && !break_names;
+
+	printf("key:%c", break_names ? '\n' : ' ');
+	fprint_hex(stdout, key, info->key_size, " ");
+
+	printf(single_line ? "  " : "\n");
+
+	printf("value:%c%s", break_names ? '\n' : ' ', value);
+
+	printf("\n");
 }
 
 static void print_entry_plain(struct bpf_map_info *info, unsigned char *key,
@@ -193,7 +293,10 @@ static void print_entry_plain(struct bpf_map_info *info, unsigned char *key,
 		printf(single_line ? "  " : "\n");
 
 		printf("value:%c", break_names ? '\n' : ' ');
-		fprint_hex(stdout, value, info->value_size, " ");
+		if (value)
+			fprint_hex(stdout, value, info->value_size, " ");
+		else
+			printf("<no entry>");
 
 		printf("\n");
 	} else {
@@ -208,8 +311,11 @@ static void print_entry_plain(struct bpf_map_info *info, unsigned char *key,
 		for (i = 0; i < n; i++) {
 			printf("value (CPU %02d):%c",
 			       i, info->value_size > 16 ? '\n' : ' ');
-			fprint_hex(stdout, value + i * step,
-				   info->value_size, " ");
+			if (value)
+				fprint_hex(stdout, value + i * step,
+					   info->value_size, " ");
+			else
+				printf("<no entry>");
 			printf("\n");
 		}
 	}
@@ -560,12 +666,66 @@ static int do_show(int argc, char **argv)
 	return errno == ENOENT ? 0 : -1;
 }
 
+static int dump_map_elem(int fd, void *key, void *value,
+			 struct bpf_map_info *map_info, struct btf *btf,
+			 json_writer_t *btf_wtr)
+{
+	int num_elems = 0;
+	int lookup_errno;
+
+	if (!bpf_map_lookup_elem(fd, key, value)) {
+		if (json_output) {
+			print_entry_json(map_info, key, value, btf);
+		} else {
+			if (btf) {
+				struct btf_dumper d = {
+					.btf = btf,
+					.jw = btf_wtr,
+					.is_plain_text = true,
+				};
+
+				do_dump_btf(&d, map_info, key, value);
+			} else {
+				print_entry_plain(map_info, key, value);
+			}
+			num_elems++;
+		}
+		return num_elems;
+	}
+
+	/* lookup error handling */
+	lookup_errno = errno;
+
+	if (map_is_map_of_maps(map_info->type) ||
+	    map_is_map_of_progs(map_info->type))
+		return 0;
+
+	if (json_output) {
+		jsonw_name(json_wtr, "key");
+		print_hex_data_json(key, map_info->key_size);
+		jsonw_name(json_wtr, "value");
+		jsonw_start_object(json_wtr);
+		jsonw_string_field(json_wtr, "error", strerror(lookup_errno));
+		jsonw_end_object(json_wtr);
+	} else {
+		if (errno == ENOENT)
+			print_entry_plain(map_info, key, NULL);
+		else
+			print_entry_error(map_info, key,
+					  strerror(lookup_errno));
+	}
+
+	return 0;
+}
+
 static int do_dump(int argc, char **argv)
 {
+	struct bpf_map_info info = {};
 	void *key, *value, *prev_key;
 	unsigned int num_elems = 0;
-	struct bpf_map_info info = {};
 	__u32 len = sizeof(info);
+	json_writer_t *btf_wtr;
+	struct btf *btf = NULL;
 	int err;
 	int fd;
 
@@ -576,12 +736,6 @@ static int do_dump(int argc, char **argv)
 	if (fd < 0)
 		return -1;
 
-	if (map_is_map_of_maps(info.type) || map_is_map_of_progs(info.type)) {
-		p_err("Dumping maps of maps and program maps not supported");
-		close(fd);
-		return -1;
-	}
-
 	key = malloc(info.key_size);
 	value = alloc_value(&info);
 	if (!key || !value) {
@@ -591,8 +745,27 @@ static int do_dump(int argc, char **argv)
 	}
 
 	prev_key = NULL;
+
+	err = btf__get_from_id(info.btf_id, &btf);
+	if (err) {
+		p_err("failed to get btf");
+		goto exit_free;
+	}
+
 	if (json_output)
 		jsonw_start_array(json_wtr);
+	else
+		if (btf) {
+			btf_wtr = get_btf_writer();
+			if (!btf_wtr) {
+				p_info("failed to create json writer for btf. falling back to plain output");
+				btf__free(btf);
+				btf = NULL;
+			} else {
+				jsonw_start_array(btf_wtr);
+			}
+		}
+
 	while (true) {
 		err = bpf_map_get_next_key(fd, prev_key, key);
 		if (err) {
@@ -600,42 +773,25 @@ static int do_dump(int argc, char **argv)
 				err = 0;
 			break;
 		}
-
-		if (!bpf_map_lookup_elem(fd, key, value)) {
-			if (json_output)
-				print_entry_json(&info, key, value);
-			else
-				print_entry_plain(&info, key, value);
-		} else {
-			if (json_output) {
-				jsonw_name(json_wtr, "key");
-				print_hex_data_json(key, info.key_size);
-				jsonw_name(json_wtr, "value");
-				jsonw_start_object(json_wtr);
-				jsonw_string_field(json_wtr, "error",
-						   "can't lookup element");
-				jsonw_end_object(json_wtr);
-			} else {
-				p_info("can't lookup element with key: ");
-				fprint_hex(stderr, key, info.key_size, " ");
-				fprintf(stderr, "\n");
-			}
-		}
-
+		num_elems += dump_map_elem(fd, key, value, &info, btf, btf_wtr);
 		prev_key = key;
-		num_elems++;
 	}
 
 	if (json_output)
 		jsonw_end_array(json_wtr);
-	else
+	else if (btf) {
+		jsonw_end_array(btf_wtr);
+		jsonw_destroy(&btf_wtr);
+	} else {
 		printf("Found %u element%s\n", num_elems,
 		       num_elems != 1 ? "s" : "");
+	}
 
 exit_free:
 	free(key);
 	free(value);
 	close(fd);
+	btf__free(btf);
 
 	return err;
 }
@@ -691,6 +847,8 @@ static int do_lookup(int argc, char **argv)
 {
 	struct bpf_map_info info = {};
 	__u32 len = sizeof(info);
+	json_writer_t *btf_wtr;
+	struct btf *btf = NULL;
 	void *key, *value;
 	int err;
 	int fd;
@@ -715,27 +873,60 @@ static int do_lookup(int argc, char **argv)
 		goto exit_free;
 
 	err = bpf_map_lookup_elem(fd, key, value);
-	if (!err) {
-		if (json_output)
-			print_entry_json(&info, key, value);
-		else
-			print_entry_plain(&info, key, value);
-	} else if (errno == ENOENT) {
-		if (json_output) {
-			jsonw_null(json_wtr);
+	if (err) {
+		if (errno == ENOENT) {
+			if (json_output) {
+				jsonw_null(json_wtr);
+			} else {
+				printf("key:\n");
+				fprint_hex(stdout, key, info.key_size, " ");
+				printf("\n\nNot found\n");
+			}
 		} else {
-			printf("key:\n");
-			fprint_hex(stdout, key, info.key_size, " ");
-			printf("\n\nNot found\n");
+			p_err("lookup failed: %s", strerror(errno));
+		}
+
+		goto exit_free;
+	}
+
+	/* here means bpf_map_lookup_elem() succeeded */
+	err = btf__get_from_id(info.btf_id, &btf);
+	if (err) {
+		p_err("failed to get btf");
+		goto exit_free;
+	}
+
+	if (json_output) {
+		print_entry_json(&info, key, value, btf);
+	} else if (btf) {
+		/* if here json_wtr wouldn't have been initialised,
+		 * so let's create separate writer for btf
+		 */
+		btf_wtr = get_btf_writer();
+		if (!btf_wtr) {
+			p_info("failed to create json writer for btf. falling back to plain output");
+			btf__free(btf);
+			btf = NULL;
+			print_entry_plain(&info, key, value);
+		} else {
+			struct btf_dumper d = {
+				.btf = btf,
+				.jw = btf_wtr,
+				.is_plain_text = true,
+			};
+
+			do_dump_btf(&d, &info, key, value);
+			jsonw_destroy(&btf_wtr);
 		}
 	} else {
-		p_err("lookup failed: %s", strerror(errno));
+		print_entry_plain(&info, key, value);
 	}
 
 exit_free:
 	free(key);
 	free(value);
 	close(fd);
+	btf__free(btf);
 
 	return err;
 }

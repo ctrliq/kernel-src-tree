@@ -10307,9 +10307,6 @@ _scsih_determine_hba_mpi_version(struct pci_dev *pdev)
 	return 0;
 }
 
-static const struct pci_device_id mpt3sas_pci_table[];
-static const struct pci_device_id mpt3sas_pci_ids_removed[];
-
 /**
  * _scsih_probe - attach and add scsi host
  * @pdev: PCI device struct
@@ -10324,10 +10321,6 @@ _scsih_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 	struct Scsi_Host *shost = NULL;
 	int rv;
 	u16 hba_mpi_version;
-
-	if (pci_device_support_removed(mpt3sas_pci_table,
-				mpt3sas_pci_ids_removed, pdev))
-		return -ENODEV;
 
 	/* Determine in which MPI version class this pci device belongs */
 	hba_mpi_version = _scsih_determine_hba_mpi_version(pdev);
@@ -10406,7 +10399,6 @@ _scsih_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 		case MPI26_MFGPAGE_DEVID_HARD_SEC_3816:
 		case MPI26_MFGPAGE_DEVID_HARD_SEC_3916:
 			ioc->is_aero_ioc = ioc->is_gen35_ioc = 1;
-			mark_tech_preview("LSI MPT Fusion SAS 3.0 Device Driver", THIS_MODULE);
 			break;
 		default:
 			ioc->is_gen35_ioc = ioc->is_aero_ioc = 0;
@@ -10771,24 +10763,6 @@ bool scsih_ncq_prio_supp(struct scsi_device *sdev)
  * The pci device ids are defined in mpi/mpi2_cnfg.h.
  */
 static const struct pci_device_id mpt3sas_pci_table[] = {
-	/* Spitfire ~ 2004 */
-	{ MPI2_MFGPAGE_VENDORID_LSI, MPI2_MFGPAGE_DEVID_SAS2004,
-		PCI_ANY_ID, PCI_ANY_ID },
-	/* Falcon ~ 2008 */
-	{ MPI2_MFGPAGE_VENDORID_LSI, MPI2_MFGPAGE_DEVID_SAS2008,
-		PCI_ANY_ID, PCI_ANY_ID },
-	/* Liberator ~ 2108 */
-	{ MPI2_MFGPAGE_VENDORID_LSI, MPI2_MFGPAGE_DEVID_SAS2108_1,
-		PCI_ANY_ID, PCI_ANY_ID },
-	{ MPI2_MFGPAGE_VENDORID_LSI, MPI2_MFGPAGE_DEVID_SAS2108_2,
-		PCI_ANY_ID, PCI_ANY_ID },
-	{ MPI2_MFGPAGE_VENDORID_LSI, MPI2_MFGPAGE_DEVID_SAS2108_3,
-		PCI_ANY_ID, PCI_ANY_ID },
-	/* Meteor ~ 2116 */
-	{ MPI2_MFGPAGE_VENDORID_LSI, MPI2_MFGPAGE_DEVID_SAS2116_1,
-		PCI_ANY_ID, PCI_ANY_ID },
-	{ MPI2_MFGPAGE_VENDORID_LSI, MPI2_MFGPAGE_DEVID_SAS2116_2,
-		PCI_ANY_ID, PCI_ANY_ID },
 	/* Thunderbolt ~ 2208 */
 	{ MPI2_MFGPAGE_VENDORID_LSI, MPI2_MFGPAGE_DEVID_SAS2208_1,
 		PCI_ANY_ID, PCI_ANY_ID },
@@ -10812,9 +10786,6 @@ static const struct pci_device_id mpt3sas_pci_table[] = {
 	{ MPI2_MFGPAGE_VENDORID_LSI, MPI2_MFGPAGE_DEVID_SWITCH_MPI_EP,
 		PCI_ANY_ID, PCI_ANY_ID },
 	{ MPI2_MFGPAGE_VENDORID_LSI, MPI2_MFGPAGE_DEVID_SWITCH_MPI_EP_1,
-		PCI_ANY_ID, PCI_ANY_ID },
-	/* SSS6200 */
-	{ MPI2_MFGPAGE_VENDORID_LSI, MPI2_MFGPAGE_DEVID_SSS6200,
 		PCI_ANY_ID, PCI_ANY_ID },
 	/* Fury ~ 3004 and 3008 */
 	{ MPI2_MFGPAGE_VENDORID_LSI, MPI25_MFGPAGE_DEVID_SAS3004,
@@ -10892,31 +10863,6 @@ static const struct pci_device_id mpt3sas_pci_table[] = {
 	{0}     /* Terminating entry */
 };
 MODULE_DEVICE_TABLE(pci, mpt3sas_pci_table);
-
-static const struct pci_device_id mpt3sas_pci_ids_removed[] = {
-	/* Spitfire ~ 2004 */
-	{ MPI2_MFGPAGE_VENDORID_LSI, MPI2_MFGPAGE_DEVID_SAS2004,
-		PCI_ANY_ID, PCI_ANY_ID },
-	/* Falcon ~ 2008 */
-	{ MPI2_MFGPAGE_VENDORID_LSI, MPI2_MFGPAGE_DEVID_SAS2008,
-		PCI_ANY_ID, PCI_ANY_ID },
-	/* Liberator ~ 2108 */
-	{ MPI2_MFGPAGE_VENDORID_LSI, MPI2_MFGPAGE_DEVID_SAS2108_1,
-		PCI_ANY_ID, PCI_ANY_ID },
-	{ MPI2_MFGPAGE_VENDORID_LSI, MPI2_MFGPAGE_DEVID_SAS2108_2,
-		PCI_ANY_ID, PCI_ANY_ID },
-	{ MPI2_MFGPAGE_VENDORID_LSI, MPI2_MFGPAGE_DEVID_SAS2108_3,
-		PCI_ANY_ID, PCI_ANY_ID },
-	/* Meteor ~ 2116 */
-	{ MPI2_MFGPAGE_VENDORID_LSI, MPI2_MFGPAGE_DEVID_SAS2116_1,
-		PCI_ANY_ID, PCI_ANY_ID },
-	{ MPI2_MFGPAGE_VENDORID_LSI, MPI2_MFGPAGE_DEVID_SAS2116_2,
-		PCI_ANY_ID, PCI_ANY_ID },
-	/* SSS6200 */
-	{ MPI2_MFGPAGE_VENDORID_LSI, MPI2_MFGPAGE_DEVID_SSS6200,
-		PCI_ANY_ID, PCI_ANY_ID },
-	{0}     /* Terminating entry */
-};
 
 static struct pci_error_handlers _mpt3sas_err_handler = {
 	.error_detected	= scsih_pci_error_detected,

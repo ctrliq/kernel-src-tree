@@ -35,6 +35,7 @@
 #include "t4_regs.h"
 #include "t4_values.h"
 #include "t4_msg.h"
+#include "t4_tcb.h"
 #include "t4fw_ri_api.h"
 
 #define T4_MAX_NUM_PD 65536
@@ -194,7 +195,19 @@ struct t4_cqe {
 			__be32 abs_rqe_idx;
 		} srcqe;
 		struct {
-			__be64 imm_data;
+			__be32 mo;
+			__be32 msn;
+			/*
+			 * Use union for immediate data to be consistent with
+			 * stack's 32 bit data and iWARP spec's 64 bit data.
+			 */
+			union {
+				struct {
+					__be32 imm_data32;
+					u32 reserved;
+				} ib_imm_data;
+				__be64 imm_data64;
+			} iw_imm_data;
 		} imm_data_rcqe;
 
 		u64 drain_cookie;
@@ -257,6 +270,8 @@ struct t4_cqe {
 #define CQE_WRID_STAG(x)  (be32_to_cpu((x)->u.rcqe.stag))
 #define CQE_WRID_MSN(x)   (be32_to_cpu((x)->u.rcqe.msn))
 #define CQE_ABS_RQE_IDX(x) (be32_to_cpu((x)->u.srcqe.abs_rqe_idx))
+#define CQE_IMM_DATA(x)( \
+	(x)->u.imm_data_rcqe.iw_imm_data.ib_imm_data.imm_data32)
 
 /* used for SQ completion processing */
 #define CQE_WRID_SQ_IDX(x)	((x)->u.scqe.cidx)
@@ -383,7 +398,7 @@ struct t4_srq_pending_wr {
 struct t4_srq {
 	union t4_recv_wr *queue;
 	dma_addr_t dma_addr;
-	DECLARE_PCI_UNMAP_ADDR(mapping);
+	DEFINE_DMA_UNMAP_ADDR(mapping);
 	struct t4_swrqe *sw_rq;
 	void __iomem *bar2_va;
 	u64 bar2_pa;
@@ -495,7 +510,6 @@ static inline void t4_rq_produce(struct t4_wq *wq, u8 len16)
 static inline void t4_rq_consume(struct t4_wq *wq)
 {
 	wq->rq.in_use--;
-	wq->rq.msn++;
 	if (++wq->rq.cidx == wq->rq.size)
 		wq->rq.cidx = 0;
 }
@@ -645,12 +659,14 @@ static inline void t4_ring_rq_db(struct t4_wq *wq, u16 inc,
 
 static inline int t4_wq_in_error(struct t4_wq *wq)
 {
-	return wq->rq.queue[wq->rq.size].status.qp_err;
+	return *wq->qp_errp;
 }
 
-static inline void t4_set_wq_in_error(struct t4_wq *wq)
+static inline void t4_set_wq_in_error(struct t4_wq *wq, u32 srqidx)
 {
-	wq->rq.queue[wq->rq.size].status.qp_err = 1;
+	if (srqidx)
+		*wq->srqidxp = srqidx;
+	*wq->qp_errp = 1;
 }
 
 static inline void t4_disable_wq_db(struct t4_wq *wq)

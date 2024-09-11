@@ -157,7 +157,6 @@ struct xfrm_state {
 	struct xfrm_id		id;
 	struct xfrm_selector	sel;
 	struct xfrm_mark	mark;
-	u32			if_id;
 	u32			tfcpad;
 
 	u32			genid;
@@ -177,7 +176,7 @@ struct xfrm_state {
 		int		header_len;
 		int		trailer_len;
 		u32		extra_flags;
-		struct xfrm_mark	smark;
+		u32		output_mark;
 	} props;
 
 	struct xfrm_lifetime_cfg lft;
@@ -255,6 +254,9 @@ struct xfrm_state {
 	/* Private data of this transformer, format is opaque,
 	 * interpreted by xfrm_type methods. */
 	void			*data;
+
+	RH_KABI_EXTEND(u32	output_mark_mask)
+	RH_KABI_EXTEND(u32	if_id)
 };
 
 static inline struct net *xs_net(struct xfrm_state *x)
@@ -593,7 +595,6 @@ struct xfrm_policy {
 	atomic_t		genid;
 	u32			priority;
 	u32			index;
-	u32			if_id;
 	struct xfrm_mark	mark;
 	struct xfrm_selector	selector;
 	struct xfrm_lifetime_cfg lft;
@@ -608,6 +609,7 @@ struct xfrm_policy {
 	struct xfrm_sec_ctx	*security;
 	struct xfrm_tmpl       	xfrm_vec[XFRM_MAX_DEPTH];
 	struct rcu_head		rcu;
+	RH_KABI_EXTEND(u32	if_id)
 };
 
 static inline struct net *xp_net(const struct xfrm_policy *xp)
@@ -2074,9 +2076,10 @@ static inline int xfrm_mark_put(struct sk_buff *skb, const struct xfrm_mark *m)
 
 static inline __u32 xfrm_smark_get(__u32 mark, struct xfrm_state *x)
 {
-	struct xfrm_mark *m = &x->props.smark;
+	u32 m = x->output_mark_mask;
+	u32 v = x->props.output_mark;
 
-	return (m->v & m->m) | (mark & ~m->m);
+	return (v & m) | (mark & ~m);
 }
 
 static inline int xfrm_if_id_put(struct sk_buff *skb, __u32 if_id)

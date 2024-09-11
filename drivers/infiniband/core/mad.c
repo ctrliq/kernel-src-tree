@@ -888,10 +888,10 @@ static int handle_outgoing_dr_smp(struct ib_mad_agent_private *mad_agent_priv,
 	}
 
 	/* No GRH for DR SMP */
-	ret = device->process_mad(device, 0, port_num, &mad_wc, NULL,
-				  (const struct ib_mad_hdr *)smp, mad_size,
-				  (struct ib_mad_hdr *)mad_priv->mad,
-				  &mad_size, &out_mad_pkey_index);
+	ret = device->ops.process_mad(device, 0, port_num, &mad_wc, NULL,
+				      (const struct ib_mad_hdr *)smp, mad_size,
+				      (struct ib_mad_hdr *)mad_priv->mad,
+				      &mad_size, &out_mad_pkey_index);
 	switch (ret)
 	{
 	case IB_MAD_RESULT_SUCCESS | IB_MAD_RESULT_REPLY:
@@ -1920,8 +1920,8 @@ static inline int rcv_has_same_gid(const struct ib_mad_agent_private *mad_agent_
 			const struct ib_global_route *grh =
 					rdma_ah_read_grh(&attr);
 
-			if (ib_get_cached_gid(device, port_num,
-					      grh->sgid_index, &sgid, NULL))
+			if (rdma_query_gid(device, port_num,
+					   grh->sgid_index, &sgid))
 				return 0;
 			return !memcmp(sgid.raw, rwc->recv_buf.grh->dgid.raw,
 				       16);
@@ -2305,14 +2305,12 @@ static void ib_mad_recv_done(struct ib_cq *cq, struct ib_wc *wc)
 	}
 
 	/* Give driver "right of first refusal" on incoming MAD */
-	if (port_priv->device->process_mad) {
-		ret = port_priv->device->process_mad(port_priv->device, 0,
-						     port_priv->port_num,
-						     wc, &recv->grh,
-						     (const struct ib_mad_hdr *)recv->mad,
-						     recv->mad_size,
-						     (struct ib_mad_hdr *)response->mad,
-						     &mad_size, &resp_mad_pkey_index);
+	if (port_priv->device->ops.process_mad) {
+		ret = port_priv->device->ops.process_mad(
+			port_priv->device, 0, port_priv->port_num, wc,
+			&recv->grh, (const struct ib_mad_hdr *)recv->mad,
+			recv->mad_size, (struct ib_mad_hdr *)response->mad,
+			&mad_size, &resp_mad_pkey_index);
 
 		if (opa)
 			wc->pkey_index = resp_mad_pkey_index;
@@ -2414,7 +2412,7 @@ static void wait_for_response(struct ib_mad_send_wr_private *mad_send_wr)
 }
 
 void ib_reset_mad_timeout(struct ib_mad_send_wr_private *mad_send_wr,
-			  int timeout_ms)
+			  unsigned long timeout_ms)
 {
 	mad_send_wr->timeout = msecs_to_jiffies(timeout_ms);
 	wait_for_response(mad_send_wr);

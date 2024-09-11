@@ -17,6 +17,9 @@ struct mlxsw_sp_acl_tcam {
 	unsigned long *used_groups;  /* bit array */
 	unsigned int max_groups;
 	unsigned int max_group_size;
+	struct mutex lock; /* guards vregion list */
+	struct list_head vregion_list;
+	u32 vregion_rehash_intrvl;   /* ms */
 	unsigned long priv[0];
 	/* priv has to be always the last item */
 };
@@ -26,6 +29,11 @@ int mlxsw_sp_acl_tcam_init(struct mlxsw_sp *mlxsw_sp,
 			   struct mlxsw_sp_acl_tcam *tcam);
 void mlxsw_sp_acl_tcam_fini(struct mlxsw_sp *mlxsw_sp,
 			    struct mlxsw_sp_acl_tcam *tcam);
+u32 mlxsw_sp_acl_tcam_vregion_rehash_intrvl_get(struct mlxsw_sp *mlxsw_sp,
+						struct mlxsw_sp_acl_tcam *tcam);
+int mlxsw_sp_acl_tcam_vregion_rehash_intrvl_set(struct mlxsw_sp *mlxsw_sp,
+						struct mlxsw_sp_acl_tcam *tcam,
+						u32 val);
 int mlxsw_sp_acl_tcam_priority_get(struct mlxsw_sp *mlxsw_sp,
 				   struct mlxsw_sp_acl_rule_info *rulei,
 				   u32 *priority, bool fillup_priority);
@@ -71,6 +79,8 @@ struct mlxsw_sp_acl_tcam_vregion;
 
 struct mlxsw_sp_acl_tcam_region {
 	struct mlxsw_sp_acl_tcam_vregion *vregion;
+	struct mlxsw_sp_acl_tcam_group *group;
+	struct list_head list; /* Member of a TCAM group */
 	enum mlxsw_reg_ptar_key_type key_type;
 	u16 id; /* ACL ID and region ID - they are same */
 	char tcam_region_info[MLXSW_REG_PXXX_TCAM_REGION_INFO_LEN];
@@ -206,6 +216,7 @@ mlxsw_sp_acl_atcam_region_init(struct mlxsw_sp *mlxsw_sp,
 			       struct mlxsw_sp_acl_atcam *atcam,
 			       struct mlxsw_sp_acl_atcam_region *aregion,
 			       struct mlxsw_sp_acl_tcam_region *region,
+			       void *hints_priv,
 			       const struct mlxsw_sp_acl_ctcam_region_ops *ops);
 void mlxsw_sp_acl_atcam_region_fini(struct mlxsw_sp_acl_atcam_region *aregion);
 void mlxsw_sp_acl_atcam_chunk_init(struct mlxsw_sp_acl_atcam_region *aregion,
@@ -265,7 +276,8 @@ void mlxsw_sp_acl_erp_bf_remove(struct mlxsw_sp *mlxsw_sp,
 void *
 mlxsw_sp_acl_erp_rehash_hints_get(struct mlxsw_sp_acl_atcam_region *aregion);
 void mlxsw_sp_acl_erp_rehash_hints_put(void *hints_priv);
-int mlxsw_sp_acl_erp_region_init(struct mlxsw_sp_acl_atcam_region *aregion);
+int mlxsw_sp_acl_erp_region_init(struct mlxsw_sp_acl_atcam_region *aregion,
+				 void *hints_priv);
 void mlxsw_sp_acl_erp_region_fini(struct mlxsw_sp_acl_atcam_region *aregion);
 int mlxsw_sp_acl_erps_init(struct mlxsw_sp *mlxsw_sp,
 			   struct mlxsw_sp_acl_atcam *atcam);

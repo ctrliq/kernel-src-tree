@@ -39,6 +39,7 @@
 #include <linux/slab.h>
 #include <linux/hash.h>
 #include <net/ip.h>
+#include <net/busy_poll.h>
 #include <net/vxlan.h>
 #include <net/devlink.h>
 

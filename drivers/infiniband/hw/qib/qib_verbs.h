@@ -292,9 +292,6 @@ void qib_put_txreq(struct qib_verbs_txreq *tx);
 int qib_verbs_send(struct rvt_qp *qp, struct ib_header *hdr,
 		   u32 hdrwords, struct rvt_sge_state *ss, u32 len);
 
-void qib_copy_sge(struct rvt_sge_state *ss, void *data, u32 length,
-		  int release);
-
 void qib_uc_rcv(struct qib_ibport *ibp, struct ib_header *hdr,
 		int has_grh, void *data, u32 tlen, struct rvt_qp *qp);
 
@@ -333,9 +330,6 @@ void qib_make_ruc_header(struct rvt_qp *qp, struct ib_other_headers *ohdr,
 void _qib_do_send(struct work_struct *work);
 
 void qib_do_send(struct rvt_qp *qp);
-
-void qib_send_complete(struct rvt_qp *qp, struct rvt_swqe *wqe,
-		       enum ib_wc_status status);
 
 void qib_send_rc_ack(struct rvt_qp *qp);
 

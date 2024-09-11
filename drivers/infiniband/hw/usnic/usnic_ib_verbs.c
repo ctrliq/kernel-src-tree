@@ -763,6 +763,7 @@ int usnic_ib_mmap(struct ib_ucontext *context,
 /* In ib callbacks section -  Start of stub funcs */
 struct ib_ah *usnic_ib_create_ah(struct ib_pd *pd,
 				 struct rdma_ah_attr *ah_attr,
+				 u32 flags,
 				 struct ib_udata *udata)
 
 {
@@ -770,21 +771,21 @@ struct ib_ah *usnic_ib_create_ah(struct ib_pd *pd,
 	return ERR_PTR(-EPERM);
 }
 
-int usnic_ib_destroy_ah(struct ib_ah *ah)
+int usnic_ib_destroy_ah(struct ib_ah *ah, u32 flags)
 {
 	usnic_dbg("\n");
 	return -EINVAL;
 }
 
-int usnic_ib_post_send(struct ib_qp *ibqp, struct ib_send_wr *wr,
-				struct ib_send_wr **bad_wr)
+int usnic_ib_post_send(struct ib_qp *ibqp, const struct ib_send_wr *wr,
+		       const struct ib_send_wr **bad_wr)
 {
 	usnic_dbg("\n");
 	return -EINVAL;
 }
 
-int usnic_ib_post_recv(struct ib_qp *ibqp, struct ib_recv_wr *wr,
-				struct ib_recv_wr **bad_wr)
+int usnic_ib_post_recv(struct ib_qp *ibqp, const struct ib_recv_wr *wr,
+		       const struct ib_recv_wr **bad_wr)
 {
 	usnic_dbg("\n");
 	return -EINVAL;

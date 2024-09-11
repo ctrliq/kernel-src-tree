@@ -21,12 +21,21 @@
 DEFINE_STATIC_KEY_FALSE(cgroup_bpf_enabled_key);
 EXPORT_SYMBOL(cgroup_bpf_enabled_key);
 
-/**
- * cgroup_bpf_put() - put references of all bpf programs
- * @cgrp: the cgroup to modify
- */
-void cgroup_bpf_put(struct cgroup *cgrp)
+void cgroup_bpf_offline(struct cgroup *cgrp)
 {
+	cgroup_get(cgrp);
+	percpu_ref_kill(&cgrp->bpf.refcnt);
+}
+
+/**
+ * cgroup_bpf_release() - put references of all bpf programs and
+ *                        release all cgroup bpf data
+ * @work: work structure embedded into the cgroup to modify
+ */
+static void cgroup_bpf_release(struct work_struct *work)
+{
+	struct cgroup *cgrp = container_of(work, struct cgroup,
+					   bpf.release_work);
 	enum bpf_cgroup_storage_type stype;
 	unsigned int type;
 
@@ -46,6 +55,22 @@ void cgroup_bpf_put(struct cgroup *cgrp)
 		}
 		bpf_prog_array_free(cgrp->bpf.effective[type]);
 	}
+
+	percpu_ref_exit(&cgrp->bpf.refcnt);
+	cgroup_put(cgrp);
+}
+
+/**
+ * cgroup_bpf_release_fn() - callback used to schedule releasing
+ *                           of bpf cgroup data
+ * @ref: percpu ref counter structure
+ */
+static void cgroup_bpf_release_fn(struct percpu_ref *ref)
+{
+	struct cgroup *cgrp = container_of(ref, struct cgroup, bpf.refcnt);
+
+	INIT_WORK(&cgrp->bpf.release_work, cgroup_bpf_release);
+	queue_work(system_wq, &cgrp->bpf.release_work);
 }
 
 /* count number of elements in the list.
@@ -166,7 +191,12 @@ int cgroup_bpf_inherit(struct cgroup *cgrp)
  */
 #define	NR ARRAY_SIZE(cgrp->bpf.effective)
 	struct bpf_prog_array __rcu *arrays[NR] = {};
-	int i;
+	int ret, i;
+
+	ret = percpu_ref_init(&cgrp->bpf.refcnt, cgroup_bpf_release_fn, 0,
+			      GFP_KERNEL);
+	if (ret)
+		return ret;
 
 	for (i = 0; i < NR; i++)
 		INIT_LIST_HEAD(&cgrp->bpf.progs[i]);
@@ -182,6 +212,9 @@ int cgroup_bpf_inherit(struct cgroup *cgrp)
 cleanup:
 	for (i = 0; i < NR; i++)
 		bpf_prog_array_free(arrays[i]);
+
+	percpu_ref_exit(&cgrp->bpf.refcnt);
+
 	return -ENOMEM;
 }
 
@@ -247,6 +280,7 @@ int __cgroup_bpf_attach(struct cgroup *cgrp, struct bpf_prog *prog,
 	bool pl_was_allocated;
 	int err;
 
+	BUILD_BUG_ON(RH_MAX_BPF_ATTACH_TYPE < MAX_BPF_ATTACH_TYPE);
 	if ((flags & BPF_F_ALLOW_OVERRIDE) && (flags & BPF_F_ALLOW_MULTI))
 		/* invalid combination */
 		return -EINVAL;

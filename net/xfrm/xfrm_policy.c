@@ -593,6 +593,7 @@ static void xfrm_hash_rebuild(struct work_struct *work)
 	} while (read_seqretry(&net->xfrm.policy_hthresh.lock, seq));
 
 	spin_lock_bh(&net->xfrm.xfrm_policy_lock);
+	write_seqcount_begin(&xfrm_policy_hash_generation);
 
 	/* reset the bydst and inexact table in all directions */
 	for (dir = 0; dir < XFRM_POLICY_MAX; dir++) {
@@ -639,6 +640,7 @@ static void xfrm_hash_rebuild(struct work_struct *work)
 			hlist_add_head_rcu(&policy->bydst, chain);
 	}
 
+	write_seqcount_end(&xfrm_policy_hash_generation);
 	spin_unlock_bh(&net->xfrm.xfrm_policy_lock);
 
 	mutex_unlock(&hash_resize_mutex);
@@ -1632,7 +1634,8 @@ static struct dst_entry *xfrm_bundle_create(struct xfrm_policy *policy,
 		if (xfrm[i]->props.mode != XFRM_MODE_TRANSPORT) {
 			__u32 mark = 0;
 
-			if (xfrm[i]->props.smark.v || xfrm[i]->props.smark.m)
+			if (xfrm[i]->props.output_mark ||
+			    xfrm[i]->output_mark_mask)
 				mark = xfrm_smark_get(fl->flowi_mark, xfrm[i]);
 
 			family = xfrm[i]->props.family;

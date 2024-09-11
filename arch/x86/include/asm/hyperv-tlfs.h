@@ -336,8 +336,8 @@ struct hv_tsc_emulation_status {
 /*
  * Crash notification (HV_X64_MSR_CRASH_CTL) flags.
  */
-#define HV_CRASH_CTL_CRASH_NOTIFY_MSG		BIT_ULL(62)
-#define HV_CRASH_CTL_CRASH_NOTIFY		BIT_ULL(63)
+#define HV_CRASH_CTL_CRASH_NOTIFY_MSG          BIT_ULL(62)
+#define HV_CRASH_CTL_CRASH_NOTIFY              BIT_ULL(63)
 #define HV_X64_MSR_CRASH_PARAMS		\
 		(1 + (HV_X64_MSR_CRASH_P4 - HV_X64_MSR_CRASH_P0))
 

@@ -34,6 +34,7 @@
  */
 
 #include "core.h"
+#include "trace.h"
 
 #include <linux/sysctl.h>
 
@@ -57,6 +58,13 @@ static struct ctl_table tipc_table[] = {
 		.mode		= 0644,
 		.proc_handler	= proc_dointvec_minmax,
 		.extra1         = &zero,
+	},
+	{
+		.procname       = "sk_filter",
+		.data           = &sysctl_tipc_sk_filter,
+		.maxlen         = sizeof(sysctl_tipc_sk_filter),
+		.mode           = 0644,
+		.proc_handler   = proc_doulongvec_minmax,
 	},
 	{}
 };

@@ -333,6 +333,8 @@ struct ethtool_ops_extended_rh {
  * See &struct net_device and &struct net_device_ops for documentation
  * of the generic netdev features interface.
  */
+struct ethtool_link_ksettings_rh80;
+
 struct ethtool_ops {
 	int	(*get_settings)(struct net_device *, struct ethtool_cmd *);
 	int	(*set_settings)(struct net_device *, struct ethtool_cmd *);
@@ -407,10 +409,14 @@ struct ethtool_ops {
 					  struct ethtool_coalesce *);
 	int	(*set_per_queue_coalesce)(struct net_device *, u32,
 					  struct ethtool_coalesce *);
-	int	(*get_link_ksettings)(struct net_device *,
-				      struct ethtool_link_ksettings *);
-	int	(*set_link_ksettings)(struct net_device *,
-				      const struct ethtool_link_ksettings *);
+	RH_KABI_REPLACE(int	(*get_link_ksettings)(struct net_device *,
+					struct ethtool_link_ksettings *),
+			int	(*get_link_ksettings_rh80)(struct net_device *,
+					struct ethtool_link_ksettings_rh80 *))
+	RH_KABI_REPLACE(int	(*set_link_ksettings)(struct net_device *,
+					const struct ethtool_link_ksettings *),
+			int	(*set_link_ksettings_rh80)(struct net_device *,
+					const struct ethtool_link_ksettings_rh80 *))
 	int	(*get_fecparam)(struct net_device *,
 				      struct ethtool_fecparam *);
 	int	(*set_fecparam)(struct net_device *,
@@ -418,8 +424,10 @@ struct ethtool_ops {
 	void	(*get_ethtool_phy_stats)(struct net_device *,
 					 struct ethtool_stats *, u64 *);
 
-	RH_KABI_RESERVE(1)
-	RH_KABI_RESERVE(2)
+	RH_KABI_USE(1, int	(*get_link_ksettings)(struct net_device *,
+				      struct ethtool_link_ksettings *))
+	RH_KABI_USE(2, int	(*set_link_ksettings)(struct net_device *,
+				      const struct ethtool_link_ksettings *))
 	RH_KABI_RESERVE(3)
 	RH_KABI_RESERVE(4)
 	RH_KABI_RESERVE(5)

@@ -173,7 +173,7 @@ static void tcindex_destroy_fexts_work(struct work_struct *work)
 }
 
 static int tcindex_delete(struct tcf_proto *tp, void *arg, bool *last,
-			  struct netlink_ext_ack *extack)
+			  bool rtnl_held, struct netlink_ext_ack *extack)
 {
 	struct tcindex_data *p = rtnl_dereference(tp->root);
 	struct tcindex_filter_result *r = arg;
@@ -495,7 +495,7 @@ static int
 tcindex_change(struct net *net, struct sk_buff *in_skb,
 	       struct tcf_proto *tp, unsigned long base, u32 handle,
 	       struct nlattr **tca, void **arg, bool ovr,
-	       struct netlink_ext_ack *extack)
+	       bool rtnl_held, struct netlink_ext_ack *extack)
 {
 	struct nlattr *opt = tca[TCA_OPTIONS];
 	struct nlattr *tb[TCA_TCINDEX_MAX + 1];
@@ -518,7 +518,8 @@ tcindex_change(struct net *net, struct sk_buff *in_skb,
 				 tca[TCA_RATE], ovr, extack);
 }
 
-static void tcindex_walk(struct tcf_proto *tp, struct tcf_walker *walker)
+static void tcindex_walk(struct tcf_proto *tp, struct tcf_walker *walker,
+			 bool rtnl_held)
 {
 	struct tcindex_data *p = rtnl_dereference(tp->root);
 	struct tcindex_filter *f, *next;
@@ -554,7 +555,7 @@ static void tcindex_walk(struct tcf_proto *tp, struct tcf_walker *walker)
 	}
 }
 
-static void tcindex_destroy(struct tcf_proto *tp,
+static void tcindex_destroy(struct tcf_proto *tp, bool rtnl_held,
 			    struct netlink_ext_ack *extack)
 {
 	struct tcindex_data *p = rtnl_dereference(tp->root);
@@ -581,7 +582,7 @@ static void tcindex_destroy(struct tcf_proto *tp,
 
 		for (f = rtnl_dereference(p->h[i]); f; f = next) {
 			next = rtnl_dereference(f->next);
-			tcindex_delete(tp, &f->result, &last, NULL);
+			tcindex_delete(tp, &f->result, &last, rtnl_held, NULL);
 		}
 	}
 
@@ -590,7 +591,7 @@ static void tcindex_destroy(struct tcf_proto *tp,
 
 
 static int tcindex_dump(struct net *net, struct tcf_proto *tp, void *fh,
-			struct sk_buff *skb, struct tcmsg *t)
+			struct sk_buff *skb, struct tcmsg *t, bool rtnl_held)
 {
 	struct tcindex_data *p = rtnl_dereference(tp->root);
 	struct tcindex_filter_result *r = fh;

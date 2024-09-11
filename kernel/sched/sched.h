@@ -55,6 +55,7 @@
 #include <linux/proc_fs.h>
 #include <linux/prefetch.h>
 #include <linux/profile.h>
+#include <linux/psi.h>
 #include <linux/rcupdate_wait.h>
 #include <linux/security.h>
 #include <linux/stackprotector.h>
@@ -322,6 +323,7 @@ extern bool dl_cpu_busy(unsigned int cpu);
 #ifdef CONFIG_CGROUP_SCHED
 
 #include <linux/cgroup.h>
+#include <linux/psi.h>
 
 struct cfs_rq;
 struct rt_rq;
@@ -798,7 +800,6 @@ struct rq {
 #ifdef CONFIG_NUMA_BALANCING
 	unsigned int		nr_numa_running;
 	unsigned int		nr_preferred_running;
-	unsigned int		numa_migrate_on;
 #endif
 	#define CPU_LOAD_IDX_MAX 5
 	unsigned long		cpu_load[CPU_LOAD_IDX_MAX];
@@ -869,11 +870,8 @@ struct rq {
 
 	struct list_head cfs_tasks;
 
-	struct sched_avg	avg_rt;
-	struct sched_avg	avg_dl;
-#ifdef CONFIG_HAVE_SCHED_AVG_IRQ
-	struct sched_avg	avg_irq;
-#endif
+	RH_KABI_DEPRECATE(u64, rt_avg)
+	RH_KABI_DEPRECATE(u64, age_stamp)
 	u64			idle_stamp;
 	u64			avg_idle;
 
@@ -932,6 +930,15 @@ struct rq {
 
 	RH_KABI_RESERVE(1)
 	RH_KABI_RESERVE(2)
+#ifdef CONFIG_NUMA_BALANCING
+	RH_KABI_EXTEND(unsigned int numa_migrate_on)
+#endif
+	RH_KABI_EXTEND(struct sched_avg	avg_rt)
+	RH_KABI_EXTEND(struct sched_avg	avg_dl)
+#ifdef CONFIG_HAVE_SCHED_AVG_IRQ
+	RH_KABI_EXTEND(struct sched_avg	avg_irq)
+#endif
+
 };
 
 static inline int cpu_of(struct rq *rq)
@@ -1635,7 +1642,8 @@ struct sched_class {
 
 #ifdef CONFIG_SMP
 	int  (*select_task_rq)(struct task_struct *p, int task_cpu, int sd_flag, int flags);
-	void (*migrate_task_rq)(struct task_struct *p, int new_cpu);
+	RH_KABI_REPLACE(void (*migrate_task_rq)(struct task_struct *p),\
+			void (*migrate_task_rq)(struct task_struct *p, int new_cpu))
 
 	void (*task_woken)(struct rq *this_rq, struct task_struct *task);
 
@@ -1675,6 +1683,7 @@ struct sched_class {
 
 	RH_KABI_RESERVE(1)
 	RH_KABI_RESERVE(2)
+
 };
 
 static inline void put_prev_task(struct rq *rq, struct task_struct *prev)

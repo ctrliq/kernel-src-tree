@@ -208,7 +208,7 @@ static void send_handler(struct ib_mad_agent *agent,
 	struct ib_umad_packet *packet = send_wc->send_buf->context[0];
 
 	dequeue_send(file, packet);
-	rdma_destroy_ah(packet->msg->ah);
+	rdma_destroy_ah(packet->msg->ah, RDMA_DESTROY_AH_SLEEPABLE);
 	ib_free_send_mad(packet->msg);
 
 	if (send_wc->status == IB_WC_RESP_TIMEOUT_ERR) {
@@ -271,6 +271,7 @@ static void recv_handler(struct ib_mad_agent *agent,
 		packet->mad.hdr.traffic_class = grh->traffic_class;
 		memcpy(packet->mad.hdr.gid, &grh->dgid, 16);
 		packet->mad.hdr.flow_label = cpu_to_be32(grh->flow_label);
+		rdma_destroy_ah_attr(&ah_attr);
 	}
 
 	if (queue_packet(file, agent, packet))
@@ -623,7 +624,7 @@ err_send:
 err_msg:
 	ib_free_send_mad(packet->msg);
 err_ah:
-	rdma_destroy_ah(ah);
+	rdma_destroy_ah(ah, RDMA_DESTROY_AH_SLEEPABLE);
 err_up:
 	mutex_unlock(&file->mutex);
 err:
@@ -1130,7 +1131,7 @@ static ssize_t ibdev_show(struct device *dev, struct device_attribute *attr,
 	if (!port)
 		return -ENODEV;
 
-	return sprintf(buf, "%s\n", port->ib_dev->name);
+	return sprintf(buf, "%s\n", dev_name(&port->ib_dev->dev));
 }
 static DEVICE_ATTR_RO(ibdev);
 

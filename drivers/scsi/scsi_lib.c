@@ -39,6 +39,14 @@
 #include "scsi_priv.h"
 #include "scsi_logging.h"
 
+/*
+ * Size of integrity metadata is usually small, 1 inline sg should
+ * cover normal cases.
+ */
+#define  SCSI_INLINE_PROT_SG_CNT  1
+
+#define  SCSI_INLINE_SG_CNT  2
+
 static struct kmem_cache *scsi_sdb_cache;
 static struct kmem_cache *scsi_sense_cache;
 static struct kmem_cache *scsi_sense_isadma_cache;
@@ -559,14 +567,17 @@ static void scsi_mq_free_sgtables(struct scsi_cmnd *cmd)
 	struct scsi_data_buffer *sdb;
 
 	if (cmd->sdb.table.nents)
-		sg_free_table_chained(&cmd->sdb.table, true);
+		sg_free_table_chained(&cmd->sdb.table,
+				SCSI_INLINE_SG_CNT);
 	if (cmd->request->next_rq) {
 		sdb = cmd->request->next_rq->special;
 		if (sdb)
-			sg_free_table_chained(&sdb->table, true);
+			sg_free_table_chained(&sdb->table,
+				SCSI_INLINE_SG_CNT);
 	}
 	if (scsi_prot_sg_count(cmd))
-		sg_free_table_chained(&cmd->prot_sdb->table, true);
+		sg_free_table_chained(&cmd->prot_sdb->table,
+				SCSI_INLINE_PROT_SG_CNT);
 }
 
 static void scsi_mq_uninit_cmd(struct scsi_cmnd *cmd)
@@ -1023,7 +1034,8 @@ static blk_status_t scsi_init_sgtable(struct request *req,
 	 * If sg table allocation fails, requeue request later.
 	 */
 	if (unlikely(sg_alloc_table_chained(&sdb->table,
-			blk_rq_nr_phys_segments(req), sdb->table.sgl)))
+			blk_rq_nr_phys_segments(req), sdb->table.sgl,
+			SCSI_INLINE_SG_CNT)))
 		return BLK_STS_RESOURCE;
 
 	/* 
@@ -1083,7 +1095,8 @@ blk_status_t scsi_init_io(struct scsi_cmnd *cmd)
 		ivecs = blk_rq_count_integrity_sg(rq->q, rq->bio);
 
 		if (sg_alloc_table_chained(&prot_sdb->table, ivecs,
-				prot_sdb->table.sgl)) {
+				prot_sdb->table.sgl,
+				SCSI_INLINE_PROT_SG_CNT)) {
 			ret = BLK_STS_RESOURCE;
 			goto out_free_sgtables;
 		}
@@ -1606,9 +1619,9 @@ static int scsi_dispatch_cmd(struct scsi_cmnd *cmd)
 }
 
 /* Size in bytes of the sg-list stored in the scsi-mq command-private data. */
-static unsigned int scsi_mq_sgl_size(struct Scsi_Host *shost)
+static unsigned int scsi_mq_inline_sgl_size(struct Scsi_Host *shost)
 {
-	return min_t(unsigned int, shost->sg_tablesize, SG_CHUNK_SIZE) *
+	return min_t(unsigned int, shost->sg_tablesize, SCSI_INLINE_SG_CNT) *
 		sizeof(struct scatterlist);
 }
 
@@ -1621,7 +1634,10 @@ static blk_status_t scsi_mq_prep_fn(struct request *req)
 
 	scsi_init_command(sdev, cmd);
 
+	req->special = cmd;
+
 	cmd->request = req;
+
 	cmd->tag = req->tag;
 	cmd->prot_op = SCSI_PROT_NORMAL;
 
@@ -1805,7 +1821,7 @@ static int scsi_mq_init_request(struct blk_mq_tag_set *set, struct request *rq,
 	if (scsi_host_get_prot(shost)) {
 		sg = (void *)cmd + sizeof(struct scsi_cmnd) +
 			shost->hostt->cmd_size;
-		cmd->prot_sdb = (void *)sg + scsi_mq_sgl_size(shost);
+		cmd->prot_sdb = (void *)sg + scsi_mq_inline_sgl_size(shost);
 	}
 
 	return 0;
@@ -1902,10 +1918,11 @@ int scsi_mq_setup_tags(struct Scsi_Host *shost)
 {
 	unsigned int cmd_size, sgl_size;
 
-	sgl_size = scsi_mq_sgl_size(shost);
+	sgl_size = scsi_mq_inline_sgl_size(shost);
 	cmd_size = sizeof(struct scsi_cmnd) + shost->hostt->cmd_size + sgl_size;
 	if (scsi_host_get_prot(shost))
-		cmd_size += sizeof(struct scsi_data_buffer) + sgl_size;
+		cmd_size += sizeof(struct scsi_data_buffer) +
+			sizeof(struct scatterlist) * SCSI_INLINE_PROT_SG_CNT;
 
 	memset(&shost->tag_set, 0, sizeof(shost->tag_set));
 	shost->tag_set.ops = &scsi_mq_ops;

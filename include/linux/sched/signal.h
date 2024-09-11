@@ -96,9 +96,6 @@ struct signal_struct {
 	/* shared signal handling: */
 	struct sigpending	shared_pending;
 
-	/* For collecting multiprocess signals during fork */
-	struct hlist_head	multiprocess;
-
 	/* thread group exit support */
 	int			group_exit_code;
 	/* overloaded:
@@ -156,7 +153,7 @@ struct signal_struct {
 #endif
 
 	/* PID/PID hash table linkage. */
-	struct pid *pids[PIDTYPE_MAX];
+	RH_KABI_DEPRECATE(struct pid *, leader_pid)
 
 #ifdef CONFIG_NO_HZ_FULL
 	atomic_t tick_dep_mask;
@@ -234,7 +231,17 @@ struct signal_struct {
 					 * credential calculations
 					 * (notably. ptrace) */
 
-	RH_KABI_RESERVE(1)
+	/*
+	 * RHEL8: signal_struct is always dynamically allocated at process
+	 * creation time and not embedded directly into other structure.
+	 * So it is safe to extend the size of the structure.
+	 */
+	/* PID/PID hash table linkage. */
+	RH_KABI_EXTEND(struct pid *pids[PIDTYPE_MAX])
+
+	/* For collecting multiprocess signals during fork */
+	RH_KABI_USE(1, struct hlist_head multiprocess)
+
 	RH_KABI_RESERVE(2)
 	RH_KABI_RESERVE(3)
 	RH_KABI_RESERVE(4)

@@ -249,7 +249,7 @@ struct ib_qp *pvrdma_create_qp(struct ib_pd *pd,
 		init_completion(&qp->free);
 
 		qp->state = IB_QPS_RESET;
-		qp->is_kernel = !(pd->uobject && udata);
+		qp->is_kernel = !udata;
 
 		if (!qp->is_kernel) {
 			dev_dbg(&dev->pdev->dev,
@@ -624,8 +624,8 @@ static int set_reg_seg(struct pvrdma_sq_wqe_hdr *wqe_hdr,
  *
  * @return: 0 on success, otherwise errno returned.
  */
-int pvrdma_post_send(struct ib_qp *ibqp, struct ib_send_wr *wr,
-		     struct ib_send_wr **bad_wr)
+int pvrdma_post_send(struct ib_qp *ibqp, const struct ib_send_wr *wr,
+		     const struct ib_send_wr **bad_wr)
 {
 	struct pvrdma_qp *qp = to_vqp(ibqp);
 	struct pvrdma_dev *dev = to_vdev(ibqp->device);
@@ -834,8 +834,8 @@ out:
  *
  * @return: 0 on success, otherwise errno returned.
  */
-int pvrdma_post_recv(struct ib_qp *ibqp, struct ib_recv_wr *wr,
-		     struct ib_recv_wr **bad_wr)
+int pvrdma_post_recv(struct ib_qp *ibqp, const struct ib_recv_wr *wr,
+		     const struct ib_recv_wr **bad_wr)
 {
 	struct pvrdma_dev *dev = to_vdev(ibqp->device);
 	unsigned long flags;

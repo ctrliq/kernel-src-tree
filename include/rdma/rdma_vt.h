@@ -149,6 +149,10 @@ struct rvt_ibport {
 
 #define RVT_CQN_MAX 16 /* maximum length of cq name */
 
+#define RVT_SGE_COPY_MEMCPY	0
+#define RVT_SGE_COPY_CACHELESS	1
+#define RVT_SGE_COPY_ADAPTIVE	2
+
 /*
  * Things that are driver specific, module parameters in hfi1 and qib
  */
@@ -161,6 +165,9 @@ struct rvt_driver_params {
 	 */
 	unsigned int lkey_table_size;
 	unsigned int qp_table_size;
+	unsigned int sge_copy_mode;
+	unsigned int wss_threshold;
+	unsigned int wss_clean_period;
 	int qpn_start;
 	int qpn_inc;
 	int qpn_res_start;
@@ -175,6 +182,7 @@ struct rvt_driver_params {
 	u32 max_mad_size;
 	u8 qos_shift;
 	u8 max_rdma_atomic;
+	u8 extra_rdma_atomic;
 	u8 reserved_operations;
 };
 
@@ -191,6 +199,19 @@ struct rvt_ah {
 	atomic_t refcount;
 	u8 vl;
 	u8 log_pmtu;
+};
+
+/* memory working set size */
+struct rvt_wss {
+	unsigned long *entries;
+	atomic_t total_count;
+	atomic_t clean_counter;
+	atomic_t clean_entry;
+
+	int threshold;
+	int num_entries;
+	long pages_mask;
+	unsigned int clean_period;
 };
 
 struct rvt_dev_info;
@@ -385,6 +406,9 @@ struct rvt_dev_info {
 	/* post send table */
 	const struct rvt_operation_params *post_parms;
 
+	/* opcode translation table */
+	const enum ib_wc_opcode *wc_opcode;
+
 	/* Driver specific helper functions */
 	struct rvt_driver_provided driver_f;
 
@@ -425,6 +449,8 @@ struct rvt_dev_info {
 	u32 n_mcast_grps_allocated; /* number of mcast groups allocated */
 	spinlock_t n_mcast_grps_lock;
 
+	/* Memory Working Set Size */
+	struct rvt_wss *wss;
 };
 
 /**
@@ -437,7 +463,14 @@ static inline void rvt_set_ibdev_name(struct rvt_dev_info *rdi,
 				      const char *fmt, const char *name,
 				      const int unit)
 {
-	snprintf(rdi->ibdev.name, sizeof(rdi->ibdev.name), fmt, name, unit);
+	/*
+	 * FIXME: rvt and its users want to touch the ibdev before
+	 * registration and have things like the name work. We don't have the
+	 * infrastructure in the core to support this directly today, hack it
+	 * to work by setting the name manually here.
+	 */
+	dev_set_name(&rdi->ibdev.dev, fmt, name, unit);
+	strlcpy(rdi->ibdev.name, dev_name(&rdi->ibdev.dev), IB_DEVICE_NAME_MAX);
 }
 
 /**
@@ -490,7 +523,14 @@ static inline unsigned rvt_get_npkeys(struct rvt_dev_info *rdi)
  */
 static inline unsigned int rvt_max_atomic(struct rvt_dev_info *rdi)
 {
-	return rdi->dparms.max_rdma_atomic + 1;
+	return rdi->dparms.max_rdma_atomic +
+		rdi->dparms.extra_rdma_atomic + 1;
+}
+
+static inline unsigned int rvt_size_atomic(struct rvt_dev_info *rdi)
+{
+	return rdi->dparms.max_rdma_atomic +
+		rdi->dparms.extra_rdma_atomic;
 }
 
 /*

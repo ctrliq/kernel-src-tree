@@ -302,7 +302,7 @@ static void nvmet_tcp_map_pdu_iovec(struct nvmet_tcp_cmd *cmd)
 		iov++;
 	}
 
-	iov_iter_kvec(&cmd->recv_msg.msg_iter, READ, cmd->iov,
+	iov_iter_kvec(&cmd->recv_msg.msg_iter, ITER_KVEC | READ, cmd->iov,
 		cmd->nr_mapped, cmd->pdu_len);
 }
 
@@ -1720,6 +1720,7 @@ static int __init nvmet_tcp_init(void)
 	if (ret)
 		goto err;
 
+	mark_tech_preview("NVMe/TCP Target", THIS_MODULE);
 	return 0;
 err:
 	destroy_workqueue(nvmet_tcp_wq);

@@ -23,6 +23,7 @@
 #include <linux/if_vlan.h>
 #include <net/tcp.h>
 #include <net/dst.h>
+#include <net/tls.h>
 
 #include "chtls.h"
 #include "chtls_cm.h"
@@ -1017,6 +1018,7 @@ static struct sock *chtls_recv_sock(struct sock *lsk,
 	const struct tcphdr *tcph;
 	struct inet_sock *newinet;
 	const struct iphdr *iph;
+	struct tls_context *ctx;
 	struct net_device *ndev;
 	struct chtls_sock *csk;
 	struct dst_entry *dst;
@@ -1066,6 +1068,8 @@ static struct sock *chtls_recv_sock(struct sock *lsk,
 
 	oreq->ts_recent = PASS_OPEN_TID_G(ntohl(req->tos_stid));
 	sk_setup_caps(newsk, dst);
+	ctx = tls_get_ctx(lsk);
+	newsk->sk_destruct = ctx->sk_destruct;
 	csk->sk = newsk;
 	csk->passive_reap_next = oreq;
 	csk->tx_chan = cxgb4_port_chan(ndev);

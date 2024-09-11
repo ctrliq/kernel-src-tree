@@ -462,13 +462,21 @@ static void nvmet_rdma_free_rsps(struct nvmet_rdma_queue *queue)
 static int nvmet_rdma_post_recv(struct nvmet_rdma_device *ndev,
 		struct nvmet_rdma_cmd *cmd)
 {
+	int ret;
+
 	ib_dma_sync_single_for_device(ndev->device,
 		cmd->sge[0].addr, cmd->sge[0].length,
 		DMA_FROM_DEVICE);
 
 	if (ndev->srq)
-		return ib_post_srq_recv(ndev->srq, &cmd->wr, NULL);
-	return ib_post_recv(cmd->queue->cm_id->qp, &cmd->wr, NULL);
+		ret = ib_post_srq_recv(ndev->srq, &cmd->wr, NULL);
+	else
+		ret = ib_post_recv(cmd->queue->cm_id->qp, &cmd->wr, NULL);
+
+	if (unlikely(ret))
+		pr_err("post_recv cmd failed\n");
+
+	return ret;
 }
 
 static void nvmet_rdma_process_wr_wait_list(struct nvmet_rdma_queue *queue)
@@ -572,7 +580,7 @@ static void nvmet_rdma_queue_response(struct nvmet_req *req)
 		rsp->send_sge.addr, rsp->send_sge.length,
 		DMA_TO_DEVICE);
 
-	if (ib_post_send(cm_id->qp, first_wr, NULL)) {
+	if (unlikely(ib_post_send(cm_id->qp, first_wr, NULL))) {
 		pr_err("sending cmd response failed\n");
 		nvmet_rdma_release_rsp(rsp);
 	}

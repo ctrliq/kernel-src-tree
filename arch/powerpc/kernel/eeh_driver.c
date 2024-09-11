@@ -35,8 +35,8 @@
 #include <asm/rtas.h>
 
 struct eeh_rmv_data {
-	struct list_head removed_vf_list;
-	int removed_dev_count;
+	struct list_head RH_KABI_RENAME(edev_list, removed_vf_list);
+	int RH_KABI_RENAME(removed, removed_dev_count);
 };
 
 static int eeh_result_priority(enum pci_ers_result result)

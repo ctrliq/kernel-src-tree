@@ -11,7 +11,9 @@
 
 #include <linux/kernel.h>
 #include <linux/thread_info.h>
+#ifndef __GENKSYMS__
 #include <crypto/hash.h>
+#endif
 #include <uapi/linux/uio.h>
 
 struct page;

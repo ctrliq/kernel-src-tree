@@ -295,6 +295,11 @@ static void __change_pid(struct task_struct *task, enum pid_type type,
 	hlist_del_rcu(&task->pid_links[type]);
 	*pid_ptr = new;
 
+	if (type == PIDTYPE_PGID)
+		task->rh_pgid = new;
+	else if (type == PIDTYPE_SID)
+		task->rh_sid = new;
+
 	for (tmp = PIDTYPE_MAX; --tmp >= 0; )
 		if (!hlist_empty(&pid->tasks[tmp]))
 			return;

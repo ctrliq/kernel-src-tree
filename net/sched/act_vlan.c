@@ -120,6 +120,7 @@ static int tcf_vlan_init(struct net *net, struct nlattr *nla,
 	u8 push_prio = 0;
 	bool exists = false;
 	int ret = 0, err;
+	u32 index;
 
 	if (!nla)
 		return -EINVAL;
@@ -131,7 +132,8 @@ static int tcf_vlan_init(struct net *net, struct nlattr *nla,
 	if (!tb[TCA_VLAN_PARMS])
 		return -EINVAL;
 	parm = nla_data(tb[TCA_VLAN_PARMS]);
-	err = tcf_idr_check_alloc(tn, &parm->index, a, bind);
+	index = parm->index;
+	err = tcf_idr_check_alloc(tn, &index, a, bind);
 	if (err < 0)
 		return err;
 	exists = err;
@@ -147,7 +149,7 @@ static int tcf_vlan_init(struct net *net, struct nlattr *nla,
 			if (exists)
 				tcf_idr_release(*a, bind);
 			else
-				tcf_idr_cleanup(tn, parm->index);
+				tcf_idr_cleanup(tn, index);
 			return -EINVAL;
 		}
 		push_vid = nla_get_u16(tb[TCA_VLAN_PUSH_VLAN_ID]);
@@ -155,7 +157,7 @@ static int tcf_vlan_init(struct net *net, struct nlattr *nla,
 			if (exists)
 				tcf_idr_release(*a, bind);
 			else
-				tcf_idr_cleanup(tn, parm->index);
+				tcf_idr_cleanup(tn, index);
 			return -ERANGE;
 		}
 
@@ -169,7 +171,7 @@ static int tcf_vlan_init(struct net *net, struct nlattr *nla,
 				if (exists)
 					tcf_idr_release(*a, bind);
 				else
-					tcf_idr_cleanup(tn, parm->index);
+					tcf_idr_cleanup(tn, index);
 				return -EPROTONOSUPPORT;
 			}
 		} else {
@@ -183,16 +185,16 @@ static int tcf_vlan_init(struct net *net, struct nlattr *nla,
 		if (exists)
 			tcf_idr_release(*a, bind);
 		else
-			tcf_idr_cleanup(tn, parm->index);
+			tcf_idr_cleanup(tn, index);
 		return -EINVAL;
 	}
 	action = parm->v_action;
 
 	if (!exists) {
-		ret = tcf_idr_create(tn, parm->index, est, a,
+		ret = tcf_idr_create(tn, index, est, a,
 				     &act_vlan_ops, bind, true);
 		if (ret) {
-			tcf_idr_cleanup(tn, parm->index);
+			tcf_idr_cleanup(tn, index);
 			return ret;
 		}
 

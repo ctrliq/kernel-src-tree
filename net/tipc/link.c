@@ -129,8 +129,8 @@ struct tipc_link {
 	struct net *net;
 
 	/* Management and link supervision data */
-	u32 peer_session;
-	u32 session;
+	u16 peer_session;
+	u16 session;
 	u16 snd_nxt_state;
 	u16 rcv_nxt_state;
 	u32 peer_bearer_id;
@@ -139,6 +139,7 @@ struct tipc_link {
 	u32 abort_limit;
 	u32 state;
 	u16 peer_caps;
+	bool in_session;
 	bool active;
 	u32 silent_intv_cnt;
 	char if_name[TIPC_MAX_IF_NAME];
@@ -209,16 +210,12 @@ enum {
 };
 
 #define TIPC_BC_RETR_LIM msecs_to_jiffies(10)   /* [ms] */
+#define TIPC_UC_RETR_TIME (jiffies + msecs_to_jiffies(1))
 
 /*
  * Interval between NACKs when packets arrive out of order
  */
 #define TIPC_NACK_INTV (TIPC_MIN_LINK_WIN * 2)
-
-/* Wildcard value for link session numbers. When it is known that
- * peer endpoint is down, any session number must be accepted.
- */
-#define ANY_SESSION 0x10000
 
 /* Link FSM states:
  */
@@ -251,6 +248,10 @@ static int tipc_link_build_nack_msg(struct tipc_link *l,
 static void tipc_link_build_bc_init_msg(struct tipc_link *l,
 					struct sk_buff_head *xmitq);
 static bool tipc_link_release_pkts(struct tipc_link *l, u16 to);
+static u16 tipc_build_gap_ack_blks(struct tipc_link *l, void *data);
+static void tipc_link_advance_transmq(struct tipc_link *l, u16 acked, u16 gap,
+				      struct tipc_gap_ack_blks *ga,
+				      struct sk_buff_head *xmitq);
 
 /*
  *  Simple non-static link routines (i.e. referenced outside this file)
@@ -362,9 +363,11 @@ void tipc_link_remove_bc_peer(struct tipc_link *snd_l,
 	rcv_l->bc_peer_is_up = true;
 	rcv_l->state = LINK_ESTABLISHED;
 	tipc_link_bc_ack_rcv(rcv_l, ack, xmitq);
+	trace_tipc_link_reset(rcv_l, TIPC_DUMP_ALL, "bclink removed!");
 	tipc_link_reset(rcv_l);
 	rcv_l->state = LINK_RESET;
 	if (!snd_l->ackers) {
+		trace_tipc_link_reset(snd_l, TIPC_DUMP_ALL, "zero ackers!");
 		tipc_link_reset(snd_l);
 		snd_l->state = LINK_RESET;
 		__skb_queue_purge(xmitq);
@@ -477,7 +480,7 @@ bool tipc_link_create(struct net *net, char *if_name, int bearer_id,
 	l->addr = peer;
 	l->peer_caps = peer_caps;
 	l->net = net;
-	l->peer_session = ANY_SESSION;
+	l->in_session = false;
 	l->bearer_id = bearer_id;
 	l->tolerance = tolerance;
 	if (bc_rcvlink)
@@ -529,6 +532,7 @@ bool tipc_link_bc_create(struct net *net, u32 ownnode, u32 peer,
 
 	l = *link;
 	strcpy(l->name, tipc_bclink_name);
+	trace_tipc_link_reset(l, TIPC_DUMP_ALL, "bclink created!");
 	tipc_link_reset(l);
 	l->state = LINK_RESET;
 	l->ackers = 0;
@@ -553,6 +557,7 @@ bool tipc_link_bc_create(struct net *net, u32 ownnode, u32 peer,
 int tipc_link_fsm_evt(struct tipc_link *l, int evt)
 {
 	int rc = 0;
+	int old_state = l->state;
 
 	switch (l->state) {
 	case LINK_RESETTING:
@@ -699,10 +704,12 @@ int tipc_link_fsm_evt(struct tipc_link *l, int evt)
 	default:
 		pr_err("Unknown FSM state %x in %s\n", l->state, l->name);
 	}
+	trace_tipc_link_fsm(l->name, old_state, l->state, evt);
 	return rc;
 illegal_evt:
 	pr_err("Illegal FSM event %x in state %x on link %s\n",
 	       evt, l->state, l->name);
+	trace_tipc_link_fsm(l->name, old_state, l->state, evt);
 	return rc;
 }
 
@@ -747,6 +754,18 @@ static void link_profile_stats(struct tipc_link *l)
 		l->stats.msg_length_profile[6]++;
 }
 
+/**
+ * tipc_link_too_silent - check if link is "too silent"
+ * @l: tipc link to be checked
+ *
+ * Returns true if the link 'silent_intv_cnt' is about to reach the
+ * 'abort_limit' value, otherwise false
+ */
+bool tipc_link_too_silent(struct tipc_link *l)
+{
+	return (l->silent_intv_cnt + 2 > l->abort_limit);
+}
+
 /* tipc_link_timeout - perform periodic task as instructed from node timeout
  */
 int tipc_link_timeout(struct tipc_link *l, struct sk_buff_head *xmitq)
@@ -760,6 +779,8 @@ int tipc_link_timeout(struct tipc_link *l, struct sk_buff_head *xmitq)
 	u16 bc_acked = l->bc_rcvlink->acked;
 	struct tipc_mon_state *mstate = &l->mon_state;
 
+	trace_tipc_link_timeout(l, TIPC_DUMP_NONE, " ");
+	trace_tipc_link_too_silent(l, TIPC_DUMP_ALL, " ");
 	switch (l->state) {
 	case LINK_ESTABLISHED:
 	case LINK_SYNCHING:
@@ -822,6 +843,7 @@ static int link_schedule_user(struct tipc_link *l, struct tipc_msg *hdr)
 	TIPC_SKB_CB(skb)->chain_imp = msg_importance(hdr);
 	skb_queue_tail(&l->wakeupq, skb);
 	l->stats.link_congs++;
+	trace_tipc_link_conges(l, TIPC_DUMP_ALL, "wakeup scheduled!");
 	return -ELINKCONG;
 }
 
@@ -853,7 +875,9 @@ void tipc_link_reset(struct tipc_link *l)
 
 	__skb_queue_head_init(&list);
 
-	l->peer_session = ANY_SESSION;
+	l->in_session = false;
+	/* Force re-synch of peer session number before establishing */
+	l->peer_session--;
 	l->session++;
 	l->mtu = l->advertised_mtu;
 
@@ -1052,6 +1076,7 @@ static int tipc_link_retrans(struct tipc_link *l, struct tipc_link *r,
 	if (less(to, from))
 		return 0;
 
+	trace_tipc_link_retrans(r, from, to, &l->transmq);
 	/* Detect repeated retransmit failures on same packet */
 	if (r->prev_from != from) {
 		r->prev_from = from;
@@ -1059,6 +1084,9 @@ static int tipc_link_retrans(struct tipc_link *l, struct tipc_link *r,
 		r->stale_cnt = 0;
 	} else if (++r->stale_cnt > 99 && time_after(jiffies, r->stale_limit)) {
 		link_retransmit_failure(l, skb);
+		trace_tipc_list_dump(&l->transmq, true, "retrans failure!");
+		trace_tipc_link_dump(l, TIPC_DUMP_NONE, "retrans failure!");
+		trace_tipc_link_dump(r, TIPC_DUMP_NONE, "retrans failure!");
 		if (link_is_bc_sndlink(l))
 			return TIPC_LINK_DOWN_EVT;
 		return tipc_link_fsm_evt(l, LINK_FAILURE_EVT);
@@ -1108,6 +1136,7 @@ static bool tipc_data_input(struct tipc_link *l, struct sk_buff *skb,
 			skb_queue_tail(mc_inputq, skb);
 			return true;
 		}
+		/* fall through */
 	case CONN_MANAGER:
 		skb_queue_tail(inputq, skb);
 		return true;
@@ -1242,6 +1271,106 @@ static bool tipc_link_release_pkts(struct tipc_link *l, u16 acked)
 	return released;
 }
 
+/* tipc_build_gap_ack_blks - build Gap ACK blocks
+ * @l: tipc link that data have come with gaps in sequence if any
+ * @data: data buffer to store the Gap ACK blocks after built
+ *
+ * returns the actual allocated memory size
+ */
+static u16 tipc_build_gap_ack_blks(struct tipc_link *l, void *data)
+{
+	struct sk_buff *skb = skb_peek(&l->deferdq);
+	struct tipc_gap_ack_blks *ga = data;
+	u16 len, expect, seqno = 0;
+	u8 n = 0;
+
+	if (!skb)
+		goto exit;
+
+	expect = buf_seqno(skb);
+	skb_queue_walk(&l->deferdq, skb) {
+		seqno = buf_seqno(skb);
+		if (unlikely(more(seqno, expect))) {
+			ga->gacks[n].ack = htons(expect - 1);
+			ga->gacks[n].gap = htons(seqno - expect);
+			if (++n >= MAX_GAP_ACK_BLKS) {
+				pr_info_ratelimited("Too few Gap ACK blocks!\n");
+				goto exit;
+			}
+		} else if (unlikely(less(seqno, expect))) {
+			pr_warn("Unexpected skb in deferdq!\n");
+			continue;
+		}
+		expect = seqno + 1;
+	}
+
+	/* last block */
+	ga->gacks[n].ack = htons(seqno);
+	ga->gacks[n].gap = 0;
+	n++;
+
+exit:
+	len = tipc_gap_ack_blks_sz(n);
+	ga->len = htons(len);
+	ga->gack_cnt = n;
+	return len;
+}
+
+/* tipc_link_advance_transmq - advance TIPC link transmq queue by releasing
+ *			       acked packets, also doing retransmissions if
+ *			       gaps found
+ * @l: tipc link with transmq queue to be advanced
+ * @acked: seqno of last packet acked by peer without any gaps before
+ * @gap: # of gap packets
+ * @ga: buffer pointer to Gap ACK blocks from peer
+ * @xmitq: queue for accumulating the retransmitted packets if any
+ */
+static void tipc_link_advance_transmq(struct tipc_link *l, u16 acked, u16 gap,
+				      struct tipc_gap_ack_blks *ga,
+				      struct sk_buff_head *xmitq)
+{
+	struct sk_buff *skb, *_skb, *tmp;
+	struct tipc_msg *hdr;
+	u16 bc_ack = l->bc_rcvlink->rcv_nxt - 1;
+	u16 ack = l->rcv_nxt - 1;
+	u16 seqno;
+	u16 n = 0;
+
+	skb_queue_walk_safe(&l->transmq, skb, tmp) {
+		seqno = buf_seqno(skb);
+
+next_gap_ack:
+		if (less_eq(seqno, acked)) {
+			/* release skb */
+			__skb_unlink(skb, &l->transmq);
+			kfree_skb(skb);
+		} else if (less_eq(seqno, acked + gap)) {
+			/* retransmit skb */
+			if (time_before(jiffies, TIPC_SKB_CB(skb)->nxt_retr))
+				continue;
+			TIPC_SKB_CB(skb)->nxt_retr = TIPC_UC_RETR_TIME;
+
+			_skb = __pskb_copy(skb, MIN_H_SIZE, GFP_ATOMIC);
+			if (!_skb)
+				continue;
+			hdr = buf_msg(_skb);
+			msg_set_ack(hdr, ack);
+			msg_set_bcast_ack(hdr, bc_ack);
+			_skb->priority = TC_PRIO_CONTROL;
+			__skb_queue_tail(xmitq, _skb);
+			l->stats.retransmitted++;
+		} else {
+			/* retry with Gap ACK blocks if any */
+			if (!ga || n >= ga->gack_cnt)
+				break;
+			acked = ntohs(ga->gacks[n].ack);
+			gap = ntohs(ga->gacks[n].gap);
+			n++;
+			goto next_gap_ack;
+		}
+	}
+}
+
 /* tipc_link_build_state_msg: prepare link state message for transmission
  *
  * Note that sending of broadcast ack is coordinated among nodes, to reduce
@@ -1296,6 +1425,7 @@ static int tipc_link_build_nack_msg(struct tipc_link *l,
 				    struct sk_buff_head *xmitq)
 {
 	u32 def_cnt = ++l->stats.deferred_recv;
+	u32 defq_len = skb_queue_len(&l->deferdq);
 	int match1, match2;
 
 	if (link_is_bc_rcvlink(l)) {
@@ -1306,7 +1436,7 @@ static int tipc_link_build_nack_msg(struct tipc_link *l,
 		return 0;
 	}
 
-	if ((skb_queue_len(&l->deferdq) == 1) || !(def_cnt % TIPC_NACK_INTV))
+	if (defq_len >= 3 && !((defq_len - 3) % 16))
 		tipc_link_build_proto_msg(l, STATE_MSG, 0, 0, 0, 0, 0, xmitq);
 	return 0;
 }
@@ -1320,9 +1450,16 @@ int tipc_link_rcv(struct tipc_link *l, struct sk_buff *skb,
 		  struct sk_buff_head *xmitq)
 {
 	struct sk_buff_head *defq = &l->deferdq;
-	struct tipc_msg *hdr;
+	struct tipc_msg *hdr = buf_msg(skb);
 	u16 seqno, rcv_nxt, win_lim;
 	int rc = 0;
+
+	/* Verify and update link state */
+	if (unlikely(msg_user(hdr) == LINK_PROTOCOL))
+		return tipc_link_proto_rcv(l, skb, xmitq);
+
+	/* Don't send probe at next timeout expiration */
+	l->silent_intv_cnt = 0;
 
 	do {
 		hdr = buf_msg(skb);
@@ -1330,18 +1467,11 @@ int tipc_link_rcv(struct tipc_link *l, struct sk_buff *skb,
 		rcv_nxt = l->rcv_nxt;
 		win_lim = rcv_nxt + TIPC_MAX_LINK_WIN;
 
-		/* Verify and update link state */
-		if (unlikely(msg_user(hdr) == LINK_PROTOCOL))
-			return tipc_link_proto_rcv(l, skb, xmitq);
-
 		if (unlikely(!link_is_up(l))) {
 			if (l->state == LINK_ESTABLISHING)
 				rc = TIPC_LINK_UP_EVT;
 			goto drop;
 		}
-
-		/* Don't send probe at next timeout expiration */
-		l->silent_intv_cnt = 0;
 
 		/* Drop if outside receive window */
 		if (unlikely(less(seqno, rcv_nxt) || more(seqno, win_lim))) {
@@ -1376,7 +1506,7 @@ int tipc_link_rcv(struct tipc_link *l, struct sk_buff *skb,
 			rc |= tipc_link_build_state_msg(l, xmitq);
 		if (unlikely(rc & ~TIPC_LINK_SND_STATE))
 			break;
-	} while ((skb = __skb_dequeue(defq)));
+	} while ((skb = __tipc_skb_dequeue(defq, l->rcv_nxt)));
 
 	return rc;
 drop:
@@ -1397,6 +1527,7 @@ static void tipc_link_build_proto_msg(struct tipc_link *l, int mtyp, bool probe,
 	struct tipc_mon_state *mstate = &l->mon_state;
 	int dlen = 0;
 	void *data;
+	u16 glen = 0;
 
 	/* Don't send protocol message during reset or link failover */
 	if (tipc_link_is_blocked(l))
@@ -1409,8 +1540,8 @@ static void tipc_link_build_proto_msg(struct tipc_link *l, int mtyp, bool probe,
 		rcvgap = buf_seqno(skb_peek(dfq)) - l->rcv_nxt;
 
 	skb = tipc_msg_create(LINK_PROTOCOL, mtyp, INT_H_SIZE,
-			      tipc_max_domain_size, l->addr,
-			      tipc_own_addr(l->net), 0, 0, 0);
+			      tipc_max_domain_size + MAX_GAP_ACK_BLKS_SZ,
+			      l->addr, tipc_own_addr(l->net), 0, 0, 0);
 	if (!skb)
 		return;
 
@@ -1437,13 +1568,19 @@ static void tipc_link_build_proto_msg(struct tipc_link *l, int mtyp, bool probe,
 		msg_set_bc_gap(hdr, link_bc_rcv_gap(bcl));
 		msg_set_probe(hdr, probe);
 		msg_set_is_keepalive(hdr, probe || probe_reply);
-		tipc_mon_prep(l->net, data, &dlen, mstate, l->bearer_id);
-		msg_set_size(hdr, INT_H_SIZE + dlen);
-		skb_trim(skb, INT_H_SIZE + dlen);
+		if (l->peer_caps & TIPC_GAP_ACK_BLOCK)
+			glen = tipc_build_gap_ack_blks(l, data);
+		tipc_mon_prep(l->net, data + glen, &dlen, mstate, l->bearer_id);
+		msg_set_size(hdr, INT_H_SIZE + glen + dlen);
+		skb_trim(skb, INT_H_SIZE + glen + dlen);
 		l->stats.sent_states++;
 		l->rcv_unacked = 0;
 	} else {
 		/* RESET_MSG or ACTIVATE_MSG */
+		if (mtyp == ACTIVATE_MSG) {
+			msg_set_dest_session_valid(hdr, 1);
+			msg_set_dest_session(hdr, l->peer_session);
+		}
 		msg_set_max_pkt(hdr, l->advertised_mtu);
 		strcpy(data, l->if_name);
 		msg_set_size(hdr, INT_H_SIZE + TIPC_MAX_IF_NAME);
@@ -1455,6 +1592,7 @@ static void tipc_link_build_proto_msg(struct tipc_link *l, int mtyp, bool probe,
 		l->stats.sent_nacks++;
 	skb->priority = TC_PRIO_CONTROL;
 	__skb_queue_tail(xmitq, skb);
+	trace_tipc_proto_build(skb, false, l->name);
 }
 
 void tipc_link_create_dummy_tnl_msg(struct tipc_link *l,
@@ -1567,6 +1705,82 @@ tnl:
 	}
 }
 
+/**
+ * tipc_link_failover_prepare() - prepare tnl for link failover
+ *
+ * This is a special version of the precursor - tipc_link_tnl_prepare(),
+ * see the tipc_node_link_failover() for details
+ *
+ * @l: failover link
+ * @tnl: tunnel link
+ * @xmitq: queue for messages to be xmited
+ */
+void tipc_link_failover_prepare(struct tipc_link *l, struct tipc_link *tnl,
+				struct sk_buff_head *xmitq)
+{
+	struct sk_buff_head *fdefq = &tnl->failover_deferdq;
+
+	tipc_link_create_dummy_tnl_msg(tnl, xmitq);
+
+	/* This failover link enpoint was never established before,
+	 * so it has not received anything from peer.
+	 * Otherwise, it must be a normal failover situation or the
+	 * node has entered SELF_DOWN_PEER_LEAVING and both peer nodes
+	 * would have to start over from scratch instead.
+	 */
+	WARN_ON(l && tipc_link_is_up(l));
+	tnl->drop_point = 1;
+	tnl->failover_reasm_skb = NULL;
+
+	/* Initiate the link's failover deferdq */
+	if (unlikely(!skb_queue_empty(fdefq))) {
+		pr_warn("Link failover deferdq not empty: %d!\n",
+			skb_queue_len(fdefq));
+		__skb_queue_purge(fdefq);
+	}
+}
+
+/* tipc_link_validate_msg(): validate message against current link state
+ * Returns true if message should be accepted, otherwise false
+ */
+bool tipc_link_validate_msg(struct tipc_link *l, struct tipc_msg *hdr)
+{
+	u16 curr_session = l->peer_session;
+	u16 session = msg_session(hdr);
+	int mtyp = msg_type(hdr);
+
+	if (msg_user(hdr) != LINK_PROTOCOL)
+		return true;
+
+	switch (mtyp) {
+	case RESET_MSG:
+		if (!l->in_session)
+			return true;
+		/* Accept only RESET with new session number */
+		return more(session, curr_session);
+	case ACTIVATE_MSG:
+		if (!l->in_session)
+			return true;
+		/* Accept only ACTIVATE with new or current session number */
+		return !less(session, curr_session);
+	case STATE_MSG:
+		/* Accept only STATE with current session number */
+		if (!l->in_session)
+			return false;
+		if (session != curr_session)
+			return false;
+		/* Extra sanity check */
+		if (!link_is_up(l) && msg_ack(hdr))
+			return false;
+		if (!(l->peer_caps & TIPC_LINK_PROTO_SEQNO))
+			return true;
+		/* Accept only STATE with new sequence number */
+		return !less(msg_seqno(hdr), l->rcv_nxt_state);
+	default:
+		return false;
+	}
+}
+
 /* tipc_link_proto_rcv(): receive link level protocol message :
  * Note that network plane id propagates through the network, and may
  * change at any time. The node with lowest numerical id determines
@@ -1576,6 +1790,7 @@ static int tipc_link_proto_rcv(struct tipc_link *l, struct sk_buff *skb,
 			       struct sk_buff_head *xmitq)
 {
 	struct tipc_msg *hdr = buf_msg(skb);
+	struct tipc_gap_ack_blks *ga = NULL;
 	u16 rcvgap = 0;
 	u16 ack = msg_ack(hdr);
 	u16 gap = msg_seq_gap(hdr);
@@ -1586,10 +1801,12 @@ static int tipc_link_proto_rcv(struct tipc_link *l, struct sk_buff *skb,
 	u16 dlen = msg_data_sz(hdr);
 	int mtyp = msg_type(hdr);
 	bool reply = msg_probe(hdr);
+	u16 glen = 0;
 	void *data;
 	char *if_name;
 	int rc = 0;
 
+	trace_tipc_proto_rcv(skb, false, l->name);
 	if (tipc_link_is_blocked(l) || !xmitq)
 		goto exit;
 
@@ -1600,17 +1817,15 @@ static int tipc_link_proto_rcv(struct tipc_link *l, struct sk_buff *skb,
 	hdr = buf_msg(skb);
 	data = msg_data(hdr);
 
+	if (!tipc_link_validate_msg(l, hdr)) {
+		trace_tipc_skb_dump(skb, false, "PROTO invalid (1)!");
+		trace_tipc_link_dump(l, TIPC_DUMP_NONE, "PROTO invalid (1)!");
+		goto exit;
+	}
+
 	switch (mtyp) {
 	case RESET_MSG:
-
-		/* Ignore duplicate RESET with old session number */
-		if ((less_eq(msg_session(hdr), l->peer_session)) &&
-		    (l->peer_session != ANY_SESSION))
-			break;
-		/* fall thru' */
-
 	case ACTIVATE_MSG:
-
 		/* Complete own link name with peer's interface name */
 		if_name =  strrchr(l->name, ':') + 1;
 		if (sizeof(l->name) - (if_name - l->name) <= TIPC_MAX_IF_NAME)
@@ -1634,6 +1849,17 @@ static int tipc_link_proto_rcv(struct tipc_link *l, struct sk_buff *skb,
 			rc = tipc_link_fsm_evt(l, LINK_FAILURE_EVT);
 			break;
 		}
+
+		/* If this endpoint was re-created while peer was ESTABLISHING
+		 * it doesn't know current session number. Force re-synch.
+		 */
+		if (mtyp == ACTIVATE_MSG && msg_dest_session_valid(hdr) &&
+		    l->session != msg_dest_session(hdr)) {
+			if (less(l->session, msg_dest_session(hdr)))
+				l->session = msg_dest_session(hdr) + 1;
+			break;
+		}
+
 		/* ACTIVATE_MSG serves as PEER_RESET if link is already down */
 		if (mtyp == RESET_MSG || !link_is_up(l))
 			rc = tipc_link_fsm_evt(l, LINK_PEER_RESET_EVT);
@@ -1643,16 +1869,13 @@ static int tipc_link_proto_rcv(struct tipc_link *l, struct sk_buff *skb,
 			rc = TIPC_LINK_UP_EVT;
 
 		l->peer_session = msg_session(hdr);
+		l->in_session = true;
 		l->peer_bearer_id = msg_bearer_id(hdr);
 		if (l->mtu > msg_max_pkt(hdr))
 			l->mtu = msg_max_pkt(hdr);
 		break;
 
 	case STATE_MSG:
-
-		if (l->peer_caps & TIPC_LINK_PROTO_SEQNO &&
-		    less(msg_seqno(hdr), l->rcv_nxt_state))
-			break;
 		l->rcv_nxt_state = msg_seqno(hdr) + 1;
 
 		/* Update own tolerance if peer indicates a non-zero value */
@@ -1677,7 +1900,17 @@ static int tipc_link_proto_rcv(struct tipc_link *l, struct sk_buff *skb,
 				rc = TIPC_LINK_UP_EVT;
 			break;
 		}
-		tipc_mon_rcv(l->net, data, dlen, l->addr,
+
+		/* Receive Gap ACK blocks from peer if any */
+		if (l->peer_caps & TIPC_GAP_ACK_BLOCK) {
+			ga = (struct tipc_gap_ack_blks *)data;
+			glen = ntohs(ga->len);
+			/* sanity check: if failed, ignore Gap ACK blocks */
+			if (glen != tipc_gap_ack_blks_sz(ga->gack_cnt))
+				ga = NULL;
+		}
+
+		tipc_mon_rcv(l->net, data + glen, dlen - glen, l->addr,
 			     &l->mon_state, l->bearer_id);
 
 		/* Send NACK if peer has sent pkts we haven't received yet */
@@ -1686,13 +1919,12 @@ static int tipc_link_proto_rcv(struct tipc_link *l, struct sk_buff *skb,
 		if (rcvgap || reply)
 			tipc_link_build_proto_msg(l, STATE_MSG, 0, reply,
 						  rcvgap, 0, 0, xmitq);
-		tipc_link_release_pkts(l, ack);
+
+		tipc_link_advance_transmq(l, ack, gap, ga, xmitq);
 
 		/* If NACK, retransmit will now start at right position */
-		if (gap) {
-			rc = tipc_link_retrans(l, l, ack + 1, ack + gap, xmitq);
+		if (gap)
 			l->stats.recv_nacks++;
-		}
 
 		tipc_link_advance_backlog(l, xmitq);
 		if (unlikely(!skb_queue_empty(&l->wakeupq)))
@@ -1853,6 +2085,7 @@ void tipc_link_bc_ack_rcv(struct tipc_link *l, u16 acked,
 	if (!more(acked, l->acked))
 		return;
 
+	trace_tipc_link_bc_ack(l, l->acked, acked, &snd_l->transmq);
 	/* Skip over packets peer has already acked */
 	skb_queue_walk(&snd_l->transmq, skb) {
 		if (more(buf_seqno(skb), l->acked))

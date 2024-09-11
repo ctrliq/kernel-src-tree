@@ -26,7 +26,7 @@ static void jump_label_make_nop(struct jump_entry *entry, struct insn *insn)
 {
 	/* brcl 0,offset */
 	insn->opcode = 0xc004;
-	insn->offset = (jump_entry_target(entry) - jump_entry_code(entry)) >> 1;
+	insn->offset = (entry->target - entry->code) >> 1;
 }
 
 static void jump_label_make_branch(struct jump_entry *entry, struct insn *insn)

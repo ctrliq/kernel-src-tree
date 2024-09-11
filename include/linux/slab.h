@@ -154,7 +154,7 @@ void kmem_cache_destroy(struct kmem_cache *);
 int kmem_cache_shrink(struct kmem_cache *);
 
 void memcg_create_kmem_cache(struct mem_cgroup *, struct kmem_cache *);
-void memcg_deactivate_kmem_caches(struct mem_cgroup *);
+void memcg_deactivate_kmem_caches(struct mem_cgroup *, struct mem_cgroup *);
 
 /*
  * Please use this macro to create slab caches. Simply specify the
@@ -644,12 +644,15 @@ struct memcg_cache_params {
 			struct mem_cgroup *memcg;
 			struct list_head children_node;
 			struct list_head kmem_caches_node;
-			struct percpu_ref refcnt;
+			RH_KABI_EXTEND(struct percpu_ref refcnt)
 
-			void (*work_fn)(struct kmem_cache *);
+			void (*RH_KABI_RENAME(deact_fn,
+					      work_fn))(struct kmem_cache *);
 			union {
-				struct rcu_head rcu_head;
-				struct work_struct work;
+				struct rcu_head RH_KABI_RENAME(deact_rcu_head,
+							       rcu_head);
+				struct work_struct RH_KABI_RENAME(deact_work,
+								  work);
 			};
 		};
 	};

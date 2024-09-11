@@ -712,6 +712,10 @@ struct task_struct {
 	unsigned			sched_contributes_to_load:1;
 	unsigned			sched_migrated:1;
 	unsigned			sched_remote_wakeup:1;
+#ifdef CONFIG_PSI
+	RH_KABI_EXTEND(unsigned		sched_psi_wake_requeue:1)
+#endif
+
 	/* Force alignment to the next boundary: */
 	unsigned			:0;
 
@@ -724,7 +728,11 @@ struct task_struct {
 	unsigned			restore_sigmask:1;
 #endif
 #ifdef CONFIG_MEMCG
-	unsigned			in_user_fault:1;
+	RH_KABI_REPLACE_UNSAFE(unsigned	memcg_may_oom:1,
+			       unsigned	in_user_fault:1)
+#ifdef CONFIG_MEMCG_KMEM
+	RH_KABI_DEPRECATE(unsigned,	memcg_kmem_skip_account:1)
+#endif
 #endif
 #ifdef CONFIG_COMPAT_BRK
 	unsigned			brk_randomized:1;
@@ -736,6 +744,10 @@ struct task_struct {
 #ifdef CONFIG_BLK_CGROUP
 	/* to be used once the psi infrastructure lands upstream. */
 	unsigned			use_memdelay:1;
+#endif
+#ifdef CONFIG_CGROUPS
+	/* task is frozen/stopped (used by the cgroup freezer) */
+	RH_KABI_EXTEND(unsigned		frozen:1)
 #endif
 
 	unsigned long			atomic_flags; /* Flags requiring atomic access. */
@@ -778,8 +790,27 @@ struct task_struct {
 	struct list_head		ptrace_entry;
 
 	/* PID/PID hash table linkage. */
+#ifdef __GENKSYMS__
+	struct pid_link			pids[PIDTYPE_MAX];
+#else
+	/*
+	 * RHEL8: For backward compatibility, we need to maintain the pid
+	 * pointers in pid_link. The new thread_pid field is equivalent to
+	 * pids[PIDTYPE_PID].pid and so is put at the same offset. The
+	 * hlist_node in pid_link can be reused as they are not used by
+	 * others.
+	 */
+	/* Used by memcontrol for targeted memcg charge: */
+	struct mem_cgroup		*active_memcg;
+	long				rh_reserved2;
 	struct pid			*thread_pid;
-	struct hlist_node		pid_links[PIDTYPE_MAX];
+	long				rh_reserved3;
+	long				rh_reserved4;
+	struct pid			*rh_pgid;
+	long				rh_reserved5;
+	long				rh_reserved6;
+	struct pid			*rh_sid;
+#endif
 	struct list_head		thread_group;
 	struct list_head		thread_node;
 
@@ -958,7 +989,8 @@ struct task_struct {
 
 	/* Ptrace state: */
 	unsigned long			ptrace_message;
-	kernel_siginfo_t		*last_siginfo;
+	RH_KABI_REPLACE(siginfo_t	*last_siginfo,
+		 kernel_siginfo_t	*last_siginfo)
 
 	struct task_io_accounting	ioac;
 #ifdef CONFIG_TASK_XACCT
@@ -977,13 +1009,17 @@ struct task_struct {
 	int				cpuset_mem_spread_rotor;
 	int				cpuset_slab_spread_rotor;
 #endif
+#ifdef CONFIG_PSI
+	/* Pressure stall state */
+	RH_KABI_FILL_HOLE(unsigned int	psi_flags)
+#endif
 #ifdef CONFIG_CGROUPS
 	/* Control Group info protected by css_set_lock: */
 	struct css_set __rcu		*cgroups;
 	/* cg_list protected by css_set_lock and tsk->alloc_lock: */
 	struct list_head		cg_list;
 #endif
-#ifdef CONFIG_INTEL_RDT
+#ifdef CONFIG_RESCTRL
 	u32				closid;
 	u32				rmid;
 #endif
@@ -1153,9 +1189,6 @@ struct task_struct {
 
 	/* Number of pages to reclaim on returning to userland: */
 	unsigned int			memcg_nr_pages_over_high;
-
-	/* Used by memcontrol for targeted memcg charge: */
-	struct mem_cgroup		*active_memcg;
 #endif
 
 #ifdef CONFIG_BLK_CGROUP
@@ -1197,6 +1230,7 @@ struct task_struct {
 	 */
 	randomized_struct_fields_end
 
+#ifdef __GENKSYMS__
 	RH_KABI_RESERVE(1)
 	RH_KABI_RESERVE(2)
 	RH_KABI_RESERVE(3)
@@ -1205,6 +1239,15 @@ struct task_struct {
 	RH_KABI_RESERVE(6)
 	RH_KABI_RESERVE(7)
 	RH_KABI_RESERVE(8)
+#else
+	/*
+	 * RHEL8: With PIDTYPE_MAX equals 4, the following fields will
+	 * occupy 8 long's. There are some rh_reserved* fields up near
+	 * the pid_link structure that can be reused for other purpose.
+	 */
+	/* PID/PID hash table linkage. */
+	struct hlist_node		pid_links[PIDTYPE_MAX];
+#endif
 
 	/* CPU-specific state of this task: */
 	struct thread_struct		thread;
@@ -1397,8 +1440,11 @@ extern struct pid *cad_pid;
 #define PF_KTHREAD		0x00200000	/* I am a kernel thread */
 #define PF_RANDOMIZE		0x00400000	/* Randomize virtual address space */
 #define PF_SWAPWRITE		0x00800000	/* Allowed to write to swap */
+#define PF_MEMSTALL		0x01000000	/* Stalled due to lack of memory */
+#define PF_UMH			0x02000000	/* I'm an Usermodehelper process */
 #define PF_NO_SETAFFINITY	0x04000000	/* Userland is not allowed to meddle with cpus_allowed */
 #define PF_MCE_EARLY		0x08000000      /* Early kill for mce process policy */
+#define PF_MEMALLOC_NOCMA	0x10000000	/* All allocation request will have _GFP_MOVABLE cleared */
 #define PF_MUTEX_TESTER		0x20000000	/* Thread belongs to the rt mutex tester */
 #define PF_FREEZER_SKIP		0x40000000	/* Freezer should not count it as freezable */
 #define PF_SUSPEND_TASK		0x80000000      /* This thread called freeze_processes() and should not be frozen */
@@ -1899,6 +1945,14 @@ static inline void rseq_execve(struct task_struct *t)
 }
 
 #endif
+
+void __exit_umh(struct task_struct *tsk);
+
+static inline void exit_umh(struct task_struct *tsk)
+{
+	if (unlikely(tsk->flags & PF_UMH))
+		__exit_umh(tsk);
+}
 
 #ifdef CONFIG_DEBUG_RSEQ
 

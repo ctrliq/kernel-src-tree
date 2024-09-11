@@ -1,5 +1,3 @@
-#! /usr/bin/python3
-#
 # Cpu task migration overview toy
 #
 # Copyright (C) 2010 Frederic Weisbecker <fweisbec@gmail.com>

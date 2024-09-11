@@ -375,14 +375,20 @@ static struct tipc_node *tipc_node_create(struct net *net, u32 addr,
 		if (n->capabilities == capabilities)
 			goto exit;
 		/* Same node may come back with new capabilities */
-		write_lock_bh(&n->lock);
+		tipc_node_write_lock(n);
 		n->capabilities = capabilities;
 		for (bearer_id = 0; bearer_id < MAX_BEARERS; bearer_id++) {
 			l = n->links[bearer_id].link;
 			if (l)
 				tipc_link_update_caps(l, capabilities);
 		}
-		write_unlock_bh(&n->lock);
+		tipc_node_write_unlock_fast(n);
+
+		/* Calculate cluster capabilities */
+		tn->capabilities = TIPC_NODE_CAPABILITIES;
+		list_for_each_entry_rcu(temp_node, &tn->node_list, list) {
+			tn->capabilities &= temp_node->capabilities;
+		}
 		goto exit;
 	}
 	n = kzalloc(sizeof(*n), GFP_ATOMIC);
@@ -433,6 +439,12 @@ static struct tipc_node *tipc_node_create(struct net *net, u32 addr,
 			break;
 	}
 	list_add_tail_rcu(&n->list, &temp_node->list);
+	/* Calculate cluster capabilities */
+	tn->capabilities = TIPC_NODE_CAPABILITIES;
+	list_for_each_entry_rcu(temp_node, &tn->node_list, list) {
+		tn->capabilities &= temp_node->capabilities;
+	}
+	trace_tipc_node_create(n, true, " ");
 exit:
 	spin_unlock_bh(&tn->node_list_lock);
 	return n;
@@ -460,6 +472,7 @@ static void tipc_node_delete_from_list(struct tipc_node *node)
 
 static void tipc_node_delete(struct tipc_node *node)
 {
+	trace_tipc_node_delete(node, true, " ");
 	tipc_node_delete_from_list(node);
 
 	del_timer_sync(&node->timer);
@@ -587,6 +600,7 @@ static void  tipc_node_clear_links(struct tipc_node *node)
  */
 static bool tipc_node_cleanup(struct tipc_node *peer)
 {
+	struct tipc_node *temp_node;
 	struct tipc_net *tn = tipc_net(peer->net);
 	bool deleted = false;
 
@@ -602,6 +616,13 @@ static bool tipc_node_cleanup(struct tipc_node *peer)
 		deleted = true;
 	}
 	tipc_node_write_unlock(peer);
+
+	/* Calculate cluster capabilities */
+	tn->capabilities = TIPC_NODE_CAPABILITIES;
+	list_for_each_entry_rcu(temp_node, &tn->node_list, list) {
+		tn->capabilities &= temp_node->capabilities;
+	}
+
 	spin_unlock_bh(&tn->node_list_lock);
 	return deleted;
 }
@@ -617,6 +638,7 @@ static void tipc_node_timeout(struct timer_list *t)
 	int bearer_id;
 	int rc = 0;
 
+	trace_tipc_node_timeout(n, false, " ");
 	if (!node_is_up(n) && tipc_node_cleanup(n)) {
 		/*Removing the reference of Timer*/
 		tipc_node_put(n);
@@ -682,6 +704,7 @@ static void __tipc_node_link_up(struct tipc_node *n, int bearer_id,
 
 	pr_debug("Established link <%s> on network plane %c\n",
 		 tipc_link_name(nl), tipc_link_plane(nl));
+	trace_tipc_node_link_up(n, true, " ");
 
 	/* Ensure that a STATE message goes first */
 	tipc_link_build_state_msg(nl, xmitq);
@@ -691,7 +714,6 @@ static void __tipc_node_link_up(struct tipc_node *n, int bearer_id,
 		*slot0 = bearer_id;
 		*slot1 = bearer_id;
 		tipc_node_fsm_evt(n, SELF_ESTABL_CONTACT_EVT);
-		n->failover_sent = false;
 		n->action_flags |= TIPC_NOTIFY_NODE_UP;
 		tipc_link_set_active(nl, true);
 		tipc_bcast_add_peer(n->net, nl, xmitq);
@@ -731,6 +753,45 @@ static void tipc_node_link_up(struct tipc_node *n, int bearer_id,
 	maddr = &n->links[bearer_id].maddr;
 	tipc_bearer_xmit(n->net, bearer_id, xmitq, maddr);
 	tipc_node_write_unlock(n);
+}
+
+/**
+ * tipc_node_link_failover() - start failover in case "half-failover"
+ *
+ * This function is only called in a very special situation where link
+ * failover can be already started on peer node but not on this node.
+ * This can happen when e.g.
+ *	1. Both links <1A-2A>, <1B-2B> down
+ *	2. Link endpoint 2A up, but 1A still down (e.g. due to network
+ *	   disturbance, wrong session, etc.)
+ *	3. Link <1B-2B> up
+ *	4. Link endpoint 2A down (e.g. due to link tolerance timeout)
+ *	5. Node B starts failover onto link <1B-2B>
+ *
+ *	==> Node A does never start link/node failover!
+ *
+ * @n: tipc node structure
+ * @l: link peer endpoint failingover (- can be NULL)
+ * @tnl: tunnel link
+ * @xmitq: queue for messages to be xmited on tnl link later
+ */
+static void tipc_node_link_failover(struct tipc_node *n, struct tipc_link *l,
+				    struct tipc_link *tnl,
+				    struct sk_buff_head *xmitq)
+{
+	/* Avoid to be "self-failover" that can never end */
+	if (!tipc_link_is_up(tnl))
+		return;
+
+	tipc_link_fsm_evt(tnl, LINK_SYNCH_END_EVT);
+	tipc_node_fsm_evt(n, NODE_SYNCH_END_EVT);
+
+	n->sync_point = tipc_link_rcv_nxt(tnl) + (U16_MAX / 2 - 1);
+	tipc_link_failover_prepare(l, tnl, xmitq);
+
+	if (l)
+		tipc_link_fsm_evt(l, LINK_FAILOVER_BEGIN_EVT);
+	tipc_node_fsm_evt(n, NODE_FAILOVER_BEGIN_EVT);
 }
 
 /**
@@ -784,6 +845,7 @@ static void __tipc_node_link_down(struct tipc_node *n, int *bearer_id,
 		if (tipc_link_peer_is_down(l))
 			tipc_node_fsm_evt(n, PEER_LOST_CONTACT_EVT);
 		tipc_node_fsm_evt(n, SELF_LOST_CONTACT_EVT);
+		trace_tipc_link_reset(l, TIPC_DUMP_ALL, "link down!");
 		tipc_link_fsm_evt(l, LINK_RESET_EVT);
 		tipc_link_reset(l);
 		tipc_link_build_reset_msg(l, xmitq);
@@ -801,6 +863,7 @@ static void __tipc_node_link_down(struct tipc_node *n, int *bearer_id,
 	tipc_node_fsm_evt(n, NODE_SYNCH_END_EVT);
 	n->sync_point = tipc_link_rcv_nxt(tnl) + (U16_MAX / 2 - 1);
 	tipc_link_tnl_prepare(l, tnl, FAILOVER_MSG, xmitq);
+	trace_tipc_link_reset(l, TIPC_DUMP_ALL, "link down -> failover!");
 	tipc_link_reset(l);
 	tipc_link_fsm_evt(l, LINK_RESET_EVT);
 	tipc_link_fsm_evt(l, LINK_FAILOVER_BEGIN_EVT);
@@ -824,15 +887,17 @@ static void tipc_node_link_down(struct tipc_node *n, int bearer_id, bool delete)
 	tipc_node_write_lock(n);
 	if (!tipc_link_is_establishing(l)) {
 		__tipc_node_link_down(n, &bearer_id, &xmitq, &maddr);
-		if (delete) {
-			kfree(l);
-			le->link = NULL;
-			n->link_cnt--;
-		}
 	} else {
 		/* Defuse pending tipc_node_link_up() */
+		tipc_link_reset(l);
 		tipc_link_fsm_evt(l, LINK_RESET_EVT);
 	}
+	if (delete) {
+		kfree(l);
+		le->link = NULL;
+		n->link_cnt--;
+	}
+	trace_tipc_node_link_down(n, true, "node link down or deleted!");
 	tipc_node_write_unlock(n);
 	if (delete)
 		tipc_mon_remove_peer(n->net, n->addr, old_bearer_id);
@@ -1023,6 +1088,7 @@ void tipc_node_check_dest(struct net *net, u32 addr,
 			*respond = false;
 			goto exit;
 		}
+		trace_tipc_link_reset(l, TIPC_DUMP_ALL, "link created!");
 		tipc_link_reset(l);
 		tipc_link_fsm_evt(l, LINK_RESET_EVT);
 		if (n->state == NODE_FAILINGOVER)
@@ -1062,6 +1128,7 @@ static void tipc_node_reset_links(struct tipc_node *n)
 
 	pr_warn("Resetting all links to %x\n", n->addr);
 
+	trace_tipc_node_reset_links(n, true, " ");
 	for (i = 0; i < MAX_BEARERS; i++) {
 		tipc_node_link_down(n, i, false);
 	}
@@ -1237,11 +1304,13 @@ static void tipc_node_fsm_evt(struct tipc_node *n, int evt)
 		pr_err("Unknown node fsm state %x\n", state);
 		break;
 	}
+	trace_tipc_node_fsm(n->peer_id, n->state, state, evt);
 	n->state = state;
 	return;
 
 illegal_evt:
 	pr_err("Illegal node fsm evt %x in state %x\n", evt, state);
+	trace_tipc_node_fsm(n->peer_id, n->state, state, evt);
 }
 
 static void node_lost_contact(struct tipc_node *n,
@@ -1255,6 +1324,7 @@ static void node_lost_contact(struct tipc_node *n,
 
 	pr_debug("Lost contact with %x\n", n->addr);
 	n->delete_at = jiffies + msecs_to_jiffies(NODE_CLEANUP_AFTER);
+	trace_tipc_node_lost_contact(n, true, " ");
 
 	/* Clean up broadcast state */
 	tipc_bcast_remove_peer(n->net, n->bc_entry.link);
@@ -1566,7 +1636,7 @@ static void tipc_node_bc_rcv(struct net *net, struct sk_buff *skb, int bearer_id
  * tipc_node_check_state - check and if necessary update node state
  * @skb: TIPC packet
  * @bearer_id: identity of bearer delivering the packet
- * Returns true if state is ok, otherwise consumes buffer and returns false
+ * Returns true if state and msg are ok, otherwise false
  */
 static bool tipc_node_check_state(struct tipc_node *n, struct sk_buff *skb,
 				  int bearer_id, struct sk_buff_head *xmitq)
@@ -1583,6 +1653,10 @@ static bool tipc_node_check_state(struct tipc_node *n, struct sk_buff *skb,
 	struct tipc_media_addr *maddr;
 	int pb_id;
 
+	if (trace_tipc_node_check_state_enabled()) {
+		trace_tipc_skb_dump(skb, false, "skb for node state check");
+		trace_tipc_node_check_state(n, true, " ");
+	}
 	l = n->links[bearer_id].link;
 	if (!l)
 		return false;
@@ -1598,6 +1672,12 @@ static bool tipc_node_check_state(struct tipc_node *n, struct sk_buff *skb,
 			pl = n->links[pb_id].link;
 			break;
 		}
+	}
+
+	if (!tipc_link_validate_msg(l, hdr)) {
+		trace_tipc_skb_dump(skb, false, "PROTO invalid (2)!");
+		trace_tipc_link_dump(l, TIPC_DUMP_NONE, "PROTO invalid (2)!");
+		return false;
 	}
 
 	/* Check and update node accesibility if applicable */
@@ -1628,17 +1708,20 @@ static bool tipc_node_check_state(struct tipc_node *n, struct sk_buff *skb,
 		syncpt = oseqno + exp_pkts - 1;
 		if (pl && tipc_link_is_up(pl)) {
 			__tipc_node_link_down(n, &pb_id, xmitq, &maddr);
+			trace_tipc_node_link_down(n, true,
+						  "node link down <- failover!");
 			tipc_skb_queue_splice_tail_init(tipc_link_inputq(pl),
 							tipc_link_inputq(l));
 		}
+
 		/* If parallel link was already down, and this happened before
-		 * the tunnel link came up, FAILOVER was never sent. Ensure that
-		 * FAILOVER is sent to get peer out of NODE_FAILINGOVER state.
+		 * the tunnel link came up, node failover was never started.
+		 * Ensure that a FAILOVER_MSG is sent to get peer out of
+		 * NODE_FAILINGOVER state, also this node must accept
+		 * TUNNEL_MSGs from peer.
 		 */
-		if (n->state != NODE_FAILINGOVER && !n->failover_sent) {
-			tipc_link_create_dummy_tnl_msg(l, xmitq);
-			n->failover_sent = true;
-		}
+		if (n->state != NODE_FAILINGOVER)
+			tipc_node_link_failover(n, pl, l, xmitq);
 
 		/* If pkts arrive out of order, use lowest calculated syncpt */
 		if (less(syncpt, n->sync_point))

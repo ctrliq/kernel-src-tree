@@ -211,9 +211,9 @@ struct ib_fmr_pool *ib_create_fmr_pool(struct ib_pd             *pd,
 		return ERR_PTR(-EINVAL);
 
 	device = pd->device;
-	if (!device->alloc_fmr    || !device->dealloc_fmr  ||
-	    !device->map_phys_fmr || !device->unmap_fmr) {
-		pr_info(PFX "Device %s does not support FMRs\n", device->name);
+	if (!device->ops.alloc_fmr    || !device->ops.dealloc_fmr  ||
+	    !device->ops.map_phys_fmr || !device->ops.unmap_fmr) {
+		dev_info(&device->dev, "Device does not support FMRs\n");
 		return ERR_PTR(-ENOSYS);
 	}
 
@@ -257,7 +257,8 @@ struct ib_fmr_pool *ib_create_fmr_pool(struct ib_pd             *pd,
 	atomic_set(&pool->flush_ser, 0);
 	init_waitqueue_head(&pool->force_wait);
 
-	pool->worker = kthread_create_worker(0, "ib_fmr(%s)", device->name);
+	pool->worker =
+		kthread_create_worker(0, "ib_fmr(%s)", dev_name(&device->dev));
 	if (IS_ERR(pool->worker)) {
 		pr_warn(PFX "couldn't start cleanup kthread worker\n");
 		ret = PTR_ERR(pool->worker);

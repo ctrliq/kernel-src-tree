@@ -1157,7 +1157,8 @@ static void ocrdma_del_qpn_map(struct ocrdma_dev *dev, struct ocrdma_qp *qp)
 }
 
 static int ocrdma_check_qp_params(struct ib_pd *ibpd, struct ocrdma_dev *dev,
-				  struct ib_qp_init_attr *attrs)
+				  struct ib_qp_init_attr *attrs,
+				  struct ib_udata *udata)
 {
 	if ((attrs->qp_type != IB_QPT_GSI) &&
 	    (attrs->qp_type != IB_QPT_RC) &&
@@ -1205,7 +1206,7 @@ static int ocrdma_check_qp_params(struct ib_pd *ibpd, struct ocrdma_dev *dev,
 		return -EINVAL;
 	}
 	/* unprivileged user space cannot create special QP */
-	if (ibpd->uobject && attrs->qp_type == IB_QPT_GSI) {
+	if (udata && attrs->qp_type == IB_QPT_GSI) {
 		pr_err
 		    ("%s(%d) Userspace can't create special QPs of type=0x%x\n",
 		     __func__, dev->id, attrs->qp_type);
@@ -1362,7 +1363,7 @@ struct ib_qp *ocrdma_create_qp(struct ib_pd *ibpd,
 	struct ocrdma_create_qp_ureq ureq;
 	u16 dpp_credit_lmt, dpp_offset;
 
-	status = ocrdma_check_qp_params(ibpd, dev, attrs);
+	status = ocrdma_check_qp_params(ibpd, dev, attrs, udata);
 	if (status)
 		goto gen_err;
 
@@ -2153,8 +2154,8 @@ static void ocrdma_ring_sq_db(struct ocrdma_qp *qp)
 	iowrite32(val, qp->sq_db);
 }
 
-int ocrdma_post_send(struct ib_qp *ibqp, struct ib_send_wr *wr,
-		     struct ib_send_wr **bad_wr)
+int ocrdma_post_send(struct ib_qp *ibqp, const struct ib_send_wr *wr,
+		     const struct ib_send_wr **bad_wr)
 {
 	int status = 0;
 	struct ocrdma_qp *qp = get_ocrdma_qp(ibqp);
@@ -2265,8 +2266,8 @@ static void ocrdma_ring_rq_db(struct ocrdma_qp *qp)
 	iowrite32(val, qp->rq_db);
 }
 
-static void ocrdma_build_rqe(struct ocrdma_hdr_wqe *rqe, struct ib_recv_wr *wr,
-			     u16 tag)
+static void ocrdma_build_rqe(struct ocrdma_hdr_wqe *rqe,
+			     const struct ib_recv_wr *wr, u16 tag)
 {
 	u32 wqe_size = 0;
 	struct ocrdma_sge *sge;
@@ -2286,8 +2287,8 @@ static void ocrdma_build_rqe(struct ocrdma_hdr_wqe *rqe, struct ib_recv_wr *wr,
 	ocrdma_cpu_to_le32(rqe, wqe_size);
 }
 
-int ocrdma_post_recv(struct ib_qp *ibqp, struct ib_recv_wr *wr,
-		     struct ib_recv_wr **bad_wr)
+int ocrdma_post_recv(struct ib_qp *ibqp, const struct ib_recv_wr *wr,
+		     const struct ib_recv_wr **bad_wr)
 {
 	int status = 0;
 	unsigned long flags;
@@ -2356,8 +2357,8 @@ static void ocrdma_ring_srq_db(struct ocrdma_srq *srq)
 	iowrite32(val, srq->db + OCRDMA_DB_GEN2_SRQ_OFFSET);
 }
 
-int ocrdma_post_srq_recv(struct ib_srq *ibsrq, struct ib_recv_wr *wr,
-			 struct ib_recv_wr **bad_wr)
+int ocrdma_post_srq_recv(struct ib_srq *ibsrq, const struct ib_recv_wr *wr,
+			 const struct ib_recv_wr **bad_wr)
 {
 	int status = 0;
 	unsigned long flags;

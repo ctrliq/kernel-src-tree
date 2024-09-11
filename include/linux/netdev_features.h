@@ -74,7 +74,7 @@ enum {
 	__NETIF_F_RH_KABI_PLACEHOLDER_6,
 	__NETIF_F_RH_KABI_PLACEHOLDER_7,
 	__NETIF_F_RH_KABI_PLACEHOLDER_8,
-	__NETIF_F_RH_KABI_PLACEHOLDER_9,
+	NETIF_F_HW_TLS_RX_BIT,		/* Hardware TLS RX offload */
 
 	NETIF_F_FCOE_CRC_BIT,		/* FCoE CRC32 */
 	NETIF_F_SCTP_CRC_BIT,		/* SCTP checksum offload */
@@ -96,7 +96,6 @@ enum {
 	NETIF_F_HW_ESP_TX_CSUM_BIT,	/* ESP with TX checksum offload */
 	NETIF_F_RX_UDP_TUNNEL_PORT_BIT, /* Offload of RX port for UDP tunnels */
 	NETIF_F_HW_TLS_TX_BIT,		/* Hardware TLS TX offload */
-	NETIF_F_HW_TLS_RX_BIT,		/* Hardware TLS RX offload */
 
 	NETIF_F_GRO_HW_BIT,		/* Hardware Generic receive offload */
 	NETIF_F_HW_TLS_RECORD_BIT,	/* Offload TLS record */

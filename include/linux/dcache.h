@@ -120,8 +120,11 @@ struct dentry {
 		struct hlist_bl_node d_in_lookup_hash;	/* only for in-lookup ones */
 	 	struct rcu_head d_rcu;
 	} d_u;
+#ifdef __GENKSYMS__
+	/* Undo RH_KABI_RESERVE() */
 	RH_KABI_RESERVE(1)
 	RH_KABI_RESERVE(2)
+#endif
 } __randomize_layout;
 
 /*

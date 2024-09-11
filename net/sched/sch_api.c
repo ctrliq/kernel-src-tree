@@ -1744,7 +1744,7 @@ static int tc_dump_qdisc(struct sk_buff *skb, struct netlink_callback *cb)
 	ASSERT_RTNL();
 
 	err = nlmsg_parse(nlh, sizeof(struct tcmsg), tca, TCA_MAX,
-			  rtm_tca_policy, NULL);
+			  rtm_tca_policy, cb->extack);
 	if (err < 0)
 		return err;
 
@@ -1931,14 +1931,14 @@ static void tc_bind_tclass(struct Qdisc *q, u32 portid, u32 clid,
 	     chain = tcf_get_next_chain(block, chain)) {
 		struct tcf_proto *tp;
 
-		for (tp = tcf_get_next_proto(chain, NULL);
-		     tp; tp = tcf_get_next_proto(chain, tp)) {
+		for (tp = tcf_get_next_proto(chain, NULL, true);
+		     tp; tp = tcf_get_next_proto(chain, tp, true)) {
 			struct tcf_bind_args arg = {};
 
 			arg.w.fn = tcf_node_bind;
 			arg.classid = clid;
 			arg.cl = new_cl;
-			tp->ops->walk(tp, &arg.w);
+			tp->ops->walk(tp, &arg.w, true);
 		}
 	}
 }

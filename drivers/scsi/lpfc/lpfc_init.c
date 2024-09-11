@@ -2325,82 +2325,8 @@ lpfc_get_hba_model_desc(struct lpfc_hba *phba, uint8_t *mdp, uint8_t *descp)
 	vp = &phba->vpd;
 
 	switch (dev_id) {
-	case PCI_DEVICE_ID_FIREFLY:
-		m = (typeof(m)){"LP6000", "PCI",
-				"Obsolete, Unsupported Fibre Channel Adapter"};
-		break;
-	case PCI_DEVICE_ID_SUPERFLY:
-		if (vp->rev.biuRev >= 1 && vp->rev.biuRev <= 3)
-			m = (typeof(m)){"LP7000", "PCI", ""};
-		else
-			m = (typeof(m)){"LP7000E", "PCI", ""};
-		m.function = "Obsolete, Unsupported Fibre Channel Adapter";
-		break;
-	case PCI_DEVICE_ID_DRAGONFLY:
-		m = (typeof(m)){"LP8000", "PCI",
-				"Obsolete, Unsupported Fibre Channel Adapter"};
-		break;
-	case PCI_DEVICE_ID_CENTAUR:
-		if (FC_JEDEC_ID(vp->rev.biuRev) == CENTAUR_2G_JEDEC_ID)
-			m = (typeof(m)){"LP9002", "PCI", ""};
-		else
-			m = (typeof(m)){"LP9000", "PCI", ""};
-		m.function = "Obsolete, Unsupported Fibre Channel Adapter";
-		break;
-	case PCI_DEVICE_ID_RFLY:
-		m = (typeof(m)){"LP952", "PCI",
-				"Obsolete, Unsupported Fibre Channel Adapter"};
-		break;
-	case PCI_DEVICE_ID_PEGASUS:
-		m = (typeof(m)){"LP9802", "PCI-X",
-				"Obsolete, Unsupported Fibre Channel Adapter"};
-		break;
-	case PCI_DEVICE_ID_THOR:
-		m = (typeof(m)){"LP10000", "PCI-X",
-				"Obsolete, Unsupported Fibre Channel Adapter"};
-		break;
-	case PCI_DEVICE_ID_VIPER:
-		m = (typeof(m)){"LPX1000",  "PCI-X",
-				"Obsolete, Unsupported Fibre Channel Adapter"};
-		break;
-	case PCI_DEVICE_ID_PFLY:
-		m = (typeof(m)){"LP982", "PCI-X",
-				"Obsolete, Unsupported Fibre Channel Adapter"};
-		break;
-	case PCI_DEVICE_ID_TFLY:
-		m = (typeof(m)){"LP1050", "PCI-X",
-				"Obsolete, Unsupported Fibre Channel Adapter"};
-		break;
-	case PCI_DEVICE_ID_HELIOS:
-		m = (typeof(m)){"LP11000", "PCI-X2",
-				"Obsolete, Unsupported Fibre Channel Adapter"};
-		break;
-	case PCI_DEVICE_ID_HELIOS_SCSP:
-		m = (typeof(m)){"LP11000-SP", "PCI-X2",
-				"Obsolete, Unsupported Fibre Channel Adapter"};
-		break;
-	case PCI_DEVICE_ID_HELIOS_DCSP:
-		m = (typeof(m)){"LP11002-SP",  "PCI-X2",
-				"Obsolete, Unsupported Fibre Channel Adapter"};
-		break;
-	case PCI_DEVICE_ID_NEPTUNE:
-		m = (typeof(m)){"LPe1000", "PCIe",
-				"Obsolete, Unsupported Fibre Channel Adapter"};
-		break;
-	case PCI_DEVICE_ID_NEPTUNE_SCSP:
-		m = (typeof(m)){"LPe1000-SP", "PCIe",
-				"Obsolete, Unsupported Fibre Channel Adapter"};
-		break;
-	case PCI_DEVICE_ID_NEPTUNE_DCSP:
-		m = (typeof(m)){"LPe1002-SP", "PCIe",
-				"Obsolete, Unsupported Fibre Channel Adapter"};
-		break;
 	case PCI_DEVICE_ID_BMID:
 		m = (typeof(m)){"LP1150", "PCI-X2", "Fibre Channel Adapter"};
-		break;
-	case PCI_DEVICE_ID_BSMB:
-		m = (typeof(m)){"LP111", "PCI-X2",
-				"Obsolete, Unsupported Fibre Channel Adapter"};
 		break;
 	case PCI_DEVICE_ID_ZEPHYR:
 		m = (typeof(m)){"LPe11000", "PCIe", "Fibre Channel Adapter"};
@@ -2417,22 +2343,6 @@ lpfc_get_hba_model_desc(struct lpfc_hba *phba, uint8_t *mdp, uint8_t *descp)
 		break;
 	case PCI_DEVICE_ID_ZSMB:
 		m = (typeof(m)){"LPe111", "PCIe", "Fibre Channel Adapter"};
-		break;
-	case PCI_DEVICE_ID_LP101:
-		m = (typeof(m)){"LP101", "PCI-X",
-				"Obsolete, Unsupported Fibre Channel Adapter"};
-		break;
-	case PCI_DEVICE_ID_LP10000S:
-		m = (typeof(m)){"LP10000-S", "PCI",
-				"Obsolete, Unsupported Fibre Channel Adapter"};
-		break;
-	case PCI_DEVICE_ID_LP11000S:
-		m = (typeof(m)){"LP11000-S", "PCI-X2",
-				"Obsolete, Unsupported Fibre Channel Adapter"};
-		break;
-	case PCI_DEVICE_ID_LPE11000S:
-		m = (typeof(m)){"LPe11000-S", "PCIe",
-				"Obsolete, Unsupported Fibre Channel Adapter"};
 		break;
 	case PCI_DEVICE_ID_SAT:
 		m = (typeof(m)){"LPe12000", "PCIe", "Fibre Channel Adapter"};
@@ -2452,54 +2362,17 @@ lpfc_get_hba_model_desc(struct lpfc_hba *phba, uint8_t *mdp, uint8_t *descp)
 	case PCI_DEVICE_ID_SAT_S:
 		m = (typeof(m)){"LPe12000-S", "PCIe", "Fibre Channel Adapter"};
 		break;
-	case PCI_DEVICE_ID_HORNET:
-		m = (typeof(m)){"LP21000", "PCIe",
-				"Obsolete, Unsupported FCoE Adapter"};
-		GE = 1;
-		break;
-	case PCI_DEVICE_ID_PROTEUS_VF:
-		m = (typeof(m)){"LPev12000", "PCIe IOV",
-				"Obsolete, Unsupported Fibre Channel Adapter"};
-		break;
-	case PCI_DEVICE_ID_PROTEUS_PF:
-		m = (typeof(m)){"LPev12000", "PCIe IOV",
-				"Obsolete, Unsupported Fibre Channel Adapter"};
-		break;
-	case PCI_DEVICE_ID_PROTEUS_S:
-		m = (typeof(m)){"LPemv12002-S", "PCIe IOV",
-				"Obsolete, Unsupported Fibre Channel Adapter"};
-		break;
-	case PCI_DEVICE_ID_TIGERSHARK:
-		oneConnect = 1;
-		m = (typeof(m)){"OCe10100", "PCIe", "FCoE"};
-		break;
-	case PCI_DEVICE_ID_TOMCAT:
-		oneConnect = 1;
-		m = (typeof(m)){"OCe11100", "PCIe", "FCoE"};
-		break;
 	case PCI_DEVICE_ID_FALCON:
 		m = (typeof(m)){"LPSe12002-ML1-E", "PCIe",
 				"EmulexSecure Fibre"};
 		break;
-	case PCI_DEVICE_ID_BALIUS:
-		m = (typeof(m)){"LPVe12002", "PCIe Shared I/O",
-				"Obsolete, Unsupported Fibre Channel Adapter"};
-		break;
 	case PCI_DEVICE_ID_LANCER_FC:
 		m = (typeof(m)){"LPe16000", "PCIe", "Fibre Channel Adapter"};
 		break;
-	case PCI_DEVICE_ID_LANCER_FC_VF:
-		m = (typeof(m)){"LPe16000", "PCIe",
-				"Obsolete, Unsupported Fibre Channel Adapter"};
-		break;
 	case PCI_DEVICE_ID_LANCER_FCOE:
 		oneConnect = 1;
-		m = (typeof(m)){"OCe15100", "PCIe", "FCoE"};
-		break;
-	case PCI_DEVICE_ID_LANCER_FCOE_VF:
-		oneConnect = 1;
 		m = (typeof(m)){"OCe15100", "PCIe",
-				"Obsolete, Unsupported FCoE"};
+				"Obsolete, Unsupported FCoE Adapter"};
 		break;
 	case PCI_DEVICE_ID_LANCER_G6_FC:
 		m = (typeof(m)){"LPe32000", "PCIe", "Fibre Channel Adapter"};
@@ -6255,13 +6128,6 @@ lpfc_sli_driver_resource_setup(struct lpfc_hba *phba)
 	rc = lpfc_setup_driver_resource_phase1(phba);
 	if (rc)
 		return -ENODEV;
-
-	if (phba->pcidev->device == PCI_DEVICE_ID_HORNET) {
-		phba->menlo_flag |= HBA_MENLO_SUPPORT;
-		/* check for menlo minimum sg count */
-		if (phba->cfg_sg_seg_cnt < LPFC_DEFAULT_MENLO_SG_SEG_CNT)
-			phba->cfg_sg_seg_cnt = LPFC_DEFAULT_MENLO_SG_SEG_CNT;
-	}
 
 	if (!phba->sli.sli3_ring)
 		phba->sli.sli3_ring = kcalloc(LPFC_SLI3_MAX_RING,
@@ -13197,10 +13063,6 @@ lpfc_pci_probe_one(struct pci_dev *pdev, const struct pci_device_id *pid)
 {
 	int rc;
 	struct lpfc_sli_intf intf;
-
-	if (pci_device_support_removed(lpfc_id_table,
-				lpfc_pci_ids_removed, pdev))
-		return -ENODEV;
 
 	if (pci_read_config_dword(pdev, LPFC_SLI_INTF, &intf.word0))
 		return -ENODEV;

@@ -26,7 +26,7 @@
 #define NFP_FLOWER_LAYER2_GENEVE_OP	BIT(6)
 
 #define NFP_FLOWER_MASK_VLAN_PRIO	GENMASK(15, 13)
-#define NFP_FLOWER_MASK_VLAN_CFI	BIT(12)
+#define NFP_FLOWER_MASK_VLAN_PRESENT	BIT(12)
 #define NFP_FLOWER_MASK_VLAN_VID	GENMASK(11, 0)
 
 #define NFP_FLOWER_MASK_MPLS_LB		GENMASK(31, 12)
@@ -82,7 +82,6 @@
 #define NFP_FL_OUT_FLAGS_TYPE_IDX	GENMASK(2, 0)
 
 #define NFP_FL_PUSH_VLAN_PRIO		GENMASK(15, 13)
-#define NFP_FL_PUSH_VLAN_CFI		BIT(12)
 #define NFP_FL_PUSH_VLAN_VID		GENMASK(11, 0)
 
 #define IPV6_FLOW_LABEL_MASK		cpu_to_be32(0x000fffff)
@@ -364,7 +363,7 @@ struct nfp_flower_ipv6 {
  * +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
  * |                         ipv4_addr_dst                         |
  * +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
- * |                            Reserved                           |
+ * |           Reserved            |      tos      |      ttl      |
  * +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
  * |                            Reserved                           |
  * +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
@@ -374,7 +373,10 @@ struct nfp_flower_ipv6 {
 struct nfp_flower_ipv4_udp_tun {
 	__be32 ip_src;
 	__be32 ip_dst;
-	__be32 reserved[2];
+	__be16 reserved1;
+	u8 tos;
+	u8 ttl;
+	__be32 reserved2;
 	__be32 tun_id;
 };
 

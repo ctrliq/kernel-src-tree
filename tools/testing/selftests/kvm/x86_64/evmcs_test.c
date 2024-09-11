@@ -123,8 +123,6 @@ int main(int argc, char *argv[])
 			    stage, run->exit_reason,
 			    exit_reason_str(run->exit_reason));
 
-		memset(&regs1, 0, sizeof(regs1));
-		vcpu_regs_get(vm, VCPU_ID, &regs1);
 		switch (get_ucall(vm, VCPU_ID, &uc)) {
 		case UCALL_ABORT:
 			TEST_ASSERT(false, "%s at %s:%d", (const char *)uc.args[0],
@@ -144,12 +142,16 @@ int main(int argc, char *argv[])
 			    stage, (ulong)uc.args[1]);
 
 		state = vcpu_save_state(vm, VCPU_ID);
+		memset(&regs1, 0, sizeof(regs1));
+		vcpu_regs_get(vm, VCPU_ID, &regs1);
+
 		kvm_vm_release(vm);
 
 		/* Restore state in a new VM.  */
 		kvm_vm_restart(vm, O_RDWR);
 		vm_vcpu_add(vm, VCPU_ID, 0, 0);
 		vcpu_set_cpuid(vm, VCPU_ID, kvm_get_supported_cpuid());
+		vcpu_ioctl(vm, VCPU_ID, KVM_ENABLE_CAP, &enable_evmcs_cap);
 		vcpu_load_state(vm, VCPU_ID, state);
 		run = vcpu_state(vm, VCPU_ID);
 		free(state);

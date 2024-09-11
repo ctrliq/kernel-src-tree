@@ -255,10 +255,18 @@ void arm64_force_sig_fault(int signo, int code, void __user *addr,
 	force_sig_fault(signo, code, addr, current);
 }
 
-void arm64_force_sig_info(struct siginfo *info, const char *str)
+void arm64_force_sig_mceerr(int code, void __user *addr, short lsb,
+			    const char *str)
 {
-	arm64_show_signal(info->si_signo, str);
-	force_sig_info(info->si_signo, info, current);
+	arm64_show_signal(SIGBUS, str);
+	force_sig_mceerr(code, addr, lsb, current);
+}
+
+void arm64_force_sig_ptrace_errno_trap(int errno, void __user *addr,
+				       const char *str)
+{
+	arm64_show_signal(SIGTRAP, str);
+	force_sig_ptrace_errno_trap(errno, addr);
 }
 
 void arm64_notify_die(const char *str, struct pt_regs *regs,

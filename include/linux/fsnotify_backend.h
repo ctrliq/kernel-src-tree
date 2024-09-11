@@ -38,6 +38,7 @@
 #define FS_DELETE		0x00000200	/* Subfile was deleted */
 #define FS_DELETE_SELF		0x00000400	/* Self was deleted */
 #define FS_MOVE_SELF		0x00000800	/* Self was moved */
+#define FS_OPEN_EXEC		0x00001000	/* File was opened for exec */
 
 #define FS_UNMOUNT		0x00002000	/* inode on umount fs */
 #define FS_Q_OVERFLOW		0x00004000	/* Event queued overflowed */
@@ -45,6 +46,7 @@
 
 #define FS_OPEN_PERM		0x00010000	/* open event in an permission hook */
 #define FS_ACCESS_PERM		0x00020000	/* access event in a permissions hook */
+#define FS_OPEN_EXEC_PERM	0x00040000	/* open/exec event in a permission hook */
 
 #define FS_EXCL_UNLINK		0x04000000	/* do not send events if object is unlinked */
 #define FS_ISDIR		0x40000000	/* event occurred against dir */
@@ -62,11 +64,13 @@
 #define FS_EVENTS_POSS_ON_CHILD   (FS_ACCESS | FS_MODIFY | FS_ATTRIB |\
 				   FS_CLOSE_WRITE | FS_CLOSE_NOWRITE | FS_OPEN |\
 				   FS_MOVED_FROM | FS_MOVED_TO | FS_CREATE |\
-				   FS_DELETE | FS_OPEN_PERM | FS_ACCESS_PERM)
+				   FS_DELETE | FS_OPEN_PERM | FS_ACCESS_PERM | \
+				   FS_OPEN_EXEC | FS_OPEN_EXEC_PERM)
 
 #define FS_MOVE			(FS_MOVED_FROM | FS_MOVED_TO)
 
-#define ALL_FSNOTIFY_PERM_EVENTS (FS_OPEN_PERM | FS_ACCESS_PERM)
+#define ALL_FSNOTIFY_PERM_EVENTS (FS_OPEN_PERM | FS_ACCESS_PERM | \
+				  FS_OPEN_EXEC_PERM)
 
 /* Events that can be reported to backends */
 #define ALL_FSNOTIFY_EVENTS (FS_ACCESS | FS_MODIFY | FS_ATTRIB | \
@@ -74,7 +78,8 @@
 			     FS_MOVED_FROM | FS_MOVED_TO | FS_CREATE | \
 			     FS_DELETE | FS_DELETE_SELF | FS_MOVE_SELF | \
 			     FS_UNMOUNT | FS_Q_OVERFLOW | FS_IN_IGNORED | \
-			     FS_OPEN_PERM | FS_ACCESS_PERM | FS_DN_RENAME)
+			     FS_OPEN_PERM | FS_ACCESS_PERM | FS_DN_RENAME | \
+			     FS_OPEN_EXEC | FS_OPEN_EXEC_PERM)
 
 /* Extra flags that may be reported with event or control handling of events */
 #define ALL_FSNOTIFY_FLAGS  (FS_EXCL_UNLINK | FS_ISDIR | FS_IN_ONESHOT | \
@@ -265,6 +270,13 @@ FSNOTIFY_ITER_FUNCS(vfsmount, VFSMOUNT)
 	for (type = 0; type < FSNOTIFY_OBJ_TYPE_COUNT; type++)
 
 /*
+ * fsnotify_connp_t is what we embed in objects which connector can be attached
+ * to. fsnotify_connp_t * is how we refer from connector back to object.
+ */
+struct fsnotify_mark_connector;
+typedef struct fsnotify_mark_connector __rcu *fsnotify_connp_t;
+
+/*
  * Inode / vfsmount point to this structure which tracks all marks attached to
  * the inode / vfsmount. The reference to inode / vfsmount is held by this
  * structure. We destroy this structure when there are no more marks attached
@@ -273,16 +285,14 @@ FSNOTIFY_ITER_FUNCS(vfsmount, VFSMOUNT)
 struct fsnotify_mark_connector {
 	spinlock_t lock;
 	unsigned int type;	/* Type of object [lock] */
-	union {	/* Object pointer [lock] */
-		struct inode *inode;
-		struct vfsmount *mnt;
+	union {
+		/* Object pointer [lock] */
+		fsnotify_connp_t *obj;
 		/* Used listing heads to free after srcu period expires */
 		struct fsnotify_mark_connector *destroy_next;
 	};
 	struct hlist_head list;
 };
-
-typedef struct fsnotify_mark_connector __rcu *fsnotify_connp_t;
 
 /*
  * A mark is simply an object attached to an in core inode which allows an
@@ -405,6 +415,8 @@ extern struct fsnotify_event *fsnotify_remove_first_event(struct fsnotify_group 
 
 /* functions used to manipulate the marks attached to inodes */
 
+/* Get mask of events for a list of marks */
+extern __u32 fsnotify_conn_mask(struct fsnotify_mark_connector *conn);
 /* Calculate mask of events for a list of marks */
 extern void fsnotify_recalc_mask(struct fsnotify_mark_connector *conn);
 extern void fsnotify_init_mark(struct fsnotify_mark *mark,

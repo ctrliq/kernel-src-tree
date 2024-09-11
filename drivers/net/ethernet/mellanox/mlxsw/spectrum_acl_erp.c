@@ -1202,6 +1202,32 @@ mlxsw_sp_acl_erp_delta_fill(const struct mlxsw_sp_acl_erp_key *parent_key,
 	return 0;
 }
 
+static bool mlxsw_sp_acl_erp_delta_check(void *priv, const void *parent_obj,
+					 const void *obj)
+{
+	const struct mlxsw_sp_acl_erp_key *parent_key = parent_obj;
+	const struct mlxsw_sp_acl_erp_key *key = obj;
+	u16 delta_start;
+	u8 delta_mask;
+	int err;
+
+	err = mlxsw_sp_acl_erp_delta_fill(parent_key, key,
+					  &delta_start, &delta_mask);
+	return err ? false : true;
+}
+
+static int mlxsw_sp_acl_erp_hints_obj_cmp(const void *obj1, const void *obj2)
+{
+	const struct mlxsw_sp_acl_erp_key *key1 = obj1;
+	const struct mlxsw_sp_acl_erp_key *key2 = obj2;
+
+	/* For hints purposes, two objects are considered equal
+	 * in case the masks are the same. Does not matter what
+	 * the "ctcam" value is.
+	 */
+	return memcmp(key1->mask, key2->mask, sizeof(key1->mask));
+}
+
 static void *mlxsw_sp_acl_erp_delta_create(void *priv, void *parent_obj,
 					   void *obj)
 {
@@ -1256,12 +1282,17 @@ static void mlxsw_sp_acl_erp_delta_destroy(void *priv, void *delta_priv)
 	kfree(delta);
 }
 
-static void *mlxsw_sp_acl_erp_root_create(void *priv, void *obj)
+static void *mlxsw_sp_acl_erp_root_create(void *priv, void *obj,
+					  unsigned int root_id)
 {
 	struct mlxsw_sp_acl_atcam_region *aregion = priv;
 	struct mlxsw_sp_acl_erp_table *erp_table = aregion->erp_table;
 	struct mlxsw_sp_acl_erp_key *key = obj;
 
+	if (!key->ctcam &&
+	    root_id != OBJAGG_OBJ_ROOT_ID_INVALID &&
+	    root_id >= MLXSW_SP_ACL_ERP_MAX_PER_REGION)
+		return ERR_PTR(-ENOBUFS);
 	return erp_table->ops->erp_create(erp_table, key);
 }
 
@@ -1275,6 +1306,8 @@ static void mlxsw_sp_acl_erp_root_destroy(void *priv, void *root_priv)
 
 static const struct objagg_ops mlxsw_sp_acl_erp_objagg_ops = {
 	.obj_size = sizeof(struct mlxsw_sp_acl_erp_key),
+	.delta_check = mlxsw_sp_acl_erp_delta_check,
+	.hints_obj_cmp = mlxsw_sp_acl_erp_hints_obj_cmp,
 	.delta_create = mlxsw_sp_acl_erp_delta_create,
 	.delta_destroy = mlxsw_sp_acl_erp_delta_destroy,
 	.root_create = mlxsw_sp_acl_erp_root_create,
@@ -1282,7 +1315,8 @@ static const struct objagg_ops mlxsw_sp_acl_erp_objagg_ops = {
 };
 
 static struct mlxsw_sp_acl_erp_table *
-mlxsw_sp_acl_erp_table_create(struct mlxsw_sp_acl_atcam_region *aregion)
+mlxsw_sp_acl_erp_table_create(struct mlxsw_sp_acl_atcam_region *aregion,
+			      struct objagg_hints *hints)
 {
 	struct mlxsw_sp_acl_erp_table *erp_table;
 	int err;
@@ -1292,7 +1326,7 @@ mlxsw_sp_acl_erp_table_create(struct mlxsw_sp_acl_atcam_region *aregion)
 		return ERR_PTR(-ENOMEM);
 
 	erp_table->objagg = objagg_create(&mlxsw_sp_acl_erp_objagg_ops,
-					  aregion);
+					  hints, aregion);
 	if (IS_ERR(erp_table->objagg)) {
 		err = PTR_ERR(erp_table->objagg);
 		goto err_objagg_create;
@@ -1420,12 +1454,14 @@ void mlxsw_sp_acl_erp_rehash_hints_put(void *hints_priv)
 	objagg_hints_put(hints);
 }
 
-int mlxsw_sp_acl_erp_region_init(struct mlxsw_sp_acl_atcam_region *aregion)
+int mlxsw_sp_acl_erp_region_init(struct mlxsw_sp_acl_atcam_region *aregion,
+				 void *hints_priv)
 {
 	struct mlxsw_sp_acl_erp_table *erp_table;
+	struct objagg_hints *hints = hints_priv;
 	int err;
 
-	erp_table = mlxsw_sp_acl_erp_table_create(aregion);
+	erp_table = mlxsw_sp_acl_erp_table_create(aregion, hints);
 	if (IS_ERR(erp_table))
 		return PTR_ERR(erp_table);
 	aregion->erp_table = erp_table;

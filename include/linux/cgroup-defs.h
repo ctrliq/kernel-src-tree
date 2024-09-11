@@ -20,6 +20,7 @@
 #include <linux/u64_stats_sync.h>
 #include <linux/workqueue.h>
 #include <linux/bpf-cgroup.h>
+#include <linux/psi_types.h>
 
 #ifdef CONFIG_CGROUPS
 
@@ -64,6 +65,12 @@ enum {
 	 * specified at mount time and thus is implemented here.
 	 */
 	CGRP_CPUSET_CLONE_CHILDREN,
+
+	/* Control group has to be frozen. */
+	CGRP_FREEZE,
+
+	/* Cgroup is frozen. */
+	CGRP_FROZEN,
 };
 
 /* cgroup_root->flags */
@@ -316,6 +323,25 @@ struct cgroup_rstat_cpu {
 	struct cgroup *updated_next;		/* NULL iff not on the list */
 };
 
+struct cgroup_freezer_state {
+	/* Should the cgroup and its descendants be frozen. */
+	bool freeze;
+
+	/* Should the cgroup actually be frozen? */
+	int e_freeze;
+
+	/* Fields below are protected by css_set_lock */
+
+	/* Number of frozen descendant cgroups */
+	int nr_frozen_descendants;
+
+	/*
+	 * Number of tasks, which are counted as frozen:
+	 * frozen, SIGSTOPped, and PTRACEd.
+	 */
+	int nr_frozen_tasks;
+};
+
 struct cgroup {
 	/* self css with NULL ->ss, points back to this cgroup */
 	struct cgroup_subsys_state self;
@@ -419,7 +445,6 @@ struct cgroup {
 	 * specific task are charged to the dom_cgrp.
 	 */
 	struct cgroup *dom_cgrp;
-	struct cgroup *old_dom_cgrp;		/* used while enabling threaded */
 
 	/* per-cpu recursive resource statistics */
 	struct cgroup_rstat_cpu __percpu *rstat_cpu;
@@ -448,6 +473,31 @@ struct cgroup {
 
 	/* If there is block congestion on this cgroup. */
 	atomic_t congestion_count;
+
+	/*
+	 * RHEL8:
+	 * The cgroup structures are all allocated by the core kernel
+	 * code at run time. It is also accessed only the cgroup core code
+	 * and so changes made to the cgroup structure should not affect
+	 * third-party kernel modules. However, a number of important kernel
+	 * data structures do contain pointer to a cgroup structure and so
+	 * the kABI signature has to be maintained.
+	 *
+	 * The ancestor_ids[] arrary has to be at the end of structure.
+	 */
+	RH_KABI_EXTEND(struct cgroup *old_dom_cgrp) /* used while enabling threaded */
+
+	/* Used to store internal freezer state */
+	RH_KABI_EXTEND(struct cgroup_freezer_state freezer)
+
+	/* used to track pressure stalls */
+	RH_KABI_EXTEND(struct psi_group psi)
+
+	/*
+	 * RHEL8:
+	 * The ancestor_ids[] should only be used by cgroup core.
+	 * External kernel modules should not used it.
+	 */
 
 	/* ids of the ancestors at each level including self */
 	int ancestor_ids[];
@@ -576,8 +626,14 @@ struct cftype {
 	ssize_t (*write)(struct kernfs_open_file *of,
 			 char *buf, size_t nbytes, loff_t off);
 
-	__poll_t (*poll)(struct kernfs_open_file *of,
-			 struct poll_table_struct *pt);
+	/*
+	 * RHEL8: Third party kernel modules are not supposed to create
+	 * new cgroup controller that use the cftype structure. They are
+	 * also not supposed to access this structure anyway. So it is
+	 * safe to extend it.
+	 */
+	RH_KABI_EXTEND(__poll_t (*poll)(struct kernfs_open_file *of,
+					struct poll_table_struct *pt))
 
 #ifdef CONFIG_DEBUG_LOCK_ALLOC
 	struct lock_class_key	lockdep_key;

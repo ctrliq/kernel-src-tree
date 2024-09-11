@@ -99,8 +99,8 @@ struct eeh_pe {
 	struct eeh_pe *parent;		/* Parent PE			*/
 	void *data;			/* PE auxillary data		*/
 	struct list_head child_list;	/* List of PEs below this PE	*/
-	struct list_head child;		/* Memb. child_list/eeh_phb_pe	*/
 	struct list_head edevs;		/* List of eeh_dev in this PE	*/
+	struct list_head child;		/* Memb. child_list/eeh_phb_pe	*/
 };
 
 #define eeh_pe_for_each_dev(pe, edev, tmp) \
@@ -141,12 +141,13 @@ struct eeh_dev {
 	int aer_cap;			/* Saved AER capability		*/
 	int af_cap;			/* Saved AF capability		*/
 	struct eeh_pe *pe;		/* Associated PE		*/
-	struct list_head entry;		/* Membership in eeh_pe.edevs	*/
-	struct list_head rmv_entry;	/* Membership in rmv_list	*/
+	struct list_head RH_KABI_RENAME(list, entry);		/* Membership in eeh_pe.edevs	*/
+	struct list_head RH_KABI_RENAME(rmv_list, rmv_entry);	/* Membership in rmv_list	*/
 	struct pci_dn *pdn;		/* Associated PCI device node	*/
 	struct pci_dev *pdev;		/* Associated PCI device	*/
 	bool in_error;			/* Error flag for edev		*/
 	struct pci_dev *physfn;		/* Associated SRIOV PF		*/
+	RH_KABI_DEPRECATE(struct pci_bus *, bus)
 };
 
 static inline struct pci_dn *eeh_dev_to_pdn(struct eeh_dev *edev)
@@ -207,6 +208,7 @@ struct eeh_ops {
 	int (*get_pe_addr)(struct eeh_pe *pe);
 	int (*get_state)(struct eeh_pe *pe, int *delay);
 	int (*reset)(struct eeh_pe *pe, int option);
+	RH_KABI_DEPRECATE_FN(int, wait_state, struct eeh_pe *pe, int max_wait);
 	int (*get_log)(struct eeh_pe *pe, int severity, char *drv_log, unsigned long len);
 	int (*configure_bridge)(struct eeh_pe *pe);
 	int (*err_inject)(struct eeh_pe *pe, int type, int func,

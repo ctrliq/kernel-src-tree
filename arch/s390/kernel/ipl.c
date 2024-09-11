@@ -31,6 +31,7 @@
 #include <asm/os_info.h>
 #include <asm/sections.h>
 #include <asm/boot_data.h>
+#include <asm/uv.h>
 #include "entry.h"
 
 #define IPL_PARM_BLOCK_VERSION 0
@@ -121,6 +122,13 @@ static char *dump_type_str(enum dump_type type)
 
 int __bootdata_preserved(ipl_block_valid);
 struct ipl_parameter_block __bootdata_preserved(ipl_block);
+int __bootdata_preserved(ipl_secure_flag);
+
+unsigned long __bootdata_preserved(ipl_cert_list_addr);
+unsigned long __bootdata_preserved(ipl_cert_list_size);
+
+unsigned long __bootdata(early_ipl_comp_list_addr);
+unsigned long __bootdata(early_ipl_comp_list_size);
 
 static int reipl_capabilities = IPL_TYPE_UNKNOWN;
 
@@ -153,6 +161,8 @@ static inline int __diag308(unsigned long subcode, void *addr)
 
 int diag308(unsigned long subcode, void *addr)
 {
+	if (IS_ENABLED(CONFIG_KASAN))
+		__arch_local_irq_stosm(0x04); /* enable DAT */
 	diag_stat_inc(DIAG_STAT_X308);
 	return __diag308(subcode, addr);
 }
@@ -264,6 +274,24 @@ static ssize_t ipl_type_show(struct kobject *kobj, struct kobj_attribute *attr,
 
 static struct kobj_attribute sys_ipl_type_attr = __ATTR_RO(ipl_type);
 
+static ssize_t ipl_secure_show(struct kobject *kobj,
+			       struct kobj_attribute *attr, char *page)
+{
+	return sprintf(page, "%i\n", !!ipl_secure_flag);
+}
+
+static struct kobj_attribute sys_ipl_secure_attr =
+	__ATTR(secure, 0444, ipl_secure_show, NULL);
+
+static ssize_t ipl_has_secure_show(struct kobject *kobj,
+				   struct kobj_attribute *attr, char *page)
+{
+	return sprintf(page, "%i\n", !!sclp.has_sipl);
+}
+
+static struct kobj_attribute sys_ipl_has_secure_attr =
+	__ATTR(has_secure, 0444, ipl_has_secure_show, NULL);
+
 static ssize_t ipl_vm_parm_show(struct kobject *kobj,
 				struct kobj_attribute *attr, char *page)
 {
@@ -359,6 +387,8 @@ static struct attribute *ipl_fcp_attrs[] = {
 	&sys_ipl_fcp_bootprog_attr.attr,
 	&sys_ipl_fcp_br_lba_attr.attr,
 	&sys_ipl_ccw_loadparm_attr.attr,
+	&sys_ipl_secure_attr.attr,
+	&sys_ipl_has_secure_attr.attr,
 	NULL,
 };
 
@@ -374,6 +404,8 @@ static struct attribute *ipl_ccw_attrs_vm[] = {
 	&sys_ipl_device_attr.attr,
 	&sys_ipl_ccw_loadparm_attr.attr,
 	&sys_ipl_vm_parm_attr.attr,
+	&sys_ipl_secure_attr.attr,
+	&sys_ipl_has_secure_attr.attr,
 	NULL,
 };
 
@@ -381,6 +413,8 @@ static struct attribute *ipl_ccw_attrs_lpar[] = {
 	&sys_ipl_type_attr.attr,
 	&sys_ipl_device_attr.attr,
 	&sys_ipl_ccw_loadparm_attr.attr,
+	&sys_ipl_secure_attr.attr,
+	&sys_ipl_has_secure_attr.attr,
 	NULL,
 };
 
@@ -858,15 +892,21 @@ static void __reipl_run(void *unused)
 {
 	switch (reipl_type) {
 	case IPL_TYPE_CCW:
+		uv_set_shared(__pa(reipl_block_ccw));
 		diag308(DIAG308_SET, reipl_block_ccw);
+		uv_remove_shared(__pa(reipl_block_ccw));
 		diag308(DIAG308_LOAD_CLEAR, NULL);
 		break;
 	case IPL_TYPE_FCP:
+		uv_set_shared(__pa(reipl_block_fcp));
 		diag308(DIAG308_SET, reipl_block_fcp);
+		uv_remove_shared(__pa(reipl_block_fcp));
 		diag308(DIAG308_LOAD_CLEAR, NULL);
 		break;
 	case IPL_TYPE_NSS:
+		uv_set_shared(__pa(reipl_block_nss));
 		diag308(DIAG308_SET, reipl_block_nss);
+		uv_remove_shared(__pa(reipl_block_nss));
 		diag308(DIAG308_LOAD_CLEAR, NULL);
 		break;
 	case IPL_TYPE_UNKNOWN:
@@ -1136,7 +1176,9 @@ static struct kset *dump_kset;
 
 static void diag308_dump(void *dump_block)
 {
+	uv_set_shared(__pa(dump_block));
 	diag308(DIAG308_SET, dump_block);
+	uv_remove_shared(__pa(dump_block));
 	while (1) {
 		if (diag308(DIAG308_LOAD_NORMAL_DUMP, NULL) != 0x302)
 			break;
@@ -1809,3 +1851,8 @@ int ipl_report_free(struct ipl_report *report)
 }
 
 #endif
+
+bool ipl_get_secureboot(void)
+{
+	return !!ipl_secure_flag;
+}

@@ -722,6 +722,8 @@ struct mlxsw_sp_fid *mlxsw_sp_acl_dummy_fid(struct mlxsw_sp *mlxsw_sp);
 
 int mlxsw_sp_acl_init(struct mlxsw_sp *mlxsw_sp);
 void mlxsw_sp_acl_fini(struct mlxsw_sp *mlxsw_sp);
+u32 mlxsw_sp_acl_region_rehash_intrvl_get(struct mlxsw_sp *mlxsw_sp);
+int mlxsw_sp_acl_region_rehash_intrvl_set(struct mlxsw_sp *mlxsw_sp, u32 val);
 
 /* spectrum_acl_tcam.c */
 struct mlxsw_sp_acl_tcam;
@@ -736,7 +738,8 @@ struct mlxsw_sp_acl_tcam_ops {
 	size_t region_priv_size;
 	int (*region_init)(struct mlxsw_sp *mlxsw_sp, void *region_priv,
 			   void *tcam_priv,
-			   struct mlxsw_sp_acl_tcam_region *region);
+			   struct mlxsw_sp_acl_tcam_region *region,
+			   void *hints_priv);
 	void (*region_fini)(struct mlxsw_sp *mlxsw_sp, void *region_priv);
 	int (*region_associate)(struct mlxsw_sp *mlxsw_sp,
 				struct mlxsw_sp_acl_tcam_region *region);

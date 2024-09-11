@@ -222,8 +222,16 @@ put_exit:
 	return ret;
 }
 
-static bool tce_page_is_contained(struct page *page, unsigned page_shift)
+static bool tce_page_is_contained(struct mm_struct *mm, unsigned long hpa,
+		unsigned int page_shift)
 {
+	struct page *page;
+	unsigned long size = 0;
+
+	if (mm_iommu_is_devmem(mm, hpa, page_shift, &size))
+		return size == (1UL << page_shift);
+
+	page = pfn_to_page(hpa >> PAGE_SHIFT);
 	/*
 	 * Check that the TCE table granularity is not bigger than the size of
 	 * a page we just found. Otherwise the hardware can get access to
@@ -503,7 +511,8 @@ static int tce_iommu_clear(struct tce_container *container,
 
 		direction = DMA_NONE;
 		oldhpa = 0;
-		ret = iommu_tce_xchg(tbl, entry, &oldhpa, &direction);
+		ret = iommu_tce_xchg(container->mm, tbl, entry, &oldhpa,
+				&direction);
 		if (ret)
 			continue;
 
@@ -541,7 +550,6 @@ static long tce_iommu_build(struct tce_container *container,
 		enum dma_data_direction direction)
 {
 	long i, ret = 0;
-	struct page *page;
 	unsigned long hpa;
 	enum dma_data_direction dirtmp;
 
@@ -552,15 +560,16 @@ static long tce_iommu_build(struct tce_container *container,
 		if (ret)
 			break;
 
-		page = pfn_to_page(hpa >> PAGE_SHIFT);
-		if (!tce_page_is_contained(page, tbl->it_page_shift)) {
+		if (!tce_page_is_contained(container->mm, hpa,
+				tbl->it_page_shift)) {
 			ret = -EPERM;
 			break;
 		}
 
 		hpa |= offset;
 		dirtmp = direction;
-		ret = iommu_tce_xchg(tbl, entry + i, &hpa, &dirtmp);
+		ret = iommu_tce_xchg(container->mm, tbl, entry + i, &hpa,
+				&dirtmp);
 		if (ret) {
 			tce_iommu_unuse_page(container, hpa);
 			pr_err("iommu_tce: %s failed ioba=%lx, tce=%lx, ret=%ld\n",
@@ -587,7 +596,6 @@ static long tce_iommu_build_v2(struct tce_container *container,
 		enum dma_data_direction direction)
 {
 	long i, ret = 0;
-	struct page *page;
 	unsigned long hpa;
 	enum dma_data_direction dirtmp;
 
@@ -600,8 +608,8 @@ static long tce_iommu_build_v2(struct tce_container *container,
 		if (ret)
 			break;
 
-		page = pfn_to_page(hpa >> PAGE_SHIFT);
-		if (!tce_page_is_contained(page, tbl->it_page_shift)) {
+		if (!tce_page_is_contained(container->mm, hpa,
+				tbl->it_page_shift)) {
 			ret = -EPERM;
 			break;
 		}
@@ -614,7 +622,8 @@ static long tce_iommu_build_v2(struct tce_container *container,
 		if (mm_iommu_mapped_inc(mem))
 			break;
 
-		ret = iommu_tce_xchg(tbl, entry + i, &hpa, &dirtmp);
+		ret = iommu_tce_xchg(container->mm, tbl, entry + i, &hpa,
+				&dirtmp);
 		if (ret) {
 			/* dirtmp cannot be DMA_NONE here */
 			tce_iommu_unuse_page_v2(container, tbl, entry + i);

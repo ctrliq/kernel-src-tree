@@ -1479,8 +1479,16 @@ enum ethtool_link_mode_bit_indices {
 	 * use the new ETHTOOL_GLINKSETTINGS/ETHTOOL_SLINKSETTINGS API.
 	 */
 
+	/* RHEL */
+	__ETHTOOL_LINK_MODE_LAST_RH80
+	  = ETHTOOL_LINK_MODE_FEC_BASER_BIT,
+
 	__ETHTOOL_LINK_MODE_LAST
+#ifndef __GENKSYMS__
 	  = ETHTOOL_LINK_MODE_200000baseCR4_Full_BIT,
+#else
+	  = __ETHTOOL_LINK_MODE_LAST_RH80,
+#endif
 };
 
 #define __ETHTOOL_LINK_MODE_LEGACY_MASK(base_name)	\

@@ -5,6 +5,7 @@
 #include <asm/sclp.h>
 #include <asm/sections.h>
 #include <asm/boot_data.h>
+#include <asm/uv.h>
 #include "boot.h"
 
 char __bootdata(early_command_line)[COMMAND_LINE_SIZE];
@@ -43,7 +44,9 @@ void store_ipl_parmblock(void)
 {
 	int rc;
 
+	uv_set_shared(__pa(&ipl_block));
 	rc = __diag308(DIAG308_STORE, &ipl_block);
+	uv_remove_shared(__pa(&ipl_block));
 	if (rc == DIAG308_RC_OK &&
 	    ipl_block.hdr.version <= IPL_MAX_SUPPORTED_VERSION)
 		ipl_block_valid = 1;

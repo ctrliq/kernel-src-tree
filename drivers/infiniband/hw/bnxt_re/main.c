@@ -369,7 +369,8 @@ static void bnxt_re_fill_fw_msg(struct bnxt_fw_msg *fw_msg, void *msg,
 	fw_msg->timeout = timeout;
 }
 
-static int bnxt_re_net_ring_free(struct bnxt_re_dev *rdev, u16 fw_ring_id)
+static int bnxt_re_net_ring_free(struct bnxt_re_dev *rdev,
+				 u16 fw_ring_id, int type)
 {
 	struct bnxt_en_dev *en_dev = rdev->en_dev;
 	struct hwrm_ring_free_input req = {0};
@@ -383,7 +384,7 @@ static int bnxt_re_net_ring_free(struct bnxt_re_dev *rdev, u16 fw_ring_id)
 	memset(&fw_msg, 0, sizeof(fw_msg));
 
 	bnxt_re_init_hwrm_hdr(rdev, (void *)&req, HWRM_RING_FREE, -1, -1);
-	req.ring_type = RING_ALLOC_REQ_RING_TYPE_L2_CMPL;
+	req.ring_type = type;
 	req.ring_id = cpu_to_le16(fw_ring_id);
 	bnxt_re_fill_fw_msg(&fw_msg, (void *)&req, sizeof(req), (void *)&resp,
 			    sizeof(resp), DFLT_HWRM_CMD_TIMEOUT);
@@ -420,7 +421,7 @@ static int bnxt_re_net_ring_alloc(struct bnxt_re_dev *rdev, dma_addr_t *dma_arr,
 	/* Association of ring index with doorbell index and MSIX number */
 	req.logical_id = cpu_to_le16(map_index);
 	req.length = cpu_to_le32(ring_mask + 1);
-	req.ring_type = RING_ALLOC_REQ_RING_TYPE_L2_CMPL;
+	req.ring_type = type;
 	req.int_mode = RING_ALLOC_REQ_INT_MODE_MSIX;
 	bnxt_re_fill_fw_msg(&fw_msg, (void *)&req, sizeof(req), (void *)&resp,
 			    sizeof(resp), DFLT_HWRM_CMD_TIMEOUT);
@@ -559,10 +560,84 @@ static struct bnxt_en_dev *bnxt_re_dev_probe(struct net_device *netdev)
 	return en_dev;
 }
 
+static ssize_t hw_rev_show(struct device *device, struct device_attribute *attr,
+			   char *buf)
+{
+	struct bnxt_re_dev *rdev =
+		rdma_device_to_drv_device(device, struct bnxt_re_dev, ibdev);
+
+	return scnprintf(buf, PAGE_SIZE, "0x%x\n", rdev->en_dev->pdev->vendor);
+}
+static DEVICE_ATTR_RO(hw_rev);
+
+static ssize_t hca_type_show(struct device *device,
+			     struct device_attribute *attr, char *buf)
+{
+	struct bnxt_re_dev *rdev =
+		rdma_device_to_drv_device(device, struct bnxt_re_dev, ibdev);
+
+	return scnprintf(buf, PAGE_SIZE, "%s\n", rdev->ibdev.node_desc);
+}
+static DEVICE_ATTR_RO(hca_type);
+
+static struct attribute *bnxt_re_attributes[] = {
+	&dev_attr_hw_rev.attr,
+	&dev_attr_hca_type.attr,
+	NULL
+};
+
+static const struct attribute_group bnxt_re_dev_attr_group = {
+	.attrs = bnxt_re_attributes,
+};
+
 static void bnxt_re_unregister_ib(struct bnxt_re_dev *rdev)
 {
 	ib_unregister_device(&rdev->ibdev);
 }
+
+static const struct ib_device_ops bnxt_re_dev_ops = {
+	.add_gid = bnxt_re_add_gid,
+	.alloc_hw_stats = bnxt_re_ib_alloc_hw_stats,
+	.alloc_mr = bnxt_re_alloc_mr,
+	.alloc_pd = bnxt_re_alloc_pd,
+	.alloc_ucontext = bnxt_re_alloc_ucontext,
+	.create_ah = bnxt_re_create_ah,
+	.create_cq = bnxt_re_create_cq,
+	.create_qp = bnxt_re_create_qp,
+	.create_srq = bnxt_re_create_srq,
+	.dealloc_pd = bnxt_re_dealloc_pd,
+	.dealloc_ucontext = bnxt_re_dealloc_ucontext,
+	.del_gid = bnxt_re_del_gid,
+	.dereg_mr = bnxt_re_dereg_mr,
+	.destroy_ah = bnxt_re_destroy_ah,
+	.destroy_cq = bnxt_re_destroy_cq,
+	.destroy_qp = bnxt_re_destroy_qp,
+	.destroy_srq = bnxt_re_destroy_srq,
+	.get_dev_fw_str = bnxt_re_query_fw_str,
+	.get_dma_mr = bnxt_re_get_dma_mr,
+	.get_hw_stats = bnxt_re_ib_get_hw_stats,
+	.get_link_layer = bnxt_re_get_link_layer,
+	.get_netdev = bnxt_re_get_netdev,
+	.get_port_immutable = bnxt_re_get_port_immutable,
+	.map_mr_sg = bnxt_re_map_mr_sg,
+	.mmap = bnxt_re_mmap,
+	.modify_ah = bnxt_re_modify_ah,
+	.modify_device = bnxt_re_modify_device,
+	.modify_qp = bnxt_re_modify_qp,
+	.modify_srq = bnxt_re_modify_srq,
+	.poll_cq = bnxt_re_poll_cq,
+	.post_recv = bnxt_re_post_recv,
+	.post_send = bnxt_re_post_send,
+	.post_srq_recv = bnxt_re_post_srq_recv,
+	.query_ah = bnxt_re_query_ah,
+	.query_device = bnxt_re_query_device,
+	.query_pkey = bnxt_re_query_pkey,
+	.query_port = bnxt_re_query_port,
+	.query_qp = bnxt_re_query_qp,
+	.query_srq = bnxt_re_query_srq,
+	.reg_user_mr = bnxt_re_reg_user_mr,
+	.req_notify_cq = bnxt_re_req_notify_cq,
+};
 
 static int bnxt_re_register_ib(struct bnxt_re_dev *rdev)
 {
@@ -571,7 +646,6 @@ static int bnxt_re_register_ib(struct bnxt_re_dev *rdev)
 	/* ib device init */
 	ibdev->owner = THIS_MODULE;
 	ibdev->node_type = RDMA_NODE_IB_CA;
-	strlcpy(ibdev->name, "bnxt_re%d", IB_DEVICE_NAME_MAX);
 	strlcpy(ibdev->node_desc, BNXT_RE_DESC " HCA",
 		strlen(BNXT_RE_DESC) + 5);
 	ibdev->phys_port_cnt = 1;
@@ -611,85 +685,12 @@ static int bnxt_re_register_ib(struct bnxt_re_dev *rdev)
 			(1ull << IB_USER_VERBS_CMD_DESTROY_AH);
 	/* POLL_CQ and REQ_NOTIFY_CQ is directly handled in libbnxt_re */
 
-	/* Kernel verbs */
-	ibdev->query_device		= bnxt_re_query_device;
-	ibdev->modify_device		= bnxt_re_modify_device;
 
-	ibdev->query_port		= bnxt_re_query_port;
-	ibdev->get_port_immutable	= bnxt_re_get_port_immutable;
-	ibdev->get_dev_fw_str           = bnxt_re_query_fw_str;
-	ibdev->query_pkey		= bnxt_re_query_pkey;
-	ibdev->get_netdev		= bnxt_re_get_netdev;
-	ibdev->add_gid			= bnxt_re_add_gid;
-	ibdev->del_gid			= bnxt_re_del_gid;
-	ibdev->get_link_layer		= bnxt_re_get_link_layer;
-
-	ibdev->alloc_pd			= bnxt_re_alloc_pd;
-	ibdev->dealloc_pd		= bnxt_re_dealloc_pd;
-
-	ibdev->create_ah		= bnxt_re_create_ah;
-	ibdev->modify_ah		= bnxt_re_modify_ah;
-	ibdev->query_ah			= bnxt_re_query_ah;
-	ibdev->destroy_ah		= bnxt_re_destroy_ah;
-
-	ibdev->create_srq		= bnxt_re_create_srq;
-	ibdev->modify_srq		= bnxt_re_modify_srq;
-	ibdev->query_srq		= bnxt_re_query_srq;
-	ibdev->destroy_srq		= bnxt_re_destroy_srq;
-	ibdev->post_srq_recv		= bnxt_re_post_srq_recv;
-
-	ibdev->create_qp		= bnxt_re_create_qp;
-	ibdev->modify_qp		= bnxt_re_modify_qp;
-	ibdev->query_qp			= bnxt_re_query_qp;
-	ibdev->destroy_qp		= bnxt_re_destroy_qp;
-
-	ibdev->post_send		= bnxt_re_post_send;
-	ibdev->post_recv		= bnxt_re_post_recv;
-
-	ibdev->create_cq		= bnxt_re_create_cq;
-	ibdev->destroy_cq		= bnxt_re_destroy_cq;
-	ibdev->poll_cq			= bnxt_re_poll_cq;
-	ibdev->req_notify_cq		= bnxt_re_req_notify_cq;
-
-	ibdev->get_dma_mr		= bnxt_re_get_dma_mr;
-	ibdev->dereg_mr			= bnxt_re_dereg_mr;
-	ibdev->alloc_mr			= bnxt_re_alloc_mr;
-	ibdev->map_mr_sg		= bnxt_re_map_mr_sg;
-
-	ibdev->reg_user_mr		= bnxt_re_reg_user_mr;
-	ibdev->alloc_ucontext		= bnxt_re_alloc_ucontext;
-	ibdev->dealloc_ucontext		= bnxt_re_dealloc_ucontext;
-	ibdev->mmap			= bnxt_re_mmap;
-	ibdev->get_hw_stats             = bnxt_re_ib_get_hw_stats;
-	ibdev->alloc_hw_stats           = bnxt_re_ib_alloc_hw_stats;
-
+	rdma_set_device_sysfs_group(ibdev, &bnxt_re_dev_attr_group);
 	ibdev->driver_id = RDMA_DRIVER_BNXT_RE;
-	return ib_register_device(ibdev, NULL);
+	ib_set_device_ops(ibdev, &bnxt_re_dev_ops);
+	return ib_register_device(ibdev, "bnxt_re%d", NULL);
 }
-
-static ssize_t show_rev(struct device *device, struct device_attribute *attr,
-			char *buf)
-{
-	struct bnxt_re_dev *rdev = to_bnxt_re_dev(device, ibdev.dev);
-
-	return scnprintf(buf, PAGE_SIZE, "0x%x\n", rdev->en_dev->pdev->vendor);
-}
-
-static ssize_t show_hca(struct device *device, struct device_attribute *attr,
-			char *buf)
-{
-	struct bnxt_re_dev *rdev = to_bnxt_re_dev(device, ibdev.dev);
-
-	return scnprintf(buf, PAGE_SIZE, "%s\n", rdev->ibdev.node_desc);
-}
-
-static DEVICE_ATTR(hw_rev, 0444, show_rev, NULL);
-static DEVICE_ATTR(hca_type, 0444, show_hca, NULL);
-
-static struct device_attribute *bnxt_re_attributes[] = {
-	&dev_attr_hw_rev,
-	&dev_attr_hca_type
-};
 
 static void bnxt_re_dev_remove(struct bnxt_re_dev *rdev)
 {
@@ -884,6 +885,12 @@ static int bnxt_re_cqn_handler(struct bnxt_qplib_nq *nq,
 	return 0;
 }
 
+static u32 bnxt_re_get_nqdb_offset(struct bnxt_re_dev *rdev, u16 indx)
+{
+	return bnxt_qplib_is_chip_gen_p5(&rdev->chip_ctx) ?
+				0x10000 : rdev->msix_entries[indx].db_offset;
+}
+
 static void bnxt_re_cleanup_res(struct bnxt_re_dev *rdev)
 {
 	int i;
@@ -897,18 +904,18 @@ static void bnxt_re_cleanup_res(struct bnxt_re_dev *rdev)
 
 static int bnxt_re_init_res(struct bnxt_re_dev *rdev)
 {
-	int rc = 0, i;
 	int num_vec_enabled = 0;
+	int rc = 0, i;
+	u32 db_offt;
 
 	bnxt_qplib_init_res(&rdev->qplib_res);
 
 	for (i = 1; i < rdev->num_msix ; i++) {
+		db_offt = bnxt_re_get_nqdb_offset(rdev, i);
 		rc = bnxt_qplib_enable_nq(rdev->en_dev->pdev, &rdev->nq[i - 1],
 					  i - 1, rdev->msix_entries[i].vector,
-					  rdev->msix_entries[i].db_offset,
-					  &bnxt_re_cqn_handler,
+					  db_offt, &bnxt_re_cqn_handler,
 					  &bnxt_re_srqn_handler);
-
 		if (rc) {
 			dev_err(rdev_to_dev(rdev),
 				"Failed to enable NQ with rc = 0x%x", rc);
@@ -920,17 +927,18 @@ static int bnxt_re_init_res(struct bnxt_re_dev *rdev)
 fail:
 	for (i = num_vec_enabled; i >= 0; i--)
 		bnxt_qplib_disable_nq(&rdev->nq[i]);
-
 	return rc;
 }
 
 static void bnxt_re_free_nq_res(struct bnxt_re_dev *rdev)
 {
+	u8 type;
 	int i;
 
 	for (i = 0; i < rdev->num_msix - 1; i++) {
+		type = bnxt_qplib_get_ring_type(&rdev->chip_ctx);
+		bnxt_re_net_ring_free(rdev, rdev->nq[i].ring_id, type);
 		rdev->nq[i].res = NULL;
-		bnxt_re_net_ring_free(rdev, rdev->nq[i].ring_id);
 		bnxt_qplib_free_nq(&rdev->nq[i]);
 	}
 }
@@ -952,8 +960,11 @@ static void bnxt_re_free_res(struct bnxt_re_dev *rdev)
 
 static int bnxt_re_alloc_res(struct bnxt_re_dev *rdev)
 {
-	int rc = 0, i;
 	int num_vec_created = 0;
+	dma_addr_t *pg_map;
+	int rc = 0, i;
+	int pages;
+	u8 type;
 
 	/* Configure and allocate resources for qplib */
 	rdev->qplib_res.rcfw = &rdev->rcfw;
@@ -983,13 +994,13 @@ static int bnxt_re_alloc_res(struct bnxt_re_dev *rdev)
 				i, rc);
 			goto free_nq;
 		}
-		rc = bnxt_re_net_ring_alloc
-			(rdev, rdev->nq[i].hwq.pbl[PBL_LVL_0].pg_map_arr,
-			 rdev->nq[i].hwq.pbl[rdev->nq[i].hwq.level].pg_count,
-			 HWRM_RING_ALLOC_CMPL,
-			 BNXT_QPLIB_NQE_MAX_CNT - 1,
-			 rdev->msix_entries[i + 1].ring_idx,
-			 &rdev->nq[i].ring_id);
+		type = bnxt_qplib_get_ring_type(&rdev->chip_ctx);
+		pg_map = rdev->nq[i].hwq.pbl[PBL_LVL_0].pg_map_arr;
+		pages = rdev->nq[i].hwq.pbl[rdev->nq[i].hwq.level].pg_count;
+		rc = bnxt_re_net_ring_alloc(rdev, pg_map, pages, type,
+					    BNXT_QPLIB_NQE_MAX_CNT - 1,
+					    rdev->msix_entries[i + 1].ring_idx,
+					    &rdev->nq[i].ring_id);
 		if (rc) {
 			dev_err(rdev_to_dev(rdev),
 				"Failed to allocate NQ fw id with rc = 0x%x",
@@ -1002,7 +1013,8 @@ static int bnxt_re_alloc_res(struct bnxt_re_dev *rdev)
 	return 0;
 free_nq:
 	for (i = num_vec_created; i >= 0; i--) {
-		bnxt_re_net_ring_free(rdev, rdev->nq[i].ring_id);
+		type = bnxt_qplib_get_ring_type(&rdev->chip_ctx);
+		bnxt_re_net_ring_free(rdev, rdev->nq[i].ring_id, type);
 		bnxt_qplib_free_nq(&rdev->nq[i]);
 	}
 	bnxt_qplib_dealloc_dpi(&rdev->qplib_res,
@@ -1256,12 +1268,10 @@ static void bnxt_re_query_hwrm_intf_version(struct bnxt_re_dev *rdev)
 
 static void bnxt_re_ib_unreg(struct bnxt_re_dev *rdev)
 {
-	int i, rc;
+	u8 type;
+	int rc;
 
 	if (test_and_clear_bit(BNXT_RE_FLAG_IBDEV_REGISTERED, &rdev->flags)) {
-		for (i = 0; i < ARRAY_SIZE(bnxt_re_attributes); i++)
-			device_remove_file(&rdev->ibdev.dev,
-					   bnxt_re_attributes[i]);
 		/* Cleanup ib dev */
 		bnxt_re_unregister_ib(rdev);
 	}
@@ -1282,7 +1292,8 @@ static void bnxt_re_ib_unreg(struct bnxt_re_dev *rdev)
 		bnxt_re_net_stats_ctx_free(rdev, rdev->qplib_ctx.stats.fw_id);
 		bnxt_qplib_free_ctx(rdev->en_dev->pdev, &rdev->qplib_ctx);
 		bnxt_qplib_disable_rcfw_channel(&rdev->rcfw);
-		bnxt_re_net_ring_free(rdev, rdev->rcfw.creq_ring_id);
+		type = bnxt_qplib_get_ring_type(&rdev->chip_ctx);
+		bnxt_re_net_ring_free(rdev, rdev->rcfw.creq_ring_id, type);
 		bnxt_qplib_free_rcfw_channel(&rdev->rcfw);
 	}
 	if (test_and_clear_bit(BNXT_RE_FLAG_GOT_MSIX, &rdev->flags)) {
@@ -1313,9 +1324,12 @@ static void bnxt_re_worker(struct work_struct *work)
 
 static int bnxt_re_ib_reg(struct bnxt_re_dev *rdev)
 {
-	int i, j, rc;
-
+	dma_addr_t *pg_map;
+	u32 db_offt, ridx;
+	int pages, vid;
 	bool locked;
+	u8 type;
+	int rc;
 
 	/* Acquire rtnl lock through out this function */
 	rtnl_lock();
@@ -1359,21 +1373,22 @@ static int bnxt_re_ib_reg(struct bnxt_re_dev *rdev)
 		pr_err("Failed to allocate RCFW Channel: %#x\n", rc);
 		goto fail;
 	}
-	rc = bnxt_re_net_ring_alloc
-			(rdev, rdev->rcfw.creq.pbl[PBL_LVL_0].pg_map_arr,
-			 rdev->rcfw.creq.pbl[rdev->rcfw.creq.level].pg_count,
-			 HWRM_RING_ALLOC_CMPL, BNXT_QPLIB_CREQE_MAX_CNT - 1,
-			 rdev->msix_entries[BNXT_RE_AEQ_IDX].ring_idx,
-			 &rdev->rcfw.creq_ring_id);
+	type = bnxt_qplib_get_ring_type(&rdev->chip_ctx);
+	pg_map = rdev->rcfw.creq.pbl[PBL_LVL_0].pg_map_arr;
+	pages = rdev->rcfw.creq.pbl[rdev->rcfw.creq.level].pg_count;
+	ridx = rdev->msix_entries[BNXT_RE_AEQ_IDX].ring_idx;
+	rc = bnxt_re_net_ring_alloc(rdev, pg_map, pages, type,
+				    BNXT_QPLIB_CREQE_MAX_CNT - 1,
+				    ridx, &rdev->rcfw.creq_ring_id);
 	if (rc) {
 		pr_err("Failed to allocate CREQ: %#x\n", rc);
 		goto free_rcfw;
 	}
-	rc = bnxt_qplib_enable_rcfw_channel
-				(rdev->en_dev->pdev, &rdev->rcfw,
-				 rdev->msix_entries[BNXT_RE_AEQ_IDX].vector,
-				 rdev->msix_entries[BNXT_RE_AEQ_IDX].db_offset,
-				 rdev->is_virtfn, &bnxt_re_aeq_handler);
+	db_offt = bnxt_re_get_nqdb_offset(rdev, BNXT_RE_AEQ_IDX);
+	vid = rdev->msix_entries[BNXT_RE_AEQ_IDX].vector;
+	rc = bnxt_qplib_enable_rcfw_channel(rdev->en_dev->pdev, &rdev->rcfw,
+					    vid, db_offt, rdev->is_virtfn,
+					    &bnxt_re_aeq_handler);
 	if (rc) {
 		pr_err("Failed to enable RCFW channel: %#x\n", rc);
 		goto free_ring;
@@ -1444,20 +1459,6 @@ static int bnxt_re_ib_reg(struct bnxt_re_dev *rdev)
 	}
 	set_bit(BNXT_RE_FLAG_IBDEV_REGISTERED, &rdev->flags);
 	dev_info(rdev_to_dev(rdev), "Device registered successfully");
-	for (i = 0; i < ARRAY_SIZE(bnxt_re_attributes); i++) {
-		rc = device_create_file(&rdev->ibdev.dev,
-					bnxt_re_attributes[i]);
-		if (rc) {
-			dev_err(rdev_to_dev(rdev),
-				"Failed to create IB sysfs: %#x", rc);
-			/* Must clean up all created device files */
-			for (j = 0; j < i; j++)
-				device_remove_file(&rdev->ibdev.dev,
-						   bnxt_re_attributes[j]);
-			bnxt_re_unregister_ib(rdev);
-			goto fail;
-		}
-	}
 	ib_get_eth_speed(&rdev->ibdev, 1, &rdev->active_speed,
 			 &rdev->active_width);
 	set_bit(BNXT_RE_FLAG_ISSUE_ROCE_STATS, &rdev->flags);
@@ -1472,7 +1473,8 @@ free_ctx:
 disable_rcfw:
 	bnxt_qplib_disable_rcfw_channel(&rdev->rcfw);
 free_ring:
-	bnxt_re_net_ring_free(rdev, rdev->rcfw.creq_ring_id);
+	type = bnxt_qplib_get_ring_type(&rdev->chip_ctx);
+	bnxt_re_net_ring_free(rdev, rdev->rcfw.creq_ring_id, type);
 free_rcfw:
 	bnxt_qplib_free_rcfw_channel(&rdev->rcfw);
 fail:

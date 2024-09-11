@@ -1269,6 +1269,13 @@ static struct rt6_info *rt6_make_pcpu_route(struct net *net,
 	prev = cmpxchg(p, NULL, pcpu_rt);
 	BUG_ON(prev);
 
+	if (rt->fib6_destroying) {
+		struct fib6_info *from;
+
+		from = xchg((__force struct fib6_info **)&pcpu_rt->from, NULL);
+		fib6_info_release(from);
+	}
+
 	return pcpu_rt;
 }
 
@@ -3100,7 +3107,7 @@ static struct fib6_info *ip6_route_info_create(struct fib6_config *cfg,
 	rt->fib6_metric = cfg->fc_metric;
 	rt->fib6_nh.nh_weight = 1;
 
-	rt->fib6_type = cfg->fc_type;
+	rt->fib6_type = cfg->fc_type ? : RTN_UNICAST;
 
 	/* We cannot add true routes via loopback here,
 	   they would result in kernel looping; promote them to reject routes
@@ -4194,7 +4201,7 @@ static int rtm_to_fib6_config(struct sk_buff *skb, struct nlmsghdr *nlh,
 	int err;
 
 	err = nlmsg_parse(nlh, sizeof(*rtm), tb, RTA_MAX, rtm_ipv6_policy,
-			  NULL);
+			  extack);
 	if (err < 0)
 		goto errout;
 
@@ -4862,30 +4869,23 @@ static bool fib6_info_uses_dev(const struct fib6_info *f6i,
 	return false;
 }
 
-struct fib6_nh_exception_dump_walker {
-	struct rt6_rtnl_dump_arg *dump;
-	struct fib6_info *rt;
-	unsigned int flags;
-	unsigned int skip;
-	unsigned int count;
-};
-
-static int rt6_nh_dump_exceptions(struct fib6_nh *nh, void *arg)
+static int rt6_dump_exceptions(struct fib6_info *rt,
+			       struct rt6_rtnl_dump_arg *dump,
+			       unsigned int flags, unsigned int skip,
+			       unsigned int *count)
 {
-	struct fib6_nh_exception_dump_walker *w = arg;
-	struct rt6_rtnl_dump_arg *dump = w->dump;
 	struct rt6_exception_bucket *bucket;
 	struct rt6_exception *rt6_ex;
 	int i, err;
 
-	bucket = fib6_nh_get_excptn_bucket(nh, NULL);
+	bucket = rcu_dereference(rt->rt6i_exception_bucket);
 	if (!bucket)
 		return 0;
 
 	for (i = 0; i < FIB6_EXCEPTION_BUCKET_SIZE; i++) {
 		hlist_for_each_entry(rt6_ex, &bucket->chain, hlist) {
-			if (w->skip) {
-				w->skip--;
+			if (skip) {
+				skip--;
 				continue;
 			}
 
@@ -4901,19 +4901,19 @@ static int rt6_nh_dump_exceptions(struct fib6_nh *nh, void *arg)
 			 * we'll skip the wrong amount.
 			 */
 			if (rt6_check_expired(rt6_ex->rt6i)) {
-				w->count++;
+				(*count)++;
 				continue;
 			}
 
-			err = rt6_fill_node(dump->net, dump->skb, w->rt,
+			err = rt6_fill_node(dump->net, dump->skb, rt,
 					    &rt6_ex->rt6i->dst, NULL, NULL, 0,
 					    RTM_NEWROUTE,
 					    NETLINK_CB(dump->cb->skb).portid,
-					    dump->cb->nlh->nlmsg_seq, w->flags);
+					    dump->cb->nlh->nlmsg_seq, flags);
 			if (err)
 				return err;
 
-			w->count++;
+			(*count)++;
 		}
 		bucket++;
 	}
@@ -4965,25 +4965,14 @@ int rt6_dump_route(struct fib6_info *rt, void *p_arg, unsigned int skip)
 	}
 
 	if (filter->dump_exceptions) {
-		struct fib6_nh_exception_dump_walker w = { .dump = arg,
-							   .rt = rt,
-							   .flags = flags,
-							   .skip = skip,
-							   .count = 0 };
 		int err;
 
 		rcu_read_lock();
-		if (rt->nh) {
-			err = nexthop_for_each_fib6_nh(rt->nh,
-						       rt6_nh_dump_exceptions,
-						       &w);
-		} else {
-			err = rt6_nh_dump_exceptions(rt->fib6_nh, &w);
-		}
+		err = rt6_dump_exceptions(rt, arg, flags, skip, &count);
 		rcu_read_unlock();
 
 		if (err)
-			return count += w.count;
+			return count;
 	}
 
 	return -1;

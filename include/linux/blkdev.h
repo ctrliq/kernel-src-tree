@@ -550,7 +550,8 @@ struct request_queue {
 
 	struct mutex		sysfs_lock;
 
-	atomic_t		mq_freeze_depth;
+	RH_KABI_REPLACE(atomic_t                mq_freeze_depth,
+			int			mq_freeze_depth)
 
 #if defined(CONFIG_BLK_DEV_BSG)
 	struct bsg_class_device bsg_dev;
@@ -563,6 +564,7 @@ struct request_queue {
 	struct rcu_head		rcu_head;
 	wait_queue_head_t	mq_freeze_wq;
 	struct percpu_ref	q_usage_counter;
+	RH_KABI_DEPRECATE(struct list_head, all_q_node)
 
 	struct blk_mq_tag_set	*tag_set;
 	struct list_head	tag_set_list;
@@ -581,6 +583,18 @@ struct request_queue {
 
 #define BLK_MAX_WRITE_HINTS	5
 	u64			write_hints[BLK_MAX_WRITE_HINTS];
+
+	/*
+	 * for reusing dead hctx instance in case of updating
+	 * nr_hw_queues
+	 */
+	RH_KABI_EXTEND(struct list_head	unused_hctx_list)
+	RH_KABI_EXTEND(spinlock_t	unused_hctx_lock)
+	/*
+	 * Protect concurrent access to q_usage_counter by
+	 * percpu_ref_kill() and percpu_ref_reinit().
+	 */
+	RH_KABI_EXTEND(struct mutex		mq_freeze_lock)
 };
 
 #define QUEUE_FLAG_STOPPED	1	/* queue is stopped */
@@ -600,7 +614,7 @@ struct request_queue {
 #define QUEUE_FLAG_SAME_FORCE  15	/* force complete on same CPU */
 #define QUEUE_FLAG_DEAD        16	/* queue tear-down finished */
 #define QUEUE_FLAG_INIT_DONE   17	/* queue is initialized */
-#define QUEUE_FLAG_NO_SG_MERGE 18	/* don't attempt to merge SG segments*/
+#define QUEUE_FLAG_NO_SG_MERGE 18	/* don't attempt to merge SG segments (obsolete) */
 #define QUEUE_FLAG_POLL	       19	/* IO polling enabled if set */
 #define QUEUE_FLAG_WC	       20	/* Write back caching */
 #define QUEUE_FLAG_FUA	       21	/* device supports FUA writes */

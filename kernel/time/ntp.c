@@ -17,6 +17,7 @@
 #include <linux/mm.h>
 #include <linux/module.h>
 #include <linux/rtc.h>
+#include <linux/audit.h>
 
 #include "ntp_internal.h"
 #include "timekeeping_internal.h"
@@ -715,7 +716,8 @@ static inline void process_adjtimex_modes(const struct timex *txc, s32 *time_tai
  * adjtimex mainly allows reading (and writing, if superuser) of
  * kernel time-keeping variables. used by xntpd.
  */
-int __do_adjtimex(struct timex *txc, const struct timespec64 *ts, s32 *time_tai)
+int __do_adjtimex(struct timex *txc, const struct timespec64 *ts,
+		  s32 *time_tai, struct audit_ntp_data *ad)
 {
 	int result;
 
@@ -726,13 +728,28 @@ int __do_adjtimex(struct timex *txc, const struct timespec64 *ts, s32 *time_tai)
 			/* adjtime() is independent from ntp_adjtime() */
 			time_adjust = txc->offset;
 			ntp_update_frequency();
+
+			audit_ntp_set_old(ad, AUDIT_NTP_ADJUST,	save_adjust);
+			audit_ntp_set_new(ad, AUDIT_NTP_ADJUST,	time_adjust);
 		}
 		txc->offset = save_adjust;
 	} else {
-
 		/* If there are input parameters, then process them: */
-		if (txc->modes)
+		if (txc->modes) {
+			audit_ntp_set_old(ad, AUDIT_NTP_OFFSET,	time_offset);
+			audit_ntp_set_old(ad, AUDIT_NTP_FREQ,	time_freq);
+			audit_ntp_set_old(ad, AUDIT_NTP_STATUS,	time_status);
+			audit_ntp_set_old(ad, AUDIT_NTP_TAI,	*time_tai);
+			audit_ntp_set_old(ad, AUDIT_NTP_TICK,	tick_usec);
+
 			process_adjtimex_modes(txc, time_tai);
+
+			audit_ntp_set_new(ad, AUDIT_NTP_OFFSET,	time_offset);
+			audit_ntp_set_new(ad, AUDIT_NTP_FREQ,	time_freq);
+			audit_ntp_set_new(ad, AUDIT_NTP_STATUS,	time_status);
+			audit_ntp_set_new(ad, AUDIT_NTP_TAI,	*time_tai);
+			audit_ntp_set_new(ad, AUDIT_NTP_TICK,	tick_usec);
+		}
 
 		txc->offset = shift_right(time_offset * NTP_INTERVAL_FREQ,
 				  NTP_SCALE_SHIFT);

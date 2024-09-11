@@ -28,7 +28,9 @@
 #include <linux/sched/signal.h>
 #include <linux/net.h>
 #include <net/devlink.h>
+#ifndef __GENKSYMS__
 #include <net/xdp_sock.h>
+#endif
 #include <net/flow_offload.h>
 
 /*
@@ -542,6 +544,134 @@ struct ethtool_link_usettings {
 	} link_modes;
 };
 
+/* RHEL: RHEL-8.0 knows only 51 link modes so its bitmaps used
+ * in ethtool_link_ksettings are array of longs with just 1 item.
+ * The RHEL code uses more link modes so the size of fields
+ * supported, advertising and lp_advertising are larger so
+ * the current struct ethtool_link_ksettings cannot be used
+ * for drivers compiled against RHEL-8.0.
+ * We need to declare a compatibility structure that will
+ * be used for these old drivers.
+ */
+#define __ETHTOOL_DECLARE_LINK_MODE_MASK_RH80(name)	\
+	DECLARE_BITMAP(name, __ETHTOOL_LINK_MODE_LAST_RH80 + 1)
+
+struct ethtool_link_ksettings_rh80 {
+	struct ethtool_link_settings base;
+	struct {
+		__ETHTOOL_DECLARE_LINK_MODE_MASK_RH80(supported);
+		__ETHTOOL_DECLARE_LINK_MODE_MASK_RH80(advertising);
+		__ETHTOOL_DECLARE_LINK_MODE_MASK_RH80(lp_advertising);
+	} link_modes;
+};
+
+/* RHEL: Helper function to check whether a driver implements
+ * ethtool_ops->get_link_ksettings() callback or its older
+ * variant used in RHEL-8.0.
+ */
+static inline
+bool __rh_has_get_link_ksettings(struct net_device *dev)
+{
+	return (dev->ethtool_ops->get_link_ksettings ||
+		dev->ethtool_ops->get_link_ksettings_rh80);
+}
+
+/* RHEL: Helper function to check whether a driver implements
+ * ethtool_ops->set_link_ksettings() callback or its older
+ * variant used in RHEL-8.0.
+ */
+static inline
+bool __rh_has_set_link_ksettings(struct net_device *dev)
+{
+	return (dev->ethtool_ops->set_link_ksettings ||
+		dev->ethtool_ops->set_link_ksettings_rh80);
+}
+
+/* RHEL: Helper function to call ethtool_ops->get_link_ksettings()
+ * callback or its older variant used RHEL-8.0 depending on what
+ * the driver implements.
+ *
+ * Newer callback is called directly and link_ksettings parameter
+ * is passed through.
+ * For older callback a temporary storage is used and its content
+ * is then translated for caller.
+ */
+static inline
+int __rh_call_get_link_ksettings(struct net_device *dev,
+				 struct ethtool_link_ksettings *link_ksettings)
+{
+	int err = -ENOTSUPP;
+
+	if (dev->ethtool_ops->get_link_ksettings) {
+		err = dev->ethtool_ops->get_link_ksettings(dev, link_ksettings);
+	} else if (dev->ethtool_ops->get_link_ksettings_rh80) {
+		struct ethtool_link_ksettings_rh80 tmp;
+
+		memset(&tmp, 0, sizeof(tmp));
+		err = dev->ethtool_ops->get_link_ksettings_rh80(dev, &tmp);
+		if (!err) {
+			link_ksettings->base = tmp.base;
+			bitmap_zero(link_ksettings->link_modes.supported,
+				    __ETHTOOL_LINK_MODE_LAST);
+			bitmap_copy(link_ksettings->link_modes.supported,
+				    tmp.link_modes.supported,
+				    __ETHTOOL_LINK_MODE_LAST_RH80);
+			bitmap_zero(link_ksettings->link_modes.advertising,
+				    __ETHTOOL_LINK_MODE_LAST);
+			bitmap_copy(link_ksettings->link_modes.advertising,
+				    tmp.link_modes.advertising,
+				    __ETHTOOL_LINK_MODE_LAST_RH80);
+			bitmap_zero(link_ksettings->link_modes.lp_advertising,
+				    __ETHTOOL_LINK_MODE_LAST);
+			bitmap_copy(link_ksettings->link_modes.lp_advertising,
+				    tmp.link_modes.lp_advertising,
+				    __ETHTOOL_LINK_MODE_LAST_RH80);
+		}
+	}
+
+	return err;
+}
+
+/* RHEL: Helper function to call ethtool_ops->set_link_ksettings()
+ * callback or its older variant used RHEL-8.0 depending on what
+ * the driver implements.
+ *
+ * Newer callback is called directly and link_ksettings parameter
+ * is passed through.
+ * For older callback a temporary storage is used and its content
+ * is filled from input buffer (link modes bitmaps truncated).
+ */
+static inline
+int __rh_call_set_link_ksettings(struct net_device *dev,
+				 const struct ethtool_link_ksettings *link_ksettings)
+{
+	int err = -ENOTSUPP;
+
+	if (dev->ethtool_ops->set_link_ksettings) {
+		err = dev->ethtool_ops->set_link_ksettings(dev, link_ksettings);
+	} else if (dev->ethtool_ops->set_link_ksettings_rh80) {
+		struct ethtool_link_ksettings_rh80 tmp;
+
+		/* Copy only link modes that are known for RHEL-8.0 based
+		 * drivers.
+		 */
+		tmp.base = link_ksettings->base;
+		bitmap_copy(tmp.link_modes.supported,
+			    link_ksettings->link_modes.supported,
+			    __ETHTOOL_LINK_MODE_LAST_RH80);
+		bitmap_copy(tmp.link_modes.advertising,
+			    link_ksettings->link_modes.advertising,
+			    __ETHTOOL_LINK_MODE_LAST_RH80);
+		bitmap_copy(tmp.link_modes.lp_advertising,
+			    link_ksettings->link_modes.lp_advertising,
+			    __ETHTOOL_LINK_MODE_LAST_RH80);
+
+		err = dev->ethtool_ops->set_link_ksettings_rh80(dev, &tmp);
+	}
+
+	return err;
+}
+
 /* Internal kernel helper to query a device ethtool_link_settings.
  *
  * Backward compatibility note: for compatibility with legacy drivers
@@ -560,10 +690,9 @@ int __ethtool_get_link_ksettings(struct net_device *dev,
 
 	ASSERT_RTNL();
 
-	if (dev->ethtool_ops->get_link_ksettings) {
+	if (__rh_has_get_link_ksettings(dev)) {
 		memset(link_ksettings, 0, sizeof(*link_ksettings));
-		return dev->ethtool_ops->get_link_ksettings(dev,
-							    link_ksettings);
+		return __rh_call_get_link_ksettings(dev, link_ksettings);
 	}
 
 	/* driver doesn't support %ethtool_link_ksettings API. revert to
@@ -656,7 +785,7 @@ static int ethtool_get_link_ksettings(struct net_device *dev,
 
 	ASSERT_RTNL();
 
-	if (!dev->ethtool_ops->get_link_ksettings)
+	if (!__rh_has_get_link_ksettings(dev))
 		return -EOPNOTSUPP;
 
 	/* handle bitmap nbits handshake */
@@ -690,7 +819,7 @@ static int ethtool_get_link_ksettings(struct net_device *dev,
 	 */
 
 	memset(&link_ksettings, 0, sizeof(link_ksettings));
-	err = dev->ethtool_ops->get_link_ksettings(dev, &link_ksettings);
+	err = __rh_call_get_link_ksettings(dev, &link_ksettings);
 	if (err < 0)
 		return err;
 
@@ -720,7 +849,7 @@ static int ethtool_set_link_ksettings(struct net_device *dev,
 
 	ASSERT_RTNL();
 
-	if (!dev->ethtool_ops->set_link_ksettings)
+	if (!__rh_has_set_link_ksettings(dev))
 		return -EOPNOTSUPP;
 
 	/* make sure nbits field has expected value */
@@ -744,7 +873,7 @@ static int ethtool_set_link_ksettings(struct net_device *dev,
 	    != link_ksettings.base.link_mode_masks_nwords)
 		return -EINVAL;
 
-	return dev->ethtool_ops->set_link_ksettings(dev, &link_ksettings);
+	return __rh_call_set_link_ksettings(dev, &link_ksettings);
 }
 
 /* Query device for its ethtool_cmd settings.
@@ -763,14 +892,13 @@ static int ethtool_get_settings(struct net_device *dev, void __user *useraddr)
 
 	ASSERT_RTNL();
 
-	if (dev->ethtool_ops->get_link_ksettings) {
+	if (__rh_has_get_link_ksettings(dev)) {
 		/* First, use link_ksettings API if it is supported */
 		int err;
 		struct ethtool_link_ksettings link_ksettings;
 
 		memset(&link_ksettings, 0, sizeof(link_ksettings));
-		err = dev->ethtool_ops->get_link_ksettings(dev,
-							   &link_ksettings);
+		err = __rh_call_get_link_ksettings(dev, &link_ksettings);
 		if (err < 0)
 			return err;
 		convert_link_ksettings_to_legacy_settings(&cmd,
@@ -821,7 +949,7 @@ static int ethtool_set_settings(struct net_device *dev, void __user *useraddr)
 		return -EFAULT;
 
 	/* first, try new %ethtool_link_ksettings API. */
-	if (dev->ethtool_ops->set_link_ksettings) {
+	if (__rh_has_set_link_ksettings(dev)) {
 		struct ethtool_link_ksettings link_ksettings;
 
 		if (!convert_legacy_settings_to_link_ksettings(&link_ksettings,
@@ -831,8 +959,7 @@ static int ethtool_set_settings(struct net_device *dev, void __user *useraddr)
 		link_ksettings.base.cmd = ETHTOOL_SLINKSETTINGS;
 		link_ksettings.base.link_mode_masks_nwords
 			= __ETHTOOL_LINK_MODE_MASK_NU32;
-		return dev->ethtool_ops->set_link_ksettings(dev,
-							    &link_ksettings);
+		return __rh_call_set_link_ksettings(dev, &link_ksettings);
 	}
 
 	/* legacy %ethtool_cmd API */

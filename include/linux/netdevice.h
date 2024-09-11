@@ -632,7 +632,7 @@ struct netdev_queue {
 	struct dql		dql;
 #endif
 
-	RH_KABI_RESERVE(1)
+	RH_KABI_USE(1, struct xdp_umem	*umem)
 	RH_KABI_RESERVE(2)
 	RH_KABI_RESERVE(3)
 	RH_KABI_RESERVE(4)
@@ -755,7 +755,7 @@ struct netdev_rx_queue {
 	struct net_device		*dev;
 	RH_KABI_EXCLUDE(struct xdp_rxq_info	xdp_rxq)
 
-	RH_KABI_RESERVE(1)
+	RH_KABI_USE(1, struct xdp_umem	*umem)
 	RH_KABI_RESERVE(2)
 	RH_KABI_RESERVE(3)
 	RH_KABI_RESERVE(4)
@@ -884,8 +884,12 @@ enum bpf_netdev_command {
 	XDP_QUERY_PROG,
 	XDP_QUERY_PROG_HW,
 	/* BPF program for offload callbacks, invoked at program load time. */
+	BPF_OFFLOAD_VERIFIER_PREP,
+	BPF_OFFLOAD_TRANSLATE,
+	BPF_OFFLOAD_DESTROY,
 	BPF_OFFLOAD_MAP_ALLOC,
 	BPF_OFFLOAD_MAP_FREE,
+	XDP_QUERY_XSK_UMEM,
 	XDP_SETUP_XSK_UMEM,
 };
 
@@ -908,14 +912,23 @@ struct netdev_bpf {
 			/* flags with which program was installed */
 			u32 prog_flags;
 		};
+		/* BPF_OFFLOAD_VERIFIER_PREP */
+		struct {
+			struct bpf_prog *prog;
+			const struct bpf_prog_offload_ops *ops; /* callee set */
+		} verifier;
+		/* BPF_OFFLOAD_DESTROY */
+		struct {
+			struct bpf_prog *prog;
+		} offload;
 		/* BPF_OFFLOAD_MAP_ALLOC, BPF_OFFLOAD_MAP_FREE */
 		struct {
 			struct bpf_offloaded_map *offmap;
 		};
-		/* XDP_SETUP_XSK_UMEM */
+		/* XDP_QUERY_XSK_UMEM, XDP_SETUP_XSK_UMEM */
 		struct {
-			struct xdp_umem *umem;
-			u16 queue_id;
+			struct xdp_umem *umem; /* out for query*/
+			u16 queue_id; /* in for query */
 		} xsk;
 	};
 };
@@ -964,7 +977,9 @@ struct tlsdev_ops {
 			    struct tls_context *ctx,
 			    enum tls_offload_ctx_dir direction);
 
-	RH_KABI_RESERVE(1)
+	RH_KABI_USE(1, void (*tls_dev_resync_rx)(struct net_device *netdev,
+						 struct sock *sk, u32 seq,
+						 u64 rcd_sn))
 	RH_KABI_RESERVE(2)
 	RH_KABI_RESERVE(3)
 	RH_KABI_RESERVE(4)
@@ -1419,13 +1434,19 @@ struct net_device_ops {
 	void			(*ndo_neigh_destroy)(struct net_device *dev,
 						     struct neighbour *n);
 
-	int			(*ndo_fdb_add)(struct ndmsg *ndm,
+	RH_KABI_REPLACE(int	(*ndo_fdb_add)(struct ndmsg *ndm,
+					       struct nlattr *tb[],
+					       struct net_device *dev,
+					       const unsigned char *addr,
+					       u16 vid,
+					       u16 flags),
+			int	(*ndo_fdb_add)(struct ndmsg *ndm,
 					       struct nlattr *tb[],
 					       struct net_device *dev,
 					       const unsigned char *addr,
 					       u16 vid,
 					       u16 flags,
-					       struct netlink_ext_ack *extack);
+					       struct netlink_ext_ack *extack))
 	int			(*ndo_fdb_del)(struct ndmsg *ndm,
 					       struct nlattr *tb[],
 					       struct net_device *dev,
@@ -1437,10 +1458,13 @@ struct net_device_ops {
 						struct net_device *filter_dev,
 						int *idx);
 
-	int			(*ndo_bridge_setlink)(struct net_device *dev,
+	RH_KABI_REPLACE(int	(*ndo_bridge_setlink)(struct net_device *dev,
+						      struct nlmsghdr *nlh,
+						      u16 flags),
+			int	(*ndo_bridge_setlink)(struct net_device *dev,
 						      struct nlmsghdr *nlh,
 						      u16 flags,
-						      struct netlink_ext_ack *extack);
+						      struct netlink_ext_ack *extack))
 	int			(*ndo_bridge_getlink)(struct sk_buff *skb,
 						      u32 pid, u32 seq,
 						      struct net_device *dev,
@@ -1453,8 +1477,6 @@ struct net_device_ops {
 						      bool new_carrier);
 	int			(*ndo_get_phys_port_id)(struct net_device *dev,
 							struct netdev_phys_item_id *ppid);
-	int			(*ndo_get_port_parent_id)(struct net_device *dev,
-							  struct netdev_phys_item_id *ppid);
 	int			(*ndo_get_phys_port_name)(struct net_device *dev,
 							  char *name, size_t len);
 	void			(*ndo_udp_tunnel_add)(struct net_device *dev,
@@ -1485,7 +1507,8 @@ struct net_device_ops {
 	RH_KABI_EXCLUDE(int	(*ndo_xsk_async_xmit)(struct net_device *dev,
 						      u32 queue_id))
 
-	RH_KABI_RESERVE(1)
+	RH_KABI_USE(1, int	(*ndo_get_port_parent_id)(struct net_device *dev,
+							  struct netdev_phys_item_id *ppid))
 	RH_KABI_RESERVE(2)
 	RH_KABI_RESERVE(3)
 	RH_KABI_RESERVE(4)
@@ -2013,10 +2036,6 @@ struct net_device {
 #endif
 	RH_KABI_EXCLUDE(struct wireless_dev	*ieee80211_ptr)
 	struct wpan_dev		*ieee802154_ptr;
-#if IS_ENABLED(CONFIG_MPLS_ROUTING)
-	struct mpls_dev __rcu	*mpls_ptr;
-#endif
-
 /*
  * Cache lines mostly used on receive path (including eth_type_trans())
  */
@@ -2110,6 +2129,7 @@ struct net_device {
 		struct pcpu_lstats __percpu		*lstats;
 		struct pcpu_sw_netstats __percpu	*tstats;
 		struct pcpu_dstats __percpu		*dstats;
+		RH_KABI_DEPRECATE(struct pcpu_vstats __percpu *, vstats)
 	};
 
 #if IS_ENABLED(CONFIG_GARP)
@@ -2150,7 +2170,7 @@ struct net_device {
 	struct lock_class_key	*qdisc_running_key;
 	bool			proto_down;
 
-	RH_KABI_RESERVE(1)
+	RH_KABI_USE(1, struct mpls_dev __rcu   *mpls_ptr)
 	RH_KABI_RESERVE(2)
 	RH_KABI_RESERVE(3)
 	RH_KABI_RESERVE(4)
@@ -2528,11 +2548,13 @@ struct pcpu_sw_netstats {
 	struct u64_stats_sync   syncp;
 };
 
+#ifndef __GENKSYMS__
 struct pcpu_lstats {
 	u64 packets;
 	u64 bytes;
 	struct u64_stats_sync syncp;
 };
+#endif
 
 #define __netdev_alloc_pcpu_stats(type, gfp)				\
 ({									\

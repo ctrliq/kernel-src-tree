@@ -310,8 +310,15 @@ void __init paging_init(void)
 	printk(KERN_DEBUG "Memory hole size: %ldMB\n",
 	       (long int)((top_of_ram - total_ram) >> 20));
 
-#ifdef CONFIG_ZONE_DMA
+#if defined(CONFIG_ZONE_DMA) && defined(CONFIG_PPC_BOOK3E_64)
 	max_zone_pfns[ZONE_DMA]	= min(max_low_pfn, 0x7fffffffUL >> PAGE_SHIFT);
+#endif
+#if defined(CONFIG_ZONE_DMA) && !defined(CONFIG_PPC_BOOK3E_64)
+	/*
+	 * Reduce the window where gfp_allowed_mask isn't out of control of
+	 * powerpc in between kernel_init_freeable() and free_initmem().
+	 */
+	gfp_allowed_mask &= ~(__GFP_DMA|__GFP_DMA32);
 #endif
 	max_zone_pfns[ZONE_NORMAL] = max_low_pfn;
 #ifdef CONFIG_HIGHMEM
@@ -387,6 +394,18 @@ void free_initmem(void)
 	mark_initmem_nx();
 	init_mem_is_free = true;
 	free_initmem_default(POISON_FREE_INITMEM);
+#if defined(CONFIG_ZONE_DMA) && !defined(CONFIG_PPC_BOOK3E_64)
+	/*
+	 * At this point "gfp_allowed_mask" won't be overwritten by
+	 * the common code anymore so we can set it for our purpose.
+	 *
+	 * We leave the ZONE_DMA enabled to preserve the kABI, but
+	 * it's empty, so __GFP_DMA must be ignored when building the
+	 * zonelist in prepare_alloc_pages->node_zonelist or all
+	 * driver GFP_DMA allocations will fail for no good reason.
+	 */
+	gfp_allowed_mask &= ~(__GFP_DMA|__GFP_DMA32);
+#endif
 }
 
 #ifdef CONFIG_BLK_DEV_INITRD

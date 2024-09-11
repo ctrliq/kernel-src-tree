@@ -49,12 +49,14 @@ enum switchdev_attr_id {
 	SWITCHDEV_ATTR_ID_PORT_STP_STATE,
 	SWITCHDEV_ATTR_ID_PORT_BRIDGE_FLAGS,
 	SWITCHDEV_ATTR_ID_PORT_BRIDGE_FLAGS_SUPPORT,
-	SWITCHDEV_ATTR_ID_PORT_PRE_BRIDGE_FLAGS,
 	SWITCHDEV_ATTR_ID_PORT_MROUTER,
 	SWITCHDEV_ATTR_ID_BRIDGE_AGEING_TIME,
 	SWITCHDEV_ATTR_ID_BRIDGE_VLAN_FILTERING,
 	SWITCHDEV_ATTR_ID_BRIDGE_MC_DISABLED,
 	SWITCHDEV_ATTR_ID_BRIDGE_MROUTER,
+#ifndef __GENKSYMS__
+	SWITCHDEV_ATTR_ID_PORT_PRE_BRIDGE_FLAGS,
+#endif
 };
 
 struct switchdev_attr {
@@ -132,10 +134,6 @@ struct switchdev_ops_extended_rh {
  * @switchdev_port_attr_get: Get a port attribute (see switchdev_attr).
  *
  * @switchdev_port_attr_set: Set a port attribute (see switchdev_attr).
- *
- * @switchdev_port_obj_add: Add an object to port (see switchdev_obj_*).
- *
- * @switchdev_port_obj_del: Delete an object from port (see switchdev_obj_*).
  */
 struct switchdev_ops {
 	int	(*switchdev_port_attr_get)(struct net_device *dev,
@@ -143,11 +141,11 @@ struct switchdev_ops {
 	int	(*switchdev_port_attr_set)(struct net_device *dev,
 					   const struct switchdev_attr *attr,
 					   struct switchdev_trans *trans);
-	int	(*switchdev_port_obj_add)(struct net_device *dev,
+	RH_KABI_DEPRECATE_FN(int, switchdev_port_obj_add, struct net_device *dev,
 					  const struct switchdev_obj *obj,
-					  struct switchdev_trans *trans);
-	int	(*switchdev_port_obj_del)(struct net_device *dev,
-					  const struct switchdev_obj *obj);
+					  struct switchdev_trans *trans)
+	RH_KABI_DEPRECATE_FN(int, switchdev_port_obj_del, struct net_device *dev,
+					  const struct switchdev_obj *obj)
 
 	RH_KABI_RESERVE(1)
 	RH_KABI_RESERVE(2)
@@ -179,6 +177,7 @@ enum switchdev_notifier_type {
 
 struct switchdev_notifier_info {
 	struct net_device *dev;
+	struct netlink_ext_ack *extack;
 };
 
 struct switchdev_notifier_fdb_info {
@@ -209,6 +208,12 @@ switchdev_notifier_info_to_dev(const struct switchdev_notifier_info *info)
 	return info->dev;
 }
 
+static inline struct netlink_ext_ack *
+switchdev_notifier_info_to_extack(const struct switchdev_notifier_info *info)
+{
+	return info->extack;
+}
+
 #ifdef CONFIG_NET_SWITCHDEV
 
 void switchdev_deferred_process(void);
@@ -217,19 +222,22 @@ int switchdev_port_attr_get(struct net_device *dev,
 int switchdev_port_attr_set(struct net_device *dev,
 			    const struct switchdev_attr *attr);
 int switchdev_port_obj_add(struct net_device *dev,
-			   const struct switchdev_obj *obj);
+			   const struct switchdev_obj *obj,
+			   struct netlink_ext_ack *extack);
 int switchdev_port_obj_del(struct net_device *dev,
 			   const struct switchdev_obj *obj);
 
 int register_switchdev_notifier(struct notifier_block *nb);
 int unregister_switchdev_notifier(struct notifier_block *nb);
 int call_switchdev_notifiers(unsigned long val, struct net_device *dev,
-			     struct switchdev_notifier_info *info);
+			     struct switchdev_notifier_info *info,
+			     struct netlink_ext_ack *extack);
 
 int register_switchdev_blocking_notifier(struct notifier_block *nb);
 int unregister_switchdev_blocking_notifier(struct notifier_block *nb);
 int call_switchdev_blocking_notifiers(unsigned long val, struct net_device *dev,
-				      struct switchdev_notifier_info *info);
+				      struct switchdev_notifier_info *info,
+				      struct netlink_ext_ack *extack);
 
 void switchdev_port_fwd_mark_set(struct net_device *dev,
 				 struct net_device *group_dev,
@@ -279,7 +287,8 @@ static inline int switchdev_port_attr_set(struct net_device *dev,
 }
 
 static inline int switchdev_port_obj_add(struct net_device *dev,
-					 const struct switchdev_obj *obj)
+					 const struct switchdev_obj *obj,
+					 struct netlink_ext_ack *extack)
 {
 	return -EOPNOTSUPP;
 }
@@ -302,7 +311,8 @@ static inline int unregister_switchdev_notifier(struct notifier_block *nb)
 
 static inline int call_switchdev_notifiers(unsigned long val,
 					   struct net_device *dev,
-					   struct switchdev_notifier_info *info)
+					   struct switchdev_notifier_info *info,
+					   struct netlink_ext_ack *extack)
 {
 	return NOTIFY_DONE;
 }
@@ -322,7 +332,8 @@ unregister_switchdev_blocking_notifier(struct notifier_block *nb)
 static inline int
 call_switchdev_blocking_notifiers(unsigned long val,
 				  struct net_device *dev,
-				  struct switchdev_notifier_info *info)
+				  struct switchdev_notifier_info *info,
+				  struct netlink_ext_ack *extack)
 {
 	return NOTIFY_DONE;
 }

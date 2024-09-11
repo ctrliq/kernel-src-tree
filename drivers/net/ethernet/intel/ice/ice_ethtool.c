@@ -35,8 +35,14 @@ static int ice_q_stats_len(struct net_device *netdev)
 #define ICE_PF_STATS_LEN	ARRAY_SIZE(ice_gstrings_pf_stats)
 #define ICE_VSI_STATS_LEN	ARRAY_SIZE(ice_gstrings_vsi_stats)
 
-#define ICE_ALL_STATS_LEN(n)	(ICE_PF_STATS_LEN + ICE_VSI_STATS_LEN + \
-				 ice_q_stats_len(n))
+#define ICE_PFC_STATS_LEN ( \
+		(FIELD_SIZEOF(struct ice_pf, stats.priority_xoff_rx) + \
+		 FIELD_SIZEOF(struct ice_pf, stats.priority_xon_rx) + \
+		 FIELD_SIZEOF(struct ice_pf, stats.priority_xoff_tx) + \
+		 FIELD_SIZEOF(struct ice_pf, stats.priority_xon_tx)) \
+		 / sizeof(u64))
+#define ICE_ALL_STATS_LEN(n)	(ICE_PF_STATS_LEN + ICE_PFC_STATS_LEN + \
+				 ICE_VSI_STATS_LEN + ice_q_stats_len(n))
 
 static const struct ice_stats ice_gstrings_vsi_stats[] = {
 	ICE_VSI_STAT("tx_unicast", eth_stats.tx_unicast),
@@ -312,6 +318,22 @@ static void ice_get_strings(struct net_device *netdev, u32 stringset, u8 *data)
 			p += ETH_GSTRING_LEN;
 		}
 
+		for (i = 0; i < ICE_MAX_USER_PRIORITY; i++) {
+			snprintf(p, ETH_GSTRING_LEN,
+				 "port.tx-priority-%u-xon", i);
+			p += ETH_GSTRING_LEN;
+			snprintf(p, ETH_GSTRING_LEN,
+				 "port.tx-priority-%u-xoff", i);
+			p += ETH_GSTRING_LEN;
+		}
+		for (i = 0; i < ICE_MAX_USER_PRIORITY; i++) {
+			snprintf(p, ETH_GSTRING_LEN,
+				 "port.rx-priority-%u-xon", i);
+			p += ETH_GSTRING_LEN;
+			snprintf(p, ETH_GSTRING_LEN,
+				 "port.rx-priority-%u-xoff", i);
+			p += ETH_GSTRING_LEN;
+		}
 		break;
 	case ETH_SS_PRIV_FLAGS:
 		for (i = 0; i < ICE_PRIV_FLAG_ARRAY_SIZE; i++) {
@@ -566,6 +588,16 @@ ice_get_ethtool_stats(struct net_device *netdev,
 		p = (char *)pf + ice_gstrings_pf_stats[j].stat_offset;
 		data[i++] = (ice_gstrings_pf_stats[j].sizeof_stat ==
 			     sizeof(u64)) ? *(u64 *)p : *(u32 *)p;
+	}
+
+	for (j = 0; j < ICE_MAX_USER_PRIORITY; j++) {
+		data[i++] = pf->stats.priority_xon_tx[j];
+		data[i++] = pf->stats.priority_xoff_tx[j];
+	}
+
+	for (j = 0; j < ICE_MAX_USER_PRIORITY; j++) {
+		data[i++] = pf->stats.priority_xon_rx[j];
+		data[i++] = pf->stats.priority_xoff_rx[j];
 	}
 }
 
@@ -892,7 +924,7 @@ ice_get_settings_link_up(struct ethtool_link_ksettings *ks,
 
 	link_info = &vsi->port_info->phy.link_info;
 
-	/* Initialize supported and advertised settings based on phy settings */
+	/* Initialize supported and advertised settings based on PHY settings */
 	switch (link_info->phy_type_low) {
 	case ICE_PHY_TYPE_LOW_100BASE_TX:
 		ethtool_link_ksettings_add_link_mode(ks, supported, Autoneg);
@@ -1222,7 +1254,7 @@ ice_get_settings_link_down(struct ethtool_link_ksettings *ks,
 			   struct net_device *netdev)
 {
 	/* link is down and the driver needs to fall back on
-	 * supported phy types to figure out what info to display
+	 * supported PHY types to figure out what info to display
 	 */
 	ice_phy_type_to_ethtool(netdev, ks);
 
@@ -1238,8 +1270,9 @@ ice_get_settings_link_down(struct ethtool_link_ksettings *ks,
  *
  * Reports speed/duplex settings based on media_type
  */
-static int ice_get_link_ksettings(struct net_device *netdev,
-				  struct ethtool_link_ksettings *ks)
+static int
+ice_get_link_ksettings(struct net_device *netdev,
+		       struct ethtool_link_ksettings *ks)
 {
 	struct ice_netdev_priv *np = netdev_priv(netdev);
 	struct ice_link_status *hw_link_info;
@@ -1431,7 +1464,7 @@ ice_setup_autoneg(struct ice_port_info *p, struct ethtool_link_ksettings *ks,
 	} else {
 		/* If autoneg is currently enabled */
 		if (p->phy.link_info.an_info & ICE_AQ_AN_COMPLETED) {
-			/* If autoneg is supported 10GBASE_T is the only phy
+			/* If autoneg is supported 10GBASE_T is the only PHY
 			 * that can disable it, so otherwise return error
 			 */
 			if (ethtool_link_ksettings_test_link_mode(ks,
@@ -1481,7 +1514,7 @@ ice_set_link_ksettings(struct net_device *netdev,
 	if (!p)
 		return -EOPNOTSUPP;
 
-	/* Check if this is lan vsi */
+	/* Check if this is LAN VSI */
 	ice_for_each_vsi(pf, idx)
 		if (pf->vsi[idx]->type == ICE_VSI_PF) {
 			if (np->vsi != pf->vsi[idx])
@@ -1545,7 +1578,7 @@ ice_set_link_ksettings(struct net_device *netdev,
 	if (!abilities)
 		return -ENOMEM;
 
-	/* Get the current phy config */
+	/* Get the current PHY config */
 	status = ice_aq_get_phy_caps(p, false, ICE_AQC_REPORT_SW_CFG, abilities,
 				     NULL);
 	if (status) {
@@ -1640,15 +1673,16 @@ done:
 }
 
 /**
- * ice_get_rxnfc - command to get RX flow classification rules
+ * ice_get_rxnfc - command to get Rx flow classification rules
  * @netdev: network interface device structure
  * @cmd: ethtool rxnfc command
  * @rule_locs: buffer to rturn Rx flow classification rules
  *
  * Returns Success if the command is supported.
  */
-static int ice_get_rxnfc(struct net_device *netdev, struct ethtool_rxnfc *cmd,
-			 u32 __always_unused *rule_locs)
+static int
+ice_get_rxnfc(struct net_device *netdev, struct ethtool_rxnfc *cmd,
+	      u32 __always_unused *rule_locs)
 {
 	struct ice_netdev_priv *np = netdev_priv(netdev);
 	struct ice_vsi *vsi = np->vsi;
@@ -1916,7 +1950,7 @@ ice_get_pauseparam(struct net_device *netdev, struct ethtool_pauseparam *pause)
 	if (!pcaps)
 		return;
 
-	/* Get current phy config */
+	/* Get current PHY config */
 	status = ice_aq_get_phy_caps(pi, false, ICE_AQC_REPORT_SW_CFG, pcaps,
 				     NULL);
 	if (status)
@@ -2115,11 +2149,12 @@ out:
  * @key: hash key
  * @hfunc: hash function
  *
- * Returns -EINVAL if the table specifies an invalid queue id, otherwise
+ * Returns -EINVAL if the table specifies an invalid queue ID, otherwise
  * returns 0 after programming the table.
  */
-static int ice_set_rxfh(struct net_device *netdev, const u32 *indir,
-			const u8 *key, const u8 hfunc)
+static int
+ice_set_rxfh(struct net_device *netdev, const u32 *indir, const u8 *key,
+	     const u8 hfunc)
 {
 	struct ice_netdev_priv *np = netdev_priv(netdev);
 	struct ice_vsi *vsi = np->vsi;
@@ -2173,6 +2208,323 @@ static int ice_set_rxfh(struct net_device *netdev, const u32 *indir,
 	return 0;
 }
 
+enum ice_container_type {
+	ICE_RX_CONTAINER,
+	ICE_TX_CONTAINER,
+};
+
+/**
+ * ice_get_rc_coalesce - get ITR values for specific ring container
+ * @ec: ethtool structure to fill with driver's coalesce settings
+ * @c_type: container type, Rx or Tx
+ * @rc: ring container that the ITR values will come from
+ *
+ * Query the device for ice_ring_container specific ITR values. This is
+ * done per ice_ring_container because each q_vector can have 1 or more rings
+ * and all of said ring(s) will have the same ITR values.
+ *
+ * Returns 0 on success, negative otherwise.
+ */
+static int
+ice_get_rc_coalesce(struct ethtool_coalesce *ec, enum ice_container_type c_type,
+		    struct ice_ring_container *rc)
+{
+	struct ice_pf *pf;
+
+	if (!rc->ring)
+		return -EINVAL;
+
+	pf = rc->ring->vsi->back;
+
+	switch (c_type) {
+	case ICE_RX_CONTAINER:
+		ec->use_adaptive_rx_coalesce = ITR_IS_DYNAMIC(rc->itr_setting);
+		ec->rx_coalesce_usecs = rc->itr_setting & ~ICE_ITR_DYNAMIC;
+		ec->rx_coalesce_usecs_high = rc->ring->q_vector->intrl;
+		break;
+	case ICE_TX_CONTAINER:
+		ec->use_adaptive_tx_coalesce = ITR_IS_DYNAMIC(rc->itr_setting);
+		ec->tx_coalesce_usecs = rc->itr_setting & ~ICE_ITR_DYNAMIC;
+		break;
+	default:
+		dev_dbg(&pf->pdev->dev, "Invalid c_type %d\n", c_type);
+		return -EINVAL;
+	}
+
+	return 0;
+}
+
+/**
+ * ice_get_q_coalesce - get a queue's ITR/INTRL (coalesce) settings
+ * @vsi: VSI associated to the queue for getting ITR/INTRL (coalesce) settings
+ * @ec: coalesce settings to program the device with
+ * @q_num: update ITR/INTRL (coalesce) settings for this queue number/index
+ *
+ * Return 0 on success, and negative under the following conditions:
+ * 1. Getting Tx or Rx ITR/INTRL (coalesce) settings failed.
+ * 2. The q_num passed in is not a valid number/index for Tx and Rx rings.
+ */
+static int
+ice_get_q_coalesce(struct ice_vsi *vsi, struct ethtool_coalesce *ec, int q_num)
+{
+	if (q_num < vsi->num_rxq && q_num < vsi->num_txq) {
+		if (ice_get_rc_coalesce(ec, ICE_RX_CONTAINER,
+					&vsi->rx_rings[q_num]->q_vector->rx))
+			return -EINVAL;
+		if (ice_get_rc_coalesce(ec, ICE_TX_CONTAINER,
+					&vsi->tx_rings[q_num]->q_vector->tx))
+			return -EINVAL;
+	} else if (q_num < vsi->num_rxq) {
+		if (ice_get_rc_coalesce(ec, ICE_RX_CONTAINER,
+					&vsi->rx_rings[q_num]->q_vector->rx))
+			return -EINVAL;
+	} else if (q_num < vsi->num_txq) {
+		if (ice_get_rc_coalesce(ec, ICE_TX_CONTAINER,
+					&vsi->tx_rings[q_num]->q_vector->tx))
+			return -EINVAL;
+	} else {
+		return -EINVAL;
+	}
+
+	return 0;
+}
+
+/**
+ * __ice_get_coalesce - get ITR/INTRL values for the device
+ * @netdev: pointer to the netdev associated with this query
+ * @ec: ethtool structure to fill with driver's coalesce settings
+ * @q_num: queue number to get the coalesce settings for
+ *
+ * If the caller passes in a negative q_num then we return coalesce settings
+ * based on queue number 0, else use the actual q_num passed in.
+ */
+static int
+__ice_get_coalesce(struct net_device *netdev, struct ethtool_coalesce *ec,
+		   int q_num)
+{
+	struct ice_netdev_priv *np = netdev_priv(netdev);
+	struct ice_vsi *vsi = np->vsi;
+
+	if (q_num < 0)
+		q_num = 0;
+
+	if (ice_get_q_coalesce(vsi, ec, q_num))
+		return -EINVAL;
+
+	if (q_num < vsi->num_txq)
+		ec->tx_max_coalesced_frames_irq = vsi->work_lmt;
+
+	if (q_num < vsi->num_rxq)
+		ec->rx_max_coalesced_frames_irq = vsi->work_lmt;
+
+	return 0;
+}
+
+static int
+ice_get_coalesce(struct net_device *netdev, struct ethtool_coalesce *ec)
+{
+	return __ice_get_coalesce(netdev, ec, -1);
+}
+
+static int
+ice_get_per_q_coalesce(struct net_device *netdev, u32 q_num,
+		       struct ethtool_coalesce *ec)
+{
+	return __ice_get_coalesce(netdev, ec, q_num);
+}
+
+/**
+ * ice_set_rc_coalesce - set ITR values for specific ring container
+ * @c_type: container type, Rx or Tx
+ * @ec: ethtool structure from user to update ITR settings
+ * @rc: ring container that the ITR values will come from
+ * @vsi: VSI associated to the ring container
+ *
+ * Set specific ITR values. This is done per ice_ring_container because each
+ * q_vector can have 1 or more rings and all of said ring(s) will have the same
+ * ITR values.
+ *
+ * Returns 0 on success, negative otherwise.
+ */
+static int
+ice_set_rc_coalesce(enum ice_container_type c_type, struct ethtool_coalesce *ec,
+		    struct ice_ring_container *rc, struct ice_vsi *vsi)
+{
+	struct ice_pf *pf = vsi->back;
+	u16 itr_setting;
+
+	if (!rc->ring)
+		return -EINVAL;
+
+	itr_setting = rc->itr_setting & ~ICE_ITR_DYNAMIC;
+
+	switch (c_type) {
+	case ICE_RX_CONTAINER:
+		if (ec->rx_coalesce_usecs_high > ICE_MAX_INTRL ||
+		    (ec->rx_coalesce_usecs_high &&
+		     ec->rx_coalesce_usecs_high < pf->hw.intrl_gran)) {
+			netdev_info(vsi->netdev,
+				    "Invalid value, rx-usecs-high valid values are 0 (disabled), %d-%d\n",
+				    pf->hw.intrl_gran, ICE_MAX_INTRL);
+			return -EINVAL;
+		}
+
+		if (ec->rx_coalesce_usecs_high != rc->ring->q_vector->intrl) {
+			rc->ring->q_vector->intrl = ec->rx_coalesce_usecs_high;
+			wr32(&pf->hw, GLINT_RATE(vsi->hw_base_vector +
+						 rc->ring->q_vector->v_idx),
+			     ice_intrl_usec_to_reg(ec->rx_coalesce_usecs_high,
+						   pf->hw.intrl_gran));
+		}
+
+		if (ec->rx_coalesce_usecs != itr_setting &&
+		    ec->use_adaptive_rx_coalesce) {
+			netdev_info(vsi->netdev,
+				    "Rx interrupt throttling cannot be changed if adaptive-rx is enabled\n");
+			return -EINVAL;
+		}
+
+		if (ec->rx_coalesce_usecs > ICE_ITR_MAX) {
+			netdev_info(vsi->netdev,
+				    "Invalid value, rx-usecs range is 0-%d\n",
+				   ICE_ITR_MAX);
+			return -EINVAL;
+		}
+
+		if (ec->use_adaptive_rx_coalesce) {
+			rc->itr_setting |= ICE_ITR_DYNAMIC;
+		} else {
+			rc->itr_setting = ITR_REG_ALIGN(ec->rx_coalesce_usecs);
+			rc->target_itr = ITR_TO_REG(rc->itr_setting);
+		}
+		break;
+	case ICE_TX_CONTAINER:
+		if (ec->tx_coalesce_usecs_high) {
+			netdev_info(vsi->netdev,
+				    "setting tx-usecs-high is not supported\n");
+			return -EINVAL;
+		}
+
+		if (ec->tx_coalesce_usecs != itr_setting &&
+		    ec->use_adaptive_tx_coalesce) {
+			netdev_info(vsi->netdev,
+				    "Tx interrupt throttling cannot be changed if adaptive-tx is enabled\n");
+			return -EINVAL;
+		}
+
+		if (ec->tx_coalesce_usecs > ICE_ITR_MAX) {
+			netdev_info(vsi->netdev,
+				    "Invalid value, tx-usecs range is 0-%d\n",
+				   ICE_ITR_MAX);
+			return -EINVAL;
+		}
+
+		if (ec->use_adaptive_tx_coalesce) {
+			rc->itr_setting |= ICE_ITR_DYNAMIC;
+		} else {
+			rc->itr_setting = ITR_REG_ALIGN(ec->tx_coalesce_usecs);
+			rc->target_itr = ITR_TO_REG(rc->itr_setting);
+		}
+		break;
+	default:
+		dev_dbg(&pf->pdev->dev, "Invalid container type %d\n", c_type);
+		return -EINVAL;
+	}
+
+	return 0;
+}
+
+/**
+ * ice_set_q_coalesce - set a queue's ITR/INTRL (coalesce) settings
+ * @vsi: VSI associated to the queue that need updating
+ * @ec: coalesce settings to program the device with
+ * @q_num: update ITR/INTRL (coalesce) settings for this queue number/index
+ *
+ * Return 0 on success, and negative under the following conditions:
+ * 1. Setting Tx or Rx ITR/INTRL (coalesce) settings failed.
+ * 2. The q_num passed in is not a valid number/index for Tx and Rx rings.
+ */
+static int
+ice_set_q_coalesce(struct ice_vsi *vsi, struct ethtool_coalesce *ec, int q_num)
+{
+	if (q_num < vsi->num_rxq && q_num < vsi->num_txq) {
+		if (ice_set_rc_coalesce(ICE_RX_CONTAINER, ec,
+					&vsi->rx_rings[q_num]->q_vector->rx,
+					vsi))
+			return -EINVAL;
+
+		if (ice_set_rc_coalesce(ICE_TX_CONTAINER, ec,
+					&vsi->tx_rings[q_num]->q_vector->tx,
+					vsi))
+			return -EINVAL;
+	} else if (q_num < vsi->num_rxq) {
+		if (ice_set_rc_coalesce(ICE_RX_CONTAINER, ec,
+					&vsi->rx_rings[q_num]->q_vector->rx,
+					vsi))
+			return -EINVAL;
+	} else if (q_num < vsi->num_txq) {
+		if (ice_set_rc_coalesce(ICE_TX_CONTAINER, ec,
+					&vsi->tx_rings[q_num]->q_vector->tx,
+					vsi))
+			return -EINVAL;
+	} else {
+		return -EINVAL;
+	}
+
+	return 0;
+}
+
+/**
+ * __ice_set_coalesce - set ITR/INTRL values for the device
+ * @netdev: pointer to the netdev associated with this query
+ * @ec: ethtool structure to fill with driver's coalesce settings
+ * @q_num: queue number to get the coalesce settings for
+ *
+ * If the caller passes in a negative q_num then we set the coalesce settings
+ * for all Tx/Rx queues, else use the actual q_num passed in.
+ */
+static int
+__ice_set_coalesce(struct net_device *netdev, struct ethtool_coalesce *ec,
+		   int q_num)
+{
+	struct ice_netdev_priv *np = netdev_priv(netdev);
+	struct ice_vsi *vsi = np->vsi;
+
+	if (q_num < 0) {
+		int i;
+
+		ice_for_each_q_vector(vsi, i) {
+			if (ice_set_q_coalesce(vsi, ec, i))
+				return -EINVAL;
+		}
+		goto set_work_lmt;
+	}
+
+	if (ice_set_q_coalesce(vsi, ec, q_num))
+		return -EINVAL;
+
+set_work_lmt:
+
+	if (ec->tx_max_coalesced_frames_irq || ec->rx_max_coalesced_frames_irq)
+		vsi->work_lmt = max(ec->tx_max_coalesced_frames_irq,
+				    ec->rx_max_coalesced_frames_irq);
+
+	return 0;
+}
+
+static int
+ice_set_coalesce(struct net_device *netdev, struct ethtool_coalesce *ec)
+{
+	return __ice_set_coalesce(netdev, ec, -1);
+}
+
+static int
+ice_set_per_q_coalesce(struct net_device *netdev, u32 q_num,
+		       struct ethtool_coalesce *ec)
+{
+	return __ice_set_coalesce(netdev, ec, q_num);
+}
+
 static const struct ethtool_ops ice_ethtool_ops = {
 	.get_link_ksettings	= ice_get_link_ksettings,
 	.set_link_ksettings	= ice_set_link_ksettings,
@@ -2184,6 +2536,8 @@ static const struct ethtool_ops ice_ethtool_ops = {
 	.get_link		= ethtool_op_get_link,
 	.get_eeprom_len		= ice_get_eeprom_len,
 	.get_eeprom		= ice_get_eeprom,
+	.get_coalesce		= ice_get_coalesce,
+	.set_coalesce		= ice_set_coalesce,
 	.get_strings		= ice_get_strings,
 	.set_phys_id		= ice_set_phys_id,
 	.get_ethtool_stats      = ice_get_ethtool_stats,
@@ -2200,6 +2554,9 @@ static const struct ethtool_ops ice_ethtool_ops = {
 	.get_rxfh_indir_size	= ice_get_rxfh_indir_size,
 	.get_rxfh		= ice_get_rxfh,
 	.set_rxfh		= ice_set_rxfh,
+	.get_ts_info		= ethtool_op_get_ts_info,
+	.get_per_queue_coalesce = ice_get_per_q_coalesce,
+	.set_per_queue_coalesce = ice_set_per_q_coalesce,
 };
 
 /**

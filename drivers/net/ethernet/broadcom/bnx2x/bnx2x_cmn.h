@@ -52,7 +52,7 @@ extern int bnx2x_num_queues;
 
 #define BNX2X_PCI_ALLOC(y, size)					\
 ({									\
-	void *x = dma_zalloc_coherent(&bp->pdev->dev, size, y, GFP_KERNEL); \
+	void *x = dma_alloc_coherent(&bp->pdev->dev, size, y, GFP_KERNEL); \
 	if (x)								\
 		DP(NETIF_MSG_HW,					\
 		   "BNX2X_PCI_ALLOC: Physical %Lx Virtual %p\n",	\
@@ -527,7 +527,7 @@ static inline void bnx2x_update_rx_prod(struct bnx2x *bp,
 		REG_WR_RELAXED(bp, fp->ustorm_rx_prods_offset + i * 4,
 			       ((u32 *)&rx_prods)[i]);
 
-	mmiowb();
+	mmiowb(); /* keep prod updates ordered */
 
 	DP(NETIF_MSG_RX_STATUS,
 	   "queue[%d]:  wrote  bd_prod %u  cqe_prod %u  sge_prod %u\n",

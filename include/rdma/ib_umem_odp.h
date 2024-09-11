@@ -44,6 +44,8 @@ struct umem_odp_node {
 
 struct ib_umem_odp {
 	struct ib_umem umem;
+	struct ib_ucontext_per_mm *per_mm;
+
 	/*
 	 * An array of the pages included in the on-demand paging umem.
 	 * Indices of pages that are currently not mapped into the device will
@@ -65,14 +67,8 @@ struct ib_umem_odp {
 	struct mutex		umem_mutex;
 	void			*private; /* for the HW driver to use. */
 
-	/* When false, use the notifier counter in the ucontext struct. */
-	bool mn_counters_active;
 	int notifiers_seq;
 	int notifiers_count;
-
-	/* A linked list of umems that don't have private mmu notifier
-	 * counters yet. */
-	struct list_head no_private_counters;
 
 	/* Tree tracking */
 	struct umem_odp_node	interval_tree;
@@ -87,13 +83,6 @@ static inline struct ib_umem_odp *to_ib_umem_odp(struct ib_umem *umem)
 	return container_of(umem, struct ib_umem_odp, umem);
 }
 
-#ifdef CONFIG_INFINIBAND_ON_DEMAND_PAGING
-
-int ib_umem_odp_get(struct ib_umem_odp *umem_odp, int access);
-struct ib_umem_odp *ib_alloc_odp_umem(struct ib_ucontext *context,
-				      unsigned long addr, size_t size);
-void ib_umem_odp_release(struct ib_umem_odp *umem_odp);
-
 /*
  * The lower 2 bits of the DMA address signal the R/W permissions for
  * the entry. To upgrade the permissions, provide the appropriate
@@ -106,6 +95,30 @@ void ib_umem_odp_release(struct ib_umem_odp *umem_odp);
 #define ODP_WRITE_ALLOWED_BIT (1<<1ULL)
 
 #define ODP_DMA_ADDR_MASK (~(ODP_READ_ALLOWED_BIT | ODP_WRITE_ALLOWED_BIT))
+
+#ifdef CONFIG_INFINIBAND_ON_DEMAND_PAGING
+
+struct ib_ucontext_per_mm {
+	struct ib_ucontext *context;
+	struct mm_struct *mm;
+	struct pid *tgid;
+	bool active;
+
+	struct rb_root_cached umem_tree;
+	/* Protects umem_tree */
+	struct rw_semaphore umem_rwsem;
+
+	struct mmu_notifier mn;
+	unsigned int odp_mrs_count;
+
+	struct list_head ucontext_list;
+	struct rcu_head rcu;
+};
+
+int ib_umem_odp_get(struct ib_umem_odp *umem_odp, int access);
+struct ib_umem_odp *ib_alloc_odp_umem(struct ib_umem_odp *root_umem,
+				      unsigned long addr, size_t size);
+void ib_umem_odp_release(struct ib_umem_odp *umem_odp);
 
 int ib_umem_odp_map_dma_pages(struct ib_umem_odp *umem_odp, u64 start_offset,
 			      u64 bcnt, u64 access_mask,
@@ -140,12 +153,6 @@ static inline int ib_umem_mmu_notifier_retry(struct ib_umem_odp *umem_odp,
 	 * the relevant locks taken (umem_odp->umem_mutex
 	 * and the ucontext umem_mutex semaphore locked for read).
 	 */
-
-	/* Do not allow page faults while the new ib_umem hasn't seen a state
-	 * with zero notifiers yet, and doesn't have its own valid set of
-	 * private counters. */
-	if (!umem_odp->mn_counters_active)
-		return 1;
 
 	if (unlikely(umem_odp->notifiers_count))
 		return 1;

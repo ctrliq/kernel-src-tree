@@ -280,7 +280,6 @@ rpcrdma_cm_event_handler(struct rdma_cm_id *id, struct rdma_cm_event *event)
 			ep->rep_connected = -EAGAIN;
 		goto disconnected;
 	case RDMA_CM_EVENT_DISCONNECTED:
-		++xprt->connect_cookie;
 		ep->rep_connected = -ECONNABORTED;
 disconnected:
 		xprt_force_disconnect(xprt);
@@ -1520,7 +1519,8 @@ rpcrdma_post_recvs(struct rpcrdma_xprt *r_xprt, bool temp)
 	if (!count)
 		goto out;
 
-	rc = ib_post_recv(r_xprt->rx_ia.ri_id->qp, wr, &bad_wr);
+	rc = ib_post_recv(r_xprt->rx_ia.ri_id->qp, wr,
+			  (const struct ib_recv_wr **)&bad_wr);
 	if (rc) {
 		for (wr = bad_wr; wr; wr = wr->next) {
 			struct rpcrdma_rep *rep;

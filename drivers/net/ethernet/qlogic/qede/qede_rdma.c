@@ -89,7 +89,7 @@ static void qede_rdma_destroy_wq(struct qede_dev *edev)
 	destroy_workqueue(edev->rdma_info.rdma_wq);
 }
 
-int qede_rdma_dev_add(struct qede_dev *edev, enum qede_rdma_probe_mode mode)
+int qede_rdma_dev_add(struct qede_dev *edev, bool recovery)
 {
 	int rc;
 
@@ -97,7 +97,7 @@ int qede_rdma_dev_add(struct qede_dev *edev, enum qede_rdma_probe_mode mode)
 		return 0;
 
 	/* Cannot start qedr while recovering since it wasn't fully stopped */
-	if (mode == QEDE_RDMA_PROBE_RECOVERY)
+	if (recovery)
 		return 0;
 
 	rc = qede_rdma_create_wq(edev);
@@ -119,14 +119,13 @@ static void _qede_rdma_dev_remove(struct qede_dev *edev)
 		qedr_drv->remove(edev->rdma_info.qedr_dev);
 }
 
-void qede_rdma_dev_remove(struct qede_dev *edev,
-			  enum qede_rdma_remove_mode mode)
+void qede_rdma_dev_remove(struct qede_dev *edev, bool recovery)
 {
 	if (!qede_rdma_supported(edev))
 		return;
 
 	/* Cannot remove qedr while recovering since it wasn't fully stopped */
-	if (mode == QEDE_RDMA_REMOVE_NORMAL) {
+	if (!recovery) {
 		qede_rdma_destroy_wq(edev);
 		mutex_lock(&qedr_dev_list_lock);
 		if (!edev->rdma_info.exp_recovery)

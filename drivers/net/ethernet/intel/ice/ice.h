@@ -83,6 +83,8 @@ extern const char ice_drv_ver[];
 #define ICE_MAX_QS_PER_VF		256
 #define ICE_MIN_QS_PER_VF		1
 #define ICE_DFLT_QS_PER_VF		4
+#define ICE_NONQ_VECS_VF		1
+#define ICE_MAX_SCATTER_QS_PER_VF	16
 #define ICE_MAX_BASE_QS_PER_VF		16
 #define ICE_MAX_INTR_PER_VF		65
 #define ICE_MIN_INTR_PER_VF		(ICE_MIN_QS_PER_VF + 1)
@@ -123,6 +125,26 @@ extern const char ice_drv_ver[];
 #define ice_for_each_alloc_rxq(vsi, i) \
 	for ((i) = 0; (i) < (vsi)->alloc_rxq; (i)++)
 
+#define ice_for_each_q_vector(vsi, i) \
+	for ((i) = 0; (i) < (vsi)->num_q_vectors; (i)++)
+
+#define ICE_UCAST_PROMISC_BITS (ICE_PROMISC_UCAST_TX | ICE_PROMISC_MCAST_TX | \
+				ICE_PROMISC_UCAST_RX | ICE_PROMISC_MCAST_RX)
+
+#define ICE_UCAST_VLAN_PROMISC_BITS (ICE_PROMISC_UCAST_TX | \
+				     ICE_PROMISC_MCAST_TX | \
+				     ICE_PROMISC_UCAST_RX | \
+				     ICE_PROMISC_MCAST_RX | \
+				     ICE_PROMISC_VLAN_TX  | \
+				     ICE_PROMISC_VLAN_RX)
+
+#define ICE_MCAST_PROMISC_BITS (ICE_PROMISC_MCAST_TX | ICE_PROMISC_MCAST_RX)
+
+#define ICE_MCAST_VLAN_PROMISC_BITS (ICE_PROMISC_MCAST_TX | \
+				     ICE_PROMISC_MCAST_RX | \
+				     ICE_PROMISC_VLAN_TX  | \
+				     ICE_PROMISC_VLAN_RX)
+
 struct ice_tc_info {
 	u16 qoffset;
 	u16 qcount_tx;
@@ -132,7 +154,7 @@ struct ice_tc_info {
 
 struct ice_tc_cfg {
 	u8 numtc; /* Total number of enabled TCs */
-	u8 ena_tc; /* TX map */
+	u8 ena_tc; /* Tx map */
 	struct ice_tc_info tc_info[ICE_MAX_TRAFFIC_CLASS];
 };
 
@@ -258,6 +280,7 @@ struct ice_vsi {
 	u8 irqs_ready;
 	u8 current_isup;		 /* Sync 'link up' logging */
 	u8 stat_offsets_loaded;
+	u8 vlan_ena;
 
 	/* queue information */
 	u8 tx_mapping_mode;		 /* ICE_MAP_MODE_[CONTIG|SCATTER] */
@@ -276,19 +299,26 @@ struct ice_vsi {
 /* struct that defines an interrupt vector */
 struct ice_q_vector {
 	struct ice_vsi *vsi;
-	cpumask_t affinity_mask;
-	struct napi_struct napi;
-	struct ice_ring_container rx;
-	struct ice_ring_container tx;
-	struct irq_affinity_notify affinity_notify;
+
 	u16 v_idx;			/* index in the vsi->q_vector array. */
-	u8 num_ring_tx;			/* total number of Tx rings in vector */
+	u16 reg_idx;
 	u8 num_ring_rx;			/* total number of Rx rings in vector */
-	char name[ICE_INT_NAME_STR_LEN];
+	u8 num_ring_tx;			/* total number of Tx rings in vector */
+	u8 itr_countdown;		/* when 0 should adjust adaptive ITR */
 	/* in usecs, need to use ice_intrl_to_usecs_reg() before writing this
 	 * value to the device
 	 */
 	u8 intrl;
+
+	struct napi_struct napi;
+
+	struct ice_ring_container rx;
+	struct ice_ring_container tx;
+
+	cpumask_t affinity_mask;
+	struct irq_affinity_notify affinity_notify;
+
+	char name[ICE_INT_NAME_STR_LEN];
 } ____cacheline_internodealigned_in_smp;
 
 enum ice_pf_flags {
@@ -340,8 +370,8 @@ struct ice_pf {
 	u32 hw_oicr_idx;	/* Other interrupt cause vector HW index */
 	u32 num_avail_hw_msix;	/* remaining HW MSIX vectors left unclaimed */
 	u32 num_lan_msix;	/* Total MSIX vectors for base driver */
-	u16 num_lan_tx;		/* num lan Tx queues setup */
-	u16 num_lan_rx;		/* num lan Rx queues setup */
+	u16 num_lan_tx;		/* num LAN Tx queues setup */
+	u16 num_lan_rx;		/* num LAN Rx queues setup */
 	u16 q_left_tx;		/* remaining num Tx queues left unclaimed */
 	u16 q_left_rx;		/* remaining num Rx queues left unclaimed */
 	u16 next_vsi;		/* Next free slot in pf->vsi[] - 0-based! */
@@ -355,6 +385,9 @@ struct ice_pf {
 	struct ice_hw_port_stats stats_prev;
 	struct ice_hw hw;
 	u8 stat_prev_loaded;	/* has previous stats been loaded */
+#ifdef CONFIG_DCB
+	u16 dcbx_cap;
+#endif /* CONFIG_DCB */
 	u32 tx_timeout_count;
 	unsigned long tx_timeout_last_recovery;
 	u32 tx_timeout_recovery_level;
@@ -367,14 +400,15 @@ struct ice_netdev_priv {
 
 /**
  * ice_irq_dynamic_ena - Enable default interrupt generation settings
- * @hw: pointer to hw struct
- * @vsi: pointer to vsi struct, can be NULL
+ * @hw: pointer to HW struct
+ * @vsi: pointer to VSI struct, can be NULL
  * @q_vector: pointer to q_vector, can be NULL
  */
-static inline void ice_irq_dynamic_ena(struct ice_hw *hw, struct ice_vsi *vsi,
-				       struct ice_q_vector *q_vector)
+static inline void
+ice_irq_dynamic_ena(struct ice_hw *hw, struct ice_vsi *vsi,
+		    struct ice_q_vector *q_vector)
 {
-	u32 vector = (vsi && q_vector) ? vsi->hw_base_vector + q_vector->v_idx :
+	u32 vector = (vsi && q_vector) ? q_vector->reg_idx :
 				((struct ice_pf *)hw->back)->hw_oicr_idx;
 	int itr = ICE_ITR_NONE;
 	u32 val;
@@ -390,10 +424,24 @@ static inline void ice_irq_dynamic_ena(struct ice_hw *hw, struct ice_vsi *vsi,
 	wr32(hw, GLINT_DYN_CTL(vector), val);
 }
 
-static inline void ice_vsi_set_tc_cfg(struct ice_vsi *vsi)
+/**
+ * ice_find_vsi_by_type - Find and return VSI of a given type
+ * @pf: PF to search for VSI
+ * @type: Value indicating type of VSI we are looking for
+ */
+static inline struct ice_vsi *
+ice_find_vsi_by_type(struct ice_pf *pf, enum ice_vsi_type type)
 {
-	vsi->tc_cfg.ena_tc =  ICE_DFLT_TRAFFIC_CLASS;
-	vsi->tc_cfg.numtc = 1;
+	int i;
+
+	for (i = 0; i < pf->num_alloc_vsi; i++) {
+		struct ice_vsi *vsi = pf->vsi[i];
+
+		if (vsi && vsi->type == type)
+			return vsi;
+	}
+
+	return NULL;
 }
 
 void ice_set_ethtool_ops(struct net_device *netdev);
@@ -404,5 +452,9 @@ int ice_get_rss(struct ice_vsi *vsi, u8 *seed, u8 *lut, u16 lut_size);
 void ice_fill_rss_lut(u8 *lut, u16 rss_table_size, u16 rss_size);
 void ice_print_link_msg(struct ice_vsi *vsi, bool isup);
 void ice_napi_del(struct ice_vsi *vsi);
+#ifdef CONFIG_DCB
+int ice_pf_ena_all_vsi(struct ice_pf *pf, bool locked);
+void ice_pf_dis_all_vsi(struct ice_pf *pf, bool locked);
+#endif /* CONFIG_DCB */
 
 #endif /* _ICE_H_ */

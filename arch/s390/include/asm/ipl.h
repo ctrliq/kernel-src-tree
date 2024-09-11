@@ -36,6 +36,8 @@ struct ipl_parameter_block {
 
 #define IPL_MAX_SUPPORTED_VERSION (0)
 
+#define IPL_RB_CERT_UNKNOWN ((unsigned short)-1)
+
 #define DIAG308_VMPARM_SIZE (64)
 #define DIAG308_SCPDATA_OFFSET offsetof(struct ipl_parameter_block, \
 					fcp.scp_data)
@@ -107,6 +109,7 @@ int ipl_report_add_component(struct ipl_report *report, struct kexec_buf *kbuf,
 			     unsigned char flags, unsigned short cert);
 int ipl_report_add_certificate(struct ipl_report *report, void *key,
 			       unsigned long addr, unsigned long len);
+bool ipl_get_secureboot(void);
 
 /*
  * DIAG 308 support

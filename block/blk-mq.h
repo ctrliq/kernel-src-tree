@@ -23,7 +23,9 @@ struct blk_mq_ctx {
 
 	unsigned int		cpu;
 	unsigned short		index_hw[HCTX_MAX_TYPES];
+#ifndef __GENKSYMS__
 	struct blk_mq_hw_ctx 	*hctxs[HCTX_MAX_TYPES];
+#endif
 
 	/* incremented at dispatch time */
 	unsigned long		rq_dispatched[2];
@@ -38,7 +40,7 @@ struct blk_mq_ctx {
 } ____cacheline_aligned_in_smp;
 
 void blk_mq_freeze_queue(struct request_queue *q);
-void blk_mq_free_queue(struct request_queue *q);
+void blk_mq_exit_queue(struct request_queue *q);
 int blk_mq_update_nr_requests(struct request_queue *q, unsigned int nr);
 void blk_mq_wake_waiters(struct request_queue *q);
 bool blk_mq_dispatch_rq_list(struct request_queue *, struct list_head *, bool);

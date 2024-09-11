@@ -229,7 +229,7 @@ static void nvme_tcp_init_iter(struct nvme_tcp_request *req,
 		offset = bio->bi_iter.bi_bvec_done;
 	}
 
-	iov_iter_bvec(&req->iter, dir, vec, nsegs, size);
+	iov_iter_bvec(&req->iter, ITER_BVEC | dir, vec, nsegs, size);
 	req->iter.iov_offset = offset;
 }
 
@@ -2276,6 +2276,8 @@ static int __init nvme_tcp_init_module(void)
 		return -ENOMEM;
 
 	nvmf_register_transport(&nvme_tcp_transport);
+
+	mark_tech_preview("NVMe/TCP", THIS_MODULE);
 	return 0;
 }
 

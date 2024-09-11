@@ -675,6 +675,7 @@ struct rtl8169_private {
 		struct work_struct work;
 	} wk;
 
+	unsigned irq_enabled:1;
 	unsigned supports_gmii:1;
 	dma_addr_t counters_phys_addr;
 	struct rtl8169_counters *counters;
@@ -1287,13 +1288,12 @@ static u8 rtl8168d_efuse_read(struct rtl8169_private *tp, int reg_addr)
 static void rtl_ack_events(struct rtl8169_private *tp, u16 bits)
 {
 	RTL_W16(tp, IntrStatus, bits);
-	mmiowb();
 }
 
 static void rtl_irq_disable(struct rtl8169_private *tp)
 {
 	RTL_W16(tp, IntrMask, 0);
-	mmiowb();
+	tp->irq_enabled = 0;
 }
 
 #define RTL_EVENT_NAPI_RX	(RxOK | RxErr)
@@ -1302,6 +1302,7 @@ static void rtl_irq_disable(struct rtl8169_private *tp)
 
 static void rtl_irq_enable(struct rtl8169_private *tp)
 {
+	tp->irq_enabled = 1;
 	RTL_W16(tp, IntrMask, tp->irq_mask);
 }
 
@@ -6089,8 +6090,6 @@ static netdev_tx_t rtl8169_start_xmit(struct sk_buff *skb,
 
 	RTL_W8(tp, TxPoll, NPQ);
 
-	mmiowb();
-
 	if (!rtl_tx_slots_avail(tp, MAX_SKB_FRAGS)) {
 		/* Avoid wrongly optimistic queue wake-up: rtl_tx thread must
 		 * not miss a ring update when it notices a stopped queue.
@@ -6362,9 +6361,8 @@ static irqreturn_t rtl8169_interrupt(int irq, void *dev_instance)
 {
 	struct rtl8169_private *tp = dev_instance;
 	u16 status = RTL_R16(tp, IntrStatus);
-	u16 irq_mask = RTL_R16(tp, IntrMask);
 
-	if (status == 0xffff || !(status & irq_mask))
+	if (!tp->irq_enabled || status == 0xffff || !(status & tp->irq_mask))
 		return IRQ_NONE;
 
 	if (unlikely(status & SYSErr)) {
@@ -6433,9 +6431,7 @@ static int rtl8169_poll(struct napi_struct *napi, int budget)
 
 	if (work_done < budget) {
 		napi_complete_done(napi, work_done);
-
 		rtl_irq_enable(tp);
-		mmiowb();
 	}
 
 	return work_done;
@@ -6485,7 +6481,7 @@ static int r8169_phy_connect(struct rtl8169_private *tp)
 		phy_set_max_speed(phydev, SPEED_100);
 
 	/* Ensure to advertise everything, incl. pause */
-	phydev->advertising = phydev->supported;
+	linkmode_copy(phydev->advertising, phydev->supported);
 
 	phy_attached_info(phydev);
 

@@ -62,6 +62,8 @@ struct bpf_reg_state {
 	 * offset, so they can share range knowledge.
 	 * For PTR_TO_MAP_VALUE_OR_NULL this is used to share which map value we
 	 * came from, when one is tested for != NULL.
+	 * For PTR_TO_SOCKET this is used to share which pointers retain the
+	 * same reference to the socket, to determine proper reference freeing.
 	 */
 	u32 id;
 	/* For scalar types (SCALAR_VALUE), this represents our knowledge of
@@ -106,6 +108,17 @@ struct bpf_stack_state {
 	u8 slot_type[BPF_REG_SIZE];
 };
 
+struct bpf_reference_state {
+	/* Track each reference created with a unique id, even if the same
+	 * instruction creates the reference multiple times (eg, via CALL).
+	 */
+	int id;
+	/* Instruction where the allocation of this reference occurred. This
+	 * is used purely to inform the user of a reference leak.
+	 */
+	int insn_idx;
+};
+
 /* state of the program:
  * type of all registers and stack info
  */
@@ -123,7 +136,9 @@ struct bpf_func_state {
 	 */
 	u32 subprogno;
 
-	/* should be second to last. See copy_func_state() */
+	/* The following fields should be last. See copy_func_state() */
+	int acquired_refs;
+	struct bpf_reference_state *refs;
 	int allocated_stack;
 	struct bpf_stack_state *stack;
 };
@@ -200,6 +215,7 @@ static inline bool bpf_verifier_log_needed(const struct bpf_verifier_log *log)
 
 struct bpf_subprog_info {
 	u32 start; /* insn idx of function entry point */
+	u32 linfo_idx; /* The idx to the main_prog->aux->linfo */
 	u16 stack_depth; /* max. stack depth used by this function */
 };
 
@@ -222,6 +238,7 @@ struct bpf_verifier_env {
 	bool allow_ptr_leaks;
 	bool seen_direct_write;
 	struct bpf_insn_aux_data *insn_aux_data; /* array of per-insn state */
+	const struct bpf_line_info *prev_linfo;
 	struct bpf_verifier_log log;
 	struct bpf_subprog_info subprog_info[BPF_MAX_SUBPROGS + 1];
 	u32 subprog_cnt;
@@ -232,11 +249,16 @@ __printf(2, 0) void bpf_verifier_vlog(struct bpf_verifier_log *log,
 __printf(2, 3) void bpf_verifier_log_write(struct bpf_verifier_env *env,
 					   const char *fmt, ...);
 
-static inline struct bpf_reg_state *cur_regs(struct bpf_verifier_env *env)
+static inline struct bpf_func_state *cur_func(struct bpf_verifier_env *env)
 {
 	struct bpf_verifier_state *cur = env->cur_state;
 
-	return cur->frame[cur->curframe]->regs;
+	return cur->frame[cur->curframe];
+}
+
+static inline struct bpf_reg_state *cur_regs(struct bpf_verifier_env *env)
+{
+	return cur_func(env)->regs;
 }
 
 int bpf_prog_offload_verifier_prep(struct bpf_prog *prog);

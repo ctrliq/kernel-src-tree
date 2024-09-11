@@ -571,6 +571,7 @@ static struct xfrm_state *xfrm_state_construct(struct net *net,
 					       int *errp)
 {
 	struct xfrm_state *x = xfrm_state_alloc(net);
+	struct xfrm_mark smark;
 	int err = -ENOMEM;
 
 	if (!x)
@@ -617,7 +618,9 @@ static struct xfrm_state *xfrm_state_construct(struct net *net,
 
 	xfrm_mark_get(attrs, &x->mark);
 
-	xfrm_smark_init(attrs, &x->props.smark);
+	xfrm_smark_init(attrs, &smark);
+	x->props.output_mark = smark.v;
+	x->output_mark_mask = smark.m;
 
 	if (attrs[XFRMA_IF_ID])
 		x->if_id = nla_get_u32(attrs[XFRMA_IF_ID]);
@@ -881,6 +884,7 @@ static int copy_to_user_state_extra(struct xfrm_state *x,
 				    struct xfrm_usersa_info *p,
 				    struct sk_buff *skb)
 {
+	struct xfrm_mark smark;
 	int ret = 0;
 
 	copy_to_user_state(x, p);
@@ -940,7 +944,9 @@ static int copy_to_user_state_extra(struct xfrm_state *x,
 	if (ret)
 		goto out;
 
-	ret = xfrm_smark_put(skb, &x->props.smark);
+	smark.v = x->props.output_mark;
+	smark.m = x->output_mark_mask;
+	ret = xfrm_smark_put(skb, &smark);
 	if (ret)
 		goto out;
 
@@ -1026,7 +1032,7 @@ static int xfrm_dump_sa(struct sk_buff *skb, struct netlink_callback *cb)
 		int err;
 
 		err = nlmsg_parse(cb->nlh, 0, attrs, XFRMA_MAX, xfrma_policy,
-				  NULL);
+				  cb->extack);
 		if (err < 0)
 			return err;
 
@@ -2810,9 +2816,9 @@ static inline unsigned int xfrm_sa_len(struct xfrm_state *x)
 		l += nla_total_size(sizeof(x->props.extra_flags));
 	if (x->xso.dev)
 		 l += nla_total_size(sizeof(x->xso));
-	if (x->props.smark.v | x->props.smark.m) {
-		l += nla_total_size(sizeof(x->props.smark.v));
-		l += nla_total_size(sizeof(x->props.smark.m));
+	if (x->props.output_mark | x->output_mark_mask) {
+		l += nla_total_size(sizeof(x->props.output_mark));
+		l += nla_total_size(sizeof(x->output_mark_mask));
 	}
 	if (x->if_id)
 		l += nla_total_size(sizeof(x->if_id));

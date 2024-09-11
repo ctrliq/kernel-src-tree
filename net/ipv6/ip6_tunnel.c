@@ -1185,7 +1185,14 @@ route_lookup:
 	}
 	skb_dst_set(skb, dst);
 
-	hop_limit = hop_limit ? : ip6_dst_hoplimit(dst);
+	if (hop_limit == 0) {
+		if (skb->protocol == htons(ETH_P_IP))
+			hop_limit = ip_hdr(skb)->ttl;
+		else if (skb->protocol == htons(ETH_P_IPV6))
+			hop_limit = ipv6_hdr(skb)->hop_limit;
+		else
+			hop_limit = ip6_dst_hoplimit(dst);
+	}
 
 	/* Calculate max headroom for all the headers and adjust
 	 * needed_headroom if necessary.

@@ -467,7 +467,7 @@ qla2x00_start_iocbs(struct scsi_qla_host *vha, struct req_que *req)
 			req->ring_ptr++;
 
 		/* Set chip new ring index. */
-		if (ha->mqenable || IS_QLA27XX(ha)) {
+		if (ha->mqenable || IS_QLA27XX(ha) || IS_QLA28XX(ha)) {
 			WRT_REG_DWORD(req->req_q_in, req->ring_index);
 		} else if (IS_QLA83XX(ha)) {
 			WRT_REG_DWORD(req->req_q_in, req->ring_index);
@@ -1094,88 +1094,300 @@ qla24xx_walk_and_build_sglist(struct qla_hw_data *ha, srb_t *sp, uint32_t *dsd,
 
 int
 qla24xx_walk_and_build_prot_sglist(struct qla_hw_data *ha, srb_t *sp,
-	uint32_t *dsd, uint16_t tot_dsds, struct qla_tc_param *tc)
+    uint32_t *cur_dsd, uint16_t tot_dsds, struct qla_tgt_cmd *tc)
 {
-	void *next_dsd;
-	uint8_t avail_dsds = 0;
-	uint32_t dsd_list_len;
-	struct dsd_dma *dsd_ptr;
+	struct dsd_dma *dsd_ptr = NULL, *dif_dsd, *nxt_dsd;
 	struct scatterlist *sg, *sgl;
-	int	i;
-	struct scsi_cmnd *cmd;
-	uint32_t *cur_dsd = dsd;
-	uint16_t used_dsds = tot_dsds;
+	struct crc_context *difctx = NULL;
 	struct scsi_qla_host *vha;
+	uint dsd_list_len;
+	uint avail_dsds = 0;
+	uint used_dsds = tot_dsds;
+	bool dif_local_dma_alloc = false;
+	bool direction_to_device = false;
+	int i;
 
 	if (sp) {
-		cmd = GET_CMD_SP(sp);
+		struct scsi_cmnd *cmd = GET_CMD_SP(sp);
 		sgl = scsi_prot_sglist(cmd);
 		vha = sp->vha;
+		difctx = sp->u.scmd.ctx;
+		direction_to_device = cmd->sc_data_direction == DMA_TO_DEVICE;
+		ql_dbg(ql_dbg_tgt + ql_dbg_verbose, vha, 0xe021,
+		  "%s: scsi_cmnd: %p, crc_ctx: %p, sp: %p\n",
+			__func__, cmd, difctx, sp);
 	} else if (tc) {
 		vha = tc->vha;
 		sgl = tc->prot_sg;
+		difctx = tc->ctx;
+		direction_to_device = tc->dma_data_direction == DMA_TO_DEVICE;
 	} else {
 		BUG();
 		return 1;
 	}
 
-	ql_dbg(ql_dbg_tgt, vha, 0xe021,
-		"%s: enter\n", __func__);
+	ql_dbg(ql_dbg_tgt + ql_dbg_verbose, vha, 0xe021,
+	    "%s: enter (write=%u)\n", __func__, direction_to_device);
 
-	for_each_sg(sgl, sg, tot_dsds, i) {
-		dma_addr_t	sle_dma;
+	/* if initiator doing write or target doing read */
+	if (direction_to_device) {
+		for_each_sg(sgl, sg, tot_dsds, i) {
+			u64 sle_phys = sg_phys(sg);
 
-		/* Allocate additional continuation packets? */
-		if (avail_dsds == 0) {
-			avail_dsds = (used_dsds > QLA_DSDS_PER_IOCB) ?
-						QLA_DSDS_PER_IOCB : used_dsds;
-			dsd_list_len = (avail_dsds + 1) * 12;
-			used_dsds -= avail_dsds;
+			/* If SGE addr + len flips bits in upper 32-bits */
+			if (MSD(sle_phys + sg->length) ^ MSD(sle_phys)) {
+				ql_dbg(ql_dbg_tgt + ql_dbg_verbose, vha, 0xe022,
+				    "%s: page boundary crossing (phys=%llx len=%x)\n",
+				    __func__, sle_phys, sg->length);
 
-			/* allocate tracking DS */
-			dsd_ptr = kzalloc(sizeof(struct dsd_dma), GFP_ATOMIC);
-			if (!dsd_ptr)
-				return 1;
-
-			/* allocate new list */
-			dsd_ptr->dsd_addr = next_dsd =
-			    dma_pool_alloc(ha->dl_dma_pool, GFP_ATOMIC,
-				&dsd_ptr->dsd_list_dma);
-
-			if (!next_dsd) {
-				/*
-				 * Need to cleanup only this dsd_ptr, rest
-				 * will be done by sp_free_dma()
-				 */
-				kfree(dsd_ptr);
-				return 1;
+				if (difctx) {
+					ha->dif_bundle_crossed_pages++;
+					dif_local_dma_alloc = true;
+				} else {
+					ql_dbg(ql_dbg_tgt + ql_dbg_verbose,
+					    vha, 0xe022,
+					    "%s: difctx pointer is NULL\n",
+					    __func__);
+				}
+				break;
 			}
-
-			if (sp) {
-				list_add_tail(&dsd_ptr->list,
-				    &((struct crc_context *)
-					    sp->u.scmd.ctx)->dsd_list);
-
-				sp->flags |= SRB_CRC_CTX_DSD_VALID;
-			} else {
-				list_add_tail(&dsd_ptr->list,
-				    &(tc->ctx->dsd_list));
-				*tc->ctx_dsd_alloced = 1;
-			}
-
-			/* add new list to cmd iocb or last list */
-			*cur_dsd++ = cpu_to_le32(LSD(dsd_ptr->dsd_list_dma));
-			*cur_dsd++ = cpu_to_le32(MSD(dsd_ptr->dsd_list_dma));
-			*cur_dsd++ = dsd_list_len;
-			cur_dsd = (uint32_t *)next_dsd;
 		}
-		sle_dma = sg_dma_address(sg);
+		ha->dif_bundle_writes++;
+	} else {
+		ha->dif_bundle_reads++;
+	}
 
-		*cur_dsd++ = cpu_to_le32(LSD(sle_dma));
-		*cur_dsd++ = cpu_to_le32(MSD(sle_dma));
-		*cur_dsd++ = cpu_to_le32(sg_dma_len(sg));
+	if (ql2xdifbundlinginternalbuffers)
+		dif_local_dma_alloc = direction_to_device;
 
-		avail_dsds--;
+	if (dif_local_dma_alloc) {
+		u32 track_difbundl_buf = 0;
+		u32 ldma_sg_len = 0;
+		u8 ldma_needed = 1;
+
+		difctx->no_dif_bundl = 0;
+		difctx->dif_bundl_len = 0;
+
+		/* Track DSD buffers */
+		INIT_LIST_HEAD(&difctx->ldif_dsd_list);
+		/* Track local DMA buffers */
+		INIT_LIST_HEAD(&difctx->ldif_dma_hndl_list);
+
+		for_each_sg(sgl, sg, tot_dsds, i) {
+			u32 sglen = sg_dma_len(sg);
+
+			ql_dbg(ql_dbg_tgt + ql_dbg_verbose, vha, 0xe023,
+			    "%s: sg[%x] (phys=%llx sglen=%x) ldma_sg_len: %x dif_bundl_len: %x ldma_needed: %x\n",
+			    __func__, i, (u64)sg_phys(sg), sglen, ldma_sg_len,
+			    difctx->dif_bundl_len, ldma_needed);
+
+			while (sglen) {
+				u32 xfrlen = 0;
+
+				if (ldma_needed) {
+					/*
+					 * Allocate list item to store
+					 * the DMA buffers
+					 */
+					dsd_ptr = kzalloc(sizeof(*dsd_ptr),
+					    GFP_ATOMIC);
+					if (!dsd_ptr) {
+						ql_dbg(ql_dbg_tgt, vha, 0xe024,
+						    "%s: failed alloc dsd_ptr\n",
+						    __func__);
+						return 1;
+					}
+					ha->dif_bundle_kallocs++;
+
+					/* allocate dma buffer */
+					dsd_ptr->dsd_addr = dma_pool_alloc
+						(ha->dif_bundl_pool, GFP_ATOMIC,
+						 &dsd_ptr->dsd_list_dma);
+					if (!dsd_ptr->dsd_addr) {
+						ql_dbg(ql_dbg_tgt, vha, 0xe024,
+						    "%s: failed alloc ->dsd_ptr\n",
+						    __func__);
+						/*
+						 * need to cleanup only this
+						 * dsd_ptr rest will be done
+						 * by sp_free_dma()
+						 */
+						kfree(dsd_ptr);
+						ha->dif_bundle_kallocs--;
+						return 1;
+					}
+					ha->dif_bundle_dma_allocs++;
+					ldma_needed = 0;
+					difctx->no_dif_bundl++;
+					list_add_tail(&dsd_ptr->list,
+					    &difctx->ldif_dma_hndl_list);
+				}
+
+				/* xfrlen is min of dma pool size and sglen */
+				xfrlen = (sglen >
+				   (DIF_BUNDLING_DMA_POOL_SIZE - ldma_sg_len)) ?
+				    DIF_BUNDLING_DMA_POOL_SIZE - ldma_sg_len :
+				    sglen;
+
+				/* replace with local allocated dma buffer */
+				sg_pcopy_to_buffer(sgl, sg_nents(sgl),
+				    dsd_ptr->dsd_addr + ldma_sg_len, xfrlen,
+				    difctx->dif_bundl_len);
+				difctx->dif_bundl_len += xfrlen;
+				sglen -= xfrlen;
+				ldma_sg_len += xfrlen;
+				if (ldma_sg_len == DIF_BUNDLING_DMA_POOL_SIZE ||
+				    sg_is_last(sg)) {
+					ldma_needed = 1;
+					ldma_sg_len = 0;
+				}
+			}
+		}
+
+		track_difbundl_buf = used_dsds = difctx->no_dif_bundl;
+		ql_dbg(ql_dbg_tgt + ql_dbg_verbose, vha, 0xe025,
+		    "dif_bundl_len=%x, no_dif_bundl=%x track_difbundl_buf: %x\n",
+		    difctx->dif_bundl_len, difctx->no_dif_bundl,
+		    track_difbundl_buf);
+
+		if (sp)
+			sp->flags |= SRB_DIF_BUNDL_DMA_VALID;
+		else
+			tc->prot_flags = DIF_BUNDL_DMA_VALID;
+
+		list_for_each_entry_safe(dif_dsd, nxt_dsd,
+		    &difctx->ldif_dma_hndl_list, list) {
+			u32 sglen = (difctx->dif_bundl_len >
+			    DIF_BUNDLING_DMA_POOL_SIZE) ?
+			    DIF_BUNDLING_DMA_POOL_SIZE : difctx->dif_bundl_len;
+
+			BUG_ON(track_difbundl_buf == 0);
+
+			/* Allocate additional continuation packets? */
+			if (avail_dsds == 0) {
+				ql_dbg(ql_dbg_tgt + ql_dbg_verbose, vha,
+				    0xe024,
+				    "%s: adding continuation iocb's\n",
+				    __func__);
+				avail_dsds = (used_dsds > QLA_DSDS_PER_IOCB) ?
+				    QLA_DSDS_PER_IOCB : used_dsds;
+				dsd_list_len = (avail_dsds + 1) * 12;
+				used_dsds -= avail_dsds;
+
+				/* allocate tracking DS */
+				dsd_ptr = kzalloc(sizeof(*dsd_ptr), GFP_ATOMIC);
+				if (!dsd_ptr) {
+					ql_dbg(ql_dbg_tgt, vha, 0xe026,
+					    "%s: failed alloc dsd_ptr\n",
+					    __func__);
+					return 1;
+				}
+				ha->dif_bundle_kallocs++;
+
+				difctx->no_ldif_dsd++;
+				/* allocate new list */
+				dsd_ptr->dsd_addr =
+				    dma_pool_alloc(ha->dl_dma_pool, GFP_ATOMIC,
+					&dsd_ptr->dsd_list_dma);
+				if (!dsd_ptr->dsd_addr) {
+					ql_dbg(ql_dbg_tgt, vha, 0xe026,
+					    "%s: failed alloc ->dsd_addr\n",
+					    __func__);
+					/*
+					 * need to cleanup only this dsd_ptr
+					 *  rest will be done by sp_free_dma()
+					 */
+					kfree(dsd_ptr);
+					ha->dif_bundle_kallocs--;
+					return 1;
+				}
+				ha->dif_bundle_dma_allocs++;
+
+				if (sp) {
+					list_add_tail(&dsd_ptr->list,
+					    &difctx->ldif_dsd_list);
+					sp->flags |= SRB_CRC_CTX_DSD_VALID;
+				} else {
+					list_add_tail(&dsd_ptr->list,
+					    &difctx->ldif_dsd_list);
+					tc->ctx_dsd_alloced = 1;
+				}
+
+				/* add new list to cmd iocb or last list */
+				*cur_dsd++ =
+				    cpu_to_le32(LSD(dsd_ptr->dsd_list_dma));
+				*cur_dsd++ =
+				    cpu_to_le32(MSD(dsd_ptr->dsd_list_dma));
+				*cur_dsd++ = dsd_list_len;
+				cur_dsd = dsd_ptr->dsd_addr;
+			}
+			*cur_dsd++ = cpu_to_le32(LSD(dif_dsd->dsd_list_dma));
+			*cur_dsd++ = cpu_to_le32(MSD(dif_dsd->dsd_list_dma));
+			*cur_dsd++ = cpu_to_le32(sglen);
+			avail_dsds--;
+			difctx->dif_bundl_len -= sglen;
+			track_difbundl_buf--;
+		}
+
+		ql_dbg(ql_dbg_tgt + ql_dbg_verbose, vha, 0xe026,
+		    "%s: no_ldif_dsd:%x, no_dif_bundl:%x\n", __func__,
+			difctx->no_ldif_dsd, difctx->no_dif_bundl);
+	} else {
+		for_each_sg(sgl, sg, tot_dsds, i) {
+			dma_addr_t sle_dma;
+
+			/* Allocate additional continuation packets? */
+			if (avail_dsds == 0) {
+				avail_dsds = (used_dsds > QLA_DSDS_PER_IOCB) ?
+				    QLA_DSDS_PER_IOCB : used_dsds;
+				dsd_list_len = (avail_dsds + 1) * 12;
+				used_dsds -= avail_dsds;
+
+				/* allocate tracking DS */
+				dsd_ptr = kzalloc(sizeof(*dsd_ptr), GFP_ATOMIC);
+				if (!dsd_ptr) {
+					ql_dbg(ql_dbg_tgt + ql_dbg_verbose,
+					    vha, 0xe027,
+					    "%s: failed alloc dsd_dma...\n",
+					    __func__);
+					return 1;
+				}
+
+				/* allocate new list */
+				dsd_ptr->dsd_addr =
+				    dma_pool_alloc(ha->dl_dma_pool, GFP_ATOMIC,
+					&dsd_ptr->dsd_list_dma);
+				if (!dsd_ptr->dsd_addr) {
+					/* need to cleanup only this dsd_ptr */
+					/* rest will be done by sp_free_dma() */
+					kfree(dsd_ptr);
+					return 1;
+				}
+
+				if (sp) {
+					list_add_tail(&dsd_ptr->list,
+					    &difctx->dsd_list);
+					sp->flags |= SRB_CRC_CTX_DSD_VALID;
+				} else {
+					list_add_tail(&dsd_ptr->list,
+					    &difctx->dsd_list);
+					tc->ctx_dsd_alloced = 1;
+				}
+
+				/* add new list to cmd iocb or last list */
+				*cur_dsd++ =
+				    cpu_to_le32(LSD(dsd_ptr->dsd_list_dma));
+				*cur_dsd++ =
+				    cpu_to_le32(MSD(dsd_ptr->dsd_list_dma));
+				*cur_dsd++ = dsd_list_len;
+				cur_dsd = dsd_ptr->dsd_addr;
+			}
+			sle_dma = sg_dma_address(sg);
+			*cur_dsd++ = cpu_to_le32(LSD(sle_dma));
+			*cur_dsd++ = cpu_to_le32(MSD(sle_dma));
+			*cur_dsd++ = cpu_to_le32(sg_dma_len(sg));
+			avail_dsds--;
+		}
 	}
 	/* Null termination */
 	*cur_dsd++ = 0;
@@ -1183,7 +1395,6 @@ qla24xx_walk_and_build_prot_sglist(struct qla_hw_data *ha, srb_t *sp,
 	*cur_dsd++ = 0;
 	return 0;
 }
-
 /**
  * qla24xx_build_scsi_crc_2_iocbs() - Build IOCB command utilizing Command
  *							Type 6 IOCB types.
@@ -2114,7 +2325,8 @@ __qla2x00_alloc_iocbs(struct qla_qpair *qpair, srb_t *sp)
 	if (req->cnt < req_cnt + 2) {
 		if (qpair->use_shadow_reg)
 			cnt = *req->out_ptr;
-		else if (ha->mqenable || IS_QLA83XX(ha) || IS_QLA27XX(ha))
+		else if (ha->mqenable || IS_QLA83XX(ha) || IS_QLA27XX(ha) ||
+		    IS_QLA28XX(ha))
 			cnt = RD_REG_DWORD(&reg->isp25mq.req_q_out);
 		else if (IS_P3P_TYPE(ha))
 			cnt = RD_REG_DWORD(&reg->isp82.req_q_out);
@@ -2219,12 +2431,15 @@ qla24xx_login_iocb(srb_t *sp, struct logio_entry_24xx *logio)
 	struct srb_iocb *lio = &sp->u.iocb_cmd;
 
 	logio->entry_type = LOGINOUT_PORT_IOCB_TYPE;
-	logio->control_flags = cpu_to_le16(LCF_COMMAND_PLOGI);
-
-	if (lio->u.logio.flags & SRB_LOGIN_COND_PLOGI)
-		logio->control_flags |= cpu_to_le16(LCF_COND_PLOGI);
-	if (lio->u.logio.flags & SRB_LOGIN_SKIP_PRLI)
-		logio->control_flags |= cpu_to_le16(LCF_SKIP_PRLI);
+	if (lio->u.logio.flags & SRB_LOGIN_PRLI_ONLY) {
+		logio->control_flags = cpu_to_le16(LCF_COMMAND_PRLI);
+	} else {
+		logio->control_flags = cpu_to_le16(LCF_COMMAND_PLOGI);
+		if (lio->u.logio.flags & SRB_LOGIN_COND_PLOGI)
+			logio->control_flags |= cpu_to_le16(LCF_COND_PLOGI);
+		if (lio->u.logio.flags & SRB_LOGIN_SKIP_PRLI)
+			logio->control_flags |= cpu_to_le16(LCF_SKIP_PRLI);
+	}
 	logio->nport_handle = cpu_to_le16(sp->fcport->loop_id);
 	logio->port_id[0] = sp->fcport->d_id.b.al_pa;
 	logio->port_id[1] = sp->fcport->d_id.b.area;
@@ -2440,6 +2655,7 @@ qla24xx_els_dcmd_iocb(scsi_qla_host_t *vha, int els_opcode,
 	sp->fcport = fcport;
 	elsio->timeout = qla2x00_els_dcmd_iocb_timeout;
 	qla2x00_init_timer(sp, ELS_DCMD_TIMEOUT);
+	init_completion(&sp->u.iocb_cmd.u.els_logo.comp);
 	sp->done = qla2x00_els_dcmd_sp_done;
 	sp->free = qla2x00_els_dcmd_sp_free;
 
@@ -2487,7 +2703,6 @@ qla24xx_els_logo_iocb(srb_t *sp, struct els_entry_24xx *els_iocb)
 {
 	scsi_qla_host_t *vha = sp->vha;
 	struct srb_iocb *elsio = &sp->u.iocb_cmd;
-	uint32_t	dsd_len = 24;
 
 	els_iocb->entry_type = ELS_IOCB_TYPE;
 	els_iocb->entry_count = 1;
@@ -2510,20 +2725,21 @@ qla24xx_els_logo_iocb(srb_t *sp, struct els_entry_24xx *els_iocb)
 	els_iocb->control_flags = 0;
 
 	if (elsio->u.els_logo.els_cmd == ELS_DCMD_PLOGI) {
-		els_iocb->tx_byte_count = sizeof(struct els_plogi_payload);
+		els_iocb->tx_byte_count = els_iocb->tx_len =
+			sizeof(struct els_plogi_payload);
 		els_iocb->tx_address[0] =
 			cpu_to_le32(LSD(elsio->u.els_plogi.els_plogi_pyld_dma));
 		els_iocb->tx_address[1] =
 			cpu_to_le32(MSD(elsio->u.els_plogi.els_plogi_pyld_dma));
-		els_iocb->tx_len = dsd_len;
 
 		els_iocb->rx_dsd_count = 1;
-		els_iocb->rx_byte_count = sizeof(struct els_plogi_payload);
+		els_iocb->rx_byte_count = els_iocb->rx_len =
+			sizeof(struct els_plogi_payload);
 		els_iocb->rx_address[0] =
 			cpu_to_le32(LSD(elsio->u.els_plogi.els_resp_pyld_dma));
 		els_iocb->rx_address[1] =
 			cpu_to_le32(MSD(elsio->u.els_plogi.els_resp_pyld_dma));
-		els_iocb->rx_len = dsd_len;
+
 		ql_dbg(ql_dbg_io + ql_dbg_buffer, vha, 0x3073,
 		    "PLOGI ELS IOCB:\n");
 		ql_dump_buffer(ql_log_info, vha, 0x0109,
@@ -2552,7 +2768,6 @@ qla2x00_els_dcmd2_iocb_timeout(void *data)
 	fc_port_t *fcport = sp->fcport;
 	struct scsi_qla_host *vha = sp->vha;
 	struct qla_hw_data *ha = vha->hw;
-	struct srb_iocb *lio = &sp->u.iocb_cmd;
 	unsigned long flags = 0;
 	int res;
 
@@ -2568,7 +2783,7 @@ qla2x00_els_dcmd2_iocb_timeout(void *data)
 	    (res == QLA_SUCCESS) ? "successful" : "failed");
 	spin_unlock_irqrestore(&ha->hardware_lock, flags);
 
-	complete(&lio->u.els_plogi.comp);
+	sp->done(sp, QLA_FUNCTION_TIMEOUT);
 }
 
 static void
@@ -2578,17 +2793,55 @@ qla2x00_els_dcmd2_sp_done(void *ptr, int res)
 	fc_port_t *fcport = sp->fcport;
 	struct srb_iocb *lio = &sp->u.iocb_cmd;
 	struct scsi_qla_host *vha = sp->vha;
+	struct event_arg ea;
+	struct qla_work_evt *e;
 
-	ql_dbg(ql_dbg_io + ql_dbg_disc, vha, 0x3072,
-	    "%s ELS hdl=%x, portid=%06x done %8phC\n",
-	    sp->name, sp->handle, fcport->d_id.b24, fcport->port_name);
+	ql_dbg(ql_dbg_disc, vha, 0x3072,
+	    "%s ELS done rc %d hdl=%x, portid=%06x %8phC\n",
+	    sp->name, res, sp->handle, fcport->d_id.b24, fcport->port_name);
 
-	complete(&lio->u.els_plogi.comp);
+	fcport->flags &= ~(FCF_ASYNC_SENT|FCF_ASYNC_ACTIVE);
+	del_timer(&sp->u.iocb_cmd.timer);
+
+	if (sp->flags & SRB_WAKEUP_ON_COMP)
+		complete(&lio->u.els_plogi.comp);
+	else {
+		if (res) {
+			set_bit(RELOGIN_NEEDED, &vha->dpc_flags);
+		} else {
+			memset(&ea, 0, sizeof(ea));
+			ea.fcport = fcport;
+			ea.rc = res;
+			ea.event = FCME_ELS_PLOGI_DONE;
+			qla2x00_fcport_event_handler(vha, &ea);
+		}
+
+		e = qla2x00_alloc_work(vha, QLA_EVT_UNMAP);
+		if (!e) {
+			struct srb_iocb *elsio = &sp->u.iocb_cmd;
+
+			if (elsio->u.els_plogi.els_plogi_pyld)
+				dma_free_coherent(&sp->vha->hw->pdev->dev,
+				    elsio->u.els_plogi.tx_size,
+				    elsio->u.els_plogi.els_plogi_pyld,
+				    elsio->u.els_plogi.els_plogi_pyld_dma);
+
+			if (elsio->u.els_plogi.els_resp_pyld)
+				dma_free_coherent(&sp->vha->hw->pdev->dev,
+				    elsio->u.els_plogi.rx_size,
+				    elsio->u.els_plogi.els_resp_pyld,
+				    elsio->u.els_plogi.els_resp_pyld_dma);
+			sp->free(sp);
+			return;
+		}
+		e->u.iosb.sp = sp;
+		qla2x00_post_work(vha, e);
+	}
 }
 
 int
 qla24xx_els_dcmd2_iocb(scsi_qla_host_t *vha, int els_opcode,
-		       fc_port_t *fcport, port_id_t remote_did)
+    fc_port_t *fcport, bool wait)
 {
 	srb_t *sp;
 	struct srb_iocb *elsio = NULL;
@@ -2615,9 +2868,13 @@ qla24xx_els_dcmd2_iocb(scsi_qla_host_t *vha, int els_opcode,
 
 	elsio->timeout = qla2x00_els_dcmd2_iocb_timeout;
 	init_completion(&elsio->u.els_plogi.comp);
-	qla2x00_init_timer(sp, ELS_DCMD_TIMEOUT);
+	if (wait)
+		sp->flags = SRB_WAKEUP_ON_COMP;
+
+	qla2x00_init_timer(sp, ELS_DCMD_TIMEOUT + 2);
 
 	sp->done = qla2x00_els_dcmd2_sp_done;
+	elsio->u.els_plogi.tx_size = elsio->u.els_plogi.rx_size = DMA_POOL_SIZE;
 
 	ptr = elsio->u.els_plogi.els_plogi_pyld =
 	    dma_alloc_coherent(&ha->pdev->dev, DMA_POOL_SIZE,
@@ -2641,33 +2898,52 @@ qla24xx_els_dcmd2_iocb(scsi_qla_host_t *vha, int els_opcode,
 
 	memset(ptr, 0, sizeof(struct els_plogi_payload));
 	memset(resp_ptr, 0, sizeof(struct els_plogi_payload));
+	memcpy(elsio->u.els_plogi.els_plogi_pyld->data,
+	    &ha->plogi_els_payld.data,
+	    sizeof(elsio->u.els_plogi.els_plogi_pyld->data));
+
 	elsio->u.els_plogi.els_cmd = els_opcode;
 	elsio->u.els_plogi.els_plogi_pyld->opcode = els_opcode;
-	qla24xx_get_port_login_templ(vha, ptr_dma + 4,
-		&elsio->u.els_plogi.els_plogi_pyld->data[0],
-		sizeof(struct els_plogi_payload));
 
-	ql_dbg(ql_dbg_io + ql_dbg_buffer, vha, 0x3073, "PLOGI buffer:\n");
-	ql_dump_buffer(ql_dbg_io + ql_dbg_buffer, vha, 0x0109,
+	ql_dbg(ql_dbg_disc + ql_dbg_buffer, vha, 0x3073, "PLOGI buffer:\n");
+	ql_dump_buffer(ql_dbg_disc + ql_dbg_buffer, vha, 0x0109,
 	    (uint8_t *)elsio->u.els_plogi.els_plogi_pyld, 0x70);
 
 	rval = qla2x00_start_sp(sp);
 	if (rval != QLA_SUCCESS) {
 		rval = QLA_FUNCTION_FAILED;
-		goto out;
+	} else {
+		ql_dbg(ql_dbg_disc, vha, 0x3074,
+		    "%s PLOGI sent, hdl=%x, loopid=%x, to port_id %06x from port_id %06x\n",
+		    sp->name, sp->handle, fcport->loop_id,
+		    fcport->d_id.b24, vha->d_id.b24);
 	}
 
-	ql_dbg(ql_dbg_io, vha, 0x3074,
-	    "%s PLOGI sent, hdl=%x, loopid=%x, portid=%06x\n",
-	    sp->name, sp->handle, fcport->loop_id, fcport->d_id.b24);
+	if (wait) {
+		wait_for_completion(&elsio->u.els_plogi.comp);
 
-	wait_for_completion(&elsio->u.els_plogi.comp);
-
-	if (elsio->u.els_plogi.comp_status != CS_COMPLETE)
-		rval = QLA_FUNCTION_FAILED;
+		if (elsio->u.els_plogi.comp_status != CS_COMPLETE)
+			rval = QLA_FUNCTION_FAILED;
+	} else {
+		goto done;
+	}
 
 out:
+	fcport->flags &= ~(FCF_ASYNC_SENT);
+	if (elsio->u.els_plogi.els_plogi_pyld)
+		dma_free_coherent(&sp->vha->hw->pdev->dev,
+		    elsio->u.els_plogi.tx_size,
+		    elsio->u.els_plogi.els_plogi_pyld,
+		    elsio->u.els_plogi.els_plogi_pyld_dma);
+
+	if (elsio->u.els_plogi.els_resp_pyld)
+		dma_free_coherent(&sp->vha->hw->pdev->dev,
+		    elsio->u.els_plogi.rx_size,
+		    elsio->u.els_plogi.els_resp_pyld,
+		    elsio->u.els_plogi.els_resp_pyld_dma);
+
 	sp->free(sp);
+done:
 	return rval;
 }
 

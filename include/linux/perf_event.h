@@ -451,7 +451,7 @@ struct pmu {
 	/*
 	 * Check period value for PERF_EVENT_IOC_PERIOD ioctl.
 	 */
-	int (*check_period)		(struct perf_event *event, u64 value); /* optional */
+	RH_KABI_EXTEND(int (*check_period)		(struct perf_event *event, u64 value)) /* optional */
 };
 
 enum perf_addr_filter_action_t {

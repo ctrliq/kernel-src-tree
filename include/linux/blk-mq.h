@@ -57,6 +57,7 @@ struct blk_mq_hw_ctx {
 	unsigned int		queue_num;
 
 	atomic_t		nr_active;
+	RH_KABI_DEPRECATE(unsigned int,	nr_expired)
 
 	struct hlist_node	cpuhp_dead;
 	struct kobject		kobj;
@@ -70,8 +71,12 @@ struct blk_mq_hw_ctx {
 	struct dentry		*sched_debugfs_dir;
 #endif
 
+#ifdef __GENKSYMS__
 	RH_KABI_RESERVE(1)
 	RH_KABI_RESERVE(2)
+#else
+	struct list_head	hctx_list;	//use reserve 1 and 2
+#endif
 	RH_KABI_RESERVE(3)
 	RH_KABI_RESERVE(4)
 	RH_KABI_RESERVE(5)
@@ -221,12 +226,6 @@ struct blk_mq_ops {
 	void (*initialize_rq_fn)(struct request *rq);
 
 	/*
-	 * Called before freeing one request which isn't completed yet,
-	 * and usually for freeing the driver private data
-	 */
-	cleanup_rq_fn		*cleanup_rq;
-
-	/*
 	 * If set, returns whether or not this queue currently is busy
 	 */
 	busy_fn			*busy;
@@ -241,7 +240,12 @@ struct blk_mq_ops {
 	void (*show_rq)(struct seq_file *m, struct request *rq);
 #endif
 
-	RH_KABI_RESERVE(1)
+	/*
+	 * Called before freeing one request which isn't completed yet,
+	 * and usually for freeing the driver private data
+	 */
+	RH_KABI_USE(1, cleanup_rq_fn           *cleanup_rq)
+
 	RH_KABI_RESERVE(2)
 	RH_KABI_RESERVE(3)
 	RH_KABI_RESERVE(4)
@@ -254,6 +258,7 @@ struct blk_mq_ops {
 enum {
 	BLK_MQ_F_SHOULD_MERGE	= 1 << 0,
 	BLK_MQ_F_TAG_SHARED	= 1 << 1,
+	BLK_MQ_F_SG_MERGE	= 1 << 2,	/* obsolete */
 	BLK_MQ_F_BLOCKING	= 1 << 5,
 	BLK_MQ_F_NO_SCHED	= 1 << 6,
 	BLK_MQ_F_ALLOC_POLICY_START_BIT = 8,

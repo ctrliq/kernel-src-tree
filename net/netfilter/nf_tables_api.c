@@ -3378,7 +3378,7 @@ static int nf_tables_newset(struct net *net, struct sock *nlsk,
 	struct nft_set *set;
 	struct nft_ctx ctx;
 	char *name;
-	unsigned int size;
+	u64 size;
 	bool create;
 	u64 timeout;
 	u32 ktype, dtype, flags, policy, gc_int, objtype;
@@ -7321,38 +7321,51 @@ static int __init nf_tables_module_init(void)
 {
 	int err;
 
-	nft_chain_filter_init();
+	err = register_pernet_subsys(&nf_tables_net_ops);
+	if (err < 0)
+		return err;
+
+	err = nft_chain_filter_init();
+	if (err < 0)
+		goto err1;
 
 	info = kmalloc_array(NFT_RULE_MAXEXPRS, sizeof(struct nft_expr_info),
 			     GFP_KERNEL);
 	if (info == NULL) {
 		err = -ENOMEM;
-		goto err1;
+		goto err2;
 	}
 
 	err = nf_tables_core_module_init();
 	if (err < 0)
-		goto err2;
-
-	err = nfnetlink_subsys_register(&nf_tables_subsys);
-	if (err < 0)
 		goto err3;
 
-	register_netdevice_notifier(&nf_tables_flowtable_notifier);
-
-	err = rhltable_init(&nft_objname_ht, &nft_objname_ht_params);
+	err = register_netdevice_notifier(&nf_tables_flowtable_notifier);
 	if (err < 0)
 		goto err4;
 
+	err = rhltable_init(&nft_objname_ht, &nft_objname_ht_params);
+	if (err < 0)
+		goto err5;
 
-	return register_pernet_subsys(&nf_tables_net_ops);
-err4:
+	/* must be last */
+	err = nfnetlink_subsys_register(&nf_tables_subsys);
+	if (err < 0)
+		goto err6;
+
+	return err;
+err6:
+	rhltable_destroy(&nft_objname_ht);
+err5:
 	unregister_netdevice_notifier(&nf_tables_flowtable_notifier);
-err3:
+err4:
 	nf_tables_core_module_exit();
-err2:
+err3:
 	kfree(info);
+err2:
+	nft_chain_filter_fini();
 err1:
+	unregister_pernet_subsys(&nf_tables_net_ops);
 	return err;
 }
 

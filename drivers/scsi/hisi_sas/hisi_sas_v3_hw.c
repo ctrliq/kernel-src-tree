@@ -1010,7 +1010,7 @@ get_free_slot_v3_hw(struct hisi_hba *hisi_hba, struct hisi_sas_dq *dq)
 				DLVRY_Q_0_RD_PTR + (queue * 0x14));
 	if (r == (w+1) % HISI_SAS_QUEUE_SLOTS) {
 		dev_warn(dev, "full queue=%d r=%d w=%d\n",
-				queue, r, w);
+			 queue, r, w);
 		return -EAGAIN;
 	}
 
@@ -1950,7 +1950,7 @@ static const struct hisi_sas_hw_error axi_error[] = {
 	{ .msk = BIT(5), .msg = "SATA_AXI_R_ERR" },
 	{ .msk = BIT(6), .msg = "DQE_AXI_R_ERR" },
 	{ .msk = BIT(7), .msg = "CQE_AXI_W_ERR" },
-	{},
+	{}
 };
 
 static const struct hisi_sas_hw_error fifo_error[] = {
@@ -1959,7 +1959,7 @@ static const struct hisi_sas_hw_error fifo_error[] = {
 	{ .msk = BIT(10), .msg = "GETDQE_FIFO" },
 	{ .msk = BIT(11), .msg = "CMDP_FIFO" },
 	{ .msk = BIT(12), .msg = "AWTCTRL_FIFO" },
-	{},
+	{}
 };
 
 static const struct hisi_sas_hw_error fatal_axi_error[] = {
@@ -2207,13 +2207,11 @@ slot_complete_v3_hw(struct hisi_hba *hisi_hba, struct hisi_sas_slot *slot)
 
 		slot_err_v3_hw(hisi_hba, task, slot);
 		if (ts->stat != SAS_DATA_UNDERRUN)
-			dev_info(dev, "erroneous completion iptt=%d task=%p dev id=%d "
-				"CQ hdr: 0x%x 0x%x 0x%x 0x%x "
-				"Error info: 0x%x 0x%x 0x%x 0x%x\n",
-				slot->idx, task, sas_dev->device_id,
-				dw0, dw1, complete_hdr->act, dw3,
-				error_info[0], error_info[1],
-				error_info[2], error_info[3]);
+			dev_info(dev, "erroneous completion iptt=%d task=%p dev id=%d CQ hdr: 0x%x 0x%x 0x%x 0x%x Error info: 0x%x 0x%x 0x%x 0x%x\n",
+				 slot->idx, task, sas_dev->device_id,
+				 dw0, dw1, complete_hdr->act, dw3,
+				 error_info[0], error_info[1],
+				 error_info[2], error_info[3]);
 		if (unlikely(slot->abort))
 			return ts->stat;
 		goto out;
@@ -2446,8 +2444,7 @@ static int interrupt_init_v3_hw(struct hisi_hba *hisi_hba)
 				      cq_interrupt_v3_hw, irqflags,
 				      DRV_NAME " cq", cq);
 		if (rc) {
-			dev_err(dev,
-				"could not request cq%d interrupt, rc=%d\n",
+			dev_err(dev, "could not request cq%d interrupt, rc=%d\n",
 				i, rc);
 			rc = -ENOENT;
 			goto free_cq_irqs;
@@ -2603,7 +2600,7 @@ static int write_gpio_v3_hw(struct hisi_hba *hisi_hba, u8 reg_type,
 		break;
 	default:
 		dev_err(dev, "write gpio: unsupported or bad reg type %d\n",
-				reg_type);
+			reg_type);
 		return -EINVAL;
 	}
 
@@ -3043,7 +3040,7 @@ hisi_sas_v3_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 
 	hisi_hba->regs = pcim_iomap(pdev, 5, 0);
 	if (!hisi_hba->regs) {
-		dev_err(dev, "cannot map register.\n");
+		dev_err(dev, "cannot map register\n");
 		rc = -ENOMEM;
 		goto err_out_ha;
 	}
@@ -3084,6 +3081,15 @@ hisi_sas_v3_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 		sha->sas_port[i] = &hisi_hba->port[i].sas_port;
 	}
 
+	if (hisi_hba->prot_mask) {
+		dev_info(dev, "Registering for DIF/DIX prot_mask=0x%x\n",
+			 prot_mask);
+		scsi_host_set_prot(hisi_hba->shost, prot_mask);
+		if (hisi_hba->prot_mask & HISI_SAS_DIX_PROT_MASK)
+			scsi_host_set_guard(hisi_hba->shost,
+					    SHOST_DIX_GUARD_CRC);
+	}
+
 	if (hisi_sas_debugfs_enable)
 		hisi_sas_debugfs_init(hisi_hba);
 
@@ -3098,15 +3104,6 @@ hisi_sas_v3_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 	rc = hisi_hba->hw->hw_init(hisi_hba);
 	if (rc)
 		goto err_out_register_ha;
-
-	if (hisi_hba->prot_mask) {
-		dev_info(dev, "Registering for DIF/DIX prot_mask=0x%x\n",
-			 prot_mask);
-		scsi_host_set_prot(hisi_hba->shost, prot_mask);
-		if (hisi_hba->prot_mask & HISI_SAS_DIX_PROT_MASK)
-			scsi_host_set_guard(hisi_hba->shost,
-					    SHOST_DIX_GUARD_CRC);
-	}
 
 	scsi_scan_host(shost);
 
@@ -3259,7 +3256,7 @@ static int hisi_sas_v3_resume(struct pci_dev *pdev)
 	pci_power_t device_state = pdev->current_state;
 
 	dev_warn(dev, "resuming from operating state [D%d]\n",
-			device_state);
+		 device_state);
 	pci_set_power_state(pdev, PCI_D0);
 	pci_enable_wake(pdev, PCI_D0, 0);
 	pci_restore_state(pdev);

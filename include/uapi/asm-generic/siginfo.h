@@ -29,6 +29,108 @@ typedef union sigval {
 #define __ARCH_SI_ATTRIBUTES
 #endif
 
+/*
+ * RHEL8: The old and new siginfo structures have the same offsets for
+ * their fields. They are just constructed in different ways.
+ */
+#ifdef __GENKSYMS__
+#define __ARCH_SI_PREAMBLE_SIZE	(4 * sizeof(int))
+#define SI_PAD_SIZE	((SI_MAX_SIZE - __ARCH_SI_PREAMBLE_SIZE) / sizeof(int))
+
+typedef struct siginfo {
+	int si_signo;
+#ifndef __ARCH_HAS_SWAPPED_SIGINFO
+	int si_errno;
+	int si_code;
+#else
+	int si_code;
+	int si_errno;
+#endif
+
+	union {
+		int _pad[SI_PAD_SIZE];
+
+		/* kill() */
+		struct {
+			__kernel_pid_t _pid;	/* sender's pid */
+			__kernel_uid32_t _uid;	/* sender's uid */
+		} _kill;
+
+		/* POSIX.1b timers */
+		struct {
+			__kernel_timer_t _tid;	/* timer id */
+			int _overrun;		/* overrun count */
+			sigval_t _sigval;	/* same as below */
+			int _sys_private;       /* not to be passed to user */
+		} _timer;
+
+		/* POSIX.1b signals */
+		struct {
+			__kernel_pid_t _pid;	/* sender's pid */
+			__kernel_uid32_t _uid;	/* sender's uid */
+			sigval_t _sigval;
+		} _rt;
+
+		/* SIGCHLD */
+		struct {
+			__kernel_pid_t _pid;	/* which child */
+			__kernel_uid32_t _uid;	/* sender's uid */
+			int _status;		/* exit code */
+			__ARCH_SI_CLOCK_T _utime;
+			__ARCH_SI_CLOCK_T _stime;
+		} _sigchld;
+
+		/* SIGILL, SIGFPE, SIGSEGV, SIGBUS, SIGTRAP, SIGEMT */
+		struct {
+			void __user *_addr; /* faulting insn/memory ref. */
+#ifdef __ARCH_SI_TRAPNO
+			int _trapno;	/* TRAP # which caused the signal */
+#endif
+#ifdef __ia64__
+			int _imm;		/* immediate value for "break" */
+			unsigned int _flags;	/* see ia64 si_flags */
+			unsigned long _isr;	/* isr */
+#endif
+
+#define __ADDR_BND_PKEY_PAD  (__alignof__(void *) < sizeof(short) ? \
+			      sizeof(short) : __alignof__(void *))
+			union {
+				/*
+				 * used when si_code=BUS_MCEERR_AR or
+				 * used when si_code=BUS_MCEERR_AO
+				 */
+				short _addr_lsb; /* LSB of the reported address */
+				/* used when si_code=SEGV_BNDERR */
+				struct {
+					char _dummy_bnd[__ADDR_BND_PKEY_PAD];
+					void __user *_lower;
+					void __user *_upper;
+				} _addr_bnd;
+				/* used when si_code=SEGV_PKUERR */
+				struct {
+					char _dummy_pkey[__ADDR_BND_PKEY_PAD];
+					__u32 _pkey;
+				} _addr_pkey;
+			};
+		} _sigfault;
+
+		/* SIGPOLL */
+		struct {
+			__ARCH_SI_BAND_T _band;	/* POLL_IN, POLL_OUT, POLL_MSG */
+			int _fd;
+		} _sigpoll;
+
+		/* SIGSYS */
+		struct {
+			void __user *_call_addr; /* calling user insn */
+			int _syscall;	/* triggering system call number */
+			unsigned int _arch;	/* AUDIT_ARCH_* of syscall */
+		} _sigsys;
+	} _sifields;
+} __ARCH_SI_ATTRIBUTES siginfo_t;
+
+#else /* __GENKSYMS__ */
+
 union __sifields {
 	/* kill() */
 	struct {
@@ -132,6 +234,7 @@ typedef struct siginfo {
 		int _si_pad[SI_MAX_SIZE/sizeof(int)];
 	};
 } __ARCH_SI_ATTRIBUTES siginfo_t;
+#endif /* __GENKSYMS__ */
 
 /*
  * How these fields are to be accessed.

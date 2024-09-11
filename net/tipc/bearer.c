@@ -43,6 +43,7 @@
 #include "bcast.h"
 #include "netlink.h"
 #include "udp_media.h"
+#include "trace.h"
 
 #define MAX_ADDR_STR 60
 
@@ -577,7 +578,7 @@ static int tipc_l2_rcv_msg(struct sk_buff *skb, struct net_device *dev,
 		rcu_dereference_rtnl(orig_dev->tipc_ptr);
 	if (likely(b && test_bit(0, &b->up) &&
 		   (skb->pkt_type <= PACKET_MULTICAST))) {
-		skb->next = NULL;
+		skb_mark_not_on_list(skb);
 		tipc_rcv(dev_net(b->pt.dev), skb, b);
 		rcu_read_unlock();
 		return NET_RX_SUCCESS;
@@ -607,13 +608,14 @@ static int tipc_l2_device_event(struct notifier_block *nb, unsigned long evt,
 	if (!b)
 		return NOTIFY_DONE;
 
+	trace_tipc_l2_device_event(dev, b, evt);
 	switch (evt) {
 	case NETDEV_CHANGE:
 		if (netif_carrier_ok(dev) && netif_oper_up(dev)) {
 			test_and_set_bit_lock(0, &b->up);
 			break;
 		}
-		/* fall through */
+		/* else: fall through */
 	case NETDEV_GOING_DOWN:
 		clear_bit_unlock(0, &b->up);
 		tipc_reset_bearer(net, b);

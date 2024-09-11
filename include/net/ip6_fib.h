@@ -171,7 +171,12 @@ struct fib6_info {
 					dst_nocount:1,
 					dst_nopolicy:1,
 					dst_host:1,
+#ifndef __GENKSYMS__
+					fib6_destroying:1,
+					unused:2;
+#else
 					unused:3;
+#endif
 
 	struct fib6_nh			fib6_nh;
 	struct rcu_head			rcu;

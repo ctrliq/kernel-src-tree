@@ -7330,7 +7330,8 @@ static void mlxsw_sp_rif_vlan_fdb_del(struct mlxsw_sp_rif *rif, const char *mac)
 
 	info.addr = mac;
 	info.vid = vid;
-	call_switchdev_notifiers(SWITCHDEV_FDB_DEL_TO_BRIDGE, dev, &info.info);
+	call_switchdev_notifiers(SWITCHDEV_FDB_DEL_TO_BRIDGE, dev, &info.info,
+				 NULL);
 }
 
 static const struct mlxsw_sp_rif_ops mlxsw_sp_rif_vlan_ops = {
@@ -7417,7 +7418,8 @@ static void mlxsw_sp_rif_fid_fdb_del(struct mlxsw_sp_rif *rif, const char *mac)
 
 	info.addr = mac;
 	info.vid = 0;
-	call_switchdev_notifiers(SWITCHDEV_FDB_DEL_TO_BRIDGE, dev, &info.info);
+	call_switchdev_notifiers(SWITCHDEV_FDB_DEL_TO_BRIDGE, dev, &info.info,
+				 NULL);
 }
 
 static const struct mlxsw_sp_rif_ops mlxsw_sp_rif_fid_ops = {
@@ -7840,7 +7842,7 @@ static int mlxsw_sp_dscp_init(struct mlxsw_sp *mlxsw_sp)
 
 static int __mlxsw_sp_router_init(struct mlxsw_sp *mlxsw_sp)
 {
-	bool usp = init_net.ipv4.sysctl_ip_fwd_update_priority;
+	bool usp = init_net.ipv4_sysctl_ip_fwd_update_priority;
 	char rgcr_pl[MLXSW_REG_RGCR_LEN];
 	u64 max_rifs;
 	int err;

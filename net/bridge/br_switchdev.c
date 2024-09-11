@@ -117,7 +117,7 @@ br_switchdev_fdb_call_notifiers(bool adding, const unsigned char *mac,
 	info.added_by_user = added_by_user;
 	info.offloaded = offloaded;
 	notifier_type = adding ? SWITCHDEV_FDB_ADD_TO_DEVICE : SWITCHDEV_FDB_DEL_TO_DEVICE;
-	call_switchdev_notifiers(notifier_type, dev, &info.info);
+	call_switchdev_notifiers(notifier_type, dev, &info.info, NULL);
 }
 
 void
@@ -155,7 +155,7 @@ int br_switchdev_port_vlan_add(struct net_device *dev, u16 vid, u16 flags,
 		.vid_end = vid,
 	};
 
-	return switchdev_port_obj_add(dev, &v.obj);
+	return switchdev_port_obj_add(dev, &v.obj, extack);
 }
 
 int br_switchdev_port_vlan_del(struct net_device *dev, u16 vid)

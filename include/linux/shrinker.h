@@ -64,15 +64,13 @@ struct shrinker {
 				      struct shrink_control *sc);
 
 	int seeks;	/* seeks to recreate an obj */
+	/* ID in shrinker_idr */
+	RH_KABI_FILL_HOLE(int id)
 	long batch;	/* reclaim batch size, 0 = default */
 	unsigned long flags;
 
 	/* These are for internal use */
 	struct list_head list;
-#ifdef CONFIG_MEMCG_KMEM
-	/* ID in shrinker_idr */
-	int id;
-#endif
 	/* objs pending delete, per node */
 	atomic_long_t *nr_deferred;
 };

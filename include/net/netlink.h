@@ -251,7 +251,7 @@ enum {
 struct nla_policy {
 	u16		type;
 	u16		len;
-	const void     *validation_data;
+	RH_KABI_CONST void     *validation_data;
 };
 
 #define NLA_POLICY_EXACT_LEN(_len)	{ .type = NLA_EXACT_LEN, .len = _len }

@@ -10,6 +10,7 @@
 #include <string.h>
 #include <assert.h>
 #include <stdlib.h>
+#include <stdarg.h>
 #include <time.h>
 
 #include <linux/types.h>
@@ -576,7 +577,7 @@ static void test_bpf_obj_id(void)
 			  load_time < now - 60 || load_time > now + 60 ||
 			  prog_infos[i].created_by_uid != my_uid ||
 			  prog_infos[i].nr_map_ids != 1 ||
-			  *(int *)prog_infos[i].map_ids != map_infos[i].id ||
+			  *(int *)(long)prog_infos[i].map_ids != map_infos[i].id ||
 			  strcmp((char *)prog_infos[i].name, expected_prog_name),
 			  "get-prog-info(fd)",
 			  "err %d errno %d i %d type %d(%d) info_len %u(%Zu) jit_enabled %d jited_prog_len %u xlated_prog_len %u jited_prog %d xlated_prog %d load_time %lu(%lu) uid %u(%u) nr_map_ids %u(%u) map_id %u(%u) name %s(%s)\n",
@@ -591,7 +592,7 @@ static void test_bpf_obj_id(void)
 			  load_time, now,
 			  prog_infos[i].created_by_uid, my_uid,
 			  prog_infos[i].nr_map_ids, 1,
-			  *(int *)prog_infos[i].map_ids, map_infos[i].id,
+			  *(int *)(long)prog_infos[i].map_ids, map_infos[i].id,
 			  prog_infos[i].name, expected_prog_name))
 			goto done;
 	}
@@ -637,7 +638,7 @@ static void test_bpf_obj_id(void)
 		bzero(&prog_info, sizeof(prog_info));
 		info_len = sizeof(prog_info);
 
-		saved_map_id = *(int *)(prog_infos[i].map_ids);
+		saved_map_id = *(int *)((long)prog_infos[i].map_ids);
 		prog_info.map_ids = prog_infos[i].map_ids;
 		prog_info.nr_map_ids = 2;
 		err = bpf_obj_get_info_by_fd(prog_fd, &prog_info, &info_len);
@@ -645,12 +646,12 @@ static void test_bpf_obj_id(void)
 		prog_infos[i].xlated_prog_insns = 0;
 		CHECK(err || info_len != sizeof(struct bpf_prog_info) ||
 		      memcmp(&prog_info, &prog_infos[i], info_len) ||
-		      *(int *)prog_info.map_ids != saved_map_id,
+		      *(int *)(long)prog_info.map_ids != saved_map_id,
 		      "get-prog-info(next_id->fd)",
 		      "err %d errno %d info_len %u(%Zu) memcmp %d map_id %u(%u)\n",
 		      err, errno, info_len, sizeof(struct bpf_prog_info),
 		      memcmp(&prog_info, &prog_infos[i], info_len),
-		      *(int *)prog_info.map_ids, saved_map_id);
+		      *(int *)(long)prog_info.map_ids, saved_map_id);
 		close(prog_fd);
 	}
 	CHECK(nr_id_found != nr_iters,
@@ -1780,6 +1781,15 @@ static void test_task_fd_query_tp(void)
 				   "sys_enter_read");
 }
 
+static int libbpf_debug_print(enum libbpf_print_level level,
+			      const char *format, va_list args)
+{
+	if (level == LIBBPF_DEBUG)
+		return 0;
+
+	return vfprintf(stderr, format, args);
+}
+
 static void test_reference_tracking()
 {
 	const char *file = "./test_sk_lookup_kern.o";
@@ -1806,9 +1816,9 @@ static void test_reference_tracking()
 
 		/* Expect verifier failure if test name has 'fail' */
 		if (strstr(title, "fail") != NULL) {
-			libbpf_set_print(NULL, NULL, NULL);
+			libbpf_set_print(NULL);
 			err = !bpf_program__load(prog, "GPL", 0);
-			libbpf_set_print(printf, printf, NULL);
+			libbpf_set_print(libbpf_debug_print);
 		} else {
 			err = bpf_program__load(prog, "GPL", 0);
 		}
@@ -1817,8 +1827,105 @@ static void test_reference_tracking()
 	bpf_object__close(obj);
 }
 
+enum {
+	QUEUE,
+	STACK,
+};
+
+static void test_queue_stack_map(int type)
+{
+	const int MAP_SIZE = 32;
+	__u32 vals[MAP_SIZE], duration, retval, size, val;
+	int i, err, prog_fd, map_in_fd, map_out_fd;
+	char file[32], buf[128];
+	struct bpf_object *obj;
+	struct iphdr *iph = (void *)buf + sizeof(struct ethhdr);
+
+	/* Fill test values to be used */
+	for (i = 0; i < MAP_SIZE; i++)
+		vals[i] = rand();
+
+	if (type == QUEUE)
+		strncpy(file, "./test_queue_map.o", sizeof(file));
+	else if (type == STACK)
+		strncpy(file, "./test_stack_map.o", sizeof(file));
+	else
+		return;
+
+	err = bpf_prog_load(file, BPF_PROG_TYPE_SCHED_CLS, &obj, &prog_fd);
+	if (err) {
+		error_cnt++;
+		return;
+	}
+
+	map_in_fd = bpf_find_map(__func__, obj, "map_in");
+	if (map_in_fd < 0)
+		goto out;
+
+	map_out_fd = bpf_find_map(__func__, obj, "map_out");
+	if (map_out_fd < 0)
+		goto out;
+
+	/* Push 32 elements to the input map */
+	for (i = 0; i < MAP_SIZE; i++) {
+		err = bpf_map_update_elem(map_in_fd, NULL, &vals[i], 0);
+		if (err) {
+			error_cnt++;
+			goto out;
+		}
+	}
+
+	/* The eBPF program pushes iph.saddr in the output map,
+	 * pops the input map and saves this value in iph.daddr
+	 */
+	for (i = 0; i < MAP_SIZE; i++) {
+		if (type == QUEUE) {
+			val = vals[i];
+			pkt_v4.iph.saddr = vals[i] * 5;
+		} else if (type == STACK) {
+			val = vals[MAP_SIZE - 1 - i];
+			pkt_v4.iph.saddr = vals[MAP_SIZE - 1 - i] * 5;
+		}
+
+		err = bpf_prog_test_run(prog_fd, 1, &pkt_v4, sizeof(pkt_v4),
+					buf, &size, &retval, &duration);
+		if (err || retval || size != sizeof(pkt_v4) ||
+		    iph->daddr != val)
+			break;
+	}
+
+	CHECK(err || retval || size != sizeof(pkt_v4) || iph->daddr != val,
+	      "bpf_map_pop_elem",
+	      "err %d errno %d retval %d size %d iph->daddr %u\n",
+	      err, errno, retval, size, iph->daddr);
+
+	/* Queue is empty, program should return TC_ACT_SHOT */
+	err = bpf_prog_test_run(prog_fd, 1, &pkt_v4, sizeof(pkt_v4),
+				buf, &size, &retval, &duration);
+	CHECK(err || retval != 2 /* TC_ACT_SHOT */|| size != sizeof(pkt_v4),
+	      "check-queue-stack-map-empty",
+	      "err %d errno %d retval %d size %d\n",
+	      err, errno, retval, size);
+
+	/* Check that the program pushed elements correctly */
+	for (i = 0; i < MAP_SIZE; i++) {
+		err = bpf_map_lookup_and_delete_elem(map_out_fd, NULL, &val);
+		if (err || val != vals[i] * 5)
+			break;
+	}
+
+	CHECK(i != MAP_SIZE && (err || val != vals[i] * 5),
+	      "bpf_map_push_elem", "err %d value %u\n", err, val);
+
+out:
+	pkt_v4.iph.saddr = 0;
+	bpf_object__close(obj);
+}
+
 int main(void)
 {
+	srand(time(NULL));
+
 	jit_enabled = is_jit_enabled();
 
 	test_pkt_access();
@@ -1840,6 +1947,8 @@ int main(void)
 	test_task_fd_query_rawtp();
 	test_task_fd_query_tp();
 	test_reference_tracking();
+	test_queue_stack_map(QUEUE);
+	test_queue_stack_map(STACK);
 
 	printf("Summary: %d PASSED, %d FAILED\n", pass_cnt, error_cnt);
 	return error_cnt ? EXIT_FAILURE : EXIT_SUCCESS;

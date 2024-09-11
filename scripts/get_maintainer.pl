@@ -62,8 +62,7 @@ my $self_test = undef;
 my $version = 0;
 my $help = 0;
 my $find_maintainer_files = 0;
-my $rh_only = 1;
-
+my $maintainer_path;
 my $vcs_used = 0;
 
 my $exit = 0;
@@ -266,10 +265,10 @@ if (!GetOptions(
 		'fe|file-emails!' => \$file_emails,
 		'f|file' => \$from_filename,
 		'find-maintainer-files' => \$find_maintainer_files,
+		'mpath|maintainer-path=s' => \$maintainer_path,
 		'self-test:s' => \$self_test,
 		'v|version' => \$version,
 		'h|help|usage' => \$help,
-		'rh-only!' => \$rh_only,
 		)) {
     die "$P: invalid argument - use --help if necessary\n";
 }
@@ -388,52 +387,36 @@ sub find_ignore_git {
 read_all_maintainer_files();
 
 sub read_all_maintainer_files {
-	my $conf = which_conf(".get_maintainer.MAINTAINERS");
-	if ( -f $conf) {
-	    my @conf_args;
-	    my $add = 0;
-	    open(my $conffile, '<', "$conf")
-		or warn "$P: Can't find a readable .get_maintainer.MAINTAINERS file $!\n";
-	    while (<$conffile>) {
-		my $line = $_;
-		if ($line =~ m/^\+/ ) {
-		    $add = 1;
-		}
-		next if ($line =~ m/^\s*#/);
-		$line =~ s/^\+//g;
-		$line =~ s/^\-//g;
-		$line =~ s/\s*\n?$//;
-		push(@mfiles, $line);
-	    }
-	    close($conffile);
-	    if ($add eq 0) {
-		foreach my $file (@mfiles) {
-		     read_maintainer_file("$file");
-		}
-		return;
+    my $path = "${lk_path}MAINTAINERS";
+    if (defined $maintainer_path) {
+	$path = $maintainer_path;
+	# Perl Cookbook tilde expansion if necessary
+	$path =~ s@^~([^/]*)@ $1 ? (getpwnam($1))[7] : ( $ENV{HOME} || $ENV{LOGDIR} || (getpwuid($<))[7])@ex;
+    }
+
+    if (-d $path) {
+	$path .= '/' if ($path !~ m@/$@);
+	if ($find_maintainer_files) {
+	    find( { wanted => \&find_is_maintainer_file,
+		    preprocess => \&find_ignore_git,
+		    no_chdir => 1,
+		}, "$path");
+	} else {
+	    opendir(DIR, "$path") or die $!;
+	    my @files = readdir(DIR);
+	    closedir(DIR);
+	    foreach my $file (@files) {
+		push(@mfiles, "$path$file") if ($file !~ /^\./);
 	    }
 	}
-
-    if (-d "${lk_path}MAINTAINERS") {
-        opendir(DIR, "${lk_path}MAINTAINERS") or die $!;
-        my @files = readdir(DIR);
-        closedir(DIR);
-        foreach my $file (@files) {
-            push(@mfiles, "${lk_path}MAINTAINERS/$file") if ($file !~ /^\./);
-        }
-    }
-
-    if ($find_maintainer_files) {
-        find( { wanted => \&find_is_maintainer_file,
-                preprocess => \&find_ignore_git,
-                no_chdir => 1,
-        }, "${lk_path}");
+    } elsif (-f "$path") {
+	push(@mfiles, "$path");
     } else {
-        push(@mfiles, "${lk_path}MAINTAINERS") if -f "${lk_path}MAINTAINERS";
+	die "$P: MAINTAINER file not found '$path'\n";
     }
-
+    die "$P: No MAINTAINER files found in '$path'\n" if (scalar(@mfiles) == 0);
     foreach my $file (@mfiles) {
-        read_maintainer_file("$file");
+	read_maintainer_file("$file");
     }
 }
 
@@ -1099,14 +1082,6 @@ Notes:
       Entries in this file can be any command line argument.
       This file is prepended to any additional command line arguments.
       Multiple lines and # comments are allowed.
-  File ".get_maintainer.ignore", if it exists in the linux kernel source root
-      directory, can contain a list of email addresses to ignore.  Multiple
-      lines and # comments are allowed.
-  File ".get_maintainer.MAINTAINERS", if it exists in the linux kernel source
-      root directory, can change the location of the MAINTAINERS file.
-      Entries beginning with a '+' are added to the default list, and
-      entries beginning with a '-' override the existing MAINTAINERS list
-      lookup.  Multiple lines and # comments are allowed.
   Most options have both positive and negative forms.
       The negative forms for --<foo> are --no<foo> and --no-<foo>.
 
@@ -1411,11 +1386,6 @@ sub push_email_address {
 
     if ($address eq "") {
 	return 0;
-    }
-
-    # to avoid confusion, only print redhat.com email addresses
-    if (($rh_only) && $line !~ /\@redhat\.com/) {
-	    return 0;
     }
 
     if (!$email_remove_duplicates) {

@@ -660,10 +660,10 @@ EXPORT_SYMBOL_GPL(__online_page_free);
 static void generic_online_page(struct page *page, unsigned int order)
 {
 	__free_pages_core(page, order);
-	totalram_pages_add(1UL << order);
+	totalram_pages += 1UL << order;
 #ifdef CONFIG_HIGHMEM
 	if (PageHighMem(page))
-		totalhigh_pages_add(1UL << order);
+		totalhigh_pages += 1UL << order;
 #endif
 }
 

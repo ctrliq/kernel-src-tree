@@ -268,15 +268,13 @@ struct kernfs_ops {
 	ssize_t (*write)(struct kernfs_open_file *of, char *buf, size_t bytes,
 			 loff_t off);
 
-	__poll_t (*poll)(struct kernfs_open_file *of,
-			 struct poll_table_struct *pt);
-
 	int (*mmap)(struct kernfs_open_file *of, struct vm_area_struct *vma);
 
 #ifdef CONFIG_DEBUG_LOCK_ALLOC
 	struct lock_class_key	lockdep_key;
 #endif
-	RH_KABI_RESERVE(1)
+	RH_KABI_USE(1, __poll_t (*poll)(struct kernfs_open_file *of,
+					struct poll_table_struct *pt))
 	RH_KABI_RESERVE(2)
 };
 
@@ -366,10 +364,10 @@ __poll_t kernfs_generic_poll(struct kernfs_open_file *of,
 			     struct poll_table_struct *pt);
 void kernfs_notify(struct kernfs_node *kn);
 
-int kernfs_security_xattr_get(struct kernfs_node *kn, const char *suffix,
-			      void *value, size_t size);
-int kernfs_security_xattr_set(struct kernfs_node *kn, const char *suffix,
-			      void *value, size_t size, int flags);
+int kernfs_xattr_get(struct kernfs_node *kn, const char *name,
+		     void *value, size_t size);
+int kernfs_xattr_set(struct kernfs_node *kn, const char *name,
+		     const void *value, size_t size, int flags);
 
 const void *kernfs_super_ns(struct super_block *sb);
 struct dentry *kernfs_mount_ns(struct file_system_type *fs_type, int flags,
@@ -475,14 +473,12 @@ static inline int kernfs_setattr(struct kernfs_node *kn,
 
 static inline void kernfs_notify(struct kernfs_node *kn) { }
 
-static inline int kernfs_security_xattr_get(struct kernfs_node *kn,
-					    const char *suffix, void *value,
-					    size_t size)
+static inline int kernfs_xattr_get(struct kernfs_node *kn, const char *name,
+				   void *value, size_t size)
 { return -ENOSYS; }
 
-static inline int kernfs_security_xattr_set(struct kernfs_node *kn,
-					    const char *suffix, void *value,
-					    size_t size, int flags)
+static inline int kernfs_xattr_set(struct kernfs_node *kn, const char *name,
+				   const void *value, size_t size, int flags)
 { return -ENOSYS; }
 
 static inline const void *kernfs_super_ns(struct super_block *sb)

@@ -211,7 +211,7 @@ static int ipv4_fwd_update_priority(struct ctl_table *table, int write,
 	int ret;
 
 	net = container_of(table->data, struct net,
-			   ipv4.sysctl_ip_fwd_update_priority);
+			   ipv4_sysctl_ip_fwd_update_priority);
 	ret = proc_dointvec_minmax(table, write, buffer, lenp, ppos);
 	if (write && ret == 0)
 		call_netevent_notifiers(NETEVENT_IPV4_FWD_UPDATE_PRIORITY_UPDATE,
@@ -684,7 +684,7 @@ static struct ctl_table ipv4_net_table[] = {
 	},
 	{
 		.procname	= "ip_forward_update_priority",
-		.data		= &init_net.ipv4.sysctl_ip_fwd_update_priority,
+		.data		= &init_net.ipv4_sysctl_ip_fwd_update_priority,
 		.maxlen		= sizeof(int),
 		.mode		= 0644,
 		.proc_handler   = ipv4_fwd_update_priority,
@@ -739,7 +739,7 @@ static struct ctl_table ipv4_net_table[] = {
 	},
 	{
 		.procname	= "tcp_min_snd_mss",
-		.data		= &init_net.ipv4.sysctl_tcp_min_snd_mss,
+		.data		= &init_net.ipv4_sysctl_tcp_min_snd_mss,
 		.maxlen		= sizeof(int),
 		.mode		= 0644,
 		.proc_handler	= proc_dointvec_minmax,

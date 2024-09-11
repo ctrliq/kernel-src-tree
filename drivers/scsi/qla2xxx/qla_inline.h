@@ -202,6 +202,12 @@ qla2x00_reset_active(scsi_qla_host_t *vha)
 	    test_bit(ABORT_ISP_ACTIVE, &vha->dpc_flags);
 }
 
+static inline int
+qla2x00_chip_is_down(scsi_qla_host_t *vha)
+{
+	return (qla2x00_reset_active(vha) || !vha->hw->flags.fw_started);
+}
+
 static inline srb_t *
 qla2xxx_get_qpair_sp(scsi_qla_host_t *vha, struct qla_qpair *qpair,
     fc_port_t *fcport, gfp_t flag)
@@ -274,11 +280,8 @@ qla2x00_init_timer(srb_t *sp, unsigned long tmo)
 	timer_setup(&sp->u.iocb_cmd.timer, qla2x00_sp_timeout, 0);
 	sp->u.iocb_cmd.timer.expires = jiffies + tmo * HZ;
 	sp->free = qla2x00_sp_free;
-	init_completion(&sp->comp);
 	if (IS_QLAFX00(sp->vha->hw) && (sp->type == SRB_FXIOCB_DCMD))
 		init_completion(&sp->u.iocb_cmd.u.fxiocb.fxiocb_comp);
-	if (sp->type == SRB_ELS_DCMD)
-		init_completion(&sp->u.iocb_cmd.u.els_logo.comp);
 	add_timer(&sp->u.iocb_cmd.timer);
 }
 
@@ -314,13 +317,13 @@ static inline bool
 qla_is_exch_offld_enabled(struct scsi_qla_host *vha)
 {
 	if (qla_ini_mode_enabled(vha) &&
-	    (ql2xiniexchg > FW_DEF_EXCHANGES_CNT))
+	    (vha->ql2xiniexchg > FW_DEF_EXCHANGES_CNT))
 		return true;
 	else if (qla_tgt_mode_enabled(vha) &&
-	    (ql2xexchoffld > FW_DEF_EXCHANGES_CNT))
+	    (vha->ql2xexchoffld > FW_DEF_EXCHANGES_CNT))
 		return true;
 	else if (qla_dual_mode_enabled(vha) &&
-	    ((ql2xiniexchg + ql2xexchoffld) > FW_DEF_EXCHANGES_CNT))
+	    ((vha->ql2xiniexchg + vha->ql2xexchoffld) > FW_DEF_EXCHANGES_CNT))
 		return true;
 	else
 		return false;

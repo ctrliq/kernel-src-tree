@@ -17,7 +17,7 @@ TEST_CUSTOM_PROGS = $(OUTPUT)/urandom_read
 all: $(TEST_CUSTOM_PROGS)
 
 $(TEST_CUSTOM_PROGS): $(OUTPUT)/%: %.c
-	$(CC) -o $(TEST_CUSTOM_PROGS) -static $< -Wl,--build-id
+	$(CC) -o $(TEST_CUSTOM_PROGS) $< -Wl,--build-id
 
 # Order correspond to 'make run_tests' order
 TEST_GEN_PROGS = test_verifier test_tag test_maps test_lru_map test_lpm_map test_progs \
@@ -37,7 +37,9 @@ TEST_GEN_FILES = test_pkt_access.o test_xdp.o test_l4lb.o test_tcp_estats.o test
 	test_get_stack_rawtp.o test_sockmap_kern.o test_sockhash_kern.o \
 	test_lwt_seg6local.o sendmsg4_prog.o sendmsg6_prog.o test_lirc_mode2_kern.o \
 	get_cgroup_id_kern.o socket_cookie_prog.o test_select_reuseport_kern.o \
-	test_skb_cgroup_id_kern.o bpf_flow.o netcnt_prog.o test_sk_lookup_kern.o
+	test_skb_cgroup_id_kern.o bpf_flow.o netcnt_prog.o \
+	test_sk_lookup_kern.o test_xdp_vlan.o test_queue_map.o test_stack_map.o \
+	xdp_dummy.o test_map_in_map.o
 
 # Order correspond to 'make run_tests' order
 TEST_PROGS := test_kmod.sh \
@@ -49,7 +51,9 @@ TEST_PROGS := test_kmod.sh \
 	test_tunnel.sh \
 	test_lwt_seg6local.sh \
 	test_lirc_mode2.sh \
-	test_skb_cgroup_id.sh
+	test_skb_cgroup_id.sh \
+	test_flow_dissector.sh \
+	test_xdp_vlan.sh
 
 TEST_PROGS_EXTENDED := with_addr.sh \
 	with_tunnels.sh \
@@ -57,7 +61,8 @@ TEST_PROGS_EXTENDED := with_addr.sh \
 	tcp_server.py
 
 # Compile but not part of 'make run_tests'
-TEST_GEN_PROGS_EXTENDED = test_libbpf_open test_sock_addr test_skb_cgroup_id_user
+TEST_GEN_PROGS_EXTENDED = test_libbpf_open test_sock_addr test_skb_cgroup_id_user \
+	flow_dissector_load test_flow_dissector
 
 include ../lib.mk
 
@@ -118,6 +123,9 @@ CLANG_FLAGS = -I. -I./include/uapi -I../../../include/uapi \
 
 $(OUTPUT)/test_l4lb_noinline.o: CLANG_FLAGS += -fno-inline
 $(OUTPUT)/test_xdp_noinline.o: CLANG_FLAGS += -fno-inline
+
+$(OUTPUT)/test_queue_map.o: test_queue_stack_map.h
+$(OUTPUT)/test_stack_map.o: test_queue_stack_map.h
 
 BTF_LLC_PROBE := $(shell $(LLC) -march=bpf -mattr=help 2>&1 | grep dwarfris)
 BTF_PAHOLE_PROBE := $(shell $(BTF_PAHOLE) --help 2>&1 | grep BTF)

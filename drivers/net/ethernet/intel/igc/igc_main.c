@@ -4015,6 +4015,8 @@ static int igc_probe(struct pci_dev *pdev,
 	const struct igc_info *ei = igc_info_tbl[ent->driver_data];
 	int err;
 
+	mark_tech_preview(DRV_SUMMARY, THIS_MODULE);
+
 	err = pci_enable_device_mem(pdev);
 	if (err)
 		return err;

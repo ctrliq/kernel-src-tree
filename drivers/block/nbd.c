@@ -921,6 +921,24 @@ static blk_status_t nbd_queue_rq(struct blk_mq_hw_ctx *hctx,
 	return ret;
 }
 
+static int nbd_check_sock_type(struct nbd_device *nbd, struct socket *sock)
+{
+	struct sockaddr addr;
+	int err;
+
+	err = kernel_getsockname(sock, &addr);
+	if (err < 0)
+		return err;
+
+	if (addr.sa_family != AF_UNIX) {
+		dev_err(disk_to_dev(nbd->disk),
+			"Only AF_UNIX sockets are supported.\n");
+		return -EINVAL;
+	}
+
+	return 0;
+}
+
 static int nbd_add_socket(struct nbd_device *nbd, unsigned long arg,
 			  bool netlink)
 {
@@ -933,6 +951,12 @@ static int nbd_add_socket(struct nbd_device *nbd, unsigned long arg,
 	sock = sockfd_lookup(arg, &err);
 	if (!sock)
 		return err;
+
+	err = nbd_check_sock_type(nbd, sock);
+	if (err) {
+		sockfd_put(sock);
+		return err;
+	}
 
 	if (!netlink && !nbd->task_setup &&
 	    !test_bit(NBD_BOUND, &config->runtime_flags))

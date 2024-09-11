@@ -7,10 +7,15 @@
 enum pid_type
 {
 	PIDTYPE_PID,
-	PIDTYPE_TGID,
 	PIDTYPE_PGID,
 	PIDTYPE_SID,
+#ifndef __GENKSYMS__
+	PIDTYPE_TGID,
+#endif
 	PIDTYPE_MAX,
+#ifdef __GENKSYMS__
+	__PIDTYPE_TGID
+#endif
 };
 
 /*
@@ -65,6 +70,12 @@ struct pid
 };
 
 extern struct pid init_struct_pid;
+
+struct pid_link
+{
+	struct hlist_node node;
+	struct pid *pid;
+};
 
 static inline struct pid *get_pid(struct pid *pid)
 {

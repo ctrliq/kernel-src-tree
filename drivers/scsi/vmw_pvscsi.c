@@ -327,17 +327,18 @@ static void ll_device_reset(const struct pvscsi_adapter *adapter, u32 target)
 }
 
 static void pvscsi_create_sg(struct pvscsi_ctx *ctx,
-			     struct scatterlist *sg, unsigned count)
+			     struct scsi_cmnd *cmd, unsigned count)
 {
 	unsigned i;
 	struct PVSCSISGElement *sge;
+	struct scatterlist *s;
 
 	BUG_ON(count > PVSCSI_MAX_NUM_SG_ENTRIES_PER_SEGMENT);
 
 	sge = &ctx->sgl->sge[0];
-	for (i = 0; i < count; i++, sg++) {
-		sge[i].addr   = sg_dma_address(sg);
-		sge[i].length = sg_dma_len(sg);
+	scsi_for_each_sg(cmd, s, count, i) {
+		sge[i].addr   = sg_dma_address(s);
+		sge[i].length = sg_dma_len(s);
 		sge[i].flags  = 0;
 	}
 }
@@ -369,7 +370,7 @@ static int pvscsi_map_buffers(struct pvscsi_adapter *adapter,
 				    "vmw_pvscsi: Failed to map cmd sglist for DMA.\n");
 			return -ENOMEM;
 		} else if (segs > 1) {
-			pvscsi_create_sg(ctx, sg, segs);
+			pvscsi_create_sg(ctx, cmd, segs);
 
 			e->flags |= PVSCSI_FLAG_CMD_WITH_SG_LIST;
 			ctx->sglPA = pci_map_single(adapter->dev, ctx->sgl,

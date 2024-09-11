@@ -724,7 +724,7 @@ static struct blk_mq_tag_set *nvme_rdma_alloc_tagset(struct nvme_ctrl *nctrl,
 		set->ops = &nvme_rdma_admin_mq_ops;
 		set->queue_depth = NVME_AQ_MQ_TAG_DEPTH;
 		set->reserved_tags = 2; /* connect + keep-alive */
-		set->numa_node = NUMA_NO_NODE;
+		set->numa_node = nctrl->numa_node;
 		set->cmd_size = sizeof(struct nvme_rdma_request) +
 			SG_CHUNK_SIZE * sizeof(struct scatterlist);
 		set->driver_data = ctrl;
@@ -737,7 +737,7 @@ static struct blk_mq_tag_set *nvme_rdma_alloc_tagset(struct nvme_ctrl *nctrl,
 		set->ops = &nvme_rdma_mq_ops;
 		set->queue_depth = nctrl->sqsize + 1;
 		set->reserved_tags = 1; /* fabric connect */
-		set->numa_node = NUMA_NO_NODE;
+		set->numa_node = nctrl->numa_node;
 		set->flags = BLK_MQ_F_SHOULD_MERGE;
 		set->cmd_size = sizeof(struct nvme_rdma_request) +
 			SG_CHUNK_SIZE * sizeof(struct scatterlist);
@@ -779,6 +779,7 @@ static int nvme_rdma_configure_admin_queue(struct nvme_rdma_ctrl *ctrl,
 		return error;
 
 	ctrl->device = ctrl->queues[0].device;
+	ctrl->ctrl.numa_node = dev_to_node(ctrl->device->dev->dma_device);
 
 	ctrl->max_fr_pages = nvme_rdma_get_max_fr_pages(ctrl->device->dev);
 
@@ -1149,7 +1150,7 @@ static void nvme_rdma_unmap_data(struct nvme_rdma_queue *queue,
 				    WRITE ? DMA_TO_DEVICE : DMA_FROM_DEVICE);
 
 	nvme_cleanup_cmd(rq);
-	sg_free_table_chained(&req->sg_table, true);
+	sg_free_table_chained(&req->sg_table, SG_CHUNK_SIZE);
 }
 
 static int nvme_rdma_set_sg_null(struct nvme_command *c)
@@ -1264,7 +1265,8 @@ static int nvme_rdma_map_data(struct nvme_rdma_queue *queue,
 
 	req->sg_table.sgl = req->first_sgl;
 	ret = sg_alloc_table_chained(&req->sg_table,
-			blk_rq_nr_phys_segments(rq), req->sg_table.sgl);
+			blk_rq_nr_phys_segments(rq), req->sg_table.sgl,
+			SG_CHUNK_SIZE);
 	if (ret)
 		return -ENOMEM;
 
@@ -1304,7 +1306,7 @@ out_unmap_sg:
 			req->nents, rq_data_dir(rq) ==
 			WRITE ? DMA_TO_DEVICE : DMA_FROM_DEVICE);
 out_free_table:
-	sg_free_table_chained(&req->sg_table, true);
+	sg_free_table_chained(&req->sg_table, SG_CHUNK_SIZE);
 	return ret;
 }
 

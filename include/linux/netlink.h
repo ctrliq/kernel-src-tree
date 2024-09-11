@@ -186,11 +186,13 @@ struct netlink_callback {
 	void			*data;
 	/* the module that dump function belong to */
 	struct module		*module;
-	struct netlink_ext_ack	*extack;
 	u16			family;
 	u16			min_dump_alloc;
 	unsigned int		prev_seq, seq;
 	long			args[6];
+	RH_KABI_EXTEND(struct netlink_ext_ack *extack)
+	RH_KABI_EXTEND(bool strict_check)
+	RH_KABI_EXTEND(u16 answer_flags)
 };
 
 struct netlink_notify {

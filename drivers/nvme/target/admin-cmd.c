@@ -75,6 +75,7 @@ static u16 nvmet_get_smart_log_nsid(struct nvmet_req *req,
 	if (!ns) {
 		pr_err("Could not find namespace id : %d\n",
 				le32_to_cpu(req->cmd->get_log_page.nsid));
+		req->error_loc = offsetof(struct nvme_rw_command, nsid);
 		return NVME_SC_INVALID_NS;
 	}
 
@@ -210,8 +211,76 @@ static void nvmet_execute_get_log_changed_ns(struct nvmet_req *req)
 	if (!status)
 		status = nvmet_zero_sgl(req, len, req->data_len - len);
 	ctrl->nr_changed_ns = 0;
-	clear_bit(NVME_AEN_CFG_NS_ATTR, &ctrl->aen_masked);
+	nvmet_clear_aen_bit(req, NVME_AEN_BIT_NS_ATTR);
 	mutex_unlock(&ctrl->lock);
+out:
+	nvmet_req_complete(req, status);
+}
+
+static u32 nvmet_format_ana_group(struct nvmet_req *req, u32 grpid,
+		struct nvme_ana_group_desc *desc)
+{
+	struct nvmet_ctrl *ctrl = req->sq->ctrl;
+	struct nvmet_ns *ns;
+	u32 count = 0;
+
+	if (!(req->cmd->get_log_page.lsp & NVME_ANA_LOG_RGO)) {
+		rcu_read_lock();
+		list_for_each_entry_rcu(ns, &ctrl->subsys->namespaces, dev_link)
+			if (ns->anagrpid == grpid)
+				desc->nsids[count++] = cpu_to_le32(ns->nsid);
+		rcu_read_unlock();
+	}
+
+	desc->grpid = cpu_to_le32(grpid);
+	desc->nnsids = cpu_to_le32(count);
+	desc->chgcnt = cpu_to_le64(nvmet_ana_chgcnt);
+	desc->state = req->port->ana_state[grpid];
+	memset(desc->rsvd17, 0, sizeof(desc->rsvd17));
+	return sizeof(struct nvme_ana_group_desc) + count * sizeof(__le32);
+}
+
+static void nvmet_execute_get_log_page_ana(struct nvmet_req *req)
+{
+	struct nvme_ana_rsp_hdr hdr = { 0, };
+	struct nvme_ana_group_desc *desc;
+	size_t offset = sizeof(struct nvme_ana_rsp_hdr); /* start beyond hdr */
+	size_t len;
+	u32 grpid;
+	u16 ngrps = 0;
+	u16 status;
+
+	status = NVME_SC_INTERNAL;
+	desc = kmalloc(sizeof(struct nvme_ana_group_desc) +
+			NVMET_MAX_NAMESPACES * sizeof(__le32), GFP_KERNEL);
+	if (!desc)
+		goto out;
+
+	down_read(&nvmet_ana_sem);
+	for (grpid = 1; grpid <= NVMET_MAX_ANAGRPS; grpid++) {
+		if (!nvmet_ana_group_enabled[grpid])
+			continue;
+		len = nvmet_format_ana_group(req, grpid, desc);
+		status = nvmet_copy_to_sgl(req, offset, desc, len);
+		if (status)
+			break;
+		offset += len;
+		ngrps++;
+	}
+	for ( ; grpid <= NVMET_MAX_ANAGRPS; grpid++) {
+		if (nvmet_ana_group_enabled[grpid])
+			ngrps++;
+	}
+
+	hdr.chgcnt = cpu_to_le64(nvmet_ana_chgcnt);
+	hdr.ngrps = cpu_to_le16(ngrps);
+	nvmet_clear_aen_bit(req, NVME_AEN_BIT_ANA_CHANGE);
+	up_read(&nvmet_ana_sem);
+
+	kfree(desc);
+
+	/* copy the header last once we know the number of groups */
+	status = nvmet_copy_to_sgl(req, 0, &hdr, sizeof(hdr));
 out:
 	nvmet_req_complete(req, status);
 }
@@ -247,8 +316,8 @@ static void nvmet_execute_identify_ctrl(struct nvmet_req *req)
 	 * the safest is to leave it as zeroes.
 	 */
 
-	/* we support multiple ports and multiples hosts: */
-	id->cmic = (1 << 0) | (1 << 1);
+	/* we support multiple ports, multiples hosts and ANA: */
+	id->cmic = (1 << 0) | (1 << 1) | (1 << 3);
 
 	/* no limit on data transfer sizes for now */
 	id->mdts = 0;
@@ -287,6 +356,7 @@ static void nvmet_execute_identify_ctrl(struct nvmet_req *req)
 	id->maxcmd = cpu_to_le16(NVMET_MAX_CMD);
 
 	id->nn = cpu_to_le32(ctrl->subsys->max_nsid);
+	id->mnan = cpu_to_le32(NVMET_MAX_NAMESPACES);
 	id->oncs = cpu_to_le16(NVME_CTRL_ONCS_DSM |
 			NVME_CTRL_ONCS_WRITE_ZEROES);
 
@@ -316,6 +386,11 @@ static void nvmet_execute_identify_ctrl(struct nvmet_req *req)
 
 	id->msdbd = ctrl->ops->msdbd;
 
+	id->anacap = (1 << 0) | (1 << 1) | (1 << 2) | (1 << 3) | (1 << 4);
+	id->anatt = 10; /* random value */
+	id->anagrpmax = cpu_to_le32(NVMET_MAX_ANAGRPS);
+	id->nanagrpid = cpu_to_le32(NVMET_MAX_ANAGRPS);
+
 	/*
 	 * Meh, we don't really support any power state.  Fake up the same
 	 * values that qemu does.
@@ -323,6 +398,8 @@ static void nvmet_execute_identify_ctrl(struct nvmet_req *req)
 	id->psd[0].max_power = cpu_to_le16(0x9c4);
 	id->psd[0].entry_lat = cpu_to_le32(0x10);
 	id->psd[0].exit_lat = cpu_to_le32(0x4);
+
+	id->nwpc = 1 << 0; /* write protect and no write protect */
 
 	status = nvmet_copy_to_sgl(req, 0, id, sizeof(*id));
 
@@ -338,6 +415,7 @@ static void nvmet_execute_identify_ns(struct nvmet_req *req)
 	u16 status = 0;
 
 	if (le32_to_cpu(req->cmd->identify.nsid) == NVME_NSID_ALL) {
+		req->error_loc = offsetof(struct nvme_identify, nsid);
 		status = NVME_SC_INVALID_NS | NVME_SC_DNR;
 		goto out;
 	}
@@ -357,8 +435,15 @@ static void nvmet_execute_identify_ns(struct nvmet_req *req)
 	 * nuse = ncap = nsze isn't always true, but we have no way to find
 	 * that out from the underlying device.
 	 */
-	id->ncap = id->nuse = id->nsze =
-		cpu_to_le64(ns->size >> ns->blksize_shift);
+	id->ncap = id->nsze = cpu_to_le64(ns->size >> ns->blksize_shift);
+	switch (req->port->ana_state[ns->anagrpid]) {
+	case NVME_ANA_INACCESSIBLE:
+	case NVME_ANA_PERSISTENT_LOSS:
+		break;
+	default:
+		id->nuse = id->nsze;
+		break;
+        }
 
 	/*
 	 * We just provide a single LBA format that matches what the
@@ -372,11 +457,14 @@ static void nvmet_execute_identify_ns(struct nvmet_req *req)
 	 * controllers, but also with any other user of the block device.
 	 */
 	id->nmic = (1 << 0);
+	id->anagrpid = cpu_to_le32(ns->anagrpid);
 
 	memcpy(&id->nguid, &ns->nguid, sizeof(id->nguid));
 
 	id->lbaf[0].ds = ns->blksize_shift;
 
+	if (ns->readonly)
+		id->nsattr |= (1 << 0);
 	nvmet_put_namespace(ns);
 done:
 	status = nvmet_copy_to_sgl(req, 0, id, sizeof(*id));
@@ -448,6 +536,7 @@ static void nvmet_execute_identify_desclist(struct nvmet_req *req)
 
 	ns = nvmet_find_namespace(req->sq->ctrl, req->cmd->identify.nsid);
 	if (!ns) {
+		req->error_loc = offsetof(struct nvme_identify, nsid);
 		status = NVME_SC_INVALID_NS | NVME_SC_DNR;
 		goto out;
 	}
@@ -489,11 +578,84 @@ static void nvmet_execute_abort(struct nvmet_req *req)
 	nvmet_req_complete(req, 0);
 }
 
+static u16 nvmet_write_protect_flush_sync(struct nvmet_req *req)
+{
+	u16 status;
+
+	if (req->ns->file)
+		status = nvmet_file_flush(req);
+	else
+		status = nvmet_bdev_flush(req);
+
+	if (status)
+		pr_err("write protect flush failed nsid: %u\n", req->ns->nsid);
+	return status;
+}
+
+static u16 nvmet_set_feat_write_protect(struct nvmet_req *req)
+{
+	u32 write_protect = le32_to_cpu(req->cmd->common.cdw11);
+	struct nvmet_subsys *subsys = req->sq->ctrl->subsys;
+	u16 status = NVME_SC_FEATURE_NOT_CHANGEABLE;
+
+	req->ns = nvmet_find_namespace(req->sq->ctrl, req->cmd->rw.nsid);
+	if (unlikely(!req->ns)) {
+		req->error_loc = offsetof(struct nvme_common_command, nsid);
+		return status;
+	}
+
+	mutex_lock(&subsys->lock);
+	switch (write_protect) {
+	case NVME_NS_WRITE_PROTECT:
+		req->ns->readonly = true;
+		status = nvmet_write_protect_flush_sync(req);
+		if (status)
+			req->ns->readonly = false;
+		break;
+	case NVME_NS_NO_WRITE_PROTECT:
+		req->ns->readonly = false;
+		status = 0;
+		break;
+	default:
+		break;
+	}
+
+	if (!status)
+		nvmet_ns_changed(subsys, req->ns->nsid);
+	mutex_unlock(&subsys->lock);
+	return status;
+}
+
+u16 nvmet_set_feat_kato(struct nvmet_req *req)
+{
+	u32 val32 = le32_to_cpu(req->cmd->common.cdw11);
+
+	req->sq->ctrl->kato = DIV_ROUND_UP(val32, 1000);
+
+	nvmet_set_result(req, req->sq->ctrl->kato);
+
+	return 0;
+}
+
+u16 nvmet_set_feat_async_event(struct nvmet_req *req, u32 mask)
+{
+	u32 val32 = le32_to_cpu(req->cmd->common.cdw11);
+
+	if (val32 & ~mask) {
+		req->error_loc = offsetof(struct nvme_common_command, cdw11);
+		return NVME_SC_INVALID_FIELD | NVME_SC_DNR;
+	}
+
+	WRITE_ONCE(req->sq->ctrl->aen_enabled, val32);
+	nvmet_set_result(req, val32);
+
+	return 0;
+}
+
 static void nvmet_execute_set_features(struct nvmet_req *req)
 {
 	struct nvmet_subsys *subsys = req->sq->ctrl->subsys;
-	u32 cdw10 = le32_to_cpu(req->cmd->common.cdw10[0]);
-	u32 val32;
+	u32 cdw10 = le32_to_cpu(req->cmd->common.cdw10);
 	u16 status = 0;
 
 	switch (cdw10 & 0xff) {
@@ -502,24 +664,19 @@ static void nvmet_execute_set_features(struct nvmet_req *req)
 			(subsys->max_qid - 1) | ((subsys->max_qid - 1) << 16));
 		break;
 	case NVME_FEAT_KATO:
-		val32 = le32_to_cpu(req->cmd->common.cdw10[1]);
-		req->sq->ctrl->kato = DIV_ROUND_UP(val32, 1000);
-		nvmet_set_result(req, req->sq->ctrl->kato);
+		status = nvmet_set_feat_kato(req);
 		break;
 	case NVME_FEAT_ASYNC_EVENT:
-		val32 = le32_to_cpu(req->cmd->common.cdw10[1]);
-		if (val32 & ~NVMET_AEN_CFG_ALL) {
-			status = NVME_SC_INVALID_FIELD | NVME_SC_DNR;
-			break;
-		}
-
-		WRITE_ONCE(req->sq->ctrl->aen_enabled, val32);
-		nvmet_set_result(req, val32);
+		status = nvmet_set_feat_async_event(req, NVMET_AEN_CFG_ALL);
 		break;
 	case NVME_FEAT_HOST_ID:
 		status = NVME_SC_CMD_SEQ_ERROR | NVME_SC_DNR;
 		break;
+	case NVME_FEAT_WRITE_PROTECT:
+		status = nvmet_set_feat_write_protect(req);
+		break;
 	default:
+		req->error_loc = offsetof(struct nvme_common_command, cdw10);
 		status = NVME_SC_INVALID_FIELD | NVME_SC_DNR;
 		break;
 	}
@@ -527,10 +684,41 @@ static void nvmet_execute_set_features(struct nvmet_req *req)
 	nvmet_req_complete(req, status);
 }
 
+static u16 nvmet_get_feat_write_protect(struct nvmet_req *req)
+{
+	struct nvmet_subsys *subsys = req->sq->ctrl->subsys;
+	u32 result;
+
+	req->ns = nvmet_find_namespace(req->sq->ctrl, req->cmd->common.nsid);
+	if (!req->ns)  {
+		req->error_loc = offsetof(struct nvme_common_command, nsid);
+		return NVME_SC_INVALID_NS | NVME_SC_DNR;
+	}
+	mutex_lock(&subsys->lock);
+	if (req->ns->readonly == true)
+		result = NVME_NS_WRITE_PROTECT;
+	else
+		result = NVME_NS_NO_WRITE_PROTECT;
+	nvmet_set_result(req, result);
+	mutex_unlock(&subsys->lock);
+
+	return 0;
+}
+
+void nvmet_get_feat_kato(struct nvmet_req *req)
+{
+	nvmet_set_result(req, req->sq->ctrl->kato * 1000);
+}
+
+void nvmet_get_feat_async_event(struct nvmet_req *req)
+{
+	nvmet_set_result(req, READ_ONCE(req->sq->ctrl->aen_enabled));
+}
+
 static void nvmet_execute_get_features(struct nvmet_req *req)
 {
 	struct nvmet_subsys *subsys = req->sq->ctrl->subsys;
-	u32 cdw10 = le32_to_cpu(req->cmd->common.cdw10[0]);
+	u32 cdw10 = le32_to_cpu(req->cmd->common.cdw10);
 	u16 status = 0;
 
 	switch (cdw10 & 0xff) {
@@ -556,7 +744,7 @@ static void nvmet_execute_get_features(struct nvmet_req *req)
 		break;
 #endif
 	case NVME_FEAT_ASYNC_EVENT:
-		nvmet_set_result(req, READ_ONCE(req->sq->ctrl->aen_enabled));
+		nvmet_get_feat_async_event(req);
 		break;
 	case NVME_FEAT_VOLATILE_WC:
 		nvmet_set_result(req, 1);
@@ -566,11 +754,13 @@ static void nvmet_execute_get_features(struct nvmet_req *req)
 			(subsys->max_qid-1) | ((subsys->max_qid-1) << 16));
 		break;
 	case NVME_FEAT_KATO:
-		nvmet_set_result(req, req->sq->ctrl->kato * 1000);
+		nvmet_get_feat_kato(req);
 		break;
 	case NVME_FEAT_HOST_ID:
 		/* need 128-bit host identifier flag */
-		if (!(req->cmd->common.cdw10[1] & cpu_to_le32(1 << 0))) {
+		if (!(req->cmd->common.cdw11 & cpu_to_le32(1 << 0))) {
+			req->error_loc =
+				offsetof(struct nvme_common_command, cdw11);
 			status = NVME_SC_INVALID_FIELD | NVME_SC_DNR;
 			break;
 		}
@@ -578,7 +768,12 @@ static void nvmet_execute_get_features(struct nvmet_req *req)
 		status = nvmet_copy_to_sgl(req, 0, &req->sq->ctrl->hostid,
 				sizeof(req->sq->ctrl->hostid));
 		break;
+	case NVME_FEAT_WRITE_PROTECT:
+		status = nvmet_get_feat_write_protect(req);
+		break;
 	default:
+		req->error_loc =
+			offsetof(struct nvme_common_command, cdw10);
 		status = NVME_SC_INVALID_FIELD | NVME_SC_DNR;
 		break;
 	}
@@ -586,7 +781,7 @@ static void nvmet_execute_get_features(struct nvmet_req *req)
 	nvmet_req_complete(req, status);
 }
 
-static void nvmet_execute_async_event(struct nvmet_req *req)
+void nvmet_execute_async_event(struct nvmet_req *req)
 {
 	struct nvmet_ctrl *ctrl = req->sq->ctrl;
 
@@ -648,6 +843,9 @@ u16 nvmet_parse_admin_cmd(struct nvmet_req *req)
 		case NVME_LOG_CMD_EFFECTS:
 			req->execute = nvmet_execute_get_log_cmd_effects_ns;
 			return 0;
+		case NVME_LOG_ANA:
+			req->execute = nvmet_execute_get_log_page_ana;
+			return 0;
 		}
 		break;
 	case nvme_admin_identify:
@@ -691,5 +889,6 @@ u16 nvmet_parse_admin_cmd(struct nvmet_req *req)
 
 	pr_err("unhandled cmd %d on qid %d\n", cmd->common.opcode,
 	       req->sq->qid);
+	req->error_loc = offsetof(struct nvme_common_command, opcode);
 	return NVME_SC_INVALID_OPCODE | NVME_SC_DNR;
 }

@@ -1073,10 +1073,6 @@ enum qede_probe_mode {
 	QEDE_PROBE_RECOVERY,
 };
 
-#define QEDE_RDMA_PROBE_MODE(mode) \
-	((mode) == QEDE_PROBE_NORMAL ? QEDE_RDMA_PROBE_NORMAL \
-				     : QEDE_RDMA_PROBE_RECOVERY)
-
 static int __qede_probe(struct pci_dev *pdev, u32 dp_module, u8 dp_level,
 			bool is_vf, enum qede_probe_mode mode)
 {
@@ -1144,7 +1140,7 @@ static int __qede_probe(struct pci_dev *pdev, u32 dp_module, u8 dp_level,
 
 	qede_init_ndev(edev);
 
-	rc = qede_rdma_dev_add(edev, QEDE_RDMA_PROBE_MODE(mode));
+	rc = qede_rdma_dev_add(edev, (mode == QEDE_PROBE_RECOVERY));
 	if (rc)
 		goto err3;
 
@@ -1183,7 +1179,7 @@ static int __qede_probe(struct pci_dev *pdev, u32 dp_module, u8 dp_level,
 	return 0;
 
 err4:
-	qede_rdma_dev_remove(edev, QEDE_RDMA_PROBE_MODE(mode));
+	qede_rdma_dev_remove(edev, (mode == QEDE_PROBE_RECOVERY));
 err3:
 	free_netdev(edev->ndev);
 err2:
@@ -1222,10 +1218,6 @@ enum qede_remove_mode {
 	QEDE_REMOVE_RECOVERY,
 };
 
-#define QEDE_RDMA_REMOVE_MODE(mode) \
-	((mode) == QEDE_REMOVE_NORMAL ? QEDE_RDMA_REMOVE_NORMAL \
-			      : QEDE_RDMA_REMOVE_RECOVERY)
-
 static void __qede_remove(struct pci_dev *pdev, enum qede_remove_mode mode)
 {
 	struct net_device *ndev = pci_get_drvdata(pdev);
@@ -1234,7 +1226,7 @@ static void __qede_remove(struct pci_dev *pdev, enum qede_remove_mode mode)
 
 	DP_INFO(edev, "Starting qede_remove\n");
 
-	qede_rdma_dev_remove(edev, QEDE_RDMA_REMOVE_MODE(mode));
+	qede_rdma_dev_remove(edev, (mode == QEDE_REMOVE_RECOVERY));
 
 	if (mode != QEDE_REMOVE_RECOVERY) {
 		unregister_netdev(ndev);

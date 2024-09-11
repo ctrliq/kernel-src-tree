@@ -78,7 +78,7 @@ struct mem_cgroup_reclaim_cookie {
 
 struct mem_cgroup_id {
 	int id;
-	refcount_t ref;
+	RH_KABI_REPLACE(atomic_t ref, refcount_t ref)
 };
 
 /*
@@ -133,9 +133,6 @@ struct mem_cgroup_per_node {
 
 	struct mem_cgroup_reclaim_iter	iter[DEF_PRIORITY + 1];
 
-#ifdef CONFIG_MEMCG_KMEM
-	struct memcg_shrinker_map __rcu	*shrinker_map;
-#endif
 	struct rb_node		tree_node;	/* RB tree node */
 	unsigned long		usage_in_excess;/* Set to the value by which */
 						/* the soft limit is exceeded*/
@@ -145,6 +142,13 @@ struct mem_cgroup_per_node {
 
 	struct mem_cgroup	*memcg;		/* Back pointer, we cannot */
 						/* use container_of	   */
+	/*
+	 * RHEL8: The mem_cgroup_per_node is dynamically allocated at
+	 * boot time and so is perfectly fine to be extended in size.
+	 */
+#ifdef CONFIG_MEMCG_KMEM
+	RH_KABI_EXTEND(struct memcg_shrinker_map __rcu	*shrinker_map)
+#endif
 };
 
 struct mem_cgroup_threshold {
@@ -225,13 +229,15 @@ struct mem_cgroup {
 	 */
 	bool use_hierarchy;
 
+	/* protected by memcg_oom_lock */
+	bool		oom_lock;
+
 	/*
 	 * Should the OOM killer kill all belonging tasks, had it kill one?
 	 */
-	bool oom_group;
+	RH_KABI_FILL_HOLE(bool oom_group)
 
 	/* protected by memcg_oom_lock */
-	bool		oom_lock;
 	int		under_oom;
 
 	int	swappiness;

@@ -44,6 +44,7 @@
 #define MLX5E_DECLARE_STAT(type, fld) #fld, offsetof(type, fld)
 #define MLX5E_DECLARE_RX_STAT(type, fld) "rx%d_"#fld, offsetof(type, fld)
 #define MLX5E_DECLARE_TX_STAT(type, fld) "tx%d_"#fld, offsetof(type, fld)
+#define MLX5E_DECLARE_XDPSQ_STAT(type, fld) "tx%d_xdp_"#fld, offsetof(type, fld)
 #define MLX5E_DECLARE_RQ_XDPSQ_STAT(type, fld) "rx%d_xdp_tx_"#fld, offsetof(type, fld)
 #define MLX5E_DECLARE_CH_STAT(type, fld) "ch%d_"#fld, offsetof(type, fld)
 
@@ -87,6 +88,10 @@ struct mlx5e_sw_stats {
 	u64 tx_cqes;
 	u64 tx_queue_wake;
 	u64 tx_cqe_err;
+	u64 tx_xdp_xmit;
+	u64 tx_xdp_full;
+	u64 tx_xdp_err;
+	u64 tx_xdp_cqes;
 	u64 rx_wqe_err;
 	u64 rx_mpwqe_filler_cqes;
 	u64 rx_mpwqe_filler_strides;
@@ -273,5 +278,6 @@ extern const struct mlx5e_stats_grp mlx5e_stats_grps[];
 extern const int mlx5e_num_stats_grps;
 
 void mlx5e_grp_sw_update_stats(struct mlx5e_priv *priv);
+void mlx5e_grp_802_3_update_stats(struct mlx5e_priv *priv);
 
 #endif /* __MLX5_EN_STATS_H__ */

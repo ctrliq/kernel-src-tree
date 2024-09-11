@@ -62,7 +62,7 @@ struct ice_aqc_req_res {
 #define ICE_AQ_RES_NVM_WRITE_DFLT_TIMEOUT_MS	180000
 #define ICE_AQ_RES_CHNG_LOCK_DFLT_TIMEOUT_MS	1000
 #define ICE_AQ_RES_GLBL_LOCK_DFLT_TIMEOUT_MS	3000
-	/* For SDP: pin id of the SDP */
+	/* For SDP: pin ID of the SDP */
 	__le32 res_number;
 	/* Status is only used for ICE_AQC_RES_ID_GLBL_LOCK */
 	__le16 status;
@@ -747,6 +747,32 @@ struct ice_aqc_delete_elem {
 	__le32 teid[1];
 };
 
+/* Query Port ETS (indirect 0x040E)
+ *
+ * This indirect command is used to query port TC node configuration.
+ */
+struct ice_aqc_query_port_ets {
+	__le32 port_teid;
+	__le32 reserved;
+	__le32 addr_high;
+	__le32 addr_low;
+};
+
+struct ice_aqc_port_ets_elem {
+	u8 tc_valid_bits;
+	u8 reserved[3];
+	/* 3 bits for UP per TC 0-7, 4th byte reserved */
+	__le32 up2tc;
+	u8 tc_bw_share[8];
+	__le32 port_eir_prof_id;
+	__le32 port_cir_prof_id;
+	/* 3 bits per Node priority to TC 0-7, 4th byte reserved */
+	__le32 tc_node_prio;
+#define ICE_TC_NODE_PRIO_S	0x4
+	u8 reserved1[4];
+	__le32 tc_node_teid[8]; /* Used for response, reserved in command */
+};
+
 /* Query Scheduler Resource Allocation (indirect 0x0412)
  * This indirect command retrieves the scheduler resources allocated by
  * EMP Firmware to the given PF.
@@ -1024,7 +1050,7 @@ struct ice_aqc_get_link_status_data {
 	u8 ext_info;
 #define ICE_AQ_LINK_PHY_TEMP_ALARM	BIT(0)
 #define ICE_AQ_LINK_EXCESSIVE_ERRORS	BIT(1)	/* Excessive Link Errors */
-	/* Port TX Suspended */
+	/* Port Tx Suspended */
 #define ICE_AQ_LINK_TX_S		2
 #define ICE_AQ_LINK_TX_M		(0x03 << ICE_AQ_LINK_TX_S)
 #define ICE_AQ_LINK_TX_ACTIVE		0
@@ -1120,9 +1146,9 @@ struct ice_aqc_nvm {
 };
 
 /**
- * Send to PF command (indirect 0x0801) id is only used by PF
+ * Send to PF command (indirect 0x0801) ID is only used by PF
  *
- * Send to VF command (indirect 0x0802) id is only used by PF
+ * Send to VF command (indirect 0x0802) ID is only used by PF
  *
  */
 struct ice_aqc_pf_vf_msg {
@@ -1222,6 +1248,23 @@ struct ice_aqc_get_cee_dcb_cfg_resp {
 	u8 reserved[12];
 };
 
+/* Set Local LLDP MIB (indirect 0x0A08)
+ * Used to replace the local MIB of a given LLDP agent. e.g. DCBx
+ */
+struct ice_aqc_lldp_set_local_mib {
+	u8 type;
+#define SET_LOCAL_MIB_TYPE_DCBX_M		BIT(0)
+#define SET_LOCAL_MIB_TYPE_LOCAL_MIB		0
+#define SET_LOCAL_MIB_TYPE_CEE_M		BIT(1)
+#define SET_LOCAL_MIB_TYPE_CEE_WILLING		0
+#define SET_LOCAL_MIB_TYPE_CEE_NON_WILLING	SET_LOCAL_MIB_TYPE_CEE_M
+	u8 reserved0;
+	__le16 length;
+	u8 reserved1[4];
+	__le32 addr_high;
+	__le32 addr_low;
+};
+
 /* Stop/Start LLDP Agent (direct 0x0A09)
  * Used for stopping/starting specific LLDP agent. e.g. DCBx.
  * The same structure is used for the response, with the command field
@@ -1292,7 +1335,7 @@ struct ice_aqc_get_set_rss_lut {
 	__le32 addr_low;
 };
 
-/* Add TX LAN Queues (indirect 0x0C30) */
+/* Add Tx LAN Queues (indirect 0x0C30) */
 struct ice_aqc_add_txqs {
 	u8 num_qgrps;
 	u8 reserved[3];
@@ -1301,7 +1344,7 @@ struct ice_aqc_add_txqs {
 	__le32 addr_low;
 };
 
-/* This is the descriptor of each queue entry for the Add TX LAN Queues
+/* This is the descriptor of each queue entry for the Add Tx LAN Queues
  * command (0x0C30). Only used within struct ice_aqc_add_tx_qgrp.
  */
 struct ice_aqc_add_txqs_perq {
@@ -1313,7 +1356,7 @@ struct ice_aqc_add_txqs_perq {
 	struct ice_aqc_txsched_elem info;
 };
 
-/* The format of the command buffer for Add TX LAN Queues (0x0C30)
+/* The format of the command buffer for Add Tx LAN Queues (0x0C30)
  * is an array of the following structs. Please note that the length of
  * each struct ice_aqc_add_tx_qgrp is variable due
  * to the variable number of queues in each group!
@@ -1325,7 +1368,7 @@ struct ice_aqc_add_tx_qgrp {
 	struct ice_aqc_add_txqs_perq txqs[1];
 };
 
-/* Disable TX LAN Queues (indirect 0x0C31) */
+/* Disable Tx LAN Queues (indirect 0x0C31) */
 struct ice_aqc_dis_txqs {
 	u8 cmd_type;
 #define ICE_AQC_Q_DIS_CMD_S		0
@@ -1347,7 +1390,7 @@ struct ice_aqc_dis_txqs {
 	__le32 addr_low;
 };
 
-/* The buffer for Disable TX LAN Queues (indirect 0x0C31)
+/* The buffer for Disable Tx LAN Queues (indirect 0x0C31)
  * contains the following structures, arrayed one after the
  * other.
  * Note: Since the q_id is 16 bits wide, if the
@@ -1494,12 +1537,14 @@ struct ice_aq_desc {
 		struct ice_aqc_get_topo get_topo;
 		struct ice_aqc_sched_elem_cmd sched_elem_cmd;
 		struct ice_aqc_query_txsched_res query_sched_res;
+		struct ice_aqc_query_port_ets port_ets;
 		struct ice_aqc_nvm nvm;
 		struct ice_aqc_pf_vf_msg virt;
 		struct ice_aqc_lldp_get_mib lldp_get_mib;
 		struct ice_aqc_lldp_set_mib_change lldp_set_event;
 		struct ice_aqc_lldp_stop lldp_stop;
 		struct ice_aqc_lldp_start lldp_start;
+		struct ice_aqc_lldp_set_local_mib lldp_set_mib;
 		struct ice_aqc_lldp_stop_start_specific_agent lldp_agent_ctrl;
 		struct ice_aqc_get_set_rss_lut get_set_rss_lut;
 		struct ice_aqc_get_set_rss_key get_set_rss_key;
@@ -1587,6 +1632,7 @@ enum ice_adminq_opc {
 	ice_aqc_opc_get_sched_elems			= 0x0404,
 	ice_aqc_opc_suspend_sched_elems			= 0x0409,
 	ice_aqc_opc_resume_sched_elems			= 0x040A,
+	ice_aqc_opc_query_port_ets			= 0x040E,
 	ice_aqc_opc_delete_sched_elems			= 0x040F,
 	ice_aqc_opc_query_sched_res			= 0x0412,
 
@@ -1610,6 +1656,7 @@ enum ice_adminq_opc {
 	ice_aqc_opc_lldp_stop				= 0x0A05,
 	ice_aqc_opc_lldp_start				= 0x0A06,
 	ice_aqc_opc_get_cee_dcb_cfg			= 0x0A07,
+	ice_aqc_opc_lldp_set_local_mib			= 0x0A08,
 	ice_aqc_opc_lldp_stop_start_specific_agent	= 0x0A09,
 
 	/* RSS commands */
@@ -1618,7 +1665,7 @@ enum ice_adminq_opc {
 	ice_aqc_opc_get_rss_key				= 0x0B04,
 	ice_aqc_opc_get_rss_lut				= 0x0B05,
 
-	/* TX queue handling commands/events */
+	/* Tx queue handling commands/events */
 	ice_aqc_opc_add_txqs				= 0x0C30,
 	ice_aqc_opc_dis_txqs				= 0x0C31,
 

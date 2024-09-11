@@ -529,7 +529,7 @@ static int __init reserve_crashkernel_low(void)
 
 static void __init reserve_crashkernel(void)
 {
-	unsigned long long crash_size, crash_base, total_mem;
+	unsigned long long crash_size, crash_base, total_mem, mem_enc_req;
 	bool high = false;
 	int ret;
 
@@ -551,41 +551,49 @@ static void __init reserve_crashkernel(void)
 		return;
 	}
 
+	/*
+	 * When SME/SEV is active, it will always required an extra SWIOTLB
+	 * region.
+	 */
+	if (mem_encrypt_active())
+		mem_enc_req = ALIGN(swiotlb_size_or_default(), SZ_1M);
+	else
+		mem_enc_req = 0;
+
 	/* 0 means: find the address automatically */
-	if (crash_base <= 0) {
+	if (!crash_base) {
 		/*
 		 * Set CRASH_ADDR_LOW_MAX upper bound for crash memory,
-		 * as old kexec-tools loads bzImage below that, unless
-		 * "crashkernel=size[KMG],high" is specified.
+		 * crashkernel=x,high reserves memory over 4G, also allocates
+		 * 256M extra low memory for DMA buffers and swiotlb.
+		 * But the extra memory is not required for all machines.
+		 * So try low memory first and fall back to high memory
+		 * unless "crashkernel=size[KMG],high" is specified.
 		 */
-		crash_base = memblock_find_in_range(CRASH_ALIGN,
-						    high ? CRASH_ADDR_HIGH_MAX
-							 : CRASH_ADDR_LOW_MAX,
-						    crash_size, CRASH_ALIGN);
-#ifdef CONFIG_X86_64
-		/*
-		 * crashkernel=X reserve below 896M fails? Try below 4G
-		 */
-		if (!high && !crash_base)
+		if (!high)
 			crash_base = memblock_find_in_range(CRASH_ALIGN,
-						(1ULL << 32),
-						crash_size, CRASH_ALIGN);
+						CRASH_ADDR_LOW_MAX,
+						crash_size + mem_enc_req,
+						CRASH_ALIGN);
 		/*
-		 * crashkernel=X reserve below 4G fails? Try MAXMEM
+		 * For high reservation, an extra low memory for SWIOTLB will
+		 * always be reserved later, so no need to reserve extra
+		 * memory for memory encryption case here.
 		 */
-		if (!high && !crash_base)
+		if (!crash_base) {
+			mem_enc_req = 0;
 			crash_base = memblock_find_in_range(CRASH_ALIGN,
 						CRASH_ADDR_HIGH_MAX,
 						crash_size, CRASH_ALIGN);
-#endif
+		}
 		if (!crash_base) {
 			pr_info("crashkernel reservation failed - No suitable area found.\n");
 			return;
 		}
-
 	} else {
 		unsigned long long start;
 
+		mem_enc_req = 0;
 		start = memblock_find_in_range(crash_base,
 					       crash_base + crash_size,
 					       crash_size, 1 << 20);
@@ -594,6 +602,13 @@ static void __init reserve_crashkernel(void)
 			return;
 		}
 	}
+
+	if (mem_enc_req) {
+		pr_info("Memory encryption is active, crashkernel needs %ldMB extra memory\n",
+			(unsigned long)(mem_enc_req >> 20));
+		crash_size += mem_enc_req;
+	}
+
 	ret = memblock_reserve(crash_base, crash_size);
 	if (ret) {
 		pr_err("%s: Error reserving crashkernel memblock.\n", __func__);
@@ -830,9 +845,11 @@ static bool valid_amd_processor(__u8 family, const char *model_id, bool guest)
 				len += 3;
 				/*
 				 * AMD EPYC 7xx1 == NAPLES
+				 * AMD EPYC 7xx2 == ROME
 				 */
 				if (strlen(model_id) >= len) {
-					if (model_id[len-1] == '1')
+					if (model_id[len-1] == '1' ||
+					    model_id[len-1] == '2')
 						valid = true;
 				}
 			}
@@ -860,21 +877,21 @@ static bool valid_intel_processor(__u8 family, __u8 model, __u8 stepping)
 
 	switch(model) {
 	case INTEL_FAM6_KABYLAKE_DESKTOP:
-		valid = (stepping <= 10 || stepping == 12);
+		valid = (stepping <= 13);
 		break;
 
 	case INTEL_FAM6_KABYLAKE_MOBILE:
-		valid = (stepping <= 11);
+		valid = (stepping <= 12);
 		break;
 
 	case INTEL_FAM6_XEON_PHI_KNM:
 	case INTEL_FAM6_ATOM_GOLDMONT:
-	case INTEL_FAM6_ATOM_GEMINI_LAKE:
-	case INTEL_FAM6_ATOM_DENVERTON:
+	case INTEL_FAM6_ATOM_GOLDMONT_PLUS:
+	case INTEL_FAM6_ATOM_GOLDMONT_X:
 	case INTEL_FAM6_XEON_PHI_KNL:
 	case INTEL_FAM6_BROADWELL_XEON_D:
 	case INTEL_FAM6_BROADWELL_X:
-	case INTEL_FAM6_ATOM_SILVERMONT2:
+	case INTEL_FAM6_ATOM_SILVERMONT_X:
 	case INTEL_FAM6_BROADWELL_GT3E:
 	case INTEL_FAM6_HASWELL_GT3E:
 	case INTEL_FAM6_HASWELL_ULT:

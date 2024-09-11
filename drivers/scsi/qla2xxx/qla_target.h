@@ -936,6 +936,8 @@ struct qla_tgt_cmd {
 	uint64_t	lba;
 	uint16_t	a_guard, e_guard, a_app_tag, e_app_tag;
 	uint32_t	a_ref_tag, e_ref_tag;
+#define DIF_BUNDL_DMA_VALID 1
+	uint16_t prot_flags;
 
 	uint64_t jiffies_at_alloc;
 	uint64_t jiffies_at_free;
@@ -958,16 +960,20 @@ struct qla_tgt_sess_work_param {
 };
 
 struct qla_tgt_mgmt_cmd {
+	uint8_t cmd_type;
+	uint8_t pad[3];
 	uint16_t tmr_func;
 	uint8_t fc_tm_rsp;
+	uint8_t abort_io_attr;
 	struct fc_port *sess;
 	struct qla_qpair *qpair;
 	struct scsi_qla_host *vha;
 	struct se_cmd se_cmd;
 	struct work_struct free_work;
 	unsigned int flags;
+#define QLA24XX_MGMT_SEND_NACK	BIT_0
+#define QLA24XX_MGMT_ABORT_IO_ATTR_VALID BIT_1
 	uint32_t reset_count;
-#define QLA24XX_MGMT_SEND_NACK	1
 	struct work_struct work;
 	uint64_t unpacked_lun;
 	union {

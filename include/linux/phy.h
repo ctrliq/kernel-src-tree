@@ -29,6 +29,8 @@
 
 #include <linux/atomic.h>
 
+#include <linux/rh_kabi.h>
+
 #define PHY_DEFAULT_FEATURES	(SUPPORTED_Autoneg | \
 				 SUPPORTED_TP | \
 				 SUPPORTED_MII)
@@ -48,6 +50,7 @@ extern __ETHTOOL_DECLARE_LINK_MODE_MASK(phy_gbit_features) __ro_after_init;
 extern __ETHTOOL_DECLARE_LINK_MODE_MASK(phy_gbit_fibre_features) __ro_after_init;
 extern __ETHTOOL_DECLARE_LINK_MODE_MASK(phy_gbit_all_ports_features) __ro_after_init;
 extern __ETHTOOL_DECLARE_LINK_MODE_MASK(phy_10gbit_features) __ro_after_init;
+extern __ETHTOOL_DECLARE_LINK_MODE_MASK(phy_10gbit_fec_features) __ro_after_init;
 extern __ETHTOOL_DECLARE_LINK_MODE_MASK(phy_10gbit_full_features) __ro_after_init;
 
 #define PHY_BASIC_FEATURES ((unsigned long *)&phy_basic_features)
@@ -56,7 +59,13 @@ extern __ETHTOOL_DECLARE_LINK_MODE_MASK(phy_10gbit_full_features) __ro_after_ini
 #define PHY_GBIT_FIBRE_FEATURES ((unsigned long *)&phy_gbit_fibre_features)
 #define PHY_GBIT_ALL_PORTS_FEATURES ((unsigned long *)&phy_gbit_all_ports_features)
 #define PHY_10GBIT_FEATURES ((unsigned long *)&phy_10gbit_features)
+#define PHY_10GBIT_FEC_FEATURES ((unsigned long *)&phy_10gbit_fec_features)
 #define PHY_10GBIT_FULL_FEATURES ((unsigned long *)&phy_10gbit_full_features)
+
+extern const int phy_10_100_features_array[4];
+extern const int phy_basic_t1_features_array[2];
+extern const int phy_gbit_features_array[2];
+extern const int phy_10gbit_features_array[1];
 
 /*
  * Set phydev->irq to PHY_POLL if interrupts are not supported,
@@ -445,11 +454,12 @@ struct phy_device {
 	/* Enabled Interrupts */
 	u32 interrupts;
 
-	/* Union of PHY and Attached devices' supported modes */
-	/* See mii.h for more info */
-	u32 supported;
-	u32 advertising;
-	u32 lp_advertising;
+	/* RHEL specific: fileds are deprecated.
+	 * PHY now using bitmaps declared later by RH_KABI_EXTEND macro
+	 */
+	RH_KABI_DEPRECATE(u32, supported)
+	RH_KABI_DEPRECATE(u32, advertising)
+	RH_KABI_DEPRECATE(u32, lp_advertising)
 
 	/* Energy efficient ethernet modes which should be prohibited */
 	u32 eee_broken_modes;
@@ -486,6 +496,17 @@ struct phy_device {
 	u8 mdix;
 	u8 mdix_ctrl;
 
+	/* RHEL specific: Phy is not protected by kabi. This change
+	 * will rise kabi check warning for eth_type_trans and
+	 * ethtool_op_get_link over pointers:
+	 * net_device -> phy_device
+	 * Change will break all phy drivers and all need rebuild.
+	 * It is reason why this field could be in the middle of struct.
+	 */
+	RH_KABI_EXTEND(__ETHTOOL_DECLARE_LINK_MODE_MASK(supported))
+	RH_KABI_EXTEND(__ETHTOOL_DECLARE_LINK_MODE_MASK(advertising))
+	RH_KABI_EXTEND(__ETHTOOL_DECLARE_LINK_MODE_MASK(lp_advertising))
+
 	void (*phy_link_change)(struct phy_device *, bool up, bool do_carrier);
 	void (*adjust_link)(struct net_device *dev);
 };
@@ -518,9 +539,17 @@ struct phy_driver {
 	u32 phy_id;
 	char *name;
 	u32 phy_id_mask;
-	const unsigned long * const features;
+	RH_KABI_DEPRECATE(u32, features)
 	u32 flags;
 	const void *driver_data;
+	/* RHEL specific: Phy is not protected by kabi. This change
+	 * will rise kabi check warning for eth_type_trans and
+	 * ethtool_op_get_link over pointers:
+	 * net_device -> phy_device -> phy_driver.
+	 * Change will break all phy drivers and all need rebuild.
+	 * It is reason why this field could be in the middle of struct.
+	 */
+	RH_KABI_EXTEND(const unsigned long * const features)
 
 	/*
 	 * Called to issue a PHY software reset
@@ -701,9 +730,9 @@ struct phy_setting {
 
 const struct phy_setting *
 phy_lookup_setting(int speed, int duplex, const unsigned long *mask,
-		   size_t maxbit, bool exact);
+		   bool exact);
 size_t phy_speeds(unsigned int *speeds, size_t size,
-		  unsigned long *mask, size_t maxbit);
+		  unsigned long *mask);
 
 void phy_resolve_aneg_linkmode(struct phy_device *phydev);
 
@@ -1048,7 +1077,14 @@ static inline int phy_read_status(struct phy_device *phydev)
 
 void phy_driver_unregister(struct phy_driver *drv);
 void phy_drivers_unregister(struct phy_driver *drv, int n);
+/* RHEL specific: change in phy_driver breaking kabi checker but phy is
+ * not protected by kabi. RH_KABI_DEPRECATED and RH_KABI_EXTEND macros
+ * used in phy_driver hide checksum change and old driver loaded with new
+ * kernel will crash. We need change phy_driver{s}_register
+ */
+RH_KABI_FORCE_CHANGE(1)
 int phy_driver_register(struct phy_driver *new_driver, struct module *owner);
+RH_KABI_FORCE_CHANGE(1)
 int phy_drivers_register(struct phy_driver *new_driver, int n,
 			 struct module *owner);
 void phy_state_machine(struct work_struct *work);
@@ -1066,6 +1102,14 @@ int phy_mii_ioctl(struct phy_device *phydev, struct ifreq *ifr, int cmd);
 int phy_start_interrupts(struct phy_device *phydev);
 void phy_print_status(struct phy_device *phydev);
 int phy_set_max_speed(struct phy_device *phydev, u32 max_speed);
+void phy_remove_link_mode(struct phy_device *phydev, u32 link_mode);
+void phy_support_sym_pause(struct phy_device *phydev);
+void phy_support_asym_pause(struct phy_device *phydev);
+void phy_set_sym_pause(struct phy_device *phydev, bool rx, bool tx,
+		       bool autoneg);
+void phy_set_asym_pause(struct phy_device *phydev, bool rx, bool tx);
+bool phy_validate_pause(struct phy_device *phydev,
+			struct ethtool_pauseparam *pp);
 
 int phy_register_fixup(const char *bus_id, u32 phy_uid, u32 phy_uid_mask,
 		       int (*run)(struct phy_device *));

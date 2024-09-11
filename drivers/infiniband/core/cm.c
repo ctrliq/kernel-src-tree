@@ -343,7 +343,7 @@ static int cm_alloc_msg(struct cm_id_private *cm_id_priv,
 		ret = -ENODEV;
 		goto out;
 	}
-	ah = rdma_create_ah(mad_agent->qp->pd, &av->ah_attr);
+	ah = rdma_create_ah(mad_agent->qp->pd, &av->ah_attr, 0);
 	if (IS_ERR(ah)) {
 		ret = PTR_ERR(ah);
 		goto out;
@@ -355,7 +355,7 @@ static int cm_alloc_msg(struct cm_id_private *cm_id_priv,
 			       GFP_ATOMIC,
 			       IB_MGMT_BASE_VERSION);
 	if (IS_ERR(m)) {
-		rdma_destroy_ah(ah);
+		rdma_destroy_ah(ah, 0);
 		ret = PTR_ERR(m);
 		goto out;
 	}
@@ -400,7 +400,7 @@ static int cm_create_response_msg_ah(struct cm_port *port,
 static void cm_free_msg(struct ib_mad_send_buf *msg)
 {
 	if (msg->ah)
-		rdma_destroy_ah(msg->ah);
+		rdma_destroy_ah(msg->ah, 0);
 	if (msg->context[0])
 		cm_deref_id(msg->context[0]);
 	ib_free_send_mad(msg);
@@ -1114,6 +1114,9 @@ retest:
 	wait_for_completion(&cm_id_priv->comp);
 	while ((work = cm_dequeue_work(cm_id_priv)) != NULL)
 		cm_free_work(work);
+
+	rdma_destroy_ah_attr(&cm_id_priv->av.ah_attr);
+	rdma_destroy_ah_attr(&cm_id_priv->alt_av.ah_attr);
 	kfree(cm_id_priv->private_data);
 	kfree(cm_id_priv);
 }
@@ -1668,7 +1671,7 @@ static void cm_opa_to_ib_sgid(struct cm_work *work,
 	    (ib_is_opa_gid(&path->sgid))) {
 		union ib_gid sgid;
 
-		if (ib_get_cached_gid(dev, port_num, 0, &sgid, NULL)) {
+		if (rdma_query_gid(dev, port_num, 0, &sgid)) {
 			dev_warn(&dev->dev,
 				 "Error updating sgid in CM request\n");
 			return;
@@ -2008,10 +2011,9 @@ static int cm_req_handler(struct cm_work *work)
 	if (ret) {
 		int err;
 
-		err = ib_get_cached_gid(work->port->cm_dev->ib_device,
-					work->port->port_num, 0,
-					&work->path[0].sgid,
-					NULL);
+		err = rdma_query_gid(work->port->cm_dev->ib_device,
+				     work->port->port_num, 0,
+				     &work->path[0].sgid);
 		if (err)
 			ib_send_cm_rej(cm_id, IB_CM_REJ_INVALID_GID,
 				       NULL, 0, NULL, 0);
@@ -4368,7 +4370,7 @@ static void cm_add_one(struct ib_device *ib_device)
 	cm_dev->going_down = 0;
 	cm_dev->device = device_create(&cm_class, &ib_device->dev,
 				       MKDEV(0, 0), NULL,
-				       "%s", ib_device->name);
+				       "%s", dev_name(&ib_device->dev));
 	if (IS_ERR(cm_dev->device)) {
 		kfree(cm_dev);
 		return;

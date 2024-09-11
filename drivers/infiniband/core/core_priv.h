@@ -58,6 +58,7 @@ int  ib_device_register_sysfs(struct ib_device *device,
 			      int (*port_callback)(struct ib_device *,
 						   u8, struct kobject *));
 void ib_device_unregister_sysfs(struct ib_device *device);
+int ib_device_rename(struct ib_device *ibdev, const char *name);
 
 typedef void (*roce_netdev_callback)(struct ib_device *device, u8 port,
 	      struct net_device *idev, void *cookie);
@@ -177,7 +178,7 @@ int ib_get_cached_subnet_prefix(struct ib_device *device,
 				u64              *sn_pfx);
 
 #ifdef CONFIG_SECURITY_INFINIBAND
-void ib_security_destroy_port_pkey_list(struct ib_device *device);
+void ib_security_release_port_pkey_list(struct ib_device *device);
 
 void ib_security_cache_change(struct ib_device *device,
 			      u8 port_num,
@@ -198,8 +199,9 @@ int ib_mad_agent_security_setup(struct ib_mad_agent *agent,
 				enum ib_qp_type qp_type);
 void ib_mad_agent_security_cleanup(struct ib_mad_agent *agent);
 int ib_mad_enforce_security(struct ib_mad_agent_private *map, u16 pkey_index);
+void ib_mad_agent_security_change(void);
 #else
-static inline void ib_security_destroy_port_pkey_list(struct ib_device *device)
+static inline void ib_security_release_port_pkey_list(struct ib_device *device)
 {
 }
 
@@ -214,10 +216,10 @@ static inline int ib_security_modify_qp(struct ib_qp *qp,
 					int qp_attr_mask,
 					struct ib_udata *udata)
 {
-	return qp->device->modify_qp(qp->real_qp,
-				     qp_attr,
-				     qp_attr_mask,
-				     udata);
+	return qp->device->ops.modify_qp(qp->real_qp,
+					 qp_attr,
+					 qp_attr_mask,
+					 udata);
 }
 
 static inline int ib_create_qp_security(struct ib_qp *qp,
@@ -263,6 +265,10 @@ static inline int ib_mad_enforce_security(struct ib_mad_agent_private *map,
 {
 	return 0;
 }
+
+static inline void ib_mad_agent_security_change(void)
+{
+}
 #endif
 
 struct ib_device *ib_device_get_by_index(u32 ifindex);
@@ -278,10 +284,10 @@ static inline struct ib_qp *_ib_create_qp(struct ib_device *dev,
 {
 	struct ib_qp *qp;
 
-	if (!dev->create_qp)
+	if (!dev->ops.create_qp)
 		return ERR_PTR(-EOPNOTSUPP);
 
-	qp = dev->create_qp(pd, attr, udata);
+	qp = dev->ops.create_qp(pd, attr, udata);
 	if (IS_ERR(qp))
 		return qp;
 
@@ -295,7 +301,10 @@ static inline struct ib_qp *_ib_create_qp(struct ib_device *dev,
 	 */
 	if (attr->qp_type < IB_QPT_XRC_INI) {
 		qp->res.type = RDMA_RESTRACK_QP;
-		rdma_restrack_add(&qp->res);
+		if (uobj)
+			rdma_restrack_uadd(&qp->res);
+		else
+			rdma_restrack_kadd(&qp->res);
 	} else
 		qp->res.valid = false;
 
@@ -309,7 +318,7 @@ int rdma_resolve_ip_route(struct sockaddr *src_addr,
 
 int rdma_addr_find_l2_eth_by_grh(const union ib_gid *sgid,
 				 const union ib_gid *dgid,
-				 u8 *dmac, const struct net_device *ndev,
+				 u8 *dmac, const struct ib_gid_attr *sgid_attr,
 				 int *hoplimit);
 void rdma_copy_src_l2_addr(struct rdma_dev_addr *dev_addr,
 			   const struct net_device *dev);

@@ -182,7 +182,7 @@ struct kvm_shadow_walk_iterator {
 
 static const union kvm_mmu_page_role mmu_base_role_mask = {
 	.cr0_wp = 1,
-	.cr4_pae = 1,
+	.gpte_is_8_bytes = 1,
 	.nxe = 1,
 	.smep_andnot_wp = 1,
 	.smap_andnot_wp = 1,
@@ -2205,6 +2205,7 @@ static bool kvm_mmu_prepare_zap_page(struct kvm *kvm, struct kvm_mmu_page *sp,
 static void kvm_mmu_commit_zap_page(struct kvm *kvm,
 				    struct list_head *invalid_list);
 
+
 #define for_each_valid_sp(_kvm, _sp, _gfn)				\
 	hlist_for_each_entry(_sp,					\
 	  &(_kvm)->arch.mmu_page_hash[kvm_page_table_hashfn(_gfn)], hash_link) \
@@ -2215,12 +2216,17 @@ static void kvm_mmu_commit_zap_page(struct kvm *kvm,
 	for_each_valid_sp(_kvm, _sp, _gfn)				\
 		if ((_sp)->gfn != (_gfn) || (_sp)->role.direct) {} else
 
+static inline bool is_ept_sp(struct kvm_mmu_page *sp)
+{
+	return sp->role.cr0_wp && sp->role.smap_andnot_wp;
+}
+
 /* @sp->gfn should be write-protected at the call site */
 static bool __kvm_sync_page(struct kvm_vcpu *vcpu, struct kvm_mmu_page *sp,
 			    struct list_head *invalid_list)
 {
-	if (sp->role.cr4_pae != !!is_pae(vcpu)
-	    || vcpu->arch.mmu->sync_page(vcpu, sp) == 0) {
+	if ((!is_ept_sp(sp) && sp->role.gpte_is_8_bytes != !!is_pae(vcpu)) ||
+	    vcpu->arch.mmu->sync_page(vcpu, sp) == 0) {
 		kvm_mmu_prepare_zap_page(vcpu->kvm, sp, invalid_list);
 		return false;
 	}
@@ -2423,7 +2429,7 @@ static struct kvm_mmu_page *kvm_mmu_get_page(struct kvm_vcpu *vcpu,
 	role.level = level;
 	role.direct = direct;
 	if (role.direct)
-		role.cr4_pae = 0;
+		role.gpte_is_8_bytes = true;
 	role.access = access;
 	if (!vcpu->arch.mmu->direct_map
 	    && vcpu->arch.mmu->root_level <= PT32_ROOT_LEVEL) {
@@ -3566,6 +3572,7 @@ void kvm_mmu_free_roots(struct kvm_vcpu *vcpu, struct kvm_mmu *mmu,
 							   &invalid_list);
 			mmu->root_hpa = INVALID_PAGE;
 		}
+		mmu->root_cr3 = 0;
 	}
 
 	kvm_mmu_commit_zap_page(vcpu->kvm, &invalid_list);
@@ -3621,6 +3628,7 @@ static int mmu_alloc_direct_roots(struct kvm_vcpu *vcpu)
 		vcpu->arch.mmu->root_hpa = __pa(vcpu->arch.mmu->pae_root);
 	} else
 		BUG();
+	vcpu->arch.mmu->root_cr3 = vcpu->arch.mmu->get_cr3(vcpu);
 
 	return 0;
 }
@@ -3629,10 +3637,11 @@ static int mmu_alloc_shadow_roots(struct kvm_vcpu *vcpu)
 {
 	struct kvm_mmu_page *sp;
 	u64 pdptr, pm_mask;
-	gfn_t root_gfn;
+	gfn_t root_gfn, root_cr3;
 	int i;
 
-	root_gfn = vcpu->arch.mmu->get_cr3(vcpu) >> PAGE_SHIFT;
+	root_cr3 = vcpu->arch.mmu->get_cr3(vcpu);
+	root_gfn = root_cr3 >> PAGE_SHIFT;
 
 	if (mmu_check_root(vcpu, root_gfn))
 		return 1;
@@ -3657,7 +3666,7 @@ static int mmu_alloc_shadow_roots(struct kvm_vcpu *vcpu)
 		++sp->root_count;
 		spin_unlock(&vcpu->kvm->mmu_lock);
 		vcpu->arch.mmu->root_hpa = root;
-		return 0;
+		goto set_root_cr3;
 	}
 
 	/*
@@ -3722,6 +3731,9 @@ static int mmu_alloc_shadow_roots(struct kvm_vcpu *vcpu)
 
 		vcpu->arch.mmu->root_hpa = __pa(vcpu->arch.mmu->lm_root);
 	}
+
+set_root_cr3:
+	vcpu->arch.mmu->root_cr3 = root_cr3;
 
 	return 0;
 }
@@ -4174,7 +4186,7 @@ static bool cached_root_available(struct kvm_vcpu *vcpu, gpa_t new_cr3,
 	struct kvm_mmu_root_info root;
 	struct kvm_mmu *mmu = vcpu->arch.mmu;
 
-	root.cr3 = mmu->get_cr3(vcpu);
+	root.cr3 = mmu->root_cr3;
 	root.hpa = mmu->root_hpa;
 
 	for (i = 0; i < KVM_MMU_NUM_PREV_ROOTS; i++) {
@@ -4187,6 +4199,7 @@ static bool cached_root_available(struct kvm_vcpu *vcpu, gpa_t new_cr3,
 	}
 
 	mmu->root_hpa = root.hpa;
+	mmu->root_cr3 = root.cr3;
 
 	return i < KVM_MMU_NUM_PREV_ROOTS;
 }
@@ -4763,17 +4776,52 @@ static void paging32E_init_context(struct kvm_vcpu *vcpu,
 	paging64_init_context_common(vcpu, context, PT32E_ROOT_LEVEL);
 }
 
-static union kvm_mmu_page_role
-kvm_calc_tdp_mmu_root_page_role(struct kvm_vcpu *vcpu)
+static union kvm_mmu_extended_role kvm_calc_mmu_role_ext(struct kvm_vcpu *vcpu)
 {
-	union kvm_mmu_page_role role = {0};
+	union kvm_mmu_extended_role ext = {0};
 
-	role.guest_mode = is_guest_mode(vcpu);
-	role.smm = is_smm(vcpu);
-	role.ad_disabled = (shadow_accessed_mask == 0);
-	role.level = kvm_x86_ops->get_tdp_level(vcpu);
-	role.direct = true;
-	role.access = ACC_ALL;
+	ext.cr0_pg = !!is_paging(vcpu);
+	ext.cr4_pae = !!is_pae(vcpu);
+	ext.cr4_smep = !!kvm_read_cr4_bits(vcpu, X86_CR4_SMEP);
+	ext.cr4_smap = !!kvm_read_cr4_bits(vcpu, X86_CR4_SMAP);
+	ext.cr4_pse = !!is_pse(vcpu);
+	ext.cr4_pke = !!kvm_read_cr4_bits(vcpu, X86_CR4_PKE);
+	ext.cr4_la57 = !!kvm_read_cr4_bits(vcpu, X86_CR4_LA57);
+	ext.maxphyaddr = cpuid_maxphyaddr(vcpu);
+
+	ext.valid = 1;
+
+	return ext;
+}
+
+static union kvm_mmu_role kvm_calc_mmu_role_common(struct kvm_vcpu *vcpu,
+						   bool base_only)
+{
+	union kvm_mmu_role role = {0};
+
+	role.base.access = ACC_ALL;
+	role.base.nxe = !!is_nx(vcpu);
+	role.base.cr0_wp = is_write_protection(vcpu);
+	role.base.smm = is_smm(vcpu);
+	role.base.guest_mode = is_guest_mode(vcpu);
+
+	if (base_only)
+		return role;
+
+	role.ext = kvm_calc_mmu_role_ext(vcpu);
+
+	return role;
+}
+
+static union kvm_mmu_role
+kvm_calc_tdp_mmu_root_page_role(struct kvm_vcpu *vcpu, bool base_only)
+{
+	union kvm_mmu_role role = kvm_calc_mmu_role_common(vcpu, base_only);
+
+	role.base.ad_disabled = (shadow_accessed_mask == 0);
+	role.base.level = kvm_x86_ops->get_tdp_level(vcpu);
+	role.base.direct = true;
+	role.base.gpte_is_8_bytes = true;
 
 	return role;
 }
@@ -4781,9 +4829,14 @@ kvm_calc_tdp_mmu_root_page_role(struct kvm_vcpu *vcpu)
 static void init_kvm_tdp_mmu(struct kvm_vcpu *vcpu)
 {
 	struct kvm_mmu *context = vcpu->arch.mmu;
+	union kvm_mmu_role new_role =
+		kvm_calc_tdp_mmu_root_page_role(vcpu, false);
 
-	context->mmu_role.base.word = mmu_base_role_mask.word &
-				  kvm_calc_tdp_mmu_root_page_role(vcpu).word;
+	new_role.base.word &= mmu_base_role_mask.word;
+	if (new_role.as_u64 == context->mmu_role.as_u64)
+		return;
+
+	context->mmu_role.as_u64 = new_role.as_u64;
 	context->page_fault = tdp_page_fault;
 	context->sync_page = nonpaging_sync_page;
 	context->invlpg = nonpaging_invlpg;
@@ -4823,29 +4876,24 @@ static void init_kvm_tdp_mmu(struct kvm_vcpu *vcpu)
 	reset_tdp_shadow_zero_bits_mask(vcpu, context);
 }
 
-static union kvm_mmu_page_role
-kvm_calc_shadow_mmu_root_page_role(struct kvm_vcpu *vcpu)
+static union kvm_mmu_role
+kvm_calc_shadow_mmu_root_page_role(struct kvm_vcpu *vcpu, bool base_only)
 {
-	union kvm_mmu_page_role role = {0};
-	bool smep = kvm_read_cr4_bits(vcpu, X86_CR4_SMEP);
-	bool smap = kvm_read_cr4_bits(vcpu, X86_CR4_SMAP);
+	union kvm_mmu_role role = kvm_calc_mmu_role_common(vcpu, base_only);
 
-	role.nxe = is_nx(vcpu);
-	role.cr4_pae = !!is_pae(vcpu);
-	role.cr0_wp  = is_write_protection(vcpu);
-	role.smep_andnot_wp = smep && !is_write_protection(vcpu);
-	role.smap_andnot_wp = smap && !is_write_protection(vcpu);
-	role.guest_mode = is_guest_mode(vcpu);
-	role.smm = is_smm(vcpu);
-	role.direct = !is_paging(vcpu);
-	role.access = ACC_ALL;
+	role.base.smep_andnot_wp = role.ext.cr4_smep &&
+		!is_write_protection(vcpu);
+	role.base.smap_andnot_wp = role.ext.cr4_smap &&
+		!is_write_protection(vcpu);
+	role.base.direct = !is_paging(vcpu);
+	role.base.gpte_is_8_bytes = !!is_pae(vcpu);
 
 	if (!is_long_mode(vcpu))
-		role.level = PT32E_ROOT_LEVEL;
+		role.base.level = PT32E_ROOT_LEVEL;
 	else if (is_la57_mode(vcpu))
-		role.level = PT64_ROOT_5LEVEL;
+		role.base.level = PT64_ROOT_5LEVEL;
 	else
-		role.level = PT64_ROOT_4LEVEL;
+		role.base.level = PT64_ROOT_4LEVEL;
 
 	return role;
 }
@@ -4853,6 +4901,12 @@ kvm_calc_shadow_mmu_root_page_role(struct kvm_vcpu *vcpu)
 void kvm_init_shadow_mmu(struct kvm_vcpu *vcpu)
 {
 	struct kvm_mmu *context = vcpu->arch.mmu;
+	union kvm_mmu_role new_role =
+		kvm_calc_shadow_mmu_root_page_role(vcpu, false);
+
+	new_role.base.word &= mmu_base_role_mask.word;
+	if (new_role.as_u64 == context->mmu_role.as_u64)
+		return;
 
 	if (!is_paging(vcpu))
 		nonpaging_init_context(vcpu, context);
@@ -4863,22 +4917,36 @@ void kvm_init_shadow_mmu(struct kvm_vcpu *vcpu)
 	else
 		paging32_init_context(vcpu, context);
 
-	context->mmu_role.base.word = mmu_base_role_mask.word &
-				  kvm_calc_shadow_mmu_root_page_role(vcpu).word;
+	context->mmu_role.as_u64 = new_role.as_u64;
 	reset_shadow_zero_bits_mask(vcpu, context);
 }
 EXPORT_SYMBOL_GPL(kvm_init_shadow_mmu);
 
-static union kvm_mmu_page_role
-kvm_calc_shadow_ept_root_page_role(struct kvm_vcpu *vcpu, bool accessed_dirty)
+static union kvm_mmu_role
+kvm_calc_shadow_ept_root_page_role(struct kvm_vcpu *vcpu, bool accessed_dirty,
+				   bool execonly)
 {
-	union kvm_mmu_page_role role = vcpu->arch.mmu->base_role;
+	union kvm_mmu_role role = {0};
 
-	role.level = PT64_ROOT_4LEVEL;
-	role.direct = false;
-	role.ad_disabled = !accessed_dirty;
-	role.guest_mode = true;
-	role.access = ACC_ALL;
+	/* SMM flag is inherited from root_mmu */
+	role.base.smm = vcpu->arch.root_mmu.mmu_role.base.smm;
+
+	role.base.level = PT64_ROOT_4LEVEL;
+	role.base.gpte_is_8_bytes = true;
+	role.base.direct = false;
+	role.base.ad_disabled = !accessed_dirty;
+	role.base.guest_mode = true;
+	role.base.access = ACC_ALL;
+
+	/*
+	 * WP=1 and NOT_WP=1 is an impossible combination, use WP and the
+	 * SMAP variation to denote shadow EPT entries.
+	 */
+	role.base.cr0_wp = true;
+	role.base.smap_andnot_wp = true;
+
+	role.ext = kvm_calc_mmu_role_ext(vcpu);
+	role.ext.execonly = execonly;
 
 	return role;
 }
@@ -4887,10 +4955,16 @@ void kvm_init_shadow_ept_mmu(struct kvm_vcpu *vcpu, bool execonly,
 			     bool accessed_dirty, gpa_t new_eptp)
 {
 	struct kvm_mmu *context = vcpu->arch.mmu;
-	union kvm_mmu_page_role root_page_role =
-		kvm_calc_shadow_ept_root_page_role(vcpu, accessed_dirty);
+	union kvm_mmu_role new_role =
+		kvm_calc_shadow_ept_root_page_role(vcpu, accessed_dirty,
+						   execonly);
 
-	__kvm_mmu_new_cr3(vcpu, new_eptp, root_page_role, false);
+	__kvm_mmu_new_cr3(vcpu, new_eptp, new_role.base, false);
+
+	new_role.base.word &= mmu_base_role_mask.word;
+	if (new_role.as_u64 == context->mmu_role.as_u64)
+		return;
+
 	context->shadow_root_level = PT64_ROOT_4LEVEL;
 
 	context->nx = true;
@@ -4902,8 +4976,7 @@ void kvm_init_shadow_ept_mmu(struct kvm_vcpu *vcpu, bool execonly,
 	context->update_pte = ept_update_pte;
 	context->root_level = PT64_ROOT_4LEVEL;
 	context->direct_map = false;
-	context->mmu_role.base.word =
-		root_page_role.word & mmu_base_role_mask.word;
+	context->mmu_role.as_u64 = new_role.as_u64;
 
 	update_permission_bitmask(vcpu, context, true);
 	update_pkru_bitmask(vcpu, context, true);
@@ -4996,10 +5069,14 @@ EXPORT_SYMBOL_GPL(kvm_init_mmu);
 static union kvm_mmu_page_role
 kvm_mmu_calc_root_page_role(struct kvm_vcpu *vcpu)
 {
+	union kvm_mmu_role role;
+
 	if (tdp_enabled)
-		return kvm_calc_tdp_mmu_root_page_role(vcpu);
+		role = kvm_calc_tdp_mmu_root_page_role(vcpu, true);
 	else
-		return kvm_calc_shadow_mmu_root_page_role(vcpu);
+		role = kvm_calc_shadow_mmu_root_page_role(vcpu, true);
+
+	return role.base;
 }
 
 void kvm_mmu_reset_context(struct kvm_vcpu *vcpu)
@@ -5029,8 +5106,10 @@ EXPORT_SYMBOL_GPL(kvm_mmu_load);
 
 void kvm_mmu_unload(struct kvm_vcpu *vcpu)
 {
-	kvm_mmu_free_roots(vcpu, vcpu->arch.mmu, KVM_MMU_ROOTS_ALL);
-	WARN_ON(VALID_PAGE(vcpu->arch.mmu->root_hpa));
+	kvm_mmu_free_roots(vcpu, &vcpu->arch.root_mmu, KVM_MMU_ROOTS_ALL);
+	WARN_ON(VALID_PAGE(vcpu->arch.root_mmu.root_hpa));
+	kvm_mmu_free_roots(vcpu, &vcpu->arch.guest_mmu, KVM_MMU_ROOTS_ALL);
+	WARN_ON(VALID_PAGE(vcpu->arch.guest_mmu.root_hpa));
 }
 EXPORT_SYMBOL_GPL(kvm_mmu_unload);
 
@@ -5116,7 +5195,7 @@ static bool detect_write_misaligned(struct kvm_mmu_page *sp, gpa_t gpa,
 		 gpa, bytes, sp->role.word);
 
 	offset = offset_in_page(gpa);
-	pte_size = sp->role.cr4_pae ? 8 : 4;
+	pte_size = sp->role.gpte_is_8_bytes ? 8 : 4;
 
 	/*
 	 * Sometimes, the OS only writes the last one bytes to update status
@@ -5140,7 +5219,7 @@ static u64 *get_written_sptes(struct kvm_mmu_page *sp, gpa_t gpa, int *nspte)
 	page_offset = offset_in_page(gpa);
 	level = sp->role.level;
 	*nspte = 1;
-	if (!sp->role.cr4_pae) {
+	if (!sp->role.gpte_is_8_bytes) {
 		page_offset <<= 1;	/* 32->64 */
 		/*
 		 * A 32-bit pde maps 4MB while the shadow pdes map
@@ -5330,10 +5409,12 @@ emulate:
 	 * This can happen if a guest gets a page-fault on data access but the HW
 	 * table walker is not able to read the instruction page (e.g instruction
 	 * page is not present in memory). In those cases we simply restart the
-	 * guest.
+	 * guest, with the exception of AMD Erratum 1096 which is unrecoverable.
 	 */
-	if (unlikely(insn && !insn_len))
-		return 1;
+	if (unlikely(insn && !insn_len)) {
+		if (!kvm_x86_ops->need_emulation_on_page_fault(vcpu))
+			return 1;
+	}
 
 	er = x86_emulate_instruction(vcpu, cr2, emulation_type, insn, insn_len);
 
@@ -5539,13 +5620,20 @@ int kvm_mmu_create(struct kvm_vcpu *vcpu)
 
 	vcpu->arch.mmu = &vcpu->arch.root_mmu;
 	vcpu->arch.walk_mmu = &vcpu->arch.root_mmu;
-	vcpu->arch.root_mmu.root_hpa = INVALID_PAGE;
-	vcpu->arch.root_mmu.translate_gpa = translate_gpa;
-	vcpu->arch.nested_mmu.translate_gpa = translate_nested_gpa;
 
+	vcpu->arch.root_mmu.root_hpa = INVALID_PAGE;
+	vcpu->arch.root_mmu.root_cr3 = 0;
+	vcpu->arch.root_mmu.translate_gpa = translate_gpa;
 	for (i = 0; i < KVM_MMU_NUM_PREV_ROOTS; i++)
 		vcpu->arch.root_mmu.prev_roots[i] = KVM_MMU_ROOT_INFO_INVALID;
 
+	vcpu->arch.guest_mmu.root_hpa = INVALID_PAGE;
+	vcpu->arch.guest_mmu.root_cr3 = 0;
+	vcpu->arch.guest_mmu.translate_gpa = translate_gpa;
+	for (i = 0; i < KVM_MMU_NUM_PREV_ROOTS; i++)
+		vcpu->arch.guest_mmu.prev_roots[i] = KVM_MMU_ROOT_INFO_INVALID;
+
+	vcpu->arch.nested_mmu.translate_gpa = translate_nested_gpa;
 	return alloc_mmu_pages(vcpu);
 }
 

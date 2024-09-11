@@ -425,9 +425,6 @@ int mlx5e_ethtool_set_channels(struct mlx5e_priv *priv,
 
 	new_channels.params = priv->channels.params;
 	new_channels.params.num_channels = count;
-	if (!netif_is_rxfh_configured(priv->netdev))
-		mlx5e_build_default_indir_rqt(new_channels.params.indirection_rqt,
-					      MLX5E_INDIR_RQT_SIZE, count);
 
 	if (!test_bit(MLX5E_STATE_OPENED, &priv->state)) {
 		priv->channels.params = new_channels.params;
@@ -445,6 +442,10 @@ int mlx5e_ethtool_set_channels(struct mlx5e_priv *priv,
 	arfs_enabled = priv->netdev->features & NETIF_F_NTUPLE;
 	if (arfs_enabled)
 		mlx5e_arfs_disable(priv);
+
+	if (!netif_is_rxfh_configured(priv->netdev))
+		mlx5e_build_default_indir_rqt(priv->rss_params.indirection_rqt,
+					      MLX5E_INDIR_RQT_SIZE, count);
 
 	/* Switch to new channels, set new parameters and close old ones */
 	mlx5e_switch_priv_channels(priv, &new_channels, NULL);
@@ -1082,7 +1083,7 @@ static int mlx5e_set_link_ksettings(struct net_device *netdev,
 
 u32 mlx5e_ethtool_get_rxfh_key_size(struct mlx5e_priv *priv)
 {
-	return sizeof(priv->channels.params.toeplitz_hash_key);
+	return sizeof(priv->rss_params.toeplitz_hash_key);
 }
 
 static u32 mlx5e_get_rxfh_key_size(struct net_device *netdev)
@@ -1108,17 +1109,18 @@ static int mlx5e_get_rxfh(struct net_device *netdev, u32 *indir, u8 *key,
 			  u8 *hfunc)
 {
 	struct mlx5e_priv *priv = netdev_priv(netdev);
+	struct mlx5e_rss_params *rss = &priv->rss_params;
 
 	if (indir)
-		memcpy(indir, priv->channels.params.indirection_rqt,
-		       sizeof(priv->channels.params.indirection_rqt));
+		memcpy(indir, rss->indirection_rqt,
+		       sizeof(rss->indirection_rqt));
 
 	if (key)
-		memcpy(key, priv->channels.params.toeplitz_hash_key,
-		       sizeof(priv->channels.params.toeplitz_hash_key));
+		memcpy(key, rss->toeplitz_hash_key,
+		       sizeof(rss->toeplitz_hash_key));
 
 	if (hfunc)
-		*hfunc = priv->channels.params.rss_hfunc;
+		*hfunc = rss->hfunc;
 
 	return 0;
 }
@@ -1127,6 +1129,7 @@ static int mlx5e_set_rxfh(struct net_device *dev, const u32 *indir,
 			  const u8 *key, const u8 hfunc)
 {
 	struct mlx5e_priv *priv = netdev_priv(dev);
+	struct mlx5e_rss_params *rss = &priv->rss_params;
 	int inlen = MLX5_ST_SZ_BYTES(modify_tir_in);
 	bool hash_changed = false;
 	void *in;
@@ -1142,15 +1145,14 @@ static int mlx5e_set_rxfh(struct net_device *dev, const u32 *indir,
 
 	mutex_lock(&priv->state_lock);
 
-	if (hfunc != ETH_RSS_HASH_NO_CHANGE &&
-	    hfunc != priv->channels.params.rss_hfunc) {
-		priv->channels.params.rss_hfunc = hfunc;
+	if (hfunc != ETH_RSS_HASH_NO_CHANGE && hfunc != rss->hfunc) {
+		rss->hfunc = hfunc;
 		hash_changed = true;
 	}
 
 	if (indir) {
-		memcpy(priv->channels.params.indirection_rqt, indir,
-		       sizeof(priv->channels.params.indirection_rqt));
+		memcpy(rss->indirection_rqt, indir,
+		       sizeof(rss->indirection_rqt));
 
 		if (test_bit(MLX5E_STATE_OPENED, &priv->state)) {
 			u32 rqtn = priv->indir_rqt.rqtn;
@@ -1158,7 +1160,7 @@ static int mlx5e_set_rxfh(struct net_device *dev, const u32 *indir,
 				.is_rss = true,
 				{
 					.rss = {
-						.hfunc = priv->channels.params.rss_hfunc,
+						.hfunc = rss->hfunc,
 						.channels  = &priv->channels,
 					},
 				},
@@ -1169,10 +1171,9 @@ static int mlx5e_set_rxfh(struct net_device *dev, const u32 *indir,
 	}
 
 	if (key) {
-		memcpy(priv->channels.params.toeplitz_hash_key, key,
-		       sizeof(priv->channels.params.toeplitz_hash_key));
-		hash_changed = hash_changed ||
-			       priv->channels.params.rss_hfunc == ETH_RSS_HASH_TOP;
+		memcpy(rss->toeplitz_hash_key, key,
+		       sizeof(rss->toeplitz_hash_key));
+		hash_changed = hash_changed || rss->hfunc == ETH_RSS_HASH_TOP;
 	}
 
 	if (hash_changed)
@@ -1807,12 +1808,40 @@ static int set_pflag_rx_no_csum_complete(struct net_device *netdev, bool enable)
 	return 0;
 }
 
+static int set_pflag_xdp_tx_mpwqe(struct net_device *netdev, bool enable)
+{
+	struct mlx5e_priv *priv = netdev_priv(netdev);
+	struct mlx5_core_dev *mdev = priv->mdev;
+	struct mlx5e_channels new_channels = {};
+	int err;
+
+	if (enable && !MLX5_CAP_ETH(mdev, enhanced_multi_pkt_send_wqe))
+		return -EOPNOTSUPP;
+
+	new_channels.params = priv->channels.params;
+
+	MLX5E_SET_PFLAG(&new_channels.params, MLX5E_PFLAG_XDP_TX_MPWQE, enable);
+
+	if (!test_bit(MLX5E_STATE_OPENED, &priv->state)) {
+		priv->channels.params = new_channels.params;
+		return 0;
+	}
+
+	err = mlx5e_open_channels(priv, &new_channels);
+	if (err)
+		return err;
+
+	mlx5e_switch_priv_channels(priv, &new_channels, NULL);
+	return 0;
+}
+
 static const struct pflag_desc mlx5e_priv_flags[MLX5E_NUM_PFLAGS] = {
 	{ "rx_cqe_moder",        set_pflag_rx_cqe_based_moder },
 	{ "tx_cqe_moder",        set_pflag_tx_cqe_based_moder },
 	{ "rx_cqe_compress",     set_pflag_rx_cqe_compress },
 	{ "rx_striding_rq",      set_pflag_rx_striding_rq },
 	{ "rx_no_csum_complete", set_pflag_rx_no_csum_complete },
+	{ "xdp_tx_mpwqe",        set_pflag_xdp_tx_mpwqe },
 };
 
 static int mlx5e_handle_pflag(struct net_device *netdev,

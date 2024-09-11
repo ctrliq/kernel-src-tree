@@ -2163,8 +2163,6 @@ static int rocker_port_obj_del(struct net_device *dev,
 static const struct switchdev_ops rocker_port_switchdev_ops = {
 	.switchdev_port_attr_get	= rocker_port_attr_get,
 	.switchdev_port_attr_set	= rocker_port_attr_set,
-	.switchdev_port_obj_add		= rocker_port_obj_add,
-	.switchdev_port_obj_del		= rocker_port_obj_del,
 };
 
 struct rocker_fib_event_work {
@@ -2761,7 +2759,7 @@ rocker_fdb_offload_notify(struct rocker_port *rocker_port,
 	info.vid = recv_info->vid;
 	info.offloaded = true;
 	call_switchdev_notifiers(SWITCHDEV_FDB_OFFLOADED,
-				 rocker_port->dev, &info.info);
+				 rocker_port->dev, &info.info, NULL);
 }
 
 static void rocker_switchdev_event_work(struct work_struct *work)

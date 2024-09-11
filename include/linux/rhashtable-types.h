@@ -14,6 +14,10 @@
 #include <linux/mutex.h>
 #include <linux/workqueue.h>
 
+#ifdef __GENKSYMS__
+#include <linux/rhashtable.h>
+#endif
+
 struct rhash_head {
 	struct rhash_head __rcu		*next;
 };
@@ -63,6 +67,7 @@ struct rhashtable_params {
 	u16			min_size;
 	bool			automatic_shrinking;
 	u8			locks_mul;
+	RH_KABI_DEPRECATE(u32,	nulls_base)
 	rht_hashfn_t		hashfn;
 	rht_obj_hashfn_t	obj_hashfn;
 	rht_obj_cmpfn_t		obj_cmpfn;
