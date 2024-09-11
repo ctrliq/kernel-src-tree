@@ -1,0 +1,108 @@
+nvme: keep ctrl->namespaces ordered
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-358.el8
+commit-author Christoph Hellwig <hch@lst.de>
+commit 298ba0e3d4af539cc37f982d4c011a0f07fca48c
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-358.el8/298ba0e3.failed
+
+Various places in the nvme code that rely on ctrl->namespace to be
+ordered.  Ensure that the namespae is inserted into the list at the
+right position from the start instead of sorting it after the fact.
+
+Fixes: 540c801c65eb ("NVMe: Implement namespace list scanning")
+	Reported-by: Anton Eidelman <anton.eidelman@gmail.com>
+	Signed-off-by: Christoph Hellwig <hch@lst.de>
+	Reviewed-by: Keith Busch <kbusch@kernel.org>
+	Reviewed-by: Sagi Grimberg <sagi@grimberg.me>
+	Reviewed-by: Chaitanya Kulkarni <kch@nvidia.com>
+	Reviewed-by: Damien Le Moal <damien.lemoal@wdc.com>
+(cherry picked from commit 298ba0e3d4af539cc37f982d4c011a0f07fca48c)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/nvme/host/core.c
+diff --cc drivers/nvme/host/core.c
+index e310c0f15679,e486845d2c7e..000000000000
+--- a/drivers/nvme/host/core.c
++++ b/drivers/nvme/host/core.c
+@@@ -4065,14 -3715,6 +4064,17 @@@ out_unlock
+  	return ret;
+  }
+  
+++<<<<<<< HEAD
+ +static int ns_cmp(void *priv, struct list_head *a, struct list_head *b)
+ +{
+ +	struct nvme_ns *nsa = container_of(a, struct nvme_ns, list);
+ +	struct nvme_ns *nsb = container_of(b, struct nvme_ns, list);
+ +
+ +	return nsa->head->ns_id - nsb->head->ns_id;
+ +}
+ +
+++=======
+++>>>>>>> 298ba0e3d4af (nvme: keep ctrl->namespaces ordered)
+  struct nvme_ns *nvme_find_get_ns(struct nvme_ctrl *ctrl, unsigned nsid)
+  {
+  	struct nvme_ns *ns, *ret = NULL;
+@@@ -4091,8 -3733,24 +4093,24 @@@
+  	up_read(&ctrl->namespaces_rwsem);
+  	return ret;
+  }
+ -EXPORT_SYMBOL_NS_GPL(nvme_find_get_ns, NVME_TARGET_PASSTHRU);
+ +EXPORT_SYMBOL_GPL(nvme_find_get_ns);
+  
++ /*
++  * Add the namespace to the controller list while keeping the list ordered.
++  */
++ static void nvme_ns_add_to_ctrl_list(struct nvme_ns *ns)
++ {
++ 	struct nvme_ns *tmp;
++ 
++ 	list_for_each_entry_reverse(tmp, &ns->ctrl->namespaces, list) {
++ 		if (tmp->head->ns_id < ns->head->ns_id) {
++ 			list_add(&ns->list, &tmp->list);
++ 			return;
++ 		}
++ 	}
++ 	list_add(&ns->list, &ns->ctrl->namespaces);
++ }
++ 
+  static void nvme_alloc_ns(struct nvme_ctrl *ctrl, unsigned nsid,
+  		struct nvme_ns_ids *ids)
+  {
+@@@ -4143,25 -3796,20 +4161,24 @@@
+  	if (!nvme_mpath_set_disk_name(ns, disk->disk_name, &disk->flags))
+  		sprintf(disk->disk_name, "nvme%dn%d", ctrl->instance,
+  			ns->head->instance);
+ +	ns->disk = disk;
+  
+  	if (nvme_update_ns_info(ns, id))
+ -		goto out_unlink_ns;
+ +		goto out_put_disk;
+ +
+ +	if ((ctrl->quirks & NVME_QUIRK_LIGHTNVM) && id->vs[0] == 0x1) {
+ +		if (nvme_nvm_register(ns, disk->disk_name, node)) {
+ +			dev_warn(ctrl->device, "LightNVM init failure\n");
+ +			goto out_put_disk;
+ +		}
+ +	}
+  
+  	down_write(&ctrl->namespaces_rwsem);
+- 	list_add_tail(&ns->list, &ctrl->namespaces);
++ 	nvme_ns_add_to_ctrl_list(ns);
+  	up_write(&ctrl->namespaces_rwsem);
+- 
+  	nvme_get_ctrl(ctrl);
+  
+ -	if (device_add_disk(ctrl->device, ns->disk, nvme_ns_id_attr_groups))
+ -		goto out_cleanup_ns_from_list;
+ -
+ -	if (!nvme_ns_head_multipath(ns->head))
+ -		nvme_add_ns_cdev(ns);
+ +	device_add_disk(ctrl->device, ns->disk, nvme_ns_id_attr_groups);
+  
+  	nvme_mpath_add_disk(ns, id);
+  	nvme_fault_inject_init(&ns->fault_inject, ns->disk->disk_name);
+* Unmerged path drivers/nvme/host/core.c
