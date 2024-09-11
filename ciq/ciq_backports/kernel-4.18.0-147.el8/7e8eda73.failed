@@ -1,0 +1,278 @@
+ntp: Audit NTP parameters adjustment
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-147.el8
+commit-author Ondrej Mosnacek <omosnace@redhat.com>
+commit 7e8eda734d30de81d06a949c9bf9853c445ede4e
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-147.el8/7e8eda73.failed
+
+Emit an audit record every time selected NTP parameters are modified
+from userspace (via adjtimex(2) or clock_adjtime(2)). These parameters
+may be used to indirectly change system clock, and thus their
+modifications should be audited.
+
+Such events will now generate records of type AUDIT_TIME_ADJNTPVAL
+containing the following fields:
+  - op -- which value was adjusted:
+    - offset -- corresponding to the time_offset variable
+    - freq   -- corresponding to the time_freq variable
+    - status -- corresponding to the time_status variable
+    - adjust -- corresponding to the time_adjust variable
+    - tick   -- corresponding to the tick_usec variable
+    - tai    -- corresponding to the timekeeping's TAI offset
+  - old -- the old value
+  - new -- the new value
+
+Example records:
+
+type=TIME_ADJNTPVAL msg=audit(1530616044.507:7): op=status old=64 new=8256
+type=TIME_ADJNTPVAL msg=audit(1530616044.511:11): op=freq old=0 new=49180377088000
+
+The records of this type will be associated with the corresponding
+syscall records.
+
+An overview of parameter changes that can be done via do_adjtimex()
+(based on information from Miroslav Lichvar) and whether they are
+audited:
+  __timekeeping_set_tai_offset() -- sets the offset from the
+                                    International Atomic Time
+                                    (AUDITED)
+  NTP variables:
+    time_offset -- can adjust the clock by up to 0.5 seconds per call
+                   and also speed it up or slow down by up to about
+                   0.05% (43 seconds per day) (AUDITED)
+    time_freq -- can speed up or slow down by up to about 0.05%
+                 (AUDITED)
+    time_status -- can insert/delete leap seconds and it also enables/
+                   disables synchronization of the hardware real-time
+                   clock (AUDITED)
+    time_maxerror, time_esterror -- change error estimates used to
+                                    inform userspace applications
+                                    (NOT AUDITED)
+    time_constant -- controls the speed of the clock adjustments that
+                     are made when time_offset is set (NOT AUDITED)
+    time_adjust -- can temporarily speed up or slow down the clock by up
+                   to 0.05% (AUDITED)
+    tick_usec -- a more extreme version of time_freq; can speed up or
+                 slow down the clock by up to 10% (AUDITED)
+
+	Signed-off-by: Ondrej Mosnacek <omosnace@redhat.com>
+	Reviewed-by: Richard Guy Briggs <rgb@redhat.com>
+	Reviewed-by: Thomas Gleixner <tglx@linutronix.de>
+	Signed-off-by: Paul Moore <paul@paul-moore.com>
+(cherry picked from commit 7e8eda734d30de81d06a949c9bf9853c445ede4e)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	kernel/time/ntp.c
+#	kernel/time/ntp_internal.h
+#	kernel/time/timekeeping.c
+diff --cc kernel/time/ntp.c
+index bc3a3c37ec9c,ac5555e25733..000000000000
+--- a/kernel/time/ntp.c
++++ b/kernel/time/ntp.c
+@@@ -715,7 -709,8 +716,12 @@@ static inline void process_adjtimex_mod
+   * adjtimex mainly allows reading (and writing, if superuser) of
+   * kernel time-keeping variables. used by xntpd.
+   */
+++<<<<<<< HEAD
+ +int __do_adjtimex(struct timex *txc, const struct timespec64 *ts, s32 *time_tai)
+++=======
++ int __do_adjtimex(struct __kernel_timex *txc, const struct timespec64 *ts,
++ 		  s32 *time_tai, struct audit_ntp_data *ad)
+++>>>>>>> 7e8eda734d30 (ntp: Audit NTP parameters adjustment)
+  {
+  	int result;
+  
+diff --cc kernel/time/ntp_internal.h
+index c24b0e13f011,908ecaa65fc3..000000000000
+--- a/kernel/time/ntp_internal.h
++++ b/kernel/time/ntp_internal.h
+@@@ -8,6 -8,8 +8,12 @@@ extern void ntp_clear(void)
+  extern u64 ntp_tick_length(void);
+  extern ktime_t ntp_get_next_leap(void);
+  extern int second_overflow(time64_t secs);
+++<<<<<<< HEAD
+ +extern int __do_adjtimex(struct timex *txc, const struct timespec64 *ts, s32 *time_tai);
+++=======
++ extern int __do_adjtimex(struct __kernel_timex *txc,
++ 			 const struct timespec64 *ts,
++ 			 s32 *time_tai, struct audit_ntp_data *ad);
+++>>>>>>> 7e8eda734d30 (ntp: Audit NTP parameters adjustment)
+  extern void __hardpps(const struct timespec64 *phase_ts, const struct timespec64 *raw_ts);
+  #endif /* _LINUX_NTP_INTERNAL_H */
+diff --cc kernel/time/timekeeping.c
+index e344906f9686,f366f2fdf1b0..000000000000
+--- a/kernel/time/timekeeping.c
++++ b/kernel/time/timekeeping.c
+@@@ -2291,9 -2304,10 +2291,10 @@@ static int timekeeping_validate_timex(c
+  /**
+   * do_adjtimex() - Accessor function to NTP __do_adjtimex function
+   */
+ -int do_adjtimex(struct __kernel_timex *txc)
+ +int do_adjtimex(struct timex *txc)
+  {
+  	struct timekeeper *tk = &tk_core.timekeeper;
++ 	struct audit_ntp_data ad;
+  	unsigned long flags;
+  	struct timespec64 ts;
+  	s32 orig_tai, tai;
+@@@ -2334,6 -2350,12 +2337,15 @@@
+  	write_seqcount_end(&tk_core.seq);
+  	raw_spin_unlock_irqrestore(&timekeeper_lock, flags);
+  
+++<<<<<<< HEAD
+++=======
++ 	audit_ntp_log(&ad);
++ 
++ 	/* Update the multiplier immediately if frequency was set directly */
++ 	if (txc->modes & (ADJ_FREQUENCY | ADJ_TICK))
++ 		timekeeping_advance(TK_ADV_FREQ);
++ 
+++>>>>>>> 7e8eda734d30 (ntp: Audit NTP parameters adjustment)
+  	if (tai != orig_tai)
+  		clock_was_set();
+  
+diff --git a/include/linux/audit.h b/include/linux/audit.h
+index cc0253a76da7..bcde1e6adf1e 100644
+--- a/include/linux/audit.h
++++ b/include/linux/audit.h
+@@ -85,6 +85,29 @@ struct audit_field {
+ 	u32				op;
+ };
+ 
++enum audit_ntp_type {
++	AUDIT_NTP_OFFSET,
++	AUDIT_NTP_FREQ,
++	AUDIT_NTP_STATUS,
++	AUDIT_NTP_TAI,
++	AUDIT_NTP_TICK,
++	AUDIT_NTP_ADJUST,
++
++	AUDIT_NTP_NVALS /* count */
++};
++
++#ifdef CONFIG_AUDITSYSCALL
++struct audit_ntp_val {
++	long long oldval, newval;
++};
++
++struct audit_ntp_data {
++	struct audit_ntp_val vals[AUDIT_NTP_NVALS];
++};
++#else
++struct audit_ntp_data {};
++#endif
++
+ extern int is_audit_feature_set(int which);
+ 
+ extern int __init audit_register_class(int class, unsigned *list);
+@@ -354,6 +377,7 @@ extern void __audit_mmap_fd(int fd, int flags);
+ extern void __audit_log_kern_module(char *name);
+ extern void __audit_fanotify(unsigned int response);
+ extern void __audit_tk_injoffset(struct timespec64 offset);
++extern void __audit_ntp_log(const struct audit_ntp_data *ad);
+ 
+ static inline void audit_ipc_obj(struct kern_ipc_perm *ipcp)
+ {
+@@ -466,6 +490,29 @@ static inline void audit_tk_injoffset(struct timespec64 offset)
+ 		__audit_tk_injoffset(offset);
+ }
+ 
++static inline void audit_ntp_init(struct audit_ntp_data *ad)
++{
++	memset(ad, 0, sizeof(*ad));
++}
++
++static inline void audit_ntp_set_old(struct audit_ntp_data *ad,
++				     enum audit_ntp_type type, long long val)
++{
++	ad->vals[type].oldval = val;
++}
++
++static inline void audit_ntp_set_new(struct audit_ntp_data *ad,
++				     enum audit_ntp_type type, long long val)
++{
++	ad->vals[type].newval = val;
++}
++
++static inline void audit_ntp_log(const struct audit_ntp_data *ad)
++{
++	if (!audit_dummy_context())
++		__audit_ntp_log(ad);
++}
++
+ extern int audit_n_rules;
+ extern int audit_signals;
+ #else /* CONFIG_AUDITSYSCALL */
+@@ -595,6 +642,20 @@ static inline void audit_fanotify(unsigned int response)
+ static inline void audit_tk_injoffset(struct timespec64 offset)
+ { }
+ 
++static inline void audit_ntp_init(struct audit_ntp_data *ad)
++{ }
++
++static inline void audit_ntp_set_old(struct audit_ntp_data *ad,
++				     enum audit_ntp_type type, long long val)
++{ }
++
++static inline void audit_ntp_set_new(struct audit_ntp_data *ad,
++				     enum audit_ntp_type type, long long val)
++{ }
++
++static inline void audit_ntp_log(const struct audit_ntp_data *ad)
++{ }
++
+ static inline void audit_ptrace(struct task_struct *t)
+ { }
+ #define audit_n_rules 0
+diff --git a/include/uapi/linux/audit.h b/include/uapi/linux/audit.h
+index f7f9760b901a..ed2c8ce4f8c3 100644
+--- a/include/uapi/linux/audit.h
++++ b/include/uapi/linux/audit.h
+@@ -115,6 +115,7 @@
+ #define AUDIT_KERN_MODULE	1330	/* Kernel Module events */
+ #define AUDIT_FANOTIFY		1331	/* Fanotify access decision */
+ #define AUDIT_TIME_INJOFFSET	1332	/* Timekeeping offset injected */
++#define AUDIT_TIME_ADJNTPVAL	1333	/* NTP value adjustment */
+ 
+ #define AUDIT_AVC		1400	/* SE Linux avc denial or grant */
+ #define AUDIT_SELINUX_ERR	1401	/* Internal SE Linux Errors */
+diff --git a/kernel/auditsc.c b/kernel/auditsc.c
+index 30feabd65777..e7dfa3768d42 100644
+--- a/kernel/auditsc.c
++++ b/kernel/auditsc.c
+@@ -2434,6 +2434,28 @@ void __audit_tk_injoffset(struct timespec64 offset)
+ 		  (long long)offset.tv_sec, offset.tv_nsec);
+ }
+ 
++static void audit_log_ntp_val(const struct audit_ntp_data *ad,
++			      const char *op, enum audit_ntp_type type)
++{
++	const struct audit_ntp_val *val = &ad->vals[type];
++
++	if (val->newval == val->oldval)
++		return;
++
++	audit_log(audit_context(), GFP_KERNEL, AUDIT_TIME_ADJNTPVAL,
++		  "op=%s old=%lli new=%lli", op, val->oldval, val->newval);
++}
++
++void __audit_ntp_log(const struct audit_ntp_data *ad)
++{
++	audit_log_ntp_val(ad, "offset",	AUDIT_NTP_OFFSET);
++	audit_log_ntp_val(ad, "freq",	AUDIT_NTP_FREQ);
++	audit_log_ntp_val(ad, "status",	AUDIT_NTP_STATUS);
++	audit_log_ntp_val(ad, "tai",	AUDIT_NTP_TAI);
++	audit_log_ntp_val(ad, "tick",	AUDIT_NTP_TICK);
++	audit_log_ntp_val(ad, "adjust",	AUDIT_NTP_ADJUST);
++}
++
+ static void audit_log_task(struct audit_buffer *ab)
+ {
+ 	kuid_t auid, uid;
+* Unmerged path kernel/time/ntp.c
+* Unmerged path kernel/time/ntp_internal.h
+* Unmerged path kernel/time/timekeeping.c
