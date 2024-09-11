@@ -524,7 +524,7 @@ struct nfs_closeargs {
 	struct nfs_seqid *	seqid;
 	fmode_t			fmode;
 	u32			share_access;
-	const u32 *		bitmask;
+	u32 *			bitmask;
 	struct nfs4_layoutreturn_args *lr_args;
 };
 
@@ -607,7 +607,7 @@ struct nfs4_delegreturnargs {
 	struct nfs4_sequence_args	seq_args;
 	const struct nfs_fh *fhandle;
 	const nfs4_stateid *stateid;
-	const u32 * bitmask;
+	u32 * bitmask;
 	struct nfs4_layoutreturn_args *lr_args;
 };
 
@@ -647,7 +647,7 @@ struct nfs_pgio_args {
 	union {
 		unsigned int		replen;			/* used by read */
 		struct {
-			const u32 *		bitmask;	/* used by write */
+			u32 *			bitmask;	/* used by write */
 			enum nfs3_stable_how	stable;		/* used by write */
 		};
 	};
