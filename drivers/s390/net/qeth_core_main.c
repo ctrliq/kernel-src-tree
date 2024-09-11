@@ -5830,9 +5830,7 @@ static void qeth_iqd_tx_complete(struct qeth_qdio_out_q *queue,
 	struct qeth_card *card = queue->card;
 	bool error = !!qdio_error;
 
-	if ((qdio_error == QDIO_ERROR_SLSB_PENDING) ||
-	    (queue->bufstates && (queue->bufstates[bidx].flags &
-				  QDIO_OUTBUF_STATE_FLAG_PENDING))) {
+	if (qdio_error == QDIO_ERROR_SLSB_PENDING) {
 		WARN_ON_ONCE(card->options.cq != QETH_CQ_ENABLED);
 
 		if (atomic_cmpxchg(&buffer->state, QETH_QDIO_BUF_PRIMED,
