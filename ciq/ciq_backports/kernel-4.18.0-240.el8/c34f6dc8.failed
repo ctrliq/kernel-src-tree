@@ -1,0 +1,389 @@
+gpiolib: Set lockdep class for hierarchical irq domains
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Stephen Boyd <swboyd@chromium.org>
+commit c34f6dc8c9e6bbe9fba1d53acd6d9a3889599da3
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/c34f6dc8.failed
+
+I see the following lockdep splat in the qcom pinctrl driver when
+attempting to suspend the device.
+
+ ============================================
+ WARNING: possible recursive locking detected
+ 5.4.2 #2 Tainted: G S
+ --------------------------------------------
+ cat/6536 is trying to acquire lock:
+ ffffff814787ccc0 (&irq_desc_lock_class){-.-.}, at: __irq_get_desc_lock+0x64/0x94
+
+ but task is already holding lock:
+ ffffff81436740c0 (&irq_desc_lock_class){-.-.}, at: __irq_get_desc_lock+0x64/0x94
+
+ other info that might help us debug this:
+  Possible unsafe locking scenario:
+
+        CPU0
+        ----
+   lock(&irq_desc_lock_class);
+   lock(&irq_desc_lock_class);
+
+  *** DEADLOCK ***
+
+  May be due to missing lock nesting notation
+
+ 7 locks held by cat/6536:
+  #0: ffffff8140e0c420 (sb_writers#7){.+.+}, at: vfs_write+0xc8/0x19c
+  #1: ffffff8121eec480 (&of->mutex){+.+.}, at: kernfs_fop_write+0x128/0x1f4
+  #2: ffffff8147cad668 (kn->count#263){.+.+}, at: kernfs_fop_write+0x130/0x1f4
+  #3: ffffffd011446000 (system_transition_mutex){+.+.}, at: pm_suspend+0x108/0x354
+  #4: ffffff814302b970 (&dev->mutex){....}, at: __device_suspend+0x16c/0x420
+  #5: ffffff81436740c0 (&irq_desc_lock_class){-.-.}, at: __irq_get_desc_lock+0x64/0x94
+  #6: ffffff81479b8c10 (&pctrl->lock){....}, at: msm_gpio_irq_set_wake+0x48/0x7c
+
+ stack backtrace:
+ CPU: 4 PID: 6536 Comm: cat Tainted: G S                5.4.2 #2
+ Call trace:
+  dump_backtrace+0x0/0x174
+  show_stack+0x20/0x2c
+  dump_stack+0xdc/0x144
+  __lock_acquire+0x52c/0x2268
+  lock_acquire+0x1dc/0x220
+  _raw_spin_lock_irqsave+0x64/0x80
+  __irq_get_desc_lock+0x64/0x94
+  irq_set_irq_wake+0x40/0x144
+  msm_gpio_irq_set_wake+0x5c/0x7c
+  set_irq_wake_real+0x40/0x5c
+  irq_set_irq_wake+0x70/0x144
+  cros_ec_rtc_suspend+0x38/0x4c
+  platform_pm_suspend+0x34/0x60
+  dpm_run_callback+0x64/0xcc
+  __device_suspend+0x314/0x420
+  dpm_suspend+0xf8/0x298
+  dpm_suspend_start+0x84/0xb4
+  suspend_devices_and_enter+0xbc/0x628
+  pm_suspend+0x214/0x354
+  state_store+0xb0/0x108
+  kobj_attr_store+0x14/0x24
+  sysfs_kf_write+0x4c/0x64
+  kernfs_fop_write+0x158/0x1f4
+  __vfs_write+0x54/0x18c
+  vfs_write+0xdc/0x19c
+  ksys_write+0x7c/0xe4
+  __arm64_sys_write+0x20/0x2c
+  el0_svc_common+0xa8/0x160
+  el0_svc_compat_handler+0x2c/0x38
+  el0_svc_compat+0x8/0x10
+
+This is because the msm_gpio_irq_set_wake() function calls
+irq_set_irq_wake() as a backup in case the irq comes in during the path
+to idle. Given that we're calling irqchip functions from within an
+irqchip we need to set the lockdep class to be different for this child
+controller vs. the default one that the parent irqchip gets.
+
+This used to be done before this driver was converted to hierarchical
+irq domains in commit e35a6ae0eb3a ("pinctrl/msm: Setup GPIO chip in
+hierarchy") via the gpiochip_irq_map() function. With hierarchical irq
+domains this function has been replaced by
+gpiochip_hierarchy_irq_domain_alloc(). Therefore, set the lockdep class
+like was done previously in the irq domain path so we can avoid this
+lockdep warning.
+
+Fixes: fdd61a013a24 ("gpio: Add support for hierarchical IRQ domains")
+	Cc: Thierry Reding <treding@nvidia.com>
+	Cc: Brian Masney <masneyb@onstation.org>
+	Cc: Lina Iyer <ilina@codeaurora.org>
+	Cc: Marc Zyngier <maz@kernel.org>
+	Cc: Maulik Shah <mkshah@codeaurora.org>
+	Signed-off-by: Stephen Boyd <swboyd@chromium.org>
+Link: https://lore.kernel.org/r/20200114231103.85641-1-swboyd@chromium.org
+	Signed-off-by: Linus Walleij <linus.walleij@linaro.org>
+(cherry picked from commit c34f6dc8c9e6bbe9fba1d53acd6d9a3889599da3)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/gpio/gpiolib.c
+diff --cc drivers/gpio/gpiolib.c
+index 1987b8ce323f,91a0e83c465d..000000000000
+--- a/drivers/gpio/gpiolib.c
++++ b/drivers/gpio/gpiolib.c
+@@@ -1759,6 -1872,274 +1759,277 @@@ void gpiochip_set_nested_irqchip(struc
+  }
+  EXPORT_SYMBOL_GPL(gpiochip_set_nested_irqchip);
+  
+++<<<<<<< HEAD
+++=======
++ #ifdef CONFIG_IRQ_DOMAIN_HIERARCHY
++ 
++ /**
++  * gpiochip_set_hierarchical_irqchip() - connects a hierarchical irqchip
++  * to a gpiochip
++  * @gc: the gpiochip to set the irqchip hierarchical handler to
++  * @irqchip: the irqchip to handle this level of the hierarchy, the interrupt
++  * will then percolate up to the parent
++  */
++ static void gpiochip_set_hierarchical_irqchip(struct gpio_chip *gc,
++ 					      struct irq_chip *irqchip)
++ {
++ 	/* DT will deal with mapping each IRQ as we go along */
++ 	if (is_of_node(gc->irq.fwnode))
++ 		return;
++ 
++ 	/*
++ 	 * This is for legacy and boardfile "irqchip" fwnodes: allocate
++ 	 * irqs upfront instead of dynamically since we don't have the
++ 	 * dynamic type of allocation that hardware description languages
++ 	 * provide. Once all GPIO drivers using board files are gone from
++ 	 * the kernel we can delete this code, but for a transitional period
++ 	 * it is necessary to keep this around.
++ 	 */
++ 	if (is_fwnode_irqchip(gc->irq.fwnode)) {
++ 		int i;
++ 		int ret;
++ 
++ 		for (i = 0; i < gc->ngpio; i++) {
++ 			struct irq_fwspec fwspec;
++ 			unsigned int parent_hwirq;
++ 			unsigned int parent_type;
++ 			struct gpio_irq_chip *girq = &gc->irq;
++ 
++ 			/*
++ 			 * We call the child to parent translation function
++ 			 * only to check if the child IRQ is valid or not.
++ 			 * Just pick the rising edge type here as that is what
++ 			 * we likely need to support.
++ 			 */
++ 			ret = girq->child_to_parent_hwirq(gc, i,
++ 							  IRQ_TYPE_EDGE_RISING,
++ 							  &parent_hwirq,
++ 							  &parent_type);
++ 			if (ret) {
++ 				chip_err(gc, "skip set-up on hwirq %d\n",
++ 					 i);
++ 				continue;
++ 			}
++ 
++ 			fwspec.fwnode = gc->irq.fwnode;
++ 			/* This is the hwirq for the GPIO line side of things */
++ 			fwspec.param[0] = girq->child_offset_to_irq(gc, i);
++ 			/* Just pick something */
++ 			fwspec.param[1] = IRQ_TYPE_EDGE_RISING;
++ 			fwspec.param_count = 2;
++ 			ret = __irq_domain_alloc_irqs(gc->irq.domain,
++ 						      /* just pick something */
++ 						      -1,
++ 						      1,
++ 						      NUMA_NO_NODE,
++ 						      &fwspec,
++ 						      false,
++ 						      NULL);
++ 			if (ret < 0) {
++ 				chip_err(gc,
++ 					 "can not allocate irq for GPIO line %d parent hwirq %d in hierarchy domain: %d\n",
++ 					 i, parent_hwirq,
++ 					 ret);
++ 			}
++ 		}
++ 	}
++ 
++ 	chip_err(gc, "%s unknown fwnode type proceed anyway\n", __func__);
++ 
++ 	return;
++ }
++ 
++ static int gpiochip_hierarchy_irq_domain_translate(struct irq_domain *d,
++ 						   struct irq_fwspec *fwspec,
++ 						   unsigned long *hwirq,
++ 						   unsigned int *type)
++ {
++ 	/* We support standard DT translation */
++ 	if (is_of_node(fwspec->fwnode) && fwspec->param_count == 2) {
++ 		return irq_domain_translate_twocell(d, fwspec, hwirq, type);
++ 	}
++ 
++ 	/* This is for board files and others not using DT */
++ 	if (is_fwnode_irqchip(fwspec->fwnode)) {
++ 		int ret;
++ 
++ 		ret = irq_domain_translate_twocell(d, fwspec, hwirq, type);
++ 		if (ret)
++ 			return ret;
++ 		WARN_ON(*type == IRQ_TYPE_NONE);
++ 		return 0;
++ 	}
++ 	return -EINVAL;
++ }
++ 
++ static int gpiochip_hierarchy_irq_domain_alloc(struct irq_domain *d,
++ 					       unsigned int irq,
++ 					       unsigned int nr_irqs,
++ 					       void *data)
++ {
++ 	struct gpio_chip *gc = d->host_data;
++ 	irq_hw_number_t hwirq;
++ 	unsigned int type = IRQ_TYPE_NONE;
++ 	struct irq_fwspec *fwspec = data;
++ 	struct irq_fwspec parent_fwspec;
++ 	unsigned int parent_hwirq;
++ 	unsigned int parent_type;
++ 	struct gpio_irq_chip *girq = &gc->irq;
++ 	int ret;
++ 
++ 	/*
++ 	 * The nr_irqs parameter is always one except for PCI multi-MSI
++ 	 * so this should not happen.
++ 	 */
++ 	WARN_ON(nr_irqs != 1);
++ 
++ 	ret = gc->irq.child_irq_domain_ops.translate(d, fwspec, &hwirq, &type);
++ 	if (ret)
++ 		return ret;
++ 
++ 	chip_info(gc, "allocate IRQ %d, hwirq %lu\n", irq,  hwirq);
++ 
++ 	ret = girq->child_to_parent_hwirq(gc, hwirq, type,
++ 					  &parent_hwirq, &parent_type);
++ 	if (ret) {
++ 		chip_err(gc, "can't look up hwirq %lu\n", hwirq);
++ 		return ret;
++ 	}
++ 	chip_info(gc, "found parent hwirq %u\n", parent_hwirq);
++ 
++ 	/*
++ 	 * We set handle_bad_irq because the .set_type() should
++ 	 * always be invoked and set the right type of handler.
++ 	 */
++ 	irq_domain_set_info(d,
++ 			    irq,
++ 			    hwirq,
++ 			    gc->irq.chip,
++ 			    gc,
++ 			    girq->handler,
++ 			    NULL, NULL);
++ 	irq_set_probe(irq);
++ 
++ 	/*
++ 	 * Create a IRQ fwspec to send up to the parent irqdomain:
++ 	 * specify the hwirq we address on the parent and tie it
++ 	 * all together up the chain.
++ 	 */
++ 	parent_fwspec.fwnode = d->parent->fwnode;
++ 	/* This parent only handles asserted level IRQs */
++ 	girq->populate_parent_fwspec(gc, &parent_fwspec, parent_hwirq,
++ 				     parent_type);
++ 	chip_info(gc, "alloc_irqs_parent for %d parent hwirq %d\n",
++ 		  irq, parent_hwirq);
++ 	irq_set_lockdep_class(irq, gc->irq.lock_key, gc->irq.request_key);
++ 	ret = irq_domain_alloc_irqs_parent(d, irq, 1, &parent_fwspec);
++ 	if (ret)
++ 		chip_err(gc,
++ 			 "failed to allocate parent hwirq %d for hwirq %lu\n",
++ 			 parent_hwirq, hwirq);
++ 
++ 	return ret;
++ }
++ 
++ static unsigned int gpiochip_child_offset_to_irq_noop(struct gpio_chip *chip,
++ 						      unsigned int offset)
++ {
++ 	return offset;
++ }
++ 
++ static void gpiochip_hierarchy_setup_domain_ops(struct irq_domain_ops *ops)
++ {
++ 	ops->activate = gpiochip_irq_domain_activate;
++ 	ops->deactivate = gpiochip_irq_domain_deactivate;
++ 	ops->alloc = gpiochip_hierarchy_irq_domain_alloc;
++ 	ops->free = irq_domain_free_irqs_common;
++ 
++ 	/*
++ 	 * We only allow overriding the translate() function for
++ 	 * hierarchical chips, and this should only be done if the user
++ 	 * really need something other than 1:1 translation.
++ 	 */
++ 	if (!ops->translate)
++ 		ops->translate = gpiochip_hierarchy_irq_domain_translate;
++ }
++ 
++ static int gpiochip_hierarchy_add_domain(struct gpio_chip *gc)
++ {
++ 	if (!gc->irq.child_to_parent_hwirq ||
++ 	    !gc->irq.fwnode) {
++ 		chip_err(gc, "missing irqdomain vital data\n");
++ 		return -EINVAL;
++ 	}
++ 
++ 	if (!gc->irq.child_offset_to_irq)
++ 		gc->irq.child_offset_to_irq = gpiochip_child_offset_to_irq_noop;
++ 
++ 	if (!gc->irq.populate_parent_fwspec)
++ 		gc->irq.populate_parent_fwspec =
++ 			gpiochip_populate_parent_fwspec_twocell;
++ 
++ 	gpiochip_hierarchy_setup_domain_ops(&gc->irq.child_irq_domain_ops);
++ 
++ 	gc->irq.domain = irq_domain_create_hierarchy(
++ 		gc->irq.parent_domain,
++ 		0,
++ 		gc->ngpio,
++ 		gc->irq.fwnode,
++ 		&gc->irq.child_irq_domain_ops,
++ 		gc);
++ 
++ 	if (!gc->irq.domain)
++ 		return -ENOMEM;
++ 
++ 	gpiochip_set_hierarchical_irqchip(gc, gc->irq.chip);
++ 
++ 	return 0;
++ }
++ 
++ static bool gpiochip_hierarchy_is_hierarchical(struct gpio_chip *gc)
++ {
++ 	return !!gc->irq.parent_domain;
++ }
++ 
++ void gpiochip_populate_parent_fwspec_twocell(struct gpio_chip *chip,
++ 					     struct irq_fwspec *fwspec,
++ 					     unsigned int parent_hwirq,
++ 					     unsigned int parent_type)
++ {
++ 	fwspec->param_count = 2;
++ 	fwspec->param[0] = parent_hwirq;
++ 	fwspec->param[1] = parent_type;
++ }
++ EXPORT_SYMBOL_GPL(gpiochip_populate_parent_fwspec_twocell);
++ 
++ void gpiochip_populate_parent_fwspec_fourcell(struct gpio_chip *chip,
++ 					      struct irq_fwspec *fwspec,
++ 					      unsigned int parent_hwirq,
++ 					      unsigned int parent_type)
++ {
++ 	fwspec->param_count = 4;
++ 	fwspec->param[0] = 0;
++ 	fwspec->param[1] = parent_hwirq;
++ 	fwspec->param[2] = 0;
++ 	fwspec->param[3] = parent_type;
++ }
++ EXPORT_SYMBOL_GPL(gpiochip_populate_parent_fwspec_fourcell);
++ 
++ #else
++ 
++ static int gpiochip_hierarchy_add_domain(struct gpio_chip *gc)
++ {
++ 	return -EINVAL;
++ }
++ 
++ static bool gpiochip_hierarchy_is_hierarchical(struct gpio_chip *gc)
++ {
++ 	return false;
++ }
++ 
++ #endif /* CONFIG_IRQ_DOMAIN_HIERARCHY */
++ 
+++>>>>>>> c34f6dc8c9e6 (gpiolib: Set lockdep class for hierarchical irq domains)
+  /**
+   * gpiochip_irq_map() - maps an IRQ into a GPIO irqchip
+   * @d: the irqdomain used by this irqchip
+* Unmerged path drivers/gpio/gpiolib.c
