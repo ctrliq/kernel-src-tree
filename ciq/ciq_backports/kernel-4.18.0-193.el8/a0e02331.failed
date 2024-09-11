@@ -1,0 +1,442 @@
+ALSA: firewire-lib: use variable size of queue for isoc packets instead of fixed size
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-193.el8
+commit-author Takashi Sakamoto <o-takashi@sakamocchi.jp>
+commit a0e023317e2d55c6b2fbf342c12d8a59797e1cff
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-193.el8/a0e02331.failed
+
+The number of packets in packet buffer has been fixed number (=48) since
+first commit of ALSA IEC 61883-1/6 packet streaming engine.
+
+This commit allows the engine to use variable number of packets in the
+buffer. The size is calculated by a parameter in AMDTP domain structure
+surely to store the number of events in the packets of buffer. Although
+the value of parameter is expected to come from 'period size' parameter
+of PCM substream, at present 48 is still used.
+
+	Signed-off-by: Takashi Sakamoto <o-takashi@sakamocchi.jp>
+Link: https://lore.kernel.org/r/20191017155424.885-2-o-takashi@sakamocchi.jp
+	Signed-off-by: Takashi Iwai <tiwai@suse.de>
+(cherry picked from commit a0e023317e2d55c6b2fbf342c12d8a59797e1cff)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	sound/firewire/amdtp-stream.c
+#	sound/firewire/amdtp-stream.h
+diff --cc sound/firewire/amdtp-stream.c
+index 1e174e012d5f,1f38729c8e74..000000000000
+--- a/sound/firewire/amdtp-stream.c
++++ b/sound/firewire/amdtp-stream.c
+@@@ -677,15 -668,90 +676,93 @@@ static inline u32 increment_cycle_count
+  }
+  
+  // Align to actual cycle count for the packet which is going to be scheduled.
+- // This module queued the same number of isochronous cycle as QUEUE_LENGTH to
+- // skip isochronous cycle, therefore it's OK to just increment the cycle by
+- // QUEUE_LENGTH for scheduled cycle.
+- static inline u32 compute_it_cycle(const __be32 ctx_header_tstamp)
++ // This module queued the same number of isochronous cycle as the size of queue
++ // to kip isochronous cycle, therefore it's OK to just increment the cycle by
++ // the size of queue for scheduled cycle.
++ static inline u32 compute_it_cycle(const __be32 ctx_header_tstamp,
++ 				   unsigned int queue_size)
+  {
+  	u32 cycle = compute_cycle_count(ctx_header_tstamp);
+- 	return increment_cycle_count(cycle, QUEUE_LENGTH);
++ 	return increment_cycle_count(cycle, queue_size);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static int generate_device_pkt_descs(struct amdtp_stream *s,
++ 				     struct pkt_desc *descs,
++ 				     const __be32 *ctx_header,
++ 				     unsigned int packets)
++ {
++ 	unsigned int dbc = s->data_block_counter;
++ 	int i;
++ 	int err;
++ 
++ 	for (i = 0; i < packets; ++i) {
++ 		struct pkt_desc *desc = descs + i;
++ 		unsigned int index = (s->packet_index + i) % s->queue_size;
++ 		unsigned int cycle;
++ 		unsigned int payload_length;
++ 		unsigned int data_blocks;
++ 		unsigned int syt;
++ 
++ 		cycle = compute_cycle_count(ctx_header[1]);
++ 
++ 		err = parse_ir_ctx_header(s, cycle, ctx_header, &payload_length,
++ 					  &data_blocks, &dbc, &syt, i);
++ 		if (err < 0)
++ 			return err;
++ 
++ 		desc->cycle = cycle;
++ 		desc->syt = syt;
++ 		desc->data_blocks = data_blocks;
++ 		desc->data_block_counter = dbc;
++ 		desc->ctx_payload = s->buffer.packets[index].buffer;
++ 
++ 		if (!(s->flags & CIP_DBC_IS_END_EVENT))
++ 			dbc = (dbc + desc->data_blocks) & 0xff;
++ 
++ 		ctx_header +=
++ 			s->ctx_data.tx.ctx_header_size / sizeof(*ctx_header);
++ 	}
++ 
++ 	s->data_block_counter = dbc;
++ 
++ 	return 0;
++ }
++ 
++ static void generate_ideal_pkt_descs(struct amdtp_stream *s,
++ 				     struct pkt_desc *descs,
++ 				     const __be32 *ctx_header,
++ 				     unsigned int packets)
++ {
++ 	unsigned int dbc = s->data_block_counter;
++ 	int i;
++ 
++ 	for (i = 0; i < packets; ++i) {
++ 		struct pkt_desc *desc = descs + i;
++ 		unsigned int index = (s->packet_index + i) % s->queue_size;
++ 
++ 		desc->cycle = compute_it_cycle(*ctx_header, s->queue_size);
++ 		desc->syt = calculate_syt(s, desc->cycle);
++ 		desc->data_blocks = calculate_data_blocks(s, desc->syt);
++ 
++ 		if (s->flags & CIP_DBC_IS_END_EVENT)
++ 			dbc = (dbc + desc->data_blocks) & 0xff;
++ 
++ 		desc->data_block_counter = dbc;
++ 
++ 		if (!(s->flags & CIP_DBC_IS_END_EVENT))
++ 			dbc = (dbc + desc->data_blocks) & 0xff;
++ 
++ 		desc->ctx_payload = s->buffer.packets[index].buffer;
++ 
++ 		++ctx_header;
++ 	}
++ 
++ 	s->data_block_counter = dbc;
++ }
++ 
+++>>>>>>> a0e023317e2d (ALSA: firewire-lib: use variable size of queue for isoc packets instead of fixed size)
+  static inline void cancel_stream(struct amdtp_stream *s)
+  {
+  	s->packet_index = -1;
+@@@ -706,12 -785,16 +783,22 @@@ static void out_stream_callback(struct 
+  	if (s->packet_index < 0)
+  		return;
+  
+++<<<<<<< HEAD
+++=======
++ 	// Calculate the number of packets in buffer and check XRUN.
++ 	packets = header_length / sizeof(*ctx_header);
++ 
++ 	generate_ideal_pkt_descs(s, s->pkt_descs, ctx_header, packets);
++ 
++ 	process_ctx_payloads(s, s->pkt_descs, packets);
++ 
+++>>>>>>> a0e023317e2d (ALSA: firewire-lib: use variable size of queue for isoc packets instead of fixed size)
+  	for (i = 0; i < packets; ++i) {
+ -		const struct pkt_desc *desc = s->pkt_descs + i;
+ +		u32 cycle;
+  		unsigned int syt;
+ +		unsigned int data_blocks;
+ +		__be32 *buffer;
+ +		unsigned int pcm_frames;
+  		struct {
+  			struct fw_iso_packet params;
+  			__be32 header[IT_PKT_HEADER_SIZE_CIP / sizeof(__be32)];
+@@@ -754,51 -831,26 +841,51 @@@ static void in_stream_callback(struct f
+  	if (s->packet_index < 0)
+  		return;
+  
+- 	// The number of packets in buffer.
++ 	// Calculate the number of packets in buffer and check XRUN.
+  	packets = header_length / s->ctx_data.tx.ctx_header_size;
+  
+ -	err = generate_device_pkt_descs(s, s->pkt_descs, ctx_header, packets);
+ -	if (err < 0) {
+ -		if (err != -EAGAIN) {
+ -			cancel_stream(s);
+ -			return;
+ -		}
+ -	} else {
+ -		process_ctx_payloads(s, s->pkt_descs, packets);
+ -	}
+ -
+ -	for (i = 0; i < packets; ++i) {
+ +	for (i = 0; i < packets; i++) {
+ +		u32 cycle;
+ +		unsigned int payload_length;
+ +		unsigned int data_blocks;
+ +		unsigned int syt;
+ +		__be32 *buffer;
+ +		unsigned int pcm_frames = 0;
+  		struct fw_iso_packet params = {0};
+ +		struct snd_pcm_substream *pcm;
+ +		int err;
+  
+ -		if (queue_in_packet(s, &params) < 0) {
+ -			cancel_stream(s);
+ -			return;
+ +		cycle = compute_cycle_count(ctx_header[1]);
+ +		err = parse_ir_ctx_header(s, cycle, ctx_header, &payload_length,
+ +					  &data_blocks, &syt, i);
+ +		if (err < 0 && err != -EAGAIN)
+ +			break;
+ +
+ +		if (err >= 0) {
+ +			buffer = s->buffer.packets[s->packet_index].buffer;
+ +			pcm_frames = s->process_data_blocks(s, buffer,
+ +							    data_blocks, &syt);
+ +
+ +			if (!(s->flags & CIP_DBC_IS_END_EVENT)) {
+ +				s->data_block_counter += data_blocks;
+ +				s->data_block_counter &= 0xff;
+ +			}
+  		}
+ +
+ +		if (queue_in_packet(s, &params) < 0)
+ +			break;
+ +
+ +		pcm = READ_ONCE(s->pcm);
+ +		if (pcm && pcm_frames > 0)
+ +			update_pcm_pointers(s, pcm, pcm_frames);
+ +
+ +		ctx_header += s->ctx_data.tx.ctx_header_size / sizeof(*ctx_header);
+ +	}
+ +
+ +	/* Queueing error or detecting invalid payload. */
+ +	if (i < packets) {
+ +		cancel_stream(s);
+ +		return;
+  	}
+  
+  	fw_iso_context_queue_flush(s->context);
+@@@ -1108,3 -1170,71 +1203,74 @@@ void amdtp_domain_destroy(struct amdtp_
+  	return;
+  }
+  EXPORT_SYMBOL_GPL(amdtp_domain_destroy);
+++<<<<<<< HEAD
+++=======
++ 
++ /**
++  * amdtp_domain_add_stream - register isoc context into the domain.
++  * @d: the AMDTP domain.
++  * @s: the AMDTP stream.
++  * @channel: the isochronous channel on the bus.
++  * @speed: firewire speed code.
++  */
++ int amdtp_domain_add_stream(struct amdtp_domain *d, struct amdtp_stream *s,
++ 			    int channel, int speed)
++ {
++ 	struct amdtp_stream *tmp;
++ 
++ 	list_for_each_entry(tmp, &d->streams, list) {
++ 		if (s == tmp)
++ 			return -EBUSY;
++ 	}
++ 
++ 	list_add(&s->list, &d->streams);
++ 
++ 	s->channel = channel;
++ 	s->speed = speed;
++ 
++ 	return 0;
++ }
++ EXPORT_SYMBOL_GPL(amdtp_domain_add_stream);
++ 
++ /**
++  * amdtp_domain_start - start sending packets for isoc context in the domain.
++  * @d: the AMDTP domain.
++  */
++ int amdtp_domain_start(struct amdtp_domain *d)
++ {
++ 	struct amdtp_stream *s;
++ 	int err = 0;
++ 
++ 	list_for_each_entry(s, &d->streams, list) {
++ 		err = amdtp_stream_start(s, s->channel, s->speed, d);
++ 		if (err < 0)
++ 			break;
++ 	}
++ 
++ 	if (err < 0) {
++ 		list_for_each_entry(s, &d->streams, list)
++ 			amdtp_stream_stop(s);
++ 	}
++ 
++ 	return err;
++ }
++ EXPORT_SYMBOL_GPL(amdtp_domain_start);
++ 
++ /**
++  * amdtp_domain_stop - stop sending packets for isoc context in the same domain.
++  * @d: the AMDTP domain to which the isoc contexts belong.
++  */
++ void amdtp_domain_stop(struct amdtp_domain *d)
++ {
++ 	struct amdtp_stream *s, *next;
++ 
++ 	list_for_each_entry_safe(s, next, &d->streams, list) {
++ 		list_del(&s->list);
++ 
++ 		amdtp_stream_stop(s);
++ 	}
++ 
++ 	d->events_per_period = 0;
++ }
++ EXPORT_SYMBOL_GPL(amdtp_domain_stop);
+++>>>>>>> a0e023317e2d (ALSA: firewire-lib: use variable size of queue for isoc packets instead of fixed size)
+diff --cc sound/firewire/amdtp-stream.h
+index 7032772c4f90,8d541727e437..000000000000
+--- a/sound/firewire/amdtp-stream.h
++++ b/sound/firewire/amdtp-stream.h
+@@@ -265,9 -273,28 +266,34 @@@ static inline bool amdtp_stream_wait_ca
+  
+  struct amdtp_domain {
+  	struct list_head streams;
+++<<<<<<< HEAD
+++=======
++ 
++ 	unsigned int events_per_period;
++ 	unsigned int events_per_buffer;
+++>>>>>>> a0e023317e2d (ALSA: firewire-lib: use variable size of queue for isoc packets instead of fixed size)
+  };
+  
+  int amdtp_domain_init(struct amdtp_domain *d);
+  void amdtp_domain_destroy(struct amdtp_domain *d);
+  
+++<<<<<<< HEAD
+++=======
++ int amdtp_domain_add_stream(struct amdtp_domain *d, struct amdtp_stream *s,
++ 			    int channel, int speed);
++ 
++ int amdtp_domain_start(struct amdtp_domain *d);
++ void amdtp_domain_stop(struct amdtp_domain *d);
++ 
++ static inline int amdtp_domain_set_events_per_period(struct amdtp_domain *d,
++ 						unsigned int events_per_period,
++ 						unsigned int events_per_buffer)
++ {
++ 	d->events_per_period = events_per_period;
++ 	d->events_per_buffer = events_per_buffer;
++ 
++ 	return 0;
++ }
++ 
+++>>>>>>> a0e023317e2d (ALSA: firewire-lib: use variable size of queue for isoc packets instead of fixed size)
+  #endif
+* Unmerged path sound/firewire/amdtp-stream.c
+* Unmerged path sound/firewire/amdtp-stream.h
+diff --git a/sound/firewire/bebob/bebob_stream.c b/sound/firewire/bebob/bebob_stream.c
+index f1db3ddc3e00..e8e9eca6f116 100644
+--- a/sound/firewire/bebob/bebob_stream.c
++++ b/sound/firewire/bebob/bebob_stream.c
+@@ -610,7 +610,7 @@ int snd_bebob_stream_reserve_duplex(struct snd_bebob *bebob, unsigned int rate,
+ 		}
+ 
+ 		err = amdtp_domain_set_events_per_period(&bebob->domain,
+-							 frames_per_period);
++							 frames_per_period, 0);
+ 		if (err < 0) {
+ 			cmp_connection_release(&bebob->out_conn);
+ 			cmp_connection_release(&bebob->in_conn);
+diff --git a/sound/firewire/dice/dice-stream.c b/sound/firewire/dice/dice-stream.c
+index ef36bf588d11..b4ef08bd7e8f 100644
+--- a/sound/firewire/dice/dice-stream.c
++++ b/sound/firewire/dice/dice-stream.c
+@@ -327,7 +327,7 @@ int snd_dice_stream_reserve_duplex(struct snd_dice *dice, unsigned int rate,
+ 			goto error;
+ 
+ 		err = amdtp_domain_set_events_per_period(&dice->domain,
+-							 events_per_period);
++							 events_per_period, 0);
+ 		if (err < 0)
+ 			goto error;
+ 	}
+diff --git a/sound/firewire/digi00x/digi00x-stream.c b/sound/firewire/digi00x/digi00x-stream.c
+index 96d331e47b07..83659fc0ef25 100644
+--- a/sound/firewire/digi00x/digi00x-stream.c
++++ b/sound/firewire/digi00x/digi00x-stream.c
+@@ -318,7 +318,7 @@ int snd_dg00x_stream_reserve_duplex(struct snd_dg00x *dg00x, unsigned int rate,
+ 		}
+ 
+ 		err = amdtp_domain_set_events_per_period(&dg00x->domain,
+-							 frames_per_period);
++							 frames_per_period, 0);
+ 		if (err < 0) {
+ 			fw_iso_resources_free(&dg00x->rx_resources);
+ 			fw_iso_resources_free(&dg00x->tx_resources);
+diff --git a/sound/firewire/fireface/ff-stream.c b/sound/firewire/fireface/ff-stream.c
+index d05e7d3055e1..cbe0e5087b05 100644
+--- a/sound/firewire/fireface/ff-stream.c
++++ b/sound/firewire/fireface/ff-stream.c
+@@ -153,7 +153,7 @@ int snd_ff_stream_reserve_duplex(struct snd_ff *ff, unsigned int rate,
+ 			return err;
+ 
+ 		err = amdtp_domain_set_events_per_period(&ff->domain,
+-							 frames_per_period);
++							 frames_per_period, 0);
+ 		if (err < 0) {
+ 			fw_iso_resources_free(&ff->tx_resources);
+ 			fw_iso_resources_free(&ff->rx_resources);
+diff --git a/sound/firewire/fireworks/fireworks_stream.c b/sound/firewire/fireworks/fireworks_stream.c
+index 3987351e533c..8a458a2d0d9e 100644
+--- a/sound/firewire/fireworks/fireworks_stream.c
++++ b/sound/firewire/fireworks/fireworks_stream.c
+@@ -244,7 +244,7 @@ int snd_efw_stream_reserve_duplex(struct snd_efw *efw, unsigned int rate,
+ 		}
+ 
+ 		err = amdtp_domain_set_events_per_period(&efw->domain,
+-							 frames_per_period);
++							 frames_per_period, 0);
+ 		if (err < 0) {
+ 			cmp_connection_release(&efw->in_conn);
+ 			cmp_connection_release(&efw->out_conn);
+diff --git a/sound/firewire/motu/motu-stream.c b/sound/firewire/motu/motu-stream.c
+index 52b7c375bb0b..97245c670732 100644
+--- a/sound/firewire/motu/motu-stream.c
++++ b/sound/firewire/motu/motu-stream.c
+@@ -174,7 +174,7 @@ int snd_motu_stream_reserve_duplex(struct snd_motu *motu, unsigned int rate,
+ 		}
+ 
+ 		err = amdtp_domain_set_events_per_period(&motu->domain,
+-							 frames_per_period);
++							 frames_per_period, 0);
+ 		if (err < 0) {
+ 			fw_iso_resources_free(&motu->tx_resources);
+ 			fw_iso_resources_free(&motu->rx_resources);
+diff --git a/sound/firewire/oxfw/oxfw-stream.c b/sound/firewire/oxfw/oxfw-stream.c
+index 7d2e88c5b73d..318de8217b3a 100644
+--- a/sound/firewire/oxfw/oxfw-stream.c
++++ b/sound/firewire/oxfw/oxfw-stream.c
+@@ -308,7 +308,7 @@ int snd_oxfw_stream_reserve_duplex(struct snd_oxfw *oxfw,
+ 		}
+ 
+ 		err = amdtp_domain_set_events_per_period(&oxfw->domain,
+-							frames_per_period);
++							frames_per_period, 0);
+ 		if (err < 0) {
+ 			cmp_connection_release(&oxfw->in_conn);
+ 			if (oxfw->has_output)
+diff --git a/sound/firewire/tascam/tascam-stream.c b/sound/firewire/tascam/tascam-stream.c
+index 8c04a0ad17d9..1e4d44ed8bed 100644
+--- a/sound/firewire/tascam/tascam-stream.c
++++ b/sound/firewire/tascam/tascam-stream.c
+@@ -416,7 +416,7 @@ int snd_tscm_stream_reserve_duplex(struct snd_tscm *tscm, unsigned int rate,
+ 		}
+ 
+ 		err = amdtp_domain_set_events_per_period(&tscm->domain,
+-							frames_per_period);
++							frames_per_period, 0);
+ 		if (err < 0) {
+ 			fw_iso_resources_free(&tscm->tx_resources);
+ 			fw_iso_resources_free(&tscm->rx_resources);
