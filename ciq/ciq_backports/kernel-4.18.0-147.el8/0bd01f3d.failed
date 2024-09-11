@@ -1,0 +1,583 @@
+RDMA/uverbs: Require all objects to have a driver destroy function
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-147.el8
+commit-author Jason Gunthorpe <jgg@ziepe.ca>
+commit 0bd01f3d090788188d3766bac044292de2789d03
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-147.el8/0bd01f3d.failed
+
+If we can't destroy the object then we certainly shouldn't allow it be
+created or used. Remove it from the uverbs_uapi in this case.
+
+This also disables methods of other objects that have mandatory object
+handle inputs - ie REG_DM_MR is now automatically removed if DM objects
+cannot be created.
+
+Typically drivers not supporting an interface will mark all of the
+supporting functions as NULL, including destroy.
+
+This is intended to automatically eliminate entire corner cases in the API
+that are difficult to test.
+
+	Signed-off-by: Jason Gunthorpe <jgg@mellanox.com>
+	Signed-off-by: Leon Romanovsky <leonro@mellanox.com>
+(cherry picked from commit 0bd01f3d090788188d3766bac044292de2789d03)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/infiniband/core/rdma_core.h
+#	drivers/infiniband/core/uverbs_std_types.c
+#	drivers/infiniband/core/uverbs_std_types_counters.c
+#	drivers/infiniband/core/uverbs_std_types_cq.c
+#	drivers/infiniband/core/uverbs_std_types_flow_action.c
+#	drivers/infiniband/core/uverbs_std_types_mr.c
+#	drivers/infiniband/core/uverbs_uapi.c
+diff --cc drivers/infiniband/core/rdma_core.h
+index a243cc2a59f7,93da02c12c38..000000000000
+--- a/drivers/infiniband/core/rdma_core.h
++++ b/drivers/infiniband/core/rdma_core.h
+@@@ -113,4 -106,66 +113,69 @@@ int uverbs_finalize_object(struct ib_uo
+  			   enum uverbs_obj_access access,
+  			   bool commit);
+  
+++<<<<<<< HEAD
+++=======
++ void setup_ufile_idr_uobject(struct ib_uverbs_file *ufile);
++ void release_ufile_idr_uobject(struct ib_uverbs_file *ufile);
++ 
++ /*
++  * This is the runtime description of the uverbs API, used by the syscall
++  * machinery to validate and dispatch calls.
++  */
++ 
++ /*
++  * Depending on ID the slot pointer in the radix tree points at one of these
++  * structs.
++  */
++ struct uverbs_api_object {
++ 	const struct uverbs_obj_type *type_attrs;
++ 	const struct uverbs_obj_type_class *type_class;
++ 	u8 disabled:1;
++ };
++ 
++ struct uverbs_api_ioctl_method {
++ 	int (__rcu *handler)(struct ib_uverbs_file *ufile,
++ 			     struct uverbs_attr_bundle *ctx);
++ 	DECLARE_BITMAP(attr_mandatory, UVERBS_API_ATTR_BKEY_LEN);
++ 	u16 bundle_size;
++ 	u8 use_stack:1;
++ 	u8 driver_method:1;
++ 	u8 disabled:1;
++ 	u8 key_bitmap_len;
++ 	u8 destroy_bkey;
++ };
++ 
++ struct uverbs_api_attr {
++ 	struct uverbs_attr_spec spec;
++ };
++ 
++ struct uverbs_api {
++ 	/* radix tree contains struct uverbs_api_* pointers */
++ 	struct radix_tree_root radix;
++ 	enum rdma_driver_id driver_id;
++ };
++ 
++ static inline const struct uverbs_api_object *
++ uapi_get_object(struct uverbs_api *uapi, u16 object_id)
++ {
++ 	return radix_tree_lookup(&uapi->radix, uapi_key_obj(object_id));
++ }
++ 
++ char *uapi_key_format(char *S, unsigned int key);
++ struct uverbs_api *uverbs_alloc_api(struct ib_device *ibdev);
++ void uverbs_disassociate_api_pre(struct ib_uverbs_device *uverbs_dev);
++ void uverbs_disassociate_api(struct uverbs_api *uapi);
++ void uverbs_destroy_api(struct uverbs_api *uapi);
++ void uapi_compute_bundle_size(struct uverbs_api_ioctl_method *method_elm,
++ 			      unsigned int num_attrs);
++ void uverbs_user_mmap_disassociate(struct ib_uverbs_file *ufile);
++ 
++ extern const struct uapi_definition uverbs_def_obj_counters[];
++ extern const struct uapi_definition uverbs_def_obj_cq[];
++ extern const struct uapi_definition uverbs_def_obj_dm[];
++ extern const struct uapi_definition uverbs_def_obj_flow_action[];
++ extern const struct uapi_definition uverbs_def_obj_intf[];
++ extern const struct uapi_definition uverbs_def_obj_mr[];
++ 
+++>>>>>>> 0bd01f3d0907 (RDMA/uverbs: Require all objects to have a driver destroy function)
+  #endif /* RDMA_CORE_H */
+diff --cc drivers/infiniband/core/uverbs_std_types.c
+index 06085446ffc0,9e1abeaed57d..000000000000
+--- a/drivers/infiniband/core/uverbs_std_types.c
++++ b/drivers/infiniband/core/uverbs_std_types.c
+@@@ -204,113 -215,75 +204,141 @@@ int uverbs_destroy_def_handler(struct i
+  {
+  	return 0;
+  }
+ -EXPORT_SYMBOL(uverbs_destroy_def_handler);
+  
+ -DECLARE_UVERBS_NAMED_OBJECT(
+ -	UVERBS_OBJECT_COMP_CHANNEL,
+ -	UVERBS_TYPE_ALLOC_FD(sizeof(struct ib_uverbs_completion_event_file),
+ -			     uverbs_hot_unplug_completion_event_file,
+ -			     &uverbs_event_fops,
+ -			     "[infinibandevent]",
+ -			     O_RDONLY));
+ +/*
+ + * This spec is used in order to pass information to the hardware driver in a
+ + * legacy way. Every verb that could get driver specific data should get this
+ + * spec.
+ + */
+ +const struct uverbs_attr_def uverbs_uhw_compat_in =
+ +	UVERBS_ATTR_PTR_IN_SZ(UVERBS_ATTR_UHW_IN, UVERBS_ATTR_MIN_SIZE(0),
+ +			      UA_FLAGS(UVERBS_ATTR_SPEC_F_MIN_SZ_OR_ZERO));
+ +const struct uverbs_attr_def uverbs_uhw_compat_out =
+ +	UVERBS_ATTR_PTR_OUT_SZ(UVERBS_ATTR_UHW_OUT, UVERBS_ATTR_MIN_SIZE(0),
+ +			       UA_FLAGS(UVERBS_ATTR_SPEC_F_MIN_SZ_OR_ZERO));
+ +
+ +void create_udata(struct uverbs_attr_bundle *ctx, struct ib_udata *udata)
+ +{
+ +	/*
+ +	 * This is for ease of conversion. The purpose is to convert all drivers
+ +	 * to use uverbs_attr_bundle instead of ib_udata.
+ +	 * Assume attr == 0 is input and attr == 1 is output.
+ +	 */
+ +	const struct uverbs_attr *uhw_in =
+ +		uverbs_attr_get(ctx, UVERBS_ATTR_UHW_IN);
+ +	const struct uverbs_attr *uhw_out =
+ +		uverbs_attr_get(ctx, UVERBS_ATTR_UHW_OUT);
+ +
+ +	if (!IS_ERR(uhw_in)) {
+ +		udata->inlen = uhw_in->ptr_attr.len;
+ +		if (uverbs_attr_ptr_is_inline(uhw_in))
+ +			udata->inbuf = &uhw_in->uattr->data;
+ +		else
+ +			udata->inbuf = u64_to_user_ptr(uhw_in->ptr_attr.data);
+ +	} else {
+ +		udata->inbuf = NULL;
+ +		udata->inlen = 0;
+ +	}
+ +
+ +	if (!IS_ERR(uhw_out)) {
+ +		udata->outbuf = u64_to_user_ptr(uhw_out->ptr_attr.data);
+ +		udata->outlen = uhw_out->ptr_attr.len;
+ +	} else {
+ +		udata->outbuf = NULL;
+ +		udata->outlen = 0;
+ +	}
+ +}
+ +
+ +DECLARE_UVERBS_NAMED_OBJECT(UVERBS_OBJECT_COMP_CHANNEL,
+ +			    &UVERBS_TYPE_ALLOC_FD(0,
+ +						  sizeof(struct ib_uverbs_completion_event_file),
+ +						  uverbs_hot_unplug_completion_event_file,
+ +						  &uverbs_event_fops,
+ +						  "[infinibandevent]", O_RDONLY));
+  
+ -DECLARE_UVERBS_NAMED_OBJECT(
+ -	UVERBS_OBJECT_QP,
+ -	UVERBS_TYPE_ALLOC_IDR_SZ(sizeof(struct ib_uqp_object), uverbs_free_qp));
+ +DECLARE_UVERBS_NAMED_OBJECT(UVERBS_OBJECT_QP,
+ +			    &UVERBS_TYPE_ALLOC_IDR_SZ(sizeof(struct ib_uqp_object), 0,
+ +						      uverbs_free_qp));
+  
+  DECLARE_UVERBS_NAMED_OBJECT(UVERBS_OBJECT_MW,
+ -			    UVERBS_TYPE_ALLOC_IDR(uverbs_free_mw));
+ +			    &UVERBS_TYPE_ALLOC_IDR(0, uverbs_free_mw));
+  
+ -DECLARE_UVERBS_NAMED_OBJECT(
+ -	UVERBS_OBJECT_SRQ,
+ -	UVERBS_TYPE_ALLOC_IDR_SZ(sizeof(struct ib_usrq_object),
+ -				 uverbs_free_srq));
+ +DECLARE_UVERBS_NAMED_OBJECT(UVERBS_OBJECT_SRQ,
+ +			    &UVERBS_TYPE_ALLOC_IDR_SZ(sizeof(struct ib_usrq_object), 0,
+ +						      uverbs_free_srq));
+  
+  DECLARE_UVERBS_NAMED_OBJECT(UVERBS_OBJECT_AH,
+ -			    UVERBS_TYPE_ALLOC_IDR(uverbs_free_ah));
+ +			    &UVERBS_TYPE_ALLOC_IDR(0, uverbs_free_ah));
+  
+ -DECLARE_UVERBS_NAMED_OBJECT(
+ -	UVERBS_OBJECT_FLOW,
+ -	UVERBS_TYPE_ALLOC_IDR_SZ(sizeof(struct ib_uflow_object),
+ -				 uverbs_free_flow));
+ +DECLARE_UVERBS_NAMED_OBJECT(UVERBS_OBJECT_FLOW,
+ +			    &UVERBS_TYPE_ALLOC_IDR_SZ(sizeof(struct ib_uflow_object),
+ +						      0, uverbs_free_flow));
+  
+ -DECLARE_UVERBS_NAMED_OBJECT(
+ -	UVERBS_OBJECT_WQ,
+ -	UVERBS_TYPE_ALLOC_IDR_SZ(sizeof(struct ib_uwq_object), uverbs_free_wq));
+ +DECLARE_UVERBS_NAMED_OBJECT(UVERBS_OBJECT_WQ,
+ +			    &UVERBS_TYPE_ALLOC_IDR_SZ(sizeof(struct ib_uwq_object), 0,
+ +						      uverbs_free_wq));
+  
+  DECLARE_UVERBS_NAMED_OBJECT(UVERBS_OBJECT_RWQ_IND_TBL,
+ -			    UVERBS_TYPE_ALLOC_IDR(uverbs_free_rwq_ind_tbl));
+ +			    &UVERBS_TYPE_ALLOC_IDR(0, uverbs_free_rwq_ind_tbl));
+  
+ -DECLARE_UVERBS_NAMED_OBJECT(
+ -	UVERBS_OBJECT_XRCD,
+ -	UVERBS_TYPE_ALLOC_IDR_SZ(sizeof(struct ib_uxrcd_object),
+ -				 uverbs_free_xrcd));
+ +DECLARE_UVERBS_NAMED_OBJECT(UVERBS_OBJECT_XRCD,
+ +			    &UVERBS_TYPE_ALLOC_IDR_SZ(sizeof(struct ib_uxrcd_object), 0,
+ +						      uverbs_free_xrcd));
+  
+  DECLARE_UVERBS_NAMED_OBJECT(UVERBS_OBJECT_PD,
+ -			    UVERBS_TYPE_ALLOC_IDR(uverbs_free_pd));
+ -
+ -DECLARE_UVERBS_GLOBAL_METHODS(UVERBS_OBJECT_DEVICE);
+ -
+ +			    /* 2 is used in order to free the PD after MRs */
+ +			    &UVERBS_TYPE_ALLOC_IDR(2, uverbs_free_pd));
+ +
+ +DECLARE_UVERBS_NAMED_OBJECT(UVERBS_OBJECT_DEVICE, NULL);
+ +
+++<<<<<<< HEAD
+ +static DECLARE_UVERBS_OBJECT_TREE(uverbs_default_objects,
+ +				  &UVERBS_OBJECT(UVERBS_OBJECT_DEVICE),
+ +				  &UVERBS_OBJECT(UVERBS_OBJECT_PD),
+ +				  &UVERBS_OBJECT(UVERBS_OBJECT_MR),
+ +				  &UVERBS_OBJECT(UVERBS_OBJECT_COMP_CHANNEL),
+ +				  &UVERBS_OBJECT(UVERBS_OBJECT_CQ),
+ +				  &UVERBS_OBJECT(UVERBS_OBJECT_QP),
+ +				  &UVERBS_OBJECT(UVERBS_OBJECT_AH),
+ +				  &UVERBS_OBJECT(UVERBS_OBJECT_MW),
+ +				  &UVERBS_OBJECT(UVERBS_OBJECT_SRQ),
+ +				  &UVERBS_OBJECT(UVERBS_OBJECT_FLOW),
+ +				  &UVERBS_OBJECT(UVERBS_OBJECT_WQ),
+ +				  &UVERBS_OBJECT(UVERBS_OBJECT_RWQ_IND_TBL),
+ +				  &UVERBS_OBJECT(UVERBS_OBJECT_XRCD),
+ +				  &UVERBS_OBJECT(UVERBS_OBJECT_FLOW_ACTION),
+ +				  &UVERBS_OBJECT(UVERBS_OBJECT_DM),
+ +				  &UVERBS_OBJECT(UVERBS_OBJECT_COUNTERS));
+ +
+ +const struct uverbs_object_tree_def *uverbs_default_get_objects(void)
+ +{
+ +	return &uverbs_default_objects;
+ +}
+ +EXPORT_SYMBOL_GPL(uverbs_default_get_objects);
+++=======
++ const struct uapi_definition uverbs_def_obj_intf[] = {
++ 	UAPI_DEF_CHAIN_OBJ_TREE_NAMED(UVERBS_OBJECT_DEVICE),
++ 	UAPI_DEF_CHAIN_OBJ_TREE_NAMED(UVERBS_OBJECT_PD,
++ 				      UAPI_DEF_OBJ_NEEDS_FN(dealloc_pd)),
++ 	UAPI_DEF_CHAIN_OBJ_TREE_NAMED(UVERBS_OBJECT_COMP_CHANNEL,
++ 				      UAPI_DEF_OBJ_NEEDS_FN(dealloc_pd)),
++ 	UAPI_DEF_CHAIN_OBJ_TREE_NAMED(UVERBS_OBJECT_QP,
++ 				      UAPI_DEF_OBJ_NEEDS_FN(destroy_qp)),
++ 	UAPI_DEF_CHAIN_OBJ_TREE_NAMED(UVERBS_OBJECT_AH,
++ 				      UAPI_DEF_OBJ_NEEDS_FN(destroy_ah)),
++ 	UAPI_DEF_CHAIN_OBJ_TREE_NAMED(UVERBS_OBJECT_MW,
++ 				      UAPI_DEF_OBJ_NEEDS_FN(dealloc_mw)),
++ 	UAPI_DEF_CHAIN_OBJ_TREE_NAMED(UVERBS_OBJECT_SRQ,
++ 				      UAPI_DEF_OBJ_NEEDS_FN(destroy_srq)),
++ 	UAPI_DEF_CHAIN_OBJ_TREE_NAMED(UVERBS_OBJECT_FLOW,
++ 				      UAPI_DEF_OBJ_NEEDS_FN(destroy_flow)),
++ 	UAPI_DEF_CHAIN_OBJ_TREE_NAMED(UVERBS_OBJECT_WQ,
++ 				      UAPI_DEF_OBJ_NEEDS_FN(destroy_wq)),
++ 	UAPI_DEF_CHAIN_OBJ_TREE_NAMED(
++ 		UVERBS_OBJECT_RWQ_IND_TBL,
++ 		UAPI_DEF_OBJ_NEEDS_FN(destroy_rwq_ind_table)),
++ 	UAPI_DEF_CHAIN_OBJ_TREE_NAMED(UVERBS_OBJECT_XRCD,
++ 				      UAPI_DEF_OBJ_NEEDS_FN(dealloc_xrcd)),
++ 	{}
++ };
+++>>>>>>> 0bd01f3d0907 (RDMA/uverbs: Require all objects to have a driver destroy function)
+diff --cc drivers/infiniband/core/uverbs_std_types_counters.c
+index 03b182a684a6,c4a78abffc10..000000000000
+--- a/drivers/infiniband/core/uverbs_std_types_counters.c
++++ b/drivers/infiniband/core/uverbs_std_types_counters.c
+@@@ -155,3 -150,8 +155,11 @@@ DECLARE_UVERBS_NAMED_OBJECT(UVERBS_OBJE
+  			    &UVERBS_METHOD(UVERBS_METHOD_COUNTERS_DESTROY),
+  			    &UVERBS_METHOD(UVERBS_METHOD_COUNTERS_READ));
+  
+++<<<<<<< HEAD
+++=======
++ const struct uapi_definition uverbs_def_obj_counters[] = {
++ 	UAPI_DEF_CHAIN_OBJ_TREE_NAMED(UVERBS_OBJECT_COUNTERS,
++ 				      UAPI_DEF_OBJ_NEEDS_FN(destroy_counters)),
++ 	{}
++ };
+++>>>>>>> 0bd01f3d0907 (RDMA/uverbs: Require all objects to have a driver destroy function)
+diff --cc drivers/infiniband/core/uverbs_std_types_cq.c
+index 150b7c04ce15,f94fd877867b..000000000000
+--- a/drivers/infiniband/core/uverbs_std_types_cq.c
++++ b/drivers/infiniband/core/uverbs_std_types_cq.c
+@@@ -187,20 -188,28 +187,30 @@@ static int UVERBS_HANDLER(UVERBS_METHOD
+  			      sizeof(resp));
+  }
+  
+ -DECLARE_UVERBS_NAMED_METHOD(
+ -	UVERBS_METHOD_CQ_DESTROY,
+ -	UVERBS_ATTR_IDR(UVERBS_ATTR_DESTROY_CQ_HANDLE,
+ -			UVERBS_OBJECT_CQ,
+ -			UVERBS_ACCESS_DESTROY,
+ -			UA_MANDATORY),
+ -	UVERBS_ATTR_PTR_OUT(UVERBS_ATTR_DESTROY_CQ_RESP,
+ -			    UVERBS_ATTR_TYPE(struct ib_uverbs_destroy_cq_resp),
+ -			    UA_MANDATORY));
+ -
+ -DECLARE_UVERBS_NAMED_OBJECT(
+ -	UVERBS_OBJECT_CQ,
+ -	UVERBS_TYPE_ALLOC_IDR_SZ(sizeof(struct ib_ucq_object), uverbs_free_cq),
+ -
+ +static DECLARE_UVERBS_NAMED_METHOD(UVERBS_METHOD_CQ_DESTROY,
+ +	&UVERBS_ATTR_IDR(UVERBS_ATTR_DESTROY_CQ_HANDLE, UVERBS_OBJECT_CQ,
+ +			 UVERBS_ACCESS_DESTROY,
+ +			 UA_FLAGS(UVERBS_ATTR_SPEC_F_MANDATORY)),
+ +	&UVERBS_ATTR_PTR_OUT(UVERBS_ATTR_DESTROY_CQ_RESP,
+ +			     UVERBS_ATTR_TYPE(struct ib_uverbs_destroy_cq_resp),
+ +			     UA_FLAGS(UVERBS_ATTR_SPEC_F_MANDATORY)));
+ +
+ +DECLARE_UVERBS_NAMED_OBJECT(UVERBS_OBJECT_CQ,
+ +			    &UVERBS_TYPE_ALLOC_IDR_SZ(sizeof(struct ib_ucq_object), 0,
+ +						      uverbs_free_cq),
+  #if IS_ENABLED(CONFIG_INFINIBAND_EXP_LEGACY_VERBS_NEW_UAPI)
+ -	&UVERBS_METHOD(UVERBS_METHOD_CQ_CREATE),
+ -	&UVERBS_METHOD(UVERBS_METHOD_CQ_DESTROY)
+ +			    &UVERBS_METHOD(UVERBS_METHOD_CQ_CREATE),
+ +			    &UVERBS_METHOD(UVERBS_METHOD_CQ_DESTROY)
+  #endif
+++<<<<<<< HEAD
+ +			   );
+ +
+++=======
++ );
++ 
++ const struct uapi_definition uverbs_def_obj_cq[] = {
++ 	UAPI_DEF_CHAIN_OBJ_TREE_NAMED(UVERBS_OBJECT_CQ,
++ 				      UAPI_DEF_OBJ_NEEDS_FN(destroy_cq)),
++ 	{}
++ };
+++>>>>>>> 0bd01f3d0907 (RDMA/uverbs: Require all objects to have a driver destroy function)
+diff --cc drivers/infiniband/core/uverbs_std_types_flow_action.c
+index e3d282cb7bf2,24ac332fc3e0..000000000000
+--- a/drivers/infiniband/core/uverbs_std_types_flow_action.c
++++ b/drivers/infiniband/core/uverbs_std_types_flow_action.c
+@@@ -390,50 -377,71 +390,66 @@@ static const struct uverbs_attr_spec uv
+  	},
+  };
+  
+ -DECLARE_UVERBS_NAMED_METHOD(
+ -	UVERBS_METHOD_FLOW_ACTION_ESP_CREATE,
+ -	UVERBS_ATTR_IDR(UVERBS_ATTR_CREATE_FLOW_ACTION_ESP_HANDLE,
+ -			UVERBS_OBJECT_FLOW_ACTION,
+ -			UVERBS_ACCESS_NEW,
+ -			UA_MANDATORY),
+ -	UVERBS_ATTR_PTR_IN(UVERBS_ATTR_FLOW_ACTION_ESP_ATTRS,
+ -			   UVERBS_ATTR_STRUCT(struct ib_uverbs_flow_action_esp,
+ -					      hard_limit_pkts),
+ -			   UA_MANDATORY),
+ -	UVERBS_ATTR_PTR_IN(UVERBS_ATTR_FLOW_ACTION_ESP_ESN,
+ -			   UVERBS_ATTR_TYPE(__u32),
+ -			   UA_OPTIONAL),
+ -	UVERBS_ATTR_ENUM_IN(UVERBS_ATTR_FLOW_ACTION_ESP_KEYMAT,
+ -			    uverbs_flow_action_esp_keymat,
+ -			    UA_MANDATORY),
+ -	UVERBS_ATTR_ENUM_IN(UVERBS_ATTR_FLOW_ACTION_ESP_REPLAY,
+ -			    uverbs_flow_action_esp_replay,
+ -			    UA_OPTIONAL),
+ -	UVERBS_ATTR_PTR_IN(
+ -		UVERBS_ATTR_FLOW_ACTION_ESP_ENCAP,
+ -		UVERBS_ATTR_TYPE(struct ib_uverbs_flow_action_esp_encap),
+ -		UA_OPTIONAL));
+ -
+ -DECLARE_UVERBS_NAMED_METHOD(
+ -	UVERBS_METHOD_FLOW_ACTION_ESP_MODIFY,
+ -	UVERBS_ATTR_IDR(UVERBS_ATTR_MODIFY_FLOW_ACTION_ESP_HANDLE,
+ -			UVERBS_OBJECT_FLOW_ACTION,
+ -			UVERBS_ACCESS_WRITE,
+ -			UA_MANDATORY),
+ -	UVERBS_ATTR_PTR_IN(UVERBS_ATTR_FLOW_ACTION_ESP_ATTRS,
+ -			   UVERBS_ATTR_STRUCT(struct ib_uverbs_flow_action_esp,
+ -					      hard_limit_pkts),
+ -			   UA_OPTIONAL),
+ -	UVERBS_ATTR_PTR_IN(UVERBS_ATTR_FLOW_ACTION_ESP_ESN,
+ -			   UVERBS_ATTR_TYPE(__u32),
+ -			   UA_OPTIONAL),
+ -	UVERBS_ATTR_ENUM_IN(UVERBS_ATTR_FLOW_ACTION_ESP_KEYMAT,
+ -			    uverbs_flow_action_esp_keymat,
+ -			    UA_OPTIONAL),
+ -	UVERBS_ATTR_ENUM_IN(UVERBS_ATTR_FLOW_ACTION_ESP_REPLAY,
+ -			    uverbs_flow_action_esp_replay,
+ -			    UA_OPTIONAL),
+ -	UVERBS_ATTR_PTR_IN(
+ -		UVERBS_ATTR_FLOW_ACTION_ESP_ENCAP,
+ -		UVERBS_ATTR_TYPE(struct ib_uverbs_flow_action_esp_encap),
+ -		UA_OPTIONAL));
+ -
+ -DECLARE_UVERBS_NAMED_METHOD_DESTROY(
+ -	UVERBS_METHOD_FLOW_ACTION_DESTROY,
+ -	UVERBS_ATTR_IDR(UVERBS_ATTR_DESTROY_FLOW_ACTION_HANDLE,
+ -			UVERBS_OBJECT_FLOW_ACTION,
+ -			UVERBS_ACCESS_DESTROY,
+ -			UA_MANDATORY));
+ -
+ +static DECLARE_UVERBS_NAMED_METHOD(UVERBS_METHOD_FLOW_ACTION_ESP_CREATE,
+ +	&UVERBS_ATTR_IDR(UVERBS_ATTR_CREATE_FLOW_ACTION_ESP_HANDLE,
+ +			 UVERBS_OBJECT_FLOW_ACTION,
+ +			 UVERBS_ACCESS_NEW,
+ +			 UA_FLAGS(UVERBS_ATTR_SPEC_F_MANDATORY)),
+ +	&UVERBS_ATTR_PTR_IN(UVERBS_ATTR_FLOW_ACTION_ESP_ATTRS,
+ +			    UVERBS_ATTR_STRUCT(struct ib_uverbs_flow_action_esp, hard_limit_pkts),
+ +			    UA_FLAGS(UVERBS_ATTR_SPEC_F_MANDATORY |
+ +				     UVERBS_ATTR_SPEC_F_MIN_SZ_OR_ZERO)),
+ +	&UVERBS_ATTR_PTR_IN(UVERBS_ATTR_FLOW_ACTION_ESP_ESN, UVERBS_ATTR_TYPE(__u32)),
+ +	&UVERBS_ATTR_ENUM_IN(UVERBS_ATTR_FLOW_ACTION_ESP_KEYMAT,
+ +			     uverbs_flow_action_esp_keymat,
+ +			     UA_FLAGS(UVERBS_ATTR_SPEC_F_MANDATORY)),
+ +	&UVERBS_ATTR_ENUM_IN(UVERBS_ATTR_FLOW_ACTION_ESP_REPLAY,
+ +			     uverbs_flow_action_esp_replay),
+ +	&UVERBS_ATTR_PTR_IN(UVERBS_ATTR_FLOW_ACTION_ESP_ENCAP,
+ +			    UVERBS_ATTR_STRUCT(struct ib_uverbs_flow_action_esp_encap, type)));
+ +
+ +static DECLARE_UVERBS_NAMED_METHOD(UVERBS_METHOD_FLOW_ACTION_ESP_MODIFY,
+ +	&UVERBS_ATTR_IDR(UVERBS_ATTR_MODIFY_FLOW_ACTION_ESP_HANDLE,
+ +			 UVERBS_OBJECT_FLOW_ACTION,
+ +			 UVERBS_ACCESS_WRITE,
+ +			 UA_FLAGS(UVERBS_ATTR_SPEC_F_MANDATORY)),
+ +	&UVERBS_ATTR_PTR_IN(UVERBS_ATTR_FLOW_ACTION_ESP_ATTRS,
+ +			    UVERBS_ATTR_STRUCT(struct ib_uverbs_flow_action_esp, hard_limit_pkts),
+ +			    UA_FLAGS(UVERBS_ATTR_SPEC_F_MIN_SZ_OR_ZERO)),
+ +	&UVERBS_ATTR_PTR_IN(UVERBS_ATTR_FLOW_ACTION_ESP_ESN, UVERBS_ATTR_TYPE(__u32)),
+ +	&UVERBS_ATTR_ENUM_IN(UVERBS_ATTR_FLOW_ACTION_ESP_KEYMAT,
+ +			     uverbs_flow_action_esp_keymat),
+ +	&UVERBS_ATTR_ENUM_IN(UVERBS_ATTR_FLOW_ACTION_ESP_REPLAY,
+ +			     uverbs_flow_action_esp_replay),
+ +	&UVERBS_ATTR_PTR_IN(UVERBS_ATTR_FLOW_ACTION_ESP_ENCAP,
+ +			    UVERBS_ATTR_STRUCT(struct ib_uverbs_flow_action_esp_encap, type)));
+ +
+ +static DECLARE_UVERBS_NAMED_METHOD_WITH_HANDLER(UVERBS_METHOD_FLOW_ACTION_DESTROY,
+ +	uverbs_destroy_def_handler,
+ +	&UVERBS_ATTR_IDR(UVERBS_ATTR_DESTROY_FLOW_ACTION_HANDLE,
+ +			 UVERBS_OBJECT_FLOW_ACTION,
+ +			 UVERBS_ACCESS_DESTROY,
+ +			 UA_FLAGS(UVERBS_ATTR_SPEC_F_MANDATORY)));
+ +
+ +DECLARE_UVERBS_NAMED_OBJECT(UVERBS_OBJECT_FLOW_ACTION,
+ +			    &UVERBS_TYPE_ALLOC_IDR(0, uverbs_free_flow_action),
+ +			    &UVERBS_METHOD(UVERBS_METHOD_FLOW_ACTION_ESP_CREATE),
+ +			    &UVERBS_METHOD(UVERBS_METHOD_FLOW_ACTION_DESTROY),
+ +			    &UVERBS_METHOD(UVERBS_METHOD_FLOW_ACTION_ESP_MODIFY));
+ +
+++<<<<<<< HEAD
+++=======
++ DECLARE_UVERBS_NAMED_OBJECT(
++ 	UVERBS_OBJECT_FLOW_ACTION,
++ 	UVERBS_TYPE_ALLOC_IDR(uverbs_free_flow_action),
++ 	&UVERBS_METHOD(UVERBS_METHOD_FLOW_ACTION_ESP_CREATE),
++ 	&UVERBS_METHOD(UVERBS_METHOD_FLOW_ACTION_DESTROY),
++ 	&UVERBS_METHOD(UVERBS_METHOD_FLOW_ACTION_ESP_MODIFY));
++ 
++ const struct uapi_definition uverbs_def_obj_flow_action[] = {
++ 	UAPI_DEF_CHAIN_OBJ_TREE_NAMED(
++ 		UVERBS_OBJECT_FLOW_ACTION,
++ 		UAPI_DEF_OBJ_NEEDS_FN(destroy_flow_action)),
++ 	{}
++ };
+++>>>>>>> 0bd01f3d0907 (RDMA/uverbs: Require all objects to have a driver destroy function)
+diff --cc drivers/infiniband/core/uverbs_std_types_mr.c
+index 68f7cadf088f,c400fd382b0f..000000000000
+--- a/drivers/infiniband/core/uverbs_std_types_mr.c
++++ b/drivers/infiniband/core/uverbs_std_types_mr.c
+@@@ -115,33 -114,42 +115,46 @@@ err_dereg
+  	return ret;
+  }
+  
+ -DECLARE_UVERBS_NAMED_METHOD(
+ -	UVERBS_METHOD_DM_MR_REG,
+ -	UVERBS_ATTR_IDR(UVERBS_ATTR_REG_DM_MR_HANDLE,
+ -			UVERBS_OBJECT_MR,
+ -			UVERBS_ACCESS_NEW,
+ -			UA_MANDATORY),
+ -	UVERBS_ATTR_PTR_IN(UVERBS_ATTR_REG_DM_MR_OFFSET,
+ -			   UVERBS_ATTR_TYPE(u64),
+ -			   UA_MANDATORY),
+ -	UVERBS_ATTR_PTR_IN(UVERBS_ATTR_REG_DM_MR_LENGTH,
+ -			   UVERBS_ATTR_TYPE(u64),
+ -			   UA_MANDATORY),
+ -	UVERBS_ATTR_IDR(UVERBS_ATTR_REG_DM_MR_PD_HANDLE,
+ -			UVERBS_OBJECT_PD,
+ -			UVERBS_ACCESS_READ,
+ -			UA_MANDATORY),
+ -	UVERBS_ATTR_FLAGS_IN(UVERBS_ATTR_REG_DM_MR_ACCESS_FLAGS,
+ -			     enum ib_access_flags),
+ -	UVERBS_ATTR_IDR(UVERBS_ATTR_REG_DM_MR_DM_HANDLE,
+ -			UVERBS_OBJECT_DM,
+ -			UVERBS_ACCESS_READ,
+ -			UA_MANDATORY),
+ -	UVERBS_ATTR_PTR_OUT(UVERBS_ATTR_REG_DM_MR_RESP_LKEY,
+ -			    UVERBS_ATTR_TYPE(u32),
+ -			    UA_MANDATORY),
+ -	UVERBS_ATTR_PTR_OUT(UVERBS_ATTR_REG_DM_MR_RESP_RKEY,
+ +static DECLARE_UVERBS_NAMED_METHOD(UVERBS_METHOD_DM_MR_REG,
+ +	&UVERBS_ATTR_IDR(UVERBS_ATTR_REG_DM_MR_HANDLE, UVERBS_OBJECT_MR,
+ +			 UVERBS_ACCESS_NEW,
+ +			 UA_FLAGS(UVERBS_ATTR_SPEC_F_MANDATORY)),
+ +	&UVERBS_ATTR_PTR_IN(UVERBS_ATTR_REG_DM_MR_OFFSET,
+ +			    UVERBS_ATTR_TYPE(u64),
+ +			    UA_FLAGS(UVERBS_ATTR_SPEC_F_MANDATORY)),
+ +	&UVERBS_ATTR_PTR_IN(UVERBS_ATTR_REG_DM_MR_LENGTH,
+ +			    UVERBS_ATTR_TYPE(u64),
+ +			    UA_FLAGS(UVERBS_ATTR_SPEC_F_MANDATORY)),
+ +	&UVERBS_ATTR_IDR(UVERBS_ATTR_REG_DM_MR_PD_HANDLE, UVERBS_OBJECT_PD,
+ +			 UVERBS_ACCESS_READ,
+ +			 UA_FLAGS(UVERBS_ATTR_SPEC_F_MANDATORY)),
+ +	&UVERBS_ATTR_PTR_IN(UVERBS_ATTR_REG_DM_MR_ACCESS_FLAGS,
+  			    UVERBS_ATTR_TYPE(u32),
+ -			    UA_MANDATORY));
+ -
+ +			    UA_FLAGS(UVERBS_ATTR_SPEC_F_MANDATORY)),
+ +	&UVERBS_ATTR_IDR(UVERBS_ATTR_REG_DM_MR_DM_HANDLE, UVERBS_OBJECT_DM,
+ +			 UVERBS_ACCESS_READ,
+ +			 UA_FLAGS(UVERBS_ATTR_SPEC_F_MANDATORY)),
+ +	&UVERBS_ATTR_PTR_OUT(UVERBS_ATTR_REG_DM_MR_RESP_LKEY,
+ +			     UVERBS_ATTR_TYPE(u32),
+ +			     UA_FLAGS(UVERBS_ATTR_SPEC_F_MANDATORY)),
+ +	&UVERBS_ATTR_PTR_OUT(UVERBS_ATTR_REG_DM_MR_RESP_RKEY,
+ +			     UVERBS_ATTR_TYPE(u32),
+ +			     UA_FLAGS(UVERBS_ATTR_SPEC_F_MANDATORY)));
+ +
+++<<<<<<< HEAD
+ +DECLARE_UVERBS_NAMED_OBJECT(UVERBS_OBJECT_MR,
+ +			    /* 1 is used in order to free the MR after all the MWs */
+ +			    &UVERBS_TYPE_ALLOC_IDR(1, uverbs_free_mr),
+ +			    &UVERBS_METHOD(UVERBS_METHOD_DM_MR_REG));
+++=======
++ DECLARE_UVERBS_NAMED_OBJECT(
++ 	UVERBS_OBJECT_MR,
++ 	UVERBS_TYPE_ALLOC_IDR(uverbs_free_mr),
++ 	&UVERBS_METHOD(UVERBS_METHOD_DM_MR_REG));
++ 
++ const struct uapi_definition uverbs_def_obj_mr[] = {
++ 	UAPI_DEF_CHAIN_OBJ_TREE_NAMED(UVERBS_OBJECT_MR,
++ 				      UAPI_DEF_OBJ_NEEDS_FN(dereg_mr)),
++ 	{}
++ };
+++>>>>>>> 0bd01f3d0907 (RDMA/uverbs: Require all objects to have a driver destroy function)
+* Unmerged path drivers/infiniband/core/uverbs_uapi.c
+* Unmerged path drivers/infiniband/core/rdma_core.h
+* Unmerged path drivers/infiniband/core/uverbs_std_types.c
+* Unmerged path drivers/infiniband/core/uverbs_std_types_counters.c
+* Unmerged path drivers/infiniband/core/uverbs_std_types_cq.c
+diff --git a/drivers/infiniband/core/uverbs_std_types_dm.c b/drivers/infiniband/core/uverbs_std_types_dm.c
+index b11344264f4e..c7a19f19d86c 100644
+--- a/drivers/infiniband/core/uverbs_std_types_dm.c
++++ b/drivers/infiniband/core/uverbs_std_types_dm.c
+@@ -105,3 +105,9 @@ DECLARE_UVERBS_NAMED_OBJECT(UVERBS_OBJECT_DM,
+ 			    &UVERBS_TYPE_ALLOC_IDR(1, uverbs_free_dm),
+ 			    &UVERBS_METHOD(UVERBS_METHOD_DM_ALLOC),
+ 			    &UVERBS_METHOD(UVERBS_METHOD_DM_FREE));
++
++const struct uapi_definition uverbs_def_obj_dm[] = {
++	UAPI_DEF_CHAIN_OBJ_TREE_NAMED(UVERBS_OBJECT_DM,
++				      UAPI_DEF_OBJ_NEEDS_FN(dealloc_dm)),
++	{}
++};
+* Unmerged path drivers/infiniband/core/uverbs_std_types_flow_action.c
+* Unmerged path drivers/infiniband/core/uverbs_std_types_mr.c
+* Unmerged path drivers/infiniband/core/uverbs_uapi.c
