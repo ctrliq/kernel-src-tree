@@ -1,0 +1,363 @@
+tc/act: remove unneeded RCU lock in action callback
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-80.el8
+commit-author Paolo Abeni <pabeni@redhat.com>
+commit 7fd4b288ea6a3e45ad8afbcd5ec39554d57f1ae0
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-80.el8/7fd4b288.failed
+
+Each lockless action currently does its own RCU locking in ->act().
+This allows using plain RCU accessor, even if the context
+is really RCU BH.
+
+This change drops the per action RCU lock, replace the accessors
+with the _bh variant, cleans up a bit the surrounding code and
+documents the RCU status in the relevant header.
+No functional nor performance change is intended.
+
+The goal of this patch is clarifying that the RCU critical section
+used by the tc actions extends up to the classifier's caller.
+
+v1 -> v2:
+ - preserve rcu lock in act_bpf: it's needed by eBPF helpers,
+   as pointed out by Daniel
+
+v3 -> v4:
+ - fixed some typos in the commit message (JiriP)
+
+	Signed-off-by: Paolo Abeni <pabeni@redhat.com>
+	Acked-by: Jiri Pirko <jiri@mellanox.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 7fd4b288ea6a3e45ad8afbcd5ec39554d57f1ae0)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/sched/act_skbedit.c
+diff --cc net/sched/act_skbedit.c
+index c802e1a85239,a6db47ebec11..000000000000
+--- a/net/sched/act_skbedit.c
++++ b/net/sched/act_skbedit.c
+@@@ -37,14 -37,18 +37,23 @@@ static int tcf_skbedit(struct sk_buff *
+  		       struct tcf_result *res)
+  {
+  	struct tcf_skbedit *d = to_skbedit(a);
+ -	struct tcf_skbedit_params *params;
+ -	int action;
+  
+ +	spin_lock(&d->tcf_lock);
+  	tcf_lastuse_update(&d->tcf_tm);
+ -	bstats_cpu_update(this_cpu_ptr(d->common.cpu_bstats), skb);
+ +	bstats_update(&d->tcf_bstats, skb);
+  
+++<<<<<<< HEAD
+ +	if (d->flags & SKBEDIT_F_PRIORITY)
+ +		skb->priority = d->priority;
+ +	if (d->flags & SKBEDIT_F_INHERITDSFIELD) {
+++=======
++ 	params = rcu_dereference_bh(d->params);
++ 	action = READ_ONCE(d->tcf_action);
++ 
++ 	if (params->flags & SKBEDIT_F_PRIORITY)
++ 		skb->priority = params->priority;
++ 	if (params->flags & SKBEDIT_F_INHERITDSFIELD) {
+++>>>>>>> 7fd4b288ea6a (tc/act: remove unneeded RCU lock in action callback)
+  		int wlen = skb_network_offset(skb);
+  
+  		switch (tc_skb_protocol(skb)) {
+@@@ -63,22 -67,19 +72,31 @@@
+  			break;
+  		}
+  	}
+ -	if (params->flags & SKBEDIT_F_QUEUE_MAPPING &&
+ -	    skb->dev->real_num_tx_queues > params->queue_mapping)
+ -		skb_set_queue_mapping(skb, params->queue_mapping);
+ -	if (params->flags & SKBEDIT_F_MARK) {
+ -		skb->mark &= ~params->mask;
+ -		skb->mark |= params->mark & params->mask;
+ +	if (d->flags & SKBEDIT_F_QUEUE_MAPPING &&
+ +	    skb->dev->real_num_tx_queues > d->queue_mapping)
+ +		skb_set_queue_mapping(skb, d->queue_mapping);
+ +	if (d->flags & SKBEDIT_F_MARK) {
+ +		skb->mark &= ~d->mask;
+ +		skb->mark |= d->mark & d->mask;
+  	}
+++<<<<<<< HEAD
+ +	if (d->flags & SKBEDIT_F_PTYPE)
+ +		skb->pkt_type = d->ptype;
+ +
+ +	spin_unlock(&d->tcf_lock);
+ +	return d->tcf_action;
+ +
+ +err:
+ +	d->tcf_qstats.drops++;
+ +	spin_unlock(&d->tcf_lock);
+++=======
++ 	if (params->flags & SKBEDIT_F_PTYPE)
++ 		skb->pkt_type = params->ptype;
++ 	return action;
++ 
++ err:
++ 	qstats_drop_inc(this_cpu_ptr(d->common.cpu_qstats));
+++>>>>>>> 7fd4b288ea6a (tc/act: remove unneeded RCU lock in action callback)
+  	return TC_ACT_SHOT;
+  }
+  
+diff --git a/include/net/act_api.h b/include/net/act_api.h
+index eb868a54cfdd..061e2733c804 100644
+--- a/include/net/act_api.h
++++ b/include/net/act_api.h
+@@ -84,7 +84,7 @@ struct tc_action_ops {
+ 	size_t	size;
+ 	struct module		*owner;
+ 	int     (*act)(struct sk_buff *, const struct tc_action *,
+-		       struct tcf_result *);
++		       struct tcf_result *); /* called under RCU BH lock*/
+ 	int     (*dump)(struct sk_buff *, struct tc_action *, int, int);
+ 	void	(*cleanup)(struct tc_action *);
+ 	int     (*lookup)(struct net *net, struct tc_action **a, u32 index,
+diff --git a/include/net/sch_generic.h b/include/net/sch_generic.h
+index 9ec16169037a..df4fd485866d 100644
+--- a/include/net/sch_generic.h
++++ b/include/net/sch_generic.h
+@@ -285,6 +285,8 @@ struct tcf_proto {
+ 	/* Fast access part */
+ 	struct tcf_proto __rcu	*next;
+ 	void __rcu		*root;
++
++	/* called under RCU BH lock*/
+ 	int			(*classify)(struct sk_buff *,
+ 					    const struct tcf_proto *,
+ 					    struct tcf_result *);
+diff --git a/net/sched/act_csum.c b/net/sched/act_csum.c
+index 08b34187b0cb..17e8a86d9e81 100644
+--- a/net/sched/act_csum.c
++++ b/net/sched/act_csum.c
+@@ -556,15 +556,14 @@ static int tcf_csum(struct sk_buff *skb, const struct tc_action *a,
+ 	u32 update_flags;
+ 	int action;
+ 
+-	rcu_read_lock();
+-	params = rcu_dereference(p->params);
++	params = rcu_dereference_bh(p->params);
+ 
+ 	tcf_lastuse_update(&p->tcf_tm);
+ 	bstats_cpu_update(this_cpu_ptr(p->common.cpu_bstats), skb);
+ 
+ 	action = READ_ONCE(p->tcf_action);
+ 	if (unlikely(action == TC_ACT_SHOT))
+-		goto drop_stats;
++		goto drop;
+ 
+ 	update_flags = params->update_flags;
+ 	switch (tc_skb_protocol(skb)) {
+@@ -578,16 +577,11 @@ static int tcf_csum(struct sk_buff *skb, const struct tc_action *a,
+ 		break;
+ 	}
+ 
+-unlock:
+-	rcu_read_unlock();
+ 	return action;
+ 
+ drop:
+-	action = TC_ACT_SHOT;
+-
+-drop_stats:
+ 	qstats_drop_inc(this_cpu_ptr(p->common.cpu_qstats));
+-	goto unlock;
++	return TC_ACT_SHOT;
+ }
+ 
+ static int tcf_csum_dump(struct sk_buff *skb, struct tc_action *a, int bind,
+diff --git a/net/sched/act_ife.c b/net/sched/act_ife.c
+index 2aab42c549af..26ae34fa7fa2 100644
+--- a/net/sched/act_ife.c
++++ b/net/sched/act_ife.c
+@@ -814,14 +814,11 @@ static int tcf_ife_act(struct sk_buff *skb, const struct tc_action *a,
+ 	struct tcf_ife_params *p;
+ 	int ret;
+ 
+-	rcu_read_lock();
+-	p = rcu_dereference(ife->params);
++	p = rcu_dereference_bh(ife->params);
+ 	if (p->flags & IFE_ENCODE) {
+ 		ret = tcf_ife_encode(skb, a, res, p);
+-		rcu_read_unlock();
+ 		return ret;
+ 	}
+-	rcu_read_unlock();
+ 
+ 	return tcf_ife_decode(skb, a, res);
+ }
+diff --git a/net/sched/act_mirred.c b/net/sched/act_mirred.c
+index 82c6f70d596c..86afe781d4ff 100644
+--- a/net/sched/act_mirred.c
++++ b/net/sched/act_mirred.c
+@@ -172,11 +172,10 @@ static int tcf_mirred(struct sk_buff *skb, const struct tc_action *a,
+ 	tcf_lastuse_update(&m->tcf_tm);
+ 	bstats_cpu_update(this_cpu_ptr(m->common.cpu_bstats), skb);
+ 
+-	rcu_read_lock();
+ 	m_mac_header_xmit = READ_ONCE(m->tcfm_mac_header_xmit);
+ 	m_eaction = READ_ONCE(m->tcfm_eaction);
+ 	retval = READ_ONCE(m->tcf_action);
+-	dev = rcu_dereference(m->tcfm_dev);
++	dev = rcu_dereference_bh(m->tcfm_dev);
+ 	if (unlikely(!dev)) {
+ 		pr_notice_once("tc mirred: target device is gone\n");
+ 		goto out;
+@@ -227,7 +226,6 @@ static int tcf_mirred(struct sk_buff *skb, const struct tc_action *a,
+ 		if (tcf_mirred_is_act_redirect(m_eaction))
+ 			retval = TC_ACT_SHOT;
+ 	}
+-	rcu_read_unlock();
+ 
+ 	return retval;
+ }
+diff --git a/net/sched/act_sample.c b/net/sched/act_sample.c
+index f17d3a84eb7f..69d3c5bdae57 100644
+--- a/net/sched/act_sample.c
++++ b/net/sched/act_sample.c
+@@ -137,8 +137,7 @@ static int tcf_sample_act(struct sk_buff *skb, const struct tc_action *a,
+ 	bstats_cpu_update(this_cpu_ptr(s->common.cpu_bstats), skb);
+ 	retval = READ_ONCE(s->tcf_action);
+ 
+-	rcu_read_lock();
+-	psample_group = rcu_dereference(s->psample_group);
++	psample_group = rcu_dereference_bh(s->psample_group);
+ 
+ 	/* randomly sample packets according to rate */
+ 	if (psample_group && (prandom_u32() % s->rate == 0)) {
+@@ -162,7 +161,6 @@ static int tcf_sample_act(struct sk_buff *skb, const struct tc_action *a,
+ 			skb_pull(skb, skb->mac_len);
+ 	}
+ 
+-	rcu_read_unlock();
+ 	return retval;
+ }
+ 
+* Unmerged path net/sched/act_skbedit.c
+diff --git a/net/sched/act_skbmod.c b/net/sched/act_skbmod.c
+index f58fe4aa104d..60eb082d3eb1 100644
+--- a/net/sched/act_skbmod.c
++++ b/net/sched/act_skbmod.c
+@@ -41,20 +41,14 @@ static int tcf_skbmod_run(struct sk_buff *skb, const struct tc_action *a,
+ 	 * then MAX_EDIT_LEN needs to change appropriately
+ 	*/
+ 	err = skb_ensure_writable(skb, MAX_EDIT_LEN);
+-	if (unlikely(err)) { /* best policy is to drop on the floor */
+-		qstats_overlimit_inc(this_cpu_ptr(d->common.cpu_qstats));
+-		return TC_ACT_SHOT;
+-	}
++	if (unlikely(err)) /* best policy is to drop on the floor */
++		goto drop;
+ 
+-	rcu_read_lock();
+ 	action = READ_ONCE(d->tcf_action);
+-	if (unlikely(action == TC_ACT_SHOT)) {
+-		qstats_overlimit_inc(this_cpu_ptr(d->common.cpu_qstats));
+-		rcu_read_unlock();
+-		return action;
+-	}
++	if (unlikely(action == TC_ACT_SHOT))
++		goto drop;
+ 
+-	p = rcu_dereference(d->skbmod_p);
++	p = rcu_dereference_bh(d->skbmod_p);
+ 	flags = p->flags;
+ 	if (flags & SKBMOD_F_DMAC)
+ 		ether_addr_copy(eth_hdr(skb)->h_dest, p->eth_dst);
+@@ -62,7 +56,6 @@ static int tcf_skbmod_run(struct sk_buff *skb, const struct tc_action *a,
+ 		ether_addr_copy(eth_hdr(skb)->h_source, p->eth_src);
+ 	if (flags & SKBMOD_F_ETYPE)
+ 		eth_hdr(skb)->h_proto = p->eth_type;
+-	rcu_read_unlock();
+ 
+ 	if (flags & SKBMOD_F_SWAPMAC) {
+ 		u16 tmpaddr[ETH_ALEN / 2]; /* ether_addr_copy() requirement */
+@@ -73,6 +66,10 @@ static int tcf_skbmod_run(struct sk_buff *skb, const struct tc_action *a,
+ 	}
+ 
+ 	return action;
++
++drop:
++	qstats_overlimit_inc(this_cpu_ptr(d->common.cpu_qstats));
++	return TC_ACT_SHOT;
+ }
+ 
+ static const struct nla_policy skbmod_policy[TCA_SKBMOD_MAX + 1] = {
+diff --git a/net/sched/act_tunnel_key.c b/net/sched/act_tunnel_key.c
+index 1670ff5d2af5..411047ecb9f0 100644
+--- a/net/sched/act_tunnel_key.c
++++ b/net/sched/act_tunnel_key.c
+@@ -31,9 +31,7 @@ static int tunnel_key_act(struct sk_buff *skb, const struct tc_action *a,
+ 	struct tcf_tunnel_key_params *params;
+ 	int action;
+ 
+-	rcu_read_lock();
+-
+-	params = rcu_dereference(t->params);
++	params = rcu_dereference_bh(t->params);
+ 
+ 	tcf_lastuse_update(&t->tcf_tm);
+ 	bstats_cpu_update(this_cpu_ptr(t->common.cpu_bstats), skb);
+@@ -53,8 +51,6 @@ static int tunnel_key_act(struct sk_buff *skb, const struct tc_action *a,
+ 		break;
+ 	}
+ 
+-	rcu_read_unlock();
+-
+ 	return action;
+ }
+ 
+diff --git a/net/sched/act_vlan.c b/net/sched/act_vlan.c
+index c71fc085e1cd..bd5ff095eef3 100644
+--- a/net/sched/act_vlan.c
++++ b/net/sched/act_vlan.c
+@@ -40,11 +40,9 @@ static int tcf_vlan(struct sk_buff *skb, const struct tc_action *a,
+ 	if (skb_at_tc_ingress(skb))
+ 		skb_push_rcsum(skb, skb->mac_len);
+ 
+-	rcu_read_lock();
+-
+ 	action = READ_ONCE(v->tcf_action);
+ 
+-	p = rcu_dereference(v->vlan_p);
++	p = rcu_dereference_bh(v->vlan_p);
+ 
+ 	switch (p->tcfv_action) {
+ 	case TCA_VLAN_ACT_POP:
+@@ -61,7 +59,7 @@ static int tcf_vlan(struct sk_buff *skb, const struct tc_action *a,
+ 	case TCA_VLAN_ACT_MODIFY:
+ 		/* No-op if no vlan tag (either hw-accel or in-payload) */
+ 		if (!skb_vlan_tagged(skb))
+-			goto unlock;
++			goto out;
+ 		/* extract existing tag (and guarantee no hw-accel tag) */
+ 		if (skb_vlan_tag_present(skb)) {
+ 			tci = skb_vlan_tag_get(skb);
+@@ -86,18 +84,15 @@ static int tcf_vlan(struct sk_buff *skb, const struct tc_action *a,
+ 		BUG();
+ 	}
+ 
+-	goto unlock;
+-
+-drop:
+-	action = TC_ACT_SHOT;
+-	qstats_drop_inc(this_cpu_ptr(v->common.cpu_qstats));
+-
+-unlock:
+-	rcu_read_unlock();
++out:
+ 	if (skb_at_tc_ingress(skb))
+ 		skb_pull_rcsum(skb, skb->mac_len);
+ 
+ 	return action;
++
++drop:
++	qstats_drop_inc(this_cpu_ptr(v->common.cpu_qstats));
++	return TC_ACT_SHOT;
+ }
+ 
+ static const struct nla_policy vlan_policy[TCA_VLAN_MAX + 1] = {
