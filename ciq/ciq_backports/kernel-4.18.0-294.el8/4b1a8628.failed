@@ -1,0 +1,137 @@
+net: udp: fix UDP header access on Fast/frag0 UDP GRO
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+Rebuild_CHGLOG: - [net] udp: fix UDP header access on Fast/frag0 UDP GRO (Xin Long) [1879403]
+Rebuild_FUZZ: 95.05%
+commit-author Alexander Lobakin <alobakin@pm.me>
+commit 4b1a86281cc1d0de46df3ad2cb8c1f86ac07681c
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/4b1a8628.failed
+
+UDP GRO uses udp_hdr(skb) in its .gro_receive() callback. While it's
+probably OK for non-frag0 paths (when all headers or even the entire
+frame are already in skb head), this inline points to junk when
+using Fast GRO (napi_gro_frags() or napi_gro_receive() with only
+Ethernet header in skb head and all the rest in the frags) and breaks
+GRO packet compilation and the packet flow itself.
+To support both modes, skb_gro_header_fast() + skb_gro_header_slow()
+are typically used. UDP even has an inline helper that makes use of
+them, udp_gro_udphdr(). Use that instead of troublemaking udp_hdr()
+to get rid of the out-of-order delivers.
+
+Present since the introduction of plain UDP GRO in 5.0-rc1.
+
+Fixes: e20cf8d3f1f7 ("udp: implement GRO for plain UDP sockets.")
+	Cc: Eric Dumazet <edumazet@google.com>
+	Signed-off-by: Alexander Lobakin <alobakin@pm.me>
+	Acked-by: Willem de Bruijn <willemb@google.com>
+	Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+(cherry picked from commit 4b1a86281cc1d0de46df3ad2cb8c1f86ac07681c)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/ipv4/udp_offload.c
+diff --cc net/ipv4/udp_offload.c
+index b081620854e2,13740e9fe6ec..000000000000
+--- a/net/ipv4/udp_offload.c
++++ b/net/ipv4/udp_offload.c
+@@@ -349,10 -362,90 +349,95 @@@ out
+  	return segs;
+  }
+  
+++<<<<<<< HEAD
+ +INDIRECT_CALLABLE_DECLARE(struct sock *udp6_lib_lookup_skb(struct sk_buff *skb,
+ +						   __be16 sport, __be16 dport));
+++=======
++ #define UDP_GRO_CNT_MAX 64
++ static struct sk_buff *udp_gro_receive_segment(struct list_head *head,
++ 					       struct sk_buff *skb)
++ {
++ 	struct udphdr *uh = udp_gro_udphdr(skb);
++ 	struct sk_buff *pp = NULL;
++ 	struct udphdr *uh2;
++ 	struct sk_buff *p;
++ 	unsigned int ulen;
++ 	int ret = 0;
++ 
++ 	/* requires non zero csum, for symmetry with GSO */
++ 	if (!uh->check) {
++ 		NAPI_GRO_CB(skb)->flush = 1;
++ 		return NULL;
++ 	}
++ 
++ 	/* Do not deal with padded or malicious packets, sorry ! */
++ 	ulen = ntohs(uh->len);
++ 	if (ulen <= sizeof(*uh) || ulen != skb_gro_len(skb)) {
++ 		NAPI_GRO_CB(skb)->flush = 1;
++ 		return NULL;
++ 	}
++ 	/* pull encapsulating udp header */
++ 	skb_gro_pull(skb, sizeof(struct udphdr));
++ 
++ 	list_for_each_entry(p, head, list) {
++ 		if (!NAPI_GRO_CB(p)->same_flow)
++ 			continue;
++ 
++ 		uh2 = udp_hdr(p);
++ 
++ 		/* Match ports only, as csum is always non zero */
++ 		if ((*(u32 *)&uh->source != *(u32 *)&uh2->source)) {
++ 			NAPI_GRO_CB(p)->same_flow = 0;
++ 			continue;
++ 		}
++ 
++ 		if (NAPI_GRO_CB(skb)->is_flist != NAPI_GRO_CB(p)->is_flist) {
++ 			NAPI_GRO_CB(skb)->flush = 1;
++ 			return p;
++ 		}
++ 
++ 		/* Terminate the flow on len mismatch or if it grow "too much".
++ 		 * Under small packet flood GRO count could elsewhere grow a lot
++ 		 * leading to excessive truesize values.
++ 		 * On len mismatch merge the first packet shorter than gso_size,
++ 		 * otherwise complete the GRO packet.
++ 		 */
++ 		if (ulen > ntohs(uh2->len)) {
++ 			pp = p;
++ 		} else {
++ 			if (NAPI_GRO_CB(skb)->is_flist) {
++ 				if (!pskb_may_pull(skb, skb_gro_offset(skb))) {
++ 					NAPI_GRO_CB(skb)->flush = 1;
++ 					return NULL;
++ 				}
++ 				if ((skb->ip_summed != p->ip_summed) ||
++ 				    (skb->csum_level != p->csum_level)) {
++ 					NAPI_GRO_CB(skb)->flush = 1;
++ 					return NULL;
++ 				}
++ 				ret = skb_gro_receive_list(p, skb);
++ 			} else {
++ 				skb_gro_postpull_rcsum(skb, uh,
++ 						       sizeof(struct udphdr));
++ 
++ 				ret = skb_gro_receive(p, skb);
++ 			}
++ 		}
++ 
++ 		if (ret || ulen != ntohs(uh2->len) ||
++ 		    NAPI_GRO_CB(p)->count >= UDP_GRO_CNT_MAX)
++ 			pp = p;
++ 
++ 		return pp;
++ 	}
++ 
++ 	/* mismatch, but we never need to flush */
++ 	return NULL;
++ }
++ 
+++>>>>>>> 4b1a86281cc1 (net: udp: fix UDP header access on Fast/frag0 UDP GRO)
+  struct sk_buff *udp_gro_receive(struct list_head *head, struct sk_buff *skb,
+ -				struct udphdr *uh, struct sock *sk)
+ +				struct udphdr *uh, udp_lookup_t lookup)
+  {
+  	struct sk_buff *pp = NULL;
+  	struct sk_buff *p;
+* Unmerged path net/ipv4/udp_offload.c
