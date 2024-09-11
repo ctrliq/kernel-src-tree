@@ -1,0 +1,120 @@
+printk: limit second loop of syslog_print_all
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-358.el8
+commit-author John Ogness <john.ogness@linutronix.de>
+commit bb07b16c44b2c6ddbafa44bb06454719002e828e
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-358.el8/bb07b16c.failed
+
+The second loop of syslog_print_all() subtracts lengths that were
+added in the first loop. With commit b031a684bfd0 ("printk: remove
+logbuf_lock writer-protection of ringbuffer") it is possible that
+records are (over)written during syslog_print_all(). This allows the
+possibility of the second loop subtracting lengths that were never
+added in the first loop.
+
+This situation can result in syslog_print_all() filling the buffer
+starting from a later record, even though there may have been room
+to fit the earlier record(s) as well.
+
+Fixes: b031a684bfd0 ("printk: remove logbuf_lock writer-protection of ringbuffer")
+	Signed-off-by: John Ogness <john.ogness@linutronix.de>
+	Reviewed-by: Petr Mladek <pmladek@suse.com>
+	Signed-off-by: Petr Mladek <pmladek@suse.com>
+Link: https://lore.kernel.org/r/20210303101528.29901-4-john.ogness@linutronix.de
+(cherry picked from commit bb07b16c44b2c6ddbafa44bb06454719002e828e)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	kernel/printk/printk.c
+diff --cc kernel/printk/printk.c
+index 9c33249065a6,77ae2704e979..000000000000
+--- a/kernel/printk/printk.c
++++ b/kernel/printk/printk.c
+@@@ -1452,11 -1491,13 +1452,18 @@@ static int syslog_print(char __user *bu
+  
+  static int syslog_print_all(char __user *buf, int size, bool clear)
+  {
+++<<<<<<< HEAD
+++=======
++ 	struct printk_info info;
++ 	unsigned int line_count;
++ 	struct printk_record r;
++ 	u64 max_seq;
+++>>>>>>> bb07b16c44b2 (printk: limit second loop of syslog_print_all)
+  	char *text;
+  	int len = 0;
+ +	u64 next_seq;
+  	u64 seq;
+ +	u32 idx;
+  	bool time;
+  
+  	text = kmalloc(LOG_LINE_MAX + PREFIX_MAX, GFP_KERNEL);
+@@@ -1469,38 -1510,34 +1476,52 @@@
+  	 * Find first record that fits, including all following records,
+  	 * into the user-provided buffer for this dump.
+  	 */
+ -	prb_for_each_info(clear_seq, prb, seq, &info, &line_count)
+ -		len += get_record_print_text_size(&info, line_count, true, time);
+ -
+ +	seq = clear_seq;
+ +	idx = clear_idx;
+ +	while (seq < log_next_seq) {
+ +		struct printk_log *msg = log_from_idx(idx);
+ +
+++<<<<<<< HEAD
+ +		len += msg_print_text(msg, true, time, NULL, 0);
+ +		idx = log_next(idx);
+ +		seq++;
+++=======
++ 	/*
++ 	 * Set an upper bound for the next loop to avoid subtracting lengths
++ 	 * that were never added.
++ 	 */
++ 	max_seq = seq;
++ 
++ 	/* move first record forward until length fits into the buffer */
++ 	prb_for_each_info(clear_seq, prb, seq, &info, &line_count) {
++ 		if (len <= size || info.seq >= max_seq)
++ 			break;
++ 		len -= get_record_print_text_size(&info, line_count, true, time);
+++>>>>>>> bb07b16c44b2 (printk: limit second loop of syslog_print_all)
+  	}
+  
+ -	prb_rec_init_rd(&r, &info, text, LOG_LINE_MAX + PREFIX_MAX);
+ +	/* move first record forward until length fits into the buffer */
+ +	seq = clear_seq;
+ +	idx = clear_idx;
+ +	while (len > size && seq < log_next_seq) {
+ +		struct printk_log *msg = log_from_idx(idx);
+  
+ -	len = 0;
+ -	prb_for_each_record(seq, prb, seq, &r) {
+ -		int textlen;
+ +		len -= msg_print_text(msg, true, time, NULL, 0);
+ +		idx = log_next(idx);
+ +		seq++;
+ +	}
+  
+ -		textlen = record_print_text(&r, true, time);
+ +	/* last message fitting into this dump */
+ +	next_seq = log_next_seq;
+  
+ -		if (len + textlen > size) {
+ -			seq--;
+ -			break;
+ -		}
+ +	len = 0;
+ +	while (len >= 0 && seq < next_seq) {
+ +		struct printk_log *msg = log_from_idx(idx);
+ +		int textlen = msg_print_text(msg, true, time, text,
+ +					     LOG_LINE_MAX + PREFIX_MAX);
+ +
+ +		idx = log_next(idx);
+ +		seq++;
+  
+  		logbuf_unlock_irq();
+  		if (copy_to_user(buf + len, text, textlen))
+* Unmerged path kernel/printk/printk.c
