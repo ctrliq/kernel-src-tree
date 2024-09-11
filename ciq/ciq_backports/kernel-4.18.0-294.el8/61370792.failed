@@ -1,0 +1,123 @@
+rcu: Add a trace event for kfree_rcu() use of kfree_bulk()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Uladzislau Rezki (Sony) <urezki@gmail.com>
+commit 613707929b304737e6eb841588772f1994f6702b
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/61370792.failed
+
+The event is given three parameters, first one is the name
+of RCU flavour, second one is the number of elements in array
+for free and last one is an address of the array holding
+pointers to be freed by the kfree_bulk() function.
+
+To enable the trace event your kernel has to be build with
+CONFIG_RCU_TRACE=y, after that it is possible to track the
+events using ftrace subsystem.
+
+	Signed-off-by: Uladzislau Rezki (Sony) <urezki@gmail.com>
+	Signed-off-by: Paul E. McKenney <paulmck@kernel.org>
+(cherry picked from commit 613707929b304737e6eb841588772f1994f6702b)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	kernel/rcu/tree.c
+diff --cc kernel/rcu/tree.c
+index 4aa7b6bbcde6,909f97efb1ed..000000000000
+--- a/kernel/rcu/tree.c
++++ b/kernel/rcu/tree.c
+@@@ -2737,14 -2781,46 +2737,41 @@@ static void kfree_rcu_work(struct work_
+  	spin_lock_irqsave(&krcp->lock, flags);
+  	head = krwp->head_free;
+  	krwp->head_free = NULL;
+ -	bhead = krwp->bhead_free;
+ -	krwp->bhead_free = NULL;
+  	spin_unlock_irqrestore(&krcp->lock, flags);
+  
+++<<<<<<< HEAD
+ +	// List "head" is now private, so traverse locklessly.
+++=======
++ 	/* "bhead" is now private, so traverse locklessly. */
++ 	for (; bhead; bhead = bnext) {
++ 		bnext = bhead->next;
++ 
++ 		debug_rcu_head_unqueue_bulk(bhead->head_free_debug);
++ 
++ 		rcu_lock_acquire(&rcu_callback_map);
++ 		trace_rcu_invoke_kfree_bulk_callback(rcu_state.name,
++ 			bhead->nr_records, bhead->records);
++ 
++ 		kfree_bulk(bhead->nr_records, bhead->records);
++ 		rcu_lock_release(&rcu_callback_map);
++ 
++ 		if (cmpxchg(&krcp->bcached, NULL, bhead))
++ 			free_page((unsigned long) bhead);
++ 
++ 		cond_resched_tasks_rcu_qs();
++ 	}
++ 
++ 	/*
++ 	 * Emergency case only. It can happen under low memory
++ 	 * condition when an allocation gets failed, so the "bulk"
++ 	 * path can not be temporary maintained.
++ 	 */
+++>>>>>>> 613707929b30 (rcu: Add a trace event for kfree_rcu() use of kfree_bulk())
+  	for (; head; head = next) {
+ -		unsigned long offset = (unsigned long)head->func;
+ -
+  		next = head->next;
+ +		// Potentially optimize with kfree_bulk in future.
+  		debug_rcu_head_unqueue(head);
+ -		rcu_lock_acquire(&rcu_callback_map);
+ -		trace_rcu_invoke_kfree_callback(rcu_state.name, head, offset);
+ -
+ -		if (!WARN_ON_ONCE(!__is_kfree_rcu_offset(offset)))
+ -			kfree((void *)head - offset);
+ -
+ -		rcu_lock_release(&rcu_callback_map);
+ +		__rcu_reclaim(rcu_state.name, head);
+  		cond_resched_tasks_rcu_qs();
+  	}
+  }
+diff --git a/include/trace/events/rcu.h b/include/trace/events/rcu.h
+index 0f83f4223cfb..7a98d0ace7e4 100644
+--- a/include/trace/events/rcu.h
++++ b/include/trace/events/rcu.h
+@@ -631,6 +631,34 @@ TRACE_EVENT_RCU(rcu_invoke_kfree_callback,
+ 		  __entry->rcuname, __entry->rhp, __entry->offset)
+ );
+ 
++/*
++ * Tracepoint for the invocation of a single RCU callback of the special
++ * kfree_bulk() form. The first argument is the RCU flavor, the second
++ * argument is a number of elements in array to free, the third is an
++ * address of the array holding nr_records entries.
++ */
++TRACE_EVENT_RCU(rcu_invoke_kfree_bulk_callback,
++
++	TP_PROTO(const char *rcuname, unsigned long nr_records, void **p),
++
++	TP_ARGS(rcuname, nr_records, p),
++
++	TP_STRUCT__entry(
++		__field(const char *, rcuname)
++		__field(unsigned long, nr_records)
++		__field(void **, p)
++	),
++
++	TP_fast_assign(
++		__entry->rcuname = rcuname;
++		__entry->nr_records = nr_records;
++		__entry->p = p;
++	),
++
++	TP_printk("%s bulk=0x%p nr_records=%lu",
++		__entry->rcuname, __entry->p, __entry->nr_records)
++);
++
+ /*
+  * Tracepoint for exiting rcu_do_batch after RCU callbacks have been
+  * invoked.  The first argument is the name of the RCU flavor,
+* Unmerged path kernel/rcu/tree.c
