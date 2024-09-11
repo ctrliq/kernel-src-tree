@@ -1,0 +1,135 @@
+ext4: fix an use-after-free issue about data=journal writeback mode
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-408.el8
+commit-author Zhang Yi <yi.zhang@huawei.com>
+commit 5c48a7df91499e371ef725895b2e2d21a126e227
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-408.el8/5c48a7df.failed
+
+Our syzkaller report an use-after-free issue that accessing the freed
+buffer_head on the writeback page in __ext4_journalled_writepage(). The
+problem is that if there was a truncate racing with the data=journalled
+writeback procedure, the writeback length could become zero and
+bget_one() refuse to get buffer_head's refcount, then the truncate
+procedure release buffer once we drop page lock, finally, the last
+ext4_walk_page_buffers() trigger the use-after-free problem.
+
+sync                               truncate
+ext4_sync_file()
+ file_write_and_wait_range()
+                                   ext4_setattr(0)
+                                    inode->i_size = 0
+  ext4_writepage()
+   len = 0
+   __ext4_journalled_writepage()
+    page_bufs = page_buffers(page)
+    ext4_walk_page_buffers(bget_one) <- does not get refcount
+                                    do_invalidatepage()
+                                      free_buffer_head()
+    ext4_walk_page_buffers(page_bufs) <- trigger use-after-free
+
+After commit bdf96838aea6 ("ext4: fix race between truncate and
+__ext4_journalled_writepage()"), we have already handled the racing
+case, so the bget_one() and bput_one() are not needed. So this patch
+simply remove these hunk, and recheck the i_size to make it safe.
+
+Fixes: bdf96838aea6 ("ext4: fix race between truncate and __ext4_journalled_writepage()")
+	Signed-off-by: Zhang Yi <yi.zhang@huawei.com>
+	Cc: stable@vger.kernel.org
+Link: https://lore.kernel.org/r/20211225090937.712867-1-yi.zhang@huawei.com
+	Signed-off-by: Theodore Ts'o <tytso@mit.edu>
+(cherry picked from commit 5c48a7df91499e371ef725895b2e2d21a126e227)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/ext4/inode.c
+diff --cc fs/ext4/inode.c
+index cd87a791f0ef,68070f34f0cf..000000000000
+--- a/fs/ext4/inode.c
++++ b/fs/ext4/inode.c
+@@@ -2008,18 -1845,6 +2008,21 @@@ int ext4_da_get_block_prep(struct inod
+  	return 0;
+  }
+  
+++<<<<<<< HEAD
+ +static int bget_one(handle_t *handle, struct buffer_head *bh)
+ +{
+ +	get_bh(bh);
+ +	return 0;
+ +}
+ +
+ +static int bput_one(handle_t *handle, struct buffer_head *bh)
+ +{
+ +	put_bh(bh);
+ +	return 0;
+ +}
+ +
+++=======
+++>>>>>>> 5c48a7df9149 (ext4: fix an use-after-free issue about data=journal writeback mode)
+  static int __ext4_journalled_writepage(struct page *page,
+  				       unsigned int len)
+  {
+@@@ -2039,14 -1864,6 +2042,17 @@@
+  		inode_bh = ext4_journalled_write_inline_data(inode, len, page);
+  		if (inode_bh == NULL)
+  			goto out;
+++<<<<<<< HEAD
+ +	} else {
+ +		page_bufs = page_buffers(page);
+ +		if (!page_bufs) {
+ +			BUG();
+ +			goto out;
+ +		}
+ +		ext4_walk_page_buffers(handle, page_bufs, 0, len,
+ +				       NULL, bget_one);
+++=======
+++>>>>>>> 5c48a7df9149 (ext4: fix an use-after-free issue about data=journal writeback mode)
+  	}
+  	/*
+  	 * We need to release the page lock before we start the
+@@@ -2077,12 -1895,22 +2084,24 @@@
+  	if (inline_data) {
+  		ret = ext4_mark_inode_dirty(handle, inode);
+  	} else {
+++<<<<<<< HEAD
+ +		ret = ext4_walk_page_buffers(handle, page_bufs, 0, len, NULL,
+ +					     do_journal_get_write_access);
+++=======
++ 		struct buffer_head *page_bufs = page_buffers(page);
++ 
++ 		if (page->index == size >> PAGE_SHIFT)
++ 			len = size & ~PAGE_MASK;
++ 		else
++ 			len = PAGE_SIZE;
++ 
++ 		ret = ext4_walk_page_buffers(handle, inode, page_bufs, 0, len,
++ 					     NULL, do_journal_get_write_access);
+++>>>>>>> 5c48a7df9149 (ext4: fix an use-after-free issue about data=journal writeback mode)
+  
+ -		err = ext4_walk_page_buffers(handle, inode, page_bufs, 0, len,
+ -					     NULL, write_end_fn);
+ +		err = ext4_walk_page_buffers(handle, page_bufs, 0, len, NULL,
+ +					     write_end_fn);
+  	}
+ -	if (ret == 0)
+ -		ret = err;
+ -	err = ext4_jbd2_inode_add_write(handle, inode, page_offset(page), len);
+  	if (ret == 0)
+  		ret = err;
+  	EXT4_I(inode)->i_datasync_tid = handle->h_transaction->t_tid;
+@@@ -2094,9 -1922,6 +2113,12 @@@
+  out:
+  	unlock_page(page);
+  out_no_pagelock:
+++<<<<<<< HEAD
+ +	if (!inline_data && page_bufs)
+ +		ext4_walk_page_buffers(NULL, page_bufs, 0, len,
+ +				       NULL, bput_one);
+++=======
+++>>>>>>> 5c48a7df9149 (ext4: fix an use-after-free issue about data=journal writeback mode)
+  	brelse(inode_bh);
+  	return ret;
+  }
+* Unmerged path fs/ext4/inode.c
