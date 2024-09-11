@@ -1,0 +1,286 @@
+dmaengine: idxd: rework descriptor free path on failure
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-408.el8
+commit-author Dave Jiang <dave.jiang@intel.com>
+commit 5d78abb6fbc974d601dd365b9ce39f320fb5ba79
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-408.el8/5d78abb6.failed
+
+Refactor the completion function to allow skipping of descriptor freeing on
+the submission failure path. This completely removes descriptor freeing
+from the submit failure path and leave the responsibility to the caller.
+
+	Reviewed-by: Kevin Tian <kevin.tian@intel.com>
+	Signed-off-by: Dave Jiang <dave.jiang@intel.com>
+Link: https://lore.kernel.org/r/163528416222.3925689.12859769271667814762.stgit@djiang5-desk3.ch.intel.com
+	Signed-off-by: Vinod Koul <vkoul@kernel.org>
+(cherry picked from commit 5d78abb6fbc974d601dd365b9ce39f320fb5ba79)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/dma/idxd/irq.c
+#	drivers/dma/idxd/submit.c
+diff --cc drivers/dma/idxd/irq.c
+index 7a2cf0512501,d9c4fc22536d..000000000000
+--- a/drivers/dma/idxd/irq.c
++++ b/drivers/dma/idxd/irq.c
+@@@ -257,54 -181,38 +257,70 @@@ static int irq_process_pending_llist(st
+  {
+  	struct idxd_desc *desc, *t;
+  	struct llist_node *head;
+ +	int queued = 0;
+ +	unsigned long flags;
+ +	enum idxd_complete_type reason;
+  
+ +	*processed = 0;
+  	head = llist_del_all(&irq_entry->pending_llist);
+  	if (!head)
+ -		return;
+ +		goto out;
+ +
+ +	if (wtype == IRQ_WORK_NORMAL)
+ +		reason = IDXD_COMPLETE_NORMAL;
+ +	else
+ +		reason = IDXD_COMPLETE_DEV_FAIL;
+  
+  	llist_for_each_entry_safe(desc, t, head, llnode) {
+++<<<<<<< HEAD
+ +		if (desc->completion->status) {
+ +			if ((desc->completion->status & DSA_COMP_STATUS_MASK) != DSA_COMP_SUCCESS)
+ +				match_fault(desc, data);
+ +			complete_desc(desc, reason);
+ +			(*processed)++;
+++=======
++ 		u8 status = desc->completion->status & DSA_COMP_STATUS_MASK;
++ 
++ 		if (status) {
++ 			/*
++ 			 * Check against the original status as ABORT is software defined
++ 			 * and 0xff, which DSA_COMP_STATUS_MASK can mask out.
++ 			 */
++ 			if (unlikely(desc->completion->status == IDXD_COMP_DESC_ABORT)) {
++ 				idxd_dma_complete_txd(desc, IDXD_COMPLETE_ABORT, true);
++ 				continue;
++ 			}
++ 
++ 			idxd_dma_complete_txd(desc, IDXD_COMPLETE_NORMAL, true);
+++>>>>>>> 5d78abb6fbc9 (dmaengine: idxd: rework descriptor free path on failure)
+  		} else {
+ -			spin_lock(&irq_entry->list_lock);
+ +			spin_lock_irqsave(&irq_entry->list_lock, flags);
+  			list_add_tail(&desc->list,
+  				      &irq_entry->work_list);
+ -			spin_unlock(&irq_entry->list_lock);
+ +			spin_unlock_irqrestore(&irq_entry->list_lock, flags);
+ +			queued++;
+  		}
+  	}
+ +
+ + out:
+ +	return queued;
+  }
+  
+ -static void irq_process_work_list(struct idxd_irq_entry *irq_entry)
+ +static int irq_process_work_list(struct idxd_irq_entry *irq_entry,
+ +				 enum irq_work_type wtype,
+ +				 int *processed, u64 data)
+  {
+ +	int queued = 0;
+ +	unsigned long flags;
+  	LIST_HEAD(flist);
+  	struct idxd_desc *desc, *n;
+ +	enum idxd_complete_type reason;
+ +
+ +	*processed = 0;
+ +	if (wtype == IRQ_WORK_NORMAL)
+ +		reason = IDXD_COMPLETE_NORMAL;
+ +	else
+ +		reason = IDXD_COMPLETE_DEV_FAIL;
+  
+  	/*
+  	 * This lock protects list corruption from access of list outside of the irq handler
+@@@ -326,20 -230,25 +342,33 @@@
+  		}
+  	}
+  
+ -	spin_unlock(&irq_entry->list_lock);
+ +	spin_unlock_irqrestore(&irq_entry->list_lock, flags);
+  
+  	list_for_each_entry(desc, &flist, list) {
+++<<<<<<< HEAD
+ +		if ((desc->completion->status & DSA_COMP_STATUS_MASK) != DSA_COMP_SUCCESS)
+ +			match_fault(desc, data);
+ +		complete_desc(desc, reason);
+++=======
++ 		/*
++ 		 * Check against the original status as ABORT is software defined
++ 		 * and 0xff, which DSA_COMP_STATUS_MASK can mask out.
++ 		 */
++ 		if (unlikely(desc->completion->status == IDXD_COMP_DESC_ABORT)) {
++ 			idxd_dma_complete_txd(desc, IDXD_COMPLETE_ABORT, true);
++ 			continue;
++ 		}
++ 
++ 		idxd_dma_complete_txd(desc, IDXD_COMPLETE_NORMAL, true);
+++>>>>>>> 5d78abb6fbc9 (dmaengine: idxd: rework descriptor free path on failure)
+  	}
+ +
+ +	return queued;
+  }
+  
+ -irqreturn_t idxd_wq_thread(int irq, void *data)
+ +static int idxd_desc_process(struct idxd_irq_entry *irq_entry)
+  {
+ -	struct idxd_irq_entry *irq_entry = data;
+ +	int rc, processed, total = 0;
+  
+  	/*
+  	 * There are two lists we are processing. The pending_llist is where
+diff --cc drivers/dma/idxd/submit.c
+index 0afcd1322339,ea11809dbb32..000000000000
+--- a/drivers/dma/idxd/submit.c
++++ b/drivers/dma/idxd/submit.c
+@@@ -88,6 -79,59 +88,62 @@@ void idxd_free_desc(struct idxd_wq *wq
+  	sbitmap_queue_clear(&wq->sbq, desc->id, cpu);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static struct idxd_desc *list_abort_desc(struct idxd_wq *wq, struct idxd_irq_entry *ie,
++ 					 struct idxd_desc *desc)
++ {
++ 	struct idxd_desc *d, *n;
++ 
++ 	lockdep_assert_held(&ie->list_lock);
++ 	list_for_each_entry_safe(d, n, &ie->work_list, list) {
++ 		if (d == desc) {
++ 			list_del(&d->list);
++ 			return d;
++ 		}
++ 	}
++ 
++ 	/*
++ 	 * At this point, the desc needs to be aborted is held by the completion
++ 	 * handler where it has taken it off the pending list but has not added to the
++ 	 * work list. It will be cleaned up by the interrupt handler when it sees the
++ 	 * IDXD_COMP_DESC_ABORT for completion status.
++ 	 */
++ 	return NULL;
++ }
++ 
++ static void llist_abort_desc(struct idxd_wq *wq, struct idxd_irq_entry *ie,
++ 			     struct idxd_desc *desc)
++ {
++ 	struct idxd_desc *d, *t, *found = NULL;
++ 	struct llist_node *head;
++ 
++ 	desc->completion->status = IDXD_COMP_DESC_ABORT;
++ 	/*
++ 	 * Grab the list lock so it will block the irq thread handler. This allows the
++ 	 * abort code to locate the descriptor need to be aborted.
++ 	 */
++ 	spin_lock(&ie->list_lock);
++ 	head = llist_del_all(&ie->pending_llist);
++ 	if (head) {
++ 		llist_for_each_entry_safe(d, t, head, llnode) {
++ 			if (d == desc) {
++ 				found = desc;
++ 				continue;
++ 			}
++ 			list_add_tail(&desc->list, &ie->work_list);
++ 		}
++ 	}
++ 
++ 	if (!found)
++ 		found = list_abort_desc(wq, ie, desc);
++ 	spin_unlock(&ie->list_lock);
++ 
++ 	if (found)
++ 		idxd_dma_complete_txd(found, IDXD_COMPLETE_ABORT, false);
++ }
++ 
+++>>>>>>> 5d78abb6fbc9 (dmaengine: idxd: rework descriptor free path on failure)
+  int idxd_submit_desc(struct idxd_wq *wq, struct idxd_desc *desc)
+  {
+  	struct idxd_device *idxd = wq->idxd;
+@@@ -120,6 -175,9 +176,12 @@@
+  		rc = enqcmds(portal, desc->hw);
+  		if (rc < 0) {
+  			percpu_ref_put(&wq->wq_active);
+++<<<<<<< HEAD
+++=======
++ 			/* abort operation frees the descriptor */
++ 			if (ie)
++ 				llist_abort_desc(wq, ie, desc);
+++>>>>>>> 5d78abb6fbc9 (dmaengine: idxd: rework descriptor free path on failure)
+  			return rc;
+  		}
+  	}
+diff --git a/drivers/dma/idxd/dma.c b/drivers/dma/idxd/dma.c
+index 77439b645044..f03789b36a90 100644
+--- a/drivers/dma/idxd/dma.c
++++ b/drivers/dma/idxd/dma.c
+@@ -21,7 +21,8 @@ static inline struct idxd_wq *to_idxd_wq(struct dma_chan *c)
+ }
+ 
+ void idxd_dma_complete_txd(struct idxd_desc *desc,
+-			   enum idxd_complete_type comp_type)
++			   enum idxd_complete_type comp_type,
++			   bool free_desc)
+ {
+ 	struct dma_async_tx_descriptor *tx;
+ 	struct dmaengine_result res;
+@@ -44,6 +45,9 @@ void idxd_dma_complete_txd(struct idxd_desc *desc,
+ 		tx->callback = NULL;
+ 		tx->callback_result = NULL;
+ 	}
++
++	if (free_desc)
++		idxd_free_desc(desc->wq, desc);
+ }
+ 
+ static void op_flag_setup(unsigned long flags, u32 *desc_flags)
+diff --git a/drivers/dma/idxd/idxd.h b/drivers/dma/idxd/idxd.h
+index 03dc70e1f4d4..af3d6571b5c1 100644
+--- a/drivers/dma/idxd/idxd.h
++++ b/drivers/dma/idxd/idxd.h
+@@ -481,7 +481,7 @@ int idxd_register_dma_channel(struct idxd_wq *wq);
+ void idxd_unregister_dma_channel(struct idxd_wq *wq);
+ void idxd_parse_completion_status(u8 status, enum dmaengine_tx_result *res);
+ void idxd_dma_complete_txd(struct idxd_desc *desc,
+-			   enum idxd_complete_type comp_type);
++			   enum idxd_complete_type comp_type, bool free_desc);
+ 
+ /* cdev */
+ int idxd_cdev_register(void);
+diff --git a/drivers/dma/idxd/init.c b/drivers/dma/idxd/init.c
+index b9299e45c20d..b031565c0413 100644
+--- a/drivers/dma/idxd/init.c
++++ b/drivers/dma/idxd/init.c
+@@ -696,10 +696,8 @@ static void idxd_flush_pending_llist(struct idxd_irq_entry *ie)
+ 	if (!head)
+ 		return;
+ 
+-	llist_for_each_entry_safe(desc, itr, head, llnode) {
+-		idxd_dma_complete_txd(desc, IDXD_COMPLETE_ABORT);
+-		idxd_free_desc(desc->wq, desc);
+-	}
++	llist_for_each_entry_safe(desc, itr, head, llnode)
++		idxd_dma_complete_txd(desc, IDXD_COMPLETE_ABORT, true);
+ }
+ 
+ static void idxd_flush_work_list(struct idxd_irq_entry *ie)
+@@ -708,8 +706,7 @@ static void idxd_flush_work_list(struct idxd_irq_entry *ie)
+ 
+ 	list_for_each_entry_safe(desc, iter, &ie->work_list, list) {
+ 		list_del(&desc->list);
+-		idxd_dma_complete_txd(desc, IDXD_COMPLETE_ABORT);
+-		idxd_free_desc(desc->wq, desc);
++		idxd_dma_complete_txd(desc, IDXD_COMPLETE_ABORT, true);
+ 	}
+ }
+ 
+* Unmerged path drivers/dma/idxd/irq.c
+* Unmerged path drivers/dma/idxd/submit.c
