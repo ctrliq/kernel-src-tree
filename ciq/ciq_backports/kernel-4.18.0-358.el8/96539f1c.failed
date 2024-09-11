@@ -1,0 +1,351 @@
+selftests: xsk: Remove mutex and condition variable
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-358.el8
+commit-author Björn Töpel <bjorn.topel@intel.com>
+commit 96539f1c5efb0022b94412e8623722aad23dee6b
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-358.el8/96539f1c.failed
+
+The usage of the condition variable is broken, and overkill. Replace it
+with a pthread barrier.
+
+	Signed-off-by: Björn Töpel <bjorn.topel@intel.com>
+	Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+Link: https://lore.kernel.org/bpf/20210329224316.17793-17-maciej.fijalkowski@intel.com
+(cherry picked from commit 96539f1c5efb0022b94412e8623722aad23dee6b)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	tools/testing/selftests/bpf/xdpxceiver.c
+#	tools/testing/selftests/bpf/xdpxceiver.h
+diff --cc tools/testing/selftests/bpf/xdpxceiver.c
+index 9f8d5dabf30a,6d87bdf3574a..000000000000
+--- a/tools/testing/selftests/bpf/xdpxceiver.c
++++ b/tools/testing/selftests/bpf/xdpxceiver.c
+@@@ -106,26 -119,13 +106,29 @@@ static void __exit_with_error(int error
+  #define exit_with_error(error) __exit_with_error(error, __FILE__, __func__, __LINE__)
+  
+  #define print_ksft_result(void)\
+ -	(ksft_test_result_pass("PASS: %s %s %s%s%s%s\n", configured_mode ? "DRV" : "SKB",\
+ -			       test_type == TEST_TYPE_POLL ? "POLL" : "NOPOLL",\
+ -			       test_type == TEST_TYPE_TEARDOWN ? "Socket Teardown" : "",\
+ -			       test_type == TEST_TYPE_BIDI ? "Bi-directional Sockets" : "",\
+ -			       test_type == TEST_TYPE_STATS ? "Stats" : "",\
+ -			       test_type == TEST_TYPE_BPF_RES ? "BPF RES" : ""))
+ +	(ksft_test_result_pass("PASS: %s %s %s%s\n", uut ? "DRV" : "SKB", opt_poll ? "POLL" :\
+ +			       "NOPOLL", opt_teardown ? "Socket Teardown" : "",\
+ +			       opt_bidi ? "Bi-directional Sockets" : ""))
+ +
+++<<<<<<< HEAD
+ +static void pthread_init_mutex(void)
+ +{
+ +	pthread_mutex_init(&sync_mutex, NULL);
+ +	pthread_mutex_init(&sync_mutex_tx, NULL);
+ +	pthread_cond_init(&signal_rx_condition, NULL);
+ +	pthread_cond_init(&signal_tx_condition, NULL);
+ +}
+ +
+ +static void pthread_destroy_mutex(void)
+ +{
+ +	pthread_mutex_destroy(&sync_mutex);
+ +	pthread_mutex_destroy(&sync_mutex_tx);
+ +	pthread_cond_destroy(&signal_rx_condition);
+ +	pthread_cond_destroy(&signal_tx_condition);
+ +}
+  
+++=======
+++>>>>>>> 96539f1c5efb (selftests: xsk: Remove mutex and condition variable)
+  static void *memset32_htonl(void *dest, u32 val, u32 size)
+  {
+  	u32 *ptr = (u32 *)dest;
+@@@ -797,144 -818,92 +800,149 @@@ static void *worker_testapp_validate(vo
+  	struct generic_data data;
+  	void *bufs = NULL;
+  
+ -	if (!second_step)
+ -		thread_common_ops(ifobject, bufs);
+ -
+ -	for (int i = 0; i < num_frames; i++) {
+ -		/*send EOT frame */
+ -		if (i == (num_frames - 1))
+ -			data.seqnum = -1;
+ -		else
+ -			data.seqnum = i;
+ -		gen_udp_hdr(&data, ifobject, udp_hdr);
+ -		gen_ip_hdr(ifobject, ip_hdr);
+ -		gen_udp_csum(udp_hdr, ip_hdr);
+ -		gen_eth_hdr(ifobject, eth_hdr);
+ -		gen_eth_frame(ifobject->umem, i * XSK_UMEM__DEFAULT_FRAME_SIZE);
+ +	pthread_attr_setstacksize(&attr, THREAD_STACK);
+ +
+ +	if (!bidi_pass) {
+ +		bufs = mmap(NULL, num_frames * XSK_UMEM__DEFAULT_FRAME_SIZE,
+ +			    PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+ +		if (bufs == MAP_FAILED)
+ +			exit_with_error(errno);
+ +
+ +		if (strcmp(ifobject->nsname, ""))
+ +			switch_namespace(ifobject->ifdict_index);
+  	}
+  
+ -	print_verbose("Sending %d packets on interface %s\n",
+ -		      (opt_pkt_count - 1), ifobject->ifname);
+ -	tx_only_all(ifobject);
+ +	if (ifobject->fv.vector == tx) {
+ +		int spinningrxctr = 0;
+  
+ -	testapp_cleanup_xsk_res(ifobject);
+ -	pthread_exit(NULL);
+ -}
+ +		if (!bidi_pass)
+ +			thread_common_ops(ifobject, bufs, &sync_mutex_tx, &spinning_tx);
+  
+ -static void *worker_testapp_validate_rx(void *arg)
+ -{
+ -	struct ifobject *ifobject = (struct ifobject *)arg;
+ -	struct pollfd fds[MAX_SOCKS] = { };
+ -	void *bufs = NULL;
+ +		while (atomic_load(&spinning_rx) && spinningrxctr < SOCK_RECONF_CTR) {
+ +			spinningrxctr++;
+ +			usleep(USLEEP_MAX);
+ +		}
+ +
+ +		print_verbose("Interface [%s] vector [Tx]\n", ifobject->ifname);
+ +		for (int i = 0; i < num_frames; i++) {
+ +			/*send EOT frame */
+ +			if (i == (num_frames - 1))
+ +				data.seqnum = -1;
+ +			else
+ +				data.seqnum = i;
+ +			gen_udp_hdr(&data, ifobject, udp_hdr);
+ +			gen_ip_hdr(ifobject, ip_hdr);
+ +			gen_udp_csum(udp_hdr, ip_hdr);
+ +			gen_eth_hdr(ifobject, eth_hdr);
+ +			gen_eth_frame(ifobject->umem, i * XSK_UMEM__DEFAULT_FRAME_SIZE);
+ +		}
+  
+ -	if (!second_step)
+ -		thread_common_ops(ifobject, bufs);
+ +		print_verbose("Sending %d packets on interface %s\n",
+ +			       (opt_pkt_count - 1), ifobject->ifname);
+ +		tx_only_all(ifobject);
+ +	} else if (ifobject->fv.vector == rx) {
+ +		struct pollfd fds[MAX_SOCKS] = { };
+ +		int ret;
+  
+ -	if (stat_test_type != STAT_TEST_RX_FILL_EMPTY)
+ +		if (!bidi_pass)
+ +			thread_common_ops(ifobject, bufs, &sync_mutex_tx, &spinning_rx);
+ +
+ +		print_verbose("Interface [%s] vector [Rx]\n", ifobject->ifname);
+  		xsk_populate_fill_ring(ifobject->umem);
+  
+ -	TAILQ_INIT(&head);
+ -	if (debug_pkt_dump) {
+ -		pkt_buf = calloc(num_frames, sizeof(*pkt_buf));
+ -		if (!pkt_buf)
+ -			exit_with_error(errno);
+ -	}
+ +		TAILQ_INIT(&head);
+ +		if (debug_pkt_dump) {
+ +			pkt_buf = calloc(num_frames, sizeof(*pkt_buf));
+ +			if (!pkt_buf)
+ +				exit_with_error(errno);
+ +		}
+  
+ -	fds[0].fd = xsk_socket__fd(ifobject->xsk->xsk);
+ -	fds[0].events = POLLIN;
+ +		fds[0].fd = xsk_socket__fd(ifobject->xsk->xsk);
+ +		fds[0].events = POLLIN;
+  
+++<<<<<<< HEAD
+ +		pthread_mutex_lock(&sync_mutex);
+ +		pthread_cond_signal(&signal_rx_condition);
+ +		pthread_mutex_unlock(&sync_mutex);
+++=======
++ 	pthread_barrier_wait(&barr);
+++>>>>>>> 96539f1c5efb (selftests: xsk: Remove mutex and condition variable)
+  
+ -	while (1) {
+ -		if (test_type != TEST_TYPE_STATS) {
+ +		while (1) {
+ +			if (opt_poll) {
+ +				ret = poll(fds, 1, POLL_TMOUT);
+ +				if (ret <= 0)
+ +					continue;
+ +			}
+  			rx_pkt(ifobject->xsk, fds);
+  			worker_pkt_validate();
+ -		} else {
+ -			worker_stats_validate(ifobject);
+ +
+ +			if (sigvar)
+ +				break;
+  		}
+ -		if (sigvar)
+ -			break;
+ -	}
+  
+ -	print_verbose("Received %d packets on interface %s\n",
+ -		      pkt_counter, ifobject->ifname);
+ +		print_verbose("Received %d packets on interface %s\n",
+ +			       pkt_counter, ifobject->ifname);
+  
+ -	if (test_type == TEST_TYPE_TEARDOWN)
+ -		print_verbose("Destroying socket\n");
+ +		if (opt_teardown)
+ +			print_verbose("Destroying socket\n");
+ +	}
+  
+ -	testapp_cleanup_xsk_res(ifobject);
+ +	if (!opt_bidi || bidi_pass) {
+ +		xsk_socket__delete(ifobject->xsk->xsk);
+ +		(void)xsk_umem__delete(ifobject->umem->umem);
+ +	}
+  	pthread_exit(NULL);
+  }
+  
+  static void testapp_validate(void)
+  {
+++<<<<<<< HEAD
+ +	struct timespec max_wait = { 0, 0 };
+ +
+ +	pthread_attr_init(&attr);
+ +	pthread_attr_setstacksize(&attr, THREAD_STACK);
+ +
+ +	if (opt_bidi && bidi_pass) {
+ +		pthread_init_mutex();
+ +		if (!switching_notify) {
+ +			print_verbose("Switching Tx/Rx vectors\n");
+ +			switching_notify++;
+ +		}
+ +	}
+++=======
++ 	bool bidi = test_type == TEST_TYPE_BIDI;
++ 	bool bpf = test_type == TEST_TYPE_BPF_RES;
+++>>>>>>> 96539f1c5efb (selftests: xsk: Remove mutex and condition variable)
+  
+- 	pthread_mutex_lock(&sync_mutex);
++ 	if (pthread_barrier_init(&barr, NULL, 2))
++ 		exit_with_error(errno);
+  
+  	/*Spawn RX thread */
+ -	pthread_create(&t0, NULL, ifdict_rx->func_ptr, ifdict_rx);
+ +	if (!opt_bidi || !bidi_pass) {
+ +		if (pthread_create(&t0, &attr, worker_testapp_validate, ifdict[1]))
+ +			exit_with_error(errno);
+ +	} else if (opt_bidi && bidi_pass) {
+ +		/*switch Tx/Rx vectors */
+ +		ifdict[0]->fv.vector = rx;
+ +		if (pthread_create(&t0, &attr, worker_testapp_validate, ifdict[0]))
+ +			exit_with_error(errno);
+ +	}
+  
+- 	if (clock_gettime(CLOCK_REALTIME, &max_wait))
+- 		exit_with_error(errno);
+- 	max_wait.tv_sec += TMOUT_SEC;
+- 
+- 	if (pthread_cond_timedwait(&signal_rx_condition, &sync_mutex, &max_wait) == ETIMEDOUT)
++ 	pthread_barrier_wait(&barr);
++ 	if (pthread_barrier_destroy(&barr))
+  		exit_with_error(errno);
+  
+- 	pthread_mutex_unlock(&sync_mutex);
+- 
+  	/*Spawn TX thread */
+ -	pthread_create(&t1, NULL, ifdict_tx->func_ptr, ifdict_tx);
+ +	if (!opt_bidi || !bidi_pass) {
+ +		if (pthread_create(&t1, &attr, worker_testapp_validate, ifdict[0]))
+ +			exit_with_error(errno);
+ +	} else if (opt_bidi && bidi_pass) {
+ +		/*switch Tx/Rx vectors */
+ +		ifdict[1]->fv.vector = tx;
+ +		if (pthread_create(&t1, &attr, worker_testapp_validate, ifdict[1]))
+ +			exit_with_error(errno);
+ +	}
+  
+  	pthread_join(t1, NULL);
+  	pthread_join(t0, NULL);
+@@@ -1023,25 -1136,27 +1031,39 @@@ int main(int argc, char **argv
+  
+  	num_frames = ++opt_pkt_count;
+  
+ -	init_iface(ifdict[0], MAC1, MAC2, IP1, IP2, UDP_PORT1, UDP_PORT2, tx);
+ -	init_iface(ifdict[1], MAC2, MAC1, IP2, IP1, UDP_PORT2, UDP_PORT1, rx);
+ +	init_iface_config(ifaceconfig);
+  
+ -	ksft_set_plan(TEST_MODE_MAX * TEST_TYPE_MAX);
+ +	pthread_init_mutex();
+  
+++<<<<<<< HEAD
+ +	ksft_set_plan(1);
+ +
+ +	if (!opt_teardown && !opt_bidi) {
+ +		testapp_validate();
+ +	} else if (opt_teardown && opt_bidi) {
+ +		ksft_test_result_fail("ERROR: parameters -T and -B cannot be used together\n");
+ +		ksft_exit_xfail();
+ +	} else {
+ +		testapp_sockets();
+ +	}
+ +
+ +	for (int i = 0; i < MAX_INTERFACES; i++)
+++=======
++ 	for (i = 0; i < TEST_MODE_MAX; i++) {
++ 		for (j = 0; j < TEST_TYPE_MAX; j++)
++ 			run_pkt_test(i, j);
++ 	}
++ 
++ cleanup:
++ 	for (int i = 0; i < MAX_INTERFACES; i++) {
++ 		if (ifdict[i]->ns_fd != -1)
++ 			close(ifdict[i]->ns_fd);
++ 		free(ifdict[i]->xsk_arr);
++ 		free(ifdict[i]->umem_arr);
+++>>>>>>> 96539f1c5efb (selftests: xsk: Remove mutex and condition variable)
+  		free(ifdict[i]);
+ -	}
+  
+ -	if (failure)
+ -		exit_with_error(errno);
+ +	pthread_destroy_mutex();
+  
+  	ksft_exit_pass();
+  
+diff --cc tools/testing/selftests/bpf/xdpxceiver.h
+index f66f399dfb2d,ef219c0785eb..000000000000
+--- a/tools/testing/selftests/bpf/xdpxceiver.h
++++ b/tools/testing/selftests/bpf/xdpxceiver.h
+@@@ -128,21 -142,14 +128,26 @@@ struct ifobject 
+  };
+  
+  static struct ifobject *ifdict[MAX_INTERFACES];
+ -static struct ifobject *ifdict_rx;
+ -static struct ifobject *ifdict_tx;
+  
+  /*threads*/
+++<<<<<<< HEAD
+ +atomic_int spinning_tx;
+ +atomic_int spinning_rx;
+ +pthread_mutex_t sync_mutex;
+ +pthread_mutex_t sync_mutex_tx;
+ +pthread_cond_t signal_rx_condition;
+ +pthread_cond_t signal_tx_condition;
+ +pthread_t t0, t1, ns_thread;
+ +pthread_attr_t attr;
+ +
+ +struct targs {
+ +	bool retptr;
+ +	int idx;
+ +};
+++=======
++ pthread_barrier_t barr;
++ pthread_t t0, t1;
+++>>>>>>> 96539f1c5efb (selftests: xsk: Remove mutex and condition variable)
+  
+  TAILQ_HEAD(head_s, pkt) head = TAILQ_HEAD_INITIALIZER(head);
+  struct head_s *head_p;
+* Unmerged path tools/testing/selftests/bpf/xdpxceiver.c
+* Unmerged path tools/testing/selftests/bpf/xdpxceiver.h
