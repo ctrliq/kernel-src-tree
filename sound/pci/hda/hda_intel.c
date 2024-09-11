@@ -1028,6 +1028,7 @@ static int azx_prepare(struct device *dev)
 
 	chip = card->private_data;
 	chip->pm_prepared = 1;
+	snd_power_change_state(card, SNDRV_CTL_POWER_D3hot);
 
 	/* HDA controller always requires different WAKEEN for runtime suspend
 	 * and system suspend, so don't use direct-complete here.
@@ -1044,6 +1045,7 @@ static void azx_complete(struct device *dev)
 		return;
 
 	chip = card->private_data;
+	snd_power_change_state(card, SNDRV_CTL_POWER_D0);
 	chip->pm_prepared = 0;
 }
 
