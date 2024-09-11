@@ -1,0 +1,333 @@
+KVM: x86/mmu: Avoid memslot lookup in make_spte and mmu_try_to_unsync_pages
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-408.el8
+commit-author David Matlack <dmatlack@google.com>
+commit 53597858dbf8daab8db99c7e448558fb0f970dbd
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-408.el8/53597858.failed
+
+mmu_try_to_unsync_pages checks if page tracking is active for the given
+gfn, which requires knowing the memslot. We can pass down the memslot
+via make_spte to avoid this lookup.
+
+The memslot is also handy for make_spte's marking of the gfn as dirty:
+we can test whether dirty page tracking is enabled, and if so ensure that
+pages are mapped as writable with 4K granularity.  Apart from the warning,
+no functional change is intended.
+
+	Signed-off-by: David Matlack <dmatlack@google.com>
+Message-Id: <20210813203504.2742757-7-dmatlack@google.com>
+	Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+(cherry picked from commit 53597858dbf8daab8db99c7e448558fb0f970dbd)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kvm/mmu/mmu.c
+#	arch/x86/kvm/mmu/mmu_internal.h
+#	arch/x86/kvm/mmu/paging_tmpl.h
+#	arch/x86/kvm/mmu/spte.c
+#	arch/x86/kvm/mmu/spte.h
+#	arch/x86/kvm/mmu/tdp_mmu.c
+diff --cc arch/x86/kvm/mmu/mmu.c
+index 8ec545b124be,91292009780a..000000000000
+--- a/arch/x86/kvm/mmu/mmu.c
++++ b/arch/x86/kvm/mmu/mmu.c
+@@@ -2581,9 -2572,11 +2581,14 @@@ static void kvm_unsync_page(struct kvm_
+   * were marked unsync (or if there is no shadow page), -EPERM if the SPTE must
+   * be write-protected.
+   */
+++<<<<<<< HEAD
+ +int mmu_try_to_unsync_pages(struct kvm_vcpu *vcpu, gfn_t gfn, bool can_unsync)
+++=======
++ int mmu_try_to_unsync_pages(struct kvm_vcpu *vcpu, struct kvm_memory_slot *slot,
++ 			    gfn_t gfn, bool can_unsync, bool speculative)
+++>>>>>>> 53597858dbf8 (KVM: x86/mmu: Avoid memslot lookup in make_spte and mmu_try_to_unsync_pages)
+  {
+  	struct kvm_mmu_page *sp;
+ -	bool locked = false;
+  
+  	/*
+  	 * Force write-protection if the page is being tracked.  Note, the page
+@@@ -2716,9 -2719,17 +2721,23 @@@ static int mmu_set_spte(struct kvm_vcp
+  			was_rmapped = 1;
+  	}
+  
+++<<<<<<< HEAD
+ +	set_spte_ret = set_spte(vcpu, sptep, pte_access, level, gfn, pfn,
+ +				speculative, true, host_writable);
+ +	if (set_spte_ret & SET_SPTE_WRITE_PROTECTED_PT) {
+++=======
++ 	wrprot = make_spte(vcpu, sp, slot, pte_access, gfn, pfn, *sptep, speculative,
++ 			   true, host_writable, &spte);
++ 
++ 	if (*sptep == spte) {
++ 		ret = RET_PF_SPURIOUS;
++ 	} else {
++ 		trace_kvm_mmu_set_spte(level, gfn, sptep);
++ 		flush |= mmu_spte_update(sptep, spte);
++ 	}
++ 
++ 	if (wrprot) {
+++>>>>>>> 53597858dbf8 (KVM: x86/mmu: Avoid memslot lookup in make_spte and mmu_try_to_unsync_pages)
+  		if (write_fault)
+  			ret = RET_PF_EMULATE;
+  	}
+diff --cc arch/x86/kvm/mmu/mmu_internal.h
+index 5ac367b7f49f,585146a712d2..000000000000
+--- a/arch/x86/kvm/mmu/mmu_internal.h
++++ b/arch/x86/kvm/mmu/mmu_internal.h
+@@@ -119,16 -118,11 +119,21 @@@ static inline bool kvm_vcpu_ad_need_wri
+  	       kvm_x86_ops.cpu_dirty_log_size;
+  }
+  
+++<<<<<<< HEAD
+ +extern int nx_huge_pages;
+ +static inline bool is_nx_huge_page_enabled(void)
+ +{
+ +	return READ_ONCE(nx_huge_pages);
+ +}
+++=======
++ int mmu_try_to_unsync_pages(struct kvm_vcpu *vcpu, struct kvm_memory_slot *slot,
++ 			    gfn_t gfn, bool can_unsync, bool speculative);
+++>>>>>>> 53597858dbf8 (KVM: x86/mmu: Avoid memslot lookup in make_spte and mmu_try_to_unsync_pages)
+  
+ -void kvm_mmu_gfn_disallow_lpage(const struct kvm_memory_slot *slot, gfn_t gfn);
+ -void kvm_mmu_gfn_allow_lpage(const struct kvm_memory_slot *slot, gfn_t gfn);
+ +int mmu_try_to_unsync_pages(struct kvm_vcpu *vcpu, gfn_t gfn, bool can_unsync);
+ +
+ +void kvm_mmu_gfn_disallow_lpage(struct kvm_memory_slot *slot, gfn_t gfn);
+ +void kvm_mmu_gfn_allow_lpage(struct kvm_memory_slot *slot, gfn_t gfn);
+  bool kvm_mmu_slot_gfn_write_protect(struct kvm *kvm,
+  				    struct kvm_memory_slot *slot, u64 gfn,
+  				    int min_level);
+diff --cc arch/x86/kvm/mmu/paging_tmpl.h
+index de3ee26beb48,d8889e02c4b7..000000000000
+--- a/arch/x86/kvm/mmu/paging_tmpl.h
++++ b/arch/x86/kvm/mmu/paging_tmpl.h
+@@@ -1100,6 -1090,8 +1100,11 @@@ static int FNAME(sync_page)(struct kvm_
+  	first_pte_gpa = FNAME(get_level1_sp_gpa)(sp);
+  
+  	for (i = 0; i < PT64_ENT_PER_PAGE; i++) {
+++<<<<<<< HEAD
+++=======
++ 		u64 *sptep, spte;
++ 		struct kvm_memory_slot *slot;
+++>>>>>>> 53597858dbf8 (KVM: x86/mmu: Avoid memslot lookup in make_spte and mmu_try_to_unsync_pages)
+  		unsigned pte_access;
+  		pt_element_t gpte;
+  		gpa_t pte_gpa;
+@@@ -1133,15 -1125,18 +1138,25 @@@
+  			continue;
+  		}
+  
+++<<<<<<< HEAD
+ +		host_writable = sp->spt[i] & shadow_host_writable_mask;
+++=======
++ 		sptep = &sp->spt[i];
++ 		spte = *sptep;
++ 		host_writable = spte & shadow_host_writable_mask;
++ 		slot = kvm_vcpu_gfn_to_memslot(vcpu, gfn);
++ 		make_spte(vcpu, sp, slot, pte_access, gfn,
++ 			  spte_to_pfn(spte), spte, true, false,
++ 			  host_writable, &spte);
+++>>>>>>> 53597858dbf8 (KVM: x86/mmu: Avoid memslot lookup in make_spte and mmu_try_to_unsync_pages)
+  
+ -		flush |= mmu_spte_update(sptep, spte);
+ +		set_spte_ret |= set_spte(vcpu, &sp->spt[i],
+ +					 pte_access, PG_LEVEL_4K,
+ +					 gfn, spte_to_pfn(sp->spt[i]),
+ +					 true, false, host_writable);
+  	}
+  
+ -	return flush;
+ +	return set_spte_ret & SET_SPTE_NEED_REMOTE_TLB_FLUSH;
+  }
+  
+  #undef pt_element_t
+diff --cc arch/x86/kvm/mmu/spte.c
+index 86a21eb85d25,871f6114b0fa..000000000000
+--- a/arch/x86/kvm/mmu/spte.c
++++ b/arch/x86/kvm/mmu/spte.c
+@@@ -89,15 -89,17 +89,23 @@@ static bool kvm_is_mmio_pfn(kvm_pfn_t p
+  				     E820_TYPE_RAM);
+  }
+  
+++<<<<<<< HEAD
+ +int make_spte(struct kvm_vcpu *vcpu, unsigned int pte_access, int level,
+ +		     gfn_t gfn, kvm_pfn_t pfn, u64 old_spte, bool speculative,
+ +		     bool can_unsync, bool host_writable, bool ad_disabled,
+ +		     u64 *new_spte)
+++=======
++ bool make_spte(struct kvm_vcpu *vcpu, struct kvm_mmu_page *sp,
++ 	       struct kvm_memory_slot *slot,
++ 	       unsigned int pte_access, gfn_t gfn, kvm_pfn_t pfn,
++ 	       u64 old_spte, bool speculative, bool can_unsync,
++ 	       bool host_writable, u64 *new_spte)
+++>>>>>>> 53597858dbf8 (KVM: x86/mmu: Avoid memslot lookup in make_spte and mmu_try_to_unsync_pages)
+  {
+ -	int level = sp->role.level;
+  	u64 spte = SPTE_MMU_PRESENT_MASK;
+ -	bool wrprot = false;
+ +	int ret = 0;
+  
+ -	if (sp->role.ad_disabled)
+ +	if (ad_disabled)
+  		spte |= SPTE_TDP_AD_DISABLED_MASK;
+  	else if (kvm_vcpu_ad_need_write_protect(vcpu))
+  		spte |= SPTE_TDP_AD_WRPROT_ONLY_MASK;
+@@@ -159,10 -161,10 +167,14 @@@
+  		 * e.g. it's write-tracked (upper-level SPs) or has one or more
+  		 * shadow pages and unsync'ing pages is not allowed.
+  		 */
+++<<<<<<< HEAD
+ +		if (mmu_try_to_unsync_pages(vcpu, gfn, can_unsync)) {
+++=======
++ 		if (mmu_try_to_unsync_pages(vcpu, slot, gfn, can_unsync, speculative)) {
+++>>>>>>> 53597858dbf8 (KVM: x86/mmu: Avoid memslot lookup in make_spte and mmu_try_to_unsync_pages)
+  			pgprintk("%s: found shadow page for %llx, marking ro\n",
+  				 __func__, gfn);
+ -			wrprot = true;
+ +			ret |= SET_SPTE_WRITE_PROTECTED_PT;
+  			pte_access &= ~ACC_WRITE_MASK;
+  			spte &= ~(PT_WRITABLE_MASK | shadow_mmu_writable_mask);
+  		}
+@@@ -179,8 -181,14 +191,17 @@@ out
+  		  "spte = 0x%llx, level = %d, rsvd bits = 0x%llx", spte, level,
+  		  get_rsvd_bits(&vcpu->arch.mmu->shadow_zero_check, spte, level));
+  
+++<<<<<<< HEAD
+++=======
++ 	if ((spte & PT_WRITABLE_MASK) && kvm_slot_dirty_track_enabled(slot)) {
++ 		/* Enforced by kvm_mmu_hugepage_adjust. */
++ 		WARN_ON(level > PG_LEVEL_4K);
++ 		mark_page_dirty_in_slot(vcpu->kvm, slot, gfn);
++ 	}
++ 
+++>>>>>>> 53597858dbf8 (KVM: x86/mmu: Avoid memslot lookup in make_spte and mmu_try_to_unsync_pages)
+  	*new_spte = spte;
+ -	return wrprot;
+ +	return ret;
+  }
+  
+  u64 make_nonleaf_spte(u64 *child_pt, bool ad_disabled)
+diff --cc arch/x86/kvm/mmu/spte.h
+index eb7b227fc6cf,7c0b09461349..000000000000
+--- a/arch/x86/kvm/mmu/spte.h
++++ b/arch/x86/kvm/mmu/spte.h
+@@@ -334,15 -334,11 +334,23 @@@ static inline u64 get_mmio_spte_generat
+  	return gen;
+  }
+  
+++<<<<<<< HEAD
+ +/* Bits which may be returned by set_spte() */
+ +#define SET_SPTE_WRITE_PROTECTED_PT    BIT(0)
+ +#define SET_SPTE_NEED_REMOTE_TLB_FLUSH BIT(1)
+ +#define SET_SPTE_SPURIOUS              BIT(2)
+ +
+ +int make_spte(struct kvm_vcpu *vcpu, unsigned int pte_access, int level,
+ +		     gfn_t gfn, kvm_pfn_t pfn, u64 old_spte, bool speculative,
+ +		     bool can_unsync, bool host_writable, bool ad_disabled,
+ +		     u64 *new_spte);
+++=======
++ bool make_spte(struct kvm_vcpu *vcpu, struct kvm_mmu_page *sp,
++ 	       struct kvm_memory_slot *slot,
++ 	       unsigned int pte_access, gfn_t gfn, kvm_pfn_t pfn,
++ 	       u64 old_spte, bool speculative, bool can_unsync,
++ 	       bool host_writable, u64 *new_spte);
+++>>>>>>> 53597858dbf8 (KVM: x86/mmu: Avoid memslot lookup in make_spte and mmu_try_to_unsync_pages)
+  u64 make_nonleaf_spte(u64 *child_pt, bool ad_disabled);
+  u64 make_mmio_spte(struct kvm_vcpu *vcpu, u64 gfn, unsigned int access);
+  u64 mark_spte_for_access_track(u64 spte);
+diff --cc arch/x86/kvm/mmu/tdp_mmu.c
+index 8e1489964d2a,953f24ded6bc..000000000000
+--- a/arch/x86/kvm/mmu/tdp_mmu.c
++++ b/arch/x86/kvm/mmu/tdp_mmu.c
+@@@ -863,22 -893,22 +863,28 @@@ void kvm_tdp_mmu_invalidate_all_roots(s
+   * Installs a last-level SPTE to handle a TDP page fault.
+   * (NPT/EPT violation/misconfiguration)
+   */
+ -static int tdp_mmu_map_handle_target_level(struct kvm_vcpu *vcpu,
+ -					  struct kvm_page_fault *fault,
+ -					  struct tdp_iter *iter)
+ +static int tdp_mmu_map_handle_target_level(struct kvm_vcpu *vcpu, int write,
+ +					  int map_writable,
+ +					  struct tdp_iter *iter,
+ +					  kvm_pfn_t pfn, bool prefault)
+  {
+ -	struct kvm_mmu_page *sp = sptep_to_sp(iter->sptep);
+  	u64 new_spte;
+  	int ret = RET_PF_FIXED;
+ -	bool wrprot = false;
+ +	int make_spte_ret = 0;
+  
+ -	WARN_ON(sp->role.level != fault->goal_level);
+ -	if (unlikely(!fault->slot))
+ +	if (unlikely(is_noslot_pfn(pfn)))
+  		new_spte = make_mmio_spte(vcpu, iter->gfn, ACC_ALL);
+  	else
+++<<<<<<< HEAD
+ +		make_spte_ret = make_spte(vcpu, ACC_ALL, iter->level, iter->gfn,
+ +					 pfn, iter->old_spte, prefault, true,
+ +					 map_writable, !shadow_accessed_mask,
+ +					 &new_spte);
+++=======
++ 		wrprot = make_spte(vcpu, sp, fault->slot, ACC_ALL, iter->gfn,
++ 					 fault->pfn, iter->old_spte, fault->prefault, true,
++ 					 fault->map_writable, &new_spte);
+++>>>>>>> 53597858dbf8 (KVM: x86/mmu: Avoid memslot lookup in make_spte and mmu_try_to_unsync_pages)
+  
+  	if (new_spte == iter->old_spte)
+  		ret = RET_PF_SPURIOUS;
+diff --git a/arch/x86/include/asm/kvm_page_track.h b/arch/x86/include/asm/kvm_page_track.h
+index 9cd9230e5cc8..5c12f97ce934 100644
+--- a/arch/x86/include/asm/kvm_page_track.h
++++ b/arch/x86/include/asm/kvm_page_track.h
+@@ -59,8 +59,6 @@ void kvm_slot_page_track_add_page(struct kvm *kvm,
+ void kvm_slot_page_track_remove_page(struct kvm *kvm,
+ 				     struct kvm_memory_slot *slot, gfn_t gfn,
+ 				     enum kvm_page_track_mode mode);
+-bool kvm_page_track_is_active(struct kvm_vcpu *vcpu, gfn_t gfn,
+-			      enum kvm_page_track_mode mode);
+ bool kvm_slot_page_track_is_active(struct kvm_memory_slot *slot, gfn_t gfn,
+ 				   enum kvm_page_track_mode mode);
+ 
+* Unmerged path arch/x86/kvm/mmu/mmu.c
+* Unmerged path arch/x86/kvm/mmu/mmu_internal.h
+diff --git a/arch/x86/kvm/mmu/page_track.c b/arch/x86/kvm/mmu/page_track.c
+index 58985087b096..dca78255141e 100644
+--- a/arch/x86/kvm/mmu/page_track.c
++++ b/arch/x86/kvm/mmu/page_track.c
+@@ -135,6 +135,9 @@ void kvm_slot_page_track_remove_page(struct kvm *kvm,
+ }
+ EXPORT_SYMBOL_GPL(kvm_slot_page_track_remove_page);
+ 
++/*
++ * check if the corresponding access on the specified guest page is tracked.
++ */
+ bool kvm_slot_page_track_is_active(struct kvm_memory_slot *slot, gfn_t gfn,
+ 				   enum kvm_page_track_mode mode)
+ {
+@@ -150,17 +153,6 @@ bool kvm_slot_page_track_is_active(struct kvm_memory_slot *slot, gfn_t gfn,
+ 	return !!READ_ONCE(slot->arch.gfn_track[mode][index]);
+ }
+ 
+-/*
+- * check if the corresponding access on the specified guest page is tracked.
+- */
+-bool kvm_page_track_is_active(struct kvm_vcpu *vcpu, gfn_t gfn,
+-			      enum kvm_page_track_mode mode)
+-{
+-	struct kvm_memory_slot *slot = kvm_vcpu_gfn_to_memslot(vcpu, gfn);
+-
+-	return kvm_slot_page_track_is_active(slot, gfn, mode);
+-}
+-
+ void kvm_page_track_cleanup(struct kvm *kvm)
+ {
+ 	struct kvm_page_track_notifier_head *head;
+* Unmerged path arch/x86/kvm/mmu/paging_tmpl.h
+* Unmerged path arch/x86/kvm/mmu/spte.c
+* Unmerged path arch/x86/kvm/mmu/spte.h
+* Unmerged path arch/x86/kvm/mmu/tdp_mmu.c
