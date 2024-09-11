@@ -1,0 +1,199 @@
+NFS: Adjust fs_context error logging
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Scott Mayhew <smayhew@redhat.com>
+commit c98e9daa59a611ff4e163689815f40380c912415
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/c98e9daa.failed
+
+Several existing dprink()/dfprintk() calls were converted to use the new
+mount API logging macros by commit ce8866f0913f ("NFS: Attach
+supplementary error information to fs_context").  If the fs_context was
+not created using fsopen() then it will not have had a log buffer
+allocated for it, and the new mount API logging macros will wind up
+calling printk().
+
+This can result in syslog messages being logged where previously there
+were none... most notably "NFS4: Couldn't follow remote path", which can
+happen if the client is auto-negotiating a protocol version with an NFS
+server that doesn't support the higher v4.x versions.
+
+Convert the nfs_errorf(), nfs_invalf(), and nfs_warnf() macros to check
+for the existence of the fs_context's log buffer and call dprintk() if
+it doesn't exist.  Add nfs_ferrorf(), nfs_finvalf(), and nfs_warnf(),
+which do the same thing but take an NFS debug flag as an argument and
+call dfprintk().  Finally, modify the "NFS4: Couldn't follow remote
+path" message to use nfs_ferrorf().
+
+Bugzilla: https://bugzilla.kernel.org/show_bug.cgi?id=207385
+	Signed-off-by: Scott Mayhew <smayhew@redhat.com>
+	Reviewed-by: Benjamin Coddington <bcodding@redhat.com>
+Fixes: ce8866f0913f ("NFS: Attach supplementary error information to fs_context.")
+	Signed-off-by: Trond Myklebust <trond.myklebust@hammerspace.com>
+(cherry picked from commit c98e9daa59a611ff4e163689815f40380c912415)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/nfs/internal.h
+#	fs/nfs/nfs4super.c
+diff --cc fs/nfs/internal.h
+index 990e67c11349,6bdee7ab3a6c..000000000000
+--- a/fs/nfs/internal.h
++++ b/fs/nfs/internal.h
+@@@ -108,12 -120,51 +108,44 @@@ struct nfs_parsed_mount_data 
+  		int			port;
+  		unsigned short		protocol;
+  		unsigned short		nconnect;
+ -		unsigned short		export_path_len;
+  	} nfs_server;
+  
+ -	struct nfs_fh		*mntfh;
+ -	struct nfs_server	*server;
+ -	struct nfs_subversion	*nfs_mod;
+ -
+ -	/* Information for a cloned mount. */
+ -	struct nfs_clone_mount {
+ -		struct super_block	*sb;
+ -		struct dentry		*dentry;
+ -		struct nfs_fattr	*fattr;
+ -		unsigned int		inherited_bsize;
+ -	} clone_data;
+ +	struct security_mnt_opts lsm_opts;
+ +	struct net		*net;
+  };
+  
+++<<<<<<< HEAD
+++=======
++ #define nfs_errorf(fc, fmt, ...) ((fc)->log.log ?		\
++ 	errorf(fc, fmt, ## __VA_ARGS__) :			\
++ 	({ dprintk(fmt "\n", ## __VA_ARGS__); }))
++ 
++ #define nfs_ferrorf(fc, fac, fmt, ...) ((fc)->log.log ?		\
++ 	errorf(fc, fmt, ## __VA_ARGS__) :			\
++ 	({ dfprintk(fac, fmt "\n", ## __VA_ARGS__); }))
++ 
++ #define nfs_invalf(fc, fmt, ...) ((fc)->log.log ?		\
++ 	invalf(fc, fmt, ## __VA_ARGS__) :			\
++ 	({ dprintk(fmt "\n", ## __VA_ARGS__);  -EINVAL; }))
++ 
++ #define nfs_finvalf(fc, fac, fmt, ...) ((fc)->log.log ?		\
++ 	invalf(fc, fmt, ## __VA_ARGS__) :			\
++ 	({ dfprintk(fac, fmt "\n", ## __VA_ARGS__);  -EINVAL; }))
++ 
++ #define nfs_warnf(fc, fmt, ...) ((fc)->log.log ?		\
++ 	warnf(fc, fmt, ## __VA_ARGS__) :			\
++ 	({ dprintk(fmt "\n", ## __VA_ARGS__); }))
++ 
++ #define nfs_fwarnf(fc, fac, fmt, ...) ((fc)->log.log ?		\
++ 	warnf(fc, fmt, ## __VA_ARGS__) :			\
++ 	({ dfprintk(fac, fmt "\n", ## __VA_ARGS__); }))
++ 
++ static inline struct nfs_fs_context *nfs_fc2context(const struct fs_context *fc)
++ {
++ 	return fc->fs_private;
++ }
++ 
+++>>>>>>> c98e9daa59a6 (NFS: Adjust fs_context error logging)
+  /* mount_clnt.c */
+  struct nfs_mount_request {
+  	struct sockaddr		*sap;
+diff --cc fs/nfs/nfs4super.c
+index b5c4630cd799,d09bcfd7db89..000000000000
+--- a/fs/nfs/nfs4super.c
++++ b/fs/nfs/nfs4super.c
+@@@ -191,28 -206,33 +191,44 @@@ static struct dentry *do_nfs4_mount(str
+  	dentry = mount_subtree(root_mnt, export_path);
+  	nfs_referral_loop_unprotect();
+  
+ -	if (IS_ERR(dentry))
+ -		return PTR_ERR(dentry);
+ -
+ -	fc->root = dentry;
+ -	return 0;
+ +	return dentry;
+  }
+  
+ -int nfs4_try_get_tree(struct fs_context *fc)
+ +struct dentry *nfs4_try_mount(int flags, const char *dev_name,
+ +			      struct nfs_mount_info *mount_info)
+  {
+ -	struct nfs_fs_context *ctx = nfs_fc2context(fc);
+ -	int err;
+ +	struct nfs_parsed_mount_data *data = mount_info->parsed;
+ +	struct dentry *res;
+ +
+ +	mount_info->set_security = nfs_set_sb_security;
+  
+ -	dfprintk(MOUNT, "--> nfs4_try_get_tree()\n");
+++<<<<<<< HEAD
+ +	dfprintk(MOUNT, "--> nfs4_try_mount()\n");
+  
+ +	res = do_nfs4_mount(nfs4_create_server(mount_info),
+ +			    flags, mount_info,
+ +			    data->nfs_server.hostname,
+ +			    data->nfs_server.export_path);
+ +
+ +	dfprintk(MOUNT, "<-- nfs4_try_mount() = %d%s\n",
+ +		 PTR_ERR_OR_ZERO(res),
+ +		 IS_ERR(res) ? " [error]" : "");
+ +	return res;
+++=======
++ 	/* We create a mount for the server's root, walk to the requested
++ 	 * location and then create another mount for that.
++ 	 */
++ 	err= do_nfs4_mount(nfs4_create_server(fc),
++ 			   fc, ctx->nfs_server.hostname,
++ 			   ctx->nfs_server.export_path);
++ 	if (err) {
++ 		nfs_ferrorf(fc, MOUNT, "NFS4: Couldn't follow remote path");
++ 		dfprintk(MOUNT, "<-- nfs4_try_get_tree() = %d [error]\n", err);
++ 	} else {
++ 		dfprintk(MOUNT, "<-- nfs4_try_get_tree() = 0\n");
++ 	}
++ 	return err;
+++>>>>>>> c98e9daa59a6 (NFS: Adjust fs_context error logging)
+  }
+  
+  /*
+@@@ -231,23 -245,19 +247,37 @@@ static struct dentry *nfs4_referral_mou
+  
+  	dprintk("--> nfs4_referral_mount()\n");
+  
+++<<<<<<< HEAD
+ +	mount_info.mntfh = nfs_alloc_fhandle();
+ +	if (!mount_info.mntfh)
+ +		return ERR_PTR(-ENOMEM);
+ +
+ +	res = do_nfs4_mount(nfs4_create_referral_server(mount_info.cloned,
+ +							mount_info.mntfh),
+ +			    flags, &mount_info, data->hostname, data->mnt_path);
+ +
+ +	dprintk("<-- nfs4_referral_mount() = %d%s\n",
+ +		PTR_ERR_OR_ZERO(res),
+ +		IS_ERR(res) ? " [error]" : "");
+ +
+ +	nfs_free_fhandle(mount_info.mntfh);
+ +	return res;
+++=======
++ 	/* create a new volume representation */
++ 	err = do_nfs4_mount(nfs4_create_referral_server(fc),
++ 			    fc, ctx->nfs_server.hostname,
++ 			    ctx->nfs_server.export_path);
++ 	if (err) {
++ 		nfs_ferrorf(fc, MOUNT, "NFS4: Couldn't follow remote path");
++ 		dfprintk(MOUNT, "<-- nfs4_get_referral_tree() = %d [error]\n", err);
++ 	} else {
++ 		dfprintk(MOUNT, "<-- nfs4_get_referral_tree() = 0\n");
++ 	}
++ 	return err;
+++>>>>>>> c98e9daa59a6 (NFS: Adjust fs_context error logging)
+  }
+  
+ +
+  static int __init init_nfs_v4(void)
+  {
+  	int err;
+* Unmerged path fs/nfs/internal.h
+* Unmerged path fs/nfs/nfs4super.c
