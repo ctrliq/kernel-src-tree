@@ -1,0 +1,120 @@
+KVM: arm64: Check advertised Stage-2 page size capability
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Marc Zyngier <maz@kernel.org>
+commit b130a8f70cbbf907c399799bd1073a78763ca0e7
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/b130a8f7.failed
+
+With ARMv8.5-GTG, the hardware (or more likely a hypervisor) can
+advertise the supported Stage-2 page sizes.
+
+Let's check this at boot time.
+
+	Reviewed-by: Suzuki K Poulose <suzuki.poulose@arm.com>
+	Reviewed-by: Alexandru Elisei <alexandru.elisei@arm.com>
+	Signed-off-by: Marc Zyngier <maz@kernel.org>
+	Signed-off-by: Will Deacon <will@kernel.org>
+(cherry picked from commit b130a8f70cbbf907c399799bd1073a78763ca0e7)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/arm64/kvm/reset.c
+diff --cc arch/arm64/kvm/reset.c
+index 33f4aee10da3,70cd7bcca433..000000000000
+--- a/arch/arm64/kvm/reset.c
++++ b/arch/arm64/kvm/reset.c
+@@@ -344,9 -332,14 +344,18 @@@ out
+  	return ret;
+  }
+  
+++<<<<<<< HEAD
+ +void kvm_set_ipa_limit(void)
+++=======
++ u32 get_kvm_ipa_limit(void)
+  {
+- 	unsigned int ipa_max, pa_max, va_max, parange;
++ 	return kvm_ipa_limit;
++ }
++ 
++ int kvm_set_ipa_limit(void)
+++>>>>>>> b130a8f70cbb (KVM: arm64: Check advertised Stage-2 page size capability)
++ {
++ 	unsigned int ipa_max, pa_max, va_max, parange, tgran_2;
+  	u64 mmfr0;
+  
+  	mmfr0 = read_sanitised_ftr_reg(SYS_ID_AA64MMFR0_EL1);
+diff --git a/arch/arm64/include/asm/kvm_host.h b/arch/arm64/include/asm/kvm_host.h
+index a536de817dfb..e4529be115b9 100644
+--- a/arch/arm64/include/asm/kvm_host.h
++++ b/arch/arm64/include/asm/kvm_host.h
+@@ -643,7 +643,7 @@ static inline int kvm_arm_have_ssbd(void)
+ void kvm_vcpu_load_sysregs(struct kvm_vcpu *vcpu);
+ void kvm_vcpu_put_sysregs(struct kvm_vcpu *vcpu);
+ 
+-void kvm_set_ipa_limit(void);
++int kvm_set_ipa_limit(void);
+ 
+ #define __KVM_HAVE_ARCH_VM_ALLOC
+ struct kvm *kvm_arch_alloc_vm(void);
+diff --git a/arch/arm64/include/asm/sysreg.h b/arch/arm64/include/asm/sysreg.h
+index b515718697fb..7bd4ee978370 100644
+--- a/arch/arm64/include/asm/sysreg.h
++++ b/arch/arm64/include/asm/sysreg.h
+@@ -636,6 +636,9 @@
+ #define ID_AA64PFR1_SSBS_PSTATE_INSNS	2
+ 
+ /* id_aa64mmfr0 */
++#define ID_AA64MMFR0_TGRAN4_2_SHIFT	40
++#define ID_AA64MMFR0_TGRAN64_2_SHIFT	36
++#define ID_AA64MMFR0_TGRAN16_2_SHIFT	32
+ #define ID_AA64MMFR0_TGRAN4_SHIFT	28
+ #define ID_AA64MMFR0_TGRAN64_SHIFT	24
+ #define ID_AA64MMFR0_TGRAN16_SHIFT	20
+diff --git a/arch/arm64/kernel/cpufeature.c b/arch/arm64/kernel/cpufeature.c
+index c4f31f30b2c0..9d2a21600e7c 100644
+--- a/arch/arm64/kernel/cpufeature.c
++++ b/arch/arm64/kernel/cpufeature.c
+@@ -186,6 +186,24 @@ static const struct arm64_ftr_bits ftr_id_aa64pfr1[] = {
+ };
+ 
+ static const struct arm64_ftr_bits ftr_id_aa64mmfr0[] = {
++	/*
++	 * Page size not being supported at Stage-2 is not fatal. You
++	 * just give up KVM if PAGE_SIZE isn't supported there. Go fix
++	 * your favourite nesting hypervisor.
++	 *
++	 * There is a small corner case where the hypervisor explicitly
++	 * advertises a given granule size at Stage-2 (value 2) on some
++	 * vCPUs, and uses the fallback to Stage-1 (value 0) for other
++	 * vCPUs. Although this is not forbidden by the architecture, it
++	 * indicates that the hypervisor is being silly (or buggy).
++	 *
++	 * We make no effort to cope with this and pretend that if these
++	 * fields are inconsistent across vCPUs, then it isn't worth
++	 * trying to bring KVM up.
++	 */
++	ARM64_FTR_BITS(FTR_HIDDEN, FTR_NONSTRICT, FTR_EXACT, ID_AA64MMFR0_TGRAN4_2_SHIFT, 4, 1),
++	ARM64_FTR_BITS(FTR_HIDDEN, FTR_NONSTRICT, FTR_EXACT, ID_AA64MMFR0_TGRAN64_2_SHIFT, 4, 1),
++	ARM64_FTR_BITS(FTR_HIDDEN, FTR_NONSTRICT, FTR_EXACT, ID_AA64MMFR0_TGRAN16_2_SHIFT, 4, 1),
+ 	/*
+ 	 * We already refuse to boot CPUs that don't support our configured
+ 	 * page size, so we can only detect mismatches for a page size other
+diff --git a/arch/arm64/kvm/arm.c b/arch/arm64/kvm/arm.c
+index 8f41036b7acc..3e5fa7d78683 100644
+--- a/arch/arm64/kvm/arm.c
++++ b/arch/arm64/kvm/arm.c
+@@ -1428,9 +1428,7 @@ static inline void hyp_cpu_pm_exit(void)
+ 
+ static int init_common_resources(void)
+ {
+-	kvm_set_ipa_limit();
+-
+-	return 0;
++	return kvm_set_ipa_limit();
+ }
+ 
+ static int init_subsystems(void)
+* Unmerged path arch/arm64/kvm/reset.c
