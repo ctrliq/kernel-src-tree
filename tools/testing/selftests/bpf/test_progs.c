@@ -16,6 +16,7 @@
 #include <execinfo.h> /* backtrace */
 
 #define EXIT_NO_TEST		2
+#define EXIT_ERR_SETUP_INFRA	3
 
 /* defined in test_progs.h */
 struct test_env env = {};
@@ -116,13 +117,13 @@ static void reset_affinity() {
 	if (err < 0) {
 		stdio_restore();
 		fprintf(stderr, "Failed to reset process affinity: %d!\n", err);
-		exit(-1);
+		exit(EXIT_ERR_SETUP_INFRA);
 	}
 	err = pthread_setaffinity_np(pthread_self(), sizeof(cpuset), &cpuset);
 	if (err < 0) {
 		stdio_restore();
 		fprintf(stderr, "Failed to reset thread affinity: %d!\n", err);
-		exit(-1);
+		exit(EXIT_ERR_SETUP_INFRA);
 	}
 }
 
@@ -131,7 +132,7 @@ static void save_netns(void)
 	env.saved_netns_fd = open("/proc/self/ns/net", O_RDONLY);
 	if (env.saved_netns_fd == -1) {
 		perror("open(/proc/self/ns/net)");
-		exit(-1);
+		exit(EXIT_ERR_SETUP_INFRA);
 	}
 }
 
@@ -140,7 +141,7 @@ static void restore_netns(void)
 	if (setns(env.saved_netns_fd, CLONE_NEWNET) == -1) {
 		stdio_restore();
 		perror("setns(CLONE_NEWNS)");
-		exit(-1);
+		exit(EXIT_ERR_SETUP_INFRA);
 	}
 }
 
