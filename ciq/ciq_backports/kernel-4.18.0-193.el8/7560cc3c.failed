@@ -1,0 +1,83 @@
+iommu/vt-d: Fix lock inversion between iommu->lock and device_domain_lock
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-193.el8
+commit-author Dave Jiang <dave.jiang@intel.com>
+commit 7560cc3ca7d9d11555f80c830544e463fcdb28b8
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-193.el8/7560cc3c.failed
+
+Lockdep debug reported lock inversion related with the iommu code
+caused by dmar_insert_one_dev_info() grabbing the iommu->lock and
+the device_domain_lock out of order versus the code path in
+iommu_flush_dev_iotlb(). Expanding the scope of the iommu->lock and
+reversing the order of lock acquisition fixes the issue.
+
+[   76.238180] dsa_bus wq0.0: dsa wq wq0.0 disabled
+[   76.248706]
+[   76.250486] ========================================================
+[   76.257113] WARNING: possible irq lock inversion dependency detected
+[   76.263736] 5.1.0-rc5+ #162 Not tainted
+[   76.267854] --------------------------------------------------------
+[   76.274485] systemd-journal/521 just changed the state of lock:
+[   76.280685] 0000000055b330f5 (device_domain_lock){..-.}, at: iommu_flush_dev_iotlb.part.63+0x29/0x90
+[   76.290099] but this lock took another, SOFTIRQ-unsafe lock in the past:
+[   76.297093]  (&(&iommu->lock)->rlock){+.+.}
+[   76.297094]
+[   76.297094]
+[   76.297094] and interrupts could create inverse lock ordering between them.
+[   76.297094]
+[   76.314257]
+[   76.314257] other info that might help us debug this:
+[   76.321448]  Possible interrupt unsafe locking scenario:
+[   76.321448]
+[   76.328907]        CPU0                    CPU1
+[   76.333777]        ----                    ----
+[   76.338642]   lock(&(&iommu->lock)->rlock);
+[   76.343165]                                local_irq_disable();
+[   76.349422]                                lock(device_domain_lock);
+[   76.356116]                                lock(&(&iommu->lock)->rlock);
+[   76.363154]   <Interrupt>
+[   76.366134]     lock(device_domain_lock);
+[   76.370548]
+[   76.370548]  *** DEADLOCK ***
+
+Fixes: 745f2586e78e ("iommu/vt-d: Simplify function get_domain_for_dev()")
+	Signed-off-by: Dave Jiang <dave.jiang@intel.com>
+	Reviewed-by: Lu Baolu <baolu.lu@linux.intel.com>
+	Signed-off-by: Joerg Roedel <jroedel@suse.de>
+(cherry picked from commit 7560cc3ca7d9d11555f80c830544e463fcdb28b8)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/iommu/intel-iommu.c
+diff --cc drivers/iommu/intel-iommu.c
+index 1431de3bfba0,91f4912c09c6..000000000000
+--- a/drivers/iommu/intel-iommu.c
++++ b/drivers/iommu/intel-iommu.c
+@@@ -2480,13 -2546,16 +2480,18 @@@ static struct dmar_domain *dmar_insert_
+  	list_add(&info->global, &device_domain_list);
+  	if (dev)
+  		dev->archdata.iommu = info;
+++<<<<<<< HEAD
+++=======
++ 	spin_unlock_irqrestore(&device_domain_lock, flags);
++ 	spin_unlock(&iommu->lock);
+++>>>>>>> 7560cc3ca7d9 (iommu/vt-d: Fix lock inversion between iommu->lock and device_domain_lock)
+  
+ -	/* PASID table is mandatory for a PCI device in scalable mode. */
+ -	if (dev && dev_is_pci(dev) && sm_supported(iommu)) {
+ +	if (dev && dev_is_pci(dev) && info->pasid_supported) {
+  		ret = intel_pasid_alloc_table(dev);
+  		if (ret) {
+ -			dev_err(dev, "PASID table allocation failed\n");
+ -			dmar_remove_one_dev_info(dev);
+ -			return NULL;
+ +			pr_warn("No pasid table for %s, pasid disabled\n",
+ +				dev_name(dev));
+ +			info->pasid_supported = 0;
+  		}
+  
+  		/* Setup the PASID entry for requests without PASID: */
+* Unmerged path drivers/iommu/intel-iommu.c
