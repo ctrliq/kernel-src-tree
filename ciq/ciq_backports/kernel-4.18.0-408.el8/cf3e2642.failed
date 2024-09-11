@@ -1,0 +1,362 @@
+KVM: x86/mmu: Zap only TDP MMU leafs in kvm_zap_gfn_range()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-408.el8
+commit-author Sean Christopherson <seanjc@google.com>
+commit cf3e26427c08ad9015956293ab389004ac6a338e
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-408.el8/cf3e2642.failed
+
+Zap only leaf SPTEs in the TDP MMU's zap_gfn_range(), and rename various
+functions accordingly.  When removing mappings for functional correctness
+(except for the stupid VFIO GPU passthrough memslots bug), zapping the
+leaf SPTEs is sufficient as the paging structures themselves do not point
+at guest memory and do not directly impact the final translation (in the
+TDP MMU).
+
+Note, this aligns the TDP MMU with the legacy/full MMU, which zaps only
+the rmaps, a.k.a. leaf SPTEs, in kvm_zap_gfn_range() and
+kvm_unmap_gfn_range().
+
+	Signed-off-by: Sean Christopherson <seanjc@google.com>
+	Reviewed-by: Ben Gardon <bgardon@google.com>
+Message-Id: <20220226001546.360188-18-seanjc@google.com>
+	Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+(cherry picked from commit cf3e26427c08ad9015956293ab389004ac6a338e)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kvm/mmu/tdp_mmu.c
+#	arch/x86/kvm/mmu/tdp_mmu.h
+diff --cc arch/x86/kvm/mmu/tdp_mmu.c
+index 97bb57fe39ca,c71debdbc732..000000000000
+--- a/arch/x86/kvm/mmu/tdp_mmu.c
++++ b/arch/x86/kvm/mmu/tdp_mmu.c
+@@@ -700,43 -736,132 +700,63 @@@ static inline bool __must_check tdp_mmu
+  	return iter->yielded;
+  }
+  
+ -static inline gfn_t tdp_mmu_max_gfn_host(void)
+ -{
+ -	/*
+ -	 * Bound TDP MMU walks at host.MAXPHYADDR, guest accesses beyond that
+ -	 * will hit a #PF(RSVD) and never hit an EPT Violation/Misconfig / #NPF,
+ -	 * and so KVM will never install a SPTE for such addresses.
+ -	 */
+ -	return 1ULL << (shadow_phys_bits - PAGE_SHIFT);
+ -}
+ -
+ -static void tdp_mmu_zap_root(struct kvm *kvm, struct kvm_mmu_page *root,
+ -			     bool shared)
+ -{
+ -	bool root_is_unreachable = !refcount_read(&root->tdp_mmu_root_count);
+ -	struct tdp_iter iter;
+ -
+ -	gfn_t end = tdp_mmu_max_gfn_host();
+ -	gfn_t start = 0;
+ -
+ -	kvm_lockdep_assert_mmu_lock_held(kvm, shared);
+ -
+ -	rcu_read_lock();
+ -
+ -	/*
+ -	 * No need to try to step down in the iterator when zapping an entire
+ -	 * root, zapping an upper-level SPTE will recurse on its children.
+ -	 */
+ -	for_each_tdp_pte_min_level(iter, root, root->role.level, start, end) {
+ -retry:
+ -		/*
+ -		 * Yielding isn't allowed when zapping an unreachable root as
+ -		 * the root won't be processed by mmu_notifier callbacks.  When
+ -		 * handling an unmap/release mmu_notifier command, KVM must
+ -		 * drop all references to relevant pages prior to completing
+ -		 * the callback.  Dropping mmu_lock can result in zapping SPTEs
+ -		 * for an unreachable root after a relevant callback completes,
+ -		 * which leads to use-after-free as zapping a SPTE triggers
+ -		 * "writeback" of dirty/accessed bits to the SPTE's associated
+ -		 * struct page.
+ -		 */
+ -		if (!root_is_unreachable &&
+ -		    tdp_mmu_iter_cond_resched(kvm, &iter, false, shared))
+ -			continue;
+ -
+ -		if (!is_shadow_present_pte(iter.old_spte))
+ -			continue;
+ -
+ -		if (!shared) {
+ -			tdp_mmu_set_spte(kvm, &iter, 0);
+ -		} else if (tdp_mmu_set_spte_atomic(kvm, &iter, 0)) {
+ -			/*
+ -			 * cmpxchg() shouldn't fail if the root is unreachable.
+ -			 * Retry so as not to leak the page and its children.
+ -			 */
+ -			WARN_ONCE(root_is_unreachable,
+ -				  "Contended TDP MMU SPTE in unreachable root.");
+ -			goto retry;
+ -		}
+ -
+ -		/*
+ -		 * WARN if the root is invalid and is unreachable, all SPTEs
+ -		 * should've been zapped by kvm_tdp_mmu_zap_invalidated_roots(),
+ -		 * and inserting new SPTEs under an invalid root is a KVM bug.
+ -		 */
+ -		WARN_ON_ONCE(root_is_unreachable && root->role.invalid);
+ -	}
+ -
+ -	rcu_read_unlock();
+ -}
+ -
+ -bool kvm_tdp_mmu_zap_sp(struct kvm *kvm, struct kvm_mmu_page *sp)
+ -{
+ -	u64 old_spte;
+ -
+ -	/*
+ -	 * This helper intentionally doesn't allow zapping a root shadow page,
+ -	 * which doesn't have a parent page table and thus no associated entry.
+ -	 */
+ -	if (WARN_ON_ONCE(!sp->ptep))
+ -		return false;
+ -
+ -	rcu_read_lock();
+ -
+ -	old_spte = kvm_tdp_mmu_read_spte(sp->ptep);
+ -	if (WARN_ON_ONCE(!is_shadow_present_pte(old_spte))) {
+ -		rcu_read_unlock();
+ -		return false;
+ -	}
+ -
+ -	__tdp_mmu_set_spte(kvm, kvm_mmu_page_as_id(sp), sp->ptep, old_spte, 0,
+ -			   sp->gfn, sp->role.level + 1, true, true);
+ -
+ -	rcu_read_unlock();
+ -
+ -	return true;
+ -}
+ -
+  /*
+++<<<<<<< HEAD
+ + * Tears down the mappings for the range of gfns, [start, end), and frees the
+ + * non-root pages mapping GFNs strictly within that range. Returns true if
+ + * SPTEs have been cleared and a TLB flush is needed before releasing the
+ + * MMU lock.
+++=======
++  * Zap leafs SPTEs for the range of gfns, [start, end). Returns true if SPTEs
++  * have been cleared and a TLB flush is needed before releasing the MMU lock.
++  *
+++>>>>>>> cf3e26427c08 (KVM: x86/mmu: Zap only TDP MMU leafs in kvm_zap_gfn_range())
+   * If can_yield is true, will release the MMU lock and reschedule if the
+   * scheduler needs the CPU or there is contention on the MMU lock. If this
+   * function cannot yield, it will not release the MMU lock or reschedule and
+   * the caller must ensure it does not supply too large a GFN range, or the
+ - * operation can cause a soft lockup.
+ + * operation can cause a soft lockup.  Note, in some use cases a flush may be
+ + * required by prior actions.  Ensure the pending flush is performed prior to
+ + * yielding.
+   */
+- static bool zap_gfn_range(struct kvm *kvm, struct kvm_mmu_page *root,
+- 			  gfn_t start, gfn_t end, bool can_yield, bool flush)
++ static bool tdp_mmu_zap_leafs(struct kvm *kvm, struct kvm_mmu_page *root,
++ 			      gfn_t start, gfn_t end, bool can_yield, bool flush)
+  {
+  	struct tdp_iter iter;
+  
+++<<<<<<< HEAD
+ +	rcu_read_lock();
+ +
+ +	tdp_root_for_each_pte(iter, root, start, end) {
+++=======
++ 	end = min(end, tdp_mmu_max_gfn_host());
++ 
++ 	lockdep_assert_held_write(&kvm->mmu_lock);
++ 
++ 	rcu_read_lock();
++ 
++ 	for_each_tdp_pte_min_level(iter, root, PG_LEVEL_4K, start, end) {
+++>>>>>>> cf3e26427c08 (KVM: x86/mmu: Zap only TDP MMU leafs in kvm_zap_gfn_range())
+  		if (can_yield &&
+ -		    tdp_mmu_iter_cond_resched(kvm, &iter, flush, false)) {
+ +		    tdp_mmu_iter_cond_resched(kvm, &iter, flush)) {
+  			flush = false;
+  			continue;
+  		}
+  
+++<<<<<<< HEAD
+ +		if (!is_shadow_present_pte(iter.old_spte))
+ +			continue;
+ +
+ +		/*
+ +		 * If this is a non-last-level SPTE that covers a larger range
+ +		 * than should be zapped, continue, and zap the mappings at a
+ +		 * lower level.
+ +		 */
+ +		if ((iter.gfn < start ||
+ +		     iter.gfn + KVM_PAGES_PER_HPAGE(iter.level) > end) &&
+++=======
++ 		if (!is_shadow_present_pte(iter.old_spte) ||
+++>>>>>>> cf3e26427c08 (KVM: x86/mmu: Zap only TDP MMU leafs in kvm_zap_gfn_range())
+  		    !is_last_spte(iter.old_spte, iter.level))
+  			continue;
+  
+@@@ -1032,71 -1180,38 +1052,80 @@@ int kvm_tdp_mmu_map(struct kvm_vcpu *vc
+  	return ret;
+  }
+  
+++<<<<<<< HEAD
+ +typedef int (*tdp_handler_t)(struct kvm *kvm, struct kvm_memory_slot *slot,
+ +			     struct kvm_mmu_page *root, gfn_t start, gfn_t end,
+ +			     unsigned long data);
+++=======
++ bool kvm_tdp_mmu_unmap_gfn_range(struct kvm *kvm, struct kvm_gfn_range *range,
++ 				 bool flush)
++ {
++ 	return kvm_tdp_mmu_zap_leafs(kvm, range->slot->as_id, range->start,
++ 				     range->end, range->may_block, flush);
++ }
+++>>>>>>> cf3e26427c08 (KVM: x86/mmu: Zap only TDP MMU leafs in kvm_zap_gfn_range())
+  
+ -typedef bool (*tdp_handler_t)(struct kvm *kvm, struct tdp_iter *iter,
+ -			      struct kvm_gfn_range *range);
+ -
+ -static __always_inline bool kvm_tdp_mmu_handle_gfn(struct kvm *kvm,
+ -						   struct kvm_gfn_range *range,
+ -						   tdp_handler_t handler)
+ +static __always_inline int kvm_tdp_mmu_handle_hva_range(struct kvm *kvm,
+ +							unsigned long start,
+ +							unsigned long end,
+ +							unsigned long data,
+ +							tdp_handler_t handler)
+  {
+ +	struct kvm_memslots *slots;
+ +	struct kvm_memory_slot *memslot;
+  	struct kvm_mmu_page *root;
+ -	struct tdp_iter iter;
+ -	bool ret = false;
+ +	int ret = 0;
+ +	int as_id;
+ +
+ +	for (as_id = 0; as_id < KVM_ADDRESS_SPACE_NUM; as_id++) {
+ +		for_each_tdp_mmu_root_yield_safe(kvm, root, as_id) {
+ +			slots = __kvm_memslots(kvm, as_id);
+ +			kvm_for_each_memslot(memslot, slots) {
+ +				unsigned long hva_start, hva_end;
+ +				gfn_t gfn_start, gfn_end;
+ +
+ +				hva_start = max(start, memslot->userspace_addr);
+ +				hva_end = min(end, memslot->userspace_addr +
+ +					(memslot->npages << PAGE_SHIFT));
+ +				if (hva_start >= hva_end)
+ +					continue;
+ +				/*
+ +				 * {gfn(page) | page intersects with [hva_start, hva_end)} =
+ +				 * {gfn_start, gfn_start+1, ..., gfn_end-1}.
+ +				 */
+ +				gfn_start = hva_to_gfn_memslot(hva_start, memslot);
+ +				gfn_end = hva_to_gfn_memslot(hva_end + PAGE_SIZE - 1, memslot);
+ +
+ +				ret |= handler(kvm, memslot, root, gfn_start,
+ +					gfn_end, data);
+ +			}
+ +		}
+ +	}
+  
+ -	/*
+ -	 * Don't support rescheduling, none of the MMU notifiers that funnel
+ -	 * into this helper allow blocking; it'd be dead, wasteful code.
+ -	 */
+ -	for_each_tdp_mmu_root(kvm, root, range->slot->as_id) {
+ -		rcu_read_lock();
+ +	return ret;
+ +}
+  
+ -		tdp_root_for_each_leaf_pte(iter, root, range->start, range->end)
+ -			ret |= handler(kvm, &iter, range);
+ +static __always_inline int kvm_tdp_mmu_handle_hva(struct kvm *kvm,
+ +						  unsigned long addr,
+ +						  unsigned long data,
+ +						  tdp_handler_t handler)
+ +{
+ +	return kvm_tdp_mmu_handle_hva_range(kvm, addr, addr + 1, data, handler);
+ +}
+  
+ -		rcu_read_unlock();
+ -	}
+ +static int zap_gfn_range_hva_wrapper(struct kvm *kvm,
+ +				     struct kvm_memory_slot *slot,
+ +				     struct kvm_mmu_page *root, gfn_t start,
+ +				     gfn_t end, unsigned long unused)
+ +{
+ +	return zap_gfn_range(kvm, root, start, end, false, false);
+ +}
+  
+ -	return ret;
+ +int kvm_tdp_mmu_zap_hva_range(struct kvm *kvm, unsigned long start,
+ +			      unsigned long end)
+ +{
+ +	return kvm_tdp_mmu_handle_hva_range(kvm, start, end, 0,
+ +					    zap_gfn_range_hva_wrapper);
+  }
+  
+  /*
+diff --cc arch/x86/kvm/mmu/tdp_mmu.h
+index e1f1ae8ec3e2,54bc8118c40a..000000000000
+--- a/arch/x86/kvm/mmu/tdp_mmu.h
++++ b/arch/x86/kvm/mmu/tdp_mmu.h
+@@@ -13,33 -12,12 +13,37 @@@ __must_check static inline bool kvm_tdp
+  	return refcount_inc_not_zero(&root->tdp_mmu_root_count);
+  }
+  
+ -void kvm_tdp_mmu_put_root(struct kvm *kvm, struct kvm_mmu_page *root,
+ -			  bool shared);
+ +void kvm_tdp_mmu_put_root(struct kvm *kvm, struct kvm_mmu_page *root);
+  
+- bool __kvm_tdp_mmu_zap_gfn_range(struct kvm *kvm, int as_id, gfn_t start,
++ bool kvm_tdp_mmu_zap_leafs(struct kvm *kvm, int as_id, gfn_t start,
+  				 gfn_t end, bool can_yield, bool flush);
+++<<<<<<< HEAD
+ +static inline bool kvm_tdp_mmu_zap_gfn_range(struct kvm *kvm, int as_id,
+ +					     gfn_t start, gfn_t end, bool flush)
+ +{
+ +	return __kvm_tdp_mmu_zap_gfn_range(kvm, as_id, start, end, true, flush);
+ +}
+ +static inline bool kvm_tdp_mmu_zap_sp(struct kvm *kvm, struct kvm_mmu_page *sp)
+ +{
+ +	gfn_t end = sp->gfn + KVM_PAGES_PER_HPAGE(sp->role.level + 1);
+ +
+ +	/*
+ +	 * Don't allow yielding, as the caller may have a flush pending.  Note,
+ +	 * if mmu_lock is held for write, zapping will never yield in this case,
+ +	 * but explicitly disallow it for safety.  The TDP MMU does not yield
+ +	 * until it has made forward progress (steps sideways), and when zapping
+ +	 * a single shadow page that it's guaranteed to see (thus the mmu_lock
+ +	 * requirement), its "step sideways" will always step beyond the bounds
+ +	 * of the shadow page's gfn range and stop iterating before yielding.
+ +	 */
+ +	lockdep_assert_held_write(&kvm->mmu_lock);
+ +	return __kvm_tdp_mmu_zap_gfn_range(kvm, kvm_mmu_page_as_id(sp),
+ +					   sp->gfn, end, false, false);
+ +}
+ +
+++=======
++ bool kvm_tdp_mmu_zap_sp(struct kvm *kvm, struct kvm_mmu_page *sp);
+++>>>>>>> cf3e26427c08 (KVM: x86/mmu: Zap only TDP MMU leafs in kvm_zap_gfn_range())
+  void kvm_tdp_mmu_zap_all(struct kvm *kvm);
+  void kvm_tdp_mmu_invalidate_all_roots(struct kvm *kvm);
+  void kvm_tdp_mmu_zap_invalidated_roots(struct kvm *kvm);
+diff --git a/arch/x86/kvm/mmu/mmu.c b/arch/x86/kvm/mmu/mmu.c
+index ad983809b045..bb37acf09ec0 100644
+--- a/arch/x86/kvm/mmu/mmu.c
++++ b/arch/x86/kvm/mmu/mmu.c
+@@ -5720,8 +5720,8 @@ void kvm_zap_gfn_range(struct kvm *kvm, gfn_t gfn_start, gfn_t gfn_end)
+ 
+ 	if (is_tdp_mmu_enabled(kvm)) {
+ 		for (i = 0; i < KVM_ADDRESS_SPACE_NUM; i++)
+-			flush = kvm_tdp_mmu_zap_gfn_range(kvm, i, gfn_start,
+-							  gfn_end, flush);
++			flush = kvm_tdp_mmu_zap_leafs(kvm, i, gfn_start,
++						      gfn_end, true, flush);
+ 	}
+ 
+ 	if (flush)
+* Unmerged path arch/x86/kvm/mmu/tdp_mmu.c
+* Unmerged path arch/x86/kvm/mmu/tdp_mmu.h
