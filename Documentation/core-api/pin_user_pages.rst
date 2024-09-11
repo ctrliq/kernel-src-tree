@@ -222,6 +222,13 @@ Those are both going to show zero, unless CONFIG_DEBUG_VM is set. This is
 because there is a noticeable performance drop in unpin_user_page(), when they
 are activated.
 
+Other diagnostics
+=================
+
+dump_page() has been enhanced slightly, to handle these new counting fields, and
+to better report on compound pages in general. Specifically, for compound pages
+with order > 1, the exact (hpage_pinned_refcount) pincount is reported.
+
 References
 ==========
 
