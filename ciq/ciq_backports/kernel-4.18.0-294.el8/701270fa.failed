@@ -1,0 +1,118 @@
+mm/khugepaged: collapse_shmem() stop if punched or truncated
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Hugh Dickins <hughd@google.com>
+commit 701270fa193aadf00bdcf607738f64997275d4c7
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/701270fa.failed
+
+Huge tmpfs testing showed that although collapse_shmem() recognizes a
+concurrently truncated or hole-punched page correctly, its handling of
+holes was liable to refill an emptied extent.  Add check to stop that.
+
+Link: http://lkml.kernel.org/r/alpine.LSU.2.11.1811261522040.2275@eggly.anvils
+Fixes: f3f0e1d2150b2 ("khugepaged: add support of collapse for tmpfs/shmem pages")
+	Signed-off-by: Hugh Dickins <hughd@google.com>
+	Reviewed-by: Matthew Wilcox <willy@infradead.org>
+	Cc: Kirill A. Shutemov <kirill.shutemov@linux.intel.com>
+	Cc: Jerome Glisse <jglisse@redhat.com>
+	Cc: Konstantin Khlebnikov <khlebnikov@yandex-team.ru>
+	Cc: <stable@vger.kernel.org>	[4.8+]
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit 701270fa193aadf00bdcf607738f64997275d4c7)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	mm/khugepaged.c
+diff --cc mm/khugepaged.c
+index 00cb7550bd59,2070c316f06e..000000000000
+--- a/mm/khugepaged.c
++++ b/mm/khugepaged.c
+@@@ -1339,41 -1335,52 +1339,73 @@@ static void collapse_shmem(struct mm_st
+  	__SetPageLocked(new_page);
+  	BUG_ON(!page_ref_freeze(new_page, 1));
+  
+ +
+  	/*
+ -	 * At this point the new_page is 'frozen' (page_count() is zero),
+ -	 * locked and not up-to-date. It's safe to insert it into the page
+ -	 * cache, because nobody would be able to map it or use it in other
+ -	 * way until we unfreeze it.
+ +	 * At this point the new_page is 'frozen' (page_count() is zero), locked
+ +	 * and not up-to-date. It's safe to insert it into radix tree, because
+ +	 * nobody would be able to map it or use it in other way until we
+ +	 * unfreeze it.
+  	 */
+  
+ -	/* This will be less messy when we use multi-index entries */
+ -	do {
+ -		xas_lock_irq(&xas);
+ -		xas_create_range(&xas);
+ -		if (!xas_error(&xas))
+ +	index = start;
+ +	xa_lock_irq(&mapping->i_pages);
+ +	radix_tree_for_each_slot(slot, &mapping->i_pages, &iter, start) {
+ +		int n = min(iter.index, end) - index;
+ +
+ +		/*
+ +		 * Handle holes in the radix tree: charge it from shmem and
+ +		 * insert relevant subpage of new_page into the radix-tree.
+ +		 */
+ +		if (n && !shmem_charge(mapping->host, n)) {
+ +			result = SCAN_FAIL;
+  			break;
+++<<<<<<< HEAD
+ +		}
+ +		nr_none += n;
+ +		for (; index < min(iter.index, end); index++) {
+ +			radix_tree_insert(&mapping->i_pages, index,
+ +					new_page + (index % HPAGE_PMD_NR));
+++=======
++ 		xas_unlock_irq(&xas);
++ 		if (!xas_nomem(&xas, GFP_KERNEL))
++ 			goto out;
++ 	} while (1);
++ 
++ 	xas_set(&xas, start);
++ 	for (index = start; index < end; index++) {
++ 		struct page *page = xas_next(&xas);
++ 
++ 		VM_BUG_ON(index != xas.xa_index);
++ 		if (!page) {
++ 			/*
++ 			 * Stop if extent has been truncated or hole-punched,
++ 			 * and is now completely empty.
++ 			 */
++ 			if (index == start) {
++ 				if (!xas_next_entry(&xas, end - 1)) {
++ 					result = SCAN_TRUNCATED;
++ 					break;
++ 				}
++ 				xas_set(&xas, index);
++ 			}
++ 			if (!shmem_charge(mapping->host, 1)) {
++ 				result = SCAN_FAIL;
++ 				break;
++ 			}
++ 			xas_store(&xas, new_page + (index % HPAGE_PMD_NR));
++ 			nr_none++;
++ 			continue;
+++>>>>>>> 701270fa193a (mm/khugepaged: collapse_shmem() stop if punched or truncated)
+  		}
+  
+ +		/* We are done. */
+ +		if (index >= end)
+ +			break;
+ +
+ +		page = radix_tree_deref_slot_protected(slot,
+ +				&mapping->i_pages.xa_lock);
+  		if (xa_is_value(page) || !PageUptodate(page)) {
+ -			xas_unlock_irq(&xas);
+ +			xa_unlock_irq(&mapping->i_pages);
+  			/* swap in or instantiate fallocated page */
+  			if (shmem_getpage(mapping->host, index, &page,
+  						SGP_NOHUGE)) {
+* Unmerged path mm/khugepaged.c
