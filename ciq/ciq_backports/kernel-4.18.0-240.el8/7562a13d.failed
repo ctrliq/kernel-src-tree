@@ -1,0 +1,104 @@
+net/smc: multiple link support for rmb buffer registration
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Karsten Graul <kgraul@linux.ibm.com>
+commit 7562a13d5a8ce9bc5020705da5f50221021f5a2c
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/7562a13d.failed
+
+The CONFIRM_RKEY LLC processing handles all links in one LLC message.
+Move the call to this processing out of smcr_link_reg_rmb() which does
+processing per link, into smcr_lgr_reg_rmbs() which is responsible for
+link group level processing. Move smcr_link_reg_rmb() into module
+smc_core.c.
+>From af_smc.c now call smcr_lgr_reg_rmbs() to register new rmbs on all
+available links.
+
+	Signed-off-by: Karsten Graul <kgraul@linux.ibm.com>
+	Reviewed-by: Ursula Braun <ubraun@linux.ibm.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 7562a13d5a8ce9bc5020705da5f50221021f5a2c)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/smc/af_smc.c
+diff --cc net/smc/af_smc.c
+index 61adbee56cf2,20d6d3fbb86c..000000000000
+--- a/net/smc/af_smc.c
++++ b/net/smc/af_smc.c
+@@@ -405,9 -392,12 +389,9 @@@ static int smcr_clnt_conf_first_link(st
+  
+  	smc_wr_remember_qp_attr(link);
+  
+- 	if (smcr_link_reg_rmb(link, smc->conn.rmb_desc, false))
++ 	if (smcr_link_reg_rmb(link, smc->conn.rmb_desc))
+  		return SMC_CLC_DECL_ERR_REGRMB;
+  
+ -	/* confirm_rkey is implicit on 1st contact */
+ -	smc->conn.rmb_desc->is_conf_rkey = true;
+ -
+  	/* send CONFIRM LINK response over RoCE fabric */
+  	rc = smc_llc_send_confirm_link(link, SMC_LLC_RESP);
+  	if (rc < 0)
+@@@ -1017,12 -1023,13 +1001,18 @@@ void smc_close_non_accepted(struct soc
+  
+  static int smcr_serv_conf_first_link(struct smc_sock *smc)
+  {
+ +	struct net *net = sock_net(smc->clcsock->sk);
+  	struct smc_link *link = smc->conn.lnk;
+ -	struct smc_llc_qentry *qentry;
+ +	int rest;
+  	int rc;
+  
+++<<<<<<< HEAD
+ +	if (smcr_link_reg_rmb(link, smc->conn.rmb_desc, false))
+++=======
++ 	link->lgr->type = SMC_LGR_SINGLE;
++ 
++ 	if (smcr_link_reg_rmb(link, smc->conn.rmb_desc))
+++>>>>>>> 7562a13d5a8c (net/smc: multiple link support for rmb buffer registration)
+  		return SMC_CLC_DECL_ERR_REGRMB;
+  
+  	/* send CONFIRM LINK request to client over the RoCE fabric */
+* Unmerged path net/smc/af_smc.c
+diff --git a/net/smc/smc_core.c b/net/smc/smc_core.c
+index 8d7f08e469be..16aea040a786 100644
+--- a/net/smc/smc_core.c
++++ b/net/smc/smc_core.c
+@@ -1126,6 +1126,22 @@ static int smcr_buf_map_link(struct smc_buf_desc *buf_desc, bool is_rmb,
+ 	return rc;
+ }
+ 
++/* register a new rmb on IB device */
++int smcr_link_reg_rmb(struct smc_link *link, struct smc_buf_desc *rmb_desc)
++{
++	if (list_empty(&link->lgr->list))
++		return -ENOLINK;
++	if (!rmb_desc->is_reg_mr[link->link_idx]) {
++		/* register memory region for new rmb */
++		if (smc_wr_reg_send(link, rmb_desc->mr_rx[link->link_idx])) {
++			rmb_desc->is_reg_err = true;
++			return -EFAULT;
++		}
++		rmb_desc->is_reg_mr[link->link_idx] = true;
++	}
++	return 0;
++}
++
+ static struct smc_buf_desc *smcr_new_buf_create(struct smc_link_group *lgr,
+ 						bool is_rmb, int bufsize)
+ {
+diff --git a/net/smc/smc_core.h b/net/smc/smc_core.h
+index dbb7446cbf6a..d1bc6d264d4f 100644
+--- a/net/smc/smc_core.h
++++ b/net/smc/smc_core.h
+@@ -335,6 +335,7 @@ void smc_lgr_schedule_free_work_fast(struct smc_link_group *lgr);
+ int smc_core_init(void);
+ void smc_core_exit(void);
+ 
++int smcr_link_reg_rmb(struct smc_link *link, struct smc_buf_desc *rmb_desc);
+ static inline struct smc_link_group *smc_get_lgr(struct smc_link *link)
+ {
+ 	return link->lgr;
