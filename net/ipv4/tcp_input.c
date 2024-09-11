@@ -4348,6 +4348,11 @@ static bool tcp_try_coalesce(struct sock *sk,
 	if (TCP_SKB_CB(from)->seq != TCP_SKB_CB(to)->end_seq)
 		return false;
 
+#ifdef CONFIG_TLS_DEVICE
+	if (from->decrypted != to->decrypted)
+		return false;
+#endif
+
 	if (!skb_try_coalesce(to, from, fragstolen, &delta))
 		return false;
 
@@ -4886,6 +4891,9 @@ restart:
 			break;
 
 		memcpy(nskb->cb, skb->cb, sizeof(skb->cb));
+#ifdef CONFIG_TLS_DEVICE
+		nskb->decrypted = skb->decrypted;
+#endif
 		TCP_SKB_CB(nskb)->seq = TCP_SKB_CB(nskb)->end_seq = start;
 		if (list)
 			__skb_queue_before(list, skb, nskb);
@@ -4913,6 +4921,10 @@ restart:
 				    skb == tail ||
 				    (TCP_SKB_CB(skb)->tcp_flags & (TCPHDR_SYN | TCPHDR_FIN)))
 					goto end;
+#ifdef CONFIG_TLS_DEVICE
+				if (skb->decrypted != nskb->decrypted)
+					goto end;
+#endif
 			}
 		}
 	}
