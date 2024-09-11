@@ -184,6 +184,7 @@ struct ath11k_hw_params {
 	const struct ath11k_hw_hal_params *hal_params;
 	bool supports_dynamic_smps_6ghz;
 	bool wakeup_mhi;
+	bool supports_rssi_stats;
 };
 
 struct ath11k_hw_ops {
