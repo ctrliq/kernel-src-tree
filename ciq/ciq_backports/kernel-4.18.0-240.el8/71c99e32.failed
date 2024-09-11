@@ -1,0 +1,160 @@
+bpf/flow_dissector: support ipv6 flow_label and BPF_FLOW_DISSECTOR_F_STOP_AT_FLOW_LABEL
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Stanislav Fomichev <sdf@google.com>
+commit 71c99e32b926159ea628352751f66383d7d04d17
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/71c99e32.failed
+
+Add support for exporting ipv6 flow label via bpf_flow_keys.
+Export flow label from bpf_flow.c and also return early when
+BPF_FLOW_DISSECTOR_F_STOP_AT_FLOW_LABEL is passed.
+
+	Acked-by: Petar Penkov <ppenkov@google.com>
+	Acked-by: Willem de Bruijn <willemb@google.com>
+	Acked-by: Song Liu <songliubraving@fb.com>
+	Cc: Song Liu <songliubraving@fb.com>
+	Cc: Willem de Bruijn <willemb@google.com>
+	Cc: Petar Penkov <ppenkov@google.com>
+	Signed-off-by: Stanislav Fomichev <sdf@google.com>
+	Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+(cherry picked from commit 71c99e32b926159ea628352751f66383d7d04d17)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/core/flow_dissector.c
+#	tools/testing/selftests/bpf/progs/bpf_flow.c
+diff --cc net/core/flow_dissector.c
+index 86e5a719a1ec,9741b593ea53..000000000000
+--- a/net/core/flow_dissector.c
++++ b/net/core/flow_dissector.c
+@@@ -765,6 -736,8 +765,11 @@@ static void __skb_flow_bpf_to_target(co
+  	struct flow_dissector_key_control *key_control;
+  	struct flow_dissector_key_basic *key_basic;
+  	struct flow_dissector_key_addrs *key_addrs;
+++<<<<<<< HEAD
+++=======
++ 	struct flow_dissector_key_ports *key_ports;
++ 	struct flow_dissector_key_tags *key_tags;
+++>>>>>>> 71c99e32b926 (bpf/flow_dissector: support ipv6 flow_label and BPF_FLOW_DISSECTOR_F_STOP_AT_FLOW_LABEL)
+  
+  	key_control = skb_flow_dissector_target(flow_dissector,
+  						FLOW_DISSECTOR_KEY_CONTROL,
+diff --cc tools/testing/selftests/bpf/progs/bpf_flow.c
+index 12a50a707149,7fbfa22f33df..000000000000
+--- a/tools/testing/selftests/bpf/progs/bpf_flow.c
++++ b/tools/testing/selftests/bpf/progs/bpf_flow.c
+@@@ -300,6 -313,11 +306,14 @@@ PROG(IPV6)(struct __sk_buff *skb
+  	memcpy(&keys->ipv6_src, &ip6h->saddr, 2*sizeof(ip6h->saddr));
+  
+  	keys->thoff += sizeof(struct ipv6hdr);
+++<<<<<<< HEAD
+++=======
++ 	keys->ip_proto = ip6h->nexthdr;
++ 	keys->flow_label = ip6_flowlabel(ip6h);
++ 
++ 	if (keys->flags & BPF_FLOW_DISSECTOR_F_STOP_AT_FLOW_LABEL)
++ 		return export_flow_keys(keys, BPF_OK);
+++>>>>>>> 71c99e32b926 (bpf/flow_dissector: support ipv6 flow_label and BPF_FLOW_DISSECTOR_F_STOP_AT_FLOW_LABEL)
+  
+  	return parse_ipv6_proto(skb, ip6h->nexthdr);
+  }
+diff --git a/include/uapi/linux/bpf.h b/include/uapi/linux/bpf.h
+index a2867ed0cfa6..a9efeede64db 100644
+--- a/include/uapi/linux/bpf.h
++++ b/include/uapi/linux/bpf.h
+@@ -3543,6 +3543,7 @@ struct bpf_flow_keys {
+ 		};
+ 	};
+ 	__u32	flags;
++	__be32	flow_label;
+ };
+ 
+ struct bpf_func_info {
+* Unmerged path net/core/flow_dissector.c
+diff --git a/tools/include/uapi/linux/bpf.h b/tools/include/uapi/linux/bpf.h
+index 7277eaedc088..87a9b2cc5b5f 100644
+--- a/tools/include/uapi/linux/bpf.h
++++ b/tools/include/uapi/linux/bpf.h
+@@ -3536,6 +3536,7 @@ struct bpf_flow_keys {
+ 		};
+ 	};
+ 	__u32	flags;
++	__be32	flow_label;
+ };
+ 
+ struct bpf_func_info {
+diff --git a/tools/testing/selftests/bpf/prog_tests/flow_dissector.c b/tools/testing/selftests/bpf/prog_tests/flow_dissector.c
+index 716094eeb3a9..2bfeb738012e 100644
+--- a/tools/testing/selftests/bpf/prog_tests/flow_dissector.c
++++ b/tools/testing/selftests/bpf/prog_tests/flow_dissector.c
+@@ -16,6 +16,7 @@
+ 	      "is_encap=%u/%u "						\
+ 	      "ip_proto=0x%x/0x%x "					\
+ 	      "n_proto=0x%x/0x%x "					\
++	      "flow_label=0x%x/0x%x "					\
+ 	      "sport=%u/%u "						\
+ 	      "dport=%u/%u\n",						\
+ 	      got.nhoff, expected.nhoff,				\
+@@ -26,6 +27,7 @@
+ 	      got.is_encap, expected.is_encap,				\
+ 	      got.ip_proto, expected.ip_proto,				\
+ 	      got.n_proto, expected.n_proto,				\
++	      got.flow_label, expected.flow_label,			\
+ 	      got.sport, expected.sport,				\
+ 	      got.dport, expected.dport)
+ 
+@@ -159,6 +161,50 @@ struct test tests[] = {
+ 			.dport = 8080,
+ 		},
+ 	},
++	{
++		.name = "ipv6-flow-label",
++		.pkt.ipv6 = {
++			.eth.h_proto = __bpf_constant_htons(ETH_P_IPV6),
++			.iph.nexthdr = IPPROTO_TCP,
++			.iph.payload_len = __bpf_constant_htons(MAGIC_BYTES),
++			.iph.flow_lbl = { 0xb, 0xee, 0xef },
++			.tcp.doff = 5,
++			.tcp.source = 80,
++			.tcp.dest = 8080,
++		},
++		.keys = {
++			.nhoff = ETH_HLEN,
++			.thoff = ETH_HLEN + sizeof(struct ipv6hdr),
++			.addr_proto = ETH_P_IPV6,
++			.ip_proto = IPPROTO_TCP,
++			.n_proto = __bpf_constant_htons(ETH_P_IPV6),
++			.sport = 80,
++			.dport = 8080,
++			.flow_label = __bpf_constant_htonl(0xbeeef),
++		},
++	},
++	{
++		.name = "ipv6-no-flow-label",
++		.pkt.ipv6 = {
++			.eth.h_proto = __bpf_constant_htons(ETH_P_IPV6),
++			.iph.nexthdr = IPPROTO_TCP,
++			.iph.payload_len = __bpf_constant_htons(MAGIC_BYTES),
++			.iph.flow_lbl = { 0xb, 0xee, 0xef },
++			.tcp.doff = 5,
++			.tcp.source = 80,
++			.tcp.dest = 8080,
++		},
++		.keys = {
++			.flags = BPF_FLOW_DISSECTOR_F_STOP_AT_FLOW_LABEL,
++			.nhoff = ETH_HLEN,
++			.thoff = ETH_HLEN + sizeof(struct ipv6hdr),
++			.addr_proto = ETH_P_IPV6,
++			.ip_proto = IPPROTO_TCP,
++			.n_proto = __bpf_constant_htons(ETH_P_IPV6),
++			.flow_label = __bpf_constant_htonl(0xbeeef),
++		},
++		.flags = BPF_FLOW_DISSECTOR_F_STOP_AT_FLOW_LABEL,
++	},
+ };
+ 
+ static int create_tap(const char *ifname)
+* Unmerged path tools/testing/selftests/bpf/progs/bpf_flow.c
