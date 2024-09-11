@@ -1,0 +1,413 @@
+IB/{rdmavt, hfi1, qib}: Remove AH refcount for UD QPs
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-193.el8
+commit-author Michael J. Ruhl <michael.j.ruhl@intel.com>
+commit d310c4bf8aeacc0256091feb6a0337b8fef763ac
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-193.el8/d310c4bf.failed
+
+Historically rdmavt destroy_ah() has returned an -EBUSY when the AH has a
+non-zero reference count.  IBTA 11.2.2 notes no such return value or error
+case:
+
+	Output Modifiers:
+	- Verb results:
+	- Operation completed successfully.
+	- Invalid HCA handle.
+	- Invalid address handle.
+
+ULPs never test for this error and this will leak memory.
+
+The reference count exists to allow for driver independent progress
+mechanisms to process UD SWQEs in parallel with post sends.  The SWQE will
+hold a reference count until the UD SWQE completes and then drops the
+reference.
+
+Fix by removing need to reference count the AH.  Add a UD specific
+allocation to each SWQE entry to cache the necessary information for
+independent progress.  Copy the information during the post send
+processing.
+
+	Reviewed-by: Mike Marciniszyn <mike.marciniszyn@intel.com>
+	Signed-off-by: Mike Marciniszyn <mike.marciniszyn@intel.com>
+	Signed-off-by: Michael J. Ruhl <michael.j.ruhl@intel.com>
+	Signed-off-by: Dennis Dalessandro <dennis.dalessandro@intel.com>
+	Signed-off-by: Jason Gunthorpe <jgg@mellanox.com>
+(cherry picked from commit d310c4bf8aeacc0256091feb6a0337b8fef763ac)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/infiniband/sw/rdmavt/ah.c
+#	drivers/infiniband/sw/rdmavt/qp.c
+diff --cc drivers/infiniband/sw/rdmavt/ah.c
+index fc10e4e26ca7,fe99da0ff060..000000000000
+--- a/drivers/infiniband/sw/rdmavt/ah.c
++++ b/drivers/infiniband/sw/rdmavt/ah.c
+@@@ -126,12 -119,10 +126,10 @@@ struct ib_ah *rvt_create_ah(struct ib_p
+  
+  	rdma_copy_ah_attr(&ah->attr, ah_attr);
+  
+- 	atomic_set(&ah->refcount, 0);
+- 
+  	if (dev->driver_f.notify_new_ah)
+ -		dev->driver_f.notify_new_ah(ibah->device, ah_attr, ah);
+ +		dev->driver_f.notify_new_ah(pd->device, ah_attr, ah);
+  
+ -	return 0;
+ +	return &ah->ibah;
+  }
+  
+  /**
+@@@ -147,9 -139,6 +145,12 @@@ int rvt_destroy_ah(struct ib_ah *ibah, 
+  	struct rvt_ah *ah = ibah_to_rvtah(ibah);
+  	unsigned long flags;
+  
+++<<<<<<< HEAD
+ +	if (atomic_read(&ah->refcount) != 0)
+ +		return -EBUSY;
+ +
+++=======
+++>>>>>>> d310c4bf8aea (IB/{rdmavt, hfi1, qib}: Remove AH refcount for UD QPs)
+  	spin_lock_irqsave(&dev->n_ahs_lock, flags);
+  	dev->n_ahs_allocated--;
+  	spin_unlock_irqrestore(&dev->n_ahs_lock, flags);
+diff --cc drivers/infiniband/sw/rdmavt/qp.c
+index e6fda8da530f,de7d2edb9781..000000000000
+--- a/drivers/infiniband/sw/rdmavt/qp.c
++++ b/drivers/infiniband/sw/rdmavt/qp.c
+@@@ -1191,8 -1276,8 +1241,13 @@@ bail_qpn
+  	rvt_free_qpn(&rdi->qp_dev->qpn_table, qp->ibqp.qp_num);
+  
+  bail_rq_wq:
+++<<<<<<< HEAD
+ +	if (!qp->ip)
+ +		vfree(qp->r_rq.wq);
+++=======
++ 	rvt_free_rq(&qp->r_rq);
++ 	free_ud_wq_attr(qp);
+++>>>>>>> d310c4bf8aea (IB/{rdmavt, hfi1, qib}: Remove AH refcount for UD QPs)
+  
+  bail_driver_priv:
+  	rdi->driver_f.qp_priv_free(rdi, qp);
+diff --git a/drivers/infiniband/hw/hfi1/qp.c b/drivers/infiniband/hw/hfi1/qp.c
+index 4e0e9fc0a777..a60f3dc18d18 100644
+--- a/drivers/infiniband/hw/hfi1/qp.c
++++ b/drivers/infiniband/hw/hfi1/qp.c
+@@ -1,5 +1,5 @@
+ /*
+- * Copyright(c) 2015 - 2018 Intel Corporation.
++ * Copyright(c) 2015 - 2019 Intel Corporation.
+  *
+  * This file is provided under a dual BSD/GPLv2 license.  When using or
+  * redistributing this file, you may do so under either license.
+@@ -348,7 +348,7 @@ int hfi1_setup_wqe(struct rvt_qp *qp, struct rvt_swqe *wqe, bool *call_send)
+ 		break;
+ 	case IB_QPT_GSI:
+ 	case IB_QPT_UD:
+-		ah = ibah_to_rvtah(wqe->ud_wr.ah);
++		ah = ibah_to_rvtah(wqe->ud_wr.wr.ah);
+ 		if (wqe->length > (1 << ah->log_pmtu))
+ 			return -EINVAL;
+ 		if (ibp->sl_to_sc[rdma_ah_get_sl(&ah->attr)] == 0xf)
+diff --git a/drivers/infiniband/hw/hfi1/ud.c b/drivers/infiniband/hw/hfi1/ud.c
+index 4cb0fce5c096..7ee0c4ed2823 100644
+--- a/drivers/infiniband/hw/hfi1/ud.c
++++ b/drivers/infiniband/hw/hfi1/ud.c
+@@ -1,5 +1,5 @@
+ /*
+- * Copyright(c) 2015 - 2018 Intel Corporation.
++ * Copyright(c) 2015 - 2019 Intel Corporation.
+  *
+  * This file is provided under a dual BSD/GPLv2 license.  When using or
+  * redistributing this file, you may do so under either license.
+@@ -87,7 +87,7 @@ static void ud_loopback(struct rvt_qp *sqp, struct rvt_swqe *swqe)
+ 	rcu_read_lock();
+ 
+ 	qp = rvt_lookup_qpn(ib_to_rvt(sqp->ibqp.device), &ibp->rvp,
+-			    swqe->ud_wr.remote_qpn);
++			    swqe->ud_wr.wr.remote_qpn);
+ 	if (!qp) {
+ 		ibp->rvp.n_pkt_drops++;
+ 		rcu_read_unlock();
+@@ -105,7 +105,7 @@ static void ud_loopback(struct rvt_qp *sqp, struct rvt_swqe *swqe)
+ 		goto drop;
+ 	}
+ 
+-	ah_attr = &ibah_to_rvtah(swqe->ud_wr.ah)->attr;
++	ah_attr = swqe->ud_wr.attr;
+ 	ppd = ppd_from_ibp(ibp);
+ 
+ 	if (qp->ibqp.qp_num > 1) {
+@@ -135,8 +135,8 @@ static void ud_loopback(struct rvt_qp *sqp, struct rvt_swqe *swqe)
+ 	if (qp->ibqp.qp_num) {
+ 		u32 qkey;
+ 
+-		qkey = (int)swqe->ud_wr.remote_qkey < 0 ?
+-			sqp->qkey : swqe->ud_wr.remote_qkey;
++		qkey = (int)swqe->ud_wr.wr.remote_qkey < 0 ?
++			sqp->qkey : swqe->ud_wr.wr.remote_qkey;
+ 		if (unlikely(qkey != qp->qkey))
+ 			goto drop; /* silently drop per IBTA spec */
+ 	}
+@@ -240,7 +240,7 @@ static void ud_loopback(struct rvt_qp *sqp, struct rvt_swqe *swqe)
+ 	if (qp->ibqp.qp_type == IB_QPT_GSI || qp->ibqp.qp_type == IB_QPT_SMI) {
+ 		if (sqp->ibqp.qp_type == IB_QPT_GSI ||
+ 		    sqp->ibqp.qp_type == IB_QPT_SMI)
+-			wc.pkey_index = swqe->ud_wr.pkey_index;
++			wc.pkey_index = swqe->ud_wr.wr.pkey_index;
+ 		else
+ 			wc.pkey_index = sqp->s_pkey_index;
+ 	} else {
+@@ -283,20 +283,20 @@ static void hfi1_make_bth_deth(struct rvt_qp *qp, struct rvt_swqe *wqe,
+ 		bth0 |= IB_BTH_SOLICITED;
+ 	bth0 |= extra_bytes << 20;
+ 	if (qp->ibqp.qp_type == IB_QPT_GSI || qp->ibqp.qp_type == IB_QPT_SMI)
+-		*pkey = hfi1_get_pkey(ibp, wqe->ud_wr.pkey_index);
++		*pkey = hfi1_get_pkey(ibp, wqe->ud_wr.wr.pkey_index);
+ 	else
+ 		*pkey = hfi1_get_pkey(ibp, qp->s_pkey_index);
+ 	if (!bypass)
+ 		bth0 |= *pkey;
+ 	ohdr->bth[0] = cpu_to_be32(bth0);
+-	ohdr->bth[1] = cpu_to_be32(wqe->ud_wr.remote_qpn);
++	ohdr->bth[1] = cpu_to_be32(wqe->ud_wr.wr.remote_qpn);
+ 	ohdr->bth[2] = cpu_to_be32(mask_psn(wqe->psn));
+ 	/*
+ 	 * Qkeys with the high order bit set mean use the
+ 	 * qkey from the QP context instead of the WR (see 10.2.5).
+ 	 */
+-	ohdr->u.ud.deth[0] = cpu_to_be32((int)wqe->ud_wr.remote_qkey < 0 ?
+-					 qp->qkey : wqe->ud_wr.remote_qkey);
++	ohdr->u.ud.deth[0] = cpu_to_be32((int)wqe->ud_wr.wr.remote_qkey < 0 ?
++					 qp->qkey : wqe->ud_wr.wr.remote_qkey);
+ 	ohdr->u.ud.deth[1] = cpu_to_be32(qp->ibqp.qp_num);
+ }
+ 
+@@ -316,7 +316,7 @@ void hfi1_make_ud_req_9B(struct rvt_qp *qp, struct hfi1_pkt_state *ps,
+ 
+ 	ibp = to_iport(qp->ibqp.device, qp->port_num);
+ 	ppd = ppd_from_ibp(ibp);
+-	ah_attr = &ibah_to_rvtah(wqe->ud_wr.ah)->attr;
++	ah_attr = wqe->ud_wr.attr;
+ 
+ 	extra_bytes = -wqe->length & 3;
+ 	nwords = ((wqe->length + extra_bytes) >> 2) + SIZE_OF_CRC;
+@@ -380,7 +380,7 @@ void hfi1_make_ud_req_16B(struct rvt_qp *qp, struct hfi1_pkt_state *ps,
+ 	struct hfi1_pportdata *ppd;
+ 	struct hfi1_ibport *ibp;
+ 	u32 dlid, slid, nwords, extra_bytes;
+-	u32 dest_qp = wqe->ud_wr.remote_qpn;
++	u32 dest_qp = wqe->ud_wr.wr.remote_qpn;
+ 	u32 src_qp = qp->ibqp.qp_num;
+ 	u16 len, pkey;
+ 	u8 l4, sc5;
+@@ -388,7 +388,7 @@ void hfi1_make_ud_req_16B(struct rvt_qp *qp, struct hfi1_pkt_state *ps,
+ 
+ 	ibp = to_iport(qp->ibqp.device, qp->port_num);
+ 	ppd = ppd_from_ibp(ibp);
+-	ah_attr = &ibah_to_rvtah(wqe->ud_wr.ah)->attr;
++	ah_attr = wqe->ud_wr.attr;
+ 
+ 	/*
+ 	 * Build 16B Management Packet if either the destination
+@@ -450,7 +450,7 @@ void hfi1_make_ud_req_16B(struct rvt_qp *qp, struct hfi1_pkt_state *ps,
+ 
+ 	if (is_mgmt) {
+ 		l4 = OPA_16B_L4_FM;
+-		pkey = hfi1_get_pkey(ibp, wqe->ud_wr.pkey_index);
++		pkey = hfi1_get_pkey(ibp, wqe->ud_wr.wr.pkey_index);
+ 		hfi1_16B_set_qpn(&ps->s_txreq->phdr.hdr.opah.u.mgmt,
+ 				 dest_qp, src_qp);
+ 	} else {
+@@ -515,7 +515,7 @@ int hfi1_make_ud_req(struct rvt_qp *qp, struct hfi1_pkt_state *ps)
+ 	/* Construct the header. */
+ 	ibp = to_iport(qp->ibqp.device, qp->port_num);
+ 	ppd = ppd_from_ibp(ibp);
+-	ah_attr = &ibah_to_rvtah(wqe->ud_wr.ah)->attr;
++	ah_attr = wqe->ud_wr.attr;
+ 	priv->hdr_type = hfi1_get_hdr_type(ppd->lid, ah_attr);
+ 	if ((!hfi1_check_mcast(rdma_ah_get_dlid(ah_attr))) ||
+ 	    (rdma_ah_get_dlid(ah_attr) == be32_to_cpu(OPA_LID_PERMISSIVE))) {
+diff --git a/drivers/infiniband/hw/qib/qib_qp.c b/drivers/infiniband/hw/qib/qib_qp.c
+index a81905df2d0f..0e1d0d692891 100644
+--- a/drivers/infiniband/hw/qib/qib_qp.c
++++ b/drivers/infiniband/hw/qib/qib_qp.c
+@@ -1,5 +1,5 @@
+ /*
+- * Copyright (c) 2012 - 2017 Intel Corporation.  All rights reserved.
++ * Copyright (c) 2012 - 2019 Intel Corporation.  All rights reserved.
+  * Copyright (c) 2006 - 2012 QLogic Corporation.  * All rights reserved.
+  * Copyright (c) 2005, 2006 PathScale, Inc. All rights reserved.
+  *
+@@ -398,7 +398,7 @@ int qib_check_send_wqe(struct rvt_qp *qp,
+ 	case IB_QPT_SMI:
+ 	case IB_QPT_GSI:
+ 	case IB_QPT_UD:
+-		ah = ibah_to_rvtah(wqe->ud_wr.ah);
++		ah = ibah_to_rvtah(wqe->ud_wr.wr.ah);
+ 		if (wqe->length > (1 << ah->log_pmtu))
+ 			return -EINVAL;
+ 		/* progress hint */
+diff --git a/drivers/infiniband/hw/qib/qib_ud.c b/drivers/infiniband/hw/qib/qib_ud.c
+index 5cdedba2d164..1f35327c3376 100644
+--- a/drivers/infiniband/hw/qib/qib_ud.c
++++ b/drivers/infiniband/hw/qib/qib_ud.c
+@@ -1,4 +1,5 @@
+ /*
++ * Copyright (c) 2012 - 2019 Intel Corporation.  All rights reserved.
+  * Copyright (c) 2006, 2007, 2008, 2009 QLogic Corporation. All rights reserved.
+  * Copyright (c) 2005, 2006 PathScale, Inc. All rights reserved.
+  *
+@@ -63,7 +64,7 @@ static void qib_ud_loopback(struct rvt_qp *sqp, struct rvt_swqe *swqe)
+ 	enum ib_qp_type sqptype, dqptype;
+ 
+ 	rcu_read_lock();
+-	qp = rvt_lookup_qpn(rdi, &ibp->rvp, swqe->ud_wr.remote_qpn);
++	qp = rvt_lookup_qpn(rdi, &ibp->rvp, swqe->ud_wr.wr.remote_qpn);
+ 	if (!qp) {
+ 		ibp->rvp.n_pkt_drops++;
+ 		goto drop;
+@@ -80,7 +81,7 @@ static void qib_ud_loopback(struct rvt_qp *sqp, struct rvt_swqe *swqe)
+ 		goto drop;
+ 	}
+ 
+-	ah_attr = &ibah_to_rvtah(swqe->ud_wr.ah)->attr;
++	ah_attr = swqe->ud_wr.attr;
+ 	ppd = ppd_from_ibp(ibp);
+ 
+ 	if (qp->ibqp.qp_num > 1) {
+@@ -110,8 +111,8 @@ static void qib_ud_loopback(struct rvt_qp *sqp, struct rvt_swqe *swqe)
+ 	if (qp->ibqp.qp_num) {
+ 		u32 qkey;
+ 
+-		qkey = (int)swqe->ud_wr.remote_qkey < 0 ?
+-			sqp->qkey : swqe->ud_wr.remote_qkey;
++		qkey = (int)swqe->ud_wr.wr.remote_qkey < 0 ?
++			sqp->qkey : swqe->ud_wr.wr.remote_qkey;
+ 		if (unlikely(qkey != qp->qkey))
+ 			goto drop;
+ 	}
+@@ -203,7 +204,7 @@ static void qib_ud_loopback(struct rvt_qp *sqp, struct rvt_swqe *swqe)
+ 	wc.qp = &qp->ibqp;
+ 	wc.src_qp = sqp->ibqp.qp_num;
+ 	wc.pkey_index = qp->ibqp.qp_type == IB_QPT_GSI ?
+-		swqe->ud_wr.pkey_index : 0;
++		swqe->ud_wr.wr.pkey_index : 0;
+ 	wc.slid = ppd->lid | (rdma_ah_get_path_bits(ah_attr) &
+ 				((1 << ppd->lmc) - 1));
+ 	wc.sl = rdma_ah_get_sl(ah_attr);
+@@ -271,7 +272,7 @@ int qib_make_ud_req(struct rvt_qp *qp, unsigned long *flags)
+ 	/* Construct the header. */
+ 	ibp = to_iport(qp->ibqp.device, qp->port_num);
+ 	ppd = ppd_from_ibp(ibp);
+-	ah_attr = &ibah_to_rvtah(wqe->ud_wr.ah)->attr;
++	ah_attr = wqe->ud_wr.attr;
+ 	if (rdma_ah_get_dlid(ah_attr) >= be16_to_cpu(IB_MULTICAST_LID_BASE)) {
+ 		if (rdma_ah_get_dlid(ah_attr) !=
+ 				be16_to_cpu(IB_LID_PERMISSIVE))
+@@ -363,7 +364,7 @@ int qib_make_ud_req(struct rvt_qp *qp, unsigned long *flags)
+ 	bth0 |= extra_bytes << 20;
+ 	bth0 |= qp->ibqp.qp_type == IB_QPT_SMI ? QIB_DEFAULT_P_KEY :
+ 		qib_get_pkey(ibp, qp->ibqp.qp_type == IB_QPT_GSI ?
+-			     wqe->ud_wr.pkey_index : qp->s_pkey_index);
++			     wqe->ud_wr.wr.pkey_index : qp->s_pkey_index);
+ 	ohdr->bth[0] = cpu_to_be32(bth0);
+ 	/*
+ 	 * Use the multicast QP if the destination LID is a multicast LID.
+@@ -372,14 +373,14 @@ int qib_make_ud_req(struct rvt_qp *qp, unsigned long *flags)
+ 			be16_to_cpu(IB_MULTICAST_LID_BASE) &&
+ 		rdma_ah_get_dlid(ah_attr) != be16_to_cpu(IB_LID_PERMISSIVE) ?
+ 		cpu_to_be32(QIB_MULTICAST_QPN) :
+-		cpu_to_be32(wqe->ud_wr.remote_qpn);
++		cpu_to_be32(wqe->ud_wr.wr.remote_qpn);
+ 	ohdr->bth[2] = cpu_to_be32(wqe->psn & QIB_PSN_MASK);
+ 	/*
+ 	 * Qkeys with the high order bit set mean use the
+ 	 * qkey from the QP context instead of the WR (see 10.2.5).
+ 	 */
+-	ohdr->u.ud.deth[0] = cpu_to_be32((int)wqe->ud_wr.remote_qkey < 0 ?
+-					 qp->qkey : wqe->ud_wr.remote_qkey);
++	ohdr->u.ud.deth[0] = cpu_to_be32((int)wqe->ud_wr.wr.remote_qkey < 0 ?
++					 qp->qkey : wqe->ud_wr.wr.remote_qkey);
+ 	ohdr->u.ud.deth[1] = cpu_to_be32(qp->ibqp.qp_num);
+ 
+ done:
+* Unmerged path drivers/infiniband/sw/rdmavt/ah.c
+* Unmerged path drivers/infiniband/sw/rdmavt/qp.c
+diff --git a/include/rdma/rdma_vt.h b/include/rdma/rdma_vt.h
+index 5572d86b7a19..753836083a39 100644
+--- a/include/rdma/rdma_vt.h
++++ b/include/rdma/rdma_vt.h
+@@ -2,7 +2,7 @@
+ #define DEF_RDMA_VT_H
+ 
+ /*
+- * Copyright(c) 2016 - 2018 Intel Corporation.
++ * Copyright(c) 2016 - 2019 Intel Corporation.
+  *
+  * This file is provided under a dual BSD/GPLv2 license.  When using or
+  * redistributing this file, you may do so under either license.
+@@ -197,7 +197,6 @@ struct rvt_pd {
+ struct rvt_ah {
+ 	struct ib_ah ibah;
+ 	struct rdma_ah_attr attr;
+-	atomic_t refcount;
+ 	u8 vl;
+ 	u8 log_pmtu;
+ };
+diff --git a/include/rdma/rdmavt_qp.h b/include/rdma/rdmavt_qp.h
+index 84d0f36afc2f..2b68754dadef 100644
+--- a/include/rdma/rdmavt_qp.h
++++ b/include/rdma/rdmavt_qp.h
+@@ -2,7 +2,7 @@
+ #define DEF_RDMAVT_INCQP_H
+ 
+ /*
+- * Copyright(c) 2016 - 2018 Intel Corporation.
++ * Copyright(c) 2016 - 2019 Intel Corporation.
+  *
+  * This file is provided under a dual BSD/GPLv2 license.  When using or
+  * redistributing this file, you may do so under either license.
+@@ -156,6 +156,22 @@
+ #define RVT_SEND_RESERVE_USED           IB_SEND_RESERVED_START
+ #define RVT_SEND_COMPLETION_ONLY	(IB_SEND_RESERVED_START << 1)
+ 
++/**
++ * rvt_ud_wr - IB UD work plus AH cache
++ * @wr: valid IB work request
++ * @attr: pointer to an allocated AH attribute
++ *
++ * Special case the UD WR so we can keep track of the AH attributes.
++ *
++ * NOTE: This data structure is stricly ordered wr then attr. I.e the attr
++ * MUST come after wr.  The ib_ud_wr is sized and copied in rvt_post_one_wr.
++ * The copy assumes that wr is first.
++ */
++struct rvt_ud_wr {
++	struct ib_ud_wr wr;
++	struct rdma_ah_attr *attr;
++};
++
+ /*
+  * Send work request queue entry.
+  * The size of the sg_list is determined when the QP is created and stored
+@@ -164,7 +180,7 @@
+ struct rvt_swqe {
+ 	union {
+ 		struct ib_send_wr wr;   /* don't use wr.sg_list */
+-		struct ib_ud_wr ud_wr;
++		struct rvt_ud_wr ud_wr;
+ 		struct ib_reg_wr reg_wr;
+ 		struct ib_rdma_wr rdma_wr;
+ 		struct ib_atomic_wr atomic_wr;
+@@ -698,7 +714,7 @@ static inline void rvt_put_qp_swqe(struct rvt_qp *qp, struct rvt_swqe *wqe)
+ {
+ 	rvt_put_swqe(wqe);
+ 	if (qp->allowed_ops == IB_OPCODE_UD)
+-		atomic_dec(&ibah_to_rvtah(wqe->ud_wr.ah)->refcount);
++		rdma_destroy_ah_attr(wqe->ud_wr.attr);
+ }
+ 
+ /**
