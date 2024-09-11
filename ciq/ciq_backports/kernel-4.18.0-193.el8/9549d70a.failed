@@ -1,0 +1,304 @@
+s390/qeth: add xmit_more support for IQD devices
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-193.el8
+commit-author Julian Wiedmann <jwi@linux.ibm.com>
+commit 9549d70a2d71526b8dc41cc0b255219ba46e5bf7
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-193.el8/9549d70a.failed
+
+IQD devices offer limited support for bulking: all frames in a TX buffer
+need to have the same target. qeth_iqd_may_bulk() implements this
+constraint, and allows us to defer the TX doorbell until
+(a) the buffer is full (since each buffer needs its own doorbell), or
+(b) the entire TX queue is full, or
+(b) we reached the BQL limit.
+
+	Signed-off-by: Julian Wiedmann <jwi@linux.ibm.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 9549d70a2d71526b8dc41cc0b255219ba46e5bf7)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/s390/net/qeth_core.h
+#	drivers/s390/net/qeth_core_main.c
+diff --cc drivers/s390/net/qeth_core.h
+index dcbcb3b4d38f,e4b55f9aa062..000000000000
+--- a/drivers/s390/net/qeth_core.h
++++ b/drivers/s390/net/qeth_core.h
+@@@ -480,8 -528,36 +502,15 @@@ struct qeth_qdio_out_q 
+  	atomic_t used_buffers;
+  	/* indicates whether PCI flag must be set (or if one is outstanding) */
+  	atomic_t set_pci_flags_count;
+++<<<<<<< HEAD
+++=======
++ 	struct napi_struct napi;
++ 	struct timer_list timer;
++ 	struct qeth_hdr *prev_hdr;
++ 	u8 bulk_start;
+++>>>>>>> 9549d70a2d71 (s390/qeth: add xmit_more support for IQD devices)
+  };
+  
+ -#define qeth_for_each_output_queue(card, q, i)		\
+ -	for (i = 0; i < card->qdio.no_out_queues &&	\
+ -		    (q = card->qdio.out_qs[i]); i++)
+ -
+ -#define	qeth_napi_to_out_queue(n) container_of(n, struct qeth_qdio_out_q, napi)
+ -
+ -static inline void qeth_tx_arm_timer(struct qeth_qdio_out_q *queue)
+ -{
+ -	if (timer_pending(&queue->timer))
+ -		return;
+ -	mod_timer(&queue->timer, usecs_to_jiffies(QETH_TX_TIMER_USECS) +
+ -				 jiffies);
+ -}
+ -
+ -static inline bool qeth_out_queue_is_full(struct qeth_qdio_out_q *queue)
+ -{
+ -	return atomic_read(&queue->used_buffers) >= QDIO_MAX_BUFFERS_PER_Q;
+ -}
+ -
+ -static inline bool qeth_out_queue_is_empty(struct qeth_qdio_out_q *queue)
+ -{
+ -	return atomic_read(&queue->used_buffers) == 0;
+ -}
+ -
+  struct qeth_qdio_info {
+  	atomic_t state;
+  	/* input */
+diff --cc drivers/s390/net/qeth_core_main.c
+index a0c5702815af,8b4ea5f2832b..000000000000
+--- a/drivers/s390/net/qeth_core_main.c
++++ b/drivers/s390/net/qeth_core_main.c
+@@@ -2784,14 -2665,18 +2784,29 @@@ int qeth_init_qdio_queues(struct qeth_c
+  
+  	/* outbound queue */
+  	for (i = 0; i < card->qdio.no_out_queues; ++i) {
+++<<<<<<< HEAD
+ +		qdio_reset_buffers(card->qdio.out_qs[i]->qdio_bufs,
+ +				   QDIO_MAX_BUFFERS_PER_Q);
+ +		card->qdio.out_qs[i]->next_buf_to_fill = 0;
+ +		card->qdio.out_qs[i]->do_pack = 0;
+ +		atomic_set(&card->qdio.out_qs[i]->used_buffers, 0);
+ +		atomic_set(&card->qdio.out_qs[i]->set_pci_flags_count, 0);
+ +		atomic_set(&card->qdio.out_qs[i]->state,
+ +			   QETH_OUT_Q_UNLOCKED);
+++=======
++ 		struct qeth_qdio_out_q *queue = card->qdio.out_qs[i];
++ 
++ 		qdio_reset_buffers(queue->qdio_bufs, QDIO_MAX_BUFFERS_PER_Q);
++ 		queue->max_elements = QETH_MAX_BUFFER_ELEMENTS(card);
++ 		queue->next_buf_to_fill = 0;
++ 		queue->do_pack = 0;
++ 		queue->prev_hdr = NULL;
++ 		queue->bulk_start = 0;
++ 		atomic_set(&queue->used_buffers, 0);
++ 		atomic_set(&queue->set_pci_flags_count, 0);
++ 		atomic_set(&queue->state, QETH_OUT_Q_UNLOCKED);
++ 		netdev_tx_reset_queue(netdev_get_tx_queue(card->dev, i));
+++>>>>>>> 9549d70a2d71 (s390/qeth: add xmit_more support for IQD devices)
+  	}
+  	return 0;
+  }
+@@@ -3433,10 -3314,16 +3448,18 @@@ static void qeth_flush_buffers(struct q
+  		qeth_schedule_recovery(queue->card);
+  		return;
+  	}
+ +	if (queue->card->options.performance_stats)
+ +		queue->card->perf_stats.bufs_sent += count;
+  }
+  
++ static void qeth_flush_queue(struct qeth_qdio_out_q *queue)
++ {
++ 	qeth_flush_buffers(queue, queue->bulk_start, 1);
++ 
++ 	queue->bulk_start = QDIO_BUFNR(queue->bulk_start + 1);
++ 	queue->prev_hdr = NULL;
++ }
++ 
+  static void qeth_check_outbound_queue(struct qeth_qdio_out_q *queue)
+  {
+  	int index;
+@@@ -3895,10 -3773,9 +3941,16 @@@ static unsigned int __qeth_fill_buffer(
+   * @offset:	when mapping the skb, start at skb->data + offset
+   * @hd_len:	if > 0, build a dedicated header element of this size
+   */
+++<<<<<<< HEAD
+ +static int qeth_fill_buffer(struct qeth_qdio_out_q *queue,
+ +			    struct qeth_qdio_out_buffer *buf,
+ +			    struct sk_buff *skb, struct qeth_hdr *hdr,
+ +			    unsigned int offset, unsigned int hd_len)
+++=======
++ static unsigned int qeth_fill_buffer(struct qeth_qdio_out_buffer *buf,
++ 				     struct sk_buff *skb, struct qeth_hdr *hdr,
++ 				     unsigned int offset, unsigned int hd_len)
+++>>>>>>> 9549d70a2d71 (s390/qeth: add xmit_more support for IQD devices)
+  {
+  	struct qdio_buffer *buffer = buf->buffer;
+  	bool is_first_elem = true;
+@@@ -3918,43 -3795,64 +3970,98 @@@
+  		buf->next_element_to_fill++;
+  	}
+  
+++<<<<<<< HEAD
+ +	__qeth_fill_buffer(skb, buf, is_first_elem, offset);
+ +
+ +	if (!queue->do_pack) {
+ +		QETH_CARD_TEXT(queue->card, 6, "fillbfnp");
+ +	} else {
+ +		QETH_CARD_TEXT(queue->card, 6, "fillbfpa");
+ +		if (queue->card->options.performance_stats)
+ +			queue->card->perf_stats.skbs_sent_pack++;
+ +
+ +		/* If the buffer still has free elements, keep using it. */
+ +		if (buf->next_element_to_fill <
+ +		    QETH_MAX_BUFFER_ELEMENTS(queue->card))
+ +			return 0;
+ +	}
+ +
+ +	/* flush out the buffer */
+ +	atomic_set(&buf->state, QETH_QDIO_BUF_PRIMED);
+ +	queue->next_buf_to_fill = (queue->next_buf_to_fill + 1) %
+ +				  QDIO_MAX_BUFFERS_PER_Q;
+ +	return 1;
+++=======
++ 	return __qeth_fill_buffer(skb, buf, is_first_elem, offset);
+++>>>>>>> 9549d70a2d71 (s390/qeth: add xmit_more support for IQD devices)
+  }
+  
+- static int qeth_do_send_packet_fast(struct qeth_qdio_out_q *queue,
+- 				    struct sk_buff *skb, struct qeth_hdr *hdr,
+- 				    unsigned int offset, unsigned int hd_len)
++ static int __qeth_xmit(struct qeth_card *card, struct qeth_qdio_out_q *queue,
++ 		       struct sk_buff *skb, unsigned int elements,
++ 		       struct qeth_hdr *hdr, unsigned int offset,
++ 		       unsigned int hd_len)
+  {
+++<<<<<<< HEAD
+ +	int index = queue->next_buf_to_fill;
+ +	struct qeth_qdio_out_buffer *buffer = queue->bufs[index];
+++=======
++ 	struct qeth_qdio_out_buffer *buffer = queue->bufs[queue->bulk_start];
++ 	unsigned int bytes = qdisc_pkt_len(skb);
++ 	unsigned int next_element;
++ 	struct netdev_queue *txq;
++ 	bool stopped = false;
++ 	bool flush;
++ 
++ 	txq = netdev_get_tx_queue(card->dev, skb_get_queue_mapping(skb));
+++>>>>>>> 9549d70a2d71 (s390/qeth: add xmit_more support for IQD devices)
+  
+ -	/* Just a sanity check, the wake/stop logic should ensure that we always
+ -	 * get a free buffer.
+ +	/*
+ +	 * check if buffer is empty to make sure that we do not 'overtake'
+ +	 * ourselves and try to fill a buffer that is already primed
+  	 */
+  	if (atomic_read(&buffer->state) != QETH_QDIO_BUF_EMPTY)
+  		return -EBUSY;
+++<<<<<<< HEAD
+ +	qeth_fill_buffer(queue, buffer, skb, hdr, offset, hd_len);
+ +	qeth_flush_buffers(queue, index, 1);
+++=======
++ 
++ 	if ((buffer->next_element_to_fill + elements > queue->max_elements) ||
++ 	    !qeth_iqd_may_bulk(queue, buffer, skb, hdr)) {
++ 		atomic_set(&buffer->state, QETH_QDIO_BUF_PRIMED);
++ 		qeth_flush_queue(queue);
++ 		buffer = queue->bufs[queue->bulk_start];
++ 
++ 		/* Sanity-check again: */
++ 		if (atomic_read(&buffer->state) != QETH_QDIO_BUF_EMPTY)
++ 			return -EBUSY;
++ 	}
++ 
++ 	if (buffer->next_element_to_fill == 0 &&
++ 	    atomic_inc_return(&queue->used_buffers) >= QDIO_MAX_BUFFERS_PER_Q) {
++ 		/* If a TX completion happens right _here_ and misses to wake
++ 		 * the txq, then our re-check below will catch the race.
++ 		 */
++ 		QETH_TXQ_STAT_INC(queue, stopped);
++ 		netif_tx_stop_queue(txq);
++ 		stopped = true;
++ 	}
++ 
++ 	next_element = qeth_fill_buffer(buffer, skb, hdr, offset, hd_len);
++ 	buffer->bytes += bytes;
++ 	queue->prev_hdr = hdr;
++ 
++ 	flush = __netdev_tx_sent_queue(txq, bytes,
++ 				       !stopped && netdev_xmit_more());
++ 
++ 	if (flush || next_element >= queue->max_elements) {
++ 		atomic_set(&buffer->state, QETH_QDIO_BUF_PRIMED);
++ 		qeth_flush_queue(queue);
++ 	}
++ 
++ 	if (stopped && !qeth_out_queue_is_full(queue))
++ 		netif_tx_start_queue(txq);
+++>>>>>>> 9549d70a2d71 (s390/qeth: add xmit_more support for IQD devices)
+  	return 0;
+  }
+  
+@@@ -3964,6 -3862,9 +4071,12 @@@ int qeth_do_send_packet(struct qeth_car
+  			int elements_needed)
+  {
+  	struct qeth_qdio_out_buffer *buffer;
+++<<<<<<< HEAD
+++=======
++ 	unsigned int next_element;
++ 	struct netdev_queue *txq;
++ 	bool stopped = false;
+++>>>>>>> 9549d70a2d71 (s390/qeth: add xmit_more support for IQD devices)
+  	int start_index;
+  	int flush_count = 0;
+  	int do_pack = 0;
+@@@ -4011,8 -3915,27 +4124,32 @@@
+  		}
+  	}
+  
+++<<<<<<< HEAD
+ +	flush_count += qeth_fill_buffer(queue, buffer, skb, hdr, offset,
+ +					hd_len);
+++=======
++ 	if (buffer->next_element_to_fill == 0 &&
++ 	    atomic_inc_return(&queue->used_buffers) >= QDIO_MAX_BUFFERS_PER_Q) {
++ 		/* If a TX completion happens right _here_ and misses to wake
++ 		 * the txq, then our re-check below will catch the race.
++ 		 */
++ 		QETH_TXQ_STAT_INC(queue, stopped);
++ 		netif_tx_stop_queue(txq);
++ 		stopped = true;
++ 	}
++ 
++ 	next_element = qeth_fill_buffer(buffer, skb, hdr, offset, hd_len);
++ 
++ 	if (queue->do_pack)
++ 		QETH_TXQ_STAT_INC(queue, skbs_pack);
++ 	if (!queue->do_pack || stopped || next_element >= queue->max_elements) {
++ 		flush_count++;
++ 		atomic_set(&buffer->state, QETH_QDIO_BUF_PRIMED);
++ 		queue->next_buf_to_fill = (queue->next_buf_to_fill + 1) %
++ 					  QDIO_MAX_BUFFERS_PER_Q;
++ 	}
++ 
+++>>>>>>> 9549d70a2d71 (s390/qeth: add xmit_more support for IQD devices)
+  	if (flush_count)
+  		qeth_flush_buffers(queue, start_index, flush_count);
+  	else if (!atomic_read(&queue->set_pci_flags_count))
+@@@ -4106,10 -4030,9 +4243,10 @@@ int qeth_xmit(struct qeth_card *card, s
+  		qeth_fill_tso_ext((struct qeth_hdr_tso *) hdr,
+  				  frame_len - proto_len, skb, proto_len);
+  
+ +	is_sg = skb_is_nonlinear(skb);
+  	if (IS_IQD(card)) {
+- 		rc = qeth_do_send_packet_fast(queue, skb, hdr, data_offset,
+- 					      hd_len);
++ 		rc = __qeth_xmit(card, queue, skb, elements, hdr, data_offset,
++ 				 hd_len);
+  	} else {
+  		/* TODO: drop skb_orphan() once TX completion is fast enough */
+  		skb_orphan(skb);
+* Unmerged path drivers/s390/net/qeth_core.h
+* Unmerged path drivers/s390/net/qeth_core_main.c
