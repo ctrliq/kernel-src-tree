@@ -1,0 +1,328 @@
+xfs: validate extsz hints against rt extent size when rtinherit is set
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-394.el8
+commit-author Darrick J. Wong <djwong@kernel.org>
+commit 603f000b15f21ce8932f76689c7aa9fe58261cf5
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-394.el8/603f000b.failed
+
+The RTINHERIT bit can be set on a directory so that newly created
+regular files will have the REALTIME bit set to store their data on the
+realtime volume.  If an extent size hint (and EXTSZINHERIT) are set on
+the directory, the hint will also be copied into the new file.
+
+As pointed out in previous patches, for realtime files we require the
+extent size hint be an integer multiple of the realtime extent, but we
+don't perform the same validation on a directory with both RTINHERIT and
+EXTSZINHERIT set, even though the only use-case of that combination is
+to propagate extent size hints into new realtime files.  This leads to
+inode corruption errors when the bad values are propagated.
+
+Because there may be existing filesystems with such a configuration, we
+cannot simply amend the inode verifier to trip on these directories and
+call it a day because that will cause previously "working" filesystems
+to start throwing errors abruptly.  Note that it's valid to have
+directories with rtinherit set even if there is no realtime volume, in
+which case the problem does not manifest because rtinherit is ignored if
+there's no realtime device; and it's possible that someone set the flag,
+crashed, repaired the filesystem (which clears the hint on the realtime
+file) and continued.
+
+Therefore, mitigate this issue in several ways: First, if we try to
+write out an inode with both rtinherit/extszinherit set and an unaligned
+extent size hint, turn off the hint to correct the error.  Second, if
+someone tries to misconfigure a directory via the fssetxattr ioctl, fail
+the ioctl.  Third, reverify both extent size hint values when we
+propagate heritable inode attributes from parent to child, to prevent
+misconfigurations from spreading.
+
+	Signed-off-by: Darrick J. Wong <djwong@kernel.org>
+	Reviewed-by: Carlos Maiolino <cmaiolino@redhat.com>
+	Reviewed-by: Brian Foster <bfoster@redhat.com>
+(cherry picked from commit 603f000b15f21ce8932f76689c7aa9fe58261cf5)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/xfs/xfs_inode.c
+#	fs/xfs/xfs_ioctl.c
+diff --cc fs/xfs/xfs_inode.c
+index 663e877a1d44,e4c2da4566f1..000000000000
+--- a/fs/xfs/xfs_inode.c
++++ b/fs/xfs/xfs_inode.c
+@@@ -708,42 -694,60 +709,64 @@@ xfs_inode_inherit_flags
+  	umode_t			mode = VFS_I(ip)->i_mode;
+  
+  	if (S_ISDIR(mode)) {
+ -		if (pip->i_diflags & XFS_DIFLAG_RTINHERIT)
+ +		if (pip->i_d.di_flags & XFS_DIFLAG_RTINHERIT)
+  			di_flags |= XFS_DIFLAG_RTINHERIT;
+ -		if (pip->i_diflags & XFS_DIFLAG_EXTSZINHERIT) {
+ +		if (pip->i_d.di_flags & XFS_DIFLAG_EXTSZINHERIT) {
+  			di_flags |= XFS_DIFLAG_EXTSZINHERIT;
+ -			ip->i_extsize = pip->i_extsize;
+ +			ip->i_d.di_extsize = pip->i_d.di_extsize;
+  		}
+ -		if (pip->i_diflags & XFS_DIFLAG_PROJINHERIT)
+ +		if (pip->i_d.di_flags & XFS_DIFLAG_PROJINHERIT)
+  			di_flags |= XFS_DIFLAG_PROJINHERIT;
+  	} else if (S_ISREG(mode)) {
+ -		if ((pip->i_diflags & XFS_DIFLAG_RTINHERIT) &&
+ +		if ((pip->i_d.di_flags & XFS_DIFLAG_RTINHERIT) &&
+  		    xfs_sb_version_hasrealtime(&ip->i_mount->m_sb))
+  			di_flags |= XFS_DIFLAG_REALTIME;
+ -		if (pip->i_diflags & XFS_DIFLAG_EXTSZINHERIT) {
+ +		if (pip->i_d.di_flags & XFS_DIFLAG_EXTSZINHERIT) {
+  			di_flags |= XFS_DIFLAG_EXTSIZE;
+ -			ip->i_extsize = pip->i_extsize;
+ +			ip->i_d.di_extsize = pip->i_d.di_extsize;
+  		}
+  	}
+ -	if ((pip->i_diflags & XFS_DIFLAG_NOATIME) &&
+ +	if ((pip->i_d.di_flags & XFS_DIFLAG_NOATIME) &&
+  	    xfs_inherit_noatime)
+  		di_flags |= XFS_DIFLAG_NOATIME;
+ -	if ((pip->i_diflags & XFS_DIFLAG_NODUMP) &&
+ +	if ((pip->i_d.di_flags & XFS_DIFLAG_NODUMP) &&
+  	    xfs_inherit_nodump)
+  		di_flags |= XFS_DIFLAG_NODUMP;
+ -	if ((pip->i_diflags & XFS_DIFLAG_SYNC) &&
+ +	if ((pip->i_d.di_flags & XFS_DIFLAG_SYNC) &&
+  	    xfs_inherit_sync)
+  		di_flags |= XFS_DIFLAG_SYNC;
+ -	if ((pip->i_diflags & XFS_DIFLAG_NOSYMLINKS) &&
+ +	if ((pip->i_d.di_flags & XFS_DIFLAG_NOSYMLINKS) &&
+  	    xfs_inherit_nosymlinks)
+  		di_flags |= XFS_DIFLAG_NOSYMLINKS;
+ -	if ((pip->i_diflags & XFS_DIFLAG_NODEFRAG) &&
+ +	if ((pip->i_d.di_flags & XFS_DIFLAG_NODEFRAG) &&
+  	    xfs_inherit_nodefrag)
+  		di_flags |= XFS_DIFLAG_NODEFRAG;
+ -	if (pip->i_diflags & XFS_DIFLAG_FILESTREAM)
+ +	if (pip->i_d.di_flags & XFS_DIFLAG_FILESTREAM)
+  		di_flags |= XFS_DIFLAG_FILESTREAM;
+  
+++<<<<<<< HEAD
+ +	ip->i_d.di_flags |= di_flags;
+++=======
++ 	ip->i_diflags |= di_flags;
++ 
++ 	/*
++ 	 * Inode verifiers on older kernels only check that the extent size
++ 	 * hint is an integer multiple of the rt extent size on realtime files.
++ 	 * They did not check the hint alignment on a directory with both
++ 	 * rtinherit and extszinherit flags set.  If the misaligned hint is
++ 	 * propagated from a directory into a new realtime file, new file
++ 	 * allocations will fail due to math errors in the rt allocator and/or
++ 	 * trip the verifiers.  Validate the hint settings in the new file so
++ 	 * that we don't let broken hints propagate.
++ 	 */
++ 	failaddr = xfs_inode_validate_extsize(ip->i_mount, ip->i_extsize,
++ 			VFS_I(ip)->i_mode, ip->i_diflags);
++ 	if (failaddr) {
++ 		ip->i_diflags &= ~(XFS_DIFLAG_EXTSIZE |
++ 				   XFS_DIFLAG_EXTSZINHERIT);
++ 		ip->i_extsize = 0;
++ 	}
+++>>>>>>> 603f000b15f2 (xfs: validate extsz hints against rt extent size when rtinherit is set)
+  }
+  
+  /* Propagate di_flags2 from a parent inode to a child inode. */
+@@@ -752,12 -756,22 +775,31 @@@ xfs_inode_inherit_flags2
+  	struct xfs_inode	*ip,
+  	const struct xfs_inode	*pip)
+  {
+++<<<<<<< HEAD
+ +	if (pip->i_d.di_flags2 & XFS_DIFLAG2_COWEXTSIZE) {
+ +		ip->i_d.di_flags2 |= XFS_DIFLAG2_COWEXTSIZE;
+ +		ip->i_d.di_cowextsize = pip->i_d.di_cowextsize;
+ +	}
+ +	if (pip->i_d.di_flags2 & XFS_DIFLAG2_DAX)
+ +		ip->i_d.di_flags2 |= XFS_DIFLAG2_DAX;
+++=======
++ 	xfs_failaddr_t		failaddr;
++ 
++ 	if (pip->i_diflags2 & XFS_DIFLAG2_COWEXTSIZE) {
++ 		ip->i_diflags2 |= XFS_DIFLAG2_COWEXTSIZE;
++ 		ip->i_cowextsize = pip->i_cowextsize;
++ 	}
++ 	if (pip->i_diflags2 & XFS_DIFLAG2_DAX)
++ 		ip->i_diflags2 |= XFS_DIFLAG2_DAX;
++ 
++ 	/* Don't let invalid cowextsize hints propagate. */
++ 	failaddr = xfs_inode_validate_cowextsize(ip->i_mount, ip->i_cowextsize,
++ 			VFS_I(ip)->i_mode, ip->i_diflags, ip->i_diflags2);
++ 	if (failaddr) {
++ 		ip->i_diflags2 &= ~XFS_DIFLAG2_COWEXTSIZE;
++ 		ip->i_cowextsize = 0;
++ 	}
+++>>>>>>> 603f000b15f2 (xfs: validate extsz hints against rt extent size when rtinherit is set)
+  }
+  
+  /*
+diff --cc fs/xfs/xfs_ioctl.c
+index 0b05f7dd7822,1fe4c1fc0aea..000000000000
+--- a/fs/xfs/xfs_ioctl.c
++++ b/fs/xfs/xfs_ioctl.c
+@@@ -1335,53 -1273,45 +1335,75 @@@ out_error
+  static int
+  xfs_ioctl_setattr_check_extsize(
+  	struct xfs_inode	*ip,
+ -	struct fileattr		*fa)
+ +	struct fsxattr		*fa)
+  {
+  	struct xfs_mount	*mp = ip->i_mount;
+ -	xfs_failaddr_t		failaddr;
+ -	uint16_t		new_diflags;
+ -
+ -	if (!fa->fsx_valid)
+ -		return 0;
+ +	xfs_extlen_t		size;
+ +	xfs_fsblock_t		extsize_fsb;
+  
+  	if (S_ISREG(VFS_I(ip)->i_mode) && ip->i_df.if_nextents &&
+ -	    XFS_FSB_TO_B(mp, ip->i_extsize) != fa->fsx_extsize)
+ +	    ((ip->i_d.di_extsize << mp->m_sb.sb_blocklog) != fa->fsx_extsize))
+  		return -EINVAL;
+  
+ -	if (fa->fsx_extsize & mp->m_blockmask)
+ +	if (fa->fsx_extsize == 0)
+ +		return 0;
+ +
+ +	extsize_fsb = XFS_B_TO_FSB(mp, fa->fsx_extsize);
+ +	if (extsize_fsb > MAXEXTLEN)
+  		return -EINVAL;
+  
+ -	new_diflags = xfs_flags2diflags(ip, fa->fsx_xflags);
+ +	if (XFS_IS_REALTIME_INODE(ip) ||
+ +	    (fa->fsx_xflags & FS_XFLAG_REALTIME)) {
+ +		size = mp->m_sb.sb_rextsize << mp->m_sb.sb_blocklog;
+ +	} else {
+ +		size = mp->m_sb.sb_blocksize;
+ +		if (extsize_fsb > mp->m_sb.sb_agblocks / 2)
+ +			return -EINVAL;
+ +	}
+ +
+++<<<<<<< HEAD
+ +	if (fa->fsx_extsize % size)
+ +		return -EINVAL;
+  
+ +	return 0;
+++=======
++ 	/*
++ 	 * Inode verifiers on older kernels don't check that the extent size
++ 	 * hint is an integer multiple of the rt extent size on a directory
++ 	 * with both rtinherit and extszinherit flags set.  Don't let sysadmins
++ 	 * misconfigure directories.
++ 	 */
++ 	if ((new_diflags & XFS_DIFLAG_RTINHERIT) &&
++ 	    (new_diflags & XFS_DIFLAG_EXTSZINHERIT)) {
++ 		unsigned int	rtextsize_bytes;
++ 
++ 		rtextsize_bytes = XFS_FSB_TO_B(mp, mp->m_sb.sb_rextsize);
++ 		if (fa->fsx_extsize % rtextsize_bytes)
++ 			return -EINVAL;
++ 	}
++ 
++ 	failaddr = xfs_inode_validate_extsize(ip->i_mount,
++ 			XFS_B_TO_FSB(mp, fa->fsx_extsize),
++ 			VFS_I(ip)->i_mode, new_diflags);
++ 	return failaddr != NULL ? -EINVAL : 0;
+++>>>>>>> 603f000b15f2 (xfs: validate extsz hints against rt extent size when rtinherit is set)
+  }
+  
+ +/*
+ + * CoW extent size hint validation rules are:
+ + *
+ + * 1. CoW extent size hint can only be set if reflink is enabled on the fs.
+ + *    The inode does not have to have any shared blocks, but it must be a v3.
+ + * 2. FS_XFLAG_COWEXTSIZE is only valid for directories and regular files;
+ + *    for a directory, the hint is propagated to new files.
+ + * 3. Can be changed on files & directories at any time.
+ + * 4. CoW extsize hint of 0 turns off hints, clears inode flags.
+ + * 5. Extent size must be a multiple of the appropriate block size.
+ + * 6. The extent size hint must be limited to half the AG size to avoid
+ + *    alignment extending the extent beyond the limits of the AG.
+ + *
+ + * Please keep this function in sync with xfs_scrub_inode_cowextsize.
+ + */
+  static int
+  xfs_ioctl_setattr_check_cowextsize(
+  	struct xfs_inode	*ip,
+diff --git a/fs/xfs/libxfs/xfs_inode_buf.c b/fs/xfs/libxfs/xfs_inode_buf.c
+index 671aeb012e3f..2d4c13f68707 100644
+--- a/fs/xfs/libxfs/xfs_inode_buf.c
++++ b/fs/xfs/libxfs/xfs_inode_buf.c
+@@ -581,6 +581,28 @@ xfs_inode_validate_extsize(
+ 	inherit_flag = (flags & XFS_DIFLAG_EXTSZINHERIT);
+ 	extsize_bytes = XFS_FSB_TO_B(mp, extsize);
+ 
++	/*
++	 * This comment describes a historic gap in this verifier function.
++	 *
++	 * On older kernels, the extent size hint verifier doesn't check that
++	 * the extent size hint is an integer multiple of the realtime extent
++	 * size on a directory with both RTINHERIT and EXTSZINHERIT flags set.
++	 * The verifier has always enforced the alignment rule for regular
++	 * files with the REALTIME flag set.
++	 *
++	 * If a directory with a misaligned extent size hint is allowed to
++	 * propagate that hint into a new regular realtime file, the result
++	 * is that the inode cluster buffer verifier will trigger a corruption
++	 * shutdown the next time it is run.
++	 *
++	 * Unfortunately, there could be filesystems with these misconfigured
++	 * directories in the wild, so we cannot add a check to this verifier
++	 * at this time because that will result a new source of directory
++	 * corruption errors when reading an existing filesystem.  Instead, we
++	 * permit the misconfiguration to pass through the verifiers so that
++	 * callers of this function can correct and mitigate externally.
++	 */
++
+ 	if (rt_flag)
+ 		blocksize_bytes = mp->m_sb.sb_rextsize << mp->m_sb.sb_blocklog;
+ 	else
+diff --git a/fs/xfs/libxfs/xfs_trans_inode.c b/fs/xfs/libxfs/xfs_trans_inode.c
+index 4f02cb439ab5..efa389ea53af 100644
+--- a/fs/xfs/libxfs/xfs_trans_inode.c
++++ b/fs/xfs/libxfs/xfs_trans_inode.c
+@@ -142,6 +142,23 @@ xfs_trans_log_inode(
+ 		flags |= XFS_ILOG_CORE;
+ 	}
+ 
++	/*
++	 * Inode verifiers on older kernels don't check that the extent size
++	 * hint is an integer multiple of the rt extent size on a directory
++	 * with both rtinherit and extszinherit flags set.  If we're logging a
++	 * directory that is misconfigured in this way, clear the hint.
++	 */
++	if ((ip->i_diflags & XFS_DIFLAG_RTINHERIT) &&
++	    (ip->i_diflags & XFS_DIFLAG_EXTSZINHERIT) &&
++	    (ip->i_extsize % ip->i_mount->m_sb.sb_rextsize) > 0) {
++		xfs_info_once(ip->i_mount,
++	"Correcting misaligned extent size hint in inode 0x%llx.", ip->i_ino);
++		ip->i_diflags &= ~(XFS_DIFLAG_EXTSIZE |
++				   XFS_DIFLAG_EXTSZINHERIT);
++		ip->i_extsize = 0;
++		flags |= XFS_ILOG_CORE;
++	}
++
+ 	/*
+ 	 * Record the specific change for fdatasync optimisation. This allows
+ 	 * fdatasync to skip log forces for inodes that are only timestamp
+* Unmerged path fs/xfs/xfs_inode.c
+* Unmerged path fs/xfs/xfs_ioctl.c
+diff --git a/fs/xfs/xfs_message.h b/fs/xfs/xfs_message.h
+index 4d9bd6bb63ca..930e93e6d6ef 100644
+--- a/fs/xfs/xfs_message.h
++++ b/fs/xfs/xfs_message.h
+@@ -73,6 +73,8 @@ do {									\
+ 	xfs_printk_once(xfs_warn, dev, fmt, ##__VA_ARGS__)
+ #define xfs_notice_once(dev, fmt, ...)				\
+ 	xfs_printk_once(xfs_notice, dev, fmt, ##__VA_ARGS__)
++#define xfs_info_once(dev, fmt, ...)				\
++	xfs_printk_once(xfs_info, dev, fmt, ##__VA_ARGS__)
+ 
+ void assfail(struct xfs_mount *mp, char *expr, char *f, int l);
+ void asswarn(struct xfs_mount *mp, char *expr, char *f, int l);
