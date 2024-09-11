@@ -1,0 +1,101 @@
+nvme: don't bother to look up a namespace for controller ioctls
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-358.el8
+commit-author Christoph Hellwig <hch@lst.de>
+commit 3557a4409701a132e8f86ad234ac8cf6e97b052e
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-358.el8/3557a440.failed
+
+Don't bother to look up a namespace just to drop if after retreiving the
+controller for the multipath case.  Just look up a live controller for
+the subsystem directly.
+
+	Signed-off-by: Christoph Hellwig <hch@lst.de>
+	Reviewed-by: Keith Busch <kbusch@kernel.org>
+	Reviewed-by: Javier González <javier.gonz@samsung.com>
+(cherry picked from commit 3557a4409701a132e8f86ad234ac8cf6e97b052e)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/nvme/host/core.c
+diff --cc drivers/nvme/host/core.c
+index bf3ac9d14052,7710cf59afa9..000000000000
+--- a/drivers/nvme/host/core.c
++++ b/drivers/nvme/host/core.c
+@@@ -2449,12 -2336,68 +2449,71 @@@ static void nvme_ns_head_release(struc
+  	nvme_put_ns_head(disk->private_data);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static struct nvme_ctrl *nvme_find_get_live_ctrl(struct nvme_subsystem *subsys)
++ {
++ 	struct nvme_ctrl *ctrl;
++ 	int ret;
++ 
++ 	ret = mutex_lock_killable(&nvme_subsystems_lock);
++ 	if (ret)
++ 		return ERR_PTR(ret);
++ 	list_for_each_entry(ctrl, &subsys->ctrls, subsys_entry) {
++ 		if (ctrl->state == NVME_CTRL_LIVE)
++ 			goto found;
++ 	}
++ 	mutex_unlock(&nvme_subsystems_lock);
++ 	return ERR_PTR(-EWOULDBLOCK);
++ found:
++ 	nvme_get_ctrl(ctrl);
++ 	mutex_unlock(&nvme_subsystems_lock);
++ 	return ctrl;
++ }
++ 
++ static int nvme_ns_head_ctrl_ioctl(struct nvme_ns_head *head,
++ 		unsigned int cmd, void __user *argp)
++ {
++ 	struct nvme_ctrl *ctrl = nvme_find_get_live_ctrl(head->subsys);
++ 	int ret;
++ 
++ 	if (IS_ERR(ctrl))
++ 		return PTR_ERR(ctrl);
++ 	ret = nvme_ctrl_ioctl(ctrl, cmd, argp);
++ 	nvme_put_ctrl(ctrl);
++ 	return ret;
++ }
++ 
++ static int nvme_ns_head_ns_ioctl(struct nvme_ns_head *head,
++ 		unsigned int cmd, void __user *argp)
++ {
++ 	int srcu_idx = srcu_read_lock(&head->srcu);
++ 	struct nvme_ns *ns = nvme_find_path(head);
++ 	int ret = -EWOULDBLOCK;
++ 
++ 	if (ns)
++ 		ret = nvme_ns_ioctl(ns, cmd, argp);
++ 	srcu_read_unlock(&head->srcu, srcu_idx);
++ 	return ret;
++ }
++ 
++ static int nvme_ns_head_ioctl(struct block_device *bdev, fmode_t mode,
++ 		unsigned int cmd, unsigned long arg)
++ {
++ 	struct nvme_ns_head *head = bdev->bd_disk->private_data;
++ 
++ 	if (is_ctrl_ioctl(cmd))
++ 		return nvme_ns_head_ctrl_ioctl(head, cmd, (void __user *)arg);
++ 	return nvme_ns_head_ns_ioctl(head, cmd, (void __user *)arg);
++ }
++ 
+++>>>>>>> 3557a4409701 (nvme: don't bother to look up a namespace for controller ioctls)
+  const struct block_device_operations nvme_ns_head_ops = {
+  	.owner		= THIS_MODULE,
+ -	.submit_bio	= nvme_ns_head_submit_bio,
+  	.open		= nvme_ns_head_open,
+  	.release	= nvme_ns_head_release,
+ -	.ioctl		= nvme_ns_head_ioctl,
+ +	.ioctl		= nvme_ioctl,
+ +	.compat_ioctl	= nvme_compat_ioctl,
+  	.getgeo		= nvme_getgeo,
+  	.report_zones	= nvme_report_zones,
+  	.pr_ops		= &nvme_pr_ops,
+* Unmerged path drivers/nvme/host/core.c
