@@ -1,0 +1,345 @@
+drivers/base/memory.c: cache memory blocks in xarray to accelerate lookup
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-193.el8
+Rebuild_CHGLOG: - [base] drivers/base/memory.c: cache memory blocks in xarray to accelerate lookup fixup (David Hildenbrand) [1789900]
+Rebuild_FUZZ: 96.05%
+commit-author Scott Cheloha <cheloha@linux.vnet.ibm.com>
+commit 4fb6eabf1037cfbef90a26412492aeae5580cf0a
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-193.el8/4fb6eabf.failed
+
+Searching for a particular memory block by id is an O(n) operation because
+each memory block's underlying device is kept in an unsorted linked list
+on the subsystem bus.
+
+We can cut the lookup cost to O(log n) if we cache each memory block
+in an xarray.  This time complexity improvement is significant on
+systems with many memory blocks.  For example:
+
+1. A 128GB POWER9 VM with 256MB memblocks has 512 blocks.  With this
+   change  memory_dev_init() completes ~12ms faster and walk_memory_blocks()
+   completes ~12ms faster.
+
+Before:
+[    0.005042] memory_dev_init: adding memory blocks
+[    0.021591] memory_dev_init: added memory blocks
+[    0.022699] walk_memory_blocks: walking memory blocks
+[    0.038730] walk_memory_blocks: walked memory blocks 0-511
+
+After:
+[    0.005057] memory_dev_init: adding memory blocks
+[    0.009415] memory_dev_init: added memory blocks
+[    0.010519] walk_memory_blocks: walking memory blocks
+[    0.014135] walk_memory_blocks: walked memory blocks 0-511
+
+2. A 256GB POWER9 LPAR with 256MB memblocks has 1024 blocks.  With
+   this change memory_dev_init() completes ~88ms faster and
+   walk_memory_blocks() completes ~87ms faster.
+
+Before:
+[    0.252246] memory_dev_init: adding memory blocks
+[    0.395469] memory_dev_init: added memory blocks
+[    0.409413] walk_memory_blocks: walking memory blocks
+[    0.433028] walk_memory_blocks: walked memory blocks 0-511
+[    0.433094] walk_memory_blocks: walking memory blocks
+[    0.500244] walk_memory_blocks: walked memory blocks 131072-131583
+
+After:
+[    0.245063] memory_dev_init: adding memory blocks
+[    0.299539] memory_dev_init: added memory blocks
+[    0.313609] walk_memory_blocks: walking memory blocks
+[    0.315287] walk_memory_blocks: walked memory blocks 0-511
+[    0.315349] walk_memory_blocks: walking memory blocks
+[    0.316988] walk_memory_blocks: walked memory blocks 131072-131583
+
+3. A 32TB POWER9 LPAR with 256MB memblocks has 131072 blocks.  With
+   this change we complete memory_dev_init() ~37 minutes faster and
+   walk_memory_blocks() at least ~30 minutes faster.  The exact timing
+   for walk_memory_blocks() is  missing, though I observed that the
+   soft lockups in walk_memory_blocks() disappeared with the change,
+   suggesting that lower bound.
+
+Before:
+[   13.703907] memory_dev_init: adding blocks
+[ 2287.406099] memory_dev_init: added all blocks
+[ 2347.494986] [c000000014c5bb60] [c000000000869af4] walk_memory_blocks+0x94/0x160
+[ 2527.625378] [c000000014c5bb60] [c000000000869af4] walk_memory_blocks+0x94/0x160
+[ 2707.761977] [c000000014c5bb60] [c000000000869af4] walk_memory_blocks+0x94/0x160
+[ 2887.899975] [c000000014c5bb60] [c000000000869af4] walk_memory_blocks+0x94/0x160
+[ 3068.028318] [c000000014c5bb60] [c000000000869af4] walk_memory_blocks+0x94/0x160
+[ 3248.158764] [c000000014c5bb60] [c000000000869af4] walk_memory_blocks+0x94/0x160
+[ 3428.287296] [c000000014c5bb60] [c000000000869af4] walk_memory_blocks+0x94/0x160
+[ 3608.425357] [c000000014c5bb60] [c000000000869af4] walk_memory_blocks+0x94/0x160
+[ 3788.554572] [c000000014c5bb60] [c000000000869af4] walk_memory_blocks+0x94/0x160
+[ 3968.695071] [c000000014c5bb60] [c000000000869af4] walk_memory_blocks+0x94/0x160
+[ 4148.823970] [c000000014c5bb60] [c000000000869af4] walk_memory_blocks+0x94/0x160
+
+After:
+[   13.696898] memory_dev_init: adding blocks
+[   15.660035] memory_dev_init: added all blocks
+(the walk_memory_blocks traces disappear)
+
+There should be no significant negative impact for machines with few
+memory blocks.  A sparse xarray has a small footprint and an O(log n)
+lookup is negligibly slower than an O(n) lookup for only the smallest
+number of memory blocks.
+
+1. A 16GB x86 machine with 128MB memblocks has 132 blocks.  With this
+   change memory_dev_init() completes ~300us faster and walk_memory_blocks()
+   completes no faster or slower.  The improvement is pretty close to noise.
+
+Before:
+[    0.224752] memory_dev_init: adding memory blocks
+[    0.227116] memory_dev_init: added memory blocks
+[    0.227183] walk_memory_blocks: walking memory blocks
+[    0.227183] walk_memory_blocks: walked memory blocks 0-131
+
+After:
+[    0.224911] memory_dev_init: adding memory blocks
+[    0.226935] memory_dev_init: added memory blocks
+[    0.227089] walk_memory_blocks: walking memory blocks
+[    0.227089] walk_memory_blocks: walked memory blocks 0-131
+
+[david@redhat.com: document the locking]
+  Link: http://lkml.kernel.org/r/bc21eec6-7251-4c91-2f57-9a0671f8d414@redhat.com
+	Signed-off-by: Scott Cheloha <cheloha@linux.ibm.com>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Acked-by: David Hildenbrand <david@redhat.com>
+	Acked-by: Nathan Lynch <nathanl@linux.ibm.com>
+	Acked-by: Michal Hocko <mhocko@suse.com>
+	Cc: Rafael J. Wysocki <rafael@kernel.org>
+	Cc: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+	Cc: Rick Lindsley <ricklind@linux.vnet.ibm.com>
+	Cc: Scott Cheloha <cheloha@linux.ibm.com>
+Link: http://lkml.kernel.org/r/20200121231028.13699-1-cheloha@linux.ibm.com
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit 4fb6eabf1037cfbef90a26412492aeae5580cf0a)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/base/memory.c
+diff --cc drivers/base/memory.c
+index bce3c13a7be5,2b09b68b9f78..000000000000
+--- a/drivers/base/memory.c
++++ b/drivers/base/memory.c
+@@@ -19,9 -19,9 +19,10 @@@
+  #include <linux/memory.h>
+  #include <linux/memory_hotplug.h>
+  #include <linux/mm.h>
+ +#include <linux/mutex.h>
+  #include <linux/stat.h>
+  #include <linux/slab.h>
++ #include <linux/xarray.h>
+  
+  #include <linux/atomic.h>
+  #include <linux/uaccess.h>
+@@@ -581,22 -498,18 +589,37 @@@ int __weak arch_get_memory_phys_device(
+  }
+  
+  /*
+++<<<<<<< HEAD
+ + * A reference for the returned object is held and the reference for the
+ + * hinted object is released.
+ + */
+ +struct memory_block *find_memory_block_hinted(struct mem_section *section,
+ +					      struct memory_block *hint)
+ +{
+ +	int block_id = base_memory_block_id(__section_nr(section));
+ +	struct device *hintdev = hint ? &hint->dev : NULL;
+ +	struct device *dev;
+ +
+ +	dev = subsys_find_device_by_id(&memory_subsys, block_id, hintdev);
+ +	if (hint)
+ +		put_device(&hint->dev);
+ +	if (!dev)
+ +		return NULL;
+ +	return to_memory_block(dev);
+++=======
++  * A reference for the returned memory block device is acquired.
++  *
++  * Called under device_hotplug_lock.
++  */
++ static struct memory_block *find_memory_block_by_id(unsigned long block_id)
++ {
++ 	struct memory_block *mem;
++ 
++ 	mem = xa_load(&memory_blocks, block_id);
++ 	if (mem)
++ 		get_device(&mem->dev);
++ 	return mem;
+++>>>>>>> 4fb6eabf1037 (drivers/base/memory.c: cache memory blocks in xarray to accelerate lookup)
+  }
+  
+  /*
+@@@ -725,46 -664,32 +750,48 @@@ out
+  	return ret;
+  }
+  
+ -/*
+ - * Remove memory block devices for the given memory area. Start and size
+ - * have to be aligned to memory block granularity. Memory block devices
+ - * have to be offline.
+ - *
+ - * Called under device_hotplug_lock.
+ - */
+ -void remove_memory_block_devices(unsigned long start, unsigned long size)
+ +#ifdef CONFIG_MEMORY_HOTREMOVE
+ +static void
+ +unregister_memory(struct memory_block *memory)
+ +{
+ +	BUG_ON(memory->dev.bus != &memory_subsys);
+ +
+++	WARN_ON(xa_erase(&memory_blocks, memory->dev.id) == NULL);
+++
+ +	/* drop the ref. we got via find_memory_block() */
+ +	put_device(&memory->dev);
+ +	device_unregister(&memory->dev);
+ +}
+ +
+ +void unregister_memory_section(struct mem_section *section)
+  {
+ -	const unsigned long start_block_id = pfn_to_block_id(PFN_DOWN(start));
+ -	const unsigned long end_block_id = pfn_to_block_id(PFN_DOWN(start + size));
+  	struct memory_block *mem;
+ -	unsigned long block_id;
+  
+ -	if (WARN_ON_ONCE(!IS_ALIGNED(start, memory_block_size_bytes()) ||
+ -			 !IS_ALIGNED(size, memory_block_size_bytes())))
+ +	if (WARN_ON_ONCE(!present_section(section)))
+  		return;
+  
+ -	for (block_id = start_block_id; block_id != end_block_id; block_id++) {
+ -		mem = find_memory_block_by_id(block_id);
+ -		if (WARN_ON_ONCE(!mem))
+ -			continue;
+ -		unregister_memory_block_under_nodes(mem);
+ +	mutex_lock(&mem_sysfs_mutex);
+ +
+ +	/*
+ +	 * Some users of the memory hotplug do not want/need memblock to
+ +	 * track all sections. Skip over those.
+ +	 */
+ +	mem = find_memory_block(section);
+ +	if (!mem)
+ +		goto out_unlock;
+ +
+ +	unregister_mem_sect_under_nodes(mem, __section_nr(section));
+ +
+ +	mem->section_count--;
+ +	if (mem->section_count == 0)
+  		unregister_memory(mem);
+ -	}
+ +	else
+ +		put_device(&mem->dev);
+ +
+ +out_unlock:
+ +	mutex_unlock(&mem_sysfs_mutex);
+  }
+ +#endif /* CONFIG_MEMORY_HOTREMOVE */
+  
+  /* return true if the memory block is offlined, otherwise, return false */
+  bool is_memblock_offlined(struct memory_block *mem)
+@@@ -816,17 -745,89 +843,59 @@@ int __init memory_dev_init(void
+  	 * Create entries for memory sections that were found
+  	 * during boot and have been initialized
+  	 */
+ +	mutex_lock(&mem_sysfs_mutex);
+  	for (nr = 0; nr <= __highest_present_section_nr;
+  	     nr += sections_per_block) {
+ -		ret = add_memory_block(nr);
+ -		if (ret)
+ -			panic("%s() failed to add memory block: %d\n", __func__,
+ -			      ret);
+ +		err = add_memory_block(nr);
+ +		if (!ret)
+ +			ret = err;
+  	}
+ -}
+ +	mutex_unlock(&mem_sysfs_mutex);
+  
+++<<<<<<< HEAD
+ +out:
+ +	if (ret)
+ +		printk(KERN_ERR "%s() failed: %d\n", __func__, ret);
+++=======
++ /**
++  * walk_memory_blocks - walk through all present memory blocks overlapped
++  *			by the range [start, start + size)
++  *
++  * @start: start address of the memory range
++  * @size: size of the memory range
++  * @arg: argument passed to func
++  * @func: callback for each memory section walked
++  *
++  * This function walks through all present memory blocks overlapped by the
++  * range [start, start + size), calling func on each memory block.
++  *
++  * In case func() returns an error, walking is aborted and the error is
++  * returned.
++  *
++  * Called under device_hotplug_lock.
++  */
++ int walk_memory_blocks(unsigned long start, unsigned long size,
++ 		       void *arg, walk_memory_blocks_func_t func)
++ {
++ 	const unsigned long start_block_id = phys_to_block_id(start);
++ 	const unsigned long end_block_id = phys_to_block_id(start + size - 1);
++ 	struct memory_block *mem;
++ 	unsigned long block_id;
++ 	int ret = 0;
++ 
++ 	if (!size)
++ 		return 0;
++ 
++ 	for (block_id = start_block_id; block_id <= end_block_id; block_id++) {
++ 		mem = find_memory_block_by_id(block_id);
++ 		if (!mem)
++ 			continue;
++ 
++ 		ret = func(mem, arg);
++ 		put_device(&mem->dev);
++ 		if (ret)
++ 			break;
++ 	}
+++>>>>>>> 4fb6eabf1037 (drivers/base/memory.c: cache memory blocks in xarray to accelerate lookup)
+  	return ret;
+  }
+ -
+ -struct for_each_memory_block_cb_data {
+ -	walk_memory_blocks_func_t func;
+ -	void *arg;
+ -};
+ -
+ -static int for_each_memory_block_cb(struct device *dev, void *data)
+ -{
+ -	struct memory_block *mem = to_memory_block(dev);
+ -	struct for_each_memory_block_cb_data *cb_data = data;
+ -
+ -	return cb_data->func(mem, cb_data->arg);
+ -}
+ -
+ -/**
+ - * for_each_memory_block - walk through all present memory blocks
+ - *
+ - * @arg: argument passed to func
+ - * @func: callback for each memory block walked
+ - *
+ - * This function walks through all present memory blocks, calling func on
+ - * each memory block.
+ - *
+ - * In case func() returns an error, walking is aborted and the error is
+ - * returned.
+ - */
+ -int for_each_memory_block(void *arg, walk_memory_blocks_func_t func)
+ -{
+ -	struct for_each_memory_block_cb_data cb_data = {
+ -		.func = func,
+ -		.arg = arg,
+ -	};
+ -
+ -	return bus_for_each_dev(&memory_subsys, NULL, &cb_data,
+ -				for_each_memory_block_cb);
+ -}
+* Unmerged path drivers/base/memory.c
