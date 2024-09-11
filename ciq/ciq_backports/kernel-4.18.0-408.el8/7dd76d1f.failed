@@ -1,0 +1,554 @@
+dm: improve bio splitting and associated IO accounting
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-408.el8
+commit-author Ming Lei <ming.lei@redhat.com>
+commit 7dd76d1feec70a23e1de2b55c0c2a9c592fa8423
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-408.el8/7dd76d1f.failed
+
+The current DM code (ab)uses late assignment of dm_io->orig_bio (after
+__map_bio() returns and any bio splitting is complete) to indicate the
+FS bio has been processed and can be accounted. This results in
+awkward waiting until ->orig_bio is set in dm_submit_bio_remap().
+
+Also the bio splitting was implemented using bio_split()+bio_chain()
+-- a well-worn pattern but it requires bio cloning purely for the
+benefit of more natural IO accounting.  The bio_split() result was
+stored in ->orig_bio to represent the mapped part of the original FS
+bio.
+
+DM has switched to the bdev based IO accounting interface.  DM's IO
+accounting can be implemented in terms of the original FS bio (now
+stored early in ->orig_bio) via access to its sectors/bio_op. And
+if/when splitting is needed, set a new DM_IO_WAS_SPLIT flag and use
+new dm_io fields of .sector_offset & .sectors to allow IO accounting
+for split bios _without_ needing to clone a new bio to store in
+->orig_bio.
+
+	Signed-off-by: Ming Lei <ming.lei@redhat.com>
+Co-developed-by: Mike Snitzer <snitzer@kernel.org>
+	Signed-off-by: Mike Snitzer <snitzer@kernel.org>
+(cherry picked from commit 7dd76d1feec70a23e1de2b55c0c2a9c592fa8423)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/md/dm-core.h
+#	drivers/md/dm.c
+diff --cc drivers/md/dm-core.h
+index a9c78c74b3c7,37ddedf61249..000000000000
+--- a/drivers/md/dm-core.h
++++ b/drivers/md/dm-core.h
+@@@ -210,20 -252,50 +210,50 @@@ struct dm_target_io 
+   * One of these is allocated per original bio.
+   * It contains the first clone used for that original.
+   */
+ -#define DM_IO_MAGIC 19577
+ +#define DM_IO_MAGIC 5191977
+  struct dm_io {
+ -	unsigned short magic;
+ -
+ -	spinlock_t lock;
+ -	unsigned long start_time;
+ -	void *data;
+ -	struct hlist_node node;
+ -	struct task_struct *map_task;
+ -	struct dm_stats_aux stats_aux;
+ -
+ -	blk_short_t flags;
+ -	blk_status_t status;
+ +	unsigned int magic;
+  	atomic_t io_count;
+  	struct mapped_device *md;
++ 
++ 	/* The three fields represent mapped part of original bio */
+  	struct bio *orig_bio;
+++<<<<<<< HEAD
+ +	blk_status_t status;
+ +	unsigned long start_time;
+ +	spinlock_t endio_lock;
+ +	struct dm_stats_aux stats_aux;
+++=======
++ 	unsigned int sector_offset; /* offset to end of orig_bio */
++ 	unsigned int sectors;
++ 
+++>>>>>>> 7dd76d1feec7 (dm: improve bio splitting and associated IO accounting)
+  	/* last member of dm_target_io is 'struct bio' */
+  	struct dm_target_io tio;
+  };
+  
+++<<<<<<< HEAD
+++=======
++ /*
++  * dm_io flags
++  */
++ enum {
++ 	DM_IO_START_ACCT,
++ 	DM_IO_ACCOUNTED,
++ 	DM_IO_WAS_SPLIT
++ };
++ 
++ static inline bool dm_io_flagged(struct dm_io *io, unsigned int bit)
++ {
++ 	return (io->flags & (1U << bit)) != 0;
++ }
++ 
++ static inline void dm_io_set_flag(struct dm_io *io, unsigned int bit)
++ {
++ 	io->flags |= (1U << bit);
++ }
++ 
+++>>>>>>> 7dd76d1feec7 (dm: improve bio splitting and associated IO accounting)
+  static inline void dm_io_inc_pending(struct dm_io *io)
+  {
+  	atomic_inc(&io->io_count);
+diff --cc drivers/md/dm.c
+index e7cb1b8972bd,7a1a83b58677..000000000000
+--- a/drivers/md/dm.c
++++ b/drivers/md/dm.c
+@@@ -556,43 -502,76 +556,100 @@@ static bool bio_is_flush_with_data(stru
+  	return ((bio->bi_opf & REQ_PREFLUSH) && bio->bi_iter.bi_size);
+  }
+  
+ -static void dm_io_acct(struct dm_io *io, bool end)
+ +static void dm_io_acct(bool end, struct mapped_device *md, struct bio *bio,
+ +		       unsigned long start_time, struct dm_stats_aux *stats_aux)
+  {
+ -	struct dm_stats_aux *stats_aux = &io->stats_aux;
+ -	unsigned long start_time = io->start_time;
+ -	struct mapped_device *md = io->md;
+ -	struct bio *bio = io->orig_bio;
+ -	unsigned int sectors;
+ +	bool is_flush_with_data;
+ +	unsigned int bi_size;
+  
+++<<<<<<< HEAD
+ +	/* If REQ_PREFLUSH set save any payload but do not account it */
+ +	is_flush_with_data = bio_is_flush_with_data(bio);
+ +	if (is_flush_with_data) {
+ +		bi_size = bio->bi_iter.bi_size;
+ +		bio->bi_iter.bi_size = 0;
+++=======
++ 	/*
++ 	 * If REQ_PREFLUSH set, don't account payload, it will be
++ 	 * submitted (and accounted) after this flush completes.
++ 	 */
++ 	if (bio_is_flush_with_data(bio))
++ 		sectors = 0;
++ 	else if (likely(!(dm_io_flagged(io, DM_IO_WAS_SPLIT))))
++ 		sectors = bio_sectors(bio);
++ 	else
++ 		sectors = io->sectors;
++ 
++ 	if (!end)
++ 		bdev_start_io_acct(bio->bi_bdev, sectors, bio_op(bio),
++ 				   start_time);
++ 	else
++ 		bdev_end_io_acct(bio->bi_bdev, bio_op(bio), start_time);
++ 
++ 	if (static_branch_unlikely(&stats_enabled) &&
++ 	    unlikely(dm_stats_used(&md->stats))) {
++ 		sector_t sector;
++ 
++ 		if (likely(!dm_io_flagged(io, DM_IO_WAS_SPLIT)))
++ 			sector = bio->bi_iter.bi_sector;
++ 		else
++ 			sector = bio_end_sector(bio) - io->sector_offset;
++ 
++ 		dm_stats_account_io(&md->stats, bio_data_dir(bio),
++ 				    sector, sectors,
++ 				    end, start_time, stats_aux);
++ 	}
++ }
++ 
++ static void __dm_start_io_acct(struct dm_io *io)
++ {
++ 	dm_io_acct(io, false);
++ }
++ 
++ static void dm_start_io_acct(struct dm_io *io, struct bio *clone)
++ {
++ 	/*
++ 	 * Ensure IO accounting is only ever started once.
++ 	 */
++ 	if (dm_io_flagged(io, DM_IO_ACCOUNTED))
++ 		return;
++ 
++ 	/* Expect no possibility for race unless DM_TIO_IS_DUPLICATE_BIO. */
++ 	if (!clone || likely(dm_tio_is_normal(clone_to_tio(clone)))) {
++ 		dm_io_set_flag(io, DM_IO_ACCOUNTED);
++ 	} else {
++ 		unsigned long flags;
++ 		/* Can afford locking given DM_TIO_IS_DUPLICATE_BIO */
++ 		spin_lock_irqsave(&io->lock, flags);
++ 		dm_io_set_flag(io, DM_IO_ACCOUNTED);
++ 		spin_unlock_irqrestore(&io->lock, flags);
+++>>>>>>> 7dd76d1feec7 (dm: improve bio splitting and associated IO accounting)
+  	}
+  
+ -	__dm_start_io_acct(io);
+ +	if (!end)
+ +		bio_start_io_acct_time(bio, start_time);
+ +	else
+ +		bio_end_io_acct(bio, start_time);
+ +
+ +	if (unlikely(dm_stats_used(&md->stats)))
+ +		dm_stats_account_io(&md->stats, bio_data_dir(bio),
+ +				    bio->bi_iter.bi_sector, bio_sectors(bio),
+ +				    end, start_time, stats_aux);
+ +
+ +	/* Restore bio's payload so it does get accounted upon requeue */
+ +	if (is_flush_with_data)
+ +		bio->bi_iter.bi_size = bi_size;
+ +}
+ +
+ +static void start_io_acct(struct dm_io *io)
+ +{
+ +	dm_io_acct(false, io->md, io->orig_bio, io->start_time, &io->stats_aux);
+  }
+  
+ -static void dm_end_io_acct(struct dm_io *io)
+ +static void end_io_acct(struct mapped_device *md, struct bio *bio,
+ +			unsigned long start_time, struct dm_stats_aux *stats_aux)
+  {
+ -	dm_io_acct(io, true);
+ +	dm_io_acct(true, md, bio, start_time, stats_aux);
+  }
+  
+  static struct dm_io *alloc_io(struct mapped_device *md, struct bio *bio)
+@@@ -1242,16 -1218,70 +1299,69 @@@ static int dm_dax_zero_page_range(struc
+   */
+  void dm_accept_partial_bio(struct bio *bio, unsigned n_sectors)
+  {
+ -	struct dm_target_io *tio = clone_to_tio(bio);
+ -	unsigned bio_sectors = bio_sectors(bio);
+ -
+ -	BUG_ON(dm_tio_flagged(tio, DM_TIO_IS_DUPLICATE_BIO));
+ -	BUG_ON(op_is_zone_mgmt(bio_op(bio)));
+ -	BUG_ON(bio_op(bio) == REQ_OP_ZONE_APPEND);
+ -	BUG_ON(bio_sectors > *tio->len_ptr);
+ -	BUG_ON(n_sectors > bio_sectors);
+ -
+ -	*tio->len_ptr -= bio_sectors - n_sectors;
+ +	struct dm_target_io *tio = container_of(bio, struct dm_target_io, clone);
+ +	unsigned bi_size = bio->bi_iter.bi_size >> SECTOR_SHIFT;
+ +	BUG_ON(bio->bi_opf & REQ_PREFLUSH);
+ +	BUG_ON(bi_size > *tio->len_ptr);
+ +	BUG_ON(n_sectors > bi_size);
+ +	*tio->len_ptr -= bi_size - n_sectors;
+  	bio->bi_iter.bi_size = n_sectors << SECTOR_SHIFT;
++ 
++ 	/*
++ 	 * __split_and_process_bio() may have already saved mapped part
++ 	 * for accounting but it is being reduced so update accordingly.
++ 	 */
++ 	dm_io_set_flag(tio->io, DM_IO_WAS_SPLIT);
++ 	tio->io->sectors = n_sectors;
+  }
+  EXPORT_SYMBOL_GPL(dm_accept_partial_bio);
+  
+++<<<<<<< HEAD
+++=======
++ static inline void __dm_submit_bio_remap(struct bio *clone,
++ 					 dev_t dev, sector_t old_sector)
++ {
++ 	trace_block_bio_remap(clone, dev, old_sector);
++ 	submit_bio_noacct(clone);
++ }
++ 
++ /*
++  * @clone: clone bio that DM core passed to target's .map function
++  * @tgt_clone: clone of @clone bio that target needs submitted
++  *
++  * Targets should use this interface to submit bios they take
++  * ownership of when returning DM_MAPIO_SUBMITTED.
++  *
++  * Target should also enable ti->accounts_remapped_io
++  */
++ void dm_submit_bio_remap(struct bio *clone, struct bio *tgt_clone)
++ {
++ 	struct dm_target_io *tio = clone_to_tio(clone);
++ 	struct dm_io *io = tio->io;
++ 
++ 	WARN_ON_ONCE(!tio->ti->accounts_remapped_io);
++ 
++ 	/* establish bio that will get submitted */
++ 	if (!tgt_clone)
++ 		tgt_clone = clone;
++ 
++ 	/*
++ 	 * Account io->origin_bio to DM dev on behalf of target
++ 	 * that took ownership of IO with DM_MAPIO_SUBMITTED.
++ 	 */
++ 	if (io->map_task == current) {
++ 		/* Still in target's map function */
++ 		dm_io_set_flag(io, DM_IO_START_ACCT);
++ 	} else {
++ 		dm_start_io_acct(io, clone);
++ 	}
++ 
++ 	__dm_submit_bio_remap(tgt_clone, disk_devt(io->md->disk),
++ 			      tio->old_sector);
++ }
++ EXPORT_SYMBOL_GPL(dm_submit_bio_remap);
++ 
+++>>>>>>> 7dd76d1feec7 (dm: improve bio splitting and associated IO accounting)
+  static noinline void __set_swap_bios_limit(struct mapped_device *md, int latch)
+  {
+  	mutex_lock(&md->swap_bios_lock);
+@@@ -1325,51 -1365,33 +1435,76 @@@ static blk_qc_t __map_bio(struct dm_tar
+  		DMWARN("unimplemented target map return value: %d", r);
+  		BUG();
+  	}
+ +
+ +	return ret;
+ +}
+ +
+ +static void bio_setup_sector(struct bio *bio, sector_t sector, unsigned len)
+ +{
+ +	bio->bi_iter.bi_sector = sector;
+ +	bio->bi_iter.bi_size = to_bytes(len);
+ +}
+ +
+ +/*
+ + * Creates a bio that consists of range of complete bvecs.
+ + */
+ +static int clone_bio(struct dm_target_io *tio, struct bio *bio,
+ +		     sector_t sector, unsigned len)
+ +{
+ +	struct bio *clone = &tio->clone;
+ +
+ +	__bio_clone_fast(clone, bio);
+ +
+ +	if (bio_integrity(bio)) {
+ +		int r;
+ +
+ +		if (unlikely(!dm_target_has_integrity(tio->ti->type) &&
+ +			     !dm_target_passes_integrity(tio->ti->type))) {
+ +			DMWARN("%s: the target %s doesn't support integrity data.",
+ +				dm_device_name(tio->io->md),
+ +				tio->ti->type->name);
+ +			return -EIO;
+ +		}
+ +
+ +		r = bio_integrity_clone(clone, bio, GFP_NOIO);
+ +		if (r < 0)
+ +			return r;
+ +	}
+ +
+ +	bio_advance(clone, to_bytes(sector - clone->bi_iter.bi_sector));
+ +	clone->bi_iter.bi_size = to_bytes(len);
+ +
+ +	if (bio_integrity(bio))
+ +		bio_integrity_trim(clone);
+ +
+ +	return 0;
+  }
+  
++ static void setup_split_accounting(struct clone_info *ci, unsigned len)
++ {
++ 	struct dm_io *io = ci->io;
++ 
++ 	if (ci->sector_count > len) {
++ 		/*
++ 		 * Split needed, save the mapped part for accounting.
++ 		 * NOTE: dm_accept_partial_bio() will update accordingly.
++ 		 */
++ 		dm_io_set_flag(io, DM_IO_WAS_SPLIT);
++ 		io->sectors = len;
++ 	}
++ 
++ 	if (static_branch_unlikely(&stats_enabled) &&
++ 	    unlikely(dm_stats_used(&io->md->stats))) {
++ 		/*
++ 		 * Save bi_sector in terms of its offset from end of
++ 		 * original bio, only needed for DM-stats' benefit.
++ 		 * - saved regardless of whether split needed so that
++ 		 *   dm_accept_partial_bio() doesn't need to.
++ 		 */
++ 		io->sector_offset = bio_end_sector(ci->bio) - ci->sector;
++ 	}
++ }
++ 
+  static void alloc_multiple_bios(struct bio_list *blist, struct clone_info *ci,
+  				struct dm_target *ti, unsigned num_bios)
+  {
+@@@ -1428,14 -1425,25 +1563,34 @@@ static void __send_duplicate_bios(struc
+  				  unsigned num_bios, unsigned *len)
+  {
+  	struct bio_list blist = BIO_EMPTY_LIST;
+ -	struct bio *clone;
+ +	struct bio *bio;
+ +	struct dm_target_io *tio;
+ +
+++<<<<<<< HEAD
+ +	alloc_multiple_bios(&blist, ci, ti, num_bios);
+  
+ +	while ((bio = bio_list_pop(&blist))) {
+ +		tio = container_of(bio, struct dm_target_io, clone);
+ +		(void) __clone_and_map_simple_bio(ci, tio, len);
+++=======
++ 	switch (num_bios) {
++ 	case 0:
++ 		break;
++ 	case 1:
++ 		if (len)
++ 			setup_split_accounting(ci, *len);
++ 		clone = alloc_tio(ci, ti, 0, len, GFP_NOIO);
++ 		__map_bio(clone);
++ 		break;
++ 	default:
++ 		/* dm_accept_partial_bio() is not supported with shared tio->len_ptr */
++ 		alloc_multiple_bios(&blist, ci, ti, num_bios);
++ 		while ((clone = bio_list_pop(&blist))) {
++ 			dm_tio_set_flag(clone_to_tio(clone), DM_TIO_IS_DUPLICATE_BIO);
++ 			__map_bio(clone);
++ 		}
++ 		break;
+++>>>>>>> 7dd76d1feec7 (dm: improve bio splitting and associated IO accounting)
+  	}
+  }
+  
+@@@ -1572,24 -1537,68 +1727,30 @@@ static bool __process_abnormal_io(struc
+  /*
+   * Select the correct strategy for processing a non-flush bio.
+   */
+ -static blk_status_t __split_and_process_bio(struct clone_info *ci)
+ +static int __split_and_process_non_flush(struct clone_info *ci)
+  {
+ -	struct bio *clone;
+  	struct dm_target *ti;
+  	unsigned len;
+ -	blk_status_t error = BLK_STS_IOERR;
+ +	int r;
+  
+  	ti = dm_table_find_target(ci->map, ci->sector);
+ -	if (unlikely(!ti || __process_abnormal_io(ci, ti, &error)))
+ -		return error;
+ +	if (!ti)
+ +		return -EIO;
+  
+ -	/*
+ -	 * Only support bio polling for normal IO, and the target io is
+ -	 * exactly inside the dm_io instance (verified in dm_poll_dm_io)
+ -	 */
+ -	ci->submit_as_polled = ci->bio->bi_opf & REQ_POLLED;
+ +	if (__process_abnormal_io(ci, ti, &r))
+ +		return r;
+  
+  	len = min_t(sector_t, max_io_len(ti, ci->sector), ci->sector_count);
+++<<<<<<< HEAD
+ +
+ +	r = __clone_and_map_data_bio(ci, ti, ci->sector, &len);
+ +	if (r < 0)
+ +		return r;
+++=======
++ 	setup_split_accounting(ci, len);
++ 	clone = alloc_tio(ci, ti, 0, &len, GFP_NOIO);
++ 	__map_bio(clone);
+++>>>>>>> 7dd76d1feec7 (dm: improve bio splitting and associated IO accounting)
+  
+  	ci->sector += len;
+  	ci->sector_count -= len;
+@@@ -1608,55 -1625,54 +1769,90 @@@ static void init_clone_info(struct clon
+  /*
+   * Entry point to split a bio into clones and submit them to the targets.
+   */
+ -static void dm_split_and_process_bio(struct mapped_device *md,
+ -				     struct dm_table *map, struct bio *bio)
+ +static blk_qc_t __split_and_process_bio(struct mapped_device *md,
+ +					struct dm_table *map, struct bio *bio)
+  {
+  	struct clone_info ci;
+++<<<<<<< HEAD
+ +	blk_qc_t ret = BLK_QC_T_NONE;
+ +	int error = 0;
+++=======
++ 	struct dm_io *io;
++ 	blk_status_t error = BLK_STS_OK;
+++>>>>>>> 7dd76d1feec7 (dm: improve bio splitting and associated IO accounting)
+  
+  	init_clone_info(&ci, md, map, bio);
+ -	io = ci.io;
+  
+  	if (bio->bi_opf & REQ_PREFLUSH) {
+ -		__send_empty_flush(&ci);
+ -		/* dm_io_complete submits any data associated with flush */
+ -		goto out;
+ +		error = __send_empty_flush(&ci);
+ +		/* dm_io_dec_pending submits any data associated with flush */
+ +	} else if (op_is_zone_mgmt(bio_op(bio))) {
+ +		ci.bio = bio;
+ +		ci.sector_count = 0;
+ +		error = __split_and_process_non_flush(&ci);
+ +	} else {
+ +		ci.bio = bio;
+ +		ci.sector_count = bio_sectors(bio);
+ +		error = __split_and_process_non_flush(&ci);
+ +		if (ci.sector_count && !error) {
+ +			/*
+ +			 * Remainder must be passed to generic_make_request()
+ +			 * so that it gets handled *after* bios already submitted
+ +			 * have been completely processed.
+ +			 * We take a clone of the original to store in
+ +			 * ci.io->orig_bio to be used by end_io_acct() and
+ +			 * for dec_pending to use for completion handling.
+ +			 */
+ +			struct bio *b = bio_split(bio, bio_sectors(bio) - ci.sector_count,
+ +						  GFP_NOIO, &md->queue->bio_split);
+ +			ci.io->orig_bio = b;
+ +
+ +			bio_chain(b, bio);
+ +			trace_block_split(md->queue, b, bio->bi_iter.bi_sector);
+ +			ret = generic_make_request(bio);
+ +		}
+  	}
+ +	start_io_acct(ci.io);
+  
+++<<<<<<< HEAD
+ +	/* drop the extra reference count */
+ +	dm_io_dec_pending(ci.io, errno_to_blk_status(error));
+ +	return ret;
+++=======
++ 	error = __split_and_process_bio(&ci);
++ 	io->map_task = NULL;
++ 	if (error || !ci.sector_count)
++ 		goto out;
++ 	/*
++ 	 * Remainder must be passed to submit_bio_noacct() so it gets handled
++ 	 * *after* bios already submitted have been completely processed.
++ 	 */
++ 	bio_trim(bio, io->sectors, ci.sector_count);
++ 	trace_block_split(bio, bio->bi_iter.bi_sector);
++ 	bio_inc_remaining(bio);
++ 	submit_bio_noacct(bio);
++ out:
++ 	if (dm_io_flagged(io, DM_IO_START_ACCT))
++ 		dm_start_io_acct(io, NULL);
++ 
++ 	/*
++ 	 * Drop the extra reference count for non-POLLED bio, and hold one
++ 	 * reference for POLLED bio, which will be released in dm_poll_bio
++ 	 *
++ 	 * Add every dm_io instance into the hlist_head which is stored in
++ 	 * bio->bi_private, so that dm_poll_bio can poll them all.
++ 	 */
++ 	if (error || !ci.submit_as_polled)
++ 		dm_io_dec_pending(ci.io, error);
++ 	else
++ 		dm_queue_poll_io(bio, io);
+++>>>>>>> 7dd76d1feec7 (dm: improve bio splitting and associated IO accounting)
+  }
+  
+ -static void dm_submit_bio(struct bio *bio)
+ +static blk_qc_t dm_make_request(struct request_queue *q, struct bio *bio)
+  {
+ -	struct mapped_device *md = bio->bi_bdev->bd_disk->private_data;
+ +	struct mapped_device *md = q->queuedata;
+ +	blk_qc_t ret = BLK_QC_T_NONE;
+  	int srcu_idx;
+  	struct dm_table *map;
+  
+* Unmerged path drivers/md/dm-core.h
+* Unmerged path drivers/md/dm.c
