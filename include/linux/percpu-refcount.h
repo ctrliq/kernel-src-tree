@@ -178,14 +178,14 @@ static inline void percpu_ref_get_many(struct percpu_ref *ref, unsigned long nr)
 {
 	unsigned long __percpu *percpu_count;
 
-	rcu_read_lock_sched();
+	rcu_read_lock();
 
 	if (__ref_is_percpu(ref, &percpu_count))
 		this_cpu_add(*percpu_count, nr);
 	else
 		atomic_long_add(nr, &ref->count);
 
-	rcu_read_unlock_sched();
+	rcu_read_unlock();
 }
 
 /**
@@ -215,7 +215,7 @@ static inline bool percpu_ref_tryget(struct percpu_ref *ref)
 	unsigned long __percpu *percpu_count;
 	bool ret;
 
-	rcu_read_lock_sched();
+	rcu_read_lock();
 
 	if (__ref_is_percpu(ref, &percpu_count)) {
 		this_cpu_inc(*percpu_count);
@@ -224,7 +224,7 @@ static inline bool percpu_ref_tryget(struct percpu_ref *ref)
 		ret = atomic_long_inc_not_zero(&ref->count);
 	}
 
-	rcu_read_unlock_sched();
+	rcu_read_unlock();
 
 	return ret;
 }
@@ -249,7 +249,7 @@ static inline bool percpu_ref_tryget_live(struct percpu_ref *ref)
 	unsigned long __percpu *percpu_count;
 	bool ret = false;
 
-	rcu_read_lock_sched();
+	rcu_read_lock();
 
 	if (__ref_is_percpu(ref, &percpu_count)) {
 		this_cpu_inc(*percpu_count);
@@ -258,7 +258,7 @@ static inline bool percpu_ref_tryget_live(struct percpu_ref *ref)
 		ret = atomic_long_inc_not_zero(&ref->count);
 	}
 
-	rcu_read_unlock_sched();
+	rcu_read_unlock();
 
 	return ret;
 }
@@ -277,14 +277,14 @@ static inline void percpu_ref_put_many(struct percpu_ref *ref, unsigned long nr)
 {
 	unsigned long __percpu *percpu_count;
 
-	rcu_read_lock_sched();
+	rcu_read_lock();
 
 	if (__ref_is_percpu(ref, &percpu_count))
 		this_cpu_sub(*percpu_count, nr);
 	else if (unlikely(atomic_long_sub_and_test(nr, &ref->count)))
 		ref->release(ref);
 
-	rcu_read_unlock_sched();
+	rcu_read_unlock();
 }
 
 /**
