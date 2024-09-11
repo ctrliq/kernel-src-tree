@@ -1,0 +1,214 @@
+net: sched: protect block offload-related fields with rw_semaphore
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-193.el8
+Rebuild_CHGLOG: - [net] sched: protect block offload-related fields with rw_semaphore (Ivan Vecera) [1739606]
+Rebuild_FUZZ: 96.06%
+commit-author Vlad Buslov <vladbu@mellanox.com>
+commit 4f8116c85057239ff37519debdd5d45b38ad8130
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-193.el8/4f8116c8.failed
+
+In order to remove dependency on rtnl lock, extend tcf_block with 'cb_lock'
+rwsem and use it to protect flow_block->cb_list and related counters from
+concurrent modification. The lock is taken in read mode for read-only
+traversal of cb_list in tc_setup_cb_call() and write mode in all other
+cases. This approach ensures that:
+
+- cb_list is not changed concurrently while filters is being offloaded on
+  block.
+
+- block->nooffloaddevcnt is checked while holding the lock in read mode,
+  but is only changed by bind/unbind code when holding the cb_lock in write
+  mode to prevent concurrent modification.
+
+	Signed-off-by: Vlad Buslov <vladbu@mellanox.com>
+	Acked-by: Jiri Pirko <jiri@mellanox.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 4f8116c85057239ff37519debdd5d45b38ad8130)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/net/sch_generic.h
+#	net/sched/cls_api.c
+diff --cc include/net/sch_generic.h
+index 13911b10ed82,a3eaf5f9d28f..000000000000
+--- a/include/net/sch_generic.h
++++ b/include/net/sch_generic.h
+@@@ -13,8 -13,10 +13,9 @@@
+  #include <linux/refcount.h>
+  #include <linux/workqueue.h>
+  #include <linux/mutex.h>
++ #include <linux/rwsem.h>
+  #include <net/gen_stats.h>
+  #include <net/rtnetlink.h>
+ -#include <net/flow_offload.h>
+  
+  struct Qdisc_ops;
+  struct qdisc_walker;
+@@@ -404,7 -397,8 +405,12 @@@ struct tcf_block 
+  	refcount_t refcnt;
+  	struct net *net;
+  	struct Qdisc *q;
+++<<<<<<< HEAD
+ +	struct list_head cb_list;
+++=======
++ 	struct rw_semaphore cb_lock; /* protects cb_list and offload counters */
++ 	struct flow_block flow_block;
+++>>>>>>> 4f8116c85057 (net: sched: protect block offload-related fields with rw_semaphore)
+  	struct list_head owner_list;
+  	bool keep_dst;
+  	unsigned int offloadcnt; /* Number of oddloaded filters */
+diff --cc net/sched/cls_api.c
+index 081ac3d0fb50,959b7ca1ca02..000000000000
+--- a/net/sched/cls_api.c
++++ b/net/sched/cls_api.c
+@@@ -548,6 -546,35 +548,38 @@@ static void tcf_chain_flush(struct tcf_
+  	}
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static int tcf_block_setup(struct tcf_block *block,
++ 			   struct flow_block_offload *bo);
++ 
++ static void tc_indr_block_ing_cmd(struct net_device *dev,
++ 				  struct tcf_block *block,
++ 				  flow_indr_block_bind_cb_t *cb,
++ 				  void *cb_priv,
++ 				  enum flow_block_command command)
++ {
++ 	struct flow_block_offload bo = {
++ 		.command	= command,
++ 		.binder_type	= FLOW_BLOCK_BINDER_TYPE_CLSACT_INGRESS,
++ 		.net		= dev_net(dev),
++ 		.block_shared	= tcf_block_non_null_shared(block),
++ 	};
++ 	INIT_LIST_HEAD(&bo.cb_list);
++ 
++ 	if (!block)
++ 		return;
++ 
++ 	bo.block = &block->flow_block;
++ 
++ 	down_write(&block->cb_lock);
++ 	cb(dev, cb_priv, TC_SETUP_BLOCK, &bo);
++ 
++ 	tcf_block_setup(block, &bo);
++ 	up_write(&block->cb_lock);
++ }
++ 
+++>>>>>>> 4f8116c85057 (net: sched: protect block offload-related fields with rw_semaphore)
+  static struct tcf_block *tc_dev_ingress_block(struct net_device *dev)
+  {
+  	const struct Qdisc_class_ops *cops;
+@@@ -837,24 -672,31 +870,40 @@@ static int tcf_block_offload_bind(struc
+  	 */
+  	if (!tc_can_offload(dev) && tcf_block_offload_in_use(block)) {
+  		NL_SET_ERR_MSG(extack, "Bind to offloaded block failed as dev has offload disabled");
+- 		return -EOPNOTSUPP;
++ 		err = -EOPNOTSUPP;
++ 		goto err_unlock;
+  	}
+  
+ -	err = tcf_block_offload_cmd(block, dev, ei, FLOW_BLOCK_BIND, extack);
+ +	err = tcf_block_offload_cmd(block, dev, ei, TC_BLOCK_BIND, extack);
+  	if (err == -EOPNOTSUPP)
+  		goto no_offload_dev_inc;
+  	if (err)
+- 		return err;
++ 		goto err_unlock;
+  
+++<<<<<<< HEAD
+ +	tc_indr_block_call(block, dev, ei, TC_BLOCK_BIND, extack);
+++=======
++ 	tc_indr_block_call(block, dev, ei, FLOW_BLOCK_BIND, extack);
++ 	up_write(&block->cb_lock);
+++>>>>>>> 4f8116c85057 (net: sched: protect block offload-related fields with rw_semaphore)
+  	return 0;
+  
+  no_offload_dev_inc:
+- 	if (tcf_block_offload_in_use(block))
+- 		return -EOPNOTSUPP;
++ 	if (tcf_block_offload_in_use(block)) {
++ 		err = -EOPNOTSUPP;
++ 		goto err_unlock;
++ 	}
++ 	err = 0;
+  	block->nooffloaddevcnt++;
+++<<<<<<< HEAD
+ +	tc_indr_block_call(block, dev, ei, TC_BLOCK_BIND, extack);
+ +	return 0;
+++=======
++ 	tc_indr_block_call(block, dev, ei, FLOW_BLOCK_BIND, extack);
++ err_unlock:
++ 	up_write(&block->cb_lock);
++ 	return err;
+++>>>>>>> 4f8116c85057 (net: sched: protect block offload-related fields with rw_semaphore)
+  }
+  
+  static void tcf_block_offload_unbind(struct tcf_block *block, struct Qdisc *q,
+@@@ -863,13 -705,15 +912,19 @@@
+  	struct net_device *dev = q->dev_queue->dev;
+  	int err;
+  
+++<<<<<<< HEAD
+ +	tc_indr_block_call(block, dev, ei, TC_BLOCK_UNBIND, NULL);
+++=======
++ 	down_write(&block->cb_lock);
++ 	tc_indr_block_call(block, dev, ei, FLOW_BLOCK_UNBIND, NULL);
+++>>>>>>> 4f8116c85057 (net: sched: protect block offload-related fields with rw_semaphore)
+  
+  	if (!dev->netdev_ops->ndo_setup_tc)
+  		goto no_offload_dev_dec;
+ -	err = tcf_block_offload_cmd(block, dev, ei, FLOW_BLOCK_UNBIND, NULL);
+ +	err = tcf_block_offload_cmd(block, dev, ei, TC_BLOCK_UNBIND, NULL);
+  	if (err == -EOPNOTSUPP)
+  		goto no_offload_dev_dec;
++ 	up_write(&block->cb_lock);
+  	return;
+  
+  no_offload_dev_dec:
+@@@ -988,8 -833,9 +1044,13 @@@ static struct tcf_block *tcf_block_crea
+  		return ERR_PTR(-ENOMEM);
+  	}
+  	mutex_init(&block->lock);
+++<<<<<<< HEAD
+++=======
++ 	init_rwsem(&block->cb_lock);
++ 	flow_block_init(&block->flow_block);
+++>>>>>>> 4f8116c85057 (net: sched: protect block offload-related fields with rw_semaphore)
+  	INIT_LIST_HEAD(&block->chain_list);
+ +	INIT_LIST_HEAD(&block->cb_list);
+  	INIT_LIST_HEAD(&block->owner_list);
+  	INIT_LIST_HEAD(&block->chain0.filter_chain_list);
+  
+@@@ -3251,15 -3007,20 +3318,20 @@@ int tc_setup_cb_call(struct tcf_block *
+  	int ok_count = 0;
+  	int err;
+  
++ 	down_read(&block->cb_lock);
+  	/* Make sure all netdevs sharing this block are offload-capable. */
+- 	if (block->nooffloaddevcnt && err_stop)
+- 		return -EOPNOTSUPP;
++ 	if (block->nooffloaddevcnt && err_stop) {
++ 		ok_count = -EOPNOTSUPP;
++ 		goto err_unlock;
++ 	}
+  
+ -	list_for_each_entry(block_cb, &block->flow_block.cb_list, list) {
+ +	list_for_each_entry(block_cb, &block->cb_list, list) {
+  		err = block_cb->cb(type, type_data, block_cb->cb_priv);
+  		if (err) {
+- 			if (err_stop)
+- 				return err;
++ 			if (err_stop) {
++ 				ok_count = err;
++ 				goto err_unlock;
++ 			}
+  		} else {
+  			ok_count++;
+  		}
+* Unmerged path include/net/sch_generic.h
+* Unmerged path net/sched/cls_api.c
