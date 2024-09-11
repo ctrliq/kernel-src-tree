@@ -1,0 +1,97 @@
+mm/gup: fix omission of check on FOLL_LONGTERM in gup fast path
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-310.el8
+commit-author Pingfan Liu <kernelfans@gmail.com>
+commit df3a0a21b698d68ba046d5ed185a4990b06d19a8
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-310.el8/df3a0a21.failed
+
+FOLL_LONGTERM is a special case of FOLL_PIN.  It suggests a pin which is
+going to be given to hardware and can't move.  It would truncate CMA
+permanently and should be excluded.
+
+In gup slow path, where
+__gup_longterm_locked->check_and_migrate_cma_pages() handles
+FOLL_LONGTERM, but in fast path, there lacks such a check, which means a
+possible leak of CMA page to longterm pinned.
+
+Place a check in try_grab_compound_head() in the fast path to fix the
+leak, and if FOLL_LONGTERM happens on CMA, it will fall back to slow path
+to migrate the page.
+
+Some note about the check: Huge page's subpages have the same migrate type
+due to either allocation from a free_list[] or alloc_contig_range() with
+param MIGRATE_MOVABLE.  So it is enough to check on a single subpage by
+is_migrate_cma_page(subpage)
+
+	Signed-off-by: Pingfan Liu <kernelfans@gmail.com>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Reviewed-by: Christoph Hellwig <hch@lst.de>
+	Reviewed-by: Jason Gunthorpe <jgg@mellanox.com>
+	Cc: Ira Weiny <ira.weiny@intel.com>
+	Cc: Mike Rapoport <rppt@linux.ibm.com>
+	Cc: Dan Williams <dan.j.williams@intel.com>
+	Cc: Matthew Wilcox <willy@infradead.org>
+	Cc: John Hubbard <jhubbard@nvidia.com>
+	Cc: "Aneesh Kumar K.V" <aneesh.kumar@linux.ibm.com>
+	Cc: Christoph Hellwig <hch@infradead.org>
+	Cc: Shuah Khan <shuah@kernel.org>
+	Cc: Jason Gunthorpe <jgg@ziepe.ca>
+Link: http://lkml.kernel.org/r/1584876733-17405-3-git-send-email-kernelfans@gmail.com
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit df3a0a21b698d68ba046d5ed185a4990b06d19a8)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	mm/gup.c
+diff --cc mm/gup.c
+index eb225cc5e706,5168665da584..000000000000
+--- a/mm/gup.c
++++ b/mm/gup.c
+@@@ -69,8 -86,38 +69,43 @@@ static __maybe_unused struct page *try_
+  	if (flags & FOLL_GET)
+  		return try_get_compound_head(page, refs);
+  	else if (flags & FOLL_PIN) {
+++<<<<<<< HEAD
+ +		refs *= GUP_PIN_COUNTING_BIAS;
+ +		return try_get_compound_head(page, refs);
+++=======
++ 		int orig_refs = refs;
++ 
++ 		/*
++ 		 * Can't do FOLL_LONGTERM + FOLL_PIN with CMA in the gup fast
++ 		 * path, so fail and let the caller fall back to the slow path.
++ 		 */
++ 		if (unlikely(flags & FOLL_LONGTERM) &&
++ 				is_migrate_cma_page(page))
++ 			return NULL;
++ 
++ 		/*
++ 		 * When pinning a compound page of order > 1 (which is what
++ 		 * hpage_pincount_available() checks for), use an exact count to
++ 		 * track it, via hpage_pincount_add/_sub().
++ 		 *
++ 		 * However, be sure to *also* increment the normal page refcount
++ 		 * field at least once, so that the page really is pinned.
++ 		 */
++ 		if (!hpage_pincount_available(page))
++ 			refs *= GUP_PIN_COUNTING_BIAS;
++ 
++ 		page = try_get_compound_head(page, refs);
++ 		if (!page)
++ 			return NULL;
++ 
++ 		if (hpage_pincount_available(page))
++ 			hpage_pincount_add(page, refs);
++ 
++ 		mod_node_page_state(page_pgdat(page), NR_FOLL_PIN_ACQUIRED,
++ 				    orig_refs);
++ 
++ 		return page;
+++>>>>>>> df3a0a21b698 (mm/gup: fix omission of check on FOLL_LONGTERM in gup fast path)
+  	}
+  
+  	WARN_ON_ONCE(1);
+* Unmerged path mm/gup.c
