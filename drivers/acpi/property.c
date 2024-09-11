@@ -642,7 +642,7 @@ static int acpi_data_get_property_array(const struct acpi_device_data *data,
  */
 int __acpi_node_get_property_reference(const struct fwnode_handle *fwnode,
 	const char *propname, size_t index, size_t num_args,
-	struct acpi_reference_args *args)
+	struct fwnode_reference_args *args)
 {
 	const union acpi_object *element, *end;
 	const union acpi_object *obj;
@@ -670,7 +670,7 @@ int __acpi_node_get_property_reference(const struct fwnode_handle *fwnode,
 		if (ret)
 			return ret == -ENODEV ? -EINVAL : ret;
 
-		args->adev = device;
+		args->fwnode = acpi_fwnode_handle(device);
 		args->nargs = 0;
 		return 0;
 	}
@@ -716,11 +716,11 @@ int __acpi_node_get_property_reference(const struct fwnode_handle *fwnode,
 					return -EINVAL;
 			}
 
-			if (nargs > MAX_ACPI_REFERENCE_ARGS)
+			if (nargs > NR_FWNODE_REFERENCE_ARGS)
 				return -EINVAL;
 
 			if (idx == index) {
-				args->adev = device;
+				args->fwnode = acpi_fwnode_handle(device);
 				args->nargs = nargs;
 				for (i = 0; i < nargs; i++)
 					args->args[i] = element[i].integer.value;
@@ -1152,7 +1152,7 @@ int acpi_graph_get_remote_endpoint(const struct fwnode_handle *__fwnode,
 {
 	struct fwnode_handle *fwnode;
 	unsigned int port_nr, endpoint_nr;
-	struct acpi_reference_args args;
+	struct fwnode_reference_args args;
 	int ret;
 
 	memset(&args, 0, sizeof(args));
@@ -1161,6 +1161,10 @@ int acpi_graph_get_remote_endpoint(const struct fwnode_handle *__fwnode,
 	if (ret)
 		return ret;
 
+	/* Ensure this is a device node. */
+	if (!is_acpi_device_node(args.fwnode))
+		return -ENODEV;
+
 	/*
 	 * Always require two arguments with the reference: port and
 	 * endpoint indices.
@@ -1168,7 +1172,7 @@ int acpi_graph_get_remote_endpoint(const struct fwnode_handle *__fwnode,
 	if (args.nargs != 2)
 		return -EPROTO;
 
-	fwnode = acpi_fwnode_handle(args.adev);
+	fwnode = args.fwnode;
 	port_nr = args.args[0];
 	endpoint_nr = args.args[1];
 
@@ -1272,24 +1276,8 @@ acpi_fwnode_get_reference_args(const struct fwnode_handle *fwnode,
 			       unsigned int args_count, unsigned int index,
 			       struct fwnode_reference_args *args)
 {
-	struct acpi_reference_args acpi_args;
-	unsigned int i;
-	int ret;
-
-	ret = __acpi_node_get_property_reference(fwnode, prop, index,
-						 args_count, &acpi_args);
-	if (ret < 0)
-		return ret;
-	if (!args)
-		return 0;
-
-	args->nargs = acpi_args.nargs;
-	args->fwnode = acpi_fwnode_handle(acpi_args.adev);
-
-	for (i = 0; i < NR_FWNODE_REFERENCE_ARGS; i++)
-		args->args[i] = i < acpi_args.nargs ? acpi_args.args[i] : 0;
-
-	return 0;
+	return __acpi_node_get_property_reference(fwnode, prop, index,
+						  args_count, args);
 }
 
 static struct fwnode_handle *
