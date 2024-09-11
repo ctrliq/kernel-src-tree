@@ -1,0 +1,154 @@
+x86/fpu: Introduce copy_supervisor_to_kernel()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Yu-cheng Yu <yu-cheng.yu@intel.com>
+commit eeedf1533687b8e81865fdbde79eddf7c4b76c9a
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/eeedf153.failed
+
+The XSAVES instruction takes a mask and saves only the features specified
+in that mask.  The kernel normally specifies that all features be saved.
+
+XSAVES also unconditionally uses the "compacted format" which means that
+all specified features are saved next to each other in memory.  If a
+feature is removed from the mask, all the features after it will "move
+up" into earlier locations in the buffer.
+
+Introduce copy_supervisor_to_kernel(), which saves only supervisor states
+and then moves those states into the standard location where they are
+normally found.
+
+	Signed-off-by: Yu-cheng Yu <yu-cheng.yu@intel.com>
+	Signed-off-by: Borislav Petkov <bp@suse.de>
+Link: https://lkml.kernel.org/r/20200512145444.15483-9-yu-cheng.yu@intel.com
+(cherry picked from commit eeedf1533687b8e81865fdbde79eddf7c4b76c9a)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kernel/fpu/xstate.c
+diff --cc arch/x86/kernel/fpu/xstate.c
+index 59e66b3b5b95,587e03f0094d..000000000000
+--- a/arch/x86/kernel/fpu/xstate.c
++++ b/arch/x86/kernel/fpu/xstate.c
+@@@ -1251,3 -1290,103 +1280,106 @@@ int copy_user_to_xstate(struct xregs_st
+  
+  	return 0;
+  }
+++<<<<<<< HEAD
+++=======
++ 
++ /*
++  * Save only supervisor states to the kernel buffer.  This blows away all
++  * old states, and is intended to be used only in __fpu__restore_sig(), where
++  * user states are restored from the user buffer.
++  */
++ void copy_supervisor_to_kernel(struct xregs_state *xstate)
++ {
++ 	struct xstate_header *header;
++ 	u64 max_bit, min_bit;
++ 	u32 lmask, hmask;
++ 	int err, i;
++ 
++ 	if (WARN_ON(!boot_cpu_has(X86_FEATURE_XSAVES)))
++ 		return;
++ 
++ 	if (!xfeatures_mask_supervisor())
++ 		return;
++ 
++ 	max_bit = __fls(xfeatures_mask_supervisor());
++ 	min_bit = __ffs(xfeatures_mask_supervisor());
++ 
++ 	lmask = xfeatures_mask_supervisor();
++ 	hmask = xfeatures_mask_supervisor() >> 32;
++ 	XSTATE_OP(XSAVES, xstate, lmask, hmask, err);
++ 
++ 	/* We should never fault when copying to a kernel buffer: */
++ 	if (WARN_ON_FPU(err))
++ 		return;
++ 
++ 	/*
++ 	 * At this point, the buffer has only supervisor states and must be
++ 	 * converted back to normal kernel format.
++ 	 */
++ 	header = &xstate->header;
++ 	header->xcomp_bv |= xfeatures_mask_all;
++ 
++ 	/*
++ 	 * This only moves states up in the buffer.  Start with
++ 	 * the last state and move backwards so that states are
++ 	 * not overwritten until after they are moved.  Note:
++ 	 * memmove() allows overlapping src/dst buffers.
++ 	 */
++ 	for (i = max_bit; i >= min_bit; i--) {
++ 		u8 *xbuf = (u8 *)xstate;
++ 
++ 		if (!((header->xfeatures >> i) & 1))
++ 			continue;
++ 
++ 		/* Move xfeature 'i' into its normal location */
++ 		memmove(xbuf + xstate_comp_offsets[i],
++ 			xbuf + xstate_supervisor_only_offsets[i],
++ 			xstate_sizes[i]);
++ 	}
++ }
++ 
++ #ifdef CONFIG_PROC_PID_ARCH_STATUS
++ /*
++  * Report the amount of time elapsed in millisecond since last AVX512
++  * use in the task.
++  */
++ static void avx512_status(struct seq_file *m, struct task_struct *task)
++ {
++ 	unsigned long timestamp = READ_ONCE(task->thread.fpu.avx512_timestamp);
++ 	long delta;
++ 
++ 	if (!timestamp) {
++ 		/*
++ 		 * Report -1 if no AVX512 usage
++ 		 */
++ 		delta = -1;
++ 	} else {
++ 		delta = (long)(jiffies - timestamp);
++ 		/*
++ 		 * Cap to LONG_MAX if time difference > LONG_MAX
++ 		 */
++ 		if (delta < 0)
++ 			delta = LONG_MAX;
++ 		delta = jiffies_to_msecs(delta);
++ 	}
++ 
++ 	seq_put_decimal_ll(m, "AVX512_elapsed_ms:\t", delta);
++ 	seq_putc(m, '\n');
++ }
++ 
++ /*
++  * Report architecture specific information
++  */
++ int proc_pid_arch_status(struct seq_file *m, struct pid_namespace *ns,
++ 			struct pid *pid, struct task_struct *task)
++ {
++ 	/*
++ 	 * Report AVX512 state if the processor and build option supported.
++ 	 */
++ 	if (cpu_feature_enabled(X86_FEATURE_AVX512F))
++ 		avx512_status(m, task);
++ 
++ 	return 0;
++ }
++ #endif /* CONFIG_PROC_PID_ARCH_STATUS */
+++>>>>>>> eeedf1533687 (x86/fpu: Introduce copy_supervisor_to_kernel())
+diff --git a/arch/x86/include/asm/fpu/xstate.h b/arch/x86/include/asm/fpu/xstate.h
+index 9ba156a1547e..2fb025ff64c3 100644
+--- a/arch/x86/include/asm/fpu/xstate.h
++++ b/arch/x86/include/asm/fpu/xstate.h
+@@ -65,6 +65,7 @@ int copy_xstate_to_kernel(void *kbuf, struct xregs_state *xsave, unsigned int of
+ int copy_xstate_to_user(void __user *ubuf, struct xregs_state *xsave, unsigned int offset, unsigned int size);
+ int copy_kernel_to_xstate(struct xregs_state *xsave, const void *kbuf);
+ int copy_user_to_xstate(struct xregs_state *xsave, const void __user *ubuf);
++void copy_supervisor_to_kernel(struct xregs_state *xsave);
+ 
+ /* Validate an xstate header supplied by userspace (ptrace or sigreturn) */
+ int validate_user_xstate_header(const struct xstate_header *hdr);
+* Unmerged path arch/x86/kernel/fpu/xstate.c
