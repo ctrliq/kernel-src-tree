@@ -1,0 +1,215 @@
+RDMA/rxe: Fix FIXME in rxe_udp_encap_recv()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-310.el8
+commit-author Bob Pearson <rpearsonhpe@gmail.com>
+commit 899aba891cab1555c9ca16a558769efb177baf44
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-310.el8/899aba89.failed
+
+rxe_udp_encap_recv() drops the reference to rxe->ib_dev taken by
+rxe_get_dev_from_net() which should be held until each received skb is
+freed. This patch moves the calls to ib_device_put() to each place a
+received skb is freed. It also takes references to the ib_device for each
+cloned skb created to process received multicast packets.
+
+Fixes: 4c173f596b3f ("RDMA/rxe: Use ib_device_get_by_netdev() instead of open coding")
+Link: https://lore.kernel.org/r/20210128233318.2591-1-rpearson@hpe.com
+	Signed-off-by: Bob Pearson <rpearson@hpe.com>
+	Signed-off-by: Jason Gunthorpe <jgg@nvidia.com>
+(cherry picked from commit 899aba891cab1555c9ca16a558769efb177baf44)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/infiniband/sw/rxe/rxe_net.c
+diff --cc drivers/infiniband/sw/rxe/rxe_net.c
+index 5fcc9cc681ba,36d56163afac..000000000000
+--- a/drivers/infiniband/sw/rxe/rxe_net.c
++++ b/drivers/infiniband/sw/rxe/rxe_net.c
+@@@ -165,15 -152,14 +165,25 @@@ static struct dst_entry *rxe_find_route
+  static int rxe_udp_encap_recv(struct sock *sk, struct sk_buff *skb)
+  {
+  	struct udphdr *udph;
++ 	struct rxe_dev *rxe;
+  	struct net_device *ndev = skb->dev;
+++<<<<<<< HEAD
+ +	struct net_device *rdev = ndev;
+ +	struct rxe_dev *rxe = rxe_get_dev_from_net(ndev);
+ +	struct rxe_pkt_info *pkt = SKB_TO_PKT(skb);
+ +
+ +	if (!rxe && is_vlan_dev(rdev)) {
+ +		rdev = vlan_dev_real_dev(ndev);
+ +		rxe = rxe_get_dev_from_net(rdev);
+ +	}
+++=======
++ 	struct rxe_pkt_info *pkt = SKB_TO_PKT(skb);
++ 
++ 	/* takes a reference on rxe->ib_dev
++ 	 * drop when skb is freed
++ 	 */
++ 	rxe = rxe_get_dev_from_net(ndev);
+++>>>>>>> 899aba891cab (RDMA/rxe: Fix FIXME in rxe_udp_encap_recv())
+  	if (!rxe)
+  		goto drop;
+  
+diff --git a/drivers/infiniband/sw/rxe/rxe_comp.c b/drivers/infiniband/sw/rxe/rxe_comp.c
+index 2adc7956726d..a7f3f5086758 100644
+--- a/drivers/infiniband/sw/rxe/rxe_comp.c
++++ b/drivers/infiniband/sw/rxe/rxe_comp.c
+@@ -515,6 +515,7 @@ static void rxe_drain_resp_pkts(struct rxe_qp *qp, bool notify)
+ 	while ((skb = skb_dequeue(&qp->resp_pkts))) {
+ 		rxe_drop_ref(qp);
+ 		kfree_skb(skb);
++		ib_device_put(qp->ibqp.device);
+ 	}
+ 
+ 	while ((wqe = queue_head(qp->sq.queue))) {
+@@ -527,6 +528,17 @@ static void rxe_drain_resp_pkts(struct rxe_qp *qp, bool notify)
+ 	}
+ }
+ 
++static void free_pkt(struct rxe_pkt_info *pkt)
++{
++	struct sk_buff *skb = PKT_TO_SKB(pkt);
++	struct rxe_qp *qp = pkt->qp;
++	struct ib_device *dev = qp->ibqp.device;
++
++	kfree_skb(skb);
++	rxe_drop_ref(qp);
++	ib_device_put(dev);
++}
++
+ int rxe_completer(void *arg)
+ {
+ 	struct rxe_qp *qp = (struct rxe_qp *)arg;
+@@ -624,11 +636,8 @@ int rxe_completer(void *arg)
+ 			break;
+ 
+ 		case COMPST_DONE:
+-			if (pkt) {
+-				rxe_drop_ref(pkt->qp);
+-				kfree_skb(skb);
+-				skb = NULL;
+-			}
++			if (pkt)
++				free_pkt(pkt);
+ 			goto done;
+ 
+ 		case COMPST_EXIT:
+@@ -671,12 +680,8 @@ int rxe_completer(void *arg)
+ 			 */
+ 			if (qp->comp.started_retry &&
+ 			    !qp->comp.timeout_retry) {
+-				if (pkt) {
+-					rxe_drop_ref(pkt->qp);
+-					kfree_skb(skb);
+-					skb = NULL;
+-				}
+-
++				if (pkt)
++					free_pkt(pkt);
+ 				goto done;
+ 			}
+ 
+@@ -699,13 +704,8 @@ int rxe_completer(void *arg)
+ 					qp->comp.started_retry = 1;
+ 					rxe_run_task(&qp->req.task, 0);
+ 				}
+-
+-				if (pkt) {
+-					rxe_drop_ref(pkt->qp);
+-					kfree_skb(skb);
+-					skb = NULL;
+-				}
+-
++				if (pkt)
++					free_pkt(pkt);
+ 				goto done;
+ 
+ 			} else {
+@@ -726,9 +726,7 @@ int rxe_completer(void *arg)
+ 				mod_timer(&qp->rnr_nak_timer,
+ 					  jiffies + rnrnak_jiffies(aeth_syn(pkt)
+ 						& ~AETH_TYPE_MASK));
+-				rxe_drop_ref(pkt->qp);
+-				kfree_skb(skb);
+-				skb = NULL;
++				free_pkt(pkt);
+ 				goto exit;
+ 			} else {
+ 				rxe_counter_inc(rxe,
+@@ -742,13 +740,8 @@ int rxe_completer(void *arg)
+ 			WARN_ON_ONCE(wqe->status == IB_WC_SUCCESS);
+ 			do_complete(qp, wqe);
+ 			rxe_qp_error(qp);
+-
+-			if (pkt) {
+-				rxe_drop_ref(pkt->qp);
+-				kfree_skb(skb);
+-				skb = NULL;
+-			}
+-
++			if (pkt)
++				free_pkt(pkt);
+ 			goto exit;
+ 		}
+ 	}
+* Unmerged path drivers/infiniband/sw/rxe/rxe_net.c
+diff --git a/drivers/infiniband/sw/rxe/rxe_recv.c b/drivers/infiniband/sw/rxe/rxe_recv.c
+index 5714ae334ac3..45d2f711bce2 100644
+--- a/drivers/infiniband/sw/rxe/rxe_recv.c
++++ b/drivers/infiniband/sw/rxe/rxe_recv.c
+@@ -274,6 +274,10 @@ static void rxe_rcv_mcast_pkt(struct rxe_dev *rxe, struct sk_buff *skb)
+ 		 */
+ 		if (mce->qp_list.next != &mcg->qp_list) {
+ 			per_qp_skb = skb_clone(skb, GFP_ATOMIC);
++			if (WARN_ON(!ib_device_try_get(&rxe->ib_dev))) {
++				kfree_skb(per_qp_skb);
++				continue;
++			}
+ 		} else {
+ 			per_qp_skb = skb;
+ 			/* show we have consumed the skb */
+@@ -296,6 +300,7 @@ static void rxe_rcv_mcast_pkt(struct rxe_dev *rxe, struct sk_buff *skb)
+ err1:
+ 	/* free skb if not consumed */
+ 	kfree_skb(skb);
++	ib_device_put(&rxe->ib_dev);
+ }
+ 
+ /**
+@@ -403,4 +408,5 @@ void rxe_rcv(struct sk_buff *skb)
+ 		rxe_drop_ref(pkt->qp);
+ 
+ 	kfree_skb(skb);
++	ib_device_put(&rxe->ib_dev);
+ }
+diff --git a/drivers/infiniband/sw/rxe/rxe_resp.c b/drivers/infiniband/sw/rxe/rxe_resp.c
+index b056ad84e6d4..142f3d8014d8 100644
+--- a/drivers/infiniband/sw/rxe/rxe_resp.c
++++ b/drivers/infiniband/sw/rxe/rxe_resp.c
+@@ -99,6 +99,7 @@ static inline enum resp_states get_req(struct rxe_qp *qp,
+ 		while ((skb = skb_dequeue(&qp->req_pkts))) {
+ 			rxe_drop_ref(qp);
+ 			kfree_skb(skb);
++			ib_device_put(qp->ibqp.device);
+ 		}
+ 
+ 		/* go drain recv wr queue */
+@@ -1016,6 +1017,7 @@ static enum resp_states cleanup(struct rxe_qp *qp,
+ 		skb = skb_dequeue(&qp->req_pkts);
+ 		rxe_drop_ref(qp);
+ 		kfree_skb(skb);
++		ib_device_put(qp->ibqp.device);
+ 	}
+ 
+ 	if (qp->resp.mr) {
+@@ -1180,6 +1182,7 @@ static void rxe_drain_req_pkts(struct rxe_qp *qp, bool notify)
+ 	while ((skb = skb_dequeue(&qp->req_pkts))) {
+ 		rxe_drop_ref(qp);
+ 		kfree_skb(skb);
++		ib_device_put(qp->ibqp.device);
+ 	}
+ 
+ 	if (notify)
