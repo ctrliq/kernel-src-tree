@@ -1,0 +1,302 @@
+KVM: x86/mmu: Skip rmap operations if rmaps not allocated
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-408.el8
+commit-author Ben Gardon <bgardon@google.com>
+commit e2209710ccc5d28d8b88c822d2f3e03b269a2856
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-408.el8/e2209710.failed
+
+If only the TDP MMU is being used to manage the memory mappings for a VM,
+then many rmap operations can be skipped as they are guaranteed to be
+no-ops. This saves some time which would be spent on the rmap operation.
+It also avoids acquiring the MMU lock in write mode for many operations.
+
+This makes it safe to run the VM without rmaps allocated, when only
+using the TDP MMU and sets the stage for waiting to allocate the rmaps
+until they're needed.
+
+	Signed-off-by: Ben Gardon <bgardon@google.com>
+Message-Id: <20210518173414.450044-7-bgardon@google.com>
+	Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+(cherry picked from commit e2209710ccc5d28d8b88c822d2f3e03b269a2856)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kvm/mmu/mmu.c
+diff --cc arch/x86/kvm/mmu/mmu.c
+index 4c612c0dc324,2131f71577bc..000000000000
+--- a/arch/x86/kvm/mmu/mmu.c
++++ b/arch/x86/kvm/mmu/mmu.c
+@@@ -1580,43 -1459,38 +1590,62 @@@ static __always_inline int kvm_handle_h
+  	return ret;
+  }
+  
+ -bool kvm_unmap_gfn_range(struct kvm *kvm, struct kvm_gfn_range *range)
+ +static int kvm_handle_hva(struct kvm *kvm, unsigned long hva,
+ +			  unsigned long data, rmap_handler_t handler)
+  {
+++<<<<<<< HEAD
+ +	return kvm_handle_hva_range(kvm, hva, hva + 1, data, handler);
+++=======
++ 	bool flush = false;
++ 
++ 	if (kvm_memslots_have_rmaps(kvm))
++ 		flush = kvm_handle_gfn_range(kvm, range, kvm_unmap_rmapp);
++ 
++ 	if (is_tdp_mmu_enabled(kvm))
++ 		flush |= kvm_tdp_mmu_unmap_gfn_range(kvm, range, flush);
++ 
++ 	return flush;
+++>>>>>>> e2209710ccc5 (KVM: x86/mmu: Skip rmap operations if rmaps not allocated)
+  }
+  
+ -bool kvm_set_spte_gfn(struct kvm *kvm, struct kvm_gfn_range *range)
+ +int kvm_unmap_hva_range(struct kvm *kvm, unsigned long start, unsigned long end,
+ +			unsigned flags)
+  {
+++<<<<<<< HEAD
+ +	int r;
+ +
+ +	r = kvm_handle_hva_range(kvm, start, end, 0, kvm_unmap_rmapp);
+++=======
++ 	bool flush = false;
++ 
++ 	if (kvm_memslots_have_rmaps(kvm))
++ 		flush = kvm_handle_gfn_range(kvm, range, kvm_set_pte_rmapp);
+++>>>>>>> e2209710ccc5 (KVM: x86/mmu: Skip rmap operations if rmaps not allocated)
+  
+  	if (is_tdp_mmu_enabled(kvm))
+ -		flush |= kvm_tdp_mmu_set_spte_gfn(kvm, range);
+ +		r |= kvm_tdp_mmu_zap_hva_range(kvm, start, end);
+  
+ -	return flush;
+ +	return r;
+  }
+  
+ -static bool kvm_age_rmapp(struct kvm *kvm, struct kvm_rmap_head *rmap_head,
+ -			  struct kvm_memory_slot *slot, gfn_t gfn, int level,
+ -			  pte_t unused)
+ +int kvm_set_spte_hva(struct kvm *kvm, unsigned long hva, pte_t pte)
+ +{
+ +	int r;
+ +
+ +	r = kvm_handle_hva(kvm, hva, (unsigned long)&pte, kvm_set_pte_rmapp);
+ +
+ +	if (is_tdp_mmu_enabled(kvm))
+ +		r |= kvm_tdp_mmu_set_spte_hva(kvm, hva, &pte);
+ +
+ +	return r;
+ +}
+ +
+ +static int kvm_age_rmapp(struct kvm *kvm, struct kvm_rmap_head *rmap_head,
+ +			 struct kvm_memory_slot *slot, gfn_t gfn, int level,
+ +			 unsigned long data)
+  {
+  	u64 *sptep;
+ -	struct rmap_iterator iter;
+ +	struct rmap_iterator uninitialized_var(iter);
+  	int young = 0;
+  
+  	for_each_rmap_spte(rmap_head, &iter, sptep)
+@@@ -1655,24 -1528,28 +1684,38 @@@ static void rmap_recycle(struct kvm_vcp
+  			KVM_PAGES_PER_HPAGE(sp->role.level));
+  }
+  
+ -bool kvm_age_gfn(struct kvm *kvm, struct kvm_gfn_range *range)
+ +int kvm_age_hva(struct kvm *kvm, unsigned long start, unsigned long end)
+  {
+++<<<<<<< HEAD
+ +	int young = false;
+++=======
++ 	bool young = false;
++ 
++ 	if (kvm_memslots_have_rmaps(kvm))
++ 		young = kvm_handle_gfn_range(kvm, range, kvm_age_rmapp);
+++>>>>>>> e2209710ccc5 (KVM: x86/mmu: Skip rmap operations if rmaps not allocated)
+  
+ +	young = kvm_handle_hva_range(kvm, start, end, 0, kvm_age_rmapp);
+  	if (is_tdp_mmu_enabled(kvm))
+ -		young |= kvm_tdp_mmu_age_gfn_range(kvm, range);
+ +		young |= kvm_tdp_mmu_age_hva_range(kvm, start, end);
+  
+  	return young;
+  }
+  
+ -bool kvm_test_age_gfn(struct kvm *kvm, struct kvm_gfn_range *range)
+ +int kvm_test_age_hva(struct kvm *kvm, unsigned long hva)
+  {
+++<<<<<<< HEAD
+ +	int young = false;
+++=======
++ 	bool young = false;
++ 
++ 	if (kvm_memslots_have_rmaps(kvm))
++ 		young = kvm_handle_gfn_range(kvm, range, kvm_test_age_rmapp);
+++>>>>>>> e2209710ccc5 (KVM: x86/mmu: Skip rmap operations if rmaps not allocated)
+  
+ +	young = kvm_handle_hva(kvm, hva, 0, kvm_test_age_rmapp);
+  	if (is_tdp_mmu_enabled(kvm))
+ -		young |= kvm_tdp_mmu_test_age_gfn(kvm, range);
+ +		young |= kvm_tdp_mmu_test_age_hva(kvm, hva);
+  
+  	return young;
+  }
+@@@ -5712,15 -5572,18 +5760,30 @@@ void kvm_zap_gfn_range(struct kvm *kvm
+  	}
+  
+  	if (is_tdp_mmu_enabled(kvm)) {
+++<<<<<<< HEAD
+ +		for (i = 0; i < KVM_ADDRESS_SPACE_NUM; i++)
+ +			flush = kvm_tdp_mmu_zap_gfn_range(kvm, i, gfn_start,
+ +							  gfn_end, flush);
+ +	}
+ +
+ +	if (flush)
+ +		kvm_flush_remote_tlbs_with_address(kvm, gfn_start, gfn_end);
+ +
+ +	write_unlock(&kvm->mmu_lock);
+++=======
++ 		flush = false;
++ 
++ 		read_lock(&kvm->mmu_lock);
++ 		for (i = 0; i < KVM_ADDRESS_SPACE_NUM; i++)
++ 			flush = kvm_tdp_mmu_zap_gfn_range(kvm, i, gfn_start,
++ 							  gfn_end, flush, true);
++ 		if (flush)
++ 			kvm_flush_remote_tlbs_with_address(kvm, gfn_start,
++ 							   gfn_end);
++ 
++ 		read_unlock(&kvm->mmu_lock);
++ 	}
+++>>>>>>> e2209710ccc5 (KVM: x86/mmu: Skip rmap operations if rmaps not allocated)
+  }
+  
+  static bool slot_rmap_write_protect(struct kvm *kvm,
+@@@ -5734,14 -5597,21 +5797,27 @@@ void kvm_mmu_slot_remove_write_access(s
+  				      struct kvm_memory_slot *memslot,
+  				      int start_level)
+  {
+- 	bool flush;
++ 	bool flush = false;
+  
+++<<<<<<< HEAD
+ +	write_lock(&kvm->mmu_lock);
+ +	flush = slot_handle_level(kvm, memslot, slot_rmap_write_protect,
+ +				start_level, KVM_MAX_HUGEPAGE_LEVEL, false);
+ +	if (is_tdp_mmu_enabled(kvm))
+++=======
++ 	if (kvm_memslots_have_rmaps(kvm)) {
++ 		write_lock(&kvm->mmu_lock);
++ 		flush = slot_handle_level(kvm, memslot, slot_rmap_write_protect,
++ 					  start_level, KVM_MAX_HUGEPAGE_LEVEL,
++ 					  false);
++ 		write_unlock(&kvm->mmu_lock);
++ 	}
++ 
++ 	if (is_tdp_mmu_enabled(kvm)) {
++ 		read_lock(&kvm->mmu_lock);
+++>>>>>>> e2209710ccc5 (KVM: x86/mmu: Skip rmap operations if rmaps not allocated)
+  		flush |= kvm_tdp_mmu_wrprot_slot(kvm, memslot, start_level);
+ -		read_unlock(&kvm->mmu_lock);
+ -	}
+ +	write_unlock(&kvm->mmu_lock);
+  
+  	/*
+  	 * We can flush all the TLBs out of the mmu lock without TLB
+@@@ -5803,18 -5673,23 +5879,36 @@@ void kvm_mmu_zap_collapsible_sptes(stru
+  {
+  	/* FIXME: const-ify all uses of struct kvm_memory_slot.  */
+  	struct kvm_memory_slot *slot = (struct kvm_memory_slot *)memslot;
+ -	bool flush;
+ +	bool flush = false;
+ +
+++<<<<<<< HEAD
+ +	write_lock(&kvm->mmu_lock);
+ +	flush = slot_handle_leaf(kvm, slot, kvm_mmu_zap_collapsible_spte, true);
+ +
+ +	if (is_tdp_mmu_enabled(kvm))
+ +		flush = kvm_tdp_mmu_zap_collapsible_sptes(kvm, slot, flush);
+ +
+ +	if (flush)
+ +		kvm_arch_flush_remote_tlbs_memslot(kvm, slot);
+  
+ +	write_unlock(&kvm->mmu_lock);
+++=======
++ 	if (kvm_memslots_have_rmaps(kvm)) {
++ 		write_lock(&kvm->mmu_lock);
++ 		flush = slot_handle_leaf(kvm, slot, kvm_mmu_zap_collapsible_spte, true);
++ 		if (flush)
++ 			kvm_arch_flush_remote_tlbs_memslot(kvm, slot);
++ 		write_unlock(&kvm->mmu_lock);
++ 	}
++ 
++ 	if (is_tdp_mmu_enabled(kvm)) {
++ 		read_lock(&kvm->mmu_lock);
++ 		flush = kvm_tdp_mmu_zap_collapsible_sptes(kvm, slot, flush);
++ 		if (flush)
++ 			kvm_arch_flush_remote_tlbs_memslot(kvm, slot);
++ 		read_unlock(&kvm->mmu_lock);
++ 	}
+++>>>>>>> e2209710ccc5 (KVM: x86/mmu: Skip rmap operations if rmaps not allocated)
+  }
+  
+  void kvm_arch_flush_remote_tlbs_memslot(struct kvm *kvm,
+@@@ -5835,13 -5710,20 +5929,25 @@@
+  void kvm_mmu_slot_leaf_clear_dirty(struct kvm *kvm,
+  				   struct kvm_memory_slot *memslot)
+  {
+- 	bool flush;
++ 	bool flush = false;
+  
+++<<<<<<< HEAD
+ +	write_lock(&kvm->mmu_lock);
+ +	flush = slot_handle_leaf(kvm, memslot, __rmap_clear_dirty, false);
+ +	if (is_tdp_mmu_enabled(kvm))
+++=======
++ 	if (kvm_memslots_have_rmaps(kvm)) {
++ 		write_lock(&kvm->mmu_lock);
++ 		flush = slot_handle_leaf(kvm, memslot, __rmap_clear_dirty,
++ 					 false);
++ 		write_unlock(&kvm->mmu_lock);
++ 	}
++ 
++ 	if (is_tdp_mmu_enabled(kvm)) {
++ 		read_lock(&kvm->mmu_lock);
+++>>>>>>> e2209710ccc5 (KVM: x86/mmu: Skip rmap operations if rmaps not allocated)
+  		flush |= kvm_tdp_mmu_clear_dirty_slot(kvm, memslot);
+ -		read_unlock(&kvm->mmu_lock);
+ -	}
+ +	write_unlock(&kvm->mmu_lock);
+  
+  	/*
+  	 * It's also safe to flush TLBs out of mmu lock here as currently this
+diff --git a/arch/x86/kvm/mmu.h b/arch/x86/kvm/mmu.h
+index c9adcc66bdd5..d9e8a056fe9a 100644
+--- a/arch/x86/kvm/mmu.h
++++ b/arch/x86/kvm/mmu.h
+@@ -229,4 +229,9 @@ int kvm_arch_write_log_dirty(struct kvm_vcpu *vcpu);
+ int kvm_mmu_post_init_vm(struct kvm *kvm);
+ void kvm_mmu_pre_destroy_vm(struct kvm *kvm);
+ 
++static inline bool kvm_memslots_have_rmaps(struct kvm *kvm)
++{
++	return kvm->arch.memslots_have_rmaps;
++}
++
+ #endif
+* Unmerged path arch/x86/kvm/mmu/mmu.c
+diff --git a/arch/x86/kvm/x86.c b/arch/x86/kvm/x86.c
+index 8637d2d61d5e..31fb7112b6c1 100644
+--- a/arch/x86/kvm/x86.c
++++ b/arch/x86/kvm/x86.c
+@@ -11608,7 +11608,7 @@ static int kvm_alloc_memslot_metadata(struct kvm *kvm,
+ 	 */
+ 	memset(&slot->arch, 0, sizeof(slot->arch));
+ 
+-	if (kvm->arch.memslots_have_rmaps) {
++	if (kvm_memslots_have_rmaps(kvm)) {
+ 		r = memslot_rmap_alloc(slot, npages);
+ 		if (r)
+ 			return r;
