@@ -1,0 +1,1012 @@
+scsi: qla2xxx: Add 28xx flash primary/secondary status/image mechanism
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-147.el8
+commit-author Joe Carnuccio <joe.carnuccio@cavium.com>
+commit 5fa8774c7f38c79f38b672c1a0db0c049da477d6
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-147.el8/5fa8774c.failed
+
+Includes the following:
+- correction to 27xx image status struct;
+- factoring of 27xx image status validating routines to make common;
+- image status generation compare that works across zero wrap;
+- bsg interface to report current active images (as loaded by driver).
+
+	Signed-off-by: Joe Carnuccio <joe.carnuccio@cavium.com>
+	Signed-off-by: Mike Hernandez <mhernandez@marvell.com>
+	Signed-off-by: Himanshu Madhani <hmadhani@marvell.com>
+	Signed-off-by: Martin K. Petersen <martin.petersen@oracle.com>
+(cherry picked from commit 5fa8774c7f38c79f38b672c1a0db0c049da477d6)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/scsi/qla2xxx/qla_attr.c
+#	drivers/scsi/qla2xxx/qla_def.h
+#	drivers/scsi/qla2xxx/qla_gbl.h
+#	drivers/scsi/qla2xxx/qla_init.c
+#	drivers/scsi/qla2xxx/qla_sup.c
+diff --cc drivers/scsi/qla2xxx/qla_attr.c
+index 55925877df53,8687090193dc..000000000000
+--- a/drivers/scsi/qla2xxx/qla_attr.c
++++ b/drivers/scsi/qla2xxx/qla_attr.c
+@@@ -158,9 -160,27 +160,33 @@@ qla2x00_sysfs_read_nvram(struct file *f
+  	if (!capable(CAP_SYS_ADMIN))
+  		return 0;
+  
+++<<<<<<< HEAD
+ +	if (IS_NOCACHE_VPD_TYPE(ha))
+ +		ha->isp_ops->read_optrom(vha, ha->nvram, ha->flt_region_nvram << 2,
+ +		    ha->nvram_size);
+++=======
++ 	mutex_lock(&ha->optrom_mutex);
++ 	if (qla2x00_chip_is_down(vha)) {
++ 		mutex_unlock(&ha->optrom_mutex);
++ 		return -EAGAIN;
++ 	}
++ 
++ 	if (!IS_NOCACHE_VPD_TYPE(ha)) {
++ 		mutex_unlock(&ha->optrom_mutex);
++ 		goto skip;
++ 	}
++ 
++ 	faddr = ha->flt_region_nvram;
++ 	if (IS_QLA28XX(ha)) {
++ 		if (active_regions.aux.vpd_nvram == QLA27XX_SECONDARY_IMAGE)
++ 			faddr = ha->flt_region_nvram_sec;
++ 	}
++ 	ha->isp_ops->read_optrom(vha, ha->nvram, faddr << 2, ha->nvram_size);
++ 
++ 	mutex_unlock(&ha->optrom_mutex);
++ 
++ skip:
+++>>>>>>> 5fa8774c7f38 (scsi: qla2xxx: Add 28xx flash primary/secondary status/image mechanism)
+  	return memory_read_from_buffer(buf, count, &off, ha->nvram,
+  					ha->nvram_size);
+  }
+@@@ -492,16 -524,33 +519,41 @@@ qla2x00_sysfs_read_vpd(struct file *fil
+  	if (!capable(CAP_SYS_ADMIN))
+  		return -EINVAL;
+  
+ -	if (IS_NOCACHE_VPD_TYPE(ha))
+ -		goto skip;
+ +	if (IS_NOCACHE_VPD_TYPE(ha)) {
+ +		faddr = ha->flt_region_vpd << 2;
+  
+ -	faddr = ha->flt_region_vpd << 2;
+ +		if (IS_QLA27XX(ha) &&
+ +		    qla27xx_find_valid_image(vha) == QLA27XX_SECONDARY_IMAGE)
+ +			faddr = ha->flt_region_vpd_sec << 2;
+  
+++<<<<<<< HEAD
+ +		ha->isp_ops->read_optrom(vha, ha->vpd, faddr,
+ +		    ha->vpd_size);
+ +	}
+++=======
++ 	if (IS_QLA28XX(ha)) {
++ 		qla28xx_get_aux_images(vha, &active_regions);
++ 		if (active_regions.aux.vpd_nvram == QLA27XX_SECONDARY_IMAGE)
++ 			faddr = ha->flt_region_vpd_sec << 2;
++ 
++ 		ql_dbg(ql_dbg_init, vha, 0x7070,
++ 		    "Loading %s nvram image.\n",
++ 		    active_regions.aux.vpd_nvram == QLA27XX_PRIMARY_IMAGE ?
++ 		    "primary" : "secondary");
++ 	}
++ 
++ 	mutex_lock(&ha->optrom_mutex);
++ 	if (qla2x00_chip_is_down(vha)) {
++ 		mutex_unlock(&ha->optrom_mutex);
++ 		return -EAGAIN;
++ 	}
++ 
++ 	ha->isp_ops->read_optrom(vha, ha->vpd, faddr, ha->vpd_size);
++ 	mutex_unlock(&ha->optrom_mutex);
++ 
++ 	ha->isp_ops->read_optrom(vha, ha->vpd, faddr, ha->vpd_size);
++ skip:
+++>>>>>>> 5fa8774c7f38 (scsi: qla2xxx: Add 28xx flash primary/secondary status/image mechanism)
+  	return memory_read_from_buffer(buf, count, &off, ha->vpd, ha->vpd_size);
+  }
+  
+diff --cc drivers/scsi/qla2xxx/qla_def.h
+index 824b13554ed2,574797ac7f92..000000000000
+--- a/drivers/scsi/qla2xxx/qla_def.h
++++ b/drivers/scsi/qla2xxx/qla_def.h
+@@@ -1198,6 -1203,10 +1198,13 @@@ struct mbx_cmd_32 
+  #define QLA27XX_IMG_STATUS_VER_MAJOR   0x01
+  #define QLA27XX_IMG_STATUS_VER_MINOR    0x00
+  #define QLA27XX_IMG_STATUS_SIGN   0xFACEFADE
+++<<<<<<< HEAD
+++=======
++ #define QLA28XX_IMG_STATUS_SIGN    0xFACEFADF
++ #define QLA28XX_IMG_STATUS_SIGN		0xFACEFADF
++ #define QLA28XX_AUX_IMG_STATUS_SIGN	0xFACEFAED
++ #define QLA27XX_DEFAULT_IMAGE		0
+++>>>>>>> 5fa8774c7f38 (scsi: qla2xxx: Add 28xx flash primary/secondary status/image mechanism)
+  #define QLA27XX_PRIMARY_IMAGE  1
+  #define QLA27XX_SECONDARY_IMAGE    2
+  
+@@@ -4181,6 -4258,21 +4194,24 @@@ struct qla_hw_data 
+  
+  	atomic_t        nvme_active_aen_cnt;
+  	uint16_t        nvme_last_rptd_aen;             /* Last recorded aen count */
+++<<<<<<< HEAD
+++=======
++ 
++ 	atomic_t zio_threshold;
++ 	uint16_t last_zio_threshold;
++ 
++ #define DEFAULT_ZIO_THRESHOLD 5
+++>>>>>>> 5fa8774c7f38 (scsi: qla2xxx: Add 28xx flash primary/secondary status/image mechanism)
++ };
++ 
++ struct active_regions {
++ 	uint8_t global;
++ 	struct {
++ 		uint8_t board_config;
++ 		uint8_t vpd_nvram;
++ 		uint8_t npiv_config_0_1;
++ 		uint8_t npiv_config_2_3;
++ 	} aux;
+  };
+  
+  #define FW_ABILITY_MAX_SPEED_MASK	0xFUL
+@@@ -4384,10 -4488,11 +4415,17 @@@ typedef struct scsi_qla_host 
+  
+  struct qla27xx_image_status {
+  	uint8_t image_status_mask;
+++<<<<<<< HEAD
+ +	uint16_t generation_number;
+ +	uint8_t reserved[3];
+ +	uint8_t ver_minor;
+++=======
++ 	uint16_t generation;
+++>>>>>>> 5fa8774c7f38 (scsi: qla2xxx: Add 28xx flash primary/secondary status/image mechanism)
+  	uint8_t ver_major;
++ 	uint8_t ver_minor;
++ 	uint8_t bitmap;		/* 28xx only */
++ 	uint8_t reserved[2];
+  	uint32_t checksum;
+  	uint32_t signature;
+  } __packed;
+diff --cc drivers/scsi/qla2xxx/qla_gbl.h
+index ca3f732c0824,d5c27ffb5f41..000000000000
+--- a/drivers/scsi/qla2xxx/qla_gbl.h
++++ b/drivers/scsi/qla2xxx/qla_gbl.h
+@@@ -108,6 -106,12 +107,15 @@@ int qla24xx_post_newsess_work(struct sc
+  int qla24xx_fcport_handle_login(struct scsi_qla_host *, fc_port_t *);
+  int qla24xx_detect_sfp(scsi_qla_host_t *vha);
+  int qla24xx_post_gpdb_work(struct scsi_qla_host *, fc_port_t *, u8);
+++<<<<<<< HEAD
+++=======
++ 
++ extern void qla28xx_get_aux_images(struct scsi_qla_host *,
++     struct active_regions *);
++ extern void qla27xx_get_active_image(struct scsi_qla_host *,
++     struct active_regions *);
++ 
+++>>>>>>> 5fa8774c7f38 (scsi: qla2xxx: Add 28xx flash primary/secondary status/image mechanism)
+  void qla2x00_async_prlo_done(struct scsi_qla_host *, fc_port_t *,
+      uint16_t *);
+  extern int qla2x00_post_async_prlo_work(struct scsi_qla_host *, fc_port_t *,
+diff --cc drivers/scsi/qla2xxx/qla_init.c
+index 046c47b82245,7c5e530a90df..000000000000
+--- a/drivers/scsi/qla2xxx/qla_init.c
++++ b/drivers/scsi/qla2xxx/qla_init.c
+@@@ -6933,92 -7236,288 +6933,353 @@@ qla24xx_nvram_config(scsi_qla_host_t *v
+  	return (rval);
+  }
+  
+- uint8_t qla27xx_find_valid_image(struct scsi_qla_host *vha)
++ static void
++ qla27xx_print_image(struct scsi_qla_host *vha, char *name,
++     struct qla27xx_image_status *image_status)
++ {
++ 	ql_dbg(ql_dbg_init, vha, 0x018b,
++ 	    "%s %s: mask=%#02x gen=%#04x ver=%u.%u map=%#01x sum=%#08x sig=%#08x\n",
++ 	    name, "status",
++ 	    image_status->image_status_mask,
++ 	    le16_to_cpu(image_status->generation),
++ 	    image_status->ver_major,
++ 	    image_status->ver_minor,
++ 	    image_status->bitmap,
++ 	    le32_to_cpu(image_status->checksum),
++ 	    le32_to_cpu(image_status->signature));
++ }
++ 
++ static bool
++ qla28xx_check_aux_image_status_signature(
++     struct qla27xx_image_status *image_status)
++ {
++ 	ulong signature = le32_to_cpu(image_status->signature);
++ 
++ 	return signature != QLA28XX_AUX_IMG_STATUS_SIGN;
++ }
++ 
++ static bool
++ qla27xx_check_image_status_signature(struct qla27xx_image_status *image_status)
++ {
++ 	ulong signature = le32_to_cpu(image_status->signature);
++ 
++ 	return
++ 	    signature != QLA27XX_IMG_STATUS_SIGN &&
++ 	    signature != QLA28XX_IMG_STATUS_SIGN;
++ }
++ 
++ static ulong
++ qla27xx_image_status_checksum(struct qla27xx_image_status *image_status)
++ {
++ 	uint32_t *p = (void *)image_status;
++ 	uint n = sizeof(*image_status) / sizeof(*p);
++ 	uint32_t sum = 0;
++ 
++ 	for ( ; n--; p++)
++ 		sum += le32_to_cpup(p);
++ 
++ 	return sum;
++ }
++ 
++ static inline uint
++ qla28xx_component_bitmask(struct qla27xx_image_status *aux, uint bitmask)
++ {
++ 	return aux->bitmap & bitmask ?
++ 	    QLA27XX_SECONDARY_IMAGE : QLA27XX_PRIMARY_IMAGE;
++ }
++ 
++ static void
++ qla28xx_component_status(
++     struct active_regions *active_regions, struct qla27xx_image_status *aux)
++ {
++ 	active_regions->aux.board_config =
++ 	    qla28xx_component_bitmask(aux, QLA28XX_AUX_IMG_BOARD_CONFIG);
++ 
++ 	active_regions->aux.vpd_nvram =
++ 	    qla28xx_component_bitmask(aux, QLA28XX_AUX_IMG_VPD_NVRAM);
++ 
++ 	active_regions->aux.npiv_config_0_1 =
++ 	    qla28xx_component_bitmask(aux, QLA28XX_AUX_IMG_NPIV_CONFIG_0_1);
++ 
++ 	active_regions->aux.npiv_config_2_3 =
++ 	    qla28xx_component_bitmask(aux, QLA28XX_AUX_IMG_NPIV_CONFIG_2_3);
++ }
++ 
++ static int
++ qla27xx_compare_image_generation(
++     struct qla27xx_image_status *pri_image_status,
++     struct qla27xx_image_status *sec_image_status)
++ {
++ 	/* calculate generation delta as uint16 (this accounts for wrap) */
++ 	int16_t delta =
++ 	    le16_to_cpu(pri_image_status->generation) -
++ 	    le16_to_cpu(sec_image_status->generation);
++ 
++ 	ql_dbg(ql_dbg_init, NULL, 0x0180, "generation delta = %d\n", delta);
++ 
++ 	return delta;
++ }
++ 
++ void
++ qla28xx_get_aux_images(
++ 	struct scsi_qla_host *vha, struct active_regions *active_regions)
+  {
+++<<<<<<< HEAD
+ +	struct qla27xx_image_status pri_image_status, sec_image_status;
+ +	uint8_t valid_pri_image, valid_sec_image;
+ +	uint32_t *wptr;
+ +	uint32_t cnt, chksum, size;
+ +	struct qla_hw_data *ha = vha->hw;
+ +
+ +	valid_pri_image = valid_sec_image = 1;
+ +	ha->active_image = 0;
+ +	size = sizeof(struct qla27xx_image_status) / sizeof(uint32_t);
+ +
+ +	if (!ha->flt_region_img_status_pri) {
+ +		valid_pri_image = 0;
+++=======
++ 	struct qla_hw_data *ha = vha->hw;
++ 	struct qla27xx_image_status pri_aux_image_status, sec_aux_image_status;
++ 	bool valid_pri_image = false, valid_sec_image = false;
++ 	bool active_pri_image = false, active_sec_image = false;
++ 
++ 	if (!ha->flt_region_aux_img_status_pri) {
++ 		ql_dbg(ql_dbg_init, vha, 0x018a, "Primary aux image not addressed\n");
+++>>>>>>> 5fa8774c7f38 (scsi: qla2xxx: Add 28xx flash primary/secondary status/image mechanism)
+  		goto check_sec_image;
+  	}
+  
+- 	qla24xx_read_flash_data(vha, (uint32_t *)(&pri_image_status),
+- 	    ha->flt_region_img_status_pri, size);
++ 	qla24xx_read_flash_data(vha, (void *)&pri_aux_image_status,
++ 	    ha->flt_region_aux_img_status_pri,
++ 	    sizeof(pri_aux_image_status) >> 2);
++ 	qla27xx_print_image(vha, "Primary aux image", &pri_aux_image_status);
+  
+++<<<<<<< HEAD
+ +	if (pri_image_status.signature != QLA27XX_IMG_STATUS_SIGN) {
+ +		ql_dbg(ql_dbg_init, vha, 0x018b,
+ +		    "Primary image signature (0x%x) not valid\n",
+ +		    pri_image_status.signature);
+ +		valid_pri_image = 0;
+++=======
++ 	if (qla28xx_check_aux_image_status_signature(&pri_aux_image_status)) {
++ 		ql_dbg(ql_dbg_init, vha, 0x018b,
++ 		    "Primary aux image signature (%#x) not valid\n",
++ 		    le32_to_cpu(pri_aux_image_status.signature));
+  		goto check_sec_image;
+  	}
+  
+- 	wptr = (uint32_t *)(&pri_image_status);
+- 	cnt = size;
++ 	if (qla27xx_image_status_checksum(&pri_aux_image_status)) {
++ 		ql_dbg(ql_dbg_init, vha, 0x018c,
++ 		    "Primary aux image checksum failed\n");
++ 		goto check_sec_image;
++ 	}
+  
+- 	for (chksum = 0; cnt--; wptr++)
+- 		chksum += le32_to_cpu(*wptr);
++ 	valid_pri_image = true;
+  
+- 	if (chksum) {
++ 	if (pri_aux_image_status.image_status_mask & 1) {
++ 		ql_dbg(ql_dbg_init, vha, 0x018d,
++ 		    "Primary aux image is active\n");
++ 		active_pri_image = true;
++ 	}
++ 
++ check_sec_image:
++ 	if (!ha->flt_region_aux_img_status_sec) {
++ 		ql_dbg(ql_dbg_init, vha, 0x018a,
++ 		    "Secondary aux image not addressed\n");
++ 		goto check_valid_image;
++ 	}
++ 
++ 	qla24xx_read_flash_data(vha, (void *)&sec_aux_image_status,
++ 	    ha->flt_region_aux_img_status_sec,
++ 	    sizeof(sec_aux_image_status) >> 2);
++ 	qla27xx_print_image(vha, "Secondary aux image", &sec_aux_image_status);
++ 
++ 	if (qla28xx_check_aux_image_status_signature(&sec_aux_image_status)) {
++ 		ql_dbg(ql_dbg_init, vha, 0x018b,
++ 		    "Secondary aux image signature (%#x) not valid\n",
++ 		    le32_to_cpu(sec_aux_image_status.signature));
++ 		goto check_valid_image;
++ 	}
++ 
++ 	if (qla27xx_image_status_checksum(&sec_aux_image_status)) {
+  		ql_dbg(ql_dbg_init, vha, 0x018c,
++ 		    "Secondary aux image checksum failed\n");
++ 		goto check_valid_image;
++ 	}
++ 
++ 	valid_sec_image = true;
++ 
++ 	if (sec_aux_image_status.image_status_mask & 1) {
++ 		ql_dbg(ql_dbg_init, vha, 0x018d,
++ 		    "Secondary aux image is active\n");
++ 		active_sec_image = true;
++ 	}
++ 
++ check_valid_image:
++ 	if (valid_pri_image && active_pri_image &&
++ 	    valid_sec_image && active_sec_image) {
++ 		if (qla27xx_compare_image_generation(&pri_aux_image_status,
++ 		    &sec_aux_image_status) >= 0) {
++ 			qla28xx_component_status(active_regions,
++ 			    &pri_aux_image_status);
++ 		} else {
++ 			qla28xx_component_status(active_regions,
++ 			    &sec_aux_image_status);
++ 		}
++ 	} else if (valid_pri_image && active_pri_image) {
++ 		qla28xx_component_status(active_regions, &pri_aux_image_status);
++ 	} else if (valid_sec_image && active_sec_image) {
++ 		qla28xx_component_status(active_regions, &sec_aux_image_status);
++ 	}
++ 
++ 	ql_dbg(ql_dbg_init, vha, 0x018f,
++ 	    "aux images active: BCFG=%u VPD/NVR=%u NPIV0/1=%u NPIV2/3=%u\n",
++ 	    active_regions->aux.board_config,
++ 	    active_regions->aux.vpd_nvram,
++ 	    active_regions->aux.npiv_config_0_1,
++ 	    active_regions->aux.npiv_config_2_3);
++ }
++ 
++ void
++ qla27xx_get_active_image(struct scsi_qla_host *vha,
++     struct active_regions *active_regions)
++ {
++ 	struct qla_hw_data *ha = vha->hw;
++ 	struct qla27xx_image_status pri_image_status, sec_image_status;
++ 	bool valid_pri_image = false, valid_sec_image = false;
++ 	bool active_pri_image = false, active_sec_image = false;
++ 
++ 	if (!ha->flt_region_img_status_pri) {
++ 		ql_dbg(ql_dbg_init, vha, 0x018a, "Primary image not addressed\n");
++ 		goto check_sec_image;
++ 	}
++ 
++ 	qla24xx_read_flash_data(vha, (void *)(&pri_image_status),
++ 	    ha->flt_region_img_status_pri, sizeof(pri_image_status) >> 2);
++ 	qla27xx_print_image(vha, "Primary image", &pri_image_status);
++ 
++ 	if (qla27xx_check_image_status_signature(&pri_image_status)) {
++ 		ql_dbg(ql_dbg_init, vha, 0x018b,
++ 		    "Primary image signature (%#x) not valid\n",
++ 		    le32_to_cpu(pri_image_status.signature));
+++>>>>>>> 5fa8774c7f38 (scsi: qla2xxx: Add 28xx flash primary/secondary status/image mechanism)
++ 		goto check_sec_image;
++ 	}
++ 
++ 	if (qla27xx_image_status_checksum(&pri_image_status)) {
++ 		ql_dbg(ql_dbg_init, vha, 0x018c,
+++<<<<<<< HEAD
+ +		    "Checksum validation failed for primary image (0x%x)\n",
+ +		    chksum);
+ +		valid_pri_image = 0;
+++=======
++ 		    "Primary image checksum failed\n");
++ 		goto check_sec_image;
++ 	}
++ 
++ 	valid_pri_image = true;
++ 
++ 	if (pri_image_status.image_status_mask & 1) {
++ 		ql_dbg(ql_dbg_init, vha, 0x018d,
++ 		    "Primary image is active\n");
++ 		active_pri_image = true;
+++>>>>>>> 5fa8774c7f38 (scsi: qla2xxx: Add 28xx flash primary/secondary status/image mechanism)
+  	}
+  
+  check_sec_image:
+  	if (!ha->flt_region_img_status_sec) {
+++<<<<<<< HEAD
+ +		valid_sec_image = 0;
+++=======
++ 		ql_dbg(ql_dbg_init, vha, 0x018a, "Secondary image not addressed\n");
+++>>>>>>> 5fa8774c7f38 (scsi: qla2xxx: Add 28xx flash primary/secondary status/image mechanism)
+  		goto check_valid_image;
+  	}
+  
+  	qla24xx_read_flash_data(vha, (uint32_t *)(&sec_image_status),
+- 	    ha->flt_region_img_status_sec, size);
++ 	    ha->flt_region_img_status_sec, sizeof(sec_image_status) >> 2);
++ 	qla27xx_print_image(vha, "Secondary image", &sec_image_status);
+  
+++<<<<<<< HEAD
+ +	if (sec_image_status.signature != QLA27XX_IMG_STATUS_SIGN) {
+ +		ql_dbg(ql_dbg_init, vha, 0x018d,
+ +		    "Secondary image signature(0x%x) not valid\n",
+ +		    sec_image_status.signature);
+ +		valid_sec_image = 0;
+ +		goto check_valid_image;
+ +	}
+ +
+ +	wptr = (uint32_t *)(&sec_image_status);
+ +	cnt = size;
+ +	for (chksum = 0; cnt--; wptr++)
+ +		chksum += le32_to_cpu(*wptr);
+ +	if (chksum) {
+ +		ql_dbg(ql_dbg_init, vha, 0x018e,
+ +		    "Checksum validation failed for secondary image (0x%x)\n",
+ +		    chksum);
+ +		valid_sec_image = 0;
+ +	}
+ +
+ +check_valid_image:
+ +	if (valid_pri_image && (pri_image_status.image_status_mask & 0x1))
+ +		ha->active_image = QLA27XX_PRIMARY_IMAGE;
+ +	if (valid_sec_image && (sec_image_status.image_status_mask & 0x1)) {
+ +		if (!ha->active_image ||
+ +		    pri_image_status.generation_number <
+ +		    sec_image_status.generation_number)
+ +			ha->active_image = QLA27XX_SECONDARY_IMAGE;
+ +	}
+ +
+ +	ql_dbg(ql_dbg_init, vha, 0x018f, "%s image\n",
+ +	    ha->active_image == 0 ? "default bootld and fw" :
+ +	    ha->active_image == 1 ? "primary" :
+ +	    ha->active_image == 2 ? "secondary" :
+ +	    "Invalid");
+ +
+ +	return ha->active_image;
+++=======
++ 	if (qla27xx_check_image_status_signature(&sec_image_status)) {
++ 		ql_dbg(ql_dbg_init, vha, 0x018b,
++ 		    "Secondary image signature (%#x) not valid\n",
++ 		    le32_to_cpu(sec_image_status.signature));
++ 		goto check_valid_image;
++ 	}
++ 
++ 	if (qla27xx_image_status_checksum(&sec_image_status)) {
++ 		ql_dbg(ql_dbg_init, vha, 0x018c,
++ 		    "Secondary image checksum failed\n");
++ 		goto check_valid_image;
++ 	}
++ 
++ 	valid_sec_image = true;
++ 
++ 	if (sec_image_status.image_status_mask & 1) {
++ 		ql_dbg(ql_dbg_init, vha, 0x018d,
++ 		    "Secondary image is active\n");
++ 		active_sec_image = true;
++ 	}
++ 
++ check_valid_image:
++ 	if (valid_pri_image && active_pri_image)
++ 		active_regions->global = QLA27XX_PRIMARY_IMAGE;
++ 
++ 	if (valid_sec_image && active_sec_image) {
++ 		if (!active_regions->global ||
++ 		    qla27xx_compare_image_generation(
++ 			&pri_image_status, &sec_image_status) < 0) {
++ 			active_regions->global = QLA27XX_SECONDARY_IMAGE;
++ 		}
++ 	}
++ 
++ 	ql_dbg(ql_dbg_init, vha, 0x018f, "active image %s (%u)\n",
++ 	    active_regions->global == QLA27XX_DEFAULT_IMAGE ?
++ 		"default (boot/fw)" :
++ 	    active_regions->global == QLA27XX_PRIMARY_IMAGE ?
++ 		"primary" :
++ 	    active_regions->global == QLA27XX_SECONDARY_IMAGE ?
++ 		"secondary" : "invalid",
++ 	    active_regions->global);
+ -}
+ -
+ -bool qla24xx_risc_firmware_invalid(uint32_t *dword)
+ -{
+ -	return
+ -	    !(dword[4] | dword[5] | dword[6] | dword[7]) ||
+ -	    !(~dword[4] | ~dword[5] | ~dword[6] | ~dword[7]);
+++>>>>>>> 5fa8774c7f38 (scsi: qla2xxx: Add 28xx flash primary/secondary status/image mechanism)
+  }
+  
+  static int
+@@@ -7368,71 -7859,82 +7629,114 @@@ qla24xx_load_risc_blob(scsi_qla_host_t 
+  			fwcode += dlen;
+  			risc_addr += dlen;
+  			risc_size -= dlen;
+ +			fragment++;
+  		}
+ +
+ +		/* Next segment. */
+ +		segments--;
+  	}
+  
+ -	if (!IS_QLA27XX(ha) && !IS_QLA28XX(ha))
+ -		return QLA_SUCCESS;
+ +	if (!IS_QLA27XX(ha))
+ +		return rval;
+  
+ -	templates = (risc_attr & BIT_9) ? 2 : 1;
+ -	ql_dbg(ql_dbg_init, vha, 0x0170, "-> templates = %u\n", templates);
+ -	for (j = 0; j < templates; j++, fwdt++) {
+ -		if (fwdt->template)
+ -			vfree(fwdt->template);
+ -		fwdt->template = NULL;
+ -		fwdt->length = 0;
+ -
+ -		risc_size = be32_to_cpu(fwcode[2]);
+ -		ql_dbg(ql_dbg_init, vha, 0x0171,
+ -		    "-> fwdt%u template array at %#x (%#x dwords)\n",
+ -		    j, (uint32_t)((void *)fwcode - (void *)blob->fw->data),
+ -		    risc_size);
+ -		if (!risc_size || !~risc_size) {
+ -			ql_dbg(ql_dbg_init, vha, 0x0172,
+ -			    "-> fwdt%u failed to read array\n", j);
+ -			goto failed;
+ -		}
+ +	if (ha->fw_dump_template)
+ +		vfree(ha->fw_dump_template);
+ +	ha->fw_dump_template = NULL;
+ +	ha->fw_dump_template_len = 0;
+ +
+ +	ql_dbg(ql_dbg_init, vha, 0x171,
+ +	    "Loading fwdump template from %x\n",
+ +	    (uint32_t)((void *)fwcode - (void *)blob->fw->data));
+ +	risc_size = be32_to_cpu(fwcode[2]);
+ +	ql_dbg(ql_dbg_init, vha, 0x172,
+ +	    "-> array size %x dwords\n", risc_size);
+ +	if (risc_size == 0 || risc_size == ~0)
+ +		goto failed;
+  
+++<<<<<<< HEAD
+ +	dlen = (risc_size - 8) * sizeof(*fwcode);
+ +	ql_dbg(ql_dbg_init, vha, 0x0173,
+ +	    "-> template allocating %x bytes...\n", dlen);
+ +	ha->fw_dump_template = vmalloc(dlen);
+ +	if (!ha->fw_dump_template) {
+ +		ql_log(ql_log_warn, vha, 0x0174,
+ +		    "Failed fwdump template allocate %x bytes.\n", risc_size);
+ +		goto failed;
+++=======
++ 		/* skip header and ignore checksum */
++ 		fwcode += 7;
++ 		risc_size -= 8;
++ 
++ 		ql_dbg(ql_dbg_init, vha, 0x0173,
++ 		    "-> fwdt%u template allocate template %#x words...\n",
++ 		    j, risc_size);
++ 		fwdt->template = vmalloc(risc_size * sizeof(*dcode));
++ 		if (!fwdt->template) {
++ 			ql_log(ql_log_warn, vha, 0x0174,
++ 			    "-> fwdt%u failed allocate template.\n", j);
++ 			goto failed;
++ 		}
++ 
++ 		dcode = fwdt->template;
++ 		for (i = 0; i < risc_size; i++)
++ 			dcode[i] = fwcode[i];
++ 
++ 		if (!qla27xx_fwdt_template_valid(dcode)) {
++ 			ql_log(ql_log_warn, vha, 0x0175,
++ 			    "-> fwdt%u failed template validate\n", j);
++ 			goto failed;
++ 		}
++ 
++ 		dlen = qla27xx_fwdt_template_size(dcode);
++ 		ql_dbg(ql_dbg_init, vha, 0x0176,
++ 		    "-> fwdt%u template size %#lx bytes (%#lx words)\n",
++ 		    j, dlen, dlen / sizeof(*dcode));
++ 		if (dlen > risc_size * sizeof(*dcode)) {
++ 			ql_log(ql_log_warn, vha, 0x0177,
++ 			    "-> fwdt%u template exceeds array (%-lu bytes)\n",
++ 			    j, dlen - risc_size * sizeof(*dcode));
++ 			goto failed;
++ 		}
++ 
++ 		fwdt->length = dlen;
++ 		ql_dbg(ql_dbg_init, vha, 0x0178,
++ 		    "-> fwdt%u loaded template ok\n", j);
++ 
++ 		fwcode += risc_size + 1;
+++>>>>>>> 5fa8774c7f38 (scsi: qla2xxx: Add 28xx flash primary/secondary status/image mechanism)
+  	}
+  
+ -	return QLA_SUCCESS;
+ +	fwcode += 7;
+ +	risc_size -= 8;
+ +	dcode = ha->fw_dump_template;
+ +	for (i = 0; i < risc_size; i++)
+ +		dcode[i] = le32_to_cpu(fwcode[i]);
+  
+ -failed:
+ -	if (fwdt->template)
+ -		vfree(fwdt->template);
+ -	fwdt->template = NULL;
+ -	fwdt->length = 0;
+ +	if (!qla27xx_fwdt_template_valid(dcode)) {
+ +		ql_log(ql_log_warn, vha, 0x0175,
+ +		    "Failed fwdump template validate\n");
+ +		goto failed;
+ +	}
+  
+ -	return QLA_SUCCESS;
+ +	dlen = qla27xx_fwdt_template_size(dcode);
+ +	ql_dbg(ql_dbg_init, vha, 0x0176,
+ +	    "-> template size %x bytes\n", dlen);
+ +	if (dlen > risc_size * sizeof(*fwcode)) {
+ +		ql_log(ql_log_warn, vha, 0x0177,
+ +		    "Failed fwdump template exceeds array by %zx bytes\n",
+ +		    (size_t)(dlen - risc_size * sizeof(*fwcode)));
+ +		goto failed;
+ +	}
+ +	ha->fw_dump_template_len = dlen;
+ +	return rval;
+ +
+ +failed:
+ +	ql_log(ql_log_warn, vha, 0x017d, "Failed fwdump template\n");
+ +	if (ha->fw_dump_template)
+ +		vfree(ha->fw_dump_template);
+ +	ha->fw_dump_template = NULL;
+ +	ha->fw_dump_template_len = 0;
+ +	return rval;
+  }
+  
+  int
+@@@ -7465,14 -7968,31 +7770,35 @@@ qla81xx_load_risc(scsi_qla_host_t *vha
+  	if (ql2xfwloadbin == 2)
+  		goto try_blob_fw;
+  
+ -	/* FW Load priority:
+ +	/*
+ +	 * FW Load priority:
+  	 * 1) Firmware residing in flash.
+  	 * 2) Firmware via request-firmware interface (.bin file).
+ -	 * 3) Golden-Firmware residing in flash -- (limited operation).
+ +	 * 3) Golden-Firmware residing in flash -- limited operation.
+  	 */
+++<<<<<<< HEAD
+++=======
++ 
++ 	if (!IS_QLA27XX(ha) && !IS_QLA28XX(ha))
++ 		goto try_primary_fw;
++ 
++ 	qla27xx_get_active_image(vha, &active_regions);
++ 
++ 	if (active_regions.global != QLA27XX_SECONDARY_IMAGE)
++ 		goto try_primary_fw;
++ 
++ 	ql_dbg(ql_dbg_init, vha, 0x008b,
++ 	    "Loading secondary firmware image.\n");
++ 	rval = qla24xx_load_risc_flash(vha, srisc_addr, ha->flt_region_fw_sec);
++ 	if (!rval)
++ 		return rval;
++ 
++ try_primary_fw:
++ 	ql_dbg(ql_dbg_init, vha, 0x008b,
++ 	    "Loading primary firmware image.\n");
+++>>>>>>> 5fa8774c7f38 (scsi: qla2xxx: Add 28xx flash primary/secondary status/image mechanism)
+  	rval = qla24xx_load_risc_flash(vha, srisc_addr, ha->flt_region_fw);
+ -	if (!rval)
+ +	if (rval == QLA_SUCCESS)
+  		return rval;
+  
+  try_blob_fw:
+diff --cc drivers/scsi/qla2xxx/qla_sup.c
+index 2a3055c799fb,08c7dca07c90..000000000000
+--- a/drivers/scsi/qla2xxx/qla_sup.c
++++ b/drivers/scsi/qla2xxx/qla_sup.c
+@@@ -859,24 -859,62 +859,79 @@@ qla2xxx_get_flt_info(scsi_qla_host_t *v
+  				ha->flt_region_fw_sec = start;
+  			break;
+  		case FLT_REG_BOOTLOAD_SEC_27XX:
+ -			if (IS_QLA27XX(ha) && !IS_QLA28XX(ha))
+ +			if (IS_QLA27XX(ha))
+  				ha->flt_region_boot_sec = start;
+  			break;
++ 		case FLT_REG_AUX_IMG_PRI_28XX:
++ 			if (IS_QLA27XX(ha) || IS_QLA28XX(ha))
++ 				ha->flt_region_aux_img_status_pri = start;
++ 			break;
++ 		case FLT_REG_AUX_IMG_SEC_28XX:
++ 			if (IS_QLA27XX(ha) || IS_QLA28XX(ha))
++ 				ha->flt_region_aux_img_status_sec = start;
++ 			break;
++ 		case FLT_REG_NVRAM_SEC_28XX_0:
++ 			if (IS_QLA27XX(ha) || IS_QLA28XX(ha))
++ 				if (ha->port_no == 0)
++ 					ha->flt_region_nvram_sec = start;
++ 			break;
++ 		case FLT_REG_NVRAM_SEC_28XX_1:
++ 			if (IS_QLA27XX(ha) || IS_QLA28XX(ha))
++ 				if (ha->port_no == 1)
++ 					ha->flt_region_nvram_sec = start;
++ 			break;
++ 		case FLT_REG_NVRAM_SEC_28XX_2:
++ 			if (IS_QLA27XX(ha) || IS_QLA28XX(ha))
++ 				if (ha->port_no == 2)
++ 					ha->flt_region_nvram_sec = start;
++ 			break;
++ 		case FLT_REG_NVRAM_SEC_28XX_3:
++ 			if (IS_QLA27XX(ha) || IS_QLA28XX(ha))
++ 				if (ha->port_no == 3)
++ 					ha->flt_region_nvram_sec = start;
++ 			break;
+  		case FLT_REG_VPD_SEC_27XX_0:
+++<<<<<<< HEAD
+ +			if (IS_QLA27XX(ha))
+ +				ha->flt_region_vpd_sec = start;
+ +			break;
+ +		case FLT_REG_VPD_SEC_27XX_1:
+ +			if (IS_QLA27XX(ha))
+ +				ha->flt_region_vpd_sec = start;
+ +			break;
+ +		case FLT_REG_VPD_SEC_27XX_2:
+ +			if (IS_QLA27XX(ha))
+ +				ha->flt_region_vpd_sec = start;
+ +			break;
+ +		case FLT_REG_VPD_SEC_27XX_3:
+ +			if (IS_QLA27XX(ha))
+ +				ha->flt_region_vpd_sec = start;
+++=======
++ 		case FLT_REG_VPD_SEC_28XX_0:
++ 			if (IS_QLA27XX(ha) || IS_QLA28XX(ha)) {
++ 				ha->flt_region_vpd_nvram_sec = start;
++ 				if (ha->port_no == 0)
++ 					ha->flt_region_vpd_sec = start;
++ 			}
++ 			break;
++ 		case FLT_REG_VPD_SEC_27XX_1:
++ 		case FLT_REG_VPD_SEC_28XX_1:
++ 			if (IS_QLA27XX(ha) || IS_QLA28XX(ha))
++ 				if (ha->port_no == 1)
++ 					ha->flt_region_vpd_sec = start;
++ 			break;
++ 		case FLT_REG_VPD_SEC_27XX_2:
++ 		case FLT_REG_VPD_SEC_28XX_2:
++ 			if (IS_QLA27XX(ha) || IS_QLA28XX(ha))
++ 				if (ha->port_no == 2)
++ 					ha->flt_region_vpd_sec = start;
++ 			break;
++ 		case FLT_REG_VPD_SEC_27XX_3:
++ 		case FLT_REG_VPD_SEC_28XX_3:
++ 			if (IS_QLA27XX(ha) || IS_QLA28XX(ha))
++ 				if (ha->port_no == 3)
++ 					ha->flt_region_vpd_sec = start;
+++>>>>>>> 5fa8774c7f38 (scsi: qla2xxx: Add 28xx flash primary/secondary status/image mechanism)
+  			break;
+  		}
+  	}
+@@@ -3026,9 -3058,8 +3081,10 @@@ qla24xx_get_flash_version(scsi_qla_host
+  	int i;
+  	struct qla_hw_data *ha = vha->hw;
+  	uint32_t faddr = 0;
++ 	struct active_regions active_regions = { };
+  
+ +	pcihdr = pcids = 0;
+ +
+  	if (IS_P3P_TYPE(ha))
+  		return ret;
+  
+@@@ -3040,13 -3071,14 +3096,22 @@@
+  	memset(ha->fcode_revision, 0, sizeof(ha->fcode_revision));
+  	memset(ha->fw_revision, 0, sizeof(ha->fw_revision));
+  
+ +	dcode = mbuf;
+  	pcihdr = ha->flt_region_boot << 2;
+++<<<<<<< HEAD
+ +	if (IS_QLA27XX(ha) &&
+ +	    qla27xx_find_valid_image(vha) == QLA27XX_SECONDARY_IMAGE)
+ +		pcihdr = ha->flt_region_boot_sec << 2;
+++=======
++ 	if (IS_QLA27XX(ha) || IS_QLA28XX(ha)) {
++ 		qla27xx_get_active_image(vha, &active_regions);
++ 		if (active_regions.global == QLA27XX_SECONDARY_IMAGE) {
++ 			pcihdr = ha->flt_region_boot_sec << 2;
++ 		}
++ 	}
+++>>>>>>> 5fa8774c7f38 (scsi: qla2xxx: Add 28xx flash primary/secondary status/image mechanism)
+  
+ +	last_image = 1;
+  	do {
+  		/* Verify PCI expansion ROM header. */
+  		qla24xx_read_flash_data(vha, dcode, pcihdr >> 2, 0x20);
+@@@ -3117,20 -3149,14 +3182,27 @@@
+  
+  	/* Read firmware image information. */
+  	memset(ha->fw_revision, 0, sizeof(ha->fw_revision));
+ +	dcode = mbuf;
+  	faddr = ha->flt_region_fw;
+++<<<<<<< HEAD
+ +	if (IS_QLA27XX(ha) &&
+ +	    qla27xx_find_valid_image(vha) == QLA27XX_SECONDARY_IMAGE)
+ +		faddr = ha->flt_region_fw_sec;
+++=======
++ 	if (IS_QLA27XX(ha) || IS_QLA28XX(ha)) {
++ 		if (active_regions.global == QLA27XX_SECONDARY_IMAGE)
++ 			faddr = ha->flt_region_fw_sec;
++ 	}
+++>>>>>>> 5fa8774c7f38 (scsi: qla2xxx: Add 28xx flash primary/secondary status/image mechanism)
+ +
+ +	qla24xx_read_flash_data(vha, dcode, faddr + 4, 4);
+ +	for (i = 0; i < 4; i++)
+ +		dcode[i] = be32_to_cpu(dcode[i]);
+  
+ -	qla24xx_read_flash_data(vha, dcode, faddr, 8);
+ -	if (qla24xx_risc_firmware_invalid(dcode)) {
+ +	if ((dcode[0] == 0xffffffff && dcode[1] == 0xffffffff &&
+ +	    dcode[2] == 0xffffffff && dcode[3] == 0xffffffff) ||
+ +	    (dcode[0] == 0 && dcode[1] == 0 && dcode[2] == 0 &&
+ +	    dcode[3] == 0)) {
+  		ql_log(ql_log_warn, vha, 0x005f,
+  		    "Unrecognized fw revision at %x.\n",
+  		    ha->flt_region_fw * 4);
+* Unmerged path drivers/scsi/qla2xxx/qla_attr.c
+diff --git a/drivers/scsi/qla2xxx/qla_bsg.c b/drivers/scsi/qla2xxx/qla_bsg.c
+index 4a9fd8d944d6..4562db095698 100644
+--- a/drivers/scsi/qla2xxx/qla_bsg.c
++++ b/drivers/scsi/qla2xxx/qla_bsg.c
+@@ -2387,6 +2387,45 @@ qla2x00_do_dport_diagnostics(struct bsg_job *bsg_job)
+ 	return 0;
+ }
+ 
++static int
++qla2x00_get_flash_image_status(struct bsg_job *bsg_job)
++{
++	scsi_qla_host_t *vha = shost_priv(fc_bsg_to_shost(bsg_job));
++	struct fc_bsg_reply *bsg_reply = bsg_job->reply;
++	struct qla_hw_data *ha = vha->hw;
++	struct qla_active_regions regions = { };
++	struct active_regions active_regions = { };
++
++	qla28xx_get_aux_images(vha, &active_regions);
++	regions.global_image = active_regions.global;
++
++	if (IS_QLA28XX(ha)) {
++		qla27xx_get_active_image(vha, &active_regions);
++		regions.board_config = active_regions.aux.board_config;
++		regions.vpd_nvram = active_regions.aux.vpd_nvram;
++		regions.npiv_config_0_1 = active_regions.aux.npiv_config_0_1;
++		regions.npiv_config_2_3 = active_regions.aux.npiv_config_2_3;
++	}
++
++	ql_dbg(ql_dbg_user, vha, 0x70e1,
++	    "%s(%lu): FW=%u BCFG=%u VPDNVR=%u NPIV01=%u NPIV02=%u\n",
++	    __func__, vha->host_no, regions.global_image,
++	    regions.board_config, regions.vpd_nvram,
++	    regions.npiv_config_0_1, regions.npiv_config_2_3);
++
++	sg_copy_from_buffer(bsg_job->reply_payload.sg_list,
++	    bsg_job->reply_payload.sg_cnt, &regions, sizeof(regions));
++
++	bsg_reply->reply_data.vendor_reply.vendor_rsp[0] = EXT_STATUS_OK;
++	bsg_reply->reply_payload_rcv_len = sizeof(regions);
++	bsg_reply->result = DID_OK << 16;
++	bsg_job->reply_len = sizeof(struct fc_bsg_reply);
++	bsg_job_done(bsg_job, bsg_reply->result,
++	    bsg_reply->reply_payload_rcv_len);
++
++	return 0;
++}
++
+ static int
+ qla2x00_process_vendor_specific(struct bsg_job *bsg_job)
+ {
+@@ -2460,6 +2499,9 @@ qla2x00_process_vendor_specific(struct bsg_job *bsg_job)
+ 	case QL_VND_DPORT_DIAGNOSTICS:
+ 		return qla2x00_do_dport_diagnostics(bsg_job);
+ 
++	case QL_VND_SS_GET_FLASH_IMAGE_STATUS:
++		return qla2x00_get_flash_image_status(bsg_job);
++
+ 	default:
+ 		return -ENOSYS;
+ 	}
+diff --git a/drivers/scsi/qla2xxx/qla_bsg.h b/drivers/scsi/qla2xxx/qla_bsg.h
+index d97dfd521356..7594fad7b5b5 100644
+--- a/drivers/scsi/qla2xxx/qla_bsg.h
++++ b/drivers/scsi/qla2xxx/qla_bsg.h
+@@ -31,6 +31,7 @@
+ #define QL_VND_GET_PRIV_STATS	0x18
+ #define QL_VND_DPORT_DIAGNOSTICS	0x19
+ #define QL_VND_GET_PRIV_STATS_EX	0x1A
++#define QL_VND_SS_GET_FLASH_IMAGE_STATUS	0x1E
+ 
+ /* BSG Vendor specific subcode returns */
+ #define EXT_STATUS_OK			0
+@@ -279,4 +280,14 @@ struct qla_dport_diag {
+ #define QLA_DPORT_RESULT	0x0
+ #define QLA_DPORT_START		0x2
+ 
++/* active images in flash */
++struct qla_active_regions {
++	uint8_t global_image;
++	uint8_t board_config;
++	uint8_t vpd_nvram;
++	uint8_t npiv_config_0_1;
++	uint8_t npiv_config_2_3;
++	uint8_t reserved[32];
++} __packed;
++
+ #endif
+* Unmerged path drivers/scsi/qla2xxx/qla_def.h
+diff --git a/drivers/scsi/qla2xxx/qla_fw.h b/drivers/scsi/qla2xxx/qla_fw.h
+index 5d8688e5bc7c..531cda392c7c 100644
+--- a/drivers/scsi/qla2xxx/qla_fw.h
++++ b/drivers/scsi/qla2xxx/qla_fw.h
+@@ -1510,6 +1510,18 @@ struct qla_flt_header {
+ #define FLT_REG_VPD_SEC_27XX_2	0xD8
+ #define FLT_REG_VPD_SEC_27XX_3	0xDA
+ 
++/* 28xx */
++#define FLT_REG_AUX_IMG_PRI_28XX	0x125
++#define FLT_REG_AUX_IMG_SEC_28XX	0x126
++#define FLT_REG_VPD_SEC_28XX_0		0x10C
++#define FLT_REG_VPD_SEC_28XX_1		0x10E
++#define FLT_REG_VPD_SEC_28XX_2		0x110
++#define FLT_REG_VPD_SEC_28XX_3		0x112
++#define FLT_REG_NVRAM_SEC_28XX_0	0x10D
++#define FLT_REG_NVRAM_SEC_28XX_1	0x10F
++#define FLT_REG_NVRAM_SEC_28XX_2	0x111
++#define FLT_REG_NVRAM_SEC_28XX_3	0x113
++
+ struct qla_flt_region {
+ 	uint32_t code;
+ 	uint32_t size;
+* Unmerged path drivers/scsi/qla2xxx/qla_gbl.h
+* Unmerged path drivers/scsi/qla2xxx/qla_init.c
+* Unmerged path drivers/scsi/qla2xxx/qla_sup.c
