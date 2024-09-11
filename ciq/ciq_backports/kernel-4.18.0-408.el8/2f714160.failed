@@ -1,0 +1,161 @@
+mm,hwpoison: disable pcplists before grabbing a refcount
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-408.el8
+commit-author Oscar Salvador <osalvador@suse.de>
+commit 2f7141600d67969f444c344481d4d9ce546d0114
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-408.el8/2f714160.failed
+
+Currently, we have a sort of retry mechanism to make sure pages in
+pcp-lists are spilled to the buddy system, so we can handle those.
+
+We can save us this extra checks with the new disable-pcplist mechanism
+that is available with [1].
+
+zone_pcplist_disable makes sure to 1) disable pcplists, so any page that
+is freed up from that point onwards will end up in the buddy system and 2)
+drain pcplists, so those pages that already in pcplists are spilled to
+buddy.
+
+With that, we can make a common entry point for grabbing a refcount from
+both soft_offline and memory_failure paths that is guarded by
+zone_pcplist_disable/zone_pcplist_enable.
+
+[1] https://patchwork.kernel.org/project/linux-mm/cover/20201111092812.11329-1-vbabka@suse.cz/
+
+Link: https://lkml.kernel.org/r/20201204102558.31607-3-osalvador@suse.de
+	Signed-off-by: Oscar Salvador <osalvador@suse.de>
+	Acked-by: Naoya Horiguchi <naoya.horiguchi@nec.com>
+	Acked-by: Vlastimil Babka <vbabka@suse.cz>
+	Cc: Qian Cai <qcai@redhat.com>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit 2f7141600d67969f444c344481d4d9ce546d0114)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	mm/memory-failure.c
+diff --cc mm/memory-failure.c
+index 744f1cbe207f,3ac807c1f4f3..000000000000
+--- a/mm/memory-failure.c
++++ b/mm/memory-failure.c
+@@@ -1743,85 -1753,6 +1791,88 @@@ int unpoison_memory(unsigned long pfn
+  }
+  EXPORT_SYMBOL(unpoison_memory);
+  
+++<<<<<<< HEAD
+ +static struct page *new_page(struct page *p, unsigned long private)
+ +{
+ +	struct migration_target_control mtc = {
+ +		.nid = page_to_nid(p),
+ +		.gfp_mask = GFP_USER | __GFP_MOVABLE | __GFP_RETRY_MAYFAIL,
+ +	};
+ +
+ +	return alloc_migration_target(p, (unsigned long)&mtc);
+ +}
+ +
+ +/*
+ + * Safely get reference count of an arbitrary page.
+ + * Returns 0 for a free page, -EIO for a zero refcount page
+ + * that is not free, and 1 for any other page type.
+ + * For 1 the page is returned with increased page count, otherwise not.
+ + */
+ +static int __get_any_page(struct page *p, unsigned long pfn, int flags)
+ +{
+ +	int ret;
+ +
+ +	if (flags & MF_COUNT_INCREASED)
+ +		return 1;
+ +
+ +	/*
+ +	 * When the target page is a free hugepage, just remove it
+ +	 * from free hugepage list.
+ +	 */
+ +	if (!get_hwpoison_page(p)) {
+ +		if (PageHuge(p)) {
+ +			pr_info("%s: %#lx free huge page\n", __func__, pfn);
+ +			ret = 0;
+ +		} else if (is_free_buddy_page(p)) {
+ +			pr_info("%s: %#lx free buddy page\n", __func__, pfn);
+ +			ret = 0;
+ +		} else if (page_count(p)) {
+ +			/* raced with allocation */
+ +			ret = -EBUSY;
+ +		} else {
+ +			pr_info("%s: %#lx: unknown zero refcount page type %lx\n",
+ +				__func__, pfn, p->flags);
+ +			ret = -EIO;
+ +		}
+ +	} else {
+ +		/* Not a free page */
+ +		ret = 1;
+ +	}
+ +	return ret;
+ +}
+ +
+ +static int get_any_page(struct page *page, unsigned long pfn, int flags)
+ +{
+ +	int ret = __get_any_page(page, pfn, flags);
+ +
+ +	if (ret == -EBUSY)
+ +		ret = __get_any_page(page, pfn, flags);
+ +
+ +	if (ret == 1 && !PageHuge(page) &&
+ +	    !PageLRU(page) && !__PageMovable(page)) {
+ +		/*
+ +		 * Try to free it.
+ +		 */
+ +		put_page(page);
+ +		shake_page(page, 1);
+ +
+ +		/*
+ +		 * Did it turn free?
+ +		 */
+ +		ret = __get_any_page(page, pfn, 0);
+ +		if (ret == 1 && !PageLRU(page)) {
+ +			/* Drop page reference which is from __get_any_page() */
+ +			put_page(page);
+ +			pr_info("soft_offline: %#lx: unknown non LRU page type %lx (%pGp)\n",
+ +				pfn, page->flags, &page->flags);
+ +			return -EIO;
+ +		}
+ +	}
+ +	return ret;
+ +}
+ +
+++=======
+++>>>>>>> 2f7141600d67 (mm,hwpoison: disable pcplists before grabbing a refcount)
+  static bool isolate_page(struct page *page, struct list_head *pagelist)
+  {
+  	bool isolated = false;
+@@@ -2003,17 -1926,20 +2054,21 @@@ int soft_offline_page(unsigned long pfn
+  
+  retry:
+  	get_online_mems();
+++<<<<<<< HEAD
+ +	ret = get_any_page(page, pfn, flags);
+++=======
++ 	ret = get_hwpoison_page(page, flags, MF_SOFT_OFFLINE);
+++>>>>>>> 2f7141600d67 (mm,hwpoison: disable pcplists before grabbing a refcount)
+  	put_online_mems();
+  
+ -	if (ret > 0) {
+ +	if (ret > 0)
+  		ret = soft_offline_in_use_page(page);
+ -	} else if (ret == 0) {
+ +	else if (ret == 0)
+  		if (soft_offline_free_page(page) && try_again) {
+  			try_again = false;
+ +			flags &= ~MF_COUNT_INCREASED;
+  			goto retry;
+  		}
+ -	} else if (ret == -EIO) {
+ -		pr_info("%s: %#lx: unknown page type: %lx (%pGP)\n",
+ -			 __func__, pfn, page->flags, &page->flags);
+ -	}
+  
+  	return ret;
+  }
+* Unmerged path mm/memory-failure.c
