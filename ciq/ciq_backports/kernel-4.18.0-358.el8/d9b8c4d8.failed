@@ -1,0 +1,186 @@
+net: bridge: mcast: prepare add-router function for mcast router split
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-358.el8
+commit-author Linus Lüssing <linus.luessing@c0d3.blue>
+commit d9b8c4d8d937f58e618aa1e756162e80b385c701
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-358.el8/d9b8c4d8.failed
+
+In preparation for the upcoming split of multicast router state into
+their IPv4 and IPv6 variants move the protocol specific router list
+and timer access to ip4 wrapper functions.
+
+	Signed-off-by: Linus Lüssing <linus.luessing@c0d3.blue>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit d9b8c4d8d937f58e618aa1e756162e80b385c701)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/bridge/br_multicast.c
+diff --cc net/bridge/br_multicast.c
+index 2827c70f9d21,dc9546415520..000000000000
+--- a/net/bridge/br_multicast.c
++++ b/net/bridge/br_multicast.c
+@@@ -1258,9 -1687,8 +1258,14 @@@ static void __br_multicast_enable_port(
+  #if IS_ENABLED(CONFIG_IPV6)
+  	br_multicast_enable(&port->ip6_own_query);
+  #endif
+++<<<<<<< HEAD
+ +	if (port->multicast_router == MDB_RTR_TYPE_PERM &&
+ +	    hlist_unhashed(&port->rlist))
+ +		br_multicast_add_router(br, port);
+++=======
++ 	if (port->multicast_router == MDB_RTR_TYPE_PERM)
++ 		br_ip4_multicast_add_router(br, port);
+++>>>>>>> d9b8c4d8d937 (net: bridge: mcast: prepare add-router function for mcast router split)
+  }
+  
+  void br_multicast_enable_port(struct net_bridge_port *port)
+@@@ -2140,33 -2649,60 +2145,76 @@@ static void br_port_mc_router_state_cha
+  		.u.mrouter = is_mc_router,
+  	};
+  
+ -	switchdev_port_attr_set(p->dev, &attr, NULL);
+ +	switchdev_port_attr_set(p->dev, &attr);
+  }
+  
+- /*
+-  * Add port to router_list
++ static struct net_bridge_port *
++ br_multicast_rport_from_node(struct net_bridge *br,
++ 			     struct hlist_head *mc_router_list,
++ 			     struct hlist_node *rlist)
++ {
++ 	return hlist_entry(rlist, struct net_bridge_port, ip4_rlist);
++ }
++ 
++ static struct hlist_node *
++ br_multicast_get_rport_slot(struct net_bridge *br,
++ 			    struct net_bridge_port *port,
++ 			    struct hlist_head *mc_router_list)
++ 
++ {
++ 	struct hlist_node *slot = NULL;
++ 	struct net_bridge_port *p;
++ 	struct hlist_node *rlist;
++ 
++ 	hlist_for_each(rlist, mc_router_list) {
++ 		p = br_multicast_rport_from_node(br, mc_router_list, rlist);
++ 
++ 		if ((unsigned long)port >= (unsigned long)p)
++ 			break;
++ 
++ 		slot = rlist;
++ 	}
++ 
++ 	return slot;
++ }
++ 
++ /* Add port to router_list
+   *  list is maintained ordered by pointer value
+   *  and locked by br->multicast_lock and RCU
+   */
+  static void br_multicast_add_router(struct net_bridge *br,
+- 				    struct net_bridge_port *port)
++ 				    struct net_bridge_port *port,
++ 				    struct hlist_node *rlist,
++ 				    struct hlist_head *mc_router_list)
+  {
+- 	struct net_bridge_port *p;
+- 	struct hlist_node *slot = NULL;
++ 	struct hlist_node *slot;
+  
+++<<<<<<< HEAD
+ +	if (!hlist_unhashed(&port->rlist))
+ +		return;
+ +
+ +	hlist_for_each_entry(p, &br->router_list, rlist) {
+ +		if ((unsigned long) port >= (unsigned long) p)
+ +			break;
+ +		slot = &p->rlist;
+ +	}
+ +
+ +	if (slot)
+ +		hlist_add_behind_rcu(&port->rlist, slot);
+ +	else
+ +		hlist_add_head_rcu(&port->rlist, &br->router_list);
+++=======
++ 	if (!hlist_unhashed(rlist))
++ 		return;
++ 
++ 	slot = br_multicast_get_rport_slot(br, port, mc_router_list);
++ 
++ 	if (slot)
++ 		hlist_add_behind_rcu(rlist, slot);
++ 	else
++ 		hlist_add_head_rcu(rlist, mc_router_list);
++ 
+++>>>>>>> d9b8c4d8d937 (net: bridge: mcast: prepare add-router function for mcast router split)
+  	br_rtr_notify(br->dev, port, RTM_NEWMDB);
+  	br_port_mc_router_state_change(port, true);
+  }
+@@@ -2178,10 -2728,10 +2240,17 @@@ static void br_multicast_mark_router(st
+  
+  	if (!port) {
+  		if (br->multicast_router == MDB_RTR_TYPE_TEMP_QUERY) {
+++<<<<<<< HEAD
+ +			if (!timer_pending(&br->multicast_router_timer))
+ +				br_mc_router_state_change(br, true);
+ +			mod_timer(&br->multicast_router_timer,
+ +				  now + br->multicast_querier_interval);
+++=======
++ 			if (!br_ip4_multicast_is_router(br) &&
++ 			    !br_ip6_multicast_is_router(br))
++ 				br_mc_router_state_change(br, true);
++ 			mod_timer(timer, now + br->multicast_querier_interval);
+++>>>>>>> d9b8c4d8d937 (net: bridge: mcast: prepare add-router function for mcast router split)
+  		}
+  		return;
+  	}
+@@@ -2190,10 -2740,23 +2259,28 @@@
+  	    port->multicast_router == MDB_RTR_TYPE_PERM)
+  		return;
+  
+- 	br_multicast_add_router(br, port);
++ 	br_multicast_add_router(br, port, rlist, mc_router_list);
++ 	mod_timer(timer, now + br->multicast_querier_interval);
++ }
+  
+++<<<<<<< HEAD
+ +	mod_timer(&port->multicast_router_timer,
+ +		  now + br->multicast_querier_interval);
+++=======
++ static void br_ip4_multicast_mark_router(struct net_bridge *br,
++ 					 struct net_bridge_port *port)
++ {
++ 	struct timer_list *timer = &br->ip4_mc_router_timer;
++ 	struct hlist_node *rlist = NULL;
++ 
++ 	if (port) {
++ 		timer = &port->ip4_mc_router_timer;
++ 		rlist = &port->ip4_rlist;
++ 	}
++ 
++ 	br_multicast_mark_router(br, port, timer, rlist,
++ 				 &br->ip4_mc_router_list);
+++>>>>>>> d9b8c4d8d937 (net: bridge: mcast: prepare add-router function for mcast router split)
+  }
+  
+  static void
+@@@ -3015,8 -3578,8 +3102,13 @@@ int br_multicast_set_port_router(struc
+  		break;
+  	case MDB_RTR_TYPE_PERM:
+  		p->multicast_router = MDB_RTR_TYPE_PERM;
+++<<<<<<< HEAD
+ +		del_timer(&p->multicast_router_timer);
+ +		br_multicast_add_router(br, p);
+++=======
++ 		del_timer(&p->ip4_mc_router_timer);
++ 		br_ip4_multicast_add_router(br, p);
+++>>>>>>> d9b8c4d8d937 (net: bridge: mcast: prepare add-router function for mcast router split)
+  		break;
+  	case MDB_RTR_TYPE_TEMP:
+  		p->multicast_router = MDB_RTR_TYPE_TEMP;
+* Unmerged path net/bridge/br_multicast.c
