@@ -1,0 +1,182 @@
+driver core: Use device's fwnode to check if it is waiting for suppliers
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-358.el8
+commit-author Saravana Kannan <saravanak@google.com>
+commit 25ac86c6dbe62fba9b97e997fa648cdbe2d40173
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-358.el8/25ac86c6.failed
+
+To check if a device is still waiting for its supplier devices to be
+added, we used to check if the devices is in a global
+waiting_for_suppliers list. Since the global list will be deleted in
+subsequent patches, this patch stops using this check.
+
+Instead, this patch uses a more device specific check. It checks if the
+device's fwnode has any fwnode links that haven't been converted to
+device links yet.
+
+	Signed-off-by: Saravana Kannan <saravanak@google.com>
+Link: https://lore.kernel.org/r/20201121020232.908850-14-saravanak@google.com
+	Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+(cherry picked from commit 25ac86c6dbe62fba9b97e997fa648cdbe2d40173)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/base/core.c
+diff --cc drivers/base/core.c
+index 8db14fc9c3aa,8a973d9601d3..000000000000
+--- a/drivers/base/core.c
++++ b/drivers/base/core.c
+@@@ -49,10 -50,105 +49,112 @@@ static LIST_HEAD(wait_for_suppliers)
+  static DEFINE_MUTEX(wfs_lock);
+  static LIST_HEAD(deferred_sync);
+  static unsigned int defer_sync_state_count = 1;
+++<<<<<<< HEAD
+ +static unsigned int defer_fw_devlink_count;
+ +static LIST_HEAD(deferred_fw_devlink);
+ +static DEFINE_MUTEX(defer_fw_devlink_lock);
+ +static bool fw_devlink_is_permissive(void);
+++=======
++ static DEFINE_MUTEX(fwnode_link_lock);
++ static bool fw_devlink_is_permissive(void);
++ 
++ /**
++  * fwnode_link_add - Create a link between two fwnode_handles.
++  * @con: Consumer end of the link.
++  * @sup: Supplier end of the link.
++  *
++  * Create a fwnode link between fwnode handles @con and @sup. The fwnode link
++  * represents the detail that the firmware lists @sup fwnode as supplying a
++  * resource to @con.
++  *
++  * The driver core will use the fwnode link to create a device link between the
++  * two device objects corresponding to @con and @sup when they are created. The
++  * driver core will automatically delete the fwnode link between @con and @sup
++  * after doing that.
++  *
++  * Attempts to create duplicate links between the same pair of fwnode handles
++  * are ignored and there is no reference counting.
++  */
++ int fwnode_link_add(struct fwnode_handle *con, struct fwnode_handle *sup)
++ {
++ 	struct fwnode_link *link;
++ 	int ret = 0;
++ 
++ 	mutex_lock(&fwnode_link_lock);
++ 
++ 	list_for_each_entry(link, &sup->consumers, s_hook)
++ 		if (link->consumer == con)
++ 			goto out;
++ 
++ 	link = kzalloc(sizeof(*link), GFP_KERNEL);
++ 	if (!link) {
++ 		ret = -ENOMEM;
++ 		goto out;
++ 	}
++ 
++ 	link->supplier = sup;
++ 	INIT_LIST_HEAD(&link->s_hook);
++ 	link->consumer = con;
++ 	INIT_LIST_HEAD(&link->c_hook);
++ 
++ 	list_add(&link->s_hook, &sup->consumers);
++ 	list_add(&link->c_hook, &con->suppliers);
++ out:
++ 	mutex_unlock(&fwnode_link_lock);
++ 
++ 	return ret;
++ }
++ 
++ /**
++  * fwnode_links_purge_suppliers - Delete all supplier links of fwnode_handle.
++  * @fwnode: fwnode whose supplier links need to be deleted
++  *
++  * Deletes all supplier links connecting directly to @fwnode.
++  */
++ static void fwnode_links_purge_suppliers(struct fwnode_handle *fwnode)
++ {
++ 	struct fwnode_link *link, *tmp;
++ 
++ 	mutex_lock(&fwnode_link_lock);
++ 	list_for_each_entry_safe(link, tmp, &fwnode->suppliers, c_hook) {
++ 		list_del(&link->s_hook);
++ 		list_del(&link->c_hook);
++ 		kfree(link);
++ 	}
++ 	mutex_unlock(&fwnode_link_lock);
++ }
++ 
++ /**
++  * fwnode_links_purge_consumers - Delete all consumer links of fwnode_handle.
++  * @fwnode: fwnode whose consumer links need to be deleted
++  *
++  * Deletes all consumer links connecting directly to @fwnode.
++  */
++ static void fwnode_links_purge_consumers(struct fwnode_handle *fwnode)
++ {
++ 	struct fwnode_link *link, *tmp;
++ 
++ 	mutex_lock(&fwnode_link_lock);
++ 	list_for_each_entry_safe(link, tmp, &fwnode->consumers, s_hook) {
++ 		list_del(&link->s_hook);
++ 		list_del(&link->c_hook);
++ 		kfree(link);
++ 	}
++ 	mutex_unlock(&fwnode_link_lock);
++ }
++ 
++ /**
++  * fwnode_links_purge - Delete all links connected to a fwnode_handle.
++  * @fwnode: fwnode whose links needs to be deleted
++  *
++  * Deletes all links connecting directly to a fwnode.
++  */
++ void fwnode_links_purge(struct fwnode_handle *fwnode)
++ {
++ 	fwnode_links_purge_suppliers(fwnode);
++ 	fwnode_links_purge_consumers(fwnode);
++ }
+++>>>>>>> 25ac86c6dbe6 (driver core: Use device's fwnode to check if it is waiting for suppliers)
+  
+  #ifdef CONFIG_SRCU
+  static DEFINE_MUTEX(device_links_lock);
+@@@ -890,13 -996,13 +992,20 @@@ int device_links_check_suppliers(struc
+  	 * Device waiting for supplier to become available is not allowed to
+  	 * probe.
+  	 */
+++<<<<<<< HEAD
+ +	mutex_lock(&wfs_lock);
+ +	if (!list_empty(&dev->links_needs_suppliers) &&
+ +	    dev->links_need_for_probe) {
+ +		mutex_unlock(&wfs_lock);
+++=======
++ 	mutex_lock(&fwnode_link_lock);
++ 	if (dev->fwnode && !list_empty(&dev->fwnode->suppliers) &&
++ 	    !fw_devlink_is_permissive()) {
++ 		mutex_unlock(&fwnode_link_lock);
+++>>>>>>> 25ac86c6dbe6 (driver core: Use device's fwnode to check if it is waiting for suppliers)
+  		return -EPROBE_DEFER;
+  	}
+- 	mutex_unlock(&wfs_lock);
++ 	mutex_unlock(&fwnode_link_lock);
+  
+  	device_links_write_lock();
+  
+@@@ -1062,10 -1168,7 +1171,14 @@@ static ssize_t waiting_for_supplier_sho
+  	bool val;
+  
+  	device_lock(dev);
+++<<<<<<< HEAD
+ +	mutex_lock(&wfs_lock);
+ +	val = !list_empty(&dev->links_needs_suppliers)
+ +	      && dev->links_need_for_probe;
+ +	mutex_unlock(&wfs_lock);
+++=======
++ 	val = !list_empty(&dev->fwnode->suppliers);
+++>>>>>>> 25ac86c6dbe6 (driver core: Use device's fwnode to check if it is waiting for suppliers)
+  	device_unlock(dev);
+  	return sysfs_emit(buf, "%u\n", val);
+  }
+* Unmerged path drivers/base/core.c
