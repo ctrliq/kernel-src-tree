@@ -691,6 +691,8 @@ enum devlink_trap_generic_id {
 	DEVLINK_TRAP_GENERIC_ID_IPV6_ROUTER_ALERT,
 	DEVLINK_TRAP_GENERIC_ID_PTP_EVENT,
 	DEVLINK_TRAP_GENERIC_ID_PTP_GENERAL,
+	DEVLINK_TRAP_GENERIC_ID_FLOW_ACTION_SAMPLE,
+	DEVLINK_TRAP_GENERIC_ID_FLOW_ACTION_TRAP,
 
 	/* Add new generic trap IDs above */
 	__DEVLINK_TRAP_GENERIC_ID_MAX,
@@ -723,6 +725,8 @@ enum devlink_trap_group_generic_id {
 	DEVLINK_TRAP_GROUP_GENERIC_ID_IPV6,
 	DEVLINK_TRAP_GROUP_GENERIC_ID_PTP_EVENT,
 	DEVLINK_TRAP_GROUP_GENERIC_ID_PTP_GENERAL,
+	DEVLINK_TRAP_GROUP_GENERIC_ID_ACL_SAMPLE,
+	DEVLINK_TRAP_GROUP_GENERIC_ID_ACL_TRAP,
 
 	/* Add new generic trap group IDs above */
 	__DEVLINK_TRAP_GROUP_GENERIC_ID_MAX,
@@ -872,6 +876,10 @@ enum devlink_trap_group_generic_id {
 	"ptp_event"
 #define DEVLINK_TRAP_GENERIC_NAME_PTP_GENERAL \
 	"ptp_general"
+#define DEVLINK_TRAP_GENERIC_NAME_FLOW_ACTION_SAMPLE \
+	"flow_action_sample"
+#define DEVLINK_TRAP_GENERIC_NAME_FLOW_ACTION_TRAP \
+	"flow_action_trap"
 
 #define DEVLINK_TRAP_GROUP_GENERIC_NAME_L2_DROPS \
 	"l2_drops"
@@ -917,6 +925,10 @@ enum devlink_trap_group_generic_id {
 	"ptp_event"
 #define DEVLINK_TRAP_GROUP_GENERIC_NAME_PTP_GENERAL \
 	"ptp_general"
+#define DEVLINK_TRAP_GROUP_GENERIC_NAME_ACL_SAMPLE \
+	"acl_sample"
+#define DEVLINK_TRAP_GROUP_GENERIC_NAME_ACL_TRAP \
+	"acl_trap"
 
 #define DEVLINK_TRAP_GENERIC(_type, _init_action, _id, _group_id,	      \
 			     _metadata_cap)				      \
