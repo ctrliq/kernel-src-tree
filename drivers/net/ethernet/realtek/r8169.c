@@ -745,6 +745,16 @@ static void rtl_unlock_work(struct rtl8169_private *tp)
 	mutex_unlock(&tp->wk.mutex);
 }
 
+static void rtl_lock_config_regs(struct rtl8169_private *tp)
+{
+	RTL_W8(tp, Cfg9346, Cfg9346_Lock);
+}
+
+static void rtl_unlock_config_regs(struct rtl8169_private *tp)
+{
+	RTL_W8(tp, Cfg9346, Cfg9346_Unlock);
+}
+
 static void rtl_tx_performance_tweak(struct rtl8169_private *tp, u16 force)
 {
 	pcie_capability_clear_and_set_word(tp->pci_dev, PCI_EXP_DEVCTL,
@@ -1428,7 +1438,7 @@ static void __rtl8169_set_wol(struct rtl8169_private *tp, u32 wolopts)
 	};
 	u8 options;
 
-	RTL_W8(tp, Cfg9346, Cfg9346_Unlock);
+	rtl_unlock_config_regs(tp);
 
 	switch (tp->mac_version) {
 	case RTL_GIGA_MAC_VER_34 ... RTL_GIGA_MAC_VER_38:
@@ -1476,7 +1486,7 @@ static void __rtl8169_set_wol(struct rtl8169_private *tp, u32 wolopts)
 		break;
 	}
 
-	RTL_W8(tp, Cfg9346, Cfg9346_Lock);
+	rtl_lock_config_regs(tp);
 
 	device_set_wakeup_enable(tp_to_dev(tp), wolopts);
 }
@@ -4008,7 +4018,7 @@ static void rtl_rar_set(struct rtl8169_private *tp, u8 *addr)
 {
 	rtl_lock_work(tp);
 
-	RTL_W8(tp, Cfg9346, Cfg9346_Unlock);
+	rtl_unlock_config_regs(tp);
 
 	RTL_W32(tp, MAC4, addr[4] | addr[5] << 8);
 	RTL_R32(tp, MAC4);
@@ -4019,7 +4029,7 @@ static void rtl_rar_set(struct rtl8169_private *tp, u8 *addr)
 	if (tp->mac_version == RTL_GIGA_MAC_VER_34)
 		rtl_rar_exgmac_set(tp, addr);
 
-	RTL_W8(tp, Cfg9346, Cfg9346_Lock);
+	rtl_lock_config_regs(tp);
 
 	rtl_unlock_work(tp);
 }
@@ -4231,18 +4241,18 @@ static void rtl8169_init_ring_indexes(struct rtl8169_private *tp)
 static void rtl_hw_jumbo_enable(struct rtl8169_private *tp)
 {
 	if (tp->jumbo_ops.enable) {
-		RTL_W8(tp, Cfg9346, Cfg9346_Unlock);
+		rtl_unlock_config_regs(tp);
 		tp->jumbo_ops.enable(tp);
-		RTL_W8(tp, Cfg9346, Cfg9346_Lock);
+		rtl_lock_config_regs(tp);
 	}
 }
 
 static void rtl_hw_jumbo_disable(struct rtl8169_private *tp)
 {
 	if (tp->jumbo_ops.disable) {
-		RTL_W8(tp, Cfg9346, Cfg9346_Unlock);
+		rtl_unlock_config_regs(tp);
 		tp->jumbo_ops.disable(tp);
-		RTL_W8(tp, Cfg9346, Cfg9346_Lock);
+		rtl_lock_config_regs(tp);
 	}
 }
 
@@ -4563,13 +4573,13 @@ static void rtl_set_rx_mode(struct net_device *dev)
 
 static void rtl_hw_start(struct  rtl8169_private *tp)
 {
-	RTL_W8(tp, Cfg9346, Cfg9346_Unlock);
+	rtl_unlock_config_regs(tp);
 
 	tp->hw_start(tp);
 
 	rtl_set_rx_max_size(tp);
 	rtl_set_rx_tx_desc_registers(tp);
-	RTL_W8(tp, Cfg9346, Cfg9346_Lock);
+	rtl_lock_config_regs(tp);
 
 	/* Initially a 10 us delay. Turned it into a PCI commit. - FR */
 	RTL_R8(tp, IntrMask);
@@ -6982,9 +6992,9 @@ static int rtl_alloc_irq(struct rtl8169_private *tp)
 	unsigned int flags;
 
 	if (tp->mac_version <= RTL_GIGA_MAC_VER_06) {
-		RTL_W8(tp, Cfg9346, Cfg9346_Unlock);
+		rtl_unlock_config_regs(tp);
 		RTL_W8(tp, Config2, RTL_R8(tp, Config2) & ~MSIEnable);
-		RTL_W8(tp, Cfg9346, Cfg9346_Lock);
+		rtl_lock_config_regs(tp);
 		flags = PCI_IRQ_LEGACY;
 	} else {
 		flags = PCI_IRQ_ALL_TYPES;
