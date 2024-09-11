@@ -1,0 +1,204 @@
+io_uring: provide fallback request for OOM situations
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Jens Axboe <axboe@kernel.dk>
+commit 0ddf92e848ab7abf216f218ee363eb9b9650e98f
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/0ddf92e8.failed
+
+One thing that really sucks for userspace APIs is if the kernel passes
+back -ENOMEM/-EAGAIN for resource shortages. The application really has
+no idea of what to do in those cases. Should it try and reap
+completions? Probably a good idea. Will it solve the issue? Who knows.
+
+This patch adds a simple fallback mechanism if we fail to allocate
+memory for a request. If we fail allocating memory from the slab for a
+request, we punt to a pre-allocated request. There's just one of these
+per io_ring_ctx, but the important part is if we ever return -EBUSY to
+the application, the applications knows that it can wait for events and
+make forward progress when events have completed. This is the important
+part.
+
+	Signed-off-by: Jens Axboe <axboe@kernel.dk>
+(cherry picked from commit 0ddf92e848ab7abf216f218ee363eb9b9650e98f)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/io_uring.c
+diff --cc fs/io_uring.c
+index fca9cdc96d77,2c838baf11b4..000000000000
+--- a/fs/io_uring.c
++++ b/fs/io_uring.c
+@@@ -259,7 -236,25 +259,29 @@@ struct io_ring_ctx 
+  
+  	struct user_struct	*user;
+  
+++<<<<<<< HEAD
+ +	struct completion	ctx_done;
+++=======
++ 	/* 0 is for ctx quiesce/reinit/free, 1 is for sqo_thread started */
++ 	struct completion	*completions;
++ 
++ 	/* if all else fails... */
++ 	struct io_kiocb		*fallback_req;
++ 
++ #if defined(CONFIG_UNIX)
++ 	struct socket		*ring_sock;
++ #endif
++ 
++ 	struct {
++ 		unsigned		cached_cq_tail;
++ 		unsigned		cq_entries;
++ 		unsigned		cq_mask;
++ 		atomic_t		cq_timeouts;
++ 		struct wait_queue_head	cq_wait;
++ 		struct fasync_struct	*cq_fasync;
++ 		struct eventfd_ctx	*cq_ev_fd;
++ 	} ____cacheline_aligned_in_smp;
+++>>>>>>> 0ddf92e848ab (io_uring: provide fallback request for OOM situations)
+  
+  	struct {
+  		struct mutex		uring_lock;
+@@@ -403,11 -411,17 +425,22 @@@ static struct io_ring_ctx *io_ring_ctx_
+  	if (!ctx)
+  		return NULL;
+  
+++<<<<<<< HEAD
+++=======
++ 	ctx->fallback_req = kmem_cache_alloc(req_cachep, GFP_KERNEL);
++ 	if (!ctx->fallback_req)
++ 		goto err;
++ 
++ 	ctx->completions = kmalloc(2 * sizeof(struct completion), GFP_KERNEL);
++ 	if (!ctx->completions)
++ 		goto err;
++ 
+++>>>>>>> 0ddf92e848ab (io_uring: provide fallback request for OOM situations)
+  	if (percpu_ref_init(&ctx->refs, io_ring_ctx_ref_free,
+ -			    PERCPU_REF_ALLOW_REINIT, GFP_KERNEL))
+ -		goto err;
+ +			    PERCPU_REF_ALLOW_REINIT, GFP_KERNEL)) {
+ +		kfree(ctx);
+ +		return NULL;
+ +	}
+  
+  	ctx->flags = p->flags;
+  	init_waitqueue_head(&ctx->cq_wait);
+@@@ -424,11 -434,28 +457,20 @@@
+  	INIT_LIST_HEAD(&ctx->poll_list);
+  	INIT_LIST_HEAD(&ctx->cancel_list);
+  	INIT_LIST_HEAD(&ctx->defer_list);
+ -	INIT_LIST_HEAD(&ctx->timeout_list);
+ -	init_waitqueue_head(&ctx->inflight_wait);
+ -	spin_lock_init(&ctx->inflight_lock);
+ -	INIT_LIST_HEAD(&ctx->inflight_list);
+  	return ctx;
+++<<<<<<< HEAD
+++=======
++ err:
++ 	if (ctx->fallback_req)
++ 		kmem_cache_free(req_cachep, ctx->fallback_req);
++ 	kfree(ctx->completions);
++ 	kfree(ctx);
++ 	return NULL;
+++>>>>>>> 0ddf92e848ab (io_uring: provide fallback request for OOM situations)
+  }
+  
+ -static inline bool __io_sequence_defer(struct io_kiocb *req)
+ -{
+ -	struct io_ring_ctx *ctx = req->ctx;
+ -
+ -	return req->sequence != ctx->cached_cq_tail + ctx->cached_sq_dropped
+ -					+ atomic_read(&ctx->cached_cq_overflow);
+ -}
+ -
+ -static inline bool io_sequence_defer(struct io_kiocb *req)
+ +static inline bool io_sequence_defer(struct io_ring_ctx *ctx,
+ +				     struct io_kiocb *req)
+  {
+  	if ((req->flags & (REQ_F_IO_DRAIN|REQ_F_IO_DRAINED)) != REQ_F_IO_DRAIN)
+  		return false;
+@@@ -609,8 -784,12 +669,11 @@@ got_it
+  	/* one is dropped after submission, the other at completion */
+  	refcount_set(&req->refs, 2);
+  	req->result = 0;
+ -	INIT_IO_WORK(&req->work, io_wq_submit_work);
+  	return req;
+- out:
++ fallback:
++ 	req = io_get_fallback_req(ctx);
++ 	if (req)
++ 		goto got_it;
+  	percpu_ref_put(&ctx->refs);
+  	return NULL;
+  }
+@@@ -626,15 -805,48 +689,32 @@@ static void io_free_req_many(struct io_
+  
+  static void __io_free_req(struct io_kiocb *req)
+  {
+ -	struct io_ring_ctx *ctx = req->ctx;
+ -
+  	if (req->file && !(req->flags & REQ_F_FIXED_FILE))
+  		fput(req->file);
+++<<<<<<< HEAD
+ +	percpu_ref_put(&req->ctx->refs);
+ +	kmem_cache_free(req_cachep, req);
+++=======
++ 	if (req->flags & REQ_F_INFLIGHT) {
++ 		unsigned long flags;
++ 
++ 		spin_lock_irqsave(&ctx->inflight_lock, flags);
++ 		list_del(&req->inflight_entry);
++ 		if (waitqueue_active(&ctx->inflight_wait))
++ 			wake_up(&ctx->inflight_wait);
++ 		spin_unlock_irqrestore(&ctx->inflight_lock, flags);
++ 	}
++ 	percpu_ref_put(&ctx->refs);
++ 	if (likely(!io_is_fallback_req(req)))
++ 		kmem_cache_free(req_cachep, req);
++ 	else
++ 		clear_bit_unlock(0, (unsigned long *) ctx->fallback_req);
+++>>>>>>> 0ddf92e848ab (io_uring: provide fallback request for OOM situations)
+  }
+  
+ -static bool io_link_cancel_timeout(struct io_kiocb *req)
+ -{
+ -	struct io_ring_ctx *ctx = req->ctx;
+ -	int ret;
+ -
+ -	ret = hrtimer_try_to_cancel(&req->timeout.timer);
+ -	if (ret != -1) {
+ -		io_cqring_fill_event(req, -ECANCELED);
+ -		io_commit_cqring(ctx);
+ -		req->flags &= ~REQ_F_LINK;
+ -		io_put_req(req);
+ -		return true;
+ -	}
+ -
+ -	return false;
+ -}
+ -
+ -static void io_req_link_next(struct io_kiocb *req, struct io_kiocb **nxtptr)
+ +static void io_req_link_next(struct io_kiocb *req)
+  {
+ -	struct io_ring_ctx *ctx = req->ctx;
+  	struct io_kiocb *nxt;
+ -	bool wake_ev = false;
+  
+  	/*
+  	 * The list should never be empty when we are called here. But could
+@@@ -3513,6 -4160,8 +3593,11 @@@ static void io_ring_ctx_free(struct io_
+  		io_unaccount_mem(ctx->user,
+  				ring_pages(ctx->sq_entries, ctx->cq_entries));
+  	free_uid(ctx->user);
+++<<<<<<< HEAD
+++=======
++ 	kfree(ctx->completions);
++ 	kmem_cache_free(req_cachep, ctx->fallback_req);
+++>>>>>>> 0ddf92e848ab (io_uring: provide fallback request for OOM situations)
+  	kfree(ctx);
+  }
+  
+* Unmerged path fs/io_uring.c
