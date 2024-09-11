@@ -1,0 +1,210 @@
+net: optimize the sockptr_t for unified kernel/user address spaces
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+Rebuild_CHGLOG: - [net] optimize the sockptr_t for unified kernel/user address spaces (Jiri Benc) [1882709]
+Rebuild_FUZZ: 96.06%
+commit-author Christoph Hellwig <hch@lst.de>
+commit 6d04fe15f78acdf8e32329e208552e226f7a8ae6
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/6d04fe15.failed
+
+For architectures like x86 and arm64 we don't need the separate bit to
+indicate that a pointer is a kernel pointer as the address spaces are
+unified.  That way the sockptr_t can be reduced to a union of two
+pointers, which leads to nicer calling conventions.
+
+The only caveat is that we need to check that users don't pass in kernel
+address and thus gain access to kernel memory.  Thus the USER_SOCKPTR
+helper is replaced with a init_user_sockptr function that does this check
+and returns an error if it fails.
+
+	Signed-off-by: Christoph Hellwig <hch@lst.de>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 6d04fe15f78acdf8e32329e208552e226f7a8ae6)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/socket.c
+diff --cc net/socket.c
+index 5a1fb545df6d,94ca4547cd7c..000000000000
+--- a/net/socket.c
++++ b/net/socket.c
+@@@ -2050,11 -2094,10 +2050,15 @@@ static bool sock_use_custom_sol_socket(
+   *	Set a socket option. Because we don't know the option lengths we have
+   *	to pass the user mode parameter for the protocols to sort out.
+   */
+ -int __sys_setsockopt(int fd, int level, int optname, char __user *user_optval,
+ -		int optlen)
+ +
+ +static int __sys_setsockopt(int fd, int level, int optname,
+ +			    char __user *optval, int optlen)
+  {
+++<<<<<<< HEAD
+ +	mm_segment_t oldfs = get_fs();
+++=======
++ 	sockptr_t optval;
+++>>>>>>> 6d04fe15f78a (net: optimize the sockptr_t for unified kernel/user address spaces)
+  	char *kernel_optval = NULL;
+  	int err, fput_needed;
+  	struct socket *sock;
+@@@ -2062,44 -2105,41 +2066,48 @@@
+  	if (optlen < 0)
+  		return -EINVAL;
+  
++ 	err = init_user_sockptr(&optval, user_optval);
++ 	if (err)
++ 		return err;
++ 
+  	sock = sockfd_lookup_light(fd, &err, &fput_needed);
+ -	if (!sock)
+ -		return err;
+ -
+ -	err = security_socket_setsockopt(sock, level, optname);
+ -	if (err)
+ -		goto out_put;
+ +	if (sock != NULL) {
+ +		err = security_socket_setsockopt(sock, level, optname);
+ +		if (err)
+ +			goto out_put;
+  
+ -	if (!in_compat_syscall())
+ -		err = BPF_CGROUP_RUN_PROG_SETSOCKOPT(sock->sk, &level, &optname,
+ -						     user_optval, &optlen,
+ +		err = BPF_CGROUP_RUN_PROG_SETSOCKOPT(sock->sk, &level,
+ +						     &optname, optval, &optlen,
+  						     &kernel_optval);
+ -	if (err < 0)
+ -		goto out_put;
+ -	if (err > 0) {
+ -		err = 0;
+ -		goto out_put;
+ -	}
+  
+ -	if (kernel_optval)
+ -		optval = KERNEL_SOCKPTR(kernel_optval);
+ -	if (level == SOL_SOCKET && !sock_use_custom_sol_socket(sock))
+ -		err = sock_setsockopt(sock, level, optname, optval, optlen);
+ -	else if (unlikely(!sock->ops->setsockopt))
+ -		err = -EOPNOTSUPP;
+ -	else
+ -		err = sock->ops->setsockopt(sock, level, optname, optval,
+ +		if (err < 0) {
+ +			goto out_put;
+ +		} else if (err > 0) {
+ +			err = 0;
+ +			goto out_put;
+ +		}
+ +
+ +		if (kernel_optval) {
+ +			set_fs(KERNEL_DS);
+ +			optval = (char __user __force *)kernel_optval;
+ +		}
+ +
+ +		if (level == SOL_SOCKET && !sock_use_custom_sol_socket(sock))
+ +			err =
+ +			    sock_setsockopt(sock, level, optname, optval,
+  					    optlen);
+ -	kfree(kernel_optval);
+ +		else
+ +			err =
+ +			    sock->ops->setsockopt(sock, level, optname, optval,
+ +						  optlen);
+ +
+ +		if (kernel_optval) {
+ +			set_fs(oldfs);
+ +			kfree(kernel_optval);
+ +		}
+  out_put:
+ -	fput_light(sock->file, fput_needed);
+ +		fput_light(sock->file, fput_needed);
+ +	}
+  	return err;
+  }
+  
+diff --git a/include/linux/sockptr.h b/include/linux/sockptr.h
+index 700856e13ea0..7d5cdb2b30b5 100644
+--- a/include/linux/sockptr.h
++++ b/include/linux/sockptr.h
+@@ -8,9 +8,34 @@
+ #ifndef _LINUX_SOCKPTR_H
+ #define _LINUX_SOCKPTR_H
+ 
++#include <linux/compiler.h>
+ #include <linux/slab.h>
+ #include <linux/uaccess.h>
+ 
++#ifdef CONFIG_ARCH_HAS_NON_OVERLAPPING_ADDRESS_SPACE
++typedef union {
++	void		*kernel;
++	void __user	*user;
++} sockptr_t;
++
++static inline bool sockptr_is_kernel(sockptr_t sockptr)
++{
++	return (unsigned long)sockptr.kernel >= TASK_SIZE;
++}
++
++static inline sockptr_t KERNEL_SOCKPTR(void *p)
++{
++	return (sockptr_t) { .kernel = p };
++}
++
++static inline int __must_check init_user_sockptr(sockptr_t *sp, void __user *p)
++{
++	if ((unsigned long)p >= TASK_SIZE)
++		return -EFAULT;
++	sp->user = p;
++	return 0;
++}
++#else /* CONFIG_ARCH_HAS_NON_OVERLAPPING_ADDRESS_SPACE */
+ typedef struct {
+ 	union {
+ 		void		*kernel;
+@@ -29,10 +54,13 @@ static inline sockptr_t KERNEL_SOCKPTR(void *p)
+ 	return (sockptr_t) { .kernel = p, .is_kernel = true };
+ }
+ 
+-static inline sockptr_t USER_SOCKPTR(void __user *p)
++static inline int __must_check init_user_sockptr(sockptr_t *sp, void __user *p)
+ {
+-	return (sockptr_t) { .user = p };
++	sp->user = p;
++	sp->is_kernel = false;
++	return 0;
+ }
++#endif /* CONFIG_ARCH_HAS_NON_OVERLAPPING_ADDRESS_SPACE */
+ 
+ static inline bool sockptr_is_null(sockptr_t sockptr)
+ {
+diff --git a/net/ipv4/bpfilter/sockopt.c b/net/ipv4/bpfilter/sockopt.c
+index 1b34cb9a7708..94f18d2352d0 100644
+--- a/net/ipv4/bpfilter/sockopt.c
++++ b/net/ipv4/bpfilter/sockopt.c
+@@ -57,16 +57,18 @@ int bpfilter_ip_set_sockopt(struct sock *sk, int optname, sockptr_t optval,
+ 	return bpfilter_mbox_request(sk, optname, optval, optlen, true);
+ }
+ 
+-int bpfilter_ip_get_sockopt(struct sock *sk, int optname, char __user *optval,
+-			    int __user *optlen)
++int bpfilter_ip_get_sockopt(struct sock *sk, int optname,
++			    char __user *user_optval, int __user *optlen)
+ {
+-	int len;
++	sockptr_t optval;
++	int err, len;
+ 
+ 	if (get_user(len, optlen))
+ 		return -EFAULT;
+-
+-	return bpfilter_mbox_request(sk, optname, USER_SOCKPTR(optval), len,
+-				     false);
++	err = init_user_sockptr(&optval, user_optval);
++	if (err)
++		return err;
++	return bpfilter_mbox_request(sk, optname, optval, len, false);
+ }
+ 
+ static int __init bpfilter_sockopt_init(void)
+* Unmerged path net/socket.c
