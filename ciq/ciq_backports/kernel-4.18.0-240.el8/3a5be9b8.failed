@@ -1,0 +1,377 @@
+intel_idle: Introduce 'use_acpi' module parameter
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Rafael J. Wysocki <rafael.j.wysocki@intel.com>
+commit 3a5be9b8f43346a24f31c0017cb2566a6b2c72c5
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/3a5be9b8.failed
+
+For diagnostics, it is generally useful to be able to make intel_idle
+take the system's ACPI tables into consideration even if that is not
+required for the processor model in there, so introduce a new module
+parameter, 'use_acpi', to make that happen and update the documentation
+to cover it.
+
+While at it, fix the 'no_acpi' module parameter name in the
+documentation.
+
+	Signed-off-by: Rafael J. Wysocki <rafael.j.wysocki@intel.com>
+(cherry picked from commit 3a5be9b8f43346a24f31c0017cb2566a6b2c72c5)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/idle/intel_idle.c
+diff --cc drivers/idle/intel_idle.c
+index 076189997131,6fbd94f85fa5..000000000000
+--- a/drivers/idle/intel_idle.c
++++ b/drivers/idle/intel_idle.c
+@@@ -1107,69 -1107,168 +1107,140 @@@ static const struct x86_cpu_id intel_id
+  	{}
+  };
+  
+++<<<<<<< HEAD
+ +/*
+ + * intel_idle_probe()
+++=======
++ #define INTEL_CPU_FAM6_MWAIT \
++ 	{ X86_VENDOR_INTEL, 6, X86_MODEL_ANY, X86_FEATURE_MWAIT, 0 }
++ 
++ static const struct x86_cpu_id intel_mwait_ids[] __initconst = {
++ 	INTEL_CPU_FAM6_MWAIT,
++ 	{}
++ };
++ 
++ static bool __init intel_idle_max_cstate_reached(int cstate)
++ {
++ 	if (cstate + 1 > max_cstate) {
++ 		pr_info("max_cstate %d reached\n", max_cstate);
++ 		return true;
++ 	}
++ 	return false;
++ }
++ 
++ #ifdef CONFIG_ACPI_PROCESSOR_CSTATE
++ #include <acpi/processor.h>
++ 
++ static bool no_acpi __read_mostly;
++ module_param(no_acpi, bool, 0444);
++ MODULE_PARM_DESC(no_acpi, "Do not use ACPI _CST for building the idle states list");
++ 
++ static bool force_use_acpi __read_mostly; /* No effect if no_acpi is set. */
++ module_param_named(use_acpi, force_use_acpi, bool, 0444);
++ MODULE_PARM_DESC(use_acpi, "Use ACPI _CST for building the idle states list");
++ 
++ static struct acpi_processor_power acpi_state_table __initdata;
++ 
++ /**
++  * intel_idle_cst_usable - Check if the _CST information can be used.
++  *
++  * Check if all of the C-states listed by _CST in the max_cstate range are
++  * ACPI_CSTATE_FFH, which means that they should be entered via MWAIT.
+++>>>>>>> 3a5be9b8f433 (intel_idle: Introduce 'use_acpi' module parameter)
+   */
+ -static bool __init intel_idle_cst_usable(void)
+ +static int __init intel_idle_probe(void)
+  {
+ -	int cstate, limit;
+ -
+ -	limit = min_t(int, min_t(int, CPUIDLE_STATE_MAX, max_cstate + 1),
+ -		      acpi_state_table.count);
+ -
+ -	for (cstate = 1; cstate < limit; cstate++) {
+ -		struct acpi_processor_cx *cx = &acpi_state_table.states[cstate];
+ +	unsigned int eax, ebx, ecx;
+ +	const struct x86_cpu_id *id;
+  
+ -		if (cx->entry_method != ACPI_CSTATE_FFH)
+ -			return false;
+ +	if (max_cstate == 0) {
+ +		pr_debug("disabled\n");
+ +		return -EPERM;
+  	}
+  
+ -	return true;
+ -}
+ -
+ -static bool __init intel_idle_acpi_cst_extract(void)
+ -{
+ -	unsigned int cpu;
+ -
+ -	if (no_acpi) {
+ -		pr_debug("Not allowed to use ACPI _CST\n");
+ -		return false;
+ +	id = x86_match_cpu(intel_idle_ids);
+ +	if (!id) {
+ +		if (boot_cpu_data.x86_vendor == X86_VENDOR_INTEL &&
+ +		    boot_cpu_data.x86 == 6)
+ +			pr_debug("does not run on family %d model %d\n",
+ +				 boot_cpu_data.x86, boot_cpu_data.x86_model);
+ +		return -ENODEV;
+  	}
+  
+ -	for_each_possible_cpu(cpu) {
+ -		struct acpi_processor *pr = per_cpu(processors, cpu);
+ +	if (!boot_cpu_has(X86_FEATURE_MWAIT)) {
+ +		pr_debug("Please enable MWAIT in BIOS SETUP\n");
+ +		return -ENODEV;
+ +	}
+  
+ -		if (!pr)
+ -			continue;
+ +	if (boot_cpu_data.cpuid_level < CPUID_MWAIT_LEAF)
+ +		return -ENODEV;
+  
+ -		if (acpi_processor_evaluate_cst(pr->handle, cpu, &acpi_state_table))
+ -			continue;
+ +	cpuid(CPUID_MWAIT_LEAF, &eax, &ebx, &ecx, &mwait_substates);
+  
+ -		acpi_state_table.count++;
+ +	if (!(ecx & CPUID5_ECX_EXTENSIONS_SUPPORTED) ||
+ +	    !(ecx & CPUID5_ECX_INTERRUPT_BREAK) ||
+ +	    !mwait_substates)
+ +			return -ENODEV;
+  
+ -		if (!intel_idle_cst_usable())
+ -			continue;
+ +	pr_debug("MWAIT substates: 0x%x\n", mwait_substates);
+  
+ -		if (!acpi_processor_claim_cst_control()) {
+ -			acpi_state_table.count = 0;
+ -			return false;
+ -		}
+ +	icpu = (const struct idle_cpu *)id->driver_data;
+ +	cpuidle_state_table = icpu->state_table;
+  
+ -		return true;
+ -	}
+ +	pr_debug("v" INTEL_IDLE_VERSION " model 0x%X\n",
+ +		 boot_cpu_data.x86_model);
+  
+ -	pr_debug("ACPI _CST not found or not usable\n");
+ -	return false;
+ +	return 0;
+  }
+  
+ -static void __init intel_idle_init_cstates_acpi(struct cpuidle_driver *drv)
+ +/*
+ + * intel_idle_cpuidle_devices_uninit()
+ + * Unregisters the cpuidle devices.
+ + */
+ +static void intel_idle_cpuidle_devices_uninit(void)
+  {
+ -	int cstate, limit = min_t(int, CPUIDLE_STATE_MAX, acpi_state_table.count);
+ -
+ -	/*
+ -	 * If limit > 0, intel_idle_cst_usable() has returned 'true', so all of
+ -	 * the interesting states are ACPI_CSTATE_FFH.
+ -	 */
+ -	for (cstate = 1; cstate < limit; cstate++) {
+ -		struct acpi_processor_cx *cx;
+ -		struct cpuidle_state *state;
+ -
+ -		if (intel_idle_max_cstate_reached(cstate))
+ -			break;
+ +	int i;
+ +	struct cpuidle_device *dev;
+  
+ -		cx = &acpi_state_table.states[cstate];
+ -
+ -		state = &drv->states[drv->state_count++];
+ -
+ -		snprintf(state->name, CPUIDLE_NAME_LEN, "C%d_ACPI", cstate);
+ -		strlcpy(state->desc, cx->desc, CPUIDLE_DESC_LEN);
+ -		state->exit_latency = cx->latency;
+ -		/*
+ -		 * For C1-type C-states use the same number for both the exit
+ -		 * latency and target residency, because that is the case for
+ -		 * C1 in the majority of the static C-states tables above.
+ -		 * For the other types of C-states, however, set the target
+ -		 * residency to 3 times the exit latency which should lead to
+ -		 * a reasonable balance between energy-efficiency and
+ -		 * performance in the majority of interesting cases.
+ -		 */
+ -		state->target_residency = cx->latency;
+ -		if (cx->type > ACPI_STATE_C1)
+ -			state->target_residency *= 3;
+ -
+ -		state->flags = MWAIT2flg(cx->address);
+ -		if (cx->type > ACPI_STATE_C2)
+ -			state->flags |= CPUIDLE_FLAG_TLB_FLUSHED;
+ -
+ -		state->enter = intel_idle;
+ -		state->enter_s2idle = intel_idle_s2idle;
+ +	for_each_online_cpu(i) {
+ +		dev = per_cpu_ptr(intel_idle_cpuidle_devices, i);
+ +		cpuidle_unregister_device(dev);
+  	}
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static bool __init intel_idle_off_by_default(u32 mwait_hint)
++ {
++ 	int cstate, limit;
++ 
++ 	/*
++ 	 * If there are no _CST C-states, do not disable any C-states by
++ 	 * default.
++ 	 */
++ 	if (!acpi_state_table.count)
++ 		return false;
++ 
++ 	limit = min_t(int, CPUIDLE_STATE_MAX, acpi_state_table.count);
++ 	/*
++ 	 * If limit > 0, intel_idle_cst_usable() has returned 'true', so all of
++ 	 * the interesting states are ACPI_CSTATE_FFH.
++ 	 */
++ 	for (cstate = 1; cstate < limit; cstate++) {
++ 		if (acpi_state_table.states[cstate].address == mwait_hint)
++ 			return false;
++ 	}
++ 	return true;
++ }
++ #else /* !CONFIG_ACPI_PROCESSOR_CSTATE */
++ #define force_use_acpi	(false)
++ 
++ static inline bool intel_idle_acpi_cst_extract(void) { return false; }
++ static inline void intel_idle_init_cstates_acpi(struct cpuidle_driver *drv) { }
++ static inline bool intel_idle_off_by_default(u32 mwait_hint) { return false; }
++ #endif /* !CONFIG_ACPI_PROCESSOR_CSTATE */
++ 
+++>>>>>>> 3a5be9b8f433 (intel_idle: Introduce 'use_acpi' module parameter)
+  /*
+   * ivt_idle_state_table_update(void)
+   *
+@@@ -1373,16 -1459,19 +1444,23 @@@ static void __init intel_idle_cpuidle_d
+  			continue;
+  		}
+  
+ -		mwait_hint = flg2MWAIT(cpuidle_state_table[cstate].flags);
+ -		if (!intel_idle_verify_cstate(mwait_hint))
+ -			continue;
+  
+ -		/* Structure copy. */
+ -		drv->states[drv->state_count] = cpuidle_state_table[cstate];
+ +		if (((mwait_cstate + 1) > 2) &&
+ +			!boot_cpu_has(X86_FEATURE_NONSTOP_TSC))
+ +			mark_tsc_unstable("TSC halts in idle"
+ +					" states deeper than C2");
+  
+++<<<<<<< HEAD
+ +		drv->states[drv->state_count] =	/* structure copy */
+ +			cpuidle_state_table[cstate];
+++=======
++ 		if ((icpu->use_acpi || force_use_acpi) &&
++ 		    intel_idle_off_by_default(mwait_hint) &&
++ 		    !(cpuidle_state_table[cstate].flags & CPUIDLE_FLAG_ALWAYS_ENABLE))
++ 			drv->states[drv->state_count].flags |= CPUIDLE_FLAG_OFF;
+++>>>>>>> 3a5be9b8f433 (intel_idle: Introduce 'use_acpi' module parameter)
+  
+ -		drv->state_count++;
+ +		drv->state_count += 1;
+  	}
+  
+  	if (icpu->byt_auto_demotion_disable_flag) {
+@@@ -1445,15 -1582,53 +1523,58 @@@ static int __init intel_idle_init(void
+  	if (boot_option_idle_override != IDLE_NO_OVERRIDE)
+  		return -ENODEV;
+  
+++<<<<<<< HEAD
+ +	retval = intel_idle_probe();
+ +	if (retval)
+ +		return retval;
+++=======
++ 	if (max_cstate == 0) {
++ 		pr_debug("disabled\n");
++ 		return -EPERM;
++ 	}
++ 
++ 	id = x86_match_cpu(intel_idle_ids);
++ 	if (id) {
++ 		if (!boot_cpu_has(X86_FEATURE_MWAIT)) {
++ 			pr_debug("Please enable MWAIT in BIOS SETUP\n");
++ 			return -ENODEV;
++ 		}
++ 	} else {
++ 		id = x86_match_cpu(intel_mwait_ids);
++ 		if (!id)
++ 			return -ENODEV;
++ 	}
++ 
++ 	if (boot_cpu_data.cpuid_level < CPUID_MWAIT_LEAF)
++ 		return -ENODEV;
++ 
++ 	cpuid(CPUID_MWAIT_LEAF, &eax, &ebx, &ecx, &mwait_substates);
++ 
++ 	if (!(ecx & CPUID5_ECX_EXTENSIONS_SUPPORTED) ||
++ 	    !(ecx & CPUID5_ECX_INTERRUPT_BREAK) ||
++ 	    !mwait_substates)
++ 			return -ENODEV;
++ 
++ 	pr_debug("MWAIT substates: 0x%x\n", mwait_substates);
++ 
++ 	icpu = (const struct idle_cpu *)id->driver_data;
++ 	if (icpu) {
++ 		cpuidle_state_table = icpu->state_table;
++ 		if (icpu->use_acpi || force_use_acpi)
++ 			intel_idle_acpi_cst_extract();
++ 	} else if (!intel_idle_acpi_cst_extract()) {
++ 		return -ENODEV;
++ 	}
++ 
++ 	pr_debug("v" INTEL_IDLE_VERSION " model 0x%X\n",
++ 		 boot_cpu_data.x86_model);
+++>>>>>>> 3a5be9b8f433 (intel_idle: Introduce 'use_acpi' module parameter)
+  
+  	intel_idle_cpuidle_devices = alloc_percpu(struct cpuidle_device);
+ -	if (!intel_idle_cpuidle_devices)
+ +	if (intel_idle_cpuidle_devices == NULL)
+  		return -ENOMEM;
+  
+ -	intel_idle_cpuidle_driver_init(&intel_idle_driver);
+ -
+ +	intel_idle_cpuidle_driver_init();
+  	retval = cpuidle_register_driver(&intel_idle_driver);
+  	if (retval) {
+  		struct cpuidle_driver *drv = cpuidle_get_driver();
+diff --git a/Documentation/admin-guide/pm/intel_idle.rst b/Documentation/admin-guide/pm/intel_idle.rst
+index afbf778035f8..8998598746a4 100644
+--- a/Documentation/admin-guide/pm/intel_idle.rst
++++ b/Documentation/admin-guide/pm/intel_idle.rst
+@@ -60,6 +60,9 @@ of the system.  The former are always used if the processor model at hand is
+ recognized by ``intel_idle`` and the latter are used if that is required for
+ the given processor model (which is the case for all server processor models
+ recognized by ``intel_idle``) or if the processor model is not recognized.
++[There is a module parameter that can be used to make the driver use the ACPI
++tables with any processor model recognized by it; see
++`below <intel-idle-parameters_>`_.]
+ 
+ If the ACPI tables are going to be used for building the list of available idle
+ states, ``intel_idle`` first looks for a ``_CST`` object under one of the ACPI
+@@ -165,7 +168,7 @@ and ``idle=nomwait``.  If any of them is present in the kernel command line, the
+ ``MWAIT`` instruction is not allowed to be used, so the initialization of
+ ``intel_idle`` will fail.
+ 
+-Apart from that there are two module parameters recognized by ``intel_idle``
++Apart from that there are three module parameters recognized by ``intel_idle``
+ itself that can be set via the kernel command line (they cannot be updated via
+ sysfs, so that is the only way to change their values).
+ 
+@@ -186,9 +189,11 @@ QoS) feature can be used to prevent ``CPUIdle`` from touching those idle states
+ even if they have been enumerated (see :ref:`cpu-pm-qos` in :doc:`cpuidle`).
+ Setting ``max_cstate`` to 0 causes the ``intel_idle`` initialization to fail.
+ 
+-The ``noacpi`` module parameter (which is recognized by ``intel_idle`` if the
+-kernel has been configured with ACPI support), can be set to make the driver
+-ignore the system's ACPI tables entirely (it is unset by default).
++The ``no_acpi`` and ``use_acpi`` module parameters (recognized by ``intel_idle``
++if the kernel has been configured with ACPI support) can be set to make the
++driver ignore the system's ACPI tables entirely or use them for all of the
++recognized processor models, respectively (they both are unset by default and
++``use_acpi`` has no effect if ``no_acpi`` is set).
+ 
+ 
+ .. _intel-idle-core-and-package-idle-states:
+* Unmerged path drivers/idle/intel_idle.c
