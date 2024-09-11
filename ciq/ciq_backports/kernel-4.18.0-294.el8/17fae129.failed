@@ -1,0 +1,257 @@
+x86/{mce,mm}: Unmap the entire page if the whole page is affected and poisoned
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Tony Luck <tony.luck@intel.com>
+commit 17fae1294ad9d711b2c3dd0edef479d40c76a5e8
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/17fae129.failed
+
+An interesting thing happened when a guest Linux instance took a machine
+check. The VMM unmapped the bad page from guest physical space and
+passed the machine check to the guest.
+
+Linux took all the normal actions to offline the page from the process
+that was using it. But then guest Linux crashed because it said there
+was a second machine check inside the kernel with this stack trace:
+
+do_memory_failure
+    set_mce_nospec
+         set_memory_uc
+              _set_memory_uc
+                   change_page_attr_set_clr
+                        cpa_flush
+                             clflush_cache_range_opt
+
+This was odd, because a CLFLUSH instruction shouldn't raise a machine
+check (it isn't consuming the data). Further investigation showed that
+the VMM had passed in another machine check because is appeared that the
+guest was accessing the bad page.
+
+Fix is to check the scope of the poison by checking the MCi_MISC register.
+If the entire page is affected, then unmap the page. If only part of the
+page is affected, then mark the page as uncacheable.
+
+This assumes that VMMs will do the logical thing and pass in the "whole
+page scope" via the MCi_MISC register (since they unmapped the entire
+page).
+
+  [ bp: Adjust to x86/entry changes. ]
+
+Fixes: 284ce4011ba6 ("x86/memory_failure: Introduce {set, clear}_mce_nospec()")
+	Reported-by: Jue Wang <juew@google.com>
+	Signed-off-by: Tony Luck <tony.luck@intel.com>
+	Signed-off-by: Borislav Petkov <bp@suse.de>
+	Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+	Tested-by: Jue Wang <juew@google.com>
+	Cc: <stable@vger.kernel.org>
+Link: https://lkml.kernel.org/r/20200520163546.GA7977@agluck-desk2.amr.corp.intel.com
+
+
+
+(cherry picked from commit 17fae1294ad9d711b2c3dd0edef479d40c76a5e8)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kernel/cpu/mce/core.c
+#	include/linux/sched.h
+diff --cc arch/x86/kernel/cpu/mce/core.c
+index df108ae34b27,ce9120c4f740..000000000000
+--- a/arch/x86/kernel/cpu/mce/core.c
++++ b/arch/x86/kernel/cpu/mce/core.c
+@@@ -598,13 -572,17 +606,24 @@@ static int srao_decode_notifier(struct 
+  	struct mce *mce = (struct mce *)data;
+  	unsigned long pfn;
+  
+ -	if (!mce || !mce_usable_address(mce))
+ +	if (!mce)
+  		return NOTIFY_DONE;
+  
+++<<<<<<< HEAD
+ +	if (mce_usable_address(mce) && (mce->severity == MCE_AO_SEVERITY)) {
+ +		pfn = mce->addr >> PAGE_SHIFT;
+ +		if (!memory_failure(pfn, 0))
+ +			set_mce_nospec(pfn);
+++=======
++ 	if (mce->severity != MCE_AO_SEVERITY &&
++ 	    mce->severity != MCE_DEFERRED_SEVERITY)
++ 		return NOTIFY_DONE;
++ 
++ 	pfn = mce->addr >> PAGE_SHIFT;
++ 	if (!memory_failure(pfn, 0)) {
++ 		set_mce_nospec(pfn, whole_page(mce));
++ 		mce->kflags |= MCE_HANDLED_UC;
+++>>>>>>> 17fae1294ad9 (x86/{mce,mm}: Unmap the entire page if the whole page is affected and poisoned)
+  	}
+  
+  	return NOTIFY_OK;
+@@@ -1174,6 -1170,30 +1193,33 @@@ static void __mc_scan_banks(struct mce 
+  	*m = *final;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static void kill_me_now(struct callback_head *ch)
++ {
++ 	force_sig(SIGBUS);
++ }
++ 
++ static void kill_me_maybe(struct callback_head *cb)
++ {
++ 	struct task_struct *p = container_of(cb, struct task_struct, mce_kill_me);
++ 	int flags = MF_ACTION_REQUIRED;
++ 
++ 	pr_err("Uncorrected hardware memory error in user-access at %llx", p->mce_addr);
++ 
++ 	if (!p->mce_ripv)
++ 		flags |= MF_MUST_KILL;
++ 
++ 	if (!memory_failure(p->mce_addr >> PAGE_SHIFT, flags)) {
++ 		set_mce_nospec(p->mce_addr >> PAGE_SHIFT, p->mce_whole_page);
++ 		return;
++ 	}
++ 
++ 	pr_err("Memory error not recovered");
++ 	kill_me_now(cb);
++ }
++ 
+++>>>>>>> 17fae1294ad9 (x86/{mce,mm}: Unmap the entire page if the whole page is affected and poisoned)
+  /*
+   * The actual machine check handler. This only handles real
+   * exceptions when something got corrupted coming in through int 18.
+@@@ -1314,20 -1336,31 +1360,30 @@@ void do_machine_check(struct pt_regs *r
+  
+  	/* Fault was in user mode and we need to take some action */
+  	if ((m.cs & 3) == 3) {
+ -		/* If this triggers there is no way to recover. Die hard. */
+ -		BUG_ON(!on_thread_stack() || !user_mode(regs));
+ -
+ +		ist_begin_non_atomic(regs);
+ +		local_irq_enable();
+ +
+++<<<<<<< HEAD
+ +		if (kill_it || do_memory_failure(&m))
+ +			force_sig(SIGBUS, current);
+ +		local_irq_disable();
+ +		ist_end_non_atomic();
+++=======
++ 		current->mce_addr = m.addr;
++ 		current->mce_ripv = !!(m.mcgstatus & MCG_STATUS_RIPV);
++ 		current->mce_whole_page = whole_page(&m);
++ 		current->mce_kill_me.func = kill_me_maybe;
++ 		if (kill_it)
++ 			current->mce_kill_me.func = kill_me_now;
++ 		task_work_add(current, &current->mce_kill_me, true);
+++>>>>>>> 17fae1294ad9 (x86/{mce,mm}: Unmap the entire page if the whole page is affected and poisoned)
+  	} else {
+ -		/*
+ -		 * Handle an MCE which has happened in kernel space but from
+ -		 * which the kernel can recover: ex_has_fault_handler() has
+ -		 * already verified that the rIP at which the error happened is
+ -		 * a rIP from which the kernel can recover (by jumping to
+ -		 * recovery code specified in _ASM_EXTABLE_FAULT()) and the
+ -		 * corresponding exception handler which would do that is the
+ -		 * proper one.
+ -		 */
+ -		if (m.kflags & MCE_IN_KERNEL_RECOV) {
+ -			if (!fixup_exception(regs, X86_TRAP_MC, 0, 0))
+ -				mce_panic("Failed kernel mode recovery", &m, msg);
+ -		}
+ +		if (!fixup_exception(regs, X86_TRAP_MC))
+ +			mce_panic("Failed kernel mode recovery", &m, NULL);
+  	}
+ +
+ +out_ist:
+ +	ist_exit(regs);
+  }
+  EXPORT_SYMBOL_GPL(do_machine_check);
+  
+diff --cc include/linux/sched.h
+index 885c71b9e14f,62c1de522fc5..000000000000
+--- a/include/linux/sched.h
++++ b/include/linux/sched.h
+@@@ -1240,6 -1297,19 +1240,22 @@@ struct task_struct 
+  	void				*security;
+  #endif
+  
+++<<<<<<< HEAD
+++=======
++ #ifdef CONFIG_GCC_PLUGIN_STACKLEAK
++ 	unsigned long			lowest_stack;
++ 	unsigned long			prev_lowest_stack;
++ #endif
++ 
++ #ifdef CONFIG_X86_MCE
++ 	u64				mce_addr;
++ 	__u64				mce_ripv : 1,
++ 					mce_whole_page : 1,
++ 					__mce_reserved : 62;
++ 	struct callback_head		mce_kill_me;
++ #endif
++ 
+++>>>>>>> 17fae1294ad9 (x86/{mce,mm}: Unmap the entire page if the whole page is affected and poisoned)
+  	/*
+  	 * New fields for task_struct should be added above here, so that
+  	 * they are included in the randomized portion of task_struct.
+diff --git a/arch/x86/include/asm/set_memory.h b/arch/x86/include/asm/set_memory.h
+index 36330a6f63fc..7bc673b2c4af 100644
+--- a/arch/x86/include/asm/set_memory.h
++++ b/arch/x86/include/asm/set_memory.h
+@@ -92,28 +92,35 @@ void set_kernel_text_rw(void);
+ void set_kernel_text_ro(void);
+ 
+ #ifdef CONFIG_X86_64
+-static inline int set_mce_nospec(unsigned long pfn)
++/*
++ * Prevent speculative access to the page by either unmapping
++ * it (if we do not require access to any part of the page) or
++ * marking it uncacheable (if we want to try to retrieve data
++ * from non-poisoned lines in the page).
++ */
++static inline int set_mce_nospec(unsigned long pfn, bool unmap)
+ {
+ 	unsigned long decoy_addr;
+ 	int rc;
+ 
+ 	/*
+-	 * Mark the linear address as UC to make sure we don't log more
+-	 * errors because of speculative access to the page.
+ 	 * We would like to just call:
+-	 *      set_memory_uc((unsigned long)pfn_to_kaddr(pfn), 1);
++	 *      set_memory_XX((unsigned long)pfn_to_kaddr(pfn), 1);
+ 	 * but doing that would radically increase the odds of a
+ 	 * speculative access to the poison page because we'd have
+ 	 * the virtual address of the kernel 1:1 mapping sitting
+ 	 * around in registers.
+ 	 * Instead we get tricky.  We create a non-canonical address
+ 	 * that looks just like the one we want, but has bit 63 flipped.
+-	 * This relies on set_memory_uc() properly sanitizing any __pa()
++	 * This relies on set_memory_XX() properly sanitizing any __pa()
+ 	 * results with __PHYSICAL_MASK or PTE_PFN_MASK.
+ 	 */
+ 	decoy_addr = (pfn << PAGE_SHIFT) + (PAGE_OFFSET ^ BIT(63));
+ 
+-	rc = set_memory_uc(decoy_addr, 1);
++	if (unmap)
++		rc = set_memory_np(decoy_addr, 1);
++	else
++		rc = set_memory_uc(decoy_addr, 1);
+ 	if (rc)
+ 		pr_warn("Could not invalidate pfn=0x%lx from 1:1 map\n", pfn);
+ 	return rc;
+* Unmerged path arch/x86/kernel/cpu/mce/core.c
+* Unmerged path include/linux/sched.h
+diff --git a/include/linux/set_memory.h b/include/linux/set_memory.h
+index b5071497b8cb..7df5bcc37da7 100644
+--- a/include/linux/set_memory.h
++++ b/include/linux/set_memory.h
+@@ -29,7 +29,7 @@ static inline int set_direct_map_default_noflush(struct page *page)
+ #endif
+ 
+ #ifndef set_mce_nospec
+-static inline int set_mce_nospec(unsigned long pfn)
++static inline int set_mce_nospec(unsigned long pfn, bool unmap)
+ {
+ 	return 0;
+ }
