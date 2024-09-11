@@ -147,7 +147,7 @@ void fwnode_links_purge(struct fwnode_handle *fwnode)
 	fwnode_links_purge_consumers(fwnode);
 }
 
-static void fw_devlink_purge_absent_suppliers(struct fwnode_handle *fwnode)
+void fw_devlink_purge_absent_suppliers(struct fwnode_handle *fwnode)
 {
 	struct fwnode_handle *child;
 
@@ -161,6 +161,7 @@ static void fw_devlink_purge_absent_suppliers(struct fwnode_handle *fwnode)
 	fwnode_for_each_available_child_node(fwnode, child)
 		fw_devlink_purge_absent_suppliers(child);
 }
+EXPORT_SYMBOL_GPL(fw_devlink_purge_absent_suppliers);
 
 #ifdef CONFIG_SRCU
 static DEFINE_MUTEX(device_links_lock);
