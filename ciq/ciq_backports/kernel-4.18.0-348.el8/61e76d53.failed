@@ -1,0 +1,216 @@
+perf/x86: Track pmu in per-CPU cpu_hw_events
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-348.el8
+commit-author Kan Liang <kan.liang@linux.intel.com>
+commit 61e76d53c39bb768ad264d379837cfc56b9e35b4
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-348.el8/61e76d53.failed
+
+Some platforms, e.g. Alder Lake, have hybrid architecture. In the same
+package, there may be more than one type of CPU. The PMU capabilities
+are different among different types of CPU. Perf will register a
+dedicated PMU for each type of CPU.
+
+Add a 'pmu' variable in the struct cpu_hw_events to track the dedicated
+PMU of the current CPU.
+
+Current x86_get_pmu() use the global 'pmu', which will be broken on a
+hybrid platform. Modify it to apply the 'pmu' of the specific CPU.
+
+Initialize the per-CPU 'pmu' variable with the global 'pmu'. There is
+nothing changed for the non-hybrid platforms.
+
+The is_x86_event() will be updated in the later patch ("perf/x86:
+Register hybrid PMUs") for hybrid platforms. For the non-hybrid
+platforms, nothing is changed here.
+
+	Suggested-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+	Signed-off-by: Kan Liang <kan.liang@linux.intel.com>
+	Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+Link: https://lkml.kernel.org/r/1618237865-33448-4-git-send-email-kan.liang@linux.intel.com
+(cherry picked from commit 61e76d53c39bb768ad264d379837cfc56b9e35b4)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/events/intel/lbr.c
+diff --cc arch/x86/events/intel/lbr.c
+index d05b80c1c2dd,bb4486c4155a..000000000000
+--- a/arch/x86/events/intel/lbr.c
++++ b/arch/x86/events/intel/lbr.c
+@@@ -673,6 -696,30 +673,33 @@@ void intel_pmu_lbr_add(struct perf_even
+  	perf_sched_cb_inc(event->ctx->pmu);
+  	if (!cpuc->lbr_users++ && !event->total_time_running)
+  		intel_pmu_lbr_reset();
+++<<<<<<< HEAD
+++=======
++ 
++ 	if (static_cpu_has(X86_FEATURE_ARCH_LBR) &&
++ 	    kmem_cache && !cpuc->lbr_xsave &&
++ 	    (cpuc->lbr_users != cpuc->lbr_pebs_users))
++ 		cpuc->lbr_xsave = kmem_cache_alloc(kmem_cache, GFP_KERNEL);
++ }
++ 
++ void release_lbr_buffers(void)
++ {
++ 	struct kmem_cache *kmem_cache;
++ 	struct cpu_hw_events *cpuc;
++ 	int cpu;
++ 
++ 	if (!static_cpu_has(X86_FEATURE_ARCH_LBR))
++ 		return;
++ 
++ 	for_each_possible_cpu(cpu) {
++ 		cpuc = per_cpu_ptr(&cpu_hw_events, cpu);
++ 		kmem_cache = x86_get_pmu(cpu)->task_ctx_cache;
++ 		if (kmem_cache && cpuc->lbr_xsave) {
++ 			kmem_cache_free(kmem_cache, cpuc->lbr_xsave);
++ 			cpuc->lbr_xsave = NULL;
++ 		}
++ 	}
+++>>>>>>> 61e76d53c39b (perf/x86: Track pmu in per-CPU cpu_hw_events)
+  }
+  
+  void intel_pmu_lbr_del(struct perf_event *event)
+@@@ -1639,8 -1699,35 +1666,12 @@@ void intel_pmu_lbr_init_knl(void
+  		x86_pmu.intel_cap.lbr_format = LBR_FORMAT_EIP_FLAGS;
+  }
+  
+ -/*
+ - * LBR state size is variable based on the max number of registers.
+ - * This calculates the expected state size, which should match
+ - * what the hardware enumerates for the size of XFEATURE_LBR.
+ - */
+ -static inline unsigned int get_lbr_state_size(void)
+ -{
+ -	return sizeof(struct arch_lbr_state) +
+ -	       x86_pmu.lbr_nr * sizeof(struct lbr_entry);
+ -}
+ -
+ -static bool is_arch_lbr_xsave_available(void)
+ -{
+ -	if (!boot_cpu_has(X86_FEATURE_XSAVES))
+ -		return false;
+ -
+ -	/*
+ -	 * Check the LBR state with the corresponding software structure.
+ -	 * Disable LBR XSAVES support if the size doesn't match.
+ -	 */
+ -	if (WARN_ON(xfeature_size(XFEATURE_LBR) != get_lbr_state_size()))
+ -		return false;
+ -
+ -	return true;
+ -}
+ -
+  void __init intel_pmu_arch_lbr_init(void)
+  {
+++<<<<<<< HEAD
+++=======
++ 	struct pmu *pmu = x86_get_pmu(smp_processor_id());
+++>>>>>>> 61e76d53c39b (perf/x86: Track pmu in per-CPU cpu_hw_events)
+  	union cpuid28_eax eax;
+  	union cpuid28_ebx ebx;
+  	union cpuid28_ecx ecx;
+diff --git a/arch/x86/events/core.c b/arch/x86/events/core.c
+index 6386151f5053..6bd1e3b60e58 100644
+--- a/arch/x86/events/core.c
++++ b/arch/x86/events/core.c
+@@ -44,9 +44,11 @@
+ #include "perf_event.h"
+ 
+ struct x86_pmu x86_pmu __read_mostly;
++static struct pmu pmu;
+ 
+ DEFINE_PER_CPU(struct cpu_hw_events, cpu_hw_events) = {
+ 	.enabled = 1,
++	.pmu = &pmu,
+ };
+ 
+ DEFINE_STATIC_KEY_FALSE(rdpmc_never_available_key);
+@@ -682,16 +684,23 @@ void x86_pmu_enable_all(int added)
+ 	}
+ }
+ 
+-static struct pmu pmu;
+-
+ static inline int is_x86_event(struct perf_event *event)
+ {
+ 	return event->pmu == &pmu;
+ }
+ 
+-struct pmu *x86_get_pmu(void)
++struct pmu *x86_get_pmu(unsigned int cpu)
+ {
+-	return &pmu;
++	struct cpu_hw_events *cpuc = &per_cpu(cpu_hw_events, cpu);
++
++	/*
++	 * All CPUs of the hybrid type have been offline.
++	 * The x86_get_pmu() should not be invoked.
++	 */
++	if (WARN_ON_ONCE(!cpuc->pmu))
++		return &pmu;
++
++	return cpuc->pmu;
+ }
+ /*
+  * Event scheduler state:
+diff --git a/arch/x86/events/intel/core.c b/arch/x86/events/intel/core.c
+index 16c201bd1fa1..96c438db4d1a 100644
+--- a/arch/x86/events/intel/core.c
++++ b/arch/x86/events/intel/core.c
+@@ -4887,7 +4887,7 @@ static void update_tfa_sched(void *ignored)
+ 	 * and if so force schedule out for all event types all contexts
+ 	 */
+ 	if (test_bit(3, cpuc->active_mask))
+-		perf_pmu_resched(x86_get_pmu());
++		perf_pmu_resched(x86_get_pmu(smp_processor_id()));
+ }
+ 
+ static ssize_t show_sysctl_tfa(struct device *cdev,
+diff --git a/arch/x86/events/intel/ds.c b/arch/x86/events/intel/ds.c
+index 2f797ef5f4e7..bf978719c031 100644
+--- a/arch/x86/events/intel/ds.c
++++ b/arch/x86/events/intel/ds.c
+@@ -2187,7 +2187,7 @@ void __init intel_ds_init(void)
+ 					PERF_SAMPLE_TIME;
+ 				x86_pmu.flags |= PMU_FL_PEBS_ALL;
+ 				pebs_qual = "-baseline";
+-				x86_get_pmu()->capabilities |= PERF_PMU_CAP_EXTENDED_REGS;
++				x86_get_pmu(smp_processor_id())->capabilities |= PERF_PMU_CAP_EXTENDED_REGS;
+ 			} else {
+ 				/* Only basic record supported */
+ 				x86_pmu.large_pebs_flags &=
+@@ -2202,7 +2202,7 @@ void __init intel_ds_init(void)
+ 
+ 			if (x86_pmu.intel_cap.pebs_output_pt_available) {
+ 				pr_cont("PEBS-via-PT, ");
+-				x86_get_pmu()->capabilities |= PERF_PMU_CAP_AUX_OUTPUT;
++				x86_get_pmu(smp_processor_id())->capabilities |= PERF_PMU_CAP_AUX_OUTPUT;
+ 			}
+ 
+ 			break;
+* Unmerged path arch/x86/events/intel/lbr.c
+diff --git a/arch/x86/events/perf_event.h b/arch/x86/events/perf_event.h
+index 5b83205b6893..ba58eb8dfad8 100644
+--- a/arch/x86/events/perf_event.h
++++ b/arch/x86/events/perf_event.h
+@@ -326,6 +326,8 @@ struct cpu_hw_events {
+ 	int				n_pair; /* Large increment events */
+ 
+ 	void				*kfree_on_online[X86_PERF_KFREE_MAX];
++
++	struct pmu			*pmu;
+ };
+ 
+ #define __EVENT_CONSTRAINT_RANGE(c, e, n, m, w, o, f) {	\
+@@ -887,7 +889,7 @@ static struct perf_pmu_events_ht_attr event_attr_##v = {		\
+ 	.event_str_ht	= ht,						\
+ }
+ 
+-struct pmu *x86_get_pmu(void);
++struct pmu *x86_get_pmu(unsigned int cpu);
+ extern struct x86_pmu x86_pmu __read_mostly;
+ 
+ static __always_inline struct x86_perf_task_context_opt *task_context_opt(void *ctx)
