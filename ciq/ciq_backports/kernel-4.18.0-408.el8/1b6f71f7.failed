@@ -1,0 +1,233 @@
+scsi: lpfc: Change FA-PWWN detection methodology
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-408.el8
+commit-author James Smart <jsmart2021@gmail.com>
+commit 1b6f71f7fcb685970aa1c4ecca3dd60ed37a32ea
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-408.el8/1b6f71f7.failed
+
+Do not rely on vendor version field of the CSPs to determine if we are in a
+FA-PWWN environment. Instead, use the following procedure:
+
+First, during HBA initialization, driver does a READ_CONFIG to determine if
+FA-PWWN is configured on the HBA. A LPFC_FAWWPN_CONFIG hba_flag is set
+accordingly.
+
+Next, when the link comes up before the driver gets a link up event, the
+firmware logs into the fabric with FA-PWWN. If the fabric port does not
+support FA-PWWN, the driver will get a Misconfigured FA-WWN async event
+before the link up. A LPFC_FAWWPN_FABRIC hba_flag will be set accordingly.
+
+Finally, if the fabric supports FA-PWWN, the firmware will replace its CSPs
+WWN with the Fabric Assigned ones. Then after link up, the driver will
+retrieve the Fabric Assigned WWN when it does a READ_SPARAM mbox command.
+
+Link: https://lore.kernel.org/r/20220412222008.126521-23-jsmart2021@gmail.com
+Co-developed-by: Justin Tee <justin.tee@broadcom.com>
+	Signed-off-by: Justin Tee <justin.tee@broadcom.com>
+	Signed-off-by: James Smart <jsmart2021@gmail.com>
+	Signed-off-by: Martin K. Petersen <martin.petersen@oracle.com>
+(cherry picked from commit 1b6f71f7fcb685970aa1c4ecca3dd60ed37a32ea)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/scsi/lpfc/lpfc_init.c
+diff --cc drivers/scsi/lpfc/lpfc_init.c
+index f6a626fc2edf,39267016f339..000000000000
+--- a/drivers/scsi/lpfc/lpfc_init.c
++++ b/drivers/scsi/lpfc/lpfc_init.c
+@@@ -351,17 -350,8 +351,16 @@@ lpfc_dump_wakeup_param_cmpl(struct lpfc
+  void
+  lpfc_update_vport_wwn(struct lpfc_vport *vport)
+  {
+- 	uint8_t vvvl = vport->fc_sparam.cmn.valid_vendor_ver_level;
+- 	u32 *fawwpn_key = (u32 *)&vport->fc_sparam.un.vendorVersion[0];
++ 	struct lpfc_hba *phba = vport->phba;
+  
+ +	/* If the soft name exists then update it using the service params */
+ +	if (vport->phba->cfg_soft_wwnn)
+ +		u64_to_wwn(vport->phba->cfg_soft_wwnn,
+ +			   vport->fc_sparam.nodeName.u.wwn);
+ +	if (vport->phba->cfg_soft_wwpn)
+ +		u64_to_wwn(vport->phba->cfg_soft_wwpn,
+ +			   vport->fc_sparam.portName.u.wwn);
+ +
+  	/*
+  	 * If the name is empty or there exists a soft name
+  	 * then copy the service params name, otherwise use the fc name
+@@@ -379,22 -369,32 +378,44 @@@
+  	 */
+  	if (vport->fc_portname.u.wwn[0] != 0 &&
+  		memcmp(&vport->fc_portname, &vport->fc_sparam.portName,
+- 			sizeof(struct lpfc_name)))
++ 		       sizeof(struct lpfc_name))) {
+  		vport->vport_flag |= FAWWPN_PARAM_CHG;
+  
+++<<<<<<< HEAD
+ +	if (vport->fc_portname.u.wwn[0] == 0 ||
+ +	    vport->phba->cfg_soft_wwpn ||
+ +	    (vvvl == 1 && cpu_to_be32(*fawwpn_key) == FAPWWN_KEY_VENDOR) ||
+ +	    vport->vport_flag & FAWWPN_SET) {
+ +		memcpy(&vport->fc_portname, &vport->fc_sparam.portName,
+ +			sizeof(struct lpfc_name));
+ +		vport->vport_flag &= ~FAWWPN_SET;
+ +		if (vvvl == 1 && cpu_to_be32(*fawwpn_key) == FAPWWN_KEY_VENDOR)
+ +			vport->vport_flag |= FAWWPN_SET;
+++=======
++ 		if (phba->sli_rev == LPFC_SLI_REV4 &&
++ 		    vport->port_type == LPFC_PHYSICAL_PORT &&
++ 		    phba->sli4_hba.fawwpn_flag & LPFC_FAWWPN_FABRIC) {
++ 			lpfc_printf_log(phba, KERN_INFO,
++ 					LOG_SLI | LOG_DISCOVERY | LOG_ELS,
++ 					"2701 FA-PWWN change WWPN from %llx to "
++ 					"%llx: vflag x%x fawwpn_flag x%x\n",
++ 					wwn_to_u64(vport->fc_portname.u.wwn),
++ 					wwn_to_u64
++ 					   (vport->fc_sparam.portName.u.wwn),
++ 					vport->vport_flag,
++ 					phba->sli4_hba.fawwpn_flag);
++ 			memcpy(&vport->fc_portname, &vport->fc_sparam.portName,
++ 			       sizeof(struct lpfc_name));
++ 		}
+++>>>>>>> 1b6f71f7fcb6 (scsi: lpfc: Change FA-PWWN detection methodology)
+  	}
++ 
++ 	if (vport->fc_portname.u.wwn[0] == 0)
++ 		memcpy(&vport->fc_portname, &vport->fc_sparam.portName,
++ 		       sizeof(struct lpfc_name));
+  	else
+  		memcpy(&vport->fc_sparam.portName, &vport->fc_portname,
+- 			sizeof(struct lpfc_name));
++ 		       sizeof(struct lpfc_name));
+  }
+  
+  /**
+diff --git a/drivers/scsi/lpfc/lpfc.h b/drivers/scsi/lpfc/lpfc.h
+index 215b615f6e08..806bf7af40a6 100644
+--- a/drivers/scsi/lpfc/lpfc.h
++++ b/drivers/scsi/lpfc/lpfc.h
+@@ -739,9 +739,8 @@ struct lpfc_vport {
+ 	struct list_head rcv_buffer_list;
+ 	unsigned long rcv_buffer_time_stamp;
+ 	uint32_t vport_flag;
+-#define STATIC_VPORT	1
+-#define FAWWPN_SET	2
+-#define FAWWPN_PARAM_CHG	4
++#define STATIC_VPORT		0x1
++#define FAWWPN_PARAM_CHG	0x2
+ 
+ 	uint16_t fdmi_num_disc;
+ 	uint32_t fdmi_hba_mask;
+diff --git a/drivers/scsi/lpfc/lpfc_attr.c b/drivers/scsi/lpfc/lpfc_attr.c
+index e7ff29088d98..1ae0412cc533 100644
+--- a/drivers/scsi/lpfc/lpfc_attr.c
++++ b/drivers/scsi/lpfc/lpfc_attr.c
+@@ -1120,12 +1120,22 @@ lpfc_link_state_show(struct device *dev, struct device_attribute *attr,
+ 				len += scnprintf(buf + len, PAGE_SIZE-len,
+ 						"   Private Loop\n");
+ 		} else {
+-			if (vport->fc_flag & FC_FABRIC)
+-				len += scnprintf(buf + len, PAGE_SIZE-len,
+-						"   Fabric\n");
+-			else
++			if (vport->fc_flag & FC_FABRIC) {
++				if (phba->sli_rev == LPFC_SLI_REV4 &&
++				    vport->port_type == LPFC_PHYSICAL_PORT &&
++				    phba->sli4_hba.fawwpn_flag &
++					LPFC_FAWWPN_FABRIC)
++					len += scnprintf(buf + len,
++							 PAGE_SIZE - len,
++							 "   Fabric FA-PWWN\n");
++				else
++					len += scnprintf(buf + len,
++							 PAGE_SIZE - len,
++							 "   Fabric\n");
++			} else {
+ 				len += scnprintf(buf + len, PAGE_SIZE-len,
+ 						"   Point-2-Point\n");
++			}
+ 		}
+ 	}
+ 
+diff --git a/drivers/scsi/lpfc/lpfc_hbadisc.c b/drivers/scsi/lpfc/lpfc_hbadisc.c
+index 2849bd022f8f..fdda5a75ab3a 100644
+--- a/drivers/scsi/lpfc/lpfc_hbadisc.c
++++ b/drivers/scsi/lpfc/lpfc_hbadisc.c
+@@ -1183,6 +1183,7 @@ lpfc_port_link_failure(struct lpfc_vport *vport)
+ void
+ lpfc_linkdown_port(struct lpfc_vport *vport)
+ {
++	struct lpfc_hba *phba = vport->phba;
+ 	struct Scsi_Host  *shost = lpfc_shost_from_vport(vport);
+ 
+ 	if (vport->cfg_enable_fc4_type != LPFC_ENABLE_NVME)
+@@ -1200,6 +1201,13 @@ lpfc_linkdown_port(struct lpfc_vport *vport)
+ 	vport->fc_flag &= ~FC_DISC_DELAYED;
+ 	spin_unlock_irq(shost->host_lock);
+ 	del_timer_sync(&vport->delayed_disc_tmo);
++
++	if (phba->sli_rev == LPFC_SLI_REV4 &&
++	    vport->port_type == LPFC_PHYSICAL_PORT &&
++	    phba->sli4_hba.fawwpn_flag & LPFC_FAWWPN_CONFIG) {
++		/* Assume success on link up */
++		phba->sli4_hba.fawwpn_flag |= LPFC_FAWWPN_FABRIC;
++	}
+ }
+ 
+ int
+diff --git a/drivers/scsi/lpfc/lpfc_hw.h b/drivers/scsi/lpfc/lpfc_hw.h
+index 61633a6a380d..2521f684f7c7 100644
+--- a/drivers/scsi/lpfc/lpfc_hw.h
++++ b/drivers/scsi/lpfc/lpfc_hw.h
+@@ -511,8 +511,6 @@ struct class_parms {
+ 	uint8_t word3Reserved2;	/* Fc Word 3, bit  0: 7 */
+ };
+ 
+-#define FAPWWN_KEY_VENDOR	0x42524344 /*valid vendor version fawwpn key*/
+-
+ struct serv_parm {	/* Structure is in Big Endian format */
+ 	struct csp cmn;
+ 	struct lpfc_name portName;
+diff --git a/drivers/scsi/lpfc/lpfc_hw4.h b/drivers/scsi/lpfc/lpfc_hw4.h
+index 6ec42991d2ab..e0505320fed5 100644
+--- a/drivers/scsi/lpfc/lpfc_hw4.h
++++ b/drivers/scsi/lpfc/lpfc_hw4.h
+@@ -2857,6 +2857,9 @@ struct lpfc_mbx_read_config {
+ #define lpfc_mbx_rd_conf_extnts_inuse_SHIFT	31
+ #define lpfc_mbx_rd_conf_extnts_inuse_MASK	0x00000001
+ #define lpfc_mbx_rd_conf_extnts_inuse_WORD	word1
++#define lpfc_mbx_rd_conf_fawwpn_SHIFT		30
++#define lpfc_mbx_rd_conf_fawwpn_MASK		0x00000001
++#define lpfc_mbx_rd_conf_fawwpn_WORD		word1
+ #define lpfc_mbx_rd_conf_wcs_SHIFT		28	/* warning signaling */
+ #define lpfc_mbx_rd_conf_wcs_MASK		0x00000001
+ #define lpfc_mbx_rd_conf_wcs_WORD		word1
+* Unmerged path drivers/scsi/lpfc/lpfc_init.c
+diff --git a/drivers/scsi/lpfc/lpfc_sli.c b/drivers/scsi/lpfc/lpfc_sli.c
+index 71f9743c49b7..dad97297f4aa 100644
+--- a/drivers/scsi/lpfc/lpfc_sli.c
++++ b/drivers/scsi/lpfc/lpfc_sli.c
+@@ -5199,6 +5199,7 @@ lpfc_sli_brdrestart_s4(struct lpfc_hba *phba)
+ 	phba->pport->stopped = 0;
+ 	phba->link_state = LPFC_INIT_START;
+ 	phba->hba_flag = 0;
++	phba->sli4_hba.fawwpn_flag = 0;
+ 	spin_unlock_irq(&phba->hbalock);
+ 
+ 	memset(&psli->lnk_stat_offsets, 0, sizeof(psli->lnk_stat_offsets));
+diff --git a/drivers/scsi/lpfc/lpfc_sli4.h b/drivers/scsi/lpfc/lpfc_sli4.h
+index 028d42e37b49..8c13b3f805c7 100644
+--- a/drivers/scsi/lpfc/lpfc_sli4.h
++++ b/drivers/scsi/lpfc/lpfc_sli4.h
+@@ -981,6 +981,9 @@ struct lpfc_sli4_hba {
+ #define lpfc_conf_trunk_port3_nd_MASK	0x1
+ 	uint8_t flash_id;
+ 	uint8_t asic_rev;
++	uint16_t fawwpn_flag;	/* FA-WWPN support state */
++#define LPFC_FAWWPN_CONFIG	0x1 /* FA-PWWN is configured */
++#define LPFC_FAWWPN_FABRIC	0x2 /* FA-PWWN success with Fabric */
+ };
+ 
+ enum lpfc_sge_type {
