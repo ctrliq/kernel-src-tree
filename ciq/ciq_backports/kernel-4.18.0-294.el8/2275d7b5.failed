@@ -1,0 +1,400 @@
+powerpc/64s/radix: introduce options to disable use of the tlbie instruction
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Nicholas Piggin <npiggin@gmail.com>
+commit 2275d7b5754a573ffb2ca9e40bd0546eeb986696
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/2275d7b5.failed
+
+Introduce two options to control the use of the tlbie instruction. A
+boot time option which completely disables the kernel using the
+instruction, this is currently incompatible with HASH MMU, KVM, and
+coherent accelerators.
+
+And a debugfs option can be switched at runtime and avoids using tlbie
+for invalidating CPU TLBs for normal process and kernel address
+mappings. Coherent accelerators are still managed with tlbie, as will
+KVM partition scope translations.
+
+Cross-CPU TLB flushing is implemented with IPIs and tlbiel. This is a
+basic implementation which does not attempt to make any optimisation
+beyond the tlbie implementation.
+
+This is useful for performance testing among other things. For example
+in certain situations on large systems, using IPIs may be faster than
+tlbie as they can be directed rather than broadcast. Later we may also
+take advantage of the IPIs to do more interesting things such as trim
+the mm cpumask more aggressively.
+
+	Signed-off-by: Nicholas Piggin <npiggin@gmail.com>
+	Signed-off-by: Michael Ellerman <mpe@ellerman.id.au>
+Link: https://lore.kernel.org/r/20190902152931.17840-7-npiggin@gmail.com
+(cherry picked from commit 2275d7b5754a573ffb2ca9e40bd0546eeb986696)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/powerpc/mm/book3s64/radix_tlb.c
+diff --cc arch/powerpc/mm/book3s64/radix_tlb.c
+index 35a168bbe137,631be42abd33..000000000000
+--- a/arch/powerpc/mm/book3s64/radix_tlb.c
++++ b/arch/powerpc/mm/book3s64/radix_tlb.c
+@@@ -355,32 -269,38 +355,66 @@@ static inline void _tlbie_pid(unsigned 
+  	asm volatile("eieio; tlbsync; ptesync": : :"memory");
+  }
+  
+++<<<<<<< HEAD
+ +static inline void _tlbiel_lpid(unsigned long lpid, unsigned long ric)
+ +{
+ +	int set;
+ +
+ +	VM_BUG_ON(mfspr(SPRN_LPID) != lpid);
+ +
+ +	asm volatile("ptesync": : :"memory");
+ +
+ +	/*
+ +	 * Flush the first set of the TLB, and if we're doing a RIC_FLUSH_ALL,
+ +	 * also flush the entire Page Walk Cache.
+ +	 */
+ +	__tlbiel_lpid(lpid, 0, ric);
+ +
+ +	/* For PWC, only one flush is needed */
+ +	if (ric == RIC_FLUSH_PWC) {
+ +		asm volatile("ptesync": : :"memory");
+ +		return;
+ +	}
+ +
+ +	/* For the remaining sets, just flush the TLB */
+ +	for (set = 1; set < POWER9_TLB_SETS_RADIX ; set++)
+ +		__tlbiel_lpid(lpid, set, RIC_FLUSH_TLB);
+ +
+ +	asm volatile("ptesync": : :"memory");
+ +	asm volatile(PPC_INVALIDATE_ERAT "; isync" : : :"memory");
+++=======
++ struct tlbiel_pid {
++ 	unsigned long pid;
++ 	unsigned long ric;
++ };
++ 
++ static void do_tlbiel_pid(void *info)
++ {
++ 	struct tlbiel_pid *t = info;
++ 
++ 	if (t->ric == RIC_FLUSH_TLB)
++ 		_tlbiel_pid(t->pid, RIC_FLUSH_TLB);
++ 	else if (t->ric == RIC_FLUSH_PWC)
++ 		_tlbiel_pid(t->pid, RIC_FLUSH_PWC);
++ 	else
++ 		_tlbiel_pid(t->pid, RIC_FLUSH_ALL);
++ }
++ 
++ static inline void _tlbiel_pid_multicast(struct mm_struct *mm,
++ 				unsigned long pid, unsigned long ric)
++ {
++ 	struct cpumask *cpus = mm_cpumask(mm);
++ 	struct tlbiel_pid t = { .pid = pid, .ric = ric };
++ 
++ 	on_each_cpu_mask(cpus, do_tlbiel_pid, &t, 1);
++ 	/*
++ 	 * Always want the CPU translations to be invalidated with tlbiel in
++ 	 * these paths, so while coprocessors must use tlbie, we can not
++ 	 * optimise away the tlbiel component.
++ 	 */
++ 	if (atomic_read(&mm->context.copros) > 0)
++ 		_tlbie_pid(pid, RIC_FLUSH_ALL);
+++>>>>>>> 2275d7b5754a (powerpc/64s/radix: introduce options to disable use of the tlbie instruction)
+  }
+  
+  static inline void _tlbie_lpid(unsigned long lpid, unsigned long ric)
+@@@ -492,7 -403,54 +526,58 @@@ static inline void _tlbie_va(unsigned l
+  	asm volatile("eieio; tlbsync; ptesync": : :"memory");
+  }
+  
+++<<<<<<< HEAD
+ +static inline void _tlbie_lpid_va(unsigned long va, unsigned long lpid,
+++=======
++ struct tlbiel_va {
++ 	unsigned long pid;
++ 	unsigned long va;
++ 	unsigned long psize;
++ 	unsigned long ric;
++ };
++ 
++ static void do_tlbiel_va(void *info)
++ {
++ 	struct tlbiel_va *t = info;
++ 
++ 	if (t->ric == RIC_FLUSH_TLB)
++ 		_tlbiel_va(t->va, t->pid, t->psize, RIC_FLUSH_TLB);
++ 	else if (t->ric == RIC_FLUSH_PWC)
++ 		_tlbiel_va(t->va, t->pid, t->psize, RIC_FLUSH_PWC);
++ 	else
++ 		_tlbiel_va(t->va, t->pid, t->psize, RIC_FLUSH_ALL);
++ }
++ 
++ static inline void _tlbiel_va_multicast(struct mm_struct *mm,
++ 				unsigned long va, unsigned long pid,
++ 				unsigned long psize, unsigned long ric)
++ {
++ 	struct cpumask *cpus = mm_cpumask(mm);
++ 	struct tlbiel_va t = { .va = va, .pid = pid, .psize = psize, .ric = ric };
++ 	on_each_cpu_mask(cpus, do_tlbiel_va, &t, 1);
++ 	if (atomic_read(&mm->context.copros) > 0)
++ 		_tlbie_va(va, pid, psize, RIC_FLUSH_TLB);
++ }
++ 
++ struct tlbiel_va_range {
++ 	unsigned long pid;
++ 	unsigned long start;
++ 	unsigned long end;
++ 	unsigned long page_size;
++ 	unsigned long psize;
++ 	bool also_pwc;
++ };
++ 
++ static void do_tlbiel_va_range(void *info)
++ {
++ 	struct tlbiel_va_range *t = info;
++ 
++ 	_tlbiel_va_range(t->start, t->end, t->pid, t->page_size,
++ 				    t->psize, t->also_pwc);
++ }
++ 
++ static __always_inline void _tlbie_lpid_va(unsigned long va, unsigned long lpid,
+++>>>>>>> 2275d7b5754a (powerpc/64s/radix: introduce options to disable use of the tlbie instruction)
+  			      unsigned long psize, unsigned long ric)
+  {
+  	unsigned long ap = mmu_get_ap(psize);
+@@@ -737,9 -721,35 +847,38 @@@ EXPORT_SYMBOL(radix__flush_tlb_page)
+  #define radix__flush_all_mm radix__local_flush_all_mm
+  #endif /* CONFIG_SMP */
+  
+++<<<<<<< HEAD
+++=======
++ static void do_tlbiel_kernel(void *info)
++ {
++ 	_tlbiel_pid(0, RIC_FLUSH_ALL);
++ }
++ 
++ static inline void _tlbiel_kernel_broadcast(void)
++ {
++ 	on_each_cpu(do_tlbiel_kernel, NULL, 1);
++ 	if (tlbie_capable) {
++ 		/*
++ 		 * Coherent accelerators don't refcount kernel memory mappings,
++ 		 * so have to always issue a tlbie for them. This is quite a
++ 		 * slow path anyway.
++ 		 */
++ 		_tlbie_pid(0, RIC_FLUSH_ALL);
++ 	}
++ }
++ 
++ /*
++  * If kernel TLBIs ever become local rather than global, then
++  * drivers/misc/ocxl/link.c:ocxl_link_add_pe will need some work, as it
++  * assumes kernel TLBIs are global.
++  */
+++>>>>>>> 2275d7b5754a (powerpc/64s/radix: introduce options to disable use of the tlbie instruction)
+  void radix__flush_tlb_kernel_range(unsigned long start, unsigned long end)
+  {
+- 	_tlbie_pid(0, RIC_FLUSH_ALL);
++ 	if (cputlb_use_tlbie())
++ 		_tlbie_pid(0, RIC_FLUSH_ALL);
++ 	else
++ 		_tlbiel_kernel_broadcast();
+  }
+  EXPORT_SYMBOL(radix__flush_tlb_kernel_range);
+  
+@@@ -841,8 -856,17 +985,17 @@@ is_local
+  			if (gflush)
+  				__tlbie_va_range(gstart, gend, pid,
+  						PUD_SIZE, MMU_PAGE_1G);
+ -			fixup_tlbie();
+ +
+  			asm volatile("eieio; tlbsync; ptesync": : :"memory");
++ 		} else {
++ 			_tlbiel_va_range_multicast(mm,
++ 					start, end, pid, page_size, mmu_virtual_psize, false);
++ 			if (hflush)
++ 				_tlbiel_va_range_multicast(mm,
++ 					hstart, hend, pid, PMD_SIZE, MMU_PAGE_2M, false);
++ 			if (gflush)
++ 				_tlbiel_va_range_multicast(mm,
++ 					gstart, gend, pid, PUD_SIZE, MMU_PAGE_1G, false);
+  		}
+  	}
+  	preempt_enable();
+@@@ -1083,8 -1104,11 +1246,16 @@@ void radix__flush_tlb_collapsed_pmd(str
+  			exit_flush_lazy_tlbs(mm);
+  			goto local;
+  		}
+++<<<<<<< HEAD
+ +		_tlbie_va_range(addr, end, pid, PAGE_SIZE, mmu_virtual_psize, true);
+ +		goto local;
+++=======
++ 		if (cputlb_use_tlbie())
++ 			_tlbie_va_range(addr, end, pid, PAGE_SIZE, mmu_virtual_psize, true);
++ 		else
++ 			_tlbiel_va_range_multicast(mm,
++ 					addr, end, pid, PAGE_SIZE, mmu_virtual_psize, true);
+++>>>>>>> 2275d7b5754a (powerpc/64s/radix: introduce options to disable use of the tlbie instruction)
+  	} else {
+  local:
+  		_tlbiel_va_range(addr, end, pid, PAGE_SIZE, mmu_virtual_psize, true);
+diff --git a/Documentation/admin-guide/kernel-parameters.txt b/Documentation/admin-guide/kernel-parameters.txt
+index 364acc6154e5..19de1d8624cb 100644
+--- a/Documentation/admin-guide/kernel-parameters.txt
++++ b/Documentation/admin-guide/kernel-parameters.txt
+@@ -876,6 +876,10 @@
+ 	disable_radix	[PPC]
+ 			Disable RADIX MMU mode on POWER9
+ 
++	disable_tlbie	[PPC]
++			Disable TLBIE instruction. Currently does not work
++			with KVM, with HASH MMU, or with coherent accelerators.
++
+ 	disable_cpu_apicid= [X86,APIC,SMP]
+ 			Format: <int>
+ 			The number of initial APIC ID for the
+diff --git a/arch/powerpc/include/asm/book3s/64/tlbflush.h b/arch/powerpc/include/asm/book3s/64/tlbflush.h
+index ebf572ea621e..7aa8195b6cff 100644
+--- a/arch/powerpc/include/asm/book3s/64/tlbflush.h
++++ b/arch/powerpc/include/asm/book3s/64/tlbflush.h
+@@ -162,4 +162,13 @@ static inline void flush_tlb_pgtable(struct mmu_gather *tlb, unsigned long addre
+ 
+ 	radix__flush_tlb_pwc(tlb, address);
+ }
++
++extern bool tlbie_capable;
++extern bool tlbie_enabled;
++
++static inline bool cputlb_use_tlbie(void)
++{
++	return tlbie_enabled;
++}
++
+ #endif /*  _ASM_POWERPC_BOOK3S_64_TLBFLUSH_H */
+diff --git a/arch/powerpc/kvm/book3s_hv.c b/arch/powerpc/kvm/book3s_hv.c
+index a8da36f4714d..de85eba2eec1 100644
+--- a/arch/powerpc/kvm/book3s_hv.c
++++ b/arch/powerpc/kvm/book3s_hv.c
+@@ -5605,6 +5605,12 @@ static int kvmppc_radix_possible(void)
+ static int kvmppc_book3s_init_hv(void)
+ {
+ 	int r;
++
++	if (!tlbie_capable) {
++		pr_err("KVM-HV: Host does not support TLBIE\n");
++		return -ENODEV;
++	}
++
+ 	/*
+ 	 * FIXME!! Do we need to check on all cpus ?
+ 	 */
+diff --git a/arch/powerpc/mm/book3s64/pgtable.c b/arch/powerpc/mm/book3s64/pgtable.c
+index e3da07e289f2..27149328e10d 100644
+--- a/arch/powerpc/mm/book3s64/pgtable.c
++++ b/arch/powerpc/mm/book3s64/pgtable.c
+@@ -12,6 +12,7 @@
+ #include <linux/memblock.h>
+ #include <misc/cxl-base.h>
+ 
++#include <asm/debugfs.h>
+ #include <asm/pgalloc.h>
+ #include <asm/tlb.h>
+ #include <asm/trace.h>
+@@ -514,3 +515,49 @@ int pmd_move_must_withdraw(struct spinlock *new_pmd_ptl,
+ 
+ 	return true;
+ }
++
++/*
++ * Does the CPU support tlbie?
++ */
++bool tlbie_capable __read_mostly = true;
++EXPORT_SYMBOL(tlbie_capable);
++
++/*
++ * Should tlbie be used for management of CPU TLBs, for kernel and process
++ * address spaces? tlbie may still be used for nMMU accelerators, and for KVM
++ * guest address spaces.
++ */
++bool tlbie_enabled __read_mostly = true;
++
++static int __init setup_disable_tlbie(char *str)
++{
++	if (!radix_enabled()) {
++		pr_err("disable_tlbie: Unable to disable TLBIE with Hash MMU.\n");
++		return 1;
++	}
++
++	tlbie_capable = false;
++	tlbie_enabled = false;
++
++        return 1;
++}
++__setup("disable_tlbie", setup_disable_tlbie);
++
++static int __init pgtable_debugfs_setup(void)
++{
++	if (!tlbie_capable)
++		return 0;
++
++	/*
++	 * There is no locking vs tlb flushing when changing this value.
++	 * The tlb flushers will see one value or another, and use either
++	 * tlbie or tlbiel with IPIs. In both cases the TLBs will be
++	 * invalidated as expected.
++	 */
++	debugfs_create_bool("tlbie_enabled", 0600,
++			powerpc_debugfs_root,
++			&tlbie_enabled);
++
++	return 0;
++}
++arch_initcall(pgtable_debugfs_setup);
+* Unmerged path arch/powerpc/mm/book3s64/radix_tlb.c
+diff --git a/drivers/misc/cxl/main.c b/drivers/misc/cxl/main.c
+index c1ba0d42cbc8..6f8e01f57950 100644
+--- a/drivers/misc/cxl/main.c
++++ b/drivers/misc/cxl/main.c
+@@ -22,6 +22,7 @@
+ #include <linux/sched/task.h>
+ 
+ #include <asm/cputable.h>
++#include <asm/mmu.h>
+ #include <misc/cxl-base.h>
+ 
+ #include "cxl.h"
+@@ -324,6 +325,9 @@ static int __init init_cxl(void)
+ {
+ 	int rc = 0;
+ 
++	if (!tlbie_capable)
++		return -EINVAL;
++
+ 	if ((rc = cxl_file_init()))
+ 		return rc;
+ 
+diff --git a/drivers/misc/ocxl/main.c b/drivers/misc/ocxl/main.c
+index 7210d9e059be..ef73cf35dda2 100644
+--- a/drivers/misc/ocxl/main.c
++++ b/drivers/misc/ocxl/main.c
+@@ -2,12 +2,16 @@
+ // Copyright 2017 IBM Corp.
+ #include <linux/module.h>
+ #include <linux/pci.h>
++#include <asm/mmu.h>
+ #include "ocxl_internal.h"
+ 
+ static int __init init_ocxl(void)
+ {
+ 	int rc = 0;
+ 
++	if (!tlbie_capable)
++		return -EINVAL;
++
+ 	rc = ocxl_file_init();
+ 	if (rc)
+ 		return rc;
