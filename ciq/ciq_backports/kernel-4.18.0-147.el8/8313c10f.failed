@@ -1,0 +1,2858 @@
+RDMA/uverbs: Replace ib_uverbs_file with uverbs_attr_bundle for write
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-147.el8
+commit-author Jason Gunthorpe <jgg@ziepe.ca>
+commit 8313c10fa8be032fccc1e757bccc21207f533127
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-147.el8/8313c10f.failed
+
+Now that we can add meta-data to the description of write() methods we
+need to pass the uverbs_attr_bundle into all write based handlers so
+future patches can use it as a container for any new data transferred out
+of the core.
+
+This is the first step to bringing the write() and ioctl() methods to a
+common interface signature.
+
+This is a simple search/replace, and we push the attr down into the uobj
+and other APIs to keep changes minimal.
+
+	Signed-off-by: Jason Gunthorpe <jgg@mellanox.com>
+	Signed-off-by: Leon Romanovsky <leonro@mellanox.com>
+(cherry picked from commit 8313c10fa8be032fccc1e757bccc21207f533127)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/infiniband/core/rdma_core.c
+#	drivers/infiniband/core/rdma_core.h
+#	drivers/infiniband/core/uverbs_cmd.c
+#	drivers/infiniband/core/uverbs_main.c
+#	drivers/infiniband/core/uverbs_uapi.c
+#	drivers/infiniband/hw/mlx5/devx.c
+#	include/rdma/ib_verbs.h
+#	include/rdma/uverbs_ioctl.h
+#	include/rdma/uverbs_std_types.h
+diff --cc drivers/infiniband/core/rdma_core.c
+index 7abca5514e4d,cf671a643d4c..000000000000
+--- a/drivers/infiniband/core/rdma_core.c
++++ b/drivers/infiniband/core/rdma_core.c
+@@@ -129,17 -108,154 +129,152 @@@ static int uverbs_try_lock_object(struc
+  }
+  
+  /*
+ - * This must be called with the hw_destroy_rwsem locked for read or write,
+ - * also the uobject itself must be locked for write.
+ - *
+ - * Upon return the HW object is guaranteed to be destroyed.
+ - *
+ - * For RDMA_REMOVE_ABORT, the hw_destroy_rwsem is not required to be held,
+ - * however the type's allocat_commit function cannot have been called and the
+ - * uobject cannot be on the uobjects_lists
+ - *
+ - * For RDMA_REMOVE_DESTROY the caller shold be holding a kref (eg via
+ - * rdma_lookup_get_uobject) and the object is left in a state where the caller
+ - * needs to call rdma_lookup_put_uobject.
+ - *
+ - * For all other destroy modes this function internally unlocks the uobject
+ - * and consumes the kref on the uobj.
+ + * Does both rdma_lookup_get_uobject() and rdma_remove_commit_uobject(), then
+ + * returns success_res on success (negative errno on failure). For use by
+ + * callers that do not need the uobj.
+   */
+++<<<<<<< HEAD
+ +int __uobj_perform_destroy(const struct uverbs_obj_type *type, int id,
+ +			   struct ib_uverbs_file *ufile, int success_res)
+++=======
++ static int uverbs_destroy_uobject(struct ib_uobject *uobj,
++ 				  enum rdma_remove_reason reason)
++ {
++ 	struct ib_uverbs_file *ufile = uobj->ufile;
++ 	unsigned long flags;
++ 	int ret;
++ 
++ 	lockdep_assert_held(&ufile->hw_destroy_rwsem);
++ 	assert_uverbs_usecnt(uobj, UVERBS_LOOKUP_WRITE);
++ 
++ 	if (uobj->object) {
++ 		ret = uobj->uapi_object->type_class->destroy_hw(uobj, reason);
++ 		if (ret) {
++ 			if (ib_is_destroy_retryable(ret, reason, uobj))
++ 				return ret;
++ 
++ 			/* Nothing to be done, dangle the memory and move on */
++ 			WARN(true,
++ 			     "ib_uverbs: failed to remove uobject id %d, driver err=%d",
++ 			     uobj->id, ret);
++ 		}
++ 
++ 		uobj->object = NULL;
++ 	}
++ 
++ 	if (reason == RDMA_REMOVE_ABORT) {
++ 		WARN_ON(!list_empty(&uobj->list));
++ 		WARN_ON(!uobj->context);
++ 		uobj->uapi_object->type_class->alloc_abort(uobj);
++ 	}
++ 
++ 	uobj->context = NULL;
++ 
++ 	/*
++ 	 * For DESTROY the usecnt is held write locked, the caller is expected
++ 	 * to put it unlock and put the object when done with it. Only DESTROY
++ 	 * can remove the IDR handle.
++ 	 */
++ 	if (reason != RDMA_REMOVE_DESTROY)
++ 		atomic_set(&uobj->usecnt, 0);
++ 	else
++ 		uobj->uapi_object->type_class->remove_handle(uobj);
++ 
++ 	if (!list_empty(&uobj->list)) {
++ 		spin_lock_irqsave(&ufile->uobjects_lock, flags);
++ 		list_del_init(&uobj->list);
++ 		spin_unlock_irqrestore(&ufile->uobjects_lock, flags);
++ 
++ 		/*
++ 		 * Pairs with the get in rdma_alloc_commit_uobject(), could
++ 		 * destroy uobj.
++ 		 */
++ 		uverbs_uobject_put(uobj);
++ 	}
++ 
++ 	/*
++ 	 * When aborting the stack kref remains owned by the core code, and is
++ 	 * not transferred into the type. Pairs with the get in alloc_uobj
++ 	 */
++ 	if (reason == RDMA_REMOVE_ABORT)
++ 		uverbs_uobject_put(uobj);
++ 
++ 	return 0;
++ }
++ 
++ /*
++  * This calls uverbs_destroy_uobject() using the RDMA_REMOVE_DESTROY
++  * sequence. It should only be used from command callbacks. On success the
++  * caller must pair this with rdma_lookup_put_uobject(LOOKUP_WRITE). This
++  * version requires the caller to have already obtained an
++  * LOOKUP_DESTROY uobject kref.
++  */
++ int uobj_destroy(struct ib_uobject *uobj)
++ {
++ 	struct ib_uverbs_file *ufile = uobj->ufile;
++ 	int ret;
++ 
++ 	down_read(&ufile->hw_destroy_rwsem);
++ 
++ 	ret = uverbs_try_lock_object(uobj, UVERBS_LOOKUP_WRITE);
++ 	if (ret)
++ 		goto out_unlock;
++ 
++ 	ret = uverbs_destroy_uobject(uobj, RDMA_REMOVE_DESTROY);
++ 	if (ret) {
++ 		atomic_set(&uobj->usecnt, 0);
++ 		goto out_unlock;
++ 	}
++ 
++ out_unlock:
++ 	up_read(&ufile->hw_destroy_rwsem);
++ 	return ret;
++ }
++ 
++ /*
++  * uobj_get_destroy destroys the HW object and returns a handle to the uobj
++  * with a NULL object pointer. The caller must pair this with
++  * uverbs_put_destroy.
++  */
++ struct ib_uobject *__uobj_get_destroy(const struct uverbs_api_object *obj,
++ 				      u32 id,
++ 				      const struct uverbs_attr_bundle *attrs)
+  {
+  	struct ib_uobject *uobj;
+  	int ret;
+  
++ 	uobj = rdma_lookup_get_uobject(obj, attrs->ufile, id,
++ 				       UVERBS_LOOKUP_DESTROY);
++ 	if (IS_ERR(uobj))
++ 		return uobj;
++ 
++ 	ret = uobj_destroy(uobj);
++ 	if (ret) {
++ 		rdma_lookup_put_uobject(uobj, UVERBS_LOOKUP_DESTROY);
++ 		return ERR_PTR(ret);
++ 	}
++ 
++ 	return uobj;
++ }
++ 
++ /*
++  * Does both uobj_get_destroy() and uobj_put_destroy().  Returns success_res
++  * on success (negative errno on failure). For use by callers that do not need
++  * the uobj.
++  */
++ int __uobj_perform_destroy(const struct uverbs_api_object *obj, u32 id,
++ 			   const struct uverbs_attr_bundle *attrs,
++ 			   int success_res)
+++>>>>>>> 8313c10fa8be (RDMA/uverbs: Replace ib_uverbs_file with uverbs_attr_bundle for write)
++ {
++ 	struct ib_uobject *uobj;
+++	int ret;
++ 
+++<<<<<<< HEAD
+ +	uobj = rdma_lookup_get_uobject(type, ufile->ucontext, id, true);
+++=======
++ 	uobj = __uobj_get_destroy(obj, id, attrs);
+++>>>>>>> 8313c10fa8be (RDMA/uverbs: Replace ib_uverbs_file with uverbs_attr_bundle for write)
+  	if (IS_ERR(uobj))
+  		return PTR_ERR(uobj);
+  
+@@@ -150,11 -263,18 +285,19 @@@
+  	return success_res;
+  }
+  
+ -/* alloc_uobj must be undone by uverbs_destroy_uobject() */
+ -static struct ib_uobject *alloc_uobj(struct ib_uverbs_file *ufile,
+ -				     const struct uverbs_api_object *obj)
+ +static struct ib_uobject *alloc_uobj(struct ib_ucontext *context,
+ +				     const struct uverbs_obj_type *type)
+  {
+ -	struct ib_uobject *uobj;
+ -	struct ib_ucontext *ucontext;
+ +	struct ib_uobject *uobj = kzalloc(type->obj_size, GFP_KERNEL);
+  
+++<<<<<<< HEAD
+++=======
++ 	ucontext = ib_uverbs_get_ucontext_file(ufile);
++ 	if (IS_ERR(ucontext))
++ 		return ERR_CAST(ucontext);
++ 
++ 	uobj = kzalloc(obj->type_attrs->obj_size, GFP_KERNEL);
+++>>>>>>> 8313c10fa8be (RDMA/uverbs: Replace ib_uverbs_file with uverbs_attr_bundle for write)
+  	if (!uobj)
+  		return ERR_PTR(-ENOMEM);
+  	/*
+diff --cc drivers/infiniband/core/rdma_core.h
+index a243cc2a59f7,edd299174d95..000000000000
+--- a/drivers/infiniband/core/rdma_core.h
++++ b/drivers/infiniband/core/rdma_core.h
+@@@ -113,4 -106,102 +113,105 @@@ int uverbs_finalize_object(struct ib_uo
+  			   enum uverbs_obj_access access,
+  			   bool commit);
+  
+++<<<<<<< HEAD
+++=======
++ void setup_ufile_idr_uobject(struct ib_uverbs_file *ufile);
++ void release_ufile_idr_uobject(struct ib_uverbs_file *ufile);
++ 
++ /*
++  * This is the runtime description of the uverbs API, used by the syscall
++  * machinery to validate and dispatch calls.
++  */
++ 
++ /*
++  * Depending on ID the slot pointer in the radix tree points at one of these
++  * structs.
++  */
++ struct uverbs_api_object {
++ 	const struct uverbs_obj_type *type_attrs;
++ 	const struct uverbs_obj_type_class *type_class;
++ 	u8 disabled:1;
++ };
++ 
++ struct uverbs_api_ioctl_method {
++ 	int (__rcu *handler)(struct ib_uverbs_file *ufile,
++ 			     struct uverbs_attr_bundle *ctx);
++ 	DECLARE_BITMAP(attr_mandatory, UVERBS_API_ATTR_BKEY_LEN);
++ 	u16 bundle_size;
++ 	u8 use_stack:1;
++ 	u8 driver_method:1;
++ 	u8 disabled:1;
++ 	u8 key_bitmap_len;
++ 	u8 destroy_bkey;
++ };
++ 
++ struct uverbs_api_write_method {
++ 	ssize_t (*handler)(struct uverbs_attr_bundle *attrs,
++ 			   const char __user *buf, int in_len, int out_len);
++ 	int (*handler_ex)(struct uverbs_attr_bundle *attrs,
++ 			  struct ib_udata *ucore, struct ib_udata *uhw);
++ 	u8 disabled:1;
++ 	u8 is_ex:1;
++ };
++ 
++ struct uverbs_api_attr {
++ 	struct uverbs_attr_spec spec;
++ };
++ 
++ struct uverbs_api {
++ 	/* radix tree contains struct uverbs_api_* pointers */
++ 	struct radix_tree_root radix;
++ 	enum rdma_driver_id driver_id;
++ 
++ 	unsigned int num_write;
++ 	unsigned int num_write_ex;
++ 	struct uverbs_api_write_method notsupp_method;
++ 	const struct uverbs_api_write_method **write_methods;
++ 	const struct uverbs_api_write_method **write_ex_methods;
++ };
++ 
++ static inline const struct uverbs_api_object *
++ uapi_get_object(struct uverbs_api *uapi, u16 object_id)
++ {
++ 	return radix_tree_lookup(&uapi->radix, uapi_key_obj(object_id));
++ }
++ 
++ char *uapi_key_format(char *S, unsigned int key);
++ struct uverbs_api *uverbs_alloc_api(struct ib_device *ibdev);
++ void uverbs_disassociate_api_pre(struct ib_uverbs_device *uverbs_dev);
++ void uverbs_disassociate_api(struct uverbs_api *uapi);
++ void uverbs_destroy_api(struct uverbs_api *uapi);
++ void uapi_compute_bundle_size(struct uverbs_api_ioctl_method *method_elm,
++ 			      unsigned int num_attrs);
++ void uverbs_user_mmap_disassociate(struct ib_uverbs_file *ufile);
++ 
++ extern const struct uapi_definition uverbs_def_obj_counters[];
++ extern const struct uapi_definition uverbs_def_obj_cq[];
++ extern const struct uapi_definition uverbs_def_obj_dm[];
++ extern const struct uapi_definition uverbs_def_obj_flow_action[];
++ extern const struct uapi_definition uverbs_def_obj_intf[];
++ extern const struct uapi_definition uverbs_def_obj_mr[];
++ extern const struct uapi_definition uverbs_def_write_intf[];
++ 
++ static inline const struct uverbs_api_write_method *
++ uapi_get_method(const struct uverbs_api *uapi, u32 command)
++ {
++ 	u32 cmd_idx = command & IB_USER_VERBS_CMD_COMMAND_MASK;
++ 
++ 	if (command & ~(u32)(IB_USER_VERBS_CMD_FLAG_EXTENDED |
++ 			     IB_USER_VERBS_CMD_COMMAND_MASK))
++ 		return ERR_PTR(-EINVAL);
++ 
++ 	if (command & IB_USER_VERBS_CMD_FLAG_EXTENDED) {
++ 		if (cmd_idx >= uapi->num_write_ex)
++ 			return ERR_PTR(-EOPNOTSUPP);
++ 		return uapi->write_ex_methods[cmd_idx];
++ 	}
++ 
++ 	if (cmd_idx >= uapi->num_write)
++ 		return ERR_PTR(-EOPNOTSUPP);
++ 	return uapi->write_methods[cmd_idx];
++ }
++ 
+++>>>>>>> 8313c10fa8be (RDMA/uverbs: Replace ib_uverbs_file with uverbs_attr_bundle for write)
+  #endif /* RDMA_CORE_H */
+diff --cc drivers/infiniband/core/uverbs_cmd.c
+index 300532a4cde8,a49926a63ce0..000000000000
+--- a/drivers/infiniband/core/uverbs_cmd.c
++++ b/drivers/infiniband/core/uverbs_cmd.c
+@@@ -48,11 -48,10 +48,18 @@@
+  #include "core_priv.h"
+  
+  static struct ib_uverbs_completion_event_file *
+++<<<<<<< HEAD
+ +ib_uverbs_lookup_comp_file(int fd, struct ib_ucontext *context)
+ +{
+ +	struct ib_uobject *uobj = uobj_get_read(UVERBS_OBJECT_COMP_CHANNEL,
+ +						fd, context);
+ +	struct ib_uobject_file *uobj_file;
+++=======
++ _ib_uverbs_lookup_comp_file(s32 fd, const struct uverbs_attr_bundle *attrs)
++ {
++ 	struct ib_uobject *uobj = ufd_get_read(UVERBS_OBJECT_COMP_CHANNEL,
++ 					       fd, attrs);
+++>>>>>>> 8313c10fa8be (RDMA/uverbs: Replace ib_uverbs_file with uverbs_attr_bundle for write)
+  
+  	if (IS_ERR(uobj))
+  		return (void *)uobj;
+@@@ -60,16 -59,17 +67,23 @@@
+  	uverbs_uobject_get(uobj);
+  	uobj_put_read(uobj);
+  
+ -	return container_of(uobj, struct ib_uverbs_completion_event_file,
+ -			    uobj);
+ +	uobj_file = container_of(uobj, struct ib_uobject_file, uobj);
+ +	return container_of(uobj_file, struct ib_uverbs_completion_event_file,
+ +			    uobj_file);
+  }
+ -#define ib_uverbs_lookup_comp_file(_fd, _ufile)                                \
+ -	_ib_uverbs_lookup_comp_file((_fd)*typecheck(s32, _fd), _ufile)
+  
+++<<<<<<< HEAD
+ +ssize_t ib_uverbs_get_context(struct ib_uverbs_file *file,
+ +			      struct ib_device *ib_dev,
+ +			      const char __user *buf,
+ +			      int in_len, int out_len)
+++=======
++ static ssize_t ib_uverbs_get_context(struct uverbs_attr_bundle *attrs,
++ 				     const char __user *buf, int in_len,
++ 				     int out_len)
+++>>>>>>> 8313c10fa8be (RDMA/uverbs: Replace ib_uverbs_file with uverbs_attr_bundle for write)
+  {
++ 	struct ib_uverbs_file *file = attrs->ufile;
+  	struct ib_uverbs_get_context      cmd;
+  	struct ib_uverbs_get_context_resp resp;
+  	struct ib_udata                   udata;
+@@@ -220,13 -225,17 +234,27 @@@ static void copy_query_dev_fields(struc
+  	resp->phys_port_cnt		= ib_dev->phys_port_cnt;
+  }
+  
+++<<<<<<< HEAD
+ +ssize_t ib_uverbs_query_device(struct ib_uverbs_file *file,
+ +			       struct ib_device *ib_dev,
+ +			       const char __user *buf,
+ +			       int in_len, int out_len)
+ +{
+ +	struct ib_uverbs_query_device      cmd;
+ +	struct ib_uverbs_query_device_resp resp;
+++=======
++ static ssize_t ib_uverbs_query_device(struct uverbs_attr_bundle *attrs,
++ 				      const char __user *buf, int in_len,
++ 				      int out_len)
++ {
++ 	struct ib_uverbs_query_device      cmd;
++ 	struct ib_uverbs_query_device_resp resp;
++ 	struct ib_ucontext *ucontext;
++ 
++ 	ucontext = ib_uverbs_get_ucontext(attrs);
++ 	if (IS_ERR(ucontext))
++ 		return PTR_ERR(ucontext);
+++>>>>>>> 8313c10fa8be (RDMA/uverbs: Replace ib_uverbs_file with uverbs_attr_bundle for write)
+  
+  	if (out_len < sizeof resp)
+  		return -ENOSPC;
+@@@ -264,15 -273,21 +292,31 @@@ static u32 make_port_cap_flags(const st
+  	return res;
+  }
+  
+++<<<<<<< HEAD
+ +ssize_t ib_uverbs_query_port(struct ib_uverbs_file *file,
+ +			     struct ib_device *ib_dev,
+ +			     const char __user *buf,
+ +			     int in_len, int out_len)
+++=======
++ static ssize_t ib_uverbs_query_port(struct uverbs_attr_bundle *attrs,
++ 				    const char __user *buf, int in_len,
++ 				    int out_len)
+++>>>>>>> 8313c10fa8be (RDMA/uverbs: Replace ib_uverbs_file with uverbs_attr_bundle for write)
+  {
+  	struct ib_uverbs_query_port      cmd;
+  	struct ib_uverbs_query_port_resp resp;
+  	struct ib_port_attr              attr;
+  	int                              ret;
+++<<<<<<< HEAD
+++=======
++ 	struct ib_ucontext *ucontext;
++ 	struct ib_device *ib_dev;
++ 
++ 	ucontext = ib_uverbs_get_ucontext(attrs);
++ 	if (IS_ERR(ucontext))
++ 		return PTR_ERR(ucontext);
++ 	ib_dev = ucontext->device;
+++>>>>>>> 8313c10fa8be (RDMA/uverbs: Replace ib_uverbs_file with uverbs_attr_bundle for write)
+  
+  	if (out_len < sizeof resp)
+  		return -ENOSPC;
+@@@ -323,10 -338,9 +367,16 @@@
+  	return in_len;
+  }
+  
+++<<<<<<< HEAD
+ +ssize_t ib_uverbs_alloc_pd(struct ib_uverbs_file *file,
+ +			   struct ib_device *ib_dev,
+ +			   const char __user *buf,
+ +			   int in_len, int out_len)
+++=======
++ static ssize_t ib_uverbs_alloc_pd(struct uverbs_attr_bundle *attrs,
++ 				  const char __user *buf, int in_len,
++ 				  int out_len)
+++>>>>>>> 8313c10fa8be (RDMA/uverbs: Replace ib_uverbs_file with uverbs_attr_bundle for write)
+  {
+  	struct ib_uverbs_alloc_pd      cmd;
+  	struct ib_uverbs_alloc_pd_resp resp;
+@@@ -346,7 -361,7 +396,11 @@@
+                     in_len - sizeof(cmd) - sizeof(struct ib_uverbs_cmd_hdr),
+                     out_len - sizeof(resp));
+  
+++<<<<<<< HEAD
+ +	uobj  = uobj_alloc(UVERBS_OBJECT_PD, file->ucontext);
+++=======
++ 	uobj = uobj_alloc(UVERBS_OBJECT_PD, attrs, &ib_dev);
+++>>>>>>> 8313c10fa8be (RDMA/uverbs: Replace ib_uverbs_file with uverbs_attr_bundle for write)
+  	if (IS_ERR(uobj))
+  		return PTR_ERR(uobj);
+  
+@@@ -384,10 -397,9 +438,16 @@@ err
+  	return ret;
+  }
+  
+++<<<<<<< HEAD
+ +ssize_t ib_uverbs_dealloc_pd(struct ib_uverbs_file *file,
+ +			     struct ib_device *ib_dev,
+ +			     const char __user *buf,
+ +			     int in_len, int out_len)
+++=======
++ static ssize_t ib_uverbs_dealloc_pd(struct uverbs_attr_bundle *attrs,
++ 				    const char __user *buf, int in_len,
++ 				    int out_len)
+++>>>>>>> 8313c10fa8be (RDMA/uverbs: Replace ib_uverbs_file with uverbs_attr_bundle for write)
+  {
+  	struct ib_uverbs_dealloc_pd cmd;
+  
+@@@ -483,11 -495,11 +543,18 @@@ static void xrcd_table_delete(struct ib
+  	}
+  }
+  
+++<<<<<<< HEAD
+ +ssize_t ib_uverbs_open_xrcd(struct ib_uverbs_file *file,
+ +			    struct ib_device *ib_dev,
+ +			    const char __user *buf, int in_len,
+ +			    int out_len)
+++=======
++ static ssize_t ib_uverbs_open_xrcd(struct uverbs_attr_bundle *attrs,
++ 				   const char __user *buf, int in_len,
++ 				   int out_len)
+++>>>>>>> 8313c10fa8be (RDMA/uverbs: Replace ib_uverbs_file with uverbs_attr_bundle for write)
+  {
++ 	struct ib_uverbs_device *ibudev = attrs->ufile->device;
+  	struct ib_uverbs_open_xrcd	cmd;
+  	struct ib_uverbs_open_xrcd_resp	resp;
+  	struct ib_udata			udata;
+@@@ -533,8 -546,8 +600,13 @@@
+  		}
+  	}
+  
+++<<<<<<< HEAD
+ +	obj  = (struct ib_uxrcd_object *)uobj_alloc(UVERBS_OBJECT_XRCD,
+ +						    file->ucontext);
+++=======
++ 	obj = (struct ib_uxrcd_object *)uobj_alloc(UVERBS_OBJECT_XRCD, attrs,
++ 						   &ib_dev);
+++>>>>>>> 8313c10fa8be (RDMA/uverbs: Replace ib_uverbs_file with uverbs_attr_bundle for write)
+  	if (IS_ERR(obj)) {
+  		ret = PTR_ERR(obj);
+  		goto err_tree_mutex_unlock;
+@@@ -578,11 -591,9 +650,11 @@@
+  	if (f.file)
+  		fdput(f);
+  
+- 	mutex_unlock(&file->device->xrcd_tree_mutex);
++ 	mutex_unlock(&ibudev->xrcd_tree_mutex);
+  
+ -	return uobj_alloc_commit(&obj->uobject, in_len);
+ +	uobj_alloc_commit(&obj->uobject);
+ +
+ +	return in_len;
+  
+  err_copy:
+  	if (inode) {
+@@@ -606,10 -617,9 +678,16 @@@ err_tree_mutex_unlock
+  	return ret;
+  }
+  
+++<<<<<<< HEAD
+ +ssize_t ib_uverbs_close_xrcd(struct ib_uverbs_file *file,
+ +			     struct ib_device *ib_dev,
+ +			     const char __user *buf, int in_len,
+ +			     int out_len)
+++=======
++ static ssize_t ib_uverbs_close_xrcd(struct uverbs_attr_bundle *attrs,
++ 				    const char __user *buf, int in_len,
++ 				    int out_len)
+++>>>>>>> 8313c10fa8be (RDMA/uverbs: Replace ib_uverbs_file with uverbs_attr_bundle for write)
+  {
+  	struct ib_uverbs_close_xrcd cmd;
+  
+@@@ -641,10 -655,8 +719,15 @@@ int ib_uverbs_dealloc_xrcd(struct ib_uv
+  	return ret;
+  }
+  
+++<<<<<<< HEAD
+ +ssize_t ib_uverbs_reg_mr(struct ib_uverbs_file *file,
+ +			 struct ib_device *ib_dev,
+ +			 const char __user *buf, int in_len,
+ +			 int out_len)
+++=======
++ static ssize_t ib_uverbs_reg_mr(struct uverbs_attr_bundle *attrs,
++ 				const char __user *buf, int in_len, int out_len)
+++>>>>>>> 8313c10fa8be (RDMA/uverbs: Replace ib_uverbs_file with uverbs_attr_bundle for write)
+  {
+  	struct ib_uverbs_reg_mr      cmd;
+  	struct ib_uverbs_reg_mr_resp resp;
+@@@ -672,11 -685,11 +755,19 @@@
+  	if (ret)
+  		return ret;
+  
+++<<<<<<< HEAD
+ +	uobj  = uobj_alloc(UVERBS_OBJECT_MR, file->ucontext);
+ +	if (IS_ERR(uobj))
+ +		return PTR_ERR(uobj);
+ +
+ +	pd = uobj_get_obj_read(pd, UVERBS_OBJECT_PD, cmd.pd_handle, file->ucontext);
+++=======
++ 	uobj = uobj_alloc(UVERBS_OBJECT_MR, attrs, &ib_dev);
++ 	if (IS_ERR(uobj))
++ 		return PTR_ERR(uobj);
++ 
++ 	pd = uobj_get_obj_read(pd, UVERBS_OBJECT_PD, cmd.pd_handle, attrs);
+++>>>>>>> 8313c10fa8be (RDMA/uverbs: Replace ib_uverbs_file with uverbs_attr_bundle for write)
+  	if (!pd) {
+  		ret = -EINVAL;
+  		goto err_free;
+@@@ -735,10 -746,9 +826,16 @@@ err_free
+  	return ret;
+  }
+  
+++<<<<<<< HEAD
+ +ssize_t ib_uverbs_rereg_mr(struct ib_uverbs_file *file,
+ +			   struct ib_device *ib_dev,
+ +			   const char __user *buf, int in_len,
+ +			   int out_len)
+++=======
++ static ssize_t ib_uverbs_rereg_mr(struct uverbs_attr_bundle *attrs,
++ 				  const char __user *buf, int in_len,
++ 				  int out_len)
+++>>>>>>> 8313c10fa8be (RDMA/uverbs: Replace ib_uverbs_file with uverbs_attr_bundle for write)
+  {
+  	struct ib_uverbs_rereg_mr      cmd;
+  	struct ib_uverbs_rereg_mr_resp resp;
+@@@ -768,8 -778,7 +865,12 @@@
+  	     (cmd.start & ~PAGE_MASK) != (cmd.hca_va & ~PAGE_MASK)))
+  			return -EINVAL;
+  
+++<<<<<<< HEAD
+ +	uobj  = uobj_get_write(UVERBS_OBJECT_MR, cmd.mr_handle,
+ +			       file->ucontext);
+++=======
++ 	uobj = uobj_get_write(UVERBS_OBJECT_MR, cmd.mr_handle, attrs);
+++>>>>>>> 8313c10fa8be (RDMA/uverbs: Replace ib_uverbs_file with uverbs_attr_bundle for write)
+  	if (IS_ERR(uobj))
+  		return PTR_ERR(uobj);
+  
+@@@ -787,7 -796,8 +888,12 @@@
+  	}
+  
+  	if (cmd.flags & IB_MR_REREG_PD) {
+++<<<<<<< HEAD
+ +		pd = uobj_get_obj_read(pd, UVERBS_OBJECT_PD, cmd.pd_handle, file->ucontext);
+++=======
++ 		pd = uobj_get_obj_read(pd, UVERBS_OBJECT_PD, cmd.pd_handle,
++ 				       attrs);
+++>>>>>>> 8313c10fa8be (RDMA/uverbs: Replace ib_uverbs_file with uverbs_attr_bundle for write)
+  		if (!pd) {
+  			ret = -EINVAL;
+  			goto put_uobjs;
+@@@ -827,10 -837,9 +933,16 @@@ put_uobjs
+  	return ret;
+  }
+  
+++<<<<<<< HEAD
+ +ssize_t ib_uverbs_dereg_mr(struct ib_uverbs_file *file,
+ +			   struct ib_device *ib_dev,
+ +			   const char __user *buf, int in_len,
+ +			   int out_len)
+++=======
++ static ssize_t ib_uverbs_dereg_mr(struct uverbs_attr_bundle *attrs,
++ 				  const char __user *buf, int in_len,
++ 				  int out_len)
+++>>>>>>> 8313c10fa8be (RDMA/uverbs: Replace ib_uverbs_file with uverbs_attr_bundle for write)
+  {
+  	struct ib_uverbs_dereg_mr cmd;
+  
+@@@ -841,10 -850,9 +953,16 @@@
+  				    in_len);
+  }
+  
+++<<<<<<< HEAD
+ +ssize_t ib_uverbs_alloc_mw(struct ib_uverbs_file *file,
+ +			   struct ib_device *ib_dev,
+ +			   const char __user *buf, int in_len,
+ +			   int out_len)
+++=======
++ static ssize_t ib_uverbs_alloc_mw(struct uverbs_attr_bundle *attrs,
++ 				  const char __user *buf, int in_len,
++ 				  int out_len)
+++>>>>>>> 8313c10fa8be (RDMA/uverbs: Replace ib_uverbs_file with uverbs_attr_bundle for write)
+  {
+  	struct ib_uverbs_alloc_mw      cmd;
+  	struct ib_uverbs_alloc_mw_resp resp;
+@@@ -860,11 -869,11 +978,19 @@@
+  	if (copy_from_user(&cmd, buf, sizeof(cmd)))
+  		return -EFAULT;
+  
+++<<<<<<< HEAD
+ +	uobj  = uobj_alloc(UVERBS_OBJECT_MW, file->ucontext);
+ +	if (IS_ERR(uobj))
+ +		return PTR_ERR(uobj);
+ +
+ +	pd = uobj_get_obj_read(pd, UVERBS_OBJECT_PD, cmd.pd_handle, file->ucontext);
+++=======
++ 	uobj = uobj_alloc(UVERBS_OBJECT_MW, attrs, &ib_dev);
++ 	if (IS_ERR(uobj))
++ 		return PTR_ERR(uobj);
++ 
++ 	pd = uobj_get_obj_read(pd, UVERBS_OBJECT_PD, cmd.pd_handle, attrs);
+++>>>>>>> 8313c10fa8be (RDMA/uverbs: Replace ib_uverbs_file with uverbs_attr_bundle for write)
+  	if (!pd) {
+  		ret = -EINVAL;
+  		goto err_free;
+@@@ -911,10 -918,9 +1037,16 @@@ err_free
+  	return ret;
+  }
+  
+++<<<<<<< HEAD
+ +ssize_t ib_uverbs_dealloc_mw(struct ib_uverbs_file *file,
+ +			     struct ib_device *ib_dev,
+ +			     const char __user *buf, int in_len,
+ +			     int out_len)
+++=======
++ static ssize_t ib_uverbs_dealloc_mw(struct uverbs_attr_bundle *attrs,
++ 				    const char __user *buf, int in_len,
++ 				    int out_len)
+++>>>>>>> 8313c10fa8be (RDMA/uverbs: Replace ib_uverbs_file with uverbs_attr_bundle for write)
+  {
+  	struct ib_uverbs_dealloc_mw cmd;
+  
+@@@ -925,10 -931,9 +1057,16 @@@
+  				    in_len);
+  }
+  
+++<<<<<<< HEAD
+ +ssize_t ib_uverbs_create_comp_channel(struct ib_uverbs_file *file,
+ +				      struct ib_device *ib_dev,
+ +				      const char __user *buf, int in_len,
+ +				      int out_len)
+++=======
++ static ssize_t ib_uverbs_create_comp_channel(struct uverbs_attr_bundle *attrs,
++ 					     const char __user *buf, int in_len,
++ 					     int out_len)
+++>>>>>>> 8313c10fa8be (RDMA/uverbs: Replace ib_uverbs_file with uverbs_attr_bundle for write)
+  {
+  	struct ib_uverbs_create_comp_channel	   cmd;
+  	struct ib_uverbs_create_comp_channel_resp  resp;
+@@@ -941,7 -947,7 +1079,11 @@@
+  	if (copy_from_user(&cmd, buf, sizeof cmd))
+  		return -EFAULT;
+  
+++<<<<<<< HEAD
+ +	uobj = uobj_alloc(UVERBS_OBJECT_COMP_CHANNEL, file->ucontext);
+++=======
++ 	uobj = uobj_alloc(UVERBS_OBJECT_COMP_CHANNEL, attrs, &ib_dev);
+++>>>>>>> 8313c10fa8be (RDMA/uverbs: Replace ib_uverbs_file with uverbs_attr_bundle for write)
+  	if (IS_ERR(uobj))
+  		return PTR_ERR(uobj);
+  
+@@@ -956,12 -962,10 +1098,16 @@@
+  		return -EFAULT;
+  	}
+  
+ -	return uobj_alloc_commit(uobj, in_len);
+ +	uobj_alloc_commit(uobj);
+ +	return in_len;
+  }
+  
+++<<<<<<< HEAD
+ +static struct ib_ucq_object *create_cq(struct ib_uverbs_file *file,
+ +					struct ib_device *ib_dev,
+++=======
++ static struct ib_ucq_object *create_cq(struct uverbs_attr_bundle *attrs,
+++>>>>>>> 8313c10fa8be (RDMA/uverbs: Replace ib_uverbs_file with uverbs_attr_bundle for write)
+  				       struct ib_udata *ucore,
+  				       struct ib_udata *uhw,
+  				       struct ib_uverbs_ex_create_cq *cmd,
+@@@ -979,21 -983,18 +1125,30 @@@
+  	int                             ret;
+  	struct ib_uverbs_ex_create_cq_resp resp;
+  	struct ib_cq_init_attr attr = {};
+ -	struct ib_device *ib_dev;
+ +
+ +	if (!ib_dev->create_cq)
+ +		return ERR_PTR(-EOPNOTSUPP);
+  
+- 	if (cmd->comp_vector >= file->device->num_comp_vectors)
++ 	if (cmd->comp_vector >= attrs->ufile->device->num_comp_vectors)
+  		return ERR_PTR(-EINVAL);
+  
+++<<<<<<< HEAD
+ +	obj  = (struct ib_ucq_object *)uobj_alloc(UVERBS_OBJECT_CQ,
+ +						  file->ucontext);
+++=======
++ 	obj = (struct ib_ucq_object *)uobj_alloc(UVERBS_OBJECT_CQ, attrs,
++ 						 &ib_dev);
+++>>>>>>> 8313c10fa8be (RDMA/uverbs: Replace ib_uverbs_file with uverbs_attr_bundle for write)
+  	if (IS_ERR(obj))
+  		return obj;
+  
+  	if (cmd->comp_channel >= 0) {
+++<<<<<<< HEAD
+ +		ev_file = ib_uverbs_lookup_comp_file(cmd->comp_channel,
+ +						     file->ucontext);
+++=======
++ 		ev_file = ib_uverbs_lookup_comp_file(cmd->comp_channel, attrs);
+++>>>>>>> 8313c10fa8be (RDMA/uverbs: Replace ib_uverbs_file with uverbs_attr_bundle for write)
+  		if (IS_ERR(ev_file)) {
+  			ret = PTR_ERR(ev_file);
+  			goto err;
+@@@ -1067,10 -1070,9 +1222,16 @@@ static int ib_uverbs_create_cq_cb(struc
+  	return 0;
+  }
+  
+++<<<<<<< HEAD
+ +ssize_t ib_uverbs_create_cq(struct ib_uverbs_file *file,
+ +			    struct ib_device *ib_dev,
+ +			    const char __user *buf, int in_len,
+ +			    int out_len)
+++=======
++ static ssize_t ib_uverbs_create_cq(struct uverbs_attr_bundle *attrs,
++ 				   const char __user *buf, int in_len,
++ 				   int out_len)
+++>>>>>>> 8313c10fa8be (RDMA/uverbs: Replace ib_uverbs_file with uverbs_attr_bundle for write)
+  {
+  	struct ib_uverbs_create_cq      cmd;
+  	struct ib_uverbs_ex_create_cq	cmd_ex;
+@@@ -1099,7 -1101,7 +1260,11 @@@
+  	cmd_ex.comp_vector = cmd.comp_vector;
+  	cmd_ex.comp_channel = cmd.comp_channel;
+  
+++<<<<<<< HEAD
+ +	obj = create_cq(file, ib_dev, &ucore, &uhw, &cmd_ex,
+++=======
++ 	obj = create_cq(attrs, &ucore, &uhw, &cmd_ex,
+++>>>>>>> 8313c10fa8be (RDMA/uverbs: Replace ib_uverbs_file with uverbs_attr_bundle for write)
+  			offsetof(typeof(cmd_ex), comp_channel) +
+  			sizeof(cmd.comp_channel), ib_uverbs_create_cq_cb,
+  			NULL);
+@@@ -1121,10 -1123,8 +1286,15 @@@ static int ib_uverbs_ex_create_cq_cb(st
+  	return 0;
+  }
+  
+++<<<<<<< HEAD
+ +int ib_uverbs_ex_create_cq(struct ib_uverbs_file *file,
+ +			 struct ib_device *ib_dev,
+ +			   struct ib_udata *ucore,
+ +			   struct ib_udata *uhw)
+++=======
++ static int ib_uverbs_ex_create_cq(struct uverbs_attr_bundle *attrs,
++ 				  struct ib_udata *ucore, struct ib_udata *uhw)
+++>>>>>>> 8313c10fa8be (RDMA/uverbs: Replace ib_uverbs_file with uverbs_attr_bundle for write)
+  {
+  	struct ib_uverbs_ex_create_cq_resp resp;
+  	struct ib_uverbs_ex_create_cq  cmd;
+@@@ -1148,17 -1148,16 +1318,27 @@@
+  			     sizeof(resp.response_length)))
+  		return -ENOSPC;
+  
+++<<<<<<< HEAD
+ +	obj = create_cq(file, ib_dev, ucore, uhw, &cmd,
+++=======
++ 	obj = create_cq(attrs, ucore, uhw, &cmd,
+++>>>>>>> 8313c10fa8be (RDMA/uverbs: Replace ib_uverbs_file with uverbs_attr_bundle for write)
+  			min(ucore->inlen, sizeof(cmd)),
+  			ib_uverbs_ex_create_cq_cb, NULL);
+  
+  	return PTR_ERR_OR_ZERO(obj);
+  }
+  
+++<<<<<<< HEAD
+ +ssize_t ib_uverbs_resize_cq(struct ib_uverbs_file *file,
+ +			    struct ib_device *ib_dev,
+ +			    const char __user *buf, int in_len,
+ +			    int out_len)
+++=======
++ static ssize_t ib_uverbs_resize_cq(struct uverbs_attr_bundle *attrs,
++ 				   const char __user *buf, int in_len,
++ 				   int out_len)
+++>>>>>>> 8313c10fa8be (RDMA/uverbs: Replace ib_uverbs_file with uverbs_attr_bundle for write)
+  {
+  	struct ib_uverbs_resize_cq	cmd;
+  	struct ib_uverbs_resize_cq_resp	resp = {};
+@@@ -1174,7 -1173,7 +1354,11 @@@
+  		   in_len - sizeof(cmd) - sizeof(struct ib_uverbs_cmd_hdr),
+  		   out_len - sizeof(resp));
+  
+++<<<<<<< HEAD
+ +	cq = uobj_get_obj_read(cq, UVERBS_OBJECT_CQ, cmd.cq_handle, file->ucontext);
+++=======
++ 	cq = uobj_get_obj_read(cq, UVERBS_OBJECT_CQ, cmd.cq_handle, attrs);
+++>>>>>>> 8313c10fa8be (RDMA/uverbs: Replace ib_uverbs_file with uverbs_attr_bundle for write)
+  	if (!cq)
+  		return -EINVAL;
+  
+@@@ -1223,10 -1222,9 +1407,16 @@@ static int copy_wc_to_user(struct ib_de
+  	return 0;
+  }
+  
+++<<<<<<< HEAD
+ +ssize_t ib_uverbs_poll_cq(struct ib_uverbs_file *file,
+ +			  struct ib_device *ib_dev,
+ +			  const char __user *buf, int in_len,
+ +			  int out_len)
+++=======
++ static ssize_t ib_uverbs_poll_cq(struct uverbs_attr_bundle *attrs,
++ 				 const char __user *buf, int in_len,
++ 				 int out_len)
+++>>>>>>> 8313c10fa8be (RDMA/uverbs: Replace ib_uverbs_file with uverbs_attr_bundle for write)
+  {
+  	struct ib_uverbs_poll_cq       cmd;
+  	struct ib_uverbs_poll_cq_resp  resp;
+@@@ -1239,7 -1237,7 +1429,11 @@@
+  	if (copy_from_user(&cmd, buf, sizeof cmd))
+  		return -EFAULT;
+  
+++<<<<<<< HEAD
+ +	cq = uobj_get_obj_read(cq, UVERBS_OBJECT_CQ, cmd.cq_handle, file->ucontext);
+++=======
++ 	cq = uobj_get_obj_read(cq, UVERBS_OBJECT_CQ, cmd.cq_handle, attrs);
+++>>>>>>> 8313c10fa8be (RDMA/uverbs: Replace ib_uverbs_file with uverbs_attr_bundle for write)
+  	if (!cq)
+  		return -EINVAL;
+  
+@@@ -1275,10 -1273,9 +1469,16 @@@ out_put
+  	return ret;
+  }
+  
+++<<<<<<< HEAD
+ +ssize_t ib_uverbs_req_notify_cq(struct ib_uverbs_file *file,
+ +				struct ib_device *ib_dev,
+ +				const char __user *buf, int in_len,
+ +				int out_len)
+++=======
++ static ssize_t ib_uverbs_req_notify_cq(struct uverbs_attr_bundle *attrs,
++ 				       const char __user *buf, int in_len,
++ 				       int out_len)
+++>>>>>>> 8313c10fa8be (RDMA/uverbs: Replace ib_uverbs_file with uverbs_attr_bundle for write)
+  {
+  	struct ib_uverbs_req_notify_cq cmd;
+  	struct ib_cq                  *cq;
+@@@ -1286,7 -1283,7 +1486,11 @@@
+  	if (copy_from_user(&cmd, buf, sizeof cmd))
+  		return -EFAULT;
+  
+++<<<<<<< HEAD
+ +	cq = uobj_get_obj_read(cq, UVERBS_OBJECT_CQ, cmd.cq_handle, file->ucontext);
+++=======
++ 	cq = uobj_get_obj_read(cq, UVERBS_OBJECT_CQ, cmd.cq_handle, attrs);
+++>>>>>>> 8313c10fa8be (RDMA/uverbs: Replace ib_uverbs_file with uverbs_attr_bundle for write)
+  	if (!cq)
+  		return -EINVAL;
+  
+@@@ -1298,10 -1295,9 +1502,16 @@@
+  	return in_len;
+  }
+  
+++<<<<<<< HEAD
+ +ssize_t ib_uverbs_destroy_cq(struct ib_uverbs_file *file,
+ +			     struct ib_device *ib_dev,
+ +			     const char __user *buf, int in_len,
+ +			     int out_len)
+++=======
++ static ssize_t ib_uverbs_destroy_cq(struct uverbs_attr_bundle *attrs,
++ 				    const char __user *buf, int in_len,
++ 				    int out_len)
+++>>>>>>> 8313c10fa8be (RDMA/uverbs: Replace ib_uverbs_file with uverbs_attr_bundle for write)
+  {
+  	struct ib_uverbs_destroy_cq      cmd;
+  	struct ib_uverbs_destroy_cq_resp resp;
+@@@ -1313,8 -1307,7 +1523,12 @@@
+  	if (copy_from_user(&cmd, buf, sizeof cmd))
+  		return -EFAULT;
+  
+++<<<<<<< HEAD
+ +	uobj  = uobj_get_write(UVERBS_OBJECT_CQ, cmd.cq_handle,
+ +			       file->ucontext);
+++=======
++ 	uobj = uobj_get_destroy(UVERBS_OBJECT_CQ, cmd.cq_handle, attrs);
+++>>>>>>> 8313c10fa8be (RDMA/uverbs: Replace ib_uverbs_file with uverbs_attr_bundle for write)
+  	if (IS_ERR(uobj))
+  		return PTR_ERR(uobj);
+  
+@@@ -1372,8 -1353,8 +1586,13 @@@ static int create_qp(struct uverbs_attr
+  	if (cmd->qp_type == IB_QPT_RAW_PACKET && !capable(CAP_NET_RAW))
+  		return -EPERM;
+  
+++<<<<<<< HEAD
+ +	obj  = (struct ib_uqp_object *)uobj_alloc(UVERBS_OBJECT_QP,
+ +						  file->ucontext);
+++=======
++ 	obj = (struct ib_uqp_object *)uobj_alloc(UVERBS_OBJECT_QP, attrs,
++ 						 &ib_dev);
+++>>>>>>> 8313c10fa8be (RDMA/uverbs: Replace ib_uverbs_file with uverbs_attr_bundle for write)
+  	if (IS_ERR(obj))
+  		return PTR_ERR(obj);
+  	obj->uxrcd = NULL;
+@@@ -1383,9 -1364,9 +1602,15 @@@
+  	if (cmd_sz >= offsetof(typeof(*cmd), rwq_ind_tbl_handle) +
+  		      sizeof(cmd->rwq_ind_tbl_handle) &&
+  		      (cmd->comp_mask & IB_UVERBS_CREATE_QP_MASK_IND_TABLE)) {
+++<<<<<<< HEAD
+ +		ind_tbl = uobj_get_obj_read(rwq_ind_table, UVERBS_OBJECT_RWQ_IND_TBL,
+ +					    cmd->rwq_ind_tbl_handle,
+ +					    file->ucontext);
+++=======
++ 		ind_tbl = uobj_get_obj_read(rwq_ind_table,
++ 					    UVERBS_OBJECT_RWQ_IND_TBL,
++ 					    cmd->rwq_ind_tbl_handle, attrs);
+++>>>>>>> 8313c10fa8be (RDMA/uverbs: Replace ib_uverbs_file with uverbs_attr_bundle for write)
+  		if (!ind_tbl) {
+  			ret = -EINVAL;
+  			goto err_put;
+@@@ -1411,7 -1392,7 +1636,11 @@@
+  
+  	if (cmd->qp_type == IB_QPT_XRC_TGT) {
+  		xrcd_uobj = uobj_get_read(UVERBS_OBJECT_XRCD, cmd->pd_handle,
+++<<<<<<< HEAD
+ +					  file->ucontext);
+++=======
++ 					  attrs);
+++>>>>>>> 8313c10fa8be (RDMA/uverbs: Replace ib_uverbs_file with uverbs_attr_bundle for write)
+  
+  		if (IS_ERR(xrcd_uobj)) {
+  			ret = -EINVAL;
+@@@ -1430,8 -1411,8 +1659,13 @@@
+  			cmd->max_recv_sge = 0;
+  		} else {
+  			if (cmd->is_srq) {
+++<<<<<<< HEAD
+ +				srq = uobj_get_obj_read(srq, UVERBS_OBJECT_SRQ, cmd->srq_handle,
+ +							file->ucontext);
+++=======
++ 				srq = uobj_get_obj_read(srq, UVERBS_OBJECT_SRQ,
++ 							cmd->srq_handle, attrs);
+++>>>>>>> 8313c10fa8be (RDMA/uverbs: Replace ib_uverbs_file with uverbs_attr_bundle for write)
+  				if (!srq || srq->srq_type == IB_SRQT_XRC) {
+  					ret = -EINVAL;
+  					goto err_put;
+@@@ -1440,8 -1421,9 +1674,14 @@@
+  
+  			if (!ind_tbl) {
+  				if (cmd->recv_cq_handle != cmd->send_cq_handle) {
+++<<<<<<< HEAD
+ +					rcq = uobj_get_obj_read(cq, UVERBS_OBJECT_CQ, cmd->recv_cq_handle,
+ +								file->ucontext);
+++=======
++ 					rcq = uobj_get_obj_read(
++ 						cq, UVERBS_OBJECT_CQ,
++ 						cmd->recv_cq_handle, attrs);
+++>>>>>>> 8313c10fa8be (RDMA/uverbs: Replace ib_uverbs_file with uverbs_attr_bundle for write)
+  					if (!rcq) {
+  						ret = -EINVAL;
+  						goto err_put;
+@@@ -1451,11 -1433,12 +1691,20 @@@
+  		}
+  
+  		if (has_sq)
+++<<<<<<< HEAD
+ +			scq = uobj_get_obj_read(cq, UVERBS_OBJECT_CQ, cmd->send_cq_handle,
+ +						file->ucontext);
+ +		if (!ind_tbl)
+ +			rcq = rcq ?: scq;
+ +		pd  = uobj_get_obj_read(pd, UVERBS_OBJECT_PD, cmd->pd_handle, file->ucontext);
+++=======
++ 			scq = uobj_get_obj_read(cq, UVERBS_OBJECT_CQ,
++ 						cmd->send_cq_handle, attrs);
++ 		if (!ind_tbl)
++ 			rcq = rcq ?: scq;
++ 		pd = uobj_get_obj_read(pd, UVERBS_OBJECT_PD, cmd->pd_handle,
++ 				       attrs);
+++>>>>>>> 8313c10fa8be (RDMA/uverbs: Replace ib_uverbs_file with uverbs_attr_bundle for write)
+  		if (!pd || (!scq && has_sq)) {
+  			ret = -EINVAL;
+  			goto err_put;
+@@@ -1629,10 -1610,9 +1878,16 @@@ static int ib_uverbs_create_qp_cb(struc
+  	return 0;
+  }
+  
+++<<<<<<< HEAD
+ +ssize_t ib_uverbs_create_qp(struct ib_uverbs_file *file,
+ +			    struct ib_device *ib_dev,
+ +			    const char __user *buf, int in_len,
+ +			    int out_len)
+++=======
++ static ssize_t ib_uverbs_create_qp(struct uverbs_attr_bundle *attrs,
++ 				   const char __user *buf, int in_len,
++ 				   int out_len)
+++>>>>>>> 8313c10fa8be (RDMA/uverbs: Replace ib_uverbs_file with uverbs_attr_bundle for write)
+  {
+  	struct ib_uverbs_create_qp      cmd;
+  	struct ib_uverbs_ex_create_qp	cmd_ex;
+@@@ -1690,10 -1670,8 +1945,15 @@@ static int ib_uverbs_ex_create_qp_cb(st
+  	return 0;
+  }
+  
+++<<<<<<< HEAD
+ +int ib_uverbs_ex_create_qp(struct ib_uverbs_file *file,
+ +			   struct ib_device *ib_dev,
+ +			   struct ib_udata *ucore,
+ +			   struct ib_udata *uhw)
+++=======
++ static int ib_uverbs_ex_create_qp(struct uverbs_attr_bundle *attrs,
++ 				  struct ib_udata *ucore, struct ib_udata *uhw)
+++>>>>>>> 8313c10fa8be (RDMA/uverbs: Replace ib_uverbs_file with uverbs_attr_bundle for write)
+  {
+  	struct ib_uverbs_ex_create_qp_resp resp;
+  	struct ib_uverbs_ex_create_qp cmd = {0};
+@@@ -1727,9 -1705,9 +1987,15 @@@
+  	return 0;
+  }
+  
+++<<<<<<< HEAD
+ +ssize_t ib_uverbs_open_qp(struct ib_uverbs_file *file,
+ +			  struct ib_device *ib_dev,
+ +			  const char __user *buf, int in_len, int out_len)
+++=======
++ static ssize_t ib_uverbs_open_qp(struct uverbs_attr_bundle *attrs,
++ 				 const char __user *buf, int in_len,
++ 				 int out_len)
+++>>>>>>> 8313c10fa8be (RDMA/uverbs: Replace ib_uverbs_file with uverbs_attr_bundle for write)
+  {
+  	struct ib_uverbs_open_qp        cmd;
+  	struct ib_uverbs_create_qp_resp resp;
+@@@ -1752,13 -1731,12 +2018,22 @@@
+  		   in_len - sizeof(cmd) - sizeof(struct ib_uverbs_cmd_hdr),
+  		   out_len - sizeof(resp));
+  
+++<<<<<<< HEAD
+ +	obj  = (struct ib_uqp_object *)uobj_alloc(UVERBS_OBJECT_QP,
+ +						  file->ucontext);
+ +	if (IS_ERR(obj))
+ +		return PTR_ERR(obj);
+ +
+ +	xrcd_uobj = uobj_get_read(UVERBS_OBJECT_XRCD, cmd.pd_handle,
+ +				  file->ucontext);
+++=======
++ 	obj = (struct ib_uqp_object *)uobj_alloc(UVERBS_OBJECT_QP, attrs,
++ 						 &ib_dev);
++ 	if (IS_ERR(obj))
++ 		return PTR_ERR(obj);
++ 
++ 	xrcd_uobj = uobj_get_read(UVERBS_OBJECT_XRCD, cmd.pd_handle, attrs);
+++>>>>>>> 8313c10fa8be (RDMA/uverbs: Replace ib_uverbs_file with uverbs_attr_bundle for write)
+  	if (IS_ERR(xrcd_uobj)) {
+  		ret = -EINVAL;
+  		goto err_put;
+@@@ -1838,10 -1813,9 +2113,16 @@@ static void copy_ah_attr_to_uverbs(stru
+  	uverb_attr->port_num          = rdma_ah_get_port_num(rdma_attr);
+  }
+  
+++<<<<<<< HEAD
+ +ssize_t ib_uverbs_query_qp(struct ib_uverbs_file *file,
+ +			   struct ib_device *ib_dev,
+ +			   const char __user *buf, int in_len,
+ +			   int out_len)
+++=======
++ static ssize_t ib_uverbs_query_qp(struct uverbs_attr_bundle *attrs,
++ 				  const char __user *buf, int in_len,
++ 				  int out_len)
+++>>>>>>> 8313c10fa8be (RDMA/uverbs: Replace ib_uverbs_file with uverbs_attr_bundle for write)
+  {
+  	struct ib_uverbs_query_qp      cmd;
+  	struct ib_uverbs_query_qp_resp resp;
+@@@ -1860,7 -1834,7 +2141,11 @@@
+  		goto out;
+  	}
+  
+++<<<<<<< HEAD
+ +	qp = uobj_get_obj_read(qp, UVERBS_OBJECT_QP, cmd.qp_handle, file->ucontext);
+++=======
++ 	qp = uobj_get_obj_read(qp, UVERBS_OBJECT_QP, cmd.qp_handle, attrs);
+++>>>>>>> 8313c10fa8be (RDMA/uverbs: Replace ib_uverbs_file with uverbs_attr_bundle for write)
+  	if (!qp) {
+  		ret = -EINVAL;
+  		goto out;
+@@@ -1965,7 -1939,8 +2250,12 @@@ static int modify_qp(struct uverbs_attr
+  	if (!attr)
+  		return -ENOMEM;
+  
+++<<<<<<< HEAD
+ +	qp = uobj_get_obj_read(qp, UVERBS_OBJECT_QP, cmd->base.qp_handle, file->ucontext);
+++=======
++ 	qp = uobj_get_obj_read(qp, UVERBS_OBJECT_QP, cmd->base.qp_handle,
++ 			       attrs);
+++>>>>>>> 8313c10fa8be (RDMA/uverbs: Replace ib_uverbs_file with uverbs_attr_bundle for write)
+  	if (!qp) {
+  		ret = -EINVAL;
+  		goto out;
+@@@ -2112,10 -2087,9 +2402,16 @@@ out
+  	return ret;
+  }
+  
+++<<<<<<< HEAD
+ +ssize_t ib_uverbs_modify_qp(struct ib_uverbs_file *file,
+ +			    struct ib_device *ib_dev,
+ +			    const char __user *buf, int in_len,
+ +			    int out_len)
+++=======
++ static ssize_t ib_uverbs_modify_qp(struct uverbs_attr_bundle *attrs,
++ 				   const char __user *buf, int in_len,
++ 				   int out_len)
+++>>>>>>> 8313c10fa8be (RDMA/uverbs: Replace ib_uverbs_file with uverbs_attr_bundle for write)
+  {
+  	struct ib_uverbs_ex_modify_qp cmd = {};
+  	struct ib_udata udata;
+@@@ -2139,10 -2113,8 +2435,15 @@@
+  	return in_len;
+  }
+  
+++<<<<<<< HEAD
+ +int ib_uverbs_ex_modify_qp(struct ib_uverbs_file *file,
+ +			   struct ib_device *ib_dev,
+ +			   struct ib_udata *ucore,
+ +			   struct ib_udata *uhw)
+++=======
++ static int ib_uverbs_ex_modify_qp(struct uverbs_attr_bundle *attrs,
++ 				  struct ib_udata *ucore, struct ib_udata *uhw)
+++>>>>>>> 8313c10fa8be (RDMA/uverbs: Replace ib_uverbs_file with uverbs_attr_bundle for write)
+  {
+  	struct ib_uverbs_ex_modify_qp cmd = {};
+  	int ret;
+@@@ -2175,10 -2147,9 +2476,16 @@@
+  	return ret;
+  }
+  
+++<<<<<<< HEAD
+ +ssize_t ib_uverbs_destroy_qp(struct ib_uverbs_file *file,
+ +			     struct ib_device *ib_dev,
+ +			     const char __user *buf, int in_len,
+ +			     int out_len)
+++=======
++ static ssize_t ib_uverbs_destroy_qp(struct uverbs_attr_bundle *attrs,
++ 				    const char __user *buf, int in_len,
++ 				    int out_len)
+++>>>>>>> 8313c10fa8be (RDMA/uverbs: Replace ib_uverbs_file with uverbs_attr_bundle for write)
+  {
+  	struct ib_uverbs_destroy_qp      cmd;
+  	struct ib_uverbs_destroy_qp_resp resp;
+@@@ -2189,10 -2159,7 +2496,14 @@@
+  	if (copy_from_user(&cmd, buf, sizeof cmd))
+  		return -EFAULT;
+  
+++<<<<<<< HEAD
+ +	memset(&resp, 0, sizeof resp);
+ +
+ +	uobj  = uobj_get_write(UVERBS_OBJECT_QP, cmd.qp_handle,
+ +			       file->ucontext);
+++=======
++ 	uobj = uobj_get_destroy(UVERBS_OBJECT_QP, cmd.qp_handle, attrs);
+++>>>>>>> 8313c10fa8be (RDMA/uverbs: Replace ib_uverbs_file with uverbs_attr_bundle for write)
+  	if (IS_ERR(uobj))
+  		return PTR_ERR(uobj);
+  
+@@@ -2228,10 -2185,9 +2539,16 @@@ static void *alloc_wr(size_t wr_size, _
+  			 num_sge * sizeof (struct ib_sge), GFP_KERNEL);
+  }
+  
+++<<<<<<< HEAD
+ +ssize_t ib_uverbs_post_send(struct ib_uverbs_file *file,
+ +			    struct ib_device *ib_dev,
+ +			    const char __user *buf, int in_len,
+ +			    int out_len)
+++=======
++ static ssize_t ib_uverbs_post_send(struct uverbs_attr_bundle *attrs,
++ 				   const char __user *buf, int in_len,
++ 				   int out_len)
+++>>>>>>> 8313c10fa8be (RDMA/uverbs: Replace ib_uverbs_file with uverbs_attr_bundle for write)
+  {
+  	struct ib_uverbs_post_send      cmd;
+  	struct ib_uverbs_post_send_resp resp;
+@@@ -2257,7 -2214,7 +2574,11 @@@
+  	if (!user_wr)
+  		return -ENOMEM;
+  
+++<<<<<<< HEAD
+ +	qp = uobj_get_obj_read(qp, UVERBS_OBJECT_QP, cmd.qp_handle, file->ucontext);
+++=======
++ 	qp = uobj_get_obj_read(qp, UVERBS_OBJECT_QP, cmd.qp_handle, attrs);
+++>>>>>>> 8313c10fa8be (RDMA/uverbs: Replace ib_uverbs_file with uverbs_attr_bundle for write)
+  	if (!qp)
+  		goto out;
+  
+@@@ -2293,8 -2250,8 +2614,13 @@@
+  				goto out_put;
+  			}
+  
+++<<<<<<< HEAD
+ +			ud->ah = uobj_get_obj_read(ah, UVERBS_OBJECT_AH, user_wr->wr.ud.ah,
+ +						   file->ucontext);
+++=======
++ 			ud->ah = uobj_get_obj_read(ah, UVERBS_OBJECT_AH,
++ 						   user_wr->wr.ud.ah, attrs);
+++>>>>>>> 8313c10fa8be (RDMA/uverbs: Replace ib_uverbs_file with uverbs_attr_bundle for write)
+  			if (!ud->ah) {
+  				kfree(ud);
+  				ret = -EINVAL;
+@@@ -2508,10 -2465,9 +2834,16 @@@ err
+  	return ERR_PTR(ret);
+  }
+  
+++<<<<<<< HEAD
+ +ssize_t ib_uverbs_post_recv(struct ib_uverbs_file *file,
+ +			    struct ib_device *ib_dev,
+ +			    const char __user *buf, int in_len,
+ +			    int out_len)
+++=======
++ static ssize_t ib_uverbs_post_recv(struct uverbs_attr_bundle *attrs,
++ 				   const char __user *buf, int in_len,
++ 				   int out_len)
+++>>>>>>> 8313c10fa8be (RDMA/uverbs: Replace ib_uverbs_file with uverbs_attr_bundle for write)
+  {
+  	struct ib_uverbs_post_recv      cmd;
+  	struct ib_uverbs_post_recv_resp resp;
+@@@ -2528,7 -2485,7 +2860,11 @@@
+  	if (IS_ERR(wr))
+  		return PTR_ERR(wr);
+  
+++<<<<<<< HEAD
+ +	qp = uobj_get_obj_read(qp, UVERBS_OBJECT_QP, cmd.qp_handle, file->ucontext);
+++=======
++ 	qp = uobj_get_obj_read(qp, UVERBS_OBJECT_QP, cmd.qp_handle, attrs);
+++>>>>>>> 8313c10fa8be (RDMA/uverbs: Replace ib_uverbs_file with uverbs_attr_bundle for write)
+  	if (!qp)
+  		goto out;
+  
+@@@ -2557,10 -2514,9 +2893,16 @@@ out
+  	return ret ? ret : in_len;
+  }
+  
+++<<<<<<< HEAD
+ +ssize_t ib_uverbs_post_srq_recv(struct ib_uverbs_file *file,
+ +				struct ib_device *ib_dev,
+ +				const char __user *buf, int in_len,
+ +				int out_len)
+++=======
++ static ssize_t ib_uverbs_post_srq_recv(struct uverbs_attr_bundle *attrs,
++ 				       const char __user *buf, int in_len,
++ 				       int out_len)
+++>>>>>>> 8313c10fa8be (RDMA/uverbs: Replace ib_uverbs_file with uverbs_attr_bundle for write)
+  {
+  	struct ib_uverbs_post_srq_recv      cmd;
+  	struct ib_uverbs_post_srq_recv_resp resp;
+@@@ -2577,7 -2534,7 +2919,11 @@@
+  	if (IS_ERR(wr))
+  		return PTR_ERR(wr);
+  
+++<<<<<<< HEAD
+ +	srq = uobj_get_obj_read(srq, UVERBS_OBJECT_SRQ, cmd.srq_handle, file->ucontext);
+++=======
++ 	srq = uobj_get_obj_read(srq, UVERBS_OBJECT_SRQ, cmd.srq_handle, attrs);
+++>>>>>>> 8313c10fa8be (RDMA/uverbs: Replace ib_uverbs_file with uverbs_attr_bundle for write)
+  	if (!srq)
+  		goto out;
+  
+@@@ -2607,10 -2563,9 +2953,16 @@@ out
+  	return ret ? ret : in_len;
+  }
+  
+++<<<<<<< HEAD
+ +ssize_t ib_uverbs_create_ah(struct ib_uverbs_file *file,
+ +			    struct ib_device *ib_dev,
+ +			    const char __user *buf, int in_len,
+ +			    int out_len)
+++=======
++ static ssize_t ib_uverbs_create_ah(struct uverbs_attr_bundle *attrs,
++ 				   const char __user *buf, int in_len,
++ 				   int out_len)
+++>>>>>>> 8313c10fa8be (RDMA/uverbs: Replace ib_uverbs_file with uverbs_attr_bundle for write)
+  {
+  	struct ib_uverbs_create_ah	 cmd;
+  	struct ib_uverbs_create_ah_resp	 resp;
+@@@ -2635,11 -2588,16 +2987,24 @@@
+  		   in_len - sizeof(cmd) - sizeof(struct ib_uverbs_cmd_hdr),
+  		   out_len - sizeof(resp));
+  
+++<<<<<<< HEAD
+ +	uobj  = uobj_alloc(UVERBS_OBJECT_AH, file->ucontext);
+ +	if (IS_ERR(uobj))
+ +		return PTR_ERR(uobj);
+ +
+ +	pd = uobj_get_obj_read(pd, UVERBS_OBJECT_PD, cmd.pd_handle, file->ucontext);
+++=======
++ 	uobj = uobj_alloc(UVERBS_OBJECT_AH, attrs, &ib_dev);
++ 	if (IS_ERR(uobj))
++ 		return PTR_ERR(uobj);
++ 
++ 	if (!rdma_is_port_valid(ib_dev, cmd.attr.port_num)) {
++ 		ret = -EINVAL;
++ 		goto err;
++ 	}
++ 
++ 	pd = uobj_get_obj_read(pd, UVERBS_OBJECT_PD, cmd.pd_handle, attrs);
+++>>>>>>> 8313c10fa8be (RDMA/uverbs: Replace ib_uverbs_file with uverbs_attr_bundle for write)
+  	if (!pd) {
+  		ret = -EINVAL;
+  		goto err;
+@@@ -2696,9 -2652,9 +3061,15 @@@ err
+  	return ret;
+  }
+  
+++<<<<<<< HEAD
+ +ssize_t ib_uverbs_destroy_ah(struct ib_uverbs_file *file,
+ +			     struct ib_device *ib_dev,
+ +			     const char __user *buf, int in_len, int out_len)
+++=======
++ static ssize_t ib_uverbs_destroy_ah(struct uverbs_attr_bundle *attrs,
++ 				    const char __user *buf, int in_len,
++ 				    int out_len)
+++>>>>>>> 8313c10fa8be (RDMA/uverbs: Replace ib_uverbs_file with uverbs_attr_bundle for write)
+  {
+  	struct ib_uverbs_destroy_ah cmd;
+  
+@@@ -2709,10 -2665,9 +3080,16 @@@
+  				    in_len);
+  }
+  
+++<<<<<<< HEAD
+ +ssize_t ib_uverbs_attach_mcast(struct ib_uverbs_file *file,
+ +			       struct ib_device *ib_dev,
+ +			       const char __user *buf, int in_len,
+ +			       int out_len)
+++=======
++ static ssize_t ib_uverbs_attach_mcast(struct uverbs_attr_bundle *attrs,
++ 				      const char __user *buf, int in_len,
++ 				      int out_len)
+++>>>>>>> 8313c10fa8be (RDMA/uverbs: Replace ib_uverbs_file with uverbs_attr_bundle for write)
+  {
+  	struct ib_uverbs_attach_mcast cmd;
+  	struct ib_qp                 *qp;
+@@@ -2723,7 -2678,7 +3100,11 @@@
+  	if (copy_from_user(&cmd, buf, sizeof cmd))
+  		return -EFAULT;
+  
+++<<<<<<< HEAD
+ +	qp = uobj_get_obj_read(qp, UVERBS_OBJECT_QP, cmd.qp_handle, file->ucontext);
+++=======
++ 	qp = uobj_get_obj_read(qp, UVERBS_OBJECT_QP, cmd.qp_handle, attrs);
+++>>>>>>> 8313c10fa8be (RDMA/uverbs: Replace ib_uverbs_file with uverbs_attr_bundle for write)
+  	if (!qp)
+  		return -EINVAL;
+  
+@@@ -2759,10 -2714,9 +3140,16 @@@ out_put
+  	return ret ? ret : in_len;
+  }
+  
+++<<<<<<< HEAD
+ +ssize_t ib_uverbs_detach_mcast(struct ib_uverbs_file *file,
+ +			       struct ib_device *ib_dev,
+ +			       const char __user *buf, int in_len,
+ +			       int out_len)
+++=======
++ static ssize_t ib_uverbs_detach_mcast(struct uverbs_attr_bundle *attrs,
++ 				      const char __user *buf, int in_len,
++ 				      int out_len)
+++>>>>>>> 8313c10fa8be (RDMA/uverbs: Replace ib_uverbs_file with uverbs_attr_bundle for write)
+  {
+  	struct ib_uverbs_detach_mcast cmd;
+  	struct ib_uqp_object         *obj;
+@@@ -2774,7 -2728,7 +3161,11 @@@
+  	if (copy_from_user(&cmd, buf, sizeof cmd))
+  		return -EFAULT;
+  
+++<<<<<<< HEAD
+ +	qp = uobj_get_obj_read(qp, UVERBS_OBJECT_QP, cmd.qp_handle, file->ucontext);
+++=======
++ 	qp = uobj_get_obj_read(qp, UVERBS_OBJECT_QP, cmd.qp_handle, attrs);
+++>>>>>>> 8313c10fa8be (RDMA/uverbs: Replace ib_uverbs_file with uverbs_attr_bundle for write)
+  	if (!qp)
+  		return -EINVAL;
+  
+@@@ -2884,8 -2831,9 +3275,12 @@@ static void flow_resources_add(struct i
+  
+  	uflow_res->num++;
+  }
+ -EXPORT_SYMBOL(flow_resources_add);
+  
+++<<<<<<< HEAD
+ +static int kern_spec_to_ib_spec_action(struct ib_ucontext *ucontext,
+++=======
++ static int kern_spec_to_ib_spec_action(const struct uverbs_attr_bundle *attrs,
+++>>>>>>> 8313c10fa8be (RDMA/uverbs: Replace ib_uverbs_file with uverbs_attr_bundle for write)
+  				       struct ib_uverbs_flow_spec *kern_spec,
+  				       union ib_flow_spec *ib_spec,
+  				       struct ib_uflow_resources *uflow_res)
+@@@ -2914,7 -2862,7 +3309,11 @@@
+  		ib_spec->action.act = uobj_get_obj_read(flow_action,
+  							UVERBS_OBJECT_FLOW_ACTION,
+  							kern_spec->action.handle,
+++<<<<<<< HEAD
+ +							ucontext);
+++=======
++ 							attrs);
+++>>>>>>> 8313c10fa8be (RDMA/uverbs: Replace ib_uverbs_file with uverbs_attr_bundle for write)
+  		if (!ib_spec->action.act)
+  			return -EINVAL;
+  		ib_spec->action.size =
+@@@ -2932,7 -2880,7 +3331,11 @@@
+  			uobj_get_obj_read(counters,
+  					  UVERBS_OBJECT_COUNTERS,
+  					  kern_spec->flow_count.handle,
+++<<<<<<< HEAD
+ +					  ucontext);
+++=======
++ 					  attrs);
+++>>>>>>> 8313c10fa8be (RDMA/uverbs: Replace ib_uverbs_file with uverbs_attr_bundle for write)
+  		if (!ib_spec->flow_count.counters)
+  			return -EINVAL;
+  		ib_spec->flow_count.size =
+@@@ -3113,7 -3061,7 +3516,11 @@@ static int kern_spec_to_ib_spec_filter(
+  						     kern_filter_sz, ib_spec);
+  }
+  
+++<<<<<<< HEAD
+ +static int kern_spec_to_ib_spec(struct ib_ucontext *ucontext,
+++=======
++ static int kern_spec_to_ib_spec(struct uverbs_attr_bundle *attrs,
+++>>>>>>> 8313c10fa8be (RDMA/uverbs: Replace ib_uverbs_file with uverbs_attr_bundle for write)
+  				struct ib_uverbs_flow_spec *kern_spec,
+  				union ib_flow_spec *ib_spec,
+  				struct ib_uflow_resources *uflow_res)
+@@@ -3122,16 -3070,14 +3529,25 @@@
+  		return -EINVAL;
+  
+  	if (kern_spec->type >= IB_FLOW_SPEC_ACTION_TAG)
+++<<<<<<< HEAD
+ +		return kern_spec_to_ib_spec_action(ucontext, kern_spec, ib_spec,
+++=======
++ 		return kern_spec_to_ib_spec_action(attrs, kern_spec, ib_spec,
+++>>>>>>> 8313c10fa8be (RDMA/uverbs: Replace ib_uverbs_file with uverbs_attr_bundle for write)
+  						   uflow_res);
+  	else
+  		return kern_spec_to_ib_spec_filter(kern_spec, ib_spec);
+  }
+  
+++<<<<<<< HEAD
+ +int ib_uverbs_ex_create_wq(struct ib_uverbs_file *file,
+ +			   struct ib_device *ib_dev,
+ +			   struct ib_udata *ucore,
+ +			   struct ib_udata *uhw)
+++=======
++ static int ib_uverbs_ex_create_wq(struct uverbs_attr_bundle *attrs,
++ 				  struct ib_udata *ucore, struct ib_udata *uhw)
+++>>>>>>> 8313c10fa8be (RDMA/uverbs: Replace ib_uverbs_file with uverbs_attr_bundle for write)
+  {
+  	struct ib_uverbs_ex_create_wq	  cmd = {};
+  	struct ib_uverbs_ex_create_wq_resp resp = {};
+@@@ -3165,18 -3112,18 +3581,31 @@@
+  	if (cmd.comp_mask)
+  		return -EOPNOTSUPP;
+  
+++<<<<<<< HEAD
+ +	obj  = (struct ib_uwq_object *)uobj_alloc(UVERBS_OBJECT_WQ,
+ +						  file->ucontext);
+ +	if (IS_ERR(obj))
+ +		return PTR_ERR(obj);
+ +
+ +	pd  = uobj_get_obj_read(pd, UVERBS_OBJECT_PD, cmd.pd_handle, file->ucontext);
+++=======
++ 	obj = (struct ib_uwq_object *)uobj_alloc(UVERBS_OBJECT_WQ, attrs,
++ 						 &ib_dev);
++ 	if (IS_ERR(obj))
++ 		return PTR_ERR(obj);
++ 
++ 	pd = uobj_get_obj_read(pd, UVERBS_OBJECT_PD, cmd.pd_handle, attrs);
+++>>>>>>> 8313c10fa8be (RDMA/uverbs: Replace ib_uverbs_file with uverbs_attr_bundle for write)
+  	if (!pd) {
+  		err = -EINVAL;
+  		goto err_uobj;
+  	}
+  
+++<<<<<<< HEAD
+ +	cq = uobj_get_obj_read(cq, UVERBS_OBJECT_CQ, cmd.cq_handle, file->ucontext);
+++=======
++ 	cq = uobj_get_obj_read(cq, UVERBS_OBJECT_CQ, cmd.cq_handle, attrs);
+++>>>>>>> 8313c10fa8be (RDMA/uverbs: Replace ib_uverbs_file with uverbs_attr_bundle for write)
+  	if (!cq) {
+  		err = -EINVAL;
+  		goto err_put_pd;
+@@@ -3245,10 -3187,8 +3674,15 @@@ err_uobj
+  	return err;
+  }
+  
+++<<<<<<< HEAD
+ +int ib_uverbs_ex_destroy_wq(struct ib_uverbs_file *file,
+ +			    struct ib_device *ib_dev,
+ +			    struct ib_udata *ucore,
+ +			    struct ib_udata *uhw)
+++=======
++ static int ib_uverbs_ex_destroy_wq(struct uverbs_attr_bundle *attrs,
++ 				   struct ib_udata *ucore, struct ib_udata *uhw)
+++>>>>>>> 8313c10fa8be (RDMA/uverbs: Replace ib_uverbs_file with uverbs_attr_bundle for write)
+  {
+  	struct ib_uverbs_ex_destroy_wq	cmd = {};
+  	struct ib_uverbs_ex_destroy_wq_resp	resp = {};
+@@@ -3280,8 -3220,7 +3714,12 @@@
+  		return -EOPNOTSUPP;
+  
+  	resp.response_length = required_resp_len;
+++<<<<<<< HEAD
+ +	uobj  = uobj_get_write(UVERBS_OBJECT_WQ, cmd.wq_handle,
+ +			       file->ucontext);
+++=======
++ 	uobj = uobj_get_destroy(UVERBS_OBJECT_WQ, cmd.wq_handle, attrs);
+++>>>>>>> 8313c10fa8be (RDMA/uverbs: Replace ib_uverbs_file with uverbs_attr_bundle for write)
+  	if (IS_ERR(uobj))
+  		return PTR_ERR(uobj);
+  
+@@@ -3301,10 -3232,8 +3739,15 @@@
+  	return ib_copy_to_udata(ucore, &resp, resp.response_length);
+  }
+  
+++<<<<<<< HEAD
+ +int ib_uverbs_ex_modify_wq(struct ib_uverbs_file *file,
+ +			   struct ib_device *ib_dev,
+ +			   struct ib_udata *ucore,
+ +			   struct ib_udata *uhw)
+++=======
++ static int ib_uverbs_ex_modify_wq(struct uverbs_attr_bundle *attrs,
++ 				  struct ib_udata *ucore, struct ib_udata *uhw)
+++>>>>>>> 8313c10fa8be (RDMA/uverbs: Replace ib_uverbs_file with uverbs_attr_bundle for write)
+  {
+  	struct ib_uverbs_ex_modify_wq cmd = {};
+  	struct ib_wq *wq;
+@@@ -3331,7 -3260,7 +3774,11 @@@
+  	if (cmd.attr_mask > (IB_WQ_STATE | IB_WQ_CUR_STATE | IB_WQ_FLAGS))
+  		return -EINVAL;
+  
+++<<<<<<< HEAD
+ +	wq = uobj_get_obj_read(wq, UVERBS_OBJECT_WQ, cmd.wq_handle, file->ucontext);
+++=======
++ 	wq = uobj_get_obj_read(wq, UVERBS_OBJECT_WQ, cmd.wq_handle, attrs);
+++>>>>>>> 8313c10fa8be (RDMA/uverbs: Replace ib_uverbs_file with uverbs_attr_bundle for write)
+  	if (!wq)
+  		return -EINVAL;
+  
+@@@ -3351,10 -3275,9 +3798,16 @@@ out
+  	return ret;
+  }
+  
+++<<<<<<< HEAD
+ +int ib_uverbs_ex_create_rwq_ind_table(struct ib_uverbs_file *file,
+ +				      struct ib_device *ib_dev,
+ +				      struct ib_udata *ucore,
+ +				      struct ib_udata *uhw)
+++=======
++ static int ib_uverbs_ex_create_rwq_ind_table(struct uverbs_attr_bundle *attrs,
++ 					     struct ib_udata *ucore,
++ 					     struct ib_udata *uhw)
+++>>>>>>> 8313c10fa8be (RDMA/uverbs: Replace ib_uverbs_file with uverbs_attr_bundle for write)
+  {
+  	struct ib_uverbs_ex_create_rwq_ind_table	  cmd = {};
+  	struct ib_uverbs_ex_create_rwq_ind_table_resp  resp = {};
+@@@ -3425,8 -3349,8 +3878,13 @@@
+  
+  	for (num_read_wqs = 0; num_read_wqs < num_wq_handles;
+  			num_read_wqs++) {
+++<<<<<<< HEAD
+ +		wq = uobj_get_obj_read(wq, UVERBS_OBJECT_WQ, wqs_handles[num_read_wqs],
+ +				       file->ucontext);
+++=======
++ 		wq = uobj_get_obj_read(wq, UVERBS_OBJECT_WQ,
++ 				       wqs_handles[num_read_wqs], attrs);
+++>>>>>>> 8313c10fa8be (RDMA/uverbs: Replace ib_uverbs_file with uverbs_attr_bundle for write)
+  		if (!wq) {
+  			err = -EINVAL;
+  			goto put_wqs;
+@@@ -3435,7 -3359,7 +3893,11 @@@
+  		wqs[num_read_wqs] = wq;
+  	}
+  
+++<<<<<<< HEAD
+ +	uobj  = uobj_alloc(UVERBS_OBJECT_RWQ_IND_TBL, file->ucontext);
+++=======
++ 	uobj = uobj_alloc(UVERBS_OBJECT_RWQ_IND_TBL, attrs, &ib_dev);
+++>>>>>>> 8313c10fa8be (RDMA/uverbs: Replace ib_uverbs_file with uverbs_attr_bundle for write)
+  	if (IS_ERR(uobj)) {
+  		err = PTR_ERR(uobj);
+  		goto put_wqs;
+@@@ -3495,10 -3414,9 +3957,16 @@@ err_free
+  	return err;
+  }
+  
+++<<<<<<< HEAD
+ +int ib_uverbs_ex_destroy_rwq_ind_table(struct ib_uverbs_file *file,
+ +				       struct ib_device *ib_dev,
+ +				       struct ib_udata *ucore,
+ +				       struct ib_udata *uhw)
+++=======
++ static int ib_uverbs_ex_destroy_rwq_ind_table(struct uverbs_attr_bundle *attrs,
++ 					      struct ib_udata *ucore,
++ 					      struct ib_udata *uhw)
+++>>>>>>> 8313c10fa8be (RDMA/uverbs: Replace ib_uverbs_file with uverbs_attr_bundle for write)
+  {
+  	struct ib_uverbs_ex_destroy_rwq_ind_table	cmd = {};
+  	int			ret;
+@@@ -3522,13 -3440,12 +3990,19 @@@
+  		return -EOPNOTSUPP;
+  
+  	return uobj_perform_destroy(UVERBS_OBJECT_RWQ_IND_TBL,
+- 				    cmd.ind_tbl_handle, file, 0);
++ 				    cmd.ind_tbl_handle, attrs, 0);
+  }
+  
+++<<<<<<< HEAD
+ +int ib_uverbs_ex_create_flow(struct ib_uverbs_file *file,
+ +			     struct ib_device *ib_dev,
+ +			     struct ib_udata *ucore,
+ +			     struct ib_udata *uhw)
+++=======
++ static int ib_uverbs_ex_create_flow(struct uverbs_attr_bundle *attrs,
++ 				    struct ib_udata *ucore,
++ 				    struct ib_udata *uhw)
+++>>>>>>> 8313c10fa8be (RDMA/uverbs: Replace ib_uverbs_file with uverbs_attr_bundle for write)
+  {
+  	struct ib_uverbs_create_flow	  cmd;
+  	struct ib_uverbs_create_flow_resp resp;
+@@@ -3598,13 -3515,13 +4072,21 @@@
+  		kern_flow_attr = &cmd.flow_attr;
+  	}
+  
+++<<<<<<< HEAD
+ +	uobj  = uobj_alloc(UVERBS_OBJECT_FLOW, file->ucontext);
+++=======
++ 	uobj = uobj_alloc(UVERBS_OBJECT_FLOW, attrs, &ib_dev);
+++>>>>>>> 8313c10fa8be (RDMA/uverbs: Replace ib_uverbs_file with uverbs_attr_bundle for write)
+  	if (IS_ERR(uobj)) {
+  		err = PTR_ERR(uobj);
+  		goto err_free_attr;
+  	}
+  
+++<<<<<<< HEAD
+ +	qp = uobj_get_obj_read(qp, UVERBS_OBJECT_QP, cmd.qp_handle, file->ucontext);
+++=======
++ 	qp = uobj_get_obj_read(qp, UVERBS_OBJECT_QP, cmd.qp_handle, attrs);
+++>>>>>>> 8313c10fa8be (RDMA/uverbs: Replace ib_uverbs_file with uverbs_attr_bundle for write)
+  	if (!qp) {
+  		err = -EINVAL;
+  		goto err_uobj;
+@@@ -3641,7 -3558,7 +4123,11 @@@
+  			cmd.flow_attr.size >= kern_spec->size;
+  	     i++) {
+  		err = kern_spec_to_ib_spec(
+++<<<<<<< HEAD
+ +				file->ucontext, (struct ib_uverbs_flow_spec *)kern_spec,
+++=======
++ 				attrs, (struct ib_uverbs_flow_spec *)kern_spec,
+++>>>>>>> 8313c10fa8be (RDMA/uverbs: Replace ib_uverbs_file with uverbs_attr_bundle for write)
+  				ib_spec, uflow_res);
+  		if (err)
+  			goto err_free;
+@@@ -3705,10 -3616,9 +4191,16 @@@ err_free_attr
+  	return err;
+  }
+  
+++<<<<<<< HEAD
+ +int ib_uverbs_ex_destroy_flow(struct ib_uverbs_file *file,
+ +			      struct ib_device *ib_dev,
+ +			      struct ib_udata *ucore,
+ +			      struct ib_udata *uhw)
+++=======
++ static int ib_uverbs_ex_destroy_flow(struct uverbs_attr_bundle *attrs,
++ 				     struct ib_udata *ucore,
++ 				     struct ib_udata *uhw)
+++>>>>>>> 8313c10fa8be (RDMA/uverbs: Replace ib_uverbs_file with uverbs_attr_bundle for write)
+  {
+  	struct ib_uverbs_destroy_flow	cmd;
+  	int				ret;
+@@@ -3727,8 -3637,7 +4219,12 @@@
+  				    0);
+  }
+  
+++<<<<<<< HEAD
+ +static int __uverbs_create_xsrq(struct ib_uverbs_file *file,
+ +				struct ib_device *ib_dev,
+++=======
++ static int __uverbs_create_xsrq(struct uverbs_attr_bundle *attrs,
+++>>>>>>> 8313c10fa8be (RDMA/uverbs: Replace ib_uverbs_file with uverbs_attr_bundle for write)
+  				struct ib_uverbs_create_xsrq *cmd,
+  				struct ib_udata *udata)
+  {
+@@@ -3739,9 -3648,10 +4235,14 @@@
+  	struct ib_uobject               *uninitialized_var(xrcd_uobj);
+  	struct ib_srq_init_attr          attr;
+  	int ret;
+ -	struct ib_device *ib_dev;
+  
+++<<<<<<< HEAD
+ +	obj  = (struct ib_usrq_object *)uobj_alloc(UVERBS_OBJECT_SRQ,
+ +						   file->ucontext);
+++=======
++ 	obj = (struct ib_usrq_object *)uobj_alloc(UVERBS_OBJECT_SRQ, attrs,
++ 						  &ib_dev);
+++>>>>>>> 8313c10fa8be (RDMA/uverbs: Replace ib_uverbs_file with uverbs_attr_bundle for write)
+  	if (IS_ERR(obj))
+  		return PTR_ERR(obj);
+  
+@@@ -3750,7 -3660,7 +4251,11 @@@
+  
+  	if (cmd->srq_type == IB_SRQT_XRC) {
+  		xrcd_uobj = uobj_get_read(UVERBS_OBJECT_XRCD, cmd->xrcd_handle,
+++<<<<<<< HEAD
+ +					  file->ucontext);
+++=======
++ 					  attrs);
+++>>>>>>> 8313c10fa8be (RDMA/uverbs: Replace ib_uverbs_file with uverbs_attr_bundle for write)
+  		if (IS_ERR(xrcd_uobj)) {
+  			ret = -EINVAL;
+  			goto err;
+@@@ -3767,15 -3677,15 +4272,24 @@@
+  	}
+  
+  	if (ib_srq_has_cq(cmd->srq_type)) {
+++<<<<<<< HEAD
+ +		attr.ext.cq  = uobj_get_obj_read(cq, UVERBS_OBJECT_CQ, cmd->cq_handle,
+ +						 file->ucontext);
+++=======
++ 		attr.ext.cq = uobj_get_obj_read(cq, UVERBS_OBJECT_CQ,
++ 						cmd->cq_handle, attrs);
+++>>>>>>> 8313c10fa8be (RDMA/uverbs: Replace ib_uverbs_file with uverbs_attr_bundle for write)
+  		if (!attr.ext.cq) {
+  			ret = -EINVAL;
+  			goto err_put_xrcd;
+  		}
+  	}
+  
+++<<<<<<< HEAD
+ +	pd  = uobj_get_obj_read(pd, UVERBS_OBJECT_PD, cmd->pd_handle, file->ucontext);
+++=======
++ 	pd = uobj_get_obj_read(pd, UVERBS_OBJECT_PD, cmd->pd_handle, attrs);
+++>>>>>>> 8313c10fa8be (RDMA/uverbs: Replace ib_uverbs_file with uverbs_attr_bundle for write)
+  	if (!pd) {
+  		ret = -EINVAL;
+  		goto err_put_cq;
+@@@ -3865,10 -3773,9 +4379,16 @@@ err
+  	return ret;
+  }
+  
+++<<<<<<< HEAD
+ +ssize_t ib_uverbs_create_srq(struct ib_uverbs_file *file,
+ +			     struct ib_device *ib_dev,
+ +			     const char __user *buf, int in_len,
+ +			     int out_len)
+++=======
++ static ssize_t ib_uverbs_create_srq(struct uverbs_attr_bundle *attrs,
++ 				    const char __user *buf, int in_len,
++ 				    int out_len)
+++>>>>>>> 8313c10fa8be (RDMA/uverbs: Replace ib_uverbs_file with uverbs_attr_bundle for write)
+  {
+  	struct ib_uverbs_create_srq      cmd;
+  	struct ib_uverbs_create_xsrq     xcmd;
+@@@ -3896,16 -3803,16 +4416,26 @@@
+  		   in_len - sizeof(cmd) - sizeof(struct ib_uverbs_cmd_hdr),
+  		   out_len - sizeof(resp));
+  
+++<<<<<<< HEAD
+ +	ret = __uverbs_create_xsrq(file, ib_dev, &xcmd, &udata);
+++=======
++ 	ret = __uverbs_create_xsrq(attrs, &xcmd, &udata);
+++>>>>>>> 8313c10fa8be (RDMA/uverbs: Replace ib_uverbs_file with uverbs_attr_bundle for write)
+  	if (ret)
+  		return ret;
+  
+  	return in_len;
+  }
+  
+++<<<<<<< HEAD
+ +ssize_t ib_uverbs_create_xsrq(struct ib_uverbs_file *file,
+ +			      struct ib_device *ib_dev,
+ +			      const char __user *buf, int in_len, int out_len)
+++=======
++ static ssize_t ib_uverbs_create_xsrq(struct uverbs_attr_bundle *attrs,
++ 				     const char __user *buf, int in_len,
++ 				     int out_len)
+++>>>>>>> 8313c10fa8be (RDMA/uverbs: Replace ib_uverbs_file with uverbs_attr_bundle for write)
+  {
+  	struct ib_uverbs_create_xsrq     cmd;
+  	struct ib_uverbs_create_srq_resp resp;
+@@@ -3923,17 -3830,16 +4453,27 @@@
+  		   in_len - sizeof(cmd) - sizeof(struct ib_uverbs_cmd_hdr),
+  		   out_len - sizeof(resp));
+  
+++<<<<<<< HEAD
+ +	ret = __uverbs_create_xsrq(file, ib_dev, &cmd, &udata);
+++=======
++ 	ret = __uverbs_create_xsrq(attrs, &cmd, &udata);
+++>>>>>>> 8313c10fa8be (RDMA/uverbs: Replace ib_uverbs_file with uverbs_attr_bundle for write)
+  	if (ret)
+  		return ret;
+  
+  	return in_len;
+  }
+  
+++<<<<<<< HEAD
+ +ssize_t ib_uverbs_modify_srq(struct ib_uverbs_file *file,
+ +			     struct ib_device *ib_dev,
+ +			     const char __user *buf, int in_len,
+ +			     int out_len)
+++=======
++ static ssize_t ib_uverbs_modify_srq(struct uverbs_attr_bundle *attrs,
++ 				    const char __user *buf, int in_len,
++ 				    int out_len)
+++>>>>>>> 8313c10fa8be (RDMA/uverbs: Replace ib_uverbs_file with uverbs_attr_bundle for write)
+  {
+  	struct ib_uverbs_modify_srq cmd;
+  	struct ib_udata             udata;
+@@@ -3947,7 -3853,7 +4487,11 @@@
+  	ib_uverbs_init_udata(&udata, buf + sizeof cmd, NULL, in_len - sizeof cmd,
+  		   out_len);
+  
+++<<<<<<< HEAD
+ +	srq = uobj_get_obj_read(srq, UVERBS_OBJECT_SRQ, cmd.srq_handle, file->ucontext);
+++=======
++ 	srq = uobj_get_obj_read(srq, UVERBS_OBJECT_SRQ, cmd.srq_handle, attrs);
+++>>>>>>> 8313c10fa8be (RDMA/uverbs: Replace ib_uverbs_file with uverbs_attr_bundle for write)
+  	if (!srq)
+  		return -EINVAL;
+  
+@@@ -3961,10 -3867,9 +4505,16 @@@
+  	return ret ? ret : in_len;
+  }
+  
+++<<<<<<< HEAD
+ +ssize_t ib_uverbs_query_srq(struct ib_uverbs_file *file,
+ +			    struct ib_device *ib_dev,
+ +			    const char __user *buf,
+ +			    int in_len, int out_len)
+++=======
++ static ssize_t ib_uverbs_query_srq(struct uverbs_attr_bundle *attrs,
++ 				   const char __user *buf, int in_len,
++ 				   int out_len)
+++>>>>>>> 8313c10fa8be (RDMA/uverbs: Replace ib_uverbs_file with uverbs_attr_bundle for write)
+  {
+  	struct ib_uverbs_query_srq      cmd;
+  	struct ib_uverbs_query_srq_resp resp;
+@@@ -3978,7 -3883,7 +4528,11 @@@
+  	if (copy_from_user(&cmd, buf, sizeof cmd))
+  		return -EFAULT;
+  
+++<<<<<<< HEAD
+ +	srq = uobj_get_obj_read(srq, UVERBS_OBJECT_SRQ, cmd.srq_handle, file->ucontext);
+++=======
++ 	srq = uobj_get_obj_read(srq, UVERBS_OBJECT_SRQ, cmd.srq_handle, attrs);
+++>>>>>>> 8313c10fa8be (RDMA/uverbs: Replace ib_uverbs_file with uverbs_attr_bundle for write)
+  	if (!srq)
+  		return -EINVAL;
+  
+@@@ -4001,10 -3906,9 +4555,16 @@@
+  	return in_len;
+  }
+  
+++<<<<<<< HEAD
+ +ssize_t ib_uverbs_destroy_srq(struct ib_uverbs_file *file,
+ +			      struct ib_device *ib_dev,
+ +			      const char __user *buf, int in_len,
+ +			      int out_len)
+++=======
++ static ssize_t ib_uverbs_destroy_srq(struct uverbs_attr_bundle *attrs,
++ 				     const char __user *buf, int in_len,
++ 				     int out_len)
+++>>>>>>> 8313c10fa8be (RDMA/uverbs: Replace ib_uverbs_file with uverbs_attr_bundle for write)
+  {
+  	struct ib_uverbs_destroy_srq      cmd;
+  	struct ib_uverbs_destroy_srq_resp resp;
+@@@ -4015,8 -3918,7 +4575,12 @@@
+  	if (copy_from_user(&cmd, buf, sizeof cmd))
+  		return -EFAULT;
+  
+++<<<<<<< HEAD
+ +	uobj  = uobj_get_write(UVERBS_OBJECT_SRQ, cmd.srq_handle,
+ +			       file->ucontext);
+++=======
++ 	uobj = uobj_get_destroy(UVERBS_OBJECT_SRQ, cmd.srq_handle, attrs);
+++>>>>>>> 8313c10fa8be (RDMA/uverbs: Replace ib_uverbs_file with uverbs_attr_bundle for write)
+  	if (IS_ERR(uobj))
+  		return PTR_ERR(uobj);
+  
+@@@ -4042,18 -3934,21 +4606,31 @@@
+  	return in_len;
+  }
+  
+++<<<<<<< HEAD
+ +int ib_uverbs_ex_query_device(struct ib_uverbs_file *file,
+ +			      struct ib_device *ib_dev,
+ +			      struct ib_udata *ucore,
+ +			      struct ib_udata *uhw)
+++=======
++ static int ib_uverbs_ex_query_device(struct uverbs_attr_bundle *attrs,
++ 				     struct ib_udata *ucore,
++ 				     struct ib_udata *uhw)
+++>>>>>>> 8313c10fa8be (RDMA/uverbs: Replace ib_uverbs_file with uverbs_attr_bundle for write)
+  {
+  	struct ib_uverbs_ex_query_device_resp resp = { {0} };
+  	struct ib_uverbs_ex_query_device  cmd;
+  	struct ib_device_attr attr = {0};
+ -	struct ib_ucontext *ucontext;
+ -	struct ib_device *ib_dev;
+  	int err;
+  
+++<<<<<<< HEAD
+ +	if (!ib_dev->query_device)
+ +		return -EOPNOTSUPP;
+++=======
++ 	ucontext = ib_uverbs_get_ucontext(attrs);
++ 	if (IS_ERR(ucontext))
++ 		return PTR_ERR(ucontext);
++ 	ib_dev = ucontext->device;
+++>>>>>>> 8313c10fa8be (RDMA/uverbs: Replace ib_uverbs_file with uverbs_attr_bundle for write)
+  
+  	if (ucore->inlen < sizeof(cmd))
+  		return -EINVAL;
+@@@ -4163,10 -4058,8 +4740,15 @@@ end
+  	return err;
+  }
+  
+++<<<<<<< HEAD
+ +int ib_uverbs_ex_modify_cq(struct ib_uverbs_file *file,
+ +			   struct ib_device *ib_dev,
+ +			   struct ib_udata *ucore,
+ +			   struct ib_udata *uhw)
+++=======
++ static int ib_uverbs_ex_modify_cq(struct uverbs_attr_bundle *attrs,
++ 				  struct ib_udata *ucore, struct ib_udata *uhw)
+++>>>>>>> 8313c10fa8be (RDMA/uverbs: Replace ib_uverbs_file with uverbs_attr_bundle for write)
+  {
+  	struct ib_uverbs_ex_modify_cq cmd = {};
+  	struct ib_cq *cq;
+@@@ -4194,7 -4087,7 +4776,11 @@@
+  	if (cmd.attr_mask > IB_CQ_MODERATE)
+  		return -EOPNOTSUPP;
+  
+++<<<<<<< HEAD
+ +	cq = uobj_get_obj_read(cq, UVERBS_OBJECT_CQ, cmd.cq_handle, file->ucontext);
+++=======
++ 	cq = uobj_get_obj_read(cq, UVERBS_OBJECT_CQ, cmd.cq_handle, attrs);
+++>>>>>>> 8313c10fa8be (RDMA/uverbs: Replace ib_uverbs_file with uverbs_attr_bundle for write)
+  	if (!cq)
+  		return -EINVAL;
+  
+diff --cc drivers/infiniband/core/uverbs_main.c
+index 495189811c27,c5d245133b51..000000000000
+--- a/drivers/infiniband/core/uverbs_main.c
++++ b/drivers/infiniband/core/uverbs_main.c
+@@@ -138,6 -77,30 +138,33 @@@ static int (*uverbs_ex_cmd_table[])(str
+  static void ib_uverbs_add_one(struct ib_device *device);
+  static void ib_uverbs_remove_one(struct ib_device *device, void *client_data);
+  
+++<<<<<<< HEAD
+++=======
++ /*
++  * Must be called with the ufile->device->disassociate_srcu held, and the lock
++  * must be held until use of the ucontext is finished.
++  */
++ struct ib_ucontext *ib_uverbs_get_ucontext_file(struct ib_uverbs_file *ufile)
++ {
++ 	/*
++ 	 * We do not hold the hw_destroy_rwsem lock for this flow, instead
++ 	 * srcu is used. It does not matter if someone races this with
++ 	 * get_context, we get NULL or valid ucontext.
++ 	 */
++ 	struct ib_ucontext *ucontext = smp_load_acquire(&ufile->ucontext);
++ 
++ 	if (!srcu_dereference(ufile->device->ib_dev,
++ 			      &ufile->device->disassociate_srcu))
++ 		return ERR_PTR(-EIO);
++ 
++ 	if (!ucontext)
++ 		return ERR_PTR(-EINVAL);
++ 
++ 	return ucontext;
++ }
++ EXPORT_SYMBOL(ib_uverbs_get_ucontext_file);
++ 
+++>>>>>>> 8313c10fa8be (RDMA/uverbs: Replace ib_uverbs_file with uverbs_attr_bundle for write)
+  int uverbs_dealloc_mw(struct ib_mw *mw)
+  {
+  	struct ib_pd *pd = mw->pd;
+@@@ -713,12 -628,12 +740,16 @@@ static ssize_t ib_uverbs_write(struct f
+  			     size_t count, loff_t *pos)
+  {
+  	struct ib_uverbs_file *file = filp->private_data;
+ -	const struct uverbs_api_write_method *method_elm;
+ -	struct uverbs_api *uapi = file->device->uapi;
+  	struct ib_uverbs_ex_cmd_hdr ex_hdr;
+ +	struct ib_device *ib_dev;
+  	struct ib_uverbs_cmd_hdr hdr;
+++<<<<<<< HEAD
+ +	bool extended;
+++=======
++ 	struct uverbs_attr_bundle bundle;
+++>>>>>>> 8313c10fa8be (RDMA/uverbs: Replace ib_uverbs_file with uverbs_attr_bundle for write)
+  	int srcu_key;
+ +	u32 command;
+  	ssize_t ret;
+  
+  	if (!ib_safe_file_access(filp)) {
+@@@ -773,10 -667,10 +804,17 @@@
+  
+  	buf += sizeof(hdr);
+  
+++<<<<<<< HEAD
+ +	if (!extended) {
+ +		ret = uverbs_cmd_table[command](file, ib_dev, buf,
+ +						hdr.in_words * 4,
+ +						hdr.out_words * 4);
+++=======
++ 	bundle.ufile = file;
++ 	if (!method_elm->is_ex) {
++ 		ret = method_elm->handler(&bundle, buf, hdr.in_words * 4,
++ 					  hdr.out_words * 4);
+++>>>>>>> 8313c10fa8be (RDMA/uverbs: Replace ib_uverbs_file with uverbs_attr_bundle for write)
+  	} else {
+  		struct ib_udata ucore;
+  		struct ib_udata uhw;
+@@@ -793,7 -687,7 +831,11 @@@
+  					ex_hdr.provider_in_words * 8,
+  					ex_hdr.provider_out_words * 8);
+  
+++<<<<<<< HEAD
+ +		ret = uverbs_ex_cmd_table[command](file, ib_dev, &ucore, &uhw);
+++=======
++ 		ret = method_elm->handler_ex(&bundle, &ucore, &uhw);
+++>>>>>>> 8313c10fa8be (RDMA/uverbs: Replace ib_uverbs_file with uverbs_attr_bundle for write)
+  		ret = (ret) ? : count;
+  	}
+  
+@@@ -810,10 -703,9 +852,16 @@@ static int ib_uverbs_mmap(struct file *
+  	int srcu_key;
+  
+  	srcu_key = srcu_read_lock(&file->device->disassociate_srcu);
+++<<<<<<< HEAD
+ +	ib_dev = srcu_dereference(file->device->ib_dev,
+ +				  &file->device->disassociate_srcu);
+ +	if (!ib_dev) {
+ +		ret = -EIO;
+++=======
++ 	ucontext = ib_uverbs_get_ucontext_file(file);
++ 	if (IS_ERR(ucontext)) {
++ 		ret = PTR_ERR(ucontext);
+++>>>>>>> 8313c10fa8be (RDMA/uverbs: Replace ib_uverbs_file with uverbs_attr_bundle for write)
+  		goto out;
+  	}
+  
+diff --cc include/rdma/ib_verbs.h
+index b27ceb4ca59e,0b7269870571..000000000000
+--- a/include/rdma/ib_verbs.h
++++ b/include/rdma/ib_verbs.h
+@@@ -4147,6 -4207,11 +4147,14 @@@ ib_get_vector_affinity(struct ib_devic
+   */
+  void rdma_roce_rescan_device(struct ib_device *ibdev);
+  
+++<<<<<<< HEAD
+++=======
++ struct ib_ucontext *ib_uverbs_get_ucontext_file(struct ib_uverbs_file *ufile);
++ 
++ int uverbs_destroy_def_handler(struct ib_uverbs_file *file,
++ 			       struct uverbs_attr_bundle *attrs);
++ 
+++>>>>>>> 8313c10fa8be (RDMA/uverbs: Replace ib_uverbs_file with uverbs_attr_bundle for write)
+  struct net_device *rdma_alloc_netdev(struct ib_device *device, u8 port_num,
+  				     enum rdma_netdev_t type, const char *name,
+  				     unsigned char name_assign_type,
+diff --cc include/rdma/uverbs_ioctl.h
+index 90a4947ff548,f744691cd9ae..000000000000
+--- a/include/rdma/uverbs_ioctl.h
++++ b/include/rdma/uverbs_ioctl.h
+@@@ -191,137 -338,266 +191,265 @@@ struct uverbs_object_def 
+  	const struct uverbs_method_def * const (*methods)[];
+  };
+  
+ -enum uapi_definition_kind {
+ -	UAPI_DEF_END = 0,
+ -	UAPI_DEF_OBJECT_START,
+ -	UAPI_DEF_WRITE,
+ -	UAPI_DEF_CHAIN_OBJ_TREE,
+ -	UAPI_DEF_CHAIN,
+ -	UAPI_DEF_IS_SUPPORTED_FUNC,
+ -	UAPI_DEF_IS_SUPPORTED_DEV_FN,
+ -};
+ -
+ -enum uapi_definition_scope {
+ -	UAPI_SCOPE_OBJECT = 1,
+ -	UAPI_SCOPE_METHOD = 2,
+ +struct uverbs_object_tree_def {
+ +	size_t					 num_objects;
+ +	const struct uverbs_object_def * const (*objects)[];
+  };
+  
+ +#define UA_FLAGS(_flags)  .flags = _flags
+ +#define __UVERBS_ATTR0(_id, _type, _fld, _attr, ...)              \
+ +	((const struct uverbs_attr_def)				  \
+ +	 {.id = _id, .attr = {{._fld = {.type = _type, _attr, .flags = 0, } }, } })
+ +#define __UVERBS_ATTR1(_id, _type, _fld, _attr, _extra1, ...)      \
+ +	((const struct uverbs_attr_def)				  \
+ +	 {.id = _id, .attr = {{._fld = {.type = _type, _attr, _extra1 } },} })
+ +#define __UVERBS_ATTR2(_id, _type, _fld, _attr, _extra1, _extra2)    \
+ +	((const struct uverbs_attr_def)				  \
+ +	 {.id = _id, .attr = {{._fld = {.type = _type, _attr, _extra1, _extra2 } },} })
+ +#define __UVERBS_ATTR(_id, _type, _fld, _attr, _extra1, _extra2, _n, ...)	\
+ +	__UVERBS_ATTR##_n(_id, _type, _fld, _attr, _extra1, _extra2)
+ +
+++<<<<<<< HEAD
+++=======
++ struct uapi_definition {
++ 	u8 kind;
++ 	u8 scope;
++ 	union {
++ 		struct {
++ 			u16 object_id;
++ 		} object_start;
++ 		struct {
++ 			u8 is_ex;
++ 			u16 command_num;
++ 		} write;
++ 	};
++ 
++ 	union {
++ 		bool (*func_is_supported)(struct ib_device *device);
++ 		ssize_t (*func_write)(struct uverbs_attr_bundle *attrs,
++ 				      const char __user *buf, int in_len,
++ 				      int out_len);
++ 		int (*func_write_ex)(struct uverbs_attr_bundle *attrs,
++ 				     struct ib_udata *ucore,
++ 				     struct ib_udata *uhw);
++ 		const struct uapi_definition *chain;
++ 		const struct uverbs_object_def *chain_obj_tree;
++ 		size_t needs_fn_offset;
++ 	};
++ };
++ 
++ /* Define things connected to object_id */
++ #define DECLARE_UVERBS_OBJECT(_object_id, ...)                                 \
++ 	{                                                                      \
++ 		.kind = UAPI_DEF_OBJECT_START,                                 \
++ 		.object_start = { .object_id = _object_id },                   \
++ 	},                                                                     \
++ 		##__VA_ARGS__
++ 
++ /* Use in a var_args of DECLARE_UVERBS_OBJECT */
++ #define DECLARE_UVERBS_WRITE(_command_num, _func, ...)                         \
++ 	{                                                                      \
++ 		.kind = UAPI_DEF_WRITE,                                        \
++ 		.scope = UAPI_SCOPE_OBJECT,                                    \
++ 		.write = { .is_ex = 0, .command_num = _command_num },          \
++ 		.func_write = _func,                                           \
++ 	},                                                                     \
++ 		##__VA_ARGS__
++ 
++ /* Use in a var_args of DECLARE_UVERBS_OBJECT */
++ #define DECLARE_UVERBS_WRITE_EX(_command_num, _func, ...)                      \
++ 	{                                                                      \
++ 		.kind = UAPI_DEF_WRITE,                                        \
++ 		.scope = UAPI_SCOPE_OBJECT,                                    \
++ 		.write = { .is_ex = 1, .command_num = _command_num },          \
++ 		.func_write_ex = _func,                                        \
++ 	},                                                                     \
++ 		##__VA_ARGS__
++ 
++ /*
++  * Object is only supported if the function pointer named ibdev_fn in struct
++  * ib_device is not NULL.
++  */
++ #define UAPI_DEF_OBJ_NEEDS_FN(ibdev_fn)                                        \
++ 	{                                                                      \
++ 		.kind = UAPI_DEF_IS_SUPPORTED_DEV_FN,                          \
++ 		.scope = UAPI_SCOPE_OBJECT,                                    \
++ 		.needs_fn_offset =                                             \
++ 			offsetof(struct ib_device, ibdev_fn) +                 \
++ 			BUILD_BUG_ON_ZERO(                                     \
++ 				sizeof(((struct ib_device *)0)->ibdev_fn) !=   \
++ 				sizeof(void *)),                               \
++ 	}
++ 
++ /*
++  * Method is only supported if the function pointer named ibdev_fn in struct
++  * ib_device is not NULL.
++  */
++ #define UAPI_DEF_METHOD_NEEDS_FN(ibdev_fn)                                     \
++ 	{                                                                      \
++ 		.kind = UAPI_DEF_IS_SUPPORTED_DEV_FN,                          \
++ 		.scope = UAPI_SCOPE_METHOD,                                    \
++ 		.needs_fn_offset =                                             \
++ 			offsetof(struct ib_device, ibdev_fn) +                 \
++ 			BUILD_BUG_ON_ZERO(                                     \
++ 				sizeof(((struct ib_device *)0)->ibdev_fn) !=   \
++ 				sizeof(void *)),                               \
++ 	}
++ 
++ /* Call a function to determine if the entire object is supported or not */
++ #define UAPI_DEF_IS_OBJ_SUPPORTED(_func)                                       \
++ 	{                                                                      \
++ 		.kind = UAPI_DEF_IS_SUPPORTED_FUNC,                            \
++ 		.scope = UAPI_SCOPE_OBJECT, .func_is_supported = _func,        \
++ 	}
++ 
++ /* Include another struct uapi_definition in this one */
++ #define UAPI_DEF_CHAIN(_def_var)                                               \
++ 	{                                                                      \
++ 		.kind = UAPI_DEF_CHAIN, .chain = _def_var,                     \
++ 	}
++ 
++ /* Temporary until the tree base description is replaced */
++ #define UAPI_DEF_CHAIN_OBJ_TREE(_object_enum, _object_ptr)                     \
++ 	{                                                                      \
++ 		.kind = UAPI_DEF_CHAIN_OBJ_TREE,                               \
++ 		.object_start = { .object_id = _object_enum },                 \
++ 		.chain_obj_tree = _object_ptr,                                 \
++ 	}
++ #define UAPI_DEF_CHAIN_OBJ_TREE_NAMED(_object_enum, ...)                       \
++ 	UAPI_DEF_CHAIN_OBJ_TREE(_object_enum, &UVERBS_OBJECT(_object_enum)),   \
++ 		##__VA_ARGS__
++ 
++ /*
++  * =======================================
++  *	Attribute Specifications
++  * =======================================
++  */
++ 
++ #define UVERBS_ATTR_SIZE(_min_len, _len)			\
++ 	.u.ptr.min_len = _min_len, .u.ptr.len = _len
++ 
++ #define UVERBS_ATTR_NO_DATA() UVERBS_ATTR_SIZE(0, 0)
++ 
++ /*
++  * Specifies a uapi structure that cannot be extended. The user must always
++  * supply the whole structure and nothing more. The structure must be declared
++  * in a header under include/uapi/rdma.
++  */
+++>>>>>>> 8313c10fa8be (RDMA/uverbs: Replace ib_uverbs_file with uverbs_attr_bundle for write)
+  #define UVERBS_ATTR_TYPE(_type)					\
+ -	.u.ptr.min_len = sizeof(_type), .u.ptr.len = sizeof(_type)
+ -/*
+ - * Specifies a uapi structure where the user must provide at least up to
+ - * member 'last'.  Anything after last and up until the end of the structure
+ - * can be non-zero, anything longer than the end of the structure must be
+ - * zero. The structure must be declared in a header under include/uapi/rdma.
+ - */
+ -#define UVERBS_ATTR_STRUCT(_type, _last)                                       \
+ -	.zero_trailing = 1,                                                    \
+ -	UVERBS_ATTR_SIZE(((uintptr_t)(&((_type *)0)->_last + 1)),              \
+ -			 sizeof(_type))
+ -/*
+ - * Specifies at least min_len bytes must be passed in, but the amount can be
+ - * larger, up to the protocol maximum size. No check for zeroing is done.
+ - */
+ -#define UVERBS_ATTR_MIN_SIZE(_min_len) UVERBS_ATTR_SIZE(_min_len, USHRT_MAX)
+ -
+ -/* Must be used in the '...' of any UVERBS_ATTR */
+ -#define UA_ALLOC_AND_COPY .alloc_and_copy = 1
+ -#define UA_MANDATORY .mandatory = 1
+ -#define UA_OPTIONAL .mandatory = 0
+ -
+ -/*
+ - * min_len must be bigger than 0 and _max_len must be smaller than 4095.  Only
+ - * READ\WRITE accesses are supported.
+ - */
+ -#define UVERBS_ATTR_IDRS_ARR(_attr_id, _idr_type, _access, _min_len, _max_len, \
+ -			     ...)                                              \
+ -	(&(const struct uverbs_attr_def){                                      \
+ -		.id = (_attr_id) +                                             \
+ -		      BUILD_BUG_ON_ZERO((_min_len) == 0 ||                     \
+ -					(_max_len) >                           \
+ -						PAGE_SIZE / sizeof(void *) ||  \
+ -					(_min_len) > (_max_len) ||             \
+ -					(_access) == UVERBS_ACCESS_NEW ||      \
+ -					(_access) == UVERBS_ACCESS_DESTROY),   \
+ -		.attr = { .type = UVERBS_ATTR_TYPE_IDRS_ARRAY,                 \
+ -			  .u2.objs_arr.obj_type = _idr_type,                   \
+ -			  .u2.objs_arr.access = _access,                       \
+ -			  .u2.objs_arr.min_len = _min_len,                     \
+ -			  .u2.objs_arr.max_len = _max_len,                     \
+ -			  __VA_ARGS__ } })
+ -
+ -#define UVERBS_ATTR_IDR(_attr_id, _idr_type, _access, ...)                     \
+ -	(&(const struct uverbs_attr_def){                                      \
+ -		.id = _attr_id,                                                \
+ -		.attr = { .type = UVERBS_ATTR_TYPE_IDR,                        \
+ -			  .u.obj.obj_type = _idr_type,                         \
+ -			  .u.obj.access = _access,                             \
+ -			  __VA_ARGS__ } })
+ -
+ -#define UVERBS_ATTR_FD(_attr_id, _fd_type, _access, ...)                       \
+ -	(&(const struct uverbs_attr_def){                                      \
+ -		.id = (_attr_id) +                                             \
+ -		      BUILD_BUG_ON_ZERO((_access) != UVERBS_ACCESS_NEW &&      \
+ -					(_access) != UVERBS_ACCESS_READ),      \
+ -		.attr = { .type = UVERBS_ATTR_TYPE_FD,                         \
+ -			  .u.obj.obj_type = _fd_type,                          \
+ -			  .u.obj.access = _access,                             \
+ -			  __VA_ARGS__ } })
+ -
+ -#define UVERBS_ATTR_PTR_IN(_attr_id, _type, ...)                               \
+ -	(&(const struct uverbs_attr_def){                                      \
+ -		.id = _attr_id,                                                \
+ -		.attr = { .type = UVERBS_ATTR_TYPE_PTR_IN,                     \
+ -			  _type,                                               \
+ -			  __VA_ARGS__ } })
+ -
+ -#define UVERBS_ATTR_PTR_OUT(_attr_id, _type, ...)                              \
+ -	(&(const struct uverbs_attr_def){                                      \
+ -		.id = _attr_id,                                                \
+ -		.attr = { .type = UVERBS_ATTR_TYPE_PTR_OUT,                    \
+ -			  _type,                                               \
+ -			  __VA_ARGS__ } })
+ -
+ -/* _enum_arry should be a 'static const union uverbs_attr_spec[]' */
+ -#define UVERBS_ATTR_ENUM_IN(_attr_id, _enum_arr, ...)                          \
+ -	(&(const struct uverbs_attr_def){                                      \
+ -		.id = _attr_id,                                                \
+ -		.attr = { .type = UVERBS_ATTR_TYPE_ENUM_IN,                    \
+ -			  .u2.enum_def.ids = _enum_arr,                        \
+ -			  .u.enum_def.num_elems = ARRAY_SIZE(_enum_arr),       \
+ -			  __VA_ARGS__ },                                       \
+ -	})
+ -
+ -/* An input value that is a member in the enum _enum_type. */
+ -#define UVERBS_ATTR_CONST_IN(_attr_id, _enum_type, ...)                        \
+ -	UVERBS_ATTR_PTR_IN(                                                    \
+ -		_attr_id,                                                      \
+ -		UVERBS_ATTR_SIZE(                                              \
+ -			sizeof(u64) + BUILD_BUG_ON_ZERO(!sizeof(_enum_type)),  \
+ -			sizeof(u64)),                                          \
+ -		__VA_ARGS__)
+ +	.min_len = sizeof(_type), .len = sizeof(_type)
+ +#define UVERBS_ATTR_STRUCT(_type, _last)			\
+ +	.min_len = ((uintptr_t)(&((_type *)0)->_last + 1)), .len = sizeof(_type)
+ +#define UVERBS_ATTR_SIZE(_min_len, _len)			\
+ +	.min_len = _min_len, .len = _len
+ +#define UVERBS_ATTR_MIN_SIZE(_min_len)				\
+ +	UVERBS_ATTR_SIZE(_min_len, USHRT_MAX)
+  
+  /*
+ - * An input value that is a bitwise combination of values of _enum_type.
+ - * This permits the flag value to be passed as either a u32 or u64, it must
+ - * be retrieved via uverbs_get_flag().
+ + * In new compiler, UVERBS_ATTR could be simplified by declaring it as
+ + * [_id] = {.type = _type, .len = _len, ##__VA_ARGS__}
+ + * But since we support older compilers too, we need the more complex code.
+   */
+ -#define UVERBS_ATTR_FLAGS_IN(_attr_id, _enum_type, ...)                        \
+ -	UVERBS_ATTR_PTR_IN(                                                    \
+ -		_attr_id,                                                      \
+ -		UVERBS_ATTR_SIZE(sizeof(u32) + BUILD_BUG_ON_ZERO(              \
+ -						       !sizeof(_enum_type *)), \
+ -				 sizeof(u64)),                                 \
+ -		__VA_ARGS__)
+ +#define UVERBS_ATTR(_id, _type, _fld, _attr, ...)			\
+ +	__UVERBS_ATTR(_id, _type, _fld, _attr, ##__VA_ARGS__, 2, 1, 0)
+ +#define UVERBS_ATTR_PTR_IN_SZ(_id, _len, ...)				\
+ +	UVERBS_ATTR(_id, UVERBS_ATTR_TYPE_PTR_IN, ptr, _len, ##__VA_ARGS__)
+ +/* If sizeof(_type) <= sizeof(u64), this will be inlined rather than a pointer */
+ +#define UVERBS_ATTR_PTR_IN(_id, _type, ...)				\
+ +	UVERBS_ATTR_PTR_IN_SZ(_id, _type, ##__VA_ARGS__)
+ +#define UVERBS_ATTR_PTR_OUT_SZ(_id, _len, ...)				\
+ +	UVERBS_ATTR(_id, UVERBS_ATTR_TYPE_PTR_OUT, ptr, _len, ##__VA_ARGS__)
+ +#define UVERBS_ATTR_PTR_OUT(_id, _type, ...)				\
+ +	UVERBS_ATTR_PTR_OUT_SZ(_id, _type, ##__VA_ARGS__)
+ +#define UVERBS_ATTR_ENUM_IN(_id, _enum_arr, ...)			\
+ +	UVERBS_ATTR(_id, UVERBS_ATTR_TYPE_ENUM_IN, enum_def,		\
+ +		    .ids = (_enum_arr),					\
+ +		    .num_elems = ARRAY_SIZE(_enum_arr), ##__VA_ARGS__)
+  
+  /*
+ - * This spec is used in order to pass information to the hardware driver in a
+ - * legacy way. Every verb that could get driver specific data should get this
+ - * spec.
+ + * In new compiler, UVERBS_ATTR_IDR (and FD) could be simplified by declaring
+ + * it as
+ + * {.id = _id,								\
+ + *  .attr {.type = __obj_class,						\
+ + *         .obj = {.obj_type = _idr_type,				\
+ + *                       .access = _access                              \
+ + *                }, ##__VA_ARGS__ } }
+ + * But since we support older compilers too, we need the more complex code.
+   */
+ -#define UVERBS_ATTR_UHW()                                                      \
+ -	UVERBS_ATTR_PTR_IN(UVERBS_ATTR_UHW_IN,                                 \
+ -			   UVERBS_ATTR_MIN_SIZE(0),			       \
+ -			   UA_OPTIONAL),				       \
+ -	UVERBS_ATTR_PTR_OUT(UVERBS_ATTR_UHW_OUT,                               \
+ -			    UVERBS_ATTR_MIN_SIZE(0),			       \
+ -			    UA_OPTIONAL)
+ +#define ___UVERBS_ATTR_OBJ0(_id, _obj_class, _obj_type, _access, ...)\
+ +	((const struct uverbs_attr_def)					\
+ +	{.id = _id,							\
+ +	 .attr = { {.obj = {.type = _obj_class, .obj_type = _obj_type,	\
+ +			    .access = _access, .flags = 0 } }, } })
+ +#define ___UVERBS_ATTR_OBJ1(_id, _obj_class, _obj_type, _access, _flags)\
+ +	((const struct uverbs_attr_def)					\
+ +	{.id = _id,							\
+ +	.attr = { {.obj = {.type = _obj_class, .obj_type = _obj_type,	\
+ +			   .access = _access, _flags} }, } })
+ +#define ___UVERBS_ATTR_OBJ(_id, _obj_class, _obj_type, _access, _flags, \
+ +			   _n, ...)					\
+ +	___UVERBS_ATTR_OBJ##_n(_id, _obj_class, _obj_type, _access, _flags)
+ +#define __UVERBS_ATTR_OBJ(_id, _obj_class, _obj_type, _access, ...)	\
+ +	___UVERBS_ATTR_OBJ(_id, _obj_class, _obj_type, _access,		\
+ +			   ##__VA_ARGS__, 1, 0)
+ +#define UVERBS_ATTR_IDR(_id, _idr_type, _access, ...)			 \
+ +	__UVERBS_ATTR_OBJ(_id, UVERBS_ATTR_TYPE_IDR, _idr_type, _access,\
+ +			  ##__VA_ARGS__)
+ +#define UVERBS_ATTR_FD(_id, _fd_type, _access, ...)			\
+ +	__UVERBS_ATTR_OBJ(_id, UVERBS_ATTR_TYPE_FD, _fd_type,		\
+ +			  (_access) + BUILD_BUG_ON_ZERO(		\
+ +				(_access) != UVERBS_ACCESS_NEW &&	\
+ +				(_access) != UVERBS_ACCESS_READ),	\
+ +			  ##__VA_ARGS__)
+ +#define DECLARE_UVERBS_ATTR_SPEC(_name, ...)				\
+ +	const struct uverbs_attr_def _name = __VA_ARGS__
+ +
+ +#define DECLARE_UVERBS_ENUM(_name, ...)					\
+ +	const struct uverbs_enum_spec _name = {				\
+ +		.len = ARRAY_SIZE(((struct uverbs_attr_spec[]){__VA_ARGS__})),\
+ +		.ids = {__VA_ARGS__},					\
+ +	}
+ +#define _UVERBS_METHOD_ATTRS_SZ(...)					\
+ +	(sizeof((const struct uverbs_attr_def * const []){__VA_ARGS__}) /\
+ +	 sizeof(const struct uverbs_attr_def *))
+ +#define _UVERBS_METHOD(_id, _handler, _flags, ...)			\
+ +	((const struct uverbs_method_def) {				\
+ +	 .id = _id,							\
+ +	 .flags = _flags,						\
+ +	 .handler = _handler,						\
+ +	 .num_attrs = _UVERBS_METHOD_ATTRS_SZ(__VA_ARGS__),		\
+ +	 .attrs = &(const struct uverbs_attr_def * const []){__VA_ARGS__} })
+ +#define DECLARE_UVERBS_METHOD(_name, _id, _handler, ...)		\
+ +	const struct uverbs_method_def _name =				\
+ +		_UVERBS_METHOD(_id, _handler, 0, ##__VA_ARGS__)
+ +#define DECLARE_UVERBS_CTX_METHOD(_name, _id, _handler, _flags, ...)	\
+ +	const struct uverbs_method_def _name =				\
+ +		_UVERBS_METHOD(_id, _handler,				\
+ +			       UVERBS_ACTION_FLAG_CREATE_ROOT,		\
+ +			       ##__VA_ARGS__)
+ +#define _UVERBS_OBJECT_METHODS_SZ(...)					\
+ +	(sizeof((const struct uverbs_method_def * const []){__VA_ARGS__}) / \
+ +	 sizeof(const struct uverbs_method_def *))
+ +#define _UVERBS_OBJECT(_id, _type_attrs, ...)				\
+ +	((const struct uverbs_object_def) {				\
+ +	 .id = _id,							\
+ +	 .type_attrs = _type_attrs,					\
+ +	 .num_methods = _UVERBS_OBJECT_METHODS_SZ(__VA_ARGS__),		\
+ +	 .methods = &(const struct uverbs_method_def * const []){__VA_ARGS__} })
+ +#define DECLARE_UVERBS_OBJECT(_name, _id, _type_attrs, ...)		\
+ +	const struct uverbs_object_def _name =				\
+ +		_UVERBS_OBJECT(_id, _type_attrs, ##__VA_ARGS__)
+ +#define _UVERBS_TREE_OBJECTS_SZ(...)					\
+ +	(sizeof((const struct uverbs_object_def * const []){__VA_ARGS__}) / \
+ +	 sizeof(const struct uverbs_object_def *))
+ +#define _UVERBS_OBJECT_TREE(...)					\
+ +	((const struct uverbs_object_tree_def) {			\
+ +	 .num_objects = _UVERBS_TREE_OBJECTS_SZ(__VA_ARGS__),		\
+ +	 .objects = &(const struct uverbs_object_def * const []){__VA_ARGS__} })
+ +#define DECLARE_UVERBS_OBJECT_TREE(_name, ...)				\
+ +	const struct uverbs_object_tree_def _name =			\
+ +		_UVERBS_OBJECT_TREE(__VA_ARGS__)
+  
+  /* =================================================
+   *              Parsing infrastructure
+@@@ -547,54 -806,70 +675,63 @@@ static inline int _uverbs_copy_from_or_
+  #define uverbs_copy_from_or_zero(to, attrs_bundle, idx)			      \
+  	_uverbs_copy_from_or_zero(to, attrs_bundle, idx, sizeof(*to))
+  
+++<<<<<<< HEAD
+ +/* =================================================
+ + *	 Definitions -> Specs infrastructure
+ + * =================================================
+ + */
+ +
+ +/*
+ + * uverbs_alloc_spec_tree - Merges different common and driver specific feature
+ + *	into one parsing tree that every uverbs command will be parsed upon.
+ + *
+ + * @num_trees: Number of trees in the array @trees.
+ + * @trees: Array of pointers to tree root definitions to merge. Each such tree
+ + *	   possibly contains objects, methods and attributes definitions.
+ + *
+ + * Returns:
+ + *	uverbs_root_spec *: The root of the merged parsing tree.
+ + *	On error, we return an error code. Error is checked via IS_ERR.
+ + *
+ + * The following merges could take place:
+ + * a. Two trees representing the same method with different handler
+ + *	-> We take the handler of the tree that its handler != NULL
+ + *	   and its index in the trees array is greater. The incentive for that
+ + *	   is that developers are expected to first merge common trees and then
+ + *	   merge trees that gives specialized the behaviour.
+ + * b. Two trees representing the same object with different
+ + *    type_attrs (struct uverbs_obj_type):
+ + *	-> We take the type_attrs of the tree that its type_attr != NULL
+ + *	   and its index in the trees array is greater. This could be used
+ + *	   in order to override the free function, allocation size, etc.
+ + * c. Two trees representing the same method attribute (same id but possibly
+ + *    different attributes):
+ + *	-> ERROR (-ENOENT), we believe that's not the programmer's intent.
+ + *
+ + * An object without any methods is considered invalid and will abort the
+ + * function with -ENOENT error.
+ + */
+++=======
++ static inline struct ib_ucontext *
++ ib_uverbs_get_ucontext(const struct uverbs_attr_bundle *attrs)
++ {
++ 	return ib_uverbs_get_ucontext_file(attrs->ufile);
++ }
++ 
+++>>>>>>> 8313c10fa8be (RDMA/uverbs: Replace ib_uverbs_file with uverbs_attr_bundle for write)
+  #if IS_ENABLED(CONFIG_INFINIBAND_USER_ACCESS)
+ -int uverbs_get_flags64(u64 *to, const struct uverbs_attr_bundle *attrs_bundle,
+ -		       size_t idx, u64 allowed_bits);
+ -int uverbs_get_flags32(u32 *to, const struct uverbs_attr_bundle *attrs_bundle,
+ -		       size_t idx, u64 allowed_bits);
+ -int uverbs_copy_to(const struct uverbs_attr_bundle *attrs_bundle, size_t idx,
+ -		   const void *from, size_t size);
+ -__malloc void *_uverbs_alloc(struct uverbs_attr_bundle *bundle, size_t size,
+ -			     gfp_t flags);
+ -
+ -static inline __malloc void *uverbs_alloc(struct uverbs_attr_bundle *bundle,
+ -					  size_t size)
+ -{
+ -	return _uverbs_alloc(bundle, size, GFP_KERNEL);
+ -}
+ -
+ -static inline __malloc void *uverbs_zalloc(struct uverbs_attr_bundle *bundle,
+ -					   size_t size)
+ -{
+ -	return _uverbs_alloc(bundle, size, GFP_KERNEL | __GFP_ZERO);
+ -}
+ -int _uverbs_get_const(s64 *to, const struct uverbs_attr_bundle *attrs_bundle,
+ -		      size_t idx, s64 lower_bound, u64 upper_bound,
+ -		      s64 *def_val);
+ +struct uverbs_root_spec *uverbs_alloc_spec_tree(unsigned int num_trees,
+ +						const struct uverbs_object_tree_def **trees);
+ +void uverbs_free_spec_tree(struct uverbs_root_spec *root);
+  #else
+ -static inline int
+ -uverbs_get_flags64(u64 *to, const struct uverbs_attr_bundle *attrs_bundle,
+ -		   size_t idx, u64 allowed_bits)
+ +static inline struct uverbs_root_spec *uverbs_alloc_spec_tree(unsigned int num_trees,
+ +							      const struct uverbs_object_tree_def **trees)
+  {
+ -	return -EINVAL;
+ +	return NULL;
+  }
+ -static inline int
+ -uverbs_get_flags32(u32 *to, const struct uverbs_attr_bundle *attrs_bundle,
+ -		   size_t idx, u64 allowed_bits)
+ -{
+ -	return -EINVAL;
+ -}
+ -static inline int uverbs_copy_to(const struct uverbs_attr_bundle *attrs_bundle,
+ -				 size_t idx, const void *from, size_t size)
+ -{
+ -	return -EINVAL;
+ -}
+ -static inline __malloc void *uverbs_alloc(struct uverbs_attr_bundle *bundle,
+ -					  size_t size)
+ -{
+ -	return ERR_PTR(-EINVAL);
+ -}
+ -static inline __malloc void *uverbs_zalloc(struct uverbs_attr_bundle *bundle,
+ -					   size_t size)
+ -{
+ -	return ERR_PTR(-EINVAL);
+ -}
+ -static inline int
+ -_uverbs_get_const(s64 *to, const struct uverbs_attr_bundle *attrs_bundle,
+ -		  size_t idx, s64 lower_bound, u64 upper_bound,
+ -		  s64 *def_val)
+ +
+ +static inline void uverbs_free_spec_tree(struct uverbs_root_spec *root)
+  {
+ -	return -EINVAL;
+  }
+  #endif
+  
+diff --cc include/rdma/uverbs_std_types.h
+index 27c24453fc12,a6358c36bba0..000000000000
+--- a/include/rdma/uverbs_std_types.h
++++ b/include/rdma/uverbs_std_types.h
+@@@ -37,44 -37,59 +37,98 @@@
+  #include <rdma/uverbs_ioctl.h>
+  #include <rdma/ib_user_ioctl_verbs.h>
+  
+++<<<<<<< HEAD
+ +#if IS_ENABLED(CONFIG_INFINIBAND_USER_ACCESS)
+ +const struct uverbs_object_tree_def *uverbs_default_get_objects(void);
+ +#else
+ +static inline const struct uverbs_object_tree_def *uverbs_default_get_objects(void)
+++=======
++ /* Returns _id, or causes a compile error if _id is not a u32.
++  *
++  * The uobj APIs should only be used with the write based uAPI to access
++  * object IDs. The write API must use a u32 for the object handle, which is
++  * checked by this macro.
++  */
++ #define _uobj_check_id(_id) ((_id) * typecheck(u32, _id))
++ 
++ #define uobj_get_type(_attrs, _object)                                         \
++ 	uapi_get_object((_attrs)->ufile->device->uapi, _object)
++ 
++ #define uobj_get_read(_type, _id, _attrs)                                      \
++ 	rdma_lookup_get_uobject(uobj_get_type(_attrs, _type), (_attrs)->ufile, \
++ 				_uobj_check_id(_id), UVERBS_LOOKUP_READ)
++ 
++ #define ufd_get_read(_type, _fdnum, _attrs)                                    \
++ 	rdma_lookup_get_uobject(uobj_get_type(_attrs, _type), (_attrs)->ufile, \
++ 				(_fdnum)*typecheck(s32, _fdnum),               \
++ 				UVERBS_LOOKUP_READ)
++ 
++ static inline void *_uobj_get_obj_read(struct ib_uobject *uobj)
+++>>>>>>> 8313c10fa8be (RDMA/uverbs: Replace ib_uverbs_file with uverbs_attr_bundle for write)
+  {
+ -	if (IS_ERR(uobj))
+ -		return NULL;
+ -	return uobj->object;
+ +	return NULL;
+  }
+++<<<<<<< HEAD
+ +#endif
+ +
+ +static inline struct ib_uobject *__uobj_get(const struct uverbs_obj_type *type,
+ +					    bool write,
+ +					    struct ib_ucontext *ucontext,
+ +					    int id)
+ +{
+ +	return rdma_lookup_get_uobject(type, ucontext, id, write);
+ +}
+ +
+ +#define uobj_get_type(_object) UVERBS_OBJECT(_object).type_attrs
+ +
+ +#define uobj_get_read(_type, _id, _ucontext)				\
+ +	 __uobj_get(uobj_get_type(_type), false, _ucontext, _id)
+ +
+ +#define uobj_get_obj_read(_object, _type, _id, _ucontext)		\
+ +({									\
+ +	struct ib_uobject *__uobj =					\
+ +		__uobj_get(uobj_get_type(_type),			\
+ +			   false, _ucontext, _id);			\
+ +									\
+ +	(struct ib_##_object *)(IS_ERR(__uobj) ? NULL : __uobj->object);\
+ +})
+ +
+ +#define uobj_get_write(_type, _id, _ucontext)				\
+ +	 __uobj_get(uobj_get_type(_type), true, _ucontext, _id)
+ +
+ +int __uobj_perform_destroy(const struct uverbs_obj_type *type, int id,
+ +			   struct ib_uverbs_file *ufile, int success_res);
+ +#define uobj_perform_destroy(_type, _id, _ufile, _success_res)                 \
+ +	__uobj_perform_destroy(uobj_get_type(_type), _id, _ufile, _success_res)
+++=======
++ #define uobj_get_obj_read(_object, _type, _id, _attrs)                         \
++ 	((struct ib_##_object *)_uobj_get_obj_read(                            \
++ 		uobj_get_read(_type, _id, _attrs)))
++ 
++ #define uobj_get_write(_type, _id, _attrs)                                     \
++ 	rdma_lookup_get_uobject(uobj_get_type(_attrs, _type), (_attrs)->ufile, \
++ 				_uobj_check_id(_id), UVERBS_LOOKUP_WRITE)
++ 
++ int __uobj_perform_destroy(const struct uverbs_api_object *obj, u32 id,
++ 			   const struct uverbs_attr_bundle *attrs,
++ 			   int success_res);
++ #define uobj_perform_destroy(_type, _id, _attrs, _success_res)                 \
++ 	__uobj_perform_destroy(uobj_get_type(_attrs, _type),                   \
++ 			       _uobj_check_id(_id), _attrs, _success_res)
++ 
++ struct ib_uobject *__uobj_get_destroy(const struct uverbs_api_object *obj,
++ 				      u32 id,
++ 				      const struct uverbs_attr_bundle *attrs);
++ 
++ #define uobj_get_destroy(_type, _id, _attrs)                                   \
++ 	__uobj_get_destroy(uobj_get_type(_attrs, _type), _uobj_check_id(_id),  \
++ 			   _attrs)
++ 
++ static inline void uobj_put_destroy(struct ib_uobject *uobj)
++ {
++ 	rdma_lookup_put_uobject(uobj, UVERBS_LOOKUP_WRITE);
++ }
+++>>>>>>> 8313c10fa8be (RDMA/uverbs: Replace ib_uverbs_file with uverbs_attr_bundle for write)
+  
+  static inline void uobj_put_read(struct ib_uobject *uobj)
+  {
+@@@ -104,14 -119,70 +158,81 @@@ static inline void uobj_alloc_abort(str
+  	rdma_alloc_abort_uobject(uobj);
+  }
+  
+++<<<<<<< HEAD
+ +static inline struct ib_uobject *__uobj_alloc(const struct uverbs_obj_type *type,
+ +					      struct ib_ucontext *ucontext)
+ +{
+ +	return rdma_alloc_begin_uobject(type, ucontext);
+ +}
+ +
+ +#define uobj_alloc(_type, ucontext)	\
+ +	__uobj_alloc(uobj_get_type(_type), ucontext)
+++=======
++ static inline struct ib_uobject *
++ __uobj_alloc(const struct uverbs_api_object *obj,
++ 	     struct uverbs_attr_bundle *attrs, struct ib_device **ib_dev)
++ {
++ 	struct ib_uobject *uobj = rdma_alloc_begin_uobject(obj, attrs->ufile);
++ 
++ 	if (!IS_ERR(uobj))
++ 		*ib_dev = uobj->context->device;
++ 	return uobj;
++ }
++ 
++ #define uobj_alloc(_type, _attrs, _ib_dev)                                     \
++ 	__uobj_alloc(uobj_get_type(_attrs, _type), _attrs, _ib_dev)
++ 
++ static inline void uverbs_flow_action_fill_action(struct ib_flow_action *action,
++ 						  struct ib_uobject *uobj,
++ 						  struct ib_device *ib_dev,
++ 						  enum ib_flow_action_type type)
++ {
++ 	atomic_set(&action->usecnt, 0);
++ 	action->device = ib_dev;
++ 	action->type = type;
++ 	action->uobject = uobj;
++ 	uobj->object = action;
++ }
++ 
++ struct ib_uflow_resources {
++ 	size_t			max;
++ 	size_t			num;
++ 	size_t			collection_num;
++ 	size_t			counters_num;
++ 	struct ib_counters	**counters;
++ 	struct ib_flow_action	**collection;
++ };
++ 
++ struct ib_uflow_object {
++ 	struct ib_uobject		uobject;
++ 	struct ib_uflow_resources	*resources;
++ };
++ 
++ struct ib_uflow_resources *flow_resources_alloc(size_t num_specs);
++ void flow_resources_add(struct ib_uflow_resources *uflow_res,
++ 			enum ib_flow_spec_type type,
++ 			void *ibobj);
++ void ib_uverbs_flow_resources_free(struct ib_uflow_resources *uflow_res);
++ 
++ static inline void ib_set_flow(struct ib_uobject *uobj, struct ib_flow *ibflow,
++ 			       struct ib_qp *qp, struct ib_device *device,
++ 			       struct ib_uflow_resources *uflow_res)
++ {
++ 	struct ib_uflow_object *uflow;
++ 
++ 	uobj->object = ibflow;
++ 	ibflow->uobject = uobj;
++ 
++ 	if (qp) {
++ 		atomic_inc(&qp->usecnt);
++ 		ibflow->qp = qp;
++ 	}
++ 
++ 	ibflow->device = device;
++ 	uflow = container_of(uobj, typeof(*uflow), uobject);
++ 	uflow->resources = uflow_res;
++ }
+++>>>>>>> 8313c10fa8be (RDMA/uverbs: Replace ib_uverbs_file with uverbs_attr_bundle for write)
+  
+  #endif
+  
+* Unmerged path drivers/infiniband/core/uverbs_uapi.c
+* Unmerged path drivers/infiniband/hw/mlx5/devx.c
+* Unmerged path drivers/infiniband/core/rdma_core.c
+* Unmerged path drivers/infiniband/core/rdma_core.h
+* Unmerged path drivers/infiniband/core/uverbs_cmd.c
+* Unmerged path drivers/infiniband/core/uverbs_main.c
+* Unmerged path drivers/infiniband/core/uverbs_uapi.c
+* Unmerged path drivers/infiniband/hw/mlx5/devx.c
+* Unmerged path include/rdma/ib_verbs.h
+* Unmerged path include/rdma/uverbs_ioctl.h
+* Unmerged path include/rdma/uverbs_std_types.h
