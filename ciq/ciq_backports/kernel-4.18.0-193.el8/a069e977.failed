@@ -1,0 +1,105 @@
+net/mlx5e: Calculate linear RX frag size considering XSK
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-193.el8
+Rebuild_CHGLOG: - [netdrv] mlx5e: Calculate linear RX frag size considering XSK (Alaa Hleihel) [1724336]
+Rebuild_FUZZ: 96.30%
+commit-author Maxim Mikityanskiy <maximmi@mellanox.com>
+commit a069e977d6d8f26c90a5d9374135729dc41c3a0d
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-193.el8/a069e977.failed
+
+Additional conditions introduced:
+
+- XSK implies XDP.
+- Headroom includes the XSK headroom if it exists.
+- No space is reserved for struct shared_skb_info in XSK mode.
+- Fragment size smaller than the XSK chunk size is not allowed.
+
+A new auxiliary function mlx5e_get_linear_rq_headroom with the support
+for XSK is introduced. Use this function in the implementation of
+mlx5e_get_rq_headroom. Change headroom to u32 to match the headroom
+field in struct xdp_umem.
+
+	Signed-off-by: Maxim Mikityanskiy <maximmi@mellanox.com>
+	Signed-off-by: Tariq Toukan <tariqt@mellanox.com>
+	Acked-by: Saeed Mahameed <saeedm@mellanox.com>
+	Signed-off-by: Daniel Borkmann <daniel@iogearbox.net>
+(cherry picked from commit a069e977d6d8f26c90a5d9374135729dc41c3a0d)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/mellanox/mlx5/core/en/params.c
+diff --cc drivers/net/ethernet/mellanox/mlx5/core/en/params.c
+index fa6661ea6310,50a458dc3836..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en/params.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en/params.c
+@@@ -27,10 -56,9 +56,10 @@@ u8 mlx5e_mpwqe_log_pkts_per_wqe(struct 
+  	return MLX5_MPWRQ_LOG_WQE_SZ - order_base_2(linear_frag_sz);
+  }
+  
+ -bool mlx5e_rx_is_linear_skb(struct mlx5e_params *params)
+ +bool mlx5e_rx_is_linear_skb(struct mlx5_core_dev *mdev,
+ +			    struct mlx5e_params *params)
+  {
+- 	u32 frag_sz = mlx5e_rx_get_linear_frag_sz(params);
++ 	u32 frag_sz = mlx5e_rx_get_linear_frag_sz(params, NULL);
+  
+  	return !params->lro_en && frag_sz <= PAGE_SIZE;
+  }
+@@@ -91,15 -119,9 +120,20 @@@ u8 mlx5e_mpwqe_get_log_num_strides(stru
+  u16 mlx5e_get_rq_headroom(struct mlx5_core_dev *mdev,
+  			  struct mlx5e_params *params)
+  {
+++<<<<<<< HEAD
+ +	u16 linear_rq_headroom = params->xdp_prog ?
+ +		XDP_PACKET_HEADROOM : MLX5_RX_HEADROOM;
+ +	bool is_linear_skb;
+ +
+ +	linear_rq_headroom += NET_IP_ALIGN;
+ +
+ +	is_linear_skb = (params->rq_wq_type == MLX5_WQ_TYPE_CYCLIC) ?
+ +		mlx5e_rx_is_linear_skb(mdev, params) :
+++=======
++ 	bool is_linear_skb = (params->rq_wq_type == MLX5_WQ_TYPE_CYCLIC) ?
++ 		mlx5e_rx_is_linear_skb(params) :
+++>>>>>>> a069e977d6d8 (net/mlx5e: Calculate linear RX frag size considering XSK)
+  		mlx5e_rx_mpwqe_is_linear_skb(mdev, params);
+  
+- 	return is_linear_skb ? linear_rq_headroom : 0;
++ 	return is_linear_skb ? mlx5e_get_linear_rq_headroom(params, NULL) : 0;
+  }
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/en/params.c
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/en/params.h b/drivers/net/ethernet/mellanox/mlx5/core/en/params.h
+index 0ef1436c4c76..d0f24c5698b4 100644
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en/params.h
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en/params.h
+@@ -6,7 +6,13 @@
+ 
+ #include "en.h"
+ 
+-u32 mlx5e_rx_get_linear_frag_sz(struct mlx5e_params *params);
++struct mlx5e_xsk_param {
++	u16 headroom;
++	u16 chunk_size;
++};
++
++u32 mlx5e_rx_get_linear_frag_sz(struct mlx5e_params *params,
++				struct mlx5e_xsk_param *xsk);
+ u8 mlx5e_mpwqe_log_pkts_per_wqe(struct mlx5e_params *params);
+ bool mlx5e_rx_is_linear_skb(struct mlx5_core_dev *mdev,
+ 			    struct mlx5e_params *params);
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/en_main.c b/drivers/net/ethernet/mellanox/mlx5/core/en_main.c
+index a1e30a8caca0..3f6a658738e1 100644
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_main.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_main.c
+@@ -1952,7 +1952,7 @@ static void mlx5e_build_rq_frags_info(struct mlx5_core_dev *mdev,
+ 	if (mlx5e_rx_is_linear_skb(mdev, params)) {
+ 		int frag_stride;
+ 
+-		frag_stride = mlx5e_rx_get_linear_frag_sz(params);
++		frag_stride = mlx5e_rx_get_linear_frag_sz(params, NULL);
+ 		frag_stride = roundup_pow_of_two(frag_stride);
+ 
+ 		info->arr[0].frag_size = byte_count;
