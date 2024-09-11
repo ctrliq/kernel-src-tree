@@ -1,0 +1,149 @@
+openvswitch: Properly set L4 keys on "later" IP fragments
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-193.el8
+commit-author Greg Rose <gvrose8192@gmail.com>
+commit ad06a566e118e57b852cab5933dbbbaebb141de3
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-193.el8/ad06a566.failed
+
+When IP fragments are reassembled before being sent to conntrack, the
+key from the last fragment is used.  Unless there are reordering
+issues, the last fragment received will not contain the L4 ports, so the
+key for the reassembled datagram won't contain them.  This patch updates
+the key once we have a reassembled datagram.
+
+The handle_fragments() function works on L3 headers so we pull the L3/L4
+flow key update code from key_extract into a new function
+'key_extract_l3l4'.  Then we add a another new function
+ovs_flow_key_update_l3l4() and export it so that it is accessible by
+handle_fragments() for conntrack packet reassembly.
+
+Co-authored-by: Justin Pettit <jpettit@ovn.org>
+	Signed-off-by: Greg Rose <gvrose8192@gmail.com>
+	Acked-by: Pravin B Shelar <pshelar@ovn.org>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit ad06a566e118e57b852cab5933dbbbaebb141de3)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/openvswitch/flow.c
+diff --cc net/openvswitch/flow.c
+index f920a347ee1c,005f7622edac..000000000000
+--- a/net/openvswitch/flow.c
++++ b/net/openvswitch/flow.c
+@@@ -536,78 -523,15 +536,63 @@@ static int parse_nsh(struct sk_buff *sk
+  }
+  
+  /**
+-  * key_extract - extracts a flow key from an Ethernet frame.
++  * key_extract_l3l4 - extracts L3/L4 header information.
+   * @skb: sk_buff that contains the frame, with skb->data pointing to the
+-  * Ethernet header
++  *       L3 header
+   * @key: output flow key
+   *
+-  * The caller must ensure that skb->len >= ETH_HLEN.
+-  *
+-  * Returns 0 if successful, otherwise a negative errno value.
+-  *
+-  * Initializes @skb header fields as follows:
+-  *
+-  *    - skb->mac_header: the L2 header.
+-  *
+-  *    - skb->network_header: just past the L2 header, or just past the
+-  *      VLAN header, to the first byte of the L2 payload.
+-  *
+-  *    - skb->transport_header: If key->eth.type is ETH_P_IP or ETH_P_IPV6
+-  *      on output, then just past the IP header, if one is present and
+-  *      of a correct length, otherwise the same as skb->network_header.
+-  *      For other key->eth.type values it is left untouched.
+-  *
+-  *    - skb->protocol: the type of the data starting at skb->network_header.
+-  *      Equals to key->eth.type.
+   */
+- static int key_extract(struct sk_buff *skb, struct sw_flow_key *key)
++ static int key_extract_l3l4(struct sk_buff *skb, struct sw_flow_key *key)
+  {
+  	int error;
+++<<<<<<< HEAD
+ +	struct ethhdr *eth;
+ +
+ +	/* Flags are always used as part of stats */
+ +	key->tp.flags = 0;
+ +
+ +	skb_reset_mac_header(skb);
+ +
+ +	/* Link layer. */
+ +	clear_vlan(key);
+ +	if (ovs_key_mac_proto(key) == MAC_PROTO_NONE) {
+ +		if (unlikely(eth_type_vlan(skb->protocol)))
+ +			return -EINVAL;
+ +
+ +		skb_reset_network_header(skb);
+ +		key->eth.type = skb->protocol;
+ +	} else {
+ +		eth = eth_hdr(skb);
+ +		ether_addr_copy(key->eth.src, eth->h_source);
+ +		ether_addr_copy(key->eth.dst, eth->h_dest);
+ +
+ +		__skb_pull(skb, 2 * ETH_ALEN);
+ +		/* We are going to push all headers that we pull, so no need to
+ +		* update skb->csum here.
+ +		*/
+ +
+ +		if (unlikely(parse_vlan(skb, key)))
+ +			return -ENOMEM;
+ +
+ +		key->eth.type = parse_ethertype(skb);
+ +		if (unlikely(key->eth.type == htons(0)))
+ +			return -ENOMEM;
+ +
+ +		/* Multiple tagged packets need to retain TPID to satisfy
+ +		 * skb_vlan_pop(), which will later shift the ethertype into
+ +		 * skb->protocol.
+ +		 */
+ +		if (key->eth.cvlan.tci & htons(VLAN_TAG_PRESENT))
+ +			skb->protocol = key->eth.cvlan.tpid;
+ +		else
+ +			skb->protocol = key->eth.type;
+ +
+ +		skb_reset_network_header(skb);
+ +		__skb_push(skb, skb->data - skb_mac_header(skb));
+ +	}
+ +	skb_reset_mac_len(skb);
+++=======
+++>>>>>>> ad06a566e118 (openvswitch: Properly set L4 keys on "later" IP fragments)
+  
+  	/* Network layer. */
+  	if (key->eth.type == htons(ETH_P_IP)) {
+diff --git a/net/openvswitch/conntrack.c b/net/openvswitch/conntrack.c
+index f4b59fc63a75..dad3e8c3e96e 100644
+--- a/net/openvswitch/conntrack.c
++++ b/net/openvswitch/conntrack.c
+@@ -524,6 +524,11 @@ static int handle_fragments(struct net *net, struct sw_flow_key *key,
+ 		return -EPFNOSUPPORT;
+ 	}
+ 
++	/* The key extracted from the fragment that completed this datagram
++	 * likely didn't have an L4 header, so regenerate it.
++	 */
++	ovs_flow_key_update_l3l4(skb, key);
++
+ 	key->ip.frag = OVS_FRAG_TYPE_NONE;
+ 	skb_clear_hash(skb);
+ 	skb->ignore_df = 1;
+* Unmerged path net/openvswitch/flow.c
+diff --git a/net/openvswitch/flow.h b/net/openvswitch/flow.h
+index c670dd24b8b7..6f8d12406792 100644
+--- a/net/openvswitch/flow.h
++++ b/net/openvswitch/flow.h
+@@ -284,6 +284,7 @@ void ovs_flow_stats_clear(struct sw_flow *);
+ u64 ovs_flow_used_time(unsigned long flow_jiffies);
+ 
+ int ovs_flow_key_update(struct sk_buff *skb, struct sw_flow_key *key);
++int ovs_flow_key_update_l3l4(struct sk_buff *skb, struct sw_flow_key *key);
+ int ovs_flow_key_extract(const struct ip_tunnel_info *tun_info,
+ 			 struct sk_buff *skb,
+ 			 struct sw_flow_key *key);
