@@ -1,0 +1,345 @@
+KVM: stats: Add halt polling related histogram stats
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-358.el8
+commit-author Jing Zhang <jingzhangos@google.com>
+commit 8ccba534a1a5c6565220c81113d6157571f380cb
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-358.el8/8ccba534.failed
+
+Add three log histogram stats to record the distribution of time spent
+on successful polling, failed polling and VCPU wait.
+halt_poll_success_hist: Distribution of spent time for a successful poll.
+halt_poll_fail_hist: Distribution of spent time for a failed poll.
+halt_wait_hist: Distribution of time a VCPU has spent on waiting.
+
+	Signed-off-by: Jing Zhang <jingzhangos@google.com>
+Message-Id: <20210802165633.1866976-6-jingzhangos@google.com>
+	Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+(cherry picked from commit 8ccba534a1a5c6565220c81113d6157571f380cb)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/powerpc/kvm/book3s_hv.c
+#	include/linux/kvm_host.h
+#	include/linux/kvm_types.h
+#	virt/kvm/kvm_main.c
+diff --cc arch/powerpc/kvm/book3s_hv.c
+index e49c21bec9bd,6d63c8e6d4f0..000000000000
+--- a/arch/powerpc/kvm/book3s_hv.c
++++ b/arch/powerpc/kvm/book3s_hv.c
+@@@ -3951,19 -4144,31 +3951,41 @@@ out
+  
+  	/* Attribute wait time */
+  	if (do_sleep) {
+ -		vc->runner->stat.generic.halt_wait_ns +=
+ +		vc->runner->stat.halt_wait_ns +=
+  			ktime_to_ns(cur) - ktime_to_ns(start_wait);
++ 		KVM_STATS_LOG_HIST_UPDATE(
++ 				vc->runner->stat.generic.halt_wait_hist,
++ 				ktime_to_ns(cur) - ktime_to_ns(start_wait));
+  		/* Attribute failed poll time */
+++<<<<<<< HEAD
+ +		if (vc->halt_poll_ns)
+ +			vc->runner->stat.halt_poll_fail_ns +=
+++=======
++ 		if (vc->halt_poll_ns) {
++ 			vc->runner->stat.generic.halt_poll_fail_ns +=
+++>>>>>>> 8ccba534a1a5 (KVM: stats: Add halt polling related histogram stats)
+  				ktime_to_ns(start_wait) -
+  				ktime_to_ns(start_poll);
++ 			KVM_STATS_LOG_HIST_UPDATE(
++ 				vc->runner->stat.generic.halt_poll_fail_hist,
++ 				ktime_to_ns(start_wait) -
++ 				ktime_to_ns(start_poll));
++ 		}
+  	} else {
+  		/* Attribute successful poll time */
+++<<<<<<< HEAD
+ +		if (vc->halt_poll_ns)
+ +			vc->runner->stat.halt_poll_success_ns +=
+++=======
++ 		if (vc->halt_poll_ns) {
++ 			vc->runner->stat.generic.halt_poll_success_ns +=
+++>>>>>>> 8ccba534a1a5 (KVM: stats: Add halt polling related histogram stats)
+  				ktime_to_ns(cur) -
+  				ktime_to_ns(start_poll);
++ 			KVM_STATS_LOG_HIST_UPDATE(
++ 				vc->runner->stat.generic.halt_poll_success_hist,
++ 				ktime_to_ns(cur) - ktime_to_ns(start_poll));
++ 		}
+  	}
+  
+  	/* Adjust poll time */
+diff --cc include/linux/kvm_host.h
+index 53ea2b6e9d9d,e4d712e9f760..000000000000
+--- a/include/linux/kvm_host.h
++++ b/include/linux/kvm_host.h
+@@@ -1250,27 -1347,172 +1250,134 @@@ enum kvm_stat_kind 
+  
+  struct kvm_stat_data {
+  	struct kvm *kvm;
+ -	const struct _kvm_stats_desc *desc;
+ -	enum kvm_stat_kind kind;
+ +	struct kvm_stats_debugfs_item *dbgfs_item;
+  };
+  
+ -struct _kvm_stats_desc {
+ -	struct kvm_stats_desc desc;
+ -	char name[KVM_STATS_NAME_SIZE];
+ +struct kvm_stats_debugfs_item {
+ +	const char *name;
+ +	int offset;
+ +	enum kvm_stat_kind kind;
+ +	int mode;
+  };
+  
+ +#define KVM_DBGFS_GET_MODE(dbgfs_item)                                         \
+ +	((dbgfs_item)->mode ? (dbgfs_item)->mode : 0644)
+ +
+++<<<<<<< HEAD
+ +#define VM_STAT(n, x, ...) 							\
+ +	{ n, offsetof(struct kvm, stat.x), KVM_STAT_VM, ## __VA_ARGS__ }
+ +#define VCPU_STAT(n, x, ...)							\
+ +	{ n, offsetof(struct kvm_vcpu, stat.x), KVM_STAT_VCPU, ## __VA_ARGS__ }
+++=======
++ #define STATS_DESC_COMMON(type, unit, base, exp, sz, bsz)		       \
++ 	.flags = type | unit | base |					       \
++ 		 BUILD_BUG_ON_ZERO(type & ~KVM_STATS_TYPE_MASK) |	       \
++ 		 BUILD_BUG_ON_ZERO(unit & ~KVM_STATS_UNIT_MASK) |	       \
++ 		 BUILD_BUG_ON_ZERO(base & ~KVM_STATS_BASE_MASK),	       \
++ 	.exponent = exp,						       \
++ 	.size = sz,							       \
++ 	.bucket_size = bsz
++ 
++ #define VM_GENERIC_STATS_DESC(stat, type, unit, base, exp, sz, bsz)	       \
++ 	{								       \
++ 		{							       \
++ 			STATS_DESC_COMMON(type, unit, base, exp, sz, bsz),     \
++ 			.offset = offsetof(struct kvm_vm_stat, generic.stat)   \
++ 		},							       \
++ 		.name = #stat,						       \
++ 	}
++ #define VCPU_GENERIC_STATS_DESC(stat, type, unit, base, exp, sz, bsz)	       \
++ 	{								       \
++ 		{							       \
++ 			STATS_DESC_COMMON(type, unit, base, exp, sz, bsz),     \
++ 			.offset = offsetof(struct kvm_vcpu_stat, generic.stat) \
++ 		},							       \
++ 		.name = #stat,						       \
++ 	}
++ #define VM_STATS_DESC(stat, type, unit, base, exp, sz, bsz)		       \
++ 	{								       \
++ 		{							       \
++ 			STATS_DESC_COMMON(type, unit, base, exp, sz, bsz),     \
++ 			.offset = offsetof(struct kvm_vm_stat, stat)	       \
++ 		},							       \
++ 		.name = #stat,						       \
++ 	}
++ #define VCPU_STATS_DESC(stat, type, unit, base, exp, sz, bsz)		       \
++ 	{								       \
++ 		{							       \
++ 			STATS_DESC_COMMON(type, unit, base, exp, sz, bsz),     \
++ 			.offset = offsetof(struct kvm_vcpu_stat, stat)	       \
++ 		},							       \
++ 		.name = #stat,						       \
++ 	}
++ /* SCOPE: VM, VM_GENERIC, VCPU, VCPU_GENERIC */
++ #define STATS_DESC(SCOPE, stat, type, unit, base, exp, sz, bsz)		       \
++ 	SCOPE##_STATS_DESC(stat, type, unit, base, exp, sz, bsz)
++ 
++ #define STATS_DESC_CUMULATIVE(SCOPE, name, unit, base, exponent)	       \
++ 	STATS_DESC(SCOPE, name, KVM_STATS_TYPE_CUMULATIVE,		       \
++ 		unit, base, exponent, 1, 0)
++ #define STATS_DESC_INSTANT(SCOPE, name, unit, base, exponent)		       \
++ 	STATS_DESC(SCOPE, name, KVM_STATS_TYPE_INSTANT,			       \
++ 		unit, base, exponent, 1, 0)
++ #define STATS_DESC_PEAK(SCOPE, name, unit, base, exponent)		       \
++ 	STATS_DESC(SCOPE, name, KVM_STATS_TYPE_PEAK,			       \
++ 		unit, base, exponent, 1, 0)
++ #define STATS_DESC_LINEAR_HIST(SCOPE, name, unit, base, exponent, sz, bsz)     \
++ 	STATS_DESC(SCOPE, name, KVM_STATS_TYPE_LINEAR_HIST,		       \
++ 		unit, base, exponent, sz, bsz)
++ #define STATS_DESC_LOG_HIST(SCOPE, name, unit, base, exponent, sz)	       \
++ 	STATS_DESC(SCOPE, name, KVM_STATS_TYPE_LOG_HIST,		       \
++ 		unit, base, exponent, sz, 0)
++ 
++ /* Cumulative counter, read/write */
++ #define STATS_DESC_COUNTER(SCOPE, name)					       \
++ 	STATS_DESC_CUMULATIVE(SCOPE, name, KVM_STATS_UNIT_NONE,		       \
++ 		KVM_STATS_BASE_POW10, 0)
++ /* Instantaneous counter, read only */
++ #define STATS_DESC_ICOUNTER(SCOPE, name)				       \
++ 	STATS_DESC_INSTANT(SCOPE, name, KVM_STATS_UNIT_NONE,		       \
++ 		KVM_STATS_BASE_POW10, 0)
++ /* Peak counter, read/write */
++ #define STATS_DESC_PCOUNTER(SCOPE, name)				       \
++ 	STATS_DESC_PEAK(SCOPE, name, KVM_STATS_UNIT_NONE,		       \
++ 		KVM_STATS_BASE_POW10, 0)
++ 
++ /* Cumulative time in nanosecond */
++ #define STATS_DESC_TIME_NSEC(SCOPE, name)				       \
++ 	STATS_DESC_CUMULATIVE(SCOPE, name, KVM_STATS_UNIT_SECONDS,	       \
++ 		KVM_STATS_BASE_POW10, -9)
++ /* Linear histogram for time in nanosecond */
++ #define STATS_DESC_LINHIST_TIME_NSEC(SCOPE, name, sz, bsz)		       \
++ 	STATS_DESC_LINEAR_HIST(SCOPE, name, KVM_STATS_UNIT_SECONDS,	       \
++ 		KVM_STATS_BASE_POW10, -9, sz, bsz)
++ /* Logarithmic histogram for time in nanosecond */
++ #define STATS_DESC_LOGHIST_TIME_NSEC(SCOPE, name, sz)			       \
++ 	STATS_DESC_LOG_HIST(SCOPE, name, KVM_STATS_UNIT_SECONDS,	       \
++ 		KVM_STATS_BASE_POW10, -9, sz)
++ 
++ #define KVM_GENERIC_VM_STATS()						       \
++ 	STATS_DESC_COUNTER(VM_GENERIC, remote_tlb_flush)
++ 
++ #define KVM_GENERIC_VCPU_STATS()					       \
++ 	STATS_DESC_COUNTER(VCPU_GENERIC, halt_successful_poll),		       \
++ 	STATS_DESC_COUNTER(VCPU_GENERIC, halt_attempted_poll),		       \
++ 	STATS_DESC_COUNTER(VCPU_GENERIC, halt_poll_invalid),		       \
++ 	STATS_DESC_COUNTER(VCPU_GENERIC, halt_wakeup),			       \
++ 	STATS_DESC_TIME_NSEC(VCPU_GENERIC, halt_poll_success_ns),	       \
++ 	STATS_DESC_TIME_NSEC(VCPU_GENERIC, halt_poll_fail_ns),		       \
++ 	STATS_DESC_TIME_NSEC(VCPU_GENERIC, halt_wait_ns),		       \
++ 	STATS_DESC_LOGHIST_TIME_NSEC(VCPU_GENERIC, halt_poll_success_hist,     \
++ 			HALT_POLL_HIST_COUNT),				       \
++ 	STATS_DESC_LOGHIST_TIME_NSEC(VCPU_GENERIC, halt_poll_fail_hist,	       \
++ 			HALT_POLL_HIST_COUNT),				       \
++ 	STATS_DESC_LOGHIST_TIME_NSEC(VCPU_GENERIC, halt_wait_hist,	       \
++ 			HALT_POLL_HIST_COUNT)
+++>>>>>>> 8ccba534a1a5 (KVM: stats: Add halt polling related histogram stats)
+  
+ +extern struct kvm_stats_debugfs_item debugfs_entries[];
+  extern struct dentry *kvm_debugfs_dir;
+  
+ -ssize_t kvm_stats_read(char *id, const struct kvm_stats_header *header,
+ -		       const struct _kvm_stats_desc *desc,
+ -		       void *stats, size_t size_stats,
+ -		       char __user *user_buffer, size_t size, loff_t *offset);
+ -
+ -/**
+ - * kvm_stats_linear_hist_update() - Update bucket value for linear histogram
+ - * statistics data.
+ - *
+ - * @data: start address of the stats data
+ - * @size: the number of bucket of the stats data
+ - * @value: the new value used to update the linear histogram's bucket
+ - * @bucket_size: the size (width) of a bucket
+ - */
+ -static inline void kvm_stats_linear_hist_update(u64 *data, size_t size,
+ -						u64 value, size_t bucket_size)
+ -{
+ -	size_t index = div64_u64(value, bucket_size);
+ -
+ -	index = min(index, size - 1);
+ -	++data[index];
+ -}
+ -
+ -/**
+ - * kvm_stats_log_hist_update() - Update bucket value for logarithmic histogram
+ - * statistics data.
+ - *
+ - * @data: start address of the stats data
+ - * @size: the number of bucket of the stats data
+ - * @value: the new value used to update the logarithmic histogram's bucket
+ - */
+ -static inline void kvm_stats_log_hist_update(u64 *data, size_t size, u64 value)
+ -{
+ -	size_t index = fls64(value);
+ -
+ -	index = min(index, size - 1);
+ -	++data[index];
+ -}
+ -
+ -#define KVM_STATS_LINEAR_HIST_UPDATE(array, value, bsize)		       \
+ -	kvm_stats_linear_hist_update(array, ARRAY_SIZE(array), value, bsize)
+ -#define KVM_STATS_LOG_HIST_UPDATE(array, value)				       \
+ -	kvm_stats_log_hist_update(array, ARRAY_SIZE(array), value)
+ -
+ -
+ -extern const struct kvm_stats_header kvm_vm_stats_header;
+ -extern const struct _kvm_stats_desc kvm_vm_stats_desc[];
+ -extern const struct kvm_stats_header kvm_vcpu_stats_header;
+ -extern const struct _kvm_stats_desc kvm_vcpu_stats_desc[];
+ -
+  #if defined(CONFIG_MMU_NOTIFIER) && defined(KVM_ARCH_WANT_MMU_NOTIFIER)
+  static inline int mmu_notifier_retry(struct kvm *kvm, unsigned long mmu_seq)
+  {
+diff --cc include/linux/kvm_types.h
+index 8446b08abe44,de7fb5f364d8..000000000000
+--- a/include/linux/kvm_types.h
++++ b/include/linux/kvm_types.h
+@@@ -90,5 -76,25 +90,28 @@@ struct kvm_mmu_memory_cache 
+  };
+  #endif
+  
+++<<<<<<< HEAD
+++=======
++ #define HALT_POLL_HIST_COUNT			32
++ 
++ struct kvm_vm_stat_generic {
++ 	u64 remote_tlb_flush;
++ };
++ 
++ struct kvm_vcpu_stat_generic {
++ 	u64 halt_successful_poll;
++ 	u64 halt_attempted_poll;
++ 	u64 halt_poll_invalid;
++ 	u64 halt_wakeup;
++ 	u64 halt_poll_success_ns;
++ 	u64 halt_poll_fail_ns;
++ 	u64 halt_wait_ns;
++ 	u64 halt_poll_success_hist[HALT_POLL_HIST_COUNT];
++ 	u64 halt_poll_fail_hist[HALT_POLL_HIST_COUNT];
++ 	u64 halt_wait_hist[HALT_POLL_HIST_COUNT];
++ };
++ 
++ #define KVM_STATS_NAME_SIZE	48
+++>>>>>>> 8ccba534a1a5 (KVM: stats: Add halt polling related histogram stats)
+  
+  #endif /* __KVM_TYPES_H__ */
+diff --cc virt/kvm/kvm_main.c
+index 04fef38446f1,3e67c93ca403..000000000000
+--- a/virt/kvm/kvm_main.c
++++ b/virt/kvm/kvm_main.c
+@@@ -2946,9 -3219,14 +2946,18 @@@ void kvm_vcpu_block(struct kvm_vcpu *vc
+  			 * arrives.
+  			 */
+  			if (kvm_vcpu_check_block(vcpu) < 0) {
+ -				++vcpu->stat.generic.halt_successful_poll;
+ +				++vcpu->stat.halt_successful_poll;
+  				if (!vcpu_valid_wakeup(vcpu))
+++<<<<<<< HEAD
+ +					++vcpu->stat.halt_poll_invalid;
+++=======
++ 					++vcpu->stat.generic.halt_poll_invalid;
++ 
++ 				KVM_STATS_LOG_HIST_UPDATE(
++ 				      vcpu->stat.generic.halt_poll_success_hist,
++ 				      ktime_to_ns(ktime_get()) -
++ 				      ktime_to_ns(start));
+++>>>>>>> 8ccba534a1a5 (KVM: stats: Add halt polling related histogram stats)
+  				goto out;
+  			}
+  			cpu_relax();
+@@@ -2968,6 -3251,12 +2982,15 @@@
+  	}
+  	finish_rcuwait(&vcpu->wait);
+  	cur = ktime_get();
+++<<<<<<< HEAD
+++=======
++ 	if (waited) {
++ 		vcpu->stat.generic.halt_wait_ns +=
++ 			ktime_to_ns(cur) - ktime_to_ns(poll_end);
++ 		KVM_STATS_LOG_HIST_UPDATE(vcpu->stat.generic.halt_wait_hist,
++ 				ktime_to_ns(cur) - ktime_to_ns(poll_end));
++ 	}
+++>>>>>>> 8ccba534a1a5 (KVM: stats: Add halt polling related histogram stats)
+  out:
+  	kvm_arch_vcpu_unblocking(vcpu);
+  	block_ns = ktime_to_ns(cur) - ktime_to_ns(start);
+* Unmerged path arch/powerpc/kvm/book3s_hv.c
+* Unmerged path include/linux/kvm_host.h
+* Unmerged path include/linux/kvm_types.h
+* Unmerged path virt/kvm/kvm_main.c
