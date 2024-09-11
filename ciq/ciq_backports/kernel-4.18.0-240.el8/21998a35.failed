@@ -1,0 +1,120 @@
+x86/speculation: Avoid force-disabling IBPB based on STIBP and enhanced IBRS.
+
+jira LE-1907
+cve CVE-2020-10767
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+Rebuild_CHGLOG: - [x86] x86/speculation: Avoid force-disabling IBPB based on STIBP and enhanced IBRS (Waiman Long) [1847379 1846029] {CVE-2020-10767}
+Rebuild_FUZZ: 99.35%
+commit-author Anthony Steinhauser <asteinhauser@google.com>
+commit 21998a351512eba4ed5969006f0c55882d995ada
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/21998a35.failed
+
+When STIBP is unavailable or enhanced IBRS is available, Linux
+force-disables the IBPB mitigation of Spectre-BTB even when simultaneous
+multithreading is disabled. While attempts to enable IBPB using
+prctl(PR_SET_SPECULATION_CTRL, PR_SPEC_INDIRECT_BRANCH, ...) fail with
+EPERM, the seccomp syscall (or its prctl(PR_SET_SECCOMP, ...) equivalent)
+which are used e.g. by Chromium or OpenSSH succeed with no errors but the
+application remains silently vulnerable to cross-process Spectre v2 attacks
+(classical BTB poisoning). At the same time the SYSFS reporting
+(/sys/devices/system/cpu/vulnerabilities/spectre_v2) displays that IBPB is
+conditionally enabled when in fact it is unconditionally disabled.
+
+STIBP is useful only when SMT is enabled. When SMT is disabled and STIBP is
+unavailable, it makes no sense to force-disable also IBPB, because IBPB
+protects against cross-process Spectre-BTB attacks regardless of the SMT
+state. At the same time since missing STIBP was only observed on AMD CPUs,
+AMD does not recommend using STIBP, but recommends using IBPB, so disabling
+IBPB because of missing STIBP goes directly against AMD's advice:
+https://developer.amd.com/wp-content/resources/Architecture_Guidelines_Update_Indirect_Branch_Control.pdf
+
+Similarly, enhanced IBRS is designed to protect cross-core BTB poisoning
+and BTB-poisoning attacks from user space against kernel (and
+BTB-poisoning attacks from guest against hypervisor), it is not designed
+to prevent cross-process (or cross-VM) BTB poisoning between processes (or
+VMs) running on the same core. Therefore, even with enhanced IBRS it is
+necessary to flush the BTB during context-switches, so there is no reason
+to force disable IBPB when enhanced IBRS is available.
+
+Enable the prctl control of IBPB even when STIBP is unavailable or enhanced
+IBRS is available.
+
+Fixes: 7cc765a67d8e ("x86/speculation: Enable prctl mode for spectre_v2_user")
+	Signed-off-by: Anthony Steinhauser <asteinhauser@google.com>
+	Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+	Cc: stable@vger.kernel.org
+(cherry picked from commit 21998a351512eba4ed5969006f0c55882d995ada)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kernel/cpu/bugs.c
+diff --cc arch/x86/kernel/cpu/bugs.c
+index 65f1365341af,8d57562b1d2c..000000000000
+--- a/arch/x86/kernel/cpu/bugs.c
++++ b/arch/x86/kernel/cpu/bugs.c
+@@@ -493,10 -495,12 +493,12 @@@ early_param("nospectre_v1", nospectre_v
+  static enum spectre_v2_mitigation spectre_v2_enabled __ro_after_init =
+  	SPECTRE_V2_NONE;
+  
+- static enum spectre_v2_user_mitigation spectre_v2_user __ro_after_init =
++ static enum spectre_v2_user_mitigation spectre_v2_user_stibp __ro_after_init =
++ 	SPECTRE_V2_USER_NONE;
++ static enum spectre_v2_user_mitigation spectre_v2_user_ibpb __ro_after_init =
+  	SPECTRE_V2_USER_NONE;
+  
+ -#ifdef CONFIG_RETPOLINE
+ +#ifdef RETPOLINE
+  static bool spectre_v2_bad_module;
+  
+  bool retpoline_module_ok(bool has_retpoline)
+@@@ -1204,7 -1177,9 +1220,13 @@@ static int ib_prctl_set(struct task_str
+  		 * Indirect branch speculation is always disabled in strict
+  		 * mode.
+  		 */
+++<<<<<<< HEAD
+ +		if (spectre_v2_user == SPECTRE_V2_USER_STRICT)
+++=======
++ 		if (spectre_v2_user_ibpb == SPECTRE_V2_USER_STRICT ||
++ 		    spectre_v2_user_stibp == SPECTRE_V2_USER_STRICT ||
++ 		    spectre_v2_user_stibp == SPECTRE_V2_USER_STRICT_PREFERRED)
+++>>>>>>> 21998a351512 (x86/speculation: Avoid force-disabling IBPB based on STIBP and enhanced IBRS.)
+  			return -EPERM;
+  		task_clear_spec_ib_disable(task);
+  		task_update_spec_tif(task);
+@@@ -1215,9 -1190,12 +1237,16 @@@
+  		 * Indirect branch speculation is always allowed when
+  		 * mitigation is force disabled.
+  		 */
+- 		if (spectre_v2_user == SPECTRE_V2_USER_NONE)
++ 		if (spectre_v2_user_ibpb == SPECTRE_V2_USER_NONE &&
++ 		    spectre_v2_user_stibp == SPECTRE_V2_USER_NONE)
+  			return -EPERM;
+++<<<<<<< HEAD
+ +		if (spectre_v2_user == SPECTRE_V2_USER_STRICT)
+++=======
++ 		if (spectre_v2_user_ibpb == SPECTRE_V2_USER_STRICT ||
++ 		    spectre_v2_user_stibp == SPECTRE_V2_USER_STRICT ||
++ 		    spectre_v2_user_stibp == SPECTRE_V2_USER_STRICT_PREFERRED)
+++>>>>>>> 21998a351512 (x86/speculation: Avoid force-disabling IBPB based on STIBP and enhanced IBRS.)
+  			return 0;
+  		task_set_spec_ib_disable(task);
+  		if (ctrl == PR_SPEC_FORCE_DISABLE)
+@@@ -1289,11 -1274,8 +1325,14 @@@ static int ib_prctl_get(struct task_str
+  		if (task_spec_ib_disable(task))
+  			return PR_SPEC_PRCTL | PR_SPEC_DISABLE;
+  		return PR_SPEC_PRCTL | PR_SPEC_ENABLE;
+++<<<<<<< HEAD
+ +	case SPECTRE_V2_USER_STRICT:
+ +		return PR_SPEC_DISABLE;
+ +	default:
+++=======
++ 	} else
+++>>>>>>> 21998a351512 (x86/speculation: Avoid force-disabling IBPB based on STIBP and enhanced IBRS.)
+  		return PR_SPEC_NOT_AFFECTED;
+- 	}
+  }
+  
+  int arch_prctl_spec_ctrl_get(struct task_struct *task, unsigned long which)
+* Unmerged path arch/x86/kernel/cpu/bugs.c
