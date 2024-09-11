@@ -1,0 +1,426 @@
+sched: Make the idle task quack like a per-CPU kthread
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-358.el8
+commit-author Valentin Schneider <valentin.schneider@arm.com>
+commit 00b89fe0197f0c55a045775c11553c0cdb7082fe
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-358.el8/00b89fe0.failed
+
+For all intents and purposes, the idle task is a per-CPU kthread. It isn't
+created via the same route as other pcpu kthreads however, and as a result
+it is missing a few bells and whistles: it fails kthread_is_per_cpu() and
+it doesn't have PF_NO_SETAFFINITY set.
+
+Fix the former by giving the idle task a kthread struct along with the
+KTHREAD_IS_PER_CPU flag. This requires some extra iffery as init_idle()
+call be called more than once on the same idle task.
+
+	Signed-off-by: Valentin Schneider <valentin.schneider@arm.com>
+	Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+Link: https://lkml.kernel.org/r/20210510151024.2448573-2-valentin.schneider@arm.com
+(cherry picked from commit 00b89fe0197f0c55a045775c11553c0cdb7082fe)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/kthread.h
+#	kernel/kthread.c
+#	kernel/sched/core.c
+diff --cc include/linux/kthread.h
+index 0f8c0b02730d,d9133d6db308..000000000000
+--- a/include/linux/kthread.h
++++ b/include/linux/kthread.h
+@@@ -37,6 -33,11 +37,14 @@@ struct task_struct *kthread_create_on_c
+  					  unsigned int cpu,
+  					  const char *namefmt);
+  
+++<<<<<<< HEAD
+++=======
++ void set_kthread_struct(struct task_struct *p);
++ 
++ void kthread_set_per_cpu(struct task_struct *k, int cpu);
++ bool kthread_is_per_cpu(struct task_struct *k);
++ 
+++>>>>>>> 00b89fe0197f (sched: Make the idle task quack like a per-CPU kthread)
+  /**
+   * kthread_run - create and wake a thread.
+   * @threadfn: the function to run until signal_pending(current).
+diff --cc kernel/kthread.c
+index 8256f0e75930,3d326833092b..000000000000
+--- a/kernel/kthread.c
++++ b/kernel/kthread.c
+@@@ -67,49 -68,47 +67,90 @@@ enum KTHREAD_BITS 
+  	KTHREAD_SHOULD_PARK,
+  };
+  
+++<<<<<<< HEAD
+ +/* RHEL kABI deviation from upstream: we define housekeeping_cpumask
+ + * and hk_flags directly because including linux/tick.h changes
+ + * vm_struct from UNKNOWN to a known symbol, breaking kthread_bind
+ + * and others on AArch64
+ + */
+ +
+ +enum hk_flags {
+ +	HK_FLAG_TIMER           = 1,
+ +	HK_FLAG_RCU             = (1 << 1),
+ +	HK_FLAG_MISC            = (1 << 2),
+ +	HK_FLAG_SCHED           = (1 << 3),
+ +	HK_FLAG_TICK            = (1 << 4),
+ +	HK_FLAG_DOMAIN          = (1 << 5),
+ +	HK_FLAG_WQ              = (1 << 6),
+ +	HK_FLAG_MANAGED_IRQ     = (1 << 7),
+ +	HK_FLAG_KTHREAD         = (1 << 8),
+ +};
+ +
+ +#ifdef CONFIG_CPU_ISOLATION
+ +extern const struct cpumask *housekeeping_cpumask(enum hk_flags flags);
+ +#else
+ +static inline const struct cpumask *housekeeping_cpumask(enum hk_flags flags)
+ +{
+ +	return cpu_possible_mask;
+ +}
+ +#endif
+ +
+ +static inline void set_kthread_struct(void *kthread)
+ +{
+ +	/*
+ +	 * We abuse ->set_child_tid to avoid the new member and because it
+ +	 * can't be wrongly copied by copy_process(). We also rely on fact
+ +	 * that the caller can't exec, so PF_KTHREAD can't be cleared.
+ +	 */
+ +	current->set_child_tid = (__force void __user *)kthread;
+ +}
+ +
+++=======
+++>>>>>>> 00b89fe0197f (sched: Make the idle task quack like a per-CPU kthread)
+  static inline struct kthread *to_kthread(struct task_struct *k)
+  {
+  	WARN_ON(!(k->flags & PF_KTHREAD));
+  	return (__force void *)k->set_child_tid;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ /*
++  * Variant of to_kthread() that doesn't assume @p is a kthread.
++  *
++  * Per construction; when:
++  *
++  *   (p->flags & PF_KTHREAD) && p->set_child_tid
++  *
++  * the task is both a kthread and struct kthread is persistent. However
++  * PF_KTHREAD on it's own is not, kernel_thread() can exec() (See umh.c and
++  * begin_new_exec()).
++  */
++ static inline struct kthread *__to_kthread(struct task_struct *p)
++ {
++ 	void *kthread = (__force void *)p->set_child_tid;
++ 	if (kthread && !(p->flags & PF_KTHREAD))
++ 		kthread = NULL;
++ 	return kthread;
++ }
++ 
++ void set_kthread_struct(struct task_struct *p)
++ {
++ 	struct kthread *kthread;
++ 
++ 	if (__to_kthread(p))
++ 		return;
++ 
++ 	kthread = kzalloc(sizeof(*kthread), GFP_KERNEL);
++ 	/*
++ 	 * We abuse ->set_child_tid to avoid the new member and because it
++ 	 * can't be wrongly copied by copy_process(). We also rely on fact
++ 	 * that the caller can't exec, so PF_KTHREAD can't be cleared.
++ 	 */
++ 	p->set_child_tid = (__force void __user *)kthread;
++ }
++ 
+++>>>>>>> 00b89fe0197f (sched: Make the idle task quack like a per-CPU kthread)
+  void free_kthread_struct(struct task_struct *k)
+  {
+  	struct kthread *kthread;
+diff --cc kernel/sched/core.c
+index e666d68063ec,6a5124c4d54f..000000000000
+--- a/kernel/sched/core.c
++++ b/kernel/sched/core.c
+@@@ -5897,8 -8234,16 +5897,16 @@@ void init_idle(struct task_struct *idle
+  
+  	__sched_fork(0, idle);
+  
++ 	/*
++ 	 * The idle task doesn't need the kthread struct to function, but it
++ 	 * is dressed up as a per-CPU kthread and thus needs to play the part
++ 	 * if we want to avoid special-casing it in code that deals with per-CPU
++ 	 * kthreads.
++ 	 */
++ 	set_kthread_struct(idle);
++ 
+  	raw_spin_lock_irqsave(&idle->pi_lock, flags);
+ -	raw_spin_rq_lock(rq);
+ +	raw_spin_lock(&rq->lock);
+  
+  	idle->state = TASK_RUNNING;
+  	idle->se.exec_start = sched_clock();
+@@@ -6057,127 -8407,152 +6070,170 @@@ void idle_task_exit(void
+  	BUG_ON(cpu_online(smp_processor_id()));
+  	BUG_ON(current != this_rq()->idle);
+  
+ -	if (mm != &init_mm) {
+ -		switch_mm(mm, &init_mm, current);
+ -		finish_arch_post_lock_switch();
+ +	if (mm != &init_mm) {
+ +		switch_mm(mm, &init_mm, current);
+ +		finish_arch_post_lock_switch();
+ +	}
+ +
+ +	/* finish_cpu(), as ran on the BP, will clean up the active_mm state */
+ +}
+ +
+ +/*
+ + * Since this CPU is going 'away' for a while, fold any nr_active delta
+ + * we might have. Assumes we're called after migrate_tasks() so that the
+ + * nr_active count is stable. We need to take the teardown thread which
+ + * is calling this into account, so we hand in adjust = 1 to the load
+ + * calculation.
+ + *
+ + * Also see the comment "Global load-average calculations".
+ + */
+ +static void calc_load_migrate(struct rq *rq)
+ +{
+ +	long delta = calc_load_fold_active(rq, 1);
+ +	if (delta)
+ +		atomic_long_add(delta, &calc_load_tasks);
+ +}
+ +
+ +static struct task_struct *__pick_migrate_task(struct rq *rq)
+ +{
+ +	const struct sched_class *class;
+ +	struct task_struct *next;
+ +
+ +	for_each_class(class) {
+ +		next = class->pick_next_task(rq);
+ +		if (next) {
+ +			next->sched_class->put_prev_task(rq, next);
+ +			return next;
+ +		}
+  	}
+  
+ -	/* finish_cpu(), as ran on the BP, will clean up the active_mm state */
+ +	/* The idle class should always have a runnable task */
+ +	BUG();
+  }
+  
+ -static int __balance_push_cpu_stop(void *arg)
+ +/*
+ + * Migrate all tasks from the rq, sleeping tasks will be migrated by
+ + * try_to_wake_up()->select_task_rq().
+ + *
+ + * Called with rq->lock held even though we'er in stop_machine() and
+ + * there's no concurrency possible, we hold the required locks anyway
+ + * because of lock validation efforts.
+ + */
+ +static void migrate_tasks(struct rq *dead_rq, struct rq_flags *rf)
+  {
+ -	struct task_struct *p = arg;
+ -	struct rq *rq = this_rq();
+ -	struct rq_flags rf;
+ -	int cpu;
+ +	struct rq *rq = dead_rq;
+ +	struct task_struct *next, *stop = rq->stop;
+ +	struct rq_flags orf = *rf;
+ +	int dest_cpu;
+  
+ -	raw_spin_lock_irq(&p->pi_lock);
+ -	rq_lock(rq, &rf);
+ +	/*
+ +	 * Fudge the rq selection such that the below task selection loop
+ +	 * doesn't get stuck on the currently eligible stop task.
+ +	 *
+ +	 * We're currently inside stop_machine() and the rq is either stuck
+ +	 * in the stop_machine_cpu_stop() loop, or we're executing this code,
+ +	 * either way we should never end up calling schedule() until we're
+ +	 * done here.
+ +	 */
+ +	rq->stop = NULL;
+  
+ +	/*
+ +	 * put_prev_task() and pick_next_task() sched
+ +	 * class method both need to have an up-to-date
+ +	 * value of rq->clock[_task]
+ +	 */
+  	update_rq_clock(rq);
+  
+ -	if (task_rq(p) == rq && task_on_rq_queued(p)) {
+ -		cpu = select_fallback_rq(rq->cpu, p);
+ -		rq = __migrate_task(rq, &rf, p, cpu);
+ -	}
+ +	for (;;) {
+ +		/*
+ +		 * There's this thread running, bail when that's the only
+ +		 * remaining thread:
+ +		 */
+ +		if (rq->nr_running == 1)
+ +			break;
+  
+++<<<<<<< HEAD
+ +		next = __pick_migrate_task(rq);
+++=======
++ 	rq_unlock(rq, &rf);
++ 	raw_spin_unlock_irq(&p->pi_lock);
++ 
++ 	put_task_struct(p);
++ 
++ 	return 0;
++ }
++ 
++ static DEFINE_PER_CPU(struct cpu_stop_work, push_work);
++ 
++ /*
++  * Ensure we only run per-cpu kthreads once the CPU goes !active.
++  *
++  * This is enabled below SCHED_AP_ACTIVE; when !cpu_active(), but only
++  * effective when the hotplug motion is down.
++  */
++ static void balance_push(struct rq *rq)
++ {
++ 	struct task_struct *push_task = rq->curr;
++ 
++ 	lockdep_assert_rq_held(rq);
++ 	SCHED_WARN_ON(rq->cpu != smp_processor_id());
++ 
++ 	/*
++ 	 * Ensure the thing is persistent until balance_push_set(.on = false);
++ 	 */
++ 	rq->balance_callback = &balance_push_callback;
++ 
++ 	/*
++ 	 * Only active while going offline.
++ 	 */
++ 	if (!cpu_dying(rq->cpu))
++ 		return;
++ 
++ 	/*
++ 	 * Both the cpu-hotplug and stop task are in this case and are
++ 	 * required to complete the hotplug process.
++ 	 */
++ 	if (kthread_is_per_cpu(push_task) ||
++ 	    is_migration_disabled(push_task)) {
+++>>>>>>> 00b89fe0197f (sched: Make the idle task quack like a per-CPU kthread)
+  
+  		/*
+ -		 * If this is the idle task on the outgoing CPU try to wake
+ -		 * up the hotplug control thread which might wait for the
+ -		 * last task to vanish. The rcuwait_active() check is
+ -		 * accurate here because the waiter is pinned on this CPU
+ -		 * and can't obviously be running in parallel.
+ +		 * Rules for changing task_struct::cpus_mask are holding
+ +		 * both pi_lock and rq->lock, such that holding either
+ +		 * stabilizes the mask.
+  		 *
+ -		 * On RT kernels this also has to check whether there are
+ -		 * pinned and scheduled out tasks on the runqueue. They
+ -		 * need to leave the migrate disabled section first.
+ +		 * Drop rq->lock is not quite as disastrous as it usually is
+ +		 * because !cpu_active at this point, which means load-balance
+ +		 * will not interfere. Also, stop-machine.
+  		 */
+ -		if (!rq->nr_running && !rq_has_pinned_tasks(rq) &&
+ -		    rcuwait_active(&rq->hotplug_wait)) {
+ -			raw_spin_rq_unlock(rq);
+ -			rcuwait_wake_up(&rq->hotplug_wait);
+ -			raw_spin_rq_lock(rq);
+ -		}
+ -		return;
+ -	}
+ -
+ -	get_task_struct(push_task);
+ -	/*
+ -	 * Temporarily drop rq->lock such that we can wake-up the stop task.
+ -	 * Both preemption and IRQs are still disabled.
+ -	 */
+ -	raw_spin_rq_unlock(rq);
+ -	stop_one_cpu_nowait(rq->cpu, __balance_push_cpu_stop, push_task,
+ -			    this_cpu_ptr(&push_work));
+ -	/*
+ -	 * At this point need_resched() is true and we'll take the loop in
+ -	 * schedule(). The next pick is obviously going to be the stop task
+ -	 * which kthread_is_per_cpu() and will push this task away.
+ -	 */
+ -	raw_spin_rq_lock(rq);
+ -}
+ +		rq_unlock(rq, rf);
+ +		raw_spin_lock(&next->pi_lock);
+ +		rq_relock(rq, rf);
+  
+ -static void balance_push_set(int cpu, bool on)
+ -{
+ -	struct rq *rq = cpu_rq(cpu);
+ -	struct rq_flags rf;
+ +		/*
+ +		 * Since we're inside stop-machine, _nothing_ should have
+ +		 * changed the task, WARN if weird stuff happened, because in
+ +		 * that case the above rq->lock drop is a fail too.
+ +		 */
+ +		if (WARN_ON(task_rq(next) != rq || !task_on_rq_queued(next))) {
+ +			raw_spin_unlock(&next->pi_lock);
+ +			continue;
+ +		}
+  
+ -	rq_lock_irqsave(rq, &rf);
+ -	if (on) {
+ -		WARN_ON_ONCE(rq->balance_callback);
+ -		rq->balance_callback = &balance_push_callback;
+ -	} else if (rq->balance_callback == &balance_push_callback) {
+ -		rq->balance_callback = NULL;
+ +		/* Find suitable destination for @next, with force if needed. */
+ +		dest_cpu = select_fallback_rq(dead_rq->cpu, next);
+ +		rq = __migrate_task(rq, rf, next, dest_cpu);
+ +		if (rq != dead_rq) {
+ +			rq_unlock(rq, rf);
+ +			rq = dead_rq;
+ +			*rf = orf;
+ +			rq_relock(rq, rf);
+ +		}
+ +		raw_spin_unlock(&next->pi_lock);
+  	}
+ -	rq_unlock_irqrestore(rq, &rf);
+ -}
+  
+ -/*
+ - * Invoked from a CPUs hotplug control thread after the CPU has been marked
+ - * inactive. All tasks which are not per CPU kernel threads are either
+ - * pushed off this CPU now via balance_push() or placed on a different CPU
+ - * during wakeup. Wait until the CPU is quiescent.
+ - */
+ -static void balance_hotplug_wait(void)
+ -{
+ -	struct rq *rq = this_rq();
+ -
+ -	rcuwait_wait_event(&rq->hotplug_wait,
+ -			   rq->nr_running == 1 && !rq_has_pinned_tasks(rq),
+ -			   TASK_UNINTERRUPTIBLE);
+ -}
+ -
+ -#else
+ -
+ -static inline void balance_push(struct rq *rq)
+ -{
+ -}
+ -
+ -static inline void balance_push_set(int cpu, bool on)
+ -{
+ -}
+ -
+ -static inline void balance_hotplug_wait(void)
+ -{
+ +	rq->stop = stop;
+  }
+ -
+  #endif /* CONFIG_HOTPLUG_CPU */
+  
+  void set_rq_online(struct rq *rq)
+* Unmerged path include/linux/kthread.h
+* Unmerged path kernel/kthread.c
+* Unmerged path kernel/sched/core.c
