@@ -1,0 +1,99 @@
+mm/page_alloc: fix memalloc_nocma_{save/restore} APIs
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-448.el8
+commit-author Joonsoo Kim <iamjoonsoo.kim@lge.com>
+commit 8510e69c8efef82f2b37ea3e8ea19a27122c533e
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-448.el8/8510e69c.failed
+
+Currently, memalloc_nocma_{save/restore} API that prevents CMA area
+in page allocation is implemented by using current_gfp_context(). However,
+there are two problems of this implementation.
+
+First, this doesn't work for allocation fastpath. In the fastpath,
+original gfp_mask is used since current_gfp_context() is introduced in
+order to control reclaim and it is on slowpath. So, CMA area can be
+allocated through the allocation fastpath even if
+memalloc_nocma_{save/restore} APIs are used. Currently, there is just
+one user for these APIs and it has a fallback method to prevent actual
+problem.
+Second, clearing __GFP_MOVABLE in current_gfp_context() has a side effect
+to exclude the memory on the ZONE_MOVABLE for allocation target.
+
+To fix these problems, this patch changes the implementation to exclude
+CMA area in page allocation. Main point of this change is using the
+alloc_flags. alloc_flags is mainly used to control allocation so it fits
+for excluding CMA area in allocation.
+
+Fixes: d7fefcc8de91 (mm/cma: add PF flag to force non cma alloc)
+	Signed-off-by: Joonsoo Kim <iamjoonsoo.kim@lge.com>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Reviewed-by: Vlastimil Babka <vbabka@suse.cz>
+	Cc: Christoph Hellwig <hch@infradead.org>
+	Cc: Roman Gushchin <guro@fb.com>
+	Cc: Mike Kravetz <mike.kravetz@oracle.com>
+	Cc: Naoya Horiguchi <n-horiguchi@ah.jp.nec.com>
+	Cc: Michal Hocko <mhocko@suse.com>
+	Cc: "Aneesh Kumar K . V" <aneesh.kumar@linux.ibm.com>
+Link: http://lkml.kernel.org/r/1595468942-29687-1-git-send-email-iamjoonsoo.kim@lge.com
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit 8510e69c8efef82f2b37ea3e8ea19a27122c533e)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	mm/page_alloc.c
+diff --cc mm/page_alloc.c
+index 1f4a77a1aaaf,167732f4d124..000000000000
+--- a/mm/page_alloc.c
++++ b/mm/page_alloc.c
+@@@ -4422,13 -4347,8 +4436,18 @@@ gfp_to_alloc_flags(gfp_t gfp_mask
+  	} else if (unlikely(rt_task(current)) && !in_interrupt())
+  		alloc_flags |= ALLOC_HARDER;
+  
+++<<<<<<< HEAD
+ +	if (gfp_mask & __GFP_KSWAPD_RECLAIM)
+ +		alloc_flags |= ALLOC_KSWAPD;
+ +
+ +#ifdef CONFIG_CMA
+ +	if (gfpflags_to_migratetype(gfp_mask) == MIGRATE_MOVABLE)
+ +		alloc_flags |= ALLOC_CMA;
+ +#endif
+++=======
++ 	alloc_flags = current_alloc_flags(gfp_mask, alloc_flags);
++ 
+++>>>>>>> 8510e69c8efe (mm/page_alloc: fix memalloc_nocma_{save/restore} APIs)
+  	return alloc_flags;
+  }
+  
+diff --git a/include/linux/sched/mm.h b/include/linux/sched/mm.h
+index 0b21b5736e43..2e66b649eb6b 100644
+--- a/include/linux/sched/mm.h
++++ b/include/linux/sched/mm.h
+@@ -176,12 +176,10 @@ static inline bool in_vfork(struct task_struct *tsk)
+  * Applies per-task gfp context to the given allocation flags.
+  * PF_MEMALLOC_NOIO implies GFP_NOIO
+  * PF_MEMALLOC_NOFS implies GFP_NOFS
+- * PF_MEMALLOC_NOCMA implies no allocation from CMA region.
+  */
+ static inline gfp_t current_gfp_context(gfp_t flags)
+ {
+-	if (unlikely(current->flags &
+-		     (PF_MEMALLOC_NOIO | PF_MEMALLOC_NOFS | PF_MEMALLOC_NOCMA))) {
++	if (unlikely(current->flags & (PF_MEMALLOC_NOIO | PF_MEMALLOC_NOFS))) {
+ 		/*
+ 		 * NOIO implies both NOIO and NOFS and it is a weaker context
+ 		 * so always make sure it makes precedence
+@@ -190,10 +188,6 @@ static inline gfp_t current_gfp_context(gfp_t flags)
+ 			flags &= ~(__GFP_IO | __GFP_FS);
+ 		else if (current->flags & PF_MEMALLOC_NOFS)
+ 			flags &= ~__GFP_FS;
+-#ifdef CONFIG_CMA
+-		if (current->flags & PF_MEMALLOC_NOCMA)
+-			flags &= ~__GFP_MOVABLE;
+-#endif
+ 	}
+ 	return flags;
+ }
+* Unmerged path mm/page_alloc.c
