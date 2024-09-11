@@ -1,0 +1,183 @@
+mptcp: fix static checker warnings in mptcp_pm_add_timer
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Geliang Tang <geliangtang@gmail.com>
+commit 724d06b437bba9faf280842a983e69c04f244767
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/724d06b4.failed
+
+Fix the following Smatch complaint:
+
+     net/mptcp/pm_netlink.c:213 mptcp_pm_add_timer()
+     warn: variable dereferenced before check 'msk' (see line 208)
+
+ net/mptcp/pm_netlink.c
+    207          struct mptcp_sock *msk = entry->sock;
+    208          struct sock *sk = (struct sock *)msk;
+    209          struct net *net = sock_net(sk);
+                                           ^^
+ "msk" dereferenced here.
+
+    210
+    211          pr_debug("msk=%p", msk);
+    212
+    213          if (!msk)
+                    ^^^^
+ Too late.
+
+    214                  return;
+    215
+
+Fixes: 93f323b9cccc ("mptcp: add a new sysctl add_addr_timeout")
+	Reported-by: Dan Carpenter <dan.carpenter@oracle.com>
+	Reviewed-by: Dan Carpenter <dan.carpenter@oracle.com>
+	Reviewed-by: Matthieu Baerts <matthieu.baerts@tessares.net>
+	Signed-off-by: Geliang Tang <geliangtang@gmail.com>
+Link: https://lore.kernel.org/r/078a2ef5bdc4e3b2c25ef852461692001f426495.1604976945.git.geliangtang@gmail.com
+	Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+(cherry picked from commit 724d06b437bba9faf280842a983e69c04f244767)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/mptcp/pm_netlink.c
+diff --cc net/mptcp/pm_netlink.c
+index 6f3bf9fdbbbc,446ef8f07734..000000000000
+--- a/net/mptcp/pm_netlink.c
++++ b/net/mptcp/pm_netlink.c
+@@@ -179,11 -187,129 +179,132 @@@ static void check_work_pending(struct m
+  		WRITE_ONCE(msk->pm.work_pending, false);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static struct mptcp_pm_add_entry *
++ lookup_anno_list_by_saddr(struct mptcp_sock *msk,
++ 			  struct mptcp_addr_info *addr)
++ {
++ 	struct mptcp_pm_add_entry *entry;
++ 
++ 	list_for_each_entry(entry, &msk->pm.anno_list, list) {
++ 		if (addresses_equal(&entry->addr, addr, false))
++ 			return entry;
++ 	}
++ 
++ 	return NULL;
++ }
++ 
++ static void mptcp_pm_add_timer(struct timer_list *timer)
++ {
++ 	struct mptcp_pm_add_entry *entry = from_timer(entry, timer, add_timer);
++ 	struct mptcp_sock *msk = entry->sock;
++ 	struct sock *sk = (struct sock *)msk;
++ 
++ 	pr_debug("msk=%p", msk);
++ 
++ 	if (!msk)
++ 		return;
++ 
++ 	if (inet_sk_state_load(sk) == TCP_CLOSE)
++ 		return;
++ 
++ 	if (!entry->addr.id)
++ 		return;
++ 
++ 	if (mptcp_pm_should_add_signal(msk)) {
++ 		sk_reset_timer(sk, timer, jiffies + TCP_RTO_MAX / 8);
++ 		goto out;
++ 	}
++ 
++ 	spin_lock_bh(&msk->pm.lock);
++ 
++ 	if (!mptcp_pm_should_add_signal(msk)) {
++ 		pr_debug("retransmit ADD_ADDR id=%d", entry->addr.id);
++ 		mptcp_pm_announce_addr(msk, &entry->addr, false);
++ 		entry->retrans_times++;
++ 	}
++ 
++ 	if (entry->retrans_times < ADD_ADDR_RETRANS_MAX)
++ 		sk_reset_timer(sk, timer,
++ 			       jiffies + mptcp_get_add_addr_timeout(sock_net(sk)));
++ 
++ 	spin_unlock_bh(&msk->pm.lock);
++ 
++ out:
++ 	__sock_put(sk);
++ }
++ 
++ struct mptcp_pm_add_entry *
++ mptcp_pm_del_add_timer(struct mptcp_sock *msk,
++ 		       struct mptcp_addr_info *addr)
++ {
++ 	struct mptcp_pm_add_entry *entry;
++ 	struct sock *sk = (struct sock *)msk;
++ 
++ 	spin_lock_bh(&msk->pm.lock);
++ 	entry = lookup_anno_list_by_saddr(msk, addr);
++ 	if (entry)
++ 		entry->retrans_times = ADD_ADDR_RETRANS_MAX;
++ 	spin_unlock_bh(&msk->pm.lock);
++ 
++ 	if (entry)
++ 		sk_stop_timer_sync(sk, &entry->add_timer);
++ 
++ 	return entry;
++ }
++ 
++ static bool mptcp_pm_alloc_anno_list(struct mptcp_sock *msk,
++ 				     struct mptcp_pm_addr_entry *entry)
++ {
++ 	struct mptcp_pm_add_entry *add_entry = NULL;
++ 	struct sock *sk = (struct sock *)msk;
++ 	struct net *net = sock_net(sk);
++ 
++ 	if (lookup_anno_list_by_saddr(msk, &entry->addr))
++ 		return false;
++ 
++ 	add_entry = kmalloc(sizeof(*add_entry), GFP_ATOMIC);
++ 	if (!add_entry)
++ 		return false;
++ 
++ 	list_add(&add_entry->list, &msk->pm.anno_list);
++ 
++ 	add_entry->addr = entry->addr;
++ 	add_entry->sock = msk;
++ 	add_entry->retrans_times = 0;
++ 
++ 	timer_setup(&add_entry->add_timer, mptcp_pm_add_timer, 0);
++ 	sk_reset_timer(sk, &add_entry->add_timer,
++ 		       jiffies + mptcp_get_add_addr_timeout(net));
++ 
++ 	return true;
++ }
++ 
++ void mptcp_pm_free_anno_list(struct mptcp_sock *msk)
++ {
++ 	struct mptcp_pm_add_entry *entry, *tmp;
++ 	struct sock *sk = (struct sock *)msk;
++ 	LIST_HEAD(free_list);
++ 
++ 	pr_debug("msk=%p", msk);
++ 
++ 	spin_lock_bh(&msk->pm.lock);
++ 	list_splice_init(&msk->pm.anno_list, &free_list);
++ 	spin_unlock_bh(&msk->pm.lock);
++ 
++ 	list_for_each_entry_safe(entry, tmp, &free_list, list) {
++ 		sk_stop_timer_sync(sk, &entry->add_timer);
++ 		kfree(entry);
++ 	}
++ }
++ 
+++>>>>>>> 724d06b437bb (mptcp: fix static checker warnings in mptcp_pm_add_timer)
+  static void mptcp_pm_create_subflow_or_signal_addr(struct mptcp_sock *msk)
+  {
+ -	struct mptcp_addr_info remote = { 0 };
+  	struct sock *sk = (struct sock *)msk;
+  	struct mptcp_pm_addr_entry *local;
+ +	struct mptcp_addr_info remote;
+  	struct pm_nl_pernet *pernet;
+  
+  	pernet = net_generic(sock_net((struct sock *)msk), pm_nl_pernet_id);
+* Unmerged path net/mptcp/pm_netlink.c
