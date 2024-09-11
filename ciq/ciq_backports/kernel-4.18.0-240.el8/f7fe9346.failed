@@ -1,0 +1,262 @@
+io_uring: initialize fixed_file_data lock
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Xiaoguang Wang <xiaoguang.wang@linux.alibaba.com>
+commit f7fe9346869a12efe3af3cc9be2e45a1b6ff8761
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/f7fe9346.failed
+
+syzbot reports below warning:
+INFO: trying to register non-static key.
+the code is fine but needs lockdep annotation.
+turning off the locking correctness validator.
+CPU: 1 PID: 7099 Comm: syz-executor897 Not tainted 5.6.0-next-20200406-syzkaller #0
+Hardware name: Google Google Compute Engine/Google Compute Engine, BIOS Google 01/01/2011
+Call Trace:
+ __dump_stack lib/dump_stack.c:77 [inline]
+ dump_stack+0x188/0x20d lib/dump_stack.c:118
+ assign_lock_key kernel/locking/lockdep.c:913 [inline]
+ register_lock_class+0x1664/0x1760 kernel/locking/lockdep.c:1225
+ __lock_acquire+0x104/0x4e00 kernel/locking/lockdep.c:4223
+ lock_acquire+0x1f2/0x8f0 kernel/locking/lockdep.c:4923
+ __raw_spin_lock_irqsave include/linux/spinlock_api_smp.h:110 [inline]
+ _raw_spin_lock_irqsave+0x8c/0xbf kernel/locking/spinlock.c:159
+ io_sqe_files_register fs/io_uring.c:6599 [inline]
+ __io_uring_register+0x1fe8/0x2f00 fs/io_uring.c:8001
+ __do_sys_io_uring_register fs/io_uring.c:8081 [inline]
+ __se_sys_io_uring_register fs/io_uring.c:8063 [inline]
+ __x64_sys_io_uring_register+0x192/0x560 fs/io_uring.c:8063
+ do_syscall_64+0xf6/0x7d0 arch/x86/entry/common.c:295
+ entry_SYSCALL_64_after_hwframe+0x49/0xb3
+RIP: 0033:0x440289
+Code: 18 89 d0 c3 66 2e 0f 1f 84 00 00 00 00 00 0f 1f 00 48 89 f8 48 89 f7
+48 89 d6 48 89 ca 4d 89 c2 4d 89 c8 4c 8b 4c 24 08 0f 05 <48> 3d 01 f0 ff
+ff 0f 83 fb 13 fc ff c3 66 2e 0f 1f 84 00 00 00 00
+RSP: 002b:00007ffff1bbf558 EFLAGS: 00000246 ORIG_RAX: 00000000000001ab
+RAX: ffffffffffffffda RBX: 00000000004002c8 RCX: 0000000000440289
+RDX: 0000000020000280 RSI: 0000000000000002 RDI: 0000000000000003
+RBP: 00000000006ca018 R08: 0000000000000000 R09: 00000000004002c8
+R10: 0000000000000001 R11: 0000000000000246 R12: 0000000000401b10
+R13: 0000000000401ba0 R14: 0000000000000000 R15: 0000000000000000
+
+Initialize struct fixed_file_data's lock to fix this issue.
+
+	Reported-by: syzbot+e6eeca4a035da76b3065@syzkaller.appspotmail.com
+Fixes: 055895537302 ("io_uring: refactor file register/unregister/update handling")
+	Signed-off-by: Xiaoguang Wang <xiaoguang.wang@linux.alibaba.com>
+	Signed-off-by: Jens Axboe <axboe@kernel.dk>
+(cherry picked from commit f7fe9346869a12efe3af3cc9be2e45a1b6ff8761)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/io_uring.c
+diff --cc fs/io_uring.c
+index 2afa3b27779e,773f55c49cd8..000000000000
+--- a/fs/io_uring.c
++++ b/fs/io_uring.c
+@@@ -3037,6 -6408,199 +3037,202 @@@ static void io_sqe_file_unregister(stru
+  #endif
+  }
+  
+++<<<<<<< HEAD
+++=======
++ struct io_file_put {
++ 	struct list_head list;
++ 	struct file *file;
++ };
++ 
++ static void io_file_put_work(struct work_struct *work)
++ {
++ 	struct fixed_file_ref_node *ref_node;
++ 	struct fixed_file_data *file_data;
++ 	struct io_ring_ctx *ctx;
++ 	struct io_file_put *pfile, *tmp;
++ 	unsigned long flags;
++ 
++ 	ref_node = container_of(work, struct fixed_file_ref_node, work);
++ 	file_data = ref_node->file_data;
++ 	ctx = file_data->ctx;
++ 
++ 	list_for_each_entry_safe(pfile, tmp, &ref_node->file_list, list) {
++ 		list_del_init(&pfile->list);
++ 		io_ring_file_put(ctx, pfile->file);
++ 		kfree(pfile);
++ 	}
++ 
++ 	spin_lock_irqsave(&file_data->lock, flags);
++ 	list_del_init(&ref_node->node);
++ 	spin_unlock_irqrestore(&file_data->lock, flags);
++ 
++ 	percpu_ref_exit(&ref_node->refs);
++ 	kfree(ref_node);
++ 	percpu_ref_put(&file_data->refs);
++ }
++ 
++ static void io_file_data_ref_zero(struct percpu_ref *ref)
++ {
++ 	struct fixed_file_ref_node *ref_node;
++ 
++ 	ref_node = container_of(ref, struct fixed_file_ref_node, refs);
++ 
++ 	queue_work(system_wq, &ref_node->work);
++ }
++ 
++ static struct fixed_file_ref_node *alloc_fixed_file_ref_node(
++ 			struct io_ring_ctx *ctx)
++ {
++ 	struct fixed_file_ref_node *ref_node;
++ 
++ 	ref_node = kzalloc(sizeof(*ref_node), GFP_KERNEL);
++ 	if (!ref_node)
++ 		return ERR_PTR(-ENOMEM);
++ 
++ 	if (percpu_ref_init(&ref_node->refs, io_file_data_ref_zero,
++ 			    0, GFP_KERNEL)) {
++ 		kfree(ref_node);
++ 		return ERR_PTR(-ENOMEM);
++ 	}
++ 	INIT_LIST_HEAD(&ref_node->node);
++ 	INIT_LIST_HEAD(&ref_node->file_list);
++ 	INIT_WORK(&ref_node->work, io_file_put_work);
++ 	ref_node->file_data = ctx->file_data;
++ 	return ref_node;
++ 
++ }
++ 
++ static void destroy_fixed_file_ref_node(struct fixed_file_ref_node *ref_node)
++ {
++ 	percpu_ref_exit(&ref_node->refs);
++ 	kfree(ref_node);
++ }
++ 
++ static int io_sqe_files_register(struct io_ring_ctx *ctx, void __user *arg,
++ 				 unsigned nr_args)
++ {
++ 	__s32 __user *fds = (__s32 __user *) arg;
++ 	unsigned nr_tables;
++ 	struct file *file;
++ 	int fd, ret = 0;
++ 	unsigned i;
++ 	struct fixed_file_ref_node *ref_node;
++ 	unsigned long flags;
++ 
++ 	if (ctx->file_data)
++ 		return -EBUSY;
++ 	if (!nr_args)
++ 		return -EINVAL;
++ 	if (nr_args > IORING_MAX_FIXED_FILES)
++ 		return -EMFILE;
++ 
++ 	ctx->file_data = kzalloc(sizeof(*ctx->file_data), GFP_KERNEL);
++ 	if (!ctx->file_data)
++ 		return -ENOMEM;
++ 	ctx->file_data->ctx = ctx;
++ 	init_completion(&ctx->file_data->done);
++ 	INIT_LIST_HEAD(&ctx->file_data->ref_list);
++ 	spin_lock_init(&ctx->file_data->lock);
++ 
++ 	nr_tables = DIV_ROUND_UP(nr_args, IORING_MAX_FILES_TABLE);
++ 	ctx->file_data->table = kcalloc(nr_tables,
++ 					sizeof(struct fixed_file_table),
++ 					GFP_KERNEL);
++ 	if (!ctx->file_data->table) {
++ 		kfree(ctx->file_data);
++ 		ctx->file_data = NULL;
++ 		return -ENOMEM;
++ 	}
++ 
++ 	if (percpu_ref_init(&ctx->file_data->refs, io_file_ref_kill,
++ 				PERCPU_REF_ALLOW_REINIT, GFP_KERNEL)) {
++ 		kfree(ctx->file_data->table);
++ 		kfree(ctx->file_data);
++ 		ctx->file_data = NULL;
++ 		return -ENOMEM;
++ 	}
++ 
++ 	if (io_sqe_alloc_file_tables(ctx, nr_tables, nr_args)) {
++ 		percpu_ref_exit(&ctx->file_data->refs);
++ 		kfree(ctx->file_data->table);
++ 		kfree(ctx->file_data);
++ 		ctx->file_data = NULL;
++ 		return -ENOMEM;
++ 	}
++ 
++ 	for (i = 0; i < nr_args; i++, ctx->nr_user_files++) {
++ 		struct fixed_file_table *table;
++ 		unsigned index;
++ 
++ 		ret = -EFAULT;
++ 		if (copy_from_user(&fd, &fds[i], sizeof(fd)))
++ 			break;
++ 		/* allow sparse sets */
++ 		if (fd == -1) {
++ 			ret = 0;
++ 			continue;
++ 		}
++ 
++ 		table = &ctx->file_data->table[i >> IORING_FILE_TABLE_SHIFT];
++ 		index = i & IORING_FILE_TABLE_MASK;
++ 		file = fget(fd);
++ 
++ 		ret = -EBADF;
++ 		if (!file)
++ 			break;
++ 
++ 		/*
++ 		 * Don't allow io_uring instances to be registered. If UNIX
++ 		 * isn't enabled, then this causes a reference cycle and this
++ 		 * instance can never get freed. If UNIX is enabled we'll
++ 		 * handle it just fine, but there's still no point in allowing
++ 		 * a ring fd as it doesn't support regular read/write anyway.
++ 		 */
++ 		if (file->f_op == &io_uring_fops) {
++ 			fput(file);
++ 			break;
++ 		}
++ 		ret = 0;
++ 		table->files[index] = file;
++ 	}
++ 
++ 	if (ret) {
++ 		for (i = 0; i < ctx->nr_user_files; i++) {
++ 			file = io_file_from_index(ctx, i);
++ 			if (file)
++ 				fput(file);
++ 		}
++ 		for (i = 0; i < nr_tables; i++)
++ 			kfree(ctx->file_data->table[i].files);
++ 
++ 		kfree(ctx->file_data->table);
++ 		kfree(ctx->file_data);
++ 		ctx->file_data = NULL;
++ 		ctx->nr_user_files = 0;
++ 		return ret;
++ 	}
++ 
++ 	ret = io_sqe_files_scm(ctx);
++ 	if (ret) {
++ 		io_sqe_files_unregister(ctx);
++ 		return ret;
++ 	}
++ 
++ 	ref_node = alloc_fixed_file_ref_node(ctx);
++ 	if (IS_ERR(ref_node)) {
++ 		io_sqe_files_unregister(ctx);
++ 		return PTR_ERR(ref_node);
++ 	}
++ 
++ 	ctx->file_data->cur_refs = &ref_node->refs;
++ 	spin_lock_irqsave(&ctx->file_data->lock, flags);
++ 	list_add(&ref_node->node, &ctx->file_data->ref_list);
++ 	spin_unlock_irqrestore(&ctx->file_data->lock, flags);
++ 	percpu_ref_get(&ctx->file_data->refs);
++ 	return ret;
++ }
++ 
+++>>>>>>> f7fe9346869a (io_uring: initialize fixed_file_data lock)
+  static int io_sqe_file_register(struct io_ring_ctx *ctx, struct file *file,
+  				int index)
+  {
+* Unmerged path fs/io_uring.c
