@@ -1,0 +1,177 @@
+io_uring: fix use-after-free by io_cleanup_req()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Pavel Begunkov <asml.silence@gmail.com>
+commit 929a3af90f0f4bd7132d83552c1a98c83f60ef7e
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/929a3af9.failed
+
+io_cleanup_req() should be called before req->io is freed, and so
+shouldn't be after __io_free_req() -> __io_req_aux_free(). Also,
+it will be ignored for in io_free_req_many(), which use
+__io_req_aux_free().
+
+Place cleanup_req() into __io_req_aux_free().
+
+Fixes: 99bc4c38537d774 ("io_uring: fix iovec leaks")
+	Signed-off-by: Pavel Begunkov <asml.silence@gmail.com>
+	Signed-off-by: Jens Axboe <axboe@kernel.dk>
+(cherry picked from commit 929a3af90f0f4bd7132d83552c1a98c83f60ef7e)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/io_uring.c
+diff --cc fs/io_uring.c
+index ffb8e9d82a6a,6e249aa97ba3..000000000000
+--- a/fs/io_uring.c
++++ b/fs/io_uring.c
+@@@ -612,26 -1248,130 +612,64 @@@ out
+  	return NULL;
+  }
+  
+ -static void __io_req_do_free(struct io_kiocb *req)
+ +static void io_free_req_many(struct io_ring_ctx *ctx, void **reqs, int *nr)
+  {
+++<<<<<<< HEAD
+ +	if (*nr) {
+ +		kmem_cache_free_bulk(req_cachep, *nr, reqs);
+ +		percpu_ref_put_many(&ctx->refs, *nr);
+ +		*nr = 0;
+++=======
++ 	if (likely(!io_is_fallback_req(req)))
++ 		kmem_cache_free(req_cachep, req);
++ 	else
++ 		clear_bit_unlock(0, (unsigned long *) req->ctx->fallback_req);
++ }
++ 
++ static void __io_req_aux_free(struct io_kiocb *req)
++ {
++ 	struct io_ring_ctx *ctx = req->ctx;
++ 
++ 	if (req->flags & REQ_F_NEED_CLEANUP)
++ 		io_cleanup_req(req);
++ 
++ 	kfree(req->io);
++ 	if (req->file) {
++ 		if (req->flags & REQ_F_FIXED_FILE)
++ 			percpu_ref_put(&ctx->file_data->refs);
++ 		else
++ 			fput(req->file);
+++>>>>>>> 929a3af90f0f (io_uring: fix use-after-free by io_cleanup_req())
+  	}
+ -
+ -	io_req_work_drop_env(req);
+  }
+  
+  static void __io_free_req(struct io_kiocb *req)
+  {
+++<<<<<<< HEAD
+ +	if (req->file && !(req->flags & REQ_F_FIXED_FILE))
+ +		fput(req->file);
+++=======
++ 	__io_req_aux_free(req);
++ 
++ 	if (req->flags & REQ_F_INFLIGHT) {
++ 		struct io_ring_ctx *ctx = req->ctx;
++ 		unsigned long flags;
++ 
++ 		spin_lock_irqsave(&ctx->inflight_lock, flags);
++ 		list_del(&req->inflight_entry);
++ 		if (waitqueue_active(&ctx->inflight_wait))
++ 			wake_up(&ctx->inflight_wait);
++ 		spin_unlock_irqrestore(&ctx->inflight_lock, flags);
++ 	}
++ 
+++>>>>>>> 929a3af90f0f (io_uring: fix use-after-free by io_cleanup_req())
+  	percpu_ref_put(&req->ctx->refs);
+ -	__io_req_do_free(req);
+ +	kmem_cache_free(req_cachep, req);
+  }
+  
+ -struct req_batch {
+ -	void *reqs[IO_IOPOLL_BATCH];
+ -	int to_free;
+ -	int need_iter;
+ -};
+ -
+ -static void io_free_req_many(struct io_ring_ctx *ctx, struct req_batch *rb)
+ -{
+ -	int fixed_refs = rb->to_free;
+ -
+ -	if (!rb->to_free)
+ -		return;
+ -	if (rb->need_iter) {
+ -		int i, inflight = 0;
+ -		unsigned long flags;
+ -
+ -		fixed_refs = 0;
+ -		for (i = 0; i < rb->to_free; i++) {
+ -			struct io_kiocb *req = rb->reqs[i];
+ -
+ -			if (req->flags & REQ_F_FIXED_FILE) {
+ -				req->file = NULL;
+ -				fixed_refs++;
+ -			}
+ -			if (req->flags & REQ_F_INFLIGHT)
+ -				inflight++;
+ -			__io_req_aux_free(req);
+ -		}
+ -		if (!inflight)
+ -			goto do_free;
+ -
+ -		spin_lock_irqsave(&ctx->inflight_lock, flags);
+ -		for (i = 0; i < rb->to_free; i++) {
+ -			struct io_kiocb *req = rb->reqs[i];
+ -
+ -			if (req->flags & REQ_F_INFLIGHT) {
+ -				list_del(&req->inflight_entry);
+ -				if (!--inflight)
+ -					break;
+ -			}
+ -		}
+ -		spin_unlock_irqrestore(&ctx->inflight_lock, flags);
+ -
+ -		if (waitqueue_active(&ctx->inflight_wait))
+ -			wake_up(&ctx->inflight_wait);
+ -	}
+ -do_free:
+ -	kmem_cache_free_bulk(req_cachep, rb->to_free, rb->reqs);
+ -	if (fixed_refs)
+ -		percpu_ref_put_many(&ctx->file_data->refs, fixed_refs);
+ -	percpu_ref_put_many(&ctx->refs, rb->to_free);
+ -	rb->to_free = rb->need_iter = 0;
+ -}
+ -
+ -static bool io_link_cancel_timeout(struct io_kiocb *req)
+ -{
+ -	struct io_ring_ctx *ctx = req->ctx;
+ -	int ret;
+ -
+ -	ret = hrtimer_try_to_cancel(&req->io->timeout.timer);
+ -	if (ret != -1) {
+ -		io_cqring_fill_event(req, -ECANCELED);
+ -		io_commit_cqring(ctx);
+ -		req->flags &= ~REQ_F_LINK;
+ -		io_put_req(req);
+ -		return true;
+ -	}
+ -
+ -	return false;
+ -}
+ -
+ -static void io_req_link_next(struct io_kiocb *req, struct io_kiocb **nxtptr)
+ +static void io_req_link_next(struct io_kiocb *req)
+  {
+ -	struct io_ring_ctx *ctx = req->ctx;
+ -	bool wake_ev = false;
+ -
+ -	/* Already got next link */
+ -	if (req->flags & REQ_F_LINK_NEXT)
+ -		return;
+ +	struct io_kiocb *nxt;
+  
+  	/*
+  	 * The list should never be empty when we are called here. But could
+* Unmerged path fs/io_uring.c
