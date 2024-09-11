@@ -1,0 +1,159 @@
+dma-mapping: fix handling of dma-ranges for reserved memory (again)
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-193.el8
+commit-author Vladimir Murzin <vladimir.murzin@arm.com>
+commit a445e940ea686fc60475564009821010eb213be3
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-193.el8/a445e940.failed
+
+Daniele reported that issue previously fixed in c41f9ea998f3
+("drivers: dma-coherent: Account dma_pfn_offset when used with device
+tree") reappear shortly after 43fc509c3efb ("dma-coherent: introduce
+interface for default DMA pool") where fix was accidentally dropped.
+
+Lets put fix back in place and respect dma-ranges for reserved memory.
+
+Fixes: 43fc509c3efb ("dma-coherent: introduce interface for default DMA pool")
+
+	Reported-by: Daniele Alessandrelli <daniele.alessandrelli@gmail.com>
+	Tested-by: Daniele Alessandrelli <daniele.alessandrelli@gmail.com>
+	Tested-by: Alexandre Torgue <alexandre.torgue@st.com>
+	Signed-off-by: Vladimir Murzin <vladimir.murzin@arm.com>
+	Signed-off-by: Christoph Hellwig <hch@lst.de>
+(cherry picked from commit a445e940ea686fc60475564009821010eb213be3)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/arm/mm/dma-mapping-nommu.c
+#	kernel/dma/coherent.c
+diff --cc arch/arm/mm/dma-mapping-nommu.c
+index f448a0663b10,287ef898a55e..000000000000
+--- a/arch/arm/mm/dma-mapping-nommu.c
++++ b/arch/arm/mm/dma-mapping-nommu.c
+@@@ -39,17 -35,7 +39,21 @@@ static void *arm_nommu_dma_alloc(struc
+  				 unsigned long attrs)
+  
+  {
+++<<<<<<< HEAD
+ +	void *ret;
+ +
+ +	/*
+ +	 * Try generic allocator first if we are advertised that
+ +	 * consistency is not required.
+ +	 */
+ +
+ +	if (attrs & DMA_ATTR_NON_CONSISTENT)
+ +		return dma_direct_alloc(dev, size, dma_handle, gfp, attrs);
+ +
+ +	ret = dma_alloc_from_global_coherent(size, dma_handle);
+++=======
++ 	void *ret = dma_alloc_from_global_coherent(dev, size, dma_handle);
+++>>>>>>> a445e940ea68 (dma-mapping: fix handling of dma-ranges for reserved memory (again))
+  
+  	/*
+  	 * dma_alloc_from_global_coherent() may fail because:
+diff --cc kernel/dma/coherent.c
+index 66f0fb7e9a3a,551b0eb7028a..000000000000
+--- a/kernel/dma/coherent.c
++++ b/kernel/dma/coherent.c
+@@@ -124,44 -122,10 +124,45 @@@ int dma_declare_coherent_memory(struct 
+  		dma_release_coherent_memory(mem);
+  	return ret;
+  }
+ +EXPORT_SYMBOL(dma_declare_coherent_memory);
+ +
+ +void dma_release_declared_memory(struct device *dev)
+ +{
+ +	struct dma_coherent_mem *mem = dev->dma_mem;
+ +
+ +	if (!mem)
+ +		return;
+ +	dma_release_coherent_memory(mem);
+ +	dev->dma_mem = NULL;
+ +}
+ +EXPORT_SYMBOL(dma_release_declared_memory);
+ +
+ +void *dma_mark_declared_memory_occupied(struct device *dev,
+ +					dma_addr_t device_addr, size_t size)
+ +{
+ +	struct dma_coherent_mem *mem = dev->dma_mem;
+ +	unsigned long flags;
+ +	int pos, err;
+ +
+ +	size += device_addr & ~PAGE_MASK;
+ +
+ +	if (!mem)
+ +		return ERR_PTR(-EINVAL);
+ +
+ +	spin_lock_irqsave(&mem->spinlock, flags);
+ +	pos = PFN_DOWN(device_addr - dma_get_device_base(dev, mem));
+ +	err = bitmap_allocate_region(mem->bitmap, pos, get_order(size));
+ +	spin_unlock_irqrestore(&mem->spinlock, flags);
+ +
+ +	if (err != 0)
+ +		return ERR_PTR(err);
+ +	return mem->virt_base + (pos << PAGE_SHIFT);
+ +}
+ +EXPORT_SYMBOL(dma_mark_declared_memory_occupied);
+  
+- static void *__dma_alloc_from_coherent(struct dma_coherent_mem *mem,
+- 		ssize_t size, dma_addr_t *dma_handle)
++ static void *__dma_alloc_from_coherent(struct device *dev,
++ 				       struct dma_coherent_mem *mem,
++ 				       ssize_t size, dma_addr_t *dma_handle)
+  {
+  	int order = get_order(size);
+  	unsigned long flags;
+@@@ -212,19 -176,12 +213,25 @@@ int dma_alloc_from_dev_coherent(struct 
+  	if (!mem)
+  		return 0;
+  
+++<<<<<<< HEAD
+ +	*ret = __dma_alloc_from_coherent(mem, size, dma_handle);
+ +	if (*ret)
+ +		return 1;
+ +
+ +	/*
+ +	 * In the case where the allocation can not be satisfied from the
+ +	 * per-device area, try to fall back to generic memory if the
+ +	 * constraints allow it.
+ +	 */
+ +	return mem->flags & DMA_MEMORY_EXCLUSIVE;
+++=======
++ 	*ret = __dma_alloc_from_coherent(dev, mem, size, dma_handle);
++ 	return 1;
+++>>>>>>> a445e940ea68 (dma-mapping: fix handling of dma-ranges for reserved memory (again))
+  }
+  
+- void *dma_alloc_from_global_coherent(ssize_t size, dma_addr_t *dma_handle)
++ void *dma_alloc_from_global_coherent(struct device *dev, ssize_t size,
++ 				     dma_addr_t *dma_handle)
+  {
+  	if (!dma_coherent_default_memory)
+  		return NULL;
+* Unmerged path arch/arm/mm/dma-mapping-nommu.c
+diff --git a/include/linux/dma-mapping.h b/include/linux/dma-mapping.h
+index ed23ee2d7dd4..ea84a60f079b 100644
+--- a/include/linux/dma-mapping.h
++++ b/include/linux/dma-mapping.h
+@@ -175,7 +175,7 @@ int dma_release_from_dev_coherent(struct device *dev, int order, void *vaddr);
+ int dma_mmap_from_dev_coherent(struct device *dev, struct vm_area_struct *vma,
+ 			    void *cpu_addr, size_t size, int *ret);
+ 
+-void *dma_alloc_from_global_coherent(ssize_t size, dma_addr_t *dma_handle);
++void *dma_alloc_from_global_coherent(struct device *dev, ssize_t size, dma_addr_t *dma_handle);
+ int dma_release_from_global_coherent(int order, void *vaddr);
+ int dma_mmap_from_global_coherent(struct vm_area_struct *vma, void *cpu_addr,
+ 				  size_t size, int *ret);
+@@ -185,7 +185,7 @@ int dma_mmap_from_global_coherent(struct vm_area_struct *vma, void *cpu_addr,
+ #define dma_release_from_dev_coherent(dev, order, vaddr) (0)
+ #define dma_mmap_from_dev_coherent(dev, vma, vaddr, order, ret) (0)
+ 
+-static inline void *dma_alloc_from_global_coherent(ssize_t size,
++static inline void *dma_alloc_from_global_coherent(struct device *dev, ssize_t size,
+ 						   dma_addr_t *dma_handle)
+ {
+ 	return NULL;
+* Unmerged path kernel/dma/coherent.c
