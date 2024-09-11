@@ -39,9 +39,9 @@ typedef struct {
 } mm_context_t;
 
 /*
- * This macro is only used by the TLBI code, which cannot race with an
- * ASID change and therefore doesn't need to reload the counter using
- * atomic64_read.
+ * This macro is only used by the TLBI and low-level switch_mm() code,
+ * neither of which can race with an ASID change. We therefore don't
+ * need to reload the counter using atomic64_read().
  */
 #define __ASID(asid)	((asid) & 0xffff)
 #define ASID(mm)	__ASID((mm)->context.id.counter)
