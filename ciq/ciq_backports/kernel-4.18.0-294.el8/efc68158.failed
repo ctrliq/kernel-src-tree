@@ -1,0 +1,175 @@
+bpf: change logging calls from verbose() to bpf_log() and use log pointer
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Toke Høiland-Jørgensen <toke@redhat.com>
+commit efc68158c429f37d87fd02ee9a26913c78546fc9
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/efc68158.failed
+
+In preparation for moving code around, change a bunch of references to
+env->log (and the verbose() logging helper) to use bpf_log() and a direct
+pointer to struct bpf_verifier_log. While we're touching the function
+signature, mark the 'prog' argument to bpf_check_type_match() as const.
+
+Also enhance the bpf_verifier_log_needed() check to handle NULL pointers
+for the log struct so we can re-use the code with logging disabled.
+
+	Acked-by: Andrii Nakryiko <andriin@fb.com>
+	Signed-off-by: Toke Høiland-Jørgensen <toke@redhat.com>
+	Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+(cherry picked from commit efc68158c429f37d87fd02ee9a26913c78546fc9)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	kernel/bpf/verifier.c
+diff --cc kernel/bpf/verifier.c
+index 9fd915b15d99,d93489c1ac65..000000000000
+--- a/kernel/bpf/verifier.c
++++ b/kernel/bpf/verifier.c
+@@@ -10590,8 -11249,10 +10590,9 @@@ static int check_attach_btf_id(struct b
+  	struct bpf_prog *prog = env->prog;
+  	bool prog_extension = prog->type == BPF_PROG_TYPE_EXT;
+  	struct bpf_prog *tgt_prog = prog->aux->linked_prog;
++ 	struct bpf_verifier_log *log = &env->log;
+  	u32 btf_id = prog->aux->attach_btf_id;
+  	const char prefix[] = "btf_trace_";
+ -	struct btf_func_model fmodel;
+  	int ret = 0, subprog = -1, i;
+  	struct bpf_trampoline *tr;
+  	const struct btf_type *t;
+@@@ -10733,6 -11400,21 +10734,24 @@@
+  		prog->aux->attach_func_proto = t;
+  		prog->aux->attach_btf_trace = true;
+  		return 0;
+++<<<<<<< HEAD
+++=======
++ 	case BPF_TRACE_ITER:
++ 		if (!btf_type_is_func(t)) {
++ 			bpf_log(log, "attach_btf_id %u is not a function\n",
++ 				btf_id);
++ 			return -EINVAL;
++ 		}
++ 		t = btf_type_by_id(btf, t->type);
++ 		if (!btf_type_is_func_proto(t))
++ 			return -EINVAL;
++ 		prog->aux->attach_func_name = tname;
++ 		prog->aux->attach_func_proto = t;
++ 		if (!bpf_iter_prog_supported(prog))
++ 			return -EINVAL;
++ 		ret = btf_distill_func_proto(log, btf, t, tname, &fmodel);
++ 		return ret;
+++>>>>>>> efc68158c429 (bpf: change logging calls from verbose() to bpf_log() and use log pointer)
+  	default:
+  		if (!prog_extension)
+  			return -EINVAL;
+@@@ -10793,13 -11475,41 +10812,46 @@@
+  			}
+  		}
+  
+++<<<<<<< HEAD
+ +		if (prog->expected_attach_type == BPF_MODIFY_RETURN) {
+++=======
++ 		if (prog->aux->sleepable) {
++ 			ret = -EINVAL;
++ 			switch (prog->type) {
++ 			case BPF_PROG_TYPE_TRACING:
++ 				/* fentry/fexit/fmod_ret progs can be sleepable only if they are
++ 				 * attached to ALLOW_ERROR_INJECTION and are not in denylist.
++ 				 */
++ 				if (!check_non_sleepable_error_inject(btf_id) &&
++ 				    within_error_injection_list(addr))
++ 					ret = 0;
++ 				break;
++ 			case BPF_PROG_TYPE_LSM:
++ 				/* LSM progs check that they are attached to bpf_lsm_*() funcs.
++ 				 * Only some of them are sleepable.
++ 				 */
++ 				if (check_sleepable_lsm_hook(btf_id))
++ 					ret = 0;
++ 				break;
++ 			default:
++ 				break;
++ 			}
++ 			if (ret)
++ 				bpf_log(log, "%s is not sleepable\n",
++ 					prog->aux->attach_func_name);
++ 		} else if (prog->expected_attach_type == BPF_MODIFY_RETURN) {
++ 			if (tgt_prog) {
++ 				bpf_log(log, "can't modify return codes of BPF programs\n");
++ 				ret = -EINVAL;
++ 				goto out;
++ 			}
+++>>>>>>> efc68158c429 (bpf: change logging calls from verbose() to bpf_log() and use log pointer)
+  			ret = check_attach_modify_return(prog, addr);
+  			if (ret)
+- 				verbose(env, "%s() is not modifiable\n",
++ 				bpf_log(log, "%s() is not modifiable\n",
+  					prog->aux->attach_func_name);
+  		}
+ +
+  		if (ret)
+  			goto out;
+  		tr->func.addr = (void *)addr;
+diff --git a/include/linux/bpf.h b/include/linux/bpf.h
+index 53810b02f758..afeed6c54cf6 100644
+--- a/include/linux/bpf.h
++++ b/include/linux/bpf.h
+@@ -1263,7 +1263,7 @@ int btf_check_func_arg_match(struct bpf_verifier_env *env, int subprog,
+ 			     struct bpf_reg_state *regs);
+ int btf_prepare_func_args(struct bpf_verifier_env *env, int subprog,
+ 			  struct bpf_reg_state *reg);
+-int btf_check_type_match(struct bpf_verifier_env *env, struct bpf_prog *prog,
++int btf_check_type_match(struct bpf_verifier_log *log, const struct bpf_prog *prog,
+ 			 struct btf *btf, const struct btf_type *t);
+ 
+ struct bpf_prog *bpf_prog_by_id(u32 id);
+diff --git a/include/linux/bpf_verifier.h b/include/linux/bpf_verifier.h
+index 37159d005edc..c6bc408d55dd 100644
+--- a/include/linux/bpf_verifier.h
++++ b/include/linux/bpf_verifier.h
+@@ -346,8 +346,9 @@ static inline bool bpf_verifier_log_full(const struct bpf_verifier_log *log)
+ 
+ static inline bool bpf_verifier_log_needed(const struct bpf_verifier_log *log)
+ {
+-	return (log->level && log->ubuf && !bpf_verifier_log_full(log)) ||
+-		log->level == BPF_LOG_KERNEL;
++	return log &&
++		((log->level && log->ubuf && !bpf_verifier_log_full(log)) ||
++		 log->level == BPF_LOG_KERNEL);
+ }
+ 
+ #define BPF_MAX_SUBPROGS 256
+diff --git a/kernel/bpf/btf.c b/kernel/bpf/btf.c
+index 52afb4b50a36..789331b6a762 100644
+--- a/kernel/bpf/btf.c
++++ b/kernel/bpf/btf.c
+@@ -4321,7 +4321,7 @@ static int btf_check_func_type_match(struct bpf_verifier_log *log,
+ }
+ 
+ /* Compare BTFs of given program with BTF of target program */
+-int btf_check_type_match(struct bpf_verifier_env *env, struct bpf_prog *prog,
++int btf_check_type_match(struct bpf_verifier_log *log, const struct bpf_prog *prog,
+ 			 struct btf *btf2, const struct btf_type *t2)
+ {
+ 	struct btf *btf1 = prog->aux->btf;
+@@ -4329,7 +4329,7 @@ int btf_check_type_match(struct bpf_verifier_env *env, struct bpf_prog *prog,
+ 	u32 btf_id = 0;
+ 
+ 	if (!prog->aux->func_info) {
+-		bpf_log(&env->log, "Program extension requires BTF\n");
++		bpf_log(log, "Program extension requires BTF\n");
+ 		return -EINVAL;
+ 	}
+ 
+@@ -4341,7 +4341,7 @@ int btf_check_type_match(struct bpf_verifier_env *env, struct bpf_prog *prog,
+ 	if (!t1 || !btf_type_is_func(t1))
+ 		return -EFAULT;
+ 
+-	return btf_check_func_type_match(&env->log, btf1, t1, btf2, t2);
++	return btf_check_func_type_match(log, btf1, t1, btf2, t2);
+ }
+ 
+ /* Compare BTF of a function with given bpf_reg_state.
+* Unmerged path kernel/bpf/verifier.c
