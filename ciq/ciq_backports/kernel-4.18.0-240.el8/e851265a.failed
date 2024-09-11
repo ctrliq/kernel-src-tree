@@ -1,0 +1,162 @@
+KVM: x86/mmu: Use huge pages for DAX-backed files
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Sean Christopherson <sean.j.christopherson@intel.com>
+commit e851265a816f96a86c5a0316d2fc4d45be76d1d4
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/e851265a.failed
+
+Walk the host page tables to identify hugepage mappings for ZONE_DEVICE
+pfns, i.e. DAX pages.  Explicitly query kvm_is_zone_device_pfn() when
+deciding whether or not to bother walking the host page tables, as DAX
+pages do not set up the head/tail infrastructure, i.e. will return false
+for PageCompound() even when using huge pages.
+
+Zap ZONE_DEVICE sptes when disabling dirty logging, e.g. if live
+migration fails, to allow KVM to rebuild large pages for DAX-based
+mappings.  Presumably DAX favors large pages, and worst case scenario is
+a minor performance hit as KVM will need to re-fault all DAX-based
+pages.
+
+	Suggested-by: Barret Rhoden <brho@google.com>
+	Cc: David Hildenbrand <david@redhat.com>
+	Cc: Dan Williams <dan.j.williams@intel.com>
+	Cc: Jason Zeng <jason.zeng@intel.com>
+	Cc: Dave Jiang <dave.jiang@intel.com>
+	Cc: Liran Alon <liran.alon@oracle.com>
+	Cc: linux-nvdimm <linux-nvdimm@lists.01.org>
+	Signed-off-by: Sean Christopherson <sean.j.christopherson@intel.com>
+	Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+(cherry picked from commit e851265a816f96a86c5a0316d2fc4d45be76d1d4)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kvm/mmu/mmu.c
+diff --cc arch/x86/kvm/mmu/mmu.c
+index f41b4d90aa8d,febd65a9721a..000000000000
+--- a/arch/x86/kvm/mmu/mmu.c
++++ b/arch/x86/kvm/mmu/mmu.c
+@@@ -3332,33 -3239,81 +3332,98 @@@ static void direct_pte_prefetch(struct 
+  	__direct_pte_prefetch(vcpu, sp, sptep);
+  }
+  
+ -static int host_pfn_mapping_level(struct kvm_vcpu *vcpu, gfn_t gfn,
+ -				  kvm_pfn_t pfn, struct kvm_memory_slot *slot)
+ +static void transparent_hugepage_adjust(struct kvm_vcpu *vcpu,
+ +					gfn_t gfn, kvm_pfn_t *pfnp,
+ +					int *levelp)
+  {
+++<<<<<<< HEAD
+ +	kvm_pfn_t pfn = *pfnp;
+ +	int level = *levelp;
+++=======
++ 	unsigned long hva;
++ 	pte_t *pte;
++ 	int level;
++ 
++ 	BUILD_BUG_ON(PT_PAGE_TABLE_LEVEL != (int)PG_LEVEL_4K ||
++ 		     PT_DIRECTORY_LEVEL != (int)PG_LEVEL_2M ||
++ 		     PT_PDPE_LEVEL != (int)PG_LEVEL_1G);
++ 
++ 	if (!PageCompound(pfn_to_page(pfn)) && !kvm_is_zone_device_pfn(pfn))
++ 		return PT_PAGE_TABLE_LEVEL;
++ 
++ 	/*
++ 	 * Note, using the already-retrieved memslot and __gfn_to_hva_memslot()
++ 	 * is not solely for performance, it's also necessary to avoid the
++ 	 * "writable" check in __gfn_to_hva_many(), which will always fail on
++ 	 * read-only memslots due to gfn_to_hva() assuming writes.  Earlier
++ 	 * page fault steps have already verified the guest isn't writing a
++ 	 * read-only memslot.
++ 	 */
++ 	hva = __gfn_to_hva_memslot(slot, gfn);
++ 
++ 	pte = lookup_address_in_mm(vcpu->kvm->mm, hva, &level);
++ 	if (unlikely(!pte))
++ 		return PT_PAGE_TABLE_LEVEL;
++ 
++ 	return level;
++ }
++ 
++ static int kvm_mmu_hugepage_adjust(struct kvm_vcpu *vcpu, gfn_t gfn,
++ 				   int max_level, kvm_pfn_t *pfnp)
++ {
++ 	struct kvm_memory_slot *slot;
++ 	struct kvm_lpage_info *linfo;
++ 	kvm_pfn_t pfn = *pfnp;
++ 	kvm_pfn_t mask;
++ 	int level;
++ 
++ 	if (unlikely(max_level == PT_PAGE_TABLE_LEVEL))
++ 		return PT_PAGE_TABLE_LEVEL;
++ 
++ 	if (is_error_noslot_pfn(pfn) || kvm_is_reserved_pfn(pfn))
++ 		return PT_PAGE_TABLE_LEVEL;
++ 
++ 	slot = gfn_to_memslot_dirty_bitmap(vcpu, gfn, true);
++ 	if (!slot)
++ 		return PT_PAGE_TABLE_LEVEL;
++ 
++ 	max_level = min(max_level, kvm_x86_ops->get_lpage_level());
++ 	for ( ; max_level > PT_PAGE_TABLE_LEVEL; max_level--) {
++ 		linfo = lpage_info_slot(gfn, slot, max_level);
++ 		if (!linfo->disallow_lpage)
++ 			break;
++ 	}
++ 
++ 	if (max_level == PT_PAGE_TABLE_LEVEL)
++ 		return PT_PAGE_TABLE_LEVEL;
++ 
++ 	level = host_pfn_mapping_level(vcpu, gfn, pfn, slot);
++ 	if (level == PT_PAGE_TABLE_LEVEL)
++ 		return level;
++ 
++ 	level = min(level, max_level);
+++>>>>>>> e851265a816f (KVM: x86/mmu: Use huge pages for DAX-backed files)
+  
+  	/*
+ -	 * mmu_notifier_retry() was successful and mmu_lock is held, so
+ -	 * the pmd can't be split from under us.
+ +	 * Check if it's a transparent hugepage. If this would be an
+ +	 * hugetlbfs page, level wouldn't be set to
+ +	 * PT_PAGE_TABLE_LEVEL and there would be no adjustment done
+ +	 * here.
+  	 */
+ -	mask = KVM_PAGES_PER_HPAGE(level) - 1;
+ -	VM_BUG_ON((gfn & mask) != (pfn & mask));
+ -	*pfnp = pfn & ~mask;
+ +	if (!is_error_noslot_pfn(pfn) && !kvm_is_reserved_pfn(pfn) &&
+ +	    !kvm_is_zone_device_pfn(pfn) && level == PT_PAGE_TABLE_LEVEL &&
+ +	    PageTransCompoundMap(pfn_to_page(pfn))) {
+ +		unsigned long mask;
+  
+ -	return level;
+ +		/*
+ +		 * mmu_notifier_retry() was successful and mmu_lock is held, so
+ +		 * the pmd can't be split from under us.
+ +		 */
+ +		*levelp = level = PT_DIRECTORY_LEVEL;
+ +		mask = KVM_PAGES_PER_HPAGE(level) - 1;
+ +		VM_BUG_ON((gfn & mask) != (pfn & mask));
+ +		*pfnp = pfn & ~mask;
+ +	}
+  }
+  
+  static void disallowed_hugepage_adjust(struct kvm_shadow_walk_iterator it,
+@@@ -5962,8 -5911,8 +6027,13 @@@ restart
+  		 * mapping if the indirect sp has level = 1.
+  		 */
+  		if (sp->role.direct && !kvm_is_reserved_pfn(pfn) &&
+++<<<<<<< HEAD
+ +		    !kvm_is_zone_device_pfn(pfn) &&
+ +		    PageTransCompoundMap(pfn_to_page(pfn))) {
+++=======
++ 		    (kvm_is_zone_device_pfn(pfn) ||
++ 		     PageCompound(pfn_to_page(pfn)))) {
+++>>>>>>> e851265a816f (KVM: x86/mmu: Use huge pages for DAX-backed files)
+  			pte_list_remove(rmap_head, sptep);
+  
+  			if (kvm_available_flush_tlb_with_range())
+* Unmerged path arch/x86/kvm/mmu/mmu.c
