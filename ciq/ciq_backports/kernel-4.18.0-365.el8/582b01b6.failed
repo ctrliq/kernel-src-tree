@@ -1,0 +1,241 @@
+x86/fpu: Remove old KVM FPU interface
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-365.el8
+commit-author Thomas Gleixner <tglx@linutronix.de>
+commit 582b01b6ab2714a0a4d554cea7f0d4efeaa2154d
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-365.el8/582b01b6.failed
+
+No more users.
+
+	Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+	Signed-off-by: Borislav Petkov <bp@suse.de>
+Link: https://lkml.kernel.org/r/20211022185313.074853631@linutronix.de
+(cherry picked from commit 582b01b6ab2714a0a4d554cea7f0d4efeaa2154d)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/include/asm/fpu/api.h
+#	arch/x86/kernel/fpu/core.c
+diff --cc arch/x86/include/asm/fpu/api.h
+index 9833eb36228b,e9379d7e7743..000000000000
+--- a/arch/x86/include/asm/fpu/api.h
++++ b/arch/x86/include/asm/fpu/api.h
+@@@ -95,13 -110,45 +95,22 @@@ extern int cpu_has_xfeatures(u64 xfeatu
+  
+  static inline void update_pasid(void) { }
+  
+ -/* Trap handling */
+ -extern int  fpu__exception_code(struct fpu *fpu, int trap_nr);
+ -extern void fpu_sync_fpstate(struct fpu *fpu);
+ -extern void fpu_reset_from_exception_fixup(void);
+ -
+ -/* Boot, hotplug and resume */
+ -extern void fpu__init_cpu(void);
+ -extern void fpu__init_system(struct cpuinfo_x86 *c);
+ -extern void fpu__init_check_bugs(void);
+ -extern void fpu__resume_cpu(void);
+ -
+ -#ifdef CONFIG_MATH_EMULATION
+ -extern void fpstate_init_soft(struct swregs_state *soft);
+ -#else
+ -static inline void fpstate_init_soft(struct swregs_state *soft) {}
+ -#endif
+ -
+ -/* State tracking */
+ -DECLARE_PER_CPU(struct fpu *, fpu_fpregs_owner_ctx);
+ -
+  /* fpstate-related functions which are exported to KVM */
+++<<<<<<< HEAD
+ +extern void fpu_init_fpstate_user(struct fpu *fpu);
+ +
+ +/* KVM specific functions */
+ +extern void fpu_swap_kvm_fpu(struct fpu *save, struct fpu *rstor, u64 restore_mask);
+++=======
++ extern void fpstate_clear_xstate_component(struct fpstate *fps, unsigned int xfeature);
++ 
++ /* KVM specific functions */
++ extern bool fpu_alloc_guest_fpstate(struct fpu_guest *gfpu);
++ extern void fpu_free_guest_fpstate(struct fpu_guest *gfpu);
++ extern int fpu_swap_kvm_fpstate(struct fpu_guest *gfpu, bool enter_guest);
+++>>>>>>> 582b01b6ab27 (x86/fpu: Remove old KVM FPU interface)
+  
+ -extern void fpu_copy_guest_fpstate_to_uabi(struct fpu_guest *gfpu, void *buf, unsigned int size, u32 pkru);
+ -extern int fpu_copy_uabi_to_guest_fpstate(struct fpu_guest *gfpu, const void *buf, u64 xcr0, u32 *vpkru);
+ -
+ -static inline void fpstate_set_confidential(struct fpu_guest *gfpu)
+ -{
+ -	gfpu->fpstate->is_confidential = true;
+ -}
+ -
+ -static inline bool fpstate_is_confidential(struct fpu_guest *gfpu)
+ -{
+ -	return gfpu->fpstate->is_confidential;
+ -}
+ +extern int fpu_copy_kvm_uabi_to_fpstate(struct fpu *fpu, const void *buf, u64 xcr0, u32 *pkru);
+ +extern void fpu_copy_fpstate_to_kvm_uabi(struct fpu *fpu, void *buf, unsigned int size, u32 pkru);
+  
+  #endif /* _ASM_X86_FPU_API_H */
+diff --cc arch/x86/kernel/fpu/core.c
+index 2859edb41245,9c475e2efd4d..000000000000
+--- a/arch/x86/kernel/fpu/core.c
++++ b/arch/x86/kernel/fpu/core.c
+@@@ -151,34 -170,85 +151,108 @@@ void restore_fpregs_from_fpstate(union 
+  	}
+  }
+  
+ -void fpu_reset_from_exception_fixup(void)
+ +#if IS_ENABLED(CONFIG_KVM)
+++<<<<<<< HEAD
+ +void fpu_swap_kvm_fpu(struct fpu *save, struct fpu *rstor, u64 restore_mask)
+  {
+ -	restore_fpregs_from_fpstate(&init_fpstate, XFEATURE_MASK_FPSTATE);
+ +	fpregs_lock();
+ +
+ +	if (save) {
+ +		if (test_thread_flag(TIF_NEED_FPU_LOAD)) {
+ +			memcpy(&save->state, &current->thread.fpu.state,
+ +			       fpu_kernel_xstate_size);
+ +		} else {
+ +			save_fpregs_to_fpstate(save);
+ +		}
+ +	}
+ +
+ +	if (rstor) {
+ +		restore_mask &= xfeatures_mask_fpstate();
+ +		restore_fpregs_from_fpstate(&rstor->state, restore_mask);
+ +	}
+ +
+ +	fpregs_mark_activate();
+ +	fpregs_unlock();
+  }
+ +EXPORT_SYMBOL_GPL(fpu_swap_kvm_fpu);
+  
+ -#if IS_ENABLED(CONFIG_KVM)
+ +void fpu_copy_fpstate_to_kvm_uabi(struct fpu *fpu, void *buf,
+ +			       unsigned int size, u32 pkru)
+++=======
++ static void __fpstate_reset(struct fpstate *fpstate);
++ 
++ bool fpu_alloc_guest_fpstate(struct fpu_guest *gfpu)
++ {
++ 	struct fpstate *fpstate;
++ 	unsigned int size;
++ 
++ 	size = fpu_user_cfg.default_size + ALIGN(offsetof(struct fpstate, regs), 64);
++ 	fpstate = vzalloc(size);
++ 	if (!fpstate)
++ 		return false;
++ 
++ 	__fpstate_reset(fpstate);
++ 	fpstate_init_user(fpstate);
++ 	fpstate->is_valloc	= true;
++ 	fpstate->is_guest	= true;
++ 
++ 	gfpu->fpstate = fpstate;
++ 	return true;
++ }
++ EXPORT_SYMBOL_GPL(fpu_alloc_guest_fpstate);
++ 
++ void fpu_free_guest_fpstate(struct fpu_guest *gfpu)
++ {
++ 	struct fpstate *fps = gfpu->fpstate;
++ 
++ 	if (!fps)
++ 		return;
++ 
++ 	if (WARN_ON_ONCE(!fps->is_valloc || !fps->is_guest || fps->in_use))
++ 		return;
++ 
++ 	gfpu->fpstate = NULL;
++ 	vfree(fps);
++ }
++ EXPORT_SYMBOL_GPL(fpu_free_guest_fpstate);
++ 
++ int fpu_swap_kvm_fpstate(struct fpu_guest *guest_fpu, bool enter_guest)
++ {
++ 	struct fpstate *guest_fps = guest_fpu->fpstate;
++ 	struct fpu *fpu = &current->thread.fpu;
++ 	struct fpstate *cur_fps = fpu->fpstate;
++ 
++ 	fpregs_lock();
++ 	if (!cur_fps->is_confidential && !test_thread_flag(TIF_NEED_FPU_LOAD))
++ 		save_fpregs_to_fpstate(fpu);
++ 
++ 	/* Swap fpstate */
++ 	if (enter_guest) {
++ 		fpu->__task_fpstate = cur_fps;
++ 		fpu->fpstate = guest_fps;
++ 		guest_fps->in_use = true;
++ 	} else {
++ 		guest_fps->in_use = false;
++ 		fpu->fpstate = fpu->__task_fpstate;
++ 		fpu->__task_fpstate = NULL;
++ 	}
++ 
++ 	cur_fps = fpu->fpstate;
++ 
++ 	if (!cur_fps->is_confidential)
++ 		restore_fpregs_from_fpstate(cur_fps, XFEATURE_MASK_FPSTATE);
++ 
++ 	fpregs_mark_activate();
++ 	fpregs_unlock();
++ 	return 0;
++ }
++ EXPORT_SYMBOL_GPL(fpu_swap_kvm_fpstate);
++ 
++ void fpu_copy_guest_fpstate_to_uabi(struct fpu_guest *gfpu, void *buf,
++ 				    unsigned int size, u32 pkru)
+++>>>>>>> 582b01b6ab27 (x86/fpu: Remove old KVM FPU interface)
+  {
+ -	struct fpstate *kstate = gfpu->fpstate;
+ +	union fpregs_state *kstate = &fpu->state;
+  	union fpregs_state *ustate = buf;
+  	struct membuf mb = { .p = buf, .left = size };
+  
+@@@ -320,22 -390,30 +394,25 @@@ void fpstate_init_user(union fpregs_sta
+  		return;
+  	}
+  
+ -	xstate_init_xcomp_bv(&fpstate->regs.xsave, fpstate->xfeatures);
+ +	xstate_init_xcomp_bv(&state->xsave, xfeatures_mask_uabi());
+  
+  	if (cpu_feature_enabled(X86_FEATURE_FXSR))
+ -		fpstate_init_fxstate(fpstate);
+ +		fpstate_init_fxstate(&state->fxsave);
+  	else
+ -		fpstate_init_fstate(fpstate);
+ +		fpstate_init_fstate(&state->fsave);
+  }
+  
+ -static void __fpstate_reset(struct fpstate *fpstate)
+ -{
+ -	/* Initialize sizes and feature masks */
+ -	fpstate->size		= fpu_kernel_cfg.default_size;
+ -	fpstate->user_size	= fpu_user_cfg.default_size;
+ -	fpstate->xfeatures	= fpu_kernel_cfg.default_features;
+ -	fpstate->user_xfeatures	= fpu_user_cfg.default_features;
+ -}
+ -
+ -void fpstate_reset(struct fpu *fpu)
+++<<<<<<< HEAD
+ +#if IS_ENABLED(CONFIG_KVM)
+ +void fpu_init_fpstate_user(struct fpu *fpu)
+  {
+ -	/* Set the fpstate pointer to the default fpstate */
+ -	fpu->fpstate = &fpu->__fpstate;
+ -	__fpstate_reset(fpu->fpstate);
+ +	fpstate_init_user(&fpu->state);
+  }
+ +EXPORT_SYMBOL_GPL(fpu_init_fpstate_user);
+ +#endif
+  
+++=======
+++>>>>>>> 582b01b6ab27 (x86/fpu: Remove old KVM FPU interface)
+  /* Clone current's FPU state on fork */
+  int fpu_clone(struct task_struct *dst)
+  {
+* Unmerged path arch/x86/include/asm/fpu/api.h
+* Unmerged path arch/x86/kernel/fpu/core.c
