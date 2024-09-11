@@ -1,0 +1,178 @@
+net/mlx5e: Only access fully initialized flows in neigh update
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-193.el8
+Rebuild_CHGLOG: - [netdrv] mlx5e: Only access fully initialized flows in neigh update (Alaa Hleihel) [1663231 1724336]
+Rebuild_FUZZ: 96.67%
+commit-author Vlad Buslov <vladbu@mellanox.com>
+commit 95435ad7999b1218367f0667ed5fe98d042ffe78
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-193.el8/95435ad7.failed
+
+To remove dependency on rtnl lock and prevent neigh update code from
+accessing uninitialized flows when executing concurrently with tc, extend
+mlx5e_tc_flow with 'init_done' completion. Modify helper
+mlx5e_take_all_encap_flows() to wait for flow completion after obtaining
+reference to it. Modify mlx5e_tc_encap_flows_del() and
+mlx5e_tc_encap_flows_add() to skip flows that don't have OFFLOADED flag
+set, which can happen if concurrent flow initialization failed.
+
+This commit finishes neigh update refactoring for concurrent execution
+started in previous change in this series.
+
+	Signed-off-by: Vlad Buslov <vladbu@mellanox.com>
+	Reviewed-by: Roi Dayan <roid@mellanox.com>
+	Signed-off-by: Saeed Mahameed <saeedm@mellanox.com>
+(cherry picked from commit 95435ad7999b1218367f0667ed5fe98d042ffe78)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/mellanox/mlx5/core/en_tc.c
+diff --cc drivers/net/ethernet/mellanox/mlx5/core/en_tc.c
+index c033e0d4fc59,5d4ce3d58832..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_tc.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_tc.c
+@@@ -121,6 -125,12 +121,14 @@@ struct mlx5e_tc_flow 
+  	struct list_head	hairpin; /* flows sharing the same hairpin */
+  	struct list_head	peer;    /* flows with peer flow */
+  	struct list_head	unready; /* flows not ready to be offloaded (e.g due to missing route) */
+++<<<<<<< HEAD
+++=======
++ 	int			tmp_efi_index;
++ 	struct list_head	tmp_list; /* temporary flow list used by neigh update */
++ 	refcount_t		refcnt;
++ 	struct rcu_head		rcu_head;
++ 	struct completion	init_done;
+++>>>>>>> 95435ad7999b (net/mlx5e: Only access fully initialized flows in neigh update)
+  	union {
+  		struct mlx5_esw_flow_attr esw_attr[0];
+  		struct mlx5_nic_flow_attr nic_attr[0];
+@@@ -1146,7 -1320,8 +1154,12 @@@ void mlx5e_tc_encap_flows_add(struct ml
+  		bool all_flow_encaps_valid = true;
+  		int i;
+  
+++<<<<<<< HEAD
+ +		flow = container_of(efi, struct mlx5e_tc_flow, encaps[efi->index]);
+++=======
++ 		if (!mlx5e_is_offloaded_flow(flow))
++ 			continue;
+++>>>>>>> 95435ad7999b (net/mlx5e: Only access fully initialized flows in neigh update)
+  		esw_attr = flow->esw_attr;
+  		spec = &esw_attr->parse_attr->spec;
+  
+@@@ -1193,8 -1369,9 +1206,14 @@@ void mlx5e_tc_encap_flows_del(struct ml
+  	struct mlx5e_tc_flow *flow;
+  	int err;
+  
+++<<<<<<< HEAD
+ +	list_for_each_entry(efi, &e->flows, list) {
+ +		flow = container_of(efi, struct mlx5e_tc_flow, encaps[efi->index]);
+++=======
++ 	list_for_each_entry(flow, flow_list, tmp_list) {
++ 		if (!mlx5e_is_offloaded_flow(flow))
++ 			continue;
+++>>>>>>> 95435ad7999b (net/mlx5e: Only access fully initialized flows in neigh update)
+  		spec = &flow->esw_attr->parse_attr->spec;
+  
+  		/* update from encap rule to slow path rule */
+@@@ -1227,6 -1405,79 +1246,82 @@@ static struct mlx5_fc *mlx5e_tc_get_cou
+  		return flow->nic_attr->counter;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ /* Takes reference to all flows attached to encap and adds the flows to
++  * flow_list using 'tmp_list' list_head in mlx5e_tc_flow.
++  */
++ void mlx5e_take_all_encap_flows(struct mlx5e_encap_entry *e, struct list_head *flow_list)
++ {
++ 	struct encap_flow_item *efi;
++ 	struct mlx5e_tc_flow *flow;
++ 
++ 	list_for_each_entry(efi, &e->flows, list) {
++ 		flow = container_of(efi, struct mlx5e_tc_flow, encaps[efi->index]);
++ 		if (IS_ERR(mlx5e_flow_get(flow)))
++ 			continue;
++ 		wait_for_completion(&flow->init_done);
++ 
++ 		flow->tmp_efi_index = efi->index;
++ 		list_add(&flow->tmp_list, flow_list);
++ 	}
++ }
++ 
++ /* Iterate over tmp_list of flows attached to flow_list head. */
++ void mlx5e_put_encap_flow_list(struct mlx5e_priv *priv, struct list_head *flow_list)
++ {
++ 	struct mlx5e_tc_flow *flow, *tmp;
++ 
++ 	list_for_each_entry_safe(flow, tmp, flow_list, tmp_list)
++ 		mlx5e_flow_put(priv, flow);
++ }
++ 
++ static struct mlx5e_encap_entry *
++ mlx5e_get_next_valid_encap(struct mlx5e_neigh_hash_entry *nhe,
++ 			   struct mlx5e_encap_entry *e)
++ {
++ 	struct mlx5e_encap_entry *next = NULL;
++ 
++ retry:
++ 	rcu_read_lock();
++ 
++ 	/* find encap with non-zero reference counter value */
++ 	for (next = e ?
++ 		     list_next_or_null_rcu(&nhe->encap_list,
++ 					   &e->encap_list,
++ 					   struct mlx5e_encap_entry,
++ 					   encap_list) :
++ 		     list_first_or_null_rcu(&nhe->encap_list,
++ 					    struct mlx5e_encap_entry,
++ 					    encap_list);
++ 	     next;
++ 	     next = list_next_or_null_rcu(&nhe->encap_list,
++ 					  &next->encap_list,
++ 					  struct mlx5e_encap_entry,
++ 					  encap_list))
++ 		if (mlx5e_encap_take(next))
++ 			break;
++ 
++ 	rcu_read_unlock();
++ 
++ 	/* release starting encap */
++ 	if (e)
++ 		mlx5e_encap_put(netdev_priv(e->out_dev), e);
++ 	if (!next)
++ 		return next;
++ 
++ 	/* wait for encap to be fully initialized */
++ 	wait_for_completion(&next->res_ready);
++ 	/* continue searching if encap entry is not in valid state after completion */
++ 	if (!(next->flags & MLX5_ENCAP_ENTRY_VALID)) {
++ 		e = next;
++ 		goto retry;
++ 	}
++ 
++ 	return next;
++ }
++ 
+++>>>>>>> 95435ad7999b (net/mlx5e: Only access fully initialized flows in neigh update)
+  void mlx5e_tc_update_neigh_used_value(struct mlx5e_neigh_hash_entry *nhe)
+  {
+  	struct mlx5e_neigh *m_neigh = &nhe->m_neigh;
+@@@ -3039,6 -3493,12 +3134,15 @@@ mlx5e_alloc_flow(struct mlx5e_priv *pri
+  	flow->cookie = f->cookie;
+  	flow->flags = flow_flags;
+  	flow->priv = priv;
+++<<<<<<< HEAD
+++=======
++ 	for (out_index = 0; out_index < MLX5_MAX_FLOW_FWD_VPORTS; out_index++)
++ 		INIT_LIST_HEAD(&flow->encaps[out_index].list);
++ 	INIT_LIST_HEAD(&flow->mod_hdr);
++ 	INIT_LIST_HEAD(&flow->hairpin);
++ 	refcount_set(&flow->refcnt, 1);
++ 	init_completion(&flow->init_done);
+++>>>>>>> 95435ad7999b (net/mlx5e: Only access fully initialized flows in neigh update)
+  
+  	*__flow = flow;
+  	*__parse_attr = parse_attr;
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/en_tc.c
