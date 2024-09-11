@@ -73,7 +73,7 @@ struct typec_switch *typec_switch_get(struct device *dev)
 EXPORT_SYMBOL_GPL(typec_switch_get);
 
 /**
- * typec_put_switch - Release USB Type-C orientation switch
+ * typec_switch_put - Release USB Type-C orientation switch
  * @sw: USB Type-C orientation switch
  *
  * Decrement reference count for @sw.
