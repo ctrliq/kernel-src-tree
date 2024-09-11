@@ -1,0 +1,357 @@
+drm/amd/display: check if REFCLK_CNTL register is present
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Dmytro Laktyushkin <Dmytro.Laktyushkin@amd.com>
+commit 3ebd17f53556fff2809793b5d2c2259a1f2714dd
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/3ebd17f5.failed
+
+Check before programming the register since it isn't present on
+all IPs using this code.
+
+	Signed-off-by: Dmytro Laktyushkin <Dmytro.Laktyushkin@amd.com>
+	Reviewed-by: Eric Bernstein <Eric.Bernstein@amd.com>
+	Acked-by: Aurabindo Pillai <aurabindo.pillai@amd.com>
+	Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
+(cherry picked from commit 3ebd17f53556fff2809793b5d2c2259a1f2714dd)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/gpu/drm/amd/display/dc/dcn20/dcn20_hwseq.c
+diff --cc drivers/gpu/drm/amd/display/dc/dcn20/dcn20_hwseq.c
+index fbbf9758dc66,bd2ccf8eb9cf..000000000000
+--- a/drivers/gpu/drm/amd/display/dc/dcn20/dcn20_hwseq.c
++++ b/drivers/gpu/drm/amd/display/dc/dcn20/dcn20_hwseq.c
+@@@ -1922,156 -2205,192 +1922,266 @@@ static void dcn20_update_mpcc(struct d
+  	hubp->mpcc_id = mpcc_id;
+  }
+  
+ -void dcn20_enable_stream(struct pipe_ctx *pipe_ctx)
+ +static int find_free_gsl_group(const struct dc *dc)
+  {
+ -	enum dc_lane_count lane_count =
+ -		pipe_ctx->stream->link->cur_link_settings.lane_count;
+ +	if (dc->res_pool->gsl_groups.gsl_0 == 0)
+ +		return 1;
+ +	if (dc->res_pool->gsl_groups.gsl_1 == 0)
+ +		return 2;
+ +	if (dc->res_pool->gsl_groups.gsl_2 == 0)
+ +		return 3;
+  
+ -	struct dc_crtc_timing *timing = &pipe_ctx->stream->timing;
+ -	struct dc_link *link = pipe_ctx->stream->link;
+ +	return 0;
+ +}
+  
+ -	uint32_t active_total_with_borders;
+ -	uint32_t early_control = 0;
+ -	struct timing_generator *tg = pipe_ctx->stream_res.tg;
+ +/* NOTE: This is not a generic setup_gsl function (hence the suffix as_lock)
+ + * This is only used to lock pipes in pipe splitting case with immediate flip
+ + * Ordinary MPC/OTG locks suppress VUPDATE which doesn't help with immediate,
+ + * so we get tearing with freesync since we cannot flip multiple pipes
+ + * atomically.
+ + * We use GSL for this:
+ + * - immediate flip: find first available GSL group if not already assigned
+ + *                   program gsl with that group, set current OTG as master
+ + *                   and always us 0x4 = AND of flip_ready from all pipes
+ + * - vsync flip: disable GSL if used
+ + *
+ + * Groups in stream_res are stored as +1 from HW registers, i.e.
+ + * gsl_0 <=> pipe_ctx->stream_res.gsl_group == 1
+ + * Using a magic value like -1 would require tracking all inits/resets
+ + */
+ +void dcn20_setup_gsl_group_as_lock(
+ +		const struct dc *dc,
+ +		struct pipe_ctx *pipe_ctx,
+ +		bool enable)
+ +{
+ +	struct gsl_params gsl;
+ +	int group_idx;
+  
+ -	/* For MST, there are multiply stream go to only one link.
+ -	 * connect DIG back_end to front_end while enable_stream and
+ -	 * disconnect them during disable_stream
+ -	 * BY this, it is logic clean to separate stream and link
+ -	 */
+ -	link->link_enc->funcs->connect_dig_be_to_fe(link->link_enc,
+ -						    pipe_ctx->stream_res.stream_enc->id, true);
+ +	memset(&gsl, 0, sizeof(struct gsl_params));
+  
+ -	if (pipe_ctx->plane_state && pipe_ctx->plane_state->flip_immediate != 1) {
+ -		if (link->dc->hwss.program_dmdata_engine)
+ -			link->dc->hwss.program_dmdata_engine(pipe_ctx);
+ -	}
+ +	if (enable) {
+ +		/* return if group already assigned since GSL was set up
+ +		 * for vsync flip, we would unassign so it can't be "left over"
+ +		 */
+ +		if (pipe_ctx->stream_res.gsl_group > 0)
+ +			return;
+  
+ -	link->dc->hwss.update_info_frame(pipe_ctx);
+ +		group_idx = find_free_gsl_group(dc);
+ +		ASSERT(group_idx != 0);
+ +		pipe_ctx->stream_res.gsl_group = group_idx;
+  
+ -	/* enable early control to avoid corruption on DP monitor*/
+ -	active_total_with_borders =
+ -			timing->h_addressable
+ -				+ timing->h_border_left
+ -				+ timing->h_border_right;
+ +		/* set gsl group reg field and mark resource used */
+ +		switch (group_idx) {
+ +		case 1:
+ +			gsl.gsl0_en = 1;
+ +			dc->res_pool->gsl_groups.gsl_0 = 1;
+ +			break;
+ +		case 2:
+ +			gsl.gsl1_en = 1;
+ +			dc->res_pool->gsl_groups.gsl_1 = 1;
+ +			break;
+ +		case 3:
+ +			gsl.gsl2_en = 1;
+ +			dc->res_pool->gsl_groups.gsl_2 = 1;
+ +			break;
+ +		default:
+ +			BREAK_TO_DEBUGGER();
+ +			return; // invalid case
+ +		}
+ +		gsl.gsl_master_en = 1;
+ +	} else {
+ +		group_idx = pipe_ctx->stream_res.gsl_group;
+ +		if (group_idx == 0)
+ +			return; // if not in use, just return
+  
+ -	if (lane_count != 0)
+ -		early_control = active_total_with_borders % lane_count;
+ +		pipe_ctx->stream_res.gsl_group = 0;
+  
+ -	if (early_control == 0)
+ -		early_control = lane_count;
+ +		/* unset gsl group reg field and mark resource free */
+ +		switch (group_idx) {
+ +		case 1:
+ +			gsl.gsl0_en = 0;
+ +			dc->res_pool->gsl_groups.gsl_0 = 0;
+ +			break;
+ +		case 2:
+ +			gsl.gsl1_en = 0;
+ +			dc->res_pool->gsl_groups.gsl_1 = 0;
+ +			break;
+ +		case 3:
+ +			gsl.gsl2_en = 0;
+ +			dc->res_pool->gsl_groups.gsl_2 = 0;
+ +			break;
+ +		default:
+ +			BREAK_TO_DEBUGGER();
+ +			return;
+ +		}
+ +		gsl.gsl_master_en = 0;
+ +	}
+  
+ -	tg->funcs->set_early_control(tg, early_control);
+ +	/* at this point we want to program whether it's to enable or disable */
+ +	if (pipe_ctx->stream_res.tg->funcs->set_gsl != NULL &&
+ +		pipe_ctx->stream_res.tg->funcs->set_gsl_source_select != NULL) {
+ +		pipe_ctx->stream_res.tg->funcs->set_gsl(
+ +			pipe_ctx->stream_res.tg,
+ +			&gsl);
+  
+ -	/* enable audio only within mode set */
+ -	if (pipe_ctx->stream_res.audio != NULL) {
+ -		if (dc_is_dp_signal(pipe_ctx->stream->signal))
+ -			pipe_ctx->stream_res.stream_enc->funcs->dp_audio_enable(pipe_ctx->stream_res.stream_enc);
+ -	}
+ +		pipe_ctx->stream_res.tg->funcs->set_gsl_source_select(
+ +			pipe_ctx->stream_res.tg, group_idx,	enable ? 4 : 0);
+ +	} else
+ +		BREAK_TO_DEBUGGER();
+  }
+  
+ -void dcn20_program_dmdata_engine(struct pipe_ctx *pipe_ctx)
+ +static void dcn20_set_flip_control_gsl(
+ +		struct pipe_ctx *pipe_ctx,
+ +		bool flip_immediate)
+  {
+ -	struct dc_stream_state    *stream     = pipe_ctx->stream;
+ -	struct hubp               *hubp       = pipe_ctx->plane_res.hubp;
+ -	bool                       enable     = false;
+ -	struct stream_encoder     *stream_enc = pipe_ctx->stream_res.stream_enc;
+ -	enum dynamic_metadata_mode mode       = dc_is_dp_signal(stream->signal)
+ -							? dmdata_dp
+ -							: dmdata_hdmi;
+ -
+ -	/* if using dynamic meta, don't set up generic infopackets */
+ -	if (pipe_ctx->stream->dmdata_address.quad_part != 0) {
+ -		pipe_ctx->stream_res.encoder_info_frame.hdrsmd.valid = false;
+ -		enable = true;
+ -	}
+ -
+ -	if (!hubp)
+ -		return;
+ -
+ -	if (!stream_enc || !stream_enc->funcs->set_dynamic_metadata)
+ -		return;
+ +	if (pipe_ctx && pipe_ctx->plane_res.hubp->funcs->hubp_set_flip_control_surface_gsl)
+ +		pipe_ctx->plane_res.hubp->funcs->hubp_set_flip_control_surface_gsl(
+ +				pipe_ctx->plane_res.hubp, flip_immediate);
+  
+ -	stream_enc->funcs->set_dynamic_metadata(stream_enc, enable,
+ -						hubp->inst, mode);
+++<<<<<<< HEAD
+  }
+  
+ -void dcn20_fpga_init_hw(struct dc *dc)
+ +void dcn20_hw_sequencer_construct(struct dc *dc)
+  {
+ -	int i, j;
+ -	struct dce_hwseq *hws = dc->hwseq;
+ -	struct resource_pool *res_pool = dc->res_pool;
+ -	struct dc_state  *context = dc->current_state;
+ -
+ +	dcn10_hw_sequencer_construct(dc);
+ +	dc->hwss.init_hw = dcn20_init_hw;
+ +	dc->hwss.init_pipes = NULL;
+ +	dc->hwss.unblank_stream = dcn20_unblank_stream;
+ +	dc->hwss.update_plane_addr = dcn20_update_plane_addr;
+ +	dc->hwss.disable_plane = dcn20_disable_plane,
+ +	dc->hwss.enable_stream_timing = dcn20_enable_stream_timing;
+ +	dc->hwss.program_triplebuffer = dcn20_program_tripleBuffer;
+ +	dc->hwss.set_input_transfer_func = dcn20_set_input_transfer_func;
+ +	dc->hwss.set_output_transfer_func = dcn20_set_output_transfer_func;
+ +	dc->hwss.apply_ctx_for_surface = dcn20_apply_ctx_for_surface;
+ +	dc->hwss.pipe_control_lock = dcn20_pipe_control_lock;
+ +	dc->hwss.pipe_control_lock_global = dcn20_pipe_control_lock_global;
+ +	dc->hwss.optimize_bandwidth = dcn20_optimize_bandwidth;
+ +	dc->hwss.prepare_bandwidth = dcn20_prepare_bandwidth;
+ +	dc->hwss.update_bandwidth = dcn20_update_bandwidth;
+ +	dc->hwss.enable_writeback = dcn20_enable_writeback;
+ +	dc->hwss.disable_writeback = dcn20_disable_writeback;
+ +	dc->hwss.program_output_csc = dcn20_program_output_csc;
+ +	dc->hwss.update_odm = dcn20_update_odm;
+ +	dc->hwss.blank_pixel_data = dcn20_blank_pixel_data;
+ +	dc->hwss.dmdata_status_done = dcn20_dmdata_status_done;
+ +	dc->hwss.disable_stream = dcn20_disable_stream;
+ +	dc->hwss.init_sys_ctx = dcn20_init_sys_ctx;
+ +	dc->hwss.init_vm_ctx = dcn20_init_vm_ctx;
+ +	dc->hwss.disable_stream_gating = dcn20_disable_stream_gating;
+ +	dc->hwss.enable_stream_gating = dcn20_enable_stream_gating;
+ +	dc->hwss.setup_vupdate_interrupt = dcn20_setup_vupdate_interrupt;
+ +	dc->hwss.reset_hw_ctx_wrap = dcn20_reset_hw_ctx_wrap;
+ +	dc->hwss.update_mpcc = dcn20_update_mpcc;
+ +	dc->hwss.set_flip_control_gsl = dcn20_set_flip_control_gsl;
+ +	dc->hwss.did_underflow_occur = dcn10_did_underflow_occur;
+++=======
++ 	if (dc->clk_mgr && dc->clk_mgr->funcs->init_clocks)
++ 		dc->clk_mgr->funcs->init_clocks(dc->clk_mgr);
++ 
++ 	// Initialize the dccg
++ 	if (res_pool->dccg->funcs->dccg_init)
++ 		res_pool->dccg->funcs->dccg_init(res_pool->dccg);
++ 
++ 	//Enable ability to power gate / don't force power on permanently
++ 	hws->funcs.enable_power_gating_plane(hws, true);
++ 
++ 	// Specific to FPGA dccg and registers
++ 	REG_WRITE(RBBMIF_TIMEOUT_DIS, 0xFFFFFFFF);
++ 	REG_WRITE(RBBMIF_TIMEOUT_DIS_2, 0xFFFFFFFF);
++ 
++ 	hws->funcs.dccg_init(hws);
++ 
++ 	REG_UPDATE(DCHUBBUB_GLOBAL_TIMER_CNTL, DCHUBBUB_GLOBAL_TIMER_REFDIV, 2);
++ 	REG_UPDATE(DCHUBBUB_GLOBAL_TIMER_CNTL, DCHUBBUB_GLOBAL_TIMER_ENABLE, 1);
++ 	if (REG(REFCLK_CNTL))
++ 		REG_WRITE(REFCLK_CNTL, 0);
++ 	//
++ 
++ 
++ 	/* Blank pixel data with OPP DPG */
++ 	for (i = 0; i < dc->res_pool->timing_generator_count; i++) {
++ 		struct timing_generator *tg = dc->res_pool->timing_generators[i];
++ 
++ 		if (tg->funcs->is_tg_enabled(tg))
++ 			dcn20_init_blank(dc, tg);
++ 	}
++ 
++ 	for (i = 0; i < res_pool->timing_generator_count; i++) {
++ 		struct timing_generator *tg = dc->res_pool->timing_generators[i];
++ 
++ 		if (tg->funcs->is_tg_enabled(tg))
++ 			tg->funcs->lock(tg);
++ 	}
++ 
++ 	for (i = 0; i < dc->res_pool->pipe_count; i++) {
++ 		struct dpp *dpp = res_pool->dpps[i];
++ 
++ 		dpp->funcs->dpp_reset(dpp);
++ 	}
++ 
++ 	/* Reset all MPCC muxes */
++ 	res_pool->mpc->funcs->mpc_init(res_pool->mpc);
++ 
++ 	/* initialize OPP mpc_tree parameter */
++ 	for (i = 0; i < dc->res_pool->res_cap->num_opp; i++) {
++ 		res_pool->opps[i]->mpc_tree_params.opp_id = res_pool->opps[i]->inst;
++ 		res_pool->opps[i]->mpc_tree_params.opp_list = NULL;
++ 		for (j = 0; j < MAX_PIPES; j++)
++ 			res_pool->opps[i]->mpcc_disconnect_pending[j] = false;
++ 	}
++ 
++ 	for (i = 0; i < dc->res_pool->pipe_count; i++) {
++ 		struct timing_generator *tg = dc->res_pool->timing_generators[i];
++ 		struct pipe_ctx *pipe_ctx = &context->res_ctx.pipe_ctx[i];
++ 		struct hubp *hubp = dc->res_pool->hubps[i];
++ 		struct dpp *dpp = dc->res_pool->dpps[i];
++ 
++ 		pipe_ctx->stream_res.tg = tg;
++ 		pipe_ctx->pipe_idx = i;
++ 
++ 		pipe_ctx->plane_res.hubp = hubp;
++ 		pipe_ctx->plane_res.dpp = dpp;
++ 		pipe_ctx->plane_res.mpcc_inst = dpp->inst;
++ 		hubp->mpcc_id = dpp->inst;
++ 		hubp->opp_id = OPP_ID_INVALID;
++ 		hubp->power_gated = false;
++ 		pipe_ctx->stream_res.opp = NULL;
++ 
++ 		hubp->funcs->hubp_init(hubp);
++ 
++ 		//dc->res_pool->opps[i]->mpc_tree_params.opp_id = dc->res_pool->opps[i]->inst;
++ 		//dc->res_pool->opps[i]->mpc_tree_params.opp_list = NULL;
++ 		dc->res_pool->opps[i]->mpcc_disconnect_pending[pipe_ctx->plane_res.mpcc_inst] = true;
++ 		pipe_ctx->stream_res.opp = dc->res_pool->opps[i];
++ 		/*to do*/
++ 		hws->funcs.plane_atomic_disconnect(dc, pipe_ctx);
++ 	}
++ 
++ 	/* initialize DWB pointer to MCIF_WB */
++ 	for (i = 0; i < res_pool->res_cap->num_dwb; i++)
++ 		res_pool->dwbc[i]->mcif = res_pool->mcif_wb[i];
++ 
++ 	for (i = 0; i < dc->res_pool->timing_generator_count; i++) {
++ 		struct timing_generator *tg = dc->res_pool->timing_generators[i];
++ 
++ 		if (tg->funcs->is_tg_enabled(tg))
++ 			tg->funcs->unlock(tg);
++ 	}
++ 
++ 	for (i = 0; i < dc->res_pool->pipe_count; i++) {
++ 		struct pipe_ctx *pipe_ctx = &context->res_ctx.pipe_ctx[i];
++ 
++ 		dc->hwss.disable_plane(dc, pipe_ctx);
++ 
++ 		pipe_ctx->stream_res.tg = NULL;
++ 		pipe_ctx->plane_res.hubp = NULL;
++ 	}
++ 
++ 	for (i = 0; i < dc->res_pool->timing_generator_count; i++) {
++ 		struct timing_generator *tg = dc->res_pool->timing_generators[i];
++ 
++ 		tg->funcs->tg_init(tg);
++ 	}
+++>>>>>>> 3ebd17f53556 (drm/amd/display: check if REFCLK_CNTL register is present)
+  }
+* Unmerged path drivers/gpu/drm/amd/display/dc/dcn20/dcn20_hwseq.c
