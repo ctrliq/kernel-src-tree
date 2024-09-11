@@ -1,0 +1,158 @@
+virtiofs: simplify sb setup
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-310.el8
+commit-author Miklos Szeredi <mszeredi@redhat.com>
+commit b19d3d00d662cfb8bfdc809ec90344ec58b0bf31
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-310.el8/b19d3d00.failed
+
+Currently when acquiring an sb for virtiofs fuse_mount_get() is being
+called from virtio_fs_set_super() if a new sb is being filled and
+fuse_mount_put() is called unconditionally after sget_fc() returns.
+
+The exact same result can be obtained by checking whether
+fs_contex->s_fs_info was set to NULL (ref trasferred to sb->s_fs_info) and
+only calling fuse_mount_put() if the ref wasn't transferred (error or
+matching sb found).
+
+This allows getting rid of virtio_fs_set_super() and fuse_mount_get().
+
+	Signed-off-by: Miklos Szeredi <mszeredi@redhat.com>
+(cherry picked from commit b19d3d00d662cfb8bfdc809ec90344ec58b0bf31)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/fuse/fuse_i.h
+#	fs/fuse/inode.c
+#	fs/fuse/virtio_fs.c
+diff --cc fs/fuse/fuse_i.h
+index 1e2f0f27c1cd,c036c4dc714a..000000000000
+--- a/fs/fuse/fuse_i.h
++++ b/fs/fuse/fuse_i.h
+@@@ -996,6 -1024,11 +996,14 @@@ void fuse_conn_init(struct fuse_conn *f
+   */
+  void fuse_conn_put(struct fuse_conn *fc);
+  
+++<<<<<<< HEAD
+++=======
++ /**
++  * Release reference to fuse_mount
++  */
++ void fuse_mount_put(struct fuse_mount *fm);
++ 
+++>>>>>>> b19d3d00d662 (virtiofs: simplify sb setup)
+  struct fuse_dev *fuse_dev_alloc_install(struct fuse_conn *fc);
+  struct fuse_dev *fuse_dev_alloc(void);
+  void fuse_dev_install(struct fuse_dev *fud, struct fuse_conn *fc);
+diff --cc fs/fuse/inode.c
+index ad83ccd9accc,654708574d5e..000000000000
+--- a/fs/fuse/inode.c
++++ b/fs/fuse/inode.c
+@@@ -692,6 -732,16 +692,19 @@@ struct fuse_conn *fuse_conn_get(struct 
+  }
+  EXPORT_SYMBOL_GPL(fuse_conn_get);
+  
+++<<<<<<< HEAD
+++=======
++ void fuse_mount_put(struct fuse_mount *fm)
++ {
++ 	if (refcount_dec_and_test(&fm->count)) {
++ 		if (fm->fc)
++ 			fuse_conn_put(fm->fc);
++ 		kfree(fm);
++ 	}
++ }
++ EXPORT_SYMBOL_GPL(fuse_mount_put);
++ 
+++>>>>>>> b19d3d00d662 (virtiofs: simplify sb setup)
+  static struct inode *fuse_get_root_inode(struct super_block *sb, unsigned mode)
+  {
+  	struct fuse_attr attr;
+diff --cc fs/fuse/virtio_fs.c
+index 342f1a411d7e,14d65db47778..000000000000
+--- a/fs/fuse/virtio_fs.c
++++ b/fs/fuse/virtio_fs.c
+@@@ -1385,26 -1379,29 +1385,29 @@@ static void virtio_kill_sb(struct super
+  	virtio_fs_free_devs(vfs);
+  }
+  
+ -static void virtio_kill_sb(struct super_block *sb)
+ +static int virtio_fs_test_super(struct super_block *sb,
+ +				struct fs_context *fsc)
+  {
+ -	struct fuse_mount *fm = get_fuse_mount_super(sb);
+ -	bool last;
+ +	struct fuse_conn *fc = fsc->s_fs_info;
+  
+ -	/* If mount failed, we can still be called without any fc */
+ -	if (fm) {
+ -		last = fuse_mount_remove(fm);
+ -		if (last)
+ -			virtio_fs_conn_destroy(fm);
+ -	}
+ -	kill_anon_super(sb);
+ +	return fc->iq.priv == get_fuse_conn_super(sb)->iq.priv;
+  }
+  
+ -static int virtio_fs_test_super(struct super_block *sb,
+ -				struct fs_context *fsc)
+++<<<<<<< HEAD
+ +static int virtio_fs_set_super(struct super_block *sb,
+ +			       struct fs_context *fsc)
+  {
+ -	struct fuse_mount *fsc_fm = fsc->s_fs_info;
+ -	struct fuse_mount *sb_fm = get_fuse_mount_super(sb);
+ +	int err;
+ +
+ +	err = get_anon_bdev(&sb->s_dev);
+ +	if (!err)
+ +		fuse_conn_get(fsc->s_fs_info);
+  
+ -	return fsc_fm->fc->iq.priv == sb_fm->fc->iq.priv;
+ +	return err;
+  }
+  
+++=======
+++>>>>>>> b19d3d00d662 (virtiofs: simplify sb setup)
+  static int virtio_fs_get_tree(struct fs_context *fsc)
+  {
+  	struct virtio_fs *fs;
+@@@ -1430,14 -1428,25 +1433,21 @@@
+  		return -ENOMEM;
+  	}
+  
+ -	fm = kzalloc(sizeof(struct fuse_mount), GFP_KERNEL);
+ -	if (!fm) {
+ -		mutex_lock(&virtio_fs_mutex);
+ -		virtio_fs_put(fs);
+ -		mutex_unlock(&virtio_fs_mutex);
+ -		kfree(fc);
+ -		return -ENOMEM;
+ -	}
+ -
+ -	fuse_conn_init(fc, fm, get_user_ns(current_user_ns()),
+ -		       &virtio_fs_fiq_ops, fs);
+ +	fuse_conn_init(fc, get_user_ns(current_user_ns()), &virtio_fs_fiq_ops,
+ +		       fs);
+  	fc->release = fuse_free_conn;
+  	fc->delete_stale = true;
+ -	fc->auto_submounts = true;
+  
+++<<<<<<< HEAD
+ +	fsc->s_fs_info = fc;
+ +	sb = sget_fc(fsc, virtio_fs_test_super, virtio_fs_set_super);
+ +	fuse_conn_put(fc);
+++=======
++ 	fsc->s_fs_info = fm;
++ 	sb = sget_fc(fsc, virtio_fs_test_super, set_anon_super_fc);
++ 	if (fsc->s_fs_info)
++ 		fuse_mount_put(fm);
+++>>>>>>> b19d3d00d662 (virtiofs: simplify sb setup)
+  	if (IS_ERR(sb))
+  		return PTR_ERR(sb);
+  
+* Unmerged path fs/fuse/fuse_i.h
+* Unmerged path fs/fuse/inode.c
+* Unmerged path fs/fuse/virtio_fs.c
