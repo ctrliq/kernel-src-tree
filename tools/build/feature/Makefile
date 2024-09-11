@@ -30,6 +30,7 @@ FILES=                                          \
          test-libpython.bin                     \
          test-libpython-version.bin             \
          test-libslang.bin                      \
+         test-libslang-include-subdir.bin       \
          test-libcrypto.bin                     \
          test-libunwind.bin                     \
          test-libunwind-debug-frame.bin         \
@@ -177,6 +178,9 @@ $(OUTPUT)test-libaudit.bin:
 	$(BUILD) -laudit
 
 $(OUTPUT)test-libslang.bin:
+	$(BUILD) -lslang
+
+$(OUTPUT)test-libslang-include-subdir.bin:
 	$(BUILD) -lslang
 
 $(OUTPUT)test-libcrypto.bin:
