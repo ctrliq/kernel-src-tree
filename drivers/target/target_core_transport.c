@@ -2128,9 +2128,6 @@ static void transport_complete_qf(struct se_cmd *cmd)
 		if (cmd->scsi_status)
 			goto queue_status;
 
-		cmd->se_cmd_flags |= SCF_EMULATED_TASK_SENSE;
-		cmd->scsi_status = SAM_STAT_CHECK_CONDITION;
-		cmd->scsi_sense_length  = TRANSPORT_SENSE_BUFFER;
 		translate_sense_reason(cmd, TCM_LOGICAL_UNIT_COMMUNICATION_FAILURE);
 		goto queue_status;
 	}
@@ -3206,6 +3203,9 @@ static int translate_sense_reason(struct se_cmd *cmd, sense_reason_t reason)
 		ascq = si->ascq;
 	}
 
+	cmd->se_cmd_flags |= SCF_EMULATED_TASK_SENSE;
+	cmd->scsi_status = SAM_STAT_CHECK_CONDITION;
+	cmd->scsi_sense_length  = TRANSPORT_SENSE_BUFFER;
 	scsi_build_sense_buffer(desc_format, buffer, si->key, asc, ascq);
 	if (si->add_sector_info)
 		return scsi_set_sense_information(buffer,
@@ -3232,9 +3232,6 @@ transport_send_check_condition_and_sense(struct se_cmd *cmd,
 	if (!from_transport) {
 		int rc;
 
-		cmd->se_cmd_flags |= SCF_EMULATED_TASK_SENSE;
-		cmd->scsi_status = SAM_STAT_CHECK_CONDITION;
-		cmd->scsi_sense_length  = TRANSPORT_SENSE_BUFFER;
 		rc = translate_sense_reason(cmd, reason);
 		if (rc)
 			return rc;
