@@ -1,0 +1,476 @@
+io_uring: prune request from overflow list on flush
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Jens Axboe <axboe@kernel.dk>
+commit 2ca10259b4189a433c309054496dd6af1415f992
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/2ca10259.failed
+
+Carter reported an issue where he could produce a stall on ring exit,
+when we're cleaning up requests that match the given file table. For
+this particular test case, a combination of a few things caused the
+issue:
+
+- The cq ring was overflown
+- The request being canceled was in the overflow list
+
+The combination of the above means that the cq overflow list holds a
+reference to the request. The request is canceled correctly, but since
+the overflow list holds a reference to it, the final put won't happen.
+Since the final put doesn't happen, the request remains in the inflight.
+Hence we never finish the cancelation flush.
+
+Fix this by removing requests from the overflow list if we're canceling
+them.
+
+	Cc: stable@vger.kernel.org # 5.5
+	Reported-by: Carter Li 李通洲 <carter.li@eoitek.com>
+	Signed-off-by: Jens Axboe <axboe@kernel.dk>
+(cherry picked from commit 2ca10259b4189a433c309054496dd6af1415f992)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/io_uring.c
+diff --cc fs/io_uring.c
+index ffb8e9d82a6a,5a826017ebb8..000000000000
+--- a/fs/io_uring.c
++++ b/fs/io_uring.c
+@@@ -308,6 -329,203 +308,206 @@@ struct io_poll_iocb 
+  	struct wait_queue_entry		wait;
+  };
+  
+++<<<<<<< HEAD
+++=======
++ struct io_close {
++ 	struct file			*file;
++ 	struct file			*put_file;
++ 	int				fd;
++ };
++ 
++ struct io_timeout_data {
++ 	struct io_kiocb			*req;
++ 	struct hrtimer			timer;
++ 	struct timespec64		ts;
++ 	enum hrtimer_mode		mode;
++ 	u32				seq_offset;
++ };
++ 
++ struct io_accept {
++ 	struct file			*file;
++ 	struct sockaddr __user		*addr;
++ 	int __user			*addr_len;
++ 	int				flags;
++ };
++ 
++ struct io_sync {
++ 	struct file			*file;
++ 	loff_t				len;
++ 	loff_t				off;
++ 	int				flags;
++ 	int				mode;
++ };
++ 
++ struct io_cancel {
++ 	struct file			*file;
++ 	u64				addr;
++ };
++ 
++ struct io_timeout {
++ 	struct file			*file;
++ 	u64				addr;
++ 	int				flags;
++ 	unsigned			count;
++ };
++ 
++ struct io_rw {
++ 	/* NOTE: kiocb has the file as the first member, so don't do it here */
++ 	struct kiocb			kiocb;
++ 	u64				addr;
++ 	u64				len;
++ };
++ 
++ struct io_connect {
++ 	struct file			*file;
++ 	struct sockaddr __user		*addr;
++ 	int				addr_len;
++ };
++ 
++ struct io_sr_msg {
++ 	struct file			*file;
++ 	union {
++ 		struct user_msghdr __user *msg;
++ 		void __user		*buf;
++ 	};
++ 	int				msg_flags;
++ 	size_t				len;
++ };
++ 
++ struct io_open {
++ 	struct file			*file;
++ 	int				dfd;
++ 	union {
++ 		unsigned		mask;
++ 	};
++ 	struct filename			*filename;
++ 	struct statx __user		*buffer;
++ 	struct open_how			how;
++ };
++ 
++ struct io_files_update {
++ 	struct file			*file;
++ 	u64				arg;
++ 	u32				nr_args;
++ 	u32				offset;
++ };
++ 
++ struct io_fadvise {
++ 	struct file			*file;
++ 	u64				offset;
++ 	u32				len;
++ 	u32				advice;
++ };
++ 
++ struct io_madvise {
++ 	struct file			*file;
++ 	u64				addr;
++ 	u32				len;
++ 	u32				advice;
++ };
++ 
++ struct io_epoll {
++ 	struct file			*file;
++ 	int				epfd;
++ 	int				op;
++ 	int				fd;
++ 	struct epoll_event		event;
++ };
++ 
++ struct io_async_connect {
++ 	struct sockaddr_storage		address;
++ };
++ 
++ struct io_async_msghdr {
++ 	struct iovec			fast_iov[UIO_FASTIOV];
++ 	struct iovec			*iov;
++ 	struct sockaddr __user		*uaddr;
++ 	struct msghdr			msg;
++ 	struct sockaddr_storage		addr;
++ };
++ 
++ struct io_async_rw {
++ 	struct iovec			fast_iov[UIO_FASTIOV];
++ 	struct iovec			*iov;
++ 	ssize_t				nr_segs;
++ 	ssize_t				size;
++ };
++ 
++ struct io_async_ctx {
++ 	union {
++ 		struct io_async_rw	rw;
++ 		struct io_async_msghdr	msg;
++ 		struct io_async_connect	connect;
++ 		struct io_timeout_data	timeout;
++ 	};
++ };
++ 
++ enum {
++ 	REQ_F_FIXED_FILE_BIT	= IOSQE_FIXED_FILE_BIT,
++ 	REQ_F_IO_DRAIN_BIT	= IOSQE_IO_DRAIN_BIT,
++ 	REQ_F_LINK_BIT		= IOSQE_IO_LINK_BIT,
++ 	REQ_F_HARDLINK_BIT	= IOSQE_IO_HARDLINK_BIT,
++ 	REQ_F_FORCE_ASYNC_BIT	= IOSQE_ASYNC_BIT,
++ 
++ 	REQ_F_LINK_NEXT_BIT,
++ 	REQ_F_FAIL_LINK_BIT,
++ 	REQ_F_INFLIGHT_BIT,
++ 	REQ_F_CUR_POS_BIT,
++ 	REQ_F_NOWAIT_BIT,
++ 	REQ_F_IOPOLL_COMPLETED_BIT,
++ 	REQ_F_LINK_TIMEOUT_BIT,
++ 	REQ_F_TIMEOUT_BIT,
++ 	REQ_F_ISREG_BIT,
++ 	REQ_F_MUST_PUNT_BIT,
++ 	REQ_F_TIMEOUT_NOSEQ_BIT,
++ 	REQ_F_COMP_LOCKED_BIT,
++ 	REQ_F_NEED_CLEANUP_BIT,
++ 	REQ_F_OVERFLOW_BIT,
++ };
++ 
++ enum {
++ 	/* ctx owns file */
++ 	REQ_F_FIXED_FILE	= BIT(REQ_F_FIXED_FILE_BIT),
++ 	/* drain existing IO first */
++ 	REQ_F_IO_DRAIN		= BIT(REQ_F_IO_DRAIN_BIT),
++ 	/* linked sqes */
++ 	REQ_F_LINK		= BIT(REQ_F_LINK_BIT),
++ 	/* doesn't sever on completion < 0 */
++ 	REQ_F_HARDLINK		= BIT(REQ_F_HARDLINK_BIT),
++ 	/* IOSQE_ASYNC */
++ 	REQ_F_FORCE_ASYNC	= BIT(REQ_F_FORCE_ASYNC_BIT),
++ 
++ 	/* already grabbed next link */
++ 	REQ_F_LINK_NEXT		= BIT(REQ_F_LINK_NEXT_BIT),
++ 	/* fail rest of links */
++ 	REQ_F_FAIL_LINK		= BIT(REQ_F_FAIL_LINK_BIT),
++ 	/* on inflight list */
++ 	REQ_F_INFLIGHT		= BIT(REQ_F_INFLIGHT_BIT),
++ 	/* read/write uses file position */
++ 	REQ_F_CUR_POS		= BIT(REQ_F_CUR_POS_BIT),
++ 	/* must not punt to workers */
++ 	REQ_F_NOWAIT		= BIT(REQ_F_NOWAIT_BIT),
++ 	/* polled IO has completed */
++ 	REQ_F_IOPOLL_COMPLETED	= BIT(REQ_F_IOPOLL_COMPLETED_BIT),
++ 	/* has linked timeout */
++ 	REQ_F_LINK_TIMEOUT	= BIT(REQ_F_LINK_TIMEOUT_BIT),
++ 	/* timeout request */
++ 	REQ_F_TIMEOUT		= BIT(REQ_F_TIMEOUT_BIT),
++ 	/* regular file */
++ 	REQ_F_ISREG		= BIT(REQ_F_ISREG_BIT),
++ 	/* must be punted even for NONBLOCK */
++ 	REQ_F_MUST_PUNT		= BIT(REQ_F_MUST_PUNT_BIT),
++ 	/* no timeout sequence */
++ 	REQ_F_TIMEOUT_NOSEQ	= BIT(REQ_F_TIMEOUT_NOSEQ_BIT),
++ 	/* completion under lock */
++ 	REQ_F_COMP_LOCKED	= BIT(REQ_F_COMP_LOCKED_BIT),
++ 	/* needs cleanup */
++ 	REQ_F_NEED_CLEANUP	= BIT(REQ_F_NEED_CLEANUP_BIT),
++ 	/* in overflow list */
++ 	REQ_F_OVERFLOW		= BIT(REQ_F_OVERFLOW_BIT),
++ };
++ 
+++>>>>>>> 2ca10259b418 (io_uring: prune request from overflow list on flush)
+  /*
+   * NOTE! Each of the iocb union members has the file pointer
+   * as the first entry in their struct definition. So you can
+@@@ -515,13 -1047,99 +715,77 @@@ static struct io_uring_cqe *io_get_cqri
+  		return NULL;
+  
+  	ctx->cached_cq_tail++;
+ -	return &rings->cqes[tail & ctx->cq_mask];
+ -}
+ -
+ -static inline bool io_should_trigger_evfd(struct io_ring_ctx *ctx)
+ -{
+ -	if (!ctx->cq_ev_fd)
+ -		return false;
+ -	if (!ctx->eventfd_async)
+ -		return true;
+ -	return io_wq_current_is_worker() || in_interrupt();
+ -}
+ -
+ -static void __io_cqring_ev_posted(struct io_ring_ctx *ctx, bool trigger_ev)
+ -{
+ -	if (waitqueue_active(&ctx->wait))
+ -		wake_up(&ctx->wait);
+ -	if (waitqueue_active(&ctx->sqo_wait))
+ -		wake_up(&ctx->sqo_wait);
+ -	if (trigger_ev)
+ -		eventfd_signal(ctx->cq_ev_fd, 1);
+ -}
+ -
+ -static void io_cqring_ev_posted(struct io_ring_ctx *ctx)
+ -{
+ -	__io_cqring_ev_posted(ctx, io_should_trigger_evfd(ctx));
+ +	return &ring->cqes[tail & ctx->cq_mask];
+  }
+  
+ -/* Returns true if there are no backlogged entries after the flush */
+ -static bool io_cqring_overflow_flush(struct io_ring_ctx *ctx, bool force)
+ +static void io_cqring_fill_event(struct io_ring_ctx *ctx, u64 ki_user_data,
+ +				 long res)
+  {
+ -	struct io_rings *rings = ctx->rings;
+  	struct io_uring_cqe *cqe;
+++<<<<<<< HEAD
+++=======
++ 	struct io_kiocb *req;
++ 	unsigned long flags;
++ 	LIST_HEAD(list);
++ 
++ 	if (!force) {
++ 		if (list_empty_careful(&ctx->cq_overflow_list))
++ 			return true;
++ 		if ((ctx->cached_cq_tail - READ_ONCE(rings->cq.head) ==
++ 		    rings->cq_ring_entries))
++ 			return false;
++ 	}
++ 
++ 	spin_lock_irqsave(&ctx->completion_lock, flags);
++ 
++ 	/* if force is set, the ring is going away. always drop after that */
++ 	if (force)
++ 		ctx->cq_overflow_flushed = 1;
++ 
++ 	cqe = NULL;
++ 	while (!list_empty(&ctx->cq_overflow_list)) {
++ 		cqe = io_get_cqring(ctx);
++ 		if (!cqe && !force)
++ 			break;
++ 
++ 		req = list_first_entry(&ctx->cq_overflow_list, struct io_kiocb,
++ 						list);
++ 		list_move(&req->list, &list);
++ 		req->flags &= ~REQ_F_OVERFLOW;
++ 		if (cqe) {
++ 			WRITE_ONCE(cqe->user_data, req->user_data);
++ 			WRITE_ONCE(cqe->res, req->result);
++ 			WRITE_ONCE(cqe->flags, 0);
++ 		} else {
++ 			WRITE_ONCE(ctx->rings->cq_overflow,
++ 				atomic_inc_return(&ctx->cached_cq_overflow));
++ 		}
++ 	}
++ 
++ 	io_commit_cqring(ctx);
++ 	if (cqe) {
++ 		clear_bit(0, &ctx->sq_check_overflow);
++ 		clear_bit(0, &ctx->cq_check_overflow);
++ 	}
++ 	spin_unlock_irqrestore(&ctx->completion_lock, flags);
++ 	io_cqring_ev_posted(ctx);
++ 
++ 	while (!list_empty(&list)) {
++ 		req = list_first_entry(&list, struct io_kiocb, list);
++ 		list_del(&req->list);
++ 		io_put_req(req);
++ 	}
++ 
++ 	return cqe != NULL;
++ }
++ 
++ static void io_cqring_fill_event(struct io_kiocb *req, long res)
++ {
++ 	struct io_ring_ctx *ctx = req->ctx;
++ 	struct io_uring_cqe *cqe;
++ 
++ 	trace_io_uring_complete(ctx, req->user_data, res);
+++>>>>>>> 2ca10259b418 (io_uring: prune request from overflow list on flush)
+  
+  	/*
+  	 * If we can't get a cq entry, userspace overflowed the
+@@@ -529,14 -1147,22 +793,25 @@@
+  	 * the ring.
+  	 */
+  	cqe = io_get_cqring(ctx);
+ -	if (likely(cqe)) {
+ -		WRITE_ONCE(cqe->user_data, req->user_data);
+ +	if (cqe) {
+ +		WRITE_ONCE(cqe->user_data, ki_user_data);
+  		WRITE_ONCE(cqe->res, res);
+  		WRITE_ONCE(cqe->flags, 0);
+ -	} else if (ctx->cq_overflow_flushed) {
+ -		WRITE_ONCE(ctx->rings->cq_overflow,
+ -				atomic_inc_return(&ctx->cached_cq_overflow));
+  	} else {
+++<<<<<<< HEAD
+ +		unsigned overflow = READ_ONCE(ctx->cq_ring->overflow);
+ +
+ +		WRITE_ONCE(ctx->cq_ring->overflow, overflow + 1);
+++=======
++ 		if (list_empty(&ctx->cq_overflow_list)) {
++ 			set_bit(0, &ctx->sq_check_overflow);
++ 			set_bit(0, &ctx->cq_check_overflow);
++ 		}
++ 		req->flags |= REQ_F_OVERFLOW;
++ 		refcount_inc(&req->refs);
++ 		req->result = res;
++ 		list_add_tail(&req->list, &ctx->cq_overflow_list);
+++>>>>>>> 2ca10259b418 (io_uring: prune request from overflow list on flush)
+  	}
+  }
+  
+@@@ -3578,12 -6440,84 +3853,74 @@@ static int io_uring_release(struct inod
+  	return 0;
+  }
+  
+++<<<<<<< HEAD
+ +static int io_uring_mmap(struct file *file, struct vm_area_struct *vma)
+++=======
++ static void io_uring_cancel_files(struct io_ring_ctx *ctx,
++ 				  struct files_struct *files)
++ {
++ 	struct io_kiocb *req;
++ 	DEFINE_WAIT(wait);
++ 
++ 	while (!list_empty_careful(&ctx->inflight_list)) {
++ 		struct io_kiocb *cancel_req = NULL;
++ 
++ 		spin_lock_irq(&ctx->inflight_lock);
++ 		list_for_each_entry(req, &ctx->inflight_list, inflight_entry) {
++ 			if (req->work.files != files)
++ 				continue;
++ 			/* req is being completed, ignore */
++ 			if (!refcount_inc_not_zero(&req->refs))
++ 				continue;
++ 			cancel_req = req;
++ 			break;
++ 		}
++ 		if (cancel_req)
++ 			prepare_to_wait(&ctx->inflight_wait, &wait,
++ 						TASK_UNINTERRUPTIBLE);
++ 		spin_unlock_irq(&ctx->inflight_lock);
++ 
++ 		/* We need to keep going until we don't find a matching req */
++ 		if (!cancel_req)
++ 			break;
++ 
++ 		if (cancel_req->flags & REQ_F_OVERFLOW) {
++ 			spin_lock_irq(&ctx->completion_lock);
++ 			list_del(&cancel_req->list);
++ 			cancel_req->flags &= ~REQ_F_OVERFLOW;
++ 			if (list_empty(&ctx->cq_overflow_list)) {
++ 				clear_bit(0, &ctx->sq_check_overflow);
++ 				clear_bit(0, &ctx->cq_check_overflow);
++ 			}
++ 			spin_unlock_irq(&ctx->completion_lock);
++ 
++ 			WRITE_ONCE(ctx->rings->cq_overflow,
++ 				atomic_inc_return(&ctx->cached_cq_overflow));
++ 
++ 			/*
++ 			 * Put inflight ref and overflow ref. If that's
++ 			 * all we had, then we're done with this request.
++ 			 */
++ 			if (refcount_sub_and_test(2, &cancel_req->refs)) {
++ 				io_put_req(cancel_req);
++ 				continue;
++ 			}
++ 		}
++ 
++ 		io_wq_cancel_work(ctx->io_wq, &cancel_req->work);
++ 		io_put_req(cancel_req);
++ 		schedule();
++ 	}
++ 	finish_wait(&ctx->inflight_wait, &wait);
++ }
++ 
++ static int io_uring_flush(struct file *file, void *data)
+++>>>>>>> 2ca10259b418 (io_uring: prune request from overflow list on flush)
+  {
+ +	loff_t offset = (loff_t) vma->vm_pgoff << PAGE_SHIFT;
+ +	unsigned long sz = vma->vm_end - vma->vm_start;
+  	struct io_ring_ctx *ctx = file->private_data;
+ -
+ -	io_uring_cancel_files(ctx, data);
+ -
+ -	/*
+ -	 * If the task is going away, cancel work it may have pending
+ -	 */
+ -	if (fatal_signal_pending(current) || (current->flags & PF_EXITING))
+ -		io_wq_cancel_pid(ctx->io_wq, task_pid_vnr(current));
+ -
+ -	return 0;
+ -}
+ -
+ -static void *io_uring_validate_mmap_request(struct file *file,
+ -					    loff_t pgoff, size_t sz)
+ -{
+ -	struct io_ring_ctx *ctx = file->private_data;
+ -	loff_t offset = pgoff << PAGE_SHIFT;
+ +	unsigned long pfn;
+  	struct page *page;
+  	void *ptr;
+  
+* Unmerged path fs/io_uring.c
