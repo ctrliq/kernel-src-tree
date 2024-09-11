@@ -1,0 +1,118 @@
+net/mlx5e: E-Switch, Add misc bit when misc fields changed for mirroring
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Jianbo Liu <jianbol@mellanox.com>
+commit 0faddfe6b7953e224a1283f89f671ef6a9ba73de
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/0faddfe6.failed
+
+The modified flow_context fields in FTE must be indicated in
+modify_enable bitmask. Previously, the misc bit in modify_enable is
+always set as source vport must be set for each rule. So, when parsing
+vxlan/gre/geneve/qinq rules, this bit is not set because those are all
+from the same misc fileds that source vport fields are located at, and
+we don't need to set the indicator twice.
+
+After adding per vport tables for mirroring, misc bit is not set, then
+firmware syndrome happens. To fix it, set the bit wherever misc fileds
+are changed. This also makes it unnecessary to check misc fields and set
+the misc bit accordingly in metadata matching, so here remove it.
+
+Besides, flow_source must be specified for uplink because firmware
+will check it and some actions are only allowed for packets received
+from uplink.
+
+Fixes: 96e326878fa5 ("net/mlx5e: Eswitch, Use per vport tables for mirroring")
+	Signed-off-by: Jianbo Liu <jianbol@mellanox.com>
+	Reviewed-by: Chris Mi <chrism@mellanox.com>
+	Reviewed-by: Roi Dayan <roid@mellanox.com>
+	Signed-off-by: Saeed Mahameed <saeedm@mellanox.com>
+(cherry picked from commit 0faddfe6b7953e224a1283f89f671ef6a9ba73de)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/mellanox/mlx5/core/eswitch_offloads.c
+diff --cc drivers/net/ethernet/mellanox/mlx5/core/eswitch_offloads.c
+index 98ef84b15725,d70d6c099582..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx5/core/eswitch_offloads.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/eswitch_offloads.c
+@@@ -221,7 -376,21 +218,25 @@@ mlx5_eswitch_add_offloaded_rule(struct 
+  	if (flow_act.action & MLX5_FLOW_CONTEXT_ACTION_MOD_HDR)
+  		flow_act.modify_hdr = attr->modify_hdr;
+  
+++<<<<<<< HEAD
+ +	fdb = esw_get_prio_table(esw, attr->chain, attr->prio, !!split);
+++=======
++ 	if (split) {
++ 		if (MLX5_CAP_ESW_FLOWTABLE(esw->dev, flow_source) &&
++ 		    attr->in_rep->vport == MLX5_VPORT_UPLINK)
++ 			spec->flow_context.flow_source = MLX5_FLOW_CONTEXT_FLOW_SOURCE_UPLINK;
++ 		fdb = esw_vport_tbl_get(esw, attr);
++ 	} else {
++ 		if (attr->chain || attr->prio)
++ 			fdb = mlx5_esw_chains_get_table(esw, attr->chain,
++ 							attr->prio, 0);
++ 		else
++ 			fdb = attr->fdb;
++ 
++ 		if (!(attr->flags & MLX5_ESW_ATTR_FLAG_NO_IN_PORT))
++ 			mlx5_eswitch_set_rule_source_port(esw, spec, attr);
++ 	}
+++>>>>>>> 0faddfe6b795 (net/mlx5e: E-Switch, Add misc bit when misc fields changed for mirroring)
+  	if (IS_ERR(fdb)) {
+  		rule = ERR_CAST(fdb);
+  		goto err_esw_get;
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/en/tc_tun_geneve.c b/drivers/net/ethernet/mellanox/mlx5/core/en/tc_tun_geneve.c
+index 951ea26d96bc..e472ed0eacfb 100644
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en/tc_tun_geneve.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en/tc_tun_geneve.c
+@@ -301,6 +301,8 @@ static int mlx5e_tc_tun_parse_geneve_params(struct mlx5e_priv *priv,
+ 		MLX5_SET(fte_match_set_misc, misc_v, geneve_protocol_type, ETH_P_TEB);
+ 	}
+ 
++	spec->match_criteria_enable |= MLX5_MATCH_MISC_PARAMETERS;
++
+ 	return 0;
+ }
+ 
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/en/tc_tun_gre.c b/drivers/net/ethernet/mellanox/mlx5/core/en/tc_tun_gre.c
+index 58b13192df23..2805416c32a3 100644
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en/tc_tun_gre.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en/tc_tun_gre.c
+@@ -80,6 +80,8 @@ static int mlx5e_tc_tun_parse_gretap(struct mlx5e_priv *priv,
+ 			 gre_key.key, be32_to_cpu(enc_keyid.key->keyid));
+ 	}
+ 
++	spec->match_criteria_enable |= MLX5_MATCH_MISC_PARAMETERS;
++
+ 	return 0;
+ }
+ 
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/en/tc_tun_vxlan.c b/drivers/net/ethernet/mellanox/mlx5/core/en/tc_tun_vxlan.c
+index 37b176801bcc..038a0f1cecec 100644
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en/tc_tun_vxlan.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en/tc_tun_vxlan.c
+@@ -136,6 +136,8 @@ static int mlx5e_tc_tun_parse_vxlan(struct mlx5e_priv *priv,
+ 	MLX5_SET(fte_match_set_misc, misc_v, vxlan_vni,
+ 		 be32_to_cpu(enc_keyid.key->keyid));
+ 
++	spec->match_criteria_enable |= MLX5_MATCH_MISC_PARAMETERS;
++
+ 	return 0;
+ }
+ 
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/en_tc.c b/drivers/net/ethernet/mellanox/mlx5/core/en_tc.c
+index 23a1c21d8bab..a6794913456f 100644
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_tc.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_tc.c
+@@ -1893,6 +1893,7 @@ static int __parse_cls_flower(struct mlx5e_priv *priv,
+ 				 match.key->vlan_priority);
+ 
+ 			*match_level = MLX5_MATCH_L2;
++			spec->match_criteria_enable |= MLX5_MATCH_MISC_PARAMETERS;
+ 		}
+ 	}
+ 
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/eswitch_offloads.c
