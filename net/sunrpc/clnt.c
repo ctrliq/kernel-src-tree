@@ -46,10 +46,6 @@
 # define RPCDBG_FACILITY	RPCDBG_CALL
 #endif
 
-#define dprint_status(t)					\
-	dprintk("RPC: %5u %s (status %d)\n", t->tk_pid,		\
-			__func__, t->tk_status)
-
 /*
  * All RPC clients are linked into this list
  */
@@ -1654,8 +1650,6 @@ call_start(struct rpc_task *task)
 static void
 call_reserve(struct rpc_task *task)
 {
-	dprint_status(task);
-
 	task->tk_status  = 0;
 	task->tk_action  = call_reserveresult;
 	xprt_reserve(task);
@@ -1670,8 +1664,6 @@ static void
 call_reserveresult(struct rpc_task *task)
 {
 	int status = task->tk_status;
-
-	dprint_status(task);
 
 	/*
 	 * After a call to xprt_reserve(), we must have either
@@ -1713,8 +1705,6 @@ call_reserveresult(struct rpc_task *task)
 static void
 call_retry_reserve(struct rpc_task *task)
 {
-	dprint_status(task);
-
 	task->tk_status  = 0;
 	task->tk_action  = call_reserveresult;
 	xprt_retry_reserve(task);
@@ -1726,8 +1716,6 @@ call_retry_reserve(struct rpc_task *task)
 static void
 call_refresh(struct rpc_task *task)
 {
-	dprint_status(task);
-
 	task->tk_action = call_refreshresult;
 	task->tk_status = 0;
 	task->tk_client->cl_stats->rpcauthrefresh++;
@@ -1741,8 +1729,6 @@ static void
 call_refreshresult(struct rpc_task *task)
 {
 	int status = task->tk_status;
-
-	dprint_status(task);
 
 	task->tk_status = 0;
 	task->tk_action = call_refresh;
@@ -1787,8 +1773,6 @@ call_allocate(struct rpc_task *task)
 	struct rpc_xprt *xprt = req->rq_xprt;
 	const struct rpc_procinfo *proc = task->tk_msg.rpc_proc;
 	int status;
-
-	dprint_status(task);
 
 	task->tk_status = 0;
 	task->tk_action = call_encode;
@@ -1878,7 +1862,7 @@ call_encode(struct rpc_task *task)
 {
 	if (!rpc_task_need_encode(task))
 		goto out;
-	dprint_status(task);
+
 	/* Dequeue task from the receive queue while we're encoding */
 	xprt_request_dequeue_xprt(task);
 	/* Encode here so that rpcsec_gss can use correct sequence number. */
@@ -1955,8 +1939,6 @@ call_bind(struct rpc_task *task)
 		return;
 	}
 
-	dprint_status(task);
-
 	task->tk_action = call_bind_status;
 	if (!xprt_prepare_transmit(task))
 		return;
@@ -1978,7 +1960,6 @@ call_bind_status(struct rpc_task *task)
 		return;
 	}
 
-	dprint_status(task);
 	trace_rpc_bind_status(task);
 	if (task->tk_status >= 0)
 		goto out_next;
@@ -2105,7 +2086,6 @@ call_connect_status(struct rpc_task *task)
 		return;
 	}
 
-	dprint_status(task);
 	trace_rpc_connect_status(task);
 
 	if (task->tk_status == 0) {
@@ -2173,8 +2153,6 @@ call_transmit(struct rpc_task *task)
 		return;
 	}
 
-	dprint_status(task);
-
 	task->tk_action = call_transmit_status;
 	if (!xprt_prepare_transmit(task))
 		return;
@@ -2209,7 +2187,6 @@ call_transmit_status(struct rpc_task *task)
 
 	switch (task->tk_status) {
 	default:
-		dprint_status(task);
 		break;
 	case -EBADMSG:
 		task->tk_status = 0;
@@ -2291,8 +2268,6 @@ call_bc_transmit_status(struct rpc_task *task)
 	if (rpc_task_transmitted(task))
 		task->tk_status = 0;
 
-	dprint_status(task);
-
 	switch (task->tk_status) {
 	case 0:
 		/* Success */
@@ -2351,8 +2326,6 @@ call_status(struct rpc_task *task)
 
 	if (!task->tk_msg.rpc_proc->p_proc)
 		trace_xprt_ping(task->tk_xprt, task->tk_status);
-
-	dprint_status(task);
 
 	status = task->tk_status;
 	if (status >= 0) {
@@ -2486,8 +2459,6 @@ call_decode(struct rpc_task *task)
 	struct rpc_rqst	*req = task->tk_rqstp;
 	struct xdr_stream xdr;
 	int err;
-
-	dprint_status(task);
 
 	if (!task->tk_msg.rpc_proc->p_decode) {
 		task->tk_action = rpc_exit_task;
