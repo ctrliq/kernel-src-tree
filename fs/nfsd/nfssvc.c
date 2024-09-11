@@ -395,7 +395,7 @@ static int nfsd_startup_net(int nrservs, struct net *net, const struct cred *cre
 		ret = lockd_up(net, cred);
 		if (ret)
 			goto out_socks;
-		nn->lockd_up = 1;
+		nn->lockd_up = true;
 	}
 
 	ret = nfs4_state_start_net(net);
@@ -408,7 +408,7 @@ static int nfsd_startup_net(int nrservs, struct net *net, const struct cred *cre
 out_lockd:
 	if (nn->lockd_up) {
 		lockd_down(net);
-		nn->lockd_up = 0;
+		nn->lockd_up = false;
 	}
 out_socks:
 	nfsd_shutdown_generic();
@@ -422,7 +422,7 @@ static void nfsd_shutdown_net(struct net *net)
 	nfs4_state_shutdown_net(net);
 	if (nn->lockd_up) {
 		lockd_down(net);
-		nn->lockd_up = 0;
+		nn->lockd_up = false;
 	}
 	nn->nfsd_net_up = false;
 	nfsd_shutdown_generic();
