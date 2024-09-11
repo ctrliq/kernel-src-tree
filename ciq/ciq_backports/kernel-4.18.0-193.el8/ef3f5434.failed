@@ -1,0 +1,135 @@
+SUNRPC: Distinguish between the slot allocation list and receive queue
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-193.el8
+commit-author Trond Myklebust <trond.myklebust@hammerspace.com>
+commit ef3f54347f690d06649c0d7a1f63d3410b3d08d3
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-193.el8/ef3f5434.failed
+
+When storing a struct rpc_rqst on the slot allocation list, we currently
+use the same field 'rq_list' as we use to store the request on the
+receive queue. Since the structure is never on both lists at the same
+time, this is OK.
+However, for clarity, let's make that a union with different names for
+the different lists so that we can more easily distinguish between
+the two states.
+
+	Signed-off-by: Trond Myklebust <trond.myklebust@hammerspace.com>
+(cherry picked from commit ef3f54347f690d06649c0d7a1f63d3410b3d08d3)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/sunrpc/xprt.c
+diff --cc net/sunrpc/xprt.c
+index cc25632c1df5,d527dc08540e..000000000000
+--- a/net/sunrpc/xprt.c
++++ b/net/sunrpc/xprt.c
+@@@ -882,6 -904,62 +882,65 @@@ static void xprt_wait_on_pinned_rqst(st
+  	wait_var_event(&req->rq_pin, !xprt_is_pinned_rqst(req));
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static bool
++ xprt_request_data_received(struct rpc_task *task)
++ {
++ 	return !test_bit(RPC_TASK_NEED_RECV, &task->tk_runstate) &&
++ 		READ_ONCE(task->tk_rqstp->rq_reply_bytes_recvd) != 0;
++ }
++ 
++ static bool
++ xprt_request_need_enqueue_receive(struct rpc_task *task, struct rpc_rqst *req)
++ {
++ 	return !test_bit(RPC_TASK_NEED_RECV, &task->tk_runstate) &&
++ 		READ_ONCE(task->tk_rqstp->rq_reply_bytes_recvd) == 0;
++ }
++ 
++ /**
++  * xprt_request_enqueue_receive - Add an request to the receive queue
++  * @task: RPC task
++  *
++  */
++ void
++ xprt_request_enqueue_receive(struct rpc_task *task)
++ {
++ 	struct rpc_rqst *req = task->tk_rqstp;
++ 	struct rpc_xprt *xprt = req->rq_xprt;
++ 
++ 	if (!xprt_request_need_enqueue_receive(task, req))
++ 		return;
++ 	spin_lock(&xprt->queue_lock);
++ 
++ 	/* Update the softirq receive buffer */
++ 	memcpy(&req->rq_private_buf, &req->rq_rcv_buf,
++ 			sizeof(req->rq_private_buf));
++ 
++ 	/* Add request to the receive list */
++ 	list_add_tail(&req->rq_recv, &xprt->recv_queue);
++ 	set_bit(RPC_TASK_NEED_RECV, &task->tk_runstate);
++ 	spin_unlock(&xprt->queue_lock);
++ 
++ 	xprt_reset_majortimeo(req);
++ 	/* Turn off autodisconnect */
++ 	del_singleshot_timer_sync(&xprt->timer);
++ }
++ 
++ /**
++  * xprt_request_dequeue_receive_locked - Remove a request from the receive queue
++  * @task: RPC task
++  *
++  * Caller must hold xprt->queue_lock.
++  */
++ static void
++ xprt_request_dequeue_receive_locked(struct rpc_task *task)
++ {
++ 	if (test_and_clear_bit(RPC_TASK_NEED_RECV, &task->tk_runstate))
++ 		list_del(&task->tk_rqstp->rq_recv);
++ }
++ 
+++>>>>>>> ef3f54347f69 (SUNRPC: Distinguish between the slot allocation list and receive queue)
+  /**
+   * xprt_update_rtt - Update RPC RTT statistics
+   * @task: RPC request that recently completed
+@@@ -1414,10 -1489,10 +1473,10 @@@ static void xprt_init(struct rpc_xprt *
+  
+  	spin_lock_init(&xprt->transport_lock);
+  	spin_lock_init(&xprt->reserve_lock);
+ -	spin_lock_init(&xprt->queue_lock);
+ +	spin_lock_init(&xprt->recv_lock);
+  
+  	INIT_LIST_HEAD(&xprt->free);
+- 	INIT_LIST_HEAD(&xprt->recv);
++ 	INIT_LIST_HEAD(&xprt->recv_queue);
+  #if defined(CONFIG_SUNRPC_BACKCHANNEL)
+  	spin_lock_init(&xprt->bc_pa_lock);
+  	INIT_LIST_HEAD(&xprt->bc_pa_list);
+diff --git a/include/linux/sunrpc/xprt.h b/include/linux/sunrpc/xprt.h
+index bd743c51a865..803fee7e697f 100644
+--- a/include/linux/sunrpc/xprt.h
++++ b/include/linux/sunrpc/xprt.h
+@@ -82,7 +82,11 @@ struct rpc_rqst {
+ 	struct page		**rq_enc_pages;	/* scratch pages for use by
+ 						   gss privacy code */
+ 	void (*rq_release_snd_buf)(struct rpc_rqst *); /* release rq_enc_pages */
+-	struct list_head	rq_list;
++
++	union {
++		struct list_head	rq_list;	/* Slot allocation list */
++		struct list_head	rq_recv;	/* Receive queue */
++	};
+ 
+ 	void			*rq_buffer;	/* Call XDR encode buffer */
+ 	size_t			rq_callsize;
+@@ -249,7 +253,8 @@ struct rpc_xprt {
+ 	struct list_head	bc_pa_list;	/* List of preallocated
+ 						 * backchannel rpc_rqst's */
+ #endif /* CONFIG_SUNRPC_BACKCHANNEL */
+-	struct list_head	recv;
++
++	struct list_head	recv_queue;	/* Receive queue */
+ 
+ 	struct {
+ 		unsigned long		bind_count,	/* total number of binds */
+* Unmerged path net/sunrpc/xprt.c
