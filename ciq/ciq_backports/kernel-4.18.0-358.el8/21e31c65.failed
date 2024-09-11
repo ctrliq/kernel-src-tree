@@ -1,0 +1,160 @@
+Bluetooth: btusb: Consolidate code for waiting firmware download
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-358.el8
+commit-author Luiz Augusto von Dentz <luiz.von.dentz@intel.com>
+commit 21e31c6501d9c24dae8869628ccc80b36f2a3d01
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-358.el8/21e31c65.failed
+
+This moves duplicated code for waiting firmware download completion to
+a function that can be reused.
+
+	Signed-off-by: Luiz Augusto von Dentz <luiz.von.dentz@intel.com>
+	Tested-by: Tedd Ho-Jeong An <tedd.an@intel.com>
+	Signed-off-by: Marcel Holtmann <marcel@holtmann.org>
+(cherry picked from commit 21e31c6501d9c24dae8869628ccc80b36f2a3d01)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/bluetooth/btusb.c
+diff --cc drivers/bluetooth/btusb.c
+index c42f0b5d801a,dcdc434cf794..000000000000
+--- a/drivers/bluetooth/btusb.c
++++ b/drivers/bluetooth/btusb.c
+@@@ -2441,57 -2426,80 +2441,117 @@@ static bool btusb_setup_intel_new_get_f
+  			suffix);
+  		break;
+  	default:
+ -		return -EINVAL;
+ +		return false;
+  	}
+ -
+ -	return 0;
+ +	return true;
+  }
+  
+++<<<<<<< HEAD
+ +static int btusb_intel_download_firmware(struct hci_dev *hdev,
+ +					 struct intel_version *ver,
+ +					 struct intel_boot_params *params,
+ +					 u32 *boot_param)
+++=======
++ static void btusb_setup_intel_newgen_get_fw_name(const struct intel_version_tlv *ver_tlv,
++ 						 char *fw_name, size_t len,
++ 						 const char *suffix)
++ {
++ 	/* The firmware file name for new generation controllers will be
++ 	 * ibt-<cnvi_top type+cnvi_top step>-<cnvr_top type+cnvr_top step>
++ 	 */
++ 	snprintf(fw_name, len, "intel/ibt-%04x-%04x.%s",
++ 		 INTEL_CNVX_TOP_PACK_SWAB(INTEL_CNVX_TOP_TYPE(ver_tlv->cnvi_top),
++ 					  INTEL_CNVX_TOP_STEP(ver_tlv->cnvi_top)),
++ 		 INTEL_CNVX_TOP_PACK_SWAB(INTEL_CNVX_TOP_TYPE(ver_tlv->cnvr_top),
++ 					  INTEL_CNVX_TOP_STEP(ver_tlv->cnvr_top)),
++ 		 suffix);
++ }
++ 
++ static int btusb_download_wait(struct hci_dev *hdev, ktime_t calltime, int msec)
++ {
++ 	struct btusb_data *data = hci_get_drvdata(hdev);
++ 	ktime_t delta, rettime;
++ 	unsigned long long duration;
++ 	int err;
++ 
++ 	set_bit(BTUSB_FIRMWARE_LOADED, &data->flags);
++ 
++ 	bt_dev_info(hdev, "Waiting for firmware download to complete");
++ 
++ 	err = wait_on_bit_timeout(&data->flags, BTUSB_DOWNLOADING,
++ 				  TASK_INTERRUPTIBLE,
++ 				  msecs_to_jiffies(msec));
++ 	if (err == -EINTR) {
++ 		bt_dev_err(hdev, "Firmware loading interrupted");
++ 		return err;
++ 	}
++ 
++ 	if (err) {
++ 		bt_dev_err(hdev, "Firmware loading timeout");
++ 		return -ETIMEDOUT;
++ 	}
++ 
++ 	if (test_bit(BTUSB_FIRMWARE_FAILED, &data->flags)) {
++ 		bt_dev_err(hdev, "Firmware loading failed");
++ 		return -ENOEXEC;
++ 	}
++ 
++ 	rettime = ktime_get();
++ 	delta = ktime_sub(rettime, calltime);
++ 	duration = (unsigned long long)ktime_to_ns(delta) >> 10;
++ 
++ 	bt_dev_info(hdev, "Firmware loaded in %llu usecs", duration);
++ 
++ 	return 0;
++ }
++ 
++ static int btusb_intel_download_firmware_newgen(struct hci_dev *hdev,
++ 						struct intel_version_tlv *ver,
++ 						u32 *boot_param)
+++>>>>>>> 21e31c6501d9 (Bluetooth: btusb: Consolidate code for waiting firmware download)
+  {
+  	const struct firmware *fw;
+  	char fwname[64];
+  	int err;
+  	struct btusb_data *data = hci_get_drvdata(hdev);
++ 	ktime_t calltime;
+  
+ -	if (!ver || !boot_param)
+ +	if (!ver || !params)
+  		return -EINVAL;
+  
+ +	/* The hardware platform number has a fixed value of 0x37 and
+ +	 * for now only accept this single value.
+ +	 */
+ +	if (ver->hw_platform != 0x37) {
+ +		bt_dev_err(hdev, "Unsupported Intel hardware platform (%u)",
+ +			   ver->hw_platform);
+ +		return -EINVAL;
+ +	}
+ +
+ +	/* Check for supported iBT hardware variants of this firmware
+ +	 * loading method.
+ +	 *
+ +	 * This check has been put in place to ensure correct forward
+ +	 * compatibility options when newer hardware variants come along.
+ +	 */
+ +	switch (ver->hw_variant) {
+ +	case 0x0b:	/* SfP */
+ +	case 0x0c:	/* WsP */
+ +	case 0x11:	/* JfP */
+ +	case 0x12:	/* ThP */
+ +	case 0x13:	/* HrP */
+ +	case 0x14:	/* CcP */
+ +		break;
+ +	default:
+ +		bt_dev_err(hdev, "Unsupported Intel hardware variant (%u)",
+ +			   ver->hw_variant);
+ +		return -EINVAL;
+ +	}
+ +
+ +	btintel_version_info(hdev, ver);
+ +
+  	/* The firmware variant determines if the device is in bootloader
+ -	 * mode or is running operational firmware. The value 0x03 identifies
+ +	 * mode or is running operational firmware. The value 0x06 identifies
+  	 * the bootloader and the value 0x23 identifies the operational
+  	 * firmware.
+  	 *
+@@@ -2661,8 -2593,9 +2703,9 @@@ static int btusb_intel_download_firmwar
+  	char fwname[64];
+  	int err;
+  	struct btusb_data *data = hci_get_drvdata(hdev);
++ 	ktime_t calltime;
+  
+ -	if (!ver || !params)
+ +	if (!ver || !boot_param)
+  		return -EINVAL;
+  
+  	/* The firmware variant determines if the device is in bootloader
+* Unmerged path drivers/bluetooth/btusb.c
