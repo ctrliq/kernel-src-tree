@@ -1,0 +1,152 @@
+drm/i915/display/adlp: Add new PSR2 workarounds
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-365.el8
+commit-author José Roberto de Souza <jose.souza@intel.com>
+commit 641dd82ffa9daad38f630d9f4a36e4875fd4e0c6
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-365.el8/641dd82f.failed
+
+Wa_16014451276 fixes the starting coordinate for PSR2 selective
+updates. CHICKEN_TRANS definition of the workaround bit has a wrong
+name based on workaround definition and HSD.
+
+Wa_14014971508 allows the screen to continue to be updated when
+coming back from DC5/DC6 and SF_SINGLE_FULL_FRAME bit is not kept
+set in PSR2_MAN_TRK_CTL.
+
+Wa_16012604467 fixes underruns when exiting PSR2 when it is in one
+of its internal states.
+
+Wa_14014971508 is still in pending status in BSpec but by
+the time this is reviewed and ready to be merged it will be finalized.
+
+v2:
+- renamed register to ADLP_1_BASED_X_GRANULARITY
+- added comment about all ADL-P supported panels being 1 based X
+granularity
+
+BSpec: 54369
+BSpec: 50054
+	Cc: Gwan-gyeong Mun <gwan-gyeong.mun@intel.com>
+	Signed-off-by: José Roberto de Souza <jose.souza@intel.com>
+	Reviewed-by: Gwan-gyeong Mun <gwan-gyeong.mun@intel.com>
+Link: https://patchwork.freedesktop.org/patch/msgid/20210914212507.177511-5-jose.souza@intel.com
+(cherry picked from commit 641dd82ffa9daad38f630d9f4a36e4875fd4e0c6)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/gpu/drm/i915/display/intel_psr.c
+#	drivers/gpu/drm/i915/i915_reg.h
+diff --cc drivers/gpu/drm/i915/display/intel_psr.c
+index 2c6c4a4f9477,c1894b056d6c..000000000000
+--- a/drivers/gpu/drm/i915/display/intel_psr.c
++++ b/drivers/gpu/drm/i915/display/intel_psr.c
+@@@ -978,29 -1142,18 +988,34 @@@ static void intel_psr_enable_source(str
+  			     TRANS_SET_CONTEXT_LATENCY(intel_dp->psr.transcoder),
+  			     TRANS_SET_CONTEXT_LATENCY_MASK,
+  			     TRANS_SET_CONTEXT_LATENCY_VALUE(1));
++ 
++ 	/* Wa_16012604467:adlp */
++ 	if (IS_ALDERLAKE_P(dev_priv) && intel_dp->psr.psr2_enabled)
++ 		intel_de_rmw(dev_priv, CLKGATE_DIS_MISC, 0,
++ 			     CLKGATE_DIS_MISC_DMASC_GATING_DIS);
+  }
+  
+ -static bool psr_interrupt_error_check(struct intel_dp *intel_dp)
+ +static void intel_psr_enable_locked(struct drm_i915_private *dev_priv,
+ +				    const struct intel_crtc_state *crtc_state,
+ +				    const struct drm_connector_state *conn_state)
+  {
+ -	struct drm_i915_private *dev_priv = dp_to_i915(intel_dp);
+ +	struct intel_dp *intel_dp = dev_priv->psr.dp;
+ +	struct intel_digital_port *dig_port = dp_to_dig_port(intel_dp);
+ +	struct intel_encoder *encoder = &dig_port->base;
+  	u32 val;
+  
+ +	drm_WARN_ON(&dev_priv->drm, dev_priv->psr.enabled);
+ +
+ +	dev_priv->psr.psr2_enabled = crtc_state->has_psr2;
+ +	dev_priv->psr.busy_frontbuffer_bits = 0;
+ +	dev_priv->psr.pipe = to_intel_crtc(crtc_state->uapi.crtc)->pipe;
+ +	dev_priv->psr.dc3co_enabled = !!crtc_state->dc3co_exitline;
+ +	dev_priv->psr.transcoder = crtc_state->cpu_transcoder;
+ +	/* DC5/DC6 requires at least 6 idle frames */
+ +	val = usecs_to_jiffies(intel_get_frame_time_us(crtc_state) * 6);
+ +	dev_priv->psr.dc3co_exit_delay = val;
+ +	dev_priv->psr.psr2_sel_fetch_enabled = crtc_state->enable_psr2_sel_fetch;
+ +
+  	/*
+  	 * If a PSR error happened and the driver is reloaded, the EDP_PSR_IIR
+  	 * will still keep the error set even after the reset done in the
+@@@ -1143,6 -1336,13 +1158,16 @@@ static void intel_psr_disable_locked(st
+  			     TRANS_SET_CONTEXT_LATENCY(intel_dp->psr.transcoder),
+  			     TRANS_SET_CONTEXT_LATENCY_MASK, 0);
+  
+++<<<<<<< HEAD
+++=======
++ 	/* Wa_16012604467:adlp */
++ 	if (IS_ALDERLAKE_P(dev_priv) && intel_dp->psr.psr2_enabled)
++ 		intel_de_rmw(dev_priv, CLKGATE_DIS_MISC,
++ 			     CLKGATE_DIS_MISC_DMASC_GATING_DIS, 0);
++ 
++ 	intel_snps_phy_update_psr_power_state(dev_priv, phy, false);
++ 
+++>>>>>>> 641dd82ffa9d (drm/i915/display/adlp: Add new PSR2 workarounds)
+  	/* Disable PSR on Sink */
+  	drm_dp_dpcd_writeb(&intel_dp->aux, DP_PSR_EN_CFG, 0);
+  
+@@@ -1277,7 -1507,18 +1302,20 @@@ static void psr2_man_trk_ctl_calc(struc
+  	u32 val = PSR2_MAN_TRK_CTL_ENABLE;
+  
+  	if (full_update) {
+++<<<<<<< HEAD
+ +		val |= PSR2_MAN_TRK_CTL_SF_SINGLE_FULL_FRAME;
+++=======
++ 		/*
++ 		 * Wa_14014971508:adlp
++ 		 * SINGLE_FULL_FRAME bit is not hold in register so can not be
++ 		 * restored by DMC, so using CONTINUOS_FULL_FRAME to mimic that
++ 		 */
++ 		if (IS_ALDERLAKE_P(dev_priv))
++ 			val |= ADLP_PSR2_MAN_TRK_CTL_SF_CONTINUOS_FULL_FRAME;
++ 		else
++ 			val |= PSR2_MAN_TRK_CTL_SF_SINGLE_FULL_FRAME;
++ 
+++>>>>>>> 641dd82ffa9d (drm/i915/display/adlp: Add new PSR2 workarounds)
+  		goto exit;
+  	}
+  
+diff --cc drivers/gpu/drm/i915/i915_reg.h
+index 1a358779d38f,67351ed5ab5b..000000000000
+--- a/drivers/gpu/drm/i915/i915_reg.h
++++ b/drivers/gpu/drm/i915/i915_reg.h
+@@@ -8083,9 -8202,10 +8083,10 @@@ enum 
+  					    [TRANSCODER_D] = _CHICKEN_TRANS_D))
+  #define  HSW_FRAME_START_DELAY_MASK	REG_GENMASK(28, 27)
+  #define  HSW_FRAME_START_DELAY(x)	REG_FIELD_PREP(HSW_FRAME_START_DELAY_MASK, x)
+ -#define  VSC_DATA_SEL_SOFTWARE_CONTROL	REG_BIT(25) /* GLK */
+ +#define  VSC_DATA_SEL_SOFTWARE_CONTROL	REG_BIT(25) /* GLK and CNL+ */
+  #define  FECSTALL_DIS_DPTSTREAM_DPTTG	REG_BIT(23)
+  #define  DDI_TRAINING_OVERRIDE_ENABLE	REG_BIT(19)
++ #define  ADLP_1_BASED_X_GRANULARITY	REG_BIT(18)
+  #define  DDI_TRAINING_OVERRIDE_VALUE	REG_BIT(18)
+  #define  DDIE_TRAINING_OVERRIDE_ENABLE	REG_BIT(17) /* CHICKEN_TRANS_A only */
+  #define  DDIE_TRAINING_OVERRIDE_VALUE	REG_BIT(16) /* CHICKEN_TRANS_A only */
+@@@ -12559,4 -12757,10 +12560,13 @@@ enum skl_power_gate 
+  #define TGL_ROOT_DEVICE_SKU_ULX		0x2
+  #define TGL_ROOT_DEVICE_SKU_ULT		0x4
+  
+++<<<<<<< HEAD
+++=======
++ #define CLKREQ_POLICY			_MMIO(0x101038)
++ #define  CLKREQ_POLICY_MEM_UP_OVRD	REG_BIT(1)
++ 
++ #define CLKGATE_DIS_MISC			_MMIO(0x46534)
++ #define  CLKGATE_DIS_MISC_DMASC_GATING_DIS	REG_BIT(21)
++ 
+++>>>>>>> 641dd82ffa9d (drm/i915/display/adlp: Add new PSR2 workarounds)
+  #endif /* _I915_REG_H_ */
+* Unmerged path drivers/gpu/drm/i915/display/intel_psr.c
+* Unmerged path drivers/gpu/drm/i915/i915_reg.h
