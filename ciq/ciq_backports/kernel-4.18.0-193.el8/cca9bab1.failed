@@ -1,0 +1,222 @@
+tcp: use monotonic timestamps for PAWS
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-193.el8
+commit-author Arnd Bergmann <arnd@arndb.de>
+commit cca9bab1b72cd2296097c75f59ef11ef80461279
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-193.el8/cca9bab1.failed
+
+Using get_seconds() for timestamps is deprecated since it can lead
+to overflows on 32-bit systems. While the interface generally doesn't
+overflow until year 2106, the specific implementation of the TCP PAWS
+algorithm breaks in 2038 when the intermediate signed 32-bit timestamps
+overflow.
+
+A related problem is that the local timestamps in CLOCK_REALTIME form
+lead to unexpected behavior when settimeofday is called to set the system
+clock backwards or forwards by more than 24 days.
+
+While the first problem could be solved by using an overflow-safe method
+of comparing the timestamps, a nicer solution is to use a monotonic
+clocksource with ktime_get_seconds() that simply doesn't overflow (at
+least not until 136 years after boot) and that doesn't change during
+settimeofday().
+
+To make 32-bit and 64-bit architectures behave the same way here, and
+also save a few bytes in the tcp_options_received structure, I'm changing
+the type to a 32-bit integer, which is now safe on all architectures.
+
+Finally, the ts_recent_stamp field also (confusingly) gets used to store
+a jiffies value in tcp_synq_overflow()/tcp_synq_no_recent_overflow().
+This is currently safe, but changing the type to 32-bit requires
+some small changes there to keep it working.
+
+	Signed-off-by: Arnd Bergmann <arnd@arndb.de>
+	Signed-off-by: Eric Dumazet <edumazet@google.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit cca9bab1b72cd2296097c75f59ef11ef80461279)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/ipv4/tcp_ipv4.c
+diff --cc net/ipv4/tcp_ipv4.c
+index d96f498708c5,dc415c66a33a..000000000000
+--- a/net/ipv4/tcp_ipv4.c
++++ b/net/ipv4/tcp_ipv4.c
+@@@ -155,25 -155,13 +155,35 @@@ int tcp_twsk_unique(struct sock *sk, st
+  	   and use initial timestamp retrieved from peer table.
+  	 */
+  	if (tcptw->tw_ts_recent_stamp &&
+++<<<<<<< HEAD
+ +	    (!twp || (reuse && get_seconds() - tcptw->tw_ts_recent_stamp > 1))) {
+ +		/* In case of repair and re-using TIME-WAIT sockets we still
+ +		 * want to be sure that it is safe as above but honor the
+ +		 * sequence numbers and time stamps set as part of the repair
+ +		 * process.
+ +		 *
+ +		 * Without this check re-using a TIME-WAIT socket with TCP
+ +		 * repair would accumulate a -1 on the repair assigned
+ +		 * sequence number. The first time it is reused the sequence
+ +		 * is -1, the second time -2, etc. This fixes that issue
+ +		 * without appearing to create any others.
+ +		 */
+ +		if (likely(!tp->repair)) {
+ +			tp->write_seq = tcptw->tw_snd_nxt + 65535 + 2;
+ +			if (tp->write_seq == 0)
+ +				tp->write_seq = 1;
+ +			tp->rx_opt.ts_recent	   = tcptw->tw_ts_recent;
+ +			tp->rx_opt.ts_recent_stamp = tcptw->tw_ts_recent_stamp;
+ +		}
+++=======
++ 	    (!twp || (reuse && time_after32(ktime_get_seconds(),
++ 					    tcptw->tw_ts_recent_stamp)))) {
++ 		tp->write_seq = tcptw->tw_snd_nxt + 65535 + 2;
++ 		if (tp->write_seq == 0)
++ 			tp->write_seq = 1;
++ 		tp->rx_opt.ts_recent	   = tcptw->tw_ts_recent;
++ 		tp->rx_opt.ts_recent_stamp = tcptw->tw_ts_recent_stamp;
+++>>>>>>> cca9bab1b72c (tcp: use monotonic timestamps for PAWS)
+  		sock_hold(sktw);
+  		return 1;
+  	}
+diff --git a/drivers/crypto/chelsio/chtls/chtls_cm.c b/drivers/crypto/chelsio/chtls/chtls_cm.c
+index 5300d810ecb6..300c139ccfa9 100644
+--- a/drivers/crypto/chelsio/chtls/chtls_cm.c
++++ b/drivers/crypto/chelsio/chtls/chtls_cm.c
+@@ -1676,7 +1676,7 @@ static void chtls_timewait(struct sock *sk)
+ 	struct tcp_sock *tp = tcp_sk(sk);
+ 
+ 	tp->rcv_nxt++;
+-	tp->rx_opt.ts_recent_stamp = get_seconds();
++	tp->rx_opt.ts_recent_stamp = ktime_get_seconds();
+ 	tp->srtt_us = 0;
+ 	tcp_time_wait(sk, TCP_TIME_WAIT, 0);
+ }
+diff --git a/include/linux/tcp.h b/include/linux/tcp.h
+index 8c66475339ed..9eb473a326b1 100644
+--- a/include/linux/tcp.h
++++ b/include/linux/tcp.h
+@@ -89,7 +89,7 @@ struct tcp_sack_block {
+ 
+ struct tcp_options_received {
+ /*	PAWS/RTTM data	*/
+-	long	ts_recent_stamp;/* Time we stored ts_recent (for aging) */
++	int	ts_recent_stamp;/* Time we stored ts_recent (for aging) */
+ 	u32	ts_recent;	/* Time stamp to echo next		*/
+ 	u32	rcv_tsval;	/* Time stamp value             	*/
+ 	u32	rcv_tsecr;	/* Time stamp echo reply        	*/
+@@ -426,7 +426,7 @@ struct tcp_timewait_sock {
+ 	/* The time we sent the last out-of-window ACK: */
+ 	u32			  tw_last_oow_ack_time;
+ 
+-	long			  tw_ts_recent_stamp;
++	int			  tw_ts_recent_stamp;
+ #ifdef CONFIG_TCP_MD5SIG
+ 	struct tcp_md5sig_key	  *tw_md5_key;
+ #endif
+diff --git a/include/net/tcp.h b/include/net/tcp.h
+index a2d22446a290..c8bdaa1da874 100644
+--- a/include/net/tcp.h
++++ b/include/net/tcp.h
+@@ -475,19 +475,20 @@ struct sock *cookie_v4_check(struct sock *sk, struct sk_buff *skb);
+  */
+ static inline void tcp_synq_overflow(const struct sock *sk)
+ {
+-	unsigned long last_overflow = tcp_sk(sk)->rx_opt.ts_recent_stamp;
+-	unsigned long now = jiffies;
++	unsigned int last_overflow = tcp_sk(sk)->rx_opt.ts_recent_stamp;
++	unsigned int now = jiffies;
+ 
+-	if (time_after(now, last_overflow + HZ))
++	if (time_after32(now, last_overflow + HZ))
+ 		tcp_sk(sk)->rx_opt.ts_recent_stamp = now;
+ }
+ 
+ /* syncookies: no recent synqueue overflow on this listening socket? */
+ static inline bool tcp_synq_no_recent_overflow(const struct sock *sk)
+ {
+-	unsigned long last_overflow = tcp_sk(sk)->rx_opt.ts_recent_stamp;
++	unsigned int last_overflow = tcp_sk(sk)->rx_opt.ts_recent_stamp;
++	unsigned int now = jiffies;
+ 
+-	return time_after(jiffies, last_overflow + TCP_SYNCOOKIE_VALID);
++	return time_after32(now, last_overflow + TCP_SYNCOOKIE_VALID);
+ }
+ 
+ static inline u32 tcp_cookie_time(void)
+@@ -1389,7 +1390,8 @@ static inline bool tcp_paws_check(const struct tcp_options_received *rx_opt,
+ {
+ 	if ((s32)(rx_opt->ts_recent - rx_opt->rcv_tsval) <= paws_win)
+ 		return true;
+-	if (unlikely(get_seconds() >= rx_opt->ts_recent_stamp + TCP_PAWS_24DAYS))
++	if (unlikely(!time_before32(ktime_get_seconds(),
++				    rx_opt->ts_recent_stamp + TCP_PAWS_24DAYS)))
+ 		return true;
+ 	/*
+ 	 * Some OSes send SYN and SYNACK messages with tsval=0 tsecr=0,
+@@ -1419,7 +1421,8 @@ static inline bool tcp_paws_reject(const struct tcp_options_received *rx_opt,
+ 
+ 	   However, we can relax time bounds for RST segments to MSL.
+ 	 */
+-	if (rst && get_seconds() >= rx_opt->ts_recent_stamp + TCP_PAWS_MSL)
++	if (rst && !time_before32(ktime_get_seconds(),
++				  rx_opt->ts_recent_stamp + TCP_PAWS_MSL))
+ 		return false;
+ 	return true;
+ }
+diff --git a/net/ipv4/tcp_input.c b/net/ipv4/tcp_input.c
+index 91b38ee19b27..4fe9dcf25b63 100644
+--- a/net/ipv4/tcp_input.c
++++ b/net/ipv4/tcp_input.c
+@@ -3481,7 +3481,7 @@ static void tcp_send_challenge_ack(struct sock *sk, const struct sk_buff *skb)
+ static void tcp_store_ts_recent(struct tcp_sock *tp)
+ {
+ 	tp->rx_opt.ts_recent = tp->rx_opt.rcv_tsval;
+-	tp->rx_opt.ts_recent_stamp = get_seconds();
++	tp->rx_opt.ts_recent_stamp = ktime_get_seconds();
+ }
+ 
+ static void tcp_replace_ts_recent(struct tcp_sock *tp, u32 seq)
+* Unmerged path net/ipv4/tcp_ipv4.c
+diff --git a/net/ipv4/tcp_minisocks.c b/net/ipv4/tcp_minisocks.c
+index 3bf9282b15f6..12affb7864d9 100644
+--- a/net/ipv4/tcp_minisocks.c
++++ b/net/ipv4/tcp_minisocks.c
+@@ -144,7 +144,7 @@ tcp_timewait_state_process(struct inet_timewait_sock *tw, struct sk_buff *skb,
+ 		tw->tw_substate	  = TCP_TIME_WAIT;
+ 		tcptw->tw_rcv_nxt = TCP_SKB_CB(skb)->end_seq;
+ 		if (tmp_opt.saw_tstamp) {
+-			tcptw->tw_ts_recent_stamp = get_seconds();
++			tcptw->tw_ts_recent_stamp = ktime_get_seconds();
+ 			tcptw->tw_ts_recent	  = tmp_opt.rcv_tsval;
+ 		}
+ 
+@@ -190,7 +190,7 @@ tcp_timewait_state_process(struct inet_timewait_sock *tw, struct sk_buff *skb,
+ 
+ 		if (tmp_opt.saw_tstamp) {
+ 			tcptw->tw_ts_recent	  = tmp_opt.rcv_tsval;
+-			tcptw->tw_ts_recent_stamp = get_seconds();
++			tcptw->tw_ts_recent_stamp = ktime_get_seconds();
+ 		}
+ 
+ 		inet_twsk_put(tw);
+@@ -538,7 +538,7 @@ struct sock *tcp_create_openreq_child(const struct sock *sk,
+ 
+ 	if (newtp->rx_opt.tstamp_ok) {
+ 		newtp->rx_opt.ts_recent = req->ts_recent;
+-		newtp->rx_opt.ts_recent_stamp = get_seconds();
++		newtp->rx_opt.ts_recent_stamp = ktime_get_seconds();
+ 		newtp->tcp_header_len = sizeof(struct tcphdr) + TCPOLEN_TSTAMP_ALIGNED;
+ 	} else {
+ 		newtp->rx_opt.ts_recent_stamp = 0;
+@@ -604,7 +604,7 @@ struct sock *tcp_check_req(struct sock *sk, struct sk_buff *skb,
+ 			 * it can be estimated (approximately)
+ 			 * from another data.
+ 			 */
+-			tmp_opt.ts_recent_stamp = get_seconds() - ((TCP_TIMEOUT_INIT/HZ)<<req->num_timeout);
++			tmp_opt.ts_recent_stamp = ktime_get_seconds() - ((TCP_TIMEOUT_INIT/HZ)<<req->num_timeout);
+ 			paws_reject = tcp_paws_reject(&tmp_opt, th->rst);
+ 		}
+ 	}
