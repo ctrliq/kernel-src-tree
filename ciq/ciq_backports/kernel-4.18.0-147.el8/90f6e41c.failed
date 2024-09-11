@@ -1,0 +1,136 @@
+RDMA/uverbs: Use kernel API to allocate uverbs indexes
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-147.el8
+commit-author Leon Romanovsky <leon@kernel.org>
+commit 90f6e41cc03a4055d56e94ad7c97df4b1add7f61
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-147.el8/90f6e41c.failed
+
+Replace custom code to allocate indexes to generic kernel API.
+
+	Signed-off-by: Leon Romanovsky <leonro@mellanox.com>
+	Signed-off-by: Doug Ledford <dledford@redhat.com>
+(cherry picked from commit 90f6e41cc03a4055d56e94ad7c97df4b1add7f61)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/infiniband/core/uverbs_main.c
+diff --cc drivers/infiniband/core/uverbs_main.c
+index 495189811c27,6d373f5515b7..000000000000
+--- a/drivers/infiniband/core/uverbs_main.c
++++ b/drivers/infiniband/core/uverbs_main.c
+@@@ -74,10 -73,9 +74,10 @@@ enum 
+  static dev_t dynamic_uverbs_dev;
+  static struct class *uverbs_class;
+  
+- static DECLARE_BITMAP(dev_map, IB_UVERBS_MAX_DEVICES);
++ static DEFINE_IDA(uverbs_ida);
+  
+  static ssize_t (*uverbs_cmd_table[])(struct ib_uverbs_file *file,
+ +				     struct ib_device *ib_dev,
+  				     const char __user *buf, int in_len,
+  				     int out_len) = {
+  	[IB_USER_VERBS_CMD_GET_CONTEXT]		= ib_uverbs_get_context,
+@@@ -1030,62 -1265,38 +1030,67 @@@ static void ib_uverbs_add_one(struct ib
+  	mutex_init(&uverbs_dev->lists_mutex);
+  	INIT_LIST_HEAD(&uverbs_dev->uverbs_file_list);
+  	INIT_LIST_HEAD(&uverbs_dev->uverbs_events_file_list);
+ -	rcu_assign_pointer(uverbs_dev->ib_dev, device);
+ -	uverbs_dev->num_comp_vectors = device->num_comp_vectors;
+  
+- 	devnum = find_first_zero_bit(dev_map, IB_UVERBS_MAX_DEVICES);
+- 	if (devnum >= IB_UVERBS_MAX_DEVICES)
++ 	devnum = ida_alloc_max(&uverbs_ida, IB_UVERBS_MAX_DEVICES - 1,
++ 			       GFP_KERNEL);
++ 	if (devnum < 0)
+  		goto err;
+  	uverbs_dev->devnum = devnum;
+- 	set_bit(devnum, dev_map);
+  	if (devnum >= IB_UVERBS_NUM_FIXED_MINOR)
+  		base = dynamic_uverbs_dev + devnum - IB_UVERBS_NUM_FIXED_MINOR;
+  	else
+  		base = IB_UVERBS_BASE_DEV + devnum;
+  
+ -	if (ib_uverbs_create_uapi(device, uverbs_dev))
+ -		goto err_uapi;
+ -
+ -	uverbs_dev->dev.devt = base;
+ -	dev_set_name(&uverbs_dev->dev, "uverbs%d", uverbs_dev->devnum);
+ +	rcu_assign_pointer(uverbs_dev->ib_dev, device);
+ +	uverbs_dev->num_comp_vectors = device->num_comp_vectors;
+  
+ -	cdev_init(&uverbs_dev->cdev,
+ -		  device->mmap ? &uverbs_mmap_fops : &uverbs_fops);
+ +	cdev_init(&uverbs_dev->cdev, NULL);
+  	uverbs_dev->cdev.owner = THIS_MODULE;
+ -
+ -	ret = cdev_device_add(&uverbs_dev->cdev, &uverbs_dev->dev);
+ -	if (ret)
+ -		goto err_uapi;
+ +	uverbs_dev->cdev.ops = device->mmap ? &uverbs_mmap_fops : &uverbs_fops;
+ +	cdev_set_parent(&uverbs_dev->cdev, &uverbs_dev->kobj);
+ +	kobject_set_name(&uverbs_dev->cdev.kobj, "uverbs%d", uverbs_dev->devnum);
+ +	if (cdev_add(&uverbs_dev->cdev, base, 1))
+ +		goto err_cdev;
+ +
+ +	uverbs_dev->dev = device_create(uverbs_class, device->dev.parent,
+ +					uverbs_dev->cdev.dev, uverbs_dev,
+ +					"uverbs%d", uverbs_dev->devnum);
+ +	if (IS_ERR(uverbs_dev->dev))
+ +		goto err_cdev;
+ +
+ +	if (device_create_file(uverbs_dev->dev, &dev_attr_ibdev))
+ +		goto err_class;
+ +	if (device_create_file(uverbs_dev->dev, &dev_attr_abi_version))
+ +		goto err_class;
+ +
+ +	if (!device->specs_root) {
+ +		const struct uverbs_object_tree_def *default_root[] = {
+ +			uverbs_default_get_objects()};
+ +
+ +		uverbs_dev->specs_root = uverbs_alloc_spec_tree(1,
+ +								default_root);
+ +		if (IS_ERR(uverbs_dev->specs_root))
+ +			goto err_class;
+ +
+ +		device->specs_root = uverbs_dev->specs_root;
+ +	}
+  
+  	ib_set_client_data(device, &uverbs_client, uverbs_dev);
+ +
+  	return;
+  
+++<<<<<<< HEAD
+ +err_class:
+ +	device_destroy(uverbs_class, uverbs_dev->cdev.dev);
+ +
+ +err_cdev:
+ +	cdev_del(&uverbs_dev->cdev);
+ +	clear_bit(devnum, dev_map);
+ +
+++=======
++ err_uapi:
++ 	ida_free(&uverbs_ida, devnum);
+++>>>>>>> 90f6e41cc03a (RDMA/uverbs: Use kernel API to allocate uverbs indexes)
+  err:
+  	if (atomic_dec_and_test(&uverbs_dev->refcount))
+  		ib_uverbs_comp_dev(uverbs_dev);
+@@@ -1210,10 -1370,8 +1215,15 @@@ static void ib_uverbs_remove_one(struc
+  	if (!uverbs_dev)
+  		return;
+  
+++<<<<<<< HEAD
+ +	dev_set_drvdata(uverbs_dev->dev, NULL);
+ +	device_destroy(uverbs_class, uverbs_dev->cdev.dev);
+ +	cdev_del(&uverbs_dev->cdev);
+ +	clear_bit(uverbs_dev->devnum, dev_map);
+++=======
++ 	cdev_device_del(&uverbs_dev->cdev, &uverbs_dev->dev);
++ 	ida_free(&uverbs_ida, uverbs_dev->devnum);
+++>>>>>>> 90f6e41cc03a (RDMA/uverbs: Use kernel API to allocate uverbs indexes)
+  
+  	if (device->disassociate_ucontext) {
+  		/* We disassociate HW resources and immediately return.
+* Unmerged path drivers/infiniband/core/uverbs_main.c
