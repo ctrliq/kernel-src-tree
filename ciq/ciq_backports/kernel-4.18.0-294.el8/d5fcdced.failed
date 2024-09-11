@@ -1,0 +1,165 @@
+scsi: zfcp: use enum zfcp_erp_act_result for argument/return of affected functions
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Steffen Maier <maier@linux.ibm.com>
+commit d5fcdced311bf51a587b26b36e568eb1b640fbc9
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/d5fcdced.failed
+
+With that instead of just "int" it becomes clear which functions return
+this type and which ones also accept it as argument they just pass through
+in some cases or modify in other cases.  v2.6.27 commit 287ac01acf22
+("[SCSI] zfcp: Cleanup code in zfcp_erp.c") introduced the enum which was
+cpp defines previously.
+
+Silence some false -Wswitch compiler warning cases with individual
+NOP cases. When adding more enum values and building with W=1 we
+would get compiler warnings about missed new cases.
+
+Consistently use the variable name "result", so change "retval" in
+zfcp_erp_strategy() to "result". This avoids confusion with other compile
+unit variables "retval" having different semantics and type.
+
+	Signed-off-by: Steffen Maier <maier@linux.ibm.com>
+	Reviewed-by: Benjamin Block <bblock@linux.ibm.com>
+	Signed-off-by: Martin K. Petersen <martin.petersen@oracle.com>
+(cherry picked from commit d5fcdced311bf51a587b26b36e568eb1b640fbc9)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/s390/scsi/zfcp_erp.c
+diff --cc drivers/s390/scsi/zfcp_erp.c
+index dee8c2740a50,5c7fb64111fe..000000000000
+--- a/drivers/s390/scsi/zfcp_erp.c
++++ b/drivers/s390/scsi/zfcp_erp.c
+@@@ -744,10 -710,11 +744,11 @@@ static void zfcp_erp_enqueue_ptp_port(s
+  				 adapter->peer_d_id);
+  	if (IS_ERR(port)) /* error or port already attached */
+  		return;
+ -	_zfcp_erp_port_reopen(port, 0, "ereptp1");
+ +	zfcp_erp_port_reopen(port, 0, "ereptp1");
+  }
+  
+- static int zfcp_erp_adapter_strat_fsf_xconf(struct zfcp_erp_action *erp_action)
++ static enum zfcp_erp_act_result zfcp_erp_adapter_strat_fsf_xconf(
++ 	struct zfcp_erp_action *erp_action)
+  {
+  	int retries;
+  	int sleep = 1;
+@@@ -786,17 -753,14 +787,18 @@@
+  	if (!(atomic_read(&adapter->status) & ZFCP_STATUS_ADAPTER_XCONFIG_OK))
+  		return ZFCP_ERP_FAILED;
+  
+ +	return ZFCP_ERP_SUCCEEDED;
+ +}
+ +
+ +static void
+ +zfcp_erp_adapter_strategy_open_ptp_port(struct zfcp_adapter *const adapter)
+ +{
+  	if (fc_host_port_type(adapter->scsi_host) == FC_PORTTYPE_PTP)
+  		zfcp_erp_enqueue_ptp_port(adapter);
+ -
+ -	return ZFCP_ERP_SUCCEEDED;
+  }
+  
+- static int zfcp_erp_adapter_strategy_open_fsf_xport(struct zfcp_erp_action *act)
++ static enum zfcp_erp_act_result zfcp_erp_adapter_strategy_open_fsf_xport(
++ 	struct zfcp_erp_action *act)
+  {
+  	int ret;
+  	struct zfcp_adapter *adapter = act->adapter;
+@@@ -821,60 -785,8 +823,65 @@@
+  	return ZFCP_ERP_SUCCEEDED;
+  }
+  
+++<<<<<<< HEAD
+ +static enum zfcp_erp_act_result
+ +zfcp_erp_adapter_strategy_alloc_shost(struct zfcp_adapter *const adapter)
+ +{
+ +	struct zfcp_diag_adapter_config_data *const config_data =
+ +		&adapter->diagnostics->config_data;
+ +	struct zfcp_diag_adapter_port_data *const port_data =
+ +		&adapter->diagnostics->port_data;
+ +	unsigned long flags;
+ +	int rc;
+ +
+ +	rc = zfcp_scsi_adapter_register(adapter);
+ +	if (rc == -EEXIST)
+ +		return ZFCP_ERP_SUCCEEDED;
+ +	else if (rc)
+ +		return ZFCP_ERP_FAILED;
+ +
+ +	/*
+ +	 * We allocated the shost for the first time. Before it was NULL,
+ +	 * and so we deferred all updates in the xconf- and xport-data
+ +	 * handlers. We need to make up for that now, and make all the updates
+ +	 * that would have been done before.
+ +	 *
+ +	 * We can be sure that xconf- and xport-data succeeded, because
+ +	 * otherwise this function is not called. But they might have been
+ +	 * incomplete.
+ +	 */
+ +
+ +	spin_lock_irqsave(&config_data->header.access_lock, flags);
+ +	zfcp_scsi_shost_update_config_data(adapter, &config_data->data,
+ +					   !!config_data->header.incomplete);
+ +	spin_unlock_irqrestore(&config_data->header.access_lock, flags);
+ +
+ +	if (adapter->adapter_features & FSF_FEATURE_HBAAPI_MANAGEMENT) {
+ +		spin_lock_irqsave(&port_data->header.access_lock, flags);
+ +		zfcp_scsi_shost_update_port_data(adapter, &port_data->data);
+ +		spin_unlock_irqrestore(&port_data->header.access_lock, flags);
+ +	}
+ +
+ +	/*
+ +	 * There is a remote possibility that the 'Exchange Port Data' request
+ +	 * reports a different connectivity status than 'Exchange Config Data'.
+ +	 * But any change to the connectivity status of the local optic that
+ +	 * happens after the initial xconf request is expected to be reported
+ +	 * to us, as soon as we post Status Read Buffers to the FCP channel
+ +	 * firmware after this function. So any resulting inconsistency will
+ +	 * only be momentary.
+ +	 */
+ +	if (config_data->header.incomplete)
+ +		zfcp_fsf_fc_host_link_down(adapter);
+ +
+ +	return ZFCP_ERP_SUCCEEDED;
+ +}
+ +
+ +static int zfcp_erp_adapter_strategy_open_fsf(struct zfcp_erp_action *act)
+++=======
++ static enum zfcp_erp_act_result zfcp_erp_adapter_strategy_open_fsf(
++ 	struct zfcp_erp_action *act)
+++>>>>>>> d5fcdced311b (scsi: zfcp: use enum zfcp_erp_act_result for argument/return of affected functions)
+  {
+  	if (zfcp_erp_adapter_strat_fsf_xconf(act) == ZFCP_ERP_FAILED)
+  		return ZFCP_ERP_FAILED;
+@@@ -1279,9 -1240,10 +1317,10 @@@ static int zfcp_erp_strat_change_det(at
+  	return 0;
+  }
+  
+- static int zfcp_erp_strategy_statechange(struct zfcp_erp_action *act, int ret)
++ static enum zfcp_erp_act_result zfcp_erp_strategy_statechange(
++ 	struct zfcp_erp_action *act, enum zfcp_erp_act_result result)
+  {
+ -	enum zfcp_erp_act_type type = act->type;
+ +	int action = act->action;
+  	struct zfcp_adapter *adapter = act->adapter;
+  	struct zfcp_port *port = act->port;
+  	struct scsi_device *sdev = act->sdev;
+@@@ -1454,9 -1414,10 +1494,10 @@@ static void zfcp_erp_action_cleanup(str
+  	}
+  }
+  
+- static int zfcp_erp_strategy_do_action(struct zfcp_erp_action *erp_action)
++ static enum zfcp_erp_act_result zfcp_erp_strategy_do_action(
++ 	struct zfcp_erp_action *erp_action)
+  {
+ -	switch (erp_action->type) {
+ +	switch (erp_action->action) {
+  	case ZFCP_ERP_ACTION_REOPEN_ADAPTER:
+  		return zfcp_erp_adapter_strategy(erp_action);
+  	case ZFCP_ERP_ACTION_REOPEN_PORT_FORCED:
+* Unmerged path drivers/s390/scsi/zfcp_erp.c
