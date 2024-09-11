@@ -1,0 +1,236 @@
+lib/genalloc.c: Add algorithm, align and zeroed family of DMA allocators
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-193.el8
+Rebuild_CHGLOG: - [lib] genalloc.c: Add algorithm, align and zeroed family of DMA allocators (Don Dutile) [1754732]
+Rebuild_FUZZ: 97.14%
+commit-author Fredrik Noring <noring@nocrew.org>
+commit cf394fc5f7155c24efb584979e81427575ab3539
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-193.el8/cf394fc5.failed
+
+Provide the algorithm option to DMA allocators as well, along with
+convenience variants for zeroed and aligned memory. The following
+four functions are added:
+
+- gen_pool_dma_alloc_algo()
+- gen_pool_dma_alloc_align()
+- gen_pool_dma_zalloc_algo()
+- gen_pool_dma_zalloc_align()
+
+	Signed-off-by: Fredrik Noring <noring@nocrew.org>
+	Tested-by: Guenter Roeck <linux@roeck-us.net>
+	Signed-off-by: Christoph Hellwig <hch@lst.de>
+(cherry picked from commit cf394fc5f7155c24efb584979e81427575ab3539)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/genalloc.h
+diff --cc include/linux/genalloc.h
+index 2c25717d83c4,ed641337df87..000000000000
+--- a/include/linux/genalloc.h
++++ b/include/linux/genalloc.h
+@@@ -124,48 -116,21 +124,61 @@@ static inline int gen_pool_add(struct g
+  	return gen_pool_add_virt(pool, addr, -1, size, nid);
+  }
+  extern void gen_pool_destroy(struct gen_pool *);
+ -extern unsigned long gen_pool_alloc(struct gen_pool *, size_t);
+ -extern unsigned long gen_pool_alloc_algo(struct gen_pool *, size_t,
+ -		genpool_algo_t algo, void *data);
+ +unsigned long gen_pool_alloc_algo_owner(struct gen_pool *pool, size_t size,
+ +		genpool_algo_t algo, void *data, void **owner);
+ +
+ +static inline unsigned long gen_pool_alloc_owner(struct gen_pool *pool,
+ +		size_t size, void **owner)
+ +{
+ +	return gen_pool_alloc_algo_owner(pool, size, pool->algo, pool->data,
+ +			owner);
+ +}
+ +
+ +static inline unsigned long gen_pool_alloc_algo(struct gen_pool *pool,
+ +		size_t size, genpool_algo_t algo, void *data)
+ +{
+ +	return gen_pool_alloc_algo_owner(pool, size, algo, data, NULL);
+ +}
+ +
+ +/**
+ + * gen_pool_alloc - allocate special memory from the pool
+ + * @pool: pool to allocate from
+ + * @size: number of bytes to allocate from the pool
+ + *
+ + * Allocate the requested number of bytes from the specified pool.
+ + * Uses the pool allocation function (with first-fit algorithm by default).
+ + * Can not be used in NMI handler on architectures without
+ + * NMI-safe cmpxchg implementation.
+ + */
+ +static inline unsigned long gen_pool_alloc(struct gen_pool *pool, size_t size)
+ +{
+ +	return gen_pool_alloc_algo(pool, size, pool->algo, pool->data);
+ +}
+ +
+  extern void *gen_pool_dma_alloc(struct gen_pool *pool, size_t size,
+  		dma_addr_t *dma);
+++<<<<<<< HEAD
+ +void *gen_pool_dma_zalloc(struct gen_pool *pool, size_t size, dma_addr_t *dma);
+ +extern void gen_pool_free_owner(struct gen_pool *pool, unsigned long addr,
+ +		size_t size, void **owner);
+ +static inline void gen_pool_free(struct gen_pool *pool, unsigned long addr,
+ +                size_t size)
+ +{
+ +	gen_pool_free_owner(pool, addr, size, NULL);
+ +}
+ +
+++=======
++ extern void *gen_pool_dma_alloc_algo(struct gen_pool *pool, size_t size,
++ 		dma_addr_t *dma, genpool_algo_t algo, void *data);
++ extern void *gen_pool_dma_alloc_align(struct gen_pool *pool, size_t size,
++ 		dma_addr_t *dma, int align);
++ extern void *gen_pool_dma_zalloc(struct gen_pool *pool, size_t size, dma_addr_t *dma);
++ extern void *gen_pool_dma_zalloc_algo(struct gen_pool *pool, size_t size,
++ 		dma_addr_t *dma, genpool_algo_t algo, void *data);
++ extern void *gen_pool_dma_zalloc_align(struct gen_pool *pool, size_t size,
++ 		dma_addr_t *dma, int align);
++ extern void gen_pool_free(struct gen_pool *, unsigned long, size_t);
+++>>>>>>> cf394fc5f715 (lib/genalloc.c: Add algorithm, align and zeroed family of DMA allocators)
+  extern void gen_pool_for_each_chunk(struct gen_pool *,
+  	void (*)(struct gen_pool *, struct gen_pool_chunk *, void *), void *);
+  extern size_t gen_pool_avail(struct gen_pool *);
+* Unmerged path include/linux/genalloc.h
+diff --git a/lib/genalloc.c b/lib/genalloc.c
+index 0674b607217f..7004d42fd6ee 100644
+--- a/lib/genalloc.c
++++ b/lib/genalloc.c
+@@ -339,13 +339,35 @@ EXPORT_SYMBOL(gen_pool_alloc_algo_owner);
+  * Return: virtual address of the allocated memory, or %NULL on failure
+  */
+ void *gen_pool_dma_alloc(struct gen_pool *pool, size_t size, dma_addr_t *dma)
++{
++	return gen_pool_dma_alloc_algo(pool, size, dma, pool->algo, pool->data);
++}
++EXPORT_SYMBOL(gen_pool_dma_alloc);
++
++/**
++ * gen_pool_dma_alloc_algo - allocate special memory from the pool for DMA
++ * usage with the given pool algorithm
++ * @pool: pool to allocate from
++ * @size: number of bytes to allocate from the pool
++ * @dma: DMA-view physical address return value. Use %NULL if unneeded.
++ * @algo: algorithm passed from caller
++ * @data: data passed to algorithm
++ *
++ * Allocate the requested number of bytes from the specified pool. Uses the
++ * given pool allocation function. Can not be used in NMI handler on
++ * architectures without NMI-safe cmpxchg implementation.
++ *
++ * Return: virtual address of the allocated memory, or %NULL on failure
++ */
++void *gen_pool_dma_alloc_algo(struct gen_pool *pool, size_t size,
++		dma_addr_t *dma, genpool_algo_t algo, void *data)
+ {
+ 	unsigned long vaddr;
+ 
+ 	if (!pool)
+ 		return NULL;
+ 
+-	vaddr = gen_pool_alloc(pool, size);
++	vaddr = gen_pool_alloc_algo(pool, size, algo, data);
+ 	if (!vaddr)
+ 		return NULL;
+ 
+@@ -354,7 +376,31 @@ void *gen_pool_dma_alloc(struct gen_pool *pool, size_t size, dma_addr_t *dma)
+ 
+ 	return (void *)vaddr;
+ }
+-EXPORT_SYMBOL(gen_pool_dma_alloc);
++EXPORT_SYMBOL(gen_pool_dma_alloc_algo);
++
++/**
++ * gen_pool_dma_alloc_align - allocate special memory from the pool for DMA
++ * usage with the given alignment
++ * @pool: pool to allocate from
++ * @size: number of bytes to allocate from the pool
++ * @dma: DMA-view physical address return value. Use %NULL if unneeded.
++ * @align: alignment in bytes for starting address
++ *
++ * Allocate the requested number bytes from the specified pool, with the given
++ * alignment restriction. Can not be used in NMI handler on architectures
++ * without NMI-safe cmpxchg implementation.
++ *
++ * Return: virtual address of the allocated memory, or %NULL on failure
++ */
++void *gen_pool_dma_alloc_align(struct gen_pool *pool, size_t size,
++		dma_addr_t *dma, int align)
++{
++	struct genpool_data_align data = { .align = align };
++
++	return gen_pool_dma_alloc_algo(pool, size, dma,
++			gen_pool_first_fit_align, &data);
++}
++EXPORT_SYMBOL(gen_pool_dma_alloc_align);
+ 
+ /**
+  * gen_pool_dma_zalloc - allocate special zeroed memory from the pool for
+@@ -372,14 +418,60 @@ EXPORT_SYMBOL(gen_pool_dma_alloc);
+  */
+ void *gen_pool_dma_zalloc(struct gen_pool *pool, size_t size, dma_addr_t *dma)
+ {
+-	void *vaddr = gen_pool_dma_alloc(pool, size, dma);
++	return gen_pool_dma_zalloc_algo(pool, size, dma, pool->algo, pool->data);
++}
++EXPORT_SYMBOL(gen_pool_dma_zalloc);
++
++/**
++ * gen_pool_dma_zalloc_algo - allocate special zeroed memory from the pool for
++ * DMA usage with the given pool algorithm
++ * @pool: pool to allocate from
++ * @size: number of bytes to allocate from the pool
++ * @dma: DMA-view physical address return value. Use %NULL if unneeded.
++ * @algo: algorithm passed from caller
++ * @data: data passed to algorithm
++ *
++ * Allocate the requested number of zeroed bytes from the specified pool. Uses
++ * the given pool allocation function. Can not be used in NMI handler on
++ * architectures without NMI-safe cmpxchg implementation.
++ *
++ * Return: virtual address of the allocated zeroed memory, or %NULL on failure
++ */
++void *gen_pool_dma_zalloc_algo(struct gen_pool *pool, size_t size,
++		dma_addr_t *dma, genpool_algo_t algo, void *data)
++{
++	void *vaddr = gen_pool_dma_alloc_algo(pool, size, dma, algo, data);
+ 
+ 	if (vaddr)
+ 		memset(vaddr, 0, size);
+ 
+ 	return vaddr;
+ }
+-EXPORT_SYMBOL(gen_pool_dma_zalloc);
++EXPORT_SYMBOL(gen_pool_dma_zalloc_algo);
++
++/**
++ * gen_pool_dma_zalloc_align - allocate special zeroed memory from the pool for
++ * DMA usage with the given alignment
++ * @pool: pool to allocate from
++ * @size: number of bytes to allocate from the pool
++ * @dma: DMA-view physical address return value. Use %NULL if unneeded.
++ * @align: alignment in bytes for starting address
++ *
++ * Allocate the requested number of zeroed bytes from the specified pool,
++ * with the given alignment restriction. Can not be used in NMI handler on
++ * architectures without NMI-safe cmpxchg implementation.
++ *
++ * Return: virtual address of the allocated zeroed memory, or %NULL on failure
++ */
++void *gen_pool_dma_zalloc_align(struct gen_pool *pool, size_t size,
++		dma_addr_t *dma, int align)
++{
++	struct genpool_data_align data = { .align = align };
++
++	return gen_pool_dma_zalloc_algo(pool, size, dma,
++			gen_pool_first_fit_align, &data);
++}
++EXPORT_SYMBOL(gen_pool_dma_zalloc_align);
+ 
+ /**
+  * gen_pool_free - free allocated special memory back to the pool
