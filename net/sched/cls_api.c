@@ -1672,6 +1672,7 @@ int tcf_classify_ingress(struct sk_buff *skb,
 		skb_ext_del(skb, TC_SKB_EXT);
 
 		tp = rcu_dereference_bh(fchain->filter_chain);
+		last_executed_chain = fchain->index;
 	}
 
 	ret = __tcf_classify(skb, tp, orig_tp, res, compat_mode,
