@@ -1,0 +1,183 @@
+nvme: factor out nvme_ns_open and nvme_ns_release helpers
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-358.el8
+commit-author Christoph Hellwig <hch@lst.de>
+commit f5b9a51db29c31f4e486b08d1d823d6f75f2c2c7
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-358.el8/f5b9a51d.failed
+
+These will be reused for the per-namespace character devices.
+
+	Signed-off-by: Christoph Hellwig <hch@lst.de>
+	Reviewed-by: Keith Busch <kbusch@kernel.org>
+	Reviewed-by: Javier González <javier.gonz@samsung.com>
+	Reviewed-by: Chaitanya Kulkarni <chaitanya.kulkarni@wdc.com>
+(cherry picked from commit f5b9a51db29c31f4e486b08d1d823d6f75f2c2c7)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/nvme/host/core.c
+diff --cc drivers/nvme/host/core.c
+index c7006e7b918f,ded60d50fc56..000000000000
+--- a/drivers/nvme/host/core.c
++++ b/drivers/nvme/host/core.c
+@@@ -1799,130 -1483,8 +1799,133 @@@ void nvme_put_ns_from_disk(struct nvme_
+  		srcu_read_unlock(&head->srcu, idx);
+  }
+  
+++<<<<<<< HEAD
+ +static bool is_ctrl_ioctl(unsigned int cmd)
+ +{
+ +	if (cmd == NVME_IOCTL_ADMIN_CMD || cmd == NVME_IOCTL_ADMIN64_CMD)
+ +		return true;
+ +	if (is_sed_ioctl(cmd))
+ +		return true;
+ +	return false;
+ +}
+ +
+ +static int nvme_handle_ctrl_ioctl(struct nvme_ns *ns, unsigned int cmd,
+ +				  void __user *argp,
+ +				  struct nvme_ns_head *head,
+ +				  int srcu_idx)
+ +{
+ +	struct nvme_ctrl *ctrl = ns->ctrl;
+ +	int ret;
+ +
+ +	nvme_get_ctrl(ns->ctrl);
+ +	nvme_put_ns_from_disk(head, srcu_idx);
+ +
+ +	switch (cmd) {
+ +	case NVME_IOCTL_ADMIN_CMD:
+ +		ret = nvme_user_cmd(ctrl, NULL, argp);
+ +		break;
+ +	case NVME_IOCTL_ADMIN64_CMD:
+ +		ret = nvme_user_cmd64(ctrl, NULL, argp);
+ +		break;
+ +	default:
+ +		ret = sed_ioctl(ctrl->opal_dev, cmd, argp);
+ +		break;
+ +	}
+ +	nvme_put_ctrl(ctrl);
+ +	return ret;
+ +}
+ +
+ +static int nvme_ioctl(struct block_device *bdev, fmode_t mode,
+ +		unsigned int cmd, unsigned long arg)
+ +{
+ +	struct nvme_ns_head *head = NULL;
+ +	void __user *argp = (void __user *)arg;
+ +	struct nvme_ns *ns;
+ +	int srcu_idx, ret;
+ +
+ +	ns = nvme_get_ns_from_disk(bdev->bd_disk, &head, &srcu_idx);
+ +	if (unlikely(!ns))
+ +		return -EWOULDBLOCK;
+ +
+ +	/*
+ +	 * Handle ioctls that apply to the controller instead of the namespace
+ +	 * seperately and drop the ns SRCU reference early.  This avoids a
+ +	 * deadlock when deleting namespaces using the passthrough interface.
+ +	 */
+ +	if (is_ctrl_ioctl(cmd))
+ +		return nvme_handle_ctrl_ioctl(ns, cmd, argp, head, srcu_idx);
+ +
+ +	switch (cmd) {
+ +	case NVME_IOCTL_ID:
+ +		force_successful_syscall_return();
+ +		ret = ns->head->ns_id;
+ +		break;
+ +	case NVME_IOCTL_IO_CMD:
+ +		ret = nvme_user_cmd(ns->ctrl, ns, argp);
+ +		break;
+ +	case NVME_IOCTL_SUBMIT_IO:
+ +		ret = nvme_submit_io(ns, argp);
+ +		break;
+ +	case NVME_IOCTL_IO64_CMD:
+ +		ret = nvme_user_cmd64(ns->ctrl, ns, argp);
+ +		break;
+ +	default:
+ +		if (ns->ndev)
+ +			ret = nvme_nvm_ioctl(ns, cmd, argp);
+ +		else
+ +			ret = -ENOTTY;
+ +	}
+ +
+ +	nvme_put_ns_from_disk(head, srcu_idx);
+ +	return ret;
+ +}
+ +
+ +#ifdef CONFIG_COMPAT
+ +struct nvme_user_io32 {
+ +	__u8	opcode;
+ +	__u8	flags;
+ +	__u16	control;
+ +	__u16	nblocks;
+ +	__u16	rsvd;
+ +	__u64	metadata;
+ +	__u64	addr;
+ +	__u64	slba;
+ +	__u32	dsmgmt;
+ +	__u32	reftag;
+ +	__u16	apptag;
+ +	__u16	appmask;
+ +} __attribute__((__packed__));
+ +
+ +#define NVME_IOCTL_SUBMIT_IO32	_IOW('N', 0x42, struct nvme_user_io32)
+ +
+ +static int nvme_compat_ioctl(struct block_device *bdev, fmode_t mode,
+ +		unsigned int cmd, unsigned long arg)
+ +{
+ +	/*
+ +	 * Corresponds to the difference of NVME_IOCTL_SUBMIT_IO
+ +	 * between 32 bit programs and 64 bit kernel.
+ +	 * The cause is that the results of sizeof(struct nvme_user_io),
+ +	 * which is used to define NVME_IOCTL_SUBMIT_IO,
+ +	 * are not same between 32 bit compiler and 64 bit compiler.
+ +	 * NVME_IOCTL_SUBMIT_IO32 is for 64 bit kernel handling
+ +	 * NVME_IOCTL_SUBMIT_IO issued from 32 bit programs.
+ +	 * Other IOCTL numbers are same between 32 bit and 64 bit.
+ +	 * So there is nothing to do regarding to other IOCTL numbers.
+ +	 */
+ +	if (cmd == NVME_IOCTL_SUBMIT_IO32)
+ +		return nvme_ioctl(bdev, mode, NVME_IOCTL_SUBMIT_IO, arg);
+ +
+ +	return nvme_ioctl(bdev, mode, cmd, arg);
+ +}
+ +#else
+ +#define nvme_compat_ioctl	NULL
+ +#endif /* CONFIG_COMPAT */
+ +
+ +static int nvme_open(struct block_device *bdev, fmode_t mode)
+++=======
++ static int nvme_ns_open(struct nvme_ns *ns)
+++>>>>>>> f5b9a51db29c (nvme: factor out nvme_ns_open and nvme_ns_release helpers)
+  {
+- 	struct nvme_ns *ns = bdev->bd_disk->private_data;
+  
+  	/* should never be called due to GENHD_FL_HIDDEN */
+  	if (WARN_ON_ONCE(nvme_ns_head_multipath(ns->head)))
+@@@ -1948,7 -1509,17 +1950,21 @@@ static void nvme_ns_release(struct nvme
+  	nvme_put_ns(ns);
+  }
+  
+++<<<<<<< HEAD
+ +static int nvme_getgeo(struct block_device *bdev, struct hd_geometry *geo)
+++=======
++ static int nvme_open(struct block_device *bdev, fmode_t mode)
++ {
++ 	return nvme_ns_open(bdev->bd_disk->private_data);
++ }
++ 
++ static void nvme_release(struct gendisk *disk, fmode_t mode)
++ {
++ 	nvme_ns_release(disk->private_data);
++ }
++ 
++ int nvme_getgeo(struct block_device *bdev, struct hd_geometry *geo)
+++>>>>>>> f5b9a51db29c (nvme: factor out nvme_ns_open and nvme_ns_release helpers)
+  {
+  	/* some standard values */
+  	geo->heads = 1 << 6;
+* Unmerged path drivers/nvme/host/core.c
