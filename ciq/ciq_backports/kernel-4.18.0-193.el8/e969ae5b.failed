@@ -1,0 +1,117 @@
+bnxt_en: Query firmware capability to support aRFS on 57500 chips.
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-193.el8
+Rebuild_CHGLOG: - [netdrv] bnxt_en: Query firmware capability to support aRFS on 57500 chips (Jonathan Toppins) [1724766]
+Rebuild_FUZZ: 99.24%
+commit-author Michael Chan <michael.chan@broadcom.com>
+commit e969ae5bbfcf48e3ff2d159870453121d5a8441d
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-193.el8/e969ae5b.failed
+
+Query support for the aRFS ring table index in the firmware.
+
+	Signed-off-by: Michael Chan <michael.chan@broadcom.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit e969ae5bbfcf48e3ff2d159870453121d5a8441d)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/broadcom/bnxt/bnxt.h
+diff --cc drivers/net/ethernet/broadcom/bnxt/bnxt.h
+index ce7d741e7566,eca36dd6b751..000000000000
+--- a/drivers/net/ethernet/broadcom/bnxt/bnxt.h
++++ b/drivers/net/ethernet/broadcom/bnxt/bnxt.h
+@@@ -1483,6 -1482,11 +1483,14 @@@ struct bnxt 
+  	#define BNXT_FW_CAP_KONG_MB_CHNL		0x00000080
+  	#define BNXT_FW_CAP_OVS_64BIT_HANDLE		0x00000400
+  	#define BNXT_FW_CAP_TRUSTED_VF			0x00000800
+++<<<<<<< HEAD
+++=======
++ 	#define BNXT_FW_CAP_PKG_VER			0x00004000
++ 	#define BNXT_FW_CAP_CFA_ADV_FLOW		0x00008000
++ 	#define BNXT_FW_CAP_CFA_RFS_RING_TBL_IDX	0x00010000
++ 	#define BNXT_FW_CAP_PCIE_STATS_SUPPORTED	0x00020000
++ 	#define BNXT_FW_CAP_EXT_STATS_SUPPORTED		0x00040000
+++>>>>>>> e969ae5bbfcf (bnxt_en: Query firmware capability to support aRFS on 57500 chips.)
+  
+  #define BNXT_NEW_RM(bp)		((bp)->fw_cap & BNXT_FW_CAP_NEW_RM)
+  	u32			hwrm_spec_code;
+diff --git a/drivers/net/ethernet/broadcom/bnxt/bnxt.c b/drivers/net/ethernet/broadcom/bnxt/bnxt.c
+index 2968e48dc9a1..2b13ed2ce12c 100644
+--- a/drivers/net/ethernet/broadcom/bnxt/bnxt.c
++++ b/drivers/net/ethernet/broadcom/bnxt/bnxt.c
+@@ -6614,6 +6614,34 @@ static int bnxt_hwrm_func_qcaps(struct bnxt *bp)
+ 	return 0;
+ }
+ 
++static int bnxt_hwrm_cfa_adv_flow_mgnt_qcaps(struct bnxt *bp)
++{
++	struct hwrm_cfa_adv_flow_mgnt_qcaps_input req = {0};
++	struct hwrm_cfa_adv_flow_mgnt_qcaps_output *resp;
++	int rc = 0;
++	u32 flags;
++
++	if (!(bp->fw_cap & BNXT_FW_CAP_CFA_ADV_FLOW))
++		return 0;
++
++	resp = bp->hwrm_cmd_resp_addr;
++	bnxt_hwrm_cmd_hdr_init(bp, &req, HWRM_CFA_ADV_FLOW_MGNT_QCAPS, -1, -1);
++
++	mutex_lock(&bp->hwrm_cmd_lock);
++	rc = _hwrm_send_message(bp, &req, sizeof(req), HWRM_CMD_TIMEOUT);
++	if (rc)
++		goto hwrm_cfa_adv_qcaps_exit;
++
++	flags = le32_to_cpu(resp->flags);
++	if (flags &
++	    CFA_ADV_FLOW_MGNT_QCAPS_RESP_FLAGS_RFS_RING_TBL_IDX_SUPPORTED)
++		bp->fw_cap |= BNXT_FW_CAP_CFA_RFS_RING_TBL_IDX;
++
++hwrm_cfa_adv_qcaps_exit:
++	mutex_unlock(&bp->hwrm_cmd_lock);
++	return rc;
++}
++
+ static int bnxt_hwrm_func_reset(struct bnxt *bp)
+ {
+ 	struct hwrm_func_reset_input req = {0};
+@@ -6737,6 +6765,10 @@ static int bnxt_hwrm_ver_get(struct bnxt *bp)
+ 	    VER_GET_RESP_DEV_CAPS_CFG_TRUSTED_VF_SUPPORTED)
+ 		bp->fw_cap |= BNXT_FW_CAP_TRUSTED_VF;
+ 
++	if (dev_caps_cfg &
++	    VER_GET_RESP_DEV_CAPS_CFG_CFA_ADV_FLOW_MGNT_SUPPORTED)
++		bp->fw_cap |= BNXT_FW_CAP_CFA_ADV_FLOW;
++
+ hwrm_ver_get_exit:
+ 	mutex_unlock(&bp->hwrm_cmd_lock);
+ 	return rc;
+@@ -9031,8 +9063,11 @@ static bool bnxt_can_reserve_rings(struct bnxt *bp)
+ /* If the chip and firmware supports RFS */
+ static bool bnxt_rfs_supported(struct bnxt *bp)
+ {
+-	if (bp->flags & BNXT_FLAG_CHIP_P5)
++	if (bp->flags & BNXT_FLAG_CHIP_P5) {
++		if (bp->fw_cap & BNXT_FW_CAP_CFA_RFS_RING_TBL_IDX)
++			return true;
+ 		return false;
++	}
+ 	if (BNXT_PF(bp) && !BNXT_CHIP_TYPE_NITRO_A0(bp))
+ 		return true;
+ 	if (bp->flags & BNXT_FLAG_NEW_RSS_CAP)
+@@ -10632,6 +10667,12 @@ static int bnxt_init_one(struct pci_dev *pdev, const struct pci_device_id *ent)
+ 		rc = -1;
+ 		goto init_err_pci_clean;
+ 	}
++
++	rc = bnxt_hwrm_cfa_adv_flow_mgnt_qcaps(bp);
++	if (rc)
++		netdev_warn(bp->dev, "hwrm query adv flow mgnt failure rc: %d\n",
++			    rc);
++
+ 	rc = bnxt_init_mac_addr(bp);
+ 	if (rc) {
+ 		dev_err(&pdev->dev, "Unable to initialize mac address.\n");
+* Unmerged path drivers/net/ethernet/broadcom/bnxt/bnxt.h
