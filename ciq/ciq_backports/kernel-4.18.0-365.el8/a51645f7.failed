@@ -1,0 +1,795 @@
+net: ethernet: support of_get_mac_address new ERR_PTR error
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-365.el8
+commit-author Petr Štetiar <ynezz@true.cz>
+commit a51645f70f6384ae3329551750f7f502cb8de5fc
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-365.el8/a51645f7.failed
+
+There was NVMEM support added to of_get_mac_address, so it could now
+return ERR_PTR encoded error values, so we need to adjust all current
+users of of_get_mac_address to this new fact.
+
+While at it, remove superfluous is_valid_ether_addr as the MAC address
+returned from of_get_mac_address is always valid and checked by
+is_valid_ether_addr anyway.
+
+Fixes: d01f449c008a ("of_net: add NVMEM support to of_get_mac_address")
+	Signed-off-by: Petr Štetiar <ynezz@true.cz>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit a51645f70f6384ae3329551750f7f502cb8de5fc)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/lantiq_xrx200.c
+#	drivers/net/ethernet/nxp/lpc_eth.c
+#	drivers/net/ethernet/xilinx/ll_temac_main.c
+diff --cc drivers/net/ethernet/nxp/lpc_eth.c
+index f378a450e51b,da138edddd32..000000000000
+--- a/drivers/net/ethernet/nxp/lpc_eth.c
++++ b/drivers/net/ethernet/nxp/lpc_eth.c
+@@@ -1382,8 -1367,8 +1382,13 @@@ static int lpc_eth_drv_probe(struct pla
+  	__lpc_get_mac(pldat, ndev->dev_addr);
+  
+  	if (!is_valid_ether_addr(ndev->dev_addr)) {
+++<<<<<<< HEAD
+ +		const char *macaddr = of_get_mac_address(pdev->dev.of_node);
+ +		if (macaddr)
+++=======
++ 		const char *macaddr = of_get_mac_address(np);
++ 		if (!IS_ERR(macaddr))
+++>>>>>>> a51645f70f63 (net: ethernet: support of_get_mac_address new ERR_PTR error)
+  			memcpy(ndev->dev_addr, macaddr, ETH_ALEN);
+  	}
+  	if (!is_valid_ether_addr(ndev->dev_addr))
+diff --cc drivers/net/ethernet/xilinx/ll_temac_main.c
+index 60abc9250f56,f389a819f058..000000000000
+--- a/drivers/net/ethernet/xilinx/ll_temac_main.c
++++ b/drivers/net/ethernet/xilinx/ll_temac_main.c
+@@@ -1028,68 -1138,142 +1028,82 @@@ static int temac_of_probe(struct platfo
+  
+  	/* Setup checksum offload, but default to off if not specified */
+  	lp->temac_features = 0;
+ -	if (temac_np) {
+ -		p = (__be32 *)of_get_property(temac_np, "xlnx,txcsum", NULL);
+ -		if (p && be32_to_cpu(*p))
+ -			lp->temac_features |= TEMAC_FEATURE_TX_CSUM;
+ -		p = (__be32 *)of_get_property(temac_np, "xlnx,rxcsum", NULL);
+ -		if (p && be32_to_cpu(*p))
+ -			lp->temac_features |= TEMAC_FEATURE_RX_CSUM;
+ -	} else if (pdata) {
+ -		if (pdata->txcsum)
+ -			lp->temac_features |= TEMAC_FEATURE_TX_CSUM;
+ -		if (pdata->rxcsum)
+ -			lp->temac_features |= TEMAC_FEATURE_RX_CSUM;
+ -	}
+ -	if (lp->temac_features & TEMAC_FEATURE_TX_CSUM)
+ +	p = (__be32 *)of_get_property(op->dev.of_node, "xlnx,txcsum", NULL);
+ +	if (p && be32_to_cpu(*p)) {
+ +		lp->temac_features |= TEMAC_FEATURE_TX_CSUM;
+  		/* Can checksum TCP/UDP over IPv4. */
+  		ndev->features |= NETIF_F_IP_CSUM;
+ +	}
+ +	p = (__be32 *)of_get_property(op->dev.of_node, "xlnx,rxcsum", NULL);
+ +	if (p && be32_to_cpu(*p))
+ +		lp->temac_features |= TEMAC_FEATURE_RX_CSUM;
+ +
+ +	/* Find the DMA node, map the DMA registers, and decode the DMA IRQs */
+ +	np = of_parse_phandle(op->dev.of_node, "llink-connected", 0);
+ +	if (!np) {
+ +		dev_err(&op->dev, "could not find DMA node\n");
+ +		rc = -ENODEV;
+ +		goto err_iounmap;
+ +	}
+  
+ -	/* Setup LocalLink DMA */
+ -	if (temac_np) {
+ -		/* Find the DMA node, map the DMA registers, and
+ -		 * decode the DMA IRQs.
+ -		 */
+ -		dma_np = of_parse_phandle(temac_np, "llink-connected", 0);
+ -		if (!dma_np) {
+ -			dev_err(&pdev->dev, "could not find DMA node\n");
+ -			return -ENODEV;
+ -		}
+ -
+ -		/* Setup the DMA register accesses, could be DCR or
+ -		 * memory mapped.
+ -		 */
+ -		if (temac_dcr_setup(lp, pdev, dma_np)) {
+ -			/* no DCR in the device tree, try non-DCR */
+ -			lp->sdma_regs = devm_of_iomap(&pdev->dev, dma_np, 0,
+ -						      NULL);
+ -			if (IS_ERR(lp->sdma_regs)) {
+ -				dev_err(&pdev->dev,
+ -					"unable to map DMA registers\n");
+ -				of_node_put(dma_np);
+ -				return PTR_ERR(lp->sdma_regs);
+ -			}
+ -			if (of_get_property(dma_np, "little-endian", NULL)) {
+ -				lp->dma_in = temac_dma_in32_le;
+ -				lp->dma_out = temac_dma_out32_le;
+ -			} else {
+ -				lp->dma_in = temac_dma_in32_be;
+ -				lp->dma_out = temac_dma_out32_be;
+ -			}
+ -			dev_dbg(&pdev->dev, "MEM base: %p\n", lp->sdma_regs);
+ -		}
+ -
+ -		/* Get DMA RX and TX interrupts */
+ -		lp->rx_irq = irq_of_parse_and_map(dma_np, 0);
+ -		lp->tx_irq = irq_of_parse_and_map(dma_np, 1);
+ -
+ -		/* Use defaults for IRQ delay/coalescing setup.  These
+ -		 * are configuration values, so does not belong in
+ -		 * device-tree.
+ -		 */
+ -		lp->tx_chnl_ctrl = 0x10220000;
+ -		lp->rx_chnl_ctrl = 0xff070000;
+ +	/* Setup the DMA register accesses, could be DCR or memory mapped */
+ +	if (temac_dcr_setup(lp, op, np)) {
+  
+ -		/* Finished with the DMA node; drop the reference */
+ -		of_node_put(dma_np);
+ -	} else if (pdata) {
+ -		/* 2nd memory resource specifies DMA registers */
+ -		res = platform_get_resource(pdev, IORESOURCE_MEM, 1);
+ -		lp->sdma_regs = devm_ioremap_nocache(&pdev->dev, res->start,
+ -						     resource_size(res));
+ -		if (IS_ERR(lp->sdma_regs)) {
+ -			dev_err(&pdev->dev,
+ -				"could not map DMA registers\n");
+ -			return PTR_ERR(lp->sdma_regs);
+ -		}
+ -		if (pdata->dma_little_endian) {
+ -			lp->dma_in = temac_dma_in32_le;
+ -			lp->dma_out = temac_dma_out32_le;
+ +		/* no DCR in the device tree, try non-DCR */
+ +		lp->sdma_regs = of_iomap(np, 0);
+ +		if (lp->sdma_regs) {
+ +			lp->dma_in = temac_dma_in32;
+ +			lp->dma_out = temac_dma_out32;
+ +			dev_dbg(&op->dev, "MEM base: %p\n", lp->sdma_regs);
+  		} else {
+ -			lp->dma_in = temac_dma_in32_be;
+ -			lp->dma_out = temac_dma_out32_be;
+ +			dev_err(&op->dev, "unable to map DMA registers\n");
+ +			of_node_put(np);
+ +			goto err_iounmap;
+  		}
+ -
+ -		/* Get DMA RX and TX interrupts */
+ -		lp->rx_irq = platform_get_irq(pdev, 0);
+ -		lp->tx_irq = platform_get_irq(pdev, 1);
+ -
+ -		/* IRQ delay/coalescing setup */
+ -		if (pdata->tx_irq_timeout || pdata->tx_irq_count)
+ -			lp->tx_chnl_ctrl = (pdata->tx_irq_timeout << 24) |
+ -				(pdata->tx_irq_count << 16);
+ -		else
+ -			lp->tx_chnl_ctrl = 0x10220000;
+ -		if (pdata->rx_irq_timeout || pdata->rx_irq_count)
+ -			lp->rx_chnl_ctrl = (pdata->rx_irq_timeout << 24) |
+ -				(pdata->rx_irq_count << 16);
+ -		else
+ -			lp->rx_chnl_ctrl = 0xff070000;
+  	}
+  
+ -	/* Error handle returned DMA RX and TX interrupts */
+ -	if (lp->rx_irq < 0) {
+ -		if (lp->rx_irq != -EPROBE_DEFER)
+ -			dev_err(&pdev->dev, "could not get DMA RX irq\n");
+ -		return lp->rx_irq;
+ -	}
+ -	if (lp->tx_irq < 0) {
+ -		if (lp->tx_irq != -EPROBE_DEFER)
+ -			dev_err(&pdev->dev, "could not get DMA TX irq\n");
+ -		return lp->tx_irq;
+ +	lp->rx_irq = irq_of_parse_and_map(np, 0);
+ +	lp->tx_irq = irq_of_parse_and_map(np, 1);
+ +
+ +	of_node_put(np); /* Finished with the DMA node; drop the reference */
+ +
+ +	if (!lp->rx_irq || !lp->tx_irq) {
+ +		dev_err(&op->dev, "could not determine irqs\n");
+ +		rc = -ENOMEM;
+ +		goto err_iounmap_2;
+  	}
+  
+++<<<<<<< HEAD
+++=======
++ 	if (temac_np) {
++ 		/* Retrieve the MAC address */
++ 		addr = of_get_mac_address(temac_np);
++ 		if (IS_ERR(addr)) {
++ 			dev_err(&pdev->dev, "could not find MAC address\n");
++ 			return -ENODEV;
++ 		}
++ 		temac_init_mac_address(ndev, addr);
++ 	} else if (pdata) {
++ 		temac_init_mac_address(ndev, pdata->mac_addr);
++ 	}
+++>>>>>>> a51645f70f63 (net: ethernet: support of_get_mac_address new ERR_PTR error)
+ +
+ +	/* Retrieve the MAC address */
+ +	addr = of_get_mac_address(op->dev.of_node);
+ +	if (!addr) {
+ +		dev_err(&op->dev, "could not find MAC address\n");
+ +		rc = -ENODEV;
+ +		goto err_iounmap_2;
+ +	}
+ +	temac_init_mac_address(ndev, addr);
+  
+ -	rc = temac_mdio_setup(lp, pdev);
+ +	rc = temac_mdio_setup(lp, op->dev.of_node);
+  	if (rc)
+ -		dev_warn(&pdev->dev, "error registering MDIO bus\n");
+ +		dev_warn(&op->dev, "error registering MDIO bus\n");
+  
+ -	if (temac_np) {
+ -		lp->phy_node = of_parse_phandle(temac_np, "phy-handle", 0);
+ -		if (lp->phy_node)
+ -			dev_dbg(lp->dev, "using PHY node %pOF\n", temac_np);
+ -	} else if (pdata) {
+ -		snprintf(lp->phy_name, sizeof(lp->phy_name),
+ -			 PHY_ID_FMT, lp->mii_bus->id, pdata->phy_addr);
+ -		lp->phy_interface = pdata->phy_interface;
+ -	}
+ +	lp->phy_node = of_parse_phandle(op->dev.of_node, "phy-handle", 0);
+ +	if (lp->phy_node)
+ +		dev_dbg(lp->dev, "using PHY node %pOF (%p)\n", np, np);
+  
+  	/* Add the device attributes */
+  	rc = sysfs_create_group(&lp->dev->kobj, &temac_attr_group);
+* Unmerged path drivers/net/ethernet/lantiq_xrx200.c
+diff --git a/drivers/net/ethernet/aeroflex/greth.c b/drivers/net/ethernet/aeroflex/greth.c
+index f0bc2c555543..31934345a843 100644
+--- a/drivers/net/ethernet/aeroflex/greth.c
++++ b/drivers/net/ethernet/aeroflex/greth.c
+@@ -1458,7 +1458,7 @@ static int greth_of_probe(struct platform_device *ofdev)
+ 		const u8 *addr;
+ 
+ 		addr = of_get_mac_address(ofdev->dev.of_node);
+-		if (addr) {
++		if (!IS_ERR(addr)) {
+ 			for (i = 0; i < 6; i++)
+ 				macaddr[i] = (unsigned int) addr[i];
+ 		} else {
+diff --git a/drivers/net/ethernet/allwinner/sun4i-emac.c b/drivers/net/ethernet/allwinner/sun4i-emac.c
+index 7b54c4472fb3..a1ee0f78fdec 100644
+--- a/drivers/net/ethernet/allwinner/sun4i-emac.c
++++ b/drivers/net/ethernet/allwinner/sun4i-emac.c
+@@ -870,7 +870,7 @@ static int emac_probe(struct platform_device *pdev)
+ 
+ 	/* Read MAC-address from DT */
+ 	mac_addr = of_get_mac_address(np);
+-	if (mac_addr)
++	if (!IS_ERR(mac_addr))
+ 		memcpy(ndev->dev_addr, mac_addr, ETH_ALEN);
+ 
+ 	/* Check if the MAC address is valid, if not get a random one */
+diff --git a/drivers/net/ethernet/altera/altera_tse_main.c b/drivers/net/ethernet/altera/altera_tse_main.c
+index 02921d877c08..669c6dd5c4ea 100644
+--- a/drivers/net/ethernet/altera/altera_tse_main.c
++++ b/drivers/net/ethernet/altera/altera_tse_main.c
+@@ -1535,7 +1535,7 @@ static int altera_tse_probe(struct platform_device *pdev)
+ 
+ 	/* get default MAC address from device tree */
+ 	macaddr = of_get_mac_address(pdev->dev.of_node);
+-	if (macaddr)
++	if (!IS_ERR(macaddr))
+ 		ether_addr_copy(ndev->dev_addr, macaddr);
+ 	else
+ 		eth_hw_addr_random(ndev);
+diff --git a/drivers/net/ethernet/arc/emac_main.c b/drivers/net/ethernet/arc/emac_main.c
+index 4406325fdd9f..1be55e8ffb77 100644
+--- a/drivers/net/ethernet/arc/emac_main.c
++++ b/drivers/net/ethernet/arc/emac_main.c
+@@ -960,7 +960,7 @@ int arc_emac_probe(struct net_device *ndev, int interface)
+ 	/* Get MAC address from device tree */
+ 	mac_addr = of_get_mac_address(dev->of_node);
+ 
+-	if (mac_addr)
++	if (!IS_ERR(mac_addr))
+ 		memcpy(ndev->dev_addr, mac_addr, ETH_ALEN);
+ 	else
+ 		eth_hw_addr_random(ndev);
+diff --git a/drivers/net/ethernet/aurora/nb8800.c b/drivers/net/ethernet/aurora/nb8800.c
+index c9e613872c53..046257d67892 100644
+--- a/drivers/net/ethernet/aurora/nb8800.c
++++ b/drivers/net/ethernet/aurora/nb8800.c
+@@ -1465,7 +1465,7 @@ static int nb8800_probe(struct platform_device *pdev)
+ 	dev->irq = irq;
+ 
+ 	mac = of_get_mac_address(pdev->dev.of_node);
+-	if (mac)
++	if (!IS_ERR(mac))
+ 		ether_addr_copy(dev->dev_addr, mac);
+ 
+ 	if (!is_valid_ether_addr(dev->dev_addr))
+diff --git a/drivers/net/ethernet/broadcom/bcmsysport.c b/drivers/net/ethernet/broadcom/bcmsysport.c
+index d92a344bc8ce..bd2b5819a056 100644
+--- a/drivers/net/ethernet/broadcom/bcmsysport.c
++++ b/drivers/net/ethernet/broadcom/bcmsysport.c
+@@ -2339,7 +2339,7 @@ static int bcm_sysport_probe(struct platform_device *pdev)
+ 
+ 	/* Initialize netdevice members */
+ 	macaddr = of_get_mac_address(dn);
+-	if (!macaddr || !is_valid_ether_addr(macaddr)) {
++	if (IS_ERR(macaddr)) {
+ 		dev_warn(&pdev->dev, "using random Ethernet MAC\n");
+ 		eth_hw_addr_random(dev);
+ 	} else {
+diff --git a/drivers/net/ethernet/broadcom/bgmac-bcma.c b/drivers/net/ethernet/broadcom/bgmac-bcma.c
+index 6fe074c1588b..34d18302b1a3 100644
+--- a/drivers/net/ethernet/broadcom/bgmac-bcma.c
++++ b/drivers/net/ethernet/broadcom/bgmac-bcma.c
+@@ -132,7 +132,7 @@ static int bgmac_probe(struct bcma_device *core)
+ 		mac = of_get_mac_address(bgmac->dev->of_node);
+ 
+ 	/* If no MAC address assigned via device tree, check SPROM */
+-	if (!mac) {
++	if (IS_ERR_OR_NULL(mac)) {
+ 		switch (core->core_unit) {
+ 		case 0:
+ 			mac = sprom->et0mac;
+diff --git a/drivers/net/ethernet/broadcom/bgmac-platform.c b/drivers/net/ethernet/broadcom/bgmac-platform.c
+index 894eda5b13cf..6dc0dd91ad11 100644
+--- a/drivers/net/ethernet/broadcom/bgmac-platform.c
++++ b/drivers/net/ethernet/broadcom/bgmac-platform.c
+@@ -193,7 +193,7 @@ static int bgmac_probe(struct platform_device *pdev)
+ 	bgmac->dma_dev = &pdev->dev;
+ 
+ 	mac_addr = of_get_mac_address(np);
+-	if (mac_addr)
++	if (!IS_ERR(mac_addr))
+ 		ether_addr_copy(bgmac->net_dev->dev_addr, mac_addr);
+ 	else
+ 		dev_warn(&pdev->dev, "MAC address not present in device tree\n");
+diff --git a/drivers/net/ethernet/broadcom/genet/bcmgenet.c b/drivers/net/ethernet/broadcom/genet/bcmgenet.c
+index c5ec29140e9f..116c5aeea2f7 100644
+--- a/drivers/net/ethernet/broadcom/genet/bcmgenet.c
++++ b/drivers/net/ethernet/broadcom/genet/bcmgenet.c
+@@ -3476,7 +3476,7 @@ static int bcmgenet_probe(struct platform_device *pdev)
+ 
+ 	if (dn) {
+ 		macaddr = of_get_mac_address(dn);
+-		if (!macaddr) {
++		if (IS_ERR(macaddr)) {
+ 			dev_err(&pdev->dev, "can't find MAC address\n");
+ 			err = -EINVAL;
+ 			goto err;
+diff --git a/drivers/net/ethernet/cavium/octeon/octeon_mgmt.c b/drivers/net/ethernet/cavium/octeon/octeon_mgmt.c
+index a8e5b6b02696..f141436f0564 100644
+--- a/drivers/net/ethernet/cavium/octeon/octeon_mgmt.c
++++ b/drivers/net/ethernet/cavium/octeon/octeon_mgmt.c
+@@ -1502,7 +1502,7 @@ static int octeon_mgmt_probe(struct platform_device *pdev)
+ 
+ 	mac = of_get_mac_address(pdev->dev.of_node);
+ 
+-	if (mac)
++	if (!IS_ERR(mac))
+ 		memcpy(netdev->dev_addr, mac, ETH_ALEN);
+ 	else
+ 		eth_hw_addr_random(netdev);
+diff --git a/drivers/net/ethernet/cavium/thunder/thunder_bgx.c b/drivers/net/ethernet/cavium/thunder/thunder_bgx.c
+index e337da6ba2a4..7c8a370adf28 100644
+--- a/drivers/net/ethernet/cavium/thunder/thunder_bgx.c
++++ b/drivers/net/ethernet/cavium/thunder/thunder_bgx.c
+@@ -1484,7 +1484,7 @@ static int bgx_init_of_phy(struct bgx *bgx)
+ 			break;
+ 
+ 		mac = of_get_mac_address(node);
+-		if (mac)
++		if (!IS_ERR(mac))
+ 			ether_addr_copy(bgx->lmac[lmac].mac, mac);
+ 
+ 		SET_NETDEV_DEV(&bgx->lmac[lmac].netdev, &bgx->pdev->dev);
+diff --git a/drivers/net/ethernet/davicom/dm9000.c b/drivers/net/ethernet/davicom/dm9000.c
+index 1ea29122e1f2..35fadc8e2dff 100644
+--- a/drivers/net/ethernet/davicom/dm9000.c
++++ b/drivers/net/ethernet/davicom/dm9000.c
+@@ -1411,7 +1411,7 @@ static struct dm9000_plat_data *dm9000_parse_dt(struct device *dev)
+ 		pdata->flags |= DM9000_PLATF_NO_EEPROM;
+ 
+ 	mac_addr = of_get_mac_address(np);
+-	if (mac_addr)
++	if (!IS_ERR(mac_addr))
+ 		memcpy(pdata->dev_addr, mac_addr, sizeof(pdata->dev_addr));
+ 
+ 	return pdata;
+diff --git a/drivers/net/ethernet/ethoc.c b/drivers/net/ethernet/ethoc.c
+index c0c7a35d0af6..9cb820ad9315 100644
+--- a/drivers/net/ethernet/ethoc.c
++++ b/drivers/net/ethernet/ethoc.c
+@@ -1155,7 +1155,7 @@ static int ethoc_probe(struct platform_device *pdev)
+ 		const void *mac;
+ 
+ 		mac = of_get_mac_address(pdev->dev.of_node);
+-		if (mac)
++		if (!IS_ERR(mac))
+ 			ether_addr_copy(netdev->dev_addr, mac);
+ 		priv->phy_id = -1;
+ 	}
+diff --git a/drivers/net/ethernet/ezchip/nps_enet.c b/drivers/net/ethernet/ezchip/nps_enet.c
+index 659f1ad37e96..b4ce26155087 100644
+--- a/drivers/net/ethernet/ezchip/nps_enet.c
++++ b/drivers/net/ethernet/ezchip/nps_enet.c
+@@ -616,7 +616,7 @@ static s32 nps_enet_probe(struct platform_device *pdev)
+ 
+ 	/* set kernel MAC address to dev */
+ 	mac_addr = of_get_mac_address(dev->of_node);
+-	if (mac_addr)
++	if (!IS_ERR(mac_addr))
+ 		ether_addr_copy(ndev->dev_addr, mac_addr);
+ 	else
+ 		eth_hw_addr_random(ndev);
+diff --git a/drivers/net/ethernet/freescale/fec_main.c b/drivers/net/ethernet/freescale/fec_main.c
+index 5206013c106d..f0ce877f4aa5 100644
+--- a/drivers/net/ethernet/freescale/fec_main.c
++++ b/drivers/net/ethernet/freescale/fec_main.c
+@@ -1652,7 +1652,7 @@ static void fec_get_mac(struct net_device *ndev)
+ 		struct device_node *np = fep->pdev->dev.of_node;
+ 		if (np) {
+ 			const char *mac = of_get_mac_address(np);
+-			if (mac)
++			if (!IS_ERR(mac))
+ 				iap = (unsigned char *) mac;
+ 		}
+ 	}
+diff --git a/drivers/net/ethernet/freescale/fec_mpc52xx.c b/drivers/net/ethernet/freescale/fec_mpc52xx.c
+index dc20614b8f44..8a636f41fa92 100644
+--- a/drivers/net/ethernet/freescale/fec_mpc52xx.c
++++ b/drivers/net/ethernet/freescale/fec_mpc52xx.c
+@@ -901,7 +901,7 @@ static int mpc52xx_fec_probe(struct platform_device *op)
+ 	 * First try to read MAC address from DT
+ 	 */
+ 	mac_addr = of_get_mac_address(np);
+-	if (mac_addr) {
++	if (!IS_ERR(mac_addr)) {
+ 		memcpy(ndev->dev_addr, mac_addr, ETH_ALEN);
+ 	} else {
+ 		struct mpc52xx_fec __iomem *fec = priv->fec;
+diff --git a/drivers/net/ethernet/freescale/fman/mac.c b/drivers/net/ethernet/freescale/fman/mac.c
+index d4e575032b3e..59ce6100e798 100644
+--- a/drivers/net/ethernet/freescale/fman/mac.c
++++ b/drivers/net/ethernet/freescale/fman/mac.c
+@@ -721,7 +721,7 @@ static int mac_probe(struct platform_device *_of_dev)
+ 
+ 	/* Get the MAC address */
+ 	mac_addr = of_get_mac_address(mac_node);
+-	if (!mac_addr) {
++	if (IS_ERR(mac_addr)) {
+ 		dev_err(dev, "of_get_mac_address(%pOF) failed\n", mac_node);
+ 		err = -EINVAL;
+ 		goto _return_of_get_parent;
+diff --git a/drivers/net/ethernet/freescale/fs_enet/fs_enet-main.c b/drivers/net/ethernet/freescale/fs_enet/fs_enet-main.c
+index 8379ab1dc6e3..392fa3eac26b 100644
+--- a/drivers/net/ethernet/freescale/fs_enet/fs_enet-main.c
++++ b/drivers/net/ethernet/freescale/fs_enet/fs_enet-main.c
+@@ -1013,7 +1013,7 @@ static int fs_enet_probe(struct platform_device *ofdev)
+ 	spin_lock_init(&fep->tx_lock);
+ 
+ 	mac_addr = of_get_mac_address(ofdev->dev.of_node);
+-	if (mac_addr)
++	if (!IS_ERR(mac_addr))
+ 		memcpy(ndev->dev_addr, mac_addr, ETH_ALEN);
+ 
+ 	ret = fep->ops->allocate_bd(ndev);
+diff --git a/drivers/net/ethernet/freescale/gianfar.c b/drivers/net/ethernet/freescale/gianfar.c
+index de9438022f2e..dceecada5be6 100644
+--- a/drivers/net/ethernet/freescale/gianfar.c
++++ b/drivers/net/ethernet/freescale/gianfar.c
+@@ -873,7 +873,7 @@ static int gfar_of_init(struct platform_device *ofdev, struct net_device **pdev)
+ 
+ 	mac_addr = of_get_mac_address(np);
+ 
+-	if (mac_addr)
++	if (!IS_ERR(mac_addr))
+ 		memcpy(dev->dev_addr, mac_addr, ETH_ALEN);
+ 
+ 	if (model && !strcasecmp(model, "TSEC"))
+diff --git a/drivers/net/ethernet/freescale/ucc_geth.c b/drivers/net/ethernet/freescale/ucc_geth.c
+index 2e8e7a2fde71..9aa4dc078670 100644
+--- a/drivers/net/ethernet/freescale/ucc_geth.c
++++ b/drivers/net/ethernet/freescale/ucc_geth.c
+@@ -3898,7 +3898,7 @@ static int ucc_geth_probe(struct platform_device* ofdev)
+ 	}
+ 
+ 	mac_addr = of_get_mac_address(np);
+-	if (mac_addr)
++	if (!IS_ERR(mac_addr))
+ 		memcpy(dev->dev_addr, mac_addr, ETH_ALEN);
+ 
+ 	ugeth->ug_info = ug_info;
+diff --git a/drivers/net/ethernet/hisilicon/hisi_femac.c b/drivers/net/ethernet/hisilicon/hisi_femac.c
+index 2c2808830e95..96c32ae320b0 100644
+--- a/drivers/net/ethernet/hisilicon/hisi_femac.c
++++ b/drivers/net/ethernet/hisilicon/hisi_femac.c
+@@ -870,7 +870,7 @@ static int hisi_femac_drv_probe(struct platform_device *pdev)
+ 			   phy_modes(phy->interface));
+ 
+ 	mac_addr = of_get_mac_address(node);
+-	if (mac_addr)
++	if (!IS_ERR(mac_addr))
+ 		ether_addr_copy(ndev->dev_addr, mac_addr);
+ 	if (!is_valid_ether_addr(ndev->dev_addr)) {
+ 		eth_hw_addr_random(ndev);
+diff --git a/drivers/net/ethernet/hisilicon/hix5hd2_gmac.c b/drivers/net/ethernet/hisilicon/hix5hd2_gmac.c
+index 1d55968d4e6b..d0172ed66a43 100644
+--- a/drivers/net/ethernet/hisilicon/hix5hd2_gmac.c
++++ b/drivers/net/ethernet/hisilicon/hix5hd2_gmac.c
+@@ -1230,7 +1230,7 @@ static int hix5hd2_dev_probe(struct platform_device *pdev)
+ 	}
+ 
+ 	mac_addr = of_get_mac_address(node);
+-	if (mac_addr)
++	if (!IS_ERR(mac_addr))
+ 		ether_addr_copy(ndev->dev_addr, mac_addr);
+ 	if (!is_valid_ether_addr(ndev->dev_addr)) {
+ 		eth_hw_addr_random(ndev);
+* Unmerged path drivers/net/ethernet/lantiq_xrx200.c
+diff --git a/drivers/net/ethernet/marvell/mv643xx_eth.c b/drivers/net/ethernet/marvell/mv643xx_eth.c
+index 8772a715952f..83f6d9ca02d7 100644
+--- a/drivers/net/ethernet/marvell/mv643xx_eth.c
++++ b/drivers/net/ethernet/marvell/mv643xx_eth.c
+@@ -2753,7 +2753,7 @@ static int mv643xx_eth_shared_of_add_port(struct platform_device *pdev,
+ 	}
+ 
+ 	mac_addr = of_get_mac_address(pnp);
+-	if (mac_addr)
++	if (!IS_ERR(mac_addr))
+ 		memcpy(ppd.mac_addr, mac_addr, ETH_ALEN);
+ 
+ 	mv643xx_eth_property(pnp, "tx-queue-size", ppd.tx_queue_size);
+diff --git a/drivers/net/ethernet/marvell/mvneta.c b/drivers/net/ethernet/marvell/mvneta.c
+index 304c49ad6c9b..70214179bd12 100644
+--- a/drivers/net/ethernet/marvell/mvneta.c
++++ b/drivers/net/ethernet/marvell/mvneta.c
+@@ -4424,7 +4424,7 @@ static int mvneta_probe(struct platform_device *pdev)
+ 	}
+ 
+ 	dt_mac_addr = of_get_mac_address(dn);
+-	if (dt_mac_addr) {
++	if (!IS_ERR(dt_mac_addr)) {
+ 		mac_from = "device tree";
+ 		memcpy(dev->dev_addr, dt_mac_addr, ETH_ALEN);
+ 	} else {
+diff --git a/drivers/net/ethernet/marvell/pxa168_eth.c b/drivers/net/ethernet/marvell/pxa168_eth.c
+index 8acd668c1a43..5dddaabd1231 100644
+--- a/drivers/net/ethernet/marvell/pxa168_eth.c
++++ b/drivers/net/ethernet/marvell/pxa168_eth.c
+@@ -1458,7 +1458,7 @@ static int pxa168_eth_probe(struct platform_device *pdev)
+ 	if (pdev->dev.of_node)
+ 		mac_addr = of_get_mac_address(pdev->dev.of_node);
+ 
+-	if (mac_addr && is_valid_ether_addr(mac_addr)) {
++	if (!IS_ERR_OR_NULL(mac_addr)) {
+ 		ether_addr_copy(dev->dev_addr, mac_addr);
+ 	} else {
+ 		/* try reading the mac address, if set by the bootloader */
+diff --git a/drivers/net/ethernet/marvell/sky2.c b/drivers/net/ethernet/marvell/sky2.c
+index 0e01b4486d17..3d22dd83b570 100644
+--- a/drivers/net/ethernet/marvell/sky2.c
++++ b/drivers/net/ethernet/marvell/sky2.c
+@@ -4821,7 +4821,7 @@ static struct net_device *sky2_init_netdev(struct sky2_hw *hw, unsigned port,
+ 	 * 2) from internal registers set by bootloader
+ 	 */
+ 	iap = of_get_mac_address(hw->pdev->dev.of_node);
+-	if (iap)
++	if (!IS_ERR(iap))
+ 		memcpy(dev->dev_addr, iap, ETH_ALEN);
+ 	else
+ 		memcpy_fromio(dev->dev_addr, hw->regs + B2_MAC_1 + port * 8,
+diff --git a/drivers/net/ethernet/mediatek/mtk_eth_soc.c b/drivers/net/ethernet/mediatek/mtk_eth_soc.c
+index e558deb9449b..b3e512d2acbf 100644
+--- a/drivers/net/ethernet/mediatek/mtk_eth_soc.c
++++ b/drivers/net/ethernet/mediatek/mtk_eth_soc.c
+@@ -2033,7 +2033,7 @@ static int __init mtk_init(struct net_device *dev)
+ 	const char *mac_addr;
+ 
+ 	mac_addr = of_get_mac_address(mac->of_node);
+-	if (mac_addr)
++	if (!IS_ERR(mac_addr))
+ 		ether_addr_copy(dev->dev_addr, mac_addr);
+ 
+ 	/* If the mac address is invalid, use random mac address  */
+diff --git a/drivers/net/ethernet/micrel/ks8851.c b/drivers/net/ethernet/micrel/ks8851.c
+index bd6e9014bc74..7708d0b05918 100644
+--- a/drivers/net/ethernet/micrel/ks8851.c
++++ b/drivers/net/ethernet/micrel/ks8851.c
+@@ -419,7 +419,7 @@ static void ks8851_init_mac(struct ks8851_net *ks)
+ 	const u8 *mac_addr;
+ 
+ 	mac_addr = of_get_mac_address(ks->spidev->dev.of_node);
+-	if (mac_addr) {
++	if (!IS_ERR(mac_addr)) {
+ 		memcpy(dev->dev_addr, mac_addr, ETH_ALEN);
+ 		ks8851_write_mac_addr(dev);
+ 		return;
+diff --git a/drivers/net/ethernet/micrel/ks8851_mll.c b/drivers/net/ethernet/micrel/ks8851_mll.c
+index f3e9dd47b56f..e5cb6156c3ea 100644
+--- a/drivers/net/ethernet/micrel/ks8851_mll.c
++++ b/drivers/net/ethernet/micrel/ks8851_mll.c
+@@ -1633,7 +1633,7 @@ static int ks8851_probe(struct platform_device *pdev)
+ 	/* overwriting the default MAC address */
+ 	if (pdev->dev.of_node) {
+ 		mac = of_get_mac_address(pdev->dev.of_node);
+-		if (mac)
++		if (!IS_ERR(mac))
+ 			memcpy(ks->mac_addr, mac, ETH_ALEN);
+ 	} else {
+ 		struct ks8851_mll_platform_data *pdata;
+* Unmerged path drivers/net/ethernet/nxp/lpc_eth.c
+diff --git a/drivers/net/ethernet/qualcomm/qca_spi.c b/drivers/net/ethernet/qualcomm/qca_spi.c
+index 0d2c213bf52e..b77b093216a8 100644
+--- a/drivers/net/ethernet/qualcomm/qca_spi.c
++++ b/drivers/net/ethernet/qualcomm/qca_spi.c
+@@ -932,7 +932,7 @@ qca_spi_probe(struct spi_device *spi)
+ 
+ 	mac = of_get_mac_address(spi->dev.of_node);
+ 
+-	if (mac)
++	if (!IS_ERR(mac))
+ 		ether_addr_copy(qca->net_dev->dev_addr, mac);
+ 
+ 	if (!is_valid_ether_addr(qca->net_dev->dev_addr)) {
+diff --git a/drivers/net/ethernet/qualcomm/qca_uart.c b/drivers/net/ethernet/qualcomm/qca_uart.c
+index 9d60b90939e6..f40b91025e91 100644
+--- a/drivers/net/ethernet/qualcomm/qca_uart.c
++++ b/drivers/net/ethernet/qualcomm/qca_uart.c
+@@ -351,7 +351,7 @@ static int qca_uart_probe(struct serdev_device *serdev)
+ 
+ 	mac = of_get_mac_address(serdev->dev.of_node);
+ 
+-	if (mac)
++	if (!IS_ERR(mac))
+ 		ether_addr_copy(qca->net_dev->dev_addr, mac);
+ 
+ 	if (!is_valid_ether_addr(qca->net_dev->dev_addr)) {
+diff --git a/drivers/net/ethernet/renesas/ravb_main.c b/drivers/net/ethernet/renesas/ravb_main.c
+index 2763ef5c80b3..7f1ab356fcbc 100644
+--- a/drivers/net/ethernet/renesas/ravb_main.c
++++ b/drivers/net/ethernet/renesas/ravb_main.c
+@@ -121,7 +121,7 @@ static void ravb_set_buffer_align(struct sk_buff *skb)
+  */
+ static void ravb_read_mac_address(struct net_device *ndev, const u8 *mac)
+ {
+-	if (mac) {
++	if (!IS_ERR(mac)) {
+ 		ether_addr_copy(ndev->dev_addr, mac);
+ 	} else {
+ 		u32 mahr = ravb_read(ndev, MAHR);
+diff --git a/drivers/net/ethernet/renesas/sh_eth.c b/drivers/net/ethernet/renesas/sh_eth.c
+index d3bb8450ca29..9a41b4a91f00 100644
+--- a/drivers/net/ethernet/renesas/sh_eth.c
++++ b/drivers/net/ethernet/renesas/sh_eth.c
+@@ -3107,7 +3107,7 @@ static struct sh_eth_plat_data *sh_eth_parse_dt(struct device *dev)
+ 	pdata->phy_interface = of_get_phy_mode(np);
+ 
+ 	mac_addr = of_get_mac_address(np);
+-	if (mac_addr)
++	if (!IS_ERR(mac_addr))
+ 		memcpy(pdata->mac_addr, mac_addr, ETH_ALEN);
+ 
+ 	pdata->no_ether_link =
+diff --git a/drivers/net/ethernet/samsung/sxgbe/sxgbe_platform.c b/drivers/net/ethernet/samsung/sxgbe/sxgbe_platform.c
+index fbd00cb0cb7d..d2bc9412ba03 100644
+--- a/drivers/net/ethernet/samsung/sxgbe/sxgbe_platform.c
++++ b/drivers/net/ethernet/samsung/sxgbe/sxgbe_platform.c
+@@ -124,7 +124,7 @@ static int sxgbe_platform_probe(struct platform_device *pdev)
+ 	}
+ 
+ 	/* Get MAC address if available (DT) */
+-	if (mac)
++	if (!IS_ERR_OR_NULL(mac))
+ 		ether_addr_copy(priv->dev->dev_addr, mac);
+ 
+ 	/* Get the TX/RX IRQ numbers */
+diff --git a/drivers/net/ethernet/socionext/sni_ave.c b/drivers/net/ethernet/socionext/sni_ave.c
+index 633d0138af15..fb24441c93a0 100644
+--- a/drivers/net/ethernet/socionext/sni_ave.c
++++ b/drivers/net/ethernet/socionext/sni_ave.c
+@@ -1592,7 +1592,7 @@ static int ave_probe(struct platform_device *pdev)
+ 	ndev->max_mtu = AVE_MAX_ETHFRAME - (ETH_HLEN + ETH_FCS_LEN);
+ 
+ 	mac_addr = of_get_mac_address(np);
+-	if (mac_addr)
++	if (!IS_ERR(mac_addr))
+ 		ether_addr_copy(ndev->dev_addr, mac_addr);
+ 
+ 	/* if the mac address is invalid, use random mac address */
+diff --git a/drivers/net/ethernet/stmicro/stmmac/stmmac_main.c b/drivers/net/ethernet/stmicro/stmmac/stmmac_main.c
+index 131ec0b508ae..7dba8ba1275c 100644
+--- a/drivers/net/ethernet/stmicro/stmmac/stmmac_main.c
++++ b/drivers/net/ethernet/stmicro/stmmac/stmmac_main.c
+@@ -5564,7 +5564,7 @@ int stmmac_dvr_probe(struct device *device,
+ 	for (i = 0; i < MTL_MAX_TX_QUEUES; i++)
+ 		priv->tx_irq[i] = res->tx_irq[i];
+ 
+-	if (res->mac)
++	if (!IS_ERR_OR_NULL(res->mac))
+ 		memcpy(priv->dev->dev_addr, res->mac, ETH_ALEN);
+ 
+ 	dev_set_drvdata(device, priv->dev);
+diff --git a/drivers/net/ethernet/ti/cpsw.c b/drivers/net/ethernet/ti/cpsw.c
+index 49ae576ed25d..f594cb201b1c 100644
+--- a/drivers/net/ethernet/ti/cpsw.c
++++ b/drivers/net/ethernet/ti/cpsw.c
+@@ -2842,7 +2842,7 @@ static int cpsw_probe_dt(struct cpsw_platform_data *data,
+ 
+ no_phy_slave:
+ 		mac_addr = of_get_mac_address(slave_node);
+-		if (mac_addr) {
++		if (!IS_ERR(mac_addr)) {
+ 			memcpy(slave_data->mac_addr, mac_addr, ETH_ALEN);
+ 		} else {
+ 			ret = ti_cm_get_macid(&pdev->dev, i,
+diff --git a/drivers/net/ethernet/ti/netcp_core.c b/drivers/net/ethernet/ti/netcp_core.c
+index 10d9b08ed584..340a885f856e 100644
+--- a/drivers/net/ethernet/ti/netcp_core.c
++++ b/drivers/net/ethernet/ti/netcp_core.c
+@@ -2051,7 +2051,7 @@ static int netcp_create_interface(struct netcp_device *netcp_device,
+ 		devm_release_mem_region(dev, res.start, size);
+ 	} else {
+ 		mac_addr = of_get_mac_address(node_interface);
+-		if (mac_addr)
++		if (!IS_ERR(mac_addr))
+ 			ether_addr_copy(ndev->dev_addr, mac_addr);
+ 		else
+ 			random_ether_addr(ndev->dev_addr);
+diff --git a/drivers/net/ethernet/wiznet/w5100.c b/drivers/net/ethernet/wiznet/w5100.c
+index ca2d4c1abe1e..e6cc29e36ae2 100644
+--- a/drivers/net/ethernet/wiznet/w5100.c
++++ b/drivers/net/ethernet/wiznet/w5100.c
+@@ -1158,7 +1158,7 @@ int w5100_probe(struct device *dev, const struct w5100_ops *ops,
+ 	INIT_WORK(&priv->setrx_work, w5100_setrx_work);
+ 	INIT_WORK(&priv->restart_work, w5100_restart_work);
+ 
+-	if (mac_addr)
++	if (!IS_ERR_OR_NULL(mac_addr))
+ 		memcpy(ndev->dev_addr, mac_addr, ETH_ALEN);
+ 	else
+ 		eth_hw_addr_random(ndev);
+* Unmerged path drivers/net/ethernet/xilinx/ll_temac_main.c
+diff --git a/drivers/net/ethernet/xilinx/xilinx_axienet_main.c b/drivers/net/ethernet/xilinx/xilinx_axienet_main.c
+index 25d339e4404a..99126fda7e6e 100644
+--- a/drivers/net/ethernet/xilinx/xilinx_axienet_main.c
++++ b/drivers/net/ethernet/xilinx/xilinx_axienet_main.c
+@@ -1603,7 +1603,7 @@ static int axienet_probe(struct platform_device *pdev)
+ 
+ 	/* Retrieve the MAC address */
+ 	mac_addr = of_get_mac_address(pdev->dev.of_node);
+-	if (!mac_addr) {
++	if (IS_ERR(mac_addr)) {
+ 		dev_err(&pdev->dev, "could not find MAC address\n");
+ 		goto free_netdev;
+ 	}
+diff --git a/drivers/net/ethernet/xilinx/xilinx_emaclite.c b/drivers/net/ethernet/xilinx/xilinx_emaclite.c
+index b1700225a984..30d0dbdf5a1e 100644
+--- a/drivers/net/ethernet/xilinx/xilinx_emaclite.c
++++ b/drivers/net/ethernet/xilinx/xilinx_emaclite.c
+@@ -1126,7 +1126,7 @@ static int xemaclite_of_probe(struct platform_device *ofdev)
+ 	lp->rx_ping_pong = get_bool(ofdev, "xlnx,rx-ping-pong");
+ 	mac_address = of_get_mac_address(ofdev->dev.of_node);
+ 
+-	if (mac_address) {
++	if (!IS_ERR(mac_address)) {
+ 		/* Set the MAC address. */
+ 		memcpy(ndev->dev_addr, mac_address, ETH_ALEN);
+ 	} else {
+diff --git a/net/ethernet/eth.c b/net/ethernet/eth.c
+index e7ecb2faf936..e26aa34d3763 100644
+--- a/net/ethernet/eth.c
++++ b/net/ethernet/eth.c
+@@ -553,7 +553,7 @@ int eth_platform_get_mac_address(struct device *dev, u8 *mac_addr)
+ 	addr = NULL;
+ 	if (dp)
+ 		addr = of_get_mac_address(dp);
+-	if (!addr)
++	if (IS_ERR_OR_NULL(addr))
+ 		addr = arch_get_platform_mac_address();
+ 
+ 	if (!addr)
