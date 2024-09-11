@@ -1856,6 +1856,9 @@ void *xa_find_after(struct xarray *xa, unsigned long *indexp,
 	XA_STATE(xas, xa, *indexp + 1);
 	void *entry;
 
+	if (xas.xa_index == 0)
+		return NULL;
+
 	rcu_read_lock();
 	for (;;) {
 		if ((__force unsigned int)filter < XA_MAX_MARKS)
