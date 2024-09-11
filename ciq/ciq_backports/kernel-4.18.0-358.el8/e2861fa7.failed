@@ -1,0 +1,102 @@
+evm: Don't deadlock if a crypto algorithm is unavailable
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-358.el8
+commit-author Matthew Garrett <mjg59@google.com>
+commit e2861fa71641c6414831d628a1f4f793b6562580
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-358.el8/e2861fa7.failed
+
+When EVM attempts to appraise a file signed with a crypto algorithm the
+kernel doesn't have support for, it will cause the kernel to trigger a
+module load. If the EVM policy includes appraisal of kernel modules this
+will in turn call back into EVM - since EVM is holding a lock until the
+crypto initialisation is complete, this triggers a deadlock. Add a
+CRYPTO_NOLOAD flag and skip module loading if it's set, and add that flag
+in the EVM case in order to fail gracefully with an error message
+instead of deadlocking.
+
+	Signed-off-by: Matthew Garrett <mjg59@google.com>
+	Acked-by: Herbert Xu <herbert@gondor.apana.org.au>
+	Signed-off-by: Mimi Zohar <zohar@linux.vnet.ibm.com>
+(cherry picked from commit e2861fa71641c6414831d628a1f4f793b6562580)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/crypto.h
+diff --cc include/linux/crypto.h
+index c526afe0575d,e8839d3a7559..000000000000
+--- a/include/linux/crypto.h
++++ b/include/linux/crypto.h
+@@@ -113,36 -113,9 +113,42 @@@
+  #define CRYPTO_ALG_OPTIONAL_KEY		0x00004000
+  
+  /*
+++<<<<<<< HEAD
+ + * The algorithm may allocate memory during request processing, i.e. during
+ + * encryption, decryption, or hashing.  Users can request an algorithm with this
+ + * flag unset if they can't handle memory allocation failures.
+ + *
+ + * This flag is currently only implemented for algorithms of type "skcipher",
+ + * "aead", "ahash", "shash", and "cipher".  Algorithms of other types might not
+ + * have this flag set even if they allocate memory.
+ + *
+ + * In some edge cases, algorithms can allocate memory regardless of this flag.
+ + * To avoid these cases, users must obey the following usage constraints:
+ + *    skcipher:
+ + *	- The IV buffer and all scatterlist elements must be aligned to the
+ + *	  algorithm's alignmask.
+ + *	- If the data were to be divided into chunks of size
+ + *	  crypto_skcipher_walksize() (with any remainder going at the end), no
+ + *	  chunk can cross a page boundary or a scatterlist element boundary.
+ + *    aead:
+ + *	- The IV buffer and all scatterlist elements must be aligned to the
+ + *	  algorithm's alignmask.
+ + *	- The first scatterlist element must contain all the associated data,
+ + *	  and its pages must be !PageHighMem.
+ + *	- If the plaintext/ciphertext were to be divided into chunks of size
+ + *	  crypto_aead_walksize() (with the remainder going at the end), no chunk
+ + *	  can cross a page boundary or a scatterlist element boundary.
+ + *    ahash:
+ + *	- The result buffer must be aligned to the algorithm's alignmask.
+ + *	- crypto_ahash_finup() must not be used unless the algorithm implements
+ + *	  ->finup() natively.
+ + */
+ +#define CRYPTO_ALG_ALLOCATES_MEMORY	0x00010000
+++=======
++  * Don't trigger module loading
++  */
++ #define CRYPTO_NOLOAD			0x00008000
+++>>>>>>> e2861fa71641 (evm: Don't deadlock if a crypto algorithm is unavailable)
+  
+  /*
+   * Transform masks and values (for crt_flags).
+diff --git a/crypto/api.c b/crypto/api.c
+index 565e6e2ff6eb..b5667f6aa168 100644
+--- a/crypto/api.c
++++ b/crypto/api.c
+@@ -229,7 +229,7 @@ static struct crypto_alg *crypto_larval_lookup(const char *name, u32 type,
+ 	mask &= ~(CRYPTO_ALG_LARVAL | CRYPTO_ALG_DEAD);
+ 
+ 	alg = crypto_alg_lookup(name, type, mask);
+-	if (!alg) {
++	if (!alg && !(mask & CRYPTO_NOLOAD)) {
+ 		request_module("crypto-%s", name);
+ 
+ 		if (!((type ^ CRYPTO_ALG_NEED_FALLBACK) & mask &
+* Unmerged path include/linux/crypto.h
+diff --git a/security/integrity/evm/evm_crypto.c b/security/integrity/evm/evm_crypto.c
+index 4c8318e7dfeb..a40d283956bb 100644
+--- a/security/integrity/evm/evm_crypto.c
++++ b/security/integrity/evm/evm_crypto.c
+@@ -100,7 +100,8 @@ static struct shash_desc *init_desc(char type, uint8_t hash_algo)
+ 		mutex_lock(&mutex);
+ 		if (*tfm)
+ 			goto out;
+-		*tfm = crypto_alloc_shash(algo, 0, CRYPTO_ALG_ASYNC);
++		*tfm = crypto_alloc_shash(algo, 0,
++					  CRYPTO_ALG_ASYNC | CRYPTO_NOLOAD);
+ 		if (IS_ERR(*tfm)) {
+ 			rc = PTR_ERR(*tfm);
+ 			pr_err("Can not allocate %s (reason: %ld)\n", algo, rc);
