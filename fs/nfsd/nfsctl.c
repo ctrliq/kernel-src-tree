@@ -1332,6 +1332,7 @@ void nfsd_client_rmdir(struct dentry *dentry)
 	ret = simple_rmdir(dir, dentry);
 	WARN_ON_ONCE(ret);
 	d_delete(dentry);
+	dput(dentry);
 	inode_unlock(dir);
 }
 
