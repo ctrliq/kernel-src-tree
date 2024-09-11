@@ -1,0 +1,152 @@
+kasan: don't run tests when KASAN is not enabled
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-365.el8
+commit-author Andrey Konovalov <andreyknvl@google.com>
+commit d82dc3a40d12c6eea15c18d24c0bdbc887d0e7c6
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-365.el8/d82dc3a4.failed
+
+Don't run KASAN tests when it's disabled with kasan.mode=off to avoid
+corrupting kernel memory.
+
+Link: https://linux-review.googlesource.com/id/I6447af436a69a94bfc35477f6bf4e2122948355e
+Link: https://lkml.kernel.org/r/25bd4fb5cae7b421d806a1f33fb633edd313f0c7.1610733117.git.andreyknvl@google.com
+	Signed-off-by: Andrey Konovalov <andreyknvl@google.com>
+	Reviewed-by: Marco Elver <elver@google.com>
+	Reviewed-by: Alexander Potapenko <glider@google.com>
+	Cc: Andrey Ryabinin <aryabinin@virtuozzo.com>
+	Cc: Branislav Rankov <Branislav.Rankov@arm.com>
+	Cc: Catalin Marinas <catalin.marinas@arm.com>
+	Cc: Dmitry Vyukov <dvyukov@google.com>
+	Cc: Evgenii Stepanov <eugenis@google.com>
+	Cc: Kevin Brodsky <kevin.brodsky@arm.com>
+	Cc: Peter Collingbourne <pcc@google.com>
+	Cc: Vincenzo Frascino <vincenzo.frascino@arm.com>
+	Cc: Will Deacon <will.deacon@arm.com>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit d82dc3a40d12c6eea15c18d24c0bdbc887d0e7c6)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	lib/test_kasan.c
+diff --cc lib/test_kasan.c
+index 5679dda37d78,25576303897b..000000000000
+--- a/lib/test_kasan.c
++++ b/lib/test_kasan.c
+@@@ -27,24 -22,101 +27,38 @@@
+  
+  #include <asm/page.h>
+  
+ -#include <kunit/test.h>
+ -
+  #include "../mm/kasan/kasan.h"
+  
+ -#define OOB_TAG_OFF (IS_ENABLED(CONFIG_KASAN_GENERIC) ? 0 : KASAN_GRANULE_SIZE)
+ +#define OOB_TAG_OFF (IS_ENABLED(CONFIG_KASAN_GENERIC) ? 0 : KASAN_SHADOW_SCALE_SIZE)
+  
+  /*
+ - * Some tests use these global variables to store return values from function
+ - * calls that could otherwise be eliminated by the compiler as dead code.
+ + * We assign some test results to these globals to make sure the tests
+ + * are not eliminated as dead code.
+   */
+ -void *kasan_ptr_result;
+ -int kasan_int_result;
+  
+ -static struct kunit_resource resource;
+ -static struct kunit_kasan_expectation fail_data;
+ -static bool multishot;
+ +int kasan_int_result;
+ +void *kasan_ptr_result;
+  
+  /*
+ - * Temporarily enable multi-shot mode. Otherwise, KASAN would only report the
+ - * first detected bug and panic the kernel if panic_on_warn is enabled. For
+ - * hardware tag-based KASAN also allow tag checking to be reenabled for each
+ - * test, see the comment for KUNIT_EXPECT_KASAN_FAIL().
+ + * Note: test functions are marked noinline so that their names appear in
+ + * reports.
+   */
+++<<<<<<< HEAD
+++=======
++ static int kasan_test_init(struct kunit *test)
++ {
++ 	if (!kasan_enabled()) {
++ 		kunit_err(test, "can't run KASAN tests with KASAN disabled");
++ 		return -1;
++ 	}
++ 
++ 	multishot = kasan_save_enable_multi_shot();
++ 	kasan_set_tagging_report_once(false);
++ 	return 0;
++ }
+++>>>>>>> d82dc3a40d12 (kasan: don't run tests when KASAN is not enabled)
+  
+ -static void kasan_test_exit(struct kunit *test)
+ -{
+ -	kasan_set_tagging_report_once(true);
+ -	kasan_restore_multi_shot(multishot);
+ -}
+ -
+ -/**
+ - * KUNIT_EXPECT_KASAN_FAIL() - check that the executed expression produces a
+ - * KASAN report; causes a test failure otherwise. This relies on a KUnit
+ - * resource named "kasan_data". Do not use this name for KUnit resources
+ - * outside of KASAN tests.
+ - *
+ - * For hardware tag-based KASAN, when a tag fault happens, tag checking is
+ - * normally auto-disabled. When this happens, this test handler reenables
+ - * tag checking. As tag checking can be only disabled or enabled per CPU, this
+ - * handler disables migration (preemption).
+ - *
+ - * Since the compiler doesn't see that the expression can change the fail_data
+ - * fields, it can reorder or optimize away the accesses to those fields.
+ - * Use READ/WRITE_ONCE() for the accesses and compiler barriers around the
+ - * expression to prevent that.
+ - */
+ -#define KUNIT_EXPECT_KASAN_FAIL(test, expression) do {		\
+ -	if (IS_ENABLED(CONFIG_KASAN_HW_TAGS))			\
+ -		migrate_disable();				\
+ -	WRITE_ONCE(fail_data.report_expected, true);		\
+ -	WRITE_ONCE(fail_data.report_found, false);		\
+ -	kunit_add_named_resource(test,				\
+ -				NULL,				\
+ -				NULL,				\
+ -				&resource,			\
+ -				"kasan_data", &fail_data);	\
+ -	barrier();						\
+ -	expression;						\
+ -	barrier();						\
+ -	KUNIT_EXPECT_EQ(test,					\
+ -			READ_ONCE(fail_data.report_expected),	\
+ -			READ_ONCE(fail_data.report_found));	\
+ -	if (IS_ENABLED(CONFIG_KASAN_HW_TAGS)) {			\
+ -		if (READ_ONCE(fail_data.report_found))		\
+ -			kasan_enable_tagging();			\
+ -		migrate_enable();				\
+ -	}							\
+ -} while (0)
+ -
+ -#define KASAN_TEST_NEEDS_CONFIG_ON(test, config) do {			\
+ -	if (!IS_ENABLED(config)) {					\
+ -		kunit_info((test), "skipping, " #config " required");	\
+ -		return;							\
+ -	}								\
+ -} while (0)
+ -
+ -#define KASAN_TEST_NEEDS_CONFIG_OFF(test, config) do {			\
+ -	if (IS_ENABLED(config)) {					\
+ -		kunit_info((test), "skipping, " #config " enabled");	\
+ -		return;							\
+ -	}								\
+ -} while (0)
+ -
+ -static void kmalloc_oob_right(struct kunit *test)
+ +static noinline void __init kmalloc_oob_right(void)
+  {
+  	char *ptr;
+  	size_t size = 123;
+* Unmerged path lib/test_kasan.c
