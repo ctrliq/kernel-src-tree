@@ -1,0 +1,186 @@
+mptcp: add the incoming RM_ADDR support
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Geliang Tang <geliangtang@gmail.com>
+commit d0876b2284cf8b34dd214b2d0aa21071c345da59
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/d0876b22.failed
+
+This patch added the RM_ADDR option parsing logic:
+
+We parsed the incoming options to find if the rm_addr option is received,
+and called mptcp_pm_rm_addr_received to schedule PM work to a new status,
+named MPTCP_PM_RM_ADDR_RECEIVED.
+
+PM work got this status, and called mptcp_pm_nl_rm_addr_received to handle
+it.
+
+In mptcp_pm_nl_rm_addr_received, we closed the subflow matching the rm_id,
+and updated PM counter.
+
+	Suggested-by: Matthieu Baerts <matthieu.baerts@tessares.net>
+	Suggested-by: Paolo Abeni <pabeni@redhat.com>
+	Suggested-by: Mat Martineau <mathew.j.martineau@linux.intel.com>
+	Signed-off-by: Geliang Tang <geliangtang@gmail.com>
+	Reviewed-by: Mat Martineau <mathew.j.martineau@linux.intel.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit d0876b2284cf8b34dd214b2d0aa21071c345da59)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/mptcp/protocol.c
+#	net/mptcp/protocol.h
+diff --cc net/mptcp/protocol.c
+index 691a71ca323f,26b9233f247c..000000000000
+--- a/net/mptcp/protocol.c
++++ b/net/mptcp/protocol.c
+@@@ -1413,6 -1674,33 +1413,36 @@@ static unsigned int mptcp_sync_mss(stru
+  	return 0;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static void pm_work(struct mptcp_sock *msk)
++ {
++ 	struct mptcp_pm_data *pm = &msk->pm;
++ 
++ 	spin_lock_bh(&msk->pm.lock);
++ 
++ 	pr_debug("msk=%p status=%x", msk, pm->status);
++ 	if (pm->status & BIT(MPTCP_PM_ADD_ADDR_RECEIVED)) {
++ 		pm->status &= ~BIT(MPTCP_PM_ADD_ADDR_RECEIVED);
++ 		mptcp_pm_nl_add_addr_received(msk);
++ 	}
++ 	if (pm->status & BIT(MPTCP_PM_RM_ADDR_RECEIVED)) {
++ 		pm->status &= ~BIT(MPTCP_PM_RM_ADDR_RECEIVED);
++ 		mptcp_pm_nl_rm_addr_received(msk);
++ 	}
++ 	if (pm->status & BIT(MPTCP_PM_ESTABLISHED)) {
++ 		pm->status &= ~BIT(MPTCP_PM_ESTABLISHED);
++ 		mptcp_pm_nl_fully_established(msk);
++ 	}
++ 	if (pm->status & BIT(MPTCP_PM_SUBFLOW_ESTABLISHED)) {
++ 		pm->status &= ~BIT(MPTCP_PM_SUBFLOW_ESTABLISHED);
++ 		mptcp_pm_nl_subflow_established(msk);
++ 	}
++ 
++ 	spin_unlock_bh(&msk->pm.lock);
++ }
++ 
+++>>>>>>> d0876b2284cf (mptcp: add the incoming RM_ADDR support)
+  static void mptcp_worker(struct work_struct *work)
+  {
+  	struct mptcp_sock *msk = container_of(work, struct mptcp_sock, work);
+diff --cc net/mptcp/protocol.h
+index 68e02bf1a169,837e01057544..000000000000
+--- a/net/mptcp/protocol.h
++++ b/net/mptcp/protocol.h
+@@@ -348,11 -362,14 +349,19 @@@ int mptcp_is_enabled(struct net *net)
+  void mptcp_subflow_fully_established(struct mptcp_subflow_context *subflow,
+  				     struct mptcp_options_received *mp_opt);
+  bool mptcp_subflow_data_available(struct sock *sk);
+++<<<<<<< HEAD
+ +void mptcp_subflow_init(void);
+++=======
++ void __init mptcp_subflow_init(void);
++ void mptcp_subflow_shutdown(struct sock *sk, struct sock *ssk, int how);
++ void __mptcp_close_ssk(struct sock *sk, struct sock *ssk,
++ 		       struct mptcp_subflow_context *subflow,
++ 		       long timeout);
+++>>>>>>> d0876b2284cf (mptcp: add the incoming RM_ADDR support)
+  
+  /* called with sk socket lock held */
+ -int __mptcp_subflow_connect(struct sock *sk, const struct mptcp_addr_info *loc,
+ +int __mptcp_subflow_connect(struct sock *sk, int ifindex,
+ +			    const struct mptcp_addr_info *loc,
+  			    const struct mptcp_addr_info *remote);
+  int mptcp_subflow_create_socket(struct sock *sk, struct socket **new_sock);
+  
+diff --git a/net/mptcp/options.c b/net/mptcp/options.c
+index 13ea424aa84f..fcbd36472a48 100644
+--- a/net/mptcp/options.c
++++ b/net/mptcp/options.c
+@@ -860,6 +860,11 @@ void mptcp_incoming_options(struct sock *sk, struct sk_buff *skb,
+ 		mp_opt.add_addr = 0;
+ 	}
+ 
++	if (mp_opt.rm_addr) {
++		mptcp_pm_rm_addr_received(msk, mp_opt.rm_id);
++		mp_opt.rm_addr = 0;
++	}
++
+ 	if (!mp_opt.dss)
+ 		return;
+ 
+diff --git a/net/mptcp/pm.c b/net/mptcp/pm.c
+index ee1f5beb4857..01df3339cff1 100644
+--- a/net/mptcp/pm.c
++++ b/net/mptcp/pm.c
+@@ -151,6 +151,18 @@ void mptcp_pm_add_addr_received(struct mptcp_sock *msk,
+ 	spin_unlock_bh(&pm->lock);
+ }
+ 
++void mptcp_pm_rm_addr_received(struct mptcp_sock *msk, u8 rm_id)
++{
++	struct mptcp_pm_data *pm = &msk->pm;
++
++	pr_debug("msk=%p remote_id=%d", msk, rm_id);
++
++	spin_lock_bh(&pm->lock);
++	mptcp_pm_schedule_work(msk, MPTCP_PM_RM_ADDR_RECEIVED);
++	pm->rm_id = rm_id;
++	spin_unlock_bh(&pm->lock);
++}
++
+ /* path manager helpers */
+ 
+ bool mptcp_pm_add_addr_signal(struct mptcp_sock *msk, unsigned int remaining,
+diff --git a/net/mptcp/pm_netlink.c b/net/mptcp/pm_netlink.c
+index 6f3bf9fdbbbc..b252e00af8ca 100644
+--- a/net/mptcp/pm_netlink.c
++++ b/net/mptcp/pm_netlink.c
+@@ -271,6 +271,40 @@ void mptcp_pm_nl_add_addr_received(struct mptcp_sock *msk)
+ 	spin_lock_bh(&msk->pm.lock);
+ }
+ 
++void mptcp_pm_nl_rm_addr_received(struct mptcp_sock *msk)
++{
++	struct mptcp_subflow_context *subflow, *tmp;
++	struct sock *sk = (struct sock *)msk;
++
++	pr_debug("address rm_id %d", msk->pm.rm_id);
++
++	if (!msk->pm.rm_id)
++		return;
++
++	if (list_empty(&msk->conn_list))
++		return;
++
++	list_for_each_entry_safe(subflow, tmp, &msk->conn_list, node) {
++		struct sock *ssk = mptcp_subflow_tcp_sock(subflow);
++		int how = RCV_SHUTDOWN | SEND_SHUTDOWN;
++		long timeout = 0;
++
++		if (msk->pm.rm_id != subflow->remote_id)
++			continue;
++
++		spin_unlock_bh(&msk->pm.lock);
++		mptcp_subflow_shutdown(sk, ssk, how);
++		__mptcp_close_ssk(sk, ssk, subflow, timeout);
++		spin_lock_bh(&msk->pm.lock);
++
++		msk->pm.add_addr_accepted--;
++		msk->pm.subflows--;
++		WRITE_ONCE(msk->pm.accept_addr, true);
++
++		break;
++	}
++}
++
+ static bool address_use_port(struct mptcp_pm_addr_entry *entry)
+ {
+ 	return (entry->flags &
+* Unmerged path net/mptcp/protocol.c
+* Unmerged path net/mptcp/protocol.h
