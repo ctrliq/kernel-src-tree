@@ -1,0 +1,201 @@
+net/smc: add smcr_port_err() and smcr_link_down() processing
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Karsten Graul <kgraul@linux.ibm.com>
+commit 541afa10c126b6c22c2a805a559c70cc41fd156e
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/541afa10.failed
+
+Call smcr_port_err() when an IB event reports an inactive IB device.
+smcr_port_err() calls smcr_link_down() for all affected links.
+smcr_link_down() either triggers the local DELETE_LINK processing, or
+sends an DELETE_LINK LLC message to the SMC server to initiate the
+processing.
+The old handler function smc_port_terminate() is removed.
+Add helper smcr_link_down_cond() to take a link down conditionally, and
+smcr_link_down_cond_sched() to schedule the link_down processing to a
+work.
+
+	Signed-off-by: Karsten Graul <kgraul@linux.ibm.com>
+	Reviewed-by: Ursula Braun <ubraun@linux.ibm.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 541afa10c126b6c22c2a805a559c70cc41fd156e)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/smc/smc_core.c
+#	net/smc/smc_core.h
+#	net/smc/smc_llc.h
+diff --cc net/smc/smc_core.c
+index cf74dd642f9a,62108e0cd529..000000000000
+--- a/net/smc/smc_core.c
++++ b/net/smc/smc_core.c
+@@@ -52,8 -53,10 +52,9 @@@ struct smc_ib_up_work 
+  
+  static void smc_buf_free(struct smc_link_group *lgr, bool is_rmb,
+  			 struct smc_buf_desc *buf_desc);
+ -static void __smc_lgr_terminate(struct smc_link_group *lgr, bool soft);
+  
+  static void smc_link_up_work(struct work_struct *work);
++ static void smc_link_down_work(struct work_struct *work);
+  
+  /* return head of link group list and its lock for a given link group */
+  static inline struct list_head *smc_lgr_list_head(struct smc_link_group *lgr,
+@@@ -753,44 -815,11 +755,47 @@@ void smc_lgr_terminate(struct smc_link_
+  		spin_unlock_bh(lgr_lock);
+  		return;	/* lgr already terminating */
+  	}
+ +	if (!soft)
+ +		lgr->freeing = 1;
+  	list_del_init(&lgr->list);
+  	spin_unlock_bh(lgr_lock);
+ -	schedule_work(&lgr->terminate_work);
+ +	__smc_lgr_terminate(lgr, soft);
+  }
+  
+++<<<<<<< HEAD
+ +/* Called when IB port is terminated */
+ +void smc_port_terminate(struct smc_ib_device *smcibdev, u8 ibport)
+ +{
+ +	struct smc_link_group *lgr, *l;
+ +	LIST_HEAD(lgr_free_list);
+ +	int i;
+ +
+ +	spin_lock_bh(&smc_lgr_list.lock);
+ +	list_for_each_entry_safe(lgr, l, &smc_lgr_list.list, list) {
+ +		if (lgr->is_smcd)
+ +			continue;
+ +		/* tbd - terminate only when no more links are active */
+ +		for (i = 0; i < SMC_LINKS_PER_LGR_MAX; i++) {
+ +			if (lgr->lnk[i].state == SMC_LNK_INACTIVE ||
+ +			    lgr->lnk[i].state == SMC_LNK_DELETING)
+ +				continue;
+ +			if (lgr->lnk[i].smcibdev == smcibdev &&
+ +			    lgr->lnk[i].ibport == ibport) {
+ +				list_move(&lgr->list, &lgr_free_list);
+ +				lgr->freeing = 1;
+ +			}
+ +		}
+ +	}
+ +	spin_unlock_bh(&smc_lgr_list.lock);
+ +
+ +	list_for_each_entry_safe(lgr, l, &lgr_free_list, list) {
+ +		list_del_init(&lgr->list);
+ +		__smc_lgr_terminate(lgr, false);
+ +	}
+ +}
+ +
+++=======
+++>>>>>>> 541afa10c126 (net/smc: add smcr_port_err() and smcr_link_down() processing)
+  /* Called when peer lgr shutdown (regularly or abnormally) is received */
+  void smc_smcd_terminate(struct smcd_dev *dev, u64 peer_gid, unsigned short vlan)
+  {
+diff --cc net/smc/smc_core.h
+index fd2bbf547caf,da3cddbd1651..000000000000
+--- a/net/smc/smc_core.h
++++ b/net/smc/smc_core.h
+@@@ -117,15 -117,9 +117,16 @@@ struct smc_link 
+  	u8			link_id;	/* unique # within link group */
+  	u8			link_idx;	/* index in lgr link array */
+  	struct smc_link_group	*lgr;		/* parent link group */
++ 	struct work_struct	link_down_wrk;	/* wrk to bring link down */
+  
+  	enum smc_link_state	state;		/* state of link */
+ +	struct workqueue_struct *llc_wq;	/* single thread work queue */
+ +	struct completion	llc_confirm;	/* wait for rx of conf link */
+ +	struct completion	llc_confirm_resp; /* wait 4 rx of cnf lnk rsp */
+ +	int			llc_confirm_rc; /* rc from confirm link msg */
+ +	int			llc_confirm_resp_rc; /* rc from conf_resp msg */
+ +	struct completion	llc_add;	/* wait for rx of add link */
+ +	struct completion	llc_add_resp;	/* wait for rx of add link rsp*/
+  	struct delayed_work	llc_testlink_wrk; /* testlink worker */
+  	struct completion	llc_testlink_resp; /* wait for rx of testlink */
+  	int			llc_testlink_time; /* testlink interval */
+@@@ -307,9 -344,9 +308,14 @@@ struct smc_clc_msg_local
+  
+  void smc_lgr_forget(struct smc_link_group *lgr);
+  void smc_lgr_cleanup_early(struct smc_connection *conn);
+++<<<<<<< HEAD
+ +void smc_lgr_terminate(struct smc_link_group *lgr, bool soft);
+ +void smc_port_terminate(struct smc_ib_device *smcibdev, u8 ibport);
+++=======
++ void smc_lgr_terminate_sched(struct smc_link_group *lgr);
+++>>>>>>> 541afa10c126 (net/smc: add smcr_port_err() and smcr_link_down() processing)
+  void smcr_port_add(struct smc_ib_device *smcibdev, u8 ibport);
++ void smcr_port_err(struct smc_ib_device *smcibdev, u8 ibport);
+  void smc_smcd_terminate(struct smcd_dev *dev, u64 peer_gid,
+  			unsigned short vlan);
+  void smc_smcd_terminate_all(struct smcd_dev *dev);
+@@@ -336,6 -373,13 +342,16 @@@ void smc_lgr_schedule_free_work_fast(st
+  int smc_core_init(void);
+  void smc_core_exit(void);
+  
+++<<<<<<< HEAD
+++=======
++ void smcr_link_clear(struct smc_link *lnk);
++ int smcr_buf_map_lgr(struct smc_link *lnk);
++ int smcr_buf_reg_lgr(struct smc_link *lnk);
++ int smcr_link_reg_rmb(struct smc_link *link, struct smc_buf_desc *rmb_desc);
++ void smcr_link_down_cond(struct smc_link *lnk);
++ void smcr_link_down_cond_sched(struct smc_link *lnk);
++ 
+++>>>>>>> 541afa10c126 (net/smc: add smcr_port_err() and smcr_link_down() processing)
+  static inline struct smc_link_group *smc_get_lgr(struct smc_link *link)
+  {
+  	return link->lgr;
+diff --cc net/smc/smc_llc.h
+index 461c0c3ef76e,4ed4486e5082..000000000000
+--- a/net/smc/smc_llc.h
++++ b/net/smc/smc_llc.h
+@@@ -35,6 -35,30 +35,33 @@@ enum smc_llc_msg_type 
+  	SMC_LLC_DELETE_RKEY		= 0x09,
+  };
+  
+++<<<<<<< HEAD
+++=======
++ #define smc_link_downing(state) \
++ 	(cmpxchg(state, SMC_LNK_ACTIVE, SMC_LNK_INACTIVE) == SMC_LNK_ACTIVE)
++ 
++ /* LLC DELETE LINK Request Reason Codes */
++ #define SMC_LLC_DEL_LOST_PATH		0x00010000
++ #define SMC_LLC_DEL_OP_INIT_TERM	0x00020000
++ #define SMC_LLC_DEL_PROG_INIT_TERM	0x00030000
++ #define SMC_LLC_DEL_PROT_VIOL		0x00040000
++ #define SMC_LLC_DEL_NO_ASYM_NEEDED	0x00050000
++ /* LLC DELETE LINK Response Reason Codes */
++ #define SMC_LLC_DEL_NOLNK	0x00100000  /* Unknown Link ID (no link) */
++ #define SMC_LLC_DEL_NOLGR	0x00200000  /* Unknown Link Group */
++ 
++ /* returns a usable link of the link group, or NULL */
++ static inline struct smc_link *smc_llc_usable_link(struct smc_link_group *lgr)
++ {
++ 	int i;
++ 
++ 	for (i = 0; i < SMC_LINKS_PER_LGR_MAX; i++)
++ 		if (smc_link_usable(&lgr->lnk[i]))
++ 			return &lgr->lnk[i];
++ 	return NULL;
++ }
++ 
+++>>>>>>> 541afa10c126 (net/smc: add smcr_port_err() and smcr_link_down() processing)
+  /* transmit */
+  int smc_llc_send_confirm_link(struct smc_link *lnk,
+  			      enum smc_llc_reqresp reqresp);
+* Unmerged path net/smc/smc_core.c
+* Unmerged path net/smc/smc_core.h
+diff --git a/net/smc/smc_ib.c b/net/smc/smc_ib.c
+index 3d87e3a22e90..8c3a86476c25 100644
+--- a/net/smc/smc_ib.c
++++ b/net/smc/smc_ib.c
+@@ -249,7 +249,7 @@ static void smc_ib_port_event_work(struct work_struct *work)
+ 		clear_bit(port_idx, &smcibdev->port_event_mask);
+ 		if (!smc_ib_port_active(smcibdev, port_idx + 1)) {
+ 			set_bit(port_idx, smcibdev->ports_going_away);
+-			smc_port_terminate(smcibdev, port_idx + 1);
++			smcr_port_err(smcibdev, port_idx + 1);
+ 		} else {
+ 			clear_bit(port_idx, smcibdev->ports_going_away);
+ 			smcr_port_add(smcibdev, port_idx + 1);
+* Unmerged path net/smc/smc_llc.h
