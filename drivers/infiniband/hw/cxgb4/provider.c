@@ -639,7 +639,7 @@ void c4iw_register_device(struct work_struct *work)
 	dev->ibdev.get_dev_fw_str = get_dev_fw_str;
 	dev->ibdev.get_netdev = get_netdev;
 
-	dev->ibdev.iwcm = kmalloc(sizeof(struct iw_cm_verbs), GFP_KERNEL);
+	dev->ibdev.iwcm = kzalloc(sizeof(struct iw_cm_verbs), GFP_KERNEL);
 	if (!dev->ibdev.iwcm) {
 		ret = -ENOMEM;
 		goto err_dealloc_ctx;

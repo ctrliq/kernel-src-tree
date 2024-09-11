@@ -1427,7 +1427,7 @@ int iwch_register_device(struct iwch_dev *dev)
 	dev->ibdev.get_port_immutable = iwch_port_immutable;
 	dev->ibdev.get_dev_fw_str = get_dev_fw_ver_str;
 
-	dev->ibdev.iwcm = kmalloc(sizeof(struct iw_cm_verbs), GFP_KERNEL);
+	dev->ibdev.iwcm = kzalloc(sizeof(struct iw_cm_verbs), GFP_KERNEL);
 	if (!dev->ibdev.iwcm)
 		return -ENOMEM;
 
