@@ -473,14 +473,14 @@ static int bnxt_dl_params_register(struct bnxt *bp)
 	rc = devlink_params_register(bp->dl, bnxt_dl_params,
 				     ARRAY_SIZE(bnxt_dl_params));
 	if (rc) {
-		netdev_warn(bp->dev, "devlink_params_register failed. rc=%d",
+		netdev_warn(bp->dev, "devlink_params_register failed. rc=%d\n",
 			    rc);
 		return rc;
 	}
 	rc = devlink_port_params_register(&bp->dl_port, bnxt_dl_port_params,
 					  ARRAY_SIZE(bnxt_dl_port_params));
 	if (rc) {
-		netdev_err(bp->dev, "devlink_port_params_register failed");
+		netdev_err(bp->dev, "devlink_port_params_register failed\n");
 		devlink_params_unregister(bp->dl, bnxt_dl_params,
 					  ARRAY_SIZE(bnxt_dl_params));
 		return rc;
@@ -511,7 +511,7 @@ int bnxt_dl_register(struct bnxt *bp)
 	else
 		dl = devlink_alloc(&bnxt_vf_dl_ops, sizeof(struct bnxt_dl));
 	if (!dl) {
-		netdev_warn(bp->dev, "devlink_alloc failed");
+		netdev_warn(bp->dev, "devlink_alloc failed\n");
 		return -ENOMEM;
 	}
 
@@ -524,7 +524,7 @@ int bnxt_dl_register(struct bnxt *bp)
 
 	rc = devlink_register(dl, &bp->pdev->dev);
 	if (rc) {
-		netdev_warn(bp->dev, "devlink_register failed. rc=%d", rc);
+		netdev_warn(bp->dev, "devlink_register failed. rc=%d\n", rc);
 		goto err_dl_free;
 	}
 
@@ -536,7 +536,7 @@ int bnxt_dl_register(struct bnxt *bp)
 			       sizeof(bp->dsn));
 	rc = devlink_port_register(dl, &bp->dl_port, bp->pf.port_id);
 	if (rc) {
-		netdev_err(bp->dev, "devlink_port_register failed");
+		netdev_err(bp->dev, "devlink_port_register failed\n");
 		goto err_dl_unreg;
 	}
 
