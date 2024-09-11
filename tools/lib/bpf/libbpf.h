@@ -23,6 +23,7 @@
 #ifndef __BPF_LIBBPF_H
 #define __BPF_LIBBPF_H
 
+#include <stdarg.h>
 #include <stdio.h>
 #include <stdint.h>
 #include <stdbool.h>
