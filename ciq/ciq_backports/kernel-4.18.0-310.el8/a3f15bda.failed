@@ -1,0 +1,153 @@
+KVM: x86/mmu: Pass address space ID to TDP MMU root walkers
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-310.el8
+commit-author Sean Christopherson <seanjc@google.com>
+commit a3f15bda46e85c33e55b23aa51dd542453f134e3
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-310.el8/a3f15bda.failed
+
+Move the address space ID check that is performed when iterating over
+roots into the macro helpers to consolidate code.
+
+No functional change intended.
+
+	Signed-off-by: Sean Christopherson <seanjc@google.com>
+Message-Id: <20210326021957.1424875-7-seanjc@google.com>
+	Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+(cherry picked from commit a3f15bda46e85c33e55b23aa51dd542453f134e3)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kvm/mmu/tdp_mmu.c
+diff --cc arch/x86/kvm/mmu/tdp_mmu.c
+index 86c17ea316da,3608f4aa1d08..000000000000
+--- a/arch/x86/kvm/mmu/tdp_mmu.c
++++ b/arch/x86/kvm/mmu/tdp_mmu.c
+@@@ -1257,72 -1247,12 +1247,66 @@@ void kvm_tdp_mmu_clear_dirty_pt_masked(
+  				       bool wrprot)
+  {
+  	struct kvm_mmu_page *root;
+- 	int root_as_id;
+  
+  	lockdep_assert_held_write(&kvm->mmu_lock);
+- 	for_each_tdp_mmu_root(kvm, root) {
+- 		root_as_id = kvm_mmu_page_as_id(root);
+- 		if (root_as_id != slot->as_id)
+- 			continue;
+- 
++ 	for_each_tdp_mmu_root(kvm, root, slot->as_id)
+  		clear_dirty_pt_masked(kvm, root, gfn, mask, wrprot);
+- 	}
+  }
+  
+ +/*
+ + * Set the dirty status of all the SPTEs mapping GFNs in the memslot. This is
+ + * only used for PML, and so will involve setting the dirty bit on each SPTE.
+ + * Returns true if an SPTE has been changed and the TLBs need to be flushed.
+ + */
+ +static bool set_dirty_gfn_range(struct kvm *kvm, struct kvm_mmu_page *root,
+ +				gfn_t start, gfn_t end)
+ +{
+ +	struct tdp_iter iter;
+ +	u64 new_spte;
+ +	bool spte_set = false;
+ +
+ +	rcu_read_lock();
+ +
+ +	tdp_root_for_each_pte(iter, root, start, end) {
+ +		if (tdp_mmu_iter_cond_resched(kvm, &iter, false))
+ +			continue;
+ +
+ +		if (!is_shadow_present_pte(iter.old_spte) ||
+ +		    iter.old_spte & shadow_dirty_mask)
+ +			continue;
+ +
+ +		new_spte = iter.old_spte | shadow_dirty_mask;
+ +
+ +		tdp_mmu_set_spte(kvm, &iter, new_spte);
+ +		spte_set = true;
+ +	}
+ +
+ +	rcu_read_unlock();
+ +	return spte_set;
+ +}
+ +
+ +/*
+ + * Set the dirty status of all the SPTEs mapping GFNs in the memslot. This is
+ + * only used for PML, and so will involve setting the dirty bit on each SPTE.
+ + * Returns true if an SPTE has been changed and the TLBs need to be flushed.
+ + */
+ +bool kvm_tdp_mmu_slot_set_dirty(struct kvm *kvm, struct kvm_memory_slot *slot)
+ +{
+ +	struct kvm_mmu_page *root;
+ +	int root_as_id;
+ +	bool spte_set = false;
+ +
+ +	for_each_tdp_mmu_root_yield_safe(kvm, root) {
+ +		root_as_id = kvm_mmu_page_as_id(root);
+ +		if (root_as_id != slot->as_id)
+ +			continue;
+ +
+ +		spte_set |= set_dirty_gfn_range(kvm, root, slot->base_gfn,
+ +				slot->base_gfn + slot->npages);
+ +	}
+ +	return spte_set;
+ +}
+ +
+  /*
+   * Clear leaf entries which could be replaced by large mappings, for
+   * GFNs within the slot.
+@@@ -1369,23 -1299,15 +1353,26 @@@ static bool zap_collapsible_spte_range(
+   * Clear non-leaf entries (and free associated page tables) which could
+   * be replaced by large mappings, for GFNs within the slot.
+   */
+ -bool kvm_tdp_mmu_zap_collapsible_sptes(struct kvm *kvm,
+ -				       struct kvm_memory_slot *slot, bool flush)
+ +void kvm_tdp_mmu_zap_collapsible_sptes(struct kvm *kvm,
+ +				       struct kvm_memory_slot *slot)
+  {
+  	struct kvm_mmu_page *root;
+++<<<<<<< HEAD
+ +	bool flush = false;
+ +	int root_as_id;
+ +
+ +	for_each_tdp_mmu_root_yield_safe(kvm, root) {
+ +		root_as_id = kvm_mmu_page_as_id(root);
+ +		if (root_as_id != slot->as_id)
+ +			continue;
+++=======
+++>>>>>>> a3f15bda46e8 (KVM: x86/mmu: Pass address space ID to TDP MMU root walkers)
+  
++ 	for_each_tdp_mmu_root_yield_safe(kvm, root, slot->as_id)
+  		flush = zap_collapsible_spte_range(kvm, root, slot, flush);
+- 	}
+  
+ -	return flush;
+ +	if (flush)
+ +		kvm_flush_remote_tlbs(kvm);
+  }
+  
+  /*
+diff --git a/arch/x86/kvm/mmu/mmu_internal.h b/arch/x86/kvm/mmu/mmu_internal.h
+index e03267e93459..f296b8a258ff 100644
+--- a/arch/x86/kvm/mmu/mmu_internal.h
++++ b/arch/x86/kvm/mmu/mmu_internal.h
+@@ -88,9 +88,14 @@ static inline struct kvm_mmu_page *sptep_to_sp(u64 *sptep)
+ 	return to_shadow_page(__pa(sptep));
+ }
+ 
++static inline int kvm_mmu_role_as_id(union kvm_mmu_page_role role)
++{
++	return role.smm ? 1 : 0;
++}
++
+ static inline int kvm_mmu_page_as_id(struct kvm_mmu_page *sp)
+ {
+-	return sp->role.smm ? 1 : 0;
++	return kvm_mmu_role_as_id(sp->role);
+ }
+ 
+ static inline bool kvm_vcpu_ad_need_write_protect(struct kvm_vcpu *vcpu)
+* Unmerged path arch/x86/kvm/mmu/tdp_mmu.c
