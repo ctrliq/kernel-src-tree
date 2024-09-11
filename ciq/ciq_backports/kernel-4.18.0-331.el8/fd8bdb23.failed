@@ -1,0 +1,285 @@
+hwmon: (k10temp) Display up to eight sets of CCD temperatures
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-331.el8
+commit-author Guenter Roeck <linux@roeck-us.net>
+commit fd8bdb23b91876ac1e624337bb88dc1dcc21d67e
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-331.el8/fd8bdb23.failed
+
+In HWiNFO, we see support for Tccd1, Tccd3, Tccd5, and Tccd7 temperature
+sensors on Zen2 based Threadripper CPUs. Checking register maps on
+Threadripper 3970X confirms SMN register addresses and values for those
+sensors.
+
+Register values observed in an idle system:
+
+0x059950: 00000000 00000abc 00000000 00000ad8
+0x059960: 00000000 00000ade 00000000 00000ae4
+
+Under load:
+
+0x059950: 00000000 00000c02 00000000 00000c14
+0x059960: 00000000 00000c30 00000000 00000c22
+
+More analysis shows that EPYC CPUs support up to 8 CCD temperature
+sensors. EPYC 7601 supports three CCD temperature sensors. Unlike
+Zen2 CPUs, the register space in Zen1 CPUs supports a maximum of four
+sensors, so only search for a maximum of four sensors on Zen1 CPUs.
+
+On top of that, in thm_10_0_sh_mask.h in the Linux kernel, we find
+definitions for THM_DIE{1-3}_TEMP__VALID_MASK, set to 0x00000800, as well
+as matching SMN addresses. This lets us conclude that bit 11 of the
+respective registers is a valid bit. With this assumption, the temperature
+offset is now 49 degrees C. This conveniently matches the documented
+temperature offset for Tdie, again suggesting that above registers indeed
+report temperatures sensor values. Assume that bit 11 is indeed a valid
+bit, and add support for the additional sensors.
+
+With this patch applied, output from 3970X (idle) looks as follows:
+
+k10temp-pci-00c3
+Adapter: PCI adapter
+Tdie:         +55.9°C
+Tctl:         +55.9°C
+Tccd1:        +39.8°C
+Tccd3:        +43.8°C
+Tccd5:        +43.8°C
+Tccd7:        +44.8°C
+
+	Tested-by: Michael Larabel <michael@phoronix.com>
+	Signed-off-by: Guenter Roeck <linux@roeck-us.net>
+(cherry picked from commit fd8bdb23b91876ac1e624337bb88dc1dcc21d67e)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/hwmon/k10temp.c
+diff --cc drivers/hwmon/k10temp.c
+index c73c6199bfdb,e39354ffe973..000000000000
+--- a/drivers/hwmon/k10temp.c
++++ b/drivers/hwmon/k10temp.c
+@@@ -5,8 -5,23 +5,24 @@@
+   *
+   * Copyright (c) 2009 Clemens Ladisch <clemens@ladisch.de>
+   * Copyright (c) 2020 Guenter Roeck <linux@roeck-us.net>
+++<<<<<<< HEAD
+++=======
++  *
++  * Implementation notes:
++  * - CCD register address information as well as the calculation to
++  *   convert raw register values is from https://github.com/ocerman/zenpower.
++  *   The information is not confirmed from chip datasheets, but experiments
++  *   suggest that it provides reasonable temperature values.
++  * - Register addresses to read chip voltage and current are also from
++  *   https://github.com/ocerman/zenpower, and not confirmed from chip
++  *   datasheets. Current calibration is board specific and not typically
++  *   shared by board vendors. For this reason, current values are
++  *   normalized to report 1A/LSB for core current and and 0.25A/LSB for SoC
++  *   current. Reported values can be adjusted using the sensors configuration
++  *   file.
+++>>>>>>> fd8bdb23b918 (hwmon: (k10temp) Display up to eight sets of CCD temperatures)
+   */
+  
+ -#include <linux/bitops.h>
+ -#include <linux/debugfs.h>
+  #include <linux/err.h>
+  #include <linux/hwmon.h>
+  #include <linux/init.h>
+@@@ -60,6 -75,20 +76,23 @@@ static DEFINE_MUTEX(nb_smu_ind_mutex)
+  
+  /* F17h M01h Access througn SMN */
+  #define F17H_M01H_REPORTED_TEMP_CTRL_OFFSET	0x00059800
+++<<<<<<< HEAD
+++=======
++ 
++ #define F17H_M70H_CCD_TEMP(x)			(0x00059954 + ((x) * 4))
++ #define F17H_M70H_CCD_TEMP_VALID		BIT(11)
++ #define F17H_M70H_CCD_TEMP_MASK			GENMASK(10, 0)
++ 
++ #define F17H_M01H_SVI				0x0005A000
++ #define F17H_M01H_SVI_TEL_PLANE0		(F17H_M01H_SVI + 0xc)
++ #define F17H_M01H_SVI_TEL_PLANE1		(F17H_M01H_SVI + 0x10)
++ 
++ #define CUR_TEMP_SHIFT				21
++ #define CUR_TEMP_RANGE_SEL_MASK			BIT(19)
++ 
++ #define CFACTOR_ICORE				1000000	/* 1A / LSB	*/
++ #define CFACTOR_ISOC				250000	/* 0.25A / LSB	*/
+++>>>>>>> fd8bdb23b918 (hwmon: (k10temp) Display up to eight sets of CCD temperatures)
+  
+  struct k10temp_data {
+  	struct pci_dev *pdev;
+@@@ -68,6 -97,10 +101,13 @@@
+  	int temp_offset;
+  	u32 temp_adjust_mask;
+  	bool show_tdie;
+++<<<<<<< HEAD
+++=======
++ 	u32 show_tccd;
++ 	u32 svi_addr[2];
++ 	bool show_current;
++ 	int cfactor[2];
+++>>>>>>> fd8bdb23b918 (hwmon: (k10temp) Display up to eight sets of CCD temperatures)
+  };
+  
+  struct tctl_offset {
+@@@ -139,6 -182,24 +179,27 @@@ static long get_raw_temp(struct k10temp
+  const char *k10temp_temp_label[] = {
+  	"Tdie",
+  	"Tctl",
+++<<<<<<< HEAD
+++=======
++ 	"Tccd1",
++ 	"Tccd2",
++ 	"Tccd3",
++ 	"Tccd4",
++ 	"Tccd5",
++ 	"Tccd6",
++ 	"Tccd7",
++ 	"Tccd8",
++ };
++ 
++ const char *k10temp_in_label[] = {
++ 	"Vcore",
++ 	"Vsoc",
++ };
++ 
++ const char *k10temp_curr_label[] = {
++ 	"Icore",
++ 	"Isoc",
+++>>>>>>> fd8bdb23b918 (hwmon: (k10temp) Display up to eight sets of CCD temperatures)
+  };
+  
+  static int k10temp_read_labels(struct device *dev,
+@@@ -168,6 -279,11 +229,14 @@@ static int k10temp_read(struct device *
+  			if (*val < 0)
+  				*val = 0;
+  			break;
+++<<<<<<< HEAD
+++=======
++ 		case 2 ... 9:		/* Tccd{1-8} */
++ 			amd_smn_read(amd_pci_dev_to_node_id(data->pdev),
++ 				     F17H_M70H_CCD_TEMP(channel - 2), &regval);
++ 			*val = (regval & F17H_M70H_CCD_TEMP_MASK) * 125 - 49000;
++ 			break;
+++>>>>>>> fd8bdb23b918 (hwmon: (k10temp) Display up to eight sets of CCD temperatures)
+  		default:
+  			return -EOPNOTSUPP;
+  		}
+@@@ -202,8 -333,20 +271,23 @@@ static umode_t k10temp_is_visible(cons
+  	case hwmon_temp:
+  		switch (attr) {
+  		case hwmon_temp_input:
+++<<<<<<< HEAD
+ +			if (channel && !data->show_tdie)
+++=======
++ 			switch (channel) {
++ 			case 0:		/* Tdie, or Tctl if we don't show it */
++ 				break;
++ 			case 1:		/* Tctl */
++ 				if (!data->show_tdie)
++ 					return 0;
++ 				break;
++ 			case 2 ... 9:		/* Tccd{1-8} */
++ 				if (!(data->show_tccd & BIT(channel - 2)))
++ 					return 0;
++ 				break;
++ 			default:
+++>>>>>>> fd8bdb23b918 (hwmon: (k10temp) Display up to eight sets of CCD temperatures)
+  				return 0;
+ -			}
+  			break;
+  		case hwmon_temp_max:
+  			if (channel || data->show_tdie)
+@@@ -225,8 -368,20 +309,22 @@@
+  				return 0;
+  			break;
+  		case hwmon_temp_label:
+ -			/* No labels if we don't show the die temperature */
+  			if (!data->show_tdie)
+  				return 0;
+++<<<<<<< HEAD
+++=======
++ 			switch (channel) {
++ 			case 0:		/* Tdie */
++ 			case 1:		/* Tctl */
++ 				break;
++ 			case 2 ... 9:		/* Tccd{1-8} */
++ 				if (!(data->show_tccd & BIT(channel - 2)))
++ 					return 0;
++ 				break;
++ 			default:
++ 				return 0;
++ 			}
+++>>>>>>> fd8bdb23b918 (hwmon: (k10temp) Display up to eight sets of CCD temperatures)
+  			break;
+  		default:
+  			return 0;
+@@@ -277,7 -507,21 +375,18 @@@ static const struct hwmon_channel_info 
+  			   HWMON_T_INPUT | HWMON_T_MAX |
+  			   HWMON_T_CRIT | HWMON_T_CRIT_HYST |
+  			   HWMON_T_LABEL,
+++<<<<<<< HEAD
+++=======
++ 			   HWMON_T_INPUT | HWMON_T_LABEL,
++ 			   HWMON_T_INPUT | HWMON_T_LABEL,
++ 			   HWMON_T_INPUT | HWMON_T_LABEL,
++ 			   HWMON_T_INPUT | HWMON_T_LABEL,
++ 			   HWMON_T_INPUT | HWMON_T_LABEL,
++ 			   HWMON_T_INPUT | HWMON_T_LABEL,
++ 			   HWMON_T_INPUT | HWMON_T_LABEL,
++ 			   HWMON_T_INPUT | HWMON_T_LABEL,
+++>>>>>>> fd8bdb23b918 (hwmon: (k10temp) Display up to eight sets of CCD temperatures)
+  			   HWMON_T_INPUT | HWMON_T_LABEL),
+ -	HWMON_CHANNEL_INFO(in,
+ -			   HWMON_I_INPUT | HWMON_I_LABEL,
+ -			   HWMON_I_INPUT | HWMON_I_LABEL),
+ -	HWMON_CHANNEL_INFO(curr,
+ -			   HWMON_C_INPUT | HWMON_C_LABEL,
+ -			   HWMON_C_INPUT | HWMON_C_LABEL),
+  	NULL
+  };
+  
+@@@ -321,10 -579,33 +444,40 @@@ static int k10temp_probe(struct pci_de
+  	     (boot_cpu_data.x86_model & 0xf0) == 0x70)) {
+  		data->read_htcreg = read_htcreg_nb_f15;
+  		data->read_tempreg = read_tempreg_nb_f15;
+++<<<<<<< HEAD
+ +	} else if (boot_cpu_data.x86 == 0x17 || boot_cpu_data.x86 == 0x19) {
+ +		data->temp_adjust_mask = 0x80000;
+ +		data->read_tempreg = read_tempreg_nb_f17;
+ +		data->show_tdie = true;
+++=======
++ 	} else if (boot_cpu_data.x86 == 0x17 || boot_cpu_data.x86 == 0x18) {
++ 		data->temp_adjust_mask = CUR_TEMP_RANGE_SEL_MASK;
++ 		data->read_tempreg = read_tempreg_nb_f17;
++ 		data->show_tdie = true;
++ 
++ 		switch (boot_cpu_data.x86_model) {
++ 		case 0x1:	/* Zen */
++ 		case 0x8:	/* Zen+ */
++ 		case 0x11:	/* Zen APU */
++ 		case 0x18:	/* Zen+ APU */
++ 			data->show_current = !is_threadripper() && !is_epyc();
++ 			data->svi_addr[0] = F17H_M01H_SVI_TEL_PLANE0;
++ 			data->svi_addr[1] = F17H_M01H_SVI_TEL_PLANE1;
++ 			data->cfactor[0] = CFACTOR_ICORE;
++ 			data->cfactor[1] = CFACTOR_ISOC;
++ 			k10temp_get_ccd_support(pdev, data, 4);
++ 			break;
++ 		case 0x31:	/* Zen2 Threadripper */
++ 		case 0x71:	/* Zen2 */
++ 			data->show_current = !is_threadripper() && !is_epyc();
++ 			data->cfactor[0] = CFACTOR_ICORE;
++ 			data->cfactor[1] = CFACTOR_ISOC;
++ 			data->svi_addr[0] = F17H_M01H_SVI_TEL_PLANE1;
++ 			data->svi_addr[1] = F17H_M01H_SVI_TEL_PLANE0;
++ 			k10temp_get_ccd_support(pdev, data, 8);
++ 			break;
++ 		}
+++>>>>>>> fd8bdb23b918 (hwmon: (k10temp) Display up to eight sets of CCD temperatures)
+  	} else {
+  		data->read_htcreg = read_htcreg_pci;
+  		data->read_tempreg = read_tempreg_pci;
+* Unmerged path drivers/hwmon/k10temp.c
