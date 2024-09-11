@@ -1,0 +1,93 @@
+Revert "GFS2: Prevent delete work from occurring on glocks used for create"
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-331.el8
+commit-author Andreas Gruenbacher <agruenba@redhat.com>
+commit a55a47a3bc82cb53509ed2501697f9b385036195
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-331.el8/a55a47a3.failed
+
+Since commit a0e3cc65fa29 ("gfs2: Turn gl_delete into a delayed work"), we're
+cancelling any pending delete work of an iopen glock before attaching a new
+inode to that glock in gfs2_create_inode.  This means that delete_work_func can
+no longer be queued or running when attaching the iopen glock to the new inode,
+and we can revert commit a4923865ea07 ("GFS2: Prevent delete work from
+occurring on glocks used for create"), which tried to achieve the same but in a
+racy way.
+
+	Signed-off-by: Andreas Gruenbacher <agruenba@redhat.com>
+(cherry picked from commit a55a47a3bc82cb53509ed2501697f9b385036195)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/gfs2/glock.c
+diff --cc fs/gfs2/glock.c
+index 0f5ce565da7a,d87a5bc3607b..000000000000
+--- a/fs/gfs2/glock.c
++++ b/fs/gfs2/glock.c
+@@@ -2118,6 -2106,10 +2112,13 @@@ static const char *gflags2str(char *buf
+  		*p++ = 'o';
+  	if (test_bit(GLF_BLOCKING, gflags))
+  		*p++ = 'b';
+++<<<<<<< HEAD
+++=======
++ 	if (test_bit(GLF_PENDING_DELETE, gflags))
++ 		*p++ = 'P';
++ 	if (test_bit(GLF_FREEING, gflags))
++ 		*p++ = 'x';
+++>>>>>>> a55a47a3bc82 (Revert "GFS2: Prevent delete work from occurring on glocks used for create")
+  	*p = 0;
+  	return buf;
+  }
+* Unmerged path fs/gfs2/glock.c
+diff --git a/fs/gfs2/incore.h b/fs/gfs2/incore.h
+index 09f851e5c568..051de8d9bf92 100644
+--- a/fs/gfs2/incore.h
++++ b/fs/gfs2/incore.h
+@@ -352,7 +352,6 @@ enum {
+ 	GLF_LRU				= 13,
+ 	GLF_OBJECT			= 14, /* Used only for tracing */
+ 	GLF_BLOCKING			= 15,
+-	GLF_INODE_CREATING		= 16, /* Inode creation occurring */
+ 	GLF_PENDING_DELETE		= 17,
+ 	GLF_FREEING			= 18, /* Wait for glock to be freed */
+ };
+diff --git a/fs/gfs2/inode.c b/fs/gfs2/inode.c
+index 303a2d77a489..2feebe7acdf9 100644
+--- a/fs/gfs2/inode.c
++++ b/fs/gfs2/inode.c
+@@ -607,7 +607,7 @@ static int gfs2_create_inode(struct inode *dir, struct dentry *dentry,
+ 	struct inode *inode = NULL;
+ 	struct gfs2_inode *dip = GFS2_I(dir), *ip;
+ 	struct gfs2_sbd *sdp = GFS2_SB(&dip->i_inode);
+-	struct gfs2_glock *io_gl = NULL;
++	struct gfs2_glock *io_gl;
+ 	int error, free_vfs_inode = 1;
+ 	u32 aflags = 0;
+ 	unsigned blocks = 1;
+@@ -749,8 +749,6 @@ static int gfs2_create_inode(struct inode *dir, struct dentry *dentry,
+ 	init_dinode(dip, ip, symname);
+ 	gfs2_trans_end(sdp);
+ 
+-	BUG_ON(test_and_set_bit(GLF_INODE_CREATING, &io_gl->gl_flags));
+-
+ 	error = gfs2_glock_nq_init(io_gl, LM_ST_SHARED, GL_EXACT, &ip->i_iopen_gh);
+ 	if (error)
+ 		goto fail_gunlock2;
+@@ -796,7 +794,6 @@ static int gfs2_create_inode(struct inode *dir, struct dentry *dentry,
+ 	gfs2_glock_dq_uninit(ghs);
+ 	gfs2_qa_put(ip);
+ 	gfs2_glock_dq_uninit(ghs + 1);
+-	clear_bit(GLF_INODE_CREATING, &io_gl->gl_flags);
+ 	gfs2_glock_put(io_gl);
+ 	gfs2_qa_put(dip);
+ 	return error;
+@@ -805,7 +802,6 @@ static int gfs2_create_inode(struct inode *dir, struct dentry *dentry,
+ 	glock_clear_object(io_gl, ip);
+ 	gfs2_glock_dq_uninit(&ip->i_iopen_gh);
+ fail_gunlock2:
+-	clear_bit(GLF_INODE_CREATING, &io_gl->gl_flags);
+ 	glock_clear_object(io_gl, ip);
+ 	gfs2_glock_put(io_gl);
+ fail_free_inode:
