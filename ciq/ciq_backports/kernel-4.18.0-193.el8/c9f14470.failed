@@ -1,0 +1,318 @@
+net: sched: add API for registering unlocked offload block callbacks
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-193.el8
+Rebuild_CHGLOG: - [net] sched: add API for registering unlocked offload block callbacks (Ivan Vecera) [1739606]
+Rebuild_FUZZ: 96.18%
+commit-author Vlad Buslov <vladbu@mellanox.com>
+commit c9f14470d04830de217f9d28fcd0deffd7e8c0b1
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-193.el8/c9f14470.failed
+
+Extend struct flow_block_offload with "unlocked_driver_cb" flag to allow
+registering and unregistering block hardware offload callbacks that do not
+require caller to hold rtnl lock. Extend tcf_block with additional
+lockeddevcnt counter that is incremented for each non-unlocked driver
+callback attached to device. This counter is necessary to conditionally
+obtain rtnl lock before calling hardware callbacks in following patches.
+
+Register mlx5 tc block offload callbacks as "unlocked".
+
+	Signed-off-by: Vlad Buslov <vladbu@mellanox.com>
+	Acked-by: Jiri Pirko <jiri@mellanox.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit c9f14470d04830de217f9d28fcd0deffd7e8c0b1)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/mellanox/mlx5/core/en_main.c
+#	drivers/net/ethernet/mellanox/mlx5/core/en_rep.c
+#	include/net/flow_offload.h
+diff --cc drivers/net/ethernet/mellanox/mlx5/core/en_main.c
+index d67b5ad8b9d4,8592b98d0e70..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_main.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_main.c
+@@@ -3481,10 -3469,17 +3481,24 @@@ static int mlx5e_setup_tc_block(struct 
+  static int mlx5e_setup_tc(struct net_device *dev, enum tc_setup_type type,
+  			  void *type_data)
+  {
+++<<<<<<< HEAD
+ +	switch (type) {
+ +#ifdef CONFIG_MLX5_ESWITCH
+ +	case TC_SETUP_BLOCK:
+ +		return mlx5e_setup_tc_block(dev, type_data);
+++=======
++ 	struct mlx5e_priv *priv = netdev_priv(dev);
++ 	struct flow_block_offload *f = type_data;
++ 
++ 	switch (type) {
++ #ifdef CONFIG_MLX5_ESWITCH
++ 	case TC_SETUP_BLOCK:
++ 		f->unlocked_driver_cb = true;
++ 		return flow_block_cb_setup_simple(type_data,
++ 						  &mlx5e_block_cb_list,
++ 						  mlx5e_setup_tc_block_cb,
++ 						  priv, priv, true);
+++>>>>>>> c9f14470d048 (net: sched: add API for registering unlocked offload block callbacks)
+  #endif
+  	case TC_SETUP_QDISC_MQPRIO:
+  		return mlx5e_setup_tc_mqprio(priv, type_data);
+diff --cc drivers/net/ethernet/mellanox/mlx5/core/en_rep.c
+index d4d2e9fb17fa,e7ac6233037d..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_rep.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_rep.c
+@@@ -717,16 -745,29 +717,22 @@@ static int mlx5e_rep_indr_setup_block_c
+  static int
+  mlx5e_rep_indr_setup_tc_block(struct net_device *netdev,
+  			      struct mlx5e_rep_priv *rpriv,
+ -			      struct flow_block_offload *f)
+ +			      struct tc_block_offload *f)
+  {
+  	struct mlx5e_rep_indr_block_priv *indr_priv;
+ -	struct flow_block_cb *block_cb;
+ +	int err = 0;
+  
+ -	if (f->binder_type != FLOW_BLOCK_BINDER_TYPE_CLSACT_INGRESS)
+ +	if (f->binder_type != TCF_BLOCK_BINDER_TYPE_CLSACT_INGRESS)
+  		return -EOPNOTSUPP;
+  
+++<<<<<<< HEAD
+++=======
++ 	f->unlocked_driver_cb = true;
++ 	f->driver_block_list = &mlx5e_block_cb_list;
++ 
+++>>>>>>> c9f14470d048 (net: sched: add API for registering unlocked offload block callbacks)
+  	switch (f->command) {
+ -	case FLOW_BLOCK_BIND:
+ +	case TC_BLOCK_BIND:
+  		indr_priv = mlx5e_rep_indr_block_priv_lookup(rpriv, netdev);
+  		if (indr_priv)
+  			return -EEXIST;
+@@@ -1218,9 -1245,16 +1224,22 @@@ static int mlx5e_rep_setup_tc_block(str
+  static int mlx5e_rep_setup_tc(struct net_device *dev, enum tc_setup_type type,
+  			      void *type_data)
+  {
+++<<<<<<< HEAD
+ +	switch (type) {
+ +	case TC_SETUP_BLOCK:
+ +		return mlx5e_rep_setup_tc_block(dev, type_data);
+++=======
++ 	struct mlx5e_priv *priv = netdev_priv(dev);
++ 	struct flow_block_offload *f = type_data;
++ 
++ 	switch (type) {
++ 	case TC_SETUP_BLOCK:
++ 		f->unlocked_driver_cb = true;
++ 		return flow_block_cb_setup_simple(type_data,
++ 						  &mlx5e_rep_block_cb_list,
++ 						  mlx5e_rep_setup_tc_cb,
++ 						  priv, priv, true);
+++>>>>>>> c9f14470d048 (net: sched: add API for registering unlocked offload block callbacks)
+  	default:
+  		return -EOPNOTSUPP;
+  	}
+diff --cc include/net/flow_offload.h
+index 2cdb83492339,fc881875f856..000000000000
+--- a/include/net/flow_offload.h
++++ b/include/net/flow_offload.h
+@@@ -234,4 -263,150 +234,153 @@@ static inline void flow_stats_update(st
+  	flow_stats->lastused	= max_t(u64, flow_stats->lastused, lastused);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ enum flow_block_command {
++ 	FLOW_BLOCK_BIND,
++ 	FLOW_BLOCK_UNBIND,
++ };
++ 
++ enum flow_block_binder_type {
++ 	FLOW_BLOCK_BINDER_TYPE_UNSPEC,
++ 	FLOW_BLOCK_BINDER_TYPE_CLSACT_INGRESS,
++ 	FLOW_BLOCK_BINDER_TYPE_CLSACT_EGRESS,
++ };
++ 
++ struct flow_block {
++ 	struct list_head cb_list;
++ };
++ 
++ struct netlink_ext_ack;
++ 
++ struct flow_block_offload {
++ 	enum flow_block_command command;
++ 	enum flow_block_binder_type binder_type;
++ 	bool block_shared;
++ 	bool unlocked_driver_cb;
++ 	struct net *net;
++ 	struct flow_block *block;
++ 	struct list_head cb_list;
++ 	struct list_head *driver_block_list;
++ 	struct netlink_ext_ack *extack;
++ };
++ 
++ enum tc_setup_type;
++ typedef int flow_setup_cb_t(enum tc_setup_type type, void *type_data,
++ 			    void *cb_priv);
++ 
++ struct flow_block_cb {
++ 	struct list_head	driver_list;
++ 	struct list_head	list;
++ 	flow_setup_cb_t		*cb;
++ 	void			*cb_ident;
++ 	void			*cb_priv;
++ 	void			(*release)(void *cb_priv);
++ 	unsigned int		refcnt;
++ };
++ 
++ struct flow_block_cb *flow_block_cb_alloc(flow_setup_cb_t *cb,
++ 					  void *cb_ident, void *cb_priv,
++ 					  void (*release)(void *cb_priv));
++ void flow_block_cb_free(struct flow_block_cb *block_cb);
++ 
++ struct flow_block_cb *flow_block_cb_lookup(struct flow_block *block,
++ 					   flow_setup_cb_t *cb, void *cb_ident);
++ 
++ void *flow_block_cb_priv(struct flow_block_cb *block_cb);
++ void flow_block_cb_incref(struct flow_block_cb *block_cb);
++ unsigned int flow_block_cb_decref(struct flow_block_cb *block_cb);
++ 
++ static inline void flow_block_cb_add(struct flow_block_cb *block_cb,
++ 				     struct flow_block_offload *offload)
++ {
++ 	list_add_tail(&block_cb->list, &offload->cb_list);
++ }
++ 
++ static inline void flow_block_cb_remove(struct flow_block_cb *block_cb,
++ 					struct flow_block_offload *offload)
++ {
++ 	list_move(&block_cb->list, &offload->cb_list);
++ }
++ 
++ bool flow_block_cb_is_busy(flow_setup_cb_t *cb, void *cb_ident,
++ 			   struct list_head *driver_block_list);
++ 
++ int flow_block_cb_setup_simple(struct flow_block_offload *f,
++ 			       struct list_head *driver_list,
++ 			       flow_setup_cb_t *cb,
++ 			       void *cb_ident, void *cb_priv, bool ingress_only);
++ 
++ enum flow_cls_command {
++ 	FLOW_CLS_REPLACE,
++ 	FLOW_CLS_DESTROY,
++ 	FLOW_CLS_STATS,
++ 	FLOW_CLS_TMPLT_CREATE,
++ 	FLOW_CLS_TMPLT_DESTROY,
++ };
++ 
++ struct flow_cls_common_offload {
++ 	u32 chain_index;
++ 	__be16 protocol;
++ 	u32 prio;
++ 	struct netlink_ext_ack *extack;
++ };
++ 
++ struct flow_cls_offload {
++ 	struct flow_cls_common_offload common;
++ 	enum flow_cls_command command;
++ 	unsigned long cookie;
++ 	struct flow_rule *rule;
++ 	struct flow_stats stats;
++ 	u32 classid;
++ };
++ 
++ static inline struct flow_rule *
++ flow_cls_offload_flow_rule(struct flow_cls_offload *flow_cmd)
++ {
++ 	return flow_cmd->rule;
++ }
++ 
++ static inline void flow_block_init(struct flow_block *flow_block)
++ {
++ 	INIT_LIST_HEAD(&flow_block->cb_list);
++ }
++ 
++ typedef int flow_indr_block_bind_cb_t(struct net_device *dev, void *cb_priv,
++ 				      enum tc_setup_type type, void *type_data);
++ 
++ typedef void flow_indr_block_ing_cmd_t(struct net_device *dev,
++ 					flow_indr_block_bind_cb_t *cb,
++ 					void *cb_priv,
++ 					enum flow_block_command command);
++ 
++ struct flow_indr_block_ing_entry {
++ 	flow_indr_block_ing_cmd_t *cb;
++ 	struct list_head	list;
++ };
++ 
++ void flow_indr_add_block_ing_cb(struct flow_indr_block_ing_entry *entry);
++ 
++ void flow_indr_del_block_ing_cb(struct flow_indr_block_ing_entry *entry);
++ 
++ int __flow_indr_block_cb_register(struct net_device *dev, void *cb_priv,
++ 				  flow_indr_block_bind_cb_t *cb,
++ 				  void *cb_ident);
++ 
++ void __flow_indr_block_cb_unregister(struct net_device *dev,
++ 				     flow_indr_block_bind_cb_t *cb,
++ 				     void *cb_ident);
++ 
++ int flow_indr_block_cb_register(struct net_device *dev, void *cb_priv,
++ 				flow_indr_block_bind_cb_t *cb, void *cb_ident);
++ 
++ void flow_indr_block_cb_unregister(struct net_device *dev,
++ 				   flow_indr_block_bind_cb_t *cb,
++ 				   void *cb_ident);
++ 
++ void flow_indr_block_call(struct net_device *dev,
++ 			  struct flow_block_offload *bo,
++ 			  enum flow_block_command command);
++ 
+++>>>>>>> c9f14470d048 (net: sched: add API for registering unlocked offload block callbacks)
+  #endif /* _NET_FLOW_OFFLOAD_H */
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/en_main.c
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/en_rep.c
+* Unmerged path include/net/flow_offload.h
+diff --git a/include/net/sch_generic.h b/include/net/sch_generic.h
+index 13911b10ed82..3f2deb90c1a9 100644
+--- a/include/net/sch_generic.h
++++ b/include/net/sch_generic.h
+@@ -409,6 +409,7 @@ struct tcf_block {
+ 	bool keep_dst;
+ 	unsigned int offloadcnt; /* Number of oddloaded filters */
+ 	unsigned int nooffloaddevcnt; /* Number of devs unable to do offload */
++	unsigned int lockeddevcnt; /* Number of devs that require rtnl lock. */
+ 	struct {
+ 		struct tcf_chain *chain;
+ 		struct list_head filter_chain_list;
+diff --git a/net/sched/cls_api.c b/net/sched/cls_api.c
+index 081ac3d0fb50..d3bbea6ed6da 100644
+--- a/net/sched/cls_api.c
++++ b/net/sched/cls_api.c
+@@ -1666,6 +1666,8 @@ static int tcf_block_bind(struct tcf_block *block,
+ 						  bo->extack);
+ 		if (err)
+ 			goto err_unroll;
++		if (!bo->unlocked_driver_cb)
++			block->lockeddevcnt++;
+ 
+ 		i++;
+ 	}
+@@ -1681,6 +1683,8 @@ static int tcf_block_bind(struct tcf_block *block,
+ 						    block_cb->cb_priv, false,
+ 						    tcf_block_offload_in_use(block),
+ 						    NULL);
++			if (!bo->unlocked_driver_cb)
++				block->lockeddevcnt--;
+ 		}
+ 		flow_block_cb_free(block_cb);
+ 	}
+@@ -1700,6 +1704,8 @@ static void tcf_block_unbind(struct tcf_block *block,
+ 					    NULL);
+ 		list_del(&block_cb->list);
+ 		flow_block_cb_free(block_cb);
++		if (!bo->unlocked_driver_cb)
++			block->lockeddevcnt--;
+ 	}
+ }
+ 
