@@ -1,0 +1,161 @@
+sched/fair: Make sched-idle CPU selection consistent throughout
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Viresh Kumar <viresh.kumar@linaro.org>
+commit 17346452b25b98acfb395d2a82ec2e4ad0cb7a01
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/17346452.failed
+
+There are instances where we keep searching for an idle CPU despite
+already having a sched-idle CPU (in find_idlest_group_cpu(),
+select_idle_smt() and select_idle_cpu() and then there are places where
+we don't necessarily do that and return a sched-idle CPU as soon as we
+find one (in select_idle_sibling()). This looks a bit inconsistent and
+it may be worth having the same policy everywhere.
+
+On the other hand, choosing a sched-idle CPU over a idle one shall be
+beneficial from performance and power point of view as well, as we don't
+need to get the CPU online from a deep idle state which wastes quite a
+lot of time and energy and delays the scheduling of the newly woken up
+task.
+
+This patch tries to simplify code around sched-idle CPU selection and
+make it consistent throughout.
+
+Testing is done with the help of rt-app on hikey board (ARM64 octa-core,
+2 clusters, 0-3 and 4-7). The cpufreq governor was set to performance to
+avoid any side affects from CPU frequency. Following are the tests
+performed:
+
+Test 1: 1-cfs-task:
+
+ A single SCHED_NORMAL task is pinned to CPU5 which runs for 2333 us
+ out of 7777 us (so gives time for the cluster to go in deep idle
+ state).
+
+Test 2: 1-cfs-1-idle-task:
+
+ A single SCHED_NORMAL task is pinned on CPU5 and single SCHED_IDLE
+ task is pinned on CPU6 (to make sure cluster 1 doesn't go in deep idle
+ state).
+
+Test 3: 1-cfs-8-idle-task:
+
+ A single SCHED_NORMAL task is pinned on CPU5 and eight SCHED_IDLE
+ tasks are created which run forever (not pinned anywhere, so they run
+ on all CPUs). Checked with kernelshark that as soon as NORMAL task
+ sleeps, the SCHED_IDLE task starts running on CPU5.
+
+And here are the results on mean latency (in us), using the "st" tool.
+
+  $ st 1-cfs-task/rt-app-cfs_thread-0.log
+  N       min     max     sum     mean    stddev
+  642     90      592     197180  307.134 109.906
+
+  $ st 1-cfs-1-idle-task/rt-app-cfs_thread-0.log
+  N       min     max     sum     mean    stddev
+  642     67      311     113850  177.336 41.4251
+
+  $ st 1-cfs-8-idle-task/rt-app-cfs_thread-0.log
+  N       min     max     sum     mean    stddev
+  643     29      173     41364   64.3297 13.2344
+
+The mean latency when we need to:
+
+ - wakeup from deep idle state is 307 us.
+ - wakeup from shallow idle state is 177 us.
+ - preempt a SCHED_IDLE task is 64 us.
+
+	Signed-off-by: Viresh Kumar <viresh.kumar@linaro.org>
+	Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+	Reviewed-by: Vincent Guittot <vincent.guittot@linaro.org>
+	Cc: Linus Torvalds <torvalds@linux-foundation.org>
+	Cc: Peter Zijlstra <peterz@infradead.org>
+	Cc: Thomas Gleixner <tglx@linutronix.de>
+Link: https://lkml.kernel.org/r/b90cbcce608cef4e02a7bbfe178335f76d201bab.1573728344.git.viresh.kumar@linaro.org
+	Signed-off-by: Ingo Molnar <mingo@kernel.org>
+(cherry picked from commit 17346452b25b98acfb395d2a82ec2e4ad0cb7a01)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	kernel/sched/fair.c
+diff --cc kernel/sched/fair.c
+index 18d7b6f2200a,1f34fa9732d8..000000000000
+--- a/kernel/sched/fair.c
++++ b/kernel/sched/fair.c
+@@@ -5663,7 -5596,10 +5663,14 @@@ find_idlest_group_cpu(struct sched_grou
+  		return cpumask_first(sched_group_span(group));
+  
+  	/* Traverse only the allowed CPUs */
+++<<<<<<< HEAD
+ +	for_each_cpu_and(i, sched_group_span(group), &p->cpus_allowed) {
+++=======
++ 	for_each_cpu_and(i, sched_group_span(group), p->cpus_ptr) {
++ 		if (sched_idle_cpu(i))
++ 			return i;
++ 
+++>>>>>>> 17346452b25b (sched/fair: Make sched-idle CPU selection consistent throughout)
+  		if (available_idle_cpu(i)) {
+  			struct rq *rq = cpu_rq(i);
+  			struct cpuidle_state *idle = idle_get_state(rq);
+@@@ -5687,7 -5623,7 +5694,11 @@@
+  				shallowest_idle_cpu = i;
+  			}
+  		} else if (shallowest_idle_cpu == -1) {
+++<<<<<<< HEAD
+ +			load = cpu_runnable_load(cpu_rq(i));
+++=======
++ 			load = cpu_load(cpu_rq(i));
+++>>>>>>> 17346452b25b (sched/fair: Make sched-idle CPU selection consistent throughout)
+  			if (load < min_load) {
+  				min_load = load;
+  				least_loaded_cpu = i;
+@@@ -5854,9 -5790,9 +5865,9 @@@ static int select_idle_smt(struct task_
+  		return -1;
+  
+  	for_each_cpu(cpu, cpu_smt_mask(target)) {
+ -		if (!cpumask_test_cpu(cpu, p->cpus_ptr))
+ +		if (!cpumask_test_cpu(cpu, &p->cpus_allowed))
+  			continue;
+- 		if (available_idle_cpu(cpu))
++ 		if (available_idle_cpu(cpu) || sched_idle_cpu(cpu))
+  			return cpu;
+  	}
+  
+@@@ -5888,6 -5825,7 +5899,10 @@@ static int select_idle_cpu(struct task_
+  	u64 avg_cost, avg_idle;
+  	u64 time, cost;
+  	s64 delta;
+++<<<<<<< HEAD
+++=======
++ 	int this = smp_processor_id();
+++>>>>>>> 17346452b25b (sched/fair: Make sched-idle CPU selection consistent throughout)
+  	int cpu, nr = INT_MAX;
+  
+  	this_sd = rcu_dereference(*this_cpu_ptr(&sd_llc));
+@@@ -5912,14 -5850,14 +5927,18 @@@
+  			nr = 4;
+  	}
+  
+ -	time = cpu_clock(this);
+ -
+ -	cpumask_and(cpus, sched_domain_span(sd), p->cpus_ptr);
+ +	time = local_clock();
+  
+ -	for_each_cpu_wrap(cpu, cpus, target) {
+ +	for_each_cpu_wrap(cpu, sched_domain_span(sd), target) {
+  		if (!--nr)
+  			return -1;
+++<<<<<<< HEAD
+ +		if (!cpumask_test_cpu(cpu, &p->cpus_allowed))
+ +			continue;
+ +		if (available_idle_cpu(cpu))
+++=======
++ 		if (available_idle_cpu(cpu) || sched_idle_cpu(cpu))
+++>>>>>>> 17346452b25b (sched/fair: Make sched-idle CPU selection consistent throughout)
+  			break;
+  	}
+  
+* Unmerged path kernel/sched/fair.c
