@@ -1,0 +1,219 @@
+iommu: Add probe_device() and release_device() call-backs
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Joerg Roedel <jroedel@suse.de>
+commit a6a4c7e2c5b8b981d1c546a393ff21f2112468c3
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/a6a4c7e2.failed
+
+Add call-backs to 'struct iommu_ops' as an alternative to the
+add_device() and remove_device() call-backs, which will be removed when
+all drivers are converted.
+
+The new call-backs will not setup IOMMU groups and domains anymore,
+so also add a probe_finalize() call-back where the IOMMU driver can do
+per-device setup work which require the device to be set up with a
+group and a domain.
+
+	Signed-off-by: Joerg Roedel <jroedel@suse.de>
+	Tested-by: Marek Szyprowski <m.szyprowski@samsung.com>
+	Acked-by: Marek Szyprowski <m.szyprowski@samsung.com>
+Link: https://lore.kernel.org/r/20200429133712.31431-8-joro@8bytes.org
+	Signed-off-by: Joerg Roedel <jroedel@suse.de>
+(cherry picked from commit a6a4c7e2c5b8b981d1c546a393ff21f2112468c3)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/iommu/iommu.c
+#	include/linux/iommu.h
+diff --cc drivers/iommu/iommu.c
+index 7997fcb701e0,6cfe7799dc8c..000000000000
+--- a/drivers/iommu/iommu.c
++++ b/drivers/iommu/iommu.c
+@@@ -161,17 -150,94 +161,72 @@@ void iommu_device_unregister(struct iom
+  	list_del(&iommu->list);
+  	spin_unlock(&iommu_device_lock);
+  }
+ -EXPORT_SYMBOL_GPL(iommu_device_unregister);
+ -
+ -static struct dev_iommu *dev_iommu_get(struct device *dev)
+ -{
+ -	struct dev_iommu *param = dev->iommu;
+ -
+ -	if (param)
+ -		return param;
+ -
+ -	param = kzalloc(sizeof(*param), GFP_KERNEL);
+ -	if (!param)
+ -		return NULL;
+ -
+ -	mutex_init(&param->lock);
+ -	dev->iommu = param;
+ -	return param;
+ -}
+ -
+ -static void dev_iommu_free(struct device *dev)
+ -{
+ -	kfree(dev->iommu);
+ -	dev->iommu = NULL;
+ -}
+  
++ static int __iommu_probe_device(struct device *dev)
++ {
++ 	const struct iommu_ops *ops = dev->bus->iommu_ops;
++ 	struct iommu_device *iommu_dev;
++ 	struct iommu_group *group;
++ 	int ret;
++ 
++ 	iommu_dev = ops->probe_device(dev);
++ 	if (IS_ERR(iommu_dev))
++ 		return PTR_ERR(iommu_dev);
++ 
++ 	dev->iommu->iommu_dev = iommu_dev;
++ 
++ 	group = iommu_group_get_for_dev(dev);
++ 	if (!IS_ERR(group)) {
++ 		ret = PTR_ERR(group);
++ 		goto out_release;
++ 	}
++ 	iommu_group_put(group);
++ 
++ 	iommu_device_link(iommu_dev, dev);
++ 
++ 	return 0;
++ 
++ out_release:
++ 	ops->release_device(dev);
++ 
++ 	return ret;
++ }
++ 
+  int iommu_probe_device(struct device *dev)
+  {
+  	const struct iommu_ops *ops = dev->bus->iommu_ops;
+ -	int ret;
+ +	int ret = -EINVAL;
+  
+  	WARN_ON(dev->iommu_group);
+ -	if (!ops)
+ -		return -EINVAL;
+  
+ -	if (!dev_iommu_get(dev))
+ -		return -ENOMEM;
+ +	if (ops)
+ +		ret = ops->add_device(dev);
+  
+++<<<<<<< HEAD
+++=======
++ 	if (!try_module_get(ops->owner)) {
++ 		ret = -EINVAL;
++ 		goto err_free_dev_param;
++ 	}
++ 
++ 	if (ops->probe_device)
++ 		ret = __iommu_probe_device(dev);
++ 	else
++ 		ret = ops->add_device(dev);
++ 
++ 	if (ret)
++ 		goto err_module_put;
++ 
++ 	if (ops->probe_finalize)
++ 		ops->probe_finalize(dev);
++ 
++ 	return 0;
++ 
++ err_module_put:
++ 	module_put(ops->owner);
++ err_free_dev_param:
++ 	dev_iommu_free(dev);
+++>>>>>>> a6a4c7e2c5b8 (iommu: Add probe_device() and release_device() call-backs)
+  	return ret;
+  }
+  
+@@@ -179,8 -256,16 +245,19 @@@ void iommu_release_device(struct devic
+  {
+  	const struct iommu_ops *ops = dev->bus->iommu_ops;
+  
+- 	if (dev->iommu_group)
++ 	if (!dev->iommu)
++ 		return;
++ 
++ 	if (ops->release_device)
++ 		__iommu_release_device(dev);
++ 	else if (dev->iommu_group)
+  		ops->remove_device(dev);
+++<<<<<<< HEAD
+++=======
++ 
++ 	module_put(ops->owner);
++ 	dev_iommu_free(dev);
+++>>>>>>> a6a4c7e2c5b8 (iommu: Add probe_device() and release_device() call-backs)
+  }
+  
+  static struct iommu_domain *__iommu_domain_alloc(struct bus_type *bus,
+diff --cc include/linux/iommu.h
+index c0752afea934,30170d191e5e..000000000000
+--- a/include/linux/iommu.h
++++ b/include/linux/iommu.h
+@@@ -343,6 -349,53 +350,56 @@@ struct iommu_device 
+  	struct device *dev;
+  };
+  
+++<<<<<<< HEAD
+++=======
++ /**
++  * struct iommu_fault_event - Generic fault event
++  *
++  * Can represent recoverable faults such as a page requests or
++  * unrecoverable faults such as DMA or IRQ remapping faults.
++  *
++  * @fault: fault descriptor
++  * @list: pending fault event list, used for tracking responses
++  */
++ struct iommu_fault_event {
++ 	struct iommu_fault fault;
++ 	struct list_head list;
++ };
++ 
++ /**
++  * struct iommu_fault_param - per-device IOMMU fault data
++  * @handler: Callback function to handle IOMMU faults at device level
++  * @data: handler private data
++  * @faults: holds the pending faults which needs response
++  * @lock: protect pending faults list
++  */
++ struct iommu_fault_param {
++ 	iommu_dev_fault_handler_t handler;
++ 	void *data;
++ 	struct list_head faults;
++ 	struct mutex lock;
++ };
++ 
++ /**
++  * struct dev_iommu - Collection of per-device IOMMU data
++  *
++  * @fault_param: IOMMU detected device fault reporting data
++  * @fwspec:	 IOMMU fwspec data
++  * @iommu_dev:	 IOMMU device this device is linked to
++  * @priv:	 IOMMU Driver private data
++  *
++  * TODO: migrate other per device data pointers under iommu_dev_data, e.g.
++  *	struct iommu_group	*iommu_group;
++  */
++ struct dev_iommu {
++ 	struct mutex lock;
++ 	struct iommu_fault_param	*fault_param;
++ 	struct iommu_fwspec		*fwspec;
++ 	struct iommu_device		*iommu_dev;
++ 	void				*priv;
++ };
++ 
+++>>>>>>> a6a4c7e2c5b8 (iommu: Add probe_device() and release_device() call-backs)
+  int  iommu_device_register(struct iommu_device *iommu);
+  void iommu_device_unregister(struct iommu_device *iommu);
+  int  iommu_device_sysfs_add(struct iommu_device *iommu,
+* Unmerged path drivers/iommu/iommu.c
+* Unmerged path include/linux/iommu.h
