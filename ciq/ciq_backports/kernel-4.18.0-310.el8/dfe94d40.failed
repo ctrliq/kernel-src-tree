@@ -1,0 +1,120 @@
+x86/hyperv: Fix kexec panic/hang issues
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-310.el8
+commit-author Dexuan Cui <decui@microsoft.com>
+commit dfe94d4086e40e92b1926bddcefa629b791e9b28
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-310.el8/dfe94d40.failed
+
+Currently the kexec kernel can panic or hang due to 2 causes:
+
+1) hv_cpu_die() is not called upon kexec, so the hypervisor corrupts the
+old VP Assist Pages when the kexec kernel runs. The same issue is fixed
+for hibernation in commit 421f090c819d ("x86/hyperv: Suspend/resume the
+VP assist page for hibernation"). Now fix it for kexec.
+
+2) hyperv_cleanup() is called too early. In the kexec path, the other CPUs
+are stopped in hv_machine_shutdown() -> native_machine_shutdown(), so
+between hv_kexec_handler() and native_machine_shutdown(), the other CPUs
+can still try to access the hypercall page and cause panic. The workaround
+"hv_hypercall_pg = NULL;" in hyperv_cleanup() is unreliabe. Move
+hyperv_cleanup() to a better place.
+
+	Signed-off-by: Dexuan Cui <decui@microsoft.com>
+	Reviewed-by: Michael Kelley <mikelley@microsoft.com>
+Link: https://lore.kernel.org/r/20201222065541.24312-1-decui@microsoft.com
+	Signed-off-by: Wei Liu <wei.liu@kernel.org>
+(cherry picked from commit dfe94d4086e40e92b1926bddcefa629b791e9b28)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/hyperv/hv_init.c
+diff --cc arch/x86/hyperv/hv_init.c
+index 43ec03694a62,4638a52d8eae..000000000000
+--- a/arch/x86/hyperv/hv_init.c
++++ b/arch/x86/hyperv/hv_init.c
+@@@ -25,6 -15,8 +25,11 @@@
+  #include <asm/hypervisor.h>
+  #include <asm/hyperv-tlfs.h>
+  #include <asm/mshyperv.h>
+++<<<<<<< HEAD
+++=======
++ #include <asm/idtentry.h>
++ #include <linux/kexec.h>
+++>>>>>>> dfe94d4086e4 (x86/hyperv: Fix kexec panic/hang issues)
+  #include <linux/version.h>
+  #include <linux/vmalloc.h>
+  #include <linux/mm.h>
+* Unmerged path arch/x86/hyperv/hv_init.c
+diff --git a/arch/x86/include/asm/mshyperv.h b/arch/x86/include/asm/mshyperv.h
+index ed173f78033a..7f16bb960e49 100644
+--- a/arch/x86/include/asm/mshyperv.h
++++ b/arch/x86/include/asm/mshyperv.h
+@@ -87,6 +87,8 @@ static inline void hv_disable_stimer0_percpu_irq(int irq) {}
+ 
+ 
+ #if IS_ENABLED(CONFIG_HYPERV)
++extern int hyperv_init_cpuhp;
++
+ extern void *hv_hypercall_pg;
+ extern void  __percpu  **hyperv_pcpu_input_arg;
+ 
+diff --git a/arch/x86/kernel/cpu/mshyperv.c b/arch/x86/kernel/cpu/mshyperv.c
+index 7aa6d08edfd2..abc2816bb4d8 100644
+--- a/arch/x86/kernel/cpu/mshyperv.c
++++ b/arch/x86/kernel/cpu/mshyperv.c
+@@ -143,14 +143,32 @@ static void hv_machine_shutdown(void)
+ {
+ 	if (kexec_in_progress && hv_kexec_handler)
+ 		hv_kexec_handler();
++
++	/*
++	 * Call hv_cpu_die() on all the CPUs, otherwise later the hypervisor
++	 * corrupts the old VP Assist Pages and can crash the kexec kernel.
++	 */
++	if (kexec_in_progress && hyperv_init_cpuhp > 0)
++		cpuhp_remove_state(hyperv_init_cpuhp);
++
++	/* The function calls stop_other_cpus(). */
+ 	native_machine_shutdown();
++
++	/* Disable the hypercall page when there is only 1 active CPU. */
++	if (kexec_in_progress)
++		hyperv_cleanup();
+ }
+ 
+ static void hv_machine_crash_shutdown(struct pt_regs *regs)
+ {
+ 	if (hv_crash_handler)
+ 		hv_crash_handler(regs);
++
++	/* The function calls crash_smp_send_stop(). */
+ 	native_machine_crash_shutdown(regs);
++
++	/* Disable the hypercall page when there is only 1 active CPU. */
++	hyperv_cleanup();
+ }
+ #endif /* CONFIG_KEXEC_CORE */
+ #endif /* CONFIG_HYPERV */
+diff --git a/drivers/hv/vmbus_drv.c b/drivers/hv/vmbus_drv.c
+index 619d0b690781..4ffc53dd0e01 100644
+--- a/drivers/hv/vmbus_drv.c
++++ b/drivers/hv/vmbus_drv.c
+@@ -2555,7 +2555,6 @@ static void hv_kexec_handler(void)
+ 	/* Make sure conn_state is set as hv_synic_cleanup checks for it */
+ 	mb();
+ 	cpuhp_remove_state(hyperv_cpuhp_online);
+-	hyperv_cleanup();
+ };
+ 
+ static void hv_crash_handler(struct pt_regs *regs)
+@@ -2571,7 +2570,6 @@ static void hv_crash_handler(struct pt_regs *regs)
+ 	cpu = smp_processor_id();
+ 	hv_stimer_cleanup(cpu);
+ 	hv_synic_disable_regs(cpu);
+-	hyperv_cleanup();
+ };
+ 
+ static int hv_synic_suspend(void)
