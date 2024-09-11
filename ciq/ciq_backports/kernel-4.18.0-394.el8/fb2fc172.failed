@@ -1,0 +1,164 @@
+xfs: support shrinking unused space in the last AG
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-394.el8
+commit-author Gao Xiang <hsiangkao@redhat.com>
+commit fb2fc172018599a6564aab4ac0dce79bf94bd6bc
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-394.el8/fb2fc172.failed
+
+As the first step of shrinking, this attempts to enable shrinking
+unused space in the last allocation group by fixing up freespace
+btree, agi, agf and adjusting super block and use a helper
+xfs_ag_shrink_space() to fixup the last AG.
+
+This can be all done in one transaction for now, so I think no
+additional protection is needed.
+
+	Reviewed-by: Darrick J. Wong <djwong@kernel.org>
+	Signed-off-by: Gao Xiang <hsiangkao@redhat.com>
+	Signed-off-by: Darrick J. Wong <djwong@kernel.org>
+(cherry picked from commit fb2fc172018599a6564aab4ac0dce79bf94bd6bc)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/xfs/xfs_fsops.c
+diff --cc fs/xfs/xfs_fsops.c
+index a93bbef19e5c,b33c894b6cf3..000000000000
+--- a/fs/xfs/xfs_fsops.c
++++ b/fs/xfs/xfs_fsops.c
+@@@ -33,7 -91,8 +33,12 @@@ xfs_growfs_data_private
+  	xfs_agnumber_t		nagcount;
+  	xfs_agnumber_t		nagimax = 0;
+  	xfs_rfsblock_t		nb, nb_div, nb_mod;
+++<<<<<<< HEAD
+ +	xfs_rfsblock_t		delta;
+++=======
++ 	int64_t			delta;
++ 	bool			lastag_extended;
+++>>>>>>> fb2fc1720185 (xfs: support shrinking unused space in the last AG)
+  	xfs_agnumber_t		oagcount;
+  	struct xfs_trans	*tp;
+  	struct aghdr_init_data	id = {};
+@@@ -74,36 -145,20 +91,53 @@@
+  	if (error)
+  		return error;
+  
+++<<<<<<< HEAD
+ +	/*
+ +	 * Write new AG headers to disk. Non-transactional, but need to be
+ +	 * written and completed prior to the growfs transaction being logged.
+ +	 * To do this, we use a delayed write buffer list and wait for
+ +	 * submission and IO completion of the list as a whole. This allows the
+ +	 * IO subsystem to merge all the AG headers in a single AG into a single
+ +	 * IO and hide most of the latency of the IO from us.
+ +	 *
+ +	 * This also means that if we get an error whilst building the buffer
+ +	 * list to write, we can cancel the entire list without having written
+ +	 * anything.
+ +	 */
+ +	INIT_LIST_HEAD(&id.buffer_list);
+ +	for (id.agno = nagcount - 1;
+ +	     id.agno >= oagcount;
+ +	     id.agno--, delta -= id.agsize) {
+ +
+ +		if (id.agno == nagcount - 1)
+ +			id.agsize = nb -
+ +				(id.agno * (xfs_rfsblock_t)mp->m_sb.sb_agblocks);
+ +		else
+ +			id.agsize = mp->m_sb.sb_agblocks;
+ +
+ +		error = xfs_ag_init_headers(mp, &id);
+ +		if (error) {
+ +			xfs_buf_delwri_cancel(&id.buffer_list);
+ +			goto out_trans_cancel;
+ +		}
+ +	}
+ +	error = xfs_buf_delwri_submit(&id.buffer_list);
+++=======
++ 	if (delta > 0) {
++ 		error = xfs_resizefs_init_new_ags(tp, &id, oagcount, nagcount,
++ 						  delta, &lastag_extended);
++ 	} else {
++ 		static struct ratelimit_state shrink_warning = \
++ 			RATELIMIT_STATE_INIT("shrink_warning", 86400 * HZ, 1);
++ 		ratelimit_set_flags(&shrink_warning, RATELIMIT_MSG_ON_RELEASE);
++ 
++ 		if (__ratelimit(&shrink_warning))
++ 			xfs_alert(mp,
++ 	"EXPERIMENTAL online shrink feature in use. Use at your own risk!");
++ 
++ 		error = xfs_ag_shrink_space(mp, &tp, nagcount - 1, -delta);
++ 	}
+++>>>>>>> fb2fc1720185 (xfs: support shrinking unused space in the last AG)
+  	if (error)
+  		goto out_trans_cancel;
+  
+@@@ -146,28 -193,29 +180,38 @@@
+  	xfs_set_low_space_thresholds(mp);
+  	mp->m_alloc_set_aside = xfs_alloc_set_aside(mp);
+  
+++<<<<<<< HEAD
+ +	/*
+ +	 * If we expanded the last AG, free the per-AG reservation
+ +	 * so we can reinitialize it with the new size.
+ +	 */
+ +	if (delta) {
+ +		struct xfs_perag	*pag;
+- 
+- 		pag = xfs_perag_get(mp, id.agno);
+- 		error = xfs_ag_resv_free(pag);
+- 		xfs_perag_put(pag);
+- 		if (error)
+- 			return error;
+++=======
++ 	if (delta > 0) {
++ 		/*
++ 		 * If we expanded the last AG, free the per-AG reservation
++ 		 * so we can reinitialize it with the new size.
++ 		 */
++ 		if (lastag_extended) {
++ 			struct xfs_perag	*pag;
+++>>>>>>> fb2fc1720185 (xfs: support shrinking unused space in the last AG)
++ 
++ 			pag = xfs_perag_get(mp, id.agno);
++ 			error = xfs_ag_resv_free(pag);
++ 			xfs_perag_put(pag);
++ 			if (error)
++ 				return error;
++ 		}
++ 		/*
++ 		 * Reserve AG metadata blocks. ENOSPC here does not mean there
++ 		 * was a growfs failure, just that there still isn't space for
++ 		 * new user data after the grow has been run.
++ 		 */
++ 		error = xfs_fs_reserve_ag_blocks(mp);
++ 		if (error == -ENOSPC)
++ 			error = 0;
+  	}
+- 
+- 	/*
+- 	 * Reserve AG metadata blocks. ENOSPC here does not mean there was a
+- 	 * growfs failure, just that there still isn't space for new user data
+- 	 * after the grow has been run.
+- 	 */
+- 	error = xfs_fs_reserve_ag_blocks(mp);
+- 	if (error == -ENOSPC)
+- 		error = 0;
+  	return error;
+  
+  out_trans_cancel:
+* Unmerged path fs/xfs/xfs_fsops.c
+diff --git a/fs/xfs/xfs_trans.c b/fs/xfs/xfs_trans.c
+index f821fa201f62..9f161c311257 100644
+--- a/fs/xfs/xfs_trans.c
++++ b/fs/xfs/xfs_trans.c
+@@ -436,7 +436,6 @@ xfs_trans_mod_sb(
+ 		tp->t_res_frextents_delta += delta;
+ 		break;
+ 	case XFS_TRANS_SB_DBLOCKS:
+-		ASSERT(delta > 0);
+ 		tp->t_dblocks_delta += delta;
+ 		break;
+ 	case XFS_TRANS_SB_AGCOUNT:
