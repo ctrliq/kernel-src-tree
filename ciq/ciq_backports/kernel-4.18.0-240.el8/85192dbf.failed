@@ -1,0 +1,721 @@
+bpf: Convert bpf_prog refcnt to atomic64_t
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Andrii Nakryiko <andriin@fb.com>
+commit 85192dbf4de08795afe2b88e52a36fc6abfc3dba
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/85192dbf.failed
+
+Similarly to bpf_map's refcnt/usercnt, convert bpf_prog's refcnt to atomic64
+and remove artificial 32k limit. This allows to make bpf_prog's refcounting
+non-failing, simplifying logic of users of bpf_prog_add/bpf_prog_inc.
+
+Validated compilation by running allyesconfig kernel build.
+
+	Suggested-by: Daniel Borkmann <daniel@iogearbox.net>
+	Signed-off-by: Andrii Nakryiko <andriin@fb.com>
+	Signed-off-by: Daniel Borkmann <daniel@iogearbox.net>
+Link: https://lore.kernel.org/bpf/20191117172806.2195367-3-andriin@fb.com
+(cherry picked from commit 85192dbf4de08795afe2b88e52a36fc6abfc3dba)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/virtio_net.c
+#	drivers/staging/fsl-dpaa2/ethernet/dpaa2-eth.c
+#	kernel/bpf/syscall.c
+diff --cc drivers/net/virtio_net.c
+index 41ab230d202c,4d7d5434cc5d..000000000000
+--- a/drivers/net/virtio_net.c
++++ b/drivers/net/virtio_net.c
+@@@ -2287,18 -2441,30 +2287,27 @@@ static int virtnet_xdp_set(struct net_d
+  		return -ENOMEM;
+  	}
+  
+++<<<<<<< HEAD
+ +	if (prog) {
+ +		prog = bpf_prog_add(prog, vi->max_queue_pairs - 1);
+ +		if (IS_ERR(prog))
+ +			return PTR_ERR(prog);
+ +	}
+++=======
++ 	old_prog = rtnl_dereference(vi->rq[0].xdp_prog);
++ 	if (!prog && !old_prog)
++ 		return 0;
++ 
++ 	if (prog)
++ 		bpf_prog_add(prog, vi->max_queue_pairs - 1);
+++>>>>>>> 85192dbf4de0 (bpf: Convert bpf_prog refcnt to atomic64_t)
+  
+  	/* Make sure NAPI is not using any XDP TX queues for RX. */
+ -	if (netif_running(dev)) {
+ -		for (i = 0; i < vi->max_queue_pairs; i++) {
+ +	if (netif_running(dev))
+ +		for (i = 0; i < vi->max_queue_pairs; i++)
+  			napi_disable(&vi->rq[i].napi);
+ -			virtnet_napi_tx_disable(&vi->sq[i].napi);
+ -		}
+ -	}
+ -
+ -	if (!prog) {
+ -		for (i = 0; i < vi->max_queue_pairs; i++) {
+ -			rcu_assign_pointer(vi->rq[i].xdp_prog, prog);
+ -			if (i == 0)
+ -				virtnet_restore_guest_offloads(vi);
+ -		}
+ -		synchronize_net();
+ -	}
+  
+ +	netif_set_real_num_rx_queues(dev, curr_qp + xdp_qp);
+  	err = _virtnet_set_queues(vi, curr_qp + xdp_qp);
+  	if (err)
+  		goto err;
+diff --cc drivers/staging/fsl-dpaa2/ethernet/dpaa2-eth.c
+index 396371728aa1,acc56606d3a5..000000000000
+--- a/drivers/staging/fsl-dpaa2/ethernet/dpaa2-eth.c
++++ b/drivers/staging/fsl-dpaa2/ethernet/dpaa2-eth.c
+@@@ -1464,6 -1710,342 +1464,345 @@@ static int dpaa2_eth_ioctl(struct net_d
+  	return -EINVAL;
+  }
+  
+++<<<<<<< HEAD:drivers/staging/fsl-dpaa2/ethernet/dpaa2-eth.c
+++=======
++ static bool xdp_mtu_valid(struct dpaa2_eth_priv *priv, int mtu)
++ {
++ 	int mfl, linear_mfl;
++ 
++ 	mfl = DPAA2_ETH_L2_MAX_FRM(mtu);
++ 	linear_mfl = DPAA2_ETH_RX_BUF_SIZE - DPAA2_ETH_RX_HWA_SIZE -
++ 		     dpaa2_eth_rx_head_room(priv) - XDP_PACKET_HEADROOM;
++ 
++ 	if (mfl > linear_mfl) {
++ 		netdev_warn(priv->net_dev, "Maximum MTU for XDP is %d\n",
++ 			    linear_mfl - VLAN_ETH_HLEN);
++ 		return false;
++ 	}
++ 
++ 	return true;
++ }
++ 
++ static int set_rx_mfl(struct dpaa2_eth_priv *priv, int mtu, bool has_xdp)
++ {
++ 	int mfl, err;
++ 
++ 	/* We enforce a maximum Rx frame length based on MTU only if we have
++ 	 * an XDP program attached (in order to avoid Rx S/G frames).
++ 	 * Otherwise, we accept all incoming frames as long as they are not
++ 	 * larger than maximum size supported in hardware
++ 	 */
++ 	if (has_xdp)
++ 		mfl = DPAA2_ETH_L2_MAX_FRM(mtu);
++ 	else
++ 		mfl = DPAA2_ETH_MFL;
++ 
++ 	err = dpni_set_max_frame_length(priv->mc_io, 0, priv->mc_token, mfl);
++ 	if (err) {
++ 		netdev_err(priv->net_dev, "dpni_set_max_frame_length failed\n");
++ 		return err;
++ 	}
++ 
++ 	return 0;
++ }
++ 
++ static int dpaa2_eth_change_mtu(struct net_device *dev, int new_mtu)
++ {
++ 	struct dpaa2_eth_priv *priv = netdev_priv(dev);
++ 	int err;
++ 
++ 	if (!priv->xdp_prog)
++ 		goto out;
++ 
++ 	if (!xdp_mtu_valid(priv, new_mtu))
++ 		return -EINVAL;
++ 
++ 	err = set_rx_mfl(priv, new_mtu, true);
++ 	if (err)
++ 		return err;
++ 
++ out:
++ 	dev->mtu = new_mtu;
++ 	return 0;
++ }
++ 
++ static int update_rx_buffer_headroom(struct dpaa2_eth_priv *priv, bool has_xdp)
++ {
++ 	struct dpni_buffer_layout buf_layout = {0};
++ 	int err;
++ 
++ 	err = dpni_get_buffer_layout(priv->mc_io, 0, priv->mc_token,
++ 				     DPNI_QUEUE_RX, &buf_layout);
++ 	if (err) {
++ 		netdev_err(priv->net_dev, "dpni_get_buffer_layout failed\n");
++ 		return err;
++ 	}
++ 
++ 	/* Reserve extra headroom for XDP header size changes */
++ 	buf_layout.data_head_room = dpaa2_eth_rx_head_room(priv) +
++ 				    (has_xdp ? XDP_PACKET_HEADROOM : 0);
++ 	buf_layout.options = DPNI_BUF_LAYOUT_OPT_DATA_HEAD_ROOM;
++ 	err = dpni_set_buffer_layout(priv->mc_io, 0, priv->mc_token,
++ 				     DPNI_QUEUE_RX, &buf_layout);
++ 	if (err) {
++ 		netdev_err(priv->net_dev, "dpni_set_buffer_layout failed\n");
++ 		return err;
++ 	}
++ 
++ 	return 0;
++ }
++ 
++ static int setup_xdp(struct net_device *dev, struct bpf_prog *prog)
++ {
++ 	struct dpaa2_eth_priv *priv = netdev_priv(dev);
++ 	struct dpaa2_eth_channel *ch;
++ 	struct bpf_prog *old;
++ 	bool up, need_update;
++ 	int i, err;
++ 
++ 	if (prog && !xdp_mtu_valid(priv, dev->mtu))
++ 		return -EINVAL;
++ 
++ 	if (prog)
++ 		bpf_prog_add(prog, priv->num_channels);
++ 
++ 	up = netif_running(dev);
++ 	need_update = (!!priv->xdp_prog != !!prog);
++ 
++ 	if (up)
++ 		dpaa2_eth_stop(dev);
++ 
++ 	/* While in xdp mode, enforce a maximum Rx frame size based on MTU.
++ 	 * Also, when switching between xdp/non-xdp modes we need to reconfigure
++ 	 * our Rx buffer layout. Buffer pool was drained on dpaa2_eth_stop,
++ 	 * so we are sure no old format buffers will be used from now on.
++ 	 */
++ 	if (need_update) {
++ 		err = set_rx_mfl(priv, dev->mtu, !!prog);
++ 		if (err)
++ 			goto out_err;
++ 		err = update_rx_buffer_headroom(priv, !!prog);
++ 		if (err)
++ 			goto out_err;
++ 	}
++ 
++ 	old = xchg(&priv->xdp_prog, prog);
++ 	if (old)
++ 		bpf_prog_put(old);
++ 
++ 	for (i = 0; i < priv->num_channels; i++) {
++ 		ch = priv->channel[i];
++ 		old = xchg(&ch->xdp.prog, prog);
++ 		if (old)
++ 			bpf_prog_put(old);
++ 	}
++ 
++ 	if (up) {
++ 		err = dpaa2_eth_open(dev);
++ 		if (err)
++ 			return err;
++ 	}
++ 
++ 	return 0;
++ 
++ out_err:
++ 	if (prog)
++ 		bpf_prog_sub(prog, priv->num_channels);
++ 	if (up)
++ 		dpaa2_eth_open(dev);
++ 
++ 	return err;
++ }
++ 
++ static int dpaa2_eth_xdp(struct net_device *dev, struct netdev_bpf *xdp)
++ {
++ 	struct dpaa2_eth_priv *priv = netdev_priv(dev);
++ 
++ 	switch (xdp->command) {
++ 	case XDP_SETUP_PROG:
++ 		return setup_xdp(dev, xdp->prog);
++ 	case XDP_QUERY_PROG:
++ 		xdp->prog_id = priv->xdp_prog ? priv->xdp_prog->aux->id : 0;
++ 		break;
++ 	default:
++ 		return -EINVAL;
++ 	}
++ 
++ 	return 0;
++ }
++ 
++ static int dpaa2_eth_xdp_xmit_frame(struct net_device *net_dev,
++ 				    struct xdp_frame *xdpf)
++ {
++ 	struct dpaa2_eth_priv *priv = netdev_priv(net_dev);
++ 	struct device *dev = net_dev->dev.parent;
++ 	struct rtnl_link_stats64 *percpu_stats;
++ 	struct dpaa2_eth_drv_stats *percpu_extras;
++ 	unsigned int needed_headroom;
++ 	struct dpaa2_eth_swa *swa;
++ 	struct dpaa2_eth_fq *fq;
++ 	struct dpaa2_fd fd;
++ 	void *buffer_start, *aligned_start;
++ 	dma_addr_t addr;
++ 	int err, i;
++ 
++ 	/* We require a minimum headroom to be able to transmit the frame.
++ 	 * Otherwise return an error and let the original net_device handle it
++ 	 */
++ 	needed_headroom = dpaa2_eth_needed_headroom(priv, NULL);
++ 	if (xdpf->headroom < needed_headroom)
++ 		return -EINVAL;
++ 
++ 	percpu_stats = this_cpu_ptr(priv->percpu_stats);
++ 	percpu_extras = this_cpu_ptr(priv->percpu_extras);
++ 
++ 	/* Setup the FD fields */
++ 	memset(&fd, 0, sizeof(fd));
++ 
++ 	/* Align FD address, if possible */
++ 	buffer_start = xdpf->data - needed_headroom;
++ 	aligned_start = PTR_ALIGN(buffer_start - DPAA2_ETH_TX_BUF_ALIGN,
++ 				  DPAA2_ETH_TX_BUF_ALIGN);
++ 	if (aligned_start >= xdpf->data - xdpf->headroom)
++ 		buffer_start = aligned_start;
++ 
++ 	swa = (struct dpaa2_eth_swa *)buffer_start;
++ 	/* fill in necessary fields here */
++ 	swa->type = DPAA2_ETH_SWA_XDP;
++ 	swa->xdp.dma_size = xdpf->data + xdpf->len - buffer_start;
++ 	swa->xdp.xdpf = xdpf;
++ 
++ 	addr = dma_map_single(dev, buffer_start,
++ 			      swa->xdp.dma_size,
++ 			      DMA_BIDIRECTIONAL);
++ 	if (unlikely(dma_mapping_error(dev, addr))) {
++ 		percpu_stats->tx_dropped++;
++ 		return -ENOMEM;
++ 	}
++ 
++ 	dpaa2_fd_set_addr(&fd, addr);
++ 	dpaa2_fd_set_offset(&fd, xdpf->data - buffer_start);
++ 	dpaa2_fd_set_len(&fd, xdpf->len);
++ 	dpaa2_fd_set_format(&fd, dpaa2_fd_single);
++ 	dpaa2_fd_set_ctrl(&fd, FD_CTRL_PTA);
++ 
++ 	fq = &priv->fq[smp_processor_id() % dpaa2_eth_queue_count(priv)];
++ 	for (i = 0; i < DPAA2_ETH_ENQUEUE_RETRIES; i++) {
++ 		err = priv->enqueue(priv, fq, &fd, 0);
++ 		if (err != -EBUSY)
++ 			break;
++ 	}
++ 	percpu_extras->tx_portal_busy += i;
++ 	if (unlikely(err < 0)) {
++ 		percpu_stats->tx_errors++;
++ 		/* let the Rx device handle the cleanup */
++ 		return err;
++ 	}
++ 
++ 	percpu_stats->tx_packets++;
++ 	percpu_stats->tx_bytes += dpaa2_fd_get_len(&fd);
++ 
++ 	return 0;
++ }
++ 
++ static int dpaa2_eth_xdp_xmit(struct net_device *net_dev, int n,
++ 			      struct xdp_frame **frames, u32 flags)
++ {
++ 	int drops = 0;
++ 	int i, err;
++ 
++ 	if (unlikely(flags & ~XDP_XMIT_FLAGS_MASK))
++ 		return -EINVAL;
++ 
++ 	if (!netif_running(net_dev))
++ 		return -ENETDOWN;
++ 
++ 	for (i = 0; i < n; i++) {
++ 		struct xdp_frame *xdpf = frames[i];
++ 
++ 		err = dpaa2_eth_xdp_xmit_frame(net_dev, xdpf);
++ 		if (err) {
++ 			xdp_return_frame_rx_napi(xdpf);
++ 			drops++;
++ 		}
++ 	}
++ 
++ 	return n - drops;
++ }
++ 
++ static int update_xps(struct dpaa2_eth_priv *priv)
++ {
++ 	struct net_device *net_dev = priv->net_dev;
++ 	struct cpumask xps_mask;
++ 	struct dpaa2_eth_fq *fq;
++ 	int i, num_queues, netdev_queues;
++ 	int err = 0;
++ 
++ 	num_queues = dpaa2_eth_queue_count(priv);
++ 	netdev_queues = (net_dev->num_tc ? : 1) * num_queues;
++ 
++ 	/* The first <num_queues> entries in priv->fq array are Tx/Tx conf
++ 	 * queues, so only process those
++ 	 */
++ 	for (i = 0; i < netdev_queues; i++) {
++ 		fq = &priv->fq[i % num_queues];
++ 
++ 		cpumask_clear(&xps_mask);
++ 		cpumask_set_cpu(fq->target_cpu, &xps_mask);
++ 
++ 		err = netif_set_xps_queue(net_dev, &xps_mask, i);
++ 		if (err) {
++ 			netdev_warn_once(net_dev, "Error setting XPS queue\n");
++ 			break;
++ 		}
++ 	}
++ 
++ 	return err;
++ }
++ 
++ static int dpaa2_eth_setup_tc(struct net_device *net_dev,
++ 			      enum tc_setup_type type, void *type_data)
++ {
++ 	struct dpaa2_eth_priv *priv = netdev_priv(net_dev);
++ 	struct tc_mqprio_qopt *mqprio = type_data;
++ 	u8 num_tc, num_queues;
++ 	int i;
++ 
++ 	if (type != TC_SETUP_QDISC_MQPRIO)
++ 		return -EINVAL;
++ 
++ 	mqprio->hw = TC_MQPRIO_HW_OFFLOAD_TCS;
++ 	num_queues = dpaa2_eth_queue_count(priv);
++ 	num_tc = mqprio->num_tc;
++ 
++ 	if (num_tc == net_dev->num_tc)
++ 		return 0;
++ 
++ 	if (num_tc  > dpaa2_eth_tc_count(priv)) {
++ 		netdev_err(net_dev, "Max %d traffic classes supported\n",
++ 			   dpaa2_eth_tc_count(priv));
++ 		return -EINVAL;
++ 	}
++ 
++ 	if (!num_tc) {
++ 		netdev_reset_tc(net_dev);
++ 		netif_set_real_num_tx_queues(net_dev, num_queues);
++ 		goto out;
++ 	}
++ 
++ 	netdev_set_num_tc(net_dev, num_tc);
++ 	netif_set_real_num_tx_queues(net_dev, num_tc * num_queues);
++ 
++ 	for (i = 0; i < num_tc; i++)
++ 		netdev_set_tc_queue(net_dev, i, num_queues, i * num_queues);
++ 
++ out:
++ 	update_xps(priv);
++ 
++ 	return 0;
++ }
++ 
+++>>>>>>> 85192dbf4de0 (bpf: Convert bpf_prog refcnt to atomic64_t):drivers/net/ethernet/freescale/dpaa2/dpaa2-eth.c
+  static const struct net_device_ops dpaa2_eth_ops = {
+  	.ndo_open = dpaa2_eth_open,
+  	.ndo_start_xmit = dpaa2_eth_tx,
+diff --cc kernel/bpf/syscall.c
+index dd68cbc967e7,52fe4bacb330..000000000000
+--- a/kernel/bpf/syscall.c
++++ b/kernel/bpf/syscall.c
+@@@ -1409,9 -1339,8 +1409,9 @@@ static void __bpf_prog_put_noref(struc
+  
+  static void __bpf_prog_put(struct bpf_prog *prog, bool do_idr_lock)
+  {
+- 	if (atomic_dec_and_test(&prog->aux->refcnt)) {
++ 	if (atomic64_dec_and_test(&prog->aux->refcnt)) {
+  		perf_event_bpf_event(prog, PERF_BPF_EVENT_PROG_UNLOAD, 0);
+ +		bpf_audit_prog(prog, BPF_AUDIT_UNLOAD);
+  		/* bpf_prog_free_id() must be called first */
+  		bpf_prog_free_id(prog, do_idr_lock);
+  		__bpf_prog_put_noref(prog, true);
+@@@ -1516,13 -1445,9 +1516,13 @@@ static struct bpf_prog *____bpf_prog_ge
+  	return f.file->private_data;
+  }
+  
+++<<<<<<< HEAD
+ +struct bpf_prog *bpf_prog_add(struct bpf_prog *prog, int i)
+++=======
++ void bpf_prog_add(struct bpf_prog *prog, int i)
+++>>>>>>> 85192dbf4de0 (bpf: Convert bpf_prog refcnt to atomic64_t)
+  {
+- 	if (atomic_add_return(i, &prog->aux->refcnt) > BPF_MAX_REFCNT) {
+- 		atomic_sub(i, &prog->aux->refcnt);
+- 		return ERR_PTR(-EBUSY);
+- 	}
+- 	return prog;
++ 	atomic64_add(i, &prog->aux->refcnt);
+  }
+  EXPORT_SYMBOL_GPL(bpf_prog_add);
+  
+@@@ -1548,12 -1473,7 +1548,16 @@@ struct bpf_prog *bpf_prog_inc_not_zero(
+  {
+  	int refold;
+  
+++<<<<<<< HEAD
+ +	refold = __atomic_add_unless(&prog->aux->refcnt, 1, 0);
+ +
+ +	if (refold >= BPF_MAX_REFCNT) {
+ +		__bpf_prog_put(prog, false);
+ +		return ERR_PTR(-EBUSY);
+ +	}
+++=======
++ 	refold = atomic64_fetch_add_unless(&prog->aux->refcnt, 1, 0);
+++>>>>>>> 85192dbf4de0 (bpf: Convert bpf_prog refcnt to atomic64_t)
+  
+  	if (!refold)
+  		return ERR_PTR(-ENOENT);
+diff --git a/drivers/net/ethernet/broadcom/bnxt/bnxt.c b/drivers/net/ethernet/broadcom/bnxt/bnxt.c
+index f0c5e8e2615a..f69bd51754a0 100644
+--- a/drivers/net/ethernet/broadcom/bnxt/bnxt.c
++++ b/drivers/net/ethernet/broadcom/bnxt/bnxt.c
+@@ -3181,13 +3181,8 @@ static int bnxt_init_one_rx_ring(struct bnxt *bp, int ring_nr)
+ 	bnxt_init_rxbd_pages(ring, type);
+ 
+ 	if (BNXT_RX_PAGE_MODE(bp) && bp->xdp_prog) {
+-		rxr->xdp_prog = bpf_prog_add(bp->xdp_prog, 1);
+-		if (IS_ERR(rxr->xdp_prog)) {
+-			int rc = PTR_ERR(rxr->xdp_prog);
+-
+-			rxr->xdp_prog = NULL;
+-			return rc;
+-		}
++		bpf_prog_add(bp->xdp_prog, 1);
++		rxr->xdp_prog = bp->xdp_prog;
+ 	}
+ 	prod = rxr->rx_prod;
+ 	for (i = 0; i < bp->rx_ring_size; i++) {
+diff --git a/drivers/net/ethernet/cavium/thunder/nicvf_main.c b/drivers/net/ethernet/cavium/thunder/nicvf_main.c
+index 28eac9056211..c499b14d86e1 100644
+--- a/drivers/net/ethernet/cavium/thunder/nicvf_main.c
++++ b/drivers/net/ethernet/cavium/thunder/nicvf_main.c
+@@ -1861,13 +1861,8 @@ static int nicvf_xdp_setup(struct nicvf *nic, struct bpf_prog *prog)
+ 
+ 	if (nic->xdp_prog) {
+ 		/* Attach BPF program */
+-		nic->xdp_prog = bpf_prog_add(nic->xdp_prog, nic->rx_queues - 1);
+-		if (!IS_ERR(nic->xdp_prog)) {
+-			bpf_attached = true;
+-		} else {
+-			ret = PTR_ERR(nic->xdp_prog);
+-			nic->xdp_prog = NULL;
+-		}
++		bpf_prog_add(nic->xdp_prog, nic->rx_queues - 1);
++		bpf_attached = true;
+ 	}
+ 
+ 	/* Calculate Tx queues needed for XDP and network stack */
+diff --git a/drivers/net/ethernet/mellanox/mlx4/en_netdev.c b/drivers/net/ethernet/mellanox/mlx4/en_netdev.c
+index 200463bd7173..f52788d13213 100644
+--- a/drivers/net/ethernet/mellanox/mlx4/en_netdev.c
++++ b/drivers/net/ethernet/mellanox/mlx4/en_netdev.c
+@@ -2290,11 +2290,7 @@ int mlx4_en_try_alloc_resources(struct mlx4_en_priv *priv,
+ 		lockdep_is_held(&priv->mdev->state_lock));
+ 
+ 	if (xdp_prog && carry_xdp_prog) {
+-		xdp_prog = bpf_prog_add(xdp_prog, tmp->rx_ring_num);
+-		if (IS_ERR(xdp_prog)) {
+-			mlx4_en_free_resources(tmp);
+-			return PTR_ERR(xdp_prog);
+-		}
++		bpf_prog_add(xdp_prog, tmp->rx_ring_num);
+ 		for (i = 0; i < tmp->rx_ring_num; i++)
+ 			rcu_assign_pointer(tmp->rx_ring[i]->xdp_prog,
+ 					   xdp_prog);
+@@ -2786,11 +2782,9 @@ static int mlx4_xdp_set(struct net_device *dev, struct bpf_prog *prog)
+ 	 * program for a new one.
+ 	 */
+ 	if (priv->tx_ring_num[TX_XDP] == xdp_ring_num) {
+-		if (prog) {
+-			prog = bpf_prog_add(prog, priv->rx_ring_num - 1);
+-			if (IS_ERR(prog))
+-				return PTR_ERR(prog);
+-		}
++		if (prog)
++			bpf_prog_add(prog, priv->rx_ring_num - 1);
++
+ 		mutex_lock(&mdev->state_lock);
+ 		for (i = 0; i < priv->rx_ring_num; i++) {
+ 			old_prog = rcu_dereference_protected(
+@@ -2811,13 +2805,8 @@ static int mlx4_xdp_set(struct net_device *dev, struct bpf_prog *prog)
+ 	if (!tmp)
+ 		return -ENOMEM;
+ 
+-	if (prog) {
+-		prog = bpf_prog_add(prog, priv->rx_ring_num - 1);
+-		if (IS_ERR(prog)) {
+-			err = PTR_ERR(prog);
+-			goto out;
+-		}
+-	}
++	if (prog)
++		bpf_prog_add(prog, priv->rx_ring_num - 1);
+ 
+ 	mutex_lock(&mdev->state_lock);
+ 	memcpy(&new_prof, priv->prof, sizeof(struct mlx4_en_port_profile));
+@@ -2866,7 +2855,6 @@ static int mlx4_xdp_set(struct net_device *dev, struct bpf_prog *prog)
+ 
+ unlock_out:
+ 	mutex_unlock(&mdev->state_lock);
+-out:
+ 	kfree(tmp);
+ 	return err;
+ }
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/en_main.c b/drivers/net/ethernet/mellanox/mlx5/core/en_main.c
+index ea998980a21e..970b140a5b93 100644
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_main.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_main.c
+@@ -410,12 +410,9 @@ static int mlx5e_alloc_rq(struct mlx5e_channel *c,
+ 	else
+ 		rq->stats = &c->priv->channel_stats[c->ix].rq;
+ 
+-	rq->xdp_prog = params->xdp_prog ? bpf_prog_inc(params->xdp_prog) : NULL;
+-	if (IS_ERR(rq->xdp_prog)) {
+-		err = PTR_ERR(rq->xdp_prog);
+-		rq->xdp_prog = NULL;
+-		goto err_rq_wq_destroy;
+-	}
++	if (params->xdp_prog)
++		bpf_prog_inc(params->xdp_prog);
++	rq->xdp_prog = params->xdp_prog;
+ 
+ 	rq_xdp_ix = rq->ix;
+ 	if (xsk)
+@@ -4418,16 +4415,11 @@ static int mlx5e_xdp_set(struct net_device *netdev, struct bpf_prog *prog)
+ 	/* no need for full reset when exchanging programs */
+ 	reset = (!priv->channels.params.xdp_prog || !prog);
+ 
+-	if (was_opened && !reset) {
++	if (was_opened && !reset)
+ 		/* num_channels is invariant here, so we can take the
+ 		 * batched reference right upfront.
+ 		 */
+-		prog = bpf_prog_add(prog, priv->channels.num);
+-		if (IS_ERR(prog)) {
+-			err = PTR_ERR(prog);
+-			goto unlock;
+-		}
+-	}
++		bpf_prog_add(prog, priv->channels.num);
+ 
+ 	if (was_opened && reset) {
+ 		struct mlx5e_channels new_channels = {};
+diff --git a/drivers/net/ethernet/qlogic/qede/qede_main.c b/drivers/net/ethernet/qlogic/qede/qede_main.c
+index ba53612ae0df..34fa3917eb33 100644
+--- a/drivers/net/ethernet/qlogic/qede/qede_main.c
++++ b/drivers/net/ethernet/qlogic/qede/qede_main.c
+@@ -2115,12 +2115,8 @@ static int qede_start_queues(struct qede_dev *edev, bool clear_stats)
+ 			if (rc)
+ 				goto out;
+ 
+-			fp->rxq->xdp_prog = bpf_prog_add(edev->xdp_prog, 1);
+-			if (IS_ERR(fp->rxq->xdp_prog)) {
+-				rc = PTR_ERR(fp->rxq->xdp_prog);
+-				fp->rxq->xdp_prog = NULL;
+-				goto out;
+-			}
++			bpf_prog_add(edev->xdp_prog, 1);
++			fp->rxq->xdp_prog = edev->xdp_prog;
+ 		}
+ 
+ 		if (fp->type & QEDE_FASTPATH_TX) {
+* Unmerged path drivers/net/virtio_net.c
+* Unmerged path drivers/staging/fsl-dpaa2/ethernet/dpaa2-eth.c
+diff --git a/include/linux/bpf.h b/include/linux/bpf.h
+index a5585413dfbe..261b6505e17d 100644
+--- a/include/linux/bpf.h
++++ b/include/linux/bpf.h
+@@ -390,7 +390,7 @@ struct bpf_prog_stats {
+ } __aligned(2 * sizeof(u64));
+ 
+ struct bpf_prog_aux {
+-	atomic_t refcnt;
++	atomic64_t refcnt;
+ 	u32 used_map_cnt;
+ 	u32 max_ctx_offset;
+ 	/* not protected by KABI, safe to extend in the middle */
+@@ -667,9 +667,9 @@ extern const struct bpf_verifier_ops xdp_analyzer_ops;
+ struct bpf_prog *bpf_prog_get(u32 ufd);
+ struct bpf_prog *bpf_prog_get_type_dev(u32 ufd, enum bpf_prog_type type,
+ 				       bool attach_drv);
+-struct bpf_prog * __must_check bpf_prog_add(struct bpf_prog *prog, int i);
++void bpf_prog_add(struct bpf_prog *prog, int i);
+ void bpf_prog_sub(struct bpf_prog *prog, int i);
+-struct bpf_prog * __must_check bpf_prog_inc(struct bpf_prog *prog);
++void bpf_prog_inc(struct bpf_prog *prog);
+ struct bpf_prog * __must_check bpf_prog_inc_not_zero(struct bpf_prog *prog);
+ void bpf_prog_put(struct bpf_prog *prog);
+ int __bpf_prog_charge(struct user_struct *user, u32 pages);
+@@ -798,10 +798,8 @@ static inline struct bpf_prog *bpf_prog_get_type_dev(u32 ufd,
+ 	return ERR_PTR(-EOPNOTSUPP);
+ }
+ 
+-static inline struct bpf_prog * __must_check bpf_prog_add(struct bpf_prog *prog,
+-							  int i)
++static inline void bpf_prog_add(struct bpf_prog *prog, int i)
+ {
+-	return ERR_PTR(-EOPNOTSUPP);
+ }
+ 
+ static inline void bpf_prog_sub(struct bpf_prog *prog, int i)
+@@ -812,9 +810,8 @@ static inline void bpf_prog_put(struct bpf_prog *prog)
+ {
+ }
+ 
+-static inline struct bpf_prog * __must_check bpf_prog_inc(struct bpf_prog *prog)
++static inline void bpf_prog_inc(struct bpf_prog *prog)
+ {
+-	return ERR_PTR(-EOPNOTSUPP);
+ }
+ 
+ static inline struct bpf_prog *__must_check
+diff --git a/kernel/bpf/inode.c b/kernel/bpf/inode.c
+index dc9d7ac8228d..6e107821135a 100644
+--- a/kernel/bpf/inode.c
++++ b/kernel/bpf/inode.c
+@@ -33,7 +33,7 @@ static void *bpf_any_get(void *raw, enum bpf_type type)
+ {
+ 	switch (type) {
+ 	case BPF_TYPE_PROG:
+-		raw = bpf_prog_inc(raw);
++		bpf_prog_inc(raw);
+ 		break;
+ 	case BPF_TYPE_MAP:
+ 		raw = bpf_map_inc(raw, true);
+@@ -536,7 +536,8 @@ static struct bpf_prog *__get_prog_inode(struct inode *inode, enum bpf_prog_type
+ 	if (!bpf_prog_get_ok(prog, &type, false))
+ 		return ERR_PTR(-EINVAL);
+ 
+-	return bpf_prog_inc(prog);
++	bpf_prog_inc(prog);
++	return prog;
+ }
+ 
+ struct bpf_prog *bpf_prog_get_type_path(const char *name, enum bpf_prog_type type)
+* Unmerged path kernel/bpf/syscall.c
+diff --git a/kernel/events/core.c b/kernel/events/core.c
+index 186b371d7069..e7c7881d3949 100644
+--- a/kernel/events/core.c
++++ b/kernel/events/core.c
+@@ -10716,12 +10716,9 @@ perf_event_alloc(struct perf_event_attr *attr, int cpu,
+ 		context = parent_event->overflow_handler_context;
+ #if defined(CONFIG_BPF_SYSCALL) && defined(CONFIG_EVENT_TRACING)
+ 		if (overflow_handler == bpf_overflow_handler) {
+-			struct bpf_prog *prog = bpf_prog_inc(parent_event->prog);
++			struct bpf_prog *prog = parent_event->prog;
+ 
+-			if (IS_ERR(prog)) {
+-				err = PTR_ERR(prog);
+-				goto err_ns;
+-			}
++			bpf_prog_inc(prog);
+ 			event->prog = prog;
+ 			event->orig_overflow_handler =
+ 				parent_event->orig_overflow_handler;
