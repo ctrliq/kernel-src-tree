@@ -80,7 +80,7 @@ struct evlist *evlist__new(void)
 	return evlist;
 }
 
-struct evlist *perf_evlist__new_default(void)
+struct evlist *evlist__new_default(void)
 {
 	struct evlist *evlist = evlist__new();
 
@@ -92,7 +92,7 @@ struct evlist *perf_evlist__new_default(void)
 	return evlist;
 }
 
-struct evlist *perf_evlist__new_dummy(void)
+struct evlist *evlist__new_dummy(void)
 {
 	struct evlist *evlist = evlist__new();
 
