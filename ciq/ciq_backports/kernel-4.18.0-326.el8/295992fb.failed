@@ -1,0 +1,291 @@
+mm: introduce vma_set_file function v5
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-326.el8
+commit-author Christian König <christian.koenig@amd.com>
+commit 295992fb815e791d14b18ef7cdbbaf1a76211a31
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-326.el8/295992fb.failed
+
+Add the new vma_set_file() function to allow changing
+vma->vm_file with the necessary refcount dance.
+
+v2: add more users of this.
+v3: add missing EXPORT_SYMBOL, rebase on mmap cleanup,
+    add comments why we drop the reference on two occasions.
+v4: make it clear that changing an anonymous vma is illegal.
+v5: move vma_set_file to mm/util.c
+
+	Signed-off-by: Christian König <christian.koenig@amd.com>
+	Reviewed-by: Daniel Vetter <daniel.vetter@ffwll.ch> (v2)
+	Reviewed-by: Jason Gunthorpe <jgg@nvidia.com>
+	Acked-by: Andrew Morton <akpm@linux-foundation.org>
+Link: https://patchwork.freedesktop.org/patch/399360/
+(cherry picked from commit 295992fb815e791d14b18ef7cdbbaf1a76211a31)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	mm/util.c
+diff --cc mm/util.c
+index faad48f14add,8c9b7d1e7c49..000000000000
+--- a/mm/util.c
++++ b/mm/util.c
+@@@ -292,7 -311,117 +292,121 @@@ int vma_is_stack_for_current(struct vm_
+  	return (vma->vm_start <= KSTK_ESP(t) && vma->vm_end >= KSTK_ESP(t));
+  }
+  
+++<<<<<<< HEAD
+ +#if defined(CONFIG_MMU) && !defined(HAVE_ARCH_PICK_MMAP_LAYOUT)
+++=======
++ /*
++  * Change backing file, only valid to use during initial VMA setup.
++  */
++ void vma_set_file(struct vm_area_struct *vma, struct file *file)
++ {
++ 	/* Changing an anonymous vma with this is illegal */
++ 	get_file(file);
++ 	swap(vma->vm_file, file);
++ 	fput(file);
++ }
++ EXPORT_SYMBOL(vma_set_file);
++ 
++ #ifndef STACK_RND_MASK
++ #define STACK_RND_MASK (0x7ff >> (PAGE_SHIFT - 12))     /* 8MB of VA */
++ #endif
++ 
++ unsigned long randomize_stack_top(unsigned long stack_top)
++ {
++ 	unsigned long random_variable = 0;
++ 
++ 	if (current->flags & PF_RANDOMIZE) {
++ 		random_variable = get_random_long();
++ 		random_variable &= STACK_RND_MASK;
++ 		random_variable <<= PAGE_SHIFT;
++ 	}
++ #ifdef CONFIG_STACK_GROWSUP
++ 	return PAGE_ALIGN(stack_top) + random_variable;
++ #else
++ 	return PAGE_ALIGN(stack_top) - random_variable;
++ #endif
++ }
++ 
++ #ifdef CONFIG_ARCH_WANT_DEFAULT_TOPDOWN_MMAP_LAYOUT
++ unsigned long arch_randomize_brk(struct mm_struct *mm)
++ {
++ 	/* Is the current task 32bit ? */
++ 	if (!IS_ENABLED(CONFIG_64BIT) || is_compat_task())
++ 		return randomize_page(mm->brk, SZ_32M);
++ 
++ 	return randomize_page(mm->brk, SZ_1G);
++ }
++ 
++ unsigned long arch_mmap_rnd(void)
++ {
++ 	unsigned long rnd;
++ 
++ #ifdef CONFIG_HAVE_ARCH_MMAP_RND_COMPAT_BITS
++ 	if (is_compat_task())
++ 		rnd = get_random_long() & ((1UL << mmap_rnd_compat_bits) - 1);
++ 	else
++ #endif /* CONFIG_HAVE_ARCH_MMAP_RND_COMPAT_BITS */
++ 		rnd = get_random_long() & ((1UL << mmap_rnd_bits) - 1);
++ 
++ 	return rnd << PAGE_SHIFT;
++ }
++ 
++ static int mmap_is_legacy(struct rlimit *rlim_stack)
++ {
++ 	if (current->personality & ADDR_COMPAT_LAYOUT)
++ 		return 1;
++ 
++ 	if (rlim_stack->rlim_cur == RLIM_INFINITY)
++ 		return 1;
++ 
++ 	return sysctl_legacy_va_layout;
++ }
++ 
++ /*
++  * Leave enough space between the mmap area and the stack to honour ulimit in
++  * the face of randomisation.
++  */
++ #define MIN_GAP		(SZ_128M)
++ #define MAX_GAP		(STACK_TOP / 6 * 5)
++ 
++ static unsigned long mmap_base(unsigned long rnd, struct rlimit *rlim_stack)
++ {
++ 	unsigned long gap = rlim_stack->rlim_cur;
++ 	unsigned long pad = stack_guard_gap;
++ 
++ 	/* Account for stack randomization if necessary */
++ 	if (current->flags & PF_RANDOMIZE)
++ 		pad += (STACK_RND_MASK << PAGE_SHIFT);
++ 
++ 	/* Values close to RLIM_INFINITY can overflow. */
++ 	if (gap + pad > gap)
++ 		gap += pad;
++ 
++ 	if (gap < MIN_GAP)
++ 		gap = MIN_GAP;
++ 	else if (gap > MAX_GAP)
++ 		gap = MAX_GAP;
++ 
++ 	return PAGE_ALIGN(STACK_TOP - gap - rnd);
++ }
++ 
++ void arch_pick_mmap_layout(struct mm_struct *mm, struct rlimit *rlim_stack)
++ {
++ 	unsigned long random_factor = 0UL;
++ 
++ 	if (current->flags & PF_RANDOMIZE)
++ 		random_factor = arch_mmap_rnd();
++ 
++ 	if (mmap_is_legacy(rlim_stack)) {
++ 		mm->mmap_base = TASK_UNMAPPED_BASE + random_factor;
++ 		mm->get_unmapped_area = arch_get_unmapped_area;
++ 	} else {
++ 		mm->mmap_base = mmap_base(random_factor, rlim_stack);
++ 		mm->get_unmapped_area = arch_get_unmapped_area_topdown;
++ 	}
++ }
++ #elif defined(CONFIG_MMU) && !defined(HAVE_ARCH_PICK_MMAP_LAYOUT)
+++>>>>>>> 295992fb815e (mm: introduce vma_set_file function v5)
+  void arch_pick_mmap_layout(struct mm_struct *mm, struct rlimit *rlim_stack)
+  {
+  	mm->mmap_base = TASK_UNMAPPED_BASE;
+diff --git a/drivers/dma-buf/dma-buf.c b/drivers/dma-buf/dma-buf.c
+index 8759086e1087..c3d843f563d3 100644
+--- a/drivers/dma-buf/dma-buf.c
++++ b/drivers/dma-buf/dma-buf.c
+@@ -1162,8 +1162,7 @@ int dma_buf_mmap(struct dma_buf *dmabuf, struct vm_area_struct *vma,
+ 		return -EINVAL;
+ 
+ 	/* readjust the vma */
+-	fput(vma->vm_file);
+-	vma->vm_file = get_file(dmabuf->file);
++	vma_set_file(vma, dmabuf->file);
+ 	vma->vm_pgoff = pgoff;
+ 
+ 	return dmabuf->ops->mmap(dmabuf, vma);
+diff --git a/drivers/gpu/drm/etnaviv/etnaviv_gem.c b/drivers/gpu/drm/etnaviv/etnaviv_gem.c
+index ba55618bef21..00a8d81176d3 100644
+--- a/drivers/gpu/drm/etnaviv/etnaviv_gem.c
++++ b/drivers/gpu/drm/etnaviv/etnaviv_gem.c
+@@ -144,10 +144,8 @@ static int etnaviv_gem_mmap_obj(struct etnaviv_gem_object *etnaviv_obj,
+ 		 * address_space (so unmap_mapping_range does what we want,
+ 		 * in particular in the case of mmap'd dmabufs)
+ 		 */
+-		fput(vma->vm_file);
+-		get_file(etnaviv_obj->base.filp);
+ 		vma->vm_pgoff = 0;
+-		vma->vm_file  = etnaviv_obj->base.filp;
++		vma_set_file(vma, etnaviv_obj->base.filp);
+ 
+ 		vma->vm_page_prot = vm_page_prot;
+ 	}
+diff --git a/drivers/gpu/drm/i915/gem/i915_gem_dmabuf.c b/drivers/gpu/drm/i915/gem/i915_gem_dmabuf.c
+index 2679380159fc..fe90bebd8023 100644
+--- a/drivers/gpu/drm/i915/gem/i915_gem_dmabuf.c
++++ b/drivers/gpu/drm/i915/gem/i915_gem_dmabuf.c
+@@ -112,8 +112,7 @@ static int i915_gem_dmabuf_mmap(struct dma_buf *dma_buf, struct vm_area_struct *
+ 	if (ret)
+ 		return ret;
+ 
+-	fput(vma->vm_file);
+-	vma->vm_file = get_file(obj->base.filp);
++	vma_set_file(vma, obj->base.filp);
+ 
+ 	return 0;
+ }
+diff --git a/drivers/gpu/drm/i915/gem/i915_gem_mman.c b/drivers/gpu/drm/i915/gem/i915_gem_mman.c
+index 753f82d87a31..3a6f1b85fa4d 100644
+--- a/drivers/gpu/drm/i915/gem/i915_gem_mman.c
++++ b/drivers/gpu/drm/i915/gem/i915_gem_mman.c
+@@ -878,8 +878,9 @@ int i915_gem_mmap(struct file *filp, struct vm_area_struct *vma)
+ 	 * requires avoiding extraneous references to their filp, hence why
+ 	 * we prefer to use an anonymous file for their mmaps.
+ 	 */
+-	fput(vma->vm_file);
+-	vma->vm_file = anon;
++	vma_set_file(vma, anon);
++	/* Drop the initial creation reference, the vma is now holding one. */
++	fput(anon);
+ 
+ 	switch (mmo->mmap_type) {
+ 	case I915_MMAP_TYPE_WC:
+diff --git a/drivers/gpu/drm/msm/msm_gem.c b/drivers/gpu/drm/msm/msm_gem.c
+index 7a1d9f26e64c..50b04ddb11b3 100644
+--- a/drivers/gpu/drm/msm/msm_gem.c
++++ b/drivers/gpu/drm/msm/msm_gem.c
+@@ -195,10 +195,8 @@ int msm_gem_mmap_obj(struct drm_gem_object *obj,
+ 		 * address_space (so unmap_mapping_range does what we want,
+ 		 * in particular in the case of mmap'd dmabufs)
+ 		 */
+-		fput(vma->vm_file);
+-		get_file(obj->filp);
+ 		vma->vm_pgoff = 0;
+-		vma->vm_file  = obj->filp;
++		vma_set_file(vma, obj->filp);
+ 
+ 		vma->vm_page_prot = vm_get_page_prot(vma->vm_flags);
+ 	}
+diff --git a/drivers/gpu/drm/omapdrm/omap_gem.c b/drivers/gpu/drm/omapdrm/omap_gem.c
+index 17a53d207978..b4d05da33c60 100644
+--- a/drivers/gpu/drm/omapdrm/omap_gem.c
++++ b/drivers/gpu/drm/omapdrm/omap_gem.c
+@@ -599,9 +599,8 @@ int omap_gem_mmap_obj(struct drm_gem_object *obj,
+ 		 * address_space (so unmap_mapping_range does what we want,
+ 		 * in particular in the case of mmap'd dmabufs)
+ 		 */
+-		fput(vma->vm_file);
+ 		vma->vm_pgoff = 0;
+-		vma->vm_file  = get_file(obj->filp);
++		vma_set_file(vma, obj->filp);
+ 
+ 		vma->vm_page_prot = vm_get_page_prot(vma->vm_flags);
+ 	}
+diff --git a/drivers/gpu/drm/vgem/vgem_drv.c b/drivers/gpu/drm/vgem/vgem_drv.c
+index 15dd41e67de3..096391aff9be 100644
+--- a/drivers/gpu/drm/vgem/vgem_drv.c
++++ b/drivers/gpu/drm/vgem/vgem_drv.c
+@@ -393,8 +393,7 @@ static int vgem_prime_mmap(struct drm_gem_object *obj,
+ 	if (ret)
+ 		return ret;
+ 
+-	fput(vma->vm_file);
+-	vma->vm_file = get_file(obj->filp);
++	vma_set_file(vma, obj->filp);
+ 	vma->vm_flags |= VM_DONTEXPAND | VM_DONTDUMP;
+ 	vma->vm_page_prot = pgprot_writecombine(vm_get_page_prot(vma->vm_flags));
+ 
+diff --git a/drivers/staging/android/ashmem.c b/drivers/staging/android/ashmem.c
+index d5d33e12e952..6784d30e573f 100644
+--- a/drivers/staging/android/ashmem.c
++++ b/drivers/staging/android/ashmem.c
+@@ -406,9 +406,9 @@ static int ashmem_mmap(struct file *file, struct vm_area_struct *vma)
+ 		vma_set_anonymous(vma);
+ 	}
+ 
+-	if (vma->vm_file)
+-		fput(vma->vm_file);
+-	vma->vm_file = asma->file;
++	vma_set_file(vma, asma->file);
++	/* XXX: merge this with the get_file() above if possible */
++	fput(asma->file);
+ 
+ out:
+ 	mutex_unlock(&ashmem_mutex);
+diff --git a/include/linux/mm.h b/include/linux/mm.h
+index f18b64e4a6b0..98968ed30a88 100644
+--- a/include/linux/mm.h
++++ b/include/linux/mm.h
+@@ -2639,6 +2639,8 @@ static inline void vma_set_page_prot(struct vm_area_struct *vma)
+ }
+ #endif
+ 
++void vma_set_file(struct vm_area_struct *vma, struct file *file);
++
+ #ifdef CONFIG_NUMA_BALANCING
+ unsigned long change_prot_numa(struct vm_area_struct *vma,
+ 			unsigned long start, unsigned long end);
+* Unmerged path mm/util.c
