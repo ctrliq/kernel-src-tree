@@ -1,0 +1,1092 @@
+netfilter: nat: remove l4proto->manip_pkt
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Florian Westphal <fw@strlen.de>
+commit faec18dbb0405c7d4dda025054511dc3a6696918
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/faec18db.failed
+
+This removes the last l4proto indirection, the two callers, the l3proto
+packet mangling helpers for ipv4 and ipv6, now call the
+nf_nat_l4proto_manip_pkt() helper.
+
+nf_nat_proto_{dccp,tcp,sctp,gre,icmp,icmpv6} are left behind, even though
+they contain no functionality anymore to not clutter this patch.
+
+Next patch will remove the empty files and the nf_nat_l4proto
+struct.
+
+nf_nat_proto_udp.c is renamed to nf_nat_proto.c, as it now contains the
+other nat manip functionality as well, not just udp and udplite.
+
+	Signed-off-by: Florian Westphal <fw@strlen.de>
+	Signed-off-by: Pablo Neira Ayuso <pablo@netfilter.org>
+(cherry picked from commit faec18dbb0405c7d4dda025054511dc3a6696918)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/net/netfilter/nf_nat_l4proto.h
+#	net/ipv4/netfilter/nf_nat_proto_gre.c
+#	net/ipv4/netfilter/nf_nat_proto_icmp.c
+#	net/ipv6/netfilter/nf_nat_proto_icmpv6.c
+#	net/netfilter/Makefile
+#	net/netfilter/nf_nat_proto_dccp.c
+#	net/netfilter/nf_nat_proto_sctp.c
+#	net/netfilter/nf_nat_proto_tcp.c
+#	net/netfilter/nf_nat_proto_udp.c
+#	net/netfilter/nf_nat_proto_unknown.c
+diff --cc include/net/netfilter/nf_nat_l4proto.h
+index 7ecac2cd1020,7b57bd302107..000000000000
+--- a/include/net/netfilter/nf_nat_l4proto.h
++++ b/include/net/netfilter/nf_nat_l4proto.h
+@@@ -12,34 -12,6 +12,37 @@@ struct nf_nat_l4proto 
+  	/* Protocol number. */
+  	u8 l4proto;
+  
+++<<<<<<< HEAD
+ +	/* Translate a packet to the target according to manip type.
+ +	 * Return true if succeeded.
+ +	 */
+ +	bool (*manip_pkt)(struct sk_buff *skb,
+ +			  const struct nf_nat_l3proto *l3proto,
+ +			  unsigned int iphdroff, unsigned int hdroff,
+ +			  const struct nf_conntrack_tuple *tuple,
+ +			  enum nf_nat_manip_type maniptype);
+ +
+ +	/* Is the manipable part of the tuple between min and max incl? */
+ +	bool (*in_range)(const struct nf_conntrack_tuple *tuple,
+ +			 enum nf_nat_manip_type maniptype,
+ +			 const union nf_conntrack_man_proto *min,
+ +			 const union nf_conntrack_man_proto *max);
+ +
+ +	/* Alter the per-proto part of the tuple (depending on
+ +	 * maniptype), to give a unique tuple in the given range if
+ +	 * possible.  Per-protocol part of tuple is initialized to the
+ +	 * incoming packet.
+ +	 */
+ +	void (*unique_tuple)(const struct nf_nat_l3proto *l3proto,
+ +			     struct nf_conntrack_tuple *tuple,
+ +			     const struct nf_nat_range2 *range,
+ +			     enum nf_nat_manip_type maniptype,
+ +			     const struct nf_conn *ct);
+ +
+ +	int (*nlattr_to_range)(struct nlattr *tb[],
+ +			       struct nf_nat_range2 *range);
+++=======
+++>>>>>>> faec18dbb040 (netfilter: nat: remove l4proto->manip_pkt)
+  };
+  
+  /* Protocol registration. */
+diff --cc net/ipv4/netfilter/nf_nat_proto_gre.c
+index 00fda6331ce5,25849295d537..000000000000
+--- a/net/ipv4/netfilter/nf_nat_proto_gre.c
++++ b/net/ipv4/netfilter/nf_nat_proto_gre.c
+@@@ -37,97 -37,8 +37,102 @@@ MODULE_LICENSE("GPL")
+  MODULE_AUTHOR("Harald Welte <laforge@gnumonks.org>");
+  MODULE_DESCRIPTION("Netfilter NAT protocol helper module for GRE");
+  
+++<<<<<<< HEAD
+ +/* generate unique tuple ... */
+ +static void
+ +gre_unique_tuple(const struct nf_nat_l3proto *l3proto,
+ +		 struct nf_conntrack_tuple *tuple,
+ +		 const struct nf_nat_range2 *range,
+ +		 enum nf_nat_manip_type maniptype,
+ +		 const struct nf_conn *ct)
+ +{
+ +	static u_int16_t key;
+ +	__be16 *keyptr;
+ +	unsigned int min, i, range_size;
+ +
+ +	/* If there is no master conntrack we are not PPTP,
+ +	   do not change tuples */
+ +	if (!ct->master)
+ +		return;
+ +
+ +	if (maniptype == NF_NAT_MANIP_SRC)
+ +		keyptr = &tuple->src.u.gre.key;
+ +	else
+ +		keyptr = &tuple->dst.u.gre.key;
+ +
+ +	if (!(range->flags & NF_NAT_RANGE_PROTO_SPECIFIED)) {
+ +		pr_debug("%p: NATing GRE PPTP\n", ct);
+ +		min = 1;
+ +		range_size = 0xffff;
+ +	} else {
+ +		min = ntohs(range->min_proto.gre.key);
+ +		range_size = ntohs(range->max_proto.gre.key) - min + 1;
+ +	}
+ +
+ +	pr_debug("min = %u, range_size = %u\n", min, range_size);
+ +
+ +	for (i = 0; ; ++key) {
+ +		*keyptr = htons(min + key % range_size);
+ +		if (++i == range_size || !nf_nat_used_tuple(tuple, ct))
+ +			return;
+ +	}
+ +
+ +	pr_debug("%p: no NAT mapping\n", ct);
+ +	return;
+ +}
+ +
+ +/* manipulate a GRE packet according to maniptype */
+ +static bool
+ +gre_manip_pkt(struct sk_buff *skb,
+ +	      const struct nf_nat_l3proto *l3proto,
+ +	      unsigned int iphdroff, unsigned int hdroff,
+ +	      const struct nf_conntrack_tuple *tuple,
+ +	      enum nf_nat_manip_type maniptype)
+ +{
+ +	const struct gre_base_hdr *greh;
+ +	struct pptp_gre_header *pgreh;
+ +
+ +	/* pgreh includes two optional 32bit fields which are not required
+ +	 * to be there.  That's where the magic '8' comes from */
+ +	if (!skb_make_writable(skb, hdroff + sizeof(*pgreh) - 8))
+ +		return false;
+ +
+ +	greh = (void *)skb->data + hdroff;
+ +	pgreh = (struct pptp_gre_header *)greh;
+ +
+ +	/* we only have destination manip of a packet, since 'source key'
+ +	 * is not present in the packet itself */
+ +	if (maniptype != NF_NAT_MANIP_DST)
+ +		return true;
+ +
+ +	switch (greh->flags & GRE_VERSION) {
+ +	case GRE_VERSION_0:
+ +		/* We do not currently NAT any GREv0 packets.
+ +		 * Try to behave like "nf_nat_proto_unknown" */
+ +		break;
+ +	case GRE_VERSION_1:
+ +		pr_debug("call_id -> 0x%04x\n", ntohs(tuple->dst.u.gre.key));
+ +		pgreh->call_id = tuple->dst.u.gre.key;
+ +		break;
+ +	default:
+ +		pr_debug("can't nat unknown GRE version\n");
+ +		return false;
+ +	}
+ +	return true;
+ +}
+ +
+ +static const struct nf_nat_l4proto gre = {
+ +	.l4proto		= IPPROTO_GRE,
+ +	.manip_pkt		= gre_manip_pkt,
+ +	.in_range		= nf_nat_l4proto_in_range,
+ +	.unique_tuple		= gre_unique_tuple,
+ +#if IS_ENABLED(CONFIG_NF_CT_NETLINK)
+ +	.nlattr_to_range	= nf_nat_l4proto_nlattr_to_range,
+ +#endif
+++=======
++ static const struct nf_nat_l4proto gre = {
++ 	.l4proto		= IPPROTO_GRE,
+++>>>>>>> faec18dbb040 (netfilter: nat: remove l4proto->manip_pkt)
+  };
+  
+  static int __init nf_nat_proto_gre_init(void)
+diff --cc net/ipv4/netfilter/nf_nat_proto_icmp.c
+index 6d7cf1d79baf,c2b7fd1a997b..000000000000
+--- a/net/ipv4/netfilter/nf_nat_proto_icmp.c
++++ b/net/ipv4/netfilter/nf_nat_proto_icmp.c
+@@@ -17,67 -16,6 +16,72 @@@
+  #include <net/netfilter/nf_nat_core.h>
+  #include <net/netfilter/nf_nat_l4proto.h>
+  
+++<<<<<<< HEAD
+ +static bool
+ +icmp_in_range(const struct nf_conntrack_tuple *tuple,
+ +	      enum nf_nat_manip_type maniptype,
+ +	      const union nf_conntrack_man_proto *min,
+ +	      const union nf_conntrack_man_proto *max)
+ +{
+ +	return ntohs(tuple->src.u.icmp.id) >= ntohs(min->icmp.id) &&
+ +	       ntohs(tuple->src.u.icmp.id) <= ntohs(max->icmp.id);
+ +}
+ +
+ +static void
+ +icmp_unique_tuple(const struct nf_nat_l3proto *l3proto,
+ +		  struct nf_conntrack_tuple *tuple,
+ +		  const struct nf_nat_range2 *range,
+ +		  enum nf_nat_manip_type maniptype,
+ +		  const struct nf_conn *ct)
+ +{
+ +	static u_int16_t id;
+ +	unsigned int range_size;
+ +	unsigned int i;
+ +
+ +	range_size = ntohs(range->max_proto.icmp.id) -
+ +		     ntohs(range->min_proto.icmp.id) + 1;
+ +	/* If no range specified... */
+ +	if (!(range->flags & NF_NAT_RANGE_PROTO_SPECIFIED))
+ +		range_size = 0xFFFF;
+ +
+ +	for (i = 0; ; ++id) {
+ +		tuple->src.u.icmp.id = htons(ntohs(range->min_proto.icmp.id) +
+ +					     (id % range_size));
+ +		if (++i == range_size || !nf_nat_used_tuple(tuple, ct))
+ +			return;
+ +	}
+ +	return;
+ +}
+ +
+ +static bool
+ +icmp_manip_pkt(struct sk_buff *skb,
+ +	       const struct nf_nat_l3proto *l3proto,
+ +	       unsigned int iphdroff, unsigned int hdroff,
+ +	       const struct nf_conntrack_tuple *tuple,
+ +	       enum nf_nat_manip_type maniptype)
+ +{
+ +	struct icmphdr *hdr;
+ +
+ +	if (!skb_make_writable(skb, hdroff + sizeof(*hdr)))
+ +		return false;
+ +
+ +	hdr = (struct icmphdr *)(skb->data + hdroff);
+ +	inet_proto_csum_replace2(&hdr->checksum, skb,
+ +				 hdr->un.echo.id, tuple->src.u.icmp.id, false);
+ +	hdr->un.echo.id = tuple->src.u.icmp.id;
+ +	return true;
+ +}
+ +
+ +const struct nf_nat_l4proto nf_nat_l4proto_icmp = {
+ +	.l4proto		= IPPROTO_ICMP,
+ +	.manip_pkt		= icmp_manip_pkt,
+ +	.in_range		= icmp_in_range,
+ +	.unique_tuple		= icmp_unique_tuple,
+ +#if IS_ENABLED(CONFIG_NF_CT_NETLINK)
+ +	.nlattr_to_range	= nf_nat_l4proto_nlattr_to_range,
+ +#endif
+++=======
++ const struct nf_nat_l4proto nf_nat_l4proto_icmp = {
++ 	.l4proto		= IPPROTO_ICMP,
+++>>>>>>> faec18dbb040 (netfilter: nat: remove l4proto->manip_pkt)
+  };
+diff --cc net/ipv6/netfilter/nf_nat_proto_icmpv6.c
+index d9bf42ba44fa,fcbe7e750420..000000000000
+--- a/net/ipv6/netfilter/nf_nat_proto_icmpv6.c
++++ b/net/ipv6/netfilter/nf_nat_proto_icmpv6.c
+@@@ -19,72 -19,6 +19,77 @@@
+  #include <net/netfilter/nf_nat_l3proto.h>
+  #include <net/netfilter/nf_nat_l4proto.h>
+  
+++<<<<<<< HEAD
+ +static bool
+ +icmpv6_in_range(const struct nf_conntrack_tuple *tuple,
+ +		enum nf_nat_manip_type maniptype,
+ +		const union nf_conntrack_man_proto *min,
+ +		const union nf_conntrack_man_proto *max)
+ +{
+ +	return ntohs(tuple->src.u.icmp.id) >= ntohs(min->icmp.id) &&
+ +	       ntohs(tuple->src.u.icmp.id) <= ntohs(max->icmp.id);
+ +}
+ +
+ +static void
+ +icmpv6_unique_tuple(const struct nf_nat_l3proto *l3proto,
+ +		    struct nf_conntrack_tuple *tuple,
+ +		    const struct nf_nat_range2 *range,
+ +		    enum nf_nat_manip_type maniptype,
+ +		    const struct nf_conn *ct)
+ +{
+ +	static u16 id;
+ +	unsigned int range_size;
+ +	unsigned int i;
+ +
+ +	range_size = ntohs(range->max_proto.icmp.id) -
+ +		     ntohs(range->min_proto.icmp.id) + 1;
+ +
+ +	if (!(range->flags & NF_NAT_RANGE_PROTO_SPECIFIED))
+ +		range_size = 0xffff;
+ +
+ +	for (i = 0; ; ++id) {
+ +		tuple->src.u.icmp.id = htons(ntohs(range->min_proto.icmp.id) +
+ +					     (id % range_size));
+ +		if (++i == range_size || !nf_nat_used_tuple(tuple, ct))
+ +			return;
+ +	}
+ +}
+ +
+ +static bool
+ +icmpv6_manip_pkt(struct sk_buff *skb,
+ +		 const struct nf_nat_l3proto *l3proto,
+ +		 unsigned int iphdroff, unsigned int hdroff,
+ +		 const struct nf_conntrack_tuple *tuple,
+ +		 enum nf_nat_manip_type maniptype)
+ +{
+ +	struct icmp6hdr *hdr;
+ +
+ +	if (!skb_make_writable(skb, hdroff + sizeof(*hdr)))
+ +		return false;
+ +
+ +	hdr = (struct icmp6hdr *)(skb->data + hdroff);
+ +	l3proto->csum_update(skb, iphdroff, &hdr->icmp6_cksum,
+ +			     tuple, maniptype);
+ +	if (hdr->icmp6_type == ICMPV6_ECHO_REQUEST ||
+ +	    hdr->icmp6_type == ICMPV6_ECHO_REPLY) {
+ +		inet_proto_csum_replace2(&hdr->icmp6_cksum, skb,
+ +					 hdr->icmp6_identifier,
+ +					 tuple->src.u.icmp.id, false);
+ +		hdr->icmp6_identifier = tuple->src.u.icmp.id;
+ +	}
+ +	return true;
+ +}
+ +
+ +const struct nf_nat_l4proto nf_nat_l4proto_icmpv6 = {
+ +	.l4proto		= IPPROTO_ICMPV6,
+ +	.manip_pkt		= icmpv6_manip_pkt,
+ +	.in_range		= icmpv6_in_range,
+ +	.unique_tuple		= icmpv6_unique_tuple,
+ +#if IS_ENABLED(CONFIG_NF_CT_NETLINK)
+ +	.nlattr_to_range	= nf_nat_l4proto_nlattr_to_range,
+ +#endif
+++=======
++ const struct nf_nat_l4proto nf_nat_l4proto_icmpv6 = {
++ 	.l4proto		= IPPROTO_ICMPV6,
+++>>>>>>> faec18dbb040 (netfilter: nat: remove l4proto->manip_pkt)
+  };
+diff --cc net/netfilter/Makefile
+index c1b6a98afe92,ed4a912c5484..000000000000
+--- a/net/netfilter/Makefile
++++ b/net/netfilter/Makefile
+@@@ -41,8 -47,8 +41,13 @@@ obj-$(CONFIG_NF_CONNTRACK_SANE) += nf_c
+  obj-$(CONFIG_NF_CONNTRACK_SIP) += nf_conntrack_sip.o
+  obj-$(CONFIG_NF_CONNTRACK_TFTP) += nf_conntrack_tftp.o
+  
+++<<<<<<< HEAD
+ +nf_nat-y	:= nf_nat_core.o nf_nat_proto_unknown.o nf_nat_proto_common.o \
+ +		   nf_nat_proto_udp.o nf_nat_proto_tcp.o nf_nat_helper.o
+++=======
++ nf_nat-y	:= nf_nat_core.o nf_nat_proto_unknown.o \
++ 		   nf_nat_proto.o nf_nat_proto_tcp.o nf_nat_helper.o
+++>>>>>>> faec18dbb040 (netfilter: nat: remove l4proto->manip_pkt)
+  
+  # NAT protocols (nf_nat)
+  nf_nat-$(CONFIG_NF_NAT_PROTO_DCCP) += nf_nat_proto_dccp.o
+diff --cc net/netfilter/nf_nat_proto_dccp.c
+index 7d4d2c124990,dace808d4a23..000000000000
+--- a/net/netfilter/nf_nat_proto_dccp.c
++++ b/net/netfilter/nf_nat_proto_dccp.c
+@@@ -18,62 -17,6 +17,67 @@@
+  #include <net/netfilter/nf_nat_l3proto.h>
+  #include <net/netfilter/nf_nat_l4proto.h>
+  
+++<<<<<<< HEAD
+ +static void
+ +dccp_unique_tuple(const struct nf_nat_l3proto *l3proto,
+ +		  struct nf_conntrack_tuple *tuple,
+ +		  const struct nf_nat_range2 *range,
+ +		  enum nf_nat_manip_type maniptype,
+ +		  const struct nf_conn *ct)
+ +{
+ +	nf_nat_l4proto_unique_tuple(l3proto, tuple, range, maniptype, ct);
+ +}
+ +
+ +static bool
+ +dccp_manip_pkt(struct sk_buff *skb,
+ +	       const struct nf_nat_l3proto *l3proto,
+ +	       unsigned int iphdroff, unsigned int hdroff,
+ +	       const struct nf_conntrack_tuple *tuple,
+ +	       enum nf_nat_manip_type maniptype)
+ +{
+ +	struct dccp_hdr *hdr;
+ +	__be16 *portptr, oldport, newport;
+ +	int hdrsize = 8; /* DCCP connection tracking guarantees this much */
+ +
+ +	if (skb->len >= hdroff + sizeof(struct dccp_hdr))
+ +		hdrsize = sizeof(struct dccp_hdr);
+ +
+ +	if (!skb_make_writable(skb, hdroff + hdrsize))
+ +		return false;
+ +
+ +	hdr = (struct dccp_hdr *)(skb->data + hdroff);
+ +
+ +	if (maniptype == NF_NAT_MANIP_SRC) {
+ +		newport = tuple->src.u.dccp.port;
+ +		portptr = &hdr->dccph_sport;
+ +	} else {
+ +		newport = tuple->dst.u.dccp.port;
+ +		portptr = &hdr->dccph_dport;
+ +	}
+ +
+ +	oldport = *portptr;
+ +	*portptr = newport;
+ +
+ +	if (hdrsize < sizeof(*hdr))
+ +		return true;
+ +
+ +	l3proto->csum_update(skb, iphdroff, &hdr->dccph_checksum,
+ +			     tuple, maniptype);
+ +	inet_proto_csum_replace2(&hdr->dccph_checksum, skb, oldport, newport,
+ +				 false);
+ +	return true;
+ +}
+ +
+ +const struct nf_nat_l4proto nf_nat_l4proto_dccp = {
+ +	.l4proto		= IPPROTO_DCCP,
+ +	.manip_pkt		= dccp_manip_pkt,
+ +	.in_range		= nf_nat_l4proto_in_range,
+ +	.unique_tuple		= dccp_unique_tuple,
+ +#if IS_ENABLED(CONFIG_NF_CT_NETLINK)
+ +	.nlattr_to_range	= nf_nat_l4proto_nlattr_to_range,
+ +#endif
+++=======
++ const struct nf_nat_l4proto nf_nat_l4proto_dccp = {
++ 	.l4proto		= IPPROTO_DCCP,
+++>>>>>>> faec18dbb040 (netfilter: nat: remove l4proto->manip_pkt)
+  };
+diff --cc net/netfilter/nf_nat_proto_sctp.c
+index f05ad8fa7b20,e555cb7a248c..000000000000
+--- a/net/netfilter/nf_nat_proto_sctp.c
++++ b/net/netfilter/nf_nat_proto_sctp.c
+@@@ -10,65 -10,7 +10,69 @@@
+  
+  #include <net/netfilter/nf_nat_l4proto.h>
+  
+++<<<<<<< HEAD
+ +static void
+ +sctp_unique_tuple(const struct nf_nat_l3proto *l3proto,
+ +		  struct nf_conntrack_tuple *tuple,
+ +		  const struct nf_nat_range2 *range,
+ +		  enum nf_nat_manip_type maniptype,
+ +		  const struct nf_conn *ct)
+ +{
+ +	nf_nat_l4proto_unique_tuple(l3proto, tuple, range, maniptype, ct);
+ +}
+ +
+ +static bool
+ +sctp_manip_pkt(struct sk_buff *skb,
+ +	       const struct nf_nat_l3proto *l3proto,
+ +	       unsigned int iphdroff, unsigned int hdroff,
+ +	       const struct nf_conntrack_tuple *tuple,
+ +	       enum nf_nat_manip_type maniptype)
+ +{
+ +	struct sctphdr *hdr;
+ +	int hdrsize = 8;
+ +
+ +	/* This could be an inner header returned in imcp packet; in such
+ +	 * cases we cannot update the checksum field since it is outside
+ +	 * of the 8 bytes of transport layer headers we are guaranteed.
+ +	 */
+ +	if (skb->len >= hdroff + sizeof(*hdr))
+ +		hdrsize = sizeof(*hdr);
+ +
+ +	if (!skb_make_writable(skb, hdroff + hdrsize))
+ +		return false;
+ +
+ +	hdr = (struct sctphdr *)(skb->data + hdroff);
+ +
+ +	if (maniptype == NF_NAT_MANIP_SRC) {
+ +		/* Get rid of src port */
+ +		hdr->source = tuple->src.u.sctp.port;
+ +	} else {
+ +		/* Get rid of dst port */
+ +		hdr->dest = tuple->dst.u.sctp.port;
+ +	}
+ +
+ +	if (hdrsize < sizeof(*hdr))
+ +		return true;
+ +
+ +	if (skb->ip_summed != CHECKSUM_PARTIAL) {
+ +		hdr->checksum = sctp_compute_cksum(skb, hdroff);
+ +		skb->ip_summed = CHECKSUM_NONE;
+ +	}
+ +
+ +	return true;
+ +}
+ +
+ +const struct nf_nat_l4proto nf_nat_l4proto_sctp = {
+ +	.l4proto		= IPPROTO_SCTP,
+ +	.manip_pkt		= sctp_manip_pkt,
+ +	.in_range		= nf_nat_l4proto_in_range,
+ +	.unique_tuple		= sctp_unique_tuple,
+ +#if IS_ENABLED(CONFIG_NF_CT_NETLINK)
+ +	.nlattr_to_range	= nf_nat_l4proto_nlattr_to_range,
+ +#endif
+++=======
++ 
++ const struct nf_nat_l4proto nf_nat_l4proto_sctp = {
++ 	.l4proto		= IPPROTO_SCTP,
+++>>>>>>> faec18dbb040 (netfilter: nat: remove l4proto->manip_pkt)
+  };
+diff --cc net/netfilter/nf_nat_proto_tcp.c
+index c312e6b3e2ea,04d2dc100048..000000000000
+--- a/net/netfilter/nf_nat_proto_tcp.c
++++ b/net/netfilter/nf_nat_proto_tcp.c
+@@@ -18,65 -18,6 +18,70 @@@
+  #include <net/netfilter/nf_nat_l4proto.h>
+  #include <net/netfilter/nf_nat_core.h>
+  
+++<<<<<<< HEAD
+ +static void
+ +tcp_unique_tuple(const struct nf_nat_l3proto *l3proto,
+ +		 struct nf_conntrack_tuple *tuple,
+ +		 const struct nf_nat_range2 *range,
+ +		 enum nf_nat_manip_type maniptype,
+ +		 const struct nf_conn *ct)
+ +{
+ +	nf_nat_l4proto_unique_tuple(l3proto, tuple, range, maniptype, ct);
+ +}
+ +
+ +static bool
+ +tcp_manip_pkt(struct sk_buff *skb,
+ +	      const struct nf_nat_l3proto *l3proto,
+ +	      unsigned int iphdroff, unsigned int hdroff,
+ +	      const struct nf_conntrack_tuple *tuple,
+ +	      enum nf_nat_manip_type maniptype)
+ +{
+ +	struct tcphdr *hdr;
+ +	__be16 *portptr, newport, oldport;
+ +	int hdrsize = 8; /* TCP connection tracking guarantees this much */
+ +
+ +	/* this could be a inner header returned in icmp packet; in such
+ +	   cases we cannot update the checksum field since it is outside of
+ +	   the 8 bytes of transport layer headers we are guaranteed */
+ +	if (skb->len >= hdroff + sizeof(struct tcphdr))
+ +		hdrsize = sizeof(struct tcphdr);
+ +
+ +	if (!skb_make_writable(skb, hdroff + hdrsize))
+ +		return false;
+ +
+ +	hdr = (struct tcphdr *)(skb->data + hdroff);
+ +
+ +	if (maniptype == NF_NAT_MANIP_SRC) {
+ +		/* Get rid of src port */
+ +		newport = tuple->src.u.tcp.port;
+ +		portptr = &hdr->source;
+ +	} else {
+ +		/* Get rid of dst port */
+ +		newport = tuple->dst.u.tcp.port;
+ +		portptr = &hdr->dest;
+ +	}
+ +
+ +	oldport = *portptr;
+ +	*portptr = newport;
+ +
+ +	if (hdrsize < sizeof(*hdr))
+ +		return true;
+ +
+ +	l3proto->csum_update(skb, iphdroff, &hdr->check, tuple, maniptype);
+ +	inet_proto_csum_replace2(&hdr->check, skb, oldport, newport, false);
+ +	return true;
+ +}
+ +
+ +const struct nf_nat_l4proto nf_nat_l4proto_tcp = {
+ +	.l4proto		= IPPROTO_TCP,
+ +	.manip_pkt		= tcp_manip_pkt,
+ +	.in_range		= nf_nat_l4proto_in_range,
+ +	.unique_tuple		= tcp_unique_tuple,
+ +#if IS_ENABLED(CONFIG_NF_CT_NETLINK)
+ +	.nlattr_to_range	= nf_nat_l4proto_nlattr_to_range,
+ +#endif
+++=======
++ const struct nf_nat_l4proto nf_nat_l4proto_tcp = {
++ 	.l4proto		= IPPROTO_TCP,
+++>>>>>>> faec18dbb040 (netfilter: nat: remove l4proto->manip_pkt)
+  };
+diff --cc net/netfilter/nf_nat_proto_unknown.c
+index c5db3e251232,7f6201208a32..000000000000
+--- a/net/netfilter/nf_nat_proto_unknown.c
++++ b/net/netfilter/nf_nat_proto_unknown.c
+@@@ -17,38 -17,5 +17,42 @@@
+  #include <net/netfilter/nf_nat.h>
+  #include <net/netfilter/nf_nat_l4proto.h>
+  
+++<<<<<<< HEAD
+ +static bool unknown_in_range(const struct nf_conntrack_tuple *tuple,
+ +			     enum nf_nat_manip_type manip_type,
+ +			     const union nf_conntrack_man_proto *min,
+ +			     const union nf_conntrack_man_proto *max)
+ +{
+ +	return true;
+ +}
+ +
+ +static void unknown_unique_tuple(const struct nf_nat_l3proto *l3proto,
+ +				 struct nf_conntrack_tuple *tuple,
+ +				 const struct nf_nat_range2 *range,
+ +				 enum nf_nat_manip_type maniptype,
+ +				 const struct nf_conn *ct)
+ +{
+ +	/* Sorry: we can't help you; if it's not unique, we can't frob
+ +	 * anything.
+ +	 */
+ +	return;
+ +}
+ +
+ +static bool
+ +unknown_manip_pkt(struct sk_buff *skb,
+ +		  const struct nf_nat_l3proto *l3proto,
+ +		  unsigned int iphdroff, unsigned int hdroff,
+ +		  const struct nf_conntrack_tuple *tuple,
+ +		  enum nf_nat_manip_type maniptype)
+ +{
+ +	return true;
+ +}
+ +
+ +const struct nf_nat_l4proto nf_nat_l4proto_unknown = {
+ +	.manip_pkt		= unknown_manip_pkt,
+ +	.in_range		= unknown_in_range,
+ +	.unique_tuple		= unknown_unique_tuple,
+++=======
++ const struct nf_nat_l4proto nf_nat_l4proto_unknown = {
+++>>>>>>> faec18dbb040 (netfilter: nat: remove l4proto->manip_pkt)
+  };
+* Unmerged path net/netfilter/nf_nat_proto_udp.c
+* Unmerged path include/net/netfilter/nf_nat_l4proto.h
+diff --git a/net/ipv4/netfilter/Kconfig b/net/ipv4/netfilter/Kconfig
+index bbfc356cb1b5..b7760d746e3b 100644
+--- a/net/ipv4/netfilter/Kconfig
++++ b/net/ipv4/netfilter/Kconfig
+@@ -170,15 +170,10 @@ config NF_NAT_SNMP_BASIC
+ 
+ 	  To compile it as a module, choose M here.  If unsure, say N.
+ 
+-config NF_NAT_PROTO_GRE
+-	tristate
+-	depends on NF_CT_PROTO_GRE
+-
+ config NF_NAT_PPTP
+ 	tristate
+ 	depends on NF_CONNTRACK
+ 	default NF_CONNTRACK_PPTP
+-	select NF_NAT_PROTO_GRE
+ 
+ config NF_NAT_H323
+ 	tristate
+diff --git a/net/ipv4/netfilter/nf_nat_l3proto_ipv4.c b/net/ipv4/netfilter/nf_nat_l3proto_ipv4.c
+index 78a67f961d86..7844f52023f4 100644
+--- a/net/ipv4/netfilter/nf_nat_l3proto_ipv4.c
++++ b/net/ipv4/netfilter/nf_nat_l3proto_ipv4.c
+@@ -90,8 +90,8 @@ static bool nf_nat_ipv4_manip_pkt(struct sk_buff *skb,
+ 	iph = (void *)skb->data + iphdroff;
+ 	hdroff = iphdroff + iph->ihl * 4;
+ 
+-	if (!l4proto->manip_pkt(skb, &nf_nat_l3proto_ipv4, iphdroff, hdroff,
+-				target, maniptype))
++	if (!nf_nat_l4proto_manip_pkt(skb, &nf_nat_l3proto_ipv4, iphdroff,
++				      hdroff, target, maniptype))
+ 		return false;
+ 	iph = (void *)skb->data + iphdroff;
+ 
+diff --git a/net/ipv4/netfilter/nf_nat_pptp.c b/net/ipv4/netfilter/nf_nat_pptp.c
+index 29f8f86628ef..e17b4ee7604c 100644
+--- a/net/ipv4/netfilter/nf_nat_pptp.c
++++ b/net/ipv4/netfilter/nf_nat_pptp.c
+@@ -299,8 +299,6 @@ pptp_inbound_pkt(struct sk_buff *skb,
+ 
+ static int __init nf_nat_helper_pptp_init(void)
+ {
+-	nf_nat_need_gre();
+-
+ 	BUG_ON(nf_nat_pptp_hook_outbound != NULL);
+ 	RCU_INIT_POINTER(nf_nat_pptp_hook_outbound, pptp_outbound_pkt);
+ 
+* Unmerged path net/ipv4/netfilter/nf_nat_proto_gre.c
+* Unmerged path net/ipv4/netfilter/nf_nat_proto_icmp.c
+diff --git a/net/ipv6/netfilter/nf_nat_l3proto_ipv6.c b/net/ipv6/netfilter/nf_nat_l3proto_ipv6.c
+index 9a3e0cf4290a..ec99763cf022 100644
+--- a/net/ipv6/netfilter/nf_nat_l3proto_ipv6.c
++++ b/net/ipv6/netfilter/nf_nat_l3proto_ipv6.c
+@@ -97,8 +97,8 @@ static bool nf_nat_ipv6_manip_pkt(struct sk_buff *skb,
+ 		goto manip_addr;
+ 
+ 	if ((frag_off & htons(~0x7)) == 0 &&
+-	    !l4proto->manip_pkt(skb, &nf_nat_l3proto_ipv6, iphdroff, hdroff,
+-				target, maniptype))
++	    !nf_nat_l4proto_manip_pkt(skb, &nf_nat_l3proto_ipv6, iphdroff, hdroff,
++				      target, maniptype))
+ 		return false;
+ 
+ 	/* must reload, offset might have changed */
+* Unmerged path net/ipv6/netfilter/nf_nat_proto_icmpv6.c
+diff --git a/net/netfilter/Kconfig b/net/netfilter/Kconfig
+index 0afbf3b2f362..067c32eb94c8 100644
+--- a/net/netfilter/Kconfig
++++ b/net/netfilter/Kconfig
+@@ -392,21 +392,6 @@ config NF_NAT_NEEDED
+ 	depends on NF_NAT
+ 	default y
+ 
+-config NF_NAT_PROTO_DCCP
+-	bool
+-	depends on NF_NAT && NF_CT_PROTO_DCCP
+-	default NF_NAT && NF_CT_PROTO_DCCP
+-
+-config NF_NAT_PROTO_UDPLITE
+-	bool
+-	depends on NF_NAT && NF_CT_PROTO_UDPLITE
+-	default NF_NAT && NF_CT_PROTO_UDPLITE
+-
+-config NF_NAT_PROTO_SCTP
+-	bool
+-	default NF_NAT && NF_CT_PROTO_SCTP
+-	depends on NF_NAT && NF_CT_PROTO_SCTP
+-
+ config NF_NAT_AMANDA
+ 	tristate
+ 	depends on NF_CONNTRACK && NF_NAT
+* Unmerged path net/netfilter/Makefile
+diff --git a/net/netfilter/nf_nat_proto.c b/net/netfilter/nf_nat_proto.c
+new file mode 100644
+index 000000000000..1042706827cb
+--- /dev/null
++++ b/net/netfilter/nf_nat_proto.c
+@@ -0,0 +1,353 @@
++/* (C) 1999-2001 Paul `Rusty' Russell
++ * (C) 2002-2006 Netfilter Core Team <coreteam@netfilter.org>
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License version 2 as
++ * published by the Free Software Foundation.
++ */
++
++#include <linux/types.h>
++#include <linux/export.h>
++#include <linux/init.h>
++#include <linux/udp.h>
++#include <linux/tcp.h>
++#include <linux/icmp.h>
++#include <linux/icmpv6.h>
++
++#include <linux/dccp.h>
++#include <linux/sctp.h>
++#include <net/sctp/checksum.h>
++
++#include <linux/netfilter.h>
++#include <net/netfilter/nf_nat.h>
++#include <net/netfilter/nf_nat_core.h>
++#include <net/netfilter/nf_nat_l3proto.h>
++#include <net/netfilter/nf_nat_l4proto.h>
++
++static void
++__udp_manip_pkt(struct sk_buff *skb,
++	        const struct nf_nat_l3proto *l3proto,
++	        unsigned int iphdroff, struct udphdr *hdr,
++	        const struct nf_conntrack_tuple *tuple,
++	        enum nf_nat_manip_type maniptype, bool do_csum)
++{
++	__be16 *portptr, newport;
++
++	if (maniptype == NF_NAT_MANIP_SRC) {
++		/* Get rid of src port */
++		newport = tuple->src.u.udp.port;
++		portptr = &hdr->source;
++	} else {
++		/* Get rid of dst port */
++		newport = tuple->dst.u.udp.port;
++		portptr = &hdr->dest;
++	}
++	if (do_csum) {
++		l3proto->csum_update(skb, iphdroff, &hdr->check,
++				     tuple, maniptype);
++		inet_proto_csum_replace2(&hdr->check, skb, *portptr, newport,
++					 false);
++		if (!hdr->check)
++			hdr->check = CSUM_MANGLED_0;
++	}
++	*portptr = newport;
++}
++
++static bool udp_manip_pkt(struct sk_buff *skb,
++			  const struct nf_nat_l3proto *l3proto,
++			  unsigned int iphdroff, unsigned int hdroff,
++			  const struct nf_conntrack_tuple *tuple,
++			  enum nf_nat_manip_type maniptype)
++{
++	struct udphdr *hdr;
++	bool do_csum;
++
++	if (!skb_make_writable(skb, hdroff + sizeof(*hdr)))
++		return false;
++
++	hdr = (struct udphdr *)(skb->data + hdroff);
++	do_csum = hdr->check || skb->ip_summed == CHECKSUM_PARTIAL;
++
++	__udp_manip_pkt(skb, l3proto, iphdroff, hdr, tuple, maniptype, do_csum);
++	return true;
++}
++
++static bool udplite_manip_pkt(struct sk_buff *skb,
++			      const struct nf_nat_l3proto *l3proto,
++			      unsigned int iphdroff, unsigned int hdroff,
++			      const struct nf_conntrack_tuple *tuple,
++			      enum nf_nat_manip_type maniptype)
++{
++#ifdef CONFIG_NF_CT_PROTO_UDPLITE
++	struct udphdr *hdr;
++
++	if (!skb_make_writable(skb, hdroff + sizeof(*hdr)))
++		return false;
++
++	hdr = (struct udphdr *)(skb->data + hdroff);
++	__udp_manip_pkt(skb, l3proto, iphdroff, hdr, tuple, maniptype, true);
++#endif
++	return true;
++}
++
++static bool
++sctp_manip_pkt(struct sk_buff *skb,
++	       const struct nf_nat_l3proto *l3proto,
++	       unsigned int iphdroff, unsigned int hdroff,
++	       const struct nf_conntrack_tuple *tuple,
++	       enum nf_nat_manip_type maniptype)
++{
++#ifdef CONFIG_NF_CT_PROTO_SCTP
++	struct sctphdr *hdr;
++	int hdrsize = 8;
++
++	/* This could be an inner header returned in imcp packet; in such
++	 * cases we cannot update the checksum field since it is outside
++	 * of the 8 bytes of transport layer headers we are guaranteed.
++	 */
++	if (skb->len >= hdroff + sizeof(*hdr))
++		hdrsize = sizeof(*hdr);
++
++	if (!skb_make_writable(skb, hdroff + hdrsize))
++		return false;
++
++	hdr = (struct sctphdr *)(skb->data + hdroff);
++
++	if (maniptype == NF_NAT_MANIP_SRC) {
++		/* Get rid of src port */
++		hdr->source = tuple->src.u.sctp.port;
++	} else {
++		/* Get rid of dst port */
++		hdr->dest = tuple->dst.u.sctp.port;
++	}
++
++	if (hdrsize < sizeof(*hdr))
++		return true;
++
++	if (skb->ip_summed != CHECKSUM_PARTIAL) {
++		hdr->checksum = sctp_compute_cksum(skb, hdroff);
++		skb->ip_summed = CHECKSUM_NONE;
++	}
++
++#endif
++	return true;
++}
++
++static bool
++tcp_manip_pkt(struct sk_buff *skb,
++	      const struct nf_nat_l3proto *l3proto,
++	      unsigned int iphdroff, unsigned int hdroff,
++	      const struct nf_conntrack_tuple *tuple,
++	      enum nf_nat_manip_type maniptype)
++{
++	struct tcphdr *hdr;
++	__be16 *portptr, newport, oldport;
++	int hdrsize = 8; /* TCP connection tracking guarantees this much */
++
++	/* this could be a inner header returned in icmp packet; in such
++	   cases we cannot update the checksum field since it is outside of
++	   the 8 bytes of transport layer headers we are guaranteed */
++	if (skb->len >= hdroff + sizeof(struct tcphdr))
++		hdrsize = sizeof(struct tcphdr);
++
++	if (!skb_make_writable(skb, hdroff + hdrsize))
++		return false;
++
++	hdr = (struct tcphdr *)(skb->data + hdroff);
++
++	if (maniptype == NF_NAT_MANIP_SRC) {
++		/* Get rid of src port */
++		newport = tuple->src.u.tcp.port;
++		portptr = &hdr->source;
++	} else {
++		/* Get rid of dst port */
++		newport = tuple->dst.u.tcp.port;
++		portptr = &hdr->dest;
++	}
++
++	oldport = *portptr;
++	*portptr = newport;
++
++	if (hdrsize < sizeof(*hdr))
++		return true;
++
++	l3proto->csum_update(skb, iphdroff, &hdr->check, tuple, maniptype);
++	inet_proto_csum_replace2(&hdr->check, skb, oldport, newport, false);
++	return true;
++}
++
++static bool
++dccp_manip_pkt(struct sk_buff *skb,
++	       const struct nf_nat_l3proto *l3proto,
++	       unsigned int iphdroff, unsigned int hdroff,
++	       const struct nf_conntrack_tuple *tuple,
++	       enum nf_nat_manip_type maniptype)
++{
++#ifdef CONFIG_NF_CT_PROTO_DCCP
++	struct dccp_hdr *hdr;
++	__be16 *portptr, oldport, newport;
++	int hdrsize = 8; /* DCCP connection tracking guarantees this much */
++
++	if (skb->len >= hdroff + sizeof(struct dccp_hdr))
++		hdrsize = sizeof(struct dccp_hdr);
++
++	if (!skb_make_writable(skb, hdroff + hdrsize))
++		return false;
++
++	hdr = (struct dccp_hdr *)(skb->data + hdroff);
++
++	if (maniptype == NF_NAT_MANIP_SRC) {
++		newport = tuple->src.u.dccp.port;
++		portptr = &hdr->dccph_sport;
++	} else {
++		newport = tuple->dst.u.dccp.port;
++		portptr = &hdr->dccph_dport;
++	}
++
++	oldport = *portptr;
++	*portptr = newport;
++
++	if (hdrsize < sizeof(*hdr))
++		return true;
++
++	l3proto->csum_update(skb, iphdroff, &hdr->dccph_checksum,
++			     tuple, maniptype);
++	inet_proto_csum_replace2(&hdr->dccph_checksum, skb, oldport, newport,
++				 false);
++#endif
++	return true;
++}
++
++static bool
++icmp_manip_pkt(struct sk_buff *skb,
++	       const struct nf_nat_l3proto *l3proto,
++	       unsigned int iphdroff, unsigned int hdroff,
++	       const struct nf_conntrack_tuple *tuple,
++	       enum nf_nat_manip_type maniptype)
++{
++	struct icmphdr *hdr;
++
++	if (!skb_make_writable(skb, hdroff + sizeof(*hdr)))
++		return false;
++
++	hdr = (struct icmphdr *)(skb->data + hdroff);
++	inet_proto_csum_replace2(&hdr->checksum, skb,
++				 hdr->un.echo.id, tuple->src.u.icmp.id, false);
++	hdr->un.echo.id = tuple->src.u.icmp.id;
++	return true;
++}
++
++static bool
++icmpv6_manip_pkt(struct sk_buff *skb,
++		 const struct nf_nat_l3proto *l3proto,
++		 unsigned int iphdroff, unsigned int hdroff,
++		 const struct nf_conntrack_tuple *tuple,
++		 enum nf_nat_manip_type maniptype)
++{
++	struct icmp6hdr *hdr;
++
++	if (!skb_make_writable(skb, hdroff + sizeof(*hdr)))
++		return false;
++
++	hdr = (struct icmp6hdr *)(skb->data + hdroff);
++	l3proto->csum_update(skb, iphdroff, &hdr->icmp6_cksum,
++			     tuple, maniptype);
++	if (hdr->icmp6_type == ICMPV6_ECHO_REQUEST ||
++	    hdr->icmp6_type == ICMPV6_ECHO_REPLY) {
++		inet_proto_csum_replace2(&hdr->icmp6_cksum, skb,
++					 hdr->icmp6_identifier,
++					 tuple->src.u.icmp.id, false);
++		hdr->icmp6_identifier = tuple->src.u.icmp.id;
++	}
++	return true;
++}
++
++/* manipulate a GRE packet according to maniptype */
++static bool
++gre_manip_pkt(struct sk_buff *skb,
++	      const struct nf_nat_l3proto *l3proto,
++	      unsigned int iphdroff, unsigned int hdroff,
++	      const struct nf_conntrack_tuple *tuple,
++	      enum nf_nat_manip_type maniptype)
++{
++#if IS_ENABLED(CONFIG_NF_CT_PROTO_GRE)
++	const struct gre_base_hdr *greh;
++	struct pptp_gre_header *pgreh;
++
++	/* pgreh includes two optional 32bit fields which are not required
++	 * to be there.  That's where the magic '8' comes from */
++	if (!skb_make_writable(skb, hdroff + sizeof(*pgreh) - 8))
++		return false;
++
++	greh = (void *)skb->data + hdroff;
++	pgreh = (struct pptp_gre_header *)greh;
++
++	/* we only have destination manip of a packet, since 'source key'
++	 * is not present in the packet itself */
++	if (maniptype != NF_NAT_MANIP_DST)
++		return true;
++
++	switch (greh->flags & GRE_VERSION) {
++	case GRE_VERSION_0:
++		/* We do not currently NAT any GREv0 packets.
++		 * Try to behave like "nf_nat_proto_unknown" */
++		break;
++	case GRE_VERSION_1:
++		pr_debug("call_id -> 0x%04x\n", ntohs(tuple->dst.u.gre.key));
++		pgreh->call_id = tuple->dst.u.gre.key;
++		break;
++	default:
++		pr_debug("can't nat unknown GRE version\n");
++		return false;
++	}
++#endif
++	return true;
++}
++
++bool nf_nat_l4proto_manip_pkt(struct sk_buff *skb,
++			      const struct nf_nat_l3proto *l3proto,
++			      unsigned int iphdroff, unsigned int hdroff,
++			      const struct nf_conntrack_tuple *tuple,
++			      enum nf_nat_manip_type maniptype)
++{
++	switch (tuple->dst.protonum) {
++	case IPPROTO_TCP:
++		return tcp_manip_pkt(skb, l3proto, iphdroff, hdroff,
++				     tuple, maniptype);
++	case IPPROTO_UDP:
++		return udp_manip_pkt(skb, l3proto, iphdroff, hdroff,
++				     tuple, maniptype);
++	case IPPROTO_UDPLITE:
++		return udplite_manip_pkt(skb, l3proto, iphdroff, hdroff,
++					 tuple, maniptype);
++	case IPPROTO_SCTP:
++		return sctp_manip_pkt(skb, l3proto, iphdroff, hdroff,
++				      tuple, maniptype);
++	case IPPROTO_ICMP:
++		return icmp_manip_pkt(skb, l3proto, iphdroff, hdroff,
++				      tuple, maniptype);
++	case IPPROTO_ICMPV6:
++		return icmpv6_manip_pkt(skb, l3proto, iphdroff, hdroff,
++					tuple, maniptype);
++	case IPPROTO_DCCP:
++		return dccp_manip_pkt(skb, l3proto, iphdroff, hdroff,
++				      tuple, maniptype);
++	case IPPROTO_GRE:
++		return gre_manip_pkt(skb, l3proto, iphdroff, hdroff,
++				     tuple, maniptype);
++	}
++
++	/* If we don't know protocol -- no error, pass it unmodified. */
++	return true;
++}
++EXPORT_SYMBOL_GPL(nf_nat_l4proto_manip_pkt);
++
++#ifdef CONFIG_NF_NAT_PROTO_UDPLITE
++const struct nf_nat_l4proto nf_nat_l4proto_udplite = {
++	.l4proto		= IPPROTO_UDPLITE,
++};
++#endif /* CONFIG_NF_NAT_PROTO_UDPLITE */
++
++const struct nf_nat_l4proto nf_nat_l4proto_udp = {
++	.l4proto		= IPPROTO_UDP,
++};
+* Unmerged path net/netfilter/nf_nat_proto_dccp.c
+* Unmerged path net/netfilter/nf_nat_proto_sctp.c
+* Unmerged path net/netfilter/nf_nat_proto_tcp.c
+* Unmerged path net/netfilter/nf_nat_proto_udp.c
+* Unmerged path net/netfilter/nf_nat_proto_unknown.c
