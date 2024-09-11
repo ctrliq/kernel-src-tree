@@ -1,0 +1,1157 @@
+KVM: Use 'unsigned long' as kvm_for_each_vcpu()'s index
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-408.el8
+commit-author Marc Zyngier <maz@kernel.org>
+commit 46808a4cb89708c2e5b264eb9d1035762581921b
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-408.el8/46808a4c.failed
+
+Everywhere we use kvm_for_each_vpcu(), we use an int as the vcpu
+index. Unfortunately, we're about to move rework the iterator,
+which requires this to be upgrade to an unsigned long.
+
+Let's bite the bullet and repaint all of it in one go.
+
+	Signed-off-by: Marc Zyngier <maz@kernel.org>
+Message-Id: <20211116160403.4074052-7-maz@kernel.org>
+	Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+(cherry picked from commit 46808a4cb89708c2e5b264eb9d1035762581921b)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/arm64/kvm/vgic/vgic-v3.c
+#	arch/riscv/kvm/vcpu_sbi.c
+#	arch/riscv/kvm/vmid.c
+#	arch/x86/kvm/svm/sev.c
+#	arch/x86/kvm/x86.c
+#	virt/kvm/kvm_main.c
+diff --cc arch/arm64/kvm/vgic/vgic-v3.c
+index 6c23ecaeff61,5fedaee15e72..000000000000
+--- a/arch/arm64/kvm/vgic/vgic-v3.c
++++ b/arch/arm64/kvm/vgic/vgic-v3.c
+@@@ -510,18 -542,14 +510,23 @@@ int vgic_v3_map_resources(struct kvm *k
+  	struct vgic_dist *dist = &kvm->arch.vgic;
+  	struct kvm_vcpu *vcpu;
+  	int ret = 0;
+- 	int c;
++ 	unsigned long c;
+  
+ +	if (vgic_ready(kvm))
+ +		goto out;
+ +
+  	kvm_for_each_vcpu(c, vcpu, kvm) {
+  		struct vgic_cpu *vgic_cpu = &vcpu->arch.vgic_cpu;
+  
+  		if (IS_VGIC_ADDR_UNDEF(vgic_cpu->rd_iodev.base_addr)) {
+++<<<<<<< HEAD
+ +			kvm_debug("vcpu %d redistributor base not set\n", c);
+ +			ret = -ENXIO;
+ +			goto out;
+++=======
++ 			kvm_debug("vcpu %ld redistributor base not set\n", c);
++ 			return -ENXIO;
+++>>>>>>> 46808a4cb897 (KVM: Use 'unsigned long' as kvm_for_each_vcpu()'s index)
+  		}
+  	}
+  
+diff --cc arch/x86/kvm/svm/sev.c
+index 7b7d0da0e95f,322553322202..000000000000
+--- a/arch/x86/kvm/svm/sev.c
++++ b/arch/x86/kvm/svm/sev.c
+@@@ -1544,6 -1544,223 +1545,226 @@@ static bool is_cmd_allowed_from_mirror(
+  	return false;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static int sev_lock_two_vms(struct kvm *dst_kvm, struct kvm *src_kvm)
++ {
++ 	struct kvm_sev_info *dst_sev = &to_kvm_svm(dst_kvm)->sev_info;
++ 	struct kvm_sev_info *src_sev = &to_kvm_svm(src_kvm)->sev_info;
++ 	int r = -EBUSY;
++ 
++ 	if (dst_kvm == src_kvm)
++ 		return -EINVAL;
++ 
++ 	/*
++ 	 * Bail if these VMs are already involved in a migration to avoid
++ 	 * deadlock between two VMs trying to migrate to/from each other.
++ 	 */
++ 	if (atomic_cmpxchg_acquire(&dst_sev->migration_in_progress, 0, 1))
++ 		return -EBUSY;
++ 
++ 	if (atomic_cmpxchg_acquire(&src_sev->migration_in_progress, 0, 1))
++ 		goto release_dst;
++ 
++ 	r = -EINTR;
++ 	if (mutex_lock_killable(&dst_kvm->lock))
++ 		goto release_src;
++ 	if (mutex_lock_killable(&src_kvm->lock))
++ 		goto unlock_dst;
++ 	return 0;
++ 
++ unlock_dst:
++ 	mutex_unlock(&dst_kvm->lock);
++ release_src:
++ 	atomic_set_release(&src_sev->migration_in_progress, 0);
++ release_dst:
++ 	atomic_set_release(&dst_sev->migration_in_progress, 0);
++ 	return r;
++ }
++ 
++ static void sev_unlock_two_vms(struct kvm *dst_kvm, struct kvm *src_kvm)
++ {
++ 	struct kvm_sev_info *dst_sev = &to_kvm_svm(dst_kvm)->sev_info;
++ 	struct kvm_sev_info *src_sev = &to_kvm_svm(src_kvm)->sev_info;
++ 
++ 	mutex_unlock(&dst_kvm->lock);
++ 	mutex_unlock(&src_kvm->lock);
++ 	atomic_set_release(&dst_sev->migration_in_progress, 0);
++ 	atomic_set_release(&src_sev->migration_in_progress, 0);
++ }
++ 
++ 
++ static int sev_lock_vcpus_for_migration(struct kvm *kvm)
++ {
++ 	struct kvm_vcpu *vcpu;
++ 	unsigned long i, j;
++ 
++ 	kvm_for_each_vcpu(i, vcpu, kvm) {
++ 		if (mutex_lock_killable(&vcpu->mutex))
++ 			goto out_unlock;
++ 	}
++ 
++ 	return 0;
++ 
++ out_unlock:
++ 	kvm_for_each_vcpu(j, vcpu, kvm) {
++ 		if (i == j)
++ 			break;
++ 
++ 		mutex_unlock(&vcpu->mutex);
++ 	}
++ 	return -EINTR;
++ }
++ 
++ static void sev_unlock_vcpus_for_migration(struct kvm *kvm)
++ {
++ 	struct kvm_vcpu *vcpu;
++ 	unsigned long i;
++ 
++ 	kvm_for_each_vcpu(i, vcpu, kvm) {
++ 		mutex_unlock(&vcpu->mutex);
++ 	}
++ }
++ 
++ static void sev_migrate_from(struct kvm_sev_info *dst,
++ 			      struct kvm_sev_info *src)
++ {
++ 	dst->active = true;
++ 	dst->asid = src->asid;
++ 	dst->handle = src->handle;
++ 	dst->pages_locked = src->pages_locked;
++ 	dst->enc_context_owner = src->enc_context_owner;
++ 
++ 	src->asid = 0;
++ 	src->active = false;
++ 	src->handle = 0;
++ 	src->pages_locked = 0;
++ 	src->enc_context_owner = NULL;
++ 
++ 	list_cut_before(&dst->regions_list, &src->regions_list, &src->regions_list);
++ }
++ 
++ static int sev_es_migrate_from(struct kvm *dst, struct kvm *src)
++ {
++ 	unsigned long i;
++ 	struct kvm_vcpu *dst_vcpu, *src_vcpu;
++ 	struct vcpu_svm *dst_svm, *src_svm;
++ 
++ 	if (atomic_read(&src->online_vcpus) != atomic_read(&dst->online_vcpus))
++ 		return -EINVAL;
++ 
++ 	kvm_for_each_vcpu(i, src_vcpu, src) {
++ 		if (!src_vcpu->arch.guest_state_protected)
++ 			return -EINVAL;
++ 	}
++ 
++ 	kvm_for_each_vcpu(i, src_vcpu, src) {
++ 		src_svm = to_svm(src_vcpu);
++ 		dst_vcpu = kvm_get_vcpu(dst, i);
++ 		dst_svm = to_svm(dst_vcpu);
++ 
++ 		/*
++ 		 * Transfer VMSA and GHCB state to the destination.  Nullify and
++ 		 * clear source fields as appropriate, the state now belongs to
++ 		 * the destination.
++ 		 */
++ 		memcpy(&dst_svm->sev_es, &src_svm->sev_es, sizeof(src_svm->sev_es));
++ 		dst_svm->vmcb->control.ghcb_gpa = src_svm->vmcb->control.ghcb_gpa;
++ 		dst_svm->vmcb->control.vmsa_pa = src_svm->vmcb->control.vmsa_pa;
++ 		dst_vcpu->arch.guest_state_protected = true;
++ 
++ 		memset(&src_svm->sev_es, 0, sizeof(src_svm->sev_es));
++ 		src_svm->vmcb->control.ghcb_gpa = INVALID_PAGE;
++ 		src_svm->vmcb->control.vmsa_pa = INVALID_PAGE;
++ 		src_vcpu->arch.guest_state_protected = false;
++ 	}
++ 	to_kvm_svm(src)->sev_info.es_active = false;
++ 	to_kvm_svm(dst)->sev_info.es_active = true;
++ 
++ 	return 0;
++ }
++ 
++ int svm_vm_migrate_from(struct kvm *kvm, unsigned int source_fd)
++ {
++ 	struct kvm_sev_info *dst_sev = &to_kvm_svm(kvm)->sev_info;
++ 	struct kvm_sev_info *src_sev, *cg_cleanup_sev;
++ 	struct file *source_kvm_file;
++ 	struct kvm *source_kvm;
++ 	bool charged = false;
++ 	int ret;
++ 
++ 	source_kvm_file = fget(source_fd);
++ 	if (!file_is_kvm(source_kvm_file)) {
++ 		ret = -EBADF;
++ 		goto out_fput;
++ 	}
++ 
++ 	source_kvm = source_kvm_file->private_data;
++ 	ret = sev_lock_two_vms(kvm, source_kvm);
++ 	if (ret)
++ 		goto out_fput;
++ 
++ 	if (sev_guest(kvm) || !sev_guest(source_kvm)) {
++ 		ret = -EINVAL;
++ 		goto out_unlock;
++ 	}
++ 
++ 	src_sev = &to_kvm_svm(source_kvm)->sev_info;
++ 
++ 	/*
++ 	 * VMs mirroring src's encryption context rely on it to keep the
++ 	 * ASID allocated, but below we are clearing src_sev->asid.
++ 	 */
++ 	if (src_sev->num_mirrored_vms) {
++ 		ret = -EBUSY;
++ 		goto out_unlock;
++ 	}
++ 
++ 	dst_sev->misc_cg = get_current_misc_cg();
++ 	cg_cleanup_sev = dst_sev;
++ 	if (dst_sev->misc_cg != src_sev->misc_cg) {
++ 		ret = sev_misc_cg_try_charge(dst_sev);
++ 		if (ret)
++ 			goto out_dst_cgroup;
++ 		charged = true;
++ 	}
++ 
++ 	ret = sev_lock_vcpus_for_migration(kvm);
++ 	if (ret)
++ 		goto out_dst_cgroup;
++ 	ret = sev_lock_vcpus_for_migration(source_kvm);
++ 	if (ret)
++ 		goto out_dst_vcpu;
++ 
++ 	if (sev_es_guest(source_kvm)) {
++ 		ret = sev_es_migrate_from(kvm, source_kvm);
++ 		if (ret)
++ 			goto out_source_vcpu;
++ 	}
++ 	sev_migrate_from(dst_sev, src_sev);
++ 	kvm_vm_dead(source_kvm);
++ 	cg_cleanup_sev = src_sev;
++ 	ret = 0;
++ 
++ out_source_vcpu:
++ 	sev_unlock_vcpus_for_migration(source_kvm);
++ out_dst_vcpu:
++ 	sev_unlock_vcpus_for_migration(kvm);
++ out_dst_cgroup:
++ 	/* Operates on the source on success, on the destination on failure.  */
++ 	if (charged)
++ 		sev_misc_cg_uncharge(cg_cleanup_sev);
++ 	put_misc_cg(cg_cleanup_sev->misc_cg);
++ 	cg_cleanup_sev->misc_cg = NULL;
++ out_unlock:
++ 	sev_unlock_two_vms(kvm, source_kvm);
++ out_fput:
++ 	if (source_kvm_file)
++ 		fput(source_kvm_file);
++ 	return ret;
++ }
++ 
+++>>>>>>> 46808a4cb897 (KVM: Use 'unsigned long' as kvm_for_each_vcpu()'s index)
+  int svm_mem_enc_op(struct kvm *kvm, void __user *argp)
+  {
+  	struct kvm_sev_cmd sev_cmd;
+diff --cc arch/x86/kvm/x86.c
+index 91e139cea33b,96bcf2035bdc..000000000000
+--- a/arch/x86/kvm/x86.c
++++ b/arch/x86/kvm/x86.c
+@@@ -2827,10 -2807,19 +2827,21 @@@ static void kvm_gen_update_masterclock(
+  	kvm_make_mclock_inprogress_request(kvm);
+  
+  	/* no guest entries from this point */
+ -	__kvm_start_pvclock_update(kvm);
+ -}
+ +	raw_spin_lock_irqsave(&ka->pvclock_gtod_sync_lock, flags);
+ +	pvclock_update_vm_gtod_copy(kvm);
+ +	raw_spin_unlock_irqrestore(&ka->pvclock_gtod_sync_lock, flags);
+  
+++<<<<<<< HEAD
+++=======
++ static void kvm_end_pvclock_update(struct kvm *kvm)
++ {
++ 	struct kvm_arch *ka = &kvm->arch;
++ 	struct kvm_vcpu *vcpu;
++ 	unsigned long i;
++ 
++ 	write_seqcount_end(&ka->pvclock_sc);
++ 	raw_spin_unlock_irq(&ka->tsc_write_lock);
+++>>>>>>> 46808a4cb897 (KVM: Use 'unsigned long' as kvm_for_each_vcpu()'s index)
+  	kvm_for_each_vcpu(i, vcpu, kvm)
+  		kvm_make_request(KVM_REQ_CLOCK_UPDATE, vcpu);
+  
+diff --cc virt/kvm/kvm_main.c
+index 13b1084d09e4,1c68384a7c4b..000000000000
+--- a/virt/kvm/kvm_main.c
++++ b/virt/kvm/kvm_main.c
+@@@ -470,7 -451,20 +471,24 @@@ void kvm_vcpu_destroy(struct kvm_vcpu *
+  	free_page((unsigned long)vcpu->run);
+  	kmem_cache_free(kvm_vcpu_cache, vcpu);
+  }
+++<<<<<<< HEAD
+ +EXPORT_SYMBOL_GPL(kvm_vcpu_destroy);
+++=======
++ 
++ void kvm_destroy_vcpus(struct kvm *kvm)
++ {
++ 	unsigned long i;
++ 	struct kvm_vcpu *vcpu;
++ 
++ 	kvm_for_each_vcpu(i, vcpu, kvm) {
++ 		kvm_vcpu_destroy(vcpu);
++ 		xa_erase(&kvm->vcpu_array, i);
++ 	}
++ 
++ 	atomic_set(&kvm->online_vcpus, 0);
++ }
++ EXPORT_SYMBOL_GPL(kvm_destroy_vcpus);
+++>>>>>>> 46808a4cb897 (KVM: Use 'unsigned long' as kvm_for_each_vcpu()'s index)
+  
+  #if defined(CONFIG_MMU_NOTIFIER) && defined(KVM_ARCH_WANT_MMU_NOTIFIER)
+  static inline struct kvm *mmu_notifier_to_kvm(struct mmu_notifier *mn)
+* Unmerged path arch/riscv/kvm/vcpu_sbi.c
+* Unmerged path arch/riscv/kvm/vmid.c
+diff --git a/arch/arm64/kvm/arch_timer.c b/arch/arm64/kvm/arch_timer.c
+index 45111a5e9c90..cc6477b2d55a 100644
+--- a/arch/arm64/kvm/arch_timer.c
++++ b/arch/arm64/kvm/arch_timer.c
+@@ -761,7 +761,7 @@ int kvm_timer_vcpu_reset(struct kvm_vcpu *vcpu)
+ /* Make the updates of cntvoff for all vtimer contexts atomic */
+ static void update_vtimer_cntvoff(struct kvm_vcpu *vcpu, u64 cntvoff)
+ {
+-	int i;
++	unsigned long i;
+ 	struct kvm *kvm = vcpu->kvm;
+ 	struct kvm_vcpu *tmp;
+ 
+@@ -1091,8 +1091,8 @@ void kvm_timer_vcpu_terminate(struct kvm_vcpu *vcpu)
+ 
+ static bool timer_irqs_are_valid(struct kvm_vcpu *vcpu)
+ {
+-	int vtimer_irq, ptimer_irq;
+-	int i, ret;
++	int vtimer_irq, ptimer_irq, ret;
++	unsigned long i;
+ 
+ 	vtimer_irq = vcpu_vtimer(vcpu)->irq.irq;
+ 	ret = kvm_vgic_set_owner(vcpu, vtimer_irq, vcpu_vtimer(vcpu));
+@@ -1198,7 +1198,7 @@ void kvm_timer_init_vhe(void)
+ static void set_timer_irqs(struct kvm *kvm, int vtimer_irq, int ptimer_irq)
+ {
+ 	struct kvm_vcpu *vcpu;
+-	int i;
++	unsigned long i;
+ 
+ 	kvm_for_each_vcpu(i, vcpu, kvm) {
+ 		vcpu_vtimer(vcpu)->irq.irq = vtimer_irq;
+diff --git a/arch/arm64/kvm/arm.c b/arch/arm64/kvm/arm.c
+index c717141ce25d..5fd0b0c49b77 100644
+--- a/arch/arm64/kvm/arm.c
++++ b/arch/arm64/kvm/arm.c
+@@ -579,7 +579,7 @@ bool kvm_arch_intc_initialized(struct kvm *kvm)
+ 
+ void kvm_arm_halt_guest(struct kvm *kvm)
+ {
+-	int i;
++	unsigned long i;
+ 	struct kvm_vcpu *vcpu;
+ 
+ 	kvm_for_each_vcpu(i, vcpu, kvm)
+@@ -589,7 +589,7 @@ void kvm_arm_halt_guest(struct kvm *kvm)
+ 
+ void kvm_arm_resume_guest(struct kvm *kvm)
+ {
+-	int i;
++	unsigned long i;
+ 	struct kvm_vcpu *vcpu;
+ 
+ 	kvm_for_each_vcpu(i, vcpu, kvm) {
+@@ -1607,7 +1607,7 @@ static void check_kvm_target_cpu(void *ret)
+ struct kvm_vcpu *kvm_mpidr_to_vcpu(struct kvm *kvm, unsigned long mpidr)
+ {
+ 	struct kvm_vcpu *vcpu;
+-	int i;
++	unsigned long i;
+ 
+ 	mpidr &= MPIDR_HWID_BITMASK;
+ 	kvm_for_each_vcpu(i, vcpu, kvm) {
+diff --git a/arch/arm64/kvm/pmu-emul.c b/arch/arm64/kvm/pmu-emul.c
+index 26cc578c3aab..a4e7294c3e8c 100644
+--- a/arch/arm64/kvm/pmu-emul.c
++++ b/arch/arm64/kvm/pmu-emul.c
+@@ -805,7 +805,7 @@ static int kvm_arm_pmu_v3_init(struct kvm_vcpu *vcpu)
+  */
+ static bool pmu_irq_is_valid(struct kvm *kvm, int irq)
+ {
+-	int i;
++	unsigned long i;
+ 	struct kvm_vcpu *vcpu;
+ 
+ 	kvm_for_each_vcpu(i, vcpu, kvm) {
+diff --git a/arch/arm64/kvm/psci.c b/arch/arm64/kvm/psci.c
+index ec637c43b8c5..d649b3700404 100644
+--- a/arch/arm64/kvm/psci.c
++++ b/arch/arm64/kvm/psci.c
+@@ -132,8 +132,8 @@ static unsigned long kvm_psci_vcpu_on(struct kvm_vcpu *source_vcpu)
+ 
+ static unsigned long kvm_psci_vcpu_affinity_info(struct kvm_vcpu *vcpu)
+ {
+-	int i, matching_cpus = 0;
+-	unsigned long mpidr;
++	int matching_cpus = 0;
++	unsigned long i, mpidr;
+ 	unsigned long target_affinity;
+ 	unsigned long target_affinity_mask;
+ 	unsigned long lowest_affinity_level;
+@@ -175,7 +175,7 @@ static unsigned long kvm_psci_vcpu_affinity_info(struct kvm_vcpu *vcpu)
+ 
+ static void kvm_prepare_system_event(struct kvm_vcpu *vcpu, u32 type)
+ {
+-	int i;
++	unsigned long i;
+ 	struct kvm_vcpu *tmp;
+ 
+ 	/*
+diff --git a/arch/arm64/kvm/reset.c b/arch/arm64/kvm/reset.c
+index 3350edce9e40..b2e6499949da 100644
+--- a/arch/arm64/kvm/reset.c
++++ b/arch/arm64/kvm/reset.c
+@@ -239,7 +239,7 @@ static bool vcpu_allowed_register_width(struct kvm_vcpu *vcpu)
+ {
+ 	struct kvm_vcpu *tmp;
+ 	bool is32bit;
+-	int i;
++	unsigned long i;
+ 
+ 	is32bit = vcpu_has_feature(vcpu, KVM_ARM_VCPU_EL1_32BIT);
+ 	if (!cpus_have_const_cap(ARM64_HAS_32BIT_EL1) && is32bit)
+diff --git a/arch/arm64/kvm/vgic/vgic-init.c b/arch/arm64/kvm/vgic/vgic-init.c
+index a8ce86ca3ba5..32ef3290e26f 100644
+--- a/arch/arm64/kvm/vgic/vgic-init.c
++++ b/arch/arm64/kvm/vgic/vgic-init.c
+@@ -81,8 +81,9 @@ void kvm_vgic_early_init(struct kvm *kvm)
+  */
+ int kvm_vgic_create(struct kvm *kvm, u32 type)
+ {
+-	int i, ret;
+ 	struct kvm_vcpu *vcpu;
++	unsigned long i;
++	int ret;
+ 
+ 	if (irqchip_in_kernel(kvm))
+ 		return -EEXIST;
+@@ -266,7 +267,8 @@ int vgic_init(struct kvm *kvm)
+ {
+ 	struct vgic_dist *dist = &kvm->arch.vgic;
+ 	struct kvm_vcpu *vcpu;
+-	int ret = 0, i, idx;
++	int ret = 0, i;
++	unsigned long idx;
+ 
+ 	if (vgic_initialized(kvm))
+ 		return 0;
+@@ -319,7 +321,7 @@ int vgic_init(struct kvm *kvm)
+ 			goto out;
+ 	}
+ 
+-	kvm_for_each_vcpu(i, vcpu, kvm)
++	kvm_for_each_vcpu(idx, vcpu, kvm)
+ 		kvm_vgic_vcpu_enable(vcpu);
+ 
+ 	ret = kvm_vgic_setup_default_irq_routing(kvm);
+@@ -381,7 +383,7 @@ void kvm_vgic_vcpu_destroy(struct kvm_vcpu *vcpu)
+ static void __kvm_vgic_destroy(struct kvm *kvm)
+ {
+ 	struct kvm_vcpu *vcpu;
+-	int i;
++	unsigned long i;
+ 
+ 	vgic_debug_destroy(kvm);
+ 
+diff --git a/arch/arm64/kvm/vgic/vgic-kvm-device.c b/arch/arm64/kvm/vgic/vgic-kvm-device.c
+index 8df9e2300e2a..849481e174cb 100644
+--- a/arch/arm64/kvm/vgic/vgic-kvm-device.c
++++ b/arch/arm64/kvm/vgic/vgic-kvm-device.c
+@@ -326,7 +326,7 @@ void unlock_all_vcpus(struct kvm *kvm)
+ bool lock_all_vcpus(struct kvm *kvm)
+ {
+ 	struct kvm_vcpu *tmp_vcpu;
+-	int c;
++	unsigned long c;
+ 
+ 	/*
+ 	 * Any time a vcpu is run, vcpu_load is called which tries to grab the
+diff --git a/arch/arm64/kvm/vgic/vgic-mmio-v2.c b/arch/arm64/kvm/vgic/vgic-mmio-v2.c
+index ea6b949f334e..5ec19b01210a 100644
+--- a/arch/arm64/kvm/vgic/vgic-mmio-v2.c
++++ b/arch/arm64/kvm/vgic/vgic-mmio-v2.c
+@@ -121,9 +121,8 @@ static void vgic_mmio_write_sgir(struct kvm_vcpu *source_vcpu,
+ 	int intid = val & 0xf;
+ 	int targets = (val >> 16) & 0xff;
+ 	int mode = (val >> 24) & 0x03;
+-	int c;
+ 	struct kvm_vcpu *vcpu;
+-	unsigned long flags;
++	unsigned long flags, c;
+ 
+ 	switch (mode) {
+ 	case 0x0:		/* as specified by targets */
+diff --git a/arch/arm64/kvm/vgic/vgic-mmio-v3.c b/arch/arm64/kvm/vgic/vgic-mmio-v3.c
+index a8219f6c8aa1..b5aa87af657e 100644
+--- a/arch/arm64/kvm/vgic/vgic-mmio-v3.c
++++ b/arch/arm64/kvm/vgic/vgic-mmio-v3.c
+@@ -762,7 +762,8 @@ static void vgic_unregister_redist_iodev(struct kvm_vcpu *vcpu)
+ static int vgic_register_all_redist_iodevs(struct kvm *kvm)
+ {
+ 	struct kvm_vcpu *vcpu;
+-	int c, ret = 0;
++	unsigned long c;
++	int ret = 0;
+ 
+ 	kvm_for_each_vcpu(c, vcpu, kvm) {
+ 		ret = vgic_register_redist_iodev(vcpu);
+@@ -1001,10 +1002,10 @@ void vgic_v3_dispatch_sgi(struct kvm_vcpu *vcpu, u64 reg, bool allow_group1)
+ 	struct kvm_vcpu *c_vcpu;
+ 	u16 target_cpus;
+ 	u64 mpidr;
+-	int sgi, c;
++	int sgi;
+ 	int vcpu_id = vcpu->vcpu_id;
+ 	bool broadcast;
+-	unsigned long flags;
++	unsigned long c, flags;
+ 
+ 	sgi = (reg & ICC_SGI1R_SGI_ID_MASK) >> ICC_SGI1R_SGI_ID_SHIFT;
+ 	broadcast = reg & BIT_ULL(ICC_SGI1R_IRQ_ROUTING_MODE_BIT);
+* Unmerged path arch/arm64/kvm/vgic/vgic-v3.c
+diff --git a/arch/arm64/kvm/vgic/vgic-v4.c b/arch/arm64/kvm/vgic/vgic-v4.c
+index 35a01ab218dc..dfb790cb129e 100644
+--- a/arch/arm64/kvm/vgic/vgic-v4.c
++++ b/arch/arm64/kvm/vgic/vgic-v4.c
+@@ -200,7 +200,7 @@ void vgic_v4_configure_vsgis(struct kvm *kvm)
+ {
+ 	struct vgic_dist *dist = &kvm->arch.vgic;
+ 	struct kvm_vcpu *vcpu;
+-	int i;
++	unsigned long i;
+ 
+ 	kvm_arm_halt_guest(kvm);
+ 
+@@ -227,7 +227,8 @@ int vgic_v4_init(struct kvm *kvm)
+ {
+ 	struct vgic_dist *dist = &kvm->arch.vgic;
+ 	struct kvm_vcpu *vcpu;
+-	int i, nr_vcpus, ret;
++	int nr_vcpus, ret;
++	unsigned long i;
+ 
+ 	if (!kvm_vgic_global_state.has_gicv4)
+ 		return 0; /* Nothing to see here... move along. */
+diff --git a/arch/arm64/kvm/vgic/vgic.c b/arch/arm64/kvm/vgic/vgic.c
+index 59cc901f9d35..ba2631c9c03d 100644
+--- a/arch/arm64/kvm/vgic/vgic.c
++++ b/arch/arm64/kvm/vgic/vgic.c
+@@ -997,7 +997,7 @@ int kvm_vgic_vcpu_pending_irq(struct kvm_vcpu *vcpu)
+ void vgic_kick_vcpus(struct kvm *kvm)
+ {
+ 	struct kvm_vcpu *vcpu;
+-	int c;
++	unsigned long c;
+ 
+ 	/*
+ 	 * We've injected an interrupt, time to find out who deserves
+diff --git a/arch/powerpc/kvm/book3s_32_mmu.c b/arch/powerpc/kvm/book3s_32_mmu.c
+index 069e8e45ffd3..59acf4fbf1ab 100644
+--- a/arch/powerpc/kvm/book3s_32_mmu.c
++++ b/arch/powerpc/kvm/book3s_32_mmu.c
+@@ -349,7 +349,7 @@ static void kvmppc_mmu_book3s_32_mtsrin(struct kvm_vcpu *vcpu, u32 srnum,
+ 
+ static void kvmppc_mmu_book3s_32_tlbie(struct kvm_vcpu *vcpu, ulong ea, bool large)
+ {
+-	int i;
++	unsigned long i;
+ 	struct kvm_vcpu *v;
+ 
+ 	/* flush this VA on all cpus */
+diff --git a/arch/powerpc/kvm/book3s_64_mmu.c b/arch/powerpc/kvm/book3s_64_mmu.c
+index a4bf163417a1..a154f9a23005 100644
+--- a/arch/powerpc/kvm/book3s_64_mmu.c
++++ b/arch/powerpc/kvm/book3s_64_mmu.c
+@@ -543,7 +543,7 @@ static void kvmppc_mmu_book3s_64_tlbie(struct kvm_vcpu *vcpu, ulong va,
+ 				       bool large)
+ {
+ 	u64 mask = 0xFFFFFFFFFULL;
+-	long i;
++	unsigned long i;
+ 	struct kvm_vcpu *v;
+ 
+ 	dprintk("KVM MMU: tlbie(0x%lx)\n", va);
+diff --git a/arch/powerpc/kvm/book3s_hv.c b/arch/powerpc/kvm/book3s_hv.c
+index fbfb23772025..f4596c23aac9 100644
+--- a/arch/powerpc/kvm/book3s_hv.c
++++ b/arch/powerpc/kvm/book3s_hv.c
+@@ -1708,7 +1708,7 @@ static void kvmppc_set_lpcr(struct kvm_vcpu *vcpu, u64 new_lpcr,
+ 	 */
+ 	if ((new_lpcr & LPCR_ILE) != (vc->lpcr & LPCR_ILE)) {
+ 		struct kvm_vcpu *vcpu;
+-		int i;
++		unsigned long i;
+ 
+ 		kvm_for_each_vcpu(i, vcpu, kvm) {
+ 			if (vcpu->arch.vcore != vc)
+@@ -4564,8 +4564,8 @@ static int kvm_vm_ioctl_get_dirty_log_hv(struct kvm *kvm,
+ {
+ 	struct kvm_memslots *slots;
+ 	struct kvm_memory_slot *memslot;
+-	int i, r;
+-	unsigned long n;
++	int r;
++	unsigned long n, i;
+ 	unsigned long *buf, *p;
+ 	struct kvm_vcpu *vcpu;
+ 
+@@ -5639,7 +5639,7 @@ static int kvmhv_svm_off(struct kvm *kvm)
+ 	int mmu_was_ready;
+ 	int srcu_idx;
+ 	int ret = 0;
+-	int i;
++	unsigned long i;
+ 
+ 	if (!(kvm->arch.secure_guest & KVMPPC_SECURE_INIT_START))
+ 		return ret;
+diff --git a/arch/powerpc/kvm/book3s_pr.c b/arch/powerpc/kvm/book3s_pr.c
+index 0c3232959abe..f7a205792245 100644
+--- a/arch/powerpc/kvm/book3s_pr.c
++++ b/arch/powerpc/kvm/book3s_pr.c
+@@ -431,7 +431,7 @@ static int kvmppc_core_check_requests_pr(struct kvm_vcpu *vcpu)
+ /************* MMU Notifiers *************/
+ static bool do_kvm_unmap_gfn(struct kvm *kvm, struct kvm_gfn_range *range)
+ {
+-	long i;
++	unsigned long i;
+ 	struct kvm_vcpu *vcpu;
+ 
+ 	kvm_for_each_vcpu(i, vcpu, kvm)
+diff --git a/arch/powerpc/kvm/book3s_xics.c b/arch/powerpc/kvm/book3s_xics.c
+index af4f050f486d..27b3a019666f 100644
+--- a/arch/powerpc/kvm/book3s_xics.c
++++ b/arch/powerpc/kvm/book3s_xics.c
+@@ -945,8 +945,8 @@ static int xics_debug_show(struct seq_file *m, void *private)
+ 	struct kvmppc_xics *xics = m->private;
+ 	struct kvm *kvm = xics->kvm;
+ 	struct kvm_vcpu *vcpu;
+-	int icsid, i;
+-	unsigned long flags;
++	int icsid;
++	unsigned long flags, i;
+ 	unsigned long t_rm_kick_vcpu, t_rm_check_resend;
+ 	unsigned long t_rm_notify_eoi;
+ 	unsigned long t_reject, t_check_resend;
+@@ -1343,7 +1343,7 @@ static int xics_has_attr(struct kvm_device *dev, struct kvm_device_attr *attr)
+ static void kvmppc_xics_release(struct kvm_device *dev)
+ {
+ 	struct kvmppc_xics *xics = dev->private;
+-	int i;
++	unsigned long i;
+ 	struct kvm *kvm = xics->kvm;
+ 	struct kvm_vcpu *vcpu;
+ 
+diff --git a/arch/powerpc/kvm/book3s_xics.h b/arch/powerpc/kvm/book3s_xics.h
+index 453c9e518c19..e78262ed8ca7 100644
+--- a/arch/powerpc/kvm/book3s_xics.h
++++ b/arch/powerpc/kvm/book3s_xics.h
+@@ -119,7 +119,7 @@ static inline struct kvmppc_icp *kvmppc_xics_find_server(struct kvm *kvm,
+ 							 u32 nr)
+ {
+ 	struct kvm_vcpu *vcpu = NULL;
+-	int i;
++	unsigned long i;
+ 
+ 	kvm_for_each_vcpu(i, vcpu, kvm) {
+ 		if (vcpu->arch.icp && nr == vcpu->arch.icp->server_num)
+diff --git a/arch/powerpc/kvm/book3s_xive.c b/arch/powerpc/kvm/book3s_xive.c
+index 2f1106e13520..b7d0f094c236 100644
+--- a/arch/powerpc/kvm/book3s_xive.c
++++ b/arch/powerpc/kvm/book3s_xive.c
+@@ -285,7 +285,8 @@ static int xive_check_provisioning(struct kvm *kvm, u8 prio)
+ {
+ 	struct kvmppc_xive *xive = kvm->arch.xive;
+ 	struct kvm_vcpu *vcpu;
+-	int i, rc;
++	unsigned long i;
++	int rc;
+ 
+ 	lockdep_assert_held(&xive->lock);
+ 
+@@ -356,7 +357,8 @@ static int xive_try_pick_queue(struct kvm_vcpu *vcpu, u8 prio)
+ int kvmppc_xive_select_target(struct kvm *kvm, u32 *server, u8 prio)
+ {
+ 	struct kvm_vcpu *vcpu;
+-	int i, rc;
++	unsigned long i;
++	int rc;
+ 
+ 	/* Locate target server */
+ 	vcpu = kvmppc_xive_find_server(kvm, *server);
+@@ -1430,7 +1432,8 @@ static void xive_pre_save_queue(struct kvmppc_xive *xive, struct xive_q *q)
+ static void xive_pre_save_scan(struct kvmppc_xive *xive)
+ {
+ 	struct kvm_vcpu *vcpu = NULL;
+-	int i, j;
++	unsigned long i;
++	int j;
+ 
+ 	/*
+ 	 * See comment in xive_get_source() about how this
+@@ -1611,7 +1614,7 @@ static bool xive_check_delayed_irq(struct kvmppc_xive *xive, u32 irq)
+ {
+ 	struct kvm *kvm = xive->kvm;
+ 	struct kvm_vcpu *vcpu = NULL;
+-	int i;
++	unsigned long i;
+ 
+ 	kvm_for_each_vcpu(i, vcpu, kvm) {
+ 		struct kvmppc_xive_vcpu *xc = vcpu->arch.xive_vcpu;
+@@ -1948,7 +1951,7 @@ static void kvmppc_xive_release(struct kvm_device *dev)
+ 	struct kvmppc_xive *xive = dev->private;
+ 	struct kvm *kvm = xive->kvm;
+ 	struct kvm_vcpu *vcpu;
+-	int i;
++	unsigned long i;
+ 
+ 	pr_devel("Releasing xive device\n");
+ 
+@@ -2168,7 +2171,7 @@ static int xive_debug_show(struct seq_file *m, void *private)
+ 	u64 t_vm_h_cppr = 0;
+ 	u64 t_vm_h_eoi = 0;
+ 	u64 t_vm_h_ipi = 0;
+-	unsigned int i;
++	unsigned long i;
+ 
+ 	if (!kvm)
+ 		return 0;
+diff --git a/arch/powerpc/kvm/book3s_xive.h b/arch/powerpc/kvm/book3s_xive.h
+index 89e6c9acf854..a174a2ee3072 100644
+--- a/arch/powerpc/kvm/book3s_xive.h
++++ b/arch/powerpc/kvm/book3s_xive.h
+@@ -199,7 +199,7 @@ struct kvmppc_xive_vcpu {
+ static inline struct kvm_vcpu *kvmppc_xive_find_server(struct kvm *kvm, u32 nr)
+ {
+ 	struct kvm_vcpu *vcpu = NULL;
+-	int i;
++	unsigned long i;
+ 
+ 	kvm_for_each_vcpu(i, vcpu, kvm) {
+ 		if (vcpu->arch.xive_vcpu && nr == vcpu->arch.xive_vcpu->server_num)
+@@ -240,7 +240,7 @@ static inline u32 kvmppc_xive_vp(struct kvmppc_xive *xive, u32 server)
+ static inline bool kvmppc_xive_vp_in_use(struct kvm *kvm, u32 vp_id)
+ {
+ 	struct kvm_vcpu *vcpu = NULL;
+-	int i;
++	unsigned long i;
+ 
+ 	kvm_for_each_vcpu(i, vcpu, kvm) {
+ 		if (vcpu->arch.xive_vcpu && vp_id == vcpu->arch.xive_vcpu->vp_id)
+diff --git a/arch/powerpc/kvm/book3s_xive_native.c b/arch/powerpc/kvm/book3s_xive_native.c
+index 76800c84f2a3..a5278fac0e75 100644
+--- a/arch/powerpc/kvm/book3s_xive_native.c
++++ b/arch/powerpc/kvm/book3s_xive_native.c
+@@ -801,7 +801,7 @@ static int kvmppc_xive_reset(struct kvmppc_xive *xive)
+ {
+ 	struct kvm *kvm = xive->kvm;
+ 	struct kvm_vcpu *vcpu;
+-	unsigned int i;
++	unsigned long i;
+ 
+ 	pr_devel("%s\n", __func__);
+ 
+@@ -910,7 +910,7 @@ static int kvmppc_xive_native_eq_sync(struct kvmppc_xive *xive)
+ {
+ 	struct kvm *kvm = xive->kvm;
+ 	struct kvm_vcpu *vcpu;
+-	unsigned int i;
++	unsigned long i;
+ 
+ 	pr_devel("%s\n", __func__);
+ 
+@@ -1011,7 +1011,7 @@ static void kvmppc_xive_native_release(struct kvm_device *dev)
+ 	struct kvmppc_xive *xive = dev->private;
+ 	struct kvm *kvm = xive->kvm;
+ 	struct kvm_vcpu *vcpu;
+-	int i;
++	unsigned long i;
+ 
+ 	pr_devel("Releasing xive native device\n");
+ 
+@@ -1203,7 +1203,7 @@ static int xive_native_debug_show(struct seq_file *m, void *private)
+ 	struct kvmppc_xive *xive = m->private;
+ 	struct kvm *kvm = xive->kvm;
+ 	struct kvm_vcpu *vcpu;
+-	unsigned int i;
++	unsigned long i;
+ 
+ 	if (!kvm)
+ 		return 0;
+diff --git a/arch/powerpc/kvm/e500_emulate.c b/arch/powerpc/kvm/e500_emulate.c
+index 6ea3dbd6065a..fbe0a026ccaa 100644
+--- a/arch/powerpc/kvm/e500_emulate.c
++++ b/arch/powerpc/kvm/e500_emulate.c
+@@ -68,7 +68,7 @@ static int kvmppc_e500_emul_msgsnd(struct kvm_vcpu *vcpu, int rb)
+ 	ulong param = vcpu->arch.regs.gpr[rb];
+ 	int prio = dbell2prio(rb);
+ 	int pir = param & PPC_DBELL_PIR_MASK;
+-	int i;
++	unsigned long i;
+ 	struct kvm_vcpu *cvcpu;
+ 
+ 	if (prio < 0)
+* Unmerged path arch/riscv/kvm/vcpu_sbi.c
+* Unmerged path arch/riscv/kvm/vmid.c
+diff --git a/arch/s390/kvm/interrupt.c b/arch/s390/kvm/interrupt.c
+index fad1be82e605..fb933b0bb40c 100644
+--- a/arch/s390/kvm/interrupt.c
++++ b/arch/s390/kvm/interrupt.c
+@@ -2667,7 +2667,7 @@ static int flic_ais_mode_set_all(struct kvm *kvm, struct kvm_device_attr *attr)
+ static int flic_set_attr(struct kvm_device *dev, struct kvm_device_attr *attr)
+ {
+ 	int r = 0;
+-	unsigned int i;
++	unsigned long i;
+ 	struct kvm_vcpu *vcpu;
+ 
+ 	switch (attr->group) {
+diff --git a/arch/s390/kvm/kvm-s390.c b/arch/s390/kvm/kvm-s390.c
+index d74a232fd87a..bf2571fa90f1 100644
+--- a/arch/s390/kvm/kvm-s390.c
++++ b/arch/s390/kvm/kvm-s390.c
+@@ -294,7 +294,7 @@ static int kvm_clock_sync(struct notifier_block *notifier, unsigned long val,
+ {
+ 	struct kvm *kvm;
+ 	struct kvm_vcpu *vcpu;
+-	int i;
++	unsigned long i;
+ 	unsigned long long *delta = v;
+ 
+ 	list_for_each_entry(kvm, &vm_list, vm_list) {
+@@ -680,7 +680,7 @@ int kvm_vm_ioctl_get_dirty_log(struct kvm *kvm,
+ 
+ static void icpt_operexc_on_all_vcpus(struct kvm *kvm)
+ {
+-	unsigned int i;
++	unsigned long i;
+ 	struct kvm_vcpu *vcpu;
+ 
+ 	kvm_for_each_vcpu(i, vcpu, kvm) {
+@@ -934,7 +934,7 @@ static void kvm_s390_vcpu_crypto_setup(struct kvm_vcpu *vcpu);
+ void kvm_s390_vcpu_crypto_reset_all(struct kvm *kvm)
+ {
+ 	struct kvm_vcpu *vcpu;
+-	int i;
++	unsigned long i;
+ 
+ 	kvm_s390_vcpu_block_all(kvm);
+ 
+@@ -1019,7 +1019,7 @@ static int kvm_s390_vm_set_crypto(struct kvm *kvm, struct kvm_device_attr *attr)
+ 
+ static void kvm_s390_sync_request_broadcast(struct kvm *kvm, int req)
+ {
+-	int cx;
++	unsigned long cx;
+ 	struct kvm_vcpu *vcpu;
+ 
+ 	kvm_for_each_vcpu(cx, vcpu, kvm)
+@@ -2175,7 +2175,7 @@ static int kvm_s390_cpus_from_pv(struct kvm *kvm, u16 *rcp, u16 *rrcp)
+ 	struct kvm_vcpu *vcpu;
+ 	u16 rc, rrc;
+ 	int ret = 0;
+-	int i;
++	unsigned long i;
+ 
+ 	/*
+ 	 * We ignore failures and try to destroy as many CPUs as possible.
+@@ -2199,7 +2199,8 @@ static int kvm_s390_cpus_from_pv(struct kvm *kvm, u16 *rcp, u16 *rrcp)
+ 
+ static int kvm_s390_cpus_to_pv(struct kvm *kvm, u16 *rc, u16 *rrc)
+ {
+-	int i, r = 0;
++	unsigned long i;
++	int r = 0;
+ 	u16 dummy;
+ 
+ 	struct kvm_vcpu *vcpu;
+@@ -2890,7 +2891,7 @@ static int sca_switch_to_extended(struct kvm *kvm)
+ 	struct bsca_block *old_sca = kvm->arch.sca;
+ 	struct esca_block *new_sca;
+ 	struct kvm_vcpu *vcpu;
+-	unsigned int vcpu_idx;
++	unsigned long vcpu_idx;
+ 	u32 scaol, scaoh;
+ 
+ 	if (kvm->arch.use_esca)
+@@ -3372,7 +3373,7 @@ static void kvm_gmap_notifier(struct gmap *gmap, unsigned long start,
+ 	struct kvm *kvm = gmap->private;
+ 	struct kvm_vcpu *vcpu;
+ 	unsigned long prefix;
+-	int i;
++	unsigned long i;
+ 
+ 	if (gmap_is_shadow(gmap))
+ 		return;
+@@ -3864,7 +3865,7 @@ static void __kvm_s390_set_tod_clock(struct kvm *kvm, const struct kvm_s390_vm_t
+ {
+ 	struct kvm_vcpu *vcpu;
+ 	union tod_clock clk;
+-	int i;
++	unsigned long i;
+ 
+ 	preempt_disable();
+ 
+@@ -4511,7 +4512,7 @@ static void __disable_ibs_on_vcpu(struct kvm_vcpu *vcpu)
+ 
+ static void __disable_ibs_on_all_vcpus(struct kvm *kvm)
+ {
+-	unsigned int i;
++	unsigned long i;
+ 	struct kvm_vcpu *vcpu;
+ 
+ 	kvm_for_each_vcpu(i, vcpu, kvm) {
+diff --git a/arch/s390/kvm/kvm-s390.h b/arch/s390/kvm/kvm-s390.h
+index d2bb3e5db9d2..04be71c29ac1 100644
+--- a/arch/s390/kvm/kvm-s390.h
++++ b/arch/s390/kvm/kvm-s390.h
+@@ -369,7 +369,7 @@ int kvm_s390_handle_diag(struct kvm_vcpu *vcpu);
+ 
+ static inline void kvm_s390_vcpu_block_all(struct kvm *kvm)
+ {
+-	int i;
++	unsigned long i;
+ 	struct kvm_vcpu *vcpu;
+ 
+ 	WARN_ON(!mutex_is_locked(&kvm->lock));
+@@ -379,7 +379,7 @@ static inline void kvm_s390_vcpu_block_all(struct kvm *kvm)
+ 
+ static inline void kvm_s390_vcpu_unblock_all(struct kvm *kvm)
+ {
+-	int i;
++	unsigned long i;
+ 	struct kvm_vcpu *vcpu;
+ 
+ 	kvm_for_each_vcpu(i, vcpu, kvm)
+diff --git a/arch/x86/kvm/hyperv.c b/arch/x86/kvm/hyperv.c
+index 6b45a1f562d3..b9e2f1ef7d36 100644
+--- a/arch/x86/kvm/hyperv.c
++++ b/arch/x86/kvm/hyperv.c
+@@ -164,7 +164,7 @@ static int synic_set_sint(struct kvm_vcpu_hv_synic *synic, int sint,
+ static struct kvm_vcpu *get_vcpu_by_vpidx(struct kvm *kvm, u32 vpidx)
+ {
+ 	struct kvm_vcpu *vcpu = NULL;
+-	int i;
++	unsigned long i;
+ 
+ 	if (vpidx >= KVM_MAX_VCPUS)
+ 		return NULL;
+@@ -1716,7 +1716,8 @@ static __always_inline unsigned long *sparse_set_to_vcpu_mask(
+ {
+ 	struct kvm_hv *hv = to_kvm_hv(kvm);
+ 	struct kvm_vcpu *vcpu;
+-	int i, bank, sbank = 0;
++	int bank, sbank = 0;
++	unsigned long i;
+ 
+ 	memset(vp_bitmap, 0,
+ 	       KVM_HV_MAX_SPARSE_VCPU_SET_BITS * sizeof(*vp_bitmap));
+@@ -1863,7 +1864,7 @@ static void kvm_send_ipi_to_many(struct kvm *kvm, u32 vector,
+ 		.vector = vector
+ 	};
+ 	struct kvm_vcpu *vcpu;
+-	int i;
++	unsigned long i;
+ 
+ 	kvm_for_each_vcpu(i, vcpu, kvm) {
+ 		if (vcpu_bitmap && !test_bit(i, vcpu_bitmap))
+diff --git a/arch/x86/kvm/i8254.c b/arch/x86/kvm/i8254.c
+index 5a69cce4d72d..0b65a764ed3a 100644
+--- a/arch/x86/kvm/i8254.c
++++ b/arch/x86/kvm/i8254.c
+@@ -242,7 +242,7 @@ static void pit_do_work(struct kthread_work *work)
+ 	struct kvm_pit *pit = container_of(work, struct kvm_pit, expired);
+ 	struct kvm *kvm = pit->kvm;
+ 	struct kvm_vcpu *vcpu;
+-	int i;
++	unsigned long i;
+ 	struct kvm_kpit_state *ps = &pit->pit_state;
+ 
+ 	if (atomic_read(&ps->reinject) && !atomic_xchg(&ps->irq_ack, 0))
+diff --git a/arch/x86/kvm/i8259.c b/arch/x86/kvm/i8259.c
+index 0b80263d46d8..814064d06016 100644
+--- a/arch/x86/kvm/i8259.c
++++ b/arch/x86/kvm/i8259.c
+@@ -50,7 +50,7 @@ static void pic_unlock(struct kvm_pic *s)
+ {
+ 	bool wakeup = s->wakeup_needed;
+ 	struct kvm_vcpu *vcpu;
+-	int i;
++	unsigned long i;
+ 
+ 	s->wakeup_needed = false;
+ 
+@@ -270,7 +270,8 @@ int kvm_pic_read_irq(struct kvm *kvm)
+ 
+ static void kvm_pic_reset(struct kvm_kpic_state *s)
+ {
+-	int irq, i;
++	int irq;
++	unsigned long i;
+ 	struct kvm_vcpu *vcpu;
+ 	u8 edge_irr = s->irr & ~s->elcr;
+ 	bool found = false;
+diff --git a/arch/x86/kvm/ioapic.c b/arch/x86/kvm/ioapic.c
+index 4e0f52660842..97413fec8fa3 100644
+--- a/arch/x86/kvm/ioapic.c
++++ b/arch/x86/kvm/ioapic.c
+@@ -149,7 +149,7 @@ void kvm_rtc_eoi_tracking_restore_one(struct kvm_vcpu *vcpu)
+ static void kvm_rtc_eoi_tracking_restore_all(struct kvm_ioapic *ioapic)
+ {
+ 	struct kvm_vcpu *vcpu;
+-	int i;
++	unsigned long i;
+ 
+ 	if (RTC_GSI >= IOAPIC_NUM_PINS)
+ 		return;
+@@ -184,7 +184,7 @@ static bool rtc_irq_check_coalesced(struct kvm_ioapic *ioapic)
+ 
+ static void ioapic_lazy_update_eoi(struct kvm_ioapic *ioapic, int irq)
+ {
+-	int i;
++	unsigned long i;
+ 	struct kvm_vcpu *vcpu;
+ 	union kvm_ioapic_redirect_entry *entry = &ioapic->redirtbl[irq];
+ 
+diff --git a/arch/x86/kvm/irq_comm.c b/arch/x86/kvm/irq_comm.c
+index 801677671072..f0e46c2bf26d 100644
+--- a/arch/x86/kvm/irq_comm.c
++++ b/arch/x86/kvm/irq_comm.c
+@@ -45,9 +45,9 @@ static int kvm_set_ioapic_irq(struct kvm_kernel_irq_routing_entry *e,
+ int kvm_irq_delivery_to_apic(struct kvm *kvm, struct kvm_lapic *src,
+ 		struct kvm_lapic_irq *irq, struct dest_map *dest_map)
+ {
+-	int i, r = -1;
++	int r = -1;
+ 	struct kvm_vcpu *vcpu, *lowest = NULL;
+-	unsigned long dest_vcpu_bitmap[BITS_TO_LONGS(KVM_MAX_VCPUS)];
++	unsigned long i, dest_vcpu_bitmap[BITS_TO_LONGS(KVM_MAX_VCPUS)];
+ 	unsigned int dest_vcpus = 0;
+ 
+ 	if (kvm_irq_delivery_to_apic_fast(kvm, src, irq, &r, dest_map))
+@@ -320,7 +320,8 @@ int kvm_set_routing_entry(struct kvm *kvm,
+ bool kvm_intr_is_single_vcpu(struct kvm *kvm, struct kvm_lapic_irq *irq,
+ 			     struct kvm_vcpu **dest_vcpu)
+ {
+-	int i, r = 0;
++	int r = 0;
++	unsigned long i;
+ 	struct kvm_vcpu *vcpu;
+ 
+ 	if (kvm_intr_is_single_vcpu_fast(kvm, irq, dest_vcpu))
+diff --git a/arch/x86/kvm/kvm_onhyperv.c b/arch/x86/kvm/kvm_onhyperv.c
+index c7db2df50a7a..b469f45e3fe4 100644
+--- a/arch/x86/kvm/kvm_onhyperv.c
++++ b/arch/x86/kvm/kvm_onhyperv.c
+@@ -33,7 +33,8 @@ int hv_remote_flush_tlb_with_range(struct kvm *kvm,
+ {
+ 	struct kvm_arch *kvm_arch = &kvm->arch;
+ 	struct kvm_vcpu *vcpu;
+-	int ret = 0, i, nr_unique_valid_roots;
++	int ret = 0, nr_unique_valid_roots;
++	unsigned long i;
+ 	hpa_t root;
+ 
+ 	spin_lock(&kvm_arch->hv_root_tdp_lock);
+diff --git a/arch/x86/kvm/lapic.c b/arch/x86/kvm/lapic.c
+index 1fa559671126..1dcfa1e57883 100644
+--- a/arch/x86/kvm/lapic.c
++++ b/arch/x86/kvm/lapic.c
+@@ -185,7 +185,7 @@ void kvm_recalculate_apic_map(struct kvm *kvm)
+ {
+ 	struct kvm_apic_map *new, *old = NULL;
+ 	struct kvm_vcpu *vcpu;
+-	int i;
++	unsigned long i;
+ 	u32 max_id = 255; /* enough space for any xAPIC ID */
+ 
+ 	/* Read kvm->arch.apic_map_dirty before kvm->arch.apic_map.  */
+@@ -1172,8 +1172,8 @@ void kvm_bitmap_or_dest_vcpus(struct kvm *kvm, struct kvm_lapic_irq *irq,
+ 	struct kvm_lapic *src = NULL;
+ 	struct kvm_apic_map *map;
+ 	struct kvm_vcpu *vcpu;
+-	unsigned long bitmap;
+-	int i, vcpu_idx;
++	unsigned long bitmap, i;
++	int vcpu_idx;
+ 	bool ret;
+ 
+ 	rcu_read_lock();
+diff --git a/arch/x86/kvm/svm/avic.c b/arch/x86/kvm/svm/avic.c
+index 06d3591d6afb..7f6cb57f58c7 100644
+--- a/arch/x86/kvm/svm/avic.c
++++ b/arch/x86/kvm/svm/avic.c
+@@ -293,7 +293,7 @@ static void avic_kick_target_vcpus(struct kvm *kvm, struct kvm_lapic *source,
+ 				   u32 icrl, u32 icrh)
+ {
+ 	struct kvm_vcpu *vcpu;
+-	int i;
++	unsigned long i;
+ 
+ 	kvm_for_each_vcpu(i, vcpu, kvm) {
+ 		bool m = kvm_apic_match_dest(vcpu, source,
+* Unmerged path arch/x86/kvm/svm/sev.c
+* Unmerged path arch/x86/kvm/x86.c
+diff --git a/include/linux/kvm_host.h b/include/linux/kvm_host.h
+index 470cdd19398b..0a7c2574e856 100644
+--- a/include/linux/kvm_host.h
++++ b/include/linux/kvm_host.h
+@@ -661,7 +661,7 @@ static inline struct kvm_vcpu *kvm_get_vcpu(struct kvm *kvm, int i)
+ static inline struct kvm_vcpu *kvm_get_vcpu_by_id(struct kvm *kvm, int id)
+ {
+ 	struct kvm_vcpu *vcpu = NULL;
+-	int i;
++	unsigned long i;
+ 
+ 	if (id < 0)
+ 		return NULL;
+* Unmerged path virt/kvm/kvm_main.c
