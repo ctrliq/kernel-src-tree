@@ -1,0 +1,2125 @@
+net: switchdev: remove the transaction structure from port attributes
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-358.el8
+commit-author Vladimir Oltean <vladimir.oltean@nxp.com>
+commit bae33f2b5afea932176c1b9096851c81dc0983de
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-358.el8/bae33f2b.failed
+
+Since the introduction of the switchdev API, port attributes were
+transmitted to drivers for offloading using a two-step transactional
+model, with a prepare phase that was supposed to catch all errors, and a
+commit phase that was supposed to never fail.
+
+Some classes of failures can never be avoided, like hardware access, or
+memory allocation. In the latter case, merely attempting to move the
+memory allocation to the preparation phase makes it impossible to avoid
+memory leaks, since commit 91cf8eceffc1 ("switchdev: Remove unused
+transaction item queue") which has removed the unused mechanism of
+passing on the allocated memory between one phase and another.
+
+It is time we admit that separating the preparation from the commit
+phase is something that is best left for the driver to decide, and not
+something that should be baked into the API, especially since there are
+no switchdev callers that depend on this.
+
+This patch removes the struct switchdev_trans member from switchdev port
+attribute notifier structures, and converts drivers to not look at this
+member.
+
+In part, this patch contains a revert of my previous commit 2e554a7a5d8a
+("net: dsa: propagate switchdev vlan_filtering prepare phase to
+drivers").
+
+For the most part, the conversion was trivial except for:
+- Rocker's world implementation based on Broadcom OF-DPA had an odd
+  implementation of ofdpa_port_attr_bridge_flags_set. The conversion was
+  done mechanically, by pasting the implementation twice, then only
+  keeping the code that would get executed during prepare phase on top,
+  then only keeping the code that gets executed during the commit phase
+  on bottom, then simplifying the resulting code until this was obtained.
+- DSA's offloading of STP state, bridge flags, VLAN filtering and
+  multicast router could be converted right away. But the ageing time
+  could not, so a shim was introduced and this was left for a further
+  commit.
+
+	Signed-off-by: Vladimir Oltean <vladimir.oltean@nxp.com>
+	Acked-by: Linus Walleij <linus.walleij@linaro.org>
+	Acked-by: Jiri Pirko <jiri@nvidia.com>
+	Reviewed-by: Kurt Kanzenbach <kurt@linutronix.de> # hellcreek
+	Reviewed-by: Linus Walleij <linus.walleij@linaro.org> # RTL8366RB
+	Reviewed-by: Ido Schimmel <idosch@nvidia.com>
+	Reviewed-by: Florian Fainelli <f.fainelli@gmail.com>
+	Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+(cherry picked from commit bae33f2b5afea932176c1b9096851c81dc0983de)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/dsa/b53/b53_common.c
+#	drivers/net/dsa/b53/b53_priv.h
+#	drivers/net/dsa/hirschmann/hellcreek.c
+#	drivers/net/dsa/lantiq_gswip.c
+#	drivers/net/dsa/microchip/ksz8795.c
+#	drivers/net/dsa/microchip/ksz9477.c
+#	drivers/net/dsa/mt7530.c
+#	drivers/net/dsa/mv88e6xxx/chip.c
+#	drivers/net/dsa/ocelot/felix.c
+#	drivers/net/dsa/qca8k.c
+#	drivers/net/dsa/realtek-smi-core.h
+#	drivers/net/dsa/rtl8366.c
+#	drivers/net/dsa/sja1105/sja1105.h
+#	drivers/net/dsa/sja1105/sja1105_devlink.c
+#	drivers/net/dsa/sja1105/sja1105_main.c
+#	drivers/net/ethernet/marvell/prestera/prestera_switchdev.c
+#	drivers/net/ethernet/mscc/ocelot.c
+#	drivers/net/ethernet/mscc/ocelot_net.c
+#	drivers/net/ethernet/ti/cpsw_switchdev.c
+#	drivers/staging/fsl-dpaa2/ethsw/ethsw.c
+#	include/soc/mscc/ocelot.h
+#	net/dsa/dsa_priv.h
+#	net/dsa/port.c
+#	net/dsa/slave.c
+#	net/dsa/switch.c
+diff --cc drivers/net/dsa/b53/b53_common.c
+index d93c790bfbe8,f07f547db53e..000000000000
+--- a/drivers/net/dsa/b53/b53_common.c
++++ b/drivers/net/dsa/b53/b53_common.c
+@@@ -1069,8 -1234,152 +1069,155 @@@ static void b53_adjust_link(struct dsa_
+  	p->eee_enabled = b53_eee_init(ds, port, phydev);
+  }
+  
+ -void b53_port_event(struct dsa_switch *ds, int port)
+ +int b53_vlan_filtering(struct dsa_switch *ds, int port, bool vlan_filtering)
+  {
+++<<<<<<< HEAD
+++=======
++ 	struct b53_device *dev = ds->priv;
++ 	bool link;
++ 	u16 sts;
++ 
++ 	b53_read16(dev, B53_STAT_PAGE, B53_LINK_STAT, &sts);
++ 	link = !!(sts & BIT(port));
++ 	dsa_port_phylink_mac_change(ds, port, link);
++ }
++ EXPORT_SYMBOL(b53_port_event);
++ 
++ void b53_phylink_validate(struct dsa_switch *ds, int port,
++ 			  unsigned long *supported,
++ 			  struct phylink_link_state *state)
++ {
++ 	struct b53_device *dev = ds->priv;
++ 	__ETHTOOL_DECLARE_LINK_MODE_MASK(mask) = { 0, };
++ 
++ 	if (dev->ops->serdes_phylink_validate)
++ 		dev->ops->serdes_phylink_validate(dev, port, mask, state);
++ 
++ 	/* Allow all the expected bits */
++ 	phylink_set(mask, Autoneg);
++ 	phylink_set_port_modes(mask);
++ 	phylink_set(mask, Pause);
++ 	phylink_set(mask, Asym_Pause);
++ 
++ 	/* With the exclusion of 5325/5365, MII, Reverse MII and 802.3z, we
++ 	 * support Gigabit, including Half duplex.
++ 	 */
++ 	if (state->interface != PHY_INTERFACE_MODE_MII &&
++ 	    state->interface != PHY_INTERFACE_MODE_REVMII &&
++ 	    !phy_interface_mode_is_8023z(state->interface) &&
++ 	    !(is5325(dev) || is5365(dev))) {
++ 		phylink_set(mask, 1000baseT_Full);
++ 		phylink_set(mask, 1000baseT_Half);
++ 	}
++ 
++ 	if (!phy_interface_mode_is_8023z(state->interface)) {
++ 		phylink_set(mask, 10baseT_Half);
++ 		phylink_set(mask, 10baseT_Full);
++ 		phylink_set(mask, 100baseT_Half);
++ 		phylink_set(mask, 100baseT_Full);
++ 	}
++ 
++ 	bitmap_and(supported, supported, mask,
++ 		   __ETHTOOL_LINK_MODE_MASK_NBITS);
++ 	bitmap_and(state->advertising, state->advertising, mask,
++ 		   __ETHTOOL_LINK_MODE_MASK_NBITS);
++ 
++ 	phylink_helper_basex_speed(state);
++ }
++ EXPORT_SYMBOL(b53_phylink_validate);
++ 
++ int b53_phylink_mac_link_state(struct dsa_switch *ds, int port,
++ 			       struct phylink_link_state *state)
++ {
++ 	struct b53_device *dev = ds->priv;
++ 	int ret = -EOPNOTSUPP;
++ 
++ 	if ((phy_interface_mode_is_8023z(state->interface) ||
++ 	     state->interface == PHY_INTERFACE_MODE_SGMII) &&
++ 	     dev->ops->serdes_link_state)
++ 		ret = dev->ops->serdes_link_state(dev, port, state);
++ 
++ 	return ret;
++ }
++ EXPORT_SYMBOL(b53_phylink_mac_link_state);
++ 
++ void b53_phylink_mac_config(struct dsa_switch *ds, int port,
++ 			    unsigned int mode,
++ 			    const struct phylink_link_state *state)
++ {
++ 	struct b53_device *dev = ds->priv;
++ 
++ 	if (mode == MLO_AN_PHY || mode == MLO_AN_FIXED)
++ 		return;
++ 
++ 	if ((phy_interface_mode_is_8023z(state->interface) ||
++ 	     state->interface == PHY_INTERFACE_MODE_SGMII) &&
++ 	     dev->ops->serdes_config)
++ 		dev->ops->serdes_config(dev, port, mode, state);
++ }
++ EXPORT_SYMBOL(b53_phylink_mac_config);
++ 
++ void b53_phylink_mac_an_restart(struct dsa_switch *ds, int port)
++ {
++ 	struct b53_device *dev = ds->priv;
++ 
++ 	if (dev->ops->serdes_an_restart)
++ 		dev->ops->serdes_an_restart(dev, port);
++ }
++ EXPORT_SYMBOL(b53_phylink_mac_an_restart);
++ 
++ void b53_phylink_mac_link_down(struct dsa_switch *ds, int port,
++ 			       unsigned int mode,
++ 			       phy_interface_t interface)
++ {
++ 	struct b53_device *dev = ds->priv;
++ 
++ 	if (mode == MLO_AN_PHY)
++ 		return;
++ 
++ 	if (mode == MLO_AN_FIXED) {
++ 		b53_force_link(dev, port, false);
++ 		return;
++ 	}
++ 
++ 	if (phy_interface_mode_is_8023z(interface) &&
++ 	    dev->ops->serdes_link_set)
++ 		dev->ops->serdes_link_set(dev, port, mode, interface, false);
++ }
++ EXPORT_SYMBOL(b53_phylink_mac_link_down);
++ 
++ void b53_phylink_mac_link_up(struct dsa_switch *ds, int port,
++ 			     unsigned int mode,
++ 			     phy_interface_t interface,
++ 			     struct phy_device *phydev,
++ 			     int speed, int duplex,
++ 			     bool tx_pause, bool rx_pause)
++ {
++ 	struct b53_device *dev = ds->priv;
++ 
++ 	if (mode == MLO_AN_PHY)
++ 		return;
++ 
++ 	if (mode == MLO_AN_FIXED) {
++ 		b53_force_port_config(dev, port, speed, duplex,
++ 				      tx_pause, rx_pause);
++ 		b53_force_link(dev, port, true);
++ 		return;
++ 	}
++ 
++ 	if (phy_interface_mode_is_8023z(interface) &&
++ 	    dev->ops->serdes_link_set)
++ 		dev->ops->serdes_link_set(dev, port, mode, interface, true);
++ }
++ EXPORT_SYMBOL(b53_phylink_mac_link_up);
++ 
++ int b53_vlan_filtering(struct dsa_switch *ds, int port, bool vlan_filtering)
++ {
++ 	struct b53_device *dev = ds->priv;
++ 
++ 	b53_enable_vlan(dev, dev->vlan_enabled, vlan_filtering);
++ 
+++>>>>>>> bae33f2b5afe (net: switchdev: remove the transaction structure from port attributes)
+  	return 0;
+  }
+  EXPORT_SYMBOL(b53_vlan_filtering);
+diff --cc drivers/net/dsa/b53/b53_priv.h
+index df149756c282,9ab0fb409f78..000000000000
+--- a/drivers/net/dsa/b53/b53_priv.h
++++ b/drivers/net/dsa/b53/b53_priv.h
+@@@ -298,6 -326,28 +298,31 @@@ int b53_br_join(struct dsa_switch *ds, 
+  void b53_br_leave(struct dsa_switch *ds, int port, struct net_device *bridge);
+  void b53_br_set_stp_state(struct dsa_switch *ds, int port, u8 state);
+  void b53_br_fast_age(struct dsa_switch *ds, int port);
+++<<<<<<< HEAD
+++=======
++ int b53_br_egress_floods(struct dsa_switch *ds, int port,
++ 			 bool unicast, bool multicast);
++ int b53_setup_devlink_resources(struct dsa_switch *ds);
++ void b53_port_event(struct dsa_switch *ds, int port);
++ void b53_phylink_validate(struct dsa_switch *ds, int port,
++ 			  unsigned long *supported,
++ 			  struct phylink_link_state *state);
++ int b53_phylink_mac_link_state(struct dsa_switch *ds, int port,
++ 			       struct phylink_link_state *state);
++ void b53_phylink_mac_config(struct dsa_switch *ds, int port,
++ 			    unsigned int mode,
++ 			    const struct phylink_link_state *state);
++ void b53_phylink_mac_an_restart(struct dsa_switch *ds, int port);
++ void b53_phylink_mac_link_down(struct dsa_switch *ds, int port,
++ 			       unsigned int mode,
++ 			       phy_interface_t interface);
++ void b53_phylink_mac_link_up(struct dsa_switch *ds, int port,
++ 			     unsigned int mode,
++ 			     phy_interface_t interface,
++ 			     struct phy_device *phydev,
++ 			     int speed, int duplex,
++ 			     bool tx_pause, bool rx_pause);
+++>>>>>>> bae33f2b5afe (net: switchdev: remove the transaction structure from port attributes)
+  int b53_vlan_filtering(struct dsa_switch *ds, int port, bool vlan_filtering);
+  int b53_vlan_prepare(struct dsa_switch *ds, int port,
+  		     const struct switchdev_obj_port_vlan *vlan);
+diff --cc drivers/net/dsa/mt7530.c
+index 74547f43b938,fcaddc9c9370..000000000000
+--- a/drivers/net/dsa/mt7530.c
++++ b/drivers/net/dsa/mt7530.c
+@@@ -1009,10 -1378,6 +1009,13 @@@ static in
+  mt7530_port_vlan_filtering(struct dsa_switch *ds, int port,
+  			   bool vlan_filtering)
+  {
+++<<<<<<< HEAD
+ +	struct mt7530_priv *priv = ds->priv;
+ +
+ +	priv->ports[port].vlan_filtering = vlan_filtering;
+ +
+++=======
+++>>>>>>> bae33f2b5afe (net: switchdev: remove the transaction structure from port attributes)
+  	if (vlan_filtering) {
+  		/* The port is being kept as VLAN-unaware port when bridge is
+  		 * set up with vlan_filtering not being set, Otherwise, the
+diff --cc drivers/net/dsa/mv88e6xxx/chip.c
+index bb28c701381a,bbf1a71ce55c..000000000000
+--- a/drivers/net/dsa/mv88e6xxx/chip.c
++++ b/drivers/net/dsa/mv88e6xxx/chip.c
+@@@ -1468,12 -1590,12 +1468,16 @@@ static int mv88e6xxx_port_vlan_filterin
+  		MV88E6XXX_PORT_CTL2_8021Q_MODE_DISABLED;
+  	int err;
+  
+++<<<<<<< HEAD
+ +	if (!chip->info->max_vid)
+++=======
++ 	if (!mv88e6xxx_max_vid(chip))
+++>>>>>>> bae33f2b5afe (net: switchdev: remove the transaction structure from port attributes)
+  		return -EOPNOTSUPP;
+  
+ -	mv88e6xxx_reg_lock(chip);
+ +	mutex_lock(&chip->reg_lock);
+  	err = mv88e6xxx_port_set_8021q_mode(chip, port, mode);
+ -	mv88e6xxx_reg_unlock(chip);
+ +	mutex_unlock(&chip->reg_lock);
+  
+  	return err;
+  }
+diff --cc drivers/net/dsa/qca8k.c
+index cdcde7f8e0b2,1de6473b221b..000000000000
+--- a/drivers/net/dsa/qca8k.c
++++ b/drivers/net/dsa/qca8k.c
+@@@ -865,8 -1293,72 +865,74 @@@ qca8k_port_fdb_dump(struct dsa_switch *
+  	return 0;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static int
++ qca8k_port_vlan_filtering(struct dsa_switch *ds, int port, bool vlan_filtering)
++ {
++ 	struct qca8k_priv *priv = ds->priv;
++ 
++ 	if (vlan_filtering) {
++ 		qca8k_rmw(priv, QCA8K_PORT_LOOKUP_CTRL(port),
++ 			  QCA8K_PORT_LOOKUP_VLAN_MODE,
++ 			  QCA8K_PORT_LOOKUP_VLAN_MODE_SECURE);
++ 	} else {
++ 		qca8k_rmw(priv, QCA8K_PORT_LOOKUP_CTRL(port),
++ 			  QCA8K_PORT_LOOKUP_VLAN_MODE,
++ 			  QCA8K_PORT_LOOKUP_VLAN_MODE_NONE);
++ 	}
++ 
++ 	return 0;
++ }
++ 
++ static int
++ qca8k_port_vlan_prepare(struct dsa_switch *ds, int port,
++ 			const struct switchdev_obj_port_vlan *vlan)
++ {
++ 	return 0;
++ }
++ 
++ static void
++ qca8k_port_vlan_add(struct dsa_switch *ds, int port,
++ 		    const struct switchdev_obj_port_vlan *vlan)
++ {
++ 	bool untagged = vlan->flags & BRIDGE_VLAN_INFO_UNTAGGED;
++ 	bool pvid = vlan->flags & BRIDGE_VLAN_INFO_PVID;
++ 	struct qca8k_priv *priv = ds->priv;
++ 	int ret = 0;
++ 
++ 	ret = qca8k_vlan_add(priv, port, vlan->vid, untagged);
++ 	if (ret)
++ 		dev_err(priv->dev, "Failed to add VLAN to port %d (%d)", port, ret);
++ 
++ 	if (pvid) {
++ 		int shift = 16 * (port % 2);
++ 
++ 		qca8k_rmw(priv, QCA8K_EGRESS_VLAN(port),
++ 			  0xfff << shift, vlan->vid << shift);
++ 		qca8k_write(priv, QCA8K_REG_PORT_VLAN_CTRL0(port),
++ 			    QCA8K_PORT_VLAN_CVID(vlan->vid) |
++ 			    QCA8K_PORT_VLAN_SVID(vlan->vid));
++ 	}
++ }
++ 
++ static int
++ qca8k_port_vlan_del(struct dsa_switch *ds, int port,
++ 		    const struct switchdev_obj_port_vlan *vlan)
++ {
++ 	struct qca8k_priv *priv = ds->priv;
++ 	int ret = 0;
++ 
++ 	ret = qca8k_vlan_del(priv, port, vlan->vid);
++ 	if (ret)
++ 		dev_err(priv->dev, "Failed to delete VLAN from port %d (%d)", port, ret);
++ 
++ 	return ret;
++ }
++ 
+++>>>>>>> bae33f2b5afe (net: switchdev: remove the transaction structure from port attributes)
+  static enum dsa_tag_protocol
+ -qca8k_get_tag_protocol(struct dsa_switch *ds, int port,
+ -		       enum dsa_tag_protocol mp)
+ +qca8k_get_tag_protocol(struct dsa_switch *ds, int port)
+  {
+  	return DSA_TAG_PROTO_QCA;
+  }
+diff --cc drivers/net/ethernet/mscc/ocelot.c
+index fb1208bf823d,af620f7ce469..000000000000
+--- a/drivers/net/ethernet/mscc/ocelot.c
++++ b/drivers/net/ethernet/mscc/ocelot.c
+@@@ -129,21 -103,141 +129,61 @@@ static void ocelot_mact_init(struct oce
+  	ocelot_write(ocelot, MACACCESS_CMD_INIT, ANA_TABLES_MACACCESS);
+  }
+  
+ -static void ocelot_vcap_enable(struct ocelot *ocelot, int port)
+ -{
+ -	ocelot_write_gix(ocelot, ANA_PORT_VCAP_S2_CFG_S2_ENA |
+ -			 ANA_PORT_VCAP_S2_CFG_S2_IP6_CFG(0xa),
+ -			 ANA_PORT_VCAP_S2_CFG, port);
+ -
+ -	ocelot_write_gix(ocelot, ANA_PORT_VCAP_CFG_S1_ENA,
+ -			 ANA_PORT_VCAP_CFG, port);
+ -
+ -	ocelot_rmw_gix(ocelot, REW_PORT_CFG_ES0_EN,
+ -		       REW_PORT_CFG_ES0_EN,
+ -		       REW_PORT_CFG, port);
+ -}
+ -
+ -static inline u32 ocelot_vlant_read_vlanaccess(struct ocelot *ocelot)
+ -{
+ -	return ocelot_read(ocelot, ANA_TABLES_VLANACCESS);
+ -}
+ -
+  static inline int ocelot_vlant_wait_for_completion(struct ocelot *ocelot)
+  {
+ -	u32 val;
+ -
+ -	return readx_poll_timeout(ocelot_vlant_read_vlanaccess,
+ -		ocelot,
+ -		val,
+ -		(val & ANA_TABLES_VLANACCESS_VLAN_TBL_CMD_M) ==
+ -		ANA_TABLES_VLANACCESS_CMD_IDLE,
+ -		TABLE_UPDATE_SLEEP_US, TABLE_UPDATE_TIMEOUT_US);
+ -}
+ -
+ -static int ocelot_vlant_set_mask(struct ocelot *ocelot, u16 vid, u32 mask)
+ -{
+ -	/* Select the VID to configure */
+ -	ocelot_write(ocelot, ANA_TABLES_VLANTIDX_V_INDEX(vid),
+ -		     ANA_TABLES_VLANTIDX);
+ -	/* Set the vlan port members mask and issue a write command */
+ -	ocelot_write(ocelot, ANA_TABLES_VLANACCESS_VLAN_PORT_MASK(mask) |
+ -			     ANA_TABLES_VLANACCESS_CMD_WRITE,
+ -		     ANA_TABLES_VLANACCESS);
+ -
+ -	return ocelot_vlant_wait_for_completion(ocelot);
+ -}
+ -
+ -static void ocelot_port_set_native_vlan(struct ocelot *ocelot, int port,
+ -					struct ocelot_vlan native_vlan)
+ -{
+ -	struct ocelot_port *ocelot_port = ocelot->ports[port];
+ -	u32 val = 0;
+ -
+ -	ocelot_port->native_vlan = native_vlan;
+ -
+ -	ocelot_rmw_gix(ocelot, REW_PORT_VLAN_CFG_PORT_VID(native_vlan.vid),
+ -		       REW_PORT_VLAN_CFG_PORT_VID_M,
+ -		       REW_PORT_VLAN_CFG, port);
+ -
+ -	if (ocelot_port->vlan_aware) {
+ -		if (native_vlan.valid)
+ -			/* Tag all frames except when VID == DEFAULT_VLAN */
+ -			val = REW_TAG_CFG_TAG_CFG(1);
+ -		else
+ -			/* Tag all frames */
+ -			val = REW_TAG_CFG_TAG_CFG(3);
+ -	} else {
+ -		/* Port tagging disabled. */
+ -		val = REW_TAG_CFG_TAG_CFG(0);
+ -	}
+ -	ocelot_rmw_gix(ocelot, val,
+ -		       REW_TAG_CFG_TAG_CFG_M,
+ -		       REW_TAG_CFG, port);
+ -}
+ -
+ -/* Default vlan to clasify for untagged frames (may be zero) */
+ -static void ocelot_port_set_pvid(struct ocelot *ocelot, int port,
+ -				 struct ocelot_vlan pvid_vlan)
+ -{
+ -	struct ocelot_port *ocelot_port = ocelot->ports[port];
+ -	u32 val = 0;
+ -
+ -	ocelot_port->pvid_vlan = pvid_vlan;
+ -
+ -	if (!ocelot_port->vlan_aware)
+ -		pvid_vlan.vid = 0;
+ +	unsigned int val, timeout = 10;
+  
+ -	ocelot_rmw_gix(ocelot,
+ -		       ANA_PORT_VLAN_CFG_VLAN_VID(pvid_vlan.vid),
+ -		       ANA_PORT_VLAN_CFG_VLAN_VID_M,
+ -		       ANA_PORT_VLAN_CFG, port);
+ -
+ -	/* If there's no pvid, we should drop not only untagged traffic (which
+ -	 * happens automatically), but also 802.1p traffic which gets
+ -	 * classified to VLAN 0, but that is always in our RX filter, so it
+ -	 * would get accepted were it not for this setting.
+ +	/* Wait for the issued mac table command to be completed, or timeout.
+ +	 * When the command read from ANA_TABLES_MACACCESS is
+ +	 * MACACCESS_CMD_IDLE, the issued command completed successfully.
+  	 */
+ -	if (!pvid_vlan.valid && ocelot_port->vlan_aware)
+ -		val = ANA_PORT_DROP_CFG_DROP_PRIO_S_TAGGED_ENA |
+ -		      ANA_PORT_DROP_CFG_DROP_PRIO_C_TAGGED_ENA;
+ +	do {
+ +		val = ocelot_read(ocelot, ANA_TABLES_VLANACCESS);
+ +		val &= ANA_TABLES_VLANACCESS_VLAN_TBL_CMD_M;
+ +	} while (val != ANA_TABLES_VLANACCESS_CMD_IDLE && timeout--);
+  
+++<<<<<<< HEAD
+ +	if (!timeout)
+ +		return -ETIMEDOUT;
+++=======
++ 	ocelot_rmw_gix(ocelot, val,
++ 		       ANA_PORT_DROP_CFG_DROP_PRIO_S_TAGGED_ENA |
++ 		       ANA_PORT_DROP_CFG_DROP_PRIO_C_TAGGED_ENA,
++ 		       ANA_PORT_DROP_CFG, port);
++ }
++ 
++ int ocelot_port_vlan_filtering(struct ocelot *ocelot, int port,
++ 			       bool vlan_aware)
++ {
++ 	struct ocelot_vcap_block *block = &ocelot->block[VCAP_IS1];
++ 	struct ocelot_port *ocelot_port = ocelot->ports[port];
++ 	struct ocelot_vcap_filter *filter;
++ 	u32 val;
++ 
++ 	list_for_each_entry(filter, &block->rules, list) {
++ 		if (filter->ingress_port_mask & BIT(port) &&
++ 		    filter->action.vid_replace_ena) {
++ 			dev_err(ocelot->dev,
++ 				"Cannot change VLAN state with vlan modify rules active\n");
++ 			return -EBUSY;
++ 		}
++ 	}
++ 
++ 	ocelot_port->vlan_aware = vlan_aware;
++ 
++ 	if (vlan_aware)
++ 		val = ANA_PORT_VLAN_CFG_VLAN_AWARE_ENA |
++ 		      ANA_PORT_VLAN_CFG_VLAN_POP_CNT(1);
++ 	else
++ 		val = 0;
++ 	ocelot_rmw_gix(ocelot, val,
++ 		       ANA_PORT_VLAN_CFG_VLAN_AWARE_ENA |
++ 		       ANA_PORT_VLAN_CFG_VLAN_POP_CNT_M,
++ 		       ANA_PORT_VLAN_CFG, port);
++ 
++ 	ocelot_port_set_pvid(ocelot, port, ocelot_port->pvid_vlan);
++ 	ocelot_port_set_native_vlan(ocelot, port, ocelot_port->native_vlan);
+++>>>>>>> bae33f2b5afe (net: switchdev: remove the transaction structure from port attributes)
+  
+  	return 0;
+  }
+@@@ -1069,152 -1168,304 +1109,169 @@@ static int ocelot_port_bridge_join(stru
+  
+  	return 0;
+  }
+ -EXPORT_SYMBOL(ocelot_port_bridge_join);
+  
+ -int ocelot_port_bridge_leave(struct ocelot *ocelot, int port,
+ -			     struct net_device *bridge)
+ +static void ocelot_port_bridge_leave(struct ocelot_port *ocelot_port,
+ +				     struct net_device *bridge)
+  {
+++<<<<<<< HEAD
+ +	struct ocelot *ocelot = ocelot_port->ocelot;
+++=======
++ 	struct ocelot_vlan pvid = {0}, native_vlan = {0};
++ 	int ret;
+++>>>>>>> bae33f2b5afe (net: switchdev: remove the transaction structure from port attributes)
+  
+ -	ocelot->bridge_mask &= ~BIT(port);
+ +	ocelot->bridge_mask &= ~BIT(ocelot_port->chip_port);
+  
+  	if (!ocelot->bridge_mask)
+  		ocelot->hw_bridge_dev = NULL;
+++<<<<<<< HEAD
+++=======
++ 
++ 	ret = ocelot_port_vlan_filtering(ocelot, port, false);
++ 	if (ret)
++ 		return ret;
++ 
++ 	ocelot_port_set_pvid(ocelot, port, pvid);
++ 	ocelot_port_set_native_vlan(ocelot, port, native_vlan);
++ 
++ 	return 0;
+++>>>>>>> bae33f2b5afe (net: switchdev: remove the transaction structure from port attributes)
+  }
+ -EXPORT_SYMBOL(ocelot_port_bridge_leave);
+  
+ -static void ocelot_set_aggr_pgids(struct ocelot *ocelot)
+ +/* Checks if the net_device instance given to us originate from our driver. */
+ +static bool ocelot_netdevice_dev_check(const struct net_device *dev)
+  {
+ -	int i, port, lag;
+ -
+ -	/* Reset destination and aggregation PGIDS */
+ -	for_each_unicast_dest_pgid(ocelot, port)
+ -		ocelot_write_rix(ocelot, BIT(port), ANA_PGID_PGID, port);
+ -
+ -	for_each_aggr_pgid(ocelot, i)
+ -		ocelot_write_rix(ocelot, GENMASK(ocelot->num_phys_ports - 1, 0),
+ -				 ANA_PGID_PGID, i);
+ -
+ -	/* Now, set PGIDs for each LAG */
+ -	for (lag = 0; lag < ocelot->num_phys_ports; lag++) {
+ -		unsigned long bond_mask;
+ -		int aggr_count = 0;
+ -		u8 aggr_idx[16];
+ -
+ -		bond_mask = ocelot->lags[lag];
+ -		if (!bond_mask)
+ -			continue;
+ -
+ -		for_each_set_bit(port, &bond_mask, ocelot->num_phys_ports) {
+ -			// Destination mask
+ -			ocelot_write_rix(ocelot, bond_mask,
+ -					 ANA_PGID_PGID, port);
+ -			aggr_idx[aggr_count] = port;
+ -			aggr_count++;
+ -		}
+ -
+ -		for_each_aggr_pgid(ocelot, i) {
+ -			u32 ac;
+ -
+ -			ac = ocelot_read_rix(ocelot, ANA_PGID_PGID, i);
+ -			ac &= ~bond_mask;
+ -			ac |= BIT(aggr_idx[i % aggr_count]);
+ -			ocelot_write_rix(ocelot, ac, ANA_PGID_PGID, i);
+ -		}
+ -	}
+ +	return dev->netdev_ops == &ocelot_port_netdev_ops;
+  }
+  
+ -static void ocelot_setup_lag(struct ocelot *ocelot, int lag)
+ +static int ocelot_netdevice_port_event(struct net_device *dev,
+ +				       unsigned long event,
+ +				       struct netdev_notifier_changeupper_info *info)
+  {
+ -	unsigned long bond_mask = ocelot->lags[lag];
+ -	unsigned int p;
+ -
+ -	for_each_set_bit(p, &bond_mask, ocelot->num_phys_ports) {
+ -		u32 port_cfg = ocelot_read_gix(ocelot, ANA_PORT_PORT_CFG, p);
+ +	struct ocelot_port *ocelot_port = netdev_priv(dev);
+ +	int err = 0;
+  
+ -		port_cfg &= ~ANA_PORT_PORT_CFG_PORTID_VAL_M;
+ +	if (!ocelot_netdevice_dev_check(dev))
+ +		return 0;
+  
+ -		/* Use lag port as logical port for port i */
+ -		ocelot_write_gix(ocelot, port_cfg |
+ -				 ANA_PORT_PORT_CFG_PORTID_VAL(lag),
+ -				 ANA_PORT_PORT_CFG, p);
+ +	switch (event) {
+ +	case NETDEV_CHANGEUPPER:
+ +		if (netif_is_bridge_master(info->upper_dev)) {
+ +			if (info->linking)
+ +				err = ocelot_port_bridge_join(ocelot_port,
+ +							      info->upper_dev);
+ +			else
+ +				ocelot_port_bridge_leave(ocelot_port,
+ +							 info->upper_dev);
+ +		}
+ +		break;
+ +	default:
+ +		break;
+  	}
+ +
+ +	return err;
+  }
+  
+ -int ocelot_port_lag_join(struct ocelot *ocelot, int port,
+ -			 struct net_device *bond)
+ +static int ocelot_netdevice_event(struct notifier_block *unused,
+ +				  unsigned long event, void *ptr)
+  {
+ -	struct net_device *ndev;
+ -	u32 bond_mask = 0;
+ -	int lag, lp;
+ -
+ -	rcu_read_lock();
+ -	for_each_netdev_in_bond_rcu(bond, ndev) {
+ -		struct ocelot_port_private *priv = netdev_priv(ndev);
+ -
+ -		bond_mask |= BIT(priv->chip_port);
+ -	}
+ -	rcu_read_unlock();
+ +	struct netdev_notifier_changeupper_info *info = ptr;
+ +	struct net_device *dev = netdev_notifier_info_to_dev(ptr);
+ +	int ret = 0;
+  
+ -	lp = __ffs(bond_mask);
+ +	if (netif_is_lag_master(dev)) {
+ +		struct net_device *slave;
+ +		struct list_head *iter;
+  
+ -	/* If the new port is the lowest one, use it as the logical port from
+ -	 * now on
+ -	 */
+ -	if (port == lp) {
+ -		lag = port;
+ -		ocelot->lags[port] = bond_mask;
+ -		bond_mask &= ~BIT(port);
+ -		if (bond_mask) {
+ -			lp = __ffs(bond_mask);
+ -			ocelot->lags[lp] = 0;
+ +		netdev_for_each_lower_dev(dev, slave, iter) {
+ +			ret = ocelot_netdevice_port_event(slave, event, info);
+ +			if (ret)
+ +				goto notify;
+  		}
+  	} else {
+ -		lag = lp;
+ -		ocelot->lags[lp] |= BIT(port);
+ +		ret = ocelot_netdevice_port_event(dev, event, info);
+  	}
+  
+ -	ocelot_setup_lag(ocelot, lag);
+ -	ocelot_set_aggr_pgids(ocelot);
+ -
+ -	return 0;
+ +notify:
+ +	return notifier_from_errno(ret);
+  }
+ -EXPORT_SYMBOL(ocelot_port_lag_join);
+ -
+ -void ocelot_port_lag_leave(struct ocelot *ocelot, int port,
+ -			   struct net_device *bond)
+ -{
+ -	u32 port_cfg;
+ -	int i;
+ -
+ -	/* Remove port from any lag */
+ -	for (i = 0; i < ocelot->num_phys_ports; i++)
+ -		ocelot->lags[i] &= ~BIT(port);
+ -
+ -	/* if it was the logical port of the lag, move the lag config to the
+ -	 * next port
+ -	 */
+ -	if (ocelot->lags[port]) {
+ -		int n = __ffs(ocelot->lags[port]);
+ -
+ -		ocelot->lags[n] = ocelot->lags[port];
+ -		ocelot->lags[port] = 0;
+ -
+ -		ocelot_setup_lag(ocelot, n);
+ -	}
+ -
+ -	port_cfg = ocelot_read_gix(ocelot, ANA_PORT_PORT_CFG, port);
+ -	port_cfg &= ~ANA_PORT_PORT_CFG_PORTID_VAL_M;
+ -	ocelot_write_gix(ocelot, port_cfg | ANA_PORT_PORT_CFG_PORTID_VAL(port),
+ -			 ANA_PORT_PORT_CFG, port);
+  
+ -	ocelot_set_aggr_pgids(ocelot);
+ -}
+ -EXPORT_SYMBOL(ocelot_port_lag_leave);
+ +struct notifier_block ocelot_netdevice_nb __read_mostly = {
+ +	.notifier_call = ocelot_netdevice_event,
+ +};
+ +EXPORT_SYMBOL(ocelot_netdevice_nb);
+  
+ -/* Configure the maximum SDU (L2 payload) on RX to the value specified in @sdu.
+ - * The length of VLAN tags is accounted for automatically via DEV_MAC_TAGS_CFG.
+ - * In the special case that it's the NPI port that we're configuring, the
+ - * length of the tag and optional prefix needs to be accounted for privately,
+ - * in order to be able to sustain communication at the requested @sdu.
+ - */
+ -void ocelot_port_set_maxlen(struct ocelot *ocelot, int port, size_t sdu)
+ +static int ocelot_switchdev_blocking_event(struct notifier_block *unused,
+ +					   unsigned long event, void *ptr)
+  {
+ -	struct ocelot_port *ocelot_port = ocelot->ports[port];
+ -	int maxlen = sdu + ETH_HLEN + ETH_FCS_LEN;
+ -	int pause_start, pause_stop;
+ -	int atop, atop_tot;
+ -
+ -	if (port == ocelot->npi) {
+ -		maxlen += OCELOT_TAG_LEN;
+ -
+ -		if (ocelot->inj_prefix == OCELOT_TAG_PREFIX_SHORT)
+ -			maxlen += OCELOT_SHORT_PREFIX_LEN;
+ -		else if (ocelot->inj_prefix == OCELOT_TAG_PREFIX_LONG)
+ -			maxlen += OCELOT_LONG_PREFIX_LEN;
+ +	struct net_device *dev = switchdev_notifier_info_to_dev(ptr);
+ +	int err;
+ +
+ +	switch (event) {
+ +		/* Blocking events. */
+ +	case SWITCHDEV_PORT_OBJ_ADD:
+ +		err = switchdev_handle_port_obj_add(dev, ptr,
+ +						    ocelot_netdevice_dev_check,
+ +						    ocelot_port_obj_add);
+ +		return notifier_from_errno(err);
+ +	case SWITCHDEV_PORT_OBJ_DEL:
+ +		err = switchdev_handle_port_obj_del(dev, ptr,
+ +						    ocelot_netdevice_dev_check,
+ +						    ocelot_port_obj_del);
+ +		return notifier_from_errno(err);
+  	}
+  
+ -	ocelot_port_writel(ocelot_port, maxlen, DEV_MAC_MAXLEN_CFG);
+ -
+ -	/* Set Pause watermark hysteresis */
+ -	pause_start = 6 * maxlen / OCELOT_BUFFER_CELL_SZ;
+ -	pause_stop = 4 * maxlen / OCELOT_BUFFER_CELL_SZ;
+ -	ocelot_fields_write(ocelot, port, SYS_PAUSE_CFG_PAUSE_START,
+ -			    pause_start);
+ -	ocelot_fields_write(ocelot, port, SYS_PAUSE_CFG_PAUSE_STOP,
+ -			    pause_stop);
+ -
+ -	/* Tail dropping watermarks */
+ -	atop_tot = (ocelot->shared_queue_sz - 9 * maxlen) /
+ -		   OCELOT_BUFFER_CELL_SZ;
+ -	atop = (9 * maxlen) / OCELOT_BUFFER_CELL_SZ;
+ -	ocelot_write_rix(ocelot, ocelot->ops->wm_enc(atop), SYS_ATOP, port);
+ -	ocelot_write(ocelot, ocelot->ops->wm_enc(atop_tot), SYS_ATOP_TOT_CFG);
+ +	return NOTIFY_DONE;
+  }
+ -EXPORT_SYMBOL(ocelot_port_set_maxlen);
+  
+ -int ocelot_get_max_mtu(struct ocelot *ocelot, int port)
+ -{
+ -	int max_mtu = 65535 - ETH_HLEN - ETH_FCS_LEN;
+ -
+ -	if (port == ocelot->npi) {
+ -		max_mtu -= OCELOT_TAG_LEN;
+ -
+ -		if (ocelot->inj_prefix == OCELOT_TAG_PREFIX_SHORT)
+ -			max_mtu -= OCELOT_SHORT_PREFIX_LEN;
+ -		else if (ocelot->inj_prefix == OCELOT_TAG_PREFIX_LONG)
+ -			max_mtu -= OCELOT_LONG_PREFIX_LEN;
+ -	}
+ -
+ -	return max_mtu;
+ -}
+ -EXPORT_SYMBOL(ocelot_get_max_mtu);
+ +struct notifier_block ocelot_switchdev_blocking_nb __read_mostly = {
+ +	.notifier_call = ocelot_switchdev_blocking_event,
+ +};
+ +EXPORT_SYMBOL(ocelot_switchdev_blocking_nb);
+  
+ -void ocelot_init_port(struct ocelot *ocelot, int port)
+ +int ocelot_probe_port(struct ocelot *ocelot, u8 port,
+ +		      void __iomem *regs,
+ +		      struct phy_device *phy)
+  {
+ -	struct ocelot_port *ocelot_port = ocelot->ports[port];
+ -
+ -	skb_queue_head_init(&ocelot_port->tx_skbs);
+ -	spin_lock_init(&ocelot_port->ts_id_lock);
+ -
+ -	/* Basic L2 initialization */
+ -
+ -	/* Set MAC IFG Gaps
+ -	 * FDX: TX_IFG = 5, RX_IFG1 = RX_IFG2 = 0
+ -	 * !FDX: TX_IFG = 5, RX_IFG1 = RX_IFG2 = 5
+ -	 */
+ -	ocelot_port_writel(ocelot_port, DEV_MAC_IFG_CFG_TX_IFG(5),
+ -			   DEV_MAC_IFG_CFG);
+ -
+ -	/* Load seed (0) and set MAC HDX late collision  */
+ -	ocelot_port_writel(ocelot_port, DEV_MAC_HDX_CFG_LATE_COL_POS(67) |
+ -			   DEV_MAC_HDX_CFG_SEED_LOAD,
+ -			   DEV_MAC_HDX_CFG);
+ -	mdelay(1);
+ -	ocelot_port_writel(ocelot_port, DEV_MAC_HDX_CFG_LATE_COL_POS(67),
+ -			   DEV_MAC_HDX_CFG);
+ -
+ -	/* Set Max Length and maximum tags allowed */
+ -	ocelot_port_set_maxlen(ocelot, port, ETH_DATA_LEN);
+ -	ocelot_port_writel(ocelot_port, DEV_MAC_TAGS_CFG_TAG_ID(ETH_P_8021AD) |
+ -			   DEV_MAC_TAGS_CFG_VLAN_AWR_ENA |
+ -			   DEV_MAC_TAGS_CFG_VLAN_DBL_AWR_ENA |
+ -			   DEV_MAC_TAGS_CFG_VLAN_LEN_AWR_ENA,
+ -			   DEV_MAC_TAGS_CFG);
+ +	struct ocelot_port *ocelot_port;
+ +	struct net_device *dev;
+ +	int err;
+  
+ -	/* Set SMAC of Pause frame (00:00:00:00:00:00) */
+ -	ocelot_port_writel(ocelot_port, 0, DEV_MAC_FC_MAC_HIGH_CFG);
+ -	ocelot_port_writel(ocelot_port, 0, DEV_MAC_FC_MAC_LOW_CFG);
+ -
+ -	/* Enable transmission of pause frames */
+ -	ocelot_fields_write(ocelot, port, SYS_PAUSE_CFG_PAUSE_ENA, 1);
+ -
+ -	/* Drop frames with multicast source address */
+ -	ocelot_rmw_gix(ocelot, ANA_PORT_DROP_CFG_DROP_MC_SMAC_ENA,
+ -		       ANA_PORT_DROP_CFG_DROP_MC_SMAC_ENA,
+ -		       ANA_PORT_DROP_CFG, port);
+ +	dev = alloc_etherdev(sizeof(struct ocelot_port));
+ +	if (!dev)
+ +		return -ENOMEM;
+ +	SET_NETDEV_DEV(dev, ocelot->dev);
+ +	ocelot_port = netdev_priv(dev);
+ +	ocelot_port->dev = dev;
+ +	ocelot_port->ocelot = ocelot;
+ +	ocelot_port->regs = regs;
+ +	ocelot_port->chip_port = port;
+ +	ocelot_port->phy = phy;
+ +	INIT_LIST_HEAD(&ocelot_port->mc);
+ +	ocelot->ports[port] = ocelot_port;
+ +
+ +	dev->netdev_ops = &ocelot_port_netdev_ops;
+ +	dev->ethtool_ops = &ocelot_ethtool_ops;
+ +	dev->switchdev_ops = &ocelot_port_switchdev_ops;
+ +
+ +	memcpy(dev->dev_addr, ocelot->base_mac, ETH_ALEN);
+ +	dev->dev_addr[ETH_ALEN - 1] += port;
+ +	ocelot_mact_learn(ocelot, PGID_CPU, dev->dev_addr, ocelot_port->pvid,
+ +			  ENTRYTYPE_LOCKED);
+ +
+ +	err = register_netdev(dev);
+ +	if (err) {
+ +		dev_err(ocelot->dev, "register_netdev failed\n");
+ +		goto err_register_netdev;
+ +	}
+  
+ -	/* Set default VLAN and tag type to 8021Q. */
+ -	ocelot_rmw_gix(ocelot, REW_PORT_VLAN_CFG_PORT_TPID(ETH_P_8021Q),
+ -		       REW_PORT_VLAN_CFG_PORT_TPID_M,
+ -		       REW_PORT_VLAN_CFG, port);
+ +	return 0;
+  
+ -	/* Enable vcap lookups */
+ -	ocelot_vcap_enable(ocelot, port);
+ -}
+ -EXPORT_SYMBOL(ocelot_init_port);
+ -
+ -/* Configure and enable the CPU port module, which is a set of queues
+ - * accessible through register MMIO, frame DMA or Ethernet (in case
+ - * NPI mode is used).
+ - */
+ -static void ocelot_cpu_port_init(struct ocelot *ocelot)
+ -{
+ -	int cpu = ocelot->num_phys_ports;
+ -
+ -	/* The unicast destination PGID for the CPU port module is unused */
+ -	ocelot_write_rix(ocelot, 0, ANA_PGID_PGID, cpu);
+ -	/* Instead set up a multicast destination PGID for traffic copied to
+ -	 * the CPU. Whitelisted MAC addresses like the port netdevice MAC
+ -	 * addresses will be copied to the CPU via this PGID.
+ -	 */
+ -	ocelot_write_rix(ocelot, BIT(cpu), ANA_PGID_PGID, PGID_CPU);
+ -	ocelot_write_gix(ocelot, ANA_PORT_PORT_CFG_RECV_ENA |
+ -			 ANA_PORT_PORT_CFG_PORTID_VAL(cpu),
+ -			 ANA_PORT_PORT_CFG, cpu);
+ -
+ -	/* Enable CPU port module */
+ -	ocelot_fields_write(ocelot, cpu, QSYS_SWITCH_PORT_MODE_PORT_ENA, 1);
+ -	/* CPU port Injection/Extraction configuration */
+ -	ocelot_fields_write(ocelot, cpu, SYS_PORT_MODE_INCL_XTR_HDR,
+ -			    ocelot->xtr_prefix);
+ -	ocelot_fields_write(ocelot, cpu, SYS_PORT_MODE_INCL_INJ_HDR,
+ -			    ocelot->inj_prefix);
+ -
+ -	/* Configure the CPU port to be VLAN aware */
+ -	ocelot_write_gix(ocelot, ANA_PORT_VLAN_CFG_VLAN_VID(0) |
+ -				 ANA_PORT_VLAN_CFG_VLAN_AWARE_ENA |
+ -				 ANA_PORT_VLAN_CFG_VLAN_POP_CNT(1),
+ -			 ANA_PORT_VLAN_CFG, cpu);
+ +err_register_netdev:
+ +	free_netdev(dev);
+ +	return err;
+  }
+ +EXPORT_SYMBOL(ocelot_probe_port);
+  
+  int ocelot_init(struct ocelot *ocelot)
+  {
+diff --cc drivers/staging/fsl-dpaa2/ethsw/ethsw.c
+index 1f9a4c8ef2da,ca3d07fe7f58..000000000000
+--- a/drivers/staging/fsl-dpaa2/ethsw/ethsw.c
++++ b/drivers/staging/fsl-dpaa2/ethsw/ethsw.c
+@@@ -640,51 -900,32 +640,70 @@@ static void ethsw_teardown_irqs(struct 
+  	fsl_mc_free_irqs(sw_dev);
+  }
+  
+++<<<<<<< HEAD
+ +static int swdev_port_attr_get(struct net_device *netdev,
+ +			       struct switchdev_attr *attr)
+ +{
+ +	struct ethsw_port_priv *port_priv = netdev_priv(netdev);
+ +
+ +	switch (attr->id) {
+ +	case SWITCHDEV_ATTR_ID_PORT_BRIDGE_FLAGS:
+ +		attr->u.brport_flags =
+ +			(port_priv->ethsw_data->learning ? BR_LEARNING : 0) |
+ +			(port_priv->flood ? BR_FLOOD : 0);
+ +		break;
+ +	case SWITCHDEV_ATTR_ID_PORT_BRIDGE_FLAGS_SUPPORT:
+ +		attr->u.brport_flags_support = BR_LEARNING | BR_FLOOD;
+ +		break;
+ +	default:
+ +		return -EOPNOTSUPP;
+ +	}
+ +
+ +	return 0;
+ +}
+ +
+ +static int port_attr_stp_state_set(struct net_device *netdev,
+ +				   struct switchdev_trans *trans,
+ +				   u8 state)
+ +{
+ +	struct ethsw_port_priv *port_priv = netdev_priv(netdev);
+ +
+ +	if (switchdev_trans_ph_prepare(trans))
+ +		return 0;
+ +
+ +	return ethsw_port_set_stp_state(port_priv, state);
+ +}
+ +
+ +static int port_attr_br_flags_set(struct net_device *netdev,
+ +				  struct switchdev_trans *trans,
+ +				  unsigned long flags)
+++=======
++ static int dpaa2_switch_port_attr_stp_state_set(struct net_device *netdev,
++ 						u8 state)
+  {
+  	struct ethsw_port_priv *port_priv = netdev_priv(netdev);
+- 	int err = 0;
+  
+- 	if (switchdev_trans_ph_prepare(trans))
+- 		return 0;
++ 	return dpaa2_switch_port_set_stp_state(port_priv, state);
++ }
++ 
++ static int dpaa2_switch_port_attr_br_flags_pre_set(struct net_device *netdev,
++ 						   unsigned long flags)
++ {
++ 	if (flags & ~(BR_LEARNING | BR_FLOOD))
++ 		return -EINVAL;
++ 
++ 	return 0;
++ }
++ 
++ static int dpaa2_switch_port_attr_br_flags_set(struct net_device *netdev,
++ 					       unsigned long flags)
+++>>>>>>> bae33f2b5afe (net: switchdev: remove the transaction structure from port attributes)
++ {
++ 	struct ethsw_port_priv *port_priv = netdev_priv(netdev);
++ 	int err = 0;
+  
+  	/* Learning is enabled per switch */
+ -	err = dpaa2_switch_set_learning(port_priv->ethsw_data,
+ -					!!(flags & BR_LEARNING));
+ +	err = ethsw_set_learning(port_priv->ethsw_data, flags & BR_LEARNING);
+  	if (err)
+  		goto exit;
+  
+@@@ -694,20 -935,23 +713,38 @@@ exit
+  	return err;
+  }
+  
+++<<<<<<< HEAD
+ +static int swdev_port_attr_set(struct net_device *netdev,
+ +			       const struct switchdev_attr *attr,
+ +			       struct switchdev_trans *trans)
+++=======
++ static int dpaa2_switch_port_attr_set(struct net_device *netdev,
++ 				      const struct switchdev_attr *attr)
+++>>>>>>> bae33f2b5afe (net: switchdev: remove the transaction structure from port attributes)
+  {
+  	int err = 0;
+  
+  	switch (attr->id) {
+  	case SWITCHDEV_ATTR_ID_PORT_STP_STATE:
+++<<<<<<< HEAD
+ +		err = port_attr_stp_state_set(netdev, trans,
+ +					      attr->u.stp_state);
+ +		break;
+ +	case SWITCHDEV_ATTR_ID_PORT_BRIDGE_FLAGS:
+ +		err = port_attr_br_flags_set(netdev, trans,
+ +					     attr->u.brport_flags);
+++=======
++ 		err = dpaa2_switch_port_attr_stp_state_set(netdev,
++ 							   attr->u.stp_state);
++ 		break;
++ 	case SWITCHDEV_ATTR_ID_PORT_PRE_BRIDGE_FLAGS:
++ 		err = dpaa2_switch_port_attr_br_flags_pre_set(netdev,
++ 							      attr->u.brport_flags);
++ 		break;
++ 	case SWITCHDEV_ATTR_ID_PORT_BRIDGE_FLAGS:
++ 		err = dpaa2_switch_port_attr_br_flags_set(netdev,
++ 							  attr->u.brport_flags);
+++>>>>>>> bae33f2b5afe (net: switchdev: remove the transaction structure from port attributes)
+  		break;
+  	case SWITCHDEV_ATTR_ID_BRIDGE_VLAN_FILTERING:
+  		/* VLANs are supported by default  */
+@@@ -932,14 -1181,21 +969,28 @@@ static int swdev_port_obj_del(struct ne
+  	return err;
+  }
+  
+++<<<<<<< HEAD
+ +static const struct switchdev_ops ethsw_port_switchdev_ops = {
+ +	.switchdev_port_attr_get	= swdev_port_attr_get,
+ +	.switchdev_port_attr_set	= swdev_port_attr_set,
+ +};
+++=======
++ static int dpaa2_switch_port_attr_set_event(struct net_device *netdev,
++ 					    struct switchdev_notifier_port_attr_info
++ 					    *port_attr_info)
++ {
++ 	int err;
++ 
++ 	err = dpaa2_switch_port_attr_set(netdev, port_attr_info->attr);
++ 
++ 	port_attr_info->handled = true;
++ 	return notifier_from_errno(err);
++ }
+++>>>>>>> bae33f2b5afe (net: switchdev: remove the transaction structure from port attributes)
+  
+  /* For the moment, only flood setting needs to be updated */
+ -static int dpaa2_switch_port_bridge_join(struct net_device *netdev,
+ -					 struct net_device *upper_dev)
+ +static int port_bridge_join(struct net_device *netdev,
+ +			    struct net_device *upper_dev)
+  {
+  	struct ethsw_port_priv *port_priv = netdev_priv(netdev);
+  	struct ethsw_core *ethsw = port_priv->ethsw_data;
+diff --cc net/dsa/dsa_priv.h
+index 4aeecfbc0008,3e6063bf3f17..000000000000
+--- a/net/dsa/dsa_priv.h
++++ b/net/dsa/dsa_priv.h
+@@@ -139,29 -128,32 +139,48 @@@ static inline struct net_device *dsa_ma
+  }
+  
+  /* port.c */
+++<<<<<<< HEAD
+ +int dsa_port_set_state(struct dsa_port *dp, u8 state,
+ +		       struct switchdev_trans *trans);
+++=======
++ int dsa_port_set_state(struct dsa_port *dp, u8 state);
++ int dsa_port_enable_rt(struct dsa_port *dp, struct phy_device *phy);
+++>>>>>>> bae33f2b5afe (net: switchdev: remove the transaction structure from port attributes)
+  int dsa_port_enable(struct dsa_port *dp, struct phy_device *phy);
+ -void dsa_port_disable_rt(struct dsa_port *dp);
+ -void dsa_port_disable(struct dsa_port *dp);
+ +void dsa_port_disable(struct dsa_port *dp, struct phy_device *phy);
+  int dsa_port_bridge_join(struct dsa_port *dp, struct net_device *br);
+  void dsa_port_bridge_leave(struct dsa_port *dp, struct net_device *br);
+++<<<<<<< HEAD
+ +int dsa_port_vlan_filtering(struct dsa_port *dp, bool vlan_filtering,
+ +			    struct switchdev_trans *trans);
+ +int dsa_port_ageing_time(struct dsa_port *dp, clock_t ageing_clock,
+ +			 struct switchdev_trans *trans);
+++=======
++ int dsa_port_vlan_filtering(struct dsa_port *dp, bool vlan_filtering);
++ bool dsa_port_skip_vlan_configuration(struct dsa_port *dp);
++ int dsa_port_ageing_time(struct dsa_port *dp, clock_t ageing_clock);
++ int dsa_port_mtu_change(struct dsa_port *dp, int new_mtu,
++ 			bool propagate_upstream);
+++>>>>>>> bae33f2b5afe (net: switchdev: remove the transaction structure from port attributes)
+  int dsa_port_fdb_add(struct dsa_port *dp, const unsigned char *addr,
+  		     u16 vid);
+  int dsa_port_fdb_del(struct dsa_port *dp, const unsigned char *addr,
+  		     u16 vid);
+  int dsa_port_fdb_dump(struct dsa_port *dp, dsa_fdb_dump_cb_t *cb, void *data);
+  int dsa_port_mdb_add(const struct dsa_port *dp,
+ -		     const struct switchdev_obj_port_mdb *mdb);
+ +		     const struct switchdev_obj_port_mdb *mdb,
+ +		     struct switchdev_trans *trans);
+  int dsa_port_mdb_del(const struct dsa_port *dp,
+  		     const struct switchdev_obj_port_mdb *mdb);
+++<<<<<<< HEAD
+++=======
++ int dsa_port_pre_bridge_flags(const struct dsa_port *dp, unsigned long flags);
++ int dsa_port_bridge_flags(const struct dsa_port *dp, unsigned long flags);
++ int dsa_port_mrouter(struct dsa_port *dp, bool mrouter);
+++>>>>>>> bae33f2b5afe (net: switchdev: remove the transaction structure from port attributes)
+  int dsa_port_vlan_add(struct dsa_port *dp,
+ -		      const struct switchdev_obj_port_vlan *vlan);
+ +		      const struct switchdev_obj_port_vlan *vlan,
+ +		      struct switchdev_trans *trans);
+  int dsa_port_vlan_del(struct dsa_port *dp,
+  		      const struct switchdev_obj_port_vlan *vlan);
+  int dsa_port_link_register_of(struct dsa_port *dp);
+diff --cc net/dsa/port.c
+index 2d7e01b23572,14bf0053ae01..000000000000
+--- a/net/dsa/port.c
++++ b/net/dsa/port.c
+@@@ -105,16 -142,23 +103,31 @@@ int dsa_port_bridge_join(struct dsa_por
+  	};
+  	int err;
+  
+++<<<<<<< HEAD
+ +	/* Here the port is already bridged. Reflect the current configuration
+ +	 * so that drivers can program their chips accordingly.
+++=======
++ 	/* Set the flooding mode before joining the port in the switch */
++ 	err = dsa_port_bridge_flags(dp, BR_FLOOD | BR_MCAST_FLOOD);
++ 	if (err)
++ 		return err;
++ 
++ 	/* Here the interface is already bridged. Reflect the current
++ 	 * configuration so that drivers can program their chips accordingly.
+++>>>>>>> bae33f2b5afe (net: switchdev: remove the transaction structure from port attributes)
+  	 */
+  	dp->bridge_dev = br;
+  
+ -	err = dsa_broadcast(DSA_NOTIFIER_BRIDGE_JOIN, &info);
+ +	err = dsa_port_notify(dp, DSA_NOTIFIER_BRIDGE_JOIN, &info);
+  
+  	/* The bridging is rolled back on error */
+++<<<<<<< HEAD
+ +	if (err)
+++=======
++ 	if (err) {
++ 		dsa_port_bridge_flags(dp, 0);
+++>>>>>>> bae33f2b5afe (net: switchdev: remove the transaction structure from port attributes)
+  		dp->bridge_dev = NULL;
+ -	}
+  
+  	return err;
+  }
+@@@ -137,30 -182,130 +150,153 @@@ void dsa_port_bridge_leave(struct dsa_p
+  	if (err)
+  		pr_err("DSA: failed to notify DSA_NOTIFIER_BRIDGE_LEAVE\n");
+  
+++<<<<<<< HEAD
+++=======
++ 	/* Port is leaving the bridge, disable flooding */
++ 	dsa_port_bridge_flags(dp, 0);
++ 
+++>>>>>>> bae33f2b5afe (net: switchdev: remove the transaction structure from port attributes)
+  	/* Port left the bridge, put in BR_STATE_DISABLED by the bridge layer,
+  	 * so allow it to be in BR_STATE_FORWARDING to be kept functional
+  	 */
+  	dsa_port_set_state_now(dp, BR_STATE_FORWARDING);
+  }
+  
+++<<<<<<< HEAD
+ +int dsa_port_vlan_filtering(struct dsa_port *dp, bool vlan_filtering,
+ +			    struct switchdev_trans *trans)
+ +{
+ +	struct dsa_switch *ds = dp->ds;
+ +
+ +	/* bridge skips -EOPNOTSUPP, so skip the prepare phase */
+ +	if (switchdev_trans_ph_prepare(trans))
+ +		return 0;
+ +
+ +	if (ds->ops->port_vlan_filtering)
+ +		return ds->ops->port_vlan_filtering(ds, dp->index,
+ +						    vlan_filtering);
+++=======
++ /* Must be called under rcu_read_lock() */
++ static bool dsa_port_can_apply_vlan_filtering(struct dsa_port *dp,
++ 					      bool vlan_filtering)
++ {
++ 	struct dsa_switch *ds = dp->ds;
++ 	int err, i;
++ 
++ 	/* VLAN awareness was off, so the question is "can we turn it on".
++ 	 * We may have had 8021q uppers, those need to go. Make sure we don't
++ 	 * enter an inconsistent state: deny changing the VLAN awareness state
++ 	 * as long as we have 8021q uppers.
++ 	 */
++ 	if (vlan_filtering && dsa_is_user_port(ds, dp->index)) {
++ 		struct net_device *upper_dev, *slave = dp->slave;
++ 		struct net_device *br = dp->bridge_dev;
++ 		struct list_head *iter;
++ 
++ 		netdev_for_each_upper_dev_rcu(slave, upper_dev, iter) {
++ 			struct bridge_vlan_info br_info;
++ 			u16 vid;
++ 
++ 			if (!is_vlan_dev(upper_dev))
++ 				continue;
++ 
++ 			vid = vlan_dev_vlan_id(upper_dev);
++ 
++ 			/* br_vlan_get_info() returns -EINVAL or -ENOENT if the
++ 			 * device, respectively the VID is not found, returning
++ 			 * 0 means success, which is a failure for us here.
++ 			 */
++ 			err = br_vlan_get_info(br, vid, &br_info);
++ 			if (err == 0) {
++ 				dev_err(ds->dev, "Must remove upper %s first\n",
++ 					upper_dev->name);
++ 				return false;
++ 			}
++ 		}
++ 	}
++ 
++ 	if (!ds->vlan_filtering_is_global)
++ 		return true;
++ 
++ 	/* For cases where enabling/disabling VLAN awareness is global to the
++ 	 * switch, we need to handle the case where multiple bridges span
++ 	 * different ports of the same switch device and one of them has a
++ 	 * different setting than what is being requested.
++ 	 */
++ 	for (i = 0; i < ds->num_ports; i++) {
++ 		struct net_device *other_bridge;
++ 
++ 		other_bridge = dsa_to_port(ds, i)->bridge_dev;
++ 		if (!other_bridge)
++ 			continue;
++ 		/* If it's the same bridge, it also has same
++ 		 * vlan_filtering setting => no need to check
++ 		 */
++ 		if (other_bridge == dp->bridge_dev)
++ 			continue;
++ 		if (br_vlan_enabled(other_bridge) != vlan_filtering) {
++ 			dev_err(ds->dev, "VLAN filtering is a global setting\n");
++ 			return false;
++ 		}
++ 	}
++ 	return true;
++ }
++ 
++ int dsa_port_vlan_filtering(struct dsa_port *dp, bool vlan_filtering)
++ {
++ 	struct dsa_switch *ds = dp->ds;
++ 	bool apply;
++ 	int err;
++ 
++ 	if (!ds->ops->port_vlan_filtering)
++ 		return -EOPNOTSUPP;
++ 
++ 	/* We are called from dsa_slave_switchdev_blocking_event(),
++ 	 * which is not under rcu_read_lock(), unlike
++ 	 * dsa_slave_switchdev_event().
++ 	 */
++ 	rcu_read_lock();
++ 	apply = dsa_port_can_apply_vlan_filtering(dp, vlan_filtering);
++ 	rcu_read_unlock();
++ 	if (!apply)
++ 		return -EINVAL;
++ 
++ 	if (dsa_port_is_vlan_filtering(dp) == vlan_filtering)
++ 		return 0;
++ 
++ 	err = ds->ops->port_vlan_filtering(ds, dp->index, vlan_filtering);
++ 	if (err)
++ 		return err;
++ 
++ 	if (ds->vlan_filtering_is_global)
++ 		ds->vlan_filtering = vlan_filtering;
++ 	else
++ 		dp->vlan_filtering = vlan_filtering;
+++>>>>>>> bae33f2b5afe (net: switchdev: remove the transaction structure from port attributes)
+  
+  	return 0;
+  }
+  
+++<<<<<<< HEAD
+ +int dsa_port_ageing_time(struct dsa_port *dp, clock_t ageing_clock,
+ +			 struct switchdev_trans *trans)
+++=======
++ /* This enforces legacy behavior for switch drivers which assume they can't
++  * receive VLAN configuration when enslaved to a bridge with vlan_filtering=0
++  */
++ bool dsa_port_skip_vlan_configuration(struct dsa_port *dp)
++ {
++ 	struct dsa_switch *ds = dp->ds;
++ 
++ 	if (!dp->bridge_dev)
++ 		return false;
++ 
++ 	return (!ds->configure_vlan_while_not_filtering &&
++ 		!br_vlan_enabled(dp->bridge_dev));
++ }
++ 
++ int dsa_port_ageing_time(struct dsa_port *dp, clock_t ageing_clock)
+++>>>>>>> bae33f2b5afe (net: switchdev: remove the transaction structure from port attributes)
+  {
+  	unsigned long ageing_jiffies = clock_t_to_jiffies(ageing_clock);
+  	unsigned int ageing_time = jiffies_to_msecs(ageing_jiffies);
+@@@ -177,6 -327,54 +318,57 @@@
+  	return dsa_port_notify(dp, DSA_NOTIFIER_AGEING_TIME, &info);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ int dsa_port_pre_bridge_flags(const struct dsa_port *dp, unsigned long flags)
++ {
++ 	struct dsa_switch *ds = dp->ds;
++ 
++ 	if (!ds->ops->port_egress_floods ||
++ 	    (flags & ~(BR_FLOOD | BR_MCAST_FLOOD)))
++ 		return -EINVAL;
++ 
++ 	return 0;
++ }
++ 
++ int dsa_port_bridge_flags(const struct dsa_port *dp, unsigned long flags)
++ {
++ 	struct dsa_switch *ds = dp->ds;
++ 	int port = dp->index;
++ 	int err = 0;
++ 
++ 	if (ds->ops->port_egress_floods)
++ 		err = ds->ops->port_egress_floods(ds, port, flags & BR_FLOOD,
++ 						  flags & BR_MCAST_FLOOD);
++ 
++ 	return err;
++ }
++ 
++ int dsa_port_mrouter(struct dsa_port *dp, bool mrouter)
++ {
++ 	struct dsa_switch *ds = dp->ds;
++ 	int port = dp->index;
++ 
++ 	if (!ds->ops->port_egress_floods)
++ 		return -EOPNOTSUPP;
++ 
++ 	return ds->ops->port_egress_floods(ds, port, true, mrouter);
++ }
++ 
++ int dsa_port_mtu_change(struct dsa_port *dp, int new_mtu,
++ 			bool propagate_upstream)
++ {
++ 	struct dsa_notifier_mtu_info info = {
++ 		.sw_index = dp->ds->index,
++ 		.propagate_upstream = propagate_upstream,
++ 		.port = dp->index,
++ 		.mtu = new_mtu,
++ 	};
++ 
++ 	return dsa_port_notify(dp, DSA_NOTIFIER_MTU, &info);
++ }
++ 
+++>>>>>>> bae33f2b5afe (net: switchdev: remove the transaction structure from port attributes)
+  int dsa_port_fdb_add(struct dsa_port *dp, const unsigned char *addr,
+  		     u16 vid)
+  {
+diff --cc net/dsa/slave.c
+index 24cc4de02bd3,7ba505825db2..000000000000
+--- a/net/dsa/slave.c
++++ b/net/dsa/slave.c
+@@@ -283,15 -275,23 +282,26 @@@ static int dsa_slave_port_attr_set(stru
+  
+  	switch (attr->id) {
+  	case SWITCHDEV_ATTR_ID_PORT_STP_STATE:
+- 		ret = dsa_port_set_state(dp, attr->u.stp_state, trans);
++ 		ret = dsa_port_set_state(dp, attr->u.stp_state);
+  		break;
+  	case SWITCHDEV_ATTR_ID_BRIDGE_VLAN_FILTERING:
+- 		ret = dsa_port_vlan_filtering(dp, attr->u.vlan_filtering,
+- 					      trans);
++ 		ret = dsa_port_vlan_filtering(dp, attr->u.vlan_filtering);
+  		break;
+  	case SWITCHDEV_ATTR_ID_BRIDGE_AGEING_TIME:
+- 		ret = dsa_port_ageing_time(dp, attr->u.ageing_time, trans);
++ 		ret = dsa_port_ageing_time(dp, attr->u.ageing_time);
+  		break;
+++<<<<<<< HEAD
+++=======
++ 	case SWITCHDEV_ATTR_ID_PORT_PRE_BRIDGE_FLAGS:
++ 		ret = dsa_port_pre_bridge_flags(dp, attr->u.brport_flags);
++ 		break;
++ 	case SWITCHDEV_ATTR_ID_PORT_BRIDGE_FLAGS:
++ 		ret = dsa_port_bridge_flags(dp, attr->u.brport_flags);
++ 		break;
++ 	case SWITCHDEV_ATTR_ID_BRIDGE_MROUTER:
++ 		ret = dsa_port_mrouter(dp->cpu_dp, attr->u.mrouter);
++ 		break;
+++>>>>>>> bae33f2b5afe (net: switchdev: remove the transaction structure from port attributes)
+  	default:
+  		ret = -EOPNOTSUPP;
+  		break;
+diff --cc net/dsa/switch.c
+index b93511726069,17979956d756..000000000000
+--- a/net/dsa/switch.c
++++ b/net/dsa/switch.c
+@@@ -70,13 -107,43 +70,39 @@@ static int dsa_switch_bridge_join(struc
+  static int dsa_switch_bridge_leave(struct dsa_switch *ds,
+  				   struct dsa_notifier_bridge_info *info)
+  {
+ -	bool unset_vlan_filtering = br_vlan_enabled(info->br);
+ -	struct dsa_switch_tree *dst = ds->dst;
+ -	int err, i;
+ -
+ -	if (dst->index == info->tree_index && ds->index == info->sw_index &&
+ -	    ds->ops->port_bridge_join)
+ +	if (ds->index == info->sw_index && ds->ops->port_bridge_leave)
+  		ds->ops->port_bridge_leave(ds, info->port, info->br);
+  
+ -	if ((dst->index != info->tree_index || ds->index != info->sw_index) &&
+ -	    ds->ops->crosschip_bridge_join)
+ -		ds->ops->crosschip_bridge_leave(ds, info->tree_index,
+ -						info->sw_index, info->port,
+ +	if (ds->index != info->sw_index && ds->ops->crosschip_bridge_leave)
+ +		ds->ops->crosschip_bridge_leave(ds, info->sw_index, info->port,
+  						info->br);
+  
+++<<<<<<< HEAD
+++=======
++ 	/* If the bridge was vlan_filtering, the bridge core doesn't trigger an
++ 	 * event for changing vlan_filtering setting upon slave ports leaving
++ 	 * it. That is a good thing, because that lets us handle it and also
++ 	 * handle the case where the switch's vlan_filtering setting is global
++ 	 * (not per port). When that happens, the correct moment to trigger the
++ 	 * vlan_filtering callback is only when the last port left this bridge.
++ 	 */
++ 	if (unset_vlan_filtering && ds->vlan_filtering_is_global) {
++ 		for (i = 0; i < ds->num_ports; i++) {
++ 			if (i == info->port)
++ 				continue;
++ 			if (dsa_to_port(ds, i)->bridge_dev == info->br) {
++ 				unset_vlan_filtering = false;
++ 				break;
++ 			}
++ 		}
++ 	}
++ 	if (unset_vlan_filtering) {
++ 		err = dsa_port_vlan_filtering(dsa_to_port(ds, info->port),
++ 					      false);
++ 		if (err && err != EOPNOTSUPP)
++ 			return err;
++ 	}
+++>>>>>>> bae33f2b5afe (net: switchdev: remove the transaction structure from port attributes)
+  	return 0;
+  }
+  
+* Unmerged path drivers/net/dsa/hirschmann/hellcreek.c
+* Unmerged path drivers/net/dsa/lantiq_gswip.c
+* Unmerged path drivers/net/dsa/microchip/ksz8795.c
+* Unmerged path drivers/net/dsa/microchip/ksz9477.c
+* Unmerged path drivers/net/dsa/ocelot/felix.c
+* Unmerged path drivers/net/dsa/realtek-smi-core.h
+* Unmerged path drivers/net/dsa/rtl8366.c
+* Unmerged path drivers/net/dsa/sja1105/sja1105.h
+* Unmerged path drivers/net/dsa/sja1105/sja1105_devlink.c
+* Unmerged path drivers/net/dsa/sja1105/sja1105_main.c
+* Unmerged path drivers/net/ethernet/marvell/prestera/prestera_switchdev.c
+* Unmerged path drivers/net/ethernet/mscc/ocelot_net.c
+* Unmerged path drivers/net/ethernet/ti/cpsw_switchdev.c
+* Unmerged path include/soc/mscc/ocelot.h
+* Unmerged path drivers/net/dsa/b53/b53_common.c
+* Unmerged path drivers/net/dsa/b53/b53_priv.h
+* Unmerged path drivers/net/dsa/hirschmann/hellcreek.c
+* Unmerged path drivers/net/dsa/lantiq_gswip.c
+* Unmerged path drivers/net/dsa/microchip/ksz8795.c
+* Unmerged path drivers/net/dsa/microchip/ksz9477.c
+* Unmerged path drivers/net/dsa/mt7530.c
+* Unmerged path drivers/net/dsa/mv88e6xxx/chip.c
+* Unmerged path drivers/net/dsa/ocelot/felix.c
+* Unmerged path drivers/net/dsa/qca8k.c
+* Unmerged path drivers/net/dsa/realtek-smi-core.h
+* Unmerged path drivers/net/dsa/rtl8366.c
+* Unmerged path drivers/net/dsa/sja1105/sja1105.h
+* Unmerged path drivers/net/dsa/sja1105/sja1105_devlink.c
+* Unmerged path drivers/net/dsa/sja1105/sja1105_main.c
+* Unmerged path drivers/net/ethernet/marvell/prestera/prestera_switchdev.c
+diff --git a/drivers/net/ethernet/mellanox/mlxsw/spectrum_switchdev.c b/drivers/net/ethernet/mellanox/mlxsw/spectrum_switchdev.c
+index 14ce372c3f85..2658f129b9f0 100644
+--- a/drivers/net/ethernet/mellanox/mlxsw/spectrum_switchdev.c
++++ b/drivers/net/ethernet/mellanox/mlxsw/spectrum_switchdev.c
+@@ -531,7 +531,6 @@ mlxsw_sp_port_bridge_vlan_stp_set(struct mlxsw_sp_port *mlxsw_sp_port,
+ }
+ 
+ static int mlxsw_sp_port_attr_stp_state_set(struct mlxsw_sp_port *mlxsw_sp_port,
+-					    struct switchdev_trans *trans,
+ 					    struct net_device *orig_dev,
+ 					    u8 state)
+ {
+@@ -539,9 +538,6 @@ static int mlxsw_sp_port_attr_stp_state_set(struct mlxsw_sp_port *mlxsw_sp_port,
+ 	struct mlxsw_sp_bridge_vlan *bridge_vlan;
+ 	int err;
+ 
+-	if (switchdev_trans_ph_prepare(trans))
+-		return 0;
+-
+ 	/* It's possible we failed to enslave the port, yet this
+ 	 * operation is executed due to it being deferred.
+ 	 */
+@@ -663,7 +659,6 @@ mlxsw_sp_bridge_port_learning_set(struct mlxsw_sp_port *mlxsw_sp_port,
+ 
+ static int mlxsw_sp_port_attr_br_pre_flags_set(struct mlxsw_sp_port
+ 					       *mlxsw_sp_port,
+-					       struct switchdev_trans *trans,
+ 					       unsigned long brport_flags)
+ {
+ 	if (brport_flags & ~(BR_LEARNING | BR_FLOOD | BR_MCAST_FLOOD))
+@@ -673,16 +668,12 @@ static int mlxsw_sp_port_attr_br_pre_flags_set(struct mlxsw_sp_port
+ }
+ 
+ static int mlxsw_sp_port_attr_br_flags_set(struct mlxsw_sp_port *mlxsw_sp_port,
+-					   struct switchdev_trans *trans,
+ 					   struct net_device *orig_dev,
+ 					   unsigned long brport_flags)
+ {
+ 	struct mlxsw_sp_bridge_port *bridge_port;
+ 	int err;
+ 
+-	if (switchdev_trans_ph_prepare(trans))
+-		return 0;
+-
+ 	bridge_port = mlxsw_sp_bridge_port_find(mlxsw_sp_port->mlxsw_sp->bridge,
+ 						orig_dev);
+ 	if (!bridge_port)
+@@ -728,35 +719,26 @@ static int mlxsw_sp_ageing_set(struct mlxsw_sp *mlxsw_sp, u32 ageing_time)
+ }
+ 
+ static int mlxsw_sp_port_attr_br_ageing_set(struct mlxsw_sp_port *mlxsw_sp_port,
+-					    struct switchdev_trans *trans,
+ 					    unsigned long ageing_clock_t)
+ {
+ 	struct mlxsw_sp *mlxsw_sp = mlxsw_sp_port->mlxsw_sp;
+ 	unsigned long ageing_jiffies = clock_t_to_jiffies(ageing_clock_t);
+ 	u32 ageing_time = jiffies_to_msecs(ageing_jiffies) / 1000;
+ 
+-	if (switchdev_trans_ph_prepare(trans)) {
+-		if (ageing_time < MLXSW_SP_MIN_AGEING_TIME ||
+-		    ageing_time > MLXSW_SP_MAX_AGEING_TIME)
+-			return -ERANGE;
+-		else
+-			return 0;
+-	}
++	if (ageing_time < MLXSW_SP_MIN_AGEING_TIME ||
++	    ageing_time > MLXSW_SP_MAX_AGEING_TIME)
++		return -ERANGE;
+ 
+ 	return mlxsw_sp_ageing_set(mlxsw_sp, ageing_time);
+ }
+ 
+ static int mlxsw_sp_port_attr_br_vlan_set(struct mlxsw_sp_port *mlxsw_sp_port,
+-					  struct switchdev_trans *trans,
+ 					  struct net_device *orig_dev,
+ 					  bool vlan_enabled)
+ {
+ 	struct mlxsw_sp *mlxsw_sp = mlxsw_sp_port->mlxsw_sp;
+ 	struct mlxsw_sp_bridge_device *bridge_device;
+ 
+-	if (!switchdev_trans_ph_prepare(trans))
+-		return 0;
+-
+ 	bridge_device = mlxsw_sp_bridge_device_find(mlxsw_sp->bridge, orig_dev);
+ 	if (WARN_ON(!bridge_device))
+ 		return -EINVAL;
+@@ -769,16 +751,12 @@ static int mlxsw_sp_port_attr_br_vlan_set(struct mlxsw_sp_port *mlxsw_sp_port,
+ }
+ 
+ static int mlxsw_sp_port_attr_br_vlan_proto_set(struct mlxsw_sp_port *mlxsw_sp_port,
+-						struct switchdev_trans *trans,
+ 						struct net_device *orig_dev,
+ 						u16 vlan_proto)
+ {
+ 	struct mlxsw_sp *mlxsw_sp = mlxsw_sp_port->mlxsw_sp;
+ 	struct mlxsw_sp_bridge_device *bridge_device;
+ 
+-	if (!switchdev_trans_ph_prepare(trans))
+-		return 0;
+-
+ 	bridge_device = mlxsw_sp_bridge_device_find(mlxsw_sp->bridge, orig_dev);
+ 	if (WARN_ON(!bridge_device))
+ 		return -EINVAL;
+@@ -788,16 +766,12 @@ static int mlxsw_sp_port_attr_br_vlan_proto_set(struct mlxsw_sp_port *mlxsw_sp_p
+ }
+ 
+ static int mlxsw_sp_port_attr_mrouter_set(struct mlxsw_sp_port *mlxsw_sp_port,
+-					  struct switchdev_trans *trans,
+ 					  struct net_device *orig_dev,
+ 					  bool is_port_mrouter)
+ {
+ 	struct mlxsw_sp_bridge_port *bridge_port;
+ 	int err;
+ 
+-	if (switchdev_trans_ph_prepare(trans))
+-		return 0;
+-
+ 	bridge_port = mlxsw_sp_bridge_port_find(mlxsw_sp_port->mlxsw_sp->bridge,
+ 						orig_dev);
+ 	if (!bridge_port)
+@@ -829,7 +803,6 @@ static bool mlxsw_sp_mc_flood(const struct mlxsw_sp_bridge_port *bridge_port)
+ }
+ 
+ static int mlxsw_sp_port_mc_disabled_set(struct mlxsw_sp_port *mlxsw_sp_port,
+-					 struct switchdev_trans *trans,
+ 					 struct net_device *orig_dev,
+ 					 bool mc_disabled)
+ {
+@@ -838,9 +811,6 @@ static int mlxsw_sp_port_mc_disabled_set(struct mlxsw_sp_port *mlxsw_sp_port,
+ 	struct mlxsw_sp_bridge_port *bridge_port;
+ 	int err;
+ 
+-	if (switchdev_trans_ph_prepare(trans))
+-		return 0;
+-
+ 	/* It's possible we failed to enslave the port, yet this
+ 	 * operation is executed due to it being deferred.
+ 	 */
+@@ -900,16 +870,12 @@ mlxsw_sp_bridge_mrouter_update_mdb(struct mlxsw_sp *mlxsw_sp,
+ 
+ static int
+ mlxsw_sp_port_attr_br_mrouter_set(struct mlxsw_sp_port *mlxsw_sp_port,
+-				  struct switchdev_trans *trans,
+ 				  struct net_device *orig_dev,
+ 				  bool is_mrouter)
+ {
+ 	struct mlxsw_sp *mlxsw_sp = mlxsw_sp_port->mlxsw_sp;
+ 	struct mlxsw_sp_bridge_device *bridge_device;
+ 
+-	if (switchdev_trans_ph_prepare(trans))
+-		return 0;
+-
+ 	/* It's possible we failed to enslave the port, yet this
+ 	 * operation is executed due to it being deferred.
+ 	 */
+@@ -925,54 +891,52 @@ mlxsw_sp_port_attr_br_mrouter_set(struct mlxsw_sp_port *mlxsw_sp_port,
+ }
+ 
+ static int mlxsw_sp_port_attr_set(struct net_device *dev,
+-				  const struct switchdev_attr *attr,
+-				  struct switchdev_trans *trans)
++				  const struct switchdev_attr *attr)
+ {
+ 	struct mlxsw_sp_port *mlxsw_sp_port = netdev_priv(dev);
+ 	int err;
+ 
+ 	switch (attr->id) {
+ 	case SWITCHDEV_ATTR_ID_PORT_STP_STATE:
+-		err = mlxsw_sp_port_attr_stp_state_set(mlxsw_sp_port, trans,
++		err = mlxsw_sp_port_attr_stp_state_set(mlxsw_sp_port,
+ 						       attr->orig_dev,
+ 						       attr->u.stp_state);
+ 		break;
+ 	case SWITCHDEV_ATTR_ID_PORT_PRE_BRIDGE_FLAGS:
+ 		err = mlxsw_sp_port_attr_br_pre_flags_set(mlxsw_sp_port,
+-							  trans,
+ 							  attr->u.brport_flags);
+ 		break;
+ 	case SWITCHDEV_ATTR_ID_PORT_BRIDGE_FLAGS:
+-		err = mlxsw_sp_port_attr_br_flags_set(mlxsw_sp_port, trans,
++		err = mlxsw_sp_port_attr_br_flags_set(mlxsw_sp_port,
+ 						      attr->orig_dev,
+ 						      attr->u.brport_flags);
+ 		break;
+ 	case SWITCHDEV_ATTR_ID_BRIDGE_AGEING_TIME:
+-		err = mlxsw_sp_port_attr_br_ageing_set(mlxsw_sp_port, trans,
++		err = mlxsw_sp_port_attr_br_ageing_set(mlxsw_sp_port,
+ 						       attr->u.ageing_time);
+ 		break;
+ 	case SWITCHDEV_ATTR_ID_BRIDGE_VLAN_FILTERING:
+-		err = mlxsw_sp_port_attr_br_vlan_set(mlxsw_sp_port, trans,
++		err = mlxsw_sp_port_attr_br_vlan_set(mlxsw_sp_port,
+ 						     attr->orig_dev,
+ 						     attr->u.vlan_filtering);
+ 		break;
+ 	case SWITCHDEV_ATTR_ID_BRIDGE_VLAN_PROTOCOL:
+-		err = mlxsw_sp_port_attr_br_vlan_proto_set(mlxsw_sp_port, trans,
++		err = mlxsw_sp_port_attr_br_vlan_proto_set(mlxsw_sp_port,
+ 							   attr->orig_dev,
+ 							   attr->u.vlan_protocol);
+ 		break;
+ 	case SWITCHDEV_ATTR_ID_PORT_MROUTER:
+-		err = mlxsw_sp_port_attr_mrouter_set(mlxsw_sp_port, trans,
++		err = mlxsw_sp_port_attr_mrouter_set(mlxsw_sp_port,
+ 						     attr->orig_dev,
+ 						     attr->u.mrouter);
+ 		break;
+ 	case SWITCHDEV_ATTR_ID_BRIDGE_MC_DISABLED:
+-		err = mlxsw_sp_port_mc_disabled_set(mlxsw_sp_port, trans,
++		err = mlxsw_sp_port_mc_disabled_set(mlxsw_sp_port,
+ 						    attr->orig_dev,
+ 						    attr->u.mc_disabled);
+ 		break;
+ 	case SWITCHDEV_ATTR_ID_BRIDGE_MROUTER:
+-		err = mlxsw_sp_port_attr_br_mrouter_set(mlxsw_sp_port, trans,
++		err = mlxsw_sp_port_attr_br_mrouter_set(mlxsw_sp_port,
+ 							attr->orig_dev,
+ 							attr->u.mrouter);
+ 		break;
+@@ -981,8 +945,7 @@ static int mlxsw_sp_port_attr_set(struct net_device *dev,
+ 		break;
+ 	}
+ 
+-	if (switchdev_trans_ph_commit(trans))
+-		mlxsw_sp_span_respin(mlxsw_sp_port->mlxsw_sp);
++	mlxsw_sp_span_respin(mlxsw_sp_port->mlxsw_sp);
+ 
+ 	return err;
+ }
+* Unmerged path drivers/net/ethernet/mscc/ocelot.c
+* Unmerged path drivers/net/ethernet/mscc/ocelot_net.c
+diff --git a/drivers/net/ethernet/rocker/rocker.h b/drivers/net/ethernet/rocker/rocker.h
+index 2b2e1c4f0dc3..b57e37c05ea3 100644
+--- a/drivers/net/ethernet/rocker/rocker.h
++++ b/drivers/net/ethernet/rocker/rocker.h
+@@ -107,15 +107,13 @@ struct rocker_world_ops {
+ 	int (*port_attr_stp_state_set)(struct rocker_port *rocker_port,
+ 				       u8 state);
+ 	int (*port_attr_bridge_flags_set)(struct rocker_port *rocker_port,
+-					  unsigned long brport_flags,
+-					  struct switchdev_trans *trans);
++					  unsigned long brport_flags);
+ 	int (*port_attr_bridge_flags_support_get)(const struct rocker_port *
+ 						  rocker_port,
+ 						  unsigned long *
+ 						  p_brport_flags);
+ 	int (*port_attr_bridge_ageing_time_set)(struct rocker_port *rocker_port,
+-						u32 ageing_time,
+-						struct switchdev_trans *trans);
++						u32 ageing_time);
+ 	int (*port_obj_vlan_add)(struct rocker_port *rocker_port,
+ 				 const struct switchdev_obj_port_vlan *vlan);
+ 	int (*port_obj_vlan_del)(struct rocker_port *rocker_port,
+diff --git a/drivers/net/ethernet/rocker/rocker_main.c b/drivers/net/ethernet/rocker/rocker_main.c
+index 6bf36ef15dab..f5104a4ffe28 100644
+--- a/drivers/net/ethernet/rocker/rocker_main.c
++++ b/drivers/net/ethernet/rocker/rocker_main.c
+@@ -1551,17 +1551,13 @@ static void rocker_world_port_stop(struct rocker_port *rocker_port)
+ }
+ 
+ static int rocker_world_port_attr_stp_state_set(struct rocker_port *rocker_port,
+-						u8 state,
+-						struct switchdev_trans *trans)
++						u8 state)
+ {
+ 	struct rocker_world_ops *wops = rocker_port->rocker->wops;
+ 
+ 	if (!wops->port_attr_stp_state_set)
+ 		return -EOPNOTSUPP;
+ 
+-	if (switchdev_trans_ph_prepare(trans))
+-		return 0;
+-
+ 	return wops->port_attr_stp_state_set(rocker_port, state);
+ }
+ 
+@@ -1581,8 +1577,7 @@ rocker_world_port_attr_bridge_flags_support_get(const struct rocker_port *
+ 
+ static int
+ rocker_world_port_attr_pre_bridge_flags_set(struct rocker_port *rocker_port,
+-					    unsigned long brport_flags,
+-					    struct switchdev_trans *trans)
++					    unsigned long brport_flags)
+ {
+ 	struct rocker_world_ops *wops = rocker_port->rocker->wops;
+ 	unsigned long brport_flags_s;
+@@ -1604,37 +1599,26 @@ rocker_world_port_attr_pre_bridge_flags_set(struct rocker_port *rocker_port,
+ 
+ static int
+ rocker_world_port_attr_bridge_flags_set(struct rocker_port *rocker_port,
+-					unsigned long brport_flags,
+-					struct switchdev_trans *trans)
++					unsigned long brport_flags)
+ {
+ 	struct rocker_world_ops *wops = rocker_port->rocker->wops;
+ 
+ 	if (!wops->port_attr_bridge_flags_set)
+ 		return -EOPNOTSUPP;
+ 
+-	if (switchdev_trans_ph_prepare(trans))
+-		return 0;
+-
+-	return wops->port_attr_bridge_flags_set(rocker_port, brport_flags,
+-						trans);
++	return wops->port_attr_bridge_flags_set(rocker_port, brport_flags);
+ }
+ 
+ static int
+ rocker_world_port_attr_bridge_ageing_time_set(struct rocker_port *rocker_port,
+-					      u32 ageing_time,
+-					      struct switchdev_trans *trans)
+-
++					      u32 ageing_time)
+ {
+ 	struct rocker_world_ops *wops = rocker_port->rocker->wops;
+ 
+ 	if (!wops->port_attr_bridge_ageing_time_set)
+ 		return -EOPNOTSUPP;
+ 
+-	if (switchdev_trans_ph_prepare(trans))
+-		return 0;
+-
+-	return wops->port_attr_bridge_ageing_time_set(rocker_port, ageing_time,
+-						      trans);
++	return wops->port_attr_bridge_ageing_time_set(rocker_port, ageing_time);
+ }
+ 
+ static int
+@@ -2067,8 +2051,7 @@ static const struct net_device_ops rocker_port_netdev_ops = {
+  ********************/
+ 
+ static int rocker_port_attr_set(struct net_device *dev,
+-				const struct switchdev_attr *attr,
+-				struct switchdev_trans *trans)
++				const struct switchdev_attr *attr)
+ {
+ 	struct rocker_port *rocker_port = netdev_priv(dev);
+ 	int err = 0;
+@@ -2076,23 +2059,19 @@ static int rocker_port_attr_set(struct net_device *dev,
+ 	switch (attr->id) {
+ 	case SWITCHDEV_ATTR_ID_PORT_STP_STATE:
+ 		err = rocker_world_port_attr_stp_state_set(rocker_port,
+-							   attr->u.stp_state,
+-							   trans);
++							   attr->u.stp_state);
+ 		break;
+ 	case SWITCHDEV_ATTR_ID_PORT_PRE_BRIDGE_FLAGS:
+ 		err = rocker_world_port_attr_pre_bridge_flags_set(rocker_port,
+-							      attr->u.brport_flags,
+-							      trans);
++							      attr->u.brport_flags);
+ 		break;
+ 	case SWITCHDEV_ATTR_ID_PORT_BRIDGE_FLAGS:
+ 		err = rocker_world_port_attr_bridge_flags_set(rocker_port,
+-							      attr->u.brport_flags,
+-							      trans);
++							      attr->u.brport_flags);
+ 		break;
+ 	case SWITCHDEV_ATTR_ID_BRIDGE_AGEING_TIME:
+ 		err = rocker_world_port_attr_bridge_ageing_time_set(rocker_port,
+-								    attr->u.ageing_time,
+-								    trans);
++								    attr->u.ageing_time);
+ 		break;
+ 	default:
+ 		err = -EOPNOTSUPP;
+@@ -2711,8 +2690,7 @@ rocker_switchdev_port_attr_set_event(struct net_device *netdev,
+ {
+ 	int err;
+ 
+-	err = rocker_port_attr_set(netdev, port_attr_info->attr,
+-				   port_attr_info->trans);
++	err = rocker_port_attr_set(netdev, port_attr_info->attr);
+ 
+ 	port_attr_info->handled = true;
+ 	return notifier_from_errno(err);
+diff --git a/drivers/net/ethernet/rocker/rocker_ofdpa.c b/drivers/net/ethernet/rocker/rocker_ofdpa.c
+index fa296a7c255d..d3e2ff241638 100644
+--- a/drivers/net/ethernet/rocker/rocker_ofdpa.c
++++ b/drivers/net/ethernet/rocker/rocker_ofdpa.c
+@@ -2491,8 +2491,7 @@ static int ofdpa_port_attr_stp_state_set(struct rocker_port *rocker_port,
+ }
+ 
+ static int ofdpa_port_attr_bridge_flags_set(struct rocker_port *rocker_port,
+-					    unsigned long brport_flags,
+-					    struct switchdev_trans *trans)
++					    unsigned long brport_flags)
+ {
+ 	struct ofdpa_port *ofdpa_port = rocker_port->wpriv;
+ 	unsigned long orig_flags;
+@@ -2500,14 +2499,11 @@ static int ofdpa_port_attr_bridge_flags_set(struct rocker_port *rocker_port,
+ 
+ 	orig_flags = ofdpa_port->brport_flags;
+ 	ofdpa_port->brport_flags = brport_flags;
+-	if ((orig_flags ^ ofdpa_port->brport_flags) & BR_LEARNING &&
+-	    !switchdev_trans_ph_prepare(trans))
++
++	if ((orig_flags ^ ofdpa_port->brport_flags) & BR_LEARNING)
+ 		err = rocker_port_set_learning(ofdpa_port->rocker_port,
+ 					       !!(ofdpa_port->brport_flags & BR_LEARNING));
+ 
+-	if (switchdev_trans_ph_prepare(trans))
+-		ofdpa_port->brport_flags = orig_flags;
+-
+ 	return err;
+ }
+ 
+@@ -2523,18 +2519,15 @@ ofdpa_port_attr_bridge_flags_support_get(const struct rocker_port *
+ 
+ static int
+ ofdpa_port_attr_bridge_ageing_time_set(struct rocker_port *rocker_port,
+-				       u32 ageing_time,
+-				       struct switchdev_trans *trans)
++				       u32 ageing_time)
+ {
+ 	struct ofdpa_port *ofdpa_port = rocker_port->wpriv;
+ 	struct ofdpa *ofdpa = ofdpa_port->ofdpa;
+ 
+-	if (!switchdev_trans_ph_prepare(trans)) {
+-		ofdpa_port->ageing_time = clock_t_to_jiffies(ageing_time);
+-		if (ofdpa_port->ageing_time < ofdpa->ageing_time)
+-			ofdpa->ageing_time = ofdpa_port->ageing_time;
+-		mod_timer(&ofdpa_port->ofdpa->fdb_cleanup_timer, jiffies);
+-	}
++	ofdpa_port->ageing_time = clock_t_to_jiffies(ageing_time);
++	if (ofdpa_port->ageing_time < ofdpa->ageing_time)
++		ofdpa->ageing_time = ofdpa_port->ageing_time;
++	mod_timer(&ofdpa_port->ofdpa->fdb_cleanup_timer, jiffies);
+ 
+ 	return 0;
+ }
+* Unmerged path drivers/net/ethernet/ti/cpsw_switchdev.c
+* Unmerged path drivers/staging/fsl-dpaa2/ethsw/ethsw.c
+diff --git a/include/net/switchdev.h b/include/net/switchdev.h
+index 4c14c5b37237..3d1488330567 100644
+--- a/include/net/switchdev.h
++++ b/include/net/switchdev.h
+@@ -190,7 +190,6 @@ struct switchdev_notifier_port_obj_info {
+ struct switchdev_notifier_port_attr_info {
+ 	struct switchdev_notifier_info info; /* must be first */
+ 	const struct switchdev_attr *attr;
+-	struct switchdev_trans *trans;
+ 	bool handled;
+ };
+ 
+@@ -250,8 +249,7 @@ int switchdev_handle_port_attr_set(struct net_device *dev,
+ 			struct switchdev_notifier_port_attr_info *port_attr_info,
+ 			bool (*check_cb)(const struct net_device *dev),
+ 			int (*set_cb)(struct net_device *dev,
+-				      const struct switchdev_attr *attr,
+-				      struct switchdev_trans *trans));
++				      const struct switchdev_attr *attr));
+ #else
+ 
+ static inline void switchdev_deferred_process(void)
+@@ -343,8 +341,7 @@ switchdev_handle_port_attr_set(struct net_device *dev,
+ 			struct switchdev_notifier_port_attr_info *port_attr_info,
+ 			bool (*check_cb)(const struct net_device *dev),
+ 			int (*set_cb)(struct net_device *dev,
+-				      const struct switchdev_attr *attr,
+-				      struct switchdev_trans *trans))
++				      const struct switchdev_attr *attr))
+ {
+ 	return 0;
+ }
+* Unmerged path include/soc/mscc/ocelot.h
+* Unmerged path net/dsa/dsa_priv.h
+* Unmerged path net/dsa/port.c
+* Unmerged path net/dsa/slave.c
+* Unmerged path net/dsa/switch.c
+diff --git a/net/switchdev/switchdev.c b/net/switchdev/switchdev.c
+index b8f2957d0fcb..9b2efa94cccc 100644
+--- a/net/switchdev/switchdev.c
++++ b/net/switchdev/switchdev.c
+@@ -104,15 +104,13 @@ static int switchdev_deferred_enqueue(struct net_device *dev,
+ 
+ static int switchdev_port_attr_notify(enum switchdev_notifier_type nt,
+ 				      struct net_device *dev,
+-				      const struct switchdev_attr *attr,
+-				      struct switchdev_trans *trans)
++				      const struct switchdev_attr *attr)
+ {
+ 	int err;
+ 	int rc;
+ 
+ 	struct switchdev_notifier_port_attr_info attr_info = {
+ 		.attr = attr,
+-		.trans = trans,
+ 		.handled = false,
+ 	};
+ 
+@@ -133,34 +131,7 @@ static int switchdev_port_attr_notify(enum switchdev_notifier_type nt,
+ static int switchdev_port_attr_set_now(struct net_device *dev,
+ 				       const struct switchdev_attr *attr)
+ {
+-	struct switchdev_trans trans;
+-	int err;
+-
+-	/* Phase I: prepare for attr set. Driver/device should fail
+-	 * here if there are going to be issues in the commit phase,
+-	 * such as lack of resources or support.  The driver/device
+-	 * should reserve resources needed for the commit phase here,
+-	 * but should not commit the attr.
+-	 */
+-
+-	trans.ph_prepare = true;
+-	err = switchdev_port_attr_notify(SWITCHDEV_PORT_ATTR_SET, dev, attr,
+-					 &trans);
+-	if (err)
+-		return err;
+-
+-	/* Phase II: commit attr set.  This cannot fail as a fault
+-	 * of driver/device.  If it does, it's a bug in the driver/device
+-	 * because the driver said everythings was OK in phase I.
+-	 */
+-
+-	trans.ph_prepare = false;
+-	err = switchdev_port_attr_notify(SWITCHDEV_PORT_ATTR_SET, dev, attr,
+-					 &trans);
+-	WARN(err, "%s: Commit of attribute (id=%d) failed.\n",
+-	     dev->name, attr->id);
+-
+-	return err;
++	return switchdev_port_attr_notify(SWITCHDEV_PORT_ATTR_SET, dev, attr);
+ }
+ 
+ static void switchdev_port_attr_set_deferred(struct net_device *dev,
+@@ -190,10 +161,6 @@ static int switchdev_port_attr_set_defer(struct net_device *dev,
+  *	@dev: port device
+  *	@attr: attribute to set
+  *
+- *	Use a 2-phase prepare-commit transaction model to ensure
+- *	system is not left in a partially updated state due to
+- *	failure from driver/device.
+- *
+  *	rtnl_lock must be held and must not be in atomic section,
+  *	in case SWITCHDEV_F_DEFER flag is not set.
+  */
+@@ -564,8 +531,7 @@ static int __switchdev_handle_port_attr_set(struct net_device *dev,
+ 			struct switchdev_notifier_port_attr_info *port_attr_info,
+ 			bool (*check_cb)(const struct net_device *dev),
+ 			int (*set_cb)(struct net_device *dev,
+-				      const struct switchdev_attr *attr,
+-				      struct switchdev_trans *trans))
++				      const struct switchdev_attr *attr))
+ {
+ 	struct net_device *lower_dev;
+ 	struct list_head *iter;
+@@ -573,8 +539,7 @@ static int __switchdev_handle_port_attr_set(struct net_device *dev,
+ 
+ 	if (check_cb(dev)) {
+ 		port_attr_info->handled = true;
+-		return set_cb(dev, port_attr_info->attr,
+-			      port_attr_info->trans);
++		return set_cb(dev, port_attr_info->attr);
+ 	}
+ 
+ 	/* Switch ports might be stacked under e.g. a LAG. Ignore the
+@@ -601,8 +566,7 @@ int switchdev_handle_port_attr_set(struct net_device *dev,
+ 			struct switchdev_notifier_port_attr_info *port_attr_info,
+ 			bool (*check_cb)(const struct net_device *dev),
+ 			int (*set_cb)(struct net_device *dev,
+-				      const struct switchdev_attr *attr,
+-				      struct switchdev_trans *trans))
++				      const struct switchdev_attr *attr))
+ {
+ 	int err;
+ 
