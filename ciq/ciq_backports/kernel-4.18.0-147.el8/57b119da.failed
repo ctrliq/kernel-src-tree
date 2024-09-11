@@ -1,0 +1,168 @@
+KVM: nVMX: add KVM_CAP_HYPERV_ENLIGHTENED_VMCS capability
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-147.el8
+commit-author Vitaly Kuznetsov <vkuznets@redhat.com>
+commit 57b119da3594f5145a64fdebe0ac9ee0cc65f371
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-147.el8/57b119da.failed
+
+Enlightened VMCS is opt-in. The current version does not contain all
+fields supported by nested VMX so we must not advertise the
+corresponding VMX features if enlightened VMCS is enabled.
+
+Userspace is given the enlightened VMCS version supported by KVM as
+part of enabling KVM_CAP_HYPERV_ENLIGHTENED_VMCS. The version is to
+be advertised to the nested hypervisor, currently done via a cpuid
+leaf for Hyper-V.
+
+	Suggested-by: Ladi Prosek <lprosek@redhat.com>
+	Signed-off-by: Vitaly Kuznetsov <vkuznets@redhat.com>
+	Reviewed-by: Liran Alon <liran.alon@oracle.com>
+	Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+(cherry picked from commit 57b119da3594f5145a64fdebe0ac9ee0cc65f371)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kvm/x86.c
+#	include/uapi/linux/kvm.h
+diff --cc arch/x86/kvm/x86.c
+index ec01edf7f9e4,50f308499ce5..000000000000
+--- a/arch/x86/kvm/x86.c
++++ b/arch/x86/kvm/x86.c
+@@@ -2914,6 -2912,8 +2914,11 @@@ int kvm_vm_ioctl_check_extension(struc
+  	case KVM_CAP_HYPERV_VP_INDEX:
+  	case KVM_CAP_HYPERV_EVENTFD:
+  	case KVM_CAP_HYPERV_TLBFLUSH:
+++<<<<<<< HEAD
+++=======
++ 	case KVM_CAP_HYPERV_SEND_IPI:
++ 	case KVM_CAP_HYPERV_ENLIGHTENED_VMCS:
+++>>>>>>> 57b119da3594 (KVM: nVMX: add KVM_CAP_HYPERV_ENLIGHTENED_VMCS capability)
+  	case KVM_CAP_PCI_SEGMENT:
+  	case KVM_CAP_DEBUGREGS:
+  	case KVM_CAP_X86_ROBUST_SINGLESTEP:
+diff --cc include/uapi/linux/kvm.h
+index a76a9addaa2b,a2f2b8845502..000000000000
+--- a/include/uapi/linux/kvm.h
++++ b/include/uapi/linux/kvm.h
+@@@ -964,7 -961,9 +964,13 @@@ struct kvm_ppc_resize_hpt 
+  #define KVM_CAP_ARM_INJECT_SERROR_ESR 158
+  #define KVM_CAP_MSR_PLATFORM_INFO 159
+  #define KVM_CAP_PPC_NESTED_HV 160
+++<<<<<<< HEAD
+ +#define KVM_CAP_ARM_VM_IPA_SIZE 165
+++=======
++ #define KVM_CAP_HYPERV_SEND_IPI 161
++ #define KVM_CAP_COALESCED_PIO 162
++ #define KVM_CAP_HYPERV_ENLIGHTENED_VMCS 163
+++>>>>>>> 57b119da3594 (KVM: nVMX: add KVM_CAP_HYPERV_ENLIGHTENED_VMCS capability)
+  
+  #ifdef KVM_CAP_IRQ_ROUTING
+  
+diff --git a/arch/x86/include/asm/kvm_host.h b/arch/x86/include/asm/kvm_host.h
+index 7d68598fed64..973fb5090868 100644
+--- a/arch/x86/include/asm/kvm_host.h
++++ b/arch/x86/include/asm/kvm_host.h
+@@ -1161,6 +1161,9 @@ struct kvm_x86_ops {
+ 	int (*mem_enc_unreg_region)(struct kvm *kvm, struct kvm_enc_region *argp);
+ 
+ 	int (*get_msr_feature)(struct kvm_msr_entry *entry);
++
++	int (*nested_enable_evmcs)(struct kvm_vcpu *vcpu,
++				   uint16_t *vmcs_version);
+ };
+ 
+ struct kvm_arch_async_pf {
+diff --git a/arch/x86/kvm/svm.c b/arch/x86/kvm/svm.c
+index dc60714e2d63..7390c51c8864 100644
+--- a/arch/x86/kvm/svm.c
++++ b/arch/x86/kvm/svm.c
+@@ -7061,6 +7061,13 @@ static int svm_unregister_enc_region(struct kvm *kvm,
+ 	return ret;
+ }
+ 
++static int nested_enable_evmcs(struct kvm_vcpu *vcpu,
++				   uint16_t *vmcs_version)
++{
++	/* Intel-only feature */
++	return -ENODEV;
++}
++
+ static struct kvm_x86_ops svm_x86_ops __ro_after_init = {
+ 	.cpu_has_kvm_support = has_svm,
+ 	.disabled_by_bios = is_disabled,
+@@ -7190,6 +7197,8 @@ static struct kvm_x86_ops svm_x86_ops __ro_after_init = {
+ 	.mem_enc_op = svm_mem_enc_op,
+ 	.mem_enc_reg_region = svm_register_enc_region,
+ 	.mem_enc_unreg_region = svm_unregister_enc_region,
++
++	.nested_enable_evmcs = nested_enable_evmcs,
+ };
+ 
+ static int __init svm_init(void)
+diff --git a/arch/x86/kvm/vmx.c b/arch/x86/kvm/vmx.c
+index deb7949d2173..cd2d410be885 100644
+--- a/arch/x86/kvm/vmx.c
++++ b/arch/x86/kvm/vmx.c
+@@ -848,6 +848,13 @@ struct nested_vmx {
+ 
+ 	bool change_vmcs01_virtual_apic_mode;
+ 
++	/*
++	 * Enlightened VMCS has been enabled. It does not mean that L1 has to
++	 * use it. However, VMX features available to L1 will be limited based
++	 * on what the enlightened VMCS supports.
++	 */
++	bool enlightened_vmcs_enabled;
++
+ 	/* L2 must run next, and mustn't decide to exit to L1. */
+ 	bool nested_run_pending;
+ 
+@@ -1595,6 +1602,34 @@ static inline void evmcs_sanitize_exec_ctrls(struct vmcs_config *vmcs_conf) {}
+ static inline void evmcs_touch_msr_bitmap(void) {}
+ #endif /* IS_ENABLED(CONFIG_HYPERV) */
+ 
++static int nested_enable_evmcs(struct kvm_vcpu *vcpu,
++			       uint16_t *vmcs_version)
++{
++	struct vcpu_vmx *vmx = to_vmx(vcpu);
++
++	/* We don't support disabling the feature for simplicity. */
++	if (vmx->nested.enlightened_vmcs_enabled)
++		return 0;
++
++	vmx->nested.enlightened_vmcs_enabled = true;
++
++	/*
++	 * vmcs_version represents the range of supported Enlightened VMCS
++	 * versions: lower 8 bits is the minimal version, higher 8 bits is the
++	 * maximum supported version. KVM supports versions from 1 to
++	 * KVM_EVMCS_VERSION.
++	 */
++	*vmcs_version = (KVM_EVMCS_VERSION << 8) | 1;
++
++	vmx->nested.msrs.pinbased_ctls_high &= ~EVMCS1_UNSUPPORTED_PINCTRL;
++	vmx->nested.msrs.entry_ctls_high &= ~EVMCS1_UNSUPPORTED_VMENTRY_CTRL;
++	vmx->nested.msrs.exit_ctls_high &= ~EVMCS1_UNSUPPORTED_VMEXIT_CTRL;
++	vmx->nested.msrs.secondary_ctls_high &= ~EVMCS1_UNSUPPORTED_2NDEXEC;
++	vmx->nested.msrs.vmfunc_controls &= ~EVMCS1_UNSUPPORTED_VMFUNC;
++
++	return 0;
++}
++
+ static inline bool is_exception_n(u32 intr_info, u8 vector)
+ {
+ 	return (intr_info & (INTR_INFO_INTR_TYPE_MASK | INTR_INFO_VECTOR_MASK |
+@@ -14586,6 +14621,8 @@ static struct kvm_x86_ops vmx_x86_ops __ro_after_init = {
+ 	.pre_enter_smm = vmx_pre_enter_smm,
+ 	.pre_leave_smm = vmx_pre_leave_smm,
+ 	.enable_smi_window = enable_smi_window,
++
++	.nested_enable_evmcs = nested_enable_evmcs,
+ };
+ 
+ static void vmx_cleanup_l1d_flush(void)
+* Unmerged path arch/x86/kvm/x86.c
+* Unmerged path include/uapi/linux/kvm.h
