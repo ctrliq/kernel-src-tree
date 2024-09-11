@@ -1,0 +1,204 @@
+x86/hyperv: Initialize GHCB page in Isolation VM
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-408.el8
+commit-author Tianyu Lan <Tianyu.Lan@microsoft.com>
+commit 0cc4f6d9f0b9f20f3f1e1149bdb6737c0b4e134a
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-408.el8/0cc4f6d9.failed
+
+Hyperv exposes GHCB page via SEV ES GHCB MSR for SNP guest
+to communicate with hypervisor. Map GHCB page for all
+cpus to read/write MSR register and submit hvcall request
+via ghcb page.
+
+	Reviewed-by: Michael Kelley <mikelley@microsoft.com>
+	Signed-off-by: Tianyu Lan <Tianyu.Lan@microsoft.com>
+Link: https://lore.kernel.org/r/20211025122116.264793-2-ltykernel@gmail.com
+	Signed-off-by: Wei Liu <wei.liu@kernel.org>
+(cherry picked from commit 0cc4f6d9f0b9f20f3f1e1149bdb6737c0b4e134a)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/hyperv/hv_init.c
+diff --cc arch/x86/hyperv/hv_init.c
+index a366a7958291,a7e922755ad1..000000000000
+--- a/arch/x86/hyperv/hv_init.c
++++ b/arch/x86/hyperv/hv_init.c
+@@@ -51,8 -45,37 +54,36 @@@ static void *hv_hypercall_pg_saved
+  struct hv_vp_assist_page **hv_vp_assist_page;
+  EXPORT_SYMBOL_GPL(hv_vp_assist_page);
+  
++ static int hyperv_init_ghcb(void)
++ {
++ 	u64 ghcb_gpa;
++ 	void *ghcb_va;
++ 	void **ghcb_base;
++ 
++ 	if (!hv_isolation_type_snp())
++ 		return 0;
++ 
++ 	if (!hv_ghcb_pg)
++ 		return -EINVAL;
++ 
++ 	/*
++ 	 * GHCB page is allocated by paravisor. The address
++ 	 * returned by MSR_AMD64_SEV_ES_GHCB is above shared
++ 	 * memory boundary and map it here.
++ 	 */
++ 	rdmsrl(MSR_AMD64_SEV_ES_GHCB, ghcb_gpa);
++ 	ghcb_va = memremap(ghcb_gpa, HV_HYP_PAGE_SIZE, MEMREMAP_WB);
++ 	if (!ghcb_va)
++ 		return -ENOMEM;
++ 
++ 	ghcb_base = (void **)this_cpu_ptr(hv_ghcb_pg);
++ 	*ghcb_base = ghcb_va;
++ 
++ 	return 0;
++ }
++ 
+  static int hv_cpu_init(unsigned int cpu)
+  {
+ -	union hv_vp_assist_msr_contents msr = { 0 };
+  	struct hv_vp_assist_page **hvp = &hv_vp_assist_page[smp_processor_id()];
+  	int ret;
+  
+@@@ -63,29 -86,37 +94,29 @@@
+  	if (!hv_vp_assist_page)
+  		return 0;
+  
+ +	/*
+ +	 * The VP ASSIST PAGE is an "overlay" page (see Hyper-V TLFS's Section
+ +	 * 5.2.1 "GPA Overlay Pages"). Here it must be zeroed out to make sure
+ +	 * we always write the EOI MSR in hv_apic_eoi_write() *after* the
+ +	 * EOI optimization is disabled in hv_cpu_die(), otherwise a CPU may
+ +	 * not be stopped in the case of CPU offlining and the VM will hang.
+ +	 */
+  	if (!*hvp) {
+ -		if (hv_root_partition) {
+ -			/*
+ -			 * For root partition we get the hypervisor provided VP assist
+ -			 * page, instead of allocating a new page.
+ -			 */
+ -			rdmsrl(HV_X64_MSR_VP_ASSIST_PAGE, msr.as_uint64);
+ -			*hvp = memremap(msr.pfn <<
+ -					HV_X64_MSR_VP_ASSIST_PAGE_ADDRESS_SHIFT,
+ -					PAGE_SIZE, MEMREMAP_WB);
+ -		} else {
+ -			/*
+ -			 * The VP assist page is an "overlay" page (see Hyper-V TLFS's
+ -			 * Section 5.2.1 "GPA Overlay Pages"). Here it must be zeroed
+ -			 * out to make sure we always write the EOI MSR in
+ -			 * hv_apic_eoi_write() *after* the EOI optimization is disabled
+ -			 * in hv_cpu_die(), otherwise a CPU may not be stopped in the
+ -			 * case of CPU offlining and the VM will hang.
+ -			 */
+ -			*hvp = __vmalloc(PAGE_SIZE, GFP_KERNEL | __GFP_ZERO);
+ -			if (*hvp)
+ -				msr.pfn = vmalloc_to_pfn(*hvp);
+ -		}
+ -		WARN_ON(!(*hvp));
+ -		if (*hvp) {
+ -			msr.enable = 1;
+ -			wrmsrl(HV_X64_MSR_VP_ASSIST_PAGE, msr.as_uint64);
+ -		}
+ +		*hvp = __vmalloc(PAGE_SIZE, GFP_KERNEL | __GFP_ZERO,
+ +				 PAGE_KERNEL);
+ +	}
+ +
+ +	if (*hvp) {
+ +		u64 val;
+ +
+ +		val = vmalloc_to_pfn(*hvp);
+ +		val = (val << HV_X64_MSR_VP_ASSIST_PAGE_ADDRESS_SHIFT) |
+ +			HV_X64_MSR_VP_ASSIST_PAGE_ENABLE;
+ +
+ +		wrmsrl(HV_X64_MSR_VP_ASSIST_PAGE, val);
+  	}
+  
+- 	return 0;
++ 	return hyperv_init_ghcb();
+  }
+  
+  static void (*hv_reenlightenment_cb)(void);
+@@@ -371,11 -426,10 +416,18 @@@ void __init hyperv_init(void
+  
+  	hv_hypercall_pg = __vmalloc_node_range(PAGE_SIZE, 1, VMALLOC_START,
+  			VMALLOC_END, GFP_KERNEL, PAGE_KERNEL_ROX,
+++<<<<<<< HEAD
+ +			VM_FLUSH_RESET_PERMS, NUMA_NO_NODE, __func__);
+ +	if (hv_hypercall_pg == NULL) {
+ +		wrmsrl(HV_X64_MSR_GUEST_OS_ID, 0);
+ +		goto remove_cpuhp_state;
+ +	}
+++=======
++ 			VM_FLUSH_RESET_PERMS, NUMA_NO_NODE,
++ 			__builtin_return_address(0));
++ 	if (hv_hypercall_pg == NULL)
++ 		goto clean_guest_os_id;
+++>>>>>>> 0cc4f6d9f0b9 (x86/hyperv: Initialize GHCB page in Isolation VM)
+  
+  	rdmsrl(HV_X64_MSR_HYPERCALL, hypercall_msr.as_uint64);
+  	hypercall_msr.enable = 1;
+* Unmerged path arch/x86/hyperv/hv_init.c
+diff --git a/arch/x86/include/asm/mshyperv.h b/arch/x86/include/asm/mshyperv.h
+index 50ff5ae8218d..67fd84423b5b 100644
+--- a/arch/x86/include/asm/mshyperv.h
++++ b/arch/x86/include/asm/mshyperv.h
+@@ -11,6 +11,8 @@
+ #include <asm/paravirt.h>
+ #include <asm/mshyperv.h>
+ 
++DECLARE_STATIC_KEY_FALSE(isolation_type_snp);
++
+ typedef int (*hyperv_fill_flush_list_func)(
+ 		struct hv_guest_mapping_flush_list *flush,
+ 		void *data);
+@@ -52,6 +54,8 @@ extern void *hv_hypercall_pg;
+ 
+ extern u64 hv_current_partition_id;
+ 
++extern void __percpu **hv_ghcb_pg;
++
+ int hv_call_deposit_pages(int node, u64 partition_id, u32 num_pages);
+ int hv_call_add_logical_proc(int node, u32 lp_index, u32 acpi_id);
+ int hv_call_create_vp(int node, u64 partition_id, u32 vp_index, u32 flags);
+diff --git a/arch/x86/kernel/cpu/mshyperv.c b/arch/x86/kernel/cpu/mshyperv.c
+index c4d6cd740ffd..c16549141776 100644
+--- a/arch/x86/kernel/cpu/mshyperv.c
++++ b/arch/x86/kernel/cpu/mshyperv.c
+@@ -298,6 +298,9 @@ static void __init ms_hyperv_init_platform(void)
+ 
+ 		pr_info("Hyper-V: Isolation Config: Group A 0x%x, Group B 0x%x\n",
+ 			ms_hyperv.isolation_config_a, ms_hyperv.isolation_config_b);
++
++		if (hv_get_isolation_type() == HV_ISOLATION_TYPE_SNP)
++			static_branch_enable(&isolation_type_snp);
+ 	}
+ 
+ 	if (hv_max_functions_eax >= HYPERV_CPUID_NESTED_FEATURES) {
+diff --git a/include/asm-generic/mshyperv.h b/include/asm-generic/mshyperv.h
+index 807f1b524af2..1ad9658de1fe 100644
+--- a/include/asm-generic/mshyperv.h
++++ b/include/asm-generic/mshyperv.h
+@@ -254,6 +254,7 @@ bool hv_is_hyperv_initialized(void);
+ bool hv_is_hibernation_supported(void);
+ enum hv_isolation_type hv_get_isolation_type(void);
+ bool hv_is_isolation_supported(void);
++bool hv_isolation_type_snp(void);
+ void hyperv_cleanup(void);
+ bool hv_query_ext_cap(u64 cap_query);
+ void hv_setup_dma_ops(struct device *dev, bool coherent);
+@@ -261,6 +262,11 @@ void hv_setup_dma_ops(struct device *dev, bool coherent);
+ static inline bool hv_is_hyperv_initialized(void) { return false; }
+ static inline bool hv_is_hibernation_supported(void) { return false; }
+ static inline void hyperv_cleanup(void) {}
++static inline bool hv_is_isolation_supported(void) { return false; }
++static inline enum hv_isolation_type hv_get_isolation_type(void)
++{
++	return HV_ISOLATION_TYPE_NONE;
++}
+ #endif /* CONFIG_HYPERV */
+ 
+ #endif
