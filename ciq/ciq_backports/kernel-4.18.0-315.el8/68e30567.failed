@@ -1,0 +1,191 @@
+lockdep: Adjust check_redundant() for recursive read change
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-315.el8
+commit-author Boqun Feng <boqun.feng@gmail.com>
+commit 68e305678583f13a67e2ce22088c2520bd4f97b4
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-315.el8/68e30567.failed
+
+check_redundant() will report redundancy if it finds a path could
+replace the about-to-add dependency in the BFS search. With recursive
+read lock changes, we certainly need to change the match function for
+the check_redundant(), because the path needs to match not only the lock
+class but also the dependency kinds. For example, if the about-to-add
+dependency @prev -> @next is A -(SN)-> B, and we find a path A -(S*)->
+.. -(*R)->B in the dependency graph with __bfs() (for simplicity, we can
+also say we find an -(SR)-> path from A to B), we can not replace the
+dependency with that path in the BFS search. Because the -(SN)->
+dependency can make a strong path with a following -(S*)-> dependency,
+however an -(SR)-> path cannot.
+
+Further, we can replace an -(SN)-> dependency with a -(EN)-> path, that
+means if we find a path which is stronger than or equal to the
+about-to-add dependency, we can report the redundancy. By "stronger", it
+means both the start and the end of the path are not weaker than the
+start and the end of the dependency (E is "stronger" than S and N is
+"stronger" than R), so that we can replace the dependency with that
+path.
+
+To make sure we find a path whose start point is not weaker than the
+about-to-add dependency, we use a trick: the ->only_xr of the root
+(start point) of __bfs() is initialized as @prev-> == 0, therefore if
+@prev is E, __bfs() will pick only -(E*)-> for the first dependency,
+otherwise, __bfs() can pick -(E*)-> or -(S*)-> for the first dependency.
+
+To make sure we find a path whose end point is not weaker than the
+about-to-add dependency, we replace the match function for __bfs()
+check_redundant(), we check for the case that either @next is R
+(anything is not weaker than it) or the end point of the path is N
+(which is not weaker than anything).
+
+	Signed-off-by: Boqun Feng <boqun.feng@gmail.com>
+	Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+Link: https://lkml.kernel.org/r/20200807074238.1632519-11-boqun.feng@gmail.com
+(cherry picked from commit 68e305678583f13a67e2ce22088c2520bd4f97b4)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	kernel/locking/lockdep.c
+diff --cc kernel/locking/lockdep.c
+index 3abcaf4f62ca,42e2f1fbbd5f..000000000000
+--- a/kernel/locking/lockdep.c
++++ b/kernel/locking/lockdep.c
+@@@ -1734,15 -1833,72 +1734,49 @@@ print_circular_bug_header(struct lock_l
+  	print_circular_bug_entry(entry, depth);
+  }
+  
+++<<<<<<< HEAD
+ +static inline int class_equal(struct lock_list *entry, void *data)
+++=======
++ /*
++  * We are about to add A -> B into the dependency graph, and in __bfs() a
++  * strong dependency path A -> .. -> B is found: hlock_class equals
++  * entry->class.
++  *
++  * If A -> .. -> B can replace A -> B in any __bfs() search (means the former
++  * is _stronger_ than or equal to the latter), we consider A -> B as redundant.
++  * For example if A -> .. -> B is -(EN)-> (i.e. A -(E*)-> .. -(*N)-> B), and A
++  * -> B is -(ER)-> or -(EN)->, then we don't need to add A -> B into the
++  * dependency graph, as any strong path ..-> A -> B ->.. we can get with
++  * having dependency A -> B, we could already get a equivalent path ..-> A ->
++  * .. -> B -> .. with A -> .. -> B. Therefore A -> B is reduntant.
++  *
++  * We need to make sure both the start and the end of A -> .. -> B is not
++  * weaker than A -> B. For the start part, please see the comment in
++  * check_redundant(). For the end part, we need:
++  *
++  * Either
++  *
++  *     a) A -> B is -(*R)-> (everything is not weaker than that)
++  *
++  * or
++  *
++  *     b) A -> .. -> B is -(*N)-> (nothing is stronger than this)
++  *
++  */
++ static inline bool hlock_equal(struct lock_list *entry, void *data)
+++>>>>>>> 68e305678583 (lockdep: Adjust check_redundant() for recursive read change)
+  {
+- 	return entry->class == data;
++ 	struct held_lock *hlock = (struct held_lock *)data;
++ 
++ 	return hlock_class(hlock) == entry->class && /* Found A -> .. -> B */
++ 	       (hlock->read == 2 ||  /* A -> B is -(*R)-> */
++ 		!entry->only_xr); /* A -> .. -> B is -(*N)-> */
+  }
+  
+ -/*
+ - * We are about to add B -> A into the dependency graph, and in __bfs() a
+ - * strong dependency path A -> .. -> B is found: hlock_class equals
+ - * entry->class.
+ - *
+ - * We will have a deadlock case (conflict) if A -> .. -> B -> A is a strong
+ - * dependency cycle, that means:
+ - *
+ - * Either
+ - *
+ - *     a) B -> A is -(E*)->
+ - *
+ - * or
+ - *
+ - *     b) A -> .. -> B is -(*N)-> (i.e. A -> .. -(*N)-> B)
+ - *
+ - * as then we don't have -(*R)-> -(S*)-> in the cycle.
+ - */
+ -static inline bool hlock_conflict(struct lock_list *entry, void *data)
+ -{
+ -	struct held_lock *hlock = (struct held_lock *)data;
+ -
+ -	return hlock_class(hlock) == entry->class && /* Found A -> .. -> B */
+ -	       (hlock->read == 0 || /* B -> A is -(E*)-> */
+ -		!entry->only_xr); /* A -> .. -> B is -(*N)-> */
+ -}
+ -
+  static noinline void print_circular_bug(struct lock_list *this,
+ -				struct lock_list *target,
+ -				struct held_lock *check_src,
+ -				struct held_lock *check_tgt)
+ +					struct lock_list *target,
+ +					struct held_lock *check_src,
+ +					struct held_lock *check_tgt)
+  {
+  	struct task_struct *curr = current;
+  	struct lock_list *parent;
+@@@ -1911,27 -2064,35 +1945,50 @@@ check_noncircular(struct held_lock *src
+   * <target> or not. If it can, <src> -> <target> dependency is already
+   * in the graph.
+   *
+ - * Return BFS_RMATCH if it does, or BFS_RMATCH if it does not, return BFS_E* if
+ - * any error appears in the bfs search.
+ + * Print an error and return 2 if it does or 1 if it does not.
+   */
+ -static noinline enum bfs_result
+ +static noinline int
+  check_redundant(struct held_lock *src, struct held_lock *target)
+  {
+++<<<<<<< HEAD
+ +	int ret;
+ +	struct lock_list *uninitialized_var(target_entry);
+ +	struct lock_list src_entry = {
+ +		.class = hlock_class(src),
+ +		.parent = NULL,
+ +	};
+ +
+ +	debug_atomic_inc(nr_redundant_checks);
+ +
+ +	ret = check_path(hlock_class(target), &src_entry, &target_entry);
+++=======
++ 	enum bfs_result ret;
++ 	struct lock_list *target_entry;
++ 	struct lock_list src_entry;
++ 
++ 	bfs_init_root(&src_entry, src);
++ 	/*
++ 	 * Special setup for check_redundant().
++ 	 *
++ 	 * To report redundant, we need to find a strong dependency path that
++ 	 * is equal to or stronger than <src> -> <target>. So if <src> is E,
++ 	 * we need to let __bfs() only search for a path starting at a -(E*)->,
++ 	 * we achieve this by setting the initial node's ->only_xr to true in
++ 	 * that case. And if <prev> is S, we set initial ->only_xr to false
++ 	 * because both -(S*)-> (equal) and -(E*)-> (stronger) are redundant.
++ 	 */
++ 	src_entry.only_xr = src->read == 0;
++ 
++ 	debug_atomic_inc(nr_redundant_checks);
++ 
++ 	ret = check_path(target, &src_entry, hlock_equal, &target_entry);
+++>>>>>>> 68e305678583 (lockdep: Adjust check_redundant() for recursive read change)
+  
+ -	if (ret == BFS_RMATCH)
+ +	if (!ret) {
+  		debug_atomic_inc(nr_redundant);
+ +		ret = 2;
+ +	} else if (ret < 0)
+ +		ret = 0;
+  
+  	return ret;
+  }
+* Unmerged path kernel/locking/lockdep.c
