@@ -1,0 +1,206 @@
+block: allow partitions on host aware zone devices
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Christoph Hellwig <hch@lst.de>
+commit b72053072c0bbe9f1cdfe2ffa3c201c185da2201
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/b7205307.failed
+
+Host-aware SMR drives can be used with the commands to explicitly manage
+zone state, but they can also be used as normal disks.  In the former
+case it makes perfect sense to allow partitions on them, in the latter
+it does not, just like for host managed devices.  Add a check to
+add_partition to allow partitions on host aware devices, but give
+up any zone management capabilities in that case, which also catches
+the previously missed case of adding a partition vs just scanning it.
+
+Because sd can rescan the attribute at runtime it needs to check if
+a disk has partitions, for which a new helper is added to genhd.h.
+
+Fixes: 5eac3eb30c9a ("block: Remove partition support for zoned block devices")
+	Reported-by: Borislav Petkov <bp@suse.de>
+	Signed-off-by: Christoph Hellwig <hch@lst.de>
+	Tested-by: Damien Le Moal <damien.lemoal@wdc.com>
+	Reviewed-by: Damien Le Moal <damien.lemoal@wdc.com>
+	Signed-off-by: Jens Axboe <axboe@kernel.dk>
+(cherry picked from commit b72053072c0bbe9f1cdfe2ffa3c201c185da2201)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	block/partition-generic.c
+diff --cc block/partition-generic.c
+index aee643ce13d1,564fae77711d..000000000000
+--- a/block/partition-generic.c
++++ b/block/partition-generic.c
+@@@ -459,53 -482,53 +477,68 @@@ static int drop_partitions(struct gendi
+  	return 0;
+  }
+  
+ -static bool blk_add_partition(struct gendisk *disk, struct block_device *bdev,
+ -		struct parsed_partitions *state, int p)
+ +static bool part_zone_aligned(struct gendisk *disk,
+ +			      struct block_device *bdev,
+ +			      sector_t from, sector_t size)
+  {
+ -	sector_t size = state->parts[p].size;
+ -	sector_t from = state->parts[p].from;
+ -	struct hd_struct *part;
+ +	unsigned int zone_sectors = bdev_zone_sectors(bdev);
+  
+ -	if (!size)
+ +	/*
+ +	 * If this function is called, then the disk is a zoned block device
+ +	 * (host-aware or host-managed). This can be detected even if the
+ +	 * zoned block device support is disabled (CONFIG_BLK_DEV_ZONED not
+ +	 * set). In this case, however, only host-aware devices will be seen
+ +	 * as a block device is not created for host-managed devices. Without
+ +	 * zoned block device support, host-aware drives can still be used as
+ +	 * regular block devices (no zone operation) and their zone size will
+ +	 * be reported as 0. Allow this case.
+ +	 */
+ +	if (!zone_sectors)
+  		return true;
+  
+ -	if (from >= get_capacity(disk)) {
+ -		printk(KERN_WARNING
+ -		       "%s: p%d start %llu is beyond EOD, ",
+ -		       disk->disk_name, p, (unsigned long long) from);
+ -		if (disk_unlock_native_capacity(disk))
+ +	/*
+ +	 * Check partition start and size alignement. If the drive has a
+ +	 * smaller last runt zone, ignore it and allow the partition to
+ +	 * use it. Check the zone size too: it should be a power of 2 number
+ +	 * of sectors.
+ +	 */
+ +	if (WARN_ON_ONCE(!is_power_of_2(zone_sectors))) {
+ +		u32 rem;
+ +
+ +		div_u64_rem(from, zone_sectors, &rem);
+ +		if (rem)
+  			return false;
+ -		return true;
+ -	}
+ +		if ((from + size) < get_capacity(disk)) {
+ +			div_u64_rem(size, zone_sectors, &rem);
+ +			if (rem)
+ +				return false;
+ +		}
+  
+ -	if (from + size > get_capacity(disk)) {
+ -		printk(KERN_WARNING
+ -		       "%s: p%d size %llu extends beyond EOD, ",
+ -		       disk->disk_name, p, (unsigned long long) size);
+ +	} else {
+  
+ -		if (disk_unlock_native_capacity(disk))
+ +		if (from & (zone_sectors - 1))
+ +			return false;
+ +		if ((from + size) < get_capacity(disk) &&
+ +		    (size & (zone_sectors - 1)))
+  			return false;
+  
+ -		/*
+ -		 * We can not ignore partitions of broken tables created by for
+ -		 * example camera firmware, but we limit them to the end of the
+ -		 * disk to avoid creating invalid block devices.
+ -		 */
+ -		size = get_capacity(disk) - from;
+  	}
+  
+++<<<<<<< HEAD
+++=======
++ 	part = add_partition(disk, p, from, size, state->parts[p].flags,
++ 			     &state->parts[p].info);
++ 	if (IS_ERR(part) && PTR_ERR(part) != -ENXIO) {
++ 		printk(KERN_ERR " %s: p%d could not be added: %ld\n",
++ 		       disk->disk_name, p, -PTR_ERR(part));
++ 		return true;
++ 	}
++ 
++ #ifdef CONFIG_BLK_DEV_MD
++ 	if (state->parts[p].flags & ADDPART_FLAG_RAID)
++ 		md_autodetect_dev(part_to_dev(part)->devt);
++ #endif
+++>>>>>>> b72053072c0b (block: allow partitions on host aware zone devices)
+  	return true;
+  }
+  
+@@@ -544,10 -556,21 +577,26 @@@ rescan
+  		}
+  		return -EIO;
+  	}
+ -
+  	/*
+++<<<<<<< HEAD
+ +	 * If any partition code tried to read beyond EOD, try
+ +	 * unlocking native capacity even if partition table is
+ +	 * successfully read as we could be missing some partitions.
+++=======
++ 	 * Partitions are not supported on host managed zoned block devices.
++ 	 */
++ 	if (disk->queue->limits.zoned == BLK_ZONED_HM) {
++ 		pr_warn("%s: ignoring partition table on host managed zoned block device\n",
++ 			disk->disk_name);
++ 		ret = 0;
++ 		goto out_free_state;
++ 	}
++ 
++ 	/*
++ 	 * If we read beyond EOD, try unlocking native capacity even if the
++ 	 * partition table was successfully read as we could be missing some
++ 	 * partitions.
+++>>>>>>> b72053072c0b (block: allow partitions on host aware zone devices)
+  	 */
+  	if (state->access_beyond_eod) {
+  		printk(KERN_WARNING
+* Unmerged path block/partition-generic.c
+diff --git a/drivers/scsi/sd.c b/drivers/scsi/sd.c
+index 1f8c205eb02e..b2fdf8bd20fc 100644
+--- a/drivers/scsi/sd.c
++++ b/drivers/scsi/sd.c
+@@ -2889,15 +2889,16 @@ static void sd_read_block_characteristics(struct scsi_disk *sdkp)
+ 		q->limits.zoned = BLK_ZONED_HM;
+ 	} else {
+ 		sdkp->zoned = (buffer[8] >> 4) & 3;
+-		if (sdkp->zoned == 1)
++		if (sdkp->zoned == 1 && !disk_has_partitions(sdkp->disk)) {
+ 			/* Host-aware */
+ 			q->limits.zoned = BLK_ZONED_HA;
+-		else
++		} else {
+ 			/*
+-			 * Treat drive-managed devices as
+-			 * regular block devices.
++			 * Treat drive-managed devices and host-aware devices
++			 * with partitions as regular block devices.
+ 			 */
+ 			q->limits.zoned = BLK_ZONED_NONE;
++		}
+ 	}
+ 	if (blk_queue_is_zoned(q) && sdkp->first_scan)
+ 		sd_printk(KERN_NOTICE, sdkp, "Host-%s zoned block device\n",
+diff --git a/include/linux/genhd.h b/include/linux/genhd.h
+index fe1fb3b4d909..0a722ba50a45 100644
+--- a/include/linux/genhd.h
++++ b/include/linux/genhd.h
+@@ -251,6 +251,18 @@ static inline bool disk_part_scan_enabled(struct gendisk *disk)
+ 		!(disk->flags & GENHD_FL_NO_PART_SCAN);
+ }
+ 
++static inline bool disk_has_partitions(struct gendisk *disk)
++{
++	bool ret = false;
++
++	rcu_read_lock();
++	if (rcu_dereference(disk->part_tbl)->len > 1)
++		ret = true;
++	rcu_read_unlock();
++
++	return ret;
++}
++
+ static inline dev_t disk_devt(struct gendisk *disk)
+ {
+ 	return MKDEV(disk->major, disk->first_minor);
