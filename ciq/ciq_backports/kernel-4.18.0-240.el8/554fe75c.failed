@@ -1,0 +1,104 @@
+net/mlx5e: Avoid duplicating rule destinations
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Dmytro Linkin <dmitrolin@mellanox.com>
+commit 554fe75c1b3f679b1eebf193a4e56492837d3f5a
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/554fe75c.failed
+
+Following scenario easily break driver logic and crash the kernel:
+1. Add rule with mirred actions to same device.
+2. Delete this rule.
+In described scenario rule is not added to database and on deletion
+driver access invalid entry.
+Example:
+
+ $ tc filter add dev ens1f0_0 ingress protocol ip prio 1 \
+       flower skip_sw \
+       action mirred egress mirror dev ens1f0_1 pipe \
+       action mirred egress redirect dev ens1f0_1
+ $ tc filter del dev ens1f0_0 ingress protocol ip prio 1
+
+Dmesg output:
+
+[  376.634396] mlx5_core 0000:82:00.0: mlx5_cmd_check:756:(pid 3439): DESTROY_FLOW_GROUP(0x934) op_mod(0x0) failed, status bad resource state(0x9), syndrome (0x563e2f)
+[  376.654983] mlx5_core 0000:82:00.0: del_hw_flow_group:567:(pid 3439): flow steering can't destroy fg 89 of ft 3145728
+[  376.673433] kasan: CONFIG_KASAN_INLINE enabled
+[  376.683769] kasan: GPF could be caused by NULL-ptr deref or user memory access
+[  376.695229] general protection fault: 0000 [#1] PREEMPT SMP KASAN PTI
+[  376.705069] CPU: 7 PID: 3439 Comm: tc Not tainted 5.4.0-rc5+ #76
+[  376.714959] Hardware name: Supermicro SYS-2028TP-DECTR/X10DRT-PT, BIOS 2.0a 08/12/2016
+[  376.726371] RIP: 0010:mlx5_del_flow_rules+0x105/0x960 [mlx5_core]
+[  376.735817] Code: 01 00 00 00 48 83 eb 08 e8 28 d9 ff ff 4c 39 e3 75 d8 4c 8d bd c0 02 00 00 48 b8 00 00 00 00 00 fc ff df 4c 89 fa 48 c1 ea 03 <0f> b6 04 02 84 c0 74 08 3c 03 0f 8e 84 04 00 00 48 8d 7d 28 8b 9 d
+[  376.761261] RSP: 0018:ffff888847c56db8 EFLAGS: 00010202
+[  376.770054] RAX: dffffc0000000000 RBX: ffff8888582a6da0 RCX: ffff888847c56d60
+[  376.780743] RDX: 0000000000000058 RSI: 0000000000000008 RDI: 0000000000000282
+[  376.791328] RBP: 0000000000000000 R08: fffffbfff0c60ea6 R09: fffffbfff0c60ea6
+[  376.802050] R10: fffffbfff0c60ea5 R11: ffffffff8630752f R12: ffff8888582a6da0
+[  376.812798] R13: dffffc0000000000 R14: ffff8888582a6da0 R15: 00000000000002c0
+[  376.823445] FS:  00007f675f9a8840(0000) GS:ffff88886d200000(0000) knlGS:0000000000000000
+[  376.834971] CS:  0010 DS: 0000 ES: 0000 CR0: 0000000080050033
+[  376.844179] CR2: 00000000007d9640 CR3: 00000007d3f26003 CR4: 00000000001606e0
+[  376.854843] Call Trace:
+[  376.868542]  __mlx5_eswitch_del_rule+0x49/0x300 [mlx5_core]
+[  376.877735]  mlx5e_tc_del_fdb_flow+0x6ec/0x9e0 [mlx5_core]
+[  376.921549]  mlx5e_flow_put+0x2b/0x50 [mlx5_core]
+[  376.929813]  mlx5e_delete_flower+0x5b6/0xbd0 [mlx5_core]
+[  376.973030]  tc_setup_cb_reoffload+0x29/0xc0
+[  376.980619]  fl_reoffload+0x50a/0x770 [cls_flower]
+[  377.015087]  tcf_block_playback_offloads+0xbd/0x250
+[  377.033400]  tcf_block_setup+0x1b2/0xc60
+[  377.057247]  tcf_block_offload_cmd+0x195/0x240
+[  377.098826]  tcf_block_offload_unbind+0xe7/0x180
+[  377.107056]  __tcf_block_put+0xe5/0x400
+[  377.114528]  ingress_destroy+0x3d/0x60 [sch_ingress]
+[  377.122894]  qdisc_destroy+0xf1/0x5a0
+[  377.129993]  qdisc_graft+0xa3d/0xe50
+[  377.151227]  tc_get_qdisc+0x48e/0xa20
+[  377.165167]  rtnetlink_rcv_msg+0x35d/0x8d0
+[  377.199528]  netlink_rcv_skb+0x11e/0x340
+[  377.219638]  netlink_unicast+0x408/0x5b0
+[  377.239913]  netlink_sendmsg+0x71b/0xb30
+[  377.267505]  sock_sendmsg+0xb1/0xf0
+[  377.273801]  ___sys_sendmsg+0x635/0x900
+[  377.312784]  __sys_sendmsg+0xd3/0x170
+[  377.338693]  do_syscall_64+0x95/0x460
+[  377.344833]  entry_SYSCALL_64_after_hwframe+0x49/0xbe
+[  377.352321] RIP: 0033:0x7f675e58e090
+
+To avoid this, for every mirred action check if output device was
+already processed. If so - drop rule with EOPNOTSUPP error.
+
+	Signed-off-by: Dmytro Linkin <dmitrolin@mellanox.com>
+	Reviewed-by: Roi Dayan <roid@mellanox.com>
+	Reviewed-by: Vlad Buslov <vladbu@mellanox.com>
+	Signed-off-by: Saeed Mahameed <saeedm@mellanox.com>
+(cherry picked from commit 554fe75c1b3f679b1eebf193a4e56492837d3f5a)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/mellanox/mlx5/core/en_tc.c
+diff --cc drivers/net/ethernet/mellanox/mlx5/core/en_tc.c
+index 1b99e136993c,fe83886f5435..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_tc.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_tc.c
+@@@ -3217,10 -3276,12 +3262,15 @@@ static int parse_tc_fdb_actions(struct 
+  	struct mlx5e_tc_flow_parse_attr *parse_attr = attr->parse_attr;
+  	struct mlx5e_rep_priv *rpriv = priv->ppriv;
+  	const struct ip_tunnel_info *info = NULL;
+++<<<<<<< HEAD
+++=======
++ 	int ifindexes[MLX5_MAX_FLOW_FWD_VPORTS];
++ 	bool ft_flow = mlx5e_is_ft_flow(flow);
+++>>>>>>> 554fe75c1b3f (net/mlx5e: Avoid duplicating rule destinations)
+  	const struct flow_action_entry *act;
++ 	int err, i, if_count = 0;
+  	bool encap = false;
+  	u32 action = 0;
+- 	int err, i;
+  
+  	if (!flow_action_has_entries(flow_action))
+  		return -EINVAL;
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/en_tc.c
