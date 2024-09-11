@@ -1,0 +1,198 @@
+ftrace/x86: Add register_ftrace_direct() for custom trampolines
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Steven Rostedt (VMware) <rostedt@goodmis.org>
+commit 562955fe6a558b9ef98ad87c470314946338cb2f
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/562955fe.failed
+
+Enable x86 to allow for register_ftrace_direct(), where a custom trampoline
+may be called directly from an ftrace mcount/fentry location.
+
+	Signed-off-by: Steven Rostedt (VMware) <rostedt@goodmis.org>
+(cherry picked from commit 562955fe6a558b9ef98ad87c470314946338cb2f)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/ftrace.h
+diff --cc include/linux/ftrace.h
+index a0bdf45611c0,2bc7bd6b8387..000000000000
+--- a/include/linux/ftrace.h
++++ b/include/linux/ftrace.h
+@@@ -243,6 -246,43 +243,46 @@@ static inline void ftrace_free_init_mem
+  static inline void ftrace_free_mem(struct module *mod, void *start, void *end) { }
+  #endif /* CONFIG_FUNCTION_TRACER */
+  
+++<<<<<<< HEAD
+++=======
++ #ifdef CONFIG_DYNAMIC_FTRACE_WITH_DIRECT_CALLS
++ int register_ftrace_direct(unsigned long ip, unsigned long addr);
++ int unregister_ftrace_direct(unsigned long ip, unsigned long addr);
++ struct ftrace_direct_func *ftrace_find_direct_func(unsigned long addr);
++ #else
++ static inline int register_ftrace_direct(unsigned long ip, unsigned long addr)
++ {
++ 	return -ENODEV;
++ }
++ static inline int unregister_ftrace_direct(unsigned long ip, unsigned long addr)
++ {
++ 	return -ENODEV;
++ }
++ static inline struct ftrace_direct_func *ftrace_find_direct_func(unsigned long addr)
++ {
++ 	return NULL;
++ }
++ #endif /* CONFIG_DYNAMIC_FTRACE_WITH_DIRECT_CALLS */
++ 
++ #ifndef CONFIG_HAVE_DYNAMIC_FTRACE_WITH_DIRECT_CALLS
++ /*
++  * This must be implemented by the architecture.
++  * It is the way the ftrace direct_ops helper, when called
++  * via ftrace (because there's other callbacks besides the
++  * direct call), can inform the architecture's trampoline that this
++  * routine has a direct caller, and what the caller is.
++  *
++  * For example, in x86, it returns the direct caller
++  * callback function via the regs->orig_ax parameter.
++  * Then in the ftrace trampoline, if this is set, it makes
++  * the return from the trampoline jump to the direct caller
++  * instead of going back to the function it just traced.
++  */
++ static inline void arch_ftrace_set_direct_caller(struct pt_regs *regs,
++ 						 unsigned long addr) { }
++ #endif /* CONFIG_HAVE_DYNAMIC_FTRACE_WITH_DIRECT_CALLS */
++ 
+++>>>>>>> 562955fe6a55 (ftrace/x86: Add register_ftrace_direct() for custom trampolines)
+  #ifdef CONFIG_STACK_TRACER
+  
+  extern int stack_tracer_enabled;
+diff --git a/arch/x86/Kconfig b/arch/x86/Kconfig
+index 70c5effebd49..1f777320ec96 100644
+--- a/arch/x86/Kconfig
++++ b/arch/x86/Kconfig
+@@ -142,6 +142,7 @@ config X86
+ 	select HAVE_DMA_CONTIGUOUS
+ 	select HAVE_DYNAMIC_FTRACE
+ 	select HAVE_DYNAMIC_FTRACE_WITH_REGS
++	select HAVE_DYNAMIC_FTRACE_WITH_DIRECT_CALLS
+ 	select HAVE_EBPF_JIT
+ 	select HAVE_EFFICIENT_UNALIGNED_ACCESS
+ 	select HAVE_EXIT_THREAD
+diff --git a/arch/x86/include/asm/ftrace.h b/arch/x86/include/asm/ftrace.h
+index c18ed65287d5..f3cd34e7232b 100644
+--- a/arch/x86/include/asm/ftrace.h
++++ b/arch/x86/include/asm/ftrace.h
+@@ -31,6 +31,19 @@ static inline unsigned long ftrace_call_adjust(unsigned long addr)
+ 	return addr;
+ }
+ 
++/*
++ * When a ftrace registered caller is tracing a function that is
++ * also set by a register_ftrace_direct() call, it needs to be
++ * differentiated in the ftrace_caller trampoline. To do this, we
++ * place the direct caller in the ORIG_AX part of pt_regs. This
++ * tells the ftrace_caller that there's a direct caller.
++ */
++static inline void arch_ftrace_set_direct_caller(struct pt_regs *regs, unsigned long addr)
++{
++	/* Emulate a call */
++	regs->orig_ax = addr;
++}
++
+ #ifdef CONFIG_DYNAMIC_FTRACE
+ 
+ struct dyn_arch_ftrace {
+diff --git a/arch/x86/kernel/ftrace.c b/arch/x86/kernel/ftrace.c
+index c0b4955db311..854fb9562a61 100644
+--- a/arch/x86/kernel/ftrace.c
++++ b/arch/x86/kernel/ftrace.c
+@@ -1030,6 +1030,18 @@ void prepare_ftrace_return(unsigned long self_addr, unsigned long *parent,
+ 	if (unlikely(atomic_read(&current->tracing_graph_pause)))
+ 		return;
+ 
++	/*
++	 * If the return location is actually pointing directly to
++	 * the start of a direct trampoline (if we trace the trampoline
++	 * it will still be offset by MCOUNT_INSN_SIZE), then the
++	 * return address is actually off by one word, and we
++	 * need to adjust for that.
++	 */
++	if (ftrace_find_direct_func(self_addr + MCOUNT_INSN_SIZE)) {
++		self_addr = *parent;
++		parent++;
++	}
++
+ 	/*
+ 	 * Protect against fault, even if it shouldn't
+ 	 * happen. This tool is too much intrusive to
+diff --git a/arch/x86/kernel/ftrace_64.S b/arch/x86/kernel/ftrace_64.S
+index 91b2cff4b79a..bed956d367ed 100644
+--- a/arch/x86/kernel/ftrace_64.S
++++ b/arch/x86/kernel/ftrace_64.S
+@@ -101,6 +101,7 @@ EXPORT_SYMBOL(mcount)
+ 	movq %rdi, RDI(%rsp)
+ 	movq %r8, R8(%rsp)
+ 	movq %r9, R9(%rsp)
++	movq $0, ORIG_RAX(%rsp)
+ 	/*
+ 	 * Save the original RBP. Even though the mcount ABI does not
+ 	 * require this, it helps out callers.
+@@ -132,7 +133,11 @@ EXPORT_SYMBOL(mcount)
+ 	subq $MCOUNT_INSN_SIZE, %rdi
+ 	.endm
+ 
+-.macro restore_mcount_regs
++.macro restore_mcount_regs save=0
++
++	/* ftrace_regs_caller or frame pointers require this */
++	movq RBP(%rsp), %rbp
++
+ 	movq R9(%rsp), %r9
+ 	movq R8(%rsp), %r8
+ 	movq RDI(%rsp), %rdi
+@@ -141,10 +146,7 @@ EXPORT_SYMBOL(mcount)
+ 	movq RCX(%rsp), %rcx
+ 	movq RAX(%rsp), %rax
+ 
+-	/* ftrace_regs_caller can modify %rbp */
+-	movq RBP(%rsp), %rbp
+-
+-	addq $MCOUNT_REG_SIZE, %rsp
++	addq $MCOUNT_REG_SIZE-\save, %rsp
+ 
+ 	.endm
+ 
+@@ -244,10 +246,28 @@ GLOBAL(ftrace_regs_call)
+ 	movq R10(%rsp), %r10
+ 	movq RBX(%rsp), %rbx
+ 
+-	restore_mcount_regs
++	movq ORIG_RAX(%rsp), %rax
++	movq %rax, MCOUNT_REG_SIZE-8(%rsp)
++
++	/* If ORIG_RAX is anything but zero, make this a call to that */
++	movq ORIG_RAX(%rsp), %rax
++	cmpq	$0, %rax
++	je	1f
++
++	/* Swap the flags with orig_rax */
++	movq MCOUNT_REG_SIZE(%rsp), %rdi
++	movq %rdi, MCOUNT_REG_SIZE-8(%rsp)
++	movq %rax, MCOUNT_REG_SIZE(%rsp)
++
++	restore_mcount_regs 8
++
++	jmp	2f
++
++1:	restore_mcount_regs
++
+ 
+ 	/* Restore flags */
+-	popfq
++2:	popfq
+ 
+ 	/*
+ 	 * As this jmp to ftrace_epilogue can be a short jump
+* Unmerged path include/linux/ftrace.h
