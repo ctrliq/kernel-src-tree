@@ -1948,7 +1948,6 @@ static bool modify_header_match_supported(struct mlx5_flow_spec *spec,
 {
 	const struct tc_action *a;
 	bool modify_ip_header;
-	LIST_HEAD(actions);
 	u8 htype, ip_proto;
 	void *headers_v;
 	u16 ethertype;
@@ -2032,7 +2031,6 @@ static int parse_tc_nic_actions(struct mlx5e_priv *priv, struct tcf_exts *exts,
 {
 	struct mlx5_nic_flow_attr *attr = flow->nic_attr;
 	const struct tc_action *a;
-	LIST_HEAD(actions);
 	u32 action = 0;
 	int err, i;
 
@@ -2607,7 +2605,6 @@ static int parse_tc_fdb_actions(struct mlx5e_priv *priv, struct tcf_exts *exts,
 	struct mlx5e_rep_priv *rpriv = priv->ppriv;
 	struct ip_tunnel_info *info = NULL;
 	const struct tc_action *a;
-	LIST_HEAD(actions);
 	bool encap = false;
 	u32 action = 0;
 	int i;
