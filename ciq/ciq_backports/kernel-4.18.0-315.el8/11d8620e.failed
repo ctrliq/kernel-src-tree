@@ -1,0 +1,115 @@
+hv_netvsc: Use HV_HYP_PAGE_SIZE for Hyper-V communication
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-315.el8
+commit-author Boqun Feng <boqun.feng@gmail.com>
+commit 11d8620e0867cb21313aa66ff6ce0172e28f68ff
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-315.el8/11d8620e.failed
+
+When communicating with Hyper-V, HV_HYP_PAGE_SIZE should be used since
+that's the page size used by Hyper-V and Hyper-V expects all
+page-related data using the unit of HY_HYP_PAGE_SIZE, for example, the
+"pfn" in hv_page_buffer is actually the HV_HYP_PAGE (i.e. the Hyper-V
+page) number.
+
+In order to support guest whose page size is not 4k, we need to make
+hv_netvsc always use HV_HYP_PAGE_SIZE for Hyper-V communication.
+
+	Signed-off-by: Boqun Feng <boqun.feng@gmail.com>
+	Reviewed-by: Michael Kelley <mikelley@microsoft.com>
+Link: https://lore.kernel.org/r/20200916034817.30282-8-boqun.feng@gmail.com
+	Signed-off-by: Wei Liu <wei.liu@kernel.org>
+(cherry picked from commit 11d8620e0867cb21313aa66ff6ce0172e28f68ff)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/hyperv/netvsc_drv.c
+diff --cc drivers/net/hyperv/netvsc_drv.c
+index 66ed9fe6d865,70d91e9b4395..000000000000
+--- a/drivers/net/hyperv/netvsc_drv.c
++++ b/drivers/net/hyperv/netvsc_drv.c
+@@@ -448,9 -434,10 +447,16 @@@ static u32 init_page_array(void *hdr, u
+  	for (i = 0; i < frags; i++) {
+  		skb_frag_t *frag = skb_shinfo(skb)->frags + i;
+  
+++<<<<<<< HEAD
+ +		slots_used += fill_pg_buf(skb_frag_page(frag),
+ +					frag->page_offset,
+ +					skb_frag_size(frag), &pb[slots_used]);
+++=======
++ 		slots_used += fill_pg_buf(page_to_hvpfn(skb_frag_page(frag)),
++ 					  skb_frag_off(frag),
++ 					  skb_frag_size(frag),
++ 					  &pb[slots_used]);
+++>>>>>>> 11d8620e0867 (hv_netvsc: Use HV_HYP_PAGE_SIZE for Hyper-V communication)
+  	}
+  	return slots_used;
+  }
+@@@ -463,11 -450,11 +469,11 @@@ static int count_skb_frag_slots(struct 
+  	for (i = 0; i < frags; i++) {
+  		skb_frag_t *frag = skb_shinfo(skb)->frags + i;
+  		unsigned long size = skb_frag_size(frag);
+ -		unsigned long offset = skb_frag_off(frag);
+ +		unsigned long offset = frag->page_offset;
+  
+  		/* Skip unused frames from start of page */
+- 		offset &= ~PAGE_MASK;
+- 		pages += PFN_UP(offset + size);
++ 		offset &= ~HV_HYP_PAGE_MASK;
++ 		pages += HVPFN_UP(offset + size);
+  	}
+  	return pages;
+  }
+diff --git a/drivers/net/hyperv/netvsc.c b/drivers/net/hyperv/netvsc.c
+index 978f14630083..ea2fcd938d2e 100644
+--- a/drivers/net/hyperv/netvsc.c
++++ b/drivers/net/hyperv/netvsc.c
+@@ -857,7 +857,7 @@ static void netvsc_copy_to_send_buf(struct netvsc_device *net_device,
+ 	}
+ 
+ 	for (i = 0; i < page_count; i++) {
+-		char *src = phys_to_virt(pb[i].pfn << PAGE_SHIFT);
++		char *src = phys_to_virt(pb[i].pfn << HV_HYP_PAGE_SHIFT);
+ 		u32 offset = pb[i].offset;
+ 		u32 len = pb[i].len;
+ 
+* Unmerged path drivers/net/hyperv/netvsc_drv.c
+diff --git a/drivers/net/hyperv/rndis_filter.c b/drivers/net/hyperv/rndis_filter.c
+index 69991dbe9774..c39d2472e7ed 100644
+--- a/drivers/net/hyperv/rndis_filter.c
++++ b/drivers/net/hyperv/rndis_filter.c
+@@ -36,7 +36,7 @@
+ 
+ static void rndis_set_multicast(struct work_struct *w);
+ 
+-#define RNDIS_EXT_LEN PAGE_SIZE
++#define RNDIS_EXT_LEN HV_HYP_PAGE_SIZE
+ struct rndis_request {
+ 	struct list_head list_ent;
+ 	struct completion  wait_event;
+@@ -226,18 +226,17 @@ static int rndis_filter_send_request(struct rndis_device *dev,
+ 	packet->page_buf_cnt = 1;
+ 
+ 	pb[0].pfn = virt_to_phys(&req->request_msg) >>
+-					PAGE_SHIFT;
++					HV_HYP_PAGE_SHIFT;
+ 	pb[0].len = req->request_msg.msg_len;
+-	pb[0].offset =
+-		(unsigned long)&req->request_msg & (PAGE_SIZE - 1);
++	pb[0].offset = offset_in_hvpage(&req->request_msg);
+ 
+ 	/* Add one page_buf when request_msg crossing page boundary */
+-	if (pb[0].offset + pb[0].len > PAGE_SIZE) {
++	if (pb[0].offset + pb[0].len > HV_HYP_PAGE_SIZE) {
+ 		packet->page_buf_cnt++;
+-		pb[0].len = PAGE_SIZE -
++		pb[0].len = HV_HYP_PAGE_SIZE -
+ 			pb[0].offset;
+ 		pb[1].pfn = virt_to_phys((void *)&req->request_msg
+-			+ pb[0].len) >> PAGE_SHIFT;
++			+ pb[0].len) >> HV_HYP_PAGE_SHIFT;
+ 		pb[1].offset = 0;
+ 		pb[1].len = req->request_msg.msg_len -
+ 			pb[0].len;
