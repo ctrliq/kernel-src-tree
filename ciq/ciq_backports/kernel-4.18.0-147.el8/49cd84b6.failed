@@ -1,0 +1,163 @@
+nvme: implement Enhanced Command Retry
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-147.el8
+commit-author Keith Busch <keith.busch@intel.com>
+commit 49cd84b6f8b677ef45731ed56ddb802cdbb94c9e
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-147.el8/49cd84b6.failed
+
+A controller may have an internal state that is not able to successfully
+process commands for a short duration. In such states, an immediate
+command requeue is expected to fail. The driver may exceed its max
+retry count, which permanently ends the command in failure when the same
+command would succeed after waiting for the controller to be ready.
+
+NVMe ratified TP 4033 provides a delay hint in the completion status
+code for failed commands. Implement the retry delay based on the command
+completion status and the controller's requested delay.
+
+Note that requeued commands are handled per request_queue, not per
+individual request. If multiple commands fail, the controller should
+consistently report the desired delay time for retryable commands in
+all CQEs, otherwise the requeue list may be kicked too soon.
+
+	Signed-off-by: Keith Busch <keith.busch@intel.com>
+	Reviewed-by: Sagi Grimberg <sagi@grimberg.me>
+	Signed-off-by: Christoph Hellwig <hch@lst.de>
+	Signed-off-by: Jens Axboe <axboe@kernel.dk>
+(cherry picked from commit 49cd84b6f8b677ef45731ed56ddb802cdbb94c9e)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/nvme.h
+diff --cc include/linux/nvme.h
+index d41eeec9c38b,88812cb15be0..000000000000
+--- a/include/linux/nvme.h
++++ b/include/linux/nvme.h
+@@@ -795,6 -818,12 +808,15 @@@ enum 
+  	NVME_FEAT_HOST_MEM_BUF	= 0x0d,
+  	NVME_FEAT_TIMESTAMP	= 0x0e,
+  	NVME_FEAT_KATO		= 0x0f,
+++<<<<<<< HEAD
+++=======
++ 	NVME_FEAT_HCTM		= 0x10,
++ 	NVME_FEAT_NOPSC		= 0x11,
++ 	NVME_FEAT_RRL		= 0x12,
++ 	NVME_FEAT_PLM_CONFIG	= 0x13,
++ 	NVME_FEAT_PLM_WINDOW	= 0x14,
++ 	NVME_FEAT_HOST_BEHAVIOR	= 0x16,
+++>>>>>>> 49cd84b6f8b6 (nvme: implement Enhanced Command Retry)
+  	NVME_FEAT_SW_PROGRESS	= 0x80,
+  	NVME_FEAT_HOST_ID	= 0x81,
+  	NVME_FEAT_RESV_MASK	= 0x82,
+@@@ -1248,7 -1277,9 +1270,8 @@@ enum 
+  	NVME_SC_ANA_PERSISTENT_LOSS	= 0x301,
+  	NVME_SC_ANA_INACCESSIBLE	= 0x302,
+  	NVME_SC_ANA_TRANSITION		= 0x303,
+ -	NVME_SC_HOST_PATH_ERROR		= 0x370,
+  
++ 	NVME_SC_CRD			= 0x1800,
+  	NVME_SC_DNR			= 0x4000,
+  };
+  
+diff --git a/drivers/nvme/host/core.c b/drivers/nvme/host/core.c
+index 5cb9ef23ea1b..d1cff0d947c8 100644
+--- a/drivers/nvme/host/core.c
++++ b/drivers/nvme/host/core.c
+@@ -244,6 +244,22 @@ static inline bool nvme_req_needs_retry(struct request *req)
+ 	return true;
+ }
+ 
++static void nvme_retry_req(struct request *req)
++{
++	struct nvme_ns *ns = req->q->queuedata;
++	unsigned long delay = 0;
++	u16 crd;
++
++	/* The mask and shift result must be <= 3 */
++	crd = (nvme_req(req)->status & NVME_SC_CRD) >> 11;
++	if (ns && crd)
++		delay = ns->ctrl->crdt[crd - 1] * 100;
++
++	nvme_req(req)->retries++;
++	blk_mq_requeue_request(req, false);
++	blk_mq_delay_kick_requeue_list(req->q, delay);
++}
++
+ void nvme_complete_rq(struct request *req)
+ {
+ 	blk_status_t status = nvme_error_status(req);
+@@ -258,8 +274,7 @@ void nvme_complete_rq(struct request *req)
+ 		}
+ 
+ 		if (!blk_queue_dying(req->q)) {
+-			nvme_req(req)->retries++;
+-			blk_mq_requeue_request(req, true);
++			nvme_retry_req(req);
+ 			return;
+ 		}
+ 	}
+@@ -1881,6 +1896,26 @@ static int nvme_configure_timestamp(struct nvme_ctrl *ctrl)
+ 	return ret;
+ }
+ 
++static int nvme_configure_acre(struct nvme_ctrl *ctrl)
++{
++	struct nvme_feat_host_behavior *host;
++	int ret;
++
++	/* Don't bother enabling the feature if retry delay is not reported */
++	if (!ctrl->crdt[0])
++		return 0;
++
++	host = kzalloc(sizeof(*host), GFP_KERNEL);
++	if (!host)
++		return 0;
++
++	host->acre = NVME_ENABLE_ACRE;
++	ret = nvme_set_features(ctrl, NVME_FEAT_HOST_BEHAVIOR, 0,
++				host, sizeof(*host), NULL);
++	kfree(host);
++	return ret;
++}
++
+ static int nvme_configure_apst(struct nvme_ctrl *ctrl)
+ {
+ 	/*
+@@ -2402,6 +2437,10 @@ int nvme_init_identify(struct nvme_ctrl *ctrl)
+ 		ctrl->quirks &= ~NVME_QUIRK_NO_DEEPEST_PS;
+ 	}
+ 
++	ctrl->crdt[0] = le16_to_cpu(id->crdt1);
++	ctrl->crdt[1] = le16_to_cpu(id->crdt2);
++	ctrl->crdt[2] = le16_to_cpu(id->crdt3);
++
+ 	ctrl->oacs = le16_to_cpu(id->oacs);
+ 	ctrl->oncs = le16_to_cpup(&id->oncs);
+ 	ctrl->oaes = le32_to_cpu(id->oaes);
+@@ -2496,6 +2535,10 @@ int nvme_init_identify(struct nvme_ctrl *ctrl)
+ 	if (ret < 0)
+ 		return ret;
+ 
++	ret = nvme_configure_acre(ctrl);
++	if (ret < 0)
++		return ret;
++
+ 	ctrl->identified = true;
+ 
+ 	return 0;
+diff --git a/drivers/nvme/host/nvme.h b/drivers/nvme/host/nvme.h
+index ab2cc22eba2c..edd6a4a64fa9 100644
+--- a/drivers/nvme/host/nvme.h
++++ b/drivers/nvme/host/nvme.h
+@@ -180,6 +180,7 @@ struct nvme_ctrl {
+ 	u32 page_size;
+ 	u32 max_hw_sectors;
+ 	u32 max_segments;
++	u16 crdt[3];
+ 	u16 oncs;
+ 	u16 oacs;
+ 	u16 nssa;
+* Unmerged path include/linux/nvme.h
