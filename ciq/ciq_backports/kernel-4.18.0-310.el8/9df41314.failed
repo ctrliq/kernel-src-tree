@@ -1,0 +1,196 @@
+mm/compaction: do page isolation first in compaction
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-310.el8
+commit-author Alex Shi <alex.shi@linux.alibaba.com>
+commit 9df41314390b81a541ca6e84c8340bad0959e4b5
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-310.el8/9df41314.failed
+
+Currently, compaction would get the lru_lock and then do page isolation
+which works fine with pgdat->lru_lock, since any page isoltion would
+compete for the lru_lock.  If we want to change to memcg lru_lock, we have
+to isolate the page before getting lru_lock, thus isoltion would block
+page's memcg change which relay on page isoltion too.  Then we could
+safely use per memcg lru_lock later.
+
+The new page isolation use previous introduced TestClearPageLRU() + pgdat
+lru locking which will be changed to memcg lru lock later.
+
+Hugh Dickins <hughd@google.com> fixed following bugs in this patch's early
+version:
+
+Fix lots of crashes under compaction load: isolate_migratepages_block()
+must clean up appropriately when rejecting a page, setting PageLRU again
+if it had been cleared; and a put_page() after get_page_unless_zero()
+cannot safely be done while holding locked_lruvec - it may turn out to be
+the final put_page(), which will take an lruvec lock when PageLRU.
+
+And move __isolate_lru_page_prepare back after get_page_unless_zero to
+make trylock_page() safe: trylock_page() is not safe to use at this time:
+its setting PG_locked can race with the page being freed or allocated
+("Bad page"), and can also erase flags being set by one of those "sole
+owners" of a freshly allocated page who use non-atomic __SetPageFlag().
+
+Link: https://lkml.kernel.org/r/1604566549-62481-16-git-send-email-alex.shi@linux.alibaba.com
+	Suggested-by: Johannes Weiner <hannes@cmpxchg.org>
+	Signed-off-by: Alex Shi <alex.shi@linux.alibaba.com>
+	Acked-by: Hugh Dickins <hughd@google.com>
+	Acked-by: Johannes Weiner <hannes@cmpxchg.org>
+	Acked-by: Vlastimil Babka <vbabka@suse.cz>
+	Cc: Matthew Wilcox <willy@infradead.org>
+	Cc: Alexander Duyck <alexander.duyck@gmail.com>
+	Cc: Andrea Arcangeli <aarcange@redhat.com>
+	Cc: Andrey Ryabinin <aryabinin@virtuozzo.com>
+	Cc: "Chen, Rong A" <rong.a.chen@intel.com>
+	Cc: Daniel Jordan <daniel.m.jordan@oracle.com>
+	Cc: "Huang, Ying" <ying.huang@intel.com>
+	Cc: Jann Horn <jannh@google.com>
+	Cc: Joonsoo Kim <iamjoonsoo.kim@lge.com>
+	Cc: Kirill A. Shutemov <kirill.shutemov@linux.intel.com>
+	Cc: Kirill A. Shutemov <kirill@shutemov.name>
+	Cc: Konstantin Khlebnikov <khlebnikov@yandex-team.ru>
+	Cc: Mel Gorman <mgorman@techsingularity.net>
+	Cc: Michal Hocko <mhocko@kernel.org>
+	Cc: Michal Hocko <mhocko@suse.com>
+	Cc: Mika Penttilä <mika.penttila@nextfour.com>
+	Cc: Minchan Kim <minchan@kernel.org>
+	Cc: Shakeel Butt <shakeelb@google.com>
+	Cc: Tejun Heo <tj@kernel.org>
+	Cc: Thomas Gleixner <tglx@linutronix.de>
+	Cc: Vladimir Davydov <vdavydov.dev@gmail.com>
+	Cc: Wei Yang <richard.weiyang@gmail.com>
+	Cc: Yang Shi <yang.shi@linux.alibaba.com>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit 9df41314390b81a541ca6e84c8340bad0959e4b5)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	mm/compaction.c
+diff --cc mm/compaction.c
+index 99256f4bcb1a,50938e66083c..000000000000
+--- a/mm/compaction.c
++++ b/mm/compaction.c
+@@@ -992,19 -1004,18 +1004,26 @@@ isolate_migratepages_block(struct compa
+  			 * and it's on LRU. It can only be a THP so the order
+  			 * is safe to read and it's 0 for tail pages.
+  			 */
+ -			if (unlikely(PageCompound(page) && !cc->alloc_contig)) {
+ +			if (unlikely(PageCompound(page))) {
+  				low_pfn += compound_nr(page) - 1;
+- 				goto isolate_fail;
++ 				SetPageLRU(page);
++ 				goto isolate_fail_put;
+  			}
+  		}
+  
+  		lruvec = mem_cgroup_page_lruvec(page, pgdat);
+  
+++<<<<<<< HEAD
+ +		/* Try isolate the page */
+ +		if (__isolate_lru_page(page, isolate_mode) != 0)
+ +			goto isolate_fail;
+ +
+ +		VM_BUG_ON_PAGE(PageCompound(page), page);
+++=======
++ 		/* The whole page is taken off the LRU; skip the tail pages. */
++ 		if (PageCompound(page))
++ 			low_pfn += compound_nr(page) - 1;
+++>>>>>>> 9df41314390b (mm/compaction: do page isolation first in compaction)
+  
+  		/* Successfully isolated */
+  		del_page_from_lru_list(page, lruvec, page_lru(page));
+diff --git a/include/linux/swap.h b/include/linux/swap.h
+index c9e934b74fab..aa180f3419be 100644
+--- a/include/linux/swap.h
++++ b/include/linux/swap.h
+@@ -350,7 +350,7 @@ extern void lru_cache_add_inactive_or_unevictable(struct page *page,
+ extern unsigned long zone_reclaimable_pages(struct zone *zone);
+ extern unsigned long try_to_free_pages(struct zonelist *zonelist, int order,
+ 					gfp_t gfp_mask, nodemask_t *mask);
+-extern int __isolate_lru_page(struct page *page, isolate_mode_t mode);
++extern int __isolate_lru_page_prepare(struct page *page, isolate_mode_t mode);
+ extern unsigned long try_to_free_mem_cgroup_pages(struct mem_cgroup *memcg,
+ 						  unsigned long nr_pages,
+ 						  gfp_t gfp_mask,
+* Unmerged path mm/compaction.c
+diff --git a/mm/vmscan.c b/mm/vmscan.c
+index c4c778570990..a8b5952eebb9 100644
+--- a/mm/vmscan.c
++++ b/mm/vmscan.c
+@@ -1546,7 +1546,7 @@ unsigned int reclaim_clean_pages_from_list(struct zone *zone,
+  *
+  * returns 0 on success, -ve errno on failure.
+  */
+-int __isolate_lru_page(struct page *page, isolate_mode_t mode)
++int __isolate_lru_page_prepare(struct page *page, isolate_mode_t mode)
+ {
+ 	int ret = -EBUSY;
+ 
+@@ -1598,22 +1598,9 @@ int __isolate_lru_page(struct page *page, isolate_mode_t mode)
+ 	if ((mode & ISOLATE_UNMAPPED) && page_mapped(page))
+ 		return ret;
+ 
+-	if (likely(get_page_unless_zero(page))) {
+-		/*
+-		 * Be careful not to clear PageLRU until after we're
+-		 * sure the page is not being freed elsewhere -- the
+-		 * page release code relies on it.
+-		 */
+-		if (TestClearPageLRU(page))
+-			ret = 0;
+-		else
+-			put_page(page);
+-	}
+-
+-	return ret;
++	return 0;
+ }
+ 
+-
+ /*
+  * Update LRU sizes after isolating pages. The LRU size updates must
+  * be complete before mem_cgroup_update_lru_size due to a sanity check.
+@@ -1693,20 +1680,34 @@ static unsigned long isolate_lru_pages(unsigned long nr_to_scan,
+ 		 * only when the page is being freed somewhere else.
+ 		 */
+ 		scan += nr_pages;
+-		switch (__isolate_lru_page(page, mode)) {
++		switch (__isolate_lru_page_prepare(page, mode)) {
+ 		case 0:
++			/*
++			 * Be careful not to clear PageLRU until after we're
++			 * sure the page is not being freed elsewhere -- the
++			 * page release code relies on it.
++			 */
++			if (unlikely(!get_page_unless_zero(page)))
++				goto busy;
++
++			if (!TestClearPageLRU(page)) {
++				/*
++				 * This page may in other isolation path,
++				 * but we still hold lru_lock.
++				 */
++				put_page(page);
++				goto busy;
++			}
++
+ 			nr_taken += nr_pages;
+ 			nr_zone_taken[page_zonenum(page)] += nr_pages;
+ 			list_move(&page->lru, dst);
+ 			break;
+ 
+-		case -EBUSY:
++		default:
++busy:
+ 			/* else it is being freed elsewhere */
+ 			list_move(&page->lru, src);
+-			continue;
+-
+-		default:
+-			BUG();
+ 		}
+ 	}
+ 
