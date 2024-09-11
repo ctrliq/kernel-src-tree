@@ -1,0 +1,165 @@
+block: fix bdev_disk_changed for non-partitioned devices
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Christoph Hellwig <hch@lst.de>
+commit 142fe8f4bb169e8632024d51c64653a8bf140561
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/142fe8f4.failed
+
+We still have to set the capacity to 0 if invalidating or call
+revalidate_disk if not even if the disk has no partitions.  Fix
+that by merging rescan_partitions into bdev_disk_changed and just
+stubbing out blk_add_partitions and blk_drop_partitions for
+non-partitioned devices.
+
+	Signed-off-by: Christoph Hellwig <hch@lst.de>
+	Reviewed-by: Jan Kara <jack@suse.cz>
+	Signed-off-by: Jens Axboe <axboe@kernel.dk>
+(cherry picked from commit 142fe8f4bb169e8632024d51c64653a8bf140561)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	block/ioctl.c
+#	block/partition-generic.c
+#	fs/block_dev.c
+#	include/linux/genhd.h
+diff --cc block/ioctl.c
+index 4825c78a6baa,5ccd9f016594..000000000000
+--- a/block/ioctl.c
++++ b/block/ioctl.c
+@@@ -170,7 -169,7 +168,11 @@@ int __blkdev_reread_part(struct block_d
+  
+  	lockdep_assert_held(&bdev->bd_mutex);
+  
+++<<<<<<< HEAD
+ +	return rescan_partitions(disk, bdev);
+++=======
++ 	return bdev_disk_changed(bdev, false);
+++>>>>>>> 142fe8f4bb16 (block: fix bdev_disk_changed for non-partitioned devices)
+  }
+  EXPORT_SYMBOL(__blkdev_reread_part);
+  
+diff --cc block/partition-generic.c
+index aee643ce13d1,61487421a319..000000000000
+--- a/block/partition-generic.c
++++ b/block/partition-generic.c
+@@@ -509,26 -507,20 +511,34 @@@ static bool part_zone_aligned(struct ge
+  	return true;
+  }
+  
+ -int blk_add_partitions(struct gendisk *disk, struct block_device *bdev)
+ +int rescan_partitions(struct gendisk *disk, struct block_device *bdev)
+  {
+ -	struct parsed_partitions *state;
+ -	int ret = -EAGAIN, p, highest;
+ +	struct parsed_partitions *state = NULL;
+ +	struct hd_struct *part;
+ +	int p, highest, res;
+ +rescan:
+ +	if (state && !IS_ERR(state)) {
+ +		free_partitions(state);
+ +		state = NULL;
+ +	}
+  
+++<<<<<<< HEAD
+ +	res = drop_partitions(disk, bdev);
+ +	if (res)
+ +		return res;
+ +
+ +	if (disk->fops->revalidate_disk)
+ +		disk->fops->revalidate_disk(disk);
+ +	check_disk_size_change(disk, bdev, true);
+ +	bdev->bd_invalidated = 0;
+ +	if (!get_capacity(disk) || !(state = check_partition(disk, bdev)))
+++=======
++ 	if (!disk_part_scan_enabled(disk))
++ 		return 0;
++ 
++ 	state = check_partition(disk, bdev);
++ 	if (!state)
+++>>>>>>> 142fe8f4bb16 (block: fix bdev_disk_changed for non-partitioned devices)
+  		return 0;
+  	if (IS_ERR(state)) {
+  		/*
+diff --cc fs/block_dev.c
+index 445bfb04306f,ae16466a67f7..000000000000
+--- a/fs/block_dev.c
++++ b/fs/block_dev.c
+@@@ -1529,17 -1508,37 +1529,51 @@@ EXPORT_SYMBOL(bd_set_size)
+  
+  static void __blkdev_put(struct block_device *bdev, fmode_t mode, int for_part);
+  
+++<<<<<<< HEAD
+ +static void bdev_disk_changed(struct block_device *bdev, bool invalidate)
+ +{
+ +	if (disk_part_scan_enabled(bdev->bd_disk)) {
+ +		if (invalidate)
+ +			invalidate_partitions(bdev->bd_disk, bdev);
+ +		else
+ +			rescan_partitions(bdev->bd_disk, bdev);
+ +	} else {
+ +		check_disk_size_change(bdev->bd_disk, bdev, !invalidate);
+ +		bdev->bd_invalidated = 0;
+ +	}
+++=======
++ int bdev_disk_changed(struct block_device *bdev, bool invalidate)
++ {
++ 	struct gendisk *disk = bdev->bd_disk;
++ 	int ret;
++ 
++ rescan:
++ 	ret = blk_drop_partitions(disk, bdev);
++ 	if (ret)
++ 		return ret;
++ 
++ 	if (invalidate)
++ 		set_capacity(disk, 0);
++ 	else if (disk->fops->revalidate_disk)
++ 		disk->fops->revalidate_disk(disk);
++ 
++ 	check_disk_size_change(disk, bdev, !invalidate);
++ 	bdev->bd_invalidated = 0;
++ 
++ 	if (get_capacity(disk)) {
++ 		ret = blk_add_partitions(disk, bdev);
++ 		if (ret == -EAGAIN)
++ 			goto rescan;
++ 	} else {
++ 		/*
++ 		 * Tell userspace that the media / partition table may have
++ 		 * changed.
++ 		 */
++ 		kobject_uevent(&disk_to_dev(disk)->kobj, KOBJ_CHANGE);
++ 	}
++ 
++ 	return ret;
+++>>>>>>> 142fe8f4bb16 (block: fix bdev_disk_changed for non-partitioned devices)
+  }
+  
+  /*
+diff --cc include/linux/genhd.h
+index fe1fb3b4d909,8bb63027e4d6..000000000000
+--- a/include/linux/genhd.h
++++ b/include/linux/genhd.h
+@@@ -627,9 -621,10 +627,15 @@@ extern void blk_invalidate_devt(dev_t d
+  extern dev_t blk_lookup_devt(const char *name, int partno);
+  extern char *disk_name (struct gendisk *hd, int partno, char *buf);
+  
+++<<<<<<< HEAD
+++=======
++ int bdev_disk_changed(struct block_device *bdev, bool invalidate);
++ int blk_add_partitions(struct gendisk *disk, struct block_device *bdev);
++ int blk_drop_partitions(struct gendisk *disk, struct block_device *bdev);
+++>>>>>>> 142fe8f4bb16 (block: fix bdev_disk_changed for non-partitioned devices)
+  extern int disk_expand_part_tbl(struct gendisk *disk, int target);
+ +extern int rescan_partitions(struct gendisk *disk, struct block_device *bdev);
+ +extern int invalidate_partitions(struct gendisk *disk, struct block_device *bdev);
+  extern struct hd_struct * __must_check add_partition(struct gendisk *disk,
+  						     int partno, sector_t start,
+  						     sector_t len, int flags,
+* Unmerged path block/ioctl.c
+* Unmerged path block/partition-generic.c
+* Unmerged path fs/block_dev.c
+* Unmerged path include/linux/genhd.h
