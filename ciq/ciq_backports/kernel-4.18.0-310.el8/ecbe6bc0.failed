@@ -1,0 +1,146 @@
+block: use bd_prepare_to_claim directly in the loop driver
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-310.el8
+commit-author Christoph Hellwig <hch@lst.de>
+commit ecbe6bc0003bfd5bf8581cb679cae0eb944432cb
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-310.el8/ecbe6bc0.failed
+
+The arcane magic in bd_start_claiming is only needed to be able to claim
+a block_device that hasn't been fully set up.  Switch the loop driver
+that claims from the ioctl path with a fully set up struct block_device
+to just use the much simpler bd_prepare_to_claim directly.
+
+	Signed-off-by: Christoph Hellwig <hch@lst.de>
+	Acked-by: Tejun Heo <tj@kernel.org>
+	Signed-off-by: Jens Axboe <axboe@kernel.dk>
+(cherry picked from commit ecbe6bc0003bfd5bf8581cb679cae0eb944432cb)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/blkdev.h
+diff --cc include/linux/blkdev.h
+index d2fea581dcca,06995b96e946..000000000000
+--- a/include/linux/blkdev.h
++++ b/include/linux/blkdev.h
+@@@ -1941,6 -1898,53 +1941,43 @@@ static inline void bio_end_io_acct(stru
+  {
+  	return disk_end_io_acct(bio->bi_disk, bio_op(bio), start_time);
+  }
+ +#endif /* CONFIG_BLOCK */
+  
+ -int bdev_read_only(struct block_device *bdev);
+ -int set_blocksize(struct block_device *bdev, int size);
+ -
+ -const char *bdevname(struct block_device *bdev, char *buffer);
+ -struct block_device *lookup_bdev(const char *);
+ -
+ -void blkdev_show(struct seq_file *seqf, off_t offset);
+ -
+ -#define BDEVNAME_SIZE	32	/* Largest string for a blockdev identifier */
+ -#define BDEVT_SIZE	10	/* Largest string for MAJ:MIN for blkdev */
+ -#ifdef CONFIG_BLOCK
+ -#define BLKDEV_MAJOR_MAX	512
+ -#else
+ -#define BLKDEV_MAJOR_MAX	0
+  #endif
+++<<<<<<< HEAD
+++=======
++ 
++ int blkdev_get(struct block_device *bdev, fmode_t mode, void *holder);
++ struct block_device *blkdev_get_by_path(const char *path, fmode_t mode,
++ 		void *holder);
++ struct block_device *blkdev_get_by_dev(dev_t dev, fmode_t mode, void *holder);
++ int bd_prepare_to_claim(struct block_device *bdev, struct block_device *whole,
++ 		void *holder);
++ void bd_abort_claiming(struct block_device *bdev, struct block_device *whole,
++ 		void *holder);
++ void blkdev_put(struct block_device *bdev, fmode_t mode);
++ 
++ struct block_device *I_BDEV(struct inode *inode);
++ struct block_device *bdget(dev_t);
++ struct block_device *bdgrab(struct block_device *bdev);
++ void bdput(struct block_device *);
++ 
++ #ifdef CONFIG_BLOCK
++ void invalidate_bdev(struct block_device *bdev);
++ int sync_blockdev(struct block_device *bdev);
++ #else
++ static inline void invalidate_bdev(struct block_device *bdev)
++ {
++ }
++ static inline int sync_blockdev(struct block_device *bdev)
++ {
++ 	return 0;
++ }
++ #endif
++ int fsync_bdev(struct block_device *bdev);
++ 
++ struct super_block *freeze_bdev(struct block_device *bdev);
++ int thaw_bdev(struct block_device *bdev, struct super_block *sb);
++ 
++ #endif /* _LINUX_BLKDEV_H */
+++>>>>>>> ecbe6bc0003b (block: use bd_prepare_to_claim directly in the loop driver)
+diff --git a/drivers/block/loop.c b/drivers/block/loop.c
+index 1628cb73fbe1..9825a73ac979 100644
+--- a/drivers/block/loop.c
++++ b/drivers/block/loop.c
+@@ -1102,11 +1102,10 @@ static int loop_configure(struct loop_device *lo, fmode_t mode,
+ 	 * here to avoid changing device under exclusive owner.
+ 	 */
+ 	if (!(mode & FMODE_EXCL)) {
+-		claimed_bdev = bd_start_claiming(bdev, loop_configure);
+-		if (IS_ERR(claimed_bdev)) {
+-			error = PTR_ERR(claimed_bdev);
++		claimed_bdev = bdev->bd_contains;
++		error = bd_prepare_to_claim(bdev, claimed_bdev, loop_configure);
++		if (error)
+ 			goto out_putf;
+-		}
+ 	}
+ 
+ 	error = mutex_lock_killable(&loop_ctl_mutex);
+diff --git a/fs/block_dev.c b/fs/block_dev.c
+index f19cc879b480..8e8f7c9cd14e 100644
+--- a/fs/block_dev.c
++++ b/fs/block_dev.c
+@@ -1063,8 +1063,8 @@ static bool bd_may_claim(struct block_device *bdev, struct block_device *whole,
+  * RETURNS:
+  * 0 if @bdev can be claimed, -EBUSY otherwise.
+  */
+-static int bd_prepare_to_claim(struct block_device *bdev,
+-			       struct block_device *whole, void *holder)
++int bd_prepare_to_claim(struct block_device *bdev, struct block_device *whole,
++		void *holder)
+ {
+ retry:
+ 	spin_lock(&bdev_lock);
+@@ -1091,6 +1091,7 @@ static int bd_prepare_to_claim(struct block_device *bdev,
+ 	spin_unlock(&bdev_lock);
+ 	return 0;
+ }
++EXPORT_SYMBOL_GPL(bd_prepare_to_claim); /* only for the loop driver */
+ 
+ static struct gendisk *bdev_get_gendisk(struct block_device *bdev, int *partno)
+ {
+@@ -1136,7 +1137,8 @@ static struct gendisk *bdev_get_gendisk(struct block_device *bdev, int *partno)
+  * Pointer to the block device containing @bdev on success, ERR_PTR()
+  * value on failure.
+  */
+-struct block_device *bd_start_claiming(struct block_device *bdev, void *holder)
++static struct block_device *bd_start_claiming(struct block_device *bdev,
++		void *holder)
+ {
+ 	struct gendisk *disk;
+ 	struct block_device *whole;
+@@ -1177,7 +1179,6 @@ struct block_device *bd_start_claiming(struct block_device *bdev, void *holder)
+ 
+ 	return whole;
+ }
+-EXPORT_SYMBOL(bd_start_claiming);
+ 
+ static void bd_clear_claiming(struct block_device *whole, void *holder)
+ {
+* Unmerged path include/linux/blkdev.h
