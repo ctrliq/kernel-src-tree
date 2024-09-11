@@ -1,0 +1,503 @@
+bpf: verifier: refactor check_attach_btf_id()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Toke Høiland-Jørgensen <toke@redhat.com>
+commit f7b12b6fea00988496b7606d4964cd77beef46a5
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/f7b12b6f.failed
+
+The check_attach_btf_id() function really does three things:
+
+1. It performs a bunch of checks on the program to ensure that the
+   attachment is valid.
+
+2. It stores a bunch of state about the attachment being requested in
+   the verifier environment and struct bpf_prog objects.
+
+3. It allocates a trampoline for the attachment.
+
+This patch splits out (1.) and (3.) into separate functions which will
+perform the checks, but return the computed values instead of directly
+modifying the environment. This is done in preparation for reusing the
+checks when the actual attachment is happening, which will allow tracing
+programs to have multiple (compatible) attachments.
+
+This also fixes a bug where a bunch of checks were skipped if a trampoline
+already existed for the tracing target.
+
+Fixes: 6ba43b761c41 ("bpf: Attachment verification for BPF_MODIFY_RETURN")
+Fixes: 1e6c62a88215 ("bpf: Introduce sleepable BPF programs")
+	Acked-by: Andrii Nakryiko <andriin@fb.com>
+	Signed-off-by: Toke Høiland-Jørgensen <toke@redhat.com>
+	Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+(cherry picked from commit f7b12b6fea00988496b7606d4964cd77beef46a5)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	kernel/bpf/verifier.c
+diff --cc kernel/bpf/verifier.c
+index 9fd915b15d99,7ff05a79984a..000000000000
+--- a/kernel/bpf/verifier.c
++++ b/kernel/bpf/verifier.c
+@@@ -10585,37 -11212,59 +10584,81 @@@ static int check_attach_modify_return(u
+  	return -EINVAL;
+  }
+  
+++<<<<<<< HEAD
+ +static int check_attach_btf_id(struct bpf_verifier_env *env)
+++=======
++ /* non exhaustive list of sleepable bpf_lsm_*() functions */
++ BTF_SET_START(btf_sleepable_lsm_hooks)
++ #ifdef CONFIG_BPF_LSM
++ BTF_ID(func, bpf_lsm_bprm_committed_creds)
++ #else
++ BTF_ID_UNUSED
++ #endif
++ BTF_SET_END(btf_sleepable_lsm_hooks)
++ 
++ static int check_sleepable_lsm_hook(u32 btf_id)
++ {
++ 	return btf_id_set_contains(&btf_sleepable_lsm_hooks, btf_id);
++ }
++ 
++ /* list of non-sleepable functions that are otherwise on
++  * ALLOW_ERROR_INJECTION list
++  */
++ BTF_SET_START(btf_non_sleepable_error_inject)
++ /* Three functions below can be called from sleepable and non-sleepable context.
++  * Assume non-sleepable from bpf safety point of view.
++  */
++ BTF_ID(func, __add_to_page_cache_locked)
++ BTF_ID(func, should_fail_alloc_page)
++ BTF_ID(func, should_failslab)
++ BTF_SET_END(btf_non_sleepable_error_inject)
++ 
++ static int check_non_sleepable_error_inject(u32 btf_id)
++ {
++ 	return btf_id_set_contains(&btf_non_sleepable_error_inject, btf_id);
++ }
++ 
++ int bpf_check_attach_target(struct bpf_verifier_log *log,
++ 			    const struct bpf_prog *prog,
++ 			    const struct bpf_prog *tgt_prog,
++ 			    u32 btf_id,
++ 			    struct bpf_attach_target_info *tgt_info)
+++>>>>>>> f7b12b6fea00 (bpf: verifier: refactor check_attach_btf_id())
+  {
+- 	struct bpf_prog *prog = env->prog;
+  	bool prog_extension = prog->type == BPF_PROG_TYPE_EXT;
+++<<<<<<< HEAD
+ +	struct bpf_prog *tgt_prog = prog->aux->linked_prog;
+ +	u32 btf_id = prog->aux->attach_btf_id;
+++=======
+++>>>>>>> f7b12b6fea00 (bpf: verifier: refactor check_attach_btf_id())
+  	const char prefix[] = "btf_trace_";
+  	int ret = 0, subprog = -1, i;
+- 	struct bpf_trampoline *tr;
+  	const struct btf_type *t;
+  	bool conservative = true;
+  	const char *tname;
+  	struct btf *btf;
+++<<<<<<< HEAD
+ +	long addr;
+ +	u64 key;
+ +
+ +	if (prog->type == BPF_PROG_TYPE_STRUCT_OPS)
+ +		return check_struct_ops_btf_id(env);
+ +
+ +	if (prog->type != BPF_PROG_TYPE_TRACING &&
+ +	    prog->type != BPF_PROG_TYPE_LSM &&
+ +	    !prog_extension)
+ +		return 0;
+++=======
++ 	long addr = 0;
+++>>>>>>> f7b12b6fea00 (bpf: verifier: refactor check_attach_btf_id())
+  
+  	if (!btf_id) {
+ -		bpf_log(log, "Tracing programs must provide btf_id\n");
+ +		verbose(env, "Tracing programs must provide btf_id\n");
+  		return -EINVAL;
+  	}
+- 	btf = bpf_prog_get_target_btf(prog);
++ 	btf = tgt_prog ? tgt_prog->aux->btf : btf_vmlinux;
+  	if (!btf) {
+ -		bpf_log(log,
+ +		verbose(env,
+  			"FENTRY/FEXIT program can only be attached to another program annotated with BTF\n");
+  		return -EINVAL;
+  	}
+@@@ -10653,11 -11302,9 +10696,9 @@@
+  					"Extension programs should be JITed\n");
+  				return -EINVAL;
+  			}
+- 			env->ops = bpf_verifier_ops[tgt_prog->type];
+- 			prog->expected_attach_type = tgt_prog->expected_attach_type;
+  		}
+  		if (!tgt_prog->jited) {
+ -			bpf_log(log, "Can attach to only JITed progs\n");
+ +			verbose(env, "Can attach to only JITed progs\n");
+  			return -EINVAL;
+  		}
+  		if (tgt_prog->type == prog->type) {
+@@@ -10687,16 -11334,14 +10728,14 @@@
+  			 * reasonable stack size. Hence extending fentry is not
+  			 * allowed.
+  			 */
+ -			bpf_log(log, "Cannot extend fentry/fexit\n");
+ +			verbose(env, "Cannot extend fentry/fexit\n");
+  			return -EINVAL;
+  		}
+- 		key = ((u64)aux->id) << 32 | btf_id;
+  	} else {
+  		if (prog_extension) {
+ -			bpf_log(log, "Cannot replace kernel functions\n");
+ +			verbose(env, "Cannot replace kernel functions\n");
+  			return -EINVAL;
+  		}
+- 		key = btf_id;
+  	}
+  
+  	switch (prog->expected_attach_type) {
+@@@ -10726,13 -11371,20 +10765,30 @@@
+  			/* should never happen in valid vmlinux build */
+  			return -EINVAL;
+  
+++<<<<<<< HEAD
+ +		/* remember two read only pointers that are valid for
+ +		 * the life time of the kernel
+ +		 */
+ +		prog->aux->attach_func_name = tname;
+ +		prog->aux->attach_func_proto = t;
+ +		prog->aux->attach_btf_trace = true;
+ +		return 0;
+++=======
++ 		break;
++ 	case BPF_TRACE_ITER:
++ 		if (!btf_type_is_func(t)) {
++ 			bpf_log(log, "attach_btf_id %u is not a function\n",
++ 				btf_id);
++ 			return -EINVAL;
++ 		}
++ 		t = btf_type_by_id(btf, t->type);
++ 		if (!btf_type_is_func_proto(t))
++ 			return -EINVAL;
++ 		ret = btf_distill_func_proto(log, btf, t, tname, &tgt_info->fmodel);
++ 		if (ret)
++ 			return ret;
++ 		break;
+++>>>>>>> f7b12b6fea00 (bpf: verifier: refactor check_attach_btf_id())
+  	default:
+  		if (!prog_extension)
+  			return -EINVAL;
+@@@ -10741,15 -11393,8 +10797,18 @@@
+  	case BPF_LSM_MAC:
+  	case BPF_TRACE_FENTRY:
+  	case BPF_TRACE_FEXIT:
+++<<<<<<< HEAD
+ +		prog->aux->attach_func_name = tname;
+ +		if (prog->type == BPF_PROG_TYPE_LSM) {
+ +			ret = bpf_lsm_verify_prog(&env->log, prog);
+ +			if (ret < 0)
+ +				return ret;
+ +		}
+ +
+++=======
+++>>>>>>> f7b12b6fea00 (bpf: verifier: refactor check_attach_btf_id())
+  		if (!btf_type_is_func(t)) {
+ -			bpf_log(log, "attach_btf_id %u is not a function\n",
+ +			verbose(env, "attach_btf_id %u is not a function\n",
+  				btf_id);
+  			return -EINVAL;
+  		}
+@@@ -10759,24 -11404,14 +10818,20 @@@
+  		t = btf_type_by_id(btf, t->type);
+  		if (!btf_type_is_func_proto(t))
+  			return -EINVAL;
+- 		tr = bpf_trampoline_lookup(key);
+- 		if (!tr)
+- 			return -ENOMEM;
+- 		/* t is either vmlinux type or another program's type */
+- 		prog->aux->attach_func_proto = t;
+- 		mutex_lock(&tr->mutex);
+- 		if (tr->func.addr) {
+- 			prog->aux->trampoline = tr;
+- 			goto out;
+- 		}
+- 		if (tgt_prog && conservative) {
+- 			prog->aux->attach_func_proto = NULL;
++ 
++ 		if (tgt_prog && conservative)
+  			t = NULL;
+++<<<<<<< HEAD
+ +		}
+ +		ret = btf_distill_func_proto(&env->log, btf, t,
+ +					     tname, &tr->func.model);
+++=======
++ 
++ 		ret = btf_distill_func_proto(log, btf, t, tname, &tgt_info->fmodel);
+++>>>>>>> f7b12b6fea00 (bpf: verifier: refactor check_attach_btf_id())
+  		if (ret < 0)
+- 			goto out;
++ 			return ret;
++ 
+  		if (tgt_prog) {
+  			if (subprog == 0)
+  				addr = (long) tgt_prog->bpf_func;
+@@@ -10785,31 -11420,117 +10840,136 @@@
+  		} else {
+  			addr = kallsyms_lookup_name(tname);
+  			if (!addr) {
+ -				bpf_log(log,
+ +				verbose(env,
+  					"The address of function %s cannot be found\n",
+  					tname);
+- 				ret = -ENOENT;
+- 				goto out;
++ 				return -ENOENT;
+  			}
+  		}
+  
+++<<<<<<< HEAD
+ +		if (prog->expected_attach_type == BPF_MODIFY_RETURN) {
+ +			ret = check_attach_modify_return(prog, addr);
+ +			if (ret)
+ +				verbose(env, "%s() is not modifiable\n",
+ +					prog->aux->attach_func_name);
+ +		}
+ +
+ +		if (ret)
+ +			goto out;
+ +		tr->func.addr = (void *)addr;
+ +		prog->aux->trampoline = tr;
+ +out:
+ +		mutex_unlock(&tr->mutex);
+ +		if (ret)
+ +			bpf_trampoline_put(tr);
+ +		return ret;
+++=======
++ 		if (prog->aux->sleepable) {
++ 			ret = -EINVAL;
++ 			switch (prog->type) {
++ 			case BPF_PROG_TYPE_TRACING:
++ 				/* fentry/fexit/fmod_ret progs can be sleepable only if they are
++ 				 * attached to ALLOW_ERROR_INJECTION and are not in denylist.
++ 				 */
++ 				if (!check_non_sleepable_error_inject(btf_id) &&
++ 				    within_error_injection_list(addr))
++ 					ret = 0;
++ 				break;
++ 			case BPF_PROG_TYPE_LSM:
++ 				/* LSM progs check that they are attached to bpf_lsm_*() funcs.
++ 				 * Only some of them are sleepable.
++ 				 */
++ 				if (check_sleepable_lsm_hook(btf_id))
++ 					ret = 0;
++ 				break;
++ 			default:
++ 				break;
++ 			}
++ 			if (ret) {
++ 				bpf_log(log, "%s is not sleepable\n", tname);
++ 				return ret;
++ 			}
++ 		} else if (prog->expected_attach_type == BPF_MODIFY_RETURN) {
++ 			if (tgt_prog) {
++ 				bpf_log(log, "can't modify return codes of BPF programs\n");
++ 				return -EINVAL;
++ 			}
++ 			ret = check_attach_modify_return(addr, tname);
++ 			if (ret) {
++ 				bpf_log(log, "%s() is not modifiable\n", tname);
++ 				return ret;
++ 			}
++ 		}
++ 
++ 		break;
+++>>>>>>> f7b12b6fea00 (bpf: verifier: refactor check_attach_btf_id())
+  	}
++ 	tgt_info->tgt_addr = addr;
++ 	tgt_info->tgt_name = tname;
++ 	tgt_info->tgt_type = t;
++ 	return 0;
++ }
++ 
++ static int check_attach_btf_id(struct bpf_verifier_env *env)
++ {
++ 	struct bpf_prog *prog = env->prog;
++ 	struct bpf_prog *tgt_prog = prog->aux->linked_prog;
++ 	struct bpf_attach_target_info tgt_info = {};
++ 	u32 btf_id = prog->aux->attach_btf_id;
++ 	struct bpf_trampoline *tr;
++ 	int ret;
++ 	u64 key;
++ 
++ 	if (prog->aux->sleepable && prog->type != BPF_PROG_TYPE_TRACING &&
++ 	    prog->type != BPF_PROG_TYPE_LSM) {
++ 		verbose(env, "Only fentry/fexit/fmod_ret and lsm programs can be sleepable\n");
++ 		return -EINVAL;
++ 	}
++ 
++ 	if (prog->type == BPF_PROG_TYPE_STRUCT_OPS)
++ 		return check_struct_ops_btf_id(env);
++ 
++ 	if (prog->type != BPF_PROG_TYPE_TRACING &&
++ 	    prog->type != BPF_PROG_TYPE_LSM &&
++ 	    prog->type != BPF_PROG_TYPE_EXT)
++ 		return 0;
++ 
++ 	ret = bpf_check_attach_target(&env->log, prog, tgt_prog, btf_id, &tgt_info);
++ 	if (ret)
++ 		return ret;
++ 
++ 	if (tgt_prog && prog->type == BPF_PROG_TYPE_EXT) {
++ 		env->ops = bpf_verifier_ops[tgt_prog->type];
++ 		prog->expected_attach_type = tgt_prog->expected_attach_type;
++ 	}
++ 
++ 	/* store info about the attachment target that will be used later */
++ 	prog->aux->attach_func_proto = tgt_info.tgt_type;
++ 	prog->aux->attach_func_name = tgt_info.tgt_name;
++ 
++ 	if (prog->expected_attach_type == BPF_TRACE_RAW_TP) {
++ 		prog->aux->attach_btf_trace = true;
++ 		return 0;
++ 	} else if (prog->expected_attach_type == BPF_TRACE_ITER) {
++ 		if (!bpf_iter_prog_supported(prog))
++ 			return -EINVAL;
++ 		return 0;
++ 	}
++ 
++ 	if (prog->type == BPF_PROG_TYPE_LSM) {
++ 		ret = bpf_lsm_verify_prog(&env->log, prog);
++ 		if (ret < 0)
++ 			return ret;
++ 	}
++ 
++ 	key = bpf_trampoline_compute_key(tgt_prog, btf_id);
++ 	tr = bpf_trampoline_get(key, &tgt_info);
++ 	if (!tr)
++ 		return -ENOMEM;
++ 
++ 	prog->aux->trampoline = tr;
++ 	return 0;
+  }
+  
+  int bpf_check(struct bpf_prog **prog, union bpf_attr *attr,
+diff --git a/include/linux/bpf.h b/include/linux/bpf.h
+index 53810b02f758..91bf6cf90eb4 100644
+--- a/include/linux/bpf.h
++++ b/include/linux/bpf.h
+@@ -533,6 +533,13 @@ struct bpf_trampoline {
+ 	struct bpf_ksym ksym;
+ };
+ 
++struct bpf_attach_target_info {
++	struct btf_func_model fmodel;
++	long tgt_addr;
++	const char *tgt_name;
++	const struct btf_type *tgt_type;
++};
++
+ #define BPF_DISPATCHER_MAX 48 /* Fits in 2048B */
+ 
+ struct bpf_dispatcher_prog {
+@@ -560,9 +567,10 @@ static __always_inline unsigned int bpf_dispatcher_nop_func(
+ 	return bpf_func(ctx, insnsi);
+ }
+ #ifdef CONFIG_BPF_JIT
+-struct bpf_trampoline *bpf_trampoline_lookup(u64 key);
+ int bpf_trampoline_link_prog(struct bpf_prog *prog);
+ int bpf_trampoline_unlink_prog(struct bpf_prog *prog);
++struct bpf_trampoline *bpf_trampoline_get(u64 key,
++					  struct bpf_attach_target_info *tgt_info);
+ void bpf_trampoline_put(struct bpf_trampoline *tr);
+ #define BPF_DISPATCHER_INIT(_name) {				\
+ 	.mutex = __MUTEX_INITIALIZER(_name.mutex),		\
+@@ -607,10 +615,6 @@ void bpf_image_ksym_del(struct bpf_ksym *ksym);
+ void bpf_ksym_add(struct bpf_ksym *ksym);
+ void bpf_ksym_del(struct bpf_ksym *ksym);
+ #else
+-static inline struct bpf_trampoline *bpf_trampoline_lookup(u64 key)
+-{
+-	return NULL;
+-}
+ static inline int bpf_trampoline_link_prog(struct bpf_prog *prog)
+ {
+ 	return -ENOTSUPP;
+@@ -619,6 +623,11 @@ static inline int bpf_trampoline_unlink_prog(struct bpf_prog *prog)
+ {
+ 	return -ENOTSUPP;
+ }
++static inline struct bpf_trampoline *bpf_trampoline_get(u64 key,
++							struct bpf_attach_target_info *tgt_info)
++{
++	return ERR_PTR(-EOPNOTSUPP);
++}
+ static inline void bpf_trampoline_put(struct bpf_trampoline *tr) {}
+ #define DEFINE_BPF_DISPATCHER(name)
+ #define DECLARE_BPF_DISPATCHER(name)
+diff --git a/include/linux/bpf_verifier.h b/include/linux/bpf_verifier.h
+index 37159d005edc..6f24b3ae7fe7 100644
+--- a/include/linux/bpf_verifier.h
++++ b/include/linux/bpf_verifier.h
+@@ -441,4 +441,17 @@ bpf_prog_offload_remove_insns(struct bpf_verifier_env *env, u32 off, u32 cnt);
+ int check_ctx_reg(struct bpf_verifier_env *env,
+ 		  const struct bpf_reg_state *reg, int regno);
+ 
++/* this lives here instead of in bpf.h because it needs to dereference tgt_prog */
++static inline u64 bpf_trampoline_compute_key(const struct bpf_prog *tgt_prog,
++					     u32 btf_id)
++{
++        return tgt_prog ? (((u64)tgt_prog->aux->id) << 32 | btf_id) : btf_id;
++}
++
++int bpf_check_attach_target(struct bpf_verifier_log *log,
++			    const struct bpf_prog *prog,
++			    const struct bpf_prog *tgt_prog,
++			    u32 btf_id,
++			    struct bpf_attach_target_info *tgt_info);
++
+ #endif /* _LINUX_BPF_VERIFIER_H */
+diff --git a/kernel/bpf/trampoline.c b/kernel/bpf/trampoline.c
+index 9be85aa4ec5f..2ca15bc50d1d 100644
+--- a/kernel/bpf/trampoline.c
++++ b/kernel/bpf/trampoline.c
+@@ -63,7 +63,7 @@ static void bpf_trampoline_ksym_add(struct bpf_trampoline *tr)
+ 	bpf_image_ksym_add(tr->image, ksym);
+ }
+ 
+-struct bpf_trampoline *bpf_trampoline_lookup(u64 key)
++static struct bpf_trampoline *bpf_trampoline_lookup(u64 key)
+ {
+ 	struct bpf_trampoline *tr;
+ 	struct hlist_head *head;
+@@ -331,6 +331,26 @@ int bpf_trampoline_unlink_prog(struct bpf_prog *prog)
+ 	return err;
+ }
+ 
++struct bpf_trampoline *bpf_trampoline_get(u64 key,
++					  struct bpf_attach_target_info *tgt_info)
++{
++	struct bpf_trampoline *tr;
++
++	tr = bpf_trampoline_lookup(key);
++	if (!tr)
++		return NULL;
++
++	mutex_lock(&tr->mutex);
++	if (tr->func.addr)
++		goto out;
++
++	memcpy(&tr->func.model, &tgt_info->fmodel, sizeof(tgt_info->fmodel));
++	tr->func.addr = (void *)tgt_info->tgt_addr;
++out:
++	mutex_unlock(&tr->mutex);
++	return tr;
++}
++
+ void bpf_trampoline_put(struct bpf_trampoline *tr)
+ {
+ 	if (!tr)
+* Unmerged path kernel/bpf/verifier.c
