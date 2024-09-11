@@ -38,15 +38,6 @@ struct conntrack4_net {
 	unsigned int users;
 };
 
-static bool ipv4_invert_tuple(struct nf_conntrack_tuple *tuple,
-			      const struct nf_conntrack_tuple *orig)
-{
-	tuple->src.u3.ip = orig->dst.u3.ip;
-	tuple->dst.u3.ip = orig->src.u3.ip;
-
-	return true;
-}
-
 static int ipv4_get_l4proto(const struct sk_buff *skb, unsigned int nhoff,
 			    unsigned int *dataoff, u_int8_t *protonum)
 {
@@ -355,7 +346,6 @@ static void ipv4_hooks_unregister(struct net *net)
 
 const struct nf_conntrack_l3proto nf_conntrack_l3proto_ipv4 = {
 	.l3proto	 = PF_INET,
-	.invert_tuple	 = ipv4_invert_tuple,
 	.get_l4proto	 = ipv4_get_l4proto,
 #if IS_ENABLED(CONFIG_NF_CT_NETLINK)
 	.tuple_to_nlattr = ipv4_tuple_to_nlattr,
