@@ -1,0 +1,625 @@
+bpf: Introduce sleepable BPF programs
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-315.el8
+commit-author Alexei Starovoitov <ast@kernel.org>
+commit 1e6c62a8821557720a9b2ea9617359b264f2f67c
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-315.el8/1e6c62a8.failed
+
+Introduce sleepable BPF programs that can request such property for themselves
+via BPF_F_SLEEPABLE flag at program load time. In such case they will be able
+to use helpers like bpf_copy_from_user() that might sleep. At present only
+fentry/fexit/fmod_ret and lsm programs can request to be sleepable and only
+when they are attached to kernel functions that are known to allow sleeping.
+
+The non-sleepable programs are relying on implicit rcu_read_lock() and
+migrate_disable() to protect life time of programs, maps that they use and
+per-cpu kernel structures used to pass info between bpf programs and the
+kernel. The sleepable programs cannot be enclosed into rcu_read_lock().
+migrate_disable() maps to preempt_disable() in non-RT kernels, so the progs
+should not be enclosed in migrate_disable() as well. Therefore
+rcu_read_lock_trace is used to protect the life time of sleepable progs.
+
+There are many networking and tracing program types. In many cases the
+'struct bpf_prog *' pointer itself is rcu protected within some other kernel
+data structure and the kernel code is using rcu_dereference() to load that
+program pointer and call BPF_PROG_RUN() on it. All these cases are not touched.
+Instead sleepable bpf programs are allowed with bpf trampoline only. The
+program pointers are hard-coded into generated assembly of bpf trampoline and
+synchronize_rcu_tasks_trace() is used to protect the life time of the program.
+The same trampoline can hold both sleepable and non-sleepable progs.
+
+When rcu_read_lock_trace is held it means that some sleepable bpf program is
+running from bpf trampoline. Those programs can use bpf arrays and preallocated
+hash/lru maps. These map types are waiting on programs to complete via
+synchronize_rcu_tasks_trace();
+
+Updates to trampoline now has to do synchronize_rcu_tasks_trace() and
+synchronize_rcu_tasks() to wait for sleepable progs to finish and for
+trampoline assembly to finish.
+
+This is the first step of introducing sleepable progs. Eventually dynamically
+allocated hash maps can be allowed and networking program types can become
+sleepable too.
+
+	Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+	Signed-off-by: Daniel Borkmann <daniel@iogearbox.net>
+	Reviewed-by: Josef Bacik <josef@toxicpanda.com>
+	Acked-by: Andrii Nakryiko <andriin@fb.com>
+	Acked-by: KP Singh <kpsingh@google.com>
+Link: https://lore.kernel.org/bpf/20200827220114.69225-3-alexei.starovoitov@gmail.com
+(cherry picked from commit 1e6c62a8821557720a9b2ea9617359b264f2f67c)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/bpf.h
+#	kernel/bpf/verifier.c
+diff --cc include/linux/bpf.h
+index 3f26f919575f,4dd7e927621d..000000000000
+--- a/include/linux/bpf.h
++++ b/include/linux/bpf.h
+@@@ -724,36 -725,30 +726,45 @@@ struct bpf_prog_aux 
+  	u32 stack_depth;
+  	u32 id;
+  	u32 func_cnt; /* used by non-func prog as the number of func progs */
+ -	u32 func_idx; /* 0 for non-func prog, the index in func array for func prog */
+ -	u32 attach_btf_id; /* in-kernel BTF type id to attach to */
+ -	u32 ctx_arg_info_size;
+ -	u32 max_rdonly_access;
+ -	u32 max_rdwr_access;
+ -	const struct bpf_ctx_arg_aux *ctx_arg_info;
+ -	struct bpf_prog *linked_prog;
+ -	bool verifier_zext; /* Zero extensions has been inserted by verifier. */
+ +	RH_KABI_BROKEN_INSERT(u32 func_idx) /* 0 for non-func prog, the index in func array for func prog */
+ +	RH_KABI_BROKEN_INSERT(u32 attach_btf_id) /* in-kernel BTF type id to attach to */
+ +	RH_KABI_BROKEN_INSERT(u32 ctx_arg_info_size)
+ +	RH_KABI_BROKEN_INSERT(u32 max_rdonly_access)
+ +	RH_KABI_BROKEN_INSERT(u32 max_rdwr_access)
+ +	RH_KABI_BROKEN_INSERT(const struct bpf_ctx_arg_aux *ctx_arg_info)
+ +	RH_KABI_BROKEN_INSERT_BLOCK(
+ +	struct mutex dst_mutex; /* protects dst_* pointers below, *after* prog becomes visible */
+ +	struct bpf_prog *dst_prog;
+ +	struct bpf_trampoline *dst_trampoline;
+ +	enum bpf_prog_type saved_dst_prog_type;
+ +	enum bpf_attach_type saved_dst_attach_type;
+ +	) /* RH_KABI_BROKEN_INSERT_BLOCK */
+ +	RH_KABI_BROKEN_INSERT(bool verifier_zext) /* Zero extensions has been inserted by verifier. */
+  	bool offload_requested;
+++<<<<<<< HEAD
+ +	RH_KABI_BROKEN_INSERT(bool attach_btf_trace) /* true if attaching to BTF-enabled raw tp */
+ +	RH_KABI_BROKEN_INSERT(bool func_proto_unreliable)
+ +	RH_KABI_BROKEN_INSERT(enum bpf_tramp_prog_type trampoline_prog_type)
+ +	RH_KABI_BROKEN_INSERT(struct hlist_node tramp_hlist)
+++=======
++ 	bool attach_btf_trace; /* true if attaching to BTF-enabled raw tp */
++ 	bool func_proto_unreliable;
++ 	bool sleepable;
++ 	enum bpf_tramp_prog_type trampoline_prog_type;
++ 	struct bpf_trampoline *trampoline;
++ 	struct hlist_node tramp_hlist;
+++>>>>>>> 1e6c62a88215 (bpf: Introduce sleepable BPF programs)
+  	/* BTF_KIND_FUNC_PROTO for valid attach_btf_id */
+ -	const struct btf_type *attach_func_proto;
+ +	RH_KABI_BROKEN_INSERT(const struct btf_type *attach_func_proto)
+  	/* function name for valid attach_btf_id */
+ -	const char *attach_func_name;
+ +	RH_KABI_BROKEN_INSERT(const char *attach_func_name)
+  	struct bpf_prog **func;
+  	void *jit_data; /* JIT specific data. arch dependent */
+ -	struct bpf_jit_poke_descriptor *poke_tab;
+ -	u32 size_poke_tab;
+ -	struct bpf_ksym ksym;
+ +	RH_KABI_BROKEN_INSERT(struct bpf_jit_poke_descriptor *poke_tab)
+ +	RH_KABI_BROKEN_INSERT(u32 size_poke_tab)
+ +	RH_KABI_BROKEN_REMOVE(struct latch_tree_node ksym_tnode)
+ +	RH_KABI_BROKEN_REMOVE(struct list_head ksym_lnode)
+ +	RH_KABI_BROKEN_INSERT(struct bpf_ksym ksym)
+  	const struct bpf_prog_ops *ops;
+  	struct bpf_map **used_maps;
+  	struct bpf_prog *prog;
+diff --cc kernel/bpf/verifier.c
+index 543b6ee6fd97,3ebfdb7bd427..000000000000
+--- a/kernel/bpf/verifier.c
++++ b/kernel/bpf/verifier.c
+@@@ -10981,28 -11003,74 +10999,81 @@@ static int check_attach_modify_return(u
+  	return -EINVAL;
+  }
+  
+++<<<<<<< HEAD
+ +int bpf_check_attach_target(struct bpf_verifier_log *log,
+ +			    const struct bpf_prog *prog,
+ +			    const struct bpf_prog *tgt_prog,
+ +			    u32 btf_id,
+ +			    struct bpf_attach_target_info *tgt_info)
+++=======
++ /* non exhaustive list of sleepable bpf_lsm_*() functions */
++ BTF_SET_START(btf_sleepable_lsm_hooks)
++ #ifdef CONFIG_BPF_LSM
++ BTF_ID(func, bpf_lsm_file_mprotect)
++ BTF_ID(func, bpf_lsm_bprm_committed_creds)
++ #endif
++ BTF_SET_END(btf_sleepable_lsm_hooks)
++ 
++ static int check_sleepable_lsm_hook(u32 btf_id)
++ {
++ 	return btf_id_set_contains(&btf_sleepable_lsm_hooks, btf_id);
++ }
++ 
++ /* list of non-sleepable functions that are otherwise on
++  * ALLOW_ERROR_INJECTION list
++  */
++ BTF_SET_START(btf_non_sleepable_error_inject)
++ /* Three functions below can be called from sleepable and non-sleepable context.
++  * Assume non-sleepable from bpf safety point of view.
++  */
++ BTF_ID(func, __add_to_page_cache_locked)
++ BTF_ID(func, should_fail_alloc_page)
++ BTF_ID(func, should_failslab)
++ BTF_SET_END(btf_non_sleepable_error_inject)
++ 
++ static int check_non_sleepable_error_inject(u32 btf_id)
++ {
++ 	return btf_id_set_contains(&btf_non_sleepable_error_inject, btf_id);
++ }
++ 
++ static int check_attach_btf_id(struct bpf_verifier_env *env)
+++>>>>>>> 1e6c62a88215 (bpf: Introduce sleepable BPF programs)
+  {
+ -	struct bpf_prog *prog = env->prog;
+  	bool prog_extension = prog->type == BPF_PROG_TYPE_EXT;
+ -	struct bpf_prog *tgt_prog = prog->aux->linked_prog;
+ -	u32 btf_id = prog->aux->attach_btf_id;
+  	const char prefix[] = "btf_trace_";
+ -	struct btf_func_model fmodel;
+  	int ret = 0, subprog = -1, i;
+ -	struct bpf_trampoline *tr;
+  	const struct btf_type *t;
+  	bool conservative = true;
+  	const char *tname;
+  	struct btf *btf;
+++<<<<<<< HEAD
+ +	long addr = 0;
+++=======
++ 	long addr;
++ 	u64 key;
++ 
++ 	if (prog->aux->sleepable && prog->type != BPF_PROG_TYPE_TRACING &&
++ 	    prog->type != BPF_PROG_TYPE_LSM) {
++ 		verbose(env, "Only fentry/fexit/fmod_ret and lsm programs can be sleepable\n");
++ 		return -EINVAL;
++ 	}
++ 
++ 	if (prog->type == BPF_PROG_TYPE_STRUCT_OPS)
++ 		return check_struct_ops_btf_id(env);
++ 
++ 	if (prog->type != BPF_PROG_TYPE_TRACING &&
++ 	    prog->type != BPF_PROG_TYPE_LSM &&
++ 	    !prog_extension)
++ 		return 0;
+++>>>>>>> 1e6c62a88215 (bpf: Introduce sleepable BPF programs)
+  
+  	if (!btf_id) {
+ -		verbose(env, "Tracing programs must provide btf_id\n");
+ +		bpf_log(log, "Tracing programs must provide btf_id\n");
+  		return -EINVAL;
+  	}
+ -	btf = bpf_prog_get_target_btf(prog);
+ +	btf = tgt_prog ? tgt_prog->aux->btf : btf_vmlinux;
+  	if (!btf) {
+ -		verbose(env,
+ +		bpf_log(log,
+  			"FENTRY/FEXIT program can only be attached to another program annotated with BTF\n");
+  		return -EINVAL;
+  	}
+@@@ -11170,88 -11264,46 +11241,130 @@@
+  			}
+  		}
+  
+++<<<<<<< HEAD
+ +		if (prog->expected_attach_type == BPF_MODIFY_RETURN) {
+ +			if (tgt_prog) {
+ +				bpf_log(log, "can't modify return codes of BPF programs\n");
+ +				return -EINVAL;
+ +			}
+ +			ret = check_attach_modify_return(addr, tname);
+ +			if (ret) {
+ +				bpf_log(log, "%s() is not modifiable\n", tname);
+ +				return ret;
+ +			}
+ +		}
+ +
+ +		break;
+++=======
++ 		if (prog->aux->sleepable) {
++ 			ret = -EINVAL;
++ 			switch (prog->type) {
++ 			case BPF_PROG_TYPE_TRACING:
++ 				/* fentry/fexit/fmod_ret progs can be sleepable only if they are
++ 				 * attached to ALLOW_ERROR_INJECTION and are not in denylist.
++ 				 */
++ 				if (!check_non_sleepable_error_inject(btf_id) &&
++ 				    within_error_injection_list(addr))
++ 					ret = 0;
++ 				break;
++ 			case BPF_PROG_TYPE_LSM:
++ 				/* LSM progs check that they are attached to bpf_lsm_*() funcs.
++ 				 * Only some of them are sleepable.
++ 				 */
++ 				if (check_sleepable_lsm_hook(btf_id))
++ 					ret = 0;
++ 				break;
++ 			default:
++ 				break;
++ 			}
++ 			if (ret)
++ 				verbose(env, "%s is not sleepable\n",
++ 					prog->aux->attach_func_name);
++ 		} else if (prog->expected_attach_type == BPF_MODIFY_RETURN) {
++ 			ret = check_attach_modify_return(prog, addr);
++ 			if (ret)
++ 				verbose(env, "%s() is not modifiable\n",
++ 					prog->aux->attach_func_name);
++ 		}
++ 		if (ret)
++ 			goto out;
++ 		tr->func.addr = (void *)addr;
++ 		prog->aux->trampoline = tr;
++ out:
++ 		mutex_unlock(&tr->mutex);
++ 		if (ret)
++ 			bpf_trampoline_put(tr);
++ 		return ret;
+++>>>>>>> 1e6c62a88215 (bpf: Introduce sleepable BPF programs)
+ +	}
+ +	tgt_info->tgt_addr = addr;
+ +	tgt_info->tgt_name = tname;
+ +	tgt_info->tgt_type = t;
+ +	return 0;
+ +}
+ +
+ +static int check_attach_btf_id(struct bpf_verifier_env *env)
+ +{
+ +	struct bpf_prog *prog = env->prog;
+ +	struct bpf_prog *tgt_prog = prog->aux->dst_prog;
+ +	struct bpf_attach_target_info tgt_info = {};
+ +	u32 btf_id = prog->aux->attach_btf_id;
+ +	struct bpf_trampoline *tr;
+ +	int ret;
+ +	u64 key;
+ +
+ +	if (prog->type == BPF_PROG_TYPE_STRUCT_OPS)
+ +		return check_struct_ops_btf_id(env);
+ +
+ +	if (prog->type != BPF_PROG_TYPE_TRACING &&
+ +	    prog->type != BPF_PROG_TYPE_LSM &&
+ +	    prog->type != BPF_PROG_TYPE_EXT)
+ +		return 0;
+ +
+ +	ret = bpf_check_attach_target(&env->log, prog, tgt_prog, btf_id, &tgt_info);
+ +	if (ret)
+ +		return ret;
+ +
+ +	if (tgt_prog && prog->type == BPF_PROG_TYPE_EXT) {
+ +		/* to make freplace equivalent to their targets, they need to
+ +		 * inherit env->ops and expected_attach_type for the rest of the
+ +		 * verification
+ +		 */
+ +		env->ops = bpf_verifier_ops[tgt_prog->type];
+ +		prog->expected_attach_type = tgt_prog->expected_attach_type;
+ +	}
+ +
+ +	/* store info about the attachment target that will be used later */
+ +	prog->aux->attach_func_proto = tgt_info.tgt_type;
+ +	prog->aux->attach_func_name = tgt_info.tgt_name;
+ +
+ +	if (tgt_prog) {
+ +		prog->aux->saved_dst_prog_type = tgt_prog->type;
+ +		prog->aux->saved_dst_attach_type = tgt_prog->expected_attach_type;
+ +	}
+ +
+ +	if (prog->expected_attach_type == BPF_TRACE_RAW_TP) {
+ +		prog->aux->attach_btf_trace = true;
+ +		return 0;
+ +	} else if (prog->expected_attach_type == BPF_TRACE_ITER) {
+ +		if (!bpf_iter_prog_supported(prog))
+ +			return -EINVAL;
+ +		return 0;
+ +	}
+ +
+ +	if (prog->type == BPF_PROG_TYPE_LSM) {
+ +		ret = bpf_lsm_verify_prog(&env->log, prog);
+ +		if (ret < 0)
+ +			return ret;
+  	}
+ +
+ +	key = bpf_trampoline_compute_key(tgt_prog, btf_id);
+ +	tr = bpf_trampoline_get(key, &tgt_info);
+ +	if (!tr)
+ +		return -ENOMEM;
+ +
+ +	prog->aux->dst_trampoline = tr;
+ +	return 0;
+  }
+  
+  int bpf_check(struct bpf_prog **prog, union bpf_attr *attr,
+diff --git a/arch/x86/net/bpf_jit_comp.c b/arch/x86/net/bpf_jit_comp.c
+index eeda778a456d..bf5999462f6f 100644
+--- a/arch/x86/net/bpf_jit_comp.c
++++ b/arch/x86/net/bpf_jit_comp.c
+@@ -1383,10 +1383,15 @@ static int invoke_bpf_prog(const struct btf_func_model *m, u8 **pprog,
+ 	u8 *prog = *pprog;
+ 	int cnt = 0;
+ 
+-	if (emit_call(&prog, __bpf_prog_enter, prog))
+-		return -EINVAL;
+-	/* remember prog start time returned by __bpf_prog_enter */
+-	emit_mov_reg(&prog, true, BPF_REG_6, BPF_REG_0);
++	if (p->aux->sleepable) {
++		if (emit_call(&prog, __bpf_prog_enter_sleepable, prog))
++			return -EINVAL;
++	} else {
++		if (emit_call(&prog, __bpf_prog_enter, prog))
++			return -EINVAL;
++		/* remember prog start time returned by __bpf_prog_enter */
++		emit_mov_reg(&prog, true, BPF_REG_6, BPF_REG_0);
++	}
+ 
+ 	/* arg1: lea rdi, [rbp - stack_size] */
+ 	EMIT4(0x48, 0x8D, 0x7D, -stack_size);
+@@ -1406,13 +1411,18 @@ static int invoke_bpf_prog(const struct btf_func_model *m, u8 **pprog,
+ 	if (mod_ret)
+ 		emit_stx(&prog, BPF_DW, BPF_REG_FP, BPF_REG_0, -8);
+ 
+-	/* arg1: mov rdi, progs[i] */
+-	emit_mov_imm64(&prog, BPF_REG_1, (long) p >> 32,
+-		       (u32) (long) p);
+-	/* arg2: mov rsi, rbx <- start time in nsec */
+-	emit_mov_reg(&prog, true, BPF_REG_2, BPF_REG_6);
+-	if (emit_call(&prog, __bpf_prog_exit, prog))
+-		return -EINVAL;
++	if (p->aux->sleepable) {
++		if (emit_call(&prog, __bpf_prog_exit_sleepable, prog))
++			return -EINVAL;
++	} else {
++		/* arg1: mov rdi, progs[i] */
++		emit_mov_imm64(&prog, BPF_REG_1, (long) p >> 32,
++			       (u32) (long) p);
++		/* arg2: mov rsi, rbx <- start time in nsec */
++		emit_mov_reg(&prog, true, BPF_REG_2, BPF_REG_6);
++		if (emit_call(&prog, __bpf_prog_exit, prog))
++			return -EINVAL;
++	}
+ 
+ 	*pprog = prog;
+ 	return 0;
+* Unmerged path include/linux/bpf.h
+diff --git a/include/uapi/linux/bpf.h b/include/uapi/linux/bpf.h
+index cf3328549833..65c0b10546fd 100644
+--- a/include/uapi/linux/bpf.h
++++ b/include/uapi/linux/bpf.h
+@@ -351,6 +351,14 @@ enum bpf_link_type {
+ /* The verifier internal test flag. Behavior is undefined */
+ #define BPF_F_TEST_STATE_FREQ	(1U << 3)
+ 
++/* If BPF_F_SLEEPABLE is used in BPF_PROG_LOAD command, the verifier will
++ * restrict map and helper usage for such programs. Sleepable BPF programs can
++ * only be attached to hooks where kernel execution context allows sleeping.
++ * Such programs are allowed to use helpers that may sleep like
++ * bpf_copy_from_user().
++ */
++#define BPF_F_SLEEPABLE		(1U << 4)
++
+ /* When BPF ldimm64's insn[0].src_reg != 0 then this can have
+  * two extensions:
+  *
+diff --git a/init/Kconfig b/init/Kconfig
+index ed4d4b9da16e..5e62fab2e99d 100644
+--- a/init/Kconfig
++++ b/init/Kconfig
+@@ -1489,6 +1489,7 @@ config BPF_SYSCALL
+ 	bool "Enable bpf() system call"
+ 	select BPF
+ 	select IRQ_WORK
++	select TASKS_TRACE_RCU
+ 	default n
+ 	help
+ 	  Enable the bpf() system call that allows to manipulate eBPF
+diff --git a/kernel/bpf/arraymap.c b/kernel/bpf/arraymap.c
+index e44c2b8877d8..a5706a1d74e5 100644
+--- a/kernel/bpf/arraymap.c
++++ b/kernel/bpf/arraymap.c
+@@ -18,6 +18,7 @@
+ #include <linux/filter.h>
+ #include <linux/perf_event.h>
+ #include <uapi/linux/btf.h>
++#include <linux/rcupdate_trace.h>
+ 
+ #include "map_in_map.h"
+ 
+diff --git a/kernel/bpf/hashtab.c b/kernel/bpf/hashtab.c
+index 2ce243cadee6..746d824aebc0 100644
+--- a/kernel/bpf/hashtab.c
++++ b/kernel/bpf/hashtab.c
+@@ -17,6 +17,7 @@
+ #include <linux/rculist_nulls.h>
+ #include <linux/random.h>
+ #include <uapi/linux/btf.h>
++#include <linux/rcupdate_trace.h>
+ #include "percpu_freelist.h"
+ #include "bpf_lru_list.h"
+ #include "map_in_map.h"
+@@ -585,8 +586,7 @@ static void *__htab_map_lookup_elem(struct bpf_map *map, void *key)
+ 	struct htab_elem *l;
+ 	u32 hash, key_size;
+ 
+-	/* Must be called with rcu_read_lock. */
+-	WARN_ON_ONCE(!rcu_read_lock_held());
++	WARN_ON_ONCE(!rcu_read_lock_held() && !rcu_read_lock_trace_held());
+ 
+ 	key_size = map->key_size;
+ 
+@@ -949,7 +949,7 @@ static int htab_map_update_elem(struct bpf_map *map, void *key, void *value,
+ 		/* unknown flags */
+ 		return -EINVAL;
+ 
+-	WARN_ON_ONCE(!rcu_read_lock_held());
++	WARN_ON_ONCE(!rcu_read_lock_held() && !rcu_read_lock_trace_held());
+ 
+ 	key_size = map->key_size;
+ 
+@@ -1040,7 +1040,7 @@ static int htab_lru_map_update_elem(struct bpf_map *map, void *key, void *value,
+ 		/* unknown flags */
+ 		return -EINVAL;
+ 
+-	WARN_ON_ONCE(!rcu_read_lock_held());
++	WARN_ON_ONCE(!rcu_read_lock_held() && !rcu_read_lock_trace_held());
+ 
+ 	key_size = map->key_size;
+ 
+@@ -1228,7 +1228,7 @@ static int htab_map_delete_elem(struct bpf_map *map, void *key)
+ 	u32 hash, key_size;
+ 	int ret = -ENOENT;
+ 
+-	WARN_ON_ONCE(!rcu_read_lock_held());
++	WARN_ON_ONCE(!rcu_read_lock_held() && !rcu_read_lock_trace_held());
+ 
+ 	key_size = map->key_size;
+ 
+@@ -1260,7 +1260,7 @@ static int htab_lru_map_delete_elem(struct bpf_map *map, void *key)
+ 	u32 hash, key_size;
+ 	int ret = -ENOENT;
+ 
+-	WARN_ON_ONCE(!rcu_read_lock_held());
++	WARN_ON_ONCE(!rcu_read_lock_held() && !rcu_read_lock_trace_held());
+ 
+ 	key_size = map->key_size;
+ 
+diff --git a/kernel/bpf/syscall.c b/kernel/bpf/syscall.c
+index 70e6c7e995cb..9a17bc0fc2de 100644
+--- a/kernel/bpf/syscall.c
++++ b/kernel/bpf/syscall.c
+@@ -38,6 +38,7 @@
+ #include <linux/init.h>
+ #include <linux/poll.h>
+ #include <linux/bpf-netns.h>
++#include <linux/rcupdate_trace.h>
+ 
+ #include <linux/rh_features.h>
+ 
+@@ -1756,10 +1757,14 @@ static void __bpf_prog_put_noref(struct bpf_prog *prog, bool deferred)
+ 	btf_put(prog->aux->btf);
+ 	bpf_prog_free_linfo(prog);
+ 
+-	if (deferred)
+-		call_rcu(&prog->aux->rcu, __bpf_prog_put_rcu);
+-	else
++	if (deferred) {
++		if (prog->aux->sleepable)
++			call_rcu_tasks_trace(&prog->aux->rcu, __bpf_prog_put_rcu);
++		else
++			call_rcu(&prog->aux->rcu, __bpf_prog_put_rcu);
++	} else {
+ 		__bpf_prog_put_rcu(&prog->aux->rcu);
++	}
+ }
+ 
+ static void __bpf_prog_put(struct bpf_prog *prog, bool do_idr_lock)
+@@ -2129,6 +2134,7 @@ static int bpf_prog_load(union bpf_attr *attr, union bpf_attr __user *uattr)
+ 	if (attr->prog_flags & ~(BPF_F_STRICT_ALIGNMENT |
+ 				 BPF_F_ANY_ALIGNMENT |
+ 				 BPF_F_TEST_STATE_FREQ |
++				 BPF_F_SLEEPABLE |
+ 				 BPF_F_TEST_RND_HI32))
+ 		return -EINVAL;
+ 
+@@ -2184,6 +2190,7 @@ static int bpf_prog_load(union bpf_attr *attr, union bpf_attr __user *uattr)
+ 	}
+ 
+ 	prog->aux->offload_requested = !!attr->prog_ifindex;
++	prog->aux->sleepable = attr->prog_flags & BPF_F_SLEEPABLE;
+ 
+ 	err = security_bpf_prog_alloc(prog->aux);
+ 	if (err)
+diff --git a/kernel/bpf/trampoline.c b/kernel/bpf/trampoline.c
+index b8e9e74ce71b..c9f26353e5c6 100644
+--- a/kernel/bpf/trampoline.c
++++ b/kernel/bpf/trampoline.c
+@@ -7,6 +7,8 @@
+ #include <linux/rbtree_latch.h>
+ #include <linux/perf_event.h>
+ #include <linux/btf.h>
++#include <linux/rcupdate_trace.h>
++#include <linux/rcupdate_wait.h>
+ 
+ /* dummy _ops. The verifier will operate on target program's ops. */
+ const struct bpf_verifier_ops bpf_extension_verifier_ops = {
+@@ -210,9 +212,12 @@ static int bpf_trampoline_update(struct bpf_trampoline *tr)
+ 	 * updates to trampoline would change the code from underneath the
+ 	 * preempted task. Hence wait for tasks to voluntarily schedule or go
+ 	 * to userspace.
++	 * The same trampoline can hold both sleepable and non-sleepable progs.
++	 * synchronize_rcu_tasks_trace() is needed to make sure all sleepable
++	 * programs finish executing.
++	 * Wait for these two grace periods together.
+ 	 */
+-
+-	synchronize_rcu_tasks();
++	synchronize_rcu_mult(call_rcu_tasks, call_rcu_tasks_trace);
+ 
+ 	err = arch_prepare_bpf_trampoline(new_image, new_image + PAGE_SIZE / 2,
+ 					  &tr->func.model, flags, tprogs,
+@@ -360,7 +365,14 @@ void bpf_trampoline_put(struct bpf_trampoline *tr)
+ 	if (WARN_ON_ONCE(!hlist_empty(&tr->progs_hlist[BPF_TRAMP_FEXIT])))
+ 		goto out;
+ 	bpf_image_ksym_del(&tr->ksym);
+-	/* wait for tasks to get out of trampoline before freeing it */
++	/* This code will be executed when all bpf progs (both sleepable and
++	 * non-sleepable) went through
++	 * bpf_prog_put()->call_rcu[_tasks_trace]()->bpf_prog_free_deferred().
++	 * Hence no need for another synchronize_rcu_tasks_trace() here,
++	 * but synchronize_rcu_tasks() is still needed, since trampoline
++	 * may not have had any sleepable programs and we need to wait
++	 * for tasks to get out of trampoline code before freeing it.
++	 */
+ 	synchronize_rcu_tasks();
+ 	bpf_jit_free_exec(tr->image);
+ 	hlist_del(&tr->hlist);
+@@ -410,6 +422,16 @@ void notrace __bpf_prog_exit(struct bpf_prog *prog, u64 start)
+ 	rcu_read_unlock();
+ }
+ 
++void notrace __bpf_prog_enter_sleepable(void)
++{
++	rcu_read_lock_trace();
++}
++
++void notrace __bpf_prog_exit_sleepable(void)
++{
++	rcu_read_unlock_trace();
++}
++
+ int __weak
+ arch_prepare_bpf_trampoline(void *image, void *image_end,
+ 			    const struct btf_func_model *m, u32 flags,
+* Unmerged path kernel/bpf/verifier.c
+diff --git a/tools/include/uapi/linux/bpf.h b/tools/include/uapi/linux/bpf.h
+index 769e400e6f58..0b0644bee806 100644
+--- a/tools/include/uapi/linux/bpf.h
++++ b/tools/include/uapi/linux/bpf.h
+@@ -345,6 +345,14 @@ enum bpf_link_type {
+ /* The verifier internal test flag. Behavior is undefined */
+ #define BPF_F_TEST_STATE_FREQ	(1U << 3)
+ 
++/* If BPF_F_SLEEPABLE is used in BPF_PROG_LOAD command, the verifier will
++ * restrict map and helper usage for such programs. Sleepable BPF programs can
++ * only be attached to hooks where kernel execution context allows sleeping.
++ * Such programs are allowed to use helpers that may sleep like
++ * bpf_copy_from_user().
++ */
++#define BPF_F_SLEEPABLE		(1U << 4)
++
+ /* When BPF ldimm64's insn[0].src_reg != 0 then this can have
+  * two extensions:
+  *
