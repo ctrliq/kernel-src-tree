@@ -2061,6 +2061,7 @@ static int trace__event_handler(struct trace *trace, struct perf_evsel *evsel,
 				union perf_event *event __maybe_unused,
 				struct perf_sample *sample)
 {
+	struct thread *thread = machine__findnew_thread(trace->host, sample->pid, sample->tid);
 	int callchain_ret = 0;
 
 	if (sample->callchain) {
@@ -2078,21 +2079,18 @@ static int trace__event_handler(struct trace *trace, struct perf_evsel *evsel,
 	if (trace->trace_syscalls)
 		fprintf(trace->output, "(         ): ");
 
+	if (thread)
+		trace__fprintf_comm_tid(trace, thread, trace->output);
+
 	if (evsel == trace->syscalls.events.augmented) {
 		int id = perf_evsel__sc_tp_uint(evsel, id, sample);
 		struct syscall *sc = trace__syscall_info(trace, evsel, id);
 
 		if (sc) {
-			struct thread *thread = machine__findnew_thread(trace->host, sample->pid, sample->tid);
-
-			if (thread) {
-				trace__fprintf_comm_tid(trace, thread, trace->output);
-				fprintf(trace->output, "%s(", sc->name);
-				trace__fprintf_sys_enter(trace, evsel, sample);
-				fputc(')', trace->output);
-				thread__put(thread);
-				goto newline;
-			}
+			fprintf(trace->output, "%s(", sc->name);
+			trace__fprintf_sys_enter(trace, evsel, sample);
+			fputc(')', trace->output);
+			goto newline;
 		}
 
 		/*
@@ -2123,6 +2121,7 @@ newline:
 		trace__fprintf_callchain(trace, sample);
 	else if (callchain_ret < 0)
 		pr_err("Problem processing %s callchain, skipping...\n", perf_evsel__name(evsel));
+	thread__put(thread);
 out:
 	return 0;
 }
