@@ -1,0 +1,150 @@
+net/fq_impl: drop get_default_func, move default flow to fq_tin
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-315.el8
+commit-author Felix Fietkau <nbd@nbd.name>
+commit bf9009bf21b53501f2abb2f59f9314d85bde5fc9
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-315.el8/bf9009bf.failed
+
+Simplifies the code and prepares for a rework of scanning for flows on
+overmemory drop.
+
+	Signed-off-by: Felix Fietkau <nbd@nbd.name>
+Link: https://lore.kernel.org/r/20201218184718.93650-2-nbd@nbd.name
+	Signed-off-by: Johannes Berg <johannes.berg@intel.com>
+(cherry picked from commit bf9009bf21b53501f2abb2f59f9314d85bde5fc9)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/net/fq_impl.h
+#	net/mac80211/tx.c
+diff --cc include/net/fq_impl.h
+index abeccf666679,dd374c7f0fe5..000000000000
+--- a/include/net/fq_impl.h
++++ b/include/net/fq_impl.h
+@@@ -143,23 -142,24 +143,28 @@@ begin
+  	return skb;
+  }
+  
+ -static u32 fq_flow_idx(struct fq *fq, struct sk_buff *skb)
+ -{
+ -	u32 hash = skb_get_hash(skb);
+ -
+ -	return reciprocal_scale(hash, fq->flows_cnt);
+ -}
+ -
+  static struct fq_flow *fq_flow_classify(struct fq *fq,
+++<<<<<<< HEAD
+ +					struct fq_tin *tin,
+ +					struct sk_buff *skb,
+ +					fq_flow_get_default_t get_default_func)
+++=======
++ 					struct fq_tin *tin, u32 idx,
++ 					struct sk_buff *skb)
+++>>>>>>> bf9009bf21b5 (net/fq_impl: drop get_default_func, move default flow to fq_tin)
+  {
+  	struct fq_flow *flow;
+ +	u32 hash;
+ +	u32 idx;
+  
+  	lockdep_assert_held(&fq->lock);
+  
+ +	hash = skb_get_hash_perturb(skb, &fq->perturbation);
+ +	idx = reciprocal_scale(hash, fq->flows_cnt);
+  	flow = &fq->flows[idx];
+ +
+  	if (flow->tin && flow->tin != tin) {
+- 		flow = get_default_func(fq, tin, idx, skb);
++ 		flow = &tin->default_flow;
+  		tin->collisions++;
+  		fq->collisions++;
+  	}
+@@@ -189,17 -189,16 +194,20 @@@ static void fq_recalc_backlog(struct f
+  }
+  
+  static void fq_tin_enqueue(struct fq *fq,
+ -			   struct fq_tin *tin, u32 idx,
+ +			   struct fq_tin *tin,
+  			   struct sk_buff *skb,
+- 			   fq_skb_free_t free_func,
+- 			   fq_flow_get_default_t get_default_func)
++ 			   fq_skb_free_t free_func)
+  {
+  	struct fq_flow *flow;
+  	bool oom;
+  
+  	lockdep_assert_held(&fq->lock);
+  
+++<<<<<<< HEAD
+ +	flow = fq_flow_classify(fq, tin, skb, get_default_func);
+++=======
++ 	flow = fq_flow_classify(fq, tin, idx, skb);
+++>>>>>>> bf9009bf21b5 (net/fq_impl: drop get_default_func, move default flow to fq_tin)
+  
+  	flow->tin = tin;
+  	flow->backlog += skb->len;
+diff --cc net/mac80211/tx.c
+index a1584634b4c4,935a9ce65749..000000000000
+--- a/net/mac80211/tx.c
++++ b/net/mac80211/tx.c
+@@@ -1405,11 -1385,14 +1394,19 @@@ static void ieee80211_txq_enqueue(struc
+  {
+  	struct fq *fq = &local->fq;
+  	struct fq_tin *tin = &txqi->tin;
+ -	u32 flow_idx = fq_flow_idx(fq, skb);
+  
+  	ieee80211_set_skb_enqueue_time(skb);
+++<<<<<<< HEAD
+ +	fq_tin_enqueue(fq, tin, skb,
+ +		       fq_skb_free_func,
+ +		       fq_flow_get_default_func);
+++=======
++ 
++ 	spin_lock_bh(&fq->lock);
++ 	fq_tin_enqueue(fq, tin, flow_idx, skb,
++ 		       fq_skb_free_func);
++ 	spin_unlock_bh(&fq->lock);
+++>>>>>>> bf9009bf21b5 (net/fq_impl: drop get_default_func, move default flow to fq_tin)
+  }
+  
+  static bool fq_vlan_filter_func(struct fq *fq, struct fq_tin *tin,
+@@@ -3289,7 -3270,7 +3285,11 @@@ static bool ieee80211_amsdu_aggregate(s
+  	 */
+  
+  	tin = &txqi->tin;
+++<<<<<<< HEAD
+ +	flow = fq_flow_classify(fq, tin, skb, fq_flow_get_default_func);
+++=======
++ 	flow = fq_flow_classify(fq, tin, flow_idx, skb);
+++>>>>>>> bf9009bf21b5 (net/fq_impl: drop get_default_func, move default flow to fq_tin)
+  	head = skb_peek_tail(&flow->queue);
+  	if (!head || skb_is_gso(head))
+  		goto out;
+diff --git a/include/net/fq.h b/include/net/fq.h
+index c51be50e1349..d83c8e048a5b 100644
+--- a/include/net/fq.h
++++ b/include/net/fq.h
+@@ -48,6 +48,7 @@ struct fq_flow {
+ struct fq_tin {
+ 	struct list_head new_flows;
+ 	struct list_head old_flows;
++	struct fq_flow default_flow;
+ 	u32 backlog_bytes;
+ 	u32 backlog_packets;
+ 	u32 overlimit;
+* Unmerged path include/net/fq_impl.h
+diff --git a/net/mac80211/ieee80211_i.h b/net/mac80211/ieee80211_i.h
+index 0b1eaec6649f..5e9dedb2dca2 100644
+--- a/net/mac80211/ieee80211_i.h
++++ b/net/mac80211/ieee80211_i.h
+@@ -835,7 +835,6 @@ enum txq_info_flags {
+  */
+ struct txq_info {
+ 	struct fq_tin tin;
+-	struct fq_flow def_flow;
+ 	struct codel_vars def_cvars;
+ 	struct codel_stats cstats;
+ 	struct sk_buff_head frags;
+* Unmerged path net/mac80211/tx.c
