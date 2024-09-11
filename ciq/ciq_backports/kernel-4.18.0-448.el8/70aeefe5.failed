@@ -1,0 +1,703 @@
+s390/vfio-ap: reset queues after adapter/domain unassignment
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-448.el8
+commit-author Tony Krowiak <akrowiak@linux.ibm.com>
+commit 70aeefe574cbf86528528832c615cae2701f2cf3
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-448.el8/70aeefe5.failed
+
+When an adapter or domain is unassigned from an mdev attached to a KVM
+guest, one or more of the guest's queues may get dynamically removed. Since
+the removed queues could get re-assigned to another mdev, they need to be
+reset. So, when an adapter or domain is unassigned from the mdev, the
+queues that are removed from the guest's AP configuration (APCB) will be
+reset.
+
+	Signed-off-by: Tony Krowiak <akrowiak@linux.ibm.com>
+	Reviewed-by: Jason J. Herne <jjherne@linux.ibm.com>
+	Signed-off-by: Alexander Gordeev <agordeev@linux.ibm.com>
+(cherry picked from commit 70aeefe574cbf86528528832c615cae2701f2cf3)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/s390/crypto/vfio_ap_ops.c
+#	drivers/s390/crypto/vfio_ap_private.h
+diff --cc drivers/s390/crypto/vfio_ap_ops.c
+index 69b05ef08538,906bb8c7c4a1..000000000000
+--- a/drivers/s390/crypto/vfio_ap_ops.c
++++ b/drivers/s390/crypto/vfio_ap_ops.c
+@@@ -24,21 -26,181 +24,32 @@@
+  #define VFIO_AP_MDEV_TYPE_HWVIRT "passthrough"
+  #define VFIO_AP_MDEV_NAME_HWVIRT "VFIO AP Passthrough Device"
+  
+++<<<<<<< HEAD
+ +static int vfio_ap_mdev_reset_queues(struct mdev_device *mdev);
+ +static struct vfio_ap_queue *vfio_ap_find_queue(int apqn);
+++=======
++ #define AP_QUEUE_ASSIGNED "assigned"
++ #define AP_QUEUE_UNASSIGNED "unassigned"
++ #define AP_QUEUE_IN_USE "in use"
++ 
++ static int vfio_ap_mdev_reset_queues(struct ap_queue_table *qtable);
++ static struct vfio_ap_queue *vfio_ap_find_queue(int apqn);
++ static const struct vfio_device_ops vfio_ap_matrix_dev_ops;
++ static int vfio_ap_mdev_reset_queue(struct vfio_ap_queue *q, unsigned int retry);
+++>>>>>>> 70aeefe574cb (s390/vfio-ap: reset queues after adapter/domain unassignment)
+  
+  /**
+ - * get_update_locks_for_kvm: Acquire the locks required to dynamically update a
+ - *			     KVM guest's APCB in the proper order.
+ - *
+ - * @kvm: a pointer to a struct kvm object containing the KVM guest's APCB.
+ - *
+ - * The proper locking order is:
+ - * 1. matrix_dev->guests_lock: required to use the KVM pointer to update a KVM
+ - *			       guest's APCB.
+ - * 2. kvm->lock:	       required to update a guest's APCB
+ - * 3. matrix_dev->mdevs_lock:  required to access data stored in a matrix_mdev
+ - *
+ - * Note: If @kvm is NULL, the KVM lock will not be taken.
+ - */
+ -static inline void get_update_locks_for_kvm(struct kvm *kvm)
+ -{
+ -	mutex_lock(&matrix_dev->guests_lock);
+ -	if (kvm)
+ -		mutex_lock(&kvm->lock);
+ -	mutex_lock(&matrix_dev->mdevs_lock);
+ -}
+ -
+ -/**
+ - * release_update_locks_for_kvm: Release the locks used to dynamically update a
+ - *				 KVM guest's APCB in the proper order.
+ - *
+ - * @kvm: a pointer to a struct kvm object containing the KVM guest's APCB.
+ - *
+ - * The proper unlocking order is:
+ - * 1. matrix_dev->mdevs_lock
+ - * 2. kvm->lock
+ - * 3. matrix_dev->guests_lock
+ - *
+ - * Note: If @kvm is NULL, the KVM lock will not be released.
+ - */
+ -static inline void release_update_locks_for_kvm(struct kvm *kvm)
+ -{
+ -	mutex_unlock(&matrix_dev->mdevs_lock);
+ -	if (kvm)
+ -		mutex_unlock(&kvm->lock);
+ -	mutex_unlock(&matrix_dev->guests_lock);
+ -}
+ -
+ -/**
+ - * get_update_locks_for_mdev: Acquire the locks required to dynamically update a
+ - *			      KVM guest's APCB in the proper order.
+ - *
+ - * @matrix_mdev: a pointer to a struct ap_matrix_mdev object containing the AP
+ - *		 configuration data to use to update a KVM guest's APCB.
+ - *
+ - * The proper locking order is:
+ - * 1. matrix_dev->guests_lock: required to use the KVM pointer to update a KVM
+ - *			       guest's APCB.
+ - * 2. matrix_mdev->kvm->lock:  required to update a guest's APCB
+ - * 3. matrix_dev->mdevs_lock:  required to access data stored in a matrix_mdev
+ - *
+ - * Note: If @matrix_mdev is NULL or is not attached to a KVM guest, the KVM
+ - *	 lock will not be taken.
+ - */
+ -static inline void get_update_locks_for_mdev(struct ap_matrix_mdev *matrix_mdev)
+ -{
+ -	mutex_lock(&matrix_dev->guests_lock);
+ -	if (matrix_mdev && matrix_mdev->kvm)
+ -		mutex_lock(&matrix_mdev->kvm->lock);
+ -	mutex_lock(&matrix_dev->mdevs_lock);
+ -}
+ -
+ -/**
+ - * release_update_locks_for_mdev: Release the locks used to dynamically update a
+ - *				  KVM guest's APCB in the proper order.
+ - *
+ - * @matrix_mdev: a pointer to a struct ap_matrix_mdev object containing the AP
+ - *		 configuration data to use to update a KVM guest's APCB.
+ - *
+ - * The proper unlocking order is:
+ - * 1. matrix_dev->mdevs_lock
+ - * 2. matrix_mdev->kvm->lock
+ - * 3. matrix_dev->guests_lock
+ - *
+ - * Note: If @matrix_mdev is NULL or is not attached to a KVM guest, the KVM
+ - *	 lock will not be released.
+ - */
+ -static inline void release_update_locks_for_mdev(struct ap_matrix_mdev *matrix_mdev)
+ -{
+ -	mutex_unlock(&matrix_dev->mdevs_lock);
+ -	if (matrix_mdev && matrix_mdev->kvm)
+ -		mutex_unlock(&matrix_mdev->kvm->lock);
+ -	mutex_unlock(&matrix_dev->guests_lock);
+ -}
+ -
+ -/**
+ - * get_update_locks_by_apqn: Find the mdev to which an APQN is assigned and
+ - *			     acquire the locks required to update the APCB of
+ - *			     the KVM guest to which the mdev is attached.
+ - *
+ - * @apqn: the APQN of a queue device.
+ - *
+ - * The proper locking order is:
+ - * 1. matrix_dev->guests_lock: required to use the KVM pointer to update a KVM
+ - *			       guest's APCB.
+ - * 2. matrix_mdev->kvm->lock:  required to update a guest's APCB
+ - * 3. matrix_dev->mdevs_lock:  required to access data stored in a matrix_mdev
+ - *
+ - * Note: If @apqn is not assigned to a matrix_mdev, the matrix_mdev->kvm->lock
+ - *	 will not be taken.
+ - *
+ - * Return: the ap_matrix_mdev object to which @apqn is assigned or NULL if @apqn
+ - *	   is not assigned to an ap_matrix_mdev.
+ - */
+ -static struct ap_matrix_mdev *get_update_locks_by_apqn(int apqn)
+ -{
+ -	struct ap_matrix_mdev *matrix_mdev;
+ -
+ -	mutex_lock(&matrix_dev->guests_lock);
+ -
+ -	list_for_each_entry(matrix_mdev, &matrix_dev->mdev_list, node) {
+ -		if (test_bit_inv(AP_QID_CARD(apqn), matrix_mdev->matrix.apm) &&
+ -		    test_bit_inv(AP_QID_QUEUE(apqn), matrix_mdev->matrix.aqm)) {
+ -			if (matrix_mdev->kvm)
+ -				mutex_lock(&matrix_mdev->kvm->lock);
+ -
+ -			mutex_lock(&matrix_dev->mdevs_lock);
+ -
+ -			return matrix_mdev;
+ -		}
+ -	}
+ -
+ -	mutex_lock(&matrix_dev->mdevs_lock);
+ -
+ -	return NULL;
+ -}
+ -
+ -/**
+ - * get_update_locks_for_queue: get the locks required to update the APCB of the
+ - *			       KVM guest to which the matrix mdev linked to a
+ - *			       vfio_ap_queue object is attached.
+ - *
+ - * @q: a pointer to a vfio_ap_queue object.
+ + * vfio_ap_get_queue - retrieve a queue with a specific APQN from a list
+ + * @matrix_mdev: the associated mediated matrix
+ + * @apqn: The queue APQN
+   *
+ - * The proper locking order is:
+ - * 1. q->matrix_dev->guests_lock: required to use the KVM pointer to update a
+ - *				  KVM guest's APCB.
+ - * 2. q->matrix_mdev->kvm->lock:  required to update a guest's APCB
+ - * 3. matrix_dev->mdevs_lock:	  required to access data stored in matrix_mdev
+ + * Retrieve a queue with a specific APQN from the list of the
+ + * devices of the vfio_ap_drv.
+ + * Verify that the APID and the APQI are set in the matrix.
+   *
+ - * Note: if @queue is not linked to an ap_matrix_mdev object, the KVM lock
+ - *	  will not be taken.
+ + * Return: the pointer to the associated vfio_ap_queue
+   */
+ -static inline void get_update_locks_for_queue(struct vfio_ap_queue *q)
+ -{
+ -	mutex_lock(&matrix_dev->guests_lock);
+ -	if (q->matrix_mdev && q->matrix_mdev->kvm)
+ -		mutex_lock(&q->matrix_mdev->kvm->lock);
+ -	mutex_lock(&matrix_dev->mdevs_lock);
+ -}
+ -
+ -/**
+ - * vfio_ap_mdev_get_queue - retrieve a queue with a specific APQN from a
+ - *			    hash table of queues assigned to a matrix mdev
+ - * @matrix_mdev: the matrix mdev
+ - * @apqn: The APQN of a queue device
+ - *
+ - * Return: the pointer to the vfio_ap_queue struct representing the queue or
+ - *	   NULL if the queue is not assigned to @matrix_mdev
+ - */
+ -static struct vfio_ap_queue *vfio_ap_mdev_get_queue(
+ +static struct vfio_ap_queue *vfio_ap_get_queue(
+  					struct ap_matrix_mdev *matrix_mdev,
+  					int apqn)
+  {
+@@@ -322,9 -606,100 +333,103 @@@ static void vfio_ap_matrix_init(struct 
+  	matrix->adm_max = info->apxa ? info->Nd : 15;
+  }
+  
+++<<<<<<< HEAD
+ +static int vfio_ap_mdev_create(struct kobject *kobj, struct mdev_device *mdev)
+++=======
++ static void vfio_ap_mdev_update_guest_apcb(struct ap_matrix_mdev *matrix_mdev)
++ {
++ 	if (matrix_mdev->kvm)
++ 		kvm_arch_crypto_set_masks(matrix_mdev->kvm,
++ 					  matrix_mdev->shadow_apcb.apm,
++ 					  matrix_mdev->shadow_apcb.aqm,
++ 					  matrix_mdev->shadow_apcb.adm);
++ }
++ 
++ static bool vfio_ap_mdev_filter_cdoms(struct ap_matrix_mdev *matrix_mdev)
++ {
++ 	DECLARE_BITMAP(prev_shadow_adm, AP_DOMAINS);
++ 
++ 	bitmap_copy(prev_shadow_adm, matrix_mdev->shadow_apcb.adm, AP_DOMAINS);
++ 	bitmap_and(matrix_mdev->shadow_apcb.adm, matrix_mdev->matrix.adm,
++ 		   (unsigned long *)matrix_dev->info.adm, AP_DOMAINS);
++ 
++ 	return !bitmap_equal(prev_shadow_adm, matrix_mdev->shadow_apcb.adm,
++ 			     AP_DOMAINS);
++ }
++ 
++ /*
++  * vfio_ap_mdev_filter_matrix - filter the APQNs assigned to the matrix mdev
++  *				to ensure no queue devices are passed through to
++  *				the guest that are not bound to the vfio_ap
++  *				device driver.
++  *
++  * @matrix_mdev: the matrix mdev whose matrix is to be filtered.
++  *
++  * Note: If an APQN referencing a queue device that is not bound to the vfio_ap
++  *	 driver, its APID will be filtered from the guest's APCB. The matrix
++  *	 structure precludes filtering an individual APQN, so its APID will be
++  *	 filtered.
++  *
++  * Return: a boolean value indicating whether the KVM guest's APCB was changed
++  *	   by the filtering or not.
++  */
++ static bool vfio_ap_mdev_filter_matrix(unsigned long *apm, unsigned long *aqm,
++ 				       struct ap_matrix_mdev *matrix_mdev)
++ {
++ 	int ret;
++ 	unsigned long apid, apqi, apqn;
++ 	DECLARE_BITMAP(prev_shadow_apm, AP_DEVICES);
++ 	DECLARE_BITMAP(prev_shadow_aqm, AP_DOMAINS);
++ 	struct vfio_ap_queue *q;
++ 
++ 	ret = ap_qci(&matrix_dev->info);
++ 	if (ret)
++ 		return false;
++ 
++ 	bitmap_copy(prev_shadow_apm, matrix_mdev->shadow_apcb.apm, AP_DEVICES);
++ 	bitmap_copy(prev_shadow_aqm, matrix_mdev->shadow_apcb.aqm, AP_DOMAINS);
++ 	vfio_ap_matrix_init(&matrix_dev->info, &matrix_mdev->shadow_apcb);
++ 
++ 	/*
++ 	 * Copy the adapters, domains and control domains to the shadow_apcb
++ 	 * from the matrix mdev, but only those that are assigned to the host's
++ 	 * AP configuration.
++ 	 */
++ 	bitmap_and(matrix_mdev->shadow_apcb.apm, matrix_mdev->matrix.apm,
++ 		   (unsigned long *)matrix_dev->info.apm, AP_DEVICES);
++ 	bitmap_and(matrix_mdev->shadow_apcb.aqm, matrix_mdev->matrix.aqm,
++ 		   (unsigned long *)matrix_dev->info.aqm, AP_DOMAINS);
++ 
++ 	for_each_set_bit_inv(apid, apm, AP_DEVICES) {
++ 		for_each_set_bit_inv(apqi, aqm, AP_DOMAINS) {
++ 			/*
++ 			 * If the APQN is not bound to the vfio_ap device
++ 			 * driver, then we can't assign it to the guest's
++ 			 * AP configuration. The AP architecture won't
++ 			 * allow filtering of a single APQN, so let's filter
++ 			 * the APID since an adapter represents a physical
++ 			 * hardware device.
++ 			 */
++ 			apqn = AP_MKQID(apid, apqi);
++ 			q = vfio_ap_mdev_get_queue(matrix_mdev, apqn);
++ 			if (!q || q->reset_rc) {
++ 				clear_bit_inv(apid,
++ 					      matrix_mdev->shadow_apcb.apm);
++ 				break;
++ 			}
++ 		}
++ 	}
++ 
++ 	return !bitmap_equal(prev_shadow_apm, matrix_mdev->shadow_apcb.apm,
++ 			     AP_DEVICES) ||
++ 	       !bitmap_equal(prev_shadow_aqm, matrix_mdev->shadow_apcb.aqm,
++ 			     AP_DOMAINS);
++ }
++ 
++ static int vfio_ap_mdev_probe(struct mdev_device *mdev)
+++>>>>>>> 70aeefe574cb (s390/vfio-ap: reset queues after adapter/domain unassignment)
+  {
+  	struct ap_matrix_mdev *matrix_mdev;
+ -	int ret;
+  
+  	if ((atomic_dec_if_positive(&matrix_dev->available_instances) < 0))
+  		return -EPERM;
+@@@ -337,31 -712,92 +442,78 @@@
+  
+  	matrix_mdev->mdev = mdev;
+  	vfio_ap_matrix_init(&matrix_dev->info, &matrix_mdev->matrix);
+ +	mdev_set_drvdata(mdev, matrix_mdev);
+  	matrix_mdev->pqap_hook = handle_pqap;
+ -	vfio_ap_matrix_init(&matrix_dev->info, &matrix_mdev->shadow_apcb);
+ -	hash_init(matrix_mdev->qtable.queues);
+ -
+ -	ret = vfio_register_emulated_iommu_dev(&matrix_mdev->vdev);
+ -	if (ret)
+ -		goto err_list;
+ -	dev_set_drvdata(&mdev->dev, matrix_mdev);
+ -	mutex_lock(&matrix_dev->mdevs_lock);
+ +	mutex_lock(&matrix_dev->lock);
+  	list_add(&matrix_mdev->node, &matrix_dev->mdev_list);
+ -	mutex_unlock(&matrix_dev->mdevs_lock);
+ -	return 0;
+ +	mutex_unlock(&matrix_dev->lock);
+  
+ -err_list:
+ -	vfio_uninit_group_dev(&matrix_mdev->vdev);
+ -	kfree(matrix_mdev);
+ -err_dec_available:
+ -	atomic_inc(&matrix_dev->available_instances);
+ -	return ret;
+ +	return 0;
+  }
+  
+ -static void vfio_ap_mdev_link_queue(struct ap_matrix_mdev *matrix_mdev,
+ -				    struct vfio_ap_queue *q)
+ +static int vfio_ap_mdev_remove(struct mdev_device *mdev)
+  {
+ -	if (q) {
+ -		q->matrix_mdev = matrix_mdev;
+ -		hash_add(matrix_mdev->qtable.queues, &q->mdev_qnode, q->apqn);
+ -	}
+ -}
+ +	struct ap_matrix_mdev *matrix_mdev = mdev_get_drvdata(mdev);
+  
+++<<<<<<< HEAD
+ +	mutex_lock(&matrix_dev->lock);
+ +	vfio_ap_mdev_reset_queues(mdev);
+++=======
++ static void vfio_ap_mdev_link_apqn(struct ap_matrix_mdev *matrix_mdev, int apqn)
++ {
++ 	struct vfio_ap_queue *q;
++ 
++ 	q = vfio_ap_find_queue(apqn);
++ 	vfio_ap_mdev_link_queue(matrix_mdev, q);
++ }
++ 
++ static void vfio_ap_unlink_queue_fr_mdev(struct vfio_ap_queue *q)
++ {
++ 	hash_del(&q->mdev_qnode);
++ }
++ 
++ static void vfio_ap_unlink_mdev_fr_queue(struct vfio_ap_queue *q)
++ {
++ 	q->matrix_mdev = NULL;
++ }
++ 
++ static void vfio_ap_mdev_unlink_fr_queues(struct ap_matrix_mdev *matrix_mdev)
++ {
++ 	struct vfio_ap_queue *q;
++ 	unsigned long apid, apqi;
++ 
++ 	for_each_set_bit_inv(apid, matrix_mdev->matrix.apm, AP_DEVICES) {
++ 		for_each_set_bit_inv(apqi, matrix_mdev->matrix.aqm,
++ 				     AP_DOMAINS) {
++ 			q = vfio_ap_mdev_get_queue(matrix_mdev,
++ 						   AP_MKQID(apid, apqi));
++ 			if (q)
++ 				q->matrix_mdev = NULL;
++ 		}
++ 	}
++ }
++ 
++ static void vfio_ap_mdev_remove(struct mdev_device *mdev)
++ {
++ 	struct ap_matrix_mdev *matrix_mdev = dev_get_drvdata(&mdev->dev);
++ 
++ 	vfio_unregister_group_dev(&matrix_mdev->vdev);
++ 
++ 	mutex_lock(&matrix_dev->guests_lock);
++ 	mutex_lock(&matrix_dev->mdevs_lock);
++ 	vfio_ap_mdev_reset_queues(&matrix_mdev->qtable);
++ 	vfio_ap_mdev_unlink_fr_queues(matrix_mdev);
+++>>>>>>> 70aeefe574cb (s390/vfio-ap: reset queues after adapter/domain unassignment)
+  	list_del(&matrix_mdev->node);
+ -	mutex_unlock(&matrix_dev->mdevs_lock);
+ -	mutex_unlock(&matrix_dev->guests_lock);
+ -	vfio_uninit_group_dev(&matrix_mdev->vdev);
+  	kfree(matrix_mdev);
+ +	mdev_set_drvdata(mdev, NULL);
+  	atomic_inc(&matrix_dev->available_instances);
+ +	mutex_unlock(&matrix_dev->lock);
+ +
+ +	return 0;
+  }
+  
+ -static ssize_t name_show(struct mdev_type *mtype,
+ -			 struct mdev_type_attribute *attr, char *buf)
+ +static ssize_t name_show(struct kobject *kobj, struct device *dev, char *buf)
+  {
+  	return sprintf(buf, "%s\n", VFIO_AP_MDEV_NAME_HWVIRT);
+  }
+@@@ -643,6 -1000,72 +795,75 @@@ done
+  }
+  static DEVICE_ATTR_WO(assign_adapter);
+  
+++<<<<<<< HEAD
+++=======
++ static struct vfio_ap_queue
++ *vfio_ap_unlink_apqn_fr_mdev(struct ap_matrix_mdev *matrix_mdev,
++ 			     unsigned long apid, unsigned long apqi)
++ {
++ 	struct vfio_ap_queue *q = NULL;
++ 
++ 	q = vfio_ap_mdev_get_queue(matrix_mdev, AP_MKQID(apid, apqi));
++ 	/* If the queue is assigned to the matrix mdev, unlink it. */
++ 	if (q)
++ 		vfio_ap_unlink_queue_fr_mdev(q);
++ 
++ 	return q;
++ }
++ 
++ /**
++  * vfio_ap_mdev_unlink_adapter - unlink all queues associated with unassigned
++  *				 adapter from the matrix mdev to which the
++  *				 adapter was assigned.
++  * @matrix_mdev: the matrix mediated device to which the adapter was assigned.
++  * @apid: the APID of the unassigned adapter.
++  * @qtable: table for storing queues associated with unassigned adapter.
++  */
++ static void vfio_ap_mdev_unlink_adapter(struct ap_matrix_mdev *matrix_mdev,
++ 					unsigned long apid,
++ 					struct ap_queue_table *qtable)
++ {
++ 	unsigned long apqi;
++ 	struct vfio_ap_queue *q;
++ 
++ 	for_each_set_bit_inv(apqi, matrix_mdev->matrix.aqm, AP_DOMAINS) {
++ 		q = vfio_ap_unlink_apqn_fr_mdev(matrix_mdev, apid, apqi);
++ 
++ 		if (q && qtable) {
++ 			if (test_bit_inv(apid, matrix_mdev->shadow_apcb.apm) &&
++ 			    test_bit_inv(apqi, matrix_mdev->shadow_apcb.aqm))
++ 				hash_add(qtable->queues, &q->mdev_qnode,
++ 					 q->apqn);
++ 		}
++ 	}
++ }
++ 
++ static void vfio_ap_mdev_hot_unplug_adapter(struct ap_matrix_mdev *matrix_mdev,
++ 					    unsigned long apid)
++ {
++ 	int loop_cursor;
++ 	struct vfio_ap_queue *q;
++ 	struct ap_queue_table *qtable = kzalloc(sizeof(*qtable), GFP_KERNEL);
++ 
++ 	hash_init(qtable->queues);
++ 	vfio_ap_mdev_unlink_adapter(matrix_mdev, apid, qtable);
++ 
++ 	if (test_bit_inv(apid, matrix_mdev->shadow_apcb.apm)) {
++ 		clear_bit_inv(apid, matrix_mdev->shadow_apcb.apm);
++ 		vfio_ap_mdev_update_guest_apcb(matrix_mdev);
++ 	}
++ 
++ 	vfio_ap_mdev_reset_queues(qtable);
++ 
++ 	hash_for_each(qtable->queues, loop_cursor, q, mdev_qnode) {
++ 		vfio_ap_unlink_mdev_fr_queue(q);
++ 		hash_del(&q->mdev_qnode);
++ 	}
++ 
++ 	kfree(qtable);
++ }
++ 
+++>>>>>>> 70aeefe574cb (s390/vfio-ap: reset queues after adapter/domain unassignment)
+  /**
+   * unassign_adapter_store - parses the APID from @buf and clears the
+   * corresponding bit in the mediated matrix device's APM
+@@@ -685,9 -1101,10 +906,13 @@@ static ssize_t unassign_adapter_store(s
+  	}
+  
+  	clear_bit_inv((unsigned long)apid, matrix_mdev->matrix.apm);
+++<<<<<<< HEAD
+++=======
++ 	vfio_ap_mdev_hot_unplug_adapter(matrix_mdev, apid);
+++>>>>>>> 70aeefe574cb (s390/vfio-ap: reset queues after adapter/domain unassignment)
+  	ret = count;
+  done:
+ -	release_update_locks_for_mdev(matrix_mdev);
+ +	mutex_unlock(&matrix_dev->lock);
+  	return ret;
+  }
+  static DEVICE_ATTR_WO(unassign_adapter);
+@@@ -790,6 -1193,49 +1015,52 @@@ done
+  }
+  static DEVICE_ATTR_WO(assign_domain);
+  
+++<<<<<<< HEAD
+++=======
++ static void vfio_ap_mdev_unlink_domain(struct ap_matrix_mdev *matrix_mdev,
++ 				       unsigned long apqi,
++ 				       struct ap_queue_table *qtable)
++ {
++ 	unsigned long apid;
++ 	struct vfio_ap_queue *q;
++ 
++ 	for_each_set_bit_inv(apid, matrix_mdev->matrix.apm, AP_DEVICES) {
++ 		q = vfio_ap_unlink_apqn_fr_mdev(matrix_mdev, apid, apqi);
++ 
++ 		if (q && qtable) {
++ 			if (test_bit_inv(apid, matrix_mdev->shadow_apcb.apm) &&
++ 			    test_bit_inv(apqi, matrix_mdev->shadow_apcb.aqm))
++ 				hash_add(qtable->queues, &q->mdev_qnode,
++ 					 q->apqn);
++ 		}
++ 	}
++ }
+++>>>>>>> 70aeefe574cb (s390/vfio-ap: reset queues after adapter/domain unassignment)
++ 
++ static void vfio_ap_mdev_hot_unplug_domain(struct ap_matrix_mdev *matrix_mdev,
++ 					   unsigned long apqi)
++ {
++ 	int loop_cursor;
++ 	struct vfio_ap_queue *q;
++ 	struct ap_queue_table *qtable = kzalloc(sizeof(*qtable), GFP_KERNEL);
++ 
++ 	hash_init(qtable->queues);
++ 	vfio_ap_mdev_unlink_domain(matrix_mdev, apqi, qtable);
++ 
++ 	if (test_bit_inv(apqi, matrix_mdev->shadow_apcb.aqm)) {
++ 		clear_bit_inv(apqi, matrix_mdev->shadow_apcb.aqm);
++ 		vfio_ap_mdev_update_guest_apcb(matrix_mdev);
++ 	}
++ 
++ 	vfio_ap_mdev_reset_queues(qtable);
++ 
++ 	hash_for_each(qtable->queues, loop_cursor, q, mdev_qnode) {
++ 		vfio_ap_unlink_mdev_fr_queue(q);
++ 		hash_del(&q->mdev_qnode);
++ 	}
++ 
++ 	kfree(qtable);
++ }
+  
+  /**
+   * unassign_domain_store - parses the APQI from @buf and clears the
+@@@ -833,6 -1272,7 +1104,10 @@@ static ssize_t unassign_domain_store(st
+  	}
+  
+  	clear_bit_inv((unsigned long)apqi, matrix_mdev->matrix.aqm);
+++<<<<<<< HEAD
+++=======
++ 	vfio_ap_mdev_hot_unplug_domain(matrix_mdev, apqi);
+++>>>>>>> 70aeefe574cb (s390/vfio-ap: reset queues after adapter/domain unassignment)
+  	ret = count;
+  
+  done:
+@@@ -1141,11 -1554,10 +1416,15 @@@ static void vfio_ap_mdev_unset_kvm(stru
+  		kvm->arch.crypto.pqap_hook = NULL;
+  		up_write(&kvm->arch.crypto.pqap_hook_rwsem);
+  
+ -		get_update_locks_for_kvm(kvm);
+ +		mutex_lock(&kvm->lock);
+ +		mutex_lock(&matrix_dev->lock);
+  
+  		kvm_arch_crypto_clear_masks(kvm);
+++<<<<<<< HEAD
+ +		vfio_ap_mdev_reset_queues(matrix_mdev->mdev);
+++=======
++ 		vfio_ap_mdev_reset_queues(&matrix_mdev->qtable);
+++>>>>>>> 70aeefe574cb (s390/vfio-ap: reset queues after adapter/domain unassignment)
+  		kvm_put_kvm(kvm);
+  		matrix_mdev->kvm = NULL;
+  
+@@@ -1241,28 -1639,20 +1526,44 @@@ free_resources
+  	return ret;
+  }
+  
+++<<<<<<< HEAD
+ +static int vfio_ap_mdev_reset_queues(struct mdev_device *mdev)
+++=======
++ static int vfio_ap_mdev_reset_queues(struct ap_queue_table *qtable)
+++>>>>>>> 70aeefe574cb (s390/vfio-ap: reset queues after adapter/domain unassignment)
+  {
+ -	int ret, loop_cursor, rc = 0;
+ +	int ret;
+ +	int rc = 0;
+ +	unsigned long apid, apqi;
+  	struct vfio_ap_queue *q;
+ +	struct ap_matrix_mdev *matrix_mdev = mdev_get_drvdata(mdev);
+  
+++<<<<<<< HEAD
+ +	for_each_set_bit_inv(apid, matrix_mdev->matrix.apm,
+ +			     matrix_mdev->matrix.apm_max + 1) {
+ +		for_each_set_bit_inv(apqi, matrix_mdev->matrix.aqm,
+ +				     matrix_mdev->matrix.aqm_max + 1) {
+ +			q = vfio_ap_find_queue(AP_MKQID(apid, apqi));
+ +			ret = vfio_ap_mdev_reset_queue(q, 1);
+ +			/*
+ +			 * Regardless whether a queue turns out to be busy, or
+ +			 * is not operational, we need to continue resetting
+ +			 * the remaining queues.
+ +			 */
+ +			if (ret)
+ +				rc = ret;
+ +		}
+++=======
++ 	hash_for_each(qtable->queues, loop_cursor, q, mdev_qnode) {
++ 		ret = vfio_ap_mdev_reset_queue(q, 1);
++ 		/*
++ 		 * Regardless whether a queue turns out to be busy, or
++ 		 * is not operational, we need to continue resetting
++ 		 * the remaining queues.
++ 		 */
++ 		if (ret)
++ 			rc = ret;
+++>>>>>>> 70aeefe574cb (s390/vfio-ap: reset queues after adapter/domain unassignment)
+  	}
+  
+  	return rc;
+@@@ -1345,13 -1728,7 +1646,17 @@@ static ssize_t vfio_ap_mdev_ioctl(struc
+  		ret = vfio_ap_mdev_get_device_info(arg);
+  		break;
+  	case VFIO_DEVICE_RESET:
+++<<<<<<< HEAD
+ +		matrix_mdev = mdev_get_drvdata(mdev);
+ +		if (WARN(!matrix_mdev, "Driver data missing from mdev!!")) {
+ +			ret = -EINVAL;
+ +			break;
+ +		}
+ +
+ +		ret = vfio_ap_mdev_reset_queues(mdev);
+++=======
++ 		ret = vfio_ap_mdev_reset_queues(&matrix_mdev->qtable);
+++>>>>>>> 70aeefe574cb (s390/vfio-ap: reset queues after adapter/domain unassignment)
+  		break;
+  	default:
+  		ret = -EOPNOTSUPP;
+diff --cc drivers/s390/crypto/vfio_ap_private.h
+index 104c59398001,dd81b3da0235..000000000000
+--- a/drivers/s390/crypto/vfio_ap_private.h
++++ b/drivers/s390/crypto/vfio_ap_private.h
+@@@ -112,6 -125,8 +112,11 @@@ struct ap_matrix_mdev 
+   * @saved_pfn: the guest PFN pinned for the guest
+   * @apqn: the APQN of the AP queue device
+   * @saved_isc: the guest ISC registered with the GIB interface
+++<<<<<<< HEAD
+++=======
++  * @mdev_qnode: allows the vfio_ap_queue struct to be added to a hashtable
++  * @reset_rc: the status response code from the last reset of the queue
+++>>>>>>> 70aeefe574cb (s390/vfio-ap: reset queues after adapter/domain unassignment)
+   */
+  struct vfio_ap_queue {
+  	struct ap_matrix_mdev *matrix_mdev;
+@@@ -119,6 -134,8 +124,11 @@@
+  	int	apqn;
+  #define VFIO_AP_ISC_INVALID 0xff
+  	unsigned char saved_isc;
+++<<<<<<< HEAD
+++=======
++ 	struct hlist_node mdev_qnode;
++ 	unsigned int reset_rc;
+++>>>>>>> 70aeefe574cb (s390/vfio-ap: reset queues after adapter/domain unassignment)
+  };
+  
+  int vfio_ap_mdev_register(void);
+* Unmerged path drivers/s390/crypto/vfio_ap_ops.c
+* Unmerged path drivers/s390/crypto/vfio_ap_private.h
