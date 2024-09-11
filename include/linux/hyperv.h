@@ -797,6 +797,7 @@ struct vmbus_device {
 	u16  dev_type;
 	guid_t guid;
 	bool perf_device;
+	bool allowed_in_isolated;
 };
 
 struct vmbus_channel {
