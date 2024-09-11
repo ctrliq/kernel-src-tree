@@ -3388,10 +3388,9 @@ static int mlx5e_modify_channels_vsd(struct mlx5e_channels *chs, bool vsd)
 	return 0;
 }
 
-static int mlx5e_setup_tc_mqprio(struct net_device *netdev,
+static int mlx5e_setup_tc_mqprio(struct mlx5e_priv *priv,
 				 struct tc_mqprio_qopt *mqprio)
 {
-	struct mlx5e_priv *priv = netdev_priv(netdev);
 	struct mlx5e_channels new_channels = {};
 	u8 tc = mqprio->num_tc;
 	int err = 0;
@@ -3488,7 +3487,7 @@ static int mlx5e_setup_tc(struct net_device *dev, enum tc_setup_type type,
 		return mlx5e_setup_tc_block(dev, type_data);
 #endif
 	case TC_SETUP_QDISC_MQPRIO:
-		return mlx5e_setup_tc_mqprio(dev, type_data);
+		return mlx5e_setup_tc_mqprio(priv, type_data);
 	default:
 		return -EOPNOTSUPP;
 	}
