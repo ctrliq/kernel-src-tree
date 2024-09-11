@@ -1,0 +1,209 @@
+powerpc/mm/radix: Fix PTE/PMD fragment count for early page table mappings
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Aneesh Kumar K.V <aneesh.kumar@linux.ibm.com>
+commit 645d5ce2f7d6cb4dcf6a4e087fb550e238d24283
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/645d5ce2.failed
+
+We can hit the following BUG_ON during memory unplug:
+
+kernel BUG at arch/powerpc/mm/book3s64/pgtable.c:342!
+Oops: Exception in kernel mode, sig: 5 [#1]
+LE PAGE_SIZE=64K MMU=Radix SMP NR_CPUS=2048 NUMA pSeries
+NIP [c000000000093308] pmd_fragment_free+0x48/0xc0
+LR [c00000000147bfec] remove_pagetable+0x578/0x60c
+Call Trace:
+0xc000008050000000 (unreliable)
+remove_pagetable+0x384/0x60c
+radix__remove_section_mapping+0x18/0x2c
+remove_section_mapping+0x1c/0x3c
+arch_remove_memory+0x11c/0x180
+try_remove_memory+0x120/0x1b0
+__remove_memory+0x20/0x40
+dlpar_remove_lmb+0xc0/0x114
+dlpar_memory+0x8b0/0xb20
+handle_dlpar_errorlog+0xc0/0x190
+pseries_hp_work_fn+0x2c/0x60
+process_one_work+0x30c/0x810
+worker_thread+0x98/0x540
+kthread+0x1c4/0x1d0
+ret_from_kernel_thread+0x5c/0x74
+
+This occurs when unplug is attempted for such memory which has
+been mapped using memblock pages as part of early kernel page
+table setup. We wouldn't have initialized the PMD or PTE fragment
+count for those PMD or PTE pages.
+
+This can be fixed by allocating memory in PAGE_SIZE granularity
+during early page table allocation. This makes sure a specific
+page is not shared for another memblock allocation and we can
+free them correctly on removing page-table pages.
+
+Since we now do PAGE_SIZE allocations for both PUD table and
+PMD table (Note that PTE table allocation is already of PAGE_SIZE),
+we end up allocating more memory for the same amount of system RAM.
+Here is a comparision of how much more we need for a 64T and 2G
+system after this patch:
+
+1. 64T system
+-------------
+64T RAM would need 64G for vmemmap with struct page size being 64B.
+
+128 PUD tables for 64T memory (1G mappings)
+1 PUD table and 64 PMD tables for 64G vmemmap (2M mappings)
+
+With default PUD[PMD]_TABLE_SIZE(4K), (128+1+64)*4K=772K
+With PAGE_SIZE(64K) table allocations, (128+1+64)*64K=12352K
+
+2. 2G system
+------------
+2G RAM would need 2M for vmemmap with struct page size being 64B.
+
+1 PUD table for 2G memory (1G mapping)
+1 PUD table and 1 PMD table for 2M vmemmap (2M mappings)
+
+With default PUD[PMD]_TABLE_SIZE(4K), (1+1+1)*4K=12K
+With new PAGE_SIZE(64K) table allocations, (1+1+1)*64K=192K
+
+	Signed-off-by: Bharata B Rao <bharata@linux.ibm.com>
+	Signed-off-by: Aneesh Kumar K.V <aneesh.kumar@linux.ibm.com>
+	Signed-off-by: Michael Ellerman <mpe@ellerman.id.au>
+Link: https://lore.kernel.org/r/20200709131925.922266-2-aneesh.kumar@linux.ibm.com
+(cherry picked from commit 645d5ce2f7d6cb4dcf6a4e087fb550e238d24283)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/powerpc/mm/book3s64/radix_pgtable.c
+#	arch/powerpc/mm/pgtable-frag.c
+diff --cc arch/powerpc/mm/book3s64/radix_pgtable.c
+index e1a99bba24b3,85806a6bed4d..000000000000
+--- a/arch/powerpc/mm/book3s64/radix_pgtable.c
++++ b/arch/powerpc/mm/book3s64/radix_pgtable.c
+@@@ -52,28 -38,31 +52,35 @@@ static int native_register_process_tabl
+  static __ref void *early_alloc_pgtable(unsigned long size, int nid,
+  			unsigned long region_start, unsigned long region_end)
+  {
+ -	phys_addr_t min_addr = MEMBLOCK_LOW_LIMIT;
+ -	phys_addr_t max_addr = MEMBLOCK_ALLOC_ANYWHERE;
+ -	void *ptr;
+ +	unsigned long pa = 0;
+ +	void *pt;
+  
+ -	if (region_start)
+ -		min_addr = region_start;
+ -	if (region_end)
+ -		max_addr = region_end;
+ +	if (region_start || region_end) /* has region hint */
+ +		pa = memblock_alloc_range(size, size, region_start, region_end,
+ +						MEMBLOCK_NONE);
+ +	else if (nid != -1) /* has node hint */
+ +		pa = memblock_alloc_base_nid(size, size,
+ +						MEMBLOCK_ALLOC_ANYWHERE,
+ +						nid, MEMBLOCK_NONE);
+  
+ -	ptr = memblock_alloc_try_nid(size, size, min_addr, max_addr, nid);
+ +	if (!pa)
+ +		pa = memblock_alloc_base(size, size, MEMBLOCK_ALLOC_ANYWHERE);
+  
+ -	if (!ptr)
+ -		panic("%s: Failed to allocate %lu bytes align=0x%lx nid=%d from=%pa max_addr=%pa\n",
+ -		      __func__, size, size, nid, &min_addr, &max_addr);
+ +	BUG_ON(!pa);
+  
+ -	return ptr;
+ +	pt = __va(pa);
+ +	memset(pt, 0, size);
+ +
+ +	return pt;
+  }
+  
++ /*
++  * When allocating pud or pmd pointers, we allocate a complete page
++  * of PAGE_SIZE rather than PUD_TABLE_SIZE or PMD_TABLE_SIZE. This
++  * is to ensure that the page obtained from the memblock allocator
++  * can be completely used as page table page and can be freed
++  * correctly when the page table entries are removed.
++  */
+  static int early_map_kernel_page(unsigned long ea, unsigned long pa,
+  			  pgprot_t flags,
+  			  unsigned int map_page_size,
+@@@ -87,12 -77,13 +94,20 @@@
+  	pte_t *ptep;
+  
+  	pgdp = pgd_offset_k(ea);
+++<<<<<<< HEAD
+ +	if (pgd_none(*pgdp)) {
+ +		pudp = early_alloc_pgtable(PUD_TABLE_SIZE, nid,
+ +						region_start, region_end);
+ +		pgd_populate(&init_mm, pgdp, pudp);
+++=======
++ 	p4dp = p4d_offset(pgdp, ea);
++ 	if (p4d_none(*p4dp)) {
++ 		pudp = early_alloc_pgtable(PAGE_SIZE, nid,
++ 					   region_start, region_end);
++ 		p4d_populate(&init_mm, p4dp, pudp);
+++>>>>>>> 645d5ce2f7d6 (powerpc/mm/radix: Fix PTE/PMD fragment count for early page table mappings)
+  	}
+ -	pudp = pud_offset(p4dp, ea);
+ +	pudp = pud_offset(pgdp, ea);
+  	if (map_page_size == PUD_SIZE) {
+  		ptep = (pte_t *)pudp;
+  		goto set_the_pte;
+* Unmerged path arch/powerpc/mm/pgtable-frag.c
+diff --git a/arch/powerpc/include/asm/book3s/64/pgalloc.h b/arch/powerpc/include/asm/book3s/64/pgalloc.h
+index 39e5b697d581..7d9148b958d1 100644
+--- a/arch/powerpc/include/asm/book3s/64/pgalloc.h
++++ b/arch/powerpc/include/asm/book3s/64/pgalloc.h
+@@ -136,9 +136,23 @@ static inline pud_t *pud_alloc_one(struct mm_struct *mm, unsigned long addr)
+ 	return pud;
+ }
+ 
++static inline void __pud_free(pud_t *pud)
++{
++	struct page *page = virt_to_page(pud);
++
++	/*
++	 * Early pud pages allocated via memblock allocator
++	 * can't be directly freed to slab
++	 */
++	if (PageReserved(page))
++		free_reserved_page(page);
++	else
++		kmem_cache_free(PGT_CACHE(PUD_CACHE_INDEX), pud);
++}
++
+ static inline void pud_free(struct mm_struct *mm, pud_t *pud)
+ {
+-	kmem_cache_free(PGT_CACHE(PUD_CACHE_INDEX), pud);
++	return __pud_free(pud);
+ }
+ 
+ static inline void pud_populate(struct mm_struct *mm, pud_t *pud, pmd_t *pmd)
+diff --git a/arch/powerpc/mm/book3s64/pgtable.c b/arch/powerpc/mm/book3s64/pgtable.c
+index e3da07e289f2..35cda10bd692 100644
+--- a/arch/powerpc/mm/book3s64/pgtable.c
++++ b/arch/powerpc/mm/book3s64/pgtable.c
+@@ -347,6 +347,9 @@ void pmd_fragment_free(unsigned long *pmd)
+ {
+ 	struct page *page = virt_to_page(pmd);
+ 
++	if (PageReserved(page))
++		return free_reserved_page(page);
++
+ 	BUG_ON(atomic_read(&page->pt_frag_refcount) <= 0);
+ 	if (atomic_dec_and_test(&page->pt_frag_refcount)) {
+ 		pgtable_pmd_page_dtor(page);
+@@ -449,7 +452,7 @@ static inline void pgtable_free(void *table, int index)
+ 		pmd_fragment_free(table);
+ 		break;
+ 	case PUD_INDEX:
+-		kmem_cache_free(PGT_CACHE(PUD_CACHE_INDEX), table);
++		__pud_free(table);
+ 		break;
+ #if defined(CONFIG_PPC_4K_PAGES) && defined(CONFIG_HUGETLB_PAGE)
+ 		/* 16M hugepd directory at pud level */
+* Unmerged path arch/powerpc/mm/book3s64/radix_pgtable.c
+* Unmerged path arch/powerpc/mm/pgtable-frag.c
