@@ -1,0 +1,171 @@
+RDMA/mlx5: Move netdev info into the port struct
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-193.el8
+commit-author Mark Bloch <markb@mellanox.com>
+commit 95579e785a9ae7d98c199b38c4b79b64a31d90fa
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-193.el8/95579e78.failed
+
+Netdev info is stored in a separate array and holds data relevant on a per
+port basis, move it to be part of the port struct.
+
+	Signed-off-by: Mark Bloch <markb@mellanox.com>
+	Signed-off-by: Leon Romanovsky <leonro@mellanox.com>
+	Signed-off-by: Jason Gunthorpe <jgg@mellanox.com>
+(cherry picked from commit 95579e785a9ae7d98c199b38c4b79b64a31d90fa)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/infiniband/hw/mlx5/qp.c
+diff --cc drivers/infiniband/hw/mlx5/qp.c
+index 83a4d3984747,db03b2768a9d..000000000000
+--- a/drivers/infiniband/hw/mlx5/qp.c
++++ b/drivers/infiniband/hw/mlx5/qp.c
+@@@ -3399,8 -3408,9 +3399,14 @@@ static int __mlx5_ib_modify_qp(struct i
+  		    (ibqp->qp_type == IB_QPT_XRC_INI) ||
+  		    (ibqp->qp_type == IB_QPT_XRC_TGT)) {
+  			if (dev->lag_active) {
+++<<<<<<< HEAD
+ +				u8 p = mlx5_core_native_port_num(dev->mdev);
+ +				tx_affinity = get_tx_affinity(dev, pd, base, p);
+++=======
++ 				u8 p = mlx5_core_native_port_num(dev->mdev) - 1;
++ 				tx_affinity = get_tx_affinity(dev, pd, base, p,
++ 							      udata);
+++>>>>>>> 95579e785a9a (RDMA/mlx5: Move netdev info into the port struct)
+  				context->flags |= cpu_to_be32(tx_affinity << 24);
+  			}
+  		}
+diff --git a/drivers/infiniband/hw/mlx5/main.c b/drivers/infiniband/hw/mlx5/main.c
+index 5fcf98302272..ddb3b1b2cf2a 100644
+--- a/drivers/infiniband/hw/mlx5/main.c
++++ b/drivers/infiniband/hw/mlx5/main.c
+@@ -257,11 +257,11 @@ static struct net_device *mlx5_ib_get_netdev(struct ib_device *device,
+ 
+ 	/* Ensure ndev does not disappear before we invoke dev_hold()
+ 	 */
+-	read_lock(&ibdev->roce[port_num - 1].netdev_lock);
+-	ndev = ibdev->roce[port_num - 1].netdev;
++	read_lock(&ibdev->port[port_num - 1].roce.netdev_lock);
++	ndev = ibdev->port[port_num - 1].roce.netdev;
+ 	if (ndev)
+ 		dev_hold(ndev);
+-	read_unlock(&ibdev->roce[port_num - 1].netdev_lock);
++	read_unlock(&ibdev->port[port_num - 1].roce.netdev_lock);
+ 
+ out:
+ 	mlx5_ib_put_native_port_mdev(ibdev, port_num);
+@@ -1959,11 +1959,11 @@ static struct ib_ucontext *mlx5_ib_alloc_ucontext(struct ib_device *ibdev,
+ 	print_lib_caps(dev, context->lib_caps);
+ 
+ 	if (dev->lag_active) {
+-		u8 port = mlx5_core_native_port_num(dev->mdev);
++		u8 port = mlx5_core_native_port_num(dev->mdev) - 1;
+ 
+ 		atomic_set(&context->tx_port_affinity,
+ 			   atomic_add_return(
+-				   1, &dev->roce[port].tx_port_affinity));
++				   1, &dev->port[port].roce.tx_port_affinity));
+ 	}
+ 
+ 	return &context->ibucontext;
+@@ -5025,10 +5025,10 @@ static int mlx5_add_netdev_notifier(struct mlx5_ib_dev *dev, u8 port_num)
+ {
+ 	int err;
+ 
+-	dev->roce[port_num].nb.notifier_call = mlx5_netdev_event;
+-	err = register_netdevice_notifier(&dev->roce[port_num].nb);
++	dev->port[port_num].roce.nb.notifier_call = mlx5_netdev_event;
++	err = register_netdevice_notifier(&dev->port[port_num].roce.nb);
+ 	if (err) {
+-		dev->roce[port_num].nb.notifier_call = NULL;
++		dev->port[port_num].roce.nb.notifier_call = NULL;
+ 		return err;
+ 	}
+ 
+@@ -5037,9 +5037,9 @@ static int mlx5_add_netdev_notifier(struct mlx5_ib_dev *dev, u8 port_num)
+ 
+ static void mlx5_remove_netdev_notifier(struct mlx5_ib_dev *dev, u8 port_num)
+ {
+-	if (dev->roce[port_num].nb.notifier_call) {
+-		unregister_netdevice_notifier(&dev->roce[port_num].nb);
+-		dev->roce[port_num].nb.notifier_call = NULL;
++	if (dev->port[port_num].roce.nb.notifier_call) {
++		unregister_netdevice_notifier(&dev->port[port_num].roce.nb);
++		dev->port[port_num].roce.nb.notifier_call = NULL;
+ 	}
+ }
+ 
+@@ -5588,7 +5588,7 @@ static void mlx5_ib_unbind_slave_port(struct mlx5_ib_dev *ibdev,
+ 		mlx5_ib_err(ibdev, "Failed to unaffiliate port %u\n",
+ 			    port_num + 1);
+ 
+-	ibdev->roce[port_num].last_port_state = IB_PORT_DOWN;
++	ibdev->port[port_num].roce.last_port_state = IB_PORT_DOWN;
+ }
+ 
+ /* The mlx5_ib_multiport_mutex should be held when calling this function */
+@@ -5863,7 +5863,7 @@ int mlx5_ib_stage_init_init(struct mlx5_ib_dev *dev)
+ 
+ 	for (i = 0; i < dev->num_ports; i++) {
+ 		spin_lock_init(&dev->port[i].mp.mpi_lock);
+-		rwlock_init(&dev->roce[i].netdev_lock);
++		rwlock_init(&dev->port[i].roce.netdev_lock);
+ 	}
+ 
+ 	err = mlx5_ib_init_multiport_master(dev);
+@@ -6161,9 +6161,9 @@ static int mlx5_ib_stage_common_roce_init(struct mlx5_ib_dev *dev)
+ 	int i;
+ 
+ 	for (i = 0; i < dev->num_ports; i++) {
+-		dev->roce[i].dev = dev;
+-		dev->roce[i].native_port_num = i + 1;
+-		dev->roce[i].last_port_state = IB_PORT_DOWN;
++		dev->port[i].roce.dev = dev;
++		dev->port[i].roce.native_port_num = i + 1;
++		dev->port[i].roce.last_port_state = IB_PORT_DOWN;
+ 	}
+ 
+ 	dev->ib_dev.uverbs_ex_cmd_mask |=
+diff --git a/drivers/infiniband/hw/mlx5/mlx5_ib.h b/drivers/infiniband/hw/mlx5/mlx5_ib.h
+index d77f0cb4a75e..17526143b308 100644
+--- a/drivers/infiniband/hw/mlx5/mlx5_ib.h
++++ b/drivers/infiniband/hw/mlx5/mlx5_ib.h
+@@ -705,12 +705,6 @@ struct mlx5_ib_multiport {
+ 	spinlock_t mpi_lock;
+ };
+ 
+-struct mlx5_ib_port {
+-	struct mlx5_ib_counters cnts;
+-	struct mlx5_ib_multiport mp;
+-	struct mlx5_ib_dbg_cc_params	*dbg_cc_params;
+-};
+-
+ struct mlx5_roce {
+ 	/* Protect mlx5_ib_get_netdev from invoking dev_hold() with a NULL
+ 	 * netdev pointer
+@@ -724,6 +718,13 @@ struct mlx5_roce {
+ 	u8			native_port_num;
+ };
+ 
++struct mlx5_ib_port {
++	struct mlx5_ib_counters cnts;
++	struct mlx5_ib_multiport mp;
++	struct mlx5_ib_dbg_cc_params *dbg_cc_params;
++	struct mlx5_roce roce;
++};
++
+ struct mlx5_ib_dbg_param {
+ 	int			offset;
+ 	struct mlx5_ib_dev	*dev;
+@@ -908,7 +909,6 @@ struct mlx5_ib_dev {
+ 	struct ib_device		ib_dev;
+ 	struct mlx5_core_dev		*mdev;
+ 	struct notifier_block		mdev_events;
+-	struct mlx5_roce		roce[MLX5_MAX_PORTS];
+ 	int				num_ports;
+ 	/* serialize update of capability mask
+ 	 */
+* Unmerged path drivers/infiniband/hw/mlx5/qp.c
