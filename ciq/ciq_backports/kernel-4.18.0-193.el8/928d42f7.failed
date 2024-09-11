@@ -1,0 +1,251 @@
+SUNRPC: Handle the SYSTEM_ERR rpc error
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-193.el8
+commit-author Trond Myklebust <trond.myklebust@hammerspace.com>
+commit 928d42f7d8737e1d6327e09668525f59725dabf9
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-193.el8/928d42f7.failed
+
+Handle the SYSTEM_ERR rpc error by retrying the RPC call as if it
+were a garbage argument.
+
+	Signed-off-by: Trond Myklebust <trond.myklebust@hammerspace.com>
+(cherry picked from commit 928d42f7d8737e1d6327e09668525f59725dabf9)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/sunrpc/clnt.c
+diff --cc net/sunrpc/clnt.c
+index 4c9385209a04,cb73d6c25857..000000000000
+--- a/net/sunrpc/clnt.c
++++ b/net/sunrpc/clnt.c
+@@@ -2333,158 -2426,83 +2333,166 @@@ rpc_encode_header(struct rpc_task *task
+  {
+  	struct rpc_clnt *clnt = task->tk_client;
+  	struct rpc_rqst	*req = task->tk_rqstp;
+ -	__be32 *p;
+ -	int error;
+ -
+ -	error = -EMSGSIZE;
+ -	p = xdr_reserve_space(xdr, RPC_CALLHDRSIZE << 2);
+ -	if (!p)
+ -		goto out_fail;
+ -	*p++ = req->rq_xid;
+ -	*p++ = rpc_call;
+ -	*p++ = cpu_to_be32(RPC_VERSION);
+ -	*p++ = cpu_to_be32(clnt->cl_prog);
+ -	*p++ = cpu_to_be32(clnt->cl_vers);
+ -	*p   = cpu_to_be32(task->tk_msg.rpc_proc->p_proc);
+ -
+ -	error = rpcauth_marshcred(task, xdr);
+ -	if (error < 0)
+ -		goto out_fail;
+ -	return 0;
+ -out_fail:
+ -	trace_rpc_bad_callhdr(task);
+ -	rpc_exit(task, error);
+ -	return error;
+ +	__be32		*p = req->rq_svec[0].iov_base;
+ +
+ +	/* FIXME: check buffer size? */
+ +
+ +	*p++ = req->rq_xid;		/* XID */
+ +	*p++ = htonl(RPC_CALL);		/* CALL */
+ +	*p++ = htonl(RPC_VERSION);	/* RPC version */
+ +	*p++ = htonl(clnt->cl_prog);	/* program number */
+ +	*p++ = htonl(clnt->cl_vers);	/* program version */
+ +	*p++ = htonl(task->tk_msg.rpc_proc->p_proc);	/* procedure */
+ +	p = rpcauth_marshcred(task, p);
+ +	req->rq_slen = xdr_adjust_iovec(&req->rq_svec[0], p);
+ +	return p;
+  }
+  
+ -static noinline int
+ -rpc_decode_header(struct rpc_task *task, struct xdr_stream *xdr)
+ +static __be32 *
+ +rpc_verify_header(struct rpc_task *task)
+  {
+  	struct rpc_clnt *clnt = task->tk_client;
+ -	int error;
+ -	__be32 *p;
+ +	struct kvec *iov = &task->tk_rqstp->rq_rcv_buf.head[0];
+ +	int len = task->tk_rqstp->rq_rcv_buf.len >> 2;
+ +	__be32	*p = iov->iov_base;
+ +	u32 n;
+ +	int error = -EACCES;
+ +
+ +	if ((task->tk_rqstp->rq_rcv_buf.len & 3) != 0) {
+ +		/* RFC-1014 says that the representation of XDR data must be a
+ +		 * multiple of four bytes
+ +		 * - if it isn't pointer subtraction in the NFS client may give
+ +		 *   undefined results
+ +		 */
+ +		dprintk("RPC: %5u %s: XDR representation not a multiple of"
+ +		       " 4 bytes: 0x%x\n", task->tk_pid, __func__,
+ +		       task->tk_rqstp->rq_rcv_buf.len);
+ +		error = -EIO;
+ +		goto out_err;
+ +	}
+ +	if ((len -= 3) < 0)
+ +		goto out_overflow;
+  
+ -	/* RFC-1014 says that the representation of XDR data must be a
+ -	 * multiple of four bytes
+ -	 * - if it isn't pointer subtraction in the NFS client may give
+ -	 *   undefined results
+ -	 */
+ -	if (task->tk_rqstp->rq_rcv_buf.len & 3)
+ -		goto out_unparsable;
+ -
+ -	p = xdr_inline_decode(xdr, 3 * sizeof(*p));
+ -	if (!p)
+ -		goto out_unparsable;
+ -	p++;	/* skip XID */
+ -	if (*p++ != rpc_reply)
+ -		goto out_unparsable;
+ -	if (*p++ != rpc_msg_accepted)
+ -		goto out_msg_denied;
+ -
+ -	error = rpcauth_checkverf(task, xdr);
+ -	if (error)
+ -		goto out_verifier;
+ -
+ -	p = xdr_inline_decode(xdr, sizeof(*p));
+ -	if (!p)
+ -		goto out_unparsable;
+ -	switch (*p) {
+ -	case rpc_success:
+ -		return 0;
+ -	case rpc_prog_unavail:
+ -		trace_rpc__prog_unavail(task);
+ +	p += 1; /* skip XID */
+ +	if ((n = ntohl(*p++)) != RPC_REPLY) {
+ +		dprintk("RPC: %5u %s: not an RPC reply: %x\n",
+ +			task->tk_pid, __func__, n);
+ +		error = -EIO;
+ +		goto out_garbage;
+ +	}
+ +
+ +	if ((n = ntohl(*p++)) != RPC_MSG_ACCEPTED) {
+ +		if (--len < 0)
+ +			goto out_overflow;
+ +		switch ((n = ntohl(*p++))) {
+ +		case RPC_AUTH_ERROR:
+ +			break;
+ +		case RPC_MISMATCH:
+ +			dprintk("RPC: %5u %s: RPC call version mismatch!\n",
+ +				task->tk_pid, __func__);
+ +			error = -EPROTONOSUPPORT;
+ +			goto out_err;
+ +		default:
+ +			dprintk("RPC: %5u %s: RPC call rejected, "
+ +				"unknown error: %x\n",
+ +				task->tk_pid, __func__, n);
+ +			error = -EIO;
+ +			goto out_err;
+ +		}
+ +		if (--len < 0)
+ +			goto out_overflow;
+ +		switch ((n = ntohl(*p++))) {
+ +		case RPC_AUTH_REJECTEDCRED:
+ +		case RPC_AUTH_REJECTEDVERF:
+ +		case RPCSEC_GSS_CREDPROBLEM:
+ +		case RPCSEC_GSS_CTXPROBLEM:
+ +			if (!task->tk_cred_retry)
+ +				break;
+ +			task->tk_cred_retry--;
+ +			dprintk("RPC: %5u %s: retry stale creds\n",
+ +					task->tk_pid, __func__);
+ +			rpcauth_invalcred(task);
+ +			/* Ensure we obtain a new XID! */
+ +			xprt_release(task);
+ +			task->tk_action = call_reserve;
+ +			goto out_retry;
+ +		case RPC_AUTH_BADCRED:
+ +		case RPC_AUTH_BADVERF:
+ +			/* possibly garbled cred/verf? */
+ +			if (!task->tk_garb_retry)
+ +				break;
+ +			task->tk_garb_retry--;
+ +			dprintk("RPC: %5u %s: retry garbled creds\n",
+ +					task->tk_pid, __func__);
+ +			task->tk_action = call_bind;
+ +			goto out_retry;
+ +		case RPC_AUTH_TOOWEAK:
+ +			printk(KERN_NOTICE "RPC: server %s requires stronger "
+ +			       "authentication.\n",
+ +			       task->tk_xprt->servername);
+ +			break;
+ +		default:
+ +			dprintk("RPC: %5u %s: unknown auth error: %x\n",
+ +					task->tk_pid, __func__, n);
+ +			error = -EIO;
+ +		}
+ +		dprintk("RPC: %5u %s: call rejected %d\n",
+ +				task->tk_pid, __func__, n);
+ +		goto out_err;
+ +	}
+ +	p = rpcauth_checkverf(task, p);
+ +	if (IS_ERR(p)) {
+ +		error = PTR_ERR(p);
+ +		dprintk("RPC: %5u %s: auth check failed with %d\n",
+ +				task->tk_pid, __func__, error);
+ +		goto out_garbage;		/* bad verifier, retry */
+ +	}
+ +	len = p - (__be32 *)iov->iov_base - 1;
+ +	if (len < 0)
+ +		goto out_overflow;
+ +	switch ((n = ntohl(*p++))) {
+ +	case RPC_SUCCESS:
+ +		return p;
+ +	case RPC_PROG_UNAVAIL:
+ +		dprintk("RPC: %5u %s: program %u is unsupported "
+ +				"by server %s\n", task->tk_pid, __func__,
+ +				(unsigned int)clnt->cl_prog,
+ +				task->tk_xprt->servername);
+  		error = -EPFNOSUPPORT;
+  		goto out_err;
+ -	case rpc_prog_mismatch:
+ -		trace_rpc__prog_mismatch(task);
+ +	case RPC_PROG_MISMATCH:
+ +		dprintk("RPC: %5u %s: program %u, version %u unsupported "
+ +				"by server %s\n", task->tk_pid, __func__,
+ +				(unsigned int)clnt->cl_prog,
+ +				(unsigned int)clnt->cl_vers,
+ +				task->tk_xprt->servername);
+  		error = -EPROTONOSUPPORT;
+  		goto out_err;
+ -	case rpc_proc_unavail:
+ -		trace_rpc__proc_unavail(task);
+ +	case RPC_PROC_UNAVAIL:
+ +		dprintk("RPC: %5u %s: proc %s unsupported by program %u, "
+ +				"version %u on server %s\n",
+ +				task->tk_pid, __func__,
+ +				rpc_proc_name(task),
+ +				clnt->cl_prog, clnt->cl_vers,
+ +				task->tk_xprt->servername);
+  		error = -EOPNOTSUPP;
+  		goto out_err;
+++<<<<<<< HEAD
+ +	case RPC_GARBAGE_ARGS:
+ +		dprintk("RPC: %5u %s: server saw garbage\n",
+ +				task->tk_pid, __func__);
+ +		break;			/* retry */
+++=======
++ 	case rpc_garbage_args:
++ 	case rpc_system_err:
++ 		trace_rpc__garbage_args(task);
++ 		error = -EIO;
++ 		break;
+++>>>>>>> 928d42f7d873 (SUNRPC: Handle the SYSTEM_ERR rpc error)
+  	default:
+ -		goto out_unparsable;
+ +		dprintk("RPC: %5u %s: server accept status: %x\n",
+ +				task->tk_pid, __func__, n);
+ +		/* Also retry */
+  	}
+  
+  out_garbage:
+* Unmerged path net/sunrpc/clnt.c
