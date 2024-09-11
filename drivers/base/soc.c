@@ -165,7 +165,7 @@ out1:
 	return ERR_PTR(ret);
 }
 
-/* Ensure soc_dev->attr is freed prior to calling soc_device_unregister. */
+/* Ensure soc_dev->attr is freed after calling soc_device_unregister. */
 void soc_device_unregister(struct soc_device *soc_dev)
 {
 	ida_simple_remove(&soc_ida, soc_dev->soc_dev_num);
