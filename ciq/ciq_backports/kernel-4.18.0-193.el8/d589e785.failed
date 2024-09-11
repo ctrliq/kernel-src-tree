@@ -1,0 +1,151 @@
+net/mlx5e: Allow concurrent creation of encap entries
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-193.el8
+Rebuild_CHGLOG: - [netdrv] mlx5e: Allow concurrent creation of encap entries (Alaa Hleihel) [1663231 1724336]
+Rebuild_FUZZ: 96.08%
+commit-author Vlad Buslov <vladbu@mellanox.com>
+commit d589e785baf5e48ee80a4fbfed96661a4c7c8c8d
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-193.el8/d589e785.failed
+
+Encap entries creation is fully synchronized by encap_tbl_lock. In order to
+allow concurrent allocation of hardware resources used to offload
+encapsulation, extend mlx5e_encap_entry with 'res_ready' completion. Move
+call to mlx5e_tc_tun_create_header_ipv{4|6}() out of encap_tbl_lock
+critical section. Modify code that attaches new flows to existing encap to
+wait for 'res_ready' completion before using the entry. Insert encap entry
+to table before provisioning it to hardware and modify all users of the
+encap table to verify that encap was fully initialized by checking
+completion result for non-zero value (and to wait for 'res_ready'
+completion, if necessary).
+
+	Signed-off-by: Vlad Buslov <vladbu@mellanox.com>
+	Reviewed-by: Roi Dayan <roid@mellanox.com>
+	Signed-off-by: Saeed Mahameed <saeedm@mellanox.com>
+(cherry picked from commit d589e785baf5e48ee80a4fbfed96661a4c7c8c8d)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/mellanox/mlx5/core/en_rep.h
+#	drivers/net/ethernet/mellanox/mlx5/core/en_tc.c
+diff --cc drivers/net/ethernet/mellanox/mlx5/core/en_rep.h
+index 98e5b7d6bb09,8ac96727cad8..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_rep.h
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_rep.h
+@@@ -160,6 -164,9 +160,12 @@@ struct mlx5e_encap_entry 
+  	u8 flags;
+  	char *encap_header;
+  	int encap_size;
+++<<<<<<< HEAD
+++=======
++ 	refcount_t refcnt;
++ 	struct completion res_ready;
++ 	int compl_result;
+++>>>>>>> d589e785baf5 (net/mlx5e: Allow concurrent creation of encap entries)
+  };
+  
+  struct mlx5e_rep_sq {
+diff --cc drivers/net/ethernet/mellanox/mlx5/core/en_tc.c
+index c033e0d4fc59,5be3da621499..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_tc.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_tc.c
+@@@ -2577,42 -2900,59 +2577,70 @@@ static int mlx5e_attach_encap(struct ml
+  
+  	hash_key = hash_encap_info(&key);
+  
+ -	mutex_lock(&esw->offloads.encap_tbl_lock);
+ -	e = mlx5e_encap_get(priv, &key, hash_key);
+ +	hash_for_each_possible_rcu(esw->offloads.encap_tbl, e,
+ +				   encap_hlist, hash_key) {
+ +		e_key.ip_tun_key = &e->tun_info->key;
+ +		e_key.tc_tunnel = e->tunnel;
+ +		if (!cmp_encap_info(&e_key, &key)) {
+ +			found = true;
+ +			break;
+ +		}
+ +	}
+  
+  	/* must verify if encap is valid or not */
+++<<<<<<< HEAD
+ +	if (found)
+++=======
++ 	if (e) {
++ 		mutex_unlock(&esw->offloads.encap_tbl_lock);
++ 		wait_for_completion(&e->res_ready);
++ 
++ 		/* Protect against concurrent neigh update. */
++ 		mutex_lock(&esw->offloads.encap_tbl_lock);
++ 		if (e->compl_result) {
++ 			err = -EREMOTEIO;
++ 			goto out_err;
++ 		}
+++>>>>>>> d589e785baf5 (net/mlx5e: Allow concurrent creation of encap entries)
+  		goto attach_flow;
++ 	}
+  
+  	e = kzalloc(sizeof(*e), GFP_KERNEL);
+ -	if (!e) {
+ -		err = -ENOMEM;
+ -		goto out_err;
+ -	}
+ +	if (!e)
+ +		return -ENOMEM;
+  
+++<<<<<<< HEAD
+++=======
++ 	refcount_set(&e->refcnt, 1);
++ 	init_completion(&e->res_ready);
++ 
+++>>>>>>> d589e785baf5 (net/mlx5e: Allow concurrent creation of encap entries)
+  	e->tun_info = tun_info;
+  	err = mlx5e_tc_tun_init_encap_attr(mirred_dev, priv, e, extack);
+- 	if (err)
++ 	if (err) {
++ 		kfree(e);
++ 		e = NULL;
+  		goto out_err;
++ 	}
+  
+  	INIT_LIST_HEAD(&e->flows);
++ 	hash_add_rcu(esw->offloads.encap_tbl, &e->encap_hlist, hash_key);
++ 	mutex_unlock(&esw->offloads.encap_tbl_lock);
+  
+  	if (family == AF_INET)
+  		err = mlx5e_tc_tun_create_header_ipv4(priv, mirred_dev, e);
+  	else if (family == AF_INET6)
+  		err = mlx5e_tc_tun_create_header_ipv6(priv, mirred_dev, e);
+  
+- 	if (err)
++ 	/* Protect against concurrent neigh update. */
++ 	mutex_lock(&esw->offloads.encap_tbl_lock);
++ 	complete_all(&e->res_ready);
++ 	if (err) {
++ 		e->compl_result = err;
+  		goto out_err;
+- 
+- 	hash_add_rcu(esw->offloads.encap_tbl, &e->encap_hlist, hash_key);
++ 	}
+  
+  attach_flow:
+ -	flow->encaps[out_index].e = e;
+  	list_add(&flow->encaps[out_index].list, &e->flows);
+  	flow->encaps[out_index].index = out_index;
+  	*encap_dev = e->out_dev;
+@@@ -2627,7 -2968,9 +2655,13 @@@
+  	return err;
+  
+  out_err:
+++<<<<<<< HEAD
+ +	kfree(e);
+++=======
++ 	mutex_unlock(&esw->offloads.encap_tbl_lock);
++ 	if (e)
++ 		mlx5e_encap_put(priv, e);
+++>>>>>>> d589e785baf5 (net/mlx5e: Allow concurrent creation of encap entries)
+  	return err;
+  }
+  
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/en_rep.h
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/en_tc.c
