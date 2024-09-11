@@ -1,0 +1,889 @@
+net: Convert GRO SKB handling to list_head.
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+Rebuild_CHGLOG: - [net] Convert GRO SKB handling to list_head. (Ivan Vecera) [1805302]
+Rebuild_FUZZ: 93.83%
+commit-author David Miller <davem@davemloft.net>
+commit d4546c2509b1e9cd082e3682dcec98472e37ee5a
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/d4546c25.failed
+
+Manage pending per-NAPI GRO packets via list_head.
+
+Return an SKB pointer from the GRO receive handlers.  When GRO receive
+handlers return non-NULL, it means that this SKB needs to be completed
+at this time and removed from the NAPI queue.
+
+Several operations are greatly simplified by this transformation,
+especially timing out the oldest SKB in the list when gro_count
+exceeds MAX_GRO_SKBS, and napi_gro_flush() which walks the queue
+in reverse order.
+
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit d4546c2509b1e9cd082e3682dcec98472e37ee5a)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/skbuff.h
+#	net/8021q/vlan.c
+#	net/ipv4/af_inet.c
+#	net/ipv4/tcp_offload.c
+#	net/ipv4/udp_offload.c
+#	net/ipv6/ip6_offload.c
+#	net/ipv6/tcpv6_offload.c
+#	net/ipv6/udp_offload.c
+diff --cc include/linux/skbuff.h
+index b56676cd0603,7ccc601b55d9..000000000000
+--- a/include/linux/skbuff.h
++++ b/include/linux/skbuff.h
+@@@ -719,15 -674,13 +719,20 @@@ struct sk_buff 
+  				 * UDP receive path is one user.
+  				 */
+  				unsigned long		dev_scratch;
+ -				int			ip_defrag_offset;
+  			};
+  		};
+++<<<<<<< HEAD
+ +		struct rb_node		rbnode; /* used in netem, ip4 defrag, and tcp stack */
+ +	};
+ +
+ +	union {
+ +		struct sock		*sk;
+ +		int			ip_defrag_offset;
+++=======
++ 		struct rb_node		rbnode; /* used in netem & tcp stack */
++ 		struct list_head	list;
+++>>>>>>> d4546c2509b1 (net: Convert GRO SKB handling to list_head.)
+  	};
+ -	struct sock		*sk;
+  
+  	union {
+  		ktime_t		tstamp;
+diff --cc net/8021q/vlan.c
+index dc4411165e43,99141986efa0..000000000000
+--- a/net/8021q/vlan.c
++++ b/net/8021q/vlan.c
+@@@ -650,6 -647,93 +650,96 @@@ out
+  	return err;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static struct sk_buff *vlan_gro_receive(struct list_head *head,
++ 					struct sk_buff *skb)
++ {
++ 	const struct packet_offload *ptype;
++ 	unsigned int hlen, off_vlan;
++ 	struct sk_buff *pp = NULL;
++ 	struct vlan_hdr *vhdr;
++ 	struct sk_buff *p;
++ 	__be16 type;
++ 	int flush = 1;
++ 
++ 	off_vlan = skb_gro_offset(skb);
++ 	hlen = off_vlan + sizeof(*vhdr);
++ 	vhdr = skb_gro_header_fast(skb, off_vlan);
++ 	if (skb_gro_header_hard(skb, hlen)) {
++ 		vhdr = skb_gro_header_slow(skb, hlen, off_vlan);
++ 		if (unlikely(!vhdr))
++ 			goto out;
++ 	}
++ 
++ 	type = vhdr->h_vlan_encapsulated_proto;
++ 
++ 	rcu_read_lock();
++ 	ptype = gro_find_receive_by_type(type);
++ 	if (!ptype)
++ 		goto out_unlock;
++ 
++ 	flush = 0;
++ 
++ 	list_for_each_entry(p, head, list) {
++ 		struct vlan_hdr *vhdr2;
++ 
++ 		if (!NAPI_GRO_CB(p)->same_flow)
++ 			continue;
++ 
++ 		vhdr2 = (struct vlan_hdr *)(p->data + off_vlan);
++ 		if (compare_vlan_header(vhdr, vhdr2))
++ 			NAPI_GRO_CB(p)->same_flow = 0;
++ 	}
++ 
++ 	skb_gro_pull(skb, sizeof(*vhdr));
++ 	skb_gro_postpull_rcsum(skb, vhdr, sizeof(*vhdr));
++ 	pp = call_gro_receive(ptype->callbacks.gro_receive, head, skb);
++ 
++ out_unlock:
++ 	rcu_read_unlock();
++ out:
++ 	NAPI_GRO_CB(skb)->flush |= flush;
++ 
++ 	return pp;
++ }
++ 
++ static int vlan_gro_complete(struct sk_buff *skb, int nhoff)
++ {
++ 	struct vlan_hdr *vhdr = (struct vlan_hdr *)(skb->data + nhoff);
++ 	__be16 type = vhdr->h_vlan_encapsulated_proto;
++ 	struct packet_offload *ptype;
++ 	int err = -ENOENT;
++ 
++ 	rcu_read_lock();
++ 	ptype = gro_find_complete_by_type(type);
++ 	if (ptype)
++ 		err = ptype->callbacks.gro_complete(skb, nhoff + sizeof(*vhdr));
++ 
++ 	rcu_read_unlock();
++ 	return err;
++ }
++ 
++ static struct packet_offload vlan_packet_offloads[] __read_mostly = {
++ 	{
++ 		.type = cpu_to_be16(ETH_P_8021Q),
++ 		.priority = 10,
++ 		.callbacks = {
++ 			.gro_receive = vlan_gro_receive,
++ 			.gro_complete = vlan_gro_complete,
++ 		},
++ 	},
++ 	{
++ 		.type = cpu_to_be16(ETH_P_8021AD),
++ 		.priority = 10,
++ 		.callbacks = {
++ 			.gro_receive = vlan_gro_receive,
++ 			.gro_complete = vlan_gro_complete,
++ 		},
++ 	},
++ };
++ 
+++>>>>>>> d4546c2509b1 (net: Convert GRO SKB handling to list_head.)
+  static int __net_init vlan_init_net(struct net *net)
+  {
+  	struct vlan_net *vn = net_generic(net, vlan_net_id);
+diff --cc net/ipv4/af_inet.c
+index 30da0676b3bf,06b218a2870f..000000000000
+--- a/net/ipv4/af_inet.c
++++ b/net/ipv4/af_inet.c
+@@@ -1386,16 -1384,12 +1386,20 @@@ out
+  }
+  EXPORT_SYMBOL(inet_gso_segment);
+  
+++<<<<<<< HEAD
+ +INDIRECT_CALLABLE_DECLARE(struct sk_buff **tcp4_gro_receive(struct sk_buff **,
+ +							    struct sk_buff *));
+ +INDIRECT_CALLABLE_DECLARE(struct sk_buff **udp4_gro_receive(struct sk_buff **,
+ +							    struct sk_buff *));
+ +struct sk_buff **inet_gro_receive(struct sk_buff **head, struct sk_buff *skb)
+++=======
++ struct sk_buff *inet_gro_receive(struct list_head *head, struct sk_buff *skb)
+++>>>>>>> d4546c2509b1 (net: Convert GRO SKB handling to list_head.)
+  {
+  	const struct net_offload *ops;
+- 	struct sk_buff **pp = NULL;
+- 	struct sk_buff *p;
++ 	struct sk_buff *pp = NULL;
+  	const struct iphdr *iph;
++ 	struct sk_buff *p;
+  	unsigned int hlen;
+  	unsigned int off;
+  	unsigned int id;
+diff --cc net/ipv4/tcp_offload.c
+index 84307bef0c75,f5aee641f825..000000000000
+--- a/net/ipv4/tcp_offload.c
++++ b/net/ipv4/tcp_offload.c
+@@@ -263,11 -262,8 +263,11 @@@ found
+  
+  	flush |= (len - 1) >= mss;
+  	flush |= (ntohl(th2->seq) + skb_gro_len(p)) ^ ntohl(th->seq);
+ +#ifdef CONFIG_TLS_DEVICE
+ +	flush |= p->decrypted ^ skb->decrypted;
+ +#endif
+  
+- 	if (flush || skb_gro_receive(head, skb)) {
++ 	if (flush || skb_gro_receive(p, skb)) {
+  		mss = 1;
+  		goto out_check_final;
+  	}
+@@@ -306,8 -302,7 +306,12 @@@ int tcp_gro_complete(struct sk_buff *sk
+  }
+  EXPORT_SYMBOL(tcp_gro_complete);
+  
+++<<<<<<< HEAD
+ +INDIRECT_CALLABLE_SCOPE
+ +struct sk_buff **tcp4_gro_receive(struct sk_buff **head, struct sk_buff *skb)
+++=======
++ static struct sk_buff *tcp4_gro_receive(struct list_head *head, struct sk_buff *skb)
+++>>>>>>> d4546c2509b1 (net: Convert GRO SKB handling to list_head.)
+  {
+  	/* Don't bother verifying checksum if we're going to flush anyway. */
+  	if (!NAPI_GRO_CB(skb)->flush &&
+diff --cc net/ipv4/udp_offload.c
+index f8b9d9405ff4,ac46c1c55c99..000000000000
+--- a/net/ipv4/udp_offload.c
++++ b/net/ipv4/udp_offload.c
+@@@ -349,12 -343,11 +349,18 @@@ out
+  	return segs;
+  }
+  
+++<<<<<<< HEAD
+ +INDIRECT_CALLABLE_DECLARE(struct sock *udp6_lib_lookup_skb(struct sk_buff *skb,
+ +						   __be16 sport, __be16 dport));
+ +struct sk_buff **udp_gro_receive(struct sk_buff **head, struct sk_buff *skb,
+ +				 struct udphdr *uh, udp_lookup_t lookup)
+++=======
++ struct sk_buff *udp_gro_receive(struct list_head *head, struct sk_buff *skb,
++ 				struct udphdr *uh, udp_lookup_t lookup)
+++>>>>>>> d4546c2509b1 (net: Convert GRO SKB handling to list_head.)
+  {
+- 	struct sk_buff *p, **pp = NULL;
++ 	struct sk_buff *pp = NULL;
++ 	struct sk_buff *p;
+  	struct udphdr *uh2;
+  	unsigned int off = skb_gro_offset(skb);
+  	int flush = 1;
+@@@ -408,8 -400,8 +414,13 @@@ out
+  }
+  EXPORT_SYMBOL(udp_gro_receive);
+  
+++<<<<<<< HEAD
+ +INDIRECT_CALLABLE_SCOPE
+ +struct sk_buff **udp4_gro_receive(struct sk_buff **head, struct sk_buff *skb)
+++=======
++ static struct sk_buff *udp4_gro_receive(struct list_head *head,
++ 					struct sk_buff *skb)
+++>>>>>>> d4546c2509b1 (net: Convert GRO SKB handling to list_head.)
+  {
+  	struct udphdr *uh = udp_gro_udphdr(skb);
+  
+diff --cc net/ipv6/ip6_offload.c
+index c01351ba648d,37ff4805b20c..000000000000
+--- a/net/ipv6/ip6_offload.c
++++ b/net/ipv6/ip6_offload.c
+@@@ -181,15 -163,11 +181,20 @@@ static int ipv6_exthdrs_len(struct ipv6
+  	return len;
+  }
+  
+++<<<<<<< HEAD
+ +INDIRECT_CALLABLE_DECLARE(struct sk_buff **tcp6_gro_receive(struct sk_buff **,
+ +							    struct sk_buff *));
+ +INDIRECT_CALLABLE_DECLARE(struct sk_buff **udp6_gro_receive(struct sk_buff **,
+ +							    struct sk_buff *));
+ +INDIRECT_CALLABLE_SCOPE struct sk_buff **ipv6_gro_receive(struct sk_buff **head,
+ +							  struct sk_buff *skb)
+++=======
++ static struct sk_buff *ipv6_gro_receive(struct list_head *head,
++ 					struct sk_buff *skb)
+++>>>>>>> d4546c2509b1 (net: Convert GRO SKB handling to list_head.)
+  {
+  	const struct net_offload *ops;
+- 	struct sk_buff **pp = NULL;
++ 	struct sk_buff *pp = NULL;
+  	struct sk_buff *p;
+  	struct ipv6hdr *iph;
+  	unsigned int nlen;
+diff --cc net/ipv6/tcpv6_offload.c
+index df0a6de64cf0,e72947c99454..000000000000
+--- a/net/ipv6/tcpv6_offload.c
++++ b/net/ipv6/tcpv6_offload.c
+@@@ -16,8 -15,8 +16,13 @@@
+  #include <net/ip6_checksum.h>
+  #include "ip6_offload.h"
+  
+++<<<<<<< HEAD
+ +INDIRECT_CALLABLE_SCOPE
+ +struct sk_buff **tcp6_gro_receive(struct sk_buff **head, struct sk_buff *skb)
+++=======
++ static struct sk_buff *tcp6_gro_receive(struct list_head *head,
++ 					struct sk_buff *skb)
+++>>>>>>> d4546c2509b1 (net: Convert GRO SKB handling to list_head.)
+  {
+  	/* Don't bother verifying checksum if we're going to flush anyway. */
+  	if (!NAPI_GRO_CB(skb)->flush &&
+diff --cc net/ipv6/udp_offload.c
+index 1510e8300643,95dee9ca8d22..000000000000
+--- a/net/ipv6/udp_offload.c
++++ b/net/ipv6/udp_offload.c
+@@@ -115,8 -114,8 +115,13 @@@ out
+  	return segs;
+  }
+  
+++<<<<<<< HEAD
+ +INDIRECT_CALLABLE_SCOPE
+ +struct sk_buff **udp6_gro_receive(struct sk_buff **head, struct sk_buff *skb)
+++=======
++ static struct sk_buff *udp6_gro_receive(struct list_head *head,
++ 					struct sk_buff *skb)
+++>>>>>>> d4546c2509b1 (net: Convert GRO SKB handling to list_head.)
+  {
+  	struct udphdr *uh = udp_gro_udphdr(skb);
+  
+diff --git a/drivers/net/geneve.c b/drivers/net/geneve.c
+index 56df05adb742..1d094859dead 100644
+--- a/drivers/net/geneve.c
++++ b/drivers/net/geneve.c
+@@ -472,11 +472,12 @@ static int geneve_hlen(struct genevehdr *gh)
+ 	return sizeof(*gh) + gh->opt_len * 4;
+ }
+ 
+-static struct sk_buff **geneve_gro_receive(struct sock *sk,
+-					   struct sk_buff **head,
+-					   struct sk_buff *skb)
++static struct sk_buff *geneve_gro_receive(struct sock *sk,
++					  struct list_head *head,
++					  struct sk_buff *skb)
+ {
+-	struct sk_buff *p, **pp = NULL;
++	struct sk_buff *pp = NULL;
++	struct sk_buff *p;
+ 	struct genevehdr *gh, *gh2;
+ 	unsigned int hlen, gh_len, off_gnv;
+ 	const struct packet_offload *ptype;
+@@ -503,7 +504,7 @@ static struct sk_buff **geneve_gro_receive(struct sock *sk,
+ 			goto out;
+ 	}
+ 
+-	for (p = *head; p; p = p->next) {
++	list_for_each_entry(p, head, list) {
+ 		if (!NAPI_GRO_CB(p)->same_flow)
+ 			continue;
+ 
+diff --git a/drivers/net/vxlan.c b/drivers/net/vxlan.c
+index b5e4c39e4c74..62044710c8f4 100644
+--- a/drivers/net/vxlan.c
++++ b/drivers/net/vxlan.c
+@@ -718,11 +718,12 @@ static struct vxlanhdr *vxlan_gro_remcsum(struct sk_buff *skb,
+ 	return vh;
+ }
+ 
+-static struct sk_buff **vxlan_gro_receive(struct sock *sk,
+-					  struct sk_buff **head,
+-					  struct sk_buff *skb)
++static struct sk_buff *vxlan_gro_receive(struct sock *sk,
++					 struct list_head *head,
++					 struct sk_buff *skb)
+ {
+-	struct sk_buff *p, **pp = NULL;
++	struct sk_buff *pp = NULL;
++	struct sk_buff *p;
+ 	struct vxlanhdr *vh, *vh2;
+ 	unsigned int hlen, off_vx;
+ 	int flush = 1;
+@@ -757,7 +758,7 @@ static struct sk_buff **vxlan_gro_receive(struct sock *sk,
+ 
+ 	skb_gro_pull(skb, sizeof(struct vxlanhdr)); /* pull vxlan header */
+ 
+-	for (p = *head; p; p = p->next) {
++	list_for_each_entry(p, head, list) {
+ 		if (!NAPI_GRO_CB(p)->same_flow)
+ 			continue;
+ 
+diff --git a/include/linux/etherdevice.h b/include/linux/etherdevice.h
+index c5c5084518fe..087c6ed3206b 100644
+--- a/include/linux/etherdevice.h
++++ b/include/linux/etherdevice.h
+@@ -60,8 +60,7 @@ struct net_device *devm_alloc_etherdev_mqs(struct device *dev, int sizeof_priv,
+ 					   unsigned int rxqs);
+ #define devm_alloc_etherdev(dev, sizeof_priv) devm_alloc_etherdev_mqs(dev, sizeof_priv, 1, 1)
+ 
+-struct sk_buff **eth_gro_receive(struct sk_buff **head,
+-				 struct sk_buff *skb);
++struct sk_buff *eth_gro_receive(struct list_head *head, struct sk_buff *skb);
+ int eth_gro_complete(struct sk_buff *skb, int nhoff);
+ 
+ /* Reserved Ethernet Addresses per IEEE 802.1Q */
+diff --git a/include/linux/netdevice.h b/include/linux/netdevice.h
+index fc80cb1def2a..7e2978f87be8 100644
+--- a/include/linux/netdevice.h
++++ b/include/linux/netdevice.h
+@@ -333,7 +333,7 @@ struct napi_struct {
+ 	int			poll_owner;
+ #endif
+ 	struct net_device	*dev;
+-	struct sk_buff		*gro_list;
++	struct list_head	gro_list;
+ 	struct sk_buff		*skb;
+ 	struct hrtimer		timer;
+ 	struct list_head	dev_list;
+@@ -2499,10 +2499,10 @@ static inline int gro_recursion_inc_test(struct sk_buff *skb)
+ 	return ++NAPI_GRO_CB(skb)->recursion_counter == GRO_RECURSION_LIMIT;
+ }
+ 
+-typedef struct sk_buff **(*gro_receive_t)(struct sk_buff **, struct sk_buff *);
+-static inline struct sk_buff **call_gro_receive(gro_receive_t cb,
+-						struct sk_buff **head,
+-						struct sk_buff *skb)
++typedef struct sk_buff *(*gro_receive_t)(struct list_head *, struct sk_buff *);
++static inline struct sk_buff *call_gro_receive(gro_receive_t cb,
++					       struct list_head *head,
++					       struct sk_buff *skb)
+ {
+ 	if (unlikely(gro_recursion_inc_test(skb))) {
+ 		NAPI_GRO_CB(skb)->flush |= 1;
+@@ -2512,12 +2512,12 @@ static inline struct sk_buff **call_gro_receive(gro_receive_t cb,
+ 	return cb(head, skb);
+ }
+ 
+-typedef struct sk_buff **(*gro_receive_sk_t)(struct sock *, struct sk_buff **,
+-					     struct sk_buff *);
+-static inline struct sk_buff **call_gro_receive_sk(gro_receive_sk_t cb,
+-						   struct sock *sk,
+-						   struct sk_buff **head,
+-						   struct sk_buff *skb)
++typedef struct sk_buff *(*gro_receive_sk_t)(struct sock *, struct list_head *,
++					    struct sk_buff *);
++static inline struct sk_buff *call_gro_receive_sk(gro_receive_sk_t cb,
++						  struct sock *sk,
++						  struct list_head *head,
++						  struct sk_buff *skb)
+ {
+ 	if (unlikely(gro_recursion_inc_test(skb))) {
+ 		NAPI_GRO_CB(skb)->flush |= 1;
+@@ -2548,8 +2548,8 @@ struct packet_type {
+ struct offload_callbacks {
+ 	struct sk_buff		*(*gso_segment)(struct sk_buff *skb,
+ 						netdev_features_t features);
+-	struct sk_buff		**(*gro_receive)(struct sk_buff **head,
+-						 struct sk_buff *skb);
++	struct sk_buff		*(*gro_receive)(struct list_head *head,
++						struct sk_buff *skb);
+ 	int			(*gro_complete)(struct sk_buff *skb, int nhoff);
+ };
+ 
+@@ -2836,7 +2836,7 @@ struct net_device *dev_get_by_index_rcu(struct net *net, int ifindex);
+ struct net_device *dev_get_by_napi_id(unsigned int napi_id);
+ int netdev_get_name(struct net *net, char *name, int ifindex);
+ int dev_restart(struct net_device *dev);
+-int skb_gro_receive(struct sk_buff **head, struct sk_buff *skb);
++int skb_gro_receive(struct sk_buff *p, struct sk_buff *skb);
+ 
+ static inline unsigned int skb_gro_offset(const struct sk_buff *skb)
+ {
+@@ -3052,7 +3052,7 @@ static inline void skb_gro_remcsum_cleanup(struct sk_buff *skb,
+ }
+ 
+ #ifdef CONFIG_XFRM_OFFLOAD
+-static inline void skb_gro_flush_final(struct sk_buff *skb, struct sk_buff **pp, int flush)
++static inline void skb_gro_flush_final(struct sk_buff *skb, struct sk_buff *pp, int flush)
+ {
+ 	if (PTR_ERR(pp) != -EINPROGRESS)
+ 		NAPI_GRO_CB(skb)->flush |= flush;
+@@ -3069,7 +3069,7 @@ static inline void skb_gro_flush_final_remcsum(struct sk_buff *skb,
+ 	}
+ }
+ #else
+-static inline void skb_gro_flush_final(struct sk_buff *skb, struct sk_buff **pp, int flush)
++static inline void skb_gro_flush_final(struct sk_buff *skb, struct sk_buff *pp, int flush)
+ {
+ 	NAPI_GRO_CB(skb)->flush |= flush;
+ }
+* Unmerged path include/linux/skbuff.h
+diff --git a/include/linux/udp.h b/include/linux/udp.h
+index c051eb19504b..c8410837f044 100644
+--- a/include/linux/udp.h
++++ b/include/linux/udp.h
+@@ -75,8 +75,8 @@ struct udp_sock {
+ 	void (*encap_destroy)(struct sock *sk);
+ 
+ 	/* GRO functions for UDP socket */
+-	struct sk_buff **	(*gro_receive)(struct sock *sk,
+-					       struct sk_buff **head,
++	struct sk_buff *	(*gro_receive)(struct sock *sk,
++					       struct list_head *head,
+ 					       struct sk_buff *skb);
+ 	int			(*gro_complete)(struct sock *sk,
+ 						struct sk_buff *skb,
+diff --git a/include/net/inet_common.h b/include/net/inet_common.h
+index 7bd6a02ebc8e..975901a95c0f 100644
+--- a/include/net/inet_common.h
++++ b/include/net/inet_common.h
+@@ -45,7 +45,7 @@ int inet_ctl_sock_create(struct sock **sk, unsigned short family,
+ int inet_recv_error(struct sock *sk, struct msghdr *msg, int len,
+ 		    int *addr_len);
+ 
+-struct sk_buff **inet_gro_receive(struct sk_buff **head, struct sk_buff *skb);
++struct sk_buff *inet_gro_receive(struct list_head *head, struct sk_buff *skb);
+ int inet_gro_complete(struct sk_buff *skb, int nhoff);
+ struct sk_buff *inet_gso_segment(struct sk_buff *skb,
+ 				 netdev_features_t features);
+diff --git a/include/net/tcp.h b/include/net/tcp.h
+index 3601d0f6dfb6..fd7925c247d8 100644
+--- a/include/net/tcp.h
++++ b/include/net/tcp.h
+@@ -1854,7 +1854,7 @@ void tcp_v4_destroy_sock(struct sock *sk);
+ 
+ struct sk_buff *tcp_gso_segment(struct sk_buff *skb,
+ 				netdev_features_t features);
+-struct sk_buff **tcp_gro_receive(struct sk_buff **head, struct sk_buff *skb);
++struct sk_buff *tcp_gro_receive(struct list_head *head, struct sk_buff *skb);
+ int tcp_gro_complete(struct sk_buff *skb);
+ 
+ void __tcp_v4_send_check(struct sk_buff *skb, __be32 saddr, __be32 daddr);
+diff --git a/include/net/udp.h b/include/net/udp.h
+index b2402c6e63b9..9e82cb391dea 100644
+--- a/include/net/udp.h
++++ b/include/net/udp.h
+@@ -170,8 +170,8 @@ static inline void udp_csum_pull_header(struct sk_buff *skb)
+ typedef struct sock *(*udp_lookup_t)(struct sk_buff *skb, __be16 sport,
+ 				     __be16 dport);
+ 
+-struct sk_buff **udp_gro_receive(struct sk_buff **head, struct sk_buff *skb,
+-				 struct udphdr *uh, udp_lookup_t lookup);
++struct sk_buff *udp_gro_receive(struct list_head *head, struct sk_buff *skb,
++				struct udphdr *uh, udp_lookup_t lookup);
+ int udp_gro_complete(struct sk_buff *skb, int nhoff, udp_lookup_t lookup);
+ 
+ struct sk_buff *__udp_gso_segment(struct sk_buff *gso_skb,
+diff --git a/include/net/udp_tunnel.h b/include/net/udp_tunnel.h
+index e319dc47365a..a473ab300d74 100644
+--- a/include/net/udp_tunnel.h
++++ b/include/net/udp_tunnel.h
+@@ -67,9 +67,9 @@ typedef int (*udp_tunnel_encap_rcv_t)(struct sock *sk, struct sk_buff *skb);
+ typedef int (*udp_tunnel_encap_err_lookup_t)(struct sock *sk,
+ 					     struct sk_buff *skb);
+ typedef void (*udp_tunnel_encap_destroy_t)(struct sock *sk);
+-typedef struct sk_buff **(*udp_tunnel_gro_receive_t)(struct sock *sk,
+-						     struct sk_buff **head,
+-						     struct sk_buff *skb);
++typedef struct sk_buff *(*udp_tunnel_gro_receive_t)(struct sock *sk,
++						    struct list_head *head,
++						    struct sk_buff *skb);
+ typedef int (*udp_tunnel_gro_complete_t)(struct sock *sk, struct sk_buff *skb,
+ 					 int nhoff);
+ 
+* Unmerged path net/8021q/vlan.c
+diff --git a/net/core/dev.c b/net/core/dev.c
+index f887b8ff8a98..bae412b462ea 100644
+--- a/net/core/dev.c
++++ b/net/core/dev.c
+@@ -5164,36 +5164,25 @@ static int napi_gro_complete(struct sk_buff *skb)
+  */
+ void napi_gro_flush(struct napi_struct *napi, bool flush_old)
+ {
+-	struct sk_buff *skb, *prev = NULL;
+-
+-	/* scan list and build reverse chain */
+-	for (skb = napi->gro_list; skb != NULL; skb = skb->next) {
+-		skb->prev = prev;
+-		prev = skb;
+-	}
+-
+-	for (skb = prev; skb; skb = prev) {
+-		skb->next = NULL;
++	struct sk_buff *skb, *p;
+ 
++	list_for_each_entry_safe_reverse(skb, p, &napi->gro_list, list) {
+ 		if (flush_old && NAPI_GRO_CB(skb)->age == jiffies)
+ 			return;
+-
+-		prev = skb->prev;
++		list_del_init(&skb->list);
+ 		napi_gro_complete(skb);
+ 		napi->gro_count--;
+ 	}
+-
+-	napi->gro_list = NULL;
+ }
+ EXPORT_SYMBOL(napi_gro_flush);
+ 
+ static void gro_list_prepare(struct napi_struct *napi, struct sk_buff *skb)
+ {
+-	struct sk_buff *p;
+ 	unsigned int maclen = skb->dev->hard_header_len;
+ 	u32 hash = skb_get_hash_raw(skb);
++	struct sk_buff *p;
+ 
+-	for (p = napi->gro_list; p; p = p->next) {
++	list_for_each_entry(p, &napi->gro_list, list) {
+ 		unsigned long diffs;
+ 
+ 		NAPI_GRO_CB(p)->flush = 0;
+@@ -5266,12 +5255,12 @@ INDIRECT_CALLABLE_DECLARE(struct sk_buff **ipv6_gro_receive(struct sk_buff **,
+ 							    struct sk_buff *));
+ static enum gro_result dev_gro_receive(struct napi_struct *napi, struct sk_buff *skb)
+ {
+-	struct sk_buff **pp = NULL;
++	struct list_head *head = &offload_base;
+ 	struct packet_offload *ptype;
+ 	__be16 type = skb->protocol;
+-	struct list_head *head = &offload_base;
+-	int same_flow;
++	struct sk_buff *pp = NULL;
+ 	enum gro_result ret;
++	int same_flow;
+ 	int grow;
+ 
+ 	if (netif_elide_gro(skb->dev))
+@@ -5330,11 +5319,8 @@ static enum gro_result dev_gro_receive(struct napi_struct *napi, struct sk_buff
+ 	ret = NAPI_GRO_CB(skb)->free ? GRO_MERGED_FREE : GRO_MERGED;
+ 
+ 	if (pp) {
+-		struct sk_buff *nskb = *pp;
+-
+-		*pp = nskb->next;
+-		nskb->next = NULL;
+-		napi_gro_complete(nskb);
++		list_del_init(&pp->list);
++		napi_gro_complete(pp);
+ 		napi->gro_count--;
+ 	}
+ 
+@@ -5345,15 +5331,10 @@ static enum gro_result dev_gro_receive(struct napi_struct *napi, struct sk_buff
+ 		goto normal;
+ 
+ 	if (unlikely(napi->gro_count >= MAX_GRO_SKBS)) {
+-		struct sk_buff *nskb = napi->gro_list;
++		struct sk_buff *nskb;
+ 
+-		/* locate the end of the list to select the 'oldest' flow */
+-		while (nskb->next) {
+-			pp = &nskb->next;
+-			nskb = *pp;
+-		}
+-		*pp = NULL;
+-		nskb->next = NULL;
++		nskb = list_last_entry(&napi->gro_list, struct sk_buff, list);
++		list_del(&nskb->list);
+ 		napi_gro_complete(nskb);
+ 	} else {
+ 		napi->gro_count++;
+@@ -5362,8 +5343,7 @@ static enum gro_result dev_gro_receive(struct napi_struct *napi, struct sk_buff
+ 	NAPI_GRO_CB(skb)->age = jiffies;
+ 	NAPI_GRO_CB(skb)->last = skb;
+ 	skb_shinfo(skb)->gso_size = skb_gro_len(skb);
+-	skb->next = napi->gro_list;
+-	napi->gro_list = skb;
++	list_add(&skb->list, &napi->gro_list);
+ 	ret = GRO_HELD;
+ 
+ pull:
+@@ -5773,7 +5753,7 @@ bool napi_complete_done(struct napi_struct *n, int work_done)
+ 				 NAPIF_STATE_IN_BUSY_POLL)))
+ 		return false;
+ 
+-	if (n->gro_list) {
++	if (!list_empty(&n->gro_list)) {
+ 		unsigned long timeout = 0;
+ 
+ 		if (work_done)
+@@ -5985,7 +5965,7 @@ static enum hrtimer_restart napi_watchdog(struct hrtimer *timer)
+ 	/* Note : we use a relaxed variant of napi_schedule_prep() not setting
+ 	 * NAPI_STATE_MISSED, since we do not react to a device IRQ.
+ 	 */
+-	if (napi->gro_list && !napi_disable_pending(napi) &&
++	if (!list_empty(&napi->gro_list) && !napi_disable_pending(napi) &&
+ 	    !test_and_set_bit(NAPI_STATE_SCHED, &napi->state))
+ 		__napi_schedule_irqoff(napi);
+ 
+@@ -5999,7 +5979,7 @@ void netif_napi_add(struct net_device *dev, struct napi_struct *napi,
+ 	hrtimer_init(&napi->timer, CLOCK_MONOTONIC, HRTIMER_MODE_REL_PINNED);
+ 	napi->timer.function = napi_watchdog;
+ 	napi->gro_count = 0;
+-	napi->gro_list = NULL;
++	INIT_LIST_HEAD(&napi->gro_list);
+ 	napi->skb = NULL;
+ 	napi->poll = poll;
+ 	if (weight > NAPI_POLL_WEIGHT)
+@@ -6032,6 +6012,14 @@ void napi_disable(struct napi_struct *n)
+ }
+ EXPORT_SYMBOL(napi_disable);
+ 
++static void gro_list_free(struct list_head *head)
++{
++	struct sk_buff *skb, *p;
++
++	list_for_each_entry_safe(skb, p, head, list)
++		kfree_skb(skb);
++}
++
+ /* Must be called in process context */
+ void netif_napi_del(struct napi_struct *napi)
+ {
+@@ -6041,8 +6029,8 @@ void netif_napi_del(struct napi_struct *napi)
+ 	list_del_init(&napi->dev_list);
+ 	napi_free_frags(napi);
+ 
+-	kfree_skb_list(napi->gro_list);
+-	napi->gro_list = NULL;
++	gro_list_free(&napi->gro_list);
++	INIT_LIST_HEAD(&napi->gro_list);
+ 	napi->gro_count = 0;
+ }
+ EXPORT_SYMBOL(netif_napi_del);
+@@ -6085,7 +6073,7 @@ static int napi_poll(struct napi_struct *n, struct list_head *repoll)
+ 		goto out_unlock;
+ 	}
+ 
+-	if (n->gro_list) {
++	if (!list_empty(&n->gro_list)) {
+ 		/* flush too old packets
+ 		 * If HZ < 1000, flush all packets.
+ 		 */
+diff --git a/net/core/skbuff.c b/net/core/skbuff.c
+index c141d34fff11..a895eb0fff04 100644
+--- a/net/core/skbuff.c
++++ b/net/core/skbuff.c
+@@ -3911,14 +3911,14 @@ struct sk_buff *skb_segment(struct sk_buff *head_skb,
+ }
+ EXPORT_SYMBOL_GPL(skb_segment);
+ 
+-int skb_gro_receive(struct sk_buff **head, struct sk_buff *skb)
++int skb_gro_receive(struct sk_buff *p, struct sk_buff *skb)
+ {
+ 	struct skb_shared_info *pinfo, *skbinfo = skb_shinfo(skb);
+ 	unsigned int offset = skb_gro_offset(skb);
+ 	unsigned int headlen = skb_headlen(skb);
+ 	unsigned int len = skb_gro_len(skb);
+-	struct sk_buff *lp, *p = *head;
+ 	unsigned int delta_truesize;
++	struct sk_buff *lp;
+ 
+ 	if (unlikely(p->len + len >= 65536 || NAPI_GRO_CB(skb)->flush))
+ 		return -E2BIG;
+diff --git a/net/ethernet/eth.c b/net/ethernet/eth.c
+index 35cbd3222f89..e7ecb2faf936 100644
+--- a/net/ethernet/eth.c
++++ b/net/ethernet/eth.c
+@@ -442,13 +442,13 @@ ssize_t sysfs_format_mac(char *buf, const unsigned char *addr, int len)
+ }
+ EXPORT_SYMBOL(sysfs_format_mac);
+ 
+-struct sk_buff **eth_gro_receive(struct sk_buff **head,
+-				 struct sk_buff *skb)
++struct sk_buff *eth_gro_receive(struct list_head *head, struct sk_buff *skb)
+ {
+-	struct sk_buff *p, **pp = NULL;
+-	struct ethhdr *eh, *eh2;
+-	unsigned int hlen, off_eth;
+ 	const struct packet_offload *ptype;
++	unsigned int hlen, off_eth;
++	struct sk_buff *pp = NULL;
++	struct ethhdr *eh, *eh2;
++	struct sk_buff *p;
+ 	__be16 type;
+ 	int flush = 1;
+ 
+@@ -463,7 +463,7 @@ struct sk_buff **eth_gro_receive(struct sk_buff **head,
+ 
+ 	flush = 0;
+ 
+-	for (p = *head; p; p = p->next) {
++	list_for_each_entry(p, head, list) {
+ 		if (!NAPI_GRO_CB(p)->same_flow)
+ 			continue;
+ 
+* Unmerged path net/ipv4/af_inet.c
+diff --git a/net/ipv4/esp4_offload.c b/net/ipv4/esp4_offload.c
+index 27b0232dd3b1..b4a274750620 100644
+--- a/net/ipv4/esp4_offload.c
++++ b/net/ipv4/esp4_offload.c
+@@ -28,8 +28,8 @@
+ #include <linux/spinlock.h>
+ #include <net/udp.h>
+ 
+-static struct sk_buff **esp4_gro_receive(struct sk_buff **head,
+-					 struct sk_buff *skb)
++static struct sk_buff *esp4_gro_receive(struct list_head *head,
++					struct sk_buff *skb)
+ {
+ 	int offset = skb_gro_offset(skb);
+ 	struct xfrm_offload *xo;
+diff --git a/net/ipv4/fou.c b/net/ipv4/fou.c
+index 64350280ff7b..8349f211b01f 100644
+--- a/net/ipv4/fou.c
++++ b/net/ipv4/fou.c
+@@ -226,14 +226,14 @@ static int gue_udp_recv(struct sock *sk, struct sk_buff *skb)
+ 	return 0;
+ }
+ 
+-static struct sk_buff **fou_gro_receive(struct sock *sk,
+-					struct sk_buff **head,
+-					struct sk_buff *skb)
++static struct sk_buff *fou_gro_receive(struct sock *sk,
++				       struct list_head *head,
++				       struct sk_buff *skb)
+ {
+-	const struct net_offload *ops;
+-	struct sk_buff **pp = NULL;
+ 	u8 proto = fou_from_sock(sk)->protocol;
+ 	const struct net_offload **offloads;
++	const struct net_offload *ops;
++	struct sk_buff *pp = NULL;
+ 
+ 	/* We can clear the encap_mark for FOU as we are essentially doing
+ 	 * one of two possible things.  We are either adding an L4 tunnel
+@@ -307,13 +307,13 @@ static struct guehdr *gue_gro_remcsum(struct sk_buff *skb, unsigned int off,
+ 	return guehdr;
+ }
+ 
+-static struct sk_buff **gue_gro_receive(struct sock *sk,
+-					struct sk_buff **head,
+-					struct sk_buff *skb)
++static struct sk_buff *gue_gro_receive(struct sock *sk,
++				       struct list_head *head,
++				       struct sk_buff *skb)
+ {
+ 	const struct net_offload **offloads;
+ 	const struct net_offload *ops;
+-	struct sk_buff **pp = NULL;
++	struct sk_buff *pp = NULL;
+ 	struct sk_buff *p;
+ 	struct guehdr *guehdr;
+ 	size_t len, optlen, hdrlen, off;
+@@ -399,7 +399,7 @@ static struct sk_buff **gue_gro_receive(struct sock *sk,
+ 
+ 	skb_gro_pull(skb, hdrlen);
+ 
+-	for (p = *head; p; p = p->next) {
++	list_for_each_entry(p, head, list) {
+ 		const struct guehdr *guehdr2;
+ 
+ 		if (!NAPI_GRO_CB(p)->same_flow)
+diff --git a/net/ipv4/gre_offload.c b/net/ipv4/gre_offload.c
+index 6a7d980105f6..6c63524f598a 100644
+--- a/net/ipv4/gre_offload.c
++++ b/net/ipv4/gre_offload.c
+@@ -108,10 +108,10 @@ static struct sk_buff *gre_gso_segment(struct sk_buff *skb,
+ 	return segs;
+ }
+ 
+-static struct sk_buff **gre_gro_receive(struct sk_buff **head,
+-					struct sk_buff *skb)
++static struct sk_buff *gre_gro_receive(struct list_head *head,
++				       struct sk_buff *skb)
+ {
+-	struct sk_buff **pp = NULL;
++	struct sk_buff *pp = NULL;
+ 	struct sk_buff *p;
+ 	const struct gre_base_hdr *greh;
+ 	unsigned int hlen, grehlen;
+@@ -182,7 +182,7 @@ static struct sk_buff **gre_gro_receive(struct sk_buff **head,
+ 					     null_compute_pseudo);
+ 	}
+ 
+-	for (p = *head; p; p = p->next) {
++	list_for_each_entry(p, head, list) {
+ 		const struct gre_base_hdr *greh2;
+ 
+ 		if (!NAPI_GRO_CB(p)->same_flow)
+* Unmerged path net/ipv4/tcp_offload.c
+* Unmerged path net/ipv4/udp_offload.c
+diff --git a/net/ipv6/esp6_offload.c b/net/ipv6/esp6_offload.c
+index 3810e17068ab..f8d80a6d952b 100644
+--- a/net/ipv6/esp6_offload.c
++++ b/net/ipv6/esp6_offload.c
+@@ -49,8 +49,8 @@ static __u16 esp6_nexthdr_esp_offset(struct ipv6hdr *ipv6_hdr, int nhlen)
+ 	return 0;
+ }
+ 
+-static struct sk_buff **esp6_gro_receive(struct sk_buff **head,
+-					 struct sk_buff *skb)
++static struct sk_buff *esp6_gro_receive(struct list_head *head,
++					struct sk_buff *skb)
+ {
+ 	int offset = skb_gro_offset(skb);
+ 	struct xfrm_offload *xo;
+* Unmerged path net/ipv6/ip6_offload.c
+* Unmerged path net/ipv6/tcpv6_offload.c
+* Unmerged path net/ipv6/udp_offload.c
