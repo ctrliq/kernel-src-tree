@@ -1,0 +1,254 @@
+net: page_pool: Add bulk support for ptr_ring
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-326.el8
+commit-author Lorenzo Bianconi <lorenzo@kernel.org>
+commit 7886244736a4dbb49987f330772842130493e050
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-326.el8/78862447.failed
+
+Introduce the capability to batch page_pool ptr_ring refill since it is
+usually run inside the driver NAPI tx completion loop.
+
+	Suggested-by: Jesper Dangaard Brouer <brouer@redhat.com>
+Co-developed-by: Jesper Dangaard Brouer <brouer@redhat.com>
+	Signed-off-by: Jesper Dangaard Brouer <brouer@redhat.com>
+	Signed-off-by: Lorenzo Bianconi <lorenzo@kernel.org>
+	Signed-off-by: Daniel Borkmann <daniel@iogearbox.net>
+	Acked-by: John Fastabend <john.fastabend@gmail.com>
+	Acked-by: Ilias Apalodimas <ilias.apalodimas@linaro.org>
+Link: https://lore.kernel.org/bpf/08dd249c9522c001313f520796faa777c4089e1c.1605267335.git.lorenzo@kernel.org
+(cherry picked from commit 7886244736a4dbb49987f330772842130493e050)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/core/xdp.c
+diff --cc net/core/xdp.c
+index aae9619d8ff9,3d330ebda893..000000000000
+--- a/net/core/xdp.c
++++ b/net/core/xdp.c
+@@@ -383,9 -380,63 +383,66 @@@ void xdp_return_frame_rx_napi(struct xd
+  }
+  EXPORT_SYMBOL_GPL(xdp_return_frame_rx_napi);
+  
+++<<<<<<< HEAD
+++=======
++ /* XDP bulk APIs introduce a defer/flush mechanism to return
++  * pages belonging to the same xdp_mem_allocator object
++  * (identified via the mem.id field) in bulk to optimize
++  * I-cache and D-cache.
++  * The bulk queue size is set to 16 to be aligned to how
++  * XDP_REDIRECT bulking works. The bulk is flushed when
++  * it is full or when mem.id changes.
++  * xdp_frame_bulk is usually stored/allocated on the function
++  * call-stack to avoid locking penalties.
++  */
++ void xdp_flush_frame_bulk(struct xdp_frame_bulk *bq)
++ {
++ 	struct xdp_mem_allocator *xa = bq->xa;
++ 
++ 	if (unlikely(!xa || !bq->count))
++ 		return;
++ 
++ 	page_pool_put_page_bulk(xa->page_pool, bq->q, bq->count);
++ 	/* bq->xa is not cleared to save lookup, if mem.id same in next bulk */
++ 	bq->count = 0;
++ }
++ EXPORT_SYMBOL_GPL(xdp_flush_frame_bulk);
++ 
++ /* Must be called with rcu_read_lock held */
++ void xdp_return_frame_bulk(struct xdp_frame *xdpf,
++ 			   struct xdp_frame_bulk *bq)
++ {
++ 	struct xdp_mem_info *mem = &xdpf->mem;
++ 	struct xdp_mem_allocator *xa;
++ 
++ 	if (mem->type != MEM_TYPE_PAGE_POOL) {
++ 		__xdp_return(xdpf->data, &xdpf->mem, false);
++ 		return;
++ 	}
++ 
++ 	xa = bq->xa;
++ 	if (unlikely(!xa)) {
++ 		xa = rhashtable_lookup(mem_id_ht, &mem->id, mem_id_rht_params);
++ 		bq->count = 0;
++ 		bq->xa = xa;
++ 	}
++ 
++ 	if (bq->count == XDP_BULK_QUEUE_SIZE)
++ 		xdp_flush_frame_bulk(bq);
++ 
++ 	if (unlikely(mem->id != xa->mem.id)) {
++ 		xdp_flush_frame_bulk(bq);
++ 		bq->xa = rhashtable_lookup(mem_id_ht, &mem->id, mem_id_rht_params);
++ 	}
++ 
++ 	bq->q[bq->count++] = xdpf->data;
++ }
++ EXPORT_SYMBOL_GPL(xdp_return_frame_bulk);
++ 
+++>>>>>>> 7886244736a4 (net: page_pool: Add bulk support for ptr_ring)
+  void xdp_return_buff(struct xdp_buff *xdp)
+  {
+ -	__xdp_return(xdp->data, &xdp->rxq->mem, true);
+ +	__xdp_return(xdp->data, &xdp->rxq->mem, true, xdp);
+  }
+  
+  /* Only called for MEM_TYPE_PAGE_POOL see xdp.h */
+diff --git a/include/net/page_pool.h b/include/net/page_pool.h
+index 81d7773f96cd..b5b195305346 100644
+--- a/include/net/page_pool.h
++++ b/include/net/page_pool.h
+@@ -152,6 +152,8 @@ struct page_pool *page_pool_create(const struct page_pool_params *params);
+ void page_pool_destroy(struct page_pool *pool);
+ void page_pool_use_xdp_mem(struct page_pool *pool, void (*disconnect)(void *));
+ void page_pool_release_page(struct page_pool *pool, struct page *page);
++void page_pool_put_page_bulk(struct page_pool *pool, void **data,
++			     int count);
+ #else
+ static inline void page_pool_destroy(struct page_pool *pool)
+ {
+@@ -165,6 +167,11 @@ static inline void page_pool_release_page(struct page_pool *pool,
+ 					  struct page *page)
+ {
+ }
++
++static inline void page_pool_put_page_bulk(struct page_pool *pool, void **data,
++					   int count)
++{
++}
+ #endif
+ 
+ void page_pool_put_page(struct page_pool *pool, struct page *page,
+@@ -215,4 +222,23 @@ static inline void page_pool_nid_changed(struct page_pool *pool, int new_nid)
+ 	if (unlikely(pool->p.nid != new_nid))
+ 		page_pool_update_nid(pool, new_nid);
+ }
++
++static inline void page_pool_ring_lock(struct page_pool *pool)
++	__acquires(&pool->ring.producer_lock)
++{
++	if (in_serving_softirq())
++		spin_lock(&pool->ring.producer_lock);
++	else
++		spin_lock_bh(&pool->ring.producer_lock);
++}
++
++static inline void page_pool_ring_unlock(struct page_pool *pool)
++	__releases(&pool->ring.producer_lock)
++{
++	if (in_serving_softirq())
++		spin_unlock(&pool->ring.producer_lock);
++	else
++		spin_unlock_bh(&pool->ring.producer_lock);
++}
++
+ #endif /* _NET_PAGE_POOL_H */
+diff --git a/net/core/page_pool.c b/net/core/page_pool.c
+index 1433c7e71080..ad8b0707af04 100644
+--- a/net/core/page_pool.c
++++ b/net/core/page_pool.c
+@@ -11,6 +11,8 @@
+ #include <linux/device.h>
+ 
+ #include <net/page_pool.h>
++#include <net/xdp.h>
++
+ #include <linux/dma-direction.h>
+ #include <linux/dma-mapping.h>
+ #include <linux/page-flags.h>
+@@ -354,8 +356,9 @@ static bool page_pool_recycle_in_cache(struct page *page,
+  * If the page refcnt != 1, then the page will be returned to memory
+  * subsystem.
+  */
+-void page_pool_put_page(struct page_pool *pool, struct page *page,
+-			unsigned int dma_sync_size, bool allow_direct)
++static __always_inline struct page *
++__page_pool_put_page(struct page_pool *pool, struct page *page,
++		     unsigned int dma_sync_size, bool allow_direct)
+ {
+ 	/* This allocator is optimized for the XDP mode that uses
+ 	 * one-frame-per-page, but have fallbacks that act like the
+@@ -373,15 +376,12 @@ void page_pool_put_page(struct page_pool *pool, struct page *page,
+ 			page_pool_dma_sync_for_device(pool, page,
+ 						      dma_sync_size);
+ 
+-		if (allow_direct && in_serving_softirq())
+-			if (page_pool_recycle_in_cache(page, pool))
+-				return;
++		if (allow_direct && in_serving_softirq() &&
++		    page_pool_recycle_in_cache(page, pool))
++			return NULL;
+ 
+-		if (!page_pool_recycle_in_ring(pool, page)) {
+-			/* Cache full, fallback to free pages */
+-			page_pool_return_page(pool, page);
+-		}
+-		return;
++		/* Page found as candidate for recycling */
++		return page;
+ 	}
+ 	/* Fallback/non-XDP mode: API user have elevated refcnt.
+ 	 *
+@@ -399,9 +399,59 @@ void page_pool_put_page(struct page_pool *pool, struct page *page,
+ 	/* Do not replace this with page_pool_return_page() */
+ 	page_pool_release_page(pool, page);
+ 	put_page(page);
++
++	return NULL;
++}
++
++void page_pool_put_page(struct page_pool *pool, struct page *page,
++			unsigned int dma_sync_size, bool allow_direct)
++{
++	page = __page_pool_put_page(pool, page, dma_sync_size, allow_direct);
++	if (page && !page_pool_recycle_in_ring(pool, page)) {
++		/* Cache full, fallback to free pages */
++		page_pool_return_page(pool, page);
++	}
+ }
+ EXPORT_SYMBOL(page_pool_put_page);
+ 
++/* Caller must not use data area after call, as this function overwrites it */
++void page_pool_put_page_bulk(struct page_pool *pool, void **data,
++			     int count)
++{
++	int i, bulk_len = 0;
++
++	for (i = 0; i < count; i++) {
++		struct page *page = virt_to_head_page(data[i]);
++
++		page = __page_pool_put_page(pool, page, -1, false);
++		/* Approved for bulk recycling in ptr_ring cache */
++		if (page)
++			data[bulk_len++] = page;
++	}
++
++	if (unlikely(!bulk_len))
++		return;
++
++	/* Bulk producer into ptr_ring page_pool cache */
++	page_pool_ring_lock(pool);
++	for (i = 0; i < bulk_len; i++) {
++		if (__ptr_ring_produce(&pool->ring, data[i]))
++			break; /* ring full */
++	}
++	page_pool_ring_unlock(pool);
++
++	/* Hopefully all pages was return into ptr_ring */
++	if (likely(i == bulk_len))
++		return;
++
++	/* ptr_ring cache full, free remaining pages outside producer lock
++	 * since put_page() with refcnt == 1 can be an expensive operation
++	 */
++	for (; i < bulk_len; i++)
++		page_pool_return_page(pool, data[i]);
++}
++EXPORT_SYMBOL(page_pool_put_page_bulk);
++
+ static void page_pool_empty_ring(struct page_pool *pool)
+ {
+ 	struct page *page;
+* Unmerged path net/core/xdp.c
