@@ -101,6 +101,7 @@ extern const char *selinux_policycap_names[__POLICYDB_CAPABILITY_MAX];
 
 struct selinux_avc;
 struct selinux_ss;
+struct selinux_policy;
 
 struct selinux_state {
 #ifdef CONFIG_SECURITY_SELINUX_DISABLE
@@ -219,7 +220,12 @@ static inline bool selinux_policycap_nnp_nosuid_transition(void)
 
 int security_mls_enabled(struct selinux_state *state);
 int security_load_policy(struct selinux_state *state,
-			 void *data, size_t len);
+			void *data, size_t len,
+			struct selinux_policy **newpolicyp);
+void selinux_policy_commit(struct selinux_state *state,
+			struct selinux_policy *newpolicy);
+void selinux_policy_cancel(struct selinux_state *state,
+			struct selinux_policy *policy);
 int security_read_policy(struct selinux_state *state,
 			 void **data, size_t *len);
 size_t security_policydb_len(struct selinux_state *state);
@@ -353,9 +359,9 @@ int security_net_peersid_resolve(struct selinux_state *state,
 				 u32 xfrm_sid,
 				 u32 *peer_sid);
 
-int security_get_classes(struct selinux_state *state,
+int security_get_classes(struct selinux_policy *policy,
 			 char ***classes, int *nclasses);
-int security_get_permissions(struct selinux_state *state,
+int security_get_permissions(struct selinux_policy *policy,
 			     char *class, char ***perms, int *nperms);
 int security_get_reject_unknown(struct selinux_state *state);
 int security_get_allow_unknown(struct selinux_state *state);
@@ -372,6 +378,10 @@ int security_get_allow_unknown(struct selinux_state *state);
 int security_fs_use(struct selinux_state *state, struct super_block *sb);
 
 int security_genfs_sid(struct selinux_state *state,
+		       const char *fstype, char *name, u16 sclass,
+		       u32 *sid);
+
+int selinux_policy_genfs_sid(struct selinux_policy *policy,
 		       const char *fstype, char *name, u16 sclass,
 		       u32 *sid);
 
