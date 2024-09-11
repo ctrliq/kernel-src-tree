@@ -1,0 +1,120 @@
+ice: Get rid of ice_pull_tail
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-147.el8
+commit-author Maciej Fijalkowski <maciej.fijalkowski@intel.com>
+commit 1857ca42a734d41261f4c30e5f625fa7e2b70b0d
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-147.el8/1857ca42.failed
+
+Instead of adding a frag and later when dealing with EOP frame accessing
+that frag in order to copy the headers onto linear part of skb, we can do
+this in ice_add_rx_frag in case where the data_len is still 0 and frame
+won't fit onto the linear part as a whole.
+
+Function comment of ice_pull_tail was a bit misleading because of
+mentioned optimizations that can be performed (drop a frag/maintaining
+accurate truesize of skb) - it seems that this part of logic was dropped
+and the comment was not updated to reflect this change.
+
+	Signed-off-by: Maciej Fijalkowski <maciej.fijalkowski@intel.com>
+	Signed-off-by: Anirudh Venkataramanan <anirudh.venkataramanan@intel.com>
+	Tested-by: Andrew Bowers <andrewx.bowers@intel.com>
+	Signed-off-by: Jeff Kirsher <jeffrey.t.kirsher@intel.com>
+(cherry picked from commit 1857ca42a734d41261f4c30e5f625fa7e2b70b0d)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/intel/ice/ice_txrx.c
+diff --cc drivers/net/ethernet/intel/ice/ice_txrx.c
+index b0086743621b,becee476002d..000000000000
+--- a/drivers/net/ethernet/intel/ice/ice_txrx.c
++++ b/drivers/net/ethernet/intel/ice/ice_txrx.c
+@@@ -517,21 -559,15 +517,31 @@@ static bool ice_add_rx_frag(struct ice_
+  #if (PAGE_SIZE < 8192)
+  	unsigned int truesize = ICE_RXBUF_2048;
+  #else
+ -	unsigned int truesize = ALIGN(size, L1_CACHE_BYTES);
+ +	unsigned int last_offset = PAGE_SIZE - ICE_RXBUF_2048;
+ +	unsigned int truesize;
+  #endif /* PAGE_SIZE < 8192) */
+++<<<<<<< HEAD
+ +
+ +	struct page *page;
+ +	unsigned int size;
+ +
+ +	size = le16_to_cpu(rx_desc->wb.pkt_len) &
+ +		ICE_RX_FLX_DESC_PKT_LEN_M;
+ +
+ +	page = rx_buf->page;
+ +
+ +#if (PAGE_SIZE >= 8192)
+ +	truesize = ALIGN(size, L1_CACHE_BYTES);
+ +#endif /* PAGE_SIZE >= 8192) */
+++=======
++ 	struct page *page = rx_buf->page;
++ 	unsigned int pull_len;
++ 	unsigned char *va;
++ 
++ 	va = page_address(page) + rx_buf->page_offset;
++ 	if (unlikely(skb_is_nonlinear(skb)))
++ 		goto add_tail_frag;
+++>>>>>>> 1857ca42a734 (ice: Get rid of ice_pull_tail)
+  
+  	/* will the data fit in the skb we allocated? if so, just
+  	 * copy it as it is pretty small anyway
+@@@ -550,34 -584,26 +558,50 @@@
+  		return false;
+  	}
+  
++ 	/* we need the header to contain the greater of either ETH_HLEN or
++ 	 * 60 bytes if the skb->len is less than 60 for skb_pad.
++ 	 */
++ 	pull_len = eth_get_headlen(va, ICE_RX_HDR_SIZE);
++ 
++ 	/* align pull length to size of long to optimize memcpy performance */
++ 	memcpy(__skb_put(skb, pull_len), va, ALIGN(pull_len, sizeof(long)));
++ 
++ 	/* the header from the frame that we're adding as a frag was added to
++ 	 * linear part of skb so move the pointer past that header and
++ 	 * reduce the size of data
++ 	 */
++ 	va += pull_len;
++ 	size -= pull_len;
++ 
++ add_tail_frag:
+  	skb_add_rx_frag(skb, skb_shinfo(skb)->nr_frags, page,
+- 			rx_buf->page_offset, size, truesize);
++ 			(unsigned long)va & ~PAGE_MASK, size, truesize);
+  
+ -	return ice_can_reuse_rx_page(rx_buf, truesize);
+ +	/* avoid re-using remote pages */
+ +	if (unlikely(ice_page_is_reserved(page)))
+ +		return false;
+ +
+ +#if (PAGE_SIZE < 8192)
+ +	/* if we are only owner of page we can reuse it */
+ +	if (unlikely(page_count(page) != 1))
+ +		return false;
+ +
+ +	/* flip page offset to other buffer */
+ +	rx_buf->page_offset ^= truesize;
+ +#else
+ +	/* move offset up to the next cache line */
+ +	rx_buf->page_offset += truesize;
+ +
+ +	if (rx_buf->page_offset > last_offset)
+ +		return false;
+ +#endif /* PAGE_SIZE < 8192) */
+ +
+ +	/* Even if we own the page, we are not allowed to use atomic_set()
+ +	 * This would break get_page_unless_zero() users.
+ +	 */
+ +	get_page(rx_buf->page);
+ +
+ +	return true;
+  }
+  
+  /**
+* Unmerged path drivers/net/ethernet/intel/ice/ice_txrx.c
