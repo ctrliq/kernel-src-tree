@@ -1,0 +1,259 @@
+bnxt_en: implement dump callback for fw health reporter
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-408.el8
+commit-author Edwin Peer <edwin.peer@broadcom.com>
+commit 188876db04a3524aa81ced7475686e7c44ca1a5e
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-408.el8/188876db.failed
+
+Populate the dump with firmware 'live' coredump data. This includes
+the information stored in NVRAM by the firmware exception handler
+prior to recovery. Thus, the live dump includes the desired crash
+context.
+
+Firmware does not support HWRM calls after RESET_NOTIFY, so there is
+no supported way to capture a coredump during the auto dump phase.
+Detect this and abort when called from devlink_health_report().
+
+	Signed-off-by: Edwin Peer <edwin.peer@broadcom.com>
+	Signed-off-by: Michael Chan <michael.chan@broadcom.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 188876db04a3524aa81ced7475686e7c44ca1a5e)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/broadcom/bnxt/bnxt_devlink.c
+diff --cc drivers/net/ethernet/broadcom/bnxt/bnxt_devlink.c
+index d875469f72ce,106f4249e47b..000000000000
+--- a/drivers/net/ethernet/broadcom/bnxt/bnxt_devlink.c
++++ b/drivers/net/ethernet/broadcom/bnxt/bnxt_devlink.c
+@@@ -18,7 -18,17 +18,8 @@@
+  #include "bnxt_ethtool.h"
+  #include "bnxt_ulp.h"
+  #include "bnxt_ptp.h"
++ #include "bnxt_coredump.h"
+  
+ -static void __bnxt_fw_recover(struct bnxt *bp)
+ -{
+ -	if (test_bit(BNXT_STATE_FW_FATAL_COND, &bp->state) ||
+ -	    test_bit(BNXT_STATE_FW_NON_FATAL_COND, &bp->state))
+ -		bnxt_fw_reset(bp);
+ -	else
+ -		bnxt_fw_exception(bp);
+ -}
+ -
+  static int
+  bnxt_dl_flash_update(struct devlink *dl,
+  		     struct devlink_flash_update_params *params,
+@@@ -51,85 -105,139 +52,147 @@@ static int bnxt_fw_reporter_diagnose(st
+  	int rc;
+  
+  	if (test_bit(BNXT_STATE_IN_FW_RESET, &bp->state))
+ -		return devlink_fmsg_string_pair_put(fmsg, "Status", "recovering");
+ +		return 0;
+  
+ -	if (!h->status_reliable)
+ -		return devlink_fmsg_string_pair_put(fmsg, "Status", "unknown");
+ +	val = bnxt_fw_health_readl(bp, BNXT_FW_HEALTH_REG);
+  
+ -	mutex_lock(&h->lock);
+ -	fw_status = bnxt_fw_health_readl(bp, BNXT_FW_HEALTH_REG);
+ -	if (BNXT_FW_IS_BOOTING(fw_status)) {
+ -		rc = devlink_fmsg_string_pair_put(fmsg, "Status", "initializing");
+ -		if (rc)
+ -			goto unlock;
+ -	} else if (h->severity || fw_status != BNXT_FW_STATUS_HEALTHY) {
+ -		if (!h->severity) {
+ -			h->severity = SEVERITY_FATAL;
+ -			h->remedy = REMEDY_POWER_CYCLE_DEVICE;
+ -			h->diagnoses++;
+ -			devlink_health_report(h->fw_reporter,
+ -					      "FW error diagnosed", h);
+ -		}
+ -		rc = devlink_fmsg_string_pair_put(fmsg, "Status", "error");
+ +	if (BNXT_FW_IS_BOOTING(val)) {
+ +		rc = devlink_fmsg_string_pair_put(fmsg, "Description",
+ +						  "Not yet completed initialization");
+  		if (rc)
+ -			goto unlock;
+ -		rc = devlink_fmsg_u32_pair_put(fmsg, "Syndrome", fw_status);
+ -		if (rc)
+ -			goto unlock;
+ -	} else {
+ -		rc = devlink_fmsg_string_pair_put(fmsg, "Status", "healthy");
+ +			return rc;
+ +	} else if (BNXT_FW_IS_ERR(val)) {
+ +		rc = devlink_fmsg_string_pair_put(fmsg, "Description",
+ +						  "Encountered fatal error and cannot recover");
+  		if (rc)
+ -			goto unlock;
+ +			return rc;
+  	}
+  
+ -	rc = devlink_fmsg_string_pair_put(fmsg, "Severity",
+ -					  bnxt_health_severity_str(h->severity));
+ -	if (rc)
+ -		goto unlock;
+ -
+ -	if (h->severity) {
+ -		rc = devlink_fmsg_string_pair_put(fmsg, "Remedy",
+ -						  bnxt_health_remedy_str(h->remedy));
+ +	if (val >> 16) {
+ +		rc = devlink_fmsg_u32_pair_put(fmsg, "Error code", val >> 16);
+  		if (rc)
+ -			goto unlock;
+ -		if (h->remedy == REMEDY_DEVLINK_RECOVER) {
+ -			rc = devlink_fmsg_string_pair_put(fmsg, "Impact",
+ -							  "traffic+ntuple_cfg");
+ -			if (rc)
+ -				goto unlock;
+ -		}
+ +			return rc;
+  	}
+  
+ -unlock:
+ -	mutex_unlock(&h->lock);
+ -	if (rc || !h->resets_reliable)
+ -		return rc;
+ -
+ -	fw_resets = bnxt_fw_health_readl(bp, BNXT_FW_RESET_CNT_REG);
+ -	rc = devlink_fmsg_u32_pair_put(fmsg, "Resets", fw_resets);
+ -	if (rc)
+ -		return rc;
+ -	rc = devlink_fmsg_u32_pair_put(fmsg, "Arrests", h->arrests);
+ -	if (rc)
+ -		return rc;
+ -	rc = devlink_fmsg_u32_pair_put(fmsg, "Survivals", h->survivals);
+ +	val = bnxt_fw_health_readl(bp, BNXT_FW_RESET_CNT_REG);
+ +	rc = devlink_fmsg_u32_pair_put(fmsg, "Reset count", val);
+  	if (rc)
+  		return rc;
+ -	rc = devlink_fmsg_u32_pair_put(fmsg, "Discoveries", h->discoveries);
+ -	if (rc)
+ -		return rc;
+ -	rc = devlink_fmsg_u32_pair_put(fmsg, "Fatalities", h->fatalities);
+ -	if (rc)
+ -		return rc;
+ -	return devlink_fmsg_u32_pair_put(fmsg, "Diagnoses", h->diagnoses);
+ -}
+  
+++<<<<<<< HEAD
+ +	return 0;
+++=======
++ static int bnxt_fw_dump(struct devlink_health_reporter *reporter,
++ 			struct devlink_fmsg *fmsg, void *priv_ctx,
++ 			struct netlink_ext_ack *extack)
++ {
++ 	struct bnxt *bp = devlink_health_reporter_priv(reporter);
++ 	u32 dump_len;
++ 	void *data;
++ 	int rc;
++ 
++ 	/* TODO: no firmware dump support in devlink_health_report() context */
++ 	if (priv_ctx)
++ 		return -EOPNOTSUPP;
++ 
++ 	dump_len = bnxt_get_coredump_length(bp, BNXT_DUMP_LIVE);
++ 	if (!dump_len)
++ 		return -EIO;
++ 
++ 	data = vmalloc(dump_len);
++ 	if (!data)
++ 		return -ENOMEM;
++ 
++ 	rc = bnxt_get_coredump(bp, BNXT_DUMP_LIVE, data, &dump_len);
++ 	if (!rc) {
++ 		rc = devlink_fmsg_pair_nest_start(fmsg, "core");
++ 		if (rc)
++ 			goto exit;
++ 		rc = devlink_fmsg_binary_pair_put(fmsg, "data", data, dump_len);
++ 		if (rc)
++ 			goto exit;
++ 		rc = devlink_fmsg_u32_pair_put(fmsg, "size", dump_len);
++ 		if (rc)
++ 			goto exit;
++ 		rc = devlink_fmsg_pair_nest_end(fmsg);
++ 	}
++ 
++ exit:
++ 	vfree(data);
++ 	return rc;
++ }
++ 
++ static int bnxt_fw_recover(struct devlink_health_reporter *reporter,
++ 			   void *priv_ctx,
++ 			   struct netlink_ext_ack *extack)
++ {
++ 	struct bnxt *bp = devlink_health_reporter_priv(reporter);
++ 
++ 	if (bp->fw_health->severity == SEVERITY_FATAL)
++ 		return -ENODEV;
++ 
++ 	set_bit(BNXT_STATE_RECOVER, &bp->state);
++ 	__bnxt_fw_recover(bp);
++ 
++ 	return -EINPROGRESS;
+++>>>>>>> 188876db04a3 (bnxt_en: implement dump callback for fw health reporter)
+  }
+  
+  static const struct devlink_health_reporter_ops bnxt_dl_fw_reporter_ops = {
+  	.name = "fw",
+++<<<<<<< HEAD
+ +	.diagnose = bnxt_fw_reporter_diagnose,
+ +};
+ +
+ +static int bnxt_fw_reset_recover(struct devlink_health_reporter *reporter,
+ +				 void *priv_ctx,
+ +				 struct netlink_ext_ack *extack)
+ +{
+ +	struct bnxt *bp = devlink_health_reporter_priv(reporter);
+ +
+ +	if (!priv_ctx)
+ +		return -EOPNOTSUPP;
+ +
+ +	bnxt_fw_reset(bp);
+ +	return -EINPROGRESS;
+ +}
+ +
+ +static const
+ +struct devlink_health_reporter_ops bnxt_dl_fw_reset_reporter_ops = {
+ +	.name = "fw_reset",
+ +	.recover = bnxt_fw_reset_recover,
+ +};
+ +
+ +static int bnxt_fw_fatal_recover(struct devlink_health_reporter *reporter,
+ +				 void *priv_ctx,
+ +				 struct netlink_ext_ack *extack)
+ +{
+ +	struct bnxt *bp = devlink_health_reporter_priv(reporter);
+ +	struct bnxt_fw_reporter_ctx *fw_reporter_ctx = priv_ctx;
+ +	unsigned long event;
+ +
+ +	if (!priv_ctx)
+ +		return -EOPNOTSUPP;
+ +
+ +	bp->fw_health->fatal = true;
+ +	event = fw_reporter_ctx->sp_event;
+ +	if (event == BNXT_FW_RESET_NOTIFY_SP_EVENT)
+ +		bnxt_fw_reset(bp);
+ +	else if (event == BNXT_FW_EXCEPTION_SP_EVENT)
+ +		bnxt_fw_exception(bp);
+ +
+ +	return -EINPROGRESS;
+ +}
+ +
+ +static const
+ +struct devlink_health_reporter_ops bnxt_dl_fw_fatal_reporter_ops = {
+ +	.name = "fw_fatal",
+ +	.recover = bnxt_fw_fatal_recover,
+++=======
++ 	.diagnose = bnxt_fw_diagnose,
++ 	.dump = bnxt_fw_dump,
++ 	.recover = bnxt_fw_recover,
+++>>>>>>> 188876db04a3 (bnxt_en: implement dump callback for fw health reporter)
+  };
+  
+  void bnxt_dl_fw_reporters_create(struct bnxt *bp)
+* Unmerged path drivers/net/ethernet/broadcom/bnxt/bnxt_devlink.c
