@@ -1,0 +1,263 @@
+hugetlbfs: use i_mmap_rwsem for more pmd sharing synchronization
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-310.el8
+commit-author Mike Kravetz <mike.kravetz@oracle.com>
+commit b43a9990055958e70347c56f90ea2ae32c67334c
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-310.el8/b43a9990.failed
+
+While looking at BUGs associated with invalid huge page map counts, it was
+discovered and observed that a huge pte pointer could become 'invalid' and
+point to another task's page table.  Consider the following:
+
+A task takes a page fault on a shared hugetlbfs file and calls
+huge_pte_alloc to get a ptep.  Suppose the returned ptep points to a
+shared pmd.
+
+Now, another task truncates the hugetlbfs file.  As part of truncation, it
+unmaps everyone who has the file mapped.  If the range being truncated is
+covered by a shared pmd, huge_pmd_unshare will be called.  For all but the
+last user of the shared pmd, huge_pmd_unshare will clear the pud pointing
+to the pmd.  If the task in the middle of the page fault is not the last
+user, the ptep returned by huge_pte_alloc now points to another task's
+page table or worse.  This leads to bad things such as incorrect page
+map/reference counts or invalid memory references.
+
+To fix, expand the use of i_mmap_rwsem as follows:
+
+- i_mmap_rwsem is held in read mode whenever huge_pmd_share is called.
+  huge_pmd_share is only called via huge_pte_alloc, so callers of
+  huge_pte_alloc take i_mmap_rwsem before calling.  In addition, callers
+  of huge_pte_alloc continue to hold the semaphore until finished with the
+  ptep.
+
+- i_mmap_rwsem is held in write mode whenever huge_pmd_unshare is
+  called.
+
+[mike.kravetz@oracle.com: add explicit check for mapping != null]
+Link: http://lkml.kernel.org/r/20181218223557.5202-2-mike.kravetz@oracle.com
+Fixes: 39dde65c9940 ("shared page table for hugetlb page")
+	Signed-off-by: Mike Kravetz <mike.kravetz@oracle.com>
+	Acked-by: Kirill A. Shutemov <kirill.shutemov@linux.intel.com>
+	Cc: Michal Hocko <mhocko@kernel.org>
+	Cc: Hugh Dickins <hughd@google.com>
+	Cc: Naoya Horiguchi <n-horiguchi@ah.jp.nec.com>
+	Cc: "Aneesh Kumar K . V" <aneesh.kumar@linux.vnet.ibm.com>
+	Cc: Andrea Arcangeli <aarcange@redhat.com>
+	Cc: Davidlohr Bueso <dave@stgolabs.net>
+	Cc: Prakash Sangappa <prakash.sangappa@oracle.com>
+	Cc: Colin Ian King <colin.king@canonical.com>
+	Cc: <stable@vger.kernel.org>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit b43a9990055958e70347c56f90ea2ae32c67334c)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	mm/hugetlb.c
+#	mm/userfaultfd.c
+diff --cc mm/hugetlb.c
+index 75fa4469cb29,87fd3ab809c6..000000000000
+--- a/mm/hugetlb.c
++++ b/mm/hugetlb.c
+@@@ -3510,10 -3247,17 +3511,18 @@@ int copy_hugetlb_page_range(struct mm_s
+  	cow = (vma->vm_flags & (VM_SHARED | VM_MAYWRITE)) == VM_MAYWRITE;
+  
+  	if (cow) {
+ -		mmu_notifier_range_init(&range, src, vma->vm_start,
+ +		mmu_notifier_range_init(&range, MMU_NOTIFY_CLEAR, 0, vma, src,
+ +					vma->vm_start,
+  					vma->vm_end);
+  		mmu_notifier_invalidate_range_start(&range);
++ 	} else {
++ 		/*
++ 		 * For shared mappings i_mmap_rwsem must be held to call
++ 		 * huge_pte_alloc, otherwise the returned ptep could go
++ 		 * away if part of a shared pmd and another thread calls
++ 		 * huge_pmd_unshare.
++ 		 */
++ 		i_mmap_lock_read(mapping);
+  	}
+  
+  	for (addr = vma->vm_start; addr < vma->vm_end; addr += sz) {
+@@@ -4039,13 -3784,18 +4052,17 @@@ retry
+  			};
+  
+  			/*
+- 			 * hugetlb_fault_mutex must be dropped before
+- 			 * handling userfault.  Reacquire after handling
+- 			 * fault to make calling code simpler.
++ 			 * hugetlb_fault_mutex and i_mmap_rwsem must be
++ 			 * dropped before handling userfault.  Reacquire
++ 			 * after handling fault to make calling code simpler.
+  			 */
+ -			hash = hugetlb_fault_mutex_hash(h, mm, vma, mapping,
+ -							idx, haddr);
+ +			hash = hugetlb_fault_mutex_hash(mapping, idx);
+  			mutex_unlock(&hugetlb_fault_mutex_table[hash]);
++ 			i_mmap_unlock_read(mapping);
++ 
+  			ret = handle_userfault(&vmf, VM_UFFD_MISSING);
++ 
++ 			i_mmap_lock_read(mapping);
+  			mutex_lock(&hugetlb_fault_mutex_table[hash]);
+  			goto out;
+  		}
+@@@ -4231,7 -3979,8 +4263,12 @@@ vm_fault_t hugetlb_fault(struct mm_stru
+  	 * get spurious allocation failures if two CPUs race to instantiate
+  	 * the same page in the page cache.
+  	 */
+++<<<<<<< HEAD
+ +	hash = hugetlb_fault_mutex_hash(mapping, idx);
+++=======
++ 	idx = vma_hugecache_offset(h, vma, haddr);
++ 	hash = hugetlb_fault_mutex_hash(h, mm, vma, mapping, idx, haddr);
+++>>>>>>> b43a99900559 (hugetlbfs: use i_mmap_rwsem for more pmd sharing synchronization)
+  	mutex_lock(&hugetlb_fault_mutex_table[hash]);
+  
+  	entry = huge_ptep_get(ptep);
+@@@ -4977,7 -4694,6 +5017,10 @@@ pte_t *huge_pmd_share(struct mm_struct 
+  	if (!vma_shareable(vma, addr))
+  		return (pte_t *)pmd_alloc(mm, pud, addr);
+  
+++<<<<<<< HEAD
+ +	i_mmap_lock_read(mapping);
+++=======
+++>>>>>>> b43a99900559 (hugetlbfs: use i_mmap_rwsem for more pmd sharing synchronization)
+  	vma_interval_tree_foreach(svma, &mapping->i_mmap, idx, idx) {
+  		if (svma == vma)
+  			continue;
+@@@ -5007,7 -4723,6 +5050,10 @@@
+  	spin_unlock(ptl);
+  out:
+  	pte = (pte_t *)pmd_alloc(mm, pud, addr);
+++<<<<<<< HEAD
+ +	i_mmap_unlock_read(mapping);
+++=======
+++>>>>>>> b43a99900559 (hugetlbfs: use i_mmap_rwsem for more pmd sharing synchronization)
+  	return pte;
+  }
+  
+diff --cc mm/userfaultfd.c
+index 429f02d71f5d,48368589f519..000000000000
+--- a/mm/userfaultfd.c
++++ b/mm/userfaultfd.c
+@@@ -273,19 -264,26 +273,29 @@@ retry
+  		pte_t dst_pteval;
+  
+  		BUG_ON(dst_addr >= dst_start + len);
+ -		VM_BUG_ON(dst_addr & ~huge_page_mask(h));
+  
+  		/*
+- 		 * Serialize via hugetlb_fault_mutex
++ 		 * Serialize via i_mmap_rwsem and hugetlb_fault_mutex.
++ 		 * i_mmap_rwsem ensures the dst_pte remains valid even
++ 		 * in the case of shared pmds.  fault mutex prevents
++ 		 * races with other faulting threads.
+  		 */
+- 		idx = linear_page_index(dst_vma, dst_addr);
+  		mapping = dst_vma->vm_file->f_mapping;
+++<<<<<<< HEAD
+ +		hash = hugetlb_fault_mutex_hash(mapping, idx);
+++=======
++ 		i_mmap_lock_read(mapping);
++ 		idx = linear_page_index(dst_vma, dst_addr);
++ 		hash = hugetlb_fault_mutex_hash(h, dst_mm, dst_vma, mapping,
++ 								idx, dst_addr);
+++>>>>>>> b43a99900559 (hugetlbfs: use i_mmap_rwsem for more pmd sharing synchronization)
+  		mutex_lock(&hugetlb_fault_mutex_table[hash]);
+  
+  		err = -ENOMEM;
+ -		dst_pte = huge_pte_alloc(dst_mm, dst_addr, huge_page_size(h));
+ +		dst_pte = huge_pte_alloc(dst_mm, dst_addr, vma_hpagesize);
+  		if (!dst_pte) {
+  			mutex_unlock(&hugetlb_fault_mutex_table[hash]);
++ 			i_mmap_unlock_read(mapping);
+  			goto out_unlock;
+  		}
+  
+* Unmerged path mm/hugetlb.c
+diff --git a/mm/memory-failure.c b/mm/memory-failure.c
+index 1eb364eceed0..c4087703ae9d 100644
+--- a/mm/memory-failure.c
++++ b/mm/memory-failure.c
+@@ -993,7 +993,7 @@ static bool hwpoison_user_mappings(struct page *p, unsigned long pfn,
+ 	enum ttu_flags ttu = TTU_IGNORE_MLOCK | TTU_IGNORE_ACCESS;
+ 	struct address_space *mapping;
+ 	LIST_HEAD(tokill);
+-	bool unmap_success;
++	bool unmap_success = true;
+ 	int kill = 1, forcekill;
+ 	struct page *hpage = *hpagep;
+ 	bool mlocked = PageMlocked(hpage);
+@@ -1055,7 +1055,19 @@ static bool hwpoison_user_mappings(struct page *p, unsigned long pfn,
+ 	if (kill)
+ 		collect_procs(hpage, &tokill, flags & MF_ACTION_REQUIRED);
+ 
+-	unmap_success = try_to_unmap(hpage, ttu);
++	if (!PageHuge(hpage)) {
++		unmap_success = try_to_unmap(hpage, ttu);
++	} else if (mapping) {
++		/*
++		 * For hugetlb pages, try_to_unmap could potentially call
++		 * huge_pmd_unshare.  Because of this, take semaphore in
++		 * write mode here and set TTU_RMAP_LOCKED to indicate we
++		 * have taken the lock at this higer level.
++		 */
++		i_mmap_lock_write(mapping);
++		unmap_success = try_to_unmap(hpage, ttu|TTU_RMAP_LOCKED);
++		i_mmap_unlock_write(mapping);
++	}
+ 	if (!unmap_success)
+ 		pr_err("Memory failure: %#lx: failed to unmap page (mapcount=%d)\n",
+ 		       pfn, page_mapcount(hpage));
+diff --git a/mm/migrate.c b/mm/migrate.c
+index 22e581ba4c3c..5db2df62b1b2 100644
+--- a/mm/migrate.c
++++ b/mm/migrate.c
+@@ -1331,8 +1331,19 @@ static int unmap_and_move_huge_page(new_page_t get_new_page,
+ 		goto put_anon;
+ 
+ 	if (page_mapped(hpage)) {
++		struct address_space *mapping = page_mapping(hpage);
++
++		/*
++		 * try_to_unmap could potentially call huge_pmd_unshare.
++		 * Because of this, take semaphore in write mode here and
++		 * set TTU_RMAP_LOCKED to let lower levels know we have
++		 * taken the lock.
++		 */
++		i_mmap_lock_write(mapping);
+ 		try_to_unmap(hpage,
+-			TTU_MIGRATION|TTU_IGNORE_MLOCK|TTU_IGNORE_ACCESS);
++			TTU_MIGRATION|TTU_IGNORE_MLOCK|TTU_IGNORE_ACCESS|
++			TTU_RMAP_LOCKED);
++		i_mmap_unlock_write(mapping);
+ 		page_was_mapped = 1;
+ 	}
+ 
+diff --git a/mm/rmap.c b/mm/rmap.c
+index 5b780f3cf0f3..aa2a82c5c0a2 100644
+--- a/mm/rmap.c
++++ b/mm/rmap.c
+@@ -25,6 +25,7 @@
+  *     page->flags PG_locked (lock_page)
+  *       hugetlbfs_i_mmap_rwsem_key (in huge_pmd_share)
+  *         mapping->i_mmap_rwsem
++ *           hugetlb_fault_mutex (hugetlbfs specific page fault mutex)
+  *           anon_vma->rwsem
+  *             mm->page_table_lock or pte_lock
+  *               pgdat->lru_lock (in mark_page_accessed, isolate_lru_page)
+@@ -1407,6 +1408,9 @@ static bool try_to_unmap_one(struct page *page, struct vm_area_struct *vma,
+ 		/*
+ 		 * If sharing is possible, start and end will be adjusted
+ 		 * accordingly.
++		 *
++		 * If called for a huge page, caller must hold i_mmap_rwsem
++		 * in write mode as it is possible to call huge_pmd_unshare.
+ 		 */
+ 		adjust_range_if_pmd_sharing_possible(vma, &range.start,
+ 						     &range.end);
+* Unmerged path mm/userfaultfd.c
