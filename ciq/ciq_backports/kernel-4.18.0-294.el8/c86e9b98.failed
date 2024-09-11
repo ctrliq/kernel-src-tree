@@ -1,0 +1,262 @@
+lockdep: Prepare for noinstr sections
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Peter Zijlstra <peterz@infradead.org>
+commit c86e9b987cea3dd0209203e714553a47f5d7c6dd
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/c86e9b98.failed
+
+Force inlining and prevent instrumentation of all sorts by marking the
+functions which are invoked from low level entry code with 'noinstr'.
+
+Split the irqflags tracking into two parts. One which does the heavy
+lifting while RCU is watching and the final one which can be invoked after
+RCU is turned off.
+
+	Signed-off-by: Peter Zijlstra <peterz@infradead.org>
+	Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+	Reviewed-by: Alexandre Chartre <alexandre.chartre@oracle.com>
+Link: https://lkml.kernel.org/r/20200505134100.484532537@linutronix.de
+
+
+(cherry picked from commit c86e9b987cea3dd0209203e714553a47f5d7c6dd)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/irqflags.h
+#	kernel/locking/lockdep.c
+#	kernel/trace/trace_preemptirq.c
+diff --cc include/linux/irqflags.h
+index b53a9f136087,d7f7e436c3af..000000000000
+--- a/include/linux/irqflags.h
++++ b/include/linux/irqflags.h
+@@@ -15,16 -15,31 +15,34 @@@
+  #include <linux/typecheck.h>
+  #include <asm/irqflags.h>
+  
+++<<<<<<< HEAD
+++=======
++ /* Currently lockdep_softirqs_on/off is used only by lockdep */
++ #ifdef CONFIG_PROVE_LOCKING
++   extern void lockdep_softirqs_on(unsigned long ip);
++   extern void lockdep_softirqs_off(unsigned long ip);
++   extern void lockdep_hardirqs_on_prepare(unsigned long ip);
++   extern void lockdep_hardirqs_on(unsigned long ip);
++   extern void lockdep_hardirqs_off(unsigned long ip);
++ #else
++   static inline void lockdep_softirqs_on(unsigned long ip) { }
++   static inline void lockdep_softirqs_off(unsigned long ip) { }
++   static inline void lockdep_hardirqs_on_prepare(unsigned long ip) { }
++   static inline void lockdep_hardirqs_on(unsigned long ip) { }
++   static inline void lockdep_hardirqs_off(unsigned long ip) { }
++ #endif
++ 
+++>>>>>>> c86e9b987cea (lockdep: Prepare for noinstr sections)
+  #ifdef CONFIG_TRACE_IRQFLAGS
+ -  extern void trace_hardirqs_on_prepare(void);
+ -  extern void trace_hardirqs_off_prepare(void);
+ +  extern void trace_softirqs_on(unsigned long ip);
+ +  extern void trace_softirqs_off(unsigned long ip);
+    extern void trace_hardirqs_on(void);
+    extern void trace_hardirqs_off(void);
+ -# define lockdep_hardirq_context(p)	((p)->hardirq_context)
+ -# define lockdep_softirq_context(p)	((p)->softirq_context)
+ -# define lockdep_hardirqs_enabled(p)	((p)->hardirqs_enabled)
+ -# define lockdep_softirqs_enabled(p)	((p)->softirqs_enabled)
+ -# define lockdep_hardirq_enter()		\
+ +# define trace_hardirq_context(p)	((p)->hardirq_context)
+ +# define trace_softirq_context(p)	((p)->softirq_context)
+ +# define trace_hardirqs_enabled(p)	((p)->hardirqs_enabled)
+ +# define trace_softirqs_enabled(p)	((p)->softirqs_enabled)
+ +# define trace_hardirq_enter()			\
+  do {						\
+  	if (!current->hardirq_context++)	\
+  		current->hardirq_threaded = 0;	\
+diff --cc kernel/locking/lockdep.c
+index 4f4f4a6b0ac9,9ccd675a8b5a..000000000000
+--- a/kernel/locking/lockdep.c
++++ b/kernel/locking/lockdep.c
+@@@ -3639,18 -3651,20 +3636,26 @@@ static void __trace_hardirqs_on_caller(
+  	 * this bit from being set before)
+  	 */
+  	if (curr->softirqs_enabled)
+- 		if (!mark_held_locks(curr, LOCK_ENABLED_SOFTIRQ))
+- 			return;
+- 
+- 	curr->hardirq_enable_ip = ip;
+- 	curr->hardirq_enable_event = ++curr->irq_events;
+- 	debug_atomic_inc(hardirqs_on_events);
++ 		mark_held_locks(curr, LOCK_ENABLED_SOFTIRQ);
+  }
+  
+++<<<<<<< HEAD
+ +__visible void trace_hardirqs_on_caller(unsigned long ip)
+++=======
++ /**
++  * lockdep_hardirqs_on_prepare - Prepare for enabling interrupts
++  * @ip:		Caller address
++  *
++  * Invoked before a possible transition to RCU idle from exit to user or
++  * guest mode. This ensures that all RCU operations are done before RCU
++  * stops watching. After the RCU transition lockdep_hardirqs_on() has to be
++  * invoked to set the final state.
++  */
++ void lockdep_hardirqs_on_prepare(unsigned long ip)
+++>>>>>>> c86e9b987cea (lockdep: Prepare for noinstr sections)
+  {
+ +	time_hardirqs_on(CALLER_ADDR0, ip);
+ +
+  	if (unlikely(!debug_locks || current->lockdep_recursion))
+  		return;
+  
+@@@ -3685,28 -3699,62 +3690,82 @@@
+  	if (DEBUG_LOCKS_WARN_ON(current->hardirq_context))
+  		return;
+  
++ 	current->hardirq_chain_key = current->curr_chain_key;
++ 
+  	current->lockdep_recursion++;
+- 	__trace_hardirqs_on_caller(ip);
++ 	__trace_hardirqs_on_caller();
+  	lockdep_recursion_finish();
+  }
+++<<<<<<< HEAD
+ +EXPORT_SYMBOL(trace_hardirqs_on_caller);
+ +
+ +void trace_hardirqs_on(void)
+ +{
+ +	trace_hardirqs_on_caller(CALLER_ADDR0);
+ +}
+ +EXPORT_SYMBOL(trace_hardirqs_on);
+++=======
++ EXPORT_SYMBOL_GPL(lockdep_hardirqs_on_prepare);
++ 
++ void noinstr lockdep_hardirqs_on(unsigned long ip)
++ {
++ 	struct task_struct *curr = current;
++ 
++ 	if (unlikely(!debug_locks || curr->lockdep_recursion))
++ 		return;
++ 
++ 	if (curr->hardirqs_enabled) {
++ 		/*
++ 		 * Neither irq nor preemption are disabled here
++ 		 * so this is racy by nature but losing one hit
++ 		 * in a stat is not a big deal.
++ 		 */
++ 		__debug_atomic_inc(redundant_hardirqs_on);
++ 		return;
++ 	}
++ 
++ 	/*
++ 	 * We're enabling irqs and according to our state above irqs weren't
++ 	 * already enabled, yet we find the hardware thinks they are in fact
++ 	 * enabled.. someone messed up their IRQ state tracing.
++ 	 */
++ 	if (DEBUG_LOCKS_WARN_ON(!irqs_disabled()))
++ 		return;
++ 
++ 	/*
++ 	 * Ensure the lock stack remained unchanged between
++ 	 * lockdep_hardirqs_on_prepare() and lockdep_hardirqs_on().
++ 	 */
++ 	DEBUG_LOCKS_WARN_ON(current->hardirq_chain_key !=
++ 			    current->curr_chain_key);
++ 
++ 	/* we'll do an OFF -> ON transition: */
++ 	curr->hardirqs_enabled = 1;
++ 	curr->hardirq_enable_ip = ip;
++ 	curr->hardirq_enable_event = ++curr->irq_events;
++ 	debug_atomic_inc(hardirqs_on_events);
++ }
++ EXPORT_SYMBOL_GPL(lockdep_hardirqs_on);
+++>>>>>>> c86e9b987cea (lockdep: Prepare for noinstr sections)
+  
+  /*
+   * Hardirqs were disabled:
+   */
+++<<<<<<< HEAD
+ +__visible void trace_hardirqs_off_caller(unsigned long ip)
+ +{
+ +	struct task_struct *curr = current;
+ +
+ +	time_hardirqs_off(CALLER_ADDR0, ip);
+ +
+ +	if (unlikely(!debug_locks || current->lockdep_recursion))
+++=======
++ void noinstr lockdep_hardirqs_off(unsigned long ip)
++ {
++ 	struct task_struct *curr = current;
++ 
++ 	if (unlikely(!debug_locks || curr->lockdep_recursion))
+++>>>>>>> c86e9b987cea (lockdep: Prepare for noinstr sections)
+  		return;
+  
+  	/*
+@@@ -3724,16 -3772,11 +3783,21 @@@
+  		curr->hardirq_disable_ip = ip;
+  		curr->hardirq_disable_event = ++curr->irq_events;
+  		debug_atomic_inc(hardirqs_off_events);
+- 	} else
++ 	} else {
+  		debug_atomic_inc(redundant_hardirqs_off);
++ 	}
+  }
+++<<<<<<< HEAD
+ +EXPORT_SYMBOL(trace_hardirqs_off_caller);
+ +
+ +void trace_hardirqs_off(void)
+ +{
+ +	trace_hardirqs_off_caller(CALLER_ADDR0);
+ +}
+ +EXPORT_SYMBOL(trace_hardirqs_off);
+++=======
++ EXPORT_SYMBOL_GPL(lockdep_hardirqs_off);
+++>>>>>>> c86e9b987cea (lockdep: Prepare for noinstr sections)
+  
+  /*
+   * Softirqs will be enabled:
+@@@ -4699,7 -4740,8 +4763,12 @@@ __lock_release(struct lockdep_map *lock
+  	return 0;
+  }
+  
+++<<<<<<< HEAD
+ +static int __lock_is_held(const struct lockdep_map *lock, int read)
+++=======
++ static __always_inline
++ int __lock_is_held(const struct lockdep_map *lock, int read)
+++>>>>>>> c86e9b987cea (lockdep: Prepare for noinstr sections)
+  {
+  	struct task_struct *curr = current;
+  	int i;
+* Unmerged path kernel/trace/trace_preemptirq.c
+* Unmerged path include/linux/irqflags.h
+diff --git a/include/linux/sched.h b/include/linux/sched.h
+index 6a1641d92452..cc59e31e82b2 100644
+--- a/include/linux/sched.h
++++ b/include/linux/sched.h
+@@ -945,6 +945,7 @@ struct task_struct {
+ 	unsigned int			hardirq_disable_event;
+ 	int				hardirqs_enabled;
+ 	int				hardirq_context;
++	u64				hardirq_chain_key;
+ 	unsigned long			softirq_disable_ip;
+ 	unsigned long			softirq_enable_ip;
+ 	unsigned int			softirq_disable_event;
+* Unmerged path kernel/locking/lockdep.c
+* Unmerged path kernel/trace/trace_preemptirq.c
+diff --git a/lib/debug_locks.c b/lib/debug_locks.c
+index ce51749cc145..798a1f0a35d0 100644
+--- a/lib/debug_locks.c
++++ b/lib/debug_locks.c
+@@ -35,7 +35,7 @@ EXPORT_SYMBOL_GPL(debug_locks_silent);
+ /*
+  * Generic 'turn off all lock debugging' function:
+  */
+-int debug_locks_off(void)
++noinstr int debug_locks_off(void)
+ {
+ 	if (debug_locks && __debug_locks_off()) {
+ 		if (!debug_locks_silent) {
