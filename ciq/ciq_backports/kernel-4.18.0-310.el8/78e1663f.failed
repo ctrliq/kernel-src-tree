@@ -1,0 +1,128 @@
+sd_zbc: clear zone resources for non-zoned case
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-310.el8
+commit-author Damien Le Moal <damien.lemoal@wdc.com>
+commit 78e1663f19b5c34579cf186e776df3bf1ed326a5
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-310.el8/78e1663f.failed
+
+For host-aware ZBC disk, setting the device zoned model to BLK_ZONED_HA
+using blk_queue_set_zoned() in sd_read_block_characteristics() may
+result in the block device effective zoned model to be "none"
+(BLK_ZONED_NONE) if partitions are present on the device. In this case,
+sd_zbc_read_zones() should not setup the zone related queue limits for
+the disk so that the device limits and configuration is consistent with
+a regular disk and resources not uselessly allocated (e.g. the zone
+write pointer tracking array for zone append emulation).
+
+Furthermore, if the disk zoned model changes at run time due to the
+creation of a partition by the user, the zone related resources can be
+released.
+
+Fix both problems by introducing the function sd_zbc_clear_zone_info()
+to reset the scsi disk zone information and free resources and by
+returning early in sd_zbc_read_zones() for a block device that has a
+zoned model equal to BLK_ZONED_NONE.
+
+	Signed-off-by: Damien Le Moal <damien.lemoal@wdc.com>
+	Reviewed-by: Christoph Hellwig <hch@lst.de>
+	Reviewed-by: Martin K. Petersen <martin.petersen@oracle.com>
+	Reviewed-by: Chaitanya Kulkarni <chaitanya.kulkarni@wdc.com>
+	Reviewed-by: Johannes Thumshirn <johannes.thumshirn@edc.com>
+	Signed-off-by: Jens Axboe <axboe@kernel.dk>
+(cherry picked from commit 78e1663f19b5c34579cf186e776df3bf1ed326a5)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/scsi/sd_zbc.c
+diff --cc drivers/scsi/sd_zbc.c
+index 03ce186ae933,03adb39293c2..000000000000
+--- a/drivers/scsi/sd_zbc.c
++++ b/drivers/scsi/sd_zbc.c
+@@@ -651,12 -665,28 +651,35 @@@ int sd_zbc_init_disk(struct scsi_disk *
+  	return 0;
+  }
+  
+- void sd_zbc_release_disk(struct scsi_disk *sdkp)
++ static void sd_zbc_clear_zone_info(struct scsi_disk *sdkp)
+  {
+++<<<<<<< HEAD
+ +	kvfree(sdkp->aux->zones_wp_offset);
+ +	sdkp->aux->zones_wp_offset = NULL;
+ +	kfree(sdkp->aux->zone_wp_update_buf);
+ +	sdkp->aux->zone_wp_update_buf = NULL;
+++=======
++ 	/* Serialize against revalidate zones */
++ 	mutex_lock(&sdkp->rev_mutex);
++ 
++ 	kvfree(sdkp->zones_wp_offset);
++ 	sdkp->zones_wp_offset = NULL;
++ 	kfree(sdkp->zone_wp_update_buf);
++ 	sdkp->zone_wp_update_buf = NULL;
++ 
++ 	sdkp->nr_zones = 0;
++ 	sdkp->rev_nr_zones = 0;
++ 	sdkp->zone_blocks = 0;
++ 	sdkp->rev_zone_blocks = 0;
++ 
++ 	mutex_unlock(&sdkp->rev_mutex);
++ }
++ 
++ void sd_zbc_release_disk(struct scsi_disk *sdkp)
++ {
++ 	if (sd_is_zoned(sdkp))
++ 		sd_zbc_clear_zone_info(sdkp);
+++>>>>>>> 78e1663f19b5 (sd_zbc: clear zone resources for non-zoned case)
+  }
+  
+  static void sd_zbc_revalidate_zones_cb(struct gendisk *disk)
+@@@ -755,28 -813,23 +793,41 @@@ int sd_zbc_read_zones(struct scsi_disk 
+  	/* The drive satisfies the kernel restrictions: set it up */
+  	blk_queue_flag_set(QUEUE_FLAG_ZONE_RESETALL, q);
+  	blk_queue_required_elevator_features(q, ELEVATOR_F_ZBD_SEQ_WRITE);
+ -	if (sdkp->zones_max_open == U32_MAX)
+ -		blk_queue_max_open_zones(q, 0);
+ -	else
+ -		blk_queue_max_open_zones(q, sdkp->zones_max_open);
+ -	blk_queue_max_active_zones(q, 0);
+  	nr_zones = round_up(sdkp->capacity, zone_blocks) >> ilog2(zone_blocks);
+  
+++<<<<<<< HEAD
+ +	/* READ16/WRITE16 is mandatory for ZBC disks */
+ +	sdkp->device->use_16_for_rw = 1;
+ +	sdkp->device->use_10_for_rw = 0;
+ +
+ +	ret = sd_zbc_revalidate_zones(sdkp, zone_blocks, nr_zones);
+ +	if (ret)
+ +		goto err;
+ +
+ +	/*
+ +	 * On the first scan 'chunk_sectors' isn't setup yet, so calling
+ +	 * blk_queue_max_zone_append_sectors() will result in a WARN(). Defer
+ +	 * this setting to the second scan.
+ +	 */
+ +	if (sdkp->first_scan)
+ +		return 0;
+ +
+ +	max_append = min_t(u32, logical_to_sectors(sdkp->device, zone_blocks),
+ +			   q->limits.max_segments << (PAGE_SHIFT - 9));
+ +
+ +	blk_queue_max_zone_append_sectors(q, max_append);
+++=======
++ 	/*
++ 	 * Per ZBC and ZAC specifications, writes in sequential write required
++ 	 * zones of host-managed devices must be aligned to the device physical
++ 	 * block size.
++ 	 */
++ 	if (blk_queue_zoned_model(q) == BLK_ZONED_HM)
++ 		blk_queue_zone_write_granularity(q, sdkp->physical_block_size);
++ 
++ 	sdkp->rev_nr_zones = nr_zones;
++ 	sdkp->rev_zone_blocks = zone_blocks;
+++>>>>>>> 78e1663f19b5 (sd_zbc: clear zone resources for non-zoned case)
+  
+  	return 0;
+  
+* Unmerged path drivers/scsi/sd_zbc.c
