@@ -1,0 +1,171 @@
+powerpc/papr_scm: Add perf interface support
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-408.el8
+commit-author Kajol Jain <kjain@linux.ibm.com>
+commit 4c08d4bbc089a95f3f38389c2b79dbc6ab24f10b
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-408.el8/4c08d4bb.failed
+
+Performance monitoring support for papr-scm nvdimm devices
+via perf interface is added which includes addition of pmu
+functions like add/del/read/event_init for nvdimm_pmu struture.
+
+A new parameter 'priv' in added to the pdev_archdata structure to save
+nvdimm_pmu device pointer, to handle the unregistering of pmu device.
+
+papr_scm_pmu_register function populates the nvdimm_pmu structure
+with name, capabilities, cpumask along with event handling
+functions. Finally the populated nvdimm_pmu structure is passed to
+register the pmu device. Event handling functions internally uses
+hcall to get events and counter data.
+
+Result in power9 machine with 2 nvdimm device:
+
+Ex: List all event by perf list
+
+command:# perf list nmem
+
+  nmem0/cache_rh_cnt/                                [Kernel PMU event]
+  nmem0/cache_wh_cnt/                                [Kernel PMU event]
+  nmem0/cri_res_util/                                [Kernel PMU event]
+  nmem0/ctl_res_cnt/                                 [Kernel PMU event]
+  nmem0/ctl_res_tm/                                  [Kernel PMU event]
+  nmem0/fast_w_cnt/                                  [Kernel PMU event]
+  nmem0/host_l_cnt/                                  [Kernel PMU event]
+  nmem0/host_l_dur/                                  [Kernel PMU event]
+  nmem0/host_s_cnt/                                  [Kernel PMU event]
+  nmem0/host_s_dur/                                  [Kernel PMU event]
+  nmem0/med_r_cnt/                                   [Kernel PMU event]
+  nmem0/med_r_dur/                                   [Kernel PMU event]
+  nmem0/med_w_cnt/                                   [Kernel PMU event]
+  nmem0/med_w_dur/                                   [Kernel PMU event]
+  nmem0/mem_life/                                    [Kernel PMU event]
+  nmem0/poweron_secs/                                [Kernel PMU event]
+  ...
+  nmem1/mem_life/                                    [Kernel PMU event]
+  nmem1/poweron_secs/                                [Kernel PMU event]
+
+	Acked-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+	Tested-by: Nageswara R Sastry <rnsastry@linux.ibm.com>
+	Signed-off-by: Kajol Jain <kjain@linux.ibm.com>
+[Add numa_map_to_online_node function call to get online node id]
+	Reported-by: Nageswara R Sastry <rnsastry@linux.ibm.com>
+	Reviewed-by: Madhavan Srinivasan <maddy@in.ibm.com>
+Link: https://lore.kernel.org/r/20220225143024.47947-4-kjain@linux.ibm.com
+	Signed-off-by: Dan Williams <dan.j.williams@intel.com>
+(cherry picked from commit 4c08d4bbc089a95f3f38389c2b79dbc6ab24f10b)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/powerpc/platforms/pseries/papr_scm.c
+diff --cc arch/powerpc/platforms/pseries/papr_scm.c
+index 8ac8b5513ae6,4dd513d7c029..000000000000
+--- a/arch/powerpc/platforms/pseries/papr_scm.c
++++ b/arch/powerpc/platforms/pseries/papr_scm.c
+@@@ -17,6 -16,10 +17,12 @@@
+  
+  #include <asm/plpar_wrappers.h>
+  #include <asm/papr_pdsm.h>
+++<<<<<<< HEAD
+++=======
++ #include <asm/mce.h>
++ #include <asm/unaligned.h>
++ #include <linux/perf_event.h>
+++>>>>>>> 4c08d4bbc089 (powerpc/papr_scm: Add perf interface support)
+  
+  #define BIND_ANY_ADDR (~0ul)
+  
+@@@ -114,11 -121,48 +122,16 @@@ struct papr_scm_priv 
+  	/* length of the stat buffer as expected by phyp */
+  	size_t stat_buffer_len;
+  
+++<<<<<<< HEAD
+ +	/* The bits which needs to be overridden */
+ +	u64 health_bitmap_inject_mask;
+ +
+++=======
++ 	 /* array to have event_code and stat_id mappings */
++ 	char **nvdimm_events_map;
+++>>>>>>> 4c08d4bbc089 (powerpc/papr_scm: Add perf interface support)
+  };
+  
+ -static int papr_scm_pmem_flush(struct nd_region *nd_region,
+ -			       struct bio *bio __maybe_unused)
+ -{
+ -	struct papr_scm_priv *p = nd_region_provider_data(nd_region);
+ -	unsigned long ret_buf[PLPAR_HCALL_BUFSIZE], token = 0;
+ -	long rc;
+ -
+ -	dev_dbg(&p->pdev->dev, "flush drc 0x%x", p->drc_index);
+ -
+ -	do {
+ -		rc = plpar_hcall(H_SCM_FLUSH, ret_buf, p->drc_index, token);
+ -		token = ret_buf[0];
+ -
+ -		/* Check if we are stalled for some time */
+ -		if (H_IS_LONG_BUSY(rc)) {
+ -			msleep(get_longbusy_msecs(rc));
+ -			rc = H_BUSY;
+ -		} else if (rc == H_BUSY) {
+ -			cond_resched();
+ -		}
+ -	} while (rc == H_BUSY);
+ -
+ -	if (rc) {
+ -		dev_err(&p->pdev->dev, "flush error: %ld", rc);
+ -		rc = -EIO;
+ -	} else {
+ -		dev_dbg(&p->pdev->dev, "flush drc 0x%x complete", p->drc_index);
+ -	}
+ -
+ -	return rc;
+ -}
+ -
+ -static LIST_HEAD(papr_nd_regions);
+ -static DEFINE_MUTEX(papr_ndr_lock);
+ -
+  static int drc_pmem_bind(struct papr_scm_priv *p)
+  {
+  	unsigned long ret[PLPAR_HCALL_BUFSIZE];
+@@@ -1172,8 -1467,19 +1398,18 @@@ static int papr_scm_remove(struct platf
+  {
+  	struct papr_scm_priv *p = platform_get_drvdata(pdev);
+  
+ -	mutex_lock(&papr_ndr_lock);
+ -	list_del(&p->region_list);
+ -	mutex_unlock(&papr_ndr_lock);
+ -
+  	nvdimm_bus_unregister(p->bus);
+  	drc_pmem_unbind(p);
+++<<<<<<< HEAD
+++=======
++ 
++ 	if (pdev->archdata.priv)
++ 		unregister_nvdimm_pmu(pdev->archdata.priv);
++ 
++ 	pdev->archdata.priv = NULL;
++ 	kfree(p->nvdimm_events_map);
++ 	kfree(p->bus_desc.provider_name);
+++>>>>>>> 4c08d4bbc089 (powerpc/papr_scm: Add perf interface support)
+  	kfree(p);
+  
+  	return 0;
+diff --git a/arch/powerpc/include/asm/device.h b/arch/powerpc/include/asm/device.h
+index 3bcee69b38e0..6a4b23b988bd 100644
+--- a/arch/powerpc/include/asm/device.h
++++ b/arch/powerpc/include/asm/device.h
+@@ -52,6 +52,11 @@ struct dev_archdata {
+ 
+ struct pdev_archdata {
+ 	u64 dma_mask;
++	/*
++	 * Pointer to nvdimm_pmu structure, to handle the unregistering
++	 * of pmu device
++	 */
++	void *priv;
+ };
+ 
+ #endif /* _ASM_POWERPC_DEVICE_H */
+* Unmerged path arch/powerpc/platforms/pseries/papr_scm.c
