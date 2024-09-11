@@ -1296,7 +1296,7 @@ static int __init nvmet_init(void)
 
 	error = nvmet_init_discovery();
 	if (error)
-		goto out;
+		goto out_free_work_queue;
 
 	error = nvmet_init_configfs();
 	if (error)
@@ -1305,6 +1305,8 @@ static int __init nvmet_init(void)
 
 out_exit_discovery:
 	nvmet_exit_discovery();
+out_free_work_queue:
+	destroy_workqueue(buffered_io_wq);
 out:
 	return error;
 }
