@@ -1,0 +1,142 @@
+KVM: PPC: Book3S HV: Use __gfn_to_pfn_memslot in HPT page fault handler
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-193.el8
+commit-author Paul Mackerras <paulus@ozlabs.org>
+commit cd758a9b57ee85f0733c759e60f42b969c81f27b
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-193.el8/cd758a9b.failed
+
+This makes the same changes in the page fault handler for HPT guests
+that commits 31c8b0d0694a ("KVM: PPC: Book3S HV: Use __gfn_to_pfn_memslot()
+in page fault handler", 2018-03-01), 71d29f43b633 ("KVM: PPC: Book3S HV:
+Don't use compound_order to determine host mapping size", 2018-09-11)
+and 6579804c4317 ("KVM: PPC: Book3S HV: Avoid crash from THP collapse
+during radix page fault", 2018-10-04) made for the page fault handler
+for radix guests.
+
+In summary, where we used to call get_user_pages_fast() and then do
+special handling for VM_PFNMAP vmas, we now call __get_user_pages_fast()
+and then __gfn_to_pfn_memslot() if that fails, followed by reading the
+Linux PTE to get the host PFN, host page size and mapping attributes.
+
+This also brings in the change from SetPageDirty() to set_page_dirty_lock()
+which was done for the radix page fault handler in commit c3856aeb2940
+("KVM: PPC: Book3S HV: Fix handling of large pages in radix page fault
+handler", 2018-02-23).
+
+	Signed-off-by: Paul Mackerras <paulus@ozlabs.org>
+(cherry picked from commit cd758a9b57ee85f0733c759e60f42b969c81f27b)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/powerpc/kvm/book3s_64_mmu_hv.c
+diff --cc arch/powerpc/kvm/book3s_64_mmu_hv.c
+index 33f519595cac,3aecec890d6f..000000000000
+--- a/arch/powerpc/kvm/book3s_64_mmu_hv.c
++++ b/arch/powerpc/kvm/book3s_64_mmu_hv.c
+@@@ -513,13 -489,14 +513,17 @@@ int kvmppc_book3s_hv_page_fault(struct 
+  	struct kvm_memory_slot *memslot;
+  	unsigned long *rmap;
+  	struct revmap_entry *rev;
+- 	struct page *page, *pages[1];
+- 	long index, ret, npages;
++ 	struct page *page;
++ 	long index, ret;
+  	bool is_ci;
+- 	unsigned int writing, write_ok;
+- 	struct vm_area_struct *vma;
++ 	bool writing, write_ok;
++ 	unsigned int shift;
+  	unsigned long rcbits;
+  	long mmio_update;
+++<<<<<<< HEAD
+++=======
++ 	pte_t pte, *ptep;
+++>>>>>>> cd758a9b57ee (KVM: PPC: Book3S HV: Use __gfn_to_pfn_memslot in HPT page fault handler)
+  
+  	if (kvm_is_radix(kvm))
+  		return kvmppc_book3s_radix_page_fault(run, vcpu, ea, dsisr);
+@@@ -593,54 -570,31 +597,78 @@@
+  	smp_rmb();
+  
+  	ret = -EFAULT;
+- 	is_ci = false;
+- 	pfn = 0;
+  	page = NULL;
+++<<<<<<< HEAD
+ +	pte_size = PAGE_SIZE;
+++=======
+++>>>>>>> cd758a9b57ee (KVM: PPC: Book3S HV: Use __gfn_to_pfn_memslot in HPT page fault handler)
+  	writing = (dsisr & DSISR_ISSTORE) != 0;
+  	/* If writing != 0, then the HPTE must allow writing, if we get here */
+  	write_ok = writing;
+  	hva = gfn_to_hva_memslot(memslot, gfn);
+++<<<<<<< HEAD
+ +	npages = get_user_pages_fast(hva, 1, writing, pages);
+ +	if (npages < 1) {
+ +		/* Check if it's an I/O mapping */
+ +		down_read(&current->mm->mmap_sem);
+ +		vma = find_vma(current->mm, hva);
+ +		if (vma && vma->vm_start <= hva && hva + psize <= vma->vm_end &&
+ +		    (vma->vm_flags & VM_PFNMAP)) {
+ +			pfn = vma->vm_pgoff +
+ +				((hva - vma->vm_start) >> PAGE_SHIFT);
+ +			pte_size = psize;
+ +			is_ci = pte_ci(__pte((pgprot_val(vma->vm_page_prot))));
+ +			write_ok = vma->vm_flags & VM_WRITE;
+ +		}
+ +		up_read(&current->mm->mmap_sem);
+ +		if (!pfn)
+ +			goto out_put;
+ +	} else {
+ +		page = pages[0];
+ +		pfn = page_to_pfn(page);
+ +		if (PageHuge(page)) {
+ +			page = compound_head(page);
+ +			pte_size <<= compound_order(page);
+ +		}
+ +		/* if the guest wants write access, see if that is OK */
+ +		if (!writing && hpte_is_writable(r)) {
+ +			pte_t *ptep, pte;
+ +			unsigned long flags;
+ +			/*
+ +			 * We need to protect against page table destruction
+ +			 * hugepage split and collapse.
+ +			 */
+ +			local_irq_save(flags);
+ +			ptep = find_current_mm_pte(current->mm->pgd,
+ +						   hva, NULL, NULL);
+ +			if (ptep) {
+ +				pte = kvmppc_read_update_linux_pte(ptep, 1);
+ +				if (__pte_write(pte))
+ +					write_ok = 1;
+ +			}
+ +			local_irq_restore(flags);
+++=======
++ 
++ 	/*
++ 	 * Do a fast check first, since __gfn_to_pfn_memslot doesn't
++ 	 * do it with !atomic && !async, which is how we call it.
++ 	 * We always ask for write permission since the common case
++ 	 * is that the page is writable.
++ 	 */
++ 	if (__get_user_pages_fast(hva, 1, 1, &page) == 1) {
++ 		write_ok = true;
++ 	} else {
++ 		/* Call KVM generic code to do the slow-path check */
++ 		pfn = __gfn_to_pfn_memslot(memslot, gfn, false, NULL,
++ 					   writing, &write_ok);
++ 		if (is_error_noslot_pfn(pfn))
++ 			return -EFAULT;
++ 		page = NULL;
++ 		if (pfn_valid(pfn)) {
++ 			page = pfn_to_page(pfn);
++ 			if (PageReserved(page))
++ 				page = NULL;
+++>>>>>>> cd758a9b57ee (KVM: PPC: Book3S HV: Use __gfn_to_pfn_memslot in HPT page fault handler)
+  		}
+  	}
+  
+* Unmerged path arch/powerpc/kvm/book3s_64_mmu_hv.c
