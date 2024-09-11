@@ -1,0 +1,194 @@
+kasan: fix krealloc handling for tag-based mode
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Andrey Konovalov <andreyknvl@google.com>
+commit a3fe7cdf02e318870fb71218726cc2321ff41f30
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/a3fe7cdf.failed
+
+Right now tag-based KASAN can retag the memory that is reallocated via
+krealloc and return a differently tagged pointer even if the same slab
+object gets used and no reallocated technically happens.
+
+There are a few issues with this approach.  One is that krealloc callers
+can't rely on comparing the return value with the passed argument to
+check whether reallocation happened.  Another is that if a caller knows
+that no reallocation happened, that it can access object memory through
+the old pointer, which leads to false positives.  Look at
+nf_ct_ext_add() to see an example.
+
+Fix this by keeping the same tag if the memory don't actually gets
+reallocated during krealloc.
+
+Link: http://lkml.kernel.org/r/bb2a71d17ed072bcc528cbee46fcbd71a6da3be4.1546540962.git.andreyknvl@google.com
+	Signed-off-by: Andrey Konovalov <andreyknvl@google.com>
+	Cc: Andrey Ryabinin <aryabinin@virtuozzo.com>
+	Cc: Christoph Lameter <cl@linux.com>
+	Cc: Dmitry Vyukov <dvyukov@google.com>
+	Cc: Mark Rutland <mark.rutland@arm.com>
+	Cc: Vincenzo Frascino <vincenzo.frascino@arm.com>
+	Cc: Will Deacon <will.deacon@arm.com>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit a3fe7cdf02e318870fb71218726cc2321ff41f30)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	mm/kasan/kasan.c
+diff --cc mm/kasan/kasan.c
+index d79269dd4b58,73c9cbfdedf4..000000000000
+--- a/mm/kasan/kasan.c
++++ b/mm/kasan/kasan.c
+@@@ -413,62 -346,45 +413,104 @@@ void kasan_poison_object_data(struct km
+  			KASAN_KMALLOC_REDZONE);
+  }
+  
+++<<<<<<< HEAD:mm/kasan/kasan.c
+ +static inline int in_irqentry_text(unsigned long ptr)
+ +{
+ +	return (ptr >= (unsigned long)&__irqentry_text_start &&
+ +		ptr < (unsigned long)&__irqentry_text_end) ||
+ +		(ptr >= (unsigned long)&__softirqentry_text_start &&
+ +		 ptr < (unsigned long)&__softirqentry_text_end);
+ +}
+ +
+ +static inline void filter_irq_stacks(struct stack_trace *trace)
+ +{
+ +	int i;
+ +
+ +	if (!trace->nr_entries)
+ +		return;
+ +	for (i = 0; i < trace->nr_entries; i++)
+ +		if (in_irqentry_text(trace->entries[i])) {
+ +			/* Include the irqentry function into the stack. */
+ +			trace->nr_entries = i + 1;
+ +			break;
+ +		}
+ +}
+ +
+ +static inline depot_stack_handle_t save_stack(gfp_t flags)
+ +{
+ +	unsigned long entries[KASAN_STACK_DEPTH];
+ +	struct stack_trace trace = {
+ +		.nr_entries = 0,
+ +		.entries = entries,
+ +		.max_entries = KASAN_STACK_DEPTH,
+ +		.skip = 0
+ +	};
+ +
+ +	save_stack_trace(&trace);
+ +	filter_irq_stacks(&trace);
+ +
+ +	return depot_save_stack(&trace, flags);
+ +}
+ +
+ +static inline void set_track(struct kasan_track *track, gfp_t flags)
+ +{
+ +	track->pid = current->pid;
+ +	track->stack = save_stack(flags);
+ +}
+ +
+ +struct kasan_alloc_meta *get_alloc_info(struct kmem_cache *cache,
+ +					const void *object)
+ +{
+ +	BUILD_BUG_ON(sizeof(struct kasan_alloc_meta) > 32);
+ +	return (void *)object + cache->kasan_info.alloc_meta_offset;
+ +}
+ +
+ +struct kasan_free_meta *get_free_info(struct kmem_cache *cache,
+ +				      const void *object)
+ +{
+ +	BUILD_BUG_ON(sizeof(struct kasan_free_meta) > 32);
+ +	return (void *)object + cache->kasan_info.free_meta_offset;
+++=======
++ /*
++  * This function assigns a tag to an object considering the following:
++  * 1. A cache might have a constructor, which might save a pointer to a slab
++  *    object somewhere (e.g. in the object itself). We preassign a tag for
++  *    each object in caches with constructors during slab creation and reuse
++  *    the same tag each time a particular object is allocated.
++  * 2. A cache might be SLAB_TYPESAFE_BY_RCU, which means objects can be
++  *    accessed after being freed. We preassign tags for objects in these
++  *    caches as well.
++  * 3. For SLAB allocator we can't preassign tags randomly since the freelist
++  *    is stored as an array of indexes instead of a linked list. Assign tags
++  *    based on objects indexes, so that objects that are next to each other
++  *    get different tags.
++  */
++ static u8 assign_tag(struct kmem_cache *cache, const void *object,
++ 			bool init, bool krealloc)
++ {
++ 	/* Reuse the same tag for krealloc'ed objects. */
++ 	if (krealloc)
++ 		return get_tag(object);
++ 
++ 	/*
++ 	 * If the cache neither has a constructor nor has SLAB_TYPESAFE_BY_RCU
++ 	 * set, assign a tag when the object is being allocated (init == false).
++ 	 */
++ 	if (!cache->ctor && !(cache->flags & SLAB_TYPESAFE_BY_RCU))
++ 		return init ? KASAN_TAG_KERNEL : random_tag();
++ 
++ 	/* For caches that either have a constructor or SLAB_TYPESAFE_BY_RCU: */
++ #ifdef CONFIG_SLAB
++ 	/* For SLAB assign tags based on the object index in the freelist. */
++ 	return (u8)obj_to_index(cache, virt_to_page(object), (void *)object);
++ #else
++ 	/*
++ 	 * For SLUB assign a random tag during slab creation, otherwise reuse
++ 	 * the already assigned tag.
++ 	 */
++ 	return init ? random_tag() : get_tag(object);
++ #endif
+++>>>>>>> a3fe7cdf02e3 (kasan: fix krealloc handling for tag-based mode):mm/kasan/common.c
+  }
+  
+  void * __must_check kasan_init_slab_obj(struct kmem_cache *cache,
+@@@ -482,6 -398,10 +524,13 @@@
+  	alloc_info = get_alloc_info(cache, object);
+  	__memset(alloc_info, 0, sizeof(*alloc_info));
+  
+++<<<<<<< HEAD:mm/kasan/kasan.c
+++=======
++ 	if (IS_ENABLED(CONFIG_KASAN_SW_TAGS))
++ 		object = set_tag(object,
++ 				assign_tag(cache, object, true, false));
++ 
+++>>>>>>> a3fe7cdf02e3 (kasan: fix krealloc handling for tag-based mode):mm/kasan/common.c
+  	return (void *)object;
+  }
+  
+@@@ -546,15 -484,25 +595,29 @@@ static void *__kasan_kmalloc(struct kme
+  	redzone_end = round_up((unsigned long)object + cache->object_size,
+  				KASAN_SHADOW_SCALE_SIZE);
+  
+++<<<<<<< HEAD:mm/kasan/kasan.c
+ +	kasan_unpoison_shadow(object, size);
+++=======
++ 	if (IS_ENABLED(CONFIG_KASAN_SW_TAGS))
++ 		tag = assign_tag(cache, object, false, krealloc);
++ 
++ 	/* Tag is ignored in set_tag without CONFIG_KASAN_SW_TAGS */
++ 	kasan_unpoison_shadow(set_tag(object, tag), size);
+++>>>>>>> a3fe7cdf02e3 (kasan: fix krealloc handling for tag-based mode):mm/kasan/common.c
+  	kasan_poison_shadow((void *)redzone_start, redzone_end - redzone_start,
+  		KASAN_KMALLOC_REDZONE);
+  
+  	if (cache->flags & SLAB_KASAN)
+  		set_track(&get_alloc_info(cache, object)->alloc_track, flags);
+  
+ -	return set_tag(object, tag);
+ +	return (void *)object;
+  }
++ 
++ void * __must_check kasan_kmalloc(struct kmem_cache *cache, const void *object,
++ 				size_t size, gfp_t flags)
++ {
++ 	return __kasan_kmalloc(cache, object, size, flags, false);
++ }
+  EXPORT_SYMBOL(kasan_kmalloc);
+  
+  void * __must_check kasan_kmalloc_large(const void *ptr, size_t size,
+* Unmerged path mm/kasan/kasan.c
