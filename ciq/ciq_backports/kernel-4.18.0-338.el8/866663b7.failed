@@ -1,0 +1,114 @@
+block: return ELEVATOR_DISCARD_MERGE if possible
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-338.el8
+commit-author Ming Lei <ming.lei@redhat.com>
+commit 866663b7b52d2da267b28e12eed89ee781b8fed1
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-338.el8/866663b7.failed
+
+When merging one bio to request, if they are discard IO and the queue
+supports multi-range discard, we need to return ELEVATOR_DISCARD_MERGE
+because both block core and related drivers(nvme, virtio-blk) doesn't
+handle mixed discard io merge(traditional IO merge together with
+discard merge) well.
+
+Fix the issue by returning ELEVATOR_DISCARD_MERGE in this situation,
+so both blk-mq and drivers just need to handle multi-range discard.
+
+	Reported-by: Oleksandr Natalenko <oleksandr@natalenko.name>
+	Signed-off-by: Ming Lei <ming.lei@redhat.com>
+	Tested-by: Oleksandr Natalenko <oleksandr@natalenko.name>
+Fixes: 2705dfb20947 ("block: fix discard request merge")
+Link: https://lore.kernel.org/r/20210729034226.1591070-1-ming.lei@redhat.com
+	Signed-off-by: Jens Axboe <axboe@kernel.dk>
+(cherry picked from commit 866663b7b52d2da267b28e12eed89ee781b8fed1)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	block/mq-deadline-main.c
+* Unmerged path block/mq-deadline-main.c
+diff --git a/block/bfq-iosched.c b/block/bfq-iosched.c
+index a3372b860340..a3663a0812ec 100644
+--- a/block/bfq-iosched.c
++++ b/block/bfq-iosched.c
+@@ -2305,6 +2305,9 @@ static int bfq_request_merge(struct request_queue *q, struct request **req,
+ 	__rq = bfq_find_rq_fmerge(bfqd, bio, q);
+ 	if (__rq && elv_bio_merge_ok(__rq, bio)) {
+ 		*req = __rq;
++
++		if (blk_discard_mergable(__rq))
++			return ELEVATOR_DISCARD_MERGE;
+ 		return ELEVATOR_FRONT_MERGE;
+ 	}
+ 
+diff --git a/block/blk-merge.c b/block/blk-merge.c
+index d52ca640ebbd..aec2755e8b9b 100644
+--- a/block/blk-merge.c
++++ b/block/blk-merge.c
+@@ -693,22 +693,6 @@ static void blk_account_io_merge_request(struct request *req)
+ 	}
+ }
+ 
+-/*
+- * Two cases of handling DISCARD merge:
+- * If max_discard_segments > 1, the driver takes every bio
+- * as a range and send them to controller together. The ranges
+- * needn't to be contiguous.
+- * Otherwise, the bios/requests will be handled as same as
+- * others which should be contiguous.
+- */
+-static inline bool blk_discard_mergable(struct request *req)
+-{
+-	if (req_op(req) == REQ_OP_DISCARD &&
+-	    queue_max_discard_segments(req->q) > 1)
+-		return true;
+-	return false;
+-}
+-
+ static enum elv_merge blk_try_req_merge(struct request *req,
+ 					struct request *next)
+ {
+diff --git a/block/elevator.c b/block/elevator.c
+index d1f0c061a731..aa39bbc8f7ec 100644
+--- a/block/elevator.c
++++ b/block/elevator.c
+@@ -350,6 +350,9 @@ enum elv_merge elv_merge(struct request_queue *q, struct request **req,
+ 	__rq = elv_rqhash_find(q, bio->bi_iter.bi_sector);
+ 	if (__rq && elv_bio_merge_ok(__rq, bio)) {
+ 		*req = __rq;
++
++		if (blk_discard_mergable(__rq))
++			return ELEVATOR_DISCARD_MERGE;
+ 		return ELEVATOR_BACK_MERGE;
+ 	}
+ 
+* Unmerged path block/mq-deadline-main.c
+diff --git a/include/linux/blkdev.h b/include/linux/blkdev.h
+index 3554f7fdbe26..05242726698d 100644
+--- a/include/linux/blkdev.h
++++ b/include/linux/blkdev.h
+@@ -1486,6 +1486,22 @@ static inline int queue_limit_discard_alignment(struct queue_limits *lim, sector
+ 	return offset << SECTOR_SHIFT;
+ }
+ 
++/*
++ * Two cases of handling DISCARD merge:
++ * If max_discard_segments > 1, the driver takes every bio
++ * as a range and send them to controller together. The ranges
++ * needn't to be contiguous.
++ * Otherwise, the bios/requests will be handled as same as
++ * others which should be contiguous.
++ */
++static inline bool blk_discard_mergable(struct request *req)
++{
++	if (req_op(req) == REQ_OP_DISCARD &&
++	    queue_max_discard_segments(req->q) > 1)
++		return true;
++	return false;
++}
++
+ static inline int bdev_discard_alignment(struct block_device *bdev)
+ {
+ 	struct request_queue *q = bdev_get_queue(bdev);
