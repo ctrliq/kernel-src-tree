@@ -1,0 +1,145 @@
+Fix use after free in get_tree_bdev()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author David Howells <dhowells@redhat.com>
+commit dd7bc8158b413e0b580c491e8bd18cb91057c7c2
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/dd7bc815.failed
+
+Commit 6fcf0c72e4b9, a fix to get_tree_bdev() put a missing blkdev_put() in
+the wrong place, before a warnf() that displays the bdev under
+consideration rather after it.
+
+This results in a silent lockup in printk("%pg") called via warnf() from
+get_tree_bdev() under some circumstances when there's a race with the
+blockdev being frozen.  This can be caused by xfstests/tests/generic/085 in
+combination with Lukas Czerner's ext4 mount API conversion patchset.  It
+looks like it ought to occur with other users of get_tree_bdev() such as
+XFS, but apparently doesn't.
+
+Fix this by switching the order of the lines.
+
+Fixes: 6fcf0c72e4b9 ("vfs: add missing blkdev_put() in get_tree_bdev()")
+	Reported-by: Lukas Czerner <lczerner@redhat.com>
+	Signed-off-by: David Howells <dhowells@redhat.com>
+cc: Ian Kent <raven@themaw.net>
+cc: Al Viro <viro@zeniv.linux.org.uk>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit dd7bc8158b413e0b580c491e8bd18cb91057c7c2)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/super.c
+diff --cc fs/super.c
+index 72596c26684f,a288cd60d2ae..000000000000
+--- a/fs/super.c
++++ b/fs/super.c
+@@@ -1094,6 -1259,102 +1094,105 @@@ static int set_bdev_super(struct super_
+  	return 0;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static int set_bdev_super_fc(struct super_block *s, struct fs_context *fc)
++ {
++ 	return set_bdev_super(s, fc->sget_key);
++ }
++ 
++ static int test_bdev_super_fc(struct super_block *s, struct fs_context *fc)
++ {
++ 	return s->s_bdev == fc->sget_key;
++ }
++ 
++ /**
++  * get_tree_bdev - Get a superblock based on a single block device
++  * @fc: The filesystem context holding the parameters
++  * @fill_super: Helper to initialise a new superblock
++  */
++ int get_tree_bdev(struct fs_context *fc,
++ 		int (*fill_super)(struct super_block *,
++ 				  struct fs_context *))
++ {
++ 	struct block_device *bdev;
++ 	struct super_block *s;
++ 	fmode_t mode = FMODE_READ | FMODE_EXCL;
++ 	int error = 0;
++ 
++ 	if (!(fc->sb_flags & SB_RDONLY))
++ 		mode |= FMODE_WRITE;
++ 
++ 	if (!fc->source)
++ 		return invalf(fc, "No source specified");
++ 
++ 	bdev = blkdev_get_by_path(fc->source, mode, fc->fs_type);
++ 	if (IS_ERR(bdev)) {
++ 		errorf(fc, "%s: Can't open blockdev", fc->source);
++ 		return PTR_ERR(bdev);
++ 	}
++ 
++ 	/* Once the superblock is inserted into the list by sget_fc(), s_umount
++ 	 * will protect the lockfs code from trying to start a snapshot while
++ 	 * we are mounting
++ 	 */
++ 	mutex_lock(&bdev->bd_fsfreeze_mutex);
++ 	if (bdev->bd_fsfreeze_count > 0) {
++ 		mutex_unlock(&bdev->bd_fsfreeze_mutex);
++ 		warnf(fc, "%pg: Can't mount, blockdev is frozen", bdev);
++ 		blkdev_put(bdev, mode);
++ 		return -EBUSY;
++ 	}
++ 
++ 	fc->sb_flags |= SB_NOSEC;
++ 	fc->sget_key = bdev;
++ 	s = sget_fc(fc, test_bdev_super_fc, set_bdev_super_fc);
++ 	mutex_unlock(&bdev->bd_fsfreeze_mutex);
++ 	if (IS_ERR(s)) {
++ 		blkdev_put(bdev, mode);
++ 		return PTR_ERR(s);
++ 	}
++ 
++ 	if (s->s_root) {
++ 		/* Don't summarily change the RO/RW state. */
++ 		if ((fc->sb_flags ^ s->s_flags) & SB_RDONLY) {
++ 			warnf(fc, "%pg: Can't mount, would change RO state", bdev);
++ 			deactivate_locked_super(s);
++ 			blkdev_put(bdev, mode);
++ 			return -EBUSY;
++ 		}
++ 
++ 		/*
++ 		 * s_umount nests inside bd_mutex during
++ 		 * __invalidate_device().  blkdev_put() acquires
++ 		 * bd_mutex and can't be called under s_umount.  Drop
++ 		 * s_umount temporarily.  This is safe as we're
++ 		 * holding an active reference.
++ 		 */
++ 		up_write(&s->s_umount);
++ 		blkdev_put(bdev, mode);
++ 		down_write(&s->s_umount);
++ 	} else {
++ 		s->s_mode = mode;
++ 		snprintf(s->s_id, sizeof(s->s_id), "%pg", bdev);
++ 		sb_set_blocksize(s, block_size(bdev));
++ 		error = fill_super(s, fc);
++ 		if (error) {
++ 			deactivate_locked_super(s);
++ 			return error;
++ 		}
++ 
++ 		s->s_flags |= SB_ACTIVE;
++ 		bdev->bd_super = s;
++ 	}
++ 
++ 	BUG_ON(fc->root);
++ 	fc->root = dget(s->s_root);
++ 	return 0;
++ }
++ EXPORT_SYMBOL(get_tree_bdev);
++ 
+++>>>>>>> dd7bc8158b41 (Fix use after free in get_tree_bdev())
+  static int test_bdev_super(struct super_block *s, void *data)
+  {
+  	return (void *)s->s_bdev == data;
+* Unmerged path fs/super.c
