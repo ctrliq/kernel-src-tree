@@ -36,8 +36,6 @@
 #include <linux/uaccess.h>
 #include <linux/atomic.h>
 
-#include <asm/irq.h>
-
 #define PHY_STATE_STR(_state)			\
 	case PHY_##_state:			\
 		return __stringify(_state);	\
