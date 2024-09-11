@@ -1,0 +1,341 @@
+mm: memcg/slab: charge individual slab objects instead of pages
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Roman Gushchin <guro@fb.com>
+commit f2fe7b09a52bc898ec030d4fa6f78725439c7c2c
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/f2fe7b09.failed
+
+Switch to per-object accounting of non-root slab objects.
+
+Charging is performed using obj_cgroup API in the pre_alloc hook.
+Obj_cgroup is charged with the size of the object and the size of
+metadata: as now it's the size of an obj_cgroup pointer.  If the amount of
+memory has been charged successfully, the actual allocation code is
+executed.  Otherwise, -ENOMEM is returned.
+
+In the post_alloc hook if the actual allocation succeeded, corresponding
+vmstats are bumped and the obj_cgroup pointer is saved.  Otherwise, the
+charge is canceled.
+
+On the free path obj_cgroup pointer is obtained and used to uncharge the
+size of the releasing object.
+
+Memcg and lruvec counters are now representing only memory used by active
+slab objects and do not include the free space.  The free space is shared
+and doesn't belong to any specific cgroup.
+
+Global per-node slab vmstats are still modified from
+(un)charge_slab_page() functions.  The idea is to keep all slab pages
+accounted as slab pages on system level.
+
+	Signed-off-by: Roman Gushchin <guro@fb.com>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Reviewed-by: Vlastimil Babka <vbabka@suse.cz>
+	Reviewed-by: Shakeel Butt <shakeelb@google.com>
+	Cc: Christoph Lameter <cl@linux.com>
+	Cc: Johannes Weiner <hannes@cmpxchg.org>
+	Cc: Michal Hocko <mhocko@kernel.org>
+	Cc: Tejun Heo <tj@kernel.org>
+Link: http://lkml.kernel.org/r/20200623174037.3951353-10-guro@fb.com
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit f2fe7b09a52bc898ec030d4fa6f78725439c7c2c)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	mm/slab.h
+diff --cc mm/slab.h
+index 45ad57de9d88,1f067e8bc377..000000000000
+--- a/mm/slab.h
++++ b/mm/slab.h
+@@@ -278,71 -382,112 +278,179 @@@ static inline struct mem_cgroup *memcg_
+  	return NULL;
+  }
+  
+++<<<<<<< HEAD
+ +/*
+ + * Charge the slab page belonging to the non-root kmem_cache.
+ + * Can be called for non-root kmem_caches only.
+ + */
+ +static __always_inline int memcg_charge_slab(struct page *page,
+ +					     gfp_t gfp, int order,
+ +					     struct kmem_cache *s)
+ +{
+ +	int nr_pages = 1 << order;
+ +	struct mem_cgroup *memcg;
+ +	struct lruvec *lruvec;
+ +	int ret;
+ +
+ +	rcu_read_lock();
+ +	memcg = READ_ONCE(s->memcg_params.memcg);
+ +	while (memcg && !css_tryget_online(&memcg->css))
+ +		memcg = parent_mem_cgroup(memcg);
+ +	rcu_read_unlock();
+ +
+ +	if (unlikely(!memcg || mem_cgroup_is_root(memcg))) {
+ +		mod_node_page_state(page_pgdat(page), cache_vmstat_idx(s),
+ +				    nr_pages);
+ +		percpu_ref_get_many(&s->memcg_params.refcnt, nr_pages);
+ +		return 0;
+ +	}
+ +
+ +	ret = memcg_kmem_charge(memcg, gfp, nr_pages);
+ +	if (ret)
+ +		goto out;
+ +
+ +	lruvec = mem_cgroup_lruvec(memcg, page_pgdat(page));
+ +	mod_lruvec_state(lruvec, cache_vmstat_idx(s), nr_pages);
+ +
+ +	/* transer try_charge() page references to kmem_cache */
+ +	percpu_ref_get_many(&s->memcg_params.refcnt, nr_pages);
+ +	css_put_many(&memcg->css, nr_pages);
+ +out:
+ +	css_put(&memcg->css);
+ +	return ret;
+ +}
+ +
+ +/*
+ + * Uncharge a slab page belonging to a non-root kmem_cache.
+ + * Can be called for non-root kmem_caches only.
+ + */
+ +static __always_inline void memcg_uncharge_slab(struct page *page, int order,
+ +						struct kmem_cache *s)
+ +{
+ +	int nr_pages = 1 << order;
+++=======
++ static inline int memcg_alloc_page_obj_cgroups(struct page *page,
++ 					       struct kmem_cache *s, gfp_t gfp)
++ {
++ 	unsigned int objects = objs_per_slab_page(s, page);
++ 	void *vec;
++ 
++ 	vec = kcalloc_node(objects, sizeof(struct obj_cgroup *), gfp,
++ 			   page_to_nid(page));
++ 	if (!vec)
++ 		return -ENOMEM;
++ 
++ 	kmemleak_not_leak(vec);
++ 	page->obj_cgroups = (struct obj_cgroup **) ((unsigned long)vec | 0x1UL);
++ 	return 0;
++ }
++ 
++ static inline void memcg_free_page_obj_cgroups(struct page *page)
++ {
++ 	kfree(page_obj_cgroups(page));
++ 	page->obj_cgroups = NULL;
++ }
++ 
++ static inline size_t obj_full_size(struct kmem_cache *s)
++ {
++ 	/*
++ 	 * For each accounted object there is an extra space which is used
++ 	 * to store obj_cgroup membership. Charge it too.
++ 	 */
++ 	return s->size + sizeof(struct obj_cgroup *);
++ }
++ 
++ static inline struct kmem_cache *memcg_slab_pre_alloc_hook(struct kmem_cache *s,
++ 						struct obj_cgroup **objcgp,
++ 						size_t objects, gfp_t flags)
++ {
++ 	struct kmem_cache *cachep;
++ 
++ 	cachep = memcg_kmem_get_cache(s, objcgp);
++ 	if (is_root_cache(cachep))
++ 		return s;
++ 
++ 	if (obj_cgroup_charge(*objcgp, flags, objects * obj_full_size(s))) {
++ 		obj_cgroup_put(*objcgp);
++ 		memcg_kmem_put_cache(cachep);
++ 		cachep = NULL;
++ 	}
++ 
++ 	return cachep;
++ }
++ 
++ static inline void mod_objcg_state(struct obj_cgroup *objcg,
++ 				   struct pglist_data *pgdat,
++ 				   int idx, int nr)
++ {
+++>>>>>>> f2fe7b09a52b (mm: memcg/slab: charge individual slab objects instead of pages)
+  	struct mem_cgroup *memcg;
+  	struct lruvec *lruvec;
+  
+  	rcu_read_lock();
+++<<<<<<< HEAD
+ +	memcg = READ_ONCE(s->memcg_params.memcg);
+ +	if (likely(!mem_cgroup_is_root(memcg))) {
+ +		lruvec = mem_cgroup_lruvec(memcg, page_pgdat(page));
+ +		mod_lruvec_state(lruvec, cache_vmstat_idx(s), -nr_pages);
+ +		memcg_kmem_uncharge(memcg, nr_pages);
+ +	} else {
+ +		mod_node_page_state(page_pgdat(page), cache_vmstat_idx(s),
+ +				    -nr_pages);
+ +	}
+ +	rcu_read_unlock();
+ +
+ +	percpu_ref_put_many(&s->memcg_params.refcnt, nr_pages);
+++=======
++ 	memcg = obj_cgroup_memcg(objcg);
++ 	lruvec = mem_cgroup_lruvec(memcg, pgdat);
++ 	mod_memcg_lruvec_state(lruvec, idx, nr);
++ 	rcu_read_unlock();
++ }
++ 
++ static inline void memcg_slab_post_alloc_hook(struct kmem_cache *s,
++ 					      struct obj_cgroup *objcg,
++ 					      size_t size, void **p)
++ {
++ 	struct page *page;
++ 	unsigned long off;
++ 	size_t i;
++ 
++ 	for (i = 0; i < size; i++) {
++ 		if (likely(p[i])) {
++ 			page = virt_to_head_page(p[i]);
++ 			off = obj_to_index(s, page, p[i]);
++ 			obj_cgroup_get(objcg);
++ 			page_obj_cgroups(page)[off] = objcg;
++ 			mod_objcg_state(objcg, page_pgdat(page),
++ 					cache_vmstat_idx(s), obj_full_size(s));
++ 		} else {
++ 			obj_cgroup_uncharge(objcg, obj_full_size(s));
++ 		}
++ 	}
++ 	obj_cgroup_put(objcg);
++ 	memcg_kmem_put_cache(s);
++ }
++ 
++ static inline void memcg_slab_free_hook(struct kmem_cache *s, struct page *page,
++ 					void *p)
++ {
++ 	struct obj_cgroup *objcg;
++ 	unsigned int off;
++ 
++ 	if (!memcg_kmem_enabled() || is_root_cache(s))
++ 		return;
++ 
++ 	off = obj_to_index(s, page, p);
++ 	objcg = page_obj_cgroups(page)[off];
++ 	page_obj_cgroups(page)[off] = NULL;
++ 
++ 	obj_cgroup_uncharge(objcg, obj_full_size(s));
++ 	mod_objcg_state(objcg, page_pgdat(page), cache_vmstat_idx(s),
++ 			-obj_full_size(s));
++ 
++ 	obj_cgroup_put(objcg);
+++>>>>>>> f2fe7b09a52b (mm: memcg/slab: charge individual slab objects instead of pages)
+  }
+  
+  extern void slab_init_memcg_params(struct kmem_cache *);
+@@@ -383,14 -528,31 +491,41 @@@ static inline struct mem_cgroup *memcg_
+  	return NULL;
+  }
+  
+++<<<<<<< HEAD
+ +static inline int memcg_charge_slab(struct page *page, gfp_t gfp, int order,
+ +				    struct kmem_cache *s)
+++=======
++ static inline int memcg_alloc_page_obj_cgroups(struct page *page,
++ 					       struct kmem_cache *s, gfp_t gfp)
+++>>>>>>> f2fe7b09a52b (mm: memcg/slab: charge individual slab objects instead of pages)
+  {
+  	return 0;
+  }
+  
+++<<<<<<< HEAD
+ +static inline void memcg_uncharge_slab(struct page *page, int order,
+ +				       struct kmem_cache *s)
+++=======
++ static inline void memcg_free_page_obj_cgroups(struct page *page)
++ {
++ }
++ 
++ static inline struct kmem_cache *memcg_slab_pre_alloc_hook(struct kmem_cache *s,
++ 						struct obj_cgroup **objcgp,
++ 						size_t objects, gfp_t flags)
++ {
++ 	return NULL;
++ }
++ 
++ static inline void memcg_slab_post_alloc_hook(struct kmem_cache *s,
++ 					      struct obj_cgroup *objcg,
++ 					      size_t size, void **p)
++ {
++ }
++ 
++ static inline void memcg_slab_free_hook(struct kmem_cache *s, struct page *page,
++ 					void *p)
+++>>>>>>> f2fe7b09a52b (mm: memcg/slab: charge individual slab objects instead of pages)
+  {
+  }
+  
+@@@ -409,25 -582,33 +544,53 @@@ static __always_inline int charge_slab_
+  					    gfp_t gfp, int order,
+  					    struct kmem_cache *s)
+  {
+++<<<<<<< HEAD
+ +	if (is_root_cache(s)) {
+ +		mod_node_page_state(page_pgdat(page), cache_vmstat_idx(s),
+ +				    1 << order);
+ +		return 0;
+ +	}
+ +
+ +	return memcg_charge_slab(page, gfp, order, s);
+++=======
++ #ifdef CONFIG_MEMCG_KMEM
++ 	if (memcg_kmem_enabled() && !is_root_cache(s)) {
++ 		int ret;
++ 
++ 		ret = memcg_alloc_page_obj_cgroups(page, s, gfp);
++ 		if (ret)
++ 			return ret;
++ 
++ 		percpu_ref_get_many(&s->memcg_params.refcnt, 1 << order);
++ 	}
++ #endif
++ 	mod_node_page_state(page_pgdat(page), cache_vmstat_idx(s),
++ 			    PAGE_SIZE << order);
++ 	return 0;
+++>>>>>>> f2fe7b09a52b (mm: memcg/slab: charge individual slab objects instead of pages)
+  }
+  
+  static __always_inline void uncharge_slab_page(struct page *page, int order,
+  					       struct kmem_cache *s)
+  {
+++<<<<<<< HEAD
+ +	if (is_root_cache(s)) {
+ +		mod_node_page_state(page_pgdat(page), cache_vmstat_idx(s),
+ +				    -(1 << order));
+ +		return;
+ +	}
+ +
+ +	memcg_uncharge_slab(page, order, s);
+++=======
++ #ifdef CONFIG_MEMCG_KMEM
++ 	if (memcg_kmem_enabled() && !is_root_cache(s)) {
++ 		memcg_free_page_obj_cgroups(page);
++ 		percpu_ref_put_many(&s->memcg_params.refcnt, 1 << order);
++ 	}
++ #endif
++ 	mod_node_page_state(page_pgdat(page), cache_vmstat_idx(s),
++ 			    -(PAGE_SIZE << order));
+++>>>>>>> f2fe7b09a52b (mm: memcg/slab: charge individual slab objects instead of pages)
+  }
+  
+  static inline struct kmem_cache *cache_from_obj(struct kmem_cache *s, void *x)
+@@@ -500,7 -674,7 +663,11 @@@ static inline struct kmem_cache *slab_p
+  
+  	if (memcg_kmem_enabled() &&
+  	    ((flags & __GFP_ACCOUNT) || (s->flags & SLAB_ACCOUNT)))
+++<<<<<<< HEAD
+ +		return memcg_kmem_get_cache(s);
+++=======
++ 		return memcg_slab_pre_alloc_hook(s, objcgp, size, flags);
+++>>>>>>> f2fe7b09a52b (mm: memcg/slab: charge individual slab objects instead of pages)
+  
+  	return s;
+  }
+* Unmerged path mm/slab.h
