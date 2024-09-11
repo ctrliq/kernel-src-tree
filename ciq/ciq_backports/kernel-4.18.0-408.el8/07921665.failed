@@ -1,0 +1,178 @@
+KVM: Use prepare/commit hooks to handle generic memslot metadata updates
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-408.el8
+commit-author Sean Christopherson <seanjc@google.com>
+commit 07921665a651918350bc6653d4ca8a516a867b4b
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-408.el8/07921665.failed
+
+Handle the generic memslot metadata, a.k.a. dirty bitmap, updates at the
+same time that arch handles it's own metadata updates, i.e. at memslot
+prepare and commit.  This will simplify converting @new to a dynamically
+allocated object, and more closely aligns common KVM with architecture
+code.
+
+No functional change intended.
+
+	Signed-off-by: Sean Christopherson <seanjc@google.com>
+	Reviewed-by: Maciej S. Szmigiero <maciej.szmigiero@oracle.com>
+	Signed-off-by: Maciej S. Szmigiero <maciej.szmigiero@oracle.com>
+Message-Id: <2ddd5446e3706fe3c1e52e3df279f04c458be830.1638817640.git.maciej.szmigiero@oracle.com>
+(cherry picked from commit 07921665a651918350bc6653d4ca8a516a867b4b)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	virt/kvm/kvm_main.c
+diff --cc virt/kvm/kvm_main.c
+index 84c0bcfed6e7,ec5567e8442b..000000000000
+--- a/virt/kvm/kvm_main.c
++++ b/virt/kvm/kvm_main.c
+@@@ -1387,8 -1549,70 +1387,71 @@@ static void kvm_copy_memslots_arch(stru
+  		to->memslots[i].arch = from->memslots[i].arch;
+  }
+  
++ static int kvm_prepare_memory_region(struct kvm *kvm,
++ 				     const struct kvm_memory_slot *old,
++ 				     struct kvm_memory_slot *new,
++ 				     enum kvm_mr_change change)
++ {
++ 	int r;
++ 
++ 	/*
++ 	 * If dirty logging is disabled, nullify the bitmap; the old bitmap
++ 	 * will be freed on "commit".  If logging is enabled in both old and
++ 	 * new, reuse the existing bitmap.  If logging is enabled only in the
++ 	 * new and KVM isn't using a ring buffer, allocate and initialize a
++ 	 * new bitmap.
++ 	 */
++ 	if (!(new->flags & KVM_MEM_LOG_DIRTY_PAGES))
++ 		new->dirty_bitmap = NULL;
++ 	else if (old->dirty_bitmap)
++ 		new->dirty_bitmap = old->dirty_bitmap;
++ 	else if (!kvm->dirty_ring_size) {
++ 		r = kvm_alloc_dirty_bitmap(new);
++ 		if (r)
++ 			return r;
++ 
++ 		if (kvm_dirty_log_manual_protect_and_init_set(kvm))
++ 			bitmap_set(new->dirty_bitmap, 0, new->npages);
++ 	}
++ 
++ 	r = kvm_arch_prepare_memory_region(kvm, old, new, change);
++ 
++ 	/* Free the bitmap on failure if it was allocated above. */
++ 	if (r && new->dirty_bitmap && !old->dirty_bitmap)
++ 		kvm_destroy_dirty_bitmap(new);
++ 
++ 	return r;
++ }
++ 
++ static void kvm_commit_memory_region(struct kvm *kvm,
++ 				     struct kvm_memory_slot *old,
++ 				     const struct kvm_memory_slot *new,
++ 				     enum kvm_mr_change change)
++ {
++ 	/*
++ 	 * Update the total number of memslot pages before calling the arch
++ 	 * hook so that architectures can consume the result directly.
++ 	 */
++ 	if (change == KVM_MR_DELETE)
++ 		kvm->nr_memslot_pages -= old->npages;
++ 	else if (change == KVM_MR_CREATE)
++ 		kvm->nr_memslot_pages += new->npages;
++ 
++ 	kvm_arch_commit_memory_region(kvm, old, new, change);
++ 
++ 	/*
++ 	 * Free the old memslot's metadata.  On DELETE, free the whole thing,
++ 	 * otherwise free the dirty bitmap as needed (the below effectively
++ 	 * checks both the flags and whether a ring buffer is being used).
++ 	 */
++ 	if (change == KVM_MR_DELETE)
++ 		kvm_free_memslot(kvm, old);
++ 	else if (old->dirty_bitmap && !new->dirty_bitmap)
++ 		kvm_destroy_dirty_bitmap(old);
++ }
++ 
+  static int kvm_set_memslot(struct kvm *kvm,
+ +			   const struct kvm_userspace_memory_region *mem,
+  			   struct kvm_memory_slot *new,
+  			   enum kvm_mr_change change)
+  {
+@@@ -1474,30 -1698,14 +1537,38 @@@
+  		old.as_id = new->as_id;
+  	}
+  
+++<<<<<<< HEAD
+ +	/* Copy the arch-specific data, again after (re)acquiring slots_arch_lock. */
+ +	memcpy(&new->arch, &old.arch, sizeof(old.arch));
+ +
+ +	r = kvm_arch_prepare_memory_region(kvm, new, mem, change);
+++=======
++ 	r = kvm_prepare_memory_region(kvm, &old, new, change);
+++>>>>>>> 07921665a651 (KVM: Use prepare/commit hooks to handle generic memslot metadata updates)
+  	if (r)
+  		goto out_slots;
+  
+  	update_memslots(slots, new, change);
+  	slots = install_new_memslots(kvm, new->as_id, slots);
+  
+++<<<<<<< HEAD
+ +	/*
+ +	 * Update the total number of memslot pages before calling the arch
+ +	 * hook so that architectures can consume the result directly.
+ +	 */
+ +	if (change == KVM_MR_DELETE)
+ +		kvm->nr_memslot_pages -= old.npages;
+ +	else if (change == KVM_MR_CREATE)
+ +		kvm->nr_memslot_pages += new->npages;
+ +
+ +	kvm_arch_commit_memory_region(kvm, mem, &old, new, change);
+ +
+ +	/* Free the old memslot's metadata.  Note, this is the full copy!!! */
+ +	if (change == KVM_MR_DELETE)
+ +		kvm_free_memslot(kvm, &old);
+++=======
++ 	kvm_commit_memory_region(kvm, &old, new, change);
+++>>>>>>> 07921665a651 (KVM: Use prepare/commit hooks to handle generic memslot metadata updates)
+  
+  	kvfree(slots);
+  	return 0;
+@@@ -1629,30 -1833,7 +1696,34 @@@ int __kvm_set_memory_region(struct kvm 
+  		}
+  	}
+  
+++<<<<<<< HEAD
+ +	/* Allocate/free page dirty bitmap as needed */
+ +	if (!(new.flags & KVM_MEM_LOG_DIRTY_PAGES))
+ +		new.dirty_bitmap = NULL;
+ +	else if (!new.dirty_bitmap && !kvm->dirty_ring_size) {
+ +		r = kvm_alloc_dirty_bitmap(&new);
+ +		if (r)
+ +			return r;
+ +
+ +		if (kvm_dirty_log_manual_protect_and_init_set(kvm))
+ +			bitmap_set(new.dirty_bitmap, 0, new.npages);
+ +	}
+ +
+ +	r = kvm_set_memslot(kvm, mem, &new, change);
+ +	if (r)
+ +		goto out_bitmap;
+ +
+ +	if (old.dirty_bitmap && !new.dirty_bitmap)
+ +		kvm_destroy_dirty_bitmap(&old);
+ +	return 0;
+ +
+ +out_bitmap:
+ +	if (new.dirty_bitmap && !old.dirty_bitmap)
+ +		kvm_destroy_dirty_bitmap(&new);
+ +	return r;
+++=======
++ 	return kvm_set_memslot(kvm, &new, change);
+++>>>>>>> 07921665a651 (KVM: Use prepare/commit hooks to handle generic memslot metadata updates)
+  }
+  EXPORT_SYMBOL_GPL(__kvm_set_memory_region);
+  
+* Unmerged path virt/kvm/kvm_main.c
