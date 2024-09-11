@@ -1,0 +1,120 @@
+KVM: x86: hyper-v: Cache guest CPUID leaves determining features availability
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-358.el8
+commit-author Vitaly Kuznetsov <vkuznets@redhat.com>
+commit 10d7bf1e46dc19d964f0f67d2a6d20df907742d1
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-358.el8/10d7bf1e.failed
+
+Limiting exposed Hyper-V features requires a fast way to check if the
+particular feature is exposed in guest visible CPUIDs or not. To aboid
+looping through all CPUID entries on every hypercall/MSR access cache
+the required leaves on CPUID update.
+
+	Signed-off-by: Vitaly Kuznetsov <vkuznets@redhat.com>
+	Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+Message-Id: <20210521095204.2161214-4-vkuznets@redhat.com>
+	Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+(cherry picked from commit 10d7bf1e46dc19d964f0f67d2a6d20df907742d1)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/include/asm/kvm_host.h
+diff --cc arch/x86/include/asm/kvm_host.h
+index 32b2a9c1142c,95b254b5a523..000000000000
+--- a/arch/x86/include/asm/kvm_host.h
++++ b/arch/x86/include/asm/kvm_host.h
+@@@ -548,6 -543,15 +548,18 @@@ struct kvm_vcpu_hv 
+  	struct kvm_vcpu_hv_stimer stimer[HV_SYNIC_STIMER_COUNT];
+  	DECLARE_BITMAP(stimer_pending_bitmap, HV_SYNIC_STIMER_COUNT);
+  	cpumask_t tlb_flush;
+++<<<<<<< HEAD
+++=======
++ 	bool enforce_cpuid;
++ 	struct {
++ 		u32 features_eax; /* HYPERV_CPUID_FEATURES.EAX */
++ 		u32 features_ebx; /* HYPERV_CPUID_FEATURES.EBX */
++ 		u32 features_edx; /* HYPERV_CPUID_FEATURES.EDX */
++ 		u32 enlightenments_eax; /* HYPERV_CPUID_ENLIGHTMENT_INFO.EAX */
++ 		u32 enlightenments_ebx; /* HYPERV_CPUID_ENLIGHTMENT_INFO.EBX */
++ 		u32 syndbg_cap_eax; /* HYPERV_CPUID_SYNDBG_PLATFORM_CAPABILITIES.EAX */
++ 	} cpuid_cache;
+++>>>>>>> 10d7bf1e46dc (KVM: x86: hyper-v: Cache guest CPUID leaves determining features availability)
+  };
+  
+  /* Xen HVM per vcpu emulation context */
+* Unmerged path arch/x86/include/asm/kvm_host.h
+diff --git a/arch/x86/kvm/hyperv.c b/arch/x86/kvm/hyperv.c
+index 7738c262ba2c..07b2da4ae6cb 100644
+--- a/arch/x86/kvm/hyperv.c
++++ b/arch/x86/kvm/hyperv.c
+@@ -274,15 +274,10 @@ static int synic_set_msr(struct kvm_vcpu_hv_synic *synic,
+ 
+ static bool kvm_hv_is_syndbg_enabled(struct kvm_vcpu *vcpu)
+ {
+-	struct kvm_cpuid_entry2 *entry;
+-
+-	entry = kvm_find_cpuid_entry(vcpu,
+-				     HYPERV_CPUID_SYNDBG_PLATFORM_CAPABILITIES,
+-				     0);
+-	if (!entry)
+-		return false;
++	struct kvm_vcpu_hv *hv_vcpu = to_hv_vcpu(vcpu);
+ 
+-	return entry->eax & HV_X64_SYNDBG_CAP_ALLOW_KERNEL_DEBUGGING;
++	return hv_vcpu->cpuid_cache.syndbg_cap_eax &
++		HV_X64_SYNDBG_CAP_ALLOW_KERNEL_DEBUGGING;
+ }
+ 
+ static int kvm_hv_syndbg_complete_userspace(struct kvm_vcpu *vcpu)
+@@ -1845,12 +1840,46 @@ static u64 kvm_hv_send_ipi(struct kvm_vcpu *vcpu, struct kvm_hv_hcall *hc, bool
+ void kvm_hv_set_cpuid(struct kvm_vcpu *vcpu)
+ {
+ 	struct kvm_cpuid_entry2 *entry;
++	struct kvm_vcpu_hv *hv_vcpu = to_hv_vcpu(vcpu);
+ 
+ 	entry = kvm_find_cpuid_entry(vcpu, HYPERV_CPUID_INTERFACE, 0);
+-	if (entry && entry->eax == HYPERV_CPUID_SIGNATURE_EAX)
++	if (entry && entry->eax == HYPERV_CPUID_SIGNATURE_EAX) {
+ 		vcpu->arch.hyperv_enabled = true;
+-	else
++	} else {
+ 		vcpu->arch.hyperv_enabled = false;
++		return;
++	}
++
++	if (!to_hv_vcpu(vcpu) && kvm_hv_vcpu_init(vcpu))
++		return;
++
++	hv_vcpu = to_hv_vcpu(vcpu);
++
++	entry = kvm_find_cpuid_entry(vcpu, HYPERV_CPUID_FEATURES, 0);
++	if (entry) {
++		hv_vcpu->cpuid_cache.features_eax = entry->eax;
++		hv_vcpu->cpuid_cache.features_ebx = entry->ebx;
++		hv_vcpu->cpuid_cache.features_edx = entry->edx;
++	} else {
++		hv_vcpu->cpuid_cache.features_eax = 0;
++		hv_vcpu->cpuid_cache.features_ebx = 0;
++		hv_vcpu->cpuid_cache.features_edx = 0;
++	}
++
++	entry = kvm_find_cpuid_entry(vcpu, HYPERV_CPUID_ENLIGHTMENT_INFO, 0);
++	if (entry) {
++		hv_vcpu->cpuid_cache.enlightenments_eax = entry->eax;
++		hv_vcpu->cpuid_cache.enlightenments_ebx = entry->ebx;
++	} else {
++		hv_vcpu->cpuid_cache.enlightenments_eax = 0;
++		hv_vcpu->cpuid_cache.enlightenments_ebx = 0;
++	}
++
++	entry = kvm_find_cpuid_entry(vcpu, HYPERV_CPUID_SYNDBG_PLATFORM_CAPABILITIES, 0);
++	if (entry)
++		hv_vcpu->cpuid_cache.syndbg_cap_eax = entry->eax;
++	else
++		hv_vcpu->cpuid_cache.syndbg_cap_eax = 0;
+ }
+ 
+ bool kvm_hv_hypercall_enabled(struct kvm_vcpu *vcpu)
