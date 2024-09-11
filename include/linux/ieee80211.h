@@ -2430,7 +2430,7 @@ struct ieee80211_tx_pwr_env {
 static inline u8
 ieee80211_he_oper_size(const u8 *he_oper_ie)
 {
-	struct ieee80211_he_operation *he_oper = (void *)he_oper_ie;
+	const struct ieee80211_he_operation *he_oper = (const void *)he_oper_ie;
 	u8 oper_len = sizeof(struct ieee80211_he_operation);
 	u32 he_oper_params;
 
@@ -2463,7 +2463,7 @@ ieee80211_he_oper_size(const u8 *he_oper_ie)
 static inline const struct ieee80211_he_6ghz_oper *
 ieee80211_he_6ghz_oper(const struct ieee80211_he_operation *he_oper)
 {
-	const u8 *ret = (void *)&he_oper->optional;
+	const u8 *ret = (const void *)&he_oper->optional;
 	u32 he_oper_params;
 
 	if (!he_oper)
@@ -2478,7 +2478,7 @@ ieee80211_he_6ghz_oper(const struct ieee80211_he_operation *he_oper)
 	if (he_oper_params & IEEE80211_HE_OPERATION_CO_HOSTED_BSS)
 		ret++;
 
-	return (void *)ret;
+	return (const void *)ret;
 }
 
 /* HE Spatial Reuse defines */
@@ -2499,7 +2499,7 @@ ieee80211_he_6ghz_oper(const struct ieee80211_he_operation *he_oper)
 static inline u8
 ieee80211_he_spr_size(const u8 *he_spr_ie)
 {
-	struct ieee80211_he_spr *he_spr = (void *)he_spr_ie;
+	const struct ieee80211_he_spr *he_spr = (const void *)he_spr_ie;
 	u8 spr_len = sizeof(struct ieee80211_he_spr);
 	u8 he_spr_params;
 
