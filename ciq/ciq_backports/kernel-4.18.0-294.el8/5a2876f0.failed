@@ -1,0 +1,155 @@
+scsi: zfcp: introduce sysfs interface to read the local B2B-Credit
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Benjamin Block <bblock@linux.ibm.com>
+commit 5a2876f0d1ef26b76755749f978d46e4666013dd
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/5a2876f0.failed
+
+In addition to the diagnostic data from the local SFP transceiver this
+patch adds an interface to read the advertised buffer-to-buffer credit from
+the local FC_Port.
+
+With this patch the userspace-interface will only read data stored in the
+corresponding "diagnostic buffer" (that was stored during completion of a
+previous Exchange Config Data command). Implicit updating will follow later
+in this series.
+
+Link: https://lore.kernel.org/r/8a53aef87b53c50cfb1a3425b799bacb6f82b832.1572018132.git.bblock@linux.ibm.com
+	Reviewed-by: Steffen Maier <maier@linux.ibm.com>
+	Signed-off-by: Benjamin Block <bblock@linux.ibm.com>
+	Signed-off-by: Martin K. Petersen <martin.petersen@oracle.com>
+(cherry picked from commit 5a2876f0d1ef26b76755749f978d46e4666013dd)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/s390/scsi/zfcp_sysfs.c
+diff --cc drivers/s390/scsi/zfcp_sysfs.c
+index 432e4f59b575,376d76b9f337..000000000000
+--- a/drivers/s390/scsi/zfcp_sysfs.c
++++ b/drivers/s390/scsi/zfcp_sysfs.c
+@@@ -744,3 -665,118 +744,121 @@@ struct device_attribute *zfcp_sysfs_sho
+  	&dev_attr_queue_full,
+  	NULL
+  };
+++<<<<<<< HEAD
+++=======
++ 
++ static ssize_t zfcp_sysfs_adapter_diag_b2b_credit_show(
++ 	struct device *dev, struct device_attribute *attr, char *buf)
++ {
++ 	struct zfcp_adapter *adapter = zfcp_ccw_adapter_by_cdev(to_ccwdev(dev));
++ 	struct zfcp_diag_header *diag_hdr;
++ 	struct fc_els_flogi *nsp;
++ 	ssize_t rc = -ENOLINK;
++ 	unsigned long flags;
++ 	unsigned int status;
++ 
++ 	if (!adapter)
++ 		return -ENODEV;
++ 
++ 	status = atomic_read(&adapter->status);
++ 	if (0 == (status & ZFCP_STATUS_COMMON_OPEN) ||
++ 	    0 == (status & ZFCP_STATUS_COMMON_UNBLOCKED) ||
++ 	    0 != (status & ZFCP_STATUS_COMMON_ERP_FAILED))
++ 		goto out;
++ 
++ 	diag_hdr = &adapter->diagnostics->config_data.header;
++ 
++ 	spin_lock_irqsave(&diag_hdr->access_lock, flags);
++ 	/* nport_serv_param doesn't contain the ELS_Command code */
++ 	nsp = (struct fc_els_flogi *)((unsigned long)
++ 					      adapter->diagnostics->config_data
++ 						      .data.nport_serv_param -
++ 				      sizeof(u32));
++ 
++ 	rc = scnprintf(buf, 5 + 2, "%hu\n",
++ 		       be16_to_cpu(nsp->fl_csp.sp_bb_cred));
++ 	spin_unlock_irqrestore(&diag_hdr->access_lock, flags);
++ 
++ out:
++ 	zfcp_ccw_adapter_put(adapter);
++ 	return rc;
++ }
++ static ZFCP_DEV_ATTR(adapter_diag, b2b_credit, 0400,
++ 		     zfcp_sysfs_adapter_diag_b2b_credit_show, NULL);
++ 
++ #define ZFCP_DEFINE_DIAG_SFP_ATTR(_name, _qtcb_member, _prtsize, _prtfmt)      \
++ 	static ssize_t zfcp_sysfs_adapter_diag_sfp_##_name##_show(	       \
++ 		struct device *dev, struct device_attribute *attr, char *buf)  \
++ 	{								       \
++ 		struct zfcp_adapter *const adapter =			       \
++ 			zfcp_ccw_adapter_by_cdev(to_ccwdev(dev));	       \
++ 		struct zfcp_diag_header *diag_hdr;			       \
++ 		ssize_t rc = -ENOLINK;					       \
++ 		unsigned long flags;					       \
++ 		unsigned int status;					       \
++ 									       \
++ 		if (!adapter)						       \
++ 			return -ENODEV;					       \
++ 									       \
++ 		status = atomic_read(&adapter->status);			       \
++ 		if (0 == (status & ZFCP_STATUS_COMMON_OPEN) ||		       \
++ 		    0 == (status & ZFCP_STATUS_COMMON_UNBLOCKED) ||	       \
++ 		    0 != (status & ZFCP_STATUS_COMMON_ERP_FAILED))	       \
++ 			goto out;					       \
++ 									       \
++ 		if (!zfcp_diag_support_sfp(adapter)) {			       \
++ 			rc = -EOPNOTSUPP;				       \
++ 			goto out;					       \
++ 		}							       \
++ 									       \
++ 		diag_hdr = &adapter->diagnostics->port_data.header;	       \
++ 									       \
++ 		rc = zfcp_diag_update_buffer_limited(			       \
++ 			adapter, diag_hdr, zfcp_diag_update_port_data_buffer); \
++ 		if (rc != 0)						       \
++ 			goto out;					       \
++ 									       \
++ 		spin_lock_irqsave(&diag_hdr->access_lock, flags);	       \
++ 		rc = scnprintf(						       \
++ 			buf, (_prtsize) + 2, _prtfmt "\n",		       \
++ 			adapter->diagnostics->port_data.data._qtcb_member);    \
++ 		spin_unlock_irqrestore(&diag_hdr->access_lock, flags);	       \
++ 									       \
++ 	out:								       \
++ 		zfcp_ccw_adapter_put(adapter);				       \
++ 		return rc;						       \
++ 	}								       \
++ 	static ZFCP_DEV_ATTR(adapter_diag_sfp, _name, 0400,		       \
++ 			     zfcp_sysfs_adapter_diag_sfp_##_name##_show, NULL)
++ 
++ ZFCP_DEFINE_DIAG_SFP_ATTR(temperature, temperature, 5, "%hu");
++ ZFCP_DEFINE_DIAG_SFP_ATTR(vcc, vcc, 5, "%hu");
++ ZFCP_DEFINE_DIAG_SFP_ATTR(tx_bias, tx_bias, 5, "%hu");
++ ZFCP_DEFINE_DIAG_SFP_ATTR(tx_power, tx_power, 5, "%hu");
++ ZFCP_DEFINE_DIAG_SFP_ATTR(rx_power, rx_power, 5, "%hu");
++ ZFCP_DEFINE_DIAG_SFP_ATTR(port_tx_type, sfp_flags.port_tx_type, 2, "%hu");
++ ZFCP_DEFINE_DIAG_SFP_ATTR(optical_port, sfp_flags.optical_port, 1, "%hu");
++ ZFCP_DEFINE_DIAG_SFP_ATTR(sfp_invalid, sfp_flags.sfp_invalid, 1, "%hu");
++ ZFCP_DEFINE_DIAG_SFP_ATTR(connector_type, sfp_flags.connector_type, 1, "%hu");
++ ZFCP_DEFINE_DIAG_SFP_ATTR(fec_active, sfp_flags.fec_active, 1, "%hu");
++ 
++ static struct attribute *zfcp_sysfs_diag_attrs[] = {
++ 	&dev_attr_adapter_diag_sfp_temperature.attr,
++ 	&dev_attr_adapter_diag_sfp_vcc.attr,
++ 	&dev_attr_adapter_diag_sfp_tx_bias.attr,
++ 	&dev_attr_adapter_diag_sfp_tx_power.attr,
++ 	&dev_attr_adapter_diag_sfp_rx_power.attr,
++ 	&dev_attr_adapter_diag_sfp_port_tx_type.attr,
++ 	&dev_attr_adapter_diag_sfp_optical_port.attr,
++ 	&dev_attr_adapter_diag_sfp_sfp_invalid.attr,
++ 	&dev_attr_adapter_diag_sfp_connector_type.attr,
++ 	&dev_attr_adapter_diag_sfp_fec_active.attr,
++ 	&dev_attr_adapter_diag_b2b_credit.attr,
++ 	NULL,
++ };
++ 
++ const struct attribute_group zfcp_sysfs_diag_attr_group = {
++ 	.name = "diagnostics",
++ 	.attrs = zfcp_sysfs_diag_attrs,
++ };
+++>>>>>>> 5a2876f0d1ef (scsi: zfcp: introduce sysfs interface to read the local B2B-Credit)
+* Unmerged path drivers/s390/scsi/zfcp_sysfs.c
