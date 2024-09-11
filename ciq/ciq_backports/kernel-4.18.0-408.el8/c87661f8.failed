@@ -1,0 +1,170 @@
+KVM: Free new dirty bitmap if creating a new memslot fails
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-408.el8
+commit-author Sean Christopherson <seanjc@google.com>
+commit c87661f855c3f2023e40ddc364002601ee234367
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-408.el8/c87661f8.failed
+
+Fix a goof in kvm_prepare_memory_region() where KVM fails to free the
+new memslot's dirty bitmap during a CREATE action if
+kvm_arch_prepare_memory_region() fails.  The logic is supposed to detect
+if the bitmap was allocated and thus needs to be freed, versus if the
+bitmap was inherited from the old memslot and thus needs to be kept.  If
+there is no old memslot, then obviously the bitmap can't have been
+inherited
+
+The bug was exposed by commit 86931ff7207b ("KVM: x86/mmu: Do not create
+SPTEs for GFNs that exceed host.MAXPHYADDR"), which made it trivally easy
+for syzkaller to trigger failure during kvm_arch_prepare_memory_region(),
+but the bug can be hit other ways too, e.g. due to -ENOMEM when
+allocating x86's memslot metadata.
+
+The backtrace from kmemleak:
+
+  __vmalloc_node_range+0xb40/0xbd0 mm/vmalloc.c:3195
+  __vmalloc_node mm/vmalloc.c:3232 [inline]
+  __vmalloc+0x49/0x50 mm/vmalloc.c:3246
+  __vmalloc_array mm/util.c:671 [inline]
+  __vcalloc+0x49/0x70 mm/util.c:694
+  kvm_alloc_dirty_bitmap virt/kvm/kvm_main.c:1319
+  kvm_prepare_memory_region virt/kvm/kvm_main.c:1551
+  kvm_set_memslot+0x1bd/0x690 virt/kvm/kvm_main.c:1782
+  __kvm_set_memory_region+0x689/0x750 virt/kvm/kvm_main.c:1949
+  kvm_set_memory_region virt/kvm/kvm_main.c:1962
+  kvm_vm_ioctl_set_memory_region virt/kvm/kvm_main.c:1974
+  kvm_vm_ioctl+0x377/0x13a0 virt/kvm/kvm_main.c:4528
+  vfs_ioctl fs/ioctl.c:51
+  __do_sys_ioctl fs/ioctl.c:870
+  __se_sys_ioctl fs/ioctl.c:856
+  __x64_sys_ioctl+0xfc/0x140 fs/ioctl.c:856
+  do_syscall_x64 arch/x86/entry/common.c:50
+  do_syscall_64+0x35/0xb0 arch/x86/entry/common.c:80
+  entry_SYSCALL_64_after_hwframe+0x44/0xae
+
+And the relevant sequence of KVM events:
+
+  ioctl(3, KVM_CREATE_VM, 0)              = 4
+  ioctl(4, KVM_SET_USER_MEMORY_REGION, {slot=0,
+                                        flags=KVM_MEM_LOG_DIRTY_PAGES,
+                                        guest_phys_addr=0x10000000000000,
+                                        memory_size=4096,
+                                        userspace_addr=0x20fe8000}
+       ) = -1 EINVAL (Invalid argument)
+
+Fixes: 244893fa2859 ("KVM: Dynamically allocate "new" memslots from the get-go")
+	Cc: stable@vger.kernel.org
+	Reported-by: syzbot+8606b8a9cc97a63f1c87@syzkaller.appspotmail.com
+	Signed-off-by: Sean Christopherson <seanjc@google.com>
+Message-Id: <20220518003842.1341782-1-seanjc@google.com>
+	Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+(cherry picked from commit c87661f855c3f2023e40ddc364002601ee234367)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	virt/kvm/kvm_main.c
+diff --cc virt/kvm/kvm_main.c
+index acfbcac00e50,5ab12214e18d..000000000000
+--- a/virt/kvm/kvm_main.c
++++ b/virt/kvm/kvm_main.c
+@@@ -1359,14 -1526,89 +1359,93 @@@ static struct kvm_memslots *install_new
+  	kvm_arch_memslots_updated(kvm, gen);
+  
+  	slots->generation = gen;
+ +
+ +	return old_memslots;
+  }
+  
+ -static int kvm_prepare_memory_region(struct kvm *kvm,
+ -				     const struct kvm_memory_slot *old,
+ -				     struct kvm_memory_slot *new,
+ -				     enum kvm_mr_change change)
+ +static size_t kvm_memslots_size(int slots)
+  {
+++<<<<<<< HEAD
+ +	return sizeof(struct kvm_memslots) +
+ +	       (sizeof(struct kvm_memory_slot) * slots);
+++=======
++ 	int r;
++ 
++ 	/*
++ 	 * If dirty logging is disabled, nullify the bitmap; the old bitmap
++ 	 * will be freed on "commit".  If logging is enabled in both old and
++ 	 * new, reuse the existing bitmap.  If logging is enabled only in the
++ 	 * new and KVM isn't using a ring buffer, allocate and initialize a
++ 	 * new bitmap.
++ 	 */
++ 	if (change != KVM_MR_DELETE) {
++ 		if (!(new->flags & KVM_MEM_LOG_DIRTY_PAGES))
++ 			new->dirty_bitmap = NULL;
++ 		else if (old && old->dirty_bitmap)
++ 			new->dirty_bitmap = old->dirty_bitmap;
++ 		else if (!kvm->dirty_ring_size) {
++ 			r = kvm_alloc_dirty_bitmap(new);
++ 			if (r)
++ 				return r;
++ 
++ 			if (kvm_dirty_log_manual_protect_and_init_set(kvm))
++ 				bitmap_set(new->dirty_bitmap, 0, new->npages);
++ 		}
++ 	}
++ 
++ 	r = kvm_arch_prepare_memory_region(kvm, old, new, change);
++ 
++ 	/* Free the bitmap on failure if it was allocated above. */
++ 	if (r && new && new->dirty_bitmap && (!old || !old->dirty_bitmap))
++ 		kvm_destroy_dirty_bitmap(new);
++ 
++ 	return r;
++ }
++ 
++ static void kvm_commit_memory_region(struct kvm *kvm,
++ 				     struct kvm_memory_slot *old,
++ 				     const struct kvm_memory_slot *new,
++ 				     enum kvm_mr_change change)
++ {
++ 	/*
++ 	 * Update the total number of memslot pages before calling the arch
++ 	 * hook so that architectures can consume the result directly.
++ 	 */
++ 	if (change == KVM_MR_DELETE)
++ 		kvm->nr_memslot_pages -= old->npages;
++ 	else if (change == KVM_MR_CREATE)
++ 		kvm->nr_memslot_pages += new->npages;
++ 
++ 	kvm_arch_commit_memory_region(kvm, old, new, change);
++ 
++ 	switch (change) {
++ 	case KVM_MR_CREATE:
++ 		/* Nothing more to do. */
++ 		break;
++ 	case KVM_MR_DELETE:
++ 		/* Free the old memslot and all its metadata. */
++ 		kvm_free_memslot(kvm, old);
++ 		break;
++ 	case KVM_MR_MOVE:
++ 	case KVM_MR_FLAGS_ONLY:
++ 		/*
++ 		 * Free the dirty bitmap as needed; the below check encompasses
++ 		 * both the flags and whether a ring buffer is being used)
++ 		 */
++ 		if (old->dirty_bitmap && !new->dirty_bitmap)
++ 			kvm_destroy_dirty_bitmap(old);
++ 
++ 		/*
++ 		 * The final quirk.  Free the detached, old slot, but only its
++ 		 * memory, not any metadata.  Metadata, including arch specific
++ 		 * data, may be reused by @new.
++ 		 */
++ 		kfree(old);
++ 		break;
++ 	default:
++ 		BUG();
++ 	}
+++>>>>>>> c87661f855c3 (KVM: Free new dirty bitmap if creating a new memslot fails)
+  }
+  
+  /*
+* Unmerged path virt/kvm/kvm_main.c
