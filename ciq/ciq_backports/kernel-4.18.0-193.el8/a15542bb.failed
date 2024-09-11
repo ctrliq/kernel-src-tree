@@ -1,0 +1,153 @@
+RDMA/nldev: Skip counter if port doesn't match
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-193.el8
+commit-author Mark Zhang <markz@mellanox.com>
+commit a15542bb72a48042f5df7475893d46f725f5f9fb
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-193.el8/a15542bb.failed
+
+The counter resource should return -EAGAIN if it was requested for a
+different port, this is similar to how QP works if the users provides a
+port filter.
+
+Otherwise port filtering in netlink will return broken counter nests.
+
+Fixes: c4ffee7c9bdb ("RDMA/netlink: Implement counter dumpit calback")
+Link: https://lore.kernel.org/r/20191020062800.8065-1-leon@kernel.org
+	Signed-off-by: Mark Zhang <markz@mellanox.com>
+	Signed-off-by: Leon Romanovsky <leonro@mellanox.com>
+	Reviewed-by: Jason Gunthorpe <jgg@mellanox.com>
+	Signed-off-by: Jason Gunthorpe <jgg@mellanox.com>
+(cherry picked from commit a15542bb72a48042f5df7475893d46f725f5f9fb)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/infiniband/core/nldev.c
+diff --cc drivers/infiniband/core/nldev.c
+index efccd8e0fb77,c03af08b80e7..000000000000
+--- a/drivers/infiniband/core/nldev.c
++++ b/drivers/infiniband/core/nldev.c
+@@@ -599,6 -683,117 +599,120 @@@ out
+  	return -EMSGSIZE;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static int fill_stat_counter_qps(struct sk_buff *msg,
++ 				 struct rdma_counter *counter)
++ {
++ 	struct rdma_restrack_entry *res;
++ 	struct rdma_restrack_root *rt;
++ 	struct nlattr *table_attr;
++ 	struct ib_qp *qp = NULL;
++ 	unsigned long id = 0;
++ 	int ret = 0;
++ 
++ 	table_attr = nla_nest_start(msg, RDMA_NLDEV_ATTR_RES_QP);
++ 
++ 	rt = &counter->device->res[RDMA_RESTRACK_QP];
++ 	xa_lock(&rt->xa);
++ 	xa_for_each(&rt->xa, id, res) {
++ 		if (!rdma_is_visible_in_pid_ns(res))
++ 			continue;
++ 
++ 		qp = container_of(res, struct ib_qp, res);
++ 		if (qp->qp_type == IB_QPT_RAW_PACKET && !capable(CAP_NET_RAW))
++ 			continue;
++ 
++ 		if (!qp->counter || (qp->counter->id != counter->id))
++ 			continue;
++ 
++ 		ret = fill_stat_counter_qp_entry(msg, qp->qp_num);
++ 		if (ret)
++ 			goto err;
++ 	}
++ 
++ 	xa_unlock(&rt->xa);
++ 	nla_nest_end(msg, table_attr);
++ 	return 0;
++ 
++ err:
++ 	xa_unlock(&rt->xa);
++ 	nla_nest_cancel(msg, table_attr);
++ 	return ret;
++ }
++ 
++ static int fill_stat_hwcounter_entry(struct sk_buff *msg,
++ 				     const char *name, u64 value)
++ {
++ 	struct nlattr *entry_attr;
++ 
++ 	entry_attr = nla_nest_start(msg, RDMA_NLDEV_ATTR_STAT_HWCOUNTER_ENTRY);
++ 	if (!entry_attr)
++ 		return -EMSGSIZE;
++ 
++ 	if (nla_put_string(msg, RDMA_NLDEV_ATTR_STAT_HWCOUNTER_ENTRY_NAME,
++ 			   name))
++ 		goto err;
++ 	if (nla_put_u64_64bit(msg, RDMA_NLDEV_ATTR_STAT_HWCOUNTER_ENTRY_VALUE,
++ 			      value, RDMA_NLDEV_ATTR_PAD))
++ 		goto err;
++ 
++ 	nla_nest_end(msg, entry_attr);
++ 	return 0;
++ 
++ err:
++ 	nla_nest_cancel(msg, entry_attr);
++ 	return -EMSGSIZE;
++ }
++ 
++ static int fill_stat_counter_hwcounters(struct sk_buff *msg,
++ 					struct rdma_counter *counter)
++ {
++ 	struct rdma_hw_stats *st = counter->stats;
++ 	struct nlattr *table_attr;
++ 	int i;
++ 
++ 	table_attr = nla_nest_start(msg, RDMA_NLDEV_ATTR_STAT_HWCOUNTERS);
++ 	if (!table_attr)
++ 		return -EMSGSIZE;
++ 
++ 	for (i = 0; i < st->num_counters; i++)
++ 		if (fill_stat_hwcounter_entry(msg, st->names[i], st->value[i]))
++ 			goto err;
++ 
++ 	nla_nest_end(msg, table_attr);
++ 	return 0;
++ 
++ err:
++ 	nla_nest_cancel(msg, table_attr);
++ 	return -EMSGSIZE;
++ }
++ 
++ static int fill_res_counter_entry(struct sk_buff *msg, bool has_cap_net_admin,
++ 				  struct rdma_restrack_entry *res,
++ 				  uint32_t port)
++ {
++ 	struct rdma_counter *counter =
++ 		container_of(res, struct rdma_counter, res);
++ 
++ 	if (port && port != counter->port)
++ 		return -EAGAIN;
++ 
++ 	/* Dump it even query failed */
++ 	rdma_counter_query_stats(counter);
++ 
++ 	if (nla_put_u32(msg, RDMA_NLDEV_ATTR_PORT_INDEX, counter->port) ||
++ 	    nla_put_u32(msg, RDMA_NLDEV_ATTR_STAT_COUNTER_ID, counter->id) ||
++ 	    fill_res_name_pid(msg, &counter->res) ||
++ 	    fill_stat_counter_mode(msg, counter) ||
++ 	    fill_stat_counter_qps(msg, counter) ||
++ 	    fill_stat_counter_hwcounters(msg, counter))
++ 		return -EMSGSIZE;
++ 
++ 	return 0;
++ }
++ 
+++>>>>>>> a15542bb72a4 (RDMA/nldev: Skip counter if port doesn't match)
+  static int nldev_get_doit(struct sk_buff *skb, struct nlmsghdr *nlh,
+  			  struct netlink_ext_ack *extack)
+  {
+* Unmerged path drivers/infiniband/core/nldev.c
