@@ -1,0 +1,282 @@
+dma-mapping: zero memory returned from dma_alloc_*
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Christoph Hellwig <hch@lst.de>
+commit 518a2f1925c3165befbf06b75e07636549d92c1c
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/518a2f19.failed
+
+If we want to map memory from the DMA allocator to userspace it must be
+zeroed at allocation time to prevent stale data leaks.   We already do
+this on most common architectures, but some architectures don't do this
+yet, fix them up, either by passing GFP_ZERO when we use the normal page
+allocator or doing a manual memset otherwise.
+
+	Signed-off-by: Christoph Hellwig <hch@lst.de>
+	Acked-by: Geert Uytterhoeven <geert@linux-m68k.org> [m68k]
+	Acked-by: Sam Ravnborg <sam@ravnborg.org> [sparc]
+(cherry picked from commit 518a2f1925c3165befbf06b75e07636549d92c1c)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/sparc/kernel/ioport.c
+#	arch/sparc/mm/io-unit.c
+#	arch/sparc/mm/iommu.c
+diff --cc arch/sparc/kernel/ioport.c
+index cca9134cfa7d,f89603855f1e..000000000000
+--- a/arch/sparc/kernel/ioport.c
++++ b/arch/sparc/kernel/ioport.c
+@@@ -434,19 -315,19 +434,27 @@@ arch_initcall(sparc_register_ioport)
+  /* Allocate and map kernel buffer using consistent mode DMA for a device.
+   * hwdev should be valid struct pci_dev pointer for PCI devices.
+   */
+ -void *arch_dma_alloc(struct device *dev, size_t size, dma_addr_t *dma_handle,
+ -		gfp_t gfp, unsigned long attrs)
+ +static void *pci32_alloc_coherent(struct device *dev, size_t len,
+ +				  dma_addr_t *pba, gfp_t gfp,
+ +				  unsigned long attrs)
+  {
+ -	unsigned long addr;
+ +	unsigned long len_total = PAGE_ALIGN(len);
+  	void *va;
+ +	struct resource *res;
+ +	int order;
+  
+ -	if (!size || size > 256 * 1024)	/* __get_free_pages() limit */
+ +	if (len == 0) {
+  		return NULL;
+++<<<<<<< HEAD
+ +	}
+ +	if (len > 256*1024) {			/* __get_free_pages() limit */
+++=======
++ 
++ 	size = PAGE_ALIGN(size);
++ 	va = (void *) __get_free_pages(gfp | __GFP_ZERO, get_order(size));
++ 	if (!va) {
++ 		printk("%s: no %zd pages\n", __func__, size >> PAGE_SHIFT);
+++>>>>>>> 518a2f1925c3 (dma-mapping: zero memory returned from dma_alloc_*)
+  		return NULL;
+  	}
+  
+diff --cc arch/sparc/mm/io-unit.c
+index c8cb27d3ea75,f770ee7229d8..000000000000
+--- a/arch/sparc/mm/io-unit.c
++++ b/arch/sparc/mm/io-unit.c
+@@@ -208,7 -219,19 +208,23 @@@ static int iounit_map_dma_area(struct d
+  	pgprot_t dvma_prot;
+  	iopte_t __iomem *iopte;
+  
+++<<<<<<< HEAD
+ +	*pba = addr;
+++=======
++ 	/* XXX So what is maxphys for us and how do drivers know it? */
++ 	if (!len || len > 256 * 1024)
++ 		return NULL;
++ 
++ 	len = PAGE_ALIGN(len);
++ 	va = __get_free_pages(gfp | __GFP_ZERO, get_order(len));
++ 	if (!va)
++ 		return NULL;
++ 
++ 	addr = ret = sparc_dma_alloc_resource(dev, len);
++ 	if (!addr)
++ 		goto out_free_pages;
++ 	*dma_handle = addr;
+++>>>>>>> 518a2f1925c3 (dma-mapping: zero memory returned from dma_alloc_*)
+  
+  	dvma_prot = __pgprot(SRMMU_CACHE | SRMMU_ET_PTE | SRMMU_PRIV);
+  	end = PAGE_ALIGN((addr + len));
+diff --cc arch/sparc/mm/iommu.c
+index 2c5f8a648f8c,e8d5d73ca40d..000000000000
+--- a/arch/sparc/mm/iommu.c
++++ b/arch/sparc/mm/iommu.c
+@@@ -331,6 -339,19 +331,22 @@@ static int iommu_map_dma_area(struct de
+  	iopte_t *first;
+  	int ioptex;
+  
+++<<<<<<< HEAD
+++=======
++ 	/* XXX So what is maxphys for us and how do drivers know it? */
++ 	if (!len || len > 256 * 1024)
++ 		return NULL;
++ 
++ 	len = PAGE_ALIGN(len);
++ 	va = __get_free_pages(gfp | __GFP_ZERO, get_order(len));
++ 	if (va == 0)
++ 		return NULL;
++ 
++ 	addr = ret = sparc_dma_alloc_resource(dev, len);
++ 	if (!addr)
++ 		goto out_free_pages;
++ 
+++>>>>>>> 518a2f1925c3 (dma-mapping: zero memory returned from dma_alloc_*)
+  	BUG_ON((va & ~PAGE_MASK) != 0);
+  	BUG_ON((addr & ~PAGE_MASK) != 0);
+  	BUG_ON((len & ~PAGE_MASK) != 0);
+diff --git a/arch/alpha/kernel/pci_iommu.c b/arch/alpha/kernel/pci_iommu.c
+index 6923b0d9c1e1..7cbf5c300099 100644
+--- a/arch/alpha/kernel/pci_iommu.c
++++ b/arch/alpha/kernel/pci_iommu.c
+@@ -443,7 +443,7 @@ static void *alpha_pci_alloc_coherent(struct device *dev, size_t size,
+ 	gfp &= ~GFP_DMA;
+ 
+ try_again:
+-	cpu_addr = (void *)__get_free_pages(gfp, order);
++	cpu_addr = (void *)__get_free_pages(gfp | __GFP_ZERO, order);
+ 	if (! cpu_addr) {
+ 		printk(KERN_INFO "pci_alloc_consistent: "
+ 		       "get_free_pages failed from %pf\n",
+diff --git a/arch/arc/mm/dma.c b/arch/arc/mm/dma.c
+index ec47e6079f5d..fa1678583824 100644
+--- a/arch/arc/mm/dma.c
++++ b/arch/arc/mm/dma.c
+@@ -29,7 +29,7 @@ void *arch_dma_alloc(struct device *dev, size_t size, dma_addr_t *dma_handle,
+ 	void *kvaddr;
+ 	int need_coh = 1, need_kvaddr = 0;
+ 
+-	page = alloc_pages(gfp, order);
++	page = alloc_pages(gfp | __GFP_ZERO, order);
+ 	if (!page)
+ 		return NULL;
+ 
+diff --git a/arch/c6x/mm/dma-coherent.c b/arch/c6x/mm/dma-coherent.c
+index d0a8e0c4b27e..fd5cf948d682 100644
+--- a/arch/c6x/mm/dma-coherent.c
++++ b/arch/c6x/mm/dma-coherent.c
+@@ -78,6 +78,7 @@ static void __free_dma_pages(u32 addr, int order)
+ void *arch_dma_alloc(struct device *dev, size_t size, dma_addr_t *handle,
+ 		gfp_t gfp, unsigned long attrs)
+ {
++	void *ret;
+ 	u32 paddr;
+ 	int order;
+ 
+@@ -94,7 +95,9 @@ void *arch_dma_alloc(struct device *dev, size_t size, dma_addr_t *handle,
+ 	if (!paddr)
+ 		return NULL;
+ 
+-	return phys_to_virt(paddr);
++	ret = phys_to_virt(paddr);
++	memset(ret, 0, 1 << order);
++	return ret;
+ }
+ 
+ /*
+diff --git a/arch/m68k/kernel/dma.c b/arch/m68k/kernel/dma.c
+index 463572c4943f..753942de4299 100644
+--- a/arch/m68k/kernel/dma.c
++++ b/arch/m68k/kernel/dma.c
+@@ -32,7 +32,7 @@ static void *m68k_dma_alloc(struct device *dev, size_t size, dma_addr_t *handle,
+ 	size = PAGE_ALIGN(size);
+ 	order = get_order(size);
+ 
+-	page = alloc_pages(flag, order);
++	page = alloc_pages(flag | __GFP_ZERO, order);
+ 	if (!page)
+ 		return NULL;
+ 
+diff --git a/arch/microblaze/mm/consistent.c b/arch/microblaze/mm/consistent.c
+index b06c3a7faf20..29dff592100c 100644
+--- a/arch/microblaze/mm/consistent.c
++++ b/arch/microblaze/mm/consistent.c
+@@ -79,7 +79,7 @@ void *consistent_alloc(gfp_t gfp, size_t size, dma_addr_t *dma_handle)
+ 	size = PAGE_ALIGN(size);
+ 	order = get_order(size);
+ 
+-	vaddr = __get_free_pages(gfp, order);
++	vaddr = __get_free_pages(gfp | __GFP_ZERO, order);
+ 	if (!vaddr)
+ 		return NULL;
+ 
+diff --git a/arch/openrisc/kernel/dma.c b/arch/openrisc/kernel/dma.c
+index ec7fd45704d2..41533909e528 100644
+--- a/arch/openrisc/kernel/dma.c
++++ b/arch/openrisc/kernel/dma.c
+@@ -92,7 +92,7 @@ or1k_dma_alloc(struct device *dev, size_t size,
+ 		.mm = &init_mm
+ 	};
+ 
+-	page = alloc_pages_exact(size, gfp);
++	page = alloc_pages_exact(size, gfp | __GFP_ZERO);
+ 	if (!page)
+ 		return NULL;
+ 
+diff --git a/arch/parisc/kernel/pci-dma.c b/arch/parisc/kernel/pci-dma.c
+index 6df07ce4f3c2..87cd3ce21746 100644
+--- a/arch/parisc/kernel/pci-dma.c
++++ b/arch/parisc/kernel/pci-dma.c
+@@ -405,7 +405,7 @@ static void *pa11_dma_alloc(struct device *dev, size_t size,
+ 	order = get_order(size);
+ 	size = 1 << (order + PAGE_SHIFT);
+ 	vaddr = pcxl_alloc_range(size);
+-	paddr = __get_free_pages(flag, order);
++	paddr = __get_free_pages(flag | __GFP_ZERO, order);
+ 	flush_kernel_dcache_range(paddr, size);
+ 	paddr = __pa(paddr);
+ 	map_uncached_pages(vaddr, size, paddr);
+@@ -582,7 +582,7 @@ static void *pcx_dma_alloc(struct device *dev, size_t size,
+ 	if ((attrs & DMA_ATTR_NON_CONSISTENT) == 0)
+ 		return NULL;
+ 
+-	addr = (void *)__get_free_pages(flag, get_order(size));
++	addr = (void *)__get_free_pages(flag | __GFP_ZERO, get_order(size));
+ 	if (addr)
+ 		*dma_handle = (dma_addr_t)virt_to_phys(addr);
+ 
+diff --git a/arch/s390/pci/pci_dma.c b/arch/s390/pci/pci_dma.c
+index 346ba382193a..9e52d1527f71 100644
+--- a/arch/s390/pci/pci_dma.c
++++ b/arch/s390/pci/pci_dma.c
+@@ -404,7 +404,7 @@ static void *s390_dma_alloc(struct device *dev, size_t size,
+ 	dma_addr_t map;
+ 
+ 	size = PAGE_ALIGN(size);
+-	page = alloc_pages(flag, get_order(size));
++	page = alloc_pages(flag | __GFP_ZERO, get_order(size));
+ 	if (!page)
+ 		return NULL;
+ 
+* Unmerged path arch/sparc/kernel/ioport.c
+* Unmerged path arch/sparc/mm/io-unit.c
+* Unmerged path arch/sparc/mm/iommu.c
+diff --git a/arch/xtensa/kernel/pci-dma.c b/arch/xtensa/kernel/pci-dma.c
+index a02dc563d290..f43100eb5750 100644
+--- a/arch/xtensa/kernel/pci-dma.c
++++ b/arch/xtensa/kernel/pci-dma.c
+@@ -140,7 +140,7 @@ static void *xtensa_dma_alloc(struct device *dev, size_t size,
+ 						 flag & __GFP_NOWARN);
+ 
+ 	if (!page)
+-		page = alloc_pages(flag, get_order(size));
++		page = alloc_pages(flag | __GFP_ZERO, get_order(size));
+ 
+ 	if (!page)
+ 		return NULL;
+diff --git a/drivers/misc/mic/host/mic_boot.c b/drivers/misc/mic/host/mic_boot.c
+index c327985c9523..6479435ac96b 100644
+--- a/drivers/misc/mic/host/mic_boot.c
++++ b/drivers/misc/mic/host/mic_boot.c
+@@ -149,7 +149,7 @@ static void *__mic_dma_alloc(struct device *dev, size_t size,
+ 	struct scif_hw_dev *scdev = dev_get_drvdata(dev);
+ 	struct mic_device *mdev = scdev_to_mdev(scdev);
+ 	dma_addr_t tmp;
+-	void *va = kmalloc(size, gfp);
++	void *va = kmalloc(size, gfp | __GFP_ZERO);
+ 
+ 	if (va) {
+ 		tmp = mic_map_single(mdev, va, size);
+diff --git a/kernel/dma/virt.c b/kernel/dma/virt.c
+index 631ddec4b60a..ebe128833af7 100644
+--- a/kernel/dma/virt.c
++++ b/kernel/dma/virt.c
+@@ -13,7 +13,7 @@ static void *dma_virt_alloc(struct device *dev, size_t size,
+ {
+ 	void *ret;
+ 
+-	ret = (void *)__get_free_pages(gfp, get_order(size));
++	ret = (void *)__get_free_pages(gfp | __GFP_ZERO, get_order(size));
+ 	if (ret)
+ 		*dma_handle = (uintptr_t)ret;
+ 	return ret;
