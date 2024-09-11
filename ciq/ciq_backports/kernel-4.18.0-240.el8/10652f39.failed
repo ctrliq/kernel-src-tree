@@ -1,0 +1,341 @@
+net/mlx5: Refactor ingress acl configuration
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Parav Pandit <parav@mellanox.com>
+commit 10652f39943ec19d32a6fa44a8523b0d40abcbcf
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/10652f39.failed
+
+Drop, untagged, spoof check and untagged spoof check flow groups are
+limited to legacy mode only.
+
+Therefore, following refactoring is done to
+(a) improve code readability
+(b) have better code split between legacy and offloads mode
+
+1. Move legacy flow groups under legacy structure
+2. Add validity check for group deletion
+3. Restrict scope of esw_vport_disable_ingress_acl to legacy mode
+4. Rename esw_vport_enable_ingress_acl() to
+esw_vport_create_ingress_acl_table() and limit its scope to
+table creation
+5. Introduce legacy flow groups creation helper
+esw_legacy_create_ingress_acl_groups() and keep its scope to legacy mode
+6. Reduce offloads ingress groups from 4 to just 1 metadata group
+per vport
+7. Removed redundant IS_ERR_OR_NULL as entries are marked NULL on free.
+8. Shortern error message to remove redundant 'E-switch'
+
+	Signed-off-by: Parav Pandit <parav@mellanox.com>
+	Signed-off-by: Saeed Mahameed <saeedm@mellanox.com>
+(cherry picked from commit 10652f39943ec19d32a6fa44a8523b0d40abcbcf)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/mellanox/mlx5/core/eswitch.c
+#	drivers/net/ethernet/mellanox/mlx5/core/eswitch.h
+#	drivers/net/ethernet/mellanox/mlx5/core/eswitch_offloads.c
+diff --cc drivers/net/ethernet/mellanox/mlx5/core/eswitch.c
+index 7ecf89103bc8,cc8d43d8c469..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx5/core/eswitch.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/eswitch.c
+@@@ -1197,22 -1216,21 +1208,31 @@@ void esw_vport_destroy_ingress_acl_tabl
+  void esw_vport_cleanup_ingress_rules(struct mlx5_eswitch *esw,
+  				     struct mlx5_vport *vport)
+  {
+++<<<<<<< HEAD
+ +	if (!IS_ERR_OR_NULL(vport->ingress.drop_rule))
+ +		mlx5_del_flow_rules(vport->ingress.drop_rule);
+ +
+ +	if (!IS_ERR_OR_NULL(vport->ingress.allow_rule))
+++=======
++ 	if (vport->ingress.legacy.drop_rule) {
++ 		mlx5_del_flow_rules(vport->ingress.legacy.drop_rule);
++ 		vport->ingress.legacy.drop_rule = NULL;
++ 	}
++ 
++ 	if (vport->ingress.allow_rule) {
+++>>>>>>> 10652f39943e (net/mlx5: Refactor ingress acl configuration)
+  		mlx5_del_flow_rules(vport->ingress.allow_rule);
+ -		vport->ingress.allow_rule = NULL;
+ -	}
+ +
+ +	vport->ingress.drop_rule = NULL;
+ +	vport->ingress.allow_rule = NULL;
+ +
+ +	esw_vport_del_ingress_acl_modify_metadata(esw, vport);
+  }
+  
+- void esw_vport_disable_ingress_acl(struct mlx5_eswitch *esw,
+- 				   struct mlx5_vport *vport)
++ static void esw_vport_disable_legacy_ingress_acl(struct mlx5_eswitch *esw,
++ 						 struct mlx5_vport *vport)
+  {
+- 	if (IS_ERR_OR_NULL(vport->ingress.acl))
++ 	if (!vport->ingress.acl)
+  		return;
+  
+  	esw_debug(esw->dev, "Destroy vport[%d] E-Switch ingress ACL\n", vport->vport);
+@@@ -1312,13 -1354,14 +1356,14 @@@ static int esw_vport_ingress_config(str
+  		esw_warn(esw->dev,
+  			 "vport[%d] configure ingress drop rule, err(%d)\n",
+  			 vport->vport, err);
+ -		vport->ingress.legacy.drop_rule = NULL;
+ +		vport->ingress.drop_rule = NULL;
+  		goto out;
+  	}
++ 	kvfree(spec);
++ 	return 0;
+  
+  out:
+- 	if (err)
+- 		esw_vport_cleanup_ingress_rules(esw, vport);
++ 	esw_vport_disable_legacy_ingress_acl(esw, vport);
+  	kvfree(spec);
+  	return err;
+  }
+@@@ -1676,31 -1719,77 +1721,80 @@@ static void esw_vport_create_drop_count
+  		}
+  	}
+  
+ -	ret = esw_vport_ingress_config(esw, vport);
+ -	if (ret)
+ -		goto ingress_err;
+ -
+ -	if (!mlx5_esw_is_manager_vport(esw, vport->vport) &&
+ -	    MLX5_CAP_ESW_EGRESS_ACL(esw->dev, flow_counter)) {
+ -		vport->egress.legacy.drop_counter = mlx5_fc_create(esw->dev, false);
+ -		if (IS_ERR(vport->egress.legacy.drop_counter)) {
+ -			esw_warn(esw->dev,
+ +	if (MLX5_CAP_ESW_EGRESS_ACL(dev, flow_counter)) {
+ +		vport->egress.drop_counter = mlx5_fc_create(dev, false);
+ +		if (IS_ERR(vport->egress.drop_counter)) {
+ +			esw_warn(dev,
+  				 "vport[%d] configure egress drop rule counter failed\n",
+  				 vport->vport);
+ -			vport->egress.legacy.drop_counter = NULL;
+ +			vport->egress.drop_counter = NULL;
+  		}
+  	}
+++<<<<<<< HEAD
+++=======
++ 
++ 	ret = esw_vport_egress_config(esw, vport);
++ 	if (ret)
++ 		goto egress_err;
++ 
++ 	return 0;
++ 
++ egress_err:
++ 	esw_vport_disable_legacy_ingress_acl(esw, vport);
++ 	mlx5_fc_destroy(esw->dev, vport->egress.legacy.drop_counter);
++ 	vport->egress.legacy.drop_counter = NULL;
++ 
++ ingress_err:
++ 	mlx5_fc_destroy(esw->dev, vport->ingress.legacy.drop_counter);
++ 	vport->ingress.legacy.drop_counter = NULL;
++ 	return ret;
+++>>>>>>> 10652f39943e (net/mlx5: Refactor ingress acl configuration)
+  }
+  
+ -static int esw_vport_setup_acl(struct mlx5_eswitch *esw,
+ -			       struct mlx5_vport *vport)
+ +static void esw_vport_destroy_drop_counters(struct mlx5_vport *vport)
+  {
+ -	if (esw->mode == MLX5_ESWITCH_LEGACY)
+ -		return esw_vport_create_legacy_acl_tables(esw, vport);
+ -	else
+ -		return esw_vport_create_offloads_acl_tables(esw, vport);
+ +	struct mlx5_core_dev *dev = vport->dev;
+ +
+ +	if (vport->ingress.drop_counter)
+ +		mlx5_fc_destroy(dev, vport->ingress.drop_counter);
+ +	if (vport->egress.drop_counter)
+ +		mlx5_fc_destroy(dev, vport->egress.drop_counter);
+  }
+  
+++<<<<<<< HEAD
+ +static void esw_enable_vport(struct mlx5_eswitch *esw, struct mlx5_vport *vport,
+ +			     enum mlx5_eswitch_vport_event enabled_events)
+++=======
++ static void esw_vport_destroy_legacy_acl_tables(struct mlx5_eswitch *esw,
++ 						struct mlx5_vport *vport)
++ 
++ {
++ 	if (mlx5_esw_is_manager_vport(esw, vport->vport))
++ 		return;
++ 
++ 	esw_vport_disable_egress_acl(esw, vport);
++ 	mlx5_fc_destroy(esw->dev, vport->egress.legacy.drop_counter);
++ 	vport->egress.legacy.drop_counter = NULL;
++ 
++ 	esw_vport_disable_legacy_ingress_acl(esw, vport);
++ 	mlx5_fc_destroy(esw->dev, vport->ingress.legacy.drop_counter);
++ 	vport->ingress.legacy.drop_counter = NULL;
++ }
++ 
++ static void esw_vport_cleanup_acl(struct mlx5_eswitch *esw,
++ 				  struct mlx5_vport *vport)
++ {
++ 	if (esw->mode == MLX5_ESWITCH_LEGACY)
++ 		esw_vport_destroy_legacy_acl_tables(esw, vport);
++ 	else
++ 		esw_vport_destroy_offloads_acl_tables(esw, vport);
++ }
++ 
++ static int esw_enable_vport(struct mlx5_eswitch *esw, struct mlx5_vport *vport,
++ 			    enum mlx5_eswitch_vport_event enabled_events)
+++>>>>>>> 10652f39943e (net/mlx5: Refactor ingress acl configuration)
+  {
+  	u16 vport_num = vport->vport;
+ -	int ret;
+  
+  	mutex_lock(&esw->state_lock);
+  	WARN_ON(vport->enabled);
+diff --cc drivers/net/ethernet/mellanox/mlx5/core/eswitch.h
+index ab76b9d1f8c7,5e91735726b7..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx5/core/eswitch.h
++++ b/drivers/net/ethernet/mellanox/mlx5/core/eswitch.h
+@@@ -65,14 -65,17 +65,27 @@@
+  
+  struct vport_ingress {
+  	struct mlx5_flow_table *acl;
+++<<<<<<< HEAD
+ +	struct mlx5_flow_group *allow_untagged_spoofchk_grp;
+ +	struct mlx5_flow_group *allow_spoofchk_only_grp;
+ +	struct mlx5_flow_group *allow_untagged_only_grp;
+ +	struct mlx5_flow_group *drop_grp;
+ +	struct mlx5_flow_handle  *allow_rule;
+ +	struct mlx5_flow_handle  *drop_rule;
+ +	struct mlx5_fc           *drop_counter;
+++=======
++ 	struct mlx5_flow_handle *allow_rule;
+  	struct {
++ 		struct mlx5_flow_group *allow_spoofchk_only_grp;
++ 		struct mlx5_flow_group *allow_untagged_spoofchk_grp;
++ 		struct mlx5_flow_group *allow_untagged_only_grp;
++ 		struct mlx5_flow_group *drop_grp;
++ 		struct mlx5_flow_handle *drop_rule;
++ 		struct mlx5_fc *drop_counter;
++ 	} legacy;
+++>>>>>>> 10652f39943e (net/mlx5: Refactor ingress acl configuration)
++ 	struct {
++ 		struct mlx5_flow_group *metadata_grp;
+  		struct mlx5_modify_hdr *modify_metadata;
+  		struct mlx5_flow_handle *modify_metadata_rule;
+  	} offloads;
+@@@ -261,10 -268,6 +276,13 @@@ int esw_vport_enable_egress_acl(struct 
+  				struct mlx5_vport *vport);
+  void esw_vport_disable_egress_acl(struct mlx5_eswitch *esw,
+  				  struct mlx5_vport *vport);
+++<<<<<<< HEAD
+ +void esw_vport_disable_ingress_acl(struct mlx5_eswitch *esw,
+ +				   struct mlx5_vport *vport);
+ +void esw_vport_del_ingress_acl_modify_metadata(struct mlx5_eswitch *esw,
+ +					       struct mlx5_vport *vport);
+++=======
+++>>>>>>> 10652f39943e (net/mlx5: Refactor ingress acl configuration)
+  int mlx5_esw_modify_vport_rate(struct mlx5_eswitch *esw, u16 vport_num,
+  			       u32 rate_mbps);
+  
+diff --cc drivers/net/ethernet/mellanox/mlx5/core/eswitch_offloads.c
+index 00d126fa6e02,807372a7211b..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx5/core/eswitch_offloads.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/eswitch_offloads.c
+@@@ -1952,53 -1996,50 +1998,79 @@@ esw_check_vport_match_metadata_supporte
+  	return true;
+  }
+  
+ -int
+ -esw_vport_create_offloads_acl_tables(struct mlx5_eswitch *esw,
+ -				     struct mlx5_vport *vport)
+ +static bool
+ +esw_check_vport_match_metadata_mandatory(const struct mlx5_eswitch *esw)
+  {
+++<<<<<<< HEAD
+ +	return mlx5_core_mp_enabled(esw->dev);
+++=======
++ 	int err;
++ 
++ 	err = esw_vport_ingress_config(esw, vport);
++ 	if (err)
++ 		return err;
++ 
++ 	if (mlx5_eswitch_is_vf_vport(esw, vport->vport)) {
++ 		err = esw_vport_egress_config(esw, vport);
++ 		if (err) {
++ 			esw_vport_del_ingress_acl_modify_metadata(esw, vport);
++ 			esw_vport_cleanup_ingress_rules(esw, vport);
++ 			esw_vport_destroy_ingress_acl_table(vport);
++ 		}
++ 	}
++ 	return err;
+++>>>>>>> 10652f39943e (net/mlx5: Refactor ingress acl configuration)
+  }
+  
+ -void
+ -esw_vport_destroy_offloads_acl_tables(struct mlx5_eswitch *esw,
+ -				      struct mlx5_vport *vport)
+ +static bool esw_use_vport_metadata(const struct mlx5_eswitch *esw)
+  {
+++<<<<<<< HEAD
+ +	return esw_check_vport_match_metadata_mandatory(esw) &&
+ +	       esw_check_vport_match_metadata_supported(esw);
+++=======
++ 	esw_vport_disable_egress_acl(esw, vport);
++ 	esw_vport_del_ingress_acl_modify_metadata(esw, vport);
++ 	esw_vport_cleanup_ingress_rules(esw, vport);
++ 	esw_vport_destroy_ingress_acl_group(vport);
++ 	esw_vport_destroy_ingress_acl_table(vport);
+++>>>>>>> 10652f39943e (net/mlx5: Refactor ingress acl configuration)
+  }
+  
+ -static int esw_create_uplink_offloads_acl_tables(struct mlx5_eswitch *esw)
+ +static int esw_create_offloads_acl_tables(struct mlx5_eswitch *esw)
+  {
+  	struct mlx5_vport *vport;
+ +	int i, j;
+  	int err;
+  
+ -	if (esw_check_vport_match_metadata_supported(esw))
+ +	if (esw_use_vport_metadata(esw))
+  		esw->flags |= MLX5_ESWITCH_VPORT_MATCH_METADATA;
+  
+ -	vport = mlx5_eswitch_get_vport(esw, MLX5_VPORT_UPLINK);
+ -	err = esw_vport_create_offloads_acl_tables(esw, vport);
+ -	if (err)
+ -		esw->flags &= ~MLX5_ESWITCH_VPORT_MATCH_METADATA;
+ +	mlx5_esw_for_all_vports(esw, i, vport) {
+ +		err = esw_vport_ingress_config(esw, vport);
+ +		if (err)
+ +			goto err_ingress;
+ +
+ +		if (mlx5_eswitch_is_vf_vport(esw, vport->vport)) {
+ +			err = esw_vport_egress_config(esw, vport);
+ +			if (err)
+ +				goto err_egress;
+ +		}
+ +	}
+ +
+ +	if (mlx5_eswitch_vport_match_metadata_enabled(esw))
+ +		esw_info(esw->dev, "Use metadata reg_c as source vport to match\n");
+ +
+ +	return 0;
+ +
+ +err_egress:
+ +	esw_vport_disable_ingress_acl(esw, vport);
+ +err_ingress:
+ +	for (j = MLX5_VPORT_PF; j < i; j++) {
+ +		vport = &esw->vports[j];
+ +		esw_vport_disable_egress_acl(esw, vport);
+ +		esw_vport_disable_ingress_acl(esw, vport);
+ +	}
+ +
+  	return err;
+  }
+  
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/eswitch.c
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/eswitch.h
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/eswitch_offloads.c
