@@ -1,0 +1,161 @@
+net/mlx5: E-switch, Generalize per vport table API
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-326.el8
+commit-author Chris Mi <cmi@nvidia.com>
+commit c796bb7cd2307d5fb815e919b964bf2d65c95ec3
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-326.el8/c796bb7c.failed
+
+Currently, per vport table was used only for port mirroring actions.
+However, sample action will also require a per vport table instance.
+
+Generalize the vport table API to work with multiple namespaces where
+each namespace manages its own vport table instance.
+
+	Signed-off-by: Chris Mi <cmi@nvidia.com>
+	Reviewed-by: Oz Shlomo <ozsh@nvidia.com>
+	Reviewed-by: Mark Bloch <mbloch@nvidia.com>
+	Signed-off-by: Saeed Mahameed <saeedm@nvidia.com>
+(cherry picked from commit c796bb7cd2307d5fb815e919b964bf2d65c95ec3)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/mellanox/mlx5/core/eswitch_offloads.c
+diff --cc drivers/net/ethernet/mellanox/mlx5/core/eswitch_offloads.c
+index ff63d3681390,8ac4b60ea225..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx5/core/eswitch_offloads.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/eswitch_offloads.c
+@@@ -302,8 -491,9 +311,9 @@@ mlx5_eswitch_add_offloaded_rule(struct 
+  		fwd_attr.chain = attr->chain;
+  		fwd_attr.prio = attr->prio;
+  		fwd_attr.vport = esw_attr->in_rep->vport;
++ 		fwd_attr.vport_ns = &mlx5_esw_vport_tbl_mirror_ns;
+  
+ -		fdb = mlx5_esw_vporttbl_get(esw, &fwd_attr);
+ +		fdb = esw_vport_tbl_get(esw, &fwd_attr);
+  	} else {
+  		if (attr->chain || attr->prio)
+  			fdb = mlx5_chains_get_table(chains, attr->chain,
+@@@ -370,7 -558,8 +380,12 @@@ mlx5_eswitch_add_fwd_rule(struct mlx5_e
+  	fwd_attr.chain = attr->chain;
+  	fwd_attr.prio = attr->prio;
+  	fwd_attr.vport = esw_attr->in_rep->vport;
+++<<<<<<< HEAD
+ +	fwd_fdb = esw_vport_tbl_get(esw, &fwd_attr);
+++=======
++ 	fwd_attr.vport_ns = &mlx5_esw_vport_tbl_mirror_ns;
++ 	fwd_fdb = mlx5_esw_vporttbl_get(esw, &fwd_attr);
+++>>>>>>> c796bb7cd230 (net/mlx5: E-switch, Generalize per vport table API)
+  	if (IS_ERR(fwd_fdb)) {
+  		rule = ERR_CAST(fwd_fdb);
+  		goto err_get_fwd;
+@@@ -1076,7 -1357,8 +1092,12 @@@ static void mlx5_esw_vport_tbl_put(stru
+  	attr.prio = 1;
+  	mlx5_esw_for_all_vports(esw, i, vport) {
+  		attr.vport = vport->vport;
+++<<<<<<< HEAD
+ +		esw_vport_tbl_put(esw, &attr);
+++=======
++ 		attr.vport_ns = &mlx5_esw_vport_tbl_mirror_ns;
++ 		mlx5_esw_vporttbl_put(esw, &attr);
+++>>>>>>> c796bb7cd230 (net/mlx5: E-switch, Generalize per vport table API)
+  	}
+  }
+  
+@@@ -1091,7 -1373,8 +1112,12 @@@ static int mlx5_esw_vport_tbl_get(struc
+  	attr.prio = 1;
+  	mlx5_esw_for_all_vports(esw, i, vport) {
+  		attr.vport = vport->vport;
+++<<<<<<< HEAD
+ +		fdb = esw_vport_tbl_get(esw, &attr);
+++=======
++ 		attr.vport_ns = &mlx5_esw_vport_tbl_mirror_ns;
++ 		fdb = mlx5_esw_vporttbl_get(esw, &attr);
+++>>>>>>> c796bb7cd230 (net/mlx5: E-switch, Generalize per vport table API)
+  		if (IS_ERR(fdb))
+  			goto out;
+  	}
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/esw/vporttbl.c b/drivers/net/ethernet/mellanox/mlx5/core/esw/vporttbl.c
+index 8219c5d50db0..ca972eb6c64f 100644
+--- a/drivers/net/ethernet/mellanox/mlx5/core/esw/vporttbl.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/esw/vporttbl.c
+@@ -3,9 +3,6 @@
+ 
+ #include "eswitch.h"
+ 
+-#define MLX5_ESW_VPORT_TABLE_SIZE 128
+-#define MLX5_ESW_VPORT_TBL_NUM_GROUPS  4
+-
+ /* This struct is used as a key to the hash table and we need it to be packed
+  * so hash result is consistent
+  */
+@@ -14,6 +11,7 @@ struct mlx5_vport_key {
+ 	u16 prio;
+ 	u16 vport;
+ 	u16 vhca_id;
++	const struct esw_vport_tbl_namespace *vport_ns;
+ } __packed;
+ 
+ struct mlx5_vport_table {
+@@ -24,14 +22,16 @@ struct mlx5_vport_table {
+ };
+ 
+ static struct mlx5_flow_table *
+-esw_vport_tbl_create(struct mlx5_eswitch *esw, struct mlx5_flow_namespace *ns)
++esw_vport_tbl_create(struct mlx5_eswitch *esw, struct mlx5_flow_namespace *ns,
++		     const struct esw_vport_tbl_namespace *vport_ns)
+ {
+ 	struct mlx5_flow_table_attr ft_attr = {};
+ 	struct mlx5_flow_table *fdb;
+ 
+-	ft_attr.autogroup.max_num_groups = MLX5_ESW_VPORT_TBL_NUM_GROUPS;
+-	ft_attr.max_fte = MLX5_ESW_VPORT_TABLE_SIZE;
++	ft_attr.autogroup.max_num_groups = vport_ns->max_num_groups;
++	ft_attr.max_fte = vport_ns->max_fte;
+ 	ft_attr.prio = FDB_PER_VPORT;
++	ft_attr.flags = vport_ns->flags;
+ 	fdb = mlx5_create_auto_grouped_flow_table(ns, &ft_attr);
+ 	if (IS_ERR(fdb)) {
+ 		esw_warn(esw->dev, "Failed to create per vport FDB Table err %ld\n",
+@@ -49,6 +49,7 @@ static u32 flow_attr_to_vport_key(struct mlx5_eswitch *esw,
+ 	key->chain = attr->chain;
+ 	key->prio = attr->prio;
+ 	key->vhca_id = MLX5_CAP_GEN(esw->dev, vhca_id);
++	key->vport_ns  = attr->vport_ns;
+ 	return jhash(key, sizeof(*key), 0);
+ }
+ 
+@@ -96,7 +97,7 @@ esw_vport_tbl_get(struct mlx5_eswitch *esw, struct mlx5_vport_tbl_attr *attr)
+ 		goto err_ns;
+ 	}
+ 
+-	fdb = esw_vport_tbl_create(esw, ns);
++	fdb = esw_vport_tbl_create(esw, ns, attr->vport_ns);
+ 	if (IS_ERR(fdb))
+ 		goto err_ns;
+ 
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/eswitch.h b/drivers/net/ethernet/mellanox/mlx5/core/eswitch.h
+index 451410599bb1..d9bdd0ed984d 100644
+--- a/drivers/net/ethernet/mellanox/mlx5/core/eswitch.h
++++ b/drivers/net/ethernet/mellanox/mlx5/core/eswitch.h
+@@ -704,10 +704,17 @@ void
+ esw_vport_destroy_offloads_acl_tables(struct mlx5_eswitch *esw,
+ 				      struct mlx5_vport *vport);
+ 
++struct esw_vport_tbl_namespace {
++	int max_fte;
++	int max_num_groups;
++	u32 flags;
++};
++
+ struct mlx5_vport_tbl_attr {
+ 	u16 chain;
+ 	u16 prio;
+ 	u16 vport;
++	const struct esw_vport_tbl_namespace *vport_ns;
+ };
+ 
+ struct mlx5_flow_table *
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/eswitch_offloads.c
