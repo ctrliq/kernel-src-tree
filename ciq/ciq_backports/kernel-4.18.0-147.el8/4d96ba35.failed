@@ -1,0 +1,158 @@
+mm: memcg/slab: stop setting page->mem_cgroup pointer for slab pages
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-147.el8
+commit-author Roman Gushchin <guro@fb.com>
+commit 4d96ba3530750fae3f3f01150adfecde96157815
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-147.el8/4d96ba35.failed
+
+Every slab page charged to a non-root memory cgroup has a pointer to the
+memory cgroup and holds a reference to it, which protects a non-empty
+memory cgroup from being released.  At the same time the page has a
+pointer to the corresponding kmem_cache, and also hold a reference to the
+kmem_cache.  And kmem_cache by itself holds a reference to the cgroup.
+
+So there is clearly some redundancy, which allows to stop setting the
+page->mem_cgroup pointer and rely on getting memcg pointer indirectly via
+kmem_cache.  Further it will allow to change this pointer easier, without
+a need to go over all charged pages.
+
+So let's stop setting page->mem_cgroup pointer for slab pages, and stop
+using the css refcounter directly for protecting the memory cgroup from
+going away.  Instead rely on kmem_cache as an intermediate object.
+
+Make sure that vmstats and shrinker lists are working as previously, as
+well as /proc/kpagecgroup interface.
+
+Link: http://lkml.kernel.org/r/20190611231813.3148843-10-guro@fb.com
+	Signed-off-by: Roman Gushchin <guro@fb.com>
+	Acked-by: Vladimir Davydov <vdavydov.dev@gmail.com>
+	Reviewed-by: Shakeel Butt <shakeelb@google.com>
+	Cc: Christoph Lameter <cl@linux.com>
+	Cc: Johannes Weiner <hannes@cmpxchg.org>
+	Cc: Michal Hocko <mhocko@suse.com>
+	Cc: Waiman Long <longman@redhat.com>
+	Cc: David Rientjes <rientjes@google.com>
+	Cc: Joonsoo Kim <iamjoonsoo.kim@lge.com>
+	Cc: Pekka Enberg <penberg@kernel.org>
+	Cc: Andrei Vagin <avagin@gmail.com>
+	Cc: Qian Cai <cai@lca.pw>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit 4d96ba3530750fae3f3f01150adfecde96157815)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	mm/slab.h
+diff --cc mm/slab.h
+index fc50b234565a,7ead47cb9338..000000000000
+--- a/mm/slab.h
++++ b/mm/slab.h
+@@@ -329,6 -378,42 +371,45 @@@ static inline void memcg_link_cache(str
+  
+  #endif /* CONFIG_MEMCG_KMEM */
+  
+++<<<<<<< HEAD
+++=======
++ static inline struct kmem_cache *virt_to_cache(const void *obj)
++ {
++ 	struct page *page;
++ 
++ 	page = virt_to_head_page(obj);
++ 	if (WARN_ONCE(!PageSlab(page), "%s: Object is not a Slab page!\n",
++ 					__func__))
++ 		return NULL;
++ 	return page->slab_cache;
++ }
++ 
++ static __always_inline int charge_slab_page(struct page *page,
++ 					    gfp_t gfp, int order,
++ 					    struct kmem_cache *s)
++ {
++ 	if (is_root_cache(s)) {
++ 		mod_node_page_state(page_pgdat(page), cache_vmstat_idx(s),
++ 				    1 << order);
++ 		return 0;
++ 	}
++ 
++ 	return memcg_charge_slab(page, gfp, order, s);
++ }
++ 
++ static __always_inline void uncharge_slab_page(struct page *page, int order,
++ 					       struct kmem_cache *s)
++ {
++ 	if (is_root_cache(s)) {
++ 		mod_node_page_state(page_pgdat(page), cache_vmstat_idx(s),
++ 				    -(1 << order));
++ 		return;
++ 	}
++ 
++ 	memcg_uncharge_slab(page, order, s);
++ }
++ 
+++>>>>>>> 4d96ba353075 (mm: memcg/slab: stop setting page->mem_cgroup pointer for slab pages)
+  static inline struct kmem_cache *cache_from_obj(struct kmem_cache *s, void *x)
+  {
+  	struct kmem_cache *cachep;
+diff --git a/mm/list_lru.c b/mm/list_lru.c
+index 976d634a479c..f03ac60a76c1 100644
+--- a/mm/list_lru.c
++++ b/mm/list_lru.c
+@@ -11,6 +11,7 @@
+ #include <linux/slab.h>
+ #include <linux/mutex.h>
+ #include <linux/memcontrol.h>
++#include "slab.h"
+ 
+ #ifdef CONFIG_MEMCG_KMEM
+ static LIST_HEAD(list_lrus);
+@@ -66,7 +67,7 @@ static __always_inline struct mem_cgroup *mem_cgroup_from_kmem(void *ptr)
+ 	if (!memcg_kmem_enabled())
+ 		return NULL;
+ 	page = virt_to_head_page(ptr);
+-	return page->mem_cgroup;
++	return memcg_from_slab_page(page);
+ }
+ 
+ static inline struct list_lru_one *
+diff --git a/mm/memcontrol.c b/mm/memcontrol.c
+index 4b3962b0a37e..6168f3b6ca7f 100644
+--- a/mm/memcontrol.c
++++ b/mm/memcontrol.c
+@@ -487,7 +487,10 @@ ino_t page_cgroup_ino(struct page *page)
+ 	unsigned long ino = 0;
+ 
+ 	rcu_read_lock();
+-	memcg = READ_ONCE(page->mem_cgroup);
++	if (PageHead(page) && PageSlab(page))
++		memcg = memcg_from_slab_page(page);
++	else
++		memcg = READ_ONCE(page->mem_cgroup);
+ 	while (memcg && !(memcg->css.flags & CSS_ONLINE))
+ 		memcg = parent_mem_cgroup(memcg);
+ 	if (memcg)
+@@ -2616,9 +2619,6 @@ int __memcg_kmem_charge_memcg(struct page *page, gfp_t gfp, int order,
+ 		cancel_charge(memcg, nr_pages);
+ 		return -ENOMEM;
+ 	}
+-
+-	page->mem_cgroup = memcg;
+-
+ 	return 0;
+ }
+ 
+@@ -2641,8 +2641,10 @@ int __memcg_kmem_charge(struct page *page, gfp_t gfp, int order)
+ 	memcg = get_mem_cgroup_from_current();
+ 	if (!mem_cgroup_is_root(memcg)) {
+ 		ret = __memcg_kmem_charge_memcg(page, gfp, order, memcg);
+-		if (!ret)
++		if (!ret) {
++			page->mem_cgroup = memcg;
+ 			__SetPageKmemcg(page);
++		}
+ 	}
+ 	css_put(&memcg->css);
+ 	return ret;
+* Unmerged path mm/slab.h
