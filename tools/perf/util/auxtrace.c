@@ -983,6 +983,7 @@ void itrace_synth_opts__set_default(struct itrace_synth_opts *synth_opts,
 	synth_opts->transactions = true;
 	synth_opts->ptwrites = true;
 	synth_opts->pwr_events = true;
+	synth_opts->other_events = true;
 	synth_opts->errors = true;
 	if (no_sample) {
 		synth_opts->period_type = PERF_ITRACE_PERIOD_INSTRUCTIONS;
@@ -1079,6 +1080,9 @@ int itrace_parse_synth_opts(const struct option *opt, const char *str,
 			break;
 		case 'p':
 			synth_opts->pwr_events = true;
+			break;
+		case 'o':
+			synth_opts->other_events = true;
 			break;
 		case 'e':
 			synth_opts->errors = true;
