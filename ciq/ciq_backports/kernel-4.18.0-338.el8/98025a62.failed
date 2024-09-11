@@ -1,0 +1,241 @@
+drm/dp_mst: Use Extended Base Receiver Capability DPCD space
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-338.el8
+commit-author Nikola Cornij <nikola.cornij@amd.com>
+commit 98025a62cb00778a467dbc359d647c9515d51b4e
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-338.el8/98025a62.failed
+
+[why]
+DP 1.4a spec mandates that if DP_EXTENDED_RECEIVER_CAP_FIELD_PRESENT is
+set, Extended Base Receiver Capability DPCD space must be used. Without
+doing that, the three DPCD values that differ will be wrong, leading to
+incorrect or limited functionality. MST link rate, for example, could
+have a lower value. Also, Synaptics quirk wouldn't work out well when
+Extended DPCD was not read, resulting in no DSC for such hubs.
+
+[how]
+Modify MST topology manager to use the values from Extended DPCD where
+applicable.
+
+To prevent regression on the sources that have a lower maximum link rate
+capability than MAX_LINK_RATE from Extended DPCD, have the drivers
+supply maximum lane count and rate at initialization time.
+
+This also reverts commit 2dcab875e763 ("Revert drm/dp_mst: Retrieve
+extended DPCD caps for topology manager"), brining the change back to the
+original commit ad44c03208e4 ("drm/dp_mst: Retrieve extended DPCD caps for
+topology manager").
+
+	Signed-off-by: Nikola Cornij <nikola.cornij@amd.com>
+	Reviewed-by: Lyude Paul <lyude@redhat.com>
+	Signed-off-by: Lyude Paul <lyude@redhat.com>
+Link: https://patchwork.freedesktop.org/patch/msgid/20210429221151.22020-2-nikola.cornij@amd.com
+(cherry picked from commit 98025a62cb00778a467dbc359d647c9515d51b4e)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/gpu/drm/drm_dp_mst_topology.c
+diff --cc drivers/gpu/drm/drm_dp_mst_topology.c
+index cbc7bf4ac10e,54604633e65c..000000000000
+--- a/drivers/gpu/drm/drm_dp_mst_topology.c
++++ b/drivers/gpu/drm/drm_dp_mst_topology.c
+@@@ -3710,14 -3714,18 +3712,29 @@@ int drm_dp_mst_topology_mgr_set_mst(str
+  		WARN_ON(mgr->mst_primary);
+  
+  		/* get dpcd info */
+++<<<<<<< HEAD
+ +		ret = drm_dp_dpcd_read(mgr->aux, DP_DPCD_REV, mgr->dpcd, DP_RECEIVER_CAP_SIZE);
+ +		if (ret != DP_RECEIVER_CAP_SIZE) {
+ +			DRM_DEBUG_KMS("failed to read DPCD\n");
+ +			goto out_unlock;
+ +		}
+ +
+ +		mgr->pbn_div = drm_dp_get_vc_payload_bw(drm_dp_bw_code_to_link_rate(mgr->dpcd[1]),
+ +							mgr->dpcd[2] & DP_MAX_LANE_COUNT_MASK);
+++=======
++ 		ret = drm_dp_read_dpcd_caps(mgr->aux, mgr->dpcd);
++ 		if (ret < 0) {
++ 			drm_dbg_kms(mgr->dev, "%s: failed to read DPCD, ret %d\n",
++ 				    mgr->aux->name, ret);
++ 			goto out_unlock;
++ 		}
++ 
++ 		lane_count = min_t(int, mgr->dpcd[2] & DP_MAX_LANE_COUNT_MASK, mgr->max_lane_count);
++ 		link_rate = min_t(int, mgr->dpcd[1], mgr->max_link_rate);
++ 		mgr->pbn_div = drm_dp_get_vc_payload_bw(mgr,
++ 							drm_dp_bw_code_to_link_rate(link_rate),
++ 							lane_count);
+++>>>>>>> 98025a62cb00 (drm/dp_mst: Use Extended Base Receiver Capability DPCD space)
+  		if (mgr->pbn_div == 0) {
+  			ret = -EINVAL;
+  			goto out_unlock;
+diff --git a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_mst_types.c b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_mst_types.c
+index 41b09ab22233..c31ca6ff7672 100644
+--- a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_mst_types.c
++++ b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_mst_types.c
+@@ -426,6 +426,8 @@ void amdgpu_dm_initialize_dp_connector(struct amdgpu_display_manager *dm,
+ 				       struct amdgpu_dm_connector *aconnector,
+ 				       int link_index)
+ {
++	struct dc_link_settings max_link_enc_cap = {0};
++
+ 	aconnector->dm_dp_aux.aux.name =
+ 		kasprintf(GFP_KERNEL, "AMDGPU DM aux hw bus %d",
+ 			  link_index);
+@@ -439,6 +441,7 @@ void amdgpu_dm_initialize_dp_connector(struct amdgpu_display_manager *dm,
+ 	if (aconnector->base.connector_type == DRM_MODE_CONNECTOR_eDP)
+ 		return;
+ 
++	dc_link_dp_get_max_link_enc_cap(aconnector->dc_link, &max_link_enc_cap);
+ 	aconnector->mst_mgr.cbs = &dm_mst_cbs;
+ 	drm_dp_mst_topology_mgr_init(
+ 		&aconnector->mst_mgr,
+@@ -446,6 +449,8 @@ void amdgpu_dm_initialize_dp_connector(struct amdgpu_display_manager *dm,
+ 		&aconnector->dm_dp_aux.aux,
+ 		16,
+ 		4,
++		(u8)max_link_enc_cap.lane_count,
++		(u8)max_link_enc_cap.link_rate,
+ 		aconnector->connector_id);
+ 
+ 	drm_connector_attach_dp_subconnector_property(&aconnector->base);
+diff --git a/drivers/gpu/drm/amd/display/dc/core/dc_link_dp.c b/drivers/gpu/drm/amd/display/dc/core/dc_link_dp.c
+index c1391bfb7a9b..f1ece1aefd14 100644
+--- a/drivers/gpu/drm/amd/display/dc/core/dc_link_dp.c
++++ b/drivers/gpu/drm/amd/display/dc/core/dc_link_dp.c
+@@ -1835,6 +1835,24 @@ bool dc_link_dp_sync_lt_end(struct dc_link *link, bool link_down)
+ 	return true;
+ }
+ 
++bool dc_link_dp_get_max_link_enc_cap(const struct dc_link *link, struct dc_link_settings *max_link_enc_cap)
++{
++	if (!max_link_enc_cap) {
++		DC_LOG_ERROR("%s: Could not return max link encoder caps", __func__);
++		return false;
++	}
++
++	if (link->link_enc->funcs->get_max_link_cap) {
++		link->link_enc->funcs->get_max_link_cap(link->link_enc, max_link_enc_cap);
++		return true;
++	}
++
++	DC_LOG_ERROR("%s: Max link encoder caps unknown", __func__);
++	max_link_enc_cap->lane_count = 1;
++	max_link_enc_cap->link_rate = 6;
++	return false;
++}
++
+ static struct dc_link_settings get_max_link_cap(struct dc_link *link)
+ {
+ 	struct dc_link_settings max_link_cap = {0};
+diff --git a/drivers/gpu/drm/amd/display/dc/dc_link.h b/drivers/gpu/drm/amd/display/dc/dc_link.h
+index e189f16bc026..b68bb3c1b19a 100644
+--- a/drivers/gpu/drm/amd/display/dc/dc_link.h
++++ b/drivers/gpu/drm/amd/display/dc/dc_link.h
+@@ -320,6 +320,8 @@ bool dc_link_dp_set_test_pattern(
+ 	const unsigned char *p_custom_pattern,
+ 	unsigned int cust_pattern_size);
+ 
++bool dc_link_dp_get_max_link_enc_cap(const struct dc_link *link, struct dc_link_settings *max_link_enc_cap);
++
+ void dc_link_enable_hpd_filter(struct dc_link *link, bool enable);
+ 
+ bool dc_link_is_dp_sink_present(struct dc_link *link);
+* Unmerged path drivers/gpu/drm/drm_dp_mst_topology.c
+diff --git a/drivers/gpu/drm/i915/display/intel_dp_mst.c b/drivers/gpu/drm/i915/display/intel_dp_mst.c
+index b4621ed0127e..90e2b9fb28ed 100644
+--- a/drivers/gpu/drm/i915/display/intel_dp_mst.c
++++ b/drivers/gpu/drm/i915/display/intel_dp_mst.c
+@@ -940,6 +940,7 @@ intel_dp_mst_encoder_init(struct intel_digital_port *dig_port, int conn_base_id)
+ 	struct intel_dp *intel_dp = &dig_port->dp;
+ 	enum port port = dig_port->base.port;
+ 	int ret;
++	int bios_max_link_rate;
+ 
+ 	if (!HAS_DP_MST(i915) || intel_dp_is_edp(intel_dp))
+ 		return 0;
+@@ -954,8 +955,11 @@ intel_dp_mst_encoder_init(struct intel_digital_port *dig_port, int conn_base_id)
+ 
+ 	/* create encoders */
+ 	intel_dp_create_fake_mst_encoders(dig_port);
++	bios_max_link_rate = intel_bios_dp_max_link_rate(&dig_port->base);
+ 	ret = drm_dp_mst_topology_mgr_init(&intel_dp->mst_mgr, &i915->drm,
+-					   &intel_dp->aux, 16, 3, conn_base_id);
++					   &intel_dp->aux, 16, 3,
++					   (u8)dig_port->max_lanes,
++					   (u8)(bios_max_link_rate / 27000), conn_base_id);
+ 	if (ret)
+ 		return ret;
+ 
+diff --git a/drivers/gpu/drm/nouveau/dispnv50/disp.c b/drivers/gpu/drm/nouveau/dispnv50/disp.c
+index 1c9c0cdf85db..c46d0374b6e6 100644
+--- a/drivers/gpu/drm/nouveau/dispnv50/disp.c
++++ b/drivers/gpu/drm/nouveau/dispnv50/disp.c
+@@ -1617,7 +1617,8 @@ nv50_mstm_new(struct nouveau_encoder *outp, struct drm_dp_aux *aux, int aux_max,
+ 	mstm->mgr.cbs = &nv50_mstm;
+ 
+ 	ret = drm_dp_mst_topology_mgr_init(&mstm->mgr, dev, aux, aux_max,
+-					   max_payloads, conn_base_id);
++					   (u8)max_payloads, outp->dcb->dpconf.link_nr,
++					   (u8)outp->dcb->dpconf.link_bw, conn_base_id);
+ 	if (ret)
+ 		return ret;
+ 
+diff --git a/drivers/gpu/drm/radeon/radeon_dp_mst.c b/drivers/gpu/drm/radeon/radeon_dp_mst.c
+index 4e4c937c36c6..27d953eece94 100644
+--- a/drivers/gpu/drm/radeon/radeon_dp_mst.c
++++ b/drivers/gpu/drm/radeon/radeon_dp_mst.c
+@@ -630,13 +630,20 @@ int
+ radeon_dp_mst_init(struct radeon_connector *radeon_connector)
+ {
+ 	struct drm_device *dev = radeon_connector->base.dev;
++	int max_link_rate;
+ 
+ 	if (!radeon_connector->ddc_bus->has_aux)
+ 		return 0;
+ 
++	if (radeon_connector_is_dp12_capable(&radeon_connector->base))
++		max_link_rate = 0x14;
++	else
++		max_link_rate = 0x0a;
++
+ 	radeon_connector->mst_mgr.cbs = &mst_cbs;
+ 	return drm_dp_mst_topology_mgr_init(&radeon_connector->mst_mgr, dev,
+ 					    &radeon_connector->ddc_bus->aux, 16, 6,
++					    4, (u8)max_link_rate,
+ 					    radeon_connector->base.base.id);
+ }
+ 
+diff --git a/include/drm/drm_dp_mst_helper.h b/include/drm/drm_dp_mst_helper.h
+index bd1c39907b92..edfb7240d318 100644
+--- a/include/drm/drm_dp_mst_helper.h
++++ b/include/drm/drm_dp_mst_helper.h
+@@ -593,6 +593,14 @@ struct drm_dp_mst_topology_mgr {
+ 	 * @max_payloads: maximum number of payloads the GPU can generate.
+ 	 */
+ 	int max_payloads;
++	/**
++	 * @max_lane_count: maximum number of lanes the GPU can drive.
++	 */
++	u8 max_lane_count;
++	/**
++	 * @max_link_rate: maximum link rate per lane GPU can output.
++	 */
++	u8 max_link_rate;
+ 	/**
+ 	 * @conn_base_id: DRM connector ID this mgr is connected to. Only used
+ 	 * to build the MST connector path value.
+@@ -765,7 +773,9 @@ struct drm_dp_mst_topology_mgr {
+ int drm_dp_mst_topology_mgr_init(struct drm_dp_mst_topology_mgr *mgr,
+ 				 struct drm_device *dev, struct drm_dp_aux *aux,
+ 				 int max_dpcd_transaction_bytes,
+-				 int max_payloads, int conn_base_id);
++				 int max_payloads,
++				 u8 max_lane_count, u8 max_link_rate,
++				 int conn_base_id);
+ 
+ void drm_dp_mst_topology_mgr_destroy(struct drm_dp_mst_topology_mgr *mgr);
+ 
