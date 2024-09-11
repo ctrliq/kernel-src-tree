@@ -294,6 +294,11 @@ static void nft_meta_set_eval(const struct nft_expr *expr,
 
 		skb->nf_trace = !!value8;
 		break;
+#ifdef CONFIG_NETWORK_SECMARK
+	case NFT_META_SECMARK:
+		skb->secmark = value;
+		break;
+#endif
 	default:
 		WARN_ON(1);
 	}
@@ -448,6 +453,9 @@ static int nft_meta_set_init(const struct nft_ctx *ctx,
 	switch (priv->key) {
 	case NFT_META_MARK:
 	case NFT_META_PRIORITY:
+#ifdef CONFIG_NETWORK_SECMARK
+	case NFT_META_SECMARK:
+#endif
 		len = sizeof(u32);
 		break;
 	case NFT_META_NFTRACE:
