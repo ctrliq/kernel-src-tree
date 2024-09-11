@@ -1,0 +1,118 @@
+RDMA/core: Add UVERBS_METHOD_ASYNC_EVENT_ALLOC
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Jason Gunthorpe <jgg@ziepe.ca>
+commit d680e88e2013186e696665cbf2056fb32b781e41
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/d680e88e.failed
+
+Allow the async FD to be allocated separately from the context.
+
+This is necessary to introduce the ioctl to create a context, as an ioctl
+should only ever create a single uobject at a time.
+
+If multiple async FDs are created then the first one is used to deliver
+affiliated events from any ib_uevent_object, with all subsequent ones will
+receive only unaffiliated events.
+
+Link: https://lore.kernel.org/r/1578506740-22188-3-git-send-email-yishaih@mellanox.com
+	Signed-off-by: Yishai Hadas <yishaih@mellanox.com>
+	Signed-off-by: Jason Gunthorpe <jgg@mellanox.com>
+(cherry picked from commit d680e88e2013186e696665cbf2056fb32b781e41)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/infiniband/core/uverbs_main.c
+#	drivers/infiniband/core/uverbs_std_types_async_fd.c
+diff --cc drivers/infiniband/core/uverbs_main.c
+index 124314ce24bb,fb9e75257607..000000000000
+--- a/drivers/infiniband/core/uverbs_main.c
++++ b/drivers/infiniband/core/uverbs_main.c
+@@@ -507,45 -467,25 +507,55 @@@ void ib_uverbs_init_event_queue(struct 
+  	ev_queue->async_queue = NULL;
+  }
+  
+ -void ib_uverbs_init_async_event_file(
+ -	struct ib_uverbs_async_event_file *async_file)
+ +struct file *ib_uverbs_alloc_async_event_file(struct ib_uverbs_file *uverbs_file,
+ +					      struct ib_device	*ib_dev)
+  {
+ -	struct ib_uverbs_file *uverbs_file = async_file->uobj.ufile;
+ -	struct ib_device *ib_dev = async_file->uobj.context->device;
+ -
+ -	ib_uverbs_init_event_queue(&async_file->ev_queue);
+ -
+ +	struct ib_uverbs_async_event_file *ev_file;
+ +	struct file *filp;
+ +
+ +	ev_file = kzalloc(sizeof(*ev_file), GFP_KERNEL);
+ +	if (!ev_file)
+ +		return ERR_PTR(-ENOMEM);
+ +
+++<<<<<<< HEAD
+ +	ib_uverbs_init_event_queue(&ev_file->ev_queue);
+ +	ev_file->uverbs_file = uverbs_file;
+ +	kref_get(&ev_file->uverbs_file->ref);
+ +	kref_init(&ev_file->ref);
+ +	filp = anon_inode_getfile("[infinibandevent]", &uverbs_async_event_fops,
+ +				  ev_file, O_RDONLY);
+ +	if (IS_ERR(filp))
+ +		goto err_put_refs;
+++=======
++ 	/* The first async_event_file becomes the default one for the file. */
++ 	lockdep_assert_held(&uverbs_file->ucontext_lock);
++ 	if (!uverbs_file->async_file) {
++ 		/* Pairs with the put in ib_uverbs_release_file */
++ 		uverbs_uobject_get(&async_file->uobj);
++ 		smp_store_release(&uverbs_file->async_file, async_file);
++ 	}
+ -
+ -	INIT_IB_EVENT_HANDLER(&async_file->event_handler, ib_dev,
+++>>>>>>> d680e88e2013 (RDMA/core: Add UVERBS_METHOD_ASYNC_EVENT_ALLOC)
+ +
+ +	mutex_lock(&uverbs_file->device->lists_mutex);
+ +	list_add_tail(&ev_file->list,
+ +		      &uverbs_file->device->uverbs_events_file_list);
+ +	mutex_unlock(&uverbs_file->device->lists_mutex);
+ +
+ +	WARN_ON(uverbs_file->async_file);
+ +	uverbs_file->async_file = ev_file;
+ +	kref_get(&uverbs_file->async_file->ref);
+ +	INIT_IB_EVENT_HANDLER(&uverbs_file->event_handler,
+ +			      ib_dev,
+  			      ib_uverbs_event_handler);
+ -	ib_register_event_handler(&async_file->event_handler);
+ +	ib_register_event_handler(&uverbs_file->event_handler);
+ +	/* At that point async file stuff was fully set */
+ +
+ +	return filp;
+ +
+ +err_put_refs:
+ +	kref_put(&ev_file->uverbs_file->ref, ib_uverbs_release_file);
+ +	kref_put(&ev_file->ref, ib_uverbs_release_async_event_file);
+ +	return filp;
+  }
+  
+  static ssize_t verify_hdr(struct ib_uverbs_cmd_hdr *hdr,
+* Unmerged path drivers/infiniband/core/uverbs_std_types_async_fd.c
+* Unmerged path drivers/infiniband/core/uverbs_main.c
+* Unmerged path drivers/infiniband/core/uverbs_std_types_async_fd.c
+diff --git a/include/uapi/rdma/ib_user_ioctl_cmds.h b/include/uapi/rdma/ib_user_ioctl_cmds.h
+index 64f0e3aacd3f..746c2368772f 100644
+--- a/include/uapi/rdma/ib_user_ioctl_cmds.h
++++ b/include/uapi/rdma/ib_user_ioctl_cmds.h
+@@ -241,4 +241,12 @@ enum uverbs_attrs_flow_destroy_ids {
+ 	UVERBS_ATTR_DESTROY_FLOW_HANDLE,
+ };
+ 
++enum uverbs_method_async_event {
++	UVERBS_METHOD_ASYNC_EVENT_ALLOC,
++};
++
++enum uverbs_attrs_async_event_create {
++	UVERBS_ATTR_ASYNC_EVENT_ALLOC_FD_HANDLE,
++};
++
+ #endif
