@@ -1,0 +1,536 @@
+xarray: Add definition of struct xarray
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-147.el8
+commit-author Matthew Wilcox <willy@infradead.org>
+commit f8d5d0cc145cc21bfc56ef807dc28102aebbf228
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-147.el8/f8d5d0cc.failed
+
+This is a direct replacement for struct radix_tree_root.  Some of the
+struct members have changed name; convert those, and use a #define so
+that radix_tree users continue to work without change.
+
+	Signed-off-by: Matthew Wilcox <willy@infradead.org>
+	Reviewed-by: Josef Bacik <jbacik@fb.com>
+(cherry picked from commit f8d5d0cc145cc21bfc56ef807dc28102aebbf228)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/radix-tree.h
+#	include/linux/xarray.h
+#	lib/radix-tree.c
+diff --cc include/linux/radix-tree.h
+index 8e57792d07fb,0b080bd88ab7..000000000000
+--- a/include/linux/radix-tree.h
++++ b/include/linux/radix-tree.h
+@@@ -28,8 -28,11 +28,11 @@@
+  #include <linux/rcupdate.h>
+  #include <linux/spinlock.h>
+  #include <linux/types.h>
+ -#include <linux/xarray.h>
+ +#include <linux/rh_kabi.h>
+  
++ /* Keep unconverted code working */
++ #define radix_tree_root		xarray
++ 
+  /*
+   * The bottom two bits of the slot determine how the remaining bits in the
+   * slot are interpreted:
+@@@ -109,32 -93,14 +112,36 @@@ struct radix_tree_node 
+  	};
+  	void __rcu	*slots[RADIX_TREE_MAP_SIZE];
+  	unsigned long	tags[RADIX_TREE_MAX_TAGS][RADIX_TREE_TAG_LONGS];
+ +	RH_KABI_SIZE_AND_EXTEND(radix_tree_node);
+  };
+  
+- /* The IDR tag is stored in the low bits of the GFP flags */
++ /* The IDR tag is stored in the low bits of xa_flags */
+  #define ROOT_IS_IDR	((__force gfp_t)4)
+- /* The top bits of gfp_mask are used to store the root tags */
++ /* The top bits of xa_flags are used to store the root tags */
+  #define ROOT_TAG_SHIFT	(__GFP_BITS_SHIFT)
+  
+++<<<<<<< HEAD
+ +/**
+ + * struct radix_tree_root_rh  - Red Hat KABI extension struct
+ + */
+ +struct radix_tree_root_rh {
+ +};
+ +
+ +struct radix_tree_root {
+ +	spinlock_t		xa_lock;
+ +	gfp_t			gfp_mask;
+ +	struct radix_tree_node	__rcu *rnode;
+ +	RH_KABI_SIZE_AND_EXTEND(radix_tree_root);
+ +};
+ +
+ +#define RADIX_TREE_INIT(name, mask)	{				\
+ +	.xa_lock = __SPIN_LOCK_UNLOCKED(name.xa_lock),			\
+ +	.gfp_mask = (mask),						\
+ +	.rnode = NULL,							\
+ +}
+++=======
++ #define RADIX_TREE_INIT(name, mask)	XARRAY_INIT(name, mask)
+++>>>>>>> f8d5d0cc145c (xarray: Add definition of struct xarray)
+  
+  #define RADIX_TREE(name, mask) \
+  	struct radix_tree_root name = RADIX_TREE_INIT(name, mask)
+@@@ -148,15 -109,9 +150,15 @@@
+  
+  static inline bool radix_tree_empty(const struct radix_tree_root *root)
+  {
+- 	return root->rnode == NULL;
++ 	return root->xa_head == NULL;
+  }
+  
+ +/**
+ + * struct radix_tree_iter_rh  - Red Hat KABI extension struct
+ + */
+ +struct radix_tree_iter_rh {
+ +};
+ +
+  /**
+   * struct radix_tree_iter - radix tree iterator state
+   *
+diff --cc include/linux/xarray.h
+index 2dfc8006fe64,9122cf8bf52a..000000000000
+--- a/include/linux/xarray.h
++++ b/include/linux/xarray.h
+@@@ -4,11 -4,225 +4,85 @@@
+  /*
+   * eXtensible Arrays
+   * Copyright (c) 2017 Microsoft Corporation
+ - * Author: Matthew Wilcox <willy@infradead.org>
+ - *
+ - * See Documentation/core-api/xarray.rst for how to use the XArray.
+ + * Author: Matthew Wilcox <mawilcox@microsoft.com>
+   */
+  
+++<<<<<<< HEAD
+++=======
++ #include <linux/bug.h>
++ #include <linux/compiler.h>
++ #include <linux/kconfig.h>
+++>>>>>>> f8d5d0cc145c (xarray: Add definition of struct xarray)
+  #include <linux/spinlock.h>
+ -#include <linux/types.h>
+ -
+ -/*
+ - * The bottom two bits of the entry determine how the XArray interprets
+ - * the contents:
+ - *
+ - * 00: Pointer entry
+ - * 10: Internal entry
+ - * x1: Value entry or tagged pointer
+ - *
+ - * Attempting to store internal entries in the XArray is a bug.
+ - *
+ - * Most internal entries are pointers to the next node in the tree.
+ - * The following internal entries have a special meaning:
+ - *
+ - * 0-62: Sibling entries
+ - * 256: Retry entry
+ - */
+ -
+ -#define BITS_PER_XA_VALUE	(BITS_PER_LONG - 1)
+ -
+ -/**
+ - * xa_mk_value() - Create an XArray entry from an integer.
+ - * @v: Value to store in XArray.
+ - *
+ - * Context: Any context.
+ - * Return: An entry suitable for storing in the XArray.
+ - */
+ -static inline void *xa_mk_value(unsigned long v)
+ -{
+ -	WARN_ON((long)v < 0);
+ -	return (void *)((v << 1) | 1);
+ -}
+ -
+ -/**
+ - * xa_to_value() - Get value stored in an XArray entry.
+ - * @entry: XArray entry.
+ - *
+ - * Context: Any context.
+ - * Return: The value stored in the XArray entry.
+ - */
+ -static inline unsigned long xa_to_value(const void *entry)
+ -{
+ -	return (unsigned long)entry >> 1;
+ -}
+ -
+ -/**
+ - * xa_is_value() - Determine if an entry is a value.
+ - * @entry: XArray entry.
+ - *
+ - * Context: Any context.
+ - * Return: True if the entry is a value, false if it is a pointer.
+ - */
+ -static inline bool xa_is_value(const void *entry)
+ -{
+ -	return (unsigned long)entry & 1;
+ -}
+ -
+ -/**
+ - * xa_tag_pointer() - Create an XArray entry for a tagged pointer.
+ - * @p: Plain pointer.
+ - * @tag: Tag value (0, 1 or 3).
+ - *
+ - * If the user of the XArray prefers, they can tag their pointers instead
+ - * of storing value entries.  Three tags are available (0, 1 and 3).
+ - * These are distinct from the xa_mark_t as they are not replicated up
+ - * through the array and cannot be searched for.
+ - *
+ - * Context: Any context.
+ - * Return: An XArray entry.
+ - */
+ -static inline void *xa_tag_pointer(void *p, unsigned long tag)
+ -{
+ -	return (void *)((unsigned long)p | tag);
+ -}
+ -
+ -/**
+ - * xa_untag_pointer() - Turn an XArray entry into a plain pointer.
+ - * @entry: XArray entry.
+ - *
+ - * If you have stored a tagged pointer in the XArray, call this function
+ - * to get the untagged version of the pointer.
+ - *
+ - * Context: Any context.
+ - * Return: A pointer.
+ - */
+ -static inline void *xa_untag_pointer(void *entry)
+ -{
+ -	return (void *)((unsigned long)entry & ~3UL);
+ -}
+ -
+ -/**
+ - * xa_pointer_tag() - Get the tag stored in an XArray entry.
+ - * @entry: XArray entry.
+ - *
+ - * If you have stored a tagged pointer in the XArray, call this function
+ - * to get the tag of that pointer.
+ - *
+ - * Context: Any context.
+ - * Return: A tag.
+ - */
+ -static inline unsigned int xa_pointer_tag(void *entry)
+ -{
+ -	return (unsigned long)entry & 3UL;
+ -}
+ -
+ -/*
+ - * xa_mk_internal() - Create an internal entry.
+ - * @v: Value to turn into an internal entry.
+ - *
+ - * Context: Any context.
+ - * Return: An XArray internal entry corresponding to this value.
+ - */
+ -static inline void *xa_mk_internal(unsigned long v)
+ -{
+ -	return (void *)((v << 2) | 2);
+ -}
+ -
+ -/*
+ - * xa_to_internal() - Extract the value from an internal entry.
+ - * @entry: XArray entry.
+ - *
+ - * Context: Any context.
+ - * Return: The value which was stored in the internal entry.
+ - */
+ -static inline unsigned long xa_to_internal(const void *entry)
+ -{
+ -	return (unsigned long)entry >> 2;
+ -}
+ -
+ -/*
+ - * xa_is_internal() - Is the entry an internal entry?
+ - * @entry: XArray entry.
+ - *
+ - * Context: Any context.
+ - * Return: %true if the entry is an internal entry.
+ - */
+ -static inline bool xa_is_internal(const void *entry)
+ -{
+ -	return ((unsigned long)entry & 3) == 2;
+ -}
+  
++ /**
++  * struct xarray - The anchor of the XArray.
++  * @xa_lock: Lock that protects the contents of the XArray.
++  *
++  * To use the xarray, define it statically or embed it in your data structure.
++  * It is a very small data structure, so it does not usually make sense to
++  * allocate it separately and keep a pointer to it in your data structure.
++  *
++  * You may use the xa_lock to protect your own data structures as well.
++  */
++ /*
++  * If all of the entries in the array are NULL, @xa_head is a NULL pointer.
++  * If the only non-NULL entry in the array is at index 0, @xa_head is that
++  * entry.  If any other entry in the array is non-NULL, @xa_head points
++  * to an @xa_node.
++  */
++ struct xarray {
++ 	spinlock_t	xa_lock;
++ /* private: The rest of the data structure is not to be used directly. */
++ 	gfp_t		xa_flags;
++ 	void __rcu *	xa_head;
++ };
++ 
++ #define XARRAY_INIT(name, flags) {				\
++ 	.xa_lock = __SPIN_LOCK_UNLOCKED(name.xa_lock),		\
++ 	.xa_flags = flags,					\
++ 	.xa_head = NULL,					\
++ }
++ 
++ /**
++  * DEFINE_XARRAY_FLAGS() - Define an XArray with custom flags.
++  * @name: A string that names your XArray.
++  * @flags: XA_FLAG values.
++  *
++  * This is intended for file scope definitions of XArrays.  It declares
++  * and initialises an empty XArray with the chosen name and flags.  It is
++  * equivalent to calling xa_init_flags() on the array, but it does the
++  * initialisation at compiletime instead of runtime.
++  */
++ #define DEFINE_XARRAY_FLAGS(name, flags)				\
++ 	struct xarray name = XARRAY_INIT(name, flags)
++ 
++ /**
++  * DEFINE_XARRAY() - Define an XArray.
++  * @name: A string that names your XArray.
++  *
++  * This is intended for file scope definitions of XArrays.  It declares
++  * and initialises an empty XArray with the chosen name.  It is equivalent
++  * to calling xa_init() on the array, but it does the initialisation at
++  * compiletime instead of runtime.
++  */
++ #define DEFINE_XARRAY(name) DEFINE_XARRAY_FLAGS(name, 0)
++ 
++ void xa_init_flags(struct xarray *, gfp_t flags);
++ 
++ /**
++  * xa_init() - Initialise an empty XArray.
++  * @xa: XArray.
++  *
++  * An empty XArray is full of NULL entries.
++  *
++  * Context: Any context.
++  */
++ static inline void xa_init(struct xarray *xa)
++ {
++ 	xa_init_flags(xa, 0);
++ }
++ 
+  #define xa_trylock(xa)		spin_trylock(&(xa)->xa_lock)
+  #define xa_lock(xa)		spin_lock(&(xa)->xa_lock)
+  #define xa_unlock(xa)		spin_unlock(&(xa)->xa_lock)
+diff --cc lib/radix-tree.c
+index a904a8ddd174,299d4bdba109..000000000000
+--- a/lib/radix-tree.c
++++ b/lib/radix-tree.c
+@@@ -656,8 -632,8 +656,13 @@@ static int radix_tree_extend(struct rad
+  		BUG_ON(shift > BITS_PER_LONG);
+  		if (radix_tree_is_internal_node(entry)) {
+  			entry_to_node(entry)->parent = node;
+++<<<<<<< HEAD
+ +		} else if (radix_tree_exceptional_entry(entry)) {
+ +			/* Moving an exceptional root->rnode to a node */
+++=======
++ 		} else if (xa_is_value(entry)) {
++ 			/* Moving an exceptional root->xa_head to a node */
+++>>>>>>> f8d5d0cc145c (xarray: Add definition of struct xarray)
+  			node->exceptional = 1;
+  		}
+  		/*
+* Unmerged path include/linux/radix-tree.h
+* Unmerged path include/linux/xarray.h
+diff --git a/lib/Makefile b/lib/Makefile
+index cbc4517d9693..53fca3515191 100644
+--- a/lib/Makefile
++++ b/lib/Makefile
+@@ -18,7 +18,7 @@ KCOV_INSTRUMENT_debugobjects.o := n
+ KCOV_INSTRUMENT_dynamic_debug.o := n
+ 
+ lib-y := ctype.o string.o vsprintf.o cmdline.o \
+-	 rbtree.o radix-tree.o timerqueue.o\
++	 rbtree.o radix-tree.o timerqueue.o xarray.o \
+ 	 idr.o int_sqrt.o extable.o \
+ 	 sha1.o chacha20.o irq_regs.o argv_split.o \
+ 	 flex_proportions.o ratelimit.o show_mem.o \
+diff --git a/lib/idr.c b/lib/idr.c
+index 729e381e23b4..aac36b2eba8c 100644
+--- a/lib/idr.c
++++ b/lib/idr.c
+@@ -39,8 +39,8 @@ int idr_alloc_u32(struct idr *idr, void *ptr, u32 *nextid,
+ 	unsigned int base = idr->idr_base;
+ 	unsigned int id = *nextid;
+ 
+-	if (WARN_ON_ONCE(!(idr->idr_rt.gfp_mask & ROOT_IS_IDR)))
+-		idr->idr_rt.gfp_mask |= IDR_RT_MARKER;
++	if (WARN_ON_ONCE(!(idr->idr_rt.xa_flags & ROOT_IS_IDR)))
++		idr->idr_rt.xa_flags |= IDR_RT_MARKER;
+ 
+ 	id = (id < base) ? 0 : id - base;
+ 	radix_tree_iter_init(&iter, id);
+* Unmerged path lib/radix-tree.c
+diff --git a/lib/xarray.c b/lib/xarray.c
+new file mode 100644
+index 000000000000..862f4c64c754
+--- /dev/null
++++ b/lib/xarray.c
+@@ -0,0 +1,44 @@
++// SPDX-License-Identifier: GPL-2.0+
++/*
++ * XArray implementation
++ * Copyright (c) 2017 Microsoft Corporation
++ * Author: Matthew Wilcox <willy@infradead.org>
++ */
++
++#include <linux/export.h>
++#include <linux/xarray.h>
++
++/*
++ * Coding conventions in this file:
++ *
++ * @xa is used to refer to the entire xarray.
++ * @xas is the 'xarray operation state'.  It may be either a pointer to
++ * an xa_state, or an xa_state stored on the stack.  This is an unfortunate
++ * ambiguity.
++ * @index is the index of the entry being operated on
++ * @mark is an xa_mark_t; a small number indicating one of the mark bits.
++ * @node refers to an xa_node; usually the primary one being operated on by
++ * this function.
++ * @offset is the index into the slots array inside an xa_node.
++ * @parent refers to the @xa_node closer to the head than @node.
++ * @entry refers to something stored in a slot in the xarray
++ */
++
++/**
++ * xa_init_flags() - Initialise an empty XArray with flags.
++ * @xa: XArray.
++ * @flags: XA_FLAG values.
++ *
++ * If you need to initialise an XArray with special flags (eg you need
++ * to take the lock from interrupt context), use this function instead
++ * of xa_init().
++ *
++ * Context: Any context.
++ */
++void xa_init_flags(struct xarray *xa, gfp_t flags)
++{
++	spin_lock_init(&xa->xa_lock);
++	xa->xa_flags = flags;
++	xa->xa_head = NULL;
++}
++EXPORT_SYMBOL(xa_init_flags);
+diff --git a/tools/testing/radix-tree/Makefile b/tools/testing/radix-tree/Makefile
+index 37baecc3766f..cda646666beb 100644
+--- a/tools/testing/radix-tree/Makefile
++++ b/tools/testing/radix-tree/Makefile
+@@ -5,7 +5,7 @@ CFLAGS += -I. -I../../include -g -Og -Wall -D_LGPL_SOURCE -fsanitize=address \
+ LDFLAGS += -fsanitize=address -fsanitize=undefined
+ LDLIBS+= -lpthread -lurcu
+ TARGETS = main idr-test multiorder
+-CORE_OFILES := radix-tree.o idr.o linux.o test.o find_bit.o
++CORE_OFILES := xarray.o radix-tree.o idr.o linux.o test.o find_bit.o
+ OFILES = main.o $(CORE_OFILES) regression1.o regression2.o regression3.o \
+ 	 tag_check.o multiorder.o idr-test.o iteration_check.o benchmark.o
+ 
+@@ -35,6 +35,7 @@ vpath %.c ../../lib
+ $(OFILES): Makefile *.h */*.h generated/map-shift.h \
+ 	../../include/linux/*.h \
+ 	../../include/asm/*.h \
++	../../../include/linux/xarray.h \
+ 	../../../include/linux/radix-tree.h \
+ 	../../../include/linux/idr.h
+ 
+@@ -44,6 +45,8 @@ radix-tree.c: ../../../lib/radix-tree.c
+ idr.c: ../../../lib/idr.c
+ 	sed -e 's/^static //' -e 's/__always_inline //' -e 's/inline //' < $< > $@
+ 
++xarray.o: ../../../lib/xarray.c
++
+ generated/map-shift.h:
+ 	@if ! grep -qws $(SHIFT) generated/map-shift.h; then		\
+ 		echo "#define RADIX_TREE_MAP_SHIFT $(SHIFT)" >		\
+diff --git a/tools/testing/radix-tree/linux/bug.h b/tools/testing/radix-tree/linux/bug.h
+index 23b8ed52f8c8..03dc8a57eb99 100644
+--- a/tools/testing/radix-tree/linux/bug.h
++++ b/tools/testing/radix-tree/linux/bug.h
+@@ -1 +1,2 @@
++#include <stdio.h>
+ #include "asm/bug.h"
+diff --git a/tools/testing/radix-tree/linux/kconfig.h b/tools/testing/radix-tree/linux/kconfig.h
+new file mode 100644
+index 000000000000..6c8675859913
+--- /dev/null
++++ b/tools/testing/radix-tree/linux/kconfig.h
+@@ -0,0 +1 @@
++#include "../../../../include/linux/kconfig.h"
+diff --git a/tools/testing/radix-tree/multiorder.c b/tools/testing/radix-tree/multiorder.c
+index 7bf405638b0b..200583fb8960 100644
+--- a/tools/testing/radix-tree/multiorder.c
++++ b/tools/testing/radix-tree/multiorder.c
+@@ -193,13 +193,13 @@ static void multiorder_shrink(unsigned long index, int order)
+ 
+ 	assert(item_insert_order(&tree, 0, order) == 0);
+ 
+-	node = tree.rnode;
++	node = tree.xa_head;
+ 
+ 	assert(item_insert(&tree, index) == 0);
+-	assert(node != tree.rnode);
++	assert(node != tree.xa_head);
+ 
+ 	assert(item_delete(&tree, index) != 0);
+-	assert(node == tree.rnode);
++	assert(node == tree.xa_head);
+ 
+ 	for (i = 0; i < max; i++) {
+ 		struct item *item = item_lookup(&tree, i);
+diff --git a/tools/testing/radix-tree/test.c b/tools/testing/radix-tree/test.c
+index def6015570b2..2b9474179141 100644
+--- a/tools/testing/radix-tree/test.c
++++ b/tools/testing/radix-tree/test.c
+@@ -281,7 +281,7 @@ static int verify_node(struct radix_tree_node *slot, unsigned int tag,
+ 
+ void verify_tag_consistency(struct radix_tree_root *root, unsigned int tag)
+ {
+-	struct radix_tree_node *node = root->rnode;
++	struct radix_tree_node *node = root->xa_head;
+ 	if (!radix_tree_is_internal_node(node))
+ 		return;
+ 	verify_node(node, tag, !!root_tag_get(root, tag));
+@@ -311,13 +311,13 @@ void item_kill_tree(struct radix_tree_root *root)
+ 		}
+ 	}
+ 	assert(radix_tree_gang_lookup(root, (void **)items, 0, 32) == 0);
+-	assert(root->rnode == NULL);
++	assert(root->xa_head == NULL);
+ }
+ 
+ void tree_verify_min_height(struct radix_tree_root *root, int maxindex)
+ {
+ 	unsigned shift;
+-	struct radix_tree_node *node = root->rnode;
++	struct radix_tree_node *node = root->xa_head;
+ 	if (!radix_tree_is_internal_node(node)) {
+ 		assert(maxindex == 0);
+ 		return;
+diff --git a/tools/testing/radix-tree/xarray.c b/tools/testing/radix-tree/xarray.c
+new file mode 100644
+index 000000000000..9bbd667172a7
+--- /dev/null
++++ b/tools/testing/radix-tree/xarray.c
+@@ -0,0 +1,7 @@
++// SPDX-License-Identifier: GPL-2.0+
++/*
++ * xarray.c: Userspace shim for XArray test-suite
++ * Copyright (c) 2018 Matthew Wilcox <willy@infradead.org>
++ */
++
++#include "../../../lib/xarray.c"
