@@ -1,0 +1,266 @@
+io-uring: drop 'free_pfile' in struct io_file_put
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Hillf Danton <hdanton@sina.com>
+commit a5318d3cdffbecf075928363d7e4becfeddabfcb
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/a5318d3c.failed
+
+Sync removal of file is only used in case of a GFP_KERNEL kmalloc
+failure at the cost of io_file_put::done and work flush, while a
+glich like it can be handled at the call site without too much pain.
+
+That said, what is proposed is to drop sync removing of file, and
+the kink in neck as well.
+
+	Signed-off-by: Hillf Danton <hdanton@sina.com>
+	Signed-off-by: Jens Axboe <axboe@kernel.dk>
+(cherry picked from commit a5318d3cdffbecf075928363d7e4becfeddabfcb)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/io_uring.c
+diff --cc fs/io_uring.c
+index 7842c6de7135,635902122c29..000000000000
+--- a/fs/io_uring.c
++++ b/fs/io_uring.c
+@@@ -3021,6 -6346,158 +3021,161 @@@ static void io_sqe_file_unregister(stru
+  #endif
+  }
+  
+++<<<<<<< HEAD
+++=======
++ struct io_file_put {
++ 	struct llist_node llist;
++ 	struct file *file;
++ };
++ 
++ static void io_ring_file_ref_flush(struct fixed_file_data *data)
++ {
++ 	struct io_file_put *pfile, *tmp;
++ 	struct llist_node *node;
++ 
++ 	while ((node = llist_del_all(&data->put_llist)) != NULL) {
++ 		llist_for_each_entry_safe(pfile, tmp, node, llist) {
++ 			io_ring_file_put(data->ctx, pfile->file);
++ 			kfree(pfile);
++ 		}
++ 	}
++ }
++ 
++ static void io_ring_file_ref_switch(struct work_struct *work)
++ {
++ 	struct fixed_file_data *data;
++ 
++ 	data = container_of(work, struct fixed_file_data, ref_work);
++ 	io_ring_file_ref_flush(data);
++ 	percpu_ref_switch_to_percpu(&data->refs);
++ }
++ 
++ static void io_file_data_ref_zero(struct percpu_ref *ref)
++ {
++ 	struct fixed_file_data *data;
++ 
++ 	data = container_of(ref, struct fixed_file_data, refs);
++ 
++ 	/*
++ 	 * We can't safely switch from inside this context, punt to wq. If
++ 	 * the table ref is going away, the table is being unregistered.
++ 	 * Don't queue up the async work for that case, the caller will
++ 	 * handle it.
++ 	 */
++ 	if (!percpu_ref_is_dying(&data->refs))
++ 		queue_work(system_wq, &data->ref_work);
++ }
++ 
++ static int io_sqe_files_register(struct io_ring_ctx *ctx, void __user *arg,
++ 				 unsigned nr_args)
++ {
++ 	__s32 __user *fds = (__s32 __user *) arg;
++ 	unsigned nr_tables;
++ 	struct file *file;
++ 	int fd, ret = 0;
++ 	unsigned i;
++ 
++ 	if (ctx->file_data)
++ 		return -EBUSY;
++ 	if (!nr_args)
++ 		return -EINVAL;
++ 	if (nr_args > IORING_MAX_FIXED_FILES)
++ 		return -EMFILE;
++ 
++ 	ctx->file_data = kzalloc(sizeof(*ctx->file_data), GFP_KERNEL);
++ 	if (!ctx->file_data)
++ 		return -ENOMEM;
++ 	ctx->file_data->ctx = ctx;
++ 	init_completion(&ctx->file_data->done);
++ 
++ 	nr_tables = DIV_ROUND_UP(nr_args, IORING_MAX_FILES_TABLE);
++ 	ctx->file_data->table = kcalloc(nr_tables,
++ 					sizeof(struct fixed_file_table),
++ 					GFP_KERNEL);
++ 	if (!ctx->file_data->table) {
++ 		kfree(ctx->file_data);
++ 		ctx->file_data = NULL;
++ 		return -ENOMEM;
++ 	}
++ 
++ 	if (percpu_ref_init(&ctx->file_data->refs, io_file_data_ref_zero,
++ 				PERCPU_REF_ALLOW_REINIT, GFP_KERNEL)) {
++ 		kfree(ctx->file_data->table);
++ 		kfree(ctx->file_data);
++ 		ctx->file_data = NULL;
++ 		return -ENOMEM;
++ 	}
++ 	ctx->file_data->put_llist.first = NULL;
++ 	INIT_WORK(&ctx->file_data->ref_work, io_ring_file_ref_switch);
++ 
++ 	if (io_sqe_alloc_file_tables(ctx, nr_tables, nr_args)) {
++ 		percpu_ref_exit(&ctx->file_data->refs);
++ 		kfree(ctx->file_data->table);
++ 		kfree(ctx->file_data);
++ 		ctx->file_data = NULL;
++ 		return -ENOMEM;
++ 	}
++ 
++ 	for (i = 0; i < nr_args; i++, ctx->nr_user_files++) {
++ 		struct fixed_file_table *table;
++ 		unsigned index;
++ 
++ 		ret = -EFAULT;
++ 		if (copy_from_user(&fd, &fds[i], sizeof(fd)))
++ 			break;
++ 		/* allow sparse sets */
++ 		if (fd == -1) {
++ 			ret = 0;
++ 			continue;
++ 		}
++ 
++ 		table = &ctx->file_data->table[i >> IORING_FILE_TABLE_SHIFT];
++ 		index = i & IORING_FILE_TABLE_MASK;
++ 		file = fget(fd);
++ 
++ 		ret = -EBADF;
++ 		if (!file)
++ 			break;
++ 
++ 		/*
++ 		 * Don't allow io_uring instances to be registered. If UNIX
++ 		 * isn't enabled, then this causes a reference cycle and this
++ 		 * instance can never get freed. If UNIX is enabled we'll
++ 		 * handle it just fine, but there's still no point in allowing
++ 		 * a ring fd as it doesn't support regular read/write anyway.
++ 		 */
++ 		if (file->f_op == &io_uring_fops) {
++ 			fput(file);
++ 			break;
++ 		}
++ 		ret = 0;
++ 		table->files[index] = file;
++ 	}
++ 
++ 	if (ret) {
++ 		for (i = 0; i < ctx->nr_user_files; i++) {
++ 			file = io_file_from_index(ctx, i);
++ 			if (file)
++ 				fput(file);
++ 		}
++ 		for (i = 0; i < nr_tables; i++)
++ 			kfree(ctx->file_data->table[i].files);
++ 
++ 		kfree(ctx->file_data->table);
++ 		kfree(ctx->file_data);
++ 		ctx->file_data = NULL;
++ 		ctx->nr_user_files = 0;
++ 		return ret;
++ 	}
++ 
++ 	ret = io_sqe_files_scm(ctx);
++ 	if (ret)
++ 		io_sqe_files_unregister(ctx);
++ 
++ 	return ret;
++ }
++ 
+++>>>>>>> a5318d3cdffb (io-uring: drop 'free_pfile' in struct io_file_put)
+  static int io_sqe_file_register(struct io_ring_ctx *ctx, struct file *file,
+  				int index)
+  {
+@@@ -3064,10 -6541,40 +3219,45 @@@
+  #endif
+  }
+  
+ -static void io_atomic_switch(struct percpu_ref *ref)
+ +static int io_sqe_files_update(struct io_ring_ctx *ctx, void __user *arg,
+ +			       unsigned nr_args)
+  {
+++<<<<<<< HEAD
+ +	struct io_uring_files_update up;
+++=======
++ 	struct fixed_file_data *data;
++ 
++ 	/*
++ 	 * Juggle reference to ensure we hit zero, if needed, so we can
++ 	 * switch back to percpu mode
++ 	 */
++ 	data = container_of(ref, struct fixed_file_data, refs);
++ 	percpu_ref_put(&data->refs);
++ 	percpu_ref_get(&data->refs);
++ }
++ 
++ static int io_queue_file_removal(struct fixed_file_data *data,
++ 				  struct file *file)
++ {
++ 	struct io_file_put *pfile;
++ 
++ 	pfile = kzalloc(sizeof(*pfile), GFP_KERNEL);
++ 	if (!pfile)
++ 		return -ENOMEM;
++ 
++ 	pfile->file = file;
++ 	llist_add(&pfile->llist, &data->put_llist);
++ 	return 0;
++ }
++ 
++ static int __io_sqe_files_update(struct io_ring_ctx *ctx,
++ 				 struct io_uring_files_update *up,
++ 				 unsigned nr_args)
++ {
++ 	struct fixed_file_data *data = ctx->file_data;
++ 	bool ref_switch = false;
++ 	struct file *file;
+++>>>>>>> a5318d3cdffb (io-uring: drop 'free_pfile' in struct io_file_put)
+  	__s32 __user *fds;
+  	int fd, i, err;
+  	__u32 done;
+@@@ -3093,14 -6595,18 +3283,27 @@@
+  			err = -EFAULT;
+  			break;
+  		}
+++<<<<<<< HEAD
+ +		i = array_index_nospec(up.offset, ctx->nr_user_files);
+ +		if (ctx->user_files[i]) {
+ +			io_sqe_file_unregister(ctx, i);
+ +			ctx->user_files[i] = NULL;
+++=======
++ 		i = array_index_nospec(up->offset, ctx->nr_user_files);
++ 		table = &ctx->file_data->table[i >> IORING_FILE_TABLE_SHIFT];
++ 		index = i & IORING_FILE_TABLE_MASK;
++ 		if (table->files[index]) {
++ 			file = io_file_from_index(ctx, index);
++ 			err = io_queue_file_removal(data, file);
++ 			if (err)
++ 				break;
++ 			table->files[index] = NULL;
++ 			ref_switch = true;
+++>>>>>>> a5318d3cdffb (io-uring: drop 'free_pfile' in struct io_file_put)
+  		}
+  		if (fd != -1) {
+ +			struct file *file;
+ +
+  			file = fget(fd);
+  			if (!file) {
+  				err = -EBADF;
+* Unmerged path fs/io_uring.c
