@@ -1,0 +1,177 @@
+net/mlx5: E-Switch, Setup all vports' metadata to support peer miss rule
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Vu Pham <vuhuong@mellanox.com>
+commit fc99c3d6371c14343b1822cc8846ed3a54dbafe3
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/fc99c3d6.failed
+
+In merged eswitch configuration, peer miss rule is setup for all
+vports. If metadata is enabled, peer miss rule with metadata matching
+will be configured instead of source port matching; however, some
+vports that have not yet been enabled don't have default_metadata
+setup and their default_metadata will be zero.
+
+Hence, setup/cleanup default metadata for all vports when eswitch moves
+in/out of offloads mode.
+
+Fixes: 133dcfc577ea ("net/mlx5: E-Switch, Alloc and free unique metadata for match")
+	Signed-off-by: Vu Pham <vuhuong@mellanox.com>
+	Reviewed-by: Bodong Wang <bodong@nvidia.com>
+	Reviewed-by: Roi Dayan <roid@nvidia.com>
+	Reviewed-by: Mark Bloch <mbloch@nvidia.com>
+	Signed-off-by: Saeed Mahameed <saeedm@nvidia.com>
+(cherry picked from commit fc99c3d6371c14343b1822cc8846ed3a54dbafe3)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/mellanox/mlx5/core/eswitch_offloads.c
+diff --cc drivers/net/ethernet/mellanox/mlx5/core/eswitch_offloads.c
+index afb4bff4a4e1,3321bb1f188d..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx5/core/eswitch_offloads.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/eswitch_offloads.c
+@@@ -1957,6 -1876,87 +1957,90 @@@ static bool esw_use_vport_metadata(cons
+  	       esw_check_vport_match_metadata_supported(esw);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ u32 mlx5_esw_match_metadata_alloc(struct mlx5_eswitch *esw)
++ {
++ 	u32 num_vports = GENMASK(ESW_VPORT_BITS - 1, 0) - 1;
++ 	u32 vhca_id_mask = GENMASK(ESW_VHCA_ID_BITS - 1, 0);
++ 	u32 vhca_id = MLX5_CAP_GEN(esw->dev, vhca_id);
++ 	u32 start;
++ 	u32 end;
++ 	int id;
++ 
++ 	/* Make sure the vhca_id fits the ESW_VHCA_ID_BITS */
++ 	WARN_ON_ONCE(vhca_id >= BIT(ESW_VHCA_ID_BITS));
++ 
++ 	/* Trim vhca_id to ESW_VHCA_ID_BITS */
++ 	vhca_id &= vhca_id_mask;
++ 
++ 	start = (vhca_id << ESW_VPORT_BITS);
++ 	end = start + num_vports;
++ 	if (!vhca_id)
++ 		start += 1; /* zero is reserved/invalid metadata */
++ 	id = ida_alloc_range(&esw->offloads.vport_metadata_ida, start, end, GFP_KERNEL);
++ 
++ 	return (id < 0) ? 0 : id;
++ }
++ 
++ void mlx5_esw_match_metadata_free(struct mlx5_eswitch *esw, u32 metadata)
++ {
++ 	ida_free(&esw->offloads.vport_metadata_ida, metadata);
++ }
++ 
++ static int esw_offloads_vport_metadata_setup(struct mlx5_eswitch *esw,
++ 					     struct mlx5_vport *vport)
++ {
++ 	vport->default_metadata = mlx5_esw_match_metadata_alloc(esw);
++ 	vport->metadata = vport->default_metadata;
++ 	return vport->metadata ? 0 : -ENOSPC;
++ }
++ 
++ static void esw_offloads_vport_metadata_cleanup(struct mlx5_eswitch *esw,
++ 						struct mlx5_vport *vport)
++ {
++ 	if (!vport->default_metadata)
++ 		return;
++ 
++ 	WARN_ON(vport->metadata != vport->default_metadata);
++ 	mlx5_esw_match_metadata_free(esw, vport->default_metadata);
++ }
++ 
++ static void esw_offloads_metadata_uninit(struct mlx5_eswitch *esw)
++ {
++ 	struct mlx5_vport *vport;
++ 	int i;
++ 
++ 	if (!mlx5_eswitch_vport_match_metadata_enabled(esw))
++ 		return;
++ 
++ 	mlx5_esw_for_all_vports_reverse(esw, i, vport)
++ 		esw_offloads_vport_metadata_cleanup(esw, vport);
++ }
++ 
++ static int esw_offloads_metadata_init(struct mlx5_eswitch *esw)
++ {
++ 	struct mlx5_vport *vport;
++ 	int err;
++ 	int i;
++ 
++ 	if (!mlx5_eswitch_vport_match_metadata_enabled(esw))
++ 		return 0;
++ 
++ 	mlx5_esw_for_all_vports(esw, i, vport) {
++ 		err = esw_offloads_vport_metadata_setup(esw, vport);
++ 		if (err)
++ 			goto metadata_err;
++ 	}
++ 
++ 	return 0;
++ 
++ metadata_err:
++ 	esw_offloads_metadata_uninit(esw);
++ 	return err;
++ }
++ 
+++>>>>>>> fc99c3d6371c (net/mlx5: E-Switch, Setup all vports' metadata to support peer miss rule)
+  int
+  esw_vport_create_offloads_acl_tables(struct mlx5_eswitch *esw,
+  				     struct mlx5_vport *vport)
+@@@ -2146,6 -2157,17 +2230,20 @@@ int esw_offloads_enable(struct mlx5_esw
+  	mutex_init(&esw->offloads.termtbl_mutex);
+  	mlx5_rdma_enable_roce(esw->dev);
+  
+++<<<<<<< HEAD
+++=======
++ 	err = mlx5_esw_host_number_init(esw);
++ 	if (err)
++ 		goto err_vport_metadata;
++ 
++ 	if (esw_use_vport_metadata(esw))
++ 		esw->flags |= MLX5_ESWITCH_VPORT_MATCH_METADATA;
++ 
++ 	err = esw_offloads_metadata_init(esw);
++ 	if (err)
++ 		goto err_metadata;
++ 
+++>>>>>>> fc99c3d6371c (net/mlx5: E-Switch, Setup all vports' metadata to support peer miss rule)
+  	err = esw_set_passing_vport_metadata(esw, true);
+  	if (err)
+  		goto err_vport_metadata;
+@@@ -2177,6 -2200,9 +2275,12 @@@ err_vports
+  err_steering_init:
+  	esw_set_passing_vport_metadata(esw, false);
+  err_vport_metadata:
+++<<<<<<< HEAD
+++=======
++ 	esw_offloads_metadata_uninit(esw);
++ err_metadata:
++ 	esw->flags &= ~MLX5_ESWITCH_VPORT_MATCH_METADATA;
+++>>>>>>> fc99c3d6371c (net/mlx5: E-Switch, Setup all vports' metadata to support peer miss rule)
+  	mlx5_rdma_disable_roce(esw->dev);
+  	mutex_destroy(&esw->offloads.termtbl_mutex);
+  	return err;
+@@@ -2206,10 -2232,12 +2310,15 @@@ static int esw_offloads_stop(struct mlx
+  void esw_offloads_disable(struct mlx5_eswitch *esw)
+  {
+  	esw_offloads_devcom_cleanup(esw);
+ +	esw_offloads_unload_all_reps(esw);
+  	mlx5_eswitch_disable_pf_vf_vports(esw);
+ -	esw_offloads_unload_rep(esw, MLX5_VPORT_UPLINK);
+  	esw_set_passing_vport_metadata(esw, false);
+  	esw_offloads_steering_cleanup(esw);
+++<<<<<<< HEAD
+++=======
++ 	esw_offloads_metadata_uninit(esw);
++ 	esw->flags &= ~MLX5_ESWITCH_VPORT_MATCH_METADATA;
+++>>>>>>> fc99c3d6371c (net/mlx5: E-Switch, Setup all vports' metadata to support peer miss rule)
+  	mlx5_rdma_disable_roce(esw->dev);
+  	mutex_destroy(&esw->offloads.termtbl_mutex);
+  	esw->offloads.encap = DEVLINK_ESWITCH_ENCAP_MODE_NONE;
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/eswitch_offloads.c
