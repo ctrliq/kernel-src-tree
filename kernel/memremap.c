@@ -67,7 +67,6 @@ int device_private_entry_fault(struct vm_area_struct *vma,
 	 */
 	return page->pgmap->page_fault(vma, addr, page, flags, pmdp);
 }
-EXPORT_SYMBOL(device_private_entry_fault);
 #endif /* CONFIG_DEVICE_PRIVATE */
 
 static void pgmap_radix_release(struct resource *res, unsigned long end_pgoff)
