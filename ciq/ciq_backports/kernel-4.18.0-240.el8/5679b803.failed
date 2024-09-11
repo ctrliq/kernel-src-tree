@@ -1,0 +1,143 @@
+KVM: SVM: keep DR6 synchronized with vcpu->arch.dr6
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Paolo Bonzini <pbonzini@redhat.com>
+commit 5679b803e44ed8947e8c2a7f44cdef1d93ea24d5
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/5679b803.failed
+
+kvm_x86_ops.set_dr6 is only ever called with vcpu->arch.dr6 as the
+second argument.  Ensure that the VMCB value is synchronized to
+vcpu->arch.dr6 on #DB (both "normal" and nested) and nested vmentry, so
+that the current value of DR6 is always available in vcpu->arch.dr6.
+The get_dr6 callback can just access vcpu->arch.dr6 and becomes redundant.
+
+	Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+(cherry picked from commit 5679b803e44ed8947e8c2a7f44cdef1d93ea24d5)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kvm/svm/nested.c
+#	arch/x86/kvm/x86.c
+diff --cc arch/x86/kvm/x86.c
+index 106a1269d846,4ea644827b8a..000000000000
+--- a/arch/x86/kvm/x86.c
++++ b/arch/x86/kvm/x86.c
+@@@ -1049,10 -1047,10 +1048,10 @@@ static void kvm_update_dr0123(struct kv
+  	}
+  }
+  
+- static void kvm_update_dr6(struct kvm_vcpu *vcpu)
++ void kvm_update_dr6(struct kvm_vcpu *vcpu)
+  {
+  	if (!(vcpu->guest_debug & KVM_GUESTDBG_USE_HW_BP))
+ -		kvm_x86_ops.set_dr6(vcpu, vcpu->arch.dr6);
+ +		kvm_x86_ops->set_dr6(vcpu, vcpu->arch.dr6);
+  }
+  
+  static void kvm_update_dr7(struct kvm_vcpu *vcpu)
+@@@ -1130,10 -1128,7 +1129,14 @@@ int kvm_get_dr(struct kvm_vcpu *vcpu, i
+  	case 4:
+  		/* fall through */
+  	case 6:
+++<<<<<<< HEAD
+ +		if (vcpu->guest_debug & KVM_GUESTDBG_USE_HW_BP)
+ +			*val = vcpu->arch.dr6;
+ +		else
+ +			*val = kvm_x86_ops->get_dr6(vcpu);
+++=======
++ 		*val = vcpu->arch.dr6;
+++>>>>>>> 5679b803e44e (KVM: SVM: keep DR6 synchronized with vcpu->arch.dr6)
+  		break;
+  	case 5:
+  		/* fall through */
+* Unmerged path arch/x86/kvm/svm/nested.c
+diff --git a/arch/x86/include/asm/kvm_host.h b/arch/x86/include/asm/kvm_host.h
+index f7e2cf375636..2e82e1972424 100644
+--- a/arch/x86/include/asm/kvm_host.h
++++ b/arch/x86/include/asm/kvm_host.h
+@@ -1093,7 +1093,6 @@ struct kvm_x86_ops {
+ 	void (*set_idt)(struct kvm_vcpu *vcpu, struct desc_ptr *dt);
+ 	void (*get_gdt)(struct kvm_vcpu *vcpu, struct desc_ptr *dt);
+ 	void (*set_gdt)(struct kvm_vcpu *vcpu, struct desc_ptr *dt);
+-	u64 (*get_dr6)(struct kvm_vcpu *vcpu);
+ 	void (*set_dr6)(struct kvm_vcpu *vcpu, unsigned long value);
+ 	void (*sync_dirty_debug_regs)(struct kvm_vcpu *vcpu);
+ 	void (*set_dr7)(struct kvm_vcpu *vcpu, unsigned long value);
+@@ -1627,6 +1626,7 @@ int kvm_pv_send_ipi(struct kvm *kvm, unsigned long ipi_bitmap_low,
+ 
+ void kvm_define_shared_msr(unsigned index, u32 msr);
+ int kvm_set_shared_msr(unsigned index, u64 val, u64 mask);
++void kvm_update_dr6(struct kvm_vcpu *vcpu);
+ 
+ u64 kvm_scale_tsc(struct kvm_vcpu *vcpu, u64 tsc);
+ u64 kvm_read_l1_tsc(struct kvm_vcpu *vcpu, u64 host_tsc);
+* Unmerged path arch/x86/kvm/svm/nested.c
+diff --git a/arch/x86/kvm/svm/svm.c b/arch/x86/kvm/svm/svm.c
+index a95f04022d02..59f77f71d135 100644
+--- a/arch/x86/kvm/svm/svm.c
++++ b/arch/x86/kvm/svm/svm.c
+@@ -2783,11 +2783,6 @@ static void new_asid(struct vcpu_svm *svm, struct svm_cpu_data *sd)
+ 	mark_dirty(svm->vmcb, VMCB_ASID);
+ }
+ 
+-static u64 svm_get_dr6(struct kvm_vcpu *vcpu)
+-{
+-	return to_svm(vcpu)->vmcb->save.dr6;
+-}
+-
+ static void svm_set_dr6(struct kvm_vcpu *vcpu, unsigned long value)
+ {
+ 	struct vcpu_svm *svm = to_svm(vcpu);
+@@ -2804,7 +2799,7 @@ static void svm_sync_dirty_debug_regs(struct kvm_vcpu *vcpu)
+ 	get_debugreg(vcpu->arch.db[1], 1);
+ 	get_debugreg(vcpu->arch.db[2], 2);
+ 	get_debugreg(vcpu->arch.db[3], 3);
+-	vcpu->arch.dr6 = svm_get_dr6(vcpu);
++	vcpu->arch.dr6 = svm->vmcb->save.dr6;
+ 	vcpu->arch.dr7 = svm->vmcb->save.dr7;
+ 
+ 	vcpu->arch.switch_db_regs &= ~KVM_DEBUGREG_WONT_EXIT;
+@@ -2850,6 +2845,7 @@ static int db_interception(struct vcpu_svm *svm)
+ 	if (!(svm->vcpu.guest_debug &
+ 	      (KVM_GUESTDBG_SINGLESTEP | KVM_GUESTDBG_USE_HW_BP)) &&
+ 		!svm->nmi_singlestep) {
++		vcpu->arch.dr6 = svm->vmcb->save.dr6;
+ 		kvm_queue_exception(&svm->vcpu, DB_VECTOR);
+ 		return 1;
+ 	}
+@@ -7498,7 +7494,6 @@ static struct kvm_x86_ops svm_x86_ops __ro_after_init = {
+ 	.set_idt = svm_set_idt,
+ 	.get_gdt = svm_get_gdt,
+ 	.set_gdt = svm_set_gdt,
+-	.get_dr6 = svm_get_dr6,
+ 	.set_dr6 = svm_set_dr6,
+ 	.set_dr7 = svm_set_dr7,
+ 	.sync_dirty_debug_regs = svm_sync_dirty_debug_regs,
+diff --git a/arch/x86/kvm/vmx/vmx.c b/arch/x86/kvm/vmx/vmx.c
+index e843ee035ff0..8ba6ed4ad3a4 100644
+--- a/arch/x86/kvm/vmx/vmx.c
++++ b/arch/x86/kvm/vmx/vmx.c
+@@ -5065,11 +5065,6 @@ static int handle_dr(struct kvm_vcpu *vcpu)
+ 	return kvm_skip_emulated_instruction(vcpu);
+ }
+ 
+-static u64 vmx_get_dr6(struct kvm_vcpu *vcpu)
+-{
+-	return vcpu->arch.dr6;
+-}
+-
+ static void vmx_set_dr6(struct kvm_vcpu *vcpu, unsigned long val)
+ {
+ }
+@@ -7909,7 +7904,6 @@ static struct kvm_x86_ops vmx_x86_ops __ro_after_init = {
+ 	.set_idt = vmx_set_idt,
+ 	.get_gdt = vmx_get_gdt,
+ 	.set_gdt = vmx_set_gdt,
+-	.get_dr6 = vmx_get_dr6,
+ 	.set_dr6 = vmx_set_dr6,
+ 	.set_dr7 = vmx_set_dr7,
+ 	.sync_dirty_debug_regs = vmx_sync_dirty_debug_regs,
+* Unmerged path arch/x86/kvm/x86.c
