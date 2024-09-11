@@ -1,0 +1,273 @@
+iommu/io-pgtable: Rename iommu_gather_ops to iommu_flush_ops
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-193.el8
+Rebuild_CHGLOG: - [iommu] io-pgtable: Rename iommu_gather_ops to iommu_flush_ops (Jerry Snitselaar) [1729845]
+Rebuild_FUZZ: 94.74%
+commit-author Will Deacon <will@kernel.org>
+commit 298f78895b081911e0b3605f07d79ebd3d4cf7b0
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-193.el8/298f7889.failed
+
+In preparation for TLB flush gathering in the IOMMU API, rename the
+iommu_gather_ops structure in io-pgtable to iommu_flush_ops, which
+better describes its purpose and avoids the potential for confusion
+between different levels of the API.
+
+$ find linux/ -type f -name '*.[ch]' | xargs sed -i 's/gather_ops/flush_ops/g'
+
+	Signed-off-by: Will Deacon <will@kernel.org>
+(cherry picked from commit 298f78895b081911e0b3605f07d79ebd3d4cf7b0)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/gpu/drm/panfrost/panfrost_mmu.c
+#	drivers/iommu/ipmmu-vmsa.c
+diff --cc drivers/iommu/ipmmu-vmsa.c
+index c842cf9ce2c3,2c14a2c65b22..000000000000
+--- a/drivers/iommu/ipmmu-vmsa.c
++++ b/drivers/iommu/ipmmu-vmsa.c
+@@@ -490,7 -459,55 +490,57 @@@ static int ipmmu_domain_init_context(st
+  	 */
+  	ipmmu_ctx_write_all(domain, IMCTR,
+  			    IMCTR_INTEN | IMCTR_FLUSH | IMCTR_MMUEN);
+ -}
+  
+++<<<<<<< HEAD
+++=======
++ static int ipmmu_domain_init_context(struct ipmmu_vmsa_domain *domain)
++ {
++ 	int ret;
++ 
++ 	/*
++ 	 * Allocate the page table operations.
++ 	 *
++ 	 * VMSA states in section B3.6.3 "Control of Secure or Non-secure memory
++ 	 * access, Long-descriptor format" that the NStable bit being set in a
++ 	 * table descriptor will result in the NStable and NS bits of all child
++ 	 * entries being ignored and considered as being set. The IPMMU seems
++ 	 * not to comply with this, as it generates a secure access page fault
++ 	 * if any of the NStable and NS bits isn't set when running in
++ 	 * non-secure mode.
++ 	 */
++ 	domain->cfg.quirks = IO_PGTABLE_QUIRK_ARM_NS;
++ 	domain->cfg.pgsize_bitmap = SZ_1G | SZ_2M | SZ_4K;
++ 	domain->cfg.ias = 32;
++ 	domain->cfg.oas = 40;
++ 	domain->cfg.tlb = &ipmmu_flush_ops;
++ 	domain->io_domain.geometry.aperture_end = DMA_BIT_MASK(32);
++ 	domain->io_domain.geometry.force_aperture = true;
++ 	/*
++ 	 * TODO: Add support for coherent walk through CCI with DVM and remove
++ 	 * cache handling. For now, delegate it to the io-pgtable code.
++ 	 */
++ 	domain->cfg.coherent_walk = false;
++ 	domain->cfg.iommu_dev = domain->mmu->root->dev;
++ 
++ 	/*
++ 	 * Find an unused context.
++ 	 */
++ 	ret = ipmmu_domain_allocate_context(domain->mmu->root, domain);
++ 	if (ret < 0)
++ 		return ret;
++ 
++ 	domain->context_id = ret;
++ 
++ 	domain->iop = alloc_io_pgtable_ops(ARM_32_LPAE_S1, &domain->cfg,
++ 					   domain);
++ 	if (!domain->iop) {
++ 		ipmmu_domain_free_context(domain->mmu->root,
++ 					  domain->context_id);
++ 		return -EINVAL;
++ 	}
++ 
++ 	ipmmu_domain_setup_context(domain);
+++>>>>>>> 298f78895b08 (iommu/io-pgtable: Rename iommu_gather_ops to iommu_flush_ops)
+  	return 0;
+  }
+  
+* Unmerged path drivers/gpu/drm/panfrost/panfrost_mmu.c
+* Unmerged path drivers/gpu/drm/panfrost/panfrost_mmu.c
+diff --git a/drivers/iommu/arm-smmu-v3.c b/drivers/iommu/arm-smmu-v3.c
+index c08a34136024..0f6980bd53a3 100644
+--- a/drivers/iommu/arm-smmu-v3.c
++++ b/drivers/iommu/arm-smmu-v3.c
+@@ -1598,7 +1598,7 @@ static void arm_smmu_tlb_inv_range_nosync(unsigned long iova, size_t size,
+ 	} while (size -= granule);
+ }
+ 
+-static const struct iommu_gather_ops arm_smmu_gather_ops = {
++static const struct iommu_flush_ops arm_smmu_flush_ops = {
+ 	.tlb_flush_all	= arm_smmu_tlb_inv_context,
+ 	.tlb_add_flush	= arm_smmu_tlb_inv_range_nosync,
+ 	.tlb_sync	= arm_smmu_tlb_sync,
+@@ -1791,7 +1791,7 @@ static int arm_smmu_domain_finalise(struct iommu_domain *domain)
+ 		.ias		= ias,
+ 		.oas		= oas,
+ 		.coherent_walk	= smmu->features & ARM_SMMU_FEAT_COHERENCY,
+-		.tlb		= &arm_smmu_gather_ops,
++		.tlb		= &arm_smmu_flush_ops,
+ 		.iommu_dev	= smmu->dev,
+ 	};
+ 
+diff --git a/drivers/iommu/arm-smmu.c b/drivers/iommu/arm-smmu.c
+index 58f85e7c33c2..41e02fe43e51 100644
+--- a/drivers/iommu/arm-smmu.c
++++ b/drivers/iommu/arm-smmu.c
+@@ -244,7 +244,7 @@ enum arm_smmu_domain_stage {
+ struct arm_smmu_domain {
+ 	struct arm_smmu_device		*smmu;
+ 	struct io_pgtable_ops		*pgtbl_ops;
+-	const struct iommu_gather_ops	*tlb_ops;
++	const struct iommu_flush_ops	*tlb_ops;
+ 	struct arm_smmu_cfg		cfg;
+ 	enum arm_smmu_domain_stage	stage;
+ 	bool				non_strict;
+@@ -540,19 +540,19 @@ static void arm_smmu_tlb_inv_vmid_nosync(unsigned long iova, size_t size,
+ 	writel_relaxed(smmu_domain->cfg.vmid, base + ARM_SMMU_GR0_TLBIVMID);
+ }
+ 
+-static const struct iommu_gather_ops arm_smmu_s1_tlb_ops = {
++static const struct iommu_flush_ops arm_smmu_s1_tlb_ops = {
+ 	.tlb_flush_all	= arm_smmu_tlb_inv_context_s1,
+ 	.tlb_add_flush	= arm_smmu_tlb_inv_range_nosync,
+ 	.tlb_sync	= arm_smmu_tlb_sync_context,
+ };
+ 
+-static const struct iommu_gather_ops arm_smmu_s2_tlb_ops_v2 = {
++static const struct iommu_flush_ops arm_smmu_s2_tlb_ops_v2 = {
+ 	.tlb_flush_all	= arm_smmu_tlb_inv_context_s2,
+ 	.tlb_add_flush	= arm_smmu_tlb_inv_range_nosync,
+ 	.tlb_sync	= arm_smmu_tlb_sync_context,
+ };
+ 
+-static const struct iommu_gather_ops arm_smmu_s2_tlb_ops_v1 = {
++static const struct iommu_flush_ops arm_smmu_s2_tlb_ops_v1 = {
+ 	.tlb_flush_all	= arm_smmu_tlb_inv_context_s2,
+ 	.tlb_add_flush	= arm_smmu_tlb_inv_vmid_nosync,
+ 	.tlb_sync	= arm_smmu_tlb_sync_vmid,
+diff --git a/drivers/iommu/io-pgtable-arm-v7s.c b/drivers/iommu/io-pgtable-arm-v7s.c
+index 6a6d6bb438d9..c0b352ce37a6 100644
+--- a/drivers/iommu/io-pgtable-arm-v7s.c
++++ b/drivers/iommu/io-pgtable-arm-v7s.c
+@@ -828,7 +828,7 @@ static void dummy_tlb_sync(void *cookie)
+ 	WARN_ON(cookie != cfg_cookie);
+ }
+ 
+-static const struct iommu_gather_ops dummy_tlb_ops = {
++static const struct iommu_flush_ops dummy_tlb_ops = {
+ 	.tlb_flush_all	= dummy_tlb_flush_all,
+ 	.tlb_add_flush	= dummy_tlb_add_flush,
+ 	.tlb_sync	= dummy_tlb_sync,
+diff --git a/drivers/iommu/io-pgtable-arm.c b/drivers/iommu/io-pgtable-arm.c
+index 1d4e2e1ead04..811e6295b077 100644
+--- a/drivers/iommu/io-pgtable-arm.c
++++ b/drivers/iommu/io-pgtable-arm.c
+@@ -1124,7 +1124,7 @@ static void dummy_tlb_sync(void *cookie)
+ 	WARN_ON(cookie != cfg_cookie);
+ }
+ 
+-static const struct iommu_gather_ops dummy_tlb_ops __initconst = {
++static const struct iommu_flush_ops dummy_tlb_ops __initconst = {
+ 	.tlb_flush_all	= dummy_tlb_flush_all,
+ 	.tlb_add_flush	= dummy_tlb_add_flush,
+ 	.tlb_sync	= dummy_tlb_sync,
+* Unmerged path drivers/iommu/ipmmu-vmsa.c
+diff --git a/drivers/iommu/msm_iommu.c b/drivers/iommu/msm_iommu.c
+index bc2cef99bb30..075c550f2437 100644
+--- a/drivers/iommu/msm_iommu.c
++++ b/drivers/iommu/msm_iommu.c
+@@ -189,7 +189,7 @@ static void __flush_iotlb_sync(void *cookie)
+ 	 */
+ }
+ 
+-static const struct iommu_gather_ops msm_iommu_gather_ops = {
++static const struct iommu_flush_ops msm_iommu_flush_ops = {
+ 	.tlb_flush_all = __flush_iotlb,
+ 	.tlb_add_flush = __flush_iotlb_range,
+ 	.tlb_sync = __flush_iotlb_sync,
+@@ -356,7 +356,7 @@ static int msm_iommu_domain_config(struct msm_priv *priv)
+ 		.pgsize_bitmap = msm_iommu_ops.pgsize_bitmap,
+ 		.ias = 32,
+ 		.oas = 32,
+-		.tlb = &msm_iommu_gather_ops,
++		.tlb = &msm_iommu_flush_ops,
+ 		.iommu_dev = priv->dev,
+ 	};
+ 
+diff --git a/drivers/iommu/mtk_iommu.c b/drivers/iommu/mtk_iommu.c
+index f9f69f7111a9..998aa6f3c768 100644
+--- a/drivers/iommu/mtk_iommu.c
++++ b/drivers/iommu/mtk_iommu.c
+@@ -196,7 +196,7 @@ static void mtk_iommu_tlb_sync(void *cookie)
+ 	}
+ }
+ 
+-static const struct iommu_gather_ops mtk_iommu_gather_ops = {
++static const struct iommu_flush_ops mtk_iommu_flush_ops = {
+ 	.tlb_flush_all = mtk_iommu_tlb_flush_all,
+ 	.tlb_add_flush = mtk_iommu_tlb_add_flush_nosync,
+ 	.tlb_sync = mtk_iommu_tlb_sync,
+@@ -275,7 +275,7 @@ static int mtk_iommu_domain_finalise(struct mtk_iommu_domain *dom)
+ 		.pgsize_bitmap = mtk_iommu_ops.pgsize_bitmap,
+ 		.ias = 32,
+ 		.oas = 32,
+-		.tlb = &mtk_iommu_gather_ops,
++		.tlb = &mtk_iommu_flush_ops,
+ 		.iommu_dev = data->dev,
+ 	};
+ 
+diff --git a/drivers/iommu/qcom_iommu.c b/drivers/iommu/qcom_iommu.c
+index 5fa9507289ec..6b17abdad87f 100644
+--- a/drivers/iommu/qcom_iommu.c
++++ b/drivers/iommu/qcom_iommu.c
+@@ -175,7 +175,7 @@ static void qcom_iommu_tlb_inv_range_nosync(unsigned long iova, size_t size,
+ 	}
+ }
+ 
+-static const struct iommu_gather_ops qcom_gather_ops = {
++static const struct iommu_flush_ops qcom_flush_ops = {
+ 	.tlb_flush_all	= qcom_iommu_tlb_inv_context,
+ 	.tlb_add_flush	= qcom_iommu_tlb_inv_range_nosync,
+ 	.tlb_sync	= qcom_iommu_tlb_sync,
+@@ -226,7 +226,7 @@ static int qcom_iommu_init_domain(struct iommu_domain *domain,
+ 		.pgsize_bitmap	= qcom_iommu_ops.pgsize_bitmap,
+ 		.ias		= 32,
+ 		.oas		= 40,
+-		.tlb		= &qcom_gather_ops,
++		.tlb		= &qcom_flush_ops,
+ 		.iommu_dev	= qcom_iommu->dev,
+ 	};
+ 
+diff --git a/include/linux/io-pgtable.h b/include/linux/io-pgtable.h
+index b5a450a3bb47..6292ea15d674 100644
+--- a/include/linux/io-pgtable.h
++++ b/include/linux/io-pgtable.h
+@@ -17,7 +17,7 @@ enum io_pgtable_fmt {
+ };
+ 
+ /**
+- * struct iommu_gather_ops - IOMMU callbacks for TLB and page table management.
++ * struct iommu_flush_ops - IOMMU callbacks for TLB and page table management.
+  *
+  * @tlb_flush_all: Synchronously invalidate the entire TLB context.
+  * @tlb_add_flush: Queue up a TLB invalidation for a virtual address range.
+@@ -28,7 +28,7 @@ enum io_pgtable_fmt {
+  * Note that these can all be called in atomic context and must therefore
+  * not block.
+  */
+-struct iommu_gather_ops {
++struct iommu_flush_ops {
+ 	void (*tlb_flush_all)(void *cookie);
+ 	void (*tlb_add_flush)(unsigned long iova, size_t size, size_t granule,
+ 			      bool leaf, void *cookie);
+@@ -84,7 +84,7 @@ struct io_pgtable_cfg {
+ 	unsigned int			ias;
+ 	unsigned int			oas;
+ 	bool				coherent_walk;
+-	const struct iommu_gather_ops	*tlb;
++	const struct iommu_flush_ops	*tlb;
+ 	struct device			*iommu_dev;
+ 
+ 	/* Low-level data specific to the table format */
