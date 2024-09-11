@@ -1,0 +1,168 @@
+IB/mlx5: Move to fully dynamic UAR mode once user space supports it
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Yishai Hadas <yishaih@mellanox.com>
+commit 0a2fd01c28ae490a639a32a52b81fb2df48b92a0
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/0a2fd01c.failed
+
+Move to fully dynamic UAR mode once user space supports it.  In this case
+we prevent any legacy mode of UARs on the allocated context and prevent
+redundant allocation of the static ones.
+
+Link: https://lore.kernel.org/r/20200324060143.1569116-6-leon@kernel.org
+	Signed-off-by: Yishai Hadas <yishaih@mellanox.com>
+	Reviewed-by: Michael Guralnik <michaelgur@mellanox.com>
+	Signed-off-by: Leon Romanovsky <leonro@mellanox.com>
+	Signed-off-by: Jason Gunthorpe <jgg@mellanox.com>
+(cherry picked from commit 0a2fd01c28ae490a639a32a52b81fb2df48b92a0)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/infiniband/hw/mlx5/mlx5_ib.h
+diff --cc drivers/infiniband/hw/mlx5/mlx5_ib.h
+index b2c552a6e848,b88414acb993..000000000000
+--- a/drivers/infiniband/hw/mlx5/mlx5_ib.h
++++ b/drivers/infiniband/hw/mlx5/mlx5_ib.h
+@@@ -128,6 -128,24 +128,27 @@@ enum mlx5_ib_mmap_type 
+  	MLX5_IB_MMAP_TYPE_UAR_NC = 4,
+  };
+  
+++<<<<<<< HEAD
+++=======
++ struct mlx5_bfreg_info {
++ 	u32 *sys_pages;
++ 	int num_low_latency_bfregs;
++ 	unsigned int *count;
++ 
++ 	/*
++ 	 * protect bfreg allocation data structs
++ 	 */
++ 	struct mutex lock;
++ 	u32 ver;
++ 	u8 lib_uar_4k : 1;
++ 	u8 lib_uar_dyn : 1;
++ 	u32 num_sys_pages;
++ 	u32 num_static_sys_pages;
++ 	u32 total_num_bfregs;
++ 	u32 num_dyn_bfregs;
++ };
++ 
+++>>>>>>> 0a2fd01c28ae (IB/mlx5: Move to fully dynamic UAR mode once user space supports it)
+  struct mlx5_ib_ucontext {
+  	struct ib_ucontext	ibucontext;
+  	struct list_head	db_page_list;
+diff --git a/drivers/infiniband/hw/mlx5/cq.c b/drivers/infiniband/hw/mlx5/cq.c
+index deb6aa9e93e5..a6985cc94394 100644
+--- a/drivers/infiniband/hw/mlx5/cq.c
++++ b/drivers/infiniband/hw/mlx5/cq.c
+@@ -764,10 +764,14 @@ static int create_cq_user(struct mlx5_ib_dev *dev, struct ib_udata *udata,
+ 	MLX5_SET(cqc, cqc, log_page_size,
+ 		 page_shift - MLX5_ADAPTER_PAGE_SHIFT);
+ 
+-	if (ucmd.flags & MLX5_IB_CREATE_CQ_FLAGS_UAR_PAGE_INDEX)
++	if (ucmd.flags & MLX5_IB_CREATE_CQ_FLAGS_UAR_PAGE_INDEX) {
+ 		*index = ucmd.uar_page_index;
+-	else
++	} else if (context->bfregi.lib_uar_dyn) {
++		err = -EINVAL;
++		goto err_cqb;
++	} else {
+ 		*index = context->bfregi.sys_pages[0];
++	}
+ 
+ 	if (ucmd.cqe_comp_en == 1) {
+ 		int mini_cqe_format;
+diff --git a/drivers/infiniband/hw/mlx5/main.c b/drivers/infiniband/hw/mlx5/main.c
+index 05d7069003dd..4376ad1002e2 100644
+--- a/drivers/infiniband/hw/mlx5/main.c
++++ b/drivers/infiniband/hw/mlx5/main.c
+@@ -1789,6 +1789,7 @@ static int mlx5_ib_alloc_ucontext(struct ib_ucontext *uctx,
+ 				     max_cqe_version);
+ 	u32 dump_fill_mkey;
+ 	bool lib_uar_4k;
++	bool lib_uar_dyn;
+ 
+ 	if (!dev->ib_active)
+ 		return -EAGAIN;
+@@ -1847,8 +1848,14 @@ static int mlx5_ib_alloc_ucontext(struct ib_ucontext *uctx,
+ 	}
+ 
+ 	lib_uar_4k = req.lib_caps & MLX5_LIB_CAP_4K_UAR;
++	lib_uar_dyn = req.lib_caps & MLX5_LIB_CAP_DYN_UAR;
+ 	bfregi = &context->bfregi;
+ 
++	if (lib_uar_dyn) {
++		bfregi->lib_uar_dyn = lib_uar_dyn;
++		goto uar_done;
++	}
++
+ 	/* updates req->total_num_bfregs */
+ 	err = calc_total_bfregs(dev, lib_uar_4k, &req, bfregi);
+ 	if (err)
+@@ -1875,6 +1882,7 @@ static int mlx5_ib_alloc_ucontext(struct ib_ucontext *uctx,
+ 	if (err)
+ 		goto out_sys_pages;
+ 
++uar_done:
+ 	if (req.flags & MLX5_IB_ALLOC_UCTX_DEVX) {
+ 		err = mlx5_ib_devx_create(dev, true);
+ 		if (err < 0)
+@@ -1896,7 +1904,7 @@ static int mlx5_ib_alloc_ucontext(struct ib_ucontext *uctx,
+ 	INIT_LIST_HEAD(&context->db_page_list);
+ 	mutex_init(&context->db_page_mutex);
+ 
+-	resp.tot_bfregs = req.total_num_bfregs;
++	resp.tot_bfregs = lib_uar_dyn ? 0 : req.total_num_bfregs;
+ 	resp.num_ports = dev->num_ports;
+ 
+ 	if (offsetofend(typeof(resp), cqe_version) <= udata->outlen)
+@@ -2149,6 +2157,9 @@ static int uar_mmap(struct mlx5_ib_dev *dev, enum mlx5_ib_mmap_cmd cmd,
+ 	int max_valid_idx = dyn_uar ? bfregi->num_sys_pages :
+ 				bfregi->num_static_sys_pages;
+ 
++	if (bfregi->lib_uar_dyn)
++		return -EINVAL;
++
+ 	if (vma->vm_end - vma->vm_start != PAGE_SIZE)
+ 		return -EINVAL;
+ 
+* Unmerged path drivers/infiniband/hw/mlx5/mlx5_ib.h
+diff --git a/drivers/infiniband/hw/mlx5/qp.c b/drivers/infiniband/hw/mlx5/qp.c
+index eb3a828a76c4..b5210b338976 100644
+--- a/drivers/infiniband/hw/mlx5/qp.c
++++ b/drivers/infiniband/hw/mlx5/qp.c
+@@ -697,6 +697,9 @@ static int alloc_bfreg(struct mlx5_ib_dev *dev,
+ {
+ 	int bfregn = -ENOMEM;
+ 
++	if (bfregi->lib_uar_dyn)
++		return -EINVAL;
++
+ 	mutex_lock(&bfregi->lock);
+ 	if (bfregi->ver >= 2) {
+ 		bfregn = alloc_high_class_bfreg(dev, bfregi);
+@@ -768,6 +771,9 @@ int bfregn_to_uar_index(struct mlx5_ib_dev *dev,
+ 	u32 index_of_sys_page;
+ 	u32 offset;
+ 
++	if (bfregi->lib_uar_dyn)
++		return -EINVAL;
++
+ 	bfregs_per_sys_page = get_uars_per_sys_page(dev, bfregi->lib_uar_4k) *
+ 				MLX5_NON_FP_BFREGS_PER_UAR;
+ 	index_of_sys_page = bfregn / bfregs_per_sys_page;
+diff --git a/include/uapi/rdma/mlx5-abi.h b/include/uapi/rdma/mlx5-abi.h
+index a65d60b44829..df1cc3641bda 100644
+--- a/include/uapi/rdma/mlx5-abi.h
++++ b/include/uapi/rdma/mlx5-abi.h
+@@ -79,6 +79,7 @@ struct mlx5_ib_alloc_ucontext_req {
+ 
+ enum mlx5_lib_caps {
+ 	MLX5_LIB_CAP_4K_UAR	= (__u64)1 << 0,
++	MLX5_LIB_CAP_DYN_UAR	= (__u64)1 << 1,
+ };
+ 
+ enum mlx5_ib_alloc_uctx_v2_flags {
