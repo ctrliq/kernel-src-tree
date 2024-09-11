@@ -190,8 +190,9 @@ static void ibmvfc_trc_start(struct ibmvfc_event *evt)
 	struct ibmvfc_mad_common *mad = &evt->iu.mad_common;
 	struct ibmvfc_fcp_cmd_iu *iu = ibmvfc_get_fcp_iu(vhost, vfc_cmd);
 	struct ibmvfc_trace_entry *entry;
+	int index = atomic_inc_return(&vhost->trace_index) & IBMVFC_TRACE_INDEX_MASK;
 
-	entry = &vhost->trace[vhost->trace_index++];
+	entry = &vhost->trace[index];
 	entry->evt = evt;
 	entry->time = jiffies;
 	entry->fmt = evt->crq.format;
@@ -225,8 +226,10 @@ static void ibmvfc_trc_end(struct ibmvfc_event *evt)
 	struct ibmvfc_mad_common *mad = &evt->xfer_iu->mad_common;
 	struct ibmvfc_fcp_cmd_iu *iu = ibmvfc_get_fcp_iu(vhost, vfc_cmd);
 	struct ibmvfc_fcp_rsp *rsp = ibmvfc_get_fcp_rsp(vhost, vfc_cmd);
-	struct ibmvfc_trace_entry *entry = &vhost->trace[vhost->trace_index++];
+	struct ibmvfc_trace_entry *entry;
+	int index = atomic_inc_return(&vhost->trace_index) & IBMVFC_TRACE_INDEX_MASK;
 
+	entry = &vhost->trace[index];
 	entry->evt = evt;
 	entry->time = jiffies;
 	entry->fmt = evt->crq.format;
@@ -819,6 +822,7 @@ static int ibmvfc_reset_crq(struct ibmvfc_host *vhost)
 	} while (rc == H_BUSY || H_IS_LONG_BUSY(rc));
 
 	spin_lock_irqsave(vhost->host->host_lock, flags);
+	spin_lock(vhost->crq.q_lock);
 	vhost->state = IBMVFC_NO_CRQ;
 	vhost->logged_in = 0;
 
@@ -835,6 +839,7 @@ static int ibmvfc_reset_crq(struct ibmvfc_host *vhost)
 		dev_warn(vhost->dev, "Partner adapter not ready\n");
 	else if (rc != 0)
 		dev_warn(vhost->dev, "Couldn't register crq (rc=%d)\n", rc);
+	spin_unlock(vhost->crq.q_lock);
 	spin_unlock_irqrestore(vhost->host->host_lock, flags);
 
 	return rc;
@@ -867,10 +872,16 @@ static int ibmvfc_valid_event(struct ibmvfc_event_pool *pool,
 static void ibmvfc_free_event(struct ibmvfc_event *evt)
 {
 	struct ibmvfc_event_pool *pool = &evt->queue->evt_pool;
+	unsigned long flags;
 
 	BUG_ON(!ibmvfc_valid_event(pool, evt));
 	BUG_ON(atomic_inc_return(&evt->free) != 1);
+
+	spin_lock_irqsave(&evt->queue->l_lock, flags);
 	list_add_tail(&evt->queue_list, &evt->queue->free);
+	if (evt->eh_comp)
+		complete(evt->eh_comp);
+	spin_unlock_irqrestore(&evt->queue->l_lock, flags);
 }
 
 /**
@@ -889,10 +900,25 @@ static void ibmvfc_scsi_eh_done(struct ibmvfc_event *evt)
 		cmnd->scsi_done(cmnd);
 	}
 
-	if (evt->eh_comp)
-		complete(evt->eh_comp);
-
 	ibmvfc_free_event(evt);
+}
+
+/**
+ * ibmvfc_complete_purge - Complete failed command list
+ * @purge_list:		list head of failed commands
+ *
+ * This function runs completions on commands to fail as a result of a
+ * host reset or platform migration. Caller must hold host_lock.
+ **/
+static void ibmvfc_complete_purge(struct list_head *purge_list)
+{
+	struct ibmvfc_event *evt, *pos;
+
+	list_for_each_entry_safe(evt, pos, purge_list, queue_list) {
+		list_del(&evt->queue_list);
+		ibmvfc_trc_end(evt);
+		evt->done(evt);
+	}
 }
 
 /**
@@ -911,10 +937,7 @@ static void ibmvfc_fail_request(struct ibmvfc_event *evt, int error_code)
 	} else
 		evt->xfer_iu->mad_common.status = cpu_to_be16(IBMVFC_MAD_DRIVER_FAILED);
 
-	list_del(&evt->queue_list);
 	del_timer(&evt->timer);
-	ibmvfc_trc_end(evt);
-	evt->done(evt);
 }
 
 /**
@@ -928,10 +951,14 @@ static void ibmvfc_fail_request(struct ibmvfc_event *evt, int error_code)
 static void ibmvfc_purge_requests(struct ibmvfc_host *vhost, int error_code)
 {
 	struct ibmvfc_event *evt, *pos;
+	unsigned long flags;
 
 	ibmvfc_dbg(vhost, "Purging all requests\n");
+	spin_lock_irqsave(&vhost->crq.l_lock, flags);
 	list_for_each_entry_safe(evt, pos, &vhost->crq.sent, queue_list)
 		ibmvfc_fail_request(evt, error_code);
+	list_splice_init(&vhost->crq.sent, &vhost->purge);
+	spin_unlock_irqrestore(&vhost->crq.l_lock, flags);
 }
 
 /**
@@ -1328,6 +1355,7 @@ static int ibmvfc_init_event_pool(struct ibmvfc_host *vhost,
 
 	INIT_LIST_HEAD(&queue->sent);
 	INIT_LIST_HEAD(&queue->free);
+	spin_lock_init(&queue->l_lock);
 
 	for (i = 0; i < pool->size; ++i) {
 		struct ibmvfc_event *evt = &pool->events[i];
@@ -1382,11 +1410,14 @@ static void ibmvfc_free_event_pool(struct ibmvfc_host *vhost,
 static struct ibmvfc_event *ibmvfc_get_event(struct ibmvfc_queue *queue)
 {
 	struct ibmvfc_event *evt;
+	unsigned long flags;
 
+	spin_lock_irqsave(&queue->l_lock, flags);
 	BUG_ON(list_empty(&queue->free));
 	evt = list_entry(queue->free.next, struct ibmvfc_event, queue_list);
 	atomic_set(&evt->free, 0);
 	list_del(&evt->queue_list);
+	spin_unlock_irqrestore(&queue->l_lock, flags);
 	return evt;
 }
 
@@ -1520,6 +1551,7 @@ static int ibmvfc_send_event(struct ibmvfc_event *evt,
 			     struct ibmvfc_host *vhost, unsigned long timeout)
 {
 	__be64 *crq_as_u64 = (__be64 *) &evt->crq;
+	unsigned long flags;
 	int rc;
 
 	/* Copy the IU into the transfer area */
@@ -1531,7 +1563,6 @@ static int ibmvfc_send_event(struct ibmvfc_event *evt,
 	else
 		BUG();
 
-	list_add_tail(&evt->queue_list, &evt->queue->sent);
 	timer_setup(&evt->timer, ibmvfc_timeout, 0);
 
 	if (timeout) {
@@ -1539,11 +1570,15 @@ static int ibmvfc_send_event(struct ibmvfc_event *evt,
 		add_timer(&evt->timer);
 	}
 
+	spin_lock_irqsave(&evt->queue->l_lock, flags);
+	list_add_tail(&evt->queue_list, &evt->queue->sent);
+
 	mb();
 
 	if ((rc = ibmvfc_send_crq(vhost, be64_to_cpu(crq_as_u64[0]),
 				  be64_to_cpu(crq_as_u64[1])))) {
 		list_del(&evt->queue_list);
+		spin_unlock_irqrestore(&evt->queue->l_lock, flags);
 		del_timer(&evt->timer);
 
 		/* If send_crq returns H_CLOSED, return SCSI_MLQUEUE_HOST_BUSY.
@@ -1568,8 +1603,10 @@ static int ibmvfc_send_event(struct ibmvfc_event *evt,
 			evt->xfer_iu->mad_common.status = cpu_to_be16(IBMVFC_MAD_CRQ_ERROR);
 
 		evt->done(evt);
-	} else
+	} else {
+		spin_unlock_irqrestore(&evt->queue->l_lock, flags);
 		ibmvfc_trc_start(evt);
+	}
 
 	return 0;
 }
@@ -1676,9 +1713,6 @@ static void ibmvfc_scsi_done(struct ibmvfc_event *evt)
 		scsi_dma_unmap(cmnd);
 		cmnd->scsi_done(cmnd);
 	}
-
-	if (evt->eh_comp)
-		complete(evt->eh_comp);
 
 	ibmvfc_free_event(evt);
 }
@@ -2231,28 +2265,28 @@ static int ibmvfc_wait_for_ops(struct ibmvfc_host *vhost, void *device,
 	ENTER;
 	do {
 		wait = 0;
-		spin_lock_irqsave(vhost->host->host_lock, flags);
+		spin_lock_irqsave(&vhost->crq.l_lock, flags);
 		list_for_each_entry(evt, &vhost->crq.sent, queue_list) {
 			if (match(evt, device)) {
 				evt->eh_comp = &comp;
 				wait++;
 			}
 		}
-		spin_unlock_irqrestore(vhost->host->host_lock, flags);
+		spin_unlock_irqrestore(&vhost->crq.l_lock, flags);
 
 		if (wait) {
 			timeout = wait_for_completion_timeout(&comp, timeout);
 
 			if (!timeout) {
 				wait = 0;
-				spin_lock_irqsave(vhost->host->host_lock, flags);
+				spin_lock_irqsave(&vhost->crq.l_lock, flags);
 				list_for_each_entry(evt, &vhost->crq.sent, queue_list) {
 					if (match(evt, device)) {
 						evt->eh_comp = NULL;
 						wait++;
 					}
 				}
-				spin_unlock_irqrestore(vhost->host->host_lock, flags);
+				spin_unlock_irqrestore(&vhost->crq.l_lock, flags);
 				if (wait)
 					dev_err(vhost->dev, "Timed out waiting for aborted commands\n");
 				LEAVE;
@@ -2289,14 +2323,16 @@ static int ibmvfc_cancel_all(struct scsi_device *sdev, int type)
 	u16 status;
 
 	ENTER;
-	spin_lock_irqsave(vhost->host->host_lock, flags);
 	found_evt = NULL;
+	spin_lock_irqsave(vhost->host->host_lock, flags);
+	spin_lock(&vhost->crq.l_lock);
 	list_for_each_entry(evt, &vhost->crq.sent, queue_list) {
 		if (evt->cmnd && evt->cmnd->device == sdev) {
 			found_evt = evt;
 			break;
 		}
 	}
+	spin_unlock(&vhost->crq.l_lock);
 
 	if (!found_evt) {
 		if (vhost->log_level > IBMVFC_DEFAULT_LOG_LEVEL)
@@ -2426,14 +2462,16 @@ static int ibmvfc_abort_task_set(struct scsi_device *sdev)
 	unsigned long flags, timeout = IBMVFC_ABORT_TIMEOUT;
 	int rsp_code = 0;
 
-	spin_lock_irqsave(vhost->host->host_lock, flags);
 	found_evt = NULL;
+	spin_lock_irqsave(vhost->host->host_lock, flags);
+	spin_lock(&vhost->crq.l_lock);
 	list_for_each_entry(evt, &vhost->crq.sent, queue_list) {
 		if (evt->cmnd && evt->cmnd->device == sdev) {
 			found_evt = evt;
 			break;
 		}
 	}
+	spin_unlock(&vhost->crq.l_lock);
 
 	if (!found_evt) {
 		if (vhost->log_level > IBMVFC_DEFAULT_LOG_LEVEL)
@@ -2947,7 +2985,9 @@ static void ibmvfc_handle_crq(struct ibmvfc_crq *crq, struct ibmvfc_host *vhost)
 	}
 
 	del_timer(&evt->timer);
+	spin_lock(&evt->queue->l_lock);
 	list_del(&evt->queue_list);
+	spin_unlock(&evt->queue->l_lock);
 	ibmvfc_trc_end(evt);
 	evt->done(evt);
 }
@@ -3341,6 +3381,7 @@ static void ibmvfc_tasklet(void *data)
 	int done = 0;
 
 	spin_lock_irqsave(vhost->host->host_lock, flags);
+	spin_lock(vhost->crq.q_lock);
 	while (!done) {
 		/* Pull all the valid messages off the async CRQ */
 		while ((async = ibmvfc_next_async_crq(vhost)) != NULL) {
@@ -3371,6 +3412,7 @@ static void ibmvfc_tasklet(void *data)
 			done = 1;
 	}
 
+	spin_unlock(vhost->crq.q_lock);
 	spin_unlock_irqrestore(vhost->host->host_lock, flags);
 }
 
@@ -4746,6 +4788,7 @@ static void ibmvfc_do_work(struct ibmvfc_host *vhost)
 	struct ibmvfc_target *tgt;
 	unsigned long flags;
 	struct fc_rport *rport;
+	LIST_HEAD(purge);
 	int rc;
 
 	ibmvfc_log_ae(vhost, vhost->events_to_log);
@@ -4758,6 +4801,8 @@ static void ibmvfc_do_work(struct ibmvfc_host *vhost)
 		break;
 	case IBMVFC_HOST_ACTION_RESET:
 		vhost->action = IBMVFC_HOST_ACTION_TGT_DEL;
+		list_splice_init(&vhost->purge, &purge);
+		ibmvfc_complete_purge(&purge);
 		spin_unlock_irqrestore(vhost->host->host_lock, flags);
 		rc = ibmvfc_reset_crq(vhost);
 		spin_lock_irqsave(vhost->host->host_lock, flags);
@@ -4771,6 +4816,8 @@ static void ibmvfc_do_work(struct ibmvfc_host *vhost)
 		break;
 	case IBMVFC_HOST_ACTION_REENABLE:
 		vhost->action = IBMVFC_HOST_ACTION_TGT_DEL;
+		list_splice_init(&vhost->purge, &purge);
+		ibmvfc_complete_purge(&purge);
 		spin_unlock_irqrestore(vhost->host->host_lock, flags);
 		rc = ibmvfc_reenable_crq_queue(vhost);
 		spin_lock_irqsave(vhost->host->host_lock, flags);
@@ -4948,6 +4995,9 @@ static int ibmvfc_alloc_queue(struct ibmvfc_host *vhost,
 	size_t fmt_size;
 
 	ENTER;
+	spin_lock_init(&queue->_lock);
+	queue->q_lock = &queue->_lock;
+
 	switch (fmt) {
 	case IBMVFC_CRQ_FMT:
 		fmt_size = sizeof(*queue->msgs.crq);
@@ -5110,6 +5160,7 @@ static int ibmvfc_alloc_mem(struct ibmvfc_host *vhost)
 
 	vhost->trace = kcalloc(IBMVFC_NUM_TRACE_ENTRIES,
 			       sizeof(struct ibmvfc_trace_entry), GFP_KERNEL);
+	atomic_set(&vhost->trace_index, -1);
 
 	if (!vhost->trace)
 		goto free_disc_buffer;
@@ -5226,6 +5277,7 @@ static int ibmvfc_probe(struct vio_dev *vdev, const struct vio_device_id *id)
 
 	vhost = shost_priv(shost);
 	INIT_LIST_HEAD(&vhost->targets);
+	INIT_LIST_HEAD(&vhost->purge);
 	sprintf(vhost->name, IBMVFC_NAME);
 	vhost->host = shost;
 	vhost->dev = dev;
@@ -5309,6 +5361,7 @@ out:
 static int ibmvfc_remove(struct vio_dev *vdev)
 {
 	struct ibmvfc_host *vhost = dev_get_drvdata(&vdev->dev);
+	LIST_HEAD(purge);
 	unsigned long flags;
 
 	ENTER;
@@ -5326,6 +5379,8 @@ static int ibmvfc_remove(struct vio_dev *vdev)
 
 	spin_lock_irqsave(vhost->host->host_lock, flags);
 	ibmvfc_purge_requests(vhost, DID_ERROR);
+	list_splice_init(&vhost->purge, &purge);
+	ibmvfc_complete_purge(&purge);
 	spin_unlock_irqrestore(vhost->host->host_lock, flags);
 	ibmvfc_free_event_pool(vhost, &vhost->crq);
 
