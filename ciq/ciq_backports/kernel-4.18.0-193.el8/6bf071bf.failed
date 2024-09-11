@@ -1,0 +1,136 @@
+xdp: page_pool related fix to cpumap
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-193.el8
+commit-author Jesper Dangaard Brouer <brouer@redhat.com>
+commit 6bf071bf09d4b2ff3ee8783531e2ce814f0870cb
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-193.el8/6bf071bf.failed
+
+When converting an xdp_frame into an SKB, and sending this into the network
+stack, then the underlying XDP memory model need to release associated
+resources, because the network stack don't have callbacks for XDP memory
+models.  The only memory model that needs this is page_pool, when a driver
+use the DMA-mapping feature.
+
+Introduce page_pool_release_page(), which basically does the same as
+page_pool_unmap_page(). Add xdp_release_frame() as the XDP memory model
+interface for calling it, if the memory model match MEM_TYPE_PAGE_POOL, to
+save the function call overhead for others. Have cpumap call
+xdp_release_frame() before xdp_scrub_frame().
+
+	Signed-off-by: Jesper Dangaard Brouer <brouer@redhat.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 6bf071bf09d4b2ff3ee8783531e2ce814f0870cb)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/net/xdp.h
+diff --cc include/net/xdp.h
+index 7efc9ceb6f88,40c6d3398458..000000000000
+--- a/include/net/xdp.h
++++ b/include/net/xdp.h
+@@@ -145,10 -129,21 +145,28 @@@ void xdp_return_frame(struct xdp_frame 
+  void xdp_return_frame_rx_napi(struct xdp_frame *xdpf);
+  void xdp_return_buff(struct xdp_buff *xdp);
+  
+++<<<<<<< HEAD
+ +/* RHEL: increase the version of xdp_rxq_info_reg kABI whenever XDP is
+ + * changed in a kABI incompatible way. That includes changes to ndo_xdp* and
+ + * ndo_bpf ops, inline function changes and XDP struct changes. */
+ +RH_KABI_FORCE_CHANGE(1)
+++=======
++ /* When sending xdp_frame into the network stack, then there is no
++  * return point callback, which is needed to release e.g. DMA-mapping
++  * resources with page_pool.  Thus, have explicit function to release
++  * frame resources.
++  */
++ void __xdp_release_frame(void *data, struct xdp_mem_info *mem);
++ static inline void xdp_release_frame(struct xdp_frame *xdpf)
++ {
++ 	struct xdp_mem_info *mem = &xdpf->mem;
++ 
++ 	/* Curr only page_pool needs this */
++ 	if (mem->type == MEM_TYPE_PAGE_POOL)
++ 		__xdp_release_frame(xdpf->data, mem);
++ }
++ 
+++>>>>>>> 6bf071bf09d4 (xdp: page_pool related fix to cpumap)
+  int xdp_rxq_info_reg(struct xdp_rxq_info *xdp_rxq,
+  		     struct net_device *dev, u32 queue_index);
+  void xdp_rxq_info_unreg(struct xdp_rxq_info *xdp_rxq);
+diff --git a/include/net/page_pool.h b/include/net/page_pool.h
+index ad218cef88c5..e240fac4c5b9 100644
+--- a/include/net/page_pool.h
++++ b/include/net/page_pool.h
+@@ -110,7 +110,6 @@ static inline struct page *page_pool_dev_alloc_pages(struct page_pool *pool)
+ struct page_pool *page_pool_create(const struct page_pool_params *params);
+ 
+ void page_pool_destroy(struct page_pool *pool);
+-void page_pool_unmap_page(struct page_pool *pool, struct page *page);
+ 
+ /* Never call this directly, use helpers below */
+ void __page_pool_put_page(struct page_pool *pool,
+@@ -133,6 +132,20 @@ static inline void page_pool_recycle_direct(struct page_pool *pool,
+ 	__page_pool_put_page(pool, page, true);
+ }
+ 
++/* Disconnects a page (from a page_pool).  API users can have a need
++ * to disconnect a page (from a page_pool), to allow it to be used as
++ * a regular page (that will eventually be returned to the normal
++ * page-allocator via put_page).
++ */
++void page_pool_unmap_page(struct page_pool *pool, struct page *page);
++static inline void page_pool_release_page(struct page_pool *pool,
++					  struct page *page)
++{
++#ifdef CONFIG_PAGE_POOL
++	page_pool_unmap_page(pool, page);
++#endif
++}
++
+ static inline dma_addr_t page_pool_get_dma_addr(struct page *page)
+ {
+ 	return page->dma_addr;
+* Unmerged path include/net/xdp.h
+diff --git a/kernel/bpf/cpumap.c b/kernel/bpf/cpumap.c
+index cf727d77c6c6..b7a3eab4f7c8 100644
+--- a/kernel/bpf/cpumap.c
++++ b/kernel/bpf/cpumap.c
+@@ -209,6 +209,9 @@ static struct sk_buff *cpu_map_build_skb(struct bpf_cpu_map_entry *rcpu,
+ 	 * - RX ring dev queue index	(skb_record_rx_queue)
+ 	 */
+ 
++	/* Until page_pool get SKB return path, release DMA here */
++	xdp_release_frame(xdpf);
++
+ 	/* Allow SKB to reuse area used by xdp_frame */
+ 	xdp_scrub_frame(xdpf);
+ 
+diff --git a/net/core/xdp.c b/net/core/xdp.c
+index 762abeb89847..179d90570afe 100644
+--- a/net/core/xdp.c
++++ b/net/core/xdp.c
+@@ -381,6 +381,21 @@ void xdp_return_buff(struct xdp_buff *xdp)
+ }
+ EXPORT_SYMBOL_GPL(xdp_return_buff);
+ 
++/* Only called for MEM_TYPE_PAGE_POOL see xdp.h */
++void __xdp_release_frame(void *data, struct xdp_mem_info *mem)
++{
++	struct xdp_mem_allocator *xa;
++	struct page *page;
++
++	rcu_read_lock();
++	xa = rhashtable_lookup(mem_id_ht, &mem->id, mem_id_rht_params);
++	page = virt_to_head_page(data);
++	if (xa)
++		page_pool_release_page(xa->page_pool, page);
++	rcu_read_unlock();
++}
++EXPORT_SYMBOL_GPL(__xdp_release_frame);
++
+ int xdp_attachment_query(struct xdp_attachment_info *info,
+ 			 struct netdev_bpf *bpf)
+ {
