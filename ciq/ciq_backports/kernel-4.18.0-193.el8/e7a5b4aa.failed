@@ -1,0 +1,119 @@
+RDMA/device: Don't fire uevent before device is fully initialized
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-193.el8
+commit-author Leon Romanovsky <leon@kernel.org>
+commit e7a5b4aafd82771f8924905c208d5d236ddcb671
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-193.el8/e7a5b4aa.failed
+
+When the refcount is 0 the device is invisible to netlink. However in the
+patch below the refcount = 1 was moved to after the device_add().  This
+creates a race where userspace can issue a netlink query after the
+device_add() event and not see the device as visible.
+
+Ensure that no uevent is fired before device is fully registered.
+
+Fixes: d79af7242bb2 ("RDMA/device: Expose ib_device_try_get(()")
+	Signed-off-by: Leon Romanovsky <leonro@mellanox.com>
+	Signed-off-by: Jason Gunthorpe <jgg@mellanox.com>
+(cherry picked from commit e7a5b4aafd82771f8924905c208d5d236ddcb671)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/infiniband/core/device.c
+diff --cc drivers/infiniband/core/device.c
+index ec96a7b1c811,78dc07c6ac4b..000000000000
+--- a/drivers/infiniband/core/device.c
++++ b/drivers/infiniband/core/device.c
+@@@ -606,43 -1298,62 +606,64 @@@ int ib_register_device(struct ib_devic
+  	if (ret) {
+  		dev_warn(&device->dev,
+  			 "Couldn't set up InfiniBand P_Key/GID cache\n");
+ -		return ret;
+ +		goto out;
+  	}
+  
+ -	ib_device_register_rdmacg(device);
+ +	device->index = __dev_new_index();
+  
+++<<<<<<< HEAD
+ +	ret = ib_device_register_rdmacg(device);
+ +	if (ret) {
+ +		dev_warn(&device->dev,
+ +			 "Couldn't register device with rdma cgroup\n");
+ +		goto dev_cleanup;
+ +	}
+++=======
++ 	/*
++ 	 * Ensure that ADD uevent is not fired because it
++ 	 * is too early amd device is not initialized yet.
++ 	 */
++ 	dev_set_uevent_suppress(&device->dev, true);
++ 	ret = device_add(&device->dev);
++ 	if (ret)
++ 		goto cg_cleanup;
+++>>>>>>> e7a5b4aafd82 (RDMA/device: Don't fire uevent before device is fully initialized)
+  
+  	ret = ib_device_register_sysfs(device);
+  	if (ret) {
+  		dev_warn(&device->dev,
+  			 "Couldn't register device with driver model\n");
+ -		goto dev_cleanup;
+ +		goto cg_cleanup;
+  	}
+  
+++<<<<<<< HEAD
+ +	refcount_set(&device->refcount, 1);
+++=======
++ 	ret = enable_device_and_get(device);
++ 	dev_set_uevent_suppress(&device->dev, false);
++ 	/* Mark for userspace that device is ready */
++ 	kobject_uevent(&device->dev.kobj, KOBJ_ADD);
++ 	if (ret) {
++ 		void (*dealloc_fn)(struct ib_device *);
+++>>>>>>> e7a5b4aafd82 (RDMA/device: Don't fire uevent before device is fully initialized)
+  
+ -		/*
+ -		 * If we hit this error flow then we don't want to
+ -		 * automatically dealloc the device since the caller is
+ -		 * expected to call ib_dealloc_device() after
+ -		 * ib_register_device() fails. This is tricky due to the
+ -		 * possibility for a parallel unregistration along with this
+ -		 * error flow. Since we have a refcount here we know any
+ -		 * parallel flow is stopped in disable_device and will see the
+ -		 * NULL pointers, causing the responsibility to
+ -		 * ib_dealloc_device() to revert back to this thread.
+ -		 */
+ -		dealloc_fn = device->ops.dealloc_driver;
+ -		device->ops.dealloc_driver = NULL;
+ -		ib_device_put(device);
+ -		__ib_unregister_device(device);
+ -		device->ops.dealloc_driver = dealloc_fn;
+ -		return ret;
+ -	}
+ -	ib_device_put(device);
+ +	xa_for_each_marked (&clients, index, client, CLIENT_REGISTERED)
+ +		if (!add_client_context(device, client) && client->add)
+ +			client->add(device);
+  
+ +	down_write(&lists_rwsem);
+ +	list_add_tail(&device->core_list, &device_list);
+ +	up_write(&lists_rwsem);
+ +	mutex_unlock(&device_mutex);
+  	return 0;
+  
+ -dev_cleanup:
+ -	device_del(&device->dev);
+  cg_cleanup:
++ 	dev_set_uevent_suppress(&device->dev, false);
+  	ib_device_unregister_rdmacg(device);
+ +dev_cleanup:
+  	ib_cache_cleanup_one(device);
+ +out:
+ +	mutex_unlock(&device_mutex);
+  	return ret;
+  }
+  EXPORT_SYMBOL(ib_register_device);
+* Unmerged path drivers/infiniband/core/device.c
