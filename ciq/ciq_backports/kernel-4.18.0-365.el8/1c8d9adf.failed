@@ -1,0 +1,485 @@
+drm/i915/fb: move intel_surf_alignment() to intel_fb.c
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-365.el8
+commit-author Jani Nikula <jani.nikula@intel.com>
+commit 1c8d9adfc3ad7e5472fbed2163897c13ad67620b
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-365.el8/1c8d9adf.failed
+
+Split out fb related stuff from intel_display.c to intel_fb.c.
+
+	Reviewed-by: Rodrigo Vivi <rodrigo.vivi@intel.com>
+	Signed-off-by: Jani Nikula <jani.nikula@intel.com>
+Link: https://patchwork.freedesktop.org/patch/msgid/0b894be3a6acff5fe917b686771a084a6c2aa535.1629721467.git.jani.nikula@intel.com
+(cherry picked from commit 1c8d9adfc3ad7e5472fbed2163897c13ad67620b)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/gpu/drm/i915/display/intel_display.c
+#	drivers/gpu/drm/i915/display/intel_display.h
+#	drivers/gpu/drm/i915/display/intel_fb.c
+#	drivers/gpu/drm/i915/display/intel_fb.h
+diff --cc drivers/gpu/drm/i915/display/intel_display.c
+index 19f6e7572c75,a9e3ac07b207..000000000000
+--- a/drivers/gpu/drm/i915/display/intel_display.c
++++ b/drivers/gpu/drm/i915/display/intel_display.c
+@@@ -1081,330 -871,138 +1081,333 @@@ void intel_disable_pipe(const struct in
+  		intel_wait_for_pipe_off(old_crtc_state);
+  }
+  
+ -bool
+ -intel_format_info_is_yuv_semiplanar(const struct drm_format_info *info,
+ -				    u64 modifier)
+ +static unsigned int intel_tile_size(const struct drm_i915_private *dev_priv)
+  {
+ -	return info->is_yuv &&
+ -	       info->num_planes == (is_ccs_modifier(modifier) ? 4 : 2);
+ +	return IS_GEN(dev_priv, 2) ? 2048 : 4096;
+  }
+  
+ -unsigned int intel_rotation_info_size(const struct intel_rotation_info *rot_info)
+ +static bool is_ccs_plane(const struct drm_framebuffer *fb, int plane)
+  {
+ -	unsigned int size = 0;
+ -	int i;
+ +	if (!is_ccs_modifier(fb->modifier))
+ +		return false;
+  
+ -	for (i = 0 ; i < ARRAY_SIZE(rot_info->plane); i++)
+ -		size += rot_info->plane[i].dst_stride * rot_info->plane[i].width;
+ +	return plane >= fb->format->num_planes / 2;
+ +}
+  
+ -	return size;
+ +static bool is_gen12_ccs_modifier(u64 modifier)
+ +{
+ +	return modifier == I915_FORMAT_MOD_Y_TILED_GEN12_RC_CCS ||
+ +	       modifier == I915_FORMAT_MOD_Y_TILED_GEN12_RC_CCS_CC ||
+ +	       modifier == I915_FORMAT_MOD_Y_TILED_GEN12_MC_CCS;
+  }
+  
+ -unsigned int intel_remapped_info_size(const struct intel_remapped_info *rem_info)
+ +static bool is_gen12_ccs_plane(const struct drm_framebuffer *fb, int plane)
+  {
+ -	unsigned int size = 0;
+ -	int i;
+ +	return is_gen12_ccs_modifier(fb->modifier) && is_ccs_plane(fb, plane);
+ +}
+  
+ -	for (i = 0 ; i < ARRAY_SIZE(rem_info->plane); i++)
+ -		size += rem_info->plane[i].dst_stride * rem_info->plane[i].height;
+ +static bool is_gen12_ccs_cc_plane(const struct drm_framebuffer *fb, int plane)
+ +{
+ +	return fb->modifier == I915_FORMAT_MOD_Y_TILED_GEN12_RC_CCS_CC &&
+ +	       plane == 2;
+ +}
+  
+ -	return size;
+ +static bool is_aux_plane(const struct drm_framebuffer *fb, int plane)
+ +{
+ +	if (is_ccs_modifier(fb->modifier))
+ +		return is_ccs_plane(fb, plane);
+ +
+ +	return plane == 1;
+  }
+  
+ -static bool intel_plane_uses_fence(const struct intel_plane_state *plane_state)
+ +static int main_to_ccs_plane(const struct drm_framebuffer *fb, int main_plane)
+  {
+ -	struct intel_plane *plane = to_intel_plane(plane_state->uapi.plane);
+ -	struct drm_i915_private *dev_priv = to_i915(plane->base.dev);
+ +	drm_WARN_ON(fb->dev, !is_ccs_modifier(fb->modifier) ||
+ +		    (main_plane && main_plane >= fb->format->num_planes / 2));
+  
+ -	return DISPLAY_VER(dev_priv) < 4 ||
+ -		(plane->has_fbc &&
+ -		 plane_state->view.gtt.type == I915_GGTT_VIEW_NORMAL);
+ +	return fb->format->num_planes / 2 + main_plane;
+  }
+  
+ -static struct i915_vma *
+ -intel_pin_fb_obj_dpt(struct drm_framebuffer *fb,
+ -		     const struct i915_ggtt_view *view,
+ -		     bool uses_fence,
+ -		     unsigned long *out_flags,
+ -		     struct i915_address_space *vm)
+ +static int ccs_to_main_plane(const struct drm_framebuffer *fb, int ccs_plane)
+  {
+ -	struct drm_device *dev = fb->dev;
+ -	struct drm_i915_private *dev_priv = to_i915(dev);
+ -	struct drm_i915_gem_object *obj = intel_fb_obj(fb);
+ -	struct i915_vma *vma;
+ -	u32 alignment;
+ -	int ret;
+ +	drm_WARN_ON(fb->dev, !is_ccs_modifier(fb->modifier) ||
+ +		    ccs_plane < fb->format->num_planes / 2);
+  
+ -	if (WARN_ON(!i915_gem_object_is_framebuffer(obj)))
+ -		return ERR_PTR(-EINVAL);
+ +	if (is_gen12_ccs_cc_plane(fb, ccs_plane))
+ +		return 0;
+  
+ -	alignment = 4096 * 512;
+ +	return ccs_plane - fb->format->num_planes / 2;
+ +}
+  
+ -	atomic_inc(&dev_priv->gpu_error.pending_fb_pin);
+ +int intel_main_to_aux_plane(const struct drm_framebuffer *fb, int main_plane)
+ +{
+ +	struct drm_i915_private *i915 = to_i915(fb->dev);
+  
+ -	ret = i915_gem_object_set_cache_level(obj, I915_CACHE_NONE);
+ -	if (ret) {
+ -		vma = ERR_PTR(ret);
+ -		goto err;
+ -	}
+ +	if (is_ccs_modifier(fb->modifier))
+ +		return main_to_ccs_plane(fb, main_plane);
+ +	else if (INTEL_GEN(i915) < 11 &&
+ +		 intel_format_info_is_yuv_semiplanar(fb->format, fb->modifier))
+ +		return 1;
+ +	else
+ +		return 0;
+ +}
+  
+ -	vma = i915_vma_instance(obj, vm, view);
+ -	if (IS_ERR(vma))
+ -		goto err;
+ +bool
+ +intel_format_info_is_yuv_semiplanar(const struct drm_format_info *info,
+ +				    u64 modifier)
+ +{
+ +	return info->is_yuv &&
+ +	       info->num_planes == (is_ccs_modifier(modifier) ? 4 : 2);
+ +}
+  
+ -	if (i915_vma_misplaced(vma, 0, alignment, 0)) {
+ -		ret = i915_vma_unbind(vma);
+ -		if (ret) {
+ -			vma = ERR_PTR(ret);
+ -			goto err;
+ -		}
+ -	}
+ +static bool is_semiplanar_uv_plane(const struct drm_framebuffer *fb,
+ +				   int color_plane)
+ +{
+ +	return intel_format_info_is_yuv_semiplanar(fb->format, fb->modifier) &&
+ +	       color_plane == 1;
+ +}
+  
+ -	ret = i915_vma_pin(vma, 0, alignment, PIN_GLOBAL);
+ -	if (ret) {
+ -		vma = ERR_PTR(ret);
+ -		goto err;
+ +static unsigned int
+ +intel_tile_width_bytes(const struct drm_framebuffer *fb, int color_plane)
+ +{
+ +	struct drm_i915_private *dev_priv = to_i915(fb->dev);
+ +	unsigned int cpp = fb->format->cpp[color_plane];
+ +
+ +	switch (fb->modifier) {
+ +	case DRM_FORMAT_MOD_LINEAR:
+ +		return intel_tile_size(dev_priv);
+ +	case I915_FORMAT_MOD_X_TILED:
+ +		if (IS_GEN(dev_priv, 2))
+ +			return 128;
+ +		else
+ +			return 512;
+ +	case I915_FORMAT_MOD_Y_TILED_CCS:
+ +		if (is_ccs_plane(fb, color_plane))
+ +			return 128;
+ +		fallthrough;
+ +	case I915_FORMAT_MOD_Y_TILED_GEN12_RC_CCS:
+ +	case I915_FORMAT_MOD_Y_TILED_GEN12_RC_CCS_CC:
+ +	case I915_FORMAT_MOD_Y_TILED_GEN12_MC_CCS:
+ +		if (is_ccs_plane(fb, color_plane))
+ +			return 64;
+ +		fallthrough;
+ +	case I915_FORMAT_MOD_Y_TILED:
+ +		if (IS_GEN(dev_priv, 2) || HAS_128_BYTE_Y_TILING(dev_priv))
+ +			return 128;
+ +		else
+ +			return 512;
+ +	case I915_FORMAT_MOD_Yf_TILED_CCS:
+ +		if (is_ccs_plane(fb, color_plane))
+ +			return 128;
+ +		fallthrough;
+ +	case I915_FORMAT_MOD_Yf_TILED:
+ +		switch (cpp) {
+ +		case 1:
+ +			return 64;
+ +		case 2:
+ +		case 4:
+ +			return 128;
+ +		case 8:
+ +		case 16:
+ +			return 256;
+ +		default:
+ +			MISSING_CASE(cpp);
+ +			return cpp;
+ +		}
+ +		break;
+ +	default:
+ +		MISSING_CASE(fb->modifier);
+ +		return cpp;
+  	}
+ +}
+  
+ -	vma->display_alignment = max_t(u64, vma->display_alignment, alignment);
+ +static unsigned int
+ +intel_tile_height(const struct drm_framebuffer *fb, int color_plane)
+ +{
+ +	if (is_gen12_ccs_plane(fb, color_plane))
+ +		return 1;
+  
+ -	i915_gem_object_flush_if_display(obj);
+ +	return intel_tile_size(to_i915(fb->dev)) /
+ +		intel_tile_width_bytes(fb, color_plane);
+ +}
+  
+ -	i915_vma_get(vma);
+ -err:
+ -	atomic_dec(&dev_priv->gpu_error.pending_fb_pin);
+ +/* Return the tile dimensions in pixel units */
+ +static void intel_tile_dims(const struct drm_framebuffer *fb, int color_plane,
+ +			    unsigned int *tile_width,
+ +			    unsigned int *tile_height)
+ +{
+ +	unsigned int tile_width_bytes = intel_tile_width_bytes(fb, color_plane);
+ +	unsigned int cpp = fb->format->cpp[color_plane];
+  
+ -	return vma;
+ +	*tile_width = tile_width_bytes / cpp;
+ +	*tile_height = intel_tile_height(fb, color_plane);
+  }
+  
+ -struct i915_vma *
+ -intel_pin_and_fence_fb_obj(struct drm_framebuffer *fb,
+ -			   bool phys_cursor,
+ -			   const struct i915_ggtt_view *view,
+ -			   bool uses_fence,
+ -			   unsigned long *out_flags)
+ +static unsigned int intel_tile_row_size(const struct drm_framebuffer *fb,
+ +					int color_plane)
+  {
+ -	struct drm_device *dev = fb->dev;
+ -	struct drm_i915_private *dev_priv = to_i915(dev);
+ -	struct drm_i915_gem_object *obj = intel_fb_obj(fb);
+ -	intel_wakeref_t wakeref;
+ -	struct i915_gem_ww_ctx ww;
+ -	struct i915_vma *vma;
+ -	unsigned int pinctl;
+ -	u32 alignment;
+ -	int ret;
+ +	unsigned int tile_width, tile_height;
+  
+ -	if (drm_WARN_ON(dev, !i915_gem_object_is_framebuffer(obj)))
+ -		return ERR_PTR(-EINVAL);
+ +	intel_tile_dims(fb, color_plane, &tile_width, &tile_height);
+  
+ -	if (phys_cursor)
+ -		alignment = intel_cursor_alignment(dev_priv);
+ -	else
+ -		alignment = intel_surf_alignment(fb, 0);
+ -	if (drm_WARN_ON(dev, alignment && !is_power_of_2(alignment)))
+ -		return ERR_PTR(-EINVAL);
+ +	return fb->pitches[color_plane] * tile_height;
+ +}
+  
+ -	/* Note that the w/a also requires 64 PTE of padding following the
+ -	 * bo. We currently fill all unused PTE with the shadow page and so
+ -	 * we should always have valid PTE following the scanout preventing
+ -	 * the VT-d warning.
+ -	 */
+ -	if (intel_scanout_needs_vtd_wa(dev_priv) && alignment < 256 * 1024)
+ -		alignment = 256 * 1024;
+ +unsigned int
+ +intel_fb_align_height(const struct drm_framebuffer *fb,
+ +		      int color_plane, unsigned int height)
+ +{
+ +	unsigned int tile_height = intel_tile_height(fb, color_plane);
+  
+ -	/*
+ +	return ALIGN(height, tile_height);
+ +}
+ +
+ +unsigned int intel_rotation_info_size(const struct intel_rotation_info *rot_info)
+ +{
+ +	unsigned int size = 0;
+ +	int i;
+ +
+ +	for (i = 0 ; i < ARRAY_SIZE(rot_info->plane); i++)
+ +		size += rot_info->plane[i].width * rot_info->plane[i].height;
+ +
+ +	return size;
+ +}
+ +
+ +unsigned int intel_remapped_info_size(const struct intel_remapped_info *rem_info)
+ +{
+ +	unsigned int size = 0;
+ +	int i;
+ +
+ +	for (i = 0 ; i < ARRAY_SIZE(rem_info->plane); i++)
+ +		size += rem_info->plane[i].width * rem_info->plane[i].height;
+ +
+ +	return size;
+ +}
+ +
+++<<<<<<< HEAD
+ +static void
+ +intel_fill_fb_ggtt_view(struct i915_ggtt_view *view,
+ +			const struct drm_framebuffer *fb,
+ +			unsigned int rotation)
+ +{
+ +	view->type = I915_GGTT_VIEW_NORMAL;
+ +	if (drm_rotation_90_or_270(rotation)) {
+ +		view->type = I915_GGTT_VIEW_ROTATED;
+ +		view->rotated = to_intel_framebuffer(fb)->rot_info;
+ +	}
+ +}
+ +
+ +static unsigned int intel_cursor_alignment(const struct drm_i915_private *dev_priv)
+ +{
+ +	if (IS_I830(dev_priv))
+ +		return 16 * 1024;
+ +	else if (IS_I85X(dev_priv))
+ +		return 256;
+ +	else if (IS_I845G(dev_priv) || IS_I865G(dev_priv))
+ +		return 32;
+ +	else
+ +		return 4 * 1024;
+ +}
+ +
+ +static unsigned int intel_linear_alignment(const struct drm_i915_private *dev_priv)
+ +{
+ +	if (INTEL_GEN(dev_priv) >= 9)
+ +		return 256 * 1024;
+ +	else if (IS_I965G(dev_priv) || IS_I965GM(dev_priv) ||
+ +		 IS_VALLEYVIEW(dev_priv) || IS_CHERRYVIEW(dev_priv))
+ +		return 128 * 1024;
+ +	else if (INTEL_GEN(dev_priv) >= 4)
+ +		return 4 * 1024;
+ +	else
+ +		return 0;
+ +}
+ +
+ +static bool has_async_flips(struct drm_i915_private *i915)
+ +{
+ +	return INTEL_GEN(i915) >= 5;
+ +}
+ +
+ +unsigned int intel_surf_alignment(const struct drm_framebuffer *fb,
+ +				  int color_plane)
+ +{
+ +	struct drm_i915_private *dev_priv = to_i915(fb->dev);
+ +
+ +	/* AUX_DIST needs only 4K alignment */
+ +	if ((INTEL_GEN(dev_priv) < 12 && is_aux_plane(fb, color_plane)) ||
+ +	    is_ccs_plane(fb, color_plane))
+ +		return 4096;
+ +
+ +	switch (fb->modifier) {
+ +	case DRM_FORMAT_MOD_LINEAR:
+ +		return intel_linear_alignment(dev_priv);
+ +	case I915_FORMAT_MOD_X_TILED:
+ +		if (has_async_flips(dev_priv))
+ +			return 256 * 1024;
+ +		return 0;
+ +	case I915_FORMAT_MOD_Y_TILED_GEN12_MC_CCS:
+ +		if (is_semiplanar_uv_plane(fb, color_plane))
+ +			return intel_tile_row_size(fb, color_plane);
+ +		fallthrough;
+ +	case I915_FORMAT_MOD_Y_TILED_GEN12_RC_CCS:
+ +	case I915_FORMAT_MOD_Y_TILED_GEN12_RC_CCS_CC:
+ +		return 16 * 1024;
+ +	case I915_FORMAT_MOD_Y_TILED_CCS:
+ +	case I915_FORMAT_MOD_Yf_TILED_CCS:
+ +	case I915_FORMAT_MOD_Y_TILED:
+ +		if (INTEL_GEN(dev_priv) >= 12 &&
+ +		    is_semiplanar_uv_plane(fb, color_plane))
+ +			return intel_tile_row_size(fb, color_plane);
+ +		fallthrough;
+ +	case I915_FORMAT_MOD_Yf_TILED:
+ +		return 1 * 1024 * 1024;
+ +	default:
+ +		MISSING_CASE(fb->modifier);
+ +		return 0;
+ +	}
+ +}
+ +
+++=======
+++>>>>>>> 1c8d9adfc3ad (drm/i915/fb: move intel_surf_alignment() to intel_fb.c)
+ +static bool intel_plane_uses_fence(const struct intel_plane_state *plane_state)
+ +{
+ +	struct intel_plane *plane = to_intel_plane(plane_state->uapi.plane);
+ +	struct drm_i915_private *dev_priv = to_i915(plane->base.dev);
+ +
+ +	return INTEL_GEN(dev_priv) < 4 ||
+ +		(plane->has_fbc &&
+ +		 plane_state->view.type == I915_GGTT_VIEW_NORMAL);
+ +}
+ +
+ +struct i915_vma *
+ +intel_pin_and_fence_fb_obj(struct drm_framebuffer *fb,
+ +			   const struct i915_ggtt_view *view,
+ +			   bool uses_fence,
+ +			   unsigned long *out_flags)
+ +{
+ +	struct drm_device *dev = fb->dev;
+ +	struct drm_i915_private *dev_priv = to_i915(dev);
+ +	struct drm_i915_gem_object *obj = intel_fb_obj(fb);
+ +	intel_wakeref_t wakeref;
+ +	struct i915_vma *vma;
+ +	unsigned int pinctl;
+ +	u32 alignment;
+ +
+ +	if (drm_WARN_ON(dev, !i915_gem_object_is_framebuffer(obj)))
+ +		return ERR_PTR(-EINVAL);
+ +
+ +	alignment = intel_surf_alignment(fb, 0);
+ +	if (drm_WARN_ON(dev, alignment && !is_power_of_2(alignment)))
+ +		return ERR_PTR(-EINVAL);
+ +
+ +	/* Note that the w/a also requires 64 PTE of padding following the
+ +	 * bo. We currently fill all unused PTE with the shadow page and so
+ +	 * we should always have valid PTE following the scanout preventing
+ +	 * the VT-d warning.
+ +	 */
+ +	if (intel_scanout_needs_vtd_wa(dev_priv) && alignment < 256 * 1024)
+ +		alignment = 256 * 1024;
+ +
+ +	/*
+  	 * Global gtt pte registers are special registers which actually forward
+  	 * writes to a chunk of system memory. Which means that there is no risk
+  	 * that the register values disappear as soon as we call
+diff --cc drivers/gpu/drm/i915/display/intel_display.h
+index 76f8a805b0a3,4719ffc97fce..000000000000
+--- a/drivers/gpu/drm/i915/display/intel_display.h
++++ b/drivers/gpu/drm/i915/display/intel_display.h
+@@@ -653,12 -627,9 +653,18 @@@ void intel_plane_unpin_fb(struct intel_
+  struct intel_encoder *
+  intel_get_crtc_new_encoder(const struct intel_atomic_state *state,
+  			   const struct intel_crtc_state *crtc_state);
+++<<<<<<< HEAD
+ +unsigned int intel_surf_alignment(const struct drm_framebuffer *fb,
+ +				  int color_plane);
+ +u32 intel_plane_adjust_aligned_offset(int *x, int *y,
+ +				      const struct intel_plane_state *state,
+ +				      int color_plane,
+ +				      u32 old_offset, u32 new_offset);
+++=======
++ 
++ void intel_display_driver_register(struct drm_i915_private *i915);
++ void intel_display_driver_unregister(struct drm_i915_private *i915);
+++>>>>>>> 1c8d9adfc3ad (drm/i915/fb: move intel_surf_alignment() to intel_fb.c)
+  
+  /* modesetting */
+  void intel_modeset_init_hw(struct drm_i915_private *i915);
+* Unmerged path drivers/gpu/drm/i915/display/intel_fb.c
+* Unmerged path drivers/gpu/drm/i915/display/intel_fb.h
+* Unmerged path drivers/gpu/drm/i915/display/intel_display.c
+* Unmerged path drivers/gpu/drm/i915/display/intel_display.h
+* Unmerged path drivers/gpu/drm/i915/display/intel_fb.c
+* Unmerged path drivers/gpu/drm/i915/display/intel_fb.h
