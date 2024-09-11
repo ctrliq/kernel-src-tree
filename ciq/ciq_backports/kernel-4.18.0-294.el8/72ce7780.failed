@@ -1,0 +1,224 @@
+lib/vdso: Provide sanity check for cycles (again)
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Thomas Gleixner <tglx@linutronix.de>
+commit 72ce778007e57e8996b4bebdec738fc5e1145fd2
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/72ce7780.failed
+
+The original x86 VDSO implementation checked for the validity of the clock
+source read by testing whether the returned signed cycles value is less
+than zero. This check was also used by the vdso read function to signal
+that the current selected clocksource is not VDSO capable.
+
+During the rework of the VDSO code the check was removed and replaced with
+a check for the clocksource mode being != NONE.
+
+This turned out to be a mistake because the check is necessary for paravirt
+and hyperv clock sources. The reason is that these clock sources have their
+own internal sequence counter to validate the clocksource at the point of
+reading it. This is necessary because the hypervisor can invalidate the
+clocksource asynchronously so a check during the VDSO data update is not
+sufficient. Having a separate indicator for the validity is slower than
+just validating the cycles value. The check for it being negative turned
+out to be the fastest implementation and safe as it would require an uptime
+of ~73 years with a 4GHz counter frequency to result in a false positive.
+
+Add an optional function to validate the cycles with a default
+implementation which allows the compiler to optimize it out for
+architectures which do not require it.
+
+Fixes: 5d51bee725cc ("clocksource: Add common vdso clock mode storage")
+	Reported-by: Miklos Szeredi <miklos@szeredi.hu>
+	Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+	Tested-by: Miklos Szeredi <mszeredi@redhat.com>
+	Cc: stable@vger.kernel.org
+Link: https://lkml.kernel.org/r/20200606221531.963970768@linutronix.de
+
+(cherry picked from commit 72ce778007e57e8996b4bebdec738fc5e1145fd2)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	lib/vdso/gettimeofday.c
+diff --cc lib/vdso/gettimeofday.c
+index 632c43443888,3bb82a6cc5aa..000000000000
+--- a/lib/vdso/gettimeofday.c
++++ b/lib/vdso/gettimeofday.c
+@@@ -10,40 -5,146 +10,152 @@@
+  #include <vdso/datapage.h>
+  #include <vdso/helpers.h>
+  
+ -#ifndef vdso_calc_delta
+  /*
+ - * Default implementation which works for all sane clocksources. That
+ - * obviously excludes x86/TSC.
+ + * The generic vDSO implementation requires that gettimeofday.h
+ + * provides:
+ + * - __arch_get_vdso_data(): to get the vdso datapage.
+ + * - __arch_get_hw_counter(): to get the hw counter based on the
+ + *   clock_mode.
+ + * - gettimeofday_fallback(): fallback for gettimeofday.
+ + * - clock_gettime_fallback(): fallback for clock_gettime.
+ + * - clock_getres_fallback(): fallback for clock_getres.
+   */
+++<<<<<<< HEAD
+ +#ifdef ENABLE_COMPAT_VDSO
+ +#include <asm/vdso/compat_gettimeofday.h>
+++=======
++ static __always_inline
++ u64 vdso_calc_delta(u64 cycles, u64 last, u64 mask, u32 mult)
++ {
++ 	return ((cycles - last) & mask) * mult;
++ }
++ #endif
++ 
++ #ifndef vdso_shift_ns
++ static __always_inline u64 vdso_shift_ns(u64 ns, u32 shift)
++ {
++ 	return ns >> shift;
++ }
++ #endif
++ 
++ #ifndef __arch_vdso_hres_capable
++ static inline bool __arch_vdso_hres_capable(void)
++ {
++ 	return true;
++ }
++ #endif
++ 
++ #ifndef vdso_clocksource_ok
++ static inline bool vdso_clocksource_ok(const struct vdso_data *vd)
++ {
++ 	return vd->clock_mode != VDSO_CLOCKMODE_NONE;
++ }
++ #endif
++ 
++ #ifndef vdso_cycles_ok
++ static inline bool vdso_cycles_ok(u64 cycles)
++ {
++ 	return true;
++ }
++ #endif
++ 
++ #ifdef CONFIG_TIME_NS
++ static int do_hres_timens(const struct vdso_data *vdns, clockid_t clk,
++ 			  struct __kernel_timespec *ts)
++ {
++ 	const struct vdso_data *vd = __arch_get_timens_vdso_data();
++ 	const struct timens_offset *offs = &vdns->offset[clk];
++ 	const struct vdso_timestamp *vdso_ts;
++ 	u64 cycles, last, ns;
++ 	u32 seq;
++ 	s64 sec;
++ 
++ 	if (clk != CLOCK_MONOTONIC_RAW)
++ 		vd = &vd[CS_HRES_COARSE];
++ 	else
++ 		vd = &vd[CS_RAW];
++ 	vdso_ts = &vd->basetime[clk];
++ 
++ 	do {
++ 		seq = vdso_read_begin(vd);
++ 
++ 		if (unlikely(!vdso_clocksource_ok(vd)))
++ 			return -1;
++ 
++ 		cycles = __arch_get_hw_counter(vd->clock_mode);
++ 		if (unlikely(!vdso_cycles_ok(cycles)))
++ 			return -1;
++ 		ns = vdso_ts->nsec;
++ 		last = vd->cycle_last;
++ 		ns += vdso_calc_delta(cycles, last, vd->mask, vd->mult);
++ 		ns = vdso_shift_ns(ns, vd->shift);
++ 		sec = vdso_ts->sec;
++ 	} while (unlikely(vdso_read_retry(vd, seq)));
++ 
++ 	/* Add the namespace offset */
++ 	sec += offs->sec;
++ 	ns += offs->nsec;
++ 
++ 	/*
++ 	 * Do this outside the loop: a race inside the loop could result
++ 	 * in __iter_div_u64_rem() being extremely slow.
++ 	 */
++ 	ts->tv_sec = sec + __iter_div_u64_rem(ns, NSEC_PER_SEC, &ns);
++ 	ts->tv_nsec = ns;
++ 
++ 	return 0;
++ }
+++>>>>>>> 72ce778007e5 (lib/vdso: Provide sanity check for cycles (again))
+  #else
+ -static __always_inline const struct vdso_data *__arch_get_timens_vdso_data(void)
+ -{
+ -	return NULL;
+ -}
+ -
+ -static int do_hres_timens(const struct vdso_data *vdns, clockid_t clk,
+ -			  struct __kernel_timespec *ts)
+ -{
+ -	return -EINVAL;
+ -}
+ -#endif
+ +#include <asm/vdso/gettimeofday.h>
+ +#endif /* ENABLE_COMPAT_VDSO */
+  
+ -static __always_inline int do_hres(const struct vdso_data *vd, clockid_t clk,
+ -				   struct __kernel_timespec *ts)
+ +static int do_hres(const struct vdso_data *vd, clockid_t clk,
+ +		   struct __kernel_timespec *ts)
+  {
+  	const struct vdso_timestamp *vdso_ts = &vd->basetime[clk];
+  	u64 cycles, last, sec, ns;
+  	u32 seq;
+  
+ -	/* Allows to compile the high resolution parts out */
+ -	if (!__arch_vdso_hres_capable())
+ -		return -1;
+ -
+  	do {
+++<<<<<<< HEAD
+ +		seq = vdso_read_begin(vd);
+ +		cycles = __arch_get_hw_counter(vd->clock_mode) &
+ +			vd->mask;
+++=======
++ 		/*
++ 		 * Open coded to handle VDSO_CLOCKMODE_TIMENS. Time namespace
++ 		 * enabled tasks have a special VVAR page installed which
++ 		 * has vd->seq set to 1 and vd->clock_mode set to
++ 		 * VDSO_CLOCKMODE_TIMENS. For non time namespace affected tasks
++ 		 * this does not affect performance because if vd->seq is
++ 		 * odd, i.e. a concurrent update is in progress the extra
++ 		 * check for vd->clock_mode is just a few extra
++ 		 * instructions while spin waiting for vd->seq to become
++ 		 * even again.
++ 		 */
++ 		while (unlikely((seq = READ_ONCE(vd->seq)) & 1)) {
++ 			if (IS_ENABLED(CONFIG_TIME_NS) &&
++ 			    vd->clock_mode == VDSO_CLOCKMODE_TIMENS)
++ 				return do_hres_timens(vd, clk, ts);
++ 			cpu_relax();
++ 		}
++ 		smp_rmb();
++ 
++ 		if (unlikely(!vdso_clocksource_ok(vd)))
++ 			return -1;
++ 
++ 		cycles = __arch_get_hw_counter(vd->clock_mode);
++ 		if (unlikely(!vdso_cycles_ok(cycles)))
++ 			return -1;
+++>>>>>>> 72ce778007e5 (lib/vdso: Provide sanity check for cycles (again))
+  		ns = vdso_ts->nsec;
+  		last = vd->cycle_last;
+ -		ns += vdso_calc_delta(cycles, last, vd->mask, vd->mult);
+ -		ns = vdso_shift_ns(ns, vd->shift);
+ +		if (unlikely((s64)cycles < 0))
+ +			return clock_gettime_fallback(clk, ts);
+ +		if (cycles > last)
+ +			ns += (cycles - last) * vd->mult;
+ +		ns >>= vd->shift;
+  		sec = vdso_ts->sec;
+  	} while (unlikely(vdso_read_retry(vd, seq)));
+  
+* Unmerged path lib/vdso/gettimeofday.c
