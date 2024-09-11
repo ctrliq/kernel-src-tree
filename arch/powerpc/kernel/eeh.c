@@ -1848,6 +1848,7 @@ static int __init eeh_init_proc(void)
 		debugfs_create_file_unsafe("eeh_dev_break", 0600,
 				powerpc_debugfs_root, NULL,
 				&eeh_dev_break_fops);
+		eeh_cache_debugfs_init();
 #endif
 	}
 

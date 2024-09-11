@@ -272,7 +272,8 @@ static void setup_queues(struct qdio_irq *irq_ptr,
 		setup_storage_lists(q, irq_ptr,
 				    qdio_init->output_sbal_addr_array[i], i);
 
-		tasklet_setup(&q->u.out.tasklet, qdio_outbound_tasklet);
+		tasklet_init(&q->u.out.tasklet, qdio_outbound_tasklet,
+			     (unsigned long) q);
 		timer_setup(&q->u.out.timer, qdio_outbound_timer, 0);
 	}
 }

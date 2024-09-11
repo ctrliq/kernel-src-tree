@@ -365,7 +365,7 @@ static void process_cmsg(struct msghdr *msgh)
 	struct cmsghdr *cmsg;
 
 	for (cmsg = CMSG_FIRSTHDR(msgh); cmsg ; cmsg = CMSG_NXTHDR(msgh, cmsg)) {
-		if (cmsg->cmsg_level == SOL_SOCKET && cmsg->cmsg_type == SO_TIMESTAMPNS_NEW) {
+		if (cmsg->cmsg_level == SOL_SOCKET && cmsg->cmsg_type == SO_TIMESTAMPNS) {
 			memcpy(&ts, CMSG_DATA(cmsg), sizeof(ts));
 			ts_found = true;
 			continue;
@@ -876,7 +876,7 @@ static void apply_cmsg_types(int fd, const struct cfg_cmsg_types *cmsg)
 	static const unsigned int on = 1;
 
 	if (cmsg->timestampns)
-		xsetsockopt(fd, SOL_SOCKET, SO_TIMESTAMPNS_NEW, &on, sizeof(on));
+		xsetsockopt(fd, SOL_SOCKET, SO_TIMESTAMPNS, &on, sizeof(on));
 }
 
 static void parse_cmsg_types(const char *type)

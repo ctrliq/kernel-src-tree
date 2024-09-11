@@ -187,8 +187,13 @@ struct blk_mq_queue_data {
 typedef blk_status_t (queue_rq_fn)(struct blk_mq_hw_ctx *,
 		const struct blk_mq_queue_data *);
 typedef void (commit_rqs_fn)(struct blk_mq_hw_ctx *);
+#ifndef __GENKSYMS__
+typedef int (get_budget_fn)(struct request_queue *);
+typedef void (put_budget_fn)(struct request_queue *, int);
+#else
 typedef bool (get_budget_fn)(struct blk_mq_hw_ctx *);
 typedef void (put_budget_fn)(struct blk_mq_hw_ctx *);
+#endif
 typedef enum blk_eh_timer_return (timeout_fn)(struct request *, bool);
 typedef int (init_hctx_fn)(struct blk_mq_hw_ctx *, void *, unsigned int);
 typedef void (exit_hctx_fn)(struct blk_mq_hw_ctx *, unsigned int);
@@ -286,8 +291,16 @@ struct blk_mq_ops {
 	 */
 	RH_KABI_USE(1, cleanup_rq_fn           *cleanup_rq)
 
-	RH_KABI_RESERVE(2)
-	RH_KABI_RESERVE(3)
+	/*
+	 * Store rq's budget token
+	 */
+	RH_KABI_USE(2, void (*set_rq_budget_token)(struct request *, int))
+
+	/*
+	 * Retrieve rq's budget token
+	 */
+	RH_KABI_USE(3, int (*get_rq_budget_token)(struct request *))
+
 	RH_KABI_RESERVE(4)
 	RH_KABI_RESERVE(5)
 	RH_KABI_RESERVE(6)

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 /*
  * Copyright 2002 Andi Kleen, SuSE Labs.
  * Thanks to Ben LaHaise for precious feedback.
@@ -23,7 +24,7 @@
 #include <linux/uaccess.h>
 #include <asm/pgalloc.h>
 #include <asm/proto.h>
-#include <asm/pat.h>
+#include <asm/memtype.h>
 #include <asm/set_memory.h>
 
 #include "../mm_internal.h"

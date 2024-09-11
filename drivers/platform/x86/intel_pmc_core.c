@@ -121,6 +121,10 @@ static const struct pmc_bit_map spt_pfear_map[] = {
 };
 
 static const struct pmc_bit_map *ext_spt_pfear_map[] = {
+	/*
+	 * Check intel_pmc_core_ids[] users of spt_reg_map for
+	 * a list of core SoCs using this.
+	 */
 	spt_pfear_map,
 	NULL
 };
@@ -170,7 +174,6 @@ static const struct pmc_reg_map spt_reg_map = {
 
 /* Cannon Lake: PGD PFET Enable Ack Status Register(s) bitmap */
 static const struct pmc_bit_map cnp_pfear_map[] = {
-	/* Reserved for Cannon Lake but valid for Comet Lake */
 	{"PMC",                 BIT(0)},
 	{"OPI-DMI",             BIT(1)},
 	{"SPI/eSPI",            BIT(2)},
@@ -196,10 +199,6 @@ static const struct pmc_bit_map cnp_pfear_map[] = {
 	{"SDX",                 BIT(4)},
 	{"SPE",                 BIT(5)},
 	{"Fuse",                BIT(6)},
-	/*
-	 * Reserved for Cannon Lake but valid for Ice Lake, Comet Lake
-	 * and Tiger Lake.
-	 */
 	{"SBR8",		BIT(7)},
 
 	{"CSME_FSC",            BIT(0)},
@@ -243,10 +242,6 @@ static const struct pmc_bit_map cnp_pfear_map[] = {
 	{"HDA_PGD4",            BIT(2)},
 	{"HDA_PGD5",            BIT(3)},
 	{"HDA_PGD6",            BIT(4)},
-	/*
-	 * Reserved for Cannon Lake but valid for Ice Lake, Comet Lake
-	 * and Tiger Lake.
-	 */
 	{"PSF6",		BIT(5)},
 	{"PSF7",		BIT(6)},
 	{"PSF8",		BIT(7)},
@@ -254,12 +249,15 @@ static const struct pmc_bit_map cnp_pfear_map[] = {
 };
 
 static const struct pmc_bit_map *ext_cnp_pfear_map[] = {
+	/*
+	 * Check intel_pmc_core_ids[] users of cnp_reg_map for
+	 * a list of core SoCs using this.
+	 */
 	cnp_pfear_map,
 	NULL
 };
 
 static const struct pmc_bit_map icl_pfear_map[] = {
-	/* Ice Lake generation onwards only */
 	{"RES_65",		BIT(0)},
 	{"RES_66",		BIT(1)},
 	{"RES_67",		BIT(2)},
@@ -272,13 +270,16 @@ static const struct pmc_bit_map icl_pfear_map[] = {
 };
 
 static const struct pmc_bit_map *ext_icl_pfear_map[] = {
+	/*
+	 * Check intel_pmc_core_ids[] users of icl_reg_map for
+	 * a list of core SoCs using this.
+	 */
 	cnp_pfear_map,
 	icl_pfear_map,
 	NULL
 };
 
 static const struct pmc_bit_map tgl_pfear_map[] = {
-	/* Tiger Lake generation onwards only */
 	{"PSF9",		BIT(0)},
 	{"RES_66",		BIT(1)},
 	{"RES_67",		BIT(2)},
@@ -290,6 +291,10 @@ static const struct pmc_bit_map tgl_pfear_map[] = {
 };
 
 static const struct pmc_bit_map *ext_tgl_pfear_map[] = {
+	/*
+	 * Check intel_pmc_core_ids[] users of tgl_reg_map for
+	 * a list of core SoCs using this.
+	 */
 	cnp_pfear_map,
 	tgl_pfear_map,
 	NULL
@@ -373,7 +378,10 @@ static const struct pmc_bit_map cnp_ltr_show_map[] = {
 	{"ISH",			CNP_PMC_LTR_ISH},
 	{"UFSX2",		CNP_PMC_LTR_UFSX2},
 	{"EMMC",		CNP_PMC_LTR_EMMC},
-	/* Reserved for Cannon Lake but valid for Ice Lake */
+	/*
+	 * Check intel_pmc_core_ids[] users of cnp_reg_map for
+	 * a list of core SoCs using this.
+	 */
 	{"WIGIG",		ICL_PMC_LTR_WIGIG},
 	{"THC0",                TGL_PMC_LTR_THC0},
 	{"THC1",                TGL_PMC_LTR_THC1},
@@ -1562,6 +1570,8 @@ static const struct x86_cpu_id intel_pmc_core_ids[] = {
 	X86_MATCH_INTEL_FAM6_MODEL(COMETLAKE_L,		&cnp_reg_map),
 	X86_MATCH_INTEL_FAM6_MODEL(TIGERLAKE_L,		&tgl_reg_map),
 	X86_MATCH_INTEL_FAM6_MODEL(TIGERLAKE,		&tgl_reg_map),
+	X86_MATCH_INTEL_FAM6_MODEL(ATOM_TREMONT,	&tgl_reg_map),
+	X86_MATCH_INTEL_FAM6_MODEL(ATOM_TREMONT_L,	&icl_reg_map),
 	X86_MATCH_INTEL_FAM6_MODEL(ROCKETLAKE,		&tgl_reg_map),
 	X86_MATCH_INTEL_FAM6_MODEL(ALDERLAKE_L,		&tgl_reg_map),
 	{}

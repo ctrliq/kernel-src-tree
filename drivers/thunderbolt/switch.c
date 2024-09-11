@@ -1387,6 +1387,30 @@ static ssize_t authorized_show(struct device *dev,
 	return sprintf(buf, "%u\n", sw->authorized);
 }
 
+static int disapprove_switch(struct device *dev, void *not_used)
+{
+	struct tb_switch *sw;
+
+	sw = tb_to_switch(dev);
+	if (sw && sw->authorized) {
+		int ret;
+
+		/* First children */
+		ret = device_for_each_child_reverse(&sw->dev, NULL, disapprove_switch);
+		if (ret)
+			return ret;
+
+		ret = tb_domain_disapprove_switch(sw->tb, sw);
+		if (ret)
+			return ret;
+
+		sw->authorized = 0;
+		kobject_uevent(&sw->dev.kobj, KOBJ_CHANGE);
+	}
+
+	return 0;
+}
+
 static int tb_switch_set_authorized(struct tb_switch *sw, unsigned int val)
 {
 	int ret = -EINVAL;
@@ -1394,10 +1418,18 @@ static int tb_switch_set_authorized(struct tb_switch *sw, unsigned int val)
 	if (!mutex_trylock(&sw->tb->lock))
 		return restart_syscall();
 
-	if (sw->authorized)
+	if (!!sw->authorized == !!val)
 		goto unlock;
 
 	switch (val) {
+	/* Disapprove switch */
+	case 0:
+		if (tb_route(sw)) {
+			ret = disapprove_switch(&sw->dev, NULL);
+			goto unlock;
+		}
+		break;
+
 	/* Approve switch */
 	case 1:
 		if (sw->key)
@@ -1736,7 +1768,11 @@ static umode_t switch_attr_is_visible(struct kobject *kobj,
 	struct device *dev = kobj_to_dev(kobj);
 	struct tb_switch *sw = tb_to_switch(dev);
 
-	if (attr == &dev_attr_device.attr) {
+	if (attr == &dev_attr_authorized.attr) {
+		if (sw->tb->security_level == TB_SECURITY_NOPCIE ||
+		    sw->tb->security_level == TB_SECURITY_DPONLY)
+			return 0;
+	} else if (attr == &dev_attr_device.attr) {
 		if (!sw->device)
 			return 0;
 	} else if (attr == &dev_attr_device_name.attr) {

@@ -265,9 +265,10 @@ prepare_to_wait(struct wait_queue_head *wq_head, struct wait_queue_entry *wq_ent
 }
 EXPORT_SYMBOL(prepare_to_wait);
 
+/* This API is RH only */
 /* Returns true if we are the first waiter in the queue, false otherwise. */
 bool
-prepare_to_wait_exclusive(struct wait_queue_head *wq_head, struct wait_queue_entry *wq_entry, int state)
+prepare_to_wait_exclusive_return(struct wait_queue_head *wq_head, struct wait_queue_entry *wq_entry, int state)
 {
 	unsigned long flags;
 	bool was_empty = false;
@@ -281,6 +282,13 @@ prepare_to_wait_exclusive(struct wait_queue_head *wq_head, struct wait_queue_ent
 	set_current_state(state);
 	spin_unlock_irqrestore(&wq_head->lock, flags);
 	return was_empty;
+}
+EXPORT_SYMBOL(prepare_to_wait_exclusive_return);
+
+void
+prepare_to_wait_exclusive(struct wait_queue_head *wq_head, struct wait_queue_entry *wq_entry, int state)
+{
+	prepare_to_wait_exclusive_return(wq_head, wq_entry, state);
 }
 EXPORT_SYMBOL(prepare_to_wait_exclusive);
 

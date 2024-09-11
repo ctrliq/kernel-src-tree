@@ -510,12 +510,6 @@ struct zone {
 #endif
 	struct pglist_data	*zone_pgdat;
 	struct per_cpu_pageset __percpu *pageset;
-	/*
-	 * the high and batch values are copied to individual pagesets for
-	 * faster access
-	 */
-	int pageset_high;
-	int pageset_batch;
 
 #ifndef CONFIG_SPARSEMEM
 	/*
@@ -588,6 +582,14 @@ struct zone {
 	int initialized;
 
 	RH_KABI_FILL_HOLE(unsigned long watermark_boost)
+
+	/*
+	 * the high and batch values are copied to individual pagesets for
+	 * faster access.
+	 * Utilizes a hole in the KABI between watermark_boost and zone padding
+	 */
+	RH_KABI_FILL_HOLE(int pageset_high)
+	RH_KABI_FILL_HOLE(int pageset_batch)
 
 	/* Write-intensive fields used from the page allocator */
 	ZONE_PADDING(_pad1_)
@@ -859,6 +861,7 @@ typedef struct pglist_data {
 	 * is the first PFN that needs to be initialised.
 	 */
 	unsigned long first_deferred_pfn;
+	RH_KABI_DEPRECATE(unsigned long, static_init_pgcnt)
 #endif /* CONFIG_DEFERRED_STRUCT_PAGE_INIT */
 
 #ifdef CONFIG_TRANSPARENT_HUGEPAGE

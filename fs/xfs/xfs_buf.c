@@ -223,9 +223,7 @@ _xfs_buf_alloc(
 	int			i;
 
 	*bpp = NULL;
-	bp = kmem_zone_zalloc(xfs_buf_zone, KM_NOFS);
-	if (unlikely(!bp))
-		return -ENOMEM;
+	bp = kmem_cache_zalloc(xfs_buf_zone, GFP_NOFS | __GFP_NOFAIL);
 
 	/*
 	 * We don't want certain flags to appear in b_flags unless they are
@@ -489,7 +487,7 @@ _xfs_buf_map_pages(
 		nofs_flag = memalloc_nofs_save();
 		do {
 			bp->b_addr = vm_map_ram(bp->b_pages, bp->b_page_count,
-						-1, PAGE_KERNEL);
+						-1);
 			if (bp->b_addr)
 				break;
 			vm_unmap_aliases();
@@ -1847,6 +1845,7 @@ xfs_buftarg_drain(
 {
 	LIST_HEAD(dispose);
 	int			loop = 0;
+	bool			write_fail = false;
 
 	xfs_buftarg_wait(btp);
 
@@ -1860,16 +1859,28 @@ xfs_buftarg_drain(
 			bp = list_first_entry(&dispose, struct xfs_buf, b_lru);
 			list_del_init(&bp->b_lru);
 			if (bp->b_flags & XBF_WRITE_FAIL) {
-				xfs_alert(btp->bt_mount,
+				write_fail = true;
+				xfs_buf_alert_ratelimited(bp,
+					"XFS: Corruption Alert",
 "Corruption Alert: Buffer at daddr 0x%llx had permanent write failures!",
 					(long long)bp->b_bn);
-				xfs_alert(btp->bt_mount,
-"Please run xfs_repair to determine the extent of the problem.");
 			}
 			xfs_buf_rele(bp);
 		}
 		if (loop++ != 0)
 			delay(100);
+	}
+
+	/*
+	 * If one or more failed buffers were freed, that means dirty metadata
+	 * was thrown away. This should only ever happen after I/O completion
+	 * handling has elevated I/O error(s) to permanent failures and shuts
+	 * down the fs.
+	 */
+	if (write_fail) {
+		ASSERT(XFS_FORCED_SHUTDOWN(btp->bt_mount));
+		xfs_alert(btp->bt_mount,
+	      "Please run xfs_repair to determine the extent of the problem.");
 	}
 }
 

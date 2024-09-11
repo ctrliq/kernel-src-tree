@@ -438,33 +438,31 @@ struct ethtool_link_usettings {
 int __ethtool_get_link_ksettings(struct net_device *dev,
 				 struct ethtool_link_ksettings *link_ksettings)
 {
-	int err;
-	struct ethtool_cmd cmd;
-
 	ASSERT_RTNL();
 
-	if (__rh_has_get_link_ksettings(dev)) {
-		memset(link_ksettings, 0, sizeof(*link_ksettings));
-		return __rh_call_get_link_ksettings(dev, link_ksettings);
+	if (!__rh_has_get_link_ksettings(dev)) {
+		struct ethtool_cmd cmd;
+		int err;
+
+		/* driver doesn't support %ethtool_link_ksettings API. revert to
+		 * legacy %ethtool_cmd API, unless it's not supported either.
+		 */
+		if (!dev->ethtool_ops->get_settings)
+			return -EOPNOTSUPP;
+
+		memset(&cmd, 0, sizeof(cmd));
+		cmd.cmd = ETHTOOL_GSET;
+		err = dev->ethtool_ops->get_settings(dev, &cmd);
+		if (err < 0)
+			return err;
+
+		/* we ignore deprecated fields transceiver/maxrxpkt/maxtxpkt */
+		convert_legacy_settings_to_link_ksettings(link_ksettings, &cmd);
+		return err;
 	}
 
-	/* driver doesn't support %ethtool_link_ksettings API. revert to
-	 * legacy %ethtool_cmd API, unless it's not supported either.
-	 * TODO: remove when ethtool_ops::get_settings disappears internally
-	 */
-	if (!dev->ethtool_ops->get_settings)
-		return -EOPNOTSUPP;
-
-	memset(&cmd, 0, sizeof(cmd));
-	cmd.cmd = ETHTOOL_GSET;
-	err = dev->ethtool_ops->get_settings(dev, &cmd);
-	if (err < 0)
-		return err;
-
-	/* we ignore deprecated fields transceiver/maxrxpkt/maxtxpkt
-	 */
-	convert_legacy_settings_to_link_ksettings(link_ksettings, &cmd);
-	return err;
+	memset(link_ksettings, 0, sizeof(*link_ksettings));
+	return __rh_call_get_link_ksettings(dev, link_ksettings);
 }
 EXPORT_SYMBOL(__ethtool_get_link_ksettings);
 
@@ -2567,14 +2565,15 @@ static int ethtool_phy_tunable_valid(const struct ethtool_tunable *tuna)
 
 static int get_phy_tunable(struct net_device *dev, void __user *useraddr)
 {
-	int ret;
-	struct ethtool_tunable tuna;
 	struct phy_device *phydev = dev->phydev;
+	struct ethtool_tunable tuna;
+	bool phy_drv_tunable;
 	void *data;
+	int ret;
 
-	if (!(phydev && phydev->drv && phydev->drv->get_tunable))
+	phy_drv_tunable = phydev && phydev->drv && phydev->drv->get_tunable;
+	if (!phy_drv_tunable && !dev->ethtool_ops->get_phy_tunable)
 		return -EOPNOTSUPP;
-
 	if (copy_from_user(&tuna, useraddr, sizeof(tuna)))
 		return -EFAULT;
 	ret = ethtool_phy_tunable_valid(&tuna);
@@ -2583,9 +2582,13 @@ static int get_phy_tunable(struct net_device *dev, void __user *useraddr)
 	data = kmalloc(tuna.len, GFP_USER);
 	if (!data)
 		return -ENOMEM;
-	mutex_lock(&phydev->lock);
-	ret = phydev->drv->get_tunable(phydev, &tuna, data);
-	mutex_unlock(&phydev->lock);
+	if (phy_drv_tunable) {
+		mutex_lock(&phydev->lock);
+		ret = phydev->drv->get_tunable(phydev, &tuna, data);
+		mutex_unlock(&phydev->lock);
+	} else {
+		ret = dev->ethtool_ops->get_phy_tunable(dev, &tuna, data);
+	}
 	if (ret)
 		goto out;
 	useraddr += sizeof(tuna);
@@ -2601,12 +2604,14 @@ out:
 
 static int set_phy_tunable(struct net_device *dev, void __user *useraddr)
 {
-	int ret;
-	struct ethtool_tunable tuna;
 	struct phy_device *phydev = dev->phydev;
+	struct ethtool_tunable tuna;
+	bool phy_drv_tunable;
 	void *data;
+	int ret;
 
-	if (!(phydev && phydev->drv && phydev->drv->set_tunable))
+	phy_drv_tunable = phydev && phydev->drv && phydev->drv->get_tunable;
+	if (!phy_drv_tunable && !dev->ethtool_ops->set_phy_tunable)
 		return -EOPNOTSUPP;
 	if (copy_from_user(&tuna, useraddr, sizeof(tuna)))
 		return -EFAULT;
@@ -2617,9 +2622,13 @@ static int set_phy_tunable(struct net_device *dev, void __user *useraddr)
 	data = memdup_user(useraddr, tuna.len);
 	if (IS_ERR(data))
 		return PTR_ERR(data);
-	mutex_lock(&phydev->lock);
-	ret = phydev->drv->set_tunable(phydev, &tuna, data);
-	mutex_unlock(&phydev->lock);
+	if (phy_drv_tunable) {
+		mutex_lock(&phydev->lock);
+		ret = phydev->drv->set_tunable(phydev, &tuna, data);
+		mutex_unlock(&phydev->lock);
+	} else {
+		ret = dev->ethtool_ops->set_phy_tunable(dev, &tuna, data);
+	}
 
 	kfree(data);
 	return ret;

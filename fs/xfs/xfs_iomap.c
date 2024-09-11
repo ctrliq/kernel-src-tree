@@ -293,11 +293,11 @@ out_trans_cancel:
 
 STATIC bool
 xfs_quota_need_throttle(
-	struct xfs_inode *ip,
-	int type,
-	xfs_fsblock_t alloc_blocks)
+	struct xfs_inode	*ip,
+	xfs_dqtype_t		type,
+	xfs_fsblock_t		alloc_blocks)
 {
-	struct xfs_dquot *dq = xfs_inode_dquot(ip, type);
+	struct xfs_dquot	*dq = xfs_inode_dquot(ip, type);
 
 	if (!dq || !xfs_this_quota_on(ip->i_mount, type))
 		return false;
@@ -315,15 +315,15 @@ xfs_quota_need_throttle(
 
 STATIC void
 xfs_quota_calc_throttle(
-	struct xfs_inode *ip,
-	int type,
-	xfs_fsblock_t *qblocks,
-	int *qshift,
-	int64_t	*qfreesp)
+	struct xfs_inode	*ip,
+	xfs_dqtype_t		type,
+	xfs_fsblock_t		*qblocks,
+	int			*qshift,
+	int64_t			*qfreesp)
 {
-	int64_t freesp;
-	int shift = 0;
-	struct xfs_dquot *dq = xfs_inode_dquot(ip, type);
+	struct xfs_dquot	*dq = xfs_inode_dquot(ip, type);
+	int64_t			freesp;
+	int			shift = 0;
 
 	/* no dq, or over hi wmark, squash the prealloc completely */
 	if (!dq || dq->q_blk.reserved >= dq->q_prealloc_hi_wmark) {
@@ -882,7 +882,7 @@ xfs_buffered_write_iomap_begin(
 
 	xfs_ilock(ip, XFS_ILOCK_EXCL);
 
-	if (XFS_IS_CORRUPT(mp, !xfs_ifork_has_extents(ip, XFS_DATA_FORK)) ||
+	if (XFS_IS_CORRUPT(mp, !xfs_ifork_has_extents(&ip->i_df)) ||
 	    XFS_TEST_ERROR(false, mp, XFS_ERRTAG_BMAPIFORMAT)) {
 		error = -EFSCORRUPTED;
 		goto out_unlock;
@@ -1291,12 +1291,12 @@ xfs_xattr_iomap_begin(
 	lockmode = xfs_ilock_attr_map_shared(ip);
 
 	/* if there are no attribute fork or extents, return ENOENT */
-	if (!XFS_IFORK_Q(ip) || !ip->i_d.di_anextents) {
+	if (!XFS_IFORK_Q(ip) || !ip->i_afp->if_nextents) {
 		error = -ENOENT;
 		goto out_unlock;
 	}
 
-	ASSERT(ip->i_d.di_aformat != XFS_DINODE_FMT_LOCAL);
+	ASSERT(ip->i_afp->if_format != XFS_DINODE_FMT_LOCAL);
 	error = xfs_bmapi_read(ip, offset_fsb, end_fsb - offset_fsb, &imap,
 			       &nimaps, XFS_BMAPI_ATTRFORK);
 out_unlock:

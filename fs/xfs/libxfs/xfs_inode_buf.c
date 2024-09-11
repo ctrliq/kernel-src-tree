@@ -157,13 +157,28 @@ xfs_imap_to_bp(
 	return 0;
 }
 
+static inline struct timespec64 xfs_inode_decode_bigtime(uint64_t ts)
+{
+	struct timespec64	tv;
+	uint32_t		n;
+
+	tv.tv_sec = xfs_bigtime_to_unix(div_u64_rem(ts, NSEC_PER_SEC, &n));
+	tv.tv_nsec = n;
+
+	return tv;
+}
+
 /* Convert an ondisk timestamp to an incore timestamp. */
 struct timespec64
 xfs_inode_from_disk_ts(
+	struct xfs_dinode		*dip,
 	const xfs_timestamp_t		ts)
 {
 	struct timespec64		tv;
 	struct xfs_legacy_timestamp	*lts;
+
+	if (xfs_dinode_has_bigtime(dip))
+		return xfs_inode_decode_bigtime(be64_to_cpu(ts));
 
 	lts = (struct xfs_legacy_timestamp *)&ts;
 	tv.tv_sec = (int)be32_to_cpu(lts->t_sec);
@@ -217,7 +232,6 @@ xfs_inode_from_disk(
 					be16_to_cpu(from->di_projid_lo);
 	}
 
-	to->di_format = from->di_format;
 	i_uid_write(inode, be32_to_cpu(from->di_uid));
 	i_gid_write(inode, be32_to_cpu(from->di_gid));
 
@@ -227,17 +241,14 @@ xfs_inode_from_disk(
 	 * a time before epoch is converted to a time long after epoch
 	 * on 64 bit systems.
 	 */
-	inode->i_atime = xfs_inode_from_disk_ts(from->di_atime);
-	inode->i_mtime = xfs_inode_from_disk_ts(from->di_mtime);
-	inode->i_ctime = xfs_inode_from_disk_ts(from->di_ctime);
+	inode->i_atime = xfs_inode_from_disk_ts(from, from->di_atime);
+	inode->i_mtime = xfs_inode_from_disk_ts(from, from->di_mtime);
+	inode->i_ctime = xfs_inode_from_disk_ts(from, from->di_ctime);
 
 	to->di_size = be64_to_cpu(from->di_size);
 	to->di_nblocks = be64_to_cpu(from->di_nblocks);
 	to->di_extsize = be32_to_cpu(from->di_extsize);
-	to->di_nextents = be32_to_cpu(from->di_nextents);
-	to->di_anextents = be16_to_cpu(from->di_anextents);
 	to->di_forkoff = from->di_forkoff;
-	to->di_aformat	= from->di_aformat;
 	to->di_dmevmask	= be32_to_cpu(from->di_dmevmask);
 	to->di_dmstate	= be16_to_cpu(from->di_dmstate);
 	to->di_flags	= be16_to_cpu(from->di_flags);
@@ -245,7 +256,7 @@ xfs_inode_from_disk(
 	if (xfs_sb_version_has_v3inode(&ip->i_mount->m_sb)) {
 		inode_set_iversion_queried(inode,
 					   be64_to_cpu(from->di_changecount));
-		to->di_crtime = xfs_inode_from_disk_ts(from->di_crtime);
+		to->di_crtime = xfs_inode_from_disk_ts(from, from->di_crtime);
 		to->di_flags2 = be64_to_cpu(from->di_flags2);
 		to->di_cowextsize = be32_to_cpu(from->di_cowextsize);
 	}
@@ -263,17 +274,21 @@ xfs_inode_from_disk(
 	return 0;
 
 out_destroy_data_fork:
-	xfs_idestroy_fork(ip, XFS_DATA_FORK);
+	xfs_idestroy_fork(&ip->i_df);
 	return error;
 }
 
 /* Convert an incore timestamp to an ondisk timestamp. */
 static inline xfs_timestamp_t
 xfs_inode_to_disk_ts(
+	struct xfs_inode		*ip,
 	const struct timespec64		tv)
 {
 	struct xfs_legacy_timestamp	*lts;
 	xfs_timestamp_t			ts;
+
+	if (xfs_inode_has_bigtime(ip))
+		return cpu_to_be64(xfs_inode_encode_bigtime(tv));
 
 	lts = (struct xfs_legacy_timestamp *)&ts;
 	lts->t_sec = cpu_to_be32(tv.tv_sec);
@@ -294,16 +309,16 @@ xfs_inode_to_disk(
 	to->di_magic = cpu_to_be16(XFS_DINODE_MAGIC);
 	to->di_onlink = 0;
 
-	to->di_format = from->di_format;
+	to->di_format = xfs_ifork_format(&ip->i_df);
 	to->di_uid = cpu_to_be32(i_uid_read(inode));
 	to->di_gid = cpu_to_be32(i_gid_read(inode));
 	to->di_projid_lo = cpu_to_be16(from->di_projid & 0xffff);
 	to->di_projid_hi = cpu_to_be16(from->di_projid >> 16);
 
 	memset(to->di_pad, 0, sizeof(to->di_pad));
-	to->di_atime = xfs_inode_to_disk_ts(inode->i_atime);
-	to->di_mtime = xfs_inode_to_disk_ts(inode->i_mtime);
-	to->di_ctime = xfs_inode_to_disk_ts(inode->i_ctime);
+	to->di_atime = xfs_inode_to_disk_ts(ip, inode->i_atime);
+	to->di_mtime = xfs_inode_to_disk_ts(ip, inode->i_mtime);
+	to->di_ctime = xfs_inode_to_disk_ts(ip, inode->i_ctime);
 	to->di_nlink = cpu_to_be32(inode->i_nlink);
 	to->di_gen = cpu_to_be32(inode->i_generation);
 	to->di_mode = cpu_to_be16(inode->i_mode);
@@ -311,10 +326,10 @@ xfs_inode_to_disk(
 	to->di_size = cpu_to_be64(from->di_size);
 	to->di_nblocks = cpu_to_be64(from->di_nblocks);
 	to->di_extsize = cpu_to_be32(from->di_extsize);
-	to->di_nextents = cpu_to_be32(from->di_nextents);
-	to->di_anextents = cpu_to_be16(from->di_anextents);
+	to->di_nextents = cpu_to_be32(xfs_ifork_nextents(&ip->i_df));
+	to->di_anextents = cpu_to_be16(xfs_ifork_nextents(ip->i_afp));
 	to->di_forkoff = from->di_forkoff;
-	to->di_aformat = from->di_aformat;
+	to->di_aformat = xfs_ifork_format(ip->i_afp);
 	to->di_dmevmask = cpu_to_be32(from->di_dmevmask);
 	to->di_dmstate = cpu_to_be16(from->di_dmstate);
 	to->di_flags = cpu_to_be16(from->di_flags);
@@ -322,7 +337,7 @@ xfs_inode_to_disk(
 	if (xfs_sb_version_has_v3inode(&ip->i_mount->m_sb)) {
 		to->di_version = 3;
 		to->di_changecount = cpu_to_be64(inode_peek_iversion(inode));
-		to->di_crtime = xfs_inode_to_disk_ts(from->di_crtime);
+		to->di_crtime = xfs_inode_to_disk_ts(ip, from->di_crtime);
 		to->di_flags2 = cpu_to_be64(from->di_flags2);
 		to->di_cowextsize = cpu_to_be32(from->di_cowextsize);
 		to->di_ino = cpu_to_be64(ip->i_ino);
@@ -537,6 +552,11 @@ xfs_dinode_verify(
 			mode, flags, flags2);
 	if (fa)
 		return fa;
+
+	/* bigtime iflag can only happen on bigtime filesystems */
+	if (xfs_dinode_has_bigtime(dip) &&
+	    !xfs_sb_version_hasbigtime(&mp->m_sb))
+		return __this_address;
 
 	return NULL;
 }

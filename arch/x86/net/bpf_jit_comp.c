@@ -799,6 +799,49 @@ static void emit_stx(u8 **pprog, u32 size, u32 dst_reg, u32 src_reg, int off)
 	*pprog = prog;
 }
 
+static int emit_atomic(u8 **pprog, u8 atomic_op,
+		       u32 dst_reg, u32 src_reg, s16 off, u8 bpf_size)
+{
+	u8 *prog = *pprog;
+	int cnt = 0;
+
+	EMIT1(0xF0); /* lock prefix */
+
+	maybe_emit_mod(&prog, dst_reg, src_reg, bpf_size == BPF_DW);
+
+	/* emit opcode */
+	switch (atomic_op) {
+	case BPF_ADD:
+	case BPF_SUB:
+	case BPF_AND:
+	case BPF_OR:
+	case BPF_XOR:
+		/* lock *(u32/u64*)(dst_reg + off) <op>= src_reg */
+		EMIT1(simple_alu_opcodes[atomic_op]);
+		break;
+	case BPF_ADD | BPF_FETCH:
+		/* src_reg = atomic_fetch_add(dst_reg + off, src_reg); */
+		EMIT2(0x0F, 0xC1);
+		break;
+	case BPF_XCHG:
+		/* src_reg = atomic_xchg(dst_reg + off, src_reg); */
+		EMIT1(0x87);
+		break;
+	case BPF_CMPXCHG:
+		/* r0 = atomic_cmpxchg(dst_reg + off, r0, src_reg); */
+		EMIT2(0x0F, 0xB1);
+		break;
+	default:
+		pr_err("bpf_jit: unknown atomic opcode %02x\n", atomic_op);
+		return -EFAULT;
+	}
+
+	emit_insn_suffix(&prog, dst_reg, src_reg, off);
+
+	*pprog = prog;
+	return 0;
+}
+
 static bool ex_handler_bpf(const struct exception_table_entry *x,
 			   struct pt_regs *regs, int trapnr,
 			   unsigned long error_code, unsigned long fault_addr)
@@ -843,6 +886,7 @@ static int do_jit(struct bpf_prog *bpf_prog, int *addrs, u8 *image,
 	int i, cnt = 0, excnt = 0;
 	int proglen = 0;
 	u8 *prog = temp;
+	int err;
 
 	detect_reg_usage(insn, insn_cnt, callee_regs_used,
 			 &tail_call_seen);
@@ -1254,18 +1298,60 @@ st:			if (is_imm8(insn->off))
 			}
 			break;
 
-			/* STX XADD: lock *(u32*)(dst_reg + off) += src_reg */
-		case BPF_STX | BPF_XADD | BPF_W:
-			/* Emit 'lock add dword ptr [rax + off], eax' */
-			if (is_ereg(dst_reg) || is_ereg(src_reg))
-				EMIT3(0xF0, add_2mod(0x40, dst_reg, src_reg), 0x01);
-			else
-				EMIT2(0xF0, 0x01);
-			goto xadd;
-		case BPF_STX | BPF_XADD | BPF_DW:
-			EMIT3(0xF0, add_2mod(0x48, dst_reg, src_reg), 0x01);
-xadd:
-			emit_modrm_dstoff(&prog, dst_reg, src_reg, insn->off);
+		case BPF_STX | BPF_ATOMIC | BPF_W:
+		case BPF_STX | BPF_ATOMIC | BPF_DW:
+			if (insn->imm == (BPF_AND | BPF_FETCH) ||
+			    insn->imm == (BPF_OR | BPF_FETCH) ||
+			    insn->imm == (BPF_XOR | BPF_FETCH)) {
+				u8 *branch_target;
+				bool is64 = BPF_SIZE(insn->code) == BPF_DW;
+				u32 real_src_reg = src_reg;
+
+				/*
+				 * Can't be implemented with a single x86 insn.
+				 * Need to do a CMPXCHG loop.
+				 */
+
+				/* Will need RAX as a CMPXCHG operand so save R0 */
+				emit_mov_reg(&prog, true, BPF_REG_AX, BPF_REG_0);
+				if (src_reg == BPF_REG_0)
+					real_src_reg = BPF_REG_AX;
+
+				branch_target = prog;
+				/* Load old value */
+				emit_ldx(&prog, BPF_SIZE(insn->code),
+					 BPF_REG_0, dst_reg, insn->off);
+				/*
+				 * Perform the (commutative) operation locally,
+				 * put the result in the AUX_REG.
+				 */
+				emit_mov_reg(&prog, is64, AUX_REG, BPF_REG_0);
+				maybe_emit_mod(&prog, AUX_REG, real_src_reg, is64);
+				EMIT2(simple_alu_opcodes[BPF_OP(insn->imm)],
+				      add_2reg(0xC0, AUX_REG, real_src_reg));
+				/* Attempt to swap in new value */
+				err = emit_atomic(&prog, BPF_CMPXCHG,
+						  dst_reg, AUX_REG, insn->off,
+						  BPF_SIZE(insn->code));
+				if (WARN_ON(err))
+					return err;
+				/*
+				 * ZF tells us whether we won the race. If it's
+				 * cleared we need to try again.
+				 */
+				EMIT2(X86_JNE, -(prog - branch_target) - 2);
+				/* Return the pre-modification value */
+				emit_mov_reg(&prog, is64, real_src_reg, BPF_REG_0);
+				/* Restore R0 after clobbering RAX */
+				emit_mov_reg(&prog, true, BPF_REG_0, BPF_REG_AX);
+				break;
+
+			}
+
+			err = emit_atomic(&prog, insn->imm, dst_reg, src_reg,
+						  insn->off, BPF_SIZE(insn->code));
+			if (err)
+				return err;
 			break;
 
 			/* call */

@@ -212,6 +212,7 @@ static inline struct nf_dccp_net *nf_dccp_pernet(struct net *net)
 {
        return &net->ct.nf_ct_proto.dccp;
 }
+#endif
 
 /* Caller must check nf_ct_protonum(ct) is IPPROTO_TCP before calling. */
 static inline void nf_ct_set_tcp_be_liberal(struct nf_conn *ct)
@@ -226,7 +227,6 @@ static inline bool nf_conntrack_tcp_established(const struct nf_conn *ct)
 	return ct->proto.tcp.state == TCP_CONNTRACK_ESTABLISHED &&
 	       test_bit(IPS_ASSURED_BIT, &ct->status);
 }
-#endif
 
 #ifdef CONFIG_NF_CT_PROTO_SCTP
 static inline struct nf_sctp_net *nf_sctp_pernet(struct net *net)

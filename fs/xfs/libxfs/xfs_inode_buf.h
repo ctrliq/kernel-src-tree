@@ -16,16 +16,12 @@ struct xfs_dinode;
  * format specific structures at the appropriate time.
  */
 struct xfs_icdinode {
-	int8_t		di_format;	/* format of di_c data */
 	uint16_t	di_flushiter;	/* incremented on flush */
 	prid_t		di_projid;	/* owner's project id */
 	xfs_fsize_t	di_size;	/* number of bytes in file */
 	xfs_rfsblock_t	di_nblocks;	/* # of direct & btree blocks used */
 	xfs_extlen_t	di_extsize;	/* basic/minimum extent size for file */
-	xfs_extnum_t	di_nextents;	/* number of extents in data fork */
-	xfs_aextnum_t	di_anextents;	/* number of extents in attribute fork*/
 	uint8_t		di_forkoff;	/* attr fork offs, <<3 for 64b align */
-	int8_t		di_aformat;	/* format of attr fork's data */
 	uint32_t	di_dmevmask;	/* DMIG event mask */
 	uint16_t	di_dmstate;	/* DMIG state info */
 	uint16_t	di_flags;	/* random flags, XFS_DIFLAG_... */
@@ -35,6 +31,11 @@ struct xfs_icdinode {
 
 	struct timespec64 di_crtime;	/* time created */
 };
+
+static inline bool xfs_icdinode_has_bigtime(const struct xfs_icdinode *icd)
+{
+	return icd->di_flags2 & XFS_DIFLAG2_BIGTIME;
+}
 
 /*
  * Inode location information.  Stored in the inode and passed to
@@ -62,6 +63,12 @@ xfs_failaddr_t xfs_inode_validate_cowextsize(struct xfs_mount *mp,
 		uint32_t cowextsize, uint16_t mode, uint16_t flags,
 		uint64_t flags2);
 
-struct timespec64 xfs_inode_from_disk_ts(const xfs_timestamp_t ts);
+static inline uint64_t xfs_inode_encode_bigtime(struct timespec64 tv)
+{
+	return xfs_unix_to_bigtime(tv.tv_sec) * NSEC_PER_SEC + tv.tv_nsec;
+}
+
+struct timespec64 xfs_inode_from_disk_ts(struct xfs_dinode *dip,
+		const xfs_timestamp_t ts);
 
 #endif	/* __XFS_INODE_BUF_H__ */

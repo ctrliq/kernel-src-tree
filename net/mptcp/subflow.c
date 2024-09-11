@@ -102,7 +102,7 @@ static struct mptcp_sock *subflow_token_join_request(struct request_sock *req)
 	return msk;
 }
 
-static int __subflow_init_req(struct request_sock *req, const struct sock *sk_listener)
+static void subflow_init_req(struct request_sock *req, const struct sock *sk_listener)
 {
 	struct mptcp_subflow_request_sock *subflow_req = mptcp_subflow_rsk(req);
 
@@ -110,16 +110,6 @@ static int __subflow_init_req(struct request_sock *req, const struct sock *sk_li
 	subflow_req->mp_join = 0;
 	subflow_req->msk = NULL;
 	mptcp_token_init_request(req);
-
-#ifdef CONFIG_TCP_MD5SIG
-	/* no MPTCP if MD5SIG is enabled on this socket or we may run out of
-	 * TCP option space.
-	 */
-	if (rcu_access_pointer(tcp_sk(sk_listener)->md5sig_info))
-		return -EINVAL;
-#endif
-
-	return 0;
 }
 
 static bool subflow_use_different_sport(struct mptcp_sock *msk, const struct sock *sk)
@@ -142,20 +132,23 @@ static void subflow_add_reset_reason(struct sk_buff *skb, u8 reason)
  * Returns an error code if a JOIN has failed and a TCP reset
  * should be sent.
  */
-static int subflow_init_req(struct request_sock *req,
-			    const struct sock *sk_listener,
-			    struct sk_buff *skb)
+static int subflow_check_req(struct request_sock *req,
+			     const struct sock *sk_listener,
+			     struct sk_buff *skb)
 {
 	struct mptcp_subflow_context *listener = mptcp_subflow_ctx(sk_listener);
 	struct mptcp_subflow_request_sock *subflow_req = mptcp_subflow_rsk(req);
 	struct mptcp_options_received mp_opt;
-	int ret;
 
 	pr_debug("subflow_req=%p, listener=%p", subflow_req, listener);
 
-	ret = __subflow_init_req(req, sk_listener);
-	if (ret)
-		return 0;
+#ifdef CONFIG_TCP_MD5SIG
+	/* no MPTCP if MD5SIG is enabled on this socket or we may run out of
+	 * TCP option space.
+	 */
+	if (rcu_access_pointer(tcp_sk(sk_listener)->md5sig_info))
+		return -EINVAL;
+#endif
 
 	mptcp_get_options(skb, &mp_opt);
 
@@ -253,10 +246,7 @@ int mptcp_subflow_init_cookie_req(struct request_sock *req,
 	struct mptcp_options_received mp_opt;
 	int err;
 
-	err = __subflow_init_req(req, sk_listener);
-	if (err)
-		return err;
-
+	subflow_init_req(req, sk_listener);
 	mptcp_get_options(skb, &mp_opt);
 
 	if (mp_opt.mp_capable && mp_opt.mp_join)
@@ -296,12 +286,13 @@ static struct dst_entry *subflow_v4_route_req(const struct sock *sk,
 	int err;
 
 	tcp_rsk(req)->is_mptcp = 1;
+	subflow_init_req(req, sk);
 
 	dst = tcp_request_sock_ipv4_ops.route_req(sk, skb, fl, req);
 	if (!dst)
 		return NULL;
 
-	err = subflow_init_req(req, sk, skb);
+	err = subflow_check_req(req, sk, skb);
 	if (err == 0)
 		return dst;
 
@@ -321,12 +312,13 @@ static struct dst_entry *subflow_v6_route_req(const struct sock *sk,
 	int err;
 
 	tcp_rsk(req)->is_mptcp = 1;
+	subflow_init_req(req, sk);
 
 	dst = tcp_request_sock_ipv6_ops.route_req(sk, skb, fl, req);
 	if (!dst)
 		return NULL;
 
-	err = subflow_init_req(req, sk, skb);
+	err = subflow_check_req(req, sk, skb);
 	if (err == 0)
 		return dst;
 
@@ -687,6 +679,9 @@ create_child:
 			goto out;
 		}
 
+		/* ssk inherits options of listener sk */
+		ctx->setsockopt_seq = listener->setsockopt_seq;
+
 		if (ctx->mp_capable) {
 			/* this can't race with mptcp_close(), as the msk is
 			 * not yet exposted to user-space
@@ -702,6 +697,7 @@ create_child:
 			 * created mptcp socket
 			 */
 			new_msk->sk_destruct = mptcp_sock_destruct;
+			mptcp_sk(new_msk)->setsockopt_seq = ctx->setsockopt_seq;
 			mptcp_pm_new_connection(mptcp_sk(new_msk), child, 1);
 			mptcp_token_accept(subflow_req, mptcp_sk(new_msk));
 			ctx->conn = new_msk;
@@ -1318,6 +1314,7 @@ int __mptcp_subflow_connect(struct sock *sk, const struct mptcp_addr_info *loc,
 	mptcp_info2sockaddr(remote, &addr, ssk->sk_family);
 
 	mptcp_add_pending_subflow(msk, subflow);
+	mptcp_sockopt_sync(msk, ssk);
 	err = kernel_connect(sf, (struct sockaddr *)&addr, addrlen, O_NONBLOCK);
 	if (err && err != -EINPROGRESS)
 		goto failed_unlink;

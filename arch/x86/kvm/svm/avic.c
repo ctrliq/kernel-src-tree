@@ -149,14 +149,6 @@ int avic_vm_init(struct kvm *kvm)
 	struct page *l_page;
 	u32 vm_id;
 
-	static bool nested_taint_added = false;
-
-	/* RHEL-only: running as a nested hypervisor is TechPreview */
-	if (!nested_taint_added && boot_cpu_has(X86_FEATURE_HYPERVISOR)) {
-		mark_tech_preview("Running as a nested hypervisor", THIS_MODULE);
-		nested_taint_added = true;
-	}
-
 	if (!avic)
 		return 0;
 

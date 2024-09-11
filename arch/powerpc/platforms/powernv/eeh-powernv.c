@@ -91,7 +91,7 @@ static ssize_t pnv_eeh_ei_write(struct file *filp,
 		return -EINVAL;
 
 	/* Retrieve PE */
-	pe = eeh_pe_get(hose, pe_no, 0);
+	pe = eeh_pe_get(hose, pe_no);
 	if (!pe)
 		return -ENODEV;
 
@@ -310,7 +310,7 @@ static struct eeh_pe *pnv_eeh_get_upstream_pe(struct pci_dev *pdev)
 	if (parent) {
 		struct pnv_ioda_pe *ioda_pe = pnv_ioda_get_pe(parent);
 
-		return eeh_pe_get(phb->hose, ioda_pe->pe_number, 0);
+		return eeh_pe_get(phb->hose, ioda_pe->pe_number);
 	}
 
 	return NULL;
@@ -351,19 +351,18 @@ static struct eeh_dev *pnv_eeh_probe(struct pci_dev *pdev)
 	}
 
 	/* Skip for PCI-ISA bridge */
-	if ((pdn->class_code >> 8) == PCI_CLASS_BRIDGE_ISA)
+	if ((pdev->class >> 8) == PCI_CLASS_BRIDGE_ISA)
 		return NULL;
 
 	eeh_edev_dbg(edev, "Probing device\n");
 
 	/* Initialize eeh device */
-	edev->class_code = pdn->class_code;
 	edev->mode	&= 0xFFFFFF00;
 	edev->pcix_cap = pnv_eeh_find_cap(pdn, PCI_CAP_ID_PCIX);
 	edev->pcie_cap = pnv_eeh_find_cap(pdn, PCI_CAP_ID_EXP);
 	edev->af_cap   = pnv_eeh_find_cap(pdn, PCI_CAP_ID_AF);
 	edev->aer_cap  = pnv_eeh_find_ecap(pdn, PCI_EXT_CAP_ID_ERR);
-	if ((edev->class_code >> 8) == PCI_CLASS_BRIDGE_PCI) {
+	if ((pdev->class >> 8) == PCI_CLASS_BRIDGE_PCI) {
 		edev->mode |= EEH_DEV_BRIDGE;
 		if (edev->pcie_cap) {
 			pnv_pci_cfg_read(pdn, edev->pcie_cap + PCI_EXP_FLAGS,
@@ -1363,7 +1362,7 @@ static int pnv_eeh_get_pe(struct pci_controller *hose,
 	}
 
 	/* Find the PE according to PE# */
-	dev_pe = eeh_pe_get(hose, pe_no, 0);
+	dev_pe = eeh_pe_get(hose, pe_no);
 	if (!dev_pe)
 		return -EEXIST;
 
@@ -1697,16 +1696,6 @@ static int __init eeh_powernv_init(void)
 
 		if (phb->diag_data_size > max_diag_size)
 			max_diag_size = phb->diag_data_size;
-
-		/*
-		 * PE#0 should be regarded as valid by EEH core
-		 * if it's not the reserved one. Currently, we
-		 * have the reserved PE#255 and PE#127 for PHB3
-		 * and P7IOC separately. So we should regard
-		 * PE#0 as valid for PHB3 and P7IOC.
-		 */
-		if (phb->ioda.reserved_pe_idx != 0)
-			eeh_add_flag(EEH_VALID_PE_ZERO);
 
 		break;
 	}

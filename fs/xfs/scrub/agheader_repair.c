@@ -453,7 +453,7 @@ xrep_agfl_walk_rmap(
 
 	/* Record all the OWN_AG blocks. */
 	if (rec->rm_owner == XFS_RMAP_OWN_AG) {
-		fsb = XFS_AGB_TO_FSB(cur->bc_mp, cur->bc_private.a.agno,
+		fsb = XFS_AGB_TO_FSB(cur->bc_mp, cur->bc_ag.agno,
 				rec->rm_startblock);
 		error = xbitmap_set(ra->freesp, fsb, rec->rm_blockcount);
 		if (error)
@@ -810,10 +810,34 @@ xrep_agi_calc_from_btrees(
 	error = xfs_ialloc_count_inodes(cur, &count, &freecount);
 	if (error)
 		goto err;
+	if (xfs_sb_version_hasinobtcounts(&mp->m_sb)) {
+		xfs_agblock_t	blocks;
+
+		error = xfs_btree_count_blocks(cur, &blocks);
+		if (error)
+			goto err;
+		agi->agi_iblocks = cpu_to_be32(blocks);
+	}
 	xfs_btree_del_cursor(cur, error);
 
 	agi->agi_count = cpu_to_be32(count);
 	agi->agi_freecount = cpu_to_be32(freecount);
+
+	if (xfs_sb_version_hasfinobt(&mp->m_sb) &&
+	    xfs_sb_version_hasinobtcounts(&mp->m_sb)) {
+		xfs_agblock_t	blocks;
+
+		cur = xfs_inobt_init_cursor(mp, sc->tp, agi_bp, sc->sa.agno,
+				XFS_BTNUM_FINO);
+		if (error)
+			goto err;
+		error = xfs_btree_count_blocks(cur, &blocks);
+		if (error)
+			goto err;
+		xfs_btree_del_cursor(cur, error);
+		agi->agi_fblocks = cpu_to_be32(blocks);
+	}
+
 	return 0;
 err:
 	xfs_btree_del_cursor(cur, error);

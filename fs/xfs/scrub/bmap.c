@@ -394,7 +394,7 @@ xchk_bmapbt_rec(
 	struct xfs_bmbt_irec	iext_irec;
 	struct xfs_iext_cursor	icur;
 	struct xchk_bmap_info	*info = bs->private;
-	struct xfs_inode	*ip = bs->cur->bc_private.b.ip;
+	struct xfs_inode	*ip = bs->cur->bc_ino.ip;
 	struct xfs_buf		*bp = NULL;
 	struct xfs_btree_block	*block;
 	struct xfs_ifork	*ifp = XFS_IFORK_PTR(ip, info->whichfork);
@@ -521,7 +521,7 @@ xchk_bmap_check_rmap(
 			xchk_fblock_set_corrupt(sc, sbcri->whichfork,
 					rec->rm_offset);
 		if (irec.br_startblock != XFS_AGB_TO_FSB(sc->mp,
-				cur->bc_private.a.agno, rec->rm_startblock))
+				cur->bc_ag.agno, rec->rm_startblock))
 			xchk_fblock_set_corrupt(sc, sbcri->whichfork,
 					rec->rm_offset);
 		if (irec.br_blockcount > rec->rm_blockcount)
@@ -586,6 +586,7 @@ xchk_bmap_check_rmaps(
 	struct xfs_scrub	*sc,
 	int			whichfork)
 {
+	struct xfs_ifork	*ifp = XFS_IFORK_PTR(sc->ip, whichfork);
 	xfs_agnumber_t		agno;
 	bool			zero_size;
 	int			error;
@@ -608,13 +609,14 @@ xchk_bmap_check_rmaps(
 	 * to flag this bmap as corrupt if there are rmaps that need to be
 	 * reattached.
 	 */
+
 	if (whichfork == XFS_DATA_FORK)
 		zero_size = i_size_read(VFS_I(sc->ip)) == 0;
 	else
 		zero_size = false;
 
-	if (XFS_IFORK_FORMAT(sc->ip, whichfork) != XFS_DINODE_FMT_BTREE &&
-	    (zero_size || XFS_IFORK_NEXTENTS(sc->ip, whichfork) > 0))
+	if (ifp->if_format != XFS_DINODE_FMT_BTREE &&
+	    (zero_size || ifp->if_nextents > 0))
 		return 0;
 
 	for (agno = 0; agno < sc->mp->m_sb.sb_agcount; agno++) {
@@ -676,7 +678,7 @@ xchk_bmap(
 	}
 
 	/* Check the fork values */
-	switch (XFS_IFORK_FORMAT(ip, whichfork)) {
+	switch (ifp->if_format) {
 	case XFS_DINODE_FMT_UUID:
 	case XFS_DINODE_FMT_DEV:
 	case XFS_DINODE_FMT_LOCAL:

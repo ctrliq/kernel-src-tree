@@ -20,6 +20,8 @@
 #include <linux/module.h>
 #include <linux/kallsyms.h>
 #include <linux/capability.h>
+#include <linux/sched/mm.h>
+#include <linux/slab.h>
 
 struct bpf_verifier_env;
 struct bpf_verifier_log;
@@ -36,9 +38,12 @@ struct seq_operations;
 struct bpf_iter_aux_info;
 struct bpf_local_storage;
 struct bpf_local_storage_map;
+struct kobject;
+struct mem_cgroup;
 
 extern struct idr btf_idr;
 extern spinlock_t btf_idr_lock;
+extern struct kobject *btf_kobj;
 
 typedef int (*bpf_iter_init_seq_priv_t)(void *private_data,
 					struct bpf_iter_aux_info *aux);
@@ -137,11 +142,6 @@ struct bpf_map_ops {
 	) /* RH_KABI_BROKEN_INSERT_BLOCK */
 };
 
-struct bpf_map_memory {
-	u32 pages;
-	struct user_struct *user;
-};
-
 struct bpf_map {
 	/* The first two cachelines with read-mostly members of which some
 	 * are also accessed in fast-path (e.g. ops, max_entries).
@@ -163,7 +163,9 @@ struct bpf_map {
 	u32 btf_key_type_id;
 	u32 btf_value_type_id;
 	struct btf *btf;
-	RH_KABI_BROKEN_INSERT(struct bpf_map_memory memory)
+#ifdef CONFIG_MEMCG_KMEM
+	RH_KABI_BROKEN_INSERT(struct mem_cgroup *memcg)
+#endif
 	RH_KABI_BROKEN_INSERT(char name[BPF_OBJ_NAME_LEN])
 	RH_KABI_BROKEN_INSERT(u32 btf_vmlinux_value_type_id)
 	RH_KABI_REPLACE(bool unpriv_array, bool bypass_spec_v1)
@@ -320,6 +322,7 @@ enum bpf_return_type {
 	RET_PTR_TO_BTF_ID_OR_NULL,	/* returns a pointer to a btf_id or NULL */
 	RET_PTR_TO_MEM_OR_BTF_ID_OR_NULL, /* returns a pointer to a valid memory or a btf_id or NULL */
 	RET_PTR_TO_MEM_OR_BTF_ID,	/* returns a pointer to a valid memory or a btf_id */
+	RET_PTR_TO_BTF_ID,		/* returns a pointer to a btf_id */
 };
 
 /* eBPF function prototype used by verifier to allow BPF_CALLs from eBPF programs
@@ -428,7 +431,10 @@ struct bpf_insn_access_aux {
 	enum bpf_reg_type reg_type;
 	union {
 		int ctx_field_size;
-		u32 btf_id;
+		struct {
+			struct btf *btf;
+			u32 btf_id;
+		};
 	};
 	struct bpf_verifier_log *log; /* for verbose logs */
 };
@@ -465,6 +471,7 @@ struct bpf_verifier_ops {
 				  struct bpf_insn *dst,
 				  struct bpf_prog *prog, u32 *target_size);
 	int (*btf_struct_access)(struct bpf_verifier_log *log,
+				 const struct btf *btf,
 				 const struct btf_type *t, int off, int size,
 				 enum bpf_access_type atype,
 				 u32 *next_btf_id);
@@ -767,9 +774,15 @@ struct bpf_ctx_arg_aux {
 	u32 btf_id;
 };
 
+struct btf_mod_pair {
+	struct btf *btf;
+	struct module *module;
+};
+
 struct bpf_prog_aux {
 	RH_KABI_BROKEN_REPLACE(atomic_t refcnt, atomic64_t refcnt)
 	u32 used_map_cnt;
+	RH_KABI_BROKEN_INSERT(u32 used_btf_cnt)
 	u32 max_ctx_offset;
 	/* not protected by KABI, safe to extend in the middle */
 	RH_KABI_BROKEN_INSERT(u32 max_pkt_offset)
@@ -789,6 +802,7 @@ struct bpf_prog_aux {
 	struct bpf_trampoline *dst_trampoline;
 	enum bpf_prog_type saved_dst_prog_type;
 	enum bpf_attach_type saved_dst_attach_type;
+	struct btf *attach_btf;
 	) /* RH_KABI_BROKEN_INSERT_BLOCK */
 	RH_KABI_BROKEN_INSERT(bool verifier_zext) /* Zero extensions has been inserted by verifier. */
 	bool offload_requested;
@@ -812,6 +826,7 @@ struct bpf_prog_aux {
 	const struct bpf_prog_ops *ops;
 	struct bpf_map **used_maps;
 	RH_KABI_BROKEN_INSERT(struct mutex used_maps_mutex) /* mutex for used_maps and used_map_cnt */
+	RH_KABI_BROKEN_INSERT(struct btf_mod_pair *used_btfs)
 	struct bpf_prog *prog;
 	struct user_struct *user;
 	u64 load_time; /* ns since boottime */
@@ -1022,7 +1037,6 @@ struct bpf_event_entry {
 
 bool bpf_prog_array_compatible(struct bpf_array *array, const struct bpf_prog *fp);
 int bpf_prog_calc_tag(struct bpf_prog *fp);
-const char *kernel_type_name(u32 btf_type_id);
 
 const struct bpf_func_proto *bpf_get_trace_printk_proto(void);
 
@@ -1220,8 +1234,6 @@ void bpf_prog_sub(struct bpf_prog *prog, int i);
 void bpf_prog_inc(struct bpf_prog *prog);
 struct bpf_prog * __must_check bpf_prog_inc_not_zero(struct bpf_prog *prog);
 void bpf_prog_put(struct bpf_prog *prog);
-int __bpf_prog_charge(struct user_struct *user, u32 pages);
-void __bpf_prog_uncharge(struct user_struct *user, u32 pages);
 void __bpf_free_used_maps(struct bpf_prog_aux *aux,
 			  struct bpf_map **used_maps, u32 len);
 
@@ -1236,12 +1248,6 @@ void bpf_map_inc_with_uref(struct bpf_map *map);
 struct bpf_map * __must_check bpf_map_inc_not_zero(struct bpf_map *map);
 void bpf_map_put_with_uref(struct bpf_map *map);
 void bpf_map_put(struct bpf_map *map);
-int bpf_map_charge_memlock(struct bpf_map *map, u32 pages);
-void bpf_map_uncharge_memlock(struct bpf_map *map, u32 pages);
-int bpf_map_charge_init(struct bpf_map_memory *mem, u64 size);
-void bpf_map_charge_finish(struct bpf_map_memory *mem);
-void bpf_map_charge_move(struct bpf_map_memory *dst,
-			 struct bpf_map_memory *src);
 void *bpf_map_area_alloc(u64 size, int numa_node);
 void *bpf_map_area_mmapable_alloc(u64 size, int numa_node);
 void bpf_map_area_free(void *base);
@@ -1257,6 +1263,34 @@ int  generic_map_delete_batch(struct bpf_map *map,
 			      union bpf_attr __user *uattr);
 struct bpf_map *bpf_map_get_curr_or_next(u32 *id);
 struct bpf_prog *bpf_prog_get_curr_or_next(u32 *id);
+
+#ifdef CONFIG_MEMCG_KMEM
+void *bpf_map_kmalloc_node(const struct bpf_map *map, size_t size, gfp_t flags,
+			   int node);
+void *bpf_map_kzalloc(const struct bpf_map *map, size_t size, gfp_t flags);
+void __percpu *bpf_map_alloc_percpu(const struct bpf_map *map, size_t size,
+				    size_t align, gfp_t flags);
+#else
+static inline void *
+bpf_map_kmalloc_node(const struct bpf_map *map, size_t size, gfp_t flags,
+		     int node)
+{
+	return kmalloc_node(size, flags, node);
+}
+
+static inline void *
+bpf_map_kzalloc(const struct bpf_map *map, size_t size, gfp_t flags)
+{
+	return kzalloc(size, flags);
+}
+
+static inline void __percpu *
+bpf_map_alloc_percpu(const struct bpf_map *map, size_t size, size_t align,
+		     gfp_t flags)
+{
+	return __alloc_percpu_gfp(size, align, flags);
+}
+#endif
 
 extern int sysctl_unprivileged_bpf_disabled;
 
@@ -1448,12 +1482,13 @@ int bpf_prog_test_run_raw_tp(struct bpf_prog *prog,
 bool btf_ctx_access(int off, int size, enum bpf_access_type type,
 		    const struct bpf_prog *prog,
 		    struct bpf_insn_access_aux *info);
-int btf_struct_access(struct bpf_verifier_log *log,
+int btf_struct_access(struct bpf_verifier_log *log, const struct btf *btf,
 		      const struct btf_type *t, int off, int size,
 		      enum bpf_access_type atype,
 		      u32 *next_btf_id);
 bool btf_struct_ids_match(struct bpf_verifier_log *log,
-			  int off, u32 id, u32 need_type_id);
+			  const struct btf *btf, u32 id, int off,
+			  const struct btf *need_btf, u32 need_type_id);
 
 int btf_distill_func_proto(struct bpf_verifier_log *log,
 			   struct btf *btf,
@@ -1506,15 +1541,6 @@ static inline struct bpf_prog *__must_check
 bpf_prog_inc_not_zero(struct bpf_prog *prog)
 {
 	return ERR_PTR(-EOPNOTSUPP);
-}
-
-static inline int __bpf_prog_charge(struct user_struct *user, u32 pages)
-{
-	return 0;
-}
-
-static inline void __bpf_prog_uncharge(struct user_struct *user, u32 pages)
-{
 }
 
 static inline void bpf_link_init(struct bpf_link *link, enum bpf_link_type type,
@@ -1668,6 +1694,9 @@ bpf_base_func_proto(enum bpf_func_id func_id)
 	return NULL;
 }
 #endif /* CONFIG_BPF_SYSCALL */
+
+void __bpf_free_used_btfs(struct bpf_prog_aux *aux,
+			  struct btf_mod_pair *used_btfs, u32 len);
 
 static inline struct bpf_prog *bpf_prog_get_type(u32 ufd,
 						 enum bpf_prog_type type)
@@ -1860,6 +1889,8 @@ extern const struct bpf_func_proto bpf_copy_from_user_proto;
 extern const struct bpf_func_proto bpf_snprintf_btf_proto;
 extern const struct bpf_func_proto bpf_per_cpu_ptr_proto;
 extern const struct bpf_func_proto bpf_this_cpu_ptr_proto;
+extern const struct bpf_func_proto bpf_ktime_get_coarse_ns_proto;
+extern const struct bpf_func_proto bpf_sock_from_file_proto;
 
 const struct bpf_func_proto *bpf_tracing_func_proto(
 	enum bpf_func_id func_id, const struct bpf_prog *prog);

@@ -17,7 +17,7 @@
  */
 
 #include <asm/iomap.h>
-#include <asm/pat.h>
+#include <asm/memtype.h>
 #include <linux/export.h>
 #include <linux/highmem.h>
 

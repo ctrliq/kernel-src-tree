@@ -45,7 +45,7 @@
 #include <linux/kthread.h>
 
 #include <asm/page.h>
-#include <asm/pat.h>
+#include <asm/memtype.h>
 #include <asm/cmpxchg.h>
 #include <asm/io.h>
 #include <asm/set_memory.h>

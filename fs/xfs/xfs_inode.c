@@ -44,7 +44,6 @@ kmem_zone_t *xfs_inode_zone;
  */
 #define	XFS_ITRUNC_MAX_EXTENTS	2
 
-STATIC int xfs_iflush_int(struct xfs_inode *, struct xfs_buf *);
 STATIC int xfs_iunlink(struct xfs_trans *, struct xfs_inode *);
 STATIC int xfs_iunlink_remove(struct xfs_trans *, struct xfs_inode *);
 
@@ -112,7 +111,7 @@ xfs_ilock_data_map_shared(
 {
 	uint			lock_mode = XFS_ILOCK_SHARED;
 
-	if (ip->i_d.di_format == XFS_DINODE_FMT_BTREE &&
+	if (ip->i_df.if_format == XFS_DINODE_FMT_BTREE &&
 	    (ip->i_df.if_flags & XFS_IFEXTENTS) == 0)
 		lock_mode = XFS_ILOCK_EXCL;
 	xfs_ilock(ip, lock_mode);
@@ -125,7 +124,8 @@ xfs_ilock_attr_map_shared(
 {
 	uint			lock_mode = XFS_ILOCK_SHARED;
 
-	if (ip->i_d.di_aformat == XFS_DINODE_FMT_BTREE &&
+	if (ip->i_afp &&
+	    ip->i_afp->if_format == XFS_DINODE_FMT_BTREE &&
 	    (ip->i_afp->if_flags & XFS_IFEXTENTS) == 0)
 		lock_mode = XFS_ILOCK_EXCL;
 	xfs_ilock(ip, lock_mode);
@@ -144,17 +144,17 @@ xfs_ilock_attr_map_shared(
  *
  * i_rwsem -> i_mmap_lock -> page_lock -> i_ilock
  *
- * mmap_sem locking order:
+ * mmap_lock locking order:
  *
- * i_rwsem -> page lock -> mmap_sem
- * mmap_sem -> i_mmap_lock -> page_lock
+ * i_rwsem -> page lock -> mmap_lock
+ * mmap_lock -> i_mmap_lock -> page_lock
  *
- * The difference in mmap_sem locking order mean that we cannot hold the
+ * The difference in mmap_lock locking order mean that we cannot hold the
  * i_mmap_lock over syscall based read(2)/write(2) based IO. These IO paths can
- * fault in pages during copy in/out (for buffered IO) or require the mmap_sem
+ * fault in pages during copy in/out (for buffered IO) or require the mmap_lock
  * in get_user_pages() to map the user pages into the kernel address space for
  * direct IO. Similarly the i_rwsem cannot be taken inside a page fault because
- * page faults already hold the mmap_sem.
+ * page faults already hold the mmap_lock.
  *
  * Hence to serialise fully against both syscall and mmap based IO, we need to
  * take both the i_rwsem and the i_mmap_lock. These locks should *only* be both
@@ -598,22 +598,6 @@ xfs_lock_two_inodes(
 	}
 }
 
-void
-__xfs_iflock(
-	struct xfs_inode	*ip)
-{
-	wait_queue_head_t *wq = bit_waitqueue(&ip->i_flags, __XFS_IFLOCK_BIT);
-	DEFINE_WAIT_BIT(wait, &ip->i_flags, __XFS_IFLOCK_BIT);
-
-	do {
-		prepare_to_wait_exclusive(wq, &wait.wq_entry, TASK_UNINTERRUPTIBLE);
-		if (xfs_isiflocked(ip))
-			io_schedule();
-	} while (!xfs_iflock_nowait(ip));
-
-	finish_wait(wq, &wait.wq_entry);
-}
-
 STATIC uint
 _xfs_dic2xflags(
 	uint16_t		di_flags,
@@ -887,7 +871,7 @@ xfs_ialloc(
 		inode->i_mode &= ~S_ISGID;
 
 	ip->i_d.di_size = 0;
-	ip->i_d.di_nextents = 0;
+	ip->i_df.if_nextents = 0;
 	ASSERT(ip->i_d.di_nblocks == 0);
 
 	tv = current_time(inode);
@@ -902,7 +886,7 @@ xfs_ialloc(
 
 	if (xfs_sb_version_has_v3inode(&mp->m_sb)) {
 		inode_set_iversion(inode, 1);
-		ip->i_d.di_flags2 = 0;
+		ip->i_d.di_flags2 = mp->m_ino_geo.new_diflags2;
 		ip->i_d.di_cowextsize = 0;
 		ip->i_d.di_crtime = tv;
 	}
@@ -913,7 +897,7 @@ xfs_ialloc(
 	case S_IFCHR:
 	case S_IFBLK:
 	case S_IFSOCK:
-		ip->i_d.di_format = XFS_DINODE_FMT_DEV;
+		ip->i_df.if_format = XFS_DINODE_FMT_DEV;
 		ip->i_df.if_flags = 0;
 		flags |= XFS_ILOG_DEV;
 		break;
@@ -925,7 +909,7 @@ xfs_ialloc(
 			xfs_inode_inherit_flags2(ip, pip);
 		/* FALLTHROUGH */
 	case S_IFLNK:
-		ip->i_d.di_format = XFS_DINODE_FMT_EXTENTS;
+		ip->i_df.if_format = XFS_DINODE_FMT_EXTENTS;
 		ip->i_df.if_flags = XFS_IFEXTENTS;
 		ip->i_df.if_bytes = 0;
 		ip->i_df.if_u1.if_root = NULL;
@@ -933,11 +917,6 @@ xfs_ialloc(
 	default:
 		ASSERT(0);
 	}
-	/*
-	 * Attribute fork settings for new inode.
-	 */
-	ip->i_d.di_aformat = XFS_DINODE_FMT_EXTENTS;
-	ip->i_d.di_anextents = 0;
 
 	/*
 	 * Log the new values stuffed into the inode.
@@ -1645,7 +1624,7 @@ xfs_release(
 			return 0;
 		/*
 		 * If we can't get the iolock just skip truncating the blocks
-		 * past EOF because we could deadlock with the mmap_sem
+		 * past EOF because we could deadlock with the mmap_lock
 		 * otherwise. We'll get another chance to drop them once the
 		 * last reference to the inode is dropped, so we'll never leak
 		 * blocks permanently.
@@ -1697,7 +1676,7 @@ xfs_inactive_truncate(
 	if (error)
 		goto error_trans_cancel;
 
-	ASSERT(ip->i_d.di_nextents == 0);
+	ASSERT(ip->i_df.if_nextents == 0);
 
 	error = xfs_trans_commit(tp);
 	if (error)
@@ -1866,7 +1845,7 @@ xfs_inactive(
 
 	if (S_ISREG(VFS_I(ip)->i_mode) &&
 	    (ip->i_d.di_size != 0 || XFS_ISIZE(ip) != 0 ||
-	     ip->i_d.di_nextents > 0 || ip->i_delayed_blks > 0))
+	     ip->i_df.if_nextents > 0 || ip->i_delayed_blks > 0))
 		truncate = 1;
 
 	error = xfs_qm_dqattach(ip);
@@ -1892,7 +1871,6 @@ xfs_inactive(
 	}
 
 	ASSERT(!ip->i_afp);
-	ASSERT(ip->i_d.di_anextents == 0);
 	ASSERT(ip->i_d.di_forkoff == 0);
 
 	/*
@@ -2282,7 +2260,6 @@ xfs_iunlink(
 	}
 
 	if (next_agino != NULLAGINO) {
-		struct xfs_perag	*pag;
 		xfs_agino_t		old_agino;
 
 		/*
@@ -2299,9 +2276,7 @@ xfs_iunlink(
 		 * agino has been unlinked, add a backref from the next inode
 		 * back to agino.
 		 */
-		pag = xfs_perag_get(mp, agno);
-		error = xfs_iunlink_add_backref(pag, agino, next_agino);
-		xfs_perag_put(pag);
+		error = xfs_iunlink_add_backref(agibp->b_pag, agino, next_agino);
 		if (error)
 			return error;
 	}
@@ -2437,7 +2412,6 @@ xfs_iunlink_remove(
 	struct xfs_buf		*agibp;
 	struct xfs_buf		*last_ibp;
 	struct xfs_dinode	*last_dip = NULL;
-	struct xfs_perag	*pag = NULL;
 	xfs_agnumber_t		agno = XFS_INO_TO_AGNO(mp, ip->i_ino);
 	xfs_agino_t		agino = XFS_INO_TO_AGINO(mp, ip->i_ino);
 	xfs_agino_t		next_agino;
@@ -2481,32 +2455,22 @@ xfs_iunlink_remove(
 	 * this inode's backref to point from the next inode.
 	 */
 	if (next_agino != NULLAGINO) {
-		pag = xfs_perag_get(mp, agno);
-		error = xfs_iunlink_change_backref(pag, next_agino,
+		error = xfs_iunlink_change_backref(agibp->b_pag, next_agino,
 				NULLAGINO);
 		if (error)
-			goto out;
+			return error;
 	}
 
-	if (head_agino == agino) {
-		/* Point the head of the list to the next unlinked inode. */
-		error = xfs_iunlink_update_bucket(tp, agno, agibp, bucket_index,
-				next_agino);
-		if (error)
-			goto out;
-	} else {
+	if (head_agino != agino) {
 		struct xfs_imap	imap;
 		xfs_agino_t	prev_agino;
-
-		if (!pag)
-			pag = xfs_perag_get(mp, agno);
 
 		/* We need to search the list for the inode being freed. */
 		error = xfs_iunlink_map_prev(tp, agno, head_agino, agino,
 				&prev_agino, &imap, &last_dip, &last_ibp,
-				pag);
+				agibp->b_pag);
 		if (error)
-			goto out;
+			return error;
 
 		/* Point the previous inode on the list to the next inode. */
 		xfs_iunlink_update_dinode(tp, agno, prev_agino, last_ibp,
@@ -2520,15 +2484,13 @@ xfs_iunlink_remove(
 		 * change_backref takes care of deleting the backref if
 		 * next_agino is NULLAGINO.
 		 */
-		error = xfs_iunlink_change_backref(pag, agino, next_agino);
-		if (error)
-			goto out;
+		return xfs_iunlink_change_backref(agibp->b_pag, agino,
+				next_agino);
 	}
 
-out:
-	if (pag)
-		xfs_perag_put(pag);
-	return error;
+	/* Point the head of the list to the next unlinked inode. */
+	return xfs_iunlink_update_bucket(tp, agno, agibp, bucket_index,
+			next_agino);
 }
 
 /*
@@ -2564,11 +2526,8 @@ retry:
 	 * valid, the wrong inode or stale.
 	 */
 	spin_lock(&ip->i_flags_lock);
-	if (ip->i_ino != inum || __xfs_iflags_test(ip, XFS_ISTALE)) {
-		spin_unlock(&ip->i_flags_lock);
-		rcu_read_unlock();
-		return;
-	}
+	if (ip->i_ino != inum || __xfs_iflags_test(ip, XFS_ISTALE))
+		goto out_iflags_unlock;
 
 	/*
 	 * Don't try to lock/unlock the current inode, but we _cannot_ skip the
@@ -2585,16 +2544,14 @@ retry:
 		}
 	}
 	ip->i_flags |= XFS_ISTALE;
-	spin_unlock(&ip->i_flags_lock);
-	rcu_read_unlock();
 
 	/*
-	 * If we can't get the flush lock, the inode is already attached.  All
+	 * If the inode is flushing, it is already attached to the buffer.  All
 	 * we needed to do here is mark the inode stale so buffer IO completion
 	 * will remove it from the AIL.
 	 */
 	iip = ip->i_itemp;
-	if (!xfs_iflock_nowait(ip)) {
+	if (__xfs_iflags_test(ip, XFS_IFLUSHING)) {
 		ASSERT(!list_empty(&iip->ili_item.li_bio_list));
 		ASSERT(iip->ili_last_fields);
 		goto out_iunlock;
@@ -2606,10 +2563,12 @@ retry:
 	 * commit as the flock synchronises removal of the inode from the
 	 * cluster buffer against inode reclaim.
 	 */
-	if (!iip || list_empty(&iip->ili_item.li_bio_list)) {
-		xfs_ifunlock(ip);
+	if (!iip || list_empty(&iip->ili_item.li_bio_list))
 		goto out_iunlock;
-	}
+
+	__xfs_iflags_set(ip, XFS_IFLUSHING);
+	spin_unlock(&ip->i_flags_lock);
+	rcu_read_unlock();
 
 	/* we have a dirty inode in memory that has not yet been flushed. */
 	spin_lock(&iip->ili_lock);
@@ -2619,9 +2578,16 @@ retry:
 	spin_unlock(&iip->ili_lock);
 	ASSERT(iip->ili_last_fields);
 
+	if (ip != free_ip)
+		xfs_iunlock(ip, XFS_ILOCK_EXCL);
+	return;
+
 out_iunlock:
 	if (ip != free_ip)
 		xfs_iunlock(ip, XFS_ILOCK_EXCL);
+out_iflags_unlock:
+	spin_unlock(&ip->i_flags_lock);
+	rcu_read_unlock();
 }
 
 /*
@@ -2664,8 +2630,9 @@ xfs_ifree_cluster(
 
 		/*
 		 * We obtain and lock the backing buffer first in the process
-		 * here, as we have to ensure that any dirty inode that we
-		 * can't get the flush lock on is attached to the buffer.
+		 * here to ensure dirty inodes attached to the buffer remain in
+		 * the flushing state while we mark them stale.
+		 *
 		 * If we scan the in-memory inodes first, then buffer IO can
 		 * complete before we get a lock on it, and hence we may fail
 		 * to mark all the active inodes on the buffer stale.
@@ -2722,8 +2689,7 @@ xfs_ifree(
 
 	ASSERT(xfs_isilocked(ip, XFS_ILOCK_EXCL));
 	ASSERT(VFS_I(ip)->i_nlink == 0);
-	ASSERT(ip->i_d.di_nextents == 0);
-	ASSERT(ip->i_d.di_anextents == 0);
+	ASSERT(ip->i_df.if_nextents == 0);
 	ASSERT(ip->i_d.di_size == 0 || !S_ISREG(VFS_I(ip)->i_mode));
 	ASSERT(ip->i_d.di_nblocks == 0);
 
@@ -2743,7 +2709,7 @@ xfs_ifree(
 	 * data fork to extents format.  Note that the attr fork data has
 	 * already been freed by xfs_attr_inactive.
 	 */
-	if (ip->i_d.di_format == XFS_DINODE_FMT_LOCAL) {
+	if (ip->i_df.if_format == XFS_DINODE_FMT_LOCAL) {
 		kmem_free(ip->i_df.if_u1.if_data);
 		ip->i_df.if_u1.if_data = NULL;
 		ip->i_df.if_bytes = 0;
@@ -2751,11 +2717,10 @@ xfs_ifree(
 
 	VFS_I(ip)->i_mode = 0;		/* mark incore inode as free */
 	ip->i_d.di_flags = 0;
-	ip->i_d.di_flags2 = 0;
+	ip->i_d.di_flags2 = ip->i_mount->m_ino_geo.new_diflags2;
 	ip->i_d.di_dmevmask = 0;
 	ip->i_d.di_forkoff = 0;		/* mark the attr fork not in use */
-	ip->i_d.di_format = XFS_DINODE_FMT_EXTENTS;
-	ip->i_d.di_aformat = XFS_DINODE_FMT_EXTENTS;
+	ip->i_df.if_format = XFS_DINODE_FMT_EXTENTS;
 
 	/* Don't attempt to replay owner changes for a deleted inode */
 	spin_lock(&iip->ili_lock);
@@ -3475,231 +3440,8 @@ out_release_wip:
 	return error;
 }
 
-STATIC int
-xfs_iflush_cluster(
-	struct xfs_inode	*ip,
-	struct xfs_buf		*bp)
-{
-	struct xfs_mount	*mp = ip->i_mount;
-	struct xfs_perag	*pag;
-	unsigned long		first_index, mask;
-	int			cilist_size;
-	struct xfs_inode	**cilist;
-	struct xfs_inode	*cip;
-	struct xfs_ino_geometry	*igeo = M_IGEO(mp);
-	int			error = 0;
-	int			nr_found;
-	int			clcount = 0;
-	int			i;
-
-	pag = xfs_perag_get(mp, XFS_INO_TO_AGNO(mp, ip->i_ino));
-
-	cilist_size = igeo->inodes_per_cluster * sizeof(struct xfs_inode *);
-	cilist = kmem_alloc(cilist_size, KM_MAYFAIL|KM_NOFS);
-	if (!cilist)
-		goto out_put;
-
-	mask = ~(igeo->inodes_per_cluster - 1);
-	first_index = XFS_INO_TO_AGINO(mp, ip->i_ino) & mask;
-	rcu_read_lock();
-	/* really need a gang lookup range call here */
-	nr_found = radix_tree_gang_lookup(&pag->pag_ici_root, (void**)cilist,
-					first_index, igeo->inodes_per_cluster);
-	if (nr_found == 0)
-		goto out_free;
-
-	for (i = 0; i < nr_found; i++) {
-		cip = cilist[i];
-		if (cip == ip)
-			continue;
-
-		/*
-		 * because this is an RCU protected lookup, we could find a
-		 * recently freed or even reallocated inode during the lookup.
-		 * We need to check under the i_flags_lock for a valid inode
-		 * here. Skip it if it is not valid or the wrong inode.
-		 */
-		spin_lock(&cip->i_flags_lock);
-		if (!cip->i_ino ||
-		    __xfs_iflags_test(cip, XFS_ISTALE)) {
-			spin_unlock(&cip->i_flags_lock);
-			continue;
-		}
-
-		/*
-		 * Once we fall off the end of the cluster, no point checking
-		 * any more inodes in the list because they will also all be
-		 * outside the cluster.
-		 */
-		if ((XFS_INO_TO_AGINO(mp, cip->i_ino) & mask) != first_index) {
-			spin_unlock(&cip->i_flags_lock);
-			break;
-		}
-		spin_unlock(&cip->i_flags_lock);
-
-		/*
-		 * Do an un-protected check to see if the inode is dirty and
-		 * is a candidate for flushing.  These checks will be repeated
-		 * later after the appropriate locks are acquired.
-		 */
-		if (xfs_inode_clean(cip) && xfs_ipincount(cip) == 0)
-			continue;
-
-		/*
-		 * Try to get locks.  If any are unavailable or it is pinned,
-		 * then this inode cannot be flushed and is skipped.
-		 */
-
-		if (!xfs_ilock_nowait(cip, XFS_ILOCK_SHARED))
-			continue;
-		if (!xfs_iflock_nowait(cip)) {
-			xfs_iunlock(cip, XFS_ILOCK_SHARED);
-			continue;
-		}
-		if (xfs_ipincount(cip)) {
-			xfs_ifunlock(cip);
-			xfs_iunlock(cip, XFS_ILOCK_SHARED);
-			continue;
-		}
-
-
-		/*
-		 * Check the inode number again, just to be certain we are not
-		 * racing with freeing in xfs_reclaim_inode(). See the comments
-		 * in that function for more information as to why the initial
-		 * check is not sufficient.
-		 */
-		if (!cip->i_ino) {
-			xfs_ifunlock(cip);
-			xfs_iunlock(cip, XFS_ILOCK_SHARED);
-			continue;
-		}
-
-		/*
-		 * arriving here means that this inode can be flushed.  First
-		 * re-check that it's dirty before flushing.
-		 */
-		if (!xfs_inode_clean(cip)) {
-			error = xfs_iflush_int(cip, bp);
-			if (error) {
-				xfs_iunlock(cip, XFS_ILOCK_SHARED);
-				goto out_free;
-			}
-			clcount++;
-		} else {
-			xfs_ifunlock(cip);
-		}
-		xfs_iunlock(cip, XFS_ILOCK_SHARED);
-	}
-
-	if (clcount) {
-		XFS_STATS_INC(mp, xs_icluster_flushcnt);
-		XFS_STATS_ADD(mp, xs_icluster_flushinode, clcount);
-	}
-
-out_free:
-	rcu_read_unlock();
-	kmem_free(cilist);
-out_put:
-	xfs_perag_put(pag);
-	return error;
-}
-
-/*
- * Flush dirty inode metadata into the backing buffer.
- *
- * The caller must have the inode lock and the inode flush lock held.  The
- * inode lock will still be held upon return to the caller, and the inode
- * flush lock will be released after the inode has reached the disk.
- *
- * The caller must write out the buffer returned in *bpp and release it.
- */
-int
+static int
 xfs_iflush(
-	struct xfs_inode	*ip,
-	struct xfs_buf		**bpp)
-{
-	struct xfs_mount	*mp = ip->i_mount;
-	struct xfs_buf		*bp = NULL;
-	struct xfs_dinode	*dip;
-	int			error;
-
-	XFS_STATS_INC(mp, xs_iflush_count);
-
-	ASSERT(xfs_isilocked(ip, XFS_ILOCK_EXCL|XFS_ILOCK_SHARED));
-	ASSERT(xfs_isiflocked(ip));
-	ASSERT(ip->i_d.di_format != XFS_DINODE_FMT_BTREE ||
-	       ip->i_d.di_nextents > XFS_IFORK_MAXEXT(ip, XFS_DATA_FORK));
-
-	*bpp = NULL;
-
-	xfs_iunpin_wait(ip);
-
-	/*
-	 * For stale inodes we cannot rely on the backing buffer remaining
-	 * stale in cache for the remaining life of the stale inode and so
-	 * xfs_imap_to_bp() below may give us a buffer that no longer contains
-	 * inodes below. We have to check this after ensuring the inode is
-	 * unpinned so that it is safe to reclaim the stale inode after the
-	 * flush call.
-	 */
-	if (xfs_iflags_test(ip, XFS_ISTALE)) {
-		xfs_ifunlock(ip);
-		return 0;
-	}
-
-	/*
-	 * Get the buffer containing the on-disk inode. We are doing a try-lock
-	 * operation here, so we may get an EAGAIN error. In that case, return
-	 * leaving the inode dirty.
-	 *
-	 * If we get any other error, we effectively have a corruption situation
-	 * and we cannot flush the inode. Abort the flush and shut down.
-	 */
-	error = xfs_imap_to_bp(mp, NULL, &ip->i_imap, &dip, &bp, XBF_TRYLOCK);
-	if (error == -EAGAIN) {
-		xfs_ifunlock(ip);
-		return error;
-	}
-	if (error)
-		goto abort;
-
-	/*
-	 * If the buffer is pinned then push on the log now so we won't
-	 * get stuck waiting in the write for too long.
-	 */
-	if (xfs_buf_ispinned(bp))
-		xfs_log_force(mp, 0);
-
-	/*
-	 * Flush the provided inode then attempt to gather others from the
-	 * cluster into the write.
-	 *
-	 * Note: Once we attempt to flush an inode, we must run buffer
-	 * completion callbacks on any failure. If this fails, simulate an I/O
-	 * failure on the buffer and shut down.
-	 */
-	error = xfs_iflush_int(ip, bp);
-	if (!error)
-		error = xfs_iflush_cluster(ip, bp);
-	if (error) {
-		bp->b_flags |= XBF_ASYNC;
-		xfs_buf_ioend_fail(bp);
-		goto shutdown;
-	}
-
-	*bpp = bp;
-	return 0;
-
-abort:
-	xfs_iflush_abort(ip);
-shutdown:
-	xfs_force_shutdown(mp, SHUTDOWN_CORRUPT_INCORE);
-	return error;
-}
-
-STATIC int
-xfs_iflush_int(
 	struct xfs_inode	*ip,
 	struct xfs_buf		*bp)
 {
@@ -3709,10 +3451,10 @@ xfs_iflush_int(
 	int			error;
 
 	ASSERT(xfs_isilocked(ip, XFS_ILOCK_EXCL|XFS_ILOCK_SHARED));
-	ASSERT(xfs_isiflocked(ip));
-	ASSERT(ip->i_d.di_format != XFS_DINODE_FMT_BTREE ||
-	       ip->i_d.di_nextents > XFS_IFORK_MAXEXT(ip, XFS_DATA_FORK));
-	ASSERT(iip != NULL && iip->ili_fields != 0);
+	ASSERT(xfs_iflags_test(ip, XFS_IFLUSHING));
+	ASSERT(ip->i_df.if_format != XFS_DINODE_FMT_BTREE ||
+	       ip->i_df.if_nextents > XFS_IFORK_MAXEXT(ip, XFS_DATA_FORK));
+	ASSERT(iip->ili_item.li_buf == bp);
 
 	dip = xfs_buf_offset(bp, ip->i_imap.im_boffset);
 
@@ -3732,8 +3474,8 @@ xfs_iflush_int(
 	}
 	if (S_ISREG(VFS_I(ip)->i_mode)) {
 		if (XFS_TEST_ERROR(
-		    (ip->i_d.di_format != XFS_DINODE_FMT_EXTENTS) &&
-		    (ip->i_d.di_format != XFS_DINODE_FMT_BTREE),
+		    ip->i_df.if_format != XFS_DINODE_FMT_EXTENTS &&
+		    ip->i_df.if_format != XFS_DINODE_FMT_BTREE,
 		    mp, XFS_ERRTAG_IFLUSH_3)) {
 			xfs_alert_tag(mp, XFS_PTAG_IFLUSH,
 				"%s: Bad regular inode %Lu, ptr "PTR_FMT,
@@ -3742,9 +3484,9 @@ xfs_iflush_int(
 		}
 	} else if (S_ISDIR(VFS_I(ip)->i_mode)) {
 		if (XFS_TEST_ERROR(
-		    (ip->i_d.di_format != XFS_DINODE_FMT_EXTENTS) &&
-		    (ip->i_d.di_format != XFS_DINODE_FMT_BTREE) &&
-		    (ip->i_d.di_format != XFS_DINODE_FMT_LOCAL),
+		    ip->i_df.if_format != XFS_DINODE_FMT_EXTENTS &&
+		    ip->i_df.if_format != XFS_DINODE_FMT_BTREE &&
+		    ip->i_df.if_format != XFS_DINODE_FMT_LOCAL,
 		    mp, XFS_ERRTAG_IFLUSH_4)) {
 			xfs_alert_tag(mp, XFS_PTAG_IFLUSH,
 				"%s: Bad directory inode %Lu, ptr "PTR_FMT,
@@ -3752,13 +3494,13 @@ xfs_iflush_int(
 			goto flush_out;
 		}
 	}
-	if (XFS_TEST_ERROR(ip->i_d.di_nextents + ip->i_d.di_anextents >
+	if (XFS_TEST_ERROR(ip->i_df.if_nextents + xfs_ifork_nextents(ip->i_afp) >
 				ip->i_d.di_nblocks, mp, XFS_ERRTAG_IFLUSH_5)) {
 		xfs_alert_tag(mp, XFS_PTAG_IFLUSH,
 			"%s: detected corrupt incore inode %Lu, "
 			"total extents = %d, nblocks = %Ld, ptr "PTR_FMT,
 			__func__, ip->i_ino,
-			ip->i_d.di_nextents + ip->i_d.di_anextents,
+			ip->i_df.if_nextents + xfs_ifork_nextents(ip->i_afp),
 			ip->i_d.di_nblocks, ip);
 		goto flush_out;
 	}
@@ -3786,10 +3528,10 @@ xfs_iflush_int(
 	 * If there are inline format data / attr forks attached to this inode,
 	 * make sure they are not corrupt.
 	 */
-	if (ip->i_d.di_format == XFS_DINODE_FMT_LOCAL &&
+	if (ip->i_df.if_format == XFS_DINODE_FMT_LOCAL &&
 	    xfs_ifork_verify_local_data(ip))
 		goto flush_out;
-	if (ip->i_d.di_aformat == XFS_DINODE_FMT_LOCAL &&
+	if (ip->i_afp && ip->i_afp->if_format == XFS_DINODE_FMT_LOCAL &&
 	    xfs_ifork_verify_local_attr(ip))
 		goto flush_out;
 
@@ -3842,6 +3584,121 @@ flush_out:
 	/* generate the checksum. */
 	xfs_dinode_calc_crc(mp, dip);
 	return error;
+}
+
+/*
+ * Non-blocking flush of dirty inode metadata into the backing buffer.
+ *
+ * The caller must have a reference to the inode and hold the cluster buffer
+ * locked. The function will walk across all the inodes on the cluster buffer it
+ * can find and lock without blocking, and flush them to the cluster buffer.
+ *
+ * On successful flushing of at least one inode, the caller must write out the
+ * buffer and release it. If no inodes are flushed, -EAGAIN will be returned and
+ * the caller needs to release the buffer. On failure, the filesystem will be
+ * shut down, the buffer will have been unlocked and released, and EFSCORRUPTED
+ * will be returned.
+ */
+int
+xfs_iflush_cluster(
+	struct xfs_buf		*bp)
+{
+	struct xfs_mount	*mp = bp->b_mount;
+	struct xfs_log_item	*lip, *n;
+	struct xfs_inode	*ip;
+	struct xfs_inode_log_item *iip;
+	int			clcount = 0;
+	int			error = 0;
+
+	/*
+	 * We must use the safe variant here as on shutdown xfs_iflush_abort()
+	 * can remove itself from the list.
+	 */
+	list_for_each_entry_safe(lip, n, &bp->b_li_list, li_bio_list) {
+		iip = (struct xfs_inode_log_item *)lip;
+		ip = iip->ili_inode;
+
+		/*
+		 * Quick and dirty check to avoid locks if possible.
+		 */
+		if (__xfs_iflags_test(ip, XFS_IRECLAIM | XFS_IFLUSHING))
+			continue;
+		if (xfs_ipincount(ip))
+			continue;
+
+		/*
+		 * The inode is still attached to the buffer, which means it is
+		 * dirty but reclaim might try to grab it. Check carefully for
+		 * that, and grab the ilock while still holding the i_flags_lock
+		 * to guarantee reclaim will not be able to reclaim this inode
+		 * once we drop the i_flags_lock.
+		 */
+		spin_lock(&ip->i_flags_lock);
+		ASSERT(!__xfs_iflags_test(ip, XFS_ISTALE));
+		if (__xfs_iflags_test(ip, XFS_IRECLAIM | XFS_IFLUSHING)) {
+			spin_unlock(&ip->i_flags_lock);
+			continue;
+		}
+
+		/*
+		 * ILOCK will pin the inode against reclaim and prevent
+		 * concurrent transactions modifying the inode while we are
+		 * flushing the inode. If we get the lock, set the flushing
+		 * state before we drop the i_flags_lock.
+		 */
+		if (!xfs_ilock_nowait(ip, XFS_ILOCK_SHARED)) {
+			spin_unlock(&ip->i_flags_lock);
+			continue;
+		}
+		__xfs_iflags_set(ip, XFS_IFLUSHING);
+		spin_unlock(&ip->i_flags_lock);
+
+		/*
+		 * Abort flushing this inode if we are shut down because the
+		 * inode may not currently be in the AIL. This can occur when
+		 * log I/O failure unpins the inode without inserting into the
+		 * AIL, leaving a dirty/unpinned inode attached to the buffer
+		 * that otherwise looks like it should be flushed.
+		 */
+		if (XFS_FORCED_SHUTDOWN(mp)) {
+			xfs_iunpin_wait(ip);
+			xfs_iflush_abort(ip);
+			xfs_iunlock(ip, XFS_ILOCK_SHARED);
+			error = -EIO;
+			continue;
+		}
+
+		/* don't block waiting on a log force to unpin dirty inodes */
+		if (xfs_ipincount(ip)) {
+			xfs_iflags_clear(ip, XFS_IFLUSHING);
+			xfs_iunlock(ip, XFS_ILOCK_SHARED);
+			continue;
+		}
+
+		if (!xfs_inode_clean(ip))
+			error = xfs_iflush(ip, bp);
+		else
+			xfs_iflags_clear(ip, XFS_IFLUSHING);
+		xfs_iunlock(ip, XFS_ILOCK_SHARED);
+		if (error)
+			break;
+		clcount++;
+	}
+
+	if (error) {
+		bp->b_flags |= XBF_ASYNC;
+		xfs_buf_ioend_fail(bp);
+		xfs_force_shutdown(mp, SHUTDOWN_CORRUPT_INCORE);
+		return error;
+	}
+
+	if (!clcount)
+		return -EAGAIN;
+
+	XFS_STATS_INC(mp, xs_icluster_flushcnt);
+	XFS_STATS_ADD(mp, xs_icluster_flushinode, clcount);
+	return 0;
+
 }
 
 /* Release an inode. */

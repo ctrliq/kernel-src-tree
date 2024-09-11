@@ -11,6 +11,7 @@
 #include <linux/mutex.h>
 #include <linux/property.h>
 #include <linux/slab.h>
+#include <linux/usb/pd_vdo.h>
 
 #include "bus.h"
 
@@ -26,6 +27,7 @@ struct typec_cable {
 	enum typec_plug_type		type;
 	struct usb_pd_identity		*identity;
 	unsigned int			active:1;
+	u16				pd_revision; /* 0300H = "3.0" */
 };
 
 struct typec_partner {
@@ -35,6 +37,8 @@ struct typec_partner {
 	enum typec_accessory		accessory;
 	struct ida			mode_ids;
 	int				num_altmodes;
+	u16				pd_revision; /* 0300H = "3.0" */
+	enum usb_pd_svdm_ver		svdm_version;
 };
 
 struct typec_port {
@@ -83,6 +87,29 @@ static const char * const typec_accessory_modes[] = {
 	[TYPEC_ACCESSORY_DEBUG]		= "debug",
 };
 
+/* Product types defined in USB PD Specification R3.0 V2.0 */
+static const char * const product_type_ufp[8] = {
+	[IDH_PTYPE_NOT_UFP]		= "not_ufp",
+	[IDH_PTYPE_HUB]			= "hub",
+	[IDH_PTYPE_PERIPH]		= "peripheral",
+	[IDH_PTYPE_PSD]			= "psd",
+	[IDH_PTYPE_AMA]			= "ama",
+};
+
+static const char * const product_type_dfp[8] = {
+	[IDH_PTYPE_NOT_DFP]		= "not_dfp",
+	[IDH_PTYPE_DFP_HUB]		= "hub",
+	[IDH_PTYPE_DFP_HOST]		= "host",
+	[IDH_PTYPE_DFP_PB]		= "power_brick",
+};
+
+static const char * const product_type_cable[8] = {
+	[IDH_PTYPE_NOT_CABLE]		= "not_cable",
+	[IDH_PTYPE_PCABLE]		= "passive",
+	[IDH_PTYPE_ACABLE]		= "active",
+	[IDH_PTYPE_VPD]			= "vpd",
+};
+
 static struct usb_pd_identity *get_pd_identity(struct device *dev)
 {
 	if (is_typec_partner(dev)) {
@@ -95,6 +122,32 @@ static struct usb_pd_identity *get_pd_identity(struct device *dev)
 		return cable->identity;
 	}
 	return NULL;
+}
+
+static const char *get_pd_product_type(struct device *dev)
+{
+	struct typec_port *port = to_typec_port(dev->parent);
+	struct usb_pd_identity *id = get_pd_identity(dev);
+	const char *ptype = NULL;
+
+	if (is_typec_partner(dev)) {
+		if (!id)
+			return NULL;
+
+		if (port->data_role == TYPEC_HOST)
+			ptype = product_type_ufp[PD_IDH_PTYPE(id->id_header)];
+		else
+			ptype = product_type_dfp[PD_IDH_DFP_PTYPE(id->id_header)];
+	} else if (is_typec_cable(dev)) {
+		if (id)
+			ptype = product_type_cable[PD_IDH_PTYPE(id->id_header)];
+		else
+			ptype = to_typec_cable(dev)->active ?
+				product_type_cable[IDH_PTYPE_ACABLE] :
+				product_type_cable[IDH_PTYPE_PCABLE];
+	}
+
+	return ptype;
 }
 
 static ssize_t id_header_show(struct device *dev, struct device_attribute *attr,
@@ -171,6 +224,25 @@ static const struct attribute_group *usb_pd_id_groups[] = {
 	NULL,
 };
 
+static void typec_product_type_notify(struct device *dev)
+{
+	char *envp[2] = { };
+	const char *ptype;
+
+	ptype = get_pd_product_type(dev);
+	if (!ptype)
+		return;
+
+	sysfs_notify(&dev->kobj, NULL, "type");
+
+	envp[0] = kasprintf(GFP_KERNEL, "PRODUCT_TYPE=%s", ptype);
+	if (!envp[0])
+		return;
+
+	kobject_uevent_env(&dev->kobj, KOBJ_CHANGE, envp);
+	kfree(envp[0]);
+}
+
 static void typec_report_identity(struct device *dev)
 {
 	sysfs_notify(&dev->kobj, "identity", "id_header");
@@ -179,7 +251,26 @@ static void typec_report_identity(struct device *dev)
 	sysfs_notify(&dev->kobj, "identity", "product_type_vdo1");
 	sysfs_notify(&dev->kobj, "identity", "product_type_vdo2");
 	sysfs_notify(&dev->kobj, "identity", "product_type_vdo3");
+	typec_product_type_notify(dev);
 }
+
+static ssize_t
+type_show(struct device *dev, struct device_attribute *attr, char *buf)
+{
+	const char *ptype;
+
+	ptype = get_pd_product_type(dev);
+	if (!ptype)
+		return 0;
+
+	return sysfs_emit(buf, "%s\n", ptype);
+}
+static DEVICE_ATTR_RO(type);
+
+static ssize_t usb_power_delivery_revision_show(struct device *dev,
+						struct device_attribute *attr,
+						char *buf);
+static DEVICE_ATTR_RO(usb_power_delivery_revision);
 
 /* ------------------------------------------------------------------------- */
 /* Alternate Modes */
@@ -596,6 +687,8 @@ static struct attribute *typec_partner_attrs[] = {
 	&dev_attr_accessory_mode.attr,
 	&dev_attr_supports_usb_power_delivery.attr,
 	&dev_attr_number_of_alternate_modes.attr,
+	&dev_attr_type.attr,
+	&dev_attr_usb_power_delivery_revision.attr,
 	NULL
 };
 
@@ -607,6 +700,10 @@ static umode_t typec_partner_attr_is_visible(struct kobject *kobj, struct attrib
 		if (partner->num_altmodes < 0)
 			return 0;
 	}
+
+	if (attr == &dev_attr_type.attr)
+		if (!get_pd_product_type(kobj_to_dev(kobj)))
+			return 0;
 
 	return attr->mode;
 }
@@ -729,6 +826,20 @@ typec_partner_register_altmode(struct typec_partner *partner,
 EXPORT_SYMBOL_GPL(typec_partner_register_altmode);
 
 /**
+ * typec_partner_set_svdm_version - Set negotiated Structured VDM (SVDM) Version
+ * @partner: USB Type-C Partner that supports SVDM
+ * @svdm_version: Negotiated SVDM Version
+ *
+ * This routine is used to save the negotiated SVDM Version.
+ */
+void typec_partner_set_svdm_version(struct typec_partner *partner,
+				   enum usb_pd_svdm_ver svdm_version)
+{
+	partner->svdm_version = svdm_version;
+}
+EXPORT_SYMBOL_GPL(typec_partner_set_svdm_version);
+
+/**
  * typec_register_partner - Register a USB Type-C Partner
  * @port: The USB Type-C Port the partner is connected to
  * @desc: Description of the partner
@@ -751,6 +862,8 @@ struct typec_partner *typec_register_partner(struct typec_port *port,
 	partner->usb_pd = desc->usb_pd;
 	partner->accessory = desc->accessory;
 	partner->num_altmodes = -1;
+	partner->pd_revision = desc->pd_revision;
+	partner->svdm_version = port->cap->svdm_version;
 
 	if (desc->identity) {
 		/*
@@ -944,15 +1057,6 @@ EXPORT_SYMBOL_GPL(typec_unregister_plug);
 
 /* Type-C Cables */
 
-static ssize_t
-type_show(struct device *dev, struct device_attribute *attr, char *buf)
-{
-	struct typec_cable *cable = to_typec_cable(dev);
-
-	return sprintf(buf, "%s\n", cable->active ? "active" : "passive");
-}
-static DEVICE_ATTR_RO(type);
-
 static const char * const typec_plug_types[] = {
 	[USB_PLUG_NONE]		= "unknown",
 	[USB_PLUG_TYPE_A]	= "type-a",
@@ -973,6 +1077,7 @@ static DEVICE_ATTR_RO(plug_type);
 static struct attribute *typec_cable_attrs[] = {
 	&dev_attr_type.attr,
 	&dev_attr_plug_type.attr,
+	&dev_attr_usb_power_delivery_revision.attr,
 	NULL
 };
 ATTRIBUTE_GROUPS(typec_cable);
@@ -1075,6 +1180,7 @@ struct typec_cable *typec_register_cable(struct typec_port *port,
 
 	cable->type = desc->type;
 	cable->active = desc->active;
+	cable->pd_revision = desc->pd_revision;
 
 	if (desc->identity) {
 		/*
@@ -1444,12 +1550,23 @@ static ssize_t usb_power_delivery_revision_show(struct device *dev,
 						struct device_attribute *attr,
 						char *buf)
 {
-	struct typec_port *p = to_typec_port(dev);
-	u16 rev = p->cap->pd_revision;
+	u16 rev = 0;
 
-	return sprintf(buf, "%d.%d\n", (rev >> 8) & 0xff, (rev >> 4) & 0xf);
+	if (is_typec_partner(dev)) {
+		struct typec_partner *partner = to_typec_partner(dev);
+
+		rev = partner->pd_revision;
+	} else if (is_typec_cable(dev)) {
+		struct typec_cable *cable = to_typec_cable(dev);
+
+		rev = cable->pd_revision;
+	} else if (is_typec_port(dev)) {
+		struct typec_port *p = to_typec_port(dev);
+
+		rev = p->cap->pd_revision;
+	}
+	return sysfs_emit(buf, "%d.%d\n", (rev >> 8) & 0xff, (rev >> 4) & 0xf);
 }
-static DEVICE_ATTR_RO(usb_power_delivery_revision);
 
 static ssize_t orientation_show(struct device *dev,
 				   struct device_attribute *attr,
@@ -1553,6 +1670,11 @@ const struct device_type typec_port_dev_type = {
 /* --------------------------------------- */
 /* Driver callbacks to report role updates */
 
+static int partner_match(struct device *dev, void *data)
+{
+	return is_typec_partner(dev);
+}
+
 /**
  * typec_set_data_role - Report data role change
  * @port: The USB Type-C Port where the role was changed
@@ -1562,12 +1684,23 @@ const struct device_type typec_port_dev_type = {
  */
 void typec_set_data_role(struct typec_port *port, enum typec_data_role role)
 {
+	struct device *partner_dev;
+
 	if (port->data_role == role)
 		return;
 
 	port->data_role = role;
 	sysfs_notify(&port->dev.kobj, NULL, "data_role");
 	kobject_uevent(&port->dev.kobj, KOBJ_CHANGE);
+
+	partner_dev = device_find_child(&port->dev, NULL, partner_match);
+	if (!partner_dev)
+		return;
+
+	if (to_typec_partner(partner_dev)->identity)
+		typec_product_type_notify(partner_dev);
+
+	put_device(partner_dev);
 }
 EXPORT_SYMBOL_GPL(typec_set_data_role);
 
@@ -1607,11 +1740,6 @@ void typec_set_vconn_role(struct typec_port *port, enum typec_role role)
 	kobject_uevent(&port->dev.kobj, KOBJ_CHANGE);
 }
 EXPORT_SYMBOL_GPL(typec_set_vconn_role);
-
-static int partner_match(struct device *dev, void *data)
-{
-	return is_typec_partner(dev);
-}
 
 /**
  * typec_set_pwr_opmode - Report changed power operation mode
@@ -1781,6 +1909,33 @@ int typec_set_mode(struct typec_port *port, int mode)
 EXPORT_SYMBOL_GPL(typec_set_mode);
 
 /* --------------------------------------- */
+
+/**
+ * typec_get_negotiated_svdm_version - Get negotiated SVDM Version
+ * @port: USB Type-C Port.
+ *
+ * Get the negotiated SVDM Version. The Version is set to the port default
+ * value stored in typec_capability on partner registration, and updated after
+ * a successful Discover Identity if the negotiated value is less than the
+ * default value.
+ *
+ * Returns usb_pd_svdm_ver if the partner has been registered otherwise -ENODEV.
+ */
+int typec_get_negotiated_svdm_version(struct typec_port *port)
+{
+	enum usb_pd_svdm_ver svdm_version;
+	struct device *partner_dev;
+
+	partner_dev = device_find_child(&port->dev, NULL, partner_match);
+	if (!partner_dev)
+		return -ENODEV;
+
+	svdm_version = to_typec_partner(partner_dev)->svdm_version;
+	put_device(partner_dev);
+
+	return svdm_version;
+}
+EXPORT_SYMBOL_GPL(typec_get_negotiated_svdm_version);
 
 /**
  * typec_get_drvdata - Return private driver data pointer

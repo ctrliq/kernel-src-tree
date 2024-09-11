@@ -35,6 +35,8 @@ struct xfs_icreate_log;
 struct xfs_owner_info;
 struct xfs_trans_res;
 struct xfs_inobt_rec_incore;
+union xfs_btree_ptr;
+struct xfs_dqtrx;
 
 #define XFS_ATTR_FILTER_FLAGS \
 	{ XFS_ATTR_ROOT,	"ROOT" }, \
@@ -863,40 +865,65 @@ DECLARE_EVENT_CLASS(xfs_dquot_class,
 	TP_STRUCT__entry(
 		__field(dev_t, dev)
 		__field(u32, id)
+		__field(xfs_dqtype_t, type)
 		__field(unsigned, flags)
 		__field(unsigned, nrefs)
 		__field(unsigned long long, res_bcount)
+		__field(unsigned long long, res_rtbcount)
+		__field(unsigned long long, res_icount)
+
 		__field(unsigned long long, bcount)
+		__field(unsigned long long, rtbcount)
 		__field(unsigned long long, icount)
+
 		__field(unsigned long long, blk_hardlimit)
 		__field(unsigned long long, blk_softlimit)
+		__field(unsigned long long, rtb_hardlimit)
+		__field(unsigned long long, rtb_softlimit)
 		__field(unsigned long long, ino_hardlimit)
 		__field(unsigned long long, ino_softlimit)
-	), \
+	),
 	TP_fast_assign(
 		__entry->dev = dqp->q_mount->m_super->s_dev;
 		__entry->id = dqp->q_id;
-		__entry->flags = dqp->dq_flags | dqp->q_flags;
+		__entry->type = dqp->q_type;
+		__entry->flags = dqp->q_flags;
 		__entry->nrefs = dqp->q_nrefs;
+
 		__entry->res_bcount = dqp->q_blk.reserved;
+		__entry->res_rtbcount = dqp->q_rtb.reserved;
+		__entry->res_icount = dqp->q_ino.reserved;
+
 		__entry->bcount = dqp->q_blk.count;
+		__entry->rtbcount = dqp->q_rtb.count;
 		__entry->icount = dqp->q_ino.count;
+
 		__entry->blk_hardlimit = dqp->q_blk.hardlimit;
 		__entry->blk_softlimit = dqp->q_blk.softlimit;
+		__entry->rtb_hardlimit = dqp->q_rtb.hardlimit;
+		__entry->rtb_softlimit = dqp->q_rtb.softlimit;
 		__entry->ino_hardlimit = dqp->q_ino.hardlimit;
 		__entry->ino_softlimit = dqp->q_ino.softlimit;
 	),
-	TP_printk("dev %d:%d id 0x%x flags %s nrefs %u res_bc 0x%llx "
+	TP_printk("dev %d:%d id 0x%x type %s flags %s nrefs %u "
+		  "res_bc 0x%llx res_rtbc 0x%llx res_ic 0x%llx "
 		  "bcnt 0x%llx bhardlimit 0x%llx bsoftlimit 0x%llx "
+		  "rtbcnt 0x%llx rtbhardlimit 0x%llx rtbsoftlimit 0x%llx "
 		  "icnt 0x%llx ihardlimit 0x%llx isoftlimit 0x%llx]",
 		  MAJOR(__entry->dev), MINOR(__entry->dev),
 		  __entry->id,
+		  __print_flags(__entry->type, "|", XFS_DQTYPE_STRINGS),
 		  __print_flags(__entry->flags, "|", XFS_DQFLAG_STRINGS),
 		  __entry->nrefs,
 		  __entry->res_bcount,
+		  __entry->res_rtbcount,
+		  __entry->res_icount,
 		  __entry->bcount,
 		  __entry->blk_hardlimit,
 		  __entry->blk_softlimit,
+		  __entry->rtbcount,
+		  __entry->rtb_hardlimit,
+		  __entry->rtb_softlimit,
 		  __entry->icount,
 		  __entry->ino_hardlimit,
 		  __entry->ino_softlimit)
@@ -927,6 +954,125 @@ DEFINE_DQUOT_EVENT(xfs_dqrele);
 DEFINE_DQUOT_EVENT(xfs_dqflush);
 DEFINE_DQUOT_EVENT(xfs_dqflush_force);
 DEFINE_DQUOT_EVENT(xfs_dqflush_done);
+DEFINE_DQUOT_EVENT(xfs_trans_apply_dquot_deltas_before);
+DEFINE_DQUOT_EVENT(xfs_trans_apply_dquot_deltas_after);
+
+#define XFS_QMOPT_FLAGS \
+	{ XFS_QMOPT_UQUOTA,		"UQUOTA" }, \
+	{ XFS_QMOPT_PQUOTA,		"PQUOTA" }, \
+	{ XFS_QMOPT_FORCE_RES,		"FORCE_RES" }, \
+	{ XFS_QMOPT_SBVERSION,		"SBVERSION" }, \
+	{ XFS_QMOPT_GQUOTA,		"GQUOTA" }, \
+	{ XFS_QMOPT_INHERIT,		"INHERIT" }, \
+	{ XFS_QMOPT_RES_REGBLKS,	"RES_REGBLKS" }, \
+	{ XFS_QMOPT_RES_RTBLKS,		"RES_RTBLKS" }, \
+	{ XFS_QMOPT_BCOUNT,		"BCOUNT" }, \
+	{ XFS_QMOPT_ICOUNT,		"ICOUNT" }, \
+	{ XFS_QMOPT_RTBCOUNT,		"RTBCOUNT" }, \
+	{ XFS_QMOPT_DELBCOUNT,		"DELBCOUNT" }, \
+	{ XFS_QMOPT_DELRTBCOUNT,	"DELRTBCOUNT" }, \
+	{ XFS_QMOPT_RES_INOS,		"RES_INOS" }
+
+TRACE_EVENT(xfs_trans_mod_dquot,
+	TP_PROTO(struct xfs_trans *tp, struct xfs_dquot *dqp,
+		 unsigned int field, int64_t delta),
+	TP_ARGS(tp, dqp, field, delta),
+	TP_STRUCT__entry(
+		__field(dev_t, dev)
+		__field(xfs_dqtype_t, type)
+		__field(unsigned int, flags)
+		__field(unsigned int, dqid)
+		__field(unsigned int, field)
+		__field(int64_t, delta)
+	),
+	TP_fast_assign(
+		__entry->dev = tp->t_mountp->m_super->s_dev;
+		__entry->type = dqp->q_type;
+		__entry->flags = dqp->q_flags;
+		__entry->dqid = dqp->q_id;
+		__entry->field = field;
+		__entry->delta = delta;
+	),
+	TP_printk("dev %d:%d dquot id 0x%x type %s flags %s field %s delta %lld",
+		  MAJOR(__entry->dev), MINOR(__entry->dev),
+		  __entry->dqid,
+		  __print_flags(__entry->type, "|", XFS_DQTYPE_STRINGS),
+		  __print_flags(__entry->flags, "|", XFS_DQFLAG_STRINGS),
+		  __print_flags(__entry->field, "|", XFS_QMOPT_FLAGS),
+		  __entry->delta)
+);
+
+DECLARE_EVENT_CLASS(xfs_dqtrx_class,
+	TP_PROTO(struct xfs_dqtrx *qtrx),
+	TP_ARGS(qtrx),
+	TP_STRUCT__entry(
+		__field(dev_t, dev)
+		__field(xfs_dqtype_t, type)
+		__field(unsigned int, flags)
+		__field(u32, dqid)
+
+		__field(uint64_t, blk_res)
+		__field(int64_t,  bcount_delta)
+		__field(int64_t,  delbcnt_delta)
+
+		__field(uint64_t, rtblk_res)
+		__field(uint64_t, rtblk_res_used)
+		__field(int64_t,  rtbcount_delta)
+		__field(int64_t,  delrtb_delta)
+
+		__field(uint64_t, ino_res)
+		__field(uint64_t, ino_res_used)
+		__field(int64_t,  icount_delta)
+	),
+	TP_fast_assign(
+		__entry->dev = qtrx->qt_dquot->q_mount->m_super->s_dev;
+		__entry->type = qtrx->qt_dquot->q_type;
+		__entry->flags = qtrx->qt_dquot->q_flags;
+		__entry->dqid = qtrx->qt_dquot->q_id;
+
+		__entry->blk_res = qtrx->qt_blk_res;
+		__entry->bcount_delta = qtrx->qt_bcount_delta;
+		__entry->delbcnt_delta = qtrx->qt_delbcnt_delta;
+
+		__entry->rtblk_res = qtrx->qt_rtblk_res;
+		__entry->rtblk_res_used = qtrx->qt_rtblk_res_used;
+		__entry->rtbcount_delta = qtrx->qt_rtbcount_delta;
+		__entry->delrtb_delta = qtrx->qt_delrtb_delta;
+
+		__entry->ino_res = qtrx->qt_ino_res;
+		__entry->ino_res_used = qtrx->qt_ino_res_used;
+		__entry->icount_delta = qtrx->qt_icount_delta;
+	),
+	TP_printk("dev %d:%d dquot id 0x%x type %s flags %s"
+		  "blk_res %llu bcount_delta %lld delbcnt_delta %lld "
+		  "rtblk_res %llu rtblk_res_used %llu rtbcount_delta %lld delrtb_delta %lld "
+		  "ino_res %llu ino_res_used %llu icount_delta %lld",
+		MAJOR(__entry->dev), MINOR(__entry->dev),
+		__entry->dqid,
+		  __print_flags(__entry->type, "|", XFS_DQTYPE_STRINGS),
+		  __print_flags(__entry->flags, "|", XFS_DQFLAG_STRINGS),
+
+		__entry->blk_res,
+		__entry->bcount_delta,
+		__entry->delbcnt_delta,
+
+		__entry->rtblk_res,
+		__entry->rtblk_res_used,
+		__entry->rtbcount_delta,
+		__entry->delrtb_delta,
+
+		__entry->ino_res,
+		__entry->ino_res_used,
+		__entry->icount_delta)
+)
+
+#define DEFINE_DQTRX_EVENT(name) \
+DEFINE_EVENT(xfs_dqtrx_class, name, \
+	TP_PROTO(struct xfs_dqtrx *qtrx), \
+	TP_ARGS(qtrx))
+DEFINE_DQTRX_EVENT(xfs_trans_apply_dquot_deltas);
+DEFINE_DQTRX_EVENT(xfs_trans_mod_dquot_before);
+DEFINE_DQTRX_EVENT(xfs_trans_mod_dquot_after);
 
 DECLARE_EVENT_CLASS(xfs_loggrant_class,
 	TP_PROTO(struct xlog *log, struct xlog_ticket *tic),
@@ -1892,8 +2038,8 @@ DECLARE_EVENT_CLASS(xfs_swap_extent_class,
 		__entry->dev = VFS_I(ip)->i_sb->s_dev;
 		__entry->which = which;
 		__entry->ino = ip->i_ino;
-		__entry->format = ip->i_d.di_format;
-		__entry->nex = ip->i_d.di_nextents;
+		__entry->format = ip->i_df.if_format;
+		__entry->nex = ip->i_df.if_nextents;
 		__entry->broot_size = ip->i_df.if_broot_bytes;
 		__entry->fork_off = XFS_IFORK_BOFF(ip);
 	),
@@ -3552,6 +3698,177 @@ TRACE_EVENT(xfs_check_new_dalign,
 		  __entry->new_dalign, __entry->sb_rootino,
 		  __entry->calc_rootino)
 )
+
+TRACE_EVENT(xfs_btree_commit_afakeroot,
+	TP_PROTO(struct xfs_btree_cur *cur),
+	TP_ARGS(cur),
+	TP_STRUCT__entry(
+		__field(dev_t, dev)
+		__field(xfs_btnum_t, btnum)
+		__field(xfs_agnumber_t, agno)
+		__field(xfs_agblock_t, agbno)
+		__field(unsigned int, levels)
+		__field(unsigned int, blocks)
+	),
+	TP_fast_assign(
+		__entry->dev = cur->bc_mp->m_super->s_dev;
+		__entry->btnum = cur->bc_btnum;
+		__entry->agno = cur->bc_ag.agno;
+		__entry->agbno = cur->bc_ag.afake->af_root;
+		__entry->levels = cur->bc_ag.afake->af_levels;
+		__entry->blocks = cur->bc_ag.afake->af_blocks;
+	),
+	TP_printk("dev %d:%d btree %s ag %u levels %u blocks %u root %u",
+		  MAJOR(__entry->dev), MINOR(__entry->dev),
+		  __print_symbolic(__entry->btnum, XFS_BTNUM_STRINGS),
+		  __entry->agno,
+		  __entry->levels,
+		  __entry->blocks,
+		  __entry->agbno)
+)
+
+TRACE_EVENT(xfs_btree_commit_ifakeroot,
+	TP_PROTO(struct xfs_btree_cur *cur),
+	TP_ARGS(cur),
+	TP_STRUCT__entry(
+		__field(dev_t, dev)
+		__field(xfs_btnum_t, btnum)
+		__field(xfs_agnumber_t, agno)
+		__field(xfs_agino_t, agino)
+		__field(unsigned int, levels)
+		__field(unsigned int, blocks)
+		__field(int, whichfork)
+	),
+	TP_fast_assign(
+		__entry->dev = cur->bc_mp->m_super->s_dev;
+		__entry->btnum = cur->bc_btnum;
+		__entry->agno = XFS_INO_TO_AGNO(cur->bc_mp,
+					cur->bc_ino.ip->i_ino);
+		__entry->agino = XFS_INO_TO_AGINO(cur->bc_mp,
+					cur->bc_ino.ip->i_ino);
+		__entry->levels = cur->bc_ino.ifake->if_levels;
+		__entry->blocks = cur->bc_ino.ifake->if_blocks;
+		__entry->whichfork = cur->bc_ino.whichfork;
+	),
+	TP_printk("dev %d:%d btree %s ag %u agino %u whichfork %s levels %u blocks %u",
+		  MAJOR(__entry->dev), MINOR(__entry->dev),
+		  __print_symbolic(__entry->btnum, XFS_BTNUM_STRINGS),
+		  __entry->agno,
+		  __entry->agino,
+		  __entry->whichfork == XFS_ATTR_FORK ? "attr" : "data",
+		  __entry->levels,
+		  __entry->blocks)
+)
+
+TRACE_EVENT(xfs_btree_bload_level_geometry,
+	TP_PROTO(struct xfs_btree_cur *cur, unsigned int level,
+		 uint64_t nr_this_level, unsigned int nr_per_block,
+		 unsigned int desired_npb, uint64_t blocks,
+		 uint64_t blocks_with_extra),
+	TP_ARGS(cur, level, nr_this_level, nr_per_block, desired_npb, blocks,
+		blocks_with_extra),
+	TP_STRUCT__entry(
+		__field(dev_t, dev)
+		__field(xfs_btnum_t, btnum)
+		__field(unsigned int, level)
+		__field(unsigned int, nlevels)
+		__field(uint64_t, nr_this_level)
+		__field(unsigned int, nr_per_block)
+		__field(unsigned int, desired_npb)
+		__field(unsigned long long, blocks)
+		__field(unsigned long long, blocks_with_extra)
+	),
+	TP_fast_assign(
+		__entry->dev = cur->bc_mp->m_super->s_dev;
+		__entry->btnum = cur->bc_btnum;
+		__entry->level = level;
+		__entry->nlevels = cur->bc_nlevels;
+		__entry->nr_this_level = nr_this_level;
+		__entry->nr_per_block = nr_per_block;
+		__entry->desired_npb = desired_npb;
+		__entry->blocks = blocks;
+		__entry->blocks_with_extra = blocks_with_extra;
+	),
+	TP_printk("dev %d:%d btree %s level %u/%u nr_this_level %llu nr_per_block %u desired_npb %u blocks %llu blocks_with_extra %llu",
+		  MAJOR(__entry->dev), MINOR(__entry->dev),
+		  __print_symbolic(__entry->btnum, XFS_BTNUM_STRINGS),
+		  __entry->level,
+		  __entry->nlevels,
+		  __entry->nr_this_level,
+		  __entry->nr_per_block,
+		  __entry->desired_npb,
+		  __entry->blocks,
+		  __entry->blocks_with_extra)
+)
+
+TRACE_EVENT(xfs_btree_bload_block,
+	TP_PROTO(struct xfs_btree_cur *cur, unsigned int level,
+		 uint64_t block_idx, uint64_t nr_blocks,
+		 union xfs_btree_ptr *ptr, unsigned int nr_records),
+	TP_ARGS(cur, level, block_idx, nr_blocks, ptr, nr_records),
+	TP_STRUCT__entry(
+		__field(dev_t, dev)
+		__field(xfs_btnum_t, btnum)
+		__field(unsigned int, level)
+		__field(unsigned long long, block_idx)
+		__field(unsigned long long, nr_blocks)
+		__field(xfs_agnumber_t, agno)
+		__field(xfs_agblock_t, agbno)
+		__field(unsigned int, nr_records)
+	),
+	TP_fast_assign(
+		__entry->dev = cur->bc_mp->m_super->s_dev;
+		__entry->btnum = cur->bc_btnum;
+		__entry->level = level;
+		__entry->block_idx = block_idx;
+		__entry->nr_blocks = nr_blocks;
+		if (cur->bc_flags & XFS_BTREE_LONG_PTRS) {
+			xfs_fsblock_t	fsb = be64_to_cpu(ptr->l);
+
+			__entry->agno = XFS_FSB_TO_AGNO(cur->bc_mp, fsb);
+			__entry->agbno = XFS_FSB_TO_AGBNO(cur->bc_mp, fsb);
+		} else {
+			__entry->agno = cur->bc_ag.agno;
+			__entry->agbno = be32_to_cpu(ptr->s);
+		}
+		__entry->nr_records = nr_records;
+	),
+	TP_printk("dev %d:%d btree %s level %u block %llu/%llu fsb (%u/%u) recs %u",
+		  MAJOR(__entry->dev), MINOR(__entry->dev),
+		  __print_symbolic(__entry->btnum, XFS_BTNUM_STRINGS),
+		  __entry->level,
+		  __entry->block_idx,
+		  __entry->nr_blocks,
+		  __entry->agno,
+		  __entry->agbno,
+		  __entry->nr_records)
+)
+
+DECLARE_EVENT_CLASS(xfs_timestamp_range_class,
+	TP_PROTO(struct xfs_mount *mp, time64_t min, time64_t max),
+	TP_ARGS(mp, min, max),
+	TP_STRUCT__entry(
+		__field(dev_t, dev)
+		__field(long long, min)
+		__field(long long, max)
+	),
+	TP_fast_assign(
+		__entry->dev = mp->m_super->s_dev;
+		__entry->min = min;
+		__entry->max = max;
+	),
+	TP_printk("dev %d:%d min %lld max %lld",
+		  MAJOR(__entry->dev), MINOR(__entry->dev),
+		  __entry->min,
+		  __entry->max)
+)
+
+#define DEFINE_TIMESTAMP_RANGE_EVENT(name) \
+DEFINE_EVENT(xfs_timestamp_range_class, name, \
+	TP_PROTO(struct xfs_mount *mp, long long min, long long max), \
+	TP_ARGS(mp, min, max))
+DEFINE_TIMESTAMP_RANGE_EVENT(xfs_inode_timestamp_range);
+DEFINE_TIMESTAMP_RANGE_EVENT(xfs_quota_expiry_range);
 
 #endif /* _TRACE_XFS_H */
 

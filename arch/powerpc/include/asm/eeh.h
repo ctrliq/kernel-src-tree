@@ -40,7 +40,6 @@ struct pci_dn;
 #define EEH_FORCE_DISABLED	0x02	/* EEH disabled			     */
 #define EEH_PROBE_MODE_DEV	0x04	/* From PCI device		     */
 #define EEH_PROBE_MODE_DEVTREE	0x08	/* From device tree		     */
-#define EEH_VALID_PE_ZERO	0x10	/* PE#0 is valid		     */
 #define EEH_ENABLE_IO_FOR_LOG	0x20	/* Enable IO for log		     */
 #define EEH_EARLY_DUMP_LOG	0x40	/* Dump log immediately		     */
 
@@ -87,6 +86,7 @@ struct pci_dn;
 struct eeh_pe {
 	int type;			/* PE type: PHB/Bus/Device	*/
 	int state;			/* PE EEH dependent mode	*/
+	RH_KABI_DEPRECATE(int, config_addr)/* Traditional PCI address   */
 	int addr;			/* PE configuration address	*/
 	struct pci_controller *phb;	/* Associated PHB		*/
 	struct pci_bus *bus;		/* Top PCI bus for bus PE	*/
@@ -145,7 +145,7 @@ static inline bool eeh_pe_passed(struct eeh_pe *pe)
 
 struct eeh_dev {
 	int mode;			/* EEH mode			*/
-	int class_code;			/* Class code of the device	*/
+	RH_KABI_DEPRECATE(int, class_code)/* Class code of the device   */
 	int pe_config_addr;		/* PE config address		*/
 	u32 config_space[16];		/* Saved PCI config space	*/
 	int pcix_cap;			/* Saved PCIx capability	*/
@@ -158,9 +158,12 @@ struct eeh_dev {
 	struct pci_dn *pdn;		/* Associated PCI device node	*/
 	struct pci_dev *pdev;		/* Associated PCI device	*/
 	bool in_error;			/* Error flag for edev		*/
+
+	/* VF specific properties */
 	struct pci_dev *physfn;		/* Associated SRIOV PF		*/
 	RH_KABI_REPLACE(struct pci_bus * bus, struct pci_controller *controller)
 	RH_KABI_EXTEND(int bdfn)	/* bdfn of device (for cfg ops) */
+	RH_KABI_EXTEND(int vf_index)    /* Index of this VF             */
 };
 
 /* "fmt" must be a simple literal string */
@@ -226,8 +229,10 @@ enum {
 
 struct eeh_ops {
 	char *name;
+	RH_KABI_DEPRECATE_FN(int*, init, void);
 	struct eeh_dev *(*probe)(struct pci_dev *pdev);
 	int (*set_option)(struct eeh_pe *pe, int option);
+	RH_KABI_DEPRECATE_FN(int, get_pe_addr, struct eeh_pe *pe);
 	int (*get_state)(struct eeh_pe *pe, int *delay);
 	int (*reset)(struct eeh_pe *pe, int option);
 	RH_KABI_DEPRECATE_FN(int, wait_state, struct eeh_pe *pe, int max_wait);
@@ -235,11 +240,15 @@ struct eeh_ops {
 	int (*configure_bridge)(struct eeh_pe *pe);
 	int (*err_inject)(struct eeh_pe *pe, int type, int func,
 			  unsigned long addr, unsigned long mask);
-	int (*read_config)(struct eeh_dev *edev, int where, int size, u32 *val);
-	int (*write_config)(struct eeh_dev *edev, int where, int size, u32 val);
+	RH_KABI_REPLACE(int (*read_config)(struct pci_dn *pdn, int where, int size, u32 *val),                                         
+			int (*read_config)(struct eeh_dev *edev, int where, int size, u32 *val))                                       
+	RH_KABI_REPLACE(int (*write_config)(struct pci_dn *pdn, int where, int size, u32 val),                                         
+			int (*write_config)(struct eeh_dev *edev, int where, int size, u32 val))
 	int (*next_error)(struct eeh_pe **pe);
-	int (*restore_config)(struct eeh_dev *edev);
-	int (*notify_resume)(struct eeh_dev *edev);
+	RH_KABI_REPLACE(int (*restore_config)(struct pci_dn *pdn),
+			int (*restore_config)(struct eeh_dev *edev))
+	RH_KABI_REPLACE(int (*notify_resume)(struct pci_dn *pdn),
+			int (*notify_resume)(struct eeh_dev *edev))
 };
 
 extern int eeh_subsystem_flags;
@@ -290,8 +299,7 @@ int eeh_phb_pe_create(struct pci_controller *phb);
 int eeh_wait_state(struct eeh_pe *pe, int max_wait);
 struct eeh_pe *eeh_phb_pe_get(struct pci_controller *phb);
 struct eeh_pe *eeh_pe_next(struct eeh_pe *pe, struct eeh_pe *root);
-struct eeh_pe *eeh_pe_get(struct pci_controller *phb,
-			  int pe_no, int config_addr);
+struct eeh_pe *eeh_pe_get(struct pci_controller *phb, int pe_no);
 int eeh_pe_tree_insert(struct eeh_dev *edev, struct eeh_pe *new_pe_parent);
 int eeh_pe_tree_remove(struct eeh_dev *edev);
 void eeh_pe_update_time_stamp(struct eeh_pe *pe);
@@ -303,7 +311,6 @@ void eeh_pe_restore_bars(struct eeh_pe *pe);
 const char *eeh_pe_loc_get(struct eeh_pe *pe);
 struct pci_bus *eeh_pe_bus_get(struct eeh_pe *pe);
 
-struct eeh_dev *eeh_dev_init(struct pci_dn *pdn);
 void eeh_show_enabled(void);
 int __init eeh_init(struct eeh_ops *ops);
 int eeh_check_failure(const volatile void __iomem *token);
@@ -346,11 +353,6 @@ static inline bool eeh_enabled(void)
 }
 
 static inline void eeh_show_enabled(void) { }
-
-static inline void *eeh_dev_init(struct pci_dn *pdn, void *data)
-{
-	return NULL;
-}
 
 static inline void eeh_dev_phb_init_dynamic(struct pci_controller *phb) { }
 
@@ -477,6 +479,9 @@ static inline void eeh_readsl(const volatile void __iomem *addr, void * buf,
 	if (EEH_POSSIBLE_ERROR((*(((u32*)buf)+nl-1)), u32))
 		eeh_check_failure(addr);
 }
+
+
+void eeh_cache_debugfs_init(void);
 
 #endif /* CONFIG_PPC64 */
 #endif /* __KERNEL__ */

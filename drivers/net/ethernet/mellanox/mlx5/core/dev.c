@@ -47,7 +47,7 @@ static bool is_eth_rep_supported(struct mlx5_core_dev *dev)
 	if (!MLX5_ESWITCH_MANAGER(dev))
 		return false;
 
-	if (mlx5_eswitch_mode(dev->priv.eswitch) != MLX5_ESWITCH_OFFLOADS)
+	if (!is_mdev_switchdev_mode(dev))
 		return false;
 
 	return true;
@@ -56,9 +56,6 @@ static bool is_eth_rep_supported(struct mlx5_core_dev *dev)
 static bool is_eth_supported(struct mlx5_core_dev *dev)
 {
 	if (!IS_ENABLED(CONFIG_MLX5_CORE_EN))
-		return false;
-
-	if (is_eth_rep_supported(dev))
 		return false;
 
 	if (MLX5_CAP_GEN(dev, port_type) != MLX5_CAP_PORT_TYPE_ETH)
@@ -144,7 +141,7 @@ static bool is_ib_rep_supported(struct mlx5_core_dev *dev)
 	if (!MLX5_ESWITCH_MANAGER(dev))
 		return false;
 
-	if (mlx5_eswitch_mode(dev->priv.eswitch) != MLX5_ESWITCH_OFFLOADS)
+	if (!is_mdev_switchdev_mode(dev))
 		return false;
 
 	if (mlx5_core_mp_enabled(dev))

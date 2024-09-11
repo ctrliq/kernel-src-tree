@@ -185,9 +185,6 @@ static void __init maple_setup_arch(void)
 #ifdef CONFIG_SMP
 	smp_ops = &maple_smp_ops;
 #endif
-	/* Lookup PCI hosts */
-       	maple_pci_init();
-
 #ifdef CONFIG_DUMMY_CONSOLE
 	conswitchp = &dummy_con;
 #endif
@@ -360,6 +357,7 @@ define_machine(maple) {
 	.name			= "Maple",
 	.probe			= maple_probe,
 	.setup_arch		= maple_setup_arch,
+	.discover_phbs		= maple_pci_init,
 	.init_IRQ		= maple_init_IRQ,
 	.pci_irq_fixup		= maple_pci_irq_fixup,
 	.pci_get_legacy_ide_irq	= maple_pci_get_legacy_ide_irq,

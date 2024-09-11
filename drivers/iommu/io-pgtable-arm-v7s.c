@@ -505,7 +505,6 @@ static int arm_v7s_map(struct io_pgtable_ops *ops, unsigned long iova,
 			phys_addr_t paddr, size_t size, int prot, gfp_t gfp)
 {
 	struct arm_v7s_io_pgtable *data = io_pgtable_ops_to_data(ops);
-	struct io_pgtable *iop = &data->iop;
 	int ret;
 
 	if (WARN_ON(iova >= (1ULL << data->iop.cfg.ias) ||
@@ -521,12 +520,7 @@ static int arm_v7s_map(struct io_pgtable_ops *ops, unsigned long iova,
 	 * Synchronise all PTE updates for the new mapping before there's
 	 * a chance for anything to kick off a table walk for the new iova.
 	 */
-	if (iop->cfg.quirks & IO_PGTABLE_QUIRK_TLBI_ON_MAP) {
-		io_pgtable_tlb_flush_walk(iop, iova, size,
-					  ARM_V7S_BLOCK_SIZE(2));
-	} else {
-		wmb();
-	}
+	wmb();
 
 	return ret;
 }
@@ -570,7 +564,7 @@ static arm_v7s_iopte arm_v7s_split_cont(struct arm_v7s_io_pgtable *data,
 	__arm_v7s_pte_sync(ptep, ARM_V7S_CONT_PAGES, &iop->cfg);
 
 	size *= ARM_V7S_CONT_PAGES;
-	io_pgtable_tlb_flush_leaf(iop, iova, size, size);
+	io_pgtable_tlb_flush_walk(iop, iova, size, size);
 	return pte;
 }
 
@@ -742,7 +736,6 @@ static struct io_pgtable *arm_v7s_alloc_pgtable(struct io_pgtable_cfg *cfg,
 
 	if (cfg->quirks & ~(IO_PGTABLE_QUIRK_ARM_NS |
 			    IO_PGTABLE_QUIRK_NO_PERMS |
-			    IO_PGTABLE_QUIRK_TLBI_ON_MAP |
 			    IO_PGTABLE_QUIRK_ARM_MTK_4GB |
 			    IO_PGTABLE_QUIRK_NON_STRICT))
 		return NULL;
@@ -849,7 +842,6 @@ static void __init dummy_tlb_add_page(struct iommu_iotlb_gather *gather,
 static const struct iommu_flush_ops dummy_tlb_ops __initconst = {
 	.tlb_flush_all	= dummy_tlb_flush_all,
 	.tlb_flush_walk	= dummy_tlb_flush,
-	.tlb_flush_leaf	= dummy_tlb_flush,
 	.tlb_add_page	= dummy_tlb_add_page,
 };
 

@@ -17,6 +17,7 @@ static const char * const profile_names[] = {
 	[PLATFORM_PROFILE_COOL] = "cool",
 	[PLATFORM_PROFILE_QUIET] = "quiet",
 	[PLATFORM_PROFILE_BALANCED] = "balanced",
+	[PLATFORM_PROFILE_BALANCED_PERFORMANCE] = "balanced-performance",
 	[PLATFORM_PROFILE_PERFORMANCE] = "performance",
 };
 static_assert(ARRAY_SIZE(profile_names) == PLATFORM_PROFILE_LAST);
@@ -39,11 +40,11 @@ static ssize_t platform_profile_choices_show(struct device *dev,
 
 	for_each_set_bit(i, cur_profile->choices, PLATFORM_PROFILE_LAST) {
 		if (len == 0)
-			len += sysfs_emit_at(buf, len, "%s", profile_names[i]);
+			len += scnprintf(buf, len, "%s", profile_names[i]);
 		else
-			len += sysfs_emit_at(buf, len, " %s", profile_names[i]);
+			len += scnprintf(buf, len, " %s", profile_names[i]);
 	}
-	len += sysfs_emit_at(buf, len, "\n");
+	len += scnprintf(buf, len, "\n");
 	mutex_unlock(&profile_lock);
 	return len;
 }
@@ -73,7 +74,7 @@ static ssize_t platform_profile_show(struct device *dev,
 	if (WARN_ON((profile < 0) || (profile >= ARRAY_SIZE(profile_names))))
 		return -EIO;
 
-	return sysfs_emit(buf, "%s\n", profile_names[profile]);
+	return sprintf(buf, "%s\n", profile_names[profile]);
 }
 
 static ssize_t platform_profile_store(struct device *dev,

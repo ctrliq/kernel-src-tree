@@ -151,7 +151,7 @@ xfs_alloc_lookup_eq(
 	cur->bc_rec.a.ar_startblock = bno;
 	cur->bc_rec.a.ar_blockcount = len;
 	error = xfs_btree_lookup(cur, XFS_LOOKUP_EQ, stat);
-	cur->bc_private.a.priv.abt.active = (*stat == 1);
+	cur->bc_ag.abt.active = (*stat == 1);
 	return error;
 }
 
@@ -171,7 +171,7 @@ xfs_alloc_lookup_ge(
 	cur->bc_rec.a.ar_startblock = bno;
 	cur->bc_rec.a.ar_blockcount = len;
 	error = xfs_btree_lookup(cur, XFS_LOOKUP_GE, stat);
-	cur->bc_private.a.priv.abt.active = (*stat == 1);
+	cur->bc_ag.abt.active = (*stat == 1);
 	return error;
 }
 
@@ -190,7 +190,7 @@ xfs_alloc_lookup_le(
 	cur->bc_rec.a.ar_startblock = bno;
 	cur->bc_rec.a.ar_blockcount = len;
 	error = xfs_btree_lookup(cur, XFS_LOOKUP_LE, stat);
-	cur->bc_private.a.priv.abt.active = (*stat == 1);
+	cur->bc_ag.abt.active = (*stat == 1);
 	return error;
 }
 
@@ -198,7 +198,7 @@ static inline bool
 xfs_alloc_cur_active(
 	struct xfs_btree_cur	*cur)
 {
-	return cur && cur->bc_private.a.priv.abt.active;
+	return cur && cur->bc_ag.abt.active;
 }
 
 /*
@@ -230,7 +230,7 @@ xfs_alloc_get_rec(
 	int			*stat)	/* output: success/failure */
 {
 	struct xfs_mount	*mp = cur->bc_mp;
-	xfs_agnumber_t		agno = cur->bc_private.a.agno;
+	xfs_agnumber_t		agno = cur->bc_ag.agno;
 	union xfs_btree_rec	*rec;
 	int			error;
 
@@ -710,13 +710,12 @@ xfs_alloc_read_agfl(
 STATIC int
 xfs_alloc_update_counters(
 	struct xfs_trans	*tp,
-	struct xfs_perag	*pag,
 	struct xfs_buf		*agbp,
 	long			len)
 {
 	struct xfs_agf		*agf = agbp->b_addr;
 
-	pag->pagf_freeblks += len;
+	agbp->b_pag->pagf_freeblks += len;
 	be32_add_cpu(&agf->agf_freeblks, len);
 
 	xfs_trans_agblocks_delta(tp, len);
@@ -908,7 +907,7 @@ xfs_alloc_cur_check(
 		deactivate = true;
 out:
 	if (deactivate)
-		cur->bc_private.a.priv.abt.active = false;
+		cur->bc_ag.abt.active = false;
 	trace_xfs_alloc_cur_check(args->mp, cur->bc_btnum, bno, len, diff,
 				  *new);
 	return 0;
@@ -1175,8 +1174,7 @@ xfs_alloc_ag_vextent(
 	}
 
 	if (!args->wasfromfl) {
-		error = xfs_alloc_update_counters(args->tp, args->pag,
-						  args->agbp,
+		error = xfs_alloc_update_counters(args->tp, args->agbp,
 						  -((long)(args->len)));
 		if (error)
 			return error;
@@ -1352,7 +1350,7 @@ xfs_alloc_walk_iter(
 		if (error)
 			return error;
 		if (i == 0)
-			cur->bc_private.a.priv.abt.active = false;
+			cur->bc_ag.abt.active = false;
 
 		if (count > 0)
 			count--;
@@ -1467,7 +1465,7 @@ xfs_alloc_ag_vextent_locality(
 		if (error)
 			return error;
 		if (i) {
-			acur->cnt->bc_private.a.priv.abt.active = true;
+			acur->cnt->bc_ag.abt.active = true;
 			fbcur = acur->cnt;
 			fbinc = false;
 		}
@@ -1887,7 +1885,6 @@ xfs_free_ag_extent(
 	enum xfs_ag_resv_type		type)
 {
 	struct xfs_mount		*mp;
-	struct xfs_perag		*pag;
 	struct xfs_btree_cur		*bno_cur;
 	struct xfs_btree_cur		*cnt_cur;
 	xfs_agblock_t			gtbno; /* start of right neighbor */
@@ -2167,10 +2164,8 @@ xfs_free_ag_extent(
 	/*
 	 * Update the freespace totals in the ag and superblock.
 	 */
-	pag = xfs_perag_get(mp, agno);
-	error = xfs_alloc_update_counters(tp, pag, agbp, len);
-	xfs_ag_resv_free_extent(pag, type, tp, len);
-	xfs_perag_put(pag);
+	error = xfs_alloc_update_counters(tp, agbp, len);
+	xfs_ag_resv_free_extent(agbp->b_pag, type, tp, len);
 	if (error)
 		goto error0;
 
@@ -2691,7 +2686,7 @@ xfs_alloc_get_freelist(
 	if (be32_to_cpu(agf->agf_flfirst) == xfs_agfl_size(mp))
 		agf->agf_flfirst = 0;
 
-	pag = xfs_perag_get(mp, be32_to_cpu(agf->agf_seqno));
+	pag = agbp->b_pag;
 	ASSERT(!pag->pagf_agflreset);
 	be32_add_cpu(&agf->agf_flcount, -1);
 	xfs_trans_agflist_delta(tp, -1);
@@ -2703,7 +2698,6 @@ xfs_alloc_get_freelist(
 		pag->pagf_btreeblks++;
 		logflags |= XFS_AGF_BTREEBLKS;
 	}
-	xfs_perag_put(pag);
 
 	xfs_alloc_log_agf(tp, agbp, logflags);
 	*bnop = bno;
@@ -2799,7 +2793,7 @@ xfs_alloc_put_freelist(
 	if (be32_to_cpu(agf->agf_fllast) == xfs_agfl_size(mp))
 		agf->agf_fllast = 0;
 
-	pag = xfs_perag_get(mp, be32_to_cpu(agf->agf_seqno));
+	pag = agbp->b_pag;
 	ASSERT(!pag->pagf_agflreset);
 	be32_add_cpu(&agf->agf_flcount, 1);
 	xfs_trans_agflist_delta(tp, 1);
@@ -2811,7 +2805,6 @@ xfs_alloc_put_freelist(
 		pag->pagf_btreeblks--;
 		logflags |= XFS_AGF_BTREEBLKS;
 	}
-	xfs_perag_put(pag);
 
 	xfs_alloc_log_agf(tp, agbp, logflags);
 
@@ -3009,7 +3002,7 @@ xfs_alloc_read_agf(
 	ASSERT(!(*bpp)->b_error);
 
 	agf = (*bpp)->b_addr;
-	pag = xfs_perag_get(mp, agno);
+	pag = (*bpp)->b_pag;
 	if (!pag->pagf_init) {
 		pag->pagf_freeblks = be32_to_cpu(agf->agf_freeblks);
 		pag->pagf_btreeblks = be32_to_cpu(agf->agf_btreeblks);
@@ -3050,7 +3043,6 @@ xfs_alloc_read_agf(
 		       be32_to_cpu(agf->agf_levels[XFS_BTNUM_CNTi]));
 	}
 #endif
-	xfs_perag_put(pag);
 	return 0;
 }
 

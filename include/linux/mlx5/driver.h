@@ -194,7 +194,8 @@ enum port_state_policy {
 
 enum mlx5_coredev_type {
 	MLX5_COREDEV_PF,
-	MLX5_COREDEV_VF
+	MLX5_COREDEV_VF,
+	MLX5_COREDEV_SF,
 };
 
 struct mlx5_field_desc {
@@ -367,6 +368,8 @@ struct mlx5_core_mkey {
 	u32			key;
 	u32			pd;
 	u32			type;
+	struct wait_queue_head wait;
+	refcount_t usecount;
 };
 
 #define MLX5_24BIT_MASK		((1 << 24) - 1)
@@ -498,9 +501,13 @@ struct mlx5_mpfs;
 struct mlx5_eswitch;
 struct mlx5_lag;
 struct mlx5_devcom;
+struct mlx5_fw_reset;
 struct mlx5_eq_table;
 struct mlx5_irq_table;
 struct mlx5_vhca_state_notifier;
+struct mlx5_sf_dev_table;
+struct mlx5_sf_hw_table;
+struct mlx5_sf_table;
 
 struct mlx5_rate_limit {
 	u32			rate;
@@ -595,6 +602,7 @@ struct mlx5_priv {
 	struct mlx5_lag		*lag;
 	u32			flags;
 	struct mlx5_devcom	*devcom;
+	struct mlx5_fw_reset	*fw_reset;
 	struct mlx5_core_roce	roce;
 	struct mlx5_fc_stats		fc_stats;
 	struct mlx5_rl_table            rl_table;
@@ -603,6 +611,12 @@ struct mlx5_priv {
 	struct mlx5_uars_page	       *uar;
 #ifdef CONFIG_MLX5_SF
 	struct mlx5_vhca_state_notifier *vhca_state_notifier;
+	struct mlx5_sf_dev_table *sf_dev_table;
+	struct mlx5_core_dev *parent_mdev;
+#endif
+#ifdef CONFIG_MLX5_SF_MANAGER
+	struct mlx5_sf_hw_table *sf_hw_table;
+	struct mlx5_sf_table *sf_table;
 #endif
 };
 
@@ -635,10 +649,13 @@ struct mlx5_td {
 };
 
 struct mlx5e_resources {
-	u32                        pdn;
-	struct mlx5_td             td;
-	struct mlx5_core_mkey      mkey;
-	struct mlx5_sq_bfreg       bfreg;
+	struct mlx5e_hw_objs {
+		u32                        pdn;
+		struct mlx5_td             td;
+		struct mlx5_core_mkey      mkey;
+		struct mlx5_sq_bfreg       bfreg;
+	} hw_objs;
+	struct net_device *uplink_netdev;
 };
 
 enum mlx5_sw_icm_type {
@@ -689,6 +706,27 @@ struct mlx5_hv_vhca;
 #define MLX5_LOG_SW_ICM_BLOCK_SIZE(dev) (MLX5_CAP_DEV_MEM(dev, log_sw_icm_alloc_granularity))
 #define MLX5_SW_ICM_BLOCK_SIZE(dev) (1 << MLX5_LOG_SW_ICM_BLOCK_SIZE(dev))
 
+enum {
+	MLX5_PROF_MASK_QP_SIZE		= (u64)1 << 0,
+	MLX5_PROF_MASK_MR_CACHE		= (u64)1 << 1,
+};
+
+enum {
+	MR_CACHE_LAST_STD_ENTRY = 20,
+	MLX5_IMR_MTT_CACHE_ENTRY,
+	MLX5_IMR_KSM_CACHE_ENTRY,
+	MAX_MR_CACHE_ENTRIES
+};
+
+struct mlx5_profile {
+	u64	mask;
+	u8	log_max_qp;
+	struct {
+		int	size;
+		int	limit;
+	} mr_cache[MAX_MR_CACHE_ENTRIES];
+};
+
 struct mlx5_core_dev {
 	struct device *device;
 	enum mlx5_coredev_type coredev_type;
@@ -717,7 +755,7 @@ struct mlx5_core_dev {
 	struct mutex		intf_state_mutex;
 	unsigned long		intf_state;
 	struct mlx5_priv	priv;
-	struct mlx5_profile	*profile;
+	struct mlx5_profile	profile;
 	u32			issi;
 	struct mlx5e_resources  mlx5e_res;
 	struct mlx5_dm          *dm;
@@ -1064,22 +1102,25 @@ static inline u8 mlx5_mkey_variant(u32 mkey)
 	return mkey & 0xff;
 }
 
-enum {
-	MLX5_PROF_MASK_QP_SIZE		= (u64)1 << 0,
-	MLX5_PROF_MASK_MR_CACHE		= (u64)1 << 1,
-};
-
-enum {
-	MR_CACHE_LAST_STD_ENTRY = 20,
-	MLX5_IMR_MTT_CACHE_ENTRY,
-	MLX5_IMR_KSM_CACHE_ENTRY,
-	MAX_MR_CACHE_ENTRIES
-};
-
+/* Async-atomic event notifier used by mlx5 core to forward FW
+ * evetns recived from event queue to mlx5 consumers.
+ * Optimise event queue dipatching.
+ */
 int mlx5_notifier_register(struct mlx5_core_dev *dev, struct notifier_block *nb);
 int mlx5_notifier_unregister(struct mlx5_core_dev *dev, struct notifier_block *nb);
+
+/* Async-atomic event notifier used for forwarding
+ * evetns from the event queue into the to mlx5 events dispatcher,
+ * eswitch, clock and others.
+ */
 int mlx5_eq_notifier_register(struct mlx5_core_dev *dev, struct mlx5_nb *nb);
 int mlx5_eq_notifier_unregister(struct mlx5_core_dev *dev, struct mlx5_nb *nb);
+
+/* Blocking event notifier used to forward SW events, used for slow path */
+int mlx5_blocking_notifier_register(struct mlx5_core_dev *dev, struct notifier_block *nb);
+int mlx5_blocking_notifier_unregister(struct mlx5_core_dev *dev, struct notifier_block *nb);
+int mlx5_blocking_notifier_call_chain(struct mlx5_core_dev *dev, unsigned int event,
+				      void *data);
 
 int mlx5_core_query_vendor_id(struct mlx5_core_dev *mdev, u32 *vendor_id);
 
@@ -1113,15 +1154,6 @@ struct net_device *mlx5_rdma_netdev_alloc(struct mlx5_core_dev *mdev,
 int mlx5_rdma_rn_get_params(struct mlx5_core_dev *mdev,
 			    struct ib_device *device,
 			    struct rdma_netdev_alloc_params *params);
-
-struct mlx5_profile {
-	u64	mask;
-	u8	log_max_qp;
-	struct {
-		int	size;
-		int	limit;
-	} mr_cache[MAX_MR_CACHE_ENTRIES];
-};
 
 enum {
 	MLX5_PCI_DEV_IS_VF		= 1 << 0,

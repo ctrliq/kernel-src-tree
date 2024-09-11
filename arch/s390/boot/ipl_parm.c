@@ -204,6 +204,17 @@ static void parse_mem_opt(void)
 	}
 }
 
+static inline bool is_ipl_block_dump(void)
+{
+	if (ipl_block.pb0_hdr.pbt == IPL_PBT_FCP &&
+	    ipl_block.fcp.opt == IPL_PB0_FCP_OPT_DUMP)
+		return true;
+	if (ipl_block.pb0_hdr.pbt == IPL_PBT_NVME &&
+	    ipl_block.nvme.opt == IPL_PB0_NVME_OPT_DUMP)
+		return true;
+	return false;
+}
+
 void setup_memory_end(void)
 {
 	parse_mem_opt();
@@ -212,9 +223,7 @@ void setup_memory_end(void)
 		kaslr_enabled = 0;
 		memory_end = min(memory_end ?: OLDMEM_SIZE, OLDMEM_SIZE);
 		memory_end_set = 1;
-	} else if (ipl_block_valid &&
-		   ipl_block.pb0_hdr.pbt == IPL_PBT_FCP &&
-		   ipl_block.fcp.opt == IPL_PB0_FCP_OPT_DUMP) {
+	} else if (ipl_block_valid && is_ipl_block_dump()) {
 		kaslr_enabled = 0;
 		if (!sclp_early_get_hsa_size(&memory_end) && memory_end)
 			memory_end_set = 1;

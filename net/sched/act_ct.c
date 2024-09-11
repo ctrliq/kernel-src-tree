@@ -1551,8 +1551,6 @@ static int __init ct_init_module(void)
 
 	static_branch_inc(&tcf_frag_xmit_count);
 
-	rh_mark_used_feature("act_ct");
-
 	return 0;
 
 err_register:

@@ -29,7 +29,7 @@
 #include <linux/moduleloader.h>
 #include <linux/bpf.h>
 #include <linux/btf.h>
-#include <linux/frame.h>
+#include <linux/objtool.h>
 #include <linux/rbtree_latch.h>
 #include <linux/kallsyms.h>
 #include <linux/rcupdate.h>
@@ -225,23 +225,15 @@ struct bpf_prog *bpf_prog_realloc(struct bpf_prog *fp_old, unsigned int size,
 {
 	gfp_t gfp_flags = GFP_KERNEL_ACCOUNT | __GFP_ZERO | gfp_extra_flags;
 	struct bpf_prog *fp;
-	u32 pages, delta;
-	int ret;
+	u32 pages;
 
 	size = round_up(size, PAGE_SIZE);
 	pages = size / PAGE_SIZE;
 	if (pages <= fp_old->pages)
 		return fp_old;
 
-	delta = pages - fp_old->pages;
-	ret = __bpf_prog_charge(fp_old->aux->user, delta);
-	if (ret)
-		return NULL;
-
 	fp = __vmalloc(size, gfp_flags, PAGE_KERNEL);
-	if (fp == NULL) {
-		__bpf_prog_uncharge(fp_old->aux->user, delta);
-	} else {
+	if (fp) {
 		memcpy(fp, fp_old, fp_old->pages * PAGE_SIZE);
 		fp->pages = pages;
 		fp->aux->prog = fp;
@@ -1322,8 +1314,8 @@ EXPORT_SYMBOL_GPL(__bpf_call_base);
 	INSN_3(STX, MEM,  H),			\
 	INSN_3(STX, MEM,  W),			\
 	INSN_3(STX, MEM,  DW),			\
-	INSN_3(STX, XADD, W),			\
-	INSN_3(STX, XADD, DW),			\
+	INSN_3(STX, ATOMIC, W),			\
+	INSN_3(STX, ATOMIC, DW),		\
 	/*   Immediate based. */		\
 	INSN_3(ST, MEM, B),			\
 	INSN_3(ST, MEM, H),			\
@@ -1631,13 +1623,59 @@ out:
 	LDX_PROBE(DW, 8)
 #undef LDX_PROBE
 
-	STX_XADD_W: /* lock xadd *(u32 *)(dst_reg + off16) += src_reg */
-		atomic_add((u32) SRC, (atomic_t *)(unsigned long)
-			   (DST + insn->off));
-		CONT;
-	STX_XADD_DW: /* lock xadd *(u64 *)(dst_reg + off16) += src_reg */
-		atomic64_add((u64) SRC, (atomic64_t *)(unsigned long)
-			     (DST + insn->off));
+#define ATOMIC_ALU_OP(BOP, KOP)						\
+		case BOP:						\
+			if (BPF_SIZE(insn->code) == BPF_W)		\
+				atomic_##KOP((u32) SRC, (atomic_t *)(unsigned long) \
+					     (DST + insn->off));	\
+			else						\
+				atomic64_##KOP((u64) SRC, (atomic64_t *)(unsigned long) \
+					       (DST + insn->off));	\
+			break;						\
+		case BOP | BPF_FETCH:					\
+			if (BPF_SIZE(insn->code) == BPF_W)		\
+				SRC = (u32) atomic_fetch_##KOP(		\
+					(u32) SRC,			\
+					(atomic_t *)(unsigned long) (DST + insn->off)); \
+			else						\
+				SRC = (u64) atomic64_fetch_##KOP(	\
+					(u64) SRC,			\
+					(atomic64_t *)(unsigned long) (DST + insn->off)); \
+			break;
+
+	STX_ATOMIC_DW:
+	STX_ATOMIC_W:
+		switch (IMM) {
+		ATOMIC_ALU_OP(BPF_ADD, add)
+		ATOMIC_ALU_OP(BPF_AND, and)
+		ATOMIC_ALU_OP(BPF_OR, or)
+		ATOMIC_ALU_OP(BPF_XOR, xor)
+#undef ATOMIC_ALU_OP
+
+		case BPF_XCHG:
+			if (BPF_SIZE(insn->code) == BPF_W)
+				SRC = (u32) atomic_xchg(
+					(atomic_t *)(unsigned long) (DST + insn->off),
+					(u32) SRC);
+			else
+				SRC = (u64) atomic64_xchg(
+					(atomic64_t *)(unsigned long) (DST + insn->off),
+					(u64) SRC);
+			break;
+		case BPF_CMPXCHG:
+			if (BPF_SIZE(insn->code) == BPF_W)
+				BPF_R0 = (u32) atomic_cmpxchg(
+					(atomic_t *)(unsigned long) (DST + insn->off),
+					(u32) BPF_R0, (u32) SRC);
+			else
+				BPF_R0 = (u64) atomic64_cmpxchg(
+					(atomic64_t *)(unsigned long) (DST + insn->off),
+					(u64) BPF_R0, (u64) SRC);
+			break;
+
+		default:
+			goto default_label;
+		}
 		CONT;
 
 	default_label:
@@ -1647,7 +1685,8 @@ out:
 		 *
 		 * Note, verifier whitelists all opcodes in bpf_opcode_in_insntable().
 		 */
-		pr_warn("BPF interpreter: unknown opcode %02x\n", insn->code);
+		pr_warn("BPF interpreter: unknown opcode %02x (imm: 0x%x)\n",
+			insn->code, insn->imm);
 		BUG_ON(1);
 		return 0;
 }
@@ -2132,6 +2171,28 @@ static void bpf_free_used_maps(struct bpf_prog_aux *aux)
 	kfree(aux->used_maps);
 }
 
+void __bpf_free_used_btfs(struct bpf_prog_aux *aux,
+			  struct btf_mod_pair *used_btfs, u32 len)
+{
+#ifdef CONFIG_BPF_SYSCALL
+	struct btf_mod_pair *btf_mod;
+	u32 i;
+
+	for (i = 0; i < len; i++) {
+		btf_mod = &used_btfs[i];
+		if (btf_mod->module)
+			module_put(btf_mod->module);
+		btf_put(btf_mod->btf);
+	}
+#endif
+}
+
+static void bpf_free_used_btfs(struct bpf_prog_aux *aux)
+{
+	__bpf_free_used_btfs(aux, aux->used_btfs, aux->used_btf_cnt);
+	kfree(aux->used_btfs);
+}
+
 static void bpf_prog_free_deferred(struct work_struct *work)
 {
 	struct bpf_prog_aux *aux;
@@ -2139,6 +2200,7 @@ static void bpf_prog_free_deferred(struct work_struct *work)
 
 	aux = container_of(work, struct bpf_prog_aux, work);
 	bpf_free_used_maps(aux);
+	bpf_free_used_btfs(aux);
 	if (bpf_prog_is_dev_bound(aux))
 		bpf_prog_offload_destroy(aux->prog);
 #ifdef CONFIG_PERF_EVENTS
@@ -2216,6 +2278,7 @@ const struct bpf_func_proto bpf_get_smp_processor_id_proto __weak;
 const struct bpf_func_proto bpf_get_numa_node_id_proto __weak;
 const struct bpf_func_proto bpf_ktime_get_ns_proto __weak;
 const struct bpf_func_proto bpf_ktime_get_boot_ns_proto __weak;
+const struct bpf_func_proto bpf_ktime_get_coarse_ns_proto __weak;
 
 const struct bpf_func_proto bpf_get_current_pid_tgid_proto __weak;
 const struct bpf_func_proto bpf_get_current_uid_gid_proto __weak;

@@ -520,7 +520,7 @@ static long usblp_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 {
 	struct usblp *usblp = file->private_data;
 	int length, err, i;
-	unsigned char newChannel;
+	unsigned char newChannel=0;
 	int status;
 	int twoints[2];
 	int retval = 0;

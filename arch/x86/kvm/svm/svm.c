@@ -19,7 +19,7 @@
 #include <linux/trace_events.h>
 #include <linux/slab.h>
 #include <linux/hashtable.h>
-#include <linux/frame.h>
+#include <linux/objtool.h>
 #include <linux/psp-sev.h>
 #include <linux/file.h>
 #include <linux/pagemap.h>
@@ -945,9 +945,6 @@ static __init int svm_hardware_setup(void)
 	init_msrpm_offsets();
 
 	supported_xcr0 &= ~(XFEATURE_MASK_BNDREGS | XFEATURE_MASK_BNDCSR);
-
-	if (nested)
-		mark_tech_preview("nested virtualization", THIS_MODULE);
 
 	if (boot_cpu_has(X86_FEATURE_NX))
 		kvm_enable_efer_bits(EFER_NX);
@@ -3702,10 +3699,37 @@ static fastpath_t svm_exit_handlers_fastpath(struct kvm_vcpu *vcpu)
 	return EXIT_FASTPATH_NONE;
 }
 
-static fastpath_t svm_vcpu_run(struct kvm_vcpu *vcpu)
+static noinstr void svm_vcpu_enter_exit(struct kvm_vcpu *vcpu)
 {
 	struct vcpu_svm *svm = to_svm(vcpu);
 	unsigned long vmcb_pa = svm->current_vmcb->pa;
+
+	kvm_guest_enter_irqoff();
+
+	if (sev_es_guest(vcpu->kvm)) {
+		__svm_sev_es_vcpu_run(vmcb_pa);
+	} else {
+		struct svm_cpu_data *sd = per_cpu(svm_data, vcpu->cpu);
+
+		/*
+		 * Use a single vmcb (vmcb01 because it's always valid) for
+		 * context switching guest state via VMLOAD/VMSAVE, that way
+		 * the state doesn't need to be copied between vmcb01 and
+		 * vmcb02 when switching vmcbs for nested virtualization.
+		 */
+		vmload(svm->vmcb01.pa);
+		__svm_vcpu_run(vmcb_pa, (unsigned long *)&vcpu->arch.regs);
+		vmsave(svm->vmcb01.pa);
+
+		vmload(__sme_page_pa(sd->save_area));
+	}
+
+	kvm_guest_exit_irqoff();
+}
+
+static fastpath_t svm_vcpu_run(struct kvm_vcpu *vcpu)
+{
+	struct vcpu_svm *svm = to_svm(vcpu);
 
 	trace_kvm_entry(vcpu);
 
@@ -3762,23 +3786,7 @@ static fastpath_t svm_vcpu_run(struct kvm_vcpu *vcpu)
 	if (!static_cpu_has(X86_FEATURE_V_SPEC_CTRL))
 		x86_spec_ctrl_set_guest(svm->spec_ctrl, svm->virt_spec_ctrl);
 
-	if (sev_es_guest(vcpu->kvm)) {
-		__svm_sev_es_vcpu_run(vmcb_pa);
-	} else {
-		struct svm_cpu_data *sd = per_cpu(svm_data, vcpu->cpu);
-
-		/*
-		 * Use a single vmcb (vmcb01 because it's always valid) for
-		 * context switching guest state via VMLOAD/VMSAVE, that way
-		 * the state doesn't need to be copied between vmcb01 and
-		 * vmcb02 when switching vmcbs for nested virtualization.
-		 */
-		vmload(svm->vmcb01.pa);
-		__svm_vcpu_run(vmcb_pa, (unsigned long *)&vcpu->arch.regs);
-		vmsave(svm->vmcb01.pa);
-
-		vmload(__sme_page_pa(sd->save_area));
-	}
+	svm_vcpu_enter_exit(vcpu);
 
 	/*
 	 * We do not use IBRS in the kernel. If this vCPU has used the

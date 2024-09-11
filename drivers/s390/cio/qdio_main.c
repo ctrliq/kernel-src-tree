@@ -663,10 +663,9 @@ retry:
 	return cc;
 }
 
-void qdio_outbound_tasklet(struct tasklet_struct *t)
+void qdio_outbound_tasklet(unsigned long data)
 {
-	struct qdio_output_q *out_q = from_tasklet(out_q, t, tasklet);
-	struct qdio_q *q = container_of(out_q, struct qdio_q, u.out);
+	struct qdio_q *q = (struct qdio_q *)data;
 	unsigned int start = q->first_to_check;
 	unsigned int error = 0;
 	int count;

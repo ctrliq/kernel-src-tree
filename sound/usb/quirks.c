@@ -198,7 +198,7 @@ static int create_fixed_stream_quirk(struct snd_usb_audio *chip,
 	}
 	alts = &iface->altsetting[fp->altset_idx];
 	altsd = get_iface_desc(alts);
-	if (altsd->bNumEndpoints < 1) {
+	if (altsd->bNumEndpoints <= fp->ep_idx) {
 		err = -EINVAL;
 		goto error;
 	}
@@ -208,7 +208,7 @@ static int create_fixed_stream_quirk(struct snd_usb_audio *chip,
 	if (fp->datainterval == 0)
 		fp->datainterval = snd_usb_parse_datainterval(chip, alts);
 	if (fp->maxpacksize == 0)
-		fp->maxpacksize = le16_to_cpu(get_endpoint(alts, 0)->wMaxPacketSize);
+		fp->maxpacksize = le16_to_cpu(get_endpoint(alts, fp->ep_idx)->wMaxPacketSize);
 	if (!fp->fmt_type)
 		fp->fmt_type = UAC_FORMAT_TYPE_I;
 
@@ -1152,23 +1152,7 @@ free_buf:
 
 static int snd_usb_motu_m_series_boot_quirk(struct usb_device *dev)
 {
-	int ret;
-
-	ret = usb_control_msg(dev, usb_sndctrlpipe(dev, 0),
-			      1, USB_TYPE_VENDOR | USB_RECIP_DEVICE,
-			      0x0, 0, NULL, 0, 1000);
-
-	if (ret < 0)
-		return ret;
-
 	msleep(2000);
-
-	ret = usb_control_msg(dev, usb_sndctrlpipe(dev, 0),
-			      1, USB_TYPE_VENDOR | USB_RECIP_DEVICE,
-			      0x20, 0, NULL, 0, 1000);
-
-	if (ret < 0)
-		return ret;
 
 	return 0;
 }
@@ -1417,7 +1401,8 @@ int snd_usb_apply_boot_quirk_once(struct usb_device *dev,
 /*
  * check if the device uses big-endian samples
  */
-int snd_usb_is_big_endian_format(struct snd_usb_audio *chip, struct audioformat *fp)
+int snd_usb_is_big_endian_format(struct snd_usb_audio *chip,
+				 const struct audioformat *fp)
 {
 	/* it depends on altsetting whether the device is big-endian or not */
 	switch (chip->usb_id) {
@@ -1456,7 +1441,7 @@ enum {
 };
 
 static void set_format_emu_quirk(struct snd_usb_substream *subs,
-				 struct audioformat *fmt)
+				 const struct audioformat *fmt)
 {
 	unsigned char emu_samplerate_id = 0;
 
@@ -1465,7 +1450,7 @@ static void set_format_emu_quirk(struct snd_usb_substream *subs,
 	 * by playback substream
 	 */
 	if (subs->direction == SNDRV_PCM_STREAM_PLAYBACK) {
-		if (subs->stream->substream[SNDRV_PCM_STREAM_CAPTURE].interface != -1)
+		if (subs->stream->substream[SNDRV_PCM_STREAM_CAPTURE].cur_audiofmt)
 			return;
 	}
 
@@ -1493,32 +1478,25 @@ static void set_format_emu_quirk(struct snd_usb_substream *subs,
 	subs->pkt_offset_adj = (emu_samplerate_id >= EMU_QUIRK_SR_176400HZ) ? 4 : 0;
 }
 
-
-/*
- * Pioneer DJ DJM-900NXS2
- * Device needs to know the sample rate each time substream is started
- */
-static int pioneer_djm_set_format_quirk(struct snd_usb_substream *subs)
+static int pioneer_djm_set_format_quirk(struct snd_usb_substream *subs,
+					u16 windex)
 {
-
-	/* Convert sample rate value to little endian */
+	unsigned int cur_rate = subs->data_endpoint->cur_rate;
 	u8 sr[3];
-
-	sr[0] = subs->cur_rate & 0xff;
-	sr[1] = (subs->cur_rate >> 8) & 0xff;
-	sr[2] = (subs->cur_rate >> 16) & 0xff;
-
-	/* Configure device */
+	// Convert to little endian
+	sr[0] = cur_rate & 0xff;
+	sr[1] = (cur_rate >> 8) & 0xff;
+	sr[2] = (cur_rate >> 16) & 0xff;
 	usb_set_interface(subs->dev, 0, 1);
+	// we should derive windex from fmt-sync_ep but it's not set
 	snd_usb_ctl_msg(subs->stream->chip->dev,
-		usb_rcvctrlpipe(subs->stream->chip->dev, 0),
-		0x01, 0x22, 0x0100, 0x0082, &sr, 0x0003);
-
+		usb_sndctrlpipe(subs->stream->chip->dev, 0),
+		0x01, 0x22, 0x0100, windex, &sr, 0x0003);
 	return 0;
 }
 
 void snd_usb_set_format_quirk(struct snd_usb_substream *subs,
-			      struct audioformat *fmt)
+			      const struct audioformat *fmt)
 {
 	switch (subs->stream->chip->usb_id) {
 	case USB_ID(0x041e, 0x3f02): /* E-Mu 0202 USB */
@@ -1527,12 +1505,15 @@ void snd_usb_set_format_quirk(struct snd_usb_substream *subs,
 	case USB_ID(0x041e, 0x3f19): /* E-Mu 0204 USB */
 		set_format_emu_quirk(subs, fmt);
 		break;
-	case USB_ID(0x2b73, 0x000a): /* Pioneer DJ DJM-900NXS2 */
-	case USB_ID(0x2b73, 0x0017): /* Pioneer DJ DJM-250MK2 */
-		pioneer_djm_set_format_quirk(subs);
-		break;
 	case USB_ID(0x534d, 0x2109): /* MacroSilicon MS2109 */
 		subs->stream_offset_adj = 2;
+		break;
+	case USB_ID(0x2b73, 0x0013): /* Pioneer DJM-450 */
+		pioneer_djm_set_format_quirk(subs, 0x0082);
+		break;
+	case USB_ID(0x08e4, 0x017f): /* Pioneer DJM-750 */
+	case USB_ID(0x08e4, 0x0163): /* Pioneer DJM-850 */
+		pioneer_djm_set_format_quirk(subs, 0x0086);
 		break;
 	}
 }
@@ -1587,7 +1568,7 @@ static bool is_itf_usb_dsd_dac(unsigned int id)
 }
 
 int snd_usb_select_mode_quirk(struct snd_usb_audio *chip,
-			      struct audioformat *fmt)
+			      const struct audioformat *fmt)
 {
 	struct usb_device *dev = chip->dev;
 	int err;

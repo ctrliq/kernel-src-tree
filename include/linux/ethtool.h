@@ -128,6 +128,17 @@ struct ethtool_link_ksettings {
 		__ETHTOOL_DECLARE_LINK_MODE_MASK(advertising);
 		__ETHTOOL_DECLARE_LINK_MODE_MASK(lp_advertising);
 	} link_modes;
+	/*
+	 * RHEL: NIC drivers do not allocate instances of this structure
+	 * by themselves and there is no exported function that works
+	 * with this structure on KABI allow-list. But this could be changed
+	 * if functions like __ethtool_get_link_ksettings() would be placed
+	 * on KABI allow-list.
+	 */
+	RH_KABI_EXTEND_WITH_SIZE(struct {
+				 u32	lanes;
+				 },
+				 4)
 };
 
 /**
@@ -268,6 +279,8 @@ struct ethtool_ops_extended_rh {
 
 /**
  * struct ethtool_ops - optional netdev operations
+ * @cap_link_lanes_supported: indicates if the driver supports lanes
+ *	parameter.
  * @supported_coalesce_params: supported types of interrupt coalescing.
  * @get_settings: DEPRECATED, use %get_link_ksettings/%set_link_ksettings
  *	API. Get various device settings including Ethernet link
@@ -535,13 +548,16 @@ struct ethtool_ops {
 				      struct ethtool_link_ksettings *))
 	RH_KABI_USE(2, int	(*set_link_ksettings)(struct net_device *,
 				      const struct ethtool_link_ksettings *))
-	RH_KABI_USE(3, u32	supported_coalesce_params)
+	RH_KABI_USE_SPLIT(3,	u32	supported_coalesce_params,
+				u32     cap_link_lanes_supported:1)
 	RH_KABI_USE(4, int	(*get_link_ext_state)(struct net_device *,
 				      struct ethtool_link_ext_state_info *))
 	RH_KABI_USE(5, void	(*get_pause_stats)(struct net_device *dev,
 				   struct ethtool_pause_stats *pause_stats))
-	RH_KABI_RESERVE(6)
-	RH_KABI_RESERVE(7)
+	RH_KABI_USE(6, int	(*get_phy_tunable)(struct net_device *,
+				   const struct ethtool_tunable *, void *))
+	RH_KABI_USE(7, int	(*set_phy_tunable)(struct net_device *,
+				   const struct ethtool_tunable *, const void *))
 	RH_KABI_RESERVE(8)
 	RH_KABI_RESERVE(9)
 	RH_KABI_RESERVE(10)
@@ -620,6 +636,15 @@ struct ethtool_phy_ops {
  * @ops: Ethtool PHY operations to set
  */
 void ethtool_set_ethtool_phy_ops(const struct ethtool_phy_ops *ops);
+
+/*
+ * ethtool_params_from_link_mode - Derive link parameters from a given link mode
+ * @link_ksettings: Link parameters to be derived from the link mode
+ * @link_mode: Link mode
+ */
+void
+ethtool_params_from_link_mode(struct ethtool_link_ksettings *link_ksettings,
+			      enum ethtool_link_mode_bit_indices link_mode);
 
 /**
  * ethtool_sprintf - Write formatted string to ethtool string data

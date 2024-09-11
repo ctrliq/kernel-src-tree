@@ -52,7 +52,6 @@ xfs_inode_alloc(
 
 	XFS_STATS_INC(mp, vn_active);
 	ASSERT(atomic_read(&ip->i_pincount) == 0);
-	ASSERT(!xfs_isiflocked(ip));
 	ASSERT(ip->i_ino == 0);
 
 	/* initialise the xfs inode */
@@ -61,8 +60,6 @@ xfs_inode_alloc(
 	memset(&ip->i_imap, 0, sizeof(struct xfs_imap));
 	ip->i_afp = NULL;
 	ip->i_cowfp = NULL;
-	ip->i_cnextents = 0;
-	ip->i_cformat = XFS_DINODE_FMT_EXTENTS;
 	memset(&ip->i_df, 0, sizeof(ip->i_df));
 	ip->i_flags = 0;
 	ip->i_delayed_blks = 0;
@@ -87,15 +84,18 @@ xfs_inode_free_callback(
 	case S_IFREG:
 	case S_IFDIR:
 	case S_IFLNK:
-		xfs_idestroy_fork(ip, XFS_DATA_FORK);
+		xfs_idestroy_fork(&ip->i_df);
 		break;
 	}
 
-	if (ip->i_afp)
-		xfs_idestroy_fork(ip, XFS_ATTR_FORK);
-	if (ip->i_cowfp)
-		xfs_idestroy_fork(ip, XFS_COW_FORK);
-
+	if (ip->i_afp) {
+		xfs_idestroy_fork(ip->i_afp);
+		kmem_cache_free(xfs_ifork_zone, ip->i_afp);
+	}
+	if (ip->i_cowfp) {
+		xfs_idestroy_fork(ip->i_cowfp);
+		kmem_cache_free(xfs_ifork_zone, ip->i_cowfp);
+	}
 	if (ip->i_itemp) {
 		ASSERT(!test_bit(XFS_LI_IN_AIL,
 				 &ip->i_itemp->ili_item.li_flags));
@@ -122,7 +122,7 @@ void
 xfs_inode_free(
 	struct xfs_inode	*ip)
 {
-	ASSERT(!xfs_isiflocked(ip));
+	ASSERT(!xfs_iflags_test(ip, XFS_IFLUSHING));
 
 	/*
 	 * Because we use RCU freeing we need to ensure the inode always
@@ -1034,23 +1034,21 @@ xfs_reclaim_inode(
 
 	if (!xfs_ilock_nowait(ip, XFS_ILOCK_EXCL))
 		goto out;
-	if (!xfs_iflock_nowait(ip))
+	if (xfs_iflags_test_and_set(ip, XFS_IFLUSHING))
 		goto out_iunlock;
 
 	if (XFS_FORCED_SHUTDOWN(ip->i_mount)) {
 		xfs_iunpin_wait(ip);
-		/* xfs_iflush_abort() drops the flush lock */
 		xfs_iflush_abort(ip);
 		goto reclaim;
 	}
 	if (xfs_ipincount(ip))
-		goto out_ifunlock;
+		goto out_clear_flush;
 	if (!xfs_inode_clean(ip))
-		goto out_ifunlock;
+		goto out_clear_flush;
 
-	xfs_ifunlock(ip);
+	xfs_iflags_clear(ip, XFS_IFLUSHING);
 reclaim:
-	ASSERT(!xfs_isiflocked(ip));
 
 	/*
 	 * Because we use RCU freeing we need to ensure the inode always appears
@@ -1100,8 +1098,8 @@ reclaim:
 	__xfs_inode_free(ip);
 	return;
 
-out_ifunlock:
-	xfs_ifunlock(ip);
+out_clear_flush:
+	xfs_iflags_clear(ip, XFS_IFLUSHING);
 out_iunlock:
 	xfs_iunlock(ip, XFS_ILOCK_EXCL);
 out:

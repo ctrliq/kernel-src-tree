@@ -4,10 +4,9 @@
  */
 #include <linux/cpu.h>
 
-#include <asm/pat.h>
-#include <asm/processor.h>
-
+#include <asm/memtype.h>
 #include <asm/apic.h>
+#include <asm/processor.h>
 
 struct cpuid_bit {
 	u16 feature;

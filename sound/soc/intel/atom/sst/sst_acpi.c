@@ -32,7 +32,6 @@
 #include <sound/soc-acpi.h>
 #include <sound/soc-acpi-intel-match.h>
 #include "../sst-mfld-platform.h"
-#include "../../common/sst-dsp.h"
 #include "../../common/soc-intel-quirks.h"
 #include "sst.h"
 
@@ -329,7 +328,7 @@ static int sst_acpi_probe(struct platform_device *pdev)
 }
 
 /**
-* intel_sst_remove - remove function
+* sst_acpi_remove - remove function
 *
 * @pdev:	platform device structure
 *

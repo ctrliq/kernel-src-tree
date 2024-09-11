@@ -290,6 +290,8 @@ struct bpf_local_storage;
   *	@sk_ack_backlog: current listen backlog
   *	@sk_max_ack_backlog: listen backlog set in listen()
   *	@sk_uid: user id of owner
+  *	@sk_prefer_busy_poll: prefer busypolling over softirq processing
+  *	@sk_busy_poll_budget: napi processing budget when busypolling
   *	@sk_priority: %SO_PRIORITY setting
   *	@sk_type: socket type (%SOCK_STREAM, etc)
   *	@sk_protocol: which protocol this socket belongs in this network family
@@ -512,7 +514,8 @@ struct sock {
 
 	RH_KABI_USE(1, struct bpf_local_storage __rcu     *sk_bpf_storage)
 	RH_KABI_USE(2, struct sk_buff                  *sk_tx_skb_cache)
-	RH_KABI_RESERVE(3)
+	RH_KABI_USE_SPLIT(3, u8			sk_prefer_busy_poll,
+			     u16		sk_busy_poll_budget)
 	RH_KABI_RESERVE(4)
 	RH_KABI_RESERVE(5)
 	RH_KABI_RESERVE(6)
@@ -2650,6 +2653,8 @@ static inline bool sk_dev_equal_l3scope(struct sock *sk, int dif)
 void sock_def_readable(struct sock *sk);
 
 int sock_bindtoindex(struct sock *sk, int ifindex, bool lock_sk);
+int sock_set_timestamping(struct sock *sk, int optname, int val);
+
 void sock_no_linger(struct sock *sk);
 void sock_set_keepalive(struct sock *sk);
 void sock_set_priority(struct sock *sk, u32 priority);

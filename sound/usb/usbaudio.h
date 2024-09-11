@@ -34,6 +34,7 @@ struct snd_usb_audio {
 	unsigned int txfr_quirk:1; /* Subframe boundaries on transfers */
 	unsigned int tx_length_quirk:1; /* Put length specifier in transfers */
 	unsigned int need_delayed_register:1; /* warn for delayed registration */
+	unsigned int playback_first:1;	/* for implicit fb: don't wait for the first capture URBs */
 	int num_interfaces;
 	int num_suspended_intf;
 	int sample_rate_read_error;
@@ -42,6 +43,7 @@ struct snd_usb_audio {
 
 	struct list_head pcm_list;	/* list of pcm streams */
 	struct list_head ep_list;	/* list of audio-related endpoints */
+	struct list_head iface_ref_list; /* list of interface refcounts */
 	int pcm_devs;
 
 	struct list_head midi_list;	/* list of midi interfaces */
@@ -49,10 +51,8 @@ struct snd_usb_audio {
 	struct list_head mixer_list;	/* list of mixer interfaces */
 
 	int setup;			/* from the 'device_setup' module param */
+	bool generic_implicit_fb;	/* from the 'implicit_fb' module param */
 	bool autoclock;			/* from the 'autoclock' module param */
-	bool keep_iface;		/* keep interface/altset after closing
-					 * or parameter change
-					 */
 
 	struct usb_host_interface *ctrl_intf;	/* the audio control interface */
 };

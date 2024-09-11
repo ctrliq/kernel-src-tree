@@ -543,7 +543,7 @@ void __oom_reap_task_mm(struct mm_struct *mm)
 
 static bool oom_reap_task_mm(struct task_struct *tsk, struct mm_struct *mm)
 {
-	if (!down_read_trylock(&mm->mmap_sem)) {
+	if (!mmap_read_trylock(mm)) {
 		trace_skip_task_reaping(tsk->pid);
 		return false;
 	}
@@ -555,7 +555,7 @@ static bool oom_reap_task_mm(struct task_struct *tsk, struct mm_struct *mm)
 	 * notifiers cannot block for unbounded amount of time
 	 */
 	if (mm_has_blockable_invalidate_notifiers(mm)) {
-		up_read(&mm->mmap_sem);
+		mmap_read_unlock(mm);
 		schedule_timeout_idle(HZ);
 		return true;
 	}
@@ -563,11 +563,11 @@ static bool oom_reap_task_mm(struct task_struct *tsk, struct mm_struct *mm)
 	/*
 	 * MMF_OOM_SKIP is set by exit_mmap when the OOM reaper can't
 	 * work on the mm anymore. The check for MMF_OOM_SKIP must run
-	 * under mmap_sem for reading because it serializes against the
-	 * down_write();up_write() cycle in exit_mmap().
+	 * under mmap_lock for reading because it serializes against the
+	 * mmap_write_lock();mmap_write_unlock() cycle in exit_mmap().
 	 */
 	if (test_bit(MMF_OOM_SKIP, &mm->flags)) {
-		up_read(&mm->mmap_sem);
+		mmap_read_unlock(mm);
 		trace_skip_task_reaping(tsk->pid);
 		return true;
 	}
@@ -581,7 +581,7 @@ static bool oom_reap_task_mm(struct task_struct *tsk, struct mm_struct *mm)
 			K(get_mm_counter(mm, MM_ANONPAGES)),
 			K(get_mm_counter(mm, MM_FILEPAGES)),
 			K(get_mm_counter(mm, MM_SHMEMPAGES)));
-	up_read(&mm->mmap_sem);
+	mmap_read_unlock(mm);
 
 	trace_finish_task_reaping(tsk->pid);
 	return true;
@@ -593,7 +593,7 @@ static void oom_reap_task(struct task_struct *tsk)
 	int attempts = 0;
 	struct mm_struct *mm = tsk->signal->oom_mm;
 
-	/* Retry the down_read_trylock(mmap_sem) a few times */
+	/* Retry the mmap_read_trylock(mm) a few times */
 	while (attempts++ < MAX_OOM_REAP_RETRIES && !oom_reap_task_mm(tsk, mm))
 		schedule_timeout_idle(HZ/10);
 
@@ -611,7 +611,7 @@ done:
 
 	/*
 	 * Hide this mm from OOM killer because it has been either reaped or
-	 * somebody can't call up_write(mmap_sem).
+	 * somebody can't call mmap_write_unlock(mm).
 	 */
 	set_bit(MMF_OOM_SKIP, &mm->flags);
 
@@ -882,7 +882,7 @@ static void __oom_kill_process(struct task_struct *victim, const char *message)
 	/*
 	 * Kill all user processes sharing victim->mm in other thread groups, if
 	 * any.  They don't get access to memory reserves, though, to avoid
-	 * depletion of all memory.  This prevents mm->mmap_sem livelock when an
+	 * depletion of all memory.  This prevents mm->mmap_lock livelock when an
 	 * oom killed thread cannot exit because it requires the semaphore and
 	 * its contended by another thread trying to allocate memory itself.
 	 * That thread will now get access to memory reserves since it has a

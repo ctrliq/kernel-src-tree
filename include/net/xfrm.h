@@ -425,6 +425,7 @@ struct xfrm_type {
 	int			(*reject)(struct xfrm_state *, struct sk_buff *,
 					  const struct flowi *);
 	int			(*hdr_offset)(struct xfrm_state *, struct sk_buff *, u8 **);
+	RH_KABI_DEPRECATE_FN(u32, get_mtu, struct xfrm_state *, int size)
 };
 
 int xfrm_register_type(const struct xfrm_type *type, unsigned short family);

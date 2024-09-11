@@ -282,6 +282,7 @@ struct mem_cgroup {
 	struct page_counter tcpmem;
 	RH_KABI_DEPRECATE(unsigned long, high)
 #else
+	struct page_counter tcpmem;		/* v1 only */
 	union {
 		struct page_counter swap;	/* v2 only */
 		struct page_counter memsw;	/* v1 only */
@@ -289,7 +290,6 @@ struct mem_cgroup {
 
 	/* Legacy consumer-oriented counters */
 	struct page_counter kmem;		/* v1 only */
-	struct page_counter tcpmem;		/* v1 only */
 #endif
 
 	/* Range enforcement for interrupt charges */

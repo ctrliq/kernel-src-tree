@@ -79,6 +79,8 @@ int ionic_dev_setup(struct ionic *ionic)
 	idev->intr_status = bar->vaddr + IONIC_BAR0_INTR_STATUS_OFFSET;
 	idev->intr_ctrl = bar->vaddr + IONIC_BAR0_INTR_CTRL_OFFSET;
 
+	idev->hwstamp_regs = &idev->dev_info_regs->hwstamp;
+
 	sig = ioread32(&idev->dev_info_regs->signature);
 	if (sig != IONIC_DEV_INFO_SIGNATURE) {
 		dev_err(dev, "Incompatible firmware signature %x", sig);
@@ -610,9 +612,9 @@ void ionic_q_sg_map(struct ionic_queue *q, void *base, dma_addr_t base_pa)
 void ionic_q_post(struct ionic_queue *q, bool ring_doorbell, ionic_desc_cb cb,
 		  void *cb_arg)
 {
-	struct device *dev = q->lif->ionic->dev;
 	struct ionic_desc_info *desc_info;
 	struct ionic_lif *lif = q->lif;
+	struct device *dev = q->dev;
 
 	desc_info = &q->info[q->head_idx];
 	desc_info->cb = cb;
@@ -654,7 +656,7 @@ void ionic_q_service(struct ionic_queue *q, struct ionic_cq_info *cq_info,
 
 	/* stop index must be for a descriptor that is not yet completed */
 	if (unlikely(!ionic_q_is_posted(q, stop_index)))
-		dev_err(q->lif->ionic->dev,
+		dev_err(q->dev,
 			"ionic stop is not posted %s stop %u tail %u head %u\n",
 			q->name, stop_index, q->tail_idx, q->head_idx);
 

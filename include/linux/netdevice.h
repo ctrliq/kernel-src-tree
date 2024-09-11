@@ -345,7 +345,7 @@ struct napi_struct {
 	unsigned int		napi_id;
 
 	RH_KABI_USE(1, 2, struct list_head	gro_list)
-	RH_KABI_RESERVE(3)
+	RH_KABI_USE(3, int			defer_hard_irqs_count)
 	RH_KABI_RESERVE(4)
 	RH_KABI_RESERVE(5)
 	RH_KABI_RESERVE(6)
@@ -354,23 +354,25 @@ struct napi_struct {
 };
 
 enum {
-	NAPI_STATE_SCHED,	/* Poll is scheduled */
-	NAPI_STATE_MISSED,	/* reschedule a napi */
-	NAPI_STATE_DISABLE,	/* Disable pending */
-	NAPI_STATE_NPSVC,	/* Netpoll - don't dequeue from poll_list */
-	NAPI_STATE_LISTED,	/* NAPI added to system lists */
-	NAPI_STATE_NO_BUSY_POLL,/* Do not add in napi_hash, no busy polling */
-	NAPI_STATE_IN_BUSY_POLL,/* sk_busy_loop() owns this NAPI */
+	NAPI_STATE_SCHED,		/* Poll is scheduled */
+	NAPI_STATE_MISSED,		/* reschedule a napi */
+	NAPI_STATE_DISABLE,		/* Disable pending */
+	NAPI_STATE_NPSVC,		/* Netpoll - don't dequeue from poll_list */
+	NAPI_STATE_LISTED,		/* NAPI added to system lists */
+	NAPI_STATE_NO_BUSY_POLL,	/* Do not add in napi_hash, no busy polling */
+	NAPI_STATE_IN_BUSY_POLL,	/* sk_busy_loop() owns this NAPI */
+	NAPI_STATE_PREFER_BUSY_POLL,	/* prefer busy-polling over softirq processing*/
 };
 
 enum {
-	NAPIF_STATE_SCHED	 = BIT(NAPI_STATE_SCHED),
-	NAPIF_STATE_MISSED	 = BIT(NAPI_STATE_MISSED),
-	NAPIF_STATE_DISABLE	 = BIT(NAPI_STATE_DISABLE),
-	NAPIF_STATE_NPSVC	 = BIT(NAPI_STATE_NPSVC),
-	NAPIF_STATE_LISTED	 = BIT(NAPI_STATE_LISTED),
-	NAPIF_STATE_NO_BUSY_POLL = BIT(NAPI_STATE_NO_BUSY_POLL),
-	NAPIF_STATE_IN_BUSY_POLL = BIT(NAPI_STATE_IN_BUSY_POLL),
+	NAPIF_STATE_SCHED		= BIT(NAPI_STATE_SCHED),
+	NAPIF_STATE_MISSED		= BIT(NAPI_STATE_MISSED),
+	NAPIF_STATE_DISABLE		= BIT(NAPI_STATE_DISABLE),
+	NAPIF_STATE_NPSVC		= BIT(NAPI_STATE_NPSVC),
+	NAPIF_STATE_LISTED		= BIT(NAPI_STATE_LISTED),
+	NAPIF_STATE_NO_BUSY_POLL	= BIT(NAPI_STATE_NO_BUSY_POLL),
+	NAPIF_STATE_IN_BUSY_POLL	= BIT(NAPI_STATE_IN_BUSY_POLL),
+	NAPIF_STATE_PREFER_BUSY_POLL	= BIT(NAPI_STATE_PREFER_BUSY_POLL),
 };
 
 enum gro_result {
@@ -439,6 +441,11 @@ void __napi_schedule_irqoff(struct napi_struct *n);
 static inline bool napi_disable_pending(struct napi_struct *n)
 {
 	return test_bit(NAPI_STATE_DISABLE, &n->state);
+}
+
+static inline bool napi_prefer_busy_poll(struct napi_struct *n)
+{
+	return test_bit(NAPI_STATE_PREFER_BUSY_POLL, &n->state);
 }
 
 bool napi_schedule_prep(struct napi_struct *n);
@@ -2237,7 +2244,7 @@ struct net_device {
 	/* protected by rtnl_lock */
 	RH_KABI_USE(7, struct bpf_xdp_entity	*xdp_state)
 
-	RH_KABI_RESERVE(8)
+	RH_KABI_USE(8, int			napi_defer_hard_irqs)
 	RH_KABI_RESERVE(9)
 	RH_KABI_RESERVE(10)
 	RH_KABI_RESERVE(11)
@@ -2488,7 +2495,8 @@ void __netif_napi_del(struct napi_struct *napi);
  *
  *  netif_napi_del() removes a NAPI context from the network device NAPI list
  */
-static inline void netif_napi_del(struct napi_struct *napi)
+RH_KABI_ADD_MODIFIER(static inline)
+void netif_napi_del(struct napi_struct *napi)
 {
 	__netif_napi_del(napi);
 	synchronize_net();

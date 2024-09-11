@@ -1312,7 +1312,7 @@ static void intel_irq_remapping_prepare_irte(struct intel_ir_data *data,
 		if (info->type == X86_IRQ_ALLOC_TYPE_HPET)
 			set_hpet_sid(irte, info->hpet_id);
 		else
-			set_msi_sid(irte, info->msi_dev);
+			set_msi_sid(irte, pci_real_dma_dev(info->msi_dev));
 
 		msg->address_hi = MSI_ADDR_BASE_HI;
 		msg->data = sub_handle;

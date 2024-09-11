@@ -350,7 +350,7 @@ extern pgprot_t protection_map[16];
  * @FAULT_FLAG_WRITE: Fault was a write fault.
  * @FAULT_FLAG_MKWRITE: Fault was mkwrite of existing PTE.
  * @FAULT_FLAG_ALLOW_RETRY: Allow to retry the fault if blocked.
- * @FAULT_FLAG_RETRY_NOWAIT: Don't drop mmap_sem and wait when retrying.
+ * @FAULT_FLAG_RETRY_NOWAIT: Don't drop mmap_lock and wait when retrying.
  * @FAULT_FLAG_KILLABLE: The fault task is in SIGKILL killable region.
  * @FAULT_FLAG_TRIED: The fault has been tried once.
  * @FAULT_FLAG_USER: The fault originated in userspace.
@@ -400,10 +400,10 @@ extern pgprot_t protection_map[16];
  * fault_flag_allow_retry_first - check ALLOW_RETRY the first time
  *
  * This is mostly used for places where we want to try to avoid taking
- * the mmap_sem for too long a time when waiting for another condition
+ * the mmap_lock for too long a time when waiting for another condition
  * to change, in which case we can try to be polite to release the
- * mmap_sem in the first round to avoid potential starvation of other
- * processes that would also want the mmap_sem.
+ * mmap_lock in the first round to avoid potential starvation of other
+ * processes that would also want the mmap_lock.
  *
  * Return: true if the page fault allows retry and this is the first
  * attempt of the fault handling; false otherwise.
@@ -531,7 +531,7 @@ struct vm_operations_struct {
 	 * (vma,addr) marked as MPOL_SHARED.  The shared policy infrastructure
 	 * in mm/mempolicy.c will do this automatically.
 	 * get_policy() must NOT add a ref if the policy at (vma,addr) is not
-	 * marked as MPOL_SHARED. vma policies are protected by the mmap_sem.
+	 * marked as MPOL_SHARED. vma policies are protected by the mmap_lock.
 	 * If no [shared/vma] mempolicy exists at the addr, get_policy() op
 	 * must return NULL--i.e., do not "fallback" to task or system default
 	 * policy.
@@ -2326,8 +2326,9 @@ extern int __meminit __early_pfn_to_nid(unsigned long pfn,
 #endif
 
 extern void set_dma_reserve(unsigned long new_dma_reserve);
-extern void memmap_init_zone(unsigned long, int, unsigned long, unsigned long,
-		enum meminit_context, struct vmem_altmap *);
+extern void memmap_init_zone(unsigned long, int, unsigned long,
+		unsigned long, unsigned long, enum meminit_context,
+		struct vmem_altmap *, int migratetype);
 extern void setup_per_zone_wmarks(void);
 extern int __meminit init_per_zone_wmark_min(void);
 extern void mem_init(void);
@@ -2654,6 +2655,8 @@ static inline void vma_set_page_prot(struct vm_area_struct *vma)
 	vma->vm_page_prot = vm_get_page_prot(vma->vm_flags);
 }
 #endif
+
+void vma_set_file(struct vm_area_struct *vma, struct file *file);
 
 #ifdef CONFIG_NUMA_BALANCING
 unsigned long change_prot_numa(struct vm_area_struct *vma,

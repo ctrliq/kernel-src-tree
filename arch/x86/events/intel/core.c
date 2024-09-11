@@ -274,6 +274,55 @@ static struct extra_reg intel_icl_extra_regs[] __read_mostly = {
 	EVENT_EXTRA_END
 };
 
+static struct extra_reg intel_spr_extra_regs[] __read_mostly = {
+	INTEL_UEVENT_EXTRA_REG(0x012a, MSR_OFFCORE_RSP_0, 0x3fffffffffull, RSP_0),
+	INTEL_UEVENT_EXTRA_REG(0x012b, MSR_OFFCORE_RSP_1, 0x3fffffffffull, RSP_1),
+	INTEL_UEVENT_PEBS_LDLAT_EXTRA_REG(0x01cd),
+	INTEL_UEVENT_EXTRA_REG(0x01c6, MSR_PEBS_FRONTEND, 0x7fff17, FE),
+	EVENT_EXTRA_END
+};
+
+static struct event_constraint intel_spr_event_constraints[] = {
+	FIXED_EVENT_CONSTRAINT(0x00c0, 0),	/* INST_RETIRED.ANY */
+	FIXED_EVENT_CONSTRAINT(0x01c0, 0),	/* INST_RETIRED.PREC_DIST */
+	FIXED_EVENT_CONSTRAINT(0x003c, 1),	/* CPU_CLK_UNHALTED.CORE */
+	FIXED_EVENT_CONSTRAINT(0x0300, 2),	/* CPU_CLK_UNHALTED.REF */
+	FIXED_EVENT_CONSTRAINT(0x0400, 3),	/* SLOTS */
+	METRIC_EVENT_CONSTRAINT(INTEL_TD_METRIC_RETIRING, 0),
+	METRIC_EVENT_CONSTRAINT(INTEL_TD_METRIC_BAD_SPEC, 1),
+	METRIC_EVENT_CONSTRAINT(INTEL_TD_METRIC_FE_BOUND, 2),
+	METRIC_EVENT_CONSTRAINT(INTEL_TD_METRIC_BE_BOUND, 3),
+	METRIC_EVENT_CONSTRAINT(INTEL_TD_METRIC_HEAVY_OPS, 4),
+	METRIC_EVENT_CONSTRAINT(INTEL_TD_METRIC_BR_MISPREDICT, 5),
+	METRIC_EVENT_CONSTRAINT(INTEL_TD_METRIC_FETCH_LAT, 6),
+	METRIC_EVENT_CONSTRAINT(INTEL_TD_METRIC_MEM_BOUND, 7),
+
+	INTEL_EVENT_CONSTRAINT(0x2e, 0xff),
+	INTEL_EVENT_CONSTRAINT(0x3c, 0xff),
+	/*
+	 * Generally event codes < 0x90 are restricted to counters 0-3.
+	 * The 0x2E and 0x3C are exception, which has no restriction.
+	 */
+	INTEL_EVENT_CONSTRAINT_RANGE(0x01, 0x8f, 0xf),
+
+	INTEL_UEVENT_CONSTRAINT(0x01a3, 0xf),
+	INTEL_UEVENT_CONSTRAINT(0x02a3, 0xf),
+	INTEL_UEVENT_CONSTRAINT(0x08a3, 0xf),
+	INTEL_UEVENT_CONSTRAINT(0x04a4, 0x1),
+	INTEL_UEVENT_CONSTRAINT(0x08a4, 0x1),
+	INTEL_UEVENT_CONSTRAINT(0x02cd, 0x1),
+	INTEL_EVENT_CONSTRAINT(0xce, 0x1),
+	INTEL_EVENT_CONSTRAINT_RANGE(0xd0, 0xdf, 0xf),
+	/*
+	 * Generally event codes >= 0x90 are likely to have no restrictions.
+	 * The exception are defined as above.
+	 */
+	INTEL_EVENT_CONSTRAINT_RANGE(0x90, 0xfe, 0xff),
+
+	EVENT_CONSTRAINT_END
+};
+
+
 EVENT_ATTR_STR(mem-loads,	mem_ld_nhm,	"event=0x0b,umask=0x10,ldlat=3");
 EVENT_ATTR_STR(mem-loads,	mem_ld_snb,	"event=0xcd,umask=0x1,ldlat=3");
 EVENT_ATTR_STR(mem-stores,	mem_st_snb,	"event=0xcd,umask=0x2");
@@ -313,11 +362,15 @@ EVENT_ATTR_STR_HT(topdown-recovery-bubbles, td_recovery_bubbles,
 EVENT_ATTR_STR_HT(topdown-recovery-bubbles.scale, td_recovery_bubbles_scale,
 	"4", "2");
 
-EVENT_ATTR_STR(slots,			slots,		"event=0x00,umask=0x4");
-EVENT_ATTR_STR(topdown-retiring,	td_retiring,	"event=0x00,umask=0x80");
-EVENT_ATTR_STR(topdown-bad-spec,	td_bad_spec,	"event=0x00,umask=0x81");
-EVENT_ATTR_STR(topdown-fe-bound,	td_fe_bound,	"event=0x00,umask=0x82");
-EVENT_ATTR_STR(topdown-be-bound,	td_be_bound,	"event=0x00,umask=0x83");
+EVENT_ATTR_STR(slots,			slots,			"event=0x00,umask=0x4");
+EVENT_ATTR_STR(topdown-retiring,	td_retiring,		"event=0x00,umask=0x80");
+EVENT_ATTR_STR(topdown-bad-spec,	td_bad_spec,		"event=0x00,umask=0x81");
+EVENT_ATTR_STR(topdown-fe-bound,	td_fe_bound,		"event=0x00,umask=0x82");
+EVENT_ATTR_STR(topdown-be-bound,	td_be_bound,		"event=0x00,umask=0x83");
+EVENT_ATTR_STR(topdown-heavy-ops,	td_heavy_ops,		"event=0x00,umask=0x84");
+EVENT_ATTR_STR(topdown-br-mispredict,	td_br_mispredict,	"event=0x00,umask=0x85");
+EVENT_ATTR_STR(topdown-fetch-lat,	td_fetch_lat,		"event=0x00,umask=0x86");
+EVENT_ATTR_STR(topdown-mem-bound,	td_mem_bound,		"event=0x00,umask=0x87");
 
 static struct attribute *snb_events_attrs[] = {
 	EVENT_PTR(td_slots_issued),
@@ -382,6 +435,108 @@ static u64 intel_pmu_event_map(int hw_event)
 {
 	return intel_perfmon_event_map[hw_event];
 }
+
+static __initconst const u64 spr_hw_cache_event_ids
+				[PERF_COUNT_HW_CACHE_MAX]
+				[PERF_COUNT_HW_CACHE_OP_MAX]
+				[PERF_COUNT_HW_CACHE_RESULT_MAX] =
+{
+ [ C(L1D ) ] = {
+	[ C(OP_READ) ] = {
+		[ C(RESULT_ACCESS) ] = 0x81d0,
+		[ C(RESULT_MISS)   ] = 0xe124,
+	},
+	[ C(OP_WRITE) ] = {
+		[ C(RESULT_ACCESS) ] = 0x82d0,
+	},
+ },
+ [ C(L1I ) ] = {
+	[ C(OP_READ) ] = {
+		[ C(RESULT_MISS)   ] = 0xe424,
+	},
+	[ C(OP_WRITE) ] = {
+		[ C(RESULT_ACCESS) ] = -1,
+		[ C(RESULT_MISS)   ] = -1,
+	},
+ },
+ [ C(LL  ) ] = {
+	[ C(OP_READ) ] = {
+		[ C(RESULT_ACCESS) ] = 0x12a,
+		[ C(RESULT_MISS)   ] = 0x12a,
+	},
+	[ C(OP_WRITE) ] = {
+		[ C(RESULT_ACCESS) ] = 0x12a,
+		[ C(RESULT_MISS)   ] = 0x12a,
+	},
+ },
+ [ C(DTLB) ] = {
+	[ C(OP_READ) ] = {
+		[ C(RESULT_ACCESS) ] = 0x81d0,
+		[ C(RESULT_MISS)   ] = 0xe12,
+	},
+	[ C(OP_WRITE) ] = {
+		[ C(RESULT_ACCESS) ] = 0x82d0,
+		[ C(RESULT_MISS)   ] = 0xe13,
+	},
+ },
+ [ C(ITLB) ] = {
+	[ C(OP_READ) ] = {
+		[ C(RESULT_ACCESS) ] = -1,
+		[ C(RESULT_MISS)   ] = 0xe11,
+	},
+	[ C(OP_WRITE) ] = {
+		[ C(RESULT_ACCESS) ] = -1,
+		[ C(RESULT_MISS)   ] = -1,
+	},
+	[ C(OP_PREFETCH) ] = {
+		[ C(RESULT_ACCESS) ] = -1,
+		[ C(RESULT_MISS)   ] = -1,
+	},
+ },
+ [ C(BPU ) ] = {
+	[ C(OP_READ) ] = {
+		[ C(RESULT_ACCESS) ] = 0x4c4,
+		[ C(RESULT_MISS)   ] = 0x4c5,
+	},
+	[ C(OP_WRITE) ] = {
+		[ C(RESULT_ACCESS) ] = -1,
+		[ C(RESULT_MISS)   ] = -1,
+	},
+	[ C(OP_PREFETCH) ] = {
+		[ C(RESULT_ACCESS) ] = -1,
+		[ C(RESULT_MISS)   ] = -1,
+	},
+ },
+ [ C(NODE) ] = {
+	[ C(OP_READ) ] = {
+		[ C(RESULT_ACCESS) ] = 0x12a,
+		[ C(RESULT_MISS)   ] = 0x12a,
+	},
+ },
+};
+
+static __initconst const u64 spr_hw_cache_extra_regs
+				[PERF_COUNT_HW_CACHE_MAX]
+				[PERF_COUNT_HW_CACHE_OP_MAX]
+				[PERF_COUNT_HW_CACHE_RESULT_MAX] =
+{
+ [ C(LL  ) ] = {
+	[ C(OP_READ) ] = {
+		[ C(RESULT_ACCESS) ] = 0x10001,
+		[ C(RESULT_MISS)   ] = 0x3fbfc00001,
+	},
+	[ C(OP_WRITE) ] = {
+		[ C(RESULT_ACCESS) ] = 0x3f3ffc0002,
+		[ C(RESULT_MISS)   ] = 0x3f3fc00002,
+	},
+ },
+ [ C(NODE) ] = {
+	[ C(OP_READ) ] = {
+		[ C(RESULT_ACCESS) ] = 0x10c000001,
+		[ C(RESULT_MISS)   ] = 0x3fb3000001,
+	},
+ },
+};
 
 /*
  * Notes on the events:
@@ -2133,18 +2288,6 @@ static void intel_tfa_pmu_enable_all(int added)
 	intel_pmu_enable_all(added);
 }
 
-static void enable_counter_freeze(void)
-{
-	update_debugctlmsr(get_debugctlmsr() |
-			DEBUGCTLMSR_FREEZE_PERFMON_ON_PMI);
-}
-
-static void disable_counter_freeze(void)
-{
-	update_debugctlmsr(get_debugctlmsr() &
-			~DEBUGCTLMSR_FREEZE_PERFMON_ON_PMI);
-}
-
 static inline u64 intel_pmu_get_status(void)
 {
 	u64 status;
@@ -2715,95 +2858,6 @@ static int handle_pmi_common(struct pt_regs *regs, u64 status)
 			x86_pmu_stop(event, 0);
 	}
 
-	return handled;
-}
-
-static bool disable_counter_freezing = true;
-static int __init intel_perf_counter_freezing_setup(char *s)
-{
-	bool res;
-
-	if (kstrtobool(s, &res))
-		return -EINVAL;
-
-	disable_counter_freezing = !res;
-	return 1;
-}
-__setup("perf_v4_pmi=", intel_perf_counter_freezing_setup);
-
-/*
- * Simplified handler for Arch Perfmon v4:
- * - We rely on counter freezing/unfreezing to enable/disable the PMU.
- * This is done automatically on PMU ack.
- * - Ack the PMU only after the APIC.
- */
-
-static int intel_pmu_handle_irq_v4(struct pt_regs *regs)
-{
-	struct cpu_hw_events *cpuc = this_cpu_ptr(&cpu_hw_events);
-	int handled = 0;
-	bool bts = false;
-	u64 status;
-	int pmu_enabled = cpuc->enabled;
-	int loops = 0;
-
-	/* PMU has been disabled because of counter freezing */
-	cpuc->enabled = 0;
-	if (test_bit(INTEL_PMC_IDX_FIXED_BTS, cpuc->active_mask)) {
-		bts = true;
-		intel_bts_disable_local();
-		handled = intel_pmu_drain_bts_buffer();
-		handled += intel_bts_interrupt();
-	}
-	status = intel_pmu_get_status();
-	if (!status)
-		goto done;
-again:
-	intel_pmu_lbr_read();
-	if (++loops > 100) {
-		static bool warned;
-
-		if (!warned) {
-			WARN(1, "perfevents: irq loop stuck!\n");
-			perf_event_print_debug();
-			warned = true;
-		}
-		intel_pmu_reset();
-		goto done;
-	}
-
-
-	handled += handle_pmi_common(regs, status);
-done:
-	/* Ack the PMI in the APIC */
-	apic_write(APIC_LVTPC, APIC_DM_NMI);
-
-	/*
-	 * The counters start counting immediately while ack the status.
-	 * Make it as close as possible to IRET. This avoids bogus
-	 * freezing on Skylake CPUs.
-	 */
-	if (status) {
-		intel_pmu_ack_status(status);
-	} else {
-		/*
-		 * CPU may issues two PMIs very close to each other.
-		 * When the PMI handler services the first one, the
-		 * GLOBAL_STATUS is already updated to reflect both.
-		 * When it IRETs, the second PMI is immediately
-		 * handled and it sees clear status. At the meantime,
-		 * there may be a third PMI, because the freezing bit
-		 * isn't set since the ack in first PMI handlers.
-		 * Double check if there is more work to be done.
-		 */
-		status = intel_pmu_get_status();
-		if (status)
-			goto again;
-	}
-
-	if (bts)
-		intel_bts_enable_local();
-	cpuc->enabled = pmu_enabled;
 	return handled;
 }
 
@@ -3581,6 +3635,17 @@ static bool is_available_metric_event(struct perf_event *event)
 		event->attr.config <= INTEL_TD_METRIC_AVAILABLE_MAX;
 }
 
+static inline bool is_mem_loads_event(struct perf_event *event)
+{
+	return (event->attr.config & INTEL_ARCH_EVENT_MASK) == X86_CONFIG(.event=0xcd, .umask=0x01);
+}
+
+static inline bool is_mem_loads_aux_event(struct perf_event *event)
+{
+	return (event->attr.config & INTEL_ARCH_EVENT_MASK) == X86_CONFIG(.event=0x03, .umask=0x82);
+}
+
+
 static int intel_pmu_hw_config(struct perf_event *event)
 {
 	int ret = x86_pmu_hw_config(event);
@@ -3686,6 +3751,33 @@ static int intel_pmu_hw_config(struct perf_event *event)
 			 */
 			leader->hw.flags |= PERF_X86_EVENT_TOPDOWN;
 			event->hw.flags  |= PERF_X86_EVENT_TOPDOWN;
+		}
+	}
+
+	/*
+	 * The load latency event X86_CONFIG(.event=0xcd, .umask=0x01) on SPR
+	 * doesn't function quite right. As a work-around it needs to always be
+	 * co-scheduled with a auxiliary event X86_CONFIG(.event=0x03, .umask=0x82).
+	 * The actual count of this second event is irrelevant it just needs
+	 * to be active to make the first event function correctly.
+	 *
+	 * In a group, the auxiliary event must be in front of the load latency
+	 * event. The rule is to simplify the implementation of the check.
+	 * That's because perf cannot have a complete group at the moment.
+	 */
+	if (x86_pmu.flags & PMU_FL_MEM_LOADS_AUX &&
+	    (event->attr.sample_type & PERF_SAMPLE_DATA_SRC) &&
+	    is_mem_loads_event(event)) {
+		struct perf_event *leader = event->group_leader;
+		struct perf_event *sibling = NULL;
+
+		if (!is_mem_loads_aux_event(leader)) {
+			for_each_sibling_event(sibling, leader) {
+				if (is_mem_loads_aux_event(sibling))
+					break;
+			}
+			if (list_entry_is_head(sibling, &leader->sibling_list, sibling_list))
+				return -ENODATA;
 		}
 	}
 
@@ -3878,6 +3970,29 @@ icl_get_event_constraints(struct cpu_hw_events *cpuc, int idx,
 }
 
 static struct event_constraint *
+spr_get_event_constraints(struct cpu_hw_events *cpuc, int idx,
+			  struct perf_event *event)
+{
+	struct event_constraint *c;
+
+	c = icl_get_event_constraints(cpuc, idx, event);
+
+	/*
+	 * The :ppp indicates the Precise Distribution (PDist) facility, which
+	 * is only supported on the GP counter 0. If a :ppp event which is not
+	 * available on the GP counter 0, error out.
+	 */
+	if (event->attr.precise_ip == 3) {
+		if (c->idxmsk64 & BIT_ULL(0))
+			return &counter0_constraint;
+
+		return &emptyconstraint;
+	}
+
+	return c;
+}
+
+static struct event_constraint *
 glp_get_event_constraints(struct cpu_hw_events *cpuc, int idx,
 			  struct perf_event *event)
 {
@@ -3964,6 +4079,14 @@ static u64 bdw_limit_period(struct perf_event *event, u64 left)
 static u64 nhm_limit_period(struct perf_event *event, u64 left)
 {
 	return max(left, 32ULL);
+}
+
+static u64 spr_limit_period(struct perf_event *event, u64 left)
+{
+	if (event->attr.precise_ip == 3)
+		return max(left, 128ULL);
+
+	return left;
 }
 
 PMU_FORMAT_ATTR(event,	"config:0-7"	);
@@ -4107,9 +4230,6 @@ static void intel_pmu_cpu_starting(int cpu)
 	if (x86_pmu.version > 1)
 		flip_smm_bit(&x86_pmu.attr_freeze_on_smi);
 
-	if (x86_pmu.counter_freezing)
-		enable_counter_freeze();
-
 	/* Disable perf metrics if any added CPU doesn't support it. */
 	if (x86_pmu.intel_cap.perf_metrics) {
 		union perf_capabilities perf_cap;
@@ -4180,9 +4300,6 @@ static void free_excl_cntrs(struct cpu_hw_events *cpuc)
 static void intel_pmu_cpu_dying(int cpu)
 {
 	fini_debug_store_on_cpu(cpu);
-
-	if (x86_pmu.counter_freezing)
-		disable_counter_freeze();
 }
 
 void intel_cpuc_finish(struct cpu_hw_events *cpuc)
@@ -4577,39 +4694,6 @@ static __init void intel_nehalem_quirk(void)
 	}
 }
 
-static const struct x86_cpu_desc counter_freezing_ucodes[] = {
-	INTEL_CPU_DESC(INTEL_FAM6_ATOM_GOLDMONT,	 2, 0x0000000e),
-	INTEL_CPU_DESC(INTEL_FAM6_ATOM_GOLDMONT,	 9, 0x0000002e),
-	INTEL_CPU_DESC(INTEL_FAM6_ATOM_GOLDMONT,	10, 0x00000008),
-	INTEL_CPU_DESC(INTEL_FAM6_ATOM_GOLDMONT_D,	 1, 0x00000028),
-	INTEL_CPU_DESC(INTEL_FAM6_ATOM_GOLDMONT_PLUS,	 1, 0x00000028),
-	INTEL_CPU_DESC(INTEL_FAM6_ATOM_GOLDMONT_PLUS,	 8, 0x00000006),
-	{}
-};
-
-static bool intel_counter_freezing_broken(void)
-{
-	return !x86_cpu_has_min_microcode_rev(counter_freezing_ucodes);
-}
-
-static __init void intel_counter_freezing_quirk(void)
-{
-	/* Check if it's already disabled */
-	if (disable_counter_freezing)
-		return;
-
-	/*
-	 * If the system starts with the wrong ucode, leave the
-	 * counter-freezing feature permanently disabled.
-	 */
-	if (intel_counter_freezing_broken()) {
-		pr_info("PMU counter freezing disabled due to CPU errata,"
-			"please upgrade microcode\n");
-		x86_pmu.counter_freezing = false;
-		x86_pmu.handle_irq = intel_pmu_handle_irq;
-	}
-}
-
 /*
  * enable software workaround for errata:
  * SNB: BJ122
@@ -4714,6 +4798,42 @@ static struct attribute *icl_tsx_events_attrs[] = {
 	EVENT_PTR(el_capacity_read),
 	EVENT_PTR(el_capacity_write),
 	EVENT_PTR(el_conflict),
+	EVENT_PTR(cycles_t),
+	EVENT_PTR(cycles_ct),
+	NULL,
+};
+
+
+EVENT_ATTR_STR(mem-stores,	mem_st_spr,	"event=0xcd,umask=0x2");
+EVENT_ATTR_STR(mem-loads-aux,	mem_ld_aux,	"event=0x03,umask=0x82");
+
+static struct attribute *spr_events_attrs[] = {
+	EVENT_PTR(mem_ld_hsw),
+	EVENT_PTR(mem_st_spr),
+	EVENT_PTR(mem_ld_aux),
+	NULL,
+};
+
+static struct attribute *spr_td_events_attrs[] = {
+	EVENT_PTR(slots),
+	EVENT_PTR(td_retiring),
+	EVENT_PTR(td_bad_spec),
+	EVENT_PTR(td_fe_bound),
+	EVENT_PTR(td_be_bound),
+	EVENT_PTR(td_heavy_ops),
+	EVENT_PTR(td_br_mispredict),
+	EVENT_PTR(td_fetch_lat),
+	EVENT_PTR(td_mem_bound),
+	NULL,
+};
+
+static struct attribute *spr_tsx_events_attrs[] = {
+	EVENT_PTR(tx_start),
+	EVENT_PTR(tx_abort),
+	EVENT_PTR(tx_commit),
+	EVENT_PTR(tx_capacity_read),
+	EVENT_PTR(tx_capacity_write),
+	EVENT_PTR(tx_conflict),
 	EVENT_PTR(cycles_t),
 	EVENT_PTR(cycles_ct),
 	NULL,
@@ -4998,9 +5118,6 @@ __init int intel_pmu_init(void)
 	} else if (version >= 5)
 		x86_pmu.num_counters_fixed = fls(fixed_mask);
 
-	if (version >= 4)
-		x86_pmu.counter_freezing = !disable_counter_freezing;
-
 	if (boot_cpu_has(X86_FEATURE_PDCM)) {
 		u64 capabilities;
 
@@ -5128,7 +5245,6 @@ __init int intel_pmu_init(void)
 
 	case INTEL_FAM6_ATOM_GOLDMONT:
 	case INTEL_FAM6_ATOM_GOLDMONT_D:
-		x86_add_quirk(intel_counter_freezing_quirk);
 		memcpy(hw_cache_event_ids, glm_hw_cache_event_ids,
 		       sizeof(hw_cache_event_ids));
 		memcpy(hw_cache_extra_regs, glm_hw_cache_extra_regs,
@@ -5155,7 +5271,6 @@ __init int intel_pmu_init(void)
 		break;
 
 	case INTEL_FAM6_ATOM_GOLDMONT_PLUS:
-		x86_add_quirk(intel_counter_freezing_quirk);
 		memcpy(hw_cache_event_ids, glp_hw_cache_event_ids,
 		       sizeof(hw_cache_event_ids));
 		memcpy(hw_cache_extra_regs, glp_hw_cache_extra_regs,
@@ -5509,6 +5624,43 @@ __init int intel_pmu_init(void)
 		name = "icelake";
 		break;
 
+	case INTEL_FAM6_SAPPHIRERAPIDS_X:
+		pmem = true;
+		x86_pmu.late_ack = true;
+		memcpy(hw_cache_event_ids, spr_hw_cache_event_ids, sizeof(hw_cache_event_ids));
+		memcpy(hw_cache_extra_regs, spr_hw_cache_extra_regs, sizeof(hw_cache_extra_regs));
+
+		x86_pmu.event_constraints = intel_spr_event_constraints;
+		x86_pmu.pebs_constraints = intel_spr_pebs_event_constraints;
+		x86_pmu.extra_regs = intel_spr_extra_regs;
+		x86_pmu.limit_period = spr_limit_period;
+		x86_pmu.pebs_aliases = NULL;
+		x86_pmu.pebs_prec_dist = true;
+		x86_pmu.pebs_block = true;
+		x86_pmu.flags |= PMU_FL_HAS_RSP_1;
+		x86_pmu.flags |= PMU_FL_NO_HT_SHARING;
+		x86_pmu.flags |= PMU_FL_PEBS_ALL;
+		x86_pmu.flags |= PMU_FL_INSTR_LATENCY;
+		x86_pmu.flags |= PMU_FL_MEM_LOADS_AUX;
+
+		x86_pmu.hw_config = hsw_hw_config;
+		x86_pmu.get_event_constraints = spr_get_event_constraints;
+		extra_attr = boot_cpu_has(X86_FEATURE_RTM) ?
+			hsw_format_attr : nhm_format_attr;
+		extra_skl_attr = skl_format_attr;
+		mem_attr = spr_events_attrs;
+		td_attr = spr_td_events_attrs;
+		tsx_attr = spr_tsx_events_attrs;
+		x86_pmu.rtm_abort_event = X86_CONFIG(.event=0xc9, .umask=0x04);
+		x86_pmu.lbr_pt_coexist = true;
+		intel_pmu_pebs_data_source_skl(pmem);
+		x86_pmu.num_topdown_events = 8;
+		x86_pmu.update_topdown_event = icl_update_topdown_event;
+		x86_pmu.set_topdown_event_period = icl_set_topdown_event_period;
+		pr_cont("Sapphire Rapids events, ");
+		name = "sapphire_rapids";
+		break;
+
 	default:
 		switch (x86_pmu.version) {
 		case 1:
@@ -5628,13 +5780,6 @@ __init int intel_pmu_init(void)
 		x86_pmu.perfctr = MSR_IA32_PMC0;
 		pr_cont("full-width counters, ");
 	}
-
-	/*
-	 * For arch perfmon 4 use counter freezing to avoid
-	 * several MSR accesses in the PMI.
-	 */
-	if (x86_pmu.counter_freezing)
-		x86_pmu.handle_irq = intel_pmu_handle_irq_v4;
 
 	if (x86_pmu.intel_cap.perf_metrics)
 		x86_pmu.intel_ctrl |= 1ULL << GLOBAL_CTRL_EN_PERF_METRICS;

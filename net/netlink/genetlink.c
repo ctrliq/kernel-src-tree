@@ -1360,6 +1360,15 @@ static struct genl_family genl_ctrl __ro_after_init = {
 	.netnsok = true,
 };
 
+static bool genl_bind_group_is_restricted(const struct genl_family *f,
+					  unsigned int fam_grp)
+{
+	const struct genl_multicast_group *grp = &f->mcgrps[fam_grp];
+
+	return strcmp(f->name, "mptcp_pm") == 0 &&
+	       strcmp(grp->name, "mptcp_pm_events") == 0;
+}
+
 static int genl_bind(struct net *net, int group)
 {
 	struct genl_family *f;
@@ -1375,6 +1384,9 @@ static int genl_bind(struct net *net, int group)
 
 			if (!f->netnsok && net != &init_net)
 				err = -ENOENT;
+			else if (genl_bind_group_is_restricted(f, fam_grp) &&
+				 !ns_capable(net->user_ns, CAP_NET_ADMIN))
+				err = -EPERM;
 			else if (f->mcast_bind)
 				err = f->mcast_bind(net, fam_grp);
 			else

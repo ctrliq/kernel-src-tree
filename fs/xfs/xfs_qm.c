@@ -47,7 +47,7 @@ STATIC void	xfs_qm_dqfree_one(struct xfs_dquot *dqp);
 STATIC int
 xfs_qm_dquot_walk(
 	struct xfs_mount	*mp,
-	int			type,
+	xfs_dqtype_t		type,
 	int			(*execute)(struct xfs_dquot *dqp, void *data),
 	void			*data)
 {
@@ -249,8 +249,7 @@ xfs_qm_unmount_quotas(
 STATIC int
 xfs_qm_dqattach_one(
 	struct xfs_inode	*ip,
-	xfs_dqid_t		id,
-	uint			type,
+	xfs_dqtype_t		type,
 	bool			doalloc,
 	struct xfs_dquot	**IO_idqpp)
 {
@@ -330,23 +329,23 @@ xfs_qm_dqattach_locked(
 	ASSERT(xfs_isilocked(ip, XFS_ILOCK_EXCL));
 
 	if (XFS_IS_UQUOTA_ON(mp) && !ip->i_udquot) {
-		error = xfs_qm_dqattach_one(ip, i_uid_read(VFS_I(ip)),
-				XFS_DQTYPE_USER, doalloc, &ip->i_udquot);
+		error = xfs_qm_dqattach_one(ip, XFS_DQTYPE_USER,
+				doalloc, &ip->i_udquot);
 		if (error)
 			goto done;
 		ASSERT(ip->i_udquot);
 	}
 
 	if (XFS_IS_GQUOTA_ON(mp) && !ip->i_gdquot) {
-		error = xfs_qm_dqattach_one(ip, i_gid_read(VFS_I(ip)),
-				XFS_DQTYPE_GROUP, doalloc, &ip->i_gdquot);
+		error = xfs_qm_dqattach_one(ip, XFS_DQTYPE_GROUP,
+				doalloc, &ip->i_gdquot);
 		if (error)
 			goto done;
 		ASSERT(ip->i_gdquot);
 	}
 
 	if (XFS_IS_PQUOTA_ON(mp) && !ip->i_pdquot) {
-		error = xfs_qm_dqattach_one(ip, ip->i_d.di_projid, XFS_DQTYPE_PROJ,
+		error = xfs_qm_dqattach_one(ip, XFS_DQTYPE_PROJ,
 				doalloc, &ip->i_pdquot);
 		if (error)
 			goto done;
@@ -545,7 +544,7 @@ xfs_qm_shrink_count(
 STATIC void
 xfs_qm_set_defquota(
 	struct xfs_mount	*mp,
-	uint			type,
+	xfs_dqtype_t		type,
 	struct xfs_quotainfo	*qinf)
 {
 	struct xfs_dquot	*dqp;
@@ -562,12 +561,12 @@ xfs_qm_set_defquota(
 	 * Timers and warnings have been already set, let's just set the
 	 * default limits for this quota type
 	 */
-	defq->bhardlimit = dqp->q_blk.hardlimit;
-	defq->bsoftlimit = dqp->q_blk.softlimit;
-	defq->ihardlimit = dqp->q_ino.hardlimit;
-	defq->isoftlimit = dqp->q_ino.softlimit;
-	defq->rtbhardlimit = dqp->q_rtb.hardlimit;
-	defq->rtbsoftlimit = dqp->q_rtb.softlimit;
+	defq->blk.hard = dqp->q_blk.hardlimit;
+	defq->blk.soft = dqp->q_blk.softlimit;
+	defq->ino.hard = dqp->q_ino.hardlimit;
+	defq->ino.soft = dqp->q_ino.softlimit;
+	defq->rtb.hard = dqp->q_rtb.hardlimit;
+	defq->rtb.soft = dqp->q_rtb.softlimit;
 	xfs_qm_dqdestroy(dqp);
 }
 
@@ -575,7 +574,7 @@ xfs_qm_set_defquota(
 static void
 xfs_qm_init_timelimits(
 	struct xfs_mount	*mp,
-	uint			type)
+	xfs_dqtype_t		type)
 {
 	struct xfs_quotainfo	*qinf = mp->m_quotainfo;
 	struct xfs_def_quota	*defq;
@@ -584,12 +583,12 @@ xfs_qm_init_timelimits(
 
 	defq = xfs_get_defquota(qinf, type);
 
-	defq->btimelimit = XFS_QM_BTIMELIMIT;
-	defq->itimelimit = XFS_QM_ITIMELIMIT;
-	defq->rtbtimelimit = XFS_QM_RTBTIMELIMIT;
-	defq->bwarnlimit = XFS_QM_BWARNLIMIT;
-	defq->iwarnlimit = XFS_QM_IWARNLIMIT;
-	defq->rtbwarnlimit = XFS_QM_RTBWARNLIMIT;
+	defq->blk.time = XFS_QM_BTIMELIMIT;
+	defq->ino.time = XFS_QM_ITIMELIMIT;
+	defq->rtb.time = XFS_QM_RTBTIMELIMIT;
+	defq->blk.warn = XFS_QM_BWARNLIMIT;
+	defq->ino.warn = XFS_QM_IWARNLIMIT;
+	defq->rtb.warn = XFS_QM_RTBWARNLIMIT;
 
 	/*
 	 * We try to get the limits from the superuser's limits fields.
@@ -608,17 +607,17 @@ xfs_qm_init_timelimits(
 	 * more writing. If it is zero, a default is used.
 	 */
 	if (dqp->q_blk.timer)
-		defq->btimelimit = dqp->q_blk.timer;
+		defq->blk.time = dqp->q_blk.timer;
 	if (dqp->q_ino.timer)
-		defq->itimelimit = dqp->q_ino.timer;
+		defq->ino.time = dqp->q_ino.timer;
 	if (dqp->q_rtb.timer)
-		defq->rtbtimelimit = dqp->q_rtb.timer;
+		defq->rtb.time = dqp->q_rtb.timer;
 	if (dqp->q_blk.warnings)
-		defq->bwarnlimit = dqp->q_blk.warnings;
+		defq->blk.warn = dqp->q_blk.warnings;
 	if (dqp->q_ino.warnings)
-		defq->iwarnlimit = dqp->q_ino.warnings;
+		defq->ino.warn = dqp->q_ino.warnings;
 	if (dqp->q_rtb.warnings)
-		defq->rtbwarnlimit = dqp->q_rtb.warnings;
+		defq->rtb.warn = dqp->q_rtb.warnings;
 
 	xfs_qm_dqdestroy(dqp);
 }
@@ -661,6 +660,17 @@ xfs_qm_init_quotainfo(
 	/* Precalc some constants */
 	qinf->qi_dqchunklen = XFS_FSB_TO_BB(mp, XFS_DQUOT_CLUSTER_SIZE_FSB);
 	qinf->qi_dqperchunk = xfs_calc_dquots_per_chunk(qinf->qi_dqchunklen);
+	if (xfs_sb_version_hasbigtime(&mp->m_sb)) {
+		qinf->qi_expiry_min =
+			xfs_dq_bigtime_to_unix(XFS_DQ_BIGTIME_EXPIRY_MIN);
+		qinf->qi_expiry_max =
+			xfs_dq_bigtime_to_unix(XFS_DQ_BIGTIME_EXPIRY_MAX);
+	} else {
+		qinf->qi_expiry_min = XFS_DQ_LEGACY_EXPIRY_MIN;
+		qinf->qi_expiry_max = XFS_DQ_LEGACY_EXPIRY_MAX;
+	}
+	trace_xfs_quota_expiry_range(mp, qinf->qi_expiry_min,
+			qinf->qi_expiry_max);
 
 	mp->m_qflags |= (mp->m_sb.sb_qflags & XFS_ALL_QUOTA_CHKD);
 
@@ -823,10 +833,10 @@ xfs_qm_qino_alloc(
 
 STATIC void
 xfs_qm_reset_dqcounts(
-	xfs_mount_t	*mp,
-	xfs_buf_t	*bp,
-	xfs_dqid_t	id,
-	uint		type)
+	struct xfs_mount	*mp,
+	struct xfs_buf		*bp,
+	xfs_dqid_t		id,
+	xfs_dqtype_t		type)
 {
 	struct xfs_dqblk	*dqb;
 	int			j;
@@ -855,14 +865,14 @@ xfs_qm_reset_dqcounts(
 		 * xfs_dquot_verify.
 		 */
 		if (xfs_dqblk_verify(mp, &dqb[j], id + j) ||
-		    (dqb[j].dd_diskdq.d_flags & XFS_DQTYPE_REC_MASK) != type)
+		    (dqb[j].dd_diskdq.d_type & XFS_DQTYPE_REC_MASK) != type)
 			xfs_dqblk_repair(mp, &dqb[j], id + j, type);
 
 		/*
 		 * Reset type in case we are reusing group quota file for
 		 * project quotas or vice versa
 		 */
-		ddq->d_flags = type;
+		ddq->d_type = type;
 		ddq->d_bcount = 0;
 		ddq->d_icount = 0;
 		ddq->d_rtbcount = 0;
@@ -879,6 +889,8 @@ xfs_qm_reset_dqcounts(
 			ddq->d_bwarns = 0;
 			ddq->d_iwarns = 0;
 			ddq->d_rtbwarns = 0;
+			if (xfs_sb_version_hasbigtime(&mp->m_sb))
+				ddq->d_type |= XFS_DQTYPE_BIGTIME;
 		}
 
 		if (xfs_sb_version_hascrc(&mp->m_sb)) {
@@ -895,7 +907,7 @@ xfs_qm_reset_dqcounts_all(
 	xfs_dqid_t		firstid,
 	xfs_fsblock_t		bno,
 	xfs_filblks_t		blkcnt,
-	uint			type,
+	xfs_dqtype_t		type,
 	struct list_head	*buffer_list)
 {
 	struct xfs_buf		*bp;
@@ -961,7 +973,7 @@ STATIC int
 xfs_qm_reset_dqcounts_buf(
 	struct xfs_mount	*mp,
 	struct xfs_inode	*qip,
-	uint			type,
+	xfs_dqtype_t		type,
 	struct list_head	*buffer_list)
 {
 	struct xfs_bmbt_irec	*map;
@@ -1059,7 +1071,7 @@ out:
 STATIC int
 xfs_qm_quotacheck_dqadjust(
 	struct xfs_inode	*ip,
-	uint			type,
+	xfs_dqtype_t		type,
 	xfs_qcnt_t		nblks,
 	xfs_qcnt_t		rtblks)
 {

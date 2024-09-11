@@ -161,7 +161,7 @@ struct scsi_cmnd {
 	 * The following padding has been inserted before ABI freeze to
 	 * allow extending the structure while preserving ABI.
 	 */
-	RH_KABI_RESERVE(1)
+	RH_KABI_USE(1,int budget_token)
 	RH_KABI_RESERVE(2)
 	RH_KABI_RESERVE(3)
 	RH_KABI_RESERVE(4)

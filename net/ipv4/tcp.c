@@ -1743,6 +1743,20 @@ int tcp_set_rcvlowat(struct sock *sk, int val)
 }
 EXPORT_SYMBOL(tcp_set_rcvlowat);
 
+void tcp_update_recv_tstamps(struct sk_buff *skb,
+			     struct scm_timestamping *tss)
+{
+	if (skb->tstamp)
+		tss->ts[0] = ktime_to_timespec(skb->tstamp);
+	else
+		tss->ts[0] = (struct timespec) {0};
+
+	if (skb_hwtstamps(skb)->hwtstamp)
+		tss->ts[2] = ktime_to_timespec(skb_hwtstamps(skb)->hwtstamp);
+	else
+		tss->ts[2] = (struct timespec) {0};
+}
+
 #ifdef CONFIG_MMU
 static const struct vm_operations_struct tcp_vm_ops = {
 };
@@ -1754,7 +1768,7 @@ int tcp_mmap(struct file *file, struct socket *sock,
 		return -EPERM;
 	vma->vm_flags &= ~(VM_MAYWRITE | VM_MAYEXEC);
 
-	/* Instruct vm_insert_page() to not down_read(mmap_sem) */
+	/* Instruct vm_insert_page() to not mmap_read_lock(mm) */
 	vma->vm_flags |= VM_MIXEDMAP;
 
 	vma->vm_ops = &tcp_vm_ops;
@@ -1781,11 +1795,11 @@ static int tcp_zerocopy_receive(struct sock *sk,
 
 	sock_rps_record_flow(sk);
 
-	down_read(&current->mm->mmap_sem);
+	mmap_read_lock(current->mm);
 
 	vma = find_vma(current->mm, address);
 	if (!vma || vma->vm_start > address || vma->vm_ops != &tcp_vm_ops) {
-		up_read(&current->mm->mmap_sem);
+		mmap_read_unlock(current->mm);
 		return -EINVAL;
 	}
 	zc->length = min_t(unsigned long, zc->length, vma->vm_end - address);
@@ -1832,7 +1846,7 @@ static int tcp_zerocopy_receive(struct sock *sk,
 		frags++;
 	}
 out:
-	up_read(&current->mm->mmap_sem);
+	mmap_read_unlock(current->mm);
 	if (length) {
 		tp->copied_seq = seq;
 		tcp_rcv_space_adjust(sk);
@@ -1852,23 +1866,9 @@ out:
 }
 #endif
 
-static void tcp_update_recv_tstamps(struct sk_buff *skb,
-				    struct scm_timestamping *tss)
-{
-	if (skb->tstamp)
-		tss->ts[0] = ktime_to_timespec(skb->tstamp);
-	else
-		tss->ts[0] = (struct timespec) {0};
-
-	if (skb_hwtstamps(skb)->hwtstamp)
-		tss->ts[2] = ktime_to_timespec(skb_hwtstamps(skb)->hwtstamp);
-	else
-		tss->ts[2] = (struct timespec) {0};
-}
-
 /* Similar to __sock_recv_timestamp, but does not require an skb */
-static void tcp_recv_timestamp(struct msghdr *msg, const struct sock *sk,
-			       struct scm_timestamping *tss)
+void tcp_recv_timestamp(struct msghdr *msg, const struct sock *sk,
+			struct scm_timestamping *tss)
 {
 	struct timeval tv;
 	bool has_timestamping = false;
@@ -2845,6 +2845,21 @@ int tcp_sock_set_keepidle(struct sock *sk, int val)
 }
 EXPORT_SYMBOL(tcp_sock_set_keepidle);
 
+int tcp_set_window_clamp(struct sock *sk, int val)
+{
+	struct tcp_sock *tp = tcp_sk(sk);
+
+	if (!val) {
+		if (sk->sk_state != TCP_CLOSE)
+			return -EINVAL;
+		tp->window_clamp = 0;
+	} else {
+		tp->window_clamp = val < SOCK_MIN_RCVBUF / 2 ?
+			SOCK_MIN_RCVBUF / 2 : val;
+	}
+	return 0;
+}
+
 /*
  *	Socket option code for TCP.
  */
@@ -3077,15 +3092,7 @@ static int do_tcp_setsockopt(struct sock *sk, int level,
 		break;
 
 	case TCP_WINDOW_CLAMP:
-		if (!val) {
-			if (sk->sk_state != TCP_CLOSE) {
-				err = -EINVAL;
-				break;
-			}
-			tp->window_clamp = 0;
-		} else
-			tp->window_clamp = val < SOCK_MIN_RCVBUF / 2 ?
-						SOCK_MIN_RCVBUF / 2 : val;
+		err = tcp_set_window_clamp(sk, val);
 		break;
 
 	case TCP_QUICKACK:

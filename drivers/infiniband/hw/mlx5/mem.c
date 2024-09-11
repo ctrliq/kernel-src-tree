@@ -36,71 +36,6 @@
 #include "mlx5_ib.h"
 #include <linux/jiffies.h>
 
-/* @umem: umem object to scan
- * @addr: ib virtual address requested by the user
- * @max_page_shift: high limit for page_shift - 0 means no limit
- * @count: number of PAGE_SIZE pages covered by umem
- * @shift: page shift for the compound pages found in the region
- * @ncont: number of compund pages
- * @order: log2 of the number of compound pages
- */
-void mlx5_ib_cont_pages(struct ib_umem *umem, u64 addr,
-			unsigned long max_page_shift,
-			int *count, int *shift,
-			int *ncont, int *order)
-{
-	unsigned long tmp;
-	unsigned long m;
-	u64 base = ~0, p = 0;
-	u64 len, pfn;
-	int i = 0;
-	struct scatterlist *sg;
-	int entry;
-
-	addr = addr >> PAGE_SHIFT;
-	tmp = (unsigned long)addr;
-	m = find_first_bit(&tmp, BITS_PER_LONG);
-	if (max_page_shift)
-		m = min_t(unsigned long, max_page_shift - PAGE_SHIFT, m);
-
-	for_each_sg(umem->sg_head.sgl, sg, umem->nmap, entry) {
-		len = sg_dma_len(sg) >> PAGE_SHIFT;
-		pfn = sg_dma_address(sg) >> PAGE_SHIFT;
-		if (base + p != pfn) {
-			/* If either the offset or the new
-			 * base are unaligned update m
-			 */
-			tmp = (unsigned long)(pfn | p);
-			if (!IS_ALIGNED(tmp, 1 << m))
-				m = find_first_bit(&tmp, BITS_PER_LONG);
-
-			base = pfn;
-			p = 0;
-		}
-
-		p += len;
-		i += len;
-	}
-
-	if (i) {
-		m = min_t(unsigned long, ilog2(roundup_pow_of_two(i)), m);
-
-		if (order)
-			*order = ilog2(roundup_pow_of_two(i) >> m);
-
-		*ncont = DIV_ROUND_UP(i, (1 << m));
-	} else {
-		m  = 0;
-
-		if (order)
-			*order = 0;
-
-		*ncont = 0;
-	}
-	*shift = PAGE_SHIFT + m;
-	*count = i;
-}
-
 /*
  * Populate the given array with bus addresses from the umem.
  *
@@ -165,32 +100,65 @@ void __mlx5_ib_populate_pas(struct mlx5_ib_dev *dev, struct ib_umem *umem,
 	}
 }
 
-void mlx5_ib_populate_pas(struct mlx5_ib_dev *dev, struct ib_umem *umem,
-			  int page_shift, __be64 *pas, int access_flags)
+/*
+ * Fill in a physical address list. ib_umem_num_dma_blocks() entries will be
+ * filled in the pas array.
+ */
+void mlx5_ib_populate_pas(struct ib_umem *umem, size_t page_size, __be64 *pas,
+			  u64 access_flags)
 {
-	return __mlx5_ib_populate_pas(dev, umem, page_shift, 0,
-				      ib_umem_num_dma_blocks(umem, PAGE_SIZE),
-				      pas, access_flags);
+	struct ib_block_iter biter;
+
+	rdma_umem_for_each_dma_block (umem, &biter, page_size) {
+		*pas = cpu_to_be64(rdma_block_iter_dma_address(&biter) |
+				   access_flags);
+		pas++;
+	}
 }
-int mlx5_ib_get_buf_offset(u64 addr, int page_shift, u32 *offset)
+
+/*
+ * Compute the page shift and page_offset for mailboxes that use a quantized
+ * page_offset. The granulatity of the page offset scales according to page
+ * size.
+ */
+unsigned long __mlx5_umem_find_best_quantized_pgoff(
+	struct ib_umem *umem, unsigned long pgsz_bitmap,
+	unsigned int page_offset_bits, u64 pgoff_bitmask, unsigned int scale,
+	unsigned int *page_offset_quantized)
 {
-	u64 page_size;
-	u64 page_mask;
-	u64 off_size;
-	u64 off_mask;
-	u64 buf_off;
+	const u64 page_offset_mask = (1UL << page_offset_bits) - 1;
+	unsigned long page_size;
+	u64 page_offset;
 
-	page_size = (u64)1 << page_shift;
-	page_mask = page_size - 1;
-	buf_off = addr & page_mask;
-	off_size = page_size >> 6;
-	off_mask = off_size - 1;
+	page_size = ib_umem_find_best_pgoff(umem, pgsz_bitmap, pgoff_bitmask);
+	if (!page_size)
+		return 0;
 
-	if (buf_off & off_mask)
-		return -EINVAL;
+	/*
+	 * page size is the largest possible page size.
+	 *
+	 * Reduce the page_size, and thus the page_offset and quanta, until the
+	 * page_offset fits into the mailbox field. Once page_size < scale this
+	 * loop is guaranteed to terminate.
+	 */
+	page_offset = ib_umem_dma_offset(umem, page_size);
+	while (page_offset & ~(u64)(page_offset_mask * (page_size / scale))) {
+		page_size /= 2;
+		page_offset = ib_umem_dma_offset(umem, page_size);
+	}
 
-	*offset = buf_off >> ilog2(off_size);
-	return 0;
+	/*
+	 * The address is not aligned, or otherwise cannot be represented by the
+	 * page_offset.
+	 */
+	if (!(pgsz_bitmap & page_size))
+		return 0;
+
+	*page_offset_quantized =
+		(unsigned long)page_offset / (page_size / scale);
+	if (WARN_ON(*page_offset_quantized > page_offset_mask))
+		return 0;
+	return page_size;
 }
 
 #define WR_ID_BF 0xBF

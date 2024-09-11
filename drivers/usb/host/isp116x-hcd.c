@@ -1447,7 +1447,6 @@ static int isp116x_bus_resume(struct usb_hcd *hcd)
 		val &= ~HCCONTROL_HCFS;
 		val |= HCCONTROL_USB_RESUME;
 		isp116x_write_reg32(isp116x, HCCONTROL, val);
-		break;
 	case HCCONTROL_USB_RESUME:
 		break;
 	case HCCONTROL_USB_OPER:

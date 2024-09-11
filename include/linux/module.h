@@ -430,6 +430,10 @@ struct module {
 	unsigned int num_tracepoints;
 	struct tracepoint * const *tracepoints_ptrs;
 #endif
+#ifdef CONFIG_DEBUG_INFO_BTF_MODULES
+	unsigned int btf_data_size;
+	void *btf_data;
+#endif
 #ifdef HAVE_JUMP_LABEL
 	struct jump_entry *jump_entries;
 	unsigned int num_jump_entries;

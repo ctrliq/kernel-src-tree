@@ -24,14 +24,12 @@
 #include "amdgpu_amdkfd.h"
 #include "gc/gc_10_3_0_offset.h"
 #include "gc/gc_10_3_0_sh_mask.h"
-#include "navi10_enum.h"
 #include "oss/osssys_5_0_0_offset.h"
 #include "oss/osssys_5_0_0_sh_mask.h"
 #include "soc15_common.h"
 #include "v10_structs.h"
 #include "nv.h"
 #include "nvd.h"
-#include "gfxhub_v2_1.h"
 
 enum hqd_dequeue_request_type {
 	NO_ACTION = 0,
@@ -657,7 +655,7 @@ static void set_vm_context_page_table_base_v10_3(struct kgd_dev *kgd, uint32_t v
 	struct amdgpu_device *adev = get_amdgpu_device(kgd);
 
 	/* SDMA is on gfxhub as well for Navi1* series */
-	gfxhub_v2_1_setup_vm_pt_regs(adev, vmid, page_table_base);
+	adev->gfxhub.funcs->setup_vm_pt_regs(adev, vmid, page_table_base);
 }
 
 #if 0
@@ -822,7 +820,6 @@ const struct kfd2kgd_calls gfx_v10_3_kfd2kgd = {
 	.address_watch_get_offset = address_watch_get_offset_v10_3,
 	.get_atc_vmid_pasid_mapping_info = NULL,
 	.set_vm_context_page_table_base = set_vm_context_page_table_base_v10_3,
-	.get_hive_id = amdgpu_amdkfd_get_hive_id,
 #if 0
 	.enable_debug_trap = enable_debug_trap_v10_3,
 	.disable_debug_trap = disable_debug_trap_v10_3,

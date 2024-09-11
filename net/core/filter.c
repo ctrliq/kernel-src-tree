@@ -4916,6 +4916,9 @@ static int _bpf_setsockopt(struct sock *sk, int level, int optname,
 				tp->notsent_lowat = val;
 				sk->sk_write_space(sk);
 				break;
+			case TCP_WINDOW_CLAMP:
+				ret = tcp_set_window_clamp(sk, val);
+				break;
 			default:
 				ret = -EINVAL;
 			}
@@ -10422,6 +10425,26 @@ const struct bpf_func_proto bpf_skc_to_udp6_sock_proto = {
 	.ret_type		= RET_PTR_TO_BTF_ID_OR_NULL,
 	.arg1_type		= ARG_PTR_TO_BTF_ID_SOCK_COMMON,
 	.ret_btf_id		= &btf_sock_ids[BTF_SOCK_TYPE_UDP6],
+};
+
+BPF_CALL_1(bpf_sock_from_file, struct file *, file)
+{
+	int ret __maybe_unused;
+
+	return (unsigned long) sock_from_file(file, &ret);
+}
+
+BTF_ID_LIST(bpf_sock_from_file_btf_ids)
+BTF_ID(struct, socket)
+BTF_ID(struct, file)
+
+const struct bpf_func_proto bpf_sock_from_file_proto = {
+	.func		= bpf_sock_from_file,
+	.gpl_only	= false,
+	.ret_type	= RET_PTR_TO_BTF_ID_OR_NULL,
+	.ret_btf_id	= &bpf_sock_from_file_btf_ids[0],
+	.arg1_type	= ARG_PTR_TO_BTF_ID,
+	.arg1_btf_id	= &bpf_sock_from_file_btf_ids[1],
 };
 
 static const struct bpf_func_proto *

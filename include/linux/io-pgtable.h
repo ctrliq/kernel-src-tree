@@ -26,8 +26,6 @@ enum io_pgtable_fmt {
  * @tlb_flush_walk: Synchronously invalidate all intermediate TLB state
  *                  (sometimes referred to as the "walk cache") for a virtual
  *                  address range.
- * @tlb_flush_leaf: Synchronously invalidate all leaf TLB state for a virtual
- *                  address range.
  * @tlb_add_page:   Optional callback to queue up leaf TLB invalidation for a
  *                  single page.  IOMMUs that cannot batch TLB invalidation
  *                  operations efficiently will typically issue them here, but
@@ -40,8 +38,6 @@ enum io_pgtable_fmt {
 struct iommu_flush_ops {
 	void (*tlb_flush_all)(void *cookie);
 	void (*tlb_flush_walk)(unsigned long iova, size_t size, size_t granule,
-			       void *cookie);
-	void (*tlb_flush_leaf)(unsigned long iova, size_t size, size_t granule,
 			       void *cookie);
 	void (*tlb_add_page)(struct iommu_iotlb_gather *gather,
 			     unsigned long iova, size_t granule, void *cookie);
@@ -73,10 +69,6 @@ struct io_pgtable_cfg {
 	 *	hardware which does not implement the permissions of a given
 	 *	format, and/or requires some format-specific default value.
 	 *
-	 * IO_PGTABLE_QUIRK_TLBI_ON_MAP: If the format forbids caching invalid
-	 *	(unmapped) entries but the hardware might do so anyway, perform
-	 *	TLB maintenance when mapping as well as when unmapping.
-	 *
 	 * IO_PGTABLE_QUIRK_ARM_MTK_4GB: (ARM v7s format) Set bit 9 in all
 	 *	PTEs, for Mediatek IOMMUs which treat it as a 33rd address bit
 	 *	when the SoC is in "4GB mode" and they can only access the high
@@ -88,13 +80,16 @@ struct io_pgtable_cfg {
 	 *
 	 * IO_PGTABLE_QUIRK_ARM_TTBR1: (ARM LPAE format) Configure the table
 	 *	for use in the upper half of a split address space.
+	 *
+	 * IO_PGTABLE_QUIRK_ARM_OUTER_WBWA: Override the outer-cacheability
+	 *	attributes set in the TCR for a non-coherent page-table walker.
 	 */
 	#define IO_PGTABLE_QUIRK_ARM_NS		BIT(0)
 	#define IO_PGTABLE_QUIRK_NO_PERMS	BIT(1)
-	#define IO_PGTABLE_QUIRK_TLBI_ON_MAP	BIT(2)
 	#define IO_PGTABLE_QUIRK_ARM_MTK_4GB	BIT(3)
 	#define IO_PGTABLE_QUIRK_NON_STRICT	BIT(4)
 	#define IO_PGTABLE_QUIRK_ARM_TTBR1	BIT(5)
+	#define IO_PGTABLE_QUIRK_ARM_OUTER_WBWA	BIT(6)
 	unsigned long			quirks;
 	unsigned long			pgsize_bitmap;
 	unsigned int			ias;
@@ -226,13 +221,6 @@ io_pgtable_tlb_flush_walk(struct io_pgtable *iop, unsigned long iova,
 {
 	if (iop->cfg.tlb && iop->cfg.tlb->tlb_flush_walk)
 		iop->cfg.tlb->tlb_flush_walk(iova, size, granule, iop->cookie);
-}
-
-static inline void
-io_pgtable_tlb_flush_leaf(struct io_pgtable *iop, unsigned long iova,
-			  size_t size, size_t granule)
-{
-	iop->cfg.tlb->tlb_flush_leaf(iova, size, granule, iop->cookie);
 }
 
 static inline void

@@ -395,6 +395,13 @@ static int check_export(struct inode *inode, int *flags, unsigned char *uuid)
 		return -EINVAL;
 	}
 
+	/*
+	 * Only support the re-export of NFS as tech-preview
+	 */
+	if (!strcmp(inode->i_sb->s_type->name, "nfs") ||
+	    !strcmp(inode->i_sb->s_type->name, "nfs4"))
+		mark_tech_preview("Re-exporting NFS", NULL);
+
 	return 0;
 
 }

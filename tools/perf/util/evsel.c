@@ -26,6 +26,7 @@
 #include <stdlib.h>
 #include <perf/evsel.h>
 #include "asm/bug.h"
+#include "bpf_counter.h"
 #include "callchain.h"
 #include "cgroup.h"
 #include "counts.h"
@@ -46,6 +47,7 @@
 #include "string2.h"
 #include "memswap.h"
 #include "util.h"
+#include "hashmap.h"
 #include "../perf-sys.h"
 #include "util/parse-branch-options.h"
 #include <internal/xyarray.h>
@@ -248,6 +250,7 @@ void evsel__init(struct evsel *evsel,
 	evsel->bpf_obj	   = NULL;
 	evsel->bpf_fd	   = -1;
 	INIT_LIST_HEAD(&evsel->config_terms);
+	INIT_LIST_HEAD(&evsel->bpf_counter_list);
 	perf_evsel__object.init(evsel);
 	evsel->sample_size = __evsel__sample_size(attr->sample_type);
 	evsel__calc_id_pos(evsel);
@@ -1377,6 +1380,7 @@ void evsel__exit(struct evsel *evsel)
 {
 	assert(list_empty(&evsel->core.node));
 	assert(evsel->evlist == NULL);
+	bpf_counter__destroy(evsel);
 	evsel__free_counts(evsel);
 	perf_evsel__free_fd(&evsel->core);
 	perf_evsel__free_id(&evsel->core);
@@ -1388,7 +1392,9 @@ void evsel__exit(struct evsel *evsel)
 	zfree(&evsel->group_name);
 	zfree(&evsel->name);
 	zfree(&evsel->pmu_name);
-	zfree(&evsel->per_pkg_mask);
+	evsel__zero_per_pkg(evsel);
+	hashmap__free(evsel->per_pkg_mask);
+	evsel->per_pkg_mask = NULL;
 	zfree(&evsel->metric_events);
 	perf_evsel__object.fini(evsel);
 }
@@ -1795,6 +1801,8 @@ retry_open:
 					     group_fd, flags);
 
 			FD(evsel, cpu, thread) = fd;
+
+			bpf_counter__install_pe(evsel, cpu, fd);
 
 			if (unlikely(test_attr__enabled)) {
 				test_attr__open(&evsel->core.attr, pid, cpus->map[cpu],
@@ -2776,4 +2784,17 @@ int evsel__store_ids(struct evsel *evsel, struct evlist *evlist)
 		return -ENOMEM;
 
 	return store_evsel_ids(evsel, evlist);
+}
+
+void evsel__zero_per_pkg(struct evsel *evsel)
+{
+	struct hashmap_entry *cur;
+	size_t bkt;
+
+	if (evsel->per_pkg_mask) {
+		hashmap__for_each_entry(evsel->per_pkg_mask, cur, bkt)
+			free((char *)cur->key);
+
+		hashmap__clear(evsel->per_pkg_mask);
+	}
 }

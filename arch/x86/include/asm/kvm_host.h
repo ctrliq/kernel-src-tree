@@ -1068,6 +1068,9 @@ struct kvm_arch {
 
 	bool bus_lock_detection_enabled;
 
+	/* Guest can access the SGX PROVISIONKEY. */
+	bool sgx_provisioning_allowed;
+
 	/* Deflect RDMSR and WRMSR to user space when they trigger a #GP */
 	u32 user_space_msr_mask;
 	struct kvm_x86_msr_filter __rcu *msr_filter;
@@ -1755,7 +1758,15 @@ asmlinkage void kvm_spurious_fault(void);
 	insn "\n\t"							\
 	"jmp	668f \n\t"						\
 	"667: \n\t"							\
+	"1: \n\t"							\
+	".pushsection .discard.instr_begin \n\t"			\
+	".long 1b - . \n\t"						\
+	".popsection \n\t"						\
 	"call	kvm_spurious_fault \n\t"				\
+	"1: \n\t"							\
+	".pushsection .discard.instr_end \n\t"				\
+	".long 1b - . \n\t"						\
+	".popsection \n\t"						\
 	"668: \n\t"							\
 	_ASM_EXTABLE(666b, 667b)
 

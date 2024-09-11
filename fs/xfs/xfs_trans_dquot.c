@@ -15,6 +15,7 @@
 #include "xfs_trans_priv.h"
 #include "xfs_quota.h"
 #include "xfs_qm.h"
+#include "xfs_trace.h"
 
 STATIC void	xfs_trans_alloc_dqinfo(xfs_trans_t *);
 
@@ -53,6 +54,12 @@ xfs_trans_log_dquot(
 	struct xfs_dquot	*dqp)
 {
 	ASSERT(XFS_DQ_IS_LOCKED(dqp));
+
+	/* Upgrade the dquot to bigtime format if possible. */
+	if (dqp->q_id != 0 &&
+	    xfs_sb_version_hasbigtime(&tp->t_mountp->m_sb) &&
+	    !(dqp->q_type & XFS_DQTYPE_BIGTIME))
+		dqp->q_type |= XFS_DQTYPE_BIGTIME;
 
 	tp->t_flags |= XFS_TRANS_DIRTY;
 	set_bit(XFS_LI_DIRTY, &dqp->q_logitem.qli_item.li_flags);
@@ -208,6 +215,11 @@ xfs_trans_mod_dquot(
 	if (qtrx->qt_dquot == NULL)
 		qtrx->qt_dquot = dqp;
 
+	if (delta) {
+		trace_xfs_trans_mod_dquot_before(qtrx);
+		trace_xfs_trans_mod_dquot(tp, dqp, field, delta);
+	}
+
 	switch (field) {
 	/* regular disk blk reservation */
 	case XFS_TRANS_DQ_RES_BLKS:
@@ -258,6 +270,10 @@ xfs_trans_mod_dquot(
 	default:
 		ASSERT(0);
 	}
+
+	if (delta)
+		trace_xfs_trans_mod_dquot_after(qtrx);
+
 	tp->t_flags |= XFS_TRANS_DQ_DIRTY;
 }
 
@@ -383,6 +399,13 @@ xfs_trans_apply_dquot_deltas(
 				qtrx->qt_delbcnt_delta;
 			totalrtbdelta = qtrx->qt_rtbcount_delta +
 				qtrx->qt_delrtb_delta;
+
+			if (totalbdelta != 0 || totalrtbdelta != 0 ||
+			    qtrx->qt_icount_delta != 0) {
+				trace_xfs_trans_apply_dquot_deltas_before(dqp);
+				trace_xfs_trans_apply_dquot_deltas(qtrx);
+			}
+
 #ifdef DEBUG
 			if (totalbdelta < 0)
 				ASSERT(dqp->q_blk.count >= -totalbdelta);
@@ -401,6 +424,10 @@ xfs_trans_apply_dquot_deltas(
 
 			if (totalrtbdelta)
 				dqp->q_rtb.count += totalrtbdelta;
+
+			if (totalbdelta != 0 || totalrtbdelta != 0 ||
+			    qtrx->qt_icount_delta != 0)
+				trace_xfs_trans_apply_dquot_deltas_after(dqp);
 
 			/*
 			 * Get any default limits in use.
@@ -543,6 +570,59 @@ xfs_quota_warn(
 }
 
 /*
+ * Decide if we can make an additional reservation against a quota resource.
+ * Returns an inode QUOTA_NL_ warning code and whether or not it's fatal.
+ *
+ * Note that we assume that the numeric difference between the inode and block
+ * warning codes will always be 3 since it's userspace ABI now, and will never
+ * decrease the quota reservation, so the *BELOW messages are irrelevant.
+ */
+static inline int
+xfs_dqresv_check(
+	struct xfs_dquot_res	*res,
+	struct xfs_quota_limits	*qlim,
+	int64_t			delta,
+	bool			*fatal)
+{
+	xfs_qcnt_t		hardlimit = res->hardlimit;
+	xfs_qcnt_t		softlimit = res->softlimit;
+	xfs_qcnt_t		total_count = res->reserved + delta;
+
+	BUILD_BUG_ON(QUOTA_NL_BHARDWARN     != QUOTA_NL_IHARDWARN + 3);
+	BUILD_BUG_ON(QUOTA_NL_BSOFTLONGWARN != QUOTA_NL_ISOFTLONGWARN + 3);
+	BUILD_BUG_ON(QUOTA_NL_BSOFTWARN     != QUOTA_NL_ISOFTWARN + 3);
+
+	*fatal = false;
+	if (delta <= 0)
+		return QUOTA_NL_NOWARN;
+
+	if (!hardlimit)
+		hardlimit = qlim->hard;
+	if (!softlimit)
+		softlimit = qlim->soft;
+
+	if (hardlimit && total_count > hardlimit) {
+		*fatal = true;
+		return QUOTA_NL_IHARDWARN;
+	}
+
+	if (softlimit && total_count > softlimit) {
+		time64_t	now = ktime_get_real_seconds();
+
+		if ((res->timer != 0 && now > res->timer) ||
+		    (res->warnings != 0 && res->warnings >= qlim->warn)) {
+			*fatal = true;
+			return QUOTA_NL_ISOFTLONGWARN;
+		}
+
+		res->warnings++;
+		return QUOTA_NL_ISOFTWARN;
+	}
+
+	return QUOTA_NL_NOWARN;
+}
+
+/*
  * This reserves disk blocks and inodes against a dquot.
  * Flags indicate if the dquot is to be locked here and also
  * if the blk reservation is for RT or regular blocks.
@@ -557,99 +637,49 @@ xfs_trans_dqresv(
 	long			ninos,
 	uint			flags)
 {
-	xfs_qcnt_t		hardlimit;
-	xfs_qcnt_t		softlimit;
-	time64_t		timer;
-	xfs_qwarncnt_t		warns;
-	xfs_qwarncnt_t		warnlimit;
-	xfs_qcnt_t		total_count;
-	xfs_qcnt_t		*resbcountp;
 	struct xfs_quotainfo	*q = mp->m_quotainfo;
 	struct xfs_def_quota	*defq;
-
+	struct xfs_dquot_res	*blkres;
+	struct xfs_quota_limits	*qlim;
 
 	xfs_dqlock(dqp);
 
 	defq = xfs_get_defquota(q, xfs_dquot_type(dqp));
 
 	if (flags & XFS_TRANS_DQ_RES_BLKS) {
-		hardlimit = dqp->q_blk.hardlimit;
-		if (!hardlimit)
-			hardlimit = defq->bhardlimit;
-		softlimit = dqp->q_blk.softlimit;
-		if (!softlimit)
-			softlimit = defq->bsoftlimit;
-		timer = dqp->q_blk.timer;
-		warns = dqp->q_blk.warnings;
-		warnlimit = defq->bwarnlimit;
-		resbcountp = &dqp->q_blk.reserved;
+		blkres = &dqp->q_blk;
+		qlim = &defq->blk;
 	} else {
-		ASSERT(flags & XFS_TRANS_DQ_RES_RTBLKS);
-		hardlimit = dqp->q_rtb.hardlimit;
-		if (!hardlimit)
-			hardlimit = defq->rtbhardlimit;
-		softlimit = dqp->q_rtb.softlimit;
-		if (!softlimit)
-			softlimit = defq->rtbsoftlimit;
-		timer = dqp->q_rtb.timer;
-		warns = dqp->q_rtb.warnings;
-		warnlimit = defq->rtbwarnlimit;
-		resbcountp = &dqp->q_rtb.reserved;
+		blkres = &dqp->q_rtb;
+		qlim = &defq->rtb;
 	}
 
 	if ((flags & XFS_QMOPT_FORCE_RES) == 0 && dqp->q_id &&
-	    ((XFS_IS_UQUOTA_ENFORCED(dqp->q_mount) && XFS_QM_ISUDQ(dqp)) ||
-	     (XFS_IS_GQUOTA_ENFORCED(dqp->q_mount) && XFS_QM_ISGDQ(dqp)) ||
-	     (XFS_IS_PQUOTA_ENFORCED(dqp->q_mount) && XFS_QM_ISPDQ(dqp)))) {
-		if (nblks > 0) {
+	    xfs_dquot_is_enforced(dqp)) {
+		int		quota_nl;
+		bool		fatal;
+
+		/*
+		 * dquot is locked already. See if we'd go over the hardlimit
+		 * or exceed the timelimit if we'd reserve resources.
+		 */
+		quota_nl = xfs_dqresv_check(blkres, qlim, nblks, &fatal);
+		if (quota_nl != QUOTA_NL_NOWARN) {
 			/*
-			 * dquot is locked already. See if we'd go over the
-			 * hardlimit or exceed the timelimit if we allocate
-			 * nblks.
+			 * Quota block warning codes are 3 more than the inode
+			 * codes, which we check above.
 			 */
-			total_count = *resbcountp + nblks;
-			if (hardlimit && total_count > hardlimit) {
-				xfs_quota_warn(mp, dqp, QUOTA_NL_BHARDWARN);
+			xfs_quota_warn(mp, dqp, quota_nl + 3);
+			if (fatal)
 				goto error_return;
-			}
-			if (softlimit && total_count > softlimit) {
-				if ((timer != 0 &&
-				     ktime_get_real_seconds() > timer) ||
-				    (warns != 0 && warns >= warnlimit)) {
-					xfs_quota_warn(mp, dqp,
-						       QUOTA_NL_BSOFTLONGWARN);
-					goto error_return;
-				}
-
-				xfs_quota_warn(mp, dqp, QUOTA_NL_BSOFTWARN);
-			}
 		}
-		if (ninos > 0) {
-			total_count = dqp->q_ino.reserved + ninos;
-			timer = dqp->q_ino.timer;
-			warns = dqp->q_ino.warnings;
-			warnlimit = defq->iwarnlimit;
-			hardlimit = dqp->q_ino.hardlimit;
-			if (!hardlimit)
-				hardlimit = defq->ihardlimit;
-			softlimit = dqp->q_ino.softlimit;
-			if (!softlimit)
-				softlimit = defq->isoftlimit;
 
-			if (hardlimit && total_count > hardlimit) {
-				xfs_quota_warn(mp, dqp, QUOTA_NL_IHARDWARN);
+		quota_nl = xfs_dqresv_check(&dqp->q_ino, &defq->ino, ninos,
+				&fatal);
+		if (quota_nl != QUOTA_NL_NOWARN) {
+			xfs_quota_warn(mp, dqp, quota_nl);
+			if (fatal)
 				goto error_return;
-			}
-			if (softlimit && total_count > softlimit) {
-				if  ((timer != 0 &&
-				      ktime_get_real_seconds() > timer) ||
-				     (warns != 0 && warns >= warnlimit)) {
-					xfs_quota_warn(mp, dqp,
-						       QUOTA_NL_ISOFTLONGWARN);
-					goto error_return;
-				}
-				xfs_quota_warn(mp, dqp, QUOTA_NL_ISOFTWARN);
-			}
 		}
 	}
 
@@ -657,9 +687,8 @@ xfs_trans_dqresv(
 	 * Change the reservation, but not the actual usage.
 	 * Note that q_blk.reserved = q_blk.count + resv
 	 */
-	(*resbcountp) += (xfs_qcnt_t)nblks;
-	if (ninos != 0)
-		dqp->q_ino.reserved += (xfs_qcnt_t)ninos;
+	blkres->reserved += (xfs_qcnt_t)nblks;
+	dqp->q_ino.reserved += (xfs_qcnt_t)ninos;
 
 	/*
 	 * note the reservation amt in the trans struct too,
@@ -838,7 +867,8 @@ STATIC void
 xfs_trans_alloc_dqinfo(
 	xfs_trans_t	*tp)
 {
-	tp->t_dqinfo = kmem_zone_zalloc(xfs_qm_dqtrxzone, 0);
+	tp->t_dqinfo = kmem_cache_zalloc(xfs_qm_dqtrxzone,
+					 GFP_KERNEL | __GFP_NOFAIL);
 }
 
 void

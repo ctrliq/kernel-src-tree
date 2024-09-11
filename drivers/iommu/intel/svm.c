@@ -894,6 +894,7 @@ static irqreturn_t prq_event_thread(int irq, void *d)
 	struct intel_iommu *iommu = d;
 	struct intel_svm *svm = NULL;
 	int head, tail, handled = 0;
+	unsigned int flags = 0;
 
 	/* Clear PPR bit before reading head/tail registers, to
 	 * ensure that we get a new interrupt if needed. */
@@ -983,7 +984,7 @@ static irqreturn_t prq_event_thread(int irq, void *d)
 		if (!mmget_not_zero(svm->mm))
 			goto bad_req;
 
-		down_read(&svm->mm->mmap_sem);
+		mmap_read_lock(svm->mm);
 		vma = find_extend_vma(svm->mm, address);
 		if (!vma || address < vma->vm_start)
 			goto invalid;
@@ -991,14 +992,17 @@ static irqreturn_t prq_event_thread(int irq, void *d)
 		if (access_error(vma, req))
 			goto invalid;
 
-		ret = handle_mm_fault(vma, address,
-				      req->wr_req ? FAULT_FLAG_WRITE : 0);
+		flags = FAULT_FLAG_USER | FAULT_FLAG_REMOTE;
+		if (req->wr_req)
+			flags |= FAULT_FLAG_WRITE;
+
+		ret = handle_mm_fault(vma, address, flags);
 		if (ret & VM_FAULT_ERROR)
 			goto invalid;
 
 		result = QI_RESP_SUCCESS;
 invalid:
-		up_read(&svm->mm->mmap_sem);
+		mmap_read_unlock(svm->mm);
 		mmput(svm->mm);
 bad_req:
 		/* We get here in the error case where the PASID lookup failed,

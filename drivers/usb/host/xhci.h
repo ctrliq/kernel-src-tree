@@ -918,6 +918,8 @@ struct xhci_bw_info {
 #define SS_BW_RESERVED		10
 
 struct xhci_virt_ep {
+	struct xhci_virt_device		*vdev;	/* parent */
+	unsigned int			ep_index;
 	struct xhci_ring		*ring;
 	/* Related to endpoints that are configured to use stream IDs only */
 	struct xhci_stream_info		*stream_info;
@@ -996,6 +998,7 @@ struct xhci_interval_bw_table {
 #define EP_CTX_PER_DEV		31
 
 struct xhci_virt_device {
+	int				slot_id;
 	struct usb_device		*udev;
 	/*
 	 * Commands to the hardware are passed an "input context" that
@@ -1536,9 +1539,18 @@ struct xhci_segment {
 	unsigned int		bounce_len;
 };
 
+enum xhci_cancelled_td_status {
+	TD_DIRTY = 0,
+	TD_HALTED,
+	TD_CLEARING_CACHE,
+	TD_CLEARED,
+};
+
 struct xhci_td {
 	struct list_head	td_list;
 	struct list_head	cancelled_td_list;
+	int			status;
+	enum xhci_cancelled_td_status	cancel_status;
 	struct urb		*urb;
 	struct xhci_segment	*start_seg;
 	union xhci_trb		*first_trb;
@@ -1557,13 +1569,6 @@ struct xhci_td {
 struct xhci_cd {
 	struct xhci_command	*command;
 	union xhci_trb		*cmd_trb;
-};
-
-struct xhci_dequeue_state {
-	struct xhci_segment *new_deq_seg;
-	union xhci_trb *new_deq_ptr;
-	int new_cycle_state;
-	unsigned int stream_id;
 };
 
 enum xhci_ring_type {
@@ -1649,7 +1654,7 @@ struct xhci_scratchpad {
 struct urb_priv {
 	int	num_tds;
 	int	num_tds_done;
-	struct	xhci_td	td[0];
+	struct	xhci_td	td[];
 };
 
 /*
@@ -2126,13 +2131,6 @@ int xhci_queue_reset_ep(struct xhci_hcd *xhci, struct xhci_command *cmd,
 		enum xhci_ep_reset_type reset_type);
 int xhci_queue_reset_device(struct xhci_hcd *xhci, struct xhci_command *cmd,
 		u32 slot_id);
-void xhci_find_new_dequeue_state(struct xhci_hcd *xhci,
-		unsigned int slot_id, unsigned int ep_index,
-		unsigned int stream_id, struct xhci_td *cur_td,
-		struct xhci_dequeue_state *state);
-void xhci_queue_new_dequeue_state(struct xhci_hcd *xhci,
-		unsigned int slot_id, unsigned int ep_index,
-		struct xhci_dequeue_state *deq_state);
 void xhci_cleanup_stalled_ring(struct xhci_hcd *xhci, unsigned int slot_id,
 			       unsigned int ep_index, unsigned int stream_id,
 			       struct xhci_td *td);
