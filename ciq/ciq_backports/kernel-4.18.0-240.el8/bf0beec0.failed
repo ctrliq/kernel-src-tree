@@ -1,0 +1,370 @@
+blk-mq: drain I/O when all CPUs in a hctx are offline
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Ming Lei <ming.lei@redhat.com>
+commit bf0beec0607db3c6f6fb7bd2c6d503792b05cf3f
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/bf0beec0.failed
+
+Most of blk-mq drivers depend on managed IRQ's auto-affinity to setup
+up queue mapping. Thomas mentioned the following point[1]:
+
+"That was the constraint of managed interrupts from the very beginning:
+
+ The driver/subsystem has to quiesce the interrupt line and the associated
+ queue _before_ it gets shutdown in CPU unplug and not fiddle with it
+ until it's restarted by the core when the CPU is plugged in again."
+
+However, current blk-mq implementation doesn't quiesce hw queue before
+the last CPU in the hctx is shutdown.  Even worse, CPUHP_BLK_MQ_DEAD is a
+cpuhp state handled after the CPU is down, so there isn't any chance to
+quiesce the hctx before shutting down the CPU.
+
+Add new CPUHP_AP_BLK_MQ_ONLINE state to stop allocating from blk-mq hctxs
+where the last CPU goes away, and wait for completion of in-flight
+requests.  This guarantees that there is no inflight I/O before shutting
+down the managed IRQ.
+
+Add a BLK_MQ_F_STACKING and set it for dm-rq and loop, so we don't need
+to wait for completion of in-flight requests from these drivers to avoid
+a potential dead-lock. It is safe to do this for stacking drivers as those
+do not use interrupts at all and their I/O completions are triggered by
+underlying devices I/O completion.
+
+[1] https://lore.kernel.org/linux-block/alpine.DEB.2.21.1904051331270.1802@nanos.tec.linutronix.de/
+
+[hch: different retry mechanism, merged two patches, minor cleanups]
+
+	Signed-off-by: Ming Lei <ming.lei@redhat.com>
+	Signed-off-by: Christoph Hellwig <hch@lst.de>
+	Reviewed-by: Hannes Reinecke <hare@suse.de>
+	Reviewed-by: Daniel Wagner <dwagner@suse.de>
+	Signed-off-by: Jens Axboe <axboe@kernel.dk>
+(cherry picked from commit bf0beec0607db3c6f6fb7bd2c6d503792b05cf3f)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	block/blk-mq.c
+#	include/linux/blk-mq.h
+#	include/linux/cpuhotplug.h
+diff --cc block/blk-mq.c
+index 260262d3164a,9a36ac1c1fa1..000000000000
+--- a/block/blk-mq.c
++++ b/block/blk-mq.c
+@@@ -360,31 -373,33 +360,59 @@@ static struct request *blk_mq_get_reque
+  		    e->type->ops.limit_depth &&
+  		    !(data->flags & BLK_MQ_REQ_RESERVED))
+  			e->type->ops.limit_depth(data->cmd_flags, data);
+ +	} else {
+ +		blk_mq_tag_busy(data->hctx);
+  	}
+  
+++<<<<<<< HEAD
+ +	tag = blk_mq_get_tag(data);
+ +	if (tag == BLK_MQ_NO_TAG) {
+ +		if (clear_ctx_on_error)
+ +			data->ctx = NULL;
+ +		blk_queue_exit(q);
+ +		return NULL;
+ +	}
+ +
+ +	rq = blk_mq_rq_ctx_init(data, tag, data->cmd_flags);
+ +	if (!op_is_flush(data->cmd_flags)) {
+ +		rq->elv.icq = NULL;
+ +		if (e && e->type->ops.prepare_request) {
+ +			if (e->type->icq_cache)
+ +				blk_mq_sched_assign_ioc(rq);
+ +
+ +			e->type->ops.prepare_request(rq, bio);
+ +			rq->rq_flags |= RQF_ELVPRIV;
+ +		}
+ +	}
+ +	data->hctx->queued++;
+ +	return rq;
+++=======
++ retry:
++ 	data->ctx = blk_mq_get_ctx(q);
++ 	data->hctx = blk_mq_map_queue(q, data->cmd_flags, data->ctx);
++ 	if (!(data->flags & BLK_MQ_REQ_INTERNAL))
++ 		blk_mq_tag_busy(data->hctx);
++ 
++ 	/*
++ 	 * Waiting allocations only fail because of an inactive hctx.  In that
++ 	 * case just retry the hctx assignment and tag allocation as CPU hotplug
++ 	 * should have migrated us to an online CPU by now.
++ 	 */
++ 	tag = blk_mq_get_tag(data);
++ 	if (tag == BLK_MQ_NO_TAG) {
++ 		if (data->flags & BLK_MQ_REQ_NOWAIT)
++ 			return NULL;
++ 
++ 		/*
++ 		 * Give up the CPU and sleep for a random short time to ensure
++ 		 * that thread using a realtime scheduling class are migrated
++ 		 * off the the CPU, and thus off the hctx that is going away.
++ 		 */
++ 		msleep(3);
++ 		goto retry;
++ 	}
++ 	return blk_mq_rq_ctx_init(data, tag, alloc_time_ns);
+++>>>>>>> bf0beec0607d (blk-mq: drain I/O when all CPUs in a hctx are offline)
+  }
+  
+  struct request *blk_mq_alloc_request(struct request_queue *q, unsigned int op,
+diff --cc include/linux/blk-mq.h
+index 0f41e2f0a1e5,d6fcae17da5a..000000000000
+--- a/include/linux/blk-mq.h
++++ b/include/linux/blk-mq.h
+@@@ -14,56 -15,143 +14,62 @@@ struct blk_flush_queue
+   */
+  struct blk_mq_hw_ctx {
+  	struct {
+ -		/** @lock: Protects the dispatch list. */
+  		spinlock_t		lock;
+ -		/**
+ -		 * @dispatch: Used for requests that are ready to be
+ -		 * dispatched to the hardware but for some reason (e.g. lack of
+ -		 * resources) could not be sent to the hardware. As soon as the
+ -		 * driver can send new requests, requests at this list will
+ -		 * be sent first for a fairer dispatch.
+ -		 */
+  		struct list_head	dispatch;
+ -		 /**
+ -		  * @state: BLK_MQ_S_* flags. Defines the state of the hw
+ -		  * queue (active, scheduled to restart, stopped).
+ -		  */
+ -		unsigned long		state;
+ +		unsigned long		state;		/* BLK_MQ_S_* flags */
+  	} ____cacheline_aligned_in_smp;
+  
+ -	/**
+ -	 * @run_work: Used for scheduling a hardware queue run at a later time.
+ -	 */
+  	struct delayed_work	run_work;
+ -	/** @cpumask: Map of available CPUs where this hctx can run. */
+  	cpumask_var_t		cpumask;
+ -	/**
+ -	 * @next_cpu: Used by blk_mq_hctx_next_cpu() for round-robin CPU
+ -	 * selection from @cpumask.
+ -	 */
+  	int			next_cpu;
+ -	/**
+ -	 * @next_cpu_batch: Counter of how many works left in the batch before
+ -	 * changing to the next CPU.
+ -	 */
+  	int			next_cpu_batch;
+  
+ -	/** @flags: BLK_MQ_F_* flags. Defines the behaviour of the queue. */
+ -	unsigned long		flags;
+ +	unsigned long		flags;		/* BLK_MQ_F_* flags */
+  
+ -	/**
+ -	 * @sched_data: Pointer owned by the IO scheduler attached to a request
+ -	 * queue. It's up to the IO scheduler how to use this pointer.
+ -	 */
+  	void			*sched_data;
+ -	/**
+ -	 * @queue: Pointer to the request queue that owns this hardware context.
+ -	 */
+  	struct request_queue	*queue;
+ -	/** @fq: Queue of requests that need to perform a flush operation. */
+  	struct blk_flush_queue	*fq;
+  
+ -	/**
+ -	 * @driver_data: Pointer to data owned by the block driver that created
+ -	 * this hctx
+ -	 */
+  	void			*driver_data;
+  
+ -	/**
+ -	 * @ctx_map: Bitmap for each software queue. If bit is on, there is a
+ -	 * pending request in that software queue.
+ -	 */
+  	struct sbitmap		ctx_map;
+  
+ -	/**
+ -	 * @dispatch_from: Software queue to be used when no scheduler was
+ -	 * selected.
+ -	 */
+  	struct blk_mq_ctx	*dispatch_from;
+ -	/**
+ -	 * @dispatch_busy: Number used by blk_mq_update_dispatch_busy() to
+ -	 * decide if the hw_queue is busy using Exponential Weighted Moving
+ -	 * Average algorithm.
+ -	 */
+  	unsigned int		dispatch_busy;
+  
+ -	/** @type: HCTX_TYPE_* flags. Type of hardware queue. */
+  	unsigned short		type;
+ -	/** @nr_ctx: Number of software queues. */
+  	unsigned short		nr_ctx;
+ -	/** @ctxs: Array of software queues. */
+  	struct blk_mq_ctx	**ctxs;
+  
+ -	/** @dispatch_wait_lock: Lock for dispatch_wait queue. */
+  	spinlock_t		dispatch_wait_lock;
+ -	/**
+ -	 * @dispatch_wait: Waitqueue to put requests when there is no tag
+ -	 * available at the moment, to wait for another try in the future.
+ -	 */
+  	wait_queue_entry_t	dispatch_wait;
+ -
+ -	/**
+ -	 * @wait_index: Index of next available dispatch_wait queue to insert
+ -	 * requests.
+ -	 */
+  	atomic_t		wait_index;
+  
+ -	/**
+ -	 * @tags: Tags owned by the block driver. A tag at this set is only
+ -	 * assigned when a request is dispatched from a hardware queue.
+ -	 */
+  	struct blk_mq_tags	*tags;
+ -	/**
+ -	 * @sched_tags: Tags owned by I/O scheduler. If there is an I/O
+ -	 * scheduler associated with a request queue, a tag is assigned when
+ -	 * that request is allocated. Else, this member is not used.
+ -	 */
+  	struct blk_mq_tags	*sched_tags;
+  
+ -	/** @queued: Number of queued requests. */
+  	unsigned long		queued;
+ -	/** @run: Number of dispatched requests. */
+  	unsigned long		run;
+  #define BLK_MQ_MAX_DISPATCH_ORDER	7
+ -	/** @dispatched: Number of dispatch requests by queue. */
+  	unsigned long		dispatched[BLK_MQ_MAX_DISPATCH_ORDER];
+  
+ -	/** @numa_node: NUMA node the storage adapter has been connected to. */
+  	unsigned int		numa_node;
+ -	/** @queue_num: Index of this hardware queue. */
+  	unsigned int		queue_num;
+  
+ -	/**
+ -	 * @nr_active: Number of active requests. Only used when a tag set is
+ -	 * shared across request queues.
+ -	 */
+  	atomic_t		nr_active;
+ +	RH_KABI_DEPRECATE(unsigned int,	nr_expired)
+  
+++<<<<<<< HEAD
+++=======
++ 	/** @cpuhp_online: List to store request if CPU is going to die */
++ 	struct hlist_node	cpuhp_online;
++ 	/** @cpuhp_dead: List to store request if some CPU die. */
+++>>>>>>> bf0beec0607d (blk-mq: drain I/O when all CPUs in a hctx are offline)
+  	struct hlist_node	cpuhp_dead;
+ -	/** @kobj: Kernel object for sysfs. */
+  	struct kobject		kobj;
+  
+ -	/** @poll_considered: Count times blk_poll() was called. */
+  	unsigned long		poll_considered;
+ -	/** @poll_invoked: Count how many requests blk_poll() polled. */
+  	unsigned long		poll_invoked;
+ -	/** @poll_success: Count how many polled requests were completed. */
+  	unsigned long		poll_success;
+  
+  #ifdef CONFIG_BLK_DEBUG_FS
+@@@ -258,7 -393,11 +264,15 @@@ struct blk_mq_ops 
+  enum {
+  	BLK_MQ_F_SHOULD_MERGE	= 1 << 0,
+  	BLK_MQ_F_TAG_SHARED	= 1 << 1,
+++<<<<<<< HEAD
+ +	BLK_MQ_F_SG_MERGE	= 1 << 2,	/* obsolete */
+++=======
++ 	/*
++ 	 * Set when this device requires underlying blk-mq device for
++ 	 * completing IO:
++ 	 */
++ 	BLK_MQ_F_STACKING	= 1 << 2,
+++>>>>>>> bf0beec0607d (blk-mq: drain I/O when all CPUs in a hctx are offline)
+  	BLK_MQ_F_BLOCKING	= 1 << 5,
+  	BLK_MQ_F_NO_SCHED	= 1 << 6,
+  	BLK_MQ_F_ALLOC_POLICY_START_BIT = 8,
+diff --cc include/linux/cpuhotplug.h
+index 5ae2c7e7c717,24b3a77810b6..000000000000
+--- a/include/linux/cpuhotplug.h
++++ b/include/linux/cpuhotplug.h
+@@@ -145,6 -152,9 +145,12 @@@ enum cpuhp_state 
+  	CPUHP_AP_SMPBOOT_THREADS,
+  	CPUHP_AP_X86_VDSO_VMA_ONLINE,
+  	CPUHP_AP_IRQ_AFFINITY_ONLINE,
+++<<<<<<< HEAD
+++=======
++ 	CPUHP_AP_BLK_MQ_ONLINE,
++ 	CPUHP_AP_ARM_MVEBU_SYNC_CLOCKS,
++ 	CPUHP_AP_X86_INTEL_EPB_ONLINE,
+++>>>>>>> bf0beec0607d (blk-mq: drain I/O when all CPUs in a hctx are offline)
+  	CPUHP_AP_PERF_ONLINE,
+  	CPUHP_AP_PERF_X86_ONLINE,
+  	CPUHP_AP_PERF_X86_UNCORE_ONLINE,
+diff --git a/block/blk-mq-debugfs.c b/block/blk-mq-debugfs.c
+index 76744d8a1a75..7f640dd85d45 100644
+--- a/block/blk-mq-debugfs.c
++++ b/block/blk-mq-debugfs.c
+@@ -224,6 +224,7 @@ static const char *const hctx_state_name[] = {
+ 	HCTX_STATE_NAME(STOPPED),
+ 	HCTX_STATE_NAME(TAG_ACTIVE),
+ 	HCTX_STATE_NAME(SCHED_RESTART),
++	HCTX_STATE_NAME(INACTIVE),
+ };
+ #undef HCTX_STATE_NAME
+ 
+@@ -250,6 +251,7 @@ static const char *const hctx_flag_name[] = {
+ 	HCTX_FLAG_NAME(TAG_SHARED),
+ 	HCTX_FLAG_NAME(BLOCKING),
+ 	HCTX_FLAG_NAME(NO_SCHED),
++	HCTX_FLAG_NAME(STACKING),
+ };
+ #undef HCTX_FLAG_NAME
+ 
+diff --git a/block/blk-mq-tag.c b/block/blk-mq-tag.c
+index c9d18c5028de..d98a833e3635 100644
+--- a/block/blk-mq-tag.c
++++ b/block/blk-mq-tag.c
+@@ -179,6 +179,14 @@ unsigned int blk_mq_get_tag(struct blk_mq_alloc_data *data)
+ 	sbitmap_finish_wait(bt, ws, &wait);
+ 
+ found_tag:
++	/*
++	 * Give up this allocation if the hctx is inactive.  The caller will
++	 * retry on an active hctx.
++	 */
++	if (unlikely(test_bit(BLK_MQ_S_INACTIVE, &data->hctx->state))) {
++		blk_mq_put_tag(tags, data->ctx, tag + tag_offset);
++		return BLK_MQ_NO_TAG;
++	}
+ 	return tag + tag_offset;
+ }
+ 
+* Unmerged path block/blk-mq.c
+diff --git a/drivers/block/loop.c b/drivers/block/loop.c
+index b56ae31a320e..f7b837bb7a89 100644
+--- a/drivers/block/loop.c
++++ b/drivers/block/loop.c
+@@ -2032,7 +2032,7 @@ static int loop_add(struct loop_device **l, int i)
+ 	lo->tag_set.queue_depth = 128;
+ 	lo->tag_set.numa_node = NUMA_NO_NODE;
+ 	lo->tag_set.cmd_size = sizeof(struct loop_cmd);
+-	lo->tag_set.flags = BLK_MQ_F_SHOULD_MERGE;
++	lo->tag_set.flags = BLK_MQ_F_SHOULD_MERGE | BLK_MQ_F_STACKING;
+ 	lo->tag_set.driver_data = lo;
+ 
+ 	err = blk_mq_alloc_tag_set(&lo->tag_set);
+diff --git a/drivers/md/dm-rq.c b/drivers/md/dm-rq.c
+index 3f8577e2c13b..f60c02512121 100644
+--- a/drivers/md/dm-rq.c
++++ b/drivers/md/dm-rq.c
+@@ -547,7 +547,7 @@ int dm_mq_init_request_queue(struct mapped_device *md, struct dm_table *t)
+ 	md->tag_set->ops = &dm_mq_ops;
+ 	md->tag_set->queue_depth = dm_get_blk_mq_queue_depth();
+ 	md->tag_set->numa_node = md->numa_node_id;
+-	md->tag_set->flags = BLK_MQ_F_SHOULD_MERGE;
++	md->tag_set->flags = BLK_MQ_F_SHOULD_MERGE | BLK_MQ_F_STACKING;
+ 	md->tag_set->nr_hw_queues = dm_get_blk_mq_nr_hw_queues();
+ 	md->tag_set->driver_data = md;
+ 
+* Unmerged path include/linux/blk-mq.h
+* Unmerged path include/linux/cpuhotplug.h
