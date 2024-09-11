@@ -37,6 +37,11 @@
  *		single ap_matrix_mdev device. It's quite coarse but we don't
  *		expect much contention.
  * @vfio_ap_drv: the vfio_ap device driver
+ * @guests_lock: mutex for controlling access to a guest that is using AP
+ *		 devices passed through by the vfio_ap device driver. This lock
+ *		 will be taken when the AP devices are plugged into or unplugged
+ *		 from a guest, and when an ap_matrix_mdev device is added to or
+ *		 removed from @mdev_list or the list is iterated.
  */
 struct ap_matrix_dev {
 	struct device device;
@@ -45,6 +50,7 @@ struct ap_matrix_dev {
 	struct list_head mdev_list;
 	struct mutex lock;
 	struct ap_driver  *vfio_ap_drv;
+	struct mutex guests_lock; /* serializes access to each KVM guest */
 };
 
 extern struct ap_matrix_dev *matrix_dev;
