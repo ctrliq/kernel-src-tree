@@ -1,0 +1,176 @@
+bpf, sockmap: Fix memleak on ingress msg enqueue
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-365.el8
+commit-author John Fastabend <john.fastabend@gmail.com>
+commit 9635720b7c88592214562cb72605bdab6708006c
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-365.el8/9635720b.failed
+
+If backlog handler is running during a tear down operation we may enqueue
+data on the ingress msg queue while tear down is trying to free it.
+
+ sk_psock_backlog()
+   sk_psock_handle_skb()
+     skb_psock_skb_ingress()
+       sk_psock_skb_ingress_enqueue()
+         sk_psock_queue_msg(psock,msg)
+                                           spin_lock(ingress_lock)
+                                            sk_psock_zap_ingress()
+                                             _sk_psock_purge_ingerss_msg()
+                                              _sk_psock_purge_ingress_msg()
+                                            -- free ingress_msg list --
+                                           spin_unlock(ingress_lock)
+           spin_lock(ingress_lock)
+           list_add_tail(msg,ingress_msg) <- entry on list with no one
+                                             left to free it.
+           spin_unlock(ingress_lock)
+
+To fix we only enqueue from backlog if the ENABLED bit is set. The tear
+down logic clears the bit with ingress_lock set so we wont enqueue the
+msg in the last step.
+
+Fixes: 799aa7f98d53 ("skmsg: Avoid lock_sock() in sk_psock_backlog()")
+	Signed-off-by: John Fastabend <john.fastabend@gmail.com>
+	Signed-off-by: Andrii Nakryiko <andrii@kernel.org>
+	Acked-by: Jakub Sitnicki <jakub@cloudflare.com>
+	Acked-by: Martin KaFai Lau <kafai@fb.com>
+Link: https://lore.kernel.org/bpf/20210727160500.1713554-4-john.fastabend@gmail.com
+(cherry picked from commit 9635720b7c88592214562cb72605bdab6708006c)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/skmsg.h
+#	net/core/skmsg.c
+diff --cc include/linux/skmsg.h
+index a85cacd89635,14ab0c0bc924..000000000000
+--- a/include/linux/skmsg.h
++++ b/include/linux/skmsg.h
+@@@ -287,7 -319,48 +318,52 @@@ static inline void drop_sk_msg(struct s
+  static inline void sk_psock_queue_msg(struct sk_psock *psock,
+  				      struct sk_msg *msg)
+  {
+++<<<<<<< HEAD
+ +	list_add_tail(&msg->list, &psock->ingress_msg);
+++=======
++ 	spin_lock_bh(&psock->ingress_lock);
++ 	if (sk_psock_test_state(psock, SK_PSOCK_TX_ENABLED))
++ 		list_add_tail(&msg->list, &psock->ingress_msg);
++ 	else
++ 		drop_sk_msg(psock, msg);
++ 	spin_unlock_bh(&psock->ingress_lock);
++ }
++ 
++ static inline struct sk_msg *sk_psock_dequeue_msg(struct sk_psock *psock)
++ {
++ 	struct sk_msg *msg;
++ 
++ 	spin_lock_bh(&psock->ingress_lock);
++ 	msg = list_first_entry_or_null(&psock->ingress_msg, struct sk_msg, list);
++ 	if (msg)
++ 		list_del(&msg->list);
++ 	spin_unlock_bh(&psock->ingress_lock);
++ 	return msg;
++ }
++ 
++ static inline struct sk_msg *sk_psock_peek_msg(struct sk_psock *psock)
++ {
++ 	struct sk_msg *msg;
++ 
++ 	spin_lock_bh(&psock->ingress_lock);
++ 	msg = list_first_entry_or_null(&psock->ingress_msg, struct sk_msg, list);
++ 	spin_unlock_bh(&psock->ingress_lock);
++ 	return msg;
++ }
++ 
++ static inline struct sk_msg *sk_psock_next_msg(struct sk_psock *psock,
++ 					       struct sk_msg *msg)
++ {
++ 	struct sk_msg *ret;
++ 
++ 	spin_lock_bh(&psock->ingress_lock);
++ 	if (list_is_last(&msg->list, &psock->ingress_msg))
++ 		ret = NULL;
++ 	else
++ 		ret = list_next_entry(msg, list);
++ 	spin_unlock_bh(&psock->ingress_lock);
++ 	return ret;
+++>>>>>>> 9635720b7c88 (bpf, sockmap: Fix memleak on ingress msg enqueue)
+  }
+  
+  static inline bool sk_psock_queue_empty(const struct sk_psock *psock)
+@@@ -347,39 -436,10 +423,21 @@@ static inline void sk_psock_update_prot
+  static inline void sk_psock_restore_proto(struct sock *sk,
+  					  struct sk_psock *psock)
+  {
+ -	if (psock->psock_update_sk_prot)
+ -		psock->psock_update_sk_prot(sk, psock, true);
+ +	if (inet_csk_has_ulp(sk)) {
+ +		/* TLS does not have an unhash proto in SW cases, but we need
+ +		 * to ensure we stop using the sock_map unhash routine because
+ +		 * the associated psock is being removed. So use the original
+ +		 * unhash handler.
+ +		 */
+ +		WRITE_ONCE(sk->sk_prot->unhash, psock->saved_unhash);
+ +		tcp_update_ulp(sk, psock->sk_proto, psock->saved_write_space);
+ +	} else {
+ +		sk->sk_write_space = psock->saved_write_space;
+ +		/* Pairs with lockless read in sk_clone_lock() */
+ +		WRITE_ONCE(sk->sk_prot, psock->sk_proto);
+ +	}
+  }
+  
+- static inline void sk_psock_set_state(struct sk_psock *psock,
+- 				      enum sk_psock_state_bits bit)
+- {
+- 	set_bit(bit, &psock->state);
+- }
+- 
+- static inline void sk_psock_clear_state(struct sk_psock *psock,
+- 					enum sk_psock_state_bits bit)
+- {
+- 	clear_bit(bit, &psock->state);
+- }
+- 
+- static inline bool sk_psock_test_state(const struct sk_psock *psock,
+- 				       enum sk_psock_state_bits bit)
+- {
+- 	return test_bit(bit, &psock->state);
+- }
+- 
+  static inline struct sk_psock *sk_psock_get(struct sock *sk)
+  {
+  	struct sk_psock *psock;
+diff --cc net/core/skmsg.c
+index cfa6fc7cc1e0,2d6249b28928..000000000000
+--- a/net/core/skmsg.c
++++ b/net/core/skmsg.c
+@@@ -503,6 -584,22 +503,25 @@@ static int sk_psock_handle_skb(struct s
+  	return sk_psock_skb_ingress(psock, skb);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static void sk_psock_skb_state(struct sk_psock *psock,
++ 			       struct sk_psock_work_state *state,
++ 			       struct sk_buff *skb,
++ 			       int len, int off)
++ {
++ 	spin_lock_bh(&psock->ingress_lock);
++ 	if (sk_psock_test_state(psock, SK_PSOCK_TX_ENABLED)) {
++ 		state->skb = skb;
++ 		state->len = len;
++ 		state->off = off;
++ 	} else {
++ 		sock_drop(psock->sk, skb);
++ 	}
++ 	spin_unlock_bh(&psock->ingress_lock);
++ }
++ 
+++>>>>>>> 9635720b7c88 (bpf, sockmap: Fix memleak on ingress msg enqueue)
+  static void sk_psock_backlog(struct work_struct *work)
+  {
+  	struct sk_psock *psock = container_of(work, struct sk_psock, work);
+* Unmerged path include/linux/skmsg.h
+* Unmerged path net/core/skmsg.c
