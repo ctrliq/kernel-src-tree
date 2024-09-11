@@ -105,6 +105,7 @@ struct svm_nested_state {
 
 struct vcpu_svm {
 	struct kvm_vcpu vcpu;
+	/* vmcb always points at current_vmcb->ptr, it's purely a shorthand. */
 	struct vmcb *vmcb;
 	unsigned long vmcb_pa;
 	struct svm_cpu_data *svm_data;
