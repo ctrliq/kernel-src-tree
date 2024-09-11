@@ -1,0 +1,188 @@
+bpf: Prepare hashtab locking for PREEMPT_RT
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Thomas Gleixner <tglx@linutronix.de>
+commit 7f805d17f1523c7b2c0da319ddb427d6c5d94ff1
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/7f805d17.failed
+
+PREEMPT_RT forbids certain operations like memory allocations (even with
+GFP_ATOMIC) from atomic contexts. This is required because even with
+GFP_ATOMIC the memory allocator calls into code pathes which acquire locks
+with long held lock sections. To ensure the deterministic behaviour these
+locks are regular spinlocks, which are converted to 'sleepable' spinlocks
+on RT. The only true atomic contexts on an RT kernel are the low level
+hardware handling, scheduling, low level interrupt handling, NMIs etc. None
+of these contexts should ever do memory allocations.
+
+As regular device interrupt handlers and soft interrupts are forced into
+thread context, the existing code which does
+  spin_lock*(); alloc(GPF_ATOMIC); spin_unlock*();
+just works.
+
+In theory the BPF locks could be converted to regular spinlocks as well,
+but the bucket locks and percpu_freelist locks can be taken from arbitrary
+contexts (perf, kprobes, tracepoints) which are required to be atomic
+contexts even on RT. These mechanisms require preallocated maps, so there
+is no need to invoke memory allocations within the lock held sections.
+
+BPF maps which need dynamic allocation are only used from (forced) thread
+context on RT and can therefore use regular spinlocks which in turn allows
+to invoke memory allocations from the lock held section.
+
+To achieve this make the hash bucket lock a union of a raw and a regular
+spinlock and initialize and lock/unlock either the raw spinlock for
+preallocated maps or the regular variant for maps which require memory
+allocations.
+
+On a non RT kernel this distinction is neither possible nor required.
+spinlock maps to raw_spinlock and the extra code and conditional is
+optimized out by the compiler. No functional change.
+
+	Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+	Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+Link: https://lore.kernel.org/bpf/20200224145644.509685912@linutronix.de
+(cherry picked from commit 7f805d17f1523c7b2c0da319ddb427d6c5d94ff1)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	kernel/bpf/hashtab.c
+diff --cc kernel/bpf/hashtab.c
+index 88518c0f1d13,53d9483fee10..000000000000
+--- a/kernel/bpf/hashtab.c
++++ b/kernel/bpf/hashtab.c
+@@@ -25,9 -17,72 +25,75 @@@
+  	(BPF_F_NO_PREALLOC | BPF_F_NO_COMMON_LRU | BPF_F_NUMA_NODE |	\
+  	 BPF_F_ACCESS_MASK | BPF_F_ZERO_SEED)
+  
+++<<<<<<< HEAD
+++=======
++ #define BATCH_OPS(_name)			\
++ 	.map_lookup_batch =			\
++ 	_name##_map_lookup_batch,		\
++ 	.map_lookup_and_delete_batch =		\
++ 	_name##_map_lookup_and_delete_batch,	\
++ 	.map_update_batch =			\
++ 	generic_map_update_batch,		\
++ 	.map_delete_batch =			\
++ 	generic_map_delete_batch
++ 
++ /*
++  * The bucket lock has two protection scopes:
++  *
++  * 1) Serializing concurrent operations from BPF programs on differrent
++  *    CPUs
++  *
++  * 2) Serializing concurrent operations from BPF programs and sys_bpf()
++  *
++  * BPF programs can execute in any context including perf, kprobes and
++  * tracing. As there are almost no limits where perf, kprobes and tracing
++  * can be invoked from the lock operations need to be protected against
++  * deadlocks. Deadlocks can be caused by recursion and by an invocation in
++  * the lock held section when functions which acquire this lock are invoked
++  * from sys_bpf(). BPF recursion is prevented by incrementing the per CPU
++  * variable bpf_prog_active, which prevents BPF programs attached to perf
++  * events, kprobes and tracing to be invoked before the prior invocation
++  * from one of these contexts completed. sys_bpf() uses the same mechanism
++  * by pinning the task to the current CPU and incrementing the recursion
++  * protection accross the map operation.
++  *
++  * This has subtle implications on PREEMPT_RT. PREEMPT_RT forbids certain
++  * operations like memory allocations (even with GFP_ATOMIC) from atomic
++  * contexts. This is required because even with GFP_ATOMIC the memory
++  * allocator calls into code pathes which acquire locks with long held lock
++  * sections. To ensure the deterministic behaviour these locks are regular
++  * spinlocks, which are converted to 'sleepable' spinlocks on RT. The only
++  * true atomic contexts on an RT kernel are the low level hardware
++  * handling, scheduling, low level interrupt handling, NMIs etc. None of
++  * these contexts should ever do memory allocations.
++  *
++  * As regular device interrupt handlers and soft interrupts are forced into
++  * thread context, the existing code which does
++  *   spin_lock*(); alloc(GPF_ATOMIC); spin_unlock*();
++  * just works.
++  *
++  * In theory the BPF locks could be converted to regular spinlocks as well,
++  * but the bucket locks and percpu_freelist locks can be taken from
++  * arbitrary contexts (perf, kprobes, tracepoints) which are required to be
++  * atomic contexts even on RT. These mechanisms require preallocated maps,
++  * so there is no need to invoke memory allocations within the lock held
++  * sections.
++  *
++  * BPF maps which need dynamic allocation are only used from (forced)
++  * thread context on RT and can therefore use regular spinlocks which in
++  * turn allows to invoke memory allocations from the lock held section.
++  *
++  * On a non RT kernel this distinction is neither possible nor required.
++  * spinlock maps to raw_spinlock and the extra code is optimized out by the
++  * compiler.
++  */
+++>>>>>>> 7f805d17f152 (bpf: Prepare hashtab locking for PREEMPT_RT)
+  struct bucket {
+  	struct hlist_nulls_head head;
+- 	raw_spinlock_t lock;
++ 	union {
++ 		raw_spinlock_t raw_lock;
++ 		spinlock_t     lock;
++ 	};
+  };
+  
+  struct bpf_htab {
+@@@ -65,6 -121,51 +131,54 @@@ struct htab_elem 
+  	char key[0] __aligned(8);
+  };
+  
+++<<<<<<< HEAD
+++=======
++ static inline bool htab_is_prealloc(const struct bpf_htab *htab)
++ {
++ 	return !(htab->map.map_flags & BPF_F_NO_PREALLOC);
++ }
++ 
++ static inline bool htab_use_raw_lock(const struct bpf_htab *htab)
++ {
++ 	return (!IS_ENABLED(CONFIG_PREEMPT_RT) || htab_is_prealloc(htab));
++ }
++ 
++ static void htab_init_buckets(struct bpf_htab *htab)
++ {
++ 	unsigned i;
++ 
++ 	for (i = 0; i < htab->n_buckets; i++) {
++ 		INIT_HLIST_NULLS_HEAD(&htab->buckets[i].head, i);
++ 		if (htab_use_raw_lock(htab))
++ 			raw_spin_lock_init(&htab->buckets[i].raw_lock);
++ 		else
++ 			spin_lock_init(&htab->buckets[i].lock);
++ 	}
++ }
++ 
++ static inline unsigned long htab_lock_bucket(const struct bpf_htab *htab,
++ 					     struct bucket *b)
++ {
++ 	unsigned long flags;
++ 
++ 	if (htab_use_raw_lock(htab))
++ 		raw_spin_lock_irqsave(&b->raw_lock, flags);
++ 	else
++ 		spin_lock_irqsave(&b->lock, flags);
++ 	return flags;
++ }
++ 
++ static inline void htab_unlock_bucket(const struct bpf_htab *htab,
++ 				      struct bucket *b,
++ 				      unsigned long flags)
++ {
++ 	if (htab_use_raw_lock(htab))
++ 		raw_spin_unlock_irqrestore(&b->raw_lock, flags);
++ 	else
++ 		spin_unlock_irqrestore(&b->lock, flags);
++ }
++ 
+++>>>>>>> 7f805d17f152 (bpf: Prepare hashtab locking for PREEMPT_RT)
+  static bool htab_lru_map_delete_node(void *arg, struct bpf_lru_node *node);
+  
+  static bool htab_is_lru(const struct bpf_htab *htab)
+* Unmerged path kernel/bpf/hashtab.c
