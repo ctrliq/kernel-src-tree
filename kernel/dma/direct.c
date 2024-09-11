@@ -64,6 +64,9 @@ void *dma_direct_alloc(struct device *dev, size_t size, dma_addr_t *dma_handle,
 	struct page *page = NULL;
 	void *ret;
 
+	if (attrs & DMA_ATTR_NO_WARN)
+		gfp |= __GFP_NOWARN;
+
 	/* we always manually zero the memory once we are done: */
 	gfp &= ~__GFP_ZERO;
 
