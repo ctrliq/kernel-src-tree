@@ -1,0 +1,135 @@
+KVM: VMX: Move IRQ invocation to assembly subroutine
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Sean Christopherson <sean.j.christopherson@intel.com>
+commit 535f7ef2ab7dbfbcfe732ee7634faca21417a777
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/535f7ef2.failed
+
+Move the asm blob that invokes the appropriate IRQ handler after VM-Exit
+into a proper subroutine.  Unconditionally create a stack frame in the
+subroutine so that, as objtool sees things, the function has standard
+stack behavior.  The dynamic stack adjustment makes using unwind hints
+problematic.
+
+	Suggested-by: Josh Poimboeuf <jpoimboe@redhat.com>
+	Cc: Uros Bizjak <ubizjak@gmail.com>
+	Signed-off-by: Sean Christopherson <sean.j.christopherson@intel.com>
+Message-Id: <20200915191505.10355-2-sean.j.christopherson@intel.com>
+	Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+(cherry picked from commit 535f7ef2ab7dbfbcfe732ee7634faca21417a777)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kvm/vmx/vmenter.S
+diff --cc arch/x86/kvm/vmx/vmenter.S
+index 52d7c4ab0f40,90ad7a6246e3..000000000000
+--- a/arch/x86/kvm/vmx/vmenter.S
++++ b/arch/x86/kvm/vmx/vmenter.S
+@@@ -290,4 -294,37 +291,41 @@@ ENTRY(vmread_error_trampoline
+  	pop %_ASM_BP
+  
+  	ret
+++<<<<<<< HEAD
+ +ENDPROC(vmread_error_trampoline)
+++=======
++ SYM_FUNC_END(vmread_error_trampoline)
++ 
++ SYM_FUNC_START(vmx_do_interrupt_nmi_irqoff)
++ 	/*
++ 	 * Unconditionally create a stack frame, getting the correct RSP on the
++ 	 * stack (for x86-64) would take two instructions anyways, and RBP can
++ 	 * be used to restore RSP to make objtool happy (see below).
++ 	 */
++ 	push %_ASM_BP
++ 	mov %_ASM_SP, %_ASM_BP
++ 
++ #ifdef CONFIG_X86_64
++ 	/*
++ 	 * Align RSP to a 16-byte boundary (to emulate CPU behavior) before
++ 	 * creating the synthetic interrupt stack frame for the IRQ/NMI.
++ 	 */
++ 	and  $-16, %rsp
++ 	push $__KERNEL_DS
++ 	push %rbp
++ #endif
++ 	pushf
++ 	push $__KERNEL_CS
++ 	CALL_NOSPEC _ASM_ARG1
++ 
++ 	/*
++ 	 * "Restore" RSP from RBP, even though IRET has already unwound RSP to
++ 	 * the correct value.  objtool doesn't know the callee will IRET and,
++ 	 * without the explicit restore, thinks the stack is getting walloped.
++ 	 * Using an unwind hint is problematic due to x86-64's dynamic alignment.
++ 	 */
++ 	mov %_ASM_BP, %_ASM_SP
++ 	pop %_ASM_BP
++ 	ret
++ SYM_FUNC_END(vmx_do_interrupt_nmi_irqoff)
+++>>>>>>> 535f7ef2ab7d (KVM: VMX: Move IRQ invocation to assembly subroutine)
+* Unmerged path arch/x86/kvm/vmx/vmenter.S
+diff --git a/arch/x86/kvm/vmx/vmx.c b/arch/x86/kvm/vmx/vmx.c
+index 7eddc4be3042..3d18f01c61bf 100644
+--- a/arch/x86/kvm/vmx/vmx.c
++++ b/arch/x86/kvm/vmx/vmx.c
+@@ -6363,6 +6363,8 @@ static void vmx_apicv_post_state_restore(struct kvm_vcpu *vcpu)
+ 	memset(vmx->pi_desc.pir, 0, sizeof(vmx->pi_desc.pir));
+ }
+ 
++void vmx_do_interrupt_nmi_irqoff(unsigned long entry);
++
+ static void handle_exception_nmi_irqoff(struct vcpu_vmx *vmx)
+ {
+ 	u32 intr_info = vmx_get_intr_info(&vmx->vcpu);
+@@ -6384,10 +6386,6 @@ static void handle_exception_nmi_irqoff(struct vcpu_vmx *vmx)
+ static void handle_external_interrupt_irqoff(struct kvm_vcpu *vcpu)
+ {
+ 	unsigned int vector;
+-	unsigned long entry;
+-#ifdef CONFIG_X86_64
+-	unsigned long tmp;
+-#endif
+ 	gate_desc *desc;
+ 	u32 intr_info = vmx_get_intr_info(vcpu);
+ 
+@@ -6397,36 +6395,11 @@ static void handle_external_interrupt_irqoff(struct kvm_vcpu *vcpu)
+ 
+ 	vector = intr_info & INTR_INFO_VECTOR_MASK;
+ 	desc = (gate_desc *)host_idt_base + vector;
+-	entry = gate_offset(desc);
+ 
+ 	kvm_before_interrupt(vcpu);
+-
+-	asm volatile(
+-#ifdef CONFIG_X86_64
+-		"mov %%rsp, %[sp]\n\t"
+-		"and $-16, %%rsp\n\t"
+-		"push %[ss]\n\t"
+-		"push %[sp]\n\t"
+-#endif
+-		"pushf\n\t"
+-		"push %[cs]\n\t"
+-		CALL_NOSPEC
+-		:
+-#ifdef CONFIG_X86_64
+-		[sp]"=&r"(tmp),
+-#endif
+-		ASM_CALL_CONSTRAINT
+-		:
+-		[thunk_target]"r"(entry),
+-#ifdef CONFIG_X86_64
+-		[ss]"i"(__KERNEL_DS),
+-#endif
+-		[cs]"i"(__KERNEL_CS)
+-	);
+-
++	vmx_do_interrupt_nmi_irqoff(gate_offset(desc));
+ 	kvm_after_interrupt(vcpu);
+ }
+-STACK_FRAME_NON_STANDARD(handle_external_interrupt_irqoff);
+ 
+ static void vmx_handle_exit_irqoff(struct kvm_vcpu *vcpu)
+ {
