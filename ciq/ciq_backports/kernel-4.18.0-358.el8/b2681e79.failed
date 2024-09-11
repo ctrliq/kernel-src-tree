@@ -1,0 +1,192 @@
+x86/fpu: Rename and sanitize fpu__save/copy()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-358.el8
+commit-author Thomas Gleixner <tglx@linutronix.de>
+commit b2681e791dbcee6acb1dca7a5076a0285109ac4c
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-358.el8/b2681e79.failed
+
+Both function names are a misnomer.
+
+fpu__save() is actually about synchronizing the hardware register state
+into the task's memory state so that either coredump or a math exception
+handler can inspect the state at the time where the problem happens.
+
+The function guarantees to preserve the register state, while "save" is a
+common terminology for saving the current state so it can be modified and
+restored later. This is clearly not the case here.
+
+Rename it to fpu_sync_fpstate().
+
+fpu__copy() is used to clone the current task's FPU state when duplicating
+task_struct. While the register state is a copy the rest of the FPU state
+is not.
+
+Name it accordingly and remove the really pointless @src argument along
+with the warning which comes along with it.
+
+Nothing can ever copy the FPU state of a non-current task. It's clearly
+just a consequence of arch_dup_task_struct(), but it makes no sense to
+proliferate that further.
+
+	Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+	Signed-off-by: Borislav Petkov <bp@suse.de>
+	Reviewed-by: Borislav Petkov <bp@suse.de>
+Link: https://lkml.kernel.org/r/20210623121455.196727450@linutronix.de
+(cherry picked from commit b2681e791dbcee6acb1dca7a5076a0285109ac4c)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/include/asm/fpu/internal.h
+#	arch/x86/kernel/fpu/regset.c
+diff --cc arch/x86/include/asm/fpu/internal.h
+index 25c5f10d80a4,f5da2e9b87da..000000000000
+--- a/arch/x86/include/asm/fpu/internal.h
++++ b/arch/x86/include/asm/fpu/internal.h
+@@@ -26,12 -26,8 +26,14 @@@
+  /*
+   * High level FPU state handling functions:
+   */
+++<<<<<<< HEAD
+ +extern void fpu__prepare_read(struct fpu *fpu);
+ +extern void fpu__prepare_write(struct fpu *fpu);
+ +extern void fpu__save(struct fpu *fpu);
+++=======
+++>>>>>>> b2681e791dbc (x86/fpu: Rename and sanitize fpu__save/copy())
+  extern int  fpu__restore_sig(void __user *buf, int ia32_frame);
+  extern void fpu__drop(struct fpu *fpu);
+- extern int  fpu__copy(struct task_struct *dst, struct task_struct *src);
+  extern void fpu__clear_user_states(struct fpu *fpu);
+  extern void fpu__clear_all(struct fpu *fpu);
+  extern int  fpu__exception_code(struct fpu *fpu, int trap_nr);
+diff --cc arch/x86/kernel/fpu/regset.c
+index 7bcf779c46cb,4575796d547b..000000000000
+--- a/arch/x86/kernel/fpu/regset.c
++++ b/arch/x86/kernel/fpu/regset.c
+@@@ -28,9 -28,43 +28,47 @@@ int regset_xregset_fpregs_active(struc
+  		return 0;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ /*
++  * The regset get() functions are invoked from:
++  *
++  *   - coredump to dump the current task's fpstate. If the current task
++  *     owns the FPU then the memory state has to be synchronized and the
++  *     FPU register state preserved. Otherwise fpstate is already in sync.
++  *
++  *   - ptrace to dump fpstate of a stopped task, in which case the registers
++  *     have already been saved to fpstate on context switch.
++  */
++ static void sync_fpstate(struct fpu *fpu)
++ {
++ 	if (fpu == &current->thread.fpu)
++ 		fpu_sync_fpstate(fpu);
++ }
++ 
++ /*
++  * Invalidate cached FPU registers before modifying the stopped target
++  * task's fpstate.
++  *
++  * This forces the target task on resume to restore the FPU registers from
++  * modified fpstate. Otherwise the task might skip the restore and operate
++  * with the cached FPU registers which discards the modifications.
++  */
++ static void fpu_force_restore(struct fpu *fpu)
++ {
++ 	/*
++ 	 * Only stopped child tasks can be used to modify the FPU
++ 	 * state in the fpstate buffer:
++ 	 */
++ 	WARN_ON_FPU(fpu == &current->thread.fpu);
++ 
++ 	__fpu_invalidate_fpregs_state(fpu);
++ }
++ 
+++>>>>>>> b2681e791dbc (x86/fpu: Rename and sanitize fpu__save/copy())
+  int xfpregs_get(struct task_struct *target, const struct user_regset *regset,
+ -		struct membuf to)
+ +		unsigned int pos, unsigned int count,
+ +		void *kbuf, void __user *ubuf)
+  {
+  	struct fpu *fpu = &target->thread.fpu;
+  
+* Unmerged path arch/x86/include/asm/fpu/internal.h
+diff --git a/arch/x86/kernel/fpu/core.c b/arch/x86/kernel/fpu/core.c
+index 1e27c69db876..9732672cdb6d 100644
+--- a/arch/x86/kernel/fpu/core.c
++++ b/arch/x86/kernel/fpu/core.c
+@@ -152,11 +152,10 @@ void kernel_fpu_end(void)
+ EXPORT_SYMBOL_GPL(kernel_fpu_end);
+ 
+ /*
+- * Save the FPU state (mark it for reload if necessary):
+- *
+- * This only ever gets called for the current task.
++ * Sync the FPU register state to current's memory register state when the
++ * current task owns the FPU. The hardware register state is preserved.
+  */
+-void fpu__save(struct fpu *fpu)
++void fpu_sync_fpstate(struct fpu *fpu)
+ {
+ 	WARN_ON_FPU(fpu != &current->thread.fpu);
+ 
+@@ -217,18 +216,18 @@ void fpstate_init(union fpregs_state *state)
+ }
+ EXPORT_SYMBOL_GPL(fpstate_init);
+ 
+-int fpu__copy(struct task_struct *dst, struct task_struct *src)
++/* Clone current's FPU state on fork */
++int fpu_clone(struct task_struct *dst)
+ {
++	struct fpu *src_fpu = &current->thread.fpu;
+ 	struct fpu *dst_fpu = &dst->thread.fpu;
+-	struct fpu *src_fpu = &src->thread.fpu;
+ 
++	/* The new task's FPU state cannot be valid in the hardware. */
+ 	dst_fpu->last_cpu = -1;
+ 
+-	if (!static_cpu_has(X86_FEATURE_FPU))
++	if (!cpu_feature_enabled(X86_FEATURE_FPU))
+ 		return 0;
+ 
+-	WARN_ON_FPU(src_fpu != &current->thread.fpu);
+-
+ 	/*
+ 	 * Don't let 'init optimized' areas of the XSAVE area
+ 	 * leak into the child task:
+* Unmerged path arch/x86/kernel/fpu/regset.c
+diff --git a/arch/x86/kernel/process.c b/arch/x86/kernel/process.c
+index 56f2acf80dcb..b5bb19062639 100644
+--- a/arch/x86/kernel/process.c
++++ b/arch/x86/kernel/process.c
+@@ -101,8 +101,7 @@ int arch_dup_task_struct(struct task_struct *dst, struct task_struct *src)
+ #ifdef CONFIG_VM86
+ 	dst->thread.vm86 = NULL;
+ #endif
+-
+-	return fpu__copy(dst, src);
++	return fpu_clone(dst);
+ }
+ 
+ /*
+diff --git a/arch/x86/kernel/traps.c b/arch/x86/kernel/traps.c
+index 48928b92f238..e075eb1e66f9 100644
+--- a/arch/x86/kernel/traps.c
++++ b/arch/x86/kernel/traps.c
+@@ -872,9 +872,10 @@ static void math_error(struct pt_regs *regs, int error_code, int trapnr)
+ 	}
+ 
+ 	/*
+-	 * Save the info for the exception handler and clear the error.
++	 * Synchronize the FPU register state to the memory register state
++	 * if necessary. This allows the exception handler to inspect it.
+ 	 */
+-	fpu__save(fpu);
++	fpu_sync_fpstate(fpu);
+ 
+ 	task->thread.trap_nr	= trapnr;
+ 	task->thread.error_code = error_code;
