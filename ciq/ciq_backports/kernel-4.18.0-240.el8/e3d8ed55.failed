@@ -1,0 +1,100 @@
+powerpc/kvm/book3s: Use find_kvm_host_pte in h_enter
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+Rebuild_CHGLOG: - [powerpc] kvm/book3s: Use find_kvm_host_pte in h_enter (Greg Kurz) [1748772]
+Rebuild_FUZZ: 91.67%
+commit-author Aneesh Kumar K.V <aneesh.kumar@linux.ibm.com>
+commit e3d8ed5518c7f50e24d2530b36d14b6c4284769f
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/e3d8ed55.failed
+
+Since kvmppc_do_h_enter can get called in realmode use low level
+arch_spin_lock which is safe to be called in realmode.
+
+	Signed-off-by: Aneesh Kumar K.V <aneesh.kumar@linux.ibm.com>
+	Signed-off-by: Michael Ellerman <mpe@ellerman.id.au>
+Link: https://lore.kernel.org/r/20200505071729.54912-15-aneesh.kumar@linux.ibm.com
+(cherry picked from commit e3d8ed5518c7f50e24d2530b36d14b6c4284769f)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/powerpc/kvm/book3s_64_mmu_hv.c
+diff --cc arch/powerpc/kvm/book3s_64_mmu_hv.c
+index 242a4a923b3e,18aed9775a3c..000000000000
+--- a/arch/powerpc/kvm/book3s_64_mmu_hv.c
++++ b/arch/powerpc/kvm/book3s_64_mmu_hv.c
+@@@ -293,11 -281,10 +293,15 @@@ static long kvmppc_virtmode_do_h_enter(
+  {
+  	long ret;
+  
+- 	/* Protect linux PTE lookup from page table destruction */
+- 	rcu_read_lock_sched();	/* this disables preemption too */
++ 	preempt_disable();
+  	ret = kvmppc_do_h_enter(kvm, flags, pte_index, pteh, ptel,
+++<<<<<<< HEAD
+ +				current->mm->pgd, false, pte_idx_ret);
+ +	rcu_read_unlock_sched();
+++=======
++ 				kvm->mm->pgd, false, pte_idx_ret);
++ 	preempt_enable();
+++>>>>>>> e3d8ed5518c7 (powerpc/kvm/book3s: Use find_kvm_host_pte in h_enter)
+  	if (ret == H_TOO_HARD) {
+  		/* this can't happen */
+  		pr_err("KVM: Oops, kvmppc_h_enter returned too hard!\n");
+* Unmerged path arch/powerpc/kvm/book3s_64_mmu_hv.c
+diff --git a/arch/powerpc/kvm/book3s_hv_rm_mmu.c b/arch/powerpc/kvm/book3s_hv_rm_mmu.c
+index 52079be395ee..add69a04fd4f 100644
+--- a/arch/powerpc/kvm/book3s_hv_rm_mmu.c
++++ b/arch/powerpc/kvm/book3s_hv_rm_mmu.c
+@@ -213,7 +213,7 @@ long kvmppc_do_h_enter(struct kvm *kvm, unsigned long flags,
+ 	pte_t *ptep;
+ 	unsigned int writing;
+ 	unsigned long mmu_seq;
+-	unsigned long rcbits, irq_flags = 0;
++	unsigned long rcbits;
+ 
+ 	if (kvm_is_radix(kvm))
+ 		return H_FUNCTION;
+@@ -251,17 +251,9 @@ long kvmppc_do_h_enter(struct kvm *kvm, unsigned long flags,
+ 
+ 	/* Translate to host virtual address */
+ 	hva = __gfn_to_hva_memslot(memslot, gfn);
+-	/*
+-	 * If we had a page table table change after lookup, we would
+-	 * retry via mmu_notifier_retry.
+-	 */
+-	if (!realmode)
+-		local_irq_save(irq_flags);
+-	/*
+-	 * If called in real mode we have MSR_EE = 0. Otherwise
+-	 * we disable irq above.
+-	 */
+-	ptep = __find_linux_pte(pgdir, hva, NULL, &hpage_shift);
++
++	arch_spin_lock(&kvm->mmu_lock.rlock.raw_lock);
++	ptep = find_kvm_host_pte(kvm, mmu_seq, hva, &hpage_shift);
+ 	if (ptep) {
+ 		pte_t pte;
+ 		unsigned int host_pte_size;
+@@ -275,8 +267,7 @@ long kvmppc_do_h_enter(struct kvm *kvm, unsigned long flags,
+ 		 * to <= host page size, if host is using hugepage
+ 		 */
+ 		if (host_pte_size < psize) {
+-			if (!realmode)
+-				local_irq_restore(flags);
++			arch_spin_unlock(&kvm->mmu_lock.rlock.raw_lock);
+ 			return H_PARAMETER;
+ 		}
+ 		pte = kvmppc_read_update_linux_pte(ptep, writing);
+@@ -290,8 +281,7 @@ long kvmppc_do_h_enter(struct kvm *kvm, unsigned long flags,
+ 			pa |= gpa & ~PAGE_MASK;
+ 		}
+ 	}
+-	if (!realmode)
+-		local_irq_restore(irq_flags);
++	arch_spin_unlock(&kvm->mmu_lock.rlock.raw_lock);
+ 
+ 	ptel &= HPTE_R_KEY | HPTE_R_PP0 | (psize-1);
+ 	ptel |= pa;
