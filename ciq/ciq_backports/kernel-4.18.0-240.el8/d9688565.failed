@@ -1,0 +1,174 @@
+io_uring: deferred send/recvmsg should assign iov
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Jens Axboe <axboe@kernel.dk>
+commit d96885658d9971fc2c752b8699f17a42ef745db6
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/d9688565.failed
+
+Don't just assign it from the main call path, that can miss the case
+when we're called from issue deferral.
+
+	Signed-off-by: Jens Axboe <axboe@kernel.dk>
+(cherry picked from commit d96885658d9971fc2c752b8699f17a42ef745db6)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/io_uring.c
+diff --cc fs/io_uring.c
+index 7e2b8c92aeeb,b84def504201..000000000000
+--- a/fs/io_uring.c
++++ b/fs/io_uring.c
+@@@ -1577,12 -2017,105 +1577,111 @@@ static int io_sync_file_range(struct io
+  	return 0;
+  }
+  
+ -static int io_sendmsg_prep(struct io_kiocb *req, struct io_async_ctx *io)
+ -{
+  #if defined(CONFIG_NET)
+++<<<<<<< HEAD
+ +static int io_send_recvmsg(struct io_kiocb *req, const struct io_uring_sqe *sqe,
+ +			   bool force_nonblock,
+ +		   long (*fn)(struct socket *, struct user_msghdr __user *,
+ +				unsigned int))
+ +{
+++=======
++ 	const struct io_uring_sqe *sqe = req->sqe;
++ 	struct user_msghdr __user *msg;
++ 	unsigned flags;
++ 
++ 	flags = READ_ONCE(sqe->msg_flags);
++ 	msg = (struct user_msghdr __user *)(unsigned long) READ_ONCE(sqe->addr);
++ 	io->msg.iov = io->msg.fast_iov;
++ 	return sendmsg_copy_msghdr(&io->msg.msg, msg, flags, &io->msg.iov);
++ #else
++ 	return 0;
++ #endif
++ }
++ 
++ static int io_sendmsg(struct io_kiocb *req, const struct io_uring_sqe *sqe,
++ 		      struct io_kiocb **nxt, bool force_nonblock)
++ {
++ #if defined(CONFIG_NET)
++ 	struct socket *sock;
++ 	int ret;
++ 
++ 	if (unlikely(req->ctx->flags & IORING_SETUP_IOPOLL))
++ 		return -EINVAL;
++ 
++ 	sock = sock_from_file(req->file, &ret);
++ 	if (sock) {
++ 		struct io_async_ctx io, *copy;
++ 		struct sockaddr_storage addr;
++ 		struct msghdr *kmsg;
++ 		unsigned flags;
++ 
++ 		flags = READ_ONCE(sqe->msg_flags);
++ 		if (flags & MSG_DONTWAIT)
++ 			req->flags |= REQ_F_NOWAIT;
++ 		else if (force_nonblock)
++ 			flags |= MSG_DONTWAIT;
++ 
++ 		if (req->io) {
++ 			kmsg = &req->io->msg.msg;
++ 			kmsg->msg_name = &addr;
++ 		} else {
++ 			kmsg = &io.msg.msg;
++ 			kmsg->msg_name = &addr;
++ 			ret = io_sendmsg_prep(req, &io);
++ 			if (ret)
++ 				goto out;
++ 		}
++ 
++ 		ret = __sys_sendmsg_sock(sock, kmsg, flags);
++ 		if (force_nonblock && ret == -EAGAIN) {
++ 			copy = kmalloc(sizeof(*copy), GFP_KERNEL);
++ 			if (!copy) {
++ 				ret = -ENOMEM;
++ 				goto out;
++ 			}
++ 			memcpy(&copy->msg, &io.msg, sizeof(copy->msg));
++ 			req->io = copy;
++ 			memcpy(&req->io->sqe, req->sqe, sizeof(*req->sqe));
++ 			req->sqe = &req->io->sqe;
++ 			return ret;
++ 		}
++ 		if (ret == -ERESTARTSYS)
++ 			ret = -EINTR;
++ 	}
++ 
++ out:
++ 	io_cqring_add_event(req, ret);
++ 	if (ret < 0)
++ 		req_set_fail_links(req);
++ 	io_put_req_find_next(req, nxt);
++ 	return 0;
++ #else
++ 	return -EOPNOTSUPP;
++ #endif
++ }
++ 
++ static int io_recvmsg_prep(struct io_kiocb *req, struct io_async_ctx *io)
++ {
++ #if defined(CONFIG_NET)
++ 	const struct io_uring_sqe *sqe = req->sqe;
++ 	struct user_msghdr __user *msg;
++ 	unsigned flags;
++ 
++ 	flags = READ_ONCE(sqe->msg_flags);
++ 	msg = (struct user_msghdr __user *)(unsigned long) READ_ONCE(sqe->addr);
++ 	io->msg.iov = io->msg.fast_iov;
++ 	return recvmsg_copy_msghdr(&io->msg.msg, msg, flags, &io->msg.uaddr,
++ 					&io->msg.iov);
++ #else
++ 	return 0;
++ #endif
++ }
++ 
++ static int io_recvmsg(struct io_kiocb *req, const struct io_uring_sqe *sqe,
++ 		      struct io_kiocb **nxt, bool force_nonblock)
++ {
++ #if defined(CONFIG_NET)
+++>>>>>>> d96885658d99 (io_uring: deferred send/recvmsg should assign iov)
+  	struct socket *sock;
+  	int ret;
+  
+@@@ -1602,10 -2138,30 +1701,23 @@@
+  
+  		msg = (struct user_msghdr __user *) (unsigned long)
+  			READ_ONCE(sqe->addr);
+++<<<<<<< HEAD
+++=======
++ 		if (req->io) {
++ 			kmsg = &req->io->msg.msg;
++ 			kmsg->msg_name = &addr;
++ 		} else {
++ 			kmsg = &io.msg.msg;
++ 			kmsg->msg_name = &addr;
++ 			ret = io_recvmsg_prep(req, &io);
++ 			if (ret)
++ 				goto out;
++ 		}
+++>>>>>>> d96885658d99 (io_uring: deferred send/recvmsg should assign iov)
+  
+ -		ret = __sys_recvmsg_sock(sock, kmsg, msg, io.msg.uaddr, flags);
+ -		if (force_nonblock && ret == -EAGAIN) {
+ -			copy = kmalloc(sizeof(*copy), GFP_KERNEL);
+ -			if (!copy) {
+ -				ret = -ENOMEM;
+ -				goto out;
+ -			}
+ -			memcpy(copy, &io, sizeof(*copy));
+ -			req->io = copy;
+ -			memcpy(&req->io->sqe, req->sqe, sizeof(*req->sqe));
+ -			req->sqe = &req->io->sqe;
+ +		ret = fn(sock, msg, flags);
+ +		if (force_nonblock && ret == -EAGAIN)
+  			return ret;
+ -		}
+  		if (ret == -ERESTARTSYS)
+  			ret = -EINTR;
+  	}
+* Unmerged path fs/io_uring.c
