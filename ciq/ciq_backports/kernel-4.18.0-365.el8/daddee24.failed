@@ -1,0 +1,172 @@
+x86/fpu: Mop up xfeatures_mask_uabi()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-365.el8
+commit-author Thomas Gleixner <tglx@linutronix.de>
+commit daddee24731938781b7876d20335ea3754d23484
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-365.el8/daddee24.failed
+
+Use the new fpu_user_cfg to retrieve the information instead of
+xfeatures_mask_uabi() which will be no longer correct when dynamically
+enabled features become available.
+
+Using fpu_user_cfg is appropriate when setting XCOMP_BV in the
+init_fpstate since it has space allocated for "max_features". But,
+normal fpstates might only have space for default xfeatures. Since
+XRSTOR* derives the format of the XSAVE buffer from XCOMP_BV, this can
+lead to XRSTOR reading out of bounds.
+
+So when copying actively used fpstate, simply read the XCOMP_BV features
+bits directly out of the fpstate instead.
+
+This correction courtesy of Dave Hansen <dave.hansen@linux.intel.com>
+
+	Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+	Signed-off-by: Borislav Petkov <bp@suse.de>
+Link: https://lkml.kernel.org/r/20211014230739.408879849@linutronix.de
+(cherry picked from commit daddee24731938781b7876d20335ea3754d23484)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/include/asm/fpu/xstate.h
+#	arch/x86/kernel/fpu/core.c
+#	arch/x86/kernel/fpu/signal.c
+#	arch/x86/kernel/fpu/xstate.c
+diff --cc arch/x86/include/asm/fpu/xstate.h
+index 2df5bd667a43,3c890b97f195..000000000000
+--- a/arch/x86/include/asm/fpu/xstate.h
++++ b/arch/x86/include/asm/fpu/xstate.h
+@@@ -78,29 -78,12 +78,32 @@@
+  				      XFEATURE_MASK_INDEPENDENT | \
+  				      XFEATURE_MASK_SUPERVISOR_UNSUPPORTED)
+  
+ +#ifdef CONFIG_X86_64
+ +#define REX_PREFIX	"0x48, "
+ +#else
+ +#define REX_PREFIX
+ +#endif
+ +
+ +extern u64 xfeatures_mask_all;
+ +
+  static inline u64 xfeatures_mask_supervisor(void)
+  {
+ -	return fpu_kernel_cfg.max_features & XFEATURE_MASK_SUPERVISOR_SUPPORTED;
+ +	return xfeatures_mask_all & XFEATURE_MASK_SUPERVISOR_SUPPORTED;
+ +}
+ +
+ +/*
+++<<<<<<< HEAD
+ + * The xfeatures which are enabled in XCR0 and expected to be in ptrace
+ + * buffers and signal frames.
+ + */
+ +static inline u64 xfeatures_mask_uabi(void)
+ +{
+ +	return xfeatures_mask_all & XFEATURE_MASK_USER_SUPPORTED;
+  }
+  
+  /*
+++=======
+++>>>>>>> daddee247319 (x86/fpu: Mop up xfeatures_mask_uabi())
+   * The xfeatures which are restored by the kernel when returning to user
+   * mode. This is not necessarily the same as xfeatures_mask_uabi() as the
+   * kernel does not manage all XCR0 enabled features via xsave/xrstor as
+diff --cc arch/x86/kernel/fpu/core.c
+index 2859edb41245,5acc077cb9f1..000000000000
+--- a/arch/x86/kernel/fpu/core.c
++++ b/arch/x86/kernel/fpu/core.c
+@@@ -224,7 -237,7 +224,11 @@@ int fpu_copy_kvm_uabi_to_fpstate(struc
+  	}
+  
+  	/* Ensure that XCOMP_BV is set up for XSAVES */
+++<<<<<<< HEAD
+ +	xstate_init_xcomp_bv(&kstate->xsave, xfeatures_mask_uabi());
+++=======
++ 	xstate_init_xcomp_bv(&kstate->regs.xsave, kstate->xfeatures);
+++>>>>>>> daddee247319 (x86/fpu: Mop up xfeatures_mask_uabi())
+  	return 0;
+  }
+  EXPORT_SYMBOL_GPL(fpu_copy_kvm_uabi_to_fpstate);
+@@@ -320,12 -333,24 +324,16 @@@ void fpstate_init_user(union fpregs_sta
+  		return;
+  	}
+  
+++<<<<<<< HEAD
+ +	xstate_init_xcomp_bv(&state->xsave, xfeatures_mask_uabi());
+++=======
++ 	xstate_init_xcomp_bv(&fpstate->regs.xsave, fpstate->xfeatures);
+++>>>>>>> daddee247319 (x86/fpu: Mop up xfeatures_mask_uabi())
+  
+  	if (cpu_feature_enabled(X86_FEATURE_FXSR))
+ -		fpstate_init_fxstate(fpstate);
+ +		fpstate_init_fxstate(&state->fxsave);
+  	else
+ -		fpstate_init_fstate(fpstate);
+ -}
+ -
+ -void fpstate_reset(struct fpu *fpu)
+ -{
+ -	/* Set the fpstate pointer to the default fpstate */
+ -	fpu->fpstate = &fpu->__fpstate;
+ -
+ -	/* Initialize sizes and feature masks */
+ -	fpu->fpstate->size		= fpu_kernel_cfg.default_size;
+ -	fpu->fpstate->user_size		= fpu_user_cfg.default_size;
+ -	fpu->fpstate->xfeatures		= fpu_kernel_cfg.default_features;
+ -	fpu->fpstate->user_xfeatures	= fpu_user_cfg.default_features;
+ +		fpstate_init_fstate(&state->fsave);
+  }
+  
+  #if IS_ENABLED(CONFIG_KVM)
+diff --cc arch/x86/kernel/fpu/signal.c
+index f74c29985497,3e42e6e8b56c..000000000000
+--- a/arch/x86/kernel/fpu/signal.c
++++ b/arch/x86/kernel/fpu/signal.c
+@@@ -523,8 -536,8 +523,13 @@@ void __init fpu__init_prepare_fx_sw_fra
+  
+  	fx_sw_reserved.magic1 = FP_XSTATE_MAGIC1;
+  	fx_sw_reserved.extended_size = size;
+++<<<<<<< HEAD
+ +	fx_sw_reserved.xfeatures = xfeatures_mask_uabi();
+ +	fx_sw_reserved.xstate_size = fpu_user_xstate_size;
+++=======
++ 	fx_sw_reserved.xfeatures = fpu_user_cfg.default_features;
++ 	fx_sw_reserved.xstate_size = fpu_user_cfg.default_size;
+++>>>>>>> daddee247319 (x86/fpu: Mop up xfeatures_mask_uabi())
+  
+  	if (IS_ENABLED(CONFIG_IA32_EMULATION) ||
+  	    IS_ENABLED(CONFIG_X86_32)) {
+diff --cc arch/x86/kernel/fpu/xstate.c
+index bffa08a391ba,9f92abd230db..000000000000
+--- a/arch/x86/kernel/fpu/xstate.c
++++ b/arch/x86/kernel/fpu/xstate.c
+@@@ -768,9 -768,9 +768,9 @@@ void __init fpu__init_system_xstate(voi
+  	 * Find supervisor xstates supported by the processor.
+  	 */
+  	cpuid_count(XSTATE_CPUID, 1, &eax, &ebx, &ecx, &edx);
+ -	fpu_kernel_cfg.max_features |= ecx + ((u64)edx << 32);
+ +	xfeatures_mask_all |= ecx + ((u64)edx << 32);
+  
+- 	if ((xfeatures_mask_uabi() & XFEATURE_MASK_FPSSE) != XFEATURE_MASK_FPSSE) {
++ 	if ((fpu_kernel_cfg.max_features & XFEATURE_MASK_FPSSE) != XFEATURE_MASK_FPSSE) {
+  		/*
+  		 * This indicates that something really unexpected happened
+  		 * with the enumeration.  Disable XSAVE and try to continue
+@@@ -805,7 -814,8 +805,12 @@@
+  	 * Update info used for ptrace frames; use standard-format size and no
+  	 * supervisor xstates:
+  	 */
+++<<<<<<< HEAD
+ +	update_regset_xstate_info(fpu_user_xstate_size, xfeatures_mask_uabi());
+++=======
++ 	update_regset_xstate_info(fpu_user_cfg.max_size,
++ 				  fpu_user_cfg.max_features);
+++>>>>>>> daddee247319 (x86/fpu: Mop up xfeatures_mask_uabi())
+  
+  	fpu__init_prepare_fx_sw_frame();
+  	setup_init_fpu_buf();
+* Unmerged path arch/x86/include/asm/fpu/xstate.h
+* Unmerged path arch/x86/kernel/fpu/core.c
+* Unmerged path arch/x86/kernel/fpu/signal.c
+* Unmerged path arch/x86/kernel/fpu/xstate.c
