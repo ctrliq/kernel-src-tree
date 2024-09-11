@@ -1,0 +1,173 @@
+x86/kvm: Convert FPU handling to a single swap buffer
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-365.el8
+commit-author Thomas Gleixner <tglx@linutronix.de>
+commit d69c1382e1b73a0496a70872a035ca2b22d074e5
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-365.el8/d69c1382.failed
+
+For the upcoming AMX support it's necessary to do a proper integration with
+KVM. Currently KVM allocates two FPU structs which are used for saving the user
+state of the vCPU thread and restoring the guest state when entering
+vcpu_run() and doing the reverse operation before leaving vcpu_run().
+
+With the new fpstate mechanism this can be reduced to one extra buffer by
+swapping the fpstate pointer in current::thread::fpu. This makes the
+upcoming support for AMX and XFD simpler because then fpstate information
+(features, sizes, xfd) are always consistent and it does not require any
+nasty workarounds.
+
+Convert the KVM FPU code over to this new scheme.
+
+	Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+	Signed-off-by: Borislav Petkov <bp@suse.de>
+Link: https://lkml.kernel.org/r/20211022185313.019454292@linutronix.de
+(cherry picked from commit d69c1382e1b73a0496a70872a035ca2b22d074e5)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kernel/fpu/core.c
+#	arch/x86/kvm/x86.c
+diff --cc arch/x86/kernel/fpu/core.c
+index 2859edb41245,01fbf7c3e799..000000000000
+--- a/arch/x86/kernel/fpu/core.c
++++ b/arch/x86/kernel/fpu/core.c
+@@@ -175,10 -268,10 +175,14 @@@ void fpu_swap_kvm_fpu(struct fpu *save
+  }
+  EXPORT_SYMBOL_GPL(fpu_swap_kvm_fpu);
+  
+- void fpu_copy_fpstate_to_kvm_uabi(struct fpu *fpu, void *buf,
+- 			       unsigned int size, u32 pkru)
++ void fpu_copy_guest_fpstate_to_uabi(struct fpu_guest *gfpu, void *buf,
++ 				    unsigned int size, u32 pkru)
+  {
+++<<<<<<< HEAD
+ +	union fpregs_state *kstate = &fpu->state;
+++=======
++ 	struct fpstate *kstate = gfpu->fpstate;
+++>>>>>>> d69c1382e1b7 (x86/kvm: Convert FPU handling to a single swap buffer)
+  	union fpregs_state *ustate = buf;
+  	struct membuf mb = { .p = buf, .left = size };
+  
+@@@ -191,12 -284,12 +195,16 @@@
+  		ustate->xsave.header.xfeatures = XFEATURE_MASK_FPSSE;
+  	}
+  }
+- EXPORT_SYMBOL_GPL(fpu_copy_fpstate_to_kvm_uabi);
++ EXPORT_SYMBOL_GPL(fpu_copy_guest_fpstate_to_uabi);
+  
+- int fpu_copy_kvm_uabi_to_fpstate(struct fpu *fpu, const void *buf, u64 xcr0,
+- 				 u32 *vpkru)
++ int fpu_copy_uabi_to_guest_fpstate(struct fpu_guest *gfpu, const void *buf,
++ 				   u64 xcr0, u32 *vpkru)
+  {
+++<<<<<<< HEAD
+ +	union fpregs_state *kstate = &fpu->state;
+++=======
++ 	struct fpstate *kstate = gfpu->fpstate;
+++>>>>>>> d69c1382e1b7 (x86/kvm: Convert FPU handling to a single swap buffer)
+  	const union fpregs_state *ustate = buf;
+  	struct pkru_state *xpkru;
+  	int ret;
+@@@ -224,10 -317,10 +232,10 @@@
+  	}
+  
+  	/* Ensure that XCOMP_BV is set up for XSAVES */
+ -	xstate_init_xcomp_bv(&kstate->regs.xsave, kstate->xfeatures);
+ +	xstate_init_xcomp_bv(&kstate->xsave, xfeatures_mask_uabi());
+  	return 0;
+  }
+- EXPORT_SYMBOL_GPL(fpu_copy_kvm_uabi_to_fpstate);
++ EXPORT_SYMBOL_GPL(fpu_copy_uabi_to_guest_fpstate);
+  #endif /* CONFIG_KVM */
+  
+  void kernel_fpu_begin_mask(unsigned int kfpu_mask)
+diff --cc arch/x86/kvm/x86.c
+index 0b402098e3b7,c953ec24a75c..000000000000
+--- a/arch/x86/kvm/x86.c
++++ b/arch/x86/kvm/x86.c
+@@@ -10792,8 -10664,8 +10752,13 @@@ void kvm_vcpu_reset(struct kvm_vcpu *vc
+  	kvm_async_pf_hash_reset(vcpu);
+  	vcpu->arch.apf.halted = false;
+  
+++<<<<<<< HEAD
+ +	if (vcpu->arch.guest_fpu && kvm_mpx_supported()) {
+ +		void *mpx_state_buffer;
+++=======
++ 	if (vcpu->arch.guest_fpu.fpstate && kvm_mpx_supported()) {
++ 		struct fpstate *fpstate = vcpu->arch.guest_fpu.fpstate;
+++>>>>>>> d69c1382e1b7 (x86/kvm: Convert FPU handling to a single swap buffer)
+  
+  		/*
+  		 * To avoid have the INIT path from kvm_apic_has_events() that be
+diff --git a/arch/x86/include/asm/fpu/api.h b/arch/x86/include/asm/fpu/api.h
+index 9833eb36228b..15737ee27cdc 100644
+--- a/arch/x86/include/asm/fpu/api.h
++++ b/arch/x86/include/asm/fpu/api.h
+@@ -101,7 +101,7 @@ extern void fpu_init_fpstate_user(struct fpu *fpu);
+ /* KVM specific functions */
+ extern void fpu_swap_kvm_fpu(struct fpu *save, struct fpu *rstor, u64 restore_mask);
+ 
+-extern int fpu_copy_kvm_uabi_to_fpstate(struct fpu *fpu, const void *buf, u64 xcr0, u32 *pkru);
+-extern void fpu_copy_fpstate_to_kvm_uabi(struct fpu *fpu, void *buf, unsigned int size, u32 pkru);
++extern void fpu_copy_guest_fpstate_to_uabi(struct fpu_guest *gfpu, void *buf, unsigned int size, u32 pkru);
++extern int fpu_copy_uabi_to_guest_fpstate(struct fpu_guest *gfpu, const void *buf, u64 xcr0, u32 *vpkru);
+ 
+ #endif /* _ASM_X86_FPU_API_H */
+diff --git a/arch/x86/include/asm/kvm_host.h b/arch/x86/include/asm/kvm_host.h
+index d8dbc8fbd935..b948412db403 100644
+--- a/arch/x86/include/asm/kvm_host.h
++++ b/arch/x86/include/asm/kvm_host.h
+@@ -690,11 +690,10 @@ struct kvm_vcpu_arch {
+ 	 *
+ 	 * Note that while the PKRU state lives inside the fpu registers,
+ 	 * it is switched out separately at VMENTER and VMEXIT time. The
+-	 * "guest_fpu" state here contains the guest FPU context, with the
++	 * "guest_fpstate" state here contains the guest FPU context, with the
+ 	 * host PRKU bits.
+ 	 */
+-	struct fpu *user_fpu;
+-	struct fpu *guest_fpu;
++	struct fpu_guest guest_fpu;
+ 
+ 	u64 xcr0;
+ 	u64 guest_supported_xcr0;
+@@ -1673,8 +1672,6 @@ void kvm_vcpu_deliver_sipi_vector(struct kvm_vcpu *vcpu, u8 vector);
+ int kvm_task_switch(struct kvm_vcpu *vcpu, u16 tss_selector, int idt_index,
+ 		    int reason, bool has_error_code, u32 error_code);
+ 
+-void kvm_free_guest_fpu(struct kvm_vcpu *vcpu);
+-
+ void kvm_post_set_cr0(struct kvm_vcpu *vcpu, unsigned long old_cr0, unsigned long cr0);
+ void kvm_post_set_cr4(struct kvm_vcpu *vcpu, unsigned long old_cr4, unsigned long cr4);
+ int kvm_set_cr0(struct kvm_vcpu *vcpu, unsigned long cr0);
+* Unmerged path arch/x86/kernel/fpu/core.c
+diff --git a/arch/x86/kvm/svm/svm.c b/arch/x86/kvm/svm/svm.c
+index 35e48522a597..fe566f0e7e23 100644
+--- a/arch/x86/kvm/svm/svm.c
++++ b/arch/x86/kvm/svm/svm.c
+@@ -36,6 +36,7 @@
+ #include <asm/spec-ctrl.h>
+ #include <asm/cpu_device_id.h>
+ #include <asm/traps.h>
++#include <asm/fpu/api.h>
+ 
+ #include <asm/virtext.h>
+ #include "trace.h"
+@@ -1379,10 +1380,10 @@ static int svm_create_vcpu(struct kvm_vcpu *vcpu)
+ 		/*
+ 		 * SEV-ES guests maintain an encrypted version of their FPU
+ 		 * state which is restored and saved on VMRUN and VMEXIT.
+-		 * Free the fpu structure to prevent KVM from attempting to
+-		 * access the FPU state.
++		 * Mark vcpu->arch.guest_fpu->fpstate as scratch so it won't
++		 * do xsave/xrstor on it.
+ 		 */
+-		kvm_free_guest_fpu(vcpu);
++		fpstate_set_confidential(&vcpu->arch.guest_fpu);
+ 	}
+ 
+ 	err = avic_init_vcpu(svm);
+* Unmerged path arch/x86/kvm/x86.c
