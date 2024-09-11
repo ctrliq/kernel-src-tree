@@ -1,0 +1,414 @@
+Bluetooth: Pause discovery and advertising during suspend
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Abhishek Pandit-Subedi <abhishekpandit@chromium.org>
+commit 4867bd007d25a8dfd4ffc558534f7aec8b361789
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/4867bd00.failed
+
+To prevent spurious wake ups, we disable any discovery or advertising
+when we enter suspend and restore it when we exit suspend. While paused,
+we disable any management requests to modify discovery or advertising.
+
+	Signed-off-by: Abhishek Pandit-Subedi <abhishekpandit@chromium.org>
+	Signed-off-by: Marcel Holtmann <marcel@holtmann.org>
+(cherry picked from commit 4867bd007d25a8dfd4ffc558534f7aec8b361789)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/net/bluetooth/hci_core.h
+#	net/bluetooth/hci_request.c
+diff --cc include/net/bluetooth/hci_core.h
+index b46e3ee436f3,d4e28773d378..000000000000
+--- a/include/net/bluetooth/hci_core.h
++++ b/include/net/bluetooth/hci_core.h
+@@@ -88,6 -88,31 +88,34 @@@ struct discovery_state 
+  	unsigned long		scan_duration;
+  };
+  
+++<<<<<<< HEAD
+++=======
++ #define SUSPEND_NOTIFIER_TIMEOUT	msecs_to_jiffies(2000) /* 2 seconds */
++ 
++ enum suspend_tasks {
++ 	SUSPEND_PAUSE_DISCOVERY,
++ 	SUSPEND_UNPAUSE_DISCOVERY,
++ 
++ 	SUSPEND_PAUSE_ADVERTISING,
++ 	SUSPEND_UNPAUSE_ADVERTISING,
++ 
++ 	SUSPEND_SCAN_DISABLE,
++ 	SUSPEND_SCAN_ENABLE,
++ 	SUSPEND_DISCONNECTING,
++ 
++ 	SUSPEND_POWERING_DOWN,
++ 
++ 	SUSPEND_PREPARE_NOTIFIER,
++ 	__SUSPEND_NUM_TASKS
++ };
++ 
++ enum suspended_state {
++ 	BT_RUNNING = 0,
++ 	BT_SUSPEND_DISCONNECT,
++ 	BT_SUSPEND_COMPLETE,
++ };
++ 
+++>>>>>>> 4867bd007d25 (Bluetooth: Pause discovery and advertising during suspend)
+  struct hci_conn_hash {
+  	struct list_head list;
+  	unsigned int     acl_num;
+@@@ -359,6 -415,22 +387,25 @@@ struct hci_dev 
+  	void			*smp_bredr_data;
+  
+  	struct discovery_state	discovery;
+++<<<<<<< HEAD
+++=======
++ 
++ 	int			discovery_old_state;
++ 	bool			discovery_paused;
++ 	int			advertising_old_state;
++ 	bool			advertising_paused;
++ 
++ 	struct notifier_block	suspend_notifier;
++ 	struct work_struct	suspend_prepare;
++ 	enum suspended_state	suspend_state_next;
++ 	enum suspended_state	suspend_state;
++ 	bool			scanning_paused;
++ 	bool			suspended;
++ 
++ 	wait_queue_head_t	suspend_wait_q;
++ 	DECLARE_BITMAP(suspend_tasks, __SUSPEND_NUM_TASKS);
++ 
+++>>>>>>> 4867bd007d25 (Bluetooth: Pause discovery and advertising during suspend)
+  	struct hci_conn_hash	conn_hash;
+  
+  	struct list_head	mgmt_pending;
+diff --cc net/bluetooth/hci_request.c
+index ef1f5ba85455,bf83179ab9d1..000000000000
+--- a/net/bluetooth/hci_request.c
++++ b/net/bluetooth/hci_request.c
+@@@ -804,20 -926,216 +804,225 @@@ void hci_req_add_le_passive_scan(struc
+  	    (hdev->le_features[0] & HCI_LE_EXT_SCAN_POLICY))
+  		filter_policy |= 0x02;
+  
+ -	if (hdev->suspended) {
+ -		window = LE_SUSPEND_SCAN_WINDOW;
+ -		interval = LE_SUSPEND_SCAN_INTERVAL;
+ -	} else {
+ -		window = hdev->le_scan_window;
+ -		interval = hdev->le_scan_interval;
+ -	}
+ -
+ +	memset(&param_cp, 0, sizeof(param_cp));
+ +	param_cp.type = LE_SCAN_PASSIVE;
+ +	param_cp.interval = cpu_to_le16(hdev->le_scan_interval);
+ +	param_cp.window = cpu_to_le16(hdev->le_scan_window);
+ +	param_cp.own_address_type = own_addr_type;
+ +	param_cp.filter_policy = filter_policy;
+ +	hci_req_add(req, HCI_OP_LE_SET_SCAN_PARAM, sizeof(param_cp),
+ +		    &param_cp);
+ +
+++<<<<<<< HEAD
+ +	memset(&enable_cp, 0, sizeof(enable_cp));
+ +	enable_cp.enable = LE_SCAN_ENABLE;
+ +	enable_cp.filter_dup = LE_SCAN_FILTER_DUP_ENABLE;
+ +	hci_req_add(req, HCI_OP_LE_SET_SCAN_ENABLE, sizeof(enable_cp),
+ +		    &enable_cp);
+++=======
++ 	bt_dev_dbg(hdev, "LE passive scan with whitelist = %d", filter_policy);
++ 	hci_req_start_scan(req, LE_SCAN_PASSIVE, interval, window,
++ 			   own_addr_type, filter_policy);
++ }
++ 
++ static u8 get_adv_instance_scan_rsp_len(struct hci_dev *hdev, u8 instance)
++ {
++ 	struct adv_info *adv_instance;
++ 
++ 	/* Instance 0x00 always set local name */
++ 	if (instance == 0x00)
++ 		return 1;
++ 
++ 	adv_instance = hci_find_adv_instance(hdev, instance);
++ 	if (!adv_instance)
++ 		return 0;
++ 
++ 	/* TODO: Take into account the "appearance" and "local-name" flags here.
++ 	 * These are currently being ignored as they are not supported.
++ 	 */
++ 	return adv_instance->scan_rsp_len;
++ }
++ 
++ static void hci_req_clear_event_filter(struct hci_request *req)
++ {
++ 	struct hci_cp_set_event_filter f;
++ 
++ 	memset(&f, 0, sizeof(f));
++ 	f.flt_type = HCI_FLT_CLEAR_ALL;
++ 	hci_req_add(req, HCI_OP_SET_EVENT_FLT, 1, &f);
++ 
++ 	/* Update page scan state (since we may have modified it when setting
++ 	 * the event filter).
++ 	 */
++ 	__hci_req_update_scan(req);
++ }
++ 
++ static void hci_req_set_event_filter(struct hci_request *req)
++ {
++ 	struct bdaddr_list *b;
++ 	struct hci_cp_set_event_filter f;
++ 	struct hci_dev *hdev = req->hdev;
++ 	u8 scan;
++ 
++ 	/* Always clear event filter when starting */
++ 	hci_req_clear_event_filter(req);
++ 
++ 	list_for_each_entry(b, &hdev->wakeable, list) {
++ 		memset(&f, 0, sizeof(f));
++ 		bacpy(&f.addr_conn_flt.bdaddr, &b->bdaddr);
++ 		f.flt_type = HCI_FLT_CONN_SETUP;
++ 		f.cond_type = HCI_CONN_SETUP_ALLOW_BDADDR;
++ 		f.addr_conn_flt.auto_accept = HCI_CONN_SETUP_AUTO_ON;
++ 
++ 		bt_dev_dbg(hdev, "Adding event filters for %pMR", &b->bdaddr);
++ 		hci_req_add(req, HCI_OP_SET_EVENT_FLT, sizeof(f), &f);
++ 	}
++ 
++ 	scan = !list_empty(&hdev->wakeable) ? SCAN_PAGE : SCAN_DISABLED;
++ 	hci_req_add(req, HCI_OP_WRITE_SCAN_ENABLE, 1, &scan);
++ }
++ 
++ static void hci_req_config_le_suspend_scan(struct hci_request *req)
++ {
++ 	/* Can't change params without disabling first */
++ 	hci_req_add_le_scan_disable(req);
++ 
++ 	/* Configure params and enable scanning */
++ 	hci_req_add_le_passive_scan(req);
++ 
++ 	/* Block suspend notifier on response */
++ 	set_bit(SUSPEND_SCAN_ENABLE, req->hdev->suspend_tasks);
++ }
++ 
++ static void suspend_req_complete(struct hci_dev *hdev, u8 status, u16 opcode)
++ {
++ 	bt_dev_dbg(hdev, "Request complete opcode=0x%x, status=0x%x", opcode,
++ 		   status);
++ 	if (test_and_clear_bit(SUSPEND_SCAN_ENABLE, hdev->suspend_tasks) ||
++ 	    test_and_clear_bit(SUSPEND_SCAN_DISABLE, hdev->suspend_tasks)) {
++ 		wake_up(&hdev->suspend_wait_q);
++ 	}
++ }
++ 
++ /* Call with hci_dev_lock */
++ void hci_req_prepare_suspend(struct hci_dev *hdev, enum suspended_state next)
++ {
++ 	int old_state;
++ 	struct hci_conn *conn;
++ 	struct hci_request req;
++ 	u8 page_scan;
++ 	int disconnect_counter;
++ 
++ 	if (next == hdev->suspend_state) {
++ 		bt_dev_dbg(hdev, "Same state before and after: %d", next);
++ 		goto done;
++ 	}
++ 
++ 	hdev->suspend_state = next;
++ 	hci_req_init(&req, hdev);
++ 
++ 	if (next == BT_SUSPEND_DISCONNECT) {
++ 		/* Mark device as suspended */
++ 		hdev->suspended = true;
++ 
++ 		/* Pause discovery if not already stopped */
++ 		old_state = hdev->discovery.state;
++ 		if (old_state != DISCOVERY_STOPPED) {
++ 			set_bit(SUSPEND_PAUSE_DISCOVERY, hdev->suspend_tasks);
++ 			hci_discovery_set_state(hdev, DISCOVERY_STOPPING);
++ 			queue_work(hdev->req_workqueue, &hdev->discov_update);
++ 		}
++ 
++ 		hdev->discovery_paused = true;
++ 		hdev->discovery_old_state = old_state;
++ 
++ 		/* Stop advertising */
++ 		old_state = hci_dev_test_flag(hdev, HCI_ADVERTISING);
++ 		if (old_state) {
++ 			set_bit(SUSPEND_PAUSE_ADVERTISING, hdev->suspend_tasks);
++ 			cancel_delayed_work(&hdev->discov_off);
++ 			queue_delayed_work(hdev->req_workqueue,
++ 					   &hdev->discov_off, 0);
++ 		}
++ 
++ 		hdev->advertising_paused = true;
++ 		hdev->advertising_old_state = old_state;
++ 		/* Disable page scan */
++ 		page_scan = SCAN_DISABLED;
++ 		hci_req_add(&req, HCI_OP_WRITE_SCAN_ENABLE, 1, &page_scan);
++ 
++ 		/* Disable LE passive scan */
++ 		hci_req_add_le_scan_disable(&req);
++ 
++ 		/* Mark task needing completion */
++ 		set_bit(SUSPEND_SCAN_DISABLE, hdev->suspend_tasks);
++ 
++ 		/* Prevent disconnects from causing scanning to be re-enabled */
++ 		hdev->scanning_paused = true;
++ 
++ 		/* Run commands before disconnecting */
++ 		hci_req_run(&req, suspend_req_complete);
++ 
++ 		disconnect_counter = 0;
++ 		/* Soft disconnect everything (power off) */
++ 		list_for_each_entry(conn, &hdev->conn_hash.list, list) {
++ 			hci_disconnect(conn, HCI_ERROR_REMOTE_POWER_OFF);
++ 			disconnect_counter++;
++ 		}
++ 
++ 		if (disconnect_counter > 0) {
++ 			bt_dev_dbg(hdev,
++ 				   "Had %d disconnects. Will wait on them",
++ 				   disconnect_counter);
++ 			set_bit(SUSPEND_DISCONNECTING, hdev->suspend_tasks);
++ 		}
++ 	} else if (next == BT_SUSPEND_COMPLETE) {
++ 		/* Unpause to take care of updating scanning params */
++ 		hdev->scanning_paused = false;
++ 		/* Enable event filter for paired devices */
++ 		hci_req_set_event_filter(&req);
++ 		/* Enable passive scan at lower duty cycle */
++ 		hci_req_config_le_suspend_scan(&req);
++ 		/* Pause scan changes again. */
++ 		hdev->scanning_paused = true;
++ 		hci_req_run(&req, suspend_req_complete);
++ 	} else {
++ 		hdev->suspended = false;
++ 		hdev->scanning_paused = false;
++ 
++ 		hci_req_clear_event_filter(&req);
++ 		/* Reset passive/background scanning to normal */
++ 		hci_req_config_le_suspend_scan(&req);
++ 
++ 		/* Unpause advertising */
++ 		hdev->advertising_paused = false;
++ 		if (hdev->advertising_old_state) {
++ 			set_bit(SUSPEND_UNPAUSE_ADVERTISING,
++ 				hdev->suspend_tasks);
++ 			hci_dev_set_flag(hdev, HCI_ADVERTISING);
++ 			queue_work(hdev->req_workqueue,
++ 				   &hdev->discoverable_update);
++ 			hdev->advertising_old_state = 0;
++ 		}
++ 
++ 		/* Unpause discovery */
++ 		hdev->discovery_paused = false;
++ 		if (hdev->discovery_old_state != DISCOVERY_STOPPED &&
++ 		    hdev->discovery_old_state != DISCOVERY_STOPPING) {
++ 			set_bit(SUSPEND_UNPAUSE_DISCOVERY, hdev->suspend_tasks);
++ 			hci_discovery_set_state(hdev, DISCOVERY_STARTING);
++ 			queue_work(hdev->req_workqueue, &hdev->discov_update);
++ 		}
++ 
++ 		hci_req_run(&req, suspend_req_complete);
++ 	}
++ 
++ 	hdev->suspend_state = next;
++ 
++ done:
++ 	clear_bit(SUSPEND_PREPARE_NOTIFIER, hdev->suspend_tasks);
++ 	wake_up(&hdev->suspend_wait_q);
+++>>>>>>> 4867bd007d25 (Bluetooth: Pause discovery and advertising during suspend)
+  }
+  
+  static u8 get_cur_adv_instance_scan_rsp_len(struct hci_dev *hdev)
+* Unmerged path include/net/bluetooth/hci_core.h
+* Unmerged path net/bluetooth/hci_request.c
+diff --git a/net/bluetooth/mgmt.c b/net/bluetooth/mgmt.c
+index 29a67f7d7a8e..3ae33aa5f79b 100644
+--- a/net/bluetooth/mgmt.c
++++ b/net/bluetooth/mgmt.c
+@@ -1253,6 +1253,12 @@ static int set_discoverable(struct sock *sk, struct hci_dev *hdev, void *data,
+ 		goto failed;
+ 	}
+ 
++	if (hdev->advertising_paused) {
++		err = mgmt_cmd_status(sk, hdev->id, MGMT_OP_SET_DISCOVERABLE,
++				      MGMT_STATUS_BUSY);
++		goto failed;
++	}
++
+ 	if (!hdev_is_powered(hdev)) {
+ 		bool changed = false;
+ 
+@@ -3458,6 +3464,13 @@ void mgmt_start_discovery_complete(struct hci_dev *hdev, u8 status)
+ 	}
+ 
+ 	hci_dev_unlock(hdev);
++
++	/* Handle suspend notifier */
++	if (test_and_clear_bit(SUSPEND_UNPAUSE_DISCOVERY,
++			       hdev->suspend_tasks)) {
++		bt_dev_dbg(hdev, "Unpaused discovery");
++		wake_up(&hdev->suspend_wait_q);
++	}
+ }
+ 
+ static bool discovery_type_is_valid(struct hci_dev *hdev, uint8_t type,
+@@ -3519,6 +3532,13 @@ static int start_discovery_internal(struct sock *sk, struct hci_dev *hdev,
+ 		goto failed;
+ 	}
+ 
++	/* Can't start discovery when it is paused */
++	if (hdev->discovery_paused) {
++		err = mgmt_cmd_complete(sk, hdev->id, op, MGMT_STATUS_BUSY,
++					&cp->type, sizeof(cp->type));
++		goto failed;
++	}
++
+ 	/* Clear the discovery filter first to free any previously
+ 	 * allocated memory for the UUID list.
+ 	 */
+@@ -3686,6 +3706,12 @@ void mgmt_stop_discovery_complete(struct hci_dev *hdev, u8 status)
+ 	}
+ 
+ 	hci_dev_unlock(hdev);
++
++	/* Handle suspend notifier */
++	if (test_and_clear_bit(SUSPEND_PAUSE_DISCOVERY, hdev->suspend_tasks)) {
++		bt_dev_dbg(hdev, "Paused discovery");
++		wake_up(&hdev->suspend_wait_q);
++	}
+ }
+ 
+ static int stop_discovery(struct sock *sk, struct hci_dev *hdev, void *data,
+@@ -3917,6 +3943,17 @@ static void set_advertising_complete(struct hci_dev *hdev, u8 status,
+ 	if (match.sk)
+ 		sock_put(match.sk);
+ 
++	/* Handle suspend notifier */
++	if (test_and_clear_bit(SUSPEND_PAUSE_ADVERTISING,
++			       hdev->suspend_tasks)) {
++		bt_dev_dbg(hdev, "Paused advertising");
++		wake_up(&hdev->suspend_wait_q);
++	} else if (test_and_clear_bit(SUSPEND_UNPAUSE_ADVERTISING,
++				      hdev->suspend_tasks)) {
++		bt_dev_dbg(hdev, "Unpaused advertising");
++		wake_up(&hdev->suspend_wait_q);
++	}
++
+ 	/* If "Set Advertising" was just disabled and instance advertising was
+ 	 * set up earlier, then re-enable multi-instance advertising.
+ 	 */
+@@ -3968,6 +4005,10 @@ static int set_advertising(struct sock *sk, struct hci_dev *hdev, void *data,
+ 		return mgmt_cmd_status(sk, hdev->id, MGMT_OP_SET_ADVERTISING,
+ 				       MGMT_STATUS_INVALID_PARAMS);
+ 
++	if (hdev->advertising_paused)
++		return mgmt_cmd_status(sk, hdev->id, MGMT_OP_SET_ADVERTISING,
++				       MGMT_STATUS_BUSY);
++
+ 	hci_dev_lock(hdev);
+ 
+ 	val = !!cp->val;
