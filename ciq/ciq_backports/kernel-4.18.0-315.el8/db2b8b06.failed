@@ -1,0 +1,297 @@
+libbpf: Support CO-RE relocations for multi-prog sections
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-315.el8
+commit-author Andrii Nakryiko <andriin@fb.com>
+commit db2b8b06423c7eb4abcb4310b7234f00b30d7730
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-315.el8/db2b8b06.failed
+
+Fix up CO-RE relocation code to handle relocations against ELF sections
+containing multiple BPF programs. This requires lookup of a BPF program by its
+section name and instruction index it contains. While it could have been done
+as a simple loop, it could run into performance issues pretty quickly, as
+number of CO-RE relocations can be quite large in real-world applications, and
+each CO-RE relocation incurs BPF program look up now. So instead of simple
+loop, implement a binary search by section name + insn offset.
+
+	Signed-off-by: Andrii Nakryiko <andriin@fb.com>
+	Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+	Acked-by: John Fastabend <john.fastabend@gmail.com>
+Link: https://lore.kernel.org/bpf/20200903203542.15944-4-andriin@fb.com
+(cherry picked from commit db2b8b06423c7eb4abcb4310b7234f00b30d7730)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	tools/lib/bpf/libbpf.c
+diff --cc tools/lib/bpf/libbpf.c
+index 133c0050e689,11ad230ec20c..000000000000
+--- a/tools/lib/bpf/libbpf.c
++++ b/tools/lib/bpf/libbpf.c
+@@@ -2595,6 -2580,191 +2595,194 @@@ report
+  	return err;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static const char *elf_sym_str(const struct bpf_object *obj, size_t off)
++ {
++ 	const char *name;
++ 
++ 	name = elf_strptr(obj->efile.elf, obj->efile.strtabidx, off);
++ 	if (!name) {
++ 		pr_warn("elf: failed to get section name string at offset %zu from %s: %s\n",
++ 			off, obj->path, elf_errmsg(-1));
++ 		return NULL;
++ 	}
++ 
++ 	return name;
++ }
++ 
++ static const char *elf_sec_str(const struct bpf_object *obj, size_t off)
++ {
++ 	const char *name;
++ 
++ 	name = elf_strptr(obj->efile.elf, obj->efile.shstrndx, off);
++ 	if (!name) {
++ 		pr_warn("elf: failed to get section name string at offset %zu from %s: %s\n",
++ 			off, obj->path, elf_errmsg(-1));
++ 		return NULL;
++ 	}
++ 
++ 	return name;
++ }
++ 
++ static Elf_Scn *elf_sec_by_idx(const struct bpf_object *obj, size_t idx)
++ {
++ 	Elf_Scn *scn;
++ 
++ 	scn = elf_getscn(obj->efile.elf, idx);
++ 	if (!scn) {
++ 		pr_warn("elf: failed to get section(%zu) from %s: %s\n",
++ 			idx, obj->path, elf_errmsg(-1));
++ 		return NULL;
++ 	}
++ 	return scn;
++ }
++ 
++ static Elf_Scn *elf_sec_by_name(const struct bpf_object *obj, const char *name)
++ {
++ 	Elf_Scn *scn = NULL;
++ 	Elf *elf = obj->efile.elf;
++ 	const char *sec_name;
++ 
++ 	while ((scn = elf_nextscn(elf, scn)) != NULL) {
++ 		sec_name = elf_sec_name(obj, scn);
++ 		if (!sec_name)
++ 			return NULL;
++ 
++ 		if (strcmp(sec_name, name) != 0)
++ 			continue;
++ 
++ 		return scn;
++ 	}
++ 	return NULL;
++ }
++ 
++ static int elf_sec_hdr(const struct bpf_object *obj, Elf_Scn *scn, GElf_Shdr *hdr)
++ {
++ 	if (!scn)
++ 		return -EINVAL;
++ 
++ 	if (gelf_getshdr(scn, hdr) != hdr) {
++ 		pr_warn("elf: failed to get section(%zu) header from %s: %s\n",
++ 			elf_ndxscn(scn), obj->path, elf_errmsg(-1));
++ 		return -EINVAL;
++ 	}
++ 
++ 	return 0;
++ }
++ 
++ static const char *elf_sec_name(const struct bpf_object *obj, Elf_Scn *scn)
++ {
++ 	const char *name;
++ 	GElf_Shdr sh;
++ 
++ 	if (!scn)
++ 		return NULL;
++ 
++ 	if (elf_sec_hdr(obj, scn, &sh))
++ 		return NULL;
++ 
++ 	name = elf_sec_str(obj, sh.sh_name);
++ 	if (!name) {
++ 		pr_warn("elf: failed to get section(%zu) name from %s: %s\n",
++ 			elf_ndxscn(scn), obj->path, elf_errmsg(-1));
++ 		return NULL;
++ 	}
++ 
++ 	return name;
++ }
++ 
++ static Elf_Data *elf_sec_data(const struct bpf_object *obj, Elf_Scn *scn)
++ {
++ 	Elf_Data *data;
++ 
++ 	if (!scn)
++ 		return NULL;
++ 
++ 	data = elf_getdata(scn, 0);
++ 	if (!data) {
++ 		pr_warn("elf: failed to get section(%zu) %s data from %s: %s\n",
++ 			elf_ndxscn(scn), elf_sec_name(obj, scn) ?: "<?>",
++ 			obj->path, elf_errmsg(-1));
++ 		return NULL;
++ 	}
++ 
++ 	return data;
++ }
++ 
++ static int elf_sym_by_sec_off(const struct bpf_object *obj, size_t sec_idx,
++ 			      size_t off, __u32 sym_type, GElf_Sym *sym)
++ {
++ 	Elf_Data *symbols = obj->efile.symbols;
++ 	size_t n = symbols->d_size / sizeof(GElf_Sym);
++ 	int i;
++ 
++ 	for (i = 0; i < n; i++) {
++ 		if (!gelf_getsym(symbols, i, sym))
++ 			continue;
++ 		if (sym->st_shndx != sec_idx || sym->st_value != off)
++ 			continue;
++ 		if (GELF_ST_TYPE(sym->st_info) != sym_type)
++ 			continue;
++ 		return 0;
++ 	}
++ 
++ 	return -ENOENT;
++ }
++ 
++ static bool is_sec_name_dwarf(const char *name)
++ {
++ 	/* approximation, but the actual list is too long */
++ 	return strncmp(name, ".debug_", sizeof(".debug_") - 1) == 0;
++ }
++ 
++ static bool ignore_elf_section(GElf_Shdr *hdr, const char *name)
++ {
++ 	/* no special handling of .strtab */
++ 	if (hdr->sh_type == SHT_STRTAB)
++ 		return true;
++ 
++ 	/* ignore .llvm_addrsig section as well */
++ 	if (hdr->sh_type == 0x6FFF4C03 /* SHT_LLVM_ADDRSIG */)
++ 		return true;
++ 
++ 	/* no subprograms will lead to an empty .text section, ignore it */
++ 	if (hdr->sh_type == SHT_PROGBITS && hdr->sh_size == 0 &&
++ 	    strcmp(name, ".text") == 0)
++ 		return true;
++ 
++ 	/* DWARF sections */
++ 	if (is_sec_name_dwarf(name))
++ 		return true;
++ 
++ 	if (strncmp(name, ".rel", sizeof(".rel") - 1) == 0) {
++ 		name += sizeof(".rel") - 1;
++ 		/* DWARF section relocations */
++ 		if (is_sec_name_dwarf(name))
++ 			return true;
++ 
++ 		/* .BTF and .BTF.ext don't need relocations */
++ 		if (strcmp(name, BTF_ELF_SEC) == 0 ||
++ 		    strcmp(name, BTF_EXT_ELF_SEC) == 0)
++ 			return true;
++ 	}
++ 
++ 	return false;
++ }
++ 
++ static int cmp_progs(const void *_a, const void *_b)
++ {
++ 	const struct bpf_program *a = _a;
++ 	const struct bpf_program *b = _b;
++ 
++ 	if (a->sec_idx != b->sec_idx)
++ 		return a->sec_idx < b->sec_idx ? -1 : 1;
++ 
++ 	/* sec_insn_off can't be the same within the section */
++ 	return a->sec_insn_off < b->sec_insn_off ? -1 : 1;
++ }
++ 
+++>>>>>>> db2b8b06423c (libbpf: Support CO-RE relocations for multi-prog sections)
+  static int bpf_object__elf_collect(struct bpf_object *obj)
+  {
+  	Elf *elf = obj->efile.elf;
+@@@ -2734,9 -2896,14 +2922,14 @@@
+  	}
+  
+  	if (!obj->efile.strtabidx || obj->efile.strtabidx > idx) {
+ -		pr_warn("elf: symbol strings section missing or invalid in %s\n", obj->path);
+ +		pr_warn("Corrupted ELF file: index of strtab invalid\n");
+  		return -LIBBPF_ERRNO__FORMAT;
+  	}
++ 
++ 	/* sort BPF programs by section name and in-section instruction offset
++ 	 * for faster search */
++ 	qsort(obj->programs, obj->nr_programs, sizeof(*obj->programs), cmp_progs);
++ 
+  	return bpf_object__init_btf(obj, btf_data, btf_ext_data);
+  }
+  
+@@@ -5066,9 -5274,14 +5290,18 @@@ static int bpf_core_patch_insn(struct b
+  	int insn_idx;
+  	__u8 class;
+  
+ -	if (relo->insn_off % BPF_INSN_SZ)
+ +	if (relo->insn_off % sizeof(struct bpf_insn))
+  		return -EINVAL;
+++<<<<<<< HEAD
+ +	insn_idx = relo->insn_off / sizeof(struct bpf_insn);
+++=======
++ 	insn_idx = relo->insn_off / BPF_INSN_SZ;
++ 	/* adjust insn_idx from section frame of reference to the local
++ 	 * program's frame of reference; (sub-)program code is not yet
++ 	 * relocated, so it's enough to just subtract in-section offset
++ 	 */
++ 	insn_idx = insn_idx - prog->sec_insn_off;
+++>>>>>>> db2b8b06423c (libbpf: Support CO-RE relocations for multi-prog sections)
+  	insn = &prog->insns[insn_idx];
+  	class = BPF_CLASS(insn->code);
+  
+@@@ -5485,21 -5699,25 +5718,25 @@@ bpf_object__relocate_core(struct bpf_ob
+  			err = -EINVAL;
+  			goto out;
+  		}
++ 		/* bpf_object's ELF is gone by now so it's not easy to find
++ 		 * section index by section name, but we can find *any*
++ 		 * bpf_program within desired section name and use it's
++ 		 * prog->sec_idx to do a proper search by section index and
++ 		 * instruction offset
++ 		 */
+  		prog = NULL;
+  		for (i = 0; i < obj->nr_programs; i++) {
+- 			if (!strcmp(obj->programs[i].section_name, sec_name)) {
+- 				prog = &obj->programs[i];
++ 			prog = &obj->programs[i];
++ 			if (strcmp(prog->section_name, sec_name) == 0)
+  				break;
+- 			}
+  		}
+  		if (!prog) {
+- 			pr_warn("failed to find program '%s' for CO-RE offset relocation\n",
+- 				sec_name);
+- 			err = -EINVAL;
+- 			goto out;
++ 			pr_warn("sec '%s': failed to find a BPF program\n", sec_name);
++ 			return -ENOENT;
+  		}
++ 		sec_idx = prog->sec_idx;
+  
+ -		pr_debug("sec '%s': found %d CO-RE relocations\n",
+ +		pr_debug("prog '%s': performing %d CO-RE offset relocs\n",
+  			 sec_name, sec->num_info);
+  
+  		for_each_btf_ext_rec(seg, sec, i, rec) {
+* Unmerged path tools/lib/bpf/libbpf.c
