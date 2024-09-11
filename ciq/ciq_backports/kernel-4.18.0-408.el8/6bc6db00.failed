@@ -1,0 +1,182 @@
+KVM: Remove tlbs_dirty
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-408.el8
+commit-author Lai Jiangshan <laijs@linux.alibaba.com>
+commit 6bc6db000295332bae2c1e8815d7450b72923d23
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-408.el8/6bc6db00.failed
+
+There is no user of tlbs_dirty.
+
+	Signed-off-by: Lai Jiangshan <laijs@linux.alibaba.com>
+	Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+Message-Id: <20210918005636.3675-4-jiangshanlai@gmail.com>
+	Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+(cherry picked from commit 6bc6db000295332bae2c1e8815d7450b72923d23)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	virt/kvm/kvm_main.c
+diff --cc virt/kvm/kvm_main.c
+index 6f04c4e5e88c,7851f3a1b5f7..000000000000
+--- a/virt/kvm/kvm_main.c
++++ b/virt/kvm/kvm_main.c
+@@@ -482,6 -462,140 +476,143 @@@ static void kvm_mmu_notifier_invalidate
+  	srcu_read_unlock(&kvm->srcu, idx);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ typedef bool (*hva_handler_t)(struct kvm *kvm, struct kvm_gfn_range *range);
++ 
++ typedef void (*on_lock_fn_t)(struct kvm *kvm, unsigned long start,
++ 			     unsigned long end);
++ 
++ struct kvm_hva_range {
++ 	unsigned long start;
++ 	unsigned long end;
++ 	pte_t pte;
++ 	hva_handler_t handler;
++ 	on_lock_fn_t on_lock;
++ 	bool flush_on_ret;
++ 	bool may_block;
++ };
++ 
++ /*
++  * Use a dedicated stub instead of NULL to indicate that there is no callback
++  * function/handler.  The compiler technically can't guarantee that a real
++  * function will have a non-zero address, and so it will generate code to
++  * check for !NULL, whereas comparing against a stub will be elided at compile
++  * time (unless the compiler is getting long in the tooth, e.g. gcc 4.9).
++  */
++ static void kvm_null_fn(void)
++ {
++ 
++ }
++ #define IS_KVM_NULL_FN(fn) ((fn) == (void *)kvm_null_fn)
++ 
++ static __always_inline int __kvm_handle_hva_range(struct kvm *kvm,
++ 						  const struct kvm_hva_range *range)
++ {
++ 	bool ret = false, locked = false;
++ 	struct kvm_gfn_range gfn_range;
++ 	struct kvm_memory_slot *slot;
++ 	struct kvm_memslots *slots;
++ 	int i, idx;
++ 
++ 	/* A null handler is allowed if and only if on_lock() is provided. */
++ 	if (WARN_ON_ONCE(IS_KVM_NULL_FN(range->on_lock) &&
++ 			 IS_KVM_NULL_FN(range->handler)))
++ 		return 0;
++ 
++ 	idx = srcu_read_lock(&kvm->srcu);
++ 
++ 	for (i = 0; i < KVM_ADDRESS_SPACE_NUM; i++) {
++ 		slots = __kvm_memslots(kvm, i);
++ 		kvm_for_each_memslot(slot, slots) {
++ 			unsigned long hva_start, hva_end;
++ 
++ 			hva_start = max(range->start, slot->userspace_addr);
++ 			hva_end = min(range->end, slot->userspace_addr +
++ 						  (slot->npages << PAGE_SHIFT));
++ 			if (hva_start >= hva_end)
++ 				continue;
++ 
++ 			/*
++ 			 * To optimize for the likely case where the address
++ 			 * range is covered by zero or one memslots, don't
++ 			 * bother making these conditional (to avoid writes on
++ 			 * the second or later invocation of the handler).
++ 			 */
++ 			gfn_range.pte = range->pte;
++ 			gfn_range.may_block = range->may_block;
++ 
++ 			/*
++ 			 * {gfn(page) | page intersects with [hva_start, hva_end)} =
++ 			 * {gfn_start, gfn_start+1, ..., gfn_end-1}.
++ 			 */
++ 			gfn_range.start = hva_to_gfn_memslot(hva_start, slot);
++ 			gfn_range.end = hva_to_gfn_memslot(hva_end + PAGE_SIZE - 1, slot);
++ 			gfn_range.slot = slot;
++ 
++ 			if (!locked) {
++ 				locked = true;
++ 				KVM_MMU_LOCK(kvm);
++ 				if (!IS_KVM_NULL_FN(range->on_lock))
++ 					range->on_lock(kvm, range->start, range->end);
++ 				if (IS_KVM_NULL_FN(range->handler))
++ 					break;
++ 			}
++ 			ret |= range->handler(kvm, &gfn_range);
++ 		}
++ 	}
++ 
++ 	if (range->flush_on_ret && ret)
++ 		kvm_flush_remote_tlbs(kvm);
++ 
++ 	if (locked)
++ 		KVM_MMU_UNLOCK(kvm);
++ 
++ 	srcu_read_unlock(&kvm->srcu, idx);
++ 
++ 	/* The notifiers are averse to booleans. :-( */
++ 	return (int)ret;
++ }
++ 
++ static __always_inline int kvm_handle_hva_range(struct mmu_notifier *mn,
++ 						unsigned long start,
++ 						unsigned long end,
++ 						pte_t pte,
++ 						hva_handler_t handler)
++ {
++ 	struct kvm *kvm = mmu_notifier_to_kvm(mn);
++ 	const struct kvm_hva_range range = {
++ 		.start		= start,
++ 		.end		= end,
++ 		.pte		= pte,
++ 		.handler	= handler,
++ 		.on_lock	= (void *)kvm_null_fn,
++ 		.flush_on_ret	= true,
++ 		.may_block	= false,
++ 	};
++ 
++ 	return __kvm_handle_hva_range(kvm, &range);
++ }
++ 
++ static __always_inline int kvm_handle_hva_range_no_flush(struct mmu_notifier *mn,
++ 							 unsigned long start,
++ 							 unsigned long end,
++ 							 hva_handler_t handler)
++ {
++ 	struct kvm *kvm = mmu_notifier_to_kvm(mn);
++ 	const struct kvm_hva_range range = {
++ 		.start		= start,
++ 		.end		= end,
++ 		.pte		= __pte(0),
++ 		.handler	= handler,
++ 		.on_lock	= (void *)kvm_null_fn,
++ 		.flush_on_ret	= false,
++ 		.may_block	= false,
++ 	};
++ 
++ 	return __kvm_handle_hva_range(kvm, &range);
++ }
+++>>>>>>> 6bc6db000295 (KVM: Remove tlbs_dirty)
+  static void kvm_mmu_notifier_change_pte(struct mmu_notifier *mn,
+  					struct mm_struct *mm,
+  					unsigned long address,
+diff --git a/include/linux/kvm_host.h b/include/linux/kvm_host.h
+index 20157fe0daad..04b9b086ca8a 100644
+--- a/include/linux/kvm_host.h
++++ b/include/linux/kvm_host.h
+@@ -555,7 +555,6 @@ struct kvm {
+ 	unsigned long mmu_notifier_range_start;
+ 	unsigned long mmu_notifier_range_end;
+ #endif
+-	long tlbs_dirty;
+ 	struct list_head devices;
+ 	u64 manual_dirty_log_protect;
+ 	struct dentry *debugfs_dentry;
+* Unmerged path virt/kvm/kvm_main.c
