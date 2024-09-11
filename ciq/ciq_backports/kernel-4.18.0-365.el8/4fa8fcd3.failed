@@ -1,0 +1,262 @@
+igc: AF_XDP zero-copy metadata adjust breaks SKBs on XDP_PASS
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-365.el8
+commit-author Jesper Dangaard Brouer <brouer@redhat.com>
+commit 4fa8fcd3440101dbacf4fae91de69877ef751977
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-365.el8/4fa8fcd3.failed
+
+Driver already implicitly supports XDP metadata access in AF_XDP
+zero-copy mode, as xsk_buff_pool's xp_alloc() naturally set xdp_buff
+data_meta equal data.
+
+This works fine for XDP and AF_XDP, but if a BPF-prog adjust via
+bpf_xdp_adjust_meta() and choose to call XDP_PASS, then igc function
+igc_construct_skb_zc() will construct an invalid SKB packet. The
+function correctly include the xdp->data_meta area in the memcpy, but
+forgot to pull header to take metasize into account.
+
+Fixes: fc9df2a0b520 ("igc: Enable RX via AF_XDP zero-copy")
+	Signed-off-by: Jesper Dangaard Brouer <brouer@redhat.com>
+	Tested-by: Nechama Kraus <nechamax.kraus@linux.intel.com>
+	Acked-by: Maciej Fijalkowski <maciej.fijalkowski@intel.com>
+	Signed-off-by: Tony Nguyen <anthony.l.nguyen@intel.com>
+(cherry picked from commit 4fa8fcd3440101dbacf4fae91de69877ef751977)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/intel/igc/igc_main.c
+diff --cc drivers/net/ethernet/intel/igc/igc_main.c
+index 17e116ce1be9,76b0a7311369..000000000000
+--- a/drivers/net/ethernet/intel/igc/igc_main.c
++++ b/drivers/net/ethernet/intel/igc/igc_main.c
+@@@ -2047,6 -2432,223 +2047,226 @@@ static int igc_clean_rx_irq(struct igc_
+  	return total_packets;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static struct sk_buff *igc_construct_skb_zc(struct igc_ring *ring,
++ 					    struct xdp_buff *xdp)
++ {
++ 	unsigned int metasize = xdp->data - xdp->data_meta;
++ 	unsigned int datasize = xdp->data_end - xdp->data;
++ 	unsigned int totalsize = metasize + datasize;
++ 	struct sk_buff *skb;
++ 
++ 	skb = __napi_alloc_skb(&ring->q_vector->napi,
++ 			       xdp->data_end - xdp->data_hard_start,
++ 			       GFP_ATOMIC | __GFP_NOWARN);
++ 	if (unlikely(!skb))
++ 		return NULL;
++ 
++ 	skb_reserve(skb, xdp->data_meta - xdp->data_hard_start);
++ 	memcpy(__skb_put(skb, totalsize), xdp->data_meta, totalsize);
++ 	if (metasize) {
++ 		skb_metadata_set(skb, metasize);
++ 		__skb_pull(skb, metasize);
++ 	}
++ 
++ 	return skb;
++ }
++ 
++ static void igc_dispatch_skb_zc(struct igc_q_vector *q_vector,
++ 				union igc_adv_rx_desc *desc,
++ 				struct xdp_buff *xdp,
++ 				ktime_t timestamp)
++ {
++ 	struct igc_ring *ring = q_vector->rx.ring;
++ 	struct sk_buff *skb;
++ 
++ 	skb = igc_construct_skb_zc(ring, xdp);
++ 	if (!skb) {
++ 		ring->rx_stats.alloc_failed++;
++ 		return;
++ 	}
++ 
++ 	if (timestamp)
++ 		skb_hwtstamps(skb)->hwtstamp = timestamp;
++ 
++ 	if (igc_cleanup_headers(ring, desc, skb))
++ 		return;
++ 
++ 	igc_process_skb_fields(ring, desc, skb);
++ 	napi_gro_receive(&q_vector->napi, skb);
++ }
++ 
++ static int igc_clean_rx_irq_zc(struct igc_q_vector *q_vector, const int budget)
++ {
++ 	struct igc_adapter *adapter = q_vector->adapter;
++ 	struct igc_ring *ring = q_vector->rx.ring;
++ 	u16 cleaned_count = igc_desc_unused(ring);
++ 	int total_bytes = 0, total_packets = 0;
++ 	u16 ntc = ring->next_to_clean;
++ 	struct bpf_prog *prog;
++ 	bool failure = false;
++ 	int xdp_status = 0;
++ 
++ 	rcu_read_lock();
++ 
++ 	prog = READ_ONCE(adapter->xdp_prog);
++ 
++ 	while (likely(total_packets < budget)) {
++ 		union igc_adv_rx_desc *desc;
++ 		struct igc_rx_buffer *bi;
++ 		ktime_t timestamp = 0;
++ 		unsigned int size;
++ 		int res;
++ 
++ 		desc = IGC_RX_DESC(ring, ntc);
++ 		size = le16_to_cpu(desc->wb.upper.length);
++ 		if (!size)
++ 			break;
++ 
++ 		/* This memory barrier is needed to keep us from reading
++ 		 * any other fields out of the rx_desc until we know the
++ 		 * descriptor has been written back
++ 		 */
++ 		dma_rmb();
++ 
++ 		bi = &ring->rx_buffer_info[ntc];
++ 
++ 		if (igc_test_staterr(desc, IGC_RXDADV_STAT_TSIP)) {
++ 			timestamp = igc_ptp_rx_pktstamp(q_vector->adapter,
++ 							bi->xdp->data);
++ 
++ 			bi->xdp->data += IGC_TS_HDR_LEN;
++ 
++ 			/* HW timestamp has been copied into local variable. Metadata
++ 			 * length when XDP program is called should be 0.
++ 			 */
++ 			bi->xdp->data_meta += IGC_TS_HDR_LEN;
++ 			size -= IGC_TS_HDR_LEN;
++ 		}
++ 
++ 		bi->xdp->data_end = bi->xdp->data + size;
++ 		xsk_buff_dma_sync_for_cpu(bi->xdp, ring->xsk_pool);
++ 
++ 		res = __igc_xdp_run_prog(adapter, prog, bi->xdp);
++ 		switch (res) {
++ 		case IGC_XDP_PASS:
++ 			igc_dispatch_skb_zc(q_vector, desc, bi->xdp, timestamp);
++ 			fallthrough;
++ 		case IGC_XDP_CONSUMED:
++ 			xsk_buff_free(bi->xdp);
++ 			break;
++ 		case IGC_XDP_TX:
++ 		case IGC_XDP_REDIRECT:
++ 			xdp_status |= res;
++ 			break;
++ 		}
++ 
++ 		bi->xdp = NULL;
++ 		total_bytes += size;
++ 		total_packets++;
++ 		cleaned_count++;
++ 		ntc++;
++ 		if (ntc == ring->count)
++ 			ntc = 0;
++ 	}
++ 
++ 	ring->next_to_clean = ntc;
++ 	rcu_read_unlock();
++ 
++ 	if (cleaned_count >= IGC_RX_BUFFER_WRITE)
++ 		failure = !igc_alloc_rx_buffers_zc(ring, cleaned_count);
++ 
++ 	if (xdp_status)
++ 		igc_finalize_xdp(adapter, xdp_status);
++ 
++ 	igc_update_rx_stats(q_vector, total_packets, total_bytes);
++ 
++ 	if (xsk_uses_need_wakeup(ring->xsk_pool)) {
++ 		if (failure || ring->next_to_clean == ring->next_to_use)
++ 			xsk_set_rx_need_wakeup(ring->xsk_pool);
++ 		else
++ 			xsk_clear_rx_need_wakeup(ring->xsk_pool);
++ 		return total_packets;
++ 	}
++ 
++ 	return failure ? budget : total_packets;
++ }
++ 
++ static void igc_update_tx_stats(struct igc_q_vector *q_vector,
++ 				unsigned int packets, unsigned int bytes)
++ {
++ 	struct igc_ring *ring = q_vector->tx.ring;
++ 
++ 	u64_stats_update_begin(&ring->tx_syncp);
++ 	ring->tx_stats.bytes += bytes;
++ 	ring->tx_stats.packets += packets;
++ 	u64_stats_update_end(&ring->tx_syncp);
++ 
++ 	q_vector->tx.total_bytes += bytes;
++ 	q_vector->tx.total_packets += packets;
++ }
++ 
++ static void igc_xdp_xmit_zc(struct igc_ring *ring)
++ {
++ 	struct xsk_buff_pool *pool = ring->xsk_pool;
++ 	struct netdev_queue *nq = txring_txq(ring);
++ 	union igc_adv_tx_desc *tx_desc = NULL;
++ 	int cpu = smp_processor_id();
++ 	u16 ntu = ring->next_to_use;
++ 	struct xdp_desc xdp_desc;
++ 	u16 budget;
++ 
++ 	if (!netif_carrier_ok(ring->netdev))
++ 		return;
++ 
++ 	__netif_tx_lock(nq, cpu);
++ 
++ 	budget = igc_desc_unused(ring);
++ 
++ 	while (xsk_tx_peek_desc(pool, &xdp_desc) && budget--) {
++ 		u32 cmd_type, olinfo_status;
++ 		struct igc_tx_buffer *bi;
++ 		dma_addr_t dma;
++ 
++ 		cmd_type = IGC_ADVTXD_DTYP_DATA | IGC_ADVTXD_DCMD_DEXT |
++ 			   IGC_ADVTXD_DCMD_IFCS | IGC_TXD_DCMD |
++ 			   xdp_desc.len;
++ 		olinfo_status = xdp_desc.len << IGC_ADVTXD_PAYLEN_SHIFT;
++ 
++ 		dma = xsk_buff_raw_get_dma(pool, xdp_desc.addr);
++ 		xsk_buff_raw_dma_sync_for_device(pool, dma, xdp_desc.len);
++ 
++ 		tx_desc = IGC_TX_DESC(ring, ntu);
++ 		tx_desc->read.cmd_type_len = cpu_to_le32(cmd_type);
++ 		tx_desc->read.olinfo_status = cpu_to_le32(olinfo_status);
++ 		tx_desc->read.buffer_addr = cpu_to_le64(dma);
++ 
++ 		bi = &ring->tx_buffer_info[ntu];
++ 		bi->type = IGC_TX_BUFFER_TYPE_XSK;
++ 		bi->protocol = 0;
++ 		bi->bytecount = xdp_desc.len;
++ 		bi->gso_segs = 1;
++ 		bi->time_stamp = jiffies;
++ 		bi->next_to_watch = tx_desc;
++ 
++ 		netdev_tx_sent_queue(txring_txq(ring), xdp_desc.len);
++ 
++ 		ntu++;
++ 		if (ntu == ring->count)
++ 			ntu = 0;
++ 	}
++ 
++ 	ring->next_to_use = ntu;
++ 	if (tx_desc) {
++ 		igc_flush_tx_descriptors(ring);
++ 		xsk_tx_release(pool);
++ 	}
++ 
++ 	__netif_tx_unlock(nq);
++ }
++ 
+++>>>>>>> 4fa8fcd34401 (igc: AF_XDP zero-copy metadata adjust breaks SKBs on XDP_PASS)
+  /**
+   * igc_clean_tx_irq - Reclaim resources after transmit completes
+   * @q_vector: pointer to q_vector containing needed info
+* Unmerged path drivers/net/ethernet/intel/igc/igc_main.c
