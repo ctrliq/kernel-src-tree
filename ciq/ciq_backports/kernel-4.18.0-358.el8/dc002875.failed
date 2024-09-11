@@ -1,0 +1,408 @@
+net: bridge: vlan: use br_rports_fill_info() to export mcast router ports
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-358.el8
+commit-author Nikolay Aleksandrov <nikolay@nvidia.com>
+commit dc002875c22b56c795ec24dc987ac2dd2081588e
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-358.el8/dc002875.failed
+
+Embed the standard multicast router port export by br_rports_fill_info()
+into a new global vlan attribute BRIDGE_VLANDB_GOPTS_MCAST_ROUTER_PORTS.
+In order to have the same format for the global bridge mcast context and
+the per-vlan mcast context we need a double-nesting:
+ - BRIDGE_VLANDB_GOPTS_MCAST_ROUTER_PORTS
+   - MDBA_ROUTER
+
+Currently we don't compare router lists, if any router port exists in
+the bridge mcast contexts we consider their option sets as different and
+export them separately.
+
+In addition we export the router port vlan id when dumping similar to
+the router port notification format.
+
+	Signed-off-by: Nikolay Aleksandrov <nikolay@nvidia.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit dc002875c22b56c795ec24dc987ac2dd2081588e)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/uapi/linux/if_bridge.h
+#	net/bridge/br_mdb.c
+#	net/bridge/br_private.h
+#	net/bridge/br_vlan_options.c
+diff --cc include/uapi/linux/if_bridge.h
+index d643fa57361d,620d86e825b8..000000000000
+--- a/include/uapi/linux/if_bridge.h
++++ b/include/uapi/linux/if_bridge.h
+@@@ -491,6 -548,21 +491,24 @@@ enum 
+  	BRIDGE_VLANDB_GOPTS_UNSPEC,
+  	BRIDGE_VLANDB_GOPTS_ID,
+  	BRIDGE_VLANDB_GOPTS_RANGE,
+++<<<<<<< HEAD
+++=======
++ 	BRIDGE_VLANDB_GOPTS_MCAST_SNOOPING,
++ 	BRIDGE_VLANDB_GOPTS_MCAST_IGMP_VERSION,
++ 	BRIDGE_VLANDB_GOPTS_MCAST_MLD_VERSION,
++ 	BRIDGE_VLANDB_GOPTS_MCAST_LAST_MEMBER_CNT,
++ 	BRIDGE_VLANDB_GOPTS_MCAST_STARTUP_QUERY_CNT,
++ 	BRIDGE_VLANDB_GOPTS_MCAST_LAST_MEMBER_INTVL,
++ 	BRIDGE_VLANDB_GOPTS_PAD,
++ 	BRIDGE_VLANDB_GOPTS_MCAST_MEMBERSHIP_INTVL,
++ 	BRIDGE_VLANDB_GOPTS_MCAST_QUERIER_INTVL,
++ 	BRIDGE_VLANDB_GOPTS_MCAST_QUERY_INTVL,
++ 	BRIDGE_VLANDB_GOPTS_MCAST_QUERY_RESPONSE_INTVL,
++ 	BRIDGE_VLANDB_GOPTS_MCAST_STARTUP_QUERY_INTVL,
++ 	BRIDGE_VLANDB_GOPTS_MCAST_QUERIER,
++ 	BRIDGE_VLANDB_GOPTS_MCAST_ROUTER,
++ 	BRIDGE_VLANDB_GOPTS_MCAST_ROUTER_PORTS,
+++>>>>>>> dc002875c22b (net: bridge: vlan: use br_rports_fill_info() to export mcast router ports)
+  	__BRIDGE_VLANDB_GOPTS_MAX
+  };
+  #define BRIDGE_VLANDB_GOPTS_MAX (__BRIDGE_VLANDB_GOPTS_MAX - 1)
+diff --cc net/bridge/br_mdb.c
+index 5621f5510fd4,389ff3c1e9d9..000000000000
+--- a/net/bridge/br_mdb.c
++++ b/net/bridge/br_mdb.c
+@@@ -16,14 -16,37 +16,45 @@@
+  
+  #include "br_private.h"
+  
+++<<<<<<< HEAD
+ +static int br_rports_fill_info(struct sk_buff *skb, struct netlink_callback *cb,
+ +			       struct net_device *dev)
+ +{
+ +	struct net_bridge *br = netdev_priv(dev);
+++=======
++ static bool
++ br_ip4_rports_get_timer(struct net_bridge_mcast_port *pmctx,
++ 			unsigned long *timer)
++ {
++ 	*timer = br_timer_value(&pmctx->ip4_mc_router_timer);
++ 	return !hlist_unhashed(&pmctx->ip4_rlist);
++ }
++ 
++ static bool
++ br_ip6_rports_get_timer(struct net_bridge_mcast_port *pmctx,
++ 			unsigned long *timer)
++ {
++ #if IS_ENABLED(CONFIG_IPV6)
++ 	*timer = br_timer_value(&pmctx->ip6_mc_router_timer);
++ 	return !hlist_unhashed(&pmctx->ip6_rlist);
++ #else
++ 	*timer = 0;
++ 	return false;
++ #endif
++ }
++ 
++ int br_rports_fill_info(struct sk_buff *skb,
++ 			const struct net_bridge_mcast *brmctx)
++ {
++ 	u16 vid = brmctx->vlan ? brmctx->vlan->vid : 0;
++ 	bool have_ip4_mc_rtr, have_ip6_mc_rtr;
++ 	unsigned long ip4_timer, ip6_timer;
++ 	struct nlattr *nest, *port_nest;
+++>>>>>>> dc002875c22b (net: bridge: vlan: use br_rports_fill_info() to export mcast router ports)
+  	struct net_bridge_port *p;
+ +	struct nlattr *nest, *port_nest;
+  
+ -	if (!brmctx->multicast_router || !br_rports_have_mc_router(brmctx))
+ +	if (!br->multicast_router || hlist_empty(&br->router_list))
+  		return 0;
+  
+  	nest = nla_nest_start_noflag(skb, MDBA_ROUTER);
+diff --cc net/bridge/br_private.h
+index 30e07225bc94,32c218aa3f36..000000000000
+--- a/net/bridge/br_private.h
++++ b/net/bridge/br_private.h
+@@@ -767,8 -917,41 +767,43 @@@ void br_multicast_get_stats(const struc
+  			    struct br_mcast_stats *dest);
+  void br_mdb_init(void);
+  void br_mdb_uninit(void);
+ -void br_multicast_host_join(const struct net_bridge_mcast *brmctx,
+ -			    struct net_bridge_mdb_entry *mp, bool notify);
+ +void br_multicast_host_join(struct net_bridge_mdb_entry *mp, bool notify);
+  void br_multicast_host_leave(struct net_bridge_mdb_entry *mp, bool notify);
+++<<<<<<< HEAD
+++=======
++ void br_multicast_star_g_handle_mode(struct net_bridge_port_group *pg,
++ 				     u8 filter_mode);
++ void br_multicast_sg_add_exclude_ports(struct net_bridge_mdb_entry *star_mp,
++ 				       struct net_bridge_port_group *sg);
++ struct net_bridge_group_src *
++ br_multicast_find_group_src(struct net_bridge_port_group *pg, struct br_ip *ip);
++ void br_multicast_del_group_src(struct net_bridge_group_src *src,
++ 				bool fastleave);
++ void br_multicast_ctx_init(struct net_bridge *br,
++ 			   struct net_bridge_vlan *vlan,
++ 			   struct net_bridge_mcast *brmctx);
++ void br_multicast_ctx_deinit(struct net_bridge_mcast *brmctx);
++ void br_multicast_port_ctx_init(struct net_bridge_port *port,
++ 				struct net_bridge_vlan *vlan,
++ 				struct net_bridge_mcast_port *pmctx);
++ void br_multicast_port_ctx_deinit(struct net_bridge_mcast_port *pmctx);
++ void br_multicast_toggle_one_vlan(struct net_bridge_vlan *vlan, bool on);
++ void br_multicast_toggle_vlan(struct net_bridge_vlan *vlan, bool on);
++ int br_multicast_toggle_vlan_snooping(struct net_bridge *br, bool on,
++ 				      struct netlink_ext_ack *extack);
++ bool br_multicast_toggle_global_vlan(struct net_bridge_vlan *vlan, bool on);
++ 
++ int br_mdb_replay(struct net_device *br_dev, struct net_device *dev,
++ 		  const void *ctx, bool adding, struct notifier_block *nb,
++ 		  struct netlink_ext_ack *extack);
++ int br_rports_fill_info(struct sk_buff *skb,
++ 			const struct net_bridge_mcast *brmctx);
++ 
++ static inline bool br_group_is_l2(const struct br_ip *group)
++ {
++ 	return group->proto == 0;
++ }
+++>>>>>>> dc002875c22b (net: bridge: vlan: use br_rports_fill_info() to export mcast router ports)
+  
+  #define mlock_dereference(X, br) \
+  	rcu_dereference_protected(X, lockdep_is_held(&br->multicast_lock))
+@@@ -822,21 -1096,138 +857,142 @@@ static inline int br_multicast_igmp_typ
+  	return BR_INPUT_SKB_CB(skb)->igmp;
+  }
+  
+ -static inline unsigned long br_multicast_lmqt(const struct net_bridge_mcast *brmctx)
+ +static inline unsigned long br_multicast_lmqt(const struct net_bridge *br)
+  {
+ -	return brmctx->multicast_last_member_interval *
+ -	       brmctx->multicast_last_member_count;
+ +	return br->multicast_last_member_interval *
+ +	       br->multicast_last_member_count;
+  }
+  
+ -static inline unsigned long br_multicast_gmi(const struct net_bridge_mcast *brmctx)
+ +static inline unsigned long br_multicast_gmi(const struct net_bridge *br)
+  {
+  	/* use the RFC default of 2 for QRV */
+++<<<<<<< HEAD
+ +	return 2 * br->multicast_query_interval +
+ +	       br->multicast_query_response_interval;
+++=======
++ 	return 2 * brmctx->multicast_query_interval +
++ 	       brmctx->multicast_query_response_interval;
++ }
++ 
++ static inline bool
++ br_multicast_ctx_is_vlan(const struct net_bridge_mcast *brmctx)
++ {
++ 	return !!brmctx->vlan;
++ }
++ 
++ static inline bool
++ br_multicast_port_ctx_is_vlan(const struct net_bridge_mcast_port *pmctx)
++ {
++ 	return !!pmctx->vlan;
++ }
++ 
++ static inline struct net_bridge_mcast *
++ br_multicast_port_ctx_get_global(const struct net_bridge_mcast_port *pmctx)
++ {
++ 	if (!br_multicast_port_ctx_is_vlan(pmctx))
++ 		return &pmctx->port->br->multicast_ctx;
++ 	else
++ 		return &pmctx->vlan->brvlan->br_mcast_ctx;
++ }
++ 
++ static inline bool
++ br_multicast_ctx_vlan_global_disabled(const struct net_bridge_mcast *brmctx)
++ {
++ 	return br_opt_get(brmctx->br, BROPT_MCAST_VLAN_SNOOPING_ENABLED) &&
++ 	       br_multicast_ctx_is_vlan(brmctx) &&
++ 	       !(brmctx->vlan->priv_flags & BR_VLFLAG_GLOBAL_MCAST_ENABLED);
++ }
++ 
++ static inline bool
++ br_multicast_ctx_vlan_disabled(const struct net_bridge_mcast *brmctx)
++ {
++ 	return br_multicast_ctx_is_vlan(brmctx) &&
++ 	       !(brmctx->vlan->priv_flags & BR_VLFLAG_MCAST_ENABLED);
++ }
++ 
++ static inline bool
++ br_multicast_port_ctx_vlan_disabled(const struct net_bridge_mcast_port *pmctx)
++ {
++ 	return br_multicast_port_ctx_is_vlan(pmctx) &&
++ 	       !(pmctx->vlan->priv_flags & BR_VLFLAG_MCAST_ENABLED);
++ }
++ 
++ static inline bool
++ br_multicast_port_ctx_state_disabled(const struct net_bridge_mcast_port *pmctx)
++ {
++ 	return pmctx->port->state == BR_STATE_DISABLED ||
++ 	       (br_multicast_port_ctx_is_vlan(pmctx) &&
++ 		(br_multicast_port_ctx_vlan_disabled(pmctx) ||
++ 		 pmctx->vlan->state == BR_STATE_DISABLED));
++ }
++ 
++ static inline bool
++ br_multicast_port_ctx_state_stopped(const struct net_bridge_mcast_port *pmctx)
++ {
++ 	return br_multicast_port_ctx_state_disabled(pmctx) ||
++ 	       pmctx->port->state == BR_STATE_BLOCKING ||
++ 	       (br_multicast_port_ctx_is_vlan(pmctx) &&
++ 		pmctx->vlan->state == BR_STATE_BLOCKING);
++ }
++ 
++ static inline bool
++ br_rports_have_mc_router(const struct net_bridge_mcast *brmctx)
++ {
++ #if IS_ENABLED(CONFIG_IPV6)
++ 	return !hlist_empty(&brmctx->ip4_mc_router_list) ||
++ 	       !hlist_empty(&brmctx->ip6_mc_router_list);
++ #else
++ 	return !hlist_empty(&brmctx->ip4_mc_router_list);
++ #endif
++ }
++ 
++ static inline bool
++ br_multicast_ctx_options_equal(const struct net_bridge_mcast *brmctx1,
++ 			       const struct net_bridge_mcast *brmctx2)
++ {
++ 	return brmctx1->multicast_igmp_version ==
++ 	       brmctx2->multicast_igmp_version &&
++ 	       brmctx1->multicast_last_member_count ==
++ 	       brmctx2->multicast_last_member_count &&
++ 	       brmctx1->multicast_startup_query_count ==
++ 	       brmctx2->multicast_startup_query_count &&
++ 	       brmctx1->multicast_last_member_interval ==
++ 	       brmctx2->multicast_last_member_interval &&
++ 	       brmctx1->multicast_membership_interval ==
++ 	       brmctx2->multicast_membership_interval &&
++ 	       brmctx1->multicast_querier_interval ==
++ 	       brmctx2->multicast_querier_interval &&
++ 	       brmctx1->multicast_query_interval ==
++ 	       brmctx2->multicast_query_interval &&
++ 	       brmctx1->multicast_query_response_interval ==
++ 	       brmctx2->multicast_query_response_interval &&
++ 	       brmctx1->multicast_startup_query_interval ==
++ 	       brmctx2->multicast_startup_query_interval &&
++ 	       brmctx1->multicast_querier == brmctx2->multicast_querier &&
++ 	       brmctx1->multicast_router == brmctx2->multicast_router &&
++ 	       !br_rports_have_mc_router(brmctx1) &&
++ 	       !br_rports_have_mc_router(brmctx2) &&
++ #if IS_ENABLED(CONFIG_IPV6)
++ 	       brmctx1->multicast_mld_version ==
++ 	       brmctx2->multicast_mld_version &&
++ #endif
++ 	       true;
++ }
++ 
++ static inline bool
++ br_multicast_ctx_matches_vlan_snooping(const struct net_bridge_mcast *brmctx)
++ {
++ 	bool vlan_snooping_enabled;
++ 
++ 	vlan_snooping_enabled = !!br_opt_get(brmctx->br,
++ 					     BROPT_MCAST_VLAN_SNOOPING_ENABLED);
++ 
++ 	return !!(vlan_snooping_enabled == br_multicast_ctx_is_vlan(brmctx));
+++>>>>>>> dc002875c22b (net: bridge: vlan: use br_rports_fill_info() to export mcast router ports)
+  }
+  #else
+ -static inline int br_multicast_rcv(struct net_bridge_mcast **brmctx,
+ -				   struct net_bridge_mcast_port **pmctx,
+ -				   struct net_bridge_vlan *vlan,
+ +static inline int br_multicast_rcv(struct net_bridge *br,
+ +				   struct net_bridge_port *port,
+  				   struct sk_buff *skb,
+  				   u16 vid)
+  {
+diff --cc net/bridge/br_vlan_options.c
+index 827bfc319599,b4fd5fa441b7..000000000000
+--- a/net/bridge/br_vlan_options.c
++++ b/net/bridge/br_vlan_options.c
+@@@ -268,6 -272,8 +268,11 @@@ bool br_vlan_global_opts_can_enter_rang
+  bool br_vlan_global_opts_fill(struct sk_buff *skb, u16 vid, u16 vid_range,
+  			      const struct net_bridge_vlan *v_opts)
+  {
+++<<<<<<< HEAD
+++=======
++ 	struct nlattr *nest2 __maybe_unused;
++ 	u64 clockval __maybe_unused;
+++>>>>>>> dc002875c22b (net: bridge: vlan: use br_rports_fill_info() to export mcast router ports)
+  	struct nlattr *nest;
+  
+  	nest = nla_nest_start(skb, BRIDGE_VLANDB_GLOBAL_OPTIONS);
+@@@ -281,6 -287,70 +286,73 @@@
+  	    nla_put_u16(skb, BRIDGE_VLANDB_GOPTS_RANGE, vid_range))
+  		goto out_err;
+  
+++<<<<<<< HEAD
+++=======
++ #ifdef CONFIG_BRIDGE_IGMP_SNOOPING
++ 	if (nla_put_u8(skb, BRIDGE_VLANDB_GOPTS_MCAST_SNOOPING,
++ 		       !!(v_opts->priv_flags & BR_VLFLAG_GLOBAL_MCAST_ENABLED)) ||
++ 	    nla_put_u8(skb, BRIDGE_VLANDB_GOPTS_MCAST_IGMP_VERSION,
++ 		       v_opts->br_mcast_ctx.multicast_igmp_version) ||
++ 	    nla_put_u32(skb, BRIDGE_VLANDB_GOPTS_MCAST_LAST_MEMBER_CNT,
++ 			v_opts->br_mcast_ctx.multicast_last_member_count) ||
++ 	    nla_put_u32(skb, BRIDGE_VLANDB_GOPTS_MCAST_STARTUP_QUERY_CNT,
++ 			v_opts->br_mcast_ctx.multicast_startup_query_count) ||
++ 	    nla_put_u8(skb, BRIDGE_VLANDB_GOPTS_MCAST_QUERIER,
++ 		       v_opts->br_mcast_ctx.multicast_querier) ||
++ 	    nla_put_u8(skb, BRIDGE_VLANDB_GOPTS_MCAST_ROUTER,
++ 		       v_opts->br_mcast_ctx.multicast_router))
++ 		goto out_err;
++ 
++ 	clockval = jiffies_to_clock_t(v_opts->br_mcast_ctx.multicast_last_member_interval);
++ 	if (nla_put_u64_64bit(skb, BRIDGE_VLANDB_GOPTS_MCAST_LAST_MEMBER_INTVL,
++ 			      clockval, BRIDGE_VLANDB_GOPTS_PAD))
++ 		goto out_err;
++ 	clockval = jiffies_to_clock_t(v_opts->br_mcast_ctx.multicast_membership_interval);
++ 	if (nla_put_u64_64bit(skb, BRIDGE_VLANDB_GOPTS_MCAST_MEMBERSHIP_INTVL,
++ 			      clockval, BRIDGE_VLANDB_GOPTS_PAD))
++ 		goto out_err;
++ 	clockval = jiffies_to_clock_t(v_opts->br_mcast_ctx.multicast_querier_interval);
++ 	if (nla_put_u64_64bit(skb, BRIDGE_VLANDB_GOPTS_MCAST_QUERIER_INTVL,
++ 			      clockval, BRIDGE_VLANDB_GOPTS_PAD))
++ 		goto out_err;
++ 	clockval = jiffies_to_clock_t(v_opts->br_mcast_ctx.multicast_query_interval);
++ 	if (nla_put_u64_64bit(skb, BRIDGE_VLANDB_GOPTS_MCAST_QUERY_INTVL,
++ 			      clockval, BRIDGE_VLANDB_GOPTS_PAD))
++ 		goto out_err;
++ 	clockval = jiffies_to_clock_t(v_opts->br_mcast_ctx.multicast_query_response_interval);
++ 	if (nla_put_u64_64bit(skb, BRIDGE_VLANDB_GOPTS_MCAST_QUERY_RESPONSE_INTVL,
++ 			      clockval, BRIDGE_VLANDB_GOPTS_PAD))
++ 		goto out_err;
++ 	clockval = jiffies_to_clock_t(v_opts->br_mcast_ctx.multicast_startup_query_interval);
++ 	if (nla_put_u64_64bit(skb, BRIDGE_VLANDB_GOPTS_MCAST_STARTUP_QUERY_INTVL,
++ 			      clockval, BRIDGE_VLANDB_GOPTS_PAD))
++ 		goto out_err;
++ 
++ 	if (br_rports_have_mc_router(&v_opts->br_mcast_ctx)) {
++ 		nest2 = nla_nest_start(skb,
++ 				       BRIDGE_VLANDB_GOPTS_MCAST_ROUTER_PORTS);
++ 		if (!nest2)
++ 			goto out_err;
++ 
++ 		rcu_read_lock();
++ 		if (br_rports_fill_info(skb, &v_opts->br_mcast_ctx)) {
++ 			rcu_read_unlock();
++ 			nla_nest_cancel(skb, nest2);
++ 			goto out_err;
++ 		}
++ 		rcu_read_unlock();
++ 
++ 		nla_nest_end(skb, nest2);
++ 	}
++ 
++ #if IS_ENABLED(CONFIG_IPV6)
++ 	if (nla_put_u8(skb, BRIDGE_VLANDB_GOPTS_MCAST_MLD_VERSION,
++ 		       v_opts->br_mcast_ctx.multicast_mld_version))
++ 		goto out_err;
++ #endif
++ #endif
++ 
+++>>>>>>> dc002875c22b (net: bridge: vlan: use br_rports_fill_info() to export mcast router ports)
+  	nla_nest_end(skb, nest);
+  
+  	return true;
+* Unmerged path include/uapi/linux/if_bridge.h
+* Unmerged path net/bridge/br_mdb.c
+* Unmerged path net/bridge/br_private.h
+* Unmerged path net/bridge/br_vlan_options.c
