@@ -1,0 +1,120 @@
+mm: keep separate anon and file statistics on page reclaim activity
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Johannes Weiner <hannes@cmpxchg.org>
+commit 497a6c1b09902b22ceccc0f25ba4dd623e1ddb7d
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/497a6c1b.failed
+
+Having statistics on pages scanned and pages reclaimed for both anon and
+file pages makes it easier to evaluate changes to LRU balancing.
+
+While at it, clean up the stat-keeping mess for isolation, putback,
+reclaim stats etc.  a bit: first the physical LRU operation (isolation and
+putback), followed by vmstats, reclaim_stats, and then vm events.
+
+	Signed-off-by: Johannes Weiner <hannes@cmpxchg.org>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Cc: Joonsoo Kim <iamjoonsoo.kim@lge.com>
+	Cc: Michal Hocko <mhocko@suse.com>
+	Cc: Minchan Kim <minchan@kernel.org>
+	Cc: Rik van Riel <riel@surriel.com>
+Link: http://lkml.kernel.org/r/20200520232525.798933-3-hannes@cmpxchg.org
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit 497a6c1b09902b22ceccc0f25ba4dd623e1ddb7d)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	mm/vmscan.c
+diff --cc mm/vmscan.c
+index deba1ddc925b,1fa2417f7c2a..000000000000
+--- a/mm/vmscan.c
++++ b/mm/vmscan.c
+@@@ -1887,10 -1910,10 +1887,10 @@@ shrink_inactive_list(unsigned long nr_t
+  {
+  	LIST_HEAD(page_list);
+  	unsigned long nr_scanned;
+ -	unsigned int nr_reclaimed = 0;
+ +	unsigned long nr_reclaimed = 0;
+  	unsigned long nr_taken;
+  	struct reclaim_stat stat;
+- 	int file = is_file_lru(lru);
++ 	bool file = is_file_lru(lru);
+  	enum vm_event_item item;
+  	struct pglist_data *pgdat = lruvec_pgdat(lruvec);
+  	struct zone_reclaim_stat *reclaim_stat = &lruvec->reclaim_stat;
+@@@ -1918,11 -1941,12 +1918,12 @@@
+  
+  	__mod_node_page_state(pgdat, NR_ISOLATED_ANON + file, nr_taken);
+  	reclaim_stat->recent_scanned[file] += nr_taken;
+- 
+  	item = current_is_kswapd() ? PGSCAN_KSWAPD : PGSCAN_DIRECT;
+ -	if (!cgroup_reclaim(sc))
+ +	if (global_reclaim(sc))
+  		__count_vm_events(item, nr_scanned);
+  	__count_memcg_events(lruvec_memcg(lruvec), item, nr_scanned);
++ 	__count_vm_events(PGSCAN_ANON + file, nr_scanned);
++ 
+  	spin_unlock_irq(&pgdat->lru_lock);
+  
+  	if (nr_taken == 0)
+@@@ -1933,16 -1957,16 +1934,25 @@@
+  
+  	spin_lock_irq(&pgdat->lru_lock);
+  
++ 	move_pages_to_lru(lruvec, &page_list);
++ 
++ 	__mod_node_page_state(pgdat, NR_ISOLATED_ANON + file, -nr_taken);
++ 	reclaim_stat->recent_rotated[0] += stat.nr_activate[0];
++ 	reclaim_stat->recent_rotated[1] += stat.nr_activate[1];
+  	item = current_is_kswapd() ? PGSTEAL_KSWAPD : PGSTEAL_DIRECT;
+ -	if (!cgroup_reclaim(sc))
+ +	if (global_reclaim(sc))
+  		__count_vm_events(item, nr_reclaimed);
+  	__count_memcg_events(lruvec_memcg(lruvec), item, nr_reclaimed);
+++<<<<<<< HEAD
+ +	reclaim_stat->recent_rotated[0] += stat.nr_activate[0];
+ +	reclaim_stat->recent_rotated[1] += stat.nr_activate[1];
+ +
+ +	putback_inactive_pages(lruvec, &page_list);
+ +
+ +	__mod_node_page_state(pgdat, NR_ISOLATED_ANON + file, -nr_taken);
+++=======
++ 	__count_vm_events(PGSTEAL_ANON + file, nr_reclaimed);
+++>>>>>>> 497a6c1b0990 (mm: keep separate anon and file statistics on page reclaim activity)
+  
+  	spin_unlock_irq(&pgdat->lru_lock);
+  
+diff --git a/include/linux/vm_event_item.h b/include/linux/vm_event_item.h
+index ffef0f279747..24fc7c3ae7d6 100644
+--- a/include/linux/vm_event_item.h
++++ b/include/linux/vm_event_item.h
+@@ -35,6 +35,10 @@ enum vm_event_item { PGPGIN, PGPGOUT, PSWPIN, PSWPOUT,
+ 		PGSCAN_KSWAPD,
+ 		PGSCAN_DIRECT,
+ 		PGSCAN_DIRECT_THROTTLE,
++		PGSCAN_ANON,
++		PGSCAN_FILE,
++		PGSTEAL_ANON,
++		PGSTEAL_FILE,
+ #ifdef CONFIG_NUMA
+ 		PGSCAN_ZONE_RECLAIM_FAILED,
+ #endif
+* Unmerged path mm/vmscan.c
+diff --git a/mm/vmstat.c b/mm/vmstat.c
+index d21f9cdeba42..2e51ac1950af 100644
+--- a/mm/vmstat.c
++++ b/mm/vmstat.c
+@@ -1195,6 +1195,10 @@ const char * const vmstat_text[] = {
+ 	"pgscan_kswapd",
+ 	"pgscan_direct",
+ 	"pgscan_direct_throttle",
++	"pgscan_anon",
++	"pgscan_file",
++	"pgsteal_anon",
++	"pgsteal_file",
+ 
+ #ifdef CONFIG_NUMA
+ 	"zone_reclaim_failed",
