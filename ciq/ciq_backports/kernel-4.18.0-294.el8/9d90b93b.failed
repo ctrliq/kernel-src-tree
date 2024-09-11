@@ -1,0 +1,137 @@
+lib/vdso: Make delta calculation work correctly
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Thomas Gleixner <tglx@linutronix.de>
+commit 9d90b93bf325e015bbae31b83f16da5e4e17effa
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/9d90b93b.failed
+
+The x86 vdso implementation on which the generic vdso library is based on
+has subtle (unfortunately undocumented) twists:
+
+ 1) The code assumes that the clocksource mask is U64_MAX which means that
+    no bits are masked. Which is true for any valid x86 VDSO clocksource.
+    Stupidly it still did the mask operation for no reason and at the wrong
+    place right after reading the clocksource.
+
+ 2) It contains a sanity check to catch the case where slightly
+    unsynchronized TSC values can be observed which would cause the delta
+    calculation to make a huge jump. It therefore checks whether the
+    current TSC value is larger than the value on which the current
+    conversion is based on. If it's not larger the base value is used to
+    prevent time jumps.
+
+#1 Is not only stupid for the X86 case because it does the masking for no
+reason it is also completely wrong for clocksources with a smaller mask
+which can legitimately wrap around during a conversion period. The core
+timekeeping code does it correct by applying the mask after the delta
+calculation:
+
+	(now - base) & mask
+
+#2 is equally broken for clocksources which have smaller masks and can wrap
+around during a conversion period because there the now > base check is
+just wrong and causes stale time stamps and time going backwards issues.
+
+Unbreak it by:
+
+  1) Removing the mask operation from the clocksource read which makes the
+     fallback detection work for all clocksources
+
+  2) Replacing the conditional delta calculation with a overrideable inline
+     function.
+
+#2 could reuse clocksource_delta() from the timekeeping code but that
+results in a significant performance hit for the x86 VSDO. The timekeeping
+core code must have the non optimized version as it has to operate
+correctly with clocksources which have smaller masks as well to handle the
+case where TSC is discarded as timekeeper clocksource and replaced by HPET
+or pmtimer. For the VDSO there is no replacement clocksource. If TSC is
+unusable the syscall is enforced which does the right thing.
+
+To accommodate to the needs of various architectures provide an
+override-able inline function which defaults to the regular delta
+calculation with masking:
+
+	(now - base) & mask
+
+Override it for x86 with the non-masking and checking version.
+
+This unbreaks the ARM64 syscall fallback operation, allows to use
+clocksources with arbitrary width and preserves the performance
+optimization for x86.
+
+	Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+	Reviewed-by: Vincenzo Frascino <vincenzo.frascino@arm.com>
+	Cc: linux-arch@vger.kernel.org
+	Cc: LAK <linux-arm-kernel@lists.infradead.org>
+	Cc: linux-mips@vger.kernel.org
+	Cc: linux-kselftest@vger.kernel.org
+	Cc: catalin.marinas@arm.com
+	Cc: Will Deacon <will.deacon@arm.com>
+	Cc: Arnd Bergmann <arnd@arndb.de>
+	Cc: linux@armlinux.org.uk
+	Cc: Ralf Baechle <ralf@linux-mips.org>
+	Cc: paul.burton@mips.com
+	Cc: Daniel Lezcano <daniel.lezcano@linaro.org>
+	Cc: salyzyn@android.com
+	Cc: pcc@google.com
+	Cc: shuah@kernel.org
+	Cc: 0x7f454c46@gmail.com
+	Cc: linux@rasmusvillemoes.dk
+	Cc: huw@codeweavers.com
+	Cc: sthotton@marvell.com
+	Cc: andre.przywara@arm.com
+	Cc: Andy Lutomirski <luto@kernel.org>
+Link: https://lkml.kernel.org/r/alpine.DEB.2.21.1906261159230.32342@nanos.tec.linutronix.de
+
+(cherry picked from commit 9d90b93bf325e015bbae31b83f16da5e4e17effa)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/include/asm/vdso/gettimeofday.h
+* Unmerged path arch/x86/include/asm/vdso/gettimeofday.h
+* Unmerged path arch/x86/include/asm/vdso/gettimeofday.h
+diff --git a/lib/vdso/gettimeofday.c b/lib/vdso/gettimeofday.c
+index ef28cc5d7bff..2d1c1f241fd9 100644
+--- a/lib/vdso/gettimeofday.c
++++ b/lib/vdso/gettimeofday.c
+@@ -26,6 +26,18 @@
+ #include <asm/vdso/gettimeofday.h>
+ #endif /* ENABLE_COMPAT_VDSO */
+ 
++#ifndef vdso_calc_delta
++/*
++ * Default implementation which works for all sane clocksources. That
++ * obviously excludes x86/TSC.
++ */
++static __always_inline
++u64 vdso_calc_delta(u64 cycles, u64 last, u64 mask, u32 mult)
++{
++	return ((cycles - last) & mask) * mult;
++}
++#endif
++
+ static int do_hres(const struct vdso_data *vd, clockid_t clk,
+ 		   struct __kernel_timespec *ts)
+ {
+@@ -35,14 +47,13 @@ static int do_hres(const struct vdso_data *vd, clockid_t clk,
+ 
+ 	do {
+ 		seq = vdso_read_begin(vd);
+-		cycles = __arch_get_hw_counter(vd->clock_mode) &
+-			vd->mask;
++		cycles = __arch_get_hw_counter(vd->clock_mode);
+ 		ns = vdso_ts->nsec;
+ 		last = vd->cycle_last;
+ 		if (unlikely((s64)cycles < 0))
+ 			return clock_gettime_fallback(clk, ts);
+-		if (cycles > last)
+-			ns += (cycles - last) * vd->mult;
++
++		ns += vdso_calc_delta(cycles, last, vd->mask, vd->mult);
+ 		ns >>= vd->shift;
+ 		sec = vdso_ts->sec;
+ 	} while (unlikely(vdso_read_retry(vd, seq)));
