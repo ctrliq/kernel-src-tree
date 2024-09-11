@@ -1,0 +1,116 @@
+net/fq_impl: do not maintain a backlog-sorted list of flows
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-315.el8
+commit-author Felix Fietkau <nbd@nbd.name>
+commit d7b649291782430904e17cde2ebfc90f76021ca5
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-315.el8/d7b64929.failed
+
+A sorted flow list is only needed to drop packets in the biggest flow when
+hitting the overmemory condition.
+By scanning flows only when needed, we can avoid paying the cost of
+maintaining the list under normal conditions
+In order to avoid scanning lots of empty flows and touching too many cold
+cache lines, a bitmap of flows with backlog is maintained
+
+	Signed-off-by: Felix Fietkau <nbd@nbd.name>
+Link: https://lore.kernel.org/r/20201218184718.93650-3-nbd@nbd.name
+	Signed-off-by: Johannes Berg <johannes.berg@intel.com>
+(cherry picked from commit d7b649291782430904e17cde2ebfc90f76021ca5)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/net/fq.h
+#	include/net/fq_impl.h
+diff --cc include/net/fq.h
+index c51be50e1349,2eccbbd2b559..000000000000
+--- a/include/net/fq.h
++++ b/include/net/fq.h
+@@@ -48,6 -44,8 +45,11 @@@ struct fq_flow 
+  struct fq_tin {
+  	struct list_head new_flows;
+  	struct list_head old_flows;
+++<<<<<<< HEAD
+++=======
++ 	struct list_head tin_list;
++ 	struct fq_flow default_flow;
+++>>>>>>> d7b649291782 (net/fq_impl: do not maintain a backlog-sorted list of flows)
+  	u32 backlog_bytes;
+  	u32 backlog_packets;
+  	u32 overlimit;
+@@@ -67,10 -63,11 +67,12 @@@
+   */
+  struct fq {
+  	struct fq_flow *flows;
+- 	struct list_head backlogs;
++ 	unsigned long *flows_bitmap;
++ 
++ 	struct list_head tin_backlog;
+  	spinlock_t lock;
+  	u32 flows_cnt;
+ +	siphash_key_t	perturbation;
+  	u32 limit;
+  	u32 memory_limit;
+  	u32 memory_usage;
+diff --cc include/net/fq_impl.h
+index abeccf666679,a5f67a2c0c73..000000000000
+--- a/include/net/fq_impl.h
++++ b/include/net/fq_impl.h
+@@@ -199,8 -204,15 +205,15 @@@ static void fq_tin_enqueue(struct fq *f
+  
+  	lockdep_assert_held(&fq->lock);
+  
+ -	flow = fq_flow_classify(fq, tin, idx, skb);
+ +	flow = fq_flow_classify(fq, tin, skb, get_default_func);
+  
++ 	if (!flow->backlog) {
++ 		if (flow != &tin->default_flow)
++ 			__set_bit(idx, fq->flows_bitmap);
++ 		else if (list_empty(&tin->tin_list))
++ 			list_add(&tin->tin_list, &fq->tin_backlog);
++ 	}
++ 
+  	flow->tin = tin;
+  	flow->backlog += skb->len;
+  	tin->backlog_bytes += skb->len;
+@@@ -330,6 -338,8 +339,11 @@@ static void fq_tin_init(struct fq_tin *
+  {
+  	INIT_LIST_HEAD(&tin->new_flows);
+  	INIT_LIST_HEAD(&tin->old_flows);
+++<<<<<<< HEAD
+++=======
++ 	INIT_LIST_HEAD(&tin->tin_list);
++ 	fq_flow_init(&tin->default_flow);
+++>>>>>>> d7b649291782 (net/fq_impl: do not maintain a backlog-sorted list of flows)
+  }
+  
+  static int fq_init(struct fq *fq, int flows_cnt)
+@@@ -337,10 -347,9 +351,10 @@@
+  	int i;
+  
+  	memset(fq, 0, sizeof(fq[0]));
+- 	INIT_LIST_HEAD(&fq->backlogs);
+  	spin_lock_init(&fq->lock);
++ 	INIT_LIST_HEAD(&fq->tin_backlog);
+  	fq->flows_cnt = max_t(u32, flows_cnt, 1);
+ +	get_random_bytes(&fq->perturbation, sizeof(fq->perturbation));
+  	fq->quantum = 300;
+  	fq->limit = 8192;
+  	fq->memory_limit = 16 << 20; /* 16 MBytes */
+* Unmerged path include/net/fq.h
+* Unmerged path include/net/fq_impl.h
+diff --git a/net/mac80211/tx.c b/net/mac80211/tx.c
+index a1584634b4c4..b5ffaf237e22 100644
+--- a/net/mac80211/tx.c
++++ b/net/mac80211/tx.c
+@@ -3356,8 +3356,6 @@ static bool ieee80211_amsdu_aggregate(struct ieee80211_sub_if_data *sdata,
+ 	if (head->len != orig_len) {
+ 		flow->backlog += head->len - orig_len;
+ 		tin->backlog_bytes += head->len - orig_len;
+-
+-		fq_recalc_backlog(fq, tin, flow);
+ 	}
+ out:
+ 	spin_unlock_bh(&fq->lock);
