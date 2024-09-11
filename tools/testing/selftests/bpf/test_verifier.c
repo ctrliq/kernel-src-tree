@@ -14289,7 +14289,7 @@ static void do_test_fixup(struct bpf_test *test, enum bpf_map_type prog_type,
 		do {
 			prog[*fixup_map_stacktrace].imm = map_fds[12];
 			fixup_map_stacktrace++;
-		} while (fixup_map_stacktrace);
+		} while (*fixup_map_stacktrace);
 	}
 }
 
