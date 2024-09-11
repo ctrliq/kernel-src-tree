@@ -1,0 +1,498 @@
+kasan, mm: don't save alloc stacks twice
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-365.el8
+commit-author Andrey Konovalov <andreyknvl@google.com>
+commit 928501344fc645f80390afc12708c81b3595745d
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-365.el8/92850134.failed
+
+Patch series "kasan: optimizations and fixes for HW_TAGS", v4.
+
+This patchset makes the HW_TAGS mode more efficient, mostly by reworking
+poisoning approaches and simplifying/inlining some internal helpers.
+
+With this change, the overhead of HW_TAGS annotations excluding setting
+and checking memory tags is ~3%.  The performance impact caused by tags
+will be unknown until we have hardware that supports MTE.
+
+As a side-effect, this patchset speeds up generic KASAN by ~15%.
+
+This patch (of 13):
+
+Currently KASAN saves allocation stacks in both kasan_slab_alloc() and
+kasan_kmalloc() annotations.  This patch changes KASAN to save allocation
+stacks for slab objects from kmalloc caches in kasan_kmalloc() only, and
+stacks for other slab objects in kasan_slab_alloc() only.
+
+This change requires ____kasan_kmalloc() knowing whether the object
+belongs to a kmalloc cache.  This is implemented by adding a flag field to
+the kasan_info structure.  That flag is only set for kmalloc caches via a
+new kasan_cache_create_kmalloc() annotation.
+
+Link: https://lkml.kernel.org/r/cover.1612546384.git.andreyknvl@google.com
+Link: https://lkml.kernel.org/r/7c673ebca8d00f40a7ad6f04ab9a2bddeeae2097.1612546384.git.andreyknvl@google.com
+	Signed-off-by: Andrey Konovalov <andreyknvl@google.com>
+	Reviewed-by: Marco Elver <elver@google.com>
+	Cc: Catalin Marinas <catalin.marinas@arm.com>
+	Cc: Vincenzo Frascino <vincenzo.frascino@arm.com>
+	Cc: Dmitry Vyukov <dvyukov@google.com>
+	Cc: Alexander Potapenko <glider@google.com>
+	Cc: Will Deacon <will.deacon@arm.com>
+	Cc: Andrey Ryabinin <aryabinin@virtuozzo.com>
+	Cc: Peter Collingbourne <pcc@google.com>
+	Cc: Evgenii Stepanov <eugenis@google.com>
+	Cc: Branislav Rankov <Branislav.Rankov@arm.com>
+	Cc: Kevin Brodsky <kevin.brodsky@arm.com>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit 928501344fc645f80390afc12708c81b3595745d)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/kasan.h
+#	mm/kasan/common.c
+diff --cc include/linux/kasan.h
+index 71e7b6777f1b,3fb31e8a353e..000000000000
+--- a/include/linux/kasan.h
++++ b/include/linux/kasan.h
+@@@ -67,30 -83,189 +67,202 @@@ bool kasan_slab_free(struct kmem_cache 
+  struct kasan_cache {
+  	int alloc_meta_offset;
+  	int free_meta_offset;
++ 	bool is_kmalloc;
+  };
+  
+++<<<<<<< HEAD
+++=======
++ #ifdef CONFIG_KASAN_HW_TAGS
++ 
++ DECLARE_STATIC_KEY_FALSE(kasan_flag_enabled);
++ 
++ static __always_inline bool kasan_enabled(void)
++ {
++ 	return static_branch_likely(&kasan_flag_enabled);
++ }
++ 
++ #else /* CONFIG_KASAN_HW_TAGS */
++ 
++ static inline bool kasan_enabled(void)
++ {
++ 	return true;
++ }
++ 
++ #endif /* CONFIG_KASAN_HW_TAGS */
++ 
++ slab_flags_t __kasan_never_merge(void);
++ static __always_inline slab_flags_t kasan_never_merge(void)
++ {
++ 	if (kasan_enabled())
++ 		return __kasan_never_merge();
++ 	return 0;
++ }
++ 
++ void __kasan_unpoison_range(const void *addr, size_t size);
++ static __always_inline void kasan_unpoison_range(const void *addr, size_t size)
++ {
++ 	if (kasan_enabled())
++ 		__kasan_unpoison_range(addr, size);
++ }
++ 
++ void __kasan_alloc_pages(struct page *page, unsigned int order);
++ static __always_inline void kasan_alloc_pages(struct page *page,
++ 						unsigned int order)
++ {
++ 	if (kasan_enabled())
++ 		__kasan_alloc_pages(page, order);
++ }
++ 
++ void __kasan_free_pages(struct page *page, unsigned int order);
++ static __always_inline void kasan_free_pages(struct page *page,
++ 						unsigned int order)
++ {
++ 	if (kasan_enabled())
++ 		__kasan_free_pages(page, order);
++ }
++ 
++ void __kasan_cache_create(struct kmem_cache *cache, unsigned int *size,
++ 				slab_flags_t *flags);
++ static __always_inline void kasan_cache_create(struct kmem_cache *cache,
++ 				unsigned int *size, slab_flags_t *flags)
++ {
++ 	if (kasan_enabled())
++ 		__kasan_cache_create(cache, size, flags);
++ }
++ 
++ void __kasan_cache_create_kmalloc(struct kmem_cache *cache);
++ static __always_inline void kasan_cache_create_kmalloc(struct kmem_cache *cache)
++ {
++ 	if (kasan_enabled())
++ 		__kasan_cache_create_kmalloc(cache);
++ }
++ 
++ size_t __kasan_metadata_size(struct kmem_cache *cache);
++ static __always_inline size_t kasan_metadata_size(struct kmem_cache *cache)
++ {
++ 	if (kasan_enabled())
++ 		return __kasan_metadata_size(cache);
++ 	return 0;
++ }
++ 
++ void __kasan_poison_slab(struct page *page);
++ static __always_inline void kasan_poison_slab(struct page *page)
++ {
++ 	if (kasan_enabled())
++ 		__kasan_poison_slab(page);
++ }
++ 
++ void __kasan_unpoison_object_data(struct kmem_cache *cache, void *object);
++ static __always_inline void kasan_unpoison_object_data(struct kmem_cache *cache,
++ 							void *object)
++ {
++ 	if (kasan_enabled())
++ 		__kasan_unpoison_object_data(cache, object);
++ }
++ 
++ void __kasan_poison_object_data(struct kmem_cache *cache, void *object);
++ static __always_inline void kasan_poison_object_data(struct kmem_cache *cache,
++ 							void *object)
++ {
++ 	if (kasan_enabled())
++ 		__kasan_poison_object_data(cache, object);
++ }
++ 
++ void * __must_check __kasan_init_slab_obj(struct kmem_cache *cache,
++ 					  const void *object);
++ static __always_inline void * __must_check kasan_init_slab_obj(
++ 				struct kmem_cache *cache, const void *object)
++ {
++ 	if (kasan_enabled())
++ 		return __kasan_init_slab_obj(cache, object);
++ 	return (void *)object;
++ }
++ 
++ bool __kasan_slab_free(struct kmem_cache *s, void *object, unsigned long ip);
++ static __always_inline bool kasan_slab_free(struct kmem_cache *s, void *object)
++ {
++ 	if (kasan_enabled())
++ 		return __kasan_slab_free(s, object, _RET_IP_);
++ 	return false;
++ }
++ 
++ void __kasan_slab_free_mempool(void *ptr, unsigned long ip);
++ static __always_inline void kasan_slab_free_mempool(void *ptr)
++ {
++ 	if (kasan_enabled())
++ 		__kasan_slab_free_mempool(ptr, _RET_IP_);
++ }
++ 
++ void * __must_check __kasan_slab_alloc(struct kmem_cache *s,
++ 				       void *object, gfp_t flags);
++ static __always_inline void * __must_check kasan_slab_alloc(
++ 				struct kmem_cache *s, void *object, gfp_t flags)
++ {
++ 	if (kasan_enabled())
++ 		return __kasan_slab_alloc(s, object, flags);
++ 	return object;
++ }
++ 
++ void * __must_check __kasan_kmalloc(struct kmem_cache *s, const void *object,
++ 				    size_t size, gfp_t flags);
++ static __always_inline void * __must_check kasan_kmalloc(struct kmem_cache *s,
++ 				const void *object, size_t size, gfp_t flags)
++ {
++ 	if (kasan_enabled())
++ 		return __kasan_kmalloc(s, object, size, flags);
++ 	return (void *)object;
++ }
++ 
++ void * __must_check __kasan_kmalloc_large(const void *ptr,
++ 					  size_t size, gfp_t flags);
++ static __always_inline void * __must_check kasan_kmalloc_large(const void *ptr,
++ 						      size_t size, gfp_t flags)
++ {
++ 	if (kasan_enabled())
++ 		return __kasan_kmalloc_large(ptr, size, flags);
++ 	return (void *)ptr;
++ }
++ 
++ void * __must_check __kasan_krealloc(const void *object,
++ 				     size_t new_size, gfp_t flags);
++ static __always_inline void * __must_check kasan_krealloc(const void *object,
++ 						 size_t new_size, gfp_t flags)
++ {
++ 	if (kasan_enabled())
++ 		return __kasan_krealloc(object, new_size, flags);
++ 	return (void *)object;
++ }
++ 
++ void __kasan_kfree_large(void *ptr, unsigned long ip);
++ static __always_inline void kasan_kfree_large(void *ptr)
++ {
++ 	if (kasan_enabled())
++ 		__kasan_kfree_large(ptr, _RET_IP_);
++ }
++ 
+++>>>>>>> 928501344fc6 (kasan, mm: don't save alloc stacks twice)
+  /*
+ - * Unlike kasan_check_read/write(), kasan_check_byte() is performed even for
+ - * the hardware tag-based mode that doesn't rely on compiler instrumentation.
+ + * These functions provide a special case to support backing module
+ + * allocations with real shadow memory. With KASAN vmalloc, the special
+ + * case is unnecessary, as the work is handled in the generic case.
+   */
+ -bool __kasan_check_byte(const void *addr, unsigned long ip);
+ -static __always_inline bool kasan_check_byte(const void *addr)
+ +#ifndef CONFIG_KASAN_VMALLOC
+ +int kasan_module_alloc(void *addr, size_t size);
+ +void kasan_free_shadow(const struct vm_struct *vm);
+ +#else
+ +static inline int kasan_module_alloc(void *addr, size_t size) { return 0; }
+ +static inline void kasan_free_shadow(const struct vm_struct *vm) {}
+ +#endif
+ +
+ +int kasan_add_zero_shadow(void *start, unsigned long size);
+ +void kasan_remove_zero_shadow(void *start, unsigned long size);
+ +
+ +size_t __ksize(const void *);
+ +static inline void kasan_unpoison_slab(const void *ptr)
+  {
+ -	if (kasan_enabled())
+ -		return __kasan_check_byte(addr, _RET_IP_);
+ -	return true;
+ +	kasan_unpoison_shadow(ptr, __ksize(ptr));
+  }
+ -
+ +size_t kasan_metadata_size(struct kmem_cache *cache);
+  
+  bool kasan_save_enable_multi_shot(void);
+  void kasan_restore_multi_shot(bool enabled);
+@@@ -110,7 -286,8 +282,12 @@@ static inline void kasan_free_pages(str
+  static inline void kasan_cache_create(struct kmem_cache *cache,
+  				      unsigned int *size,
+  				      slab_flags_t *flags) {}
+++<<<<<<< HEAD
+ +
+++=======
++ static inline void kasan_cache_create_kmalloc(struct kmem_cache *cache) {}
++ static inline size_t kasan_metadata_size(struct kmem_cache *cache) { return 0; }
+++>>>>>>> 928501344fc6 (kasan, mm: don't save alloc stacks twice)
+  static inline void kasan_poison_slab(struct page *page) {}
+  static inline void kasan_unpoison_object_data(struct kmem_cache *cache,
+  					void *object) {}
+diff --cc mm/kasan/common.c
+index 0d0cb20ec1a4,d8d83ca56fe2..000000000000
+--- a/mm/kasan/common.c
++++ b/mm/kasan/common.c
+@@@ -251,38 -158,67 +251,47 @@@ void kasan_cache_create(struct kmem_cac
+  	cache->kasan_info.alloc_meta_offset = *size;
+  	*size += sizeof(struct kasan_alloc_meta);
+  
+ -	/*
+ -	 * If alloc meta doesn't fit, don't add it.
+ -	 * This can only happen with SLAB, as it has KMALLOC_MAX_SIZE equal
+ -	 * to KMALLOC_MAX_CACHE_SIZE and doesn't fall back to page_alloc for
+ -	 * larger sizes.
+ -	 */
+ -	if (*size > KMALLOC_MAX_SIZE) {
+ -		cache->kasan_info.alloc_meta_offset = 0;
+ -		*size = ok_size;
+ -		/* Continue, since free meta might still fit. */
+ +	/* Add free meta. */
+ +	if (IS_ENABLED(CONFIG_KASAN_GENERIC) &&
+ +	    (cache->flags & SLAB_TYPESAFE_BY_RCU || cache->ctor ||
+ +	     cache->object_size < sizeof(struct kasan_free_meta))) {
+ +		cache->kasan_info.free_meta_offset = *size;
+ +		*size += sizeof(struct kasan_free_meta);
+  	}
+  
+ -	/* Only the generic mode uses free meta or flexible redzones. */
+ -	if (!IS_ENABLED(CONFIG_KASAN_GENERIC)) {
+ -		cache->kasan_info.free_meta_offset = KASAN_NO_FREE_META;
+ -		return;
+ -	}
+ +	redzone_size = optimal_redzone(cache->object_size);
+ +	redzone_adjust = redzone_size -	(*size - cache->object_size);
+ +	if (redzone_adjust > 0)
+ +		*size += redzone_adjust;
+ +
+ +	*size = min_t(unsigned int, KMALLOC_MAX_SIZE,
+ +			max(*size, cache->object_size + redzone_size));
+  
+  	/*
+ -	 * Add free meta into redzone when it's not possible to store
+ -	 * it in the object. This is the case when:
+ -	 * 1. Object is SLAB_TYPESAFE_BY_RCU, which means that it can
+ -	 *    be touched after it was freed, or
+ -	 * 2. Object has a constructor, which means it's expected to
+ -	 *    retain its content until the next allocation, or
+ -	 * 3. Object is too small.
+ -	 * Otherwise cache->kasan_info.free_meta_offset = 0 is implied.
+ +	 * If the metadata doesn't fit, don't enable KASAN at all.
+  	 */
+ -	if ((cache->flags & SLAB_TYPESAFE_BY_RCU) || cache->ctor ||
+ -	    cache->object_size < sizeof(struct kasan_free_meta)) {
+ -		ok_size = *size;
+ -
+ -		cache->kasan_info.free_meta_offset = *size;
+ -		*size += sizeof(struct kasan_free_meta);
+ -
+ -		/* If free meta doesn't fit, don't add it. */
+ -		if (*size > KMALLOC_MAX_SIZE) {
+ -			cache->kasan_info.free_meta_offset = KASAN_NO_FREE_META;
+ -			*size = ok_size;
+ -		}
+ +	if (*size <= cache->kasan_info.alloc_meta_offset ||
+ +			*size <= cache->kasan_info.free_meta_offset) {
+ +		cache->kasan_info.alloc_meta_offset = 0;
+ +		cache->kasan_info.free_meta_offset = 0;
+ +		*size = orig_size;
+ +		return;
+  	}
+  
+ -	/* Calculate size with optimal redzone. */
+ -	optimal_size = cache->object_size + optimal_redzone(cache->object_size);
+ -	/* Limit it with KMALLOC_MAX_SIZE (relevant for SLAB only). */
+ -	if (optimal_size > KMALLOC_MAX_SIZE)
+ -		optimal_size = KMALLOC_MAX_SIZE;
+ -	/* Use optimal size if the size with added metas is not large enough. */
+ -	if (*size < optimal_size)
+ -		*size = optimal_size;
+ +	*flags |= SLAB_KASAN;
+  }
+  
+++<<<<<<< HEAD
+ +size_t kasan_metadata_size(struct kmem_cache *cache)
+++=======
++ void __kasan_cache_create_kmalloc(struct kmem_cache *cache)
++ {
++ 	cache->kasan_info.is_kmalloc = true;
++ }
++ 
++ size_t __kasan_metadata_size(struct kmem_cache *cache)
+++>>>>>>> 928501344fc6 (kasan, mm: don't save alloc stacks twice)
+  {
+ -	if (!kasan_stack_collection_enabled())
+ -		return 0;
+  	return (cache->kasan_info.alloc_meta_offset ?
+  		sizeof(struct kasan_alloc_meta) : 0) +
+  		(cache->kasan_info.free_meta_offset ?
+@@@ -440,18 -368,53 +449,60 @@@ static bool __kasan_slab_free(struct km
+  
+  	kasan_set_free_info(cache, object, tag);
+  
+ -	return kasan_quarantine_put(cache, object);
+ +	quarantine_put(cache, object);
+ +
+ +	return IS_ENABLED(CONFIG_KASAN_GENERIC);
+  }
+  
+ -bool __kasan_slab_free(struct kmem_cache *cache, void *object, unsigned long ip)
+ +bool kasan_slab_free(struct kmem_cache *cache, void *object, unsigned long ip)
+  {
+ -	return ____kasan_slab_free(cache, object, ip, true);
+ +	return __kasan_slab_free(cache, object, ip, true);
+  }
+  
+++<<<<<<< HEAD
+ +static void *__kasan_kmalloc(struct kmem_cache *cache, const void *object,
+ +				size_t size, gfp_t flags, bool keep_tag)
+++=======
++ void __kasan_slab_free_mempool(void *ptr, unsigned long ip)
++ {
++ 	struct page *page;
++ 
++ 	page = virt_to_head_page(ptr);
++ 
++ 	/*
++ 	 * Even though this function is only called for kmem_cache_alloc and
++ 	 * kmalloc backed mempool allocations, those allocations can still be
++ 	 * !PageSlab() when the size provided to kmalloc is larger than
++ 	 * KMALLOC_MAX_SIZE, and kmalloc falls back onto page_alloc.
++ 	 */
++ 	if (unlikely(!PageSlab(page))) {
++ 		if (ptr != page_address(page)) {
++ 			kasan_report_invalid_free(ptr, ip);
++ 			return;
++ 		}
++ 		kasan_poison(ptr, page_size(page), KASAN_FREE_PAGE);
++ 	} else {
++ 		____kasan_slab_free(page->slab_cache, ptr, ip, false);
++ 	}
++ }
++ 
++ static void set_alloc_info(struct kmem_cache *cache, void *object,
++ 				gfp_t flags, bool is_kmalloc)
++ {
++ 	struct kasan_alloc_meta *alloc_meta;
++ 
++ 	/* Don't save alloc info for kmalloc caches in kasan_slab_alloc(). */
++ 	if (cache->kasan_info.is_kmalloc && !is_kmalloc)
++ 		return;
++ 
++ 	alloc_meta = kasan_get_alloc_meta(cache, object);
++ 	if (alloc_meta)
++ 		kasan_set_track(&alloc_meta->alloc_track, flags);
++ }
++ 
++ static void *____kasan_kmalloc(struct kmem_cache *cache, const void *object,
++ 				size_t size, gfp_t flags, bool is_kmalloc)
+++>>>>>>> 928501344fc6 (kasan, mm: don't save alloc stacks twice)
+  {
+  	unsigned long redzone_start;
+  	unsigned long redzone_end;
+@@@ -463,21 -426,22 +514,31 @@@
+  	if (unlikely(object == NULL))
+  		return NULL;
+  
+ -	if (is_kfence_address(kasan_reset_tag(object)))
+ -		return (void *)object;
+ -
+  	redzone_start = round_up((unsigned long)(object + size),
+ -				KASAN_GRANULE_SIZE);
+ +				KASAN_SHADOW_SCALE_SIZE);
+  	redzone_end = round_up((unsigned long)object + cache->object_size,
+++<<<<<<< HEAD
+ +				KASAN_SHADOW_SCALE_SIZE);
+++=======
++ 				KASAN_GRANULE_SIZE);
++ 	tag = assign_tag(cache, object, false, is_kmalloc);
+++>>>>>>> 928501344fc6 (kasan, mm: don't save alloc stacks twice)
+  
+ -	/* Tag is ignored in set_tag without CONFIG_KASAN_SW/HW_TAGS */
+ -	kasan_unpoison(set_tag(object, tag), size);
+ -	kasan_poison((void *)redzone_start, redzone_end - redzone_start,
+ -			   KASAN_KMALLOC_REDZONE);
+ +	if (IS_ENABLED(CONFIG_KASAN_SW_TAGS))
+ +		tag = assign_tag(cache, object, false, keep_tag);
+  
+++<<<<<<< HEAD
+ +	/* Tag is ignored in set_tag without CONFIG_KASAN_SW_TAGS */
+ +	kasan_unpoison_shadow(set_tag(object, tag), size);
+ +	kasan_poison_shadow((void *)redzone_start, redzone_end - redzone_start,
+ +		KASAN_KMALLOC_REDZONE);
+ +
+ +	if (cache->flags & SLAB_KASAN)
+ +		kasan_set_track(&get_alloc_info(cache, object)->alloc_track, flags);
+++=======
++ 	if (kasan_stack_collection_enabled())
++ 		set_alloc_info(cache, (void *)object, flags, is_kmalloc);
+++>>>>>>> 928501344fc6 (kasan, mm: don't save alloc stacks twice)
+  
+  	return set_tag(object, tag);
+  }
+* Unmerged path include/linux/kasan.h
+* Unmerged path mm/kasan/common.c
+diff --git a/mm/slab_common.c b/mm/slab_common.c
+index b485099f723a..97a0dfc5966d 100644
+--- a/mm/slab_common.c
++++ b/mm/slab_common.c
+@@ -661,6 +661,7 @@ struct kmem_cache *__init create_kmalloc_cache(const char *name,
+ 		panic("Out of memory when creating slab %s\n", name);
+ 
+ 	create_boot_cache(s, name, size, flags, useroffset, usersize);
++	kasan_cache_create_kmalloc(s);
+ 	list_add(&s->list, &slab_caches);
+ 	s->refcount = 1;
+ 	return s;
