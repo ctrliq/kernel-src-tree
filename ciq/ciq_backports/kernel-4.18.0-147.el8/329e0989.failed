@@ -1,0 +1,295 @@
+treewide: Replace more open-coded allocation size multiplications
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-147.el8
+commit-author Kees Cook <keescook@chromium.org>
+commit 329e09893909d409039f6a79757d9b80b67efe39
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-147.el8/329e0989.failed
+
+As done treewide earlier, this catches several more open-coded
+allocation size calculations that were added to the kernel during the
+merge window. This performs the following mechanical transformations
+using Coccinelle:
+
+	kvmalloc(a * b, ...) -> kvmalloc_array(a, b, ...)
+	kvzalloc(a * b, ...) -> kvcalloc(a, b, ...)
+	devm_kzalloc(..., a * b, ...) -> devm_kcalloc(..., a, b, ...)
+
+	Signed-off-by: Kees Cook <keescook@chromium.org>
+(cherry picked from commit 329e09893909d409039f6a79757d9b80b67efe39)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/bluetooth/hci_qca.c
+#	drivers/crypto/inside-secure/safexcel.c
+#	drivers/gpu/drm/mediatek/mtk_drm_crtc.c
+#	drivers/gpu/drm/msm/disp/dpu1/dpu_io_util.c
+#	drivers/hwmon/npcm750-pwm-fan.c
+#	drivers/net/wireless/mediatek/mt76/usb.c
+#	drivers/tty/serial/qcom_geni_serial.c
+diff --cc drivers/bluetooth/hci_qca.c
+index 51790dd02afb,2fee65886d50..000000000000
+--- a/drivers/bluetooth/hci_qca.c
++++ b/drivers/bluetooth/hci_qca.c
+@@@ -1002,6 -1221,119 +1002,122 @@@ static struct hci_uart_proto qca_proto 
+  	.dequeue	= qca_dequeue,
+  };
+  
+++<<<<<<< HEAD
+++=======
++ static const struct qca_vreg_data qca_soc_data = {
++ 	.soc_type = QCA_WCN3990,
++ 	.vregs = (struct qca_vreg []) {
++ 		{ "vddio",   1800000, 1900000,  15000  },
++ 		{ "vddxo",   1800000, 1900000,  80000  },
++ 		{ "vddrf",   1300000, 1350000,  300000 },
++ 		{ "vddch0",  3300000, 3400000,  450000 },
++ 	},
++ 	.num_vregs = 4,
++ };
++ 
++ static void qca_power_shutdown(struct hci_dev *hdev)
++ {
++ 	struct hci_uart *hu = hci_get_drvdata(hdev);
++ 
++ 	host_set_baudrate(hu, 2400);
++ 	qca_send_power_pulse(hdev, QCA_WCN3990_POWEROFF_PULSE);
++ 	qca_power_setup(hu, false);
++ }
++ 
++ static int qca_enable_regulator(struct qca_vreg vregs,
++ 				struct regulator *regulator)
++ {
++ 	int ret;
++ 
++ 	ret = regulator_set_voltage(regulator, vregs.min_uV,
++ 				    vregs.max_uV);
++ 	if (ret)
++ 		return ret;
++ 
++ 	if (vregs.load_uA)
++ 		ret = regulator_set_load(regulator,
++ 					 vregs.load_uA);
++ 
++ 	if (ret)
++ 		return ret;
++ 
++ 	return regulator_enable(regulator);
++ 
++ }
++ 
++ static void qca_disable_regulator(struct qca_vreg vregs,
++ 				  struct regulator *regulator)
++ {
++ 	regulator_disable(regulator);
++ 	regulator_set_voltage(regulator, 0, vregs.max_uV);
++ 	if (vregs.load_uA)
++ 		regulator_set_load(regulator, 0);
++ 
++ }
++ 
++ static int qca_power_setup(struct hci_uart *hu, bool on)
++ {
++ 	struct qca_vreg *vregs;
++ 	struct regulator_bulk_data *vreg_bulk;
++ 	struct qca_serdev *qcadev;
++ 	int i, num_vregs, ret = 0;
++ 
++ 	qcadev = serdev_device_get_drvdata(hu->serdev);
++ 	if (!qcadev || !qcadev->bt_power || !qcadev->bt_power->vreg_data ||
++ 	    !qcadev->bt_power->vreg_bulk)
++ 		return -EINVAL;
++ 
++ 	vregs = qcadev->bt_power->vreg_data->vregs;
++ 	vreg_bulk = qcadev->bt_power->vreg_bulk;
++ 	num_vregs = qcadev->bt_power->vreg_data->num_vregs;
++ 	BT_DBG("on: %d", on);
++ 	if (on && !qcadev->bt_power->vregs_on) {
++ 		for (i = 0; i < num_vregs; i++) {
++ 			ret = qca_enable_regulator(vregs[i],
++ 						   vreg_bulk[i].consumer);
++ 			if (ret)
++ 				break;
++ 		}
++ 
++ 		if (ret) {
++ 			BT_ERR("failed to enable regulator:%s", vregs[i].name);
++ 			/* turn off regulators which are enabled */
++ 			for (i = i - 1; i >= 0; i--)
++ 				qca_disable_regulator(vregs[i],
++ 						      vreg_bulk[i].consumer);
++ 		} else {
++ 			qcadev->bt_power->vregs_on = true;
++ 		}
++ 	} else if (!on && qcadev->bt_power->vregs_on) {
++ 		/* turn off regulator in reverse order */
++ 		i = qcadev->bt_power->vreg_data->num_vregs - 1;
++ 		for ( ; i >= 0; i--)
++ 			qca_disable_regulator(vregs[i], vreg_bulk[i].consumer);
++ 
++ 		qcadev->bt_power->vregs_on = false;
++ 	}
++ 
++ 	return ret;
++ }
++ 
++ static int qca_init_regulators(struct qca_power *qca,
++ 				const struct qca_vreg *vregs, size_t num_vregs)
++ {
++ 	int i;
++ 
++ 	qca->vreg_bulk = devm_kcalloc(qca->dev, num_vregs,
++ 				      sizeof(struct regulator_bulk_data),
++ 				      GFP_KERNEL);
++ 	if (!qca->vreg_bulk)
++ 		return -ENOMEM;
++ 
++ 	for (i = 0; i < num_vregs; i++)
++ 		qca->vreg_bulk[i].supply = vregs[i].name;
++ 
++ 	return devm_regulator_bulk_get(qca->dev, num_vregs, qca->vreg_bulk);
++ }
++ 
+++>>>>>>> 329e09893909 (treewide: Replace more open-coded allocation size multiplications)
+  static int qca_serdev_probe(struct serdev_device *serdev)
+  {
+  	struct qca_serdev *qcadev;
+diff --cc drivers/crypto/inside-secure/safexcel.c
+index 4e86f864a952,86c699c14f84..000000000000
+--- a/drivers/crypto/inside-secure/safexcel.c
++++ b/drivers/crypto/inside-secure/safexcel.c
+@@@ -957,6 -1044,14 +957,17 @@@ static int safexcel_probe(struct platfo
+  
+  	safexcel_configure(priv);
+  
+++<<<<<<< HEAD
+++=======
++ 	priv->ring = devm_kcalloc(dev, priv->config.rings,
++ 				  sizeof(*priv->ring),
++ 				  GFP_KERNEL);
++ 	if (!priv->ring) {
++ 		ret = -ENOMEM;
++ 		goto err_reg_clk;
++ 	}
++ 
+++>>>>>>> 329e09893909 (treewide: Replace more open-coded allocation size multiplications)
+  	for (i = 0; i < priv->config.rings; i++) {
+  		char irq_name[6] = {0}; /* "ringX\0" */
+  		char wq_name[9] = {0}; /* "wq_ringX\0" */
+@@@ -969,6 -1064,15 +980,18 @@@
+  		if (ret)
+  			goto err_reg_clk;
+  
+++<<<<<<< HEAD
+++=======
++ 		priv->ring[i].rdr_req = devm_kcalloc(dev,
++ 			EIP197_DEFAULT_RING_SIZE,
++ 			sizeof(priv->ring[i].rdr_req),
++ 			GFP_KERNEL);
++ 		if (!priv->ring[i].rdr_req) {
++ 			ret = -ENOMEM;
++ 			goto err_reg_clk;
++ 		}
++ 
+++>>>>>>> 329e09893909 (treewide: Replace more open-coded allocation size multiplications)
+  		ring_irq = devm_kzalloc(dev, sizeof(*ring_irq), GFP_KERNEL);
+  		if (!ring_irq) {
+  			ret = -ENOMEM;
+diff --cc drivers/gpu/drm/mediatek/mtk_drm_crtc.c
+index 658b8dd45b83,92ecb9bf982c..000000000000
+--- a/drivers/gpu/drm/mediatek/mtk_drm_crtc.c
++++ b/drivers/gpu/drm/mediatek/mtk_drm_crtc.c
+@@@ -595,7 -599,12 +595,16 @@@ int mtk_drm_crtc_create(struct drm_devi
+  		mtk_crtc->ddp_comp[i] = comp;
+  	}
+  
+++<<<<<<< HEAD
+ +	for (zpos = 0; zpos < OVL_LAYER_NR; zpos++) {
+++=======
++ 	mtk_crtc->layer_nr = mtk_ddp_comp_layer_nr(mtk_crtc->ddp_comp[0]);
++ 	mtk_crtc->planes = devm_kcalloc(dev, mtk_crtc->layer_nr,
++ 					sizeof(struct drm_plane),
++ 					GFP_KERNEL);
++ 
++ 	for (zpos = 0; zpos < mtk_crtc->layer_nr; zpos++) {
+++>>>>>>> 329e09893909 (treewide: Replace more open-coded allocation size multiplications)
+  		type = (zpos == 0) ? DRM_PLANE_TYPE_PRIMARY :
+  				(zpos == 1) ? DRM_PLANE_TYPE_CURSOR :
+  						DRM_PLANE_TYPE_OVERLAY;
+diff --cc drivers/tty/serial/qcom_geni_serial.c
+index c62e17c85f57,1515074e18fb..000000000000
+--- a/drivers/tty/serial/qcom_geni_serial.c
++++ b/drivers/tty/serial/qcom_geni_serial.c
+@@@ -738,6 -867,12 +738,15 @@@ static int qcom_geni_serial_port_setup(
+  						false, false, true);
+  	geni_se_init(&port->se, port->rx_wm, port->rx_rfr);
+  	geni_se_select_mode(&port->se, port->xfer_mode);
+++<<<<<<< HEAD
+++=======
++ 	if (!uart_console(uport)) {
++ 		port->rx_fifo = devm_kcalloc(uport->dev,
++ 			port->rx_fifo_depth, sizeof(u32), GFP_KERNEL);
++ 		if (!port->rx_fifo)
++ 			return -ENOMEM;
++ 	}
+++>>>>>>> 329e09893909 (treewide: Replace more open-coded allocation size multiplications)
+  	port->setup = true;
+  	return 0;
+  }
+* Unmerged path drivers/gpu/drm/msm/disp/dpu1/dpu_io_util.c
+* Unmerged path drivers/hwmon/npcm750-pwm-fan.c
+* Unmerged path drivers/net/wireless/mediatek/mt76/usb.c
+* Unmerged path drivers/bluetooth/hci_qca.c
+* Unmerged path drivers/crypto/inside-secure/safexcel.c
+* Unmerged path drivers/gpu/drm/mediatek/mtk_drm_crtc.c
+* Unmerged path drivers/gpu/drm/msm/disp/dpu1/dpu_io_util.c
+* Unmerged path drivers/hwmon/npcm750-pwm-fan.c
+diff --git a/drivers/md/dm-integrity.c b/drivers/md/dm-integrity.c
+index 9db219e89949..e19054e4b5e5 100644
+--- a/drivers/md/dm-integrity.c
++++ b/drivers/md/dm-integrity.c
+@@ -3473,7 +3473,8 @@ static int dm_integrity_ctr(struct dm_target *ti, unsigned argc, char **argv)
+ 			r = -ENOMEM;
+ 			goto bad;
+ 		}
+-		ic->recalc_tags = kvmalloc((RECALC_SECTORS >> ic->sb->log2_sectors_per_block) * ic->tag_size, GFP_KERNEL);
++		ic->recalc_tags = kvmalloc_array(RECALC_SECTORS >> ic->sb->log2_sectors_per_block,
++						 ic->tag_size, GFP_KERNEL);
+ 		if (!ic->recalc_tags) {
+ 			ti->error = "Cannot allocate tags for recalculating";
+ 			r = -ENOMEM;
+* Unmerged path drivers/net/wireless/mediatek/mt76/usb.c
+diff --git a/drivers/pci/controller/pcie-cadence.c b/drivers/pci/controller/pcie-cadence.c
+index 5865512ee61c..cd795f6fc1e2 100644
+--- a/drivers/pci/controller/pcie-cadence.c
++++ b/drivers/pci/controller/pcie-cadence.c
+@@ -180,11 +180,11 @@ int cdns_pcie_init_phy(struct device *dev, struct cdns_pcie *pcie)
+ 		return 0;
+ 	}
+ 
+-	phy = devm_kzalloc(dev, sizeof(*phy) * phy_count, GFP_KERNEL);
++	phy = devm_kcalloc(dev, phy_count, sizeof(*phy), GFP_KERNEL);
+ 	if (!phy)
+ 		return -ENOMEM;
+ 
+-	link = devm_kzalloc(dev, sizeof(*link) * phy_count, GFP_KERNEL);
++	link = devm_kcalloc(dev, phy_count, sizeof(*link), GFP_KERNEL);
+ 	if (!link)
+ 		return -ENOMEM;
+ 
+* Unmerged path drivers/tty/serial/qcom_geni_serial.c
+diff --git a/net/sched/sch_cake.c b/net/sched/sch_cake.c
+index dc539295ae65..b910cd5c56f7 100644
+--- a/net/sched/sch_cake.c
++++ b/net/sched/sch_cake.c
+@@ -2644,7 +2644,7 @@ static int cake_init(struct Qdisc *sch, struct nlattr *opt,
+ 	for (i = 1; i <= CAKE_QUEUES; i++)
+ 		quantum_div[i] = 65535 / i;
+ 
+-	q->tins = kvzalloc(CAKE_MAX_TINS * sizeof(struct cake_tin_data),
++	q->tins = kvcalloc(CAKE_MAX_TINS, sizeof(struct cake_tin_data),
+ 			   GFP_KERNEL);
+ 	if (!q->tins)
+ 		goto nomem;
