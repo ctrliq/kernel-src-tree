@@ -1,0 +1,254 @@
+net/mlx5: E-Switch, Rename esw attr mirror count field
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-147.el8
+commit-author Eli Britstein <elibr@mellanox.com>
+commit e85e02bad29e822c3ebde80e7c9e7428329c4a5b
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-147.el8/e85e02ba.failed
+
+The mirror count esw attributes field is used to determine if splitting
+the rule to two FTEs is required while programming e-switch mirroring.
+Rename it to split count, making it clearer with no functional change.
+
+	Signed-off-by: Eli Britstein <elibr@mellanox.com>
+	Reviewed-by: Or Gerlitz <ogerlitz@mellanox.com>
+	Reviewed-by: Oz Shlomo <ozsh@mellanox.com>
+	Signed-off-by: Saeed Mahameed <saeedm@mellanox.com>
+(cherry picked from commit e85e02bad29e822c3ebde80e7c9e7428329c4a5b)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/mellanox/mlx5/core/en_tc.c
+diff --cc drivers/net/ethernet/mellanox/mlx5/core/en_tc.c
+index c9ee89f4edb1,342f807543a0..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_tc.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_tc.c
+@@@ -817,17 -823,87 +817,87 @@@ static int mlx5e_attach_encap(struct ml
+  			      struct ip_tunnel_info *tun_info,
+  			      struct net_device *mirred_dev,
+  			      struct net_device **encap_dev,
+ -			      struct mlx5e_tc_flow *flow,
+ -			      struct netlink_ext_ack *extack);
+ +			      struct mlx5e_tc_flow *flow);
+  
+  static struct mlx5_flow_handle *
+++<<<<<<< HEAD
+++=======
++ mlx5e_tc_offload_fdb_rules(struct mlx5_eswitch *esw,
++ 			   struct mlx5e_tc_flow *flow,
++ 			   struct mlx5_flow_spec *spec,
++ 			   struct mlx5_esw_flow_attr *attr)
++ {
++ 	struct mlx5_flow_handle *rule;
++ 
++ 	rule = mlx5_eswitch_add_offloaded_rule(esw, spec, attr);
++ 	if (IS_ERR(rule))
++ 		return rule;
++ 
++ 	if (attr->split_count) {
++ 		flow->rule[1] = mlx5_eswitch_add_fwd_rule(esw, spec, attr);
++ 		if (IS_ERR(flow->rule[1])) {
++ 			mlx5_eswitch_del_offloaded_rule(esw, rule, attr);
++ 			return flow->rule[1];
++ 		}
++ 	}
++ 
++ 	flow->flags |= MLX5E_TC_FLOW_OFFLOADED;
++ 	return rule;
++ }
++ 
++ static void
++ mlx5e_tc_unoffload_fdb_rules(struct mlx5_eswitch *esw,
++ 			     struct mlx5e_tc_flow *flow,
++ 			   struct mlx5_esw_flow_attr *attr)
++ {
++ 	flow->flags &= ~MLX5E_TC_FLOW_OFFLOADED;
++ 
++ 	if (attr->split_count)
++ 		mlx5_eswitch_del_fwd_rule(esw, flow->rule[1], attr);
++ 
++ 	mlx5_eswitch_del_offloaded_rule(esw, flow->rule[0], attr);
++ }
++ 
++ static struct mlx5_flow_handle *
++ mlx5e_tc_offload_to_slow_path(struct mlx5_eswitch *esw,
++ 			      struct mlx5e_tc_flow *flow,
++ 			      struct mlx5_flow_spec *spec,
++ 			      struct mlx5_esw_flow_attr *slow_attr)
++ {
++ 	struct mlx5_flow_handle *rule;
++ 
++ 	memcpy(slow_attr, flow->esw_attr, sizeof(*slow_attr));
++ 	slow_attr->action = MLX5_FLOW_CONTEXT_ACTION_FWD_DEST,
++ 	slow_attr->split_count = 0,
++ 	slow_attr->dest_chain = FDB_SLOW_PATH_CHAIN,
++ 
++ 	rule = mlx5e_tc_offload_fdb_rules(esw, flow, spec, slow_attr);
++ 	if (!IS_ERR(rule))
++ 		flow->flags |= MLX5E_TC_FLOW_SLOW;
++ 
++ 	return rule;
++ }
++ 
++ static void
++ mlx5e_tc_unoffload_from_slow_path(struct mlx5_eswitch *esw,
++ 				  struct mlx5e_tc_flow *flow,
++ 				  struct mlx5_esw_flow_attr *slow_attr)
++ {
++ 	memcpy(slow_attr, flow->esw_attr, sizeof(*slow_attr));
++ 	mlx5e_tc_unoffload_fdb_rules(esw, flow, slow_attr);
++ 	flow->flags &= ~MLX5E_TC_FLOW_SLOW;
++ }
++ 
++ static int
+++>>>>>>> e85e02bad29e (net/mlx5: E-Switch, Rename esw attr mirror count field)
+  mlx5e_tc_add_fdb_flow(struct mlx5e_priv *priv,
+  		      struct mlx5e_tc_flow_parse_attr *parse_attr,
+ -		      struct mlx5e_tc_flow *flow,
+ -		      struct netlink_ext_ack *extack)
+ +		      struct mlx5e_tc_flow *flow)
+  {
+  	struct mlx5_eswitch *esw = priv->mdev->priv.eswitch;
+ -	u32 max_chain = mlx5_eswitch_get_chain_range(esw);
+  	struct mlx5_esw_flow_attr *attr = flow->esw_attr;
+ -	u16 max_prio = mlx5_eswitch_get_prio_range(esw);
+  	struct net_device *out_dev, *encap_dev = NULL;
+ +	struct mlx5_flow_handle *rule = NULL;
+  	struct mlx5_fc *counter = NULL;
+  	struct mlx5e_rep_priv *rpriv;
+  	struct mlx5e_priv *out_priv;
+@@@ -2694,24 -2506,12 +2764,33 @@@ static int parse_tc_fdb_actions(struct 
+  		}
+  
+  		if (is_tcf_vlan(a)) {
+++<<<<<<< HEAD
+ +			if (tcf_vlan_action(a) == TCA_VLAN_ACT_POP) {
+ +				action |= MLX5_FLOW_CONTEXT_ACTION_VLAN_POP;
+ +			} else if (tcf_vlan_action(a) == TCA_VLAN_ACT_PUSH) {
+ +				action |= MLX5_FLOW_CONTEXT_ACTION_VLAN_PUSH;
+ +				attr->vlan_vid = tcf_vlan_push_vid(a);
+ +				if (mlx5_eswitch_vlan_actions_supported(priv->mdev)) {
+ +					attr->vlan_prio = tcf_vlan_push_prio(a);
+ +					attr->vlan_proto = tcf_vlan_push_proto(a);
+ +					if (!attr->vlan_proto)
+ +						attr->vlan_proto = htons(ETH_P_8021Q);
+ +				} else if (tcf_vlan_push_proto(a) != htons(ETH_P_8021Q) ||
+ +					   tcf_vlan_push_prio(a)) {
+ +					return -EOPNOTSUPP;
+ +				}
+ +			} else { /* action is TCA_VLAN_ACT_MODIFY */
+ +				return -EOPNOTSUPP;
+ +			}
+ +			attr->mirror_count = attr->out_count;
+++=======
++ 			err = parse_tc_vlan_action(priv, a, attr, &action);
++ 
++ 			if (err)
++ 				return err;
++ 
++ 			attr->split_count = attr->out_count;
+++>>>>>>> e85e02bad29e (net/mlx5: E-Switch, Rename esw attr mirror count field)
+  			continue;
+  		}
+  
+@@@ -2724,10 -2543,12 +2803,16 @@@
+  	}
+  
+  	attr->action = action;
+ -	if (!actions_match_supported(priv, exts, parse_attr, flow, extack))
+ +	if (!actions_match_supported(priv, exts, parse_attr, flow))
+  		return -EOPNOTSUPP;
+  
+++<<<<<<< HEAD
+ +	if (attr->mirror_count > 0 && !mlx5_esw_has_fwd_fdb(priv->mdev)) {
+++=======
++ 	if (attr->split_count > 0 && !mlx5_esw_has_fwd_fdb(priv->mdev)) {
++ 		NL_SET_ERR_MSG_MOD(extack,
++ 				   "current firmware doesn't support split rule for port mirroring");
+++>>>>>>> e85e02bad29e (net/mlx5: E-Switch, Rename esw attr mirror count field)
+  		netdev_warn_once(priv->netdev, "current firmware doesn't support split rule for port mirroring\n");
+  		return -EOPNOTSUPP;
+  	}
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/en_tc.c
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/eswitch.h b/drivers/net/ethernet/mellanox/mlx5/core/eswitch.h
+index de691a49ed92..9db147ea5e97 100644
+--- a/drivers/net/ethernet/mellanox/mlx5/core/eswitch.h
++++ b/drivers/net/ethernet/mellanox/mlx5/core/eswitch.h
+@@ -286,7 +286,7 @@ struct mlx5_esw_flow_attr {
+ 	struct mlx5_core_dev	*out_mdev[MLX5_MAX_FLOW_FWD_VPORTS];
+ 	struct mlx5_core_dev	*in_mdev;
+ 
+-	int mirror_count;
++	int split_count;
+ 	int out_count;
+ 
+ 	int	action;
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/eswitch_offloads.c b/drivers/net/ethernet/mellanox/mlx5/core/eswitch_offloads.c
+index 828174ece8e4..f302dc837436 100644
+--- a/drivers/net/ethernet/mellanox/mlx5/core/eswitch_offloads.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/eswitch_offloads.c
+@@ -81,7 +81,7 @@ mlx5_eswitch_add_offloaded_rule(struct mlx5_eswitch *esw,
+ {
+ 	struct mlx5_flow_destination dest[MLX5_MAX_FLOW_FWD_VPORTS + 1] = {};
+ 	struct mlx5_flow_act flow_act = { .flags = FLOW_ACT_NO_APPEND, };
+-	bool mirror = !!(attr->mirror_count);
++	bool split = !!(attr->split_count);
+ 	struct mlx5_flow_handle *rule;
+ 	struct mlx5_flow_table *fdb;
+ 	int j, i = 0;
+@@ -115,7 +115,7 @@ mlx5_eswitch_add_offloaded_rule(struct mlx5_eswitch *esw,
+ 			dest[i].ft = ft;
+ 			i++;
+ 		} else {
+-			for (j = attr->mirror_count; j < attr->out_count; j++) {
++			for (j = attr->split_count; j < attr->out_count; j++) {
+ 				dest[i].type = MLX5_FLOW_DESTINATION_TYPE_VPORT;
+ 				dest[i].vport.num = attr->out_rep[j]->vport;
+ 				dest[i].vport.vhca_id =
+@@ -162,7 +162,7 @@ mlx5_eswitch_add_offloaded_rule(struct mlx5_eswitch *esw,
+ 	if (flow_act.action & MLX5_FLOW_CONTEXT_ACTION_PACKET_REFORMAT)
+ 		flow_act.reformat_id = attr->encap_id;
+ 
+-	fdb = esw_get_prio_table(esw, attr->chain, attr->prio, !!mirror);
++	fdb = esw_get_prio_table(esw, attr->chain, attr->prio, !!split);
+ 	if (IS_ERR(fdb)) {
+ 		rule = ERR_CAST(fdb);
+ 		goto err_esw_get;
+@@ -177,7 +177,7 @@ mlx5_eswitch_add_offloaded_rule(struct mlx5_eswitch *esw,
+ 	return rule;
+ 
+ err_add_rule:
+-	esw_put_prio_table(esw, attr->chain, attr->prio, !!mirror);
++	esw_put_prio_table(esw, attr->chain, attr->prio, !!split);
+ err_esw_get:
+ 	if (attr->dest_chain)
+ 		esw_put_prio_table(esw, attr->dest_chain, 1, 0);
+@@ -211,7 +211,7 @@ mlx5_eswitch_add_fwd_rule(struct mlx5_eswitch *esw,
+ 	}
+ 
+ 	flow_act.action = MLX5_FLOW_CONTEXT_ACTION_FWD_DEST;
+-	for (i = 0; i < attr->mirror_count; i++) {
++	for (i = 0; i < attr->split_count; i++) {
+ 		dest[i].type = MLX5_FLOW_DESTINATION_TYPE_VPORT;
+ 		dest[i].vport.num = attr->out_rep[i]->vport;
+ 		dest[i].vport.vhca_id =
+@@ -265,7 +265,7 @@ __mlx5_eswitch_del_rule(struct mlx5_eswitch *esw,
+ 			struct mlx5_esw_flow_attr *attr,
+ 			bool fwd_rule)
+ {
+-	bool mirror = (attr->mirror_count > 0);
++	bool split = (attr->split_count > 0);
+ 
+ 	mlx5_del_flow_rules(rule);
+ 	esw->offloads.num_flows--;
+@@ -274,7 +274,7 @@ __mlx5_eswitch_del_rule(struct mlx5_eswitch *esw,
+ 		esw_put_prio_table(esw, attr->chain, attr->prio, 1);
+ 		esw_put_prio_table(esw, attr->chain, attr->prio, 0);
+ 	} else {
+-		esw_put_prio_table(esw, attr->chain, attr->prio, !!mirror);
++		esw_put_prio_table(esw, attr->chain, attr->prio, !!split);
+ 		if (attr->dest_chain)
+ 			esw_put_prio_table(esw, attr->dest_chain, 1, 0);
+ 	}
