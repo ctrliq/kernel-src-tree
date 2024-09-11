@@ -1,0 +1,248 @@
+skmsg: Lose offset info in sk_psock_skb_ingress
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-365.el8
+commit-author Liu Jian <liujian56@huawei.com>
+commit 7303524e04af49a47991e19f895c3b8cdc3796c7
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-365.el8/7303524e.failed
+
+If sockmap enable strparser, there are lose offset info in
+sk_psock_skb_ingress(). If the length determined by parse_msg function is not
+skb->len, the skb will be converted to sk_msg multiple times, and userspace
+app will get the data multiple times.
+
+Fix this by get the offset and length from strp_msg. And as Cong suggested,
+add one bit in skb->_sk_redir to distinguish enable or disable strparser.
+
+Fixes: 604326b41a6fb ("bpf, sockmap: convert to generic sk_msg interface")
+	Signed-off-by: Liu Jian <liujian56@huawei.com>
+	Signed-off-by: Daniel Borkmann <daniel@iogearbox.net>
+	Reviewed-by: Cong Wang <cong.wang@bytedance.com>
+	Acked-by: John Fastabend <john.fastabend@gmail.com>
+Link: https://lore.kernel.org/bpf/20211029141216.211899-1-liujian56@huawei.com
+(cherry picked from commit 7303524e04af49a47991e19f895c3b8cdc3796c7)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/skmsg.h
+#	net/core/skmsg.c
+diff --cc include/linux/skmsg.h
+index a85cacd89635,94e2a1f6e58d..000000000000
+--- a/include/linux/skmsg.h
++++ b/include/linux/skmsg.h
+@@@ -442,6 -503,58 +442,61 @@@ static inline bool sk_psock_strp_enable
+  {
+  	if (!psock)
+  		return false;
+ -	return !!psock->saved_data_ready;
+ +	return psock->parser.enabled;
+  }
+++<<<<<<< HEAD
+++=======
++ 
++ #if IS_ENABLED(CONFIG_NET_SOCK_MSG)
++ 
++ #define BPF_F_STRPARSER	(1UL << 1)
++ 
++ /* We only have two bits so far. */
++ #define BPF_F_PTR_MASK ~(BPF_F_INGRESS | BPF_F_STRPARSER)
++ 
++ static inline bool skb_bpf_strparser(const struct sk_buff *skb)
++ {
++ 	unsigned long sk_redir = skb->_sk_redir;
++ 
++ 	return sk_redir & BPF_F_STRPARSER;
++ }
++ 
++ static inline void skb_bpf_set_strparser(struct sk_buff *skb)
++ {
++ 	skb->_sk_redir |= BPF_F_STRPARSER;
++ }
++ 
++ static inline bool skb_bpf_ingress(const struct sk_buff *skb)
++ {
++ 	unsigned long sk_redir = skb->_sk_redir;
++ 
++ 	return sk_redir & BPF_F_INGRESS;
++ }
++ 
++ static inline void skb_bpf_set_ingress(struct sk_buff *skb)
++ {
++ 	skb->_sk_redir |= BPF_F_INGRESS;
++ }
++ 
++ static inline void skb_bpf_set_redir(struct sk_buff *skb, struct sock *sk_redir,
++ 				     bool ingress)
++ {
++ 	skb->_sk_redir = (unsigned long)sk_redir;
++ 	if (ingress)
++ 		skb->_sk_redir |= BPF_F_INGRESS;
++ }
++ 
++ static inline struct sock *skb_bpf_redirect_fetch(const struct sk_buff *skb)
++ {
++ 	unsigned long sk_redir = skb->_sk_redir;
++ 
++ 	return (struct sock *)(sk_redir & BPF_F_PTR_MASK);
++ }
++ 
++ static inline void skb_bpf_redirect_clear(struct sk_buff *skb)
++ {
++ 	skb->_sk_redir = 0;
++ }
++ #endif /* CONFIG_NET_SOCK_MSG */
+++>>>>>>> 7303524e04af (skmsg: Lose offset info in sk_psock_skb_ingress)
+  #endif /* _LINUX_SKMSG_H */
+diff --cc net/core/skmsg.c
+index fb0aaeba0a6e,9701a1404ccb..000000000000
+--- a/net/core/skmsg.c
++++ b/net/core/skmsg.c
+@@@ -504,11 -583,27 +508,11 @@@ static int sk_psock_handle_skb(struct s
+  	if (!ingress) {
+  		if (!sock_writeable(psock->sk))
+  			return -EAGAIN;
+ -		return skb_send_sock(psock->sk, skb, off, len);
+ +		return skb_send_sock_locked(psock->sk, skb, off, len);
+  	}
+- 	return sk_psock_skb_ingress(psock, skb);
++ 	return sk_psock_skb_ingress(psock, skb, off, len);
+  }
+  
+ -static void sk_psock_skb_state(struct sk_psock *psock,
+ -			       struct sk_psock_work_state *state,
+ -			       struct sk_buff *skb,
+ -			       int len, int off)
+ -{
+ -	spin_lock_bh(&psock->ingress_lock);
+ -	if (sk_psock_test_state(psock, SK_PSOCK_TX_ENABLED)) {
+ -		state->skb = skb;
+ -		state->len = len;
+ -		state->off = off;
+ -	} else {
+ -		sock_drop(psock->sk, skb);
+ -	}
+ -	spin_unlock_bh(&psock->ingress_lock);
+ -}
+ -
+  static void sk_psock_backlog(struct work_struct *work)
+  {
+  	struct sk_psock *psock = container_of(work, struct sk_psock, work);
+@@@ -531,11 -628,18 +535,17 @@@
+  	while ((skb = skb_dequeue(&psock->ingress_skb))) {
+  		len = skb->len;
+  		off = 0;
++ 		if (skb_bpf_strparser(skb)) {
++ 			struct strp_msg *stm = strp_msg(skb);
++ 
++ 			off = stm->offset;
++ 			len = stm->full_len;
++ 		}
+  start:
+ -		ingress = skb_bpf_ingress(skb);
+ -		skb_bpf_redirect_clear(skb);
+ +		ingress = tcp_skb_bpf_ingress(skb);
+  		do {
+  			ret = -EIO;
+ -			if (!sock_flag(psock->sk, SOCK_DEAD))
+ +			if (likely(psock->sk->sk_socket))
+  				ret = sk_psock_handle_skb(psock, skb, off,
+  							  len, ingress);
+  			if (ret <= 0) {
+@@@ -774,8 -873,9 +784,14 @@@ static void sk_psock_skb_redirect(struc
+  	 * return code, but then didn't set a redirect interface.
+  	 */
+  	if (unlikely(!sk_other)) {
+++<<<<<<< HEAD
+ +		kfree_skb(skb);
+ +		return;
+++=======
++ 		skb_bpf_redirect_clear(skb);
++ 		sock_drop(from->sk, skb);
++ 		return -EIO;
+++>>>>>>> 7303524e04af (skmsg: Lose offset info in sk_psock_skb_ingress)
+  	}
+  	psock_other = sk_psock(sk_other);
+  	/* This error indicates the socket is being torn down or had another
+@@@ -825,12 -936,12 +841,17 @@@ int sk_psock_tls_strp_read(struct sk_ps
+  }
+  EXPORT_SYMBOL_GPL(sk_psock_tls_strp_read);
+  
+ -static int sk_psock_verdict_apply(struct sk_psock *psock, struct sk_buff *skb,
+ -				  int verdict)
+ +static void sk_psock_verdict_apply(struct sk_psock *psock,
+ +				   struct sk_buff *skb, int verdict)
+  {
+ +	struct tcp_skb_cb *tcp;
+  	struct sock *sk_other;
+++<<<<<<< HEAD
+ +	int err = -EIO;
+++=======
++ 	int err = 0;
++ 	u32 len, off;
+++>>>>>>> 7303524e04af (skmsg: Lose offset info in sk_psock_skb_ingress)
+  
+  	switch (verdict) {
+  	case __SK_PASS:
+@@@ -850,11 -962,28 +872,19 @@@
+  		 * retrying later from workqueue.
+  		 */
+  		if (skb_queue_empty(&psock->ingress_skb)) {
+- 			err = sk_psock_skb_ingress_self(psock, skb);
++ 			len = skb->len;
++ 			off = 0;
++ 			if (skb_bpf_strparser(skb)) {
++ 				struct strp_msg *stm = strp_msg(skb);
++ 
++ 				off = stm->offset;
++ 				len = stm->full_len;
++ 			}
++ 			err = sk_psock_skb_ingress_self(psock, skb, off, len);
+  		}
+  		if (err < 0) {
+ -			spin_lock_bh(&psock->ingress_lock);
+ -			if (sk_psock_test_state(psock, SK_PSOCK_TX_ENABLED)) {
+ -				skb_queue_tail(&psock->ingress_skb, skb);
+ -				schedule_work(&psock->work);
+ -				err = 0;
+ -			}
+ -			spin_unlock_bh(&psock->ingress_lock);
+ -			if (err < 0) {
+ -				skb_bpf_redirect_clear(skb);
+ -				goto out_free;
+ -			}
+ +			skb_queue_tail(&psock->ingress_skb, skb);
+ +			schedule_work(&psock->work);
+  		}
+  		break;
+  	case __SK_REDIRECT:
+@@@ -879,15 -1027,18 +909,24 @@@ static void sk_psock_strp_read(struct s
+  	sk = strp->sk;
+  	psock = sk_psock(sk);
+  	if (unlikely(!psock)) {
+ -		sock_drop(sk, skb);
+ +		kfree_skb(skb);
+  		goto out;
+  	}
+ -	prog = READ_ONCE(psock->progs.stream_verdict);
+ +	prog = READ_ONCE(psock->progs.skb_verdict);
+  	if (likely(prog)) {
+  		skb->sk = sk;
+++<<<<<<< HEAD
+ +		tcp_skb_bpf_redirect_clear(skb);
+ +		ret = sk_psock_bpf_run(psock, prog, skb);
+ +		ret = sk_psock_map_verd(ret, tcp_skb_bpf_redirect_fetch(skb));
+++=======
++ 		skb_dst_drop(skb);
++ 		skb_bpf_redirect_clear(skb);
++ 		ret = bpf_prog_run_pin_on_cpu(prog, skb);
++ 		if (ret == SK_PASS)
++ 			skb_bpf_set_strparser(skb);
++ 		ret = sk_psock_map_verd(ret, skb_bpf_redirect_fetch(skb));
+++>>>>>>> 7303524e04af (skmsg: Lose offset info in sk_psock_skb_ingress)
+  		skb->sk = NULL;
+  	}
+  	sk_psock_verdict_apply(psock, skb, ret);
+* Unmerged path include/linux/skmsg.h
+* Unmerged path net/core/skmsg.c
