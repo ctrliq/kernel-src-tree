@@ -1,0 +1,412 @@
+xhci: split handling halted endpoints into two steps
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-326.el8
+commit-author Mathias Nyman <mathias.nyman@linux.intel.com>
+commit 674f8438c12125d6b4fe51d44b9316bb02b286b5
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-326.el8/674f8438.failed
+
+Don't queue both a reset endpoint command and a
+set TR deq command at once when handling a halted endpoint.
+
+split this into two steps.
+Initially only queue a reset endpoint command, and then if needed queue a
+set TR deq command in the reset endpoint handler.
+
+Note: This removes the RESET_EP_QUIRK handling which was added in
+commit ac9d8fe7c6a8 ("USB: xhci: Add quirk for Fresco Logic xHCI hardware.")
+
+This quirk was added in 2009 for prototype xHCI hardware meant for
+evaluation purposes only, and should not reach consumers.
+This hardware could not handle two commands queued at once, and had
+bad data in the output context after a reset endpoint command.
+
+After this patch two command are no longer queued at once, so that
+part is solved  in this rewrite, but the workaround for bad data in the
+output context solved by issuing an extra configure endpoint command is
+bluntly removed.
+
+Adding this workaround to the new rewrite just adds complexity, and I
+think it's time to let this quirk go.
+Print a debug message instead.
+
+	Signed-off-by: Mathias Nyman <mathias.nyman@linux.intel.com>
+Link: https://lore.kernel.org/r/20210129130044.206855-22-mathias.nyman@linux.intel.com
+	Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+(cherry picked from commit 674f8438c12125d6b4fe51d44b9316bb02b286b5)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/usb/host/xhci-ring.c
+#	drivers/usb/host/xhci.h
+diff --cc drivers/usb/host/xhci-ring.c
+index bd30ef5cce7a,0788ee977557..000000000000
+--- a/drivers/usb/host/xhci-ring.c
++++ b/drivers/usb/host/xhci-ring.c
+@@@ -749,6 -749,131 +749,134 @@@ static void xhci_unmap_td_bounce_buffer
+  	seg->bounce_offs = 0;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static int xhci_td_cleanup(struct xhci_hcd *xhci, struct xhci_td *td,
++ 			   struct xhci_ring *ep_ring, int status)
++ {
++ 	struct urb *urb = NULL;
++ 
++ 	/* Clean up the endpoint's TD list */
++ 	urb = td->urb;
++ 
++ 	/* if a bounce buffer was used to align this td then unmap it */
++ 	xhci_unmap_td_bounce_buffer(xhci, ep_ring, td);
++ 
++ 	/* Do one last check of the actual transfer length.
++ 	 * If the host controller said we transferred more data than the buffer
++ 	 * length, urb->actual_length will be a very big number (since it's
++ 	 * unsigned).  Play it safe and say we didn't transfer anything.
++ 	 */
++ 	if (urb->actual_length > urb->transfer_buffer_length) {
++ 		xhci_warn(xhci, "URB req %u and actual %u transfer length mismatch\n",
++ 			  urb->transfer_buffer_length, urb->actual_length);
++ 		urb->actual_length = 0;
++ 		status = 0;
++ 	}
++ 	/* TD might be removed from td_list if we are giving back a cancelled URB */
++ 	if (!list_empty(&td->td_list))
++ 		list_del_init(&td->td_list);
++ 	/* Giving back a cancelled URB, or if a slated TD completed anyway */
++ 	if (!list_empty(&td->cancelled_td_list))
++ 		list_del_init(&td->cancelled_td_list);
++ 
++ 	inc_td_cnt(urb);
++ 	/* Giveback the urb when all the tds are completed */
++ 	if (last_td_in_urb(td)) {
++ 		if ((urb->actual_length != urb->transfer_buffer_length &&
++ 		     (urb->transfer_flags & URB_SHORT_NOT_OK)) ||
++ 		    (status != 0 && !usb_endpoint_xfer_isoc(&urb->ep->desc)))
++ 			xhci_dbg(xhci, "Giveback URB %p, len = %d, expected = %d, status = %d\n",
++ 				 urb, urb->actual_length,
++ 				 urb->transfer_buffer_length, status);
++ 
++ 		/* set isoc urb status to 0 just as EHCI, UHCI, and OHCI */
++ 		if (usb_pipetype(urb->pipe) == PIPE_ISOCHRONOUS)
++ 			status = 0;
++ 		xhci_giveback_urb_in_irq(xhci, td, status);
++ 	}
++ 
++ 	return 0;
++ }
++ 
++ 
++ /* Complete the cancelled URBs we unlinked from td_list. */
++ static void xhci_giveback_invalidated_tds(struct xhci_virt_ep *ep)
++ {
++ 	struct xhci_ring *ring;
++ 	struct xhci_td *td, *tmp_td;
++ 
++ 	list_for_each_entry_safe(td, tmp_td, &ep->cancelled_td_list,
++ 				 cancelled_td_list) {
++ 
++ 		/*
++ 		 * Doesn't matter what we pass for status, since the core will
++ 		 * just overwrite it (because the URB has been unlinked).
++ 		 */
++ 		ring = xhci_urb_to_transfer_ring(ep->xhci, td->urb);
++ 
++ 		if (td->cancel_status == TD_CLEARED)
++ 			xhci_td_cleanup(ep->xhci, td, ring, 0);
++ 
++ 		if (ep->xhci->xhc_state & XHCI_STATE_DYING)
++ 			return;
++ 	}
++ }
++ 
++ static int xhci_reset_halted_ep(struct xhci_hcd *xhci, unsigned int slot_id,
++ 				unsigned int ep_index, enum xhci_ep_reset_type reset_type)
++ {
++ 	struct xhci_command *command;
++ 	int ret = 0;
++ 
++ 	command = xhci_alloc_command(xhci, false, GFP_ATOMIC);
++ 	if (!command) {
++ 		ret = -ENOMEM;
++ 		goto done;
++ 	}
++ 
++ 	ret = xhci_queue_reset_ep(xhci, command, slot_id, ep_index, reset_type);
++ done:
++ 	if (ret)
++ 		xhci_err(xhci, "ERROR queuing reset endpoint for slot %d ep_index %d, %d\n",
++ 			 slot_id, ep_index, ret);
++ 	return ret;
++ }
++ 
++ static void xhci_handle_halted_endpoint(struct xhci_hcd *xhci,
++ 				struct xhci_virt_ep *ep, unsigned int stream_id,
++ 				struct xhci_td *td,
++ 				enum xhci_ep_reset_type reset_type)
++ {
++ 	unsigned int slot_id = ep->vdev->slot_id;
++ 	int err;
++ 
++ 	/*
++ 	 * Avoid resetting endpoint if link is inactive. Can cause host hang.
++ 	 * Device will be reset soon to recover the link so don't do anything
++ 	 */
++ 	if (ep->vdev->flags & VDEV_PORT_ERROR)
++ 		return;
++ 
++ 	ep->ep_state |= EP_HALTED;
++ 
++ 	/* add td to cancelled list and let reset ep handler take care of it */
++ 	if (reset_type == EP_HARD_RESET) {
++ 		ep->ep_state |= EP_HARD_CLEAR_TOGGLE;
++ 		if (td && list_empty(&td->cancelled_td_list)) {
++ 			list_add_tail(&td->cancelled_td_list, &ep->cancelled_td_list);
++ 			td->cancel_status = TD_HALTED;
++ 		}
++ 	}
++ 
++ 	err = xhci_reset_halted_ep(xhci, slot_id, ep->ep_index, reset_type);
++ 	if (err)
++ 		return;
++ 
++ 	xhci_ring_cmd_db(xhci);
++ }
++ 
+++>>>>>>> 674f8438c121 (xhci: split handling halted endpoints into two steps)
+  /*
+   * Fix up the ep ring first, so HW stops executing cancelled TDs.
+   * We have the xHCI lock, so nothing can modify this list until we drop it.
+@@@ -838,62 -973,17 +976,59 @@@ static void xhci_handle_cmd_stop_ep(str
+  	if (!ep)
+  		return;
+  
+- 	vdev = ep->vdev;
+- 	ep_ctx = xhci_get_ep_ctx(xhci, vdev->out_ctx, ep_index);
+- 	trace_xhci_handle_cmd_stop_ep(ep_ctx);
+- 
+- 	last_unlinked_td = list_last_entry(&ep->cancelled_td_list,
+- 			struct xhci_td, cancelled_td_list);
+- 
+- 	if (list_empty(&ep->cancelled_td_list)) {
+- 		xhci_stop_watchdog_timer_in_irq(xhci, ep);
+- 		ring_doorbell_for_active_rings(xhci, slot_id, ep_index);
+- 		return;
+- 	}
++ 	ep_ctx = xhci_get_ep_ctx(xhci, ep->vdev->out_ctx, ep_index);
+  
+- 	xhci_invalidate_cancelled_tds(ep, &deq_state);
++ 	trace_xhci_handle_cmd_stop_ep(ep_ctx);
+  
++ 	/* will queue a set TR deq if stopped on a cancelled, uncleared TD */
++ 	xhci_invalidate_cancelled_tds(ep);
+  	xhci_stop_watchdog_timer_in_irq(xhci, ep);
+  
+++<<<<<<< HEAD
+ +	/* If necessary, queue a Set Transfer Ring Dequeue Pointer command */
+ +	if (deq_state.new_deq_ptr && deq_state.new_deq_seg) {
+ +		xhci_queue_new_dequeue_state(xhci, slot_id, ep_index,
+ +					     &deq_state);
+ +		xhci_ring_cmd_db(xhci);
+ +	} else {
+ +		/* Otherwise ring the doorbell(s) to restart queued transfers */
+ +		ring_doorbell_for_active_rings(xhci, slot_id, ep_index);
+ +	}
+ +
+ +	/*
+ +	 * Drop the lock and complete the URBs in the cancelled TD list.
+ +	 * New TDs to be cancelled might be added to the end of the list before
+ +	 * we can complete all the URBs for the TDs we already unlinked.
+ +	 * So stop when we've completed the URB for the last TD we unlinked.
+ +	 */
+ +	do {
+ +		cur_td = list_first_entry(&ep->cancelled_td_list,
+ +				struct xhci_td, cancelled_td_list);
+ +		list_del_init(&cur_td->cancelled_td_list);
+ +
+ +		/* Clean up the cancelled URB */
+ +		/* Doesn't matter what we pass for status, since the core will
+ +		 * just overwrite it (because the URB has been unlinked).
+ +		 */
+ +		ep_ring = xhci_urb_to_transfer_ring(xhci, cur_td->urb);
+ +		xhci_unmap_td_bounce_buffer(xhci, ep_ring, cur_td);
+ +		inc_td_cnt(cur_td->urb);
+ +		if (last_td_in_urb(cur_td))
+ +			xhci_giveback_urb_in_irq(xhci, cur_td, 0);
+ +
+ +		/* Stop processing the cancelled list if the watchdog timer is
+ +		 * running.
+ +		 */
+ +		if (xhci->xhc_state & XHCI_STATE_DYING)
+ +			return;
+ +	} while (cur_td != last_unlinked_td);
+ +
+ +	/* Return to the event handler with xhci->lock re-acquired */
+++=======
++ 	/* Otherwise ring the doorbell(s) to restart queued transfers */
++ 	xhci_giveback_invalidated_tds(ep);
++ 	ring_doorbell_for_active_rings(xhci, slot_id, ep_index);
+++>>>>>>> 674f8438c121 (xhci: split handling halted endpoints into two steps)
+  }
+  
+  static void xhci_kill_ring_urbs(struct xhci_hcd *xhci, struct xhci_ring *ring)
+@@@ -2057,10 -2060,13 +2189,18 @@@ static int finish_td(struct xhci_hcd *x
+  		 * stall later. Hub TT buffer should only be cleared for FS/LS
+  		 * devices behind HS hubs for functional stalls.
+  		 */
+ -		if ((ep->ep_index != 0) || (trb_comp_code != COMP_STALL_ERROR))
+ +		if ((ep_index != 0) || (trb_comp_code != COMP_STALL_ERROR))
+  			xhci_clear_hub_tt_buffer(xhci, td, ep);
+++<<<<<<< HEAD
+ +		xhci_cleanup_halted_endpoint(xhci, slot_id, ep_index,
+ +					ep_ring->stream_id, td, EP_HARD_RESET);
+++=======
++ 
++ 		xhci_handle_halted_endpoint(xhci, ep, ep_ring->stream_id, td,
++ 					    EP_HARD_RESET);
++ 
++ 		return 0; /* xhci_handle_halted_endpoint marked td cancelled */
+++>>>>>>> 674f8438c121 (xhci: split handling halted endpoints into two steps)
+  	} else {
+  		/* Update ring dequeue pointer */
+  		ep_ring->dequeue = td->last_trb;
+diff --cc drivers/usb/host/xhci.h
+index db601e9a0692,b3eaa24c9a0d..000000000000
+--- a/drivers/usb/host/xhci.h
++++ b/drivers/usb/host/xhci.h
+@@@ -1539,6 -1549,8 +1546,11 @@@ enum xhci_cancelled_td_status 
+  struct xhci_td {
+  	struct list_head	td_list;
+  	struct list_head	cancelled_td_list;
+++<<<<<<< HEAD
+++=======
++ 	int			status;
++ 	enum xhci_cancelled_td_status	cancel_status;
+++>>>>>>> 674f8438c121 (xhci: split handling halted endpoints into two steps)
+  	struct urb		*urb;
+  	struct xhci_segment	*start_seg;
+  	union xhci_trb		*first_trb;
+* Unmerged path drivers/usb/host/xhci-ring.c
+diff --git a/drivers/usb/host/xhci.c b/drivers/usb/host/xhci.c
+index 2109a43439bf..8f0d3134bd3f 100644
+--- a/drivers/usb/host/xhci.c
++++ b/drivers/usb/host/xhci.c
+@@ -1440,15 +1440,6 @@ static unsigned int xhci_get_endpoint_flag(struct usb_endpoint_descriptor *desc)
+ 	return 1 << (xhci_get_endpoint_index(desc) + 1);
+ }
+ 
+-/* Find the flag for this endpoint (for use in the control context).  Use the
+- * endpoint index to create a bitmask.  The slot context is bit 0, endpoint 0 is
+- * bit 1, etc.
+- */
+-static unsigned int xhci_get_endpoint_flag_from_index(unsigned int ep_index)
+-{
+-	return 1 << (ep_index + 1);
+-}
+-
+ /* Compute the last valid endpoint context index.  Basically, this is the
+  * endpoint index plus one.  For slot contexts with more than valid endpoint,
+  * we find the most significant bit set in the added contexts flags.
+@@ -1810,7 +1801,12 @@ static int xhci_urb_dequeue(struct usb_hcd *hcd, struct urb *urb, int status)
+ 
+ 	for (; i < urb_priv->num_tds; i++) {
+ 		td = &urb_priv->td[i];
+-		list_add_tail(&td->cancelled_td_list, &ep->cancelled_td_list);
++		/* TD can already be on cancelled list if ep halted on it */
++		if (list_empty(&td->cancelled_td_list)) {
++			td->cancel_status = TD_DIRTY;
++			list_add_tail(&td->cancelled_td_list,
++				      &ep->cancelled_td_list);
++		}
+ 	}
+ 
+ 	/* Queue a stop endpoint command, but only if this is
+@@ -3119,84 +3115,6 @@ static void xhci_setup_input_ctx_for_config_ep(struct xhci_hcd *xhci,
+ 	ctrl_ctx->add_flags |= cpu_to_le32(SLOT_FLAG);
+ }
+ 
+-static void xhci_setup_input_ctx_for_quirk(struct xhci_hcd *xhci,
+-		unsigned int slot_id, unsigned int ep_index,
+-		struct xhci_dequeue_state *deq_state)
+-{
+-	struct xhci_input_control_ctx *ctrl_ctx;
+-	struct xhci_container_ctx *in_ctx;
+-	struct xhci_ep_ctx *ep_ctx;
+-	u32 added_ctxs;
+-	dma_addr_t addr;
+-
+-	in_ctx = xhci->devs[slot_id]->in_ctx;
+-	ctrl_ctx = xhci_get_input_control_ctx(in_ctx);
+-	if (!ctrl_ctx) {
+-		xhci_warn(xhci, "%s: Could not get input context, bad type.\n",
+-				__func__);
+-		return;
+-	}
+-
+-	xhci_endpoint_copy(xhci, xhci->devs[slot_id]->in_ctx,
+-			xhci->devs[slot_id]->out_ctx, ep_index);
+-	ep_ctx = xhci_get_ep_ctx(xhci, in_ctx, ep_index);
+-	addr = xhci_trb_virt_to_dma(deq_state->new_deq_seg,
+-			deq_state->new_deq_ptr);
+-	if (addr == 0) {
+-		xhci_warn(xhci, "WARN Cannot submit config ep after "
+-				"reset ep command\n");
+-		xhci_warn(xhci, "WARN deq seg = %p, deq ptr = %p\n",
+-				deq_state->new_deq_seg,
+-				deq_state->new_deq_ptr);
+-		return;
+-	}
+-	ep_ctx->deq = cpu_to_le64(addr | deq_state->new_cycle_state);
+-
+-	added_ctxs = xhci_get_endpoint_flag_from_index(ep_index);
+-	xhci_setup_input_ctx_for_config_ep(xhci, xhci->devs[slot_id]->in_ctx,
+-			xhci->devs[slot_id]->out_ctx, ctrl_ctx,
+-			added_ctxs, added_ctxs);
+-}
+-
+-void xhci_cleanup_stalled_ring(struct xhci_hcd *xhci, unsigned int slot_id,
+-			       unsigned int ep_index, unsigned int stream_id,
+-			       struct xhci_td *td)
+-{
+-	struct xhci_dequeue_state deq_state;
+-
+-	xhci_dbg_trace(xhci, trace_xhci_dbg_reset_ep,
+-			"Cleaning up stalled endpoint ring");
+-	/* We need to move the HW's dequeue pointer past this TD,
+-	 * or it will attempt to resend it on the next doorbell ring.
+-	 */
+-	xhci_find_new_dequeue_state(xhci, slot_id, ep_index, stream_id, td,
+-				    &deq_state);
+-
+-	if (!deq_state.new_deq_ptr || !deq_state.new_deq_seg)
+-		return;
+-
+-	/* HW with the reset endpoint quirk will use the saved dequeue state to
+-	 * issue a configure endpoint command later.
+-	 */
+-	if (!(xhci->quirks & XHCI_RESET_EP_QUIRK)) {
+-		xhci_dbg_trace(xhci, trace_xhci_dbg_reset_ep,
+-				"Queueing new dequeue state");
+-		xhci_queue_new_dequeue_state(xhci, slot_id,
+-				ep_index, &deq_state);
+-	} else {
+-		/* Better hope no one uses the input context between now and the
+-		 * reset endpoint completion!
+-		 * XXX: No idea how this hardware will react when stream rings
+-		 * are enabled.
+-		 */
+-		xhci_dbg_trace(xhci, trace_xhci_dbg_quirks,
+-				"Setting up input context for "
+-				"configure endpoint command");
+-		xhci_setup_input_ctx_for_quirk(xhci, slot_id,
+-				ep_index, &deq_state);
+-	}
+-}
+-
+ static void xhci_endpoint_disable(struct usb_hcd *hcd,
+ 				  struct usb_host_endpoint *host_ep)
+ {
+* Unmerged path drivers/usb/host/xhci.h
