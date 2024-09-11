@@ -1,0 +1,97 @@
+RDMA/mlx5: Fix corruption of reg_pages in mlx5_ib_rereg_user_mr()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Jason Gunthorpe <jgg@nvidia.com>
+commit fc3325701a6353594083f08e297d4c1965c601aa
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/fc332570.failed
+
+reg_pages should always contain mr->npage since when the mr is finally
+de-reg'd it is always subtracted out.
+
+If there were any error exits then mlx5_ib_rereg_user_mr() would leave the
+reg_pages adjusted and this will cause it to be double subtracted
+eventually.
+
+The manipulation of reg_pages is inherently connected to the umem, so lift
+it out of set_mr_fields() and only adjust it around creating/destroying a
+umem.
+
+reg_pages is only used for diagnostics in sysfs.
+
+Fixes: 7d0cc6edcc70 ("IB/mlx5: Add MR cache for large UMR regions")
+Link: https://lore.kernel.org/r/20201026131936.1335664-3-leon@kernel.org
+	Signed-off-by: Leon Romanovsky <leonro@nvidia.com>
+	Signed-off-by: Jason Gunthorpe <jgg@nvidia.com>
+(cherry picked from commit fc3325701a6353594083f08e297d4c1965c601aa)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/infiniband/hw/mlx5/mr.c
+diff --cc drivers/infiniband/hw/mlx5/mr.c
+index 0ba952308926,f3a28119d145..000000000000
+--- a/drivers/infiniband/hw/mlx5/mr.c
++++ b/drivers/infiniband/hw/mlx5/mr.c
+@@@ -1406,17 -1417,20 +1403,19 @@@ struct ib_mr *mlx5_ib_reg_user_mr(struc
+  	mlx5_ib_dbg(dev, "mkey 0x%x\n", mr->mmkey.key);
+  
+  	mr->umem = umem;
+- 	set_mr_fields(dev, mr, npages, length, access_flags);
++ 	mr->npages = npages;
++ 	atomic_add(mr->npages, &dev->mdev->priv.reg_pages);
++ 	set_mr_fields(dev, mr, length, access_flags);
+  
+ -	if (xlt_with_umr && !(access_flags & IB_ACCESS_ON_DEMAND)) {
+ -		/*
+ -		 * If the MR was created with reg_create then it will be
+ -		 * configured properly but left disabled. It is safe to go ahead
+ -		 * and configure it again via UMR while enabling it.
+ -		 */
+ +	if (use_umr) {
+  		int update_xlt_flags = MLX5_IB_UPD_XLT_ENABLE;
+  
+ +		if (access_flags & IB_ACCESS_ON_DEMAND)
+ +			update_xlt_flags |= MLX5_IB_UPD_XLT_ZAP;
+ +
+  		err = mlx5_ib_update_xlt(mr, 0, ncont, page_shift,
+  					 update_xlt_flags);
+ +
+  		if (err) {
+  			dereg_mr(dev, mr);
+  			return ERR_PTR(err);
+@@@ -1533,17 -1551,24 +1530,27 @@@ int mlx5_ib_rereg_user_mr(struct ib_mr 
+  		 * used.
+  		 */
+  		flags |= IB_MR_REREG_TRANS;
++ 		atomic_sub(mr->npages, &dev->mdev->priv.reg_pages);
++ 		mr->npages = 0;
+  		ib_umem_release(mr->umem);
+  		mr->umem = NULL;
+++<<<<<<< HEAD
+ +		err = mr_umem_get(dev, udata, addr, len, access_flags,
+ +				  &mr->umem, &npages, &page_shift, &ncont,
+ +				  &order);
+++=======
++ 
++ 		err = mr_umem_get(dev, addr, len, access_flags, &mr->umem,
++ 				  &npages, &page_shift, &ncont, &order);
+++>>>>>>> fc3325701a63 (RDMA/mlx5: Fix corruption of reg_pages in mlx5_ib_rereg_user_mr())
+  		if (err)
+  			goto err;
++ 		mr->npages = ncont;
++ 		atomic_add(mr->npages, &dev->mdev->priv.reg_pages);
+  	}
+  
+ -	if (!mlx5_ib_can_reconfig_with_umr(dev, mr->access_flags,
+ -					   access_flags) ||
+ -	    !mlx5_ib_can_load_pas_with_umr(dev, len) ||
+ -	    (flags & IB_MR_REREG_TRANS &&
+ -	     !mlx5_ib_pas_fits_in_mr(mr, addr, len))) {
+ +	if (!mlx5_ib_can_use_umr(dev, true, access_flags) ||
+ +	    (flags & IB_MR_REREG_TRANS && !use_umr_mtt_update(mr, addr, len))) {
+  		/*
+  		 * UMR can't be used - MKey needs to be replaced.
+  		 */
+* Unmerged path drivers/infiniband/hw/mlx5/mr.c
