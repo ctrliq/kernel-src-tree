@@ -1,0 +1,243 @@
+IB: ucontext should be set properly for all cmd & ioctl paths
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-193.el8
+commit-author Shamir Rabinovitch <shamir.rabinovitch@oracle.com>
+commit 70f06b26f07ea42d158b41bba460ce06ffa3510a
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-193.el8/70f06b26.failed
+
+the Attempt to use the below commit to initialize the ucontext for the
+uobject destroy path has shown that the below commit is incomplete.
+
+Parts were reverted and the ucontext set up in the uverbs_attr_bundle was
+moved to rdma_lookup_get_uobject which is called from the uobj_get_XXX
+macros and rdma_alloc_begin_uobject which is called when uobject is
+created.
+
+Fixes: 3d9dfd060391 ("IB/uverbs: Add ib_ucontext to uverbs_attr_bundle sent from ioctl and cmd flows")
+	Signed-off-by: Shamir Rabinovitch <shamir.rabinovitch@oracle.com>
+	Signed-off-by: Jason Gunthorpe <jgg@mellanox.com>
+(cherry picked from commit 70f06b26f07ea42d158b41bba460ce06ffa3510a)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/rdma/uverbs_std_types.h
+diff --cc include/rdma/uverbs_std_types.h
+index 883abcf6d36e,2d0e6287e43a..000000000000
+--- a/include/rdma/uverbs_std_types.h
++++ b/include/rdma/uverbs_std_types.h
+@@@ -50,7 -50,8 +50,12 @@@
+  
+  #define uobj_get_read(_type, _id, _attrs)                                      \
+  	rdma_lookup_get_uobject(uobj_get_type(_attrs, _type), (_attrs)->ufile, \
+++<<<<<<< HEAD
+ +				_uobj_check_id(_id), UVERBS_LOOKUP_READ)
+++=======
++ 				_uobj_check_id(_id), UVERBS_LOOKUP_READ,       \
++ 				_attrs)
+++>>>>>>> 70f06b26f07e (IB: ucontext should be set properly for all cmd & ioctl paths)
+  
+  #define ufd_get_read(_type, _fdnum, _attrs)                                    \
+  	rdma_lookup_get_uobject(uobj_get_type(_attrs, _type), (_attrs)->ufile, \
+@@@ -69,10 -70,11 +74,15 @@@ static inline void *_uobj_get_obj_read(
+  
+  #define uobj_get_write(_type, _id, _attrs)                                     \
+  	rdma_lookup_get_uobject(uobj_get_type(_attrs, _type), (_attrs)->ufile, \
+++<<<<<<< HEAD
+ +				_uobj_check_id(_id), UVERBS_LOOKUP_WRITE)
+++=======
++ 				_uobj_check_id(_id), UVERBS_LOOKUP_WRITE,      \
++ 				_attrs)
+++>>>>>>> 70f06b26f07e (IB: ucontext should be set properly for all cmd & ioctl paths)
+  
+  int __uobj_perform_destroy(const struct uverbs_api_object *obj, u32 id,
+- 			   const struct uverbs_attr_bundle *attrs);
++ 			   struct uverbs_attr_bundle *attrs);
+  #define uobj_perform_destroy(_type, _id, _attrs)                               \
+  	__uobj_perform_destroy(uobj_get_type(_attrs, _type),                   \
+  			       _uobj_check_id(_id), _attrs)
+diff --git a/drivers/infiniband/core/rdma_core.c b/drivers/infiniband/core/rdma_core.c
+index 9b1c4e9e0ae5..9ce17ccf2f66 100644
+--- a/drivers/infiniband/core/rdma_core.c
++++ b/drivers/infiniband/core/rdma_core.c
+@@ -224,14 +224,13 @@ int uobj_destroy(struct ib_uobject *uobj)
+  * uverbs_put_destroy.
+  */
+ struct ib_uobject *__uobj_get_destroy(const struct uverbs_api_object *obj,
+-				      u32 id,
+-				      const struct uverbs_attr_bundle *attrs)
++				      u32 id, struct uverbs_attr_bundle *attrs)
+ {
+ 	struct ib_uobject *uobj;
+ 	int ret;
+ 
+ 	uobj = rdma_lookup_get_uobject(obj, attrs->ufile, id,
+-				       UVERBS_LOOKUP_DESTROY);
++				       UVERBS_LOOKUP_DESTROY, attrs);
+ 	if (IS_ERR(uobj))
+ 		return uobj;
+ 
+@@ -249,7 +248,7 @@ struct ib_uobject *__uobj_get_destroy(const struct uverbs_api_object *obj,
+  * (negative errno on failure). For use by callers that do not need the uobj.
+  */
+ int __uobj_perform_destroy(const struct uverbs_api_object *obj, u32 id,
+-			   const struct uverbs_attr_bundle *attrs)
++			   struct uverbs_attr_bundle *attrs)
+ {
+ 	struct ib_uobject *uobj;
+ 
+@@ -393,7 +392,8 @@ lookup_get_fd_uobject(const struct uverbs_api_object *obj,
+ 
+ struct ib_uobject *rdma_lookup_get_uobject(const struct uverbs_api_object *obj,
+ 					   struct ib_uverbs_file *ufile, s64 id,
+-					   enum rdma_lookup_mode mode)
++					   enum rdma_lookup_mode mode,
++					   struct uverbs_attr_bundle *attrs)
+ {
+ 	struct ib_uobject *uobj;
+ 	int ret;
+@@ -431,6 +431,8 @@ struct ib_uobject *rdma_lookup_get_uobject(const struct uverbs_api_object *obj,
+ 	ret = uverbs_try_lock_object(uobj, mode);
+ 	if (ret)
+ 		goto free;
++	if (attrs)
++		attrs->context = uobj->context;
+ 
+ 	return uobj;
+ free:
+@@ -494,7 +496,8 @@ alloc_begin_fd_uobject(const struct uverbs_api_object *obj,
+ }
+ 
+ struct ib_uobject *rdma_alloc_begin_uobject(const struct uverbs_api_object *obj,
+-					    struct ib_uverbs_file *ufile)
++					    struct ib_uverbs_file *ufile,
++					    struct uverbs_attr_bundle *attrs)
+ {
+ 	struct ib_uobject *ret;
+ 
+@@ -514,6 +517,8 @@ struct ib_uobject *rdma_alloc_begin_uobject(const struct uverbs_api_object *obj,
+ 		up_read(&ufile->hw_destroy_rwsem);
+ 		return ret;
+ 	}
++	if (attrs)
++		attrs->context = ret->context;
+ 	return ret;
+ }
+ 
+@@ -940,26 +945,25 @@ const struct uverbs_obj_type_class uverbs_fd_class = {
+ EXPORT_SYMBOL(uverbs_fd_class);
+ 
+ struct ib_uobject *
+-uverbs_get_uobject_from_file(u16 object_id,
+-			     struct ib_uverbs_file *ufile,
+-			     enum uverbs_obj_access access, s64 id)
++uverbs_get_uobject_from_file(u16 object_id, enum uverbs_obj_access access,
++			     s64 id, struct uverbs_attr_bundle *attrs)
+ {
+ 	const struct uverbs_api_object *obj =
+-		uapi_get_object(ufile->device->uapi, object_id);
++		uapi_get_object(attrs->ufile->device->uapi, object_id);
+ 
+ 	switch (access) {
+ 	case UVERBS_ACCESS_READ:
+-		return rdma_lookup_get_uobject(obj, ufile, id,
+-					       UVERBS_LOOKUP_READ);
++		return rdma_lookup_get_uobject(obj, attrs->ufile, id,
++					       UVERBS_LOOKUP_READ, attrs);
+ 	case UVERBS_ACCESS_DESTROY:
+ 		/* Actual destruction is done inside uverbs_handle_method */
+-		return rdma_lookup_get_uobject(obj, ufile, id,
+-					       UVERBS_LOOKUP_DESTROY);
++		return rdma_lookup_get_uobject(obj, attrs->ufile, id,
++					       UVERBS_LOOKUP_DESTROY, attrs);
+ 	case UVERBS_ACCESS_WRITE:
+-		return rdma_lookup_get_uobject(obj, ufile, id,
+-					       UVERBS_LOOKUP_WRITE);
++		return rdma_lookup_get_uobject(obj, attrs->ufile, id,
++					       UVERBS_LOOKUP_WRITE, attrs);
+ 	case UVERBS_ACCESS_NEW:
+-		return rdma_alloc_begin_uobject(obj, ufile);
++		return rdma_alloc_begin_uobject(obj, attrs->ufile, attrs);
+ 	default:
+ 		WARN_ON(true);
+ 		return ERR_PTR(-EOPNOTSUPP);
+diff --git a/drivers/infiniband/core/rdma_core.h b/drivers/infiniband/core/rdma_core.h
+index 69f8db66925e..d91d44f4fa89 100644
+--- a/drivers/infiniband/core/rdma_core.h
++++ b/drivers/infiniband/core/rdma_core.h
+@@ -83,9 +83,8 @@ void uverbs_close_fd(struct file *f);
+  * uverbs_finalize_objects are called.
+  */
+ struct ib_uobject *
+-uverbs_get_uobject_from_file(u16 object_id,
+-			     struct ib_uverbs_file *ufile,
+-			     enum uverbs_obj_access access, s64 id);
++uverbs_get_uobject_from_file(u16 object_id, enum uverbs_obj_access access,
++			     s64 id, struct uverbs_attr_bundle *attrs);
+ 
+ /*
+  * Note that certain finalize stages could return a status:
+diff --git a/drivers/infiniband/core/uverbs_cmd.c b/drivers/infiniband/core/uverbs_cmd.c
+index 4aa2231ad8ef..734e3e76b54d 100644
+--- a/drivers/infiniband/core/uverbs_cmd.c
++++ b/drivers/infiniband/core/uverbs_cmd.c
+@@ -175,7 +175,7 @@ static int uverbs_request_finish(struct uverbs_req_iter *iter)
+ }
+ 
+ static struct ib_uverbs_completion_event_file *
+-_ib_uverbs_lookup_comp_file(s32 fd, const struct uverbs_attr_bundle *attrs)
++_ib_uverbs_lookup_comp_file(s32 fd, struct uverbs_attr_bundle *attrs)
+ {
+ 	struct ib_uobject *uobj = ufd_get_read(UVERBS_OBJECT_COMP_CHANNEL,
+ 					       fd, attrs);
+diff --git a/drivers/infiniband/core/uverbs_ioctl.c b/drivers/infiniband/core/uverbs_ioctl.c
+index 0ca04d224015..175d632bcdda 100644
+--- a/drivers/infiniband/core/uverbs_ioctl.c
++++ b/drivers/infiniband/core/uverbs_ioctl.c
+@@ -207,8 +207,8 @@ static int uverbs_process_idrs_array(struct bundle_priv *pbundle,
+ 
+ 	for (i = 0; i != array_len; i++) {
+ 		attr->uobjects[i] = uverbs_get_uobject_from_file(
+-			spec->u2.objs_arr.obj_type, pbundle->bundle.ufile,
+-			spec->u2.objs_arr.access, idr_vals[i]);
++			spec->u2.objs_arr.obj_type, spec->u2.objs_arr.access,
++			idr_vals[i], &pbundle->bundle);
+ 		if (IS_ERR(attr->uobjects[i])) {
+ 			ret = PTR_ERR(attr->uobjects[i]);
+ 			break;
+@@ -324,10 +324,8 @@ static int uverbs_process_attr(struct bundle_priv *pbundle,
+ 		 * IDR implementation today rejects negative IDs
+ 		 */
+ 		o_attr->uobject = uverbs_get_uobject_from_file(
+-					spec->u.obj.obj_type,
+-					pbundle->bundle.ufile,
+-					spec->u.obj.access,
+-					uattr->data_s64);
++			spec->u.obj.obj_type, spec->u.obj.access,
++			uattr->data_s64, &pbundle->bundle);
+ 		if (IS_ERR(o_attr->uobject))
+ 			return PTR_ERR(o_attr->uobject);
+ 		__set_bit(attr_bkey, pbundle->uobj_finalize);
+* Unmerged path include/rdma/uverbs_std_types.h
+diff --git a/include/rdma/uverbs_types.h b/include/rdma/uverbs_types.h
+index 175d761695e1..b68f1b92c25d 100644
+--- a/include/rdma/uverbs_types.h
++++ b/include/rdma/uverbs_types.h
+@@ -131,11 +131,13 @@ struct uverbs_obj_idr_type {
+ 
+ struct ib_uobject *rdma_lookup_get_uobject(const struct uverbs_api_object *obj,
+ 					   struct ib_uverbs_file *ufile, s64 id,
+-					   enum rdma_lookup_mode mode);
++					   enum rdma_lookup_mode mode,
++					   struct uverbs_attr_bundle *attrs);
+ void rdma_lookup_put_uobject(struct ib_uobject *uobj,
+ 			     enum rdma_lookup_mode mode);
+ struct ib_uobject *rdma_alloc_begin_uobject(const struct uverbs_api_object *obj,
+-					    struct ib_uverbs_file *ufile);
++					    struct ib_uverbs_file *ufile,
++					    struct uverbs_attr_bundle *attrs);
+ void rdma_alloc_abort_uobject(struct ib_uobject *uobj);
+ int __must_check rdma_alloc_commit_uobject(struct ib_uobject *uobj);
+ 
