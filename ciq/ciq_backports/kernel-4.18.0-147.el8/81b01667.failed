@@ -1,0 +1,88 @@
+KVM: x86: Sync the pending Posted-Interrupts
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-147.el8
+commit-author Luwei Kang <luwei.kang@intel.com>
+commit 81b016676e1c8f58027bd4d2b1d8a981776b36fe
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-147.el8/81b01667.failed
+
+Some Posted-Interrupts from passthrough devices may be lost or
+overwritten when the vCPU is in runnable state.
+
+The SN (Suppress Notification) of PID (Posted Interrupt Descriptor) will
+be set when the vCPU is preempted (vCPU in KVM_MP_STATE_RUNNABLE state
+but not running on physical CPU). If a posted interrupt coming at this
+time, the irq remmaping facility will set the bit of PIR (Posted
+Interrupt Requests) without ON (Outstanding Notification).
+So this interrupt can't be sync to APIC virtualization register and
+will not be handled by Guest because ON is zero.
+
+	Signed-off-by: Luwei Kang <luwei.kang@intel.com>
+[Eliminate the pi_clear_sn fast path. - Paolo]
+	Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+(cherry picked from commit 81b016676e1c8f58027bd4d2b1d8a981776b36fe)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kvm/vmx/vmx.h
+* Unmerged path arch/x86/kvm/vmx/vmx.h
+diff --git a/arch/x86/kvm/vmx/vmx.c b/arch/x86/kvm/vmx/vmx.c
+index 7955a1810f70..19b573bb9a17 100644
+--- a/arch/x86/kvm/vmx/vmx.c
++++ b/arch/x86/kvm/vmx/vmx.c
+@@ -3031,21 +3031,6 @@ static void vmx_vcpu_pi_load(struct kvm_vcpu *vcpu, int cpu)
+ 	if (!pi_test_sn(pi_desc) && vcpu->cpu == cpu)
+ 		return;
+ 
+-	/*
+-	 * First handle the simple case where no cmpxchg is necessary; just
+-	 * allow posting non-urgent interrupts.
+-	 *
+-	 * If the 'nv' field is POSTED_INTR_WAKEUP_VECTOR, do not change
+-	 * PI.NDST: pi_post_block will do it for us and the wakeup_handler
+-	 * expects the VCPU to be on the blocked_vcpu_list that matches
+-	 * PI.NDST.
+-	 */
+-	if (pi_desc->nv == POSTED_INTR_WAKEUP_VECTOR ||
+-	    vcpu->cpu == cpu) {
+-		pi_clear_sn(pi_desc);
+-		return;
+-	}
+-
+ 	/* The full case.  */
+ 	do {
+ 		old.control = new.control = pi_desc->control;
+@@ -3060,6 +3045,17 @@ static void vmx_vcpu_pi_load(struct kvm_vcpu *vcpu, int cpu)
+ 		new.sn = 0;
+ 	} while (cmpxchg64(&pi_desc->control, old.control,
+ 			   new.control) != old.control);
++
++	/*
++	 * Clear SN before reading the bitmap; this ensures that any
++	 * interrupt that comes after the bitmap is read sets ON.  The
++	 * VT-d firmware * writes the bitmap and reads SN atomically (5.2.3
++	 * in the spec), so it doesn't really have a memory barrier that
++	 * pairs with this.  However, we cannot do that and we need one.
++	 */
++	smp_mb__after_atomic();
++	if (!bitmap_empty((unsigned long *)pi_desc->pir, NR_VECTORS))
++		pi_set_on(pi_desc);
+ }
+ 
+ static void decache_tsc_multiplier(struct vcpu_vmx *vmx)
+* Unmerged path arch/x86/kvm/vmx/vmx.h
+diff --git a/arch/x86/kvm/x86.c b/arch/x86/kvm/x86.c
+index e0d7faa8e901..8fac9ed40aa4 100644
+--- a/arch/x86/kvm/x86.c
++++ b/arch/x86/kvm/x86.c
+@@ -7677,7 +7677,7 @@ static int vcpu_enter_guest(struct kvm_vcpu *vcpu)
+ 	 * 1) We should set ->mode before checking ->requests.  Please see
+ 	 * the comment in kvm_vcpu_exiting_guest_mode().
+ 	 *
+-	 * 2) For APICv, we should set ->mode before checking PIR.ON.  This
++	 * 2) For APICv, we should set ->mode before checking PID.ON. This
+ 	 * pairs with the memory barrier implicit in pi_test_and_set_on
+ 	 * (see vmx_deliver_posted_interrupt).
+ 	 *
