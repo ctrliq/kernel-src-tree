@@ -1,0 +1,252 @@
+blk-mq: pass obtained budget count to blk_mq_dispatch_rq_list
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Ming Lei <ming.lei@redhat.com>
+commit 1fd40b5ea72cf830cfb932bbf791533931c615e9
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/1fd40b5e.failed
+
+Pass obtained budget count to blk_mq_dispatch_rq_list(), and prepare
+for supporting fully batching submission.
+
+With the obtained budget count, it is easier to put extra budgets
+in case of .queue_rq failure.
+
+Meantime remove the old 'got_budget' parameter.
+
+	Signed-off-by: Ming Lei <ming.lei@redhat.com>
+	Tested-by: Baolin Wang <baolin.wang7@gmail.com>
+	Reviewed-by: Christoph Hellwig <hch@infradead.org>
+	Cc: Sagi Grimberg <sagi@grimberg.me>
+	Cc: Baolin Wang <baolin.wang7@gmail.com>
+	Cc: Christoph Hellwig <hch@infradead.org>
+	Signed-off-by: Jens Axboe <axboe@kernel.dk>
+(cherry picked from commit 1fd40b5ea72cf830cfb932bbf791533931c615e9)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	block/blk-mq-sched.c
+#	block/blk-mq.c
+#	block/blk-mq.h
+diff --cc block/blk-mq-sched.c
+index 5b47c24f496b,4c72073830f3..000000000000
+--- a/block/blk-mq-sched.c
++++ b/block/blk-mq-sched.c
+@@@ -139,7 -130,7 +139,11 @@@ static int blk_mq_do_dispatch_sched(str
+  		 * in blk_mq_dispatch_rq_list().
+  		 */
+  		list_add(&rq->queuelist, &rq_list);
+++<<<<<<< HEAD
+ +	} while (blk_mq_dispatch_rq_list(q, &rq_list, true));
+++=======
++ 	} while (blk_mq_dispatch_rq_list(rq->mq_hctx, &rq_list, 1));
+++>>>>>>> 1fd40b5ea72c (blk-mq: pass obtained budget count to blk_mq_dispatch_rq_list)
+  
+  	return ret;
+  }
+@@@ -208,7 -198,7 +212,11 @@@ static int blk_mq_do_dispatch_ctx(struc
+  		/* round robin for fair dispatch */
+  		ctx = blk_mq_next_ctx(hctx, rq->mq_ctx);
+  
+++<<<<<<< HEAD
+ +	} while (blk_mq_dispatch_rq_list(q, &rq_list, true));
+++=======
++ 	} while (blk_mq_dispatch_rq_list(rq->mq_hctx, &rq_list, 1));
+++>>>>>>> 1fd40b5ea72c (blk-mq: pass obtained budget count to blk_mq_dispatch_rq_list)
+  
+  	WRITE_ONCE(hctx->dispatch_from, ctx);
+  	return ret;
+@@@ -248,7 -238,7 +256,11 @@@ static int __blk_mq_sched_dispatch_requ
+  	 */
+  	if (!list_empty(&rq_list)) {
+  		blk_mq_sched_mark_restart_hctx(hctx);
+++<<<<<<< HEAD
+ +		if (blk_mq_dispatch_rq_list(q, &rq_list, false)) {
+++=======
++ 		if (blk_mq_dispatch_rq_list(hctx, &rq_list, 0)) {
+++>>>>>>> 1fd40b5ea72c (blk-mq: pass obtained budget count to blk_mq_dispatch_rq_list)
+  			if (has_sched_dispatch)
+  				ret = blk_mq_do_dispatch_sched(hctx);
+  			else
+@@@ -261,7 -251,7 +273,11 @@@
+  		ret = blk_mq_do_dispatch_ctx(hctx);
+  	} else {
+  		blk_mq_flush_busy_ctxs(hctx, &rq_list);
+++<<<<<<< HEAD
+ +		blk_mq_dispatch_rq_list(q, &rq_list, false);
+++=======
++ 		blk_mq_dispatch_rq_list(hctx, &rq_list, 0);
+++>>>>>>> 1fd40b5ea72c (blk-mq: pass obtained budget count to blk_mq_dispatch_rq_list)
+  	}
+  
+  	return ret;
+diff --cc block/blk-mq.c
+index 51b640f2232f,1b701e166681..000000000000
+--- a/block/blk-mq.c
++++ b/block/blk-mq.c
+@@@ -1208,18 -1242,79 +1208,87 @@@ static void blk_mq_handle_dev_resource(
+  	__blk_mq_requeue_request(rq);
+  }
+  
+++<<<<<<< HEAD
+ +/*
+ + * Returns true if we did some work AND can potentially do more.
+ + */
+ +bool blk_mq_dispatch_rq_list(struct request_queue *q, struct list_head *list,
+ +			     bool got_budget)
+++=======
++ static void blk_mq_handle_zone_resource(struct request *rq,
++ 					struct list_head *zone_list)
++ {
++ 	/*
++ 	 * If we end up here it is because we cannot dispatch a request to a
++ 	 * specific zone due to LLD level zone-write locking or other zone
++ 	 * related resource not being available. In this case, set the request
++ 	 * aside in zone_list for retrying it later.
++ 	 */
++ 	list_add(&rq->queuelist, zone_list);
++ 	__blk_mq_requeue_request(rq);
++ }
++ 
++ enum prep_dispatch {
++ 	PREP_DISPATCH_OK,
++ 	PREP_DISPATCH_NO_TAG,
++ 	PREP_DISPATCH_NO_BUDGET,
++ };
++ 
++ static enum prep_dispatch blk_mq_prep_dispatch_rq(struct request *rq,
++ 						  bool need_budget)
++ {
++ 	struct blk_mq_hw_ctx *hctx = rq->mq_hctx;
++ 
++ 	if (need_budget && !blk_mq_get_dispatch_budget(rq->q)) {
++ 		blk_mq_put_driver_tag(rq);
++ 		return PREP_DISPATCH_NO_BUDGET;
++ 	}
++ 
++ 	if (!blk_mq_get_driver_tag(rq)) {
++ 		/*
++ 		 * The initial allocation attempt failed, so we need to
++ 		 * rerun the hardware queue when a tag is freed. The
++ 		 * waitqueue takes care of that. If the queue is run
++ 		 * before we add this entry back on the dispatch list,
++ 		 * we'll re-run it below.
++ 		 */
++ 		if (!blk_mq_mark_tag_wait(hctx, rq)) {
++ 			/*
++ 			 * All budgets not got from this function will be put
++ 			 * together during handling partial dispatch
++ 			 */
++ 			if (need_budget)
++ 				blk_mq_put_dispatch_budget(rq->q);
++ 			return PREP_DISPATCH_NO_TAG;
++ 		}
++ 	}
++ 
++ 	return PREP_DISPATCH_OK;
++ }
++ 
++ /* release all allocated budgets before calling to blk_mq_dispatch_rq_list */
++ static void blk_mq_release_budgets(struct request_queue *q,
++ 		unsigned int nr_budgets)
++ {
++ 	int i;
++ 
++ 	for (i = 0; i < nr_budgets; i++)
++ 		blk_mq_put_dispatch_budget(q);
++ }
++ 
++ /*
++  * Returns true if we did some work AND can potentially do more.
++  */
++ bool blk_mq_dispatch_rq_list(struct blk_mq_hw_ctx *hctx, struct list_head *list,
++ 			     unsigned int nr_budgets)
+++>>>>>>> 1fd40b5ea72c (blk-mq: pass obtained budget count to blk_mq_dispatch_rq_list)
+  {
+ -	enum prep_dispatch prep;
+ -	struct request_queue *q = hctx->queue;
+ +	struct blk_mq_hw_ctx *hctx;
+  	struct request *rq, *nxt;
+ +	bool no_tag = false;
+  	int errors, queued;
+  	blk_status_t ret = BLK_STS_OK;
+ -	LIST_HEAD(zone_list);
+ +	bool no_budget_avail = false;
+  
+  	if (list_empty(list))
+  		return false;
+@@@ -1235,32 -1330,10 +1304,38 @@@
+  
+  		rq = list_first_entry(list, struct request, queuelist);
+  
+++<<<<<<< HEAD
+ +		hctx = rq->mq_hctx;
+ +		if (!got_budget && !blk_mq_get_dispatch_budget(hctx)) {
+ +			blk_mq_put_driver_tag(rq);
+ +			no_budget_avail = true;
+++=======
++ 		WARN_ON_ONCE(hctx != rq->mq_hctx);
++ 		prep = blk_mq_prep_dispatch_rq(rq, !nr_budgets);
++ 		if (prep != PREP_DISPATCH_OK)
+++>>>>>>> 1fd40b5ea72c (blk-mq: pass obtained budget count to blk_mq_dispatch_rq_list)
+  			break;
+ +		}
+ +
+ +		if (!blk_mq_get_driver_tag(rq)) {
+ +			/*
+ +			 * The initial allocation attempt failed, so we need to
+ +			 * rerun the hardware queue when a tag is freed. The
+ +			 * waitqueue takes care of that. If the queue is run
+ +			 * before we add this entry back on the dispatch list,
+ +			 * we'll re-run it below.
+ +			 */
+ +			if (!blk_mq_mark_tag_wait(hctx, rq)) {
+ +				blk_mq_put_dispatch_budget(hctx);
+ +				/*
+ +				 * For non-shared tags, the RESTART check
+ +				 * will suffice.
+ +				 */
+ +				if (hctx->flags & BLK_MQ_F_TAG_SHARED)
+ +					no_tag = true;
+ +				break;
+ +			}
+ +		}
+  
+  		list_del_init(&rq->queuelist);
+  
+@@@ -1300,7 -1392,13 +1381,9 @@@
+  	 */
+  	if (!list_empty(list)) {
+  		bool needs_restart;
+ -		/* For non-shared tags, the RESTART check will suffice */
+ -		bool no_tag = prep == PREP_DISPATCH_NO_TAG &&
+ -                        (hctx->flags & BLK_MQ_F_TAG_SHARED);
+ -		bool no_budget_avail = prep == PREP_DISPATCH_NO_BUDGET;
+  
++ 		blk_mq_release_budgets(q, nr_budgets);
++ 
+  		/*
+  		 * If we didn't flush the entire list, we could have told
+  		 * the driver there was more coming, but that turned out to
+diff --cc block/blk-mq.h
+index abd0e3d1a92b,863a2f3346d4..000000000000
+--- a/block/blk-mq.h
++++ b/block/blk-mq.h
+@@@ -43,7 -40,8 +43,12 @@@ void blk_mq_freeze_queue(struct request
+  void blk_mq_exit_queue(struct request_queue *q);
+  int blk_mq_update_nr_requests(struct request_queue *q, unsigned int nr);
+  void blk_mq_wake_waiters(struct request_queue *q);
+++<<<<<<< HEAD
+ +bool blk_mq_dispatch_rq_list(struct request_queue *, struct list_head *, bool);
+++=======
++ bool blk_mq_dispatch_rq_list(struct blk_mq_hw_ctx *hctx, struct list_head *,
++ 			     unsigned int);
+++>>>>>>> 1fd40b5ea72c (blk-mq: pass obtained budget count to blk_mq_dispatch_rq_list)
+  void blk_mq_add_to_requeue_list(struct request *rq, bool at_head,
+  				bool kick_requeue_list);
+  void blk_mq_flush_busy_ctxs(struct blk_mq_hw_ctx *hctx, struct list_head *list);
+* Unmerged path block/blk-mq-sched.c
+* Unmerged path block/blk-mq.c
+* Unmerged path block/blk-mq.h
