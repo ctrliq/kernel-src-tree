@@ -1,0 +1,435 @@
+thermal: Explicitly enable non-changing thermal zone devices
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Andrzej Pietrasiewicz <andrzej.p@collabora.com>
+commit bbcf90c0646ac797700269fa6645a6a46466c79f
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/bbcf90c0.failed
+
+Some thermal zone devices never change their state, so they should be
+always enabled.
+
+	Signed-off-by: Andrzej Pietrasiewicz <andrzej.p@collabora.com>
+	Reviewed-by: Bartlomiej Zolnierkiewicz <b.zolnierkie@samsung.com>
+	Signed-off-by: Daniel Lezcano <daniel.lezcano@linaro.org>
+Link: https://lore.kernel.org/r/20200629122925.21729-9-andrzej.p@collabora.com
+(cherry picked from commit bbcf90c0646ac797700269fa6645a6a46466c79f)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/thermal/armada_thermal.c
+diff --cc drivers/thermal/armada_thermal.c
+index 4c275ec10ac5,c2ebfb5be4b3..000000000000
+--- a/drivers/thermal/armada_thermal.c
++++ b/drivers/thermal/armada_thermal.c
+@@@ -383,34 -843,113 +383,48 @@@ static int armada_thermal_probe(struct 
+  
+  	/*
+  	 * Legacy DT bindings only described "control1" register (also referred
+ -	 * as "control MSB" on old documentation). Then, bindings moved to cover
+ +	 * as "control MSB" on old documentation). New bindings cover
+  	 * "control0/control LSB" and "control1/control MSB" registers within
+ -	 * the same resource, which was then of size 8 instead of 4.
+ -	 *
+ -	 * The logic of defining sporadic registers is broken. For instance, it
+ -	 * blocked the addition of the overheat interrupt feature that needed
+ -	 * another resource somewhere else in the same memory area. One solution
+ -	 * is to define an overall system controller and put the thermal node
+ -	 * into it, which requires the use of regmaps across all the driver.
+ +	 * the same resource, which is then of size 8 instead of 4.
+  	 */
+ -	if (IS_ERR(syscon_node_to_regmap(pdev->dev.parent->of_node))) {
+ -		/* Ensure device name is correct for the thermal core */
+ -		armada_set_sane_name(pdev, priv);
+ -
+ -		ret = armada_thermal_probe_legacy(pdev, priv);
+ -		if (ret)
+ -			return ret;
+ -
+ -		priv->data->init(pdev, priv);
+ -
+ -		/* Wait the sensors to be valid */
+ -		armada_wait_sensor_validity(priv);
+ -
+ -		tz = thermal_zone_device_register(priv->zone_name, 0, 0, priv,
+ -						  &legacy_ops, NULL, 0, 0);
+ -		if (IS_ERR(tz)) {
+ -			dev_err(&pdev->dev,
+ -				"Failed to register thermal zone device\n");
+ -			return PTR_ERR(tz);
+ +	if (resource_size(res) == LEGACY_CONTROL_MEM_LEN) {
+ +		/* ->control0 unavailable in this configuration */
+ +		if (priv->data->needs_control0) {
+ +			dev_err(&pdev->dev, "No access to control0 register\n");
+ +			return -EINVAL;
+  		}
+  
+++<<<<<<< HEAD
+ +		priv->control1 = control + LEGACY_CONTROL1_OFFSET;
+ +	} else {
+ +		priv->control0 = control + CONTROL0_OFFSET;
+ +		priv->control1 = control + CONTROL1_OFFSET;
+++=======
++ 		ret = thermal_zone_device_enable(tz);
++ 		if (ret) {
++ 			thermal_zone_device_unregister(tz);
++ 			return ret;
++ 		}
++ 
++ 		drvdata->type = LEGACY;
++ 		drvdata->data.tz = tz;
++ 		platform_set_drvdata(pdev, drvdata);
++ 
++ 		return 0;
+++>>>>>>> bbcf90c0646a (thermal: Explicitly enable non-changing thermal zone devices)
+  	}
+  
+ -	ret = armada_thermal_probe_syscon(pdev, priv);
+ -	if (ret)
+ -		return ret;
+ -
+ -	priv->current_channel = -1;
+ -	priv->data->init(pdev, priv);
+ -	drvdata->type = SYSCON;
+ -	drvdata->data.priv = priv;
+ -	platform_set_drvdata(pdev, drvdata);
+ -
+ -	irq = platform_get_irq(pdev, 0);
+ -	if (irq == -EPROBE_DEFER)
+ -		return irq;
+ -
+ -	/* The overheat interrupt feature is not mandatory */
+ -	if (irq > 0) {
+ -		ret = devm_request_threaded_irq(&pdev->dev, irq,
+ -						armada_overheat_isr,
+ -						armada_overheat_isr_thread,
+ -						0, NULL, priv);
+ -		if (ret) {
+ -			dev_err(&pdev->dev, "Cannot request threaded IRQ %d\n",
+ -				irq);
+ -			return ret;
+ -		}
+ -	}
+ -
+ -	/*
+ -	 * There is one channel for the IC and one per CPU (if any), each
+ -	 * channel has one sensor.
+ -	 */
+ -	for (sensor_id = 0; sensor_id <= priv->data->cpu_nr; sensor_id++) {
+ -		sensor = devm_kzalloc(&pdev->dev,
+ -				      sizeof(struct armada_thermal_sensor),
+ -				      GFP_KERNEL);
+ -		if (!sensor)
+ -			return -ENOMEM;
+ -
+ -		/* Register the sensor */
+ -		sensor->priv = priv;
+ -		sensor->id = sensor_id;
+ -		tz = devm_thermal_zone_of_sensor_register(&pdev->dev,
+ -							  sensor->id, sensor,
+ -							  &of_ops);
+ -		if (IS_ERR(tz)) {
+ -			dev_info(&pdev->dev, "Thermal sensor %d unavailable\n",
+ -				 sensor_id);
+ -			devm_kfree(&pdev->dev, sensor);
+ -			continue;
+ -		}
+ +	priv->data->init_sensor(pdev, priv);
+  
+ -		/*
+ -		 * The first channel that has a critical trip point registered
+ -		 * in the DT will serve as interrupt source. Others possible
+ -		 * critical trip points will simply be ignored by the driver.
+ -		 */
+ -		if (irq > 0 && !priv->overheat_sensor)
+ -			armada_configure_overheat_int(priv, tz, sensor->id);
+ +	thermal = thermal_zone_device_register(dev_name(&pdev->dev), 0, 0, priv,
+ +					       &ops, NULL, 0, 0);
+ +	if (IS_ERR(thermal)) {
+ +		dev_err(&pdev->dev,
+ +			"Failed to register thermal zone device\n");
+ +		return PTR_ERR(thermal);
+  	}
+  
+ -	/* Just complain if no overheat interrupt was set up */
+ -	if (!priv->overheat_sensor)
+ -		dev_warn(&pdev->dev, "Overheat interrupt not available\n");
+ +	platform_set_drvdata(pdev, thermal);
+  
+  	return 0;
+  }
+diff --git a/drivers/net/ethernet/chelsio/cxgb4/cxgb4_thermal.c b/drivers/net/ethernet/chelsio/cxgb4/cxgb4_thermal.c
+index 28052e7504e5..bb889bddc2cf 100644
+--- a/drivers/net/ethernet/chelsio/cxgb4/cxgb4_thermal.c
++++ b/drivers/net/ethernet/chelsio/cxgb4/cxgb4_thermal.c
+@@ -103,6 +103,14 @@ int cxgb4_thermal_init(struct adapter *adap)
+ 		ch_thermal->tzdev = NULL;
+ 		return ret;
+ 	}
++
++	ret = thermal_zone_device_enable(ch_thermal->tzdev);
++	if (ret) {
++		dev_err(adap->pdev_dev, "Failed to enable thermal zone\n");
++		thermal_zone_device_unregister(adap->ch_thermal.tzdev);
++		return ret;
++	}
++
+ 	return 0;
+ }
+ 
+diff --git a/drivers/net/wireless/intel/iwlwifi/mvm/tt.c b/drivers/net/wireless/intel/iwlwifi/mvm/tt.c
+index 418e59b7c671..0c95663bf9ed 100644
+--- a/drivers/net/wireless/intel/iwlwifi/mvm/tt.c
++++ b/drivers/net/wireless/intel/iwlwifi/mvm/tt.c
+@@ -733,7 +733,7 @@ static  struct thermal_zone_device_ops tzone_ops = {
+ 
+ static void iwl_mvm_thermal_zone_register(struct iwl_mvm *mvm)
+ {
+-	int i;
++	int i, ret;
+ 	char name[16];
+ 	static atomic_t counter = ATOMIC_INIT(0);
+ 
+@@ -759,6 +759,13 @@ static void iwl_mvm_thermal_zone_register(struct iwl_mvm *mvm)
+ 		return;
+ 	}
+ 
++	ret = thermal_zone_device_enable(mvm->tz_device.tzone);
++	if (ret) {
++		IWL_DEBUG_TEMP(mvm, "Failed to enable thermal zone\n");
++		thermal_zone_device_unregister(mvm->tz_device.tzone);
++		return;
++	}
++
+ 	/* 0 is a valid temperature,
+ 	 * so initialize the array with S16_MIN which invalid temperature
+ 	 */
+diff --git a/drivers/platform/x86/intel_mid_thermal.c b/drivers/platform/x86/intel_mid_thermal.c
+index 008a76903cbf..1e0819c8e8fd 100644
+--- a/drivers/platform/x86/intel_mid_thermal.c
++++ b/drivers/platform/x86/intel_mid_thermal.c
+@@ -509,6 +509,12 @@ static int mid_thermal_probe(struct platform_device *pdev)
+ 			ret = PTR_ERR(pinfo->tzd[i]);
+ 			goto err;
+ 		}
++		ret = thermal_zone_device_enable(pinfo->tzd[i]);
++		if (ret) {
++			kfree(td_info);
++			thermal_zone_device_unregister(pinfo->tzd[i]);
++			goto err;
++		}
+ 	}
+ 
+ 	pinfo->pdev = pdev;
+diff --git a/drivers/power/supply/power_supply_core.c b/drivers/power/supply/power_supply_core.c
+index 50bb57b205e7..b0eb4bb37954 100644
+--- a/drivers/power/supply/power_supply_core.c
++++ b/drivers/power/supply/power_supply_core.c
+@@ -718,7 +718,7 @@ static struct thermal_zone_device_ops psy_tzd_ops = {
+ 
+ static int psy_register_thermal(struct power_supply *psy)
+ {
+-	int i;
++	int i, ret;
+ 
+ 	if (psy->desc->no_thermal)
+ 		return 0;
+@@ -728,7 +728,12 @@ static int psy_register_thermal(struct power_supply *psy)
+ 		if (psy->desc->properties[i] == POWER_SUPPLY_PROP_TEMP) {
+ 			psy->tzd = thermal_zone_device_register(psy->desc->name,
+ 					0, 0, psy, &psy_tzd_ops, NULL, 0, 0);
+-			return PTR_ERR_OR_ZERO(psy->tzd);
++			if (IS_ERR(psy->tzd))
++				return PTR_ERR(psy->tzd);
++			ret = thermal_zone_device_enable(psy->tzd);
++			if (ret)
++				thermal_zone_device_unregister(psy->tzd);
++			return ret;
+ 		}
+ 	}
+ 	return 0;
+* Unmerged path drivers/thermal/armada_thermal.c
+diff --git a/drivers/thermal/dove_thermal.c b/drivers/thermal/dove_thermal.c
+index a0bc9de42553..5a74686e29a6 100644
+--- a/drivers/thermal/dove_thermal.c
++++ b/drivers/thermal/dove_thermal.c
+@@ -162,6 +162,12 @@ static int dove_thermal_probe(struct platform_device *pdev)
+ 		return PTR_ERR(thermal);
+ 	}
+ 
++	ret = thermal_zone_device_enable(thermal);
++	if (ret) {
++		thermal_zone_device_unregister(thermal);
++		return ret;
++	}
++
+ 	platform_set_drvdata(pdev, thermal);
+ 
+ 	return 0;
+diff --git a/drivers/thermal/intel/int340x_thermal/int340x_thermal_zone.c b/drivers/thermal/intel/int340x_thermal/int340x_thermal_zone.c
+index 432213272f1e..6e479deff76b 100644
+--- a/drivers/thermal/intel/int340x_thermal/int340x_thermal_zone.c
++++ b/drivers/thermal/intel/int340x_thermal/int340x_thermal_zone.c
+@@ -259,9 +259,14 @@ struct int34x_thermal_zone *int340x_thermal_zone_add(struct acpi_device *adev,
+ 		ret = PTR_ERR(int34x_thermal_zone->zone);
+ 		goto err_thermal_zone;
+ 	}
++	ret = thermal_zone_device_enable(int34x_thermal_zone->zone);
++	if (ret)
++		goto err_enable;
+ 
+ 	return int34x_thermal_zone;
+ 
++err_enable:
++	thermal_zone_device_unregister(int34x_thermal_zone->zone);
+ err_thermal_zone:
+ 	acpi_lpat_free_conversion_table(int34x_thermal_zone->lpat_table);
+ 	kfree(int34x_thermal_zone->aux_trips);
+diff --git a/drivers/thermal/intel/intel_pch_thermal.c b/drivers/thermal/intel/intel_pch_thermal.c
+index ed75a0c603e7..8a5d79e92d57 100644
+--- a/drivers/thermal/intel/intel_pch_thermal.c
++++ b/drivers/thermal/intel/intel_pch_thermal.c
+@@ -351,9 +351,14 @@ static int intel_pch_thermal_probe(struct pci_dev *pdev,
+ 		err = PTR_ERR(ptd->tzd);
+ 		goto error_cleanup;
+ 	}
++	err = thermal_zone_device_enable(ptd->tzd);
++	if (err)
++		goto err_unregister;
+ 
+ 	return 0;
+ 
++err_unregister:
++	thermal_zone_device_unregister(ptd->tzd);
+ error_cleanup:
+ 	iounmap(ptd->hw_base);
+ error_release:
+diff --git a/drivers/thermal/intel/intel_soc_dts_iosf.c b/drivers/thermal/intel/intel_soc_dts_iosf.c
+index 5716b62e0f73..2d6f3162934b 100644
+--- a/drivers/thermal/intel/intel_soc_dts_iosf.c
++++ b/drivers/thermal/intel/intel_soc_dts_iosf.c
+@@ -324,6 +324,9 @@ static int add_dts_thermal_zone(int id, struct intel_soc_dts_sensor_entry *dts,
+ 		ret = PTR_ERR(dts->tzone);
+ 		goto err_ret;
+ 	}
++	ret = thermal_zone_device_enable(dts->tzone);
++	if (ret)
++		goto err_enable;
+ 
+ 	ret = soc_dts_enable(id);
+ 	if (ret)
+diff --git a/drivers/thermal/intel/x86_pkg_temp_thermal.c b/drivers/thermal/intel/x86_pkg_temp_thermal.c
+index 4f6cf10e147d..365643db4652 100644
+--- a/drivers/thermal/intel/x86_pkg_temp_thermal.c
++++ b/drivers/thermal/intel/x86_pkg_temp_thermal.c
+@@ -390,6 +390,12 @@ static int pkg_temp_thermal_device_add(unsigned int cpu)
+ 		kfree(zonedev);
+ 		return err;
+ 	}
++	err = thermal_zone_device_enable(zonedev->tzone);
++	if (err) {
++		thermal_zone_device_unregister(zonedev->tzone);
++		kfree(zonedev);
++		return err;
++	}
+ 	/* Store MSR value for package thermal interrupt, to restore at exit */
+ 	rdmsr(MSR_IA32_PACKAGE_THERM_INTERRUPT, zonedev->msr_pkg_therm_low,
+ 	      zonedev->msr_pkg_therm_high);
+diff --git a/drivers/thermal/kirkwood_thermal.c b/drivers/thermal/kirkwood_thermal.c
+index 892236621767..9750cc07b2cf 100644
+--- a/drivers/thermal/kirkwood_thermal.c
++++ b/drivers/thermal/kirkwood_thermal.c
+@@ -74,6 +74,7 @@ static int kirkwood_thermal_probe(struct platform_device *pdev)
+ 	struct thermal_zone_device *thermal = NULL;
+ 	struct kirkwood_thermal_priv *priv;
+ 	struct resource *res;
++	int ret;
+ 
+ 	priv = devm_kzalloc(&pdev->dev, sizeof(*priv), GFP_KERNEL);
+ 	if (!priv)
+@@ -91,6 +92,12 @@ static int kirkwood_thermal_probe(struct platform_device *pdev)
+ 			"Failed to register thermal zone device\n");
+ 		return PTR_ERR(thermal);
+ 	}
++	ret = thermal_zone_device_enable(thermal);
++	if (ret) {
++		thermal_zone_device_unregister(thermal);
++		dev_err(&pdev->dev, "Failed to enable thermal zone device\n");
++		return ret;
++	}
+ 
+ 	platform_set_drvdata(pdev, thermal);
+ 
+diff --git a/drivers/thermal/rcar_thermal.c b/drivers/thermal/rcar_thermal.c
+index 45fb284d4c11..a1af0e477126 100644
+--- a/drivers/thermal/rcar_thermal.c
++++ b/drivers/thermal/rcar_thermal.c
+@@ -565,12 +565,19 @@ static int rcar_thermal_probe(struct platform_device *pdev)
+ 			priv->zone = devm_thermal_zone_of_sensor_register(
+ 						dev, i, priv,
+ 						&rcar_thermal_zone_of_ops);
+-		else
++		else {
+ 			priv->zone = thermal_zone_device_register(
+ 						"rcar_thermal",
+ 						1, 0, priv,
+ 						&rcar_thermal_zone_ops, NULL, 0,
+ 						idle);
++
++			ret = thermal_zone_device_enable(priv->zone);
++			if (ret) {
++				thermal_zone_device_unregister(priv->zone);
++				priv->zone = ERR_PTR(ret);
++			}
++		}
+ 		if (IS_ERR(priv->zone)) {
+ 			dev_err(dev, "can't register thermal zone\n");
+ 			ret = PTR_ERR(priv->zone);
+diff --git a/drivers/thermal/spear_thermal.c b/drivers/thermal/spear_thermal.c
+index 81b35aace9de..fbecb1626172 100644
+--- a/drivers/thermal/spear_thermal.c
++++ b/drivers/thermal/spear_thermal.c
+@@ -142,6 +142,11 @@ static int spear_thermal_probe(struct platform_device *pdev)
+ 		ret = PTR_ERR(spear_thermal);
+ 		goto disable_clk;
+ 	}
++	ret = thermal_zone_device_enable(spear_thermal);
++	if (ret) {
++		dev_err(&pdev->dev, "Cannot enable thermal zone\n");
++		goto unregister_tzd;
++	}
+ 
+ 	platform_set_drvdata(pdev, spear_thermal);
+ 
+@@ -150,6 +155,8 @@ static int spear_thermal_probe(struct platform_device *pdev)
+ 
+ 	return 0;
+ 
++unregister_tzd:
++	thermal_zone_device_unregister(spear_thermal);
+ disable_clk:
+ 	clk_disable(stdev->clk);
+ 
+diff --git a/drivers/thermal/st/st_thermal.c b/drivers/thermal/st/st_thermal.c
+index be637e6b01d2..de3cdc85364b 100644
+--- a/drivers/thermal/st/st_thermal.c
++++ b/drivers/thermal/st/st_thermal.c
+@@ -251,11 +251,16 @@ int st_thermal_register(struct platform_device *pdev,
+ 		ret = PTR_ERR(sensor->thermal_dev);
+ 		goto sensor_off;
+ 	}
++	ret = thermal_zone_device_enable(sensor->thermal_dev);
++	if (ret)
++		goto tzd_unregister;
+ 
+ 	platform_set_drvdata(pdev, sensor);
+ 
+ 	return 0;
+ 
++tzd_unregister:
++	thermal_zone_device_unregister(sensor->thermal_dev);
+ sensor_off:
+ 	st_thermal_sensor_off(sensor);
+ 
