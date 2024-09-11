@@ -1,0 +1,309 @@
+RDMA/core: Avoid freeing netdevs in disable_device()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-193.el8
+commit-author Parav Pandit <parav@mellanox.com>
+commit 3042492bd1f9a08e9cf4c1a4621e359fb0f9a126
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-193.el8/3042492b.failed
+
+So we can use the disable_device() helper while changing the net namespace
+of the rdma device in a subsequent patch, move free_netdevs() out of it.
+
+	Signed-off-by: Parav Pandit <parav@mellanox.com>
+	Signed-off-by: Jason Gunthorpe <jgg@mellanox.com>
+(cherry picked from commit 3042492bd1f9a08e9cf4c1a4621e359fb0f9a126)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/infiniband/core/device.c
+diff --cc drivers/infiniband/core/device.c
+index ec96a7b1c811,25f49b646007..000000000000
+--- a/drivers/infiniband/core/device.c
++++ b/drivers/infiniband/core/device.c
+@@@ -564,6 -1127,78 +564,81 @@@ static int setup_device(struct ib_devic
+  	return 0;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static void disable_device(struct ib_device *device)
++ {
++ 	struct ib_client *client;
++ 
++ 	WARN_ON(!refcount_read(&device->refcount));
++ 
++ 	down_write(&devices_rwsem);
++ 	xa_clear_mark(&devices, device->index, DEVICE_REGISTERED);
++ 	up_write(&devices_rwsem);
++ 
++ 	down_read(&clients_rwsem);
++ 	list_for_each_entry_reverse(client, &client_list, list)
++ 		remove_client_context(device, client->client_id);
++ 	up_read(&clients_rwsem);
++ 
++ 	/* Pairs with refcount_set in enable_device */
++ 	ib_device_put(device);
++ 	wait_for_completion(&device->unreg_completion);
++ 
++ 	/*
++ 	 * compat devices must be removed after device refcount drops to zero.
++ 	 * Otherwise init_net() may add more compatdevs after removing compat
++ 	 * devices and before device is disabled.
++ 	 */
++ 	remove_compat_devs(device);
++ }
++ 
++ /*
++  * An enabled device is visible to all clients and to all the public facing
++  * APIs that return a device pointer. This always returns with a new get, even
++  * if it fails.
++  */
++ static int enable_device_and_get(struct ib_device *device)
++ {
++ 	struct ib_client *client;
++ 	unsigned long index;
++ 	int ret = 0;
++ 
++ 	/*
++ 	 * One ref belongs to the xa and the other belongs to this
++ 	 * thread. This is needed to guard against parallel unregistration.
++ 	 */
++ 	refcount_set(&device->refcount, 2);
++ 	down_write(&devices_rwsem);
++ 	xa_set_mark(&devices, device->index, DEVICE_REGISTERED);
++ 
++ 	/*
++ 	 * By using downgrade_write() we ensure that no other thread can clear
++ 	 * DEVICE_REGISTERED while we are completing the client setup.
++ 	 */
++ 	downgrade_write(&devices_rwsem);
++ 
++ 	if (device->ops.enable_driver) {
++ 		ret = device->ops.enable_driver(device);
++ 		if (ret)
++ 			goto out;
++ 	}
++ 
++ 	down_read(&clients_rwsem);
++ 	xa_for_each_marked (&clients, index, client, CLIENT_REGISTERED) {
++ 		ret = add_client_context(device, client);
++ 		if (ret)
++ 			break;
++ 	}
++ 	up_read(&clients_rwsem);
++ 	if (!ret)
++ 		ret = add_compat_devs(device);
++ out:
++ 	up_read(&devices_rwsem);
++ 	return ret;
++ }
++ 
+++>>>>>>> 3042492bd1f9 (RDMA/core: Avoid freeing netdevs in disable_device())
+  /**
+   * ib_register_device - Register an IB device with IB core
+   * @device:Device to register
+@@@ -647,58 -1279,161 +722,97 @@@ out
+  }
+  EXPORT_SYMBOL(ib_register_device);
+  
+++<<<<<<< HEAD
+++=======
++ /* Callers must hold a get on the device. */
++ static void __ib_unregister_device(struct ib_device *ib_dev)
++ {
++ 	/*
++ 	 * We have a registration lock so that all the calls to unregister are
++ 	 * fully fenced, once any unregister returns the device is truely
++ 	 * unregistered even if multiple callers are unregistering it at the
++ 	 * same time. This also interacts with the registration flow and
++ 	 * provides sane semantics if register and unregister are racing.
++ 	 */
++ 	mutex_lock(&ib_dev->unregistration_lock);
++ 	if (!refcount_read(&ib_dev->refcount))
++ 		goto out;
++ 
++ 	disable_device(ib_dev);
++ 
++ 	/* Expedite removing unregistered pointers from the hash table */
++ 	free_netdevs(ib_dev);
++ 
++ 	ib_device_unregister_sysfs(ib_dev);
++ 	device_del(&ib_dev->dev);
++ 	ib_device_unregister_rdmacg(ib_dev);
++ 	ib_cache_cleanup_one(ib_dev);
++ 
++ 	/*
++ 	 * Drivers using the new flow may not call ib_dealloc_device except
++ 	 * in error unwind prior to registration success.
++ 	 */
++ 	if (ib_dev->ops.dealloc_driver) {
++ 		WARN_ON(kref_read(&ib_dev->dev.kobj.kref) <= 1);
++ 		ib_dealloc_device(ib_dev);
++ 	}
++ out:
++ 	mutex_unlock(&ib_dev->unregistration_lock);
++ }
++ 
+++>>>>>>> 3042492bd1f9 (RDMA/core: Avoid freeing netdevs in disable_device())
+  /**
+   * ib_unregister_device - Unregister an IB device
+ - * @device: The device to unregister
+ + * @device:Device to unregister
+   *
+   * Unregister an IB device.  All clients will receive a remove callback.
+ - *
+ - * Callers should call this routine only once, and protect against races with
+ - * registration. Typically it should only be called as part of a remove
+ - * callback in an implementation of driver core's struct device_driver and
+ - * related.
+ - *
+ - * If ops.dealloc_driver is used then ib_dev will be freed upon return from
+ - * this function.
+ - */
+ -void ib_unregister_device(struct ib_device *ib_dev)
+ -{
+ -	get_device(&ib_dev->dev);
+ -	__ib_unregister_device(ib_dev);
+ -	put_device(&ib_dev->dev);
+ -}
+ -EXPORT_SYMBOL(ib_unregister_device);
+ -
+ -/**
+ - * ib_unregister_device_and_put - Unregister a device while holding a 'get'
+ - * device: The device to unregister
+ - *
+ - * This is the same as ib_unregister_device(), except it includes an internal
+ - * ib_device_put() that should match a 'get' obtained by the caller.
+ - *
+ - * It is safe to call this routine concurrently from multiple threads while
+ - * holding the 'get'. When the function returns the device is fully
+ - * unregistered.
+ - *
+ - * Drivers using this flow MUST use the driver_unregister callback to clean up
+ - * their resources associated with the device and dealloc it.
+ - */
+ -void ib_unregister_device_and_put(struct ib_device *ib_dev)
+ -{
+ -	WARN_ON(!ib_dev->ops.dealloc_driver);
+ -	get_device(&ib_dev->dev);
+ -	ib_device_put(ib_dev);
+ -	__ib_unregister_device(ib_dev);
+ -	put_device(&ib_dev->dev);
+ -}
+ -EXPORT_SYMBOL(ib_unregister_device_and_put);
+ -
+ -/**
+ - * ib_unregister_driver - Unregister all IB devices for a driver
+ - * @driver_id: The driver to unregister
+ - *
+ - * This implements a fence for device unregistration. It only returns once all
+ - * devices associated with the driver_id have fully completed their
+ - * unregistration and returned from ib_unregister_device*().
+ - *
+ - * If device's are not yet unregistered it goes ahead and starts unregistering
+ - * them.
+ - *
+ - * This does not block creation of new devices with the given driver_id, that
+ - * is the responsibility of the caller.
+   */
+ -void ib_unregister_driver(enum rdma_driver_id driver_id)
+ +void ib_unregister_device(struct ib_device *device)
+  {
+ -	struct ib_device *ib_dev;
+ -	unsigned long index;
+ +	struct ib_client_data *context, *tmp;
+ +	unsigned long flags;
+  
+ -	down_read(&devices_rwsem);
+ -	xa_for_each (&devices, index, ib_dev) {
+ -		if (ib_dev->driver_id != driver_id)
+ -			continue;
+ +	/*
+ +	 * Wait for all netlink command callers to finish working on the
+ +	 * device.
+ +	 */
+ +	ib_device_put(device);
+ +	wait_for_completion(&device->unreg_completion);
+  
+ -		get_device(&ib_dev->dev);
+ -		up_read(&devices_rwsem);
+ +	mutex_lock(&device_mutex);
+  
+ -		WARN_ON(!ib_dev->ops.dealloc_driver);
+ -		__ib_unregister_device(ib_dev);
+ +	down_write(&lists_rwsem);
+ +	list_del(&device->core_list);
+ +	write_lock_irq(&device->client_data_lock);
+ +	list_for_each_entry(context, &device->client_data_list, list)
+ +		context->going_down = true;
+ +	write_unlock_irq(&device->client_data_lock);
+ +	downgrade_write(&lists_rwsem);
+  
+ -		put_device(&ib_dev->dev);
+ -		down_read(&devices_rwsem);
+ +	list_for_each_entry(context, &device->client_data_list, list) {
+ +		if (context->client->remove)
+ +			context->client->remove(device, context->data);
+  	}
+ -	up_read(&devices_rwsem);
+ -}
+ -EXPORT_SYMBOL(ib_unregister_driver);
+ +	up_read(&lists_rwsem);
+  
+ -static void ib_unregister_work(struct work_struct *work)
+ -{
+ -	struct ib_device *ib_dev =
+ -		container_of(work, struct ib_device, unregistration_work);
+ +	ib_device_unregister_sysfs(device);
+ +	ib_device_unregister_rdmacg(device);
+  
+ -	__ib_unregister_device(ib_dev);
+ -	put_device(&ib_dev->dev);
+ -}
+ +	mutex_unlock(&device_mutex);
+  
+ -/**
+ - * ib_unregister_device_queued - Unregister a device using a work queue
+ - * device: The device to unregister
+ - *
+ - * This schedules an asynchronous unregistration using a WQ for the device. A
+ - * driver should use this to avoid holding locks while doing unregistration,
+ - * such as holding the RTNL lock.
+ - *
+ - * Drivers using this API must use ib_unregister_driver before module unload
+ - * to ensure that all scheduled unregistrations have completed.
+ - */
+ -void ib_unregister_device_queued(struct ib_device *ib_dev)
+ -{
+ -	WARN_ON(!refcount_read(&ib_dev->refcount));
+ -	WARN_ON(!ib_dev->ops.dealloc_driver);
+ -	get_device(&ib_dev->dev);
+ -	if (!queue_work(system_unbound_wq, &ib_dev->unregistration_work))
+ -		put_device(&ib_dev->dev);
+ -}
+ -EXPORT_SYMBOL(ib_unregister_device_queued);
+ +	ib_cache_cleanup_one(device);
+  
+ -static struct pernet_operations rdma_dev_net_ops = {
+ -	.init = rdma_dev_init_net,
+ -	.exit = rdma_dev_exit_net,
+ -	.id = &rdma_dev_net_id,
+ -	.size = sizeof(struct rdma_dev_net),
+ -};
+ +	down_write(&lists_rwsem);
+ +	write_lock_irqsave(&device->client_data_lock, flags);
+ +	list_for_each_entry_safe(context, tmp, &device->client_data_list,
+ +				 list) {
+ +		list_del(&context->list);
+ +		kfree(context);
+ +	}
+ +	write_unlock_irqrestore(&device->client_data_lock, flags);
+ +	up_write(&lists_rwsem);
+ +}
+ +EXPORT_SYMBOL(ib_unregister_device);
+  
+  static int assign_client_id(struct ib_client *client)
+  {
+* Unmerged path drivers/infiniband/core/device.c
