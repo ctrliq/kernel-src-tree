@@ -1,0 +1,208 @@
+RDMA/core: Reorganize create QP low-level functions
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-394.el8
+commit-author Leon Romanovsky <leonro@nvidia.com>
+commit 8da9fe4e4fa7d561df0f3fe65bfa6dbf78aa7590
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-394.el8/8da9fe4e.failed
+
+The low-level create QP function grew to be larger than any sensible
+inline function should be. The inline attribute is not really needed for
+that function and can be implemented as exported symbol.
+
+Link: https://lore.kernel.org/r/2c08709d86f876c3dfb77684357b2a939e570ca4.1628014762.git.leonro@nvidia.com
+	Signed-off-by: Leon Romanovsky <leonro@nvidia.com>
+	Signed-off-by: Jason Gunthorpe <jgg@nvidia.com>
+(cherry picked from commit 8da9fe4e4fa7d561df0f3fe65bfa6dbf78aa7590)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/infiniband/core/core_priv.h
+diff --cc drivers/infiniband/core/core_priv.h
+index 98de555ab173,d28ced053222..000000000000
+--- a/drivers/infiniband/core/core_priv.h
++++ b/drivers/infiniband/core/core_priv.h
+@@@ -316,46 -316,10 +316,53 @@@ struct ib_device *ib_device_get_by_inde
+  void nldev_init(void);
+  void nldev_exit(void);
+  
+++<<<<<<< HEAD
+ +static inline struct ib_qp *
+ +_ib_create_qp(struct ib_device *dev, struct ib_pd *pd,
+ +	      struct ib_qp_init_attr *attr, struct ib_udata *udata,
+ +	      struct ib_uqp_object *uobj, const char *caller)
+ +{
+ +	struct ib_qp *qp;
+ +
+ +	if (!dev->ops.create_qp)
+ +		return ERR_PTR(-EOPNOTSUPP);
+ +
+ +	qp = dev->ops.create_qp(pd, attr, udata);
+ +	if (IS_ERR(qp))
+ +		return qp;
+ +
+ +	qp->device = dev;
+ +	qp->pd = pd;
+ +	qp->uobject = uobj;
+ +	qp->real_qp = qp;
+ +
+ +	qp->qp_type = attr->qp_type;
+ +	qp->rwq_ind_tbl = attr->rwq_ind_tbl;
+ +	qp->send_cq = attr->send_cq;
+ +	qp->recv_cq = attr->recv_cq;
+ +	qp->srq = attr->srq;
+ +	qp->rwq_ind_tbl = attr->rwq_ind_tbl;
+ +	qp->event_handler = attr->event_handler;
+ +	qp->port = attr->port_num;
+ +	qp->qp_context = attr->qp_context;
+ +
+ +	atomic_set(&qp->usecnt, 0);
+ +	spin_lock_init(&qp->mr_lock);
+ +	INIT_LIST_HEAD(&qp->rdma_mrs);
+ +	INIT_LIST_HEAD(&qp->sig_mrs);
+ +
+ +	rdma_restrack_new(&qp->res, RDMA_RESTRACK_QP);
+ +	WARN_ONCE(!udata && !caller, "Missing kernel QP owner");
+ +	rdma_restrack_set_name(&qp->res, udata ? NULL : caller);
+ +	rdma_restrack_add(&qp->res);
+ +	return qp;
+ +}
+++=======
++ struct ib_qp *_ib_create_qp(struct ib_device *dev, struct ib_pd *pd,
++ 			    struct ib_qp_init_attr *attr,
++ 			    struct ib_udata *udata, struct ib_uqp_object *uobj,
++ 			    const char *caller);
+++>>>>>>> 8da9fe4e4fa7 (RDMA/core: Reorganize create QP low-level functions)
+  
+  struct rdma_dev_addr;
+  int rdma_resolve_ip_route(struct sockaddr *src_addr,
+* Unmerged path drivers/infiniband/core/core_priv.h
+diff --git a/drivers/infiniband/core/verbs.c b/drivers/infiniband/core/verbs.c
+index 15688810fb77..2c141f92dd2b 100644
+--- a/drivers/infiniband/core/verbs.c
++++ b/drivers/infiniband/core/verbs.c
+@@ -1200,19 +1200,75 @@ static struct ib_qp *create_xrc_qp_user(struct ib_qp *qp,
+ }
+ 
+ /**
+- * ib_create_named_qp - Creates a kernel QP associated with the specified protection
+- *   domain.
++ * _ib_create_qp - Creates a QP associated with the specified protection domain
++ * @dev: IB device
+  * @pd: The protection domain associated with the QP.
+- * @qp_init_attr: A list of initial attributes required to create the
++ * @attr: A list of initial attributes required to create the
+  *   QP.  If QP creation succeeds, then the attributes are updated to
+  *   the actual capabilities of the created QP.
++ * @udata: User data
++ * @uobj: uverbs obect
+  * @caller: caller's build-time module name
+- *
+- * NOTE: for user qp use ib_create_qp_user with valid udata!
+  */
+-struct ib_qp *ib_create_named_qp(struct ib_pd *pd,
+-				 struct ib_qp_init_attr *qp_init_attr,
+-				 const char *caller)
++struct ib_qp *_ib_create_qp(struct ib_device *dev, struct ib_pd *pd,
++			    struct ib_qp_init_attr *attr,
++			    struct ib_udata *udata, struct ib_uqp_object *uobj,
++			    const char *caller)
++{
++	struct ib_qp *qp;
++	int ret;
++
++	if (!dev->ops.create_qp)
++		return ERR_PTR(-EOPNOTSUPP);
++
++	qp = rdma_zalloc_drv_obj_numa(dev, ib_qp);
++	if (!qp)
++		return ERR_PTR(-ENOMEM);
++
++	qp->device = dev;
++	qp->pd = pd;
++	qp->uobject = uobj;
++	qp->real_qp = qp;
++
++	qp->qp_type = attr->qp_type;
++	qp->rwq_ind_tbl = attr->rwq_ind_tbl;
++	qp->srq = attr->srq;
++	qp->event_handler = attr->event_handler;
++	qp->port = attr->port_num;
++	qp->qp_context = attr->qp_context;
++
++	spin_lock_init(&qp->mr_lock);
++	INIT_LIST_HEAD(&qp->rdma_mrs);
++	INIT_LIST_HEAD(&qp->sig_mrs);
++
++	rdma_restrack_new(&qp->res, RDMA_RESTRACK_QP);
++	WARN_ONCE(!udata && !caller, "Missing kernel QP owner");
++	rdma_restrack_set_name(&qp->res, udata ? NULL : caller);
++	ret = dev->ops.create_qp(qp, attr, udata);
++	if (ret)
++		goto err_create;
++
++	/*
++	 * TODO: The mlx4 internally overwrites send_cq and recv_cq.
++	 * Unfortunately, it is not an easy task to fix that driver.
++	 */
++	qp->send_cq = attr->send_cq;
++	qp->recv_cq = attr->recv_cq;
++
++	rdma_restrack_add(&qp->res);
++	return qp;
++
++err_create:
++	rdma_restrack_put(&qp->res);
++	kfree(qp);
++	return ERR_PTR(ret);
++
++}
++EXPORT_SYMBOL(_ib_create_qp);
++
++struct ib_qp *ib_create_qp_kernel(struct ib_pd *pd,
++				  struct ib_qp_init_attr *qp_init_attr,
++				  const char *caller)
+ {
+ 	struct ib_device *device = pd ? pd->device : qp_init_attr->xrcd->device;
+ 	struct ib_qp *qp;
+@@ -1279,7 +1335,7 @@ struct ib_qp *ib_create_named_qp(struct ib_pd *pd,
+ 	return ERR_PTR(ret);
+ 
+ }
+-EXPORT_SYMBOL(ib_create_named_qp);
++EXPORT_SYMBOL(ib_create_qp_kernel);
+ 
+ static const struct {
+ 	int			valid;
+diff --git a/include/rdma/ib_verbs.h b/include/rdma/ib_verbs.h
+index a7f4b93a7cab..25b9c61d4f91 100644
+--- a/include/rdma/ib_verbs.h
++++ b/include/rdma/ib_verbs.h
+@@ -3666,13 +3666,21 @@ static inline int ib_post_srq_recv(struct ib_srq *srq,
+ 					      bad_recv_wr ? : &dummy);
+ }
+ 
+-struct ib_qp *ib_create_named_qp(struct ib_pd *pd,
+-				 struct ib_qp_init_attr *qp_init_attr,
+-				 const char *caller);
++struct ib_qp *ib_create_qp_kernel(struct ib_pd *pd,
++				  struct ib_qp_init_attr *qp_init_attr,
++				  const char *caller);
++/**
++ * ib_create_qp - Creates a kernel QP associated with the specific protection
++ * domain.
++ * @pd: The protection domain associated with the QP.
++ * @init_attr: A list of initial attributes required to create the
++ *   QP.  If QP creation succeeds, then the attributes are updated to
++ *   the actual capabilities of the created QP.
++ */
+ static inline struct ib_qp *ib_create_qp(struct ib_pd *pd,
+ 					 struct ib_qp_init_attr *init_attr)
+ {
+-	return ib_create_named_qp(pd, init_attr, KBUILD_MODNAME);
++	return ib_create_qp_kernel(pd, init_attr, KBUILD_MODNAME);
+ }
+ 
+ /**
