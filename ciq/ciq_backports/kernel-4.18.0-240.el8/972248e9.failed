@@ -1,0 +1,177 @@
+scsi: bsg-lib: handle bidi requests without block layer help
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Christoph Hellwig <hch@lst.de>
+commit 972248e9111ee6fe9fb56c24ecfd7434f3d713ac
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/972248e9.failed
+
+We can just stash away the second request in struct bsg_job instead of
+using the block layer req->next_rq field, allowing for the eventual removal
+of the latter.
+
+	Signed-off-by: Christoph Hellwig <hch@lst.de>
+	Acked-by: Jens Axboe <axboe@kernel.dk>
+	Signed-off-by: Martin K. Petersen <martin.petersen@oracle.com>
+(cherry picked from commit 972248e9111ee6fe9fb56c24ecfd7434f3d713ac)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	block/bsg.c
+diff --cc block/bsg.c
+index 462bff07340c,f306853c6b08..000000000000
+--- a/block/bsg.c
++++ b/block/bsg.c
+@@@ -174,25 -175,6 +175,28 @@@ static int bsg_sg_io(struct request_que
+  	if (rq->timeout < BLK_MIN_SG_TIMEOUT)
+  		rq->timeout = BLK_MIN_SG_TIMEOUT;
+  
+++<<<<<<< HEAD
+ +	if (hdr.dout_xfer_len && hdr.din_xfer_len) {
+ +		if (!test_bit(QUEUE_FLAG_BIDI, &q->queue_flags)) {
+ +			ret = -EOPNOTSUPP;
+ +			goto out;
+ +		}
+ +
+ +		next_rq = blk_get_request(q, REQ_OP_SCSI_IN, 0);
+ +		if (IS_ERR(next_rq)) {
+ +			ret = PTR_ERR(next_rq);
+ +			goto out;
+ +		}
+ +
+ +		rq->next_rq = next_rq;
+ +		ret = blk_rq_map_user(q, next_rq, NULL, uptr64(hdr.din_xferp),
+ +				       hdr.din_xfer_len, GFP_KERNEL);
+ +		if (ret)
+ +			goto out_free_nextrq;
+ +	}
+ +
+++=======
+++>>>>>>> 972248e9111e (scsi: bsg-lib: handle bidi requests without block layer help)
+  	if (hdr.dout_xfer_len) {
+  		ret = blk_rq_map_user(q, rq, NULL, uptr64(hdr.dout_xferp),
+  				hdr.dout_xfer_len, GFP_KERNEL);
+diff --git a/block/bsg-lib.c b/block/bsg-lib.c
+index 5c22ce4b89b5..023101e993df 100644
+--- a/block/bsg-lib.c
++++ b/block/bsg-lib.c
+@@ -51,11 +51,40 @@ static int bsg_transport_fill_hdr(struct request *rq, struct sg_io_v4 *hdr,
+ 		fmode_t mode)
+ {
+ 	struct bsg_job *job = blk_mq_rq_to_pdu(rq);
++	int ret;
+ 
+ 	job->request_len = hdr->request_len;
+ 	job->request = memdup_user(uptr64(hdr->request), hdr->request_len);
++	if (IS_ERR(job->request))
++		return PTR_ERR(job->request);
++
++	if (hdr->dout_xfer_len && hdr->din_xfer_len) {
++		job->bidi_rq = blk_get_request(rq->q, REQ_OP_SCSI_IN, 0);
++		if (IS_ERR(job->bidi_rq)) {
++			ret = PTR_ERR(job->bidi_rq);
++			goto out;
++		}
++
++		ret = blk_rq_map_user(rq->q, job->bidi_rq, NULL,
++				uptr64(hdr->din_xferp), hdr->din_xfer_len,
++				GFP_KERNEL);
++		if (ret)
++			goto out_free_bidi_rq;
++
++		job->bidi_bio = job->bidi_rq->bio;
++	} else {
++		job->bidi_rq = NULL;
++		job->bidi_bio = NULL;
++	}
++
++	return 0;
+ 
+-	return PTR_ERR_OR_ZERO(job->request);
++out_free_bidi_rq:
++	if (job->bidi_rq)
++		blk_put_request(job->bidi_rq);
++out:
++	kfree(job->request);
++	return ret;
+ }
+ 
+ static int bsg_transport_complete_rq(struct request *rq, struct sg_io_v4 *hdr)
+@@ -93,7 +122,7 @@ static int bsg_transport_complete_rq(struct request *rq, struct sg_io_v4 *hdr)
+ 	/* we assume all request payload was transferred, residual == 0 */
+ 	hdr->dout_resid = 0;
+ 
+-	if (rq->next_rq) {
++	if (job->bidi_rq) {
+ 		unsigned int rsp_len = job->reply_payload.payload_len;
+ 
+ 		if (WARN_ON(job->reply_payload_rcv_len > rsp_len))
+@@ -111,6 +140,11 @@ static void bsg_transport_free_rq(struct request *rq)
+ {
+ 	struct bsg_job *job = blk_mq_rq_to_pdu(rq);
+ 
++	if (job->bidi_rq) {
++		blk_rq_unmap_user(job->bidi_bio);
++		blk_put_request(job->bidi_rq);
++	}
++
+ 	kfree(job->request);
+ }
+ 
+@@ -200,7 +234,6 @@ static int bsg_map_buffer(struct bsg_buffer *buf, struct request *req)
+  */
+ static bool bsg_prepare_job(struct device *dev, struct request *req)
+ {
+-	struct request *rsp = req->next_rq;
+ 	struct bsg_job *job = blk_mq_rq_to_pdu(req);
+ 	int ret;
+ 
+@@ -211,8 +244,8 @@ static bool bsg_prepare_job(struct device *dev, struct request *req)
+ 		if (ret)
+ 			goto failjob_rls_job;
+ 	}
+-	if (rsp && rsp->bio) {
+-		ret = bsg_map_buffer(&job->reply_payload, rsp);
++	if (job->bidi_rq) {
++		ret = bsg_map_buffer(&job->reply_payload, job->bidi_rq);
+ 		if (ret)
+ 			goto failjob_rls_rqst_payload;
+ 	}
+@@ -371,7 +404,6 @@ struct request_queue *bsg_setup_queue(struct device *dev, const char *name,
+ 	}
+ 
+ 	q->queuedata = dev;
+-	blk_queue_flag_set(QUEUE_FLAG_BIDI, q);
+ 	blk_queue_rq_timeout(q, BLK_DEFAULT_SG_TIMEOUT);
+ 
+ 	ret = bsg_register_queue(q, dev, name, &bsg_transport_ops);
+* Unmerged path block/bsg.c
+diff --git a/drivers/scsi/scsi_transport_sas.c b/drivers/scsi/scsi_transport_sas.c
+index 6407eac83854..b921df41e400 100644
+--- a/drivers/scsi/scsi_transport_sas.c
++++ b/drivers/scsi/scsi_transport_sas.c
+@@ -213,7 +213,6 @@ static int sas_bsg_initialize(struct Scsi_Host *shost, struct sas_rphy *rphy)
+ 		to_sas_host_attrs(shost)->q = q;
+ 	}
+ 
+-	blk_queue_flag_set(QUEUE_FLAG_BIDI, q);
+ 	return 0;
+ }
+ 
+diff --git a/include/linux/bsg-lib.h b/include/linux/bsg-lib.h
+index 6c8afaa66d68..e08a4df89a52 100644
+--- a/include/linux/bsg-lib.h
++++ b/include/linux/bsg-lib.h
+@@ -69,6 +69,10 @@ struct bsg_job {
+ 	int result;
+ 	unsigned int reply_payload_rcv_len;
+ 
++	/* BIDI support */
++	struct request *bidi_rq;
++	struct bio *bidi_bio;
++
+ 	void *dd_data;		/* Used for driver-specific storage */
+ 
+ 	RH_KABI_RESERVE(1)
