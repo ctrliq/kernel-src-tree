@@ -1,0 +1,296 @@
+bpf, xdp: Restructure redirect actions
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-358.el8
+commit-author Björn Töpel <bjorn.topel@intel.com>
+commit ee75aef23afe6e88497151c127c13ed69f41aaa2
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-358.el8/ee75aef2.failed
+
+The XDP_REDIRECT implementations for maps and non-maps are fairly
+similar, but obviously need to take different code paths depending on
+if the target is using a map or not. Today, the redirect targets for
+XDP either uses a map, or is based on ifindex.
+
+Here, the map type and id are added to bpf_redirect_info, instead of
+the actual map. Map type, map item/ifindex, and the map_id (if any) is
+passed to xdp_do_redirect().
+
+For ifindex-based redirect, used by the bpf_redirect() XDP BFP helper,
+a special map type/id are used. Map type of UNSPEC together with map id
+equal to INT_MAX has the special meaning of an ifindex based
+redirect. Note that valid map ids are 1 inclusive, INT_MAX exclusive
+([1,INT_MAX[).
+
+In addition to making the code easier to follow, using explicit type
+and id in bpf_redirect_info has a slight positive performance impact
+by avoiding a pointer indirection for the map type lookup, and instead
+use the cacheline for bpf_redirect_info.
+
+Since the actual map is not passed via bpf_redirect_info anymore, the
+map lookup is only done in the BPF helper. This means that the
+bpf_clear_redirect_map() function can be removed. The actual map item
+is RCU protected.
+
+The bpf_redirect_info flags member is not used by XDP, and not
+read/written any more. The map member is only written to when
+required/used, and not unconditionally.
+
+	Signed-off-by: Björn Töpel <bjorn.topel@intel.com>
+	Signed-off-by: Daniel Borkmann <daniel@iogearbox.net>
+	Reviewed-by: Maciej Fijalkowski <maciej.fijalkowski@intel.com>
+	Acked-by: Jesper Dangaard Brouer <brouer@redhat.com>
+	Acked-by: Toke Høiland-Jørgensen <toke@redhat.com>
+Link: https://lore.kernel.org/bpf/20210308112907.559576-3-bjorn.topel@gmail.com
+(cherry picked from commit ee75aef23afe6e88497151c127c13ed69f41aaa2)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/filter.h
+#	net/core/filter.c
+diff --cc include/linux/filter.h
+index 4dc7b049008a,b2b85b2cad8e..000000000000
+--- a/include/linux/filter.h
++++ b/include/linux/filter.h
+@@@ -1486,4 -1473,32 +1487,35 @@@ static inline bool bpf_sk_lookup_run_v6
+  }
+  #endif /* IS_ENABLED(CONFIG_IPV6) */
+  
+++<<<<<<< HEAD
+++=======
++ static __always_inline int __bpf_xdp_redirect_map(struct bpf_map *map, u32 ifindex, u64 flags,
++ 						  void *lookup_elem(struct bpf_map *map, u32 key))
++ {
++ 	struct bpf_redirect_info *ri = this_cpu_ptr(&bpf_redirect_info);
++ 
++ 	/* Lower bits of the flags are used as return code on lookup failure */
++ 	if (unlikely(flags > XDP_TX))
++ 		return XDP_ABORTED;
++ 
++ 	ri->tgt_value = lookup_elem(map, ifindex);
++ 	if (unlikely(!ri->tgt_value)) {
++ 		/* If the lookup fails we want to clear out the state in the
++ 		 * redirect_info struct completely, so that if an eBPF program
++ 		 * performs multiple lookups, the last one always takes
++ 		 * precedence.
++ 		 */
++ 		ri->map_id = INT_MAX; /* Valid map id idr range: [1,INT_MAX[ */
++ 		ri->map_type = BPF_MAP_TYPE_UNSPEC;
++ 		return flags;
++ 	}
++ 
++ 	ri->tgt_index = ifindex;
++ 	ri->map_id = map->id;
++ 	ri->map_type = map->map_type;
++ 
++ 	return XDP_REDIRECT;
++ }
++ 
+++>>>>>>> ee75aef23afe (bpf, xdp: Restructure redirect actions)
+  #endif /* __LINUX_FILTER_H__ */
+diff --cc net/core/filter.c
+index 6626442897f0,b6732000d8a2..000000000000
+--- a/net/core/filter.c
++++ b/net/core/filter.c
+@@@ -3963,39 -3926,6 +3946,42 @@@ void xdp_do_flush(void
+  }
+  EXPORT_SYMBOL_GPL(xdp_do_flush);
+  
+++<<<<<<< HEAD
+ +static inline void *__xdp_map_lookup_elem(struct bpf_map *map, u32 index)
+ +{
+ +	switch (map->map_type) {
+ +	case BPF_MAP_TYPE_DEVMAP:
+ +		return __dev_map_lookup_elem(map, index);
+ +	case BPF_MAP_TYPE_DEVMAP_HASH:
+ +		return __dev_map_hash_lookup_elem(map, index);
+ +	case BPF_MAP_TYPE_CPUMAP:
+ +		return __cpu_map_lookup_elem(map, index);
+ +	case BPF_MAP_TYPE_XSKMAP:
+ +		return __xsk_map_lookup_elem(map, index);
+ +	default:
+ +		return NULL;
+ +	}
+ +}
+ +
+ +void bpf_clear_redirect_map(struct bpf_map *map)
+ +{
+ +	struct bpf_redirect_info *ri;
+ +	int cpu;
+ +
+ +	for_each_possible_cpu(cpu) {
+ +		ri = per_cpu_ptr(&bpf_redirect_info, cpu);
+ +		/* Avoid polluting remote cacheline due to writes if
+ +		 * not needed. Once we pass this test, we need the
+ +		 * cmpxchg() to make sure it hasn't been changed in
+ +		 * the meantime by remote CPU.
+ +		 */
+ +		if (unlikely(READ_ONCE(ri->map) == map))
+ +			cmpxchg(&ri->map, map, NULL);
+ +	}
+ +}
+ +
+++=======
+++>>>>>>> ee75aef23afe (bpf, xdp: Restructure redirect actions)
+  int xdp_do_redirect(struct net_device *dev, struct xdp_buff *xdp,
+  		    struct bpf_prog *xdp_prog)
+  {
+* Unmerged path include/linux/filter.h
+diff --git a/include/trace/events/xdp.h b/include/trace/events/xdp.h
+index 76a97176ab81..fcad3645a70b 100644
+--- a/include/trace/events/xdp.h
++++ b/include/trace/events/xdp.h
+@@ -86,19 +86,15 @@ struct _bpf_dtab_netdev {
+ };
+ #endif /* __DEVMAP_OBJ_TYPE */
+ 
+-#define devmap_ifindex(tgt, map)				\
+-	(((map->map_type == BPF_MAP_TYPE_DEVMAP ||	\
+-		  map->map_type == BPF_MAP_TYPE_DEVMAP_HASH)) ? \
+-	  ((struct _bpf_dtab_netdev *)tgt)->dev->ifindex : 0)
+-
+ DECLARE_EVENT_CLASS(xdp_redirect_template,
+ 
+ 	TP_PROTO(const struct net_device *dev,
+ 		 const struct bpf_prog *xdp,
+ 		 const void *tgt, int err,
+-		 const struct bpf_map *map, u32 index),
++		 enum bpf_map_type map_type,
++		 u32 map_id, u32 index),
+ 
+-	TP_ARGS(dev, xdp, tgt, err, map, index),
++	TP_ARGS(dev, xdp, tgt, err, map_type, map_id, index),
+ 
+ 	TP_STRUCT__entry(
+ 		__field(int, prog_id)
+@@ -111,14 +107,22 @@ DECLARE_EVENT_CLASS(xdp_redirect_template,
+ 	),
+ 
+ 	TP_fast_assign(
++		u32 ifindex = 0, map_index = index;
++
++		if (map_type == BPF_MAP_TYPE_DEVMAP || map_type == BPF_MAP_TYPE_DEVMAP_HASH) {
++			ifindex = ((struct _bpf_dtab_netdev *)tgt)->dev->ifindex;
++		} else if (map_type == BPF_MAP_TYPE_UNSPEC && map_id == INT_MAX) {
++			ifindex = index;
++			map_index = 0;
++		}
++
+ 		__entry->prog_id	= xdp->aux->id;
+ 		__entry->act		= XDP_REDIRECT;
+ 		__entry->ifindex	= dev->ifindex;
+ 		__entry->err		= err;
+-		__entry->to_ifindex	= map ? devmap_ifindex(tgt, map) :
+-						index;
+-		__entry->map_id		= map ? map->id : 0;
+-		__entry->map_index	= map ? index : 0;
++		__entry->to_ifindex	= ifindex;
++		__entry->map_id		= map_id;
++		__entry->map_index	= map_index;
+ 	),
+ 
+ 	TP_printk("prog_id=%d action=%s ifindex=%d to_ifindex=%d err=%d"
+@@ -133,45 +137,49 @@ DEFINE_EVENT(xdp_redirect_template, xdp_redirect,
+ 	TP_PROTO(const struct net_device *dev,
+ 		 const struct bpf_prog *xdp,
+ 		 const void *tgt, int err,
+-		 const struct bpf_map *map, u32 index),
+-	TP_ARGS(dev, xdp, tgt, err, map, index)
++		 enum bpf_map_type map_type,
++		 u32 map_id, u32 index),
++	TP_ARGS(dev, xdp, tgt, err, map_type, map_id, index)
+ );
+ 
+ DEFINE_EVENT(xdp_redirect_template, xdp_redirect_err,
+ 	TP_PROTO(const struct net_device *dev,
+ 		 const struct bpf_prog *xdp,
+ 		 const void *tgt, int err,
+-		 const struct bpf_map *map, u32 index),
+-	TP_ARGS(dev, xdp, tgt, err, map, index)
++		 enum bpf_map_type map_type,
++		 u32 map_id, u32 index),
++	TP_ARGS(dev, xdp, tgt, err, map_type, map_id, index)
+ );
+ 
+-#define _trace_xdp_redirect(dev, xdp, to)				\
+-	 trace_xdp_redirect(dev, xdp, NULL, 0, NULL, to)
++#define _trace_xdp_redirect(dev, xdp, to)						\
++	 trace_xdp_redirect(dev, xdp, NULL, 0, BPF_MAP_TYPE_UNSPEC, INT_MAX, to)
+ 
+-#define _trace_xdp_redirect_err(dev, xdp, to, err)			\
+-	 trace_xdp_redirect_err(dev, xdp, NULL, err, NULL, to)
++#define _trace_xdp_redirect_err(dev, xdp, to, err)					\
++	 trace_xdp_redirect_err(dev, xdp, NULL, err, BPF_MAP_TYPE_UNSPEC, INT_MAX, to)
+ 
+-#define _trace_xdp_redirect_map(dev, xdp, to, map, index)		\
+-	 trace_xdp_redirect(dev, xdp, to, 0, map, index)
++#define _trace_xdp_redirect_map(dev, xdp, to, map_type, map_id, index) \
++	 trace_xdp_redirect(dev, xdp, to, 0, map_type, map_id, index)
+ 
+-#define _trace_xdp_redirect_map_err(dev, xdp, to, map, index, err)	\
+-	 trace_xdp_redirect_err(dev, xdp, to, err, map, index)
++#define _trace_xdp_redirect_map_err(dev, xdp, to, map_type, map_id, index, err) \
++	 trace_xdp_redirect_err(dev, xdp, to, err, map_type, map_id, index)
+ 
+ /* not used anymore, but kept around so as not to break old programs */
+ DEFINE_EVENT(xdp_redirect_template, xdp_redirect_map,
+ 	TP_PROTO(const struct net_device *dev,
+ 		 const struct bpf_prog *xdp,
+ 		 const void *tgt, int err,
+-		 const struct bpf_map *map, u32 index),
+-	TP_ARGS(dev, xdp, tgt, err, map, index)
++		 enum bpf_map_type map_type,
++		 u32 map_id, u32 index),
++	TP_ARGS(dev, xdp, tgt, err, map_type, map_id, index)
+ );
+ 
+ DEFINE_EVENT(xdp_redirect_template, xdp_redirect_map_err,
+ 	TP_PROTO(const struct net_device *dev,
+ 		 const struct bpf_prog *xdp,
+ 		 const void *tgt, int err,
+-		 const struct bpf_map *map, u32 index),
+-	TP_ARGS(dev, xdp, tgt, err, map, index)
++		 enum bpf_map_type map_type,
++		 u32 map_id, u32 index),
++	TP_ARGS(dev, xdp, tgt, err, map_type, map_id, index)
+ );
+ 
+ TRACE_EVENT(xdp_cpumap_kthread,
+diff --git a/kernel/bpf/cpumap.c b/kernel/bpf/cpumap.c
+index b488a8e0c1c6..97b458bb8ced 100644
+--- a/kernel/bpf/cpumap.c
++++ b/kernel/bpf/cpumap.c
+@@ -543,7 +543,6 @@ static void cpu_map_free(struct bpf_map *map)
+ 	 * complete.
+ 	 */
+ 
+-	bpf_clear_redirect_map(map);
+ 	synchronize_rcu();
+ 
+ 	/* For cpu_map the remote CPUs can still be using the entries
+diff --git a/kernel/bpf/devmap.c b/kernel/bpf/devmap.c
+index 418ca3a16f80..bb4a0249fb88 100644
+--- a/kernel/bpf/devmap.c
++++ b/kernel/bpf/devmap.c
+@@ -205,7 +205,6 @@ static void dev_map_free(struct bpf_map *map)
+ 	list_del_rcu(&dtab->list);
+ 	spin_unlock(&dev_map_lock);
+ 
+-	bpf_clear_redirect_map(map);
+ 	synchronize_rcu();
+ 
+ 	/* Make sure prior __dev_map_entry_free() have completed. */
+* Unmerged path net/core/filter.c
+diff --git a/net/xdp/xskmap.c b/net/xdp/xskmap.c
+index 113fd9017203..c285d3dd04ad 100644
+--- a/net/xdp/xskmap.c
++++ b/net/xdp/xskmap.c
+@@ -87,7 +87,6 @@ static void xsk_map_free(struct bpf_map *map)
+ {
+ 	struct xsk_map *m = container_of(map, struct xsk_map, map);
+ 
+-	bpf_clear_redirect_map(map);
+ 	synchronize_net();
+ 	bpf_map_area_free(m);
+ }
