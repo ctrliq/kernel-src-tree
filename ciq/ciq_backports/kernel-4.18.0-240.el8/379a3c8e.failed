@@ -1,0 +1,92 @@
+KVM: VMX: Optimize posted-interrupt delivery for timer fastpath
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Wanpeng Li <wanpengli@tencent.com>
+commit 379a3c8ee44440d5afa505230ed8cb5b0d0e314b
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/379a3c8e.failed
+
+While optimizing posted-interrupt delivery especially for the timer
+fastpath scenario, I measured kvm_x86_ops.deliver_posted_interrupt()
+to introduce substantial latency because the processor has to perform
+all vmentry tasks, ack the posted interrupt notification vector,
+read the posted-interrupt descriptor etc.
+
+This is not only slow, it is also unnecessary when delivering an
+interrupt to the current CPU (as is the case for the LAPIC timer) because
+PIR->IRR and IRR->RVI synchronization is already performed on vmentry
+Therefore skip kvm_vcpu_trigger_posted_interrupt in this case, and
+instead do vmx_sync_pir_to_irr() on the EXIT_FASTPATH_REENTER_GUEST
+fastpath as well.
+
+	Tested-by: Haiwei Li <lihaiwei@tencent.com>
+	Cc: Haiwei Li <lihaiwei@tencent.com>
+	Suggested-by: Paolo Bonzini <pbonzini@redhat.com>
+	Signed-off-by: Wanpeng Li <wanpengli@tencent.com>
+Message-Id: <1588055009-12677-6-git-send-email-wanpengli@tencent.com>
+	Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+(cherry picked from commit 379a3c8ee44440d5afa505230ed8cb5b0d0e314b)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kvm/vmx/vmx.c
+diff --cc arch/x86/kvm/vmx/vmx.c
+index 539026efd9e1,8d881fcf648e..000000000000
+--- a/arch/x86/kvm/vmx/vmx.c
++++ b/arch/x86/kvm/vmx/vmx.c
+@@@ -6791,20 -6801,26 +6792,37 @@@ static void vmx_vcpu_run(struct kvm_vcp
+  
+  	vmx_recover_nmi_blocking(vmx);
+  	vmx_complete_interrupts(vmx);
+ +}
+  
+ -	if (is_guest_mode(vcpu))
+ -		return EXIT_FASTPATH_NONE;
+ +static struct kvm *vmx_vm_alloc(void)
+ +{
+ +	BUILD_BUG_ON(offsetof(struct kvm_vmx, kvm) != 0);
+  
+++<<<<<<< HEAD
+ +	return __vmalloc(sizeof(struct kvm_vmx),
+ +			 GFP_KERNEL_ACCOUNT | __GFP_ZERO, PAGE_KERNEL);
+ +}
+++=======
++ 	exit_fastpath = vmx_exit_handlers_fastpath(vcpu);
++ 	if (exit_fastpath == EXIT_FASTPATH_REENTER_GUEST) {
++ 		if (!kvm_vcpu_exit_request(vcpu)) {
++ 			/*
++ 			 * FIXME: this goto should be a loop in vcpu_enter_guest,
++ 			 * but it would incur the cost of a retpoline for now.
++ 			 * Revisit once static calls are available.
++ 			 */
++ 			if (vcpu->arch.apicv_active)
++ 				vmx_sync_pir_to_irr(vcpu);
++ 			goto reenter_guest;
++ 		}
++ 		exit_fastpath = EXIT_FASTPATH_EXIT_HANDLED;
++ 	}
+++>>>>>>> 379a3c8ee444 (KVM: VMX: Optimize posted-interrupt delivery for timer fastpath)
+  
+ -	return exit_fastpath;
+ +static void vmx_vm_free(struct kvm *kvm)
+ +{
+ +	kfree(kvm->arch.hyperv.hv_pa_pg);
+ +	vfree(kvm);
+  }
+  
+  static void vmx_free_vcpu(struct kvm_vcpu *vcpu)
+* Unmerged path arch/x86/kvm/vmx/vmx.c
+diff --git a/virt/kvm/kvm_main.c b/virt/kvm/kvm_main.c
+index f6bf9ec4ff98..de84ae2ce1d2 100644
+--- a/virt/kvm/kvm_main.c
++++ b/virt/kvm/kvm_main.c
+@@ -4632,6 +4632,7 @@ struct kvm_vcpu *kvm_get_running_vcpu(void)
+ 
+ 	return vcpu;
+ }
++EXPORT_SYMBOL_GPL(kvm_get_running_vcpu);
+ 
+ /**
+  * kvm_get_running_vcpus - get the per-CPU array of currently running vcpus.
