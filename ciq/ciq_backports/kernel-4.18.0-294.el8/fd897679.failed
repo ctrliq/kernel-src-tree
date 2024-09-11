@@ -1,0 +1,165 @@
+mptcp: be careful on MPTCP-level ack.
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Paolo Abeni <pabeni@redhat.com>
+commit fd8976790a6c1fee98bd7bc73754ddc9f01273ab
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/fd897679.failed
+
+We can enter the main mptcp_recvmsg() loop even when
+no subflows are connected. As note by Eric, that would
+result in a divide by zero oops on ack generation.
+
+Address the issue by checking the subflow status before
+sending the ack.
+
+Additionally protect mptcp_recvmsg() against invocation
+with weird socket states.
+
+v1 -> v2:
+ - removed unneeded inline keyword - Jakub
+
+Reported-and-suggested-by: Eric Dumazet <eric.dumazet@gmail.com>
+Fixes: ea4ca586b16f ("mptcp: refine MPTCP-level ack scheduling")
+	Signed-off-by: Paolo Abeni <pabeni@redhat.com>
+Link: https://lore.kernel.org/r/5370c0ae03449239e3d1674ddcfb090cf6f20abe.1606253206.git.pabeni@redhat.com
+	Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+(cherry picked from commit fd8976790a6c1fee98bd7bc73754ddc9f01273ab)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/mptcp/protocol.c
+diff --cc net/mptcp/protocol.c
+index 75ee5f9fd199,16e9cb1c79cc..000000000000
+--- a/net/mptcp/protocol.c
++++ b/net/mptcp/protocol.c
+@@@ -262,7 -407,72 +262,76 @@@ static void mptcp_set_timeout(const str
+  	mptcp_sk(sk)->timer_ival = tout > 0 ? tout : TCP_RTO_MIN;
+  }
+  
+++<<<<<<< HEAD
+ +static void mptcp_check_data_fin(struct sock *sk)
+++=======
++ static bool mptcp_subflow_active(struct mptcp_subflow_context *subflow)
++ {
++ 	struct sock *ssk = mptcp_subflow_tcp_sock(subflow);
++ 
++ 	/* can't send if JOIN hasn't completed yet (i.e. is usable for mptcp) */
++ 	if (subflow->request_join && !subflow->fully_established)
++ 		return false;
++ 
++ 	/* only send if our side has not closed yet */
++ 	return ((1 << ssk->sk_state) & (TCPF_ESTABLISHED | TCPF_CLOSE_WAIT));
++ }
++ 
++ static bool tcp_can_send_ack(const struct sock *ssk)
++ {
++ 	return !((1 << inet_sk_state_load(ssk)) &
++ 	       (TCPF_SYN_SENT | TCPF_SYN_RECV | TCPF_TIME_WAIT | TCPF_CLOSE));
++ }
++ 
++ static void mptcp_send_ack(struct mptcp_sock *msk)
++ {
++ 	struct mptcp_subflow_context *subflow;
++ 
++ 	mptcp_for_each_subflow(msk, subflow) {
++ 		struct sock *ssk = mptcp_subflow_tcp_sock(subflow);
++ 
++ 		lock_sock(ssk);
++ 		if (tcp_can_send_ack(ssk))
++ 			tcp_send_ack(ssk);
++ 		release_sock(ssk);
++ 	}
++ }
++ 
++ static bool mptcp_subflow_cleanup_rbuf(struct sock *ssk)
++ {
++ 	int ret;
++ 
++ 	lock_sock(ssk);
++ 	ret = tcp_can_send_ack(ssk);
++ 	if (ret)
++ 		tcp_cleanup_rbuf(ssk, 1);
++ 	release_sock(ssk);
++ 	return ret;
++ }
++ 
++ static void mptcp_cleanup_rbuf(struct mptcp_sock *msk)
++ {
++ 	struct mptcp_subflow_context *subflow;
++ 
++ 	/* if the hinted ssk is still active, try to use it */
++ 	if (likely(msk->ack_hint)) {
++ 		mptcp_for_each_subflow(msk, subflow) {
++ 			struct sock *ssk = mptcp_subflow_tcp_sock(subflow);
++ 
++ 			if (msk->ack_hint == ssk &&
++ 			    mptcp_subflow_cleanup_rbuf(ssk))
++ 				return;
++ 		}
++ 	}
++ 
++ 	/* otherwise pick the first active subflow */
++ 	mptcp_for_each_subflow(msk, subflow)
++ 		if (mptcp_subflow_cleanup_rbuf(mptcp_subflow_tcp_sock(subflow)))
++ 			return;
++ }
++ 
++ static bool mptcp_check_data_fin(struct sock *sk)
+++>>>>>>> fd8976790a6c (mptcp: be careful on MPTCP-level ack.)
+  {
+  	struct mptcp_sock *msk = mptcp_sk(sk);
+  	u64 rcv_data_fin_seq;
+@@@ -310,23 -518,12 +379,28 @@@
+  			break;
+  		}
+  
+ -		ret = true;
+  		mptcp_set_timeout(sk, NULL);
+++<<<<<<< HEAD
+ +		mptcp_for_each_subflow(msk, subflow) {
+ +			struct sock *ssk = mptcp_subflow_tcp_sock(subflow);
+ +
+ +			lock_sock(ssk);
+ +			tcp_send_ack(ssk);
+ +			release_sock(ssk);
+ +		}
+ +
+ +		sk->sk_state_change(sk);
+ +
+ +		if (sk->sk_shutdown == SHUTDOWN_MASK ||
+ +		    sk->sk_state == TCP_CLOSE)
+ +			sk_wake_async(sk, SOCK_WAKE_WAITD, POLL_HUP);
+ +		else
+ +			sk_wake_async(sk, SOCK_WAKE_WAITD, POLL_IN);
+++=======
++ 		mptcp_send_ack(msk);
++ 		mptcp_close_wake_up(sk);
+++>>>>>>> fd8976790a6c (mptcp: be careful on MPTCP-level ack.)
+  	}
+ -	return ret;
+  }
+  
+  static bool __mptcp_move_skbs_from_subflow(struct mptcp_sock *msk,
+@@@ -1261,9 -1629,14 +1340,17 @@@ static int mptcp_recvmsg(struct sock *s
+  		copied += bytes_read;
+  
+  		if (skb_queue_empty(&sk->sk_receive_queue) &&
+ -		    __mptcp_move_skbs(msk, len - copied))
+ +		    __mptcp_move_skbs(msk))
+  			continue;
+  
+++<<<<<<< HEAD
+++=======
++ 		/* be sure to advertise window change */
++ 		old_space = READ_ONCE(msk->old_wspace);
++ 		if ((tcp_space(sk) - old_space) >= old_space)
++ 			mptcp_cleanup_rbuf(msk);
++ 
+++>>>>>>> fd8976790a6c (mptcp: be careful on MPTCP-level ack.)
+  		/* only the master socket status is relevant here. The exit
+  		 * conditions mirror closely tcp_recvmsg()
+  		 */
+* Unmerged path net/mptcp/protocol.c
