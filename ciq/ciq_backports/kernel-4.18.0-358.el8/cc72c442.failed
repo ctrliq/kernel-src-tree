@@ -1,0 +1,134 @@
+nvme: remove zeroout memset call for struct
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-358.el8
+commit-author Chaitanya Kulkarni <chaitanya.kulkarni@wdc.com>
+commit cc72c4426764d1716839e9ec591ee8e161ed5cbc
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-358.el8/cc72c442.failed
+
+Declare and initialize structure variables to zero values so that we can
+remove zeroout memset calls in the host/core.c.
+
+	Signed-off-by: Chaitanya Kulkarni <chaitanya.kulkarni@wdc.com>
+	Signed-off-by: Christoph Hellwig <hch@lst.de>
+(cherry picked from commit cc72c4426764d1716839e9ec591ee8e161ed5cbc)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/nvme/host/core.c
+diff --cc drivers/nvme/host/core.c
+index 228052b88c83,c7ef0b6684b5..000000000000
+--- a/drivers/nvme/host/core.c
++++ b/drivers/nvme/host/core.c
+@@@ -698,11 -659,69 +698,9 @@@ static struct request *nvme_alloc_reque
+  	return req;
+  }
+  
+ -/*
+ - * For something we're not in a state to send to the device the default action
+ - * is to busy it and retry it after the controller state is recovered.  However,
+ - * if the controller is deleting or if anything is marked for failfast or
+ - * nvme multipath it is immediately failed.
+ - *
+ - * Note: commands used to initialize the controller will be marked for failfast.
+ - * Note: nvme cli/ioctl commands are marked for failfast.
+ - */
+ -blk_status_t nvme_fail_nonready_command(struct nvme_ctrl *ctrl,
+ -		struct request *rq)
+ -{
+ -	if (ctrl->state != NVME_CTRL_DELETING_NOIO &&
+ -	    ctrl->state != NVME_CTRL_DEAD &&
+ -	    !test_bit(NVME_CTRL_FAILFAST_EXPIRED, &ctrl->flags) &&
+ -	    !blk_noretry_request(rq) && !(rq->cmd_flags & REQ_NVME_MPATH))
+ -		return BLK_STS_RESOURCE;
+ -	return nvme_host_path_error(rq);
+ -}
+ -EXPORT_SYMBOL_GPL(nvme_fail_nonready_command);
+ -
+ -bool __nvme_check_ready(struct nvme_ctrl *ctrl, struct request *rq,
+ -		bool queue_live)
+ -{
+ -	struct nvme_request *req = nvme_req(rq);
+ -
+ -	/*
+ -	 * currently we have a problem sending passthru commands
+ -	 * on the admin_q if the controller is not LIVE because we can't
+ -	 * make sure that they are going out after the admin connect,
+ -	 * controller enable and/or other commands in the initialization
+ -	 * sequence. until the controller will be LIVE, fail with
+ -	 * BLK_STS_RESOURCE so that they will be rescheduled.
+ -	 */
+ -	if (rq->q == ctrl->admin_q && (req->flags & NVME_REQ_USERCMD))
+ -		return false;
+ -
+ -	if (ctrl->ops->flags & NVME_F_FABRICS) {
+ -		/*
+ -		 * Only allow commands on a live queue, except for the connect
+ -		 * command, which is require to set the queue live in the
+ -		 * appropinquate states.
+ -		 */
+ -		switch (ctrl->state) {
+ -		case NVME_CTRL_CONNECTING:
+ -			if (blk_rq_is_passthrough(rq) && nvme_is_fabrics(req->cmd) &&
+ -			    req->cmd->fabrics.fctype == nvme_fabrics_type_connect)
+ -				return true;
+ -			break;
+ -		default:
+ -			break;
+ -		case NVME_CTRL_DEAD:
+ -			return false;
+ -		}
+ -	}
+ -
+ -	return queue_live;
+ -}
+ -EXPORT_SYMBOL_GPL(__nvme_check_ready);
+ -
+  static int nvme_toggle_streams(struct nvme_ctrl *ctrl, bool enable)
+  {
+- 	struct nvme_command c;
+- 
+- 	memset(&c, 0, sizeof(c));
++ 	struct nvme_command c = { };
+  
+  	c.directive.opcode = nvme_admin_directive_send;
+  	c.directive.nsid = cpu_to_le32(NVME_NSID_ALL);
+@@@ -2373,27 -1936,42 +2368,30 @@@ static char nvme_pr_type(enum pr_type t
+  static int nvme_pr_command(struct block_device *bdev, u32 cdw10,
+  				u64 key, u64 sa_key, u8 op)
+  {
+++<<<<<<< HEAD
+ +	struct nvme_ns_head *head = NULL;
+ +	struct nvme_ns *ns;
+ +	struct nvme_command c;
+ +	int srcu_idx, ret;
+++=======
++ 	struct nvme_command c = { };
+++>>>>>>> cc72c4426764 (nvme: remove zeroout memset call for struct)
+  	u8 data[16] = { 0, };
+  
+ +	ns = nvme_get_ns_from_disk(bdev->bd_disk, &head, &srcu_idx);
+ +	if (unlikely(!ns))
+ +		return -EWOULDBLOCK;
+ +
+  	put_unaligned_le64(key, &data[0]);
+  	put_unaligned_le64(sa_key, &data[8]);
+  
+- 	memset(&c, 0, sizeof(c));
+  	c.common.opcode = op;
+ +	c.common.nsid = cpu_to_le32(ns->head->ns_id);
+  	c.common.cdw10 = cpu_to_le32(cdw10);
+  
+ -	if (IS_ENABLED(CONFIG_NVME_MULTIPATH) &&
+ -	    bdev->bd_disk->fops == &nvme_ns_head_ops)
+ -		return nvme_send_ns_head_pr_command(bdev, &c, data);
+ -	return nvme_send_ns_pr_command(bdev->bd_disk->private_data, &c, data);
+ +	ret = nvme_submit_sync_cmd(ns->queue, &c, data, 16);
+ +	nvme_put_ns_from_disk(head, srcu_idx);
+ +	return ret;
+  }
+  
+  static int nvme_pr_register(struct block_device *bdev, u64 old,
+* Unmerged path drivers/nvme/host/core.c
