@@ -1,0 +1,224 @@
+io_uring: allow finding next link independent of req reference count
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Jens Axboe <axboe@kernel.dk>
+commit 4d7dd462971405c65bfb3821dbb6b9ce13b5e8d6
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/4d7dd462.failed
+
+We currently try and start the next link when we put the request, and
+only if we were going to free it. This means that the optimization to
+continue executing requests from the same context often fails, as we're
+not putting the final reference.
+
+Add REQ_F_LINK_NEXT to keep track of this, and allow io_uring to find the
+next request more efficiently.
+
+	Signed-off-by: Jens Axboe <axboe@kernel.dk>
+(cherry picked from commit 4d7dd462971405c65bfb3821dbb6b9ce13b5e8d6)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/io_uring.c
+diff --cc fs/io_uring.c
+index 66de1d702552,e9980c584120..000000000000
+--- a/fs/io_uring.c
++++ b/fs/io_uring.c
+@@@ -625,16 -833,57 +626,20 @@@ static void io_free_req_many(struct io_
+  
+  static void __io_free_req(struct io_kiocb *req)
+  {
+ -	struct io_ring_ctx *ctx = req->ctx;
+ -
+ -	if (req->flags & REQ_F_FREE_SQE)
+ -		kfree(req->submit.sqe);
+  	if (req->file && !(req->flags & REQ_F_FIXED_FILE))
+  		fput(req->file);
+ -	if (req->flags & REQ_F_INFLIGHT) {
+ -		unsigned long flags;
+ -
+ -		spin_lock_irqsave(&ctx->inflight_lock, flags);
+ -		list_del(&req->inflight_entry);
+ -		if (waitqueue_active(&ctx->inflight_wait))
+ -			wake_up(&ctx->inflight_wait);
+ -		spin_unlock_irqrestore(&ctx->inflight_lock, flags);
+ -	}
+ -	if (req->flags & REQ_F_TIMEOUT)
+ -		kfree(req->timeout.data);
+ -	percpu_ref_put(&ctx->refs);
+ -	if (likely(!io_is_fallback_req(req)))
+ -		kmem_cache_free(req_cachep, req);
+ -	else
+ -		clear_bit_unlock(0, (unsigned long *) ctx->fallback_req);
+ -}
+ -
+ -static bool io_link_cancel_timeout(struct io_kiocb *req)
+ -{
+ -	struct io_ring_ctx *ctx = req->ctx;
+ -	int ret;
+ -
+ -	ret = hrtimer_try_to_cancel(&req->timeout.data->timer);
+ -	if (ret != -1) {
+ -		io_cqring_fill_event(req, -ECANCELED);
+ -		io_commit_cqring(ctx);
+ -		req->flags &= ~REQ_F_LINK;
+ -		io_put_req(req);
+ -		return true;
+ -	}
+ -
+ -	return false;
+ +	percpu_ref_put(&req->ctx->refs);
+ +	kmem_cache_free(req_cachep, req);
+  }
+  
+ -static void io_req_link_next(struct io_kiocb *req, struct io_kiocb **nxtptr)
+ +static void io_req_link_next(struct io_kiocb *req)
+  {
+ -	struct io_ring_ctx *ctx = req->ctx;
+  	struct io_kiocb *nxt;
+ -	bool wake_ev = false;
+  
++ 	/* Already got next link */
++ 	if (req->flags & REQ_F_LINK_NEXT)
++ 		return;
++ 
+  	/*
+  	 * The list should never be empty when we are called here. But could
+  	 * potentially happen if the chain is messed up, check to be on the
+@@@ -649,10 -907,22 +654,17 @@@
+  			nxt->flags |= REQ_F_LINK;
+  		}
+  
+ -		/*
+ -		 * If we're in async work, we can continue processing the chain
+ -		 * in this context instead of having to queue up new async work.
+ -		 */
+ -		if (nxt) {
+ -			if (nxtptr && io_wq_current_is_worker())
+ -				*nxtptr = nxt;
+ -			else
+ -				io_queue_async_work(nxt);
+ -		}
+ -		break;
+ +		nxt->flags |= REQ_F_LINK_DONE;
+ +		INIT_WORK(&nxt->work, io_sq_wq_submit_work);
+ +		io_queue_async_work(req->ctx, nxt);
+  	}
+++<<<<<<< HEAD
+++=======
++ 
++ 	req->flags |= REQ_F_LINK_NEXT;
++ 	if (wake_ev)
++ 		io_cqring_ev_posted(ctx);
+++>>>>>>> 4d7dd4629714 (io_uring: allow finding next link independent of req reference count)
+  }
+  
+  /*
+@@@ -664,31 -935,91 +676,72 @@@ static void io_fail_links(struct io_kio
+  
+  	while (!list_empty(&req->link_list)) {
+  		link = list_first_entry(&req->link_list, struct io_kiocb, list);
+ -		list_del_init(&link->list);
+ -
+ -		trace_io_uring_fail_link(req, link);
+ +		list_del(&link->list);
+  
+ -		if ((req->flags & REQ_F_LINK_TIMEOUT) &&
+ -		    link->submit.sqe->opcode == IORING_OP_LINK_TIMEOUT) {
+ -			io_link_cancel_timeout(link);
+ -		} else {
+ -			io_cqring_fill_event(link, -ECANCELED);
+ -			__io_double_put_req(link);
+ -		}
+ -		req->flags &= ~REQ_F_LINK_TIMEOUT;
+ +		io_cqring_add_event(req->ctx, link->user_data, -ECANCELED);
+ +		__io_free_req(link);
+  	}
+ -
+ -	io_commit_cqring(ctx);
+ -	spin_unlock_irqrestore(&ctx->completion_lock, flags);
+ -	io_cqring_ev_posted(ctx);
+  }
+  
+++<<<<<<< HEAD
+ +static void io_free_req(struct io_kiocb *req)
+ +{
+++=======
++ static void io_req_find_next(struct io_kiocb *req, struct io_kiocb **nxt)
++ {
++ 	if (likely(!(req->flags & REQ_F_LINK)))
++ 		return;
++ 
+++>>>>>>> 4d7dd4629714 (io_uring: allow finding next link independent of req reference count)
+  	/*
+  	 * If LINK is set, we have dependent requests in this chain. If we
+  	 * didn't fail this request, queue the first one up, moving any other
+  	 * dependencies to the next request. In case of failure, fail the rest
+  	 * of the chain.
+  	 */
+ -	if (req->flags & REQ_F_FAIL_LINK) {
+ -		io_fail_links(req);
+ -	} else if ((req->flags & (REQ_F_LINK_TIMEOUT | REQ_F_COMP_LOCKED)) ==
+ -			REQ_F_LINK_TIMEOUT) {
+ -		struct io_ring_ctx *ctx = req->ctx;
+ -		unsigned long flags;
+ -
+ -		/*
+ -		 * If this is a timeout link, we could be racing with the
+ -		 * timeout timer. Grab the completion lock for this case to
+ -		 * protect against that.
+ -		 */
+ -		spin_lock_irqsave(&ctx->completion_lock, flags);
+ -		io_req_link_next(req, nxt);
+ -		spin_unlock_irqrestore(&ctx->completion_lock, flags);
+ -	} else {
+ -		io_req_link_next(req, nxt);
+ +	if (req->flags & REQ_F_LINK) {
+ +		if (req->flags & REQ_F_FAIL_LINK)
+ +			io_fail_links(req);
+ +		else
+ +			io_req_link_next(req);
+  	}
++ }
+  
++ static void io_free_req_find_next(struct io_kiocb *req, struct io_kiocb **nxt)
++ {
++ 	io_req_find_next(req, nxt);
+  	__io_free_req(req);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static void io_free_req(struct io_kiocb *req)
++ {
++ 	io_free_req_find_next(req, NULL);
++ }
++ 
++ /*
++  * Drop reference to request, return next in chain (if there is one) if this
++  * was the last reference to this request.
++  */
++ static void io_put_req_find_next(struct io_kiocb *req, struct io_kiocb **nxtptr)
++ {
++ 	struct io_kiocb *nxt = NULL;
++ 
++ 	io_req_find_next(req, &nxt);
++ 
++ 	if (refcount_dec_and_test(&req->refs))
++ 		__io_free_req(req);
++ 
++ 	if (nxt) {
++ 		if (nxtptr)
++ 			*nxtptr = nxt;
++ 		else
++ 			io_queue_async_work(nxt);
++ 	}
++ }
++ 
+++>>>>>>> 4d7dd4629714 (io_uring: allow finding next link independent of req reference count)
+  static void io_put_req(struct io_kiocb *req)
+  {
+  	if (refcount_dec_and_test(&req->refs))
+* Unmerged path fs/io_uring.c
