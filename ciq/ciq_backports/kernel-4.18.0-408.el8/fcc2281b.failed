@@ -1,0 +1,405 @@
+dmaengine: idxd: fix bus_probe() and bus_remove() for dsa_bus
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-408.el8
+commit-author Dave Jiang <dave.jiang@intel.com>
+commit fcc2281b142bf14e3534d6b1150991194f8d1d44
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-408.el8/fcc2281b.failed
+
+Current implementation have put all the code that should be in a driver
+probe/remove in the bus probe/remove function. Add ->probe() and ->remove()
+support for the dsa_drv and move all those code out of bus probe/remove.
+The change does not split out the distinction between device sub-driver and
+wq sub-driver. It only cleans up the bus calls. The split out will be
+addressed in follow on patches.
+
+	Reviewed-by: Dan Williams <dan.j.williams@intel.com>
+	Signed-off-by: Dave Jiang <dave.jiang@intel.com>
+Link: https://lore.kernel.org/r/162637463586.744545.5806250155539938643.stgit@djiang5-desk3.ch.intel.com
+	Signed-off-by: Vinod Koul <vkoul@kernel.org>
+(cherry picked from commit fcc2281b142bf14e3534d6b1150991194f8d1d44)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/dma/idxd/idxd.h
+#	drivers/dma/idxd/sysfs.c
+diff --cc drivers/dma/idxd/idxd.h
+index 813e19b4ecc8,493958ecc208..000000000000
+--- a/drivers/dma/idxd/idxd.h
++++ b/drivers/dma/idxd/idxd.h
+@@@ -294,8 -310,68 +296,73 @@@ struct idxd_desc 
+  	struct idxd_wq *wq;
+  };
+  
+++<<<<<<< HEAD
+ +#define confdev_to_idxd(dev) container_of(dev, struct idxd_device, conf_dev)
+ +#define confdev_to_wq(dev) container_of(dev, struct idxd_wq, conf_dev)
+++=======
++ /*
++  * This is software defined error for the completion status. We overload the error code
++  * that will never appear in completion status and only SWERR register.
++  */
++ enum idxd_completion_status {
++ 	IDXD_COMP_DESC_ABORT = 0xff,
++ };
++ 
++ #define idxd_confdev(idxd) &idxd->idxd_dev.conf_dev
++ #define wq_confdev(wq) &wq->idxd_dev.conf_dev
++ #define engine_confdev(engine) &engine->idxd_dev.conf_dev
++ #define group_confdev(group) &group->idxd_dev.conf_dev
++ #define cdev_dev(cdev) &cdev->idxd_dev.conf_dev
++ 
++ #define confdev_to_idxd_dev(dev) container_of(dev, struct idxd_dev, conf_dev)
++ #define idxd_dev_to_idxd(idxd_dev) container_of(idxd_dev, struct idxd_device, idxd_dev)
++ #define idxd_dev_to_wq(idxd_dev) container_of(idxd_dev, struct idxd_wq, idxd_dev)
++ 
++ static inline struct idxd_device *confdev_to_idxd(struct device *dev)
++ {
++ 	struct idxd_dev *idxd_dev = confdev_to_idxd_dev(dev);
++ 
++ 	return idxd_dev_to_idxd(idxd_dev);
++ }
++ 
++ static inline struct idxd_wq *confdev_to_wq(struct device *dev)
++ {
++ 	struct idxd_dev *idxd_dev = confdev_to_idxd_dev(dev);
++ 
++ 	return idxd_dev_to_wq(idxd_dev);
++ }
++ 
++ static inline struct idxd_engine *confdev_to_engine(struct device *dev)
++ {
++ 	struct idxd_dev *idxd_dev = confdev_to_idxd_dev(dev);
++ 
++ 	return container_of(idxd_dev, struct idxd_engine, idxd_dev);
++ }
++ 
++ static inline struct idxd_group *confdev_to_group(struct device *dev)
++ {
++ 	struct idxd_dev *idxd_dev = confdev_to_idxd_dev(dev);
++ 
++ 	return container_of(idxd_dev, struct idxd_group, idxd_dev);
++ }
++ 
++ static inline struct idxd_cdev *dev_to_cdev(struct device *dev)
++ {
++ 	struct idxd_dev *idxd_dev = confdev_to_idxd_dev(dev);
++ 
++ 	return container_of(idxd_dev, struct idxd_cdev, idxd_dev);
++ }
++ 
++ static inline void idxd_dev_set_type(struct idxd_dev *idev, int type)
++ {
++ 	if (type >= IDXD_DEV_MAX_TYPE) {
++ 		idev->type = IDXD_DEV_NONE;
++ 		return;
++ 	}
++ 
++ 	idev->type = type;
++ }
+++>>>>>>> fcc2281b142b (dmaengine: idxd: fix bus_probe() and bus_remove() for dsa_bus)
+  
+  extern struct bus_type dsa_bus_type;
+  
+diff --cc drivers/dma/idxd/sysfs.c
+index e25f04f3917e,f82416eec926..000000000000
+--- a/drivers/dma/idxd/sysfs.c
++++ b/drivers/dma/idxd/sysfs.c
+@@@ -19,162 -19,50 +19,172 @@@ static char *idxd_wq_type_names[] = 
+  static int idxd_config_bus_match(struct device *dev,
+  				 struct device_driver *drv)
+  {
+- 	int matched = 0;
++ 	struct idxd_dev *idxd_dev = confdev_to_idxd_dev(dev);
+  
+- 	if (is_idxd_dev(dev)) {
+- 		matched = 1;
+- 	} else if (is_idxd_wq_dev(dev)) {
+- 		struct idxd_wq *wq = confdev_to_wq(dev);
+- 
+- 		if (wq->state != IDXD_WQ_DISABLED) {
+- 			dev_dbg(dev, "%s not disabled\n", dev_name(dev));
+- 			return 0;
+- 		}
+- 		matched = 1;
+- 	}
+- 
+- 	if (matched)
+- 		dev_dbg(dev, "%s matched\n", dev_name(dev));
+- 
+- 	return matched;
++ 	return (is_idxd_dev(idxd_dev) || is_idxd_wq_dev(idxd_dev));
+  }
+  
+ +static int enable_wq(struct idxd_wq *wq)
+ +{
+ +	struct idxd_device *idxd = wq->idxd;
+ +	struct device *dev = &idxd->pdev->dev;
+ +	unsigned long flags;
+ +	int rc;
+ +
+ +	mutex_lock(&wq->wq_lock);
+ +
+ +	if (idxd->state != IDXD_DEV_ENABLED) {
+ +		mutex_unlock(&wq->wq_lock);
+ +		dev_warn(dev, "Enabling while device not enabled.\n");
+ +		return -EPERM;
+ +	}
+ +
+ +	if (wq->state != IDXD_WQ_DISABLED) {
+ +		mutex_unlock(&wq->wq_lock);
+ +		dev_warn(dev, "WQ %d already enabled.\n", wq->id);
+ +		return -EBUSY;
+ +	}
+ +
+ +	if (!wq->group) {
+ +		mutex_unlock(&wq->wq_lock);
+ +		dev_warn(dev, "WQ not attached to group.\n");
+ +		return -EINVAL;
+ +	}
+ +
+ +	if (strlen(wq->name) == 0) {
+ +		mutex_unlock(&wq->wq_lock);
+ +		dev_warn(dev, "WQ name not set.\n");
+ +		return -EINVAL;
+ +	}
+ +
+ +	/* Shared WQ checks */
+ +	if (wq_shared(wq)) {
+ +		if (!device_swq_supported(idxd)) {
+ +			dev_warn(dev, "PASID not enabled and shared WQ.\n");
+ +			mutex_unlock(&wq->wq_lock);
+ +			return -ENXIO;
+ +		}
+ +		/*
+ +		 * Shared wq with the threshold set to 0 means the user
+ +		 * did not set the threshold or transitioned from a
+ +		 * dedicated wq but did not set threshold. A value
+ +		 * of 0 would effectively disable the shared wq. The
+ +		 * driver does not allow a value of 0 to be set for
+ +		 * threshold via sysfs.
+ +		 */
+ +		if (wq->threshold == 0) {
+ +			dev_warn(dev, "Shared WQ and threshold 0.\n");
+ +			mutex_unlock(&wq->wq_lock);
+ +			return -EINVAL;
+ +		}
+ +	}
+ +
+ +	rc = idxd_wq_alloc_resources(wq);
+ +	if (rc < 0) {
+ +		mutex_unlock(&wq->wq_lock);
+ +		dev_warn(dev, "WQ resource alloc failed\n");
+ +		return rc;
+ +	}
+ +
+ +	spin_lock_irqsave(&idxd->dev_lock, flags);
+ +	if (test_bit(IDXD_FLAG_CONFIGURABLE, &idxd->flags))
+ +		rc = idxd_device_config(idxd);
+ +	spin_unlock_irqrestore(&idxd->dev_lock, flags);
+ +	if (rc < 0) {
+ +		mutex_unlock(&wq->wq_lock);
+ +		dev_warn(dev, "Writing WQ %d config failed: %d\n", wq->id, rc);
+ +		return rc;
+ +	}
+ +
+ +	rc = idxd_wq_enable(wq);
+ +	if (rc < 0) {
+ +		mutex_unlock(&wq->wq_lock);
+ +		dev_warn(dev, "WQ %d enabling failed: %d\n", wq->id, rc);
+ +		return rc;
+ +	}
+ +
+ +	rc = idxd_wq_map_portal(wq);
+ +	if (rc < 0) {
+ +		dev_warn(dev, "wq portal mapping failed: %d\n", rc);
+ +		rc = idxd_wq_disable(wq, false);
+ +		if (rc < 0)
+ +			dev_warn(dev, "IDXD wq disable failed\n");
+ +		mutex_unlock(&wq->wq_lock);
+ +		return rc;
+ +	}
+ +
+ +	wq->client_count = 0;
+ +
+ +	if (wq->type == IDXD_WQT_KERNEL) {
+ +		rc = idxd_wq_init_percpu_ref(wq);
+ +		if (rc < 0) {
+ +			dev_dbg(dev, "percpu_ref setup failed\n");
+ +			mutex_unlock(&wq->wq_lock);
+ +			return rc;
+ +		}
+ +	}
+ +
+ +	if (is_idxd_wq_dmaengine(wq)) {
+ +		rc = idxd_register_dma_channel(wq);
+ +		if (rc < 0) {
+ +			dev_dbg(dev, "DMA channel register failed\n");
+ +			mutex_unlock(&wq->wq_lock);
+ +			return rc;
+ +		}
+ +	} else if (is_idxd_wq_cdev(wq)) {
+ +		rc = idxd_wq_add_cdev(wq);
+ +		if (rc < 0) {
+ +			dev_dbg(dev, "Cdev creation failed\n");
+ +			mutex_unlock(&wq->wq_lock);
+ +			return rc;
+ +		}
+ +	}
+ +
+ +	mutex_unlock(&wq->wq_lock);
+ +	dev_info(dev, "wq %s enabled\n", dev_name(&wq->conf_dev));
+ +
+ +	return 0;
+ +}
+ +
+  static int idxd_config_bus_probe(struct device *dev)
+  {
+- 	int rc = 0;
+- 	unsigned long flags;
++ 	struct idxd_device_driver *idxd_drv =
++ 		container_of(dev->driver, struct idxd_device_driver, drv);
++ 	struct idxd_dev *idxd_dev = confdev_to_idxd_dev(dev);
+  
+- 	dev_dbg(dev, "%s called\n", __func__);
++ 	return idxd_drv->probe(idxd_dev);
++ }
+  
+- 	if (is_idxd_dev(dev)) {
+- 		struct idxd_device *idxd = confdev_to_idxd(dev);
++ static int idxd_config_bus_remove(struct device *dev)
++ {
++ 	struct idxd_device_driver *idxd_drv =
++ 		container_of(dev->driver, struct idxd_device_driver, drv);
++ 	struct idxd_dev *idxd_dev = confdev_to_idxd_dev(dev);
++ 
++ 	idxd_drv->remove(idxd_dev);
++ 	return 0;
++ }
++ 
++ struct bus_type dsa_bus_type = {
++ 	.name = "dsa",
++ 	.match = idxd_config_bus_match,
++ 	.probe = idxd_config_bus_probe,
++ 	.remove = idxd_config_bus_remove,
++ };
++ 
++ static int idxd_dsa_drv_probe(struct idxd_dev *idxd_dev)
++ {
++ 	struct device *dev = &idxd_dev->conf_dev;
++ 	unsigned long flags;
++ 	int rc;
++ 
++ 	if (is_idxd_dev(idxd_dev)) {
++ 		struct idxd_device *idxd = idxd_dev_to_idxd(idxd_dev);
+  
+- 		if (!try_module_get(THIS_MODULE))
++ 		if (idxd->state != IDXD_DEV_DISABLED)
+  			return -ENXIO;
+  
+- 		/* Perform IDXD configuration and enabling */
++ 		/* Device configuration */
+  		spin_lock_irqsave(&idxd->dev_lock, flags);
+  		if (test_bit(IDXD_FLAG_CONFIGURABLE, &idxd->flags))
+  			rc = idxd_device_config(idxd);
+@@@ -193,75 -79,35 +201,89 @@@
+  			return rc;
+  		}
+  
+- 		dev_info(dev, "Device %s enabled\n", dev_name(dev));
+- 
++ 		/* Setup DMA device without channels */
+  		rc = idxd_register_dma_device(idxd);
+  		if (rc < 0) {
+- 			module_put(THIS_MODULE);
+  			dev_dbg(dev, "Failed to register dmaengine device\n");
++ 			idxd_device_disable(idxd);
+  			return rc;
+  		}
++ 
++ 		dev_info(dev, "Device %s enabled\n", dev_name(dev));
+  		return 0;
+- 	} else if (is_idxd_wq_dev(dev)) {
+- 		struct idxd_wq *wq = confdev_to_wq(dev);
++ 	}
++ 
++ 	if (is_idxd_wq_dev(idxd_dev)) {
++ 		struct idxd_wq *wq = idxd_dev_to_wq(idxd_dev);
+  
+ -		return drv_enable_wq(wq);
+ +		return enable_wq(wq);
+  	}
+  
+  	return -ENODEV;
+  }
+  
+++<<<<<<< HEAD
+ +static void disable_wq(struct idxd_wq *wq)
+ +{
+ +	struct idxd_device *idxd = wq->idxd;
+ +	struct device *dev = &idxd->pdev->dev;
+ +
+ +	mutex_lock(&wq->wq_lock);
+ +	dev_dbg(dev, "%s removing WQ %s\n", __func__, dev_name(&wq->conf_dev));
+ +	if (wq->state == IDXD_WQ_DISABLED) {
+ +		mutex_unlock(&wq->wq_lock);
+ +		return;
+ +	}
+ +
+ +	if (wq->type == IDXD_WQT_KERNEL)
+ +		idxd_wq_quiesce(wq);
+ +
+ +	if (is_idxd_wq_dmaengine(wq))
+ +		idxd_unregister_dma_channel(wq);
+ +	else if (is_idxd_wq_cdev(wq))
+ +		idxd_wq_del_cdev(wq);
+ +
+ +	if (idxd_wq_refcount(wq))
+ +		dev_warn(dev, "Clients has claim on wq %d: %d\n",
+ +			 wq->id, idxd_wq_refcount(wq));
+ +
+ +	idxd_wq_unmap_portal(wq);
+ +
+ +	idxd_wq_drain(wq);
+ +	idxd_wq_reset(wq);
+ +
+ +	idxd_wq_free_resources(wq);
+ +	wq->client_count = 0;
+ +	mutex_unlock(&wq->wq_lock);
+ +
+ +	dev_info(dev, "wq %s disabled\n", dev_name(&wq->conf_dev));
+ +}
+ +
+ +static int idxd_config_bus_remove(struct device *dev)
+++=======
++ static void idxd_dsa_drv_remove(struct idxd_dev *idxd_dev)
+++>>>>>>> fcc2281b142b (dmaengine: idxd: fix bus_probe() and bus_remove() for dsa_bus)
+  {
+- 	dev_dbg(dev, "%s called for %s\n", __func__, dev_name(dev));
++ 	struct device *dev = &idxd_dev->conf_dev;
+  
+++<<<<<<< HEAD
+ +	/* disable workqueue here */
+ +	if (is_idxd_wq_dev(dev)) {
+ +		struct idxd_wq *wq = confdev_to_wq(dev);
+ +
+ +		disable_wq(wq);
+ +	} else if (is_idxd_dev(dev)) {
+ +		struct idxd_device *idxd = confdev_to_idxd(dev);
+ +		int i;
+ +
+ +		dev_dbg(dev, "%s removing dev %s\n", __func__,
+ +			dev_name(&idxd->conf_dev));
+++=======
++ 	if (is_idxd_dev(idxd_dev)) {
++ 		struct idxd_device *idxd = idxd_dev_to_idxd(idxd_dev);
++ 		int i;
++ 
+++>>>>>>> fcc2281b142b (dmaengine: idxd: fix bus_probe() and bus_remove() for dsa_bus)
+  		for (i = 0; i < idxd->max_wqs; i++) {
+  			struct idxd_wq *wq = idxd->wqs[i];
+  
+* Unmerged path drivers/dma/idxd/idxd.h
+* Unmerged path drivers/dma/idxd/sysfs.c
