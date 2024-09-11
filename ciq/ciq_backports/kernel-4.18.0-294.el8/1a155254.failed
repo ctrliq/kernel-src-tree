@@ -1,0 +1,422 @@
+KVM: x86: Introduce MSR filtering
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Alexander Graf <graf@amazon.com>
+commit 1a155254ff937ac92cf9940d273ea597b2c667a2
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/1a155254.failed
+
+It's not desireable to have all MSRs always handled by KVM kernel space. Some
+MSRs would be useful to handle in user space to either emulate behavior (like
+uCode updates) or differentiate whether they are valid based on the CPU model.
+
+To allow user space to specify which MSRs it wants to see handled by KVM,
+this patch introduces a new ioctl to push filter rules with bitmaps into
+KVM. Based on these bitmaps, KVM can then decide whether to reject MSR access.
+With the addition of KVM_CAP_X86_USER_SPACE_MSR it can also deflect the
+denied MSR events to user space to operate on.
+
+If no filter is populated, MSR handling stays identical to before.
+
+	Signed-off-by: Alexander Graf <graf@amazon.com>
+
+Message-Id: <20200925143422.21718-8-graf@amazon.com>
+	Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+(cherry picked from commit 1a155254ff937ac92cf9940d273ea597b2c667a2)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	Documentation/virt/kvm/api.rst
+#	arch/x86/include/asm/kvm_host.h
+#	arch/x86/include/uapi/asm/kvm.h
+#	arch/x86/kvm/x86.c
+#	include/uapi/linux/kvm.h
+diff --cc Documentation/virt/kvm/api.rst
+index 235a1db41e51,425325ff4434..000000000000
+--- a/Documentation/virt/kvm/api.rst
++++ b/Documentation/virt/kvm/api.rst
+@@@ -5161,6 -5260,44 +5254,47 @@@ if it decides to decode and emulate th
+  
+  ::
+  
+++<<<<<<< HEAD
+++=======
++ 		/* KVM_EXIT_X86_RDMSR / KVM_EXIT_X86_WRMSR */
++ 		struct {
++ 			__u8 error; /* user -> kernel */
++ 			__u8 pad[7];
++ 			__u32 reason; /* kernel -> user */
++ 			__u32 index; /* kernel -> user */
++ 			__u64 data; /* kernel <-> user */
++ 		} msr;
++ 
++ Used on x86 systems. When the VM capability KVM_CAP_X86_USER_SPACE_MSR is
++ enabled, MSR accesses to registers that would invoke a #GP by KVM kernel code
++ will instead trigger a KVM_EXIT_X86_RDMSR exit for reads and KVM_EXIT_X86_WRMSR
++ exit for writes.
++ 
++ The "reason" field specifies why the MSR trap occurred. User space will only
++ receive MSR exit traps when a particular reason was requested during through
++ ENABLE_CAP. Currently valid exit reasons are:
++ 
++ 	KVM_MSR_EXIT_REASON_UNKNOWN - access to MSR that is unknown to KVM
++ 	KVM_MSR_EXIT_REASON_INVAL - access to invalid MSRs or reserved bits
++ 	KVM_MSR_EXIT_REASON_FILTER - access blocked by KVM_X86_SET_MSR_FILTER
++ 
++ For KVM_EXIT_X86_RDMSR, the "index" field tells user space which MSR the guest
++ wants to read. To respond to this request with a successful read, user space
++ writes the respective data into the "data" field and must continue guest
++ execution to ensure the read data is transferred into guest register state.
++ 
++ If the RDMSR request was unsuccessful, user space indicates that with a "1" in
++ the "error" field. This will inject a #GP into the guest when the VCPU is
++ executed again.
++ 
++ For KVM_EXIT_X86_WRMSR, the "index" field tells user space which MSR the guest
++ wants to write. Once finished processing the event, user space must continue
++ vCPU execution. If the MSR write was unsuccessful, user space also sets the
++ "error" field to "1".
++ 
++ ::
++ 
+++>>>>>>> 1a155254ff93 (KVM: x86: Introduce MSR filtering)
+  		/* Fix the size of the union. */
+  		char padding[256];
+  	};
+@@@ -6156,3 -6315,61 +6290,64 @@@ KVM can therefore start protected VMs
+  This capability governs the KVM_S390_PV_COMMAND ioctl and the
+  KVM_MP_STATE_LOAD MP_STATE. KVM_SET_MP_STATE can fail for protected
+  guests when the state change is invalid.
+++<<<<<<< HEAD
+++=======
++ 
++ 8.24 KVM_CAP_STEAL_TIME
++ -----------------------
++ 
++ :Architectures: arm64, x86
++ 
++ This capability indicates that KVM supports steal time accounting.
++ When steal time accounting is supported it may be enabled with
++ architecture-specific interfaces.  This capability and the architecture-
++ specific interfaces must be consistent, i.e. if one says the feature
++ is supported, than the other should as well and vice versa.  For arm64
++ see Documentation/virt/kvm/devices/vcpu.rst "KVM_ARM_VCPU_PVTIME_CTRL".
++ For x86 see Documentation/virt/kvm/msr.rst "MSR_KVM_STEAL_TIME".
++ 
++ 8.25 KVM_CAP_S390_DIAG318
++ -------------------------
++ 
++ :Architectures: s390
++ 
++ This capability enables a guest to set information about its control program
++ (i.e. guest kernel type and version). The information is helpful during
++ system/firmware service events, providing additional data about the guest
++ environments running on the machine.
++ 
++ The information is associated with the DIAGNOSE 0x318 instruction, which sets
++ an 8-byte value consisting of a one-byte Control Program Name Code (CPNC) and
++ a 7-byte Control Program Version Code (CPVC). The CPNC determines what
++ environment the control program is running in (e.g. Linux, z/VM...), and the
++ CPVC is used for information specific to OS (e.g. Linux version, Linux
++ distribution...)
++ 
++ If this capability is available, then the CPNC and CPVC can be synchronized
++ between KVM and userspace via the sync regs mechanism (KVM_SYNC_DIAG318).
++ 
++ 8.26 KVM_CAP_X86_USER_SPACE_MSR
++ -------------------------------
++ 
++ :Architectures: x86
++ 
++ This capability indicates that KVM supports deflection of MSR reads and
++ writes to user space. It can be enabled on a VM level. If enabled, MSR
++ accesses that would usually trigger a #GP by KVM into the guest will
++ instead get bounced to user space through the KVM_EXIT_X86_RDMSR and
++ KVM_EXIT_X86_WRMSR exit notifications.
++ 
++ 8.25 KVM_X86_SET_MSR_FILTER
++ ---------------------------
++ 
++ :Architectures: x86
++ 
++ This capability indicates that KVM supports that accesses to user defined MSRs
++ may be rejected. With this capability exposed, KVM exports new VM ioctl
++ KVM_X86_SET_MSR_FILTER which user space can call to specify bitmaps of MSR
++ ranges that KVM should reject access to.
++ 
++ In combination with KVM_CAP_X86_USER_SPACE_MSR, this allows user space to
++ trap and emulate MSRs that are outside of the scope of KVM as well as
++ limit the attack surface on KVM's MSR emulation code.
+++>>>>>>> 1a155254ff93 (KVM: x86: Introduce MSR filtering)
+diff --cc arch/x86/include/asm/kvm_host.h
+index 5b39fca481b7,dc7a58b39faf..000000000000
+--- a/arch/x86/include/asm/kvm_host.h
++++ b/arch/x86/include/asm/kvm_host.h
+@@@ -89,6 -86,8 +89,11 @@@
+  #define KVM_REQ_TLB_FLUSH_CURRENT	KVM_ARCH_REQ(26)
+  #define KVM_REQ_HV_TLB_FLUSH \
+  	KVM_ARCH_REQ_FLAGS(27, KVM_REQUEST_NO_WAKEUP)
+++<<<<<<< HEAD
+++=======
++ #define KVM_REQ_APF_READY		KVM_ARCH_REQ(28)
++ #define KVM_REQ_MSR_FILTER_CHANGED	KVM_ARCH_REQ(29)
+++>>>>>>> 1a155254ff93 (KVM: x86: Introduce MSR filtering)
+  
+  #define CR0_RESERVED_BITS                                               \
+  	(~(unsigned long)(X86_CR0_PE | X86_CR0_MP | X86_CR0_EM | X86_CR0_TS \
+@@@ -970,6 -969,15 +982,18 @@@ struct kvm_arch 
+  	bool guest_can_read_msr_platform_info;
+  	bool exception_payload_enabled;
+  
+++<<<<<<< HEAD
+++=======
++ 	/* Deflect RDMSR and WRMSR to user space when they trigger a #GP */
++ 	u32 user_space_msr_mask;
++ 
++ 	struct {
++ 		u8 count;
++ 		bool default_allow:1;
++ 		struct msr_bitmap_range ranges[16];
++ 	} msr_filter;
++ 
+++>>>>>>> 1a155254ff93 (KVM: x86: Introduce MSR filtering)
+  	struct kvm_pmu_event_filter *pmu_event_filter;
+  	struct task_struct *nx_lpage_recovery_thread;
+  };
+diff --cc arch/x86/include/uapi/asm/kvm.h
+index 0780f97c1850,89e5f3d1bba8..000000000000
+--- a/arch/x86/include/uapi/asm/kvm.h
++++ b/arch/x86/include/uapi/asm/kvm.h
+@@@ -192,6 -192,26 +192,29 @@@ struct kvm_msr_list 
+  	__u32 indices[0];
+  };
+  
+++<<<<<<< HEAD
+++=======
++ /* Maximum size of any access bitmap in bytes */
++ #define KVM_MSR_FILTER_MAX_BITMAP_SIZE 0x600
++ 
++ /* for KVM_X86_SET_MSR_FILTER */
++ struct kvm_msr_filter_range {
++ #define KVM_MSR_FILTER_READ  (1 << 0)
++ #define KVM_MSR_FILTER_WRITE (1 << 1)
++ 	__u32 flags;
++ 	__u32 nmsrs; /* number of msrs in bitmap */
++ 	__u32 base;  /* MSR index the bitmap starts at */
++ 	__u8 *bitmap; /* a 1 bit allows the operations in flags, 0 denies */
++ };
++ 
++ #define KVM_MSR_FILTER_MAX_RANGES 16
++ struct kvm_msr_filter {
++ #define KVM_MSR_FILTER_DEFAULT_ALLOW (0 << 0)
++ #define KVM_MSR_FILTER_DEFAULT_DENY  (1 << 0)
++ 	__u32 flags;
++ 	struct kvm_msr_filter_range ranges[KVM_MSR_FILTER_MAX_RANGES];
++ };
+++>>>>>>> 1a155254ff93 (KVM: x86: Introduce MSR filtering)
+  
+  struct kvm_cpuid_entry {
+  	__u32 function;
+diff --cc arch/x86/kvm/x86.c
+index 71f2e26ab478,72f91f3640f3..000000000000
+--- a/arch/x86/kvm/x86.c
++++ b/arch/x86/kvm/x86.c
+@@@ -1484,6 -1488,40 +1484,43 @@@ void kvm_enable_efer_bits(u64 mask
+  }
+  EXPORT_SYMBOL_GPL(kvm_enable_efer_bits);
+  
+++<<<<<<< HEAD
+++=======
++ bool kvm_msr_allowed(struct kvm_vcpu *vcpu, u32 index, u32 type)
++ {
++ 	struct kvm *kvm = vcpu->kvm;
++ 	struct msr_bitmap_range *ranges = kvm->arch.msr_filter.ranges;
++ 	u32 count = kvm->arch.msr_filter.count;
++ 	u32 i;
++ 	bool r = kvm->arch.msr_filter.default_allow;
++ 	int idx;
++ 
++ 	/* MSR filtering not set up, allow everything */
++ 	if (!count)
++ 		return true;
++ 
++ 	/* Prevent collision with set_msr_filter */
++ 	idx = srcu_read_lock(&kvm->srcu);
++ 
++ 	for (i = 0; i < count; i++) {
++ 		u32 start = ranges[i].base;
++ 		u32 end = start + ranges[i].nmsrs;
++ 		u32 flags = ranges[i].flags;
++ 		unsigned long *bitmap = ranges[i].bitmap;
++ 
++ 		if ((index >= start) && (index < end) && (flags & type)) {
++ 			r = !!test_bit(index - start, bitmap);
++ 			break;
++ 		}
++ 	}
++ 
++ 	srcu_read_unlock(&kvm->srcu, idx);
++ 
++ 	return r;
++ }
++ EXPORT_SYMBOL_GPL(kvm_msr_allowed);
++ 
+++>>>>>>> 1a155254ff93 (KVM: x86: Introduce MSR filtering)
+  /*
+   * Write @data into the MSR specified by @index.  Select MSR specific fault
+   * checks are bypassed if @host_initiated is %true.
+@@@ -1586,6 -1630,75 +1629,78 @@@ int kvm_set_msr(struct kvm_vcpu *vcpu, 
+  }
+  EXPORT_SYMBOL_GPL(kvm_set_msr);
+  
+++<<<<<<< HEAD
+++=======
++ static int complete_emulated_msr(struct kvm_vcpu *vcpu, bool is_read)
++ {
++ 	if (vcpu->run->msr.error) {
++ 		kvm_inject_gp(vcpu, 0);
++ 		return 1;
++ 	} else if (is_read) {
++ 		kvm_rax_write(vcpu, (u32)vcpu->run->msr.data);
++ 		kvm_rdx_write(vcpu, vcpu->run->msr.data >> 32);
++ 	}
++ 
++ 	return kvm_skip_emulated_instruction(vcpu);
++ }
++ 
++ static int complete_emulated_rdmsr(struct kvm_vcpu *vcpu)
++ {
++ 	return complete_emulated_msr(vcpu, true);
++ }
++ 
++ static int complete_emulated_wrmsr(struct kvm_vcpu *vcpu)
++ {
++ 	return complete_emulated_msr(vcpu, false);
++ }
++ 
++ static u64 kvm_msr_reason(int r)
++ {
++ 	switch (r) {
++ 	case -ENOENT:
++ 		return KVM_MSR_EXIT_REASON_UNKNOWN;
++ 	case -EPERM:
++ 		return KVM_MSR_EXIT_REASON_FILTER;
++ 	default:
++ 		return KVM_MSR_EXIT_REASON_INVAL;
++ 	}
++ }
++ 
++ static int kvm_msr_user_space(struct kvm_vcpu *vcpu, u32 index,
++ 			      u32 exit_reason, u64 data,
++ 			      int (*completion)(struct kvm_vcpu *vcpu),
++ 			      int r)
++ {
++ 	u64 msr_reason = kvm_msr_reason(r);
++ 
++ 	/* Check if the user wanted to know about this MSR fault */
++ 	if (!(vcpu->kvm->arch.user_space_msr_mask & msr_reason))
++ 		return 0;
++ 
++ 	vcpu->run->exit_reason = exit_reason;
++ 	vcpu->run->msr.error = 0;
++ 	memset(vcpu->run->msr.pad, 0, sizeof(vcpu->run->msr.pad));
++ 	vcpu->run->msr.reason = msr_reason;
++ 	vcpu->run->msr.index = index;
++ 	vcpu->run->msr.data = data;
++ 	vcpu->arch.complete_userspace_io = completion;
++ 
++ 	return 1;
++ }
++ 
++ static int kvm_get_msr_user_space(struct kvm_vcpu *vcpu, u32 index, int r)
++ {
++ 	return kvm_msr_user_space(vcpu, index, KVM_EXIT_X86_RDMSR, 0,
++ 				   complete_emulated_rdmsr, r);
++ }
++ 
++ static int kvm_set_msr_user_space(struct kvm_vcpu *vcpu, u32 index, u64 data, int r)
++ {
++ 	return kvm_msr_user_space(vcpu, index, KVM_EXIT_X86_WRMSR, data,
++ 				   complete_emulated_wrmsr, r);
++ }
++ 
+++>>>>>>> 1a155254ff93 (KVM: x86: Introduce MSR filtering)
+  int kvm_emulate_rdmsr(struct kvm_vcpu *vcpu)
+  {
+  	u32 ecx = kvm_rcx_read(vcpu);
+@@@ -3475,6 -3654,9 +3590,12 @@@ int kvm_vm_ioctl_check_extension(struc
+  	case KVM_CAP_MSR_PLATFORM_INFO:
+  	case KVM_CAP_EXCEPTION_PAYLOAD:
+  	case KVM_CAP_SET_GUEST_DEBUG:
+++<<<<<<< HEAD
+++=======
++ 	case KVM_CAP_LAST_CPU:
++ 	case KVM_CAP_X86_USER_SPACE_MSR:
++ 	case KVM_CAP_X86_MSR_FILTER:
+++>>>>>>> 1a155254ff93 (KVM: x86: Introduce MSR filtering)
+  		r = 1;
+  		break;
+  	case KVM_CAP_SYNC_REGS:
+@@@ -8427,6 -8746,10 +8648,13 @@@ static int vcpu_enter_guest(struct kvm_
+  			kvm_hv_process_stimers(vcpu);
+  		if (kvm_check_request(KVM_REQ_APICV_UPDATE, vcpu))
+  			kvm_vcpu_update_apicv(vcpu);
+++<<<<<<< HEAD
+++=======
++ 		if (kvm_check_request(KVM_REQ_APF_READY, vcpu))
++ 			kvm_check_async_pf_completion(vcpu);
++ 		if (kvm_check_request(KVM_REQ_MSR_FILTER_CHANGED, vcpu))
++ 			kvm_x86_ops.msr_filter_changed(vcpu);
+++>>>>>>> 1a155254ff93 (KVM: x86: Introduce MSR filtering)
+  	}
+  
+  	if (kvm_check_request(KVM_REQ_EVENT, vcpu) || req_int_win) {
+diff --cc include/uapi/linux/kvm.h
+index f2c3051a98e4,58f43aa1fc21..000000000000
+--- a/include/uapi/linux/kvm.h
++++ b/include/uapi/linux/kvm.h
+@@@ -412,6 -415,17 +412,20 @@@ struct kvm_run 
+  			__u64 esr_iss;
+  			__u64 fault_ipa;
+  		} arm_nisv;
+++<<<<<<< HEAD
+++=======
++ 		/* KVM_EXIT_X86_RDMSR / KVM_EXIT_X86_WRMSR */
++ 		struct {
++ 			__u8 error; /* user -> kernel */
++ 			__u8 pad[7];
++ #define KVM_MSR_EXIT_REASON_INVAL	(1 << 0)
++ #define KVM_MSR_EXIT_REASON_UNKNOWN	(1 << 1)
++ #define KVM_MSR_EXIT_REASON_FILTER	(1 << 2)
++ 			__u32 reason; /* kernel -> user */
++ 			__u32 index; /* kernel -> user */
++ 			__u64 data; /* kernel <-> user */
++ 		} msr;
+++>>>>>>> 1a155254ff93 (KVM: x86: Introduce MSR filtering)
+  		/* Fix the size of the union. */
+  		char padding[256];
+  	};
+@@@ -1030,6 -1045,13 +1044,16 @@@ struct kvm_ppc_resize_hpt 
+  #define KVM_CAP_S390_PROTECTED 180
+  #define KVM_CAP_PPC_SECURE_GUEST 181
+  #define KVM_CAP_HALT_POLL 182
+++<<<<<<< HEAD
+++=======
++ #define KVM_CAP_ASYNC_PF_INT 183
++ #define KVM_CAP_LAST_CPU 184
++ #define KVM_CAP_SMALLER_MAXPHYADDR 185
++ #define KVM_CAP_S390_DIAG318 186
++ #define KVM_CAP_STEAL_TIME 187
++ #define KVM_CAP_X86_USER_SPACE_MSR 188
++ #define KVM_CAP_X86_MSR_FILTER 189
+++>>>>>>> 1a155254ff93 (KVM: x86: Introduce MSR filtering)
+  
+  #ifdef KVM_CAP_IRQ_ROUTING
+  
+* Unmerged path Documentation/virt/kvm/api.rst
+* Unmerged path arch/x86/include/asm/kvm_host.h
+* Unmerged path arch/x86/include/uapi/asm/kvm.h
+* Unmerged path arch/x86/kvm/x86.c
+* Unmerged path include/uapi/linux/kvm.h
