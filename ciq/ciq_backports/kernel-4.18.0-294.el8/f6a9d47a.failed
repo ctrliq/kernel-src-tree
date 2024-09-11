@@ -1,0 +1,273 @@
+RDMA/cma: Execute rdma_cm destruction from a handler properly
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Jason Gunthorpe <jgg@nvidia.com>
+commit f6a9d47ae6854980fc4b1676f1fe9f9fa45ea4e2
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/f6a9d47a.failed
+
+When a rdma_cm_id needs to be destroyed after a handler callback fails,
+part of the destruction pattern is open coded into each call site.
+
+Unfortunately the blind assignment to state discards important information
+needed to do cma_cancel_operation(). This results in active operations
+being left running after rdma_destroy_id() completes, and the
+use-after-free bugs from KASAN.
+
+Consolidate this entire pattern into destroy_id_handler_unlock() and
+manage the locking correctly. The state should be set to
+RDMA_CM_DESTROYING under the handler_lock to atomically ensure no futher
+handlers are called.
+
+Link: https://lore.kernel.org/r/20200723070707.1771101-5-leon@kernel.org
+	Reported-by: syzbot+08092148130652a6faae@syzkaller.appspotmail.com
+	Reported-by: syzbot+a929647172775e335941@syzkaller.appspotmail.com
+	Signed-off-by: Leon Romanovsky <leonro@mellanox.com>
+	Signed-off-by: Jason Gunthorpe <jgg@nvidia.com>
+(cherry picked from commit f6a9d47ae6854980fc4b1676f1fe9f9fa45ea4e2)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/infiniband/core/cma.c
+diff --cc drivers/infiniband/core/cma.c
+index abf2fb7b598e,172cc16bd231..000000000000
+--- a/drivers/infiniband/core/cma.c
++++ b/drivers/infiniband/core/cma.c
+@@@ -1824,23 -1812,11 +1811,29 @@@ static void cma_leave_mc_groups(struct 
+  	}
+  }
+  
+- void rdma_destroy_id(struct rdma_cm_id *id)
++ static void _destroy_id(struct rdma_id_private *id_priv,
++ 			enum rdma_cm_state state)
+  {
+++<<<<<<< HEAD
+ +	struct rdma_id_private *id_priv;
+ +	enum rdma_cm_state state;
+ +
+ +	id_priv = container_of(id, struct rdma_id_private, id);
+ +	trace_cm_id_destroy(id_priv);
+ +	state = cma_exch(id_priv, RDMA_CM_DESTROYING);
+  	cma_cancel_operation(id_priv, state);
+  
+ +	/*
+ +	 * Wait for any active callback to finish.  New callbacks will find
+ +	 * the id_priv state set to destroying and abort.
+ +	 */
+ +	mutex_lock(&id_priv->handler_mutex);
+ +	mutex_unlock(&id_priv->handler_mutex);
+ +
+++=======
+++	cma_cancel_operation(id_priv, state);
+++
+++>>>>>>> f6a9d47ae685 (RDMA/cma: Execute rdma_cm destruction from a handler properly)
+  	rdma_restrack_del(&id_priv->res);
+  	if (id_priv->cma_dev) {
+  		if (rdma_cap_ib_cm(id_priv->id.device, 1)) {
+@@@ -2198,43 -2212,24 +2227,56 @@@ static int cma_ib_req_handler(struct ib
+  	cm_id->context = conn_id;
+  	cm_id->cm_handler = cma_ib_handler;
+  
+ +	/*
+ +	 * Protect against the user destroying conn_id from another thread
+ +	 * until we're done accessing it.
+ +	 */
+ +	atomic_inc(&conn_id->refcount);
+  	ret = cma_cm_event_handler(conn_id, &event);
+++<<<<<<< HEAD
+ +	if (ret)
+ +		goto err3;
+ +	/*
+ +	 * Acquire mutex to prevent user executing rdma_destroy_id()
+ +	 * while we're accessing the cm_id.
+ +	 */
+ +	mutex_lock(&lock);
+++=======
++ 	if (ret) {
++ 		/* Destroy the CM ID by returning a non-zero value. */
++ 		conn_id->cm_id.ib = NULL;
++ 		mutex_unlock(&listen_id->handler_mutex);
++ 		destroy_id_handler_unlock(conn_id);
++ 		goto net_dev_put;
++ 	}
++ 
+++>>>>>>> f6a9d47ae685 (RDMA/cma: Execute rdma_cm destruction from a handler properly)
+  	if (cma_comp(conn_id, RDMA_CM_CONNECT) &&
+  	    (conn_id->id.qp_type != IB_QPT_UD)) {
+  		trace_cm_send_mra(cm_id->context);
+  		ib_send_cm_mra(cm_id, CMA_CM_MRA_SETTING, NULL, 0);
+  	}
+- 	mutex_unlock(&lock);
+  	mutex_unlock(&conn_id->handler_mutex);
+++<<<<<<< HEAD
+ +	mutex_unlock(&listen_id->handler_mutex);
+ +	cma_deref_id(conn_id);
+ +	if (net_dev)
+ +		dev_put(net_dev);
+ +	return 0;
+ +
+ +err3:
+ +	cma_deref_id(conn_id);
+ +	/* Destroy the CM ID by returning a non-zero value. */
+ +	conn_id->cm_id.ib = NULL;
+ +err2:
+ +	cma_exch(conn_id, RDMA_CM_DESTROYING);
+ +	mutex_unlock(&conn_id->handler_mutex);
+ +err1:
+++=======
++ 
++ err_unlock:
+++>>>>>>> f6a9d47ae685 (RDMA/cma: Execute rdma_cm destruction from a handler properly)
+  	mutex_unlock(&listen_id->handler_mutex);
+- 	if (conn_id)
+- 		rdma_destroy_id(&conn_id->id);
+  
+  net_dev_put:
+  	if (net_dev)
+@@@ -2411,11 -2399,8 +2451,13 @@@ static int iw_conn_req_handler(struct i
+  	if (ret) {
+  		/* User wants to destroy the CM ID */
+  		conn_id->cm_id.iw = NULL;
+- 		cma_exch(conn_id, RDMA_CM_DESTROYING);
+- 		mutex_unlock(&conn_id->handler_mutex);
+  		mutex_unlock(&listen_id->handler_mutex);
+++<<<<<<< HEAD
+ +		cma_deref_id(conn_id);
+ +		rdma_destroy_id(&conn_id->id);
+++=======
++ 		destroy_id_handler_unlock(conn_id);
+++>>>>>>> f6a9d47ae685 (RDMA/cma: Execute rdma_cm destruction from a handler properly)
+  		return ret;
+  	}
+  
+@@@ -2655,18 -2641,18 +2697,24 @@@ static void cma_work_handler(struct wor
+  
+  	mutex_lock(&id_priv->handler_mutex);
+  	if (!cma_comp_exch(id_priv, work->old_state, work->new_state))
+- 		goto out;
++ 		goto out_unlock;
+  
+  	if (cma_cm_event_handler(id_priv, &work->event)) {
+- 		cma_exch(id_priv, RDMA_CM_DESTROYING);
+- 		destroy = 1;
++ 		cma_id_put(id_priv);
++ 		destroy_id_handler_unlock(id_priv);
++ 		goto out_free;
+  	}
+- out:
++ 
++ out_unlock:
+  	mutex_unlock(&id_priv->handler_mutex);
+++<<<<<<< HEAD
+ +	cma_deref_id(id_priv);
+ +	if (destroy)
+ +		rdma_destroy_id(&id_priv->id);
+++=======
++ 	cma_id_put(id_priv);
++ out_free:
+++>>>>>>> f6a9d47ae685 (RDMA/cma: Execute rdma_cm destruction from a handler properly)
+  	kfree(work);
+  }
+  
+@@@ -2679,18 -2664,18 +2726,24 @@@ static void cma_ndev_work_handler(struc
+  	mutex_lock(&id_priv->handler_mutex);
+  	if (id_priv->state == RDMA_CM_DESTROYING ||
+  	    id_priv->state == RDMA_CM_DEVICE_REMOVAL)
+- 		goto out;
++ 		goto out_unlock;
+  
+  	if (cma_cm_event_handler(id_priv, &work->event)) {
+- 		cma_exch(id_priv, RDMA_CM_DESTROYING);
+- 		destroy = 1;
++ 		cma_id_put(id_priv);
++ 		destroy_id_handler_unlock(id_priv);
++ 		goto out_free;
+  	}
+  
+- out:
++ out_unlock:
+  	mutex_unlock(&id_priv->handler_mutex);
+++<<<<<<< HEAD
+ +	cma_deref_id(id_priv);
+ +	if (destroy)
+ +		rdma_destroy_id(&id_priv->id);
+++=======
++ 	cma_id_put(id_priv);
++ out_free:
+++>>>>>>> f6a9d47ae685 (RDMA/cma: Execute rdma_cm destruction from a handler properly)
+  	kfree(work);
+  }
+  
+@@@ -4776,33 -4748,47 +4823,53 @@@ free_gid_type
+  
+  free_cma_dev:
+  	kfree(cma_dev);
+ -	return ret;
+ +
+ +	return;
+  }
+  
+ -static void cma_send_device_removal_put(struct rdma_id_private *id_priv)
+ +static int cma_remove_id_dev(struct rdma_id_private *id_priv)
+  {
+ -	struct rdma_cm_event event = { .event = RDMA_CM_EVENT_DEVICE_REMOVAL };
+ +	struct rdma_cm_event event = {};
+  	enum rdma_cm_state state;
+ -	unsigned long flags;
+ +	int ret = 0;
+  
+ -	mutex_lock(&id_priv->handler_mutex);
+  	/* Record that we want to remove the device */
+ -	spin_lock_irqsave(&id_priv->lock, flags);
+ -	state = id_priv->state;
+ -	if (state == RDMA_CM_DESTROYING || state == RDMA_CM_DEVICE_REMOVAL) {
+ -		spin_unlock_irqrestore(&id_priv->lock, flags);
+ -		mutex_unlock(&id_priv->handler_mutex);
+ -		cma_id_put(id_priv);
+ -		return;
+ -	}
+ -	id_priv->state = RDMA_CM_DEVICE_REMOVAL;
+ -	spin_unlock_irqrestore(&id_priv->lock, flags);
+ +	state = cma_exch(id_priv, RDMA_CM_DEVICE_REMOVAL);
+ +	if (state == RDMA_CM_DESTROYING)
+ +		return 0;
+  
+++<<<<<<< HEAD
+++=======
++ 	if (cma_cm_event_handler(id_priv, &event)) {
++ 		/*
++ 		 * At this point the ULP promises it won't call
++ 		 * rdma_destroy_id() concurrently
++ 		 */
++ 		cma_id_put(id_priv);
++ 		mutex_unlock(&id_priv->handler_mutex);
++ 		trace_cm_id_destroy(id_priv);
++ 		_destroy_id(id_priv, state);
++ 		return;
++ 	}
++ 	mutex_unlock(&id_priv->handler_mutex);
++ 
++ 	/*
++ 	 * If this races with destroy then the thread that first assigns state
++ 	 * to a destroying does the cancel.
++ 	 */
+++>>>>>>> f6a9d47ae685 (RDMA/cma: Execute rdma_cm destruction from a handler properly)
+  	cma_cancel_operation(id_priv, state);
+ -	cma_id_put(id_priv);
+ +	mutex_lock(&id_priv->handler_mutex);
+ +
+ +	/* Check for destruction from another callback. */
+ +	if (!cma_comp(id_priv, RDMA_CM_DEVICE_REMOVAL))
+ +		goto out;
+ +
+ +	event.event = RDMA_CM_EVENT_DEVICE_REMOVAL;
+ +	ret = cma_cm_event_handler(id_priv, &event);
+ +out:
+ +	mutex_unlock(&id_priv->handler_mutex);
+ +	return ret;
+  }
+  
+  static void cma_process_remove(struct cma_device *cma_dev)
+* Unmerged path drivers/infiniband/core/cma.c
