@@ -1,0 +1,162 @@
+blkcg: change blkg reference counting to use percpu_ref
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-80.el8
+commit-author Dennis Zhou (Facebook) <dennisszhou@gmail.com>
+commit b3b9f24f5fcc099c41f7dc1d02350635830888e5
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-80.el8/b3b9f24f.failed
+
+Now that every bio is associated with a blkg, this puts the use of
+blkg_get, blkg_try_get, and blkg_put on the hot path. This switches over
+the refcnt in blkg to use percpu_ref.
+
+	Signed-off-by: Dennis Zhou <dennisszhou@gmail.com>
+	Acked-by: Tejun Heo <tj@kernel.org>
+	Signed-off-by: Jens Axboe <axboe@kernel.dk>
+(cherry picked from commit b3b9f24f5fcc099c41f7dc1d02350635830888e5)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/blk-cgroup.h
+diff --cc include/linux/blk-cgroup.h
+index 8bf2308b920c,7ff5d8ba8c7a..000000000000
+--- a/include/linux/blk-cgroup.h
++++ b/include/linux/blk-cgroup.h
+@@@ -509,8 -507,20 +508,23 @@@ static inline struct blkcg_gq *blkg_try
+  	return NULL;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ /**
++  * blkg_try_get_closest - try and get a blkg ref on the closet blkg
++  * @blkg: blkg to get
++  *
++  * This walks up the blkg tree to find the closest non-dying blkg and returns
++  * the blkg that it did association with as it may not be the passed in blkg.
++  */
++ static inline struct blkcg_gq *blkg_try_get_closest(struct blkcg_gq *blkg)
++ {
++ 	while (!percpu_ref_tryget(&blkg->refcnt))
++ 		blkg = blkg->parent;
+  
+- void __blkg_release_rcu(struct rcu_head *rcu);
++ 	return blkg;
++ }
+++>>>>>>> b3b9f24f5fcc (blkcg: change blkg reference counting to use percpu_ref)
+  
+  /**
+   * blkg_put - put a blkg reference
+diff --git a/block/blk-cgroup.c b/block/blk-cgroup.c
+index 301ed0447460..5bc5eb95c06f 100644
+--- a/block/blk-cgroup.c
++++ b/block/blk-cgroup.c
+@@ -84,6 +84,37 @@ static void blkg_free(struct blkcg_gq *blkg)
+ 	kfree(blkg);
+ }
+ 
++static void __blkg_release(struct rcu_head *rcu)
++{
++	struct blkcg_gq *blkg = container_of(rcu, struct blkcg_gq, rcu_head);
++
++	percpu_ref_exit(&blkg->refcnt);
++
++	/* release the blkcg and parent blkg refs this blkg has been holding */
++	css_put(&blkg->blkcg->css);
++	if (blkg->parent)
++		blkg_put(blkg->parent);
++
++	wb_congested_put(blkg->wb_congested);
++
++	blkg_free(blkg);
++}
++
++/*
++ * A group is RCU protected, but having an rcu lock does not mean that one
++ * can access all the fields of blkg and assume these are valid.  For
++ * example, don't try to follow throtl_data and request queue links.
++ *
++ * Having a reference to blkg under an rcu allows accesses to only values
++ * local to groups like group stats and group rate limits.
++ */
++static void blkg_release(struct percpu_ref *ref)
++{
++	struct blkcg_gq *blkg = container_of(ref, struct blkcg_gq, refcnt);
++
++	call_rcu(&blkg->rcu_head, __blkg_release);
++}
++
+ /**
+  * blkg_alloc - allocate a blkg
+  * @blkcg: block cgroup the new blkg is associated with
+@@ -110,7 +141,6 @@ static struct blkcg_gq *blkg_alloc(struct blkcg *blkcg, struct request_queue *q,
+ 	blkg->q = q;
+ 	INIT_LIST_HEAD(&blkg->q_node);
+ 	blkg->blkcg = blkcg;
+-	atomic_set(&blkg->refcnt, 1);
+ 
+ 	/* root blkg uses @q->root_rl, init rl only for !root blkgs */
+ 	if (blkcg != &blkcg_root) {
+@@ -217,6 +247,11 @@ static struct blkcg_gq *blkg_create(struct blkcg *blkcg,
+ 		blkg_get(blkg->parent);
+ 	}
+ 
++	ret = percpu_ref_init(&blkg->refcnt, blkg_release, 0,
++			      GFP_NOWAIT | __GFP_NOWARN);
++	if (ret)
++		goto err_cancel_ref;
++
+ 	/* invoke per-policy init */
+ 	for (i = 0; i < BLKCG_MAX_POLS; i++) {
+ 		struct blkcg_policy *pol = blkcg_policy[i];
+@@ -249,6 +284,8 @@ static struct blkcg_gq *blkg_create(struct blkcg *blkcg,
+ 	blkg_put(blkg);
+ 	return ERR_PTR(ret);
+ 
++err_cancel_ref:
++	percpu_ref_exit(&blkg->refcnt);
+ err_put_congested:
+ 	wb_congested_put(wb_congested);
+ err_put_css:
+@@ -356,7 +393,7 @@ static void blkg_destroy(struct blkcg_gq *blkg)
+ 	 * Put the reference taken at the time of creation so that when all
+ 	 * queues are gone, group can be destroyed.
+ 	 */
+-	blkg_put(blkg);
++	percpu_ref_kill(&blkg->refcnt);
+ }
+ 
+ /**
+@@ -384,29 +421,6 @@ static void blkg_destroy_all(struct request_queue *q)
+ 	q->root_rl.blkg = NULL;
+ }
+ 
+-/*
+- * A group is RCU protected, but having an rcu lock does not mean that one
+- * can access all the fields of blkg and assume these are valid.  For
+- * example, don't try to follow throtl_data and request queue links.
+- *
+- * Having a reference to blkg under an rcu allows accesses to only values
+- * local to groups like group stats and group rate limits.
+- */
+-void __blkg_release_rcu(struct rcu_head *rcu_head)
+-{
+-	struct blkcg_gq *blkg = container_of(rcu_head, struct blkcg_gq, rcu_head);
+-
+-	/* release the blkcg and parent blkg refs this blkg has been holding */
+-	css_put(&blkg->blkcg->css);
+-	if (blkg->parent)
+-		blkg_put(blkg->parent);
+-
+-	wb_congested_put(blkg->wb_congested);
+-
+-	blkg_free(blkg);
+-}
+-EXPORT_SYMBOL_GPL(__blkg_release_rcu);
+-
+ /*
+  * The next function used by blk_queue_for_each_rl().  It's a bit tricky
+  * because the root blkg uses @q->root_rl instead of its own rl.
+* Unmerged path include/linux/blk-cgroup.h
