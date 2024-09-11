@@ -1,0 +1,230 @@
+locking/rwsem: Optimize down_read_trylock()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-147.el8
+commit-author Waiman Long <longman@redhat.com>
+commit ddb20d1d3aed8f130519c0a29cd5392efcc067b8
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-147.el8/ddb20d1d.failed
+
+Modify __down_read_trylock() to optimize for an unlocked rwsem and make
+it generate slightly better code.
+
+Before this patch, down_read_trylock:
+
+   0x0000000000000000 <+0>:     callq  0x5 <down_read_trylock+5>
+   0x0000000000000005 <+5>:     jmp    0x18 <down_read_trylock+24>
+   0x0000000000000007 <+7>:     lea    0x1(%rdx),%rcx
+   0x000000000000000b <+11>:    mov    %rdx,%rax
+   0x000000000000000e <+14>:    lock cmpxchg %rcx,(%rdi)
+   0x0000000000000013 <+19>:    cmp    %rax,%rdx
+   0x0000000000000016 <+22>:    je     0x23 <down_read_trylock+35>
+   0x0000000000000018 <+24>:    mov    (%rdi),%rdx
+   0x000000000000001b <+27>:    test   %rdx,%rdx
+   0x000000000000001e <+30>:    jns    0x7 <down_read_trylock+7>
+   0x0000000000000020 <+32>:    xor    %eax,%eax
+   0x0000000000000022 <+34>:    retq
+   0x0000000000000023 <+35>:    mov    %gs:0x0,%rax
+   0x000000000000002c <+44>:    or     $0x3,%rax
+   0x0000000000000030 <+48>:    mov    %rax,0x20(%rdi)
+   0x0000000000000034 <+52>:    mov    $0x1,%eax
+   0x0000000000000039 <+57>:    retq
+
+After patch, down_read_trylock:
+
+   0x0000000000000000 <+0>:	callq  0x5 <down_read_trylock+5>
+   0x0000000000000005 <+5>:	xor    %eax,%eax
+   0x0000000000000007 <+7>:	lea    0x1(%rax),%rdx
+   0x000000000000000b <+11>:	lock cmpxchg %rdx,(%rdi)
+   0x0000000000000010 <+16>:	jne    0x29 <down_read_trylock+41>
+   0x0000000000000012 <+18>:	mov    %gs:0x0,%rax
+   0x000000000000001b <+27>:	or     $0x3,%rax
+   0x000000000000001f <+31>:	mov    %rax,0x20(%rdi)
+   0x0000000000000023 <+35>:	mov    $0x1,%eax
+   0x0000000000000028 <+40>:	retq
+   0x0000000000000029 <+41>:	test   %rax,%rax
+   0x000000000000002c <+44>:	jns    0x7 <down_read_trylock+7>
+   0x000000000000002e <+46>:	xor    %eax,%eax
+   0x0000000000000030 <+48>:	retq
+
+By using a rwsem microbenchmark, the down_read_trylock() rate (with a
+load of 10 to lengthen the lock critical section) on a x86-64 system
+before and after the patch were:
+
+                 Before Patch    After Patch
+   # of Threads     rlock           rlock
+   ------------     -----           -----
+        1           14,496          14,716
+        2            8,644           8,453
+	4            6,799           6,983
+	8            5,664           7,190
+
+On a ARM64 system, the performance results were:
+
+                 Before Patch    After Patch
+   # of Threads     rlock           rlock
+   ------------     -----           -----
+        1           23,676          24,488
+        2            7,697           9,502
+        4            4,945           3,440
+        8            2,641           1,603
+
+For the uncontended case (1 thread), the new down_read_trylock() is a
+little bit faster. For the contended cases, the new down_read_trylock()
+perform pretty well in x86-64, but performance degrades at high
+contention level on ARM64.
+
+	Suggested-by: Linus Torvalds <torvalds@linux-foundation.org>
+	Signed-off-by: Waiman Long <longman@redhat.com>
+	Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+	Acked-by: Linus Torvalds <torvalds@linux-foundation.org>
+	Cc: Andrew Morton <akpm@linux-foundation.org>
+	Cc: Arnd Bergmann <arnd@arndb.de>
+	Cc: Borislav Petkov <bp@alien8.de>
+	Cc: Davidlohr Bueso <dave@stgolabs.net>
+	Cc: H. Peter Anvin <hpa@zytor.com>
+	Cc: Paul E. McKenney <paulmck@linux.vnet.ibm.com>
+	Cc: Peter Zijlstra <peterz@infradead.org>
+	Cc: Thomas Gleixner <tglx@linutronix.de>
+	Cc: Tim Chen <tim.c.chen@linux.intel.com>
+	Cc: Will Deacon <will.deacon@arm.com>
+	Cc: linux-arm-kernel@lists.infradead.org
+	Cc: linux-c6x-dev@linux-c6x.org
+	Cc: linux-m68k@lists.linux-m68k.org
+	Cc: linux-riscv@lists.infradead.org
+	Cc: linux-um@lists.infradead.org
+	Cc: linux-xtensa@linux-xtensa.org
+	Cc: linuxppc-dev@lists.ozlabs.org
+	Cc: nios2-dev@lists.rocketboards.org
+	Cc: openrisc@lists.librecores.org
+	Cc: uclinux-h8-devel@lists.sourceforge.jp
+Link: https://lkml.kernel.org/r/20190322143008.21313-4-longman@redhat.com
+	Signed-off-by: Ingo Molnar <mingo@kernel.org>
+(cherry picked from commit ddb20d1d3aed8f130519c0a29cd5392efcc067b8)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	kernel/locking/rwsem.h
+diff --cc kernel/locking/rwsem.h
+index bad2bca0268b,1f5775aa6a1d..000000000000
+--- a/kernel/locking/rwsem.h
++++ b/kernel/locking/rwsem.h
+@@@ -132,3 -152,113 +132,116 @@@ static inline void rwsem_clear_reader_o
+  {
+  }
+  #endif
+++<<<<<<< HEAD
+++=======
++ 
++ /*
++  * lock for reading
++  */
++ static inline void __down_read(struct rw_semaphore *sem)
++ {
++ 	if (unlikely(atomic_long_inc_return_acquire(&sem->count) <= 0))
++ 		rwsem_down_read_failed(sem);
++ }
++ 
++ static inline int __down_read_killable(struct rw_semaphore *sem)
++ {
++ 	if (unlikely(atomic_long_inc_return_acquire(&sem->count) <= 0)) {
++ 		if (IS_ERR(rwsem_down_read_failed_killable(sem)))
++ 			return -EINTR;
++ 	}
++ 
++ 	return 0;
++ }
++ 
++ static inline int __down_read_trylock(struct rw_semaphore *sem)
++ {
++ 	/*
++ 	 * Optimize for the case when the rwsem is not locked at all.
++ 	 */
++ 	long tmp = RWSEM_UNLOCKED_VALUE;
++ 
++ 	do {
++ 		if (atomic_long_try_cmpxchg_acquire(&sem->count, &tmp,
++ 					tmp + RWSEM_ACTIVE_READ_BIAS)) {
++ 			return 1;
++ 		}
++ 	} while (tmp >= 0);
++ 	return 0;
++ }
++ 
++ /*
++  * lock for writing
++  */
++ static inline void __down_write(struct rw_semaphore *sem)
++ {
++ 	long tmp;
++ 
++ 	tmp = atomic_long_add_return_acquire(RWSEM_ACTIVE_WRITE_BIAS,
++ 					     &sem->count);
++ 	if (unlikely(tmp != RWSEM_ACTIVE_WRITE_BIAS))
++ 		rwsem_down_write_failed(sem);
++ }
++ 
++ static inline int __down_write_killable(struct rw_semaphore *sem)
++ {
++ 	long tmp;
++ 
++ 	tmp = atomic_long_add_return_acquire(RWSEM_ACTIVE_WRITE_BIAS,
++ 					     &sem->count);
++ 	if (unlikely(tmp != RWSEM_ACTIVE_WRITE_BIAS))
++ 		if (IS_ERR(rwsem_down_write_failed_killable(sem)))
++ 			return -EINTR;
++ 	return 0;
++ }
++ 
++ static inline int __down_write_trylock(struct rw_semaphore *sem)
++ {
++ 	long tmp;
++ 
++ 	tmp = atomic_long_cmpxchg_acquire(&sem->count, RWSEM_UNLOCKED_VALUE,
++ 		      RWSEM_ACTIVE_WRITE_BIAS);
++ 	return tmp == RWSEM_UNLOCKED_VALUE;
++ }
++ 
++ /*
++  * unlock after reading
++  */
++ static inline void __up_read(struct rw_semaphore *sem)
++ {
++ 	long tmp;
++ 
++ 	tmp = atomic_long_dec_return_release(&sem->count);
++ 	if (unlikely(tmp < -1 && (tmp & RWSEM_ACTIVE_MASK) == 0))
++ 		rwsem_wake(sem);
++ }
++ 
++ /*
++  * unlock after writing
++  */
++ static inline void __up_write(struct rw_semaphore *sem)
++ {
++ 	if (unlikely(atomic_long_sub_return_release(RWSEM_ACTIVE_WRITE_BIAS,
++ 						    &sem->count) < 0))
++ 		rwsem_wake(sem);
++ }
++ 
++ /*
++  * downgrade write lock to read lock
++  */
++ static inline void __downgrade_write(struct rw_semaphore *sem)
++ {
++ 	long tmp;
++ 
++ 	/*
++ 	 * When downgrading from exclusive to shared ownership,
++ 	 * anything inside the write-locked region cannot leak
++ 	 * into the read side. In contrast, anything in the
++ 	 * read-locked region is ok to be re-ordered into the
++ 	 * write side. As such, rely on RELEASE semantics.
++ 	 */
++ 	tmp = atomic_long_add_return_release(-RWSEM_WAITING_BIAS, &sem->count);
++ 	if (tmp < 0)
++ 		rwsem_downgrade_wake(sem);
++ }
+++>>>>>>> ddb20d1d3aed (locking/rwsem: Optimize down_read_trylock())
+* Unmerged path kernel/locking/rwsem.h
