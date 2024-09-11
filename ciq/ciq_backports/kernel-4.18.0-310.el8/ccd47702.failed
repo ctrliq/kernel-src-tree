@@ -1,0 +1,177 @@
+powerpc/64s: Fix HV NMI vs HV interrupt recoverability test
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-310.el8
+commit-author Nicholas Piggin <npiggin@gmail.com>
+commit ccd477028a202993b9ddca5d2404fdaca3b7a55c
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-310.el8/ccd47702.failed
+
+HV interrupts that use HSRR registers do not enter with MSR[RI] clear,
+but their entry code is not recoverable vs NMI, due to shared use of
+HSPRG1 as a scratch register to save r13.
+
+This means that a system reset or machine check that hits in HSRR
+interrupt entry can cause r13 to be silently corrupted.
+
+Fix this by marking NMIs non-recoverable if they land in HV interrupt
+ranges.
+
+	Signed-off-by: Nicholas Piggin <npiggin@gmail.com>
+	Signed-off-by: Michael Ellerman <mpe@ellerman.id.au>
+(cherry picked from commit ccd477028a202993b9ddca5d2404fdaca3b7a55c)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/powerpc/kernel/mce.c
+diff --cc arch/powerpc/kernel/mce.c
+index 03f15fd9bbae,b5fec1f9751a..000000000000
+--- a/arch/powerpc/kernel/mce.c
++++ b/arch/powerpc/kernel/mce.c
+@@@ -32,7 -31,7 +32,11 @@@
+  
+  #include <asm/machdep.h>
+  #include <asm/mce.h>
+++<<<<<<< HEAD
+ +#include <asm/extable.h>
+++=======
++ #include <asm/nmi.h>
+++>>>>>>> ccd477028a20 (powerpc/64s: Fix HV NMI vs HV interrupt recoverability test)
+  
+  static DEFINE_PER_CPU(int, mce_nest_count);
+  static DEFINE_PER_CPU(struct machine_check_event[MAX_MC_EVT], mce_event);
+diff --git a/arch/powerpc/include/asm/asm-prototypes.h b/arch/powerpc/include/asm/asm-prototypes.h
+index 01f690bd1100..77d7f6887d9f 100644
+--- a/arch/powerpc/include/asm/asm-prototypes.h
++++ b/arch/powerpc/include/asm/asm-prototypes.h
+@@ -60,6 +60,14 @@ int exit_vmx_usercopy(void);
+ int enter_vmx_copy(void);
+ void * exit_vmx_copy(void *dest);
+ 
++/* Exceptions */
++#ifdef CONFIG_PPC_POWERNV
++extern unsigned long real_trampolines_start;
++extern unsigned long real_trampolines_end;
++extern unsigned long virt_trampolines_start;
++extern unsigned long virt_trampolines_end;
++#endif
++
+ /* Traps */
+ long machine_check_early(struct pt_regs *regs);
+ long hmi_exception_realmode(struct pt_regs *regs);
+diff --git a/arch/powerpc/include/asm/nmi.h b/arch/powerpc/include/asm/nmi.h
+index bd9ba8defd72..84b4cfe73edd 100644
+--- a/arch/powerpc/include/asm/nmi.h
++++ b/arch/powerpc/include/asm/nmi.h
+@@ -14,4 +14,6 @@ extern void arch_trigger_cpumask_backtrace(const cpumask_t *mask,
+ #define arch_trigger_cpumask_backtrace arch_trigger_cpumask_backtrace
+ #endif
+ 
++extern void hv_nmi_check_nonrecoverable(struct pt_regs *regs);
++
+ #endif /* _ASM_NMI_H */
+diff --git a/arch/powerpc/kernel/exceptions-64s.S b/arch/powerpc/kernel/exceptions-64s.S
+index 60ccf3e2e6a6..8c81b7f808a2 100644
+--- a/arch/powerpc/kernel/exceptions-64s.S
++++ b/arch/powerpc/kernel/exceptions-64s.S
+@@ -67,6 +67,14 @@ OPEN_FIXED_SECTION(real_vectors,        0x0100, 0x1900)
+ OPEN_FIXED_SECTION(real_trampolines,    0x1900, 0x4000)
+ OPEN_FIXED_SECTION(virt_vectors,        0x4000, 0x5900)
+ OPEN_FIXED_SECTION(virt_trampolines,    0x5900, 0x7000)
++
++#ifdef CONFIG_PPC_POWERNV
++	.globl real_trampolines_start
++	.globl real_trampolines_end
++	.globl virt_trampolines_start
++	.globl virt_trampolines_end
++#endif
++
+ #if defined(CONFIG_PPC_PSERIES) || defined(CONFIG_PPC_POWERNV)
+ /*
+  * Data area reserved for FWNMI option.
+* Unmerged path arch/powerpc/kernel/mce.c
+diff --git a/arch/powerpc/kernel/traps.c b/arch/powerpc/kernel/traps.c
+index 7b3619c07d86..c015eba02701 100644
+--- a/arch/powerpc/kernel/traps.c
++++ b/arch/powerpc/kernel/traps.c
+@@ -353,6 +353,70 @@ void _exception(int signr, struct pt_regs *regs, int code, unsigned long addr)
+ 	force_sig_fault(signr, code, (void __user *)addr, current);
+ }
+ 
++/*
++ * The interrupt architecture has a quirk in that the HV interrupts excluding
++ * the NMIs (0x100 and 0x200) do not clear MSR[RI] at entry. The first thing
++ * that an interrupt handler must do is save off a GPR into a scratch register,
++ * and all interrupts on POWERNV (HV=1) use the HSPRG1 register as scratch.
++ * Therefore an NMI can clobber an HV interrupt's live HSPRG1 without noticing
++ * that it is non-reentrant, which leads to random data corruption.
++ *
++ * The solution is for NMI interrupts in HV mode to check if they originated
++ * from these critical HV interrupt regions. If so, then mark them not
++ * recoverable.
++ *
++ * An alternative would be for HV NMIs to use SPRG for scratch to avoid the
++ * HSPRG1 clobber, however this would cause guest SPRG to be clobbered. Linux
++ * guests should always have MSR[RI]=0 when its scratch SPRG is in use, so
++ * that would work. However any other guest OS that may have the SPRG live
++ * and MSR[RI]=1 could encounter silent corruption.
++ *
++ * Builds that do not support KVM could take this second option to increase
++ * the recoverability of NMIs.
++ */
++void hv_nmi_check_nonrecoverable(struct pt_regs *regs)
++{
++#ifdef CONFIG_PPC_POWERNV
++	unsigned long kbase = (unsigned long)_stext;
++	unsigned long nip = regs->nip;
++
++	if (!(regs->msr & MSR_RI))
++		return;
++	if (!(regs->msr & MSR_HV))
++		return;
++	if (regs->msr & MSR_PR)
++		return;
++
++	/*
++	 * Now test if the interrupt has hit a range that may be using
++	 * HSPRG1 without having RI=0 (i.e., an HSRR interrupt). The
++	 * problem ranges all run un-relocated. Test real and virt modes
++	 * at the same time by droping the high bit of the nip (virt mode
++	 * entry points still have the +0x4000 offset).
++	 */
++	nip &= ~0xc000000000000000ULL;
++	if ((nip >= 0x500 && nip < 0x600) || (nip >= 0x4500 && nip < 0x4600))
++		goto nonrecoverable;
++	if ((nip >= 0x980 && nip < 0xa00) || (nip >= 0x4980 && nip < 0x4a00))
++		goto nonrecoverable;
++	if ((nip >= 0xe00 && nip < 0xec0) || (nip >= 0x4e00 && nip < 0x4ec0))
++		goto nonrecoverable;
++	if ((nip >= 0xf80 && nip < 0xfa0) || (nip >= 0x4f80 && nip < 0x4fa0))
++		goto nonrecoverable;
++	/* Trampoline code runs un-relocated so subtract kbase. */
++	if (nip >= real_trampolines_start - kbase &&
++			nip < real_trampolines_end - kbase)
++		goto nonrecoverable;
++	if (nip >= virt_trampolines_start - kbase &&
++			nip < virt_trampolines_end - kbase)
++		goto nonrecoverable;
++	return;
++
++nonrecoverable:
++	regs->msr &= ~MSR_RI;
++#endif
++}
++
+ void system_reset_exception(struct pt_regs *regs)
+ {
+ 	/*
+@@ -363,6 +427,8 @@ void system_reset_exception(struct pt_regs *regs)
+ 	if (!nested)
+ 		nmi_enter();
+ 
++	hv_nmi_check_nonrecoverable(regs);
++
+ 	__this_cpu_inc(irq_stat.sreset_irqs);
+ 
+ 	/* See if any machine dependent calls */
