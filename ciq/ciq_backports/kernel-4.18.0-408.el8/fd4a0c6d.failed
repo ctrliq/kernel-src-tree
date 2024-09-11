@@ -1,0 +1,672 @@
+scsi: lpfc: Expand setting ELS_ID field in ELS_REQUEST64_WQE
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-408.el8
+commit-author James Smart <jsmart2021@gmail.com>
+commit fd4a0c6da5c12aa881b933fb4e426cb706fc2c01
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-408.el8/fd4a0c6d.failed
+
+ELS_ID field for ELS_REQUEST64_WQE is not filled out when FIP is not
+supported by the HBA.
+
+Move setting ELS_ID logic into __lpfc_sli_prep_els_req_rsp_s4(), and remove
+ELS_ID FIP dependency logic from lpfc_sli_prep_wqe().
+
+Introduce PLOGI ELS_ID and as a result update wqe_els_id_MASK because PLOGI
+ELS_ID = 0x4 occupies up to 3 bits.
+
+While in __lpfc_sli_prep_els_req_rsp_s4() routine, remove SLI3-isms.
+
+Link: https://lore.kernel.org/r/20220412222008.126521-25-jsmart2021@gmail.com
+Co-developed-by: Justin Tee <justin.tee@broadcom.com>
+	Signed-off-by: Justin Tee <justin.tee@broadcom.com>
+	Signed-off-by: James Smart <jsmart2021@gmail.com>
+	Signed-off-by: Martin K. Petersen <martin.petersen@oracle.com>
+(cherry picked from commit fd4a0c6da5c12aa881b933fb4e426cb706fc2c01)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/scsi/lpfc/lpfc_sli.c
+diff --cc drivers/scsi/lpfc/lpfc_sli.c
+index 71f9743c49b7,8bf62697317a..000000000000
+--- a/drivers/scsi/lpfc/lpfc_sli.c
++++ b/drivers/scsi/lpfc/lpfc_sli.c
+@@@ -11164,6 -10526,415 +11164,418 @@@ __lpfc_sli_issue_iocb(struct lpfc_hba *
+  	return phba->__lpfc_sli_issue_iocb(phba, ring_number, piocb, flag);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static void
++ __lpfc_sli_prep_els_req_rsp_s3(struct lpfc_iocbq *cmdiocbq,
++ 			       struct lpfc_vport *vport,
++ 			       struct lpfc_dmabuf *bmp, u16 cmd_size, u32 did,
++ 			       u32 elscmd, u8 tmo, u8 expect_rsp)
++ {
++ 	struct lpfc_hba *phba = vport->phba;
++ 	IOCB_t *cmd;
++ 
++ 	cmd = &cmdiocbq->iocb;
++ 	memset(cmd, 0, sizeof(*cmd));
++ 
++ 	cmd->un.elsreq64.bdl.addrHigh = putPaddrHigh(bmp->phys);
++ 	cmd->un.elsreq64.bdl.addrLow = putPaddrLow(bmp->phys);
++ 	cmd->un.elsreq64.bdl.bdeFlags = BUFF_TYPE_BLP_64;
++ 
++ 	if (expect_rsp) {
++ 		cmd->un.elsreq64.bdl.bdeSize = (2 * sizeof(struct ulp_bde64));
++ 		cmd->un.elsreq64.remoteID = did; /* DID */
++ 		cmd->ulpCommand = CMD_ELS_REQUEST64_CR;
++ 		cmd->ulpTimeout = tmo;
++ 	} else {
++ 		cmd->un.elsreq64.bdl.bdeSize = sizeof(struct ulp_bde64);
++ 		cmd->un.genreq64.xmit_els_remoteID = did; /* DID */
++ 		cmd->ulpCommand = CMD_XMIT_ELS_RSP64_CX;
++ 	}
++ 	cmd->ulpBdeCount = 1;
++ 	cmd->ulpLe = 1;
++ 	cmd->ulpClass = CLASS3;
++ 
++ 	/* If we have NPIV enabled, we want to send ELS traffic by VPI. */
++ 	if (phba->sli3_options & LPFC_SLI3_NPIV_ENABLED) {
++ 		if (expect_rsp) {
++ 			cmd->un.elsreq64.myID = vport->fc_myDID;
++ 
++ 			/* For ELS_REQUEST64_CR, use the VPI by default */
++ 			cmd->ulpContext = phba->vpi_ids[vport->vpi];
++ 		}
++ 
++ 		cmd->ulpCt_h = 0;
++ 		/* The CT field must be 0=INVALID_RPI for the ECHO cmd */
++ 		if (elscmd == ELS_CMD_ECHO)
++ 			cmd->ulpCt_l = 0; /* context = invalid RPI */
++ 		else
++ 			cmd->ulpCt_l = 1; /* context = VPI */
++ 	}
++ }
++ 
++ static void
++ __lpfc_sli_prep_els_req_rsp_s4(struct lpfc_iocbq *cmdiocbq,
++ 			       struct lpfc_vport *vport,
++ 			       struct lpfc_dmabuf *bmp, u16 cmd_size, u32 did,
++ 			       u32 elscmd, u8 tmo, u8 expect_rsp)
++ {
++ 	struct lpfc_hba  *phba = vport->phba;
++ 	union lpfc_wqe128 *wqe;
++ 	struct ulp_bde64_le *bde;
++ 	u8 els_id;
++ 
++ 	wqe = &cmdiocbq->wqe;
++ 	memset(wqe, 0, sizeof(*wqe));
++ 
++ 	/* Word 0 - 2 BDE */
++ 	bde = (struct ulp_bde64_le *)&wqe->generic.bde;
++ 	bde->addr_low = cpu_to_le32(putPaddrLow(bmp->phys));
++ 	bde->addr_high = cpu_to_le32(putPaddrHigh(bmp->phys));
++ 	bde->type_size = cpu_to_le32(cmd_size);
++ 	bde->type_size |= cpu_to_le32(ULP_BDE64_TYPE_BDE_64);
++ 
++ 	if (expect_rsp) {
++ 		bf_set(wqe_cmnd, &wqe->els_req.wqe_com, CMD_ELS_REQUEST64_WQE);
++ 
++ 		/* Transfer length */
++ 		wqe->els_req.payload_len = cmd_size;
++ 		wqe->els_req.max_response_payload_len = FCELSSIZE;
++ 
++ 		/* DID */
++ 		bf_set(wqe_els_did, &wqe->els_req.wqe_dest, did);
++ 
++ 		/* Word 11 - ELS_ID */
++ 		switch (elscmd) {
++ 		case ELS_CMD_PLOGI:
++ 			els_id = LPFC_ELS_ID_PLOGI;
++ 			break;
++ 		case ELS_CMD_FLOGI:
++ 			els_id = LPFC_ELS_ID_FLOGI;
++ 			break;
++ 		case ELS_CMD_LOGO:
++ 			els_id = LPFC_ELS_ID_LOGO;
++ 			break;
++ 		case ELS_CMD_FDISC:
++ 			if (!vport->fc_myDID) {
++ 				els_id = LPFC_ELS_ID_FDISC;
++ 				break;
++ 			}
++ 			fallthrough;
++ 		default:
++ 			els_id = LPFC_ELS_ID_DEFAULT;
++ 			break;
++ 		}
++ 
++ 		bf_set(wqe_els_id, &wqe->els_req.wqe_com, els_id);
++ 	} else {
++ 		/* DID */
++ 		bf_set(wqe_els_did, &wqe->xmit_els_rsp.wqe_dest, did);
++ 
++ 		/* Transfer length */
++ 		wqe->xmit_els_rsp.response_payload_len = cmd_size;
++ 
++ 		bf_set(wqe_cmnd, &wqe->xmit_els_rsp.wqe_com,
++ 		       CMD_XMIT_ELS_RSP64_WQE);
++ 	}
++ 
++ 	bf_set(wqe_tmo, &wqe->generic.wqe_com, tmo);
++ 	bf_set(wqe_reqtag, &wqe->generic.wqe_com, cmdiocbq->iotag);
++ 	bf_set(wqe_class, &wqe->generic.wqe_com, CLASS3);
++ 
++ 	/* If we have NPIV enabled, we want to send ELS traffic by VPI.
++ 	 * For SLI4, since the driver controls VPIs we also want to include
++ 	 * all ELS pt2pt protocol traffic as well.
++ 	 */
++ 	if ((phba->sli3_options & LPFC_SLI3_NPIV_ENABLED) ||
++ 	    (vport->fc_flag & FC_PT2PT)) {
++ 		if (expect_rsp) {
++ 			bf_set(els_req64_sid, &wqe->els_req, vport->fc_myDID);
++ 
++ 			/* For ELS_REQUEST64_WQE, use the VPI by default */
++ 			bf_set(wqe_ctxt_tag, &wqe->els_req.wqe_com,
++ 			       phba->vpi_ids[vport->vpi]);
++ 		}
++ 
++ 		/* The CT field must be 0=INVALID_RPI for the ECHO cmd */
++ 		if (elscmd == ELS_CMD_ECHO)
++ 			bf_set(wqe_ct, &wqe->generic.wqe_com, 0);
++ 		else
++ 			bf_set(wqe_ct, &wqe->generic.wqe_com, 1);
++ 	}
++ }
++ 
++ void
++ lpfc_sli_prep_els_req_rsp(struct lpfc_hba *phba, struct lpfc_iocbq *cmdiocbq,
++ 			  struct lpfc_vport *vport, struct lpfc_dmabuf *bmp,
++ 			  u16 cmd_size, u32 did, u32 elscmd, u8 tmo,
++ 			  u8 expect_rsp)
++ {
++ 	phba->__lpfc_sli_prep_els_req_rsp(cmdiocbq, vport, bmp, cmd_size, did,
++ 					  elscmd, tmo, expect_rsp);
++ }
++ 
++ static void
++ __lpfc_sli_prep_gen_req_s3(struct lpfc_iocbq *cmdiocbq, struct lpfc_dmabuf *bmp,
++ 			   u16 rpi, u32 num_entry, u8 tmo)
++ {
++ 	IOCB_t *cmd;
++ 
++ 	cmd = &cmdiocbq->iocb;
++ 	memset(cmd, 0, sizeof(*cmd));
++ 
++ 	cmd->un.genreq64.bdl.addrHigh = putPaddrHigh(bmp->phys);
++ 	cmd->un.genreq64.bdl.addrLow = putPaddrLow(bmp->phys);
++ 	cmd->un.genreq64.bdl.bdeFlags = BUFF_TYPE_BLP_64;
++ 	cmd->un.genreq64.bdl.bdeSize = num_entry * sizeof(struct ulp_bde64);
++ 
++ 	cmd->un.genreq64.w5.hcsw.Rctl = FC_RCTL_DD_UNSOL_CTL;
++ 	cmd->un.genreq64.w5.hcsw.Type = FC_TYPE_CT;
++ 	cmd->un.genreq64.w5.hcsw.Fctl = (SI | LA);
++ 
++ 	cmd->ulpContext = rpi;
++ 	cmd->ulpClass = CLASS3;
++ 	cmd->ulpCommand = CMD_GEN_REQUEST64_CR;
++ 	cmd->ulpBdeCount = 1;
++ 	cmd->ulpLe = 1;
++ 	cmd->ulpOwner = OWN_CHIP;
++ 	cmd->ulpTimeout = tmo;
++ }
++ 
++ static void
++ __lpfc_sli_prep_gen_req_s4(struct lpfc_iocbq *cmdiocbq, struct lpfc_dmabuf *bmp,
++ 			   u16 rpi, u32 num_entry, u8 tmo)
++ {
++ 	union lpfc_wqe128 *cmdwqe;
++ 	struct ulp_bde64_le *bde, *bpl;
++ 	u32 xmit_len = 0, total_len = 0, size, type, i;
++ 
++ 	cmdwqe = &cmdiocbq->wqe;
++ 	memset(cmdwqe, 0, sizeof(*cmdwqe));
++ 
++ 	/* Calculate total_len and xmit_len */
++ 	bpl = (struct ulp_bde64_le *)bmp->virt;
++ 	for (i = 0; i < num_entry; i++) {
++ 		size = le32_to_cpu(bpl[i].type_size) & ULP_BDE64_SIZE_MASK;
++ 		total_len += size;
++ 	}
++ 	for (i = 0; i < num_entry; i++) {
++ 		size = le32_to_cpu(bpl[i].type_size) & ULP_BDE64_SIZE_MASK;
++ 		type = le32_to_cpu(bpl[i].type_size) & ULP_BDE64_TYPE_MASK;
++ 		if (type != ULP_BDE64_TYPE_BDE_64)
++ 			break;
++ 		xmit_len += size;
++ 	}
++ 
++ 	/* Words 0 - 2 */
++ 	bde = (struct ulp_bde64_le *)&cmdwqe->generic.bde;
++ 	bde->addr_low = cpu_to_le32(putPaddrLow(bmp->phys));
++ 	bde->addr_high = cpu_to_le32(putPaddrHigh(bmp->phys));
++ 	bde->type_size = cpu_to_le32(xmit_len);
++ 	bde->type_size |= cpu_to_le32(ULP_BDE64_TYPE_BLP_64);
++ 
++ 	/* Word 3 */
++ 	cmdwqe->gen_req.request_payload_len = xmit_len;
++ 
++ 	/* Word 5 */
++ 	bf_set(wqe_type, &cmdwqe->gen_req.wge_ctl, FC_TYPE_CT);
++ 	bf_set(wqe_rctl, &cmdwqe->gen_req.wge_ctl, FC_RCTL_DD_UNSOL_CTL);
++ 	bf_set(wqe_si, &cmdwqe->gen_req.wge_ctl, 1);
++ 	bf_set(wqe_la, &cmdwqe->gen_req.wge_ctl, 1);
++ 
++ 	/* Word 6 */
++ 	bf_set(wqe_ctxt_tag, &cmdwqe->gen_req.wqe_com, rpi);
++ 
++ 	/* Word 7 */
++ 	bf_set(wqe_tmo, &cmdwqe->gen_req.wqe_com, tmo);
++ 	bf_set(wqe_class, &cmdwqe->gen_req.wqe_com, CLASS3);
++ 	bf_set(wqe_cmnd, &cmdwqe->gen_req.wqe_com, CMD_GEN_REQUEST64_CR);
++ 	bf_set(wqe_ct, &cmdwqe->gen_req.wqe_com, SLI4_CT_RPI);
++ 
++ 	/* Word 12 */
++ 	cmdwqe->gen_req.max_response_payload_len = total_len - xmit_len;
++ }
++ 
++ void
++ lpfc_sli_prep_gen_req(struct lpfc_hba *phba, struct lpfc_iocbq *cmdiocbq,
++ 		      struct lpfc_dmabuf *bmp, u16 rpi, u32 num_entry, u8 tmo)
++ {
++ 	phba->__lpfc_sli_prep_gen_req(cmdiocbq, bmp, rpi, num_entry, tmo);
++ }
++ 
++ static void
++ __lpfc_sli_prep_xmit_seq64_s3(struct lpfc_iocbq *cmdiocbq,
++ 			      struct lpfc_dmabuf *bmp, u16 rpi, u16 ox_id,
++ 			      u32 num_entry, u8 rctl, u8 last_seq, u8 cr_cx_cmd)
++ {
++ 	IOCB_t *icmd;
++ 
++ 	icmd = &cmdiocbq->iocb;
++ 	memset(icmd, 0, sizeof(*icmd));
++ 
++ 	icmd->un.xseq64.bdl.addrHigh = putPaddrHigh(bmp->phys);
++ 	icmd->un.xseq64.bdl.addrLow = putPaddrLow(bmp->phys);
++ 	icmd->un.xseq64.bdl.bdeFlags = BUFF_TYPE_BLP_64;
++ 	icmd->un.xseq64.bdl.bdeSize = (num_entry * sizeof(struct ulp_bde64));
++ 	icmd->un.xseq64.w5.hcsw.Fctl = LA;
++ 	if (last_seq)
++ 		icmd->un.xseq64.w5.hcsw.Fctl |= LS;
++ 	icmd->un.xseq64.w5.hcsw.Dfctl = 0;
++ 	icmd->un.xseq64.w5.hcsw.Rctl = rctl;
++ 	icmd->un.xseq64.w5.hcsw.Type = FC_TYPE_CT;
++ 
++ 	icmd->ulpBdeCount = 1;
++ 	icmd->ulpLe = 1;
++ 	icmd->ulpClass = CLASS3;
++ 
++ 	switch (cr_cx_cmd) {
++ 	case CMD_XMIT_SEQUENCE64_CR:
++ 		icmd->ulpContext = rpi;
++ 		icmd->ulpCommand = CMD_XMIT_SEQUENCE64_CR;
++ 		break;
++ 	case CMD_XMIT_SEQUENCE64_CX:
++ 		icmd->ulpContext = ox_id;
++ 		icmd->ulpCommand = CMD_XMIT_SEQUENCE64_CX;
++ 		break;
++ 	default:
++ 		break;
++ 	}
++ }
++ 
++ static void
++ __lpfc_sli_prep_xmit_seq64_s4(struct lpfc_iocbq *cmdiocbq,
++ 			      struct lpfc_dmabuf *bmp, u16 rpi, u16 ox_id,
++ 			      u32 full_size, u8 rctl, u8 last_seq, u8 cr_cx_cmd)
++ {
++ 	union lpfc_wqe128 *wqe;
++ 	struct ulp_bde64 *bpl;
++ 	struct ulp_bde64_le *bde;
++ 
++ 	wqe = &cmdiocbq->wqe;
++ 	memset(wqe, 0, sizeof(*wqe));
++ 
++ 	/* Words 0 - 2 */
++ 	bpl = (struct ulp_bde64 *)bmp->virt;
++ 	if (cmdiocbq->cmd_flag & (LPFC_IO_LIBDFC | LPFC_IO_LOOPBACK)) {
++ 		wqe->xmit_sequence.bde.addrHigh = bpl->addrHigh;
++ 		wqe->xmit_sequence.bde.addrLow = bpl->addrLow;
++ 		wqe->xmit_sequence.bde.tus.w = bpl->tus.w;
++ 	} else {
++ 		bde = (struct ulp_bde64_le *)&wqe->xmit_sequence.bde;
++ 		bde->addr_low = cpu_to_le32(putPaddrLow(bmp->phys));
++ 		bde->addr_high = cpu_to_le32(putPaddrHigh(bmp->phys));
++ 		bde->type_size = cpu_to_le32(bpl->tus.f.bdeSize);
++ 		bde->type_size |= cpu_to_le32(ULP_BDE64_TYPE_BDE_64);
++ 	}
++ 
++ 	/* Word 5 */
++ 	bf_set(wqe_ls, &wqe->xmit_sequence.wge_ctl, last_seq);
++ 	bf_set(wqe_la, &wqe->xmit_sequence.wge_ctl, 1);
++ 	bf_set(wqe_dfctl, &wqe->xmit_sequence.wge_ctl, 0);
++ 	bf_set(wqe_rctl, &wqe->xmit_sequence.wge_ctl, rctl);
++ 	bf_set(wqe_type, &wqe->xmit_sequence.wge_ctl, FC_TYPE_CT);
++ 
++ 	/* Word 6 */
++ 	bf_set(wqe_ctxt_tag, &wqe->xmit_sequence.wqe_com, rpi);
++ 
++ 	bf_set(wqe_cmnd, &wqe->xmit_sequence.wqe_com,
++ 	       CMD_XMIT_SEQUENCE64_WQE);
++ 
++ 	/* Word 7 */
++ 	bf_set(wqe_class, &wqe->xmit_sequence.wqe_com, CLASS3);
++ 
++ 	/* Word 9 */
++ 	bf_set(wqe_rcvoxid, &wqe->xmit_sequence.wqe_com, ox_id);
++ 
++ 	/* Word 12 */
++ 	if (cmdiocbq->cmd_flag & (LPFC_IO_LIBDFC | LPFC_IO_LOOPBACK))
++ 		wqe->xmit_sequence.xmit_len = full_size;
++ 	else
++ 		wqe->xmit_sequence.xmit_len =
++ 			wqe->xmit_sequence.bde.tus.f.bdeSize;
++ }
++ 
++ void
++ lpfc_sli_prep_xmit_seq64(struct lpfc_hba *phba, struct lpfc_iocbq *cmdiocbq,
++ 			 struct lpfc_dmabuf *bmp, u16 rpi, u16 ox_id,
++ 			 u32 num_entry, u8 rctl, u8 last_seq, u8 cr_cx_cmd)
++ {
++ 	phba->__lpfc_sli_prep_xmit_seq64(cmdiocbq, bmp, rpi, ox_id, num_entry,
++ 					 rctl, last_seq, cr_cx_cmd);
++ }
++ 
++ static void
++ __lpfc_sli_prep_abort_xri_s3(struct lpfc_iocbq *cmdiocbq, u16 ulp_context,
++ 			     u16 iotag, u8 ulp_class, u16 cqid, bool ia)
++ {
++ 	IOCB_t *icmd = NULL;
++ 
++ 	icmd = &cmdiocbq->iocb;
++ 	memset(icmd, 0, sizeof(*icmd));
++ 
++ 	/* Word 5 */
++ 	icmd->un.acxri.abortContextTag = ulp_context;
++ 	icmd->un.acxri.abortIoTag = iotag;
++ 
++ 	if (ia) {
++ 		/* Word 7 */
++ 		icmd->ulpCommand = CMD_CLOSE_XRI_CN;
++ 	} else {
++ 		/* Word 3 */
++ 		icmd->un.acxri.abortType = ABORT_TYPE_ABTS;
++ 
++ 		/* Word 7 */
++ 		icmd->ulpClass = ulp_class;
++ 		icmd->ulpCommand = CMD_ABORT_XRI_CN;
++ 	}
++ 
++ 	/* Word 7 */
++ 	icmd->ulpLe = 1;
++ }
++ 
++ static void
++ __lpfc_sli_prep_abort_xri_s4(struct lpfc_iocbq *cmdiocbq, u16 ulp_context,
++ 			     u16 iotag, u8 ulp_class, u16 cqid, bool ia)
++ {
++ 	union lpfc_wqe128 *wqe;
++ 
++ 	wqe = &cmdiocbq->wqe;
++ 	memset(wqe, 0, sizeof(*wqe));
++ 
++ 	/* Word 3 */
++ 	bf_set(abort_cmd_criteria, &wqe->abort_cmd, T_XRI_TAG);
++ 	if (ia)
++ 		bf_set(abort_cmd_ia, &wqe->abort_cmd, 1);
++ 	else
++ 		bf_set(abort_cmd_ia, &wqe->abort_cmd, 0);
++ 
++ 	/* Word 7 */
++ 	bf_set(wqe_cmnd, &wqe->abort_cmd.wqe_com, CMD_ABORT_XRI_WQE);
++ 
++ 	/* Word 8 */
++ 	wqe->abort_cmd.wqe_com.abort_tag = ulp_context;
++ 
++ 	/* Word 9 */
++ 	bf_set(wqe_reqtag, &wqe->abort_cmd.wqe_com, iotag);
++ 
++ 	/* Word 10 */
++ 	bf_set(wqe_qosd, &wqe->abort_cmd.wqe_com, 1);
++ 
++ 	/* Word 11 */
++ 	bf_set(wqe_cqid, &wqe->abort_cmd.wqe_com, cqid);
++ 	bf_set(wqe_cmd_type, &wqe->abort_cmd.wqe_com, OTHER_COMMAND);
++ }
++ 
++ void
++ lpfc_sli_prep_abort_xri(struct lpfc_hba *phba, struct lpfc_iocbq *cmdiocbq,
++ 			u16 ulp_context, u16 iotag, u8 ulp_class, u16 cqid,
++ 			bool ia)
++ {
++ 	phba->__lpfc_sli_prep_abort_xri(cmdiocbq, ulp_context, iotag, ulp_class,
++ 					cqid, ia);
++ }
++ 
+++>>>>>>> fd4a0c6da5c1 (scsi: lpfc: Expand setting ELS_ID field in ELS_REQUEST64_WQE)
+  /**
+   * lpfc_sli_api_table_setup - Set up sli api function jump table
+   * @phba: The hba struct for which this call is being executed.
+@@@ -22572,3 -22220,180 +22984,183 @@@ lpfc_free_cmd_rsp_buf_per_hdwq(struct l
+  
+  	spin_unlock_irqrestore(&hdwq->hdwq_lock, iflags);
+  }
+++<<<<<<< HEAD
+++=======
++ 
++ /**
++  * lpfc_sli_prep_wqe - Prepare WQE for the command to be posted
++  * @phba: phba object
++  * @job: job entry of the command to be posted.
++  *
++  * Fill the common fields of the wqe for each of the command.
++  *
++  * Return codes:
++  *	None
++  **/
++ void
++ lpfc_sli_prep_wqe(struct lpfc_hba *phba, struct lpfc_iocbq *job)
++ {
++ 	u8 cmnd;
++ 	u32 *pcmd;
++ 	u32 if_type = 0;
++ 	u32 fip, abort_tag;
++ 	struct lpfc_nodelist *ndlp = NULL;
++ 	union lpfc_wqe128 *wqe = &job->wqe;
++ 	u8 command_type = ELS_COMMAND_NON_FIP;
++ 
++ 	fip = phba->hba_flag & HBA_FIP_SUPPORT;
++ 	/* The fcp commands will set command type */
++ 	if (job->cmd_flag &  LPFC_IO_FCP)
++ 		command_type = FCP_COMMAND;
++ 	else if (fip && (job->cmd_flag & LPFC_FIP_ELS_ID_MASK))
++ 		command_type = ELS_COMMAND_FIP;
++ 	else
++ 		command_type = ELS_COMMAND_NON_FIP;
++ 
++ 	abort_tag = job->iotag;
++ 	cmnd = bf_get(wqe_cmnd, &wqe->els_req.wqe_com);
++ 
++ 	switch (cmnd) {
++ 	case CMD_ELS_REQUEST64_WQE:
++ 		ndlp = job->ndlp;
++ 
++ 		if_type = bf_get(lpfc_sli_intf_if_type,
++ 				 &phba->sli4_hba.sli_intf);
++ 		if (if_type >= LPFC_SLI_INTF_IF_TYPE_2) {
++ 			pcmd = (u32 *)job->cmd_dmabuf->virt;
++ 			if (pcmd && (*pcmd == ELS_CMD_FLOGI ||
++ 				     *pcmd == ELS_CMD_SCR ||
++ 				     *pcmd == ELS_CMD_RDF ||
++ 				     *pcmd == ELS_CMD_EDC ||
++ 				     *pcmd == ELS_CMD_RSCN_XMT ||
++ 				     *pcmd == ELS_CMD_FDISC ||
++ 				     *pcmd == ELS_CMD_LOGO ||
++ 				     *pcmd == ELS_CMD_QFPA ||
++ 				     *pcmd == ELS_CMD_UVEM ||
++ 				     *pcmd == ELS_CMD_PLOGI)) {
++ 				bf_set(els_req64_sp, &wqe->els_req, 1);
++ 				bf_set(els_req64_sid, &wqe->els_req,
++ 				       job->vport->fc_myDID);
++ 
++ 				if ((*pcmd == ELS_CMD_FLOGI) &&
++ 				    !(phba->fc_topology ==
++ 				      LPFC_TOPOLOGY_LOOP))
++ 					bf_set(els_req64_sid, &wqe->els_req, 0);
++ 
++ 				bf_set(wqe_ct, &wqe->els_req.wqe_com, 1);
++ 				bf_set(wqe_ctxt_tag, &wqe->els_req.wqe_com,
++ 				       phba->vpi_ids[job->vport->vpi]);
++ 			} else if (pcmd && ndlp) {
++ 				bf_set(wqe_ct, &wqe->els_req.wqe_com, 0);
++ 				bf_set(wqe_ctxt_tag, &wqe->els_req.wqe_com,
++ 				       phba->sli4_hba.rpi_ids[ndlp->nlp_rpi]);
++ 			}
++ 		}
++ 
++ 		bf_set(wqe_temp_rpi, &wqe->els_req.wqe_com,
++ 		       phba->sli4_hba.rpi_ids[ndlp->nlp_rpi]);
++ 
++ 		bf_set(wqe_dbde, &wqe->els_req.wqe_com, 1);
++ 		bf_set(wqe_iod, &wqe->els_req.wqe_com, LPFC_WQE_IOD_READ);
++ 		bf_set(wqe_qosd, &wqe->els_req.wqe_com, 1);
++ 		bf_set(wqe_lenloc, &wqe->els_req.wqe_com, LPFC_WQE_LENLOC_NONE);
++ 		bf_set(wqe_ebde_cnt, &wqe->els_req.wqe_com, 0);
++ 		break;
++ 	case CMD_XMIT_ELS_RSP64_WQE:
++ 		ndlp = job->ndlp;
++ 
++ 		/* word4 */
++ 		wqe->xmit_els_rsp.word4 = 0;
++ 
++ 		if_type = bf_get(lpfc_sli_intf_if_type,
++ 				 &phba->sli4_hba.sli_intf);
++ 		if (if_type >= LPFC_SLI_INTF_IF_TYPE_2) {
++ 			if (job->vport->fc_flag & FC_PT2PT) {
++ 				bf_set(els_rsp64_sp, &wqe->xmit_els_rsp, 1);
++ 				bf_set(els_rsp64_sid, &wqe->xmit_els_rsp,
++ 				       job->vport->fc_myDID);
++ 				if (job->vport->fc_myDID == Fabric_DID) {
++ 					bf_set(wqe_els_did,
++ 					       &wqe->xmit_els_rsp.wqe_dest, 0);
++ 				}
++ 			}
++ 		}
++ 
++ 		bf_set(wqe_dbde, &wqe->xmit_els_rsp.wqe_com, 1);
++ 		bf_set(wqe_iod, &wqe->xmit_els_rsp.wqe_com, LPFC_WQE_IOD_WRITE);
++ 		bf_set(wqe_qosd, &wqe->xmit_els_rsp.wqe_com, 1);
++ 		bf_set(wqe_lenloc, &wqe->xmit_els_rsp.wqe_com,
++ 		       LPFC_WQE_LENLOC_WORD3);
++ 		bf_set(wqe_ebde_cnt, &wqe->xmit_els_rsp.wqe_com, 0);
++ 
++ 		if (phba->fc_topology == LPFC_TOPOLOGY_LOOP) {
++ 			bf_set(els_rsp64_sp, &wqe->xmit_els_rsp, 1);
++ 			bf_set(els_rsp64_sid, &wqe->xmit_els_rsp,
++ 			       job->vport->fc_myDID);
++ 			bf_set(wqe_ct, &wqe->xmit_els_rsp.wqe_com, 1);
++ 		}
++ 
++ 		if (phba->sli_rev == LPFC_SLI_REV4) {
++ 			bf_set(wqe_rsp_temp_rpi, &wqe->xmit_els_rsp,
++ 			       phba->sli4_hba.rpi_ids[ndlp->nlp_rpi]);
++ 
++ 			if (bf_get(wqe_ct, &wqe->xmit_els_rsp.wqe_com))
++ 				bf_set(wqe_ctxt_tag, &wqe->xmit_els_rsp.wqe_com,
++ 				       phba->vpi_ids[job->vport->vpi]);
++ 		}
++ 		command_type = OTHER_COMMAND;
++ 		break;
++ 	case CMD_GEN_REQUEST64_WQE:
++ 		/* Word 10 */
++ 		bf_set(wqe_dbde, &wqe->gen_req.wqe_com, 1);
++ 		bf_set(wqe_iod, &wqe->gen_req.wqe_com, LPFC_WQE_IOD_READ);
++ 		bf_set(wqe_qosd, &wqe->gen_req.wqe_com, 1);
++ 		bf_set(wqe_lenloc, &wqe->gen_req.wqe_com, LPFC_WQE_LENLOC_NONE);
++ 		bf_set(wqe_ebde_cnt, &wqe->gen_req.wqe_com, 0);
++ 		command_type = OTHER_COMMAND;
++ 		break;
++ 	case CMD_XMIT_SEQUENCE64_WQE:
++ 		if (phba->link_flag & LS_LOOPBACK_MODE)
++ 			bf_set(wqe_xo, &wqe->xmit_sequence.wge_ctl, 1);
++ 
++ 		wqe->xmit_sequence.rsvd3 = 0;
++ 		bf_set(wqe_pu, &wqe->xmit_sequence.wqe_com, 0);
++ 		bf_set(wqe_dbde, &wqe->xmit_sequence.wqe_com, 1);
++ 		bf_set(wqe_iod, &wqe->xmit_sequence.wqe_com,
++ 		       LPFC_WQE_IOD_WRITE);
++ 		bf_set(wqe_lenloc, &wqe->xmit_sequence.wqe_com,
++ 		       LPFC_WQE_LENLOC_WORD12);
++ 		bf_set(wqe_ebde_cnt, &wqe->xmit_sequence.wqe_com, 0);
++ 		command_type = OTHER_COMMAND;
++ 		break;
++ 	case CMD_XMIT_BLS_RSP64_WQE:
++ 		bf_set(xmit_bls_rsp64_seqcnthi, &wqe->xmit_bls_rsp, 0xffff);
++ 		bf_set(wqe_xmit_bls_pt, &wqe->xmit_bls_rsp.wqe_dest, 0x1);
++ 		bf_set(wqe_ct, &wqe->xmit_bls_rsp.wqe_com, 1);
++ 		bf_set(wqe_ctxt_tag, &wqe->xmit_bls_rsp.wqe_com,
++ 		       phba->vpi_ids[phba->pport->vpi]);
++ 		bf_set(wqe_qosd, &wqe->xmit_bls_rsp.wqe_com, 1);
++ 		bf_set(wqe_lenloc, &wqe->xmit_bls_rsp.wqe_com,
++ 		       LPFC_WQE_LENLOC_NONE);
++ 		/* Overwrite the pre-set comnd type with OTHER_COMMAND */
++ 		command_type = OTHER_COMMAND;
++ 		break;
++ 	case CMD_FCP_ICMND64_WQE:	/* task mgmt commands */
++ 	case CMD_ABORT_XRI_WQE:		/* abort iotag */
++ 	case CMD_SEND_FRAME:		/* mds loopback */
++ 		/* cases already formatted for sli4 wqe - no chgs necessary */
++ 		return;
++ 	default:
++ 		dump_stack();
++ 		lpfc_printf_log(phba, KERN_ERR, LOG_TRACE_EVENT,
++ 				"6207 Invalid command 0x%x\n",
++ 				cmnd);
++ 		break;
++ 	}
++ 
++ 	wqe->generic.wqe_com.abort_tag = abort_tag;
++ 	bf_set(wqe_reqtag, &wqe->generic.wqe_com, job->iotag);
++ 	bf_set(wqe_cmd_type, &wqe->generic.wqe_com, command_type);
++ 	bf_set(wqe_cqid, &wqe->generic.wqe_com, LPFC_WQE_CQ_ID_DEFAULT);
++ }
+++>>>>>>> fd4a0c6da5c1 (scsi: lpfc: Expand setting ELS_ID field in ELS_REQUEST64_WQE)
+diff --git a/drivers/scsi/lpfc/lpfc_hw4.h b/drivers/scsi/lpfc/lpfc_hw4.h
+index 6ec42991d2ab..9d029f1a406e 100644
+--- a/drivers/scsi/lpfc/lpfc_hw4.h
++++ b/drivers/scsi/lpfc/lpfc_hw4.h
+@@ -4437,12 +4437,8 @@ struct wqe_common {
+ #define wqe_cmd_type_MASK     0x0000000f
+ #define wqe_cmd_type_WORD     word11
+ #define wqe_els_id_SHIFT      4
+-#define wqe_els_id_MASK       0x00000003
++#define wqe_els_id_MASK       0x00000007
+ #define wqe_els_id_WORD       word11
+-#define LPFC_ELS_ID_FLOGI	3
+-#define LPFC_ELS_ID_FDISC	2
+-#define LPFC_ELS_ID_LOGO	1
+-#define LPFC_ELS_ID_DEFAULT	0
+ #define wqe_irsp_SHIFT        4
+ #define wqe_irsp_MASK         0x00000001
+ #define wqe_irsp_WORD         word11
+@@ -4489,6 +4485,14 @@ struct lpfc_wqe_generic{
+ 	uint32_t payload[4];
+ };
+ 
++enum els_request64_wqe_word11 {
++	LPFC_ELS_ID_DEFAULT,
++	LPFC_ELS_ID_LOGO,
++	LPFC_ELS_ID_FDISC,
++	LPFC_ELS_ID_FLOGI,
++	LPFC_ELS_ID_PLOGI,
++};
++
+ struct els_request64_wqe {
+ 	struct ulp_bde64 bde;
+ 	uint32_t payload_len;
+* Unmerged path drivers/scsi/lpfc/lpfc_sli.c
