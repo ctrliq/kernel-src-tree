@@ -1,0 +1,265 @@
+arm64: mm: extend linear region for 52-bit VA configurations
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-365.el8
+commit-author Ard Biesheuvel <ardb@kernel.org>
+commit f4693c2716b35d0846fd45a4ad7db78bfb25efc8
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-365.el8/f4693c27.failed
+
+For historical reasons, the arm64 kernel VA space is configured as two
+equally sized halves, i.e., on a 48-bit VA build, the VA space is split
+into a 47-bit vmalloc region and a 47-bit linear region.
+
+When support for 52-bit virtual addressing was added, this equal split
+was kept, resulting in a substantial waste of virtual address space in
+the linear region:
+
+                           48-bit VA                     52-bit VA
+  0xffff_ffff_ffff_ffff +-------------+               +-------------+
+                        |   vmalloc   |               |   vmalloc   |
+  0xffff_8000_0000_0000 +-------------+ _PAGE_END(48) +-------------+
+                        |   linear    |               :             :
+  0xffff_0000_0000_0000 +-------------+               :             :
+                        :             :               :             :
+                        :             :               :             :
+                        :             :               :             :
+                        :             :               :  currently  :
+                        :  unusable   :               :             :
+                        :             :               :   unused    :
+                        :     by      :               :             :
+                        :             :               :             :
+                        :  hardware   :               :             :
+                        :             :               :             :
+  0xfff8_0000_0000_0000 :             : _PAGE_END(52) +-------------+
+                        :             :               |             |
+                        :             :               |             |
+                        :             :               |             |
+                        :             :               |             |
+                        :             :               |             |
+                        :  unusable   :               |             |
+                        :             :               |   linear    |
+                        :     by      :               |             |
+                        :             :               |   region    |
+                        :  hardware   :               |             |
+                        :             :               |             |
+                        :             :               |             |
+                        :             :               |             |
+                        :             :               |             |
+                        :             :               |             |
+                        :             :               |             |
+  0xfff0_0000_0000_0000 +-------------+  PAGE_OFFSET  +-------------+
+
+As illustrated above, the 52-bit VA kernel uses 47 bits for the vmalloc
+space (as before), to ensure that a single 64k granule kernel image can
+support any 64k granule capable system, regardless of whether it supports
+the 52-bit virtual addressing extension. However, due to the fact that
+the VA space is still split in equal halves, the linear region is only
+2^51 bytes in size, wasting almost half of the 52-bit VA space.
+
+Let's fix this, by abandoning the equal split, and simply assigning all
+VA space outside of the vmalloc region to the linear region.
+
+The KASAN shadow region is reconfigured so that it ends at the start of
+the vmalloc region, and grows downwards. That way, the arrangement of
+the vmalloc space (which contains kernel mappings, modules, BPF region,
+the vmemmap array etc) is identical between non-KASAN and KASAN builds,
+which aids debugging.
+
+	Signed-off-by: Ard Biesheuvel <ardb@kernel.org>
+	Reviewed-by: Steve Capper <steve.capper@arm.com>
+Link: https://lore.kernel.org/r/20201008153602.9467-3-ardb@kernel.org
+	Signed-off-by: Catalin Marinas <catalin.marinas@arm.com>
+(cherry picked from commit f4693c2716b35d0846fd45a4ad7db78bfb25efc8)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	Documentation/arm64/kasan-offsets.sh
+#	arch/arm64/Kconfig
+#	arch/arm64/include/asm/memory.h
+#	arch/arm64/mm/init.c
+diff --cc arch/arm64/Kconfig
+index 35a553b6fc18,c6092cbb39af..000000000000
+--- a/arch/arm64/Kconfig
++++ b/arch/arm64/Kconfig
+@@@ -291,9 -325,23 +291,26 @@@ config ARCH_SUPPORTS_UPROBE
+  config ARCH_PROC_KCORE_TEXT
+  	def_bool y
+  
+ -config BROKEN_GAS_INST
+ -	def_bool !$(as-instr,1:\n.inst 0\n.rept . - 1b\n\nnop\n.endr\n)
+ +source "init/Kconfig"
+  
+++<<<<<<< HEAD
+ +source "kernel/Kconfig.freezer"
+++=======
++ config KASAN_SHADOW_OFFSET
++ 	hex
++ 	depends on KASAN
++ 	default 0xdfff800000000000 if (ARM64_VA_BITS_48 || ARM64_VA_BITS_52) && !KASAN_SW_TAGS
++ 	default 0xdfffc00000000000 if ARM64_VA_BITS_47 && !KASAN_SW_TAGS
++ 	default 0xdffffe0000000000 if ARM64_VA_BITS_42 && !KASAN_SW_TAGS
++ 	default 0xdfffffc000000000 if ARM64_VA_BITS_39 && !KASAN_SW_TAGS
++ 	default 0xdffffff800000000 if ARM64_VA_BITS_36 && !KASAN_SW_TAGS
++ 	default 0xefff800000000000 if (ARM64_VA_BITS_48 || ARM64_VA_BITS_52) && KASAN_SW_TAGS
++ 	default 0xefffc00000000000 if ARM64_VA_BITS_47 && KASAN_SW_TAGS
++ 	default 0xeffffe0000000000 if ARM64_VA_BITS_42 && KASAN_SW_TAGS
++ 	default 0xefffffc000000000 if ARM64_VA_BITS_39 && KASAN_SW_TAGS
++ 	default 0xeffffff800000000 if ARM64_VA_BITS_36 && KASAN_SW_TAGS
++ 	default 0xffffffffffffffff
+++>>>>>>> f4693c2716b3 (arm64: mm: extend linear region for 52-bit VA configurations)
+  
+  source "arch/arm64/Kconfig.platforms"
+  
+diff --cc arch/arm64/include/asm/memory.h
+index 630eaf618e50,8e89f9b9091e..000000000000
+--- a/arch/arm64/include/asm/memory.h
++++ b/arch/arm64/include/asm/memory.h
+@@@ -57,19 -34,17 +57,23 @@@
+  			>> (PAGE_SHIFT - STRUCT_PAGE_MAX_SHIFT))
+  
+  /*
+ - * PAGE_OFFSET - the virtual address of the start of the linear map, at the
+ - *               start of the TTBR1 address space.
+ - * PAGE_END - the end of the linear map, where all other kernel mappings begin.
+ - * KIMAGE_VADDR - the virtual address of the start of the kernel image.
+ + * PAGE_OFFSET - the virtual address of the start of the linear map (top
+ + *		 (VA_BITS - 1))
+ + * KIMAGE_VADDR - the virtual address of the start of the kernel image
+   * VA_BITS - the maximum number of bits for virtual addresses.
+ + * VA_START - the first kernel virtual address.
+   */
+  #define VA_BITS			(CONFIG_ARM64_VA_BITS)
+ -#define _PAGE_OFFSET(va)	(-(UL(1) << (va)))
+ -#define PAGE_OFFSET		(_PAGE_OFFSET(VA_BITS))
+ +#define VA_START		(UL(0xffffffffffffffff) - \
+ +	(UL(1) << (VA_BITS - 1)) + 1)
+ +#define PAGE_OFFSET		(UL(0xffffffffffffffff) - \
+ +	(UL(1) << VA_BITS) + 1)
+  #define KIMAGE_VADDR		(MODULES_END)
+++<<<<<<< HEAD
+ +#define BPF_JIT_REGION_START	(VA_START + KASAN_SHADOW_SIZE)
+++=======
++ #define BPF_JIT_REGION_START	(_PAGE_END(VA_BITS_MIN))
+++>>>>>>> f4693c2716b3 (arm64: mm: extend linear region for 52-bit VA configurations)
+  #define BPF_JIT_REGION_SIZE	(SZ_128M)
+  #define BPF_JIT_REGION_END	(BPF_JIT_REGION_START + BPF_JIT_REGION_SIZE)
+  #define MODULES_END		(MODULES_VADDR + MODULES_VSIZE)
+@@@ -95,12 -73,15 +99,24 @@@
+   * significantly, so double the (minimum) stack size when they are in use.
+   */
+  #ifdef CONFIG_KASAN
+++<<<<<<< HEAD
+ +#define KASAN_SHADOW_SIZE	(UL(1) << (VA_BITS - KASAN_SHADOW_SCALE_SHIFT))
+++=======
++ #define KASAN_SHADOW_OFFSET	_AC(CONFIG_KASAN_SHADOW_OFFSET, UL)
++ #define KASAN_SHADOW_END	((UL(1) << (64 - KASAN_SHADOW_SCALE_SHIFT)) \
++ 					+ KASAN_SHADOW_OFFSET)
++ #define PAGE_END		(KASAN_SHADOW_END - (1UL << (vabits_actual - KASAN_SHADOW_SCALE_SHIFT)))
+++>>>>>>> f4693c2716b3 (arm64: mm: extend linear region for 52-bit VA configurations)
+  #define KASAN_THREAD_SHIFT	1
+  #else
+ +#define KASAN_SHADOW_SIZE	(0)
+  #define KASAN_THREAD_SHIFT	0
+++<<<<<<< HEAD
+ +#endif
+++=======
++ #define PAGE_END		(_PAGE_END(VA_BITS_MIN))
++ #endif /* CONFIG_KASAN */
+++>>>>>>> f4693c2716b3 (arm64: mm: extend linear region for 52-bit VA configurations)
+  
+  #define MIN_THREAD_SHIFT	(14 + KASAN_THREAD_SHIFT)
+  
+@@@ -194,7 -162,12 +210,14 @@@
+  #ifndef __ASSEMBLY__
+  
+  #include <linux/bitops.h>
+ -#include <linux/compiler.h>
+  #include <linux/mmdebug.h>
+++<<<<<<< HEAD
+++=======
++ #include <linux/types.h>
++ #include <asm/bug.h>
++ 
++ extern u64			vabits_actual;
+++>>>>>>> f4693c2716b3 (arm64: mm: extend linear region for 52-bit VA configurations)
+  
+  extern s64			memstart_addr;
+  /* PHYS_OFFSET - the physical address of the start of memory. */
+@@@ -268,11 -238,9 +291,17 @@@ static inline const void *__tag_set(con
+  
+  
+  /*
+++<<<<<<< HEAD
+ + * The linear kernel range starts in the middle of the virtual adddress
+ + * space. Testing the top bit for the start of the region is a
+ + * sufficient check.
+ + */
+ +#define __is_lm_address(addr)	(!((addr) & BIT(VA_BITS - 1)))
+++=======
++  * The linear kernel range starts at the bottom of the virtual address space.
++  */
++ #define __is_lm_address(addr)	(((u64)(addr) & ~PAGE_OFFSET) < (PAGE_END - PAGE_OFFSET))
+++>>>>>>> f4693c2716b3 (arm64: mm: extend linear region for 52-bit VA configurations)
+  
+  #define __lm_to_phys(addr)	(((addr) & ~PAGE_OFFSET) + PHYS_OFFSET)
+  #define __kimg_to_phys(addr)	((addr) - kimage_voffset)
+diff --cc arch/arm64/mm/init.c
+index 49bc8730c5b8,7e15d92836d8..000000000000
+--- a/arch/arm64/mm/init.c
++++ b/arch/arm64/mm/init.c
+@@@ -329,7 -269,7 +329,11 @@@ static void __init fdt_enforce_memory_r
+  
+  void __init arm64_memblock_init(void)
+  {
+++<<<<<<< HEAD
+ +	const s64 linear_region_size = BIT(VA_BITS - 1);
+++=======
++ 	const s64 linear_region_size = PAGE_END - _PAGE_OFFSET(vabits_actual);
+++>>>>>>> f4693c2716b3 (arm64: mm: extend linear region for 52-bit VA configurations)
+  
+  	/* Handle linux,usable-memory-range property */
+  	fdt_enforce_memory_region();
+* Unmerged path Documentation/arm64/kasan-offsets.sh
+* Unmerged path Documentation/arm64/kasan-offsets.sh
+diff --git a/Documentation/arm64/memory.rst b/Documentation/arm64/memory.rst
+index b040909e45f8..67a6179e89fd 100644
+--- a/Documentation/arm64/memory.rst
++++ b/Documentation/arm64/memory.rst
+@@ -32,10 +32,10 @@ AArch64 Linux memory layout with 4KB pages + 4 levels (48-bit)::
+   -----------------------------------------------------------------------
+   0000000000000000	0000ffffffffffff	 256TB		user
+   ffff000000000000	ffff7fffffffffff	 128TB		kernel logical memory map
+-  ffff800000000000	ffff9fffffffffff	  32TB		kasan shadow region
+-  ffffa00000000000	ffffa00007ffffff	 128MB		bpf jit region
+-  ffffa00008000000	ffffa0000fffffff	 128MB		modules
+-  ffffa00010000000	fffffdffbffeffff	 ~93TB		vmalloc
++[ ffff600000000000	ffff7fffffffffff ]	  32TB		[ kasan shadow region ]
++  ffff800000000000	ffff800007ffffff	 128MB		bpf jit region
++  ffff800008000000	ffff80000fffffff	 128MB		modules
++  ffff800010000000	fffffdffbffeffff	 125TB		vmalloc
+   fffffdffbfff0000	fffffdfffe5f8fff	~998MB		[guard region]
+   fffffdfffe5f9000	fffffdfffe9fffff	4124KB		fixed mappings
+   fffffdfffea00000	fffffdfffebfffff	   2MB		[guard region]
+@@ -50,12 +50,11 @@ AArch64 Linux memory layout with 64KB pages + 3 levels (52-bit with HW support):
+   Start			End			Size		Use
+   -----------------------------------------------------------------------
+   0000000000000000	000fffffffffffff	   4PB		user
+-  fff0000000000000	fff7ffffffffffff	   2PB		kernel logical memory map
+-  fff8000000000000	fffd9fffffffffff	1440TB		[gap]
+-  fffda00000000000	ffff9fffffffffff	 512TB		kasan shadow region
+-  ffffa00000000000	ffffa00007ffffff	 128MB		bpf jit region
+-  ffffa00008000000	ffffa0000fffffff	 128MB		modules
+-  ffffa00010000000	fffff81ffffeffff	 ~88TB		vmalloc
++  fff0000000000000	ffff7fffffffffff	  ~4PB		kernel logical memory map
++[ fffd800000000000	ffff7fffffffffff ]	 512TB		[ kasan shadow region ]
++  ffff800000000000	ffff800007ffffff	 128MB		bpf jit region
++  ffff800008000000	ffff80000fffffff	 128MB		modules
++  ffff800010000000	fffff81ffffeffff	 120TB		vmalloc
+   fffff81fffff0000	fffffc1ffe58ffff	  ~3TB		[guard region]
+   fffffc1ffe590000	fffffc1ffe9fffff	4544KB		fixed mappings
+   fffffc1ffea00000	fffffc1ffebfffff	   2MB		[guard region]
+* Unmerged path arch/arm64/Kconfig
+* Unmerged path arch/arm64/include/asm/memory.h
+* Unmerged path arch/arm64/mm/init.c
