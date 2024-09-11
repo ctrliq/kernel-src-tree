@@ -1,0 +1,265 @@
+ch_ktls: Correction in middle record handling
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-338.el8
+commit-author Rohit Maheshwari <rohitm@chelsio.com>
+commit 63ee4591fa2f97dc08ce37514f214fc0430e9dc3
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-338.el8/63ee4591.failed
+
+If a record starts in middle, reset TCB UNA so that we could
+avoid sending out extra packet which is needed to make it 16
+byte aligned to start AES CTR.
+Check also considers prev_seq, which should be what is
+actually sent, not the skb data length.
+Avoid updating partial TAG to HW at any point of time, that's
+why we need to check if remaining part is smaller than TAG
+size, then reset TX_MAX to be TAG starting sequence number.
+
+Fixes: 5a4b9fe7fece ("cxgb4/chcr: complete record tx handling")
+	Signed-off-by: Rohit Maheshwari <rohitm@chelsio.com>
+	Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+(cherry picked from commit 63ee4591fa2f97dc08ce37514f214fc0430e9dc3)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/crypto/chelsio/chcr_ktls.c
+diff --cc drivers/crypto/chelsio/chcr_ktls.c
+index 074af13f5bc4,026c66599d1e..000000000000
+--- a/drivers/crypto/chelsio/chcr_ktls.c
++++ b/drivers/crypto/chelsio/chcr_ktls.c
+@@@ -754,9 -827,10 +754,9 @@@ static void *chcr_write_cpl_set_tcb_ulp
+   */
+  static int chcr_ktls_xmit_tcb_cpls(struct chcr_ktls_info *tx_info,
+  				   struct sge_eth_txq *q, u64 tcp_seq,
+- 				   u64 tcp_ack, u64 tcp_win)
++ 				   u64 tcp_ack, u64 tcp_win, bool offset)
+  {
+  	bool first_wr = ((tx_info->prev_ack == 0) && (tx_info->prev_win == 0));
+ -	struct ch_ktls_port_stats_debug *port_stats;
+  	u32 len, cpl = 0, ndesc, wr_len;
+  	struct fw_ulptx_wr *wr;
+  	int credits;
+@@@ -788,14 -862,17 +788,19 @@@
+  		cpl++;
+  	}
+  	/* reset snd una if it's a re-transmit pkt */
+- 	if (tcp_seq != tx_info->prev_seq) {
++ 	if (tcp_seq != tx_info->prev_seq || offset) {
+  		/* reset snd_una */
+ -		port_stats =
+ -			&tx_info->adap->ch_ktls_stats.ktls_port[tx_info->port_id];
+  		pos = chcr_write_cpl_set_tcb_ulp(tx_info, q, tx_info->tid, pos,
+  						 TCB_SND_UNA_RAW_W,
+  						 TCB_SND_UNA_RAW_V
+  						 (TCB_SND_UNA_RAW_M),
+  						 TCB_SND_UNA_RAW_V(0), 0);
+++<<<<<<< HEAD:drivers/crypto/chelsio/chcr_ktls.c
+ +		atomic64_inc(&tx_info->adap->chcr_stats.ktls_tx_ooo);
+++=======
++ 		if (tcp_seq != tx_info->prev_seq)
++ 			atomic64_inc(&port_stats->ktls_tx_ooo);
+++>>>>>>> 63ee4591fa2f (ch_ktls: Correction in middle record handling):drivers/net/ethernet/chelsio/inline_crypto/ch_ktls/chcr_ktls.c
+  		cpl++;
+  	}
+  	/* update ack */
+@@@ -1654,12 -1662,15 +1659,24 @@@ static int chcr_end_part_handler(struc
+  		 * accordingly.
+  		 */
+  		tcp_seq = tls_record_start_seq(record);
+++<<<<<<< HEAD:drivers/crypto/chelsio/chcr_ktls.c
+ +		/* reset snd una, so the middle record won't send the already
+ +		 * sent part.
+ +		 */
+ +		if (chcr_ktls_update_snd_una(tx_info, q))
+ +			goto out;
+ +		atomic64_inc(&tx_info->adap->chcr_stats.ktls_tx_end_pkts);
+++=======
++ 		/* reset skb offset */
++ 		skb_offset = 0;
++ 
++ 		if (last_wr)
++ 			dev_kfree_skb_any(skb);
++ 
++ 		last_wr = true;
++ 
++ 		atomic64_inc(&tx_info->adap->ch_ktls_stats.ktls_tx_end_pkts);
+++>>>>>>> 63ee4591fa2f (ch_ktls: Correction in middle record handling):drivers/net/ethernet/chelsio/inline_crypto/ch_ktls/chcr_ktls.c
+  	}
+  
+  	if (chcr_ktls_xmit_wr_complete(nskb, tx_info, q, tcp_seq,
+@@@ -1712,27 -1726,33 +1730,32 @@@ static int chcr_short_record_handler(st
+  
+  	if (remaining_record > 0 &&
+  	    remaining_record < TLS_CIPHER_AES_GCM_128_TAG_SIZE) {
+ -		int trimmed_len = 0;
+ -
+ -		if (tls_end_offset > TLS_CIPHER_AES_GCM_128_TAG_SIZE)
+ -			trimmed_len = data_len -
+ -				      (TLS_CIPHER_AES_GCM_128_TAG_SIZE -
+ -				       remaining_record);
+ -		if (!trimmed_len)
+ +		int trimmed_len = skb->data_len -
+ +			(TLS_CIPHER_AES_GCM_128_TAG_SIZE - remaining_record);
+ +		struct sk_buff *tmp_skb = NULL;
+ +		/* don't process the pkt if it is only a partial tag */
+ +		if (skb->data_len < TLS_CIPHER_AES_GCM_128_TAG_SIZE)
+  			goto out;
+  
+ -		WARN_ON(trimmed_len > data_len);
+ +		WARN_ON(trimmed_len > skb->data_len);
+  
+ -		data_len = trimmed_len;
+ -		atomic64_inc(&tx_info->adap->ch_ktls_stats.ktls_tx_trimmed_pkts);
+ -	}
+ -
+ -	/* check if it is only the header part. */
+ -	if (tls_rec_offset + data_len <= (TLS_HEADER_SIZE + tx_info->iv_size)) {
+ -		if (chcr_ktls_tx_plaintxt(tx_info, skb, tcp_seq, mss,
+ -					  tcp_push_no_fin, q,
+ -					  tx_info->port_id, prior_data,
+ -					  data_len, skb_offset, prior_data_len))
+ +		/* shift to those many bytes */
+ +		tmp_skb = alloc_skb(0, GFP_KERNEL);
+ +		if (unlikely(!tmp_skb))
+  			goto out;
+  
+++<<<<<<< HEAD:drivers/crypto/chelsio/chcr_ktls.c
+ +		chcr_ktls_skb_shift(tmp_skb, skb, trimmed_len);
+ +		/* free the last trimmed portion */
+ +		dev_kfree_skb_any(skb);
+ +		skb = tmp_skb;
+ +		atomic64_inc(&tx_info->adap->chcr_stats.ktls_tx_trimmed_pkts);
+++=======
++ 		tx_info->prev_seq = tcp_seq + data_len;
++ 		return 0;
+++>>>>>>> 63ee4591fa2f (ch_ktls: Correction in middle record handling):drivers/net/ethernet/chelsio/inline_crypto/ch_ktls/chcr_ktls.c
+  	}
+ -
+ +	data_len = skb->data_len;
+  	/* check if the middle record's start point is 16 byte aligned. CTR
+  	 * needs 16 byte aligned start point to start encryption.
+  	 */
+@@@ -1897,20 -1884,7 +1921,23 @@@ int chcr_ktls_xmit(struct sk_buff *skb
+  		if (ret)
+  			return NETDEV_TX_BUSY;
+  	}
+++<<<<<<< HEAD:drivers/crypto/chelsio/chcr_ktls.c
+ +	/* update tcb */
+ +	ret = chcr_ktls_xmit_tcb_cpls(tx_info, q, ntohl(th->seq),
+ +				      ntohl(th->ack_seq),
+ +				      ntohs(th->window));
+ +	if (ret) {
+ +		dev_kfree_skb_any(local_skb);
+ +		return NETDEV_TX_BUSY;
+ +	}
+++=======
+++>>>>>>> 63ee4591fa2f (ch_ktls: Correction in middle record handling):drivers/net/ethernet/chelsio/inline_crypto/ch_ktls/chcr_ktls.c
+ +
+ +	/* copy skb contents into local skb */
+ +	chcr_ktls_skb_copy(skb, local_skb);
+  
+ +	/* go through the skb and send only one record at a time. */
+ +	data_len = skb->data_len;
+  	/* TCP segments can be in received either complete or partial.
+  	 * chcr_end_part_handler will handle cases if complete record or end
+  	 * part of the record is received. Incase of partial end part of record,
+@@@ -1937,10 -1911,33 +1964,37 @@@
+  
+  		if (unlikely(tls_record_is_start_marker(record))) {
+  			spin_unlock_irqrestore(&tx_ctx->base.lock, flags);
+ -			atomic64_inc(&port_stats->ktls_tx_skip_no_sync_data);
+ +			atomic64_inc(&stats->ktls_tx_skip_no_sync_data);
+  			goto out;
+  		}
+++<<<<<<< HEAD:drivers/crypto/chelsio/chcr_ktls.c
+ +
+++=======
++ 		tls_end_offset = record->end_seq - tcp_seq;
++ 
++ 		pr_debug("seq 0x%x, end_seq 0x%x prev_seq 0x%x, datalen 0x%x\n",
++ 			 tcp_seq, record->end_seq, tx_info->prev_seq, data_len);
++ 		/* update tcb for the skb */
++ 		if (skb_data_len == data_len) {
++ 			u32 tx_max = tcp_seq;
++ 
++ 			if (!tls_record_is_start_marker(record) &&
++ 			    tls_end_offset < TLS_CIPHER_AES_GCM_128_TAG_SIZE)
++ 				tx_max = record->end_seq -
++ 					TLS_CIPHER_AES_GCM_128_TAG_SIZE;
++ 
++ 			ret = chcr_ktls_xmit_tcb_cpls(tx_info, q, tx_max,
++ 						      ntohl(th->ack_seq),
++ 						      ntohs(th->window),
++ 						      tls_end_offset !=
++ 						      record->len);
++ 			if (ret) {
++ 				spin_unlock_irqrestore(&tx_ctx->base.lock,
++ 						       flags);
++ 				goto out;
++ 			}
++ 		}
+++>>>>>>> 63ee4591fa2f (ch_ktls: Correction in middle record handling):drivers/net/ethernet/chelsio/inline_crypto/ch_ktls/chcr_ktls.c
+  		/* increase page reference count of the record, so that there
+  		 * won't be any chance of page free in middle if in case stack
+  		 * receives ACK and try to delete the record.
+@@@ -1950,37 -1947,16 +2004,34 @@@
+  		/* lock cleared */
+  		spin_unlock_irqrestore(&tx_ctx->base.lock, flags);
+  
+- 		tls_end_offset = record->end_seq - tcp_seq;
+  
+- 		pr_debug("seq 0x%x, end_seq 0x%x prev_seq 0x%x, datalen 0x%x\n",
+- 			 tcp_seq, record->end_seq, tx_info->prev_seq, data_len);
+  		/* if a tls record is finishing in this SKB */
+  		if (tls_end_offset <= data_len) {
+ -			ret = chcr_end_part_handler(tx_info, skb, record,
+ +			struct sk_buff *nskb = NULL;
+ +
+ +			if (tls_end_offset < data_len) {
+ +				nskb = alloc_skb(0, GFP_KERNEL);
+ +				if (unlikely(!nskb)) {
+ +					ret = -ENOMEM;
+ +					goto clear_ref;
+ +				}
+ +
+ +				chcr_ktls_skb_shift(nskb, local_skb,
+ +						    tls_end_offset);
+ +			} else {
+ +				/* its the only record in this skb, directly
+ +				 * point it.
+ +				 */
+ +				nskb = local_skb;
+ +			}
+ +			ret = chcr_end_part_handler(tx_info, nskb, record,
+  						    tcp_seq, mss,
+  						    (!th->fin && th->psh), q,
+ -						    skb_offset,
+  						    tls_end_offset,
+ -						    skb_offset +
+ -						    tls_end_offset == skb->len);
+ +						    (nskb == local_skb));
+ +
+ +			if (ret && nskb != local_skb)
+ +				dev_kfree_skb_any(local_skb);
+  
+  			data_len -= tls_end_offset;
+  			/* tcp_seq increment is required to handle next record.
+@@@ -2007,10 -1986,8 +2058,15 @@@ clear_ref
+  
+  	} while (data_len > 0);
+  
+++<<<<<<< HEAD:drivers/crypto/chelsio/chcr_ktls.c
+ +	tx_info->prev_seq = ntohl(th->seq) + skb->data_len;
+ +
+ +	atomic64_inc(&stats->ktls_tx_encrypted_packets);
+ +	atomic64_add(skb->data_len, &stats->ktls_tx_encrypted_bytes);
+++=======
++ 	atomic64_inc(&port_stats->ktls_tx_encrypted_packets);
++ 	atomic64_add(skb_data_len, &port_stats->ktls_tx_encrypted_bytes);
+++>>>>>>> 63ee4591fa2f (ch_ktls: Correction in middle record handling):drivers/net/ethernet/chelsio/inline_crypto/ch_ktls/chcr_ktls.c
+  
+  	/* tcp finish is set, send a separate tcp msg including all the options
+  	 * as well.
+* Unmerged path drivers/crypto/chelsio/chcr_ktls.c
