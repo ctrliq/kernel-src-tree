@@ -1,0 +1,130 @@
+s390/pci: add zpci_set_irq()/zpci_clear_irq()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-448.el8
+commit-author Niklas Schnelle <schnelle@linux.ibm.com>
+commit c1e18c17bda68cdf2b58744b2864836de05dcf3a
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-448.el8/c1e18c17.failed
+
+Pull the directed vs floating IRQ check into common
+zpci_set_irq()/zpci_clear_irq() functions and expose them for the rest
+of the zPCI subsystem. Furthermore we add a zdev flag bit to easily
+check if IRQs are registered. This is needed for use in resetting a zPCI
+function.
+
+	Reviewed-by: Matthew Rosato <mjrosato@linux.ibm.com>
+	Signed-off-by: Niklas Schnelle <schnelle@linux.ibm.com>
+	Signed-off-by: Vasily Gorbik <gor@linux.ibm.com>
+(cherry picked from commit c1e18c17bda68cdf2b58744b2864836de05dcf3a)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/s390/include/asm/pci.h
+diff --cc arch/s390/include/asm/pci.h
+index 37481081a26c,5509b224c2ec..000000000000
+--- a/arch/s390/include/asm/pci.h
++++ b/arch/s390/include/asm/pci.h
+@@@ -131,9 -130,11 +131,14 @@@ struct zpci_dev 
+  	u8		port;
+  	u8		rid_available	: 1;
+  	u8		has_hp_slot	: 1;
+ -	u8		has_resources	: 1;
+  	u8		is_physfn	: 1;
+  	u8		util_str_avail	: 1;
+++<<<<<<< HEAD
+ +	u8		reserved	: 4;
+++=======
++ 	u8		irqs_registered	: 1;
++ 	u8		reserved	: 2;
+++>>>>>>> c1e18c17bda6 (s390/pci: add zpci_set_irq()/zpci_clear_irq())
+  	unsigned int	devfn;		/* DEVFN part of the RID*/
+  
+  	struct mutex lock;
+* Unmerged path arch/s390/include/asm/pci.h
+diff --git a/arch/s390/pci/pci_irq.c b/arch/s390/pci/pci_irq.c
+index 743f257cf2cb..2414ae13a1be 100644
+--- a/arch/s390/pci/pci_irq.c
++++ b/arch/s390/pci/pci_irq.c
+@@ -35,7 +35,7 @@ static struct airq_iv *zpci_sbv;
+  */
+ static struct airq_iv **zpci_ibv;
+ 
+-/* Modify PCI: Register adapter interruptions */
++/* Modify PCI: Register floating adapter interruptions */
+ static int zpci_set_airq(struct zpci_dev *zdev)
+ {
+ 	u64 req = ZPCI_CREATE_REQ(zdev->fh, 0, ZPCI_MOD_FC_REG_INT);
+@@ -53,7 +53,7 @@ static int zpci_set_airq(struct zpci_dev *zdev)
+ 	return zpci_mod_fc(req, &fib, &status) ? -EIO : 0;
+ }
+ 
+-/* Modify PCI: Unregister adapter interruptions */
++/* Modify PCI: Unregister floating adapter interruptions */
+ static int zpci_clear_airq(struct zpci_dev *zdev)
+ {
+ 	u64 req = ZPCI_CREATE_REQ(zdev->fh, 0, ZPCI_MOD_FC_DEREG_INT);
+@@ -98,6 +98,38 @@ static int zpci_clear_directed_irq(struct zpci_dev *zdev)
+ 	return cc ? -EIO : 0;
+ }
+ 
++/* Register adapter interruptions */
++int zpci_set_irq(struct zpci_dev *zdev)
++{
++	int rc;
++
++	if (irq_delivery == DIRECTED)
++		rc = zpci_set_directed_irq(zdev);
++	else
++		rc = zpci_set_airq(zdev);
++
++	if (!rc)
++		zdev->irqs_registered = 1;
++
++	return rc;
++}
++
++/* Clear adapter interruptions */
++int zpci_clear_irq(struct zpci_dev *zdev)
++{
++	int rc;
++
++	if (irq_delivery == DIRECTED)
++		rc = zpci_clear_directed_irq(zdev);
++	else
++		rc = zpci_clear_airq(zdev);
++
++	if (!rc)
++		zdev->irqs_registered = 0;
++
++	return rc;
++}
++
+ static int zpci_set_irq_affinity(struct irq_data *data, const struct cpumask *dest,
+ 				 bool force)
+ {
+@@ -305,10 +337,7 @@ int arch_setup_msi_irqs(struct pci_dev *pdev, int nvec, int type)
+ 	zdev->msi_first_bit = bit;
+ 	zdev->msi_nr_irqs = msi_vecs;
+ 
+-	if (irq_delivery == DIRECTED)
+-		rc = zpci_set_directed_irq(zdev);
+-	else
+-		rc = zpci_set_airq(zdev);
++	rc = zpci_set_irq(zdev);
+ 	if (rc)
+ 		return rc;
+ 
+@@ -322,10 +351,7 @@ void arch_teardown_msi_irqs(struct pci_dev *pdev)
+ 	int rc;
+ 
+ 	/* Disable interrupts */
+-	if (irq_delivery == DIRECTED)
+-		rc = zpci_clear_directed_irq(zdev);
+-	else
+-		rc = zpci_clear_airq(zdev);
++	rc = zpci_clear_irq(zdev);
+ 	if (rc)
+ 		return;
+ 
