@@ -1,0 +1,601 @@
+libbpf: Allow to augment system Kconfig through extra optional config
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Andrii Nakryiko <andriin@fb.com>
+commit 8601fd422148a8f7ff5f7eaf75b6703d5166332c
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/8601fd42.failed
+
+Instead of all or nothing approach of overriding Kconfig file location, allow
+to extend it with extra values and override chosen subset of values though
+optional user-provided extra config, passed as a string through open options'
+.kconfig option. If same config key is present in both user-supplied config
+and Kconfig, user-supplied one wins. This allows applications to more easily
+test various conditions despite host kernel's real configuration. If all of
+BPF object's __kconfig externs are satisfied from user-supplied config, system
+Kconfig won't be read at all.
+
+Simplify selftests by not needing to create temporary Kconfig files.
+
+	Suggested-by: Alexei Starovoitov <ast@fb.com>
+	Signed-off-by: Andrii Nakryiko <andriin@fb.com>
+	Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+Link: https://lore.kernel.org/bpf/20191219002837.3074619-3-andriin@fb.com
+(cherry picked from commit 8601fd422148a8f7ff5f7eaf75b6703d5166332c)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	tools/lib/bpf/libbpf.c
+#	tools/lib/bpf/libbpf.h
+#	tools/testing/selftests/bpf/prog_tests/core_extern.c
+diff --cc tools/lib/bpf/libbpf.c
+index a22c75b6283d,7b74382c7977..000000000000
+--- a/tools/lib/bpf/libbpf.c
++++ b/tools/lib/bpf/libbpf.c
+@@@ -277,6 -302,11 +277,14 @@@ struct bpf_object 
+  	size_t nr_maps;
+  	size_t maps_cap;
+  
+++<<<<<<< HEAD
+++=======
++ 	char *kconfig;
++ 	struct extern_desc *externs;
++ 	int nr_extern;
++ 	int kconfig_map_idx;
++ 
+++>>>>>>> 8601fd422148 (libbpf: Allow to augment system Kconfig through extra optional config)
+  	bool loaded;
+  	bool has_pseudo_calls;
+  	bool relaxed_core_relocs;
+@@@ -960,6 -1002,302 +968,305 @@@ static int bpf_object__init_global_data
+  	return 0;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ 
++ static struct extern_desc *find_extern_by_name(const struct bpf_object *obj,
++ 					       const void *name)
++ {
++ 	int i;
++ 
++ 	for (i = 0; i < obj->nr_extern; i++) {
++ 		if (strcmp(obj->externs[i].name, name) == 0)
++ 			return &obj->externs[i];
++ 	}
++ 	return NULL;
++ }
++ 
++ static int set_ext_value_tri(struct extern_desc *ext, void *ext_val,
++ 			     char value)
++ {
++ 	switch (ext->type) {
++ 	case EXT_BOOL:
++ 		if (value == 'm') {
++ 			pr_warn("extern %s=%c should be tristate or char\n",
++ 				ext->name, value);
++ 			return -EINVAL;
++ 		}
++ 		*(bool *)ext_val = value == 'y' ? true : false;
++ 		break;
++ 	case EXT_TRISTATE:
++ 		if (value == 'y')
++ 			*(enum libbpf_tristate *)ext_val = TRI_YES;
++ 		else if (value == 'm')
++ 			*(enum libbpf_tristate *)ext_val = TRI_MODULE;
++ 		else /* value == 'n' */
++ 			*(enum libbpf_tristate *)ext_val = TRI_NO;
++ 		break;
++ 	case EXT_CHAR:
++ 		*(char *)ext_val = value;
++ 		break;
++ 	case EXT_UNKNOWN:
++ 	case EXT_INT:
++ 	case EXT_CHAR_ARR:
++ 	default:
++ 		pr_warn("extern %s=%c should be bool, tristate, or char\n",
++ 			ext->name, value);
++ 		return -EINVAL;
++ 	}
++ 	ext->is_set = true;
++ 	return 0;
++ }
++ 
++ static int set_ext_value_str(struct extern_desc *ext, char *ext_val,
++ 			     const char *value)
++ {
++ 	size_t len;
++ 
++ 	if (ext->type != EXT_CHAR_ARR) {
++ 		pr_warn("extern %s=%s should char array\n", ext->name, value);
++ 		return -EINVAL;
++ 	}
++ 
++ 	len = strlen(value);
++ 	if (value[len - 1] != '"') {
++ 		pr_warn("extern '%s': invalid string config '%s'\n",
++ 			ext->name, value);
++ 		return -EINVAL;
++ 	}
++ 
++ 	/* strip quotes */
++ 	len -= 2;
++ 	if (len >= ext->sz) {
++ 		pr_warn("extern '%s': long string config %s of (%zu bytes) truncated to %d bytes\n",
++ 			ext->name, value, len, ext->sz - 1);
++ 		len = ext->sz - 1;
++ 	}
++ 	memcpy(ext_val, value + 1, len);
++ 	ext_val[len] = '\0';
++ 	ext->is_set = true;
++ 	return 0;
++ }
++ 
++ static int parse_u64(const char *value, __u64 *res)
++ {
++ 	char *value_end;
++ 	int err;
++ 
++ 	errno = 0;
++ 	*res = strtoull(value, &value_end, 0);
++ 	if (errno) {
++ 		err = -errno;
++ 		pr_warn("failed to parse '%s' as integer: %d\n", value, err);
++ 		return err;
++ 	}
++ 	if (*value_end) {
++ 		pr_warn("failed to parse '%s' as integer completely\n", value);
++ 		return -EINVAL;
++ 	}
++ 	return 0;
++ }
++ 
++ static bool is_ext_value_in_range(const struct extern_desc *ext, __u64 v)
++ {
++ 	int bit_sz = ext->sz * 8;
++ 
++ 	if (ext->sz == 8)
++ 		return true;
++ 
++ 	/* Validate that value stored in u64 fits in integer of `ext->sz`
++ 	 * bytes size without any loss of information. If the target integer
++ 	 * is signed, we rely on the following limits of integer type of
++ 	 * Y bits and subsequent transformation:
++ 	 *
++ 	 *     -2^(Y-1) <= X           <= 2^(Y-1) - 1
++ 	 *            0 <= X + 2^(Y-1) <= 2^Y - 1
++ 	 *            0 <= X + 2^(Y-1) <  2^Y
++ 	 *
++ 	 *  For unsigned target integer, check that all the (64 - Y) bits are
++ 	 *  zero.
++ 	 */
++ 	if (ext->is_signed)
++ 		return v + (1ULL << (bit_sz - 1)) < (1ULL << bit_sz);
++ 	else
++ 		return (v >> bit_sz) == 0;
++ }
++ 
++ static int set_ext_value_num(struct extern_desc *ext, void *ext_val,
++ 			     __u64 value)
++ {
++ 	if (ext->type != EXT_INT && ext->type != EXT_CHAR) {
++ 		pr_warn("extern %s=%llu should be integer\n",
++ 			ext->name, value);
++ 		return -EINVAL;
++ 	}
++ 	if (!is_ext_value_in_range(ext, value)) {
++ 		pr_warn("extern %s=%llu value doesn't fit in %d bytes\n",
++ 			ext->name, value, ext->sz);
++ 		return -ERANGE;
++ 	}
++ 	switch (ext->sz) {
++ 		case 1: *(__u8 *)ext_val = value; break;
++ 		case 2: *(__u16 *)ext_val = value; break;
++ 		case 4: *(__u32 *)ext_val = value; break;
++ 		case 8: *(__u64 *)ext_val = value; break;
++ 		default:
++ 			return -EINVAL;
++ 	}
++ 	ext->is_set = true;
++ 	return 0;
++ }
++ 
++ static int bpf_object__process_kconfig_line(struct bpf_object *obj,
++ 					    char *buf, void *data)
++ {
++ 	struct extern_desc *ext;
++ 	char *sep, *value;
++ 	int len, err = 0;
++ 	void *ext_val;
++ 	__u64 num;
++ 
++ 	if (strncmp(buf, "CONFIG_", 7))
++ 		return 0;
++ 
++ 	sep = strchr(buf, '=');
++ 	if (!sep) {
++ 		pr_warn("failed to parse '%s': no separator\n", buf);
++ 		return -EINVAL;
++ 	}
++ 
++ 	/* Trim ending '\n' */
++ 	len = strlen(buf);
++ 	if (buf[len - 1] == '\n')
++ 		buf[len - 1] = '\0';
++ 	/* Split on '=' and ensure that a value is present. */
++ 	*sep = '\0';
++ 	if (!sep[1]) {
++ 		*sep = '=';
++ 		pr_warn("failed to parse '%s': no value\n", buf);
++ 		return -EINVAL;
++ 	}
++ 
++ 	ext = find_extern_by_name(obj, buf);
++ 	if (!ext || ext->is_set)
++ 		return 0;
++ 
++ 	ext_val = data + ext->data_off;
++ 	value = sep + 1;
++ 
++ 	switch (*value) {
++ 	case 'y': case 'n': case 'm':
++ 		err = set_ext_value_tri(ext, ext_val, *value);
++ 		break;
++ 	case '"':
++ 		err = set_ext_value_str(ext, ext_val, value);
++ 		break;
++ 	default:
++ 		/* assume integer */
++ 		err = parse_u64(value, &num);
++ 		if (err) {
++ 			pr_warn("extern %s=%s should be integer\n",
++ 				ext->name, value);
++ 			return err;
++ 		}
++ 		err = set_ext_value_num(ext, ext_val, num);
++ 		break;
++ 	}
++ 	if (err)
++ 		return err;
++ 	pr_debug("extern %s=%s\n", ext->name, value);
++ 	return 0;
++ }
++ 
++ static int bpf_object__read_kconfig_file(struct bpf_object *obj, void *data)
++ {
++ 	char buf[PATH_MAX];
++ 	struct utsname uts;
++ 	int len, err = 0;
++ 	gzFile file;
++ 
++ 	uname(&uts);
++ 	len = snprintf(buf, PATH_MAX, "/boot/config-%s", uts.release);
++ 	if (len < 0)
++ 		return -EINVAL;
++ 	else if (len >= PATH_MAX)
++ 		return -ENAMETOOLONG;
++ 
++ 	/* gzopen also accepts uncompressed files. */
++ 	file = gzopen(buf, "r");
++ 	if (!file)
++ 		file = gzopen("/proc/config.gz", "r");
++ 
++ 	if (!file) {
++ 		pr_warn("failed to open system Kconfig\n");
++ 		return -ENOENT;
++ 	}
++ 
++ 	while (gzgets(file, buf, sizeof(buf))) {
++ 		err = bpf_object__process_kconfig_line(obj, buf, data);
++ 		if (err) {
++ 			pr_warn("error parsing system Kconfig line '%s': %d\n",
++ 				buf, err);
++ 			goto out;
++ 		}
++ 	}
++ 
++ out:
++ 	gzclose(file);
++ 	return err;
++ }
++ 
++ static int bpf_object__read_kconfig_mem(struct bpf_object *obj,
++ 					const char *config, void *data)
++ {
++ 	char buf[PATH_MAX];
++ 	int err = 0;
++ 	FILE *file;
++ 
++ 	file = fmemopen((void *)config, strlen(config), "r");
++ 	if (!file) {
++ 		err = -errno;
++ 		pr_warn("failed to open in-memory Kconfig: %d\n", err);
++ 		return err;
++ 	}
++ 
++ 	while (fgets(buf, sizeof(buf), file)) {
++ 		err = bpf_object__process_kconfig_line(obj, buf, data);
++ 		if (err) {
++ 			pr_warn("error parsing in-memory Kconfig line '%s': %d\n",
++ 				buf, err);
++ 			break;
++ 		}
++ 	}
++ 
++ 	fclose(file);
++ 	return err;
++ }
++ 
++ static int bpf_object__init_kconfig_map(struct bpf_object *obj)
++ {
++ 	struct extern_desc *last_ext;
++ 	size_t map_sz;
++ 	int err;
++ 
++ 	if (obj->nr_extern == 0)
++ 		return 0;
++ 
++ 	last_ext = &obj->externs[obj->nr_extern - 1];
++ 	map_sz = last_ext->data_off + last_ext->sz;
++ 
++ 	err = bpf_object__init_internal_map(obj, LIBBPF_MAP_KCONFIG,
++ 					    obj->efile.symbols_shndx,
++ 					    NULL, map_sz);
++ 	if (err)
++ 		return err;
++ 
++ 	obj->kconfig_map_idx = obj->nr_maps - 1;
++ 
++ 	return 0;
++ }
++ 
+++>>>>>>> 8601fd422148 (libbpf: Allow to augment system Kconfig through extra optional config)
+  static int bpf_object__init_user_maps(struct bpf_object *obj, bool strict)
+  {
+  	Elf_Data *symbols = obj->efile.symbols;
+@@@ -4007,14 -4596,12 +4314,18 @@@ bpf_object__load_progs(struct bpf_objec
+  
+  static struct bpf_object *
+  __bpf_object__open(const char *path, const void *obj_buf, size_t obj_buf_sz,
+ -		   const struct bpf_object_open_opts *opts)
+ +		   struct bpf_object_open_opts *opts)
+  {
+++<<<<<<< HEAD
+ +	const char *pin_root_path;
+++=======
++ 	const char *obj_name, *kconfig;
+++>>>>>>> 8601fd422148 (libbpf: Allow to augment system Kconfig through extra optional config)
+  	struct bpf_program *prog;
+  	struct bpf_object *obj;
+ +	const char *obj_name;
+  	char tmp_name[64];
+ +	bool relaxed_maps;
+  	int err;
+  
+  	if (elf_version(EV_CURRENT) == EV_NONE) {
+@@@ -4043,15 -4630,23 +4354,24 @@@
+  		return obj;
+  
+  	obj->relaxed_core_relocs = OPTS_GET(opts, relaxed_core_relocs, false);
+++<<<<<<< HEAD
+ +	relaxed_maps = OPTS_GET(opts, relaxed_maps, false);
+ +	pin_root_path = OPTS_GET(opts, pin_root_path, NULL);
+++=======
++ 	kconfig = OPTS_GET(opts, kconfig, NULL);
++ 	if (kconfig) {
++ 		obj->kconfig = strdup(kconfig);
++ 		if (!obj->kconfig)
++ 			return ERR_PTR(-ENOMEM);
++ 	}
+++>>>>>>> 8601fd422148 (libbpf: Allow to augment system Kconfig through extra optional config)
+  
+ -	err = bpf_object__elf_init(obj);
+ -	err = err ? : bpf_object__check_endianness(obj);
+ -	err = err ? : bpf_object__elf_collect(obj);
+ -	err = err ? : bpf_object__collect_externs(obj);
+ -	err = err ? : bpf_object__finalize_btf(obj);
+ -	err = err ? : bpf_object__init_maps(obj, opts);
+ -	err = err ? : bpf_object__init_prog_names(obj);
+ -	err = err ? : bpf_object__collect_reloc(obj);
+ -	if (err)
+ -		goto out;
+ +	CHECK_ERR(bpf_object__elf_init(obj), err, out);
+ +	CHECK_ERR(bpf_object__check_endianness(obj), err, out);
+ +	CHECK_ERR(bpf_object__probe_caps(obj), err, out);
+ +	CHECK_ERR(bpf_object__elf_collect(obj, relaxed_maps, pin_root_path),
+ +		  err, out);
+ +	CHECK_ERR(bpf_object__collect_reloc(obj), err, out);
+  	bpf_object__elf_finish(obj);
+  
+  	bpf_object__for_each_program(prog, obj) {
+@@@ -4160,6 -4757,92 +4480,95 @@@ int bpf_object__unload(struct bpf_objec
+  	return 0;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static int bpf_object__sanitize_maps(struct bpf_object *obj)
++ {
++ 	struct bpf_map *m;
++ 
++ 	bpf_object__for_each_map(m, obj) {
++ 		if (!bpf_map__is_internal(m))
++ 			continue;
++ 		if (!obj->caps.global_data) {
++ 			pr_warn("kernel doesn't support global data\n");
++ 			return -ENOTSUP;
++ 		}
++ 		if (!obj->caps.array_mmap)
++ 			m->def.map_flags ^= BPF_F_MMAPABLE;
++ 	}
++ 
++ 	return 0;
++ }
++ 
++ static int bpf_object__resolve_externs(struct bpf_object *obj,
++ 				       const char *extra_kconfig)
++ {
++ 	bool need_config = false;
++ 	struct extern_desc *ext;
++ 	int err, i;
++ 	void *data;
++ 
++ 	if (obj->nr_extern == 0)
++ 		return 0;
++ 
++ 	data = obj->maps[obj->kconfig_map_idx].mmaped;
++ 
++ 	for (i = 0; i < obj->nr_extern; i++) {
++ 		ext = &obj->externs[i];
++ 
++ 		if (strcmp(ext->name, "LINUX_KERNEL_VERSION") == 0) {
++ 			void *ext_val = data + ext->data_off;
++ 			__u32 kver = get_kernel_version();
++ 
++ 			if (!kver) {
++ 				pr_warn("failed to get kernel version\n");
++ 				return -EINVAL;
++ 			}
++ 			err = set_ext_value_num(ext, ext_val, kver);
++ 			if (err)
++ 				return err;
++ 			pr_debug("extern %s=0x%x\n", ext->name, kver);
++ 		} else if (strncmp(ext->name, "CONFIG_", 7) == 0) {
++ 			need_config = true;
++ 		} else {
++ 			pr_warn("unrecognized extern '%s'\n", ext->name);
++ 			return -EINVAL;
++ 		}
++ 	}
++ 	if (need_config && extra_kconfig) {
++ 		err = bpf_object__read_kconfig_mem(obj, extra_kconfig, data);
++ 		if (err)
++ 			return -EINVAL;
++ 		need_config = false;
++ 		for (i = 0; i < obj->nr_extern; i++) {
++ 			ext = &obj->externs[i];
++ 			if (!ext->is_set) {
++ 				need_config = true;
++ 				break;
++ 			}
++ 		}
++ 	}
++ 	if (need_config) {
++ 		err = bpf_object__read_kconfig_file(obj, data);
++ 		if (err)
++ 			return -EINVAL;
++ 	}
++ 	for (i = 0; i < obj->nr_extern; i++) {
++ 		ext = &obj->externs[i];
++ 
++ 		if (!ext->is_set && !ext->is_weak) {
++ 			pr_warn("extern %s (strong) not resolved\n", ext->name);
++ 			return -ESRCH;
++ 		} else if (!ext->is_set) {
++ 			pr_debug("extern %s (weak) not resolved, defaulting to zero\n",
++ 				 ext->name);
++ 		}
++ 	}
++ 
++ 	return 0;
++ }
++ 
+++>>>>>>> 8601fd422148 (libbpf: Allow to augment system Kconfig through extra optional config)
+  int bpf_object__load_xattr(struct bpf_object_load_attr *attr)
+  {
+  	struct bpf_object *obj;
+@@@ -4178,9 -4861,15 +4587,21 @@@
+  
+  	obj->loaded = true;
+  
+++<<<<<<< HEAD
+ +	CHECK_ERR(bpf_object__create_maps(obj), err, out);
+ +	CHECK_ERR(bpf_object__relocate(obj, attr->target_btf_path), err, out);
+ +	CHECK_ERR(bpf_object__load_progs(obj, attr->log_level), err, out);
+++=======
++ 	err = bpf_object__probe_caps(obj);
++ 	err = err ? : bpf_object__resolve_externs(obj, obj->kconfig);
++ 	err = err ? : bpf_object__sanitize_and_load_btf(obj);
++ 	err = err ? : bpf_object__sanitize_maps(obj);
++ 	err = err ? : bpf_object__create_maps(obj);
++ 	err = err ? : bpf_object__relocate(obj, attr->target_btf_path);
++ 	err = err ? : bpf_object__load_progs(obj, attr->log_level);
++ 	if (err)
++ 		goto out;
+++>>>>>>> 8601fd422148 (libbpf: Allow to augment system Kconfig through extra optional config)
+  
+  	return 0;
+  out:
+@@@ -4767,6 -5456,10 +5188,13 @@@ void bpf_object__close(struct bpf_objec
+  		zfree(&map->pin_path);
+  	}
+  
+++<<<<<<< HEAD
+++=======
++ 	zfree(&obj->kconfig);
++ 	zfree(&obj->externs);
++ 	obj->nr_extern = 0;
++ 
+++>>>>>>> 8601fd422148 (libbpf: Allow to augment system Kconfig through extra optional config)
+  	zfree(&obj->maps);
+  	obj->nr_maps = 0;
+  
+diff --cc tools/lib/bpf/libbpf.h
+index e454ceec9fa2,fe592ef48f1b..000000000000
+--- a/tools/lib/bpf/libbpf.h
++++ b/tools/lib/bpf/libbpf.h
+@@@ -84,8 -84,13 +84,18 @@@ struct bpf_object_open_opts 
+  	 * auto-pinned to that path on load; defaults to "/sys/fs/bpf".
+  	 */
+  	const char *pin_root_path;
+++<<<<<<< HEAD
+ +};
+ +#define bpf_object_open_opts__last_field pin_root_path
+++=======
++ 	__u32 attach_prog_fd;
++ 	/* Additional kernel config content that augments and overrides
++ 	 * system Kconfig for CONFIG_xxx externs.
++ 	 */
++ 	const char *kconfig;
++ };
++ #define bpf_object_open_opts__last_field kconfig
+++>>>>>>> 8601fd422148 (libbpf: Allow to augment system Kconfig through extra optional config)
+  
+  LIBBPF_API struct bpf_object *bpf_object__open(const char *path);
+  LIBBPF_API struct bpf_object *
+diff --cc tools/testing/selftests/bpf/prog_tests/core_extern.c
+index 30a7972e9012,b093787e9448..000000000000
+--- a/tools/testing/selftests/bpf/prog_tests/core_extern.c
++++ b/tools/testing/selftests/bpf/prog_tests/core_extern.c
+@@@ -144,22 -135,7 +137,26 @@@ void test_core_extern(void
+  		if (!test__start_subtest(t->name))
+  			continue;
+  
+++<<<<<<< HEAD
+ +		if (t->cfg) {
+ +			size_t n = strlen(t->cfg) + 1;
+ +			int fd = mkstemp(tmp_cfg_path);
+ +			int written;
+ +
+ +			if (CHECK(fd < 0, "mkstemp", "errno: %d\n", errno))
+ +				continue;
+ +			printf("using '%s' as config file\n", tmp_cfg_path);
+ +			written = write(fd, t->cfg, n);
+ +			close(fd);
+ +			if (CHECK_FAIL(written != n))
+ +				goto cleanup;
+ +			opts.kconfig_path = tmp_cfg_path;
+ +		}
+ +
+ +		skel = test_core_extern__open_opts(&core_extern_embed, &opts);
+++=======
++ 		skel = test_core_extern__open_opts(&opts);
+++>>>>>>> 8601fd422148 (libbpf: Allow to augment system Kconfig through extra optional config)
+  		if (CHECK(!skel, "skel_open", "skeleton open failed\n"))
+  			goto cleanup;
+  		err = test_core_extern__load(skel);
+* Unmerged path tools/lib/bpf/libbpf.c
+* Unmerged path tools/lib/bpf/libbpf.h
+* Unmerged path tools/testing/selftests/bpf/prog_tests/core_extern.c
