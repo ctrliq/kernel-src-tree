@@ -1,0 +1,155 @@
+kvm: arm/arm64: Fold VHE entry/exit work into kvm_vcpu_run_vhe()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Mark Rutland <mark.rutland@arm.com>
+commit b3f15ec3d809ccf2e171ca4e272a220d3c1a3e05
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/b3f15ec3.failed
+
+With VHE, running a vCPU always requires the sequence:
+
+1. kvm_arm_vhe_guest_enter();
+2. kvm_vcpu_run_vhe();
+3. kvm_arm_vhe_guest_exit()
+
+... and as we invoke this from the shared arm/arm64 KVM code, 32-bit arm
+has to provide stubs for all three functions.
+
+To simplify the common code, and make it easier to make further
+modifications to the arm64-specific portions in the near future, let's
+fold kvm_arm_vhe_guest_enter() and kvm_arm_vhe_guest_exit() into
+kvm_vcpu_run_vhe().
+
+The 32-bit stubs for kvm_arm_vhe_guest_enter() and
+kvm_arm_vhe_guest_exit() are removed, as they are no longer used. The
+32-bit stub for kvm_vcpu_run_vhe() is left as-is.
+
+There should be no functional change as a result of this patch.
+
+	Signed-off-by: Mark Rutland <mark.rutland@arm.com>
+	Signed-off-by: Marc Zyngier <maz@kernel.org>
+Link: https://lore.kernel.org/r/20200210114757.2889-1-mark.rutland@arm.com
+(cherry picked from commit b3f15ec3d809ccf2e171ca4e272a220d3c1a3e05)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/arm64/include/asm/kvm_host.h
+diff --cc arch/arm64/include/asm/kvm_host.h
+index 4dd101adad0d,d740ec00ecd3..000000000000
+--- a/arch/arm64/include/asm/kvm_host.h
++++ b/arch/arm64/include/asm/kvm_host.h
+@@@ -603,23 -628,6 +603,26 @@@ static inline void kvm_set_pmu_events(u
+  static inline void kvm_clr_pmu_events(u32 clr) {}
+  #endif
+  
+++<<<<<<< HEAD
+ +static inline void kvm_arm_vhe_guest_enter(void)
+ +{
+ +	local_daif_mask();
+ +}
+ +
+ +static inline void kvm_arm_vhe_guest_exit(void)
+ +{
+ +	local_daif_restore(DAIF_PROCCTX_NOIRQ);
+ +
+ +	/*
+ +	 * When we exit from the guest we change a number of CPU configuration
+ +	 * parameters, such as traps.  Make sure these changes take effect
+ +	 * before running the host or additional guests.
+ +	 */
+ +	isb();
+ +}
+ +
+++=======
+++>>>>>>> b3f15ec3d809 (kvm: arm/arm64: Fold VHE entry/exit work into kvm_vcpu_run_vhe())
+  #define KVM_BP_HARDEN_UNKNOWN		-1
+  #define KVM_BP_HARDEN_WA_NEEDED		0
+  #define KVM_BP_HARDEN_NOT_REQUIRED	1
+diff --git a/arch/arm/include/asm/kvm_host.h b/arch/arm/include/asm/kvm_host.h
+index e5c90cf571a6..02572c696d84 100644
+--- a/arch/arm/include/asm/kvm_host.h
++++ b/arch/arm/include/asm/kvm_host.h
+@@ -350,9 +350,6 @@ static inline void kvm_arch_vcpu_put_fp(struct kvm_vcpu *vcpu) {}
+ static inline void kvm_vcpu_pmu_restore_guest(struct kvm_vcpu *vcpu) {}
+ static inline void kvm_vcpu_pmu_restore_host(struct kvm_vcpu *vcpu) {}
+ 
+-static inline void kvm_arm_vhe_guest_enter(void) {}
+-static inline void kvm_arm_vhe_guest_exit(void) {}
+-
+ #define KVM_BP_HARDEN_UNKNOWN		-1
+ #define KVM_BP_HARDEN_WA_NEEDED		0
+ #define KVM_BP_HARDEN_NOT_REQUIRED	1
+* Unmerged path arch/arm64/include/asm/kvm_host.h
+diff --git a/arch/arm64/kvm/hyp/switch.c b/arch/arm64/kvm/hyp/switch.c
+index b617da7815ad..74773235b8dc 100644
+--- a/arch/arm64/kvm/hyp/switch.c
++++ b/arch/arm64/kvm/hyp/switch.c
+@@ -635,7 +635,7 @@ static void __hyp_text __pmu_switch_to_host(struct kvm_cpu_context *host_ctxt)
+ }
+ 
+ /* Switch to the guest for VHE systems running in EL2 */
+-int kvm_vcpu_run_vhe(struct kvm_vcpu *vcpu)
++static int __kvm_vcpu_run_vhe(struct kvm_vcpu *vcpu)
+ {
+ 	struct kvm_cpu_context *host_ctxt;
+ 	struct kvm_cpu_context *guest_ctxt;
+@@ -688,7 +688,42 @@ int kvm_vcpu_run_vhe(struct kvm_vcpu *vcpu)
+ 
+ 	return exit_code;
+ }
+-NOKPROBE_SYMBOL(kvm_vcpu_run_vhe);
++NOKPROBE_SYMBOL(__kvm_vcpu_run_vhe);
++
++int kvm_vcpu_run_vhe(struct kvm_vcpu *vcpu)
++{
++	int ret;
++
++	local_daif_mask();
++
++	/*
++	 * Having IRQs masked via PMR when entering the guest means the GIC
++	 * will not signal the CPU of interrupts of lower priority, and the
++	 * only way to get out will be via guest exceptions.
++	 * Naturally, we want to avoid this.
++	 *
++	 * local_daif_mask() already sets GIC_PRIO_PSR_I_SET, we just need a
++	 * dsb to ensure the redistributor is forwards EL2 IRQs to the CPU.
++	 */
++	pmr_sync();
++
++	ret = __kvm_vcpu_run_vhe(vcpu);
++
++	/*
++	 * local_daif_restore() takes care to properly restore PSTATE.DAIF
++	 * and the GIC PMR if the host is using IRQ priorities.
++	 */
++	local_daif_restore(DAIF_PROCCTX_NOIRQ);
++
++	/*
++	 * When we exit from the guest we change a number of CPU configuration
++	 * parameters, such as traps.  Make sure these changes take effect
++	 * before running the host or additional guests.
++	 */
++	isb();
++
++	return ret;
++}
+ 
+ /* Switch to the guest for legacy non-VHE systems */
+ int __hyp_text __kvm_vcpu_run_nvhe(struct kvm_vcpu *vcpu)
+diff --git a/virt/kvm/arm/arm.c b/virt/kvm/arm/arm.c
+index 616f7c6b13b9..32eb9f36112f 100644
+--- a/virt/kvm/arm/arm.c
++++ b/virt/kvm/arm/arm.c
+@@ -764,9 +764,7 @@ int kvm_arch_vcpu_ioctl_run(struct kvm_vcpu *vcpu, struct kvm_run *run)
+ 		guest_enter_irqoff();
+ 
+ 		if (has_vhe()) {
+-			kvm_arm_vhe_guest_enter();
+ 			ret = kvm_vcpu_run_vhe(vcpu);
+-			kvm_arm_vhe_guest_exit();
+ 		} else {
+ 			ret = kvm_call_hyp_ret(__kvm_vcpu_run_nvhe, vcpu);
+ 		}
