@@ -1,0 +1,190 @@
+mm/hmm: allow hmm_range to be used with a mmu_interval_notifier or hmm_mirror
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-326.el8
+commit-author Jason Gunthorpe <jgg@ziepe.ca>
+commit 04ec32fbc2b29a640d67872d2f88daac4c73e45b
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-326.el8/04ec32fb.failed
+
+hmm_mirror's handling of ranges does not use a sequence count which
+results in this bug:
+
+         CPU0                                   CPU1
+                                     hmm_range_wait_until_valid(range)
+                                         valid == true
+                                     hmm_range_fault(range)
+hmm_invalidate_range_start()
+   range->valid = false
+hmm_invalidate_range_end()
+   range->valid = true
+                                     hmm_range_valid(range)
+                                          valid == true
+
+Where the hmm_range_valid() should not have succeeded.
+
+Adding the required sequence count would make it nearly identical to the
+new mmu_interval_notifier. Instead replace the hmm_mirror stuff with
+mmu_interval_notifier.
+
+Co-existence of the two APIs is the first step.
+
+Link: https://lore.kernel.org/r/20191112202231.3856-4-jgg@ziepe.ca
+	Reviewed-by: Jérôme Glisse <jglisse@redhat.com>
+	Tested-by: Philip Yang <Philip.Yang@amd.com>
+	Tested-by: Ralph Campbell <rcampbell@nvidia.com>
+	Reviewed-by: Christoph Hellwig <hch@lst.de>
+	Signed-off-by: Jason Gunthorpe <jgg@mellanox.com>
+(cherry picked from commit 04ec32fbc2b29a640d67872d2f88daac4c73e45b)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	mm/hmm.c
+diff --cc mm/hmm.c
+index e19a0812813a,8d060c5dabe3..000000000000
+--- a/mm/hmm.c
++++ b/mm/hmm.c
+@@@ -997,101 -906,23 +1005,116 @@@ long hmm_range_snapshot(struct hmm_rang
+  	const unsigned long device_vma = VM_IO | VM_PFNMAP | VM_MIXEDMAP;
+  	unsigned long start = range->start, end;
+  	struct hmm_vma_walk hmm_vma_walk;
+- 	struct hmm *hmm = range->hmm;
++ 	struct mm_struct *mm;
+  	struct vm_area_struct *vma;
+++<<<<<<< HEAD
+++=======
++ 	int ret;
++ 
++ 	if (range->notifier)
++ 		mm = range->notifier->mm;
++ 	else
++ 		mm = range->hmm->mmu_notifier.mm;
++ 
++ 	lockdep_assert_held(&mm->mmap_sem);
+++>>>>>>> 04ec32fbc2b2 (mm/hmm: allow hmm_range to be used with a mmu_interval_notifier or hmm_mirror)
+  
+ +	lockdep_assert_held(&hmm->mm->mmap_sem);
+  	do {
+  		/* If range is no longer valid force retry. */
+- 		if (!range->valid)
++ 		if (needs_retry(range))
+  			return -EBUSY;
+  
+++<<<<<<< HEAD
+ +		vma = find_vma(hmm->mm, start);
+++=======
++ 		vma = find_vma(mm, start);
+++>>>>>>> 04ec32fbc2b2 (mm/hmm: allow hmm_range to be used with a mmu_interval_notifier or hmm_mirror)
+ +		if (vma == NULL || (vma->vm_flags & device_vma))
+ +			return -EFAULT;
+ +
+ +		if (is_vm_hugetlb_page(vma)) {
+ +			if (huge_page_shift(hstate_vma(vma)) !=
+ +				    range->page_shift &&
+ +			    range->page_shift != PAGE_SHIFT)
+ +				return -EINVAL;
+ +		} else {
+ +			if (range->page_shift != PAGE_SHIFT)
+ +				return -EINVAL;
+ +		}
+ +
+ +		if (!(vma->vm_flags & VM_READ)) {
+ +			/*
+ +			 * If vma do not allow read access, then assume that it
+ +			 * does not allow write access, either. HMM does not
+ +			 * support architecture that allow write without read.
+ +			 */
+ +			hmm_pfns_clear(range, range->pfns,
+ +				range->start, range->end);
+ +			return -EPERM;
+ +		}
+ +
+ +		range->vma = vma;
+ +		hmm_vma_walk.pgmap = NULL;
+ +		hmm_vma_walk.last = start;
+ +		hmm_vma_walk.fault = false;
+ +		hmm_vma_walk.range = range;
+ +		end = min(range->end, vma->vm_end);
+ +
+ +		walk_page_range(vma->vm_mm, 0, end, &hmm_walk_ops,
+ +				&hmm_vma_walk);
+ +		start = end;
+ +	} while (start < range->end);
+ +
+ +	return (hmm_vma_walk.last - range->start) >> PAGE_SHIFT;
+ +}
+ +EXPORT_SYMBOL(hmm_range_snapshot);
+ +
+ +/*
+ + * hmm_range_fault() - try to fault some address in a virtual address range
+ + * @range: range being faulted
+ + * @block: allow blocking on fault (if true it sleeps and do not drop mmap_sem)
+ + * Return: number of valid pages in range->pfns[] (from range start
+ + *          address). This may be zero. If the return value is negative,
+ + *          then one of the following values may be returned:
+ + *
+ + *           -EINVAL  invalid arguments or mm or virtual address are in an
+ + *                    invalid vma (for instance device file vma).
+ + *           -ENOMEM: Out of memory.
+ + *           -EPERM:  Invalid permission (for instance asking for write and
+ + *                    range is read only).
+ + *           -EAGAIN: If you need to retry and mmap_sem was drop. This can only
+ + *                    happens if block argument is false.
+ + *           -EBUSY:  If the the range is being invalidated and you should wait
+ + *                    for invalidation to finish.
+ + *           -EFAULT: Invalid (ie either no valid vma or it is illegal to access
+ + *                    that range), number of valid pages in range->pfns[] (from
+ + *                    range start address).
+ + *
+ + * This is similar to a regular CPU page fault except that it will not trigger
+ + * any memory migration if the memory being faulted is not accessible by CPUs
+ + * and caller does not ask for migration.
+ + *
+ + * On error, for one virtual address in the range, the function will mark the
+ + * corresponding HMM pfn entry with an error flag.
+ + */
+ +long hmm_range_fault(struct hmm_range *range, bool block)
+ +{
+ +	const unsigned long device_vma = VM_IO | VM_PFNMAP | VM_MIXEDMAP;
+ +	unsigned long start = range->start, end;
+ +	struct hmm_vma_walk hmm_vma_walk;
+ +	struct hmm *hmm = range->hmm;
+ +	struct vm_area_struct *vma;
+ +	int ret;
+ +
+ +	lockdep_assert_held(&hmm->mm->mmap_sem);
+ +
+ +	do {
+ +		/* If range is no longer valid force retry. */
+ +		if (!range->valid)
+ +			return -EBUSY;
+ +
+ +		vma = find_vma(hmm->mm, start);
+  		if (vma == NULL || (vma->vm_flags & device_vma))
+  			return -EFAULT;
+  
+diff --git a/include/linux/hmm.h b/include/linux/hmm.h
+index 6a8157d67186..d7e8a04b9b77 100644
+--- a/include/linux/hmm.h
++++ b/include/linux/hmm.h
+@@ -166,6 +166,9 @@ enum hmm_pfn_value_e {
+ /*
+  * struct hmm_range - track invalidation lock on virtual address range
+  *
++ * @notifier: an optional mmu_interval_notifier
++ * @notifier_seq: when notifier is used this is the result of
++ *                mmu_interval_read_begin()
+  * @hmm: the core HMM structure this range is active against
+  * @vma: the vm area struct for the range
+  * @list: all range lock are on a list
+@@ -181,6 +184,8 @@ enum hmm_pfn_value_e {
+  * @valid: pfns array did not change since it has been fill by an HMM function
+  */
+ struct hmm_range {
++	struct mmu_interval_notifier *notifier;
++	unsigned long		notifier_seq;
+ 	struct hmm		*hmm;
+ 	struct vm_area_struct	*vma;
+ 	struct list_head	list;
+* Unmerged path mm/hmm.c
