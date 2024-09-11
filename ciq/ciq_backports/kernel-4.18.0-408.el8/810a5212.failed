@@ -1,0 +1,258 @@
+x86/hyperv: Add new hvcall guest address host visibility support
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-408.el8
+commit-author Tianyu Lan <Tianyu.Lan@microsoft.com>
+commit 810a521265023a1d5c6c081ea2d216bc63d422f5
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-408.el8/810a5212.failed
+
+Add new hvcall guest address host visibility support to mark
+memory visible to host. Call it inside set_memory_decrypted
+/encrypted(). Add HYPERVISOR feature check in the
+hv_is_isolation_supported() to optimize in non-virtualization
+environment.
+
+	Acked-by: Dave Hansen <dave.hansen@intel.com>
+	Reviewed-by: Michael Kelley <mikelley@microsoft.com>
+	Signed-off-by: Tianyu Lan <Tianyu.Lan@microsoft.com>
+Link: https://lore.kernel.org/r/20211025122116.264793-4-ltykernel@gmail.com
+[ wei: fix conflicts with tip ]
+	Signed-off-by: Wei Liu <wei.liu@kernel.org>
+(cherry picked from commit 810a521265023a1d5c6c081ea2d216bc63d422f5)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/hyperv/Makefile
+#	arch/x86/include/asm/mshyperv.h
+#	arch/x86/mm/pat/set_memory.c
+diff --cc arch/x86/hyperv/Makefile
+index ea66981581b2,5d2de10809ae..000000000000
+--- a/arch/x86/hyperv/Makefile
++++ b/arch/x86/hyperv/Makefile
+@@@ -1,4 -1,5 +1,9 @@@
+++<<<<<<< HEAD
+ +obj-y			:= hv_init.o mmu.o nested.o
+++=======
++ # SPDX-License-Identifier: GPL-2.0-only
++ obj-y			:= hv_init.o mmu.o nested.o irqdomain.o ivm.o
+++>>>>>>> 810a52126502 (x86/hyperv: Add new hvcall guest address host visibility support)
+  obj-$(CONFIG_X86_64)	+= hv_apic.o hv_proc.o
+  
+  ifdef CONFIG_X86_64
+diff --cc arch/x86/include/asm/mshyperv.h
+index 50ff5ae8218d,f3154ca41ac4..000000000000
+--- a/arch/x86/include/asm/mshyperv.h
++++ b/arch/x86/include/asm/mshyperv.h
+@@@ -189,6 -180,19 +189,22 @@@ bool hv_vcpu_is_preempted(int vcpu)
+  static inline void hv_apic_init(void) {}
+  #endif
+  
+++<<<<<<< HEAD
+++=======
++ static inline void hv_set_msi_entry_from_desc(union hv_msi_entry *msi_entry,
++ 					      struct msi_desc *msi_desc)
++ {
++ 	msi_entry->address.as_uint32 = msi_desc->msg.address_lo;
++ 	msi_entry->data.as_uint32 = msi_desc->msg.data;
++ }
++ 
++ struct irq_domain *hv_create_pci_msi_domain(void);
++ 
++ int hv_map_ioapic_interrupt(int ioapic_id, bool level, int vcpu, int vector,
++ 		struct hv_interrupt_entry *entry);
++ int hv_unmap_ioapic_interrupt(int ioapic_id, struct hv_interrupt_entry *entry);
++ int hv_set_mem_host_visibility(unsigned long addr, int numpages, bool visible);
+++>>>>>>> 810a52126502 (x86/hyperv: Add new hvcall guest address host visibility support)
+  #else /* CONFIG_HYPERV */
+  static inline void hyperv_init(void) {}
+  static inline void hyperv_setup_mmu_ops(void) {}
+diff --cc arch/x86/mm/pat/set_memory.c
+index 359c81f55589,934dc5b2df36..000000000000
+--- a/arch/x86/mm/pat/set_memory.c
++++ b/arch/x86/mm/pat/set_memory.c
+@@@ -1945,10 -1992,6 +1951,13 @@@ static int __set_memory_enc_pgtable(uns
+  	struct cpa_data cpa;
+  	int ret;
+  
+++<<<<<<< HEAD
+ +	/* Nothing to do if memory encryption is not active */
+ +	if (!mem_encrypt_active())
+ +		return 0;
+ +
+++=======
+++>>>>>>> 810a52126502 (x86/hyperv: Add new hvcall guest address host visibility support)
+  	/* Should not be working on unaligned addresses */
+  	if (WARN_ONCE(addr & ~PAGE_MASK, "misaligned address: %#lx\n", addr))
+  		addr &= PAGE_MASK;
+* Unmerged path arch/x86/hyperv/Makefile
+diff --git a/arch/x86/hyperv/hv_init.c b/arch/x86/hyperv/hv_init.c
+index a366a7958291..5b78849da254 100644
+--- a/arch/x86/hyperv/hv_init.c
++++ b/arch/x86/hyperv/hv_init.c
+@@ -537,5 +537,11 @@ EXPORT_SYMBOL_GPL(hv_get_isolation_type);
+ 
+ bool hv_is_isolation_supported(void)
+ {
++	if (!cpu_feature_enabled(X86_FEATURE_HYPERVISOR))
++		return false;
++
++	if (!hypervisor_is_type(X86_HYPER_MS_HYPERV))
++		return false;
++
+ 	return hv_get_isolation_type() != HV_ISOLATION_TYPE_NONE;
+ }
+diff --git a/arch/x86/hyperv/ivm.c b/arch/x86/hyperv/ivm.c
+new file mode 100644
+index 000000000000..79e7fb83472a
+--- /dev/null
++++ b/arch/x86/hyperv/ivm.c
+@@ -0,0 +1,105 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * Hyper-V Isolation VM interface with paravisor and hypervisor
++ *
++ * Author:
++ *  Tianyu Lan <Tianyu.Lan@microsoft.com>
++ */
++
++#include <linux/hyperv.h>
++#include <linux/types.h>
++#include <linux/bitfield.h>
++#include <linux/slab.h>
++#include <asm/io.h>
++#include <asm/mshyperv.h>
++
++/*
++ * hv_mark_gpa_visibility - Set pages visible to host via hvcall.
++ *
++ * In Isolation VM, all guest memory is encrypted from host and guest
++ * needs to set memory visible to host via hvcall before sharing memory
++ * with host.
++ */
++static int hv_mark_gpa_visibility(u16 count, const u64 pfn[],
++			   enum hv_mem_host_visibility visibility)
++{
++	struct hv_gpa_range_for_visibility **input_pcpu, *input;
++	u16 pages_processed;
++	u64 hv_status;
++	unsigned long flags;
++
++	/* no-op if partition isolation is not enabled */
++	if (!hv_is_isolation_supported())
++		return 0;
++
++	if (count > HV_MAX_MODIFY_GPA_REP_COUNT) {
++		pr_err("Hyper-V: GPA count:%d exceeds supported:%lu\n", count,
++			HV_MAX_MODIFY_GPA_REP_COUNT);
++		return -EINVAL;
++	}
++
++	local_irq_save(flags);
++	input_pcpu = (struct hv_gpa_range_for_visibility **)
++			this_cpu_ptr(hyperv_pcpu_input_arg);
++	input = *input_pcpu;
++	if (unlikely(!input)) {
++		local_irq_restore(flags);
++		return -EINVAL;
++	}
++
++	input->partition_id = HV_PARTITION_ID_SELF;
++	input->host_visibility = visibility;
++	input->reserved0 = 0;
++	input->reserved1 = 0;
++	memcpy((void *)input->gpa_page_list, pfn, count * sizeof(*pfn));
++	hv_status = hv_do_rep_hypercall(
++			HVCALL_MODIFY_SPARSE_GPA_PAGE_HOST_VISIBILITY, count,
++			0, input, &pages_processed);
++	local_irq_restore(flags);
++
++	if (hv_result_success(hv_status))
++		return 0;
++	else
++		return -EFAULT;
++}
++
++/*
++ * hv_set_mem_host_visibility - Set specified memory visible to host.
++ *
++ * In Isolation VM, all guest memory is encrypted from host and guest
++ * needs to set memory visible to host via hvcall before sharing memory
++ * with host. This function works as wrap of hv_mark_gpa_visibility()
++ * with memory base and size.
++ */
++int hv_set_mem_host_visibility(unsigned long kbuffer, int pagecount, bool visible)
++{
++	enum hv_mem_host_visibility visibility = visible ?
++			VMBUS_PAGE_VISIBLE_READ_WRITE : VMBUS_PAGE_NOT_VISIBLE;
++	u64 *pfn_array;
++	int ret = 0;
++	int i, pfn;
++
++	if (!hv_is_isolation_supported() || !hv_hypercall_pg)
++		return 0;
++
++	pfn_array = kmalloc(HV_HYP_PAGE_SIZE, GFP_KERNEL);
++	if (!pfn_array)
++		return -ENOMEM;
++
++	for (i = 0, pfn = 0; i < pagecount; i++) {
++		pfn_array[pfn] = virt_to_hvpfn((void *)kbuffer + i * HV_HYP_PAGE_SIZE);
++		pfn++;
++
++		if (pfn == HV_MAX_MODIFY_GPA_REP_COUNT || i == pagecount - 1) {
++			ret = hv_mark_gpa_visibility(pfn, pfn_array,
++						     visibility);
++			if (ret)
++				goto err_free_pfn_array;
++			pfn = 0;
++		}
++	}
++
++ err_free_pfn_array:
++	kfree(pfn_array);
++	return ret;
++}
+diff --git a/arch/x86/include/asm/hyperv-tlfs.h b/arch/x86/include/asm/hyperv-tlfs.h
+index 9eb549543030..ca29c7d9c9f2 100644
+--- a/arch/x86/include/asm/hyperv-tlfs.h
++++ b/arch/x86/include/asm/hyperv-tlfs.h
+@@ -276,6 +276,23 @@ enum hv_isolation_type {
+ #define HV_X64_MSR_TIME_REF_COUNT	HV_REGISTER_TIME_REF_COUNT
+ #define HV_X64_MSR_REFERENCE_TSC	HV_REGISTER_REFERENCE_TSC
+ 
++/* Hyper-V memory host visibility */
++enum hv_mem_host_visibility {
++	VMBUS_PAGE_NOT_VISIBLE		= 0,
++	VMBUS_PAGE_VISIBLE_READ_ONLY	= 1,
++	VMBUS_PAGE_VISIBLE_READ_WRITE	= 3
++};
++
++/* HvCallModifySparseGpaPageHostVisibility hypercall */
++#define HV_MAX_MODIFY_GPA_REP_COUNT	((PAGE_SIZE / sizeof(u64)) - 2)
++struct hv_gpa_range_for_visibility {
++	u64 partition_id;
++	u32 host_visibility:2;
++	u32 reserved0:30;
++	u32 reserved1;
++	u64 gpa_page_list[HV_MAX_MODIFY_GPA_REP_COUNT];
++} __packed;
++
+ /*
+  * Declare the MSR used to setup pages used to communicate with the hypervisor.
+  */
+* Unmerged path arch/x86/include/asm/mshyperv.h
+* Unmerged path arch/x86/mm/pat/set_memory.c
+diff --git a/include/asm-generic/hyperv-tlfs.h b/include/asm-generic/hyperv-tlfs.h
+index e87b22c09707..fdce7a4cfc6f 100644
+--- a/include/asm-generic/hyperv-tlfs.h
++++ b/include/asm-generic/hyperv-tlfs.h
+@@ -158,6 +158,7 @@ struct ms_hyperv_tsc_page {
+ #define HVCALL_RETARGET_INTERRUPT		0x007e
+ #define HVCALL_FLUSH_GUEST_PHYSICAL_ADDRESS_SPACE 0x00af
+ #define HVCALL_FLUSH_GUEST_PHYSICAL_ADDRESS_LIST 0x00b0
++#define HVCALL_MODIFY_SPARSE_GPA_PAGE_HOST_VISIBILITY 0x00db
+ 
+ /* Extended hypercalls */
+ #define HV_EXT_CALL_QUERY_CAPABILITIES		0x8001
