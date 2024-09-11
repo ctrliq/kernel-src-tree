@@ -71,15 +71,6 @@ static unsigned int xstate_supervisor_only_offsets[XFEATURE_MAX] = { [ 0 ... XFE
 unsigned int fpu_user_xstate_size;
 
 /*
- * Clear all of the X86_FEATURE_* bits that are unavailable
- * when the CPU has no XSAVE support.
- */
-void fpu__xstate_clear_all_cpu_caps(void)
-{
-	setup_clear_cpu_cap(X86_FEATURE_XSAVE);
-}
-
-/*
  * Return whether the system supports a given xfeature.
  *
  * Also return the name of the (most advanced) feature that the caller requested:
@@ -781,7 +772,7 @@ static void fpu__init_disable_system_xstate(void)
 {
 	xfeatures_mask_all = 0;
 	cr4_clear_bits(X86_CR4_OSXSAVE);
-	fpu__xstate_clear_all_cpu_caps();
+	setup_clear_cpu_cap(X86_FEATURE_XSAVE);
 }
 
 /*
