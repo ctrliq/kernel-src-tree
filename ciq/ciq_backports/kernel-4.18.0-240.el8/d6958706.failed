@@ -1,0 +1,204 @@
+libbpf: Add bpf_link__disconnect() API to preserve underlying BPF resource
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Andrii Nakryiko <andriin@fb.com>
+commit d69587062c347314a019cf6ee27f2e4b494868e1
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/d6958706.failed
+
+There are cases in which BPF resource (program, map, etc) has to outlive
+userspace program that "installed" it in the system in the first place.
+When BPF program is attached, libbpf returns bpf_link object, which
+is supposed to be destroyed after no longer necessary through
+bpf_link__destroy() API. Currently, bpf_link destruction causes both automatic
+detachment and frees up any resources allocated to for bpf_link in-memory
+representation. This is inconvenient for the case described above because of
+coupling of detachment and resource freeing.
+
+This patch introduces bpf_link__disconnect() API call, which marks bpf_link as
+disconnected from its underlying BPF resouces. This means that when bpf_link
+is destroyed later, all its memory resources will be freed, but BPF resource
+itself won't be detached.
+
+This design allows to follow strict and resource-leak-free design by default,
+while giving easy and straightforward way for user code to opt for keeping BPF
+resource attached beyond lifetime of a bpf_link. For some BPF programs (i.e.,
+FS-based tracepoints, kprobes, raw tracepoint, etc), user has to make sure to
+pin BPF program to prevent kernel to automatically detach it on process exit.
+This should typically be achived by pinning BPF program (or map in some cases)
+in BPF FS.
+
+	Signed-off-by: Andrii Nakryiko <andriin@fb.com>
+	Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+	Acked-by: Martin KaFai Lau <kafai@fb.com>
+Link: https://lore.kernel.org/bpf/20191218225039.2668205-1-andriin@fb.com
+(cherry picked from commit d69587062c347314a019cf6ee27f2e4b494868e1)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	tools/lib/bpf/libbpf.c
+#	tools/lib/bpf/libbpf.map
+diff --cc tools/lib/bpf/libbpf.c
+index a22c75b6283d,2a341a5b9f63..000000000000
+--- a/tools/lib/bpf/libbpf.c
++++ b/tools/lib/bpf/libbpf.c
+@@@ -5801,7 -6602,33 +5821,37 @@@ struct bpf_link *bpf_program__attach_tr
+  	return link;
+  }
+  
+++<<<<<<< HEAD
+ +static int bpf_link__destroy_fd(struct bpf_link *link)
+++=======
++ static struct bpf_link *attach_tp(const struct bpf_sec_def *sec,
++ 				  struct bpf_program *prog)
++ {
++ 	char *sec_name, *tp_cat, *tp_name;
++ 	struct bpf_link *link;
++ 
++ 	sec_name = strdup(bpf_program__title(prog, false));
++ 	if (!sec_name)
++ 		return ERR_PTR(-ENOMEM);
++ 
++ 	/* extract "tp/<category>/<name>" */
++ 	tp_cat = sec_name + sec->len;
++ 	tp_name = strchr(tp_cat, '/');
++ 	if (!tp_name) {
++ 		link = ERR_PTR(-EINVAL);
++ 		goto out;
++ 	}
++ 	*tp_name = '\0';
++ 	tp_name++;
++ 
++ 	link = bpf_program__attach_tracepoint(prog, tp_cat, tp_name);
++ out:
++ 	free(sec_name);
++ 	return link;
++ }
++ 
++ static int bpf_link__detach_fd(struct bpf_link *link)
+++>>>>>>> d69587062c34 (libbpf: Add bpf_link__disconnect() API to preserve underlying BPF resource)
+  {
+  	struct bpf_link_fd *l = (void *)link;
+  
+@@@ -5840,6 -6667,62 +5890,65 @@@ struct bpf_link *bpf_program__attach_ra
+  	return (struct bpf_link *)link;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static struct bpf_link *attach_raw_tp(const struct bpf_sec_def *sec,
++ 				      struct bpf_program *prog)
++ {
++ 	const char *tp_name = bpf_program__title(prog, false) + sec->len;
++ 
++ 	return bpf_program__attach_raw_tracepoint(prog, tp_name);
++ }
++ 
++ struct bpf_link *bpf_program__attach_trace(struct bpf_program *prog)
++ {
++ 	char errmsg[STRERR_BUFSIZE];
++ 	struct bpf_link_fd *link;
++ 	int prog_fd, pfd;
++ 
++ 	prog_fd = bpf_program__fd(prog);
++ 	if (prog_fd < 0) {
++ 		pr_warn("program '%s': can't attach before loaded\n",
++ 			bpf_program__title(prog, false));
++ 		return ERR_PTR(-EINVAL);
++ 	}
++ 
++ 	link = calloc(1, sizeof(*link));
++ 	if (!link)
++ 		return ERR_PTR(-ENOMEM);
++ 	link->link.detach = &bpf_link__detach_fd;
++ 
++ 	pfd = bpf_raw_tracepoint_open(NULL, prog_fd);
++ 	if (pfd < 0) {
++ 		pfd = -errno;
++ 		free(link);
++ 		pr_warn("program '%s': failed to attach to trace: %s\n",
++ 			bpf_program__title(prog, false),
++ 			libbpf_strerror_r(pfd, errmsg, sizeof(errmsg)));
++ 		return ERR_PTR(pfd);
++ 	}
++ 	link->fd = pfd;
++ 	return (struct bpf_link *)link;
++ }
++ 
++ static struct bpf_link *attach_trace(const struct bpf_sec_def *sec,
++ 				     struct bpf_program *prog)
++ {
++ 	return bpf_program__attach_trace(prog);
++ }
++ 
++ struct bpf_link *bpf_program__attach(struct bpf_program *prog)
++ {
++ 	const struct bpf_sec_def *sec_def;
++ 
++ 	sec_def = find_sec_def(bpf_program__title(prog, false));
++ 	if (!sec_def || !sec_def->attach_fn)
++ 		return ERR_PTR(-ESRCH);
++ 
++ 	return sec_def->attach_fn(sec_def, prog);
++ }
++ 
+++>>>>>>> d69587062c34 (libbpf: Add bpf_link__disconnect() API to preserve underlying BPF resource)
+  enum bpf_perf_event_ret
+  bpf_perf_event_read_simple(void *mmap_mem, size_t mmap_size, size_t page_size,
+  			   void **copy_mem, size_t *copy_size,
+diff --cc tools/lib/bpf/libbpf.map
+index 3ca7228af37e,e3a471f38a71..000000000000
+--- a/tools/lib/bpf/libbpf.map
++++ b/tools/lib/bpf/libbpf.map
+@@@ -188,9 -197,29 +188,30 @@@ LIBBPF_0.0.4 
+  		bpf_map__get_pin_path;
+  		bpf_map__is_pinned;
+  		bpf_map__set_pin_path;
+ -		bpf_object__open_file;
+ -		bpf_object__open_mem;
+ -		bpf_program__attach_trace;
+  		bpf_program__get_expected_attach_type;
+  		bpf_program__get_type;
+ -		bpf_program__is_tracing;
+ -		bpf_program__set_tracing;
+ +		bpf_get_link_xdp_info;
+  		bpf_program__size;
+++<<<<<<< HEAD
+ +		bpf_btf_get_next_id;
+ +} LIBBPF_0.0.3;
+++=======
++ 		btf__find_by_name_kind;
++ 		libbpf_find_vmlinux_btf_id;
++ } LIBBPF_0.0.5;
++ 
++ LIBBPF_0.0.7 {
++ 	global:
++ 		btf_dump__emit_type_decl;
++ 		bpf_link__disconnect;
++ 		bpf_object__find_program_by_name;
++ 		bpf_object__attach_skeleton;
++ 		bpf_object__destroy_skeleton;
++ 		bpf_object__detach_skeleton;
++ 		bpf_object__load_skeleton;
++ 		bpf_object__open_skeleton;
++ 		bpf_program__attach;
++ 		bpf_program__name;
++ 		btf__align_of;
++ } LIBBPF_0.0.6;
+++>>>>>>> d69587062c34 (libbpf: Add bpf_link__disconnect() API to preserve underlying BPF resource)
+* Unmerged path tools/lib/bpf/libbpf.c
+diff --git a/tools/lib/bpf/libbpf.h b/tools/lib/bpf/libbpf.h
+index e454ceec9fa2..42aa381504b5 100644
+--- a/tools/lib/bpf/libbpf.h
++++ b/tools/lib/bpf/libbpf.h
+@@ -203,6 +203,7 @@ LIBBPF_API void bpf_program__unload(struct bpf_program *prog);
+ 
+ struct bpf_link;
+ 
++LIBBPF_API void bpf_link__disconnect(struct bpf_link *link);
+ LIBBPF_API int bpf_link__destroy(struct bpf_link *link);
+ 
+ LIBBPF_API struct bpf_link *
+* Unmerged path tools/lib/bpf/libbpf.map
