@@ -1,0 +1,150 @@
+mptcp: fix possible divide by zero
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-348.el8
+commit-author Paolo Abeni <pabeni@redhat.com>
+commit 1094c6fe7280e17e0e87934add5ad2585e990def
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-348.el8/1094c6fe.failed
+
+Florian noted that if mptcp_alloc_tx_skb() allocation fails
+in __mptcp_push_pending(), we can end-up invoking
+mptcp_push_release()/tcp_push() with a zero mss, causing
+a divide by 0 error.
+
+This change addresses the issue refactoring the skb allocation
+code checking if skb collapsing will happen for sure and doing
+the skb allocation only after such check. Skb allocation will
+now happen only after the call to tcp_send_mss() which
+correctly initializes mss_now.
+
+As side bonuses we now fill the skb tx cache only when needed,
+and this also clean-up a bit the output path.
+
+v1 -> v2:
+ - use lockdep_assert_held_once() - Jakub
+ - fix indentation - Jakub
+
+	Reported-by: Florian Westphal <fw@strlen.de>
+Fixes: 724cfd2ee8aa ("mptcp: allocate TX skbs in msk context")
+	Signed-off-by: Paolo Abeni <pabeni@redhat.com>
+	Signed-off-by: Mat Martineau <mathew.j.martineau@linux.intel.com>
+	Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+(cherry picked from commit 1094c6fe7280e17e0e87934add5ad2585e990def)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/mptcp/protocol.c
+diff --cc net/mptcp/protocol.c
+index 899fb4cb6b82,a4c6e37e07c9..000000000000
+--- a/net/mptcp/protocol.c
++++ b/net/mptcp/protocol.c
+@@@ -1072,16 -1096,16 +1079,12 @@@ static void __mptcp_clean_una(struct so
+  		cleaned = true;
+  	}
+  
+ -	/* all retransmitted data acked, recovery completed */
+ -	if (unlikely(msk->recovery) && after64(msk->snd_una, msk->recovery_snd_nxt))
+ -		msk->recovery = false;
+ -
+  out:
+- 	if (cleaned) {
+- 		if (tcp_under_memory_pressure(sk)) {
+- 			__mptcp_update_wmem(sk);
+- 			sk_mem_reclaim_partial(sk);
+- 		}
+- 	}
++ 	if (cleaned && tcp_under_memory_pressure(sk))
++ 		__mptcp_mem_reclaim_partial(sk);
+  
+ -	if (snd_una == READ_ONCE(msk->snd_nxt) && !msk->recovery) {
+ -		if (mptcp_timer_pending(sk) && !mptcp_data_fin_enabled(msk))
+ +	if (snd_una == READ_ONCE(msk->snd_nxt)) {
+ +		if (msk->timer_ival && !mptcp_data_fin_enabled(msk))
+  			mptcp_stop_timer(sk);
+  	} else {
+  		mptcp_reset_timer(sk);
+@@@ -1229,19 -1254,31 +1233,19 @@@ static bool __mptcp_alloc_tx_skb(struc
+  	return false;
+  }
+  
+- static bool mptcp_must_reclaim_memory(struct sock *sk, struct sock *ssk)
++ static bool mptcp_alloc_tx_skb(struct sock *sk, struct sock *ssk, bool data_lock_held)
+  {
+- 	return !ssk->sk_tx_skb_cache &&
+- 	       tcp_under_memory_pressure(sk);
+- }
++ 	gfp_t gfp = data_lock_held ? GFP_ATOMIC : sk->sk_allocation;
+  
+- static bool mptcp_alloc_tx_skb(struct sock *sk, struct sock *ssk)
+- {
+- 	if (unlikely(mptcp_must_reclaim_memory(sk, ssk)))
+- 		mptcp_mem_reclaim_partial(sk);
+- 	return __mptcp_alloc_tx_skb(sk, ssk, sk->sk_allocation);
++ 	if (unlikely(tcp_under_memory_pressure(sk))) {
++ 		if (data_lock_held)
++ 			__mptcp_mem_reclaim_partial(sk);
++ 		else
++ 			mptcp_mem_reclaim_partial(sk);
++ 	}
++ 	return __mptcp_alloc_tx_skb(sk, ssk, gfp);
+  }
+  
+ -/* note: this always recompute the csum on the whole skb, even
+ - * if we just appended a single frag. More status info needed
+ - */
+ -static void mptcp_update_data_checksum(struct sk_buff *skb, int added)
+ -{
+ -	struct mptcp_ext *mpext = mptcp_get_ext(skb);
+ -	__wsum csum = ~csum_unfold(mpext->csum);
+ -	int offset = skb->len - added;
+ -
+ -	mpext->csum = csum_fold(csum_block_add(csum, skb_checksum(skb, offset, added, 0), offset));
+ -}
+ -
+  static int mptcp_sendmsg_frag(struct sock *sk, struct sock *ssk,
+  			      struct mptcp_data_frag *dfrag,
+  			      struct mptcp_sendmsg_info *info)
+@@@ -1455,18 -1534,13 +1466,9 @@@ static void __mptcp_push_pending(struc
+  			if (!ssk)
+  				goto out;
+  
+ -			/* Need to lock the new subflow only if different
+ -			 * from the previous one, otherwise we are still
+ -			 * helding the relevant lock
+ -			 */
+ -			if (ssk != prev_ssk)
+ +			if (ssk != prev_ssk || !prev_ssk)
+  				lock_sock(ssk);
+  
+- 			/* keep it simple and always provide a new skb for the
+- 			 * subflow, even if we will not use it when collapsing
+- 			 * on the pending one
+- 			 */
+- 			if (!mptcp_alloc_tx_skb(sk, ssk)) {
+- 				mptcp_push_release(sk, ssk, &info);
+- 				goto out;
+- 			}
+- 
+  			ret = mptcp_sendmsg_frag(sk, ssk, dfrag, &info);
+  			if (ret <= 0) {
+  				mptcp_push_release(sk, ssk, &info);
+@@@ -2284,11 -2404,8 +2281,16 @@@ static void __mptcp_retrans(struct soc
+  
+  	/* limit retransmission to the bytes already sent on some subflows */
+  	info.sent = 0;
+++<<<<<<< HEAD
+ +	info.limit = dfrag->already_sent;
+ +	while (info.sent < dfrag->already_sent) {
+ +		if (!mptcp_alloc_tx_skb(sk, ssk))
+ +			break;
+ +
+++=======
++ 	info.limit = READ_ONCE(msk->csum_enabled) ? dfrag->data_len : dfrag->already_sent;
++ 	while (info.sent < info.limit) {
+++>>>>>>> 1094c6fe7280 (mptcp: fix possible divide by zero)
+  		ret = mptcp_sendmsg_frag(sk, ssk, dfrag, &info);
+  		if (ret <= 0)
+  			break;
+* Unmerged path net/mptcp/protocol.c
