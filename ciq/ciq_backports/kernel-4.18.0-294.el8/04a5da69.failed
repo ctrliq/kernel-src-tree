@@ -1,0 +1,286 @@
+NFSv4.2: define limits and sizes for user xattr handling
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Frank van der Linden <fllinden@amazon.com>
+commit 04a5da690e8f2da23c2ac940f2921e3aa622db82
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/04a5da69.failed
+
+Set limits for extended attributes (attribute value size and listxattr
+buffer size), based on the fs-independent limits (XATTR_*_MAX).
+
+Define the maximum XDR sizes for the RFC 8276 XATTR operations.
+In the case of operations that carry a larger payload (SETXATTR,
+GETXATTR, LISTXATTR), these exclude that payload, which is added
+as separate pages, like other operations do.
+
+Define, much like for read and write operations, the maximum overhead
+sizes for get/set/listxattr, and use them to limit the maximum payload
+size for those operations, in combination with the channel attributes.
+
+	Signed-off-by: Frank van der Linden <fllinden@amazon.com>
+	Signed-off-by: Trond Myklebust <trond.myklebust@hammerspace.com>
+(cherry picked from commit 04a5da690e8f2da23c2ac940f2921e3aa622db82)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/nfs/nfs42.h
+diff --cc fs/nfs/nfs42.h
+index 901cca7542f9,51de8ddc7d88..000000000000
+--- a/fs/nfs/nfs42.h
++++ b/fs/nfs/nfs42.h
+@@@ -23,5 -27,30 +25,26 @@@ int nfs42_proc_clone(struct file *, str
+  int nfs42_proc_layouterror(struct pnfs_layout_segment *lseg,
+  			   const struct nfs42_layout_error *errors,
+  			   size_t n);
+ -int nfs42_proc_copy_notify(struct file *, struct file *,
+ -			   struct nfs42_copy_notify_res *);
+ -static inline bool nfs42_files_from_same_server(struct file *in,
+ -						struct file *out)
+ -{
+ -	struct nfs_client *c_in = (NFS_SERVER(file_inode(in)))->nfs_client;
+ -	struct nfs_client *c_out = (NFS_SERVER(file_inode(out)))->nfs_client;
+  
+++<<<<<<< HEAD
+++=======
++ 	return nfs4_check_serverowner_major_id(c_in->cl_serverowner,
++ 					       c_out->cl_serverowner);
++ }
++ 
++ /*
++  * Maximum XDR buffer size needed for a listxattr buffer of buflen size.
++  *
++  * The upper boundary is a buffer with all 1-byte sized attribute names.
++  * They would be 7 bytes long in the eventual buffer ("user.x\0"), and
++  * 8 bytes long XDR-encoded.
++  *
++  * Include the trailing eof word as well.
++  */
++ static inline u32 nfs42_listxattr_xdrsize(u32 buflen)
++ {
++ 	return ((buflen / (XATTR_USER_PREFIX_LEN + 2)) * 8) + 4;
++ }
++ #endif /* CONFIG_NFS_V4_2 */
+++>>>>>>> 04a5da690e8f (NFSv4.2: define limits and sizes for user xattr handling)
+  #endif /* __LINUX_FS_NFS_NFS4_2_H */
+diff --git a/fs/nfs/client.c b/fs/nfs/client.c
+index 1c6787d82fc3..6927c3ab088f 100644
+--- a/fs/nfs/client.c
++++ b/fs/nfs/client.c
+@@ -54,6 +54,7 @@
+ #include "nfs.h"
+ #include "netns.h"
+ #include "sysfs.h"
++#include "nfs42.h"
+ 
+ #define NFSDBG_FACILITY		NFSDBG_CLIENT
+ 
+@@ -749,7 +750,7 @@ static int nfs_init_server(struct nfs_server *server,
+ static void nfs_server_set_fsinfo(struct nfs_server *server,
+ 				  struct nfs_fsinfo *fsinfo)
+ {
+-	unsigned long max_rpc_payload;
++	unsigned long max_rpc_payload, raw_max_rpc_payload;
+ 
+ 	/* Work out a lot of parameters */
+ 	if (server->rsize == 0)
+@@ -762,7 +763,9 @@ static void nfs_server_set_fsinfo(struct nfs_server *server,
+ 	if (fsinfo->wtmax >= 512 && server->wsize > fsinfo->wtmax)
+ 		server->wsize = nfs_block_size(fsinfo->wtmax, NULL);
+ 
+-	max_rpc_payload = nfs_block_size(rpc_max_payload(server->client), NULL);
++	raw_max_rpc_payload = rpc_max_payload(server->client);
++	max_rpc_payload = nfs_block_size(raw_max_rpc_payload, NULL);
++
+ 	if (server->rsize > max_rpc_payload)
+ 		server->rsize = max_rpc_payload;
+ 	if (server->rsize > NFS_MAX_FILE_IO_SIZE)
+@@ -795,6 +798,18 @@ static void nfs_server_set_fsinfo(struct nfs_server *server,
+ 	server->clone_blksize = fsinfo->clone_blksize;
+ 	/* We're airborne Set socket buffersize */
+ 	rpc_setbufsize(server->client, server->wsize + 100, server->rsize + 100);
++
++#ifdef CONFIG_NFS_V4_2
++	/*
++	 * Defaults until limited by the session parameters.
++	 */
++	server->gxasize = min_t(unsigned int, raw_max_rpc_payload,
++				XATTR_SIZE_MAX);
++	server->sxasize = min_t(unsigned int, raw_max_rpc_payload,
++				XATTR_SIZE_MAX);
++	server->lxasize = min_t(unsigned int, raw_max_rpc_payload,
++				nfs42_listxattr_xdrsize(XATTR_LIST_MAX));
++#endif
+ }
+ 
+ /*
+* Unmerged path fs/nfs/nfs42.h
+diff --git a/fs/nfs/nfs42xdr.c b/fs/nfs/nfs42xdr.c
+index aed865a84629..2e2d5e09d49f 100644
+--- a/fs/nfs/nfs42xdr.c
++++ b/fs/nfs/nfs42xdr.c
+@@ -150,6 +150,80 @@
+ 					 decode_clone_maxsz + \
+ 					 decode_getattr_maxsz)
+ 
++#ifdef CONFIG_NFS_V4_2
++/* Not limited by NFS itself, limited by the generic xattr code */
++#define nfs4_xattr_name_maxsz   XDR_QUADLEN(XATTR_NAME_MAX)
++
++#define encode_getxattr_maxsz   (op_encode_hdr_maxsz + 1 + \
++				 nfs4_xattr_name_maxsz)
++#define decode_getxattr_maxsz   (op_decode_hdr_maxsz + 1 + 1)
++#define encode_setxattr_maxsz   (op_encode_hdr_maxsz + \
++				 1 + nfs4_xattr_name_maxsz + 1)
++#define decode_setxattr_maxsz   (op_decode_hdr_maxsz + decode_change_info_maxsz)
++#define encode_listxattrs_maxsz  (op_encode_hdr_maxsz + 2 + 1)
++#define decode_listxattrs_maxsz  (op_decode_hdr_maxsz + 2 + 1 + 1)
++#define encode_removexattr_maxsz (op_encode_hdr_maxsz + 1 + \
++				  nfs4_xattr_name_maxsz)
++#define decode_removexattr_maxsz (op_decode_hdr_maxsz + \
++				  decode_change_info_maxsz)
++
++#define NFS4_enc_getxattr_sz	(compound_encode_hdr_maxsz + \
++				encode_sequence_maxsz + \
++				encode_putfh_maxsz + \
++				encode_getxattr_maxsz)
++#define NFS4_dec_getxattr_sz	(compound_decode_hdr_maxsz + \
++				decode_sequence_maxsz + \
++				decode_putfh_maxsz + \
++				decode_getxattr_maxsz)
++#define NFS4_enc_setxattr_sz	(compound_encode_hdr_maxsz + \
++				encode_sequence_maxsz + \
++				encode_putfh_maxsz + \
++				encode_setxattr_maxsz)
++#define NFS4_dec_setxattr_sz	(compound_decode_hdr_maxsz + \
++				decode_sequence_maxsz + \
++				decode_putfh_maxsz + \
++				decode_setxattr_maxsz)
++#define NFS4_enc_listxattrs_sz	(compound_encode_hdr_maxsz + \
++				encode_sequence_maxsz + \
++				encode_putfh_maxsz + \
++				encode_listxattrs_maxsz)
++#define NFS4_dec_listxattrs_sz	(compound_decode_hdr_maxsz + \
++				decode_sequence_maxsz + \
++				decode_putfh_maxsz + \
++				decode_listxattrs_maxsz)
++#define NFS4_enc_removexattr_sz	(compound_encode_hdr_maxsz + \
++				encode_sequence_maxsz + \
++				encode_putfh_maxsz + \
++				encode_removexattr_maxsz)
++#define NFS4_dec_removexattr_sz	(compound_decode_hdr_maxsz + \
++				decode_sequence_maxsz + \
++				decode_putfh_maxsz + \
++				decode_removexattr_maxsz)
++
++/*
++ * These values specify the maximum amount of data that is not
++ * associated with the extended attribute name or extended
++ * attribute list in the SETXATTR, GETXATTR and LISTXATTR
++ * respectively.
++ */
++const u32 nfs42_maxsetxattr_overhead = ((RPC_MAX_HEADER_WITH_AUTH +
++					compound_encode_hdr_maxsz +
++					encode_sequence_maxsz +
++					encode_putfh_maxsz + 1 +
++					nfs4_xattr_name_maxsz)
++					* XDR_UNIT);
++
++const u32 nfs42_maxgetxattr_overhead = ((RPC_MAX_HEADER_WITH_AUTH +
++					compound_decode_hdr_maxsz +
++					decode_sequence_maxsz +
++					decode_putfh_maxsz + 1) * XDR_UNIT);
++
++const u32 nfs42_maxlistxattrs_overhead = ((RPC_MAX_HEADER_WITH_AUTH +
++					compound_decode_hdr_maxsz +
++					decode_sequence_maxsz +
++					decode_putfh_maxsz + 3) * XDR_UNIT);
++#endif
++
+ static void encode_fallocate(struct xdr_stream *xdr,
+ 			     const struct nfs42_falloc_args *args)
+ {
+diff --git a/fs/nfs/nfs4_fs.h b/fs/nfs/nfs4_fs.h
+index cacd477891c1..3678b4b8dbcc 100644
+--- a/fs/nfs/nfs4_fs.h
++++ b/fs/nfs/nfs4_fs.h
+@@ -547,6 +547,12 @@ static inline void nfs4_unregister_sysctl(void)
+ /* nfs4xdr.c */
+ extern const struct rpc_procinfo nfs4_procedures[];
+ 
++#ifdef CONFIG_NFS_V4_2
++extern const u32 nfs42_maxsetxattr_overhead;
++extern const u32 nfs42_maxgetxattr_overhead;
++extern const u32 nfs42_maxlistxattrs_overhead;
++#endif
++
+ struct nfs4_mount_data;
+ 
+ /* callback_xdr.c */
+diff --git a/fs/nfs/nfs4client.c b/fs/nfs/nfs4client.c
+index 8e928f9e596a..7b84fc6f8eba 100644
+--- a/fs/nfs/nfs4client.c
++++ b/fs/nfs/nfs4client.c
+@@ -991,6 +991,36 @@ static void nfs4_session_limit_rwsize(struct nfs_server *server)
+ #endif /* CONFIG_NFS_V4_1 */
+ }
+ 
++/*
++ * Limit xattr sizes using the channel attributes.
++ */
++static void nfs4_session_limit_xasize(struct nfs_server *server)
++{
++#ifdef CONFIG_NFS_V4_2
++	struct nfs4_session *sess;
++	u32 server_gxa_sz;
++	u32 server_sxa_sz;
++	u32 server_lxa_sz;
++
++	if (!nfs4_has_session(server->nfs_client))
++		return;
++
++	sess = server->nfs_client->cl_session;
++
++	server_gxa_sz = sess->fc_attrs.max_resp_sz - nfs42_maxgetxattr_overhead;
++	server_sxa_sz = sess->fc_attrs.max_rqst_sz - nfs42_maxsetxattr_overhead;
++	server_lxa_sz = sess->fc_attrs.max_resp_sz -
++	    nfs42_maxlistxattrs_overhead;
++
++	if (server->gxasize > server_gxa_sz)
++		server->gxasize = server_gxa_sz;
++	if (server->sxasize > server_sxa_sz)
++		server->sxasize = server_sxa_sz;
++	if (server->lxasize > server_lxa_sz)
++		server->lxasize = server_lxa_sz;
++#endif
++}
++
+ static int nfs4_server_common_setup(struct nfs_server *server,
+ 		struct nfs_fh *mntfh, bool auth_probe)
+ {
+@@ -1038,6 +1068,7 @@ static int nfs4_server_common_setup(struct nfs_server *server,
+ 		goto out;
+ 
+ 	nfs4_session_limit_rwsize(server);
++	nfs4_session_limit_xasize(server);
+ 
+ 	if (server->namelen == 0 || server->namelen > NFS4_MAXNAMLEN)
+ 		server->namelen = NFS4_MAXNAMLEN;
+diff --git a/include/linux/nfs_fs_sb.h b/include/linux/nfs_fs_sb.h
+index df61ff8981e8..475cb91e85c8 100644
+--- a/include/linux/nfs_fs_sb.h
++++ b/include/linux/nfs_fs_sb.h
+@@ -162,6 +162,11 @@ struct nfs_server {
+ 	unsigned int		dtsize;		/* readdir size */
+ 	unsigned short		port;		/* "port=" setting */
+ 	unsigned int		bsize;		/* server block size */
++#ifdef CONFIG_NFS_V4_2
++	unsigned int		gxasize;	/* getxattr size */
++	unsigned int		sxasize;	/* setxattr size */
++	unsigned int		lxasize;	/* listxattr size */
++#endif
+ 	unsigned int		acregmin;	/* attr cache timeouts */
+ 	unsigned int		acregmax;
+ 	unsigned int		acdirmin;
