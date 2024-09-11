@@ -1,0 +1,514 @@
+mptcp: refine MPTCP-level ack scheduling
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Paolo Abeni <pabeni@redhat.com>
+commit ea4ca586b16ff2eb6157fe13969eb72d2403a3a1
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/ea4ca586.failed
+
+Send timely MPTCP-level ack is somewhat difficult when
+the insertion into the msk receive level is performed
+by the worker.
+
+It needs TCP-level dup-ack to notify the MPTCP-level
+ack_seq increase, as both the TCP-level ack seq and the
+rcv window are unchanged.
+
+We can actually avoid processing incoming data with the
+worker, and let the subflow or recevmsg() send ack as needed.
+
+When recvmsg() moves the skbs inside the msk receive queue,
+the msk space is still unchanged, so tcp_cleanup_rbuf() could
+end-up skipping TCP-level ack generation. Anyway, when
+__mptcp_move_skbs() is invoked, a known amount of bytes is
+going to be consumed soon: we update rcv wnd computation taking
+them in account.
+
+Additionally we need to explicitly trigger tcp_cleanup_rbuf()
+when recvmsg() consumes a significant amount of the receive buffer.
+
+	Signed-off-by: Paolo Abeni <pabeni@redhat.com>
+	Signed-off-by: Mat Martineau <mathew.j.martineau@linux.intel.com>
+	Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+(cherry picked from commit ea4ca586b16ff2eb6157fe13969eb72d2403a3a1)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/mptcp/protocol.c
+#	net/mptcp/protocol.h
+#	net/mptcp/subflow.c
+diff --cc net/mptcp/protocol.c
+index 75ee5f9fd199,4b7794835fea..000000000000
+--- a/net/mptcp/protocol.c
++++ b/net/mptcp/protocol.c
+@@@ -262,7 -407,46 +262,50 @@@ static void mptcp_set_timeout(const str
+  	mptcp_sk(sk)->timer_ival = tout > 0 ? tout : TCP_RTO_MIN;
+  }
+  
+++<<<<<<< HEAD
+ +static void mptcp_check_data_fin(struct sock *sk)
+++=======
++ static bool mptcp_subflow_active(struct mptcp_subflow_context *subflow)
++ {
++ 	struct sock *ssk = mptcp_subflow_tcp_sock(subflow);
++ 
++ 	/* can't send if JOIN hasn't completed yet (i.e. is usable for mptcp) */
++ 	if (subflow->request_join && !subflow->fully_established)
++ 		return false;
++ 
++ 	/* only send if our side has not closed yet */
++ 	return ((1 << ssk->sk_state) & (TCPF_ESTABLISHED | TCPF_CLOSE_WAIT));
++ }
++ 
++ static void mptcp_send_ack(struct mptcp_sock *msk, bool force)
++ {
++ 	struct mptcp_subflow_context *subflow;
++ 	struct sock *pick = NULL;
++ 
++ 	mptcp_for_each_subflow(msk, subflow) {
++ 		struct sock *ssk = mptcp_subflow_tcp_sock(subflow);
++ 
++ 		if (force) {
++ 			lock_sock(ssk);
++ 			tcp_send_ack(ssk);
++ 			release_sock(ssk);
++ 			continue;
++ 		}
++ 
++ 		/* if the hintes ssk is still active, use it */
++ 		pick = ssk;
++ 		if (ssk == msk->ack_hint)
++ 			break;
++ 	}
++ 	if (!force && pick) {
++ 		lock_sock(pick);
++ 		tcp_cleanup_rbuf(pick, 1);
++ 		release_sock(pick);
++ 	}
++ }
++ 
++ static bool mptcp_check_data_fin(struct sock *sk)
+++>>>>>>> ea4ca586b16f (mptcp: refine MPTCP-level ack scheduling)
+  {
+  	struct mptcp_sock *msk = mptcp_sk(sk);
+  	u64 rcv_data_fin_seq;
+@@@ -310,23 -492,12 +353,28 @@@
+  			break;
+  		}
+  
+ -		ret = true;
+  		mptcp_set_timeout(sk, NULL);
+++<<<<<<< HEAD
+ +		mptcp_for_each_subflow(msk, subflow) {
+ +			struct sock *ssk = mptcp_subflow_tcp_sock(subflow);
+ +
+ +			lock_sock(ssk);
+ +			tcp_send_ack(ssk);
+ +			release_sock(ssk);
+ +		}
+ +
+ +		sk->sk_state_change(sk);
+ +
+ +		if (sk->sk_shutdown == SHUTDOWN_MASK ||
+ +		    sk->sk_state == TCP_CLOSE)
+ +			sk_wake_async(sk, SOCK_WAKE_WAITD, POLL_HUP);
+ +		else
+ +			sk_wake_async(sk, SOCK_WAKE_WAITD, POLL_IN);
+++=======
++ 		mptcp_send_ack(msk, true);
++ 		mptcp_close_wake_up(sk);
+++>>>>>>> ea4ca586b16f (mptcp: refine MPTCP-level ack scheduling)
+  	}
+ -	return ret;
+  }
+  
+  static bool __mptcp_move_skbs_from_subflow(struct mptcp_sock *msk,
+@@@ -409,19 -588,53 +457,24 @@@
+  			break;
+  		}
+  	} while (more_data_avail);
++ 	msk->ack_hint = ssk;
+  
+ -	*bytes += moved;
+ -	return done;
+ -}
+ -
+ -static bool mptcp_ofo_queue(struct mptcp_sock *msk)
+ -{
+ -	struct sock *sk = (struct sock *)msk;
+ -	struct sk_buff *skb, *tail;
+ -	bool moved = false;
+ -	struct rb_node *p;
+ -	u64 end_seq;
+ -
+ -	p = rb_first(&msk->out_of_order_queue);
+ -	pr_debug("msk=%p empty=%d", msk, RB_EMPTY_ROOT(&msk->out_of_order_queue));
+ -	while (p) {
+ -		skb = rb_to_skb(p);
+ -		if (after64(MPTCP_SKB_CB(skb)->map_seq, msk->ack_seq))
+ -			break;
+ -
+ -		p = rb_next(p);
+ -		rb_erase(&skb->rbnode, &msk->out_of_order_queue);
+++<<<<<<< HEAD
+ +	*bytes = moved;
+  
+ -		if (unlikely(!after64(MPTCP_SKB_CB(skb)->end_seq,
+ -				      msk->ack_seq))) {
+ -			mptcp_drop(sk, skb);
+ -			MPTCP_INC_STATS(sock_net(sk), MPTCP_MIB_DUPDATA);
+ -			continue;
+ -		}
+ +	/* If the moves have caught up with the DATA_FIN sequence number
+ +	 * it's time to ack the DATA_FIN and change socket state, but
+ +	 * this is not a good place to change state. Let the workqueue
+ +	 * do it.
+ +	 */
+ +	if (mptcp_pending_data_fin(sk, NULL) &&
+ +	    schedule_work(&msk->work))
+ +		sock_hold(sk);
+  
+ -		end_seq = MPTCP_SKB_CB(skb)->end_seq;
+ -		tail = skb_peek_tail(&sk->sk_receive_queue);
+ -		if (!tail || !mptcp_ooo_try_coalesce(msk, tail, skb)) {
+ -			int delta = msk->ack_seq - MPTCP_SKB_CB(skb)->map_seq;
+ -
+ -			/* skip overlapping data, if any */
+ -			pr_debug("uncoalesced seq=%llx ack seq=%llx delta=%d",
+ -				 MPTCP_SKB_CB(skb)->map_seq, msk->ack_seq,
+ -				 delta);
+ -			MPTCP_SKB_CB(skb)->offset += delta;
+ -			__skb_queue_tail(&sk->sk_receive_queue, skb);
+ -		}
+ -		msk->ack_seq = end_seq;
+ -		moved = true;
+ -	}
+ -	return moved;
+++=======
+++	*bytes += moved;
+++>>>>>>> ea4ca586b16f (mptcp: refine MPTCP-level ack scheduling)
+ +	return done;
+  }
+  
+  /* In most cases we will be able to lock the mptcp socket.  If its already
+@@@ -449,33 -672,36 +502,27 @@@ static bool move_skbs_to_msk(struct mpt
+  
+  void mptcp_data_ready(struct sock *sk, struct sock *ssk)
+  {
+ -	struct mptcp_subflow_context *subflow = mptcp_subflow_ctx(ssk);
+  	struct mptcp_sock *msk = mptcp_sk(sk);
+ -	int sk_rbuf, ssk_rbuf;
+ -	bool wake;
+  
+ -	/* move_skbs_to_msk below can legitly clear the data_avail flag,
+ -	 * but we will need later to properly woke the reader, cache its
+ -	 * value
+ -	 */
+ -	wake = subflow->data_avail == MPTCP_SUBFLOW_DATA_AVAIL;
+ -	if (wake)
+ -		set_bit(MPTCP_DATA_READY, &msk->flags);
+ -
+ -	ssk_rbuf = READ_ONCE(ssk->sk_rcvbuf);
+ -	sk_rbuf = READ_ONCE(sk->sk_rcvbuf);
+ -	if (unlikely(ssk_rbuf > sk_rbuf))
+ -		sk_rbuf = ssk_rbuf;
+ +	set_bit(MPTCP_DATA_READY, &msk->flags);
+  
+ -	/* over limit? can't append more skbs to msk */
+ -	if (atomic_read(&sk->sk_rmem_alloc) > sk_rbuf)
+ +	if (atomic_read(&sk->sk_rmem_alloc) < READ_ONCE(sk->sk_rcvbuf) &&
+ +	    move_skbs_to_msk(msk, ssk))
+  		goto wake;
+  
+++<<<<<<< HEAD
+ +	/* don't schedule if mptcp sk is (still) over limit */
+ +	if (atomic_read(&sk->sk_rmem_alloc) > READ_ONCE(sk->sk_rcvbuf))
+ +		goto wake;
+++=======
++ 	move_skbs_to_msk(msk, ssk);
+++>>>>>>> ea4ca586b16f (mptcp: refine MPTCP-level ack scheduling)
+  
+- 	/* mptcp socket is owned, release_cb should retry */
+- 	if (!test_and_set_bit(TCP_DELACK_TIMER_DEFERRED,
+- 			      &sk->sk_tsq_flags)) {
+- 		sock_hold(sk);
+- 
+- 		/* need to try again, its possible release_cb() has already
+- 		 * been called after the test_and_set_bit() above.
+- 		 */
+- 		move_skbs_to_msk(msk, ssk);
+- 	}
+  wake:
+ -	if (wake)
+ -		sk->sk_data_ready(sk);
+ +	sk->sk_data_ready(sk);
+  }
+  
+ -void __mptcp_flush_join_list(struct mptcp_sock *msk)
+ +static void __mptcp_flush_join_list(struct mptcp_sock *msk)
+  {
+  	if (likely(list_empty(&msk->join_list)))
+  		return;
+@@@ -876,23 -1090,46 +923,41 @@@ static void mptcp_nospace(struct mptcp_
+  
+  	mptcp_for_each_subflow(msk, subflow) {
+  		struct sock *ssk = mptcp_subflow_tcp_sock(subflow);
+ -		bool ssk_writeable = sk_stream_is_writeable(ssk);
+  		struct socket *sock = READ_ONCE(ssk->sk_socket);
+  
+ -		if (ssk_writeable || !sock)
+ -			continue;
+ -
+  		/* enables ssk->write_space() callbacks */
+ -		set_bit(SOCK_NOSPACE, &sock->flags);
+ +		if (sock)
+ +			set_bit(SOCK_NOSPACE, &sock->flags);
+  	}
+ -
+ -	/* mptcp_data_acked() could run just before we set the NOSPACE bit,
+ -	 * so explicitly check for snd_una value
+ -	 */
+ -	mptcp_clean_una((struct sock *)msk);
+  }
+  
+++<<<<<<< HEAD
+ +static struct sock *mptcp_subflow_get_send(struct mptcp_sock *msk)
+ +{
+++=======
++ #define MPTCP_SEND_BURST_SIZE		((1 << 16) - \
++ 					 sizeof(struct tcphdr) - \
++ 					 MAX_TCP_OPTION_SPACE - \
++ 					 sizeof(struct ipv6hdr) - \
++ 					 sizeof(struct frag_hdr))
++ 
++ struct subflow_send_info {
++ 	struct sock *ssk;
++ 	u64 ratio;
++ };
++ 
++ static struct sock *mptcp_subflow_get_send(struct mptcp_sock *msk,
++ 					   u32 *sndbuf)
++ {
++ 	struct subflow_send_info send_info[2];
+++>>>>>>> ea4ca586b16f (mptcp: refine MPTCP-level ack scheduling)
+  	struct mptcp_subflow_context *subflow;
+ -	int i, nr_active = 0;
+ -	struct sock *ssk;
+ -	u64 ratio;
+ -	u32 pace;
+ +	struct sock *sk = (struct sock *)msk;
+ +	struct sock *backup = NULL;
+ +	bool free;
+  
+ -	sock_owned_by_me((struct sock *)msk);
+ +	sock_owned_by_me(sk);
+  
+ -	*sndbuf = 0;
+  	if (!mptcp_ext_cache_refill(msk))
+  		return NULL;
+  
+@@@ -1227,7 -1560,11 +1297,15 @@@ static bool __mptcp_move_skbs(struct mp
+  		unlock_sock_fast(ssk, slowpath);
+  	} while (!done);
+  
+++<<<<<<< HEAD
+ +	return moved > 0;
+++=======
++ 	if (mptcp_ofo_queue(msk) || moved > 0) {
++ 		mptcp_check_data_fin((struct sock *)msk);
++ 		return true;
++ 	}
++ 	return false;
+++>>>>>>> ea4ca586b16f (mptcp: refine MPTCP-level ack scheduling)
+  }
+  
+  static int mptcp_recvmsg(struct sock *sk, struct msghdr *msg, size_t len,
+@@@ -1442,7 -1882,18 +1525,18 @@@ static void mptcp_worker(struct work_st
+  	mptcp_clean_una_wakeup(sk);
+  	mptcp_check_data_fin_ack(sk);
+  	__mptcp_flush_join_list(msk);
+++<<<<<<< HEAD
+ +	__mptcp_move_skbs(msk);
+++=======
++ 	if (test_and_clear_bit(MPTCP_WORK_CLOSE_SUBFLOW, &msk->flags))
++ 		__mptcp_close_subflow(msk);
++ 
++ 	if (mptcp_send_head(sk))
++ 		mptcp_push_pending(sk, 0);
++ 
++ 	if (msk->pm.status)
++ 		pm_work(msk);
+++>>>>>>> ea4ca586b16f (mptcp: refine MPTCP-level ack scheduling)
+  
+  	if (test_and_clear_bit(MPTCP_WORK_EOF, &msk->flags))
+  		mptcp_check_for_eof(msk);
+@@@ -1511,9 -1968,11 +1605,10 @@@ static int __mptcp_init_sock(struct soc
+  	INIT_LIST_HEAD(&msk->conn_list);
+  	INIT_LIST_HEAD(&msk->join_list);
+  	INIT_LIST_HEAD(&msk->rtx_queue);
+ +	__set_bit(MPTCP_SEND_SPACE, &msk->flags);
+  	INIT_WORK(&msk->work, mptcp_worker);
+ -	msk->out_of_order_queue = RB_ROOT;
+ -	msk->first_pending = NULL;
+  
++ 	msk->ack_hint = NULL;
+  	msk->first = NULL;
+  	inet_csk(sk)->icsk_sync_mss = mptcp_sync_mss;
+  
+@@@ -2006,15 -2526,6 +2100,18 @@@ static void mptcp_release_cb(struct soc
+  
+  	sock_release_ownership(sk);
+  
+++<<<<<<< HEAD
+ +	if (flags & TCPF_DELACK_TIMER_DEFERRED) {
+ +		struct mptcp_sock *msk = mptcp_sk(sk);
+ +		struct sock *ssk;
+ +
+ +		ssk = mptcp_subflow_recv_lookup(msk);
+ +		if (!ssk || !schedule_work(&msk->work))
+ +			__sock_put(sk);
+ +	}
+ +
+++=======
+++>>>>>>> ea4ca586b16f (mptcp: refine MPTCP-level ack scheduling)
+  	if (flags & TCPF_WRITE_TIMER_DEFERRED) {
+  		mptcp_retransmit_handler(sk);
+  		__sock_put(sk);
+diff --cc net/mptcp/protocol.h
+index a60ec79c4e54,82d5626323b1..000000000000
+--- a/net/mptcp/protocol.h
++++ b/net/mptcp/protocol.h
+@@@ -203,10 -216,16 +203,17 @@@ struct mptcp_sock 
+  	u64		write_seq;
+  	u64		snd_nxt;
+  	u64		ack_seq;
+ -	u64		rcv_wnd_sent;
+  	u64		rcv_data_fin_seq;
+++<<<<<<< HEAD
+++=======
++ 	struct sock	*last_snd;
++ 	int		snd_burst;
++ 	int		old_wspace;
+++>>>>>>> ea4ca586b16f (mptcp: refine MPTCP-level ack scheduling)
+  	atomic64_t	snd_una;
+ -	atomic64_t	wnd_end;
+  	unsigned long	timer_ival;
+  	u32		token;
++ 	int		rmem_pending;
+  	unsigned long	flags;
+  	bool		can_ack;
+  	bool		fully_established;
+@@@ -214,9 -233,13 +221,10 @@@
+  	bool		snd_data_fin_enable;
+  	bool		use_64bit_ack; /* Set when we received a 64-bit DSN */
+  	spinlock_t	join_list_lock;
++ 	struct sock	*ack_hint;
+  	struct work_struct work;
+ -	struct sk_buff  *ooo_last_skb;
+ -	struct rb_root  out_of_order_queue;
+  	struct list_head conn_list;
+  	struct list_head rtx_queue;
+ -	struct mptcp_data_frag *first_pending;
+  	struct list_head join_list;
+  	struct skb_ext	*cached_ext;	/* for the next sendmsg */
+  	struct socket	*subflow; /* outgoing connect/listener/!mp_capable */
+@@@ -238,6 -261,41 +246,44 @@@ static inline struct mptcp_sock *mptcp_
+  	return (struct mptcp_sock *)sk;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static inline int __mptcp_space(const struct sock *sk)
++ {
++ 	return tcp_space(sk) + READ_ONCE(mptcp_sk(sk)->rmem_pending);
++ }
++ 
++ static inline struct mptcp_data_frag *mptcp_send_head(const struct sock *sk)
++ {
++ 	const struct mptcp_sock *msk = mptcp_sk(sk);
++ 
++ 	return READ_ONCE(msk->first_pending);
++ }
++ 
++ static inline struct mptcp_data_frag *mptcp_send_next(struct sock *sk)
++ {
++ 	struct mptcp_sock *msk = mptcp_sk(sk);
++ 	struct mptcp_data_frag *cur;
++ 
++ 	cur = msk->first_pending;
++ 	return list_is_last(&cur->list, &msk->rtx_queue) ? NULL :
++ 						     list_next_entry(cur, list);
++ }
++ 
++ static inline struct mptcp_data_frag *mptcp_pending_tail(const struct sock *sk)
++ {
++ 	struct mptcp_sock *msk = mptcp_sk(sk);
++ 
++ 	if (!msk->first_pending)
++ 		return NULL;
++ 
++ 	if (WARN_ON_ONCE(list_empty(&msk->rtx_queue)))
++ 		return NULL;
++ 
++ 	return list_last_entry(&msk->rtx_queue, struct mptcp_data_frag, list);
++ }
++ 
+++>>>>>>> ea4ca586b16f (mptcp: refine MPTCP-level ack scheduling)
+  static inline struct mptcp_data_frag *mptcp_rtx_tail(const struct sock *sk)
+  {
+  	struct mptcp_sock *msk = mptcp_sk(sk);
+diff --cc net/mptcp/subflow.c
+index dcdd522ad5a5,4d8abff1be18..000000000000
+--- a/net/mptcp/subflow.c
++++ b/net/mptcp/subflow.c
+@@@ -781,16 -833,23 +781,27 @@@ validate_seq
+  	return MAPPING_OK;
+  }
+  
+ -static void mptcp_subflow_discard_data(struct sock *ssk, struct sk_buff *skb,
+ -				       u64 limit)
+ +static int subflow_read_actor(read_descriptor_t *desc,
+ +			      struct sk_buff *skb,
+ +			      unsigned int offset, size_t len)
+  {
+ -	struct mptcp_subflow_context *subflow = mptcp_subflow_ctx(ssk);
+ -	bool fin = TCP_SKB_CB(skb)->tcp_flags & TCPHDR_FIN;
+ -	u32 incr;
+ +	size_t copy_len = min(desc->count, len);
+  
+ -	incr = limit >= skb->len ? skb->len + fin : limit;
+ +	desc->count -= copy_len;
+  
+++<<<<<<< HEAD
+ +	pr_debug("flushed %zu bytes, %zu left", copy_len, desc->count);
+ +	return copy_len;
+++=======
++ 	pr_debug("discarding=%d len=%d seq=%d", incr, skb->len,
++ 		 subflow->map_subflow_seq);
++ 	MPTCP_INC_STATS(sock_net(ssk), MPTCP_MIB_DUPDATA);
++ 	tcp_sk(ssk)->copied_seq += incr;
++ 	if (!before(tcp_sk(ssk)->copied_seq, TCP_SKB_CB(skb)->end_seq))
++ 		sk_eat_skb(ssk, skb);
++ 	if (mptcp_subflow_get_map_offset(subflow) >= subflow->map_data_len)
++ 		subflow->map_valid = 0;
+++>>>>>>> ea4ca586b16f (mptcp: refine MPTCP-level ack scheduling)
+  }
+  
+  static bool subflow_check_data_avail(struct sock *ssk)
+diff --git a/net/mptcp/options.c b/net/mptcp/options.c
+index cfc2e1d06a18..a77e9fe5ee69 100644
+--- a/net/mptcp/options.c
++++ b/net/mptcp/options.c
+@@ -527,6 +527,7 @@ static bool mptcp_established_options_dss(struct sock *sk, struct sk_buff *skb,
+ 		opts->ext_copy.ack64 = 0;
+ 	}
+ 	opts->ext_copy.use_ack = 1;
++	WRITE_ONCE(msk->old_wspace, __mptcp_space((struct sock *)msk));
+ 
+ 	/* Add kind/length/subtype/flag overhead if mapping is not populated */
+ 	if (dss_size == 0)
+* Unmerged path net/mptcp/protocol.c
+* Unmerged path net/mptcp/protocol.h
+* Unmerged path net/mptcp/subflow.c
