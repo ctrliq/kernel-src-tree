@@ -1,0 +1,205 @@
+powerpc/pseries: Add KVM guest doorbell restrictions
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Nicholas Piggin <npiggin@gmail.com>
+commit 107c55005fbd5243ee31fb13b6f166cde9e3ade1
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/107c5500.failed
+
+KVM guests have certain restrictions and performance quirks when using
+doorbells. This patch moves the EPAPR KVM guest test so it can be shared
+with PSERIES, and uses that in doorbell setup code to apply the KVM
+guest quirks and  improves IPI performance for two cases:
+
+ - PowerVM guests may now use doorbells even if they are secure.
+
+ - KVM guests no longer use doorbells if XIVE is available.
+
+There is a valid complaint that "KVM guest" is not a very reasonable
+thing to test for, it's preferable for the hypervisor to advertise
+particular behaviours to the guest so they could change if the
+hypervisor implementation or configuration changes. However in this case
+we were already assuming a KVM guest worst case, so this patch is about
+containing those quirks. If KVM later advertises fast doorbells, we
+should test for that and override the quirks.
+
+	Signed-off-by: Nicholas Piggin <npiggin@gmail.com>
+	Tested-by: Cédric Le Goater <clg@kaod.org>
+	Signed-off-by: Michael Ellerman <mpe@ellerman.id.au>
+Link: https://lore.kernel.org/r/20200726035155.1424103-4-npiggin@gmail.com
+(cherry picked from commit 107c55005fbd5243ee31fb13b6f166cde9e3ade1)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/powerpc/kernel/Makefile
+diff --cc arch/powerpc/kernel/Makefile
+index 07b9f49bc695,d4d5946224f8..000000000000
+--- a/arch/powerpc/kernel/Makefile
++++ b/arch/powerpc/kernel/Makefile
+@@@ -36,11 -45,11 +36,19 @@@ obj-y				:= cputable.o ptrace.o syscall
+  				   signal.o sysfs.o cacheinfo.o time.o \
+  				   prom.o traps.o setup-common.o \
+  				   udbg.o misc.o io.o misc_$(BITS).o \
+++<<<<<<< HEAD
+ +				   of_platform.o prom_parse.o \
+ +				   dma-common.o
+ +obj-$(CONFIG_PPC64)		+= setup_64.o sys_ppc32.o \
+ +				   signal_64.o ptrace32.o \
+ +				   paca.o nvram_64.o firmware.o note.o
+++=======
++ 				   of_platform.o prom_parse.o firmware.o
++ obj-y				+= ptrace/
++ obj-$(CONFIG_PPC64)		+= setup_64.o \
++ 				   paca.o nvram_64.o note.o syscall_64.o
++ obj-$(CONFIG_COMPAT)		+= sys_ppc32.o signal_32.o
+++>>>>>>> 107c55005fbd (powerpc/pseries: Add KVM guest doorbell restrictions)
+  obj-$(CONFIG_VDSO32)		+= vdso32/
+  obj-$(CONFIG_PPC_WATCHDOG)	+= watchdog.o
+  obj-$(CONFIG_HAVE_HW_BREAKPOINT)	+= hw_breakpoint.o
+diff --git a/arch/powerpc/include/asm/firmware.h b/arch/powerpc/include/asm/firmware.h
+index e4d42953c9b6..e9d12bbc3455 100644
+--- a/arch/powerpc/include/asm/firmware.h
++++ b/arch/powerpc/include/asm/firmware.h
+@@ -136,6 +136,12 @@ extern int fwnmi_active;
+ 
+ extern unsigned int __start___fw_ftr_fixup, __stop___fw_ftr_fixup;
+ 
++#if defined(CONFIG_PPC_PSERIES) || defined(CONFIG_KVM_GUEST)
++bool is_kvm_guest(void);
++#else
++static inline bool is_kvm_guest(void) { return false; }
++#endif
++
+ #ifdef CONFIG_PPC_PSERIES
+ void pseries_probe_fw_features(void);
+ #else
+diff --git a/arch/powerpc/include/asm/kvm_para.h b/arch/powerpc/include/asm/kvm_para.h
+index 5ceb4efca65f..fa68ba56b739 100644
+--- a/arch/powerpc/include/asm/kvm_para.h
++++ b/arch/powerpc/include/asm/kvm_para.h
+@@ -19,35 +19,15 @@
+ #ifndef __POWERPC_KVM_PARA_H__
+ #define __POWERPC_KVM_PARA_H__
+ 
+-#include <uapi/asm/kvm_para.h>
+-
+-#ifdef CONFIG_KVM_GUEST
+-
+-#include <linux/of.h>
+-
+-static inline int kvm_para_available(void)
+-{
+-	struct device_node *hyper_node;
+-
+-	hyper_node = of_find_node_by_path("/hypervisor");
+-	if (!hyper_node)
+-		return 0;
++#include <asm/firmware.h>
+ 
+-	if (!of_device_is_compatible(hyper_node, "linux,kvm"))
+-		return 0;
+-
+-	return 1;
+-}
+-
+-#else
++#include <uapi/asm/kvm_para.h>
+ 
+ static inline int kvm_para_available(void)
+ {
+-	return 0;
++	return IS_ENABLED(CONFIG_KVM_GUEST) && is_kvm_guest();
+ }
+ 
+-#endif
+-
+ static inline unsigned int kvm_arch_para_features(void)
+ {
+ 	unsigned long r;
+* Unmerged path arch/powerpc/kernel/Makefile
+diff --git a/arch/powerpc/kernel/firmware.c b/arch/powerpc/kernel/firmware.c
+index 2eae4478f7a1..05e9694e3eaf 100644
+--- a/arch/powerpc/kernel/firmware.c
++++ b/arch/powerpc/kernel/firmware.c
+@@ -15,8 +15,27 @@
+ 
+ #include <linux/export.h>
+ #include <linux/cache.h>
++#include <linux/of.h>
+ 
+ #include <asm/firmware.h>
+ 
++#ifdef CONFIG_PPC64
+ unsigned long powerpc_firmware_features __read_mostly;
+ EXPORT_SYMBOL_GPL(powerpc_firmware_features);
++#endif
++
++#if defined(CONFIG_PPC_PSERIES) || defined(CONFIG_KVM_GUEST)
++bool is_kvm_guest(void)
++{
++	struct device_node *hyper_node;
++
++	hyper_node = of_find_node_by_path("/hypervisor");
++	if (!hyper_node)
++		return 0;
++
++	if (!of_device_is_compatible(hyper_node, "linux,kvm"))
++		return 0;
++
++	return 1;
++}
++#endif
+diff --git a/arch/powerpc/platforms/pseries/smp.c b/arch/powerpc/platforms/pseries/smp.c
+index 0d5bafd3e324..2608bf4f5f90 100644
+--- a/arch/powerpc/platforms/pseries/smp.c
++++ b/arch/powerpc/platforms/pseries/smp.c
+@@ -240,24 +240,32 @@ static __init void pSeries_smp_probe(void)
+ 	if (!cpu_has_feature(CPU_FTR_SMT))
+ 		return;
+ 
+-	/*
+-	 * KVM emulates doorbells by disabling FSCR[MSGP] so msgsndp faults
+-	 * to the hypervisor which then reads the instruction from guest
+-	 * memory. This can't be done if the guest is secure, so don't use
+-	 * doorbells in secure guests.
+-	 *
+-	 * Under PowerVM, FSCR[MSGP] is enabled so doorbells could be used
+-	 * by secure guests if we distinguished this from KVM.
+-	 */
+-	if (is_secure_guest())
+-		return;
++	if (is_kvm_guest()) {
++		/*
++		 * KVM emulates doorbells by disabling FSCR[MSGP] so msgsndp
++		 * faults to the hypervisor which then reads the instruction
++		 * from guest memory, which tends to be slower than using XIVE.
++		 */
++		if (xive_enabled())
++			return;
++
++		/*
++		 * XICS hcalls aren't as fast, so we can use msgsndp (which
++		 * also helps exercise KVM emulation), however KVM can't
++		 * emulate secure guests because it can't read the instruction
++		 * out of their memory.
++		 */
++		if (is_secure_guest())
++			return;
++	}
+ 
+ 	/*
+-	 * The guest can use doobells for SMT sibling IPIs, which stay in
+-	 * the core rather than going to the interrupt controller. This
+-	 * tends to be slower under KVM where doorbells are emulated, but
+-	 * faster for PowerVM where they're enabled.
++	 * Under PowerVM, FSCR[MSGP] is enabled as guest vCPU siblings are
++	 * gang scheduled on the same physical core, so doorbells are always
++	 * faster than the interrupt controller, and they can be used by
++	 * secure guests.
+ 	 */
++
+ 	ic_cause_ipi = smp_ops->cause_ipi;
+ 	smp_ops->cause_ipi = dbell_or_ic_cause_ipi;
+ }
