@@ -1,0 +1,113 @@
+KVM: arm64: Workaround firmware wrongly advertising GICv2-on-v3 compatibility
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-315.el8
+commit-author Marc Zyngier <maz@kernel.org>
+commit 9739f6ef053f104a997165701c6e15582c4307ee
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-315.el8/9739f6ef.failed
+
+It looks like we have broken firmware out there that wrongly advertises
+a GICv2 compatibility interface, despite the CPUs not being able to deal
+with it.
+
+To work around this, check that the CPU initialising KVM is actually able
+to switch to MMIO instead of system registers, and use that as a
+precondition to enable GICv2 compatibility in KVM.
+
+Note that the detection happens on a single CPU. If the firmware is
+lying *and* that the CPUs are asymetric, all hope is lost anyway.
+
+	Reported-by: Shameerali Kolothum Thodi <shameerali.kolothum.thodi@huawei.com>
+	Tested-by: Shameer Kolothum <shameerali.kolothum.thodi@huawei.com>
+	Signed-off-by: Marc Zyngier <maz@kernel.org>
+Message-Id: <20210305185254.3730990-8-maz@kernel.org>
+	Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+(cherry picked from commit 9739f6ef053f104a997165701c6e15582c4307ee)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/arm64/kvm/hyp/vgic-v3-sr.c
+#	arch/arm64/kvm/vgic/vgic-v3.c
+diff --cc arch/arm64/kvm/hyp/vgic-v3-sr.c
+index 48c15d8ffd04,ee3682b9873c..000000000000
+--- a/arch/arm64/kvm/hyp/vgic-v3-sr.c
++++ b/arch/arm64/kvm/hyp/vgic-v3-sr.c
+@@@ -414,9 -405,45 +414,49 @@@ void __vgic_v3_init_lrs(void
+  		__gic_v3_set_lr(0, i);
+  }
+  
+++<<<<<<< HEAD
+ +u64 __vgic_v3_get_ich_vtr_el2(void)
+++=======
++ /*
++  * Return the GIC CPU configuration:
++  * - [31:0]  ICH_VTR_EL2
++  * - [62:32] RES0
++  * - [63]    MMIO (GICv2) capable
++  */
++ u64 __vgic_v3_get_gic_config(void)
+++>>>>>>> 9739f6ef053f (KVM: arm64: Workaround firmware wrongly advertising GICv2-on-v3 compatibility)
+  {
+- 	return read_gicreg(ICH_VTR_EL2);
++ 	u64 val, sre = read_gicreg(ICC_SRE_EL1);
++ 	unsigned long flags = 0;
++ 
++ 	/*
++ 	 * To check whether we have a MMIO-based (GICv2 compatible)
++ 	 * CPU interface, we need to disable the system register
++ 	 * view. To do that safely, we have to prevent any interrupt
++ 	 * from firing (which would be deadly).
++ 	 *
++ 	 * Note that this only makes sense on VHE, as interrupts are
++ 	 * already masked for nVHE as part of the exception entry to
++ 	 * EL2.
++ 	 */
++ 	if (has_vhe())
++ 		flags = local_daif_save();
++ 
++ 	write_gicreg(0, ICC_SRE_EL1);
++ 	isb();
++ 
++ 	val = read_gicreg(ICC_SRE_EL1);
++ 
++ 	write_gicreg(sre, ICC_SRE_EL1);
++ 	isb();
++ 
++ 	if (has_vhe())
++ 		local_daif_restore(flags);
++ 
++ 	val  = (val & ICC_SRE_EL1_SRE) ? 0 : (1ULL << 63);
++ 	val |= read_gicreg(ICH_VTR_EL2);
++ 
++ 	return val;
+  }
+  
+  u64 __vgic_v3_read_vmcr(void)
+diff --cc arch/arm64/kvm/vgic/vgic-v3.c
+index 235d742ea9ec,6f530925a231..000000000000
+--- a/arch/arm64/kvm/vgic/vgic-v3.c
++++ b/arch/arm64/kvm/vgic/vgic-v3.c
+@@@ -595,9 -574,13 +595,19 @@@ early_param("kvm-arm.vgic_v4_enable", e
+   */
+  int vgic_v3_probe(const struct gic_kvm_info *info)
+  {
+++<<<<<<< HEAD
+ +	u32 ich_vtr_el2 = kvm_call_hyp_ret(__vgic_v3_get_ich_vtr_el2);
+ +	int ret;
+ +
+++=======
++ 	u64 ich_vtr_el2 = kvm_call_hyp_ret(__vgic_v3_get_gic_config);
++ 	bool has_v2;
++ 	int ret;
++ 
++ 	has_v2 = ich_vtr_el2 >> 63;
++ 	ich_vtr_el2 = (u32)ich_vtr_el2;
++ 
+++>>>>>>> 9739f6ef053f (KVM: arm64: Workaround firmware wrongly advertising GICv2-on-v3 compatibility)
+  	/*
+  	 * The ListRegs field is 5 bits, but there is an architectural
+  	 * maximum of 16 list registers. Just ignore bit 4...
+* Unmerged path arch/arm64/kvm/hyp/vgic-v3-sr.c
+* Unmerged path arch/arm64/kvm/vgic/vgic-v3.c
