@@ -1,0 +1,213 @@
+IB/ipoib: Get rid of the sysfs_mutex
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-80.el8
+commit-author Jason Gunthorpe <jgg@ziepe.ca>
+commit ee190ab734ba4d3c7887bd193ce8124385738e44
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-80.el8/ee190ab7.failed
+
+This mutex was introduced to deal with the deadlock formed by calling
+unregister_netdev from within the sysfs callback of a netdev.
+
+Now that we have priv_destructor and needs_free_netdev we can switch
+to the more targeted solution of running the unregister from a
+work queue. This avoids the deadlock and gets rid of the mutex.
+
+The next patch in the series needs this mutex eliminated to create
+atomicity of unregisteration.
+
+	Signed-off-by: Jason Gunthorpe <jgg@mellanox.com>
+	Signed-off-by: Leon Romanovsky <leonro@mellanox.com>
+(cherry picked from commit ee190ab734ba4d3c7887bd193ce8124385738e44)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/infiniband/ulp/ipoib/ipoib_main.c
+#	drivers/infiniband/ulp/ipoib/ipoib_vlan.c
+diff --cc drivers/infiniband/ulp/ipoib/ipoib_main.c
+index 94512d9e8358,e9f4f261fe20..000000000000
+--- a/drivers/infiniband/ulp/ipoib/ipoib_main.c
++++ b/drivers/infiniband/ulp/ipoib/ipoib_main.c
+@@@ -2399,26 -2473,9 +2398,27 @@@ static void ipoib_remove_one(struct ib_
+  		return;
+  
+  	list_for_each_entry_safe(priv, tmp, dev_list, list) {
+ +		struct rdma_netdev *parent_rn = netdev_priv(priv->dev);
+ +
+  		ipoib_parent_unregister_pre(priv->dev);
+  
+- 		/* Wrap rtnl_lock/unlock with mutex to protect sysfs calls */
+- 		mutex_lock(&priv->sysfs_mutex);
+  		unregister_netdev(priv->dev);
+++<<<<<<< HEAD
+ +		mutex_unlock(&priv->sysfs_mutex);
+ +
+ +		parent_rn->free_rdma_netdev(priv->dev);
+ +
+ +		list_for_each_entry_safe(cpriv, tcpriv, &priv->child_intfs, list) {
+ +			struct rdma_netdev *child_rn;
+ +
+ +			child_rn = netdev_priv(cpriv->dev);
+ +			child_rn->free_rdma_netdev(cpriv->dev);
+ +			kfree(cpriv);
+ +		}
+ +
+ +		kfree(priv);
+++=======
+++>>>>>>> ee190ab734ba (IB/ipoib: Get rid of the sysfs_mutex)
+  	}
+  
+  	kfree(dev_list);
+diff --cc drivers/infiniband/ulp/ipoib/ipoib_vlan.c
+index b62ab85c8ead,891c5b40018a..000000000000
+--- a/drivers/infiniband/ulp/ipoib/ipoib_vlan.c
++++ b/drivers/infiniband/ulp/ipoib/ipoib_vlan.c
+@@@ -176,19 -168,54 +169,71 @@@ int ipoib_vlan_add(struct net_device *p
+  out:
+  	up_write(&ppriv->vlan_rwsem);
+  	rtnl_unlock();
+- 	mutex_unlock(&ppriv->sysfs_mutex);
+  
+ +	if (result && priv) {
+ +		struct rdma_netdev *rn;
+ +
+ +		rn = netdev_priv(priv->dev);
+ +		rn->free_rdma_netdev(priv->dev);
+ +		kfree(priv);
+ +	}
+ +
+  	return result;
+  }
+  
++ struct ipoib_vlan_delete_work {
++ 	struct work_struct work;
++ 	struct net_device *dev;
++ };
++ 
++ /*
++  * sysfs callbacks of a netdevice cannot obtain the rtnl lock as
++  * unregister_netdev ultimately deletes the sysfs files while holding the rtnl
++  * lock. This deadlocks the system.
++  *
++  * A callback can use rtnl_trylock to avoid the deadlock but it cannot call
++  * unregister_netdev as that internally takes and releases the rtnl_lock.  So
++  * instead we find the netdev to unregister and then do the actual unregister
++  * from the global work queue where we can obtain the rtnl_lock safely.
++  */
++ static void ipoib_vlan_delete_task(struct work_struct *work)
++ {
++ 	struct ipoib_vlan_delete_work *pwork =
++ 		container_of(work, struct ipoib_vlan_delete_work, work);
++ 	struct net_device *dev = pwork->dev;
++ 
++ 	rtnl_lock();
++ 
++ 	/* Unregistering tasks can race with another task or parent removal */
++ 	if (dev->reg_state == NETREG_REGISTERED) {
++ 		struct ipoib_dev_priv *priv = ipoib_priv(dev);
++ 		struct ipoib_dev_priv *ppriv = ipoib_priv(priv->parent);
++ 
++ 		down_write(&ppriv->vlan_rwsem);
++ 		list_del(&priv->list);
++ 		up_write(&ppriv->vlan_rwsem);
++ 
++ 		ipoib_dbg(ppriv, "delete child vlan %s\n", dev->name);
++ 		unregister_netdevice(dev);
++ 	}
++ 
++ 	rtnl_unlock();
++ 
+++<<<<<<< HEAD
+++	if (dev) {
+++		struct rdma_netdev *rn;
+++
+++		rn = netdev_priv(dev);
+++		rn->free_rdma_netdev(priv->dev);
+++		kfree(priv);
+++		return 0;
+++	}
+++
+++	return -ENODEV;
+++=======
++ 	kfree(pwork);
++ }
++ 
+  int ipoib_vlan_delete(struct net_device *pdev, unsigned short pkey)
+  {
+  	struct ipoib_dev_priv *ppriv, *priv, *tpriv;
+@@@ -227,24 -257,9 +275,10 @@@
+  			break;
+  		}
+  	}
+- 	up_write(&ppriv->vlan_rwsem);
+- 
+- 	if (dev) {
+- 		ipoib_dbg(ppriv, "delete child vlan %s\n", dev->name);
+- 		unregister_netdevice(dev);
+- 	}
+  
++ out:
+  	rtnl_unlock();
+- 	mutex_unlock(&ppriv->sysfs_mutex);
+- 
+- 	if (dev) {
+- 		struct rdma_netdev *rn;
+  
+- 		rn = netdev_priv(dev);
+- 		rn->free_rdma_netdev(priv->dev);
+- 		kfree(priv);
+- 		return 0;
+- 	}
+- 
+- 	return -ENODEV;
++ 	return rc;
+++>>>>>>> ee190ab734ba (IB/ipoib: Get rid of the sysfs_mutex)
+  }
+diff --git a/drivers/infiniband/ulp/ipoib/ipoib.h b/drivers/infiniband/ulp/ipoib/ipoib.h
+index 44bce3b18901..13c1e2013f86 100644
+--- a/drivers/infiniband/ulp/ipoib/ipoib.h
++++ b/drivers/infiniband/ulp/ipoib/ipoib.h
+@@ -331,7 +331,6 @@ struct ipoib_dev_priv {
+ 
+ 	struct rw_semaphore vlan_rwsem;
+ 	struct mutex mcast_mutex;
+-	struct mutex sysfs_mutex;
+ 
+ 	struct rb_root  path_tree;
+ 	struct list_head path_list;
+diff --git a/drivers/infiniband/ulp/ipoib/ipoib_cm.c b/drivers/infiniband/ulp/ipoib/ipoib_cm.c
+index 10f867e634cb..dfd39736f162 100644
+--- a/drivers/infiniband/ulp/ipoib/ipoib_cm.c
++++ b/drivers/infiniband/ulp/ipoib/ipoib_cm.c
+@@ -1520,19 +1520,13 @@ static ssize_t set_mode(struct device *d, struct device_attribute *attr,
+ {
+ 	struct net_device *dev = to_net_dev(d);
+ 	int ret;
+-	struct ipoib_dev_priv *priv = ipoib_priv(dev);
+-
+-	if (!mutex_trylock(&priv->sysfs_mutex))
+-		return restart_syscall();
+ 
+ 	if (!rtnl_trylock()) {
+-		mutex_unlock(&priv->sysfs_mutex);
+ 		return restart_syscall();
+ 	}
+ 
+ 	if (dev->reg_state != NETREG_REGISTERED) {
+ 		rtnl_unlock();
+-		mutex_unlock(&priv->sysfs_mutex);
+ 		return -EPERM;
+ 	}
+ 
+@@ -1544,7 +1538,6 @@ static ssize_t set_mode(struct device *d, struct device_attribute *attr,
+ 	 */
+ 	if (ret != -EBUSY)
+ 		rtnl_unlock();
+-	mutex_unlock(&priv->sysfs_mutex);
+ 
+ 	return (!ret || ret == -EBUSY) ? count : ret;
+ }
+* Unmerged path drivers/infiniband/ulp/ipoib/ipoib_main.c
+* Unmerged path drivers/infiniband/ulp/ipoib/ipoib_vlan.c
