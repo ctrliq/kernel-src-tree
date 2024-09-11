@@ -6342,7 +6342,7 @@ void __netif_napi_del(struct napi_struct *napi)
 		return;
 
 	napi_hash_del(napi);
-	list_del_init(&napi->dev_list);
+	list_del_rcu(&napi->dev_list);
 	napi_free_frags(napi);
 
 	gro_list_free(&napi->gro_list);
