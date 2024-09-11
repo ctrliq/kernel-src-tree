@@ -365,7 +365,7 @@ static struct request *blk_mq_get_request(struct request_queue *q,
 	}
 
 	tag = blk_mq_get_tag(data);
-	if (tag == BLK_MQ_TAG_FAIL) {
+	if (tag == BLK_MQ_NO_TAG) {
 		if (clear_ctx_on_error)
 			data->ctx = NULL;
 		blk_queue_exit(q);
