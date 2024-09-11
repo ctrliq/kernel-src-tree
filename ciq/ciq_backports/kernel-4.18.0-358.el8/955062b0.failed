@@ -1,0 +1,320 @@
+net: bridge: mcast: add support for raw L2 multicast groups
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-358.el8
+commit-author Nikolay Aleksandrov <nikolay@nvidia.com>
+commit 955062b03fa62b802a1ee34fbb04e39f7a70ae73
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-358.el8/955062b0.failed
+
+Extend the bridge multicast control and data path to configure routes
+for L2 (non-IP) multicast groups.
+
+The uapi struct br_mdb_entry union u is extended with another variant,
+mac_addr, which does not change the structure size, and which is valid
+when the proto field is zero.
+
+To be compatible with the forwarding code that is already in place,
+which acts as an IGMP/MLD snooping bridge with querier capabilities, we
+need to declare that for L2 MDB entries (for which there exists no such
+thing as IGMP/MLD snooping/querying), that there is always a querier.
+Otherwise, these entries would be flooded to all bridge ports and not
+just to those that are members of the L2 multicast group.
+
+Needless to say, only permanent L2 multicast groups can be installed on
+a bridge port.
+
+	Signed-off-by: Nikolay Aleksandrov <nikolay@nvidia.com>
+	Signed-off-by: Vladimir Oltean <vladimir.oltean@nxp.com>
+Link: https://lore.kernel.org/r/20201028233831.610076-1-vladimir.oltean@nxp.com
+	Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+(cherry picked from commit 955062b03fa62b802a1ee34fbb04e39f7a70ae73)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/if_bridge.h
+#	net/bridge/br_mdb.c
+#	net/bridge/br_multicast.c
+diff --cc include/linux/if_bridge.h
+index 61ec732c0c22,b979005ea39c..000000000000
+--- a/include/linux/if_bridge.h
++++ b/include/linux/if_bridge.h
+@@@ -29,7 -25,8 +29,12 @@@ struct br_ip 
+  #if IS_ENABLED(CONFIG_IPV6)
+  		struct in6_addr ip6;
+  #endif
+++<<<<<<< HEAD
+ +	} u;
+++=======
++ 		unsigned char	mac_addr[ETH_ALEN];
++ 	} dst;
+++>>>>>>> 955062b03fa6 (net: bridge: mcast: add support for raw L2 multicast groups)
+  	__be16		proto;
+  	__u16           vid;
+  };
+diff --cc net/bridge/br_mdb.c
+index 40754c5e5bdc,3c8863418d0b..000000000000
+--- a/net/bridge/br_mdb.c
++++ b/net/bridge/br_mdb.c
+@@@ -69,12 -74,23 +69,19 @@@ static void __mdb_entry_to_br_ip(struc
+  	memset(ip, 0, sizeof(struct br_ip));
+  	ip->vid = entry->vid;
+  	ip->proto = entry->addr.proto;
+ -	switch (ip->proto) {
+ -	case htons(ETH_P_IP):
+ -		ip->dst.ip4 = entry->addr.u.ip4;
+ -		if (mdb_attrs && mdb_attrs[MDBE_ATTR_SOURCE])
+ -			ip->src.ip4 = nla_get_in_addr(mdb_attrs[MDBE_ATTR_SOURCE]);
+ -		break;
+ +	if (ip->proto == htons(ETH_P_IP))
+ +		ip->u.ip4 = entry->addr.u.ip4;
+  #if IS_ENABLED(CONFIG_IPV6)
+ -	case htons(ETH_P_IPV6):
+ -		ip->dst.ip6 = entry->addr.u.ip6;
+ -		if (mdb_attrs && mdb_attrs[MDBE_ATTR_SOURCE])
+ -			ip->src.ip6 = nla_get_in6_addr(mdb_attrs[MDBE_ATTR_SOURCE]);
+ -		break;
+ +	else
+ +		ip->u.ip6 = entry->addr.u.ip6;
+  #endif
+++<<<<<<< HEAD
+++=======
++ 	default:
++ 		ether_addr_copy(ip->dst.mac_addr, entry->addr.u.mac_addr);
++ 	}
++ 
+++>>>>>>> 955062b03fa6 (net: bridge: mcast: add support for raw L2 multicast groups)
+  }
+  
+  static int __mdb_fill_srcs(struct sk_buff *skb,
+@@@ -158,11 -174,13 +165,18 @@@ static int __mdb_fill_info(struct sk_bu
+  	e.ifindex = ifindex;
+  	e.vid = mp->addr.vid;
+  	if (mp->addr.proto == htons(ETH_P_IP))
+ -		e.addr.u.ip4 = mp->addr.dst.ip4;
+ +		e.addr.u.ip4 = mp->addr.u.ip4;
+  #if IS_ENABLED(CONFIG_IPV6)
+++<<<<<<< HEAD
+ +	if (mp->addr.proto == htons(ETH_P_IPV6))
+ +		e.addr.u.ip6 = mp->addr.u.ip6;
+++=======
++ 	else if (mp->addr.proto == htons(ETH_P_IPV6))
++ 		e.addr.u.ip6 = mp->addr.dst.ip6;
+++>>>>>>> 955062b03fa6 (net: bridge: mcast: add support for raw L2 multicast groups)
+  #endif
++ 	else
++ 		ether_addr_copy(e.addr.u.mac_addr, mp->addr.dst.mac_addr);
+  	e.addr.proto = mp->addr.proto;
+  	nest_ent = nla_nest_start_noflag(skb,
+  					 MDBA_MDB_ENTRY_INFO);
+@@@ -182,17 -205,27 +196,19 @@@
+  		break;
+  #if IS_ENABLED(CONFIG_IPV6)
+  	case htons(ETH_P_IPV6):
+ -		dump_srcs_mode = !!(mp->br->multicast_mld_version == 2);
+ -		if (!ipv6_addr_any(&mp->addr.src.ip6)) {
+ -			if (nla_put_in6_addr(skb, MDBA_MDB_EATTR_SOURCE,
+ -					     &mp->addr.src.ip6))
+ -				goto nest_err;
+ -			break;
+ -		}
+ +		dump_srcs_mode = !!(p && mp->br->multicast_mld_version == 2);
+  		break;
+  #endif
++ 	default:
++ 		ether_addr_copy(e.addr.u.mac_addr, mp->addr.dst.mac_addr);
+  	}
+ -	if (p) {
+ -		if (nla_put_u8(skb, MDBA_MDB_EATTR_RTPROT, p->rt_protocol))
+ -			goto nest_err;
+ -		if (dump_srcs_mode &&
+ -		    (__mdb_fill_srcs(skb, p) ||
+ -		     nla_put_u8(skb, MDBA_MDB_EATTR_GROUP_MODE,
+ -				p->filter_mode)))
+ -			goto nest_err;
+ +	if (dump_srcs_mode &&
+ +	    (__mdb_fill_srcs(skb, p) ||
+ +	     nla_put_u8(skb, MDBA_MDB_EATTR_GROUP_MODE, p->filter_mode))) {
+ +		nla_nest_cancel(skb, nest_ent);
+ +		return -EMSGSIZE;
+  	}
+ +
+  	nla_nest_end(skb, nest_ent);
+  
+  	return 0;
+@@@ -520,12 -566,15 +536,22 @@@ void br_mdb_notify(struct net_device *d
+  
+  	if (pg) {
+  		if (mp->addr.proto == htons(ETH_P_IP))
+ -			ip_eth_mc_map(mp->addr.dst.ip4, mdb.addr);
+ +			ip_eth_mc_map(mp->addr.u.ip4, mdb.addr);
+  #if IS_ENABLED(CONFIG_IPV6)
+++<<<<<<< HEAD
+ +		else
+ +			ipv6_eth_mc_map(&mp->addr.u.ip6, mdb.addr);
+ +#endif
+ +		mdb.obj.orig_dev = pg->port->dev;
+++=======
++ 		else if (mp->addr.proto == htons(ETH_P_IPV6))
++ 			ipv6_eth_mc_map(&mp->addr.dst.ip6, mdb.addr);
++ #endif
++ 		else
++ 			ether_addr_copy(mdb.addr, mp->addr.dst.mac_addr);
++ 
++ 		mdb.obj.orig_dev = pg->key.port->dev;
+++>>>>>>> 955062b03fa6 (net: bridge: mcast: add support for raw L2 multicast groups)
+  		switch (type) {
+  		case RTM_NEWMDB:
+  			complete_info = kmalloc(sizeof(*complete_info), GFP_ATOMIC);
+@@@ -737,18 -837,41 +769,42 @@@ static int br_mdb_parse(struct sk_buff 
+  }
+  
+  static int br_mdb_add_group(struct net_bridge *br, struct net_bridge_port *port,
+ -			    struct br_mdb_entry *entry,
+ -			    struct nlattr **mdb_attrs,
+ +			    struct br_ip *group, struct br_mdb_entry *entry,
+  			    struct netlink_ext_ack *extack)
+  {
+ -	struct net_bridge_mdb_entry *mp, *star_mp;
+ +	struct net_bridge_mdb_entry *mp;
+  	struct net_bridge_port_group *p;
+  	struct net_bridge_port_group __rcu **pp;
+ -	struct br_ip group, star_group;
+  	unsigned long now = jiffies;
+ -	u8 filter_mode;
+  	int err;
+  
+++<<<<<<< HEAD
+ +	mp = br_mdb_ip_get(br, group);
+++=======
++ 	__mdb_entry_to_br_ip(entry, &group, mdb_attrs);
++ 
++ 	/* host join errors which can happen before creating the group */
++ 	if (!port) {
++ 		/* don't allow any flags for host-joined groups */
++ 		if (entry->state) {
++ 			NL_SET_ERR_MSG_MOD(extack, "Flags are not allowed for host groups");
++ 			return -EINVAL;
++ 		}
++ 		if (!br_multicast_is_star_g(&group)) {
++ 			NL_SET_ERR_MSG_MOD(extack, "Groups with sources cannot be manually host joined");
++ 			return -EINVAL;
++ 		}
++ 	}
++ 
++ 	if (br_group_is_l2(&group) && entry->state != MDB_PERMANENT) {
++ 		NL_SET_ERR_MSG_MOD(extack, "Only permanent L2 entries allowed");
++ 		return -EINVAL;
++ 	}
++ 
++ 	mp = br_mdb_ip_get(br, &group);
+++>>>>>>> 955062b03fa6 (net: bridge: mcast: add support for raw L2 multicast groups)
+  	if (!mp) {
+ -		mp = br_multicast_new_group(br, &group);
+ +		mp = br_multicast_new_group(br, group);
+  		err = PTR_ERR_OR_ZERO(mp);
+  		if (err)
+  			return err;
+diff --cc net/bridge/br_multicast.c
+index 28b757a17768,484820c223a3..000000000000
+--- a/net/bridge/br_multicast.c
++++ b/net/bridge/br_multicast.c
+@@@ -880,10 -1259,15 +885,19 @@@ static int br_multicast_add_group(struc
+  			break;
+  	}
+  
+++<<<<<<< HEAD
+ +	p = br_multicast_new_port_group(port, group, *pp, 0, src, filter_mode);
+ +	if (unlikely(!p))
+ +		goto err;
+++=======
++ 	p = br_multicast_new_port_group(port, group, *pp, 0, src,
++ 					filter_mode, RTPROT_KERNEL);
++ 	if (unlikely(!p)) {
++ 		p = ERR_PTR(-ENOMEM);
++ 		goto out;
++ 	}
+++>>>>>>> 955062b03fa6 (net: bridge: mcast: add support for raw L2 multicast groups)
+  	rcu_assign_pointer(*pp, p);
+ -	if (blocked)
+ -		p->flags |= MDB_PG_FLAGS_BLOCKED;
+  	br_mdb_notify(br->dev, mp, p, RTM_NEWMDB);
+  
+  found:
+* Unmerged path include/linux/if_bridge.h
+diff --git a/include/uapi/linux/if_bridge.h b/include/uapi/linux/if_bridge.h
+index 0e197439585f..f1c22c7a2b37 100644
+--- a/include/uapi/linux/if_bridge.h
++++ b/include/uapi/linux/if_bridge.h
+@@ -590,6 +590,7 @@ struct br_mdb_entry {
+ 		union {
+ 			__be32	ip4;
+ 			struct in6_addr ip6;
++			unsigned char mac_addr[ETH_ALEN];
+ 		} u;
+ 		__be16		proto;
+ 	} addr;
+diff --git a/net/bridge/br_device.c b/net/bridge/br_device.c
+index d13e4408d749..ef3d5d43ae10 100644
+--- a/net/bridge/br_device.c
++++ b/net/bridge/br_device.c
+@@ -96,7 +96,7 @@ netdev_tx_t br_dev_xmit(struct sk_buff *skb, struct net_device *dev)
+ 
+ 		mdst = br_mdb_get(br, skb, vid);
+ 		if ((mdst || BR_INPUT_SKB_CB_MROUTERS_ONLY(skb)) &&
+-		    br_multicast_querier_exists(br, eth_hdr(skb)))
++		    br_multicast_querier_exists(br, eth_hdr(skb), mdst))
+ 			br_multicast_flood(mdst, skb, false, true);
+ 		else
+ 			br_flood(br, skb, BR_PKT_MULTICAST, false, true);
+diff --git a/net/bridge/br_input.c b/net/bridge/br_input.c
+index 9d0b5a313f16..2097c3cf03f6 100644
+--- a/net/bridge/br_input.c
++++ b/net/bridge/br_input.c
+@@ -142,7 +142,7 @@ int br_handle_frame_finish(struct net *net, struct sock *sk, struct sk_buff *skb
+ 	case BR_PKT_MULTICAST:
+ 		mdst = br_mdb_get(br, skb, vid);
+ 		if ((mdst || BR_INPUT_SKB_CB_MROUTERS_ONLY(skb)) &&
+-		    br_multicast_querier_exists(br, eth_hdr(skb))) {
++		    br_multicast_querier_exists(br, eth_hdr(skb), mdst)) {
+ 			if ((mdst && mdst->host_joined) ||
+ 			    br_multicast_is_router(br)) {
+ 				local_rcv = true;
+* Unmerged path net/bridge/br_mdb.c
+* Unmerged path net/bridge/br_multicast.c
+diff --git a/net/bridge/br_private.h b/net/bridge/br_private.h
+index e3f6f12aac69..f29ed60e8076 100644
+--- a/net/bridge/br_private.h
++++ b/net/bridge/br_private.h
+@@ -760,6 +760,11 @@ void br_mdb_uninit(void);
+ void br_multicast_host_join(struct net_bridge_mdb_entry *mp, bool notify);
+ void br_multicast_host_leave(struct net_bridge_mdb_entry *mp, bool notify);
+ 
++static inline bool br_group_is_l2(const struct br_ip *group)
++{
++	return group->proto == 0;
++}
++
+ #define mlock_dereference(X, br) \
+ 	rcu_dereference_protected(X, lockdep_is_held(&br->multicast_lock))
+ 
+@@ -791,7 +796,8 @@ __br_multicast_querier_exists(struct net_bridge *br,
+ }
+ 
+ static inline bool br_multicast_querier_exists(struct net_bridge *br,
+-					       struct ethhdr *eth)
++					       struct ethhdr *eth,
++					       const struct net_bridge_mdb_entry *mdb)
+ {
+ 	switch (eth->h_proto) {
+ 	case (htons(ETH_P_IP)):
+@@ -803,7 +809,7 @@ static inline bool br_multicast_querier_exists(struct net_bridge *br,
+ 			&br->ip6_other_query, true);
+ #endif
+ 	default:
+-		return false;
++		return !!mdb && br_group_is_l2(&mdb->addr);
+ 	}
+ }
+ 
