@@ -1,0 +1,106 @@
+iommu/arm-smmu-v3: Defer TLB invalidation until ->iotlb_sync()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-193.el8
+Rebuild_CHGLOG: - [iommu] arm-smmu-v3: Defer TLB invalidation until ->iotlb_sync() (Jerry Snitselaar) [1729845]
+Rebuild_FUZZ: 94.92%
+commit-author Will Deacon <will@kernel.org>
+commit 2af2e72b18b499fa36d3f7379fd010ff25d2a984
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-193.el8/2af2e72b.failed
+
+Update the iommu_iotlb_gather structure passed to ->tlb_add_page() and
+use this information to defer all TLB invalidation until ->iotlb_sync().
+This drastically reduces contention on the command queue, since we can
+insert our commands in batches rather than one-by-one.
+
+	Tested-by: Ganapatrao Kulkarni  <gkulkarni@marvell.com>
+	Signed-off-by: Will Deacon <will@kernel.org>
+(cherry picked from commit 2af2e72b18b499fa36d3f7379fd010ff25d2a984)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/iommu/arm-smmu-v3.c
+diff --cc drivers/iommu/arm-smmu-v3.c
+index 7c813fae4c3e,b36a99971401..000000000000
+--- a/drivers/iommu/arm-smmu-v3.c
++++ b/drivers/iommu/arm-smmu-v3.c
+@@@ -1962,16 -1969,48 +1971,51 @@@ static void arm_smmu_tlb_inv_range(unsi
+  		cmd.tlbi.vmid	= smmu_domain->s2_cfg.vmid;
+  	}
+  
+- 	do {
+- 		arm_smmu_cmdq_issue_cmd(smmu, &cmd);
+- 		cmd.tlbi.addr += granule;
+- 	} while (size -= granule);
++ 	while (iova < end) {
++ 		if (i == CMDQ_BATCH_ENTRIES) {
++ 			arm_smmu_cmdq_issue_cmdlist(smmu, cmds, i, false);
++ 			i = 0;
++ 		}
++ 
++ 		cmd.tlbi.addr = iova;
++ 		arm_smmu_cmdq_build_cmd(&cmds[i * CMDQ_ENT_DWORDS], &cmd);
++ 		iova += granule;
++ 		i++;
++ 	}
++ 
++ 	arm_smmu_cmdq_issue_cmdlist(smmu, cmds, i, true);
+  }
+  
+++<<<<<<< HEAD
+ +static const struct iommu_gather_ops arm_smmu_gather_ops = {
+++=======
++ static void arm_smmu_tlb_inv_page_nosync(struct iommu_iotlb_gather *gather,
++ 					 unsigned long iova, size_t granule,
++ 					 void *cookie)
++ {
++ 	struct arm_smmu_domain *smmu_domain = cookie;
++ 	struct iommu_domain *domain = &smmu_domain->domain;
++ 
++ 	iommu_iotlb_gather_add_page(domain, gather, iova, granule);
++ }
++ 
++ static void arm_smmu_tlb_inv_walk(unsigned long iova, size_t size,
++ 				  size_t granule, void *cookie)
++ {
++ 	arm_smmu_tlb_inv_range(iova, size, granule, false, cookie);
++ }
++ 
++ static void arm_smmu_tlb_inv_leaf(unsigned long iova, size_t size,
++ 				  size_t granule, void *cookie)
++ {
++ 	arm_smmu_tlb_inv_range(iova, size, granule, true, cookie);
++ }
++ 
++ static const struct iommu_flush_ops arm_smmu_flush_ops = {
+++>>>>>>> 2af2e72b18b4 (iommu/arm-smmu-v3: Defer TLB invalidation until ->iotlb_sync())
+  	.tlb_flush_all	= arm_smmu_tlb_inv_context,
+ -	.tlb_flush_walk = arm_smmu_tlb_inv_walk,
+ -	.tlb_flush_leaf = arm_smmu_tlb_inv_leaf,
+ -	.tlb_add_page	= arm_smmu_tlb_inv_page_nosync,
+ +	.tlb_add_flush	= arm_smmu_tlb_inv_range_nosync,
+ +	.tlb_sync	= arm_smmu_tlb_sync,
+  };
+  
+  /* IOMMU API */
+@@@ -2375,12 -2414,13 +2419,12 @@@ static void arm_smmu_flush_iotlb_all(st
+  		arm_smmu_tlb_inv_context(smmu_domain);
+  }
+  
+ -static void arm_smmu_iotlb_sync(struct iommu_domain *domain,
+ -				struct iommu_iotlb_gather *gather)
+ +static void arm_smmu_iotlb_sync(struct iommu_domain *domain)
+  {
+- 	struct arm_smmu_device *smmu = to_smmu_domain(domain)->smmu;
++ 	struct arm_smmu_domain *smmu_domain = to_smmu_domain(domain);
+  
+- 	if (smmu)
+- 		arm_smmu_cmdq_issue_sync(smmu);
++ 	arm_smmu_tlb_inv_range(gather->start, gather->end - gather->start,
++ 			       gather->pgsize, true, smmu_domain);
+  }
+  
+  static phys_addr_t
+* Unmerged path drivers/iommu/arm-smmu-v3.c
