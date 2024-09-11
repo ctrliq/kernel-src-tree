@@ -1,0 +1,127 @@
+net/mlx5: Avoid processing commands before cmdif is ready
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Eran Ben Elisha <eranbe@mellanox.com>
+commit f7936ddd35d8b849daf0372770c7c9dbe7910fca
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/f7936ddd.failed
+
+When driver is reloading during recovery flow, it can't get new commands
+till command interface is up again. Otherwise we may get to null pointer
+trying to access non initialized command structures.
+
+Add cmdif state to avoid processing commands while cmdif is not ready.
+
+Fixes: e126ba97dba9 ("mlx5: Add driver for Mellanox Connect-IB adapters")
+	Signed-off-by: Eran Ben Elisha <eranbe@mellanox.com>
+	Signed-off-by: Moshe Shemesh <moshe@mellanox.com>
+	Signed-off-by: Saeed Mahameed <saeedm@mellanox.com>
+(cherry picked from commit f7936ddd35d8b849daf0372770c7c9dbe7910fca)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/mlx5/driver.h
+diff --cc include/linux/mlx5/driver.h
+index 5d91b6fe6d62,8397b6558dc7..000000000000
+--- a/include/linux/mlx5/driver.h
++++ b/include/linux/mlx5/driver.h
+@@@ -213,21 -213,10 +213,28 @@@ enum mlx5_port_status 
+  	MLX5_PORT_DOWN      = 2,
+  };
+  
+++<<<<<<< HEAD
+ +struct mlx5_bfreg_info {
+ +	u32		       *sys_pages;
+ +	int			num_low_latency_bfregs;
+ +	unsigned int	       *count;
+ +
+ +	/*
+ +	 * protect bfreg allocation data structs
+ +	 */
+ +	struct mutex		lock;
+ +	u32			ver;
+ +	bool			lib_uar_4k;
+ +	u32			num_sys_pages;
+ +	u32			num_static_sys_pages;
+ +	u32			total_num_bfregs;
+ +	u32			num_dyn_bfregs;
+++=======
++ enum mlx5_cmdif_state {
++ 	MLX5_CMDIF_STATE_UNINITIALIZED,
++ 	MLX5_CMDIF_STATE_UP,
++ 	MLX5_CMDIF_STATE_DOWN,
+++>>>>>>> f7936ddd35d8 (net/mlx5: Avoid processing commands before cmdif is ready)
+  };
+  
+  struct mlx5_cmd_first {
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/cmd.c b/drivers/net/ethernet/mellanox/mlx5/core/cmd.c
+index b83e2c56d851..24af86de3c68 100644
+--- a/drivers/net/ethernet/mellanox/mlx5/core/cmd.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/cmd.c
+@@ -923,6 +923,7 @@ static void cmd_work_handler(struct work_struct *work)
+ 	/* Skip sending command to fw if internal error */
+ 	if (pci_channel_offline(dev->pdev) ||
+ 	    dev->state == MLX5_DEVICE_STATE_INTERNAL_ERROR ||
++	    cmd->state != MLX5_CMDIF_STATE_UP ||
+ 	    !opcode_allowed(&dev->cmd, ent->op)) {
+ 		u8 status = 0;
+ 		u32 drv_synd;
+@@ -1742,6 +1743,7 @@ static int cmd_exec(struct mlx5_core_dev *dev, void *in, int in_size, void *out,
+ 	opcode = MLX5_GET(mbox_in, in, opcode);
+ 	if (pci_channel_offline(dev->pdev) ||
+ 	    dev->state == MLX5_DEVICE_STATE_INTERNAL_ERROR ||
++	    dev->cmd.state != MLX5_CMDIF_STATE_UP ||
+ 	    !opcode_allowed(&dev->cmd, opcode)) {
+ 		err = mlx5_internal_err_ret_value(dev, opcode, &drv_synd, &status);
+ 		MLX5_SET(mbox_out, out, status, status);
+@@ -2007,6 +2009,7 @@ int mlx5_cmd_init(struct mlx5_core_dev *dev)
+ 		goto err_free_page;
+ 	}
+ 
++	cmd->state = MLX5_CMDIF_STATE_DOWN;
+ 	cmd->checksum_disabled = 1;
+ 	cmd->max_reg_cmds = (1 << cmd->log_sz) - 1;
+ 	cmd->bitmask = (1UL << cmd->max_reg_cmds) - 1;
+@@ -2091,3 +2094,10 @@ void mlx5_cmd_cleanup(struct mlx5_core_dev *dev)
+ 	dma_pool_destroy(cmd->pool);
+ }
+ EXPORT_SYMBOL(mlx5_cmd_cleanup);
++
++void mlx5_cmd_set_state(struct mlx5_core_dev *dev,
++			enum mlx5_cmdif_state cmdif_state)
++{
++	dev->cmd.state = cmdif_state;
++}
++EXPORT_SYMBOL(mlx5_cmd_set_state);
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/main.c b/drivers/net/ethernet/mellanox/mlx5/core/main.c
+index f31dce867245..e71898563e36 100644
+--- a/drivers/net/ethernet/mellanox/mlx5/core/main.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/main.c
+@@ -996,6 +996,8 @@ static int mlx5_function_setup(struct mlx5_core_dev *dev, bool boot)
+ 		goto err_cmd_cleanup;
+ 	}
+ 
++	mlx5_cmd_set_state(dev, MLX5_CMDIF_STATE_UP);
++
+ 	err = mlx5_core_enable_hca(dev, 0);
+ 	if (err) {
+ 		mlx5_core_err(dev, "enable hca failed\n");
+@@ -1059,6 +1061,7 @@ static int mlx5_function_setup(struct mlx5_core_dev *dev, bool boot)
+ err_disable_hca:
+ 	mlx5_core_disable_hca(dev, 0);
+ err_cmd_cleanup:
++	mlx5_cmd_set_state(dev, MLX5_CMDIF_STATE_DOWN);
+ 	mlx5_cmd_cleanup(dev);
+ 
+ 	return err;
+@@ -1076,6 +1079,7 @@ static int mlx5_function_teardown(struct mlx5_core_dev *dev, bool boot)
+ 	}
+ 	mlx5_reclaim_startup_pages(dev);
+ 	mlx5_core_disable_hca(dev, 0);
++	mlx5_cmd_set_state(dev, MLX5_CMDIF_STATE_DOWN);
+ 	mlx5_cmd_cleanup(dev);
+ 
+ 	return 0;
+* Unmerged path include/linux/mlx5/driver.h
