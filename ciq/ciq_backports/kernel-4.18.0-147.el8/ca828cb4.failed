@@ -1,0 +1,301 @@
+net/mlx5: EQ, Move all EQ logic to eq.c
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-147.el8
+commit-author Saeed Mahameed <saeedm@mellanox.com>
+commit ca828cb4686f1aece8d30541e11b8e21de1a7b0e
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-147.el8/ca828cb4.failed
+
+Move completion EQs flows from main.c to eq.c, reasons:
+1) It is where this logic belongs.
+2) It will help centralize the EQ logic in one file for downstream
+refactoring, and future extensions/updates.
+
+	Signed-off-by: Saeed Mahameed <saeedm@mellanox.com>
+	Reviewed-by: Leon Romanovsky <leonro@mellanox.com>
+	Reviewed-by: Tariq Toukan <tariqt@mellanox.com>
+	Signed-off-by: Leon Romanovsky <leonro@mellanox.com>
+(cherry picked from commit ca828cb4686f1aece8d30541e11b8e21de1a7b0e)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/mellanox/mlx5/core/main.c
+diff --cc drivers/net/ethernet/mellanox/mlx5/core/main.c
+index cfdc2f0b35a2,244fec4b2ef2..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx5/core/main.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/main.c
+@@@ -1167,16 -1009,16 +1005,20 @@@ static int mlx5_load_one(struct mlx5_co
+  		goto err_put_uars;
+  	}
+  
+++<<<<<<< HEAD
+ +	err = alloc_comp_eqs(dev);
+++=======
++ 	err = mlx5_fw_tracer_init(dev->tracer);
+  	if (err) {
+- 		dev_err(&pdev->dev, "Failed to alloc completion EQs\n");
+- 		goto err_stop_eqs;
++ 		dev_err(&pdev->dev, "Failed to init FW tracer\n");
++ 		goto err_fw_tracer;
+  	}
+  
+- 	err = mlx5_irq_set_affinity_hints(dev);
++ 	err = mlx5_alloc_comp_eqs(dev);
+++>>>>>>> ca828cb4686f (net/mlx5: EQ, Move all EQ logic to eq.c)
+  	if (err) {
+- 		dev_err(&pdev->dev, "Failed to alloc affinity hint cpumask\n");
+- 		goto err_affinity_hints;
++ 		dev_err(&pdev->dev, "Failed to alloc completion EQs\n");
+ -		goto err_comp_eqs;
+++		goto err_stop_eqs;
+  	}
+  
+  	err = mlx5_fpga_device_start(dev);
+@@@ -1247,12 -1089,12 +1089,9 @@@ err_ipsec_start
+  	mlx5_fpga_device_stop(dev);
+  
+  err_fpga_start:
+- 	mlx5_irq_clear_affinity_hints(dev);
+- 
+- err_affinity_hints:
+- 	free_comp_eqs(dev);
++ 	mlx5_free_comp_eqs(dev);
+  
+ -err_comp_eqs:
+ -	mlx5_fw_tracer_cleanup(dev->tracer);
+ -
+ -err_fw_tracer:
+ +err_stop_eqs:
+  	mlx5_stop_eqs(dev);
+  
+  err_put_uars:
+@@@ -1318,8 -1160,8 +1157,13 @@@ static int mlx5_unload_one(struct mlx5_
+  	mlx5_accel_ipsec_cleanup(dev);
+  	mlx5_accel_tls_cleanup(dev);
+  	mlx5_fpga_device_stop(dev);
+++<<<<<<< HEAD
+ +	mlx5_irq_clear_affinity_hints(dev);
+ +	free_comp_eqs(dev);
+++=======
++ 	mlx5_free_comp_eqs(dev);
++ 	mlx5_fw_tracer_cleanup(dev->tracer);
+++>>>>>>> ca828cb4686f (net/mlx5: EQ, Move all EQ logic to eq.c)
+  	mlx5_stop_eqs(dev);
+  	mlx5_put_uars_page(dev, priv->uar);
+  	mlx5_free_irq_vectors(dev);
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/eq.c b/drivers/net/ethernet/mellanox/mlx5/core/eq.c
+index bb2de668b530..c5d035896812 100644
+--- a/drivers/net/ethernet/mellanox/mlx5/core/eq.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/eq.c
+@@ -812,6 +812,8 @@ void mlx5_eq_cleanup(struct mlx5_core_dev *dev)
+ 	mlx5_eq_debugfs_cleanup(dev);
+ }
+ 
++/* Async EQs */
++
+ int mlx5_start_eqs(struct mlx5_core_dev *dev)
+ {
+ 	struct mlx5_eq_table *table = &dev->priv.eq_table;
+@@ -942,12 +944,186 @@ int mlx5_core_eq_query(struct mlx5_core_dev *dev, struct mlx5_eq *eq,
+ 	return mlx5_cmd_exec(dev, in, sizeof(in), out, outlen);
+ }
+ 
++/* Completion EQs */
++
++static int mlx5_irq_set_affinity_hint(struct mlx5_core_dev *mdev, int i)
++{
++	struct mlx5_priv *priv  = &mdev->priv;
++	int vecidx = MLX5_EQ_VEC_COMP_BASE + i;
++	int irq = pci_irq_vector(mdev->pdev, vecidx);
++
++	if (!zalloc_cpumask_var(&priv->irq_info[vecidx].mask, GFP_KERNEL)) {
++		mlx5_core_warn(mdev, "zalloc_cpumask_var failed");
++		return -ENOMEM;
++	}
++
++	cpumask_set_cpu(cpumask_local_spread(i, priv->numa_node),
++			priv->irq_info[vecidx].mask);
++
++	if (IS_ENABLED(CONFIG_SMP) &&
++	    irq_set_affinity_hint(irq, priv->irq_info[vecidx].mask))
++		mlx5_core_warn(mdev, "irq_set_affinity_hint failed, irq 0x%.4x", irq);
++
++	return 0;
++}
++
++static void mlx5_irq_clear_affinity_hint(struct mlx5_core_dev *mdev, int i)
++{
++	int vecidx = MLX5_EQ_VEC_COMP_BASE + i;
++	struct mlx5_priv *priv  = &mdev->priv;
++	int irq = pci_irq_vector(mdev->pdev, vecidx);
++
++	irq_set_affinity_hint(irq, NULL);
++	free_cpumask_var(priv->irq_info[vecidx].mask);
++}
++
++static int mlx5_irq_set_affinity_hints(struct mlx5_core_dev *mdev)
++{
++	int err;
++	int i;
++
++	for (i = 0; i < mdev->priv.eq_table.num_comp_vectors; i++) {
++		err = mlx5_irq_set_affinity_hint(mdev, i);
++		if (err)
++			goto err_out;
++	}
++
++	return 0;
++
++err_out:
++	for (i--; i >= 0; i--)
++		mlx5_irq_clear_affinity_hint(mdev, i);
++
++	return err;
++}
++
++static void mlx5_irq_clear_affinity_hints(struct mlx5_core_dev *mdev)
++{
++	int i;
++
++	for (i = 0; i < mdev->priv.eq_table.num_comp_vectors; i++)
++		mlx5_irq_clear_affinity_hint(mdev, i);
++}
++
++void mlx5_free_comp_eqs(struct mlx5_core_dev *dev)
++{
++	struct mlx5_eq_table *table = &dev->priv.eq_table;
++	struct mlx5_eq *eq, *n;
++
++	mlx5_irq_clear_affinity_hints(dev);
++
++#ifdef CONFIG_RFS_ACCEL
++	if (dev->rmap) {
++		free_irq_cpu_rmap(dev->rmap);
++		dev->rmap = NULL;
++	}
++#endif
++	list_for_each_entry_safe(eq, n, &table->comp_eqs_list, list) {
++		list_del(&eq->list);
++		if (mlx5_destroy_unmap_eq(dev, eq))
++			mlx5_core_warn(dev, "failed to destroy EQ 0x%x\n",
++				       eq->eqn);
++		kfree(eq);
++	}
++}
++
++int mlx5_alloc_comp_eqs(struct mlx5_core_dev *dev)
++{
++	struct mlx5_eq_table *table = &dev->priv.eq_table;
++	char name[MLX5_MAX_IRQ_NAME];
++	struct mlx5_eq *eq;
++	int ncomp_vec;
++	int nent;
++	int err;
++	int i;
++
++	INIT_LIST_HEAD(&table->comp_eqs_list);
++	ncomp_vec = table->num_comp_vectors;
++	nent = MLX5_COMP_EQ_SIZE;
++#ifdef CONFIG_RFS_ACCEL
++	dev->rmap = alloc_irq_cpu_rmap(ncomp_vec);
++	if (!dev->rmap)
++		return -ENOMEM;
++#endif
++	for (i = 0; i < ncomp_vec; i++) {
++		int vecidx = i + MLX5_EQ_VEC_COMP_BASE;
++
++		eq = kzalloc(sizeof(*eq), GFP_KERNEL);
++		if (!eq) {
++			err = -ENOMEM;
++			goto clean;
++		}
++
++#ifdef CONFIG_RFS_ACCEL
++		irq_cpu_rmap_add(dev->rmap, pci_irq_vector(dev->pdev, vecidx));
++#endif
++		snprintf(name, MLX5_MAX_IRQ_NAME, "mlx5_comp%d", i);
++		err = mlx5_create_map_eq(dev, eq, vecidx, nent, 0,
++					 name, MLX5_EQ_TYPE_COMP);
++		if (err) {
++			kfree(eq);
++			goto clean;
++		}
++		mlx5_core_dbg(dev, "allocated completion EQN %d\n", eq->eqn);
++		/* add tail, to keep the list ordered, for mlx5_vector2eqn to work */
++		list_add_tail(&eq->list, &table->comp_eqs_list);
++	}
++
++	err = mlx5_irq_set_affinity_hints(dev);
++	if (err) {
++		mlx5_core_err(dev, "Failed to alloc affinity hint cpumask\n");
++		goto clean;
++	}
++
++	return 0;
++
++clean:
++	mlx5_free_comp_eqs(dev);
++	return err;
++}
++
++int mlx5_vector2eqn(struct mlx5_core_dev *dev, int vector, int *eqn,
++		    unsigned int *irqn)
++{
++	struct mlx5_eq_table *table = &dev->priv.eq_table;
++	struct mlx5_eq *eq, *n;
++	int err = -ENOENT;
++	int i = 0;
++
++	list_for_each_entry_safe(eq, n, &table->comp_eqs_list, list) {
++		if (i++ == vector) {
++			*eqn = eq->eqn;
++			*irqn = eq->irqn;
++			err = 0;
++			break;
++		}
++	}
++
++	return err;
++}
++EXPORT_SYMBOL(mlx5_vector2eqn);
++
++struct mlx5_eq *mlx5_eqn2eq(struct mlx5_core_dev *dev, int eqn)
++{
++	struct mlx5_eq_table *table = &dev->priv.eq_table;
++	struct mlx5_eq *eq;
++
++	list_for_each_entry(eq, &table->comp_eqs_list, list) {
++		if (eq->eqn == eqn)
++			return eq;
++	}
++
++	return ERR_PTR(-ENOENT);
++}
++
+ /* This function should only be called after mlx5_cmd_force_teardown_hca */
+ void mlx5_core_eq_free_irqs(struct mlx5_core_dev *dev)
+ {
+ 	struct mlx5_eq_table *table = &dev->priv.eq_table;
+ 	struct mlx5_eq *eq;
+ 
++	mlx5_irq_clear_affinity_hints(dev);
++
+ #ifdef CONFIG_RFS_ACCEL
+ 	if (dev->rmap) {
+ 		free_irq_cpu_rmap(dev->rmap);
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/main.c
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/mlx5_core.h b/drivers/net/ethernet/mellanox/mlx5/core/mlx5_core.h
+index 0594d0961cb3..22cff00faa5a 100644
+--- a/drivers/net/ethernet/mellanox/mlx5/core/mlx5_core.h
++++ b/drivers/net/ethernet/mellanox/mlx5/core/mlx5_core.h
+@@ -136,6 +136,8 @@ int mlx5_core_eq_query(struct mlx5_core_dev *dev, struct mlx5_eq *eq,
+ 		       u32 *out, int outlen);
+ int mlx5_start_eqs(struct mlx5_core_dev *dev);
+ void mlx5_stop_eqs(struct mlx5_core_dev *dev);
++int mlx5_alloc_comp_eqs(struct mlx5_core_dev *dev);
++void mlx5_free_comp_eqs(struct mlx5_core_dev *dev);
+ /* This function should only be called after mlx5_cmd_force_teardown_hca */
+ void mlx5_core_eq_free_irqs(struct mlx5_core_dev *dev);
+ struct mlx5_eq *mlx5_eqn2eq(struct mlx5_core_dev *dev, int eqn);
