@@ -1,0 +1,177 @@
+net: skb: export skb drop reaons to user by TRACE_DEFINE_ENUM
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-448.el8
+commit-author Menglong Dong <imagedong@tencent.com>
+commit 9cb252c4c1c53ae58bc565bab76e98133288f23a
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-448.el8/9cb252c4.failed
+
+As Eric reported, the 'reason' field is not presented when trace the
+kfree_skb event by perf:
+
+$ perf record -e skb:kfree_skb -a sleep 10
+$ perf script
+  ip_defrag 14605 [021]   221.614303:   skb:kfree_skb:
+  skbaddr=0xffff9d2851242700 protocol=34525 location=0xffffffffa39346b1
+  reason:
+
+The cause seems to be passing kernel address directly to TP_printk(),
+which is not right. As the enum 'skb_drop_reason' is not exported to
+user space through TRACE_DEFINE_ENUM(), perf can't get the drop reason
+string from the 'reason' field, which is a number.
+
+Therefore, we introduce the macro DEFINE_DROP_REASON(), which is used
+to define the trace enum by TRACE_DEFINE_ENUM(). With the help of
+DEFINE_DROP_REASON(), now we can remove the auto-generate that we
+introduced in the commit ec43908dd556
+("net: skb: use auto-generation to convert skb drop reason to string"),
+and define the string array 'drop_reasons'.
+
+Hmmmm...now we come back to the situation that have to maintain drop
+reasons in both enum skb_drop_reason and DEFINE_DROP_REASON. But they
+are both in dropreason.h, which makes it easier.
+
+After this commit, now the format of kfree_skb is like this:
+
+$ cat /tracing/events/skb/kfree_skb/format
+name: kfree_skb
+ID: 1524
+format:
+        field:unsigned short common_type;       offset:0;       size:2; signed:0;
+        field:unsigned char common_flags;       offset:2;       size:1; signed:0;
+        field:unsigned char common_preempt_count;       offset:3;       size:1; signed:0;
+        field:int common_pid;   offset:4;       size:4; signed:1;
+
+        field:void * skbaddr;   offset:8;       size:8; signed:0;
+        field:void * location;  offset:16;      size:8; signed:0;
+        field:unsigned short protocol;  offset:24;      size:2; signed:0;
+        field:enum skb_drop_reason reason;      offset:28;      size:4; signed:0;
+
+print fmt: "skbaddr=%p protocol=%u location=%p reason: %s", REC->skbaddr, REC->protocol, REC->location, __print_symbolic(REC->reason, { 1, "NOT_SPECIFIED" }, { 2, "NO_SOCKET" } ......
+
+Fixes: ec43908dd556 ("net: skb: use auto-generation to convert skb drop reason to string")
+Link: https://lore.kernel.org/netdev/CANn89i+bx0ybvE55iMYf5GJM48WwV1HNpdm9Q6t-HaEstqpCSA@mail.gmail.com/
+	Reported-by: Eric Dumazet <edumazet@google.com>
+	Signed-off-by: Menglong Dong <imagedong@tencent.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 9cb252c4c1c53ae58bc565bab76e98133288f23a)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/net/dropreason.h
+#	include/trace/events/skb.h
+#	net/core/Makefile
+#	net/core/skbuff.c
+diff --cc include/trace/events/skb.h
+index 294c61bbe44b,50a974f7dfb4..000000000000
+--- a/include/trace/events/skb.h
++++ b/include/trace/events/skb.h
+@@@ -9,22 -9,14 +9,33 @@@
+  #include <linux/netdevice.h>
+  #include <linux/tracepoint.h>
+  
+++<<<<<<< HEAD
+ +#define TRACE_SKB_DROP_REASON					\
+ +	EM(SKB_DROP_REASON_NOT_SPECIFIED, NOT_SPECIFIED)	\
+ +	EMe(SKB_DROP_REASON_MAX, MAX)
+ +
+ +#undef EM
+ +#undef EMe
+ +
+ +#define EM(a, b)	TRACE_DEFINE_ENUM(a);
+ +#define EMe(a, b)	TRACE_DEFINE_ENUM(a);
+ +
+ +TRACE_SKB_DROP_REASON
+ +
+ +#undef EM
+ +#undef EMe
+ +#define EM(a, b)	{ a, #b },
+ +#define EMe(a, b)	{ a, #b }
+++=======
++ #undef FN
++ #define FN(reason)	TRACE_DEFINE_ENUM(SKB_DROP_REASON_##reason);
++ DEFINE_DROP_REASON(FN, FN)
++ 
++ #undef FN
++ #undef FNe
++ #define FN(reason)	{ SKB_DROP_REASON_##reason, #reason },
++ #define FNe(reason)	{ SKB_DROP_REASON_##reason, #reason }
+++>>>>>>> 9cb252c4c1c5 (net: skb: export skb drop reaons to user by TRACE_DEFINE_ENUM)
+  
+  /*
+   * Tracepoint for free an sk_buff:
+@@@ -53,9 -45,12 +64,16 @@@ TRACE_EVENT(kfree_skb
+  	TP_printk("skbaddr=%p protocol=%u location=%p reason: %s",
+  		  __entry->skbaddr, __entry->protocol, __entry->location,
+  		  __print_symbolic(__entry->reason,
+++<<<<<<< HEAD
+ +				   TRACE_SKB_DROP_REASON))
+++=======
++ 				   DEFINE_DROP_REASON(FN, FNe)))
+++>>>>>>> 9cb252c4c1c5 (net: skb: export skb drop reaons to user by TRACE_DEFINE_ENUM)
+  );
+  
++ #undef FN
++ #undef FNe
++ 
+  TRACE_EVENT(consume_skb,
+  
+  	TP_PROTO(struct sk_buff *skb),
+diff --cc net/core/Makefile
+index 0c2233c826fd,5857cec87b83..000000000000
+--- a/net/core/Makefile
++++ b/net/core/Makefile
+@@@ -4,7 -4,8 +4,12 @@@
+  #
+  
+  obj-y := sock.o request_sock.o skbuff.o datagram.o stream.o scm.o \
+++<<<<<<< HEAD
+ +	 gen_stats.o gen_estimator.o net_namespace.o secure_seq.o flow_dissector.o
+++=======
++ 	 gen_stats.o gen_estimator.o net_namespace.o secure_seq.o \
++ 	 flow_dissector.o
+++>>>>>>> 9cb252c4c1c5 (net: skb: export skb drop reaons to user by TRACE_DEFINE_ENUM)
+  
+  obj-$(CONFIG_SYSCTL) += sysctl_net_core.o
+  
+@@@ -32,8 -36,7 +37,12 @@@ obj-$(CONFIG_HWBM) += hwbm.
+  obj-$(CONFIG_NET_DEVLINK) += devlink.o
+  obj-$(CONFIG_GRO_CELLS) += gro_cells.o
+  obj-$(CONFIG_FAILOVER) += failover.o
+ +ifeq ($(CONFIG_INET),y)
+  obj-$(CONFIG_NET_SOCK_MSG) += skmsg.o
+  obj-$(CONFIG_BPF_SYSCALL) += sock_map.o
+ +endif
+  obj-$(CONFIG_BPF_SYSCALL) += bpf_sk_storage.o
+++<<<<<<< HEAD
+++=======
++ obj-$(CONFIG_OF)	+= of_net.o
+++>>>>>>> 9cb252c4c1c5 (net: skb: export skb drop reaons to user by TRACE_DEFINE_ENUM)
+diff --cc net/core/skbuff.c
+index d7c555eb9bac,417463da4fac..000000000000
+--- a/net/core/skbuff.c
++++ b/net/core/skbuff.c
+@@@ -92,6 -91,13 +92,16 @@@ static struct kmem_cache *skbuff_ext_ca
+  int sysctl_max_skb_frags __read_mostly = MAX_SKB_FRAGS;
+  EXPORT_SYMBOL(sysctl_max_skb_frags);
+  
+++<<<<<<< HEAD
+++=======
++ #undef FN
++ #define FN(reason) [SKB_DROP_REASON_##reason] = #reason,
++ const char * const drop_reasons[] = {
++ 	DEFINE_DROP_REASON(FN, FN)
++ };
++ EXPORT_SYMBOL(drop_reasons);
++ 
+++>>>>>>> 9cb252c4c1c5 (net: skb: export skb drop reaons to user by TRACE_DEFINE_ENUM)
+  /**
+   *	skb_panic - private function for out-of-line support
+   *	@skb:	buffer
+* Unmerged path include/net/dropreason.h
+* Unmerged path include/net/dropreason.h
+* Unmerged path include/trace/events/skb.h
+* Unmerged path net/core/Makefile
+* Unmerged path net/core/skbuff.c
