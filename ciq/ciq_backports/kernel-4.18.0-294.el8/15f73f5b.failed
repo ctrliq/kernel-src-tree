@@ -1,0 +1,511 @@
+blk-mq: move failure injection out of blk_mq_complete_request
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Christoph Hellwig <hch@lst.de>
+commit 15f73f5b3e5958f2d169fe13c420eeeeae07bbf2
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/15f73f5b.failed
+
+Move the call to blk_should_fake_timeout out of blk_mq_complete_request
+and into the drivers, skipping call sites that are obvious error
+handlers, and remove the now superflous blk_mq_force_complete_rq helper.
+This ensures we don't keep injecting errors into completions that just
+terminate the Linux request after the hardware has been reset or the
+command has been aborted.
+
+	Reviewed-by: Daniel Wagner <dwagner@suse.de>
+	Signed-off-by: Christoph Hellwig <hch@lst.de>
+	Signed-off-by: Jens Axboe <axboe@kernel.dk>
+(cherry picked from commit 15f73f5b3e5958f2d169fe13c420eeeeae07bbf2)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	block/blk.h
+#	drivers/mmc/core/block.c
+#	include/linux/blk-mq.h
+diff --cc block/blk.h
+index 0fea53c91ae4,8ba4a5e4fe07..000000000000
+--- a/block/blk.h
++++ b/block/blk.h
+@@@ -202,22 -213,26 +202,29 @@@ static inline void elevator_exit(struc
+  
+  struct hd_struct *__disk_get_part(struct gendisk *disk, int partno);
+  
+++<<<<<<< HEAD
+ +#ifdef CONFIG_FAIL_IO_TIMEOUT
+ +int blk_should_fake_timeout(struct request_queue *);
+++=======
++ ssize_t part_size_show(struct device *dev, struct device_attribute *attr,
++ 		char *buf);
++ ssize_t part_stat_show(struct device *dev, struct device_attribute *attr,
++ 		char *buf);
++ ssize_t part_inflight_show(struct device *dev, struct device_attribute *attr,
++ 		char *buf);
++ ssize_t part_fail_show(struct device *dev, struct device_attribute *attr,
++ 		char *buf);
++ ssize_t part_fail_store(struct device *dev, struct device_attribute *attr,
++ 		const char *buf, size_t count);
+++>>>>>>> 15f73f5b3e59 (blk-mq: move failure injection out of blk_mq_complete_request)
+  ssize_t part_timeout_show(struct device *, struct device_attribute *, char *);
+  ssize_t part_timeout_store(struct device *, struct device_attribute *,
+  				const char *, size_t);
+- #else
+- static inline int blk_should_fake_timeout(struct request_queue *q)
+- {
+- 	return 0;
+- }
+- #endif
+  
+ -void __blk_queue_split(struct request_queue *q, struct bio **bio,
+ -		unsigned int *nr_segs);
+ -int ll_back_merge_fn(struct request *req, struct bio *bio,
+ -		unsigned int nr_segs);
+ -int ll_front_merge_fn(struct request *req,  struct bio *bio,
+ -		unsigned int nr_segs);
+ +int ll_back_merge_fn(struct request_queue *q, struct request *req,
+ +		     struct bio *bio);
+ +int ll_front_merge_fn(struct request_queue *q, struct request *req, 
+ +		      struct bio *bio);
+  struct request *attempt_back_merge(struct request_queue *q, struct request *rq);
+  struct request *attempt_front_merge(struct request_queue *q, struct request *rq);
+  int blk_attempt_req_merge(struct request_queue *q, struct request *rq,
+diff --cc drivers/mmc/core/block.c
+index dc8f6d530055,4791c82f8f7c..000000000000
+--- a/drivers/mmc/core/block.c
++++ b/drivers/mmc/core/block.c
+@@@ -1945,7 -1892,42 +1945,46 @@@ static void mmc_blk_urgent_bkops(struc
+  				 struct mmc_queue_req *mqrq)
+  {
+  	if (mmc_blk_urgent_bkops_needed(mq, mqrq))
+++<<<<<<< HEAD
+ +		mmc_start_bkops(mq->card, true);
+++=======
++ 		mmc_run_bkops(mq->card);
++ }
++ 
++ static void mmc_blk_hsq_req_done(struct mmc_request *mrq)
++ {
++ 	struct mmc_queue_req *mqrq =
++ 		container_of(mrq, struct mmc_queue_req, brq.mrq);
++ 	struct request *req = mmc_queue_req_to_req(mqrq);
++ 	struct request_queue *q = req->q;
++ 	struct mmc_queue *mq = q->queuedata;
++ 	struct mmc_host *host = mq->card->host;
++ 	unsigned long flags;
++ 
++ 	if (mmc_blk_rq_error(&mqrq->brq) ||
++ 	    mmc_blk_urgent_bkops_needed(mq, mqrq)) {
++ 		spin_lock_irqsave(&mq->lock, flags);
++ 		mq->recovery_needed = true;
++ 		mq->recovery_req = req;
++ 		spin_unlock_irqrestore(&mq->lock, flags);
++ 
++ 		host->cqe_ops->cqe_recovery_start(host);
++ 
++ 		schedule_work(&mq->recovery_work);
++ 		return;
++ 	}
++ 
++ 	mmc_blk_rw_reset_success(mq, req);
++ 
++ 	/*
++ 	 * Block layer timeouts race with completions which means the normal
++ 	 * completion path cannot be used during recovery.
++ 	 */
++ 	if (mq->in_recovery)
++ 		mmc_blk_cqe_complete_rq(mq, req);
++ 	else if (likely(!blk_should_fake_timeout(req->q)))
++ 		blk_mq_complete_request(req);
+++>>>>>>> 15f73f5b3e59 (blk-mq: move failure injection out of blk_mq_complete_request)
+  }
+  
+  void mmc_blk_mq_complete(struct request *req)
+diff --cc include/linux/blk-mq.h
+index 200eeffcb439,8e6ab766aef7..000000000000
+--- a/include/linux/blk-mq.h
++++ b/include/linux/blk-mq.h
+@@@ -398,10 -503,9 +398,9 @@@ void __blk_mq_end_request(struct reques
+  void blk_mq_requeue_request(struct request *rq, bool kick_requeue_list);
+  void blk_mq_kick_requeue_list(struct request_queue *q);
+  void blk_mq_delay_kick_requeue_list(struct request_queue *q, unsigned long msecs);
+- bool blk_mq_complete_request(struct request *rq);
+- void blk_mq_force_complete_rq(struct request *rq);
++ void blk_mq_complete_request(struct request *rq);
+  bool blk_mq_bio_list_merge(struct request_queue *q, struct list_head *list,
+ -			   struct bio *bio, unsigned int nr_segs);
+ +			   struct bio *bio);
+  bool blk_mq_queue_stopped(struct request_queue *q);
+  void blk_mq_stop_hw_queue(struct blk_mq_hw_ctx *hctx);
+  void blk_mq_start_hw_queue(struct blk_mq_hw_ctx *hctx);
+@@@ -432,9 -536,23 +431,27 @@@ void blk_mq_quiesce_queue_nowait(struc
+  
+  unsigned int blk_mq_rq_cpu(struct request *rq);
+  
+++<<<<<<< HEAD
+ +/*
+++=======
++ bool __blk_should_fake_timeout(struct request_queue *q);
++ static inline bool blk_should_fake_timeout(struct request_queue *q)
++ {
++ 	if (IS_ENABLED(CONFIG_FAIL_IO_TIMEOUT) &&
++ 	    test_bit(QUEUE_FLAG_FAIL_IO, &q->queue_flags))
++ 		return __blk_should_fake_timeout(q);
++ 	return false;
++ }
++ 
++ /**
++  * blk_mq_rq_from_pdu - cast a PDU to a request
++  * @pdu: the PDU (Protocol Data Unit) to be casted
++  *
++  * Return: request
++  *
+++>>>>>>> 15f73f5b3e59 (blk-mq: move failure injection out of blk_mq_complete_request)
+   * Driver command data is immediately after the request. So subtract request
+ - * size to get back to the original request.
+ + * size to get back to the original request, add request size to get the PDU.
+   */
+  static inline struct request *blk_mq_rq_from_pdu(void *pdu)
+  {
+diff --git a/block/blk-mq.c b/block/blk-mq.c
+index 8c9d610d9153..bfb146adbb87 100644
+--- a/block/blk-mq.c
++++ b/block/blk-mq.c
+@@ -582,16 +582,13 @@ static void __blk_mq_complete_request_remote(void *data)
+ }
+ 
+ /**
+- * blk_mq_force_complete_rq() - Force complete the request, bypassing any error
+- * 				injection that could drop the completion.
+- * @rq: Request to be force completed
++ * blk_mq_complete_request - end I/O on a request
++ * @rq:		the request being processed
+  *
+- * Drivers should use blk_mq_complete_request() to complete requests in their
+- * normal IO path. For timeout error recovery, drivers may call this forced
+- * completion routine after they've reclaimed timed out requests to bypass
+- * potentially subsequent fake timeouts.
+- */
+-void blk_mq_force_complete_rq(struct request *rq)
++ * Description:
++ *	Complete a request by scheduling the ->complete_rq operation.
++ **/
++void blk_mq_complete_request(struct request *rq)
+ {
+ 	struct blk_mq_ctx *ctx = rq->mq_ctx;
+ 	struct request_queue *q = rq->q;
+@@ -643,7 +640,7 @@ void blk_mq_force_complete_rq(struct request *rq)
+ 	}
+ 	put_cpu();
+ }
+-EXPORT_SYMBOL_GPL(blk_mq_force_complete_rq);
++EXPORT_SYMBOL(blk_mq_complete_request);
+ 
+ static void hctx_unlock(struct blk_mq_hw_ctx *hctx, int srcu_idx)
+ 	__releases(hctx->srcu)
+@@ -665,23 +662,6 @@ static void hctx_lock(struct blk_mq_hw_ctx *hctx, int *srcu_idx)
+ 		*srcu_idx = srcu_read_lock(hctx->srcu);
+ }
+ 
+-/**
+- * blk_mq_complete_request - end I/O on a request
+- * @rq:		the request being processed
+- *
+- * Description:
+- *	Ends all I/O on a request. It does not handle partial completions.
+- *	The actual completion happens out-of-order, through a IPI handler.
+- **/
+-bool blk_mq_complete_request(struct request *rq)
+-{
+-	if (unlikely(blk_should_fake_timeout(rq->q)))
+-		return false;
+-	blk_mq_force_complete_rq(rq);
+-	return true;
+-}
+-EXPORT_SYMBOL(blk_mq_complete_request);
+-
+ /**
+  * blk_mq_start_request - Start processing a request
+  * @rq: Pointer to request to be started
+diff --git a/block/blk-timeout.c b/block/blk-timeout.c
+index 124c26128bf6..c51bb7acd267 100644
+--- a/block/blk-timeout.c
++++ b/block/blk-timeout.c
+@@ -19,13 +19,11 @@ static int __init setup_fail_io_timeout(char *str)
+ }
+ __setup("fail_io_timeout=", setup_fail_io_timeout);
+ 
+-int blk_should_fake_timeout(struct request_queue *q)
++bool __blk_should_fake_timeout(struct request_queue *q)
+ {
+-	if (!test_bit(QUEUE_FLAG_FAIL_IO, &q->queue_flags))
+-		return 0;
+-
+ 	return should_fail(&fail_io_timeout, 1);
+ }
++EXPORT_SYMBOL_GPL(__blk_should_fake_timeout);
+ 
+ static int __init fail_io_timeout_debugfs(void)
+ {
+* Unmerged path block/blk.h
+diff --git a/block/bsg-lib.c b/block/bsg-lib.c
+index 023101e993df..d4c3b3596f2f 100644
+--- a/block/bsg-lib.c
++++ b/block/bsg-lib.c
+@@ -195,9 +195,12 @@ EXPORT_SYMBOL_GPL(bsg_job_get);
+ void bsg_job_done(struct bsg_job *job, int result,
+ 		  unsigned int reply_payload_rcv_len)
+ {
++	struct request *rq = blk_mq_rq_from_pdu(job);
++
+ 	job->result = result;
+ 	job->reply_payload_rcv_len = reply_payload_rcv_len;
+-	blk_mq_complete_request(blk_mq_rq_from_pdu(job));
++	if (likely(!blk_should_fake_timeout(rq->q)))
++		blk_mq_complete_request(rq);
+ }
+ EXPORT_SYMBOL_GPL(bsg_job_done);
+ 
+diff --git a/drivers/block/loop.c b/drivers/block/loop.c
+index e960f36a8462..69c6d906586a 100644
+--- a/drivers/block/loop.c
++++ b/drivers/block/loop.c
+@@ -517,7 +517,8 @@ static void lo_rw_aio_do_completion(struct loop_cmd *cmd)
+ 		return;
+ 	kfree(cmd->bvec);
+ 	cmd->bvec = NULL;
+-	blk_mq_complete_request(rq);
++	if (likely(!blk_should_fake_timeout(rq->q)))
++		blk_mq_complete_request(rq);
+ }
+ 
+ static void lo_rw_aio_complete(struct kiocb *iocb, long ret, long ret2)
+@@ -2061,7 +2062,8 @@ static void loop_handle_cmd(struct loop_cmd *cmd)
+ 			cmd->ret = ret;
+ 		else
+ 			cmd->ret = ret ? -EIO : 0;
+-		blk_mq_complete_request(rq);
++		if (likely(!blk_should_fake_timeout(rq->q)))
++			blk_mq_complete_request(rq);
+ 	}
+ }
+ 
+diff --git a/drivers/block/mtip32xx/mtip32xx.c b/drivers/block/mtip32xx/mtip32xx.c
+index 02b7fa291dc0..15c6a028de32 100644
+--- a/drivers/block/mtip32xx/mtip32xx.c
++++ b/drivers/block/mtip32xx/mtip32xx.c
+@@ -537,7 +537,8 @@ static void mtip_complete_command(struct mtip_cmd *cmd, blk_status_t status)
+ 	struct request *req = blk_mq_rq_from_pdu(cmd);
+ 
+ 	cmd->status = status;
+-	blk_mq_complete_request(req);
++	if (likely(!blk_should_fake_timeout(req->q)))
++		blk_mq_complete_request(req);
+ }
+ 
+ /*
+diff --git a/drivers/block/nbd.c b/drivers/block/nbd.c
+index 75841fc8f85b..99e510e8d8e3 100644
+--- a/drivers/block/nbd.c
++++ b/drivers/block/nbd.c
+@@ -772,6 +772,7 @@ static void recv_work(struct work_struct *work)
+ 	struct nbd_device *nbd = args->nbd;
+ 	struct nbd_config *config = nbd->config;
+ 	struct nbd_cmd *cmd;
++	struct request *rq;
+ 
+ 	while (1) {
+ 		cmd = nbd_read_stat(nbd, args->index);
+@@ -784,7 +785,9 @@ static void recv_work(struct work_struct *work)
+ 			break;
+ 		}
+ 
+-		blk_mq_complete_request(blk_mq_rq_from_pdu(cmd));
++		rq = blk_mq_rq_from_pdu(cmd);
++		if (likely(!blk_should_fake_timeout(rq->q)))
++			blk_mq_complete_request(rq);
+ 	}
+ 	atomic_dec(&config->recv_threads);
+ 	wake_up(&config->recv_wq);
+diff --git a/drivers/block/null_blk_main.c b/drivers/block/null_blk_main.c
+index a242cf012ea6..c92dc9f9b764 100644
+--- a/drivers/block/null_blk_main.c
++++ b/drivers/block/null_blk_main.c
+@@ -1282,7 +1282,8 @@ static inline void nullb_complete_cmd(struct nullb_cmd *cmd)
+ 	case NULL_IRQ_SOFTIRQ:
+ 		switch (cmd->nq->dev->queue_mode) {
+ 		case NULL_Q_MQ:
+-			blk_mq_complete_request(cmd->rq);
++			if (likely(!blk_should_fake_timeout(cmd->rq->q)))
++				blk_mq_complete_request(cmd->rq);
+ 			break;
+ 		case NULL_Q_BIO:
+ 			/*
+@@ -1409,7 +1410,7 @@ static bool should_requeue_request(struct request *rq)
+ static enum blk_eh_timer_return null_timeout_rq(struct request *rq, bool res)
+ {
+ 	pr_info("rq %p timed out\n", rq);
+-	blk_mq_force_complete_rq(rq);
++	blk_mq_complete_request(rq);
+ 	return BLK_EH_DONE;
+ }
+ 
+diff --git a/drivers/block/skd_main.c b/drivers/block/skd_main.c
+index 59f10a849288..722fc5be95a6 100644
+--- a/drivers/block/skd_main.c
++++ b/drivers/block/skd_main.c
+@@ -1418,7 +1418,8 @@ static void skd_resolve_req_exception(struct skd_device *skdev,
+ 	case SKD_CHECK_STATUS_REPORT_GOOD:
+ 	case SKD_CHECK_STATUS_REPORT_SMART_ALERT:
+ 		skreq->status = BLK_STS_OK;
+-		blk_mq_complete_request(req);
++		if (likely(!blk_should_fake_timeout(req->q)))
++			blk_mq_complete_request(req);
+ 		break;
+ 
+ 	case SKD_CHECK_STATUS_BUSY_IMMINENT:
+@@ -1441,7 +1442,8 @@ static void skd_resolve_req_exception(struct skd_device *skdev,
+ 	case SKD_CHECK_STATUS_REPORT_ERROR:
+ 	default:
+ 		skreq->status = BLK_STS_IOERR;
+-		blk_mq_complete_request(req);
++		if (likely(!blk_should_fake_timeout(req->q)))
++			blk_mq_complete_request(req);
+ 		break;
+ 	}
+ }
+@@ -1561,7 +1563,8 @@ static int skd_isr_completion_posted(struct skd_device *skdev,
+ 		 */
+ 		if (likely(cmp_status == SAM_STAT_GOOD)) {
+ 			skreq->status = BLK_STS_OK;
+-			blk_mq_complete_request(rq);
++			if (likely(!blk_should_fake_timeout(rq->q)))
++				blk_mq_complete_request(rq);
+ 		} else {
+ 			skd_resolve_req_exception(skdev, skreq, rq);
+ 		}
+diff --git a/drivers/block/virtio_blk.c b/drivers/block/virtio_blk.c
+index b815996da37f..9b3ef1f22051 100644
+--- a/drivers/block/virtio_blk.c
++++ b/drivers/block/virtio_blk.c
+@@ -256,7 +256,8 @@ static void virtblk_done(struct virtqueue *vq)
+ 		while ((vbr = virtqueue_get_buf(vblk->vqs[qid].vq, &len)) != NULL) {
+ 			struct request *req = blk_mq_rq_from_pdu(vbr);
+ 
+-			blk_mq_complete_request(req);
++			if (likely(!blk_should_fake_timeout(req->q)))
++				blk_mq_complete_request(req);
+ 			req_done = true;
+ 		}
+ 		if (unlikely(virtqueue_is_broken(vq)))
+diff --git a/drivers/block/xen-blkfront.c b/drivers/block/xen-blkfront.c
+index 164c1939ed31..d935a436acc4 100644
+--- a/drivers/block/xen-blkfront.c
++++ b/drivers/block/xen-blkfront.c
+@@ -1641,7 +1641,8 @@ static irqreturn_t blkif_interrupt(int irq, void *dev_id)
+ 			BUG();
+ 		}
+ 
+-		blk_mq_complete_request(req);
++		if (likely(!blk_should_fake_timeout(req->q)))
++			blk_mq_complete_request(req);
+ 	}
+ 
+ 	rinfo->ring.rsp_cons = i;
+diff --git a/drivers/md/dm-rq.c b/drivers/md/dm-rq.c
+index 20745e2e34b9..6d743ff6a314 100644
+--- a/drivers/md/dm-rq.c
++++ b/drivers/md/dm-rq.c
+@@ -281,7 +281,8 @@ static void dm_complete_request(struct request *rq, blk_status_t error)
+ 	struct dm_rq_target_io *tio = tio_from_request(rq);
+ 
+ 	tio->error = error;
+-	blk_mq_complete_request(rq);
++	if (likely(!blk_should_fake_timeout(rq->q)))
++		blk_mq_complete_request(rq);
+ }
+ 
+ /*
+* Unmerged path drivers/mmc/core/block.c
+diff --git a/drivers/nvme/host/core.c b/drivers/nvme/host/core.c
+index f1a727c76817..49b42acf64d2 100644
+--- a/drivers/nvme/host/core.c
++++ b/drivers/nvme/host/core.c
+@@ -370,7 +370,7 @@ bool nvme_cancel_request(struct request *req, void *data, bool reserved)
+ 		return true;
+ 
+ 	nvme_req(req)->status = NVME_SC_HOST_ABORTED_CMD;
+-	blk_mq_force_complete_rq(req);
++	blk_mq_complete_request(req);
+ 	return true;
+ }
+ EXPORT_SYMBOL_GPL(nvme_cancel_request);
+diff --git a/drivers/nvme/host/nvme.h b/drivers/nvme/host/nvme.h
+index 54a88d07a42d..5e29a464396f 100644
+--- a/drivers/nvme/host/nvme.h
++++ b/drivers/nvme/host/nvme.h
+@@ -485,7 +485,8 @@ static inline void nvme_end_request(struct request *req, __le16 status,
+ 	rq->result = result;
+ 	/* inject error when permitted by fault injection framework */
+ 	nvme_should_fail(req);
+-	blk_mq_complete_request(req);
++	if (likely(!blk_should_fake_timeout(req->q)))
++		blk_mq_complete_request(req);
+ }
+ 
+ static inline void nvme_get_ctrl(struct nvme_ctrl *ctrl)
+diff --git a/drivers/s390/block/dasd.c b/drivers/s390/block/dasd.c
+index e0989042c806..785c34ed0f85 100644
+--- a/drivers/s390/block/dasd.c
++++ b/drivers/s390/block/dasd.c
+@@ -2816,7 +2816,7 @@ static void __dasd_cleanup_cqr(struct dasd_ccw_req *cqr)
+ 			blk_update_request(req, BLK_STS_OK,
+ 					   blk_rq_bytes(req) - proc_bytes);
+ 			blk_mq_requeue_request(req, true);
+-		} else {
++		} else if (likely(!blk_should_fake_timeout(req->q))) {
+ 			blk_mq_complete_request(req);
+ 		}
+ 	}
+diff --git a/drivers/s390/block/scm_blk.c b/drivers/s390/block/scm_blk.c
+index 7559ac40f01b..5c031dcc32f2 100644
+--- a/drivers/s390/block/scm_blk.c
++++ b/drivers/s390/block/scm_blk.c
+@@ -256,7 +256,8 @@ static void scm_request_finish(struct scm_request *scmrq)
+ 	for (i = 0; i < nr_requests_per_io && scmrq->request[i]; i++) {
+ 		error = blk_mq_rq_to_pdu(scmrq->request[i]);
+ 		*error = scmrq->error;
+-		blk_mq_complete_request(scmrq->request[i]);
++		if (likely(!blk_should_fake_timeout(scmrq->request[i]->q)))
++			blk_mq_complete_request(scmrq->request[i]);
+ 	}
+ 
+ 	atomic_dec(&bdev->queued_reqs);
+diff --git a/drivers/scsi/scsi_lib.c b/drivers/scsi/scsi_lib.c
+index 7a0d8a09ffdc..e79c410282eb 100644
+--- a/drivers/scsi/scsi_lib.c
++++ b/drivers/scsi/scsi_lib.c
+@@ -1611,18 +1611,12 @@ static blk_status_t scsi_mq_prep_fn(struct request *req)
+ 
+ static void scsi_mq_done(struct scsi_cmnd *cmd)
+ {
++	if (unlikely(blk_should_fake_timeout(cmd->request->q)))
++		return;
+ 	if (unlikely(test_and_set_bit(SCMD_STATE_COMPLETE, &cmd->state)))
+ 		return;
+ 	trace_scsi_dispatch_cmd_done(cmd);
+-
+-	/*
+-	 * If the block layer didn't complete the request due to a timeout
+-	 * injection, scsi must clear its internal completed state so that the
+-	 * timeout handler will see it needs to escalate its own error
+-	 * recovery.
+-	 */
+-	if (unlikely(!blk_mq_complete_request(cmd->request)))
+-		clear_bit(SCMD_STATE_COMPLETE, &cmd->state);
++	blk_mq_complete_request(cmd->request);
+ }
+ 
+ static void scsi_mq_put_budget(struct blk_mq_hw_ctx *hctx)
+* Unmerged path include/linux/blk-mq.h
