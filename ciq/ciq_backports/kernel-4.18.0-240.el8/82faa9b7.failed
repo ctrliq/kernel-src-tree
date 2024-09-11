@@ -1,0 +1,117 @@
+igc: Add support for ETF offloading
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Vinicius Costa Gomes <vinicius.gomes@intel.com>
+commit 82faa9b799500f9e002067c6d8cb027ab12acca4
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/82faa9b7.failed
+
+This adds support for ETF offloading for the i225 controller.
+
+For i225, the LaunchTime feature is almost a subset of the Qbv
+feature. The main change from the i210 is that the launchtime of each
+packet is specified as an offset applied to the BASET register. BASET
+is automatically incremented each cycle.
+
+For i225, the approach chosen is to re-use most of the setup used for
+taprio offloading. With a few changes:
+
+ - The more or less obvious one is that when ETF is enabled, we should
+ set add the expected launchtime to the (advanced) transmit
+ descriptor;
+
+ - The less obvious, is that when taprio offloading is not enabled, we
+ add a dummy schedule (all queues are open all the time, with a cycle
+ time of 1 second).
+
+	Signed-off-by: Vinicius Costa Gomes <vinicius.gomes@intel.com>
+	Reviewed-by: Andre Guedes <andre.guedes@intel.com>
+	Tested-by: Aaron Brown <aaron.f.brown@intel.com>
+	Signed-off-by: Jeff Kirsher <jeffrey.t.kirsher@intel.com>
+(cherry picked from commit 82faa9b799500f9e002067c6d8cb027ab12acca4)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/intel/igc/igc_main.c
+diff --cc drivers/net/ethernet/intel/igc/igc_main.c
+index 540f446a5c1f,896b314035c9..000000000000
+--- a/drivers/net/ethernet/intel/igc/igc_main.c
++++ b/drivers/net/ethernet/intel/igc/igc_main.c
+@@@ -898,9 -914,12 +914,18 @@@ static void igc_tx_ctxtdesc(struct igc_
+  	 * should have been handled by the upper layers.
+  	 */
+  	if (tx_ring->launchtime_enable) {
+++<<<<<<< HEAD
+ +		ts = ns_to_timespec64(first->skb->tstamp);
+ +		first->skb->tstamp = 0;
+ +		context_desc->launch_time = cpu_to_le32(ts.tv_nsec / 32);
+++=======
++ 		struct igc_adapter *adapter = netdev_priv(tx_ring->netdev);
++ 		ktime_t txtime = first->skb->tstamp;
++ 
++ 		first->skb->tstamp = ktime_set(0, 0);
++ 		context_desc->launch_time = igc_tx_launchtime(adapter,
++ 							      txtime);
+++>>>>>>> 82faa9b79950 (igc: Add support for ETF offloading)
+  	} else {
+  		context_desc->launch_time = 0;
+  	}
+diff --git a/drivers/net/ethernet/intel/igc/igc_defines.h b/drivers/net/ethernet/intel/igc/igc_defines.h
+index 711df4fcf33f..d3a642e9541e 100644
+--- a/drivers/net/ethernet/intel/igc/igc_defines.h
++++ b/drivers/net/ethernet/intel/igc/igc_defines.h
+@@ -440,6 +440,7 @@
+ #define IGC_TQAVCTRL_TRANSMIT_MODE_TSN	0x00000001
+ #define IGC_TQAVCTRL_ENHANCED_QAV	0x00000008
+ 
++#define IGC_TXQCTL_QUEUE_MODE_LAUNCHT	0x00000001
+ #define IGC_TXQCTL_STRICT_CYCLE		0x00000002
+ #define IGC_TXQCTL_STRICT_END		0x00000004
+ 
+* Unmerged path drivers/net/ethernet/intel/igc/igc_main.c
+diff --git a/drivers/net/ethernet/intel/igc/igc_tsn.c b/drivers/net/ethernet/intel/igc/igc_tsn.c
+index 257fe970afe8..174103c4bea6 100644
+--- a/drivers/net/ethernet/intel/igc/igc_tsn.c
++++ b/drivers/net/ethernet/intel/igc/igc_tsn.c
+@@ -4,6 +4,20 @@
+ #include "igc.h"
+ #include "igc_tsn.h"
+ 
++static bool is_any_launchtime(struct igc_adapter *adapter)
++{
++	int i;
++
++	for (i = 0; i < adapter->num_tx_queues; i++) {
++		struct igc_ring *ring = adapter->tx_ring[i];
++
++		if (ring->launchtime_enable)
++			return true;
++	}
++
++	return false;
++}
++
+ /* Returns the TSN specific registers to their default values after
+  * TSN offloading is disabled.
+  */
+@@ -88,6 +102,9 @@ static int igc_tsn_enable_offload(struct igc_adapter *adapter)
+ 				IGC_TXQCTL_STRICT_END;
+ 		}
+ 
++		if (ring->launchtime_enable)
++			txqctl |= IGC_TXQCTL_QUEUE_MODE_LAUNCHT;
++
+ 		wr32(IGC_TXQCTL(i), txqctl);
+ 	}
+ 
+@@ -115,7 +132,7 @@ static int igc_tsn_enable_offload(struct igc_adapter *adapter)
+ 
+ int igc_tsn_offload_apply(struct igc_adapter *adapter)
+ {
+-	bool is_any_enabled = adapter->base_time;
++	bool is_any_enabled = adapter->base_time || is_any_launchtime(adapter);
+ 
+ 	if (!(adapter->flags & IGC_FLAG_TSN_QBV_ENABLED) && !is_any_enabled)
+ 		return 0;
