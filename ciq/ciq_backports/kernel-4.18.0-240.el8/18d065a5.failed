@@ -1,0 +1,176 @@
+xprtrdma: Eliminate per-transport "max pages"
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Chuck Lever <chuck.lever@oracle.com>
+commit 18d065a5d4f16eeefb690c298671c3f9131121fe
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/18d065a5.failed
+
+To support device hotplug and migrating a connection between devices
+of different capabilities, we have to guarantee that all in-kernel
+devices can support the same max NFS payload size (1 megabyte).
+
+This means that possibly one or two in-tree devices are no longer
+supported for NFS/RDMA because they cannot support 1MB rsize/wsize.
+The only one I confirmed was cxgb3, but it has already been removed
+from the kernel.
+
+	Signed-off-by: Chuck Lever <chuck.lever@oracle.com>
+	Signed-off-by: Anna Schumaker <Anna.Schumaker@Netapp.com>
+(cherry picked from commit 18d065a5d4f16eeefb690c298671c3f9131121fe)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/sunrpc/xprtrdma/frwr_ops.c
+#	net/sunrpc/xprtrdma/verbs.c
+diff --cc net/sunrpc/xprtrdma/frwr_ops.c
+index 27eddf0f3831,032a89656f75..000000000000
+--- a/net/sunrpc/xprtrdma/frwr_ops.c
++++ b/net/sunrpc/xprtrdma/frwr_ops.c
+@@@ -300,30 -258,22 +298,27 @@@ int frwr_open(struct rpcrdma_ia *ia, st
+  	ep->rep_attr.cap.max_recv_wr += RPCRDMA_BACKWARD_WRS;
+  	ep->rep_attr.cap.max_recv_wr += 1; /* for ib_drain_rq */
+  
+++<<<<<<< HEAD
+ +	ia->ri_max_segs = max_t(unsigned int, 1, RPCRDMA_MAX_DATA_SEGS /
+ +				ia->ri_max_frwr_depth);
+++=======
++ 	ia->ri_max_rdma_segs =
++ 		DIV_ROUND_UP(RPCRDMA_MAX_DATA_SEGS, ia->ri_max_frwr_depth);
+++>>>>>>> 18d065a5d4f1 (xprtrdma: Eliminate per-transport "max pages")
+  	/* Reply chunks require segments for head and tail buffers */
+- 	ia->ri_max_segs += 2;
+- 	if (ia->ri_max_segs > RPCRDMA_MAX_HDR_SEGS)
+- 		ia->ri_max_segs = RPCRDMA_MAX_HDR_SEGS;
+- 	return 0;
+- }
+- 
+- /**
+-  * frwr_maxpages - Compute size of largest payload
+-  * @r_xprt: transport
+-  *
+-  * Returns maximum size of an RPC message, in pages.
+-  *
+-  * FRWR mode conveys a list of pages per chunk segment. The
+-  * maximum length of that list is the FRWR page list depth.
+-  */
+- size_t frwr_maxpages(struct rpcrdma_xprt *r_xprt)
+- {
+- 	struct rpcrdma_ia *ia = &r_xprt->rx_ia;
++ 	ia->ri_max_rdma_segs += 2;
++ 	if (ia->ri_max_rdma_segs > RPCRDMA_MAX_HDR_SEGS)
++ 		ia->ri_max_rdma_segs = RPCRDMA_MAX_HDR_SEGS;
++ 
++ 	/* Ensure the underlying device is capable of conveying the
++ 	 * largest r/wsize NFS will ask for. This guarantees that
++ 	 * failing over from one RDMA device to another will not
++ 	 * break NFS I/O.
++ 	 */
++ 	if ((ia->ri_max_rdma_segs * ia->ri_max_frwr_depth) < RPCRDMA_MAX_SEGS)
++ 		return -ENOMEM;
+  
+- 	return min_t(unsigned int, RPCRDMA_MAX_DATA_SEGS,
+- 		     (ia->ri_max_segs - 2) * ia->ri_max_frwr_depth);
++ 	return 0;
+  }
+  
+  /**
+diff --cc net/sunrpc/xprtrdma/verbs.c
+index 70a9ee184494,21fc5766dcde..000000000000
+--- a/net/sunrpc/xprtrdma/verbs.c
++++ b/net/sunrpc/xprtrdma/verbs.c
+@@@ -929,10 -935,8 +929,10 @@@ rpcrdma_mrs_create(struct rpcrdma_xprt 
+  	struct rpcrdma_buffer *buf = &r_xprt->rx_buf;
+  	struct rpcrdma_ia *ia = &r_xprt->rx_ia;
+  	unsigned int count;
+ +	LIST_HEAD(free);
+ +	LIST_HEAD(all);
+  
+- 	for (count = 0; count < ia->ri_max_segs; count++) {
++ 	for (count = 0; count < ia->ri_max_rdma_segs; count++) {
+  		struct rpcrdma_mr *mr;
+  		int rc;
+  
+@@@ -991,7 -1016,12 +991,16 @@@ struct rpcrdma_req *rpcrdma_req_create(
+  	if (req == NULL)
+  		goto out1;
+  
+++<<<<<<< HEAD
+ +	rb = rpcrdma_regbuf_alloc(RPCRDMA_HDRBUF_SIZE, DMA_TO_DEVICE, flags);
+++=======
++ 	/* Compute maximum header buffer size in bytes */
++ 	maxhdrsize = rpcrdma_fixed_maxsz + 3 +
++ 		     r_xprt->rx_ia.ri_max_rdma_segs * rpcrdma_readchunk_maxsz;
++ 	maxhdrsize *= sizeof(__be32);
++ 	rb = rpcrdma_regbuf_alloc(__roundup_pow_of_two(maxhdrsize),
++ 				  DMA_TO_DEVICE, flags);
+++>>>>>>> 18d065a5d4f1 (xprtrdma: Eliminate per-transport "max pages")
+  	if (!rb)
+  		goto out2;
+  	req->rl_rdmabuf = rb;
+* Unmerged path net/sunrpc/xprtrdma/frwr_ops.c
+diff --git a/net/sunrpc/xprtrdma/rpc_rdma.c b/net/sunrpc/xprtrdma/rpc_rdma.c
+index 522f58cb1aab..377420c9633b 100644
+--- a/net/sunrpc/xprtrdma/rpc_rdma.c
++++ b/net/sunrpc/xprtrdma/rpc_rdma.c
+@@ -115,7 +115,7 @@ static unsigned int rpcrdma_max_reply_header_size(unsigned int maxsegs)
+  */
+ void rpcrdma_set_max_header_sizes(struct rpcrdma_xprt *r_xprt)
+ {
+-	unsigned int maxsegs = r_xprt->rx_ia.ri_max_segs;
++	unsigned int maxsegs = r_xprt->rx_ia.ri_max_rdma_segs;
+ 	struct rpcrdma_ep *ep = &r_xprt->rx_ep;
+ 
+ 	ep->rep_max_inline_send =
+diff --git a/net/sunrpc/xprtrdma/transport.c b/net/sunrpc/xprtrdma/transport.c
+index ac2053971f3a..694ef49a8d73 100644
+--- a/net/sunrpc/xprtrdma/transport.c
++++ b/net/sunrpc/xprtrdma/transport.c
+@@ -358,19 +358,13 @@ xprt_setup_rdma(struct xprt_create *args)
+ 	if (rc)
+ 		goto out3;
+ 
+-	INIT_DELAYED_WORK(&new_xprt->rx_connect_worker,
+-			  xprt_rdma_connect_worker);
+-
+-	xprt->max_payload = frwr_maxpages(new_xprt);
+-	if (xprt->max_payload == 0)
+-		goto out4;
+-	xprt->max_payload <<= PAGE_SHIFT;
+-	dprintk("RPC:       %s: transport data payload maximum: %zu bytes\n",
+-		__func__, xprt->max_payload);
+-
+ 	if (!try_module_get(THIS_MODULE))
+ 		goto out4;
+ 
++	INIT_DELAYED_WORK(&new_xprt->rx_connect_worker,
++			  xprt_rdma_connect_worker);
++	xprt->max_payload = RPCRDMA_MAX_DATA_SEGS << PAGE_SHIFT;
++
+ 	dprintk("RPC:       %s: %s:%s\n", __func__,
+ 		xprt->address_strings[RPC_DISPLAY_ADDR],
+ 		xprt->address_strings[RPC_DISPLAY_PORT]);
+* Unmerged path net/sunrpc/xprtrdma/verbs.c
+diff --git a/net/sunrpc/xprtrdma/xprt_rdma.h b/net/sunrpc/xprtrdma/xprt_rdma.h
+index d1df40fa184f..c3b1c88d150a 100644
+--- a/net/sunrpc/xprtrdma/xprt_rdma.h
++++ b/net/sunrpc/xprtrdma/xprt_rdma.h
+@@ -70,7 +70,7 @@ struct rpcrdma_ia {
+ 	struct rdma_cm_id 	*ri_id;
+ 	struct ib_pd		*ri_pd;
+ 	int			ri_async_rc;
+-	unsigned int		ri_max_segs;
++	unsigned int		ri_max_rdma_segs;
+ 	unsigned int		ri_max_frwr_depth;
+ 	bool			ri_implicit_roundup;
+ 	enum ib_mr_type		ri_mrtype;
+@@ -550,7 +550,6 @@ void frwr_reset(struct rpcrdma_req *req);
+ int frwr_open(struct rpcrdma_ia *ia, struct rpcrdma_ep *ep);
+ int frwr_init_mr(struct rpcrdma_ia *ia, struct rpcrdma_mr *mr);
+ void frwr_release_mr(struct rpcrdma_mr *mr);
+-size_t frwr_maxpages(struct rpcrdma_xprt *r_xprt);
+ struct rpcrdma_mr_seg *frwr_map(struct rpcrdma_xprt *r_xprt,
+ 				struct rpcrdma_mr_seg *seg,
+ 				int nsegs, bool writing, __be32 xid,
