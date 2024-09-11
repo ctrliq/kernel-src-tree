@@ -1,0 +1,186 @@
+perf trace: Hide evsel->access further, simplify code
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Arnaldo Carvalho de Melo <acme@redhat.com>
+commit 8b913df50f56a26b9e336becdd0af9d5ce3831cd
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/8b913df5.failed
+
+Next step will be to have a 'struct evsel_trace' to allow for handling
+the syscalls tracepoints via the strace-like code while reusing parts of
+that code with the other tracepoints, where we don't have things like
+the 'syscall_nr' or 'ret' ((raw_)?syscalls:sys_{enter,exit}(_SYSCALL)?)
+args that we want to cache offsets and have been using evsel->priv for
+that, while for the other tracepoints we'll have just an array of
+'struct syscall_arg_fmt' (i.e. ->scnprint() for number->string and
+->strtoul() string->number conversions and other state those functions
+need).
+
+	Cc: Adrian Hunter <adrian.hunter@intel.com>
+	Cc: David Ahern <dsahern@gmail.com>
+	Cc: Jiri Olsa <jolsa@kernel.org>
+	Cc: Luis Cláudio Gonçalves <lclaudio@redhat.com>
+	Cc: Namhyung Kim <namhyung@kernel.org>
+Link: https://lkml.kernel.org/n/tip-fre21jbyoqxmmquxcho7oa0x@git.kernel.org
+	Signed-off-by: Arnaldo Carvalho de Melo <acme@redhat.com>
+(cherry picked from commit 8b913df50f56a26b9e336becdd0af9d5ce3831cd)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	tools/perf/builtin-trace.c
+diff --cc tools/perf/builtin-trace.c
+index d11441fd591b,1d2ed2823202..000000000000
+--- a/tools/perf/builtin-trace.c
++++ b/tools/perf/builtin-trace.c
+@@@ -275,7 -285,46 +275,50 @@@ struct syscall_tp 
+  	};
+  };
+  
+++<<<<<<< HEAD
+ +static int perf_evsel__init_tp_uint_field(struct perf_evsel *evsel,
+++=======
++ /*
++  * Used with raw_syscalls:sys_{enter,exit} and with the
++  * syscalls:sys_{enter,exit}_SYSCALL tracepoints
++  */
++ static inline struct syscall_tp *__evsel__syscall_tp(struct evsel *evsel)
++ {
++ 	struct syscall_tp *sc = evsel->priv;
++ 
++ 	return sc;
++ }
++ 
++ static struct syscall_tp *evsel__syscall_tp(struct evsel *evsel)
++ {
++ 	if (evsel->priv == NULL) {
++ 		evsel->priv = zalloc(sizeof(struct syscall_tp));
++ 	}
++ 
++ 	return __evsel__syscall_tp(evsel);
++ }
++ 
++ /*
++  * Used with all the other tracepoints.
++  */
++ static inline struct syscall_arg_fmt *__evsel__syscall_arg_fmt(struct evsel *evsel)
++ {
++ 	struct syscall_arg_fmt *fmt = evsel->priv;
++ 
++ 	return fmt;
++ }
++ 
++ static struct syscall_arg_fmt *evsel__syscall_arg_fmt(struct evsel *evsel)
++ {
++ 	if (evsel->priv == NULL) {
++ 		evsel->priv = calloc(evsel->tp_format->format.nr_fields, sizeof(struct syscall_arg_fmt));
++ 	}
++ 
++ 	return __evsel__syscall_arg_fmt(evsel);
++ }
++ 
++ static int perf_evsel__init_tp_uint_field(struct evsel *evsel,
+++>>>>>>> 8b913df50f56 (perf trace: Hide evsel->access further, simplify code)
+  					  struct tp_field *field,
+  					  const char *name)
+  {
+@@@ -304,37 -353,34 +347,34 @@@ static int perf_evsel__init_tp_ptr_fiel
+  }
+  
+  #define perf_evsel__init_sc_tp_ptr_field(evsel, name) \
+ -	({ struct syscall_tp *sc = __evsel__syscall_tp(evsel);\
+ +	({ struct syscall_tp *sc = evsel->priv;\
+  	   perf_evsel__init_tp_ptr_field(evsel, &sc->name, #name); })
+  
+ -static void evsel__delete_priv(struct evsel *evsel)
+ +static void perf_evsel__delete_priv(struct perf_evsel *evsel)
+  {
+  	zfree(&evsel->priv);
+ -	evsel__delete(evsel);
+ +	perf_evsel__delete(evsel);
+  }
+  
+ -static int perf_evsel__init_syscall_tp(struct evsel *evsel)
+ +static int perf_evsel__init_syscall_tp(struct perf_evsel *evsel)
+  {
+- 	struct syscall_tp *sc = evsel->priv = malloc(sizeof(struct syscall_tp));
++ 	struct syscall_tp *sc = evsel__syscall_tp(evsel);
+  
+- 	if (evsel->priv != NULL) {
++ 	if (sc != NULL) {
+  		if (perf_evsel__init_tp_uint_field(evsel, &sc->id, "__syscall_nr") &&
+  		    perf_evsel__init_tp_uint_field(evsel, &sc->id, "nr"))
+- 			goto out_delete;
++ 			return -ENOENT;
+  		return 0;
+  	}
+  
+  	return -ENOMEM;
+- out_delete:
+- 	zfree(&evsel->priv);
+- 	return -ENOENT;
+  }
+  
+ -static int perf_evsel__init_augmented_syscall_tp(struct evsel *evsel, struct evsel *tp)
+ +static int perf_evsel__init_augmented_syscall_tp(struct perf_evsel *evsel, struct perf_evsel *tp)
+  {
+- 	struct syscall_tp *sc = evsel->priv = malloc(sizeof(struct syscall_tp));
++ 	struct syscall_tp *sc = evsel__syscall_tp(evsel);
+  
+- 	if (evsel->priv != NULL) {
++ 	if (sc != NULL) {
+  		struct tep_format_field *syscall_id = perf_evsel__field(tp, "id");
+  		if (syscall_id == NULL)
+  			syscall_id = perf_evsel__field(tp, "__syscall_nr");
+@@@ -347,14 -392,11 +386,11 @@@
+  	}
+  
+  	return -ENOMEM;
+- out_delete:
+- 	zfree(&evsel->priv);
+- 	return -EINVAL;
+  }
+  
+ -static int perf_evsel__init_augmented_syscall_tp_args(struct evsel *evsel)
+ +static int perf_evsel__init_augmented_syscall_tp_args(struct perf_evsel *evsel)
+  {
+ -	struct syscall_tp *sc = __evsel__syscall_tp(evsel);
+ +	struct syscall_tp *sc = evsel->priv;
+  
+  	return __tp_field__init_ptr(&sc->args, sc->id.offset + sizeof(u64));
+  }
+@@@ -366,27 -408,22 +402,22 @@@ static int perf_evsel__init_augmented_s
+  	return __tp_field__init_uint(&sc->ret, sizeof(u64), sc->id.offset + sizeof(u64), evsel->needs_swap);
+  }
+  
+ -static int perf_evsel__init_raw_syscall_tp(struct evsel *evsel, void *handler)
+ +static int perf_evsel__init_raw_syscall_tp(struct perf_evsel *evsel, void *handler)
+  {
+- 	evsel->priv = malloc(sizeof(struct syscall_tp));
+- 	if (evsel->priv != NULL) {
++ 	if (evsel__syscall_tp(evsel) != NULL) {
+  		if (perf_evsel__init_sc_tp_uint_field(evsel, id))
+- 			goto out_delete;
++ 			return -ENOENT;
+  
+  		evsel->handler = handler;
+  		return 0;
+  	}
+  
+  	return -ENOMEM;
+- 
+- out_delete:
+- 	zfree(&evsel->priv);
+- 	return -ENOENT;
+  }
+  
+ -static struct evsel *perf_evsel__raw_syscall_newtp(const char *direction, void *handler)
+ +static struct perf_evsel *perf_evsel__raw_syscall_newtp(const char *direction, void *handler)
+  {
+ -	struct evsel *evsel = perf_evsel__newtp("raw_syscalls", direction);
+ +	struct perf_evsel *evsel = perf_evsel__newtp("raw_syscalls", direction);
+  
+  	/* older kernel (e.g., RHEL6) use syscalls:{enter,exit} */
+  	if (IS_ERR(evsel))
+* Unmerged path tools/perf/builtin-trace.c
