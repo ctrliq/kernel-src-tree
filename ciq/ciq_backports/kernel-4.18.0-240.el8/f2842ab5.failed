@@ -1,0 +1,117 @@
+io_uring: enable option to only trigger eventfd for async completions
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Jens Axboe <axboe@kernel.dk>
+commit f2842ab5b72d7ee5f7f8385c2d4f32c133f5837b
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/f2842ab5.failed
+
+If an application is using eventfd notifications with poll to know when
+new SQEs can be issued, it's expecting the following read/writes to
+complete inline. And with that, it knows that there are events available,
+and don't want spurious wakeups on the eventfd for those requests.
+
+This adds IORING_REGISTER_EVENTFD_ASYNC, which works just like
+IORING_REGISTER_EVENTFD, except it only triggers notifications for events
+that happen from async completions (IRQ, or io-wq worker completions).
+Any completions inline from the submission itself will not trigger
+notifications.
+
+	Suggested-by: Mark Papadakis <markuspapadakis@icloud.com>
+	Signed-off-by: Jens Axboe <axboe@kernel.dk>
+(cherry picked from commit f2842ab5b72d7ee5f7f8385c2d4f32c133f5837b)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/io_uring.c
+diff --cc fs/io_uring.c
+index 28a601d08266,70656762244f..000000000000
+--- a/fs/io_uring.c
++++ b/fs/io_uring.c
+@@@ -214,11 -202,24 +214,19 @@@ struct io_ring_ctx 
+  
+  	struct {
+  		unsigned int		flags;
+++<<<<<<< HEAD
+ +		bool			compat;
+ +		bool			account_mem;
+++=======
++ 		int			compat: 1;
++ 		int			account_mem: 1;
++ 		int			cq_overflow_flushed: 1;
++ 		int			drain_next: 1;
++ 		int			eventfd_async: 1;
+++>>>>>>> f2842ab5b72d (io_uring: enable option to only trigger eventfd for async completions)
+  
+ -		/*
+ -		 * Ring buffer of indices into array of io_uring_sqe, which is
+ -		 * mmapped by the application using the IORING_OFF_SQES offset.
+ -		 *
+ -		 * This indirection could e.g. be used to assign fixed
+ -		 * io_uring_sqe entries to operations and only submit them to
+ -		 * the queue when needed.
+ -		 *
+ -		 * The kernel modifies neither the indices array nor the entries
+ -		 * array.
+ -		 */
+ -		u32			*sq_array;
+ +		/* SQ ring */
+ +		struct io_sq_ring	*sq_ring;
+  		unsigned		cached_sq_head;
+  		unsigned		sq_entries;
+  		unsigned		sq_mask;
+@@@ -516,31 -961,16 +524,38 @@@ static struct io_uring_cqe *io_get_cqri
+  		return NULL;
+  
+  	ctx->cached_cq_tail++;
+ -	return &rings->cqes[tail & ctx->cq_mask];
+ +	return &ring->cqes[tail & ctx->cq_mask];
+ +}
+ +
+ +static void io_cqring_fill_event(struct io_ring_ctx *ctx, u64 ki_user_data,
+ +				 long res)
+ +{
+ +	struct io_uring_cqe *cqe;
+ +
+ +	/*
+ +	 * If we can't get a cq entry, userspace overflowed the
+ +	 * submission (by quite a lot). Increment the overflow count in
+ +	 * the ring.
+ +	 */
+ +	cqe = io_get_cqring(ctx);
+ +	if (cqe) {
+ +		WRITE_ONCE(cqe->user_data, ki_user_data);
+ +		WRITE_ONCE(cqe->res, res);
+ +		WRITE_ONCE(cqe->flags, 0);
+ +	} else {
+ +		unsigned overflow = READ_ONCE(ctx->cq_ring->overflow);
+ +
+ +		WRITE_ONCE(ctx->cq_ring->overflow, overflow + 1);
+ +	}
+  }
+  
++ static inline bool io_should_trigger_evfd(struct io_ring_ctx *ctx)
++ {
++ 	if (!ctx->eventfd_async)
++ 		return true;
++ 	return io_wq_current_is_worker() || in_interrupt();
++ }
++ 
+  static void io_cqring_ev_posted(struct io_ring_ctx *ctx)
+  {
+  	if (waitqueue_active(&ctx->wait))
+* Unmerged path fs/io_uring.c
+diff --git a/include/uapi/linux/io_uring.h b/include/uapi/linux/io_uring.h
+index dd4a49ec83b7..e2942916ee15 100644
+--- a/include/uapi/linux/io_uring.h
++++ b/include/uapi/linux/io_uring.h
+@@ -145,6 +145,7 @@ struct io_uring_params {
+ #define IORING_REGISTER_EVENTFD		4
+ #define IORING_UNREGISTER_EVENTFD	5
+ #define IORING_REGISTER_FILES_UPDATE	6
++#define IORING_REGISTER_EVENTFD_ASYNC	7
+ 
+ struct io_uring_files_update {
+ 	__u32 offset;
