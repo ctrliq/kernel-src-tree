@@ -529,7 +529,6 @@ retry:
 		return rc;
 	ep = r_xprt->rx_ep;
 
-	ep->re_connect_status = 0;
 	xprt_clear_connected(xprt);
 	rpcrdma_reset_cwnd(r_xprt);
 
@@ -566,8 +565,6 @@ retry:
 	rpcrdma_mrs_create(r_xprt);
 
 out:
-	if (rc)
-		ep->re_connect_status = rc;
 	trace_xprtrdma_connect(r_xprt, rc);
 	return rc;
 }
