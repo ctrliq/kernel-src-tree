@@ -1,0 +1,289 @@
+nvme: move the fabrics queue ready check routines to core
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-358.el8
+commit-author Tao Chiu <taochiu@synology.com>
+commit a97157440e1e69c35d7804d3b72da0c626ef28e6
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-358.el8/a9715744.failed
+
+queue_rq() in pci only checks if the dispatched queue (nvmeq) is ready,
+e.g. not being suspended. Since nvme_alloc_admin_tags() in reset flow
+restarts the admin queue, users are able to submit admin commands to a
+controller before reset_work() completes. Commands submitted under this
+condition may interfere with commands that performs identify, IO queue
+setup in reset_work(), and may result in a hang described in the
+following patch.
+
+As seen in the fabrics, user commands are prevented from being executed
+under inproper controller states. We may reuse this logic to maintain a
+clear admin queue during reset_work().
+
+	Signed-off-by: Tao Chiu <taochiu@synology.com>
+	Signed-off-by: Cody Wong <codywong@synology.com>
+	Reviewed-by: Leon Chien <leonchien@synology.com>
+	Reviewed-by: Keith Busch <kbusch@kernel.org>
+	Signed-off-by: Christoph Hellwig <hch@lst.de>
+(cherry picked from commit a97157440e1e69c35d7804d3b72da0c626ef28e6)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/nvme/host/nvme.h
+diff --cc drivers/nvme/host/nvme.h
+index 7d87bfacb56d,05f31a2c64bb..000000000000
+--- a/drivers/nvme/host/nvme.h
++++ b/drivers/nvme/host/nvme.h
+@@@ -624,8 -637,22 +624,27 @@@ void nvme_start_freeze(struct nvme_ctr
+  struct request *nvme_alloc_request(struct request_queue *q,
+  		struct nvme_command *cmd, blk_mq_req_flags_t flags);
+  void nvme_cleanup_cmd(struct request *req);
+++<<<<<<< HEAD
+ +blk_status_t nvme_setup_cmd(struct nvme_ns *ns, struct request *req,
+ +		struct nvme_command *cmd);
+++=======
++ blk_status_t nvme_setup_cmd(struct nvme_ns *ns, struct request *req);
++ blk_status_t nvme_fail_nonready_command(struct nvme_ctrl *ctrl,
++ 		struct request *req);
++ bool __nvme_check_ready(struct nvme_ctrl *ctrl, struct request *rq,
++ 		bool queue_live);
++ 
++ static inline bool nvme_check_ready(struct nvme_ctrl *ctrl, struct request *rq,
++ 		bool queue_live)
++ {
++ 	if (likely(ctrl->state == NVME_CTRL_LIVE))
++ 		return true;
++ 	if (ctrl->ops->flags & NVME_F_FABRICS &&
++ 	    ctrl->state == NVME_CTRL_DELETING)
++ 		return true;
++ 	return __nvme_check_ready(ctrl, rq, queue_live);
++ }
+++>>>>>>> a97157440e1e (nvme: move the fabrics queue ready check routines to core)
+  int nvme_submit_sync_cmd(struct request_queue *q, struct nvme_command *cmd,
+  		void *buf, unsigned bufflen);
+  int __nvme_submit_sync_cmd(struct request_queue *q, struct nvme_command *cmd,
+diff --git a/drivers/nvme/host/core.c b/drivers/nvme/host/core.c
+index a6d2912c76ef..f7c2e1a7f907 100644
+--- a/drivers/nvme/host/core.c
++++ b/drivers/nvme/host/core.c
+@@ -678,6 +678,66 @@ static struct request *nvme_alloc_request_qid(struct request_queue *q,
+ 	return req;
+ }
+ 
++/*
++ * For something we're not in a state to send to the device the default action
++ * is to busy it and retry it after the controller state is recovered.  However,
++ * if the controller is deleting or if anything is marked for failfast or
++ * nvme multipath it is immediately failed.
++ *
++ * Note: commands used to initialize the controller will be marked for failfast.
++ * Note: nvme cli/ioctl commands are marked for failfast.
++ */
++blk_status_t nvme_fail_nonready_command(struct nvme_ctrl *ctrl,
++		struct request *rq)
++{
++	if (ctrl->state != NVME_CTRL_DELETING_NOIO &&
++	    ctrl->state != NVME_CTRL_DEAD &&
++	    !test_bit(NVME_CTRL_FAILFAST_EXPIRED, &ctrl->flags) &&
++	    !blk_noretry_request(rq) && !(rq->cmd_flags & REQ_NVME_MPATH))
++		return BLK_STS_RESOURCE;
++	return nvme_host_path_error(rq);
++}
++EXPORT_SYMBOL_GPL(nvme_fail_nonready_command);
++
++bool __nvme_check_ready(struct nvme_ctrl *ctrl, struct request *rq,
++		bool queue_live)
++{
++	struct nvme_request *req = nvme_req(rq);
++
++	/*
++	 * currently we have a problem sending passthru commands
++	 * on the admin_q if the controller is not LIVE because we can't
++	 * make sure that they are going out after the admin connect,
++	 * controller enable and/or other commands in the initialization
++	 * sequence. until the controller will be LIVE, fail with
++	 * BLK_STS_RESOURCE so that they will be rescheduled.
++	 */
++	if (rq->q == ctrl->admin_q && (req->flags & NVME_REQ_USERCMD))
++		return false;
++
++	if (ctrl->ops->flags & NVME_F_FABRICS) {
++		/*
++		 * Only allow commands on a live queue, except for the connect
++		 * command, which is require to set the queue live in the
++		 * appropinquate states.
++		 */
++		switch (ctrl->state) {
++		case NVME_CTRL_CONNECTING:
++			if (blk_rq_is_passthrough(rq) && nvme_is_fabrics(req->cmd) &&
++			    req->cmd->fabrics.fctype == nvme_fabrics_type_connect)
++				return true;
++			break;
++		default:
++			break;
++		case NVME_CTRL_DEAD:
++			return false;
++		}
++	}
++
++	return queue_live;
++}
++EXPORT_SYMBOL_GPL(__nvme_check_ready);
++
+ static int nvme_toggle_streams(struct nvme_ctrl *ctrl, bool enable)
+ {
+ 	struct nvme_command c;
+diff --git a/drivers/nvme/host/fabrics.c b/drivers/nvme/host/fabrics.c
+index 13c2747e3d00..a2bb7fc63a73 100644
+--- a/drivers/nvme/host/fabrics.c
++++ b/drivers/nvme/host/fabrics.c
+@@ -533,63 +533,6 @@ static struct nvmf_transport_ops *nvmf_lookup_transport(
+ 	return NULL;
+ }
+ 
+-/*
+- * For something we're not in a state to send to the device the default action
+- * is to busy it and retry it after the controller state is recovered.  However,
+- * if the controller is deleting or if anything is marked for failfast or
+- * nvme multipath it is immediately failed.
+- *
+- * Note: commands used to initialize the controller will be marked for failfast.
+- * Note: nvme cli/ioctl commands are marked for failfast.
+- */
+-blk_status_t nvmf_fail_nonready_command(struct nvme_ctrl *ctrl,
+-		struct request *rq)
+-{
+-	if (ctrl->state != NVME_CTRL_DELETING_NOIO &&
+-	    ctrl->state != NVME_CTRL_DEAD &&
+-	    !test_bit(NVME_CTRL_FAILFAST_EXPIRED, &ctrl->flags) &&
+-	    !blk_noretry_request(rq) && !(rq->cmd_flags & REQ_NVME_MPATH))
+-		return BLK_STS_RESOURCE;
+-	return nvme_host_path_error(rq);
+-}
+-EXPORT_SYMBOL_GPL(nvmf_fail_nonready_command);
+-
+-bool __nvmf_check_ready(struct nvme_ctrl *ctrl, struct request *rq,
+-		bool queue_live)
+-{
+-	struct nvme_request *req = nvme_req(rq);
+-
+-	/*
+-	 * currently we have a problem sending passthru commands
+-	 * on the admin_q if the controller is not LIVE because we can't
+-	 * make sure that they are going out after the admin connect,
+-	 * controller enable and/or other commands in the initialization
+-	 * sequence. until the controller will be LIVE, fail with
+-	 * BLK_STS_RESOURCE so that they will be rescheduled.
+-	 */
+-	if (rq->q == ctrl->admin_q && (req->flags & NVME_REQ_USERCMD))
+-		return false;
+-
+-	/*
+-	 * Only allow commands on a live queue, except for the connect command,
+-	 * which is require to set the queue live in the appropinquate states.
+-	 */
+-	switch (ctrl->state) {
+-	case NVME_CTRL_CONNECTING:
+-		if (blk_rq_is_passthrough(rq) && nvme_is_fabrics(req->cmd) &&
+-		    req->cmd->fabrics.fctype == nvme_fabrics_type_connect)
+-			return true;
+-		break;
+-	default:
+-		break;
+-	case NVME_CTRL_DEAD:
+-		return false;
+-	}
+-
+-	return queue_live;
+-}
+-EXPORT_SYMBOL_GPL(__nvmf_check_ready);
+-
+ static const match_table_t opt_tokens = {
+ 	{ NVMF_OPT_TRANSPORT,		"transport=%s"		},
+ 	{ NVMF_OPT_TRADDR,		"traddr=%s"		},
+diff --git a/drivers/nvme/host/fabrics.h b/drivers/nvme/host/fabrics.h
+index 888b108d87a4..d7f7974dc208 100644
+--- a/drivers/nvme/host/fabrics.h
++++ b/drivers/nvme/host/fabrics.h
+@@ -184,20 +184,7 @@ void nvmf_unregister_transport(struct nvmf_transport_ops *ops);
+ void nvmf_free_options(struct nvmf_ctrl_options *opts);
+ int nvmf_get_address(struct nvme_ctrl *ctrl, char *buf, int size);
+ bool nvmf_should_reconnect(struct nvme_ctrl *ctrl);
+-blk_status_t nvmf_fail_nonready_command(struct nvme_ctrl *ctrl,
+-		struct request *rq);
+-bool __nvmf_check_ready(struct nvme_ctrl *ctrl, struct request *rq,
+-		bool queue_live);
+ bool nvmf_ip_options_match(struct nvme_ctrl *ctrl,
+ 		struct nvmf_ctrl_options *opts);
+ 
+-static inline bool nvmf_check_ready(struct nvme_ctrl *ctrl, struct request *rq,
+-		bool queue_live)
+-{
+-	if (likely(ctrl->state == NVME_CTRL_LIVE ||
+-		   ctrl->state == NVME_CTRL_DELETING))
+-		return true;
+-	return __nvmf_check_ready(ctrl, rq, queue_live);
+-}
+-
+ #endif /* _NVME_FABRICS_H */
+diff --git a/drivers/nvme/host/fc.c b/drivers/nvme/host/fc.c
+index 892648360919..105c45b00709 100644
+--- a/drivers/nvme/host/fc.c
++++ b/drivers/nvme/host/fc.c
+@@ -2767,8 +2767,8 @@ nvme_fc_queue_rq(struct blk_mq_hw_ctx *hctx,
+ 	blk_status_t ret;
+ 
+ 	if (ctrl->rport->remoteport.port_state != FC_OBJSTATE_ONLINE ||
+-	    !nvmf_check_ready(&queue->ctrl->ctrl, rq, queue_ready))
+-		return nvmf_fail_nonready_command(&queue->ctrl->ctrl, rq);
++	    !nvme_check_ready(&queue->ctrl->ctrl, rq, queue_ready))
++		return nvme_fail_nonready_command(&queue->ctrl->ctrl, rq);
+ 
+ 	ret = nvme_setup_cmd(ns, rq, sqe);
+ 	if (ret)
+* Unmerged path drivers/nvme/host/nvme.h
+diff --git a/drivers/nvme/host/rdma.c b/drivers/nvme/host/rdma.c
+index 6bb5dfb8f083..06a29232e927 100644
+--- a/drivers/nvme/host/rdma.c
++++ b/drivers/nvme/host/rdma.c
+@@ -2070,8 +2070,8 @@ static blk_status_t nvme_rdma_queue_rq(struct blk_mq_hw_ctx *hctx,
+ 
+ 	WARN_ON_ONCE(rq->tag < 0);
+ 
+-	if (!nvmf_check_ready(&queue->ctrl->ctrl, rq, queue_ready))
+-		return nvmf_fail_nonready_command(&queue->ctrl->ctrl, rq);
++	if (!nvme_check_ready(&queue->ctrl->ctrl, rq, queue_ready))
++		return nvme_fail_nonready_command(&queue->ctrl->ctrl, rq);
+ 
+ 	dev = queue->device->dev;
+ 
+diff --git a/drivers/nvme/host/tcp.c b/drivers/nvme/host/tcp.c
+index 1a4ce92b545d..78a551431ccd 100644
+--- a/drivers/nvme/host/tcp.c
++++ b/drivers/nvme/host/tcp.c
+@@ -2331,8 +2331,8 @@ static blk_status_t nvme_tcp_queue_rq(struct blk_mq_hw_ctx *hctx,
+ 	bool queue_ready = test_bit(NVME_TCP_Q_LIVE, &queue->flags);
+ 	blk_status_t ret;
+ 
+-	if (!nvmf_check_ready(&queue->ctrl->ctrl, rq, queue_ready))
+-		return nvmf_fail_nonready_command(&queue->ctrl->ctrl, rq);
++	if (!nvme_check_ready(&queue->ctrl->ctrl, rq, queue_ready))
++		return nvme_fail_nonready_command(&queue->ctrl->ctrl, rq);
+ 
+ 	ret = nvme_tcp_setup_cmd_pdu(ns, rq);
+ 	if (unlikely(ret))
+diff --git a/drivers/nvme/target/loop.c b/drivers/nvme/target/loop.c
+index e11ee1447e56..295404792d04 100644
+--- a/drivers/nvme/target/loop.c
++++ b/drivers/nvme/target/loop.c
+@@ -146,8 +146,8 @@ static blk_status_t nvme_loop_queue_rq(struct blk_mq_hw_ctx *hctx,
+ 	bool queue_ready = test_bit(NVME_LOOP_Q_LIVE, &queue->flags);
+ 	blk_status_t ret;
+ 
+-	if (!nvmf_check_ready(&queue->ctrl->ctrl, req, queue_ready))
+-		return nvmf_fail_nonready_command(&queue->ctrl->ctrl, req);
++	if (!nvme_check_ready(&queue->ctrl->ctrl, req, queue_ready))
++		return nvme_fail_nonready_command(&queue->ctrl->ctrl, req);
+ 
+ 	ret = nvme_setup_cmd(ns, req, &iod->cmd);
+ 	if (ret)
