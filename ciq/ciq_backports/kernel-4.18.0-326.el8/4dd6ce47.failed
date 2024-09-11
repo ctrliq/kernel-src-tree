@@ -1,0 +1,148 @@
+iommu: Fix a check in iommu_check_bind_data()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-326.el8
+commit-author Dan Carpenter <dan.carpenter@oracle.com>
+commit 4dd6ce478003525df8618750d30f0b90380047a7
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-326.el8/4dd6ce47.failed
+
+The "data->flags" variable is a u64 so if one of the high 32 bits is
+set the original code will allow it, but it should be rejected.  The
+fix is to declare "mask" as a u64 instead of a u32.
+
+Fixes: d90573812eea ("iommu/uapi: Handle data and argsz filled by users")
+	Signed-off-by: Dan Carpenter <dan.carpenter@oracle.com>
+Link: https://lore.kernel.org/r/20201103101623.GA1127762@mwanda
+	Signed-off-by: Joerg Roedel <jroedel@suse.de>
+(cherry picked from commit 4dd6ce478003525df8618750d30f0b90380047a7)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/iommu/iommu.c
+diff --cc drivers/iommu/iommu.c
+index 5335b649855c,b53446bb8c6b..000000000000
+--- a/drivers/iommu/iommu.c
++++ b/drivers/iommu/iommu.c
+@@@ -1976,13 -2023,116 +1976,78 @@@ int iommu_cache_invalidate(struct iommu
+  	if (unlikely(!domain->ops->cache_invalidate))
+  		return -ENODEV;
+  
+ -	/*
+ -	 * No new spaces can be added before the variable sized union, the
+ -	 * minimum size is the offset to the union.
+ -	 */
+ -	minsz = offsetof(struct iommu_cache_invalidate_info, granu);
+ -
+ -	/* Copy minsz from user to get flags and argsz */
+ -	if (copy_from_user(&inv_info, uinfo, minsz))
+ -		return -EFAULT;
+ -
+ -	/* Fields before the variable size union are mandatory */
+ -	if (inv_info.argsz < minsz)
+ -		return -EINVAL;
+ -
+ -	/* PASID and address granu require additional info beyond minsz */
+ -	if (inv_info.granularity == IOMMU_INV_GRANU_PASID &&
+ -	    inv_info.argsz < offsetofend(struct iommu_cache_invalidate_info, granu.pasid_info))
+ -		return -EINVAL;
+ -
+ -	if (inv_info.granularity == IOMMU_INV_GRANU_ADDR &&
+ -	    inv_info.argsz < offsetofend(struct iommu_cache_invalidate_info, granu.addr_info))
+ -		return -EINVAL;
+ -
+ -	/*
+ -	 * User might be using a newer UAPI header which has a larger data
+ -	 * size, we shall support the existing flags within the current
+ -	 * size. Copy the remaining user data _after_ minsz but not more
+ -	 * than the current kernel supported size.
+ -	 */
+ -	if (copy_from_user((void *)&inv_info + minsz, uinfo + minsz,
+ -			   min_t(u32, inv_info.argsz, sizeof(inv_info)) - minsz))
+ -		return -EFAULT;
+ -
+ -	/* Now the argsz is validated, check the content */
+ -	ret = iommu_check_cache_invl_data(&inv_info);
+ -	if (ret)
+ -		return ret;
+ -
+ -	return domain->ops->cache_invalidate(domain, dev, &inv_info);
+ +	return domain->ops->cache_invalidate(domain, dev, inv_info);
+  }
+ -EXPORT_SYMBOL_GPL(iommu_uapi_cache_invalidate);
+ +EXPORT_SYMBOL_GPL(iommu_cache_invalidate);
+  
+ -static int iommu_check_bind_data(struct iommu_gpasid_bind_data *data)
+ +int iommu_sva_bind_gpasid(struct iommu_domain *domain,
+ +			   struct device *dev, struct iommu_gpasid_bind_data *data)
+  {
+++<<<<<<< HEAD
+++=======
++ 	u64 mask;
++ 	int i;
++ 
++ 	if (data->version != IOMMU_GPASID_BIND_VERSION_1)
++ 		return -EINVAL;
++ 
++ 	/* Check the range of supported formats */
++ 	if (data->format >= IOMMU_PASID_FORMAT_LAST)
++ 		return -EINVAL;
++ 
++ 	/* Check all flags */
++ 	mask = IOMMU_SVA_GPASID_VAL;
++ 	if (data->flags & ~mask)
++ 		return -EINVAL;
++ 
++ 	/* Check reserved padding fields */
++ 	for (i = 0; i < sizeof(data->padding); i++) {
++ 		if (data->padding[i])
++ 			return -EINVAL;
++ 	}
++ 
++ 	return 0;
++ }
++ 
++ static int iommu_sva_prepare_bind_data(void __user *udata,
++ 				       struct iommu_gpasid_bind_data *data)
++ {
++ 	u32 minsz;
++ 
++ 	/*
++ 	 * No new spaces can be added before the variable sized union, the
++ 	 * minimum size is the offset to the union.
++ 	 */
++ 	minsz = offsetof(struct iommu_gpasid_bind_data, vendor);
++ 
++ 	/* Copy minsz from user to get flags and argsz */
++ 	if (copy_from_user(data, udata, minsz))
++ 		return -EFAULT;
++ 
++ 	/* Fields before the variable size union are mandatory */
++ 	if (data->argsz < minsz)
++ 		return -EINVAL;
++ 	/*
++ 	 * User might be using a newer UAPI header, we shall let IOMMU vendor
++ 	 * driver decide on what size it needs. Since the guest PASID bind data
++ 	 * can be vendor specific, larger argsz could be the result of extension
++ 	 * for one vendor but it should not affect another vendor.
++ 	 * Copy the remaining user data _after_ minsz
++ 	 */
++ 	if (copy_from_user((void *)data + minsz, udata + minsz,
++ 			   min_t(u32, data->argsz, sizeof(*data)) - minsz))
++ 		return -EFAULT;
++ 
++ 	return iommu_check_bind_data(data);
++ }
++ 
++ int iommu_uapi_sva_bind_gpasid(struct iommu_domain *domain, struct device *dev,
++ 			       void __user *udata)
++ {
++ 	struct iommu_gpasid_bind_data data = { 0 };
++ 	int ret;
++ 
+++>>>>>>> 4dd6ce478003 (iommu: Fix a check in iommu_check_bind_data())
+  	if (unlikely(!domain->ops->sva_bind_gpasid))
+  		return -ENODEV;
+  
+* Unmerged path drivers/iommu/iommu.c
