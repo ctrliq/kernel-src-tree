@@ -1,0 +1,259 @@
+io_uring: cancel pending async work if task exits
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Jens Axboe <axboe@kernel.dk>
+commit 6ab231448fdc5e37c15a94a4700fca11e80007f7
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/6ab23144.failed
+
+Normally we cancel all work we track, but for untracked work we could
+leave the async worker behind until that work completes. This is totally
+fine, but does leave resources pending after the task is gone until that
+work completes.
+
+Cancel work that this task queued up when it goes away.
+
+	Signed-off-by: Jens Axboe <axboe@kernel.dk>
+(cherry picked from commit 6ab231448fdc5e37c15a94a4700fca11e80007f7)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/io_uring.c
+diff --cc fs/io_uring.c
+index ffb8e9d82a6a,971d51c50151..000000000000
+--- a/fs/io_uring.c
++++ b/fs/io_uring.c
+@@@ -451,36 -876,143 +451,38 @@@ static struct io_kiocb *io_get_deferred
+  	return NULL;
+  }
+  
+ -static struct io_kiocb *io_get_timeout_req(struct io_ring_ctx *ctx)
+ -{
+ -	struct io_kiocb *req;
+ -
+ -	req = list_first_entry_or_null(&ctx->timeout_list, struct io_kiocb, list);
+ -	if (req) {
+ -		if (req->flags & REQ_F_TIMEOUT_NOSEQ)
+ -			return NULL;
+ -		if (!__req_need_defer(req)) {
+ -			list_del_init(&req->list);
+ -			return req;
+ -		}
+ -	}
+ -
+ -	return NULL;
+ -}
+ -
+  static void __io_commit_cqring(struct io_ring_ctx *ctx)
+  {
+ -	struct io_rings *rings = ctx->rings;
+ +	struct io_cq_ring *ring = ctx->cq_ring;
+  
+ -	/* order cqe stores with ring update */
+ -	smp_store_release(&rings->cq.tail, ctx->cached_cq_tail);
+ -
+ -	if (wq_has_sleeper(&ctx->cq_wait)) {
+ -		wake_up_interruptible(&ctx->cq_wait);
+ -		kill_fasync(&ctx->cq_fasync, SIGIO, POLL_IN);
+ -	}
+ -}
+ +	if (ctx->cached_cq_tail != READ_ONCE(ring->r.tail)) {
+ +		/* order cqe stores with ring update */
+ +		smp_store_release(&ring->r.tail, ctx->cached_cq_tail);
+  
+ -static inline void io_req_work_grab_env(struct io_kiocb *req,
+ -					const struct io_op_def *def)
+ -{
+ -	if (!req->work.mm && def->needs_mm) {
+ -		mmgrab(current->mm);
+ -		req->work.mm = current->mm;
+ -	}
+ -	if (!req->work.creds)
+ -		req->work.creds = get_current_cred();
+ -	if (!req->work.fs && def->needs_fs) {
+ -		spin_lock(&current->fs->lock);
+ -		if (!current->fs->in_exec) {
+ -			req->work.fs = current->fs;
+ -			req->work.fs->users++;
+ -		} else {
+ -			req->work.flags |= IO_WQ_WORK_CANCEL;
+ +		if (wq_has_sleeper(&ctx->cq_wait)) {
+ +			wake_up_interruptible(&ctx->cq_wait);
+ +			kill_fasync(&ctx->cq_fasync, SIGIO, POLL_IN);
+  		}
+ -		spin_unlock(&current->fs->lock);
+  	}
++ 	if (!req->work.task_pid)
++ 		req->work.task_pid = task_pid_vnr(current);
+  }
+  
+ -static inline void io_req_work_drop_env(struct io_kiocb *req)
+ -{
+ -	if (req->work.mm) {
+ -		mmdrop(req->work.mm);
+ -		req->work.mm = NULL;
+ -	}
+ -	if (req->work.creds) {
+ -		put_cred(req->work.creds);
+ -		req->work.creds = NULL;
+ -	}
+ -	if (req->work.fs) {
+ -		struct fs_struct *fs = req->work.fs;
+ -
+ -		spin_lock(&req->work.fs->lock);
+ -		if (--fs->users)
+ -			fs = NULL;
+ -		spin_unlock(&req->work.fs->lock);
+ -		if (fs)
+ -			free_fs_struct(fs);
+ -	}
+ -}
+ -
+ -static inline bool io_prep_async_work(struct io_kiocb *req,
+ -				      struct io_kiocb **link)
+ -{
+ -	const struct io_op_def *def = &io_op_defs[req->opcode];
+ -	bool do_hashed = false;
+ -
+ -	if (req->flags & REQ_F_ISREG) {
+ -		if (def->hash_reg_file)
+ -			do_hashed = true;
+ -	} else {
+ -		if (def->unbound_nonreg_file)
+ -			req->work.flags |= IO_WQ_WORK_UNBOUND;
+ -	}
+ -
+ -	io_req_work_grab_env(req, def);
+ -
+ -	*link = io_prep_linked_timeout(req);
+ -	return do_hashed;
+ -}
+ -
+ -static inline void io_queue_async_work(struct io_kiocb *req)
+ -{
+ -	struct io_ring_ctx *ctx = req->ctx;
+ -	struct io_kiocb *link;
+ -	bool do_hashed;
+ -
+ -	do_hashed = io_prep_async_work(req, &link);
+ -
+ -	trace_io_uring_queue_async_work(ctx, do_hashed, req, &req->work,
+ -					req->flags);
+ -	if (!do_hashed) {
+ -		io_wq_enqueue(ctx->io_wq, &req->work);
+ -	} else {
+ -		io_wq_enqueue_hashed(ctx->io_wq, &req->work,
+ -					file_inode(req->file));
+ -	}
+ -
+ -	if (link)
+ -		io_queue_linked_timeout(link);
+ -}
+ -
+ -static void io_kill_timeout(struct io_kiocb *req)
+ +static inline void io_queue_async_work(struct io_ring_ctx *ctx,
+ +				       struct io_kiocb *req)
+  {
+ -	int ret;
+ +	int rw = 0;
+  
+ -	ret = hrtimer_try_to_cancel(&req->io->timeout.timer);
+ -	if (ret != -1) {
+ -		atomic_inc(&req->ctx->cq_timeouts);
+ -		list_del_init(&req->list);
+ -		io_cqring_fill_event(req, 0);
+ -		io_put_req(req);
+ +	if (req->submit.sqe) {
+ +		switch (req->submit.sqe->opcode) {
+ +		case IORING_OP_WRITEV:
+ +		case IORING_OP_WRITE_FIXED:
+ +			rw = !(req->rw.ki_flags & IOCB_DIRECT);
+ +			break;
+ +		}
+  	}
+ -}
+ -
+ -static void io_kill_timeouts(struct io_ring_ctx *ctx)
+ -{
+ -	struct io_kiocb *req, *tmp;
+  
+ -	spin_lock_irq(&ctx->completion_lock);
+ -	list_for_each_entry_safe(req, tmp, &ctx->timeout_list, list)
+ -		io_kill_timeout(req);
+ -	spin_unlock_irq(&ctx->completion_lock);
+ +	queue_work(ctx->sqo_wq[rw], &req->work);
+  }
+  
+  static void io_commit_cqring(struct io_ring_ctx *ctx)
+@@@ -3578,12 -6436,61 +3580,32 @@@ static int io_uring_release(struct inod
+  	return 0;
+  }
+  
+ -static void io_uring_cancel_files(struct io_ring_ctx *ctx,
+ -				  struct files_struct *files)
+ -{
+ -	struct io_kiocb *req;
+ -	DEFINE_WAIT(wait);
+ -
+ -	while (!list_empty_careful(&ctx->inflight_list)) {
+ -		struct io_kiocb *cancel_req = NULL;
+ -
+ -		spin_lock_irq(&ctx->inflight_lock);
+ -		list_for_each_entry(req, &ctx->inflight_list, inflight_entry) {
+ -			if (req->work.files != files)
+ -				continue;
+ -			/* req is being completed, ignore */
+ -			if (!refcount_inc_not_zero(&req->refs))
+ -				continue;
+ -			cancel_req = req;
+ -			break;
+ -		}
+ -		if (cancel_req)
+ -			prepare_to_wait(&ctx->inflight_wait, &wait,
+ -						TASK_UNINTERRUPTIBLE);
+ -		spin_unlock_irq(&ctx->inflight_lock);
+ -
+ -		/* We need to keep going until we don't find a matching req */
+ -		if (!cancel_req)
+ -			break;
+ -
+ -		io_wq_cancel_work(ctx->io_wq, &cancel_req->work);
+ -		io_put_req(cancel_req);
+ -		schedule();
+ -	}
+ -	finish_wait(&ctx->inflight_wait, &wait);
+ -}
+ -
+ -static int io_uring_flush(struct file *file, void *data)
+ +static int io_uring_mmap(struct file *file, struct vm_area_struct *vma)
+  {
+ +	loff_t offset = (loff_t) vma->vm_pgoff << PAGE_SHIFT;
+ +	unsigned long sz = vma->vm_end - vma->vm_start;
+  	struct io_ring_ctx *ctx = file->private_data;
+++<<<<<<< HEAD
+ +	unsigned long pfn;
+++=======
++ 
++ 	io_uring_cancel_files(ctx, data);
++ 
++ 	/*
++ 	 * If the task is going away, cancel work it may have pending
++ 	 */
++ 	if (fatal_signal_pending(current) || (current->flags & PF_EXITING))
++ 		io_wq_cancel_pid(ctx->io_wq, task_pid_vnr(current));
++ 
++ 	return 0;
++ }
++ 
++ static void *io_uring_validate_mmap_request(struct file *file,
++ 					    loff_t pgoff, size_t sz)
++ {
++ 	struct io_ring_ctx *ctx = file->private_data;
++ 	loff_t offset = pgoff << PAGE_SHIFT;
+++>>>>>>> 6ab231448fdc (io_uring: cancel pending async work if task exits)
+  	struct page *page;
+  	void *ptr;
+  
+* Unmerged path fs/io_uring.c
