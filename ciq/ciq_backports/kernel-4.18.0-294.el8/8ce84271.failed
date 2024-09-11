@@ -1,0 +1,653 @@
+net: atlantic: changes for multi-TC support
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Dmitry Bezrukov <dbezrukov@marvell.com>
+commit 8ce84271697a2346e88582480b26b7e244a8603a
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/8ce84271.failed
+
+This patch contains the following changes:
+* access cfg via aq_nic_get_cfg() in aq_nic_start() and aq_nic_map_skb();
+* call aq_nic_get_dev() just once in aq_nic_map_skb();
+* move ring allocation/deallocation out of aq_vec_alloc()/aq_vec_free();
+* add the missing aq_nic_deinit() in atl_resume_common();
+* rename 'tcs' field to 'tcs_max' in aq_hw_caps_s to differentiate it from
+  the 'tcs' field in aq_nic_cfg_s, which is used for the current number of
+  TCs;
+* update _TC_MAX defines to the actual number of supported TCs;
+* move tx_tc_mode register defines slightly higher (just to keep the order
+  of definitions);
+* separate variables for TX/RX buff_size in hw_atl*_hw_qos_set();
+* use AQ_HW_*_TC instead of hardcoded magic numbers;
+* actually use the 'ret' value in aq_mdo_add_secy();
+
+	Signed-off-by: Dmitry Bezrukov <dbezrukov@marvell.com>
+Co-developed-by: Mark Starovoytov <mstarovoitov@marvell.com>
+	Signed-off-by: Mark Starovoytov <mstarovoitov@marvell.com>
+	Signed-off-by: Igor Russkikh <irusskikh@marvell.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 8ce84271697a2346e88582480b26b7e244a8603a)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/aquantia/atlantic/aq_hw.h
+#	drivers/net/ethernet/aquantia/atlantic/aq_macsec.c
+#	drivers/net/ethernet/aquantia/atlantic/aq_nic.c
+#	drivers/net/ethernet/aquantia/atlantic/aq_pci_func.c
+#	drivers/net/ethernet/aquantia/atlantic/aq_vec.c
+#	drivers/net/ethernet/aquantia/atlantic/hw_atl/hw_atl_b0.c
+#	drivers/net/ethernet/aquantia/atlantic/hw_atl2/hw_atl2.c
+#	drivers/net/ethernet/aquantia/atlantic/hw_atl2/hw_atl2_internal.h
+diff --cc drivers/net/ethernet/aquantia/atlantic/aq_hw.h
+index 46eaf70c5ccb,703ef8d064a2..000000000000
+--- a/drivers/net/ethernet/aquantia/atlantic/aq_hw.h
++++ b/drivers/net/ethernet/aquantia/atlantic/aq_hw.h
+@@@ -113,10 -115,42 +113,44 @@@ struct aq_stats_s 
+  #define AQ_HW_MEDIA_TYPE_TP    1U
+  #define AQ_HW_MEDIA_TYPE_FIBRE 2U
+  
+ -#define AQ_HW_TXD_MULTIPLE 8U
+ -#define AQ_HW_RXD_MULTIPLE 8U
+ -
+  #define AQ_HW_MULTICAST_ADDRESS_MAX     32U
+  
+++<<<<<<< HEAD
+ +#define AQ_HW_TXD_MULTIPLE 8U
+ +#define AQ_HW_RXD_MULTIPLE 8U
+++=======
++ #define AQ_HW_PTP_TC                    2U
++ 
++ #define AQ_HW_LED_BLINK    0x2U
++ #define AQ_HW_LED_DEFAULT  0x0U
++ 
++ enum aq_priv_flags {
++ 	AQ_HW_LOOPBACK_DMA_SYS,
++ 	AQ_HW_LOOPBACK_PKT_SYS,
++ 	AQ_HW_LOOPBACK_DMA_NET,
++ 	AQ_HW_LOOPBACK_PHYINT_SYS,
++ 	AQ_HW_LOOPBACK_PHYEXT_SYS,
++ };
++ 
++ #define AQ_HW_LOOPBACK_MASK	(BIT(AQ_HW_LOOPBACK_DMA_SYS) |\
++ 				 BIT(AQ_HW_LOOPBACK_PKT_SYS) |\
++ 				 BIT(AQ_HW_LOOPBACK_DMA_NET) |\
++ 				 BIT(AQ_HW_LOOPBACK_PHYINT_SYS) |\
++ 				 BIT(AQ_HW_LOOPBACK_PHYEXT_SYS))
++ 
++ #define ATL_HW_CHIP_MIPS         0x00000001U
++ #define ATL_HW_CHIP_TPO2         0x00000002U
++ #define ATL_HW_CHIP_RPF2         0x00000004U
++ #define ATL_HW_CHIP_MPI_AQ       0x00000010U
++ #define ATL_HW_CHIP_ATLANTIC     0x00800000U
++ #define ATL_HW_CHIP_REVISION_A0  0x01000000U
++ #define ATL_HW_CHIP_REVISION_B0  0x02000000U
++ #define ATL_HW_CHIP_REVISION_B1  0x04000000U
++ #define ATL_HW_CHIP_ANTIGUA      0x08000000U
++ 
++ #define ATL_HW_IS_CHIP_FEATURE(_HW_, _F_) (!!(ATL_HW_CHIP_##_F_ & \
++ 	(_HW_)->chip_features))
+++>>>>>>> 8ce84271697a (net: atlantic: changes for multi-TC support)
+  
+  struct aq_hw_s {
+  	atomic_t flags;
+diff --cc drivers/net/ethernet/aquantia/atlantic/aq_nic.c
+index ed7d344e3ed7,b003f1035701..000000000000
+--- a/drivers/net/ethernet/aquantia/atlantic/aq_nic.c
++++ b/drivers/net/ethernet/aquantia/atlantic/aq_nic.c
+@@@ -342,10 -393,34 +342,27 @@@ int aq_nic_init(struct aq_nic_s *self
+  	if (err < 0)
+  		goto err_exit;
+  
+++<<<<<<< HEAD
+ +	for (i = 0U, aq_vec = self->aq_vec[0];
+ +		self->aq_vecs > i; ++i, aq_vec = self->aq_vec[i])
+++=======
++ 	if (ATL_HW_IS_CHIP_FEATURE(self->aq_hw, ATLANTIC) &&
++ 	    self->aq_nic_cfg.aq_hw_caps->media_type == AQ_HW_MEDIA_TYPE_TP) {
++ 		self->aq_hw->phy_id = HW_ATL_PHY_ID_MAX;
++ 		err = aq_phy_init(self->aq_hw);
++ 	}
++ 
++ 	for (i = 0U; i < self->aq_vecs; i++) {
++ 		aq_vec = self->aq_vec[i];
++ 		err = aq_vec_ring_alloc(aq_vec, self, i,
++ 					aq_nic_get_cfg(self));
++ 		if (err)
++ 			goto err_exit;
++ 
+++>>>>>>> 8ce84271697a (net: atlantic: changes for multi-TC support)
+  		aq_vec_init(aq_vec, self->aq_hw_ops, self->aq_hw);
++ 	}
+  
+ -	err = aq_ptp_init(self, self->irqvecs - 1);
+ -	if (err < 0)
+ -		goto err_exit;
+ -
+ -	err = aq_ptp_ring_alloc(self);
+ -	if (err < 0)
+ -		goto err_exit;
+ -
+ -	err = aq_ptp_ring_init(self);
+ -	if (err < 0)
+ -		goto err_exit;
+ -
+  	netif_carrier_off(self->ndev);
+  
+  err_exit:
+@@@ -355,9 -430,12 +372,16 @@@
+  int aq_nic_start(struct aq_nic_s *self)
+  {
+  	struct aq_vec_s *aq_vec = NULL;
+++<<<<<<< HEAD
+++=======
++ 	struct aq_nic_cfg_s *cfg;
++ 	unsigned int i = 0U;
+++>>>>>>> 8ce84271697a (net: atlantic: changes for multi-TC support)
+  	int err = 0;
+ +	unsigned int i = 0U;
+  
++ 	cfg = aq_nic_get_cfg(self);
++ 
+  	err = self->aq_hw_ops->hw_multicast_list_set(self->aq_hw,
+  						     self->mc_list.ar,
+  						     self->mc_list.count);
+@@@ -403,9 -487,13 +427,17 @@@
+  				goto err_exit;
+  		}
+  
+++<<<<<<< HEAD
+ +		if (self->aq_nic_cfg.link_irq_vec) {
+++=======
++ 		err = aq_ptp_irq_alloc(self);
++ 		if (err < 0)
++ 			goto err_exit;
++ 
++ 		if (cfg->link_irq_vec) {
+++>>>>>>> 8ce84271697a (net: atlantic: changes for multi-TC support)
+  			int irqvec = pci_irq_vector(self->pdev,
+- 						   self->aq_nic_cfg.link_irq_vec);
++ 						    cfg->link_irq_vec);
+  			err = request_threaded_irq(irqvec, NULL,
+  						   aq_linkstate_threaded_isr,
+  						   IRQF_SHARED | IRQF_ONESHOT,
+@@@ -435,38 -523,69 +467,58 @@@ err_exit
+  	return err;
+  }
+  
+ -unsigned int aq_nic_map_skb(struct aq_nic_s *self, struct sk_buff *skb,
+ -			    struct aq_ring_s *ring)
+ +static unsigned int aq_nic_map_skb(struct aq_nic_s *self,
+ +				   struct sk_buff *skb,
+ +				   struct aq_ring_s *ring)
+  {
+++<<<<<<< HEAD
+++=======
++ 	unsigned int nr_frags = skb_shinfo(skb)->nr_frags;
++ 	struct aq_nic_cfg_s *cfg = aq_nic_get_cfg(self);
++ 	struct device *dev = aq_nic_get_dev(self);
++ 	struct aq_ring_buff_s *first = NULL;
++ 	u8 ipver = ip_hdr(skb)->version;
++ 	struct aq_ring_buff_s *dx_buff;
++ 	bool need_context_tag = false;
++ 	unsigned int frag_count = 0U;
+++>>>>>>> 8ce84271697a (net: atlantic: changes for multi-TC support)
+  	unsigned int ret = 0U;
+ -	unsigned int dx;
+ -	u8 l4proto = 0;
+ -
+ -	if (ipver == 4)
+ -		l4proto = ip_hdr(skb)->protocol;
+ -	else if (ipver == 6)
+ -		l4proto = ipv6_hdr(skb)->nexthdr;
+ -
+ -	dx = ring->sw_tail;
+ -	dx_buff = &ring->buff_ring[dx];
+ -	dx_buff->flags = 0U;
+ +	unsigned int nr_frags = skb_shinfo(skb)->nr_frags;
+ +	unsigned int frag_count = 0U;
+ +	unsigned int dx = ring->sw_tail;
+ +	struct aq_ring_buff_s *first = NULL;
+ +	struct aq_ring_buff_s *dx_buff = &ring->buff_ring[dx];
+  
+  	if (unlikely(skb_is_gso(skb))) {
+ -		dx_buff->mss = skb_shinfo(skb)->gso_size;
+ -		if (l4proto == IPPROTO_TCP) {
+ -			dx_buff->is_gso_tcp = 1U;
+ -			dx_buff->len_l4 = tcp_hdrlen(skb);
+ -		} else if (l4proto == IPPROTO_UDP) {
+ -			dx_buff->is_gso_udp = 1U;
+ -			dx_buff->len_l4 = sizeof(struct udphdr);
+ -			/* UDP GSO Hardware does not replace packet length. */
+ -			udp_hdr(skb)->len = htons(dx_buff->mss +
+ -						  dx_buff->len_l4);
+ -		} else {
+ -			WARN_ONCE(true, "Bad GSO mode");
+ -			goto exit;
+ -		}
+ +		dx_buff->flags = 0U;
+  		dx_buff->len_pkt = skb->len;
+  		dx_buff->len_l2 = ETH_HLEN;
+ -		dx_buff->len_l3 = skb_network_header_len(skb);
+ +		dx_buff->len_l3 = ip_hdrlen(skb);
+ +		dx_buff->len_l4 = tcp_hdrlen(skb);
+ +		dx_buff->mss = skb_shinfo(skb)->gso_size;
+ +		dx_buff->is_txc = 1U;
+  		dx_buff->eop_index = 0xffffU;
+ -		dx_buff->is_ipv6 = (ipver == 6);
+ -		need_context_tag = true;
+ -	}
+  
+++<<<<<<< HEAD
+ +		dx_buff->is_ipv6 =
+ +			(ip_hdr(skb)->version == 6) ? 1U : 0U;
+++=======
++ 	if (cfg->is_vlan_tx_insert && skb_vlan_tag_present(skb)) {
++ 		dx_buff->vlan_tx_tag = skb_vlan_tag_get(skb);
++ 		dx_buff->len_pkt = skb->len;
++ 		dx_buff->is_vlan = 1U;
++ 		need_context_tag = true;
++ 	}
+++>>>>>>> 8ce84271697a (net: atlantic: changes for multi-TC support)
+  
+ -	if (need_context_tag) {
+  		dx = aq_ring_next_dx(ring, dx);
+  		dx_buff = &ring->buff_ring[dx];
+ -		dx_buff->flags = 0U;
+  		++ret;
+  	}
+  
+ +	dx_buff->flags = 0U;
+  	dx_buff->len = skb_headlen(skb);
+- 	dx_buff->pa = dma_map_single(aq_nic_get_dev(self),
++ 	dx_buff->pa = dma_map_single(dev,
+  				     skb->data,
+  				     dx_buff->len,
+  				     DMA_TO_DEVICE);
+@@@ -555,9 -659,10 +607,9 @@@ mapping_error
+  	     --ret, dx = aq_ring_next_dx(ring, dx)) {
+  		dx_buff = &ring->buff_ring[dx];
+  
+ -		if (!(dx_buff->is_gso_tcp || dx_buff->is_gso_udp) &&
+ -		    !dx_buff->is_vlan && dx_buff->pa) {
+ +		if (!dx_buff->is_txc && dx_buff->pa) {
+  			if (unlikely(dx_buff->is_sop)) {
+- 				dma_unmap_single(aq_nic_get_dev(self),
++ 				dma_unmap_single(dev,
+  						 dx_buff->pa,
+  						 dx_buff->len,
+  						 DMA_TO_DEVICE);
+@@@ -976,11 -1156,18 +1028,13 @@@ void aq_nic_deinit(struct aq_nic_s *sel
+  	if (!self)
+  		goto err_exit;
+  
+- 	for (i = 0U, aq_vec = self->aq_vec[0];
+- 		self->aq_vecs > i; ++i, aq_vec = self->aq_vec[i])
++ 	for (i = 0U; i < self->aq_vecs; i++) {
++ 		aq_vec = self->aq_vec[i];
+  		aq_vec_deinit(aq_vec);
++ 		aq_vec_ring_free(aq_vec);
++ 	}
+  
+ -	aq_ptp_unregister(self);
+ -	aq_ptp_ring_deinit(self);
+ -	aq_ptp_ring_free(self);
+ -	aq_ptp_free(self);
+ -
+ -	if (likely(self->aq_fw_ops->deinit) && link_down) {
+ +	if (likely(self->aq_fw_ops->deinit)) {
+  		mutex_lock(&self->fwreq_mutex);
+  		self->aq_fw_ops->deinit(self->aq_hw);
+  		mutex_unlock(&self->fwreq_mutex);
+diff --cc drivers/net/ethernet/aquantia/atlantic/aq_pci_func.c
+index 2180340f3a4a,41c0f560f95b..000000000000
+--- a/drivers/net/ethernet/aquantia/atlantic/aq_pci_func.c
++++ b/drivers/net/ethernet/aquantia/atlantic/aq_pci_func.c
+@@@ -347,21 -379,95 +347,53 @@@ static void aq_pci_shutdown(struct pci_
+  	}
+  }
+  
+ -static int aq_suspend_common(struct device *dev, bool deep)
+ +static int aq_pci_suspend(struct pci_dev *pdev, pm_message_t pm_msg)
+  {
+ -	struct aq_nic_s *nic = pci_get_drvdata(to_pci_dev(dev));
+ -
+ -	rtnl_lock();
+ -
+ -	nic->power_state = AQ_HW_POWER_STATE_D3;
+ -	netif_device_detach(nic->ndev);
+ -	netif_tx_stop_all_queues(nic->ndev);
+ -
+ -	if (netif_running(nic->ndev))
+ -		aq_nic_stop(nic);
+ -
+ -	if (deep) {
+ -		aq_nic_deinit(nic, !nic->aq_hw->aq_nic_cfg->wol);
+ -		aq_nic_set_power(nic);
+ -	}
+ -
+ -	rtnl_unlock();
+ +	struct aq_nic_s *self = pci_get_drvdata(pdev);
+  
+ -	return 0;
+ +	return aq_nic_change_pm_state(self, &pm_msg);
+  }
+  
+ -static int atl_resume_common(struct device *dev, bool deep)
+ +static int aq_pci_resume(struct pci_dev *pdev)
+  {
+ -	struct pci_dev *pdev = to_pci_dev(dev);
+ -	struct aq_nic_s *nic;
+ -	int ret = 0;
+ +	struct aq_nic_s *self = pci_get_drvdata(pdev);
+ +	pm_message_t pm_msg = PMSG_RESTORE;
+  
+++<<<<<<< HEAD
+ +	return aq_nic_change_pm_state(self, &pm_msg);
+++=======
++ 	nic = pci_get_drvdata(pdev);
++ 
++ 	rtnl_lock();
++ 
++ 	pci_set_power_state(pdev, PCI_D0);
++ 	pci_restore_state(pdev);
++ 
++ 	if (deep) {
++ 		ret = aq_nic_init(nic);
++ 		if (ret)
++ 			goto err_exit;
++ 	}
++ 
++ 	if (netif_running(nic->ndev)) {
++ 		ret = aq_nic_start(nic);
++ 		if (ret)
++ 			goto err_exit;
++ 	}
++ 
++ 	netif_device_attach(nic->ndev);
++ 	netif_tx_start_all_queues(nic->ndev);
++ 
++ err_exit:
++ 	if (ret < 0)
++ 		aq_nic_deinit(nic, true);
++ 
++ 	rtnl_unlock();
++ 
++ 	return ret;
+++>>>>>>> 8ce84271697a (net: atlantic: changes for multi-TC support)
+  }
+  
+ -static int aq_pm_freeze(struct device *dev)
+ -{
+ -	return aq_suspend_common(dev, false);
+ -}
+ -
+ -static int aq_pm_suspend_poweroff(struct device *dev)
+ -{
+ -	return aq_suspend_common(dev, true);
+ -}
+ -
+ -static int aq_pm_thaw(struct device *dev)
+ -{
+ -	return atl_resume_common(dev, false);
+ -}
+ -
+ -static int aq_pm_resume_restore(struct device *dev)
+ -{
+ -	return atl_resume_common(dev, true);
+ -}
+ -
+ -static const struct dev_pm_ops aq_pm_ops = {
+ -	.suspend = aq_pm_suspend_poweroff,
+ -	.poweroff = aq_pm_suspend_poweroff,
+ -	.freeze = aq_pm_freeze,
+ -	.resume = aq_pm_resume_restore,
+ -	.restore = aq_pm_resume_restore,
+ -	.thaw = aq_pm_thaw,
+ -};
+ -
+  static struct pci_driver aq_pci_ops = {
+  	.name = AQ_CFG_DRV_NAME,
+  	.id_table = aq_pci_tbl,
+diff --cc drivers/net/ethernet/aquantia/atlantic/aq_vec.c
+index e9e3905626ba,d5650cd6e236..000000000000
+--- a/drivers/net/ethernet/aquantia/atlantic/aq_vec.c
++++ b/drivers/net/ethernet/aquantia/atlantic/aq_vec.c
+@@@ -107,15 -104,10 +107,16 @@@ struct aq_vec_s *aq_vec_alloc(struct aq
+  			      struct aq_nic_cfg_s *aq_nic_cfg)
+  {
+  	struct aq_vec_s *self = NULL;
+++<<<<<<< HEAD
+ +	struct aq_ring_s *ring = NULL;
+ +	unsigned int i = 0U;
+ +	int err = 0;
+++=======
+++>>>>>>> 8ce84271697a (net: atlantic: changes for multi-TC support)
+  
+  	self = kzalloc(sizeof(*self), GFP_KERNEL);
+- 	if (!self) {
+- 		err = -ENOMEM;
++ 	if (!self)
+  		goto err_exit;
+- 	}
+  
+  	self->aq_nic = aq_nic;
+  	self->aq_ring_param.vec_idx = idx;
+@@@ -159,10 -160,11 +169,15 @@@ int aq_vec_ring_alloc(struct aq_vec_s *
+  
+  err_exit:
+  	if (err < 0) {
+- 		aq_vec_free(self);
++ 		aq_vec_ring_free(self);
+  		self = NULL;
+  	}
+++<<<<<<< HEAD
+ +	return self;
+++=======
++ 
++ 	return err;
+++>>>>>>> 8ce84271697a (net: atlantic: changes for multi-TC support)
+  }
+  
+  int aq_vec_init(struct aq_vec_s *self, const struct aq_hw_ops *aq_hw_ops,
+diff --cc drivers/net/ethernet/aquantia/atlantic/hw_atl/hw_atl_b0.c
+index b7e5ce0d7af5,bee4fb3c8741..000000000000
+--- a/drivers/net/ethernet/aquantia/atlantic/hw_atl/hw_atl_b0.c
++++ b/drivers/net/ethernet/aquantia/atlantic/hw_atl/hw_atl_b0.c
+@@@ -110,9 -116,10 +110,15 @@@ static int hw_atl_b0_set_fc(struct aq_h
+  
+  static int hw_atl_b0_hw_qos_set(struct aq_hw_s *self)
+  {
+++<<<<<<< HEAD
+++=======
++ 	u32 tx_buff_size = HW_ATL_B0_TXBUF_MAX;
++ 	u32 rx_buff_size = HW_ATL_B0_RXBUF_MAX;
++ 	unsigned int i_priority = 0U;
+++>>>>>>> 8ce84271697a (net: atlantic: changes for multi-TC support)
+  	u32 tc = 0U;
+ +	u32 buff_size = 0U;
+ +	unsigned int i_priority = 0U;
+  
+  	/* TPS Descriptor rate init */
+  	hw_atl_tps_tx_pkt_shed_desc_rate_curr_time_res_set(self, 0x0U);
+@@@ -125,31 -132,34 +131,51 @@@
+  	hw_atl_tps_tx_pkt_shed_desc_tc_arb_mode_set(self, 0U);
+  	hw_atl_tps_tx_pkt_shed_data_arb_mode_set(self, 0U);
+  
+++<<<<<<< HEAD
+ +	hw_atl_tps_tx_pkt_shed_tc_data_max_credit_set(self, 0xFFF, 0U);
+ +	hw_atl_tps_tx_pkt_shed_tc_data_weight_set(self, 0x64, 0U);
+ +	hw_atl_tps_tx_pkt_shed_desc_tc_max_credit_set(self, 0x50, 0U);
+ +	hw_atl_tps_tx_pkt_shed_desc_tc_weight_set(self, 0x1E, 0U);
+ +
+ +	/* Tx buf size */
+ +	buff_size = HW_ATL_B0_TXBUF_MAX;
+- 
+- 	hw_atl_tpb_tx_pkt_buff_size_per_tc_set(self, buff_size, tc);
+++=======
++ 	/* TX Packet Scheduler Data TC0 */
++ 	hw_atl_tps_tx_pkt_shed_tc_data_max_credit_set(self, 0xFFF, tc);
++ 	hw_atl_tps_tx_pkt_shed_tc_data_weight_set(self, 0x64, tc);
++ 	hw_atl_tps_tx_pkt_shed_desc_tc_max_credit_set(self, 0x50, tc);
++ 	hw_atl_tps_tx_pkt_shed_desc_tc_weight_set(self, 0x1E, tc);
++ 
++ 	/* Tx buf size TC0 */
++ 	tx_buff_size -= HW_ATL_B0_PTP_TXBUF_SIZE;
+++>>>>>>> 8ce84271697a (net: atlantic: changes for multi-TC support)
++ 
++ 	hw_atl_tpb_tx_pkt_buff_size_per_tc_set(self, tx_buff_size, tc);
+  	hw_atl_tpb_tx_buff_hi_threshold_per_tc_set(self,
+- 						   (buff_size *
++ 						   (tx_buff_size *
+  						   (1024 / 32U) * 66U) /
+  						   100U, tc);
+  	hw_atl_tpb_tx_buff_lo_threshold_per_tc_set(self,
+- 						   (buff_size *
++ 						   (tx_buff_size *
+  						   (1024 / 32U) * 50U) /
+  						   100U, tc);
+++<<<<<<< HEAD
+ +
+ +	/* QoS Rx buf size per TC */
+ +	tc = 0;
+ +	buff_size = HW_ATL_B0_RXBUF_MAX;
+++=======
++ 	/* Init TC2 for PTP_TX */
++ 	hw_atl_tpb_tx_pkt_buff_size_per_tc_set(self, HW_ATL_B0_PTP_TXBUF_SIZE,
++ 					       AQ_HW_PTP_TC);
++ 
++ 	/* QoS Rx buf size per TC */
++ 	rx_buff_size -= HW_ATL_B0_PTP_RXBUF_SIZE;
+++>>>>>>> 8ce84271697a (net: atlantic: changes for multi-TC support)
+  
+- 	hw_atl_rpb_rx_pkt_buff_size_per_tc_set(self, buff_size, tc);
++ 	hw_atl_rpb_rx_pkt_buff_size_per_tc_set(self, rx_buff_size, tc);
+  	hw_atl_rpb_rx_buff_hi_threshold_per_tc_set(self,
+- 						   (buff_size *
++ 						   (rx_buff_size *
+  						   (1024U / 32U) * 66U) /
+  						   100U, tc);
+  	hw_atl_rpb_rx_buff_lo_threshold_per_tc_set(self,
+@@@ -157,7 -167,13 +183,17 @@@
+  						   (1024U / 32U) * 50U) /
+  						   100U, tc);
+  
+++<<<<<<< HEAD
+ +	hw_atl_b0_set_fc(self, self->aq_nic_cfg->flow_control, tc);
+++=======
++ 	hw_atl_b0_set_fc(self, self->aq_nic_cfg->fc.req, tc);
++ 
++ 	/* Init TC2 for PTP_RX */
++ 	hw_atl_rpb_rx_pkt_buff_size_per_tc_set(self, HW_ATL_B0_PTP_RXBUF_SIZE,
++ 					       AQ_HW_PTP_TC);
++ 	/* No flow control for PTP */
++ 	hw_atl_rpb_rx_xoff_en_per_tc_set(self, 0U, AQ_HW_PTP_TC);
+++>>>>>>> 8ce84271697a (net: atlantic: changes for multi-TC support)
+  
+  	/* QoS 802.1p priority -> TC mapping */
+  	for (i_priority = 8U; i_priority--;)
+* Unmerged path drivers/net/ethernet/aquantia/atlantic/aq_macsec.c
+* Unmerged path drivers/net/ethernet/aquantia/atlantic/hw_atl2/hw_atl2.c
+* Unmerged path drivers/net/ethernet/aquantia/atlantic/hw_atl2/hw_atl2_internal.h
+* Unmerged path drivers/net/ethernet/aquantia/atlantic/aq_hw.h
+* Unmerged path drivers/net/ethernet/aquantia/atlantic/aq_macsec.c
+* Unmerged path drivers/net/ethernet/aquantia/atlantic/aq_nic.c
+* Unmerged path drivers/net/ethernet/aquantia/atlantic/aq_pci_func.c
+* Unmerged path drivers/net/ethernet/aquantia/atlantic/aq_vec.c
+diff --git a/drivers/net/ethernet/aquantia/atlantic/aq_vec.h b/drivers/net/ethernet/aquantia/atlantic/aq_vec.h
+index 8bdf60bb3f63..a5c415733073 100644
+--- a/drivers/net/ethernet/aquantia/atlantic/aq_vec.h
++++ b/drivers/net/ethernet/aquantia/atlantic/aq_vec.h
+@@ -28,10 +28,13 @@ irqreturn_t aq_vec_isr(int irq, void *private);
+ irqreturn_t aq_vec_isr_legacy(int irq, void *private);
+ struct aq_vec_s *aq_vec_alloc(struct aq_nic_s *aq_nic, unsigned int idx,
+ 			      struct aq_nic_cfg_s *aq_nic_cfg);
++int aq_vec_ring_alloc(struct aq_vec_s *self, struct aq_nic_s *aq_nic,
++		      unsigned int idx, struct aq_nic_cfg_s *aq_nic_cfg);
+ int aq_vec_init(struct aq_vec_s *self, const struct aq_hw_ops *aq_hw_ops,
+ 		struct aq_hw_s *aq_hw);
+ void aq_vec_deinit(struct aq_vec_s *self);
+ void aq_vec_free(struct aq_vec_s *self);
++void aq_vec_ring_free(struct aq_vec_s *self);
+ int aq_vec_start(struct aq_vec_s *self);
+ void aq_vec_stop(struct aq_vec_s *self);
+ cpumask_t *aq_vec_get_affinity_mask(struct aq_vec_s *self);
+diff --git a/drivers/net/ethernet/aquantia/atlantic/hw_atl/hw_atl_a0.c b/drivers/net/ethernet/aquantia/atlantic/hw_atl/hw_atl_a0.c
+index ec4ee92db31b..31d59c5c14d1 100644
+--- a/drivers/net/ethernet/aquantia/atlantic/hw_atl/hw_atl_a0.c
++++ b/drivers/net/ethernet/aquantia/atlantic/hw_atl/hw_atl_a0.c
+@@ -23,7 +23,7 @@
+ 	.msix_irqs = 4U,		  \
+ 	.irq_mask = ~0U,		  \
+ 	.vecs = HW_ATL_A0_RSS_MAX,	  \
+-	.tcs = HW_ATL_A0_TC_MAX,	  \
++	.tcs_max = HW_ATL_A0_TC_MAX,	  \
+ 	.rxd_alignment = 1U,		  \
+ 	.rxd_size = HW_ATL_A0_RXD_SIZE,   \
+ 	.rxds_max = HW_ATL_A0_MAX_RXD,    \
+* Unmerged path drivers/net/ethernet/aquantia/atlantic/hw_atl/hw_atl_b0.c
+diff --git a/drivers/net/ethernet/aquantia/atlantic/hw_atl/hw_atl_b0_internal.h b/drivers/net/ethernet/aquantia/atlantic/hw_atl/hw_atl_b0_internal.h
+index 89d8ee68dea9..51060c49a256 100644
+--- a/drivers/net/ethernet/aquantia/atlantic/hw_atl/hw_atl_b0_internal.h
++++ b/drivers/net/ethernet/aquantia/atlantic/hw_atl/hw_atl_b0_internal.h
+@@ -75,7 +75,7 @@
+ #define HW_ATL_B0_RSS_HASHKEY_BITS 320U
+ 
+ #define HW_ATL_B0_TCRSS_4_8  1
+-#define HW_ATL_B0_TC_MAX 1U
++#define HW_ATL_B0_TC_MAX 8U
+ #define HW_ATL_B0_RSS_MAX 8U
+ 
+ #define HW_ATL_B0_LRO_RXD_MAX 16U
+diff --git a/drivers/net/ethernet/aquantia/atlantic/hw_atl/hw_atl_llh_internal.h b/drivers/net/ethernet/aquantia/atlantic/hw_atl/hw_atl_llh_internal.h
+index 5ddaed96cf74..907b66b106ed 100644
+--- a/drivers/net/ethernet/aquantia/atlantic/hw_atl/hw_atl_llh_internal.h
++++ b/drivers/net/ethernet/aquantia/atlantic/hw_atl/hw_atl_llh_internal.h
+@@ -1977,6 +1977,24 @@
+ /* default value of bitfield lso_tcp_flag_mid[b:0] */
+ #define HW_ATL_THM_LSO_TCP_FLAG_MID_DEFAULT 0x0
+ 
++/* tx tx_tc_mode bitfield definitions
++ * preprocessor definitions for the bitfield "tx_tc_mode".
++ * port="pif_tpb_tx_tc_mode_i,pif_tps_tx_tc_mode_i"
++ */
++
++/* register address for bitfield tx_tc_mode */
++#define HW_ATL_TPB_TX_TC_MODE_ADDR 0x00007900
++/* bitmask for bitfield tx_tc_mode */
++#define HW_ATL_TPB_TX_TC_MODE_MSK 0x00000100
++/* inverted bitmask for bitfield tx_tc_mode */
++#define HW_ATL_TPB_TX_TC_MODE_MSKN 0xFFFFFEFF
++/* lower bit position of bitfield tx_tc_mode */
++#define HW_ATL_TPB_TX_TC_MODE_SHIFT 8
++/* width of bitfield tx_tc_mode */
++#define HW_ATL_TPB_TX_TC_MODE_WIDTH 1
++/* default value of bitfield tx_tc_mode */
++#define HW_ATL_TPB_TX_TC_MODE_DEFAULT 0x0
++
+ /* tx tx_buf_en bitfield definitions
+  * preprocessor definitions for the bitfield "tx_buf_en".
+  * port="pif_tpb_tx_buf_en_i"
+@@ -1995,19 +2013,6 @@
+ /* default value of bitfield tx_buf_en */
+ #define HW_ATL_TPB_TX_BUF_EN_DEFAULT 0x0
+ 
+-/* register address for bitfield tx_tc_mode */
+-#define HW_ATL_TPB_TX_TC_MODE_ADDR 0x00007900
+-/* bitmask for bitfield tx_tc_mode */
+-#define HW_ATL_TPB_TX_TC_MODE_MSK 0x00000100
+-/* inverted bitmask for bitfield tx_tc_mode */
+-#define HW_ATL_TPB_TX_TC_MODE_MSKN 0xFFFFFEFF
+-/* lower bit position of bitfield tx_tc_mode */
+-#define HW_ATL_TPB_TX_TC_MODE_SHIFT 8
+-/* width of bitfield tx_tc_mode */
+-#define HW_ATL_TPB_TX_TC_MODE_WIDTH 1
+-/* default value of bitfield tx_tc_mode */
+-#define HW_ATL_TPB_TX_TC_MODE_DEFAULT 0x0
+-
+ /* tx tx{b}_hi_thresh[c:0] bitfield definitions
+  * preprocessor definitions for the bitfield "tx{b}_hi_thresh[c:0]".
+  * parameter: buffer {b} | stride size 0x10 | range [0, 7]
+* Unmerged path drivers/net/ethernet/aquantia/atlantic/hw_atl2/hw_atl2.c
+* Unmerged path drivers/net/ethernet/aquantia/atlantic/hw_atl2/hw_atl2_internal.h
