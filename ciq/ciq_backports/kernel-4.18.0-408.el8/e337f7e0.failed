@@ -1,0 +1,223 @@
+KVM: selftests: Add a test to force emulation with a pending exception
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-408.el8
+commit-author Sean Christopherson <seanjc@google.com>
+commit e337f7e063641ca4d040c8210d4bd790b81effb0
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-408.el8/e337f7e0.failed
+
+Add a VMX specific test to verify that KVM doesn't explode if userspace
+attempts KVM_RUN when emulation is required with a pending exception.
+KVM VMX's emulation support for !unrestricted_guest punts exceptions to
+userspace instead of attempting to synthesize the exception with all the
+correct state (and stack switching, etc...).
+
+Punting is acceptable as there's never been a request to support
+injecting exceptions when emulating due to invalid state, but KVM has
+historically assumed that userspace will do the right thing and either
+clear the exception or kill the guest.  Deliberately do the opposite and
+attempt to re-enter the guest with a pending exception and emulation
+required to verify KVM continues to punt the combination to userspace,
+e.g. doesn't explode, WARN, etc...
+
+	Signed-off-by: Sean Christopherson <seanjc@google.com>
+Message-Id: <20211228232437.1875318-3-seanjc@google.com>
+	Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+(cherry picked from commit e337f7e063641ca4d040c8210d4bd790b81effb0)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	tools/testing/selftests/kvm/.gitignore
+#	tools/testing/selftests/kvm/Makefile
+diff --cc tools/testing/selftests/kvm/.gitignore
+index 6108a977b0a4,c2165b137a50..000000000000
+--- a/tools/testing/selftests/kvm/.gitignore
++++ b/tools/testing/selftests/kvm/.gitignore
+@@@ -9,9 -28,19 +9,17 @@@
+  /x86_64/sev_migrate_tests
+  /x86_64/smm_test
+  /x86_64/state_test
+ -/x86_64/svm_vmcall_test
+ -/x86_64/svm_int_ctl_test
+  /x86_64/sync_regs_test
+ -/x86_64/tsc_msrs_test
+ -/x86_64/userspace_io_test
+ -/x86_64/userspace_msr_exit_test
+  /x86_64/vmx_apic_access_test
+  /x86_64/vmx_close_while_nested_test
+++<<<<<<< HEAD
+++=======
++ /x86_64/vmx_dirty_log_test
++ /x86_64/vmx_exception_with_invalid_guest_state
++ /x86_64/vmx_invalid_nested_guest_state
++ /x86_64/vmx_preemption_timer_test
++ /x86_64/vmx_set_nested_state_test
+++>>>>>>> e337f7e06364 (KVM: selftests: Add a test to force emulation with a pending exception)
+  /x86_64/vmx_tsc_adjust_test
+  /x86_64/vmx_nested_tsc_scaling_test
+  /x86_64/xapic_ipi_test
+diff --cc tools/testing/selftests/kvm/Makefile
+index 89c308b6d33f,81ebf99d6ff0..000000000000
+--- a/tools/testing/selftests/kvm/Makefile
++++ b/tools/testing/selftests/kvm/Makefile
+@@@ -62,6 -70,8 +62,11 @@@ TEST_GEN_PROGS_x86_64 += x86_64/userspa
+  TEST_GEN_PROGS_x86_64 += x86_64/vmx_apic_access_test
+  TEST_GEN_PROGS_x86_64 += x86_64/vmx_close_while_nested_test
+  TEST_GEN_PROGS_x86_64 += x86_64/vmx_dirty_log_test
+++<<<<<<< HEAD
+++=======
++ TEST_GEN_PROGS_x86_64 += x86_64/vmx_exception_with_invalid_guest_state
++ TEST_GEN_PROGS_x86_64 += x86_64/vmx_invalid_nested_guest_state
+++>>>>>>> e337f7e06364 (KVM: selftests: Add a test to force emulation with a pending exception)
+  TEST_GEN_PROGS_x86_64 += x86_64/vmx_set_nested_state_test
+  TEST_GEN_PROGS_x86_64 += x86_64/vmx_tsc_adjust_test
+  TEST_GEN_PROGS_x86_64 += x86_64/vmx_nested_tsc_scaling_test
+* Unmerged path tools/testing/selftests/kvm/.gitignore
+* Unmerged path tools/testing/selftests/kvm/Makefile
+diff --git a/tools/testing/selftests/kvm/x86_64/vmx_exception_with_invalid_guest_state.c b/tools/testing/selftests/kvm/x86_64/vmx_exception_with_invalid_guest_state.c
+new file mode 100644
+index 000000000000..27a850f3d7ce
+--- /dev/null
++++ b/tools/testing/selftests/kvm/x86_64/vmx_exception_with_invalid_guest_state.c
+@@ -0,0 +1,139 @@
++// SPDX-License-Identifier: GPL-2.0-only
++#include "test_util.h"
++#include "kvm_util.h"
++#include "processor.h"
++
++#include <signal.h>
++#include <string.h>
++#include <sys/ioctl.h>
++#include <sys/time.h>
++
++#include "kselftest.h"
++
++#define VCPU_ID	0
++
++static struct kvm_vm *vm;
++
++static void guest_ud_handler(struct ex_regs *regs)
++{
++	/* Loop on the ud2 until guest state is made invalid. */
++}
++
++static void guest_code(void)
++{
++	asm volatile("ud2");
++}
++
++static void __run_vcpu_with_invalid_state(void)
++{
++	struct kvm_run *run = vcpu_state(vm, VCPU_ID);
++
++	vcpu_run(vm, VCPU_ID);
++
++	TEST_ASSERT(run->exit_reason == KVM_EXIT_INTERNAL_ERROR,
++		    "Expected KVM_EXIT_INTERNAL_ERROR, got %d (%s)\n",
++		    run->exit_reason, exit_reason_str(run->exit_reason));
++	TEST_ASSERT(run->emulation_failure.suberror == KVM_INTERNAL_ERROR_EMULATION,
++		    "Expected emulation failure, got %d\n",
++		    run->emulation_failure.suberror);
++}
++
++static void run_vcpu_with_invalid_state(void)
++{
++	/*
++	 * Always run twice to verify KVM handles the case where _KVM_ queues
++	 * an exception with invalid state and then exits to userspace, i.e.
++	 * that KVM doesn't explode if userspace ignores the initial error.
++	 */
++	__run_vcpu_with_invalid_state();
++	__run_vcpu_with_invalid_state();
++}
++
++static void set_timer(void)
++{
++	struct itimerval timer;
++
++	timer.it_value.tv_sec  = 0;
++	timer.it_value.tv_usec = 200;
++	timer.it_interval = timer.it_value;
++	ASSERT_EQ(setitimer(ITIMER_REAL, &timer, NULL), 0);
++}
++
++static void set_or_clear_invalid_guest_state(bool set)
++{
++	static struct kvm_sregs sregs;
++
++	if (!sregs.cr0)
++		vcpu_sregs_get(vm, VCPU_ID, &sregs);
++	sregs.tr.unusable = !!set;
++	vcpu_sregs_set(vm, VCPU_ID, &sregs);
++}
++
++static void set_invalid_guest_state(void)
++{
++	set_or_clear_invalid_guest_state(true);
++}
++
++static void clear_invalid_guest_state(void)
++{
++	set_or_clear_invalid_guest_state(false);
++}
++
++static void sigalrm_handler(int sig)
++{
++	struct kvm_vcpu_events events;
++
++	TEST_ASSERT(sig == SIGALRM, "Unexpected signal = %d", sig);
++
++	vcpu_events_get(vm, VCPU_ID, &events);
++
++	/*
++	 * If an exception is pending, attempt KVM_RUN with invalid guest,
++	 * otherwise rearm the timer and keep doing so until the timer fires
++	 * between KVM queueing an exception and re-entering the guest.
++	 */
++	if (events.exception.pending) {
++		set_invalid_guest_state();
++		run_vcpu_with_invalid_state();
++	} else {
++		set_timer();
++	}
++}
++
++int main(int argc, char *argv[])
++{
++	if (!is_intel_cpu() || vm_is_unrestricted_guest(NULL)) {
++		print_skip("Must be run with kvm_intel.unrestricted_guest=0");
++		exit(KSFT_SKIP);
++	}
++
++	vm = vm_create_default(VCPU_ID, 0, (void *)guest_code);
++
++	vm_init_descriptor_tables(vm);
++	vcpu_init_descriptor_tables(vm, VCPU_ID);
++
++	vm_install_exception_handler(vm, UD_VECTOR, guest_ud_handler);
++
++	/*
++	 * Stuff invalid guest state for L2 by making TR unusuable.  The next
++	 * KVM_RUN should induce a TRIPLE_FAULT in L2 as KVM doesn't support
++	 * emulating invalid guest state for L2.
++	 */
++	set_invalid_guest_state();
++	run_vcpu_with_invalid_state();
++
++	/*
++	 * Verify KVM also handles the case where userspace gains control while
++	 * an exception is pending and stuffs invalid state.  Run with valid
++	 * guest state and a timer firing every 200us, and attempt to enter the
++	 * guest with invalid state when the handler interrupts KVM with an
++	 * exception pending.
++	 */
++	clear_invalid_guest_state();
++	TEST_ASSERT(signal(SIGALRM, sigalrm_handler) != SIG_ERR,
++		    "Failed to register SIGALRM handler, errno = %d (%s)",
++		    errno, strerror(errno));
++
++	set_timer();
++	run_vcpu_with_invalid_state();
++}
