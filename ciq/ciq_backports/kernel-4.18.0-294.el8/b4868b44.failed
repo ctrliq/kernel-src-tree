@@ -1,0 +1,205 @@
+NFSv4: Wait for stateid updates after CLOSE/OPEN_DOWNGRADE
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Benjamin Coddington <bcodding@redhat.com>
+commit b4868b44c5628995fdd8ef2e24dda73cef963a75
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/b4868b44.failed
+
+Since commit 0e0cb35b417f ("NFSv4: Handle NFS4ERR_OLD_STATEID in
+CLOSE/OPEN_DOWNGRADE") the following livelock may occur if a CLOSE races
+with the update of the nfs_state:
+
+Process 1           Process 2           Server
+=========           =========           ========
+ OPEN file
+                    OPEN file
+                                        Reply OPEN (1)
+                                        Reply OPEN (2)
+ Update state (1)
+ CLOSE file (1)
+                                        Reply OLD_STATEID (1)
+ CLOSE file (2)
+                                        Reply CLOSE (-1)
+                    Update state (2)
+                    wait for state change
+ OPEN file
+                    wake
+ CLOSE file
+ OPEN file
+                    wake
+ CLOSE file
+ ...
+                    ...
+
+We can avoid this situation by not issuing an immediate retry with a bumped
+seqid when CLOSE/OPEN_DOWNGRADE receives NFS4ERR_OLD_STATEID.  Instead,
+take the same approach used by OPEN and wait at least 5 seconds for
+outstanding stateid updates to complete if we can detect that we're out of
+sequence.
+
+Note that after this change it is still possible (though unlikely) that
+CLOSE waits a full 5 seconds, bumps the seqid, and retries -- and that
+attempt races with another OPEN at the same time.  In order to avoid this
+race (which would result in the livelock), update
+nfs_need_update_open_stateid() to handle the case where:
+ - the state is NFS_OPEN_STATE, and
+ - the stateid doesn't match the current open stateid
+
+Finally, nfs_need_update_open_stateid() is modified to be idempotent and
+renamed to better suit the purpose of signaling that the stateid passed
+is the next stateid in sequence.
+
+Fixes: 0e0cb35b417f ("NFSv4: Handle NFS4ERR_OLD_STATEID in CLOSE/OPEN_DOWNGRADE")
+	Cc: stable@vger.kernel.org # v5.4+
+	Signed-off-by: Benjamin Coddington <bcodding@redhat.com>
+	Signed-off-by: Anna Schumaker <Anna.Schumaker@Netapp.com>
+(cherry picked from commit b4868b44c5628995fdd8ef2e24dda73cef963a75)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/nfs/nfs4proc.c
+diff --cc fs/nfs/nfs4proc.c
+index cb840795d9f0,f7ef2ca699a5..000000000000
+--- a/fs/nfs/nfs4proc.c
++++ b/fs/nfs/nfs4proc.c
+@@@ -3379,6 -3383,102 +3365,105 @@@ nfs4_wait_on_layoutreturn(struct inode 
+  	return pnfs_wait_on_layoutreturn(inode, task);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ /*
++  * Update the seqid of an open stateid
++  */
++ static void nfs4_sync_open_stateid(nfs4_stateid *dst,
++ 		struct nfs4_state *state)
++ {
++ 	__be32 seqid_open;
++ 	u32 dst_seqid;
++ 	int seq;
++ 
++ 	for (;;) {
++ 		if (!nfs4_valid_open_stateid(state))
++ 			break;
++ 		seq = read_seqbegin(&state->seqlock);
++ 		if (!nfs4_state_match_open_stateid_other(state, dst)) {
++ 			nfs4_stateid_copy(dst, &state->open_stateid);
++ 			if (read_seqretry(&state->seqlock, seq))
++ 				continue;
++ 			break;
++ 		}
++ 		seqid_open = state->open_stateid.seqid;
++ 		if (read_seqretry(&state->seqlock, seq))
++ 			continue;
++ 
++ 		dst_seqid = be32_to_cpu(dst->seqid);
++ 		if ((s32)(dst_seqid - be32_to_cpu(seqid_open)) < 0)
++ 			dst->seqid = seqid_open;
++ 		break;
++ 	}
++ }
++ 
++ /*
++  * Update the seqid of an open stateid after receiving
++  * NFS4ERR_OLD_STATEID
++  */
++ static bool nfs4_refresh_open_old_stateid(nfs4_stateid *dst,
++ 		struct nfs4_state *state)
++ {
++ 	__be32 seqid_open;
++ 	u32 dst_seqid;
++ 	bool ret;
++ 	int seq, status = -EAGAIN;
++ 	DEFINE_WAIT(wait);
++ 
++ 	for (;;) {
++ 		ret = false;
++ 		if (!nfs4_valid_open_stateid(state))
++ 			break;
++ 		seq = read_seqbegin(&state->seqlock);
++ 		if (!nfs4_state_match_open_stateid_other(state, dst)) {
++ 			if (read_seqretry(&state->seqlock, seq))
++ 				continue;
++ 			break;
++ 		}
++ 
++ 		write_seqlock(&state->seqlock);
++ 		seqid_open = state->open_stateid.seqid;
++ 
++ 		dst_seqid = be32_to_cpu(dst->seqid);
++ 
++ 		/* Did another OPEN bump the state's seqid?  try again: */
++ 		if ((s32)(be32_to_cpu(seqid_open) - dst_seqid) > 0) {
++ 			dst->seqid = seqid_open;
++ 			write_sequnlock(&state->seqlock);
++ 			ret = true;
++ 			break;
++ 		}
++ 
++ 		/* server says we're behind but we haven't seen the update yet */
++ 		set_bit(NFS_STATE_CHANGE_WAIT, &state->flags);
++ 		prepare_to_wait(&state->waitq, &wait, TASK_KILLABLE);
++ 		write_sequnlock(&state->seqlock);
++ 		trace_nfs4_close_stateid_update_wait(state->inode, dst, 0);
++ 
++ 		if (signal_pending(current))
++ 			status = -EINTR;
++ 		else
++ 			if (schedule_timeout(5*HZ) != 0)
++ 				status = 0;
++ 
++ 		finish_wait(&state->waitq, &wait);
++ 
++ 		if (!status)
++ 			continue;
++ 		if (status == -EINTR)
++ 			break;
++ 
++ 		/* we slept the whole 5 seconds, we must have lost a seqid */
++ 		dst->seqid = cpu_to_be32(dst_seqid + 1);
++ 		ret = true;
++ 		break;
++ 	}
++ 
++ 	return ret;
++ }
++ 
+++>>>>>>> b4868b44c562 (NFSv4: Wait for stateid updates after CLOSE/OPEN_DOWNGRADE)
+  struct nfs4_closedata {
+  	struct inode *inode;
+  	struct nfs4_state *state;
+diff --git a/fs/nfs/nfs4_fs.h b/fs/nfs/nfs4_fs.h
+index d191093d3b2e..5602ba4ab42d 100644
+--- a/fs/nfs/nfs4_fs.h
++++ b/fs/nfs/nfs4_fs.h
+@@ -583,6 +583,14 @@ static inline bool nfs4_stateid_is_newer(const nfs4_stateid *s1, const nfs4_stat
+ 	return (s32)(be32_to_cpu(s1->seqid) - be32_to_cpu(s2->seqid)) > 0;
+ }
+ 
++static inline bool nfs4_stateid_is_next(const nfs4_stateid *s1, const nfs4_stateid *s2)
++{
++	u32 seq1 = be32_to_cpu(s1->seqid);
++	u32 seq2 = be32_to_cpu(s2->seqid);
++
++	return seq2 == seq1 + 1U || (seq2 == 1U && seq1 == 0xffffffffU);
++}
++
+ static inline bool nfs4_stateid_match_or_older(const nfs4_stateid *dst, const nfs4_stateid *src)
+ {
+ 	return nfs4_stateid_match_other(dst, src) &&
+* Unmerged path fs/nfs/nfs4proc.c
+diff --git a/fs/nfs/nfs4trace.h b/fs/nfs/nfs4trace.h
+index f88ba25b173a..2e824863ca73 100644
+--- a/fs/nfs/nfs4trace.h
++++ b/fs/nfs/nfs4trace.h
+@@ -1511,6 +1511,7 @@ DEFINE_NFS4_INODE_STATEID_EVENT(nfs4_setattr);
+ DEFINE_NFS4_INODE_STATEID_EVENT(nfs4_delegreturn);
+ DEFINE_NFS4_INODE_STATEID_EVENT(nfs4_open_stateid_update);
+ DEFINE_NFS4_INODE_STATEID_EVENT(nfs4_open_stateid_update_wait);
++DEFINE_NFS4_INODE_STATEID_EVENT(nfs4_close_stateid_update_wait);
+ 
+ DECLARE_EVENT_CLASS(nfs4_getattr_event,
+ 		TP_PROTO(
