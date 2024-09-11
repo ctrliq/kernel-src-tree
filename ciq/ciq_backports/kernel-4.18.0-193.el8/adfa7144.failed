@@ -1,0 +1,199 @@
+SUNRPC: Cleanup: remove the unused 'task' argument from the request_send()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-193.el8
+commit-author Trond Myklebust <trond.myklebust@hammerspace.com>
+commit adfa71446dd0943ba376eff3e05c7c89582f8038
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-193.el8/adfa7144.failed
+
+	Signed-off-by: Trond Myklebust <trond.myklebust@hammerspace.com>
+(cherry picked from commit adfa71446dd0943ba376eff3e05c7c89582f8038)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/sunrpc/xprt.c
+diff --cc net/sunrpc/xprt.c
+index 94c01ec0b45e,c86a5df6c338..000000000000
+--- a/net/sunrpc/xprt.c
++++ b/net/sunrpc/xprt.c
+@@@ -1012,41 -1263,36 +1012,45 @@@ void xprt_transmit(struct rpc_task *tas
+  
+  	dprintk("RPC: %5u xprt_transmit(%u)\n", task->tk_pid, req->rq_slen);
+  
+ -	if (!req->rq_bytes_sent) {
+ -		if (xprt_request_data_received(task)) {
+ -			status = 0;
+ -			goto out_dequeue;
+ -		}
+ +	if (!req->rq_reply_bytes_recvd) {
+ +
+  		/* Verify that our message lies in the RPCSEC_GSS window */
+ -		if (rpcauth_xmit_need_reencode(task)) {
+ -			status = -EBADMSG;
+ -			goto out_dequeue;
+ +		if (!req->rq_bytes_sent && rpcauth_xmit_need_reencode(task)) {
+ +			task->tk_status = -EBADMSG;
+ +			return;
+  		}
+ -	}
+  
+ -	/*
+ -	 * Update req->rq_ntrans before transmitting to avoid races with
+ -	 * xprt_update_rtt(), which needs to know that it is recording a
+ -	 * reply to the first transmission.
+ -	 */
+ -	req->rq_ntrans++;
+ +		if (list_empty(&req->rq_list) && rpc_reply_expected(task)) {
+ +			/*
+ +			 * Add to the list only if we're expecting a reply
+ +			 */
+ +			/* Update the softirq receive buffer */
+ +			memcpy(&req->rq_private_buf, &req->rq_rcv_buf,
+ +					sizeof(req->rq_private_buf));
+ +			/* Add request to the receive list */
+ +			spin_lock(&xprt->recv_lock);
+ +			list_add_tail(&req->rq_list, &xprt->recv);
+ +			set_bit(RPC_TASK_NEED_RECV, &task->tk_runstate);
+ +			spin_unlock(&xprt->recv_lock);
+ +			xprt_reset_majortimeo(req);
+ +			/* Turn off autodisconnect */
+ +			del_singleshot_timer_sync(&xprt->timer);
+ +		}
+ +	} else if (xprt_request_data_received(task) && !req->rq_bytes_sent)
+ +		return;
+  
+  	connect_cookie = xprt->connect_cookie;
+++<<<<<<< HEAD
+ +	status = xprt->ops->send_request(req, task);
+++=======
++ 	status = xprt->ops->send_request(req);
+++>>>>>>> adfa71446dd0 (SUNRPC: Cleanup: remove the unused 'task' argument from the request_send())
+  	trace_xprt_transmit(xprt, req->rq_xid, status);
+  	if (status != 0) {
+ -		req->rq_ntrans--;
+ -		return status;
+ +		task->tk_status = status;
+ +		return;
+  	}
+  
+ -	if (is_retrans)
+ -		task->tk_client->cl_stats->rpcretrans++;
+ -
+  	xprt_inject_disconnect(xprt);
+  
+  	dprintk("RPC: %5u xmit complete\n", task->tk_pid);
+diff --git a/include/linux/sunrpc/xprt.h b/include/linux/sunrpc/xprt.h
+index e7472a422479..17ddda7ced87 100644
+--- a/include/linux/sunrpc/xprt.h
++++ b/include/linux/sunrpc/xprt.h
+@@ -134,7 +134,7 @@ struct rpc_xprt_ops {
+ 	void		(*connect)(struct rpc_xprt *xprt, struct rpc_task *task);
+ 	int		(*buf_alloc)(struct rpc_task *task);
+ 	void		(*buf_free)(struct rpc_task *task);
+-	int		(*send_request)(struct rpc_rqst *req, struct rpc_task *task);
++	int		(*send_request)(struct rpc_rqst *req);
+ 	void		(*set_retrans_timeout)(struct rpc_task *task);
+ 	void		(*timer)(struct rpc_xprt *xprt, struct rpc_task *task);
+ 	void		(*release_request)(struct rpc_task *task);
+* Unmerged path net/sunrpc/xprt.c
+diff --git a/net/sunrpc/xprtrdma/svc_rdma_backchannel.c b/net/sunrpc/xprtrdma/svc_rdma_backchannel.c
+index d648cd53231c..f647b7528120 100644
+--- a/net/sunrpc/xprtrdma/svc_rdma_backchannel.c
++++ b/net/sunrpc/xprtrdma/svc_rdma_backchannel.c
+@@ -211,7 +211,7 @@ rpcrdma_bc_send_request(struct svcxprt_rdma *rdma, struct rpc_rqst *rqst)
+  * connection.
+  */
+ static int
+-xprt_rdma_bc_send_request(struct rpc_rqst *rqst, struct rpc_task *task)
++xprt_rdma_bc_send_request(struct rpc_rqst *rqst)
+ {
+ 	struct svc_xprt *sxprt = rqst->rq_xprt->bc_xprt;
+ 	struct svcxprt_rdma *rdma;
+diff --git a/net/sunrpc/xprtrdma/transport.c b/net/sunrpc/xprtrdma/transport.c
+index 112d4b459fc7..61d8115ddc2e 100644
+--- a/net/sunrpc/xprtrdma/transport.c
++++ b/net/sunrpc/xprtrdma/transport.c
+@@ -691,7 +691,7 @@ xprt_rdma_free(struct rpc_task *task)
+ 
+ /**
+  * xprt_rdma_send_request - marshal and send an RPC request
+- * @task: RPC task with an RPC message in rq_snd_buf
++ * @rqst: RPC message in rq_snd_buf
+  *
+  * Caller holds the transport's write lock.
+  *
+@@ -706,7 +706,7 @@ xprt_rdma_free(struct rpc_task *task)
+  *		Do not try to send this message again.
+  */
+ static int
+-xprt_rdma_send_request(struct rpc_rqst *rqst, struct rpc_task *task)
++xprt_rdma_send_request(struct rpc_rqst *rqst)
+ {
+ 	struct rpc_xprt *xprt = rqst->rq_xprt;
+ 	struct rpcrdma_req *req = rpcr_to_rdmar(rqst);
+diff --git a/net/sunrpc/xprtsock.c b/net/sunrpc/xprtsock.c
+index b3c742fe8073..94de22eac46b 100644
+--- a/net/sunrpc/xprtsock.c
++++ b/net/sunrpc/xprtsock.c
+@@ -514,7 +514,6 @@ static inline void xs_encode_stream_record_marker(struct xdr_buf *buf)
+ /**
+  * xs_local_send_request - write an RPC request to an AF_LOCAL socket
+  * @req: pointer to RPC request
+- * @task: RPC task that manages the state of an RPC request
+  *
+  * Return values:
+  *        0:	The request has been sent
+@@ -523,7 +522,7 @@ static inline void xs_encode_stream_record_marker(struct xdr_buf *buf)
+  * ENOTCONN:	Caller needs to invoke connect logic then call again
+  *    other:	Some other error occured, the request was not sent
+  */
+-static int xs_local_send_request(struct rpc_rqst *req, struct rpc_task *task)
++static int xs_local_send_request(struct rpc_rqst *req)
+ {
+ 	struct rpc_xprt *xprt = req->rq_xprt;
+ 	struct sock_xprt *transport =
+@@ -586,7 +585,6 @@ static int xs_local_send_request(struct rpc_rqst *req, struct rpc_task *task)
+ /**
+  * xs_udp_send_request - write an RPC request to a UDP socket
+  * @req: pointer to RPC request
+- * @task: address of RPC task that manages the state of an RPC request
+  *
+  * Return values:
+  *        0:	The request has been sent
+@@ -595,7 +593,7 @@ static int xs_local_send_request(struct rpc_rqst *req, struct rpc_task *task)
+  * ENOTCONN:	Caller needs to invoke connect logic then call again
+  *    other:	Some other error occurred, the request was not sent
+  */
+-static int xs_udp_send_request(struct rpc_rqst *req, struct rpc_task *task)
++static int xs_udp_send_request(struct rpc_rqst *req)
+ {
+ 	struct rpc_xprt *xprt = req->rq_xprt;
+ 	struct sock_xprt *transport = container_of(xprt, struct sock_xprt, xprt);
+@@ -659,7 +657,6 @@ static int xs_udp_send_request(struct rpc_rqst *req, struct rpc_task *task)
+ /**
+  * xs_tcp_send_request - write an RPC request to a TCP socket
+  * @req: pointer to RPC request
+- * @task: address of RPC task that manages the state of an RPC request
+  *
+  * Return values:
+  *        0:	The request has been sent
+@@ -671,7 +668,7 @@ static int xs_udp_send_request(struct rpc_rqst *req, struct rpc_task *task)
+  * XXX: In the case of soft timeouts, should we eventually give up
+  *	if sendmsg is not able to make progress?
+  */
+-static int xs_tcp_send_request(struct rpc_rqst *req, struct rpc_task *task)
++static int xs_tcp_send_request(struct rpc_rqst *req)
+ {
+ 	struct rpc_xprt *xprt = req->rq_xprt;
+ 	struct sock_xprt *transport = container_of(xprt, struct sock_xprt, xprt);
+@@ -2711,7 +2708,7 @@ static int bc_sendto(struct rpc_rqst *req)
+ /*
+  * The send routine. Borrows from svc_send
+  */
+-static int bc_send_request(struct rpc_rqst *req, struct rpc_task *task)
++static int bc_send_request(struct rpc_rqst *req)
+ {
+ 	struct svc_xprt	*xprt;
+ 	int len;
