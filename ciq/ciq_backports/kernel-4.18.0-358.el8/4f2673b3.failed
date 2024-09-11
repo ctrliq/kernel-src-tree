@@ -1,0 +1,170 @@
+net: bridge: add helper to replay port and host-joined mdb entries
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-358.el8
+commit-author Vladimir Oltean <vladimir.oltean@nxp.com>
+commit 4f2673b3a2b6246729a1ff13b8945a040839dbd3
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-358.el8/4f2673b3.failed
+
+I have a system with DSA ports, and udhcpcd is configured to bring
+interfaces up as soon as they are created.
+
+I create a bridge as follows:
+
+ip link add br0 type bridge
+
+As soon as I create the bridge and udhcpcd brings it up, I also have
+avahi which automatically starts sending IPv6 packets to advertise some
+local services, and because of that, the br0 bridge joins the following
+IPv6 groups due to the code path detailed below:
+
+33:33:ff:6d:c1:9c vid 0
+33:33:00:00:00:6a vid 0
+33:33:00:00:00:fb vid 0
+
+br_dev_xmit
+-> br_multicast_rcv
+   -> br_ip6_multicast_add_group
+      -> __br_multicast_add_group
+         -> br_multicast_host_join
+            -> br_mdb_notify
+
+This is all fine, but inside br_mdb_notify we have br_mdb_switchdev_host
+hooked up, and switchdev will attempt to offload the host joined groups
+to an empty list of ports. Of course nobody offloads them.
+
+Then when we add a port to br0:
+
+ip link set swp0 master br0
+
+the bridge doesn't replay the host-joined MDB entries from br_add_if,
+and eventually the host joined addresses expire, and a switchdev
+notification for deleting it is emitted, but surprise, the original
+addition was already completely missed.
+
+The strategy to address this problem is to replay the MDB entries (both
+the port ones and the host joined ones) when the new port joins the
+bridge, similar to what vxlan_fdb_replay does (in that case, its FDB can
+be populated and only then attached to a bridge that you offload).
+However there are 2 possibilities: the addresses can be 'pushed' by the
+bridge into the port, or the port can 'pull' them from the bridge.
+
+Considering that in the general case, the new port can be really late to
+the party, and there may have been many other switchdev ports that
+already received the initial notification, we would like to avoid
+delivering duplicate events to them, since they might misbehave. And
+currently, the bridge calls the entire switchdev notifier chain, whereas
+for replaying it should just call the notifier block of the new guy.
+But the bridge doesn't know what is the new guy's notifier block, it
+just knows where the switchdev notifier chain is. So for simplification,
+we make this a driver-initiated pull for now, and the notifier block is
+passed as an argument.
+
+To emulate the calling context for mdb objects (deferred and put on the
+blocking notifier chain), we must iterate under RCU protection through
+the bridge's mdb entries, queue them, and only call them once we're out
+of the RCU read-side critical section.
+
+There was some opportunity for reuse between br_mdb_switchdev_host_port,
+br_mdb_notify and the newly added br_mdb_queue_one in how the switchdev
+mdb object is created, so a helper was created.
+
+	Suggested-by: Ido Schimmel <idosch@idosch.org>
+	Signed-off-by: Vladimir Oltean <vladimir.oltean@nxp.com>
+	Acked-by: Nikolay Aleksandrov <nikolay@nvidia.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 4f2673b3a2b6246729a1ff13b8945a040839dbd3)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/bridge/br_mdb.c
+diff --cc net/bridge/br_mdb.c
+index 40754c5e5bdc,95fa4af0e8dd..000000000000
+--- a/net/bridge/br_mdb.c
++++ b/net/bridge/br_mdb.c
+@@@ -469,18 -643,12 +597,21 @@@ static void br_mdb_switchdev_host_port(
+  		.obj = {
+  			.id = SWITCHDEV_OBJ_ID_HOST_MDB,
+  			.flags = SWITCHDEV_F_DEFER,
++ 			.orig_dev = dev,
+  		},
+- 		.vid = mp->addr.vid,
+  	};
+  
+++<<<<<<< HEAD
+ +	if (mp->addr.proto == htons(ETH_P_IP))
+ +		ip_eth_mc_map(mp->addr.u.ip4, mdb.addr);
+ +#if IS_ENABLED(CONFIG_IPV6)
+ +	else
+ +		ipv6_eth_mc_map(&mp->addr.u.ip6, mdb.addr);
+ +#endif
+++=======
++ 	br_switchdev_mdb_populate(&mdb, mp);
+++>>>>>>> 4f2673b3a2b6 (net: bridge: add helper to replay port and host-joined mdb entries)
+  
+- 	mdb.obj.orig_dev = dev;
+  	switch (type) {
+  	case RTM_NEWMDB:
+  		switchdev_port_obj_add(lower_dev, &mdb.obj, NULL);
+@@@ -519,13 -686,9 +649,19 @@@ void br_mdb_notify(struct net_device *d
+  	int err = -ENOBUFS;
+  
+  	if (pg) {
+++<<<<<<< HEAD
+ +		if (mp->addr.proto == htons(ETH_P_IP))
+ +			ip_eth_mc_map(mp->addr.u.ip4, mdb.addr);
+ +#if IS_ENABLED(CONFIG_IPV6)
+ +		else
+ +			ipv6_eth_mc_map(&mp->addr.u.ip6, mdb.addr);
+ +#endif
+ +		mdb.obj.orig_dev = pg->port->dev;
+++=======
++ 		br_switchdev_mdb_populate(&mdb, mp);
++ 
++ 		mdb.obj.orig_dev = pg->key.port->dev;
+++>>>>>>> 4f2673b3a2b6 (net: bridge: add helper to replay port and host-joined mdb entries)
+  		switch (type) {
+  		case RTM_NEWMDB:
+  			complete_info = kmalloc(sizeof(*complete_info), GFP_ATOMIC);
+diff --git a/include/linux/if_bridge.h b/include/linux/if_bridge.h
+index f081bcb0ccfd..84432c9b8d36 100644
+--- a/include/linux/if_bridge.h
++++ b/include/linux/if_bridge.h
+@@ -74,6 +74,8 @@ bool br_multicast_has_querier_anywhere(struct net_device *dev, int proto);
+ bool br_multicast_has_querier_adjacent(struct net_device *dev, int proto);
+ bool br_multicast_enabled(const struct net_device *dev);
+ bool br_multicast_router(const struct net_device *dev);
++int br_mdb_replay(struct net_device *br_dev, struct net_device *dev,
++		  struct notifier_block *nb, struct netlink_ext_ack *extack);
+ #else
+ static inline int br_multicast_list_adjacent(struct net_device *dev,
+ 					     struct list_head *br_ip_list)
+@@ -98,6 +100,13 @@ static inline bool br_multicast_router(const struct net_device *dev)
+ {
+ 	return false;
+ }
++static inline int br_mdb_replay(struct net_device *br_dev,
++				struct net_device *dev,
++				struct notifier_block *nb,
++				struct netlink_ext_ack *extack)
++{
++	return -EOPNOTSUPP;
++}
+ #endif
+ 
+ #if IS_ENABLED(CONFIG_BRIDGE) && IS_ENABLED(CONFIG_BRIDGE_VLAN_FILTERING)
+diff --git a/include/net/switchdev.h b/include/net/switchdev.h
+index 4b6737027b82..03a84877fab0 100644
+--- a/include/net/switchdev.h
++++ b/include/net/switchdev.h
+@@ -68,6 +68,7 @@ enum switchdev_obj_id {
+ };
+ 
+ struct switchdev_obj {
++	struct list_head list;
+ 	struct net_device *orig_dev;
+ 	enum switchdev_obj_id id;
+ 	u32 flags;
+* Unmerged path net/bridge/br_mdb.c
