@@ -1,0 +1,157 @@
+mac80211_hwsim: add frame transmission support over virtio
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-315.el8
+commit-author Erel Geron <erelx.geron@intel.com>
+commit 5d44fe7c9808c56e136e59147bd932f5491520f1
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-315.el8/5d44fe7c.failed
+
+This allows communication with external entities.
+
+It also required fixing up the netlink policy, since NLA_UNSPEC
+attributes are no longer accepted.
+
+	Signed-off-by: Erel Geron <erelx.geron@intel.com>
+[port to backports, inline the ID, use 29 as the ID as requested,
+ drop != NULL checks, reduce ifdefs]
+Link: https://lore.kernel.org/r/20200305143212.c6e4c87d225b.I7ce60bf143e863dcdf0fb8040aab7168ba549b99@changeid
+	Signed-off-by: Johannes Berg <johannes.berg@intel.com>
+(cherry picked from commit 5d44fe7c9808c56e136e59147bd932f5491520f1)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/wireless/mac80211_hwsim.c
+#	include/uapi/linux/virtio_ids.h
+diff --cc drivers/net/wireless/mac80211_hwsim.c
+index 8a694105682d,7fe8207db6ae..000000000000
+--- a/drivers/net/wireless/mac80211_hwsim.c
++++ b/drivers/net/wireless/mac80211_hwsim.c
+@@@ -3,6 -3,8 +3,11 @@@
+   * mac80211_hwsim - software simulator of 802.11 radio(s) for mac80211
+   * Copyright (c) 2008, Jouni Malinen <j@w1.fi>
+   * Copyright (c) 2011, Javier Lopez <jlopex@gmail.com>
+++<<<<<<< HEAD
+++=======
++  * Copyright (c) 2016 - 2017 Intel Deutschland GmbH
++  * Copyright (C) 2018 - 2020 Intel Corporation
+++>>>>>>> 5d44fe7c9808 (mac80211_hwsim: add frame transmission support over virtio)
+   */
+  
+  /*
+@@@ -636,9 -638,56 +645,60 @@@ static const struct nla_policy hwsim_ge
+  	[HWSIM_ATTR_RADIO_NAME] = { .type = NLA_STRING },
+  	[HWSIM_ATTR_NO_VIF] = { .type = NLA_FLAG },
+  	[HWSIM_ATTR_FREQ] = { .type = NLA_U32 },
+++<<<<<<< HEAD
+ +	[HWSIM_ATTR_PERM_ADDR] = { .type = NLA_UNSPEC, .len = ETH_ALEN },
+++=======
++ 	[HWSIM_ATTR_TX_INFO_FLAGS] = { .type = NLA_BINARY },
++ 	[HWSIM_ATTR_PERM_ADDR] = NLA_POLICY_ETH_ADDR_COMPAT,
++ 	[HWSIM_ATTR_IFTYPE_SUPPORT] = { .type = NLA_U32 },
++ 	[HWSIM_ATTR_CIPHER_SUPPORT] = { .type = NLA_BINARY },
+++>>>>>>> 5d44fe7c9808 (mac80211_hwsim: add frame transmission support over virtio)
+  };
+  
++ #if IS_REACHABLE(CONFIG_VIRTIO)
++ 
++ /* MAC80211_HWSIM virtio queues */
++ static struct virtqueue *hwsim_vqs[HWSIM_NUM_VQS];
++ static bool hwsim_virtio_enabled;
++ static spinlock_t hwsim_virtio_lock;
++ 
++ static void hwsim_virtio_rx_work(struct work_struct *work);
++ static DECLARE_WORK(hwsim_virtio_rx, hwsim_virtio_rx_work);
++ 
++ static int hwsim_tx_virtio(struct mac80211_hwsim_data *data,
++ 			   struct sk_buff *skb)
++ {
++ 	struct scatterlist sg[1];
++ 	unsigned long flags;
++ 	int err;
++ 
++ 	spin_lock_irqsave(&hwsim_virtio_lock, flags);
++ 	if (!hwsim_virtio_enabled) {
++ 		err = -ENODEV;
++ 		goto out_free;
++ 	}
++ 
++ 	sg_init_one(sg, skb->head, skb_end_offset(skb));
++ 	err = virtqueue_add_outbuf(hwsim_vqs[HWSIM_VQ_TX], sg, 1, skb,
++ 				   GFP_ATOMIC);
++ 	if (err)
++ 		goto out_free;
++ 	virtqueue_kick(hwsim_vqs[HWSIM_VQ_TX]);
++ 	spin_unlock_irqrestore(&hwsim_virtio_lock, flags);
++ 	return 0;
++ 
++ out_free:
++ 	spin_unlock_irqrestore(&hwsim_virtio_lock, flags);
++ 	nlmsg_free(skb);
++ 	return err;
++ }
++ #else
++ /* cause a linker error if this ends up being needed */
++ extern int hwsim_tx_virtio(struct mac80211_hwsim_data *data,
++ 			   struct sk_buff *skb);
++ #define hwsim_virtio_enabled false
++ #endif
++ 
+  static void mac80211_hwsim_tx_frame(struct ieee80211_hw *hw,
+  				    struct sk_buff *skb,
+  				    struct ieee80211_channel *chan);
+diff --cc include/uapi/linux/virtio_ids.h
+index 3cd335fde3a5,ecc27a17401a..000000000000
+--- a/include/uapi/linux/virtio_ids.h
++++ b/include/uapi/linux/virtio_ids.h
+@@@ -45,5 -45,7 +45,10 @@@
+  #define VIRTIO_ID_CRYPTO       20 /* virtio crypto */
+  #define VIRTIO_ID_IOMMU        23 /* virtio IOMMU */
+  #define VIRTIO_ID_FS           26 /* virtio filesystem */
+++<<<<<<< HEAD
+++=======
++ #define VIRTIO_ID_PMEM         27 /* virtio pmem */
++ #define VIRTIO_ID_MAC80211_HWSIM 29 /* virtio mac80211-hwsim */
+++>>>>>>> 5d44fe7c9808 (mac80211_hwsim: add frame transmission support over virtio)
+  
+  #endif /* _LINUX_VIRTIO_IDS_H */
+* Unmerged path drivers/net/wireless/mac80211_hwsim.c
+diff --git a/drivers/net/wireless/mac80211_hwsim.h b/drivers/net/wireless/mac80211_hwsim.h
+index 3dc22059f6ef..60295822f29d 100644
+--- a/drivers/net/wireless/mac80211_hwsim.h
++++ b/drivers/net/wireless/mac80211_hwsim.h
+@@ -3,6 +3,7 @@
+  * mac80211_hwsim - software simulator of 802.11 radio(s) for mac80211
+  * Copyright (c) 2008, Jouni Malinen <j@w1.fi>
+  * Copyright (c) 2011, Javier Lopez <jlopex@gmail.com>
++ * Copyright (C) 2020 Intel Corporation
+  */
+ 
+ #ifndef __MAC80211_HWSIM_H
+@@ -241,4 +242,24 @@ struct hwsim_tx_rate_flag {
+ 	s8 idx;
+ 	u16 flags;
+ } __packed;
++
++/**
++ * DOC: Frame transmission support over virtio
++ *
++ * Frame transmission is also supported over virtio to allow communication
++ * with external entities.
++ */
++
++/**
++ * enum hwsim_vqs - queues for virtio frame transmission
++ *
++ * @HWSIM_VQ_TX: send frames to external entity
++ * @HWSIM_VQ_RX: receive frames and transmission info reports
++ * @HWSIM_NUM_VQS: enum limit
++ */
++enum {
++	HWSIM_VQ_TX,
++	HWSIM_VQ_RX,
++	HWSIM_NUM_VQS,
++};
+ #endif /* __MAC80211_HWSIM_H */
+* Unmerged path include/uapi/linux/virtio_ids.h
