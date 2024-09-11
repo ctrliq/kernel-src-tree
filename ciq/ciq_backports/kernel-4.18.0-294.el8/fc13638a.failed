@@ -1,0 +1,209 @@
+scsi: scsi_debug: Implement tur_ms_to_ready parameter
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Douglas Gilbert <dgilbert@interlog.com>
+commit fc13638ae92ee9eb861732d642d922d577b82a9e
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/fc13638a.failed
+
+The current driver responds to TEST UNIT READY (TUR) with a GOOD status
+immediately after a scsi_debug device (LU) is created. This is unrealistic
+as even SSDs take some time after power-on before accepting media access
+commands.
+
+Add the tur_ms_to_ready parameter whose unit is milliseconds (default 0)
+and is the period before which a TUR (or any media access command) will set
+the CHECK CONDITION status with a sense key of NOT READY and an additional
+sense of "Logical unit is in process of becoming ready".  The period starts
+when each scsi_debug device is created.
+
+This patch was prompted by T10 proposal 20-061r2 which was accepted on
+2020716. It adds that a TUR in the situation described in the previous
+paragraph may set the INFO field (or descriptor) in the sense data to the
+estimated number in milliseconds before a subsequent TUR will yield a GOOD
+status. This patch follows that advice.
+
+Link: https://lore.kernel.org/r/20200724155531.668144-1-dgilbert@interlog.com
+	Reported-by: kernel test robot <lkp@intel.com>
+	Signed-off-by: Douglas Gilbert <dgilbert@interlog.com>
+	Signed-off-by: Martin K. Petersen <martin.petersen@oracle.com>
+(cherry picked from commit fc13638ae92ee9eb861732d642d922d577b82a9e)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/scsi/scsi_debug.c
+diff --cc drivers/scsi/scsi_debug.c
+index 1ab093573119,064ed680c053..000000000000
+--- a/drivers/scsi/scsi_debug.c
++++ b/drivers/scsi/scsi_debug.c
+@@@ -257,8 -289,21 +258,24 @@@ struct sdebug_dev_info 
+  	struct sdebug_host_info *sdbg_host;
+  	unsigned long uas_bm[1];
+  	atomic_t num_in_q;
+- 	atomic_t stopped;
++ 	atomic_t stopped;	/* 1: by SSU, 2: device start */
+  	bool used;
+++<<<<<<< HEAD
+++=======
++ 
++ 	/* For ZBC devices */
++ 	enum blk_zoned_model zmodel;
++ 	unsigned int zsize;
++ 	unsigned int zsize_shift;
++ 	unsigned int nr_zones;
++ 	unsigned int nr_conv_zones;
++ 	unsigned int nr_imp_open;
++ 	unsigned int nr_exp_open;
++ 	unsigned int nr_closed;
++ 	unsigned int max_open;
++ 	ktime_t create_ts;	/* time since bootup that this device was created */
++ 	struct sdeb_zone_state *zstate;
+++>>>>>>> fc13638ae92e (scsi: scsi_debug: Implement tur_ms_to_ready parameter)
+  };
+  
+  struct sdebug_host_info {
+@@@ -3848,6 -4918,18 +3888,21 @@@ static struct sdebug_dev_info *sdebug_d
+  			}
+  		}
+  		devip->sdbg_host = sdbg_host;
+++<<<<<<< HEAD
+++=======
++ 		if (sdeb_zbc_in_use) {
++ 			devip->zmodel = sdeb_zbc_model;
++ 			if (sdebug_device_create_zones(devip)) {
++ 				kfree(devip);
++ 				return NULL;
++ 			}
++ 		} else {
++ 			devip->zmodel = BLK_ZONED_NONE;
++ 		}
++ 		devip->sdbg_host = sdbg_host;
++ 		devip->create_ts = ktime_get_boottime();
++ 		atomic_set(&devip->stopped, (sdeb_tur_ms_to_ready > 0 ? 2 : 0));
+++>>>>>>> fc13638ae92e (scsi: scsi_debug: Implement tur_ms_to_ready parameter)
+  		list_add_tail(&devip->dev_list, &sdbg_host->dev_info_list);
+  	}
+  	return devip;
+@@@ -5209,7 -6477,52 +5266,13 @@@ static ssize_t cdb_len_store(struct dev
+  }
+  static DRIVER_ATTR_RW(cdb_len);
+  
+ -static const char * const zbc_model_strs_a[] = {
+ -	[BLK_ZONED_NONE] = "none",
+ -	[BLK_ZONED_HA]   = "host-aware",
+ -	[BLK_ZONED_HM]   = "host-managed",
+ -};
+ -
+ -static const char * const zbc_model_strs_b[] = {
+ -	[BLK_ZONED_NONE] = "no",
+ -	[BLK_ZONED_HA]   = "aware",
+ -	[BLK_ZONED_HM]   = "managed",
+ -};
+ -
+ -static const char * const zbc_model_strs_c[] = {
+ -	[BLK_ZONED_NONE] = "0",
+ -	[BLK_ZONED_HA]   = "1",
+ -	[BLK_ZONED_HM]   = "2",
+ -};
+ -
+ -static int sdeb_zbc_model_str(const char *cp)
+ -{
+ -	int res = sysfs_match_string(zbc_model_strs_a, cp);
+ -
+ -	if (res < 0) {
+ -		res = sysfs_match_string(zbc_model_strs_b, cp);
+ -		if (res < 0) {
+ -			res = sysfs_match_string(zbc_model_strs_c, cp);
+ -			if (res < 0)
+ -				return -EINVAL;
+ -		}
+ -	}
+ -	return res;
+ -}
+ -
+ -static ssize_t zbc_show(struct device_driver *ddp, char *buf)
+ -{
+ -	return scnprintf(buf, PAGE_SIZE, "%s\n",
+ -			 zbc_model_strs_a[sdeb_zbc_model]);
+ -}
+ -static DRIVER_ATTR_RO(zbc);
+  
++ static ssize_t tur_ms_to_ready_show(struct device_driver *ddp, char *buf)
++ {
++ 	return scnprintf(buf, PAGE_SIZE, "%d\n", sdeb_tur_ms_to_ready);
++ }
++ static DRIVER_ATTR_RO(tur_ms_to_ready);
++ 
+  /* Note: The following array creates attribute files in the
+     /sys/bus/pseudo/drivers/scsi_debug directory. The advantage of these
+     files (over those found in the /sys/module/scsi_debug/parameters
+@@@ -5249,6 -6565,8 +5312,11 @@@ static struct attribute *sdebug_drv_att
+  	&driver_attr_strict.attr,
+  	&driver_attr_uuid_ctl.attr,
+  	&driver_attr_cdb_len.attr,
+++<<<<<<< HEAD
+++=======
++ 	&driver_attr_tur_ms_to_ready.attr,
++ 	&driver_attr_zbc.attr,
+++>>>>>>> fc13638ae92e (scsi: scsi_debug: Implement tur_ms_to_ready parameter)
+  	NULL,
+  };
+  ATTRIBUTE_GROUPS(sdebug_drv);
+@@@ -5618,10 -7102,47 +5686,54 @@@ static bool fake_timeout(struct scsi_cm
+  	return false;
+  }
+  
+++<<<<<<< HEAD
+ +static bool fake_host_busy(struct scsi_cmnd *scp)
+ +{
+ +	return (sdebug_opts & SDEBUG_OPT_HOST_BUSY) &&
+ +		(atomic_read(&sdebug_cmnd_count) % abs(sdebug_every_nth)) == 0;
+++=======
++ /* Response to TUR or media access command when device stopped */
++ static int resp_not_ready(struct scsi_cmnd *scp, struct sdebug_dev_info *devip)
++ {
++ 	int stopped_state;
++ 	u64 diff_ns = 0;
++ 	ktime_t now_ts = ktime_get_boottime();
++ 	struct scsi_device *sdp = scp->device;
++ 
++ 	stopped_state = atomic_read(&devip->stopped);
++ 	if (stopped_state == 2) {
++ 		if (ktime_to_ns(now_ts) > ktime_to_ns(devip->create_ts)) {
++ 			diff_ns = ktime_to_ns(ktime_sub(now_ts, devip->create_ts));
++ 			if (diff_ns >= ((u64)sdeb_tur_ms_to_ready * 1000000)) {
++ 				/* tur_ms_to_ready timer extinguished */
++ 				atomic_set(&devip->stopped, 0);
++ 				return 0;
++ 			}
++ 		}
++ 		mk_sense_buffer(scp, NOT_READY, LOGICAL_UNIT_NOT_READY, 0x1);
++ 		if (sdebug_verbose)
++ 			sdev_printk(KERN_INFO, sdp,
++ 				    "%s: Not ready: in process of becoming ready\n", my_name);
++ 		if (scp->cmnd[0] == TEST_UNIT_READY) {
++ 			u64 tur_nanosecs_to_ready = (u64)sdeb_tur_ms_to_ready * 1000000;
++ 
++ 			if (diff_ns <= tur_nanosecs_to_ready)
++ 				diff_ns = tur_nanosecs_to_ready - diff_ns;
++ 			else
++ 				diff_ns = tur_nanosecs_to_ready;
++ 			/* As per 20-061r2 approved for spc6 by T10 on 20200716 */
++ 			do_div(diff_ns, 1000000);	/* diff_ns becomes milliseconds */
++ 			scsi_set_sense_information(scp->sense_buffer, SCSI_SENSE_BUFFERSIZE,
++ 						   diff_ns);
++ 			return check_condition_result;
++ 		}
++ 	}
++ 	mk_sense_buffer(scp, NOT_READY, LOGICAL_UNIT_NOT_READY, 0x2);
++ 	if (sdebug_verbose)
++ 		sdev_printk(KERN_INFO, sdp, "%s: Not ready: initializing command required\n",
++ 			    my_name);
++ 	return check_condition_result;
+++>>>>>>> fc13638ae92e (scsi: scsi_debug: Implement tur_ms_to_ready parameter)
+  }
+  
+  static int scsi_debug_queuecommand(struct Scsi_Host *shost,
+* Unmerged path drivers/scsi/scsi_debug.c
