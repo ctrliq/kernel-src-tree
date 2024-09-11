@@ -1,0 +1,80 @@
+RDMA/mlx5: Fix a race with mlx5_ib_update_xlt on an implicit MR
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-193.el8
+commit-author Jason Gunthorpe <jgg@ziepe.ca>
+commit f28b1932eaae183b80bd8c7abecae167a0e5c61a
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-193.el8/f28b1932.failed
+
+mlx5_ib_update_xlt() must be protected against parallel free of the MR it
+is accessing, also it must be called single threaded while updating the
+HW. Otherwise we can have races of the form:
+
+    CPU0                               CPU1
+  mlx5_ib_update_xlt()
+   mlx5_odp_populate_klm()
+     odp_lookup() == NULL
+     pklm = ZAP
+                                      implicit_mr_get_data()
+ 				        implicit_mr_alloc()
+ 					  <update interval tree>
+					mlx5_ib_update_xlt
+					  mlx5_odp_populate_klm()
+					    odp_lookup() != NULL
+					    pklm = VALID
+					   mlx5_ib_post_send_wait()
+
+    mlx5_ib_post_send_wait() // Replaces VALID with ZAP
+
+This can be solved by putting both the SRCU and the umem_mutex lock around
+every call to mlx5_ib_update_xlt(). This ensures that the content of the
+interval tree relavent to mlx5_odp_populate_klm() (ie mr->parent == mr)
+will not change while it is running, and thus the posted WRs to update the
+KLM will always reflect the correct information.
+
+The race above will resolve by either having CPU1 wait till CPU0 completes
+the ZAP or CPU0 will run after the add and instead store VALID.
+
+The pagefault path adding children already holds the umem_mutex and SRCU,
+so the only missed lock is during MR destruction.
+
+Fixes: 81713d3788d2 ("IB/mlx5: Add implicit MR support")
+Link: https://lore.kernel.org/r/20191001153821.23621-3-jgg@ziepe.ca
+	Reviewed-by: Artemy Kovalyov <artemyko@mellanox.com>
+	Signed-off-by: Jason Gunthorpe <jgg@mellanox.com>
+(cherry picked from commit f28b1932eaae183b80bd8c7abecae167a0e5c61a)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/infiniband/hw/mlx5/odp.c
+diff --cc drivers/infiniband/hw/mlx5/odp.c
+index 941015d5f973,3401c06b7e54..000000000000
+--- a/drivers/infiniband/hw/mlx5/odp.c
++++ b/drivers/infiniband/hw/mlx5/odp.c
+@@@ -200,14 -223,17 +223,22 @@@ void mlx5_odp_populate_klm(struct mlx5_
+  static void mr_leaf_free_action(struct work_struct *work)
+  {
+  	struct ib_umem_odp *odp = container_of(work, struct ib_umem_odp, work);
+ -	int idx = ib_umem_start(odp) >> MLX5_IMR_MTT_SHIFT;
+ +	int idx = ib_umem_start(&odp->umem) >> MLX5_IMR_MTT_SHIFT;
+  	struct mlx5_ib_mr *mr = odp->private, *imr = mr->parent;
++ 	struct ib_umem_odp *odp_imr = to_ib_umem_odp(imr->umem);
++ 	int srcu_key;
+  
+  	mr->parent = NULL;
+  	synchronize_srcu(&mr->dev->mr_srcu);
+  
+++<<<<<<< HEAD
+ +	ib_umem_release(&odp->umem);
+ +	if (imr->live)
+++=======
++ 	if (imr->live) {
++ 		srcu_key = srcu_read_lock(&mr->dev->mr_srcu);
++ 		mutex_lock(&odp_imr->umem_mutex);
+++>>>>>>> f28b1932eaae (RDMA/mlx5: Fix a race with mlx5_ib_update_xlt on an implicit MR)
+  		mlx5_ib_update_xlt(imr, idx, 1, 0,
+  				   MLX5_IB_UPD_XLT_INDIRECT |
+  				   MLX5_IB_UPD_XLT_ATOMIC);
+* Unmerged path drivers/infiniband/hw/mlx5/odp.c
