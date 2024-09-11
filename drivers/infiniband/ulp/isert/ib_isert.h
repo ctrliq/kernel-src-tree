@@ -65,7 +65,8 @@
  */
 #define ISER_RX_SIZE		(ISCSI_DEF_MAX_RECV_SEG_LEN + 1024)
 
-#define ISCSI_ISER_SG_TABLESIZE		256
+/* Maximum support is 16MB I/O size */
+#define ISCSI_ISER_MAX_SG_TABLESIZE	4096
 
 enum isert_desc_type {
 	ISCSI_TX_CONTROL,
