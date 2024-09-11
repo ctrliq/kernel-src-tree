@@ -1,0 +1,317 @@
+io_uring: support using a registered personality for commands
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Jens Axboe <axboe@kernel.dk>
+commit 75c6a03904e0dd414a4d99a3072075cb5117e5bc
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/75c6a039.failed
+
+For personalities previously registered via IORING_REGISTER_PERSONALITY,
+allow any command to select them. This is done through setting
+sqe->personality to the id returned from registration, and then flagging
+sqe->flags with IOSQE_PERSONALITY.
+
+	Reviewed-by: Pavel Begunkov <asml.silence@gmail.com>
+	Signed-off-by: Jens Axboe <axboe@kernel.dk>
+(cherry picked from commit 75c6a03904e0dd414a4d99a3072075cb5117e5bc)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/io_uring.c
+diff --cc fs/io_uring.c
+index e4dddc0b25db,8bcf0538e2e1..000000000000
+--- a/fs/io_uring.c
++++ b/fs/io_uring.c
+@@@ -2212,110 -4559,112 +2212,144 @@@ static int __io_queue_sqe(struct io_rin
+  	/* drop submission reference */
+  	io_put_req(req);
+  
+ -	if (linked_timeout) {
+ -		if (!ret)
+ -			io_queue_linked_timeout(linked_timeout);
+ -		else
+ -			io_put_req(linked_timeout);
+ -	}
+ -
+  	/* and drop final reference, if we failed */
+  	if (ret) {
+ -		io_cqring_add_event(req, ret);
+ -		req_set_fail_links(req);
+ +		io_cqring_add_event(ctx, req->user_data, ret);
+ +		if (req->flags & REQ_F_LINK)
+ +			req->flags |= REQ_F_FAIL_LINK;
+  		io_put_req(req);
+  	}
+ -done_req:
+ -	if (nxt) {
+ -		req = nxt;
+ -		nxt = NULL;
+  
+ -		if (req->flags & REQ_F_FORCE_ASYNC)
+ -			goto punt;
+ -		goto again;
+ +	return ret;
+ +}
+ +
+ +static int io_queue_sqe(struct io_ring_ctx *ctx, struct io_kiocb *req,
+ +			struct sqe_submit *s, bool force_nonblock)
+ +{
+ +	int ret;
+ +
+ +	ret = io_req_defer(ctx, req, s->sqe);
+ +	if (ret) {
+ +		if (ret != -EIOCBQUEUED) {
+ +			io_free_req(req);
+ +			io_cqring_add_event(ctx, s->sqe->user_data, ret);
+ +		}
+ +		return 0;
+  	}
+ +
+ +	return __io_queue_sqe(ctx, req, s, force_nonblock);
+  }
+  
+ -static void io_queue_sqe(struct io_kiocb *req, const struct io_uring_sqe *sqe)
+ +static int io_queue_link_head(struct io_ring_ctx *ctx, struct io_kiocb *req,
+ +			      struct sqe_submit *s, struct io_kiocb *shadow,
+ +			      bool force_nonblock)
+  {
+  	int ret;
+ +	int need_submit = false;
+  
+ -	ret = io_req_defer(req, sqe);
+ +	if (!shadow)
+ +		return io_queue_sqe(ctx, req, s, force_nonblock);
+ +
+ +	/*
+ +	 * Mark the first IO in link list as DRAIN, let all the following
+ +	 * IOs enter the defer list. all IO needs to be completed before link
+ +	 * list.
+ +	 */
+ +	req->flags |= REQ_F_IO_DRAIN;
+ +	ret = io_req_defer(ctx, req, s->sqe);
+  	if (ret) {
+  		if (ret != -EIOCBQUEUED) {
+ -fail_req:
+ -			io_cqring_add_event(req, ret);
+ -			req_set_fail_links(req);
+ -			io_double_put_req(req);
+ +			io_free_req(req);
+ +			__io_free_req(shadow);
+ +			io_cqring_add_event(ctx, s->sqe->user_data, ret);
+ +			return 0;
+  		}
+ -	} else if (req->flags & REQ_F_FORCE_ASYNC) {
+ -		ret = io_req_defer_prep(req, sqe);
+ -		if (unlikely(ret < 0))
+ -			goto fail_req;
+ +	} else {
+  		/*
+ -		 * Never try inline submit of IOSQE_ASYNC is set, go straight
+ -		 * to async execution.
+ +		 * If ret == 0 means that all IOs in front of link io are
+ +		 * running done. let's queue link head.
+  		 */
+ -		req->work.flags |= IO_WQ_WORK_CONCURRENT;
+ -		io_queue_async_work(req);
+ -	} else {
+ -		__io_queue_sqe(req, sqe);
+ +		need_submit = true;
+  	}
+ -}
+  
+ -static inline void io_queue_link_head(struct io_kiocb *req)
+ -{
+ -	if (unlikely(req->flags & REQ_F_FAIL_LINK)) {
+ -		io_cqring_add_event(req, -ECANCELED);
+ -		io_double_put_req(req);
+ -	} else
+ -		io_queue_sqe(req, NULL);
+ +	/* Insert shadow req to defer_list, blocking next IOs */
+ +	spin_lock_irq(&ctx->completion_lock);
+ +	list_add_tail(&shadow->list, &ctx->defer_list);
+ +	spin_unlock_irq(&ctx->completion_lock);
+ +
+ +	if (need_submit)
+ +		return __io_queue_sqe(ctx, req, s, force_nonblock);
+ +
+ +	return 0;
+  }
+  
+ -#define SQE_VALID_FLAGS	(IOSQE_FIXED_FILE|IOSQE_IO_DRAIN|IOSQE_IO_LINK|	\
+ -				IOSQE_IO_HARDLINK | IOSQE_ASYNC)
+ +#define SQE_VALID_FLAGS	(IOSQE_FIXED_FILE|IOSQE_IO_DRAIN|IOSQE_IO_LINK)
+  
+ -static bool io_submit_sqe(struct io_kiocb *req, const struct io_uring_sqe *sqe,
+ -			  struct io_submit_state *state, struct io_kiocb **link)
+ +static void io_submit_sqe(struct io_ring_ctx *ctx, struct sqe_submit *s,
+ +			  struct io_submit_state *state, struct io_kiocb **link,
+ +			  bool force_nonblock)
+  {
+++<<<<<<< HEAD
+ +	struct io_uring_sqe *sqe_copy;
+ +	struct io_kiocb *req;
+ +	int ret;
+++=======
++ 	const struct cred *old_creds = NULL;
++ 	struct io_ring_ctx *ctx = req->ctx;
++ 	unsigned int sqe_flags;
++ 	int ret, id;
+ -
+ -	sqe_flags = READ_ONCE(sqe->flags);
+++>>>>>>> 75c6a03904e0 (io_uring: support using a registered personality for commands)
+  
+  	/* enforce forwards compatibility on users */
+ -	if (unlikely(sqe_flags & ~SQE_VALID_FLAGS)) {
+ +	if (unlikely(s->sqe->flags & ~SQE_VALID_FLAGS)) {
+  		ret = -EINVAL;
+ -		goto err_req;
+ +		goto err;
+  	}
+++<<<<<<< HEAD
+++=======
++ 
++ 	id = READ_ONCE(sqe->personality);
++ 	if (id) {
++ 		const struct cred *personality_creds;
++ 
++ 		personality_creds = idr_find(&ctx->personality_idr, id);
++ 		if (unlikely(!personality_creds)) {
++ 			ret = -EINVAL;
++ 			goto err_req;
++ 		}
++ 		old_creds = override_creds(personality_creds);
++ 	}
++ 
++ 	/* same numerical values with corresponding REQ_F_*, safe to copy */
++ 	req->flags |= sqe_flags & (IOSQE_IO_DRAIN|IOSQE_IO_HARDLINK|
++ 					IOSQE_ASYNC);
+++>>>>>>> 75c6a03904e0 (io_uring: support using a registered personality for commands)
+ +
+ +	req = io_get_req(ctx, state);
+ +	if (unlikely(!req)) {
+ +		ret = -EAGAIN;
+ +		goto err;
+ +	}
+  
+ -	ret = io_req_set_file(state, req, sqe);
+ +	ret = io_req_set_file(ctx, s, state, req);
+  	if (unlikely(ret)) {
+  err_req:
+++<<<<<<< HEAD
+ +		io_free_req(req);
+ +err:
+ +		io_cqring_add_event(ctx, s->sqe->user_data, ret);
+ +		return;
+++=======
++ 		io_cqring_add_event(req, ret);
++ 		io_double_put_req(req);
++ 		if (old_creds)
++ 			revert_creds(old_creds);
++ 		return false;
+++>>>>>>> 75c6a03904e0 (io_uring: support using a registered personality for commands)
+  	}
+  
+ +	req->user_data = s->sqe->user_data;
+ +
+  	/*
+  	 * If we already have a head request, queue this one for async
+  	 * submittal once the head completes. If we don't have a head but
+@@@ -2324,26 -4673,58 +2358,33 @@@
+  	 * conditions are true (normal request), then just queue it.
+  	 */
+  	if (*link) {
+ -		struct io_kiocb *head = *link;
+ +		struct io_kiocb *prev = *link;
+  
+ -		/*
+ -		 * Taking sequential execution of a link, draining both sides
+ -		 * of the link also fullfils IOSQE_IO_DRAIN semantics for all
+ -		 * requests in the link. So, it drains the head and the
+ -		 * next after the link request. The last one is done via
+ -		 * drain_next flag to persist the effect across calls.
+ -		 */
+ -		if (sqe_flags & IOSQE_IO_DRAIN) {
+ -			head->flags |= REQ_F_IO_DRAIN;
+ -			ctx->drain_next = 1;
+ -		}
+ -		if (io_alloc_async_ctx(req)) {
+ +		sqe_copy = kmemdup(s->sqe, sizeof(*sqe_copy), GFP_KERNEL);
+ +		if (!sqe_copy) {
+  			ret = -EAGAIN;
+ -			goto err_req;
+ -		}
+ -
+ -		ret = io_req_defer_prep(req, sqe);
+ -		if (ret) {
+ -			/* fail even hard links since we don't submit */
+ -			head->flags |= REQ_F_FAIL_LINK;
+ -			goto err_req;
+ -		}
+ -		trace_io_uring_link(ctx, req, head);
+ -		list_add_tail(&req->link_list, &head->link_list);
+ -
+ -		/* last request of a link, enqueue the link */
+ -		if (!(sqe_flags & (IOSQE_IO_LINK|IOSQE_IO_HARDLINK))) {
+ -			io_queue_link_head(head);
+ -			*link = NULL;
+ -		}
+ -	} else {
+ -		if (unlikely(ctx->drain_next)) {
+ -			req->flags |= REQ_F_IO_DRAIN;
+ -			req->ctx->drain_next = 0;
+ -		}
+ -		if (sqe_flags & (IOSQE_IO_LINK|IOSQE_IO_HARDLINK)) {
+ -			req->flags |= REQ_F_LINK;
+ -			INIT_LIST_HEAD(&req->link_list);
+ -			ret = io_req_defer_prep(req, sqe);
+ -			if (ret)
+ -				req->flags |= REQ_F_FAIL_LINK;
+ -			*link = req;
+ -		} else {
+ -			io_queue_sqe(req, sqe);
+ +			goto err_req;
+  		}
+ +
+ +		s->sqe = sqe_copy;
+ +		memcpy(&req->submit, s, sizeof(*s));
+ +		list_add_tail(&req->list, &prev->link_list);
+ +	} else if (s->sqe->flags & IOSQE_IO_LINK) {
+ +		req->flags |= REQ_F_LINK;
+ +
+ +		memcpy(&req->submit, s, sizeof(*s));
+ +		INIT_LIST_HEAD(&req->link_list);
+ +		*link = req;
+ +	} else {
+ +		io_queue_sqe(ctx, req, s, force_nonblock);
+  	}
+++<<<<<<< HEAD
+++=======
++ 
++ 	if (old_creds)
++ 		revert_creds(old_creds);
++ 	return true;
+++>>>>>>> 75c6a03904e0 (io_uring: support using a registered personality for commands)
+  }
+  
+  /*
+* Unmerged path fs/io_uring.c
+diff --git a/include/uapi/linux/io_uring.h b/include/uapi/linux/io_uring.h
+index dd4a49ec83b7..11e221210e8f 100644
+--- a/include/uapi/linux/io_uring.h
++++ b/include/uapi/linux/io_uring.h
+@@ -31,7 +31,12 @@ struct io_uring_sqe {
+ 	};
+ 	__u64	user_data;	/* data to be passed back at completion time */
+ 	union {
+-		__u16	buf_index;	/* index into fixed buffers, if used */
++		struct {
++			/* index into fixed buffers, if used */
++			__u16	buf_index;
++			/* personality to use, if used */
++			__u16	personality;
++		};
+ 		__u64	__pad2[3];
+ 	};
+ };
