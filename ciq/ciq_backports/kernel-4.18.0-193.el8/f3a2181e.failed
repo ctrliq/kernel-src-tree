@@ -1,0 +1,198 @@
+netfilter: nf_tables: Support for sets with multiple ranged fields
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-193.el8
+commit-author Stefano Brivio <sbrivio@redhat.com>
+commit f3a2181e16f1dcbf5446ed43f6b5d9f56c459f85
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-193.el8/f3a2181e.failed
+
+Introduce a new nested netlink attribute, NFTA_SET_DESC_CONCAT, used
+to specify the length of each field in a set concatenation.
+
+This allows set implementations to support concatenation of multiple
+ranged items, as they can divide the input key into matching data for
+every single field. Such set implementations would be selected as
+they specify support for NFT_SET_INTERVAL and allow desc->field_count
+to be greater than one. Explicitly disallow this for nft_set_rbtree.
+
+In order to specify the interval for a set entry, userspace would
+include in NFTA_SET_DESC_CONCAT attributes field lengths, and pass
+range endpoints as two separate keys, represented by attributes
+NFTA_SET_ELEM_KEY and NFTA_SET_ELEM_KEY_END.
+
+While at it, export the number of 32-bit registers available for
+packet matching, as nftables will need this to know the maximum
+number of field lengths that can be specified.
+
+For example, "packets with an IPv4 address between 192.0.2.0 and
+192.0.2.42, with destination port between 22 and 25", can be
+expressed as two concatenated elements:
+
+  NFTA_SET_ELEM_KEY:            192.0.2.0 . 22
+  NFTA_SET_ELEM_KEY_END:        192.0.2.42 . 25
+
+and NFTA_SET_DESC_CONCAT attribute would contain:
+
+  NFTA_LIST_ELEM
+    NFTA_SET_FIELD_LEN:		4
+  NFTA_LIST_ELEM
+    NFTA_SET_FIELD_LEN:		2
+
+v4: No changes
+v3: Complete rework, NFTA_SET_DESC_CONCAT instead of NFTA_SET_SUBKEY
+v2: No changes
+
+	Signed-off-by: Stefano Brivio <sbrivio@redhat.com>
+	Signed-off-by: Pablo Neira Ayuso <pablo@netfilter.org>
+(cherry picked from commit f3a2181e16f1dcbf5446ed43f6b5d9f56c459f85)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/net/netfilter/nf_tables.h
+#	net/netfilter/nf_tables_api.c
+diff --cc include/net/netfilter/nf_tables.h
+index 0d548834982e,4170c033d461..000000000000
+--- a/include/net/netfilter/nf_tables.h
++++ b/include/net/netfilter/nf_tables.h
+@@@ -382,6 -413,9 +386,12 @@@ void nft_unregister_set(struct nft_set_
+   * 	@dtype: data type (verdict or numeric type defined by userspace)
+   * 	@objtype: object type (see NFT_OBJECT_* definitions)
+   * 	@size: maximum set size
+++<<<<<<< HEAD
+++=======
++  *	@field_len: length of each field in concatenation, bytes
++  *	@field_count: number of concatenated fields in element
++  *	@use: number of rules references to this set
+++>>>>>>> f3a2181e16f1 (netfilter: nf_tables: Support for sets with multiple ranged fields)
+   * 	@nelems: number of elements
+   * 	@ndeact: number of deactivated elements queued for removal
+   *	@timeout: default timeout value in jiffies
+@@@ -407,6 -441,9 +417,12 @@@ struct nft_set 
+  	u32				dtype;
+  	u32				objtype;
+  	u32				size;
+++<<<<<<< HEAD
+++=======
++ 	u8				field_len[NFT_REG32_COUNT];
++ 	u8				field_count;
++ 	u32				use;
+++>>>>>>> f3a2181e16f1 (netfilter: nf_tables: Support for sets with multiple ranged fields)
+  	atomic_t			nelems;
+  	u32				ndeact;
+  	u64				timeout;
+diff --cc net/netfilter/nf_tables_api.c
+index 04c95168b032,d1318bdf49ca..000000000000
+--- a/net/netfilter/nf_tables_api.c
++++ b/net/netfilter/nf_tables_api.c
+@@@ -3102,11 -3555,36 +3103,38 @@@ static int nf_msecs_to_jiffies64(const 
+  
+  static __be64 nf_jiffies64_to_msecs(u64 input)
+  {
+ -	return cpu_to_be64(jiffies64_to_msecs(input));
+ +	u64 ms = jiffies64_to_nsecs(input);
+ +
+ +	return cpu_to_be64(div_u64(ms, NSEC_PER_MSEC));
+  }
+  
++ static int nf_tables_fill_set_concat(struct sk_buff *skb,
++ 				     const struct nft_set *set)
++ {
++ 	struct nlattr *concat, *field;
++ 	int i;
++ 
++ 	concat = nla_nest_start_noflag(skb, NFTA_SET_DESC_CONCAT);
++ 	if (!concat)
++ 		return -ENOMEM;
++ 
++ 	for (i = 0; i < set->field_count; i++) {
++ 		field = nla_nest_start_noflag(skb, NFTA_LIST_ELEM);
++ 		if (!field)
++ 			return -ENOMEM;
++ 
++ 		if (nla_put_be32(skb, NFTA_SET_FIELD_LEN,
++ 				 htonl(set->field_len[i])))
++ 			return -ENOMEM;
++ 
++ 		nla_nest_end(skb, field);
++ 	}
++ 
++ 	nla_nest_end(skb, concat);
++ 
++ 	return 0;
++ }
++ 
+  static int nf_tables_fill_set(struct sk_buff *skb, const struct nft_ctx *ctx,
+  			      const struct nft_set *set, u16 event, u16 flags)
+  {
+@@@ -3169,7 -3647,8 +3197,12 @@@
+  	if (nla_put(skb, NFTA_SET_USERDATA, set->udlen, set->udata))
+  		goto nla_put_failure;
+  
+++<<<<<<< HEAD
+ +	desc = nla_nest_start(skb, NFTA_SET_DESC);
+++=======
++ 	desc = nla_nest_start_noflag(skb, NFTA_SET_DESC);
++ 
+++>>>>>>> f3a2181e16f1 (netfilter: nf_tables: Support for sets with multiple ranged fields)
+  	if (desc == NULL)
+  		goto nla_put_failure;
+  	if (set->size &&
+* Unmerged path include/net/netfilter/nf_tables.h
+diff --git a/include/uapi/linux/netfilter/nf_tables.h b/include/uapi/linux/netfilter/nf_tables.h
+index acbdaf82bbae..1fbe0d5b6776 100644
+--- a/include/uapi/linux/netfilter/nf_tables.h
++++ b/include/uapi/linux/netfilter/nf_tables.h
+@@ -47,6 +47,7 @@ enum nft_registers {
+ 
+ #define NFT_REG_SIZE	16
+ #define NFT_REG32_SIZE	4
++#define NFT_REG32_COUNT	(NFT_REG32_15 - NFT_REG32_00 + 1)
+ 
+ /**
+  * enum nft_verdicts - nf_tables internal verdicts
+@@ -296,14 +297,28 @@ enum nft_set_policies {
+  * enum nft_set_desc_attributes - set element description
+  *
+  * @NFTA_SET_DESC_SIZE: number of elements in set (NLA_U32)
++ * @NFTA_SET_DESC_CONCAT: description of field concatenation (NLA_NESTED)
+  */
+ enum nft_set_desc_attributes {
+ 	NFTA_SET_DESC_UNSPEC,
+ 	NFTA_SET_DESC_SIZE,
++	NFTA_SET_DESC_CONCAT,
+ 	__NFTA_SET_DESC_MAX
+ };
+ #define NFTA_SET_DESC_MAX	(__NFTA_SET_DESC_MAX - 1)
+ 
++/**
++ * enum nft_set_field_attributes - attributes of concatenated fields
++ *
++ * @NFTA_SET_FIELD_LEN: length of single field, in bits (NLA_U32)
++ */
++enum nft_set_field_attributes {
++	NFTA_SET_FIELD_UNSPEC,
++	NFTA_SET_FIELD_LEN,
++	__NFTA_SET_FIELD_MAX
++};
++#define NFTA_SET_FIELD_MAX	(__NFTA_SET_FIELD_MAX - 1)
++
+ /**
+  * enum nft_set_attributes - nf_tables set netlink attributes
+  *
+* Unmerged path net/netfilter/nf_tables_api.c
+diff --git a/net/netfilter/nft_set_rbtree.c b/net/netfilter/nft_set_rbtree.c
+index 321a0036fdf5..18a5e2aa7e34 100644
+--- a/net/netfilter/nft_set_rbtree.c
++++ b/net/netfilter/nft_set_rbtree.c
+@@ -458,6 +458,9 @@ static void nft_rbtree_destroy(const struct nft_set *set)
+ static bool nft_rbtree_estimate(const struct nft_set_desc *desc, u32 features,
+ 				struct nft_set_estimate *est)
+ {
++	if (desc->field_count > 1)
++		return false;
++
+ 	if (desc->size)
+ 		est->size = sizeof(struct nft_rbtree) +
+ 			    desc->size * sizeof(struct nft_rbtree_elem);
