@@ -1,0 +1,138 @@
+net: bridge: add no_linklocal_learn bool option
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-358.el8
+commit-author Nikolay Aleksandrov <nikolay@cumulusnetworks.com>
+commit 70e4272b4c81828e7d942209bae83b9d92752cfe
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-358.el8/70e4272b.failed
+
+Use the new boolopt API to add an option which disables learning from
+link-local packets. The default is kept as before and learning is
+enabled. This is a simple map from a boolopt bit to a bridge private
+flag that is tested before learning.
+
+v2: pass NULL for extack via sysfs
+
+	Signed-off-by: Nikolay Aleksandrov <nikolay@cumulusnetworks.com>
+	Reviewed-by: Andrew Lunn <andrew@lunn.ch>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 70e4272b4c81828e7d942209bae83b9d92752cfe)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/bridge/br_private.h
+diff --cc net/bridge/br_private.h
+index 00ba364bac43,d29f837cd7a2..000000000000
+--- a/net/bridge/br_private.h
++++ b/net/bridge/br_private.h
+@@@ -327,7 -328,7 +327,11 @@@ enum net_bridge_opts 
+  	BROPT_NEIGH_SUPPRESS_ENABLED,
+  	BROPT_MTU_SET_BY_USER,
+  	BROPT_VLAN_STATS_PER_PORT,
+++<<<<<<< HEAD
+ +	BROPT_VLAN_BRIDGE_BINDING,
+++=======
++ 	BROPT_NO_LL_LEARN,
+++>>>>>>> 70e4272b4c81 (net: bridge: add no_linklocal_learn bool option)
+  };
+  
+  struct net_bridge {
+diff --git a/include/uapi/linux/if_bridge.h b/include/uapi/linux/if_bridge.h
+index 6dc02c03bdf8..773e476a8e54 100644
+--- a/include/uapi/linux/if_bridge.h
++++ b/include/uapi/linux/if_bridge.h
+@@ -294,10 +294,13 @@ struct br_mcast_stats {
+ };
+ 
+ /* bridge boolean options
++ * BR_BOOLOPT_NO_LL_LEARN - disable learning from link-local packets
++ *
+  * IMPORTANT: if adding a new option do not forget to handle
+  *            it in br_boolopt_toggle/get and bridge sysfs
+  */
+ enum br_boolopt_id {
++	BR_BOOLOPT_NO_LL_LEARN,
+ 	BR_BOOLOPT_MAX
+ };
+ 
+diff --git a/net/bridge/br.c b/net/bridge/br.c
+index db7980655388..96a0886577f2 100644
+--- a/net/bridge/br.c
++++ b/net/bridge/br.c
+@@ -219,6 +219,9 @@ int br_boolopt_toggle(struct net_bridge *br, enum br_boolopt_id opt, bool on,
+ 		      struct netlink_ext_ack *extack)
+ {
+ 	switch (opt) {
++	case BR_BOOLOPT_NO_LL_LEARN:
++		br_opt_toggle(br, BROPT_NO_LL_LEARN, on);
++		break;
+ 	default:
+ 		/* shouldn't be called with unsupported options */
+ 		WARN_ON(1);
+@@ -231,6 +234,8 @@ int br_boolopt_toggle(struct net_bridge *br, enum br_boolopt_id opt, bool on,
+ int br_boolopt_get(const struct net_bridge *br, enum br_boolopt_id opt)
+ {
+ 	switch (opt) {
++	case BR_BOOLOPT_NO_LL_LEARN:
++		return br_opt_get(br, BROPT_NO_LL_LEARN);
+ 	default:
+ 		/* shouldn't be called with unsupported options */
+ 		WARN_ON(1);
+diff --git a/net/bridge/br_input.c b/net/bridge/br_input.c
+index 14b7d843cc9a..fdd5e01678dc 100644
+--- a/net/bridge/br_input.c
++++ b/net/bridge/br_input.c
+@@ -186,7 +186,9 @@ static void __br_handle_local_finish(struct sk_buff *skb)
+ 	u16 vid = 0;
+ 
+ 	/* check if vlan is allowed, to avoid spoofing */
+-	if (p->flags & BR_LEARNING && br_should_learn(p, skb, &vid))
++	if ((p->flags & BR_LEARNING) &&
++	    !br_opt_get(p->br, BROPT_NO_LL_LEARN) &&
++	    br_should_learn(p, skb, &vid))
+ 		br_fdb_update(p->br, p, eth_hdr(skb)->h_source, vid, false);
+ }
+ 
+* Unmerged path net/bridge/br_private.h
+diff --git a/net/bridge/br_sysfs_br.c b/net/bridge/br_sysfs_br.c
+index 3ec5a552b8e3..b05b94e9c595 100644
+--- a/net/bridge/br_sysfs_br.c
++++ b/net/bridge/br_sysfs_br.c
+@@ -328,6 +328,27 @@ static ssize_t flush_store(struct device *d,
+ }
+ static DEVICE_ATTR_WO(flush);
+ 
++static ssize_t no_linklocal_learn_show(struct device *d,
++				       struct device_attribute *attr,
++				       char *buf)
++{
++	struct net_bridge *br = to_bridge(d);
++	return sprintf(buf, "%d\n", br_boolopt_get(br, BR_BOOLOPT_NO_LL_LEARN));
++}
++
++static int set_no_linklocal_learn(struct net_bridge *br, unsigned long val)
++{
++	return br_boolopt_toggle(br, BR_BOOLOPT_NO_LL_LEARN, !!val, NULL);
++}
++
++static ssize_t no_linklocal_learn_store(struct device *d,
++					struct device_attribute *attr,
++					const char *buf, size_t len)
++{
++	return store_bridge_parm(d, buf, len, set_no_linklocal_learn);
++}
++static DEVICE_ATTR_RW(no_linklocal_learn);
++
+ #ifdef CONFIG_BRIDGE_IGMP_SNOOPING
+ static ssize_t multicast_router_show(struct device *d,
+ 				     struct device_attribute *attr, char *buf)
+@@ -847,6 +868,7 @@ static struct attribute *bridge_attrs[] = {
+ 	&dev_attr_gc_timer.attr,
+ 	&dev_attr_group_addr.attr,
+ 	&dev_attr_flush.attr,
++	&dev_attr_no_linklocal_learn.attr,
+ #ifdef CONFIG_BRIDGE_IGMP_SNOOPING
+ 	&dev_attr_multicast_router.attr,
+ 	&dev_attr_multicast_snooping.attr,
