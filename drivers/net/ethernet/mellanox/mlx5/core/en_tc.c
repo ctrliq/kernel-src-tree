@@ -2082,7 +2082,7 @@ static int mlx5e_route_lookup_ipv4(struct mlx5e_priv *priv,
 				   struct net_device **out_dev,
 				   struct flowi4 *fl4,
 				   struct neighbour **out_n,
-				   int *out_ttl)
+				   u8 *out_ttl)
 {
 	struct mlx5_eswitch *esw = priv->mdev->priv.eswitch;
 	struct mlx5e_rep_priv *uplink_rpriv;
@@ -2106,7 +2106,8 @@ static int mlx5e_route_lookup_ipv4(struct mlx5e_priv *priv,
 	else
 		*out_dev = rt->dst.dev;
 
-	*out_ttl = ip4_dst_hoplimit(&rt->dst);
+	if (!(*out_ttl))
+		*out_ttl = ip4_dst_hoplimit(&rt->dst);
 	n = dst_neigh_lookup(&rt->dst, &fl4->daddr);
 	ip_rt_put(rt);
 	if (!n)
@@ -2135,7 +2136,7 @@ static int mlx5e_route_lookup_ipv6(struct mlx5e_priv *priv,
 				   struct net_device **out_dev,
 				   struct flowi6 *fl6,
 				   struct neighbour **out_n,
-				   int *out_ttl)
+				   u8 *out_ttl)
 {
 	struct neighbour *n = NULL;
 	struct dst_entry *dst;
@@ -2150,7 +2151,8 @@ static int mlx5e_route_lookup_ipv6(struct mlx5e_priv *priv,
 	if (ret < 0)
 		return ret;
 
-	*out_ttl = ip6_dst_hoplimit(dst);
+	if (!(*out_ttl))
+		*out_ttl = ip6_dst_hoplimit(dst);
 
 	uplink_rpriv = mlx5_eswitch_get_uplink_priv(esw, REP_ETH);
 	/* if the egress device isn't on the same HW e-switch, we use the uplink */
@@ -2174,7 +2176,7 @@ static int mlx5e_route_lookup_ipv6(struct mlx5e_priv *priv,
 static void gen_vxlan_header_ipv4(struct net_device *out_dev,
 				  char buf[], int encap_size,
 				  unsigned char h_dest[ETH_ALEN],
-				  int ttl,
+				  u8 ttl,
 				  __be32 daddr,
 				  __be32 saddr,
 				  __be16 udp_dst_port,
@@ -2207,7 +2209,7 @@ static void gen_vxlan_header_ipv4(struct net_device *out_dev,
 static void gen_vxlan_header_ipv6(struct net_device *out_dev,
 				  char buf[], int encap_size,
 				  unsigned char h_dest[ETH_ALEN],
-				  int ttl,
+				  u8 ttl,
 				  struct in6_addr *daddr,
 				  struct in6_addr *saddr,
 				  __be16 udp_dst_port,
@@ -2247,8 +2249,8 @@ static int mlx5e_create_encap_header_ipv4(struct mlx5e_priv *priv,
 	struct neighbour *n = NULL;
 	struct flowi4 fl4 = {};
 	char *encap_header;
-	int ttl, err;
-	u8 nud_state;
+	u8 nud_state, ttl;
+	int err;
 
 	if (max_encap_size < ipv4_encap_size) {
 		mlx5_core_warn(priv->mdev, "encap size %d too big, max supported is %d\n",
@@ -2269,6 +2271,9 @@ static int mlx5e_create_encap_header_ipv4(struct mlx5e_priv *priv,
 		err = -EOPNOTSUPP;
 		goto free_encap;
 	}
+
+	ttl = 0;
+
 	fl4.flowi4_tos = tun_key->tos;
 	fl4.daddr = tun_key->u.ipv4.dst;
 	fl4.saddr = tun_key->u.ipv4.src;
@@ -2352,8 +2357,8 @@ static int mlx5e_create_encap_header_ipv6(struct mlx5e_priv *priv,
 	struct neighbour *n = NULL;
 	struct flowi6 fl6 = {};
 	char *encap_header;
-	int err, ttl = 0;
-	u8 nud_state;
+	u8 ttl, nud_state;
+	int err;
 
 	if (max_encap_size < ipv6_encap_size) {
 		mlx5_core_warn(priv->mdev, "encap size %d too big, max supported is %d\n",
@@ -2374,6 +2379,8 @@ static int mlx5e_create_encap_header_ipv6(struct mlx5e_priv *priv,
 		err = -EOPNOTSUPP;
 		goto free_encap;
 	}
+
+	ttl = 0;
 
 	fl6.flowlabel = ip6_make_flowinfo(RT_TOS(tun_key->tos), tun_key->label);
 	fl6.daddr = tun_key->u.ipv6.dst;
