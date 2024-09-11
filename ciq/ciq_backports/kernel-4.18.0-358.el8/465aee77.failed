@@ -1,0 +1,155 @@
+ima: Free the entire rule when deleting a list of rules
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-358.el8
+commit-author Tyler Hicks <tyhicks@linux.microsoft.com>
+commit 465aee77aae857b5fcde56ee192b33dc369fba04
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-358.el8/465aee77.failed
+
+Create a function, ima_free_rule(), to free all memory associated with
+an ima_rule_entry. Use the new function to fix memory leaks of allocated
+ima_rule_entry members, such as .fsname and .keyrings, when deleting a
+list of rules.
+
+Make the existing ima_lsm_free_rule() function specific to the LSM
+audit rule array of an ima_rule_entry and require that callers make an
+additional call to kfree to free the ima_rule_entry itself.
+
+This fixes a memory leak seen when loading by a valid rule that contains
+an additional piece of allocated memory, such as an fsname, followed by
+an invalid rule that triggers a policy load failure:
+
+ # echo -e "dont_measure fsname=securityfs\nbad syntax" > \
+    /sys/kernel/security/ima/policy
+ -bash: echo: write error: Invalid argument
+ # echo scan > /sys/kernel/debug/kmemleak
+ # cat /sys/kernel/debug/kmemleak
+ unreferenced object 0xffff9bab67ca12c0 (size 16):
+   comm "bash", pid 684, jiffies 4295212803 (age 252.344s)
+   hex dump (first 16 bytes):
+     73 65 63 75 72 69 74 79 66 73 00 6b 6b 6b 6b a5  securityfs.kkkk.
+   backtrace:
+     [<00000000adc80b1b>] kstrdup+0x2e/0x60
+     [<00000000d504cb0d>] ima_parse_add_rule+0x7d4/0x1020
+     [<00000000444825ac>] ima_write_policy+0xab/0x1d0
+     [<000000002b7f0d6c>] vfs_write+0xde/0x1d0
+     [<0000000096feedcf>] ksys_write+0x68/0xe0
+     [<0000000052b544a2>] do_syscall_64+0x56/0xa0
+     [<000000007ead1ba7>] entry_SYSCALL_64_after_hwframe+0x44/0xa9
+
+Fixes: f1b08bbcbdaf ("ima: define a new policy condition based on the filesystem name")
+Fixes: 2b60c0ecedf8 ("IMA: Read keyrings= option from the IMA policy")
+	Signed-off-by: Tyler Hicks <tyhicks@linux.microsoft.com>
+	Signed-off-by: Mimi Zohar <zohar@linux.ibm.com>
+(cherry picked from commit 465aee77aae857b5fcde56ee192b33dc369fba04)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	security/integrity/ima/ima_policy.c
+diff --cc security/integrity/ima/ima_policy.c
+index 77c1e3c92616,bf00b966e87f..000000000000
+--- a/security/integrity/ima/ima_policy.c
++++ b/security/integrity/ima/ima_policy.c
+@@@ -253,6 -253,96 +253,99 @@@ static int __init default_appraise_poli
+  }
+  __setup("ima_appraise_tcb", default_appraise_policy_setup);
+  
+++<<<<<<< HEAD
+++=======
++ static void ima_lsm_free_rule(struct ima_rule_entry *entry)
++ {
++ 	int i;
++ 
++ 	for (i = 0; i < MAX_LSM_RULES; i++) {
++ 		security_filter_rule_free(entry->lsm[i].rule);
++ 		kfree(entry->lsm[i].args_p);
++ 	}
++ }
++ 
++ static void ima_free_rule(struct ima_rule_entry *entry)
++ {
++ 	if (!entry)
++ 		return;
++ 
++ 	/*
++ 	 * entry->template->fields may be allocated in ima_parse_rule() but that
++ 	 * reference is owned by the corresponding ima_template_desc element in
++ 	 * the defined_templates list and cannot be freed here
++ 	 */
++ 	kfree(entry->fsname);
++ 	kfree(entry->keyrings);
++ 	ima_lsm_free_rule(entry);
++ 	kfree(entry);
++ }
++ 
++ static struct ima_rule_entry *ima_lsm_copy_rule(struct ima_rule_entry *entry)
++ {
++ 	struct ima_rule_entry *nentry;
++ 	int i;
++ 
++ 	nentry = kmalloc(sizeof(*nentry), GFP_KERNEL);
++ 	if (!nentry)
++ 		return NULL;
++ 
++ 	/*
++ 	 * Immutable elements are copied over as pointers and data; only
++ 	 * lsm rules can change
++ 	 */
++ 	memcpy(nentry, entry, sizeof(*nentry));
++ 	memset(nentry->lsm, 0, sizeof_field(struct ima_rule_entry, lsm));
++ 
++ 	for (i = 0; i < MAX_LSM_RULES; i++) {
++ 		if (!entry->lsm[i].args_p)
++ 			continue;
++ 
++ 		nentry->lsm[i].type = entry->lsm[i].type;
++ 		nentry->lsm[i].args_p = kstrdup(entry->lsm[i].args_p,
++ 						GFP_KERNEL);
++ 		if (!nentry->lsm[i].args_p)
++ 			goto out_err;
++ 
++ 		security_filter_rule_init(nentry->lsm[i].type,
++ 					  Audit_equal,
++ 					  nentry->lsm[i].args_p,
++ 					  &nentry->lsm[i].rule);
++ 		if (!nentry->lsm[i].rule)
++ 			pr_warn("rule for LSM \'%s\' is undefined\n",
++ 				(char *)entry->lsm[i].args_p);
++ 	}
++ 	return nentry;
++ 
++ out_err:
++ 	ima_lsm_free_rule(nentry);
++ 	kfree(nentry);
++ 	return NULL;
++ }
++ 
++ static int ima_lsm_update_rule(struct ima_rule_entry *entry)
++ {
++ 	struct ima_rule_entry *nentry;
++ 
++ 	nentry = ima_lsm_copy_rule(entry);
++ 	if (!nentry)
++ 		return -ENOMEM;
++ 
++ 	list_replace_rcu(&entry->list, &nentry->list);
++ 	synchronize_rcu();
++ 	/*
++ 	 * ima_lsm_copy_rule() shallow copied all references, except for the
++ 	 * LSM references, from entry to nentry so we only want to free the LSM
++ 	 * references and the entry itself. All other memory refrences will now
++ 	 * be owned by nentry.
++ 	 */
++ 	ima_lsm_free_rule(entry);
++ 	kfree(entry);
++ 
++ 	return 0;
++ }
++ 
+++>>>>>>> 465aee77aae8 (ima: Free the entire rule when deleting a list of rules)
+  /*
+   * The LSM policy can be reloaded, leaving the IMA LSM based rules referring
+   * to the old, stale LSM policy.  Update the IMA LSM based rules to reflect
+* Unmerged path security/integrity/ima/ima_policy.c
