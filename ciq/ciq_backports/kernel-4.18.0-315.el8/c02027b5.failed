@@ -1,0 +1,113 @@
+x86/kvm: Disable kvmclock on all CPUs on shutdown
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-315.el8
+commit-author Vitaly Kuznetsov <vkuznets@redhat.com>
+commit c02027b5742b5aa804ef08a4a9db433295533046
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-315.el8/c02027b5.failed
+
+Currenly, we disable kvmclock from machine_shutdown() hook and this
+only happens for boot CPU. We need to disable it for all CPUs to
+guard against memory corruption e.g. on restore from hibernate.
+
+Note, writing '0' to kvmclock MSR doesn't clear memory location, it
+just prevents hypervisor from updating the location so for the short
+while after write and while CPU is still alive, the clock remains usable
+and correct so we don't need to switch to some other clocksource.
+
+	Signed-off-by: Vitaly Kuznetsov <vkuznets@redhat.com>
+Message-Id: <20210414123544.1060604-4-vkuznets@redhat.com>
+	Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+(cherry picked from commit c02027b5742b5aa804ef08a4a9db433295533046)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kernel/kvm.c
+diff --cc arch/x86/kernel/kvm.c
+index 1a02ea5c1ffd,25dd126a3325..000000000000
+--- a/arch/x86/kernel/kvm.c
++++ b/arch/x86/kernel/kvm.c
+@@@ -460,6 -452,30 +460,33 @@@ static void __init sev_map_percpu_data(
+  	}
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static void kvm_guest_cpu_offline(void)
++ {
++ 	kvm_disable_steal_time();
++ 	if (kvm_para_has_feature(KVM_FEATURE_PV_EOI))
++ 		wrmsrl(MSR_KVM_PV_EOI_EN, 0);
++ 	kvm_pv_disable_apf();
++ 	apf_task_wake_all();
++ 	kvmclock_disable();
++ }
++ 
++ static int kvm_cpu_online(unsigned int cpu)
++ {
++ 	unsigned long flags;
++ 
++ 	local_irq_save(flags);
++ 	kvm_guest_cpu_init();
++ 	local_irq_restore(flags);
++ 	return 0;
++ }
++ 
++ #ifdef CONFIG_SMP
++ 
++ static DEFINE_PER_CPU(cpumask_var_t, __pv_cpu_mask);
++ 
+++>>>>>>> c02027b5742b (x86/kvm: Disable kvmclock on all CPUs on shutdown)
+  static bool pv_tlb_flush_supported(void)
+  {
+  	return (kvm_para_has_feature(KVM_FEATURE_PV_TLB_FLUSH) &&
+diff --git a/arch/x86/include/asm/kvm_para.h b/arch/x86/include/asm/kvm_para.h
+index 27ceb6b49287..d05265c98fa3 100644
+--- a/arch/x86/include/asm/kvm_para.h
++++ b/arch/x86/include/asm/kvm_para.h
+@@ -7,8 +7,6 @@
+ #include <linux/interrupt.h>
+ #include <uapi/asm/kvm_para.h>
+ 
+-extern void kvmclock_init(void);
+-
+ #ifdef CONFIG_KVM_GUEST
+ bool kvm_check_and_clear_guest_paused(void);
+ #else
+@@ -86,6 +84,8 @@ static inline long kvm_hypercall4(unsigned int nr, unsigned long p1,
+ }
+ 
+ #ifdef CONFIG_KVM_GUEST
++void kvmclock_init(void);
++void kvmclock_disable(void);
+ bool kvm_para_available(void);
+ unsigned int kvm_arch_para_features(void);
+ unsigned int kvm_arch_para_hints(void);
+* Unmerged path arch/x86/kernel/kvm.c
+diff --git a/arch/x86/kernel/kvmclock.c b/arch/x86/kernel/kvmclock.c
+index 426e1df11b40..ada0abf79862 100644
+--- a/arch/x86/kernel/kvmclock.c
++++ b/arch/x86/kernel/kvmclock.c
+@@ -220,11 +220,9 @@ static void kvm_crash_shutdown(struct pt_regs *regs)
+ }
+ #endif
+ 
+-static void kvm_shutdown(void)
++void kvmclock_disable(void)
+ {
+ 	native_write_msr(msr_kvm_system_time, 0, 0);
+-	kvm_disable_steal_time();
+-	native_machine_shutdown();
+ }
+ 
+ static void __init kvmclock_init_mem(void)
+@@ -351,7 +349,6 @@ void __init kvmclock_init(void)
+ #endif
+ 	x86_platform.save_sched_clock_state = kvm_save_sched_clock_state;
+ 	x86_platform.restore_sched_clock_state = kvm_restore_sched_clock_state;
+-	machine_ops.shutdown  = kvm_shutdown;
+ #ifdef CONFIG_KEXEC_CORE
+ 	machine_ops.crash_shutdown  = kvm_crash_shutdown;
+ #endif
