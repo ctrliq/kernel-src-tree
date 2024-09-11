@@ -1,0 +1,127 @@
+x86/fpu: Remove fpu->initialized usage in __fpu__restore_sig()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-193.el8
+commit-author Sebastian Andrzej Siewior <bigeasy@linutronix.de>
+commit 39ea9baffda91df8bfee9b45610242a3191ea1ec
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-193.el8/39ea9baf.failed
+
+This is a preparation for the removal of the ->initialized member in the
+fpu struct.
+
+__fpu__restore_sig() is deactivating the FPU via fpu__drop() and then
+setting manually ->initialized followed by fpu__restore(). The result is
+that it is possible to manipulate fpu->state and the state of registers
+won't be saved/restored on a context switch which would overwrite
+fpu->state:
+
+fpu__drop(fpu):
+  ...
+  fpu->initialized = 0;
+  preempt_enable();
+
+  <--- context switch
+
+Don't access the fpu->state while the content is read from user space
+and examined/sanitized. Use a temporary kmalloc() buffer for the
+preparation of the FPU registers and once the state is considered okay,
+load it. Should something go wrong, return with an error and without
+altering the original FPU registers.
+
+The removal of fpu__initialize() is a nop because fpu->initialized is
+already set for the user task.
+
+ [ bp: Massage a bit. ]
+
+	Signed-off-by: Sebastian Andrzej Siewior <bigeasy@linutronix.de>
+	Signed-off-by: Borislav Petkov <bp@suse.de>
+	Reviewed-by: Dave Hansen <dave.hansen@intel.com>
+	Reviewed-by: Thomas Gleixner <tglx@linutronix.de>
+	Acked-by: Borislav Petkov <bp@suse.de>
+	Cc: Andy Lutomirski <luto@kernel.org>
+	Cc: "H. Peter Anvin" <hpa@zytor.com>
+	Cc: Ingo Molnar <mingo@redhat.com>
+	Cc: Jann Horn <jannh@google.com>
+	Cc: "Jason A. Donenfeld" <Jason@zx2c4.com>
+	Cc: kvm ML <kvm@vger.kernel.org>
+	Cc: Paolo Bonzini <pbonzini@redhat.com>
+	Cc: Radim Krčmář <rkrcmar@redhat.com>
+	Cc: Rik van Riel <riel@surriel.com>
+	Cc: x86-ml <x86@kernel.org>
+Link: https://lkml.kernel.org/r/20190403164156.19645-2-bigeasy@linutronix.de
+(cherry picked from commit 39ea9baffda91df8bfee9b45610242a3191ea1ec)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kernel/fpu/signal.c
+diff --cc arch/x86/kernel/fpu/signal.c
+index 5ee04e658b45,7296a9bb78e7..000000000000
+--- a/arch/x86/kernel/fpu/signal.c
++++ b/arch/x86/kernel/fpu/signal.c
+@@@ -337,18 -332,13 +332,21 @@@ static int __fpu__restore_sig(void __us
+  		}
+  
+  		if (err || __copy_from_user(&env, buf, sizeof(env))) {
+- 			fpstate_init(&fpu->state);
+- 			trace_x86_fpu_init_state(fpu);
+  			err = -1;
+  		} else {
+- 			sanitize_restored_xstate(tsk, &env, xfeatures, fx_only);
++ 			sanitize_restored_xstate(state, &env, xfeatures, fx_only);
++ 			copy_kernel_to_fpregs(state);
+  		}
+  
+++<<<<<<< HEAD
+ +		fpu->initialized = 1;
+ +		preempt_disable();
+ +		fpu__restore(fpu);
+ +		preempt_enable();
+ +
+++=======
++ 		kfree(tmp);
+++>>>>>>> 39ea9baffda9 (x86/fpu: Remove fpu->initialized usage in __fpu__restore_sig())
+  		return err;
+  	} else {
+  		/*
+diff --git a/arch/x86/include/asm/fpu/signal.h b/arch/x86/include/asm/fpu/signal.h
+index 44bbc39a57b3..7fb516b6893a 100644
+--- a/arch/x86/include/asm/fpu/signal.h
++++ b/arch/x86/include/asm/fpu/signal.h
+@@ -22,7 +22,7 @@ int ia32_setup_frame(int sig, struct ksignal *ksig,
+ 
+ extern void convert_from_fxsr(struct user_i387_ia32_struct *env,
+ 			      struct task_struct *tsk);
+-extern void convert_to_fxsr(struct task_struct *tsk,
++extern void convert_to_fxsr(struct fxregs_state *fxsave,
+ 			    const struct user_i387_ia32_struct *env);
+ 
+ unsigned long
+diff --git a/arch/x86/kernel/fpu/regset.c b/arch/x86/kernel/fpu/regset.c
+index bc02f5144b95..5dbc099178a8 100644
+--- a/arch/x86/kernel/fpu/regset.c
++++ b/arch/x86/kernel/fpu/regset.c
+@@ -269,11 +269,10 @@ convert_from_fxsr(struct user_i387_ia32_struct *env, struct task_struct *tsk)
+ 		memcpy(&to[i], &from[i], sizeof(to[0]));
+ }
+ 
+-void convert_to_fxsr(struct task_struct *tsk,
++void convert_to_fxsr(struct fxregs_state *fxsave,
+ 		     const struct user_i387_ia32_struct *env)
+ 
+ {
+-	struct fxregs_state *fxsave = &tsk->thread.fpu.state.fxsave;
+ 	struct _fpreg *from = (struct _fpreg *) &env->st_space[0];
+ 	struct _fpxreg *to = (struct _fpxreg *) &fxsave->st_space[0];
+ 	int i;
+@@ -350,7 +349,7 @@ int fpregs_set(struct task_struct *target, const struct user_regset *regset,
+ 
+ 	ret = user_regset_copyin(&pos, &count, &kbuf, &ubuf, &env, 0, -1);
+ 	if (!ret)
+-		convert_to_fxsr(target, &env);
++		convert_to_fxsr(&target->thread.fpu.state.fxsave, &env);
+ 
+ 	/*
+ 	 * update the header bit in the xsave header, indicating the
+* Unmerged path arch/x86/kernel/fpu/signal.c
