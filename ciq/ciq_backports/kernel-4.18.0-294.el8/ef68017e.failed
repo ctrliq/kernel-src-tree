@@ -1,0 +1,323 @@
+x86/kvm: Handle async page faults directly through do_page_fault()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+Rebuild_CHGLOG: - [x86] kvm: Handle async page faults directly through do_page_fault() (Vitaly Kuznetsov) [1882793]
+Rebuild_FUZZ: 96.88%
+commit-author Andy Lutomirski <luto@kernel.org>
+commit ef68017eb5704eb2b0577c3aa6619e13caf2b59f
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/ef68017e.failed
+
+KVM overloads #PF to indicate two types of not-actually-page-fault
+events.  Right now, the KVM guest code intercepts them by modifying
+the IDT and hooking the #PF vector.  This makes the already fragile
+fault code even harder to understand, and it also pollutes call
+traces with async_page_fault and do_async_page_fault for normal page
+faults.
+
+Clean it up by moving the logic into do_page_fault() using a static
+branch.  This gets rid of the platform trap_init override mechanism
+completely.
+
+[ tglx: Fixed up 32bit, removed error code from the async functions and
+  	massaged coding style ]
+
+	Signed-off-by: Andy Lutomirski <luto@kernel.org>
+	Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+	Reviewed-by: Alexandre Chartre <alexandre.chartre@oracle.com>
+	Acked-by: Paolo Bonzini <pbonzini@redhat.com>
+	Acked-by: Peter Zijlstra <peterz@infradead.org>
+Link: https://lkml.kernel.org/r/20200505134059.169270470@linutronix.de
+
+
+(cherry picked from commit ef68017eb5704eb2b0577c3aa6619e13caf2b59f)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/entry/entry_32.S
+#	arch/x86/entry/entry_64.S
+#	arch/x86/include/asm/kvm_para.h
+#	arch/x86/kernel/kvm.c
+#	arch/x86/mm/fault.c
+diff --cc arch/x86/entry/entry_32.S
+index 3c3090e4eeca,8ba0985f5016..000000000000
+--- a/arch/x86/entry/entry_32.S
++++ b/arch/x86/entry/entry_32.S
+@@@ -1608,35 -1678,22 +1608,39 @@@ ENTRY(nmi
+  	lss	(1+5+6)*4(%esp), %esp			# back to espfix stack
+  	jmp	.Lirq_return
+  #endif
+ -SYM_CODE_END(nmi)
+ +END(nmi)
+  
+ -SYM_CODE_START(int3)
+ +ENTRY(int3)
+  	ASM_CLAC
+ -	pushl	$0
+ -	pushl	$do_int3
+ +	pushl	$-1				# mark this as an int
+ +
+ +	SAVE_ALL switch_stacks=1
+ +	ENCODE_FRAME_POINTER
+ +	TRACE_IRQS_OFF
+ +	xorl	%edx, %edx			# zero error code
+ +	movl	%esp, %eax			# pt_regs pointer
+ +	call	do_int3
+ +	jmp	ret_from_exception
+ +END(int3)
+ +
+ +ENTRY(general_protection)
+ +	pushl	$do_general_protection
+  	jmp	common_exception
+ -SYM_CODE_END(int3)
+ +END(general_protection)
+  
+ -SYM_CODE_START(general_protection)
+++<<<<<<< HEAD
+ +#ifdef CONFIG_KVM_GUEST
+ +ENTRY(async_page_fault)
+  	ASM_CLAC
+ -	pushl	$do_general_protection
+ +	pushl	$do_async_page_fault
+  	jmp	common_exception
+ -SYM_CODE_END(general_protection)
+ +END(async_page_fault)
+ +#endif
+  
+ +ENTRY(rewind_stack_do_exit)
+++=======
++ SYM_CODE_START(rewind_stack_do_exit)
+++>>>>>>> ef68017eb570 (x86/kvm: Handle async page faults directly through do_page_fault())
+  	/* Prevent any naive code from trying to unwind to our caller. */
+  	xorl	%ebp, %ebp
+  
+diff --cc arch/x86/entry/entry_64.S
+index 955c9ec809bc,9ab3ea6d02fc..000000000000
+--- a/arch/x86/entry/entry_64.S
++++ b/arch/x86/entry/entry_64.S
+@@@ -1186,12 -1200,8 +1186,15 @@@ idtentry xenint3		do_int3			has_error_c
+  #endif
+  
+  idtentry general_protection	do_general_protection	has_error_code=1
+ -idtentry page_fault		do_page_fault		has_error_code=1	read_cr2=1
+ +idtentry page_fault		do_page_fault		has_error_code=1
+  
+++<<<<<<< HEAD
+ +#ifdef CONFIG_KVM_GUEST
+ +idtentry async_page_fault	do_async_page_fault	has_error_code=1
+ +#endif
+ +
+++=======
+++>>>>>>> ef68017eb570 (x86/kvm: Handle async page faults directly through do_page_fault())
+  #ifdef CONFIG_X86_MCE
+  idtentry machine_check		do_mce			has_error_code=0	paranoid=1
+  #endif
+diff --cc arch/x86/include/asm/kvm_para.h
+index 5ed3cf1c3934,5261363adda3..000000000000
+--- a/arch/x86/include/asm/kvm_para.h
++++ b/arch/x86/include/asm/kvm_para.h
+@@@ -91,8 -91,18 +91,23 @@@ unsigned int kvm_arch_para_hints(void)
+  void kvm_async_pf_task_wait(u32 token, int interrupt_kernel);
+  void kvm_async_pf_task_wake(u32 token);
+  u32 kvm_read_and_reset_pf_reason(void);
+++<<<<<<< HEAD
+ +extern void kvm_disable_steal_time(void);
+ +void do_async_page_fault(struct pt_regs *regs, unsigned long error_code);
+++=======
++ void kvm_disable_steal_time(void);
++ bool __kvm_handle_async_pf(struct pt_regs *regs, u32 token);
++ 
++ DECLARE_STATIC_KEY_FALSE(kvm_async_pf_enabled);
++ 
++ static __always_inline bool kvm_handle_async_pf(struct pt_regs *regs, u32 token)
++ {
++ 	if (static_branch_unlikely(&kvm_async_pf_enabled))
++ 		return __kvm_handle_async_pf(regs, token);
++ 	else
++ 		return false;
++ }
+++>>>>>>> ef68017eb570 (x86/kvm: Handle async page faults directly through do_page_fault())
+  
+  #ifdef CONFIG_PARAVIRT_SPINLOCKS
+  void __init kvm_spinlock_init(void);
+diff --cc arch/x86/kernel/kvm.c
+index 34ea59cb4c95,5ad3fcca2309..000000000000
+--- a/arch/x86/kernel/kvm.c
++++ b/arch/x86/kernel/kvm.c
+@@@ -255,29 -244,27 +257,48 @@@ u32 kvm_read_and_reset_pf_reason(void
+  EXPORT_SYMBOL_GPL(kvm_read_and_reset_pf_reason);
+  NOKPROBE_SYMBOL(kvm_read_and_reset_pf_reason);
+  
+++<<<<<<< HEAD
+ +dotraplinkage void
+ +do_async_page_fault(struct pt_regs *regs, unsigned long error_code)
+ +{
+ +	enum ctx_state prev_state;
+ +
+ +	switch (kvm_read_and_reset_pf_reason()) {
+ +	default:
+ +		do_page_fault(regs, error_code);
+ +		break;
+ +	case KVM_PV_REASON_PAGE_NOT_PRESENT:
+ +		/* page is swapped out by the host. */
+ +		prev_state = exception_enter();
+ +		kvm_async_pf_task_wait((u32)read_cr2(), !user_mode(regs));
+ +		exception_exit(prev_state);
+ +		break;
+ +	case KVM_PV_REASON_PAGE_READY:
+ +		rcu_irq_enter();
+ +		kvm_async_pf_task_wake((u32)read_cr2());
+++=======
++ bool __kvm_handle_async_pf(struct pt_regs *regs, u32 token)
++ {
++ 	/*
++ 	 * If we get a page fault right here, the pf_reason seems likely
++ 	 * to be clobbered.  Bummer.
++ 	 */
++ 	switch (kvm_read_and_reset_pf_reason()) {
++ 	default:
++ 		return false;
++ 	case KVM_PV_REASON_PAGE_NOT_PRESENT:
++ 		/* page is swapped out by the host. */
++ 		kvm_async_pf_task_wait(token, !user_mode(regs));
++ 		return true;
++ 	case KVM_PV_REASON_PAGE_READY:
++ 		rcu_irq_enter();
++ 		kvm_async_pf_task_wake(token);
+++>>>>>>> ef68017eb570 (x86/kvm: Handle async page faults directly through do_page_fault())
+  		rcu_irq_exit();
+- 		break;
++ 		return true;
+  	}
+  }
+- NOKPROBE_SYMBOL(do_async_page_fault);
++ NOKPROBE_SYMBOL(__kvm_handle_async_pf);
+  
+  static void __init paravirt_ops_setup(void)
+  {
+diff --cc arch/x86/mm/fault.c
+index 387b6dbf768c,6486ccec1b0e..000000000000
+--- a/arch/x86/mm/fault.c
++++ b/arch/x86/mm/fault.c
+@@@ -27,6 -27,10 +27,13 @@@
+  #include <asm/vm86.h>			/* struct vm86			*/
+  #include <asm/mmu_context.h>		/* vma_pkey()			*/
+  #include <asm/efi.h>			/* efi_recover_from_page_fault()*/
+++<<<<<<< HEAD
+++=======
++ #include <asm/desc.h>			/* store_idt(), ...		*/
++ #include <asm/cpu_entry_area.h>		/* exception stack		*/
++ #include <asm/pgtable_areas.h>		/* VMALLOC_START, ...		*/
++ #include <asm/kvm_para.h>		/* kvm_handle_async_pf		*/
+++>>>>>>> ef68017eb570 (x86/kvm: Handle async page faults directly through do_page_fault())
+  
+  #define CREATE_TRACE_POINTS
+  #include <asm/trace/exceptions.h>
+@@@ -1447,24 -1519,38 +1454,47 @@@ trace_page_fault_entries(unsigned long 
+  		trace_page_fault_kernel(address, regs, error_code);
+  }
+  
+ -dotraplinkage void
+ -do_page_fault(struct pt_regs *regs, unsigned long hw_error_code,
+ -		unsigned long address)
+ +/*
+ + * We must have this function blacklisted from kprobes, tagged with notrace
+ + * and call read_cr2() before calling anything else. To avoid calling any
+ + * kind of tracing machinery before we've observed the CR2 value.
+ + *
+ + * exception_{enter,exit}() contains all sorts of tracepoints.
+ + */
+ +dotraplinkage void notrace
+ +do_page_fault(struct pt_regs *regs, unsigned long error_code)
+  {
+++<<<<<<< HEAD
+ +	unsigned long address = read_cr2(); /* Get the faulting address */
+ +	enum ctx_state prev_state;
+++=======
++ 	prefetchw(&current->mm->mmap_sem);
++ 	/*
++ 	 * KVM has two types of events that are, logically, interrupts, but
++ 	 * are unfortunately delivered using the #PF vector.  These events are
++ 	 * "you just accessed valid memory, but the host doesn't have it right
++ 	 * now, so I'll put you to sleep if you continue" and "that memory
++ 	 * you tried to access earlier is available now."
++ 	 *
++ 	 * We are relying on the interrupted context being sane (valid RSP,
++ 	 * relevant locks not held, etc.), which is fine as long as the
++ 	 * interrupted context had IF=1.  We are also relying on the KVM
++ 	 * async pf type field and CR2 being read consistently instead of
++ 	 * getting values from real and async page faults mixed up.
++ 	 *
++ 	 * Fingers crossed.
++ 	 */
++ 	if (kvm_handle_async_pf(regs, (u32)address))
++ 		return;
++ 
++ 	trace_page_fault_entries(regs, hw_error_code, address);
+++>>>>>>> ef68017eb570 (x86/kvm: Handle async page faults directly through do_page_fault())
+  
+ -	if (unlikely(kmmio_fault(regs, address)))
+ -		return;
+ +	prev_state = exception_enter();
+ +	if (trace_pagefault_enabled())
+ +		trace_page_fault_entries(address, regs, error_code);
+  
+ -	/* Was the fault on kernel-controlled part of the address space? */
+ -	if (unlikely(fault_in_kernel_space(address)))
+ -		do_kern_addr_fault(regs, hw_error_code, address);
+ -	else
+ -		do_user_addr_fault(regs, hw_error_code, address);
+ +	__do_page_fault(regs, error_code, address);
+ +	exception_exit(prev_state);
+  }
+  NOKPROBE_SYMBOL(do_page_fault);
+* Unmerged path arch/x86/entry/entry_32.S
+* Unmerged path arch/x86/entry/entry_64.S
+* Unmerged path arch/x86/include/asm/kvm_para.h
+diff --git a/arch/x86/include/asm/x86_init.h b/arch/x86/include/asm/x86_init.h
+index 227b18b6d630..d520b7cd9ea8 100644
+--- a/arch/x86/include/asm/x86_init.h
++++ b/arch/x86/include/asm/x86_init.h
+@@ -50,14 +50,12 @@ struct x86_init_resources {
+  * @pre_vector_init:		init code to run before interrupt vectors
+  *				are set up.
+  * @intr_init:			interrupt init code
+- * @trap_init:			platform specific trap setup
+  * @intr_mode_select:		interrupt delivery mode selection
+  * @intr_mode_init:		interrupt delivery mode setup
+  */
+ struct x86_init_irqs {
+ 	void (*pre_vector_init)(void);
+ 	void (*intr_init)(void);
+-	void (*trap_init)(void);
+ 	void (*intr_mode_select)(void);
+ 	void (*intr_mode_init)(void);
+ };
+* Unmerged path arch/x86/kernel/kvm.c
+diff --git a/arch/x86/kernel/traps.c b/arch/x86/kernel/traps.c
+index 1d1d9da68d9c..192385b95488 100644
+--- a/arch/x86/kernel/traps.c
++++ b/arch/x86/kernel/traps.c
+@@ -962,7 +962,5 @@ void __init trap_init(void)
+ 
+ 	idt_setup_ist_traps();
+ 
+-	x86_init.irqs.trap_init();
+-
+ 	idt_setup_debugidt_traps();
+ }
+diff --git a/arch/x86/kernel/x86_init.c b/arch/x86/kernel/x86_init.c
+index e88088ec779b..a259a042aae2 100644
+--- a/arch/x86/kernel/x86_init.c
++++ b/arch/x86/kernel/x86_init.c
+@@ -57,7 +57,6 @@ struct x86_init_ops x86_init __initdata = {
+ 	.irqs = {
+ 		.pre_vector_init	= init_ISA_irqs,
+ 		.intr_init		= native_init_IRQ,
+-		.trap_init		= x86_init_noop,
+ 		.intr_mode_select	= apic_intr_mode_select,
+ 		.intr_mode_init		= apic_intr_mode_init
+ 	},
+* Unmerged path arch/x86/mm/fault.c
