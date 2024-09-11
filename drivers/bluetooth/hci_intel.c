@@ -303,7 +303,7 @@ static irqreturn_t intel_irq(int irq, void *dev_id)
 
 static int intel_set_power(struct hci_uart *hu, bool powered)
 {
-	struct list_head *p;
+	struct intel_device *idev;
 	int err = -ENODEV;
 
 	if (!hu->tty->dev)
@@ -311,10 +311,7 @@ static int intel_set_power(struct hci_uart *hu, bool powered)
 
 	mutex_lock(&intel_device_list_lock);
 
-	list_for_each(p, &intel_device_list) {
-		struct intel_device *idev = list_entry(p, struct intel_device,
-						       list);
-
+	list_for_each_entry(idev, &intel_device_list, list) {
 		/* tty device and pdev device should share the same parent
 		 * which is the UART port.
 		 */
@@ -377,19 +374,16 @@ static int intel_set_power(struct hci_uart *hu, bool powered)
 
 static void intel_busy_work(struct work_struct *work)
 {
-	struct list_head *p;
 	struct intel_data *intel = container_of(work, struct intel_data,
 						busy_work);
+	struct intel_device *idev;
 
 	if (!intel->hu->tty->dev)
 		return;
 
 	/* Link is busy, delay the suspend */
 	mutex_lock(&intel_device_list_lock);
-	list_for_each(p, &intel_device_list) {
-		struct intel_device *idev = list_entry(p, struct intel_device,
-						       list);
-
+	list_for_each_entry(idev, &intel_device_list, list) {
 		if (intel->hu->tty->dev->parent == idev->pdev->dev.parent) {
 			pm_runtime_get(&idev->pdev->dev);
 			pm_runtime_mark_last_busy(&idev->pdev->dev);
@@ -548,7 +542,7 @@ static int intel_setup(struct hci_uart *hu)
 	struct sk_buff *skb;
 	struct intel_version ver;
 	struct intel_boot_params params;
-	struct list_head *p;
+	struct intel_device *idev;
 	const struct firmware *fw;
 	char fwname[64];
 	u32 boot_param;
@@ -848,13 +842,11 @@ done:
 	 * until further LPM TX notification.
 	 */
 	mutex_lock(&intel_device_list_lock);
-	list_for_each(p, &intel_device_list) {
-		struct intel_device *dev = list_entry(p, struct intel_device,
-						      list);
+	list_for_each_entry(idev, &intel_device_list, list) {
 		if (!hu->tty->dev)
 			break;
-		if (hu->tty->dev->parent == dev->pdev->dev.parent) {
-			if (device_may_wakeup(&dev->pdev->dev)) {
+		if (hu->tty->dev->parent == idev->pdev->dev.parent) {
+			if (device_may_wakeup(&idev->pdev->dev)) {
 				set_bit(STATE_LPM_ENABLED, &intel->flags);
 				set_bit(STATE_TX_ACTIVE, &intel->flags);
 			}
@@ -1008,7 +1000,7 @@ static int intel_recv(struct hci_uart *hu, const void *data, int count)
 static int intel_enqueue(struct hci_uart *hu, struct sk_buff *skb)
 {
 	struct intel_data *intel = hu->priv;
-	struct list_head *p;
+	struct intel_device *idev;
 
 	BT_DBG("hu %p skb %p", hu, skb);
 
@@ -1019,10 +1011,7 @@ static int intel_enqueue(struct hci_uart *hu, struct sk_buff *skb)
 	 * completed before enqueuing any packet.
 	 */
 	mutex_lock(&intel_device_list_lock);
-	list_for_each(p, &intel_device_list) {
-		struct intel_device *idev = list_entry(p, struct intel_device,
-						       list);
-
+	list_for_each_entry(idev, &intel_device_list, list) {
 		if (hu->tty->dev->parent == idev->pdev->dev.parent) {
 			pm_runtime_get_sync(&idev->pdev->dev);
 			pm_runtime_mark_last_busy(&idev->pdev->dev);
