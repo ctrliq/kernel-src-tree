@@ -177,7 +177,6 @@ static struct table_instance *table_instance_alloc(int new_size)
 
 	ti->n_buckets = new_size;
 	ti->node_ver = 0;
-	ti->keep_flows = false;
 	get_random_bytes(&ti->hash_seed, sizeof(u32));
 
 	return ti;
@@ -493,9 +492,6 @@ void table_instance_flow_flush(struct flow_table *table,
 {
 	int i;
 
-	if (ti->keep_flows)
-		return;
-
 	for (i = 0; i < ti->n_buckets; i++) {
 		struct sw_flow *flow;
 		struct hlist_head *head = &ti->buckets[i];
@@ -609,8 +605,6 @@ static void flow_table_copy_flows(struct table_instance *old,
 						 lockdep_ovsl_is_held())
 				table_instance_insert(new, flow);
 	}
-
-	old->keep_flows = true;
 }
 
 static struct table_instance *table_instance_rehash(struct table_instance *ti,
