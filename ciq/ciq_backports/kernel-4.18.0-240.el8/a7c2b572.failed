@@ -1,0 +1,311 @@
+perf map_groups: Auto sort maps by name, if needed
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Arnaldo Carvalho de Melo <acme@redhat.com>
+commit a7c2b572e217418ad34441202ad3addd8f94d2ea
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/a7c2b572.failed
+
+There are still lots of lookups by name, even if just when loading
+vmlinux, till that code is studied to figure out if its possible to do
+away with those map lookup by names, provide a way to sort it using
+libc's qsort/bsearch.
+
+Doing it at the first lookup defers the sorting a bit, and as the code
+stands now, is never done for user maps, just for the kernel ones.
+
+  # perf probe -l
+  # perf probe -x ~/bin/perf -L __map_groups__find_by_name
+  <__map_groups__find_by_name@/home/acme/git/perf/tools/perf/util/symbol.c:0>
+        0  static struct map *__map_groups__find_by_name(struct map_groups *mg, const char *name)
+        1  {
+                  struct map **mapp;
+
+        4         if (mg->maps_by_name == NULL &&
+        5             map__groups__sort_by_name_from_rbtree(mg))
+        6                 return NULL;
+
+        8         mapp = bsearch(name, mg->maps_by_name, mg->nr_maps, sizeof(*mapp), map__strcmp_name);
+        9         if (mapp)
+       10                 return *mapp;
+       11         return NULL;
+       12  }
+
+           struct map *map_groups__find_by_name(struct map_groups *mg, const char *name)
+           {
+
+  # perf probe -x ~/bin/perf 'found=__map_groups__find_by_name:10 name:string'
+  Added new event:
+    probe_perf:found     (on __map_groups__find_by_name:10 in /home/acme/bin/perf with name:string)
+
+  You can now use it in all perf tools, such as:
+
+  	perf record -e probe_perf:found -aR sleep 1
+
+  #
+  # perf probe -x ~/bin/perf -L map_groups__find_by_name
+  <map_groups__find_by_name@/home/acme/git/perf/tools/perf/util/symbol.c:0>
+        0  struct map *map_groups__find_by_name(struct map_groups *mg, const char *name)
+        1  {
+        2         struct maps *maps = &mg->maps;
+                  struct map *map;
+
+        5         down_read(&maps->lock);
+
+        7         if (mg->last_search_by_name && strcmp(mg->last_search_by_name->dso->short_name, name) == 0) {
+        8                 map = mg->last_search_by_name;
+        9                 goto out_unlock;
+                  }
+                  /*
+                   * If we have mg->maps_by_name, then the name isn't in the rbtree,
+                   * as mg->maps_by_name mirrors the rbtree when lookups by name are
+                   * made.
+                   */
+       16         map = __map_groups__find_by_name(mg, name);
+       17         if (map || mg->maps_by_name != NULL)
+       18                 goto out_unlock;
+
+                  /* Fallback to traversing the rbtree... */
+       21         maps__for_each_entry(maps, map)
+       22                 if (strcmp(map->dso->short_name, name) == 0) {
+       23                         mg->last_search_by_name = map;
+       24                         goto out_unlock;
+                          }
+
+       27         map = NULL;
+
+           out_unlock:
+       30         up_read(&maps->lock);
+       31         return map;
+       32  }
+
+           int dso__load_vmlinux(struct dso *dso, struct map *map,
+                                const char *vmlinux, bool vmlinux_allocated)
+
+  # perf probe -x ~/bin/perf 'fallback=map_groups__find_by_name:21 name:string'
+  Added new events:
+    probe_perf:fallback  (on map_groups__find_by_name:21 in /home/acme/bin/perf with name:string)
+    probe_perf:fallback_1 (on map_groups__find_by_name:21 in /home/acme/bin/perf with name:string)
+
+  You can now use it in all perf tools, such as:
+
+  	perf record -e probe_perf:fallback_1 -aR sleep 1
+
+  #
+  # perf probe -l
+    probe_perf:fallback  (on map_groups__find_by_name:21@util/symbol.c in /home/acme/bin/perf with name_string)
+    probe_perf:fallback_1 (on map_groups__find_by_name:21@util/symbol.c in /home/acme/bin/perf with name_string)
+    probe_perf:found     (on __map_groups__find_by_name:10@util/symbol.c in /home/acme/bin/perf with name_string)
+  #
+  # perf stat -e probe_perf:*
+
+Now run 'perf top' in another term and then, after a while, stop 'perf stat':
+
+Furthermore, if we ask for interval printing, we can see that that is done just
+at the start of the workload:
+
+  # perf stat -I1000 -e probe_perf:*
+  #           time             counts unit events
+       1.000319513                  0      probe_perf:found
+       1.000319513                  0      probe_perf:fallback_1
+       1.000319513                  0      probe_perf:fallback
+       2.001868092             23,251      probe_perf:found
+       2.001868092                  0      probe_perf:fallback_1
+       2.001868092                  0      probe_perf:fallback
+       3.002901597                  0      probe_perf:found
+       3.002901597                  0      probe_perf:fallback_1
+       3.002901597                  0      probe_perf:fallback
+       4.003358591                  0      probe_perf:found
+       4.003358591                  0      probe_perf:fallback_1
+       4.003358591                  0      probe_perf:fallback
+  ^C
+  #
+
+	Cc: Adrian Hunter <adrian.hunter@intel.com>
+	Cc: Andi Kleen <ak@linux.intel.com>
+	Cc: Jiri Olsa <jolsa@kernel.org>
+	Cc: Namhyung Kim <namhyung@kernel.org>
+Link: https://lkml.kernel.org/n/tip-c5lmbyr14x448rcfii7y6t3k@git.kernel.org
+	Signed-off-by: Arnaldo Carvalho de Melo <acme@redhat.com>
+(cherry picked from commit a7c2b572e217418ad34441202ad3addd8f94d2ea)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	tools/perf/util/map.c
+#	tools/perf/util/map_groups.h
+#	tools/perf/util/symbol.c
+diff --cc tools/perf/util/map.c
+index 09fd25d1d0fd,67e0f81416cb..000000000000
+--- a/tools/perf/util/map.c
++++ b/tools/perf/util/map.c
+@@@ -571,38 -572,72 +571,96 @@@ void map_groups__init(struct map_group
+  {
+  	maps__init(&mg->maps);
+  	mg->machine = machine;
+++<<<<<<< HEAD
+++=======
++ 	mg->last_search_by_name = NULL;
++ 	mg->nr_maps = 0;
++ 	mg->maps_by_name = NULL;
+++>>>>>>> a7c2b572e217 (perf map_groups: Auto sort maps by name, if needed)
+  	refcount_set(&mg->refcnt, 1);
+  }
+  
++ static void __map_groups__free_maps_by_name(struct map_groups *mg)
++ {
++ 	/*
++ 	 * Free everything to try to do it from the rbtree in the next search
++ 	 */
++ 	zfree(&mg->maps_by_name);
++ 	mg->nr_maps_allocated = 0;
++ }
++ 
+  void map_groups__insert(struct map_groups *mg, struct map *map)
+  {
+- 	maps__insert(&mg->maps, map);
++ 	struct maps *maps = &mg->maps;
++ 
++ 	down_write(&maps->lock);
++ 	__maps__insert(maps, map);
++ 	++mg->nr_maps;
++ 
++ 	/*
++ 	 * If we already performed some search by name, then we need to add the just
++ 	 * inserted map and resort.
++ 	 */
++ 	if (mg->maps_by_name) {
++ 		if (mg->nr_maps > mg->nr_maps_allocated) {
++ 			int nr_allocate = mg->nr_maps * 2;
++ 			struct map **maps_by_name = realloc(mg->maps_by_name, nr_allocate * sizeof(map));
++ 
++ 			if (maps_by_name == NULL) {
++ 				__map_groups__free_maps_by_name(mg);
++ 				return;
++ 			}
++ 
++ 			mg->maps_by_name = maps_by_name;
++ 			mg->nr_maps_allocated = nr_allocate;
++ 		}
++ 		mg->maps_by_name[mg->nr_maps - 1] = map;
++ 		__map_groups__sort_by_name(mg);
++ 	}
++ 	up_write(&maps->lock);
++ }
++ 
+++<<<<<<< HEAD
+++=======
++ void map_groups__remove(struct map_groups *mg, struct map *map)
++ {
++ 	struct maps *maps = &mg->maps;
++ 	down_write(&maps->lock);
++ 	if (mg->last_search_by_name == map)
++ 		mg->last_search_by_name = NULL;
++ 
++ 	__maps__remove(maps, map);
++ 	--mg->nr_maps;
++ 	if (mg->maps_by_name)
++ 		__map_groups__free_maps_by_name(mg);
++ 	up_write(&maps->lock);
+  }
+  
+++>>>>>>> a7c2b572e217 (perf map_groups: Auto sort maps by name, if needed)
+  static void __maps__purge(struct maps *maps)
+  {
+ -	struct map *pos, *next;
+ +	struct rb_root *root = &maps->entries;
+ +	struct rb_node *next = rb_first(root);
+  
+ -	maps__for_each_entry_safe(maps, pos, next) {
+ -		rb_erase_init(&pos->rb_node,  &maps->entries);
+ +	while (next) {
+ +		struct map *pos = rb_entry(next, struct map, rb_node);
+ +
+ +		next = rb_next(&pos->rb_node);
+ +		rb_erase_init(&pos->rb_node, root);
+ +		map__put(pos);
+ +	}
+ +}
+ +
+ +static void __maps__purge_names(struct maps *maps)
+ +{
+ +	struct rb_root *root = &maps->names;
+ +	struct rb_node *next = rb_first(root);
+ +
+ +	while (next) {
+ +		struct map *pos = rb_entry(next, struct map, rb_node_name);
+ +
+ +		next = rb_next(&pos->rb_node_name);
+ +		rb_erase_init(&pos->rb_node_name, root);
+  		map__put(pos);
+  	}
+  }
+diff --cc tools/perf/util/map_groups.h
+index 1876388e8dd8,63ed211fe241..000000000000
+--- a/tools/perf/util/map_groups.h
++++ b/tools/perf/util/map_groups.h
+@@@ -30,7 -37,11 +31,14 @@@ struct symbol *maps__find_symbol_by_nam
+  struct map_groups {
+  	struct maps	 maps;
+  	struct machine	 *machine;
+++<<<<<<< HEAD
+++=======
++ 	struct map	 *last_search_by_name;
++ 	struct map	 **maps_by_name;
+++>>>>>>> a7c2b572e217 (perf map_groups: Auto sort maps by name, if needed)
+  	refcount_t	 refcnt;
++ 	unsigned int	 nr_maps;
++ 	unsigned int	 nr_maps_allocated;
+  #ifdef HAVE_LIBUNWIND_SUPPORT
+  	void				*addr_space;
+  	struct unwind_libunwind_ops	*unwind_libunwind_ops;
+diff --cc tools/perf/util/symbol.c
+index 7642451537f8,db9667aacb88..000000000000
+--- a/tools/perf/util/symbol.c
++++ b/tools/perf/util/symbol.c
+@@@ -1769,20 -1817,25 +1819,40 @@@ struct map *map_groups__find_by_name(st
+  
+  	down_read(&maps->lock);
+  
+++<<<<<<< HEAD
+ +	for (node = maps->names.rb_node; node; ) {
+ +		int rc;
+ +
+ +		map = rb_entry(node, struct map, rb_node_name);
+ +
+ +		rc = strcmp(map->dso->short_name, name);
+ +		if (rc < 0)
+ +			node = node->rb_left;
+ +		else if (rc > 0)
+ +			node = node->rb_right;
+ +		else
+ +
+++=======
++ 	if (mg->last_search_by_name && strcmp(mg->last_search_by_name->dso->short_name, name) == 0) {
++ 		map = mg->last_search_by_name;
++ 		goto out_unlock;
++ 	}
++ 	/*
++ 	 * If we have mg->maps_by_name, then the name isn't in the rbtree,
++ 	 * as mg->maps_by_name mirrors the rbtree when lookups by name are
++ 	 * made.
++ 	 */
++ 	map = __map_groups__find_by_name(mg, name);
++ 	if (map || mg->maps_by_name != NULL)
++ 		goto out_unlock;
++ 
++ 	/* Fallback to traversing the rbtree... */
++ 	maps__for_each_entry(maps, map)
++ 		if (strcmp(map->dso->short_name, name) == 0) {
++ 			mg->last_search_by_name = map;
+++>>>>>>> a7c2b572e217 (perf map_groups: Auto sort maps by name, if needed)
+  			goto out_unlock;
+ -		}
+ +	}
+  
+  	map = NULL;
+  
+* Unmerged path tools/perf/util/map.c
+* Unmerged path tools/perf/util/map_groups.h
+* Unmerged path tools/perf/util/symbol.c
