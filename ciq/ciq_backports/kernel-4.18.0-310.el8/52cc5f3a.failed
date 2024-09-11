@@ -1,0 +1,320 @@
+devlink: move flash end and begin to core devlink
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-310.el8
+commit-author Jacob Keller <jacob.e.keller@intel.com>
+commit 52cc5f3a166a33012ebca2cdefebf4c689110068
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-310.el8/52cc5f3a.failed
+
+When performing a flash update via devlink, device drivers may inform
+user space of status updates via
+devlink_flash_update_(begin|end|timeout|status)_notify functions.
+
+It is expected that drivers do not send any status notifications unless
+they send a begin and end message. If a driver sends a status
+notification without sending the appropriate end notification upon
+finishing (regardless of success or failure), the current implementation
+of the devlink userspace program can get stuck endlessly waiting for the
+end notification that will never come.
+
+The current ice driver implementation may send such a status message
+without the appropriate end notification in rare cases.
+
+Fixing the ice driver is relatively simple: we just need to send the
+begin_notify at the start of the function and always send an end_notify
+no matter how the function exits.
+
+Rather than assuming driver authors will always get this right in the
+future, lets just fix the API so that it is not possible to get wrong.
+Make devlink_flash_update_begin_notify and
+devlink_flash_update_end_notify static, and call them in devlink.c core
+code. Always send the begin_notify just before calling the driver's
+flash_update routine. Always send the end_notify just after the routine
+returns regardless of success or failure.
+
+Doing this makes the status notification easier to use from the driver,
+as it no longer needs to worry about catching failures and cleaning up
+by calling devlink_flash_update_end_notify. It is now no longer possible
+to do the wrong thing in this regard. We also save a couple of lines of
+code in each driver.
+
+	Signed-off-by: Jacob Keller <jacob.e.keller@intel.com>
+	Acked-by: Vasundhara Volam <vasundhara-v.volam@broadcom.com>
+	Reviewed-by: Jiri Pirko <jiri@nvidia.com>
+	Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+(cherry picked from commit 52cc5f3a166a33012ebca2cdefebf4c689110068)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/broadcom/bnxt/bnxt_devlink.c
+#	drivers/net/ethernet/intel/ice/ice_devlink.c
+#	drivers/net/ethernet/pensando/ionic/ionic_fw.c
+#	drivers/net/netdevsim/dev.c
+#	net/core/devlink.c
+diff --cc drivers/net/ethernet/broadcom/bnxt/bnxt_devlink.c
+index 3a854195d5b0,6b7b69ed62db..000000000000
+--- a/drivers/net/ethernet/broadcom/bnxt/bnxt_devlink.c
++++ b/drivers/net/ethernet/broadcom/bnxt/bnxt_devlink.c
+@@@ -32,17 -30,12 +32,26 @@@ bnxt_dl_flash_update(struct devlink *dl
+  		return -EPERM;
+  	}
+  
+++<<<<<<< HEAD
+ +	devlink_flash_update_begin_notify(dl);
+ +	devlink_flash_update_status_notify(dl, "Preparing to flash", region, 0,
+ +					   0);
+ +	rc = bnxt_flash_package_from_file(bp->dev, filename, 0);
+++=======
++ 	devlink_flash_update_status_notify(dl, "Preparing to flash", NULL, 0, 0);
++ 	rc = bnxt_flash_package_from_fw_obj(bp->dev, params->fw, 0);
+++>>>>>>> 52cc5f3a166a (devlink: move flash end and begin to core devlink)
+  	if (!rc)
+ -		devlink_flash_update_status_notify(dl, "Flashing done", NULL, 0, 0);
+ +		devlink_flash_update_status_notify(dl, "Flashing done", region,
+ +						   0, 0);
+  	else
+++<<<<<<< HEAD
+ +		devlink_flash_update_status_notify(dl, "Flashing failed",
+ +						   region, 0, 0);
+ +	devlink_flash_update_end_notify(dl);
+++=======
++ 		devlink_flash_update_status_notify(dl, "Flashing failed", NULL, 0, 0);
+++>>>>>>> 52cc5f3a166a (devlink: move flash end and begin to core devlink)
+  	return rc;
+  }
+  
+diff --cc drivers/net/ethernet/intel/ice/ice_devlink.c
+index eed153081c7a,29d6192b15f3..000000000000
+--- a/drivers/net/ethernet/intel/ice/ice_devlink.c
++++ b/drivers/net/ethernet/intel/ice/ice_devlink.c
+@@@ -265,23 -275,9 +265,29 @@@ ice_devlink_flash_update(struct devlin
+  	if (err)
+  		return err;
+  
+++<<<<<<< HEAD
+ +	err = request_firmware(&fw, path, dev);
+ +	if (err) {
+ +		NL_SET_ERR_MSG_MOD(extack, "Unable to read file from disk");
+ +		return err;
+ +	}
+ +
+ +	dev_dbg(dev, "Beginning flash update with file '%s'\n", params->file_name);
+ +
+ +	devlink_flash_update_begin_notify(devlink);
+ +	devlink_flash_update_status_notify(devlink, "Preparing to flash",
+ +					   component, 0, 0);
+ +	err = ice_flash_pldm_image(pf, fw, extack);
+ +	devlink_flash_update_end_notify(devlink);
+ +
+ +	release_firmware(fw);
+ +
+ +	return err;
+++=======
++ 	devlink_flash_update_status_notify(devlink, "Preparing to flash", NULL, 0, 0);
++ 
++ 	return ice_flash_pldm_image(pf, params->fw, preservation, extack);
+++>>>>>>> 52cc5f3a166a (devlink: move flash end and begin to core devlink)
+  }
+  
+  static const struct devlink_ops ice_devlink_ops = {
+diff --cc drivers/net/ethernet/pensando/ionic/ionic_fw.c
+index d7bbf336c6f6,5f40324cd243..000000000000
+--- a/drivers/net/ethernet/pensando/ionic/ionic_fw.c
++++ b/drivers/net/ethernet/pensando/ionic/ionic_fw.c
+@@@ -105,18 -104,11 +105,17 @@@ int ionic_firmware_update(struct ionic_
+  	int err = 0;
+  	u8 fw_slot;
+  
+ -	netdev_info(netdev, "Installing firmware\n");
+ +	netdev_info(netdev, "Installing firmware %s\n", fw_name);
+  
+  	dl = priv_to_devlink(ionic);
+- 	devlink_flash_update_begin_notify(dl);
+  	devlink_flash_update_status_notify(dl, "Preparing to flash", NULL, 0, 0);
+  
+ +	err = request_firmware(&fw, fw_name, ionic->dev);
+ +	if (err) {
+ +		NL_SET_ERR_MSG_MOD(extack, "Unable to find firmware file");
+ +		goto err_out;
+ +	}
+ +
+  	buf_sz = sizeof(idev->dev_cmd_regs->data);
+  
+  	netdev_dbg(netdev,
+@@@ -200,7 -192,5 +199,10 @@@ err_out
+  		devlink_flash_update_status_notify(dl, "Flash failed", NULL, 0, 0);
+  	else
+  		devlink_flash_update_status_notify(dl, "Flash done", NULL, 0, 0);
+++<<<<<<< HEAD
+ +	release_firmware(fw);
+ +	devlink_flash_update_end_notify(dl);
+++=======
+++>>>>>>> 52cc5f3a166a (devlink: move flash end and begin to core devlink)
+  	return err;
+  }
+diff --cc drivers/net/netdevsim/dev.c
+index 71cbc323653c,816af1f55e2c..000000000000
+--- a/drivers/net/netdevsim/dev.c
++++ b/drivers/net/netdevsim/dev.c
+@@@ -749,11 -762,13 +749,10 @@@ static int nsim_dev_flash_update(struc
+  	struct nsim_dev *nsim_dev = devlink_priv(devlink);
+  	int i;
+  
+ -	if ((params->overwrite_mask & ~nsim_dev->fw_update_overwrite_mask) != 0)
+ -		return -EOPNOTSUPP;
+ -
+  	if (nsim_dev->fw_update_status) {
+- 		devlink_flash_update_begin_notify(devlink);
+  		devlink_flash_update_status_notify(devlink,
+  						   "Preparing to flash",
+ -						   params->component, 0, 0);
+ +						   component, 0, 0);
+  	}
+  
+  	for (i = 0; i < NSIM_DEV_FLASH_SIZE / NSIM_DEV_FLASH_CHUNK_SIZE; i++) {
+@@@ -771,10 -786,9 +770,14 @@@
+  						   NSIM_DEV_FLASH_SIZE,
+  						   NSIM_DEV_FLASH_SIZE);
+  		devlink_flash_update_timeout_notify(devlink, "Flash select",
+ -						    params->component, 81);
+ +						    component, 81);
+  		devlink_flash_update_status_notify(devlink, "Flashing done",
+++<<<<<<< HEAD
+ +						   component, 0, 0);
+ +		devlink_flash_update_end_notify(devlink);
+++=======
++ 						   params->component, 0, 0);
+++>>>>>>> 52cc5f3a166a (devlink: move flash end and begin to core devlink)
+  	}
+  
+  	return 0;
+diff --cc net/core/devlink.c
+index f205b9e289c8,e6fb1fdedded..000000000000
+--- a/net/core/devlink.c
++++ b/net/core/devlink.c
+@@@ -3162,13 -3441,47 +3160,44 @@@ static int devlink_nl_cmd_flash_update(
+  
+  	if (!info->attrs[DEVLINK_ATTR_FLASH_UPDATE_FILE_NAME])
+  		return -EINVAL;
+ -
+ -	supported_params = devlink->ops->supported_flash_update_params;
+ +	file_name = nla_data(info->attrs[DEVLINK_ATTR_FLASH_UPDATE_FILE_NAME]);
+  
+  	nla_component = info->attrs[DEVLINK_ATTR_FLASH_UPDATE_COMPONENT];
+ -	if (nla_component) {
+ -		if (!(supported_params & DEVLINK_SUPPORT_FLASH_UPDATE_COMPONENT)) {
+ -			NL_SET_ERR_MSG_ATTR(info->extack, nla_component,
+ -					    "component update is not supported by this device");
+ -			return -EOPNOTSUPP;
+ -		}
+ -		params.component = nla_data(nla_component);
+ -	}
+ +	component = nla_component ? nla_data(nla_component) : NULL;
+  
+++<<<<<<< HEAD
+ +	return devlink->ops->flash_update(devlink, file_name, component,
+ +					  info->extack);
+++=======
++ 	nla_overwrite_mask = info->attrs[DEVLINK_ATTR_FLASH_UPDATE_OVERWRITE_MASK];
++ 	if (nla_overwrite_mask) {
++ 		struct nla_bitfield32 sections;
++ 
++ 		if (!(supported_params & DEVLINK_SUPPORT_FLASH_UPDATE_OVERWRITE_MASK)) {
++ 			NL_SET_ERR_MSG_ATTR(info->extack, nla_overwrite_mask,
++ 					    "overwrite settings are not supported by this device");
++ 			return -EOPNOTSUPP;
++ 		}
++ 		sections = nla_get_bitfield32(nla_overwrite_mask);
++ 		params.overwrite_mask = sections.value & sections.selector;
++ 	}
++ 
++ 	nla_file_name = info->attrs[DEVLINK_ATTR_FLASH_UPDATE_FILE_NAME];
++ 	file_name = nla_data(nla_file_name);
++ 	ret = request_firmware(&params.fw, file_name, devlink->dev);
++ 	if (ret) {
++ 		NL_SET_ERR_MSG_ATTR(info->extack, nla_file_name, "failed to locate the requested firmware file");
++ 		return ret;
++ 	}
++ 
++ 	devlink_flash_update_begin_notify(devlink);
++ 	ret = devlink->ops->flash_update(devlink, &params, info->extack);
++ 	devlink_flash_update_end_notify(devlink);
++ 
++ 	release_firmware(params.fw);
++ 
++ 	return ret;
+++>>>>>>> 52cc5f3a166a (devlink: move flash end and begin to core devlink)
+  }
+  
+  static const struct devlink_param devlink_param_generic[] = {
+@@@ -9684,10 -10239,18 +9713,16 @@@ int devlink_compat_flash_update(struct 
+  		goto out;
+  	}
+  
+ -	ret = request_firmware(&params.fw, file_name, devlink->dev);
+ -	if (ret)
+ -		goto out;
+ -
+  	mutex_lock(&devlink->lock);
+++<<<<<<< HEAD
+ +	ret = devlink->ops->flash_update(devlink, file_name, NULL, NULL);
+++=======
++ 	devlink_flash_update_begin_notify(devlink);
++ 	ret = devlink->ops->flash_update(devlink, &params, NULL);
++ 	devlink_flash_update_end_notify(devlink);
+++>>>>>>> 52cc5f3a166a (devlink: move flash end and begin to core devlink)
+  	mutex_unlock(&devlink->lock);
+  
+ -	release_firmware(params.fw);
+ -
+  out:
+  	rtnl_lock();
+  	dev_put(dev);
+* Unmerged path drivers/net/ethernet/broadcom/bnxt/bnxt_devlink.c
+* Unmerged path drivers/net/ethernet/intel/ice/ice_devlink.c
+diff --git a/drivers/net/ethernet/mellanox/mlxfw/mlxfw_fsm.c b/drivers/net/ethernet/mellanox/mlxfw/mlxfw_fsm.c
+index bcd166911d44..46245e0b2462 100644
+--- a/drivers/net/ethernet/mellanox/mlxfw/mlxfw_fsm.c
++++ b/drivers/net/ethernet/mellanox/mlxfw/mlxfw_fsm.c
+@@ -368,7 +368,6 @@ int mlxfw_firmware_flash(struct mlxfw_dev *mlxfw_dev,
+ 	}
+ 
+ 	mlxfw_info(mlxfw_dev, "Initialize firmware flash process\n");
+-	devlink_flash_update_begin_notify(mlxfw_dev->devlink);
+ 	mlxfw_status_notify(mlxfw_dev, "Initializing firmware flash process",
+ 			    NULL, 0, 0);
+ 	err = mlxfw_dev->ops->fsm_lock(mlxfw_dev, &fwhandle);
+@@ -417,7 +416,6 @@ int mlxfw_firmware_flash(struct mlxfw_dev *mlxfw_dev,
+ 	mlxfw_info(mlxfw_dev, "Firmware flash done\n");
+ 	mlxfw_status_notify(mlxfw_dev, "Firmware flash done", NULL, 0, 0);
+ 	mlxfw_mfa2_file_fini(mfa2_file);
+-	devlink_flash_update_end_notify(mlxfw_dev->devlink);
+ 	return 0;
+ 
+ err_state_wait_activate_to_locked:
+@@ -429,7 +427,6 @@ int mlxfw_firmware_flash(struct mlxfw_dev *mlxfw_dev,
+ 	mlxfw_dev->ops->fsm_release(mlxfw_dev, fwhandle);
+ err_fsm_lock:
+ 	mlxfw_mfa2_file_fini(mfa2_file);
+-	devlink_flash_update_end_notify(mlxfw_dev->devlink);
+ 	return err;
+ }
+ EXPORT_SYMBOL(mlxfw_firmware_flash);
+* Unmerged path drivers/net/ethernet/pensando/ionic/ionic_fw.c
+* Unmerged path drivers/net/netdevsim/dev.c
+diff --git a/include/net/devlink.h b/include/net/devlink.h
+index afa4470aeeea..d76ee75612be 100644
+--- a/include/net/devlink.h
++++ b/include/net/devlink.h
+@@ -1418,8 +1418,6 @@ devlink_health_reporter_recovery_done(struct devlink_health_reporter *reporter);
+ 
+ bool devlink_is_reload_failed(const struct devlink *devlink);
+ 
+-void devlink_flash_update_begin_notify(struct devlink *devlink);
+-void devlink_flash_update_end_notify(struct devlink *devlink);
+ void devlink_flash_update_status_notify(struct devlink *devlink,
+ 					const char *status_msg,
+ 					const char *component,
+* Unmerged path net/core/devlink.c
