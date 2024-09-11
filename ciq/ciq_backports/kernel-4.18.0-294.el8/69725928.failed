@@ -1,0 +1,127 @@
+iwlwifi: read and parse PNVM file
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Luca Coelho <luciano.coelho@intel.com>
+commit 6972592850c00e5e53ac026c22acaf0bb77aa01f
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/69725928.failed
+
+The driver looks for a PNVM file that contains FW configuration data
+for each different HW combination.  The FW requests the data for a
+certain SKU_ID and the driver tries to find it in the PNVM file.
+
+Read the file, parse its contents and send it to the trans.
+
+	Signed-off-by: Luca Coelho <luciano.coelho@intel.com>
+	Signed-off-by: Kalle Valo <kvalo@codeaurora.org>
+Link: https://lore.kernel.org/r/iwlwifi.20201008181047.826bc607e57a.I1d93dd6e6651586878db57fac3e7c3f09d742c42@changeid
+(cherry picked from commit 6972592850c00e5e53ac026c22acaf0bb77aa01f)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/wireless/intel/iwlwifi/fw/pnvm.c
+#	drivers/net/wireless/intel/iwlwifi/pcie/trans.c
+diff --cc drivers/net/wireless/intel/iwlwifi/pcie/trans.c
+index d1c33dcf88a2,d2e69ad53b27..000000000000
+--- a/drivers/net/wireless/intel/iwlwifi/pcie/trans.c
++++ b/drivers/net/wireless/intel/iwlwifi/pcie/trans.c
+@@@ -1980,15 -1980,11 +1980,23 @@@ void iwl_trans_pcie_free(struct iwl_tra
+  
+  	iwl_pcie_free_fw_monitor(trans);
+  
+++<<<<<<< HEAD
+ +	for_each_possible_cpu(i) {
+ +		struct iwl_tso_hdr_page *p =
+ +			per_cpu_ptr(trans_pcie->tso_hdr_page, i);
+ +
+ +		if (p->page)
+ +			__free_page(p->page);
+ +	}
+ +
+ +	free_percpu(trans_pcie->tso_hdr_page);
+++=======
++ 	if (trans_pcie->pnvm_dram.size)
++ 		dma_free_coherent(trans->dev, trans_pcie->pnvm_dram.size,
++ 				  trans_pcie->pnvm_dram.block,
++ 				  trans_pcie->pnvm_dram.physical);
++ 
+++>>>>>>> 6972592850c0 (iwlwifi: read and parse PNVM file)
+  	mutex_destroy(&trans_pcie->mutex);
+  	iwl_trans_free(trans);
+  }
+* Unmerged path drivers/net/wireless/intel/iwlwifi/fw/pnvm.c
+diff --git a/drivers/net/wireless/intel/iwlwifi/fw/file.h b/drivers/net/wireless/intel/iwlwifi/fw/file.h
+index 57d28a9331fa..0237c06455c2 100644
+--- a/drivers/net/wireless/intel/iwlwifi/fw/file.h
++++ b/drivers/net/wireless/intel/iwlwifi/fw/file.h
+@@ -146,7 +146,11 @@ enum iwl_ucode_tlv_type {
+ 	IWL_UCODE_TLV_UMAC_DEBUG_ADDRS	= 54,
+ 	IWL_UCODE_TLV_LMAC_DEBUG_ADDRS	= 55,
+ 	IWL_UCODE_TLV_FW_RECOVERY_INFO	= 57,
+-	IWL_UCODE_TLV_FW_FSEQ_VERSION	= 60,
++	IWL_UCODE_TLV_HW_TYPE			= 58,
++	IWL_UCODE_TLV_FW_FSEQ_VERSION		= 60,
++
++	IWL_UCODE_TLV_PNVM_VERSION		= 62,
++	IWL_UCODE_TLV_PNVM_SKU			= 64,
+ 
+ 	IWL_UCODE_TLV_FW_NUM_STATIONS		= IWL_UCODE_TLV_CONST_BASE + 0,
+ 
+* Unmerged path drivers/net/wireless/intel/iwlwifi/fw/pnvm.c
+diff --git a/drivers/net/wireless/intel/iwlwifi/iwl-trans.h b/drivers/net/wireless/intel/iwlwifi/iwl-trans.h
+index 936e7df41a82..31489eacd3fe 100644
+--- a/drivers/net/wireless/intel/iwlwifi/iwl-trans.h
++++ b/drivers/net/wireless/intel/iwlwifi/iwl-trans.h
+@@ -73,6 +73,7 @@
+ #include "iwl-config.h"
+ #include "fw/img.h"
+ #include "iwl-op-mode.h"
++#include <linux/firmware.h>
+ #include "fw/api/cmdhdr.h"
+ #include "fw/api/txq.h"
+ #include "fw/api/dbg-tlv.h"
+@@ -1000,6 +1001,7 @@ struct iwl_trans {
+ 
+ 	bool pm_support;
+ 	bool ltr_enabled;
++	u8 pnvm_loaded:1;
+ 
+ 	const struct iwl_hcmd_arr *command_groups;
+ 	int command_groups_size;
+@@ -1451,8 +1453,14 @@ static inline void iwl_trans_sync_nmi(struct iwl_trans *trans)
+ static inline int iwl_trans_set_pnvm(struct iwl_trans *trans,
+ 				     const void *data, u32 len)
+ {
+-	if (trans->ops->set_pnvm)
+-		return trans->ops->set_pnvm(trans, data, len);
++	if (trans->ops->set_pnvm) {
++		int ret = trans->ops->set_pnvm(trans, data, len);
++
++		if (ret)
++			return ret;
++	}
++
++	trans->pnvm_loaded = true;
+ 
+ 	return 0;
+ }
+diff --git a/drivers/net/wireless/intel/iwlwifi/pcie/ctxt-info-gen3.c b/drivers/net/wireless/intel/iwlwifi/pcie/ctxt-info-gen3.c
+index 546a24408c63..a0352fa873d9 100644
+--- a/drivers/net/wireless/intel/iwlwifi/pcie/ctxt-info-gen3.c
++++ b/drivers/net/wireless/intel/iwlwifi/pcie/ctxt-info-gen3.c
+@@ -300,12 +300,6 @@ void iwl_pcie_ctxt_info_gen3_free(struct iwl_trans *trans)
+ 			  trans_pcie->prph_info_dma_addr);
+ 	trans_pcie->prph_info_dma_addr = 0;
+ 	trans_pcie->prph_info = NULL;
+-	dma_free_coherent(trans->dev, trans_pcie->pnvm_dram.size,
+-			  trans_pcie->pnvm_dram.block,
+-			  trans_pcie->pnvm_dram.physical);
+-	trans_pcie->pnvm_dram.size = 0;
+-	trans_pcie->pnvm_dram.block = NULL;
+-	trans_pcie->pnvm_dram.physical = 0;
+ }
+ 
+ int iwl_trans_pcie_ctx_info_gen3_set_pnvm(struct iwl_trans *trans,
+* Unmerged path drivers/net/wireless/intel/iwlwifi/pcie/trans.c
