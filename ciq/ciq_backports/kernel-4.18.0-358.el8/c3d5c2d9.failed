@@ -1,0 +1,276 @@
+PCI/IOV: Add sysfs MSI-X vector assignment interface
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-358.el8
+commit-author Leon Romanovsky <leonro@nvidia.com>
+commit c3d5c2d96d69f2578d6fbf66e39cc2cf840d9812
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-358.el8/c3d5c2d9.failed
+
+A typical cloud provider SR-IOV use case is to create many VFs for use by
+guest VMs. The VFs may not be assigned to a VM until a customer requests a
+VM of a certain size, e.g., number of CPUs. A VF may need MSI-X vectors
+proportional to the number of CPUs in the VM, but there is no standard way
+to change the number of MSI-X vectors supported by a VF.
+
+Some Mellanox ConnectX devices support dynamic assignment of MSI-X vectors
+to SR-IOV VFs. This can be done by the PF driver after VFs are enabled,
+and it can be done without affecting VFs that are already in use. The
+hardware supports a limited pool of MSI-X vectors that can be assigned to
+the PF or to individual VFs.  This is device-specific behavior that
+requires support in the PF driver.
+
+Add a read-only "sriov_vf_total_msix" sysfs file for the PF and a writable
+"sriov_vf_msix_count" file for each VF. Management software may use these
+to learn how many MSI-X vectors are available and to dynamically assign
+them to VFs before the VFs are passed through to a VM.
+
+If the PF driver implements the ->sriov_get_vf_total_msix() callback,
+"sriov_vf_total_msix" contains the total number of MSI-X vectors available
+for distribution among VFs.
+
+If no driver is bound to the VF, writing "N" to "sriov_vf_msix_count" uses
+the PF driver ->sriov_set_msix_vec_count() callback to assign "N" MSI-X
+vectors to the VF.  When a VF driver subsequently reads the MSI-X Message
+Control register, it will see the new Table Size "N".
+
+Link: https://lore.kernel.org/linux-pci/20210314124256.70253-2-leon@kernel.org
+	Acked-by: Bjorn Helgaas <bhelgaas@google.com>
+	Signed-off-by: Leon Romanovsky <leonro@nvidia.com>
+(cherry picked from commit c3d5c2d96d69f2578d6fbf66e39cc2cf840d9812)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/pci.h
+diff --cc include/linux/pci.h
+index 205b965eed8f,9b575a676888..000000000000
+--- a/include/linux/pci.h
++++ b/include/linux/pci.h
+@@@ -923,12 -877,8 +929,17 @@@ struct pci_driver 
+  	int  (*resume)(struct pci_dev *dev);	/* Device woken up */
+  	void (*shutdown)(struct pci_dev *dev);
+  	int  (*sriov_configure)(struct pci_dev *dev, int num_vfs); /* On PF */
+++<<<<<<< HEAD
+ +
+ +	RH_KABI_RESERVE(1)
+ +	RH_KABI_RESERVE(2)
+ +	RH_KABI_RESERVE(3)
+ +	RH_KABI_RESERVE(4)
+ +
+++=======
++ 	int  (*sriov_set_msix_vec_count)(struct pci_dev *vf, int msix_vec_count); /* On PF */
++ 	u32  (*sriov_get_vf_total_msix)(struct pci_dev *pf);
+++>>>>>>> c3d5c2d96d69 (PCI/IOV: Add sysfs MSI-X vector assignment interface)
+  	const struct pci_error_handlers *err_handler;
+  	const struct attribute_group **groups;
+  	struct device_driver	driver;
+diff --git a/Documentation/ABI/testing/sysfs-bus-pci b/Documentation/ABI/testing/sysfs-bus-pci
+index 881040af2611..9ba92f1a2e48 100644
+--- a/Documentation/ABI/testing/sysfs-bus-pci
++++ b/Documentation/ABI/testing/sysfs-bus-pci
+@@ -369,3 +369,32 @@ Description:
+ 		The value comes from the PCI kernel device state and can be one
+ 		of: "unknown", "error", "D0", D1", "D2", "D3hot", "D3cold".
+ 		The file is read only.
++
++What:		/sys/bus/pci/devices/.../sriov_vf_total_msix
++Date:		January 2021
++Contact:	Leon Romanovsky <leonro@nvidia.com>
++Description:
++		This file is associated with a SR-IOV physical function (PF).
++		It contains the total number of MSI-X vectors available for
++		assignment to all virtual functions (VFs) associated with PF.
++		The value will be zero if the device doesn't support this
++		functionality. For supported devices, the value will be
++		constant and won't be changed after MSI-X vectors assignment.
++
++What:		/sys/bus/pci/devices/.../sriov_vf_msix_count
++Date:		January 2021
++Contact:	Leon Romanovsky <leonro@nvidia.com>
++Description:
++		This file is associated with a SR-IOV virtual function (VF).
++		It allows configuration of the number of MSI-X vectors for
++		the VF. This allows devices that have a global pool of MSI-X
++		vectors to optimally divide them between VFs based on VF usage.
++
++		The values accepted are:
++		 * > 0 - this number will be reported as the Table Size in the
++			 VF's MSI-X capability
++		 * < 0 - not valid
++		 * = 0 - will reset to the device default value
++
++		The file is writable if the PF is bound to a driver that
++		implements ->sriov_set_msix_vec_count().
+diff --git a/drivers/pci/iov.c b/drivers/pci/iov.c
+index 4afd4ee4f7f0..afc06e6ce115 100644
+--- a/drivers/pci/iov.c
++++ b/drivers/pci/iov.c
+@@ -31,6 +31,7 @@ int pci_iov_virtfn_devfn(struct pci_dev *dev, int vf_id)
+ 	return (dev->devfn + dev->sriov->offset +
+ 		dev->sriov->stride * vf_id) & 0xff;
+ }
++EXPORT_SYMBOL_GPL(pci_iov_virtfn_devfn);
+ 
+ /*
+  * Per SR-IOV spec sec 3.3.10 and 3.3.11, First VF Offset and VF Stride may
+@@ -157,6 +158,92 @@ int pci_iov_sysfs_link(struct pci_dev *dev,
+ 	return rc;
+ }
+ 
++#ifdef CONFIG_PCI_MSI
++static ssize_t sriov_vf_total_msix_show(struct device *dev,
++					struct device_attribute *attr,
++					char *buf)
++{
++	struct pci_dev *pdev = to_pci_dev(dev);
++	u32 vf_total_msix = 0;
++
++	device_lock(dev);
++	if (!pdev->driver || !pdev->driver->sriov_get_vf_total_msix)
++		goto unlock;
++
++	vf_total_msix = pdev->driver->sriov_get_vf_total_msix(pdev);
++unlock:
++	device_unlock(dev);
++	return sysfs_emit(buf, "%u\n", vf_total_msix);
++}
++static DEVICE_ATTR_RO(sriov_vf_total_msix);
++
++static ssize_t sriov_vf_msix_count_store(struct device *dev,
++					 struct device_attribute *attr,
++					 const char *buf, size_t count)
++{
++	struct pci_dev *vf_dev = to_pci_dev(dev);
++	struct pci_dev *pdev = pci_physfn(vf_dev);
++	int val, ret;
++
++	ret = kstrtoint(buf, 0, &val);
++	if (ret)
++		return ret;
++
++	if (val < 0)
++		return -EINVAL;
++
++	device_lock(&pdev->dev);
++	if (!pdev->driver || !pdev->driver->sriov_set_msix_vec_count) {
++		ret = -EOPNOTSUPP;
++		goto err_pdev;
++	}
++
++	device_lock(&vf_dev->dev);
++	if (vf_dev->driver) {
++		/*
++		 * A driver is already attached to this VF and has configured
++		 * itself based on the current MSI-X vector count. Changing
++		 * the vector size could mess up the driver, so block it.
++		 */
++		ret = -EBUSY;
++		goto err_dev;
++	}
++
++	ret = pdev->driver->sriov_set_msix_vec_count(vf_dev, val);
++
++err_dev:
++	device_unlock(&vf_dev->dev);
++err_pdev:
++	device_unlock(&pdev->dev);
++	return ret ? : count;
++}
++static DEVICE_ATTR_WO(sriov_vf_msix_count);
++#endif
++
++static struct attribute *sriov_vf_dev_attrs[] = {
++#ifdef CONFIG_PCI_MSI
++	&dev_attr_sriov_vf_msix_count.attr,
++#endif
++	NULL,
++};
++
++static umode_t sriov_vf_attrs_are_visible(struct kobject *kobj,
++					  struct attribute *a, int n)
++{
++	struct device *dev = kobj_to_dev(kobj);
++	struct pci_dev *pdev = to_pci_dev(dev);
++
++	if (!pdev->is_virtfn)
++		return 0;
++
++	return a->mode;
++}
++
++const struct attribute_group sriov_vf_dev_attr_group = {
++	.attrs = sriov_vf_dev_attrs,
++	.is_visible = sriov_vf_attrs_are_visible,
++};
++
+ int pci_iov_add_virtfn(struct pci_dev *dev, int id)
+ {
+ 	int i;
+@@ -400,18 +487,21 @@ static DEVICE_ATTR_RO(sriov_stride);
+ static DEVICE_ATTR_RO(sriov_vf_device);
+ static DEVICE_ATTR_RW(sriov_drivers_autoprobe);
+ 
+-static struct attribute *sriov_dev_attrs[] = {
++static struct attribute *sriov_pf_dev_attrs[] = {
+ 	&dev_attr_sriov_totalvfs.attr,
+ 	&dev_attr_sriov_numvfs.attr,
+ 	&dev_attr_sriov_offset.attr,
+ 	&dev_attr_sriov_stride.attr,
+ 	&dev_attr_sriov_vf_device.attr,
+ 	&dev_attr_sriov_drivers_autoprobe.attr,
++#ifdef CONFIG_PCI_MSI
++	&dev_attr_sriov_vf_total_msix.attr,
++#endif
+ 	NULL,
+ };
+ 
+-static umode_t sriov_attrs_are_visible(struct kobject *kobj,
+-				       struct attribute *a, int n)
++static umode_t sriov_pf_attrs_are_visible(struct kobject *kobj,
++					  struct attribute *a, int n)
+ {
+ 	struct device *dev = kobj_to_dev(kobj);
+ 
+@@ -421,9 +511,9 @@ static umode_t sriov_attrs_are_visible(struct kobject *kobj,
+ 	return a->mode;
+ }
+ 
+-const struct attribute_group sriov_dev_attr_group = {
+-	.attrs = sriov_dev_attrs,
+-	.is_visible = sriov_attrs_are_visible,
++const struct attribute_group sriov_pf_dev_attr_group = {
++	.attrs = sriov_pf_dev_attrs,
++	.is_visible = sriov_pf_attrs_are_visible,
+ };
+ 
+ int __weak pcibios_sriov_enable(struct pci_dev *pdev, u16 num_vfs)
+diff --git a/drivers/pci/pci-sysfs.c b/drivers/pci/pci-sysfs.c
+index 06809e1606ab..88bb0d77fdaa 100644
+--- a/drivers/pci/pci-sysfs.c
++++ b/drivers/pci/pci-sysfs.c
+@@ -1549,7 +1549,8 @@ static const struct attribute_group *pci_dev_attr_groups[] = {
+ 	&pci_dev_attr_group,
+ 	&pci_dev_hp_attr_group,
+ #ifdef CONFIG_PCI_IOV
+-	&sriov_dev_attr_group,
++	&sriov_pf_dev_attr_group,
++	&sriov_vf_dev_attr_group,
+ #endif
+ 	&pci_bridge_attr_group,
+ 	&pcie_dev_attr_group,
+diff --git a/drivers/pci/pci.h b/drivers/pci/pci.h
+index c2031e3f0836..b652ea0fe9d9 100644
+--- a/drivers/pci/pci.h
++++ b/drivers/pci/pci.h
+@@ -514,7 +514,8 @@ void pci_iov_update_resource(struct pci_dev *dev, int resno);
+ resource_size_t pci_sriov_resource_alignment(struct pci_dev *dev, int resno);
+ void pci_restore_iov_state(struct pci_dev *dev);
+ int pci_iov_bus_range(struct pci_bus *bus);
+-extern const struct attribute_group sriov_dev_attr_group;
++extern const struct attribute_group sriov_pf_dev_attr_group;
++extern const struct attribute_group sriov_vf_dev_attr_group;
+ #else
+ static inline int pci_iov_init(struct pci_dev *dev)
+ {
+* Unmerged path include/linux/pci.h
