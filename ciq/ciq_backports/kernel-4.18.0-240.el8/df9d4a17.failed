@@ -1,0 +1,303 @@
+net/tls: sleeping function from invalid context
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+Rebuild_CHGLOG: - [net] tls: sleeping function from invalid context (Sabrina Dubroca) [1819627]
+Rebuild_FUZZ: 95.56%
+commit-author Atul Gupta <atul.gupta@chelsio.com>
+commit df9d4a1780223c3ddd4bf0810079b5a75251554e
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/df9d4a17.failed
+
+HW unhash within mutex for registered tls devices cause sleep
+when called from tcp_set_state for TCP_CLOSE. Release lock and
+re-acquire after function call with ref count incr/dec.
+defined kref and fp release for tls_device to ensure device
+is not released outside lock.
+
+BUG: sleeping function called from invalid context at
+kernel/locking/mutex.c:748
+in_atomic(): 1, irqs_disabled(): 0, pid: 0, name: swapper/7
+INFO: lockdep is turned off.
+CPU: 7 PID: 0 Comm: swapper/7 Tainted: G        W  O
+Call Trace:
+ <IRQ>
+ dump_stack+0x5e/0x8b
+ ___might_sleep+0x222/0x260
+ __mutex_lock+0x5c/0xa50
+ ? vprintk_emit+0x1f3/0x440
+ ? kmem_cache_free+0x22d/0x2a0
+ ? tls_hw_unhash+0x2f/0x80
+ ? printk+0x52/0x6e
+ ? tls_hw_unhash+0x2f/0x80
+ tls_hw_unhash+0x2f/0x80
+ tcp_set_state+0x5f/0x180
+ tcp_done+0x2e/0xe0
+ tcp_rcv_state_process+0x92c/0xdd3
+ ? lock_acquire+0xf5/0x1f0
+ ? tcp_v4_rcv+0xa7c/0xbe0
+ ? tcp_v4_do_rcv+0x70/0x1e0
+
+	Signed-off-by: Atul Gupta <atul.gupta@chelsio.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit df9d4a1780223c3ddd4bf0810079b5a75251554e)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/crypto/chelsio/chtls/chtls_main.c
+#	net/tls/tls_main.c
+diff --cc drivers/crypto/chelsio/chtls/chtls_main.c
+index f63294c8a97a,db40ab6dd410..000000000000
+--- a/drivers/crypto/chelsio/chtls/chtls_main.c
++++ b/drivers/crypto/chelsio/chtls/chtls_main.c
+@@@ -154,12 -145,34 +154,36 @@@ static int chtls_create_hash(struct tls
+  
+  static void chtls_destroy_hash(struct tls_device *dev, struct sock *sk)
+  {
+ +	struct chtls_dev *cdev = to_chtls_dev(dev);
+ +
+  	if (sk->sk_state == TCP_LISTEN)
+ -		chtls_stop_listen(sk);
+ +		chtls_stop_listen(cdev, sk);
+  }
+  
++ static void chtls_free_uld(struct chtls_dev *cdev)
++ {
++ 	int i;
++ 
++ 	tls_unregister_device(&cdev->tlsdev);
++ 	kvfree(cdev->kmap.addr);
++ 	idr_destroy(&cdev->hwtid_idr);
++ 	for (i = 0; i < (1 << RSPQ_HASH_BITS); i++)
++ 		kfree_skb(cdev->rspq_skb_cache[i]);
++ 	kfree(cdev->lldi);
++ 	kfree_skb(cdev->askb);
++ 	kfree(cdev);
++ }
++ 
++ static inline void chtls_dev_release(struct kref *kref)
++ {
++ 	struct chtls_dev *cdev;
++ 	struct tls_device *dev;
++ 
++ 	dev = container_of(kref, struct tls_device, kref);
++ 	cdev = to_chtls_dev(dev);
++ 	chtls_free_uld(cdev);
++ }
++ 
+  static void chtls_register_dev(struct chtls_dev *cdev)
+  {
+  	struct tls_device *tlsdev = &cdev->tlsdev;
+@@@ -170,12 -183,10 +194,14 @@@
+  	tlsdev->feature = chtls_inline_feature;
+  	tlsdev->hash = chtls_create_hash;
+  	tlsdev->unhash = chtls_destroy_hash;
+++<<<<<<< HEAD
+ +	tls_register_device(&cdev->tlsdev);
+- }
+- 
+- static void chtls_unregister_dev(struct chtls_dev *cdev)
+- {
+- 	tls_unregister_device(&cdev->tlsdev);
+++=======
++ 	tlsdev->release = chtls_dev_release;
++ 	kref_init(&tlsdev->kref);
++ 	tls_register_device(tlsdev);
++ 	cdev->cdev_state = CHTLS_CDEV_STATE_UP;
+++>>>>>>> df9d4a178022 (net/tls: sleeping function from invalid context)
+  }
+  
+  static void process_deferq(struct work_struct *task_param)
+@@@ -272,28 -283,17 +298,40 @@@ out
+  	return NULL;
+  }
+  
+++<<<<<<< HEAD
+ +static void chtls_free_uld(struct chtls_dev *cdev)
+ +{
+ +	int i;
+ +
+ +	chtls_unregister_dev(cdev);
+ +	kvfree(cdev->kmap.addr);
+ +	idr_destroy(&cdev->hwtid_idr);
+ +	for (i = 0; i < (1 << RSPQ_HASH_BITS); i++)
+ +		kfree_skb(cdev->rspq_skb_cache[i]);
+ +	kfree(cdev->lldi);
+ +	if (cdev->askb)
+ +		kfree_skb(cdev->askb);
+ +	kfree(cdev);
+ +}
+ +
+++=======
+++>>>>>>> df9d4a178022 (net/tls: sleeping function from invalid context)
+  static void chtls_free_all_uld(void)
+  {
+  	struct chtls_dev *cdev, *tmp;
+  
+  	mutex_lock(&cdev_mutex);
+++<<<<<<< HEAD
+ +	list_for_each_entry_safe(cdev, tmp, &cdev_list, list)
+ +		chtls_free_uld(cdev);
+++=======
++ 	list_for_each_entry_safe(cdev, tmp, &cdev_list, list) {
++ 		if (cdev->cdev_state == CHTLS_CDEV_STATE_UP) {
++ 			list_del(&cdev->list);
++ 			kref_put(&cdev->tlsdev.kref, cdev->tlsdev.release);
++ 		}
++ 	}
+++>>>>>>> df9d4a178022 (net/tls: sleeping function from invalid context)
+  	mutex_unlock(&cdev_mutex);
+  }
+  
+diff --cc net/tls/tls_main.c
+index f7a147ae7fd3,1428bd74638c..000000000000
+--- a/net/tls/tls_main.c
++++ b/net/tls/tls_main.c
+@@@ -56,14 -55,10 +56,14 @@@ enum 
+  
+  static struct proto *saved_tcpv6_prot;
+  static DEFINE_MUTEX(tcpv6_prot_mutex);
+ +static struct proto *saved_tcpv4_prot;
+ +static DEFINE_MUTEX(tcpv4_prot_mutex);
+  static LIST_HEAD(device_list);
+- static DEFINE_MUTEX(device_mutex);
++ static DEFINE_SPINLOCK(device_spinlock);
+  static struct proto tls_prots[TLS_NUM_PROTS][TLS_NUM_CONFIG][TLS_NUM_CONFIG];
+  static struct proto_ops tls_sw_proto_ops;
+ +static void build_protos(struct proto prot[TLS_NUM_CONFIG][TLS_NUM_CONFIG],
+ +			 struct proto *base);
+  
+  static void update_sk_prot(struct sock *sk, struct tls_context *ctx)
+  {
+@@@ -663,9 -555,7 +663,13 @@@ static int tls_hw_prot(struct sock *sk
+  	struct tls_device *dev;
+  	int rc = 0;
+  
+++<<<<<<< HEAD
+ +	/* RHEL: fix up the locking below after commit df9d4a178022 is
+ +	 * backported */
+ +	mutex_lock(&device_mutex);
+++=======
++ 	spin_lock_bh(&device_spinlock);
+++>>>>>>> df9d4a178022 (net/tls: sleeping function from invalid context)
+  	list_for_each_entry(dev, &device_list, dev_list) {
+  		if (dev->feature && dev->feature(dev)) {
+  			ctx = create_ctx(sk);
+@@@ -808,88 -707,11 +822,88 @@@ out
+  	return rc;
+  }
+  
+ +static void tls_update(struct sock *sk, struct proto *p,
+ +		       void (*write_space)(struct sock *sk))
+ +{
+ +	struct tls_context *ctx;
+ +
+ +	ctx = tls_get_ctx(sk);
+ +	if (likely(ctx)) {
+ +		ctx->sk_proto_close = p->close;
+ +		ctx->sk_write_space = write_space;
+ +		ctx->sk_proto = p;
+ +	} else {
+ +		sk->sk_prot = p;
+ +		sk->sk_write_space = write_space;
+ +	}
+ +}
+ +
+ +static int tls_get_info(const struct sock *sk, struct sk_buff *skb)
+ +{
+ +	u16 version, cipher_type;
+ +	struct tls_context *ctx;
+ +	struct nlattr *start;
+ +	int err;
+ +
+ +	start = nla_nest_start_noflag(skb, INET_ULP_INFO_TLS);
+ +	if (!start)
+ +		return -EMSGSIZE;
+ +
+ +	rcu_read_lock();
+ +	ctx = rcu_dereference(inet_csk(sk)->icsk_ulp_data);
+ +	if (!ctx) {
+ +		err = 0;
+ +		goto nla_failure;
+ +	}
+ +	version = ctx->prot_info.version;
+ +	if (version) {
+ +		err = nla_put_u16(skb, TLS_INFO_VERSION, version);
+ +		if (err)
+ +			goto nla_failure;
+ +	}
+ +	cipher_type = ctx->prot_info.cipher_type;
+ +	if (cipher_type) {
+ +		err = nla_put_u16(skb, TLS_INFO_CIPHER, cipher_type);
+ +		if (err)
+ +			goto nla_failure;
+ +	}
+ +	err = nla_put_u16(skb, TLS_INFO_TXCONF, tls_user_config(ctx, true));
+ +	if (err)
+ +		goto nla_failure;
+ +
+ +	err = nla_put_u16(skb, TLS_INFO_RXCONF, tls_user_config(ctx, false));
+ +	if (err)
+ +		goto nla_failure;
+ +
+ +	rcu_read_unlock();
+ +	nla_nest_end(skb, start);
+ +	return 0;
+ +
+ +nla_failure:
+ +	rcu_read_unlock();
+ +	nla_nest_cancel(skb, start);
+ +	return err;
+ +}
+ +
+ +static size_t tls_get_info_size(const struct sock *sk)
+ +{
+ +	size_t size = 0;
+ +
+ +	size += nla_total_size(0) +		/* INET_ULP_INFO_TLS */
+ +		nla_total_size(sizeof(u16)) +	/* TLS_INFO_VERSION */
+ +		nla_total_size(sizeof(u16)) +	/* TLS_INFO_CIPHER */
+ +		nla_total_size(sizeof(u16)) +	/* TLS_INFO_RXCONF */
+ +		nla_total_size(sizeof(u16)) +	/* TLS_INFO_TXCONF */
+ +		0;
+ +
+ +	return size;
+ +}
+ +
+  void tls_register_device(struct tls_device *device)
+  {
+- 	mutex_lock(&device_mutex);
++ 	spin_lock_bh(&device_spinlock);
+  	list_add_tail(&device->dev_list, &device_list);
+- 	mutex_unlock(&device_mutex);
++ 	spin_unlock_bh(&device_spinlock);
+  }
+  EXPORT_SYMBOL(tls_register_device);
+  
+* Unmerged path drivers/crypto/chelsio/chtls/chtls_main.c
+diff --git a/include/net/tls.h b/include/net/tls.h
+index 355cc88fb8ed..729aadbd317e 100644
+--- a/include/net/tls.h
++++ b/include/net/tls.h
+@@ -93,6 +93,10 @@
+  *
+  * void (*unhash)(struct tls_device *device, struct sock *sk);
+  *     This function cleans listen state set by Inline TLS driver
++ *
++ * void (*release)(struct kref *kref);
++ *     Release the registered device and allocated resources
++ * @kref: Number of reference to tls_device
+  */
+ struct tls_device {
+ 	char name[TLS_DEVICE_NAME_MAX];
+@@ -100,6 +104,8 @@ struct tls_device {
+ 	int  (*feature)(struct tls_device *device);
+ 	int  (*hash)(struct tls_device *device, struct sock *sk);
+ 	void (*unhash)(struct tls_device *device, struct sock *sk);
++	void (*release)(struct kref *kref);
++	struct kref kref;
+ };
+ 
+ enum {
+* Unmerged path net/tls/tls_main.c
