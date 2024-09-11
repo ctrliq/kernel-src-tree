@@ -1,0 +1,730 @@
+s390/pci: improve DMA translation init and exit
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-448.el8
+commit-author Niklas Schnelle <schnelle@linux.ibm.com>
+commit 1f3f76812d5dfc791193b39c2140a8bd09962c0e
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-448.el8/1f3f7681.failed
+
+Currently zpci_dma_init_device()/zpci_dma_exit_device() is called as
+part of zpci_enable_device()/zpci_disable_device() and errors for
+zpci_dma_exit_device() are always ignored even if we could abort.
+
+Improve upon this by moving zpci_dma_exit_device() out of
+zpci_disable_device() and check for errors whenever we have a way to
+abort the current operation. Note that for example in
+zpci_event_hard_deconfigured() the device is expected to be gone so we
+really can't abort and proceed even in case of error.
+
+Similarly move the cc == 3 special case out of zpci_unregister_ioat()
+and into the callers allowing to abort when finding an already disabled
+devices precludes proceeding with the operation.
+
+While we are at it log IOAT register/unregister errors in the s390
+debugfs log,
+
+	Reviewed-by: Matthew Rosato <mjrosato@linux.ibm.com>
+	Signed-off-by: Niklas Schnelle <schnelle@linux.ibm.com>
+	Signed-off-by: Heiko Carstens <hca@linux.ibm.com>
+(cherry picked from commit 1f3f76812d5dfc791193b39c2140a8bd09962c0e)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/s390/pci/pci.c
+#	arch/s390/pci/pci_bus.c
+#	arch/s390/pci/pci_event.c
+diff --cc arch/s390/pci/pci.c
+index 105423d600b5,728508da999d..000000000000
+--- a/arch/s390/pci/pci.c
++++ b/arch/s390/pci/pci.c
+@@@ -692,136 -656,184 +695,196 @@@ void zpci_free_domain(int domain
+  
+  int zpci_enable_device(struct zpci_dev *zdev)
+  {
+++<<<<<<< HEAD
+ +	int rc;
+ +
+ +	if (clp_enable_fh(zdev, ZPCI_NR_DMA_SPACES)) {
+ +		rc = -EIO;
+ +		goto out;
+ +	}
+ +
+ +	rc = zpci_dma_init_device(zdev);
+ +	if (rc)
+ +		goto out_dma;
+ +
+ +	zdev->state = ZPCI_FN_STATE_ONLINE;
+ +	return 0;
+ +
+ +out_dma:
+ +	clp_disable_fh(zdev);
+ +out:
+++=======
++ 	u32 fh = zdev->fh;
++ 	int rc = 0;
++ 
++ 	if (clp_enable_fh(zdev, &fh, ZPCI_NR_DMA_SPACES))
++ 		rc = -EIO;
++ 	else
++ 		zdev->fh = fh;
+++>>>>>>> 1f3f76812d5d (s390/pci: improve DMA translation init and exit)
+  	return rc;
+  }
+ +EXPORT_SYMBOL_GPL(zpci_enable_device);
+  
+  int zpci_disable_device(struct zpci_dev *zdev)
+  {
+++<<<<<<< HEAD
+ +	zpci_dma_exit_device(zdev);
+ +	/*
+ +	 * The zPCI function may already be disabled by the platform, this is
+ +	 * detected in clp_disable_fh() which becomes a no-op.
+ +	 */
+ +	return clp_disable_fh(zdev) ? -EIO : 0;
+ +}
+ +EXPORT_SYMBOL_GPL(zpci_disable_device);
+ +
+ +void zpci_remove_device(struct zpci_dev *zdev)
+ +{
+ +	struct zpci_bus *zbus = zdev->zbus;
+ +	struct pci_dev *pdev;
+ +
+ +	pdev = pci_get_slot(zbus->bus, zdev->devfn);
+ +	if (pdev) {
+ +		if (pdev->is_virtfn)
+ +			return zpci_remove_virtfn(pdev, zdev->vfn);
+ +		pci_stop_and_remove_bus_device_locked(pdev);
+++=======
++ 	u32 fh = zdev->fh;
++ 	int cc, rc = 0;
++ 
++ 	cc = clp_disable_fh(zdev, &fh);
++ 	if (!cc) {
++ 		zdev->fh = fh;
++ 	} else if (cc == CLP_RC_SETPCIFN_ALRDY) {
++ 		pr_info("Disabling PCI function %08x had no effect as it was already disabled\n",
++ 			zdev->fid);
++ 		/* Function is already disabled - update handle */
++ 		rc = clp_refresh_fh(zdev->fid, &fh);
++ 		if (!rc) {
++ 			zdev->fh = fh;
++ 			rc = -EINVAL;
++ 		}
++ 	} else {
++ 		rc = -EIO;
+++>>>>>>> 1f3f76812d5d (s390/pci: improve DMA translation init and exit)
+  	}
+ -	return rc;
+  }
+  
+ -/**
+ - * zpci_create_device() - Create a new zpci_dev and add it to the zbus
+ - * @fid: Function ID of the device to be created
+ - * @fh: Current Function Handle of the device to be created
+ - * @state: Initial state after creation either Standby or Configured
+ - *
+ - * Creates a new zpci device and adds it to its, possibly newly created, zbus
+ - * as well as zpci_list.
+ - *
+ - * Returns: the zdev on success or an error pointer otherwise
+ - */
+ -struct zpci_dev *zpci_create_device(u32 fid, u32 fh, enum zpci_state state)
+ +int zpci_create_device(struct zpci_dev *zdev)
+  {
+ -	struct zpci_dev *zdev;
+  	int rc;
+  
+ -	zpci_dbg(3, "add fid:%x, fh:%x, c:%d\n", fid, fh, state);
+ -	zdev = kzalloc(sizeof(*zdev), GFP_KERNEL);
+ -	if (!zdev)
+ -		return ERR_PTR(-ENOMEM);
+ +	kref_init(&zdev->kref);
+  
+ -	/* FID and Function Handle are the static/dynamic identifiers */
+ -	zdev->fid = fid;
+ -	zdev->fh = fh;
+ +	spin_lock(&zpci_list_lock);
+ +	list_add_tail(&zdev->entry, &zpci_list);
+ +	spin_unlock(&zpci_list_lock);
+  
+ -	/* Query function properties and update zdev */
+ -	rc = clp_query_pci_fn(zdev);
+ +	rc = zpci_init_iommu(zdev);
+  	if (rc)
+ -		goto error;
+ -	zdev->state =  state;
+ +		goto out;
+  
+ -	kref_init(&zdev->kref);
+  	mutex_init(&zdev->lock);
+ -
+ -	rc = zpci_init_iommu(zdev);
+ -	if (rc)
+ -		goto error;
+ +	if (zdev->state == ZPCI_FN_STATE_CONFIGURED) {
+ +		rc = zpci_enable_device(zdev);
+ +		if (rc)
+ +			goto out_destroy_iommu;
+ +	}
+  
+  	rc = zpci_bus_device_register(zdev, &pci_root_ops);
+  	if (rc)
+ -		goto error_destroy_iommu;
+ +		goto out_disable;
+  
+ -	spin_lock(&zpci_list_lock);
+ -	list_add_tail(&zdev->entry, &zpci_list);
+ -	spin_unlock(&zpci_list_lock);
+ +	return 0;
+  
+ -	return zdev;
+ +out_disable:
+ +	if (zdev->state == ZPCI_FN_STATE_ONLINE)
+ +		zpci_disable_device(zdev);
+  
+ -error_destroy_iommu:
+ +out_destroy_iommu:
+  	zpci_destroy_iommu(zdev);
+ -error:
+ -	zpci_dbg(0, "add fid:%x, rc:%d\n", fid, rc);
+ -	kfree(zdev);
+ -	return ERR_PTR(rc);
+ +out:
+ +	spin_lock(&zpci_list_lock);
+ +	list_del(&zdev->entry);
+ +	spin_unlock(&zpci_list_lock);
+ +	return rc;
+  }
+  
+ -/**
+ - * zpci_scan_configured_device() - Scan a freshly configured zpci_dev
+ - * @zdev: The zpci_dev to be configured
+ - * @fh: The general function handle supplied by the platform
+ - *
+ - * Given a device in the configuration state Configured, enables, scans and
+ - * adds it to the common code PCI subsystem if possible. If the PCI device is
+ - * parked because we can not yet create a PCI bus because we have not seen
+ - * function 0, it is ignored but will be scanned once function 0 appears.
+ - * If any failure occurs, the zpci_dev is left disabled.
+ - *
+ - * Return: 0 on success, or an error code otherwise
+ - */
+ -int zpci_scan_configured_device(struct zpci_dev *zdev, u32 fh)
+ +bool zpci_is_device_configured(struct zpci_dev *zdev)
+  {
+ -	int rc;
+ +	enum zpci_state state = zdev->state;
+  
+ -	zdev->fh = fh;
+ -	/* the PCI function will be scanned once function 0 appears */
+ -	if (!zdev->zbus->bus)
+ -		return 0;
+ -
+ -	/* For function 0 on a multi-function bus scan whole bus as we might
+ -	 * have to pick up existing functions waiting for it to allow creating
+ -	 * the PCI bus
+ -	 */
+ -	if (zdev->devfn == 0 && zdev->zbus->multifunction)
+ -		rc = zpci_bus_scan_bus(zdev->zbus);
+ -	else
+ -		rc = zpci_bus_scan_device(zdev);
+ -
+ -	return rc;
+ +	return state != ZPCI_FN_STATE_RESERVED &&
+ +		state != ZPCI_FN_STATE_STANDBY;
+  }
+  
+++<<<<<<< HEAD
+  /**
+ - * zpci_deconfigure_device() - Deconfigure a zpci_dev
+ - * @zdev: The zpci_dev to configure
+ + * zpci_device_reserved() - Mark device as resverved
+ + * @zdev: the zpci_dev that was reserved
+   *
+ - * Deconfigure a zPCI function that is currently configured and possibly known
+ - * to the common code PCI subsystem.
+ - * If any failure occurs the device is left as is.
+ - *
+ - * Return: 0 on success, or an error code otherwise
+ + * Handle the case that a given zPCI function was reserved by another system.
+ + * After a call to this function the zpci_dev can not be found via
+ + * get_zdev_by_fid() anymore but may still be accessible via existing
+ + * references though it will not be functional anymore.
+   */
+ -int zpci_deconfigure_device(struct zpci_dev *zdev)
+ +void zpci_device_reserved(struct zpci_dev *zdev)
+  {
+ -	int rc;
+ -
+ -	if (zdev->zbus->bus)
+ -		zpci_bus_remove_device(zdev, false);
+ -
+ +	if (zdev->has_hp_slot)
+ +		zpci_exit_slot(zdev);
+ +	/*
+ +	 * Remove device from zpci_list as it is going away. This also
+ +	 * makes sure we ignore subsequent zPCI events for this device.
+ +	 */
+ +	spin_lock(&zpci_list_lock);
+ +	list_del(&zdev->entry);
+ +	spin_unlock(&zpci_list_lock);
+ +	zdev->state = ZPCI_FN_STATE_RESERVED;
+ +	zpci_dbg(3, "rsv fid:%x\n", zdev->fid);
+ +	zpci_zdev_put(zdev);
+++=======
++ 	if (zdev->dma_table) {
++ 		rc = zpci_dma_exit_device(zdev);
++ 		if (rc)
++ 			return rc;
++ 	}
++ 	if (zdev_enabled(zdev)) {
++ 		rc = zpci_disable_device(zdev);
++ 		if (rc)
++ 			return rc;
++ 	}
++ 
++ 	rc = sclp_pci_deconfigure(zdev->fid);
++ 	zpci_dbg(3, "deconf fid:%x, rc:%d\n", zdev->fid, rc);
++ 	if (rc)
++ 		return rc;
++ 	zdev->state = ZPCI_FN_STATE_STANDBY;
++ 
++ 	return 0;
+++>>>>>>> 1f3f76812d5d (s390/pci: improve DMA translation init and exit)
+  }
+  
+  void zpci_release_device(struct kref *kref)
+  {
+  	struct zpci_dev *zdev = container_of(kref, struct zpci_dev, kref);
+ -	int ret;
+  
+  	if (zdev->zbus->bus)
+++<<<<<<< HEAD
+ +		zpci_remove_device(zdev);
+++=======
++ 		zpci_bus_remove_device(zdev, false);
++ 
++ 	if (zdev->dma_table)
++ 		zpci_dma_exit_device(zdev);
++ 	if (zdev_enabled(zdev))
++ 		zpci_disable_device(zdev);
+++>>>>>>> 1f3f76812d5d (s390/pci: improve DMA translation init and exit)
+  
+  	switch (zdev->state) {
+ +	case ZPCI_FN_STATE_ONLINE:
+  	case ZPCI_FN_STATE_CONFIGURED:
+ -		ret = sclp_pci_deconfigure(zdev->fid);
+ -		zpci_dbg(3, "deconf fid:%x, rc:%d\n", zdev->fid, ret);
+ -		fallthrough;
+ +		zpci_disable_device(zdev);
+ +		/* fallthrough */
+  	case ZPCI_FN_STATE_STANDBY:
+  		if (zdev->has_hp_slot)
+  			zpci_exit_slot(zdev);
+diff --cc arch/s390/pci/pci_bus.c
+index be52bf47165d,5d77acbd1c87..000000000000
+--- a/arch/s390/pci/pci_bus.c
++++ b/arch/s390/pci/pci_bus.c
+@@@ -29,25 -30,186 +29,181 @@@ static LIST_HEAD(zbus_list)
+  static DEFINE_MUTEX(zbus_list_lock);
+  static int zpci_nb_devices;
+  
+++<<<<<<< HEAD
+ +/* zpci_bus_scan
+++=======
++ /* zpci_bus_prepare_device - Prepare a zPCI function for scanning
++  * @zdev: the zPCI function to be prepared
++  *
++  * The PCI resources for the function are set up and added to its zbus and the
++  * function is enabled. The function must be added to a zbus which must have
++  * a PCI bus created. If an error occurs the zPCI function is not enabled.
++  *
++  * Return: 0 on success, an error code otherwise
++  */
++ static int zpci_bus_prepare_device(struct zpci_dev *zdev)
++ {
++ 	struct resource_entry *window, *n;
++ 	struct resource *res;
++ 	int rc;
++ 
++ 	if (!zdev_enabled(zdev)) {
++ 		rc = zpci_enable_device(zdev);
++ 		if (rc)
++ 			return rc;
++ 		rc = zpci_dma_init_device(zdev);
++ 		if (rc) {
++ 			zpci_disable_device(zdev);
++ 			return rc;
++ 		}
++ 	}
++ 
++ 	if (!zdev->has_resources) {
++ 		zpci_setup_bus_resources(zdev, &zdev->zbus->resources);
++ 		resource_list_for_each_entry_safe(window, n, &zdev->zbus->resources) {
++ 			res = window->res;
++ 			pci_bus_add_resource(zdev->zbus->bus, res, 0);
++ 		}
++ 	}
++ 
++ 	return 0;
++ }
++ 
++ /* zpci_bus_scan_device - Scan a single device adding it to the PCI core
++  * @zdev: the zdev to be scanned
++  *
++  * Scans the PCI function making it available to the common PCI code.
++  *
++  * Return: 0 on success, an error value otherwise
++  */
++ int zpci_bus_scan_device(struct zpci_dev *zdev)
++ {
++ 	struct pci_dev *pdev;
++ 	int rc;
++ 
++ 	rc = zpci_bus_prepare_device(zdev);
++ 	if (rc)
++ 		return rc;
++ 
++ 	pdev = pci_scan_single_device(zdev->zbus->bus, zdev->devfn);
++ 	if (!pdev)
++ 		return -ENODEV;
++ 
++ 	pci_bus_add_device(pdev);
++ 	pci_lock_rescan_remove();
++ 	pci_bus_add_devices(zdev->zbus->bus);
++ 	pci_unlock_rescan_remove();
++ 
++ 	return 0;
++ }
++ 
++ /* zpci_bus_remove_device - Removes the given zdev from the PCI core
++  * @zdev: the zdev to be removed from the PCI core
++  * @set_error: if true the device's error state is set to permanent failure
++  *
++  * Sets a zPCI device to a configured but offline state; the zPCI
++  * device is still accessible through its hotplug slot and the zPCI
++  * API but is removed from the common code PCI bus, making it
++  * no longer available to drivers.
++  */
++ void zpci_bus_remove_device(struct zpci_dev *zdev, bool set_error)
++ {
++ 	struct zpci_bus *zbus = zdev->zbus;
++ 	struct pci_dev *pdev;
++ 
++ 	if (!zdev->zbus->bus)
++ 		return;
++ 
++ 	pdev = pci_get_slot(zbus->bus, zdev->devfn);
++ 	if (pdev) {
++ 		if (set_error)
++ 			pdev->error_state = pci_channel_io_perm_failure;
++ 		if (pdev->is_virtfn) {
++ 			zpci_iov_remove_virtfn(pdev, zdev->vfn);
++ 			/* balance pci_get_slot */
++ 			pci_dev_put(pdev);
++ 			return;
++ 		}
++ 		pci_stop_and_remove_bus_device_locked(pdev);
++ 		/* balance pci_get_slot */
++ 		pci_dev_put(pdev);
++ 	}
++ }
++ 
++ /* zpci_bus_scan_bus - Scan all configured zPCI functions on the bus
++  * @zbus: the zbus to be scanned
++  *
++  * Enables and scans all PCI functions on the bus making them available to the
++  * common PCI code. If there is no function 0 on the zbus nothing is scanned. If
++  * a function does not have a slot yet because it was added to the zbus before
++  * function 0 the slot is created. If a PCI function fails to be initialized
++  * an error will be returned but attempts will still be made for all other
++  * functions on the bus.
++  *
++  * Return: 0 on success, an error value otherwise
++  */
++ int zpci_bus_scan_bus(struct zpci_bus *zbus)
++ {
++ 	struct zpci_dev *zdev;
++ 	int devfn, rc, ret = 0;
++ 
++ 	if (!zbus->function[0])
++ 		return 0;
++ 
++ 	for (devfn = 0; devfn < ZPCI_FUNCTIONS_PER_BUS; devfn++) {
++ 		zdev = zbus->function[devfn];
++ 		if (zdev && zdev->state == ZPCI_FN_STATE_CONFIGURED) {
++ 			rc = zpci_bus_prepare_device(zdev);
++ 			if (rc)
++ 				ret = -EIO;
++ 		}
++ 	}
++ 
++ 	pci_lock_rescan_remove();
++ 	pci_scan_child_bus(zbus->bus);
++ 	pci_bus_add_devices(zbus->bus);
++ 	pci_unlock_rescan_remove();
++ 
++ 	return ret;
++ }
++ 
++ /* zpci_bus_scan_busses - Scan all registered busses
++  *
++  * Scan all available zbusses
++  *
++  */
++ void zpci_bus_scan_busses(void)
++ {
++ 	struct zpci_bus *zbus = NULL;
++ 
++ 	mutex_lock(&zbus_list_lock);
++ 	list_for_each_entry(zbus, &zbus_list, bus_next) {
++ 		zpci_bus_scan_bus(zbus);
++ 		cond_resched();
++ 	}
++ 	mutex_unlock(&zbus_list_lock);
++ }
++ 
++ /* zpci_bus_create_pci_bus - Create the PCI bus associated with this zbus
+++>>>>>>> 1f3f76812d5d (s390/pci: improve DMA translation init and exit)
+   * @zbus: the zbus holding the zdevices
+ - * @f0: function 0 of the bus
+   * @ops: the pci operations
+   *
+ - * Function zero is taken as a parameter as this is used to determine the
+ - * domain, multifunction property and maximum bus speed of the entire bus.
+ - *
+ - * Return: 0 on success, an error code otherwise
+ + * The domain number must be set before pci_scan_root_bus is called.
+ + * This function can be called once the domain is known, hence
+ + * when the function_0 is dicovered.
+   */
+ -static int zpci_bus_create_pci_bus(struct zpci_bus *zbus, struct zpci_dev *f0, struct pci_ops *ops)
+ +static int zpci_bus_scan(struct zpci_bus *zbus, int domain, struct pci_ops *ops)
+  {
+  	struct pci_bus *bus;
+ -	int domain;
+ -
+ -	domain = zpci_alloc_domain((u16)f0->uid);
+ -	if (domain < 0)
+ -		return domain;
+ +	int rc;
+  
+ -	zbus->domain_nr = domain;
+ -	zbus->multifunction = f0->rid_available;
+ -	zbus->max_bus_speed = f0->max_bus_speed;
+ +	rc = zpci_alloc_domain(domain);
+ +	if (rc < 0)
+ +		return rc;
+ +	zbus->domain_nr = rc;
+  
+ -	/*
+ -	 * Note that the zbus->resources are taken over and zbus->resources
+ -	 * is empty after a successful call
+ -	 */
+ -	bus = pci_create_root_bus(NULL, ZPCI_BUS_NR, ops, zbus, &zbus->resources);
+ +	bus = pci_scan_root_bus(NULL, ZPCI_BUS_NR, ops, zbus, &zbus->resources);
+  	if (!bus) {
+  		zpci_free_domain(zbus->domain_nr);
+  		return -EFAULT;
+diff --cc arch/s390/pci/pci_event.c
+index 4b2bb5dfb29a,c856f80cb21b..000000000000
+--- a/arch/s390/pci/pci_event.c
++++ b/arch/s390/pci/pci_event.c
+@@@ -73,6 -74,23 +73,26 @@@ void zpci_event_error(void *data
+  		__zpci_event_error(data);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static void zpci_event_hard_deconfigured(struct zpci_dev *zdev, u32 fh)
++ {
++ 	zdev->fh = fh;
++ 	/* Give the driver a hint that the function is
++ 	 * already unusable.
++ 	 */
++ 	zpci_bus_remove_device(zdev, true);
++ 	/* Even though the device is already gone we still
++ 	 * need to free zPCI resources as part of the disable.
++ 	 */
++ 	if (zdev->dma_table)
++ 		zpci_dma_exit_device(zdev);
++ 	if (zdev_enabled(zdev))
++ 		zpci_disable_device(zdev);
++ 	zdev->state = ZPCI_FN_STATE_STANDBY;
++ }
++ 
+++>>>>>>> 1f3f76812d5d (s390/pci: improve DMA translation init and exit)
+  static void __zpci_event_availability(struct zpci_ccdf_avail *ccdf)
+  {
+  	struct zpci_dev *zdev = get_zdev_by_fid(ccdf->fid);
+diff --git a/arch/s390/include/asm/pci.h b/arch/s390/include/asm/pci.h
+index 37481081a26c..0d23c2d53036 100644
+--- a/arch/s390/include/asm/pci.h
++++ b/arch/s390/include/asm/pci.h
+@@ -272,6 +272,8 @@ struct zpci_dev *get_zdev_by_fid(u32);
+ /* DMA */
+ int zpci_dma_init(void);
+ void zpci_dma_exit(void);
++int zpci_dma_init_device(struct zpci_dev *zdev);
++int zpci_dma_exit_device(struct zpci_dev *zdev);
+ 
+ int __init zpci_irq_init(void);
+ void __init zpci_irq_exit(void);
+diff --git a/arch/s390/include/asm/pci_dma.h b/arch/s390/include/asm/pci_dma.h
+index f62cd3ed2d44..3b8e89d4578a 100644
+--- a/arch/s390/include/asm/pci_dma.h
++++ b/arch/s390/include/asm/pci_dma.h
+@@ -182,8 +182,6 @@ static inline unsigned long *get_st_pto(unsigned long entry)
+ }
+ 
+ /* Prototypes */
+-int zpci_dma_init_device(struct zpci_dev *);
+-void zpci_dma_exit_device(struct zpci_dev *);
+ void dma_free_seg_table(unsigned long);
+ unsigned long *dma_alloc_cpu_table(void);
+ void dma_cleanup_tables(unsigned long *);
+* Unmerged path arch/s390/pci/pci.c
+* Unmerged path arch/s390/pci/pci_bus.c
+diff --git a/arch/s390/pci/pci_dma.c b/arch/s390/pci/pci_dma.c
+index d50a2da05691..6f24badd30be 100644
+--- a/arch/s390/pci/pci_dma.c
++++ b/arch/s390/pci/pci_dma.c
+@@ -596,10 +596,11 @@ int zpci_dma_init_device(struct zpci_dev *zdev)
+ 		}
+ 
+ 	}
+-	rc = zpci_register_ioat(zdev, 0, zdev->start_dma, zdev->end_dma,
+-				(u64) zdev->dma_table);
+-	if (rc)
++	if (zpci_register_ioat(zdev, 0, zdev->start_dma, zdev->end_dma,
++			       (u64)zdev->dma_table)) {
++		rc = -EIO;
+ 		goto free_bitmap;
++	}
+ 
+ 	return 0;
+ free_bitmap:
+@@ -614,17 +615,25 @@ int zpci_dma_init_device(struct zpci_dev *zdev)
+ 	return rc;
+ }
+ 
+-void zpci_dma_exit_device(struct zpci_dev *zdev)
++int zpci_dma_exit_device(struct zpci_dev *zdev)
+ {
++	int cc = 0;
++
+ 	/*
+ 	 * At this point, if the device is part of an IOMMU domain, this would
+ 	 * be a strong hint towards a bug in the IOMMU API (common) code and/or
+ 	 * simultaneous access via IOMMU and DMA API. So let's issue a warning.
+ 	 */
+ 	WARN_ON(zdev->s390_domain);
+-
+-	if (zpci_unregister_ioat(zdev, 0))
+-		return;
++	if (zdev_enabled(zdev))
++		cc = zpci_unregister_ioat(zdev, 0);
++	/*
++	 * cc == 3 indicates the function is gone already. This can happen
++	 * if the function was deconfigured/disabled suddenly and we have not
++	 * received a new handle yet.
++	 */
++	if (cc && cc != 3)
++		return -EIO;
+ 
+ 	dma_cleanup_tables(zdev->dma_table);
+ 	zdev->dma_table = NULL;
+@@ -632,8 +641,8 @@ void zpci_dma_exit_device(struct zpci_dev *zdev)
+ 	zdev->iommu_bitmap = NULL;
+ 	vfree(zdev->lazy_bitmap);
+ 	zdev->lazy_bitmap = NULL;
+-
+ 	zdev->next_bit = 0;
++	return 0;
+ }
+ 
+ static int __init dma_alloc_cpu_table_caches(void)
+* Unmerged path arch/s390/pci/pci_event.c
+diff --git a/arch/s390/pci/pci_sysfs.c b/arch/s390/pci/pci_sysfs.c
+index 6e2450c2b9c1..335c281811c7 100644
+--- a/arch/s390/pci/pci_sysfs.c
++++ b/arch/s390/pci/pci_sysfs.c
+@@ -82,13 +82,26 @@ static ssize_t recover_store(struct device *dev, struct device_attribute *attr,
+ 	pci_lock_rescan_remove();
+ 	if (pci_dev_is_added(pdev)) {
+ 		pci_stop_and_remove_bus_device(pdev);
+-		ret = zpci_disable_device(zdev);
+-		if (ret)
+-			goto out;
++		if (zdev->dma_table) {
++			ret = zpci_dma_exit_device(zdev);
++			if (ret)
++				goto out;
++		}
++
++		if (zdev_enabled(zdev)) {
++			ret = zpci_disable_device(zdev);
++			if (ret)
++				goto out;
++		}
+ 
+ 		ret = zpci_enable_device(zdev);
+ 		if (ret)
+ 			goto out;
++		ret = zpci_dma_init_device(zdev);
++		if (ret) {
++			zpci_disable_device(zdev);
++			goto out;
++		}
+ 		pci_rescan_bus(zdev->zbus->bus);
+ 	}
+ out:
+diff --git a/drivers/iommu/s390-iommu.c b/drivers/iommu/s390-iommu.c
+index 6019e58ce4fb..83df387e70a3 100644
+--- a/drivers/iommu/s390-iommu.c
++++ b/drivers/iommu/s390-iommu.c
+@@ -90,7 +90,7 @@ static int s390_iommu_attach_device(struct iommu_domain *domain,
+ 	struct zpci_dev *zdev = to_zpci_dev(dev);
+ 	struct s390_domain_device *domain_device;
+ 	unsigned long flags;
+-	int rc;
++	int cc, rc;
+ 
+ 	if (!zdev)
+ 		return -ENODEV;
+@@ -99,14 +99,21 @@ static int s390_iommu_attach_device(struct iommu_domain *domain,
+ 	if (!domain_device)
+ 		return -ENOMEM;
+ 
+-	if (zdev->dma_table)
+-		zpci_dma_exit_device(zdev);
++	if (zdev->dma_table) {
++		cc = zpci_dma_exit_device(zdev);
++		if (cc) {
++			rc = -EIO;
++			goto out_free;
++		}
++	}
+ 
+ 	zdev->dma_table = s390_domain->dma_table;
+-	rc = zpci_register_ioat(zdev, 0, zdev->start_dma, zdev->end_dma,
++	cc = zpci_register_ioat(zdev, 0, zdev->start_dma, zdev->end_dma,
+ 				(u64) zdev->dma_table);
+-	if (rc)
++	if (cc) {
++		rc = -EIO;
+ 		goto out_restore;
++	}
+ 
+ 	spin_lock_irqsave(&s390_domain->list_lock, flags);
+ 	/* First device defines the DMA range limits */
+@@ -130,6 +137,7 @@ static int s390_iommu_attach_device(struct iommu_domain *domain,
+ 
+ out_restore:
+ 	zpci_dma_init_device(zdev);
++out_free:
+ 	kfree(domain_device);
+ 
+ 	return rc;
