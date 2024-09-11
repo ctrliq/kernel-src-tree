@@ -1,0 +1,114 @@
+selftests/bpf: Fix segmentation fault in test_progs
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Jianlin Lv <Jianlin.Lv@arm.com>
+commit 0390c429dbed4068bd2cd8dded937d9a5ec24cd2
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/0390c429.failed
+
+test_progs reports the segmentation fault as below:
+
+  $ sudo ./test_progs -t mmap --verbose
+  test_mmap:PASS:skel_open_and_load 0 nsec
+  [...]
+  test_mmap:PASS:adv_mmap1 0 nsec
+  test_mmap:PASS:adv_mmap2 0 nsec
+  test_mmap:PASS:adv_mmap3 0 nsec
+  test_mmap:PASS:adv_mmap4 0 nsec
+  Segmentation fault
+
+This issue was triggered because mmap() and munmap() used inconsistent
+length parameters; mmap() creates a new mapping of 3 * page_size, but the
+length parameter set in the subsequent re-map and munmap() functions is
+4 * page_size; this leads to the destruction of the process space.
+
+To fix this issue, first create 4 pages of anonymous mapping, then do all
+the mmap() with MAP_FIXED.
+
+Another issue is that when unmap the second page fails, the length
+parameter to delete tmp1 mappings should be 4 * page_size.
+
+	Signed-off-by: Jianlin Lv <Jianlin.Lv@arm.com>
+	Signed-off-by: Daniel Borkmann <daniel@iogearbox.net>
+	Acked-by: Andrii Nakryiko <andriin@fb.com>
+Link: https://lore.kernel.org/bpf/20200810153940.125508-1-Jianlin.Lv@arm.com
+(cherry picked from commit 0390c429dbed4068bd2cd8dded937d9a5ec24cd2)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	tools/testing/selftests/bpf/prog_tests/mmap.c
+diff --cc tools/testing/selftests/bpf/prog_tests/mmap.c
+index 051a6d48762c,9c3c5c0f068f..000000000000
+--- a/tools/testing/selftests/bpf/prog_tests/mmap.c
++++ b/tools/testing/selftests/bpf/prog_tests/mmap.c
+@@@ -26,36 -19,43 +26,45 @@@ void test_mmap(void
+  	const size_t map_sz = roundup_page(sizeof(struct map_data));
+  	const int zero = 0, one = 1, two = 2, far = 1500;
+  	const long page_size = sysconf(_SC_PAGE_SIZE);
+ -	int err, duration = 0, i, data_map_fd, data_map_id, tmp_fd, rdmap_fd;
+ +	int err, duration = 0, i, data_map_fd;
+ +	struct bpf_program *prog;
+ +	struct bpf_object *obj;
+ +	struct bpf_link *link = NULL;
+  	struct bpf_map *data_map, *bss_map;
+++<<<<<<< HEAD
+ +	void *bss_mmaped = NULL, *map_mmaped = NULL, *tmp1, *tmp2;
+ +	volatile struct bss_data *bss_data;
+ +	volatile struct map_data *map_data;
+++=======
++ 	void *bss_mmaped = NULL, *map_mmaped = NULL, *tmp0, *tmp1, *tmp2;
++ 	struct test_mmap__bss *bss_data;
++ 	struct bpf_map_info map_info;
++ 	__u32 map_info_sz = sizeof(map_info);
++ 	struct map_data *map_data;
++ 	struct test_mmap *skel;
+++>>>>>>> 0390c429dbed (selftests/bpf: Fix segmentation fault in test_progs)
+  	__u64 val = 0;
+  
+ -	skel = test_mmap__open_and_load();
+ -	if (CHECK(!skel, "skel_open_and_load", "skeleton open/load failed\n"))
+ +	obj = bpf_object__open_file("test_mmap.o", NULL);
+ +	if (CHECK(IS_ERR(obj), "obj_open", "failed to open '%s': %ld\n",
+ +		  file, PTR_ERR(obj)))
+  		return;
+ -
+ -	bss_map = skel->maps.bss;
+ -	data_map = skel->maps.data_map;
+ -	data_map_fd = bpf_map__fd(data_map);
+ -
+ -	rdmap_fd = bpf_map__fd(skel->maps.rdonly_map);
+ -	tmp1 = mmap(NULL, 4096, PROT_READ | PROT_WRITE, MAP_SHARED, rdmap_fd, 0);
+ -	if (CHECK(tmp1 != MAP_FAILED, "rdonly_write_mmap", "unexpected success\n")) {
+ -		munmap(tmp1, 4096);
+ +	prog = bpf_object__find_program_by_title(obj, probe_name);
+ +	if (CHECK(!prog, "find_probe", "prog '%s' not found\n", probe_name))
+  		goto cleanup;
+ -	}
+ -	/* now double-check if it's mmap()'able at all */
+ -	tmp1 = mmap(NULL, 4096, PROT_READ, MAP_SHARED, rdmap_fd, 0);
+ -	if (CHECK(tmp1 == MAP_FAILED, "rdonly_read_mmap", "failed: %d\n", errno))
+ +	err = bpf_object__load(obj);
+ +	if (CHECK(err, "obj_load", "failed to load prog '%s': %d\n",
+ +		  probe_name, err))
+  		goto cleanup;
+  
+ -	/* get map's ID */
+ -	memset(&map_info, 0, map_info_sz);
+ -	err = bpf_obj_get_info_by_fd(data_map_fd, &map_info, &map_info_sz);
+ -	if (CHECK(err, "map_get_info", "failed %d\n", errno))
+ +	bss_map = bpf_object__find_map_by_name(obj, "test_mma.bss");
+ +	if (CHECK(!bss_map, "find_bss_map", ".bss map not found\n"))
+  		goto cleanup;
+ -	data_map_id = map_info.id;
+ +	data_map = bpf_object__find_map_by_name(obj, "data_map");
+ +	if (CHECK(!data_map, "find_data_map", "data_map map not found\n"))
+ +		goto cleanup;
+ +	data_map_fd = bpf_map__fd(data_map);
+  
+ -	/* mmap BSS map */
+  	bss_mmaped = mmap(NULL, bss_sz, PROT_READ | PROT_WRITE, MAP_SHARED,
+  			  bpf_map__fd(bss_map), 0);
+  	if (CHECK(bss_mmaped == MAP_FAILED, "bss_mmap",
+* Unmerged path tools/testing/selftests/bpf/prog_tests/mmap.c
