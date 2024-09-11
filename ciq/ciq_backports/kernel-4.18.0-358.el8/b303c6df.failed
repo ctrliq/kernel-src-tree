@@ -1,0 +1,134 @@
+kbuild: compute false-positive -Wmaybe-uninitialized cases in Kconfig
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-358.el8
+commit-author Masahiro Yamada <yamada.masahiro@socionext.com>
+commit b303c6df80c9f8f13785aa83a0471fca7e38b24d
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-358.el8/b303c6df.failed
+
+Since -Wmaybe-uninitialized was introduced by GCC 4.7, we have patched
+various false positives:
+
+ - commit e74fc973b6e5 ("Turn off -Wmaybe-uninitialized when building
+   with -Os") turned off this option for -Os.
+
+ - commit 815eb71e7149 ("Kbuild: disable 'maybe-uninitialized' warning
+   for CONFIG_PROFILE_ALL_BRANCHES") turned off this option for
+   CONFIG_PROFILE_ALL_BRANCHES
+
+ - commit a76bcf557ef4 ("Kbuild: enable -Wmaybe-uninitialized warning
+   for "make W=1"") turned off this option for GCC < 4.9
+   Arnd provided more explanation in https://lkml.org/lkml/2017/3/14/903
+
+I think this looks better by shifting the logic from Makefile to Kconfig.
+
+Link: https://github.com/ClangBuiltLinux/linux/issues/350
+	Signed-off-by: Masahiro Yamada <yamada.masahiro@socionext.com>
+	Reviewed-by: Nathan Chancellor <natechancellor@gmail.com>
+	Tested-by: Nick Desaulniers <ndesaulniers@google.com>
+(cherry picked from commit b303c6df80c9f8f13785aa83a0471fca7e38b24d)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	Makefile
+diff --cc Makefile
+index 95a5c487dd35,9f52fda4ad0e..000000000000
+--- a/Makefile
++++ b/Makefile
+@@@ -660,39 -660,13 +660,42 @@@ KBUILD_CFLAGS	+= $(call cc-disable-warn
+  
+  ifdef CONFIG_CC_OPTIMIZE_FOR_SIZE
+  KBUILD_CFLAGS	+= $(call cc-option,-Oz,-Os)
+++<<<<<<< HEAD
+ +KBUILD_CFLAGS	+= $(call cc-disable-warning,maybe-uninitialized,)
+  else
+ -KBUILD_CFLAGS   += -O2
+ +# powerpc is compiled with -O3, via specfile rpmbuild -- see rhbz1051067.
+ +# we need to keep consistency here, however, for out of tree kmod builds --
+ +# see rhbz1431029 for reference
+ +ifeq ($(SRCARCH), powerpc)
+ +KBUILD_CFLAGS	+= -O3
+++=======
+++>>>>>>> b303c6df80c9 (kbuild: compute false-positive -Wmaybe-uninitialized cases in Kconfig)
+ +else
+ +KBUILD_CFLAGS	+= -O2
+ +endif
+ +ifdef CONFIG_PROFILE_ALL_BRANCHES
+ +KBUILD_CFLAGS	+= $(call cc-disable-warning,maybe-uninitialized,)
+ +endif
+ +endif
+ +
+ +ifneq ($(DISABLE_WERROR),1)
+ +ifneq ($(WITH_GCOV),1)
+ +ifeq ($(KBUILD_EXTMOD),)
+ +ifneq (,$(filter $(ARCH), x86 x86_64 powerpc s390))
+ +KBUILD_CFLAGS   += -Werror
+ +endif
+ +# powerpc is compiled with -O3. Starting with gcc 4.8, there have been some
+ +# known problems with compiler warnings so disable them on all compilers
+ +# greater than that version
+ +ifneq (,$(filter $(ARCH), powerpc))
+ +KBUILD_CFLAGS += $(call cc-ifversion, -gt, 0408, -Wno-uninitialized -Wno-maybe-uninitialized -Wno-error=array-bounds)
+ +endif
+ +endif
+  endif
+- endif
+  
+- KBUILD_CFLAGS += $(call cc-ifversion, -lt, 0409, \
+- 			$(call cc-disable-warning,maybe-uninitialized,))
++ ifdef CONFIG_CC_DISABLE_WARN_MAYBE_UNINITIALIZED
++ KBUILD_CFLAGS   += -Wno-maybe-uninitialized
++ endif
+  
+  # Tell gcc to never replace conditional load with a non-conditional one
+  KBUILD_CFLAGS	+= $(call cc-option,--param=allow-store-data-races=0)
+* Unmerged path Makefile
+diff --git a/init/Kconfig b/init/Kconfig
+index 7609c6684f41..ebb719f13bfe 100644
+--- a/init/Kconfig
++++ b/init/Kconfig
+@@ -33,6 +33,22 @@ config CC_CAN_LINK_STATIC
+ 	default $(success,$(srctree)/scripts/cc-can-link.sh $(CC) -static $(m64-flag)) if 64BIT
+ 	default $(success,$(srctree)/scripts/cc-can-link.sh $(CC) -static $(m32-flag))
+ 
++config CC_HAS_WARN_MAYBE_UNINITIALIZED
++	def_bool $(cc-option,-Wmaybe-uninitialized)
++	help
++	  GCC >= 4.7 supports this option.
++
++config CC_DISABLE_WARN_MAYBE_UNINITIALIZED
++	bool
++	depends on CC_HAS_WARN_MAYBE_UNINITIALIZED
++	default CC_IS_GCC && GCC_VERSION < 40900  # unreliable for GCC < 4.9
++	help
++	  GCC's -Wmaybe-uninitialized is not reliable by definition.
++	  Lots of false positive warnings are produced in some cases.
++
++	  If this option is enabled, -Wno-maybe-uninitialzed is passed
++	  to the compiler to suppress maybe-uninitialized warnings.
++
+ config CONSTRUCTORS
+ 	bool
+ 	depends on !UML
+@@ -1113,6 +1129,7 @@ config CC_OPTIMIZE_FOR_PERFORMANCE
+ 
+ config CC_OPTIMIZE_FOR_SIZE
+ 	bool "Optimize for size"
++	imply CC_DISABLE_WARN_MAYBE_UNINITIALIZED  # avoid false positives
+ 	help
+ 	  Enabling this option will pass "-Os" instead of "-O2" to
+ 	  your compiler resulting in a smaller kernel.
+diff --git a/kernel/trace/Kconfig b/kernel/trace/Kconfig
+index dbed47140bd5..a324cd581dde 100644
+--- a/kernel/trace/Kconfig
++++ b/kernel/trace/Kconfig
+@@ -369,6 +369,7 @@ config PROFILE_ANNOTATED_BRANCHES
+ config PROFILE_ALL_BRANCHES
+ 	bool "Profile all if conditionals" if !FORTIFY_SOURCE
+ 	select TRACE_BRANCH_PROFILING
++	imply CC_DISABLE_WARN_MAYBE_UNINITIALIZED  # avoid false positives
+ 	help
+ 	  This tracer profiles all branch conditions. Every if ()
+ 	  taken in the kernel is recorded whether it hit or miss.
