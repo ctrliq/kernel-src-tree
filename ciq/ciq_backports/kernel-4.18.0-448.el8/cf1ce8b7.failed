@@ -1,0 +1,211 @@
+scsi: mpi3mr: Reduce VD queue depth on detecting throttling
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-448.el8
+commit-author Sreekanth Reddy <sreekanth.reddy@broadcom.com>
+commit cf1ce8b715240e3e4a86162788958444e9208472
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-448.el8/cf1ce8b7.failed
+
+Reduce the VD queue depth on detecting the throttling condition.
+
+[mkp: incorporate fix for pointer cast issue reported by the test
+robot and Guenter Roeck]
+
+Link: https://lore.kernel.org/r/20220708195020.8323-3-sreekanth.reddy@broadcom.com
+	Signed-off-by: Sreekanth Reddy <sreekanth.reddy@broadcom.com>
+	Signed-off-by: Martin K. Petersen <martin.petersen@oracle.com>
+(cherry picked from commit cf1ce8b715240e3e4a86162788958444e9208472)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/scsi/mpi3mr/mpi3mr.h
+#	drivers/scsi/mpi3mr/mpi3mr_fw.c
+#	drivers/scsi/mpi3mr/mpi3mr_os.c
+diff --cc drivers/scsi/mpi3mr/mpi3mr.h
+index 8de3e5650c79,0935b2e80662..000000000000
+--- a/drivers/scsi/mpi3mr/mpi3mr.h
++++ b/drivers/scsi/mpi3mr/mpi3mr.h
+@@@ -425,6 -433,31 +425,34 @@@ struct mpi3mr_intr_info 
+  };
+  
+  /**
+++<<<<<<< HEAD
+++=======
++  * struct mpi3mr_throttle_group_info - Throttle group info
++  *
++  * @io_divert: Flag indicates io divert is on or off for the TG
++  * @need_qd_reduction: Flag to indicate QD reduction is needed
++  * @qd_reduction: Queue Depth reduction in units of 10%
++  * @fw_qd: QueueDepth value reported by the firmware
++  * @modified_qd: Modified QueueDepth value due to throttling
++  * @id: Throttle Group ID.
++  * @high: High limit to turn on throttling in 512 byte blocks
++  * @low: Low limit to turn off throttling in 512 byte blocks
++  * @pend_large_data_sz: Counter to track pending large data
++  */
++ struct mpi3mr_throttle_group_info {
++ 	u8 io_divert;
++ 	u8 need_qd_reduction;
++ 	u8 qd_reduction;
++ 	u16 fw_qd;
++ 	u16 modified_qd;
++ 	u16 id;
++ 	u32 high;
++ 	u32 low;
++ 	atomic_t pend_large_data_sz;
++ };
++ 
++ /**
+++>>>>>>> cf1ce8b71524 (scsi: mpi3mr: Reduce VD queue depth on detecting throttling)
+   * struct tgt_dev_sas_sata - SAS/SATA device specific
+   * information cached from firmware given data
+   *
+@@@ -461,11 -494,22 +489,27 @@@ struct tgt_dev_pcie 
+   * cached from firmware given data
+   *
+   * @state: State of the VD
+++<<<<<<< HEAD
+++=======
++  * @tg_qd_reduction: Queue Depth reduction in units of 10%
++  * @tg_id: VDs throttle group ID
++  * @high: High limit to turn on throttling in 512 byte blocks
++  * @low: Low limit to turn off throttling in 512 byte blocks
++  * @tg: Pointer to throttle group info
+++>>>>>>> cf1ce8b71524 (scsi: mpi3mr: Reduce VD queue depth on detecting throttling)
+   */
+ -struct tgt_dev_vd {
+ +struct tgt_dev_volume {
+  	u8 state;
+++<<<<<<< HEAD
+++=======
++ 	u8 tg_qd_reduction;
++ 	u16 tg_id;
++ 	u32 tg_high;
++ 	u32 tg_low;
++ 	struct mpi3mr_throttle_group_info *tg;
+++>>>>>>> cf1ce8b71524 (scsi: mpi3mr: Reduce VD queue depth on detecting throttling)
+  };
+  
+ -
+  /**
+   * union _form_spec_inf - union of device specific information
+   */
+diff --cc drivers/scsi/mpi3mr/mpi3mr_fw.c
+index a891e8c285f7,6e39f7969e63..000000000000
+--- a/drivers/scsi/mpi3mr/mpi3mr_fw.c
++++ b/drivers/scsi/mpi3mr/mpi3mr_fw.c
+@@@ -4043,6 -4071,22 +4043,25 @@@ void mpi3mr_memset_buffers(struct mpi3m
+  		spin_lock_init(&mrioc->req_qinfo[i].q_lock);
+  		mpi3mr_memset_op_req_q_buffers(mrioc, i);
+  	}
+++<<<<<<< HEAD
+++=======
++ 
++ 	atomic_set(&mrioc->pend_large_data_sz, 0);
++ 	if (mrioc->throttle_groups) {
++ 		tg = mrioc->throttle_groups;
++ 		for (i = 0; i < mrioc->num_io_throttle_group; i++, tg++) {
++ 			tg->id = 0;
++ 			tg->fw_qd = 0;
++ 			tg->modified_qd = 0;
++ 			tg->io_divert = 0;
++ 			tg->need_qd_reduction = 0;
++ 			tg->high = 0;
++ 			tg->low = 0;
++ 			tg->qd_reduction = 0;
++ 			atomic_set(&tg->pend_large_data_sz, 0);
++ 		}
++ 	}
+++>>>>>>> cf1ce8b71524 (scsi: mpi3mr: Reduce VD queue depth on detecting throttling)
+  }
+  
+  /**
+diff --cc drivers/scsi/mpi3mr/mpi3mr_os.c
+index c851b53cb9f5,4102636df4fc..000000000000
+--- a/drivers/scsi/mpi3mr/mpi3mr_os.c
++++ b/drivers/scsi/mpi3mr/mpi3mr_os.c
+@@@ -1042,10 -1130,32 +1089,32 @@@ static void mpi3mr_update_tgtdev(struc
+  	{
+  		struct mpi3_device0_vd_format *vdinf =
+  		    &dev_pg0->device_specific.vd_format;
+ -		struct mpi3mr_throttle_group_info *tg = NULL;
+ -		u16 vdinf_io_throttle_group =
+ -		    le16_to_cpu(vdinf->io_throttle_group);
+  
+ -		tgtdev->dev_spec.vd_inf.state = vdinf->vd_state;
+ +		tgtdev->dev_spec.vol_inf.state = vdinf->vd_state;
+  		if (vdinf->vd_state == MPI3_DEVICE0_VD_STATE_OFFLINE)
+  			tgtdev->is_hidden = 1;
+++<<<<<<< HEAD
+++=======
++ 		tgtdev->dev_spec.vd_inf.tg_id = vdinf_io_throttle_group;
++ 		tgtdev->dev_spec.vd_inf.tg_high =
++ 		    le16_to_cpu(vdinf->io_throttle_group_high) * 2048;
++ 		tgtdev->dev_spec.vd_inf.tg_low =
++ 		    le16_to_cpu(vdinf->io_throttle_group_low) * 2048;
++ 		if (vdinf_io_throttle_group < mrioc->num_io_throttle_group) {
++ 			tg = mrioc->throttle_groups + vdinf_io_throttle_group;
++ 			tg->id = vdinf_io_throttle_group;
++ 			tg->high = tgtdev->dev_spec.vd_inf.tg_high;
++ 			tg->low = tgtdev->dev_spec.vd_inf.tg_low;
++ 			tg->qd_reduction =
++ 			    tgtdev->dev_spec.vd_inf.tg_qd_reduction;
++ 			if (is_added == true)
++ 				tg->fw_qd = tgtdev->q_depth;
++ 			tg->modified_qd = tgtdev->q_depth;
++ 		}
++ 		tgtdev->dev_spec.vd_inf.tg = tg;
++ 		if (scsi_tgt_priv_data)
++ 			scsi_tgt_priv_data->throttle_group = tg;
+++>>>>>>> cf1ce8b71524 (scsi: mpi3mr: Reduce VD queue depth on detecting throttling)
+  		break;
+  	}
+  	default:
+@@@ -4128,6 -4340,39 +4265,42 @@@ static int mpi3mr_qcmd(struct Scsi_Hos
+  		goto out;
+  	}
+  	op_req_q = &mrioc->req_qinfo[scmd_priv_data->req_q_idx];
+++<<<<<<< HEAD
+++=======
++ 		data_len_blks = scsi_bufflen(scmd) >> 9;
++ 	if ((data_len_blks >= mrioc->io_throttle_data_length) &&
++ 	    stgt_priv_data->io_throttle_enabled) {
++ 		tracked_io_sz = data_len_blks;
++ 		tg = stgt_priv_data->throttle_group;
++ 		if (tg) {
++ 			ioc_pend_data_len = atomic_add_return(data_len_blks,
++ 			    &mrioc->pend_large_data_sz);
++ 			tg_pend_data_len = atomic_add_return(data_len_blks,
++ 			    &tg->pend_large_data_sz);
++ 			if (!tg->io_divert  && ((ioc_pend_data_len >=
++ 			    mrioc->io_throttle_high) ||
++ 			    (tg_pend_data_len >= tg->high))) {
++ 				tg->io_divert = 1;
++ 				tg->need_qd_reduction = 1;
++ 				mpi3mr_set_io_divert_for_all_vd_in_tg(mrioc,
++ 				    tg, 1);
++ 				mpi3mr_queue_qd_reduction_event(mrioc, tg);
++ 			}
++ 		} else {
++ 			ioc_pend_data_len = atomic_add_return(data_len_blks,
++ 			    &mrioc->pend_large_data_sz);
++ 			if (ioc_pend_data_len >= mrioc->io_throttle_high)
++ 				stgt_priv_data->io_divert = 1;
++ 		}
++ 	}
++ 
++ 	if (stgt_priv_data->io_divert) {
++ 		scsiio_req->msg_flags |=
++ 		    MPI3_SCSIIO_MSGFLAGS_DIVERT_TO_FIRMWARE;
++ 		scsiio_flags |= MPI3_SCSIIO_FLAGS_DIVERT_REASON_IO_THROTTLING;
++ 	}
++ 	scsiio_req->flags = cpu_to_le32(scsiio_flags);
+++>>>>>>> cf1ce8b71524 (scsi: mpi3mr: Reduce VD queue depth on detecting throttling)
+  
+  	if (mpi3mr_op_request_post(mrioc, op_req_q,
+  	    scmd_priv_data->mpi3mr_scsiio_req)) {
+* Unmerged path drivers/scsi/mpi3mr/mpi3mr.h
+* Unmerged path drivers/scsi/mpi3mr/mpi3mr_fw.c
+* Unmerged path drivers/scsi/mpi3mr/mpi3mr_os.c
