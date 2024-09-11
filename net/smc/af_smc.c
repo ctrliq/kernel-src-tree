@@ -616,7 +616,7 @@ static int smc_connect_rdma(struct smc_sock *smc,
 	ini->is_smcd = false;
 	ini->ib_lcl = &aclc->r0.lcl;
 	ini->ib_clcqpn = ntoh24(aclc->r0.qpn);
-	ini->first_contact_peer = aclc->hdr.flag;
+	ini->first_contact_peer = aclc->hdr.typev2 & SMC_FIRST_CONTACT_MASK;
 
 	mutex_lock(&smc_client_lgr_pending);
 	reason_code = smc_conn_create(smc, ini);
@@ -711,7 +711,7 @@ static int smc_connect_ism(struct smc_sock *smc,
 
 	ini->is_smcd = true;
 	ini->ism_peer_gid = aclc->d0.gid;
-	ini->first_contact_peer = aclc->hdr.flag;
+	ini->first_contact_peer = aclc->hdr.typev2 & SMC_FIRST_CONTACT_MASK;
 
 	/* there is only one lgr role for SMC-D; use server lock */
 	mutex_lock(&smc_server_lgr_pending);
@@ -802,9 +802,9 @@ static int __smc_connect(struct smc_sock *smc)
 	}
 
 	/* depending on previous steps, connect using rdma or ism */
-	if (rdma_supported && aclc.hdr.path == SMC_TYPE_R)
+	if (rdma_supported && aclc.hdr.typev1 == SMC_TYPE_R)
 		rc = smc_connect_rdma(smc, &aclc, &ini);
-	else if (ism_supported && aclc.hdr.path == SMC_TYPE_D)
+	else if (ism_supported && aclc.hdr.typev1 == SMC_TYPE_D)
 		rc = smc_connect_ism(smc, &aclc, &ini);
 	else
 		rc = SMC_CLC_DECL_MODEUNSUPP;
@@ -1314,7 +1314,7 @@ static void smc_listen_work(struct work_struct *work)
 	smc_tx_init(new_smc);
 
 	/* check if ISM is available */
-	if (pclc->hdr.path == SMC_TYPE_D || pclc->hdr.path == SMC_TYPE_B) {
+	if (pclc->hdr.typev1 == SMC_TYPE_D || pclc->hdr.typev1 == SMC_TYPE_B) {
 		struct smc_clc_msg_smcd *pclc_smcd = smc_get_clc_msg_smcd(pclc);
 
 		ini.is_smcd = true; /* prepare ISM check */
@@ -1324,7 +1324,7 @@ static void smc_listen_work(struct work_struct *work)
 			rc = smc_listen_ism_init(new_smc, pclc, &ini);
 		if (!rc)
 			ism_supported = true;
-		else if (pclc->hdr.path == SMC_TYPE_D)
+		else if (pclc->hdr.typev1 == SMC_TYPE_D)
 			goto out_unlock; /* skip RDMA and decline */
 	}
 
@@ -1337,7 +1337,7 @@ static void smc_listen_work(struct work_struct *work)
 		rc = smc_find_rdma_device(new_smc, &ini);
 		if (rc) {
 			/* no RDMA device found */
-			if (pclc->hdr.path == SMC_TYPE_B)
+			if (pclc->hdr.typev1 == SMC_TYPE_B)
 				/* neither ISM nor RDMA device found */
 				rc = SMC_CLC_DECL_NOSMCDEV;
 			goto out_unlock;
