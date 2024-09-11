@@ -1,0 +1,297 @@
+drivers/base/memory.c: drop the mem_sysfs_mutex
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-193.el8
+commit-author David Hildenbrand <david@redhat.com>
+commit 848e19ad3c3352b6e0906f05b282a3e22c67c98f
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-193.el8/848e19ad.failed
+
+The mem_sysfs_mutex isn't really helpful.  Also, it's not really clear
+what the mutex protects at all.
+
+The device lists of the memory subsystem are protected separately.  We
+don't need that mutex when looking up.  creating, or removing
+independent devices.  find_memory_block_by_id() will perform locking on
+its own and grab a reference of the returned device.
+
+At the time memory_dev_init() is called, we cannot have concurrent
+hot(un)plug operations yet - we're still fairly early during boot.  We
+don't need any locking.
+
+The creation/removal of memory block devices should be protected on a
+higher level - especially using the device hotplug lock to avoid
+documented issues (see Documentation/core-api/memory-hotplug.rst) - or
+if that is reworked, using similar locking.
+
+Protecting in the context of these functions only doesn't really make
+sense.  Especially, if we would have a situation where the same memory
+blocks are created/deleted at the same time, there is something horribly
+going wrong (imagining adding/removing a DIMM at the same time from two
+call paths) - after the functions succeeded something else in the
+callers would blow up (e.g., create_memory_block_devices() succeeded but
+there are no memory block devices anymore).
+
+All relevant call paths (except when adding memory early during boot via
+ACPI, which is now documented) hold the device hotplug lock when adding
+memory, and when removing memory.  Let's document that instead.
+
+Add a simple safety net to create_memory_block_devices() in case we
+would actually remove memory blocks while adding them, so we'll never
+dereference a NULL pointer.  Simplify memory_dev_init() now that the
+lock is gone.
+
+Link: http://lkml.kernel.org/r/20190925082621.4927-1-david@redhat.com
+	Signed-off-by: David Hildenbrand <david@redhat.com>
+	Reviewed-by: Andrew Morton <akpm@linux-foundation.org>
+	Cc: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+	Cc: "Rafael J. Wysocki" <rafael@kernel.org>
+	Cc: Michal Hocko <mhocko@kernel.org>
+	Cc: Oscar Salvador <osalvador@suse.de>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit 848e19ad3c3352b6e0906f05b282a3e22c67c98f)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/base/memory.c
+diff --cc drivers/base/memory.c
+index bce3c13a7be5,799b43191dea..000000000000
+--- a/drivers/base/memory.c
++++ b/drivers/base/memory.c
+@@@ -736,35 -693,72 +733,99 @@@ unregister_memory(struct memory_block *
+  	device_unregister(&memory->dev);
+  }
+  
+++<<<<<<< HEAD
+ +void unregister_memory_section(struct mem_section *section)
+++=======
++ /*
++  * Create memory block devices for the given memory area. Start and size
++  * have to be aligned to memory block granularity. Memory block devices
++  * will be initialized as offline.
++  *
++  * Called under device_hotplug_lock.
++  */
++ int create_memory_block_devices(unsigned long start, unsigned long size)
+++>>>>>>> 848e19ad3c33 (drivers/base/memory.c: drop the mem_sysfs_mutex)
+  {
+ -	const unsigned long start_block_id = pfn_to_block_id(PFN_DOWN(start));
+ -	unsigned long end_block_id = pfn_to_block_id(PFN_DOWN(start + size));
+  	struct memory_block *mem;
+ -	unsigned long block_id;
+ -	int ret = 0;
+  
+++<<<<<<< HEAD
+ +	if (WARN_ON_ONCE(!present_section(section)))
+ +		return;
+ +
+ +	mutex_lock(&mem_sysfs_mutex);
+ +
+ +	/*
+ +	 * Some users of the memory hotplug do not want/need memblock to
+ +	 * track all sections. Skip over those.
+ +	 */
+ +	mem = find_memory_block(section);
+ +	if (!mem)
+ +		goto out_unlock;
+ +
+ +	unregister_mem_sect_under_nodes(mem, __section_nr(section));
+ +
+ +	mem->section_count--;
+ +	if (mem->section_count == 0)
+ +		unregister_memory(mem);
+ +	else
+ +		put_device(&mem->dev);
+ +
+ +out_unlock:
+ +	mutex_unlock(&mem_sysfs_mutex);
+++=======
++ 	if (WARN_ON_ONCE(!IS_ALIGNED(start, memory_block_size_bytes()) ||
++ 			 !IS_ALIGNED(size, memory_block_size_bytes())))
++ 		return -EINVAL;
++ 
++ 	for (block_id = start_block_id; block_id != end_block_id; block_id++) {
++ 		ret = init_memory_block(&mem, block_id, MEM_OFFLINE);
++ 		if (ret)
++ 			break;
++ 		mem->section_count = sections_per_block;
++ 	}
++ 	if (ret) {
++ 		end_block_id = block_id;
++ 		for (block_id = start_block_id; block_id != end_block_id;
++ 		     block_id++) {
++ 			mem = find_memory_block_by_id(block_id);
++ 			if (WARN_ON_ONCE(!mem))
++ 				continue;
++ 			mem->section_count = 0;
++ 			unregister_memory(mem);
++ 		}
++ 	}
++ 	return ret;
++ }
++ 
++ /*
++  * Remove memory block devices for the given memory area. Start and size
++  * have to be aligned to memory block granularity. Memory block devices
++  * have to be offline.
++  *
++  * Called under device_hotplug_lock.
++  */
++ void remove_memory_block_devices(unsigned long start, unsigned long size)
++ {
++ 	const unsigned long start_block_id = pfn_to_block_id(PFN_DOWN(start));
++ 	const unsigned long end_block_id = pfn_to_block_id(PFN_DOWN(start + size));
++ 	struct memory_block *mem;
++ 	unsigned long block_id;
++ 
++ 	if (WARN_ON_ONCE(!IS_ALIGNED(start, memory_block_size_bytes()) ||
++ 			 !IS_ALIGNED(size, memory_block_size_bytes())))
++ 		return;
++ 
++ 	for (block_id = start_block_id; block_id != end_block_id; block_id++) {
++ 		mem = find_memory_block_by_id(block_id);
++ 		if (WARN_ON_ONCE(!mem))
++ 			continue;
++ 		mem->section_count = 0;
++ 		unregister_memory_block_under_nodes(mem);
++ 		unregister_memory(mem);
++ 	}
+++>>>>>>> 848e19ad3c33 (drivers/base/memory.c: drop the mem_sysfs_mutex)
+  }
+ +#endif /* CONFIG_MEMORY_HOTREMOVE */
+  
+  /* return true if the memory block is offlined, otherwise, return false */
+  bool is_memblock_offlined(struct memory_block *mem)
+@@@ -797,36 -791,110 +858,79 @@@ static const struct attribute_group *me
+  };
+  
+  /*
+-  * Initialize the sysfs support for memory devices...
++  * Initialize the sysfs support for memory devices. At the time this function
++  * is called, we cannot have concurrent creation/deletion of memory block
++  * devices, the device_hotplug_lock is not needed.
+   */
+ -void __init memory_dev_init(void)
+ +int __init memory_dev_init(void)
+  {
+  	int ret;
+- 	int err;
+  	unsigned long block_sz, nr;
+  
+ -	/* Validate the configured memory block size */
+ -	block_sz = memory_block_size_bytes();
+ -	if (!is_power_of_2(block_sz) || block_sz < MIN_MEMORY_BLOCK_SIZE)
+ -		panic("Memory block size not suitable: 0x%lx\n", block_sz);
+ -	sections_per_block = block_sz / MIN_MEMORY_BLOCK_SIZE;
+ -
+  	ret = subsys_system_register(&memory_subsys, memory_root_attr_groups);
+  	if (ret)
+- 		goto out;
++ 		panic("%s() failed to register subsystem: %d\n", __func__, ret);
+  
+ +	block_sz = get_memory_block_size();
+ +	sections_per_block = block_sz / MIN_MEMORY_BLOCK_SIZE;
+ +
+  	/*
+  	 * Create entries for memory sections that were found
+  	 * during boot and have been initialized
+  	 */
+- 	mutex_lock(&mem_sysfs_mutex);
+  	for (nr = 0; nr <= __highest_present_section_nr;
+  	     nr += sections_per_block) {
+- 		err = add_memory_block(nr);
+- 		if (!ret)
+- 			ret = err;
++ 		ret = add_memory_block(nr);
++ 		if (ret)
++ 			panic("%s() failed to add memory block: %d\n", __func__,
++ 			      ret);
+  	}
+++<<<<<<< HEAD
+ +	mutex_unlock(&mem_sysfs_mutex);
+ +
+ +out:
+ +	if (ret)
+ +		printk(KERN_ERR "%s() failed: %d\n", __func__, ret);
+++=======
++ }
++ 
++ /**
++  * walk_memory_blocks - walk through all present memory blocks overlapped
++  *			by the range [start, start + size)
++  *
++  * @start: start address of the memory range
++  * @size: size of the memory range
++  * @arg: argument passed to func
++  * @func: callback for each memory section walked
++  *
++  * This function walks through all present memory blocks overlapped by the
++  * range [start, start + size), calling func on each memory block.
++  *
++  * In case func() returns an error, walking is aborted and the error is
++  * returned.
++  */
++ int walk_memory_blocks(unsigned long start, unsigned long size,
++ 		       void *arg, walk_memory_blocks_func_t func)
++ {
++ 	const unsigned long start_block_id = phys_to_block_id(start);
++ 	const unsigned long end_block_id = phys_to_block_id(start + size - 1);
++ 	struct memory_block *mem;
++ 	unsigned long block_id;
++ 	int ret = 0;
++ 
++ 	if (!size)
++ 		return 0;
++ 
++ 	for (block_id = start_block_id; block_id <= end_block_id; block_id++) {
++ 		mem = find_memory_block_by_id(block_id);
++ 		if (!mem)
++ 			continue;
++ 
++ 		ret = func(mem, arg);
++ 		put_device(&mem->dev);
++ 		if (ret)
++ 			break;
++ 	}
+++>>>>>>> 848e19ad3c33 (drivers/base/memory.c: drop the mem_sysfs_mutex)
+  	return ret;
+  }
+ -
+ -struct for_each_memory_block_cb_data {
+ -	walk_memory_blocks_func_t func;
+ -	void *arg;
+ -};
+ -
+ -static int for_each_memory_block_cb(struct device *dev, void *data)
+ -{
+ -	struct memory_block *mem = to_memory_block(dev);
+ -	struct for_each_memory_block_cb_data *cb_data = data;
+ -
+ -	return cb_data->func(mem, cb_data->arg);
+ -}
+ -
+ -/**
+ - * for_each_memory_block - walk through all present memory blocks
+ - *
+ - * @arg: argument passed to func
+ - * @func: callback for each memory block walked
+ - *
+ - * This function walks through all present memory blocks, calling func on
+ - * each memory block.
+ - *
+ - * In case func() returns an error, walking is aborted and the error is
+ - * returned.
+ - */
+ -int for_each_memory_block(void *arg, walk_memory_blocks_func_t func)
+ -{
+ -	struct for_each_memory_block_cb_data cb_data = {
+ -		.func = func,
+ -		.arg = arg,
+ -	};
+ -
+ -	return bus_for_each_dev(&memory_subsys, NULL, &cb_data,
+ -				for_each_memory_block_cb);
+ -}
+* Unmerged path drivers/base/memory.c
