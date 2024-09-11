@@ -1,0 +1,243 @@
+platform/x86: ISST: Add Intel Speed Select mailbox interface via PCI
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-193.el8
+Rebuild_CHGLOG: - [platform] x86: isst: Add Intel Speed Select mailbox interface via PCI (Prarit Bhargava) [1766228]
+Rebuild_FUZZ: 92.91%
+commit-author Srinivas Pandruvada <srinivas.pandruvada@linux.intel.com>
+commit 31a166fe9c269af17977e650846ee4ea50361c07
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-193.el8/31a166fe.failed
+
+Add an IOCTL to send mailbox commands to PUNIT using PUNIT PCI device.
+A limited set of mailbox commands can be sent to PUNIT.
+
+This MMIO interface is used by the intel-speed-select tool under
+tools/x86/power to enumerate and control Intel Speed Select features.
+The MBOX commands ids and semantics of the message can be checked from
+the source code of the tool.
+
+	Signed-off-by: Srinivas Pandruvada <srinivas.pandruvada@linux.intel.com>
+	Signed-off-by: Andy Shevchenko <andriy.shevchenko@linux.intel.com>
+(cherry picked from commit 31a166fe9c269af17977e650846ee4ea50361c07)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/platform/x86/intel_speed_select_if/Makefile
+#	drivers/platform/x86/intel_speed_select_if/isst_if_common.c
+#	drivers/platform/x86/intel_speed_select_if/isst_if_common.h
+#	include/uapi/linux/isst_if.h
+* Unmerged path drivers/platform/x86/intel_speed_select_if/Makefile
+* Unmerged path drivers/platform/x86/intel_speed_select_if/isst_if_common.c
+* Unmerged path drivers/platform/x86/intel_speed_select_if/isst_if_common.h
+* Unmerged path include/uapi/linux/isst_if.h
+* Unmerged path drivers/platform/x86/intel_speed_select_if/Makefile
+* Unmerged path drivers/platform/x86/intel_speed_select_if/isst_if_common.c
+* Unmerged path drivers/platform/x86/intel_speed_select_if/isst_if_common.h
+diff --git a/drivers/platform/x86/intel_speed_select_if/isst_if_mbox_pci.c b/drivers/platform/x86/intel_speed_select_if/isst_if_mbox_pci.c
+new file mode 100644
+index 000000000000..1c4f2893cd80
+--- /dev/null
++++ b/drivers/platform/x86/intel_speed_select_if/isst_if_mbox_pci.c
+@@ -0,0 +1,199 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * Intel Speed Select Interface: Mbox via PCI Interface
++ * Copyright (c) 2019, Intel Corporation.
++ * All rights reserved.
++ *
++ * Author: Srinivas Pandruvada <srinivas.pandruvada@linux.intel.com>
++ */
++
++#include <linux/cpufeature.h>
++#include <linux/module.h>
++#include <linux/pci.h>
++#include <linux/sched/signal.h>
++#include <linux/uaccess.h>
++#include <uapi/linux/isst_if.h>
++
++#include "isst_if_common.h"
++
++#define PUNIT_MAILBOX_DATA		0xA0
++#define PUNIT_MAILBOX_INTERFACE		0xA4
++#define PUNIT_MAILBOX_BUSY_BIT		31
++
++/*
++ * Commands has variable amount of processing time. Most of the commands will
++ * be done in 0-3 tries, but some takes up to 50.
++ * The real processing time was observed as 25us for the most of the commands
++ * at 2GHz. It is possible to optimize this count taking samples on customer
++ * systems.
++ */
++#define OS_MAILBOX_RETRY_COUNT		50
++
++struct isst_if_device {
++	struct mutex mutex;
++};
++
++static int isst_if_mbox_cmd(struct pci_dev *pdev,
++			    struct isst_if_mbox_cmd *mbox_cmd)
++{
++	u32 retries, data;
++	int ret;
++
++	/* Poll for rb bit == 0 */
++	retries = OS_MAILBOX_RETRY_COUNT;
++	do {
++		ret = pci_read_config_dword(pdev, PUNIT_MAILBOX_INTERFACE,
++					    &data);
++		if (ret)
++			return ret;
++
++		if (data & BIT_ULL(PUNIT_MAILBOX_BUSY_BIT)) {
++			ret = -EBUSY;
++			continue;
++		}
++		ret = 0;
++		break;
++	} while (--retries);
++
++	if (ret)
++		return ret;
++
++	/* Write DATA register */
++	ret = pci_write_config_dword(pdev, PUNIT_MAILBOX_DATA,
++				     mbox_cmd->req_data);
++	if (ret)
++		return ret;
++
++	/* Write command register */
++	data = BIT_ULL(PUNIT_MAILBOX_BUSY_BIT) |
++		      (mbox_cmd->parameter & GENMASK_ULL(13, 0)) << 16 |
++		      (mbox_cmd->sub_command << 8) |
++		      mbox_cmd->command;
++
++	ret = pci_write_config_dword(pdev, PUNIT_MAILBOX_INTERFACE, data);
++	if (ret)
++		return ret;
++
++	/* Poll for rb bit == 0 */
++	retries = OS_MAILBOX_RETRY_COUNT;
++	do {
++		ret = pci_read_config_dword(pdev, PUNIT_MAILBOX_INTERFACE,
++					    &data);
++		if (ret)
++			return ret;
++
++		if (data & BIT_ULL(PUNIT_MAILBOX_BUSY_BIT)) {
++			ret = -EBUSY;
++			continue;
++		}
++
++		if (data & 0xff)
++			return -ENXIO;
++
++		ret = pci_read_config_dword(pdev, PUNIT_MAILBOX_DATA, &data);
++		if (ret)
++			return ret;
++
++		mbox_cmd->resp_data = data;
++		ret = 0;
++		break;
++	} while (--retries);
++
++	return ret;
++}
++
++static long isst_if_mbox_proc_cmd(u8 *cmd_ptr, int *write_only, int resume)
++{
++	struct isst_if_mbox_cmd *mbox_cmd;
++	struct isst_if_device *punit_dev;
++	struct pci_dev *pdev;
++	int ret;
++
++	mbox_cmd = (struct isst_if_mbox_cmd *)cmd_ptr;
++
++	if (isst_if_mbox_cmd_invalid(mbox_cmd))
++		return -EINVAL;
++
++	if (isst_if_mbox_cmd_set_req(mbox_cmd) && !capable(CAP_SYS_ADMIN))
++		return -EPERM;
++
++	pdev = isst_if_get_pci_dev(mbox_cmd->logical_cpu, 1, 30, 1);
++	if (!pdev)
++		return -EINVAL;
++
++	punit_dev = pci_get_drvdata(pdev);
++	if (!punit_dev)
++		return -EINVAL;
++
++	/*
++	 * Basically we are allowing one complete mailbox transaction on
++	 * a mapped PCI device at a time.
++	 */
++	mutex_lock(&punit_dev->mutex);
++	ret = isst_if_mbox_cmd(pdev, mbox_cmd);
++	mutex_unlock(&punit_dev->mutex);
++	if (ret)
++		return ret;
++
++	*write_only = 0;
++
++	return 0;
++}
++
++static const struct pci_device_id isst_if_mbox_ids[] = {
++	{ PCI_DEVICE(PCI_VENDOR_ID_INTEL, INTEL_CFG_MBOX_DEVID_0)},
++	{ 0 },
++};
++MODULE_DEVICE_TABLE(pci, isst_if_mbox_ids);
++
++static int isst_if_mbox_probe(struct pci_dev *pdev,
++			      const struct pci_device_id *ent)
++{
++	struct isst_if_device *punit_dev;
++	struct isst_if_cmd_cb cb;
++	int ret;
++
++	punit_dev = devm_kzalloc(&pdev->dev, sizeof(*punit_dev), GFP_KERNEL);
++	if (!punit_dev)
++		return -ENOMEM;
++
++	ret = pcim_enable_device(pdev);
++	if (ret)
++		return ret;
++
++	mutex_init(&punit_dev->mutex);
++	pci_set_drvdata(pdev, punit_dev);
++
++	memset(&cb, 0, sizeof(cb));
++	cb.cmd_size = sizeof(struct isst_if_mbox_cmd);
++	cb.offset = offsetof(struct isst_if_mbox_cmds, mbox_cmd);
++	cb.cmd_callback = isst_if_mbox_proc_cmd;
++	cb.owner = THIS_MODULE;
++	ret = isst_if_cdev_register(ISST_IF_DEV_MBOX, &cb);
++
++	if (ret)
++		mutex_destroy(&punit_dev->mutex);
++
++	return ret;
++}
++
++static void isst_if_mbox_remove(struct pci_dev *pdev)
++{
++	struct isst_if_device *punit_dev;
++
++	punit_dev = pci_get_drvdata(pdev);
++	isst_if_cdev_unregister(ISST_IF_DEV_MBOX);
++	mutex_destroy(&punit_dev->mutex);
++}
++
++static struct pci_driver isst_if_pci_driver = {
++	.name			= "isst_if_mbox_pci",
++	.id_table		= isst_if_mbox_ids,
++	.probe			= isst_if_mbox_probe,
++	.remove			= isst_if_mbox_remove,
++};
++
++module_pci_driver(isst_if_pci_driver);
++
++MODULE_LICENSE("GPL v2");
++MODULE_DESCRIPTION("Intel speed select interface pci mailbox driver");
+* Unmerged path include/uapi/linux/isst_if.h
