@@ -1643,8 +1643,10 @@ int kvm_arch_init(void *opaque)
 		return -ENODEV;
 	}
 
-	if (!kvm_arch_check_sve_has_vhe()) {
-		kvm_pr_unimpl("SVE system without VHE unsupported.  Broken cpu?");
+	in_hyp_mode = is_kernel_in_hyp_mode();
+
+	if (!in_hyp_mode && kvm_arch_requires_vhe()) {
+		kvm_pr_unimpl("CPU unsupported in non-VHE mode, not initializing\n");
 		return -ENODEV;
 	}
 
@@ -1659,8 +1661,6 @@ int kvm_arch_init(void *opaque)
 	err = init_common_resources();
 	if (err)
 		return err;
-
-	in_hyp_mode = is_kernel_in_hyp_mode();
 
 	if (!in_hyp_mode) {
 		err = init_hyp_mode();
