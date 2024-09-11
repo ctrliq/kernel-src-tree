@@ -1,0 +1,573 @@
+cpuidle: Use nanoseconds as the unit of time
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Rafael J. Wysocki <rafael.j.wysocki@intel.com>
+commit c1d51f684c72b5eb2aecbbd47be3a2977a2dc903
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/c1d51f68.failed
+
+Currently, the cpuidle subsystem uses microseconds as the unit of
+time which (among other things) causes the idle loop to incur some
+integer division overhead for no clear benefit.
+
+In order to allow cpuidle to measure time in nanoseconds, add two
+new fields, exit_latency_ns and target_residency_ns, to represent the
+exit latency and target residency of an idle state in nanoseconds,
+respectively, to struct cpuidle_state and initialize them with the
+help of the corresponding values in microseconds provided by drivers.
+Additionally, change cpuidle_governor_latency_req() to return the
+idle state exit latency constraint in nanoseconds.
+
+Also meeasure idle state residency (last_residency_ns in struct
+cpuidle_device and time_ns in struct cpuidle_driver) in nanoseconds
+and update the cpuidle core and governors accordingly.
+
+However, the menu governor still computes typical intervals in
+microseconds to avoid integer overflows.
+
+	Signed-off-by: Rafael J. Wysocki <rafael.j.wysocki@intel.com>
+	Acked-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+	Acked-by: Doug Smythies <dsmythies@telus.net>
+	Tested-by: Doug Smythies <dsmythies@telus.net>
+(cherry picked from commit c1d51f684c72b5eb2aecbbd47be3a2977a2dc903)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/cpuidle/cpuidle.c
+#	drivers/cpuidle/governors/ladder.c
+#	drivers/cpuidle/governors/menu.c
+#	drivers/cpuidle/governors/teo.c
+#	drivers/cpuidle/sysfs.c
+#	include/linux/cpuidle.h
+diff --cc drivers/cpuidle/cpuidle.c
+index 08b37025da09,bf9b030cd7e1..000000000000
+--- a/drivers/cpuidle/cpuidle.c
++++ b/drivers/cpuidle/cpuidle.c
+@@@ -84,15 -84,15 +84,23 @@@ static int find_deepest_state(struct cp
+  
+  	for (i = 1; i < drv->state_count; i++) {
+  		struct cpuidle_state *s = &drv->states[i];
+ -
+ +		struct cpuidle_state_usage *su = &dev->states_usage[i];
+ +
+++<<<<<<< HEAD
+ +		if (s->disabled || su->disable || s->exit_latency <= latency_req
+ +		    || s->exit_latency > max_latency
+ +		    || (s->flags & forbidden_flags)
+ +		    || (s2idle && !s->enter_s2idle))
+++=======
++ 		if (dev->states_usage[i].disable ||
++ 		    s->exit_latency_ns <= latency_req ||
++ 		    s->exit_latency_ns > max_latency_ns ||
++ 		    (s->flags & forbidden_flags) ||
++ 		    (s2idle && !s->enter_s2idle))
+++>>>>>>> c1d51f684c72 (cpuidle: Use nanoseconds as the unit of time)
+  			continue;
+  
+- 		latency_req = s->exit_latency;
++ 		latency_req = s->exit_latency_ns;
+  		ret = i;
+  	}
+  	return ret;
+@@@ -255,18 -255,15 +263,16 @@@ int cpuidle_enter_state(struct cpuidle_
+  		 * This can be moved to within driver enter routine,
+  		 * but that results in multiple copies of same code.
+  		 */
+- 		diff = ktime_us_delta(time_end, time_start);
+- 		if (diff > INT_MAX)
+- 			diff = INT_MAX;
++ 		diff = ktime_sub(time_end, time_start);
+  
+- 		dev->last_residency = (int)diff;
+- 		dev->states_usage[entered_state].time += dev->last_residency;
++ 		dev->last_residency_ns = diff;
++ 		dev->states_usage[entered_state].time_ns += diff;
+  		dev->states_usage[entered_state].usage++;
+  
+- 		if (diff < drv->states[entered_state].target_residency) {
++ 		if (diff < drv->states[entered_state].target_residency_ns) {
+  			for (i = entered_state - 1; i >= 0; i--) {
+ -				if (dev->states_usage[i].disable)
+ +				if (drv->states[i].disabled ||
+ +				    dev->states_usage[i].disable)
+  					continue;
+  
+  				/* Shallower states are enabled, so update. */
+@@@ -283,8 -279,8 +289,13 @@@
+  				 * Update if a deeper state would have been a
+  				 * better match for the observed idle duration.
+  				 */
+++<<<<<<< HEAD
+ +				if (diff - delay >= drv->states[i].target_residency)
+ +					dev->rh_cpuidle_dev.rh_states_usage[entered_state].below++;
+++=======
++ 				if (diff - delay >= drv->states[i].target_residency_ns)
++ 					dev->states_usage[entered_state].below++;
+++>>>>>>> c1d51f684c72 (cpuidle: Use nanoseconds as the unit of time)
+  
+  				break;
+  			}
+@@@ -382,15 -376,15 +393,15 @@@ u64 cpuidle_poll_time(struct cpuidle_dr
+  
+  	limit_ns = TICK_NSEC;
+  	for (i = 1; i < drv->state_count; i++) {
+ -		if (dev->states_usage[i].disable)
+ +		if (drv->states[i].disabled || dev->states_usage[i].disable)
+  			continue;
+  
+- 		limit_ns = (u64)drv->states[i].target_residency * NSEC_PER_USEC;
++ 		limit_ns = (u64)drv->states[i].target_residency_ns;
+  	}
+  
+ -	dev->poll_limit_ns = limit_ns;
+ +	dev->rh_cpuidle_dev.poll_limit_ns = limit_ns;
+  
+ -	return dev->poll_limit_ns;
+ +	return dev->rh_cpuidle_dev.poll_limit_ns;
+  }
+  
+  /**
+@@@ -556,8 -550,8 +567,13 @@@ static void __cpuidle_unregister_device
+  static void __cpuidle_device_init(struct cpuidle_device *dev)
+  {
+  	memset(dev->states_usage, 0, sizeof(dev->states_usage));
+++<<<<<<< HEAD
+ +	dev->last_residency = 0;
+ +	dev->rh_cpuidle_dev.next_hrtimer = 0;
+++=======
++ 	dev->last_residency_ns = 0;
++ 	dev->next_hrtimer = 0;
+++>>>>>>> c1d51f684c72 (cpuidle: Use nanoseconds as the unit of time)
+  }
+  
+  /**
+diff --cc drivers/cpuidle/governors/ladder.c
+index c14d41115d95,8e9058c4ea63..000000000000
+--- a/drivers/cpuidle/governors/ladder.c
++++ b/drivers/cpuidle/governors/ladder.c
+@@@ -68,9 -68,10 +68,14 @@@ static int ladder_select_state(struct c
+  {
+  	struct ladder_device *ldev = this_cpu_ptr(&ladder_devices);
+  	struct ladder_device_state *last_state;
+++<<<<<<< HEAD
+ +	int last_residency, last_idx = dev->rh_cpuidle_dev.last_state_idx;
+++=======
++ 	int last_idx = dev->last_state_idx;
+++>>>>>>> c1d51f684c72 (cpuidle: Use nanoseconds as the unit of time)
+  	int first_idx = drv->states[0].flags & CPUIDLE_FLAG_POLLING ? 1 : 0;
+- 	int latency_req = cpuidle_governor_latency_req(dev->cpu);
++ 	s64 latency_req = cpuidle_governor_latency_req(dev->cpu);
++ 	s64 last_residency;
+  
+  	/* Special case when user has set very strict latency requirement */
+  	if (unlikely(latency_req == 0)) {
+@@@ -84,10 -85,9 +89,10 @@@
+  
+  	/* consider promotion */
+  	if (last_idx < drv->state_count - 1 &&
+ +	    !drv->states[last_idx + 1].disabled &&
+  	    !dev->states_usage[last_idx + 1].disable &&
+- 	    last_residency > last_state->threshold.promotion_time &&
+- 	    drv->states[last_idx + 1].exit_latency <= latency_req) {
++ 	    last_residency > last_state->threshold.promotion_time_ns &&
++ 	    drv->states[last_idx + 1].exit_latency_ns <= latency_req) {
+  		last_state->stats.promotion_count++;
+  		last_state->stats.demotion_count = 0;
+  		if (last_state->stats.promotion_count >= last_state->threshold.promotion_count) {
+@@@ -98,9 -98,8 +103,14 @@@
+  
+  	/* consider demotion */
+  	if (last_idx > first_idx &&
+++<<<<<<< HEAD
+ +	    (drv->states[last_idx].disabled ||
+ +	    dev->states_usage[last_idx].disable ||
+ +	    drv->states[last_idx].exit_latency > latency_req)) {
+++=======
++ 	    (dev->states_usage[last_idx].disable ||
++ 	    drv->states[last_idx].exit_latency_ns > latency_req)) {
+++>>>>>>> c1d51f684c72 (cpuidle: Use nanoseconds as the unit of time)
+  		int i;
+  
+  		for (i = last_idx - 1; i > first_idx; i--) {
+diff --cc drivers/cpuidle/governors/menu.c
+index eb8d504270ad,b0a7ad566081..000000000000
+--- a/drivers/cpuidle/governors/menu.c
++++ b/drivers/cpuidle/governors/menu.c
+@@@ -292,15 -280,15 +282,21 @@@ static int menu_select(struct cpuidle_d
+  	}
+  
+  	/* determine the expected residency time, round up */
+- 	data->next_timer_us = ktime_to_us(tick_nohz_get_sleep_length(&delta_next));
++ 	data->next_timer_ns = tick_nohz_get_sleep_length(&delta_next);
+  
+  	nr_iowaiters = nr_iowait_cpu(dev->cpu);
+- 	data->bucket = which_bucket(data->next_timer_us, nr_iowaiters);
++ 	data->bucket = which_bucket(data->next_timer_ns, nr_iowaiters);
+  
+  	if (unlikely(drv->state_count <= 1 || latency_req == 0) ||
+++<<<<<<< HEAD
+ +	    ((data->next_timer_us < drv->states[1].target_residency ||
+ +	      latency_req < drv->states[1].exit_latency) &&
+ +	     !drv->states[0].disabled && !dev->states_usage[0].disable)) {
+++=======
++ 	    ((data->next_timer_ns < drv->states[1].target_residency_ns ||
++ 	      latency_req < drv->states[1].exit_latency_ns) &&
++ 	     !dev->states_usage[0].disable)) {
+++>>>>>>> c1d51f684c72 (cpuidle: Use nanoseconds as the unit of time)
+  		/*
+  		 * In this case state[0] will be used no matter what, so return
+  		 * it right away and keep the tick running if state[0] is a
+@@@ -463,9 -445,9 +455,9 @@@ static void menu_reflect(struct cpuidle
+  static void menu_update(struct cpuidle_driver *drv, struct cpuidle_device *dev)
+  {
+  	struct menu_device *data = this_cpu_ptr(&menu_devices);
+ -	int last_idx = dev->last_state_idx;
+ +	int last_idx = dev->rh_cpuidle_dev.last_state_idx;
+  	struct cpuidle_state *target = &drv->states[last_idx];
+- 	unsigned int measured_us;
++ 	u64 measured_ns;
+  	unsigned int new_factor;
+  
+  	/*
+diff --cc drivers/cpuidle/governors/teo.c
+index 14c400228920,ecbcfaefb0cd..000000000000
+--- a/drivers/cpuidle/governors/teo.c
++++ b/drivers/cpuidle/governors/teo.c
+@@@ -127,13 -126,11 +126,17 @@@ static void teo_update(struct cpuidle_d
+  		 * enough to the closest timer event expected at the idle state
+  		 * selection time to be discarded.
+  		 */
+- 		measured_us = UINT_MAX;
++ 		measured_ns = U64_MAX;
+  	} else {
+- 		unsigned int lat;
++ 		u64 lat_ns = drv->states[dev->last_state_idx].exit_latency_ns;
+  
+++<<<<<<< HEAD
+ +		lat = drv->states[dev->rh_cpuidle_dev.last_state_idx].exit_latency;
+ +
+ +		measured_us = ktime_to_us(cpu_data->time_span_ns);
+++=======
++ 		measured_ns = cpu_data->time_span_ns;
+++>>>>>>> c1d51f684c72 (cpuidle: Use nanoseconds as the unit of time)
+  		/*
+  		 * The delay between the wakeup and the first instruction
+  		 * executed by the CPU is not likely to be worst-case every
+@@@ -232,14 -229,15 +235,21 @@@ static int teo_select(struct cpuidle_dr
+  		      bool *stop_tick)
+  {
+  	struct teo_cpu *cpu_data = per_cpu_ptr(&teo_cpus, dev->cpu);
+++<<<<<<< HEAD
+ +	int latency_req = cpuidle_governor_latency_req(dev->cpu);
+ +	unsigned int duration_us, hits, misses, early_hits;
+ +	int max_early_idx, prev_max_early_idx, constraint_idx, idx, i;
+++=======
++ 	s64 latency_req = cpuidle_governor_latency_req(dev->cpu);
++ 	u64 duration_ns;
++ 	unsigned int hits, misses, early_hits;
++ 	int max_early_idx, constraint_idx, idx, i;
+++>>>>>>> c1d51f684c72 (cpuidle: Use nanoseconds as the unit of time)
+  	ktime_t delta_tick;
+  
+ -	if (dev->last_state_idx >= 0) {
+ +	if (dev->rh_cpuidle_dev.last_state_idx >= 0) {
+  		teo_update(drv, dev);
+ -		dev->last_state_idx = -1;
+ +		dev->rh_cpuidle_dev.last_state_idx = -1;
+  	}
+  
+  	cpu_data->time_span_ns = local_clock();
+@@@ -303,8 -299,7 +313,12 @@@
+  			 * shallow for that role.
+  			 */
+  			if (!(tick_nohz_tick_stopped() &&
+++<<<<<<< HEAD
+ +			      drv->states[idx].target_residency < TICK_USEC)) {
+ +				prev_max_early_idx = max_early_idx;
+++=======
++ 			      drv->states[idx].target_residency_ns < TICK_NSEC)) {
+++>>>>>>> c1d51f684c72 (cpuidle: Use nanoseconds as the unit of time)
+  				early_hits = cpu_data->states[i].early_hits;
+  				max_early_idx = idx;
+  			}
+@@@ -330,8 -325,7 +344,12 @@@
+  
+  		if (early_hits < cpu_data->states[i].early_hits &&
+  		    !(tick_nohz_tick_stopped() &&
+++<<<<<<< HEAD
+ +		      drv->states[i].target_residency < TICK_USEC)) {
+ +			prev_max_early_idx = max_early_idx;
+++=======
++ 		      drv->states[i].target_residency_ns < TICK_NSEC)) {
+++>>>>>>> c1d51f684c72 (cpuidle: Use nanoseconds as the unit of time)
+  			early_hits = cpu_data->states[i].early_hits;
+  			max_early_idx = i;
+  		}
+@@@ -345,19 -339,9 +363,25 @@@
+  	 * "early hits" metric, but if that cannot be determined, just use the
+  	 * state selected so far.
+  	 */
+++<<<<<<< HEAD
+ +	if (hits <= misses) {
+ +		/*
+ +		 * The current candidate state is not suitable, so take the one
+ +		 * whose "early hits" metric is the maximum for the range of
+ +		 * shallower states.
+ +		 */
+ +		if (idx == max_early_idx)
+ +			max_early_idx = prev_max_early_idx;
+ +
+ +		if (max_early_idx >= 0) {
+ +			idx = max_early_idx;
+ +			duration_us = drv->states[idx].target_residency_ns;
+ +		}
+++=======
++ 	if (hits <= misses && max_early_idx >= 0) {
++ 		idx = max_early_idx;
++ 		duration_ns = drv->states[idx].target_residency_ns;
+++>>>>>>> c1d51f684c72 (cpuidle: Use nanoseconds as the unit of time)
+  	}
+  
+  	/*
+diff --cc drivers/cpuidle/sysfs.c
+index 3bd044148a96,38ef770be90d..000000000000
+--- a/drivers/cpuidle/sysfs.c
++++ b/drivers/cpuidle/sysfs.c
+@@@ -311,17 -273,59 +311,66 @@@ static ssize_t show_state_##_name(struc
+  	return sprintf(buf, "%s\n", state->_name);\
+  }
+  
+- define_show_state_function(exit_latency)
+- define_show_state_function(target_residency)
++ #define define_show_state_time_function(_name) \
++ static ssize_t show_state_##_name(struct cpuidle_state *state, \
++ 				  struct cpuidle_state_usage *state_usage, \
++ 				  char *buf) \
++ { \
++ 	return sprintf(buf, "%llu\n", ktime_to_us(state->_name##_ns)); \
++ }
++ 
++ define_show_state_time_function(exit_latency)
++ define_show_state_time_function(target_residency)
+  define_show_state_function(power_usage)
+  define_show_state_ull_function(usage)
+- define_show_state_ull_function(time)
+  define_show_state_str_function(name)
+  define_show_state_str_function(desc)
+++<<<<<<< HEAD
+ +define_show_state_ull_function(disable)
+ +define_store_state_ull_function(disable)
+ +define_show_state_rh_ull_function(above)
+ +define_show_state_rh_ull_function(below)
+++=======
++ define_show_state_ull_function(above)
++ define_show_state_ull_function(below)
++ 
++ static ssize_t show_state_time(struct cpuidle_state *state,
++ 			       struct cpuidle_state_usage *state_usage,
++ 			       char *buf)
++ {
++ 	return sprintf(buf, "%llu\n", ktime_to_us(state_usage->time_ns));
++ }
++ 
++ static ssize_t show_state_disable(struct cpuidle_state *state,
++ 				  struct cpuidle_state_usage *state_usage,
++ 				  char *buf)
++ {
++ 	return sprintf(buf, "%llu\n",
++ 		       state_usage->disable & CPUIDLE_STATE_DISABLED_BY_USER);
++ }
++ 
++ static ssize_t store_state_disable(struct cpuidle_state *state,
++ 				   struct cpuidle_state_usage *state_usage,
++ 				   const char *buf, size_t size)
++ {
++ 	unsigned int value;
++ 	int err;
++ 
++ 	if (!capable(CAP_SYS_ADMIN))
++ 		return -EPERM;
++ 
++ 	err = kstrtouint(buf, 0, &value);
++ 	if (err)
++ 		return err;
++ 
++ 	if (value)
++ 		state_usage->disable |= CPUIDLE_STATE_DISABLED_BY_USER;
++ 	else
++ 		state_usage->disable &= ~CPUIDLE_STATE_DISABLED_BY_USER;
++ 
++ 	return size;
++ }
+++>>>>>>> c1d51f684c72 (cpuidle: Use nanoseconds as the unit of time)
+  
+  define_one_state_ro(name, show_state_name);
+  define_one_state_ro(desc, show_state_desc);
+diff --cc include/linux/cpuidle.h
+index a24a6cef6983,22602747f468..000000000000
+--- a/include/linux/cpuidle.h
++++ b/include/linux/cpuidle.h
+@@@ -33,7 -32,12 +33,13 @@@ struct cpuidle_driver
+  struct cpuidle_state_usage {
+  	unsigned long long	disable;
+  	unsigned long long	usage;
+++<<<<<<< HEAD
+ +	unsigned long long	time; /* in US */
+++=======
++ 	u64			time_ns;
++ 	unsigned long long	above; /* Number of times it's been too deep */
++ 	unsigned long long	below; /* Number of times it's been too shallow */
+++>>>>>>> c1d51f684c72 (cpuidle: Use nanoseconds as the unit of time)
+  #ifdef CONFIG_SUSPEND
+  	unsigned long long	s2idle_usage;
+  	unsigned long long	s2idle_time; /* in US */
+@@@ -113,11 -86,13 +121,17 @@@ struct cpuidle_device 
+  	unsigned int		registered:1;
+  	unsigned int		enabled:1;
+  	unsigned int		use_deepest_state:1;
+ -	unsigned int		poll_time_limit:1;
+ +	RH_KABI_FILL_HOLE(unsigned int             poll_time_limit:1)
+  	unsigned int		cpu;
+ -	ktime_t			next_hrtimer;
+  
+++<<<<<<< HEAD
+ +	int			last_residency;
+ +	RH_KABI_FILL_HOLE(int			last_state_idx)
+++=======
++ 	int			last_state_idx;
++ 	u64			last_residency_ns;
++ 	u64			poll_limit_ns;
+++>>>>>>> c1d51f684c72 (cpuidle: Use nanoseconds as the unit of time)
+  	struct cpuidle_state_usage	states_usage[CPUIDLE_STATE_MAX];
+  	struct cpuidle_state_kobj *kobjs[CPUIDLE_STATE_MAX];
+  	struct cpuidle_driver_kobj *kobj_driver;
+* Unmerged path drivers/cpuidle/cpuidle.c
+diff --git a/drivers/cpuidle/driver.c b/drivers/cpuidle/driver.c
+index 1dfb0518a1b3..60d78ba13c63 100644
+--- a/drivers/cpuidle/driver.c
++++ b/drivers/cpuidle/driver.c
+@@ -165,16 +165,27 @@ static void __cpuidle_driver_init(struct cpuidle_driver *drv)
+ 	if (!drv->cpumask)
+ 		drv->cpumask = (struct cpumask *)cpu_possible_mask;
+ 
+-	/*
+-	 * Look for the timer stop flag in the different states, so that we know
+-	 * if the broadcast timer has to be set up.  The loop is in the reverse
+-	 * order, because usually one of the deeper states have this flag set.
+-	 */
+-	for (i = drv->state_count - 1; i >= 0 ; i--) {
+-		if (drv->states[i].flags & CPUIDLE_FLAG_TIMER_STOP) {
++	for (i = 0; i < drv->state_count; i++) {
++		struct cpuidle_state *s = &drv->states[i];
++
++		/*
++		 * Look for the timer stop flag in the different states and if
++		 * it is found, indicate that the broadcast timer has to be set
++		 * up.
++		 */
++		if (s->flags & CPUIDLE_FLAG_TIMER_STOP)
+ 			drv->bctimer = 1;
+-			break;
+-		}
++
++		/*
++		 * The core will use the target residency and exit latency
++		 * values in nanoseconds, but allow drivers to provide them in
++		 * microseconds too.
++		 */
++		if (s->target_residency > 0)
++			s->target_residency_ns = s->target_residency * NSEC_PER_USEC;
++
++		if (s->exit_latency > 0)
++			s->exit_latency_ns = s->exit_latency * NSEC_PER_USEC;
+ 	}
+ }
+ 
+diff --git a/drivers/cpuidle/governor.c b/drivers/cpuidle/governor.c
+index d36078f5bfc1..29acaf48e575 100644
+--- a/drivers/cpuidle/governor.c
++++ b/drivers/cpuidle/governor.c
+@@ -107,11 +107,14 @@ int cpuidle_register_governor(struct cpuidle_governor *gov)
+  * cpuidle_governor_latency_req - Compute a latency constraint for CPU
+  * @cpu: Target CPU
+  */
+-int cpuidle_governor_latency_req(unsigned int cpu)
++s64 cpuidle_governor_latency_req(unsigned int cpu)
+ {
+ 	struct device *device = get_cpu_device(cpu);
+ 	int device_req = dev_pm_qos_raw_resume_latency(device);
+ 	int global_req = cpu_latency_qos_limit();
+ 
+-	return device_req < global_req ? device_req : global_req;
++	if (device_req > global_req)
++		device_req = global_req;
++
++	return (s64)device_req * NSEC_PER_USEC;
+ }
+diff --git a/drivers/cpuidle/governors/haltpoll.c b/drivers/cpuidle/governors/haltpoll.c
+index eef57bc0e1a1..16bb437cfce0 100644
+--- a/drivers/cpuidle/governors/haltpoll.c
++++ b/drivers/cpuidle/governors/haltpoll.c
+@@ -49,7 +49,7 @@ static int haltpoll_select(struct cpuidle_driver *drv,
+ 			   struct cpuidle_device *dev,
+ 			   bool *stop_tick)
+ {
+-	int latency_req = cpuidle_governor_latency_req(dev->cpu);
++	s64 latency_req = cpuidle_governor_latency_req(dev->cpu);
+ 
+ 	if (!drv->state_count || latency_req == 0) {
+ 		*stop_tick = false;
+@@ -75,10 +75,9 @@ static int haltpoll_select(struct cpuidle_driver *drv,
+ 	return 0;
+ }
+ 
+-static void adjust_poll_limit(struct cpuidle_device *dev, unsigned int block_us)
++static void adjust_poll_limit(struct cpuidle_device *dev, u64 block_ns)
+ {
+ 	unsigned int val;
+-	u64 block_ns = block_us*NSEC_PER_USEC;
+ 
+ 	/* Grow cpu_halt_poll_us if
+ 	 * cpu_halt_poll_us < block_ns < guest_halt_poll_us
+@@ -115,7 +114,7 @@ static void haltpoll_reflect(struct cpuidle_device *dev, int index)
+ 	dev->last_state_idx = index;
+ 
+ 	if (index != 0)
+-		adjust_poll_limit(dev, dev->last_residency);
++		adjust_poll_limit(dev, dev->last_residency_ns);
+ }
+ 
+ /**
+* Unmerged path drivers/cpuidle/governors/ladder.c
+* Unmerged path drivers/cpuidle/governors/menu.c
+* Unmerged path drivers/cpuidle/governors/teo.c
+diff --git a/drivers/cpuidle/poll_state.c b/drivers/cpuidle/poll_state.c
+index c8459fdb28e8..326a884cfda8 100644
+--- a/drivers/cpuidle/poll_state.c
++++ b/drivers/cpuidle/poll_state.c
+@@ -50,6 +50,8 @@ void cpuidle_poll_state_init(struct cpuidle_driver *drv)
+ 	snprintf(state->desc, CPUIDLE_DESC_LEN, "CPUIDLE CORE POLL IDLE");
+ 	state->exit_latency = 0;
+ 	state->target_residency = 0;
++	state->exit_latency_ns = 0;
++	state->target_residency_ns = 0;
+ 	state->power_usage = -1;
+ 	state->enter = poll_idle;
+ 	state->disabled = false;
+* Unmerged path drivers/cpuidle/sysfs.c
+* Unmerged path include/linux/cpuidle.h
+diff --git a/kernel/sched/idle.c b/kernel/sched/idle.c
+index b77157291d47..67deaca47c1e 100644
+--- a/kernel/sched/idle.c
++++ b/kernel/sched/idle.c
+@@ -103,7 +103,7 @@ static int call_cpuidle(struct cpuidle_driver *drv, struct cpuidle_device *dev,
+ 	 * update no idle residency and return.
+ 	 */
+ 	if (current_clr_polling_and_test()) {
+-		dev->last_residency = 0;
++		dev->last_residency_ns = 0;
+ 		local_irq_enable();
+ 		return -EBUSY;
+ 	}
