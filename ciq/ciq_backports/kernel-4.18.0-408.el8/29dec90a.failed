@@ -1,0 +1,222 @@
+dm: fix bio_set allocation
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-408.el8
+commit-author Christoph Hellwig <hch@lst.de>
+commit 29dec90a0f1d961b93f34f910e9319d8cb23edbd
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-408.el8/29dec90a.failed
+
+The use of bioset_init_from_src mean that the pre-allocated pools weren't
+used for anything except parameter passing, and the integrity pool
+creation got completely lost for the actual live mapped_device.  Fix that
+by assigning the actual preallocated dm_md_mempools to the mapped_device
+and using that for I/O instead of creating new mempools.
+
+Fixes: 2a2a4c510b76 ("dm: use bioset_init_from_src() to copy bio_set")
+	Signed-off-by: Christoph Hellwig <hch@lst.de>
+	Signed-off-by: Mike Snitzer <snitzer@kernel.org>
+(cherry picked from commit 29dec90a0f1d961b93f34f910e9319d8cb23edbd)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/md/dm.c
+#	drivers/md/dm.h
+diff --cc drivers/md/dm.c
+index e7cb1b8972bd,8b21155d3c4f..000000000000
+--- a/drivers/md/dm.c
++++ b/drivers/md/dm.c
+@@@ -601,12 -573,13 +593,18 @@@ static struct dm_io *alloc_io(struct ma
+  	struct dm_target_io *tio;
+  	struct bio *clone;
+  
+++<<<<<<< HEAD
+ +	clone = bio_alloc_bioset(GFP_NOIO, 0, &md->io_bs);
+ +	if (!clone)
+ +		return NULL;
+++=======
++ 	clone = bio_alloc_clone(NULL, bio, GFP_NOIO, &md->mempools->io_bs);
++ 	/* Set default bdev, but target must bio_set_dev() before issuing IO */
++ 	clone->bi_bdev = md->disk->part0;
+++>>>>>>> 29dec90a0f1d (dm: fix bio_set allocation)
+  
+ -	tio = clone_to_tio(clone);
+ -	tio->flags = 0;
+ -	dm_tio_set_flag(tio, DM_TIO_INSIDE_DM_IO);
+ +	tio = container_of(clone, struct dm_target_io, clone);
+ +	tio->inside_dm_io = true;
+  	tio->io = NULL;
+  
+  	io = container_of(tio, struct dm_io, tio);
+@@@ -638,13 -615,23 +636,20 @@@ static struct dm_target_io *alloc_tio(s
+  	if (!ci->io->tio.io) {
+  		/* the dm_target_io embedded in ci->io is available */
+  		tio = &ci->io->tio;
+ -		/* alloc_io() already initialized embedded clone */
+ -		clone = &tio->clone;
+  	} else {
+++<<<<<<< HEAD
+ +		struct bio *clone = bio_alloc_bioset(gfp_mask, 0, &ci->io->md->bs);
+++=======
++ 		struct mapped_device *md = ci->io->md;
++ 
++ 		clone = bio_alloc_clone(NULL, ci->bio, gfp_mask,
++ 					&md->mempools->bs);
+++>>>>>>> 29dec90a0f1d (dm: fix bio_set allocation)
+  		if (!clone)
+  			return NULL;
+ -		/* Set default bdev, but target must bio_set_dev() before issuing IO */
+ -		clone->bi_bdev = md->disk->part0;
+  
+ -		/* REQ_DM_POLL_LIST shouldn't be inherited */
+ -		clone->bi_opf &= ~REQ_DM_POLL_LIST;
+ -
+ -		tio = clone_to_tio(clone);
+ -		tio->flags = 0; /* also clears DM_TIO_INSIDE_DM_IO */
+ +		tio = container_of(clone, struct dm_target_io, clone);
+ +		tio->inside_dm_io = false;
+  	}
+  
+  	tio->magic = DM_TIO_MAGIC;
+@@@ -1770,10 -1869,10 +1775,9 @@@ static void cleanup_mapped_device(struc
+  {
+  	if (md->wq)
+  		destroy_workqueue(md->wq);
+- 	bioset_exit(&md->bs);
+- 	bioset_exit(&md->io_bs);
++ 	dm_free_md_mempools(md->mempools);
+  
+  	if (md->dax_dev) {
+ -		dax_remove_host(md->disk);
+  		kill_dax(md->dax_dev);
+  		put_dax(md->dax_dev);
+  		md->dax_dev = NULL;
+@@@ -2052,14 -2094,36 +2014,30 @@@ static struct dm_table *__bind(struct m
+  		 * immutable singletons - used to optimize dm_mq_queue_rq.
+  		 */
+  		md->immutable_target = dm_table_get_immutable_target(t);
+- 	}
+  
+- 	ret = __bind_mempools(md, t);
+- 	if (ret) {
+- 		old_map = ERR_PTR(ret);
+- 		goto out;
++ 		/*
++ 		 * There is no need to reload with request-based dm because the
++ 		 * size of front_pad doesn't change.
++ 		 *
++ 		 * Note for future: If you are to reload bioset, prep-ed
++ 		 * requests in the queue may refer to bio from the old bioset,
++ 		 * so you must walk through the queue to unprep.
++ 		 */
++ 		if (!md->mempools) {
++ 			md->mempools = t->mempools;
++ 			t->mempools = NULL;
++ 		}
++ 	} else {
++ 		/*
++ 		 * The md may already have mempools that need changing.
++ 		 * If so, reload bioset because front_pad may have changed
++ 		 * because a different table was loaded.
++ 		 */
++ 		dm_free_md_mempools(md->mempools);
++ 		md->mempools = t->mempools;
++ 		t->mempools = NULL;
+  	}
+  
+ -	ret = dm_table_set_restrictions(t, md->queue, limits);
+ -	if (ret) {
+ -		old_map = ERR_PTR(ret);
+ -		goto out;
+ -	}
+ -
+  	old_map = rcu_dereference_protected(md->map, lockdep_is_held(&md->suspend_lock));
+  	rcu_assign_pointer(md->map, (void *)t);
+  	md->immutable_target_type = dm_table_get_immutable_target_type(t);
+diff --cc drivers/md/dm.h
+index 1e35e33e3fb8,a8405ce305a9..000000000000
+--- a/drivers/md/dm.h
++++ b/drivers/md/dm.h
+@@@ -70,12 -71,6 +70,15 @@@ struct dm_target *dm_table_get_immutabl
+  struct dm_target *dm_table_get_wildcard_target(struct dm_table *t);
+  bool dm_table_bio_based(struct dm_table *t);
+  bool dm_table_request_based(struct dm_table *t);
+++<<<<<<< HEAD
+ +void dm_table_free_md_mempools(struct dm_table *t);
+ +struct dm_md_mempools *dm_table_get_md_mempools(struct dm_table *t);
+ +bool dm_table_supports_dax(struct dm_table *t, iterate_devices_callout_fn fn,
+ +			   int *blocksize);
+ +int device_not_dax_capable(struct dm_target *ti, struct dm_dev *dev,
+ +			   sector_t start, sector_t len, void *data);
+++=======
+++>>>>>>> 29dec90a0f1d (dm: fix bio_set allocation)
+  
+  void dm_lock_md_type(struct mapped_device *md);
+  void dm_unlock_md_type(struct mapped_device *md);
+diff --git a/drivers/md/dm-core.h b/drivers/md/dm-core.h
+index a9c78c74b3c7..59b777617296 100644
+--- a/drivers/md/dm-core.h
++++ b/drivers/md/dm-core.h
+@@ -31,6 +31,14 @@ struct dm_kobject_holder {
+  * access their members!
+  */
+ 
++/*
++ * For mempools pre-allocation at the table loading time.
++ */
++struct dm_md_mempools {
++	struct bio_set bs;
++	struct bio_set io_bs;
++};
++
+ struct mapped_device {
+ 	struct mutex suspend_lock;
+ 
+@@ -90,8 +98,7 @@ struct mapped_device {
+ 	/*
+ 	 * io objects are allocated from here.
+ 	 */
+-	struct bio_set io_bs;
+-	struct bio_set bs;
++	struct dm_md_mempools *mempools;
+ 
+ 	/*
+ 	 * Processing queue (flush)
+diff --git a/drivers/md/dm-rq.c b/drivers/md/dm-rq.c
+index 31b6cc71ee96..5ab340c56885 100644
+--- a/drivers/md/dm-rq.c
++++ b/drivers/md/dm-rq.c
+@@ -338,7 +338,7 @@ static int setup_clone(struct request *clone, struct request *rq,
+ {
+ 	int r;
+ 
+-	r = blk_rq_prep_clone(clone, rq, &tio->md->bs, gfp_mask,
++	r = blk_rq_prep_clone(clone, rq, &tio->md->mempools->bs, gfp_mask,
+ 			      dm_rq_bio_constructor, tio);
+ 	if (r)
+ 		return r;
+diff --git a/drivers/md/dm-table.c b/drivers/md/dm-table.c
+index 23f38af17df4..3e12ba42879a 100644
+--- a/drivers/md/dm-table.c
++++ b/drivers/md/dm-table.c
+@@ -1042,17 +1042,6 @@ static int dm_table_alloc_md_mempools(struct dm_table *t, struct mapped_device *
+ 	return 0;
+ }
+ 
+-void dm_table_free_md_mempools(struct dm_table *t)
+-{
+-	dm_free_md_mempools(t->mempools);
+-	t->mempools = NULL;
+-}
+-
+-struct dm_md_mempools *dm_table_get_md_mempools(struct dm_table *t)
+-{
+-	return t->mempools;
+-}
+-
+ static int setup_indexes(struct dm_table *t)
+ {
+ 	int i;
+* Unmerged path drivers/md/dm.c
+* Unmerged path drivers/md/dm.h
