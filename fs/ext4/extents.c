@@ -4729,9 +4729,6 @@ static long ext4_zero_range(struct file *file, loff_t offset,
 
 	trace_ext4_zero_range(inode, offset, len, mode);
 
-	if (!S_ISREG(inode->i_mode))
-		return -EINVAL;
-
 	/* Call ext4_force_commit to flush all data in case of data=journal. */
 	if (ext4_should_journal_data(inode)) {
 		ret = ext4_force_commit(inode->i_sb);
@@ -5441,9 +5438,6 @@ int ext4_collapse_range(struct inode *inode, loff_t offset, loff_t len)
 	if (!IS_ALIGNED(offset | len, EXT4_CLUSTER_SIZE(sb)))
 		return -EINVAL;
 
-	if (!S_ISREG(inode->i_mode))
-		return -EINVAL;
-
 	trace_ext4_collapse_range(inode, offset, len);
 
 	punch_start = offset >> EXT4_BLOCK_SIZE_BITS(sb);
@@ -5589,9 +5583,6 @@ int ext4_insert_range(struct inode *inode, loff_t offset, loff_t len)
 	/* Insert range works only on fs cluster size aligned regions. */
 	if (!IS_ALIGNED(offset | len, EXT4_CLUSTER_SIZE(sb)))
 		return -EINVAL;
-
-	if (!S_ISREG(inode->i_mode))
-		return -EOPNOTSUPP;
 
 	trace_ext4_insert_range(inode, offset, len);
 
