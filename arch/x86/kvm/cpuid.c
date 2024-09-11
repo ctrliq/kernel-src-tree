@@ -752,6 +752,9 @@ static inline int __do_cpuid_func(struct kvm_cpuid_array *array, u32 function)
 		entry->ecx &= kvm_cpuid_8000_0001_ecx_x86_features;
 		cpuid_mask(&entry->ecx, CPUID_8000_0001_ECX);
 		break;
+	case 0x80000006:
+		/* L2 cache and TLB: pass through host info. */
+		break;
 	case 0x80000007: /* Advanced power management */
 		/* invariant TSC is CPUID.80000007H:EDX[8] */
 		entry->edx &= (1 << 8);
