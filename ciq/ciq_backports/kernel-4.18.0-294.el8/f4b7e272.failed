@@ -1,0 +1,465 @@
+mm: remove zone_lru_lock() function, access ->lru_lock directly
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Andrey Ryabinin <aryabinin@virtuozzo.com>
+commit f4b7e272b5c0425915e2115068e0a5a20a3a628e
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/f4b7e272.failed
+
+We have common pattern to access lru_lock from a page pointer:
+	zone_lru_lock(page_zone(page))
+
+Which is silly, because it unfolds to this:
+	&NODE_DATA(page_to_nid(page))->node_zones[page_zonenum(page)]->zone_pgdat->lru_lock
+while we can simply do
+	&NODE_DATA(page_to_nid(page))->lru_lock
+
+Remove zone_lru_lock() function, since it's only complicate things.  Use
+'page_pgdat(page)->lru_lock' pattern instead.
+
+[aryabinin@virtuozzo.com: a slightly better version of __split_huge_page()]
+  Link: http://lkml.kernel.org/r/20190301121651.7741-1-aryabinin@virtuozzo.com
+Link: http://lkml.kernel.org/r/20190228083329.31892-2-aryabinin@virtuozzo.com
+	Signed-off-by: Andrey Ryabinin <aryabinin@virtuozzo.com>
+	Acked-by: Vlastimil Babka <vbabka@suse.cz>
+	Acked-by: Mel Gorman <mgorman@techsingularity.net>
+	Cc: Johannes Weiner <hannes@cmpxchg.org>
+	Cc: Michal Hocko <mhocko@kernel.org>
+	Cc: Rik van Riel <riel@surriel.com>
+	Cc: William Kucharski <william.kucharski@oracle.com>
+	Cc: John Hubbard <jhubbard@nvidia.com>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit f4b7e272b5c0425915e2115068e0a5a20a3a628e)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	mm/compaction.c
+diff --cc mm/compaction.c
+index 79db11f23bf2,e054276cf397..000000000000
+--- a/mm/compaction.c
++++ b/mm/compaction.c
+@@@ -848,10 -941,15 +849,14 @@@ isolate_migratepages_block(struct compa
+  
+  		/* If we already hold the lock, we can skip some rechecking */
+  		if (!locked) {
+++<<<<<<< HEAD
+ +			locked = compact_trylock_irqsave(zone_lru_lock(zone),
+++=======
++ 			locked = compact_lock_irqsave(&pgdat->lru_lock,
+++>>>>>>> f4b7e272b5c0 (mm: remove zone_lru_lock() function, access ->lru_lock directly)
+  								&flags, cc);
+ -
+ -			/* Try get exclusive access under lock */
+ -			if (!skip_updated) {
+ -				skip_updated = true;
+ -				if (test_and_set_skip(cc, page, low_pfn))
+ -					goto isolate_abort;
+ -			}
+ +			if (!locked)
+ +				break;
+  
+  			/* Recheck PageLRU and PageCompound under lock */
+  			if (!PageLRU(page))
+@@@ -929,15 -1033,23 +934,15 @@@ isolate_fail
+  	if (unlikely(low_pfn > end_pfn))
+  		low_pfn = end_pfn;
+  
+ -isolate_abort:
+  	if (locked)
+- 		spin_unlock_irqrestore(zone_lru_lock(zone), flags);
++ 		spin_unlock_irqrestore(&pgdat->lru_lock, flags);
+  
+  	/*
+ -	 * Updated the cached scanner pfn once the pageblock has been scanned
+ -	 * Pages will either be migrated in which case there is no point
+ -	 * scanning in the near future or migration failed in which case the
+ -	 * failure reason may persist. The block is marked for skipping if
+ -	 * there were no pages isolated in the block or if the block is
+ -	 * rescanned twice in a row.
+ +	 * Update the pageblock-skip information and cached scanner pfn,
+ +	 * if the whole pageblock was scanned without isolating any page.
+  	 */
+ -	if (low_pfn == end_pfn && (!nr_isolated || cc->rescan)) {
+ -		if (valid_page && !skip_updated)
+ -			set_pageblock_skip(valid_page);
+ -		update_cached_migrate(cc, low_pfn);
+ -	}
+ +	if (low_pfn == end_pfn)
+ +		update_pageblock_skip(cc, valid_page, nr_isolated, true);
+  
+  	trace_mm_compaction_isolate_migratepages(start_pfn, low_pfn,
+  						nr_scanned, nr_isolated);
+diff --git a/Documentation/cgroup-v1/memcg_test.txt b/Documentation/cgroup-v1/memcg_test.txt
+index 5c7f310f32bb..621e29ffb358 100644
+--- a/Documentation/cgroup-v1/memcg_test.txt
++++ b/Documentation/cgroup-v1/memcg_test.txt
+@@ -107,9 +107,9 @@ Under below explanation, we assume CONFIG_MEM_RES_CTRL_SWAP=y.
+ 
+ 8. LRU
+         Each memcg has its own private LRU. Now, its handling is under global
+-	VM's control (means that it's handled under global zone_lru_lock).
++	VM's control (means that it's handled under global pgdat->lru_lock).
+ 	Almost all routines around memcg's LRU is called by global LRU's
+-	list management functions under zone_lru_lock().
++	list management functions under pgdat->lru_lock.
+ 
+ 	A special function is mem_cgroup_isolate_pages(). This scans
+ 	memcg's private LRU and call __isolate_lru_page() to extract a page
+diff --git a/Documentation/cgroup-v1/memory.txt b/Documentation/cgroup-v1/memory.txt
+index 3682e99234c2..a347fc9293e5 100644
+--- a/Documentation/cgroup-v1/memory.txt
++++ b/Documentation/cgroup-v1/memory.txt
+@@ -267,11 +267,11 @@ When oom event notifier is registered, event will be delivered.
+    Other lock order is following:
+    PG_locked.
+    mm->page_table_lock
+-       zone_lru_lock
++       pgdat->lru_lock
+ 	  lock_page_cgroup.
+   In many cases, just lock_page_cgroup() is called.
+   per-zone-per-cgroup LRU (cgroup's private LRU) is just guarded by
+-  zone_lru_lock, it has no lock of its own.
++  pgdat->lru_lock, it has no lock of its own.
+ 
+ 2.7 Kernel Memory Extension (CONFIG_MEMCG_KMEM)
+ 
+diff --git a/include/linux/mm_types.h b/include/linux/mm_types.h
+index 5dab83d6ac8c..7f4de99bf695 100644
+--- a/include/linux/mm_types.h
++++ b/include/linux/mm_types.h
+@@ -81,7 +81,7 @@ struct page {
+ 		struct {	/* Page cache and anonymous pages */
+ 			/**
+ 			 * @lru: Pageout list, eg. active_list protected by
+-			 * zone_lru_lock.  Sometimes used as a generic list
++			 * pgdat->lru_lock.  Sometimes used as a generic list
+ 			 * by the page owner.
+ 			 */
+ 			struct list_head lru;
+diff --git a/include/linux/mmzone.h b/include/linux/mmzone.h
+index 31bf67ac9b4d..ec5d910f64dd 100644
+--- a/include/linux/mmzone.h
++++ b/include/linux/mmzone.h
+@@ -824,10 +824,6 @@ typedef struct pglist_data {
+ 
+ #define node_start_pfn(nid)	(NODE_DATA(nid)->node_start_pfn)
+ #define node_end_pfn(nid) pgdat_end_pfn(NODE_DATA(nid))
+-static inline spinlock_t *zone_lru_lock(struct zone *zone)
+-{
+-	return &zone->zone_pgdat->lru_lock;
+-}
+ 
+ static inline unsigned long pgdat_end_pfn(pg_data_t *pgdat)
+ {
+* Unmerged path mm/compaction.c
+diff --git a/mm/filemap.c b/mm/filemap.c
+index 4725c9d5c659..fc5251b6efe3 100644
+--- a/mm/filemap.c
++++ b/mm/filemap.c
+@@ -100,8 +100,8 @@
+  *    ->swap_lock		(try_to_unmap_one)
+  *    ->private_lock		(try_to_unmap_one)
+  *    ->i_pages lock		(try_to_unmap_one)
+- *    ->zone_lru_lock(zone)	(follow_page->mark_page_accessed)
+- *    ->zone_lru_lock(zone)	(check_pte_range->isolate_lru_page)
++ *    ->pgdat->lru_lock		(follow_page->mark_page_accessed)
++ *    ->pgdat->lru_lock		(check_pte_range->isolate_lru_page)
+  *    ->private_lock		(page_remove_rmap->set_page_dirty)
+  *    ->i_pages lock		(page_remove_rmap->set_page_dirty)
+  *    bdi.wb->list_lock		(page_remove_rmap->set_page_dirty)
+diff --git a/mm/huge_memory.c b/mm/huge_memory.c
+index 60b47b7d7614..9311e8cf573a 100644
+--- a/mm/huge_memory.c
++++ b/mm/huge_memory.c
+@@ -2468,11 +2468,11 @@ static void __split_huge_page(struct page *page, struct list_head *list,
+ 		pgoff_t end, unsigned long flags)
+ {
+ 	struct page *head = compound_head(page);
+-	struct zone *zone = page_zone(head);
++	pg_data_t *pgdat = page_pgdat(head);
+ 	struct lruvec *lruvec;
+ 	int i;
+ 
+-	lruvec = mem_cgroup_page_lruvec(head, zone->zone_pgdat);
++	lruvec = mem_cgroup_page_lruvec(head, pgdat);
+ 
+ 	/* complete memcg works before add pages to LRU */
+ 	mem_cgroup_split_huge_fixup(head);
+@@ -2506,7 +2506,7 @@ static void __split_huge_page(struct page *page, struct list_head *list,
+ 		xa_unlock(&head->mapping->i_pages);
+ 	}
+ 
+-	spin_unlock_irqrestore(zone_lru_lock(page_zone(head)), flags);
++	spin_unlock_irqrestore(&pgdat->lru_lock, flags);
+ 
+ 	remap_page(head);
+ 
+@@ -2717,7 +2717,7 @@ int split_huge_page_to_list(struct page *page, struct list_head *list)
+ 		lru_add_drain();
+ 
+ 	/* prevent PageLRU to go away from under us, and freeze lru stats */
+-	spin_lock_irqsave(zone_lru_lock(page_zone(head)), flags);
++	spin_lock_irqsave(&pgdata->lru_lock, flags);
+ 
+ 	if (mapping) {
+ 		void **pslot;
+@@ -2765,7 +2765,7 @@ int split_huge_page_to_list(struct page *page, struct list_head *list)
+ 		spin_unlock(&pgdata->split_queue_lock);
+ fail:		if (mapping)
+ 			xa_unlock(&mapping->i_pages);
+-		spin_unlock_irqrestore(zone_lru_lock(page_zone(head)), flags);
++		spin_unlock_irqrestore(&pgdata->lru_lock, flags);
+ 		remap_page(head);
+ 		ret = -EBUSY;
+ 	}
+diff --git a/mm/memcontrol.c b/mm/memcontrol.c
+index 48fa67e8a272..4275711fe0f6 100644
+--- a/mm/memcontrol.c
++++ b/mm/memcontrol.c
+@@ -2499,13 +2499,13 @@ static void cancel_charge(struct mem_cgroup *memcg, unsigned int nr_pages)
+ 
+ static void lock_page_lru(struct page *page, int *isolated)
+ {
+-	struct zone *zone = page_zone(page);
++	pg_data_t *pgdat = page_pgdat(page);
+ 
+-	spin_lock_irq(zone_lru_lock(zone));
++	spin_lock_irq(&pgdat->lru_lock);
+ 	if (PageLRU(page)) {
+ 		struct lruvec *lruvec;
+ 
+-		lruvec = mem_cgroup_page_lruvec(page, zone->zone_pgdat);
++		lruvec = mem_cgroup_page_lruvec(page, pgdat);
+ 		ClearPageLRU(page);
+ 		del_page_from_lru_list(page, lruvec, page_lru(page));
+ 		*isolated = 1;
+@@ -2515,17 +2515,17 @@ static void lock_page_lru(struct page *page, int *isolated)
+ 
+ static void unlock_page_lru(struct page *page, int isolated)
+ {
+-	struct zone *zone = page_zone(page);
++	pg_data_t *pgdat = page_pgdat(page);
+ 
+ 	if (isolated) {
+ 		struct lruvec *lruvec;
+ 
+-		lruvec = mem_cgroup_page_lruvec(page, zone->zone_pgdat);
++		lruvec = mem_cgroup_page_lruvec(page, pgdat);
+ 		VM_BUG_ON_PAGE(PageLRU(page), page);
+ 		SetPageLRU(page);
+ 		add_page_to_lru_list(page, lruvec, page_lru(page));
+ 	}
+-	spin_unlock_irq(zone_lru_lock(zone));
++	spin_unlock_irq(&pgdat->lru_lock);
+ }
+ 
+ static void commit_charge(struct page *page, struct mem_cgroup *memcg,
+@@ -2880,7 +2880,7 @@ void __memcg_kmem_uncharge_page(struct page *page, int order)
+ 
+ /*
+  * Because tail pages are not marked as "used", set it. We're under
+- * zone_lru_lock and migration entries setup in all page mappings.
++ * pgdat->lru_lock and migration entries setup in all page mappings.
+  */
+ void mem_cgroup_split_huge_fixup(struct page *head)
+ {
+diff --git a/mm/mlock.c b/mm/mlock.c
+index 0964aa0dd7bd..a90099da4fb4 100644
+--- a/mm/mlock.c
++++ b/mm/mlock.c
+@@ -182,7 +182,7 @@ static void __munlock_isolation_failed(struct page *page)
+ unsigned int munlock_vma_page(struct page *page)
+ {
+ 	int nr_pages;
+-	struct zone *zone = page_zone(page);
++	pg_data_t *pgdat = page_pgdat(page);
+ 
+ 	/* For try_to_munlock() and to serialize with page migration */
+ 	BUG_ON(!PageLocked(page));
+@@ -194,7 +194,7 @@ unsigned int munlock_vma_page(struct page *page)
+ 	 * might otherwise copy PageMlocked to part of the tail pages before
+ 	 * we clear it in the head page. It also stabilizes hpage_nr_pages().
+ 	 */
+-	spin_lock_irq(zone_lru_lock(zone));
++	spin_lock_irq(&pgdat->lru_lock);
+ 
+ 	if (!TestClearPageMlocked(page)) {
+ 		/* Potentially, PTE-mapped THP: do not skip the rest PTEs */
+@@ -203,17 +203,17 @@ unsigned int munlock_vma_page(struct page *page)
+ 	}
+ 
+ 	nr_pages = hpage_nr_pages(page);
+-	__mod_zone_page_state(zone, NR_MLOCK, -nr_pages);
++	__mod_zone_page_state(page_zone(page), NR_MLOCK, -nr_pages);
+ 
+ 	if (__munlock_isolate_lru_page(page, true)) {
+-		spin_unlock_irq(zone_lru_lock(zone));
++		spin_unlock_irq(&pgdat->lru_lock);
+ 		__munlock_isolated_page(page);
+ 		goto out;
+ 	}
+ 	__munlock_isolation_failed(page);
+ 
+ unlock_out:
+-	spin_unlock_irq(zone_lru_lock(zone));
++	spin_unlock_irq(&pgdat->lru_lock);
+ 
+ out:
+ 	return nr_pages - 1;
+@@ -298,7 +298,7 @@ static void __munlock_pagevec(struct pagevec *pvec, struct zone *zone)
+ 	pagevec_init(&pvec_putback);
+ 
+ 	/* Phase 1: page isolation */
+-	spin_lock_irq(zone_lru_lock(zone));
++	spin_lock_irq(&zone->zone_pgdat->lru_lock);
+ 	for (i = 0; i < nr; i++) {
+ 		struct page *page = pvec->pages[i];
+ 
+@@ -325,7 +325,7 @@ static void __munlock_pagevec(struct pagevec *pvec, struct zone *zone)
+ 		pvec->pages[i] = NULL;
+ 	}
+ 	__mod_zone_page_state(zone, NR_MLOCK, delta_munlocked);
+-	spin_unlock_irq(zone_lru_lock(zone));
++	spin_unlock_irq(&zone->zone_pgdat->lru_lock);
+ 
+ 	/* Now we can release pins of pages that we are not munlocking */
+ 	pagevec_release(&pvec_putback);
+diff --git a/mm/page_idle.c b/mm/page_idle.c
+index 59c0f8e2cc5f..295512465065 100644
+--- a/mm/page_idle.c
++++ b/mm/page_idle.c
+@@ -31,7 +31,7 @@
+ static struct page *page_idle_get_page(unsigned long pfn)
+ {
+ 	struct page *page;
+-	struct zone *zone;
++	pg_data_t *pgdat;
+ 
+ 	if (!pfn_valid(pfn))
+ 		return NULL;
+@@ -41,13 +41,13 @@ static struct page *page_idle_get_page(unsigned long pfn)
+ 	    !get_page_unless_zero(page))
+ 		return NULL;
+ 
+-	zone = page_zone(page);
+-	spin_lock_irq(zone_lru_lock(zone));
++	pgdat = page_pgdat(page);
++	spin_lock_irq(&pgdat->lru_lock);
+ 	if (unlikely(!PageLRU(page))) {
+ 		put_page(page);
+ 		page = NULL;
+ 	}
+-	spin_unlock_irq(zone_lru_lock(zone));
++	spin_unlock_irq(&pgdat->lru_lock);
+ 	return page;
+ }
+ 
+diff --git a/mm/rmap.c b/mm/rmap.c
+index 4ca7a0db9645..ebbddf444b82 100644
+--- a/mm/rmap.c
++++ b/mm/rmap.c
+@@ -27,7 +27,7 @@
+  *         mapping->i_mmap_rwsem
+  *           anon_vma->rwsem
+  *             mm->page_table_lock or pte_lock
+- *               zone_lru_lock (in mark_page_accessed, isolate_lru_page)
++ *               pgdat->lru_lock (in mark_page_accessed, isolate_lru_page)
+  *               swap_lock (in swap_duplicate, swap_info_get)
+  *                 mmlist_lock (in mmput, drain_mmlist and others)
+  *                 mapping->private_lock (in __set_page_dirty_buffers)
+diff --git a/mm/swap.c b/mm/swap.c
+index 48630e045f06..d36c8cd4ccf8 100644
+--- a/mm/swap.c
++++ b/mm/swap.c
+@@ -58,16 +58,16 @@ static DEFINE_PER_CPU(struct pagevec, activate_page_pvecs);
+ static void __page_cache_release(struct page *page)
+ {
+ 	if (PageLRU(page)) {
+-		struct zone *zone = page_zone(page);
++		pg_data_t *pgdat = page_pgdat(page);
+ 		struct lruvec *lruvec;
+ 		unsigned long flags;
+ 
+-		spin_lock_irqsave(zone_lru_lock(zone), flags);
+-		lruvec = mem_cgroup_page_lruvec(page, zone->zone_pgdat);
++		spin_lock_irqsave(&pgdat->lru_lock, flags);
++		lruvec = mem_cgroup_page_lruvec(page, pgdat);
+ 		VM_BUG_ON_PAGE(!PageLRU(page), page);
+ 		__ClearPageLRU(page);
+ 		del_page_from_lru_list(page, lruvec, page_off_lru(page));
+-		spin_unlock_irqrestore(zone_lru_lock(zone), flags);
++		spin_unlock_irqrestore(&pgdat->lru_lock, flags);
+ 	}
+ 	__ClearPageWaiters(page);
+ 	mem_cgroup_uncharge(page);
+@@ -327,12 +327,12 @@ static bool need_activate_page_drain(int cpu)
+ 
+ void activate_page(struct page *page)
+ {
+-	struct zone *zone = page_zone(page);
++	pg_data_t *pgdat = page_pgdat(page);
+ 
+ 	page = compound_head(page);
+-	spin_lock_irq(zone_lru_lock(zone));
+-	__activate_page(page, mem_cgroup_page_lruvec(page, zone->zone_pgdat), NULL);
+-	spin_unlock_irq(zone_lru_lock(zone));
++	spin_lock_irq(&pgdat->lru_lock);
++	__activate_page(page, mem_cgroup_page_lruvec(page, pgdat), NULL);
++	spin_unlock_irq(&pgdat->lru_lock);
+ }
+ #endif
+ 
+diff --git a/mm/vmscan.c b/mm/vmscan.c
+index 6ac08a98daa6..d5e5ecbf4d72 100644
+--- a/mm/vmscan.c
++++ b/mm/vmscan.c
+@@ -1626,8 +1626,8 @@ static __always_inline void update_lru_sizes(struct lruvec *lruvec,
+ 
+ }
+ 
+-/*
+- * zone_lru_lock is heavily contended.  Some of the functions that
++/**
++ * pgdat->lru_lock is heavily contended.  Some of the functions that
+  * shrink the lists perform better by taking out a batch of pages
+  * and working on them outside the LRU lock.
+  *
+@@ -1761,11 +1761,11 @@ int isolate_lru_page(struct page *page)
+ 	WARN_RATELIMIT(PageTail(page), "trying to isolate tail page");
+ 
+ 	if (PageLRU(page)) {
+-		struct zone *zone = page_zone(page);
++		pg_data_t *pgdat = page_pgdat(page);
+ 		struct lruvec *lruvec;
+ 
+-		spin_lock_irq(zone_lru_lock(zone));
+-		lruvec = mem_cgroup_page_lruvec(page, zone->zone_pgdat);
++		spin_lock_irq(&pgdat->lru_lock);
++		lruvec = mem_cgroup_page_lruvec(page, pgdat);
+ 		if (PageLRU(page)) {
+ 			int lru = page_lru(page);
+ 			get_page(page);
+@@ -1773,7 +1773,7 @@ int isolate_lru_page(struct page *page)
+ 			del_page_from_lru_list(page, lruvec, lru);
+ 			ret = 0;
+ 		}
+-		spin_unlock_irq(zone_lru_lock(zone));
++		spin_unlock_irq(&pgdat->lru_lock);
+ 	}
+ 	return ret;
+ }
+@@ -2005,9 +2005,9 @@ shrink_inactive_list(unsigned long nr_to_scan, struct lruvec *lruvec,
+  * processes, from rmap.
+  *
+  * If the pages are mostly unmapped, the processing is fast and it is
+- * appropriate to hold zone_lru_lock across the whole operation.  But if
++ * appropriate to hold pgdat->lru_lock across the whole operation.  But if
+  * the pages are mapped, the processing is slow (page_referenced()) so we
+- * should drop zone_lru_lock around each page.  It's impossible to balance
++ * should drop pgdat->lru_lock around each page.  It's impossible to balance
+  * this, so instead we remove the pages from the LRU while processing them.
+  * It is safe to rely on PG_active against the non-LRU pages in here because
+  * nobody will play with that bit on a non-LRU page.
