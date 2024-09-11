@@ -1,0 +1,166 @@
+mm/gup: combine put_compound_head() and unpin_user_page()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-310.el8
+commit-author Jason Gunthorpe <jgg@nvidia.com>
+commit 4509b42c38963f495b49aa50209c34337286ecbe
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-310.el8/4509b42c.failed
+
+These functions accomplish the same thing but have different
+implementations.
+
+unpin_user_page() has a bug where it calls mod_node_page_state() after
+calling put_page() which creates a risk that the page could have been
+hot-uplugged from the system.
+
+Fix this by using put_compound_head() as the only implementation.
+
+__unpin_devmap_managed_user_page() and related can be deleted as well in
+favour of the simpler, but slower, version in put_compound_head() that has
+an extra atomic page_ref_sub, but always calls put_page() which internally
+contains the special devmap code.
+
+Move put_compound_head() to be directly after try_grab_compound_head() so
+people can find it in future.
+
+Link: https://lkml.kernel.org/r/0-v1-6730d4ee0d32+40e6-gup_combine_put_jgg@nvidia.com
+Fixes: 1970dc6f5226 ("mm/gup: /proc/vmstat: pin_user_pages (FOLL_PIN) reporting")
+	Signed-off-by: Jason Gunthorpe <jgg@nvidia.com>
+	Reviewed-by: John Hubbard <jhubbard@nvidia.com>
+	Reviewed-by: Ira Weiny <ira.weiny@intel.com>
+	Reviewed-by: Jan Kara <jack@suse.cz>
+CC: Joao Martins <joao.m.martins@oracle.com>
+CC: Jonathan Corbet <corbet@lwn.net>
+CC: Dan Williams <dan.j.williams@intel.com>
+CC: Dave Chinner <david@fromorbit.com>
+CC: Christoph Hellwig <hch@infradead.org>
+CC: Jane Chu <jane.chu@oracle.com>
+CC: "Kirill A. Shutemov" <kirill.shutemov@linux.intel.com>
+CC: Michal Hocko <mhocko@suse.com>
+CC: Mike Kravetz <mike.kravetz@oracle.com>
+CC: Shuah Khan <shuah@kernel.org>
+CC: Muchun Song <songmuchun@bytedance.com>
+CC: Vlastimil Babka <vbabka@suse.cz>
+CC: Matthew Wilcox <willy@infradead.org>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit 4509b42c38963f495b49aa50209c34337286ecbe)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	mm/gup.c
+diff --cc mm/gup.c
+index 043501a3531d,9a374c6599fa..000000000000
+--- a/mm/gup.c
++++ b/mm/gup.c
+@@@ -110,41 -180,25 +132,44 @@@ bool __must_check try_grab_page(struct 
+  		if (WARN_ON_ONCE(page_ref_count(page) <= 0))
+  			return false;
+  
+ -		if (hpage_pincount_available(page))
+ -			hpage_pincount_add(page, 1);
+ -		else
+ -			refs = GUP_PIN_COUNTING_BIAS;
+ +		page_ref_add(page, GUP_PIN_COUNTING_BIAS);
+ +	}
+  
+ -		/*
+ -		 * Similar to try_grab_compound_head(): even if using the
+ -		 * hpage_pincount_add/_sub() routines, be sure to
+ -		 * *also* increment the normal page refcount field at least
+ -		 * once, so that the page really is pinned.
+ -		 */
+ -		page_ref_add(page, refs);
+ +	return true;
+ +}
+  
+ -		mod_node_page_state(page_pgdat(page), NR_FOLL_PIN_ACQUIRED, 1);
+ -	}
+++<<<<<<< HEAD
+ +#ifdef CONFIG_DEV_PAGEMAP_OPS
+ +static bool __unpin_devmap_managed_user_page(struct page *page)
+ +{
+ +	int count;
+ +
+ +	if (!page_is_devmap_managed(page))
+ +		return false;
+ +
+ +	count = page_ref_sub_return(page, GUP_PIN_COUNTING_BIAS);
+ +
+ +	/*
+ +	 * devmap page refcounts are 1-based, rather than 0-based: if
+ +	 * refcount is 1, then the page is free and the refcount is
+ +	 * stable because nobody holds a reference on the page.
+ +	 */
+ +	if (count == 1)
+ +		free_devmap_managed_page(page);
+ +	else if (!count)
+ +		__put_page(page);
+  
+  	return true;
+  }
+ +#else
+ +static bool __unpin_devmap_managed_user_page(struct page *page)
+ +{
+ +	return false;
+ +}
+ +#endif /* CONFIG_DEV_PAGEMAP_OPS */
+  
+++=======
+++>>>>>>> 4509b42c3896 (mm/gup: combine put_compound_head() and unpin_user_page())
+  /**
+   * unpin_user_page() - release a dma-pinned page
+   * @page:            pointer to page to be released
+@@@ -156,19 -210,7 +181,23 @@@
+   */
+  void unpin_user_page(struct page *page)
+  {
+++<<<<<<< HEAD
+ +	page = compound_head(page);
+ +
+ +	/*
+ +	 * For devmap managed pages we need to catch refcount transition from
+ +	 * GUP_PIN_COUNTING_BIAS to 1, when refcount reach one it means the
+ +	 * page is free and we need to inform the device driver through
+ +	 * callback. See include/linux/memremap.h and HMM for details.
+ +	 */
+ +	if (__unpin_devmap_managed_user_page(page))
+ +		return;
+ +
+ +	if (page_ref_sub_and_test(page, GUP_PIN_COUNTING_BIAS))
+ +		__put_page(page);
+++=======
++ 	put_compound_head(compound_head(page), 1, FOLL_PIN);
+++>>>>>>> 4509b42c3896 (mm/gup: combine put_compound_head() and unpin_user_page())
+  }
+  EXPORT_SYMBOL(unpin_user_page);
+  
+@@@ -2003,22 -1975,6 +2032,25 @@@ EXPORT_SYMBOL(get_user_pages_unlocked)
+   * This code is based heavily on the PowerPC implementation by Nick Piggin.
+   */
+  #ifdef CONFIG_HAVE_FAST_GUP
+++<<<<<<< HEAD
+ +
+ +static void put_compound_head(struct page *page, int refs, unsigned int flags)
+ +{
+ +	if (flags & FOLL_PIN)
+ +		refs *= GUP_PIN_COUNTING_BIAS;
+ +
+ +	VM_BUG_ON_PAGE(page_ref_count(page) < refs, page);
+ +	/*
+ +	 * Calling put_page() for each ref is unnecessarily slow. Only the last
+ +	 * ref needs a put_page().
+ +	 */
+ +	if (refs > 1)
+ +		page_ref_sub(page, refs - 1);
+ +	put_page(page);
+ +}
+ +
+++=======
+++>>>>>>> 4509b42c3896 (mm/gup: combine put_compound_head() and unpin_user_page())
+  #ifdef CONFIG_GUP_GET_PTE_LOW_HIGH
+  
+  /*
+* Unmerged path mm/gup.c
