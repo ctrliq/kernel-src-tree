@@ -1,0 +1,185 @@
+mm/slab: refactor common ksize KASAN logic into slab_common.c
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Marco Elver <elver@google.com>
+commit 10d1f8cb3965a6f633bf23eb984cda552927e3a5
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/10d1f8cb.failed
+
+This refactors common code of ksize() between the various allocators into
+slab_common.c: __ksize() is the allocator-specific implementation without
+instrumentation, whereas ksize() includes the required KASAN logic.
+
+Link: http://lkml.kernel.org/r/20190626142014.141844-5-elver@google.com
+	Signed-off-by: Marco Elver <elver@google.com>
+	Acked-by: Christoph Lameter <cl@linux.com>
+	Reviewed-by: Andrey Ryabinin <aryabinin@virtuozzo.com>
+	Cc: Dmitry Vyukov <dvyukov@google.com>
+	Cc: Alexander Potapenko <glider@google.com>
+	Cc: Andrey Konovalov <andreyknvl@google.com>
+	Cc: Pekka Enberg <penberg@kernel.org>
+	Cc: David Rientjes <rientjes@google.com>
+	Cc: Joonsoo Kim <iamjoonsoo.kim@lge.com>
+	Cc: Mark Rutland <mark.rutland@arm.com>
+	Cc: Kees Cook <keescook@chromium.org>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit 10d1f8cb3965a6f633bf23eb984cda552927e3a5)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	mm/slab.c
+diff --cc mm/slab.c
+index 31552303d765,3521a351ceb5..000000000000
+--- a/mm/slab.c
++++ b/mm/slab.c
+@@@ -4444,30 -4204,22 +4444,39 @@@ void __check_heap_object(const void *pt
+  #endif /* CONFIG_HARDENED_USERCOPY */
+  
+  /**
+-  * ksize - get the actual amount of memory allocated for a given object
+-  * @objp: Pointer to the object
++  * __ksize -- Uninstrumented ksize.
+   *
+++<<<<<<< HEAD
+ + * kmalloc may internally round up allocations and return more memory
+ + * than requested. ksize() can be used to determine the actual amount of
+ + * memory allocated. The caller may use this additional memory, even though
+ + * a smaller amount of memory was initially specified with the kmalloc call.
+ + * The caller must guarantee that objp points to a valid object previously
+ + * allocated with either kmalloc() or kmem_cache_alloc(). The object
+ + * must not be freed during the duration of the call.
+++=======
++  * Unlike ksize(), __ksize() is uninstrumented, and does not provide the same
++  * safety checks as ksize() with KASAN instrumentation enabled.
+++>>>>>>> 10d1f8cb3965 (mm/slab: refactor common ksize KASAN logic into slab_common.c)
+   */
+- size_t ksize(const void *objp)
++ size_t __ksize(const void *objp)
+  {
+ -	struct kmem_cache *c;
+  	size_t size;
+  
+  	BUG_ON(!objp);
+  	if (unlikely(objp == ZERO_SIZE_PTR))
+  		return 0;
+  
+++<<<<<<< HEAD
+ +	size = virt_to_cache(objp)->object_size;
+ +	/* We assume that ksize callers could use the whole allocated area,
+ +	 * so we need to unpoison this area.
+ +	 */
+ +	kasan_unpoison_shadow(objp, size);
+++=======
++ 	c = virt_to_cache(objp);
++ 	size = c ? c->object_size : 0;
+++>>>>>>> 10d1f8cb3965 (mm/slab: refactor common ksize KASAN logic into slab_common.c)
+  
+  	return size;
+  }
+diff --git a/include/linux/slab.h b/include/linux/slab.h
+index 7964239d627e..81e4edee666a 100644
+--- a/include/linux/slab.h
++++ b/include/linux/slab.h
+@@ -188,6 +188,7 @@ void * __must_check __krealloc(const void *, size_t, gfp_t);
+ void * __must_check krealloc(const void *, size_t, gfp_t);
+ void kfree(const void *);
+ void kzfree(const void *);
++size_t __ksize(const void *);
+ size_t ksize(const void *);
+ 
+ #ifdef CONFIG_HAVE_HARDENED_USERCOPY_ALLOCATOR
+* Unmerged path mm/slab.c
+diff --git a/mm/slab_common.c b/mm/slab_common.c
+index d38e88435224..e1db7adbdbce 100644
+--- a/mm/slab_common.c
++++ b/mm/slab_common.c
+@@ -1696,6 +1696,32 @@ void kzfree(const void *p)
+ }
+ EXPORT_SYMBOL(kzfree);
+ 
++/**
++ * ksize - get the actual amount of memory allocated for a given object
++ * @objp: Pointer to the object
++ *
++ * kmalloc may internally round up allocations and return more memory
++ * than requested. ksize() can be used to determine the actual amount of
++ * memory allocated. The caller may use this additional memory, even though
++ * a smaller amount of memory was initially specified with the kmalloc call.
++ * The caller must guarantee that objp points to a valid object previously
++ * allocated with either kmalloc() or kmem_cache_alloc(). The object
++ * must not be freed during the duration of the call.
++ *
++ * Return: size of the actual memory used by @objp in bytes
++ */
++size_t ksize(const void *objp)
++{
++	size_t size = __ksize(objp);
++	/*
++	 * We assume that ksize callers could use whole allocated area,
++	 * so we need to unpoison this area.
++	 */
++	kasan_unpoison_shadow(objp, size);
++	return size;
++}
++EXPORT_SYMBOL(ksize);
++
+ /* Tracepoints definitions. */
+ EXPORT_TRACEPOINT_SYMBOL(kmalloc);
+ EXPORT_TRACEPOINT_SYMBOL(kmem_cache_alloc);
+diff --git a/mm/slob.c b/mm/slob.c
+index b12651299561..8495da4402e6 100644
+--- a/mm/slob.c
++++ b/mm/slob.c
+@@ -549,7 +549,7 @@ void kfree(const void *block)
+ EXPORT_SYMBOL(kfree);
+ 
+ /* can't use ksize for kmem_cache_alloc memory, only kmalloc */
+-size_t ksize(const void *block)
++size_t __ksize(const void *block)
+ {
+ 	struct page *sp;
+ 	int align;
+@@ -567,7 +567,7 @@ size_t ksize(const void *block)
+ 	m = (unsigned int *)(block - align);
+ 	return SLOB_UNITS(*m) * SLOB_UNIT;
+ }
+-EXPORT_SYMBOL(ksize);
++EXPORT_SYMBOL(__ksize);
+ 
+ int __kmem_cache_create(struct kmem_cache *c, slab_flags_t flags)
+ {
+diff --git a/mm/slub.c b/mm/slub.c
+index 015d2ad67b2a..c09afd214765 100644
+--- a/mm/slub.c
++++ b/mm/slub.c
+@@ -3928,7 +3928,7 @@ void __check_heap_object(const void *ptr, unsigned long n, struct page *page,
+ }
+ #endif /* CONFIG_HARDENED_USERCOPY */
+ 
+-static size_t __ksize(const void *object)
++size_t __ksize(const void *object)
+ {
+ 	struct page *page;
+ 
+@@ -3944,17 +3944,7 @@ static size_t __ksize(const void *object)
+ 
+ 	return slab_ksize(page->slab_cache);
+ }
+-
+-size_t ksize(const void *object)
+-{
+-	size_t size = __ksize(object);
+-	/* We assume that ksize callers could use whole allocated area,
+-	 * so we need to unpoison this area.
+-	 */
+-	kasan_unpoison_shadow(object, size);
+-	return size;
+-}
+-EXPORT_SYMBOL(ksize);
++EXPORT_SYMBOL(__ksize);
+ 
+ void kfree(const void *x)
+ {
