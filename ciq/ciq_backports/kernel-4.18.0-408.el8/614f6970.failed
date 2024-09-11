@@ -1,0 +1,128 @@
+KVM: x86/mmu: do not allow readers to acquire references to invalid roots
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-408.el8
+commit-author Paolo Bonzini <pbonzini@redhat.com>
+commit 614f6970aa70242a3f8a8051b01244c029f77b2a
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-408.el8/614f6970.failed
+
+Remove the "shared" argument of for_each_tdp_mmu_root_yield_safe, thus ensuring
+that readers do not ever acquire a reference to an invalid root.  After this
+patch, all readers except kvm_tdp_mmu_zap_invalidated_roots() treat
+refcount=0/valid, refcount=0/invalid and refcount=1/invalid in exactly the
+same way.  kvm_tdp_mmu_zap_invalidated_roots() is different but it also
+does not acquire a reference to the invalid root, and it cannot see
+refcount=0/invalid because it is guaranteed to run after
+kvm_tdp_mmu_invalidate_all_roots().
+
+Opportunistically add a lockdep assertion to the yield-safe iterator.
+
+	Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+(cherry picked from commit 614f6970aa70242a3f8a8051b01244c029f77b2a)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kvm/mmu/tdp_mmu.c
+diff --cc arch/x86/kvm/mmu/tdp_mmu.c
+index abdf98ed849c,79bc48ddb69d..000000000000
+--- a/arch/x86/kvm/mmu/tdp_mmu.c
++++ b/arch/x86/kvm/mmu/tdp_mmu.c
+@@@ -132,42 -157,54 +132,70 @@@ static struct kvm_mmu_page *tdp_mmu_nex
+   * This makes it safe to release the MMU lock and yield within the loop, but
+   * if exiting the loop early, the caller must drop the reference to the most
+   * recent root. (Unless keeping a live reference is desirable.)
+ - *
+ - * If shared is set, this function is operating under the MMU lock in read
+ - * mode. In the unlikely event that this thread must free a root, the lock
+ - * will be temporarily dropped and reacquired in write mode.
+   */
+++<<<<<<< HEAD
+ +#define for_each_tdp_mmu_root_yield_safe(_kvm, _root, _as_id)	\
+ +	for (_root = tdp_mmu_next_root(_kvm, NULL);		\
+ +	     _root;						\
+ +	     _root = tdp_mmu_next_root(_kvm, _root))		\
+ +		if (kvm_mmu_page_as_id(_root) != _as_id) {	\
+ +		} else
+ +
+ +#define for_each_tdp_mmu_root(_kvm, _root, _as_id)				\
+ +	list_for_each_entry_rcu(_root, &_kvm->arch.tdp_mmu_roots, link,		\
+ +				lockdep_is_held_type(&kvm->mmu_lock, 0) ||	\
+ +				lockdep_is_held(&kvm->arch.tdp_mmu_pages_lock))	\
+ +		if (kvm_mmu_page_as_id(_root) != _as_id) {		\
+++=======
++ #define __for_each_tdp_mmu_root_yield_safe(_kvm, _root, _as_id, _shared, _only_valid)\
++ 	for (_root = tdp_mmu_next_root(_kvm, NULL, _shared, _only_valid);	\
++ 	     _root;								\
++ 	     _root = tdp_mmu_next_root(_kvm, _root, _shared, _only_valid))	\
++ 		if (kvm_lockdep_assert_mmu_lock_held(_kvm, _shared) &&		\
++ 		    kvm_mmu_page_as_id(_root) != _as_id) {			\
++ 		} else
++ 
++ #define for_each_valid_tdp_mmu_root_yield_safe(_kvm, _root, _as_id, _shared)	\
++ 	__for_each_tdp_mmu_root_yield_safe(_kvm, _root, _as_id, _shared, true)
++ 
++ #define for_each_tdp_mmu_root_yield_safe(_kvm, _root, _as_id)			\
++ 	__for_each_tdp_mmu_root_yield_safe(_kvm, _root, _as_id, false, false)
++ 
++ /*
++  * Iterate over all TDP MMU roots.  Requires that mmu_lock be held for write,
++  * the implication being that any flow that holds mmu_lock for read is
++  * inherently yield-friendly and should use the yield-safe variant above.
++  * Holding mmu_lock for write obviates the need for RCU protection as the list
++  * is guaranteed to be stable.
++  */
++ #define for_each_tdp_mmu_root(_kvm, _root, _as_id)			\
++ 	list_for_each_entry(_root, &_kvm->arch.tdp_mmu_roots, link)	\
++ 		if (kvm_lockdep_assert_mmu_lock_held(_kvm, false) &&	\
++ 		    kvm_mmu_page_as_id(_root) != _as_id) {		\
+++>>>>>>> 614f6970aa70 (KVM: x86/mmu: do not allow readers to acquire references to invalid roots)
+  		} else
+  
+ -static struct kvm_mmu_page *tdp_mmu_alloc_sp(struct kvm_vcpu *vcpu)
+ +static union kvm_mmu_page_role page_role_for_level(struct kvm_vcpu *vcpu,
+ +						   int level)
+  {
+ -	struct kvm_mmu_page *sp;
+ +	union kvm_mmu_page_role role;
+  
+ -	sp = kvm_mmu_memory_cache_alloc(&vcpu->arch.mmu_page_header_cache);
+ -	sp->spt = kvm_mmu_memory_cache_alloc(&vcpu->arch.mmu_shadow_page_cache);
+ +	role = vcpu->arch.mmu->mmu_role.base;
+ +	role.level = level;
+  
+ -	return sp;
+ +	return role;
+  }
+  
+ -static void tdp_mmu_init_sp(struct kvm_mmu_page *sp, gfn_t gfn,
+ -			      union kvm_mmu_page_role role)
+ +static struct kvm_mmu_page *alloc_tdp_mmu_page(struct kvm_vcpu *vcpu, gfn_t gfn,
+ +					       int level)
+  {
+ +	struct kvm_mmu_page *sp;
+ +
+ +	sp = kvm_mmu_memory_cache_alloc(&vcpu->arch.mmu_page_header_cache);
+ +	sp->spt = kvm_mmu_memory_cache_alloc(&vcpu->arch.mmu_shadow_page_cache);
+  	set_page_private(virt_to_page(sp->spt), (unsigned long)sp);
+  
+ -	sp->role = role;
+ +	sp->role.word = page_role_for_level(vcpu, level).word;
+  	sp->gfn = gfn;
+  	sp->tdp_mmu_page = true;
+  
+@@@ -746,7 -810,8 +774,12 @@@ bool __kvm_tdp_mmu_zap_gfn_range(struc
+  	struct kvm_mmu_page *root;
+  
+  	for_each_tdp_mmu_root_yield_safe(kvm, root, as_id)
+++<<<<<<< HEAD
+ +		flush = zap_gfn_range(kvm, root, start, end, can_yield, flush);
+++=======
++ 		flush = zap_gfn_range(kvm, root, start, end, can_yield, flush,
++ 				      false);
+++>>>>>>> 614f6970aa70 (KVM: x86/mmu: do not allow readers to acquire references to invalid roots)
+  
+  	return flush;
+  }
+* Unmerged path arch/x86/kvm/mmu/tdp_mmu.c
