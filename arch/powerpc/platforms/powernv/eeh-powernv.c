@@ -1722,7 +1722,7 @@ static int __init eeh_powernv_init(void)
 {
 	int ret = -EINVAL;
 
-	ret = eeh_ops_register(&pnv_eeh_ops);
+	ret = eeh_init(&pnv_eeh_ops);
 	if (!ret)
 		pr_info("EEH: PowerNV platform initialized\n");
 	else
@@ -1730,4 +1730,4 @@ static int __init eeh_powernv_init(void)
 
 	return ret;
 }
-machine_early_initcall(powernv, eeh_powernv_init);
+machine_core_initcall_sync(powernv, eeh_powernv_init);

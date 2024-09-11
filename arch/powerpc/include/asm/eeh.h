@@ -307,8 +307,7 @@ struct pci_bus *eeh_pe_bus_get(struct eeh_pe *pe);
 
 struct eeh_dev *eeh_dev_init(struct pci_dn *pdn);
 void eeh_show_enabled(void);
-int __init eeh_ops_register(struct eeh_ops *ops);
-int __exit eeh_ops_unregister(const char *name);
+int __init eeh_init(struct eeh_ops *ops);
 int eeh_check_failure(const volatile void __iomem *token);
 int eeh_dev_check_failure(struct eeh_dev *edev);
 void eeh_addr_cache_init(void);
