@@ -1,0 +1,228 @@
+exit: Factor thread_group_exited out of pidfd_poll
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Eric W. Biederman <ebiederm@xmission.com>
+commit 38fd525a4c61e7ecdc9ad4dcbf7b767d0a007962
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/38fd525a.failed
+
+Create an independent helper thread_group_exited which returns true
+when all threads have passed exit_notify in do_exit.  AKA all of the
+threads are at least zombies and might be dead or completely gone.
+
+Create this helper by taking the logic out of pidfd_poll where it is
+already tested, and adding a READ_ONCE on the read of
+task->exit_state.
+
+I will be changing the user mode driver code to use this same logic
+to know when a user mode driver needs to be restarted.
+
+Place the new helper thread_group_exited in kernel/exit.c and
+EXPORT it so it can be used by modules.
+
+Link: https://lkml.kernel.org/r/20200702164140.4468-13-ebiederm@xmission.com
+	Acked-by: Christian Brauner <christian.brauner@ubuntu.com>
+	Acked-by: Alexei Starovoitov <ast@kernel.org>
+	Tested-by: Alexei Starovoitov <ast@kernel.org>
+	Signed-off-by: "Eric W. Biederman" <ebiederm@xmission.com>
+(cherry picked from commit 38fd525a4c61e7ecdc9ad4dcbf7b767d0a007962)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/sched/signal.h
+#	kernel/fork.c
+diff --cc include/linux/sched/signal.h
+index b8faa28a8a0a,1bad18a1d8ba..000000000000
+--- a/include/linux/sched/signal.h
++++ b/include/linux/sched/signal.h
+@@@ -666,10 -674,12 +666,16 @@@ static inline int thread_group_empty(st
+  #define delay_group_leader(p) \
+  		(thread_group_leader(p) && !thread_group_empty(p))
+  
+++<<<<<<< HEAD
+ +extern struct sighand_struct *__lock_task_sighand(struct task_struct *tsk,
+++=======
++ extern bool thread_group_exited(struct pid *pid);
++ 
++ extern struct sighand_struct *__lock_task_sighand(struct task_struct *task,
+++>>>>>>> 38fd525a4c61 (exit: Factor thread_group_exited out of pidfd_poll)
+  							unsigned long *flags);
+  
+ -static inline struct sighand_struct *lock_task_sighand(struct task_struct *task,
+ +static inline struct sighand_struct *lock_task_sighand(struct task_struct *tsk,
+  						       unsigned long *flags)
+  {
+  	struct sighand_struct *ret;
+diff --cc kernel/fork.c
+index 8d4e2c9f02c2,bf215af7a904..000000000000
+--- a/kernel/fork.c
++++ b/kernel/fork.c
+@@@ -1672,8 -1691,126 +1672,124 @@@ static inline void rcu_copy_process(str
+  	INIT_LIST_HEAD(&p->rcu_tasks_holdout_list);
+  	p->rcu_tasks_idle_cpu = -1;
+  #endif /* #ifdef CONFIG_TASKS_RCU */
+ -#ifdef CONFIG_TASKS_TRACE_RCU
+ -	p->trc_reader_nesting = 0;
+ -	p->trc_reader_special.s = 0;
+ -	INIT_LIST_HEAD(&p->trc_holdout_list);
+ -#endif /* #ifdef CONFIG_TASKS_TRACE_RCU */
+  }
+  
+++<<<<<<< HEAD
+++=======
++ struct pid *pidfd_pid(const struct file *file)
++ {
++ 	if (file->f_op == &pidfd_fops)
++ 		return file->private_data;
++ 
++ 	return ERR_PTR(-EBADF);
++ }
++ 
++ static int pidfd_release(struct inode *inode, struct file *file)
++ {
++ 	struct pid *pid = file->private_data;
++ 
++ 	file->private_data = NULL;
++ 	put_pid(pid);
++ 	return 0;
++ }
++ 
++ #ifdef CONFIG_PROC_FS
++ /**
++  * pidfd_show_fdinfo - print information about a pidfd
++  * @m: proc fdinfo file
++  * @f: file referencing a pidfd
++  *
++  * Pid:
++  * This function will print the pid that a given pidfd refers to in the
++  * pid namespace of the procfs instance.
++  * If the pid namespace of the process is not a descendant of the pid
++  * namespace of the procfs instance 0 will be shown as its pid. This is
++  * similar to calling getppid() on a process whose parent is outside of
++  * its pid namespace.
++  *
++  * NSpid:
++  * If pid namespaces are supported then this function will also print
++  * the pid of a given pidfd refers to for all descendant pid namespaces
++  * starting from the current pid namespace of the instance, i.e. the
++  * Pid field and the first entry in the NSpid field will be identical.
++  * If the pid namespace of the process is not a descendant of the pid
++  * namespace of the procfs instance 0 will be shown as its first NSpid
++  * entry and no others will be shown.
++  * Note that this differs from the Pid and NSpid fields in
++  * /proc/<pid>/status where Pid and NSpid are always shown relative to
++  * the  pid namespace of the procfs instance. The difference becomes
++  * obvious when sending around a pidfd between pid namespaces from a
++  * different branch of the tree, i.e. where no ancestoral relation is
++  * present between the pid namespaces:
++  * - create two new pid namespaces ns1 and ns2 in the initial pid
++  *   namespace (also take care to create new mount namespaces in the
++  *   new pid namespace and mount procfs)
++  * - create a process with a pidfd in ns1
++  * - send pidfd from ns1 to ns2
++  * - read /proc/self/fdinfo/<pidfd> and observe that both Pid and NSpid
++  *   have exactly one entry, which is 0
++  */
++ static void pidfd_show_fdinfo(struct seq_file *m, struct file *f)
++ {
++ 	struct pid *pid = f->private_data;
++ 	struct pid_namespace *ns;
++ 	pid_t nr = -1;
++ 
++ 	if (likely(pid_has_task(pid, PIDTYPE_PID))) {
++ 		ns = proc_pid_ns(file_inode(m->file)->i_sb);
++ 		nr = pid_nr_ns(pid, ns);
++ 	}
++ 
++ 	seq_put_decimal_ll(m, "Pid:\t", nr);
++ 
++ #ifdef CONFIG_PID_NS
++ 	seq_put_decimal_ll(m, "\nNSpid:\t", nr);
++ 	if (nr > 0) {
++ 		int i;
++ 
++ 		/* If nr is non-zero it means that 'pid' is valid and that
++ 		 * ns, i.e. the pid namespace associated with the procfs
++ 		 * instance, is in the pid namespace hierarchy of pid.
++ 		 * Start at one below the already printed level.
++ 		 */
++ 		for (i = ns->level + 1; i <= pid->level; i++)
++ 			seq_put_decimal_ll(m, "\t", pid->numbers[i].nr);
++ 	}
++ #endif
++ 	seq_putc(m, '\n');
++ }
++ #endif
++ 
++ /*
++  * Poll support for process exit notification.
++  */
++ static __poll_t pidfd_poll(struct file *file, struct poll_table_struct *pts)
++ {
++ 	struct pid *pid = file->private_data;
++ 	__poll_t poll_flags = 0;
++ 
++ 	poll_wait(file, &pid->wait_pidfd, pts);
++ 
++ 	/*
++ 	 * Inform pollers only when the whole thread group exits.
++ 	 * If the thread group leader exits before all other threads in the
++ 	 * group, then poll(2) should block, similar to the wait(2) family.
++ 	 */
++ 	if (thread_group_exited(pid))
++ 		poll_flags = EPOLLIN | EPOLLRDNORM;
++ 
++ 	return poll_flags;
++ }
++ 
++ const struct file_operations pidfd_fops = {
++ 	.release = pidfd_release,
++ 	.poll = pidfd_poll,
++ #ifdef CONFIG_PROC_FS
++ 	.show_fdinfo = pidfd_show_fdinfo,
++ #endif
++ };
++ 
+++>>>>>>> 38fd525a4c61 (exit: Factor thread_group_exited out of pidfd_poll)
+  static void __delayed_free_task(struct rcu_head *rhp)
+  {
+  	struct task_struct *tsk = container_of(rhp, struct task_struct, rcu);
+* Unmerged path include/linux/sched/signal.h
+diff --git a/kernel/exit.c b/kernel/exit.c
+index 7eb7f89f2c66..3d36dd775d25 100644
+--- a/kernel/exit.c
++++ b/kernel/exit.c
+@@ -1672,6 +1672,30 @@ COMPAT_SYSCALL_DEFINE5(waitid,
+ }
+ #endif
+ 
++/**
++ * thread_group_exited - check that a thread group has exited
++ * @pid: tgid of thread group to be checked.
++ *
++ * Test if the thread group represented by tgid has exited (all
++ * threads are zombies, dead or completely gone).
++ *
++ * Return: true if the thread group has exited. false otherwise.
++ */
++bool thread_group_exited(struct pid *pid)
++{
++	struct task_struct *task;
++	bool exited;
++
++	rcu_read_lock();
++	task = pid_task(pid, PIDTYPE_PID);
++	exited = !task ||
++		(READ_ONCE(task->exit_state) && thread_group_empty(task));
++	rcu_read_unlock();
++
++	return exited;
++}
++EXPORT_SYMBOL(thread_group_exited);
++
+ __weak void abort(void)
+ {
+ 	BUG();
+* Unmerged path kernel/fork.c
