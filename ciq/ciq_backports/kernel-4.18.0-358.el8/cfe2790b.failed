@@ -1,0 +1,351 @@
+printk: move printk_info into separate array
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-358.el8
+commit-author John Ogness <john.ogness@linutronix.de>
+commit cfe2790b163acdc9c058a63bff310923e84a16b4
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-358.el8/cfe2790b.failed
+
+The majority of the size of a descriptor is taken up by meta data,
+which is often not of interest to the ringbuffer (for example,
+when performing state checks). Since descriptors are often
+temporarily stored on the stack, keeping their size minimal will
+help reduce stack pressure.
+
+Rather than embedding the printk_info into the descriptor, create
+a separate printk_info array. The index of a descriptor in the
+descriptor array corresponds to the printk_info with the same
+index in the printk_info array. The rules for validity of a
+printk_info match the existing rules for the data blocks: the
+descriptor must be in a consistent state.
+
+	Signed-off-by: John Ogness <john.ogness@linutronix.de>
+	Reviewed-by: Petr Mladek <pmladek@suse.com>
+	Signed-off-by: Petr Mladek <pmladek@suse.com>
+Link: https://lore.kernel.org/r/20200918223421.21621-2-john.ogness@linutronix.de
+(cherry picked from commit cfe2790b163acdc9c058a63bff310923e84a16b4)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	kernel/printk/printk.c
+#	kernel/printk/printk_ringbuffer.c
+diff --cc kernel/printk/printk.c
+index c1fedccb5ed4,25cfe4fe48af..000000000000
+--- a/kernel/printk/printk.c
++++ b/kernel/printk/printk.c
+@@@ -1072,23 -941,52 +1072,64 @@@ const struct file_operations kmsg_fops 
+   */
+  void log_buf_vmcoreinfo_setup(void)
+  {
+ -	VMCOREINFO_SYMBOL(prb);
+ -	VMCOREINFO_SYMBOL(printk_rb_static);
+ -	VMCOREINFO_SYMBOL(clear_seq);
+ -
+ +	VMCOREINFO_SYMBOL(log_buf);
+ +	VMCOREINFO_SYMBOL(log_buf_len);
+ +	VMCOREINFO_SYMBOL(log_first_idx);
+ +	VMCOREINFO_SYMBOL(clear_idx);
+ +	VMCOREINFO_SYMBOL(log_next_idx);
+  	/*
+ -	 * Export struct size and field offsets. User space tools can
+ +	 * Export struct printk_log size and field offsets. User space tools can
+  	 * parse it and detect any changes to structure down the line.
+  	 */
+++<<<<<<< HEAD
+ +	VMCOREINFO_STRUCT_SIZE(printk_log);
+ +	VMCOREINFO_OFFSET(printk_log, ts_nsec);
+ +	VMCOREINFO_OFFSET(printk_log, len);
+ +	VMCOREINFO_OFFSET(printk_log, text_len);
+ +	VMCOREINFO_OFFSET(printk_log, dict_len);
+ +#ifdef CONFIG_PRINTK_CALLER
+ +	VMCOREINFO_OFFSET(printk_log, caller_id);
+ +#endif
+++=======
++ 
++ 	VMCOREINFO_STRUCT_SIZE(printk_ringbuffer);
++ 	VMCOREINFO_OFFSET(printk_ringbuffer, desc_ring);
++ 	VMCOREINFO_OFFSET(printk_ringbuffer, text_data_ring);
++ 	VMCOREINFO_OFFSET(printk_ringbuffer, dict_data_ring);
++ 	VMCOREINFO_OFFSET(printk_ringbuffer, fail);
++ 
++ 	VMCOREINFO_STRUCT_SIZE(prb_desc_ring);
++ 	VMCOREINFO_OFFSET(prb_desc_ring, count_bits);
++ 	VMCOREINFO_OFFSET(prb_desc_ring, descs);
++ 	VMCOREINFO_OFFSET(prb_desc_ring, infos);
++ 	VMCOREINFO_OFFSET(prb_desc_ring, head_id);
++ 	VMCOREINFO_OFFSET(prb_desc_ring, tail_id);
++ 
++ 	VMCOREINFO_STRUCT_SIZE(prb_desc);
++ 	VMCOREINFO_OFFSET(prb_desc, state_var);
++ 	VMCOREINFO_OFFSET(prb_desc, text_blk_lpos);
++ 	VMCOREINFO_OFFSET(prb_desc, dict_blk_lpos);
++ 
++ 	VMCOREINFO_STRUCT_SIZE(prb_data_blk_lpos);
++ 	VMCOREINFO_OFFSET(prb_data_blk_lpos, begin);
++ 	VMCOREINFO_OFFSET(prb_data_blk_lpos, next);
++ 
++ 	VMCOREINFO_STRUCT_SIZE(printk_info);
++ 	VMCOREINFO_OFFSET(printk_info, seq);
++ 	VMCOREINFO_OFFSET(printk_info, ts_nsec);
++ 	VMCOREINFO_OFFSET(printk_info, text_len);
++ 	VMCOREINFO_OFFSET(printk_info, dict_len);
++ 	VMCOREINFO_OFFSET(printk_info, caller_id);
++ 
++ 	VMCOREINFO_STRUCT_SIZE(prb_data_ring);
++ 	VMCOREINFO_OFFSET(prb_data_ring, size_bits);
++ 	VMCOREINFO_OFFSET(prb_data_ring, data);
++ 	VMCOREINFO_OFFSET(prb_data_ring, head_lpos);
++ 	VMCOREINFO_OFFSET(prb_data_ring, tail_lpos);
++ 
++ 	VMCOREINFO_SIZE(atomic_long_t);
++ 	VMCOREINFO_TYPE_OFFSET(atomic_long_t, counter);
+++>>>>>>> cfe2790b163a (printk: move printk_info into separate array)
+  }
+  #endif
+  
+@@@ -1166,11 -1064,51 +1207,21 @@@ static void __init set_percpu_data_read
+  	__printk_percpu_data_ready = true;
+  }
+  
+ -static unsigned int __init add_to_rb(struct printk_ringbuffer *rb,
+ -				     struct printk_record *r)
+ -{
+ -	struct prb_reserved_entry e;
+ -	struct printk_record dest_r;
+ -
+ -	prb_rec_init_wr(&dest_r, r->info->text_len, r->info->dict_len);
+ -
+ -	if (!prb_reserve(&e, rb, &dest_r))
+ -		return 0;
+ -
+ -	memcpy(&dest_r.text_buf[0], &r->text_buf[0], r->info->text_len);
+ -	dest_r.info->text_len = r->info->text_len;
+ -	if (dest_r.dict_buf) {
+ -		memcpy(&dest_r.dict_buf[0], &r->dict_buf[0], r->info->dict_len);
+ -		dest_r.info->dict_len = r->info->dict_len;
+ -	}
+ -	dest_r.info->facility = r->info->facility;
+ -	dest_r.info->level = r->info->level;
+ -	dest_r.info->flags = r->info->flags;
+ -	dest_r.info->ts_nsec = r->info->ts_nsec;
+ -	dest_r.info->caller_id = r->info->caller_id;
+ -
+ -	prb_final_commit(&e);
+ -
+ -	return prb_record_text_space(&e);
+ -}
+ -
+ -static char setup_text_buf[CONSOLE_EXT_LOG_MAX] __initdata;
+ -static char setup_dict_buf[CONSOLE_EXT_LOG_MAX] __initdata;
+ -
+  void __init setup_log_buf(int early)
+  {
+++<<<<<<< HEAD
+++=======
++ 	struct printk_info *new_infos;
++ 	unsigned int new_descs_count;
++ 	struct prb_desc *new_descs;
++ 	struct printk_info info;
++ 	struct printk_record r;
++ 	size_t new_descs_size;
++ 	size_t new_infos_size;
+++>>>>>>> cfe2790b163a (printk: move printk_info into separate array)
+  	unsigned long flags;
+ -	char *new_dict_buf;
+  	char *new_log_buf;
+  	unsigned int free;
+ -	u64 seq;
+  
+  	/*
+  	 * Some archs call setup_log_buf() multiple times - first is very
+@@@ -1203,7 -1140,41 +1254,43 @@@
+  		return;
+  	}
+  
+++<<<<<<< HEAD
+++=======
++ 	new_dict_buf = memblock_alloc(new_log_buf_len, LOG_ALIGN);
++ 	if (unlikely(!new_dict_buf)) {
++ 		pr_err("log_buf_len: %lu dict bytes not available\n",
++ 		       new_log_buf_len);
++ 		goto err_free_log_buf;
++ 	}
++ 
++ 	new_descs_size = new_descs_count * sizeof(struct prb_desc);
++ 	new_descs = memblock_alloc(new_descs_size, LOG_ALIGN);
++ 	if (unlikely(!new_descs)) {
++ 		pr_err("log_buf_len: %zu desc bytes not available\n",
++ 		       new_descs_size);
++ 		goto err_free_dict_buf;
++ 	}
++ 
++ 	new_infos_size = new_descs_count * sizeof(struct printk_info);
++ 	new_infos = memblock_alloc(new_infos_size, LOG_ALIGN);
++ 	if (unlikely(!new_infos)) {
++ 		pr_err("log_buf_len: %zu info bytes not available\n",
++ 		       new_infos_size);
++ 		goto err_free_descs;
++ 	}
++ 
++ 	prb_rec_init_rd(&r, &info,
++ 			&setup_text_buf[0], sizeof(setup_text_buf),
++ 			&setup_dict_buf[0], sizeof(setup_dict_buf));
++ 
++ 	prb_init(&printk_rb_dynamic,
++ 		 new_log_buf, ilog2(new_log_buf_len),
++ 		 new_dict_buf, ilog2(new_log_buf_len),
++ 		 new_descs, ilog2(new_descs_count),
++ 		 new_infos);
++ 
+++>>>>>>> cfe2790b163a (printk: move printk_info into separate array)
+  	logbuf_lock_irqsave(flags);
+ -
+  	log_buf_len = new_log_buf_len;
+  	log_buf = new_log_buf;
+  	new_log_buf_len = 0;
+diff --cc kernel/printk/printk_ringbuffer.c
+index 25548d2880ae,de4b10a98623..000000000000
+--- a/kernel/printk/printk_ringbuffer.c
++++ b/kernel/printk/printk_ringbuffer.c
+@@@ -1483,8 -1520,10 +1517,9 @@@ bool prb_reserve(struct prb_reserved_en
+  		 struct printk_record *r)
+  {
+  	struct prb_desc_ring *desc_ring = &rb->desc_ring;
++ 	struct printk_info *info;
+  	struct prb_desc *d;
+  	unsigned long id;
+ -	u64 seq;
+  
+  	if (!data_check_size(&rb->text_data_ring, r->text_buf_size))
+  		goto fail;
+@@@ -1508,8 -1547,17 +1543,20 @@@
+  	}
+  
+  	d = to_desc(desc_ring, id);
++ 	info = to_info(desc_ring, id);
+  
+  	/*
+++<<<<<<< HEAD
+++=======
++ 	 * All @info fields (except @seq) are cleared and must be filled in
++ 	 * by the writer. Save @seq before clearing because it is used to
++ 	 * determine the new sequence number.
++ 	 */
++ 	seq = info->seq;
++ 	memset(info, 0, sizeof(*info));
++ 
++ 	/*
+++>>>>>>> cfe2790b163a (printk: move printk_info into separate array)
+  	 * Set the @e fields here so that prb_commit() can be used if
+  	 * text data allocation fails.
+  	 */
+@@@ -1527,10 -1575,10 +1574,17 @@@
+  	 * See the "Bootstrap" comment block in printk_ringbuffer.h for
+  	 * details about how the initializer bootstraps the descriptors.
+  	 */
+++<<<<<<< HEAD
+ +	if (d->info.seq == 0 && DESC_INDEX(desc_ring, id) != 0)
+ +		d->info.seq = DESC_INDEX(desc_ring, id);
+ +	else
+ +		d->info.seq += DESCS_COUNT(desc_ring);
+++=======
++ 	if (seq == 0 && DESC_INDEX(desc_ring, id) != 0)
++ 		info->seq = DESC_INDEX(desc_ring, id);
++ 	else
++ 		info->seq = seq + DESCS_COUNT(desc_ring);
+++>>>>>>> cfe2790b163a (printk: move printk_info into separate array)
+  
+  	/*
+  	 * New data is about to be reserved. Once that happens, previous
+@@@ -1561,12 -1607,8 +1615,12 @@@
+  	if (r->dict_buf_size && !r->dict_buf)
+  		r->dict_buf_size = 0;
+  
+- 	r->info = &d->info;
++ 	r->info = info;
+  
+ +	/* Set default values for the sizes. */
+ +	d->info.text_len = r->text_buf_size;
+ +	d->info.dict_len = r->dict_buf_size;
+ +
+  	/* Record full text space used by record. */
+  	e->text_space = space_used(&rb->text_data_ring, &d->text_blk_lpos);
+  
+* Unmerged path kernel/printk/printk.c
+* Unmerged path kernel/printk/printk_ringbuffer.c
+diff --git a/kernel/printk/printk_ringbuffer.h b/kernel/printk/printk_ringbuffer.h
+index 853ea62dc5f2..97c8561e74e0 100644
+--- a/kernel/printk/printk_ringbuffer.h
++++ b/kernel/printk/printk_ringbuffer.h
+@@ -58,7 +58,6 @@ struct prb_data_blk_lpos {
+  * @state_var: A bitwise combination of descriptor ID and descriptor state.
+  */
+ struct prb_desc {
+-	struct printk_info		info;
+ 	atomic_long_t			state_var;
+ 	struct prb_data_blk_lpos	text_blk_lpos;
+ 	struct prb_data_blk_lpos	dict_blk_lpos;
+@@ -76,6 +75,7 @@ struct prb_data_ring {
+ struct prb_desc_ring {
+ 	unsigned int		count_bits;
+ 	struct prb_desc		*descs;
++	struct printk_info	*infos;
+ 	atomic_long_t		head_id;
+ 	atomic_long_t		tail_id;
+ };
+@@ -237,19 +237,8 @@ enum desc_state {
+ static char _##name##_dict[1U << ((avgdictbits) + (descbits))]					\
+ 			__aligned(__alignof__(unsigned long));					\
+ static struct prb_desc _##name##_descs[_DESCS_COUNT(descbits)] = {				\
+-	/* this will be the first record reserved by a writer */				\
+-	[0] = {											\
+-		.info = {									\
+-			/* will be incremented to 0 on the first reservation */			\
+-			.seq = -(u64)_DESCS_COUNT(descbits),					\
+-		},										\
+-	},											\
+ 	/* the initial head and tail */								\
+ 	[_DESCS_COUNT(descbits) - 1] = {							\
+-		.info = {									\
+-			/* reports the first seq value during the bootstrap phase */		\
+-			.seq = 0,								\
+-		},										\
+ 		/* reusable */									\
+ 		.state_var	= ATOMIC_INIT(DESC0_SV(descbits)),				\
+ 		/* no associated data block */							\
+@@ -257,10 +246,23 @@ static struct prb_desc _##name##_descs[_DESCS_COUNT(descbits)] = {				\
+ 		.dict_blk_lpos	= FAILED_BLK_LPOS,						\
+ 	},											\
+ };												\
++static struct printk_info _##name##_infos[_DESCS_COUNT(descbits)] = {				\
++	/* this will be the first record reserved by a writer */				\
++	[0] = {											\
++		/* will be incremented to 0 on the first reservation */				\
++		.seq = -(u64)_DESCS_COUNT(descbits),						\
++	},											\
++	/* the initial head and tail */								\
++	[_DESCS_COUNT(descbits) - 1] = {							\
++		/* reports the first seq value during the bootstrap phase */			\
++		.seq = 0,									\
++	},											\
++};												\
+ static struct printk_ringbuffer name = {							\
+ 	.desc_ring = {										\
+ 		.count_bits	= descbits,							\
+ 		.descs		= &_##name##_descs[0],						\
++		.infos		= &_##name##_infos[0],						\
+ 		.head_id	= ATOMIC_INIT(DESC0_ID(descbits)),				\
+ 		.tail_id	= ATOMIC_INIT(DESC0_ID(descbits)),				\
+ 	},											\
+@@ -336,7 +338,8 @@ void prb_final_commit(struct prb_reserved_entry *e);
+ void prb_init(struct printk_ringbuffer *rb,
+ 	      char *text_buf, unsigned int text_buf_size,
+ 	      char *dict_buf, unsigned int dict_buf_size,
+-	      struct prb_desc *descs, unsigned int descs_count_bits);
++	      struct prb_desc *descs, unsigned int descs_count_bits,
++	      struct printk_info *infos);
+ unsigned int prb_record_text_space(struct prb_reserved_entry *e);
+ 
+ /* Reader Interface */
