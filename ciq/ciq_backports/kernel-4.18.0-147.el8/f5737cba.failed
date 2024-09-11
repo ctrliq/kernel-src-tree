@@ -1,0 +1,122 @@
+net: use indirect calls helpers for ptype hook
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-147.el8
+Rebuild_CHGLOG: - [net] use indirect calls helpers for ptype hook (Paolo Abeni) [1700747]
+Rebuild_FUZZ: 94.25%
+commit-author Paolo Abeni <pabeni@redhat.com>
+commit f5737cbadb7d07c4f71fc5f073ccc7d8d8985a8f
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-147.el8/f5737cba.failed
+
+This avoids an indirect call per RX IPv6/IPv4 packet.
+Note that we don't want to use the indirect calls helper for taps.
+
+	Signed-off-by: Paolo Abeni <pabeni@redhat.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit f5737cbadb7d07c4f71fc5f073ccc7d8d8985a8f)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/core/dev.c
+diff --cc net/core/dev.c
+index 0aa2cd48e023,108ac8137b9b..000000000000
+--- a/net/core/dev.c
++++ b/net/core/dev.c
+@@@ -4938,6 -4979,19 +4938,22 @@@ out
+  	return ret;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static int __netif_receive_skb_one_core(struct sk_buff *skb, bool pfmemalloc)
++ {
++ 	struct net_device *orig_dev = skb->dev;
++ 	struct packet_type *pt_prev = NULL;
++ 	int ret;
++ 
++ 	ret = __netif_receive_skb_core(skb, pfmemalloc, &pt_prev);
++ 	if (pt_prev)
++ 		ret = INDIRECT_CALL_INET(pt_prev->func, ipv6_rcv, ip_rcv, skb,
++ 					 skb->dev, pt_prev, orig_dev);
++ 	return ret;
++ }
++ 
+++>>>>>>> f5737cbadb7d (net: use indirect calls helpers for ptype hook)
+  /**
+   *	netif_receive_skb_core - special purpose version of netif_receive_skb
+   *	@skb: buffer to process
+@@@ -4965,6 -5019,68 +4981,71 @@@ int netif_receive_skb_core(struct sk_bu
+  }
+  EXPORT_SYMBOL(netif_receive_skb_core);
+  
+++<<<<<<< HEAD
+++=======
++ static inline void __netif_receive_skb_list_ptype(struct list_head *head,
++ 						  struct packet_type *pt_prev,
++ 						  struct net_device *orig_dev)
++ {
++ 	struct sk_buff *skb, *next;
++ 
++ 	if (!pt_prev)
++ 		return;
++ 	if (list_empty(head))
++ 		return;
++ 	if (pt_prev->list_func != NULL)
++ 		pt_prev->list_func(head, pt_prev, orig_dev);
++ 	else
++ 		list_for_each_entry_safe(skb, next, head, list) {
++ 			skb_list_del_init(skb);
++ 			INDIRECT_CALL_INET(pt_prev->func, ipv6_rcv, ip_rcv, skb,
++ 					   skb->dev, pt_prev, orig_dev);
++ 		}
++ }
++ 
++ static void __netif_receive_skb_list_core(struct list_head *head, bool pfmemalloc)
++ {
++ 	/* Fast-path assumptions:
++ 	 * - There is no RX handler.
++ 	 * - Only one packet_type matches.
++ 	 * If either of these fails, we will end up doing some per-packet
++ 	 * processing in-line, then handling the 'last ptype' for the whole
++ 	 * sublist.  This can't cause out-of-order delivery to any single ptype,
++ 	 * because the 'last ptype' must be constant across the sublist, and all
++ 	 * other ptypes are handled per-packet.
++ 	 */
++ 	/* Current (common) ptype of sublist */
++ 	struct packet_type *pt_curr = NULL;
++ 	/* Current (common) orig_dev of sublist */
++ 	struct net_device *od_curr = NULL;
++ 	struct list_head sublist;
++ 	struct sk_buff *skb, *next;
++ 
++ 	INIT_LIST_HEAD(&sublist);
++ 	list_for_each_entry_safe(skb, next, head, list) {
++ 		struct net_device *orig_dev = skb->dev;
++ 		struct packet_type *pt_prev = NULL;
++ 
++ 		skb_list_del_init(skb);
++ 		__netif_receive_skb_core(skb, pfmemalloc, &pt_prev);
++ 		if (!pt_prev)
++ 			continue;
++ 		if (pt_curr != pt_prev || od_curr != orig_dev) {
++ 			/* dispatch old sublist */
++ 			__netif_receive_skb_list_ptype(&sublist, pt_curr, od_curr);
++ 			/* start new sublist */
++ 			INIT_LIST_HEAD(&sublist);
++ 			pt_curr = pt_prev;
++ 			od_curr = orig_dev;
++ 		}
++ 		list_add_tail(&skb->list, &sublist);
++ 	}
++ 
++ 	/* dispatch final sublist */
++ 	__netif_receive_skb_list_ptype(&sublist, pt_curr, od_curr);
++ }
++ 
+++>>>>>>> f5737cbadb7d (net: use indirect calls helpers for ptype hook)
+  static int __netif_receive_skb(struct sk_buff *skb)
+  {
+  	int ret;
+* Unmerged path net/core/dev.c
