@@ -1,0 +1,154 @@
+hugetlb: convert PageHugeFreed to HPageFreed flag
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-326.el8
+commit-author Mike Kravetz <mike.kravetz@oracle.com>
+commit 6c037149014027d50175da5be4ae4531374dcbe0
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-326.el8/6c037149.failed
+
+Use new hugetlb specific HPageFreed flag to replace the PageHugeFreed
+interfaces.
+
+Link: https://lkml.kernel.org/r/20210122195231.324857-6-mike.kravetz@oracle.com
+	Signed-off-by: Mike Kravetz <mike.kravetz@oracle.com>
+	Reviewed-by: Oscar Salvador <osalvador@suse.de>
+	Reviewed-by: Muchun Song <songmuchun@bytedance.com>
+	Acked-by: Michal Hocko <mhocko@suse.com>
+	Cc: David Hildenbrand <david@redhat.com>
+	Cc: Matthew Wilcox <willy@infradead.org>
+	Cc: Miaohe Lin <linmiaohe@huawei.com>
+	Cc: Michal Hocko <mhocko@kernel.org>
+	Cc: Naoya Horiguchi <n-horiguchi@ah.jp.nec.com>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit 6c037149014027d50175da5be4ae4531374dcbe0)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	mm/hugetlb.c
+diff --cc mm/hugetlb.c
+index ecbeabd66a23,5377e1dad044..000000000000
+--- a/mm/hugetlb.c
++++ b/mm/hugetlb.c
+@@@ -861,6 -1038,7 +861,10 @@@ static void enqueue_huge_page(struct hs
+  	list_move(&page->lru, &h->hugepage_freelists[nid]);
+  	h->free_huge_pages++;
+  	h->free_huge_pages_node[nid]++;
+++<<<<<<< HEAD
+++=======
++ 	SetHPageFreed(page);
+++>>>>>>> 6c0371490140 (hugetlb: convert PageHugeFreed to HPageFreed flag)
+  }
+  
+  static struct page *dequeue_huge_page_node_exact(struct hstate *h, int nid)
+@@@ -872,21 -1050,18 +876,33 @@@
+  		if (nocma && is_migrate_cma_page(page))
+  			continue;
+  
+++<<<<<<< HEAD
+ +		if (!PageHWPoison(page))
+ +			break;
+++=======
++ 		if (PageHWPoison(page))
++ 			continue;
++ 
++ 		list_move(&page->lru, &h->hugepage_activelist);
++ 		set_page_refcounted(page);
++ 		ClearHPageFreed(page);
++ 		h->free_huge_pages--;
++ 		h->free_huge_pages_node[nid]--;
++ 		return page;
+++>>>>>>> 6c0371490140 (hugetlb: convert PageHugeFreed to HPageFreed flag)
+  	}
+  
+ -	return NULL;
+ +	/*
+ +	 * if 'non-isolated free hugepage' not found on the list,
+ +	 * the allocation fails.
+ +	 */
+ +	if (&h->hugepage_freelists[nid] == &page->lru)
+ +		return NULL;
+ +	list_move(&page->lru, &h->hugepage_activelist);
+ +	set_page_refcounted(page);
+ +	h->free_huge_pages--;
+ +	h->free_huge_pages_node[nid]--;
+ +	return page;
+  }
+  
+  static struct page *dequeue_huge_page_nodemask(struct hstate *h, gfp_t gfp_mask, int nid,
+@@@ -1305,10 -1465,12 +1321,14 @@@ static void prep_new_huge_page(struct h
+  {
+  	INIT_LIST_HEAD(&page->lru);
+  	set_compound_page_dtor(page, HUGETLB_PAGE_DTOR);
+ -	set_hugetlb_cgroup(page, NULL);
+ -	set_hugetlb_cgroup_rsvd(page, NULL);
+  	spin_lock(&hugetlb_lock);
+ +	set_hugetlb_cgroup(page, NULL);
+  	h->nr_huge_pages++;
+  	h->nr_huge_pages_node[nid]++;
+++<<<<<<< HEAD
+++=======
++ 	ClearHPageFreed(page);
+++>>>>>>> 6c0371490140 (hugetlb: convert PageHugeFreed to HPageFreed flag)
+  	spin_unlock(&hugetlb_lock);
+  }
+  
+@@@ -1575,6 -1736,26 +1595,29 @@@ int dissolve_free_huge_page(struct pag
+  		int nid = page_to_nid(head);
+  		if (h->free_huge_pages - h->resv_huge_pages == 0)
+  			goto out;
+++<<<<<<< HEAD
+++=======
++ 
++ 		/*
++ 		 * We should make sure that the page is already on the free list
++ 		 * when it is dissolved.
++ 		 */
++ 		if (unlikely(!HPageFreed(head))) {
++ 			spin_unlock(&hugetlb_lock);
++ 			cond_resched();
++ 
++ 			/*
++ 			 * Theoretically, we should return -EBUSY when we
++ 			 * encounter this race. In fact, we have a chance
++ 			 * to successfully dissolve the page if we do a
++ 			 * retry. Because the race window is quite small.
++ 			 * If we seize this opportunity, it is an optimization
++ 			 * for increasing the success rate of dissolving page.
++ 			 */
++ 			goto retry;
++ 		}
++ 
+++>>>>>>> 6c0371490140 (hugetlb: convert PageHugeFreed to HPageFreed flag)
+  		/*
+  		 * Move PageHWPoison flag from head page to the raw error page,
+  		 * which makes any subpages rather than the error page reusable.
+diff --git a/include/linux/hugetlb.h b/include/linux/hugetlb.h
+index 0fc6b0ada733..64237519d8ef 100644
+--- a/include/linux/hugetlb.h
++++ b/include/linux/hugetlb.h
+@@ -443,11 +443,13 @@ unsigned long hugetlb_get_unmapped_area(struct file *file, unsigned long addr,
+  *	allocator.  Typically used for migration target pages when no pages
+  *	are available in the pool.  The hugetlb free page path will
+  *	immediately free pages with this flag set to the buddy allocator.
++ * HPG_freed - Set when page is on the free lists.
+  */
+ enum hugetlb_page_flags {
+ 	HPG_restore_reserve = 0,
+ 	HPG_migratable,
+ 	HPG_temporary,
++	HPG_freed,
+ 	__NR_HPAGEFLAGS,
+ };
+ 
+@@ -492,6 +494,7 @@ static inline void ClearHPage##uname(struct page *page)		\
+ HPAGEFLAG(RestoreReserve, restore_reserve)
+ HPAGEFLAG(Migratable, migratable)
+ HPAGEFLAG(Temporary, temporary)
++HPAGEFLAG(Freed, freed)
+ 
+ #ifdef CONFIG_HUGETLB_PAGE
+ 
+* Unmerged path mm/hugetlb.c
