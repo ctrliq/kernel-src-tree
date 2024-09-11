@@ -1,0 +1,118 @@
+net: phy: improve phy_driver callback handle_interrupt
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Heiner Kallweit <hkallweit1@gmail.com>
+commit 9010f9deb000edce823cb79345f137742ccffa19
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/9010f9de.failed
+
+did_interrupt() clears the interrupt, therefore handle_interrupt() can
+not check which event triggered the interrupt. To overcome this
+constraint and allow more flexibility for customer interrupt handlers,
+let's decouple handle_interrupt() from parts of the phylib interrupt
+handling. Custom interrupt handlers now have to implement the
+did_interrupt() functionality in handle_interrupt() if needed.
+
+Fortunately we have just one custom interrupt handler so far (in the
+mscc PHY driver), convert it to the changed API.
+
+	Signed-off-by: Heiner Kallweit <hkallweit1@gmail.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 9010f9deb000edce823cb79345f137742ccffa19)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/phy/mscc.c
+#	include/linux/phy.h
+diff --cc drivers/net/phy/mscc.c
+index 2da557c9e9a0,4727aba8e051..000000000000
+--- a/drivers/net/phy/mscc.c
++++ b/drivers/net/phy/mscc.c
+@@@ -1758,6 -1429,20 +1758,23 @@@ err
+  	return ret;
+  }
+  
+++<<<<<<< HEAD:drivers/net/phy/mscc.c
+++=======
++ static irqreturn_t vsc8584_handle_interrupt(struct phy_device *phydev)
++ {
++ 	int irq_status;
++ 
++ 	irq_status = phy_read(phydev, MII_VSC85XX_INT_STATUS);
++ 	if (irq_status < 0 || !(irq_status & MII_VSC85XX_INT_MASK_MASK))
++ 		return IRQ_NONE;
++ 
++ 	vsc8584_handle_macsec_interrupt(phydev);
++ 	phy_mac_interrupt(phydev);
++ 
++ 	return IRQ_HANDLED;
++ }
++ 
+++>>>>>>> 9010f9deb000 (net: phy: improve phy_driver callback handle_interrupt):drivers/net/phy/mscc/mscc_main.c
+  static int vsc85xx_config_init(struct phy_device *phydev)
+  {
+  	int rc, i, phy_id;
+diff --cc include/linux/phy.h
+index 19238232acf2,cb5a2182ba6d..000000000000
+--- a/include/linux/phy.h
++++ b/include/linux/phy.h
+@@@ -630,6 -568,9 +631,12 @@@ struct phy_driver 
+  	 */
+  	int (*did_interrupt)(struct phy_device *phydev);
+  
+++<<<<<<< HEAD
+++=======
++ 	/* Override default interrupt handling */
++ 	irqreturn_t (*handle_interrupt)(struct phy_device *phydev);
++ 
+++>>>>>>> 9010f9deb000 (net: phy: improve phy_driver callback handle_interrupt)
+  	/* Clears up any memory if needed */
+  	void (*remove)(struct phy_device *phydev);
+  
+* Unmerged path drivers/net/phy/mscc.c
+diff --git a/drivers/net/phy/phy.c b/drivers/net/phy/phy.c
+index 355bfdef48d2..d71212a418f3 100644
+--- a/drivers/net/phy/phy.c
++++ b/drivers/net/phy/phy.c
+@@ -715,26 +715,24 @@ static int phy_disable_interrupts(struct phy_device *phydev)
+ static irqreturn_t phy_interrupt(int irq, void *phy_dat)
+ {
+ 	struct phy_device *phydev = phy_dat;
++	struct phy_driver *drv = phydev->drv;
+ 
+-	if (phydev->drv->did_interrupt && !phydev->drv->did_interrupt(phydev))
++	if (drv->handle_interrupt)
++		return drv->handle_interrupt(phydev);
++
++	if (drv->did_interrupt && !drv->did_interrupt(phydev))
+ 		return IRQ_NONE;
+ 
+-	if (phydev->drv->handle_interrupt) {
+-		if (phydev->drv->handle_interrupt(phydev))
+-			goto phy_err;
+-	} else {
+-		/* reschedule state queue work to run as soon as possible */
+-		phy_trigger_machine(phydev);
+-	}
++	/* reschedule state queue work to run as soon as possible */
++	phy_trigger_machine(phydev);
+ 
+ 	/* did_interrupt() may have cleared the interrupt already */
+-	if (!phydev->drv->did_interrupt && phy_clear_interrupt(phydev))
+-		goto phy_err;
+-	return IRQ_HANDLED;
++	if (!drv->did_interrupt && phy_clear_interrupt(phydev)) {
++		phy_error(phydev);
++		return IRQ_NONE;
++	}
+ 
+-phy_err:
+-	phy_error(phydev);
+-	return IRQ_NONE;
++	return IRQ_HANDLED;
+ }
+ 
+ /**
+* Unmerged path include/linux/phy.h
