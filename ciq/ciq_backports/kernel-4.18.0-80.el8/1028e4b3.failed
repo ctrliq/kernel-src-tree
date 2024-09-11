@@ -1,0 +1,249 @@
+bsg: move bsg-lib parts outside of request queue
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-80.el8
+commit-author Jens Axboe <axboe@kernel.dk>
+commit 1028e4b335665290dc563d5272f3c6b84e7fd66e
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-80.el8/1028e4b3.failed
+
+Get rid of the special bsg job fn and timeout handler, move them
+into a private bsg_set instead.
+
+Mostly from Christoph, with fixes for error handling and cleanups.
+
+	Reviewed-by: Hannes Reinecke <hare@suse.com>
+	Tested-by: Ming Lei <ming.lei@redhat.com>
+	Reviewed-by: Omar Sandoval <osandov@fb.com>
+	Signed-off-by: Jens Axboe <axboe@kernel.dk>
+(cherry picked from commit 1028e4b335665290dc563d5272f3c6b84e7fd66e)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	block/bsg-lib.c
+#	include/linux/blkdev.h
+#	include/linux/bsg-lib.h
+diff --cc block/bsg-lib.c
+index f3501cdaf1a6,192129856342..000000000000
+--- a/block/bsg-lib.c
++++ b/block/bsg-lib.c
+@@@ -232,38 -239,30 +238,50 @@@ failjob_rls_job
+   *
+   * Drivers/subsys should pass this to the queue init function.
+   */
+ -static blk_status_t bsg_queue_rq(struct blk_mq_hw_ctx *hctx,
+ -				 const struct blk_mq_queue_data *bd)
+ +static void bsg_request_fn(struct request_queue *q)
+ +	__releases(q->queue_lock)
+ +	__acquires(q->queue_lock)
+  {
+ -	struct request_queue *q = hctx->queue;
+  	struct device *dev = q->queuedata;
+++<<<<<<< HEAD
+ +	struct request *req;
+++=======
++ 	struct request *req = bd->rq;
++ 	struct bsg_set *bset =
++ 		container_of(q->tag_set, struct bsg_set, tag_set);
+++>>>>>>> 1028e4b33566 (bsg: move bsg-lib parts outside of request queue)
+  	int ret;
+  
+ -	blk_mq_start_request(req);
+ -
+  	if (!get_device(dev))
+ -		return BLK_STS_IOERR;
+ -
+ -	if (!bsg_prepare_job(dev, req))
+ -		return BLK_STS_IOERR;
+ -
+ +		return;
+ +
+ +	while (1) {
+ +		req = blk_fetch_request(q);
+ +		if (!req)
+ +			break;
+ +		spin_unlock_irq(q->queue_lock);
+ +
+++<<<<<<< HEAD
+ +		if (!bsg_prepare_job(dev, req)) {
+ +			blk_end_request_all(req, BLK_STS_OK);
+ +			spin_lock_irq(q->queue_lock);
+ +			continue;
+ +		}
+++=======
++ 	ret = bset->job_fn(blk_mq_rq_to_pdu(req));
++ 	if (ret)
++ 		return BLK_STS_IOERR;
+++>>>>>>> 1028e4b33566 (bsg: move bsg-lib parts outside of request queue)
+  
+ +		ret = q->bsg_job_fn(blk_mq_rq_to_pdu(req));
+ +		spin_lock_irq(q->queue_lock);
+ +		if (ret)
+ +			break;
+ +	}
+ +
+ +	spin_unlock_irq(q->queue_lock);
+  	put_device(dev);
+ -	return BLK_STS_OK;
+ +	spin_lock_irq(q->queue_lock);
+  }
+  
+  /* called right after the request is allocated for the request_queue */
+@@@ -296,6 -297,39 +314,42 @@@ static void bsg_exit_rq(struct request_
+  	kfree(job->reply);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ void bsg_remove_queue(struct request_queue *q)
++ {
++ 	if (q) {
++ 		struct bsg_set *bset =
++ 			container_of(q->tag_set, struct bsg_set, tag_set);
++ 
++ 		bsg_unregister_queue(q);
++ 		blk_cleanup_queue(q);
++ 		blk_mq_free_tag_set(&bset->tag_set);
++ 		kfree(bset);
++ 	}
++ }
++ EXPORT_SYMBOL_GPL(bsg_remove_queue);
++ 
++ static enum blk_eh_timer_return bsg_timeout(struct request *rq, bool reserved)
++ {
++ 	struct bsg_set *bset =
++ 		container_of(rq->q->tag_set, struct bsg_set, tag_set);
++ 
++ 	if (!bset->timeout_fn)
++ 		return BLK_EH_DONE;
++ 	return bset->timeout_fn(rq);
++ }
++ 
++ static const struct blk_mq_ops bsg_mq_ops = {
++ 	.queue_rq		= bsg_queue_rq,
++ 	.init_request		= bsg_init_rq,
++ 	.exit_request		= bsg_exit_rq,
++ 	.initialize_rq_fn	= bsg_initialize_rq,
++ 	.complete		= bsg_complete,
++ 	.timeout		= bsg_timeout,
++ };
++ 
+++>>>>>>> 1028e4b33566 (bsg: move bsg-lib parts outside of request queue)
+  /**
+   * bsg_setup_queue - Create and add the bsg hooks so we can receive requests
+   * @dev: device to attach bsg device to
+@@@ -304,28 -338,38 +358,63 @@@
+   * @dd_job_size: size of LLD data needed for each job
+   */
+  struct request_queue *bsg_setup_queue(struct device *dev, const char *name,
+++<<<<<<< HEAD
+ +		bsg_job_fn *job_fn, int dd_job_size)
+ +{
+++=======
++ 		bsg_job_fn *job_fn, bsg_timeout_fn *timeout, int dd_job_size)
++ {
++ 	struct bsg_set *bset;
++ 	struct blk_mq_tag_set *set;
+++>>>>>>> 1028e4b33566 (bsg: move bsg-lib parts outside of request queue)
+  	struct request_queue *q;
+ -	int ret = -ENOMEM;
+ +	int ret;
+  
+++<<<<<<< HEAD
+ +	q = blk_alloc_queue(GFP_KERNEL);
+ +	if (!q)
+++=======
++ 	bset = kzalloc(sizeof(*bset), GFP_KERNEL);
++ 	if (!bset)
+++>>>>>>> 1028e4b33566 (bsg: move bsg-lib parts outside of request queue)
+  		return ERR_PTR(-ENOMEM);
+ +	q->cmd_size = sizeof(struct bsg_job) + dd_job_size;
+ +	q->init_rq_fn = bsg_init_rq;
+ +	q->exit_rq_fn = bsg_exit_rq;
+ +	q->initialize_rq_fn = bsg_initialize_rq;
+ +	q->request_fn = bsg_request_fn;
+ +
+++<<<<<<< HEAD
+ +	ret = blk_init_allocated_queue(q);
+ +	if (ret)
+ +		goto out_cleanup_queue;
+  
+ +	q->queuedata = dev;
+ +	q->bsg_job_fn = job_fn;
+++=======
++ 	bset->job_fn = job_fn;
++ 	bset->timeout_fn = timeout;
++ 
++ 	set = &bset->tag_set;
++ 	set->ops = &bsg_mq_ops,
++ 	set->nr_hw_queues = 1;
++ 	set->queue_depth = 128;
++ 	set->numa_node = NUMA_NO_NODE;
++ 	set->cmd_size = sizeof(struct bsg_job) + dd_job_size;
++ 	set->flags = BLK_MQ_F_NO_SCHED | BLK_MQ_F_BLOCKING;
++ 	if (blk_mq_alloc_tag_set(set))
++ 		goto out_tag_set;
++ 
++ 	q = blk_mq_init_queue(set);
++ 	if (IS_ERR(q)) {
++ 		ret = PTR_ERR(q);
++ 		goto out_queue;
++ 	}
++ 
++ 	q->queuedata = dev;
+++>>>>>>> 1028e4b33566 (bsg: move bsg-lib parts outside of request queue)
+  	blk_queue_flag_set(QUEUE_FLAG_BIDI, q);
+ +	blk_queue_softirq_done(q, bsg_softirq_done);
+  	blk_queue_rq_timeout(q, BLK_DEFAULT_SG_TIMEOUT);
+  
+  	ret = bsg_register_queue(q, dev, name, &bsg_transport_ops);
+@@@ -338,6 -382,10 +427,13 @@@
+  	return q;
+  out_cleanup_queue:
+  	blk_cleanup_queue(q);
+++<<<<<<< HEAD
+++=======
++ out_queue:
++ 	blk_mq_free_tag_set(set);
++ out_tag_set:
++ 	kfree(bset);
+++>>>>>>> 1028e4b33566 (bsg: move bsg-lib parts outside of request queue)
+  	return ERR_PTR(ret);
+  }
+  EXPORT_SYMBOL_GPL(bsg_setup_queue);
+diff --cc include/linux/blkdev.h
+index 3848b29b455c,877a3d235c45..000000000000
+--- a/include/linux/blkdev.h
++++ b/include/linux/blkdev.h
+@@@ -634,7 -595,6 +631,10 @@@ struct request_queue 
+  	atomic_t		mq_freeze_depth;
+  
+  #if defined(CONFIG_BLK_DEV_BSG)
+++<<<<<<< HEAD
+ +	bsg_job_fn		*bsg_job_fn;
+++=======
+++>>>>>>> 1028e4b33566 (bsg: move bsg-lib parts outside of request queue)
+  	struct bsg_class_device bsg_dev;
+  #endif
+  
+diff --cc include/linux/bsg-lib.h
+index 6aeaf6472665,b356e0006731..000000000000
+--- a/include/linux/bsg-lib.h
++++ b/include/linux/bsg-lib.h
+@@@ -72,7 -75,8 +75,12 @@@ struct bsg_job 
+  void bsg_job_done(struct bsg_job *job, int result,
+  		  unsigned int reply_payload_rcv_len);
+  struct request_queue *bsg_setup_queue(struct device *dev, const char *name,
+++<<<<<<< HEAD
+ +		bsg_job_fn *job_fn, int dd_job_size);
+++=======
++ 		bsg_job_fn *job_fn, bsg_timeout_fn *timeout, int dd_job_size);
++ void bsg_remove_queue(struct request_queue *q);
+++>>>>>>> 1028e4b33566 (bsg: move bsg-lib parts outside of request queue)
+  void bsg_job_put(struct bsg_job *job);
+  int __must_check bsg_job_get(struct bsg_job *job);
+  
+* Unmerged path block/bsg-lib.c
+* Unmerged path include/linux/blkdev.h
+* Unmerged path include/linux/bsg-lib.h
