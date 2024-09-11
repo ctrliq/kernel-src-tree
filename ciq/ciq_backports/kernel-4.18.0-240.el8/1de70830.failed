@@ -1,0 +1,813 @@
+xfrm: remove output2 indirection from xfrm_mode
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Florian Westphal <fw@strlen.de>
+commit 1de70830066b72b6a8e259e5363f6c0bc4ba7bbc
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/1de70830.failed
+
+similar to previous patch: no external module dependencies,
+so we can avoid the indirection by placing this in the core.
+
+This change removes the last indirection from xfrm_mode and the
+xfrm4|6_mode_{beet,tunnel}.c modules contain (almost) no code anymore.
+
+Before:
+   text    data     bss     dec     hex filename
+   3957     136       0    4093     ffd net/xfrm/xfrm_output.o
+    587      44       0     631     277 net/ipv4/xfrm4_mode_beet.o
+    649      32       0     681     2a9 net/ipv4/xfrm4_mode_tunnel.o
+    625      44       0     669     29d net/ipv6/xfrm6_mode_beet.o
+    599      32       0     631     277 net/ipv6/xfrm6_mode_tunnel.o
+After:
+   text    data     bss     dec     hex filename
+   5359     184       0    5543    15a7 net/xfrm/xfrm_output.o
+    171      24       0     195      c3 net/ipv4/xfrm4_mode_beet.o
+    171      24       0     195      c3 net/ipv4/xfrm4_mode_tunnel.o
+    172      24       0     196      c4 net/ipv6/xfrm6_mode_beet.o
+    172      24       0     196      c4 net/ipv6/xfrm6_mode_tunnel.o
+
+v2: fold the *encap_add functions into xfrm*_prepare_output
+    preserve (move) output2 comment (Sabrina)
+    use x->outer_mode->encap, not inner
+    fix a build breakage on ppc (kbuild robot)
+
+	Signed-off-by: Florian Westphal <fw@strlen.de>
+	Reviewed-by: Sabrina Dubroca <sd@queasysnail.net>
+	Signed-off-by: Steffen Klassert <steffen.klassert@secunet.com>
+(cherry picked from commit 1de70830066b72b6a8e259e5363f6c0bc4ba7bbc)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/net/xfrm.h
+#	net/ipv4/xfrm4_mode_beet.c
+#	net/ipv4/xfrm4_mode_tunnel.c
+#	net/ipv6/xfrm6_mode_beet.c
+#	net/ipv6/xfrm6_mode_tunnel.c
+diff --cc include/net/xfrm.h
+index e9420a08d663,4351444c10fc..000000000000
+--- a/include/net/xfrm.h
++++ b/include/net/xfrm.h
+@@@ -443,42 -423,6 +443,45 @@@ int xfrm_register_type_offload(const st
+  int xfrm_unregister_type_offload(const struct xfrm_type_offload *type, unsigned short family);
+  
+  struct xfrm_mode {
+++<<<<<<< HEAD
+ +	/*
+ +	 * Remove encapsulation header.
+ +	 *
+ +	 * The IP header will be moved over the top of the encapsulation
+ +	 * header.
+ +	 *
+ +	 * On entry, the transport header shall point to where the IP header
+ +	 * should be and the network header shall be set to where the IP
+ +	 * header currently is.  skb->data shall point to the start of the
+ +	 * payload.
+ +	 */
+ +	int (*input2)(struct xfrm_state *x, struct sk_buff *skb);
+ +
+ +	/*
+ +	 * Add encapsulation header.
+ +	 *
+ +	 * On exit, the transport header will be set to the start of the
+ +	 * encapsulation header to be filled in by x->type->output and
+ +	 * the mac header will be set to the nextheader (protocol for
+ +	 * IPv4) field of the extension header directly preceding the
+ +	 * encapsulation header, or in its absence, that of the top IP
+ +	 * header.  The value of the network header will always point
+ +	 * to the top IP header while skb->data will point to the payload.
+ +	 */
+ +	int (*output2)(struct xfrm_state *x,struct sk_buff *skb);
+ +
+ +	/*
+ +	 * Adjust pointers into the packet and do GSO segmentation.
+ +	 */
+ +	struct sk_buff *(*gso_segment)(struct xfrm_state *x, struct sk_buff *skb, netdev_features_t features);
+ +
+ +	/*
+ +	 * Adjust pointers into the packet when IPsec is done at layer2.
+ +	 */
+ +	void (*xmit)(struct xfrm_state *x, struct sk_buff *skb);
+ +
+++=======
+++>>>>>>> 1de70830066b (xfrm: remove output2 indirection from xfrm_mode)
+  	struct xfrm_state_afinfo *afinfo;
+  	struct module *owner;
+  	u8 encap;
+diff --cc net/ipv4/xfrm4_mode_beet.c
+index f02cc8237d54,ba84b278e627..000000000000
+--- a/net/ipv4/xfrm4_mode_beet.c
++++ b/net/ipv4/xfrm4_mode_beet.c
+@@@ -17,118 -17,8 +17,59 @@@
+  #include <net/ip.h>
+  #include <net/xfrm.h>
+  
+- static void xfrm4_beet_make_header(struct sk_buff *skb)
+- {
+- 	struct iphdr *iph = ip_hdr(skb);
+- 
+- 	iph->ihl = 5;
+- 	iph->version = 4;
+- 
+- 	iph->protocol = XFRM_MODE_SKB_CB(skb)->protocol;
+- 	iph->tos = XFRM_MODE_SKB_CB(skb)->tos;
+- 
+- 	iph->id = XFRM_MODE_SKB_CB(skb)->id;
+- 	iph->frag_off = XFRM_MODE_SKB_CB(skb)->frag_off;
+- 	iph->ttl = XFRM_MODE_SKB_CB(skb)->ttl;
+- }
+- 
+- /* Add encapsulation header.
+-  *
+-  * The top IP header will be constructed per draft-nikander-esp-beet-mode-06.txt.
+-  */
+- static int xfrm4_beet_output(struct xfrm_state *x, struct sk_buff *skb)
+- {
+- 	struct ip_beet_phdr *ph;
+- 	struct iphdr *top_iph;
+- 	int hdrlen, optlen;
+- 
+- 	hdrlen = 0;
+- 	optlen = XFRM_MODE_SKB_CB(skb)->optlen;
+- 	if (unlikely(optlen))
+- 		hdrlen += IPV4_BEET_PHMAXLEN - (optlen & 4);
+- 
+- 	skb_set_network_header(skb, -x->props.header_len -
+- 				    hdrlen + (XFRM_MODE_SKB_CB(skb)->ihl - sizeof(*top_iph)));
+- 	if (x->sel.family != AF_INET6)
+- 		skb->network_header += IPV4_BEET_PHMAXLEN;
+- 	skb->mac_header = skb->network_header +
+- 			  offsetof(struct iphdr, protocol);
+- 	skb->transport_header = skb->network_header + sizeof(*top_iph);
+- 
+- 	xfrm4_beet_make_header(skb);
+- 
+- 	ph = __skb_pull(skb, XFRM_MODE_SKB_CB(skb)->ihl - hdrlen);
+- 
+- 	top_iph = ip_hdr(skb);
+- 
+- 	if (unlikely(optlen)) {
+- 		BUG_ON(optlen < 0);
+- 
+- 		ph->padlen = 4 - (optlen & 4);
+- 		ph->hdrlen = optlen / 8;
+- 		ph->nexthdr = top_iph->protocol;
+- 		if (ph->padlen)
+- 			memset(ph + 1, IPOPT_NOP, ph->padlen);
+- 
+- 		top_iph->protocol = IPPROTO_BEETPH;
+- 		top_iph->ihl = sizeof(struct iphdr) / 4;
+- 	}
+- 
+- 	top_iph->saddr = x->props.saddr.a4;
+- 	top_iph->daddr = x->id.daddr.a4;
+- 
+- 	return 0;
+- }
+  
+ +static int xfrm4_beet_input(struct xfrm_state *x, struct sk_buff *skb)
+ +{
+ +	struct iphdr *iph;
+ +	int optlen = 0;
+ +	int err = -EINVAL;
+ +
+ +	if (unlikely(XFRM_MODE_SKB_CB(skb)->protocol == IPPROTO_BEETPH)) {
+ +		struct ip_beet_phdr *ph;
+ +		int phlen;
+ +
+ +		if (!pskb_may_pull(skb, sizeof(*ph)))
+ +			goto out;
+ +
+ +		ph = (struct ip_beet_phdr *)skb->data;
+ +
+ +		phlen = sizeof(*ph) + ph->padlen;
+ +		optlen = ph->hdrlen * 8 + (IPV4_BEET_PHMAXLEN - phlen);
+ +		if (optlen < 0 || optlen & 3 || optlen > 250)
+ +			goto out;
+ +
+ +		XFRM_MODE_SKB_CB(skb)->protocol = ph->nexthdr;
+ +
+ +		if (!pskb_may_pull(skb, phlen))
+ +			goto out;
+ +		__skb_pull(skb, phlen);
+ +	}
+ +
+ +	skb_push(skb, sizeof(*iph));
+ +	skb_reset_network_header(skb);
+ +	skb_mac_header_rebuild(skb);
+ +
+ +	xfrm4_beet_make_header(skb);
+ +
+ +	iph = ip_hdr(skb);
+ +
+ +	iph->ihl += optlen / 4;
+ +	iph->tot_len = htons(skb->len);
+ +	iph->daddr = x->sel.daddr.a4;
+ +	iph->saddr = x->sel.saddr.a4;
+ +	iph->check = 0;
+ +	iph->check = ip_fast_csum(skb_network_header(skb), iph->ihl);
+ +	err = 0;
+ +out:
+ +	return err;
+ +}
+ +
+  static struct xfrm_mode xfrm4_beet_mode = {
+++<<<<<<< HEAD
+ +	.input2 = xfrm4_beet_input,
+ +	.output2 = xfrm4_beet_output,
+++=======
+++>>>>>>> 1de70830066b (xfrm: remove output2 indirection from xfrm_mode)
+  	.owner = THIS_MODULE,
+  	.encap = XFRM_MODE_BEET,
+  	.flags = XFRM_MODE_FLAG_TUNNEL,
+diff --cc net/ipv4/xfrm4_mode_tunnel.c
+index 823bc54b47de,b2b132c800fc..000000000000
+--- a/net/ipv4/xfrm4_mode_tunnel.c
++++ b/net/ipv4/xfrm4_mode_tunnel.c
+@@@ -15,117 -15,7 +15,121 @@@
+  #include <net/ip.h>
+  #include <net/xfrm.h>
+  
+++<<<<<<< HEAD
+ +static inline void ipip_ecn_decapsulate(struct sk_buff *skb)
+ +{
+ +	struct iphdr *inner_iph = ipip_hdr(skb);
+ +
+ +	if (INET_ECN_is_ce(XFRM_MODE_SKB_CB(skb)->tos))
+ +		IP_ECN_set_ce(inner_iph);
+ +}
+ +
+ +/* Add encapsulation header.
+ + *
+ + * The top IP header will be constructed per RFC 2401.
+ + */
+ +static int xfrm4_mode_tunnel_output(struct xfrm_state *x, struct sk_buff *skb)
+ +{
+ +	struct dst_entry *dst = skb_dst(skb);
+ +	struct iphdr *top_iph;
+ +	int flags;
+ +
+ +	skb_set_inner_network_header(skb, skb_network_offset(skb));
+ +	skb_set_inner_transport_header(skb, skb_transport_offset(skb));
+ +
+ +	skb_set_network_header(skb, -x->props.header_len);
+ +	skb->mac_header = skb->network_header +
+ +			  offsetof(struct iphdr, protocol);
+ +	skb->transport_header = skb->network_header + sizeof(*top_iph);
+ +	top_iph = ip_hdr(skb);
+ +
+ +	top_iph->ihl = 5;
+ +	top_iph->version = 4;
+ +
+ +	top_iph->protocol = xfrm_af2proto(skb_dst(skb)->ops->family);
+ +
+ +	/* DS disclosing depends on XFRM_SA_XFLAG_DONT_ENCAP_DSCP */
+ +	if (x->props.extra_flags & XFRM_SA_XFLAG_DONT_ENCAP_DSCP)
+ +		top_iph->tos = 0;
+ +	else
+ +		top_iph->tos = XFRM_MODE_SKB_CB(skb)->tos;
+ +	top_iph->tos = INET_ECN_encapsulate(top_iph->tos,
+ +					    XFRM_MODE_SKB_CB(skb)->tos);
+ +
+ +	flags = x->props.flags;
+ +	if (flags & XFRM_STATE_NOECN)
+ +		IP_ECN_clear(top_iph);
+ +
+ +	top_iph->frag_off = (flags & XFRM_STATE_NOPMTUDISC) ?
+ +		0 : (XFRM_MODE_SKB_CB(skb)->frag_off & htons(IP_DF));
+ +
+ +	top_iph->ttl = ip4_dst_hoplimit(xfrm_dst_child(dst));
+ +
+ +	top_iph->saddr = x->props.saddr.a4;
+ +	top_iph->daddr = x->id.daddr.a4;
+ +	ip_select_ident(dev_net(dst->dev), skb, NULL);
+ +
+ +	return 0;
+ +}
+ +
+ +static int xfrm4_mode_tunnel_input(struct xfrm_state *x, struct sk_buff *skb)
+ +{
+ +	int err = -EINVAL;
+ +
+ +	if (XFRM_MODE_SKB_CB(skb)->protocol != IPPROTO_IPIP)
+ +		goto out;
+ +
+ +	if (!pskb_may_pull(skb, sizeof(struct iphdr)))
+ +		goto out;
+ +
+ +	err = skb_unclone(skb, GFP_ATOMIC);
+ +	if (err)
+ +		goto out;
+ +
+ +	if (x->props.flags & XFRM_STATE_DECAP_DSCP)
+ +		ipv4_copy_dscp(XFRM_MODE_SKB_CB(skb)->tos, ipip_hdr(skb));
+ +	if (!(x->props.flags & XFRM_STATE_NOECN))
+ +		ipip_ecn_decapsulate(skb);
+ +
+ +	skb_reset_network_header(skb);
+ +	skb_mac_header_rebuild(skb);
+ +	if (skb->mac_len)
+ +		eth_hdr(skb)->h_proto = skb->protocol;
+ +
+ +	err = 0;
+ +
+ +out:
+ +	return err;
+ +}
+ +
+ +static struct sk_buff *xfrm4_mode_tunnel_gso_segment(struct xfrm_state *x,
+ +						     struct sk_buff *skb,
+ +						     netdev_features_t features)
+ +{
+ +	__skb_push(skb, skb->mac_len);
+ +	return skb_mac_gso_segment(skb, features);
+ +}
+ +
+ +static void xfrm4_mode_tunnel_xmit(struct xfrm_state *x, struct sk_buff *skb)
+ +{
+ +	struct xfrm_offload *xo = xfrm_offload(skb);
+ +
+ +	if (xo->flags & XFRM_GSO_SEGMENT)
+ +		skb->transport_header = skb->network_header +
+ +					sizeof(struct iphdr);
+ +
+ +	skb_reset_mac_len(skb);
+ +	pskb_pull(skb, skb->mac_len + x->props.header_len);
+ +}
+ +
+ +static struct xfrm_mode xfrm4_tunnel_mode = {
+ +	.input2 = xfrm4_mode_tunnel_input,
+ +	.output2 = xfrm4_mode_tunnel_output,
+ +	.gso_segment = xfrm4_mode_tunnel_gso_segment,
+ +	.xmit = xfrm4_mode_tunnel_xmit,
+++=======
++ static struct xfrm_mode xfrm4_tunnel_mode = {
+++>>>>>>> 1de70830066b (xfrm: remove output2 indirection from xfrm_mode)
+  	.owner = THIS_MODULE,
+  	.encap = XFRM_MODE_TUNNEL,
+  	.flags = XFRM_MODE_FLAG_TUNNEL,
+diff --cc net/ipv6/xfrm6_mode_beet.c
+index 6f35e24f0077,1c4a76bdd889..000000000000
+--- a/net/ipv6/xfrm6_mode_beet.c
++++ b/net/ipv6/xfrm6_mode_beet.c
+@@@ -19,92 -19,7 +19,96 @@@
+  #include <net/ipv6.h>
+  #include <net/xfrm.h>
+  
+++<<<<<<< HEAD
+ +static void xfrm6_beet_make_header(struct sk_buff *skb)
+ +{
+ +	struct ipv6hdr *iph = ipv6_hdr(skb);
+ +
+ +	iph->version = 6;
+ +
+ +	memcpy(iph->flow_lbl, XFRM_MODE_SKB_CB(skb)->flow_lbl,
+ +	       sizeof(iph->flow_lbl));
+ +	iph->nexthdr = XFRM_MODE_SKB_CB(skb)->protocol;
+ +
+ +	ipv6_change_dsfield(iph, 0, XFRM_MODE_SKB_CB(skb)->tos);
+ +	iph->hop_limit = XFRM_MODE_SKB_CB(skb)->ttl;
+ +}
+ +
+ +/* Add encapsulation header.
+ + *
+ + * The top IP header will be constructed per draft-nikander-esp-beet-mode-06.txt.
+ + */
+ +static int xfrm6_beet_output(struct xfrm_state *x, struct sk_buff *skb)
+ +{
+ +	struct ipv6hdr *top_iph;
+ +	struct ip_beet_phdr *ph;
+ +	int optlen, hdr_len;
+ +
+ +	hdr_len = 0;
+ +	optlen = XFRM_MODE_SKB_CB(skb)->optlen;
+ +	if (unlikely(optlen))
+ +		hdr_len += IPV4_BEET_PHMAXLEN - (optlen & 4);
+ +
+ +	skb_set_network_header(skb, -x->props.header_len - hdr_len);
+ +	if (x->sel.family != AF_INET6)
+ +		skb->network_header += IPV4_BEET_PHMAXLEN;
+ +	skb->mac_header = skb->network_header +
+ +			  offsetof(struct ipv6hdr, nexthdr);
+ +	skb->transport_header = skb->network_header + sizeof(*top_iph);
+ +	ph = __skb_pull(skb, XFRM_MODE_SKB_CB(skb)->ihl - hdr_len);
+ +
+ +	xfrm6_beet_make_header(skb);
+ +
+ +	top_iph = ipv6_hdr(skb);
+ +	if (unlikely(optlen)) {
+ +
+ +		BUG_ON(optlen < 0);
+ +
+ +		ph->padlen = 4 - (optlen & 4);
+ +		ph->hdrlen = optlen / 8;
+ +		ph->nexthdr = top_iph->nexthdr;
+ +		if (ph->padlen)
+ +			memset(ph + 1, IPOPT_NOP, ph->padlen);
+ +
+ +		top_iph->nexthdr = IPPROTO_BEETPH;
+ +	}
+ +
+ +	top_iph->saddr = *(struct in6_addr *)&x->props.saddr;
+ +	top_iph->daddr = *(struct in6_addr *)&x->id.daddr;
+ +	return 0;
+ +}
+ +
+ +static int xfrm6_beet_input(struct xfrm_state *x, struct sk_buff *skb)
+ +{
+ +	struct ipv6hdr *ip6h;
+ +	int size = sizeof(struct ipv6hdr);
+ +	int err;
+ +
+ +	err = skb_cow_head(skb, size + skb->mac_len);
+ +	if (err)
+ +		goto out;
+ +
+ +	__skb_push(skb, size);
+ +	skb_reset_network_header(skb);
+ +	skb_mac_header_rebuild(skb);
+ +
+ +	xfrm6_beet_make_header(skb);
+ +
+ +	ip6h = ipv6_hdr(skb);
+ +	ip6h->payload_len = htons(skb->len - size);
+ +	ip6h->daddr = x->sel.daddr.in6;
+ +	ip6h->saddr = x->sel.saddr.in6;
+ +	err = 0;
+ +out:
+ +	return err;
+ +}
+ +
+ +static struct xfrm_mode xfrm6_beet_mode = {
+ +	.input2 = xfrm6_beet_input,
+ +	.output2 = xfrm6_beet_output,
+++=======
++ static struct xfrm_mode xfrm6_beet_mode = {
+++>>>>>>> 1de70830066b (xfrm: remove output2 indirection from xfrm_mode)
+  	.owner = THIS_MODULE,
+  	.encap = XFRM_MODE_BEET,
+  	.flags = XFRM_MODE_FLAG_TUNNEL,
+diff --cc net/ipv6/xfrm6_mode_tunnel.c
+index e1a129524dde,e5c928dd70e3..000000000000
+--- a/net/ipv6/xfrm6_mode_tunnel.c
++++ b/net/ipv6/xfrm6_mode_tunnel.c
+@@@ -30,101 -22,7 +30,105 @@@ static inline void ipip6_ecn_decapsulat
+   *
+   * The top IP header will be constructed per RFC 2401.
+   */
+++<<<<<<< HEAD
+ +static int xfrm6_mode_tunnel_output(struct xfrm_state *x, struct sk_buff *skb)
+ +{
+ +	struct dst_entry *dst = skb_dst(skb);
+ +	struct ipv6hdr *top_iph;
+ +	int dsfield;
+ +
+ +	skb_set_inner_network_header(skb, skb_network_offset(skb));
+ +	skb_set_inner_transport_header(skb, skb_transport_offset(skb));
+ +
+ +	skb_set_network_header(skb, -x->props.header_len);
+ +	skb->mac_header = skb->network_header +
+ +			  offsetof(struct ipv6hdr, nexthdr);
+ +	skb->transport_header = skb->network_header + sizeof(*top_iph);
+ +	top_iph = ipv6_hdr(skb);
+ +
+ +	top_iph->version = 6;
+ +
+ +	memcpy(top_iph->flow_lbl, XFRM_MODE_SKB_CB(skb)->flow_lbl,
+ +	       sizeof(top_iph->flow_lbl));
+ +	top_iph->nexthdr = xfrm_af2proto(skb_dst(skb)->ops->family);
+ +
+ +	if (x->props.extra_flags & XFRM_SA_XFLAG_DONT_ENCAP_DSCP)
+ +		dsfield = 0;
+ +	else
+ +		dsfield = XFRM_MODE_SKB_CB(skb)->tos;
+ +	dsfield = INET_ECN_encapsulate(dsfield, XFRM_MODE_SKB_CB(skb)->tos);
+ +	if (x->props.flags & XFRM_STATE_NOECN)
+ +		dsfield &= ~INET_ECN_MASK;
+ +	ipv6_change_dsfield(top_iph, 0, dsfield);
+ +	top_iph->hop_limit = ip6_dst_hoplimit(xfrm_dst_child(dst));
+ +	top_iph->saddr = *(struct in6_addr *)&x->props.saddr;
+ +	top_iph->daddr = *(struct in6_addr *)&x->id.daddr;
+ +	return 0;
+ +}
+ +
+ +#define for_each_input_rcu(head, handler)	\
+ +	for (handler = rcu_dereference(head);	\
+ +	     handler != NULL;			\
+ +	     handler = rcu_dereference(handler->next))
+ +
+ +
+ +static int xfrm6_mode_tunnel_input(struct xfrm_state *x, struct sk_buff *skb)
+ +{
+ +	int err = -EINVAL;
+ +
+ +	if (XFRM_MODE_SKB_CB(skb)->protocol != IPPROTO_IPV6)
+ +		goto out;
+ +	if (!pskb_may_pull(skb, sizeof(struct ipv6hdr)))
+ +		goto out;
+ +
+ +	err = skb_unclone(skb, GFP_ATOMIC);
+ +	if (err)
+ +		goto out;
+ +
+ +	if (x->props.flags & XFRM_STATE_DECAP_DSCP)
+ +		ipv6_copy_dscp(ipv6_get_dsfield(ipv6_hdr(skb)),
+ +			       ipipv6_hdr(skb));
+ +	if (!(x->props.flags & XFRM_STATE_NOECN))
+ +		ipip6_ecn_decapsulate(skb);
+ +
+ +	skb_reset_network_header(skb);
+ +	skb_mac_header_rebuild(skb);
+ +	if (skb->mac_len)
+ +		eth_hdr(skb)->h_proto = skb->protocol;
+ +
+ +	err = 0;
+ +
+ +out:
+ +	return err;
+ +}
+ +
+ +static struct sk_buff *xfrm6_mode_tunnel_gso_segment(struct xfrm_state *x,
+ +						     struct sk_buff *skb,
+ +						     netdev_features_t features)
+ +{
+ +	__skb_push(skb, skb->mac_len);
+ +	return skb_mac_gso_segment(skb, features);
+ +}
+ +
+ +static void xfrm6_mode_tunnel_xmit(struct xfrm_state *x, struct sk_buff *skb)
+ +{
+ +	struct xfrm_offload *xo = xfrm_offload(skb);
+ +
+ +	if (xo->flags & XFRM_GSO_SEGMENT)
+ +		skb->transport_header = skb->network_header + sizeof(struct ipv6hdr);
+ +
+ +	skb_reset_mac_len(skb);
+ +	pskb_pull(skb, skb->mac_len + x->props.header_len);
+ +}
+ +
+ +static struct xfrm_mode xfrm6_tunnel_mode = {
+ +	.input2 = xfrm6_mode_tunnel_input,
+ +	.output2 = xfrm6_mode_tunnel_output,
+ +	.gso_segment = xfrm6_mode_tunnel_gso_segment,
+ +	.xmit = xfrm6_mode_tunnel_xmit,
+++=======
++ static struct xfrm_mode xfrm6_tunnel_mode = {
+++>>>>>>> 1de70830066b (xfrm: remove output2 indirection from xfrm_mode)
+  	.owner = THIS_MODULE,
+  	.encap = XFRM_MODE_TUNNEL,
+  	.flags = XFRM_MODE_FLAG_TUNNEL,
+* Unmerged path include/net/xfrm.h
+* Unmerged path net/ipv4/xfrm4_mode_beet.c
+* Unmerged path net/ipv4/xfrm4_mode_tunnel.c
+* Unmerged path net/ipv6/xfrm6_mode_beet.c
+* Unmerged path net/ipv6/xfrm6_mode_tunnel.c
+diff --git a/net/xfrm/xfrm_output.c b/net/xfrm/xfrm_output.c
+index 2330abcb848d..933660a6320c 100644
+--- a/net/xfrm/xfrm_output.c
++++ b/net/xfrm/xfrm_output.c
+@@ -17,8 +17,11 @@
+ #include <linux/slab.h>
+ #include <linux/spinlock.h>
+ #include <net/dst.h>
++#include <net/inet_ecn.h>
+ #include <net/xfrm.h>
+ 
++#include "xfrm_inout.h"
++
+ static int xfrm_output2(struct net *net, struct sock *sk, struct sk_buff *skb);
+ static int xfrm_inner_extract_output(struct xfrm_state *x, struct sk_buff *skb);
+ 
+@@ -141,6 +144,190 @@ static int xfrm6_ro_output(struct xfrm_state *x, struct sk_buff *skb)
+ #endif
+ }
+ 
++/* Add encapsulation header.
++ *
++ * The top IP header will be constructed per draft-nikander-esp-beet-mode-06.txt.
++ */
++static int xfrm4_beet_encap_add(struct xfrm_state *x, struct sk_buff *skb)
++{
++	struct ip_beet_phdr *ph;
++	struct iphdr *top_iph;
++	int hdrlen, optlen;
++
++	hdrlen = 0;
++	optlen = XFRM_MODE_SKB_CB(skb)->optlen;
++	if (unlikely(optlen))
++		hdrlen += IPV4_BEET_PHMAXLEN - (optlen & 4);
++
++	skb_set_network_header(skb, -x->props.header_len - hdrlen +
++			       (XFRM_MODE_SKB_CB(skb)->ihl - sizeof(*top_iph)));
++	if (x->sel.family != AF_INET6)
++		skb->network_header += IPV4_BEET_PHMAXLEN;
++	skb->mac_header = skb->network_header +
++			  offsetof(struct iphdr, protocol);
++	skb->transport_header = skb->network_header + sizeof(*top_iph);
++
++	xfrm4_beet_make_header(skb);
++
++	ph = __skb_pull(skb, XFRM_MODE_SKB_CB(skb)->ihl - hdrlen);
++
++	top_iph = ip_hdr(skb);
++
++	if (unlikely(optlen)) {
++		if (WARN_ON(optlen < 0))
++			return -EINVAL;
++
++		ph->padlen = 4 - (optlen & 4);
++		ph->hdrlen = optlen / 8;
++		ph->nexthdr = top_iph->protocol;
++		if (ph->padlen)
++			memset(ph + 1, IPOPT_NOP, ph->padlen);
++
++		top_iph->protocol = IPPROTO_BEETPH;
++		top_iph->ihl = sizeof(struct iphdr) / 4;
++	}
++
++	top_iph->saddr = x->props.saddr.a4;
++	top_iph->daddr = x->id.daddr.a4;
++
++	return 0;
++}
++
++/* Add encapsulation header.
++ *
++ * The top IP header will be constructed per RFC 2401.
++ */
++static int xfrm4_tunnel_encap_add(struct xfrm_state *x, struct sk_buff *skb)
++{
++	struct dst_entry *dst = skb_dst(skb);
++	struct iphdr *top_iph;
++	int flags;
++
++	skb_set_inner_network_header(skb, skb_network_offset(skb));
++	skb_set_inner_transport_header(skb, skb_transport_offset(skb));
++
++	skb_set_network_header(skb, -x->props.header_len);
++	skb->mac_header = skb->network_header +
++			  offsetof(struct iphdr, protocol);
++	skb->transport_header = skb->network_header + sizeof(*top_iph);
++	top_iph = ip_hdr(skb);
++
++	top_iph->ihl = 5;
++	top_iph->version = 4;
++
++	top_iph->protocol = xfrm_af2proto(skb_dst(skb)->ops->family);
++
++	/* DS disclosing depends on XFRM_SA_XFLAG_DONT_ENCAP_DSCP */
++	if (x->props.extra_flags & XFRM_SA_XFLAG_DONT_ENCAP_DSCP)
++		top_iph->tos = 0;
++	else
++		top_iph->tos = XFRM_MODE_SKB_CB(skb)->tos;
++	top_iph->tos = INET_ECN_encapsulate(top_iph->tos,
++					    XFRM_MODE_SKB_CB(skb)->tos);
++
++	flags = x->props.flags;
++	if (flags & XFRM_STATE_NOECN)
++		IP_ECN_clear(top_iph);
++
++	top_iph->frag_off = (flags & XFRM_STATE_NOPMTUDISC) ?
++		0 : (XFRM_MODE_SKB_CB(skb)->frag_off & htons(IP_DF));
++
++	top_iph->ttl = ip4_dst_hoplimit(xfrm_dst_child(dst));
++
++	top_iph->saddr = x->props.saddr.a4;
++	top_iph->daddr = x->id.daddr.a4;
++	ip_select_ident(dev_net(dst->dev), skb, NULL);
++
++	return 0;
++}
++
++#if IS_ENABLED(CONFIG_IPV6)
++static int xfrm6_tunnel_encap_add(struct xfrm_state *x, struct sk_buff *skb)
++{
++	struct dst_entry *dst = skb_dst(skb);
++	struct ipv6hdr *top_iph;
++	int dsfield;
++
++	skb_set_inner_network_header(skb, skb_network_offset(skb));
++	skb_set_inner_transport_header(skb, skb_transport_offset(skb));
++
++	skb_set_network_header(skb, -x->props.header_len);
++	skb->mac_header = skb->network_header +
++			  offsetof(struct ipv6hdr, nexthdr);
++	skb->transport_header = skb->network_header + sizeof(*top_iph);
++	top_iph = ipv6_hdr(skb);
++
++	top_iph->version = 6;
++
++	memcpy(top_iph->flow_lbl, XFRM_MODE_SKB_CB(skb)->flow_lbl,
++	       sizeof(top_iph->flow_lbl));
++	top_iph->nexthdr = xfrm_af2proto(skb_dst(skb)->ops->family);
++
++	if (x->props.extra_flags & XFRM_SA_XFLAG_DONT_ENCAP_DSCP)
++		dsfield = 0;
++	else
++		dsfield = XFRM_MODE_SKB_CB(skb)->tos;
++	dsfield = INET_ECN_encapsulate(dsfield, XFRM_MODE_SKB_CB(skb)->tos);
++	if (x->props.flags & XFRM_STATE_NOECN)
++		dsfield &= ~INET_ECN_MASK;
++	ipv6_change_dsfield(top_iph, 0, dsfield);
++	top_iph->hop_limit = ip6_dst_hoplimit(xfrm_dst_child(dst));
++	top_iph->saddr = *(struct in6_addr *)&x->props.saddr;
++	top_iph->daddr = *(struct in6_addr *)&x->id.daddr;
++	return 0;
++}
++
++static int xfrm6_beet_encap_add(struct xfrm_state *x, struct sk_buff *skb)
++{
++	struct ipv6hdr *top_iph;
++	struct ip_beet_phdr *ph;
++	int optlen, hdr_len;
++
++	hdr_len = 0;
++	optlen = XFRM_MODE_SKB_CB(skb)->optlen;
++	if (unlikely(optlen))
++		hdr_len += IPV4_BEET_PHMAXLEN - (optlen & 4);
++
++	skb_set_network_header(skb, -x->props.header_len - hdr_len);
++	if (x->sel.family != AF_INET6)
++		skb->network_header += IPV4_BEET_PHMAXLEN;
++	skb->mac_header = skb->network_header +
++			  offsetof(struct ipv6hdr, nexthdr);
++	skb->transport_header = skb->network_header + sizeof(*top_iph);
++	ph = __skb_pull(skb, XFRM_MODE_SKB_CB(skb)->ihl - hdr_len);
++
++	xfrm6_beet_make_header(skb);
++
++	top_iph = ipv6_hdr(skb);
++	if (unlikely(optlen)) {
++		if (WARN_ON(optlen < 0))
++			return -EINVAL;
++
++		ph->padlen = 4 - (optlen & 4);
++		ph->hdrlen = optlen / 8;
++		ph->nexthdr = top_iph->nexthdr;
++		if (ph->padlen)
++			memset(ph + 1, IPOPT_NOP, ph->padlen);
++
++		top_iph->nexthdr = IPPROTO_BEETPH;
++	}
++
++	top_iph->saddr = *(struct in6_addr *)&x->props.saddr;
++	top_iph->daddr = *(struct in6_addr *)&x->id.daddr;
++	return 0;
++}
++#endif
++
++/* Add encapsulation header.
++ *
++ * On exit, the transport header will be set to the start of the
++ * encapsulation header to be filled in by x->type->output and the mac
++ * header will be set to the nextheader (protocol for IPv4) field of the
++ * extension header directly preceding the encapsulation header, or in
++ * its absence, that of the top IP header.
++ * The value of the network header will always point to the top IP header
++ * while skb->data will point to the payload.
++ */
+ static int xfrm4_prepare_output(struct xfrm_state *x, struct sk_buff *skb)
+ {
+ 	int err;
+@@ -152,7 +339,15 @@ static int xfrm4_prepare_output(struct xfrm_state *x, struct sk_buff *skb)
+ 	IPCB(skb)->flags |= IPSKB_XFRM_TUNNEL_SIZE;
+ 	skb->protocol = htons(ETH_P_IP);
+ 
+-	return x->outer_mode->output2(x, skb);
++	switch (x->outer_mode->encap) {
++	case XFRM_MODE_BEET:
++		return xfrm4_beet_encap_add(x, skb);
++	case XFRM_MODE_TUNNEL:
++		return xfrm4_tunnel_encap_add(x, skb);
++	}
++
++	WARN_ON_ONCE(1);
++	return -EOPNOTSUPP;
+ }
+ 
+ static int xfrm6_prepare_output(struct xfrm_state *x, struct sk_buff *skb)
+@@ -167,11 +362,18 @@ static int xfrm6_prepare_output(struct xfrm_state *x, struct sk_buff *skb)
+ 	skb->ignore_df = 1;
+ 	skb->protocol = htons(ETH_P_IPV6);
+ 
+-	return x->outer_mode->output2(x, skb);
+-#else
+-	WARN_ON_ONCE(1);
+-	return -EOPNOTSUPP;
++	switch (x->outer_mode->encap) {
++	case XFRM_MODE_BEET:
++		return xfrm6_beet_encap_add(x, skb);
++	case XFRM_MODE_TUNNEL:
++		return xfrm6_tunnel_encap_add(x, skb);
++	default:
++		WARN_ON_ONCE(1);
++		return -EOPNOTSUPP;
++	}
+ #endif
++	WARN_ON_ONCE(1);
++	return -EAFNOSUPPORT;
+ }
+ 
+ static int xfrm_outer_mode_output(struct xfrm_state *x, struct sk_buff *skb)
