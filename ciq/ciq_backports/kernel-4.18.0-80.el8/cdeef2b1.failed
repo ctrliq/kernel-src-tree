@@ -1,0 +1,139 @@
+net/mlx5e: Use non-delayed work for update stats
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-80.el8
+commit-author Saeed Mahameed <saeedm@mellanox.com>
+commit cdeef2b1528b6faa7a7e60de7a56c48bc6838ae6
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-80.el8/cdeef2b1.failed
+
+Convert mlx5e update stats work to a normal work structure, since it is
+never used delayed.
+
+Add a helper function to queue update stats work on demand which checks
+for some conditions and reduce code duplication to have a better
+abstraction.
+
+Fixes: ed56c5193ad8 ("net/mlx5e: Update NIC HW stats on demand only")
+	Signed-off-by: Saeed Mahameed <saeedm@mellanox.com>
+(cherry picked from commit cdeef2b1528b6faa7a7e60de7a56c48bc6838ae6)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/mellanox/mlx5/core/en_main.c
+diff --cc drivers/net/ethernet/mellanox/mlx5/core/en_main.c
+index 11fe75e05d5e,f4b11bdae879..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_main.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_main.c
+@@@ -271,10 -272,9 +271,9 @@@ static void mlx5e_update_ndo_stats(stru
+  			mlx5e_stats_grps[i].update_stats(priv);
+  }
+  
+ -static void mlx5e_update_stats_work(struct work_struct *work)
+ +void mlx5e_update_stats_work(struct work_struct *work)
+  {
+- 	struct delayed_work *dwork = to_delayed_work(work);
+- 	struct mlx5e_priv *priv = container_of(dwork, struct mlx5e_priv,
++ 	struct mlx5e_priv *priv = container_of(work, struct mlx5e_priv,
+  					       update_stats_work);
+  
+  	mutex_lock(&priv->state_lock);
+@@@ -4905,6 -4935,46 +4913,49 @@@ static const struct mlx5e_profile mlx5e
+  
+  /* mlx5e generic netdev management API (move to en_common.c) */
+  
+++<<<<<<< HEAD
+++=======
++ /* mlx5e_netdev_init/cleanup must be called from profile->init/cleanup callbacks */
++ int mlx5e_netdev_init(struct net_device *netdev,
++ 		      struct mlx5e_priv *priv,
++ 		      struct mlx5_core_dev *mdev,
++ 		      const struct mlx5e_profile *profile,
++ 		      void *ppriv)
++ {
++ 	/* priv init */
++ 	priv->mdev        = mdev;
++ 	priv->netdev      = netdev;
++ 	priv->profile     = profile;
++ 	priv->ppriv       = ppriv;
++ 	priv->msglevel    = MLX5E_MSG_LEVEL;
++ 	priv->max_opened_tc = 1;
++ 
++ 	mutex_init(&priv->state_lock);
++ 	INIT_WORK(&priv->update_carrier_work, mlx5e_update_carrier_work);
++ 	INIT_WORK(&priv->set_rx_mode_work, mlx5e_set_rx_mode_work);
++ 	INIT_WORK(&priv->tx_timeout_work, mlx5e_tx_timeout_work);
++ 	INIT_WORK(&priv->update_stats_work, mlx5e_update_stats_work);
++ 
++ 	priv->wq = create_singlethread_workqueue("mlx5e");
++ 	if (!priv->wq)
++ 		return -ENOMEM;
++ 
++ 	/* netdev init */
++ 	netif_carrier_off(netdev);
++ 
++ #ifdef CONFIG_MLX5_EN_ARFS
++ 	netdev->rx_cpu_rmap = mdev->rmap;
++ #endif
++ 
++ 	return 0;
++ }
++ 
++ void mlx5e_netdev_cleanup(struct net_device *netdev, struct mlx5e_priv *priv)
++ {
++ 	destroy_workqueue(priv->wq);
++ }
++ 
+++>>>>>>> cdeef2b1528b (net/mlx5e: Use non-delayed work for update stats)
+  struct net_device *mlx5e_create_netdev(struct mlx5_core_dev *mdev,
+  				       const struct mlx5e_profile *profile,
+  				       void *ppriv)
+@@@ -4997,10 -5044,8 +5048,10 @@@ void mlx5e_detach_netdev(struct mlx5e_p
+  	flush_workqueue(priv->wq);
+  
+  	profile->cleanup_rx(priv);
+ +	mlx5e_close_drop_rq(&priv->drop_rq);
+ +	mlx5e_destroy_q_counters(priv);
+  	profile->cleanup_tx(priv);
+- 	cancel_delayed_work_sync(&priv->update_stats_work);
++ 	cancel_work_sync(&priv->update_stats_work);
+  }
+  
+  void mlx5e_destroy_netdev(struct mlx5e_priv *priv)
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/en.h b/drivers/net/ethernet/mellanox/mlx5/core/en.h
+index 6ddc006bb555..3d44bfef9cb5 100644
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en.h
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en.h
+@@ -807,7 +807,7 @@ struct mlx5e_priv {
+ 	struct work_struct         update_carrier_work;
+ 	struct work_struct         set_rx_mode_work;
+ 	struct work_struct         tx_timeout_work;
+-	struct delayed_work        update_stats_work;
++	struct work_struct         update_stats_work;
+ 
+ 	struct mlx5_core_dev      *mdev;
+ 	struct net_device         *netdev;
+@@ -1112,6 +1112,7 @@ int mlx5e_close(struct net_device *netdev);
+ int mlx5e_open(struct net_device *netdev);
+ void mlx5e_update_stats_work(struct work_struct *work);
+ 
++void mlx5e_queue_update_stats(struct mlx5e_priv *priv);
+ int mlx5e_bits_invert(unsigned long a, int size);
+ 
+ typedef int (*change_hw_mtu_cb)(struct mlx5e_priv *priv);
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/en_main.c
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/en_rep.c b/drivers/net/ethernet/mellanox/mlx5/core/en_rep.c
+index 8e3c5b4b90ab..8da9cab5810a 100644
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_rep.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_rep.c
+@@ -898,8 +898,7 @@ mlx5e_rep_get_stats(struct net_device *dev, struct rtnl_link_stats64 *stats)
+ 	struct mlx5e_priv *priv = netdev_priv(dev);
+ 
+ 	/* update HW stats in background for next time */
+-	queue_delayed_work(priv->wq, &priv->update_stats_work, 0);
+-
++	mlx5e_queue_update_stats(priv);
+ 	memcpy(stats, &priv->stats.vf_vport, sizeof(*stats));
+ }
+ 
