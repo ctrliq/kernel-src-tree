@@ -1,0 +1,239 @@
+bpf: Enable BPF_PROG_TEST_RUN for raw_tracepoint
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-315.el8
+commit-author Song Liu <songliubraving@fb.com>
+commit 1b4d60ec162f82ea29a2e7a907b5c6cc9f926321
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-315.el8/1b4d60ec.failed
+
+Add .test_run for raw_tracepoint. Also, introduce a new feature that runs
+the target program on a specific CPU. This is achieved by a new flag in
+bpf_attr.test, BPF_F_TEST_RUN_ON_CPU. When this flag is set, the program
+is triggered on cpu with id bpf_attr.test.cpu. This feature is needed for
+BPF programs that handle perf_event and other percpu resources, as the
+program can access these resource locally.
+
+	Signed-off-by: Song Liu <songliubraving@fb.com>
+	Signed-off-by: Daniel Borkmann <daniel@iogearbox.net>
+	Acked-by: John Fastabend <john.fastabend@gmail.com>
+	Acked-by: Andrii Nakryiko <andriin@fb.com>
+Link: https://lore.kernel.org/bpf/20200925205432.1777-2-songliubraving@fb.com
+(cherry picked from commit 1b4d60ec162f82ea29a2e7a907b5c6cc9f926321)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/uapi/linux/bpf.h
+diff --cc include/uapi/linux/bpf.h
+index 5b1f16fa3668,82522f05c021..000000000000
+--- a/include/uapi/linux/bpf.h
++++ b/include/uapi/linux/bpf.h
+@@@ -571,7 -571,8 +576,12 @@@ union bpf_attr 
+  						 */
+  		__aligned_u64	ctx_in;
+  		__aligned_u64	ctx_out;
+++<<<<<<< HEAD
+ +#endif /* __GENKSYMS__ */
+++=======
++ 		__u32		flags;
++ 		__u32		cpu;
+++>>>>>>> 1b4d60ec162f (bpf: Enable BPF_PROG_TEST_RUN for raw_tracepoint)
+  	} test;
+  
+  	struct { /* anonymous struct used by BPF_*_GET_*_ID */
+diff --git a/include/linux/bpf.h b/include/linux/bpf.h
+index 053d32afdbe1..196709a12bdf 100644
+--- a/include/linux/bpf.h
++++ b/include/linux/bpf.h
+@@ -1399,6 +1399,9 @@ int bpf_prog_test_run_tracing(struct bpf_prog *prog,
+ int bpf_prog_test_run_flow_dissector(struct bpf_prog *prog,
+ 				     const union bpf_attr *kattr,
+ 				     union bpf_attr __user *uattr);
++int bpf_prog_test_run_raw_tp(struct bpf_prog *prog,
++			     const union bpf_attr *kattr,
++			     union bpf_attr __user *uattr);
+ bool btf_ctx_access(int off, int size, enum bpf_access_type type,
+ 		    const struct bpf_prog *prog,
+ 		    struct bpf_insn_access_aux *info);
+* Unmerged path include/uapi/linux/bpf.h
+diff --git a/kernel/bpf/syscall.c b/kernel/bpf/syscall.c
+index 70e6c7e995cb..7e2f897b8712 100644
+--- a/kernel/bpf/syscall.c
++++ b/kernel/bpf/syscall.c
+@@ -3121,7 +3121,7 @@ static int bpf_prog_query(const union bpf_attr *attr,
+ 	}
+ }
+ 
+-#define BPF_PROG_TEST_RUN_LAST_FIELD test.ctx_out
++#define BPF_PROG_TEST_RUN_LAST_FIELD test.cpu
+ 
+ static int bpf_prog_test_run(const union bpf_attr *attr,
+ 			     union bpf_attr __user *uattr)
+diff --git a/kernel/trace/bpf_trace.c b/kernel/trace/bpf_trace.c
+index fa9081cef38b..07dbdf89ade5 100644
+--- a/kernel/trace/bpf_trace.c
++++ b/kernel/trace/bpf_trace.c
+@@ -1613,6 +1613,7 @@ const struct bpf_verifier_ops raw_tracepoint_verifier_ops = {
+ };
+ 
+ const struct bpf_prog_ops raw_tracepoint_prog_ops = {
++	.test_run = bpf_prog_test_run_raw_tp,
+ };
+ 
+ const struct bpf_verifier_ops tracing_verifier_ops = {
+diff --git a/net/bpf/test_run.c b/net/bpf/test_run.c
+index 21ab2f2323c4..b690344710d8 100644
+--- a/net/bpf/test_run.c
++++ b/net/bpf/test_run.c
+@@ -14,6 +14,7 @@
+ #include <net/sock.h>
+ #include <net/tcp.h>
+ #include <linux/error-injection.h>
++#include <linux/smp.h>
+ 
+ #define CREATE_TRACE_POINTS
+ #include <trace/events/bpf_test_run.h>
+@@ -207,6 +208,9 @@ int bpf_prog_test_run_tracing(struct bpf_prog *prog,
+ 	int b = 2, err = -EFAULT;
+ 	u32 retval = 0;
+ 
++	if (kattr->test.flags || kattr->test.cpu)
++		return -EINVAL;
++
+ 	switch (prog->expected_attach_type) {
+ 	case BPF_TRACE_FENTRY:
+ 	case BPF_TRACE_FEXIT:
+@@ -239,6 +243,87 @@ int bpf_prog_test_run_tracing(struct bpf_prog *prog,
+ 	return err;
+ }
+ 
++struct bpf_raw_tp_test_run_info {
++	struct bpf_prog *prog;
++	void *ctx;
++	u32 retval;
++};
++
++static void
++__bpf_prog_test_run_raw_tp(void *data)
++{
++	struct bpf_raw_tp_test_run_info *info = data;
++
++	rcu_read_lock();
++	migrate_disable();
++	info->retval = BPF_PROG_RUN(info->prog, info->ctx);
++	migrate_enable();
++	rcu_read_unlock();
++}
++
++int bpf_prog_test_run_raw_tp(struct bpf_prog *prog,
++			     const union bpf_attr *kattr,
++			     union bpf_attr __user *uattr)
++{
++	void __user *ctx_in = u64_to_user_ptr(kattr->test.ctx_in);
++	__u32 ctx_size_in = kattr->test.ctx_size_in;
++	struct bpf_raw_tp_test_run_info info;
++	int cpu = kattr->test.cpu, err = 0;
++
++	/* doesn't support data_in/out, ctx_out, duration, or repeat */
++	if (kattr->test.data_in || kattr->test.data_out ||
++	    kattr->test.ctx_out || kattr->test.duration ||
++	    kattr->test.repeat)
++		return -EINVAL;
++
++	if (ctx_size_in < prog->aux->max_ctx_offset)
++		return -EINVAL;
++
++	if ((kattr->test.flags & BPF_F_TEST_RUN_ON_CPU) == 0 && cpu != 0)
++		return -EINVAL;
++
++	if (ctx_size_in) {
++		info.ctx = kzalloc(ctx_size_in, GFP_USER);
++		if (!info.ctx)
++			return -ENOMEM;
++		if (copy_from_user(info.ctx, ctx_in, ctx_size_in)) {
++			err = -EFAULT;
++			goto out;
++		}
++	} else {
++		info.ctx = NULL;
++	}
++
++	info.prog = prog;
++
++	if ((kattr->test.flags & BPF_F_TEST_RUN_ON_CPU) == 0 ||
++	    cpu == smp_processor_id()) {
++		__bpf_prog_test_run_raw_tp(&info);
++	} else {
++		/* smp_call_function_single() also checks cpu_online()
++		 * after csd_lock(). However, since cpu is from user
++		 * space, let's do an extra quick check to filter out
++		 * invalid value before smp_call_function_single().
++		 */
++		if (cpu >= nr_cpu_ids || !cpu_online(cpu)) {
++			err = -ENXIO;
++			goto out;
++		}
++
++		err = smp_call_function_single(cpu, __bpf_prog_test_run_raw_tp,
++					       &info, 1);
++		if (err)
++			goto out;
++	}
++
++	if (copy_to_user(&uattr->test.retval, &info.retval, sizeof(u32)))
++		err = -EFAULT;
++
++out:
++	kfree(info.ctx);
++	return err;
++}
++
+ static void *bpf_ctx_init(const union bpf_attr *kattr, u32 max_size)
+ {
+ 	void __user *data_in = u64_to_user_ptr(kattr->test.ctx_in);
+@@ -413,6 +498,9 @@ int bpf_prog_test_run_skb(struct bpf_prog *prog, const union bpf_attr *kattr,
+ 	void *data;
+ 	int ret;
+ 
++	if (kattr->test.flags || kattr->test.cpu)
++		return -EINVAL;
++
+ 	data = bpf_test_init(kattr, size, NET_SKB_PAD + NET_IP_ALIGN,
+ 			     SKB_DATA_ALIGN(sizeof(struct skb_shared_info)));
+ 	if (IS_ERR(data))
+@@ -610,6 +698,9 @@ int bpf_prog_test_run_flow_dissector(struct bpf_prog *prog,
+ 	if (prog->type != BPF_PROG_TYPE_FLOW_DISSECTOR)
+ 		return -EINVAL;
+ 
++	if (kattr->test.flags || kattr->test.cpu)
++		return -EINVAL;
++
+ 	if (size < ETH_HLEN)
+ 		return -EINVAL;
+ 
+diff --git a/tools/include/uapi/linux/bpf.h b/tools/include/uapi/linux/bpf.h
+index 1defa5f24063..7ad984e3f47d 100644
+--- a/tools/include/uapi/linux/bpf.h
++++ b/tools/include/uapi/linux/bpf.h
+@@ -414,6 +414,11 @@ enum {
+  */
+ #define BPF_F_QUERY_EFFECTIVE	(1U << 0)
+ 
++/* Flags for BPF_PROG_TEST_RUN */
++
++/* If set, run the test on the cpu specified by bpf_attr.test.cpu */
++#define BPF_F_TEST_RUN_ON_CPU	(1U << 0)
++
+ /* type for BPF_ENABLE_STATS */
+ enum bpf_stats_type {
+ 	/* enabled run_time_ns and run_cnt */
+@@ -556,6 +561,8 @@ union bpf_attr {
+ 						 */
+ 		__aligned_u64	ctx_in;
+ 		__aligned_u64	ctx_out;
++		__u32		flags;
++		__u32		cpu;
+ 	} test;
+ 
+ 	struct { /* anonymous struct used by BPF_*_GET_*_ID */
