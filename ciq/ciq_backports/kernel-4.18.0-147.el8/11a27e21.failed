@@ -1,0 +1,163 @@
+iw_cxgb4: complete the cached SRQ buffers
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-147.el8
+commit-author Raju Rangoju <rajur@chelsio.com>
+commit 11a27e2121a544cae2dde62df9218b3d5d888a02
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-147.el8/11a27e21.failed
+
+If TP fetches an SRQ buffer but ends up not using it before the connection
+is aborted, then it passes the index of that SRQ buffer to the host in
+ABORT_REQ_RSS or ABORT_RPL CPL message.
+
+But, if the srqidx field is zero in the received ABORT_RPL or
+ABORT_REQ_RSS CPL, then we need to read the tcb.rq_start field to see if
+it really did have an RQE cached. This works around a case where HW does
+not include the srqidx in the ABORT_RPL/ABORT_REQ_RSS CPL.
+
+The final value of rq_start is the one present in TCB with the
+TF_RX_PDU_OUT bit cleared. So, we need to read the TCB, examine the
+TF_RX_PDU_OUT (bit 49 of t_flags) in order to determine if there's a rx
+PDU feedback event pending.
+
+	Signed-off-by: Raju Rangoju <rajur@chelsio.com>
+	Signed-off-by: Jason Gunthorpe <jgg@mellanox.com>
+(cherry picked from commit 11a27e2121a544cae2dde62df9218b3d5d888a02)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/infiniband/hw/cxgb4/cm.c
+diff --cc drivers/infiniband/hw/cxgb4/cm.c
+index b66e582d4364,b188d89674f1..000000000000
+--- a/drivers/infiniband/hw/cxgb4/cm.c
++++ b/drivers/infiniband/hw/cxgb4/cm.c
+@@@ -1852,10 -1888,31 +1889,34 @@@ static int rx_data(struct c4iw_dev *dev
+  	return 0;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static void complete_cached_srq_buffers(struct c4iw_ep *ep, u32 srqidx)
++ {
++ 	enum chip_type adapter_type;
++ 
++ 	adapter_type = ep->com.dev->rdev.lldi.adapter_type;
++ 
++ 	/*
++ 	 * If this TCB had a srq buffer cached, then we must complete
++ 	 * it. For user mode, that means saving the srqidx in the
++ 	 * user/kernel status page for this qp.  For kernel mode, just
++ 	 * synthesize the CQE now.
++ 	 */
++ 	if (CHELSIO_CHIP_VERSION(adapter_type) > CHELSIO_T5 && srqidx) {
++ 		if (ep->com.qp->ibqp.uobject)
++ 			t4_set_wq_in_error(&ep->com.qp->wq, srqidx);
++ 		else
++ 			c4iw_flush_srqidx(ep->com.qp, srqidx);
++ 	}
++ }
++ 
+++>>>>>>> 11a27e2121a5 (iw_cxgb4: complete the cached SRQ buffers)
+  static int abort_rpl(struct c4iw_dev *dev, struct sk_buff *skb)
+  {
++ 	u32 srqidx;
+  	struct c4iw_ep *ep;
+ -	struct cpl_abort_rpl_rss6 *rpl = cplhdr(skb);
+ +	struct cpl_abort_rpl_rss *rpl = cplhdr(skb);
+  	int release = 0;
+  	unsigned int tid = GET_TID(rpl);
+  
+@@@ -1864,6 -1921,12 +1925,15 @@@
+  		pr_warn("Abort rpl to freed endpoint\n");
+  		return 0;
+  	}
+++<<<<<<< HEAD
+++=======
++ 
++ 	if (ep->com.qp && ep->com.qp->srq) {
++ 		srqidx = ABORT_RSS_SRQIDX_G(be32_to_cpu(rpl->srqidx_status));
++ 		complete_cached_srq_buffers(ep, srqidx ? srqidx : ep->srqe_idx);
++ 	}
++ 
+++>>>>>>> 11a27e2121a5 (iw_cxgb4: complete the cached SRQ buffers)
+  	pr_debug("ep %p tid %u\n", ep, ep->hwtid);
+  	mutex_lock(&ep->com.mutex);
+  	switch (ep->com.state) {
+@@@ -2721,15 -2784,33 +2791,36 @@@ static int peer_close(struct c4iw_dev *
+  	return 0;
+  }
+  
++ static void finish_peer_abort(struct c4iw_dev *dev, struct c4iw_ep *ep)
++ {
++ 	complete_cached_srq_buffers(ep, ep->srqe_idx);
++ 	if (ep->com.cm_id && ep->com.qp) {
++ 		struct c4iw_qp_attributes attrs;
++ 
++ 		attrs.next_state = C4IW_QP_STATE_ERROR;
++ 		c4iw_modify_qp(ep->com.qp->rhp, ep->com.qp,
++ 			       C4IW_QP_ATTR_NEXT_STATE,	&attrs, 1);
++ 	}
++ 	peer_abort_upcall(ep);
++ 	release_ep_resources(ep);
++ 	c4iw_put_ep(&ep->com);
++ }
++ 
+  static int peer_abort(struct c4iw_dev *dev, struct sk_buff *skb)
+  {
+ -	struct cpl_abort_req_rss6 *req = cplhdr(skb);
+ +	struct cpl_abort_req_rss *req = cplhdr(skb);
+  	struct c4iw_ep *ep;
+  	struct sk_buff *rpl_skb;
+  	struct c4iw_qp_attributes attrs;
+  	int ret;
+  	int release = 0;
+  	unsigned int tid = GET_TID(req);
+++<<<<<<< HEAD
+++=======
++ 	u8 status;
++ 	u32 srqidx;
++ 
+++>>>>>>> 11a27e2121a5 (iw_cxgb4: complete the cached SRQ buffers)
+  	u32 len = roundup(sizeof(struct cpl_abort_rpl), 16);
+  
+  	ep = get_ep_from_tid(dev, tid);
+@@@ -2745,6 -2828,7 +2836,10 @@@
+  		mutex_unlock(&dev->rdev.stats.lock);
+  		goto deref_ep;
+  	}
+++<<<<<<< HEAD
+++=======
++ 
+++>>>>>>> 11a27e2121a5 (iw_cxgb4: complete the cached SRQ buffers)
+  	pr_debug("ep %p tid %u state %u\n", ep, ep->hwtid,
+  		 ep->com.state);
+  	set_bit(PEER_ABORT, &ep->com.history);
+* Unmerged path drivers/infiniband/hw/cxgb4/cm.c
+diff --git a/drivers/infiniband/hw/cxgb4/iw_cxgb4.h b/drivers/infiniband/hw/cxgb4/iw_cxgb4.h
+index 3235052a122e..5723ea817c7f 100644
+--- a/drivers/infiniband/hw/cxgb4/iw_cxgb4.h
++++ b/drivers/infiniband/hw/cxgb4/iw_cxgb4.h
+@@ -982,6 +982,9 @@ struct c4iw_ep {
+ 	int rcv_win;
+ 	u32 snd_wscale;
+ 	struct c4iw_ep_stats stats;
++	u32 srqe_idx;
++	u32 rx_pdu_out_cnt;
++	struct sk_buff *peer_abort_skb;
+ };
+ 
+ static inline struct c4iw_ep *to_ep(struct iw_cm_id *cm_id)
+diff --git a/drivers/infiniband/hw/cxgb4/t4.h b/drivers/infiniband/hw/cxgb4/t4.h
+index b84891285c02..72d882946c89 100644
+--- a/drivers/infiniband/hw/cxgb4/t4.h
++++ b/drivers/infiniband/hw/cxgb4/t4.h
+@@ -35,6 +35,7 @@
+ #include "t4_regs.h"
+ #include "t4_values.h"
+ #include "t4_msg.h"
++#include "t4_tcb.h"
+ #include "t4fw_ri_api.h"
+ 
+ #define T4_MAX_NUM_PD 65536
