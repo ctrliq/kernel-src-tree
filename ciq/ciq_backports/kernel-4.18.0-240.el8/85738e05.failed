@@ -1,0 +1,120 @@
+arm64: kvm: Unmask PMR before entering guest
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Julien Thierry <julien.thierry@arm.com>
+commit 85738e05dc38a80921e1e1944e5b835f6668fc30
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/85738e05.failed
+
+Interrupts masked by ICC_PMR_EL1 will not be signaled to the CPU. This
+means that hypervisor will not receive masked interrupts while running a
+guest.
+
+We need to make sure that all maskable interrupts are masked from the
+time we call local_irq_disable() in the main run loop, and remain so
+until we call local_irq_enable() after returning from the guest, and we
+need to ensure that we see no interrupts at all (including pseudo-NMIs)
+in the middle of the VM world-switch, while at the same time we need to
+ensure we exit the guest when there are interrupts for the host.
+
+We can accomplish this with pseudo-NMIs enabled by:
+  (1) local_irq_disable: set the priority mask
+  (2) enter guest: set PSTATE.I
+  (3)              clear the priority mask
+  (4) eret to guest
+  (5) exit guest:  set the priotiy mask
+                   clear PSTATE.I (and restore other host PSTATE bits)
+  (6) local_irq_enable: clear the priority mask.
+
+	Signed-off-by: Julien Thierry <julien.thierry@arm.com>
+	Acked-by: Catalin Marinas <catalin.marinas@arm.com>
+	Reviewed-by: Marc Zyngier <marc.zyngier@arm.com>
+	Reviewed-by: Christoffer Dall <christoffer.dall@arm.com>
+	Cc: Christoffer Dall <christoffer.dall@arm.com>
+	Cc: Marc Zyngier <marc.zyngier@arm.com>
+	Cc: Will Deacon <will.deacon@arm.com>
+	Cc: kvmarm@lists.cs.columbia.edu
+	Signed-off-by: Catalin Marinas <catalin.marinas@arm.com>
+(cherry picked from commit 85738e05dc38a80921e1e1944e5b835f6668fc30)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/arm64/include/asm/kvm_host.h
+#	arch/arm64/kvm/hyp/switch.c
+diff --cc arch/arm64/include/asm/kvm_host.h
+index 4ee1459d6b92,292c88263fd1..000000000000
+--- a/arch/arm64/include/asm/kvm_host.h
++++ b/arch/arm64/include/asm/kvm_host.h
+@@@ -22,14 -22,10 +22,18 @@@
+  #ifndef __ARM64_KVM_HOST_H__
+  #define __ARM64_KVM_HOST_H__
+  
+ +#include <linux/bitmap.h>
+  #include <linux/types.h>
+ +#include <linux/jump_label.h>
+  #include <linux/kvm_types.h>
+++<<<<<<< HEAD
+ +#include <linux/percpu.h>
+ +#include <asm/barrier.h>
+++=======
++ #include <asm/arch_gicv3.h>
+++>>>>>>> 85738e05dc38 (arm64: kvm: Unmask PMR before entering guest)
+  #include <asm/cpufeature.h>
+ +#include <asm/cputype.h>
+  #include <asm/daifflags.h>
+  #include <asm/fpsimd.h>
+  #include <asm/kvm.h>
+diff --cc arch/arm64/kvm/hyp/switch.c
+index 831e5cb08fb5,6a4c2d6c3287..000000000000
+--- a/arch/arm64/kvm/hyp/switch.c
++++ b/arch/arm64/kvm/hyp/switch.c
+@@@ -23,8 -22,8 +23,9 @@@
+  
+  #include <kvm/arm_psci.h>
+  
++ #include <asm/arch_gicv3.h>
+  #include <asm/cpufeature.h>
+ +#include <asm/kprobes.h>
+  #include <asm/kvm_asm.h>
+  #include <asm/kvm_emulate.h>
+  #include <asm/kvm_host.h>
+@@@ -656,9 -520,19 +657,20 @@@ int __hyp_text __kvm_vcpu_run_nvhe(stru
+  {
+  	struct kvm_cpu_context *host_ctxt;
+  	struct kvm_cpu_context *guest_ctxt;
+ +	bool pmu_switch_needed;
+  	u64 exit_code;
+  
++ 	/*
++ 	 * Having IRQs masked via PMR when entering the guest means the GIC
++ 	 * will not signal the CPU of interrupts of lower priority, and the
++ 	 * only way to get out will be via guest exceptions.
++ 	 * Naturally, we want to avoid this.
++ 	 */
++ 	if (system_uses_irq_prio_masking()) {
++ 		gic_write_pmr(GIC_PRIO_IRQON);
++ 		dsb(sy);
++ 	}
++ 
+  	vcpu = kern_hyp_va(vcpu);
+  
+  	host_ctxt = kern_hyp_va(vcpu->arch.host_cpu_context);
+@@@ -713,8 -585,9 +725,14 @@@
+  	 */
+  	__debug_switch_to_host(vcpu);
+  
+++<<<<<<< HEAD
+ +	if (pmu_switch_needed)
+ +		__pmu_switch_to_host(host_ctxt);
+++=======
++ 	/* Returning to host will clear PSR.I, remask PMR if needed */
++ 	if (system_uses_irq_prio_masking())
++ 		gic_write_pmr(GIC_PRIO_IRQOFF);
+++>>>>>>> 85738e05dc38 (arm64: kvm: Unmask PMR before entering guest)
+  
+  	return exit_code;
+  }
+* Unmerged path arch/arm64/include/asm/kvm_host.h
+* Unmerged path arch/arm64/kvm/hyp/switch.c
