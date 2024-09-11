@@ -1,0 +1,454 @@
+mm: consolidate the get_user_pages* implementations
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Christoph Hellwig <hch@lst.de>
+commit 050a9adc64383aed3429a31432b4f5a7b0cdc8ac
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/050a9adc.failed
+
+Always build mm/gup.c so that we don't have to provide separate nommu
+stubs.  Also merge the get_user_pages_fast and __get_user_pages_fast stubs
+when HAVE_FAST_GUP into the main implementations, which will never call
+the fast path if HAVE_FAST_GUP is not set.
+
+This also ensures the new put_user_pages* helpers are available for nommu,
+as those are currently missing, which would create a problem as soon as we
+actually grew users for it.
+
+Link: http://lkml.kernel.org/r/20190625143715.1689-13-hch@lst.de
+	Signed-off-by: Christoph Hellwig <hch@lst.de>
+	Cc: Andrey Konovalov <andreyknvl@google.com>
+	Cc: Benjamin Herrenschmidt <benh@kernel.crashing.org>
+	Cc: David Miller <davem@davemloft.net>
+	Cc: James Hogan <jhogan@kernel.org>
+	Cc: Jason Gunthorpe <jgg@mellanox.com>
+	Cc: Khalid Aziz <khalid.aziz@oracle.com>
+	Cc: Michael Ellerman <mpe@ellerman.id.au>
+	Cc: Nicholas Piggin <npiggin@gmail.com>
+	Cc: Paul Burton <paul.burton@mips.com>
+	Cc: Paul Mackerras <paulus@samba.org>
+	Cc: Ralf Baechle <ralf@linux-mips.org>
+	Cc: Rich Felker <dalias@libc.org>
+	Cc: Yoshinori Sato <ysato@users.sourceforge.jp>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit 050a9adc64383aed3429a31432b4f5a7b0cdc8ac)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	mm/Kconfig
+#	mm/Makefile
+#	mm/util.c
+diff --cc mm/Kconfig
+index ba2bdef1230d,48840b28482b..000000000000
+--- a/mm/Kconfig
++++ b/mm/Kconfig
+@@@ -130,10 -132,11 +130,15 @@@ config HAVE_MEMBLOCK_NODE_MA
+  config HAVE_MEMBLOCK_PHYS_MAP
+  	bool
+  
+++<<<<<<< HEAD
+ +config HAVE_GENERIC_GUP
+++=======
++ config HAVE_FAST_GUP
++ 	depends on MMU
+++>>>>>>> 050a9adc6438 (mm: consolidate the get_user_pages* implementations)
+  	bool
+  
+ -config ARCH_KEEP_MEMBLOCK
+ +config ARCH_DISCARD_MEMBLOCK
+  	bool
+  
+  config MEMORY_ISOLATION
+diff --cc mm/Makefile
+index 14638478a5a7,dc0746ca1109..000000000000
+--- a/mm/Makefile
++++ b/mm/Makefile
+@@@ -22,10 -22,10 +22,17 @@@ KCOV_INSTRUMENT_mmzone.o := 
+  KCOV_INSTRUMENT_vmstat.o := n
+  
+  mmu-y			:= nommu.o
+++<<<<<<< HEAD
+ +mmu-$(CONFIG_MMU)	:= gup.o highmem.o memory.o mincore.o \
+ +			   mlock.o mmap.o mprotect.o mremap.o msync.o \
+ +			   page_vma_mapped.o pagewalk.o pgtable-generic.o \
+ +			   rmap.o vmalloc.o
+++=======
++ mmu-$(CONFIG_MMU)	:= highmem.o memory.o mincore.o \
++ 			   mlock.o mmap.o mmu_gather.o mprotect.o mremap.o \
++ 			   msync.o page_vma_mapped.o pagewalk.o \
++ 			   pgtable-generic.o rmap.o vmalloc.o
+++>>>>>>> 050a9adc6438 (mm: consolidate the get_user_pages* implementations)
+  
+  
+  ifdef CONFIG_CROSS_MEMORY_ATTACH
+diff --cc mm/util.c
+index e99de9d3c8ae,68575a315dc5..000000000000
+--- a/mm/util.c
++++ b/mm/util.c
+@@@ -288,127 -300,6 +288,130 @@@ void arch_pick_mmap_layout(struct mm_st
+  }
+  #endif
+  
+++<<<<<<< HEAD
+ +/*
+ + * Like get_user_pages_fast() except its IRQ-safe in that it won't fall
+ + * back to the regular GUP.
+ + * Note a difference with get_user_pages_fast: this always returns the
+ + * number of pages pinned, 0 if no pages were pinned.
+ + * If the architecture does not support this function, simply return with no
+ + * pages pinned.
+ + */
+ +int __weak __get_user_pages_fast(unsigned long start,
+ +				 int nr_pages, int write, struct page **pages)
+ +{
+ +	return 0;
+ +}
+ +EXPORT_SYMBOL_GPL(__get_user_pages_fast);
+ +
+ +/**
+ + * get_user_pages_fast() - pin user pages in memory
+ + * @start:	starting user address
+ + * @nr_pages:	number of pages from start to pin
+ + * @gup_flags:	flags modifying pin behaviour
+ + * @pages:	array that receives pointers to the pages pinned.
+ + *		Should be at least nr_pages long.
+ + *
+ + * Returns number of pages pinned. This may be fewer than the number
+ + * requested. If nr_pages is 0 or negative, returns 0. If no pages
+ + * were pinned, returns -errno.
+ + *
+ + * get_user_pages_fast provides equivalent functionality to get_user_pages,
+ + * operating on current and current->mm, with force=0 and vma=NULL. However
+ + * unlike get_user_pages, it must be called without mmap_sem held.
+ + *
+ + * get_user_pages_fast may take mmap_sem and page table locks, so no
+ + * assumptions can be made about lack of locking. get_user_pages_fast is to be
+ + * implemented in a way that is advantageous (vs get_user_pages()) when the
+ + * user memory area is already faulted in and present in ptes. However if the
+ + * pages have to be faulted in, it may turn out to be slightly slower so
+ + * callers need to carefully consider what to use. On many architectures,
+ + * get_user_pages_fast simply falls back to get_user_pages.
+ + */
+ +int __weak get_user_pages_fast(unsigned long start,
+ +				int nr_pages, unsigned int gup_flags,
+ +				struct page **pages)
+ +{
+ +	return get_user_pages_unlocked(start, nr_pages, pages, gup_flags);
+ +}
+ +EXPORT_SYMBOL_GPL(get_user_pages_fast);
+ +
+ +/**
+ + * __account_locked_vm - account locked pages to an mm's locked_vm
+ + * @mm:          mm to account against
+ + * @pages:       number of pages to account
+ + * @inc:         %true if @pages should be considered positive, %false if not
+ + * @task:        task used to check RLIMIT_MEMLOCK
+ + * @bypass_rlim: %true if checking RLIMIT_MEMLOCK should be skipped
+ + *
+ + * Assumes @task and @mm are valid (i.e. at least one reference on each), and
+ + * that mmap_sem is held as writer.
+ + *
+ + * Return:
+ + * * 0       on success
+ + * * -ENOMEM if RLIMIT_MEMLOCK would be exceeded.
+ + */
+ +int __account_locked_vm(struct mm_struct *mm, unsigned long pages, bool inc,
+ +			struct task_struct *task, bool bypass_rlim)
+ +{
+ +	unsigned long locked_vm, limit;
+ +	int ret = 0;
+ +
+ +	lockdep_assert_held_exclusive(&mm->mmap_sem);
+ +
+ +	locked_vm = mm->locked_vm;
+ +	if (inc) {
+ +		if (!bypass_rlim) {
+ +			limit = task_rlimit(task, RLIMIT_MEMLOCK) >> PAGE_SHIFT;
+ +			if (locked_vm + pages > limit)
+ +				ret = -ENOMEM;
+ +		}
+ +		if (!ret)
+ +			mm->locked_vm = locked_vm + pages;
+ +	} else {
+ +		WARN_ON_ONCE(pages > locked_vm);
+ +		mm->locked_vm = locked_vm - pages;
+ +	}
+ +
+ +	pr_debug("%s: [%d] caller %ps %c%lu %lu/%lu%s\n", __func__, task->pid,
+ +		 (void *)_RET_IP_, (inc) ? '+' : '-', pages << PAGE_SHIFT,
+ +		 locked_vm << PAGE_SHIFT, task_rlimit(task, RLIMIT_MEMLOCK),
+ +		 ret ? " - exceeded" : "");
+ +
+ +	return ret;
+ +}
+ +EXPORT_SYMBOL_GPL(__account_locked_vm);
+ +
+ +/**
+ + * account_locked_vm - account locked pages to an mm's locked_vm
+ + * @mm:          mm to account against, may be NULL
+ + * @pages:       number of pages to account
+ + * @inc:         %true if @pages should be considered positive, %false if not
+ + *
+ + * Assumes a non-NULL @mm is valid (i.e. at least one reference on it).
+ + *
+ + * Return:
+ + * * 0       on success, or if mm is NULL
+ + * * -ENOMEM if RLIMIT_MEMLOCK would be exceeded.
+ + */
+ +int account_locked_vm(struct mm_struct *mm, unsigned long pages, bool inc)
+ +{
+ +	int ret;
+ +
+ +	if (pages == 0 || !mm)
+ +		return 0;
+ +
+ +	down_write(&mm->mmap_sem);
+ +	ret = __account_locked_vm(mm, pages, inc, current,
+ +				  capable(CAP_IPC_LOCK));
+ +	up_write(&mm->mmap_sem);
+ +
+ +	return ret;
+ +}
+ +EXPORT_SYMBOL_GPL(account_locked_vm);
+ +
+++=======
+++>>>>>>> 050a9adc6438 (mm: consolidate the get_user_pages* implementations)
+  unsigned long vm_mmap_pgoff(struct file *file, unsigned long addr,
+  	unsigned long len, unsigned long prot,
+  	unsigned long flag, unsigned long pgoff)
+* Unmerged path mm/Kconfig
+* Unmerged path mm/Makefile
+diff --git a/mm/gup.c b/mm/gup.c
+index 04d61d5fd8ac..2d652338b1a9 100644
+--- a/mm/gup.c
++++ b/mm/gup.c
+@@ -118,6 +118,7 @@ void put_user_pages(struct page **pages, unsigned long npages)
+ }
+ EXPORT_SYMBOL(put_user_pages);
+ 
++#ifdef CONFIG_MMU
+ static struct page *no_page_table(struct vm_area_struct *vma,
+ 		unsigned int flags)
+ {
+@@ -1309,6 +1310,51 @@ struct page *get_dump_page(unsigned long addr)
+ 	return page;
+ }
+ #endif /* CONFIG_ELF_CORE */
++#else /* CONFIG_MMU */
++static long __get_user_pages_locked(struct task_struct *tsk,
++		struct mm_struct *mm, unsigned long start,
++		unsigned long nr_pages, struct page **pages,
++		struct vm_area_struct **vmas, int *locked,
++		unsigned int foll_flags)
++{
++	struct vm_area_struct *vma;
++	unsigned long vm_flags;
++	int i;
++
++	/* calculate required read or write permissions.
++	 * If FOLL_FORCE is set, we only require the "MAY" flags.
++	 */
++	vm_flags  = (foll_flags & FOLL_WRITE) ?
++			(VM_WRITE | VM_MAYWRITE) : (VM_READ | VM_MAYREAD);
++	vm_flags &= (foll_flags & FOLL_FORCE) ?
++			(VM_MAYREAD | VM_MAYWRITE) : (VM_READ | VM_WRITE);
++
++	for (i = 0; i < nr_pages; i++) {
++		vma = find_vma(mm, start);
++		if (!vma)
++			goto finish_or_fault;
++
++		/* protect what we can, including chardevs */
++		if ((vma->vm_flags & (VM_IO | VM_PFNMAP)) ||
++		    !(vm_flags & vma->vm_flags))
++			goto finish_or_fault;
++
++		if (pages) {
++			pages[i] = virt_to_page(start);
++			if (pages[i])
++				get_page(pages[i]);
++		}
++		if (vmas)
++			vmas[i] = vma;
++		start = (start + PAGE_SIZE) & PAGE_MASK;
++	}
++
++	return i;
++
++finish_or_fault:
++	return i ? : -EFAULT;
++}
++#endif /* !CONFIG_MMU */
+ 
+ #if defined(CONFIG_FS_DAX) || defined (CONFIG_CMA)
+ static bool check_dax_vmas(struct vm_area_struct **vmas, long nr_pages)
+@@ -1479,7 +1525,7 @@ static long check_and_migrate_cma_pages(struct task_struct *tsk,
+ {
+ 	return nr_pages;
+ }
+-#endif
++#endif /* CONFIG_CMA */
+ 
+ /*
+  * __gup_longterm_locked() is a wrapper for __get_user_pages_locked which
+@@ -2123,6 +2169,12 @@ static void gup_pgd_range(unsigned long addr, unsigned long end,
+ 			return;
+ 	} while (pgdp++, addr = next, addr != end);
+ }
++#else
++static inline void gup_pgd_range(unsigned long addr, unsigned long end,
++		unsigned int flags, struct page **pages, int *nr)
++{
++}
++#endif /* CONFIG_HAVE_FAST_GUP */
+ 
+ #ifndef gup_fast_permitted
+ /*
+@@ -2140,6 +2192,9 @@ static bool gup_fast_permitted(unsigned long start, unsigned long end)
+  * the regular GUP.
+  * Note a difference with get_user_pages_fast: this always returns the
+  * number of pages pinned, 0 if no pages were pinned.
++ *
++ * If the architecture does not support this function, simply return with no
++ * pages pinned.
+  */
+ int __get_user_pages_fast(unsigned long start, int nr_pages, int write,
+ 			  struct page **pages)
+@@ -2169,7 +2224,8 @@ int __get_user_pages_fast(unsigned long start, int nr_pages, int write,
+ 	 * block IPIs that come from THPs splitting.
+ 	 */
+ 
+-	if (gup_fast_permitted(start, end)) {
++	if (IS_ENABLED(CONFIG_HAVE_FAST_GUP) &&
++	    gup_fast_permitted(start, end)) {
+ 		local_irq_save(flags);
+ 		gup_pgd_range(start, end, write ? FOLL_WRITE : 0, pages, &nr);
+ 		local_irq_restore(flags);
+@@ -2177,6 +2233,7 @@ int __get_user_pages_fast(unsigned long start, int nr_pages, int write,
+ 
+ 	return nr;
+ }
++EXPORT_SYMBOL_GPL(__get_user_pages_fast);
+ 
+ static int __gup_longterm_unlocked(unsigned long start, int nr_pages,
+ 				   unsigned int gup_flags, struct page **pages)
+@@ -2233,7 +2290,8 @@ int get_user_pages_fast(unsigned long start, int nr_pages,
+ 	if (unlikely(!access_ok((void __user *)start, len)))
+ 		return -EFAULT;
+ 
+-	if (gup_fast_permitted(start, end)) {
++	if (IS_ENABLED(CONFIG_HAVE_FAST_GUP) &&
++	    gup_fast_permitted(start, end)) {
+ 		local_irq_disable();
+ 		gup_pgd_range(addr, end, gup_flags, pages, &nr);
+ 		local_irq_enable();
+@@ -2259,5 +2317,4 @@ int get_user_pages_fast(unsigned long start, int nr_pages,
+ 
+ 	return ret;
+ }
+-
+-#endif /* CONFIG_HAVE_GENERIC_GUP */
++EXPORT_SYMBOL_GPL(get_user_pages_fast);
+diff --git a/mm/nommu.c b/mm/nommu.c
+index 29c022011471..4553661d3963 100644
+--- a/mm/nommu.c
++++ b/mm/nommu.c
+@@ -110,94 +110,6 @@ unsigned int kobjsize(const void *objp)
+ 	return PAGE_SIZE << compound_order(page);
+ }
+ 
+-static long __get_user_pages(struct task_struct *tsk, struct mm_struct *mm,
+-		      unsigned long start, unsigned long nr_pages,
+-		      unsigned int foll_flags, struct page **pages,
+-		      struct vm_area_struct **vmas, int *nonblocking)
+-{
+-	struct vm_area_struct *vma;
+-	unsigned long vm_flags;
+-	int i;
+-
+-	/* calculate required read or write permissions.
+-	 * If FOLL_FORCE is set, we only require the "MAY" flags.
+-	 */
+-	vm_flags  = (foll_flags & FOLL_WRITE) ?
+-			(VM_WRITE | VM_MAYWRITE) : (VM_READ | VM_MAYREAD);
+-	vm_flags &= (foll_flags & FOLL_FORCE) ?
+-			(VM_MAYREAD | VM_MAYWRITE) : (VM_READ | VM_WRITE);
+-
+-	for (i = 0; i < nr_pages; i++) {
+-		vma = find_vma(mm, start);
+-		if (!vma)
+-			goto finish_or_fault;
+-
+-		/* protect what we can, including chardevs */
+-		if ((vma->vm_flags & (VM_IO | VM_PFNMAP)) ||
+-		    !(vm_flags & vma->vm_flags))
+-			goto finish_or_fault;
+-
+-		if (pages) {
+-			pages[i] = virt_to_page(start);
+-			if (pages[i])
+-				get_page(pages[i]);
+-		}
+-		if (vmas)
+-			vmas[i] = vma;
+-		start = (start + PAGE_SIZE) & PAGE_MASK;
+-	}
+-
+-	return i;
+-
+-finish_or_fault:
+-	return i ? : -EFAULT;
+-}
+-
+-/*
+- * get a list of pages in an address range belonging to the specified process
+- * and indicate the VMA that covers each page
+- * - this is potentially dodgy as we may end incrementing the page count of a
+- *   slab page or a secondary page from a compound page
+- * - don't permit access to VMAs that don't support it, such as I/O mappings
+- */
+-long get_user_pages(unsigned long start, unsigned long nr_pages,
+-		    unsigned int gup_flags, struct page **pages,
+-		    struct vm_area_struct **vmas)
+-{
+-	return __get_user_pages(current, current->mm, start, nr_pages,
+-				gup_flags, pages, vmas, NULL);
+-}
+-EXPORT_SYMBOL(get_user_pages);
+-
+-long get_user_pages_locked(unsigned long start, unsigned long nr_pages,
+-			    unsigned int gup_flags, struct page **pages,
+-			    int *locked)
+-{
+-	return get_user_pages(start, nr_pages, gup_flags, pages, NULL);
+-}
+-EXPORT_SYMBOL(get_user_pages_locked);
+-
+-static long __get_user_pages_unlocked(struct task_struct *tsk,
+-			struct mm_struct *mm, unsigned long start,
+-			unsigned long nr_pages, struct page **pages,
+-			unsigned int gup_flags)
+-{
+-	long ret;
+-	down_read(&mm->mmap_sem);
+-	ret = __get_user_pages(tsk, mm, start, nr_pages, gup_flags, pages,
+-				NULL, NULL);
+-	up_read(&mm->mmap_sem);
+-	return ret;
+-}
+-
+-long get_user_pages_unlocked(unsigned long start, unsigned long nr_pages,
+-			     struct page **pages, unsigned int gup_flags)
+-{
+-	return __get_user_pages_unlocked(current, current->mm, start, nr_pages,
+-					 pages, gup_flags);
+-}
+-EXPORT_SYMBOL(get_user_pages_unlocked);
+-
+ /**
+  * follow_pfn - look up PFN at a user virtual address
+  * @vma: memory mapping
+* Unmerged path mm/util.c
