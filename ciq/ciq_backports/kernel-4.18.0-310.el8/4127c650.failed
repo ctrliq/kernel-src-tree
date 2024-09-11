@@ -1,0 +1,114 @@
+mm: kmem: enable kernel memcg accounting from interrupt contexts
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-310.el8
+commit-author Roman Gushchin <guro@fb.com>
+commit 4127c6504f25c4fcff52dc996efda2ef859dd661
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-310.el8/4127c650.failed
+
+If a memcg to charge can be determined (using remote charging API), there
+are no reasons to exclude allocations made from an interrupt context from
+the accounting.
+
+Such allocations will pass even if the resulting memcg size will exceed
+the hard limit, but it will affect the application of the memory pressure
+and an inability to put the workload under the limit will eventually
+trigger the OOM.
+
+To use active_memcg() helper, memcg_kmem_bypass() is moved back to
+memcontrol.c.
+
+	Signed-off-by: Roman Gushchin <guro@fb.com>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Reviewed-by: Shakeel Butt <shakeelb@google.com>
+	Cc: Johannes Weiner <hannes@cmpxchg.org>
+	Cc: Michal Hocko <mhocko@kernel.org>
+Link: http://lkml.kernel.org/r/20200827225843.1270629-5-guro@fb.com
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit 4127c6504f25c4fcff52dc996efda2ef859dd661)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	mm/memcontrol.c
+diff --cc mm/memcontrol.c
+index e4ee0600b869,3a24e3b619f5..000000000000
+--- a/mm/memcontrol.c
++++ b/mm/memcontrol.c
+@@@ -1083,8 -1064,47 +1083,50 @@@ struct mem_cgroup *get_mem_cgroup_from_
+  }
+  EXPORT_SYMBOL(get_mem_cgroup_from_page);
+  
+++<<<<<<< HEAD
+++=======
++ static __always_inline struct mem_cgroup *active_memcg(void)
++ {
++ 	if (in_interrupt())
++ 		return this_cpu_read(int_active_memcg);
++ 	else
++ 		return current->active_memcg;
++ }
++ 
++ static __always_inline struct mem_cgroup *get_active_memcg(void)
++ {
++ 	struct mem_cgroup *memcg;
++ 
++ 	rcu_read_lock();
++ 	memcg = active_memcg();
++ 	if (memcg) {
++ 		/* current->active_memcg must hold a ref. */
++ 		if (WARN_ON_ONCE(!css_tryget(&memcg->css)))
++ 			memcg = root_mem_cgroup;
++ 		else
++ 			memcg = current->active_memcg;
++ 	}
++ 	rcu_read_unlock();
++ 
++ 	return memcg;
++ }
++ 
++ static __always_inline bool memcg_kmem_bypass(void)
++ {
++ 	/* Allow remote memcg charging from any context. */
++ 	if (unlikely(active_memcg()))
++ 		return false;
++ 
++ 	/* Memcg to charge can't be determined. */
++ 	if (in_interrupt() || !current->mm || (current->flags & PF_KTHREAD))
++ 		return true;
++ 
++ 	return false;
++ }
++ 
+++>>>>>>> 4127c6504f25 (mm: kmem: enable kernel memcg accounting from interrupt contexts)
+  /**
+ - * If active memcg is set, do not fallback to current->mm->memcg.
+ + * If current->active_memcg is non-NULL, do not fallback to current->mm->memcg.
+   */
+  static __always_inline struct mem_cgroup *get_mem_cgroup_from_current(void)
+  {
+diff --git a/include/linux/memcontrol.h b/include/linux/memcontrol.h
+index f16582585aa2..23806c2bd3f9 100644
+--- a/include/linux/memcontrol.h
++++ b/include/linux/memcontrol.h
+@@ -1540,18 +1540,6 @@ static inline bool memcg_kmem_enabled(void)
+ 	return static_branch_likely(&memcg_kmem_enabled_key);
+ }
+ 
+-static inline bool memcg_kmem_bypass(void)
+-{
+-	if (in_interrupt())
+-		return true;
+-
+-	/* Allow remote memcg charging in kthread contexts. */
+-	if ((!current->mm || (current->flags & PF_KTHREAD)) &&
+-	     !current->active_memcg)
+-		return true;
+-	return false;
+-}
+-
+ static inline int memcg_kmem_charge_page(struct page *page, gfp_t gfp,
+ 					 int order)
+ {
+* Unmerged path mm/memcontrol.c
