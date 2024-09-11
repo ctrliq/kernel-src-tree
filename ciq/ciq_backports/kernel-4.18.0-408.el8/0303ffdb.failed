@@ -1,0 +1,164 @@
+KVM: selftests: arm64: Check for supported page sizes
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-408.el8
+commit-author Marc Zyngier <maz@kernel.org>
+commit 0303ffdb9ecffac4654b16bbf69ba84d131eb8b7
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-408.el8/0303ffdb.failed
+
+Just as arm64 implemenations don't necessary support all IPA
+ranges, they don't  all support the same page sizes either. Fun.
+
+Create a dummy VM to snapshot the page sizes supported by the
+host, and filter the supported modes.
+
+	Signed-off-by: Marc Zyngier <maz@kernel.org>
+	Reviewed-by: Andrew Jones <drjones@redhat.com>
+Link: https://lore.kernel.org/r/20211227124809.1335409-4-maz@kernel.org
+(cherry picked from commit 0303ffdb9ecffac4654b16bbf69ba84d131eb8b7)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	tools/testing/selftests/kvm/lib/guest_modes.c
+diff --cc tools/testing/selftests/kvm/lib/guest_modes.c
+index c330f414ef96,67144fdac433..000000000000
+--- a/tools/testing/selftests/kvm/lib/guest_modes.c
++++ b/tools/testing/selftests/kvm/lib/guest_modes.c
+@@@ -4,22 -4,51 +4,61 @@@
+   */
+  #include "guest_modes.h"
+  
+++<<<<<<< HEAD
+++=======
++ #ifdef __aarch64__
++ #include "processor.h"
++ enum vm_guest_mode vm_mode_default;
++ #endif
++ 
+++>>>>>>> 0303ffdb9ecf (KVM: selftests: arm64: Check for supported page sizes)
+  struct guest_mode guest_modes[NUM_VM_MODES];
+  
+  void guest_modes_append_default(void)
+  {
+ -#ifndef __aarch64__
+  	guest_mode_append(VM_MODE_DEFAULT, true, true);
+ -#else
+ +
+ +#ifdef __aarch64__
+ +	guest_mode_append(VM_MODE_P40V48_64K, true, true);
+  	{
+  		unsigned int limit = kvm_check_cap(KVM_CAP_ARM_VM_IPA_SIZE);
+++<<<<<<< HEAD
+++=======
++ 		bool ps4k, ps16k, ps64k;
++ 		int i;
++ 
++ 		aarch64_get_supported_page_sizes(limit, &ps4k, &ps16k, &ps64k);
++ 
++ 		vm_mode_default = NUM_VM_MODES;
++ 
+++>>>>>>> 0303ffdb9ecf (KVM: selftests: arm64: Check for supported page sizes)
+  		if (limit >= 52)
+- 			guest_mode_append(VM_MODE_P52V48_64K, true, true);
++ 			guest_mode_append(VM_MODE_P52V48_64K, ps64k, ps64k);
+  		if (limit >= 48) {
+- 			guest_mode_append(VM_MODE_P48V48_4K, true, true);
+- 			guest_mode_append(VM_MODE_P48V48_64K, true, true);
++ 			guest_mode_append(VM_MODE_P48V48_4K, ps4k, ps4k);
++ 			guest_mode_append(VM_MODE_P48V48_64K, ps64k, ps64k);
++ 		}
+++<<<<<<< HEAD
+++=======
++ 		if (limit >= 40) {
++ 			guest_mode_append(VM_MODE_P40V48_4K, ps4k, ps4k);
++ 			guest_mode_append(VM_MODE_P40V48_64K, ps64k, ps64k);
++ 			if (ps4k)
++ 				vm_mode_default = VM_MODE_P40V48_4K;
+  		}
++ 
++ 		/*
++ 		 * Pick the first supported IPA size if the default
++ 		 * isn't available.
++ 		 */
++ 		for (i = 0; vm_mode_default == NUM_VM_MODES && i < NUM_VM_MODES; i++) {
++ 			if (guest_modes[i].supported && guest_modes[i].enabled)
++ 				vm_mode_default = i;
++ 		}
++ 
++ 		TEST_ASSERT(vm_mode_default != NUM_VM_MODES,
++ 			    "No supported mode!");
+++>>>>>>> 0303ffdb9ecf (KVM: selftests: arm64: Check for supported page sizes)
+  	}
+  #endif
+  #ifdef __s390x__
+diff --git a/tools/testing/selftests/kvm/include/aarch64/processor.h b/tools/testing/selftests/kvm/include/aarch64/processor.h
+index 27d8e1bb5b36..8f9f46979a00 100644
+--- a/tools/testing/selftests/kvm/include/aarch64/processor.h
++++ b/tools/testing/selftests/kvm/include/aarch64/processor.h
+@@ -113,6 +113,9 @@ enum {
+ #define ESR_EC_WP_CURRENT	0x35
+ #define ESR_EC_BRK_INS		0x3c
+ 
++void aarch64_get_supported_page_sizes(uint32_t ipa,
++				      bool *ps4k, bool *ps16k, bool *ps64k);
++
+ void vm_init_descriptor_tables(struct kvm_vm *vm);
+ void vcpu_init_descriptor_tables(struct kvm_vm *vm, uint32_t vcpuid);
+ 
+diff --git a/tools/testing/selftests/kvm/lib/aarch64/processor.c b/tools/testing/selftests/kvm/lib/aarch64/processor.c
+index 80f1f7ca673b..d005543aa3e2 100644
+--- a/tools/testing/selftests/kvm/lib/aarch64/processor.c
++++ b/tools/testing/selftests/kvm/lib/aarch64/processor.c
+@@ -8,6 +8,7 @@
+ #include <linux/compiler.h>
+ #include <assert.h>
+ 
++#include "guest_modes.h"
+ #include "kvm_util.h"
+ #include "../kvm_util_internal.h"
+ #include "processor.h"
+@@ -440,6 +441,41 @@ uint32_t guest_get_vcpuid(void)
+ 	return read_sysreg(tpidr_el1);
+ }
+ 
++void aarch64_get_supported_page_sizes(uint32_t ipa,
++				      bool *ps4k, bool *ps16k, bool *ps64k)
++{
++	struct kvm_vcpu_init preferred_init;
++	int kvm_fd, vm_fd, vcpu_fd, err;
++	uint64_t val;
++	struct kvm_one_reg reg = {
++		.id	= KVM_ARM64_SYS_REG(SYS_ID_AA64MMFR0_EL1),
++		.addr	= (uint64_t)&val,
++	};
++
++	kvm_fd = open_kvm_dev_path_or_exit();
++	vm_fd = ioctl(kvm_fd, KVM_CREATE_VM, ipa);
++	TEST_ASSERT(vm_fd >= 0, "Can't create VM");
++
++	vcpu_fd = ioctl(vm_fd, KVM_CREATE_VCPU, 0);
++	TEST_ASSERT(vcpu_fd >= 0, "Can't create vcpu");
++
++	err = ioctl(vm_fd, KVM_ARM_PREFERRED_TARGET, &preferred_init);
++	TEST_ASSERT(err == 0, "Can't get target");
++	err = ioctl(vcpu_fd, KVM_ARM_VCPU_INIT, &preferred_init);
++	TEST_ASSERT(err == 0, "Can't get init vcpu");
++
++	err = ioctl(vcpu_fd, KVM_GET_ONE_REG, &reg);
++	TEST_ASSERT(err == 0, "Can't get MMFR0");
++
++	*ps4k = ((val >> 28) & 0xf) != 0xf;
++	*ps64k = ((val >> 24) & 0xf) == 0;
++	*ps16k = ((val >> 20) & 0xf) != 0;
++
++	close(vcpu_fd);
++	close(vm_fd);
++	close(kvm_fd);
++}
++
+ /*
+  * arm64 doesn't have a true default mode, so start by computing the
+  * available IPA space and page sizes early.
+* Unmerged path tools/testing/selftests/kvm/lib/guest_modes.c
