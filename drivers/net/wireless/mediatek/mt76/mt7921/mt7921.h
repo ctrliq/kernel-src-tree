@@ -151,7 +151,6 @@ struct mt7921_dev {
 
 	u16 chainmask;
 
-	struct work_struct init_work;
 	struct work_struct reset_work;
 	wait_queue_head_t reset_wait;
 	u32 reset_state;
