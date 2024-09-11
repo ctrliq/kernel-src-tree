@@ -2058,7 +2058,7 @@ static char *kobject_string(char *buf, char *end, void *ptr,
  *       [4] or [6] and is able to print port [p], flowinfo [f], scope [s]
  * - '[Ii][4S][hnbl]' IPv4 addresses in host, network, big or little endian order
  * - 'I[6S]c' for IPv6 addresses printed as specified by
- *       http://tools.ietf.org/html/rfc5952
+ *       https://tools.ietf.org/html/rfc5952
  * - 'E[achnops]' For an escaped buffer, where rules are defined by combination
  *                of the following flags (see string_escape_mem() for the
  *                details):
