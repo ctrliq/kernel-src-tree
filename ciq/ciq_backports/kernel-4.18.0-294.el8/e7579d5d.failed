@@ -1,0 +1,207 @@
+net: mptcp: cap forward allocation to 1M
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+Rebuild_CHGLOG: - [net] mptcp: cap forward allocation to 1M (Paolo Abeni) [1892375]
+Rebuild_FUZZ: 93.33%
+commit-author Davide Caratti <dcaratti@redhat.com>
+commit e7579d5d5b3298f7e888ed07ac16bfb7174c135a
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/e7579d5d.failed
+
+the following syzkaller reproducer:
+
+ r0 = socket$inet_mptcp(0x2, 0x1, 0x106)
+ bind$inet(r0, &(0x7f0000000080)={0x2, 0x4e24, @multicast2}, 0x10)
+ connect$inet(r0, &(0x7f0000000480)={0x2, 0x4e24, @local}, 0x10)
+ sendto$inet(r0, &(0x7f0000000100)="f6", 0xffffffe7, 0xc000, 0x0, 0x0)
+
+systematically triggers the following warning:
+
+ WARNING: CPU: 2 PID: 8618 at net/core/stream.c:208 sk_stream_kill_queues+0x3fa/0x580
+ Modules linked in:
+ CPU: 2 PID: 8618 Comm: syz-executor Not tainted 5.10.0+ #334
+ Hardware name: QEMU Standard PC (i440FX + PIIX, 1996), BIOS 1.11.1-4.module+el8.1.0+4066+0f1aadab 04/04
+ RIP: 0010:sk_stream_kill_queues+0x3fa/0x580
+ Code: df 48 c1 ea 03 0f b6 04 02 84 c0 74 04 3c 03 7e 40 8b ab 20 02 00 00 e9 64 ff ff ff e8 df f0 81 2
+ RSP: 0018:ffffc9000290fcb0 EFLAGS: 00010293
+ RAX: ffff888011cb8000 RBX: 0000000000000000 RCX: ffffffff86eecf0e
+ RDX: 0000000000000000 RSI: ffffffff86eecf6a RDI: 0000000000000005
+ RBP: 0000000000000e28 R08: ffff888011cb8000 R09: fffffbfff1f48139
+ R10: ffffffff8fa409c7 R11: fffffbfff1f48138 R12: ffff8880215e6220
+ R13: ffffffff8fa409c0 R14: ffffc9000290fd30 R15: 1ffff92000521fa2
+ FS:  00007f41c78f4800(0000) GS:ffff88802d000000(0000) knlGS:0000000000000000
+ CS:  0010 DS: 0000 ES: 0000 CR0: 0000000080050033
+ CR2: 00007f95c803d088 CR3: 0000000025ed2000 CR4: 00000000000006f0
+ Call Trace:
+  __mptcp_destroy_sock+0x4f5/0x8e0
+   mptcp_close+0x5e2/0x7f0
+  inet_release+0x12b/0x270
+  __sock_release+0xc8/0x270
+  sock_close+0x18/0x20
+  __fput+0x272/0x8e0
+  task_work_run+0xe0/0x1a0
+  exit_to_user_mode_prepare+0x1df/0x200
+  syscall_exit_to_user_mode+0x19/0x50
+  entry_SYSCALL_64_after_hwframe+0x44/0xa9
+
+userspace programs provide arbitrarily high values of 'len' in sendmsg():
+this is causing integer overflow of 'amount'. Cap forward allocation to 1
+megabyte: higher values are not really useful.
+
+	Suggested-by: Paolo Abeni <pabeni@redhat.com>
+Fixes: e93da92896bc ("mptcp: implement wmem reservation")
+	Signed-off-by: Davide Caratti <dcaratti@redhat.com>
+Link: https://lore.kernel.org/r/3334d00d8b2faecafdfab9aa593efcbf61442756.1608584474.git.dcaratti@redhat.com
+	Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+(cherry picked from commit e7579d5d5b3298f7e888ed07ac16bfb7174c135a)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/mptcp/protocol.c
+diff --cc net/mptcp/protocol.c
+index 509aa48ee70d,6628d8d74203..000000000000
+--- a/net/mptcp/protocol.c
++++ b/net/mptcp/protocol.c
+@@@ -589,6 -857,125 +589,127 @@@ static bool mptcp_frag_can_collapse_to(
+  		df->data_seq + df->data_len == msk->write_seq;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static int mptcp_wmem_with_overhead(struct sock *sk, int size)
++ {
++ 	struct mptcp_sock *msk = mptcp_sk(sk);
++ 	int ret, skbs;
++ 
++ 	ret = size + ((sizeof(struct mptcp_data_frag) * size) >> PAGE_SHIFT);
++ 	skbs = (msk->tx_pending_data + size) / msk->size_goal_cache;
++ 	if (skbs < msk->skb_tx_cache.qlen)
++ 		return ret;
++ 
++ 	return ret + (skbs - msk->skb_tx_cache.qlen) * SKB_TRUESIZE(MAX_TCP_HEADER);
++ }
++ 
++ static void __mptcp_wmem_reserve(struct sock *sk, int size)
++ {
++ 	int amount = mptcp_wmem_with_overhead(sk, size);
++ 	struct mptcp_sock *msk = mptcp_sk(sk);
++ 
++ 	WARN_ON_ONCE(msk->wmem_reserved);
++ 	if (WARN_ON_ONCE(amount < 0))
++ 		amount = 0;
++ 
++ 	if (amount <= sk->sk_forward_alloc)
++ 		goto reserve;
++ 
++ 	/* under memory pressure try to reserve at most a single page
++ 	 * otherwise try to reserve the full estimate and fallback
++ 	 * to a single page before entering the error path
++ 	 */
++ 	if ((tcp_under_memory_pressure(sk) && amount > PAGE_SIZE) ||
++ 	    !sk_wmem_schedule(sk, amount)) {
++ 		if (amount <= PAGE_SIZE)
++ 			goto nomem;
++ 
++ 		amount = PAGE_SIZE;
++ 		if (!sk_wmem_schedule(sk, amount))
++ 			goto nomem;
++ 	}
++ 
++ reserve:
++ 	msk->wmem_reserved = amount;
++ 	sk->sk_forward_alloc -= amount;
++ 	return;
++ 
++ nomem:
++ 	/* we will wait for memory on next allocation */
++ 	msk->wmem_reserved = -1;
++ }
++ 
++ static void __mptcp_update_wmem(struct sock *sk)
++ {
++ 	struct mptcp_sock *msk = mptcp_sk(sk);
++ 
++ 	if (!msk->wmem_reserved)
++ 		return;
++ 
++ 	if (msk->wmem_reserved < 0)
++ 		msk->wmem_reserved = 0;
++ 	if (msk->wmem_reserved > 0) {
++ 		sk->sk_forward_alloc += msk->wmem_reserved;
++ 		msk->wmem_reserved = 0;
++ 	}
++ }
++ 
++ static bool mptcp_wmem_alloc(struct sock *sk, int size)
++ {
++ 	struct mptcp_sock *msk = mptcp_sk(sk);
++ 
++ 	/* check for pre-existing error condition */
++ 	if (msk->wmem_reserved < 0)
++ 		return false;
++ 
++ 	if (msk->wmem_reserved >= size)
++ 		goto account;
++ 
++ 	mptcp_data_lock(sk);
++ 	if (!sk_wmem_schedule(sk, size)) {
++ 		mptcp_data_unlock(sk);
++ 		return false;
++ 	}
++ 
++ 	sk->sk_forward_alloc -= size;
++ 	msk->wmem_reserved += size;
++ 	mptcp_data_unlock(sk);
++ 
++ account:
++ 	msk->wmem_reserved -= size;
++ 	return true;
++ }
++ 
++ static void mptcp_wmem_uncharge(struct sock *sk, int size)
++ {
++ 	struct mptcp_sock *msk = mptcp_sk(sk);
++ 
++ 	if (msk->wmem_reserved < 0)
++ 		msk->wmem_reserved = 0;
++ 	msk->wmem_reserved += size;
++ }
++ 
++ static void mptcp_mem_reclaim_partial(struct sock *sk)
++ {
++ 	struct mptcp_sock *msk = mptcp_sk(sk);
++ 
++ 	/* if we are experiencing a transint allocation error,
++ 	 * the forward allocation memory has been already
++ 	 * released
++ 	 */
++ 	if (msk->wmem_reserved < 0)
++ 		return;
++ 
++ 	mptcp_data_lock(sk);
++ 	sk->sk_forward_alloc += msk->wmem_reserved;
++ 	sk_mem_reclaim_partial(sk);
++ 	msk->wmem_reserved = sk->sk_forward_alloc;
++ 	sk->sk_forward_alloc = 0;
++ 	mptcp_data_unlock(sk);
++ }
++ 
+++>>>>>>> e7579d5d5b32 (net: mptcp: cap forward allocation to 1M)
+  static void dfrag_uncharge(struct sock *sk, int len)
+  {
+  	sk_mem_uncharge(sk, len);
+@@@ -936,7 -1590,7 +1057,11 @@@ static int mptcp_sendmsg(struct sock *s
+  	if (msg->msg_flags & ~(MSG_MORE | MSG_DONTWAIT | MSG_NOSIGNAL))
+  		return -EOPNOTSUPP;
+  
+++<<<<<<< HEAD
+ +	lock_sock(sk);
+++=======
++ 	mptcp_lock_sock(sk, __mptcp_wmem_reserve(sk, min_t(size_t, 1 << 20, len)));
+++>>>>>>> e7579d5d5b32 (net: mptcp: cap forward allocation to 1M)
+  
+  	timeo = sock_sndtimeo(sk, msg->msg_flags & MSG_DONTWAIT);
+  
+* Unmerged path net/mptcp/protocol.c
