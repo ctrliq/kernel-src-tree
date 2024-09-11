@@ -1,0 +1,292 @@
+arm64: Introduce system_capabilities_finalized() marker
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-348.el8
+commit-author Suzuki K Poulose <suzuki.poulose@arm.com>
+commit b51c6ac220f77eb246e940442d970b4065c197b0
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-348.el8/b51c6ac2.failed
+
+We finalize the system wide capabilities after the SMP CPUs
+are booted by the kernel. This is used as a marker for deciding
+various checks in the kernel. e.g, sanity check the hotplugged
+CPUs for missing mandatory features.
+
+However there is no explicit helper available for this in the
+kernel. There is sys_caps_initialised, which is not exposed.
+The other closest one we have is the jump_label arm64_const_caps_ready
+which denotes that the capabilities are set and the capability checks
+could use the individual jump_labels for fast path. This is
+performed before setting the ELF Hwcaps, which must be checked
+against the new CPUs. We also perform some of the other initialization
+e.g, SVE setup, which is important for the use of FP/SIMD
+where SVE is supported. Normally userspace doesn't get to run
+before we finish this. However the in-kernel users may
+potentially start using the neon mode. So, we need to
+reject uses of neon mode before we are set. Instead of defining
+a new marker for the completion of SVE setup, we could simply
+reuse the arm64_const_caps_ready and enable it once we have
+finished all the setup. Also we could expose this to the
+various users as "system_capabilities_finalized()" to make
+it more meaningful than "const_caps_ready".
+
+	Cc: Ard Biesheuvel <ard.biesheuvel@linaro.org>
+	Cc: Will Deacon <will@kernel.org>
+	Cc: Mark Rutland <mark.rutland@arm.com>
+	Reviewed-by: Ard Biesheuvel <ardb@kernel.org>
+	Reviewed-by: Catalin Marinas <catalin.marinas@arm.com>
+	Signed-off-by: Suzuki K Poulose <suzuki.poulose@arm.com>
+	Signed-off-by: Will Deacon <will@kernel.org>
+(cherry picked from commit b51c6ac220f77eb246e940442d970b4065c197b0)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/arm64/include/asm/cpufeature.h
+#	arch/arm64/include/asm/kvm_host.h
+#	arch/arm64/kernel/process.c
+diff --cc arch/arm64/include/asm/cpufeature.h
+index 62621e9315f8,92ef9539874a..000000000000
+--- a/arch/arm64/include/asm/cpufeature.h
++++ b/arch/arm64/include/asm/cpufeature.h
+@@@ -705,6 -613,17 +705,20 @@@ static inline bool system_has_prio_mask
+  	       system_uses_irq_prio_masking();
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static inline bool system_capabilities_finalized(void)
++ {
++ 	return static_branch_likely(&arm64_const_caps_ready);
++ }
++ 
++ #define ARM64_BP_HARDEN_UNKNOWN		-1
++ #define ARM64_BP_HARDEN_WA_NEEDED	0
++ #define ARM64_BP_HARDEN_NOT_REQUIRED	1
++ 
++ int get_spectre_v2_workaround_state(void);
++ 
+++>>>>>>> b51c6ac220f7 (arm64: Introduce system_capabilities_finalized() marker)
+  #define ARM64_SSBD_UNKNOWN		-1
+  #define ARM64_SSBD_FORCE_DISABLE	0
+  #define ARM64_SSBD_KERNEL		1
+diff --cc arch/arm64/include/asm/kvm_host.h
+index 28ea6c06b7f8,48ce54639eb5..000000000000
+--- a/arch/arm64/include/asm/kvm_host.h
++++ b/arch/arm64/include/asm/kvm_host.h
+@@@ -558,7 -524,40 +558,44 @@@ DECLARE_PER_CPU(kvm_host_data_t, kvm_ho
+  static inline void kvm_init_host_cpu_context(struct kvm_cpu_context *cpu_ctxt)
+  {
+  	/* The host's MPIDR is immutable, so let's set it up at boot time */
+++<<<<<<< HEAD
+ +	ctxt_sys_reg(cpu_ctxt, MPIDR_EL1) = read_cpuid_mpidr();
+++=======
++ 	cpu_ctxt->sys_regs[MPIDR_EL1] = read_cpuid_mpidr();
++ }
++ 
++ void __kvm_enable_ssbs(void);
++ 
++ static inline void __cpu_init_hyp_mode(phys_addr_t pgd_ptr,
++ 				       unsigned long hyp_stack_ptr,
++ 				       unsigned long vector_ptr)
++ {
++ 	/*
++ 	 * Calculate the raw per-cpu offset without a translation from the
++ 	 * kernel's mapping to the linear mapping, and store it in tpidr_el2
++ 	 * so that we can use adr_l to access per-cpu variables in EL2.
++ 	 */
++ 	u64 tpidr_el2 = ((u64)this_cpu_ptr(&kvm_host_data) -
++ 			 (u64)kvm_ksym_ref(kvm_host_data));
++ 
++ 	/*
++ 	 * Call initialization code, and switch to the full blown HYP code.
++ 	 * If the cpucaps haven't been finalized yet, something has gone very
++ 	 * wrong, and hyp will crash and burn when it uses any
++ 	 * cpus_have_const_cap() wrapper.
++ 	 */
++ 	BUG_ON(!system_capabilities_finalized());
++ 	__kvm_call_hyp((void *)pgd_ptr, hyp_stack_ptr, vector_ptr, tpidr_el2);
++ 
++ 	/*
++ 	 * Disabling SSBD on a non-VHE system requires us to enable SSBS
++ 	 * at EL2.
++ 	 */
++ 	if (!has_vhe() && this_cpu_has_cap(ARM64_SSBS) &&
++ 	    arm64_get_ssbd_state() == ARM64_SSBD_FORCE_DISABLE) {
++ 		kvm_call_hyp(__kvm_enable_ssbs);
++ 	}
+++>>>>>>> b51c6ac220f7 (arm64: Introduce system_capabilities_finalized() marker)
+  }
+  
+  static inline bool kvm_arch_requires_vhe(void)
+diff --cc arch/arm64/kernel/process.c
+index 1d01ae2f356c,48a38144ea7b..000000000000
+--- a/arch/arm64/kernel/process.c
++++ b/arch/arm64/kernel/process.c
+@@@ -575,3 -566,86 +575,89 @@@ void arch_setup_new_exec(void
+  
+  	ptrauth_thread_init_user(current);
+  }
+++<<<<<<< HEAD
+++=======
++ 
++ #ifdef CONFIG_ARM64_TAGGED_ADDR_ABI
++ /*
++  * Control the relaxed ABI allowing tagged user addresses into the kernel.
++  */
++ static unsigned int tagged_addr_disabled;
++ 
++ long set_tagged_addr_ctrl(unsigned long arg)
++ {
++ 	if (is_compat_task())
++ 		return -EINVAL;
++ 	if (arg & ~PR_TAGGED_ADDR_ENABLE)
++ 		return -EINVAL;
++ 
++ 	/*
++ 	 * Do not allow the enabling of the tagged address ABI if globally
++ 	 * disabled via sysctl abi.tagged_addr_disabled.
++ 	 */
++ 	if (arg & PR_TAGGED_ADDR_ENABLE && tagged_addr_disabled)
++ 		return -EINVAL;
++ 
++ 	update_thread_flag(TIF_TAGGED_ADDR, arg & PR_TAGGED_ADDR_ENABLE);
++ 
++ 	return 0;
++ }
++ 
++ long get_tagged_addr_ctrl(void)
++ {
++ 	if (is_compat_task())
++ 		return -EINVAL;
++ 
++ 	if (test_thread_flag(TIF_TAGGED_ADDR))
++ 		return PR_TAGGED_ADDR_ENABLE;
++ 
++ 	return 0;
++ }
++ 
++ /*
++  * Global sysctl to disable the tagged user addresses support. This control
++  * only prevents the tagged address ABI enabling via prctl() and does not
++  * disable it for tasks that already opted in to the relaxed ABI.
++  */
++ static int zero;
++ static int one = 1;
++ 
++ static struct ctl_table tagged_addr_sysctl_table[] = {
++ 	{
++ 		.procname	= "tagged_addr_disabled",
++ 		.mode		= 0644,
++ 		.data		= &tagged_addr_disabled,
++ 		.maxlen		= sizeof(int),
++ 		.proc_handler	= proc_dointvec_minmax,
++ 		.extra1		= &zero,
++ 		.extra2		= &one,
++ 	},
++ 	{ }
++ };
++ 
++ static int __init tagged_addr_init(void)
++ {
++ 	if (!register_sysctl("abi", tagged_addr_sysctl_table))
++ 		return -EINVAL;
++ 	return 0;
++ }
++ 
++ core_initcall(tagged_addr_init);
++ #endif	/* CONFIG_ARM64_TAGGED_ADDR_ABI */
++ 
++ asmlinkage void __sched arm64_preempt_schedule_irq(void)
++ {
++ 	lockdep_assert_irqs_disabled();
++ 
++ 	/*
++ 	 * Preempting a task from an IRQ means we leave copies of PSTATE
++ 	 * on the stack. cpufeature's enable calls may modify PSTATE, but
++ 	 * resuming one of these preempted tasks would undo those changes.
++ 	 *
++ 	 * Only allow a task to be preempted once cpufeatures have been
++ 	 * enabled.
++ 	 */
++ 	if (system_capabilities_finalized())
++ 		preempt_schedule_irq();
++ }
+++>>>>>>> b51c6ac220f7 (arm64: Introduce system_capabilities_finalized() marker)
+* Unmerged path arch/arm64/include/asm/cpufeature.h
+* Unmerged path arch/arm64/include/asm/kvm_host.h
+diff --git a/arch/arm64/kernel/cpufeature.c b/arch/arm64/kernel/cpufeature.c
+index 5c98a0b235b2..312864951b7d 100644
+--- a/arch/arm64/kernel/cpufeature.c
++++ b/arch/arm64/kernel/cpufeature.c
+@@ -64,13 +64,14 @@ DECLARE_BITMAP(boot_capabilities, ARM64_NPATCHABLE);
+  * will be used to determine if a new booting CPU should
+  * go through the verification process to make sure that it
+  * supports the system capabilities, without using a hotplug
+- * notifier.
++ * notifier. This is also used to decide if we could use
++ * the fast path for checking constant CPU caps.
+  */
+-static bool sys_caps_initialised;
+-
+-static inline void set_sys_caps_initialised(void)
++DEFINE_STATIC_KEY_FALSE(arm64_const_caps_ready);
++EXPORT_SYMBOL(arm64_const_caps_ready);
++static inline void finalize_system_capabilities(void)
+ {
+-	sys_caps_initialised = true;
++	static_branch_enable(&arm64_const_caps_ready);
+ }
+ 
+ static int dump_cpu_hwcaps(struct notifier_block *self, unsigned long v, void *p)
+@@ -816,7 +817,7 @@ void update_cpu_features(int cpu,
+ 
+ 		/* Probe vector lengths, unless we already gave up on SVE */
+ 		if (id_aa64pfr0_sve(read_sanitised_ftr_reg(SYS_ID_AA64PFR0_EL1)) &&
+-		    !sys_caps_initialised)
++		    !system_capabilities_finalized())
+ 			sve_update_vq_map();
+ 	}
+ 
+@@ -2053,7 +2054,7 @@ void check_local_cpu_capabilities(void)
+ 	 * Otherwise, this CPU should verify that it has all the system
+ 	 * advertised capabilities.
+ 	 */
+-	if (!sys_caps_initialised)
++	if (!system_capabilities_finalized())
+ 		update_cpu_capabilities(SCOPE_LOCAL_CPU);
+ 	else
+ 		verify_local_cpu_capabilities();
+@@ -2067,14 +2068,6 @@ static void __init setup_boot_cpu_capabilities(void)
+ 	enable_cpu_capabilities(SCOPE_BOOT_CPU);
+ }
+ 
+-DEFINE_STATIC_KEY_FALSE(arm64_const_caps_ready);
+-EXPORT_SYMBOL(arm64_const_caps_ready);
+-
+-static void __init mark_const_caps_ready(void)
+-{
+-	static_branch_enable(&arm64_const_caps_ready);
+-}
+-
+ bool this_cpu_has_cap(unsigned int n)
+ {
+ 	if (!WARN_ON(preemptible()) && n < ARM64_NCAPS) {
+@@ -2104,7 +2097,6 @@ void __init setup_cpu_features(void)
+ 	u32 cwg;
+ 
+ 	setup_system_capabilities();
+-	mark_const_caps_ready();
+ 	setup_elf_hwcaps(arm64_elf_hwcaps);
+ 
+ 	if (system_supports_32bit_el0())
+@@ -2117,7 +2109,7 @@ void __init setup_cpu_features(void)
+ 	minsigstksz_setup();
+ 
+ 	/* Advertise that we have computed the system capabilities */
+-	set_sys_caps_initialised();
++	finalize_system_capabilities();
+ 
+ 	/*
+ 	 * Check for sane CTR_EL0.CWG value.
+* Unmerged path arch/arm64/kernel/process.c
