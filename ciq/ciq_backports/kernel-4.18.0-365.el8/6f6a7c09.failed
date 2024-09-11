@@ -1,0 +1,247 @@
+x86/fpu: Add members to struct fpu to cache permission information
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-365.el8
+commit-author Thomas Gleixner <tglx@linutronix.de>
+commit 6f6a7c09c4065a5b140194dfcfe4cf7104fec4d2
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-365.el8/6f6a7c09.failed
+
+Dynamically enabled features can be requested by any thread of a running
+process at any time. The request does neither enable the feature nor
+allocate larger buffers. It just stores the permission to use the feature
+by adding the features to the permission bitmap and by calculating the
+required sizes for kernel and user space.
+
+The reallocation of the kernel buffer happens when the feature is used
+for the first time which is caught by an exception. The permission
+bitmap is then checked and if the feature is permitted, then it becomes
+fully enabled. If not, the task dies similarly to a task which uses an
+undefined instruction.
+
+The size information is precomputed to allow proper sigaltstack size checks
+once the feature is permitted, but not yet in use because otherwise this
+would open race windows where too small stacks could be installed causing
+a later fail on signal delivery.
+
+Initialize them to the default feature set and sizes.
+
+	Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+	Signed-off-by: Chang S. Bae <chang.seok.bae@intel.com>
+	Signed-off-by: Borislav Petkov <bp@suse.de>
+Link: https://lkml.kernel.org/r/20211021225527.10184-5-chang.seok.bae@intel.com
+(cherry picked from commit 6f6a7c09c4065a5b140194dfcfe4cf7104fec4d2)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/include/asm/fpu/types.h
+#	arch/x86/kernel/fpu/core.c
+diff --cc arch/x86/include/asm/fpu/types.h
+index 696fdf451047,c3ec56279767..000000000000
+--- a/arch/x86/include/asm/fpu/types.h
++++ b/arch/x86/include/asm/fpu/types.h
+@@@ -311,6 -309,88 +311,91 @@@ union fpregs_state 
+  	u8 __padding[PAGE_SIZE];
+  };
+  
+++<<<<<<< HEAD
+++=======
++ struct fpstate {
++ 	/* @kernel_size: The size of the kernel register image */
++ 	unsigned int		size;
++ 
++ 	/* @user_size: The size in non-compacted UABI format */
++ 	unsigned int		user_size;
++ 
++ 	/* @xfeatures:		xfeatures for which the storage is sized */
++ 	u64			xfeatures;
++ 
++ 	/* @user_xfeatures:	xfeatures valid in UABI buffers */
++ 	u64			user_xfeatures;
++ 
++ 	/* @is_valloc:		Indicator for dynamically allocated state */
++ 	unsigned int		is_valloc	: 1;
++ 
++ 	/* @is_guest:		Indicator for guest state (KVM) */
++ 	unsigned int		is_guest	: 1;
++ 
++ 	/*
++ 	 * @is_confidential:	Indicator for KVM confidential mode.
++ 	 *			The FPU registers are restored by the
++ 	 *			vmentry firmware from encrypted guest
++ 	 *			memory. On vmexit the FPU registers are
++ 	 *			saved by firmware to encrypted guest memory
++ 	 *			and the registers are scrubbed before
++ 	 *			returning to the host. So there is no
++ 	 *			content which is worth saving and restoring.
++ 	 *			The fpstate has to be there so that
++ 	 *			preemption and softirq FPU usage works
++ 	 *			without special casing.
++ 	 */
++ 	unsigned int		is_confidential	: 1;
++ 
++ 	/* @in_use:		State is in use */
++ 	unsigned int		in_use		: 1;
++ 
++ 	/* @regs: The register state union for all supported formats */
++ 	union fpregs_state	regs;
++ 
++ 	/* @regs is dynamically sized! Don't add anything after @regs! */
++ } __aligned(64);
++ 
++ struct fpu_state_perm {
++ 	/*
++ 	 * @__state_perm:
++ 	 *
++ 	 * This bitmap indicates the permission for state components, which
++ 	 * are available to a thread group. The permission prctl() sets the
++ 	 * enabled state bits in thread_group_leader()->thread.fpu.
++ 	 *
++ 	 * All run time operations use the per thread information in the
++ 	 * currently active fpu.fpstate which contains the xfeature masks
++ 	 * and sizes for kernel and user space.
++ 	 *
++ 	 * This master permission field is only to be used when
++ 	 * task.fpu.fpstate based checks fail to validate whether the task
++ 	 * is allowed to expand it's xfeatures set which requires to
++ 	 * allocate a larger sized fpstate buffer.
++ 	 *
++ 	 * Do not access this field directly.  Use the provided helper
++ 	 * function. Unlocked access is possible for quick checks.
++ 	 */
++ 	u64				__state_perm;
++ 
++ 	/*
++ 	 * @__state_size:
++ 	 *
++ 	 * The size required for @__state_perm. Only valid to access
++ 	 * with sighand locked.
++ 	 */
++ 	unsigned int			__state_size;
++ 
++ 	/*
++ 	 * @__user_state_size:
++ 	 *
++ 	 * The size required for @__state_perm user part. Only valid to
++ 	 * access with sighand locked.
++ 	 */
++ 	unsigned int			__user_state_size;
++ };
++ 
+++>>>>>>> 6f6a7c09c406 (x86/fpu: Add members to struct fpu to cache permission information)
+  /*
+   * Highest level per task FPU state data structure that
+   * contains the FPU register state plus various FPU
+@@@ -331,20 -411,47 +416,48 @@@ struct fpu 
+  	 */
+  	unsigned int			last_cpu;
+  
+ -	/*
+ -	 * @avx512_timestamp:
+ -	 *
+ -	 * Records the timestamp of AVX512 use during last context switch.
+ -	 */
+ -	unsigned long			avx512_timestamp;
+ +	RH_KABI_DEPRECATE(unsigned char, initialized)
+  
+  	/*
+ -	 * @fpstate:
+ +	 * @state:
+  	 *
+ -	 * Pointer to the active struct fpstate. Initialized to
+ -	 * point at @__fpstate below.
+ +	 * In-memory copy of all FPU registers that we save/restore
+ +	 * over context switches. If the task is using the FPU then
+ +	 * the registers in the FPU are more recent than this state
+ +	 * copy. If the task context-switches away then they get
+ +	 * saved here and represent the FPU state.
+  	 */
+ -	struct fpstate			*fpstate;
+ -
+ +	union fpregs_state		state;
+  	/*
+++<<<<<<< HEAD
+ +	 * WARNING: 'state' is dynamically-sized.  Do not put
+++=======
++ 	 * @__task_fpstate:
++ 	 *
++ 	 * Pointer to an inactive struct fpstate. Initialized to NULL. Is
++ 	 * used only for KVM support to swap out the regular task fpstate.
++ 	 */
++ 	struct fpstate			*__task_fpstate;
++ 
++ 	/*
++ 	 * @perm:
++ 	 *
++ 	 * Permission related information
++ 	 */
++ 	struct fpu_state_perm		perm;
++ 
++ 	/*
++ 	 * @__fpstate:
++ 	 *
++ 	 * Initial in-memory storage for FPU registers which are saved in
++ 	 * context switch and when the kernel uses the FPU. The registers
++ 	 * are restored from this storage on return to user space if they
++ 	 * are not longer containing the tasks FPU register state.
++ 	 */
++ 	struct fpstate			__fpstate;
++ 	/*
++ 	 * WARNING: '__fpstate' is dynamically-sized.  Do not put
+++>>>>>>> 6f6a7c09c406 (x86/fpu: Add members to struct fpu to cache permission information)
+  	 * anything after it here.
+  	 */
+  };
+diff --cc arch/x86/kernel/fpu/core.c
+index 2859edb41245,b05f6a3b2057..000000000000
+--- a/arch/x86/kernel/fpu/core.c
++++ b/arch/x86/kernel/fpu/core.c
+@@@ -320,21 -390,34 +320,41 @@@ void fpstate_init_user(union fpregs_sta
+  		return;
+  	}
+  
+ -	xstate_init_xcomp_bv(&fpstate->regs.xsave, fpstate->xfeatures);
+ +	xstate_init_xcomp_bv(&state->xsave, xfeatures_mask_uabi());
+  
+  	if (cpu_feature_enabled(X86_FEATURE_FXSR))
+ -		fpstate_init_fxstate(fpstate);
+ +		fpstate_init_fxstate(&state->fxsave);
+  	else
+ -		fpstate_init_fstate(fpstate);
+ +		fpstate_init_fstate(&state->fsave);
+  }
+  
+ -static void __fpstate_reset(struct fpstate *fpstate)
+ +#if IS_ENABLED(CONFIG_KVM)
+ +void fpu_init_fpstate_user(struct fpu *fpu)
+  {
+++<<<<<<< HEAD
+ +	fpstate_init_user(&fpu->state);
+++=======
++ 	/* Initialize sizes and feature masks */
++ 	fpstate->size		= fpu_kernel_cfg.default_size;
++ 	fpstate->user_size	= fpu_user_cfg.default_size;
++ 	fpstate->xfeatures	= fpu_kernel_cfg.default_features;
++ 	fpstate->user_xfeatures	= fpu_user_cfg.default_features;
++ }
++ 
++ void fpstate_reset(struct fpu *fpu)
++ {
++ 	/* Set the fpstate pointer to the default fpstate */
++ 	fpu->fpstate = &fpu->__fpstate;
++ 	__fpstate_reset(fpu->fpstate);
++ 
++ 	/* Initialize the permission related info in fpu */
++ 	fpu->perm.__state_perm		= fpu_kernel_cfg.default_features;
++ 	fpu->perm.__state_size		= fpu_kernel_cfg.default_size;
++ 	fpu->perm.__user_state_size	= fpu_user_cfg.default_size;
+++>>>>>>> 6f6a7c09c406 (x86/fpu: Add members to struct fpu to cache permission information)
+  }
+ +EXPORT_SYMBOL_GPL(fpu_init_fpstate_user);
+ +#endif
+  
+  /* Clone current's FPU state on fork */
+  int fpu_clone(struct task_struct *dst)
+* Unmerged path arch/x86/include/asm/fpu/types.h
+* Unmerged path arch/x86/kernel/fpu/core.c
