@@ -1,0 +1,232 @@
+drm/i915: Turn off pipe CSC when it's not needed
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-147.el8
+commit-author Ville Syrjälä <ville.syrjala@linux.intel.com>
+commit 0593d2cd38134b9db4227897ec81eb18ab90b54a
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-147.el8/0593d2cd.failed
+
+As with pipe gamma we can avoid the potential precision loss from
+the pipe csc unit when there is no need to use it. And again
+we need the same logic for updating the planes.
+
+v2: Rebase
+
+	Signed-off-by: Ville Syrjälä <ville.syrjala@linux.intel.com>
+	Reviewed-by: Uma Shankar <uma.shankar@intel.com>
+	Reviewed-by: Matt Roper <matthew.d.roper@intel.com>
+Link: https://patchwork.freedesktop.org/patch/msgid/20190207202146.26423-6-ville.syrjala@linux.intel.com
+(cherry picked from commit 0593d2cd38134b9db4227897ec81eb18ab90b54a)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/gpu/drm/i915/intel_color.c
+diff --cc drivers/gpu/drm/i915/intel_color.c
+index c6a7beabd58d,9720af3742f7..000000000000
+--- a/drivers/gpu/drm/i915/intel_color.c
++++ b/drivers/gpu/drm/i915/intel_color.c
+@@@ -613,56 -630,157 +613,157 @@@ void intel_color_load_luts(struct drm_c
+  	dev_priv->display.load_luts(crtc_state);
+  }
+  
+ -void intel_color_commit(const struct intel_crtc_state *crtc_state)
+ +int intel_color_check(struct drm_crtc *crtc,
+ +		      struct drm_crtc_state *crtc_state)
+  {
+++<<<<<<< HEAD
+ +	struct drm_i915_private *dev_priv = to_i915(crtc->dev);
+ +	size_t gamma_length, degamma_length;
+++=======
++ 	struct drm_i915_private *dev_priv = to_i915(crtc_state->base.crtc->dev);
++ 
++ 	dev_priv->display.color_commit(crtc_state);
++ }
++ 
++ static bool need_plane_update(struct intel_plane *plane,
++ 			      const struct intel_crtc_state *crtc_state)
++ {
++ 	struct drm_i915_private *dev_priv = to_i915(plane->base.dev);
++ 
++ 	/*
++ 	 * On pre-SKL the pipe gamma enable and pipe csc enable for
++ 	 * the pipe bottom color are configured via the primary plane.
++ 	 * We have to reconfigure that even if the plane is inactive.
++ 	 */
++ 	return crtc_state->active_planes & BIT(plane->id) ||
++ 		(INTEL_GEN(dev_priv) < 9 &&
++ 		 plane->id == PLANE_PRIMARY);
++ }
++ 
++ static int
++ intel_color_add_affected_planes(struct intel_crtc_state *new_crtc_state)
++ {
++ 	struct intel_crtc *crtc = to_intel_crtc(new_crtc_state->base.crtc);
++ 	struct drm_i915_private *dev_priv = to_i915(crtc->base.dev);
++ 	struct intel_atomic_state *state =
++ 		to_intel_atomic_state(new_crtc_state->base.state);
++ 	const struct intel_crtc_state *old_crtc_state =
++ 		intel_atomic_get_old_crtc_state(state, crtc);
++ 	struct intel_plane *plane;
++ 
++ 	if (new_crtc_state->gamma_enable == old_crtc_state->gamma_enable &&
++ 	    new_crtc_state->csc_enable == old_crtc_state->csc_enable)
++ 		return 0;
++ 
++ 	for_each_intel_plane_on_crtc(&dev_priv->drm, crtc, plane) {
++ 		struct intel_plane_state *plane_state;
++ 
++ 		if (!need_plane_update(plane, new_crtc_state))
++ 			continue;
++ 
++ 		plane_state = intel_atomic_get_plane_state(state, plane);
++ 		if (IS_ERR(plane_state))
++ 			return PTR_ERR(plane_state);
++ 
++ 		new_crtc_state->update_planes |= BIT(plane->id);
++ 	}
++ 
++ 	return 0;
++ }
++ 
++ static int check_lut_size(const struct drm_property_blob *lut, int expected)
++ {
++ 	int len;
++ 
++ 	if (!lut)
++ 		return 0;
++ 
++ 	len = drm_color_lut_size(lut);
++ 	if (len != expected) {
++ 		DRM_DEBUG_KMS("Invalid LUT size; got %d, expected %d\n",
++ 			      len, expected);
++ 		return -EINVAL;
++ 	}
++ 
++ 	return 0;
++ }
++ 
++ int intel_color_check(struct intel_crtc_state *crtc_state)
++ {
++ 	struct drm_i915_private *dev_priv = to_i915(crtc_state->base.crtc->dev);
++ 	const struct drm_property_blob *gamma_lut = crtc_state->base.gamma_lut;
++ 	const struct drm_property_blob *degamma_lut = crtc_state->base.degamma_lut;
++ 	bool limited_color_range = false;
++ 	int gamma_length, degamma_length;
++ 	u32 gamma_tests, degamma_tests;
++ 	int ret;
+++>>>>>>> 0593d2cd3813 (drm/i915: Turn off pipe CSC when it's not needed)
+  
+  	degamma_length = INTEL_INFO(dev_priv)->color.degamma_lut_size;
+  	gamma_length = INTEL_INFO(dev_priv)->color.gamma_lut_size;
+ -	degamma_tests = INTEL_INFO(dev_priv)->color.degamma_lut_tests;
+ -	gamma_tests = INTEL_INFO(dev_priv)->color.gamma_lut_tests;
+  
+++<<<<<<< HEAD
+ +	/*
+ +	 * We allow both degamma & gamma luts at the right size or
+ +	 * NULL.
+ +	 */
+ +	if ((!crtc_state->degamma_lut ||
+ +	     drm_color_lut_size(crtc_state->degamma_lut) == degamma_length) &&
+ +	    (!crtc_state->gamma_lut ||
+ +	     drm_color_lut_size(crtc_state->gamma_lut) == gamma_length))
+++=======
++ 	crtc_state->gamma_enable = gamma_lut || degamma_lut;
++ 
++ 	if (INTEL_GEN(dev_priv) >= 9 ||
++ 	    IS_BROADWELL(dev_priv) || IS_HASWELL(dev_priv))
++ 		limited_color_range = crtc_state->limited_color_range;
++ 
++ 	crtc_state->csc_enable =
++ 		crtc_state->output_format != INTEL_OUTPUT_FORMAT_RGB ||
++ 		crtc_state->base.ctm || limited_color_range;
++ 
++ 	ret = intel_color_add_affected_planes(crtc_state);
++ 	if (ret)
++ 		return ret;
++ 
++ 	/* Always allow legacy gamma LUT with no further checking. */
++ 	if (!crtc_state->gamma_enable ||
++ 	    crtc_state_is_legacy_gamma(crtc_state)) {
++ 		crtc_state->gamma_mode = GAMMA_MODE_MODE_8BIT;
+++>>>>>>> 0593d2cd3813 (drm/i915: Turn off pipe CSC when it's not needed)
+  		return 0;
+ -	}
+  
+ -	if (check_lut_size(degamma_lut, degamma_length) ||
+ -	    check_lut_size(gamma_lut, gamma_length))
+ -		return -EINVAL;
+ -
+ -	if (drm_color_lut_check(degamma_lut, degamma_tests) ||
+ -	    drm_color_lut_check(gamma_lut, gamma_tests))
+ -		return -EINVAL;
+ -
+ -	if (INTEL_GEN(dev_priv) >= 10 || IS_GEMINILAKE(dev_priv))
+ -		crtc_state->gamma_mode = GAMMA_MODE_MODE_10BIT;
+ -	else if (INTEL_GEN(dev_priv) >= 9 || IS_BROADWELL(dev_priv))
+ -		crtc_state->gamma_mode = GAMMA_MODE_MODE_SPLIT;
+ -	else
+ -		crtc_state->gamma_mode = GAMMA_MODE_MODE_8BIT;
+ +	/*
+ +	 * We also allow no degamma lut/ctm and a gamma lut at the legacy
+ +	 * size (256 entries).
+ +	 */
+ +	if (crtc_state_is_legacy_gamma(crtc_state))
+ +		return 0;
+  
+ -	return 0;
+ +	return -EINVAL;
+  }
+  
+ -void intel_color_init(struct intel_crtc *crtc)
+ +void intel_color_init(struct drm_crtc *crtc)
+  {
+ -	struct drm_i915_private *dev_priv = to_i915(crtc->base.dev);
+ -
+ -	drm_mode_crtc_set_gamma_size(&crtc->base, 256);
+ -
+ -	if (HAS_GMCH(dev_priv)) {
+ -		if (IS_CHERRYVIEW(dev_priv))
+ -			dev_priv->display.load_luts = cherryview_load_luts;
+ -		else
+ -			dev_priv->display.load_luts = i9xx_load_luts;
+ -
+ -		dev_priv->display.color_commit = i9xx_color_commit;
+ +	struct drm_i915_private *dev_priv = to_i915(crtc->dev);
+ +
+ +	drm_mode_crtc_set_gamma_size(crtc, 256);
+ +
+ +	if (IS_CHERRYVIEW(dev_priv)) {
+ +		dev_priv->display.load_csc_matrix = cherryview_load_csc_matrix;
+ +		dev_priv->display.load_luts = cherryview_load_luts;
+ +	} else if (IS_HASWELL(dev_priv)) {
+ +		dev_priv->display.load_csc_matrix = ilk_load_csc_matrix;
+ +		dev_priv->display.load_luts = haswell_load_luts;
+ +	} else if (IS_BROADWELL(dev_priv) || IS_GEN9_BC(dev_priv) ||
+ +		   IS_BROXTON(dev_priv)) {
+ +		dev_priv->display.load_csc_matrix = ilk_load_csc_matrix;
+ +		dev_priv->display.load_luts = broadwell_load_luts;
+ +	} else if (IS_GEMINILAKE(dev_priv) || IS_CANNONLAKE(dev_priv)) {
+ +		dev_priv->display.load_csc_matrix = ilk_load_csc_matrix;
+ +		dev_priv->display.load_luts = glk_load_luts;
+  	} else {
+ -		if (IS_CANNONLAKE(dev_priv) || IS_GEMINILAKE(dev_priv))
+ -			dev_priv->display.load_luts = glk_load_luts;
+ -		else if (INTEL_GEN(dev_priv) >= 9 || IS_BROADWELL(dev_priv))
+ -			dev_priv->display.load_luts = broadwell_load_luts;
+ -		else
+ -			dev_priv->display.load_luts = i9xx_load_luts;
+ -
+ -		if (INTEL_GEN(dev_priv) >= 9)
+ -			dev_priv->display.color_commit = skl_color_commit;
+ -		else if (IS_BROADWELL(dev_priv) || IS_HASWELL(dev_priv))
+ -			dev_priv->display.color_commit = hsw_color_commit;
+ -		else
+ -			dev_priv->display.color_commit = ilk_color_commit;
+ +		dev_priv->display.load_luts = i9xx_load_luts;
+  	}
+  
+  	/* Enable color management support when we have degamma & gamma LUTs. */
+* Unmerged path drivers/gpu/drm/i915/intel_color.c
