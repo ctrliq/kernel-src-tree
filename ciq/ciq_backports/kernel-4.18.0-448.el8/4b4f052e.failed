@@ -1,0 +1,294 @@
+net: tun: track dropped skb via kfree_skb_reason()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-448.el8
+commit-author Dongli Zhang <dongli.zhang@oracle.com>
+commit 4b4f052e2d89c2eb7e13ee28ba9e85f8097aef3d
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-448.el8/4b4f052e.failed
+
+The TUN can be used as vhost-net backend. E.g, the tun_net_xmit() is the
+interface to forward the skb from TUN to vhost-net/virtio-net.
+
+However, there are many "goto drop" in the TUN driver. Therefore, the
+kfree_skb_reason() is involved at each "goto drop" to help userspace
+ftrace/ebpf to track the reason for the loss of packets.
+
+The below reasons are introduced:
+
+- SKB_DROP_REASON_DEV_READY
+- SKB_DROP_REASON_NOMEM
+- SKB_DROP_REASON_HDR_TRUNC
+- SKB_DROP_REASON_TAP_FILTER
+- SKB_DROP_REASON_TAP_TXFILTER
+
+	Cc: Joao Martins <joao.m.martins@oracle.com>
+	Cc: Joe Jin <joe.jin@oracle.com>
+	Signed-off-by: Dongli Zhang <dongli.zhang@oracle.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 4b4f052e2d89c2eb7e13ee28ba9e85f8097aef3d)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/tun.c
+#	include/linux/skbuff.h
+#	include/trace/events/skb.h
+diff --cc drivers/net/tun.c
+index 41329d982ee1,bab92e489fba..000000000000
+--- a/drivers/net/tun.c
++++ b/drivers/net/tun.c
+@@@ -1098,10 -1115,12 +1111,12 @@@ static netdev_tx_t tun_net_xmit(struct 
+  	 */
+  	skb_orphan(skb);
+  
+ -	nf_reset_ct(skb);
+ +	nf_reset(skb);
+  
+- 	if (ptr_ring_produce(&tfile->tx_ring, skb))
++ 	if (ptr_ring_produce(&tfile->tx_ring, skb)) {
++ 		drop_reason = SKB_DROP_REASON_FULL_RING;
+  		goto drop;
++ 	}
+  
+  	/* NETIF_F_LLTX requires to do our own update of trans_start */
+  	queue = netdev_get_tx_queue(dev, txq);
+@@@ -1116,9 -1135,9 +1131,9 @@@
+  	return NETDEV_TX_OK;
+  
+  drop:
+ -	atomic_long_inc(&dev->tx_dropped);
+ +	this_cpu_inc(tun->pcpu_stats->tx_dropped);
+  	skb_tx_error(skb);
+- 	kfree_skb(skb);
++ 	kfree_skb_reason(skb, drop_reason);
+  	rcu_read_unlock();
+  	return NET_XMIT_DROP;
+  }
+@@@ -1885,9 -1839,10 +1901,15 @@@ static ssize_t tun_get_user(struct tun_
+  
+  		if (err) {
+  			err = -EFAULT;
++ 			drop_reason = SKB_DROP_REASON_SKB_UCOPY_FAULT;
+  drop:
+++<<<<<<< HEAD
+ +			this_cpu_inc(tun->pcpu_stats->rx_dropped);
+ +			kfree_skb(skb);
+++=======
++ 			atomic_long_inc(&tun->dev->rx_dropped);
++ 			kfree_skb_reason(skb, drop_reason);
+++>>>>>>> 4b4f052e2d89 (net: tun: track dropped skb via kfree_skb_reason())
+  			if (frags) {
+  				tfile->napi.skb = NULL;
+  				mutex_unlock(&tfile->napi_mutex);
+diff --cc include/linux/skbuff.h
+index 6050fa383222,34f572271c0c..000000000000
+--- a/include/linux/skbuff.h
++++ b/include/linux/skbuff.h
+@@@ -318,7 -314,135 +318,139 @@@ struct sk_buff
+   * used to translate the reason to string.
+   */
+  enum skb_drop_reason {
+++<<<<<<< HEAD
+ +	SKB_DROP_REASON_NOT_SPECIFIED,
+++=======
++ 	SKB_DROP_REASON_NOT_SPECIFIED,	/* drop reason is not specified */
++ 	SKB_DROP_REASON_NO_SOCKET,	/* socket not found */
++ 	SKB_DROP_REASON_PKT_TOO_SMALL,	/* packet size is too small */
++ 	SKB_DROP_REASON_TCP_CSUM,	/* TCP checksum error */
++ 	SKB_DROP_REASON_SOCKET_FILTER,	/* dropped by socket filter */
++ 	SKB_DROP_REASON_UDP_CSUM,	/* UDP checksum error */
++ 	SKB_DROP_REASON_NETFILTER_DROP,	/* dropped by netfilter */
++ 	SKB_DROP_REASON_OTHERHOST,	/* packet don't belong to current
++ 					 * host (interface is in promisc
++ 					 * mode)
++ 					 */
++ 	SKB_DROP_REASON_IP_CSUM,	/* IP checksum error */
++ 	SKB_DROP_REASON_IP_INHDR,	/* there is something wrong with
++ 					 * IP header (see
++ 					 * IPSTATS_MIB_INHDRERRORS)
++ 					 */
++ 	SKB_DROP_REASON_IP_RPFILTER,	/* IP rpfilter validate failed.
++ 					 * see the document for rp_filter
++ 					 * in ip-sysctl.rst for more
++ 					 * information
++ 					 */
++ 	SKB_DROP_REASON_UNICAST_IN_L2_MULTICAST, /* destination address of L2
++ 						  * is multicast, but L3 is
++ 						  * unicast.
++ 						  */
++ 	SKB_DROP_REASON_XFRM_POLICY,	/* xfrm policy check failed */
++ 	SKB_DROP_REASON_IP_NOPROTO,	/* no support for IP protocol */
++ 	SKB_DROP_REASON_SOCKET_RCVBUFF,	/* socket receive buff is full */
++ 	SKB_DROP_REASON_PROTO_MEM,	/* proto memory limition, such as
++ 					 * udp packet drop out of
++ 					 * udp_memory_allocated.
++ 					 */
++ 	SKB_DROP_REASON_TCP_MD5NOTFOUND,	/* no MD5 hash and one
++ 						 * expected, corresponding
++ 						 * to LINUX_MIB_TCPMD5NOTFOUND
++ 						 */
++ 	SKB_DROP_REASON_TCP_MD5UNEXPECTED,	/* MD5 hash and we're not
++ 						 * expecting one, corresponding
++ 						 * to LINUX_MIB_TCPMD5UNEXPECTED
++ 						 */
++ 	SKB_DROP_REASON_TCP_MD5FAILURE,	/* MD5 hash and its wrong,
++ 					 * corresponding to
++ 					 * LINUX_MIB_TCPMD5FAILURE
++ 					 */
++ 	SKB_DROP_REASON_SOCKET_BACKLOG,	/* failed to add skb to socket
++ 					 * backlog (see
++ 					 * LINUX_MIB_TCPBACKLOGDROP)
++ 					 */
++ 	SKB_DROP_REASON_TCP_FLAGS,	/* TCP flags invalid */
++ 	SKB_DROP_REASON_TCP_ZEROWINDOW,	/* TCP receive window size is zero,
++ 					 * see LINUX_MIB_TCPZEROWINDOWDROP
++ 					 */
++ 	SKB_DROP_REASON_TCP_OLD_DATA,	/* the TCP data reveived is already
++ 					 * received before (spurious retrans
++ 					 * may happened), see
++ 					 * LINUX_MIB_DELAYEDACKLOST
++ 					 */
++ 	SKB_DROP_REASON_TCP_OVERWINDOW,	/* the TCP data is out of window,
++ 					 * the seq of the first byte exceed
++ 					 * the right edges of receive
++ 					 * window
++ 					 */
++ 	SKB_DROP_REASON_TCP_OFOMERGE,	/* the data of skb is already in
++ 					 * the ofo queue, corresponding to
++ 					 * LINUX_MIB_TCPOFOMERGE
++ 					 */
++ 	SKB_DROP_REASON_IP_OUTNOROUTES,	/* route lookup failed */
++ 	SKB_DROP_REASON_BPF_CGROUP_EGRESS,	/* dropped by
++ 						 * BPF_PROG_TYPE_CGROUP_SKB
++ 						 * eBPF program
++ 						 */
++ 	SKB_DROP_REASON_IPV6DISABLED,	/* IPv6 is disabled on the device */
++ 	SKB_DROP_REASON_NEIGH_CREATEFAIL,	/* failed to create neigh
++ 						 * entry
++ 						 */
++ 	SKB_DROP_REASON_NEIGH_FAILED,	/* neigh entry in failed state */
++ 	SKB_DROP_REASON_NEIGH_QUEUEFULL,	/* arp_queue for neigh
++ 						 * entry is full
++ 						 */
++ 	SKB_DROP_REASON_NEIGH_DEAD,	/* neigh entry is dead */
++ 	SKB_DROP_REASON_TC_EGRESS,	/* dropped in TC egress HOOK */
++ 	SKB_DROP_REASON_QDISC_DROP,	/* dropped by qdisc when packet
++ 					 * outputting (failed to enqueue to
++ 					 * current qdisc)
++ 					 */
++ 	SKB_DROP_REASON_CPU_BACKLOG,	/* failed to enqueue the skb to
++ 					 * the per CPU backlog queue. This
++ 					 * can be caused by backlog queue
++ 					 * full (see netdev_max_backlog in
++ 					 * net.rst) or RPS flow limit
++ 					 */
++ 	SKB_DROP_REASON_XDP,		/* dropped by XDP in input path */
++ 	SKB_DROP_REASON_TC_INGRESS,	/* dropped in TC ingress HOOK */
++ 	SKB_DROP_REASON_PTYPE_ABSENT,	/* not packet_type found to handle
++ 					 * the skb. For an etner packet,
++ 					 * this means that L3 protocol is
++ 					 * not supported
++ 					 */
++ 	SKB_DROP_REASON_SKB_CSUM,	/* sk_buff checksum computation
++ 					 * error
++ 					 */
++ 	SKB_DROP_REASON_SKB_GSO_SEG,	/* gso segmentation error */
++ 	SKB_DROP_REASON_SKB_UCOPY_FAULT,	/* failed to copy data from
++ 						 * user space, e.g., via
++ 						 * zerocopy_sg_from_iter()
++ 						 * or skb_orphan_frags_rx()
++ 						 */
++ 	SKB_DROP_REASON_DEV_HDR,	/* device driver specific
++ 					 * header/metadata is invalid
++ 					 */
++ 	/* the device is not ready to xmit/recv due to any of its data
++ 	 * structure that is not up/ready/initialized, e.g., the IFF_UP is
++ 	 * not set, or driver specific tun->tfiles[txq] is not initialized
++ 	 */
++ 	SKB_DROP_REASON_DEV_READY,
++ 	SKB_DROP_REASON_FULL_RING,	/* ring buffer is full */
++ 	SKB_DROP_REASON_NOMEM,		/* error due to OOM */
++ 	SKB_DROP_REASON_HDR_TRUNC,      /* failed to trunc/extract the header
++ 					 * from networking data, e.g., failed
++ 					 * to pull the protocol header from
++ 					 * frags via pskb_may_pull()
++ 					 */
++ 	SKB_DROP_REASON_TAP_FILTER,     /* dropped by (ebpf) filter directly
++ 					 * attached to tun/tap, e.g., via
++ 					 * TUNSETFILTEREBPF
++ 					 */
++ 	SKB_DROP_REASON_TAP_TXFILTER,	/* dropped by tx filter implemented
++ 					 * at tun/tap, e.g., check_filter()
++ 					 */
+++>>>>>>> 4b4f052e2d89 (net: tun: track dropped skb via kfree_skb_reason())
+  	SKB_DROP_REASON_MAX,
+  };
+  
+diff --cc include/trace/events/skb.h
+index 294c61bbe44b,e1670e1e4934..000000000000
+--- a/include/trace/events/skb.h
++++ b/include/trace/events/skb.h
+@@@ -11,6 -11,56 +11,59 @@@
+  
+  #define TRACE_SKB_DROP_REASON					\
+  	EM(SKB_DROP_REASON_NOT_SPECIFIED, NOT_SPECIFIED)	\
+++<<<<<<< HEAD
+++=======
++ 	EM(SKB_DROP_REASON_NO_SOCKET, NO_SOCKET)		\
++ 	EM(SKB_DROP_REASON_PKT_TOO_SMALL, PKT_TOO_SMALL)	\
++ 	EM(SKB_DROP_REASON_TCP_CSUM, TCP_CSUM)			\
++ 	EM(SKB_DROP_REASON_SOCKET_FILTER, SOCKET_FILTER)	\
++ 	EM(SKB_DROP_REASON_UDP_CSUM, UDP_CSUM)			\
++ 	EM(SKB_DROP_REASON_NETFILTER_DROP, NETFILTER_DROP)	\
++ 	EM(SKB_DROP_REASON_OTHERHOST, OTHERHOST)		\
++ 	EM(SKB_DROP_REASON_IP_CSUM, IP_CSUM)			\
++ 	EM(SKB_DROP_REASON_IP_INHDR, IP_INHDR)			\
++ 	EM(SKB_DROP_REASON_IP_RPFILTER, IP_RPFILTER)		\
++ 	EM(SKB_DROP_REASON_UNICAST_IN_L2_MULTICAST,		\
++ 	   UNICAST_IN_L2_MULTICAST)				\
++ 	EM(SKB_DROP_REASON_XFRM_POLICY, XFRM_POLICY)		\
++ 	EM(SKB_DROP_REASON_IP_NOPROTO, IP_NOPROTO)		\
++ 	EM(SKB_DROP_REASON_SOCKET_RCVBUFF, SOCKET_RCVBUFF)	\
++ 	EM(SKB_DROP_REASON_PROTO_MEM, PROTO_MEM)		\
++ 	EM(SKB_DROP_REASON_TCP_MD5NOTFOUND, TCP_MD5NOTFOUND)	\
++ 	EM(SKB_DROP_REASON_TCP_MD5UNEXPECTED,			\
++ 	   TCP_MD5UNEXPECTED)					\
++ 	EM(SKB_DROP_REASON_TCP_MD5FAILURE, TCP_MD5FAILURE)	\
++ 	EM(SKB_DROP_REASON_SOCKET_BACKLOG, SOCKET_BACKLOG)	\
++ 	EM(SKB_DROP_REASON_TCP_FLAGS, TCP_FLAGS)		\
++ 	EM(SKB_DROP_REASON_TCP_ZEROWINDOW, TCP_ZEROWINDOW)	\
++ 	EM(SKB_DROP_REASON_TCP_OLD_DATA, TCP_OLD_DATA)		\
++ 	EM(SKB_DROP_REASON_TCP_OVERWINDOW, TCP_OVERWINDOW)	\
++ 	EM(SKB_DROP_REASON_TCP_OFOMERGE, TCP_OFOMERGE)		\
++ 	EM(SKB_DROP_REASON_IP_OUTNOROUTES, IP_OUTNOROUTES)	\
++ 	EM(SKB_DROP_REASON_BPF_CGROUP_EGRESS,			\
++ 	   BPF_CGROUP_EGRESS)					\
++ 	EM(SKB_DROP_REASON_IPV6DISABLED, IPV6DISABLED)		\
++ 	EM(SKB_DROP_REASON_NEIGH_CREATEFAIL, NEIGH_CREATEFAIL)	\
++ 	EM(SKB_DROP_REASON_NEIGH_FAILED, NEIGH_FAILED)		\
++ 	EM(SKB_DROP_REASON_NEIGH_QUEUEFULL, NEIGH_QUEUEFULL)	\
++ 	EM(SKB_DROP_REASON_NEIGH_DEAD, NEIGH_DEAD)		\
++ 	EM(SKB_DROP_REASON_TC_EGRESS, TC_EGRESS)		\
++ 	EM(SKB_DROP_REASON_QDISC_DROP, QDISC_DROP)		\
++ 	EM(SKB_DROP_REASON_CPU_BACKLOG, CPU_BACKLOG)		\
++ 	EM(SKB_DROP_REASON_XDP, XDP)				\
++ 	EM(SKB_DROP_REASON_TC_INGRESS, TC_INGRESS)		\
++ 	EM(SKB_DROP_REASON_PTYPE_ABSENT, PTYPE_ABSENT)		\
++ 	EM(SKB_DROP_REASON_SKB_CSUM, SKB_CSUM)			\
++ 	EM(SKB_DROP_REASON_SKB_GSO_SEG, SKB_GSO_SEG)		\
++ 	EM(SKB_DROP_REASON_SKB_UCOPY_FAULT, SKB_UCOPY_FAULT)	\
++ 	EM(SKB_DROP_REASON_DEV_HDR, DEV_HDR)			\
++ 	EM(SKB_DROP_REASON_DEV_READY, DEV_READY)		\
++ 	EM(SKB_DROP_REASON_FULL_RING, FULL_RING)		\
++ 	EM(SKB_DROP_REASON_NOMEM, NOMEM)			\
++ 	EM(SKB_DROP_REASON_HDR_TRUNC, HDR_TRUNC)		\
++ 	EM(SKB_DROP_REASON_TAP_FILTER, TAP_FILTER)		\
++ 	EM(SKB_DROP_REASON_TAP_TXFILTER, TAP_TXFILTER)		\
+++>>>>>>> 4b4f052e2d89 (net: tun: track dropped skb via kfree_skb_reason())
+  	EMe(SKB_DROP_REASON_MAX, MAX)
+  
+  #undef EM
+* Unmerged path drivers/net/tun.c
+* Unmerged path include/linux/skbuff.h
+* Unmerged path include/trace/events/skb.h
