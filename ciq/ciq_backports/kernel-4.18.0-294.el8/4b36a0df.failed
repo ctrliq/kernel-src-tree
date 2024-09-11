@@ -1,0 +1,213 @@
+net: openvswitch: suitable access to the dp_meters
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+Rebuild_CHGLOG: - [net] openvswitch: suitable access to the dp_meters (Eelco Chaudron) [1888576]
+Rebuild_FUZZ: 94.74%
+commit-author Tonghao Zhang <xiangxia.m.yue@gmail.com>
+commit 4b36a0dff794a00989a50581aed2f94c88b57107
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/4b36a0df.failed
+
+To fix the following sparse warning:
+| net/openvswitch/meter.c:109:38: sparse: sparse: incorrect type
+| in assignment (different address spaces) ...
+| net/openvswitch/meter.c:720:45: sparse: sparse: incorrect type
+| in argument 1 (different address spaces) ...
+
+	Reported-by: kbuild test robot <lkp@intel.com>
+	Signed-off-by: Tonghao Zhang <xiangxia.m.yue@gmail.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 4b36a0dff794a00989a50581aed2f94c88b57107)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/openvswitch/meter.c
+diff --cc net/openvswitch/meter.c
+index 48d8c4cdc97b,612ad5586ce9..000000000000
+--- a/net/openvswitch/meter.c
++++ b/net/openvswitch/meter.c
+@@@ -71,18 -66,147 +71,111 @@@ static struct dp_meter *lookup_meter(co
+  	return NULL;
+  }
+  
+ -static struct dp_meter_instance *dp_meter_instance_alloc(const u32 size)
+ +static void attach_meter(struct datapath *dp, struct dp_meter *meter)
+  {
+ -	struct dp_meter_instance *ti;
+ +	struct hlist_head *head = meter_hash_bucket(dp, meter->id);
+  
+ -	ti = kvzalloc(sizeof(*ti) +
+ -		      sizeof(struct dp_meter *) * size,
+ -		      GFP_KERNEL);
+ -	if (!ti)
+ -		return NULL;
+ -
+ -	ti->n_meters = size;
+ -
+ -	return ti;
+ +	hlist_add_head_rcu(&meter->dp_hash_node, head);
+  }
+  
+ -static void dp_meter_instance_free(struct dp_meter_instance *ti)
+ +static void detach_meter(struct dp_meter *meter)
+  {
+++<<<<<<< HEAD
+++=======
++ 	kvfree(ti);
++ }
++ 
++ static void dp_meter_instance_free_rcu(struct rcu_head *rcu)
++ {
++ 	struct dp_meter_instance *ti;
++ 
++ 	ti = container_of(rcu, struct dp_meter_instance, rcu);
++ 	kvfree(ti);
++ }
++ 
++ static int
++ dp_meter_instance_realloc(struct dp_meter_table *tbl, u32 size)
++ {
++ 	struct dp_meter_instance *ti = rcu_dereference_ovsl(tbl->ti);
++ 	int n_meters = min(size, ti->n_meters);
++ 	struct dp_meter_instance *new_ti;
++ 	int i;
++ 
++ 	new_ti = dp_meter_instance_alloc(size);
++ 	if (!new_ti)
++ 		return -ENOMEM;
++ 
++ 	for (i = 0; i < n_meters; i++)
++ 		if (rcu_dereference_ovsl(ti->dp_meters[i]))
++ 			new_ti->dp_meters[i] = ti->dp_meters[i];
++ 
++ 	rcu_assign_pointer(tbl->ti, new_ti);
++ 	call_rcu(&ti->rcu, dp_meter_instance_free_rcu);
++ 
++ 	return 0;
++ }
++ 
++ static void dp_meter_instance_insert(struct dp_meter_instance *ti,
++ 				     struct dp_meter *meter)
++ {
++ 	u32 hash;
++ 
++ 	hash = meter_hash(ti, meter->id);
++ 	rcu_assign_pointer(ti->dp_meters[hash], meter);
++ }
++ 
++ static void dp_meter_instance_remove(struct dp_meter_instance *ti,
++ 				     struct dp_meter *meter)
++ {
++ 	u32 hash;
++ 
++ 	hash = meter_hash(ti, meter->id);
++ 	RCU_INIT_POINTER(ti->dp_meters[hash], NULL);
++ }
++ 
++ static int attach_meter(struct dp_meter_table *tbl, struct dp_meter *meter)
++ {
++ 	struct dp_meter_instance *ti = rcu_dereference_ovsl(tbl->ti);
++ 	u32 hash = meter_hash(ti, meter->id);
++ 	int err;
++ 
++ 	/* In generally, slots selected should be empty, because
++ 	 * OvS uses id-pool to fetch a available id.
++ 	 */
++ 	if (unlikely(rcu_dereference_ovsl(ti->dp_meters[hash])))
++ 		return -EBUSY;
++ 
++ 	dp_meter_instance_insert(ti, meter);
++ 
++ 	/* That function is thread-safe. */
++ 	tbl->count++;
++ 	if (tbl->count >= tbl->max_meters_allowed) {
++ 		err = -EFBIG;
++ 		goto attach_err;
++ 	}
++ 
++ 	if (tbl->count >= ti->n_meters &&
++ 	    dp_meter_instance_realloc(tbl, ti->n_meters * 2)) {
++ 		err = -ENOMEM;
++ 		goto attach_err;
++ 	}
++ 
++ 	return 0;
++ 
++ attach_err:
++ 	dp_meter_instance_remove(ti, meter);
++ 	tbl->count--;
++ 	return err;
++ }
++ 
++ static int detach_meter(struct dp_meter_table *tbl, struct dp_meter *meter)
++ {
++ 	struct dp_meter_instance *ti;
++ 
+++>>>>>>> 4b36a0dff794 (net: openvswitch: suitable access to the dp_meters)
+  	ASSERT_OVSL();
+ -	if (!meter)
+ -		return 0;
+ -
+ -	ti = rcu_dereference_ovsl(tbl->ti);
+ -	dp_meter_instance_remove(ti, meter);
+ -
+ -	tbl->count--;
+ -
+ -	/* Shrink the meter array if necessary. */
+ -	if (ti->n_meters > DP_METER_ARRAY_SIZE_MIN &&
+ -	    tbl->count <= (ti->n_meters / 4)) {
+ -		int half_size = ti->n_meters / 2;
+ -		int i;
+ -
+ -		/* Avoid hash collision, don't move slots to other place.
+ -		 * Make sure there are no references of meters in array
+ -		 * which will be released.
+ -		 */
+ -		for (i = half_size; i < ti->n_meters; i++)
+ -			if (rcu_dereference_ovsl(ti->dp_meters[i]))
+ -				goto out;
+ -
+ -		if (dp_meter_instance_realloc(tbl, half_size))
+ -			goto shrink_err;
+ -	}
+ -
+ -out:
+ -	return 0;
+ -
+ -shrink_err:
+ -	dp_meter_instance_insert(ti, meter);
+ -	tbl->count++;
+ -	return -ENOMEM;
+ +	if (meter)
+ +		hlist_del_rcu(&meter->dp_hash_node);
+  }
+  
+  static struct sk_buff *
+@@@ -586,16 -747,12 +679,21 @@@ int ovs_meters_init(struct datapath *dp
+  
+  void ovs_meters_exit(struct datapath *dp)
+  {
+ -	struct dp_meter_table *tbl = &dp->meter_tbl;
+ -	struct dp_meter_instance *ti = rcu_dereference_raw(tbl->ti);
+  	int i;
+  
+++<<<<<<< HEAD
+ +	for (i = 0; i < METER_HASH_BUCKETS; i++) {
+ +		struct hlist_head *head = &dp->meters[i];
+ +		struct dp_meter *meter;
+ +		struct hlist_node *n;
+++=======
++ 	for (i = 0; i < ti->n_meters; i++)
++ 		ovs_meter_free(rcu_dereference_raw(ti->dp_meters[i]));
+++>>>>>>> 4b36a0dff794 (net: openvswitch: suitable access to the dp_meters)
+ +
+ +		hlist_for_each_entry_safe(meter, n, head, dp_hash_node)
+ +			kfree(meter);
+ +	}
+  
+ -	dp_meter_instance_free(ti);
+ +	kfree(dp->meters);
+  }
+* Unmerged path net/openvswitch/meter.c
