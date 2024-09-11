@@ -1,0 +1,420 @@
+x86/traps: Handle #DB for bus lock
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-315.el8
+commit-author Fenghua Yu <fenghua.yu@intel.com>
+commit ebb1064e7c2e90b56e4d40ab154ef9796060a1c3
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-315.el8/ebb1064e.failed
+
+Bus locks degrade performance for the whole system, not just for the CPU
+that requested the bus lock. Two CPU features "#AC for split lock" and
+"#DB for bus lock" provide hooks so that the operating system may choose
+one of several mitigation strategies.
+
+#AC for split lock is already implemented. Add code to use the #DB for
+bus lock feature to cover additional situations with new options to
+mitigate.
+
+split_lock_detect=
+		#AC for split lock		#DB for bus lock
+
+off		Do nothing			Do nothing
+
+warn		Kernel OOPs			Warn once per task and
+		Warn once per task and		and continues to run.
+		disable future checking
+	 	When both features are
+		supported, warn in #AC
+
+fatal		Kernel OOPs			Send SIGBUS to user.
+		Send SIGBUS to user
+		When both features are
+		supported, fatal in #AC
+
+ratelimit:N	Do nothing			Limit bus lock rate to
+						N per second in the
+						current non-root user.
+
+Default option is "warn".
+
+Hardware only generates #DB for bus lock detect when CPL>0 to avoid
+nested #DB from multiple bus locks while the first #DB is being handled.
+So no need to handle #DB for bus lock detected in the kernel.
+
+#DB for bus lock is enabled by bus lock detection bit 2 in DEBUGCTL MSR
+while #AC for split lock is enabled by split lock detection bit 29 in
+TEST_CTRL MSR.
+
+Both breakpoint and bus lock in the same instruction can trigger one #DB.
+The bus lock is handled before the breakpoint in the #DB handler.
+
+Delivery of #DB for bus lock in userspace clears DR6[11], which is set by
+the #DB handler right after reading DR6.
+
+	Signed-off-by: Fenghua Yu <fenghua.yu@intel.com>
+	Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+	Reviewed-by: Tony Luck <tony.luck@intel.com>
+Link: https://lore.kernel.org/r/20210322135325.682257-3-fenghua.yu@intel.com
+
+(cherry picked from commit ebb1064e7c2e90b56e4d40ab154ef9796060a1c3)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/include/asm/cpu.h
+#	arch/x86/kernel/cpu/intel.c
+#	arch/x86/kernel/traps.c
+diff --cc arch/x86/include/asm/cpu.h
+index 9c08dcc07421,0d7fc0e2bfc9..000000000000
+--- a/arch/x86/include/asm/cpu.h
++++ b/arch/x86/include/asm/cpu.h
+@@@ -45,9 -45,9 +45,13 @@@ extern void __init sld_setup(struct cpu
+  extern void switch_to_sld(unsigned long tifn);
+  extern bool handle_user_split_lock(struct pt_regs *regs, long error_code);
+  extern bool handle_guest_split_lock(unsigned long ip);
+++<<<<<<< HEAD
+ +extern void handle_kernel_split_lock(struct pt_regs *regs, long error_code);
+++=======
++ extern void handle_bus_lock(struct pt_regs *regs);
+++>>>>>>> ebb1064e7c2e (x86/traps: Handle #DB for bus lock)
+  #else
+- static inline void __init cpu_set_core_cap_bits(struct cpuinfo_x86 *c) {}
++ static inline void __init sld_setup(struct cpuinfo_x86 *c) {}
+  static inline void switch_to_sld(unsigned long tifn) {}
+  static inline bool handle_user_split_lock(struct pt_regs *regs, long error_code)
+  {
+@@@ -58,10 -58,12 +62,20 @@@ static inline bool handle_guest_split_l
+  {
+  	return false;
+  }
+++<<<<<<< HEAD
+ +static inline void handle_kernel_split_lock(struct pt_regs *regs,
+ +					    long error_code)
+ +{
+ +	return;
+ +}
+++=======
++ 
++ static inline void handle_bus_lock(struct pt_regs *regs) {}
++ #endif
++ #ifdef CONFIG_IA32_FEAT_CTL
++ void init_ia32_feat_ctl(struct cpuinfo_x86 *c);
++ #else
++ static inline void init_ia32_feat_ctl(struct cpuinfo_x86 *c) {}
+++>>>>>>> ebb1064e7c2e (x86/traps: Handle #DB for bus lock)
+  #endif
+  #endif /* _ASM_X86_CPU_H */
+diff --cc arch/x86/kernel/cpu/intel.c
+index e5744a296e41,e25e52bafeb6..000000000000
+--- a/arch/x86/kernel/cpu/intel.c
++++ b/arch/x86/kernel/cpu/intel.c
+@@@ -44,47 -44,19 +44,47 @@@ enum split_lock_detect_state 
+  };
+  
+  /*
+-  * Default to sld_off because most systems do not support split lock detection
+-  * split_lock_setup() will switch this to sld_warn on systems that support
+-  * split lock detect, unless there is a command line override.
++  * Default to sld_off because most systems do not support split lock detection.
++  * sld_state_setup() will switch this to sld_warn on systems that support
++  * split lock/bus lock detect, unless there is a command line override.
+   */
+ -static enum split_lock_detect_state sld_state __ro_after_init = sld_off;
+ -static u64 msr_test_ctrl_cache __ro_after_init;
+ +static enum split_lock_detect_state sld_state = sld_off;
+ +static u64 msr_test_ctrl_cache;
+  
+  /*
+ - * With a name like MSR_TEST_CTL it should go without saying, but don't touch
+ - * MSR_TEST_CTL unless the CPU is one of the whitelisted models.  Writing it
+ - * on CPUs that do not support SLD can cause fireworks, even when writing '0'.
+ + * Just in case our CPU detection goes bad, or you have a weird system,
+ + * allow a way to override the automatic disabling of MPX.
+   */
+ -static bool cpu_model_supports_sld __ro_after_init;
+ +static int forcempx;
+ +
+ +static int __init forcempx_setup(char *__unused)
+ +{
+ +	forcempx = 1;
+ +
+ +	return 1;
+ +}
+ +__setup("intel-skd-046-workaround=disable", forcempx_setup);
+ +
+ +void check_mpx_erratum(struct cpuinfo_x86 *c)
+ +{
+ +	if (forcempx)
+ +		return;
+ +	/*
+ +	 * Turn off the MPX feature on CPUs where SMEP is not
+ +	 * available or disabled.
+ +	 *
+ +	 * Works around Intel Erratum SKD046: "Branch Instructions
+ +	 * May Initialize MPX Bound Registers Incorrectly".
+ +	 *
+ +	 * This might falsely disable MPX on systems without
+ +	 * SMEP, like Atom processors without SMEP.  But there
+ +	 * is no such hardware known at the moment.
+ +	 */
+ +	if (cpu_has(c, X86_FEATURE_MPX) && !cpu_has(c, X86_FEATURE_SMEP)) {
+ +		setup_clear_cpu_cap(X86_FEATURE_MPX);
+ +		pr_warn("x86/mpx: Disabling MPX since SMEP not present\n");
+ +	}
+ +}
+  
+  /*
+   * Processors which have self-snooping capability can handle conflicting
+@@@ -780,6 -721,9 +781,12 @@@ static void init_intel(struct cpuinfo_x
+  		tsx_disable();
+  
+  	split_lock_init();
+++<<<<<<< HEAD
+++=======
++ 	bus_lock_init();
++ 
++ 	intel_init_thermal(c);
+++>>>>>>> ebb1064e7c2e (x86/traps: Handle #DB for bus lock)
+  }
+  
+  #ifdef CONFIG_X86_32
+@@@ -1079,9 -1022,9 +1086,9 @@@ static bool split_lock_verify_msr(bool 
+  	return ctrl == tmp;
+  }
+  
+- static void __init split_lock_setup(void)
++ static void __init sld_state_setup(void)
+  {
+ -	enum split_lock_detect_state state = sld_warn;
+ +	enum split_lock_detect_state state = sld_off;
+  	char arg[20];
+  	int i, ret;
+  
+@@@ -1100,17 -1042,14 +1106,27 @@@
+  			}
+  		}
+  	}
++ 	sld_state = state;
++ }
+  
+++<<<<<<< HEAD
+ +	switch (state) {
+ +	case sld_off:
+ +		pr_info("disabled\n");
+ +		break;
+ +	case sld_warn:
+ +		pr_info("warning about split_locks\n");
+ +		break;
+ +	case sld_fatal:
+ +		pr_info("sending SIGBUS on user-space split_locks, panic on kenrel split_locks\n");
+ +		break;
+++=======
++ static void __init __split_lock_setup(void)
++ {
++ 	if (!split_lock_verify_msr(false)) {
++ 		pr_info("MSR access failed: Disabled\n");
++ 		return;
+++>>>>>>> ebb1064e7c2e (x86/traps: Handle #DB for bus lock)
+  	}
+  
+  	rdmsrl(MSR_TEST_CTRL, msr_test_ctrl_cache);
+@@@ -1313,5 -1230,41 +1369,45 @@@ static void __init split_lock_setup(str
+  		return;
+  	}
+  
+++<<<<<<< HEAD
+ +	split_lock_setup();
+++=======
++ 	cpu_model_supports_sld = true;
++ 	__split_lock_setup();
++ }
++ 
++ static void sld_state_show(void)
++ {
++ 	if (!boot_cpu_has(X86_FEATURE_BUS_LOCK_DETECT) &&
++ 	    !boot_cpu_has(X86_FEATURE_SPLIT_LOCK_DETECT))
++ 		return;
++ 
++ 	switch (sld_state) {
++ 	case sld_off:
++ 		pr_info("disabled\n");
++ 		break;
++ 	case sld_warn:
++ 		if (boot_cpu_has(X86_FEATURE_SPLIT_LOCK_DETECT))
++ 			pr_info("#AC: crashing the kernel on kernel split_locks and warning on user-space split_locks\n");
++ 		else if (boot_cpu_has(X86_FEATURE_BUS_LOCK_DETECT))
++ 			pr_info("#DB: warning on user-space bus_locks\n");
++ 		break;
++ 	case sld_fatal:
++ 		if (boot_cpu_has(X86_FEATURE_SPLIT_LOCK_DETECT)) {
++ 			pr_info("#AC: crashing the kernel on kernel split_locks and sending SIGBUS on user-space split_locks\n");
++ 		} else if (boot_cpu_has(X86_FEATURE_BUS_LOCK_DETECT)) {
++ 			pr_info("#DB: sending SIGBUS on user-space bus_locks%s\n",
++ 				boot_cpu_has(X86_FEATURE_SPLIT_LOCK_DETECT) ?
++ 				" from non-WB" : "");
++ 		}
++ 		break;
++ 	}
++ }
++ 
++ void __init sld_setup(struct cpuinfo_x86 *c)
++ {
++ 	split_lock_setup(c);
++ 	sld_state_setup();
++ 	sld_state_show();
+++>>>>>>> ebb1064e7c2e (x86/traps: Handle #DB for bus lock)
+  }
+diff --cc arch/x86/kernel/traps.c
+index 12b6775cd9ca,7bb94a6edc04..000000000000
+--- a/arch/x86/kernel/traps.c
++++ b/arch/x86/kernel/traps.c
+@@@ -782,62 -965,59 +782,73 @@@ dotraplinkage void do_debug(struct pt_r
+  	 * then it's very likely the result of an icebp/int01 trap.
+  	 * User wants a sigtrap for that.
+  	 */
+ -	icebp = !dr6;
+ +	if (!dr6 && user_mode(regs))
+ +		user_icebp = 1;
+ +
+ +	/* Store the virtualized DR6 value */
+ +	tsk->thread.debugreg6 = dr6;
+ +
+ +#ifdef CONFIG_KPROBES
+ +	if (kprobe_debug_handler(regs))
+ +		goto exit;
+ +#endif
+ +
+ +	if (notify_die(DIE_DEBUG, "debug", regs, (long)&dr6, error_code,
+ +		       SIGTRAP) == NOTIFY_STOP)
+ +		goto exit;
+  
+ -	if (notify_debug(regs, &dr6))
+ -		goto out;
+ +	/*
+ +	 * Let others (NMI) know that the debug stack is in use
+ +	 * as we may switch to the interrupt stack.
+ +	 */
+ +	debug_stack_usage_inc();
+  
+  	/* It's safe to allow irq's after DR6 has been saved */
+ -	local_irq_enable();
+ +	cond_local_irq_enable(regs);
+  
+  	if (v8086_mode(regs)) {
+ -		handle_vm86_trap((struct kernel_vm86_regs *)regs, 0, X86_TRAP_DB);
+ -		goto out_irq;
+ +		handle_vm86_trap((struct kernel_vm86_regs *) regs, error_code,
+ +					X86_TRAP_DB);
+ +		cond_local_irq_disable(regs);
+ +		debug_stack_usage_dec();
+ +		goto exit;
+  	}
+  
+++<<<<<<< HEAD
+ +	if (WARN_ON_ONCE((dr6 & DR_STEP) && !user_mode(regs))) {
+ +		/*
+ +		 * Historical junk that used to handle SYSENTER single-stepping.
+ +		 * This should be unreachable now.  If we survive for a while
+ +		 * without anyone hitting this warning, we'll turn this into
+ +		 * an oops.
+ +		 */
+ +		tsk->thread.debugreg6 &= ~DR_STEP;
+ +		set_tsk_thread_flag(tsk, TIF_SINGLESTEP);
+ +		regs->flags &= ~X86_EFLAGS_TF;
+ +	}
+ +	si_code = get_si_code(tsk->thread.debugreg6);
+ +	if (tsk->thread.debugreg6 & (DR_STEP | DR_TRAP_BITS) || user_icebp)
+ +		send_sigtrap(tsk, regs, error_code, si_code);
+ +	cond_local_irq_disable(regs);
+ +	debug_stack_usage_dec();
+++=======
++ 	/* #DB for bus lock can only be triggered from userspace. */
++ 	if (dr6 & DR_BUS_LOCK)
++ 		handle_bus_lock(regs);
++ 
++ 	/* Add the virtual_dr6 bits for signals. */
++ 	dr6 |= current->thread.virtual_dr6;
++ 	if (dr6 & (DR_STEP | DR_TRAP_BITS) || icebp)
++ 		send_sigtrap(regs, 0, get_si_code(dr6));
+++>>>>>>> ebb1064e7c2e (x86/traps: Handle #DB for bus lock)
+  
+ -out_irq:
+ -	local_irq_disable();
+ -out:
+ -	instrumentation_end();
+ -	irqentry_exit_to_user_mode(regs);
+ -}
+ -
+ -#ifdef CONFIG_X86_64
+ -/* IST stack entry */
+ -DEFINE_IDTENTRY_DEBUG(exc_debug)
+ -{
+ -	exc_debug_kernel(regs, debug_read_clear_dr6());
+ -}
+ -
+ -/* User entry, runs on regular task stack */
+ -DEFINE_IDTENTRY_DEBUG_USER(exc_debug)
+ -{
+ -	exc_debug_user(regs, debug_read_clear_dr6());
+ -}
+ -#else
+ -/* 32 bit does not have separate entry points. */
+ -DEFINE_IDTENTRY_RAW(exc_debug)
+ -{
+ -	unsigned long dr6 = debug_read_clear_dr6();
+ +exit:
+ +	nmi_exit();
+  
+ -	if (user_mode(regs))
+ -		exc_debug_user(regs, dr6);
+ -	else
+ -		exc_debug_kernel(regs, dr6);
+ +	if (!user_mode(regs))
+ +		local_db_restore(dr7);
+  }
+ -#endif
+ +NOKPROBE_SYMBOL(do_debug);
+  
+  /*
+   * Note that we play around with the 'TS' bit in an attempt to get
+* Unmerged path arch/x86/include/asm/cpu.h
+diff --git a/arch/x86/include/asm/msr-index.h b/arch/x86/include/asm/msr-index.h
+index b5564d330d6c..1bbfb629da4c 100644
+--- a/arch/x86/include/asm/msr-index.h
++++ b/arch/x86/include/asm/msr-index.h
+@@ -264,6 +264,7 @@
+ #define DEBUGCTLMSR_LBR			(1UL <<  0) /* last branch recording */
+ #define DEBUGCTLMSR_BTF_SHIFT		1
+ #define DEBUGCTLMSR_BTF			(1UL <<  1) /* single-step on branches */
++#define DEBUGCTLMSR_BUS_LOCK_DETECT	(1UL <<  2)
+ #define DEBUGCTLMSR_TR			(1UL <<  6)
+ #define DEBUGCTLMSR_BTS			(1UL <<  7)
+ #define DEBUGCTLMSR_BTINT		(1UL <<  8)
+diff --git a/arch/x86/include/uapi/asm/debugreg.h b/arch/x86/include/uapi/asm/debugreg.h
+index d95d080b30e3..0007ba077c0c 100644
+--- a/arch/x86/include/uapi/asm/debugreg.h
++++ b/arch/x86/include/uapi/asm/debugreg.h
+@@ -24,6 +24,7 @@
+ #define DR_TRAP3	(0x8)		/* db3 */
+ #define DR_TRAP_BITS	(DR_TRAP0|DR_TRAP1|DR_TRAP2|DR_TRAP3)
+ 
++#define DR_BUS_LOCK	(0x800)		/* bus_lock */
+ #define DR_STEP		(0x4000)	/* single-step */
+ #define DR_SWITCH	(0x8000)	/* task switch */
+ 
+diff --git a/arch/x86/kernel/cpu/common.c b/arch/x86/kernel/cpu/common.c
+index e7cf17e8a0fe..ac296ca67d6e 100644
+--- a/arch/x86/kernel/cpu/common.c
++++ b/arch/x86/kernel/cpu/common.c
+@@ -1182,7 +1182,7 @@ static void __init early_identify_cpu(struct cpuinfo_x86 *c)
+ 
+ 	cpu_set_bug_bits(c);
+ 
+-	cpu_set_core_cap_bits(c);
++	sld_setup(c);
+ 
+ 	fpu__init_system(c);
+ 
+* Unmerged path arch/x86/kernel/cpu/intel.c
+* Unmerged path arch/x86/kernel/traps.c
