@@ -1,0 +1,138 @@
+psi: Fix uaf issue when psi trigger is destroyed while being polled
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-394.el8
+commit-author Suren Baghdasaryan <surenb@google.com>
+commit a06247c6804f1a7c86a2e5398a4c1f1db1471848
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-394.el8/a06247c6.failed
+
+With write operation on psi files replacing old trigger with a new one,
+the lifetime of its waitqueue is totally arbitrary. Overwriting an
+existing trigger causes its waitqueue to be freed and pending poll()
+will stumble on trigger->event_wait which was destroyed.
+Fix this by disallowing to redefine an existing psi trigger. If a write
+operation is used on a file descriptor with an already existing psi
+trigger, the operation will fail with EBUSY error.
+Also bypass a check for psi_disabled in the psi_trigger_destroy as the
+flag can be flipped after the trigger is created, leading to a memory
+leak.
+
+Fixes: 0e94682b73bf ("psi: introduce psi monitor")
+	Reported-by: syzbot+cdb5dd11c97cc532efad@syzkaller.appspotmail.com
+	Suggested-by: Linus Torvalds <torvalds@linux-foundation.org>
+Analyzed-by: Eric Biggers <ebiggers@kernel.org>
+	Signed-off-by: Suren Baghdasaryan <surenb@google.com>
+	Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+	Reviewed-by: Eric Biggers <ebiggers@google.com>
+	Acked-by: Johannes Weiner <hannes@cmpxchg.org>
+	Cc: stable@vger.kernel.org
+Link: https://lore.kernel.org/r/20220111232309.1786347-1-surenb@google.com
+(cherry picked from commit a06247c6804f1a7c86a2e5398a4c1f1db1471848)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/psi_types.h
+#	kernel/sched/psi.c
+diff --cc include/linux/psi_types.h
+index 2a4d0ca50d5c,1a3cef26d129..000000000000
+--- a/include/linux/psi_types.h
++++ b/include/linux/psi_types.h
+@@@ -128,12 -141,6 +128,15 @@@ struct psi_trigger 
+  	 * events to one per window
+  	 */
+  	u64 last_event_time;
+++<<<<<<< HEAD
+ +
+ +	/* Refcounting to prevent premature destruction */
+ +	struct kref refcount;
+ +
+ +	/* Deferred event(s) from previous ratelimit window */
+ +	bool pending_event;
+++=======
+++>>>>>>> a06247c6804f (psi: Fix uaf issue when psi trigger is destroyed while being polled)
+  };
+  
+  struct psi_group {
+diff --cc kernel/sched/psi.c
+index d729ffa9c3f9,c137c4d6983e..000000000000
+--- a/kernel/sched/psi.c
++++ b/kernel/sched/psi.c
+@@@ -1166,8 -1162,6 +1166,11 @@@ struct psi_trigger *psi_trigger_create(
+  	t->event = 0;
+  	t->last_event_time = 0;
+  	init_waitqueue_head(&t->event_wait);
+++<<<<<<< HEAD
+ +	kref_init(&t->refcount);
+ +	t->pending_event = false;
+++=======
+++>>>>>>> a06247c6804f (psi: Fix uaf issue when psi trigger is destroyed while being polled)
+  
+  	mutex_lock(&group->trigger_lock);
+  
+diff --git a/Documentation/accounting/psi.txt b/Documentation/accounting/psi.txt
+index 5cbe5659e3b7..06e13adda8b7 100644
+--- a/Documentation/accounting/psi.txt
++++ b/Documentation/accounting/psi.txt
+@@ -90,7 +90,8 @@ Triggers can be set on more than one psi metric and more than one trigger
+ for the same psi metric can be specified. However for each trigger a separate
+ file descriptor is required to be able to poll it separately from others,
+ therefore for each trigger a separate open() syscall should be made even
+-when opening the same psi interface file.
++when opening the same psi interface file. Write operations to a file descriptor
++with an already existing psi trigger will fail with EBUSY.
+ 
+ Monitors activate only when system enters stall state for the monitored
+ psi metric and deactivates upon exit from the stall state. While system is
+diff --git a/include/linux/psi.h b/include/linux/psi.h
+index 9994d0f691fb..e03b5fb520d3 100644
+--- a/include/linux/psi.h
++++ b/include/linux/psi.h
+@@ -35,7 +35,7 @@ void cgroup_move_task(struct task_struct *p, struct css_set *to);
+ 
+ struct psi_trigger *psi_trigger_create(struct psi_group *group,
+ 			char *buf, size_t nbytes, enum psi_res res);
+-void psi_trigger_replace(void **trigger_ptr, struct psi_trigger *t);
++void psi_trigger_destroy(struct psi_trigger *t);
+ 
+ __poll_t psi_trigger_poll(void **trigger_ptr, struct file *file,
+ 			poll_table *wait);
+* Unmerged path include/linux/psi_types.h
+diff --git a/kernel/cgroup/cgroup.c b/kernel/cgroup/cgroup.c
+index 22d8ee84fe0a..e387ca6d0a63 100644
+--- a/kernel/cgroup/cgroup.c
++++ b/kernel/cgroup/cgroup.c
+@@ -3640,6 +3640,12 @@ static ssize_t cgroup_pressure_write(struct kernfs_open_file *of, char *buf,
+ 	cgroup_get(cgrp);
+ 	cgroup_kn_unlock(of->kn);
+ 
++	/* Allow only one trigger per file descriptor */
++	if (ctx->psi.trigger) {
++		cgroup_put(cgrp);
++		return -EBUSY;
++	}
++
+ 	psi = cgroup_ino(cgrp) == 1 ? &psi_system : &cgrp->psi;
+ 	new = psi_trigger_create(psi, buf, nbytes, res);
+ 	if (IS_ERR(new)) {
+@@ -3647,8 +3653,7 @@ static ssize_t cgroup_pressure_write(struct kernfs_open_file *of, char *buf,
+ 		return PTR_ERR(new);
+ 	}
+ 
+-	psi_trigger_replace(&ctx->psi.trigger, new);
+-
++	smp_store_release(&ctx->psi.trigger, new);
+ 	cgroup_put(cgrp);
+ 
+ 	return nbytes;
+@@ -3687,7 +3692,7 @@ static void cgroup_pressure_release(struct kernfs_open_file *of)
+ {
+ 	struct cgroup_file_ctx *ctx = of->priv;
+ 
+-	psi_trigger_replace(&ctx->psi.trigger, NULL);
++	psi_trigger_destroy(ctx->psi.trigger);
+ }
+ 
+ bool cgroup_psi_enabled(void)
+* Unmerged path kernel/sched/psi.c
