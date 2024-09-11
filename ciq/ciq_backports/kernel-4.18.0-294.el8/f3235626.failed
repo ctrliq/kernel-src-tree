@@ -1,0 +1,556 @@
+vfs: Convert ramfs, shmem, tmpfs, devtmpfs, rootfs to use the new mount API
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author David Howells <dhowells@redhat.com>
+commit f32356261d44d580649a7abce1156d15d49cf20f
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/f3235626.failed
+
+Convert the ramfs, shmem, tmpfs, devtmpfs and rootfs filesystems to the new
+internal mount API as the old one will be obsoleted and removed.  This
+allows greater flexibility in communication of mount parameters between
+userspace, the VFS and the filesystem.
+
+See Documentation/filesystems/mount_api.txt for more information.
+
+Note that tmpfs is slightly tricky as it can contain embedded commas, so it
+can't be trivially split up using strsep() to break on commas in
+generic_parse_monolithic().  Instead, tmpfs has to supply its own generic
+parser.
+
+However, if tmpfs changes, then devtmpfs and rootfs, which are wrappers
+around tmpfs or ramfs, must change too - and thus so must ramfs, so these
+had to be converted also.
+
+[AV: rewritten]
+
+	Signed-off-by: David Howells <dhowells@redhat.com>
+cc: Hugh Dickins <hughd@google.com>
+cc: linux-mm@kvack.org
+	Signed-off-by: Al Viro <viro@zeniv.linux.org.uk>
+(cherry picked from commit f32356261d44d580649a7abce1156d15d49cf20f)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	mm/shmem.c
+diff --cc mm/shmem.c
+index 10d9fe3cd81e,0f7fd4a85db6..000000000000
+--- a/mm/shmem.c
++++ b/mm/shmem.c
+@@@ -3330,14 -3364,126 +3330,134 @@@ static const struct export_operations s
+  	.fh_to_dentry	= shmem_fh_to_dentry,
+  };
+  
+++<<<<<<< HEAD
+ +static int shmem_parse_options(char *options, struct shmem_options *ctx)
+ +{
+ +	char *this_char, *value, *rest;
+ +	uid_t uid;
+ +	gid_t gid;
+++=======
++ enum shmem_param {
++ 	Opt_gid,
++ 	Opt_huge,
++ 	Opt_mode,
++ 	Opt_mpol,
++ 	Opt_nr_blocks,
++ 	Opt_nr_inodes,
++ 	Opt_size,
++ 	Opt_uid,
++ };
++ 
++ static const struct fs_parameter_spec shmem_param_specs[] = {
++ 	fsparam_u32   ("gid",		Opt_gid),
++ 	fsparam_enum  ("huge",		Opt_huge),
++ 	fsparam_u32oct("mode",		Opt_mode),
++ 	fsparam_string("mpol",		Opt_mpol),
++ 	fsparam_string("nr_blocks",	Opt_nr_blocks),
++ 	fsparam_string("nr_inodes",	Opt_nr_inodes),
++ 	fsparam_string("size",		Opt_size),
++ 	fsparam_u32   ("uid",		Opt_uid),
++ 	{}
++ };
++ 
++ static const struct fs_parameter_enum shmem_param_enums[] = {
++ 	{ Opt_huge,	"never",	SHMEM_HUGE_NEVER },
++ 	{ Opt_huge,	"always",	SHMEM_HUGE_ALWAYS },
++ 	{ Opt_huge,	"within_size",	SHMEM_HUGE_WITHIN_SIZE },
++ 	{ Opt_huge,	"advise",	SHMEM_HUGE_ADVISE },
++ 	{}
++ };
++ 
++ const struct fs_parameter_description shmem_fs_parameters = {
++ 	.name		= "tmpfs",
++ 	.specs		= shmem_param_specs,
++ 	.enums		= shmem_param_enums,
++ };
++ 
++ static int shmem_parse_one(struct fs_context *fc, struct fs_parameter *param)
++ {
++ 	struct shmem_options *ctx = fc->fs_private;
++ 	struct fs_parse_result result;
++ 	unsigned long long size;
++ 	char *rest;
++ 	int opt;
++ 
++ 	opt = fs_parse(fc, &shmem_fs_parameters, param, &result);
++ 	if (opt < 0)
++ 		return opt;
++ 
++ 	switch (opt) {
++ 	case Opt_size:
++ 		size = memparse(param->string, &rest);
++ 		if (*rest == '%') {
++ 			size <<= PAGE_SHIFT;
++ 			size *= totalram_pages();
++ 			do_div(size, 100);
++ 			rest++;
++ 		}
++ 		if (*rest)
++ 			goto bad_value;
++ 		ctx->blocks = DIV_ROUND_UP(size, PAGE_SIZE);
++ 		ctx->seen |= SHMEM_SEEN_BLOCKS;
++ 		break;
++ 	case Opt_nr_blocks:
++ 		ctx->blocks = memparse(param->string, &rest);
++ 		if (*rest)
++ 			goto bad_value;
++ 		ctx->seen |= SHMEM_SEEN_BLOCKS;
++ 		break;
++ 	case Opt_nr_inodes:
++ 		ctx->inodes = memparse(param->string, &rest);
++ 		if (*rest)
++ 			goto bad_value;
++ 		ctx->seen |= SHMEM_SEEN_INODES;
++ 		break;
++ 	case Opt_mode:
++ 		ctx->mode = result.uint_32 & 07777;
++ 		break;
++ 	case Opt_uid:
++ 		ctx->uid = make_kuid(current_user_ns(), result.uint_32);
++ 		if (!uid_valid(ctx->uid))
++ 			goto bad_value;
++ 		break;
++ 	case Opt_gid:
++ 		ctx->gid = make_kgid(current_user_ns(), result.uint_32);
++ 		if (!gid_valid(ctx->gid))
++ 			goto bad_value;
++ 		break;
++ 	case Opt_huge:
++ 		ctx->huge = result.uint_32;
++ 		if (ctx->huge != SHMEM_HUGE_NEVER &&
++ 		    !(IS_ENABLED(CONFIG_TRANSPARENT_HUGE_PAGECACHE) &&
++ 		      has_transparent_hugepage()))
++ 			goto unsupported_parameter;
++ 		ctx->seen |= SHMEM_SEEN_HUGE;
++ 		break;
++ 	case Opt_mpol:
++ 		if (IS_ENABLED(CONFIG_NUMA)) {
++ 			mpol_put(ctx->mpol);
++ 			ctx->mpol = NULL;
++ 			if (mpol_parse_str(param->string, &ctx->mpol))
++ 				goto bad_value;
++ 			break;
++ 		}
++ 		goto unsupported_parameter;
++ 	}
++ 	return 0;
++ 
++ unsupported_parameter:
++ 	return invalf(fc, "tmpfs: Unsupported parameter '%s'", param->key);
++ bad_value:
++ 	return invalf(fc, "tmpfs: Bad value for '%s'", param->key);
++ }
++ 
++ static int shmem_parse_options(struct fs_context *fc, void *data)
++ {
++ 	char *options = data;
+++>>>>>>> f32356261d44 (vfs: Convert ramfs, shmem, tmpfs, devtmpfs, rootfs to use the new mount API)
+  
+  	while (options != NULL) {
+ -		char *this_char = options;
+ +		this_char = options;
+  		for (;;) {
+  			/*
+  			 * NUL-terminate this option: unfortunately,
+@@@ -3353,102 -3499,36 +3473,124 @@@
+  				break;
+  			}
+  		}
+++<<<<<<< HEAD
+ +		if (!*this_char)
+ +			continue;
+ +		if ((value = strchr(this_char,'=')) != NULL) {
+ +			*value++ = 0;
+ +		} else {
+ +			pr_err("tmpfs: No value for mount option '%s'\n",
+ +			       this_char);
+ +			goto error;
+ +		}
+ +
+ +		if (!strcmp(this_char,"size")) {
+ +			unsigned long long size;
+ +			size = memparse(value,&rest);
+ +			if (*rest == '%') {
+ +				size <<= PAGE_SHIFT;
+ +				size *= totalram_pages;
+ +				do_div(size, 100);
+ +				rest++;
+ +			}
+ +			if (*rest)
+ +				goto bad_val;
+ +			ctx->blocks = DIV_ROUND_UP(size, PAGE_SIZE);
+ +			ctx->seen |= SHMEM_SEEN_BLOCKS;
+ +		} else if (!strcmp(this_char,"nr_blocks")) {
+ +			ctx->blocks = memparse(value, &rest);
+ +			if (*rest)
+ +				goto bad_val;
+ +			ctx->seen |= SHMEM_SEEN_BLOCKS;
+ +		} else if (!strcmp(this_char,"nr_inodes")) {
+ +			ctx->inodes = memparse(value, &rest);
+ +			if (*rest)
+ +				goto bad_val;
+ +			ctx->seen |= SHMEM_SEEN_INODES;
+ +		} else if (!strcmp(this_char,"mode")) {
+ +			ctx->mode = simple_strtoul(value, &rest, 8) & 07777;
+ +			if (*rest)
+ +				goto bad_val;
+ +		} else if (!strcmp(this_char,"uid")) {
+ +			uid = simple_strtoul(value, &rest, 0);
+ +			if (*rest)
+ +				goto bad_val;
+ +			ctx->uid = make_kuid(current_user_ns(), uid);
+ +			if (!uid_valid(ctx->uid))
+ +				goto bad_val;
+ +		} else if (!strcmp(this_char,"gid")) {
+ +			gid = simple_strtoul(value, &rest, 0);
+ +			if (*rest)
+ +				goto bad_val;
+ +			ctx->gid = make_kgid(current_user_ns(), gid);
+ +			if (!gid_valid(ctx->gid))
+ +				goto bad_val;
+ +#ifdef CONFIG_TRANSPARENT_HUGE_PAGECACHE
+ +		} else if (!strcmp(this_char, "huge")) {
+ +			int huge;
+ +			huge = shmem_parse_huge(value);
+ +			if (huge < 0)
+ +				goto bad_val;
+ +			if (!has_transparent_hugepage() &&
+ +					huge != SHMEM_HUGE_NEVER)
+ +				goto bad_val;
+ +			ctx->huge = huge;
+ +			ctx->seen |= SHMEM_SEEN_HUGE;
+ +#endif
+ +#ifdef CONFIG_NUMA
+ +		} else if (!strcmp(this_char,"mpol")) {
+ +			mpol_put(ctx->mpol);
+ +			ctx->mpol = NULL;
+ +			if (mpol_parse_str(value, &ctx->mpol))
+ +				goto bad_val;
+ +#endif
+ +		} else {
+ +			pr_err("tmpfs: Bad mount option %s\n", this_char);
+ +			goto error;
+ +		}
+ +	}
+ +	return 0;
+ +
+ +bad_val:
+ +	pr_err("tmpfs: Bad value '%s' for mount option '%s'\n",
+ +	       value, this_char);
+ +error:
+ +	mpol_put(ctx->mpol);
+ +	ctx->mpol = NULL;
+ +	return 1;
+ +
+++=======
++ 		if (*this_char) {
++ 			char *value = strchr(this_char,'=');
++ 			size_t len = 0;
++ 			int err;
++ 
++ 			if (value) {
++ 				*value++ = '\0';
++ 				len = strlen(value);
++ 			}
++ 			err = vfs_parse_fs_string(fc, this_char, value, len);
++ 			if (err < 0)
++ 				return err;
++ 		}
++ 	}
++ 	return 0;
+++>>>>>>> f32356261d44 (vfs: Convert ramfs, shmem, tmpfs, devtmpfs, rootfs to use the new mount API)
+  }
+  
+- static int shmem_remount_fs(struct super_block *sb, int *flags, char *data)
++ /*
++  * Reconfigure a shmem filesystem.
++  *
++  * Note that we disallow change from limited->unlimited blocks/inodes while any
++  * are in use; but we must separately disallow unlimited->limited, because in
++  * that case we have no record of how much is already in use.
++  */
++ static int shmem_reconfigure(struct fs_context *fc)
+  {
+- 	struct shmem_sb_info *sbinfo = SHMEM_SB(sb);
+- 	struct shmem_options ctx = {.seen = 0};
++ 	struct shmem_options *ctx = fc->fs_private;
++ 	struct shmem_sb_info *sbinfo = SHMEM_SB(fc->root->d_sb);
+  	unsigned long inodes;
+- 	int error = -EINVAL;
+- 
+- 	if (shmem_parse_options(data, &ctx))
+- 		return error;
++ 	const char *err;
+  
+  	spin_lock(&sbinfo->stat_lock);
+  	inodes = sbinfo->max_inodes - sbinfo->free_inodes;
+diff --git a/drivers/base/devtmpfs.c b/drivers/base/devtmpfs.c
+index b57b81af7f5b..eb1c99119756 100644
+--- a/drivers/base/devtmpfs.c
++++ b/drivers/base/devtmpfs.c
+@@ -66,19 +66,15 @@ static struct dentry *public_dev_mount(struct file_system_type *fs_type, int fla
+ 	return dget(s->s_root);
+ }
+ 
+-static struct dentry *dev_mount(struct file_system_type *fs_type, int flags,
+-		      const char *dev_name, void *data)
+-{
++static struct file_system_type internal_fs_type = {
++	.name = "devtmpfs",
+ #ifdef CONFIG_TMPFS
+-	return shmem_mount(fs_type, flags, dev_name, data);
++	.init_fs_context = shmem_init_fs_context,
++	.parameters	= &shmem_fs_parameters,
+ #else
+-	return ramfs_mount(fs_type, flags, dev_name, data);
++	.init_fs_context = ramfs_init_fs_context,
++	.parameters	= &ramfs_fs_parameters,
+ #endif
+-}
+-
+-static struct file_system_type internal_fs_type = {
+-	.name = "devtmpfs",
+-	.mount = dev_mount,
+ 	.kill_sb = kill_litter_super,
+ };
+ 
+diff --git a/fs/ramfs/inode.c b/fs/ramfs/inode.c
+index b85d1e77e934..d82636e8eb65 100644
+--- a/fs/ramfs/inode.c
++++ b/fs/ramfs/inode.c
+@@ -36,6 +36,8 @@
+ #include <linux/magic.h>
+ #include <linux/slab.h>
+ #include <linux/uaccess.h>
++#include <linux/fs_context.h>
++#include <linux/fs_parser.h>
+ #include "internal.h"
+ 
+ struct ramfs_mount_opts {
+@@ -175,62 +177,52 @@ static const struct super_operations ramfs_ops = {
+ 	.show_options	= ramfs_show_options,
+ };
+ 
+-enum {
++enum ramfs_param {
+ 	Opt_mode,
+-	Opt_err
+ };
+ 
+-static const match_table_t tokens = {
+-	{Opt_mode, "mode=%o"},
+-	{Opt_err, NULL}
++static const struct fs_parameter_spec ramfs_param_specs[] = {
++	fsparam_u32oct("mode",	Opt_mode),
++	{}
+ };
+ 
+-static int ramfs_parse_options(char *data, struct ramfs_mount_opts *opts)
++const struct fs_parameter_description ramfs_fs_parameters = {
++	.name		= "ramfs",
++	.specs		= ramfs_param_specs,
++};
++
++static int ramfs_parse_param(struct fs_context *fc, struct fs_parameter *param)
+ {
+-	substring_t args[MAX_OPT_ARGS];
+-	int option;
+-	int token;
+-	char *p;
+-
+-	opts->mode = RAMFS_DEFAULT_MODE;
+-
+-	while ((p = strsep(&data, ",")) != NULL) {
+-		if (!*p)
+-			continue;
+-
+-		token = match_token(p, tokens, args);
+-		switch (token) {
+-		case Opt_mode:
+-			if (match_octal(&args[0], &option))
+-				return -EINVAL;
+-			opts->mode = option & S_IALLUGO;
+-			break;
++	struct fs_parse_result result;
++	struct ramfs_fs_info *fsi = fc->s_fs_info;
++	int opt;
++
++	opt = fs_parse(fc, &ramfs_fs_parameters, param, &result);
++	if (opt < 0) {
+ 		/*
+ 		 * We might like to report bad mount options here;
+ 		 * but traditionally ramfs has ignored all mount options,
+ 		 * and as it is used as a !CONFIG_SHMEM simple substitute
+ 		 * for tmpfs, better continue to ignore other mount options.
+ 		 */
+-		}
++		if (opt == -ENOPARAM)
++			opt = 0;
++		return opt;
++	}
++
++	switch (opt) {
++	case Opt_mode:
++		fsi->mount_opts.mode = result.uint_32 & S_IALLUGO;
++		break;
+ 	}
+ 
+ 	return 0;
+ }
+ 
+-static int ramfs_fill_super(struct super_block *sb, void *data, int silent)
++static int ramfs_fill_super(struct super_block *sb, struct fs_context *fc)
+ {
+-	struct ramfs_fs_info *fsi;
++	struct ramfs_fs_info *fsi = sb->s_fs_info;
+ 	struct inode *inode;
+-	int err;
+-
+-	fsi = kzalloc(sizeof(struct ramfs_fs_info), GFP_KERNEL);
+-	sb->s_fs_info = fsi;
+-	if (!fsi)
+-		return -ENOMEM;
+-
+-	err = ramfs_parse_options(data, &fsi->mount_opts);
+-	if (err)
+-		return err;
+ 
+ 	sb->s_maxbytes		= MAX_LFS_FILESIZE;
+ 	sb->s_blocksize		= PAGE_SIZE;
+@@ -247,10 +239,34 @@ static int ramfs_fill_super(struct super_block *sb, void *data, int silent)
+ 	return 0;
+ }
+ 
+-struct dentry *ramfs_mount(struct file_system_type *fs_type,
+-	int flags, const char *dev_name, void *data)
++static int ramfs_get_tree(struct fs_context *fc)
+ {
+-	return mount_nodev(fs_type, flags, data, ramfs_fill_super);
++	return get_tree_nodev(fc, ramfs_fill_super);
++}
++
++static void ramfs_free_fc(struct fs_context *fc)
++{
++	kfree(fc->s_fs_info);
++}
++
++static const struct fs_context_operations ramfs_context_ops = {
++	.free		= ramfs_free_fc,
++	.parse_param	= ramfs_parse_param,
++	.get_tree	= ramfs_get_tree,
++};
++
++int ramfs_init_fs_context(struct fs_context *fc)
++{
++	struct ramfs_fs_info *fsi;
++
++	fsi = kzalloc(sizeof(*fsi), GFP_KERNEL);
++	if (!fsi)
++		return -ENOMEM;
++
++	fsi->mount_opts.mode = RAMFS_DEFAULT_MODE;
++	fc->s_fs_info = fsi;
++	fc->ops = &ramfs_context_ops;
++	return 0;
+ }
+ 
+ static void ramfs_kill_sb(struct super_block *sb)
+@@ -261,7 +277,8 @@ static void ramfs_kill_sb(struct super_block *sb)
+ 
+ static struct file_system_type ramfs_fs_type = {
+ 	.name		= "ramfs",
+-	.mount		= ramfs_mount,
++	.init_fs_context = ramfs_init_fs_context,
++	.parameters	= &ramfs_fs_parameters,
+ 	.kill_sb	= ramfs_kill_sb,
+ 	.fs_flags	= FS_USERNS_MOUNT,
+ };
+diff --git a/include/linux/ramfs.h b/include/linux/ramfs.h
+index e4d7d141545e..b806a0ff6554 100644
+--- a/include/linux/ramfs.h
++++ b/include/linux/ramfs.h
+@@ -4,8 +4,7 @@
+ 
+ struct inode *ramfs_get_inode(struct super_block *sb, const struct inode *dir,
+ 	 umode_t mode, dev_t dev);
+-extern struct dentry *ramfs_mount(struct file_system_type *fs_type,
+-	 int flags, const char *dev_name, void *data);
++extern int ramfs_init_fs_context(struct fs_context *fc);
+ 
+ #ifdef CONFIG_MMU
+ static inline int
+@@ -17,6 +16,7 @@ ramfs_nommu_expand_for_mapping(struct inode *inode, size_t newsize)
+ extern int ramfs_nommu_expand_for_mapping(struct inode *inode, size_t newsize);
+ #endif
+ 
++extern const struct fs_parameter_description ramfs_fs_parameters;
+ extern const struct file_operations ramfs_file_operations;
+ extern const struct vm_operations_struct generic_file_vm_ops;
+ 
+diff --git a/include/linux/shmem_fs.h b/include/linux/shmem_fs.h
+index c4a8a0f1d6db..c3613df1b68b 100644
+--- a/include/linux/shmem_fs.h
++++ b/include/linux/shmem_fs.h
+@@ -48,9 +48,9 @@ static inline struct shmem_inode_info *SHMEM_I(struct inode *inode)
+ /*
+  * Functions in mm/shmem.c called directly from elsewhere:
+  */
++extern const struct fs_parameter_description shmem_fs_parameters;
+ extern int shmem_init(void);
+-extern struct dentry *shmem_mount(struct file_system_type *fs_type,
+-	int flags, const char *dev_name, void *data);
++extern int shmem_init_fs_context(struct fs_context *fc);
+ extern struct file *shmem_file_setup(const char *name,
+ 					loff_t size, unsigned long flags);
+ extern struct file *shmem_kernel_file_setup(const char *name, loff_t size,
+diff --git a/init/do_mounts.c b/init/do_mounts.c
+index 1497d3505ec5..520179a83e77 100644
+--- a/init/do_mounts.c
++++ b/init/do_mounts.c
+@@ -604,18 +604,17 @@ void __init prepare_namespace(void)
+ }
+ 
+ static bool is_tmpfs;
+-static struct dentry *rootfs_mount(struct file_system_type *fs_type,
+-	int flags, const char *dev_name, void *data)
++static int rootfs_init_fs_context(struct fs_context *fc)
+ {
+ 	if (IS_ENABLED(CONFIG_TMPFS) && is_tmpfs)
+-		return shmem_mount(fs_type, flags, dev_name, data);
++		return shmem_init_fs_context(fc);
+ 
+-	return ramfs_mount(fs_type, flags, dev_name, data);
++	return ramfs_init_fs_context(fc);
+ }
+ 
+ struct file_system_type rootfs_fs_type = {
+ 	.name		= "rootfs",
+-	.mount		= rootfs_mount,
++	.init_fs_context = rootfs_init_fs_context,
+ 	.kill_sb	= kill_litter_super,
+ };
+ 
+* Unmerged path mm/shmem.c
