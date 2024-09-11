@@ -1,0 +1,368 @@
+ice: Support RSS configure removal for AVF
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-338.el8
+commit-author Qi Zhang <qi.z.zhang@intel.com>
+commit ddd1f3cfed3f06906c25f917eb703d683c415e24
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-338.el8/ddd1f3cf.failed
+
+Add the handler for virtchnl message VIRTCHNL_OP_DEL_RSS_CFG to remove
+an existing RSS configuration with matching hashed fields.
+
+	Signed-off-by: Vignesh Sridhar <vignesh.sridhar@intel.com>
+Co-developed-by: Jia Guo <jia.guo@intel.com>
+	Signed-off-by: Jia Guo <jia.guo@intel.com>
+	Signed-off-by: Qi Zhang <qi.z.zhang@intel.com>
+	Signed-off-by: Haiyue Wang <haiyue.wang@intel.com>
+	Tested-by: Bo Chen <BoX.C.Chen@intel.com>
+	Signed-off-by: Tony Nguyen <anthony.l.nguyen@intel.com>
+(cherry picked from commit ddd1f3cfed3f06906c25f917eb703d683c415e24)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/intel/ice/ice_virtchnl_pf.c
+diff --cc drivers/net/ethernet/intel/ice/ice_virtchnl_pf.c
+index 3d1e10138535,a1d22d2aa0bd..000000000000
+--- a/drivers/net/ethernet/intel/ice/ice_virtchnl_pf.c
++++ b/drivers/net/ethernet/intel/ice/ice_virtchnl_pf.c
+@@@ -2196,6 -2478,222 +2196,225 @@@ static bool ice_vc_isvalid_ring_len(u1
+  }
+  
+  /**
+++<<<<<<< HEAD
+++=======
++  * ice_vc_parse_rss_cfg - parses hash fields and headers from
++  * a specific virtchnl RSS cfg
++  * @hw: pointer to the hardware
++  * @rss_cfg: pointer to the virtchnl RSS cfg
++  * @addl_hdrs: pointer to the protocol header fields (ICE_FLOW_SEG_HDR_*)
++  * to configure
++  * @hash_flds: pointer to the hash bit fields (ICE_FLOW_HASH_*) to configure
++  *
++  * Return true if all the protocol header and hash fields in the RSS cfg could
++  * be parsed, else return false
++  *
++  * This function parses the virtchnl RSS cfg to be the intended
++  * hash fields and the intended header for RSS configuration
++  */
++ static bool
++ ice_vc_parse_rss_cfg(struct ice_hw *hw, struct virtchnl_rss_cfg *rss_cfg,
++ 		     u32 *addl_hdrs, u64 *hash_flds)
++ {
++ 	const struct ice_vc_hash_field_match_type *hf_list;
++ 	const struct ice_vc_hdr_match_type *hdr_list;
++ 	int i, hf_list_len, hdr_list_len;
++ 
++ 	if (!strncmp(hw->active_pkg_name, "ICE COMMS Package",
++ 		     sizeof(hw->active_pkg_name))) {
++ 		hf_list = ice_vc_hash_field_list_comms;
++ 		hf_list_len = ARRAY_SIZE(ice_vc_hash_field_list_comms);
++ 		hdr_list = ice_vc_hdr_list_comms;
++ 		hdr_list_len = ARRAY_SIZE(ice_vc_hdr_list_comms);
++ 	} else {
++ 		hf_list = ice_vc_hash_field_list_os;
++ 		hf_list_len = ARRAY_SIZE(ice_vc_hash_field_list_os);
++ 		hdr_list = ice_vc_hdr_list_os;
++ 		hdr_list_len = ARRAY_SIZE(ice_vc_hdr_list_os);
++ 	}
++ 
++ 	for (i = 0; i < rss_cfg->proto_hdrs.count; i++) {
++ 		struct virtchnl_proto_hdr *proto_hdr =
++ 					&rss_cfg->proto_hdrs.proto_hdr[i];
++ 		bool hdr_found = false;
++ 		int j;
++ 
++ 		/* Find matched ice headers according to virtchnl headers. */
++ 		for (j = 0; j < hdr_list_len; j++) {
++ 			struct ice_vc_hdr_match_type hdr_map = hdr_list[j];
++ 
++ 			if (proto_hdr->type == hdr_map.vc_hdr) {
++ 				*addl_hdrs |= hdr_map.ice_hdr;
++ 				hdr_found = true;
++ 			}
++ 		}
++ 
++ 		if (!hdr_found)
++ 			return false;
++ 
++ 		/* Find matched ice hash fields according to
++ 		 * virtchnl hash fields.
++ 		 */
++ 		for (j = 0; j < hf_list_len; j++) {
++ 			struct ice_vc_hash_field_match_type hf_map = hf_list[j];
++ 
++ 			if (proto_hdr->type == hf_map.vc_hdr &&
++ 			    proto_hdr->field_selector == hf_map.vc_hash_field) {
++ 				*hash_flds |= hf_map.ice_hash_field;
++ 				break;
++ 			}
++ 		}
++ 	}
++ 
++ 	return true;
++ }
++ 
++ /**
++  * ice_vf_adv_rss_offload_ena - determine if capabilities support advanced
++  * RSS offloads
++  * @caps: VF driver negotiated capabilities
++  *
++  * Return true if VIRTCHNL_VF_OFFLOAD_ADV_RSS_PF capability is set,
++  * else return false
++  */
++ static bool ice_vf_adv_rss_offload_ena(u32 caps)
++ {
++ 	return !!(caps & VIRTCHNL_VF_OFFLOAD_ADV_RSS_PF);
++ }
++ 
++ /**
++  * ice_vc_handle_rss_cfg
++  * @vf: pointer to the VF info
++  * @msg: pointer to the message buffer
++  * @add: add a RSS config if true, otherwise delete a RSS config
++  *
++  * This function adds/deletes a RSS config
++  */
++ static int ice_vc_handle_rss_cfg(struct ice_vf *vf, u8 *msg, bool add)
++ {
++ 	u32 v_opcode = add ? VIRTCHNL_OP_ADD_RSS_CFG : VIRTCHNL_OP_DEL_RSS_CFG;
++ 	struct virtchnl_rss_cfg *rss_cfg = (struct virtchnl_rss_cfg *)msg;
++ 	enum virtchnl_status_code v_ret = VIRTCHNL_STATUS_SUCCESS;
++ 	struct device *dev = ice_pf_to_dev(vf->pf);
++ 	struct ice_hw *hw = &vf->pf->hw;
++ 	struct ice_vsi *vsi;
++ 
++ 	if (!test_bit(ICE_FLAG_RSS_ENA, vf->pf->flags)) {
++ 		dev_dbg(dev, "VF %d attempting to configure RSS, but RSS is not supported by the PF\n",
++ 			vf->vf_id);
++ 		v_ret = VIRTCHNL_STATUS_ERR_NOT_SUPPORTED;
++ 		goto error_param;
++ 	}
++ 
++ 	if (!ice_vf_adv_rss_offload_ena(vf->driver_caps)) {
++ 		dev_dbg(dev, "VF %d attempting to configure RSS, but Advanced RSS offload is not supported\n",
++ 			vf->vf_id);
++ 		v_ret = VIRTCHNL_STATUS_ERR_PARAM;
++ 		goto error_param;
++ 	}
++ 
++ 	if (!test_bit(ICE_VF_STATE_ACTIVE, vf->vf_states)) {
++ 		v_ret = VIRTCHNL_STATUS_ERR_PARAM;
++ 		goto error_param;
++ 	}
++ 
++ 	if (rss_cfg->proto_hdrs.count > VIRTCHNL_MAX_NUM_PROTO_HDRS ||
++ 	    rss_cfg->rss_algorithm < VIRTCHNL_RSS_ALG_TOEPLITZ_ASYMMETRIC ||
++ 	    rss_cfg->rss_algorithm > VIRTCHNL_RSS_ALG_XOR_SYMMETRIC) {
++ 		dev_dbg(dev, "VF %d attempting to configure RSS, but RSS configuration is not valid\n",
++ 			vf->vf_id);
++ 		v_ret = VIRTCHNL_STATUS_ERR_PARAM;
++ 		goto error_param;
++ 	}
++ 
++ 	vsi = ice_get_vf_vsi(vf);
++ 	if (!vsi) {
++ 		v_ret = VIRTCHNL_STATUS_ERR_PARAM;
++ 		goto error_param;
++ 	}
++ 
++ 	if (rss_cfg->rss_algorithm == VIRTCHNL_RSS_ALG_R_ASYMMETRIC) {
++ 		struct ice_vsi_ctx *ctx;
++ 		enum ice_status status;
++ 		u8 lut_type, hash_type;
++ 
++ 		lut_type = ICE_AQ_VSI_Q_OPT_RSS_LUT_VSI;
++ 		hash_type = add ? ICE_AQ_VSI_Q_OPT_RSS_XOR :
++ 				ICE_AQ_VSI_Q_OPT_RSS_TPLZ;
++ 
++ 		ctx = kzalloc(sizeof(*ctx), GFP_KERNEL);
++ 		if (!ctx) {
++ 			v_ret = VIRTCHNL_STATUS_ERR_NO_MEMORY;
++ 			goto error_param;
++ 		}
++ 
++ 		ctx->info.q_opt_rss = ((lut_type <<
++ 					ICE_AQ_VSI_Q_OPT_RSS_LUT_S) &
++ 				       ICE_AQ_VSI_Q_OPT_RSS_LUT_M) |
++ 				       (hash_type &
++ 					ICE_AQ_VSI_Q_OPT_RSS_HASH_M);
++ 
++ 		/* Preserve existing queueing option setting */
++ 		ctx->info.q_opt_rss |= (vsi->info.q_opt_rss &
++ 					  ICE_AQ_VSI_Q_OPT_RSS_GBL_LUT_M);
++ 		ctx->info.q_opt_tc = vsi->info.q_opt_tc;
++ 		ctx->info.q_opt_flags = vsi->info.q_opt_rss;
++ 
++ 		ctx->info.valid_sections =
++ 				cpu_to_le16(ICE_AQ_VSI_PROP_Q_OPT_VALID);
++ 
++ 		status = ice_update_vsi(hw, vsi->idx, ctx, NULL);
++ 		if (status) {
++ 			dev_err(dev, "update VSI for RSS failed, err %s aq_err %s\n",
++ 				ice_stat_str(status),
++ 				ice_aq_str(hw->adminq.sq_last_status));
++ 			v_ret = VIRTCHNL_STATUS_ERR_PARAM;
++ 		} else {
++ 			vsi->info.q_opt_rss = ctx->info.q_opt_rss;
++ 		}
++ 
++ 		kfree(ctx);
++ 	} else {
++ 		u32 addl_hdrs = ICE_FLOW_SEG_HDR_NONE;
++ 		u64 hash_flds = ICE_HASH_INVALID;
++ 
++ 		if (!ice_vc_parse_rss_cfg(hw, rss_cfg, &addl_hdrs,
++ 					  &hash_flds)) {
++ 			v_ret = VIRTCHNL_STATUS_ERR_PARAM;
++ 			goto error_param;
++ 		}
++ 
++ 		if (add) {
++ 			if (ice_add_rss_cfg(hw, vsi->idx, hash_flds,
++ 					    addl_hdrs)) {
++ 				v_ret = VIRTCHNL_STATUS_ERR_PARAM;
++ 				dev_err(dev, "ice_add_rss_cfg failed for vsi = %d, v_ret = %d\n",
++ 					vsi->vsi_num, v_ret);
++ 			}
++ 		} else {
++ 			enum ice_status status;
++ 
++ 			status = ice_rem_rss_cfg(hw, vsi->idx, hash_flds,
++ 						 addl_hdrs);
++ 			/* We just ignore ICE_ERR_DOES_NOT_EXIST, because
++ 			 * if two configurations share the same profile remove
++ 			 * one of them actually removes both, since the
++ 			 * profile is deleted.
++ 			 */
++ 			if (status && status != ICE_ERR_DOES_NOT_EXIST) {
++ 				v_ret = VIRTCHNL_STATUS_ERR_PARAM;
++ 				dev_err(dev, "ice_rem_rss_cfg failed for VF ID:%d, error:%s\n",
++ 					vf->vf_id, ice_stat_str(status));
++ 			}
++ 		}
++ 	}
++ 
++ error_param:
++ 	return ice_vc_send_msg_to_vf(vf, v_opcode, v_ret, NULL, 0);
++ }
++ 
++ /**
+++>>>>>>> ddd1f3cfed3f (ice: Support RSS configure removal for AVF)
+   * ice_vc_config_rss_key
+   * @vf: pointer to the VF info
+   * @msg: pointer to the msg buffer
+diff --git a/drivers/net/ethernet/intel/ice/ice_flow.c b/drivers/net/ethernet/intel/ice/ice_flow.c
+index ded70e443e7b..3a9de52da507 100644
+--- a/drivers/net/ethernet/intel/ice/ice_flow.c
++++ b/drivers/net/ethernet/intel/ice/ice_flow.c
+@@ -2134,6 +2134,94 @@ ice_add_rss_cfg(struct ice_hw *hw, u16 vsi_handle, u64 hashed_flds,
+ 	return status;
+ }
+ 
++/**
++ * ice_rem_rss_cfg_sync - remove an existing RSS configuration
++ * @hw: pointer to the hardware structure
++ * @vsi_handle: software VSI handle
++ * @hashed_flds: Packet hash types (ICE_FLOW_HASH_*) to remove
++ * @addl_hdrs: Protocol header fields within a packet segment
++ * @segs_cnt: packet segment count
++ *
++ * Assumption: lock has already been acquired for RSS list
++ */
++static enum ice_status
++ice_rem_rss_cfg_sync(struct ice_hw *hw, u16 vsi_handle, u64 hashed_flds,
++		     u32 addl_hdrs, u8 segs_cnt)
++{
++	const enum ice_block blk = ICE_BLK_RSS;
++	struct ice_flow_seg_info *segs;
++	struct ice_flow_prof *prof;
++	enum ice_status status;
++
++	segs = kcalloc(segs_cnt, sizeof(*segs), GFP_KERNEL);
++	if (!segs)
++		return ICE_ERR_NO_MEMORY;
++
++	/* Construct the packet segment info from the hashed fields */
++	status = ice_flow_set_rss_seg_info(&segs[segs_cnt - 1], hashed_flds,
++					   addl_hdrs);
++	if (status)
++		goto out;
++
++	prof = ice_flow_find_prof_conds(hw, blk, ICE_FLOW_RX, segs, segs_cnt,
++					vsi_handle,
++					ICE_FLOW_FIND_PROF_CHK_FLDS);
++	if (!prof) {
++		status = ICE_ERR_DOES_NOT_EXIST;
++		goto out;
++	}
++
++	status = ice_flow_disassoc_prof(hw, blk, prof, vsi_handle);
++	if (status)
++		goto out;
++
++	/* Remove RSS configuration from VSI context before deleting
++	 * the flow profile.
++	 */
++	ice_rem_rss_list(hw, vsi_handle, prof);
++
++	if (bitmap_empty(prof->vsis, ICE_MAX_VSI))
++		status = ice_flow_rem_prof(hw, blk, prof->id);
++
++out:
++	kfree(segs);
++	return status;
++}
++
++/**
++ * ice_rem_rss_cfg - remove an existing RSS config with matching hashed fields
++ * @hw: pointer to the hardware structure
++ * @vsi_handle: software VSI handle
++ * @hashed_flds: Packet hash types (ICE_FLOW_HASH_*) to remove
++ * @addl_hdrs: Protocol header fields within a packet segment
++ *
++ * This function will lookup the flow profile based on the input
++ * hash field bitmap, iterate through the profile entry list of
++ * that profile and find entry associated with input VSI to be
++ * removed. Calls are made to underlying flow s which will APIs
++ * turn build or update buffers for RSS XLT1 section.
++ */
++enum ice_status __maybe_unused
++ice_rem_rss_cfg(struct ice_hw *hw, u16 vsi_handle, u64 hashed_flds,
++		u32 addl_hdrs)
++{
++	enum ice_status status;
++
++	if (hashed_flds == ICE_HASH_INVALID ||
++	    !ice_is_vsi_valid(hw, vsi_handle))
++		return ICE_ERR_PARAM;
++
++	mutex_lock(&hw->rss_locks);
++	status = ice_rem_rss_cfg_sync(hw, vsi_handle, hashed_flds, addl_hdrs,
++				      ICE_RSS_OUTER_HEADERS);
++	if (!status)
++		status = ice_rem_rss_cfg_sync(hw, vsi_handle, hashed_flds,
++					      addl_hdrs, ICE_RSS_INNER_HEADERS);
++	mutex_unlock(&hw->rss_locks);
++
++	return status;
++}
++
+ /* Mapping of AVF hash bit fields to an L3-L4 hash combination.
+  * As the ice_flow_avf_hdr_field represent individual bit shifts in a hash,
+  * convert its values to their appropriate flow L3, L4 values.
+diff --git a/drivers/net/ethernet/intel/ice/ice_flow.h b/drivers/net/ethernet/intel/ice/ice_flow.h
+index 80bcd6fd21fc..8abcf3e7c0c9 100644
+--- a/drivers/net/ethernet/intel/ice/ice_flow.h
++++ b/drivers/net/ethernet/intel/ice/ice_flow.h
+@@ -405,5 +405,8 @@ enum ice_status ice_rem_vsi_rss_cfg(struct ice_hw *hw, u16 vsi_handle);
+ enum ice_status
+ ice_add_rss_cfg(struct ice_hw *hw, u16 vsi_handle, u64 hashed_flds,
+ 		u32 addl_hdrs);
++enum ice_status
++ice_rem_rss_cfg(struct ice_hw *hw, u16 vsi_handle, u64 hashed_flds,
++		u32 addl_hdrs);
+ u64 ice_get_rss_cfg(struct ice_hw *hw, u16 vsi_handle, u32 hdrs);
+ #endif /* _ICE_FLOW_H_ */
+* Unmerged path drivers/net/ethernet/intel/ice/ice_virtchnl_pf.c
