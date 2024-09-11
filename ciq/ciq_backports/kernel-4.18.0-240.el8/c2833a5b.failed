@@ -1,0 +1,207 @@
+hugetlbfs: fix changes to command line processing
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Mike Kravetz <mike.kravetz@oracle.com>
+commit c2833a5bf75b3657c4dd20b3709c8c702754cb1f
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/c2833a5b.failed
+
+Previously, a check for hugepages_supported was added before processing
+hugetlb command line parameters.  On some architectures such as powerpc,
+hugepages_supported() is not set to true until after command line
+processing.  Therefore, no hugetlb command line parameters would be
+accepted.
+
+Remove the additional checks for hugepages_supported.  In hugetlb_init,
+print a warning if !hugepages_supported and command line parameters were
+specified.
+
+	Reported-by: Sandipan Das <sandipan.osd@gmail.com>
+	Signed-off-by: Mike Kravetz <mike.kravetz@oracle.com>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Cc: Stephen Rothwell <sfr@canb.auug.org.au>
+Link: http://lkml.kernel.org/r/b1f04f9f-fa46-c2a0-7693-4a0679d2a1ee@oracle.com
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit c2833a5bf75b3657c4dd20b3709c8c702754cb1f)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	mm/hugetlb.c
+diff --cc mm/hugetlb.c
+index 449fb9efecb9,8852b0b12270..000000000000
+--- a/mm/hugetlb.c
++++ b/mm/hugetlb.c
+@@@ -2826,25 -3212,44 +2826,28 @@@ static int __init hugetlb_init(void
+  {
+  	int i;
+  
+- 	if (!hugepages_supported())
++ 	if (!hugepages_supported()) {
++ 		if (hugetlb_max_hstate || default_hstate_max_huge_pages)
++ 			pr_warn("HugeTLB: huge pages not supported, ignoring associated command-line parameters\n");
+  		return 0;
++ 	}
+  
+ -	/*
+ -	 * Make sure HPAGE_SIZE (HUGETLB_PAGE_ORDER) hstate exists.  Some
+ -	 * architectures depend on setup being done here.
+ -	 */
+ -	hugetlb_add_hstate(HUGETLB_PAGE_ORDER);
+ -	if (!parsed_default_hugepagesz) {
+ -		/*
+ -		 * If we did not parse a default huge page size, set
+ -		 * default_hstate_idx to HPAGE_SIZE hstate. And, if the
+ -		 * number of huge pages for this default size was implicitly
+ -		 * specified, set that here as well.
+ -		 * Note that the implicit setting will overwrite an explicit
+ -		 * setting.  A warning will be printed in this case.
+ -		 */
+ -		default_hstate_idx = hstate_index(size_to_hstate(HPAGE_SIZE));
+ -		if (default_hstate_max_huge_pages) {
+ -			if (default_hstate.max_huge_pages) {
+ -				char buf[32];
+ -
+ -				string_get_size(huge_page_size(&default_hstate),
+ -					1, STRING_UNITS_2, buf, 32);
+ -				pr_warn("HugeTLB: Ignoring hugepages=%lu associated with %s page size\n",
+ -					default_hstate.max_huge_pages, buf);
+ -				pr_warn("HugeTLB: Using hugepages=%lu for number of default huge pages\n",
+ -					default_hstate_max_huge_pages);
+ -			}
+ -			default_hstate.max_huge_pages =
+ -				default_hstate_max_huge_pages;
+ +	if (!size_to_hstate(default_hstate_size)) {
+ +		if (default_hstate_size != 0) {
+ +			pr_err("HugeTLB: unsupported default_hugepagesz %lu. Reverting to %lu\n",
+ +			       default_hstate_size, HPAGE_SIZE);
+  		}
+ +
+ +		default_hstate_size = HPAGE_SIZE;
+ +		if (!size_to_hstate(default_hstate_size))
+ +			hugetlb_add_hstate(HUGETLB_PAGE_ORDER);
+ +	}
+ +	default_hstate_idx = hstate_index(size_to_hstate(default_hstate_size));
+ +	if (default_hstate_max_huge_pages) {
+ +		if (!default_hstate.max_huge_pages)
+ +			default_hstate.max_huge_pages = default_hstate_max_huge_pages;
+  	}
+  
+ -	hugetlb_cma_check();
+  	hugetlb_init_hstates();
+  	gather_bootmem_prealloc();
+  	report_hugepages();
+@@@ -2942,14 -3355,102 +2945,102 @@@ static int __init hugetlb_nrpages_setup
+  
+  	return 1;
+  }
+ -__setup("hugepages=", hugepages_setup);
+ +__setup("hugepages=", hugetlb_nrpages_setup);
+  
+ -/*
+ - * hugepagesz command line processing
+ - * A specific huge page size can only be specified once with hugepagesz.
+ - * hugepagesz is followed by hugepages on the command line.  The global
+ - * variable 'parsed_valid_hugepagesz' is used to determine if prior
+ - * hugepagesz argument was valid.
+ - */
+ -static int __init hugepagesz_setup(char *s)
+ +static int __init hugetlb_default_setup(char *s)
+  {
+++<<<<<<< HEAD
+ +	default_hstate_size = memparse(s, &s);
+ +	return 1;
+ +}
+ +__setup("default_hugepagesz=", hugetlb_default_setup);
+++=======
++ 	unsigned long size;
++ 	struct hstate *h;
++ 
++ 	parsed_valid_hugepagesz = false;
++ 	size = (unsigned long)memparse(s, NULL);
++ 
++ 	if (!arch_hugetlb_valid_size(size)) {
++ 		pr_err("HugeTLB: unsupported hugepagesz=%s\n", s);
++ 		return 0;
++ 	}
++ 
++ 	h = size_to_hstate(size);
++ 	if (h) {
++ 		/*
++ 		 * hstate for this size already exists.  This is normally
++ 		 * an error, but is allowed if the existing hstate is the
++ 		 * default hstate.  More specifically, it is only allowed if
++ 		 * the number of huge pages for the default hstate was not
++ 		 * previously specified.
++ 		 */
++ 		if (!parsed_default_hugepagesz ||  h != &default_hstate ||
++ 		    default_hstate.max_huge_pages) {
++ 			pr_warn("HugeTLB: hugepagesz=%s specified twice, ignoring\n", s);
++ 			return 0;
++ 		}
++ 
++ 		/*
++ 		 * No need to call hugetlb_add_hstate() as hstate already
++ 		 * exists.  But, do set parsed_hstate so that a following
++ 		 * hugepages= parameter will be applied to this hstate.
++ 		 */
++ 		parsed_hstate = h;
++ 		parsed_valid_hugepagesz = true;
++ 		return 1;
++ 	}
++ 
++ 	hugetlb_add_hstate(ilog2(size) - PAGE_SHIFT);
++ 	parsed_valid_hugepagesz = true;
++ 	return 1;
++ }
++ __setup("hugepagesz=", hugepagesz_setup);
++ 
++ /*
++  * default_hugepagesz command line input
++  * Only one instance of default_hugepagesz allowed on command line.
++  */
++ static int __init default_hugepagesz_setup(char *s)
++ {
++ 	unsigned long size;
++ 
++ 	parsed_valid_hugepagesz = false;
++ 	if (parsed_default_hugepagesz) {
++ 		pr_err("HugeTLB: default_hugepagesz previously specified, ignoring %s\n", s);
++ 		return 0;
++ 	}
++ 
++ 	size = (unsigned long)memparse(s, NULL);
++ 
++ 	if (!arch_hugetlb_valid_size(size)) {
++ 		pr_err("HugeTLB: unsupported default_hugepagesz=%s\n", s);
++ 		return 0;
++ 	}
++ 
++ 	hugetlb_add_hstate(ilog2(size) - PAGE_SHIFT);
++ 	parsed_valid_hugepagesz = true;
++ 	parsed_default_hugepagesz = true;
++ 	default_hstate_idx = hstate_index(size_to_hstate(size));
++ 
++ 	/*
++ 	 * The number of default huge pages (for this size) could have been
++ 	 * specified as the first hugetlb parameter: hugepages=X.  If so,
++ 	 * then default_hstate_max_huge_pages is set.  If the default huge
++ 	 * page size is gigantic (>= MAX_ORDER), then the pages must be
++ 	 * allocated here from bootmem allocator.
++ 	 */
++ 	if (default_hstate_max_huge_pages) {
++ 		default_hstate.max_huge_pages = default_hstate_max_huge_pages;
++ 		if (hstate_is_gigantic(&default_hstate))
++ 			hugetlb_hstate_alloc_pages(&default_hstate);
++ 		default_hstate_max_huge_pages = 0;
++ 	}
++ 
++ 	return 1;
++ }
++ __setup("default_hugepagesz=", default_hugepagesz_setup);
+++>>>>>>> c2833a5bf75b (hugetlbfs: fix changes to command line processing)
+  
+  static unsigned int cpuset_mems_nr(unsigned int *array)
+  {
+* Unmerged path mm/hugetlb.c
