@@ -1,0 +1,159 @@
+bpf: verifier: insert zero extension according to analysis result
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-193.el8
+commit-author Jiong Wang <jiong.wang@netronome.com>
+commit a4b1d3c1ddf6cb441187b6c130a473c16a05a356
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-193.el8/a4b1d3c1.failed
+
+After previous patches, verifier will mark a insn if it really needs zero
+extension on dst_reg.
+
+It is then for back-ends to decide how to use such information to eliminate
+unnecessary zero extension code-gen during JIT compilation.
+
+One approach is verifier insert explicit zero extension for those insns
+that need zero extension in a generic way, JIT back-ends then do not
+generate zero extension for sub-register write at default.
+
+However, only those back-ends which do not have hardware zero extension
+want this optimization. Back-ends like x86_64 and AArch64 have hardware
+zero extension support that the insertion should be disabled.
+
+This patch introduces new target hook "bpf_jit_needs_zext" which returns
+false at default, meaning verifier zero extension insertion is disabled at
+default. A back-end could override this hook to return true if it doesn't
+have hardware support and want verifier insert zero extension explicitly.
+
+Offload targets do not use this native target hook, instead, they could
+get the optimization results using bpf_prog_offload_ops.finalize.
+
+NOTE: arches could have diversified features, it is possible for one arch
+to have hardware zero extension support for some sub-register write insns
+but not for all. For example, PowerPC, SPARC have zero extended loads, but
+not for alu32. So when verifier zero extension insertion enabled, these JIT
+back-ends need to peephole insns to remove those zero extension inserted
+for insn that actually has hardware zero extension support. The peephole
+could be as simple as looking the next insn, if it is a special zero
+extension insn then it is safe to eliminate it if the current insn has
+hardware zero extension support.
+
+	Reviewed-by: Jakub Kicinski <jakub.kicinski@netronome.com>
+	Signed-off-by: Jiong Wang <jiong.wang@netronome.com>
+	Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+(cherry picked from commit a4b1d3c1ddf6cb441187b6c130a473c16a05a356)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/bpf.h
+diff --cc include/linux/bpf.h
+index b28c9d505664,d98141edb74b..000000000000
+--- a/include/linux/bpf.h
++++ b/include/linux/bpf.h
+@@@ -352,7 -369,8 +352,12 @@@ struct bpf_prog_aux 
+  	u32 stack_depth;
+  	u32 id;
+  	u32 func_cnt; /* used by non-func prog as the number of func progs */
+++<<<<<<< HEAD
+ +	RH_KABI_EXTEND(u32 func_idx) /* 0 for non-func prog, the index in func array for func prog */
+++=======
++ 	u32 func_idx; /* 0 for non-func prog, the index in func array for func prog */
++ 	bool verifier_zext; /* Zero extensions has been inserted by verifier. */
+++>>>>>>> a4b1d3c1ddf6 (bpf: verifier: insert zero extension according to analysis result)
+  	bool offload_requested;
+  	struct bpf_prog **func;
+  	void *jit_data; /* JIT specific data. arch dependent */
+* Unmerged path include/linux/bpf.h
+diff --git a/include/linux/filter.h b/include/linux/filter.h
+index bafe8dcd9c17..2eba112e0dc9 100644
+--- a/include/linux/filter.h
++++ b/include/linux/filter.h
+@@ -824,6 +824,7 @@ u64 __bpf_call_base(u64 r1, u64 r2, u64 r3, u64 r4, u64 r5);
+ 
+ struct bpf_prog *bpf_int_jit_compile(struct bpf_prog *prog);
+ void bpf_jit_compile(struct bpf_prog *prog);
++bool bpf_jit_needs_zext(void);
+ bool bpf_helper_changes_pkt_data(void *func);
+ 
+ static inline bool bpf_dump_raw_ok(void)
+diff --git a/kernel/bpf/core.c b/kernel/bpf/core.c
+index d3b800409cbe..8dc6db71b636 100644
+--- a/kernel/bpf/core.c
++++ b/kernel/bpf/core.c
+@@ -2062,6 +2062,15 @@ bool __weak bpf_helper_changes_pkt_data(void *func)
+ 	return false;
+ }
+ 
++/* Return TRUE if the JIT backend wants verifier to enable sub-register usage
++ * analysis code and wants explicit zero extension inserted by verifier.
++ * Otherwise, return FALSE.
++ */
++bool __weak bpf_jit_needs_zext(void)
++{
++	return false;
++}
++
+ /* To execute LD_ABS/LD_IND instructions __bpf_prog_run() may call
+  * skb_copy_bits(), so provide a weak definition of it for NET-less config.
+  */
+diff --git a/kernel/bpf/verifier.c b/kernel/bpf/verifier.c
+index 75ea2294b3b5..4dc430ce8381 100644
+--- a/kernel/bpf/verifier.c
++++ b/kernel/bpf/verifier.c
+@@ -7526,6 +7526,38 @@ static int opt_remove_nops(struct bpf_verifier_env *env)
+ 	return 0;
+ }
+ 
++static int opt_subreg_zext_lo32(struct bpf_verifier_env *env)
++{
++	struct bpf_insn_aux_data *aux = env->insn_aux_data;
++	struct bpf_insn *insns = env->prog->insnsi;
++	int i, delta = 0, len = env->prog->len;
++	struct bpf_insn zext_patch[2];
++	struct bpf_prog *new_prog;
++
++	zext_patch[1] = BPF_ZEXT_REG(0);
++	for (i = 0; i < len; i++) {
++		int adj_idx = i + delta;
++		struct bpf_insn insn;
++
++		if (!aux[adj_idx].zext_dst)
++			continue;
++
++		insn = insns[adj_idx];
++		zext_patch[0] = insn;
++		zext_patch[1].dst_reg = insn.dst_reg;
++		zext_patch[1].src_reg = insn.dst_reg;
++		new_prog = bpf_patch_insn_data(env, adj_idx, zext_patch, 2);
++		if (!new_prog)
++			return -ENOMEM;
++		env->prog = new_prog;
++		insns = new_prog->insnsi;
++		aux = env->insn_aux_data;
++		delta += 2;
++	}
++
++	return 0;
++}
++
+ /* convert load instructions that access fields of a context type into a
+  * sequence of instructions that access fields of the underlying structure:
+  *     struct __sk_buff    -> struct sk_buff
+@@ -8371,6 +8403,15 @@ int bpf_check(struct bpf_prog **prog, union bpf_attr *attr,
+ 	if (ret == 0)
+ 		ret = fixup_bpf_calls(env);
+ 
++	/* do 32-bit optimization after insn patching has done so those patched
++	 * insns could be handled correctly.
++	 */
++	if (ret == 0 && bpf_jit_needs_zext() &&
++	    !bpf_prog_is_dev_bound(env->prog->aux)) {
++		ret = opt_subreg_zext_lo32(env);
++		env->prog->aux->verifier_zext = !ret;
++	}
++
+ 	if (ret == 0)
+ 		ret = fixup_call_args(env);
+ 
