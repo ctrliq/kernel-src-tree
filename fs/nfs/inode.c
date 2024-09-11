@@ -2059,13 +2059,13 @@ static int nfs_update_inode(struct inode *inode, struct nfs_fattr *fattr)
 					| NFS_INO_INVALID_OTHER;
 				if (S_ISDIR(inode->i_mode))
 					nfs_force_lookup_revalidate(inode);
+				attr_changed = true;
 				dprintk("NFS: change_attr change on server for file %s/%ld\n",
 						inode->i_sb->s_id,
 						inode->i_ino);
 			} else if (!have_delegation)
 				nfsi->cache_validity |= NFS_INO_DATA_INVAL_DEFER;
 			inode_set_iversion_raw(inode, fattr->change_attr);
-			attr_changed = true;
 		}
 	} else {
 		nfsi->cache_validity |= save_cache_validity &
@@ -2103,7 +2103,6 @@ static int nfs_update_inode(struct inode *inode, struct nfs_fattr *fattr)
 				i_size_write(inode, new_isize);
 				if (!have_writers)
 					invalid |= NFS_INO_INVALID_DATA;
-				attr_changed = true;
 			}
 			dprintk("NFS: isize change on server for file %s/%ld "
 					"(%Ld to %Ld)\n",
@@ -2142,7 +2141,6 @@ static int nfs_update_inode(struct inode *inode, struct nfs_fattr *fattr)
 			inode->i_mode = newmode;
 			invalid |= NFS_INO_INVALID_ACCESS
 				| NFS_INO_INVALID_ACL;
-			attr_changed = true;
 		}
 	} else if (server->caps & NFS_CAP_MODE) {
 		nfsi->cache_validity |= save_cache_validity &
@@ -2156,7 +2154,6 @@ static int nfs_update_inode(struct inode *inode, struct nfs_fattr *fattr)
 			invalid |= NFS_INO_INVALID_ACCESS
 				| NFS_INO_INVALID_ACL;
 			inode->i_uid = fattr->uid;
-			attr_changed = true;
 		}
 	} else if (server->caps & NFS_CAP_OWNER) {
 		nfsi->cache_validity |= save_cache_validity &
@@ -2170,7 +2167,6 @@ static int nfs_update_inode(struct inode *inode, struct nfs_fattr *fattr)
 			invalid |= NFS_INO_INVALID_ACCESS
 				| NFS_INO_INVALID_ACL;
 			inode->i_gid = fattr->gid;
-			attr_changed = true;
 		}
 	} else if (server->caps & NFS_CAP_OWNER_GROUP) {
 		nfsi->cache_validity |= save_cache_validity &
@@ -2184,7 +2180,6 @@ static int nfs_update_inode(struct inode *inode, struct nfs_fattr *fattr)
 			if (S_ISDIR(inode->i_mode))
 				invalid |= NFS_INO_INVALID_DATA;
 			set_nlink(inode, fattr->nlink);
-			attr_changed = true;
 		}
 	} else if (server->caps & NFS_CAP_NLINK) {
 		nfsi->cache_validity |= save_cache_validity &
