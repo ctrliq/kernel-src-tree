@@ -1,0 +1,143 @@
+net: stmmac: Enable SERDES power up/down sequence
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Voon Weifeng <weifeng.voon@intel.com>
+commit b9663b7ca6ff780555108394c9c1b409f63b99a7
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/b9663b7c.failed
+
+This patch is to enable Intel SERDES power up/down sequence. The SERDES
+converts 8/10 bits data to SGMII signal. Below is an example of
+HW configuration for SGMII mode. The SERDES is located in the PHY IF
+in the diagram below.
+
+<-----------------GBE Controller---------->|<--External PHY chip-->
++----------+         +----+            +---+           +----------+
+|   EQoS   | <-GMII->| DW | < ------ > |PHY| <-SGMII-> | External |
+|   MAC    |         |xPCS|            |IF |           | PHY      |
++----------+         +----+            +---+           +----------+
+       ^               ^                 ^                ^
+       |               |                 |                |
+       +---------------------MDIO-------------------------+
+
+PHY IF configuration and status registers are accessible through
+mdio address 0x15 which is defined as mdio_adhoc_addr. During D0,
+The driver will need to power up PHY IF by changing the power state
+to P0. Likewise, for D3, the driver sets PHY IF power state to P3.
+
+	Signed-off-by: Voon Weifeng <weifeng.voon@intel.com>
+	Signed-off-by: Ong Boon Leong <boon.leong.ong@intel.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit b9663b7ca6ff780555108394c9c1b409f63b99a7)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/stmicro/stmmac/dwmac-intel.c
+* Unmerged path drivers/net/ethernet/stmicro/stmmac/dwmac-intel.c
+* Unmerged path drivers/net/ethernet/stmicro/stmmac/dwmac-intel.c
+diff --git a/drivers/net/ethernet/stmicro/stmmac/dwmac-intel.h b/drivers/net/ethernet/stmicro/stmmac/dwmac-intel.h
+new file mode 100644
+index 000000000000..e723096c0b15
+--- /dev/null
++++ b/drivers/net/ethernet/stmicro/stmmac/dwmac-intel.h
+@@ -0,0 +1,23 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++/* Copyright (c) 2020, Intel Corporation
++ * DWMAC Intel header file
++ */
++
++#ifndef __DWMAC_INTEL_H__
++#define __DWMAC_INTEL_H__
++
++#define POLL_DELAY_US 8
++
++/* SERDES Register */
++#define SERDES_GSR0	0x5	/* Global Status Reg0 */
++#define SERDES_GCR0	0xb	/* Global Configuration Reg0 */
++
++/* SERDES defines */
++#define SERDES_PLL_CLK		BIT(0)		/* PLL clk valid signal */
++#define SERDES_RST		BIT(2)		/* Serdes Reset */
++#define SERDES_PWR_ST_MASK	GENMASK(6, 4)	/* Serdes Power state*/
++#define SERDES_PWR_ST_SHIFT	4
++#define SERDES_PWR_ST_P0	0x0
++#define SERDES_PWR_ST_P3	0x3
++
++#endif /* __DWMAC_INTEL_H__ */
+diff --git a/drivers/net/ethernet/stmicro/stmmac/stmmac_main.c b/drivers/net/ethernet/stmicro/stmmac/stmmac_main.c
+index 55e88ad23227..e6d12dcff83c 100644
+--- a/drivers/net/ethernet/stmicro/stmmac/stmmac_main.c
++++ b/drivers/net/ethernet/stmicro/stmmac/stmmac_main.c
+@@ -4797,6 +4797,14 @@ int stmmac_dvr_probe(struct device *device,
+ 		goto error_netdev_register;
+ 	}
+ 
++	if (priv->plat->serdes_powerup) {
++		ret = priv->plat->serdes_powerup(ndev,
++						 priv->plat->bsp_priv);
++
++		if (ret < 0)
++			return ret;
++	}
++
+ #ifdef CONFIG_DEBUG_FS
+ 	stmmac_init_fs(ndev);
+ #endif
+@@ -4840,6 +4848,9 @@ int stmmac_dvr_remove(struct device *dev)
+ 
+ 	stmmac_stop_all_dma(priv);
+ 
++	if (priv->plat->serdes_powerdown)
++		priv->plat->serdes_powerdown(ndev, priv->plat->bsp_priv);
++
+ 	stmmac_mac_set(priv, priv->ioaddr, false);
+ 	netif_carrier_off(ndev);
+ 	unregister_netdev(ndev);
+@@ -4892,6 +4903,9 @@ int stmmac_suspend(struct device *dev)
+ 	/* Stop TX/RX DMA */
+ 	stmmac_stop_all_dma(priv);
+ 
++	if (priv->plat->serdes_powerdown)
++		priv->plat->serdes_powerdown(ndev, priv->plat->bsp_priv);
++
+ 	/* Enable Power down mode by programming the PMT regs */
+ 	if (device_may_wakeup(priv->device)) {
+ 		stmmac_pmt(priv, priv->hw, priv->wolopts);
+@@ -4954,6 +4968,7 @@ int stmmac_resume(struct device *dev)
+ {
+ 	struct net_device *ndev = dev_get_drvdata(dev);
+ 	struct stmmac_priv *priv = netdev_priv(ndev);
++	int ret;
+ 
+ 	if (!netif_running(ndev))
+ 		return 0;
+@@ -4981,6 +4996,14 @@ int stmmac_resume(struct device *dev)
+ 			stmmac_mdio_reset(priv->mii);
+ 	}
+ 
++	if (priv->plat->serdes_powerup) {
++		ret = priv->plat->serdes_powerup(ndev,
++						 priv->plat->bsp_priv);
++
++		if (ret < 0)
++			return ret;
++	}
++
+ 	netif_device_attach(ndev);
+ 
+ 	mutex_lock(&priv->lock);
+diff --git a/include/linux/stmmac.h b/include/linux/stmmac.h
+index 7bba6bd261ea..b42e67f9e050 100644
+--- a/include/linux/stmmac.h
++++ b/include/linux/stmmac.h
+@@ -174,6 +174,8 @@ struct plat_stmmacenet_data {
+ 	struct stmmac_rxq_cfg rx_queues_cfg[MTL_MAX_RX_QUEUES];
+ 	struct stmmac_txq_cfg tx_queues_cfg[MTL_MAX_TX_QUEUES];
+ 	void (*fix_mac_speed)(void *priv, unsigned int speed);
++	int (*serdes_powerup)(struct net_device *ndev, void *priv);
++	void (*serdes_powerdown)(struct net_device *ndev, void *priv);
+ 	int (*init)(struct platform_device *pdev, void *priv);
+ 	void (*exit)(struct platform_device *pdev, void *priv);
+ 	struct mac_device_info *(*setup)(void *priv);
