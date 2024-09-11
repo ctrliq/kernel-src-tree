@@ -1,0 +1,300 @@
+io_uring: change io_ring_ctx bool fields into bit fields
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Jens Axboe <axboe@kernel.dk>
+commit 69b3e546139a21b3046b6bf0cb79d5e8c9a3fa75
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/69b3e546.failed
+
+In preparation for adding another one, which would make us spill into
+another long (and hence bump the size of the ctx), change them to
+bit fields.
+
+	Signed-off-by: Jens Axboe <axboe@kernel.dk>
+(cherry picked from commit 69b3e546139a21b3046b6bf0cb79d5e8c9a3fa75)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/io_uring.c
+diff --cc fs/io_uring.c
+index 28a601d08266,42bf83b3fbd5..000000000000
+--- a/fs/io_uring.c
++++ b/fs/io_uring.c
+@@@ -214,11 -202,23 +214,18 @@@ struct io_ring_ctx 
+  
+  	struct {
+  		unsigned int		flags;
+++<<<<<<< HEAD
+ +		bool			compat;
+ +		bool			account_mem;
+++=======
++ 		int			compat: 1;
++ 		int			account_mem: 1;
++ 		int			cq_overflow_flushed: 1;
++ 		int			drain_next: 1;
+++>>>>>>> 69b3e546139a (io_uring: change io_ring_ctx bool fields into bit fields)
+  
+ -		/*
+ -		 * Ring buffer of indices into array of io_uring_sqe, which is
+ -		 * mmapped by the application using the IORING_OFF_SQES offset.
+ -		 *
+ -		 * This indirection could e.g. be used to assign fixed
+ -		 * io_uring_sqe entries to operations and only submit them to
+ -		 * the queue when needed.
+ -		 *
+ -		 * The kernel modifies neither the indices array nor the entries
+ -		 * array.
+ -		 */
+ -		u32			*sq_array;
+ +		/* SQ ring */
+ +		struct io_sq_ring	*sq_ring;
+  		unsigned		cached_sq_head;
+  		unsigned		sq_entries;
+  		unsigned		sq_mask;
+@@@ -551,9 -973,99 +558,102 @@@ static void io_cqring_ev_posted(struct 
+  		eventfd_signal(ctx->cq_ev_fd, 1);
+  }
+  
+ -/* Returns true if there are no backlogged entries after the flush */
+ -static bool io_cqring_overflow_flush(struct io_ring_ctx *ctx, bool force)
+ +static void io_cqring_add_event(struct io_ring_ctx *ctx, u64 user_data,
+ +				long res)
+  {
+++<<<<<<< HEAD
+++=======
++ 	struct io_rings *rings = ctx->rings;
++ 	struct io_uring_cqe *cqe;
++ 	struct io_kiocb *req;
++ 	unsigned long flags;
++ 	LIST_HEAD(list);
++ 
++ 	if (!force) {
++ 		if (list_empty_careful(&ctx->cq_overflow_list))
++ 			return true;
++ 		if ((ctx->cached_cq_tail - READ_ONCE(rings->cq.head) ==
++ 		    rings->cq_ring_entries))
++ 			return false;
++ 	}
++ 
++ 	spin_lock_irqsave(&ctx->completion_lock, flags);
++ 
++ 	/* if force is set, the ring is going away. always drop after that */
++ 	if (force)
++ 		ctx->cq_overflow_flushed = 1;
++ 
++ 	cqe = NULL;
++ 	while (!list_empty(&ctx->cq_overflow_list)) {
++ 		cqe = io_get_cqring(ctx);
++ 		if (!cqe && !force)
++ 			break;
++ 
++ 		req = list_first_entry(&ctx->cq_overflow_list, struct io_kiocb,
++ 						list);
++ 		list_move(&req->list, &list);
++ 		if (cqe) {
++ 			WRITE_ONCE(cqe->user_data, req->user_data);
++ 			WRITE_ONCE(cqe->res, req->result);
++ 			WRITE_ONCE(cqe->flags, 0);
++ 		} else {
++ 			WRITE_ONCE(ctx->rings->cq_overflow,
++ 				atomic_inc_return(&ctx->cached_cq_overflow));
++ 		}
++ 	}
++ 
++ 	io_commit_cqring(ctx);
++ 	if (cqe) {
++ 		clear_bit(0, &ctx->sq_check_overflow);
++ 		clear_bit(0, &ctx->cq_check_overflow);
++ 	}
++ 	spin_unlock_irqrestore(&ctx->completion_lock, flags);
++ 	io_cqring_ev_posted(ctx);
++ 
++ 	while (!list_empty(&list)) {
++ 		req = list_first_entry(&list, struct io_kiocb, list);
++ 		list_del(&req->list);
++ 		io_put_req(req);
++ 	}
++ 
++ 	return cqe != NULL;
++ }
++ 
++ static void io_cqring_fill_event(struct io_kiocb *req, long res)
++ {
++ 	struct io_ring_ctx *ctx = req->ctx;
++ 	struct io_uring_cqe *cqe;
++ 
++ 	trace_io_uring_complete(ctx, req->user_data, res);
++ 
++ 	/*
++ 	 * If we can't get a cq entry, userspace overflowed the
++ 	 * submission (by quite a lot). Increment the overflow count in
++ 	 * the ring.
++ 	 */
++ 	cqe = io_get_cqring(ctx);
++ 	if (likely(cqe)) {
++ 		WRITE_ONCE(cqe->user_data, req->user_data);
++ 		WRITE_ONCE(cqe->res, res);
++ 		WRITE_ONCE(cqe->flags, 0);
++ 	} else if (ctx->cq_overflow_flushed) {
++ 		WRITE_ONCE(ctx->rings->cq_overflow,
++ 				atomic_inc_return(&ctx->cached_cq_overflow));
++ 	} else {
++ 		if (list_empty(&ctx->cq_overflow_list)) {
++ 			set_bit(0, &ctx->sq_check_overflow);
++ 			set_bit(0, &ctx->cq_check_overflow);
++ 		}
++ 		refcount_inc(&req->refs);
++ 		req->result = res;
++ 		list_add_tail(&req->list, &ctx->cq_overflow_list);
++ 	}
++ }
++ 
++ static void io_cqring_add_event(struct io_kiocb *req, long res)
++ {
++ 	struct io_ring_ctx *ctx = req->ctx;
+++>>>>>>> 69b3e546139a (io_uring: change io_ring_ctx bool fields into bit fields)
+  	unsigned long flags;
+  
+  	spin_lock_irqsave(&ctx->completion_lock, flags);
+@@@ -2228,94 -4487,68 +2328,104 @@@ static int io_queue_sqe(struct io_ring_
+  {
+  	int ret;
+  
+++<<<<<<< HEAD
+ +	ret = io_req_defer(ctx, req, s->sqe);
+++=======
++ 	if (unlikely(req->ctx->drain_next)) {
++ 		req->flags |= REQ_F_IO_DRAIN;
++ 		req->ctx->drain_next = 0;
++ 	}
++ 	req->ctx->drain_next = (req->flags & REQ_F_DRAIN_LINK) != 0;
++ 
++ 	ret = io_req_defer(req, sqe);
+++>>>>>>> 69b3e546139a (io_uring: change io_ring_ctx bool fields into bit fields)
+  	if (ret) {
+  		if (ret != -EIOCBQUEUED) {
+ -			io_cqring_add_event(req, ret);
+ -			req_set_fail_links(req);
+ -			io_double_put_req(req);
+ +			io_free_req(req);
+ +			io_cqring_add_event(ctx, s->sqe->user_data, ret);
+  		}
+ -	} else if (req->flags & REQ_F_FORCE_ASYNC) {
+ -		/*
+ -		 * Never try inline submit of IOSQE_ASYNC is set, go straight
+ -		 * to async execution.
+ -		 */
+ -		req->work.flags |= IO_WQ_WORK_CONCURRENT;
+ -		io_queue_async_work(req);
+ -	} else {
+ -		__io_queue_sqe(req, sqe);
+ +		return 0;
+  	}
+ +
+ +	return __io_queue_sqe(ctx, req, s, force_nonblock);
+  }
+  
+ -static inline void io_queue_link_head(struct io_kiocb *req)
+ +static int io_queue_link_head(struct io_ring_ctx *ctx, struct io_kiocb *req,
+ +			      struct sqe_submit *s, struct io_kiocb *shadow,
+ +			      bool force_nonblock)
+  {
+ -	if (unlikely(req->flags & REQ_F_FAIL_LINK)) {
+ -		io_cqring_add_event(req, -ECANCELED);
+ -		io_double_put_req(req);
+ -	} else
+ -		io_queue_sqe(req, NULL);
+ +	int ret;
+ +	int need_submit = false;
+ +
+ +	if (!shadow)
+ +		return io_queue_sqe(ctx, req, s, force_nonblock);
+ +
+ +	/*
+ +	 * Mark the first IO in link list as DRAIN, let all the following
+ +	 * IOs enter the defer list. all IO needs to be completed before link
+ +	 * list.
+ +	 */
+ +	req->flags |= REQ_F_IO_DRAIN;
+ +	ret = io_req_defer(ctx, req, s->sqe);
+ +	if (ret) {
+ +		if (ret != -EIOCBQUEUED) {
+ +			io_free_req(req);
+ +			__io_free_req(shadow);
+ +			io_cqring_add_event(ctx, s->sqe->user_data, ret);
+ +			return 0;
+ +		}
+ +	} else {
+ +		/*
+ +		 * If ret == 0 means that all IOs in front of link io are
+ +		 * running done. let's queue link head.
+ +		 */
+ +		need_submit = true;
+ +	}
+ +
+ +	/* Insert shadow req to defer_list, blocking next IOs */
+ +	spin_lock_irq(&ctx->completion_lock);
+ +	list_add_tail(&shadow->list, &ctx->defer_list);
+ +	spin_unlock_irq(&ctx->completion_lock);
+ +
+ +	if (need_submit)
+ +		return __io_queue_sqe(ctx, req, s, force_nonblock);
+ +
+ +	return 0;
+  }
+  
+ -#define SQE_VALID_FLAGS	(IOSQE_FIXED_FILE|IOSQE_IO_DRAIN|IOSQE_IO_LINK|	\
+ -				IOSQE_IO_HARDLINK | IOSQE_ASYNC)
+ +#define SQE_VALID_FLAGS	(IOSQE_FIXED_FILE|IOSQE_IO_DRAIN|IOSQE_IO_LINK)
+  
+ -static bool io_submit_sqe(struct io_kiocb *req, const struct io_uring_sqe *sqe,
+ -			  struct io_submit_state *state, struct io_kiocb **link)
+ +static void io_submit_sqe(struct io_ring_ctx *ctx, struct sqe_submit *s,
+ +			  struct io_submit_state *state, struct io_kiocb **link,
+ +			  bool force_nonblock)
+  {
+ -	struct io_ring_ctx *ctx = req->ctx;
+ -	unsigned int sqe_flags;
+ +	struct io_uring_sqe *sqe_copy;
+ +	struct io_kiocb *req;
+  	int ret;
+  
+ -	sqe_flags = READ_ONCE(sqe->flags);
+ -
+  	/* enforce forwards compatibility on users */
+ -	if (unlikely(sqe_flags & ~SQE_VALID_FLAGS)) {
+ +	if (unlikely(s->sqe->flags & ~SQE_VALID_FLAGS)) {
+  		ret = -EINVAL;
+ -		goto err_req;
+ +		goto err;
+ +	}
+ +
+ +	req = io_get_req(ctx, state);
+ +	if (unlikely(!req)) {
+ +		ret = -EAGAIN;
+ +		goto err;
+  	}
+ -	if (sqe_flags & IOSQE_ASYNC)
+ -		req->flags |= REQ_F_FORCE_ASYNC;
+  
+ -	ret = io_req_set_file(state, req, sqe);
+ +	ret = io_req_set_file(ctx, s, state, req);
+  	if (unlikely(ret)) {
+  err_req:
+ -		io_cqring_add_event(req, ret);
+ -		io_double_put_req(req);
+ -		return false;
+ +		io_free_req(req);
+ +err:
+ +		io_cqring_add_event(ctx, s->sqe->user_data, ret);
+ +		return;
+  	}
+  
+ +	req->user_data = s->sqe->user_data;
+ +
+  	/*
+  	 * If we already have a head request, queue this one for async
+  	 * submittal once the head completes. If we don't have a head but
+* Unmerged path fs/io_uring.c
