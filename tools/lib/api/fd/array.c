@@ -9,6 +9,7 @@
 #include <poll.h>
 #include <stdlib.h>
 #include <unistd.h>
+#include <string.h>
 
 void fdarray__init(struct fdarray *fda, int nr_autogrow)
 {
@@ -20,7 +21,7 @@ void fdarray__init(struct fdarray *fda, int nr_autogrow)
 
 int fdarray__grow(struct fdarray *fda, int nr)
 {
-	void *priv;
+	struct priv *priv;
 	int nr_alloc = fda->nr_alloc + nr;
 	size_t psize = sizeof(fda->priv[0]) * nr_alloc;
 	size_t size  = sizeof(struct pollfd) * nr_alloc;
@@ -34,6 +35,9 @@ int fdarray__grow(struct fdarray *fda, int nr)
 		free(entries);
 		return -ENOMEM;
 	}
+
+	memset(&entries[fda->nr_alloc], 0, sizeof(struct pollfd) * nr);
+	memset(&priv[fda->nr_alloc], 0, sizeof(fda->priv[0]) * nr);
 
 	fda->nr_alloc = nr_alloc;
 	fda->entries  = entries;
@@ -70,7 +74,7 @@ void fdarray__delete(struct fdarray *fda)
 	free(fda);
 }
 
-int fdarray__add(struct fdarray *fda, int fd, short revents)
+int fdarray__add(struct fdarray *fda, int fd, short revents, enum fdarray_flags flags)
 {
 	int pos = fda->nr;
 
@@ -80,6 +84,7 @@ int fdarray__add(struct fdarray *fda, int fd, short revents)
 
 	fda->entries[fda->nr].fd     = fd;
 	fda->entries[fda->nr].events = revents;
+	fda->priv[fda->nr].flags = flags;
 	fda->nr++;
 	return pos;
 }
