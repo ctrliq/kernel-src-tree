@@ -1,0 +1,198 @@
+mt76: mt7915: fix unused 'mode' variable
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-315.el8
+commit-author Arnd Bergmann <arnd@arndb.de>
+commit c490492f15f656340b35cb9e36b9bfdea3539e19
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-315.el8/c490492f.failed
+
+clang points out a possible corner case in the mt7915_tm_set_tx_cont()
+function if called with invalid arguments:
+
+drivers/net/wireless/mediatek/mt76/mt7915/testmode.c:593:2: warning: variable 'mode' is used uninitialized whenever switch default is taken [-Wsometimes-uninitialized]
+        default:
+        ^~~~~~~
+drivers/net/wireless/mediatek/mt76/mt7915/testmode.c:597:13: note: uninitialized use occurs here
+        rateval =  mode << 6 | rate_idx;
+                   ^~~~
+drivers/net/wireless/mediatek/mt76/mt7915/testmode.c:506:37: note: initialize the variable 'mode' to silence this warning
+        u8 rate_idx = td->tx_rate_idx, mode;
+                                           ^
+
+Change it to return an error instead of continuing with invalid data
+here.
+
+Fixes: 3f0caa3cbf94 ("mt76: mt7915: add support for continuous tx in testmode")
+	Signed-off-by: Arnd Bergmann <arnd@arndb.de>
+	Signed-off-by: Kalle Valo <kvalo@codeaurora.org>
+(cherry picked from commit c490492f15f656340b35cb9e36b9bfdea3539e19)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/wireless/mediatek/mt76/mt7915/testmode.c
+diff --cc drivers/net/wireless/mediatek/mt76/mt7915/testmode.c
+index fe56ab18e974,bd798df748ba..000000000000
+--- a/drivers/net/wireless/mediatek/mt76/mt7915/testmode.c
++++ b/drivers/net/wireless/mediatek/mt76/mt7915/testmode.c
+@@@ -227,17 -474,146 +227,155 @@@ mt7915_tm_set_tx_frames(struct mt7915_d
+  }
+  
+  static void
+ -mt7915_tm_set_rx_frames(struct mt7915_phy *phy, bool en)
+ +mt7915_tm_set_rx_frames(struct mt7915_dev *dev, bool en)
+  {
+ -	if (en)
+ -		mt7915_tm_update_channel(phy);
+ +	if (en) {
+ +		mutex_unlock(&dev->mt76.mutex);
+ +		mt7915_set_channel(&dev->phy);
+ +		mutex_lock(&dev->mt76.mutex);
+  
+++<<<<<<< HEAD
+ +		mt7915_mcu_set_chan_info(&dev->phy, MCU_EXT_CMD_SET_RX_PATH);
+ +	}
+ +
+ +	mt7915_tm_set_trx(dev, &dev->phy, TM_MAC_RX_RXV, en);
+++=======
++ 	mt7915_tm_set_trx(phy, TM_MAC_RX_RXV, en);
++ }
++ 
++ static int
++ mt7915_tm_rf_switch_mode(struct mt7915_dev *dev, u32 oper)
++ {
++ 	struct mt7915_tm_rf_test req = {
++ 		.op.op_mode = cpu_to_le32(oper),
++ 	};
++ 
++ 	return mt76_mcu_send_msg(&dev->mt76, MCU_EXT_CMD(RF_TEST), &req,
++ 				 sizeof(req), true);
++ }
++ 
++ static int
++ mt7915_tm_set_tx_cont(struct mt7915_phy *phy, bool en)
++ {
++ #define TX_CONT_START	0x05
++ #define TX_CONT_STOP	0x06
++ 	struct mt7915_dev *dev = phy->dev;
++ 	struct cfg80211_chan_def *chandef = &phy->mt76->chandef;
++ 	int freq1 = ieee80211_frequency_to_channel(chandef->center_freq1);
++ 	struct mt76_testmode_data *td = &phy->mt76->test;
++ 	u32 func_idx = en ? TX_CONT_START : TX_CONT_STOP;
++ 	u8 rate_idx = td->tx_rate_idx, mode;
++ 	u16 rateval;
++ 	struct mt7915_tm_rf_test req = {
++ 		.action = 1,
++ 		.icap_len = 120,
++ 		.op.rf.func_idx = cpu_to_le32(func_idx),
++ 	};
++ 	struct tm_tx_cont *tx_cont = &req.op.rf.param.tx_cont;
++ 
++ 	tx_cont->control_ch = chandef->chan->hw_value;
++ 	tx_cont->center_ch = freq1;
++ 	tx_cont->tx_ant = td->tx_antenna_mask;
++ 	tx_cont->band = phy != &dev->phy;
++ 
++ 	switch (chandef->width) {
++ 	case NL80211_CHAN_WIDTH_40:
++ 		tx_cont->bw = CMD_CBW_40MHZ;
++ 		break;
++ 	case NL80211_CHAN_WIDTH_80:
++ 		tx_cont->bw = CMD_CBW_80MHZ;
++ 		break;
++ 	case NL80211_CHAN_WIDTH_80P80:
++ 		tx_cont->bw = CMD_CBW_8080MHZ;
++ 		break;
++ 	case NL80211_CHAN_WIDTH_160:
++ 		tx_cont->bw = CMD_CBW_160MHZ;
++ 		break;
++ 	case NL80211_CHAN_WIDTH_5:
++ 		tx_cont->bw = CMD_CBW_5MHZ;
++ 		break;
++ 	case NL80211_CHAN_WIDTH_10:
++ 		tx_cont->bw = CMD_CBW_10MHZ;
++ 		break;
++ 	case NL80211_CHAN_WIDTH_20:
++ 		tx_cont->bw = CMD_CBW_20MHZ;
++ 		break;
++ 	case NL80211_CHAN_WIDTH_20_NOHT:
++ 		tx_cont->bw = CMD_CBW_20MHZ;
++ 		break;
++ 	default:
++ 		return -EINVAL;
++ 	}
++ 
++ 	if (!en) {
++ 		req.op.rf.param.func_data = cpu_to_le32(phy != &dev->phy);
++ 		goto out;
++ 	}
++ 
++ 	if (td->tx_rate_mode <= MT76_TM_TX_MODE_OFDM) {
++ 		struct ieee80211_supported_band *sband;
++ 		u8 idx = rate_idx;
++ 
++ 		if (chandef->chan->band == NL80211_BAND_5GHZ)
++ 			sband = &phy->mt76->sband_5g.sband;
++ 		else
++ 			sband = &phy->mt76->sband_2g.sband;
++ 
++ 		if (td->tx_rate_mode == MT76_TM_TX_MODE_OFDM)
++ 			idx += 4;
++ 		rate_idx = sband->bitrates[idx].hw_value & 0xff;
++ 	}
++ 
++ 	switch (td->tx_rate_mode) {
++ 	case MT76_TM_TX_MODE_CCK:
++ 		mode = MT_PHY_TYPE_CCK;
++ 		break;
++ 	case MT76_TM_TX_MODE_OFDM:
++ 		mode = MT_PHY_TYPE_OFDM;
++ 		break;
++ 	case MT76_TM_TX_MODE_HT:
++ 		mode = MT_PHY_TYPE_HT;
++ 		break;
++ 	case MT76_TM_TX_MODE_VHT:
++ 		mode = MT_PHY_TYPE_VHT;
++ 		break;
++ 	case MT76_TM_TX_MODE_HE_SU:
++ 		mode = MT_PHY_TYPE_HE_SU;
++ 		break;
++ 	case MT76_TM_TX_MODE_HE_EXT_SU:
++ 		mode = MT_PHY_TYPE_HE_EXT_SU;
++ 		break;
++ 	case MT76_TM_TX_MODE_HE_TB:
++ 		mode = MT_PHY_TYPE_HE_TB;
++ 		break;
++ 	case MT76_TM_TX_MODE_HE_MU:
++ 		mode = MT_PHY_TYPE_HE_MU;
++ 		break;
++ 	default:
++ 		return -EINVAL;
++ 	}
++ 
++ 	rateval =  mode << 6 | rate_idx;
++ 	tx_cont->rateval = cpu_to_le16(rateval);
++ 
++ out:
++ 	if (!en) {
++ 		int ret;
++ 
++ 		ret = mt76_mcu_send_msg(&dev->mt76, MCU_EXT_CMD(RF_TEST), &req,
++ 					sizeof(req), true);
++ 		if (ret)
++ 			return ret;
++ 
++ 		return mt7915_tm_rf_switch_mode(dev, RF_OPER_NORMAL);
++ 	}
++ 
++ 	mt7915_tm_rf_switch_mode(dev, RF_OPER_RF_TEST);
++ 	mt7915_tm_update_channel(phy);
++ 
++ 	return mt76_mcu_send_msg(&dev->mt76, MCU_EXT_CMD(RF_TEST), &req,
++ 				 sizeof(req), true);
+++>>>>>>> c490492f15f6 (mt76: mt7915: fix unused 'mode' variable)
+  }
+  
+  static void
+* Unmerged path drivers/net/wireless/mediatek/mt76/mt7915/testmode.c
