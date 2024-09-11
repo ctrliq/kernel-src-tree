@@ -1,0 +1,244 @@
+net/sched: act_police: fix race condition on state variables
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-80.el8
+Rebuild_CHGLOG: - [net] sched: act_police: fix race condition on state variables (Ivan Vecera) [1638022]
+Rebuild_FUZZ: 96.55%
+commit-author Davide Caratti <dcaratti@redhat.com>
+commit f2cbd485282014132851bf37cb2ca624a456275d
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-80.el8/f2cbd485.failed
+
+after 'police' configuration parameters were converted to use RCU instead
+of spinlock, the state variables used to compute the traffic rate (namely
+'tcfp_toks', 'tcfp_ptoks' and 'tcfp_t_c') are erroneously read/updated in
+the traffic path without any protection.
+
+Use a dedicated spinlock to avoid race conditions on these variables, and
+ensure proper cache-line alignment. In this way, 'police' is still faster
+than what we observed when 'tcf_lock' was used in the traffic path _ i.e.
+reverting commit 2d550dbad83c ("net/sched: act_police: don't use spinlock
+in the data path"). Moreover, we preserve the throughput improvement that
+was obtained after 'police' started using per-cpu counters, when 'avrate'
+is used instead of 'rate'.
+
+Changes since v1 (thanks to Eric Dumazet):
+- call ktime_get_ns() before acquiring the lock in the traffic path
+- use a dedicated spinlock instead of tcf_lock
+- improve cache-line usage
+
+Fixes: 2d550dbad83c ("net/sched: act_police: don't use spinlock in the data path")
+Reported-and-suggested-by: Eric Dumazet <eric.dumazet@gmail.com>
+	Signed-off-by: Davide Caratti <dcaratti@redhat.com>
+	Reviewed-by: Eric Dumazet <edumazet@google.com>
+(cherry picked from commit f2cbd485282014132851bf37cb2ca624a456275d)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/sched/act_police.c
+diff --cc net/sched/act_police.c
+index 0b82775575a6,ee4665a5a022..000000000000
+--- a/net/sched/act_police.c
++++ b/net/sched/act_police.c
+@@@ -36,6 -32,17 +33,20 @@@ struct tcf_police 
+  	bool			rate_present;
+  	struct psched_ratecfg	peak;
+  	bool			peak_present;
+++<<<<<<< HEAD
+++=======
++ 	struct rcu_head rcu;
++ };
++ 
++ struct tcf_police {
++ 	struct tc_action	common;
++ 	struct tcf_police_params __rcu *params;
++ 
++ 	spinlock_t		tcfp_lock ____cacheline_aligned_in_smp;
++ 	s64			tcfp_toks;
++ 	s64			tcfp_ptoks;
++ 	s64			tcfp_t_c;
+++>>>>>>> f2cbd4852820 (net/sched: act_police: fix race condition on state variables)
+  };
+  
+  #define to_police(pc) ((struct tcf_police *)pc)
+@@@ -146,50 -159,70 +157,81 @@@ static int tcf_police_init(struct net *
+  		goto failure;
+  	}
+  
+ -	new = kzalloc(sizeof(*new), GFP_KERNEL);
+ -	if (unlikely(!new)) {
+ -		err = -ENOMEM;
+ -		goto failure;
+ -	}
+ -
+ +	spin_lock_bh(&police->tcf_lock);
+  	/* No failure allowed after this point */
+ -	new->tcfp_mtu = parm->mtu;
+ -	if (!new->tcfp_mtu) {
+ -		new->tcfp_mtu = ~0;
+ +	police->tcfp_mtu = parm->mtu;
+ +	if (police->tcfp_mtu == 0) {
+ +		police->tcfp_mtu = ~0;
+  		if (R_tab)
+ -			new->tcfp_mtu = 255 << R_tab->rate.cell_log;
+ +			police->tcfp_mtu = 255 << R_tab->rate.cell_log;
+  	}
+  	if (R_tab) {
+ -		new->rate_present = true;
+ -		psched_ratecfg_precompute(&new->rate, &R_tab->rate, 0);
+ +		police->rate_present = true;
+ +		psched_ratecfg_precompute(&police->rate, &R_tab->rate, 0);
+  		qdisc_put_rtab(R_tab);
+  	} else {
+ -		new->rate_present = false;
+ +		police->rate_present = false;
+  	}
+  	if (P_tab) {
+ -		new->peak_present = true;
+ -		psched_ratecfg_precompute(&new->peak, &P_tab->rate, 0);
+ +		police->peak_present = true;
+ +		psched_ratecfg_precompute(&police->peak, &P_tab->rate, 0);
+  		qdisc_put_rtab(P_tab);
+  	} else {
+ -		new->peak_present = false;
+ +		police->peak_present = false;
+  	}
+  
+++<<<<<<< HEAD
+ +	if (tb[TCA_POLICE_RESULT])
+ +		police->tcfp_result = nla_get_u32(tb[TCA_POLICE_RESULT]);
+ +	police->tcfp_burst = PSCHED_TICKS2NS(parm->burst);
+ +	police->tcfp_toks = police->tcfp_burst;
+ +	if (police->peak_present) {
+ +		police->tcfp_mtu_ptoks = (s64) psched_l2t_ns(&police->peak,
+ +							     police->tcfp_mtu);
+ +		police->tcfp_ptoks = police->tcfp_mtu_ptoks;
+ +	}
+ +	police->tcf_action = parm->action;
+++=======
++ 	new->tcfp_burst = PSCHED_TICKS2NS(parm->burst);
++ 	if (new->peak_present)
++ 		new->tcfp_mtu_ptoks = (s64)psched_l2t_ns(&new->peak,
++ 							 new->tcfp_mtu);
+++>>>>>>> f2cbd4852820 (net/sched: act_police: fix race condition on state variables)
+  
+  	if (tb[TCA_POLICE_AVRATE])
+ -		new->tcfp_ewma_rate = nla_get_u32(tb[TCA_POLICE_AVRATE]);
+ +		police->tcfp_ewma_rate = nla_get_u32(tb[TCA_POLICE_AVRATE]);
+  
+++<<<<<<< HEAD
+++=======
++ 	if (tb[TCA_POLICE_RESULT]) {
++ 		new->tcfp_result = nla_get_u32(tb[TCA_POLICE_RESULT]);
++ 		if (TC_ACT_EXT_CMP(new->tcfp_result, TC_ACT_GOTO_CHAIN)) {
++ 			NL_SET_ERR_MSG(extack,
++ 				       "goto chain not allowed on fallback");
++ 			err = -EINVAL;
++ 			goto failure;
++ 		}
++ 	}
++ 
++ 	spin_lock_bh(&police->tcf_lock);
++ 	spin_lock_bh(&police->tcfp_lock);
++ 	police->tcfp_t_c = ktime_get_ns();
++ 	police->tcfp_toks = new->tcfp_burst;
++ 	if (new->peak_present)
++ 		police->tcfp_ptoks = new->tcfp_mtu_ptoks;
++ 	spin_unlock_bh(&police->tcfp_lock);
++ 	police->tcf_action = parm->action;
++ 	rcu_swap_protected(police->params,
++ 			   new,
++ 			   lockdep_is_held(&police->tcf_lock));
+++>>>>>>> f2cbd4852820 (net/sched: act_police: fix race condition on state variables)
+  	spin_unlock_bh(&police->tcf_lock);
+ +	if (ret != ACT_P_CREATED)
+ +		return ret;
+  
+ -	if (new)
+ -		kfree_rcu(new, rcu);
+ +	police->tcfp_t_c = ktime_get_ns();
+ +	tcf_idr_insert(tn, *a);
+  
+ -	if (ret == ACT_P_CREATED)
+ -		tcf_idr_insert(tn, *a);
+  	return ret;
+  
+  failure:
+@@@ -233,35 -261,47 +275,58 @@@ static int tcf_police_act(struct sk_buf
+  		}
+  
+  		now = ktime_get_ns();
+++<<<<<<< HEAD
+ +		toks = min_t(s64, now - police->tcfp_t_c,
+ +			     police->tcfp_burst);
+ +		if (police->peak_present) {
+ +			ptoks = toks + police->tcfp_ptoks;
+ +			if (ptoks > police->tcfp_mtu_ptoks)
+ +				ptoks = police->tcfp_mtu_ptoks;
+ +			ptoks -= (s64) psched_l2t_ns(&police->peak,
+ +						     qdisc_pkt_len(skb));
+ +		}
+ +		toks += police->tcfp_toks;
+ +		if (toks > police->tcfp_burst)
+ +			toks = police->tcfp_burst;
+ +		toks -= (s64) psched_l2t_ns(&police->rate, qdisc_pkt_len(skb));
+++=======
++ 		spin_lock_bh(&police->tcfp_lock);
++ 		toks = min_t(s64, now - police->tcfp_t_c, p->tcfp_burst);
++ 		if (p->peak_present) {
++ 			ptoks = toks + police->tcfp_ptoks;
++ 			if (ptoks > p->tcfp_mtu_ptoks)
++ 				ptoks = p->tcfp_mtu_ptoks;
++ 			ptoks -= (s64)psched_l2t_ns(&p->peak,
++ 						    qdisc_pkt_len(skb));
++ 		}
++ 		toks += police->tcfp_toks;
++ 		if (toks > p->tcfp_burst)
++ 			toks = p->tcfp_burst;
++ 		toks -= (s64)psched_l2t_ns(&p->rate, qdisc_pkt_len(skb));
+++>>>>>>> f2cbd4852820 (net/sched: act_police: fix race condition on state variables)
+  		if ((toks|ptoks) >= 0) {
+  			police->tcfp_t_c = now;
+  			police->tcfp_toks = toks;
+  			police->tcfp_ptoks = ptoks;
+++<<<<<<< HEAD
+ +			if (police->tcfp_result == TC_ACT_SHOT)
+ +				police->tcf_qstats.drops++;
+ +			spin_unlock(&police->tcf_lock);
+ +			return police->tcfp_result;
+++=======
++ 			spin_unlock_bh(&police->tcfp_lock);
++ 			ret = p->tcfp_result;
++ 			goto inc_drops;
+++>>>>>>> f2cbd4852820 (net/sched: act_police: fix race condition on state variables)
+  		}
++ 		spin_unlock_bh(&police->tcfp_lock);
+  	}
+  
+ -inc_overlimits:
+ -	qstats_overlimit_inc(this_cpu_ptr(police->common.cpu_qstats));
+ -inc_drops:
+ -	if (ret == TC_ACT_SHOT)
+ -		qstats_drop_inc(this_cpu_ptr(police->common.cpu_qstats));
+ -end:
+ -	return ret;
+ -}
+ -
+ -static void tcf_police_cleanup(struct tc_action *a)
+ -{
+ -	struct tcf_police *police = to_police(a);
+ -	struct tcf_police_params *p;
+ -
+ -	p = rcu_dereference_protected(police->params, 1);
+ -	if (p)
+ -		kfree_rcu(p, rcu);
+ +	police->tcf_qstats.overlimits++;
+ +	if (police->tcf_action == TC_ACT_SHOT)
+ +		police->tcf_qstats.drops++;
+ +	spin_unlock(&police->tcf_lock);
+ +	return police->tcf_action;
+  }
+  
+  static int tcf_police_dump(struct sk_buff *skb, struct tc_action *a,
+* Unmerged path net/sched/act_police.c
