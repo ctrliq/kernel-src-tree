@@ -1,0 +1,165 @@
+devlink: Add packet trap group parameters support
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Ido Schimmel <idosch@mellanox.com>
+commit f9f54392d2c88b34a2aaa6e51b202b3fd9c984b4
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/f9f54392.failed
+
+Packet trap groups are used to aggregate logically related packet traps.
+Currently, these groups allow user space to batch operations such as
+setting the trap action of all member traps.
+
+In order to prevent the CPU from being overwhelmed by too many trapped
+packets, it is desirable to bind a packet trap policer to these groups.
+For example, to limit all the packets that encountered an exception
+during routing to 10Kpps.
+
+Allow device drivers to bind default packet trap policers to packet trap
+groups when the latter are registered with devlink.
+
+The next patch will enable user space to change this default binding.
+
+	Signed-off-by: Ido Schimmel <idosch@mellanox.com>
+	Reviewed-by: Jiri Pirko <jiri@mellanox.com>
+	Reviewed-by: Jakub Kicinski <kuba@kernel.org>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit f9f54392d2c88b34a2aaa6e51b202b3fd9c984b4)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/mellanox/mlxsw/spectrum_trap.c
+* Unmerged path drivers/net/ethernet/mellanox/mlxsw/spectrum_trap.c
+* Unmerged path drivers/net/ethernet/mellanox/mlxsw/spectrum_trap.c
+diff --git a/drivers/net/netdevsim/dev.c b/drivers/net/netdevsim/dev.c
+index 2865d9b5336b..fa283e191c33 100644
+--- a/drivers/net/netdevsim/dev.c
++++ b/drivers/net/netdevsim/dev.c
+@@ -344,10 +344,10 @@ enum {
+ 			    NSIM_TRAP_METADATA)
+ 
+ static const struct devlink_trap_group nsim_trap_groups_arr[] = {
+-	DEVLINK_TRAP_GROUP_GENERIC(L2_DROPS),
+-	DEVLINK_TRAP_GROUP_GENERIC(L3_DROPS),
+-	DEVLINK_TRAP_GROUP_GENERIC(BUFFER_DROPS),
+-	DEVLINK_TRAP_GROUP_GENERIC(ACL_DROPS),
++	DEVLINK_TRAP_GROUP_GENERIC(L2_DROPS, 0),
++	DEVLINK_TRAP_GROUP_GENERIC(L3_DROPS, 1),
++	DEVLINK_TRAP_GROUP_GENERIC(BUFFER_DROPS, 2),
++	DEVLINK_TRAP_GROUP_GENERIC(ACL_DROPS, 3),
+ };
+ 
+ static const struct devlink_trap nsim_traps_arr[] = {
+diff --git a/include/net/devlink.h b/include/net/devlink.h
+index e6a7c522300f..830110f1588c 100644
+--- a/include/net/devlink.h
++++ b/include/net/devlink.h
+@@ -528,6 +528,7 @@ struct devlink_health_reporter_ops {
+  * @name: Trap group name.
+  * @id: Trap group identifier.
+  * @generic: Whether the trap group is generic or not.
++ * @init_policer_id: Initial policer identifier.
+  *
+  * Describes immutable attributes of packet trap groups that drivers register
+  * with devlink.
+@@ -536,6 +537,7 @@ struct devlink_trap_group {
+ 	const char *name;
+ 	u16 id;
+ 	bool generic;
++	u32 init_policer_id;
+ };
+ 
+ #define DEVLINK_TRAP_METADATA_TYPE_F_IN_PORT	BIT(0)
+@@ -640,11 +642,12 @@ enum devlink_trap_group_generic_id {
+ 		.metadata_cap = _metadata_cap,				      \
+ 	}
+ 
+-#define DEVLINK_TRAP_GROUP_GENERIC(_id)					      \
++#define DEVLINK_TRAP_GROUP_GENERIC(_id, _policer_id)			      \
+ 	{								      \
+ 		.name = DEVLINK_TRAP_GROUP_GENERIC_NAME_##_id,		      \
+ 		.id = DEVLINK_TRAP_GROUP_GENERIC_ID_##_id,		      \
+ 		.generic = true,					      \
++		.init_policer_id = _policer_id,				      \
+ 	}
+ 
+ struct devlink_ops {
+diff --git a/net/core/devlink.c b/net/core/devlink.c
+index d02f367eb501..06a58a53e334 100644
+--- a/net/core/devlink.c
++++ b/net/core/devlink.c
+@@ -5273,6 +5273,7 @@ struct devlink_stats {
+ /**
+  * struct devlink_trap_group_item - Packet trap group attributes.
+  * @group: Immutable packet trap group attributes.
++ * @policer_item: Associated policer item. Can be NULL.
+  * @list: trap_group_list member.
+  * @stats: Trap group statistics.
+  *
+@@ -5281,6 +5282,7 @@ struct devlink_stats {
+  */
+ struct devlink_trap_group_item {
+ 	const struct devlink_trap_group *group;
++	struct devlink_trap_policer_item *policer_item;
+ 	struct list_head list;
+ 	struct devlink_stats __percpu *stats;
+ };
+@@ -5669,6 +5671,11 @@ devlink_nl_trap_group_fill(struct sk_buff *msg, struct devlink *devlink,
+ 	    nla_put_flag(msg, DEVLINK_ATTR_TRAP_GENERIC))
+ 		goto nla_put_failure;
+ 
++	if (group_item->policer_item &&
++	    nla_put_u32(msg, DEVLINK_ATTR_TRAP_POLICER_ID,
++			group_item->policer_item->policer->id))
++		goto nla_put_failure;
++
+ 	err = devlink_trap_stats_put(msg, group_item->stats);
+ 	if (err)
+ 		goto nla_put_failure;
+@@ -7931,6 +7938,25 @@ void *devlink_trap_ctx_priv(void *trap_ctx)
+ }
+ EXPORT_SYMBOL_GPL(devlink_trap_ctx_priv);
+ 
++static int
++devlink_trap_group_item_policer_link(struct devlink *devlink,
++				     struct devlink_trap_group_item *group_item)
++{
++	u32 policer_id = group_item->group->init_policer_id;
++	struct devlink_trap_policer_item *policer_item;
++
++	if (policer_id == 0)
++		return 0;
++
++	policer_item = devlink_trap_policer_item_lookup(devlink, policer_id);
++	if (WARN_ON_ONCE(!policer_item))
++		return -EINVAL;
++
++	group_item->policer_item = policer_item;
++
++	return 0;
++}
++
+ static int
+ devlink_trap_group_register(struct devlink *devlink,
+ 			    const struct devlink_trap_group *group)
+@@ -7953,6 +7979,10 @@ devlink_trap_group_register(struct devlink *devlink,
+ 
+ 	group_item->group = group;
+ 
++	err = devlink_trap_group_item_policer_link(devlink, group_item);
++	if (err)
++		goto err_policer_link;
++
+ 	if (devlink->ops->trap_group_init) {
+ 		err = devlink->ops->trap_group_init(devlink, group);
+ 		if (err)
+@@ -7966,6 +7996,7 @@ devlink_trap_group_register(struct devlink *devlink,
+ 	return 0;
+ 
+ err_group_init:
++err_policer_link:
+ 	free_percpu(group_item->stats);
+ err_stats_alloc:
+ 	kfree(group_item);
