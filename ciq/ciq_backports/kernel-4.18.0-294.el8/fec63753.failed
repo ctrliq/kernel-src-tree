@@ -1,0 +1,209 @@
+selinux: fix a missing-check bug in selinux_sb_eat_lsm_opts()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Gen Zhang <blackgod016574@gmail.com>
+commit fec6375320c6399c708fa9801f8cfbf950fee623
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/fec63753.failed
+
+In selinux_sb_eat_lsm_opts(), 'arg' is allocated by kmemdup_nul(). It
+returns NULL when fails. So 'arg' should be checked. And 'mnt_opts'
+should be freed when error.
+
+	Signed-off-by: Gen Zhang <blackgod016574@gmail.com>
+Fixes: 99dbbb593fe6 ("selinux: rewrite selinux_sb_eat_lsm_opts()")
+	Cc: <stable@vger.kernel.org>
+	Signed-off-by: Paul Moore <paul@paul-moore.com>
+(cherry picked from commit fec6375320c6399c708fa9801f8cfbf950fee623)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	security/selinux/hooks.c
+diff --cc security/selinux/hooks.c
+index 42145010da10,fea66f6b31bf..000000000000
+--- a/security/selinux/hooks.c
++++ b/security/selinux/hooks.c
+@@@ -2670,103 -2605,87 +2670,157 @@@ static void selinux_sb_free_security(st
+  	superblock_free_security(sb);
+  }
+  
+ -static inline int opt_len(const char *s)
+ +static inline int match_prefix(char *prefix, int plen, char *option, int olen)
+  {
+ -	bool open_quote = false;
+ -	int len;
+ -	char c;
+ +	if (plen > olen)
+ +		return 0;
+  
+ -	for (len = 0; (c = s[len]) != '\0'; len++) {
+ -		if (c == '"')
+ -			open_quote = !open_quote;
+ -		if (c == ',' && !open_quote)
+ -			break;
+ -	}
+ -	return len;
+ +	return !memcmp(prefix, option, plen);
+  }
+  
+ -static int selinux_sb_eat_lsm_opts(char *options, void **mnt_opts)
+ +static inline int selinux_option(char *option, int len)
+  {
+++<<<<<<< HEAD
+ +	return (match_prefix(CONTEXT_STR, sizeof(CONTEXT_STR)-1, option, len) ||
+ +		match_prefix(FSCONTEXT_STR, sizeof(FSCONTEXT_STR)-1, option, len) ||
+ +		match_prefix(DEFCONTEXT_STR, sizeof(DEFCONTEXT_STR)-1, option, len) ||
+ +		match_prefix(ROOTCONTEXT_STR, sizeof(ROOTCONTEXT_STR)-1, option, len) ||
+ +		match_prefix(LABELSUPP_STR, sizeof(LABELSUPP_STR)-1, option, len));
+ +}
+ +
+ +static inline void take_option(char **to, char *from, int *first, int len)
+ +{
+ +	if (!*first) {
+ +		**to = ',';
+ +		*to += 1;
+ +	} else
+ +		*first = 0;
+ +	memcpy(*to, from, len);
+ +	*to += len;
+ +}
+++=======
++ 	char *from = options;
++ 	char *to = options;
++ 	bool first = true;
++ 	int rc;
++ 
++ 	while (1) {
++ 		int len = opt_len(from);
++ 		int token;
++ 		char *arg = NULL;
+++>>>>>>> fec6375320c6 (selinux: fix a missing-check bug in selinux_sb_eat_lsm_opts())
+  
+ -		token = match_opt_prefix(from, len, &arg);
+ -
+ -		if (token != Opt_error) {
+ -			char *p, *q;
+ +static inline void take_selinux_option(char **to, char *from, int *first,
+ +				       int len)
+ +{
+ +	int current_size = 0;
+  
+ +	if (!*first) {
+ +		**to = '|';
+ +		*to += 1;
+ +	} else
+ +		*first = 0;
+ +
+++<<<<<<< HEAD
+ +	while (current_size < len) {
+ +		if (*from != '"') {
+ +			**to = *from;
+ +			*to += 1;
+++=======
++ 			/* strip quotes */
++ 			if (arg) {
++ 				for (p = q = arg; p < from + len; p++) {
++ 					char c = *p;
++ 					if (c != '"')
++ 						*q++ = c;
++ 				}
++ 				arg = kmemdup_nul(arg, q - arg, GFP_KERNEL);
++ 				if (!arg) {
++ 					rc = -ENOMEM;
++ 					goto free_opt;
++ 				}
++ 			}
++ 			rc = selinux_add_opt(token, arg, mnt_opts);
++ 			if (unlikely(rc)) {
++ 				kfree(arg);
++ 				goto free_opt;
++ 			}
++ 		} else {
++ 			if (!first) {	// copy with preceding comma
++ 				from--;
++ 				len++;
++ 			}
++ 			if (to != from)
++ 				memmove(to, from, len);
++ 			to += len;
++ 			first = false;
+++>>>>>>> fec6375320c6 (selinux: fix a missing-check bug in selinux_sb_eat_lsm_opts())
+  		}
+ -		if (!from[len])
+ -			break;
+ -		from += len + 1;
+ +		from += 1;
+ +		current_size += 1;
+  	}
+++<<<<<<< HEAD
+++=======
++ 	*to = '\0';
++ 	return 0;
++ 
++ free_opt:
++ 	if (*mnt_opts) {
++ 		selinux_free_mnt_opts(*mnt_opts);
++ 		*mnt_opts = NULL;
++ 	}
++ 	return rc;
+++>>>>>>> fec6375320c6 (selinux: fix a missing-check bug in selinux_sb_eat_lsm_opts())
+ +}
+ +
+ +static int selinux_sb_copy_data(char *orig, char *copy)
+ +{
+ +	int fnosec, fsec, rc = 0;
+ +	char *in_save, *in_curr, *in_end;
+ +	char *sec_curr, *nosec_save, *nosec;
+ +	int open_quote = 0;
+ +
+ +	in_curr = orig;
+ +	sec_curr = copy;
+ +
+ +	nosec = (char *)get_zeroed_page(GFP_KERNEL);
+ +	if (!nosec) {
+ +		rc = -ENOMEM;
+ +		goto out;
+ +	}
+ +
+ +	nosec_save = nosec;
+ +	fnosec = fsec = 1;
+ +	in_save = in_end = orig;
+ +
+ +	do {
+ +		if (*in_end == '"')
+ +			open_quote = !open_quote;
+ +		if ((*in_end == ',' && open_quote == 0) ||
+ +				*in_end == '\0') {
+ +			int len = in_end - in_curr;
+ +
+ +			if (selinux_option(in_curr, len))
+ +				take_selinux_option(&sec_curr, in_curr, &fsec, len);
+ +			else
+ +				take_option(&nosec, in_curr, &fnosec, len);
+ +
+ +			in_curr = in_end + 1;
+ +		}
+ +	} while (*in_end++);
+ +
+ +	strcpy(in_save, nosec_save);
+ +	free_page((unsigned long)nosec_save);
+ +out:
+ +	return rc;
+  }
+  
+ -static int selinux_sb_remount(struct super_block *sb, void *mnt_opts)
+ +static int selinux_sb_remount(struct super_block *sb,
+ +			      struct security_mnt_opts *opts)
+  {
+ -	struct selinux_mnt_opts *opts = mnt_opts;
+ +	int i, *flags;
+ +	char **mount_options;
+  	struct superblock_security_struct *sbsec = sb->s_security;
+ -	u32 sid;
+ -	int rc;
+  
+  	if (!(sbsec->flags & SE_SBINITIALIZED))
+  		return 0;
+* Unmerged path security/selinux/hooks.c
