@@ -1,0 +1,190 @@
+tipc: reduce duplicate packets for unicast traffic
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-147.el8
+commit-author Tuong Lien <tuong.t.lien@dektech.com.au>
+commit 382f598fb66b14a8451f2794abf70ea7b5826c96
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-147.el8/382f598f.failed
+
+For unicast transmission, the current NACK sending althorithm is over-
+active that forces the sending side to retransmit a packet that is not
+really lost but just arrived at the receiving side with some delay, or
+even retransmit same packets that have already been retransmitted
+before. As a result, many duplicates are observed also under normal
+condition, ie. without packet loss.
+
+One example case is: node1 transmits 1 2 3 4 10 5 6 7 8 9, when node2
+receives packet #10, it puts into the deferdq. When the packet #5 comes
+it sends NACK with gap [6 - 9]. However, shortly after that, when
+packet #6 arrives, it pulls out packet #10 from the deferfq, but it is
+still out of order, so it makes another NACK with gap [7 - 9] and so on
+... Finally, node1 has to retransmit the packets 5 6 7 8 9 a number of
+times, but in fact all the packets are not lost at all, so duplicates!
+
+This commit reduces duplicates by changing the condition to send NACK,
+also restricting the retransmissions on individual packets via a timer
+of about 1ms. However, it also needs to say that too tricky condition
+for NACKs or too long timeout value for retransmissions will result in
+performance reducing! The criterias in this commit are found to be
+effective for both the requirements to reduce duplicates but not affect
+performance.
+
+The tipc_link_rcv() is also improved to only dequeue skb from the link
+deferdq if it is expected (ie. its seqno <= rcv_nxt).
+
+	Acked-by: Ying Xue <ying.xue@windriver.com>
+	Acked-by: Jon Maloy <jon.maloy@ericsson.com>
+	Signed-off-by: Tuong Lien <tuong.t.lien@dektech.com.au>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 382f598fb66b14a8451f2794abf70ea7b5826c96)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/tipc/link.c
+diff --cc net/tipc/link.c
+index 37c9f30e5190,1f2cde0d025f..000000000000
+--- a/net/tipc/link.c
++++ b/net/tipc/link.c
+@@@ -1204,6 -1231,106 +1205,109 @@@ static bool tipc_link_release_pkts(stru
+  	return released;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ /* tipc_build_gap_ack_blks - build Gap ACK blocks
++  * @l: tipc link that data have come with gaps in sequence if any
++  * @data: data buffer to store the Gap ACK blocks after built
++  *
++  * returns the actual allocated memory size
++  */
++ static u16 tipc_build_gap_ack_blks(struct tipc_link *l, void *data)
++ {
++ 	struct sk_buff *skb = skb_peek(&l->deferdq);
++ 	struct tipc_gap_ack_blks *ga = data;
++ 	u16 len, expect, seqno = 0;
++ 	u8 n = 0;
++ 
++ 	if (!skb)
++ 		goto exit;
++ 
++ 	expect = buf_seqno(skb);
++ 	skb_queue_walk(&l->deferdq, skb) {
++ 		seqno = buf_seqno(skb);
++ 		if (unlikely(more(seqno, expect))) {
++ 			ga->gacks[n].ack = htons(expect - 1);
++ 			ga->gacks[n].gap = htons(seqno - expect);
++ 			if (++n >= MAX_GAP_ACK_BLKS) {
++ 				pr_info_ratelimited("Too few Gap ACK blocks!\n");
++ 				goto exit;
++ 			}
++ 		} else if (unlikely(less(seqno, expect))) {
++ 			pr_warn("Unexpected skb in deferdq!\n");
++ 			continue;
++ 		}
++ 		expect = seqno + 1;
++ 	}
++ 
++ 	/* last block */
++ 	ga->gacks[n].ack = htons(seqno);
++ 	ga->gacks[n].gap = 0;
++ 	n++;
++ 
++ exit:
++ 	len = tipc_gap_ack_blks_sz(n);
++ 	ga->len = htons(len);
++ 	ga->gack_cnt = n;
++ 	return len;
++ }
++ 
++ /* tipc_link_advance_transmq - advance TIPC link transmq queue by releasing
++  *			       acked packets, also doing retransmissions if
++  *			       gaps found
++  * @l: tipc link with transmq queue to be advanced
++  * @acked: seqno of last packet acked by peer without any gaps before
++  * @gap: # of gap packets
++  * @ga: buffer pointer to Gap ACK blocks from peer
++  * @xmitq: queue for accumulating the retransmitted packets if any
++  */
++ static void tipc_link_advance_transmq(struct tipc_link *l, u16 acked, u16 gap,
++ 				      struct tipc_gap_ack_blks *ga,
++ 				      struct sk_buff_head *xmitq)
++ {
++ 	struct sk_buff *skb, *_skb, *tmp;
++ 	struct tipc_msg *hdr;
++ 	u16 bc_ack = l->bc_rcvlink->rcv_nxt - 1;
++ 	u16 ack = l->rcv_nxt - 1;
++ 	u16 seqno;
++ 	u16 n = 0;
++ 
++ 	skb_queue_walk_safe(&l->transmq, skb, tmp) {
++ 		seqno = buf_seqno(skb);
++ 
++ next_gap_ack:
++ 		if (less_eq(seqno, acked)) {
++ 			/* release skb */
++ 			__skb_unlink(skb, &l->transmq);
++ 			kfree_skb(skb);
++ 		} else if (less_eq(seqno, acked + gap)) {
++ 			/* retransmit skb */
++ 			if (time_before(jiffies, TIPC_SKB_CB(skb)->nxt_retr))
++ 				continue;
++ 			TIPC_SKB_CB(skb)->nxt_retr = TIPC_UC_RETR_TIME;
++ 
++ 			_skb = __pskb_copy(skb, MIN_H_SIZE, GFP_ATOMIC);
++ 			if (!_skb)
++ 				continue;
++ 			hdr = buf_msg(_skb);
++ 			msg_set_ack(hdr, ack);
++ 			msg_set_bcast_ack(hdr, bc_ack);
++ 			_skb->priority = TC_PRIO_CONTROL;
++ 			__skb_queue_tail(xmitq, _skb);
++ 			l->stats.retransmitted++;
++ 		} else {
++ 			/* retry with Gap ACK blocks if any */
++ 			if (!ga || n >= ga->gack_cnt)
++ 				break;
++ 			acked = ntohs(ga->gacks[n].ack);
++ 			gap = ntohs(ga->gacks[n].gap);
++ 			n++;
++ 			goto next_gap_ack;
++ 		}
++ 	}
++ }
++ 
+++>>>>>>> 382f598fb66b (tipc: reduce duplicate packets for unicast traffic)
+  /* tipc_link_build_state_msg: prepare link state message for transmission
+   *
+   * Note that sending of broadcast ack is coordinated among nodes, to reduce
+* Unmerged path net/tipc/link.c
+diff --git a/net/tipc/msg.h b/net/tipc/msg.h
+index 70ddff2206a0..5d465106c8f7 100644
+--- a/net/tipc/msg.h
++++ b/net/tipc/msg.h
+@@ -1098,4 +1098,25 @@ static inline void tipc_skb_queue_splice_tail_init(struct sk_buff_head *list,
+ 	tipc_skb_queue_splice_tail(&tmp, head);
+ }
+ 
++/* __tipc_skb_dequeue() - dequeue the head skb according to expected seqno
++ * @list: list to be dequeued from
++ * @seqno: seqno of the expected msg
++ *
++ * returns skb dequeued from the list if its seqno is less than or equal to
++ * the expected one, otherwise the skb is still hold
++ *
++ * Note: must be used with appropriate locks held only
++ */
++static inline struct sk_buff *__tipc_skb_dequeue(struct sk_buff_head *list,
++						 u16 seqno)
++{
++	struct sk_buff *skb = skb_peek(list);
++
++	if (skb && less_eq(buf_seqno(skb), seqno)) {
++		__skb_unlink(skb, list);
++		return skb;
++	}
++	return NULL;
++}
++
+ #endif
