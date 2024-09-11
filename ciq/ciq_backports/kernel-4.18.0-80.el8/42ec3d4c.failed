@@ -1,0 +1,647 @@
+vfs: make remap_file_range functions take and return bytes completed
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-80.el8
+commit-author Darrick J. Wong <darrick.wong@oracle.com>
+commit 42ec3d4c02187a18e27ff94b409ec27234bf2ffd
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-80.el8/42ec3d4c.failed
+
+Change the remap_file_range functions to take a number of bytes to
+operate upon and return the number of bytes they operated on.  This is a
+requirement for allowing fs implementations to return short clone/dedupe
+results to the user, which will enable us to obey resource limits in a
+graceful manner.
+
+A subsequent patch will enable copy_file_range to signal to the
+->clone_file_range implementation that it can handle a short length,
+which will be returned in the function's return value.  For now the
+short return is not implemented anywhere so the behavior won't change --
+either copy_file_range manages to clone the entire range or it tries an
+alternative.
+
+Neither clone ioctl can take advantage of this, alas.
+
+	Signed-off-by: Darrick J. Wong <darrick.wong@oracle.com>
+	Reviewed-by: Amir Goldstein <amir73il@gmail.com>
+	Signed-off-by: Dave Chinner <david@fromorbit.com>
+
+(cherry picked from commit 42ec3d4c02187a18e27ff94b409ec27234bf2ffd)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	Documentation/filesystems/vfs.txt
+#	fs/btrfs/ctree.h
+#	fs/btrfs/ioctl.c
+#	fs/cifs/cifsfs.c
+#	fs/nfs/nfs4file.c
+#	fs/ocfs2/file.c
+#	fs/ocfs2/refcounttree.c
+#	fs/ocfs2/refcounttree.h
+#	fs/overlayfs/file.c
+#	fs/read_write.c
+#	fs/xfs/xfs_file.c
+#	fs/xfs/xfs_reflink.c
+#	fs/xfs/xfs_reflink.h
+#	include/linux/fs.h
+#	mm/filemap.c
+diff --cc Documentation/filesystems/vfs.txt
+index be4090e00997,1bd2919deaca..000000000000
+--- a/Documentation/filesystems/vfs.txt
++++ b/Documentation/filesystems/vfs.txt
+@@@ -881,8 -883,9 +881,14 @@@ struct file_operations 
+  	unsigned (*mmap_capabilities)(struct file *);
+  #endif
+  	ssize_t (*copy_file_range)(struct file *, loff_t, struct file *, loff_t, size_t, unsigned int);
+++<<<<<<< HEAD
+ +	int (*clone_file_range)(struct file *, loff_t, struct file *, loff_t, u64);
+ +	int (*dedupe_file_range)(struct file *, loff_t, struct file *, loff_t, u64);
+++=======
++ 	loff_t (*remap_file_range)(struct file *file_in, loff_t pos_in,
++ 				   struct file *file_out, loff_t pos_out,
++ 				   loff_t len, unsigned int remap_flags);
+++>>>>>>> 42ec3d4c0218 (vfs: make remap_file_range functions take and return bytes completed)
+  	int (*fadvise)(struct file *, loff_t, loff_t, int);
+  };
+  
+@@@ -958,11 -961,16 +964,24 @@@ otherwise noted
+  
+    copy_file_range: called by the copy_file_range(2) system call.
+  
+++<<<<<<< HEAD
+ +  clone_file_range: called by the ioctl(2) system call for FICLONERANGE and
+ +	FICLONE commands.
+ +
+ +  dedupe_file_range: called by the ioctl(2) system call for FIDEDUPERANGE
+ +	command.
+++=======
++   remap_file_range: called by the ioctl(2) system call for FICLONERANGE and
++ 	FICLONE and FIDEDUPERANGE commands to remap file ranges.  An
++ 	implementation should remap len bytes at pos_in of the source file into
++ 	the dest file at pos_out.  Implementations must handle callers passing
++ 	in len == 0; this means "remap to the end of the source file".  The
++ 	return value should the number of bytes remapped, or the usual
++ 	negative error code if errors occurred before any bytes were remapped.
++ 	The remap_flags parameter accepts REMAP_FILE_* flags.  If
++ 	REMAP_FILE_DEDUP is set then the implementation must only remap if the
++ 	requested file ranges have identical contents.
+++>>>>>>> 42ec3d4c0218 (vfs: make remap_file_range functions take and return bytes completed)
+  
+    fadvise: possibly called by the fadvise64() system call.
+  
+diff --cc fs/btrfs/ctree.h
+index d9d924017dfb,771a961d77ad..000000000000
+--- a/fs/btrfs/ctree.h
++++ b/fs/btrfs/ctree.h
+@@@ -3279,8 -3247,9 +3279,14 @@@ int btrfs_dirty_pages(struct inode *ino
+  		      size_t num_pages, loff_t pos, size_t write_bytes,
+  		      struct extent_state **cached);
+  int btrfs_fdatawrite_range(struct inode *inode, loff_t start, loff_t end);
+++<<<<<<< HEAD
+ +int btrfs_clone_file_range(struct file *file_in, loff_t pos_in,
+ +			   struct file *file_out, loff_t pos_out, u64 len);
+++=======
++ loff_t btrfs_remap_file_range(struct file *file_in, loff_t pos_in,
++ 			      struct file *file_out, loff_t pos_out,
++ 			      loff_t len, unsigned int remap_flags);
+++>>>>>>> 42ec3d4c0218 (vfs: make remap_file_range functions take and return bytes completed)
+  
+  /* tree-defrag.c */
+  int btrfs_defrag_leaves(struct btrfs_trans_handle *trans,
+diff --cc fs/btrfs/ioctl.c
+index 0247fc645c95,b0c513e10977..000000000000
+--- a/fs/btrfs/ioctl.c
++++ b/fs/btrfs/ioctl.c
+@@@ -4323,10 -4328,34 +4323,41 @@@ out_unlock
+  	return ret;
+  }
+  
+++<<<<<<< HEAD
+ +int btrfs_clone_file_range(struct file *src_file, loff_t off,
+ +		struct file *dst_file, loff_t destoff, u64 len)
+ +{
+ +	return btrfs_clone_files(dst_file, src_file, off, len, destoff);
+++=======
++ loff_t btrfs_remap_file_range(struct file *src_file, loff_t off,
++ 		struct file *dst_file, loff_t destoff, loff_t len,
++ 		unsigned int remap_flags)
++ {
++ 	int ret;
++ 
++ 	if (remap_flags & ~(REMAP_FILE_DEDUP | REMAP_FILE_ADVISORY))
++ 		return -EINVAL;
++ 
++ 	if (remap_flags & REMAP_FILE_DEDUP) {
++ 		struct inode *src = file_inode(src_file);
++ 		struct inode *dst = file_inode(dst_file);
++ 		u64 bs = BTRFS_I(src)->root->fs_info->sb->s_blocksize;
++ 
++ 		if (WARN_ON_ONCE(bs < PAGE_SIZE)) {
++ 			/*
++ 			 * Btrfs does not support blocksize < page_size. As a
++ 			 * result, btrfs_cmp_data() won't correctly handle
++ 			 * this situation without an update.
++ 			 */
++ 			return -EINVAL;
++ 		}
++ 
++ 		ret = btrfs_extent_same(src, off, len, dst, destoff);
++ 	} else {
++ 		ret = btrfs_clone_files(dst_file, src_file, off, len, destoff);
++ 	}
++ 	return ret < 0 ? ret : len;
+++>>>>>>> 42ec3d4c0218 (vfs: make remap_file_range functions take and return bytes completed)
+  }
+  
+  static long btrfs_ioctl_default_subvol(struct file *file, void __user *argp)
+diff --cc fs/cifs/cifsfs.c
+index 47079645672a,5ca71c6c8be2..000000000000
+--- a/fs/cifs/cifsfs.c
++++ b/fs/cifs/cifsfs.c
+@@@ -968,8 -975,9 +968,14 @@@ const struct inode_operations cifs_syml
+  	.listxattr = cifs_listxattr,
+  };
+  
+++<<<<<<< HEAD
+ +static int cifs_clone_file_range(struct file *src_file, loff_t off,
+ +		struct file *dst_file, loff_t destoff, u64 len)
+++=======
++ static loff_t cifs_remap_file_range(struct file *src_file, loff_t off,
++ 		struct file *dst_file, loff_t destoff, loff_t len,
++ 		unsigned int remap_flags)
+++>>>>>>> 42ec3d4c0218 (vfs: make remap_file_range functions take and return bytes completed)
+  {
+  	struct inode *src_inode = file_inode(src_file);
+  	struct inode *target_inode = file_inode(dst_file);
+diff --cc fs/nfs/nfs4file.c
+index 6b3b372b59b9,46d691ba04bc..000000000000
+--- a/fs/nfs/nfs4file.c
++++ b/fs/nfs/nfs4file.c
+@@@ -174,8 -180,9 +174,14 @@@ static long nfs42_fallocate(struct fil
+  	return nfs42_proc_allocate(filep, offset, len);
+  }
+  
+++<<<<<<< HEAD
+ +static int nfs42_clone_file_range(struct file *src_file, loff_t src_off,
+ +		struct file *dst_file, loff_t dst_off, u64 count)
+++=======
++ static loff_t nfs42_remap_file_range(struct file *src_file, loff_t src_off,
++ 		struct file *dst_file, loff_t dst_off, loff_t count,
++ 		unsigned int remap_flags)
+++>>>>>>> 42ec3d4c0218 (vfs: make remap_file_range functions take and return bytes completed)
+  {
+  	struct inode *dst_inode = file_inode(dst_file);
+  	struct nfs_server *server = NFS_SERVER(dst_inode);
+diff --cc fs/ocfs2/file.c
+index 9fa35cb6f6e0,fbaeafe44b5f..000000000000
+--- a/fs/ocfs2/file.c
++++ b/fs/ocfs2/file.c
+@@@ -2527,24 -2527,18 +2527,39 @@@ out
+  	return offset;
+  }
+  
+++<<<<<<< HEAD
+ +static int ocfs2_file_clone_range(struct file *file_in,
+ +				  loff_t pos_in,
+ +				  struct file *file_out,
+ +				  loff_t pos_out,
+ +				  u64 len)
+ +{
+ +	return ocfs2_reflink_remap_range(file_in, pos_in, file_out, pos_out,
+ +					 len, false);
+ +}
+ +
+ +static int ocfs2_file_dedupe_range(struct file *file_in,
+ +				   loff_t pos_in,
+ +				   struct file *file_out,
+ +				   loff_t pos_out,
+ +				   u64 len)
+ +{
+ +	return ocfs2_reflink_remap_range(file_in, pos_in, file_out, pos_out,
+ +					  len, true);
+++=======
++ static loff_t ocfs2_remap_file_range(struct file *file_in, loff_t pos_in,
++ 				     struct file *file_out, loff_t pos_out,
++ 				     loff_t len, unsigned int remap_flags)
++ {
++ 	int ret;
++ 
++ 	if (remap_flags & ~(REMAP_FILE_DEDUP | REMAP_FILE_ADVISORY))
++ 		return -EINVAL;
++ 
++ 	ret = ocfs2_reflink_remap_range(file_in, pos_in, file_out, pos_out,
++ 					len, remap_flags);
++ 	return ret < 0 ? ret : len;
+++>>>>>>> 42ec3d4c0218 (vfs: make remap_file_range functions take and return bytes completed)
+  }
+  
+  const struct inode_operations ocfs2_file_iops = {
+diff --cc fs/ocfs2/refcounttree.c
+index 35fa3d6d96ae,6a42c04ac0ab..000000000000
+--- a/fs/ocfs2/refcounttree.c
++++ b/fs/ocfs2/refcounttree.c
+@@@ -4816,8 -4824,8 +4816,13 @@@ int ocfs2_reflink_remap_range(struct fi
+  			      loff_t pos_in,
+  			      struct file *file_out,
+  			      loff_t pos_out,
+++<<<<<<< HEAD
+ +			      u64 len,
+ +			      bool is_dedupe)
+++=======
++ 			      loff_t len,
++ 			      unsigned int remap_flags)
+++>>>>>>> 42ec3d4c0218 (vfs: make remap_file_range functions take and return bytes completed)
+  {
+  	struct inode *inode_in = file_inode(file_in);
+  	struct inode *inode_out = file_inode(file_out);
+diff --cc fs/ocfs2/refcounttree.h
+index 4af55bf4b35b,eb65c1d0843c..000000000000
+--- a/fs/ocfs2/refcounttree.h
++++ b/fs/ocfs2/refcounttree.h
+@@@ -119,7 -119,7 +119,12 @@@ int ocfs2_reflink_remap_range(struct fi
+  			      loff_t pos_in,
+  			      struct file *file_out,
+  			      loff_t pos_out,
+++<<<<<<< HEAD
+ +			      u64 len,
+ +			      bool is_dedupe);
+++=======
++ 			      loff_t len,
++ 			      unsigned int remap_flags);
+++>>>>>>> 42ec3d4c0218 (vfs: make remap_file_range functions take and return bytes completed)
+  
+  #endif /* OCFS2_REFCOUNTTREE_H */
+diff --cc fs/overlayfs/file.c
+index 986313da0c88,6c3fec6168e9..000000000000
+--- a/fs/overlayfs/file.c
++++ b/fs/overlayfs/file.c
+@@@ -489,16 -489,20 +489,22 @@@ static ssize_t ovl_copy_file_range(stru
+  			    OVL_COPY);
+  }
+  
+++<<<<<<< HEAD
+ +static int ovl_clone_file_range(struct file *file_in, loff_t pos_in,
+ +				struct file *file_out, loff_t pos_out, u64 len)
+++=======
++ static loff_t ovl_remap_file_range(struct file *file_in, loff_t pos_in,
++ 				   struct file *file_out, loff_t pos_out,
++ 				   loff_t len, unsigned int remap_flags)
+++>>>>>>> 42ec3d4c0218 (vfs: make remap_file_range functions take and return bytes completed)
+  {
+ -	enum ovl_copyop op;
+ -
+ -	if (remap_flags & ~(REMAP_FILE_DEDUP | REMAP_FILE_ADVISORY))
+ -		return -EINVAL;
+ -
+ -	if (remap_flags & REMAP_FILE_DEDUP)
+ -		op = OVL_DEDUPE;
+ -	else
+ -		op = OVL_CLONE;
+ +	return ovl_copyfile(file_in, pos_in, file_out, pos_out, len, 0,
+ +			    OVL_CLONE);
+ +}
+  
+ +static int ovl_dedupe_file_range(struct file *file_in, loff_t pos_in,
+ +				 struct file *file_out, loff_t pos_out, u64 len)
+ +{
+  	/*
+  	 * Don't copy up because of a dedupe request, this wouldn't make sense
+  	 * most of the time (data would be duplicated instead of deduplicated).
+diff --cc fs/read_write.c
+index 734c5661fb69,356641afa487..000000000000
+--- a/fs/read_write.c
++++ b/fs/read_write.c
+@@@ -1588,11 -1588,14 +1588,22 @@@ ssize_t vfs_copy_file_range(struct fil
+  	 * Try cloning first, this is supported by more file systems, and
+  	 * more efficient if both clone and copy are supported (e.g. NFS).
+  	 */
+++<<<<<<< HEAD
+ +	if (file_in->f_op->clone_file_range) {
+ +		ret = file_in->f_op->clone_file_range(file_in, pos_in,
+ +				file_out, pos_out, len);
+ +		if (ret == 0) {
+ +			ret = len;
+++=======
++ 	if (file_in->f_op->remap_file_range) {
++ 		loff_t cloned;
++ 
++ 		cloned = file_in->f_op->remap_file_range(file_in, pos_in,
++ 				file_out, pos_out,
++ 				min_t(loff_t, MAX_RW_COUNT, len), 0);
++ 		if (cloned > 0) {
++ 			ret = cloned;
+++>>>>>>> 42ec3d4c0218 (vfs: make remap_file_range functions take and return bytes completed)
+  			goto done;
+  		}
+  	}
+@@@ -1721,8 -1725,8 +1733,13 @@@ static int remap_verify_area(struct fil
+  static int generic_remap_check_len(struct inode *inode_in,
+  				   struct inode *inode_out,
+  				   loff_t pos_out,
+++<<<<<<< HEAD
+ +				   u64 *len,
+ +				   bool is_dedupe)
+++=======
++ 				   loff_t *len,
++ 				   unsigned int remap_flags)
+++>>>>>>> 42ec3d4c0218 (vfs: make remap_file_range functions take and return bytes completed)
+  {
+  	u64 blkmask = i_blocksize(inode_in) - 1;
+  
+@@@ -1747,7 -1751,7 +1764,11 @@@
+   */
+  int generic_remap_file_range_prep(struct file *file_in, loff_t pos_in,
+  				  struct file *file_out, loff_t pos_out,
+++<<<<<<< HEAD
+ +				  u64 *len, bool is_dedupe)
+++=======
++ 				  loff_t *len, unsigned int remap_flags)
+++>>>>>>> 42ec3d4c0218 (vfs: make remap_file_range functions take and return bytes completed)
+  {
+  	struct inode *inode_in = file_inode(file_in);
+  	struct inode *inode_out = file_inode(file_out);
+@@@ -1860,13 -1883,13 +1881,22 @@@ loff_t do_clone_file_range(struct file 
+  	if (ret)
+  		return ret;
+  
+++<<<<<<< HEAD
+ +	ret = file_in->f_op->clone_file_range(file_in, pos_in,
+ +			file_out, pos_out, len);
+ +	if (!ret) {
+ +		fsnotify_access(file_in);
+ +		fsnotify_modify(file_out);
+ +	}
+++=======
++ 	ret = file_in->f_op->remap_file_range(file_in, pos_in,
++ 			file_out, pos_out, len, 0);
++ 	if (ret < 0)
++ 		return ret;
+++>>>>>>> 42ec3d4c0218 (vfs: make remap_file_range functions take and return bytes completed)
+  
++ 	fsnotify_access(file_in);
++ 	fsnotify_modify(file_out);
+  	return ret;
+  }
+  EXPORT_SYMBOL(do_clone_file_range);
+diff --cc fs/xfs/xfs_file.c
+index 61a5ad2600e8,38fde4e11714..000000000000
+--- a/fs/xfs/xfs_file.c
++++ b/fs/xfs/xfs_file.c
+@@@ -919,28 -919,23 +919,47 @@@ out_unlock
+  	return error;
+  }
+  
+++<<<<<<< HEAD
+ +STATIC int
+ +xfs_file_clone_range(
+++=======
++ STATIC loff_t
++ xfs_file_remap_range(
+++>>>>>>> 42ec3d4c0218 (vfs: make remap_file_range functions take and return bytes completed)
+ +	struct file	*file_in,
+ +	loff_t		pos_in,
+ +	struct file	*file_out,
+ +	loff_t		pos_out,
+++<<<<<<< HEAD
+ +	u64		len)
+ +{
+ +	return xfs_reflink_remap_range(file_in, pos_in, file_out, pos_out,
+ +				     len, false);
+ +}
+ +
+ +STATIC int
+ +xfs_file_dedupe_range(
+  	struct file	*file_in,
+  	loff_t		pos_in,
+  	struct file	*file_out,
+  	loff_t		pos_out,
+ +	u64		len)
+ +{
+ +	return xfs_reflink_remap_range(file_in, pos_in, file_out, pos_out,
+ +				     len, true);
+++=======
++ 	loff_t		len,
++ 	unsigned int	remap_flags)
++ {
++ 	int		ret;
++ 
++ 	if (remap_flags & ~(REMAP_FILE_DEDUP | REMAP_FILE_ADVISORY))
++ 		return -EINVAL;
++ 
++ 	ret = xfs_reflink_remap_range(file_in, pos_in, file_out, pos_out,
++ 			len, remap_flags);
++ 	return ret < 0 ? ret : len;
+++>>>>>>> 42ec3d4c0218 (vfs: make remap_file_range functions take and return bytes completed)
+  }
+  
+  STATIC int
+diff --cc fs/xfs/xfs_reflink.c
+index a7757a128a78,3dbe5fb7e9c0..000000000000
+--- a/fs/xfs/xfs_reflink.c
++++ b/fs/xfs/xfs_reflink.c
+@@@ -1295,8 -1296,8 +1295,13 @@@ xfs_reflink_remap_prep
+  	loff_t			pos_in,
+  	struct file		*file_out,
+  	loff_t			pos_out,
+++<<<<<<< HEAD
+ +	u64			*len,
+ +	bool			is_dedupe)
+++=======
++ 	loff_t			*len,
++ 	unsigned int		remap_flags)
+++>>>>>>> 42ec3d4c0218 (vfs: make remap_file_range functions take and return bytes completed)
+  {
+  	struct inode		*inode_in = file_inode(file_in);
+  	struct xfs_inode	*src = XFS_I(inode_in);
+@@@ -1409,8 -1387,8 +1414,13 @@@ xfs_reflink_remap_range
+  	loff_t			pos_in,
+  	struct file		*file_out,
+  	loff_t			pos_out,
+++<<<<<<< HEAD
+ +	u64			len,
+ +	bool			is_dedupe)
+++=======
++ 	loff_t			len,
++ 	unsigned int		remap_flags)
+++>>>>>>> 42ec3d4c0218 (vfs: make remap_file_range functions take and return bytes completed)
+  {
+  	struct inode		*inode_in = file_inode(file_in);
+  	struct xfs_inode	*src = XFS_I(inode_in);
+diff --cc fs/xfs/xfs_reflink.h
+index c585ad9552b2,c3c46c276fe1..000000000000
+--- a/fs/xfs/xfs_reflink.h
++++ b/fs/xfs/xfs_reflink.h
+@@@ -28,7 -28,8 +28,12 @@@ extern int xfs_reflink_end_cow(struct x
+  		xfs_off_t count);
+  extern int xfs_reflink_recover_cow(struct xfs_mount *mp);
+  extern int xfs_reflink_remap_range(struct file *file_in, loff_t pos_in,
+++<<<<<<< HEAD
+ +		struct file *file_out, loff_t pos_out, u64 len, bool is_dedupe);
+++=======
++ 		struct file *file_out, loff_t pos_out, loff_t len,
++ 		unsigned int remap_flags);
+++>>>>>>> 42ec3d4c0218 (vfs: make remap_file_range functions take and return bytes completed)
+  extern int xfs_reflink_inode_has_shared_extents(struct xfs_trans *tp,
+  		struct xfs_inode *ip, bool *has_shared);
+  extern int xfs_reflink_clear_inode_flag(struct xfs_inode *ip,
+diff --cc include/linux/fs.h
+index 6f009fb80ab1,c72d8c3c065a..000000000000
+--- a/include/linux/fs.h
++++ b/include/linux/fs.h
+@@@ -1741,10 -1777,9 +1741,16 @@@ struct file_operations 
+  #endif
+  	ssize_t (*copy_file_range)(struct file *, loff_t, struct file *,
+  			loff_t, size_t, unsigned int);
+++<<<<<<< HEAD
+ +	int (*clone_file_range)(struct file *, loff_t, struct file *, loff_t,
+ +			u64);
+ +	int (*dedupe_file_range)(struct file *, loff_t, struct file *, loff_t,
+ +			u64);
+++=======
++ 	loff_t (*remap_file_range)(struct file *file_in, loff_t pos_in,
++ 				   struct file *file_out, loff_t pos_out,
++ 				   loff_t len, unsigned int remap_flags);
+++>>>>>>> 42ec3d4c0218 (vfs: make remap_file_range functions take and return bytes completed)
+  	int (*fadvise)(struct file *, loff_t, loff_t, int);
+  } __randomize_layout;
+  
+@@@ -1809,11 -1844,14 +1815,22 @@@ extern ssize_t vfs_copy_file_range(stru
+  				   loff_t, size_t, unsigned int);
+  extern int generic_remap_file_range_prep(struct file *file_in, loff_t pos_in,
+  					 struct file *file_out, loff_t pos_out,
+++<<<<<<< HEAD
+ +					 u64 *count, bool is_dedupe);
+ +extern int do_clone_file_range(struct file *file_in, loff_t pos_in,
+ +			       struct file *file_out, loff_t pos_out, u64 len);
+ +extern int vfs_clone_file_range(struct file *file_in, loff_t pos_in,
+ +				struct file *file_out, loff_t pos_out, u64 len);
+++=======
++ 					 loff_t *count,
++ 					 unsigned int remap_flags);
++ extern loff_t do_clone_file_range(struct file *file_in, loff_t pos_in,
++ 				  struct file *file_out, loff_t pos_out,
++ 				  loff_t len);
++ extern loff_t vfs_clone_file_range(struct file *file_in, loff_t pos_in,
++ 				   struct file *file_out, loff_t pos_out,
++ 				   loff_t len);
+++>>>>>>> 42ec3d4c0218 (vfs: make remap_file_range functions take and return bytes completed)
+  extern int vfs_dedupe_file_range_compare(struct inode *src, loff_t srcoff,
+  					 struct inode *dest, loff_t destoff,
+  					 loff_t len, bool *is_same);
+@@@ -2958,7 -2989,7 +2975,11 @@@ extern int generic_file_readonly_mmap(s
+  extern ssize_t generic_write_checks(struct kiocb *, struct iov_iter *);
+  extern int generic_remap_checks(struct file *file_in, loff_t pos_in,
+  				struct file *file_out, loff_t pos_out,
+++<<<<<<< HEAD
+ +				uint64_t *count, bool is_dedupe);
+++=======
++ 				loff_t *count, unsigned int remap_flags);
+++>>>>>>> 42ec3d4c0218 (vfs: make remap_file_range functions take and return bytes completed)
+  extern ssize_t generic_file_read_iter(struct kiocb *, struct iov_iter *);
+  extern ssize_t __generic_file_write_iter(struct kiocb *, struct iov_iter *);
+  extern ssize_t generic_file_write_iter(struct kiocb *, struct iov_iter *);
+diff --cc mm/filemap.c
+index 84b7301e41a0,e9091d731f84..000000000000
+--- a/mm/filemap.c
++++ b/mm/filemap.c
+@@@ -2994,7 -2994,7 +2994,11 @@@ EXPORT_SYMBOL(generic_write_checks)
+   */
+  int generic_remap_checks(struct file *file_in, loff_t pos_in,
+  			 struct file *file_out, loff_t pos_out,
+++<<<<<<< HEAD
+ +			 uint64_t *req_count, bool is_dedupe)
+++=======
++ 			 loff_t *req_count, unsigned int remap_flags)
+++>>>>>>> 42ec3d4c0218 (vfs: make remap_file_range functions take and return bytes completed)
+  {
+  	struct inode *inode_in = file_in->f_mapping->host;
+  	struct inode *inode_out = file_out->f_mapping->host;
+* Unmerged path Documentation/filesystems/vfs.txt
+* Unmerged path fs/btrfs/ctree.h
+* Unmerged path fs/btrfs/ioctl.c
+* Unmerged path fs/cifs/cifsfs.c
+diff --git a/fs/ioctl.c b/fs/ioctl.c
+index 0400297c8d72..b9991bb82ddf 100644
+--- a/fs/ioctl.c
++++ b/fs/ioctl.c
+@@ -223,6 +223,7 @@ static long ioctl_file_clone(struct file *dst_file, unsigned long srcfd,
+ 			     u64 off, u64 olen, u64 destoff)
+ {
+ 	struct fd src_file = fdget(srcfd);
++	loff_t cloned;
+ 	int ret;
+ 
+ 	if (!src_file.file)
+@@ -230,7 +231,14 @@ static long ioctl_file_clone(struct file *dst_file, unsigned long srcfd,
+ 	ret = -EXDEV;
+ 	if (src_file.file->f_path.mnt != dst_file->f_path.mnt)
+ 		goto fdput;
+-	ret = vfs_clone_file_range(src_file.file, off, dst_file, destoff, olen);
++	cloned = vfs_clone_file_range(src_file.file, off, dst_file, destoff,
++				      olen);
++	if (cloned < 0)
++		ret = cloned;
++	else if (olen && cloned != olen)
++		ret = -EINVAL;
++	else
++		ret = 0;
+ fdput:
+ 	fdput(src_file);
+ 	return ret;
+* Unmerged path fs/nfs/nfs4file.c
+diff --git a/fs/nfsd/vfs.c b/fs/nfsd/vfs.c
+index 613d2fe2dddd..4249bb2d0268 100644
+--- a/fs/nfsd/vfs.c
++++ b/fs/nfsd/vfs.c
+@@ -541,8 +541,12 @@ __be32 nfsd4_set_nfs4_label(struct svc_rqst *rqstp, struct svc_fh *fhp,
+ __be32 nfsd4_clone_file_range(struct file *src, u64 src_pos, struct file *dst,
+ 		u64 dst_pos, u64 count)
+ {
+-	return nfserrno(vfs_clone_file_range(src, src_pos, dst, dst_pos,
+-					     count));
++	loff_t cloned;
++
++	cloned = vfs_clone_file_range(src, src_pos, dst, dst_pos, count);
++	if (count && cloned != count)
++		cloned = -EINVAL;
++	return nfserrno(cloned < 0 ? cloned : 0);
+ }
+ 
+ ssize_t nfsd_copy_file_range(struct file *src, u64 src_pos, struct file *dst,
+* Unmerged path fs/ocfs2/file.c
+* Unmerged path fs/ocfs2/refcounttree.c
+* Unmerged path fs/ocfs2/refcounttree.h
+diff --git a/fs/overlayfs/copy_up.c b/fs/overlayfs/copy_up.c
+index 1cc797a08a5b..8750b7235516 100644
+--- a/fs/overlayfs/copy_up.c
++++ b/fs/overlayfs/copy_up.c
+@@ -125,6 +125,7 @@ static int ovl_copy_up_data(struct path *old, struct path *new, loff_t len)
+ 	struct file *new_file;
+ 	loff_t old_pos = 0;
+ 	loff_t new_pos = 0;
++	loff_t cloned;
+ 	int error = 0;
+ 
+ 	if (len == 0)
+@@ -141,11 +142,10 @@ static int ovl_copy_up_data(struct path *old, struct path *new, loff_t len)
+ 	}
+ 
+ 	/* Try to use clone_file_range to clone up within the same fs */
+-	error = do_clone_file_range(old_file, 0, new_file, 0, len);
+-	if (!error)
++	cloned = do_clone_file_range(old_file, 0, new_file, 0, len);
++	if (cloned == len)
+ 		goto out;
+ 	/* Couldn't clone, so now we try to copy the data */
+-	error = 0;
+ 
+ 	/* FIXME: copy up sparse files efficiently */
+ 	while (len) {
+* Unmerged path fs/overlayfs/file.c
+* Unmerged path fs/read_write.c
+* Unmerged path fs/xfs/xfs_file.c
+* Unmerged path fs/xfs/xfs_reflink.c
+* Unmerged path fs/xfs/xfs_reflink.h
+* Unmerged path include/linux/fs.h
+* Unmerged path mm/filemap.c
