@@ -1,0 +1,393 @@
+bpf: implement bpf_send_signal() helper
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-193.el8
+commit-author Yonghong Song <yhs@fb.com>
+commit 8b401f9ed2441ad9e219953927a842d24ed051fc
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-193.el8/8b401f9e.failed
+
+This patch tries to solve the following specific use case.
+
+Currently, bpf program can already collect stack traces
+through kernel function get_perf_callchain()
+when certain events happens (e.g., cache miss counter or
+cpu clock counter overflows). But such stack traces are
+not enough for jitted programs, e.g., hhvm (jited php).
+To get real stack trace, jit engine internal data structures
+need to be traversed in order to get the real user functions.
+
+bpf program itself may not be the best place to traverse
+the jit engine as the traversing logic could be complex and
+it is not a stable interface either.
+
+Instead, hhvm implements a signal handler,
+e.g. for SIGALARM, and a set of program locations which
+it can dump stack traces. When it receives a signal, it will
+dump the stack in next such program location.
+
+Such a mechanism can be implemented in the following way:
+  . a perf ring buffer is created between bpf program
+    and tracing app.
+  . once a particular event happens, bpf program writes
+    to the ring buffer and the tracing app gets notified.
+  . the tracing app sends a signal SIGALARM to the hhvm.
+
+But this method could have large delays and causing profiling
+results skewed.
+
+This patch implements bpf_send_signal() helper to send
+a signal to hhvm in real time, resulting in intended stack traces.
+
+	Acked-by: Andrii Nakryiko <andriin@fb.com>
+	Signed-off-by: Yonghong Song <yhs@fb.com>
+	Signed-off-by: Daniel Borkmann <daniel@iogearbox.net>
+(cherry picked from commit 8b401f9ed2441ad9e219953927a842d24ed051fc)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/uapi/linux/bpf.h
+diff --cc include/uapi/linux/bpf.h
+index d421ae5c0fec,68d4470523a0..000000000000
+--- a/include/uapi/linux/bpf.h
++++ b/include/uapi/linux/bpf.h
+@@@ -2470,11 -2480,212 +2470,215 @@@ union bpf_attr 
+   *
+   * struct bpf_sock *bpf_get_listener_sock(struct bpf_sock *sk)
+   *	Description
+ - *		Return a **struct bpf_sock** pointer in **TCP_LISTEN** state.
+ - *		**bpf_sk_release**\ () is unnecessary and not allowed.
+ + *		Return a **struct bpf_sock** pointer in TCP_LISTEN state.
+ + *		bpf_sk_release() is unnecessary and not allowed.
+   *	Return
+ - *		A **struct bpf_sock** pointer on success, or **NULL** in
+ + *		A **struct bpf_sock** pointer on success, or NULL in
+   *		case of failure.
+++<<<<<<< HEAD
+++=======
++  *
++  * struct bpf_sock *bpf_skc_lookup_tcp(void *ctx, struct bpf_sock_tuple *tuple, u32 tuple_size, u64 netns, u64 flags)
++  *	Description
++  *		Look for TCP socket matching *tuple*, optionally in a child
++  *		network namespace *netns*. The return value must be checked,
++  *		and if non-**NULL**, released via **bpf_sk_release**\ ().
++  *
++  *		This function is identical to **bpf_sk_lookup_tcp**\ (), except
++  *		that it also returns timewait or request sockets. Use
++  *		**bpf_sk_fullsock**\ () or **bpf_tcp_sock**\ () to access the
++  *		full structure.
++  *
++  *		This helper is available only if the kernel was compiled with
++  *		**CONFIG_NET** configuration option.
++  *	Return
++  *		Pointer to **struct bpf_sock**, or **NULL** in case of failure.
++  *		For sockets with reuseport option, the **struct bpf_sock**
++  *		result is from *reuse*\ **->socks**\ [] using the hash of the
++  *		tuple.
++  *
++  * int bpf_tcp_check_syncookie(struct bpf_sock *sk, void *iph, u32 iph_len, struct tcphdr *th, u32 th_len)
++  * 	Description
++  * 		Check whether *iph* and *th* contain a valid SYN cookie ACK for
++  * 		the listening socket in *sk*.
++  *
++  * 		*iph* points to the start of the IPv4 or IPv6 header, while
++  * 		*iph_len* contains **sizeof**\ (**struct iphdr**) or
++  * 		**sizeof**\ (**struct ip6hdr**).
++  *
++  * 		*th* points to the start of the TCP header, while *th_len*
++  * 		contains **sizeof**\ (**struct tcphdr**).
++  *
++  * 	Return
++  * 		0 if *iph* and *th* are a valid SYN cookie ACK, or a negative
++  * 		error otherwise.
++  *
++  * int bpf_sysctl_get_name(struct bpf_sysctl *ctx, char *buf, size_t buf_len, u64 flags)
++  *	Description
++  *		Get name of sysctl in /proc/sys/ and copy it into provided by
++  *		program buffer *buf* of size *buf_len*.
++  *
++  *		The buffer is always NUL terminated, unless it's zero-sized.
++  *
++  *		If *flags* is zero, full name (e.g. "net/ipv4/tcp_mem") is
++  *		copied. Use **BPF_F_SYSCTL_BASE_NAME** flag to copy base name
++  *		only (e.g. "tcp_mem").
++  *	Return
++  *		Number of character copied (not including the trailing NUL).
++  *
++  *		**-E2BIG** if the buffer wasn't big enough (*buf* will contain
++  *		truncated name in this case).
++  *
++  * int bpf_sysctl_get_current_value(struct bpf_sysctl *ctx, char *buf, size_t buf_len)
++  *	Description
++  *		Get current value of sysctl as it is presented in /proc/sys
++  *		(incl. newline, etc), and copy it as a string into provided
++  *		by program buffer *buf* of size *buf_len*.
++  *
++  *		The whole value is copied, no matter what file position user
++  *		space issued e.g. sys_read at.
++  *
++  *		The buffer is always NUL terminated, unless it's zero-sized.
++  *	Return
++  *		Number of character copied (not including the trailing NUL).
++  *
++  *		**-E2BIG** if the buffer wasn't big enough (*buf* will contain
++  *		truncated name in this case).
++  *
++  *		**-EINVAL** if current value was unavailable, e.g. because
++  *		sysctl is uninitialized and read returns -EIO for it.
++  *
++  * int bpf_sysctl_get_new_value(struct bpf_sysctl *ctx, char *buf, size_t buf_len)
++  *	Description
++  *		Get new value being written by user space to sysctl (before
++  *		the actual write happens) and copy it as a string into
++  *		provided by program buffer *buf* of size *buf_len*.
++  *
++  *		User space may write new value at file position > 0.
++  *
++  *		The buffer is always NUL terminated, unless it's zero-sized.
++  *	Return
++  *		Number of character copied (not including the trailing NUL).
++  *
++  *		**-E2BIG** if the buffer wasn't big enough (*buf* will contain
++  *		truncated name in this case).
++  *
++  *		**-EINVAL** if sysctl is being read.
++  *
++  * int bpf_sysctl_set_new_value(struct bpf_sysctl *ctx, const char *buf, size_t buf_len)
++  *	Description
++  *		Override new value being written by user space to sysctl with
++  *		value provided by program in buffer *buf* of size *buf_len*.
++  *
++  *		*buf* should contain a string in same form as provided by user
++  *		space on sysctl write.
++  *
++  *		User space may write new value at file position > 0. To override
++  *		the whole sysctl value file position should be set to zero.
++  *	Return
++  *		0 on success.
++  *
++  *		**-E2BIG** if the *buf_len* is too big.
++  *
++  *		**-EINVAL** if sysctl is being read.
++  *
++  * int bpf_strtol(const char *buf, size_t buf_len, u64 flags, long *res)
++  *	Description
++  *		Convert the initial part of the string from buffer *buf* of
++  *		size *buf_len* to a long integer according to the given base
++  *		and save the result in *res*.
++  *
++  *		The string may begin with an arbitrary amount of white space
++  *		(as determined by **isspace**\ (3)) followed by a single
++  *		optional '**-**' sign.
++  *
++  *		Five least significant bits of *flags* encode base, other bits
++  *		are currently unused.
++  *
++  *		Base must be either 8, 10, 16 or 0 to detect it automatically
++  *		similar to user space **strtol**\ (3).
++  *	Return
++  *		Number of characters consumed on success. Must be positive but
++  *		no more than *buf_len*.
++  *
++  *		**-EINVAL** if no valid digits were found or unsupported base
++  *		was provided.
++  *
++  *		**-ERANGE** if resulting value was out of range.
++  *
++  * int bpf_strtoul(const char *buf, size_t buf_len, u64 flags, unsigned long *res)
++  *	Description
++  *		Convert the initial part of the string from buffer *buf* of
++  *		size *buf_len* to an unsigned long integer according to the
++  *		given base and save the result in *res*.
++  *
++  *		The string may begin with an arbitrary amount of white space
++  *		(as determined by **isspace**\ (3)).
++  *
++  *		Five least significant bits of *flags* encode base, other bits
++  *		are currently unused.
++  *
++  *		Base must be either 8, 10, 16 or 0 to detect it automatically
++  *		similar to user space **strtoul**\ (3).
++  *	Return
++  *		Number of characters consumed on success. Must be positive but
++  *		no more than *buf_len*.
++  *
++  *		**-EINVAL** if no valid digits were found or unsupported base
++  *		was provided.
++  *
++  *		**-ERANGE** if resulting value was out of range.
++  *
++  * void *bpf_sk_storage_get(struct bpf_map *map, struct bpf_sock *sk, void *value, u64 flags)
++  *	Description
++  *		Get a bpf-local-storage from a *sk*.
++  *
++  *		Logically, it could be thought of getting the value from
++  *		a *map* with *sk* as the **key**.  From this
++  *		perspective,  the usage is not much different from
++  *		**bpf_map_lookup_elem**\ (*map*, **&**\ *sk*) except this
++  *		helper enforces the key must be a full socket and the map must
++  *		be a **BPF_MAP_TYPE_SK_STORAGE** also.
++  *
++  *		Underneath, the value is stored locally at *sk* instead of
++  *		the *map*.  The *map* is used as the bpf-local-storage
++  *		"type". The bpf-local-storage "type" (i.e. the *map*) is
++  *		searched against all bpf-local-storages residing at *sk*.
++  *
++  *		An optional *flags* (**BPF_SK_STORAGE_GET_F_CREATE**) can be
++  *		used such that a new bpf-local-storage will be
++  *		created if one does not exist.  *value* can be used
++  *		together with **BPF_SK_STORAGE_GET_F_CREATE** to specify
++  *		the initial value of a bpf-local-storage.  If *value* is
++  *		**NULL**, the new bpf-local-storage will be zero initialized.
++  *	Return
++  *		A bpf-local-storage pointer is returned on success.
++  *
++  *		**NULL** if not found or there was an error in adding
++  *		a new bpf-local-storage.
++  *
++  * int bpf_sk_storage_delete(struct bpf_map *map, struct bpf_sock *sk)
++  *	Description
++  *		Delete a bpf-local-storage from a *sk*.
++  *	Return
++  *		0 on success.
++  *
++  *		**-ENOENT** if the bpf-local-storage cannot be found.
++  *
++  * int bpf_send_signal(u32 sig)
++  *	Description
++  *		Send signal *sig* to the current task.
++  *	Return
++  *		0 on success or successfully queued.
++  *
++  *		**-EBUSY** if work queue under nmi is full.
++  *
++  *		**-EINVAL** if *sig* is invalid.
++  *
++  *		**-EPERM** if no permission to send the *sig*.
++  *
++  *		**-EAGAIN** if bpf program can try again.
+++>>>>>>> 8b401f9ed244 (bpf: implement bpf_send_signal() helper)
+   */
+  #define __BPF_FUNC_MAPPER(FN)		\
+  	FN(unspec),			\
+@@@ -2575,7 -2786,18 +2779,22 @@@
+  	FN(sk_fullsock),		\
+  	FN(tcp_sock),			\
+  	FN(skb_ecn_set_ce),		\
+++<<<<<<< HEAD
+ +	FN(get_listener_sock),
+++=======
++ 	FN(get_listener_sock),		\
++ 	FN(skc_lookup_tcp),		\
++ 	FN(tcp_check_syncookie),	\
++ 	FN(sysctl_get_name),		\
++ 	FN(sysctl_get_current_value),	\
++ 	FN(sysctl_get_new_value),	\
++ 	FN(sysctl_set_new_value),	\
++ 	FN(strtol),			\
++ 	FN(strtoul),			\
++ 	FN(sk_storage_get),		\
++ 	FN(sk_storage_delete),		\
++ 	FN(send_signal),
+++>>>>>>> 8b401f9ed244 (bpf: implement bpf_send_signal() helper)
+  
+  /* integer value in 'imm' field of BPF_CALL instruction selects which helper
+   * function eBPF program intends to call
+* Unmerged path include/uapi/linux/bpf.h
+diff --git a/kernel/trace/bpf_trace.c b/kernel/trace/bpf_trace.c
+index 3cdf7ed66c34..27a910394d52 100644
+--- a/kernel/trace/bpf_trace.c
++++ b/kernel/trace/bpf_trace.c
+@@ -594,6 +594,63 @@ static const struct bpf_func_proto bpf_probe_read_str_proto = {
+ 	.arg3_type	= ARG_ANYTHING,
+ };
+ 
++struct send_signal_irq_work {
++	struct irq_work irq_work;
++	struct task_struct *task;
++	u32 sig;
++};
++
++static DEFINE_PER_CPU(struct send_signal_irq_work, send_signal_work);
++
++static void do_bpf_send_signal(struct irq_work *entry)
++{
++	struct send_signal_irq_work *work;
++
++	work = container_of(entry, struct send_signal_irq_work, irq_work);
++	group_send_sig_info(work->sig, SEND_SIG_PRIV, work->task, PIDTYPE_TGID);
++}
++
++BPF_CALL_1(bpf_send_signal, u32, sig)
++{
++	struct send_signal_irq_work *work = NULL;
++
++	/* Similar to bpf_probe_write_user, task needs to be
++	 * in a sound condition and kernel memory access be
++	 * permitted in order to send signal to the current
++	 * task.
++	 */
++	if (unlikely(current->flags & (PF_KTHREAD | PF_EXITING)))
++		return -EPERM;
++	if (unlikely(uaccess_kernel()))
++		return -EPERM;
++	if (unlikely(!nmi_uaccess_okay()))
++		return -EPERM;
++
++	if (in_nmi()) {
++		work = this_cpu_ptr(&send_signal_work);
++		if (work->irq_work.flags & IRQ_WORK_BUSY)
++			return -EBUSY;
++
++		/* Add the current task, which is the target of sending signal,
++		 * to the irq_work. The current task may change when queued
++		 * irq works get executed.
++		 */
++		work->task = current;
++		work->sig = sig;
++		irq_work_queue(&work->irq_work);
++		return 0;
++	}
++
++	return group_send_sig_info(sig, SEND_SIG_PRIV, current, PIDTYPE_TGID);
++}
++
++static const struct bpf_func_proto bpf_send_signal_proto = {
++	.func		= bpf_send_signal,
++	.gpl_only	= false,
++	.ret_type	= RET_INTEGER,
++	.arg1_type	= ARG_ANYTHING,
++};
++
+ static const struct bpf_func_proto *
+ tracing_func_proto(enum bpf_func_id func_id, const struct bpf_prog *prog)
+ {
+@@ -644,6 +701,8 @@ tracing_func_proto(enum bpf_func_id func_id, const struct bpf_prog *prog)
+ 	case BPF_FUNC_get_current_cgroup_id:
+ 		return &bpf_get_current_cgroup_id_proto;
+ #endif
++	case BPF_FUNC_send_signal:
++		return &bpf_send_signal_proto;
+ 	default:
+ 		return NULL;
+ 	}
+@@ -1390,5 +1449,18 @@ static int __init bpf_event_init(void)
+ 	return 0;
+ }
+ 
++static int __init send_signal_irq_work_init(void)
++{
++	int cpu;
++	struct send_signal_irq_work *work;
++
++	for_each_possible_cpu(cpu) {
++		work = per_cpu_ptr(&send_signal_work, cpu);
++		init_irq_work(&work->irq_work, do_bpf_send_signal);
++	}
++	return 0;
++}
++
+ fs_initcall(bpf_event_init);
++subsys_initcall(send_signal_irq_work_init);
+ #endif /* CONFIG_MODULES */
