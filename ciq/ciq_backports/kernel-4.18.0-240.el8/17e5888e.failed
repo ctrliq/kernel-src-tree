@@ -1,0 +1,101 @@
+x86: Select HARDIRQS_SW_RESEND on x86
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Hans de Goede <hdegoede@redhat.com>
+commit 17e5888e4e180b45af7bafe7f3a86440d42717f3
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/17e5888e.failed
+
+Modern x86 laptops are starting to use GPIO pins as interrupts more
+and more, e.g. touchpads and touchscreens have almost all moved away
+from PS/2 and USB to using I2C with a GPIO pin as interrupt.
+Modern x86 laptops also have almost all moved to using s2idle instead
+of using the system S3 ACPI power state to suspend.
+
+The Intel and AMD pinctrl drivers do not define irq_retrigger handlers
+for the irqchips they register, this is causing edge triggered interrupts
+which happen while suspended using s2idle to get lost.
+
+One specific example of this is the lid switch on some devices, lid
+switches used to be handled by the embedded-controller, but now the
+lid open/closed sensor is sometimes directly connected to a GPIO pin.
+On most devices the ACPI code for this looks like this:
+
+Method (_E00, ...) {
+	Notify (LID0, 0x80) // Status Change
+}
+
+Where _E00 is an ACPI event handler for changes on both edges of the GPIO
+connected to the lid sensor, this event handler is then combined with an
+_LID method which directly reads the pin. When the device is resumed by
+opening the lid, the GPIO interrupt will wake the system, but because the
+pinctrl irqchip doesn't have an irq_retrigger handler, the Notify will not
+happen. This is not a problem in the case the _LID method directly reads
+the GPIO, because the drivers/acpi/button.c code will call _LID on resume
+anyways.
+
+But some devices have an event handler for the GPIO connected to the
+lid sensor which looks like this:
+
+Method (_E00, ...) {
+	if (LID_GPIO == One)
+		LIDS = One
+	else
+		LIDS = Zero
+	Notify (LID0, 0x80) // Status Change
+}
+
+And the _LID method returns the cached LIDS value, since on open we
+do not re-run the edge-interrupt handler when we re-enable IRQS on resume
+(because of the missing irq_retrigger handler), _LID now will keep
+reporting closed, as LIDS was never changed to reflect the open status,
+this causes userspace to re-resume the laptop again shortly after opening
+the lid.
+
+The Intel GPIO controllers do not allow implementing irq_retrigger without
+emulating it in software, at which point we are better of just using the
+generic HARDIRQS_SW_RESEND mechanism rather then re-implementing software
+emulation for this separately in aprox. 14 different pinctrl drivers.
+
+Select HARDIRQS_SW_RESEND to solve the problem of edge-triggered GPIO
+interrupts not being re-triggered on resume when they were triggered during
+suspend (s2idle) and/or when they were the cause of the wakeup.
+
+This requires
+
+ 008f1d60fe25 ("x86/apic/vector: Force interupt handler invocation to irq context")
+ c16816acd086 ("genirq: Add protection against unsafe usage of generic_handle_irq()")
+
+to protect the APIC based interrupts from being wreckaged by a software
+resend.
+
+	Signed-off-by: Hans de Goede <hdegoede@redhat.com>
+	Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+Link: https://lkml.kernel.org/r/20200123210242.53367-1-hdegoede@redhat.com
+
+(cherry picked from commit 17e5888e4e180b45af7bafe7f3a86440d42717f3)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/Kconfig
+diff --cc arch/x86/Kconfig
+index 70c5effebd49,912893299a30..000000000000
+--- a/arch/x86/Kconfig
++++ b/arch/x86/Kconfig
+@@@ -113,6 -125,10 +113,13 @@@ config X8
+  	select GENERIC_STRNCPY_FROM_USER
+  	select GENERIC_STRNLEN_USER
+  	select GENERIC_TIME_VSYSCALL
+++<<<<<<< HEAD
+++=======
++ 	select GENERIC_GETTIMEOFDAY
++ 	select GENERIC_VDSO_TIME_NS
++ 	select GUP_GET_PTE_LOW_HIGH		if X86_PAE
++ 	select HARDIRQS_SW_RESEND
+++>>>>>>> 17e5888e4e18 (x86: Select HARDIRQS_SW_RESEND on x86)
+  	select HARDLOCKUP_CHECK_TIMESTAMP	if X86_64
+  	select HAVE_ACPI_APEI			if ACPI
+  	select HAVE_ACPI_APEI_NMI		if ACPI
+* Unmerged path arch/x86/Kconfig
