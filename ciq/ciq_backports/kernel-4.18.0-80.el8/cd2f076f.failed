@@ -1,0 +1,155 @@
+bsg: convert to use blk-mq
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-80.el8
+commit-author Jens Axboe <axboe@kernel.dk>
+commit cd2f076f1d7ac20a93029ab38646b303f1c1468e
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-80.el8/cd2f076f.failed
+
+Requires a few changes to the FC transport class as well.
+
+	Cc: linux-scsi@vger.kernel.org
+	Reviewed-by: Hannes Reinecke <hare@suse.com>
+	Reviewed-by: Johannes Thumshirn <jthumshirn@suse.de>
+	Tested-by: Benjamin Block <bblock@linux.vnet.ibm.com>
+	Tested-by: Ming Lei <ming.lei@redhat.com>
+	Reviewed-by: Omar Sandoval <osandov@fb.com>
+	Signed-off-by: Jens Axboe <axboe@kernel.dk>
+(cherry picked from commit cd2f076f1d7ac20a93029ab38646b303f1c1468e)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	block/bsg-lib.c
+#	drivers/scsi/scsi_transport_fc.c
+diff --cc block/bsg-lib.c
+index f3501cdaf1a6,faf20f4500c9..000000000000
+--- a/block/bsg-lib.c
++++ b/block/bsg-lib.c
+@@@ -296,6 -289,39 +289,42 @@@ static void bsg_exit_rq(struct blk_mq_t
+  	kfree(job->reply);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ void bsg_remove_queue(struct request_queue *q)
++ {
++ 	if (q) {
++ 		struct blk_mq_tag_set *set = q->tag_set;
++ 
++ 		bsg_unregister_queue(q);
++ 		blk_cleanup_queue(q);
++ 		blk_mq_free_tag_set(set);
++ 		kfree(set);
++ 	}
++ }
++ EXPORT_SYMBOL_GPL(bsg_remove_queue);
++ 
++ static enum blk_eh_timer_return bsg_timeout(struct request *rq, bool reserved)
++ {
++ 	enum blk_eh_timer_return ret = BLK_EH_DONE;
++ 	struct request_queue *q = rq->q;
++ 
++ 	if (q->rq_timed_out_fn)
++ 		ret = q->rq_timed_out_fn(rq);
++ 
++ 	return ret;
++ }
++ 
++ static const struct blk_mq_ops bsg_mq_ops = {
++ 	.queue_rq		= bsg_queue_rq,
++ 	.init_request		= bsg_init_rq,
++ 	.exit_request		= bsg_exit_rq,
++ 	.initialize_rq_fn	= bsg_initialize_rq,
++ 	.complete		= bsg_complete,
++ 	.timeout		= bsg_timeout,
++ };
++ 
+++>>>>>>> cd2f076f1d7a (bsg: convert to use blk-mq)
+  /**
+   * bsg_setup_queue - Create and add the bsg hooks so we can receive requests
+   * @dev: device to attach bsg device to
+@@@ -304,29 -330,36 +333,39 @@@
+   * @dd_job_size: size of LLD data needed for each job
+   */
+  struct request_queue *bsg_setup_queue(struct device *dev, const char *name,
+ -		bsg_job_fn *job_fn, rq_timed_out_fn *timeout, int dd_job_size)
+ +		bsg_job_fn *job_fn, int dd_job_size)
+  {
++ 	struct blk_mq_tag_set *set;
+  	struct request_queue *q;
+- 	int ret;
++ 	int ret = -ENOMEM;
+  
+- 	q = blk_alloc_queue(GFP_KERNEL);
+- 	if (!q)
++ 	set = kzalloc(sizeof(*set), GFP_KERNEL);
++ 	if (!set)
+  		return ERR_PTR(-ENOMEM);
+- 	q->cmd_size = sizeof(struct bsg_job) + dd_job_size;
+- 	q->init_rq_fn = bsg_init_rq;
+- 	q->exit_rq_fn = bsg_exit_rq;
+- 	q->initialize_rq_fn = bsg_initialize_rq;
+- 	q->request_fn = bsg_request_fn;
+  
+- 	ret = blk_init_allocated_queue(q);
+- 	if (ret)
+- 		goto out_cleanup_queue;
++ 	set->ops = &bsg_mq_ops,
++ 	set->nr_hw_queues = 1;
++ 	set->queue_depth = 128;
++ 	set->numa_node = NUMA_NO_NODE;
++ 	set->cmd_size = sizeof(struct bsg_job) + dd_job_size;
++ 	set->flags = BLK_MQ_F_NO_SCHED | BLK_MQ_F_BLOCKING;
++ 	if (blk_mq_alloc_tag_set(set))
++ 		goto out_tag_set;
++ 
++ 	q = blk_mq_init_queue(set);
++ 	if (IS_ERR(q)) {
++ 		ret = PTR_ERR(q);
++ 		goto out_queue;
++ 	}
+  
+  	q->queuedata = dev;
+  	q->bsg_job_fn = job_fn;
+  	blk_queue_flag_set(QUEUE_FLAG_BIDI, q);
+- 	blk_queue_softirq_done(q, bsg_softirq_done);
+  	blk_queue_rq_timeout(q, BLK_DEFAULT_SG_TIMEOUT);
+++<<<<<<< HEAD
+++=======
++ 	q->rq_timed_out_fn = timeout;
+++>>>>>>> cd2f076f1d7a (bsg: convert to use blk-mq)
+  
+  	ret = bsg_register_queue(q, dev, name, &bsg_transport_ops);
+  	if (ret) {
+diff --cc drivers/scsi/scsi_transport_fc.c
+index 13948102ca29,d7035270d274..000000000000
+--- a/drivers/scsi/scsi_transport_fc.c
++++ b/drivers/scsi/scsi_transport_fc.c
+@@@ -3825,15 -3837,13 +3837,23 @@@ fc_bsg_rportadd(struct Scsi_Host *shost
+  	if (!i->f->bsg_request)
+  		return -ENOTSUPP;
+  
+++<<<<<<< HEAD
+ +	q = bsg_setup_queue(dev, dev_name(dev), fc_bsg_dispatch,
+ +			i->f->dd_bsg_size);
+++=======
++ 	q = bsg_setup_queue(dev, dev_name(dev), fc_bsg_dispatch_prep,
++ 				fc_bsg_job_timeout, i->f->dd_bsg_size);
+++>>>>>>> cd2f076f1d7a (bsg: convert to use blk-mq)
+  	if (IS_ERR(q)) {
+  		dev_err(dev, "failed to setup bsg queue\n");
+  		return PTR_ERR(q);
+  	}
+  	__scsi_init_queue(shost, q);
+++<<<<<<< HEAD
+ +	blk_queue_prep_rq(q, fc_bsg_rport_prep);
+ +	blk_queue_rq_timed_out(q, fc_bsg_job_timeout);
+++=======
+++>>>>>>> cd2f076f1d7a (bsg: convert to use blk-mq)
+  	blk_queue_rq_timeout(q, BLK_DEFAULT_SG_TIMEOUT);
+  	rport->rqst_q = q;
+  	return 0;
+* Unmerged path block/bsg-lib.c
+* Unmerged path drivers/scsi/scsi_transport_fc.c
