@@ -1,0 +1,242 @@
+bpf: Make bpf_link_fops static
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Zou Wei <zou_wei@huawei.com>
+commit 6f302bfb221470e712ce3e5911fb83cdca174387
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/6f302bfb.failed
+
+Fix the following sparse warning:
+
+kernel/bpf/syscall.c:2289:30: warning: symbol 'bpf_link_fops' was not declared. Should it be static?
+
+	Reported-by: Hulk Robot <hulkci@huawei.com>
+	Signed-off-by: Zou Wei <zou_wei@huawei.com>
+	Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+	Acked-by: Andrii Nakryiko <andriin@fb.com>
+Link: https://lore.kernel.org/bpf/1587609160-117806-1-git-send-email-zou_wei@huawei.com
+(cherry picked from commit 6f302bfb221470e712ce3e5911fb83cdca174387)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	kernel/bpf/syscall.c
+diff --cc kernel/bpf/syscall.c
+index b5b79e59cfd4,7626b8024471..000000000000
+--- a/kernel/bpf/syscall.c
++++ b/kernel/bpf/syscall.c
+@@@ -1873,10 -2250,206 +1873,51 @@@ static int bpf_raw_tracepoint_release(s
+  	return 0;
+  }
+  
+++<<<<<<< HEAD
+ +static const struct file_operations bpf_raw_tp_fops = {
+ +	.release	= bpf_raw_tracepoint_release,
+++=======
++ #ifdef CONFIG_PROC_FS
++ static const struct bpf_link_ops bpf_raw_tp_lops;
++ static const struct bpf_link_ops bpf_tracing_link_lops;
++ 
++ static void bpf_link_show_fdinfo(struct seq_file *m, struct file *filp)
++ {
++ 	const struct bpf_link *link = filp->private_data;
++ 	const struct bpf_prog *prog = link->prog;
++ 	char prog_tag[sizeof(prog->tag) * 2 + 1] = { };
++ 	const char *link_type;
++ 
++ 	if (link->ops == &bpf_raw_tp_lops)
++ 		link_type = "raw_tracepoint";
++ 	else if (link->ops == &bpf_tracing_link_lops)
++ 		link_type = "tracing";
++ #ifdef CONFIG_CGROUP_BPF
++ 	else if (link->ops == &bpf_cgroup_link_lops)
++ 		link_type = "cgroup";
++ #endif
++ 	else
++ 		link_type = "unknown";
++ 
++ 	bin2hex(prog_tag, prog->tag, sizeof(prog->tag));
++ 	seq_printf(m,
++ 		   "link_type:\t%s\n"
++ 		   "prog_tag:\t%s\n"
++ 		   "prog_id:\t%u\n",
++ 		   link_type,
++ 		   prog_tag,
++ 		   prog->aux->id);
++ }
++ #endif
++ 
++ static const struct file_operations bpf_link_fops = {
++ #ifdef CONFIG_PROC_FS
++ 	.show_fdinfo	= bpf_link_show_fdinfo,
++ #endif
++ 	.release	= bpf_link_release,
+++>>>>>>> 6f302bfb2214 (bpf: Make bpf_link_fops static)
+  	.read		= bpf_dummy_read,
+ -	.write		= bpf_dummy_write,
+ -};
+ -
+ -int bpf_link_new_fd(struct bpf_link *link)
+ -{
+ -	return anon_inode_getfd("bpf-link", &bpf_link_fops, link, O_CLOEXEC);
+ -}
+ -
+ -/* Similar to bpf_link_new_fd, create anon_inode for given bpf_link, but
+ - * instead of immediately installing fd in fdtable, just reserve it and
+ - * return. Caller then need to either install it with fd_install(fd, file) or
+ - * release with put_unused_fd(fd).
+ - * This is useful for cases when bpf_link attachment/detachment are
+ - * complicated and expensive operations and should be delayed until all the fd
+ - * reservation and anon_inode creation succeeds.
+ - */
+ -struct file *bpf_link_new_file(struct bpf_link *link, int *reserved_fd)
+ -{
+ -	struct file *file;
+ -	int fd;
+ -
+ -	fd = get_unused_fd_flags(O_CLOEXEC);
+ -	if (fd < 0)
+ -		return ERR_PTR(fd);
+ -
+ -	file = anon_inode_getfile("bpf_link", &bpf_link_fops, link, O_CLOEXEC);
+ -	if (IS_ERR(file)) {
+ -		put_unused_fd(fd);
+ -		return file;
+ -	}
+ -
+ -	*reserved_fd = fd;
+ -	return file;
+ -}
+ -
+ -struct bpf_link *bpf_link_get_from_fd(u32 ufd)
+ -{
+ -	struct fd f = fdget(ufd);
+ -	struct bpf_link *link;
+ -
+ -	if (!f.file)
+ -		return ERR_PTR(-EBADF);
+ -	if (f.file->f_op != &bpf_link_fops) {
+ -		fdput(f);
+ -		return ERR_PTR(-EINVAL);
+ -	}
+ -
+ -	link = f.file->private_data;
+ -	bpf_link_inc(link);
+ -	fdput(f);
+ -
+ -	return link;
+ -}
+ -
+ -struct bpf_tracing_link {
+ -	struct bpf_link link;
+ -};
+ -
+ -static void bpf_tracing_link_release(struct bpf_link *link)
+ -{
+ -	WARN_ON_ONCE(bpf_trampoline_unlink_prog(link->prog));
+ -}
+ -
+ -static void bpf_tracing_link_dealloc(struct bpf_link *link)
+ -{
+ -	struct bpf_tracing_link *tr_link =
+ -		container_of(link, struct bpf_tracing_link, link);
+ -
+ -	kfree(tr_link);
+ -}
+ -
+ -static const struct bpf_link_ops bpf_tracing_link_lops = {
+ -	.release = bpf_tracing_link_release,
+ -	.dealloc = bpf_tracing_link_dealloc,
+ -};
+ -
+ -static int bpf_tracing_prog_attach(struct bpf_prog *prog)
+ -{
+ -	struct bpf_tracing_link *link;
+ -	struct file *link_file;
+ -	int link_fd, err;
+ -
+ -	switch (prog->type) {
+ -	case BPF_PROG_TYPE_TRACING:
+ -		if (prog->expected_attach_type != BPF_TRACE_FENTRY &&
+ -		    prog->expected_attach_type != BPF_TRACE_FEXIT &&
+ -		    prog->expected_attach_type != BPF_MODIFY_RETURN) {
+ -			err = -EINVAL;
+ -			goto out_put_prog;
+ -		}
+ -		break;
+ -	case BPF_PROG_TYPE_EXT:
+ -		if (prog->expected_attach_type != 0) {
+ -			err = -EINVAL;
+ -			goto out_put_prog;
+ -		}
+ -		break;
+ -	case BPF_PROG_TYPE_LSM:
+ -		if (prog->expected_attach_type != BPF_LSM_MAC) {
+ -			err = -EINVAL;
+ -			goto out_put_prog;
+ -		}
+ -		break;
+ -	default:
+ -		err = -EINVAL;
+ -		goto out_put_prog;
+ -	}
+ -
+ -	link = kzalloc(sizeof(*link), GFP_USER);
+ -	if (!link) {
+ -		err = -ENOMEM;
+ -		goto out_put_prog;
+ -	}
+ -	bpf_link_init(&link->link, &bpf_tracing_link_lops, prog);
+ -
+ -	link_file = bpf_link_new_file(&link->link, &link_fd);
+ -	if (IS_ERR(link_file)) {
+ -		kfree(link);
+ -		err = PTR_ERR(link_file);
+ -		goto out_put_prog;
+ -	}
+ -
+ -	err = bpf_trampoline_link_prog(prog);
+ -	if (err) {
+ -		bpf_link_cleanup(&link->link, link_file, link_fd);
+ -		goto out_put_prog;
+ -	}
+ -
+ -	fd_install(link_fd, link_file);
+ -	return link_fd;
+ -
+ -out_put_prog:
+ -	bpf_prog_put(prog);
+ -	return err;
+ -}
+ -
+ -struct bpf_raw_tp_link {
+ -	struct bpf_link link;
+ -	struct bpf_raw_event_map *btp;
+ -};
+ -
+ -static void bpf_raw_tp_link_release(struct bpf_link *link)
+ -{
+ -	struct bpf_raw_tp_link *raw_tp =
+ -		container_of(link, struct bpf_raw_tp_link, link);
+ -
+ -	bpf_probe_unregister(raw_tp->btp, raw_tp->link.prog);
+ -	bpf_put_raw_tracepoint(raw_tp->btp);
+ -}
+ -
+ -static void bpf_raw_tp_link_dealloc(struct bpf_link *link)
+ -{
+ -	struct bpf_raw_tp_link *raw_tp =
+ -		container_of(link, struct bpf_raw_tp_link, link);
+ -
+ -	kfree(raw_tp);
+ -}
+ -
+ -static const struct bpf_link_ops bpf_raw_tp_lops = {
+ -	.release = bpf_raw_tp_link_release,
+ -	.dealloc = bpf_raw_tp_link_dealloc,
+ +	.write		= bpf_dummy_write,
+  };
+  
+  #define BPF_RAW_TRACEPOINT_OPEN_LAST_FIELD raw_tracepoint.prog_fd
+* Unmerged path kernel/bpf/syscall.c
