@@ -1,0 +1,125 @@
+scsi: megaraid_sas: Added support for shared host tagset for cpuhotplug
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Kashyap Desai <kashyap.desai@broadcom.com>
+commit 103fbf8e4020845e4fcf63819288cedb092a3c91
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/103fbf8e.failed
+
+Fusion adapters can steer completions to individual queues, and
+we now have support for shared host-wide tags.
+So we can enable multiqueue support for fusion adapters.
+
+Once driver enable shared host-wide tags, cpu hotplug feature is also
+supported as it was enabled using below patchsets -
+commit bf0beec0607d ("blk-mq: drain I/O when all CPUs in a hctx are
+offline")
+
+Currently driver has provision to disable host-wide tags using
+"host_tagset_enable" module parameter.
+
+Once we do not have any major performance regression using host-wide
+tags, we will drop the hand-crafted interrupt affinity settings.
+
+Performance is also meeting the expecatation - (used both none and
+mq-deadline scheduler)
+24 Drive SSD on Aero with/without this patch can get 3.1M IOPs
+3 VDs consist of 8 SAS SSD on Aero with/without this patch can get 3.1M
+IOPs.
+
+	Signed-off-by: Kashyap Desai <kashyap.desai@broadcom.com>
+	Signed-off-by: Hannes Reinecke <hare@suse.com>
+	Signed-off-by: John Garry <john.garry@huawei.com>
+	Tested-by: Douglas Gilbert <dgilbert@interlog.com>
+	Acked-by: Martin K. Petersen <martin.petersen@oracle.com>
+	Signed-off-by: Jens Axboe <axboe@kernel.dk>
+(cherry picked from commit 103fbf8e4020845e4fcf63819288cedb092a3c91)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/scsi/megaraid/megaraid_sas_base.c
+diff --cc drivers/scsi/megaraid/megaraid_sas_base.c
+index a70a6ebab3a1,020270ce790b..000000000000
+--- a/drivers/scsi/megaraid/megaraid_sas_base.c
++++ b/drivers/scsi/megaraid/megaraid_sas_base.c
+@@@ -3421,8 -3445,9 +3439,12 @@@ static struct scsi_host_template megasa
+  	.eh_timed_out = megasas_reset_timer,
+  	.shost_attrs = megaraid_host_attrs,
+  	.bios_param = megasas_bios_param,
+++<<<<<<< HEAD
+ +	.use_clustering = ENABLE_CLUSTERING,
+++=======
++ 	.map_queues = megasas_map_queues,
+++>>>>>>> 103fbf8e4020 (scsi: megaraid_sas: Added support for shared host tagset for cpuhotplug)
+  	.change_queue_depth = scsi_change_queue_depth,
+ -	.max_segment_size = 0xffffffff,
+  };
+  
+  /**
+* Unmerged path drivers/scsi/megaraid/megaraid_sas_base.c
+diff --git a/drivers/scsi/megaraid/megaraid_sas_fusion.c b/drivers/scsi/megaraid/megaraid_sas_fusion.c
+index 04d0732c4a82..2ef8e5b8416c 100644
+--- a/drivers/scsi/megaraid/megaraid_sas_fusion.c
++++ b/drivers/scsi/megaraid/megaraid_sas_fusion.c
+@@ -371,24 +371,29 @@ megasas_get_msix_index(struct megasas_instance *instance,
+ {
+ 	int sdev_busy;
+ 
+-	/* nr_hw_queue = 1 for MegaRAID */
+-	struct blk_mq_hw_ctx *hctx =
+-		scmd->device->request_queue->queue_hw_ctx[0];
+-
+-	sdev_busy = atomic_read(&hctx->nr_active);
++	/* TBD - if sml remove device_busy in future, driver
++	 * should track counter in internal structure.
++	 */
++	sdev_busy = atomic_read(&scmd->device->device_busy);
+ 
+ 	if (instance->perf_mode == MR_BALANCED_PERF_MODE &&
+-	    sdev_busy > (data_arms * MR_DEVICE_HIGH_IOPS_DEPTH))
++	    sdev_busy > (data_arms * MR_DEVICE_HIGH_IOPS_DEPTH)) {
+ 		cmd->request_desc->SCSIIO.MSIxIndex =
+ 			mega_mod64((atomic64_add_return(1, &instance->high_iops_outstanding) /
+ 					MR_HIGH_IOPS_BATCH_COUNT), instance->low_latency_index_start);
+-	else if (instance->msix_load_balance)
++	} else if (instance->msix_load_balance) {
+ 		cmd->request_desc->SCSIIO.MSIxIndex =
+ 			(mega_mod64(atomic64_add_return(1, &instance->total_io_count),
+ 				instance->msix_vectors));
+-	else
++	} else if (instance->host->nr_hw_queues > 1) {
++		u32 tag = blk_mq_unique_tag(scmd->request);
++
++		cmd->request_desc->SCSIIO.MSIxIndex = blk_mq_unique_tag_to_hwq(tag) +
++			instance->low_latency_index_start;
++	} else {
+ 		cmd->request_desc->SCSIIO.MSIxIndex =
+ 			instance->reply_map[raw_smp_processor_id()];
++	}
+ }
+ 
+ /**
+@@ -968,9 +973,6 @@ megasas_alloc_cmds_fusion(struct megasas_instance *instance)
+ 	if (megasas_alloc_cmdlist_fusion(instance))
+ 		goto fail_exit;
+ 
+-	dev_info(&instance->pdev->dev, "Configured max firmware commands: %d\n",
+-		 instance->max_fw_cmds);
+-
+ 	/* The first 256 bytes (SMID 0) is not used. Don't add to the cmd list */
+ 	io_req_base = fusion->io_request_frames + MEGA_MPI2_RAID_DEFAULT_IO_FRAME_SIZE;
+ 	io_req_base_phys = fusion->io_request_frames_phys + MEGA_MPI2_RAID_DEFAULT_IO_FRAME_SIZE;
+@@ -1114,8 +1116,9 @@ megasas_ioc_init_fusion(struct megasas_instance *instance)
+ 		MR_HIGH_IOPS_QUEUE_COUNT) && cur_intr_coalescing)
+ 		instance->perf_mode = MR_BALANCED_PERF_MODE;
+ 
+-	dev_info(&instance->pdev->dev, "Performance mode :%s\n",
+-		MEGASAS_PERF_MODE_2STR(instance->perf_mode));
++	dev_info(&instance->pdev->dev, "Performance mode :%s (latency index = %d)\n",
++		MEGASAS_PERF_MODE_2STR(instance->perf_mode),
++		instance->low_latency_index_start);
+ 
+ 	instance->fw_sync_cache_support = (scratch_pad_1 &
+ 		MR_CAN_HANDLE_SYNC_CACHE_OFFSET) ? 1 : 0;
