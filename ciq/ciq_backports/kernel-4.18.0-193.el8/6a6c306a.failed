@@ -1,0 +1,232 @@
+RDMA/restrack: Make is_visible_in_pid_ns() as an API
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-193.el8
+commit-author Mark Zhang <markz@mellanox.com>
+commit 6a6c306a09b5227d51fcc1643c888e316935dfa8
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-193.el8/6a6c306a.failed
+
+Remove is_visible_in_pid_ns() from nldev.c and make it as a restrack API,
+so that it can be taken advantage by other parts like counter.
+
+	Signed-off-by: Mark Zhang <markz@mellanox.com>
+	Reviewed-by: Majd Dibbiny <majd@mellanox.com>
+	Signed-off-by: Leon Romanovsky <leonro@mellanox.com>
+	Signed-off-by: Jason Gunthorpe <jgg@mellanox.com>
+(cherry picked from commit 6a6c306a09b5227d51fcc1643c888e316935dfa8)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/infiniband/core/nldev.c
+#	drivers/infiniband/core/restrack.h
+diff --cc drivers/infiniband/core/nldev.c
+index efccd8e0fb77,d9ebfb50962b..000000000000
+--- a/drivers/infiniband/core/nldev.c
++++ b/drivers/infiniband/core/nldev.c
+@@@ -938,15 -999,90 +938,99 @@@ static const struct nldev_fill_res_entr
+  	},
+  };
+  
+++<<<<<<< HEAD
+ +static bool is_visible_in_pid_ns(struct rdma_restrack_entry *res)
+ +{
+ +	/*
+ +	 * 1. Kern resources should be visible in init name space only
+ +	 * 2. Present only resources visible in the current namespace
+ +	 */
+ +	if (rdma_is_kernel_res(res))
+ +		return task_active_pid_ns(current) == &init_pid_ns;
+ +	return task_active_pid_ns(current) == task_active_pid_ns(res->task);
+++=======
++ static int res_get_common_doit(struct sk_buff *skb, struct nlmsghdr *nlh,
++ 			       struct netlink_ext_ack *extack,
++ 			       enum rdma_restrack_type res_type)
++ {
++ 	const struct nldev_fill_res_entry *fe = &fill_entries[res_type];
++ 	struct nlattr *tb[RDMA_NLDEV_ATTR_MAX];
++ 	struct rdma_restrack_entry *res;
++ 	struct ib_device *device;
++ 	u32 index, id, port = 0;
++ 	bool has_cap_net_admin;
++ 	struct sk_buff *msg;
++ 	int ret;
++ 
++ 	ret = nlmsg_parse_deprecated(nlh, 0, tb, RDMA_NLDEV_ATTR_MAX - 1,
++ 				     nldev_policy, extack);
++ 	if (ret || !tb[RDMA_NLDEV_ATTR_DEV_INDEX] || !fe->id || !tb[fe->id])
++ 		return -EINVAL;
++ 
++ 	index = nla_get_u32(tb[RDMA_NLDEV_ATTR_DEV_INDEX]);
++ 	device = ib_device_get_by_index(sock_net(skb->sk), index);
++ 	if (!device)
++ 		return -EINVAL;
++ 
++ 	if (tb[RDMA_NLDEV_ATTR_PORT_INDEX]) {
++ 		port = nla_get_u32(tb[RDMA_NLDEV_ATTR_PORT_INDEX]);
++ 		if (!rdma_is_port_valid(device, port)) {
++ 			ret = -EINVAL;
++ 			goto err;
++ 		}
++ 	}
++ 
++ 	if ((port && fe->flags & NLDEV_PER_DEV) ||
++ 	    (!port && ~fe->flags & NLDEV_PER_DEV)) {
++ 		ret = -EINVAL;
++ 		goto err;
++ 	}
++ 
++ 	id = nla_get_u32(tb[fe->id]);
++ 	res = rdma_restrack_get_byid(device, res_type, id);
++ 	if (IS_ERR(res)) {
++ 		ret = PTR_ERR(res);
++ 		goto err;
++ 	}
++ 
++ 	if (!rdma_is_visible_in_pid_ns(res)) {
++ 		ret = -ENOENT;
++ 		goto err_get;
++ 	}
++ 
++ 	msg = nlmsg_new(NLMSG_DEFAULT_SIZE, GFP_KERNEL);
++ 	if (!msg) {
++ 		ret = -ENOMEM;
++ 		goto err;
++ 	}
++ 
++ 	nlh = nlmsg_put(msg, NETLINK_CB(skb).portid, nlh->nlmsg_seq,
++ 			RDMA_NL_GET_TYPE(RDMA_NL_NLDEV, fe->nldev_cmd),
++ 			0, 0);
++ 
++ 	if (fill_nldev_handle(msg, device)) {
++ 		ret = -EMSGSIZE;
++ 		goto err_free;
++ 	}
++ 
++ 	has_cap_net_admin = netlink_capable(skb, CAP_NET_ADMIN);
++ 	ret = fe->fill_res_func(msg, has_cap_net_admin, res, port);
++ 	rdma_restrack_put(res);
++ 	if (ret)
++ 		goto err_free;
++ 
++ 	nlmsg_end(msg, nlh);
++ 	ib_device_put(device);
++ 	return rdma_nl_unicast(msg, NETLINK_CB(skb).portid);
++ 
++ err_free:
++ 	nlmsg_free(msg);
++ err_get:
++ 	rdma_restrack_put(res);
++ err:
++ 	ib_device_put(device);
++ 	return ret;
+++>>>>>>> 6a6c306a09b5 (RDMA/restrack: Make is_visible_in_pid_ns() as an API)
+  }
+  
+  static int res_get_common_dumpit(struct sk_buff *skb,
+@@@ -1011,46 -1150,49 +1095,61 @@@
+  
+  	has_cap_net_admin = netlink_capable(cb->skb, CAP_NET_ADMIN);
+  
+++<<<<<<< HEAD
+ +	down_read(&device->res.rwsem);
+ +	hash_for_each_possible(device->res.hash, res, node, res_type) {
+ +		if (idx < start)
+++=======
++ 	rt = &device->res[res_type];
++ 	xa_lock(&rt->xa);
++ 	/*
++ 	 * FIXME: if the skip ahead is something common this loop should
++ 	 * use xas_for_each & xas_pause to optimize, we can have a lot of
++ 	 * objects.
++ 	 */
++ 	xa_for_each(&rt->xa, id, res) {
++ 		if (!rdma_is_visible_in_pid_ns(res))
++ 			continue;
++ 
++ 		if (idx < start || !rdma_restrack_get(res))
+++>>>>>>> 6a6c306a09b5 (RDMA/restrack: Make is_visible_in_pid_ns() as an API)
+  			goto next;
+  
+ -		xa_unlock(&rt->xa);
+ +		if (!is_visible_in_pid_ns(res))
+ +			goto next;
+  
+ -		filled = true;
+ +		if (!rdma_restrack_get(res))
+ +			/*
+ +			 * Resource is under release now, but we are not
+ +			 * relesing lock now, so it will be released in
+ +			 * our next pass, once we will get ->next pointer.
+ +			 */
+ +			goto next;
+  
+ -		entry_attr = nla_nest_start_noflag(skb, fe->entry);
+ -		if (!entry_attr) {
+ -			ret = -EMSGSIZE;
+ -			rdma_restrack_put(res);
+ -			goto msg_full;
+ -		}
+ +		filled = true;
+  
+ +		up_read(&device->res.rwsem);
+  		ret = fe->fill_res_func(skb, has_cap_net_admin, res, port);
+ +		down_read(&device->res.rwsem);
+ +		/*
+ +		 * Return resource back, but it won't be released till
+ +		 * the &device->res.rwsem will be released for write.
+ +		 */
+  		rdma_restrack_put(res);
+  
+ -		if (ret) {
+ -			nla_nest_cancel(skb, entry_attr);
+ -			if (ret == -EMSGSIZE)
+ -				goto msg_full;
+ -			if (ret == -EAGAIN)
+ -				goto again;
+ +		if (ret == -EMSGSIZE)
+ +			/*
+ +			 * There is a chance to optimize here.
+ +			 * It can be done by using list_prepare_entry
+ +			 * and list_for_each_entry_continue afterwards.
+ +			 */
+ +			break;
+ +		if (ret)
+  			goto res_err;
+ -		}
+ -		nla_nest_end(skb, entry_attr);
+ -again:		xa_lock(&rt->xa);
+  next:		idx++;
+  	}
+ -	xa_unlock(&rt->xa);
+ +	up_read(&device->res.rwsem);
+  
+ -msg_full:
+  	nla_nest_end(skb, table_attr);
+  	nlmsg_end(skb, nlh);
+  	cb->args[0] = idx;
+* Unmerged path drivers/infiniband/core/restrack.h
+* Unmerged path drivers/infiniband/core/nldev.c
+diff --git a/drivers/infiniband/core/restrack.c b/drivers/infiniband/core/restrack.c
+index bfd36820ee66..fb8806295f98 100644
+--- a/drivers/infiniband/core/restrack.c
++++ b/drivers/infiniband/core/restrack.c
+@@ -289,3 +289,16 @@ void rdma_restrack_del(struct rdma_restrack_entry *res)
+ 	}
+ }
+ EXPORT_SYMBOL(rdma_restrack_del);
++
++bool rdma_is_visible_in_pid_ns(struct rdma_restrack_entry *res)
++{
++	/*
++	 * 1. Kern resources should be visible in init
++	 *    namespace only
++	 * 2. Present only resources visible in the current
++	 *     namespace
++	 */
++	if (rdma_is_kernel_res(res))
++		return task_active_pid_ns(current) == &init_pid_ns;
++	return task_active_pid_ns(current) == task_active_pid_ns(res->task);
++}
+* Unmerged path drivers/infiniband/core/restrack.h
