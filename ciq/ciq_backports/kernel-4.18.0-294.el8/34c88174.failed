@@ -1,0 +1,232 @@
+rcu: Support kfree_bulk() interface in kfree_rcu()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Uladzislau Rezki (Sony) <urezki@gmail.com>
+commit 34c881745549e78f31ec65f319457c82aacc53bd
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/34c88174.failed
+
+The kfree_rcu() logic can be improved further by using kfree_bulk()
+interface along with "basic batching support" introduced earlier.
+
+The are at least two advantages of using "bulk" interface:
+- in case of large number of kfree_rcu() requests kfree_bulk()
+  reduces the per-object overhead caused by calling kfree()
+  per-object.
+
+- reduces the number of cache-misses due to "pointer chasing"
+  between objects which can be far spread between each other.
+
+This approach defines a new kfree_rcu_bulk_data structure that
+stores pointers in an array with a specific size. Number of entries
+in that array depends on PAGE_SIZE making kfree_rcu_bulk_data
+structure to be exactly one page.
+
+Since it deals with "block-chain" technique there is an extra
+need in dynamic allocation when a new block is required. Memory
+is allocated with GFP_NOWAIT | __GFP_NOWARN flags, i.e. that
+allows to skip direct reclaim under low memory condition to
+prevent stalling and fails silently under high memory pressure.
+
+The "emergency path" gets maintained when a system is run out of
+memory. In that case objects are linked into regular list.
+
+The "rcuperf" was run to analyze this change in terms of memory
+consumption and kfree_bulk() throughput.
+
+1) Testing on the Intel(R) Xeon(R) W-2135 CPU @ 3.70GHz, 12xCPUs
+with following parameters:
+
+kfree_loops=200000 kfree_alloc_num=1000 kfree_rcu_test=1 kfree_vary_obj_size=1
+dev.2020.01.10a branch
+
+Default / CONFIG_SLAB
+53607352517 ns, loops: 200000, batches: 1885, memory footprint: 1248MB
+53529637912 ns, loops: 200000, batches: 1921, memory footprint: 1193MB
+53570175705 ns, loops: 200000, batches: 1929, memory footprint: 1250MB
+
+Patch / CONFIG_SLAB
+23981587315 ns, loops: 200000, batches: 810, memory footprint: 1219MB
+23879375281 ns, loops: 200000, batches: 822, memory footprint: 1190MB
+24086841707 ns, loops: 200000, batches: 794, memory footprint: 1380MB
+
+Default / CONFIG_SLUB
+51291025022 ns, loops: 200000, batches: 1713, memory footprint: 741MB
+51278911477 ns, loops: 200000, batches: 1671, memory footprint: 719MB
+51256183045 ns, loops: 200000, batches: 1719, memory footprint: 647MB
+
+Patch / CONFIG_SLUB
+50709919132 ns, loops: 200000, batches: 1618, memory footprint: 456MB
+50736297452 ns, loops: 200000, batches: 1633, memory footprint: 507MB
+50660403893 ns, loops: 200000, batches: 1628, memory footprint: 429MB
+
+in case of CONFIG_SLAB there is double increase in performance and
+slightly higher memory usage. As for CONFIG_SLUB, the performance
+figures are better together with lower memory usage.
+
+2) Testing on the HiKey-960, arm64, 8xCPUs with below parameters:
+
+CONFIG_SLAB=y
+kfree_loops=200000 kfree_alloc_num=1000 kfree_rcu_test=1
+
+102898760401 ns, loops: 200000, batches: 5822, memory footprint: 158MB
+89947009882  ns, loops: 200000, batches: 6715, memory footprint: 115MB
+
+rcuperf shows approximately ~12% better throughput in case of
+using "bulk" interface. The "drain logic" or its RCU callback
+does the work faster that leads to better throughput.
+
+	Signed-off-by: Uladzislau Rezki (Sony) <urezki@gmail.com>
+	Tested-by: Joel Fernandes (Google) <joel@joelfernandes.org>
+	Signed-off-by: Paul E. McKenney <paulmck@kernel.org>
+(cherry picked from commit 34c881745549e78f31ec65f319457c82aacc53bd)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	kernel/rcu/tree.c
+diff --cc kernel/rcu/tree.c
+index 4aa7b6bbcde6,51a3aa884a7c..000000000000
+--- a/kernel/rcu/tree.c
++++ b/kernel/rcu/tree.c
+@@@ -2737,14 -2781,43 +2774,45 @@@ static void kfree_rcu_work(struct work_
+  	spin_lock_irqsave(&krcp->lock, flags);
+  	head = krwp->head_free;
+  	krwp->head_free = NULL;
++ 	bhead = krwp->bhead_free;
++ 	krwp->bhead_free = NULL;
+  	spin_unlock_irqrestore(&krcp->lock, flags);
+  
+- 	// List "head" is now private, so traverse locklessly.
++ 	/* "bhead" is now private, so traverse locklessly. */
++ 	for (; bhead; bhead = bnext) {
++ 		bnext = bhead->next;
++ 
++ 		debug_rcu_head_unqueue_bulk(bhead->head_free_debug);
++ 
++ 		rcu_lock_acquire(&rcu_callback_map);
++ 		kfree_bulk(bhead->nr_records, bhead->records);
++ 		rcu_lock_release(&rcu_callback_map);
++ 
++ 		if (cmpxchg(&krcp->bcached, NULL, bhead))
++ 			free_page((unsigned long) bhead);
++ 
++ 		cond_resched_tasks_rcu_qs();
++ 	}
++ 
++ 	/*
++ 	 * Emergency case only. It can happen under low memory
++ 	 * condition when an allocation gets failed, so the "bulk"
++ 	 * path can not be temporary maintained.
++ 	 */
+  	for (; head; head = next) {
+ -		unsigned long offset = (unsigned long)head->func;
+ -
+  		next = head->next;
+- 		// Potentially optimize with kfree_bulk in future.
+  		debug_rcu_head_unqueue(head);
+++<<<<<<< HEAD
+ +		__rcu_reclaim(rcu_state.name, head);
+++=======
++ 		rcu_lock_acquire(&rcu_callback_map);
++ 		trace_rcu_invoke_kfree_callback(rcu_state.name, head, offset);
++ 
++ 		if (!WARN_ON_ONCE(!__is_kfree_rcu_offset(offset)))
++ 			kfree((void *)head - offset);
++ 
++ 		rcu_lock_release(&rcu_callback_map);
+++>>>>>>> 34c881745549 (rcu: Support kfree_bulk() interface in kfree_rcu())
+  		cond_resched_tasks_rcu_qs();
+  	}
+  }
+@@@ -2813,29 -2908,65 +2903,79 @@@ static void kfree_rcu_monitor(struct wo
+  		spin_unlock_irqrestore(&krcp->lock, flags);
+  }
+  
++ static inline bool
++ kfree_call_rcu_add_ptr_to_bulk(struct kfree_rcu_cpu *krcp,
++ 	struct rcu_head *head, rcu_callback_t func)
++ {
++ 	struct kfree_rcu_bulk_data *bnode;
++ 
++ 	if (unlikely(!krcp->initialized))
++ 		return false;
++ 
++ 	lockdep_assert_held(&krcp->lock);
++ 
++ 	/* Check if a new block is required. */
++ 	if (!krcp->bhead ||
++ 			krcp->bhead->nr_records == KFREE_BULK_MAX_ENTR) {
++ 		bnode = xchg(&krcp->bcached, NULL);
++ 		if (!bnode) {
++ 			WARN_ON_ONCE(sizeof(struct kfree_rcu_bulk_data) > PAGE_SIZE);
++ 
++ 			bnode = (struct kfree_rcu_bulk_data *)
++ 				__get_free_page(GFP_NOWAIT | __GFP_NOWARN);
++ 		}
++ 
++ 		/* Switch to emergency path. */
++ 		if (unlikely(!bnode))
++ 			return false;
++ 
++ 		/* Initialize the new block. */
++ 		bnode->nr_records = 0;
++ 		bnode->next = krcp->bhead;
++ 		bnode->head_free_debug = NULL;
++ 
++ 		/* Attach it to the head. */
++ 		krcp->bhead = bnode;
++ 	}
++ 
++ #ifdef CONFIG_DEBUG_OBJECTS_RCU_HEAD
++ 	head->func = func;
++ 	head->next = krcp->bhead->head_free_debug;
++ 	krcp->bhead->head_free_debug = head;
++ #endif
++ 
++ 	/* Finally insert. */
++ 	krcp->bhead->records[krcp->bhead->nr_records++] =
++ 		(void *) head - (unsigned long) func;
++ 
++ 	return true;
++ }
++ 
+  /*
+++<<<<<<< HEAD
+ + * This version of kfree_call_rcu does not do batching of kfree_rcu() requests.
+ + * Used only by rcuperf torture test for comparison with kfree_rcu_batch().
+ + */
+ +void kfree_call_rcu_nobatch(struct rcu_head *head, rcu_callback_t func)
+ +{
+ +	__call_rcu(head, func, 1);
+ +}
+ +EXPORT_SYMBOL_GPL(kfree_call_rcu_nobatch);
+ +
+ +/*
+ + * Queue a request for lazy invocation of kfree() after a grace period.
+++=======
++  * Queue a request for lazy invocation of kfree_bulk()/kfree() after a grace
++  * period. Please note there are two paths are maintained, one is the main one
++  * that uses kfree_bulk() interface and second one is emergency one, that is
++  * used only when the main path can not be maintained temporary, due to memory
++  * pressure.
+++>>>>>>> 34c881745549 (rcu: Support kfree_bulk() interface in kfree_rcu())
+   *
+   * Each kfree_call_rcu() request is added to a batch. The batch will be drained
+-  * every KFREE_DRAIN_JIFFIES number of jiffies. All the objects in the batch
+-  * will be kfree'd in workqueue context. This allows us to:
+-  *
+-  * 1.	Batch requests together to reduce the number of grace periods during
+-  *	heavy kfree_rcu() load.
+-  *
+-  * 2.	It makes it possible to use kfree_bulk() on a large number of
+-  *	kfree_rcu() requests thus reducing cache misses and the per-object
+-  *	overhead of kfree().
++  * every KFREE_DRAIN_JIFFIES number of jiffies. All the objects in the batch will
++  * be free'd in workqueue context. This allows us to: batch requests together to
++  * reduce the number of grace periods during heavy kfree_rcu() load.
+   */
+  void kfree_call_rcu(struct rcu_head *head, rcu_callback_t func)
+  {
+* Unmerged path kernel/rcu/tree.c
