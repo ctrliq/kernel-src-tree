@@ -1,0 +1,221 @@
+NFSD: Remove unused NFSv2 directory entry encoders
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-394.el8
+commit-author Chuck Lever <chuck.lever@oracle.com>
+commit 8a2cf9f5709cc20a1114a7d22655928314fc86f8
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-394.el8/8a2cf9f5.failed
+
+Clean up.
+
+	Signed-off-by: Chuck Lever <chuck.lever@oracle.com>
+(cherry picked from commit 8a2cf9f5709cc20a1114a7d22655928314fc86f8)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/nfsd/nfsproc.c
+#	fs/nfsd/nfsxdr.c
+#	fs/nfsd/xdr.h
+diff --cc fs/nfsd/nfsproc.c
+index ac1e929b2596,c2cd2984e41d..000000000000
+--- a/fs/nfsd/nfsproc.c
++++ b/fs/nfsd/nfsproc.c
+@@@ -586,10 -603,7 +586,14 @@@ nfsd_proc_readdir(struct svc_rqst *rqst
+  	offset = argp->cookie;
+  	resp->status = nfsd_readdir(rqstp, &argp->fh, &offset,
+  				    &resp->common, nfssvc_encode_entry);
+++<<<<<<< HEAD
+ +
+ +	resp->count = resp->buffer - argp->buffer;
+ +	if (resp->offset)
+ +		*resp->offset = htonl(offset);
+++=======
++ 	nfssvc_encode_nfscookie(resp, offset);
+++>>>>>>> 8a2cf9f5709c (NFSD: Remove unused NFSv2 directory entry encoders)
+  
+  	fh_put(&argp->fh);
+  	return rpc_success;
+diff --cc fs/nfsd/nfsxdr.c
+index 0d6a28d055ec,5df6f00d76fd..000000000000
+--- a/fs/nfsd/nfsxdr.c
++++ b/fs/nfsd/nfsxdr.c
+@@@ -612,49 -619,91 +612,137 @@@ nfssvc_encode_statfsres(struct svc_rqs
+  	return 1;
+  }
+  
+++<<<<<<< HEAD
+ +int
+ +nfssvc_encode_entry(void *ccdv, const char *name,
+ +		    int namlen, loff_t offset, u64 ino, unsigned int d_type)
+ +{
+ +	struct readdir_cd *ccd = ccdv;
+ +	struct nfsd_readdirres *cd = container_of(ccd, struct nfsd_readdirres, common);
+ +	__be32	*p = cd->buffer;
+ +	int	buflen, slen;
+ +
+ +	/*
+ +	dprintk("nfsd: entry(%.*s off %ld ino %ld)\n",
+ +			namlen, name, offset, ino);
+ +	 */
+ +
+ +	if (offset > ~((u32) 0)) {
+ +		cd->common.err = nfserr_fbig;
+ +		return -EINVAL;
+ +	}
+ +	if (cd->offset)
+ +		*cd->offset = htonl(offset);
+ +
+ +	/* truncate filename */
+ +	namlen = min(namlen, NFS2_MAXNAMLEN);
+ +	slen = XDR_QUADLEN(namlen);
+ +
+ +	if ((buflen = cd->buflen - slen - 4) < 0) {
+ +		cd->common.err = nfserr_toosmall;
+ +		return -EINVAL;
+ +	}
+ +	if (ino > ~((u32) 0)) {
+ +		cd->common.err = nfserr_fbig;
+ +		return -EINVAL;
+ +	}
+ +	*p++ = xdr_one;				/* mark entry present */
+ +	*p++ = htonl((u32) ino);		/* file id */
+ +	p    = xdr_encode_array(p, name, namlen);/* name length & name */
+ +	cd->offset = p;			/* remember pointer */
+ +	*p++ = htonl(~0U);		/* offset of next entry */
+ +
+ +	cd->buflen = buflen;
+ +	cd->buffer = p;
+ +	cd->common.err = nfs_ok;
+ +	return 0;
+++=======
++ /**
++  * nfssvc_encode_nfscookie - Encode a directory offset cookie
++  * @resp: readdir result context
++  * @offset: offset cookie to encode
++  *
++  * The buffer space for the offset cookie has already been reserved
++  * by svcxdr_encode_entry_common().
++  */
++ void nfssvc_encode_nfscookie(struct nfsd_readdirres *resp, u32 offset)
++ {
++ 	__be32 cookie = cpu_to_be32(offset);
++ 
++ 	if (!resp->cookie_offset)
++ 		return;
++ 
++ 	write_bytes_to_xdr_buf(&resp->dirlist, resp->cookie_offset, &cookie,
++ 			       sizeof(cookie));
++ 	resp->cookie_offset = 0;
++ }
++ 
++ static bool
++ svcxdr_encode_entry_common(struct nfsd_readdirres *resp, const char *name,
++ 			   int namlen, loff_t offset, u64 ino)
++ {
++ 	struct xdr_buf *dirlist = &resp->dirlist;
++ 	struct xdr_stream *xdr = &resp->xdr;
++ 
++ 	if (xdr_stream_encode_item_present(xdr) < 0)
++ 		return false;
++ 	/* fileid */
++ 	if (xdr_stream_encode_u32(xdr, (u32)ino) < 0)
++ 		return false;
++ 	/* name */
++ 	if (xdr_stream_encode_opaque(xdr, name, min(namlen, NFS2_MAXNAMLEN)) < 0)
++ 		return false;
++ 	/* cookie */
++ 	resp->cookie_offset = dirlist->len;
++ 	if (xdr_stream_encode_u32(xdr, ~0U) < 0)
++ 		return false;
++ 
++ 	return true;
++ }
++ 
++ /**
++  * nfssvc_encode_entry - encode one NFSv2 READDIR entry
++  * @data: directory context
++  * @name: name of the object to be encoded
++  * @namlen: length of that name, in bytes
++  * @offset: the offset of the previous entry
++  * @ino: the fileid of this entry
++  * @d_type: unused
++  *
++  * Return values:
++  *   %0: Entry was successfully encoded.
++  *   %-EINVAL: An encoding problem occured, secondary status code in resp->common.err
++  *
++  * On exit, the following fields are updated:
++  *   - resp->xdr
++  *   - resp->common.err
++  *   - resp->cookie_offset
++  */
++ int nfssvc_encode_entry(void *data, const char *name, int namlen,
++ 			loff_t offset, u64 ino, unsigned int d_type)
++ {
++ 	struct readdir_cd *ccd = data;
++ 	struct nfsd_readdirres *resp = container_of(ccd,
++ 						    struct nfsd_readdirres,
++ 						    common);
++ 	unsigned int starting_length = resp->dirlist.len;
++ 
++ 	/* The offset cookie for the previous entry */
++ 	nfssvc_encode_nfscookie(resp, offset);
++ 
++ 	if (!svcxdr_encode_entry_common(resp, name, namlen, offset, ino))
++ 		goto out_toosmall;
++ 
++ 	xdr_commit_encode(&resp->xdr);
++ 	resp->common.err = nfs_ok;
++ 	return 0;
++ 
++ out_toosmall:
++ 	resp->cookie_offset = 0;
++ 	resp->common.err = nfserr_toosmall;
++ 	resp->dirlist.len = starting_length;
++ 	return -EINVAL;
+++>>>>>>> 8a2cf9f5709c (NFSD: Remove unused NFSv2 directory entry encoders)
+  }
+  
+  /*
+diff --cc fs/nfsd/xdr.h
+index d5a6096482b0,bfffcb70a5f8..000000000000
+--- a/fs/nfsd/xdr.h
++++ b/fs/nfsd/xdr.h
+@@@ -111,10 -111,11 +111,14 @@@ struct nfsd_readdirres 
+  
+  	int			count;
+  
+ -	/* Used to encode the reply's entry list */
+ -	struct xdr_stream	xdr;
+ -	struct xdr_buf		dirlist;
+  	struct readdir_cd	common;
+++<<<<<<< HEAD
+ +	__be32 *		buffer;
+ +	int			buflen;
+ +	__be32 *		offset;
+++=======
++ 	unsigned int		cookie_offset;
+++>>>>>>> 8a2cf9f5709c (NFSD: Remove unused NFSv2 directory entry encoders)
+  };
+  
+  struct nfsd_statfsres {
+@@@ -158,8 -159,9 +162,14 @@@ int nfssvc_encode_readres(struct svc_rq
+  int nfssvc_encode_statfsres(struct svc_rqst *, __be32 *);
+  int nfssvc_encode_readdirres(struct svc_rqst *, __be32 *);
+  
+++<<<<<<< HEAD
+ +int nfssvc_encode_entry(void *, const char *name,
+ +			int namlen, loff_t offset, u64 ino, unsigned int);
+++=======
++ void nfssvc_encode_nfscookie(struct nfsd_readdirres *resp, u32 offset);
++ int nfssvc_encode_entry(void *data, const char *name, int namlen,
++ 			loff_t offset, u64 ino, unsigned int d_type);
+++>>>>>>> 8a2cf9f5709c (NFSD: Remove unused NFSv2 directory entry encoders)
+  
+  void nfssvc_release_attrstat(struct svc_rqst *rqstp);
+  void nfssvc_release_diropres(struct svc_rqst *rqstp);
+* Unmerged path fs/nfsd/nfsproc.c
+* Unmerged path fs/nfsd/nfsxdr.c
+* Unmerged path fs/nfsd/xdr.h
