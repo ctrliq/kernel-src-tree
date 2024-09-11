@@ -1,0 +1,485 @@
+ALSA: usb-audio: Avoid unnecessary interface re-setup
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-326.el8
+commit-author Takashi Iwai <tiwai@suse.de>
+commit 00272c61827e37bb64c47499843d8c0d8ee136a5
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-326.el8/00272c61.failed
+
+The current endpoint handling assumed (more or less) a unique 1:1
+relation between the endpoint and the iface/altset.  The exception was
+the sync EP without the implicit feedback which has usually the
+secondary EP of the same altset.  This works fine for most devices,
+but it turned out that some unusual devices like Pinoeer's ones have
+both playback and capture endpoints in the same iface/altsetting and
+use both for the implicit feedback mode.  For handling such a case, we
+need to extend the endpoint management to take the shared interface
+into account.
+
+This patch does that: it adds a new object snd_usb_iface_ref for
+managing the reference counts of the each USB interface that is used
+by each endpoint.  The interface setup is performed only once for the
+(sharing) endpoints, and the doubly initialization is avoided.
+
+Along with this, the resource release of endpoints and interface
+refcounts are put into a single function, snd_usb_endpoint_free_all()
+instead of looping in the caller side.
+
+Fixes: bf6313a0ff76 ("ALSA: usb-audio: Refactor endpoint management")
+Link: https://lore.kernel.org/r/20210108075219.21463-4-tiwai@suse.de
+	Signed-off-by: Takashi Iwai <tiwai@suse.de>
+(cherry picked from commit 00272c61827e37bb64c47499843d8c0d8ee136a5)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	sound/usb/endpoint.c
+diff --cc sound/usb/endpoint.c
+index 208ac2aff462,ae6276aded91..000000000000
+--- a/sound/usb/endpoint.c
++++ b/sound/usb/endpoint.c
+@@@ -548,25 -590,169 +578,107 @@@ int snd_usb_add_endpoint(struct snd_usb
+  }
+  
+  /* Set up syncinterval and maxsyncsize for a sync EP */
+ -static void endpoint_set_syncinterval(struct snd_usb_audio *chip,
+ -				      struct snd_usb_endpoint *ep)
+ -{
+ -	struct usb_host_interface *alts;
+ -	struct usb_endpoint_descriptor *desc;
+ -
+ -	alts = snd_usb_get_host_interface(chip, ep->iface, ep->altsetting);
+ -	if (!alts)
+ -		return;
+ -
+ -	desc = get_endpoint(alts, ep->ep_idx);
+ -	if (desc->bLength >= USB_DT_ENDPOINT_AUDIO_SIZE &&
+ -	    desc->bRefresh >= 1 && desc->bRefresh <= 9)
+ -		ep->syncinterval = desc->bRefresh;
+ -	else if (snd_usb_get_speed(chip->dev) == USB_SPEED_FULL)
+ -		ep->syncinterval = 1;
+ -	else if (desc->bInterval >= 1 && desc->bInterval <= 16)
+ -		ep->syncinterval = desc->bInterval - 1;
+ -	else
+ -		ep->syncinterval = 3;
+ -
+ -	ep->syncmaxsize = le16_to_cpu(desc->wMaxPacketSize);
+ -}
+ -
+ -static bool endpoint_compatible(struct snd_usb_endpoint *ep,
+ -				const struct audioformat *fp,
+ -				const struct snd_pcm_hw_params *params)
+ -{
+ -	if (!ep->opened)
+ -		return false;
+ -	if (ep->cur_audiofmt != fp)
+ -		return false;
+ -	if (ep->cur_rate != params_rate(params) ||
+ -	    ep->cur_format != params_format(params) ||
+ -	    ep->cur_period_frames != params_period_size(params) ||
+ -	    ep->cur_buffer_periods != params_periods(params))
+ -		return false;
+ -	return true;
+ -}
+ -
+ -/*
+ - * Check whether the given fp and hw params are compatbile with the current
+ - * setup of the target EP for implicit feedback sync
+ - */
+ -bool snd_usb_endpoint_compatible(struct snd_usb_audio *chip,
+ -				 struct snd_usb_endpoint *ep,
+ -				 const struct audioformat *fp,
+ -				 const struct snd_pcm_hw_params *params)
+ -{
+ -	bool ret;
+ -
+ -	mutex_lock(&chip->mutex);
+ -	ret = endpoint_compatible(ep, fp, params);
+ -	mutex_unlock(&chip->mutex);
+ -	return ret;
+ -}
+ -
+ -/*
+ - * snd_usb_endpoint_open: Open the endpoint
+ - *
+ - * Called from hw_params to assign the endpoint to the substream.
+ - * It's reference-counted, and only the first opener is allowed to set up
+ - * arbitrary parameters.  The later opener must be compatible with the
+ - * former opened parameters.
+ - * The endpoint needs to be closed via snd_usb_endpoint_close() later.
+ - *
+ - * Note that this function doesn't configure the endpoint.  The substream
+ - * needs to set it up later via snd_usb_endpoint_configure().
+ - */
+ -struct snd_usb_endpoint *
+ -snd_usb_endpoint_open(struct snd_usb_audio *chip,
+ -		      const struct audioformat *fp,
+ -		      const struct snd_pcm_hw_params *params,
+ -		      bool is_sync_ep)
+ +void snd_usb_endpoint_set_syncinterval(struct snd_usb_audio *chip,
+ +				       struct snd_usb_endpoint *ep,
+ +				       struct usb_host_interface *alts)
+  {
+ -	struct snd_usb_endpoint *ep;
+ -	int ep_num = is_sync_ep ? fp->sync_ep : fp->endpoint;
+ -
+ -	mutex_lock(&chip->mutex);
+ -	ep = snd_usb_get_endpoint(chip, ep_num);
+ -	if (!ep) {
+ -		usb_audio_err(chip, "Cannot find EP 0x%x to open\n", ep_num);
+ -		goto unlock;
+ +	struct usb_endpoint_descriptor *desc = get_endpoint(alts, 1);
+ +
+ +	if (ep->type == SND_USB_ENDPOINT_TYPE_SYNC) {
+ +		if (desc->bLength >= USB_DT_ENDPOINT_AUDIO_SIZE &&
+ +		    desc->bRefresh >= 1 && desc->bRefresh <= 9)
+ +			ep->syncinterval = desc->bRefresh;
+ +		else if (snd_usb_get_speed(chip->dev) == USB_SPEED_FULL)
+ +			ep->syncinterval = 1;
+ +		else if (desc->bInterval >= 1 && desc->bInterval <= 16)
+ +			ep->syncinterval = desc->bInterval - 1;
+ +		else
+ +			ep->syncinterval = 3;
+ +
+ +		ep->syncmaxsize = le16_to_cpu(desc->wMaxPacketSize);
+  	}
+++<<<<<<< HEAD
+++=======
++ 
++ 	if (!ep->opened) {
++ 		if (is_sync_ep) {
++ 			ep->iface = fp->sync_iface;
++ 			ep->altsetting = fp->sync_altsetting;
++ 			ep->ep_idx = fp->sync_ep_idx;
++ 		} else {
++ 			ep->iface = fp->iface;
++ 			ep->altsetting = fp->altsetting;
++ 			ep->ep_idx = 0;
++ 		}
++ 		usb_audio_dbg(chip, "Open EP 0x%x, iface=%d:%d, idx=%d\n",
++ 			      ep_num, ep->iface, ep->altsetting, ep->ep_idx);
++ 
++ 		ep->iface_ref = iface_ref_find(chip, ep->iface);
++ 		if (!ep->iface_ref) {
++ 			ep = NULL;
++ 			goto unlock;
++ 		}
++ 
++ 		ep->cur_audiofmt = fp;
++ 		ep->cur_channels = fp->channels;
++ 		ep->cur_rate = params_rate(params);
++ 		ep->cur_format = params_format(params);
++ 		ep->cur_frame_bytes = snd_pcm_format_physical_width(ep->cur_format) *
++ 			ep->cur_channels / 8;
++ 		ep->cur_period_frames = params_period_size(params);
++ 		ep->cur_period_bytes = ep->cur_period_frames * ep->cur_frame_bytes;
++ 		ep->cur_buffer_periods = params_periods(params);
++ 
++ 		if (ep->type == SND_USB_ENDPOINT_TYPE_SYNC)
++ 			endpoint_set_syncinterval(chip, ep);
++ 
++ 		ep->implicit_fb_sync = fp->implicit_fb;
++ 		ep->need_setup = true;
++ 
++ 		usb_audio_dbg(chip, "  channels=%d, rate=%d, format=%s, period_bytes=%d, periods=%d, implicit_fb=%d\n",
++ 			      ep->cur_channels, ep->cur_rate,
++ 			      snd_pcm_format_name(ep->cur_format),
++ 			      ep->cur_period_bytes, ep->cur_buffer_periods,
++ 			      ep->implicit_fb_sync);
++ 
++ 	} else {
++ 		if (WARN_ON(!ep->iface_ref)) {
++ 			ep = NULL;
++ 			goto unlock;
++ 		}
++ 
++ 		if (!endpoint_compatible(ep, fp, params)) {
++ 			usb_audio_err(chip, "Incompatible EP setup for 0x%x\n",
++ 				      ep_num);
++ 			ep = NULL;
++ 			goto unlock;
++ 		}
++ 
++ 		usb_audio_dbg(chip, "Reopened EP 0x%x (count %d)\n",
++ 			      ep_num, ep->opened);
++ 	}
++ 
++ 	if (!ep->iface_ref->opened++)
++ 		ep->iface_ref->need_setup = true;
++ 
++ 	ep->opened++;
++ 
++  unlock:
++ 	mutex_unlock(&chip->mutex);
++ 	return ep;
++ }
++ 
++ /*
++  * snd_usb_endpoint_set_sync: Link data and sync endpoints
++  *
++  * Pass NULL to sync_ep to unlink again
++  */
++ void snd_usb_endpoint_set_sync(struct snd_usb_audio *chip,
++ 			       struct snd_usb_endpoint *data_ep,
++ 			       struct snd_usb_endpoint *sync_ep)
++ {
++ 	data_ep->sync_source = sync_ep;
+++>>>>>>> 00272c61827e (ALSA: usb-audio: Avoid unnecessary interface re-setup)
+  }
+  
+  /*
+@@@ -587,6 -773,60 +699,63 @@@ void snd_usb_endpoint_set_callback(stru
+  	WRITE_ONCE(ep->data_subs, data_subs);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static int endpoint_set_interface(struct snd_usb_audio *chip,
++ 				  struct snd_usb_endpoint *ep,
++ 				  bool set)
++ {
++ 	int altset = set ? ep->altsetting : 0;
++ 	int err;
++ 
++ 	usb_audio_dbg(chip, "Setting usb interface %d:%d for EP 0x%x\n",
++ 		      ep->iface, altset, ep->ep_num);
++ 	err = usb_set_interface(chip->dev, ep->iface, altset);
++ 	if (err < 0) {
++ 		usb_audio_err(chip, "%d:%d: usb_set_interface failed (%d)\n",
++ 			      ep->iface, altset, err);
++ 		return err;
++ 	}
++ 
++ 	snd_usb_set_interface_quirk(chip);
++ 	return 0;
++ }
++ 
++ /*
++  * snd_usb_endpoint_close: Close the endpoint
++  *
++  * Unreference the already opened endpoint via snd_usb_endpoint_open().
++  */
++ void snd_usb_endpoint_close(struct snd_usb_audio *chip,
++ 			    struct snd_usb_endpoint *ep)
++ {
++ 	mutex_lock(&chip->mutex);
++ 	usb_audio_dbg(chip, "Closing EP 0x%x (count %d)\n",
++ 		      ep->ep_num, ep->opened);
++ 
++ 	if (!--ep->iface_ref->opened)
++ 		endpoint_set_interface(chip, ep, false);
++ 
++ 	if (!--ep->opened) {
++ 		ep->iface = 0;
++ 		ep->altsetting = 0;
++ 		ep->cur_audiofmt = NULL;
++ 		ep->cur_rate = 0;
++ 		ep->iface_ref = NULL;
++ 		usb_audio_dbg(chip, "EP 0x%x closed\n", ep->ep_num);
++ 	}
++ 	mutex_unlock(&chip->mutex);
++ }
++ 
++ /* Prepare for suspening EP, called from the main suspend handler */
++ void snd_usb_endpoint_suspend(struct snd_usb_endpoint *ep)
++ {
++ 	ep->need_setup = true;
++ 	if (ep->iface_ref)
++ 		ep->iface_ref->need_setup = true;
++ }
++ 
+++>>>>>>> 00272c61827e (ALSA: usb-audio: Avoid unnecessary interface re-setup)
+  /*
+   *  wait until all urbs are processed.
+   */
+@@@ -1203,6 -1227,84 +1372,87 @@@ int snd_usb_endpoint_set_params(struct 
+  	return 0;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ /*
++  * snd_usb_endpoint_configure: Configure the endpoint
++  *
++  * This function sets up the EP to be fully usable state.
++  * It's called either from hw_params or prepare callback.
++  * The function checks need_setup flag, and perfoms nothing unless needed,
++  * so it's safe to call this multiple times.
++  *
++  * This returns zero if unchanged, 1 if the configuration has changed,
++  * or a negative error code.
++  */
++ int snd_usb_endpoint_configure(struct snd_usb_audio *chip,
++ 			       struct snd_usb_endpoint *ep)
++ {
++ 	bool iface_first;
++ 	int err = 0;
++ 
++ 	mutex_lock(&chip->mutex);
++ 	if (WARN_ON(!ep->iface_ref))
++ 		goto unlock;
++ 	if (!ep->need_setup)
++ 		goto unlock;
++ 
++ 	/* If the interface has been already set up, just set EP parameters */
++ 	if (!ep->iface_ref->need_setup) {
++ 		err = snd_usb_endpoint_set_params(chip, ep);
++ 		if (err < 0)
++ 			goto unlock;
++ 		goto done;
++ 	}
++ 
++ 	/* Need to deselect altsetting at first */
++ 	endpoint_set_interface(chip, ep, false);
++ 
++ 	/* Some UAC1 devices (e.g. Yamaha THR10) need the host interface
++ 	 * to be set up before parameter setups
++ 	 */
++ 	iface_first = ep->cur_audiofmt->protocol == UAC_VERSION_1;
++ 	if (iface_first) {
++ 		err = endpoint_set_interface(chip, ep, true);
++ 		if (err < 0)
++ 			goto unlock;
++ 	}
++ 
++ 	err = snd_usb_init_pitch(chip, ep->cur_audiofmt);
++ 	if (err < 0)
++ 		goto unlock;
++ 
++ 	err = snd_usb_init_sample_rate(chip, ep->cur_audiofmt, ep->cur_rate);
++ 	if (err < 0)
++ 		goto unlock;
++ 
++ 	err = snd_usb_endpoint_set_params(chip, ep);
++ 	if (err < 0)
++ 		goto unlock;
++ 
++ 	err = snd_usb_select_mode_quirk(chip, ep->cur_audiofmt);
++ 	if (err < 0)
++ 		goto unlock;
++ 
++ 	/* for UAC2/3, enable the interface altset here at last */
++ 	if (!iface_first) {
++ 		err = endpoint_set_interface(chip, ep, true);
++ 		if (err < 0)
++ 			goto unlock;
++ 	}
++ 
++ 	ep->iface_ref->need_setup = false;
++ 
++  done:
++ 	ep->need_setup = false;
++ 	err = 1;
++ 
++ unlock:
++ 	mutex_unlock(&chip->mutex);
++ 	return err;
++ }
++ 
+++>>>>>>> 00272c61827e (ALSA: usb-audio: Avoid unnecessary interface re-setup)
+  /**
+   * snd_usb_endpoint_start: start an snd_usb_endpoint
+   *
+@@@ -1362,18 -1441,24 +1612,24 @@@ void snd_usb_endpoint_release(struct sn
+  }
+  
+  /**
+-  * snd_usb_endpoint_free: Free the resources of an snd_usb_endpoint
+-  *
+-  * @ep: the endpoint to free
++  * snd_usb_endpoint_free_all: Free the resources of an snd_usb_endpoint
++  * @card: The chip
+   *
+-  * This free all resources of the given ep.
++  * This free all endpoints and those resources
+   */
+- void snd_usb_endpoint_free(struct snd_usb_endpoint *ep)
++ void snd_usb_endpoint_free_all(struct snd_usb_audio *chip)
+  {
+- 	kfree(ep);
++ 	struct snd_usb_endpoint *ep, *en;
++ 	struct snd_usb_iface_ref *ip, *in;
++ 
++ 	list_for_each_entry_safe(ep, en, &chip->ep_list, list)
++ 		kfree(ep);
++ 
++ 	list_for_each_entry_safe(ip, in, &chip->iface_ref_list, list)
++ 		kfree(ip);
+  }
+  
+ -/*
+ +/**
+   * snd_usb_handle_sync_urb: parse an USB sync packet
+   *
+   * @ep: the endpoint to handle the packet
+diff --git a/sound/usb/card.c b/sound/usb/card.c
+index 5a2e1dfa0751..824e5b49736c 100644
+--- a/sound/usb/card.c
++++ b/sound/usb/card.c
+@@ -447,10 +447,8 @@ lookup_device_name(u32 id)
+ static void snd_usb_audio_free(struct snd_card *card)
+ {
+ 	struct snd_usb_audio *chip = card->private_data;
+-	struct snd_usb_endpoint *ep, *n;
+ 
+-	list_for_each_entry_safe(ep, n, &chip->ep_list, list)
+-		snd_usb_endpoint_free(ep);
++	snd_usb_endpoint_free_all(chip);
+ 
+ 	mutex_destroy(&chip->mutex);
+ 	if (!atomic_read(&chip->shutdown))
+@@ -607,6 +605,7 @@ static int snd_usb_audio_create(struct usb_interface *intf,
+ 	chip->usb_id = usb_id;
+ 	INIT_LIST_HEAD(&chip->pcm_list);
+ 	INIT_LIST_HEAD(&chip->ep_list);
++	INIT_LIST_HEAD(&chip->iface_ref_list);
+ 	INIT_LIST_HEAD(&chip->midi_list);
+ 	INIT_LIST_HEAD(&chip->mixer_list);
+ 
+diff --git a/sound/usb/card.h b/sound/usb/card.h
+index ce446f8dba4b..595c6433123a 100644
+--- a/sound/usb/card.h
++++ b/sound/usb/card.h
+@@ -41,6 +41,7 @@ struct audioformat {
+ };
+ 
+ struct snd_usb_substream;
++struct snd_usb_iface_ref;
+ struct snd_usb_endpoint;
+ struct snd_usb_power_domain;
+ 
+@@ -57,6 +58,7 @@ struct snd_urb_ctx {
+ 
+ struct snd_usb_endpoint {
+ 	struct snd_usb_audio *chip;
++	struct snd_usb_iface_ref *iface_ref;
+ 
+ 	int use_count;
+ 	int ep_num;		/* the referenced endpoint number */
+* Unmerged path sound/usb/endpoint.c
+diff --git a/sound/usb/endpoint.h b/sound/usb/endpoint.h
+index e2fddb3dcf7a..9bed199c60a7 100644
+--- a/sound/usb/endpoint.h
++++ b/sound/usb/endpoint.h
+@@ -33,7 +33,7 @@ void snd_usb_endpoint_sync_pending_stop(struct snd_usb_endpoint *ep);
+ int  snd_usb_endpoint_activate(struct snd_usb_endpoint *ep);
+ void snd_usb_endpoint_deactivate(struct snd_usb_endpoint *ep);
+ void snd_usb_endpoint_release(struct snd_usb_endpoint *ep);
+-void snd_usb_endpoint_free(struct snd_usb_endpoint *ep);
++void snd_usb_endpoint_free_all(struct snd_usb_audio *chip);
+ 
+ int snd_usb_endpoint_implicit_feedback_sink(struct snd_usb_endpoint *ep);
+ int snd_usb_endpoint_slave_next_packet_size(struct snd_usb_endpoint *ep);
+diff --git a/sound/usb/usbaudio.h b/sound/usb/usbaudio.h
+index 07c2105a003c..77a23d2a592c 100644
+--- a/sound/usb/usbaudio.h
++++ b/sound/usb/usbaudio.h
+@@ -42,6 +42,7 @@ struct snd_usb_audio {
+ 
+ 	struct list_head pcm_list;	/* list of pcm streams */
+ 	struct list_head ep_list;	/* list of audio-related endpoints */
++	struct list_head iface_ref_list; /* list of interface refcounts */
+ 	int pcm_devs;
+ 
+ 	struct list_head midi_list;	/* list of midi interfaces */
