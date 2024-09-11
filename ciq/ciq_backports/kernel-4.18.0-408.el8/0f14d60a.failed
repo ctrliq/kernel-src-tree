@@ -1,0 +1,422 @@
+dm: improve dm_io reference counting
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-408.el8
+commit-author Ming Lei <ming.lei@redhat.com>
+commit 0f14d60a023cc4fe68758e0fcdc0ce82a82dde7d
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-408.el8/0f14d60a.failed
+
+Currently each dm_io's reference counter is grabbed before calling
+__map_bio(), this way isn't efficient since we can move this grabbing
+to initialization time inside alloc_io().
+
+Meantime it becomes typical async io reference counter model: one is
+for submission side, the other is for completion side, and the io won't
+be completed until both sides are done.
+
+	Signed-off-by: Ming Lei <ming.lei@redhat.com>
+	Signed-off-by: Mike Snitzer <snitzer@kernel.org>
+(cherry picked from commit 0f14d60a023cc4fe68758e0fcdc0ce82a82dde7d)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/md/dm.c
+diff --cc drivers/md/dm.c
+index e7cb1b8972bd,6bc2dc8071fc..000000000000
+--- a/drivers/md/dm.c
++++ b/drivers/md/dm.c
+@@@ -611,8 -589,10 +611,15 @@@ static struct dm_io *alloc_io(struct ma
+  
+  	io = container_of(tio, struct dm_io, tio);
+  	io->magic = DM_IO_MAGIC;
+++<<<<<<< HEAD
+ +	io->status = 0;
+ +	atomic_set(&io->io_count, 1);
+++=======
++ 	io->status = BLK_STS_OK;
++ 
++ 	/* one ref is for submission, the other is for completion */
++ 	atomic_set(&io->io_count, 2);
+++>>>>>>> 0f14d60a023c (dm: improve dm_io reference counting)
+  	this_cpu_inc(*md->pending_io);
+  	io->orig_bio = bio;
+  	io->md = md;
+@@@ -866,6 -881,82 +873,85 @@@ static int __noflush_suspending(struct 
+  	return test_bit(DMF_NOFLUSH_SUSPENDING, &md->flags);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static void dm_io_complete(struct dm_io *io)
++ {
++ 	blk_status_t io_error;
++ 	struct mapped_device *md = io->md;
++ 	struct bio *bio = io->orig_bio;
++ 
++ 	if (io->status == BLK_STS_DM_REQUEUE) {
++ 		unsigned long flags;
++ 		/*
++ 		 * Target requested pushing back the I/O.
++ 		 */
++ 		spin_lock_irqsave(&md->deferred_lock, flags);
++ 		if (__noflush_suspending(md) &&
++ 		    !WARN_ON_ONCE(dm_is_zone_write(md, bio))) {
++ 			/* NOTE early return due to BLK_STS_DM_REQUEUE below */
++ 			bio_list_add_head(&md->deferred, bio);
++ 		} else {
++ 			/*
++ 			 * noflush suspend was interrupted or this is
++ 			 * a write to a zoned target.
++ 			 */
++ 			io->status = BLK_STS_IOERR;
++ 		}
++ 		spin_unlock_irqrestore(&md->deferred_lock, flags);
++ 	}
++ 
++ 	io_error = io->status;
++ 	if (dm_io_flagged(io, DM_IO_ACCOUNTED))
++ 		dm_end_io_acct(io);
++ 	else if (!io_error) {
++ 		/*
++ 		 * Must handle target that DM_MAPIO_SUBMITTED only to
++ 		 * then bio_endio() rather than dm_submit_bio_remap()
++ 		 */
++ 		__dm_start_io_acct(io);
++ 		dm_end_io_acct(io);
++ 	}
++ 	free_io(io);
++ 	smp_wmb();
++ 	this_cpu_dec(*md->pending_io);
++ 
++ 	/* nudge anyone waiting on suspend queue */
++ 	if (unlikely(wq_has_sleeper(&md->wait)))
++ 		wake_up(&md->wait);
++ 
++ 	if (io_error == BLK_STS_DM_REQUEUE || io_error == BLK_STS_AGAIN) {
++ 		if (bio->bi_opf & REQ_POLLED) {
++ 			/*
++ 			 * Upper layer won't help us poll split bio (io->orig_bio
++ 			 * may only reflect a subset of the pre-split original)
++ 			 * so clear REQ_POLLED in case of requeue.
++ 			 */
++ 			bio_clear_polled(bio);
++ 			if (io_error == BLK_STS_AGAIN) {
++ 				/* io_uring doesn't handle BLK_STS_AGAIN (yet) */
++ 				queue_io(md, bio);
++ 			}
++ 		}
++ 		return;
++ 	}
++ 
++ 	if (bio_is_flush_with_data(bio)) {
++ 		/*
++ 		 * Preflush done for flush with data, reissue
++ 		 * without REQ_PREFLUSH.
++ 		 */
++ 		bio->bi_opf &= ~REQ_PREFLUSH;
++ 		queue_io(md, bio);
++ 	} else {
++ 		/* done with normal IO or empty flush */
++ 		if (io_error)
++ 			bio->bi_status = io_error;
++ 		bio_endio(bio);
++ 	}
++ }
++ 
+++>>>>>>> 0f14d60a023c (dm: improve dm_io reference counting)
+  /*
+   * Decrements the number of outstanding ios that a bio has been
+   * cloned into, completing the original io if necc.
+@@@ -1280,15 -1311,12 +1366,19 @@@ static blk_qc_t __map_bio(struct dm_tar
+  	clone->bi_end_io = clone_endio;
+  
+  	/*
+ -	 * Map the clone.
+ +	 * Map the clone.  If r == 0 we don't need to do
+ +	 * anything, the target has assumed ownership of
+ +	 * this io.
+  	 */
+++<<<<<<< HEAD
+ +	dm_io_inc_pending(io);
+ +	sector = clone->bi_iter.bi_sector;
+++=======
++ 	tio->old_sector = clone->bi_iter.bi_sector;
+++>>>>>>> 0f14d60a023c (dm: improve dm_io reference counting)
+  
+ -	if (static_branch_unlikely(&swap_bios_enabled) &&
+ -	    unlikely(swap_bios_limit(ti, clone))) {
+ +	if (unlikely(swap_bios_limit(ti, clone))) {
+ +		struct mapped_device *md = io->md;
+  		int latch = get_swap_bios();
+  		if (unlikely(latch != md->swap_bios))
+  			__set_swap_bios_limit(md, latch);
+@@@ -1410,36 -1422,38 +1500,67 @@@ static void alloc_multiple_bios(struct 
+  	}
+  }
+  
+++<<<<<<< HEAD
+ +static blk_qc_t __clone_and_map_simple_bio(struct clone_info *ci,
+ +					   struct dm_target_io *tio, unsigned *len)
+ +{
+ +	struct bio *clone = &tio->clone;
+ +
+ +	tio->len_ptr = len;
+ +
+ +	__bio_clone_fast(clone, ci->bio);
+ +	if (len)
+ +		bio_setup_sector(clone, ci->sector, *len);
+ +
+ +	return __map_bio(tio);
+ +}
+ +
+ +static void __send_duplicate_bios(struct clone_info *ci, struct dm_target *ti,
+ +				  unsigned num_bios, unsigned *len)
+ +{
+ +	struct bio_list blist = BIO_EMPTY_LIST;
+ +	struct bio *bio;
+ +	struct dm_target_io *tio;
+ +
+ +	alloc_multiple_bios(&blist, ci, ti, num_bios);
+ +
+ +	while ((bio = bio_list_pop(&blist))) {
+ +		tio = container_of(bio, struct dm_target_io, clone);
+ +		(void) __clone_and_map_simple_bio(ci, tio, len);
+++=======
++ static int __send_duplicate_bios(struct clone_info *ci, struct dm_target *ti,
++ 				  unsigned num_bios, unsigned *len)
++ {
++ 	struct bio_list blist = BIO_EMPTY_LIST;
++ 	struct bio *clone;
++ 	int ret = 0;
++ 
++ 	switch (num_bios) {
++ 	case 0:
++ 		break;
++ 	case 1:
++ 		if (len)
++ 			setup_split_accounting(ci, *len);
++ 		clone = alloc_tio(ci, ti, 0, len, GFP_NOIO);
++ 		__map_bio(clone);
++ 		ret = 1;
++ 		break;
++ 	default:
++ 		/* dm_accept_partial_bio() is not supported with shared tio->len_ptr */
++ 		alloc_multiple_bios(&blist, ci, ti, num_bios);
++ 		while ((clone = bio_list_pop(&blist))) {
++ 			dm_tio_set_flag(clone_to_tio(clone), DM_TIO_IS_DUPLICATE_BIO);
++ 			__map_bio(clone);
++ 			ret += 1;
++ 		}
++ 		break;
+++>>>>>>> 0f14d60a023c (dm: improve dm_io reference counting)
+  	}
++ 
++ 	return ret;
+  }
+  
+ -static void __send_empty_flush(struct clone_info *ci)
+ +static int __send_empty_flush(struct clone_info *ci)
+  {
+  	unsigned target_nr = 0;
+  	struct dm_target *ti;
+@@@ -1456,67 -1471,39 +1577,90 @@@
+  	ci->sector_count = 0;
+  	ci->io->tio.clone.bi_iter.bi_size = 0;
+  
+++<<<<<<< HEAD
+ +	/*
+ +	 * Empty flush uses a statically initialized bio, as the base for
+ +	 * cloning.  However, blkg association requires that a bdev is
+ +	 * associated with a gendisk, which doesn't happen until the bdev is
+ +	 * opened.  So, blkg association is done at issue time of the flush
+ +	 * rather than when the device is created in alloc_dev().
+ +	 */
+ +	bio_set_dev(ci->bio, ci->io->md->bdev);
+ +
+ +	while ((ti = dm_table_get_target(ci->map, target_nr++)))
+ +		__send_duplicate_bios(ci, ti, ti->num_flush_bios, NULL);
+++=======
++ 	while ((ti = dm_table_get_target(ci->map, target_nr++))) {
++ 		int bios;
++ 
++ 		atomic_add(ti->num_flush_bios, &ci->io->io_count);
++ 		bios = __send_duplicate_bios(ci, ti, ti->num_flush_bios, NULL);
++ 		atomic_sub(ti->num_flush_bios - bios, &ci->io->io_count);
++ 	}
++ 
++ 	/*
++ 	 * alloc_io() takes one extra reference for submission, so the
++ 	 * reference won't reach 0 without the following subtraction
++ 	 */
++ 	atomic_sub(1, &ci->io->io_count);
+++>>>>>>> 0f14d60a023c (dm: improve dm_io reference counting)
+  
+  	bio_uninit(ci->bio);
+ +	return 0;
+ +}
+ +
+ +static int __clone_and_map_data_bio(struct clone_info *ci, struct dm_target *ti,
+ +				    sector_t sector, unsigned *len)
+ +{
+ +	struct bio *bio = ci->bio;
+ +	struct dm_target_io *tio;
+ +	int r;
+ +
+ +	tio = alloc_tio(ci, ti, 0, GFP_NOIO);
+ +	tio->len_ptr = len;
+ +	r = clone_bio(tio, bio, sector, *len);
+ +	if (r < 0) {
+ +		free_tio(tio);
+ +		return r;
+ +	}
+ +	(void) __map_bio(tio);
+ +
+ +	return 0;
+  }
+  
+ -static void __send_changing_extent_only(struct clone_info *ci, struct dm_target *ti,
+ -					unsigned num_bios)
+ +static bool is_split_required_for_discard(struct dm_target *ti)
+ +{
+ +	return ti->split_discard_bios;
+ +}
+ +
+ +static int __send_changing_extent_only(struct clone_info *ci, struct dm_target *ti,
+ +				       unsigned num_bios, bool is_split_required)
+  {
+  	unsigned len;
++ 	int bios;
+  
+ -	len = min_t(sector_t, ci->sector_count,
+ -		    max_io_len_target_boundary(ti, dm_target_offset(ti, ci->sector)));
+ +	/*
+ +	 * Even though the device advertised support for this type of
+ +	 * request, that does not mean every target supports it, and
+ +	 * reconfiguration might also have changed that since the
+ +	 * check was performed.
+ +	 */
+ +	if (!num_bios)
+ +		return -EOPNOTSUPP;
+ +
+ +	if (!is_split_required)
+ +		len = min_t(sector_t, ci->sector_count,
+ +			    max_io_len_target_boundary(ti, dm_target_offset(ti, ci->sector)));
+ +	else
+ +		len = min_t(sector_t, ci->sector_count, max_io_len(ti, ci->sector));
+  
+- 	__send_duplicate_bios(ci, ti, num_bios, &len);
++ 	atomic_add(num_bios, &ci->io->io_count);
++ 	bios = __send_duplicate_bios(ci, ti, num_bios, &len);
++ 	/*
++ 	 * alloc_io() takes one extra reference for submission, so the
++ 	 * reference won't reach 0 without the following (+1) subtraction
++ 	 */
++ 	atomic_sub(num_bios - bios + 1, &ci->io->io_count);
+  
+  	ci->sector += len;
+  	ci->sector_count -= len;
+@@@ -1608,55 -1649,60 +1752,91 @@@ static void init_clone_info(struct clon
+  /*
+   * Entry point to split a bio into clones and submit them to the targets.
+   */
+ -static void dm_split_and_process_bio(struct mapped_device *md,
+ -				     struct dm_table *map, struct bio *bio)
+ +static blk_qc_t __split_and_process_bio(struct mapped_device *md,
+ +					struct dm_table *map, struct bio *bio)
+  {
+  	struct clone_info ci;
+ -	struct dm_io *io;
+ -	blk_status_t error = BLK_STS_OK;
+ +	blk_qc_t ret = BLK_QC_T_NONE;
+ +	int error = 0;
+  
+  	init_clone_info(&ci, md, map, bio);
+ -	io = ci.io;
+  
+  	if (bio->bi_opf & REQ_PREFLUSH) {
+ -		__send_empty_flush(&ci);
+ -		/* dm_io_complete submits any data associated with flush */
+ -		goto out;
+ +		error = __send_empty_flush(&ci);
+ +		/* dm_io_dec_pending submits any data associated with flush */
+ +	} else if (op_is_zone_mgmt(bio_op(bio))) {
+ +		ci.bio = bio;
+ +		ci.sector_count = 0;
+ +		error = __split_and_process_non_flush(&ci);
+ +	} else {
+ +		ci.bio = bio;
+ +		ci.sector_count = bio_sectors(bio);
+ +		error = __split_and_process_non_flush(&ci);
+ +		if (ci.sector_count && !error) {
+ +			/*
+ +			 * Remainder must be passed to generic_make_request()
+ +			 * so that it gets handled *after* bios already submitted
+ +			 * have been completely processed.
+ +			 * We take a clone of the original to store in
+ +			 * ci.io->orig_bio to be used by end_io_acct() and
+ +			 * for dec_pending to use for completion handling.
+ +			 */
+ +			struct bio *b = bio_split(bio, bio_sectors(bio) - ci.sector_count,
+ +						  GFP_NOIO, &md->queue->bio_split);
+ +			ci.io->orig_bio = b;
+ +
+ +			bio_chain(b, bio);
+ +			trace_block_split(md->queue, b, bio->bi_iter.bi_sector);
+ +			ret = generic_make_request(bio);
+ +		}
+  	}
+ +	start_io_acct(ci.io);
+  
+++<<<<<<< HEAD
+ +	/* drop the extra reference count */
+ +	dm_io_dec_pending(ci.io, errno_to_blk_status(error));
+ +	return ret;
+++=======
++ 	error = __split_and_process_bio(&ci);
++ 	io->map_task = NULL;
++ 	if (error || !ci.sector_count)
++ 		goto out;
++ 	/*
++ 	 * Remainder must be passed to submit_bio_noacct() so it gets handled
++ 	 * *after* bios already submitted have been completely processed.
++ 	 */
++ 	bio_trim(bio, io->sectors, ci.sector_count);
++ 	trace_block_split(bio, bio->bi_iter.bi_sector);
++ 	bio_inc_remaining(bio);
++ 	submit_bio_noacct(bio);
++ out:
++ 	if (dm_io_flagged(io, DM_IO_START_ACCT))
++ 		dm_start_io_acct(io, NULL);
++ 
++ 	/*
++ 	 * Drop the extra reference count for non-POLLED bio, and hold one
++ 	 * reference for POLLED bio, which will be released in dm_poll_bio
++ 	 *
++ 	 * Add every dm_io instance into the hlist_head which is stored in
++ 	 * bio->bi_private, so that dm_poll_bio can poll them all.
++ 	 */
++ 	if (error || !ci.submit_as_polled) {
++ 		/*
++ 		 * In case of submission failure, the extra reference for
++ 		 * submitting io isn't consumed yet
++ 		 */
++ 		if (error)
++ 			atomic_dec(&io->io_count);
++ 		dm_io_dec_pending(io, error);
++ 	} else
++ 		dm_queue_poll_io(bio, io);
+++>>>>>>> 0f14d60a023c (dm: improve dm_io reference counting)
+  }
+  
+ -static void dm_submit_bio(struct bio *bio)
+ +static blk_qc_t dm_make_request(struct request_queue *q, struct bio *bio)
+  {
+ -	struct mapped_device *md = bio->bi_bdev->bd_disk->private_data;
+ +	struct mapped_device *md = q->queuedata;
+ +	blk_qc_t ret = BLK_QC_T_NONE;
+  	int srcu_idx;
+  	struct dm_table *map;
+  
+* Unmerged path drivers/md/dm.c
