@@ -1596,7 +1596,7 @@ static bool hdmi_12bpc_possible(const struct intel_crtc_state *crtc_state)
 	if (HAS_GMCH_DISPLAY(dev_priv))
 		return false;
 
-	if (crtc_state->pipe_bpp <= 8*3)
+	if (crtc_state->pipe_bpp < bpc * 3)
 		return false;
 
 	if (!crtc_state->has_hdmi_sink)
