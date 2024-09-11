@@ -1,0 +1,247 @@
+tcp: Refactor pingpong code
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Wei Wang <weiwan@google.com>
+commit 31954cd8bb667030b1c0d3d77f28fe71f06999f9
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/31954cd8.failed
+
+Instead of using pingpong as a single bit information, we refactor the
+code to treat it as a counter. When interactive session is detected,
+we set pingpong count to TCP_PINGPONG_THRESH. And when pingpong count
+is >= TCP_PINGPONG_THRESH, we consider the session in pingpong mode.
+
+This patch is a pure refactor and sets foundation for the next patch.
+This patch itself does not change any pingpong logic.
+
+	Signed-off-by: Wei Wang <weiwan@google.com>
+	Signed-off-by: Yuchung Cheng <ycheng@google.com>
+	Signed-off-by: Eric Dumazet <edumazet@google.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 31954cd8bb667030b1c0d3d77f28fe71f06999f9)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/net/inet_connection_sock.h
+diff --cc include/net/inet_connection_sock.h
+index bcfefea637b6,179609d1d1ea..000000000000
+--- a/include/net/inet_connection_sock.h
++++ b/include/net/inet_connection_sock.h
+@@@ -321,9 -315,20 +321,28 @@@ int inet_csk_compat_setsockopt(struct s
+  
+  struct dst_entry *inet_csk_update_pmtu(struct sock *sk, u32 mtu);
+  
+++<<<<<<< HEAD
+ +static inline bool inet_csk_has_ulp(struct sock *sk)
+ +{
+ +	return inet_sk(sk)->is_icsk && !!inet_csk(sk)->icsk_ulp_ops;
+ +}
+ +
+++=======
++ #define TCP_PINGPONG_THRESH	1
++ 
++ static inline void inet_csk_enter_pingpong_mode(struct sock *sk)
++ {
++ 	inet_csk(sk)->icsk_ack.pingpong = TCP_PINGPONG_THRESH;
++ }
++ 
++ static inline void inet_csk_exit_pingpong_mode(struct sock *sk)
++ {
++ 	inet_csk(sk)->icsk_ack.pingpong = 0;
++ }
++ 
++ static inline bool inet_csk_in_pingpong_mode(struct sock *sk)
++ {
++ 	return inet_csk(sk)->icsk_ack.pingpong >= TCP_PINGPONG_THRESH;
++ }
+++>>>>>>> 31954cd8bb66 (tcp: Refactor pingpong code)
+  #endif /* _INET_CONNECTION_SOCK_H */
+* Unmerged path include/net/inet_connection_sock.h
+diff --git a/net/dccp/input.c b/net/dccp/input.c
+index 85d6c879383d..8d03707abdac 100644
+--- a/net/dccp/input.c
++++ b/net/dccp/input.c
+@@ -480,7 +480,7 @@ static int dccp_rcv_request_sent_state_process(struct sock *sk,
+ 			sk_wake_async(sk, SOCK_WAKE_IO, POLL_OUT);
+ 		}
+ 
+-		if (sk->sk_write_pending || icsk->icsk_ack.pingpong ||
++		if (sk->sk_write_pending || inet_csk_in_pingpong_mode(sk) ||
+ 		    icsk->icsk_accept_queue.rskq_defer_accept) {
+ 			/* Save one ACK. Data will be ready after
+ 			 * several ticks, if write_pending is set.
+diff --git a/net/dccp/timer.c b/net/dccp/timer.c
+index 1501a20a94ca..74e138495d67 100644
+--- a/net/dccp/timer.c
++++ b/net/dccp/timer.c
+@@ -199,7 +199,7 @@ static void dccp_delack_timer(struct timer_list *t)
+ 	icsk->icsk_ack.pending &= ~ICSK_ACK_TIMER;
+ 
+ 	if (inet_csk_ack_scheduled(sk)) {
+-		if (!icsk->icsk_ack.pingpong) {
++		if (!inet_csk_in_pingpong_mode(sk)) {
+ 			/* Delayed ACK missed: inflate ATO. */
+ 			icsk->icsk_ack.ato = min(icsk->icsk_ack.ato << 1,
+ 						 icsk->icsk_rto);
+@@ -207,7 +207,7 @@ static void dccp_delack_timer(struct timer_list *t)
+ 			/* Delayed ACK missed: leave pingpong mode and
+ 			 * deflate ATO.
+ 			 */
+-			icsk->icsk_ack.pingpong = 0;
++			inet_csk_exit_pingpong_mode(sk);
+ 			icsk->icsk_ack.ato = TCP_ATO_MIN;
+ 		}
+ 		dccp_send_ack(sk);
+diff --git a/net/ipv4/tcp.c b/net/ipv4/tcp.c
+index 073cd93d21d0..a68e59c6e6e3 100644
+--- a/net/ipv4/tcp.c
++++ b/net/ipv4/tcp.c
+@@ -1571,7 +1571,7 @@ static void tcp_cleanup_rbuf(struct sock *sk, int copied)
+ 		    (copied > 0 &&
+ 		     ((icsk->icsk_ack.pending & ICSK_ACK_PUSHED2) ||
+ 		      ((icsk->icsk_ack.pending & ICSK_ACK_PUSHED) &&
+-		       !icsk->icsk_ack.pingpong)) &&
++		       !inet_csk_in_pingpong_mode(sk))) &&
+ 		      !atomic_read(&sk->sk_rmem_alloc)))
+ 			time_to_ack = true;
+ 	}
+@@ -3002,16 +3002,16 @@ static int do_tcp_setsockopt(struct sock *sk, int level,
+ 
+ 	case TCP_QUICKACK:
+ 		if (!val) {
+-			icsk->icsk_ack.pingpong = 1;
++			inet_csk_enter_pingpong_mode(sk);
+ 		} else {
+-			icsk->icsk_ack.pingpong = 0;
++			inet_csk_exit_pingpong_mode(sk);
+ 			if ((1 << sk->sk_state) &
+ 			    (TCPF_ESTABLISHED | TCPF_CLOSE_WAIT) &&
+ 			    inet_csk_ack_scheduled(sk)) {
+ 				icsk->icsk_ack.pending |= ICSK_ACK_PUSHED;
+ 				tcp_cleanup_rbuf(sk, 1);
+ 				if (!(val & 1))
+-					icsk->icsk_ack.pingpong = 1;
++					inet_csk_enter_pingpong_mode(sk);
+ 			}
+ 		}
+ 		break;
+@@ -3420,7 +3420,7 @@ static int do_tcp_getsockopt(struct sock *sk, int level,
+ 		return 0;
+ 	}
+ 	case TCP_QUICKACK:
+-		val = !icsk->icsk_ack.pingpong;
++		val = !inet_csk_in_pingpong_mode(sk);
+ 		break;
+ 
+ 	case TCP_CONGESTION:
+diff --git a/net/ipv4/tcp_input.c b/net/ipv4/tcp_input.c
+index 59cf4ecfd1aa..4ae80d84359e 100644
+--- a/net/ipv4/tcp_input.c
++++ b/net/ipv4/tcp_input.c
+@@ -222,7 +222,7 @@ void tcp_enter_quickack_mode(struct sock *sk, unsigned int max_quickacks)
+ 	struct inet_connection_sock *icsk = inet_csk(sk);
+ 
+ 	tcp_incr_quickack(sk, max_quickacks);
+-	icsk->icsk_ack.pingpong = 0;
++	inet_csk_exit_pingpong_mode(sk);
+ 	icsk->icsk_ack.ato = TCP_ATO_MIN;
+ }
+ EXPORT_SYMBOL(tcp_enter_quickack_mode);
+@@ -237,7 +237,7 @@ static bool tcp_in_quickack_mode(struct sock *sk)
+ 	const struct dst_entry *dst = __sk_dst_get(sk);
+ 
+ 	return (dst && dst_metric(dst, RTAX_QUICKACK)) ||
+-		(icsk->icsk_ack.quick && !icsk->icsk_ack.pingpong);
++		(icsk->icsk_ack.quick && !inet_csk_in_pingpong_mode(sk));
+ }
+ 
+ static void tcp_ecn_queue_cwr(struct tcp_sock *tp)
+@@ -4172,7 +4172,7 @@ void tcp_fin(struct sock *sk)
+ 	case TCP_ESTABLISHED:
+ 		/* Move to CLOSE_WAIT */
+ 		tcp_set_state(sk, TCP_CLOSE_WAIT);
+-		inet_csk(sk)->icsk_ack.pingpong = 1;
++		inet_csk_enter_pingpong_mode(sk);
+ 		break;
+ 
+ 	case TCP_CLOSE_WAIT:
+@@ -5950,7 +5950,7 @@ static int tcp_rcv_synsent_state_process(struct sock *sk, struct sk_buff *skb,
+ 			return -1;
+ 		if (sk->sk_write_pending ||
+ 		    icsk->icsk_accept_queue.rskq_defer_accept ||
+-		    icsk->icsk_ack.pingpong) {
++		    inet_csk_in_pingpong_mode(sk)) {
+ 			/* Save one ACK. Data will be ready after
+ 			 * several ticks, if write_pending is set.
+ 			 *
+diff --git a/net/ipv4/tcp_ipv4.c b/net/ipv4/tcp_ipv4.c
+index bf9eebce0489..4797b1e9eed4 100644
+--- a/net/ipv4/tcp_ipv4.c
++++ b/net/ipv4/tcp_ipv4.c
+@@ -2454,7 +2454,7 @@ static void get_tcp4_sock(struct sock *sk, struct seq_file *f, int i)
+ 		refcount_read(&sk->sk_refcnt), sk,
+ 		jiffies_to_clock_t(icsk->icsk_rto),
+ 		jiffies_to_clock_t(icsk->icsk_ack.ato),
+-		(icsk->icsk_ack.quick << 1) | icsk->icsk_ack.pingpong,
++		(icsk->icsk_ack.quick << 1) | inet_csk_in_pingpong_mode(sk),
+ 		tp->snd_cwnd,
+ 		state == TCP_LISTEN ?
+ 		    fastopenq->max_qlen :
+diff --git a/net/ipv4/tcp_output.c b/net/ipv4/tcp_output.c
+index d91789f2fcaa..341237aaeb3d 100644
+--- a/net/ipv4/tcp_output.c
++++ b/net/ipv4/tcp_output.c
+@@ -160,7 +160,7 @@ static void tcp_event_data_sent(struct tcp_sock *tp,
+ 	 * packet, enter pingpong mode.
+ 	 */
+ 	if ((u32)(now - icsk->icsk_ack.lrcvtime) < icsk->icsk_ack.ato)
+-		icsk->icsk_ack.pingpong = 1;
++		inet_csk_enter_pingpong_mode(sk);
+ }
+ 
+ /* Account for an ACK we sent. */
+@@ -3665,7 +3665,7 @@ void tcp_send_delayed_ack(struct sock *sk)
+ 		const struct tcp_sock *tp = tcp_sk(sk);
+ 		int max_ato = HZ / 2;
+ 
+-		if (icsk->icsk_ack.pingpong ||
++		if (inet_csk_in_pingpong_mode(sk) ||
+ 		    (icsk->icsk_ack.pending & ICSK_ACK_PUSHED))
+ 			max_ato = TCP_DELACK_MAX;
+ 
+diff --git a/net/ipv4/tcp_timer.c b/net/ipv4/tcp_timer.c
+index b040ce810fdd..a6a0aad9f444 100644
+--- a/net/ipv4/tcp_timer.c
++++ b/net/ipv4/tcp_timer.c
+@@ -292,14 +292,14 @@ void tcp_delack_timer_handler(struct sock *sk)
+ 	icsk->icsk_ack.pending &= ~ICSK_ACK_TIMER;
+ 
+ 	if (inet_csk_ack_scheduled(sk)) {
+-		if (!icsk->icsk_ack.pingpong) {
++		if (!inet_csk_in_pingpong_mode(sk)) {
+ 			/* Delayed ACK missed: inflate ATO. */
+ 			icsk->icsk_ack.ato = min(icsk->icsk_ack.ato << 1, icsk->icsk_rto);
+ 		} else {
+ 			/* Delayed ACK missed: leave pingpong mode and
+ 			 * deflate ATO.
+ 			 */
+-			icsk->icsk_ack.pingpong = 0;
++			inet_csk_exit_pingpong_mode(sk);
+ 			icsk->icsk_ack.ato      = TCP_ATO_MIN;
+ 		}
+ 		tcp_mstamp_refresh(tcp_sk(sk));
+diff --git a/net/ipv6/tcp_ipv6.c b/net/ipv6/tcp_ipv6.c
+index 46e60f6a0531..f07b3764c9d6 100644
+--- a/net/ipv6/tcp_ipv6.c
++++ b/net/ipv6/tcp_ipv6.c
+@@ -1882,7 +1882,7 @@ static void get_tcp6_sock(struct seq_file *seq, struct sock *sp, int i)
+ 		   refcount_read(&sp->sk_refcnt), sp,
+ 		   jiffies_to_clock_t(icsk->icsk_rto),
+ 		   jiffies_to_clock_t(icsk->icsk_ack.ato),
+-		   (icsk->icsk_ack.quick << 1) | icsk->icsk_ack.pingpong,
++		   (icsk->icsk_ack.quick << 1) | inet_csk_in_pingpong_mode(sp),
+ 		   tp->snd_cwnd,
+ 		   state == TCP_LISTEN ?
+ 			fastopenq->max_qlen :
