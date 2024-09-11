@@ -62,3 +62,5 @@ void devprop_gpiochip_set_names(struct gpio_chip *chip,
 
 	kfree(names);
 }
+
+EXPORT_SYMBOL_GPL(devprop_gpiochip_set_names)
