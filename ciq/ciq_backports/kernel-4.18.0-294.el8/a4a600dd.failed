@@ -1,0 +1,137 @@
+udp: call udp_encap_enable for v6 sockets when enabling encap
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Xin Long <lucien.xin@gmail.com>
+commit a4a600dd301ccde6ea239804ec1f19364a39d643
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/a4a600dd.failed
+
+When enabling encap for a ipv6 socket without udp_encap_needed_key
+increased, UDP GRO won't work for v4 mapped v6 address packets as
+sk will be NULL in udp4_gro_receive().
+
+This patch is to enable it by increasing udp_encap_needed_key for
+v6 sockets in udp_tunnel_encap_enable(), and correspondingly
+decrease udp_encap_needed_key in udpv6_destroy_sock().
+
+v1->v2:
+  - add udp_encap_disable() and export it.
+v2->v3:
+  - add the change for rxrpc and bareudp into one patch, as Alex
+    suggested.
+v3->v4:
+  - move rxrpc part to another patch.
+
+	Acked-by: Willem de Bruijn <willemb@google.com>
+	Signed-off-by: Xin Long <lucien.xin@gmail.com>
+	Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+(cherry picked from commit a4a600dd301ccde6ea239804ec1f19364a39d643)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/ipv4/udp.c
+diff --cc net/ipv4/udp.c
+index cfc98bf6ef18,48208fb4e895..000000000000
+--- a/net/ipv4/udp.c
++++ b/net/ipv4/udp.c
+@@@ -550,6 -596,34 +550,37 @@@ void udp_encap_enable(void
+  }
+  EXPORT_SYMBOL(udp_encap_enable);
+  
+++<<<<<<< HEAD
+++=======
++ void udp_encap_disable(void)
++ {
++ 	static_branch_dec(&udp_encap_needed_key);
++ }
++ EXPORT_SYMBOL(udp_encap_disable);
++ 
++ /* Handler for tunnels with arbitrary destination ports: no socket lookup, go
++  * through error handlers in encapsulations looking for a match.
++  */
++ static int __udp4_lib_err_encap_no_sk(struct sk_buff *skb, u32 info)
++ {
++ 	int i;
++ 
++ 	for (i = 0; i < MAX_IPTUN_ENCAP_OPS; i++) {
++ 		int (*handler)(struct sk_buff *skb, u32 info);
++ 		const struct ip_tunnel_encap_ops *encap;
++ 
++ 		encap = rcu_dereference(iptun_encaps[i]);
++ 		if (!encap)
++ 			continue;
++ 		handler = encap->err_handler;
++ 		if (handler && !handler(skb, info))
++ 			return 0;
++ 	}
++ 
++ 	return -ENOENT;
++ }
++ 
+++>>>>>>> a4a600dd301c (udp: call udp_encap_enable for v6 sockets when enabling encap)
+  /* Try to match ICMP errors to UDP tunnels by looking up a socket without
+   * reversing source and destination port: this will match tunnels that force the
+   * same destination port on both endpoints (e.g. VXLAN, GENEVE). Note that
+diff --git a/drivers/net/bareudp.c b/drivers/net/bareudp.c
+index 78a6c69a8d91..f285d14fc8b2 100644
+--- a/drivers/net/bareudp.c
++++ b/drivers/net/bareudp.c
+@@ -245,12 +245,6 @@ static int bareudp_socket_create(struct bareudp_dev *bareudp, __be16 port)
+ 	tunnel_cfg.encap_destroy = NULL;
+ 	setup_udp_tunnel_sock(bareudp->net, sock, &tunnel_cfg);
+ 
+-	/* As the setup_udp_tunnel_sock does not call udp_encap_enable if the
+-	 * socket type is v6 an explicit call to udp_encap_enable is needed.
+-	 */
+-	if (sock->sk->sk_family == AF_INET6)
+-		udp_encap_enable();
+-
+ 	rcu_assign_pointer(bareudp->sock, sock);
+ 	return 0;
+ }
+diff --git a/include/net/udp.h b/include/net/udp.h
+index 412cd5dcc6ce..a9eec8bbb34c 100644
+--- a/include/net/udp.h
++++ b/include/net/udp.h
+@@ -457,6 +457,7 @@ void udp_init(void);
+ 
+ DECLARE_STATIC_KEY_FALSE(udp_encap_needed_key);
+ void udp_encap_enable(void);
++void udp_encap_disable(void);
+ #if IS_ENABLED(CONFIG_IPV6)
+ DECLARE_STATIC_KEY_FALSE(udpv6_encap_needed_key);
+ void udpv6_encap_enable(void);
+diff --git a/include/net/udp_tunnel.h b/include/net/udp_tunnel.h
+index 5c22ff324cab..3d69b11e8e38 100644
+--- a/include/net/udp_tunnel.h
++++ b/include/net/udp_tunnel.h
+@@ -175,9 +175,8 @@ static inline void udp_tunnel_encap_enable(struct socket *sock)
+ #if IS_ENABLED(CONFIG_IPV6)
+ 	if (sock->sk->sk_family == PF_INET6)
+ 		ipv6_stub->udpv6_encap_enable();
+-	else
+ #endif
+-		udp_encap_enable();
++	udp_encap_enable();
+ }
+ 
+ #endif
+* Unmerged path net/ipv4/udp.c
+diff --git a/net/ipv6/udp.c b/net/ipv6/udp.c
+index 0440ef92cf70..b66db10c0b81 100644
+--- a/net/ipv6/udp.c
++++ b/net/ipv6/udp.c
+@@ -1553,8 +1553,10 @@ void udpv6_destroy_sock(struct sock *sk)
+ 			if (encap_destroy)
+ 				encap_destroy(sk);
+ 		}
+-		if (up->encap_enabled)
++		if (up->encap_enabled) {
+ 			static_branch_dec(&udpv6_encap_needed_key);
++			udp_encap_disable();
++		}
+ 	}
+ 
+ 	inet6_destroy_sock(sk);
