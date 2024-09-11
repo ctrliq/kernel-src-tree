@@ -1,0 +1,132 @@
+ath11k: start vdev if a bss peer is already created
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-315.el8
+commit-author Carl Huang <cjhuang@codeaurora.org>
+commit aa44b2f3ecd41f90b7e477158036648a49d21a32
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-315.el8/aa44b2f3.failed
+
+For QCA6390, bss peer must be created before vdev is to start. This
+change is to start vdev if a bss peer is created. Otherwise, ath11k
+delays to start vdev.
+
+This fixes an issue in a case where HT/VHT/HE settings change between
+authentication and association, e.g., due to the user space request
+to disable HT.
+
+Tested-on: QCA6390 hw2.0 PCI WLAN.HST.1.0.1-01740-QCAHSTSWPLZ_V2_TO_X86-1
+
+	Signed-off-by: Carl Huang <cjhuang@codeaurora.org>
+	Signed-off-by: Kalle Valo <kvalo@codeaurora.org>
+Link: https://lore.kernel.org/r/20201211051358.9191-1-cjhuang@codeaurora.org
+(cherry picked from commit aa44b2f3ecd41f90b7e477158036648a49d21a32)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/wireless/ath/ath11k/mac.c
+diff --cc drivers/net/wireless/ath/ath11k/mac.c
+index 4e8304f22476,c1608f64ea95..000000000000
+--- a/drivers/net/wireless/ath/ath11k/mac.c
++++ b/drivers/net/wireless/ath/ath11k/mac.c
+@@@ -3020,7 -3020,9 +3020,13 @@@ static int ath11k_mac_station_add(struc
+  		goto free_tx_stats;
+  	}
+  
+++<<<<<<< HEAD
+ +	if (ab->hw_params.vdev_start_delay) {
+++=======
++ 	if (ab->hw_params.vdev_start_delay &&
++ 	    !arvif->is_started &&
++ 	    arvif->vdev_type != WMI_VDEV_TYPE_AP) {
+++>>>>>>> aa44b2f3ecd4 (ath11k: start vdev if a bss peer is already created)
+  		ret = ath11k_start_vdev_delay(ar->hw, vif);
+  		if (ret) {
+  			ath11k_warn(ab, "failed to delay vdev start: %d\n", ret);
+@@@ -5272,15 -5283,33 +5278,42 @@@ ath11k_mac_op_assign_vif_chanctx(struc
+  		   ctx, arvif->vdev_id);
+  
+  	/* for QCA6390 bss peer must be created before vdev_start */
+++<<<<<<< HEAD
+ +	if (ab->hw_params.vdev_start_delay) {
+++=======
++ 	if (ab->hw_params.vdev_start_delay &&
++ 	    arvif->vdev_type != WMI_VDEV_TYPE_AP &&
++ 	    arvif->vdev_type != WMI_VDEV_TYPE_MONITOR &&
++ 	    !ath11k_peer_find_by_vdev_id(ab, arvif->vdev_id)) {
+++>>>>>>> aa44b2f3ecd4 (ath11k: start vdev if a bss peer is already created)
+  		memcpy(&arvif->chanctx, ctx, sizeof(*ctx));
+ -		ret = 0;
+ -		goto out;
+ +		mutex_unlock(&ar->conf_mutex);
+ +		return 0;
+  	}
+  
+  	if (WARN_ON(arvif->is_started)) {
+++<<<<<<< HEAD
+ +		mutex_unlock(&ar->conf_mutex);
+ +		return -EBUSY;
+++=======
++ 		ret = -EBUSY;
++ 		goto out;
++ 	}
++ 
++ 	if (ab->hw_params.vdev_start_delay &&
++ 	    (arvif->vdev_type == WMI_VDEV_TYPE_AP ||
++ 	    arvif->vdev_type == WMI_VDEV_TYPE_MONITOR)) {
++ 		param.vdev_id = arvif->vdev_id;
++ 		param.peer_type = WMI_PEER_TYPE_DEFAULT;
++ 		param.peer_addr = ar->mac_addr;
++ 
++ 		ret = ath11k_peer_create(ar, arvif, NULL, &param);
++ 		if (ret) {
++ 			ath11k_warn(ab, "failed to create peer after vdev start delay: %d",
++ 				    ret);
++ 			goto out;
++ 		}
+++>>>>>>> aa44b2f3ecd4 (ath11k: start vdev if a bss peer is already created)
+  	}
+  
+  	ret = ath11k_mac_vdev_start(arvif, &ctx->def);
+* Unmerged path drivers/net/wireless/ath/ath11k/mac.c
+diff --git a/drivers/net/wireless/ath/ath11k/peer.c b/drivers/net/wireless/ath/ath11k/peer.c
+index 1866d82678fa..b69e7ebfa930 100644
+--- a/drivers/net/wireless/ath/ath11k/peer.c
++++ b/drivers/net/wireless/ath/ath11k/peer.c
+@@ -76,6 +76,23 @@ struct ath11k_peer *ath11k_peer_find_by_id(struct ath11k_base *ab,
+ 	return NULL;
+ }
+ 
++struct ath11k_peer *ath11k_peer_find_by_vdev_id(struct ath11k_base *ab,
++						int vdev_id)
++{
++	struct ath11k_peer *peer;
++
++	spin_lock_bh(&ab->base_lock);
++
++	list_for_each_entry(peer, &ab->peers, list) {
++		if (vdev_id == peer->vdev_id) {
++			spin_unlock_bh(&ab->base_lock);
++			return peer;
++		}
++	}
++	spin_unlock_bh(&ab->base_lock);
++	return NULL;
++}
++
+ void ath11k_peer_unmap_event(struct ath11k_base *ab, u16 peer_id)
+ {
+ 	struct ath11k_peer *peer;
+diff --git a/drivers/net/wireless/ath/ath11k/peer.h b/drivers/net/wireless/ath/ath11k/peer.h
+index bba2e00b6944..8553ed061aea 100644
+--- a/drivers/net/wireless/ath/ath11k/peer.h
++++ b/drivers/net/wireless/ath/ath11k/peer.h
+@@ -43,5 +43,7 @@ int ath11k_peer_create(struct ath11k *ar, struct ath11k_vif *arvif,
+ 		       struct ieee80211_sta *sta, struct peer_create_params *param);
+ int ath11k_wait_for_peer_delete_done(struct ath11k *ar, u32 vdev_id,
+ 				     const u8 *addr);
++struct ath11k_peer *ath11k_peer_find_by_vdev_id(struct ath11k_base *ab,
++						int vdev_id);
+ 
+ #endif /* _PEER_H_ */
