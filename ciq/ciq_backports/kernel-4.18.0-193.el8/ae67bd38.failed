@@ -1,0 +1,378 @@
+SUNRPC: Fix up task signalling
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-193.el8
+commit-author Trond Myklebust <trondmy@gmail.com>
+commit ae67bd3821bb0a54d97e7883d211196637d487a9
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-193.el8/ae67bd38.failed
+
+The RPC_TASK_KILLED flag should really not be set from another context
+because it can clobber data in the struct task when task->tk_flags is
+changed non-atomically.
+Let's therefore swap out RPC_TASK_KILLED with an atomic flag, and add
+a function to set that flag and safely wake up the task.
+
+	Signed-off-by: Trond Myklebust <trond.myklebust@hammerspace.com>
+	Signed-off-by: Anna Schumaker <Anna.Schumaker@Netapp.com>
+(cherry picked from commit ae67bd3821bb0a54d97e7883d211196637d487a9)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/sunrpc/xprt.c
+diff --cc net/sunrpc/xprt.c
+index c4d4cd12e49e,3a4156cb0134..000000000000
+--- a/net/sunrpc/xprt.c
++++ b/net/sunrpc/xprt.c
+@@@ -995,59 -1302,67 +995,84 @@@ void xprt_end_transmit(struct rpc_task 
+  }
+  
+  /**
+ - * xprt_request_transmit - send an RPC request on a transport
+ - * @req: pointer to request to transmit
+ - * @snd_task: RPC task that owns the transport lock
+ + * xprt_transmit - send an RPC request on a transport
+ + * @task: controlling RPC task
+   *
+ - * This performs the transmission of a single request.
+ - * Note that if the request is not the same as snd_task, then it
+ - * does need to be pinned.
+ - * Returns '0' on success.
+ + * We have to copy the iovec because sendmsg fiddles with its contents.
+   */
+ -static int
+ -xprt_request_transmit(struct rpc_rqst *req, struct rpc_task *snd_task)
+ +void xprt_transmit(struct rpc_task *task)
+  {
+ -	struct rpc_xprt *xprt = req->rq_xprt;
+ -	struct rpc_task *task = req->rq_task;
+ +	struct rpc_rqst	*req = task->tk_rqstp;
+ +	struct rpc_xprt	*xprt = req->rq_xprt;
+  	unsigned int connect_cookie;
+ -	int is_retrans = RPC_WAS_SENT(task);
+  	int status;
+  
+++<<<<<<< HEAD
+ +	dprintk("RPC: %5u xprt_transmit(%u)\n", task->tk_pid, req->rq_slen);
+++=======
++ 	if (!req->rq_bytes_sent) {
++ 		if (xprt_request_data_received(task)) {
++ 			status = 0;
++ 			goto out_dequeue;
++ 		}
++ 		/* Verify that our message lies in the RPCSEC_GSS window */
++ 		if (rpcauth_xmit_need_reencode(task)) {
++ 			status = -EBADMSG;
++ 			goto out_dequeue;
++ 		}
++ 		if (task->tk_ops->rpc_call_prepare_transmit) {
++ 			task->tk_ops->rpc_call_prepare_transmit(task,
++ 					task->tk_calldata);
++ 			status = task->tk_status;
++ 			if (status < 0)
++ 				goto out_dequeue;
++ 		}
++ 		if (RPC_SIGNALLED(task)) {
++ 			status = -ERESTARTSYS;
++ 			goto out_dequeue;
++ 		}
++ 	}
+++>>>>>>> ae67bd3821bb (SUNRPC: Fix up task signalling)
+ +
+ +	if (!req->rq_reply_bytes_recvd) {
+ +
+ +		/* Verify that our message lies in the RPCSEC_GSS window */
+ +		if (!req->rq_bytes_sent && rpcauth_xmit_need_reencode(task)) {
+ +			task->tk_status = -EBADMSG;
+ +			return;
+ +		}
+  
+ -	/*
+ -	 * Update req->rq_ntrans before transmitting to avoid races with
+ -	 * xprt_update_rtt(), which needs to know that it is recording a
+ -	 * reply to the first transmission.
+ -	 */
+ -	req->rq_ntrans++;
+ +		if (list_empty(&req->rq_list) && rpc_reply_expected(task)) {
+ +			/*
+ +			 * Add to the list only if we're expecting a reply
+ +			 */
+ +			/* Update the softirq receive buffer */
+ +			memcpy(&req->rq_private_buf, &req->rq_rcv_buf,
+ +					sizeof(req->rq_private_buf));
+ +			/* Add request to the receive list */
+ +			spin_lock(&xprt->recv_lock);
+ +			list_add_tail(&req->rq_list, &xprt->recv);
+ +			set_bit(RPC_TASK_NEED_RECV, &task->tk_runstate);
+ +			spin_unlock(&xprt->recv_lock);
+ +			xprt_reset_majortimeo(req);
+ +			/* Turn off autodisconnect */
+ +			del_singleshot_timer_sync(&xprt->timer);
+ +		}
+ +	} else if (xprt_request_data_received(task) && !req->rq_bytes_sent)
+ +		return;
+  
+  	connect_cookie = xprt->connect_cookie;
+ -	status = xprt->ops->send_request(req);
+ +	status = xprt->ops->send_request(req, task);
+ +	trace_xprt_transmit(xprt, req->rq_xid, status);
+  	if (status != 0) {
+ -		req->rq_ntrans--;
+ -		trace_xprt_transmit(req, status);
+ -		return status;
+ +		task->tk_status = status;
+ +		return;
+  	}
+  
+ -	if (is_retrans)
+ -		task->tk_client->cl_stats->rpcretrans++;
+ -
+  	xprt_inject_disconnect(xprt);
+  
+ +	dprintk("RPC: %5u xmit complete\n", task->tk_pid);
+ +	clear_bit(RPC_TASK_NEED_XMIT, &task->tk_runstate);
+  	task->tk_flags |= RPC_TASK_SENT;
+  	spin_lock_bh(&xprt->transport_lock);
+  
+diff --git a/fs/lockd/clntproc.c b/fs/lockd/clntproc.c
+index 0a67dd4250e9..39ac05dcff22 100644
+--- a/fs/lockd/clntproc.c
++++ b/fs/lockd/clntproc.c
+@@ -715,7 +715,7 @@ static void nlmclnt_unlock_callback(struct rpc_task *task, void *data)
+ 	struct nlm_rqst	*req = data;
+ 	u32 status = ntohl(req->a_res.status);
+ 
+-	if (RPC_ASSASSINATED(task))
++	if (RPC_SIGNALLED(task))
+ 		goto die;
+ 
+ 	if (task->tk_status < 0) {
+@@ -783,7 +783,7 @@ static void nlmclnt_cancel_callback(struct rpc_task *task, void *data)
+ 	struct nlm_rqst	*req = data;
+ 	u32 status = ntohl(req->a_res.status);
+ 
+-	if (RPC_ASSASSINATED(task))
++	if (RPC_SIGNALLED(task))
+ 		goto die;
+ 
+ 	if (task->tk_status < 0) {
+diff --git a/fs/nfsd/nfs4callback.c b/fs/nfsd/nfs4callback.c
+index 3ddda9d7b444..ef92c411a9bf 100644
+--- a/fs/nfsd/nfs4callback.c
++++ b/fs/nfsd/nfs4callback.c
+@@ -1039,7 +1039,7 @@ static bool nfsd4_cb_sequence_done(struct rpc_task *task, struct nfsd4_callback
+ 		 * the submission code will error out, so we don't need to
+ 		 * handle that case here.
+ 		 */
+-		if (task->tk_flags & RPC_TASK_KILLED)
++		if (RPC_SIGNALLED(task))
+ 			goto need_restart;
+ 
+ 		return true;
+@@ -1092,7 +1092,7 @@ static bool nfsd4_cb_sequence_done(struct rpc_task *task, struct nfsd4_callback
+ 	dprintk("%s: freed slot, new seqid=%d\n", __func__,
+ 		clp->cl_cb_session->se_cb_seq_nr);
+ 
+-	if (task->tk_flags & RPC_TASK_KILLED)
++	if (RPC_SIGNALLED(task))
+ 		goto need_restart;
+ out:
+ 	return ret;
+diff --git a/include/linux/sunrpc/sched.h b/include/linux/sunrpc/sched.h
+index 4e2b893b83a8..b1be186e91be 100644
+--- a/include/linux/sunrpc/sched.h
++++ b/include/linux/sunrpc/sched.h
+@@ -124,7 +124,6 @@ struct rpc_task_setup {
+ #define RPC_CALL_MAJORSEEN	0x0020		/* major timeout seen */
+ #define RPC_TASK_ROOTCREDS	0x0040		/* force root creds */
+ #define RPC_TASK_DYNAMIC	0x0080		/* task was kmalloc'ed */
+-#define RPC_TASK_KILLED		0x0100		/* task was killed */
+ #define RPC_TASK_SOFT		0x0200		/* Use soft timeouts */
+ #define RPC_TASK_SOFTCONN	0x0400		/* Fail if can't connect */
+ #define RPC_TASK_SENT		0x0800		/* message was sent */
+@@ -134,7 +133,6 @@ struct rpc_task_setup {
+ 
+ #define RPC_IS_ASYNC(t)		((t)->tk_flags & RPC_TASK_ASYNC)
+ #define RPC_IS_SWAPPER(t)	((t)->tk_flags & RPC_TASK_SWAPPER)
+-#define RPC_ASSASSINATED(t)	((t)->tk_flags & RPC_TASK_KILLED)
+ #define RPC_IS_SOFT(t)		((t)->tk_flags & (RPC_TASK_SOFT|RPC_TASK_TIMEOUT))
+ #define RPC_IS_SOFTCONN(t)	((t)->tk_flags & RPC_TASK_SOFTCONN)
+ #define RPC_WAS_SENT(t)		((t)->tk_flags & RPC_TASK_SENT)
+@@ -145,6 +143,7 @@ struct rpc_task_setup {
+ #define RPC_TASK_NEED_XMIT	3
+ #define RPC_TASK_NEED_RECV	4
+ #define RPC_TASK_MSG_PIN_WAIT	5
++#define RPC_TASK_SIGNALLED	6
+ 
+ #define RPC_IS_RUNNING(t)	test_bit(RPC_TASK_RUNNING, &(t)->tk_runstate)
+ #define rpc_set_running(t)	set_bit(RPC_TASK_RUNNING, &(t)->tk_runstate)
+@@ -168,6 +167,8 @@ struct rpc_task_setup {
+ 
+ #define RPC_IS_ACTIVATED(t)	test_bit(RPC_TASK_ACTIVE, &(t)->tk_runstate)
+ 
++#define RPC_SIGNALLED(t)	test_bit(RPC_TASK_SIGNALLED, &(t)->tk_runstate)
++
+ /*
+  * Task priorities.
+  * Note: if you change these, you must also change
+@@ -216,6 +217,7 @@ struct rpc_task *rpc_run_task(const struct rpc_task_setup *);
+ struct rpc_task *rpc_run_bc_task(struct rpc_rqst *req);
+ void		rpc_put_task(struct rpc_task *);
+ void		rpc_put_task_async(struct rpc_task *);
++void		rpc_signal_task(struct rpc_task *);
+ void		rpc_exit_task(struct rpc_task *);
+ void		rpc_exit(struct rpc_task *, int);
+ void		rpc_release_calldata(const struct rpc_call_ops *, void *);
+diff --git a/include/trace/events/sunrpc.h b/include/trace/events/sunrpc.h
+index 42376a2afcb8..06d66c02f0e9 100644
+--- a/include/trace/events/sunrpc.h
++++ b/include/trace/events/sunrpc.h
+@@ -82,7 +82,6 @@ TRACE_DEFINE_ENUM(RPC_TASK_SWAPPER);
+ TRACE_DEFINE_ENUM(RPC_CALL_MAJORSEEN);
+ TRACE_DEFINE_ENUM(RPC_TASK_ROOTCREDS);
+ TRACE_DEFINE_ENUM(RPC_TASK_DYNAMIC);
+-TRACE_DEFINE_ENUM(RPC_TASK_KILLED);
+ TRACE_DEFINE_ENUM(RPC_TASK_SOFT);
+ TRACE_DEFINE_ENUM(RPC_TASK_SOFTCONN);
+ TRACE_DEFINE_ENUM(RPC_TASK_SENT);
+@@ -97,7 +96,6 @@ TRACE_DEFINE_ENUM(RPC_TASK_NO_RETRANS_TIMEOUT);
+ 		{ RPC_CALL_MAJORSEEN, "MAJORSEEN" },			\
+ 		{ RPC_TASK_ROOTCREDS, "ROOTCREDS" },			\
+ 		{ RPC_TASK_DYNAMIC, "DYNAMIC" },			\
+-		{ RPC_TASK_KILLED, "KILLED" },				\
+ 		{ RPC_TASK_SOFT, "SOFT" },				\
+ 		{ RPC_TASK_SOFTCONN, "SOFTCONN" },			\
+ 		{ RPC_TASK_SENT, "SENT" },				\
+@@ -111,6 +109,7 @@ TRACE_DEFINE_ENUM(RPC_TASK_ACTIVE);
+ TRACE_DEFINE_ENUM(RPC_TASK_NEED_XMIT);
+ TRACE_DEFINE_ENUM(RPC_TASK_NEED_RECV);
+ TRACE_DEFINE_ENUM(RPC_TASK_MSG_PIN_WAIT);
++TRACE_DEFINE_ENUM(RPC_TASK_SIGNALLED);
+ 
+ #define rpc_show_runstate(flags)					\
+ 	__print_flags(flags, "|",					\
+@@ -119,7 +118,8 @@ TRACE_DEFINE_ENUM(RPC_TASK_MSG_PIN_WAIT);
+ 		{ (1UL << RPC_TASK_ACTIVE), "ACTIVE" },			\
+ 		{ (1UL << RPC_TASK_NEED_XMIT), "NEED_XMIT" },		\
+ 		{ (1UL << RPC_TASK_NEED_RECV), "NEED_RECV" },		\
+-		{ (1UL << RPC_TASK_MSG_PIN_WAIT), "MSG_PIN_WAIT" })
++		{ (1UL << RPC_TASK_MSG_PIN_WAIT), "MSG_PIN_WAIT" },	\
++		{ (1UL << RPC_TASK_SIGNALLED), "SIGNALLED" })
+ 
+ DECLARE_EVENT_CLASS(rpc_task_running,
+ 
+diff --git a/net/sunrpc/clnt.c b/net/sunrpc/clnt.c
+index 2b272ab9272e..27e44578f914 100644
+--- a/net/sunrpc/clnt.c
++++ b/net/sunrpc/clnt.c
+@@ -827,14 +827,8 @@ void rpc_killall_tasks(struct rpc_clnt *clnt)
+ 	 * Spin lock all_tasks to prevent changes...
+ 	 */
+ 	spin_lock(&clnt->cl_lock);
+-	list_for_each_entry(rovr, &clnt->cl_tasks, tk_task) {
+-		if (!RPC_IS_ACTIVATED(rovr))
+-			continue;
+-		if (!(rovr->tk_flags & RPC_TASK_KILLED)) {
+-			rovr->tk_flags |= RPC_TASK_KILLED;
+-			rpc_exit(rovr, -EIO);
+-		}
+-	}
++	list_for_each_entry(rovr, &clnt->cl_tasks, tk_task)
++		rpc_signal_task(rovr);
+ 	spin_unlock(&clnt->cl_lock);
+ }
+ EXPORT_SYMBOL_GPL(rpc_killall_tasks);
+@@ -1460,8 +1454,6 @@ EXPORT_SYMBOL_GPL(rpc_force_rebind);
+ int
+ rpc_restart_call_prepare(struct rpc_task *task)
+ {
+-	if (RPC_ASSASSINATED(task))
+-		return 0;
+ 	task->tk_action = call_start;
+ 	task->tk_status = 0;
+ 	if (task->tk_ops->rpc_call_prepare != NULL)
+@@ -1477,8 +1469,6 @@ EXPORT_SYMBOL_GPL(rpc_restart_call_prepare);
+ int
+ rpc_restart_call(struct rpc_task *task)
+ {
+-	if (RPC_ASSASSINATED(task))
+-		return 0;
+ 	task->tk_action = call_start;
+ 	task->tk_status = 0;
+ 	return 1;
+diff --git a/net/sunrpc/sched.c b/net/sunrpc/sched.c
+index b92b0e9731d5..84dd9708a2e3 100644
+--- a/net/sunrpc/sched.c
++++ b/net/sunrpc/sched.c
+@@ -758,8 +758,7 @@ static void
+ rpc_reset_task_statistics(struct rpc_task *task)
+ {
+ 	task->tk_timeouts = 0;
+-	task->tk_flags &= ~(RPC_CALL_MAJORSEEN|RPC_TASK_KILLED|RPC_TASK_SENT);
+-
++	task->tk_flags &= ~(RPC_CALL_MAJORSEEN|RPC_TASK_SENT);
+ 	rpc_init_task_statistics(task);
+ }
+ 
+@@ -772,7 +771,6 @@ void rpc_exit_task(struct rpc_task *task)
+ 	if (task->tk_ops->rpc_call_done != NULL) {
+ 		task->tk_ops->rpc_call_done(task, task->tk_calldata);
+ 		if (task->tk_action != NULL) {
+-			WARN_ON(RPC_ASSASSINATED(task));
+ 			/* Always release the RPC slot and buffer memory */
+ 			xprt_release(task);
+ 			rpc_reset_task_statistics(task);
+@@ -780,6 +778,19 @@ void rpc_exit_task(struct rpc_task *task)
+ 	}
+ }
+ 
++void rpc_signal_task(struct rpc_task *task)
++{
++	struct rpc_wait_queue *queue;
++
++	if (!RPC_IS_ACTIVATED(task))
++		return;
++	set_bit(RPC_TASK_SIGNALLED, &task->tk_runstate);
++	smp_mb__after_atomic();
++	queue = READ_ONCE(task->tk_waitqueue);
++	if (queue)
++		rpc_wake_up_queued_task_set_status(queue, task, -ERESTARTSYS);
++}
++
+ void rpc_exit(struct rpc_task *task, int status)
+ {
+ 	task->tk_status = status;
+@@ -835,6 +846,13 @@ static void __rpc_execute(struct rpc_task *task)
+ 		 */
+ 		if (!RPC_IS_QUEUED(task))
+ 			continue;
++
++		/*
++		 * Signalled tasks should exit rather than sleep.
++		 */
++		if (RPC_SIGNALLED(task))
++			rpc_exit(task, -ERESTARTSYS);
++
+ 		/*
+ 		 * The queue->lock protects against races with
+ 		 * rpc_make_runnable().
+@@ -860,7 +878,7 @@ static void __rpc_execute(struct rpc_task *task)
+ 		status = out_of_line_wait_on_bit(&task->tk_runstate,
+ 				RPC_TASK_QUEUED, rpc_wait_bit_killable,
+ 				TASK_KILLABLE);
+-		if (status == -ERESTARTSYS) {
++		if (status < 0) {
+ 			/*
+ 			 * When a sync task receives a signal, it exits with
+ 			 * -ERESTARTSYS. In order to catch any callbacks that
+@@ -868,7 +886,7 @@ static void __rpc_execute(struct rpc_task *task)
+ 			 * break the loop here, but go around once more.
+ 			 */
+ 			dprintk("RPC: %5u got signal\n", task->tk_pid);
+-			task->tk_flags |= RPC_TASK_KILLED;
++			set_bit(RPC_TASK_SIGNALLED, &task->tk_runstate);
+ 			rpc_exit(task, -ERESTARTSYS);
+ 		}
+ 		dprintk("RPC: %5u sync task resuming\n", task->tk_pid);
+* Unmerged path net/sunrpc/xprt.c
