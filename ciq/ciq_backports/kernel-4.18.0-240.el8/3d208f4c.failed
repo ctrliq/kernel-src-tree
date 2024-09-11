@@ -1,0 +1,201 @@
+libbpf: Expose btf__align_of() API
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Andrii Nakryiko <andriin@fb.com>
+commit 3d208f4ca111a614903f49d5a77b93ddc6de294e
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/3d208f4c.failed
+
+Expose BTF API that calculates type alignment requirements.
+
+	Signed-off-by: Andrii Nakryiko <andriin@fb.com>
+	Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+Link: https://lore.kernel.org/bpf/20191214014341.3442258-7-andriin@fb.com
+(cherry picked from commit 3d208f4ca111a614903f49d5a77b93ddc6de294e)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	tools/lib/bpf/libbpf.map
+diff --cc tools/lib/bpf/libbpf.map
+index 3ca7228af37e,e7fcca36f186..000000000000
+--- a/tools/lib/bpf/libbpf.map
++++ b/tools/lib/bpf/libbpf.map
+@@@ -188,9 -197,20 +188,21 @@@ LIBBPF_0.0.4 
+  		bpf_map__get_pin_path;
+  		bpf_map__is_pinned;
+  		bpf_map__set_pin_path;
+ -		bpf_object__open_file;
+ -		bpf_object__open_mem;
+ -		bpf_program__attach_trace;
+  		bpf_program__get_expected_attach_type;
+  		bpf_program__get_type;
+ -		bpf_program__is_tracing;
+ -		bpf_program__set_tracing;
+ +		bpf_get_link_xdp_info;
+  		bpf_program__size;
+++<<<<<<< HEAD
+ +		bpf_btf_get_next_id;
+ +} LIBBPF_0.0.3;
+++=======
++ 		btf__find_by_name_kind;
++ 		libbpf_find_vmlinux_btf_id;
++ } LIBBPF_0.0.5;
++ 
++ LIBBPF_0.0.7 {
++ 	global:
++ 		bpf_program__attach;
++ 		btf__align_of;
++ } LIBBPF_0.0.6;
+++>>>>>>> 3d208f4ca111 (libbpf: Expose btf__align_of() API)
+diff --git a/tools/lib/bpf/btf.c b/tools/lib/bpf/btf.c
+index 86a1847e4a9f..8d72e54559ab 100644
+--- a/tools/lib/bpf/btf.c
++++ b/tools/lib/bpf/btf.c
+@@ -278,6 +278,45 @@ __s64 btf__resolve_size(const struct btf *btf, __u32 type_id)
+ 	return nelems * size;
+ }
+ 
++int btf__align_of(const struct btf *btf, __u32 id)
++{
++	const struct btf_type *t = btf__type_by_id(btf, id);
++	__u16 kind = btf_kind(t);
++
++	switch (kind) {
++	case BTF_KIND_INT:
++	case BTF_KIND_ENUM:
++		return min(sizeof(void *), t->size);
++	case BTF_KIND_PTR:
++		return sizeof(void *);
++	case BTF_KIND_TYPEDEF:
++	case BTF_KIND_VOLATILE:
++	case BTF_KIND_CONST:
++	case BTF_KIND_RESTRICT:
++		return btf__align_of(btf, t->type);
++	case BTF_KIND_ARRAY:
++		return btf__align_of(btf, btf_array(t)->type);
++	case BTF_KIND_STRUCT:
++	case BTF_KIND_UNION: {
++		const struct btf_member *m = btf_members(t);
++		__u16 vlen = btf_vlen(t);
++		int i, align = 1, t;
++
++		for (i = 0; i < vlen; i++, m++) {
++			t = btf__align_of(btf, m->type);
++			if (t <= 0)
++				return t;
++			align = max(align, t);
++		}
++
++		return align;
++	}
++	default:
++		pr_warn("unsupported BTF_KIND:%u\n", btf_kind(t));
++		return 0;
++	}
++}
++
+ int btf__resolve_type(const struct btf *btf, __u32 type_id)
+ {
+ 	const struct btf_type *t;
+diff --git a/tools/lib/bpf/btf.h b/tools/lib/bpf/btf.h
+index c73d83a17dcd..1e073f8a2d8f 100644
+--- a/tools/lib/bpf/btf.h
++++ b/tools/lib/bpf/btf.h
+@@ -75,6 +75,7 @@ LIBBPF_API const struct btf_type *btf__type_by_id(const struct btf *btf,
+ 						  __u32 id);
+ LIBBPF_API __s64 btf__resolve_size(const struct btf *btf, __u32 type_id);
+ LIBBPF_API int btf__resolve_type(const struct btf *btf, __u32 type_id);
++LIBBPF_API int btf__align_of(const struct btf *btf, __u32 id);
+ LIBBPF_API int btf__fd(const struct btf *btf);
+ LIBBPF_API const void *btf__get_raw_data(const struct btf *btf, __u32 *size);
+ LIBBPF_API const char *btf__name_by_offset(const struct btf *btf, __u32 offset);
+diff --git a/tools/lib/bpf/btf_dump.c b/tools/lib/bpf/btf_dump.c
+index 613a4208127f..7fced18739fd 100644
+--- a/tools/lib/bpf/btf_dump.c
++++ b/tools/lib/bpf/btf_dump.c
+@@ -671,41 +671,6 @@ static void btf_dump_emit_type(struct btf_dump *d, __u32 id, __u32 cont_id)
+ 	}
+ }
+ 
+-static int btf_align_of(const struct btf *btf, __u32 id)
+-{
+-	const struct btf_type *t = btf__type_by_id(btf, id);
+-	__u16 kind = btf_kind(t);
+-
+-	switch (kind) {
+-	case BTF_KIND_INT:
+-	case BTF_KIND_ENUM:
+-		return min(sizeof(void *), t->size);
+-	case BTF_KIND_PTR:
+-		return sizeof(void *);
+-	case BTF_KIND_TYPEDEF:
+-	case BTF_KIND_VOLATILE:
+-	case BTF_KIND_CONST:
+-	case BTF_KIND_RESTRICT:
+-		return btf_align_of(btf, t->type);
+-	case BTF_KIND_ARRAY:
+-		return btf_align_of(btf, btf_array(t)->type);
+-	case BTF_KIND_STRUCT:
+-	case BTF_KIND_UNION: {
+-		const struct btf_member *m = btf_members(t);
+-		__u16 vlen = btf_vlen(t);
+-		int i, align = 1;
+-
+-		for (i = 0; i < vlen; i++, m++)
+-			align = max(align, btf_align_of(btf, m->type));
+-
+-		return align;
+-	}
+-	default:
+-		pr_warn("unsupported BTF_KIND:%u\n", btf_kind(t));
+-		return 1;
+-	}
+-}
+-
+ static bool btf_is_struct_packed(const struct btf *btf, __u32 id,
+ 				 const struct btf_type *t)
+ {
+@@ -713,18 +678,18 @@ static bool btf_is_struct_packed(const struct btf *btf, __u32 id,
+ 	int align, i, bit_sz;
+ 	__u16 vlen;
+ 
+-	align = btf_align_of(btf, id);
++	align = btf__align_of(btf, id);
+ 	/* size of a non-packed struct has to be a multiple of its alignment*/
+-	if (t->size % align)
++	if (align && t->size % align)
+ 		return true;
+ 
+ 	m = btf_members(t);
+ 	vlen = btf_vlen(t);
+ 	/* all non-bitfield fields have to be naturally aligned */
+ 	for (i = 0; i < vlen; i++, m++) {
+-		align = btf_align_of(btf, m->type);
++		align = btf__align_of(btf, m->type);
+ 		bit_sz = btf_member_bitfield_size(t, i);
+-		if (bit_sz == 0 && m->offset % (8 * align) != 0)
++		if (align && bit_sz == 0 && m->offset % (8 * align) != 0)
+ 			return true;
+ 	}
+ 
+@@ -808,7 +773,7 @@ static void btf_dump_emit_struct_def(struct btf_dump *d,
+ 		fname = btf_name_of(d, m->name_off);
+ 		m_sz = btf_member_bitfield_size(t, i);
+ 		m_off = btf_member_bit_offset(t, i);
+-		align = packed ? 1 : btf_align_of(d->btf, m->type);
++		align = packed ? 1 : btf__align_of(d->btf, m->type);
+ 
+ 		btf_dump_emit_bit_padding(d, off, m_off, m_sz, align, lvl + 1);
+ 		btf_dump_printf(d, "\n%s", pfx(lvl + 1));
+@@ -826,7 +791,7 @@ static void btf_dump_emit_struct_def(struct btf_dump *d,
+ 
+ 	/* pad at the end, if necessary */
+ 	if (is_struct) {
+-		align = packed ? 1 : btf_align_of(d->btf, id);
++		align = packed ? 1 : btf__align_of(d->btf, id);
+ 		btf_dump_emit_bit_padding(d, off, t->size * 8, 0, align,
+ 					  lvl + 1);
+ 	}
+* Unmerged path tools/lib/bpf/libbpf.map
