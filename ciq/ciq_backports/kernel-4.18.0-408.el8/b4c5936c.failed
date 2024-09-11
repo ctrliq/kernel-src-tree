@@ -1,0 +1,368 @@
+KVM: Kill off the old hva-based MMU notifier callbacks
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-408.el8
+commit-author Sean Christopherson <seanjc@google.com>
+commit b4c5936c47f86295cc76672e8dbeeca8b2379ba6
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-408.el8/b4c5936c.failed
+
+Yank out the hva-based MMU notifier APIs now that all architectures that
+use the notifiers have moved to the gfn-based APIs.
+
+No functional change intended.
+
+	Signed-off-by: Sean Christopherson <seanjc@google.com>
+Message-Id: <20210402005658.3024832-7-seanjc@google.com>
+	Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+(cherry picked from commit b4c5936c47f86295cc76672e8dbeeca8b2379ba6)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/kvm_host.h
+#	virt/kvm/kvm_main.c
+diff --cc include/linux/kvm_host.h
+index 20157fe0daad,6b4dd9500d70..000000000000
+--- a/include/linux/kvm_host.h
++++ b/include/linux/kvm_host.h
+@@@ -234,11 -219,17 +234,25 @@@ int kvm_async_pf_wakeup_all(struct kvm_
+  #endif
+  
+  #ifdef KVM_ARCH_WANT_MMU_NOTIFIER
+++<<<<<<< HEAD
+ +int kvm_unmap_hva_range(struct kvm *kvm,
+ +			unsigned long start, unsigned long end, unsigned flags);
+ +int kvm_set_spte_hva(struct kvm *kvm, unsigned long hva, pte_t pte);
+ +int kvm_age_hva(struct kvm *kvm, unsigned long start, unsigned long end);
+ +int kvm_test_age_hva(struct kvm *kvm, unsigned long hva);
+++=======
++ struct kvm_gfn_range {
++ 	struct kvm_memory_slot *slot;
++ 	gfn_t start;
++ 	gfn_t end;
++ 	pte_t pte;
++ 	bool may_block;
++ };
++ bool kvm_unmap_gfn_range(struct kvm *kvm, struct kvm_gfn_range *range);
++ bool kvm_age_gfn(struct kvm *kvm, struct kvm_gfn_range *range);
++ bool kvm_test_age_gfn(struct kvm *kvm, struct kvm_gfn_range *range);
++ bool kvm_set_spte_gfn(struct kvm *kvm, struct kvm_gfn_range *range);
+++>>>>>>> b4c5936c47f8 (KVM: Kill off the old hva-based MMU notifier callbacks)
+  #endif
+  
+  enum {
+diff --cc virt/kvm/kvm_main.c
+index 6f04c4e5e88c,d4c249719a56..000000000000
+--- a/virt/kvm/kvm_main.c
++++ b/virt/kvm/kvm_main.c
+@@@ -482,13 -451,123 +482,130 @@@ static void kvm_mmu_notifier_invalidate
+  	srcu_read_unlock(&kvm->srcu, idx);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ typedef bool (*hva_handler_t)(struct kvm *kvm, struct kvm_gfn_range *range);
++ 
++ struct kvm_hva_range {
++ 	unsigned long start;
++ 	unsigned long end;
++ 	pte_t pte;
++ 	hva_handler_t handler;
++ 	bool flush_on_ret;
++ 	bool may_block;
++ };
++ 
++ static __always_inline int __kvm_handle_hva_range(struct kvm *kvm,
++ 						  const struct kvm_hva_range *range)
++ {
++ 	struct kvm_memory_slot *slot;
++ 	struct kvm_memslots *slots;
++ 	struct kvm_gfn_range gfn_range;
++ 	bool ret = false;
++ 	int i, idx;
++ 
++ 	lockdep_assert_held_write(&kvm->mmu_lock);
++ 
++ 	idx = srcu_read_lock(&kvm->srcu);
++ 
++ 	for (i = 0; i < KVM_ADDRESS_SPACE_NUM; i++) {
++ 		slots = __kvm_memslots(kvm, i);
++ 		kvm_for_each_memslot(slot, slots) {
++ 			unsigned long hva_start, hva_end;
++ 
++ 			hva_start = max(range->start, slot->userspace_addr);
++ 			hva_end = min(range->end, slot->userspace_addr +
++ 						  (slot->npages << PAGE_SHIFT));
++ 			if (hva_start >= hva_end)
++ 				continue;
++ 
++ 			/*
++ 			 * To optimize for the likely case where the address
++ 			 * range is covered by zero or one memslots, don't
++ 			 * bother making these conditional (to avoid writes on
++ 			 * the second or later invocation of the handler).
++ 			 */
++ 			gfn_range.pte = range->pte;
++ 			gfn_range.may_block = range->may_block;
++ 
++ 			/*
++ 			 * {gfn(page) | page intersects with [hva_start, hva_end)} =
++ 			 * {gfn_start, gfn_start+1, ..., gfn_end-1}.
++ 			 */
++ 			gfn_range.start = hva_to_gfn_memslot(hva_start, slot);
++ 			gfn_range.end = hva_to_gfn_memslot(hva_end + PAGE_SIZE - 1, slot);
++ 			gfn_range.slot = slot;
++ 
++ 			ret |= range->handler(kvm, &gfn_range);
++ 		}
++ 	}
++ 
++ 	if (range->flush_on_ret && (ret || kvm->tlbs_dirty))
++ 		kvm_flush_remote_tlbs(kvm);
++ 
++ 	srcu_read_unlock(&kvm->srcu, idx);
++ 
++ 	/* The notifiers are averse to booleans. :-( */
++ 	return (int)ret;
++ }
++ 
++ static __always_inline int kvm_handle_hva_range(struct mmu_notifier *mn,
++ 						unsigned long start,
++ 						unsigned long end,
++ 						pte_t pte,
++ 						hva_handler_t handler)
++ {
++ 	struct kvm *kvm = mmu_notifier_to_kvm(mn);
++ 	const struct kvm_hva_range range = {
++ 		.start		= start,
++ 		.end		= end,
++ 		.pte		= pte,
++ 		.handler	= handler,
++ 		.flush_on_ret	= true,
++ 		.may_block	= false,
++ 	};
++ 	int ret;
++ 
++ 	KVM_MMU_LOCK(kvm);
++ 	ret = __kvm_handle_hva_range(kvm, &range);
++ 	KVM_MMU_UNLOCK(kvm);
++ 
++ 	return ret;
++ }
++ 
++ static __always_inline int kvm_handle_hva_range_no_flush(struct mmu_notifier *mn,
++ 							 unsigned long start,
++ 							 unsigned long end,
++ 							 hva_handler_t handler)
++ {
++ 	struct kvm *kvm = mmu_notifier_to_kvm(mn);
++ 	const struct kvm_hva_range range = {
++ 		.start		= start,
++ 		.end		= end,
++ 		.pte		= __pte(0),
++ 		.handler	= handler,
++ 		.flush_on_ret	= false,
++ 		.may_block	= false,
++ 	};
++ 	int ret;
++ 
++ 	KVM_MMU_LOCK(kvm);
++ 	ret = __kvm_handle_hva_range(kvm, &range);
++ 	KVM_MMU_UNLOCK(kvm);
++ 
++ 	return ret;
++ }
+++>>>>>>> b4c5936c47f8 (KVM: Kill off the old hva-based MMU notifier callbacks)
+  static void kvm_mmu_notifier_change_pte(struct mmu_notifier *mn,
+  					struct mm_struct *mm,
+  					unsigned long address,
+  					pte_t pte)
+  {
+  	struct kvm *kvm = mmu_notifier_to_kvm(mn);
+++<<<<<<< HEAD
+ +	int idx;
+++=======
+++>>>>>>> b4c5936c47f8 (KVM: Kill off the old hva-based MMU notifier callbacks)
+  
+  	trace_kvm_set_spte_hva(address);
+  
+@@@ -499,28 -578,24 +616,46 @@@
+  	 */
+  	WARN_ON_ONCE(!kvm->mmu_notifier_count);
+  
+++<<<<<<< HEAD
+ +	idx = srcu_read_lock(&kvm->srcu);
+ +
+ +	KVM_MMU_LOCK(kvm);
+ +
+ +	if (kvm_set_spte_hva(kvm, address, pte))
+ +		kvm_flush_remote_tlbs(kvm);
+ +
+ +	KVM_MMU_UNLOCK(kvm);
+ +	srcu_read_unlock(&kvm->srcu, idx);
+++=======
++ 	kvm_handle_hva_range(mn, address, address + 1, pte, kvm_set_spte_gfn);
+++>>>>>>> b4c5936c47f8 (KVM: Kill off the old hva-based MMU notifier callbacks)
+  }
+  
+ -static int kvm_mmu_notifier_invalidate_range_start(struct mmu_notifier *mn,
+ -					const struct mmu_notifier_range *range)
+ +static void kvm_mmu_notifier_invalidate_range_start(struct mmu_notifier *mn,
+ +						    struct mm_struct *mm,
+ +						    unsigned long start,
+ +						    unsigned long end)
+  {
+  	struct kvm *kvm = mmu_notifier_to_kvm(mn);
+++<<<<<<< HEAD
+ +	int need_tlb_flush = 0, idx;
+ +
+ +	trace_kvm_unmap_hva_range(range->start, range->end);
+ +
+ +	idx = srcu_read_lock(&kvm->srcu);
+++=======
++ 	const struct kvm_hva_range hva_range = {
++ 		.start		= range->start,
++ 		.end		= range->end,
++ 		.pte		= __pte(0),
++ 		.handler	= kvm_unmap_gfn_range,
++ 		.flush_on_ret	= true,
++ 		.may_block	= mmu_notifier_range_blockable(range),
++ 	};
++ 
++ 	trace_kvm_unmap_hva_range(range->start, range->end);
++ 
+++>>>>>>> b4c5936c47f8 (KVM: Kill off the old hva-based MMU notifier callbacks)
+  	KVM_MMU_LOCK(kvm);
+  	/*
+  	 * The count increase must become visible at unlock time as no
+@@@ -542,17 -617,16 +677,26 @@@
+  		 * complete.
+  		 */
+  		kvm->mmu_notifier_range_start =
+ -			min(kvm->mmu_notifier_range_start, range->start);
+ +			min(kvm->mmu_notifier_range_start, start);
+  		kvm->mmu_notifier_range_end =
+ -			max(kvm->mmu_notifier_range_end, range->end);
+ +			max(kvm->mmu_notifier_range_end, end);
+  	}
+++<<<<<<< HEAD
+ +	need_tlb_flush = kvm_unmap_hva_range(kvm, start, end, 0);
+ +	/* we've to flush the tlb before the pages can be freed */
+ +	if (need_tlb_flush || kvm->tlbs_dirty)
+ +		kvm_flush_remote_tlbs(kvm);
+ +
+ +	KVM_MMU_UNLOCK(kvm);
+ +	srcu_read_unlock(&kvm->srcu, idx);
+++=======
++ 
++ 	__kvm_handle_hva_range(kvm, &hva_range);
++ 
++ 	KVM_MMU_UNLOCK(kvm);
++ 
++ 	return 0;
+++>>>>>>> b4c5936c47f8 (KVM: Kill off the old hva-based MMU notifier callbacks)
+  }
+  
+  static void kvm_mmu_notifier_invalidate_range_end(struct mmu_notifier *mn,
+@@@ -586,22 -658,9 +730,28 @@@ static int kvm_mmu_notifier_clear_flush
+  					      unsigned long start,
+  					      unsigned long end)
+  {
+++<<<<<<< HEAD
+ +	struct kvm *kvm = mmu_notifier_to_kvm(mn);
+ +	int young, idx;
+ +
+ +	trace_kvm_age_hva(start, end);
+ +
+ +	idx = srcu_read_lock(&kvm->srcu);
+ +	KVM_MMU_LOCK(kvm);
+ +
+ +	young = kvm_age_hva(kvm, start, end);
+ +	if (young)
+ +		kvm_flush_remote_tlbs(kvm);
+ +
+ +	KVM_MMU_UNLOCK(kvm);
+ +	srcu_read_unlock(&kvm->srcu, idx);
+ +
+ +	return young;
+++=======
++ 	trace_kvm_age_hva(start, end);
++ 
++ 	return kvm_handle_hva_range(mn, start, end, __pte(0), kvm_age_gfn);
+++>>>>>>> b4c5936c47f8 (KVM: Kill off the old hva-based MMU notifier callbacks)
+  }
+  
+  static int kvm_mmu_notifier_clear_young(struct mmu_notifier *mn,
+@@@ -609,13 -668,8 +759,16 @@@
+  					unsigned long start,
+  					unsigned long end)
+  {
+++<<<<<<< HEAD
+ +	struct kvm *kvm = mmu_notifier_to_kvm(mn);
+ +	int young, idx;
+ +
+++=======
+++>>>>>>> b4c5936c47f8 (KVM: Kill off the old hva-based MMU notifier callbacks)
+  	trace_kvm_age_hva(start, end);
+  
+ +	idx = srcu_read_lock(&kvm->srcu);
+ +	KVM_MMU_LOCK(kvm);
+  	/*
+  	 * Even though we do not flush TLB, this will still adversely
+  	 * affect performance on pre-Haswell Intel EPT, where there is
+@@@ -629,29 -683,17 +782,40 @@@
+  	 * cadence. If we find this inaccurate, we might come up with a
+  	 * more sophisticated heuristic later.
+  	 */
+++<<<<<<< HEAD
+ +	young = kvm_age_hva(kvm, start, end);
+ +	KVM_MMU_UNLOCK(kvm);
+ +	srcu_read_unlock(&kvm->srcu, idx);
+ +
+ +	return young;
+++=======
++ 	return kvm_handle_hva_range_no_flush(mn, start, end, kvm_age_gfn);
+++>>>>>>> b4c5936c47f8 (KVM: Kill off the old hva-based MMU notifier callbacks)
+  }
+  
+  static int kvm_mmu_notifier_test_young(struct mmu_notifier *mn,
+  				       struct mm_struct *mm,
+  				       unsigned long address)
+  {
+++<<<<<<< HEAD
+ +	struct kvm *kvm = mmu_notifier_to_kvm(mn);
+ +	int young, idx;
+ +
+ +	trace_kvm_test_age_hva(address);
+ +
+ +	idx = srcu_read_lock(&kvm->srcu);
+ +	KVM_MMU_LOCK(kvm);
+ +	young = kvm_test_age_hva(kvm, address);
+ +	KVM_MMU_UNLOCK(kvm);
+ +	srcu_read_unlock(&kvm->srcu, idx);
+ +
+ +	return young;
+++=======
++ 	trace_kvm_test_age_hva(address);
++ 
++ 	return kvm_handle_hva_range_no_flush(mn, address, address + 1,
++ 					     kvm_test_age_gfn);
+++>>>>>>> b4c5936c47f8 (KVM: Kill off the old hva-based MMU notifier callbacks)
+  }
+  
+  static void kvm_mmu_notifier_release(struct mmu_notifier *mn,
+diff --git a/arch/powerpc/include/asm/kvm_host.h b/arch/powerpc/include/asm/kvm_host.h
+index 48fb22c8c6ce..cb17a2090ad9 100644
+--- a/arch/powerpc/include/asm/kvm_host.h
++++ b/arch/powerpc/include/asm/kvm_host.h
+@@ -67,7 +67,6 @@
+ #include <linux/mmu_notifier.h>
+ 
+ #define KVM_ARCH_WANT_MMU_NOTIFIER
+-#define KVM_ARCH_WANT_NEW_MMU_NOTIFIER_APIS
+ 
+ #define HPTEG_CACHE_NUM			(1 << 15)
+ #define HPTEG_HASH_BITS_PTE		13
+* Unmerged path include/linux/kvm_host.h
+* Unmerged path virt/kvm/kvm_main.c
