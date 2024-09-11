@@ -1,0 +1,337 @@
+bpf: Enable BPF_PROG_TYPE_SK_REUSEPORT bpf prog in reuseport selection
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-147.el8
+commit-author Martin KaFai Lau <kafai@fb.com>
+commit 8217ca653ec601246832d562207bc24bdf652d2f
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-147.el8/8217ca65.failed
+
+This patch allows a BPF_PROG_TYPE_SK_REUSEPORT bpf prog to select a
+SO_REUSEPORT sk from a BPF_MAP_TYPE_REUSEPORT_ARRAY introduced in
+the earlier patch.  "bpf_run_sk_reuseport()" will return -ECONNREFUSED
+when the BPF_PROG_TYPE_SK_REUSEPORT prog returns SK_DROP.
+The callers, in inet[6]_hashtable.c and ipv[46]/udp.c, are modified to
+handle this case and return NULL immediately instead of continuing the
+sk search from its hashtable.
+
+It re-uses the existing SO_ATTACH_REUSEPORT_EBPF setsockopt to attach
+BPF_PROG_TYPE_SK_REUSEPORT.  The "sk_reuseport_attach_bpf()" will check
+if the attaching bpf prog is in the new SK_REUSEPORT or the existing
+SOCKET_FILTER type and then check different things accordingly.
+
+One level of "__reuseport_attach_prog()" call is removed.  The
+"sk_unhashed() && ..." and "sk->sk_reuseport_cb" tests are pushed
+back to "reuseport_attach_prog()" in sock_reuseport.c.  sock_reuseport.c
+seems to have more knowledge on those test requirements than filter.c.
+In "reuseport_attach_prog()", after new_prog is attached to reuse->prog,
+the old_prog (if any) is also directly freed instead of returning the
+old_prog to the caller and asking the caller to free.
+
+The sysctl_optmem_max check is moved back to the
+"sk_reuseport_attach_filter()" and "sk_reuseport_attach_bpf()".
+As of other bpf prog types, the new BPF_PROG_TYPE_SK_REUSEPORT is only
+bounded by the usual "bpf_prog_charge_memlock()" during load time
+instead of bounded by both bpf_prog_charge_memlock and sysctl_optmem_max.
+
+	Signed-off-by: Martin KaFai Lau <kafai@fb.com>
+	Acked-by: Alexei Starovoitov <ast@kernel.org>
+	Signed-off-by: Daniel Borkmann <daniel@iogearbox.net>
+(cherry picked from commit 8217ca653ec601246832d562207bc24bdf652d2f)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/net/sock_reuseport.h
+#	net/core/filter.c
+#	net/core/sock_reuseport.c
+diff --cc include/net/sock_reuseport.h
+index 0054b3a9b923,8a5f70c7cdf2..000000000000
+--- a/include/net/sock_reuseport.h
++++ b/include/net/sock_reuseport.h
+@@@ -23,7 -34,7 +23,12 @@@ extern struct sock *reuseport_select_so
+  					  u32 hash,
+  					  struct sk_buff *skb,
+  					  int hdr_len);
+++<<<<<<< HEAD
+ +extern struct bpf_prog *reuseport_attach_prog(struct sock *sk,
+ +					      struct bpf_prog *prog);
+++=======
++ extern int reuseport_attach_prog(struct sock *sk, struct bpf_prog *prog);
++ int reuseport_get_id(struct sock_reuseport *reuse);
+++>>>>>>> 8217ca653ec6 (bpf: Enable BPF_PROG_TYPE_SK_REUSEPORT bpf prog in reuseport selection)
+  
+  #endif  /* _SOCK_REUSEPORT_H */
+diff --cc net/core/filter.c
+index 41d091e6cc84,22906b31d43f..000000000000
+--- a/net/core/filter.c
++++ b/net/core/filter.c
+@@@ -1455,30 -1453,6 +1455,33 @@@ static int __sk_attach_prog(struct bpf_
+  	return 0;
+  }
+  
+++<<<<<<< HEAD
+ +static int __reuseport_attach_prog(struct bpf_prog *prog, struct sock *sk)
+ +{
+ +	struct bpf_prog *old_prog;
+ +	int err;
+ +
+ +	if (bpf_prog_size(prog->len) > sysctl_optmem_max)
+ +		return -ENOMEM;
+ +
+ +	if (sk_unhashed(sk) && sk->sk_reuseport) {
+ +		err = reuseport_alloc(sk);
+ +		if (err)
+ +			return err;
+ +	} else if (!rcu_access_pointer(sk->sk_reuseport_cb)) {
+ +		/* The socket wasn't bound with SO_REUSEPORT */
+ +		return -EINVAL;
+ +	}
+ +
+ +	old_prog = reuseport_attach_prog(sk, prog);
+ +	if (old_prog)
+ +		bpf_prog_destroy(old_prog);
+ +
+ +	return 0;
+ +}
+ +
+++=======
+++>>>>>>> 8217ca653ec6 (bpf: Enable BPF_PROG_TYPE_SK_REUSEPORT bpf prog in reuseport selection)
+  static
+  struct bpf_prog *__get_filter(struct sock_fprog *fprog, struct sock *sk)
+  {
+@@@ -1596,15 -1576,46 +1607,55 @@@ int sk_reuseport_attach_bpf(u32 ufd, st
+  	if (IS_ERR(prog))
+  		return PTR_ERR(prog);
+  
+++<<<<<<< HEAD
+ +	rh_mark_used_feature("eBPF/reuseport");
+ +
+ +	err = __reuseport_attach_prog(prog, sk);
+ +	if (err < 0) {
+ +		bpf_prog_put(prog);
+ +		return err;
+++=======
++ 	if (prog->type == BPF_PROG_TYPE_SK_REUSEPORT) {
++ 		/* Like other non BPF_PROG_TYPE_SOCKET_FILTER
++ 		 * bpf prog (e.g. sockmap).  It depends on the
++ 		 * limitation imposed by bpf_prog_load().
++ 		 * Hence, sysctl_optmem_max is not checked.
++ 		 */
++ 		if ((sk->sk_type != SOCK_STREAM &&
++ 		     sk->sk_type != SOCK_DGRAM) ||
++ 		    (sk->sk_protocol != IPPROTO_UDP &&
++ 		     sk->sk_protocol != IPPROTO_TCP) ||
++ 		    (sk->sk_family != AF_INET &&
++ 		     sk->sk_family != AF_INET6)) {
++ 			err = -ENOTSUPP;
++ 			goto err_prog_put;
++ 		}
++ 	} else {
++ 		/* BPF_PROG_TYPE_SOCKET_FILTER */
++ 		if (bpf_prog_size(prog->len) > sysctl_optmem_max) {
++ 			err = -ENOMEM;
++ 			goto err_prog_put;
++ 		}
+++>>>>>>> 8217ca653ec6 (bpf: Enable BPF_PROG_TYPE_SK_REUSEPORT bpf prog in reuseport selection)
+  	}
+  
+- 	return 0;
++ 	err = reuseport_attach_prog(sk, prog);
++ err_prog_put:
++ 	if (err)
++ 		bpf_prog_put(prog);
++ 
++ 	return err;
++ }
++ 
++ void sk_reuseport_prog_free(struct bpf_prog *prog)
++ {
++ 	if (!prog)
++ 		return;
++ 
++ 	if (prog->type == BPF_PROG_TYPE_SK_REUSEPORT)
++ 		bpf_prog_put(prog);
++ 	else
++ 		bpf_prog_destroy(prog);
+  }
+  
+  struct bpf_scratchpad {
+diff --cc net/core/sock_reuseport.c
+index d3ce523cfdb1,ba5cba56f574..000000000000
+--- a/net/core/sock_reuseport.c
++++ b/net/core/sock_reuseport.c
+@@@ -8,6 -8,8 +8,11 @@@
+  
+  #include <net/sock_reuseport.h>
+  #include <linux/bpf.h>
+++<<<<<<< HEAD
+++=======
++ #include <linux/idr.h>
++ #include <linux/filter.h>
+++>>>>>>> 8217ca653ec6 (bpf: Enable BPF_PROG_TYPE_SK_REUSEPORT bpf prog in reuseport selection)
+  #include <linux/rcupdate.h>
+  
+  #define INIT_SOCKS 128
+@@@ -99,8 -134,9 +104,14 @@@ static void reuseport_free_rcu(struct r
+  	struct sock_reuseport *reuse;
+  
+  	reuse = container_of(head, struct sock_reuseport, rcu);
+++<<<<<<< HEAD
+ +	if (reuse->prog)
+ +		bpf_prog_destroy(reuse->prog);
+++=======
++ 	sk_reuseport_prog_free(rcu_dereference_protected(reuse->prog, 1));
++ 	if (reuse->reuseport_id)
++ 		ida_simple_remove(&reuseport_ida, reuse->reuseport_id);
+++>>>>>>> 8217ca653ec6 (bpf: Enable BPF_PROG_TYPE_SK_REUSEPORT bpf prog in reuseport selection)
+  	kfree(reuse);
+  }
+  
+diff --git a/include/linux/filter.h b/include/linux/filter.h
+index 08b997703a96..2cd8eb46ce4d 100644
+--- a/include/linux/filter.h
++++ b/include/linux/filter.h
+@@ -769,6 +769,7 @@ int sk_attach_filter(struct sock_fprog *fprog, struct sock *sk);
+ int sk_attach_bpf(u32 ufd, struct sock *sk);
+ int sk_reuseport_attach_filter(struct sock_fprog *fprog, struct sock *sk);
+ int sk_reuseport_attach_bpf(u32 ufd, struct sock *sk);
++void sk_reuseport_prog_free(struct bpf_prog *prog);
+ int sk_detach_filter(struct sock *sk);
+ int sk_get_filter(struct sock *sk, struct sock_filter __user *filter,
+ 		  unsigned int len);
+* Unmerged path include/net/sock_reuseport.h
+* Unmerged path net/core/filter.c
+* Unmerged path net/core/sock_reuseport.c
+diff --git a/net/ipv4/inet_hashtables.c b/net/ipv4/inet_hashtables.c
+index 3647167c8fa3..560e1e49a0e9 100644
+--- a/net/ipv4/inet_hashtables.c
++++ b/net/ipv4/inet_hashtables.c
+@@ -328,7 +328,7 @@ struct sock *__inet_lookup_listener(struct net *net,
+ 				    saddr, sport, daddr, hnum,
+ 				    dif, sdif);
+ 	if (result)
+-		return result;
++		goto done;
+ 
+ 	/* Lookup lhash2 with INADDR_ANY */
+ 
+@@ -337,9 +337,10 @@ struct sock *__inet_lookup_listener(struct net *net,
+ 	if (ilb2->count > ilb->count)
+ 		goto port_lookup;
+ 
+-	return inet_lhash2_lookup(net, ilb2, skb, doff,
+-				  saddr, sport, daddr, hnum,
+-				  dif, sdif);
++	result = inet_lhash2_lookup(net, ilb2, skb, doff,
++				    saddr, sport, daddr, hnum,
++				    dif, sdif);
++	goto done;
+ 
+ port_lookup:
+ 	sk_for_each_rcu(sk, &ilb->head) {
+@@ -352,12 +353,15 @@ struct sock *__inet_lookup_listener(struct net *net,
+ 				result = reuseport_select_sock(sk, phash,
+ 							       skb, doff);
+ 				if (result)
+-					return result;
++					goto done;
+ 			}
+ 			result = sk;
+ 			hiscore = score;
+ 		}
+ 	}
++done:
++	if (unlikely(IS_ERR(result)))
++		return NULL;
+ 	return result;
+ }
+ EXPORT_SYMBOL_GPL(__inet_lookup_listener);
+diff --git a/net/ipv4/udp.c b/net/ipv4/udp.c
+index a465cebd1cd1..19002ca79449 100644
+--- a/net/ipv4/udp.c
++++ b/net/ipv4/udp.c
+@@ -498,6 +498,8 @@ struct sock *__udp4_lib_lookup(struct net *net, __be32 saddr,
+ 						  daddr, hnum, dif, sdif,
+ 						  exact_dif, hslot2, skb);
+ 		}
++		if (unlikely(IS_ERR(result)))
++			return NULL;
+ 		return result;
+ 	}
+ begin:
+@@ -512,6 +514,8 @@ struct sock *__udp4_lib_lookup(struct net *net, __be32 saddr,
+ 						   saddr, sport);
+ 				result = reuseport_select_sock(sk, hash, skb,
+ 							sizeof(struct udphdr));
++				if (unlikely(IS_ERR(result)))
++					return NULL;
+ 				if (result)
+ 					return result;
+ 			}
+diff --git a/net/ipv6/inet6_hashtables.c b/net/ipv6/inet6_hashtables.c
+index 595ad408dba0..3d7c7460a0c5 100644
+--- a/net/ipv6/inet6_hashtables.c
++++ b/net/ipv6/inet6_hashtables.c
+@@ -191,7 +191,7 @@ struct sock *inet6_lookup_listener(struct net *net,
+ 				     saddr, sport, daddr, hnum,
+ 				     dif, sdif);
+ 	if (result)
+-		return result;
++		goto done;
+ 
+ 	/* Lookup lhash2 with in6addr_any */
+ 
+@@ -200,9 +200,10 @@ struct sock *inet6_lookup_listener(struct net *net,
+ 	if (ilb2->count > ilb->count)
+ 		goto port_lookup;
+ 
+-	return inet6_lhash2_lookup(net, ilb2, skb, doff,
+-				   saddr, sport, daddr, hnum,
+-				   dif, sdif);
++	result = inet6_lhash2_lookup(net, ilb2, skb, doff,
++				     saddr, sport, daddr, hnum,
++				     dif, sdif);
++	goto done;
+ 
+ port_lookup:
+ 	sk_for_each(sk, &ilb->head) {
+@@ -214,12 +215,15 @@ struct sock *inet6_lookup_listener(struct net *net,
+ 				result = reuseport_select_sock(sk, phash,
+ 							       skb, doff);
+ 				if (result)
+-					return result;
++					goto done;
+ 			}
+ 			result = sk;
+ 			hiscore = score;
+ 		}
+ 	}
++done:
++	if (unlikely(IS_ERR(result)))
++		return NULL;
+ 	return result;
+ }
+ EXPORT_SYMBOL_GPL(inet6_lookup_listener);
+diff --git a/net/ipv6/udp.c b/net/ipv6/udp.c
+index e2839a12108d..3699a40b0d21 100644
+--- a/net/ipv6/udp.c
++++ b/net/ipv6/udp.c
+@@ -235,6 +235,8 @@ struct sock *__udp6_lib_lookup(struct net *net,
+ 						  exact_dif, hslot2,
+ 						  skb);
+ 		}
++		if (unlikely(IS_ERR(result)))
++			return NULL;
+ 		return result;
+ 	}
+ begin:
+@@ -249,6 +251,8 @@ struct sock *__udp6_lib_lookup(struct net *net,
+ 						    saddr, sport);
+ 				result = reuseport_select_sock(sk, hash, skb,
+ 							sizeof(struct udphdr));
++				if (unlikely(IS_ERR(result)))
++					return NULL;
+ 				if (result)
+ 					return result;
+ 			}
