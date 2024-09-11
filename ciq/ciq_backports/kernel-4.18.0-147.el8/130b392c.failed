@@ -1,0 +1,400 @@
+net: tls: Add tls 1.3 support
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-147.el8
+Rebuild_CHGLOG: - [net] tls: Add tls 1.3 support (Sabrina Dubroca) [1711821]
+Rebuild_FUZZ: 90.57%
+commit-author Dave Watson <davejwatson@fb.com>
+commit 130b392c6cd6b2aed1b7eb32253d4920babb4891
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-147.el8/130b392c.failed
+
+TLS 1.3 has minor changes from TLS 1.2 at the record layer.
+
+* Header now hardcodes the same version and application content type in
+  the header.
+* The real content type is appended after the data, before encryption (or
+  after decryption).
+* The IV is xored with the sequence number, instead of concatinating four
+  bytes of IV with the explicit IV.
+* Zero-padding:  No exlicit length is given, we search backwards from the
+  end of the decrypted data for the first non-zero byte, which is the
+  content type.  Currently recv supports reading zero-padding, but there
+  is no way for send to add zero padding.
+
+	Signed-off-by: Dave Watson <davejwatson@fb.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 130b392c6cd6b2aed1b7eb32253d4920babb4891)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/net/tls.h
+#	net/tls/tls_sw.c
+diff --cc include/net/tls.h
+index d1f6db15d1de,004bf01ce868..000000000000
+--- a/include/net/tls.h
++++ b/include/net/tls.h
+@@@ -105,17 -111,20 +105,20 @@@ struct tls_rec 
+  	int tx_flags;
+  	int inplace_crypto;
+  
+ -	struct sk_msg msg_plaintext;
+ -	struct sk_msg msg_encrypted;
+ +	/* AAD | sg_plaintext_data | sg_tag */
+ +	struct scatterlist sg_plaintext_data[MAX_SKB_FRAGS + 1];
+ +	/* AAD | sg_encrypted_data (data contain overhead for hdr&iv&tag) */
+ +	struct scatterlist sg_encrypted_data[MAX_SKB_FRAGS + 1];
+  
+ -	/* AAD | msg_plaintext.sg.data | sg_tag */
+ -	struct scatterlist sg_aead_in[2];
+ -	/* AAD | msg_encrypted.sg.data (data contains overhead for hdr & iv & tag) */
+ -	struct scatterlist sg_aead_out[2];
+ +	unsigned int sg_plaintext_size;
+ +	unsigned int sg_encrypted_size;
+ +	int sg_plaintext_num_elem;
+ +	int sg_encrypted_num_elem;
+  
++ 	char content_type;
++ 	struct scatterlist sg_content_type;
++ 
+  	char aad_space[TLS_AAD_SPACE_SIZE];
+ -	u8 iv_data[TLS_CIPHER_AES_GCM_128_IV_SIZE +
+ -		   TLS_CIPHER_AES_GCM_128_SALT_SIZE];
+  	struct aead_request aead_req;
+  	u8 aead_req_ctx[];
+  };
+@@@ -195,25 -205,16 +198,30 @@@ struct cipher_context 
+  	char *iv;
+  	u16 rec_seq_size;
+  	char *rec_seq;
+++<<<<<<< HEAD
+ +
+ +	RH_KABI_RESERVE(1)
+ +	RH_KABI_RESERVE(2)
+ +	RH_KABI_RESERVE(3)
+ +	RH_KABI_RESERVE(4)
+++=======
++ 	u16 aad_size;
++ 	u16 tail_size;
+++>>>>>>> 130b392c6cd6 (net: tls: Add tls 1.3 support)
+  };
+  
+ +/* Note: this sizeof(struct tls12_crypto_info_aes_gcm_128) + 32 at rhel8 GA */
+ +#define RH_KABI_TLS_CRYPT_CONTEXT_SIZE		72
+ +
+  union tls_crypto_context {
+  	struct tls_crypto_info info;
+ -	union {
+ -		struct tls12_crypto_info_aes_gcm_128 aes_gcm_128;
+ -		struct tls12_crypto_info_aes_gcm_256 aes_gcm_256;
+ -	};
+ +	struct tls12_crypto_info_aes_gcm_128 aes_gcm_128;
+ +
+ +	/* RHEL: new alternative ciphers must be added under KABI_EXTEND(),
+ +	 * build time checks in tls_register() will ensure tls_crypto_context
+ +	 * does not exceed the padding storage
+ +	 */
+ +	char rh_kabi_padding[RH_KABI_TLS_CRYPT_CONTEXT_SIZE];
+  };
+  
+  struct tls_context {
+diff --cc net/tls/tls_sw.c
+index 3f443983a6b3,06d7ae97b929..000000000000
+--- a/net/tls/tls_sw.c
++++ b/net/tls/tls_sw.c
+@@@ -139,6 -168,11 +167,14 @@@ static void tls_decrypt_done(struct cry
+  	if (err) {
+  		ctx->async_wait.err = err;
+  		tls_err_abort(skb->sk, err);
+++<<<<<<< HEAD
+++=======
++ 	} else {
++ 		struct strp_msg *rxm = strp_msg(skb);
++ 		rxm->full_len -= padding_length(ctx, tls_ctx, skb);
++ 		rxm->offset += tls_ctx->rx.prepend_size;
++ 		rxm->full_len -= tls_ctx->rx.overhead_size;
+++>>>>>>> 130b392c6cd6 (net: tls: Add tls 1.3 support)
+  	}
+  
+  	/* After using skb->sk to propagate sk through crypto async callback
+@@@ -504,25 -468,27 +540,31 @@@ static int tls_do_encryption(struct soc
+  			     struct tls_context *tls_ctx,
+  			     struct tls_sw_context_tx *ctx,
+  			     struct aead_request *aead_req,
+ -			     size_t data_len, u32 start)
+ +			     size_t data_len)
+  {
+  	struct tls_rec *rec = ctx->open_rec;
+ -	struct sk_msg *msg_en = &rec->msg_encrypted;
+ -	struct scatterlist *sge = sk_msg_elem(msg_en, start);
+ +	struct scatterlist *plain_sg = rec->sg_plaintext_data;
+ +	struct scatterlist *enc_sg = rec->sg_encrypted_data;
+  	int rc;
+  
+++<<<<<<< HEAD
+ +	/* Skip the first index as it contains AAD data */
+ +	rec->sg_encrypted_data[1].offset += tls_ctx->tx.prepend_size;
+ +	rec->sg_encrypted_data[1].length -= tls_ctx->tx.prepend_size;
+++=======
++ 	memcpy(rec->iv_data, tls_ctx->tx.iv, sizeof(rec->iv_data));
++ 	xor_iv_with_seq(tls_ctx->crypto_send.info.version, rec->iv_data,
++ 			tls_ctx->tx.rec_seq);
+++>>>>>>> 130b392c6cd6 (net: tls: Add tls 1.3 support)
+  
+ -	sge->offset += tls_ctx->tx.prepend_size;
+ -	sge->length -= tls_ctx->tx.prepend_size;
+ -
+ -	msg_en->sg.curr = start;
+ +	/* If it is inplace crypto, then pass same SG list as both src, dst */
+ +	if (rec->inplace_crypto)
+ +		plain_sg = enc_sg;
+  
+  	aead_request_set_tfm(aead_req, ctx->aead_send);
+ -	aead_request_set_ad(aead_req, tls_ctx->tx.aad_size);
+ -	aead_request_set_crypt(aead_req, rec->sg_aead_in,
+ -			       rec->sg_aead_out,
+ -			       data_len, rec->iv_data);
+ +	aead_request_set_ad(aead_req, TLS_AAD_SPACE_SIZE);
+ +	aead_request_set_crypt(aead_req, plain_sg, enc_sg,
+ +			       data_len, tls_ctx->tx.iv);
+  
+  	aead_request_set_callback(aead_req, CRYPTO_TFM_REQ_MAY_BACKLOG,
+  				  tls_encrypt_done, sk);
+@@@ -566,27 -654,78 +609,70 @@@ static int tls_push_record(struct sock 
+  	rec->tx_flags = flags;
+  	req = &rec->aead_req;
+  
+++<<<<<<< HEAD
+ +	sg_mark_end(rec->sg_plaintext_data + rec->sg_plaintext_num_elem);
+ +	sg_mark_end(rec->sg_encrypted_data + rec->sg_encrypted_num_elem);
+ +
+ +	tls_make_aad(rec->aad_space, rec->sg_plaintext_size,
+++=======
++ 	i = msg_pl->sg.end;
++ 	sk_msg_iter_var_prev(i);
++ 
++ 	rec->content_type = record_type;
++ 	if (tls_ctx->crypto_send.info.version == TLS_1_3_VERSION) {
++ 		/* Add content type to end of message.  No padding added */
++ 		sg_set_buf(&rec->sg_content_type, &rec->content_type, 1);
++ 		sg_mark_end(&rec->sg_content_type);
++ 		sg_chain(msg_pl->sg.data, msg_pl->sg.end + 1,
++ 			 &rec->sg_content_type);
++ 	} else {
++ 		sg_mark_end(sk_msg_elem(msg_pl, i));
++ 	}
++ 
++ 	i = msg_pl->sg.start;
++ 	sg_chain(rec->sg_aead_in, 2, rec->inplace_crypto ?
++ 		 &msg_en->sg.data[i] : &msg_pl->sg.data[i]);
++ 
++ 	i = msg_en->sg.end;
++ 	sk_msg_iter_var_prev(i);
++ 	sg_mark_end(sk_msg_elem(msg_en, i));
++ 
++ 	i = msg_en->sg.start;
++ 	sg_chain(rec->sg_aead_out, 2, &msg_en->sg.data[i]);
++ 
++ 	tls_make_aad(rec->aad_space, msg_pl->sg.size + tls_ctx->tx.tail_size,
+++>>>>>>> 130b392c6cd6 (net: tls: Add tls 1.3 support)
+  		     tls_ctx->tx.rec_seq, tls_ctx->tx.rec_seq_size,
+- 		     record_type);
++ 		     record_type,
++ 		     tls_ctx->crypto_send.info.version);
+  
+  	tls_fill_prepend(tls_ctx,
+++<<<<<<< HEAD
+ +			 page_address(sg_page(&rec->sg_encrypted_data[1])) +
+ +			 rec->sg_encrypted_data[1].offset,
+ +			 rec->sg_plaintext_size, record_type);
+++=======
++ 			 page_address(sg_page(&msg_en->sg.data[i])) +
++ 			 msg_en->sg.data[i].offset,
++ 			 msg_pl->sg.size + tls_ctx->tx.tail_size,
++ 			 record_type,
++ 			 tls_ctx->crypto_send.info.version);
+++>>>>>>> 130b392c6cd6 (net: tls: Add tls 1.3 support)
+  
+ -	tls_ctx->pending_open_record_frags = false;
+ +	tls_ctx->pending_open_record_frags = 0;
+  
+ +	rc = tls_do_encryption(sk, tls_ctx, ctx, req, rec->sg_plaintext_size);
+ +	if (rc == -EINPROGRESS)
+ +		return -EINPROGRESS;
+ +
+++<<<<<<< HEAD
+++=======
++ 	rc = tls_do_encryption(sk, tls_ctx, ctx, req,
++ 			       msg_pl->sg.size + tls_ctx->tx.tail_size, i);
+++>>>>>>> 130b392c6cd6 (net: tls: Add tls 1.3 support)
+  	if (rc < 0) {
+ -		if (rc != -EINPROGRESS) {
+ -			tls_err_abort(sk, EBADMSG);
+ -			if (split) {
+ -				tls_ctx->pending_open_record_frags = true;
+ -				tls_merge_open_record(sk, rec, tmp, orig_end);
+ -			}
+ -		}
+ +		tls_err_abort(sk, EBADMSG);
+  		return rc;
+ -	} else if (split) {
+ -		msg_pl = &tmp->msg_plaintext;
+ -		msg_en = &tmp->msg_encrypted;
+ -		sk_msg_trim(sk, msg_en, msg_pl->sg.size +
+ -			    tls_ctx->tx.overhead_size);
+ -		tls_ctx->pending_open_record_frags = true;
+ -		ctx->open_rec = tmp;
+  	}
+  
+  	return tls_tx_records(sk, flags);
+@@@ -1235,13 -1469,22 +1331,25 @@@ static int decrypt_skb_update(struct so
+  		return err;
+  #endif
+  	if (!ctx->decrypted) {
+ -		err = decrypt_internal(sk, skb, dest, NULL, chunk, zc, async);
+ +		err = decrypt_internal(sk, skb, dest, NULL, chunk, zc);
+  		if (err < 0) {
+  			if (err == -EINPROGRESS)
+- 				tls_advance_record_sn(sk, &tls_ctx->rx);
++ 				tls_advance_record_sn(sk, &tls_ctx->rx,
++ 						      version);
+  
+  			return err;
+  		}
+++<<<<<<< HEAD
+++=======
++ 
++ 		rxm->full_len -= padding_length(ctx, tls_ctx, skb);
++ 
++ 		rxm->offset += tls_ctx->rx.prepend_size;
++ 		rxm->full_len -= tls_ctx->rx.overhead_size;
++ 		tls_advance_record_sn(sk, &tls_ctx->rx, version);
++ 		ctx->decrypted = true;
++ 		ctx->saved_data_ready(sk);
+++>>>>>>> 130b392c6cd6 (net: tls: Add tls 1.3 support)
+  	} else {
+  		*zc = false;
+  	}
+@@@ -1327,6 -1666,27 +1435,29 @@@ int tls_sw_recvmsg(struct sock *sk
+  
+  		rxm = strp_msg(skb);
+  
+++<<<<<<< HEAD
+++=======
++ 		to_decrypt = rxm->full_len - tls_ctx->rx.overhead_size;
++ 
++ 		if (to_decrypt <= len && !is_kvec && !is_peek &&
++ 		    ctx->control == TLS_RECORD_TYPE_DATA &&
++ 		    tls_ctx->crypto_recv.info.version != TLS_1_3_VERSION)
++ 			zc = true;
++ 
++ 		err = decrypt_skb_update(sk, skb, &msg->msg_iter,
++ 					 &chunk, &zc, ctx->async_capable);
++ 		if (err < 0 && err != -EINPROGRESS) {
++ 			tls_err_abort(sk, EBADMSG);
++ 			goto recv_end;
++ 		}
++ 
++ 		if (err == -EINPROGRESS) {
++ 			async = true;
++ 			num_async++;
++ 			goto pick_next_record;
++ 		}
++ 
+++>>>>>>> 130b392c6cd6 (net: tls: Add tls 1.3 support)
+  		if (!cmsg) {
+  			int cerr;
+  
+@@@ -1764,9 -2163,19 +1898,22 @@@ int tls_set_sw_offload(struct sock *sk
+  		goto free_priv;
+  	}
+  
+++<<<<<<< HEAD
+++=======
++ 	if (crypto_info->version == TLS_1_3_VERSION) {
++ 		nonce_size = 0;
++ 		cctx->aad_size = TLS_HEADER_SIZE;
++ 		cctx->tail_size = 1;
++ 	} else {
++ 		cctx->aad_size = TLS_AAD_SPACE_SIZE;
++ 		cctx->tail_size = 0;
++ 	}
++ 
+++>>>>>>> 130b392c6cd6 (net: tls: Add tls 1.3 support)
+  	cctx->prepend_size = TLS_HEADER_SIZE + nonce_size;
+  	cctx->tag_size = tag_size;
+- 	cctx->overhead_size = cctx->prepend_size + cctx->tag_size;
++ 	cctx->overhead_size = cctx->prepend_size + cctx->tag_size +
++ 		cctx->tail_size;
+  	cctx->iv_size = iv_size;
+  	cctx->iv = kmalloc(iv_size + TLS_CIPHER_AES_GCM_128_SALT_SIZE,
+  			   GFP_KERNEL);
+* Unmerged path include/net/tls.h
+diff --git a/include/uapi/linux/tls.h b/include/uapi/linux/tls.h
+index ff02287495ac..843c31c52664 100644
+--- a/include/uapi/linux/tls.h
++++ b/include/uapi/linux/tls.h
+@@ -51,6 +51,10 @@
+ #define TLS_1_2_VERSION_MINOR	0x3
+ #define TLS_1_2_VERSION		TLS_VERSION_NUMBER(TLS_1_2)
+ 
++#define TLS_1_3_VERSION_MAJOR	0x3
++#define TLS_1_3_VERSION_MINOR	0x4
++#define TLS_1_3_VERSION		TLS_VERSION_NUMBER(TLS_1_3)
++
+ /* Supported ciphers */
+ #define TLS_CIPHER_AES_GCM_128				51
+ #define TLS_CIPHER_AES_GCM_128_IV_SIZE			8
+diff --git a/net/tls/tls_device.c b/net/tls/tls_device.c
+index 12733b7f423c..970010576dc1 100644
+--- a/net/tls/tls_device.c
++++ b/net/tls/tls_device.c
+@@ -257,7 +257,8 @@ static int tls_push_record(struct sock *sk,
+ 	tls_fill_prepend(ctx,
+ 			 skb_frag_address(frag),
+ 			 record->len - ctx->tx.prepend_size,
+-			 record_type);
++			 record_type,
++			 ctx->crypto_send.info.version);
+ 
+ 	/* HW doesn't care about the data in the tag, because it fills it. */
+ 	dummy_tag_frag.page = skb_frag_page(frag);
+@@ -270,7 +271,7 @@ static int tls_push_record(struct sock *sk,
+ 	spin_unlock_irq(&offload_ctx->lock);
+ 	offload_ctx->open_record = NULL;
+ 	set_bit(TLS_PENDING_CLOSED_RECORD, &ctx->flags);
+-	tls_advance_record_sn(sk, &ctx->tx);
++	tls_advance_record_sn(sk, &ctx->tx, ctx->crypto_send.info.version);
+ 
+ 	for (i = 0; i < record->num_frags; i++) {
+ 		frag = &record->frags[i];
+diff --git a/net/tls/tls_device_fallback.c b/net/tls/tls_device_fallback.c
+index f5b39b2eab67..69455b814a09 100644
+--- a/net/tls/tls_device_fallback.c
++++ b/net/tls/tls_device_fallback.c
+@@ -73,7 +73,8 @@ static int tls_enc_record(struct aead_request *aead_req,
+ 	len -= TLS_CIPHER_AES_GCM_128_IV_SIZE;
+ 
+ 	tls_make_aad(aad, len - TLS_CIPHER_AES_GCM_128_TAG_SIZE,
+-		     (char *)&rcd_sn, sizeof(rcd_sn), buf[0]);
++		(char *)&rcd_sn, sizeof(rcd_sn), buf[0],
++		TLS_1_2_VERSION);
+ 
+ 	memcpy(iv + TLS_CIPHER_AES_GCM_128_SALT_SIZE, buf + TLS_HEADER_SIZE,
+ 	       TLS_CIPHER_AES_GCM_128_IV_SIZE);
+diff --git a/net/tls/tls_main.c b/net/tls/tls_main.c
+index a3694e64e12d..a4ee1cd32b42 100644
+--- a/net/tls/tls_main.c
++++ b/net/tls/tls_main.c
+@@ -429,7 +429,8 @@ static int do_tls_setsockopt_conf(struct sock *sk, char __user *optval,
+ 	}
+ 
+ 	/* check version */
+-	if (crypto_info->version != TLS_1_2_VERSION) {
++	if (crypto_info->version != TLS_1_2_VERSION &&
++	    crypto_info->version != TLS_1_3_VERSION) {
+ 		rc = -ENOTSUPP;
+ 		goto err_crypto_info;
+ 	}
+* Unmerged path net/tls/tls_sw.c
