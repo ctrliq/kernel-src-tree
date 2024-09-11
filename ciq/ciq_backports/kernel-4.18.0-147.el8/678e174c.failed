@@ -1,0 +1,163 @@
+powerpc/mm/iommu: allow migration of cma allocated pages during mm_iommu_do_alloc
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-147.el8
+Rebuild_CHGLOG: - [powerpc] mm/iommu: allow migration of cma allocated pages during mm_iommu_do_alloc (David Gibson) [1629531]
+Rebuild_FUZZ: 94.81%
+commit-author Aneesh Kumar K.V <aneesh.kumar@linux.ibm.com>
+commit 678e174c4c16a940ecfd94e52b7bad73062507f0
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-147.el8/678e174c.failed
+
+The current code doesn't do page migration if the page allocated is a
+compound page.  With HugeTLB migration support, we can end up allocating
+hugetlb pages from CMA region.  Also, THP pages can be allocated from
+CMA region.  This patch updates the code to handle compound pages
+correctly.  The patch also switches to a single get_user_pages with the
+right count, instead of doing one get_user_pages per page.  That avoids
+reading page table multiple times.  This is done by using
+get_user_pages_longterm, because that also takes care of DAX backed
+pages.
+
+DAX pages lifetime is dictated by file system rules and as such, we need
+to make sure that we free these pages on operations like truncate and
+punch hole.  If we have long term pin on these pages, which are mostly
+return to userspace with elevated page count, the entity holding the
+long term pin may not be aware of the fact that file got truncated and
+the file system blocks possibly got reused.  That can result in
+corruption.
+
+The patch also converts the hpas member of mm_iommu_table_group_mem_t to
+a union.  We use the same storage location to store pointers to struct
+page.  We cannot update all the code path use struct page *, because we
+access hpas in real mode and we can't do that struct page * to pfn
+conversion in real mode.
+
+[aneesh.kumar@linux.ibm.com: address review feedback, update changelog]
+  Link: http://lkml.kernel.org/r/20190227144736.5872-4-aneesh.kumar@linux.ibm.com
+Link: http://lkml.kernel.org/r/20190114095438.32470-5-aneesh.kumar@linux.ibm.com
+	Signed-off-by: Aneesh Kumar K.V <aneesh.kumar@linux.ibm.com>
+	Reviewed-by: Michael Ellerman <mpe@ellerman.id.au>
+	Cc: Alexey Kardashevskiy <aik@ozlabs.ru>
+	Cc: Andrea Arcangeli <aarcange@redhat.com>
+	Cc: David Gibson <david@gibson.dropbear.id.au>
+	Cc: Michal Hocko <mhocko@kernel.org>
+	Cc: Mel Gorman <mgorman@techsingularity.net>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit 678e174c4c16a940ecfd94e52b7bad73062507f0)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/powerpc/mm/mmu_context_iommu.c
+diff --cc arch/powerpc/mm/mmu_context_iommu.c
+index ce8cc69f7901,85b4e9f5c615..000000000000
+--- a/arch/powerpc/mm/mmu_context_iommu.c
++++ b/arch/powerpc/mm/mmu_context_iommu.c
+@@@ -34,8 -35,20 +35,25 @@@ struct mm_iommu_table_group_mem_t 
+  	atomic64_t mapped;
+  	unsigned int pageshift;
+  	u64 ua;			/* userspace address */
+++<<<<<<< HEAD
+ +	u64 entries;		/* number of entries in hpas[] */
+ +	u64 *hpas;		/* vmalloc'ed */
+++=======
++ 	u64 entries;		/* number of entries in hpas/hpages[] */
++ 	/*
++ 	 * in mm_iommu_get we temporarily use this to store
++ 	 * struct page address.
++ 	 *
++ 	 * We need to convert ua to hpa in real mode. Make it
++ 	 * simpler by storing physical address.
++ 	 */
++ 	union {
++ 		struct page **hpages;	/* vmalloc'ed */
++ 		phys_addr_t *hpas;
++ 	};
++ #define MM_IOMMU_TABLE_INVALID_HPA	((uint64_t)-1)
++ 	u64 dev_hpa;		/* Device memory base address */
+++>>>>>>> 678e174c4c16 (powerpc/mm/iommu: allow migration of cma allocated pages during mm_iommu_do_alloc)
+  };
+  
+  static long mm_iommu_adjust_locked_vm(struct mm_struct *mm,
+@@@ -78,59 -91,12 +96,65 @@@ bool mm_iommu_preregistered(struct mm_s
+  }
+  EXPORT_SYMBOL_GPL(mm_iommu_preregistered);
+  
+++<<<<<<< HEAD
+ +/*
+ + * Taken from alloc_migrate_target with changes to remove CMA allocations
+ + */
+ +struct page *new_iommu_non_cma_page(struct page *page, unsigned long private)
+ +{
+ +	gfp_t gfp_mask = GFP_USER;
+ +	struct page *new_page;
+ +
+ +	if (PageCompound(page))
+ +		return NULL;
+ +
+ +	if (PageHighMem(page))
+ +		gfp_mask |= __GFP_HIGHMEM;
+ +
+ +	/*
+ +	 * We don't want the allocation to force an OOM if possibe
+ +	 */
+ +	new_page = alloc_page(gfp_mask | __GFP_NORETRY | __GFP_NOWARN);
+ +	return new_page;
+ +}
+ +
+ +static int mm_iommu_move_page_from_cma(struct page *page)
+ +{
+ +	int ret = 0;
+ +	LIST_HEAD(cma_migrate_pages);
+ +
+ +	/* Ignore huge pages for now */
+ +	if (PageCompound(page))
+ +		return -EBUSY;
+ +
+ +	lru_add_drain();
+ +	ret = isolate_lru_page(page);
+ +	if (ret)
+ +		return ret;
+ +
+ +	list_add(&page->lru, &cma_migrate_pages);
+ +	put_page(page); /* Drop the gup reference */
+ +
+ +	ret = migrate_pages(&cma_migrate_pages, new_iommu_non_cma_page,
+ +				NULL, 0, MIGRATE_SYNC, MR_CONTIG_RANGE);
+ +	if (ret) {
+ +		if (!list_empty(&cma_migrate_pages))
+ +			putback_movable_pages(&cma_migrate_pages);
+ +	}
+ +
+ +	return 0;
+ +}
+ +
+ +long mm_iommu_new(struct mm_struct *mm, unsigned long ua, unsigned long entries,
+ +		struct mm_iommu_table_group_mem_t **pmem)
+++=======
++ static long mm_iommu_do_alloc(struct mm_struct *mm, unsigned long ua,
++ 			      unsigned long entries, unsigned long dev_hpa,
++ 			      struct mm_iommu_table_group_mem_t **pmem)
+++>>>>>>> 678e174c4c16 (powerpc/mm/iommu: allow migration of cma allocated pages during mm_iommu_do_alloc)
+  {
+  	struct mm_iommu_table_group_mem_t *mem;
+- 	long i, j, ret = 0, locked_entries = 0;
++ 	long i, ret, locked_entries = 0;
+  	unsigned int pageshift;
+  	unsigned long flags;
+  	unsigned long cur_ua;
+@@@ -230,6 -192,8 +241,11 @@@
+  		mem->hpas[i] = page_to_pfn(page) << PAGE_SHIFT;
+  	}
+  
+++<<<<<<< HEAD
+++=======
++ good_exit:
++ 	ret = 0;
+++>>>>>>> 678e174c4c16 (powerpc/mm/iommu: allow migration of cma allocated pages during mm_iommu_do_alloc)
+  	atomic64_set(&mem->mapped, 1);
+  	mem->used = 1;
+  	mem->ua = ua;
+* Unmerged path arch/powerpc/mm/mmu_context_iommu.c
