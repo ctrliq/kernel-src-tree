@@ -1489,8 +1489,7 @@ static int install_gpio_irq_event_handler(struct acpi_ec *ec,
  *       handler is not installed, which means "not able to handle
  *       transactions".
  */
-static int ec_install_handlers(struct acpi_ec *ec, struct acpi_device *device,
-			       bool handle_events)
+static int ec_install_handlers(struct acpi_ec *ec, struct acpi_device *device)
 {
 	acpi_status status;
 
@@ -1520,7 +1519,7 @@ static int ec_install_handlers(struct acpi_ec *ec, struct acpi_device *device,
 		set_bit(EC_FLAGS_EC_HANDLER_INSTALLED, &ec->flags);
 	}
 
-	if (!handle_events)
+	if (!device)
 		return 0;
 
 	if (!test_bit(EC_FLAGS_QUERY_METHODS_INSTALLED, &ec->flags)) {
@@ -1533,13 +1532,10 @@ static int ec_install_handlers(struct acpi_ec *ec, struct acpi_device *device,
 	if (!test_bit(EC_FLAGS_EVENT_HANDLER_INSTALLED, &ec->flags)) {
 		if (ec->gpe >= 0) {
 			install_gpe_event_handler(ec);
-		} else if (device) {
+		} else {
 			int ret = install_gpio_irq_event_handler(ec, device);
-
 			if (ret)
 				return ret;
-		} else { /* No GPE and no GpioInt? */
-			return -ENODEV;
 		}
 	}
 	/* EC is fully operational, allow queries */
@@ -1587,12 +1583,11 @@ static void ec_remove_handlers(struct acpi_ec *ec)
 	}
 }
 
-static int acpi_ec_setup(struct acpi_ec *ec, struct acpi_device *device,
-			 bool handle_events)
+static int acpi_ec_setup(struct acpi_ec *ec, struct acpi_device *device)
 {
 	int ret;
 
-	ret = ec_install_handlers(ec, device, handle_events);
+	ret = ec_install_handlers(ec, device);
 	if (ret)
 		return ret;
 
@@ -1673,7 +1668,7 @@ static int acpi_ec_add(struct acpi_device *device)
 		}
 	}
 
-	ret = acpi_ec_setup(ec, device, true);
+	ret = acpi_ec_setup(ec, device);
 	if (ret)
 		goto err_query;
 
@@ -1793,7 +1788,7 @@ void __init acpi_ec_dsdt_probe(void)
 	 * At this point, the GPE is not fully initialized, so do not to
 	 * handle the events.
 	 */
-	ret = acpi_ec_setup(ec, NULL, false);
+	ret = acpi_ec_setup(ec, NULL);
 	if (ret) {
 		acpi_ec_free(ec);
 		return;
@@ -1980,7 +1975,7 @@ void __init acpi_ec_ecdt_probe(void)
 	 * At this point, the namespace is not initialized, so do not find
 	 * the namespace objects, or handle the events.
 	 */
-	ret = acpi_ec_setup(ec, NULL, false);
+	ret = acpi_ec_setup(ec, NULL);
 	if (ret) {
 		acpi_ec_free(ec);
 		return;
