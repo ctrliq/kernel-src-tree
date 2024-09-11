@@ -1,0 +1,219 @@
+dm table: Fix zoned model check and zone sectors check
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-310.el8
+commit-author Shin'ichiro Kawasaki <shinichiro.kawasaki@wdc.com>
+commit 2d669ceb69c276f7637cf760287ca4187add082e
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-310.el8/2d669ceb.failed
+
+Commit 24f6b6036c9e ("dm table: fix zoned iterate_devices based device
+capability checks") triggered dm table load failure when dm-zoned device
+is set up for zoned block devices and a regular device for cache.
+
+The commit inverted logic of two callback functions for iterate_devices:
+device_is_zoned_model() and device_matches_zone_sectors(). The logic of
+device_is_zoned_model() was inverted then all destination devices of all
+targets in dm table are required to have the expected zoned model. This
+is fine for dm-linear, dm-flakey and dm-crypt on zoned block devices
+since each target has only one destination device. However, this results
+in failure for dm-zoned with regular cache device since that target has
+both regular block device and zoned block devices.
+
+As for device_matches_zone_sectors(), the commit inverted the logic to
+require all zoned block devices in each target have the specified
+zone_sectors. This check also fails for regular block device which does
+not have zones.
+
+To avoid the check failures, fix the zone model check and the zone
+sectors check. For zone model check, introduce the new feature flag
+DM_TARGET_MIXED_ZONED_MODEL, and set it to dm-zoned target. When the
+target has this flag, allow it to have destination devices with any
+zoned model. For zone sectors check, skip the check if the destination
+device is not a zoned block device. Also add comments and improve an
+error message to clarify expectations to the two checks.
+
+Fixes: 24f6b6036c9e ("dm table: fix zoned iterate_devices based device capability checks")
+	Signed-off-by: Shin'ichiro Kawasaki <shinichiro.kawasaki@wdc.com>
+	Signed-off-by: Damien Le Moal <damien.lemoal@wdc.com>
+	Signed-off-by: Mike Snitzer <snitzer@redhat.com>
+(cherry picked from commit 2d669ceb69c276f7637cf760287ca4187add082e)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/md/dm-table.c
+#	drivers/md/dm-zoned-target.c
+#	include/linux/device-mapper.h
+diff --cc drivers/md/dm-table.c
+index 27df037ce2ef,e5f0f1703c5d..000000000000
+--- a/drivers/md/dm-table.c
++++ b/drivers/md/dm-table.c
+@@@ -1387,9 -1591,16 +1387,16 @@@ static int device_is_zoned_model(struc
+  	struct request_queue *q = bdev_get_queue(dev->bdev);
+  	enum blk_zoned_model *zoned_model = data;
+  
+ -	return blk_queue_zoned_model(q) != *zoned_model;
+ +	return q && blk_queue_zoned_model(q) == *zoned_model;
+  }
+  
++ /*
++  * Check the device zoned model based on the target feature flag. If the target
++  * has the DM_TARGET_ZONED_HM feature flag set, host-managed zoned devices are
++  * also accepted but all devices must have the same zoned model. If the target
++  * has the DM_TARGET_MIXED_ZONED_MODEL feature set, the devices can have any
++  * zoned model with all zoned devices having the same zone size.
++  */
+  static bool dm_table_supports_zoned_model(struct dm_table *t,
+  					  enum blk_zoned_model zoned_model)
+  {
+@@@ -1399,13 -1610,15 +1406,25 @@@
+  	for (i = 0; i < dm_table_get_num_targets(t); i++) {
+  		ti = dm_table_get_target(t, i);
+  
+++<<<<<<< HEAD
+ +		if (zoned_model == BLK_ZONED_HM &&
+ +		    !dm_target_supports_zoned_hm(ti->type))
+ +			return false;
+ +
+ +		if (!ti->type->iterate_devices ||
+ +		    !ti->type->iterate_devices(ti, device_is_zoned_model, &zoned_model))
+ +			return false;
+++=======
++ 		if (dm_target_supports_zoned_hm(ti->type)) {
++ 			if (!ti->type->iterate_devices ||
++ 			    ti->type->iterate_devices(ti, device_not_zoned_model,
++ 						      &zoned_model))
++ 				return false;
++ 		} else if (!dm_target_supports_mixed_zoned_model(ti->type)) {
++ 			if (zoned_model == BLK_ZONED_HM)
++ 				return false;
++ 		}
+++>>>>>>> 2d669ceb69c2 (dm table: Fix zoned model check and zone sectors check)
+  	}
+  
+  	return true;
+@@@ -1417,26 -1630,17 +1436,38 @@@ static int device_matches_zone_sectors(
+  	struct request_queue *q = bdev_get_queue(dev->bdev);
+  	unsigned int *zone_sectors = data;
+  
+++<<<<<<< HEAD
+ +	return q && blk_queue_zone_sectors(q) == *zone_sectors;
+ +}
+ +
+ +static bool dm_table_matches_zone_sectors(struct dm_table *t,
+ +					  unsigned int zone_sectors)
+ +{
+ +	struct dm_target *ti;
+ +	unsigned i;
+ +
+ +	for (i = 0; i < dm_table_get_num_targets(t); i++) {
+ +		ti = dm_table_get_target(t, i);
+ +
+ +		if (!ti->type->iterate_devices ||
+ +		    !ti->type->iterate_devices(ti, device_matches_zone_sectors, &zone_sectors))
+ +			return false;
+ +	}
+ +
+ +	return true;
+++=======
++ 	if (!blk_queue_is_zoned(q))
++ 		return 0;
++ 
++ 	return blk_queue_zone_sectors(q) != *zone_sectors;
+++>>>>>>> 2d669ceb69c2 (dm table: Fix zoned model check and zone sectors check)
+  }
+  
++ /*
++  * Check consistency of zoned model and zone sectors across all targets. For
++  * zone sectors, if the destination device is a zoned block device, it shall
++  * have the specified zone_sectors.
++  */
+  static int validate_hardware_zoned_model(struct dm_table *table,
+  					 enum blk_zoned_model zoned_model,
+  					 unsigned int zone_sectors)
+@@@ -1454,8 -1658,8 +1485,13 @@@
+  	if (!zone_sectors || !is_power_of_2(zone_sectors))
+  		return -EINVAL;
+  
+++<<<<<<< HEAD
+ +	if (!dm_table_matches_zone_sectors(table, zone_sectors)) {
+ +		DMERR("%s: zone sectors is not consistent across all devices",
+++=======
++ 	if (dm_table_any_dev_attr(table, device_not_matches_zone_sectors, &zone_sectors)) {
++ 		DMERR("%s: zone sectors is not consistent across all zoned devices",
+++>>>>>>> 2d669ceb69c2 (dm table: Fix zoned model check and zone sectors check)
+  		      dm_device_name(table->md));
+  		return -EINVAL;
+  	}
+diff --cc drivers/md/dm-zoned-target.c
+index 927df60e19c9,7e88df64d197..000000000000
+--- a/drivers/md/dm-zoned-target.c
++++ b/drivers/md/dm-zoned-target.c
+@@@ -940,8 -1142,8 +940,13 @@@ static int dmz_iterate_devices(struct d
+  
+  static struct target_type dmz_type = {
+  	.name		 = "zoned",
+++<<<<<<< HEAD
+ +	.version	 = {1, 0, 0},
+ +	.features	 = DM_TARGET_SINGLETON | DM_TARGET_ZONED_HM,
+++=======
++ 	.version	 = {2, 0, 0},
++ 	.features	 = DM_TARGET_SINGLETON | DM_TARGET_MIXED_ZONED_MODEL,
+++>>>>>>> 2d669ceb69c2 (dm table: Fix zoned model check and zone sectors check)
+  	.module		 = THIS_MODULE,
+  	.ctr		 = dmz_ctr,
+  	.dtr		 = dmz_dtr,
+diff --cc include/linux/device-mapper.h
+index b7b09d593b1e,5c641f930caf..000000000000
+--- a/include/linux/device-mapper.h
++++ b/include/linux/device-mapper.h
+@@@ -245,10 -253,19 +245,14 @@@ struct target_type 
+  #define dm_target_passes_integrity(type) ((type)->features & DM_TARGET_PASSES_INTEGRITY)
+  
+  /*
+-  * Indicates that a target supports host-managed zoned block devices.
++  * Indicates support for zoned block devices:
++  * - DM_TARGET_ZONED_HM: the target also supports host-managed zoned
++  *   block devices but does not support combining different zoned models.
++  * - DM_TARGET_MIXED_ZONED_MODEL: the target supports combining multiple
++  *   devices with different zoned models.
+   */
+ -#ifdef CONFIG_BLK_DEV_ZONED
+  #define DM_TARGET_ZONED_HM		0x00000040
+  #define dm_target_supports_zoned_hm(type) ((type)->features & DM_TARGET_ZONED_HM)
+ -#else
+ -#define DM_TARGET_ZONED_HM		0x00000000
+ -#define dm_target_supports_zoned_hm(type) (false)
+ -#endif
+  
+  /*
+   * A target handles REQ_NOWAIT
+@@@ -256,6 -273,21 +260,24 @@@
+  #define DM_TARGET_NOWAIT		0x00000080
+  #define dm_target_supports_nowait(type) ((type)->features & DM_TARGET_NOWAIT)
+  
+++<<<<<<< HEAD
+++=======
++ /*
++  * A target supports passing through inline crypto support.
++  */
++ #define DM_TARGET_PASSES_CRYPTO		0x00000100
++ #define dm_target_passes_crypto(type) ((type)->features & DM_TARGET_PASSES_CRYPTO)
++ 
++ #ifdef CONFIG_BLK_DEV_ZONED
++ #define DM_TARGET_MIXED_ZONED_MODEL	0x00000200
++ #define dm_target_supports_mixed_zoned_model(type) \
++ 	((type)->features & DM_TARGET_MIXED_ZONED_MODEL)
++ #else
++ #define DM_TARGET_MIXED_ZONED_MODEL	0x00000000
++ #define dm_target_supports_mixed_zoned_model(type) (false)
++ #endif
++ 
+++>>>>>>> 2d669ceb69c2 (dm table: Fix zoned model check and zone sectors check)
+  struct dm_target {
+  	struct dm_table *table;
+  	struct target_type *type;
+* Unmerged path drivers/md/dm-table.c
+* Unmerged path drivers/md/dm-zoned-target.c
+* Unmerged path include/linux/device-mapper.h
