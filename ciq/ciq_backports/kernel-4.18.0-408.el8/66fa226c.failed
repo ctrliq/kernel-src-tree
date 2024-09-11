@@ -1,0 +1,222 @@
+KVM: SVM: fix race between interrupt delivery and AVIC inhibition
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-408.el8
+commit-author Maxim Levitsky <mlevitsk@redhat.com>
+commit 66fa226c131fb89287f8f7d004a46e39a859fbf6
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-408.el8/66fa226c.failed
+
+If svm_deliver_avic_intr is called just after the target vcpu's AVIC got
+inhibited, it might read a stale value of vcpu->arch.apicv_active
+which can lead to the target vCPU not noticing the interrupt.
+
+To fix this use load-acquire/store-release so that, if the target vCPU
+is IN_GUEST_MODE, we're guaranteed to see a previous disabling of the
+AVIC.  If AVIC has been disabled in the meanwhile, proceed with the
+KVM_REQ_EVENT-based delivery.
+
+Incomplete IPI vmexit has the same races as svm_deliver_avic_intr, and
+in fact it can be handled in exactly the same way; the only difference
+lies in who has set IRR, whether svm_deliver_interrupt or the processor.
+Therefore, svm_complete_interrupt_delivery can be used to fix incomplete
+IPI vmexits as well.
+
+Co-developed-by: Paolo Bonzini <pbonzini@redhat.com>
+	Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+	Signed-off-by: Maxim Levitsky <mlevitsk@redhat.com>
+	Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+(cherry picked from commit 66fa226c131fb89287f8f7d004a46e39a859fbf6)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kvm/svm/avic.c
+#	arch/x86/kvm/svm/svm.h
+diff --cc arch/x86/kvm/svm/avic.c
+index a77f6cee3cf0,fb3e20791338..000000000000
+--- a/arch/x86/kvm/svm/avic.c
++++ b/arch/x86/kvm/svm/avic.c
+@@@ -289,6 -269,22 +289,25 @@@ static int avic_init_backing_page(struc
+  	return 0;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ void avic_ring_doorbell(struct kvm_vcpu *vcpu)
++ {
++ 	/*
++ 	 * Note, the vCPU could get migrated to a different pCPU at any point,
++ 	 * which could result in signalling the wrong/previous pCPU.  But if
++ 	 * that happens the vCPU is guaranteed to do a VMRUN (after being
++ 	 * migrated) and thus will process pending interrupts, i.e. a doorbell
++ 	 * is not needed (and the spurious one is harmless).
++ 	 */
++ 	int cpu = READ_ONCE(vcpu->cpu);
++ 
++ 	if (cpu != get_cpu())
++ 		wrmsrl(MSR_AMD64_SVM_AVIC_DOORBELL, kvm_cpu_get_apicid(cpu));
++ 	put_cpu();
++ }
++ 
+++>>>>>>> 66fa226c131f (KVM: SVM: fix race between interrupt delivery and AVIC inhibition)
+  static void avic_kick_target_vcpus(struct kvm *kvm, struct kvm_lapic *source,
+  				   u32 icrl, u32 icrh)
+  {
+@@@ -667,50 -668,6 +691,53 @@@ void svm_load_eoi_exitmap(struct kvm_vc
+  	return;
+  }
+  
+++<<<<<<< HEAD
+ +int svm_deliver_avic_intr(struct kvm_vcpu *vcpu, int vec)
+ +{
+ +	if (!vcpu->arch.apicv_active)
+ +		return -1;
+ +
+ +	/*
+ +	 * Pairs with the smp_mb_*() after setting vcpu->guest_mode in
+ +	 * vcpu_enter_guest() to ensure the write to the vIRR is ordered before
+ +	 * the read of guest_mode, which guarantees that either VMRUN will see
+ +	 * and process the new vIRR entry, or that the below code will signal
+ +	 * the doorbell if the vCPU is already running in the guest.
+ +	 */
+ +	smp_mb__after_atomic();
+ +
+ +	/*
+ +	 * Signal the doorbell to tell hardware to inject the IRQ if the vCPU
+ +	 * is in the guest.  If the vCPU is not in the guest, hardware will
+ +	 * automatically process AVIC interrupts at VMRUN.
+ +	 */
+ +	if (vcpu->mode == IN_GUEST_MODE) {
+ +		int cpu = READ_ONCE(vcpu->cpu);
+ +
+ +		/*
+ +		 * Note, the vCPU could get migrated to a different pCPU at any
+ +		 * point, which could result in signalling the wrong/previous
+ +		 * pCPU.  But if that happens the vCPU is guaranteed to do a
+ +		 * VMRUN (after being migrated) and thus will process pending
+ +		 * interrupts, i.e. a doorbell is not needed (and the spurious
+ +		 * one is harmless).
+ +		 */
+ +		if (cpu != get_cpu())
+ +			wrmsrl(SVM_AVIC_DOORBELL, kvm_cpu_get_apicid(cpu));
+ +		put_cpu();
+ +	} else {
+ +		/*
+ +		 * Wake the vCPU if it was blocking.  KVM will then detect the
+ +		 * pending IRQ when checking if the vCPU has a wake event.
+ +		 */
+ +		kvm_vcpu_wake_up(vcpu);
+ +	}
+ +
+ +	return 0;
+ +}
+ +
+++=======
+++>>>>>>> 66fa226c131f (KVM: SVM: fix race between interrupt delivery and AVIC inhibition)
+  bool svm_dy_apicv_has_pending_interrupt(struct kvm_vcpu *vcpu)
+  {
+  	return false;
+diff --cc arch/x86/kvm/svm/svm.h
+index b72dd1b3a3c6,fa98d6844728..000000000000
+--- a/arch/x86/kvm/svm/svm.h
++++ b/arch/x86/kvm/svm/svm.h
+@@@ -595,9 -577,9 +597,14 @@@ void svm_hwapic_isr_update(struct kvm_v
+  bool svm_dy_apicv_has_pending_interrupt(struct kvm_vcpu *vcpu);
+  int svm_update_pi_irte(struct kvm *kvm, unsigned int host_irq,
+  		       uint32_t guest_irq, bool set);
+++<<<<<<< HEAD
+ +void svm_vcpu_blocking(struct kvm_vcpu *vcpu);
+ +void svm_vcpu_unblocking(struct kvm_vcpu *vcpu);
+++=======
++ void avic_vcpu_blocking(struct kvm_vcpu *vcpu);
++ void avic_vcpu_unblocking(struct kvm_vcpu *vcpu);
++ void avic_ring_doorbell(struct kvm_vcpu *vcpu);
+++>>>>>>> 66fa226c131f (KVM: SVM: fix race between interrupt delivery and AVIC inhibition)
+  
+  /* sev.c */
+  
+* Unmerged path arch/x86/kvm/svm/avic.c
+diff --git a/arch/x86/kvm/svm/svm.c b/arch/x86/kvm/svm/svm.c
+index 3765ba922ed5..61a316e842b7 100644
+--- a/arch/x86/kvm/svm/svm.c
++++ b/arch/x86/kvm/svm/svm.c
+@@ -3316,21 +3316,55 @@ static void svm_inject_irq(struct kvm_vcpu *vcpu)
+ 		SVM_EVTINJ_VALID | SVM_EVTINJ_TYPE_INTR;
+ }
+ 
+-static void svm_deliver_interrupt(struct kvm_lapic *apic, int delivery_mode,
+-				  int trig_mode, int vector)
++void svm_complete_interrupt_delivery(struct kvm_vcpu *vcpu, int delivery_mode,
++				     int trig_mode, int vector)
+ {
+-	struct kvm_vcpu *vcpu = apic->vcpu;
++	/*
++	 * vcpu->arch.apicv_active must be read after vcpu->mode.
++	 * Pairs with smp_store_release in vcpu_enter_guest.
++	 */
++	bool in_guest_mode = (smp_load_acquire(&vcpu->mode) == IN_GUEST_MODE);
+ 
+-	kvm_lapic_set_irr(vector, apic);
+-	if (svm_deliver_avic_intr(vcpu, vector)) {
++	if (!READ_ONCE(vcpu->arch.apicv_active)) {
++		/* Process the interrupt via inject_pending_event */
+ 		kvm_make_request(KVM_REQ_EVENT, vcpu);
+ 		kvm_vcpu_kick(vcpu);
++		return;
++	}
++
++	trace_kvm_apicv_accept_irq(vcpu->vcpu_id, delivery_mode, trig_mode, vector);
++	if (in_guest_mode) {
++		/*
++		 * Signal the doorbell to tell hardware to inject the IRQ.  If
++		 * the vCPU exits the guest before the doorbell chimes, hardware
++		 * will automatically process AVIC interrupts at the next VMRUN.
++		 */
++		avic_ring_doorbell(vcpu);
+ 	} else {
+-		trace_kvm_apicv_accept_irq(vcpu->vcpu_id, delivery_mode,
+-					   trig_mode, vector);
++		/*
++		 * Wake the vCPU if it was blocking.  KVM will then detect the
++		 * pending IRQ when checking if the vCPU has a wake event.
++		 */
++		kvm_vcpu_wake_up(vcpu);
+ 	}
+ }
+ 
++static void svm_deliver_interrupt(struct kvm_lapic *apic,  int delivery_mode,
++				  int trig_mode, int vector)
++{
++	kvm_lapic_set_irr(vector, apic);
++
++	/*
++	 * Pairs with the smp_mb_*() after setting vcpu->guest_mode in
++	 * vcpu_enter_guest() to ensure the write to the vIRR is ordered before
++	 * the read of guest_mode.  This guarantees that either VMRUN will see
++	 * and process the new vIRR entry, or that svm_complete_interrupt_delivery
++	 * will signal the doorbell if the CPU has already entered the guest.
++	 */
++	smp_mb__after_atomic();
++	svm_complete_interrupt_delivery(apic->vcpu, delivery_mode, trig_mode, vector);
++}
++
+ static void svm_update_cr8_intercept(struct kvm_vcpu *vcpu, int tpr, int irr)
+ {
+ 	struct vcpu_svm *svm = to_svm(vcpu);
+* Unmerged path arch/x86/kvm/svm/svm.h
+diff --git a/arch/x86/kvm/x86.c b/arch/x86/kvm/x86.c
+index b7a417ad06ef..d65714ab5e69 100644
+--- a/arch/x86/kvm/x86.c
++++ b/arch/x86/kvm/x86.c
+@@ -9980,7 +9980,9 @@ static int vcpu_enter_guest(struct kvm_vcpu *vcpu)
+ 	 * result in virtual interrupt delivery.
+ 	 */
+ 	local_irq_disable();
+-	vcpu->mode = IN_GUEST_MODE;
++
++	/* Store vcpu->apicv_active before vcpu->mode.  */
++	smp_store_release(&vcpu->mode, IN_GUEST_MODE);
+ 
+ 	srcu_read_unlock(&vcpu->kvm->srcu, vcpu->srcu_idx);
+ 
