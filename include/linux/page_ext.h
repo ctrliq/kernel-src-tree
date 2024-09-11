@@ -49,7 +49,7 @@ static inline void page_ext_init(void)
 }
 #endif
 
-struct page_ext *lookup_page_ext(struct page *page);
+struct page_ext *lookup_page_ext(const struct page *page);
 
 #else /* !CONFIG_PAGE_EXTENSION */
 struct page_ext;
@@ -58,7 +58,7 @@ static inline void pgdat_page_ext_init(struct pglist_data *pgdat)
 {
 }
 
-static inline struct page_ext *lookup_page_ext(struct page *page)
+static inline struct page_ext *lookup_page_ext(const struct page *page)
 {
 	return NULL;
 }
