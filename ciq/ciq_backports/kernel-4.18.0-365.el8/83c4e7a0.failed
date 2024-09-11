@@ -1,0 +1,247 @@
+KUnit: KASAN Integration
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-365.el8
+commit-author Patricia Alfonso <trishalfonso@google.com>
+commit 83c4e7a0363bdb8104f510370907161623e31086
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-365.el8/83c4e7a0.failed
+
+Integrate KASAN into KUnit testing framework.
+
+        - Fail tests when KASAN reports an error that is not expected
+        - Use KUNIT_EXPECT_KASAN_FAIL to expect a KASAN error in KASAN
+	  tests
+        - Expected KASAN reports pass tests and are still printed when run
+          without kunit_tool (kunit_tool still bypasses the report due to the
+          test passing)
+	- KUnit struct in current task used to keep track of the current
+	  test from KASAN code
+
+Make use of "[PATCH v3 kunit-next 1/2] kunit: generalize kunit_resource
+API beyond allocated resources" and "[PATCH v3 kunit-next 2/2] kunit: add
+support for named resources" from Alan Maguire [1]
+
+        - A named resource is added to a test when a KASAN report is
+          expected
+        - This resource contains a struct for kasan_data containing
+          booleans representing if a KASAN report is expected and if a
+          KASAN report is found
+
+[1] (https://lore.kernel.org/linux-kselftest/1583251361-12748-1-git-send-email-alan.maguire@oracle.com/T/#t)
+
+	Signed-off-by: Patricia Alfonso <trishalfonso@google.com>
+	Signed-off-by: David Gow <davidgow@google.com>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Tested-by: Andrey Konovalov <andreyknvl@google.com>
+	Reviewed-by: Andrey Konovalov <andreyknvl@google.com>
+	Reviewed-by: Dmitry Vyukov <dvyukov@google.com>
+	Acked-by: Brendan Higgins <brendanhiggins@google.com>
+	Cc: Andrey Ryabinin <aryabinin@virtuozzo.com>
+	Cc: Ingo Molnar <mingo@redhat.com>
+	Cc: Juri Lelli <juri.lelli@redhat.com>
+	Cc: Peter Zijlstra <a.p.zijlstra@chello.nl>
+	Cc: Shuah Khan <shuah@kernel.org>
+	Cc: Vincent Guittot <vincent.guittot@linaro.org>
+Link: https://lkml.kernel.org/r/20200915035828.570483-3-davidgow@google.com
+Link: https://lkml.kernel.org/r/20200910070331.3358048-3-davidgow@google.com
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit 83c4e7a0363bdb8104f510370907161623e31086)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	lib/kunit/test.c
+diff --cc lib/kunit/test.c
+index 77ccd5de5b47,dcc35fd30d95..000000000000
+--- a/lib/kunit/test.c
++++ b/lib/kunit/test.c
+@@@ -15,9 -16,14 +16,20 @@@
+  #include "string-stream.h"
+  #include "try-catch-impl.h"
+  
+++<<<<<<< HEAD
+ +static void kunit_set_failure(struct kunit *test)
+ +{
+ +	WRITE_ONCE(test->success, false);
+++=======
++ static void kunit_print_tap_version(void)
++ {
++ 	static bool kunit_has_printed_tap_version;
++ 
++ 	if (!kunit_has_printed_tap_version) {
++ 		pr_info("TAP version 14\n");
++ 		kunit_has_printed_tap_version = true;
++ 	}
+++>>>>>>> 83c4e7a0363b (KUnit: KASAN Integration)
+  }
+  
+  /*
+diff --git a/include/kunit/test.h b/include/kunit/test.h
+index f1507f5db30b..5bd68b2eaa47 100644
+--- a/include/kunit/test.h
++++ b/include/kunit/test.h
+@@ -255,6 +255,11 @@ struct kunit {
+ 	struct list_head resources; /* Protected by lock. */
+ };
+ 
++static inline void kunit_set_failure(struct kunit *test)
++{
++	WRITE_ONCE(test->success, false);
++}
++
+ void kunit_init_test(struct kunit *test, const char *name, char *log);
+ 
+ int kunit_run_tests(struct kunit_suite *suite);
+diff --git a/include/linux/kasan.h b/include/linux/kasan.h
+index f00d17cf6822..9a9c24f17943 100644
+--- a/include/linux/kasan.h
++++ b/include/linux/kasan.h
+@@ -14,6 +14,12 @@ struct task_struct;
+ #include <asm/kasan.h>
+ #include <asm/pgtable.h>
+ 
++/* kasan_data struct is used in KUnit tests for KASAN expected failures */
++struct kunit_kasan_expectation {
++	bool report_expected;
++	bool report_found;
++};
++
+ extern unsigned char kasan_early_shadow_page[PAGE_SIZE];
+ extern pte_t kasan_early_shadow_pte[PTRS_PER_PTE];
+ extern pmd_t kasan_early_shadow_pmd[PTRS_PER_PMD];
+* Unmerged path lib/kunit/test.c
+diff --git a/lib/test_kasan.c b/lib/test_kasan.c
+index 5679dda37d78..819cc317d76a 100644
+--- a/lib/test_kasan.c
++++ b/lib/test_kasan.c
+@@ -27,6 +27,8 @@
+ 
+ #include <asm/page.h>
+ 
++#include <kunit/test.h>
++
+ #include "../mm/kasan/kasan.h"
+ 
+ #define OOB_TAG_OFF (IS_ENABLED(CONFIG_KASAN_GENERIC) ? 0 : KASAN_SHADOW_SCALE_SIZE)
+@@ -36,14 +38,55 @@
+  * are not eliminated as dead code.
+  */
+ 
+-int kasan_int_result;
+ void *kasan_ptr_result;
++int kasan_int_result;
++
++static struct kunit_resource resource;
++static struct kunit_kasan_expectation fail_data;
++static bool multishot;
++
++static int kasan_test_init(struct kunit *test)
++{
++	/*
++	 * Temporarily enable multi-shot mode and set panic_on_warn=0.
++	 * Otherwise, we'd only get a report for the first case.
++	 */
++	multishot = kasan_save_enable_multi_shot();
++
++	return 0;
++}
++
++static void kasan_test_exit(struct kunit *test)
++{
++	kasan_restore_multi_shot(multishot);
++}
++
++/**
++ * KUNIT_EXPECT_KASAN_FAIL() - Causes a test failure when the expression does
++ * not cause a KASAN error. This uses a KUnit resource named "kasan_data." Do
++ * Do not use this name for a KUnit resource outside here.
++ *
++ */
++#define KUNIT_EXPECT_KASAN_FAIL(test, condition) do { \
++	fail_data.report_expected = true; \
++	fail_data.report_found = false; \
++	kunit_add_named_resource(test, \
++				NULL, \
++				NULL, \
++				&resource, \
++				"kasan_data", &fail_data); \
++	condition; \
++	KUNIT_EXPECT_EQ(test, \
++			fail_data.report_expected, \
++			fail_data.report_found); \
++} while (0)
++
++
+ 
+ /*
+  * Note: test functions are marked noinline so that their names appear in
+  * reports.
+  */
+-
+ static noinline void __init kmalloc_oob_right(void)
+ {
+ 	char *ptr;
+diff --git a/mm/kasan/report.c b/mm/kasan/report.c
+index 867299adf9a2..00d9d0dbd680 100644
+--- a/mm/kasan/report.c
++++ b/mm/kasan/report.c
+@@ -32,6 +32,8 @@
+ 
+ #include <asm/sections.h>
+ 
++#include <kunit/test.h>
++
+ #include "kasan.h"
+ #include "../slab.h"
+ 
+@@ -463,12 +465,37 @@ bool report_enabled(void)
+ 	return !test_and_set_bit(KASAN_BIT_REPORTED, &kasan_flags);
+ }
+ 
++#if IS_ENABLED(CONFIG_KUNIT)
++static void kasan_update_kunit_status(struct kunit *cur_test)
++{
++	struct kunit_resource *resource;
++	struct kunit_kasan_expectation *kasan_data;
++
++	resource = kunit_find_named_resource(cur_test, "kasan_data");
++
++	if (!resource) {
++		kunit_set_failure(cur_test);
++		return;
++	}
++
++	kasan_data = (struct kunit_kasan_expectation *)resource->data;
++	kasan_data->report_found = true;
++	kunit_put_resource(resource);
++}
++#endif /* IS_ENABLED(CONFIG_KUNIT) */
++
+ void kasan_report_invalid_free(void *object, unsigned long ip)
+ {
+ 	unsigned long flags;
+ 	u8 tag = get_tag(object);
+ 
+ 	object = reset_tag(object);
++
++#if IS_ENABLED(CONFIG_KUNIT)
++	if (current->kunit_test)
++		kasan_update_kunit_status(current->kunit_test);
++#endif /* IS_ENABLED(CONFIG_KUNIT) */
++
+ 	start_report(&flags);
+ 	pr_err("BUG: KASAN: double-free or invalid-free in %pS\n", (void *)ip);
+ 	print_tags(tag, object);
+@@ -486,6 +513,11 @@ void __kasan_report(unsigned long addr, size_t size, bool is_write, unsigned lon
+ 	void *untagged_addr;
+ 	unsigned long flags;
+ 
++#if IS_ENABLED(CONFIG_KUNIT)
++	if (current->kunit_test)
++		kasan_update_kunit_status(current->kunit_test);
++#endif /* IS_ENABLED(CONFIG_KUNIT) */
++
+ 	disable_trace_on_warning();
+ 
+ 	tagged_addr = (void *)addr;
