@@ -1,0 +1,495 @@
+trace/hwlat: Support hotplug operations
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-358.el8
+commit-author Daniel Bristot de Oliveira <bristot@redhat.com>
+commit ba998f7d9531ef4ce462cabd2ce57a7558c33ede
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-358.el8/ba998f7d.failed
+
+Enable and disable hwlat thread during cpu hotplug online
+and offline operations, respectivelly.
+
+Link: https://lore.kernel.org/linux-doc/20210621134636.5b332226@oasis.local.home/
+Link: https://lkml.kernel.org/r/52012d25ea35491a0f8088b947864d8df8e25157.1624372313.git.bristot@redhat.com
+
+	Cc: Phil Auld <pauld@redhat.com>
+	Cc: Sebastian Andrzej Siewior <bigeasy@linutronix.de>
+	Cc: Kate Carcia <kcarcia@redhat.com>
+	Cc: Jonathan Corbet <corbet@lwn.net>
+	Cc: Ingo Molnar <mingo@redhat.com>
+	Cc: Peter Zijlstra <peterz@infradead.org>
+	Cc: Thomas Gleixner <tglx@linutronix.de>
+	Cc: Alexandre Chartre <alexandre.chartre@oracle.com>
+	Cc: Clark Willaims <williams@redhat.com>
+	Cc: John Kacur <jkacur@redhat.com>
+	Cc: Juri Lelli <juri.lelli@redhat.com>
+	Cc: Borislav Petkov <bp@alien8.de>
+	Cc: "H. Peter Anvin" <hpa@zytor.com>
+	Cc: x86@kernel.org
+	Cc: linux-doc@vger.kernel.org
+	Cc: linux-kernel@vger.kernel.org
+	Suggested-by: Steven Rostedt (VMware) <rostedt@goodmis.org>
+	Signed-off-by: Daniel Bristot de Oliveira <bristot@redhat.com>
+	Signed-off-by: Steven Rostedt (VMware) <rostedt@goodmis.org>
+(cherry picked from commit ba998f7d9531ef4ce462cabd2ce57a7558c33ede)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	kernel/trace/trace_hwlat.c
+diff --cc kernel/trace/trace_hwlat.c
+index 86a0e47cf098,a6c0cdaf4b87..000000000000
+--- a/kernel/trace/trace_hwlat.c
++++ b/kernel/trace/trace_hwlat.c
+@@@ -368,151 -435,332 +368,369 @@@ static int start_kthread(struct trace_a
+  		return -ENOMEM;
+  	}
+  
+ -	/* Just pick the first CPU on first iteration */
+ -	cpumask_and(current_mask, cpu_online_mask, tr->tracing_cpumask);
+ -
+ -	if (hwlat_data.thread_mode == MODE_ROUND_ROBIN) {
+ -		next_cpu = cpumask_first(current_mask);
+ -		cpumask_clear(current_mask);
+ -		cpumask_set_cpu(next_cpu, current_mask);
+ -
+ -	}
+ -
+ +	cpumask_clear(current_mask);
+ +	cpumask_set_cpu(next_cpu, current_mask);
+  	sched_setaffinity(kthread->pid, current_mask);
+  
+++<<<<<<< HEAD
+ +	hwlat_kthread = kthread;
+++=======
++ 	kdata->kthread = kthread;
+  	wake_up_process(kthread);
+  
++ out_put_cpus:
++ 	put_online_cpus();
+  	return 0;
+  }
+  
++ /*
++  * stop_cpu_kthread - Stop a hwlat cpu kthread
++  */
++ static void stop_cpu_kthread(unsigned int cpu)
++ {
++ 	struct task_struct *kthread;
++ 
++ 	kthread = per_cpu(hwlat_per_cpu_data, cpu).kthread;
++ 	if (kthread)
++ 		kthread_stop(kthread);
++ 	per_cpu(hwlat_per_cpu_data, cpu).kthread = NULL;
++ }
++ 
++ /*
++  * stop_per_cpu_kthreads - Inform the hardware latency sampling/detector kthread to stop
++  *
++  * This kicks the running hardware latency sampling/detector kernel threads and
++  * tells it to stop sampling now. Use this on unload and at system shutdown.
++  */
++ static void stop_per_cpu_kthreads(void)
++ {
++ 	unsigned int cpu;
++ 
++ 	get_online_cpus();
++ 	for_each_online_cpu(cpu)
++ 		stop_cpu_kthread(cpu);
++ 	put_online_cpus();
++ }
++ 
++ /*
++  * start_cpu_kthread - Start a hwlat cpu kthread
++  */
++ static int start_cpu_kthread(unsigned int cpu)
++ {
++ 	struct task_struct *kthread;
++ 	char comm[24];
++ 
++ 	snprintf(comm, 24, "hwlatd/%d", cpu);
++ 
++ 	kthread = kthread_create_on_cpu(kthread_fn, NULL, cpu, comm);
++ 	if (IS_ERR(kthread)) {
++ 		pr_err(BANNER "could not start sampling thread\n");
++ 		return -ENOMEM;
++ 	}
++ 
++ 	per_cpu(hwlat_per_cpu_data, cpu).kthread = kthread;
+++>>>>>>> ba998f7d9531 (trace/hwlat: Support hotplug operations)
++ 	wake_up_process(kthread);
++ 
++ 	return 0;
++ }
++ 
+++<<<<<<< HEAD
+++=======
++ #ifdef CONFIG_HOTPLUG_CPU
++ static void hwlat_hotplug_workfn(struct work_struct *dummy)
++ {
++ 	struct trace_array *tr = hwlat_trace;
++ 	unsigned int cpu = smp_processor_id();
++ 
++ 	mutex_lock(&trace_types_lock);
++ 	mutex_lock(&hwlat_data.lock);
++ 	get_online_cpus();
++ 
++ 	if (!hwlat_busy || hwlat_data.thread_mode != MODE_PER_CPU)
++ 		goto out_unlock;
++ 
++ 	if (!cpumask_test_cpu(cpu, tr->tracing_cpumask))
++ 		goto out_unlock;
++ 
++ 	start_cpu_kthread(cpu);
++ 
++ out_unlock:
++ 	put_online_cpus();
++ 	mutex_unlock(&hwlat_data.lock);
++ 	mutex_unlock(&trace_types_lock);
++ }
++ 
++ static DECLARE_WORK(hwlat_hotplug_work, hwlat_hotplug_workfn);
++ 
++ /*
++  * hwlat_cpu_init - CPU hotplug online callback function
++  */
++ static int hwlat_cpu_init(unsigned int cpu)
++ {
++ 	schedule_work_on(cpu, &hwlat_hotplug_work);
++ 	return 0;
++ }
++ 
++ /*
++  * hwlat_cpu_die - CPU hotplug offline callback function
++  */
++ static int hwlat_cpu_die(unsigned int cpu)
++ {
++ 	stop_cpu_kthread(cpu);
++ 	return 0;
++ }
++ 
++ static void hwlat_init_hotplug_support(void)
++ {
++ 	int ret;
++ 
++ 	ret = cpuhp_setup_state(CPUHP_AP_ONLINE_DYN, "trace/hwlat:online",
++ 				hwlat_cpu_init, hwlat_cpu_die);
++ 	if (ret < 0)
++ 		pr_warn(BANNER "Error to init cpu hotplug support\n");
++ 
++ 	return;
++ }
++ #else /* CONFIG_HOTPLUG_CPU */
++ static void hwlat_init_hotplug_support(void)
++ {
++ 	return;
++ }
++ #endif /* CONFIG_HOTPLUG_CPU */
++ 
++ /*
++  * start_per_cpu_kthreads - Kick off the hardware latency sampling/detector kthreads
++  *
++  * This starts the kernel threads that will sit on potentially all cpus and
++  * sample the CPU timestamp counter (TSC or similar) and look for potential
++  * hardware latencies.
++  */
++ static int start_per_cpu_kthreads(struct trace_array *tr)
++ {
++ 	struct cpumask *current_mask = &save_cpumask;
++ 	unsigned int cpu;
++ 	int retval;
++ 
++ 	get_online_cpus();
++ 	/*
++ 	 * Run only on CPUs in which hwlat is allowed to run.
++ 	 */
++ 	cpumask_and(current_mask, cpu_online_mask, tr->tracing_cpumask);
++ 
++ 	for_each_online_cpu(cpu)
++ 		per_cpu(hwlat_per_cpu_data, cpu).kthread = NULL;
++ 
++ 	for_each_cpu(cpu, current_mask) {
++ 		retval = start_cpu_kthread(cpu);
++ 		if (retval)
++ 			goto out_error;
++ 	}
++ 	put_online_cpus();
++ 
++ 	return 0;
++ 
++ out_error:
++ 	put_online_cpus();
++ 	stop_per_cpu_kthreads();
++ 	return retval;
++ }
++ 
++ static void *s_mode_start(struct seq_file *s, loff_t *pos)
++ {
++ 	int mode = *pos;
++ 
++ 	mutex_lock(&hwlat_data.lock);
++ 
++ 	if (mode >= MODE_MAX)
++ 		return NULL;
++ 
++ 	return pos;
++ }
++ 
++ static void *s_mode_next(struct seq_file *s, void *v, loff_t *pos)
++ {
++ 	int mode = ++(*pos);
++ 
++ 	if (mode >= MODE_MAX)
++ 		return NULL;
++ 
++ 	return pos;
++ }
++ 
++ static int s_mode_show(struct seq_file *s, void *v)
++ {
++ 	loff_t *pos = v;
++ 	int mode = *pos;
++ 
++ 	if (mode == hwlat_data.thread_mode)
++ 		seq_printf(s, "[%s]", thread_mode_str[mode]);
++ 	else
++ 		seq_printf(s, "%s", thread_mode_str[mode]);
++ 
++ 	if (mode != MODE_MAX)
++ 		seq_puts(s, " ");
++ 
++ 	return 0;
++ }
++ 
++ static void s_mode_stop(struct seq_file *s, void *v)
++ {
++ 	seq_puts(s, "\n");
++ 	mutex_unlock(&hwlat_data.lock);
++ }
++ 
++ static const struct seq_operations thread_mode_seq_ops = {
++ 	.start		= s_mode_start,
++ 	.next		= s_mode_next,
++ 	.show		= s_mode_show,
++ 	.stop		= s_mode_stop
++ };
++ 
++ static int hwlat_mode_open(struct inode *inode, struct file *file)
++ {
++ 	return seq_open(file, &thread_mode_seq_ops);
++ };
++ 
++ static void hwlat_tracer_start(struct trace_array *tr);
++ static void hwlat_tracer_stop(struct trace_array *tr);
++ 
+++>>>>>>> ba998f7d9531 (trace/hwlat: Support hotplug operations)
+  /**
+ - * hwlat_mode_write - Write function for "mode" entry
+ - * @filp: The active open file structure
+ - * @ubuf: The user buffer that contains the value to write
+ - * @cnt: The maximum number of bytes to write to "file"
+ - * @ppos: The current position in @file
+ + * stop_kthread - Inform the hardware latency samping/detector kthread to stop
+   *
+ - * This function provides a write implementation for the "mode" interface
+ - * to the hardware latency detector. hwlatd has different operation modes.
+ - * The "none" sets the allowed cpumask for a single hwlatd thread at the
+ - * startup and lets the scheduler handle the migration. The default mode is
+ - * the "round-robin" one, in which a single hwlatd thread runs, migrating
+ - * among the allowed CPUs in a round-robin fashion. The "per-cpu" mode
+ - * creates one hwlatd thread per allowed CPU.
+ + * This kicks the running hardware latency sampling/detector kernel thread and
+ + * tells it to stop sampling now. Use this on unload and at system shutdown.
+   */
+ -static ssize_t hwlat_mode_write(struct file *filp, const char __user *ubuf,
+ -				 size_t cnt, loff_t *ppos)
+ +static void stop_kthread(void)
+  {
+ -	struct trace_array *tr = hwlat_trace;
+ -	const char *mode;
+ -	char buf[64];
+ -	int ret, i;
+ +	if (!hwlat_kthread)
+ +		return;
+ +	kthread_stop(hwlat_kthread);
+ +	hwlat_kthread = NULL;
+ +}
+  
+ -	if (cnt >= sizeof(buf))
+ -		return -EINVAL;
+ +/*
+ + * hwlat_read - Wrapper read function for reading both window and width
+ + * @filp: The active open file structure
+ + * @ubuf: The userspace provided buffer to read value into
+ + * @cnt: The maximum number of bytes to read
+ + * @ppos: The current "file" position
+ + *
+ + * This function provides a generic read implementation for the global state
+ + * "hwlat_data" structure filesystem entries.
+ + */
+ +static ssize_t hwlat_read(struct file *filp, char __user *ubuf,
+ +			  size_t cnt, loff_t *ppos)
+ +{
+ +	char buf[U64STR_SIZE];
+ +	u64 *entry = filp->private_data;
+ +	u64 val;
+ +	int len;
+  
+ -	if (copy_from_user(buf, ubuf, cnt))
+ +	if (!entry)
+  		return -EFAULT;
+  
+ -	buf[cnt] = 0;
+ +	if (cnt > sizeof(buf))
+ +		cnt = sizeof(buf);
+  
+ -	mode = strstrip(buf);
+ +	val = *entry;
+  
+ -	ret = -EINVAL;
+ +	len = snprintf(buf, sizeof(buf), "%llu\n", val);
+  
+ -	/*
+ -	 * trace_types_lock is taken to avoid concurrency on start/stop
+ -	 * and hwlat_busy.
+ -	 */
+ -	mutex_lock(&trace_types_lock);
+ -	if (hwlat_busy)
+ -		hwlat_tracer_stop(tr);
+ +	return simple_read_from_buffer(ubuf, cnt, ppos, buf, len);
+ +}
+  
+ -	mutex_lock(&hwlat_data.lock);
+ +/**
+ + * hwlat_width_write - Write function for "width" entry
+ + * @filp: The active open file structure
+ + * @ubuf: The user buffer that contains the value to write
+ + * @cnt: The maximum number of bytes to write to "file"
+ + * @ppos: The current position in @file
+ + *
+ + * This function provides a write implementation for the "width" interface
+ + * to the hardware latency detector. It can be used to configure
+ + * for how many us of the total window us we will actively sample for any
+ + * hardware-induced latency periods. Obviously, it is not possible to
+ + * sample constantly and have the system respond to a sample reader, or,
+ + * worse, without having the system appear to have gone out to lunch. It
+ + * is enforced that width is less that the total window size.
+ + */
+ +static ssize_t
+ +hwlat_width_write(struct file *filp, const char __user *ubuf,
+ +		  size_t cnt, loff_t *ppos)
+ +{
+ +	u64 val;
+ +	int err;
+  
+ -	for (i = 0; i < MODE_MAX; i++) {
+ -		if (strcmp(mode, thread_mode_str[i]) == 0) {
+ -			hwlat_data.thread_mode = i;
+ -			ret = cnt;
+ -		}
+ -	}
+ +	err = kstrtoull_from_user(ubuf, cnt, 10, &val);
+ +	if (err)
+ +		return err;
+  
+ +	mutex_lock(&hwlat_data.lock);
+ +	if (val < hwlat_data.sample_window)
+ +		hwlat_data.sample_width = val;
+ +	else
+ +		err = -EINVAL;
+  	mutex_unlock(&hwlat_data.lock);
+  
+ -	if (hwlat_busy)
+ -		hwlat_tracer_start(tr);
+ -	mutex_unlock(&trace_types_lock);
+ +	if (err)
+ +		return err;
+  
+ -	*ppos += cnt;
+ +	return cnt;
+ +}
+  
+ +/**
+ + * hwlat_window_write - Write function for "window" entry
+ + * @filp: The active open file structure
+ + * @ubuf: The user buffer that contains the value to write
+ + * @cnt: The maximum number of bytes to write to "file"
+ + * @ppos: The current position in @file
+ + *
+ + * This function provides a write implementation for the "window" interface
+ + * to the hardware latency detetector. The window is the total time
+ + * in us that will be considered one sample period. Conceptually, windows
+ + * occur back-to-back and contain a sample width period during which
+ + * actual sampling occurs. Can be used to write a new total window size. It
+ + * is enfoced that any value written must be greater than the sample width
+ + * size, or an error results.
+ + */
+ +static ssize_t
+ +hwlat_window_write(struct file *filp, const char __user *ubuf,
+ +		   size_t cnt, loff_t *ppos)
+ +{
+ +	u64 val;
+ +	int err;
+  
+ +	err = kstrtoull_from_user(ubuf, cnt, 10, &val);
+ +	if (err)
+ +		return err;
+  
+ -	return ret;
+ +	mutex_lock(&hwlat_data.lock);
+ +	if (hwlat_data.sample_width < val)
+ +		hwlat_data.sample_window = val;
+ +	else
+ +		err = -EINVAL;
+ +	mutex_unlock(&hwlat_data.lock);
+ +
+ +	if (err)
+ +		return err;
+ +
+ +	return cnt;
+  }
+  
+ -/*
+ - * The width parameter is read/write using the generic trace_min_max_param
+ - * method. The *val is protected by the hwlat_data lock and is upper
+ - * bounded by the window parameter.
+ - */
+ -static struct trace_min_max_param hwlat_width = {
+ -	.lock		= &hwlat_data.lock,
+ -	.val		= &hwlat_data.sample_width,
+ -	.max		= &hwlat_data.sample_window,
+ -	.min		= NULL,
+ +static const struct file_operations width_fops = {
+ +	.open		= tracing_open_generic,
+ +	.read		= hwlat_read,
+ +	.write		= hwlat_width_write,
+  };
+  
+ -/*
+ - * The window parameter is read/write using the generic trace_min_max_param
+ - * method. The *val is protected by the hwlat_data lock and is lower
+ - * bounded by the width parameter.
+ - */
+ -static struct trace_min_max_param hwlat_window = {
+ -	.lock		= &hwlat_data.lock,
+ -	.val		= &hwlat_data.sample_window,
+ -	.max		= NULL,
+ -	.min		= &hwlat_data.sample_width,
+ +static const struct file_operations window_fops = {
+ +	.open		= tracing_open_generic,
+ +	.read		= hwlat_read,
+ +	.write		= hwlat_window_write,
+  };
+  
+ -static const struct file_operations thread_mode_fops = {
+ -	.open		= hwlat_mode_open,
+ -	.read		= seq_read,
+ -	.llseek		= seq_lseek,
+ -	.release	= seq_release,
+ -	.write		= hwlat_mode_write
+ -};
+  /**
+   * init_tracefs - A function to initialize the tracefs interface files
+   *
+* Unmerged path kernel/trace/trace_hwlat.c
