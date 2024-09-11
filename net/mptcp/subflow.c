@@ -20,6 +20,7 @@
 #include <net/ip6_route.h>
 #endif
 #include <net/mptcp.h>
+#include <uapi/linux/mptcp.h>
 #include "protocol.h"
 #include "mib.h"
 
@@ -1059,7 +1060,7 @@ int __mptcp_subflow_connect(struct sock *sk, int ifindex,
 	subflow->remote_token = remote_token;
 	subflow->local_id = loc->id;
 	subflow->request_join = 1;
-	subflow->request_bkup = 1;
+	subflow->request_bkup = !!(loc->flags & MPTCP_PM_ADDR_FLAG_BACKUP);
 	mptcp_info2sockaddr(remote, &addr);
 
 	err = kernel_connect(sf, (struct sockaddr *)&addr, addrlen, O_NONBLOCK);
