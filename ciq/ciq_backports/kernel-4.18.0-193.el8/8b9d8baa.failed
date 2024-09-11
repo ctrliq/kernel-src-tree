@@ -1,0 +1,210 @@
+net/mlx5: Add Crdump support
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-193.el8
+Rebuild_CHGLOG: - [netdrv] mlx5: Add Crdump support (Alaa Hleihel) [1724336]
+Rebuild_FUZZ: 92.31%
+commit-author Alex Vesker <valex@mellanox.com>
+commit 8b9d8baae1de7400f19058020ee8f0f27d436687
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-193.el8/8b9d8baa.failed
+
+Crdump allows the driver to retrieve a dump of the FW PCI crspace.
+This is useful in case of catastrophic issues which may require FW
+reset. The crspace dump can be used for later debug.
+
+	Signed-off-by: Alex Vesker <valex@mellanox.com>
+	Signed-off-by: Moshe Shemesh <moshe@mellanox.com>
+	Reviewed-by: Feras Daoud <ferasda@mellanox.com>
+	Signed-off-by: Saeed Mahameed <saeedm@mellanox.com>
+(cherry picked from commit 8b9d8baae1de7400f19058020ee8f0f27d436687)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/mellanox/mlx5/core/Makefile
+#	drivers/net/ethernet/mellanox/mlx5/core/main.c
+diff --cc drivers/net/ethernet/mellanox/mlx5/core/Makefile
+index 282b26e5f09b,5fe2bf916c06..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx5/core/Makefile
++++ b/drivers/net/ethernet/mellanox/mlx5/core/Makefile
+@@@ -15,7 -15,8 +15,12 @@@ mlx5_core-y :=	main.o cmd.o debugfs.o f
+  		health.o mcg.o cq.o alloc.o qp.o port.o mr.o pd.o \
+  		transobj.o vport.o sriov.o fs_cmd.o fs_core.o \
+  		fs_counters.o rl.o lag.o dev.o events.o wq.o lib/gid.o \
+++<<<<<<< HEAD
+ +		lib/devcom.o diag/fs_tracepoint.o diag/fw_tracer.o
+++=======
++ 		lib/devcom.o lib/pci_vsc.o diag/fs_tracepoint.o \
++ 		diag/fw_tracer.o diag/crdump.o devlink.o
+++>>>>>>> 8b9d8baae1de (net/mlx5: Add Crdump support)
+  
+  #
+  # Netdev basic
+diff --cc drivers/net/ethernet/mellanox/mlx5/core/main.c
+index ea5e5990b832,c70e97071b87..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx5/core/main.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/main.c
+@@@ -1367,14 -1337,14 +1371,19 @@@ static void remove_one(struct pci_dev *
+  {
+  	struct mlx5_core_dev *dev  = pci_get_drvdata(pdev);
+  	struct devlink *devlink = priv_to_devlink(dev);
+ +	struct mlx5_priv *priv = &dev->priv;
+  
+++<<<<<<< HEAD
+ +	devlink_unregister(devlink);
+++=======
++ 	mlx5_crdump_disable(dev);
++ 	mlx5_devlink_unregister(devlink);
+++>>>>>>> 8b9d8baae1de (net/mlx5: Add Crdump support)
+  	mlx5_unregister_device(dev);
+  
+ -	if (mlx5_unload_one(dev, true)) {
+ -		mlx5_core_err(dev, "mlx5_unload_one failed\n");
+ -		mlx5_health_flush(dev);
+ +	if (mlx5_unload_one(dev, priv, true)) {
+ +		dev_err(&dev->pdev->dev, "mlx5_unload_one failed\n");
+ +		mlx5_health_cleanup(dev);
+  		return;
+  	}
+  
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/Makefile
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/diag/crdump.c b/drivers/net/ethernet/mellanox/mlx5/core/diag/crdump.c
+new file mode 100644
+index 000000000000..dfb34172c69b
+--- /dev/null
++++ b/drivers/net/ethernet/mellanox/mlx5/core/diag/crdump.c
+@@ -0,0 +1,106 @@
++// SPDX-License-Identifier: GPL-2.0 OR Linux-OpenIB
++/* Copyright (c) 2019 Mellanox Technologies */
++
++#include <linux/mlx5/driver.h>
++#include "mlx5_core.h"
++#include "lib/pci_vsc.h"
++#include "lib/mlx5.h"
++
++#define BAD_ACCESS			0xBADACCE5
++#define MLX5_PROTECTED_CR_SCAN_CRSPACE	0x7
++
++static bool mlx5_crdump_enabled(struct mlx5_core_dev *dev)
++{
++	return !!dev->priv.health.crdump_size;
++}
++
++static int mlx5_crdump_fill(struct mlx5_core_dev *dev, u32 *cr_data)
++{
++	u32 crdump_size = dev->priv.health.crdump_size;
++	int i, ret;
++
++	for (i = 0; i < (crdump_size / 4); i++)
++		cr_data[i] = BAD_ACCESS;
++
++	ret = mlx5_vsc_gw_read_block_fast(dev, cr_data, crdump_size);
++	if (ret <= 0) {
++		if (ret == 0)
++			return -EIO;
++		return ret;
++	}
++
++	if (crdump_size != ret) {
++		mlx5_core_warn(dev, "failed to read full dump, read %d out of %u\n",
++			       ret, crdump_size);
++		return -EINVAL;
++	}
++
++	return 0;
++}
++
++int mlx5_crdump_collect(struct mlx5_core_dev *dev, u32 *cr_data)
++{
++	int ret;
++
++	if (!mlx5_crdump_enabled(dev))
++		return -ENODEV;
++
++	ret = mlx5_vsc_gw_lock(dev);
++	if (ret) {
++		mlx5_core_warn(dev, "crdump: failed to lock vsc gw err %d\n",
++			       ret);
++		return ret;
++	}
++
++	ret = mlx5_vsc_gw_set_space(dev, MLX5_VSC_SPACE_SCAN_CRSPACE, NULL);
++	if (ret)
++		goto unlock;
++
++	ret = mlx5_crdump_fill(dev, cr_data);
++
++unlock:
++	mlx5_vsc_gw_unlock(dev);
++	return ret;
++}
++
++int mlx5_crdump_enable(struct mlx5_core_dev *dev)
++{
++	struct mlx5_priv *priv = &dev->priv;
++	u32 space_size;
++	int ret;
++
++	if (!mlx5_core_is_pf(dev) || !mlx5_vsc_accessible(dev) ||
++	    mlx5_crdump_enabled(dev))
++		return 0;
++
++	ret = mlx5_vsc_gw_lock(dev);
++	if (ret)
++		return ret;
++
++	/* Check if space is supported and get space size */
++	ret = mlx5_vsc_gw_set_space(dev, MLX5_VSC_SPACE_SCAN_CRSPACE,
++				    &space_size);
++	if (ret) {
++		/* Unlock and mask error since space is not supported */
++		mlx5_vsc_gw_unlock(dev);
++		return 0;
++	}
++
++	if (!space_size) {
++		mlx5_core_warn(dev, "Invalid Crspace size, zero\n");
++		mlx5_vsc_gw_unlock(dev);
++		return -EINVAL;
++	}
++
++	ret = mlx5_vsc_gw_unlock(dev);
++	if (ret)
++		return ret;
++
++	priv->health.crdump_size = space_size;
++	return 0;
++}
++
++void mlx5_crdump_disable(struct mlx5_core_dev *dev)
++{
++	dev->priv.health.crdump_size = 0;
++}
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/lib/mlx5.h b/drivers/net/ethernet/mellanox/mlx5/core/lib/mlx5.h
+index 397a2847867a..d918e44491f4 100644
+--- a/drivers/net/ethernet/mellanox/mlx5/core/lib/mlx5.h
++++ b/drivers/net/ethernet/mellanox/mlx5/core/lib/mlx5.h
+@@ -41,6 +41,9 @@ int  mlx5_core_reserve_gids(struct mlx5_core_dev *dev, unsigned int count);
+ void mlx5_core_unreserve_gids(struct mlx5_core_dev *dev, unsigned int count);
+ int  mlx5_core_reserved_gid_alloc(struct mlx5_core_dev *dev, int *gid_index);
+ void mlx5_core_reserved_gid_free(struct mlx5_core_dev *dev, int gid_index);
++int mlx5_crdump_enable(struct mlx5_core_dev *dev);
++void mlx5_crdump_disable(struct mlx5_core_dev *dev);
++int mlx5_crdump_collect(struct mlx5_core_dev *dev, u32 *cr_data);
+ 
+ /* TODO move to lib/events.h */
+ 
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/main.c
+diff --git a/include/linux/mlx5/driver.h b/include/linux/mlx5/driver.h
+index 655e39273378..712f56b779a8 100644
+--- a/include/linux/mlx5/driver.h
++++ b/include/linux/mlx5/driver.h
+@@ -436,6 +436,7 @@ struct mlx5_core_health {
+ 	u32				prev;
+ 	int				miss_counter;
+ 	bool				sick;
++	u32				crdump_size;
+ 	/* wq spinlock to synchronize draining */
+ 	spinlock_t			wq_lock;
+ 	struct workqueue_struct	       *wq;
