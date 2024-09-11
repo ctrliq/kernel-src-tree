@@ -1,0 +1,190 @@
+KVM: x86: Introduce KVM_REQ_TLB_FLUSH_CURRENT to flush current ASID
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Sean Christopherson <sean.j.christopherson@intel.com>
+commit eeeb4f67a6cd437da1f5d1a20596cdc2d7b50551
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/eeeb4f67.failed
+
+Add KVM_REQ_TLB_FLUSH_CURRENT to allow optimized TLB flushing of VMX's
+EPTP/VPID contexts[*] from the KVM MMU and/or in a deferred manner, e.g.
+to flush L2's context during nested VM-Enter.
+
+Convert KVM_REQ_TLB_FLUSH to KVM_REQ_TLB_FLUSH_CURRENT in flows where
+the flush is directly associated with vCPU-scoped instruction emulation,
+i.e. MOV CR3 and INVPCID.
+
+Add a comment in vmx_vcpu_load_vmcs() above its KVM_REQ_TLB_FLUSH to
+make it clear that it deliberately requests a flush of all contexts.
+
+Service any pending flush request on nested VM-Exit as it's possible a
+nested VM-Exit could occur after requesting a flush for L2.  Add the
+same logic for nested VM-Enter even though it's _extremely_ unlikely
+for flush to be pending on nested VM-Enter, but theoretically possible
+(in the future) due to RSM (SMM) emulation.
+
+[*] Intel also has an Address Space Identifier (ASID) concept, e.g.
+    EPTP+VPID+PCID == ASID, it's just not documented in the SDM because
+    the rules of invalidation are different based on which piece of the
+    ASID is being changed, i.e. whether the EPTP, VPID, or PCID context
+    must be invalidated.
+
+	Signed-off-by: Sean Christopherson <sean.j.christopherson@intel.com>
+Message-Id: <20200320212833.3507-25-sean.j.christopherson@intel.com>
+	Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+(cherry picked from commit eeeb4f67a6cd437da1f5d1a20596cdc2d7b50551)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/include/asm/kvm_host.h
+#	arch/x86/kvm/svm/svm.c
+#	arch/x86/kvm/vmx/vmx.c
+#	arch/x86/kvm/x86.c
+diff --cc arch/x86/include/asm/kvm_host.h
+index 10275c160b4e,72e9c4492f47..000000000000
+--- a/arch/x86/include/asm/kvm_host.h
++++ b/arch/x86/include/asm/kvm_host.h
+@@@ -84,6 -81,11 +84,14 @@@
+  #define KVM_REQ_HV_STIMER		KVM_ARCH_REQ(22)
+  #define KVM_REQ_LOAD_EOI_EXITMAP	KVM_ARCH_REQ(23)
+  #define KVM_REQ_GET_VMCS12_PAGES	KVM_ARCH_REQ(24)
+++<<<<<<< HEAD
+++=======
++ #define KVM_REQ_APICV_UPDATE \
++ 	KVM_ARCH_REQ_FLAGS(25, KVM_REQUEST_WAIT | KVM_REQUEST_NO_WAKEUP)
++ #define KVM_REQ_TLB_FLUSH_CURRENT	KVM_ARCH_REQ(26)
++ #define KVM_REQ_HV_TLB_FLUSH \
++ 	KVM_ARCH_REQ_FLAGS(27, KVM_REQUEST_NO_WAKEUP)
+++>>>>>>> eeeb4f67a6cd (KVM: x86: Introduce KVM_REQ_TLB_FLUSH_CURRENT to flush current ASID)
+  
+  #define CR0_RESERVED_BITS                                               \
+  	(~(unsigned long)(X86_CR0_PE | X86_CR0_MP | X86_CR0_EM | X86_CR0_TS \
+@@@ -1101,7 -1104,8 +1109,12 @@@ struct kvm_x86_ops 
+  	unsigned long (*get_rflags)(struct kvm_vcpu *vcpu);
+  	void (*set_rflags)(struct kvm_vcpu *vcpu, unsigned long rflags);
+  
+++<<<<<<< HEAD
+ +	void (*tlb_flush)(struct kvm_vcpu *vcpu, bool invalidate_gpa);
+++=======
++ 	void (*tlb_flush_all)(struct kvm_vcpu *vcpu);
++ 	void (*tlb_flush_current)(struct kvm_vcpu *vcpu);
+++>>>>>>> eeeb4f67a6cd (KVM: x86: Introduce KVM_REQ_TLB_FLUSH_CURRENT to flush current ASID)
+  	int  (*tlb_remote_flush)(struct kvm *kvm);
+  	int  (*tlb_remote_flush_with_range)(struct kvm *kvm,
+  			struct kvm_tlb_range *range);
+diff --cc arch/x86/kvm/svm/svm.c
+index b85940aff326,66123848448d..000000000000
+--- a/arch/x86/kvm/svm/svm.c
++++ b/arch/x86/kvm/svm/svm.c
+@@@ -7481,9 -3944,10 +7481,14 @@@ static struct kvm_x86_ops svm_x86_ops _
+  	.get_rflags = svm_get_rflags,
+  	.set_rflags = svm_set_rflags,
+  
+++<<<<<<< HEAD
+ +	.tlb_flush = svm_flush_tlb,
+++=======
++ 	.tlb_flush_all = svm_flush_tlb,
++ 	.tlb_flush_current = svm_flush_tlb,
+++>>>>>>> eeeb4f67a6cd (KVM: x86: Introduce KVM_REQ_TLB_FLUSH_CURRENT to flush current ASID)
+  	.tlb_flush_gva = svm_flush_tlb_gva,
+ -	.tlb_flush_guest = svm_flush_tlb,
+ +	.tlb_flush_guest = svm_flush_tlb_guest,
+  
+  	.run = svm_vcpu_run,
+  	.handle_exit = handle_exit,
+diff --cc arch/x86/kvm/vmx/vmx.c
+index dbadf7ce3b2f,d958cee52f41..000000000000
+--- a/arch/x86/kvm/vmx/vmx.c
++++ b/arch/x86/kvm/vmx/vmx.c
+@@@ -7929,7 -7767,8 +7933,12 @@@ static struct kvm_x86_ops vmx_x86_ops _
+  	.get_rflags = vmx_get_rflags,
+  	.set_rflags = vmx_set_rflags,
+  
+++<<<<<<< HEAD
+ +	.tlb_flush = vmx_flush_tlb,
+++=======
++ 	.tlb_flush_all = vmx_flush_tlb_all,
++ 	.tlb_flush_current = vmx_flush_tlb_current,
+++>>>>>>> eeeb4f67a6cd (KVM: x86: Introduce KVM_REQ_TLB_FLUSH_CURRENT to flush current ASID)
+  	.tlb_flush_gva = vmx_flush_tlb_gva,
+  	.tlb_flush_guest = vmx_flush_tlb_guest,
+  
+diff --cc arch/x86/kvm/x86.c
+index 0a8a4dd82886,ebbe34d89469..000000000000
+--- a/arch/x86/kvm/x86.c
++++ b/arch/x86/kvm/x86.c
+@@@ -8088,10 -8220,19 +8088,26 @@@ static int vcpu_enter_guest(struct kvm_
+  		}
+  		if (kvm_check_request(KVM_REQ_MMU_SYNC, vcpu))
+  			kvm_mmu_sync_roots(vcpu);
+++<<<<<<< HEAD
+ +		if (kvm_check_request(KVM_REQ_LOAD_CR3, vcpu))
+ +			kvm_mmu_load_cr3(vcpu);
+ +		if (kvm_check_request(KVM_REQ_TLB_FLUSH, vcpu))
+ +			kvm_vcpu_flush_tlb(vcpu, true);
+++=======
++ 		if (kvm_check_request(KVM_REQ_LOAD_MMU_PGD, vcpu))
++ 			kvm_mmu_load_pgd(vcpu);
++ 		if (kvm_check_request(KVM_REQ_TLB_FLUSH, vcpu)) {
++ 			kvm_vcpu_flush_tlb_all(vcpu);
++ 
++ 			/* Flushing all ASIDs flushes the current ASID... */
++ 			kvm_clear_request(KVM_REQ_TLB_FLUSH_CURRENT, vcpu);
++ 		}
++ 		if (kvm_check_request(KVM_REQ_TLB_FLUSH_CURRENT, vcpu))
++ 			kvm_vcpu_flush_tlb_current(vcpu);
++ 		if (kvm_check_request(KVM_REQ_HV_TLB_FLUSH, vcpu))
++ 			kvm_vcpu_flush_tlb_guest(vcpu);
++ 
+++>>>>>>> eeeb4f67a6cd (KVM: x86: Introduce KVM_REQ_TLB_FLUSH_CURRENT to flush current ASID)
+  		if (kvm_check_request(KVM_REQ_REPORT_TPR_ACCESS, vcpu)) {
+  			vcpu->run->exit_reason = KVM_EXIT_TPR_ACCESS;
+  			r = 0;
+* Unmerged path arch/x86/include/asm/kvm_host.h
+* Unmerged path arch/x86/kvm/svm/svm.c
+diff --git a/arch/x86/kvm/vmx/nested.c b/arch/x86/kvm/vmx/nested.c
+index cd775c31a62d..aacb292d6372 100644
+--- a/arch/x86/kvm/vmx/nested.c
++++ b/arch/x86/kvm/vmx/nested.c
+@@ -3192,6 +3192,9 @@ enum nvmx_vmentry_status nested_vmx_enter_non_root_mode(struct kvm_vcpu *vcpu,
+ 	u32 exit_reason = EXIT_REASON_INVALID_STATE;
+ 	u32 exit_qual;
+ 
++	if (kvm_check_request(KVM_REQ_TLB_FLUSH_CURRENT, vcpu))
++		kvm_vcpu_flush_tlb_current(vcpu);
++
+ 	evaluate_pending_interrupts = exec_controls_get(vmx) &
+ 		(CPU_BASED_VIRTUAL_INTR_PENDING | CPU_BASED_VIRTUAL_NMI_PENDING);
+ 	if (likely(!evaluate_pending_interrupts) && kvm_vcpu_apicv_active(vcpu))
+@@ -4275,6 +4278,10 @@ void nested_vmx_vmexit(struct kvm_vcpu *vcpu, u32 exit_reason,
+ 	/* trying to cancel vmlaunch/vmresume is a bug */
+ 	WARN_ON_ONCE(vmx->nested.nested_run_pending);
+ 
++	/* Service the TLB flush request for L2 before switching to L1. */
++	if (kvm_check_request(KVM_REQ_TLB_FLUSH_CURRENT, vcpu))
++		kvm_vcpu_flush_tlb_current(vcpu);
++
+ 	leave_guest_mode(vcpu);
+ 
+ 	if (nested_cpu_has_preemption_timer(vmcs12))
+* Unmerged path arch/x86/kvm/vmx/vmx.c
+* Unmerged path arch/x86/kvm/x86.c
+diff --git a/arch/x86/kvm/x86.h b/arch/x86/kvm/x86.h
+index 916e17e33414..c2d244c95818 100644
+--- a/arch/x86/kvm/x86.h
++++ b/arch/x86/kvm/x86.h
+@@ -125,6 +125,12 @@ static inline bool mmu_is_nested(struct kvm_vcpu *vcpu)
+ 	return vcpu->arch.walk_mmu == &vcpu->arch.nested_mmu;
+ }
+ 
++static inline void kvm_vcpu_flush_tlb_current(struct kvm_vcpu *vcpu)
++{
++	++vcpu->stat.tlb_flush;
++	kvm_x86_ops.tlb_flush_current(vcpu);
++}
++
+ static inline int is_pae(struct kvm_vcpu *vcpu)
+ {
+ 	return kvm_read_cr4_bits(vcpu, X86_CR4_PAE);
