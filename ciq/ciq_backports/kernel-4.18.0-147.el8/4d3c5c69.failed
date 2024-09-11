@@ -1,0 +1,162 @@
+Drivers: hv: vmbus: Remove the useless API vmbus_get_outgoing_channel()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-147.el8
+Rebuild_CHGLOG: - [hv] hv: vmbus: Remove the useless API vmbus_get_outgoing_channel() (Mohammed Gamal) [1691383]
+Rebuild_FUZZ: 93.23%
+commit-author Dexuan Cui <decui@microsoft.com>
+commit 4d3c5c69191f98c7f7e699ff08d2fd96d7070ddb
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-147.el8/4d3c5c69.failed
+
+Commit d86adf482b84 ("scsi: storvsc: Enable multi-queue support") removed
+the usage of the API in Jan 2017, and the API is not used since then.
+
+netvsc and storvsc have their own algorithms to determine the outgoing
+channel, so this API is useless.
+
+And the API is potentially unsafe, because it reads primary->num_sc without
+any lock held. This can be risky considering the RESCIND-OFFER message.
+
+Let's remove the API.
+
+	Cc: Long Li <longli@microsoft.com>
+	Cc: Stephen Hemminger <sthemmin@microsoft.com>
+	Cc: K. Y. Srinivasan <kys@microsoft.com>
+	Cc: Haiyang Zhang <haiyangz@microsoft.com>
+	Signed-off-by: Dexuan Cui <decui@microsoft.com>
+	Signed-off-by: K. Y. Srinivasan <kys@microsoft.com>
+	Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+(cherry picked from commit 4d3c5c69191f98c7f7e699ff08d2fd96d7070ddb)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/hv/channel.c
+diff --cc drivers/hv/channel.c
+index 053a13d3d7ca,f96a77b18bb9..000000000000
+--- a/drivers/hv/channel.c
++++ b/drivers/hv/channel.c
+@@@ -698,7 -700,12 +698,16 @@@ int vmbus_disconnect_ring(struct vmbus_
+  	if (channel->primary_channel != NULL)
+  		return -EINVAL;
+  
+++<<<<<<< HEAD
+ +	list_for_each_entry_safe(cur_channel, tmp, &channel->sc_list, sc_list) {
+++=======
++ 	/* Snapshot the list of subchannels */
++ 	spin_lock_irqsave(&channel->lock, flags);
++ 	list_splice_init(&channel->sc_list, &list);
++ 	spin_unlock_irqrestore(&channel->lock, flags);
++ 
++ 	list_for_each_entry_safe(cur_channel, tmp, &list, sc_list) {
+++>>>>>>> 4d3c5c69191f (Drivers: hv: vmbus: Remove the useless API vmbus_get_outgoing_channel())
+  		if (cur_channel->rescind)
+  			wait_for_completion(&cur_channel->rescind_event);
+  
+* Unmerged path drivers/hv/channel.c
+diff --git a/drivers/hv/channel_mgmt.c b/drivers/hv/channel_mgmt.c
+index 6277597d3d58..82e673671087 100644
+--- a/drivers/hv/channel_mgmt.c
++++ b/drivers/hv/channel_mgmt.c
+@@ -405,7 +405,6 @@ void hv_process_channel_removal(struct vmbus_channel *channel)
+ 		primary_channel = channel->primary_channel;
+ 		spin_lock_irqsave(&primary_channel->lock, flags);
+ 		list_del(&channel->sc_list);
+-		primary_channel->num_sc--;
+ 		spin_unlock_irqrestore(&primary_channel->lock, flags);
+ 	}
+ 
+@@ -483,7 +482,6 @@ static void vmbus_process_offer(struct vmbus_channel *newchannel)
+ 			newchannel->primary_channel = channel;
+ 			spin_lock_irqsave(&channel->lock, flags);
+ 			list_add_tail(&newchannel->sc_list, &channel->sc_list);
+-			channel->num_sc++;
+ 			spin_unlock_irqrestore(&channel->lock, flags);
+ 		} else {
+ 			goto err_free_chan;
+@@ -1239,49 +1237,6 @@ int vmbus_request_offers(void)
+ 	return ret;
+ }
+ 
+-/*
+- * Retrieve the (sub) channel on which to send an outgoing request.
+- * When a primary channel has multiple sub-channels, we try to
+- * distribute the load equally amongst all available channels.
+- */
+-struct vmbus_channel *vmbus_get_outgoing_channel(struct vmbus_channel *primary)
+-{
+-	struct list_head *cur, *tmp;
+-	int cur_cpu;
+-	struct vmbus_channel *cur_channel;
+-	struct vmbus_channel *outgoing_channel = primary;
+-	int next_channel;
+-	int i = 1;
+-
+-	if (list_empty(&primary->sc_list))
+-		return outgoing_channel;
+-
+-	next_channel = primary->next_oc++;
+-
+-	if (next_channel > (primary->num_sc)) {
+-		primary->next_oc = 0;
+-		return outgoing_channel;
+-	}
+-
+-	cur_cpu = hv_cpu_number_to_vp_number(smp_processor_id());
+-	list_for_each_safe(cur, tmp, &primary->sc_list) {
+-		cur_channel = list_entry(cur, struct vmbus_channel, sc_list);
+-		if (cur_channel->state != CHANNEL_OPENED_STATE)
+-			continue;
+-
+-		if (cur_channel->target_vp == cur_cpu)
+-			return cur_channel;
+-
+-		if (i == next_channel)
+-			return cur_channel;
+-
+-		i++;
+-	}
+-
+-	return outgoing_channel;
+-}
+-EXPORT_SYMBOL_GPL(vmbus_get_outgoing_channel);
+-
+ static void invoke_sc_cb(struct vmbus_channel *primary_channel)
+ {
+ 	struct list_head *cur, *tmp;
+diff --git a/include/linux/hyperv.h b/include/linux/hyperv.h
+index b3e24368930a..07a367f5e22f 100644
+--- a/include/linux/hyperv.h
++++ b/include/linux/hyperv.h
+@@ -830,15 +830,6 @@ struct vmbus_channel {
+ 	 * All Sub-channels of a primary channel are linked here.
+ 	 */
+ 	struct list_head sc_list;
+-	/*
+-	 * Current number of sub-channels.
+-	 */
+-	int num_sc;
+-	/*
+-	 * Number of a sub-channel (position within sc_list) which is supposed
+-	 * to be used as the next outgoing channel.
+-	 */
+-	int next_oc;
+ 	/*
+ 	 * The primary channel this sub-channel belongs to.
+ 	 * This will be NULL for the primary channel.
+@@ -965,14 +956,6 @@ void vmbus_set_sc_create_callback(struct vmbus_channel *primary_channel,
+ void vmbus_set_chn_rescind_callback(struct vmbus_channel *channel,
+ 		void (*chn_rescind_cb)(struct vmbus_channel *));
+ 
+-/*
+- * Retrieve the (sub) channel on which to send an outgoing request.
+- * When a primary channel has multiple sub-channels, we choose a
+- * channel whose VCPU binding is closest to the VCPU on which
+- * this call is being made.
+- */
+-struct vmbus_channel *vmbus_get_outgoing_channel(struct vmbus_channel *primary);
+-
+ /*
+  * Check if sub-channels have already been offerred. This API will be useful
+  * when the driver is unloaded after establishing sub-channels. In this case,
