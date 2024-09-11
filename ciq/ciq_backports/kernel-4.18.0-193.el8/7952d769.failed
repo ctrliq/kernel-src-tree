@@ -1,0 +1,157 @@
+KVM: nVMX: Sync rarely accessed guest fields only when needed
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-193.el8
+commit-author Sean Christopherson <sean.j.christopherson@intel.com>
+commit 7952d769c29caac4fb51c1f0f0c12434c805b127
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-193.el8/7952d769.failed
+
+Many guest fields are rarely read (or written) by VMMs, i.e. likely
+aren't accessed between runs of a nested VMCS.  Delay pulling rarely
+accessed guest fields from vmcs02 until they are VMREAD or until vmcs12
+is dirtied.  The latter case is necessary because nested VM-Entry will
+consume all manner of fields when vmcs12 is dirty, e.g. for consistency
+checks.
+
+Note, an alternative to synchronizing all guest fields on VMREAD would
+be to read *only* the field being accessed, but switching VMCS pointers
+is expensive and odds are good if one guest field is being accessed then
+others will soon follow, or that vmcs12 will be dirtied due to a VMWRITE
+(see above).  And the full synchronization results in slightly cleaner
+code.
+
+Note, although GUEST_PDPTRs are relevant only for a 32-bit PAE guest,
+they are accessed quite frequently for said guests, and a separate patch
+is in flight to optimize away GUEST_PDTPR synchronziation for non-PAE
+guests.
+
+Skipping rarely accessed guest fields reduces the latency of a nested
+VM-Exit by ~200 cycles.
+
+	Signed-off-by: Sean Christopherson <sean.j.christopherson@intel.com>
+	Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+(cherry picked from commit 7952d769c29caac4fb51c1f0f0c12434c805b127)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kvm/vmx/nested.c
+diff --cc arch/x86/kvm/vmx/nested.c
+index d981d2754193,879f14fa384e..000000000000
+--- a/arch/x86/kvm/vmx/nested.c
++++ b/arch/x86/kvm/vmx/nested.c
+@@@ -3403,20 -3376,57 +3403,67 @@@ static u32 vmx_get_preemption_timer_val
+  	return value >> VMX_MISC_EMULATED_PREEMPTION_TIMER_RATE;
+  }
+  
+++<<<<<<< HEAD
+ +/*
+ + * Update the guest state fields of vmcs12 to reflect changes that
+ + * occurred while L2 was running. (The "IA-32e mode guest" bit of the
+ + * VM-entry controls is also updated, since this is really a guest
+ + * state bit.)
+ + */
+ +static void sync_vmcs12(struct kvm_vcpu *vcpu, struct vmcs12 *vmcs12)
+++=======
++ static bool is_vmcs12_ext_field(unsigned long field)
+++>>>>>>> 7952d769c29c (KVM: nVMX: Sync rarely accessed guest fields only when needed)
+  {
+- 	vmcs12->guest_cr0 = vmcs12_guest_cr0(vcpu, vmcs12);
+- 	vmcs12->guest_cr4 = vmcs12_guest_cr4(vcpu, vmcs12);
++ 	switch (field) {
++ 	case GUEST_ES_SELECTOR:
++ 	case GUEST_CS_SELECTOR:
++ 	case GUEST_SS_SELECTOR:
++ 	case GUEST_DS_SELECTOR:
++ 	case GUEST_FS_SELECTOR:
++ 	case GUEST_GS_SELECTOR:
++ 	case GUEST_LDTR_SELECTOR:
++ 	case GUEST_TR_SELECTOR:
++ 	case GUEST_ES_LIMIT:
++ 	case GUEST_CS_LIMIT:
++ 	case GUEST_SS_LIMIT:
++ 	case GUEST_DS_LIMIT:
++ 	case GUEST_FS_LIMIT:
++ 	case GUEST_GS_LIMIT:
++ 	case GUEST_LDTR_LIMIT:
++ 	case GUEST_TR_LIMIT:
++ 	case GUEST_GDTR_LIMIT:
++ 	case GUEST_IDTR_LIMIT:
++ 	case GUEST_ES_AR_BYTES:
++ 	case GUEST_DS_AR_BYTES:
++ 	case GUEST_FS_AR_BYTES:
++ 	case GUEST_GS_AR_BYTES:
++ 	case GUEST_LDTR_AR_BYTES:
++ 	case GUEST_TR_AR_BYTES:
++ 	case GUEST_ES_BASE:
++ 	case GUEST_CS_BASE:
++ 	case GUEST_SS_BASE:
++ 	case GUEST_DS_BASE:
++ 	case GUEST_FS_BASE:
++ 	case GUEST_GS_BASE:
++ 	case GUEST_LDTR_BASE:
++ 	case GUEST_TR_BASE:
++ 	case GUEST_GDTR_BASE:
++ 	case GUEST_IDTR_BASE:
++ 	case GUEST_PENDING_DBG_EXCEPTIONS:
++ 	case GUEST_BNDCFGS:
++ 		return true;
++ 	default:
++ 		break;
++ 	}
+  
+- 	vmcs12->guest_rsp = kvm_rsp_read(vcpu);
+- 	vmcs12->guest_rip = kvm_rip_read(vcpu);
+- 	vmcs12->guest_rflags = vmcs_readl(GUEST_RFLAGS);
++ 	return false;
++ }
++ 
++ static void sync_vmcs02_to_vmcs12_rare(struct kvm_vcpu *vcpu,
++ 				       struct vmcs12 *vmcs12)
++ {
++ 	struct vcpu_vmx *vmx = to_vmx(vcpu);
+  
+  	vmcs12->guest_es_selector = vmcs_read16(GUEST_ES_SELECTOR);
+  	vmcs12->guest_cs_selector = vmcs_read16(GUEST_CS_SELECTOR);
+@@@ -5354,8 -5415,9 +5463,14 @@@ static int vmx_get_nested_state(struct 
+  	 * vmcs12 state is in the vmcs12 already.
+  	 */
+  	if (is_guest_mode(vcpu)) {
+++<<<<<<< HEAD
+ +		sync_vmcs12(vcpu, vmcs12);
+ +	} else if (!vmx->nested.need_vmcs12_sync) {
+++=======
++ 		sync_vmcs02_to_vmcs12(vcpu, vmcs12);
++ 		sync_vmcs02_to_vmcs12_rare(vcpu, vmcs12);
++ 	} else if (!vmx->nested.need_vmcs12_to_shadow_sync) {
+++>>>>>>> 7952d769c29c (KVM: nVMX: Sync rarely accessed guest fields only when needed)
+  		if (vmx->nested.hv_evmcs)
+  			copy_enlightened_to_vmcs12(vmx);
+  		else if (enable_shadow_vmcs)
+* Unmerged path arch/x86/kvm/vmx/nested.c
+diff --git a/arch/x86/kvm/vmx/vmx.h b/arch/x86/kvm/vmx/vmx.h
+index cdf673f3fe27..8b7b88a270df 100644
+--- a/arch/x86/kvm/vmx/vmx.h
++++ b/arch/x86/kvm/vmx/vmx.h
+@@ -109,6 +109,7 @@ struct nested_vmx {
+ 	 * to guest memory during VM exit.
+ 	 */
+ 	struct vmcs12 *cached_shadow_vmcs12;
++
+ 	/*
+ 	 * Indicates if the shadow vmcs or enlightened vmcs must be updated
+ 	 * with the data held by struct vmcs12.
+@@ -116,6 +117,12 @@ struct nested_vmx {
+ 	bool need_vmcs12_sync;
+ 	bool dirty_vmcs12;
+ 
++	/*
++	 * Indicates lazily loaded guest state has not yet been decached from
++	 * vmcs02.
++	 */
++	bool need_sync_vmcs02_to_vmcs12_rare;
++
+ 	/*
+ 	 * vmcs02 has been initialized, i.e. state that is constant for
+ 	 * vmcs02 has been written to the backing VMCS.  Initialization
