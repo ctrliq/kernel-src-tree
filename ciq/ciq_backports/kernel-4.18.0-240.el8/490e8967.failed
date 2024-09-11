@@ -1,0 +1,130 @@
+io_uring: only force async punt if poll based retry can't handle it
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Jens Axboe <axboe@kernel.dk>
+commit 490e89676a523c688343d6cb8ca5f5dc476414df
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/490e8967.failed
+
+We do blocking retry from our poll handler, if the file supports polled
+notifications. Only mark the request as needing an async worker if we
+can't poll for it.
+
+	Signed-off-by: Jens Axboe <axboe@kernel.dk>
+(cherry picked from commit 490e89676a523c688343d6cb8ca5f5dc476414df)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/io_uring.c
+diff --cc fs/io_uring.c
+index 2afa3b27779e,b536c34c6c36..000000000000
+--- a/fs/io_uring.c
++++ b/fs/io_uring.c
+@@@ -1372,35 -2589,30 +1372,48 @@@ static int io_read(struct io_kiocb *req
+  	if (!ret) {
+  		ssize_t ret2;
+  
+ -		if (req->file->f_op->read_iter)
+ -			ret2 = call_read_iter(req->file, kiocb, &iter);
+ +		if (file->f_op->read_iter)
+ +			ret2 = call_read_iter(file, kiocb, &iter);
+  		else
+ -			ret2 = loop_rw_iter(READ, req->file, kiocb, &iter);
+ +			ret2 = loop_rw_iter(READ, file, kiocb, &iter);
+  
+ +		/*
+ +		 * In case of a short read, punt to async. This can happen
+ +		 * if we have data partially cached. Alternatively we can
+ +		 * return the short read, in which case the application will
+ +		 * need to issue another SQE and wait for it. That SQE will
+ +		 * need async punt anyway, so it's more efficient to do it
+ +		 * here.
+ +		 */
+ +		if (force_nonblock && ret2 > 0 && ret2 < read_size)
+ +			ret2 = -EAGAIN;
+  		/* Catch -EAGAIN return for forced non-blocking submission */
+  		if (!force_nonblock || ret2 != -EAGAIN) {
+ -			kiocb_done(kiocb, ret2);
+ +			io_rw_done(kiocb, ret2);
+  		} else {
+++<<<<<<< HEAD
+ +			/*
+ +			 * If ->needs_lock is true, we're already in async
+ +			 * context.
+ +			 */
+ +			if (!s->needs_lock)
+ +				io_async_list_note(READ, req, iov_count);
+ +			ret = -EAGAIN;
+++=======
++ copy_iov:
++ 			ret = io_setup_async_rw(req, io_size, iovec,
++ 						inline_vecs, &iter);
++ 			if (ret)
++ 				goto out_free;
++ 			/* any defer here is final, must blocking retry */
++ 			if (!(req->flags & REQ_F_NOWAIT) &&
++ 			    !file_can_poll(req->file))
++ 				req->flags |= REQ_F_MUST_PUNT;
++ 			return -EAGAIN;
+++>>>>>>> 490e89676a52 (io_uring: only force async punt if poll based retry can't handle it)
+  		}
+  	}
+ -out_free:
+  	kfree(iovec);
+ -	req->flags &= ~REQ_F_NEED_CLEANUP;
+  	return ret;
+  }
+  
+@@@ -1458,20 -2701,35 +1471,32 @@@ static int io_write(struct io_kiocb *re
+  		}
+  		kiocb->ki_flags |= IOCB_WRITE;
+  
+ -		if (!force_nonblock)
+ -			current->signal->rlim[RLIMIT_FSIZE].rlim_cur = req->fsize;
+ -
+ -		if (req->file->f_op->write_iter)
+ -			ret2 = call_write_iter(req->file, kiocb, &iter);
+ +		if (file->f_op->write_iter)
+ +			ret2 = call_write_iter(file, kiocb, &iter);
+  		else
+ -			ret2 = loop_rw_iter(WRITE, req->file, kiocb, &iter);
+ -
+ -		if (!force_nonblock)
+ -			current->signal->rlim[RLIMIT_FSIZE].rlim_cur = RLIM_INFINITY;
+ -
+ -		/*
+ -		 * Raw bdev writes will return -EOPNOTSUPP for IOCB_NOWAIT. Just
+ -		 * retry them without IOCB_NOWAIT.
+ -		 */
+ -		if (ret2 == -EOPNOTSUPP && (kiocb->ki_flags & IOCB_NOWAIT))
+ -			ret2 = -EAGAIN;
+ +			ret2 = loop_rw_iter(WRITE, file, kiocb, &iter);
+  		if (!force_nonblock || ret2 != -EAGAIN) {
+ -			kiocb_done(kiocb, ret2);
+ +			io_rw_done(kiocb, ret2);
+  		} else {
+++<<<<<<< HEAD
+ +			/*
+ +			 * If ->needs_lock is true, we're already in async
+ +			 * context.
+ +			 */
+ +			if (!s->needs_lock)
+ +				io_async_list_note(WRITE, req, iov_count);
+ +			ret = -EAGAIN;
+++=======
++ copy_iov:
++ 			ret = io_setup_async_rw(req, io_size, iovec,
++ 						inline_vecs, &iter);
++ 			if (ret)
++ 				goto out_free;
++ 			/* any defer here is final, must blocking retry */
++ 			if (!file_can_poll(req->file))
++ 				req->flags |= REQ_F_MUST_PUNT;
++ 			return -EAGAIN;
+++>>>>>>> 490e89676a52 (io_uring: only force async punt if poll based retry can't handle it)
+  		}
+  	}
+  out_free:
+* Unmerged path fs/io_uring.c
