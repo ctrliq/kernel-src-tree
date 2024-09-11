@@ -1,0 +1,140 @@
+bpf: Allow to specify kernel module BTFs when attaching BPF programs
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-326.el8
+commit-author Andrii Nakryiko <andrii@kernel.org>
+commit 290248a5b7d829871b3ea3c62578613a580a1744
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-326.el8/290248a5.failed
+
+Add ability for user-space programs to specify non-vmlinux BTF when attaching
+BTF-powered BPF programs: raw_tp, fentry/fexit/fmod_ret, LSM, etc. For this,
+attach_prog_fd (now with the alias name attach_btf_obj_fd) should specify FD
+of a module or vmlinux BTF object. For backwards compatibility reasons,
+0 denotes vmlinux BTF. Only kernel BTF (vmlinux or module) can be specified.
+
+	Signed-off-by: Andrii Nakryiko <andrii@kernel.org>
+	Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+Link: https://lore.kernel.org/bpf/20201203204634.1325171-11-andrii@kernel.org
+(cherry picked from commit 290248a5b7d829871b3ea3c62578613a580a1744)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/btf.h
+#	include/uapi/linux/bpf.h
+#	kernel/bpf/syscall.c
+diff --cc include/linux/btf.h
+index 2bf641829664,4c200f5d242b..000000000000
+--- a/include/linux/btf.h
++++ b/include/linux/btf.h
+@@@ -88,7 -89,8 +88,12 @@@ int btf_type_snprintf_show(const struc
+  			   char *buf, int len, u64 flags);
+  
+  int btf_get_fd_by_id(u32 id);
+++<<<<<<< HEAD
+ +u32 btf_id(const struct btf *btf);
+++=======
++ u32 btf_obj_id(const struct btf *btf);
++ bool btf_is_kernel(const struct btf *btf);
+++>>>>>>> 290248a5b7d8 (bpf: Allow to specify kernel module BTFs when attaching BPF programs)
+  bool btf_member_is_reg_int(const struct btf *btf, const struct btf_type *s,
+  			   const struct btf_member *m,
+  			   u32 expected_offset, u32 expected_size);
+diff --cc include/uapi/linux/bpf.h
+index 0db238cbb096,1233f14f659f..000000000000
+--- a/include/uapi/linux/bpf.h
++++ b/include/uapi/linux/bpf.h
+@@@ -567,8 -557,12 +567,17 @@@ union bpf_attr 
+  		__aligned_u64	line_info;	/* line info */
+  		__u32		line_info_cnt;	/* number of bpf_line_info records */
+  		__u32		attach_btf_id;	/* in-kernel BTF type id to attach to */
+++<<<<<<< HEAD
+ +		__u32		attach_prog_fd; /* 0 to attach to vmlinux */
+ +#endif /* __GENKSYMS__ */
+++=======
++ 		union {
++ 			/* valid prog_fd to attach to bpf prog */
++ 			__u32		attach_prog_fd;
++ 			/* or valid module BTF object fd or 0 to attach to vmlinux */
++ 			__u32		attach_btf_obj_fd;
++ 		};
+++>>>>>>> 290248a5b7d8 (bpf: Allow to specify kernel module BTFs when attaching BPF programs)
+  	};
+  
+  	struct { /* anonymous struct used by BPF_OBJ_* commands */
+diff --cc kernel/bpf/syscall.c
+index 526b61397de6,0cd3cc2af9c1..000000000000
+--- a/kernel/bpf/syscall.c
++++ b/kernel/bpf/syscall.c
+@@@ -2175,22 -2148,18 +2213,32 @@@ static int bpf_prog_load(union bpf_att
+  
+  	/* plain bpf_prog allocation */
+  	prog = bpf_prog_alloc(bpf_prog_size(attr->insn_cnt), GFP_USER);
+- 	if (!prog)
++ 	if (!prog) {
++ 		if (dst_prog)
++ 			bpf_prog_put(dst_prog);
++ 		if (attach_btf)
++ 			btf_put(attach_btf);
+  		return -ENOMEM;
++ 	}
+  
+  	prog->expected_attach_type = attr->expected_attach_type;
++ 	prog->aux->attach_btf = attach_btf;
+  	prog->aux->attach_btf_id = attr->attach_btf_id;
+++<<<<<<< HEAD
+ +	if (attr->attach_prog_fd) {
+ +		struct bpf_prog *dst_prog;
+ +
+ +		dst_prog = bpf_prog_get(attr->attach_prog_fd);
+ +		if (IS_ERR(dst_prog)) {
+ +			err = PTR_ERR(dst_prog);
+ +			goto free_prog_nouncharge;
+ +		}
+ +		prog->aux->dst_prog = dst_prog;
+ +	}
+ +
+++=======
++ 	prog->aux->dst_prog = dst_prog;
+++>>>>>>> 290248a5b7d8 (bpf: Allow to specify kernel module BTFs when attaching BPF programs)
+  	prog->aux->offload_requested = !!attr->prog_ifindex;
+  	prog->aux->sleepable = attr->prog_flags & BPF_F_SLEEPABLE;
+  
+* Unmerged path include/linux/btf.h
+* Unmerged path include/uapi/linux/bpf.h
+diff --git a/kernel/bpf/btf.c b/kernel/bpf/btf.c
+index b89fc7b7da7f..020790c5cb67 100644
+--- a/kernel/bpf/btf.c
++++ b/kernel/bpf/btf.c
+@@ -5641,6 +5641,11 @@ u32 btf_id(const struct btf *btf)
+ 	return btf->id;
+ }
+ 
++bool btf_is_kernel(const struct btf *btf)
++{
++	return btf->kernel_btf;
++}
++
+ static int btf_id_cmp_func(const void *a, const void *b)
+ {
+ 	const int *pa = a, *pb = b;
+* Unmerged path kernel/bpf/syscall.c
+diff --git a/tools/include/uapi/linux/bpf.h b/tools/include/uapi/linux/bpf.h
+index b1d65d8c4595..92cea73226b3 100644
+--- a/tools/include/uapi/linux/bpf.h
++++ b/tools/include/uapi/linux/bpf.h
+@@ -556,7 +556,12 @@ union bpf_attr {
+ 		__aligned_u64	line_info;	/* line info */
+ 		__u32		line_info_cnt;	/* number of bpf_line_info records */
+ 		__u32		attach_btf_id;	/* in-kernel BTF type id to attach to */
+-		__u32		attach_prog_fd; /* 0 to attach to vmlinux */
++		union {
++			/* valid prog_fd to attach to bpf prog */
++			__u32		attach_prog_fd;
++			/* or valid module BTF object fd or 0 to attach to vmlinux */
++			__u32		attach_btf_obj_fd;
++		};
+ 	};
+ 
+ 	struct { /* anonymous struct used by BPF_OBJ_* commands */
