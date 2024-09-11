@@ -1,0 +1,198 @@
+KVM: PPC: Book3S HV: Avoid touching arch.mmu_ready in XIVE release functions
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-147.el8
+commit-author Paul Mackerras <paulus@ozlabs.org>
+commit c395fe1d8e49a5aa03504fcacfb7c95b5a4c6e04
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-147.el8/c395fe1d.failed
+
+Currently, kvmppc_xive_release() and kvmppc_xive_native_release() clear
+kvm->arch.mmu_ready and call kick_all_cpus_sync() as a way of ensuring
+that no vcpus are executing in the guest.  However, future patches will
+change the mutex associated with kvm->arch.mmu_ready to a new mutex that
+nests inside the vcpu mutexes, making it difficult to continue to use
+this method.
+
+In fact, taking the vcpu mutex for a vcpu excludes execution of that
+vcpu, and we already take the vcpu mutex around the call to
+kvmppc_xive_[native_]cleanup_vcpu().  Once the cleanup function is
+done and we release the vcpu mutex, the vcpu can execute once again,
+but because we have cleared vcpu->arch.xive_vcpu, vcpu->arch.irq_type,
+vcpu->arch.xive_esc_vaddr and vcpu->arch.xive_esc_raddr, that vcpu will
+not be going into XIVE code any more.  Thus, once we have cleaned up
+all of the vcpus, we are safe to clean up the rest of the XIVE state,
+and we don't need to use kvm->arch.mmu_ready to hold off vcpu execution.
+
+	Signed-off-by: Paul Mackerras <paulus@ozlabs.org>
+(cherry picked from commit c395fe1d8e49a5aa03504fcacfb7c95b5a4c6e04)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/powerpc/kvm/book3s_xive.c
+#	arch/powerpc/kvm/book3s_xive_native.c
+diff --cc arch/powerpc/kvm/book3s_xive.c
+index 346e2331b074,f623451ec0a3..000000000000
+--- a/arch/powerpc/kvm/book3s_xive.c
++++ b/arch/powerpc/kvm/book3s_xive.c
+@@@ -1829,12 -1857,46 +1829,53 @@@ static void kvmppc_xive_free(struct kvm
+  {
+  	struct kvmppc_xive *xive = dev->private;
+  	struct kvm *kvm = xive->kvm;
+ -	struct kvm_vcpu *vcpu;
+  	int i;
+++<<<<<<< HEAD
+ +
+ +	debugfs_remove(xive->dentry);
+ +
+ +	if (kvm)
+ +		kvm->arch.xive = NULL;
+++=======
++ 
++ 	pr_devel("Releasing xive device\n");
++ 
++ 	/*
++ 	 * Since this is the device release function, we know that
++ 	 * userspace does not have any open fd referring to the
++ 	 * device.  Therefore there can not be any of the device
++ 	 * attribute set/get functions being executed concurrently,
++ 	 * and similarly, the connect_vcpu and set/clr_mapped
++ 	 * functions also cannot be being executed.
++ 	 */
++ 
++ 	debugfs_remove(xive->dentry);
++ 
++ 	/*
++ 	 * We should clean up the vCPU interrupt presenters first.
++ 	 */
++ 	kvm_for_each_vcpu(i, vcpu, kvm) {
++ 		/*
++ 		 * Take vcpu->mutex to ensure that no one_reg get/set ioctl
++ 		 * (i.e. kvmppc_xive_[gs]et_icp) can be done concurrently.
++ 		 * Holding the vcpu->mutex also means that the vcpu cannot
++ 		 * be executing the KVM_RUN ioctl, and therefore it cannot
++ 		 * be executing the XIVE push or pull code or accessing
++ 		 * the XIVE MMIO regions.
++ 		 */
++ 		mutex_lock(&vcpu->mutex);
++ 		kvmppc_xive_cleanup_vcpu(vcpu);
++ 		mutex_unlock(&vcpu->mutex);
++ 	}
++ 
++ 	/*
++ 	 * Now that we have cleared vcpu->arch.xive_vcpu, vcpu->arch.irq_type
++ 	 * and vcpu->arch.xive_esc_[vr]addr on each vcpu, we are safe
++ 	 * against xive code getting called during vcpu execution or
++ 	 * set/get one_reg operations.
++ 	 */
++ 	kvm->arch.xive = NULL;
+++>>>>>>> c395fe1d8e49 (KVM: PPC: Book3S HV: Avoid touching arch.mmu_ready in XIVE release functions)
+  
+  	/* Mask and free interrupts */
+  	for (i = 0; i <= xive->max_sbid; i++) {
+@@@ -1847,8 -1909,13 +1888,17 @@@
+  	if (xive->vp_base != XIVE_INVALID_VP)
+  		xive_native_free_vp_block(xive->vp_base);
+  
+++<<<<<<< HEAD
+++=======
++ 	/*
++ 	 * A reference of the kvmppc_xive pointer is now kept under
++ 	 * the xive_devices struct of the machine for reuse. It is
++ 	 * freed when the VM is destroyed for now until we fix all the
++ 	 * execution paths.
++ 	 */
+++>>>>>>> c395fe1d8e49 (KVM: PPC: Book3S HV: Avoid touching arch.mmu_ready in XIVE release functions)
+  
+ +	kfree(xive);
+  	kfree(dev);
+  }
+  
+diff --cc arch/powerpc/kvm/book3s_xive_native.c
+index 751259394150,da31dd05fd72..000000000000
+--- a/arch/powerpc/kvm/book3s_xive_native.c
++++ b/arch/powerpc/kvm/book3s_xive_native.c
+@@@ -56,18 -971,65 +56,79 @@@ static void kvmppc_xive_native_free(str
+  {
+  	struct kvmppc_xive *xive = dev->private;
+  	struct kvm *kvm = xive->kvm;
+++<<<<<<< HEAD
+ +
+ +	debugfs_remove(xive->dentry);
+++=======
++ 	struct kvm_vcpu *vcpu;
++ 	int i;
+++>>>>>>> c395fe1d8e49 (KVM: PPC: Book3S HV: Avoid touching arch.mmu_ready in XIVE release functions)
+  
+ -	pr_devel("Releasing xive native device\n");
+ +	pr_devel("Destroying xive native device\n");
+  
+++<<<<<<< HEAD
+ +	if (kvm)
+ +		kvm->arch.xive = NULL;
+++=======
++ 	/*
++ 	 * Since this is the device release function, we know that
++ 	 * userspace does not have any open fd or mmap referring to
++ 	 * the device.  Therefore there can not be any of the
++ 	 * device attribute set/get, mmap, or page fault functions
++ 	 * being executed concurrently, and similarly, the
++ 	 * connect_vcpu and set/clr_mapped functions also cannot
++ 	 * be being executed.
++ 	 */
++ 
++ 	debugfs_remove(xive->dentry);
++ 
++ 	/*
++ 	 * We should clean up the vCPU interrupt presenters first.
++ 	 */
++ 	kvm_for_each_vcpu(i, vcpu, kvm) {
++ 		/*
++ 		 * Take vcpu->mutex to ensure that no one_reg get/set ioctl
++ 		 * (i.e. kvmppc_xive_native_[gs]et_vp) can be being done.
++ 		 * Holding the vcpu->mutex also means that the vcpu cannot
++ 		 * be executing the KVM_RUN ioctl, and therefore it cannot
++ 		 * be executing the XIVE push or pull code or accessing
++ 		 * the XIVE MMIO regions.
++ 		 */
++ 		mutex_lock(&vcpu->mutex);
++ 		kvmppc_xive_native_cleanup_vcpu(vcpu);
++ 		mutex_unlock(&vcpu->mutex);
++ 	}
++ 
++ 	/*
++ 	 * Now that we have cleared vcpu->arch.xive_vcpu, vcpu->arch.irq_type
++ 	 * and vcpu->arch.xive_esc_[vr]addr on each vcpu, we are safe
++ 	 * against xive code getting called during vcpu execution or
++ 	 * set/get one_reg operations.
++ 	 */
++ 	kvm->arch.xive = NULL;
++ 
++ 	for (i = 0; i <= xive->max_sbid; i++) {
++ 		if (xive->src_blocks[i])
++ 			kvmppc_xive_free_sources(xive->src_blocks[i]);
++ 		kfree(xive->src_blocks[i]);
++ 		xive->src_blocks[i] = NULL;
++ 	}
+++>>>>>>> c395fe1d8e49 (KVM: PPC: Book3S HV: Avoid touching arch.mmu_ready in XIVE release functions)
+  
+  	if (xive->vp_base != XIVE_INVALID_VP)
+  		xive_native_free_vp_block(xive->vp_base);
+  
+++<<<<<<< HEAD
+ +	kfree(xive);
+++=======
++ 	/*
++ 	 * A reference of the kvmppc_xive pointer is now kept under
++ 	 * the xive_devices struct of the machine for reuse. It is
++ 	 * freed when the VM is destroyed for now until we fix all the
++ 	 * execution paths.
++ 	 */
++ 
+++>>>>>>> c395fe1d8e49 (KVM: PPC: Book3S HV: Avoid touching arch.mmu_ready in XIVE release functions)
+  	kfree(dev);
+  }
+  
+* Unmerged path arch/powerpc/kvm/book3s_xive.c
+* Unmerged path arch/powerpc/kvm/book3s_xive_native.c
