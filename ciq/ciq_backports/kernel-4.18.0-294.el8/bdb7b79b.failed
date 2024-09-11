@@ -1,0 +1,648 @@
+bpf: Switch most helper return values from 32-bit int to 64-bit long
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Andrii Nakryiko <andriin@fb.com>
+commit bdb7b79b4ce864a724250e1d35948c46f135de36
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/bdb7b79b.failed
+
+Switch most of BPF helper definitions from returning int to long. These
+definitions are coming from comments in BPF UAPI header and are used to
+generate bpf_helper_defs.h (under libbpf) to be later included and used from
+BPF programs.
+
+In actual in-kernel implementation, all the helpers are defined as returning
+u64, but due to some historical reasons, most of them are actually defined as
+returning int in UAPI (usually, to return 0 on success, and negative value on
+error).
+
+This actually causes Clang to quite often generate sub-optimal code, because
+compiler believes that return value is 32-bit, and in a lot of cases has to be
+up-converted (usually with a pair of 32-bit bit shifts) to 64-bit values,
+before they can be used further in BPF code.
+
+Besides just "polluting" the code, these 32-bit shifts quite often cause
+problems for cases in which return value matters. This is especially the case
+for the family of bpf_probe_read_str() functions. There are few other similar
+helpers (e.g., bpf_read_branch_records()), in which return value is used by
+BPF program logic to record variable-length data and process it. For such
+cases, BPF program logic carefully manages offsets within some array or map to
+read variable-length data. For such uses, it's crucial for BPF verifier to
+track possible range of register values to prove that all the accesses happen
+within given memory bounds. Those extraneous zero-extending bit shifts,
+inserted by Clang (and quite often interleaved with other code, which makes
+the issues even more challenging and sometimes requires employing extra
+per-variable compiler barriers), throws off verifier logic and makes it mark
+registers as having unknown variable offset. We'll study this pattern a bit
+later below.
+
+Another common pattern is to check return of BPF helper for non-zero state to
+detect error conditions and attempt alternative actions in such case. Even in
+this simple and straightforward case, this 32-bit vs BPF's native 64-bit mode
+quite often leads to sub-optimal and unnecessary extra code. We'll look at
+this pattern as well.
+
+Clang's BPF target supports two modes of code generation: ALU32, in which it
+is capable of using lower 32-bit parts of registers, and no-ALU32, in which
+only full 64-bit registers are being used. ALU32 mode somewhat mitigates the
+above described problems, but not in all cases.
+
+This patch switches all the cases in which BPF helpers return 0 or negative
+error from returning int to returning long. It is shown below that such change
+in definition leads to equivalent or better code. No-ALU32 mode benefits more,
+but ALU32 mode doesn't degrade or still gets improved code generation.
+
+Another class of cases switched from int to long are bpf_probe_read_str()-like
+helpers, which encode successful case as non-negative values, while still
+returning negative value for errors.
+
+In all of such cases, correctness is preserved due to two's complement
+encoding of negative values and the fact that all helpers return values with
+32-bit absolute value. Two's complement ensures that for negative values
+higher 32 bits are all ones and when truncated, leave valid negative 32-bit
+value with the same value. Non-negative values have upper 32 bits set to zero
+and similarly preserve value when high 32 bits are truncated. This means that
+just casting to int/u32 is correct and efficient (and in ALU32 mode doesn't
+require any extra shifts).
+
+To minimize the chances of regressions, two code patterns were investigated,
+as mentioned above. For both patterns, BPF assembly was analyzed in
+ALU32/NO-ALU32 compiler modes, both with current 32-bit int return type and
+new 64-bit long return type.
+
+Case 1. Variable-length data reading and concatenation. This is quite
+ubiquitous pattern in tracing/monitoring applications, reading data like
+process's environment variables, file path, etc. In such case, many pieces of
+string-like variable-length data are read into a single big buffer, and at the
+end of the process, only a part of array containing actual data is sent to
+user-space for further processing. This case is tested in test_varlen.c
+selftest (in the next patch). Code flow is roughly as follows:
+
+  void *payload = &sample->payload;
+  u64 len;
+
+  len = bpf_probe_read_kernel_str(payload, MAX_SZ1, &source_data1);
+  if (len <= MAX_SZ1) {
+      payload += len;
+      sample->len1 = len;
+  }
+  len = bpf_probe_read_kernel_str(payload, MAX_SZ2, &source_data2);
+  if (len <= MAX_SZ2) {
+      payload += len;
+      sample->len2 = len;
+  }
+  /* and so on */
+  sample->total_len = payload - &sample->payload;
+  /* send over, e.g., perf buffer */
+
+There could be two variations with slightly different code generated: when len
+is 64-bit integer and when it is 32-bit integer. Both variations were analysed.
+BPF assembly instructions between two successive invocations of
+bpf_probe_read_kernel_str() were used to check code regressions. Results are
+below, followed by short analysis. Left side is using helpers with int return
+type, the right one is after the switch to long.
+
+ALU32 + INT                                ALU32 + LONG
+===========                                ============
+
+64-BIT (13 insns):                         64-BIT (10 insns):
+------------------------------------       ------------------------------------
+  17:   call 115                             17:   call 115
+  18:   if w0 > 256 goto +9 <LBB0_4>         18:   if r0 > 256 goto +6 <LBB0_4>
+  19:   w1 = w0                              19:   r1 = 0 ll
+  20:   r1 <<= 32                            21:   *(u64 *)(r1 + 0) = r0
+  21:   r1 s>>= 32                           22:   r6 = 0 ll
+  22:   r2 = 0 ll                            24:   r6 += r0
+  24:   *(u64 *)(r2 + 0) = r1              00000000000000c8 <LBB0_4>:
+  25:   r6 = 0 ll                            25:   r1 = r6
+  27:   r6 += r1                             26:   w2 = 256
+00000000000000e0 <LBB0_4>:                   27:   r3 = 0 ll
+  28:   r1 = r6                              29:   call 115
+  29:   w2 = 256
+  30:   r3 = 0 ll
+  32:   call 115
+
+32-BIT (11 insns):                         32-BIT (12 insns):
+------------------------------------       ------------------------------------
+  17:   call 115                             17:   call 115
+  18:   if w0 > 256 goto +7 <LBB1_4>         18:   if w0 > 256 goto +8 <LBB1_4>
+  19:   r1 = 0 ll                            19:   r1 = 0 ll
+  21:   *(u32 *)(r1 + 0) = r0                21:   *(u32 *)(r1 + 0) = r0
+  22:   w1 = w0                              22:   r0 <<= 32
+  23:   r6 = 0 ll                            23:   r0 >>= 32
+  25:   r6 += r1                             24:   r6 = 0 ll
+00000000000000d0 <LBB1_4>:                   26:   r6 += r0
+  26:   r1 = r6                            00000000000000d8 <LBB1_4>:
+  27:   w2 = 256                             27:   r1 = r6
+  28:   r3 = 0 ll                            28:   w2 = 256
+  30:   call 115                             29:   r3 = 0 ll
+                                             31:   call 115
+
+In ALU32 mode, the variant using 64-bit length variable clearly wins and
+avoids unnecessary zero-extension bit shifts. In practice, this is even more
+important and good, because BPF code won't need to do extra checks to "prove"
+that payload/len are within good bounds.
+
+32-bit len is one instruction longer. Clang decided to do 64-to-32 casting
+with two bit shifts, instead of equivalent `w1 = w0` assignment. The former
+uses extra register. The latter might potentially lose some range information,
+but not for 32-bit value. So in this case, verifier infers that r0 is [0, 256]
+after check at 18:, and shifting 32 bits left/right keeps that range intact.
+We should probably look into Clang's logic and see why it chooses bitshifts
+over sub-register assignments for this.
+
+NO-ALU32 + INT                             NO-ALU32 + LONG
+==============                             ===============
+
+64-BIT (14 insns):                         64-BIT (10 insns):
+------------------------------------       ------------------------------------
+  17:   call 115                             17:   call 115
+  18:   r0 <<= 32                            18:   if r0 > 256 goto +6 <LBB0_4>
+  19:   r1 = r0                              19:   r1 = 0 ll
+  20:   r1 >>= 32                            21:   *(u64 *)(r1 + 0) = r0
+  21:   if r1 > 256 goto +7 <LBB0_4>         22:   r6 = 0 ll
+  22:   r0 s>>= 32                           24:   r6 += r0
+  23:   r1 = 0 ll                          00000000000000c8 <LBB0_4>:
+  25:   *(u64 *)(r1 + 0) = r0                25:   r1 = r6
+  26:   r6 = 0 ll                            26:   r2 = 256
+  28:   r6 += r0                             27:   r3 = 0 ll
+00000000000000e8 <LBB0_4>:                   29:   call 115
+  29:   r1 = r6
+  30:   r2 = 256
+  31:   r3 = 0 ll
+  33:   call 115
+
+32-BIT (13 insns):                         32-BIT (13 insns):
+------------------------------------       ------------------------------------
+  17:   call 115                             17:   call 115
+  18:   r1 = r0                              18:   r1 = r0
+  19:   r1 <<= 32                            19:   r1 <<= 32
+  20:   r1 >>= 32                            20:   r1 >>= 32
+  21:   if r1 > 256 goto +6 <LBB1_4>         21:   if r1 > 256 goto +6 <LBB1_4>
+  22:   r2 = 0 ll                            22:   r2 = 0 ll
+  24:   *(u32 *)(r2 + 0) = r0                24:   *(u32 *)(r2 + 0) = r0
+  25:   r6 = 0 ll                            25:   r6 = 0 ll
+  27:   r6 += r1                             27:   r6 += r1
+00000000000000e0 <LBB1_4>:                 00000000000000e0 <LBB1_4>:
+  28:   r1 = r6                              28:   r1 = r6
+  29:   r2 = 256                             29:   r2 = 256
+  30:   r3 = 0 ll                            30:   r3 = 0 ll
+  32:   call 115                             32:   call 115
+
+In NO-ALU32 mode, for the case of 64-bit len variable, Clang generates much
+superior code, as expected, eliminating unnecessary bit shifts. For 32-bit
+len, code is identical.
+
+So overall, only ALU-32 32-bit len case is more-or-less equivalent and the
+difference stems from internal Clang decision, rather than compiler lacking
+enough information about types.
+
+Case 2. Let's look at the simpler case of checking return result of BPF helper
+for errors. The code is very simple:
+
+  long bla;
+  if (bpf_probe_read_kenerl(&bla, sizeof(bla), 0))
+      return 1;
+  else
+      return 0;
+
+ALU32 + CHECK (9 insns)                    ALU32 + CHECK (9 insns)
+====================================       ====================================
+  0:    r1 = r10                             0:    r1 = r10
+  1:    r1 += -8                             1:    r1 += -8
+  2:    w2 = 8                               2:    w2 = 8
+  3:    r3 = 0                               3:    r3 = 0
+  4:    call 113                             4:    call 113
+  5:    w1 = w0                              5:    r1 = r0
+  6:    w0 = 1                               6:    w0 = 1
+  7:    if w1 != 0 goto +1 <LBB2_2>          7:    if r1 != 0 goto +1 <LBB2_2>
+  8:    w0 = 0                               8:    w0 = 0
+0000000000000048 <LBB2_2>:                 0000000000000048 <LBB2_2>:
+  9:    exit                                 9:    exit
+
+Almost identical code, the only difference is the use of full register
+assignment (r1 = r0) vs half-registers (w1 = w0) in instruction #5. On 32-bit
+architectures, new BPF assembly might be slightly less optimal, in theory. But
+one can argue that's not a big issue, given that use of full registers is
+still prevalent (e.g., for parameter passing).
+
+NO-ALU32 + CHECK (11 insns)                NO-ALU32 + CHECK (9 insns)
+====================================       ====================================
+  0:    r1 = r10                             0:    r1 = r10
+  1:    r1 += -8                             1:    r1 += -8
+  2:    r2 = 8                               2:    r2 = 8
+  3:    r3 = 0                               3:    r3 = 0
+  4:    call 113                             4:    call 113
+  5:    r1 = r0                              5:    r1 = r0
+  6:    r1 <<= 32                            6:    r0 = 1
+  7:    r1 >>= 32                            7:    if r1 != 0 goto +1 <LBB2_2>
+  8:    r0 = 1                               8:    r0 = 0
+  9:    if r1 != 0 goto +1 <LBB2_2>        0000000000000048 <LBB2_2>:
+ 10:    r0 = 0                               9:    exit
+0000000000000058 <LBB2_2>:
+ 11:    exit
+
+NO-ALU32 is a clear improvement, getting rid of unnecessary zero-extension bit
+shifts.
+
+	Signed-off-by: Andrii Nakryiko <andriin@fb.com>
+	Signed-off-by: Daniel Borkmann <daniel@iogearbox.net>
+Link: https://lore.kernel.org/bpf/20200623032224.4020118-1-andriin@fb.com
+(cherry picked from commit bdb7b79b4ce864a724250e1d35948c46f135de36)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/uapi/linux/bpf.h
+#	tools/include/uapi/linux/bpf.h
+diff --cc include/uapi/linux/bpf.h
+index af3754a78dbd,be0efee49093..000000000000
+--- a/include/uapi/linux/bpf.h
++++ b/include/uapi/linux/bpf.h
+@@@ -3127,6 -3135,123 +3127,126 @@@ union bpf_attr 
+   * 		0 on success, or a negative error in case of failure:
+   *
+   *		**-EOVERFLOW** if an overflow happened: The same object will be tried again.
+++<<<<<<< HEAD
+++=======
++  *
++  * u64 bpf_sk_cgroup_id(struct bpf_sock *sk)
++  *	Description
++  *		Return the cgroup v2 id of the socket *sk*.
++  *
++  *		*sk* must be a non-**NULL** pointer to a full socket, e.g. one
++  *		returned from **bpf_sk_lookup_xxx**\ (),
++  *		**bpf_sk_fullsock**\ (), etc. The format of returned id is
++  *		same as in **bpf_skb_cgroup_id**\ ().
++  *
++  *		This helper is available only if the kernel was compiled with
++  *		the **CONFIG_SOCK_CGROUP_DATA** configuration option.
++  *	Return
++  *		The id is returned or 0 in case the id could not be retrieved.
++  *
++  * u64 bpf_sk_ancestor_cgroup_id(struct bpf_sock *sk, int ancestor_level)
++  *	Description
++  *		Return id of cgroup v2 that is ancestor of cgroup associated
++  *		with the *sk* at the *ancestor_level*.  The root cgroup is at
++  *		*ancestor_level* zero and each step down the hierarchy
++  *		increments the level. If *ancestor_level* == level of cgroup
++  *		associated with *sk*, then return value will be same as that
++  *		of **bpf_sk_cgroup_id**\ ().
++  *
++  *		The helper is useful to implement policies based on cgroups
++  *		that are upper in hierarchy than immediate cgroup associated
++  *		with *sk*.
++  *
++  *		The format of returned id and helper limitations are same as in
++  *		**bpf_sk_cgroup_id**\ ().
++  *	Return
++  *		The id is returned or 0 in case the id could not be retrieved.
++  *
++  * void *bpf_ringbuf_output(void *ringbuf, void *data, u64 size, u64 flags)
++  * 	Description
++  * 		Copy *size* bytes from *data* into a ring buffer *ringbuf*.
++  * 		If BPF_RB_NO_WAKEUP is specified in *flags*, no notification of
++  * 		new data availability is sent.
++  * 		IF BPF_RB_FORCE_WAKEUP is specified in *flags*, notification of
++  * 		new data availability is sent unconditionally.
++  * 	Return
++  * 		0, on success;
++  * 		< 0, on error.
++  *
++  * void *bpf_ringbuf_reserve(void *ringbuf, u64 size, u64 flags)
++  * 	Description
++  * 		Reserve *size* bytes of payload in a ring buffer *ringbuf*.
++  * 	Return
++  * 		Valid pointer with *size* bytes of memory available; NULL,
++  * 		otherwise.
++  *
++  * void bpf_ringbuf_submit(void *data, u64 flags)
++  * 	Description
++  * 		Submit reserved ring buffer sample, pointed to by *data*.
++  * 		If BPF_RB_NO_WAKEUP is specified in *flags*, no notification of
++  * 		new data availability is sent.
++  * 		IF BPF_RB_FORCE_WAKEUP is specified in *flags*, notification of
++  * 		new data availability is sent unconditionally.
++  * 	Return
++  * 		Nothing. Always succeeds.
++  *
++  * void bpf_ringbuf_discard(void *data, u64 flags)
++  * 	Description
++  * 		Discard reserved ring buffer sample, pointed to by *data*.
++  * 		If BPF_RB_NO_WAKEUP is specified in *flags*, no notification of
++  * 		new data availability is sent.
++  * 		IF BPF_RB_FORCE_WAKEUP is specified in *flags*, notification of
++  * 		new data availability is sent unconditionally.
++  * 	Return
++  * 		Nothing. Always succeeds.
++  *
++  * u64 bpf_ringbuf_query(void *ringbuf, u64 flags)
++  *	Description
++  *		Query various characteristics of provided ring buffer. What
++  *		exactly is queries is determined by *flags*:
++  *		  - BPF_RB_AVAIL_DATA - amount of data not yet consumed;
++  *		  - BPF_RB_RING_SIZE - the size of ring buffer;
++  *		  - BPF_RB_CONS_POS - consumer position (can wrap around);
++  *		  - BPF_RB_PROD_POS - producer(s) position (can wrap around);
++  *		Data returned is just a momentary snapshots of actual values
++  *		and could be inaccurate, so this facility should be used to
++  *		power heuristics and for reporting, not to make 100% correct
++  *		calculation.
++  *	Return
++  *		Requested value, or 0, if flags are not recognized.
++  *
++  * long bpf_csum_level(struct sk_buff *skb, u64 level)
++  * 	Description
++  * 		Change the skbs checksum level by one layer up or down, or
++  * 		reset it entirely to none in order to have the stack perform
++  * 		checksum validation. The level is applicable to the following
++  * 		protocols: TCP, UDP, GRE, SCTP, FCOE. For example, a decap of
++  * 		| ETH | IP | UDP | GUE | IP | TCP | into | ETH | IP | TCP |
++  * 		through **bpf_skb_adjust_room**\ () helper with passing in
++  * 		**BPF_F_ADJ_ROOM_NO_CSUM_RESET** flag would require one	call
++  * 		to **bpf_csum_level**\ () with **BPF_CSUM_LEVEL_DEC** since
++  * 		the UDP header is removed. Similarly, an encap of the latter
++  * 		into the former could be accompanied by a helper call to
++  * 		**bpf_csum_level**\ () with **BPF_CSUM_LEVEL_INC** if the
++  * 		skb is still intended to be processed in higher layers of the
++  * 		stack instead of just egressing at tc.
++  *
++  * 		There are three supported level settings at this time:
++  *
++  * 		* **BPF_CSUM_LEVEL_INC**: Increases skb->csum_level for skbs
++  * 		  with CHECKSUM_UNNECESSARY.
++  * 		* **BPF_CSUM_LEVEL_DEC**: Decreases skb->csum_level for skbs
++  * 		  with CHECKSUM_UNNECESSARY.
++  * 		* **BPF_CSUM_LEVEL_RESET**: Resets skb->csum_level to 0 and
++  * 		  sets CHECKSUM_NONE to force checksum validation by the stack.
++  * 		* **BPF_CSUM_LEVEL_QUERY**: No-op, returns the current
++  * 		  skb->csum_level.
++  * 	Return
++  * 		0 on success, or a negative error in case of failure. In the
++  * 		case of **BPF_CSUM_LEVEL_QUERY**, the current skb->csum_level
++  * 		is returned or the error code -EACCES in case the skb is not
++  * 		subject to CHECKSUM_UNNECESSARY.
+++>>>>>>> bdb7b79b4ce8 (bpf: Switch most helper return values from 32-bit int to 64-bit long)
+   */
+  #define __BPF_FUNC_MAPPER(FN)		\
+  	FN(unspec),			\
+diff --cc tools/include/uapi/linux/bpf.h
+index b34454b6dad0,be0efee49093..000000000000
+--- a/tools/include/uapi/linux/bpf.h
++++ b/tools/include/uapi/linux/bpf.h
+@@@ -1521,14 -1547,14 +1521,14 @@@ union bpf_attr 
+   * 	Return
+   * 		0 on success, or a negative error in case of failure.
+   *
+-  * int bpf_probe_read_str(void *dst, u32 size, const void *unsafe_ptr)
++  * long bpf_probe_read_str(void *dst, u32 size, const void *unsafe_ptr)
+   * 	Description
+   * 		Copy a NUL terminated string from an unsafe kernel address
+ - * 		*unsafe_ptr* to *dst*. See **bpf_probe_read_kernel_str**\ () for
+ + * 		*unsafe_ptr* to *dst*. See bpf_probe_read_kernel_str() for
+   * 		more details.
+   *
+ - * 		Generally, use **bpf_probe_read_user_str**\ () or
+ - * 		**bpf_probe_read_kernel_str**\ () instead.
+ + * 		Generally, use bpf_probe_read_user_str() or bpf_probe_read_kernel_str()
+ + * 		instead.
+   * 	Return
+   * 		On success, the strictly positive length of the string,
+   * 		including the trailing NUL character. On error, a negative
+@@@ -1998,11 -2026,11 +1998,11 @@@
+   * 	Return
+   * 		0 on success, or a negative error in case of failure.
+   *
+-  * int bpf_xdp_adjust_tail(struct xdp_buff *xdp_md, int delta)
++  * long bpf_xdp_adjust_tail(struct xdp_buff *xdp_md, int delta)
+   * 	Description
+   * 		Adjust (move) *xdp_md*\ **->data_end** by *delta* bytes. It is
+ - * 		possible to both shrink and grow the packet tail.
+ - * 		Shrink done via *delta* being a negative integer.
+ + * 		only possible to shrink the packet as of this writing,
+ + * 		therefore *delta* must be a negative integer.
+   *
+   * 		A call to this helper is susceptible to change the underlying
+   * 		packet buffer. Therefore, at load time, all checks on pointers
+@@@ -2915,17 -2941,17 +2915,17 @@@
+   * 		including the trailing NUL character. On error, a negative
+   * 		value.
+   *
+-  * int bpf_probe_read_kernel_str(void *dst, u32 size, const void *unsafe_ptr)
++  * long bpf_probe_read_kernel_str(void *dst, u32 size, const void *unsafe_ptr)
+   * 	Description
+   * 		Copy a NUL terminated string from an unsafe kernel address *unsafe_ptr*
+ - * 		to *dst*. Same semantics as with **bpf_probe_read_user_str**\ () apply.
+ + * 		to *dst*. Same semantics as with bpf_probe_read_user_str() apply.
+   * 	Return
+ - * 		On success, the strictly positive length of the string, including
+ + * 		On success, the strictly positive length of the string,	including
+   * 		the trailing NUL character. On error, a negative value.
+   *
+-  * int bpf_tcp_send_ack(void *tp, u32 rcv_nxt)
++  * long bpf_tcp_send_ack(void *tp, u32 rcv_nxt)
+   *	Description
+ - *		Send out a tcp-ack. *tp* is the in-kernel struct **tcp_sock**.
+ + *		Send out a tcp-ack. *tp* is the in-kernel struct tcp_sock.
+   *		*rcv_nxt* is the ack_seq to be sent out.
+   *	Return
+   *		0 on success, or a negative error in case of failure.
+@@@ -2950,11 -2976,11 +2950,11 @@@
+   *	Return
+   *		The 64 bit jiffies
+   *
+-  * int bpf_read_branch_records(struct bpf_perf_event_data *ctx, void *buf, u32 size, u64 flags)
++  * long bpf_read_branch_records(struct bpf_perf_event_data *ctx, void *buf, u32 size, u64 flags)
+   *	Description
+   *		For an eBPF program attached to a perf event, retrieve the
+ - *		branch records (**struct perf_branch_entry**) associated to *ctx*
+ - *		and store it in the buffer pointed by *buf* up to size
+ + *		branch records (struct perf_branch_entry) associated to *ctx*
+ + *		and store it in	the buffer pointed by *buf* up to size
+   *		*size* bytes.
+   *	Return
+   *		On success, number of bytes written to *buf*. On error, a
+@@@ -3066,40 -3097,161 +3066,161 @@@
+   * 	Return
+   * 		Current *ktime*.
+   *
+-  * int bpf_seq_printf(struct seq_file *m, const char *fmt, u32 fmt_size, const void *data, u32 data_len)
++  * long bpf_seq_printf(struct seq_file *m, const char *fmt, u32 fmt_size, const void *data, u32 data_len)
+   * 	Description
+ - * 		**bpf_seq_printf**\ () uses seq_file **seq_printf**\ () to print
+ - * 		out the format string.
+ + * 		seq_printf uses seq_file seq_printf() to print out the format string.
+   * 		The *m* represents the seq_file. The *fmt* and *fmt_size* are for
+   * 		the format string itself. The *data* and *data_len* are format string
+ - * 		arguments. The *data* are a **u64** array and corresponding format string
+ + * 		arguments. The *data* are a u64 array and corresponding format string
+   * 		values are stored in the array. For strings and pointers where pointees
+   * 		are accessed, only the pointer values are stored in the *data* array.
+ - * 		The *data_len* is the size of *data* in bytes.
+ + * 		The *data_len* is the *data* size in term of bytes.
+   *
+   *		Formats **%s**, **%p{i,I}{4,6}** requires to read kernel memory.
+   *		Reading kernel memory may fail due to either invalid address or
+   *		valid address but requiring a major memory fault. If reading kernel memory
+   *		fails, the string for **%s** will be an empty string, and the ip
+   *		address for **%p{i,I}{4,6}** will be 0. Not returning error to
+ - *		bpf program is consistent with what **bpf_trace_printk**\ () does for now.
+ + *		bpf program is consistent with what bpf_trace_printk() does for now.
+   * 	Return
+ - * 		0 on success, or a negative error in case of failure:
+ - *
+ - *		**-EBUSY** if per-CPU memory copy buffer is busy, can try again
+ - *		by returning 1 from bpf program.
+ - *
+ - *		**-EINVAL** if arguments are invalid, or if *fmt* is invalid/unsupported.
+ + * 		0 on success, or a negative errno in case of failure.
+   *
+ - *		**-E2BIG** if *fmt* contains too many format specifiers.
+ - *
+ - *		**-EOVERFLOW** if an overflow happened: The same object will be tried again.
+ + *		* **-EBUSY**		Percpu memory copy buffer is busy, can try again
+ + *					by returning 1 from bpf program.
+ + *		* **-EINVAL**		Invalid arguments, or invalid/unsupported formats.
+ + *		* **-E2BIG**		Too many format specifiers.
+ + *		* **-EOVERFLOW**	Overflow happens, the same object will be tried again.
+   *
+-  * int bpf_seq_write(struct seq_file *m, const void *data, u32 len)
++  * long bpf_seq_write(struct seq_file *m, const void *data, u32 len)
+   * 	Description
+ - * 		**bpf_seq_write**\ () uses seq_file **seq_write**\ () to write the data.
+ + * 		seq_write uses seq_file seq_write() to write the data.
+   * 		The *m* represents the seq_file. The *data* and *len* represent the
+ - * 		data to write in bytes.
+ + *		data to write in bytes.
+   * 	Return
+ - * 		0 on success, or a negative error in case of failure:
+ + * 		0 on success, or a negative errno in case of failure.
+   *
+++<<<<<<< HEAD
+ + *		* **-EOVERFLOW**	Overflow happens, the same object will be tried again.
+++=======
++  *		**-EOVERFLOW** if an overflow happened: The same object will be tried again.
++  *
++  * u64 bpf_sk_cgroup_id(struct bpf_sock *sk)
++  *	Description
++  *		Return the cgroup v2 id of the socket *sk*.
++  *
++  *		*sk* must be a non-**NULL** pointer to a full socket, e.g. one
++  *		returned from **bpf_sk_lookup_xxx**\ (),
++  *		**bpf_sk_fullsock**\ (), etc. The format of returned id is
++  *		same as in **bpf_skb_cgroup_id**\ ().
++  *
++  *		This helper is available only if the kernel was compiled with
++  *		the **CONFIG_SOCK_CGROUP_DATA** configuration option.
++  *	Return
++  *		The id is returned or 0 in case the id could not be retrieved.
++  *
++  * u64 bpf_sk_ancestor_cgroup_id(struct bpf_sock *sk, int ancestor_level)
++  *	Description
++  *		Return id of cgroup v2 that is ancestor of cgroup associated
++  *		with the *sk* at the *ancestor_level*.  The root cgroup is at
++  *		*ancestor_level* zero and each step down the hierarchy
++  *		increments the level. If *ancestor_level* == level of cgroup
++  *		associated with *sk*, then return value will be same as that
++  *		of **bpf_sk_cgroup_id**\ ().
++  *
++  *		The helper is useful to implement policies based on cgroups
++  *		that are upper in hierarchy than immediate cgroup associated
++  *		with *sk*.
++  *
++  *		The format of returned id and helper limitations are same as in
++  *		**bpf_sk_cgroup_id**\ ().
++  *	Return
++  *		The id is returned or 0 in case the id could not be retrieved.
++  *
++  * void *bpf_ringbuf_output(void *ringbuf, void *data, u64 size, u64 flags)
++  * 	Description
++  * 		Copy *size* bytes from *data* into a ring buffer *ringbuf*.
++  * 		If BPF_RB_NO_WAKEUP is specified in *flags*, no notification of
++  * 		new data availability is sent.
++  * 		IF BPF_RB_FORCE_WAKEUP is specified in *flags*, notification of
++  * 		new data availability is sent unconditionally.
++  * 	Return
++  * 		0, on success;
++  * 		< 0, on error.
++  *
++  * void *bpf_ringbuf_reserve(void *ringbuf, u64 size, u64 flags)
++  * 	Description
++  * 		Reserve *size* bytes of payload in a ring buffer *ringbuf*.
++  * 	Return
++  * 		Valid pointer with *size* bytes of memory available; NULL,
++  * 		otherwise.
++  *
++  * void bpf_ringbuf_submit(void *data, u64 flags)
++  * 	Description
++  * 		Submit reserved ring buffer sample, pointed to by *data*.
++  * 		If BPF_RB_NO_WAKEUP is specified in *flags*, no notification of
++  * 		new data availability is sent.
++  * 		IF BPF_RB_FORCE_WAKEUP is specified in *flags*, notification of
++  * 		new data availability is sent unconditionally.
++  * 	Return
++  * 		Nothing. Always succeeds.
++  *
++  * void bpf_ringbuf_discard(void *data, u64 flags)
++  * 	Description
++  * 		Discard reserved ring buffer sample, pointed to by *data*.
++  * 		If BPF_RB_NO_WAKEUP is specified in *flags*, no notification of
++  * 		new data availability is sent.
++  * 		IF BPF_RB_FORCE_WAKEUP is specified in *flags*, notification of
++  * 		new data availability is sent unconditionally.
++  * 	Return
++  * 		Nothing. Always succeeds.
++  *
++  * u64 bpf_ringbuf_query(void *ringbuf, u64 flags)
++  *	Description
++  *		Query various characteristics of provided ring buffer. What
++  *		exactly is queries is determined by *flags*:
++  *		  - BPF_RB_AVAIL_DATA - amount of data not yet consumed;
++  *		  - BPF_RB_RING_SIZE - the size of ring buffer;
++  *		  - BPF_RB_CONS_POS - consumer position (can wrap around);
++  *		  - BPF_RB_PROD_POS - producer(s) position (can wrap around);
++  *		Data returned is just a momentary snapshots of actual values
++  *		and could be inaccurate, so this facility should be used to
++  *		power heuristics and for reporting, not to make 100% correct
++  *		calculation.
++  *	Return
++  *		Requested value, or 0, if flags are not recognized.
++  *
++  * long bpf_csum_level(struct sk_buff *skb, u64 level)
++  * 	Description
++  * 		Change the skbs checksum level by one layer up or down, or
++  * 		reset it entirely to none in order to have the stack perform
++  * 		checksum validation. The level is applicable to the following
++  * 		protocols: TCP, UDP, GRE, SCTP, FCOE. For example, a decap of
++  * 		| ETH | IP | UDP | GUE | IP | TCP | into | ETH | IP | TCP |
++  * 		through **bpf_skb_adjust_room**\ () helper with passing in
++  * 		**BPF_F_ADJ_ROOM_NO_CSUM_RESET** flag would require one	call
++  * 		to **bpf_csum_level**\ () with **BPF_CSUM_LEVEL_DEC** since
++  * 		the UDP header is removed. Similarly, an encap of the latter
++  * 		into the former could be accompanied by a helper call to
++  * 		**bpf_csum_level**\ () with **BPF_CSUM_LEVEL_INC** if the
++  * 		skb is still intended to be processed in higher layers of the
++  * 		stack instead of just egressing at tc.
++  *
++  * 		There are three supported level settings at this time:
++  *
++  * 		* **BPF_CSUM_LEVEL_INC**: Increases skb->csum_level for skbs
++  * 		  with CHECKSUM_UNNECESSARY.
++  * 		* **BPF_CSUM_LEVEL_DEC**: Decreases skb->csum_level for skbs
++  * 		  with CHECKSUM_UNNECESSARY.
++  * 		* **BPF_CSUM_LEVEL_RESET**: Resets skb->csum_level to 0 and
++  * 		  sets CHECKSUM_NONE to force checksum validation by the stack.
++  * 		* **BPF_CSUM_LEVEL_QUERY**: No-op, returns the current
++  * 		  skb->csum_level.
++  * 	Return
++  * 		0 on success, or a negative error in case of failure. In the
++  * 		case of **BPF_CSUM_LEVEL_QUERY**, the current skb->csum_level
++  * 		is returned or the error code -EACCES in case the skb is not
++  * 		subject to CHECKSUM_UNNECESSARY.
+++>>>>>>> bdb7b79b4ce8 (bpf: Switch most helper return values from 32-bit int to 64-bit long)
+   */
+  #define __BPF_FUNC_MAPPER(FN)		\
+  	FN(unspec),			\
+* Unmerged path include/uapi/linux/bpf.h
+* Unmerged path tools/include/uapi/linux/bpf.h
