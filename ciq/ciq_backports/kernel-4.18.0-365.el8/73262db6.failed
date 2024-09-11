@@ -1,0 +1,292 @@
+drm/i915/display: Match PSR2 selective fetch sequences with specification
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-365.el8
+commit-author José Roberto de Souza <jose.souza@intel.com>
+commit 73262db68c27ed25452ffd3b57e051e1791de713
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-365.el8/73262db6.failed
+
+We were not completely following the selective fetch programming
+sequence, here some things we were doing wrong:
+- not programming plane selective fetch a PSR2_MAN_TRK_CTL registers
+when doing a modeset
+- programming PSR2_MAN_TRK_CTL out of vblank
+
+With this changes the last remainig underrun found in Alderlake-P is
+fixed.
+
+Bspec: 55229
+	Tested-by: Gwan-gyeong Mun <gwan-gyeong.mun@intel.com>
+	Reviewed-by: Gwan-gyeong Mun <gwan-gyeong.mun@intel.com>
+	Cc: Gwan-gyeong Mun <gwan-gyeong.mun@intel.com>
+	Signed-off-by: José Roberto de Souza <jose.souza@intel.com>
+Link: https://patchwork.freedesktop.org/patch/msgid/20210922215242.66683-2-jose.souza@intel.com
+(cherry picked from commit 73262db68c27ed25452ffd3b57e051e1791de713)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/gpu/drm/i915/display/intel_psr.c
+#	drivers/gpu/drm/i915/display/intel_psr.h
+#	drivers/gpu/drm/i915/display/skl_universal_plane.c
+diff --cc drivers/gpu/drm/i915/display/intel_psr.c
+index 2c6c4a4f9477,868e5205dd09..000000000000
+--- a/drivers/gpu/drm/i915/display/intel_psr.c
++++ b/drivers/gpu/drm/i915/display/intel_psr.c
+@@@ -549,20 -557,23 +549,36 @@@ static void hsw_activate_psr2(struct in
+  		val |= EDP_PSR2_FAST_WAKE(7);
+  	}
+  
+++<<<<<<< HEAD
+ +	if (dev_priv->psr.psr2_sel_fetch_enabled) {
+ +		/* WA 1408330847 */
+ +		if (IS_TGL_DISPLAY_STEP(dev_priv, STEP_A0, STEP_A0) ||
+ +		    IS_RKL_REVID(dev_priv, RKL_REVID_A0, RKL_REVID_A0))
+++=======
++ 	if (intel_dp->psr.req_psr2_sdp_prior_scanline)
++ 		val |= EDP_PSR2_SU_SDP_SCANLINE;
++ 
++ 	if (intel_dp->psr.psr2_sel_fetch_enabled) {
++ 		u32 tmp;
++ 
++ 		/* Wa_1408330847 */
++ 		if (IS_TGL_DISPLAY_STEP(dev_priv, STEP_A0, STEP_B0))
+++>>>>>>> 73262db68c27 (drm/i915/display: Match PSR2 selective fetch sequences with specification)
+  			intel_de_rmw(dev_priv, CHICKEN_PAR1_1,
+  				     DIS_RAM_BYPASS_PSR2_MAN_TRACK,
+  				     DIS_RAM_BYPASS_PSR2_MAN_TRACK);
+  
+++<<<<<<< HEAD
+ +		intel_de_write(dev_priv,
+ +			       PSR2_MAN_TRK_CTL(dev_priv->psr.transcoder),
+ +			       PSR2_MAN_TRK_CTL_ENABLE);
+++=======
++ 		tmp = intel_de_read(dev_priv, PSR2_MAN_TRK_CTL(intel_dp->psr.transcoder));
++ 		drm_WARN_ON(&dev_priv->drm, !(tmp & PSR2_MAN_TRK_CTL_ENABLE));
+++>>>>>>> 73262db68c27 (drm/i915/display: Match PSR2 selective fetch sequences with specification)
+  	} else if (HAS_PSR2_SEL_FETCH(dev_priv)) {
+  		intel_de_write(dev_priv,
+ -			       PSR2_MAN_TRK_CTL(intel_dp->psr.transcoder), 0);
+ +			       PSR2_MAN_TRK_CTL(dev_priv->psr.transcoder), 0);
+  	}
+  
+  	/*
+@@@ -1174,46 -1375,94 +1190,58 @@@ void intel_psr_disable(struct intel_dp 
+  
+  	intel_psr_disable_locked(intel_dp);
+  
+ -	mutex_unlock(&intel_dp->psr.lock);
+ -	cancel_work_sync(&intel_dp->psr.work);
+ -	cancel_delayed_work_sync(&intel_dp->psr.dc3co_work);
+ -}
+ -
+ -/**
+ - * intel_psr_pause - Pause PSR
+ - * @intel_dp: Intel DP
+ - *
+ - * This function need to be called after enabling psr.
+ - */
+ -void intel_psr_pause(struct intel_dp *intel_dp)
+ -{
+ -	struct intel_psr *psr = &intel_dp->psr;
+ -
+ -	if (!CAN_PSR(intel_dp))
+ -		return;
+ -
+ -	mutex_lock(&psr->lock);
+ -
+ -	if (!psr->enabled) {
+ -		mutex_unlock(&psr->lock);
+ -		return;
+ -	}
+ -
+ -	intel_psr_exit(intel_dp);
+ -	intel_psr_wait_exit_locked(intel_dp);
+ -	psr->paused = true;
+ -
+ -	mutex_unlock(&psr->lock);
+ -
+ -	cancel_work_sync(&psr->work);
+ -	cancel_delayed_work_sync(&psr->dc3co_work);
+ +	mutex_unlock(&dev_priv->psr.lock);
+ +	cancel_work_sync(&dev_priv->psr.work);
+ +	cancel_delayed_work_sync(&dev_priv->psr.dc3co_work);
+  }
+  
+ -/**
+ - * intel_psr_resume - Resume PSR
+ - * @intel_dp: Intel DP
+ - *
+ - * This function need to be called after pausing psr.
+ - */
+ -void intel_psr_resume(struct intel_dp *intel_dp)
+ +static void psr_force_hw_tracking_exit(struct drm_i915_private *dev_priv)
+  {
+ -	struct intel_psr *psr = &intel_dp->psr;
+ -
+ -	if (!CAN_PSR(intel_dp))
+ -		return;
+ -
+ -	mutex_lock(&psr->lock);
+ -
+ -	if (!psr->paused)
+ -		goto unlock;
+ -
+ -	psr->paused = false;
+ -	intel_psr_activate(intel_dp);
+ -
+ -unlock:
+ -	mutex_unlock(&psr->lock);
+ -}
+ -
+ -static void psr_force_hw_tracking_exit(struct intel_dp *intel_dp)
+ -{
+ -	struct drm_i915_private *dev_priv = dp_to_i915(intel_dp);
+ -
+ -	/*
+ -	 * Display WA #0884: skl+
+ -	 * This documented WA for bxt can be safely applied
+ -	 * broadly so we can force HW tracking to exit PSR
+ -	 * instead of disabling and re-enabling.
+ -	 * Workaround tells us to write 0 to CUR_SURFLIVE_A,
+ -	 * but it makes more sense write to the current active
+ -	 * pipe.
+ -	 */
+ -	intel_de_write(dev_priv, CURSURFLIVE(intel_dp->psr.pipe), 0);
+ +	if (IS_TIGERLAKE(dev_priv))
+ +		/*
+ +		 * Writes to CURSURFLIVE in TGL are causing IOMMU errors and
+ +		 * visual glitches that are often reproduced when executing
+ +		 * CPU intensive workloads while a eDP 4K panel is attached.
+ +		 *
+ +		 * Manually exiting PSR causes the frontbuffer to be updated
+ +		 * without glitches and the IOMMU errors are also gone but
+ +		 * this comes at the cost of less time with PSR active.
+ +		 *
+ +		 * So using this workaround until this issue is root caused
+ +		 * and a better fix is found.
+ +		 */
+ +		intel_psr_exit(dev_priv);
+ +	else if (INTEL_GEN(dev_priv) >= 9)
+ +		/*
+ +		 * Display WA #0884: skl+
+ +		 * This documented WA for bxt can be safely applied
+ +		 * broadly so we can force HW tracking to exit PSR
+ +		 * instead of disabling and re-enabling.
+ +		 * Workaround tells us to write 0 to CUR_SURFLIVE_A,
+ +		 * but it makes more sense write to the current active
+ +		 * pipe.
+ +		 */
+ +		intel_de_write(dev_priv, CURSURFLIVE(dev_priv->psr.pipe), 0);
+ +	else
+ +		/*
+ +		 * A write to CURSURFLIVE do not cause HW tracking to exit PSR
+ +		 * on older gens so doing the manual exit instead.
+ +		 */
+ +		intel_psr_exit(dev_priv);
+  }
+  
++ void intel_psr2_disable_plane_sel_fetch(struct intel_plane *plane,
++ 					const struct intel_crtc_state *crtc_state)
++ {
++ 	struct drm_i915_private *dev_priv = to_i915(plane->base.dev);
++ 	enum pipe pipe = plane->pipe;
++ 
++ 	if (!crtc_state->enable_psr2_sel_fetch)
++ 		return;
++ 
++ 	intel_de_write_fw(dev_priv, PLANE_SEL_FETCH_CTL(pipe, plane->id), 0);
++ }
++ 
+  void intel_psr2_program_plane_sel_fetch(struct intel_plane *plane,
+  					const struct intel_crtc_state *crtc_state,
+  					const struct intel_plane_state *plane_state,
+@@@ -1259,15 -1507,12 +1290,14 @@@
+  
+  void intel_psr2_program_trans_man_trk_ctl(const struct intel_crtc_state *crtc_state)
+  {
+ -	struct drm_i915_private *dev_priv = to_i915(crtc_state->uapi.crtc->dev);
+ +	struct intel_crtc *crtc = to_intel_crtc(crtc_state->uapi.crtc);
+ +	struct drm_i915_private *dev_priv = to_i915(crtc->base.dev);
+ +	struct i915_psr *psr = &dev_priv->psr;
+  
+- 	if (!HAS_PSR2_SEL_FETCH(dev_priv) ||
+- 	    !crtc_state->enable_psr2_sel_fetch)
++ 	if (!crtc_state->enable_psr2_sel_fetch)
+  		return;
+  
+ -	intel_de_write(dev_priv, PSR2_MAN_TRK_CTL(crtc_state->cpu_transcoder),
+ +	intel_de_write(dev_priv, PSR2_MAN_TRK_CTL(psr->transcoder),
+  		       crtc_state->psr2_man_track_ctl);
+  }
+  
+diff --cc drivers/gpu/drm/i915/display/intel_psr.h
+index 0a517978e8af,e502964697c6..000000000000
+--- a/drivers/gpu/drm/i915/display/intel_psr.h
++++ b/drivers/gpu/drm/i915/display/intel_psr.h
+@@@ -50,5 -51,9 +50,12 @@@ void intel_psr2_program_plane_sel_fetch
+  					const struct intel_crtc_state *crtc_state,
+  					const struct intel_plane_state *plane_state,
+  					int color_plane);
+++<<<<<<< HEAD
+++=======
++ void intel_psr2_disable_plane_sel_fetch(struct intel_plane *plane,
++ 					const struct intel_crtc_state *crtc_state);
++ void intel_psr_pause(struct intel_dp *intel_dp);
++ void intel_psr_resume(struct intel_dp *intel_dp);
+++>>>>>>> 73262db68c27 (drm/i915/display: Match PSR2 selective fetch sequences with specification)
+  
+  #endif /* __INTEL_PSR_H__ */
+* Unmerged path drivers/gpu/drm/i915/display/skl_universal_plane.c
+diff --git a/drivers/gpu/drm/i915/display/intel_cursor.c b/drivers/gpu/drm/i915/display/intel_cursor.c
+index 21fe4d2753e9..283fba2d8763 100644
+--- a/drivers/gpu/drm/i915/display/intel_cursor.c
++++ b/drivers/gpu/drm/i915/display/intel_cursor.c
+@@ -530,8 +530,10 @@ static void i9xx_update_cursor(struct intel_plane *plane,
+ 	if (INTEL_GEN(dev_priv) >= 9)
+ 		skl_write_cursor_wm(plane, crtc_state);
+ 
+-	if (!intel_crtc_needs_modeset(crtc_state))
++	if (plane_state)
+ 		intel_psr2_program_plane_sel_fetch(plane, crtc_state, plane_state, 0);
++	else
++		intel_psr2_disable_plane_sel_fetch(plane, crtc_state);
+ 
+ 	if (plane->cursor.base != base ||
+ 	    plane->cursor.size != fbc_ctl ||
+diff --git a/drivers/gpu/drm/i915/display/intel_display.c b/drivers/gpu/drm/i915/display/intel_display.c
+index be4f122dd751..b4035492e885 100644
+--- a/drivers/gpu/drm/i915/display/intel_display.c
++++ b/drivers/gpu/drm/i915/display/intel_display.c
+@@ -10043,11 +10043,9 @@ static int intel_crtc_atomic_check(struct intel_atomic_state *state,
+ 
+ 	}
+ 
+-	if (!mode_changed) {
+-		ret = intel_psr2_sel_fetch_update(state, crtc);
+-		if (ret)
+-			return ret;
+-	}
++	ret = intel_psr2_sel_fetch_update(state, crtc);
++	if (ret)
++		return ret;
+ 
+ 	return 0;
+ }
+@@ -12845,10 +12843,10 @@ static void commit_pipe_config(struct intel_atomic_state *state,
+ 
+ 		if (new_crtc_state->update_pipe)
+ 			intel_pipe_fastset(old_crtc_state, new_crtc_state);
+-
+-		intel_psr2_program_trans_man_trk_ctl(new_crtc_state);
+ 	}
+ 
++	intel_psr2_program_trans_man_trk_ctl(new_crtc_state);
++
+ 	if (dev_priv->display.atomic_update_watermarks)
+ 		dev_priv->display.atomic_update_watermarks(state, crtc);
+ }
+* Unmerged path drivers/gpu/drm/i915/display/intel_psr.c
+* Unmerged path drivers/gpu/drm/i915/display/intel_psr.h
+* Unmerged path drivers/gpu/drm/i915/display/skl_universal_plane.c
