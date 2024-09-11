@@ -1,0 +1,171 @@
+perf/x86: Add MSR probe interface
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-193.el8
+commit-author Jiri Olsa <jolsa@kernel.org>
+commit 98253a546a468d88b7e782ab67cdf447d3c7bbe2
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-193.el8/98253a54.failed
+
+Adding perf_msr_probe function to provide interface for
+checking up on MSR register and set the related attribute
+group visibility.
+
+User defines following struct for each MSR register:
+
+  struct perf_msr {
+       u64                       msr;
+       struct attribute_group   *grp;
+       bool                    (*test)(int idx, void *data);
+       bool                      no_check;
+  };
+
+Where:
+  msr      - is the MSR address
+  attrs    - is attribute groups array to add if the check passed
+  test     - is test function pointer
+  no_check - is bool that bypass the check and adds the
+              attribute without any test
+
+The array of struct perf_msr is passed into:
+
+  perf_msr_probe(struct perf_msr *msr, int cnt, bool zero, void *data)
+
+Together with:
+  cnt  - which is the number of struct msr array elements
+  data - which is user pointer passed to the test function
+  zero - allow counters that returns zero on rdmsr
+
+The perf_msr_probe will executed test code, read the MSR and
+check the value is != 0. If all these tests pass, related
+attribute group is kept visible.
+
+Also adding PMU_EVENT_GROUP macro helper to define attribute
+group for single attribute. It will be used in following patches.
+
+	Signed-off-by: Jiri Olsa <jolsa@kernel.org>
+	Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+	Cc: Alexander Shishkin <alexander.shishkin@linux.intel.com>
+	Cc: Andy Lutomirski <luto@kernel.org>
+	Cc: Arnaldo Carvalho de Melo <acme@kernel.org>
+	Cc: Arnaldo Carvalho de Melo <acme@redhat.com>
+	Cc: Borislav Petkov <bp@alien8.de>
+	Cc: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+	Cc: Jiri Olsa <jolsa@redhat.com>
+	Cc: Kan <kan.liang@linux.intel.com>
+	Cc: Liang
+	Cc: Linus Torvalds <torvalds@linux-foundation.org>
+	Cc: Namhyung Kim <namhyung@kernel.org>
+	Cc: Peter Zijlstra <peterz@infradead.org>
+	Cc: Stephane Eranian <eranian@google.com>
+	Cc: Thomas Gleixner <tglx@linutronix.de>
+	Cc: Vince Weaver <vincent.weaver@maine.edu>
+Link: https://lkml.kernel.org/r/20190616140358.27799-2-jolsa@kernel.org
+	Signed-off-by: Ingo Molnar <mingo@kernel.org>
+(cherry picked from commit 98253a546a468d88b7e782ab67cdf447d3c7bbe2)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/events/Makefile
+diff --cc arch/x86/events/Makefile
+index b8ccdb5c9244,9e07f554333f..000000000000
+--- a/arch/x86/events/Makefile
++++ b/arch/x86/events/Makefile
+@@@ -1,4 -1,5 +1,9 @@@
+++<<<<<<< HEAD
+ +obj-y					+= core.o
+++=======
++ # SPDX-License-Identifier: GPL-2.0-only
++ obj-y					+= core.o probe.o
+++>>>>>>> 98253a546a46 (perf/x86: Add MSR probe interface)
+  obj-y					+= amd/
+  obj-$(CONFIG_X86_LOCAL_APIC)            += msr.o
+  obj-$(CONFIG_CPU_SUP_INTEL)		+= intel/
+* Unmerged path arch/x86/events/Makefile
+diff --git a/arch/x86/events/probe.c b/arch/x86/events/probe.c
+new file mode 100644
+index 000000000000..c2ede2f3b277
+--- /dev/null
++++ b/arch/x86/events/probe.c
+@@ -0,0 +1,45 @@
++// SPDX-License-Identifier: GPL-2.0
++#include <linux/export.h>
++#include <linux/types.h>
++#include <linux/bits.h>
++#include "probe.h"
++
++static umode_t
++not_visible(struct kobject *kobj, struct attribute *attr, int i)
++{
++	return 0;
++}
++
++unsigned long
++perf_msr_probe(struct perf_msr *msr, int cnt, bool zero, void *data)
++{
++	unsigned long avail = 0;
++	unsigned int bit;
++	u64 val;
++
++	if (cnt >= BITS_PER_LONG)
++		return 0;
++
++	for (bit = 0; bit < cnt; bit++) {
++		if (!msr[bit].no_check) {
++			struct attribute_group *grp = msr[bit].grp;
++
++			grp->is_visible = not_visible;
++
++			if (msr[bit].test && !msr[bit].test(bit, data))
++				continue;
++			/* Virt sucks; you cannot tell if a R/O MSR is present :/ */
++			if (rdmsrl_safe(msr[bit].msr, &val))
++				continue;
++			/* Disable zero counters if requested. */
++			if (!zero && !val)
++				continue;
++
++			grp->is_visible = NULL;
++		}
++		avail |= BIT(bit);
++	}
++
++	return avail;
++}
++EXPORT_SYMBOL_GPL(perf_msr_probe);
+diff --git a/arch/x86/events/probe.h b/arch/x86/events/probe.h
+new file mode 100644
+index 000000000000..4c8e0afc5fb5
+--- /dev/null
++++ b/arch/x86/events/probe.h
+@@ -0,0 +1,29 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++#ifndef __ARCH_X86_EVENTS_PROBE_H__
++#define __ARCH_X86_EVENTS_PROBE_H__
++#include <linux/sysfs.h>
++
++struct perf_msr {
++	u64			  msr;
++	struct attribute_group	 *grp;
++	bool			(*test)(int idx, void *data);
++	bool			  no_check;
++};
++
++unsigned long
++perf_msr_probe(struct perf_msr *msr, int cnt, bool no_zero, void *data);
++
++#define __PMU_EVENT_GROUP(_name)			\
++static struct attribute *attrs_##_name[] = {		\
++	&attr_##_name.attr.attr,			\
++	NULL,						\
++}
++
++#define PMU_EVENT_GROUP(_grp, _name)			\
++__PMU_EVENT_GROUP(_name);				\
++static struct attribute_group group_##_name = {		\
++	.name  = #_grp,					\
++	.attrs = attrs_##_name,				\
++}
++
++#endif /* __ARCH_X86_EVENTS_PROBE_H__ */
