@@ -1,0 +1,192 @@
+bpf: Fix a verifier issue when assigning 32bit reg states to 64bit ones
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author John Fastabend <john.fastabend@gmail.com>
+commit 3a71dc366d4aa51a22f385445f2862231d3fda3b
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/3a71dc36.failed
+
+With the latest trunk llvm (llvm 11), I hit a verifier issue for
+test_prog subtest test_verif_scale1.
+
+The following simplified example illustrate the issue:
+    w9 = 0  /* R9_w=inv0 */
+    r8 = *(u32 *)(r1 + 80)  /* __sk_buff->data_end */
+    r7 = *(u32 *)(r1 + 76)  /* __sk_buff->data */
+    ......
+    w2 = w9 /* R2_w=inv0 */
+    r6 = r7 /* R6_w=pkt(id=0,off=0,r=0,imm=0) */
+    r6 += r2 /* R6_w=inv(id=0) */
+    r3 = r6 /* R3_w=inv(id=0) */
+    r3 += 14 /* R3_w=inv(id=0) */
+    if r3 > r8 goto end
+    r5 = *(u32 *)(r6 + 0) /* R6_w=inv(id=0) */
+       <== error here: R6 invalid mem access 'inv'
+    ...
+  end:
+
+In real test_verif_scale1 code, "w9 = 0" and "w2 = w9" are in
+different basic blocks.
+
+In the above, after "r6 += r2", r6 becomes a scalar, which eventually
+caused the memory access error. The correct register state should be
+a pkt pointer.
+
+The inprecise register state starts at "w2 = w9".
+The 32bit register w9 is 0, in __reg_assign_32_into_64(),
+the 64bit reg->smax_value is assigned to be U32_MAX.
+The 64bit reg->smin_value is 0 and the 64bit register
+itself remains constant based on reg->var_off.
+
+In adjust_ptr_min_max_vals(), the verifier checks for a known constant,
+smin_val must be equal to smax_val. Since they are not equal,
+the verifier decides r6 is a unknown scalar, which caused later failure.
+
+The llvm10 does not have this issue as it generates different code:
+    w9 = 0  /* R9_w=inv0 */
+    r8 = *(u32 *)(r1 + 80)  /* __sk_buff->data_end */
+    r7 = *(u32 *)(r1 + 76)  /* __sk_buff->data */
+    ......
+    r6 = r7 /* R6_w=pkt(id=0,off=0,r=0,imm=0) */
+    r6 += r9 /* R6_w=pkt(id=0,off=0,r=0,imm=0) */
+    r3 = r6 /* R3_w=pkt(id=0,off=0,r=0,imm=0) */
+    r3 += 14 /* R3_w=pkt(id=0,off=14,r=0,imm=0) */
+    if r3 > r8 goto end
+    ...
+
+To fix the above issue, we can include zero in the test condition for
+assigning the s32_max_value and s32_min_value to their 64-bit equivalents
+smax_value and smin_value.
+
+Further, fix the condition to avoid doing zero extension bounds checks
+when s32_min_value <= 0. This could allow for the case where bounds
+32-bit bounds (-1,1) get incorrectly translated to (0,1) 64-bit bounds.
+When in-fact the -1 min value needs to force U32_MAX bound.
+
+Fixes: 3f50f132d840 ("bpf: Verifier, do explicit ALU32 bounds tracking")
+	Signed-off-by: John Fastabend <john.fastabend@gmail.com>
+	Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+	Acked-by: Yonghong Song <yhs@fb.com>
+Link: https://lore.kernel.org/bpf/159077331983.6014.5758956193749002737.stgit@john-Precision-5820-Tower
+(cherry picked from commit 3a71dc366d4aa51a22f385445f2862231d3fda3b)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	kernel/bpf/verifier.c
+diff --cc kernel/bpf/verifier.c
+index afe5348c8e19,efe14cf24bc6..000000000000
+--- a/kernel/bpf/verifier.c
++++ b/kernel/bpf/verifier.c
+@@@ -1035,18 -1144,103 +1035,100 @@@ static void __reg_deduce_bounds(struct 
+  /* Attempts to improve var_off based on unsigned min/max information */
+  static void __reg_bound_offset(struct bpf_reg_state *reg)
+  {
+ -	struct tnum var64_off = tnum_intersect(reg->var_off,
+ -					       tnum_range(reg->umin_value,
+ -							  reg->umax_value));
+ -	struct tnum var32_off = tnum_intersect(tnum_subreg(reg->var_off),
+ -						tnum_range(reg->u32_min_value,
+ -							   reg->u32_max_value));
+ -
+ -	reg->var_off = tnum_or(tnum_clear_subreg(var64_off), var32_off);
+ +	reg->var_off = tnum_intersect(reg->var_off,
+ +				      tnum_range(reg->umin_value,
+ +						 reg->umax_value));
+  }
+  
+ -static void __reg_assign_32_into_64(struct bpf_reg_state *reg)
+ +/* Reset the min/max bounds of a register */
+ +static void __mark_reg_unbounded(struct bpf_reg_state *reg)
+  {
+++<<<<<<< HEAD
+ +	reg->smin_value = S64_MIN;
+ +	reg->smax_value = S64_MAX;
+ +	reg->umin_value = 0;
+ +	reg->umax_value = U64_MAX;
+++=======
++ 	reg->umin_value = reg->u32_min_value;
++ 	reg->umax_value = reg->u32_max_value;
++ 	/* Attempt to pull 32-bit signed bounds into 64-bit bounds
++ 	 * but must be positive otherwise set to worse case bounds
++ 	 * and refine later from tnum.
++ 	 */
++ 	if (reg->s32_min_value >= 0 && reg->s32_max_value >= 0)
++ 		reg->smax_value = reg->s32_max_value;
++ 	else
++ 		reg->smax_value = U32_MAX;
++ 	if (reg->s32_min_value >= 0)
++ 		reg->smin_value = reg->s32_min_value;
++ 	else
++ 		reg->smin_value = 0;
++ }
++ 
++ static void __reg_combine_32_into_64(struct bpf_reg_state *reg)
++ {
++ 	/* special case when 64-bit register has upper 32-bit register
++ 	 * zeroed. Typically happens after zext or <<32, >>32 sequence
++ 	 * allowing us to use 32-bit bounds directly,
++ 	 */
++ 	if (tnum_equals_const(tnum_clear_subreg(reg->var_off), 0)) {
++ 		__reg_assign_32_into_64(reg);
++ 	} else {
++ 		/* Otherwise the best we can do is push lower 32bit known and
++ 		 * unknown bits into register (var_off set from jmp logic)
++ 		 * then learn as much as possible from the 64-bit tnum
++ 		 * known and unknown bits. The previous smin/smax bounds are
++ 		 * invalid here because of jmp32 compare so mark them unknown
++ 		 * so they do not impact tnum bounds calculation.
++ 		 */
++ 		__mark_reg64_unbounded(reg);
++ 		__update_reg_bounds(reg);
++ 	}
++ 
++ 	/* Intersecting with the old var_off might have improved our bounds
++ 	 * slightly.  e.g. if umax was 0x7f...f and var_off was (0; 0xf...fc),
++ 	 * then new var_off is (0; 0x7f...fc) which improves our umax.
++ 	 */
++ 	__reg_deduce_bounds(reg);
++ 	__reg_bound_offset(reg);
++ 	__update_reg_bounds(reg);
++ }
++ 
++ static bool __reg64_bound_s32(s64 a)
++ {
++ 	if (a > S32_MIN && a < S32_MAX)
++ 		return true;
++ 	return false;
++ }
++ 
++ static bool __reg64_bound_u32(u64 a)
++ {
++ 	if (a > U32_MIN && a < U32_MAX)
++ 		return true;
++ 	return false;
++ }
++ 
++ static void __reg_combine_64_into_32(struct bpf_reg_state *reg)
++ {
++ 	__mark_reg32_unbounded(reg);
++ 
++ 	if (__reg64_bound_s32(reg->smin_value))
++ 		reg->s32_min_value = (s32)reg->smin_value;
++ 	if (__reg64_bound_s32(reg->smax_value))
++ 		reg->s32_max_value = (s32)reg->smax_value;
++ 	if (__reg64_bound_u32(reg->umin_value))
++ 		reg->u32_min_value = (u32)reg->umin_value;
++ 	if (__reg64_bound_u32(reg->umax_value))
++ 		reg->u32_max_value = (u32)reg->umax_value;
++ 
++ 	/* Intersecting with the old var_off might have improved our bounds
++ 	 * slightly.  e.g. if umax was 0x7f...f and var_off was (0; 0xf...fc),
++ 	 * then new var_off is (0; 0x7f...fc) which improves our umax.
++ 	 */
++ 	__reg_deduce_bounds(reg);
++ 	__reg_bound_offset(reg);
++ 	__update_reg_bounds(reg);
+++>>>>>>> 3a71dc366d4a (bpf: Fix a verifier issue when assigning 32bit reg states to 64bit ones)
+  }
+  
+  /* Mark a register as having a completely unknown (scalar) value. */
+* Unmerged path kernel/bpf/verifier.c
