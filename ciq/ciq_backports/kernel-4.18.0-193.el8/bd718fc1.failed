@@ -1,0 +1,130 @@
+mac80211: use STA info in rate_control_send_low()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-193.el8
+commit-author Johannes Berg <johannes.berg@intel.com>
+commit bd718fc11d5b184701e7fd8302033e31a3a03ba8
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-193.el8/bd718fc1.failed
+
+Even if we have a station, we currently call rate_control_send_low()
+with the NULL station unless further rate control (driver, minstrel)
+has been initialized.
+
+Change this so we can use more information about the station to use
+a better rate. For example, when we associate with an AP, we will
+now use the lowest rate it advertised as supported (that we can)
+rather than the lowest mandatory rate. This aligns our behaviour
+with most other 802.11 implementations.
+
+To make this possible, we need to also ensure that we have non-zero
+rates at all times, so in case we really have *nothing* pre-fill
+the supp_rates bitmap with the very lowest mandatory bitmap (11b
+and 11a on 2.4 and 5 GHz respectively).
+
+Additionally, hostapd appears to be giving us an empty supported
+rates bitmap (it can and should do better, since the STA must have
+supported for at least the basic rates in the BSS), so ignore any
+such bitmaps that would actually zero out the supp_rates, and in
+that case just keep the pre-filled mandatory rates.
+
+	Signed-off-by: Johannes Berg <johannes.berg@intel.com>
+	Signed-off-by: Luca Coelho <luciano.coelho@intel.com>
+	Signed-off-by: Johannes Berg <johannes.berg@intel.com>
+(cherry picked from commit bd718fc11d5b184701e7fd8302033e31a3a03ba8)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/mac80211/cfg.c
+#	net/mac80211/sta_info.c
+diff --cc net/mac80211/cfg.c
+index 5369a4a03940,fcf1dfc3a1cc..000000000000
+--- a/net/mac80211/cfg.c
++++ b/net/mac80211/cfg.c
+@@@ -5,7 -4,9 +5,13 @@@
+   * Copyright 2006-2010	Johannes Berg <johannes@sipsolutions.net>
+   * Copyright 2013-2015  Intel Mobile Communications GmbH
+   * Copyright (C) 2015-2017 Intel Deutschland GmbH
+++<<<<<<< HEAD
+ + * Copyright (C) 2018 Intel Corporation
+++=======
++  * Copyright (C) 2018-2019 Intel Corporation
++  *
++  * This file is GPLv2 as found in COPYING.
+++>>>>>>> bd718fc11d5b (mac80211: use STA info in rate_control_send_low())
+   */
+  
+  #include <linux/ieee80211.h>
+diff --cc net/mac80211/sta_info.c
+index 187f62a48b2b,315adb473e2c..000000000000
+--- a/net/mac80211/sta_info.c
++++ b/net/mac80211/sta_info.c
+@@@ -4,7 -3,11 +4,15 @@@
+   * Copyright 2006-2007	Jiri Benc <jbenc@suse.cz>
+   * Copyright 2013-2014  Intel Mobile Communications GmbH
+   * Copyright (C) 2015 - 2017 Intel Deutschland GmbH
+++<<<<<<< HEAD
+ + * Copyright (C) 2018 Intel Corporation
+++=======
++  * Copyright (C) 2018-2019 Intel Corporation
++  *
++  * This program is free software; you can redistribute it and/or modify
++  * it under the terms of the GNU General Public License version 2 as
++  * published by the Free Software Foundation.
+++>>>>>>> bd718fc11d5b (mac80211: use STA info in rate_control_send_low())
+   */
+  
+  #include <linux/module.h>
+* Unmerged path net/mac80211/cfg.c
+diff --git a/net/mac80211/mlme.c b/net/mac80211/mlme.c
+index dadba9cec8ab..96014f459a2b 100644
+--- a/net/mac80211/mlme.c
++++ b/net/mac80211/mlme.c
+@@ -4962,7 +4962,12 @@ static int ieee80211_prep_connection(struct ieee80211_sub_if_data *sdata,
+ 			basic_rates = BIT(min_rate_index);
+ 		}
+ 
+-		new_sta->sta.supp_rates[cbss->channel->band] = rates;
++		if (rates)
++			new_sta->sta.supp_rates[cbss->channel->band] = rates;
++		else
++			sdata_info(sdata,
++				   "No rates found, keeping mandatory only\n");
++
+ 		sdata->vif.bss_conf.basic_rates = basic_rates;
+ 
+ 		/* cf. IEEE 802.11 9.2.12 */
+diff --git a/net/mac80211/rate.c b/net/mac80211/rate.c
+index 734e0677f820..ea65ba9d5fe0 100644
+--- a/net/mac80211/rate.c
++++ b/net/mac80211/rate.c
+@@ -883,11 +883,6 @@ void rate_control_get_rate(struct ieee80211_sub_if_data *sdata,
+ 	struct ieee80211_tx_info *info = IEEE80211_SKB_CB(txrc->skb);
+ 	int i;
+ 
+-	if (sta && test_sta_flag(sta, WLAN_STA_RATE_CONTROL)) {
+-		ista = &sta->sta;
+-		priv_sta = sta->rate_ctrl_priv;
+-	}
+-
+ 	for (i = 0; i < IEEE80211_TX_MAX_RATES; i++) {
+ 		info->control.rates[i].idx = -1;
+ 		info->control.rates[i].flags = 0;
+@@ -897,9 +892,14 @@ void rate_control_get_rate(struct ieee80211_sub_if_data *sdata,
+ 	if (ieee80211_hw_check(&sdata->local->hw, HAS_RATE_CONTROL))
+ 		return;
+ 
+-	if (rate_control_send_low(ista, txrc))
++	if (rate_control_send_low(sta ? &sta->sta : NULL, txrc))
+ 		return;
+ 
++	if (sta && test_sta_flag(sta, WLAN_STA_RATE_CONTROL)) {
++		ista = &sta->sta;
++		priv_sta = sta->rate_ctrl_priv;
++	}
++
+ 	if (ista) {
+ 		spin_lock_bh(&sta->rate_ctrl_lock);
+ 		ref->ops->get_rate(ref->priv, ista, priv_sta, txrc);
+* Unmerged path net/mac80211/sta_info.c
