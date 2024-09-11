@@ -1,0 +1,112 @@
+iommu/io-pgtable-arm: Improve attribute handling
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Robin Murphy <robin.murphy@arm.com>
+commit 7618e479098226799207e021e8b0c2c28a23c96b
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/7618e479.failed
+
+By VMSA rules, using Normal Non-Cacheable type with a shareability
+attribute of anything other than Outer Shareable is liable to lead into
+unpredictable territory:
+
+| Overlaying the shareability attribute (B3-1377, ARM DDI 0406C.c)
+|
+| A memory region with a resultant memory type attribute of Normal, and
+| a resultant cacheability attribute of Inner Non-cacheable, Outer
+| Non-cacheable, must have a resultant shareability attribute of Outer
+| Shareable, otherwise shareability is UNPREDICTABLE
+
+Although the SMMU architectures seem to give some slightly stronger
+guarantees of Non-Cacheable output types becoming implicitly Outer
+Shareable in most cases, we may as well be explicit and not take any
+chances. It's also weird that LPAE attribute handling is currently split
+between prot_to_pte() and init_pte() given that it can all be statically
+determined up-front. Thus, collect *all* the LPAE attributes into
+prot_to_pte() in order to logically pick the shareability based on the
+incoming IOMMU API prot value, and tweak the short-descriptor code to
+stop setting TTBR0.NOS for Non-Cacheable walks.
+
+	Signed-off-by: Robin Murphy <robin.murphy@arm.com>
+	Signed-off-by: Will Deacon <will@kernel.org>
+(cherry picked from commit 7618e479098226799207e021e8b0c2c28a23c96b)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/iommu/io-pgtable-arm-v7s.c
+diff --cc drivers/iommu/io-pgtable-arm-v7s.c
+index c4cce9fb7cff,697ffffe34df..000000000000
+--- a/drivers/iommu/io-pgtable-arm-v7s.c
++++ b/drivers/iommu/io-pgtable-arm-v7s.c
+@@@ -786,15 -822,13 +786,25 @@@ static struct io_pgtable *arm_v7s_alloc
+  	/* Ensure the empty pgd is visible before any actual TTBR write */
+  	wmb();
+  
+++<<<<<<< HEAD
+ +	/* TTBRs */
+ +	cfg->arm_v7s_cfg.ttbr[0] = virt_to_phys(data->pgd) |
+ +				   ARM_V7S_TTBR_S | ARM_V7S_TTBR_NOS |
+ +				   (cfg->coherent_walk ?
+ +				   (ARM_V7S_TTBR_IRGN_ATTR(ARM_V7S_RGN_WBWA) |
+ +				    ARM_V7S_TTBR_ORGN_ATTR(ARM_V7S_RGN_WBWA)) :
+ +				   (ARM_V7S_TTBR_IRGN_ATTR(ARM_V7S_RGN_NC) |
+ +				    ARM_V7S_TTBR_ORGN_ATTR(ARM_V7S_RGN_NC)));
+ +	cfg->arm_v7s_cfg.ttbr[1] = 0;
+++=======
++ 	/* TTBR */
++ 	cfg->arm_v7s_cfg.ttbr = virt_to_phys(data->pgd) | ARM_V7S_TTBR_S |
++ 				(cfg->coherent_walk ? (ARM_V7S_TTBR_NOS |
++ 				 ARM_V7S_TTBR_IRGN_ATTR(ARM_V7S_RGN_WBWA) |
++ 				 ARM_V7S_TTBR_ORGN_ATTR(ARM_V7S_RGN_WBWA)) :
++ 				(ARM_V7S_TTBR_IRGN_ATTR(ARM_V7S_RGN_NC) |
++ 				 ARM_V7S_TTBR_ORGN_ATTR(ARM_V7S_RGN_NC)));
+++>>>>>>> 7618e4790982 (iommu/io-pgtable-arm: Improve attribute handling)
+  	return &data->iop;
+  
+  out_free_data:
+* Unmerged path drivers/iommu/io-pgtable-arm-v7s.c
+diff --git a/drivers/iommu/io-pgtable-arm.c b/drivers/iommu/io-pgtable-arm.c
+index 3091002cb54d..b7c78aee6b06 100644
+--- a/drivers/iommu/io-pgtable-arm.c
++++ b/drivers/iommu/io-pgtable-arm.c
+@@ -304,17 +304,11 @@ static void __arm_lpae_init_pte(struct arm_lpae_io_pgtable *data,
+ {
+ 	arm_lpae_iopte pte = prot;
+ 
+-	if (data->iop.cfg.quirks & IO_PGTABLE_QUIRK_ARM_NS)
+-		pte |= ARM_LPAE_PTE_NS;
+-
+ 	if (data->iop.fmt != ARM_MALI_LPAE && lvl == ARM_LPAE_MAX_LEVELS - 1)
+ 		pte |= ARM_LPAE_PTE_TYPE_PAGE;
+ 	else
+ 		pte |= ARM_LPAE_PTE_TYPE_BLOCK;
+ 
+-	if (data->iop.fmt != ARM_MALI_LPAE)
+-		pte |= ARM_LPAE_PTE_AF;
+-	pte |= ARM_LPAE_PTE_SH_IS;
+ 	pte |= paddr_to_iopte(paddr, data);
+ 
+ 	__arm_lpae_set_pte(ptep, pte, &data->iop.cfg);
+@@ -471,9 +465,20 @@ static arm_lpae_iopte arm_lpae_prot_to_pte(struct arm_lpae_io_pgtable *data,
+ 				<< ARM_LPAE_PTE_ATTRINDX_SHIFT);
+ 	}
+ 
++	if (prot & IOMMU_CACHE)
++		pte |= ARM_LPAE_PTE_SH_IS;
++	else
++		pte |= ARM_LPAE_PTE_SH_OS;
++
+ 	if (prot & IOMMU_NOEXEC)
+ 		pte |= ARM_LPAE_PTE_XN;
+ 
++	if (data->iop.cfg.quirks & IO_PGTABLE_QUIRK_ARM_NS)
++		pte |= ARM_LPAE_PTE_NS;
++
++	if (data->iop.fmt != ARM_MALI_LPAE)
++		pte |= ARM_LPAE_PTE_AF;
++
+ 	return pte;
+ }
+ 
