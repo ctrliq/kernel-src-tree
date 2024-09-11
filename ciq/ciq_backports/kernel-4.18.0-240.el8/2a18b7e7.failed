@@ -1,0 +1,147 @@
+KVM: async_pf: Inject 'page ready' event only if 'page not present' was previously injected
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Vitaly Kuznetsov <vkuznets@redhat.com>
+commit 2a18b7e7cd8882f626316c340c6f2fca49b5fa12
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/2a18b7e7.failed
+
+'Page not present' event may or may not get injected depending on
+guest's state. If the event wasn't injected, there is no need to
+inject the corresponding 'page ready' event as the guest may get
+confused. E.g. Linux thinks that the corresponding 'page not present'
+event wasn't delivered *yet* and allocates a 'dummy entry' for it.
+This entry is never freed.
+
+Note, 'wakeup all' events have no corresponding 'page not present'
+event and always get injected.
+
+s390 seems to always be able to inject 'page not present', the
+change is effectively a nop.
+
+	Suggested-by: Vivek Goyal <vgoyal@redhat.com>
+	Signed-off-by: Vitaly Kuznetsov <vkuznets@redhat.com>
+Message-Id: <20200610175532.779793-2-vkuznets@redhat.com>
+Fixes: https://bugzilla.kernel.org/show_bug.cgi?id=208081
+	Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+(cherry picked from commit 2a18b7e7cd8882f626316c340c6f2fca49b5fa12)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kvm/x86.c
+diff --cc arch/x86/kvm/x86.c
+index 7919434f1235,290784ba63e4..000000000000
+--- a/arch/x86/kvm/x86.c
++++ b/arch/x86/kvm/x86.c
+@@@ -10260,10 -10508,10 +10260,10 @@@ bool kvm_can_do_async_pf(struct kvm_vcp
+  	 * If interrupts are off we cannot even use an artificial
+  	 * halt state.
+  	 */
+ -	return kvm_arch_interrupt_allowed(vcpu);
+ +	return kvm_x86_ops->interrupt_allowed(vcpu);
+  }
+  
+- void kvm_arch_async_page_not_present(struct kvm_vcpu *vcpu,
++ bool kvm_arch_async_page_not_present(struct kvm_vcpu *vcpu,
+  				     struct kvm_async_pf *work)
+  {
+  	struct x86_exception fault;
+@@@ -10304,16 -10557,13 +10306,24 @@@ void kvm_arch_async_page_present(struc
+  		kvm_del_async_pf_gfn(vcpu, work->arch.gfn);
+  	trace_kvm_async_pf_ready(work->arch.token, work->cr2_or_gpa);
+  
+++<<<<<<< HEAD
+ +	if (vcpu->arch.apf.msr_val & KVM_ASYNC_PF_ENABLED &&
+ +	    !apf_put_user(vcpu, KVM_PV_REASON_PAGE_READY)) {
+ +			fault.vector = PF_VECTOR;
+ +			fault.error_code_valid = true;
+ +			fault.error_code = 0;
+ +			fault.nested_page_fault = false;
+ +			fault.address = work->arch.token;
+ +			fault.async_page_fault = true;
+ +			kvm_inject_page_fault(vcpu, &fault);
+++=======
++ 	if ((work->wakeup_all || work->notpresent_injected) &&
++ 	    kvm_pv_async_pf_enabled(vcpu) &&
++ 	    !apf_put_user_ready(vcpu, work->arch.token)) {
++ 		vcpu->arch.apf.pageready_pending = true;
++ 		kvm_apic_set_irq(vcpu, &irq, NULL);
+++>>>>>>> 2a18b7e7cd88 (KVM: async_pf: Inject 'page ready' event only if 'page not present' was previously injected)
+  	}
+ -
+  	vcpu->arch.apf.halted = false;
+  	vcpu->arch.mp_state = KVM_MP_STATE_RUNNABLE;
+  }
+diff --git a/arch/s390/include/asm/kvm_host.h b/arch/s390/include/asm/kvm_host.h
+index 0a34a4f585c3..2cf6949a105d 100644
+--- a/arch/s390/include/asm/kvm_host.h
++++ b/arch/s390/include/asm/kvm_host.h
+@@ -945,7 +945,7 @@ bool kvm_arch_can_dequeue_async_page_present(struct kvm_vcpu *vcpu);
+ void kvm_arch_async_page_ready(struct kvm_vcpu *vcpu,
+ 			       struct kvm_async_pf *work);
+ 
+-void kvm_arch_async_page_not_present(struct kvm_vcpu *vcpu,
++bool kvm_arch_async_page_not_present(struct kvm_vcpu *vcpu,
+ 				     struct kvm_async_pf *work);
+ 
+ void kvm_arch_async_page_present(struct kvm_vcpu *vcpu,
+diff --git a/arch/s390/kvm/kvm-s390.c b/arch/s390/kvm/kvm-s390.c
+index c66b8556524e..8e3861518654 100644
+--- a/arch/s390/kvm/kvm-s390.c
++++ b/arch/s390/kvm/kvm-s390.c
+@@ -3638,11 +3638,13 @@ static void __kvm_inject_pfault_token(struct kvm_vcpu *vcpu, bool start_token,
+ 	}
+ }
+ 
+-void kvm_arch_async_page_not_present(struct kvm_vcpu *vcpu,
++bool kvm_arch_async_page_not_present(struct kvm_vcpu *vcpu,
+ 				     struct kvm_async_pf *work)
+ {
+ 	trace_kvm_s390_pfault_init(vcpu, work->arch.pfault_token);
+ 	__kvm_inject_pfault_token(vcpu, true, work->arch.pfault_token);
++
++	return true;
+ }
+ 
+ void kvm_arch_async_page_present(struct kvm_vcpu *vcpu,
+diff --git a/arch/x86/include/asm/kvm_host.h b/arch/x86/include/asm/kvm_host.h
+index f87084a3897d..d7361080adea 100644
+--- a/arch/x86/include/asm/kvm_host.h
++++ b/arch/x86/include/asm/kvm_host.h
+@@ -1639,7 +1639,7 @@ void kvm_make_scan_ioapic_request(struct kvm *kvm);
+ void kvm_make_scan_ioapic_request_mask(struct kvm *kvm,
+ 				       unsigned long *vcpu_bitmap);
+ 
+-void kvm_arch_async_page_not_present(struct kvm_vcpu *vcpu,
++bool kvm_arch_async_page_not_present(struct kvm_vcpu *vcpu,
+ 				     struct kvm_async_pf *work);
+ void kvm_arch_async_page_present(struct kvm_vcpu *vcpu,
+ 				 struct kvm_async_pf *work);
+* Unmerged path arch/x86/kvm/x86.c
+diff --git a/include/linux/kvm_host.h b/include/linux/kvm_host.h
+index 7f2a8e5f98c9..f4c7ef65b5d4 100644
+--- a/include/linux/kvm_host.h
++++ b/include/linux/kvm_host.h
+@@ -211,6 +211,7 @@ struct kvm_async_pf {
+ 	unsigned long addr;
+ 	struct kvm_arch_async_pf arch;
+ 	bool   wakeup_all;
++	bool notpresent_injected;
+ };
+ 
+ void kvm_clear_async_pf_completion_queue(struct kvm_vcpu *vcpu);
+diff --git a/virt/kvm/async_pf.c b/virt/kvm/async_pf.c
+index 6daf208775f6..3fd130499ee3 100644
+--- a/virt/kvm/async_pf.c
++++ b/virt/kvm/async_pf.c
+@@ -197,7 +197,7 @@ int kvm_setup_async_pf(struct kvm_vcpu *vcpu, gpa_t cr2_or_gpa,
+ 
+ 	list_add_tail(&work->queue, &vcpu->async_pf.queue);
+ 	vcpu->async_pf.queued++;
+-	kvm_arch_async_page_not_present(vcpu, work);
++	work->notpresent_injected = kvm_arch_async_page_not_present(vcpu, work);
+ 
+ 	schedule_work(&work->work);
+ 
