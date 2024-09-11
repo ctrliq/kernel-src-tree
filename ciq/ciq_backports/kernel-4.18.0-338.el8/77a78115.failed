@@ -1,0 +1,244 @@
+ice: enable receive hardware timestamping
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-338.el8
+commit-author Jacob Keller <jacob.e.keller@intel.com>
+commit 77a781155a659053f3b7e81a0ab115d27ff151cd
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-338.el8/77a78115.failed
+
+Add SIOCGHWTSTAMP and SIOCSHWTSTAMP ioctl handlers to respond to
+requests to enable timestamping support. If the request is for enabling
+Rx timestamps, set a bit in the Rx descriptors to indicate that receive
+timestamps should be reported.
+
+Hardware captures receive timestamps in the PHY which only captures part
+of the timer, and reports only 40 bits into the Rx descriptor. The upper
+32 bits represent the contents of GLTSYN_TIME_L at the point of packet
+reception, while the lower 8 bits represent the upper 8 bits of
+GLTSYN_TIME_0.
+
+The networking and PTP stack expect 64 bit timestamps in nanoseconds. To
+support this, implement some logic to extend the timestamps by using the
+full PHC time.
+
+If the Rx timestamp was captured prior to the PHC time, then the real
+timestamp is
+
+  PHC - (lower_32_bits(PHC) - timestamp)
+
+If the Rx timestamp was captured after the PHC time, then the real
+timestamp is
+
+  PHC + (timestamp - lower_32_bits(PHC))
+
+These calculations are correct as long as neither the PHC timestamp nor
+the Rx timestamps are more than 2^32-1 nanseconds old. Further, we can
+detect when the Rx timestamp is before or after the PHC as long as the
+PHC timestamp is no more than 2^31-1 nanoseconds old.
+
+In that case, we calculate the delta between the lower 32 bits of the
+PHC and the Rx timestamp. If it's larger than 2^31-1 then the Rx
+timestamp must have been captured in the past. If it's smaller, then the
+Rx timestamp must have been captured after PHC time.
+
+Add an ice_ptp_extend_32b_ts function that relies on a cached copy of
+the PHC time and implements this algorithm to calculate the proper upper
+32bits of the Rx timestamps.
+
+Cache the PHC time periodically in all of the Rx rings. This enables
+each Rx ring to simply call the extension function with a recent copy of
+the PHC time. By ensuring that the PHC time is kept up to date
+periodically, we ensure this algorithm doesn't use stale data and
+produce incorrect results.
+
+To cache the time, introduce a kworker and a kwork item to periodically
+store the Rx time. It might seem like we should use the .do_aux_work
+interface of the PTP clock. This doesn't work because all PFs must cache
+this time, but only one PF owns the PTP clock device.
+
+Thus, the ice driver will manage its own kthread instead of relying on
+the PTP do_aux_work handler.
+
+With this change, the driver can now report Rx timestamps on all
+incoming packets.
+
+	Signed-off-by: Jacob Keller <jacob.e.keller@intel.com>
+	Tested-by: Tony Brelinski <tonyx.brelinski@intel.com>
+	Signed-off-by: Tony Nguyen <anthony.l.nguyen@intel.com>
+(cherry picked from commit 77a781155a659053f3b7e81a0ab115d27ff151cd)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/intel/ice/ice_ethtool.c
+#	drivers/net/ethernet/intel/ice/ice_ptp.c
+#	drivers/net/ethernet/intel/ice/ice_ptp.h
+diff --cc drivers/net/ethernet/intel/ice/ice_ethtool.c
+index a184af55ebda,38d784742bf3..000000000000
+--- a/drivers/net/ethernet/intel/ice/ice_ethtool.c
++++ b/drivers/net/ethernet/intel/ice/ice_ethtool.c
+@@@ -3227,6 -3195,29 +3227,32 @@@ ice_set_rxfh(struct net_device *netdev
+  	return 0;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static int
++ ice_get_ts_info(struct net_device *dev, struct ethtool_ts_info *info)
++ {
++ 	struct ice_pf *pf = ice_netdev_to_pf(dev);
++ 
++ 	/* only report timestamping if PTP is enabled */
++ 	if (!test_bit(ICE_FLAG_PTP, pf->flags))
++ 		return ethtool_op_get_ts_info(dev, info);
++ 
++ 	info->so_timestamping = SOF_TIMESTAMPING_RX_SOFTWARE |
++ 				SOF_TIMESTAMPING_SOFTWARE |
++ 				SOF_TIMESTAMPING_RX_HARDWARE |
++ 				SOF_TIMESTAMPING_RAW_HARDWARE;
++ 
++ 	info->phc_index = ice_get_ptp_clock_index(pf);
++ 
++ 	info->tx_types = BIT(HWTSTAMP_TX_OFF);
++ 
++ 	info->rx_filters = BIT(HWTSTAMP_FILTER_NONE) | BIT(HWTSTAMP_FILTER_ALL);
++ 
++ 	return 0;
++ }
++ 
+++>>>>>>> 77a781155a65 (ice: enable receive hardware timestamping)
+  /**
+   * ice_get_max_txq - return the maximum number of Tx queues for in a PF
+   * @pf: PF structure
+* Unmerged path drivers/net/ethernet/intel/ice/ice_ptp.c
+* Unmerged path drivers/net/ethernet/intel/ice/ice_ptp.h
+diff --git a/drivers/net/ethernet/intel/ice/ice_base.c b/drivers/net/ethernet/intel/ice/ice_base.c
+index 952e41a1e001..0f0cc0575e4b 100644
+--- a/drivers/net/ethernet/intel/ice/ice_base.c
++++ b/drivers/net/ethernet/intel/ice/ice_base.c
+@@ -392,9 +392,10 @@ int ice_setup_rx_ctx(struct ice_ring *ring)
+ 	 * of same priority
+ 	 */
+ 	if (vsi->type != ICE_VSI_VF)
+-		ice_write_qrxflxp_cntxt(hw, pf_q, rxdid, 0x3);
++		ice_write_qrxflxp_cntxt(hw, pf_q, rxdid, 0x3, true);
+ 	else
+-		ice_write_qrxflxp_cntxt(hw, pf_q, ICE_RXDID_LEGACY_1, 0x3);
++		ice_write_qrxflxp_cntxt(hw, pf_q, ICE_RXDID_LEGACY_1, 0x3,
++					false);
+ 
+ 	/* Absolute queue number out of 2K needs to be passed */
+ 	err = ice_write_rxq_ctx(hw, &rlan_ctx, pf_q);
+* Unmerged path drivers/net/ethernet/intel/ice/ice_ethtool.c
+diff --git a/drivers/net/ethernet/intel/ice/ice_lib.c b/drivers/net/ethernet/intel/ice/ice_lib.c
+index 35a2380e512a..5f089e67508a 100644
+--- a/drivers/net/ethernet/intel/ice/ice_lib.c
++++ b/drivers/net/ethernet/intel/ice/ice_lib.c
+@@ -1660,9 +1660,11 @@ void ice_vsi_cfg_frame_size(struct ice_vsi *vsi)
+  * @pf_q: index of the Rx queue in the PF's queue space
+  * @rxdid: flexible descriptor RXDID
+  * @prio: priority for the RXDID for this queue
++ * @ena_ts: true to enable timestamp and false to disable timestamp
+  */
+ void
+-ice_write_qrxflxp_cntxt(struct ice_hw *hw, u16 pf_q, u32 rxdid, u32 prio)
++ice_write_qrxflxp_cntxt(struct ice_hw *hw, u16 pf_q, u32 rxdid, u32 prio,
++			bool ena_ts)
+ {
+ 	int regval = rd32(hw, QRXFLXP_CNTXT(pf_q));
+ 
+@@ -1677,6 +1679,10 @@ ice_write_qrxflxp_cntxt(struct ice_hw *hw, u16 pf_q, u32 rxdid, u32 prio)
+ 	regval |= (prio << QRXFLXP_CNTXT_RXDID_PRIO_S) &
+ 		QRXFLXP_CNTXT_RXDID_PRIO_M;
+ 
++	if (ena_ts)
++		/* Enable TimeSync on this queue */
++		regval |= QRXFLXP_CNTXT_TS_M;
++
+ 	wr32(hw, QRXFLXP_CNTXT(pf_q), regval);
+ }
+ 
+diff --git a/drivers/net/ethernet/intel/ice/ice_lib.h b/drivers/net/ethernet/intel/ice/ice_lib.h
+index 3da17895a2b1..a8a70ac85247 100644
+--- a/drivers/net/ethernet/intel/ice/ice_lib.h
++++ b/drivers/net/ethernet/intel/ice/ice_lib.h
+@@ -73,7 +73,8 @@ int ice_vsi_rebuild(struct ice_vsi *vsi, bool init_vsi);
+ bool ice_is_reset_in_progress(unsigned long *state);
+ 
+ void
+-ice_write_qrxflxp_cntxt(struct ice_hw *hw, u16 pf_q, u32 rxdid, u32 prio);
++ice_write_qrxflxp_cntxt(struct ice_hw *hw, u16 pf_q, u32 rxdid, u32 prio,
++			bool ena_ts);
+ 
+ void ice_vsi_dis_irq(struct ice_vsi *vsi);
+ 
+diff --git a/drivers/net/ethernet/intel/ice/ice_main.c b/drivers/net/ethernet/intel/ice/ice_main.c
+index 0510fcf5eb90..4d72560ff639 100644
+--- a/drivers/net/ethernet/intel/ice/ice_main.c
++++ b/drivers/net/ethernet/intel/ice/ice_main.c
+@@ -6181,6 +6181,27 @@ static int ice_change_mtu(struct net_device *netdev, int new_mtu)
+ 	return 0;
+ }
+ 
++/**
++ * ice_do_ioctl - Access the hwtstamp interface
++ * @netdev: network interface device structure
++ * @ifr: interface request data
++ * @cmd: ioctl command
++ */
++static int ice_do_ioctl(struct net_device *netdev, struct ifreq *ifr, int cmd)
++{
++	struct ice_netdev_priv *np = netdev_priv(netdev);
++	struct ice_pf *pf = np->vsi->back;
++
++	switch (cmd) {
++	case SIOCGHWTSTAMP:
++		return ice_ptp_get_ts_config(pf, ifr);
++	case SIOCSHWTSTAMP:
++		return ice_ptp_set_ts_config(pf, ifr);
++	default:
++		return -EOPNOTSUPP;
++	}
++}
++
+ /**
+  * ice_aq_str - convert AQ err code to a string
+  * @aq_err: the AQ error code to convert
+@@ -6902,6 +6923,7 @@ static const struct net_device_ops ice_netdev_ops = {
+ 	.ndo_change_mtu = ice_change_mtu,
+ 	.ndo_get_stats64 = ice_get_stats64,
+ 	.ndo_set_tx_maxrate = ice_set_tx_maxrate,
++	.ndo_do_ioctl = ice_do_ioctl,
+ 	.ndo_set_vf_spoofchk = ice_set_vf_spoofchk,
+ 	.ndo_set_vf_mac = ice_set_vf_mac,
+ 	.ndo_get_vf_config = ice_get_vf_cfg,
+* Unmerged path drivers/net/ethernet/intel/ice/ice_ptp.c
+* Unmerged path drivers/net/ethernet/intel/ice/ice_ptp.h
+diff --git a/drivers/net/ethernet/intel/ice/ice_txrx.h b/drivers/net/ethernet/intel/ice/ice_txrx.h
+index 90957a75ab37..b5ea77241421 100644
+--- a/drivers/net/ethernet/intel/ice/ice_txrx.h
++++ b/drivers/net/ethernet/intel/ice/ice_txrx.h
+@@ -308,6 +308,8 @@ struct ice_ring {
+ 	u32 txq_teid;			/* Added Tx queue TEID */
+ 	u16 rx_buf_len;
+ 	u8 dcb_tc;			/* Traffic class of ring */
++	u64 cached_phctime;
++	u8 ptp_rx:1;
+ } ____cacheline_internodealigned_in_smp;
+ 
+ static inline bool ice_ring_uses_build_skb(struct ice_ring *ring)
+diff --git a/drivers/net/ethernet/intel/ice/ice_txrx_lib.c b/drivers/net/ethernet/intel/ice/ice_txrx_lib.c
+index 02b12736ea80..bc1e3be0fbb7 100644
+--- a/drivers/net/ethernet/intel/ice/ice_txrx_lib.c
++++ b/drivers/net/ethernet/intel/ice/ice_txrx_lib.c
+@@ -174,6 +174,9 @@ ice_process_skb_fields(struct ice_ring *rx_ring,
+ 	skb->protocol = eth_type_trans(skb, rx_ring->netdev);
+ 
+ 	ice_rx_csum(rx_ring, skb, rx_desc, ptype);
++
++	if (rx_ring->ptp_rx)
++		ice_ptp_rx_hwtstamp(rx_ring, rx_desc, skb);
+ }
+ 
+ /**
