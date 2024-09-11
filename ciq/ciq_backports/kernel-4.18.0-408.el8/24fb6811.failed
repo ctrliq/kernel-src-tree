@@ -1,0 +1,229 @@
+net/smc: retrieve v2 gid from IB device
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-408.el8
+commit-author Karsten Graul <kgraul@linux.ibm.com>
+commit 24fb68111d4509524b483b2577f1b20a24f5fdfd
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-408.el8/24fb6811.failed
+
+In smc_ib.c, scan for RoCE devices that support UDP encapsulation.
+Find an eligible device and check that there is a route to the
+remote peer.
+
+	Signed-off-by: Karsten Graul <kgraul@linux.ibm.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 24fb68111d4509524b483b2577f1b20a24f5fdfd)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/smc/smc_ib.c
+diff --cc net/smc/smc_ib.c
+index 3c1511960a11,d15bacbd73e0..000000000000
+--- a/net/smc/smc_ib.c
++++ b/net/smc/smc_ib.c
+@@@ -215,11 -218,57 +223,56 @@@ out
+  	return -ENOENT;
+  }
+  
++ static int smc_ib_determine_gid_rcu(const struct net_device *ndev,
++ 				    const struct ib_gid_attr *attr,
++ 				    u8 gid[], u8 *sgid_index,
++ 				    struct smc_init_info_smcrv2 *smcrv2)
++ {
++ 	if (!smcrv2 && attr->gid_type == IB_GID_TYPE_ROCE) {
++ 		if (gid)
++ 			memcpy(gid, &attr->gid, SMC_GID_SIZE);
++ 		if (sgid_index)
++ 			*sgid_index = attr->index;
++ 		return 0;
++ 	}
++ 	if (smcrv2 && attr->gid_type == IB_GID_TYPE_ROCE_UDP_ENCAP &&
++ 	    smc_ib_gid_to_ipv4((u8 *)&attr->gid) != cpu_to_be32(INADDR_NONE)) {
++ 		struct in_device *in_dev = __in_dev_get_rcu(ndev);
++ 		const struct in_ifaddr *ifa;
++ 		bool subnet_match = false;
++ 
++ 		if (!in_dev)
++ 			goto out;
++ 		in_dev_for_each_ifa_rcu(ifa, in_dev) {
++ 			if (!inet_ifa_match(smcrv2->saddr, ifa))
++ 				continue;
++ 			subnet_match = true;
++ 			break;
++ 		}
++ 		if (!subnet_match)
++ 			goto out;
++ 		if (smcrv2->daddr && smc_ib_find_route(smcrv2->saddr,
++ 						       smcrv2->daddr,
++ 						       smcrv2->nexthop_mac,
++ 						       &smcrv2->uses_gateway))
++ 			goto out;
++ 
++ 		if (gid)
++ 			memcpy(gid, &attr->gid, SMC_GID_SIZE);
++ 		if (sgid_index)
++ 			*sgid_index = attr->index;
++ 		return 0;
++ 	}
++ out:
++ 	return -ENODEV;
++ }
++ 
+  /* determine the gid for an ib-device port and vlan id */
+  int smc_ib_determine_gid(struct smc_ib_device *smcibdev, u8 ibport,
+- 			 unsigned short vlan_id, u8 gid[], u8 *sgid_index)
++ 			 unsigned short vlan_id, u8 gid[], u8 *sgid_index,
++ 			 struct smc_init_info_smcrv2 *smcrv2)
+  {
+  	const struct ib_gid_attr *attr;
+ -	const struct net_device *ndev;
+  	int i;
+  
+  	for (i = 0; i < smcibdev->pattr[ibport - 1].gid_tbl_len; i++) {
+@@@ -227,18 -276,20 +280,33 @@@
+  		if (IS_ERR(attr))
+  			continue;
+  
+++<<<<<<< HEAD
+ +		if (attr->ndev &&
+ +		    ((!vlan_id && !is_vlan_dev(attr->ndev)) ||
+ +		     (vlan_id && is_vlan_dev(attr->ndev) &&
+ +		      vlan_dev_vlan_id(attr->ndev) == vlan_id)) &&
+ +		    attr->gid_type == IB_GID_TYPE_ROCE) {
+ +			if (gid)
+ +				memcpy(gid, &attr->gid, SMC_GID_SIZE);
+ +			if (sgid_index)
+ +				*sgid_index = attr->index;
+ +			rdma_put_gid_attr(attr);
+ +			return 0;
+++=======
++ 		rcu_read_lock();
++ 		ndev = rdma_read_gid_attr_ndev_rcu(attr);
++ 		if (!IS_ERR(ndev) &&
++ 		    ((!vlan_id && !is_vlan_dev(ndev)) ||
++ 		     (vlan_id && is_vlan_dev(ndev) &&
++ 		      vlan_dev_vlan_id(ndev) == vlan_id))) {
++ 			if (!smc_ib_determine_gid_rcu(ndev, attr, gid,
++ 						      sgid_index, smcrv2)) {
++ 				rcu_read_unlock();
++ 				rdma_put_gid_attr(attr);
++ 				return 0;
++ 			}
+++>>>>>>> 24fb68111d45 (net/smc: retrieve v2 gid from IB device)
+  		}
+ -		rcu_read_unlock();
+  		rdma_put_gid_attr(attr);
+  	}
+  	return -ENODEV;
+diff --git a/net/smc/smc_core.c b/net/smc/smc_core.c
+index 9b543e7e0be7..e23581196cdf 100644
+--- a/net/smc/smc_core.c
++++ b/net/smc/smc_core.c
+@@ -714,7 +714,9 @@ int smcr_link_init(struct smc_link_group *lgr, struct smc_link *lnk,
+ 	lnk->psn_initial = rndvec[0] + (rndvec[1] << 8) +
+ 		(rndvec[2] << 16);
+ 	rc = smc_ib_determine_gid(lnk->smcibdev, lnk->ibport,
+-				  ini->vlan_id, lnk->gid, &lnk->sgid_index);
++				  ini->vlan_id, lnk->gid, &lnk->sgid_index,
++				  lgr->smc_version == SMC_V2 ?
++						  &ini->smcrv2 : NULL);
+ 	if (rc)
+ 		goto out;
+ 	rc = smc_llc_link_init(lnk);
+* Unmerged path net/smc/smc_ib.c
+diff --git a/net/smc/smc_ib.h b/net/smc/smc_ib.h
+index c55cbd7be67a..07585937370e 100644
+--- a/net/smc/smc_ib.h
++++ b/net/smc/smc_ib.h
+@@ -101,7 +101,8 @@ void smc_ib_sync_sg_for_device(struct smc_link *lnk,
+ 			       struct smc_buf_desc *buf_slot,
+ 			       enum dma_data_direction data_direction);
+ int smc_ib_determine_gid(struct smc_ib_device *smcibdev, u8 ibport,
+-			 unsigned short vlan_id, u8 gid[], u8 *sgid_index);
++			 unsigned short vlan_id, u8 gid[], u8 *sgid_index,
++			 struct smc_init_info_smcrv2 *smcrv2);
+ int smc_ib_find_route(__be32 saddr, __be32 daddr,
+ 		      u8 nexthop_mac[], u8 *uses_gateway);
+ bool smc_ib_is_valid_local_systemid(void);
+diff --git a/net/smc/smc_pnet.c b/net/smc/smc_pnet.c
+index 3e76efd3e560..bb24ca4e74e3 100644
+--- a/net/smc/smc_pnet.c
++++ b/net/smc/smc_pnet.c
+@@ -953,6 +953,26 @@ static int smc_pnet_find_ndev_pnetid_by_table(struct net_device *ndev,
+ 	return rc;
+ }
+ 
++static int smc_pnet_determine_gid(struct smc_ib_device *ibdev, int i,
++				  struct smc_init_info *ini)
++{
++	if (!ini->check_smcrv2 &&
++	    !smc_ib_determine_gid(ibdev, i, ini->vlan_id, ini->ib_gid, NULL,
++				  NULL)) {
++		ini->ib_dev = ibdev;
++		ini->ib_port = i;
++		return 0;
++	}
++	if (ini->check_smcrv2 &&
++	    !smc_ib_determine_gid(ibdev, i, ini->vlan_id, ini->smcrv2.ib_gid_v2,
++				  NULL, &ini->smcrv2)) {
++		ini->smcrv2.ib_dev_v2 = ibdev;
++		ini->smcrv2.ib_port_v2 = i;
++		return 0;
++	}
++	return -ENODEV;
++}
++
+ /* find a roce device for the given pnetid */
+ static void _smc_pnet_find_roce_by_pnetid(u8 *pnet_id,
+ 					  struct smc_init_info *ini,
+@@ -961,7 +981,6 @@ static void _smc_pnet_find_roce_by_pnetid(u8 *pnet_id,
+ 	struct smc_ib_device *ibdev;
+ 	int i;
+ 
+-	ini->ib_dev = NULL;
+ 	mutex_lock(&smc_ib_devices.mutex);
+ 	list_for_each_entry(ibdev, &smc_ib_devices.list, list) {
+ 		if (ibdev == known_dev)
+@@ -971,12 +990,9 @@ static void _smc_pnet_find_roce_by_pnetid(u8 *pnet_id,
+ 				continue;
+ 			if (smc_pnet_match(ibdev->pnetid[i - 1], pnet_id) &&
+ 			    smc_ib_port_active(ibdev, i) &&
+-			    !test_bit(i - 1, ibdev->ports_going_away) &&
+-			    !smc_ib_determine_gid(ibdev, i, ini->vlan_id,
+-						  ini->ib_gid, NULL)) {
+-				ini->ib_dev = ibdev;
+-				ini->ib_port = i;
+-				goto out;
++			    !test_bit(i - 1, ibdev->ports_going_away)) {
++				if (!smc_pnet_determine_gid(ibdev, i, ini))
++					goto out;
+ 			}
+ 		}
+ 	}
+@@ -1016,12 +1032,9 @@ static void smc_pnet_find_rdma_dev(struct net_device *netdev,
+ 			dev_put(ndev);
+ 			if (netdev == ndev &&
+ 			    smc_ib_port_active(ibdev, i) &&
+-			    !test_bit(i - 1, ibdev->ports_going_away) &&
+-			    !smc_ib_determine_gid(ibdev, i, ini->vlan_id,
+-						  ini->ib_gid, NULL)) {
+-				ini->ib_dev = ibdev;
+-				ini->ib_port = i;
+-				break;
++			    !test_bit(i - 1, ibdev->ports_going_away)) {
++				if (!smc_pnet_determine_gid(ibdev, i, ini))
++					break;
+ 			}
+ 		}
+ 	}
+@@ -1083,8 +1096,6 @@ void smc_pnet_find_roce_resource(struct sock *sk, struct smc_init_info *ini)
+ {
+ 	struct dst_entry *dst = sk_dst_get(sk);
+ 
+-	ini->ib_dev = NULL;
+-	ini->ib_port = 0;
+ 	if (!dst)
+ 		goto out;
+ 	if (!dst->dev)
