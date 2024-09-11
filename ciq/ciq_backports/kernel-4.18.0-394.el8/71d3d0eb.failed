@@ -1,0 +1,129 @@
+SUNRPC: Convert rpc_client refcount to use refcount_t
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-394.el8
+commit-author Trond Myklebust <trond.myklebust@hammerspace.com>
+commit 71d3d0ebc894294ef9454e45a3ac2e9ba60b3351
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-394.el8/71d3d0eb.failed
+
+There are now tools in the refcount library that allow us to convert the
+client shutdown code.
+
+	Reported-by: Xiyu Yang <xiyuyang19@fudan.edu.cn>
+	Signed-off-by: Trond Myklebust <trond.myklebust@hammerspace.com>
+	Signed-off-by: Anna Schumaker <Anna.Schumaker@Netapp.com>
+(cherry picked from commit 71d3d0ebc894294ef9454e45a3ac2e9ba60b3351)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/sunrpc/clnt.c
+diff --cc net/sunrpc/clnt.c
+index 62fc1fdcd969,a5b7f6e34d15..000000000000
+--- a/net/sunrpc/clnt.c
++++ b/net/sunrpc/clnt.c
+@@@ -1071,21 -1076,24 +1069,42 @@@ void rpc_task_set_transport(struct rpc_
+  static
+  void rpc_task_set_client(struct rpc_task *task, struct rpc_clnt *clnt)
+  {
+++<<<<<<< HEAD
+ +	rpc_task_set_transport(task, clnt);
+ +	task->tk_client = clnt;
+ +	atomic_inc(&clnt->cl_count);
+ +	if (clnt->cl_softrtry)
+ +		task->tk_flags |= RPC_TASK_SOFT;
+ +	if (clnt->cl_softerr)
+ +		task->tk_flags |= RPC_TASK_TIMEOUT;
+ +	if (clnt->cl_noretranstimeo)
+ +		task->tk_flags |= RPC_TASK_NO_RETRANS_TIMEOUT;
+ +	if (atomic_read(&clnt->cl_swapper))
+ +		task->tk_flags |= RPC_TASK_SWAPPER;
+ +	/* Add to the client's list of all tasks */
+ +	spin_lock(&clnt->cl_lock);
+ +	list_add_tail(&task->tk_task, &clnt->cl_tasks);
+ +	spin_unlock(&clnt->cl_lock);
+++=======
++ 
++ 	if (clnt != NULL) {
++ 		rpc_task_set_transport(task, clnt);
++ 		task->tk_client = clnt;
++ 		refcount_inc(&clnt->cl_count);
++ 		if (clnt->cl_softrtry)
++ 			task->tk_flags |= RPC_TASK_SOFT;
++ 		if (clnt->cl_softerr)
++ 			task->tk_flags |= RPC_TASK_TIMEOUT;
++ 		if (clnt->cl_noretranstimeo)
++ 			task->tk_flags |= RPC_TASK_NO_RETRANS_TIMEOUT;
++ 		if (atomic_read(&clnt->cl_swapper))
++ 			task->tk_flags |= RPC_TASK_SWAPPER;
++ 		/* Add to the client's list of all tasks */
++ 		spin_lock(&clnt->cl_lock);
++ 		list_add_tail(&task->tk_task, &clnt->cl_tasks);
++ 		spin_unlock(&clnt->cl_lock);
++ 	}
+++>>>>>>> 71d3d0ebc894 (SUNRPC: Convert rpc_client refcount to use refcount_t)
+  }
+  
+  static void
+diff --git a/include/linux/sunrpc/clnt.h b/include/linux/sunrpc/clnt.h
+index 02e7a5863d28..2f3ddcada5fe 100644
+--- a/include/linux/sunrpc/clnt.h
++++ b/include/linux/sunrpc/clnt.h
+@@ -14,6 +14,7 @@
+ #include <linux/socket.h>
+ #include <linux/in.h>
+ #include <linux/in6.h>
++#include <linux/refcount.h>
+ 
+ #include <linux/sunrpc/msg_prot.h>
+ #include <linux/sunrpc/sched.h>
+@@ -34,7 +35,7 @@ struct rpc_inode;
+  * The high-level client handle
+  */
+ struct rpc_clnt {
+-	atomic_t		cl_count;	/* Number of references */
++	refcount_t		cl_count;	/* Number of references */
+ 	unsigned int		cl_clid;	/* client id */
+ 	struct list_head	cl_clients;	/* Global list of clients */
+ 	struct list_head	cl_tasks;	/* List of tasks */
+diff --git a/net/sunrpc/auth_gss/gss_rpc_upcall.c b/net/sunrpc/auth_gss/gss_rpc_upcall.c
+index ca1ce053b116..7854aa910bba 100644
+--- a/net/sunrpc/auth_gss/gss_rpc_upcall.c
++++ b/net/sunrpc/auth_gss/gss_rpc_upcall.c
+@@ -173,7 +173,7 @@ static struct rpc_clnt *get_gssp_clnt(struct sunrpc_net *sn)
+ 	mutex_lock(&sn->gssp_lock);
+ 	clnt = sn->gssp_clnt;
+ 	if (clnt)
+-		atomic_inc(&clnt->cl_count);
++		refcount_inc(&clnt->cl_count);
+ 	mutex_unlock(&sn->gssp_lock);
+ 	return clnt;
+ }
+* Unmerged path net/sunrpc/clnt.c
+diff --git a/net/sunrpc/debugfs.c b/net/sunrpc/debugfs.c
+index 4833b2ad0d68..eb49a2366a1c 100644
+--- a/net/sunrpc/debugfs.c
++++ b/net/sunrpc/debugfs.c
+@@ -90,7 +90,7 @@ static int tasks_open(struct inode *inode, struct file *filp)
+ 		struct seq_file *seq = filp->private_data;
+ 		struct rpc_clnt *clnt = seq->private = inode->i_private;
+ 
+-		if (!atomic_inc_not_zero(&clnt->cl_count)) {
++		if (!refcount_inc_not_zero(&clnt->cl_count)) {
+ 			seq_release(inode, filp);
+ 			ret = -EINVAL;
+ 		}
+diff --git a/net/sunrpc/rpc_pipe.c b/net/sunrpc/rpc_pipe.c
+index 3429ae27d56a..64c90e31e191 100644
+--- a/net/sunrpc/rpc_pipe.c
++++ b/net/sunrpc/rpc_pipe.c
+@@ -429,7 +429,7 @@ rpc_info_open(struct inode *inode, struct file *file)
+ 		spin_lock(&file->f_path.dentry->d_lock);
+ 		if (!d_unhashed(file->f_path.dentry))
+ 			clnt = RPC_I(inode)->private;
+-		if (clnt != NULL && atomic_inc_not_zero(&clnt->cl_count)) {
++		if (clnt != NULL && refcount_inc_not_zero(&clnt->cl_count)) {
+ 			spin_unlock(&file->f_path.dentry->d_lock);
+ 			m->private = clnt;
+ 		} else {
