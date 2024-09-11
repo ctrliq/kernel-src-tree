@@ -149,6 +149,8 @@ $(OUTPUT)%.skel.h: $(OUTPUT)%.bpf.o $(BPFTOOL_BOOTSTRAP)
 
 $(OUTPUT)prog.o: $(OUTPUT)profiler.skel.h
 
+$(OUTPUT)pids.o: $(OUTPUT)pid_iter.skel.h
+
 endif
 endif
 
