@@ -14,6 +14,8 @@
 
 #include <linux/pinctrl/machine.h>
 
+#include <linux/types.h>
+
 struct pinctrl_dev;
 struct seq_file;
 
