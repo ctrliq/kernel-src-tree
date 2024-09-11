@@ -1,0 +1,193 @@
+s390/dasd: add copy pair swap capability
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-448.el8
+commit-author Stefan Haberland <sth@linux.ibm.com>
+commit 413862caad6fe7fddec639219bccfdab60333551
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-448.el8/413862ca.failed
+
+In case of errors or misbehaviour of the primary device a controlled
+failover to one of the configured secondary devices needs to be
+performed.
+
+The swap processing stops I/O on the primary device, all requests are
+re-queued to the blocklayer queue, the entries in the copy relation are
+swapped and finally the link to the blockdevice is moved from primary to
+secondary dasd device.
+After this, the secondary becomes the new primary device and I/O is
+restarted on that device.
+
+	Signed-off-by: Stefan Haberland <sth@linux.ibm.com>
+	Reviewed-by: Jan Hoeppner <hoeppner@linux.ibm.com>
+Link: https://lore.kernel.org/r/20220920192616.808070-5-sth@linux.ibm.com
+	Signed-off-by: Jens Axboe <axboe@kernel.dk>
+(cherry picked from commit 413862caad6fe7fddec639219bccfdab60333551)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/s390/block/dasd_int.h
+diff --cc drivers/s390/block/dasd_int.h
+index 6d3da8826fbf,3c55c29155ef..000000000000
+--- a/drivers/s390/block/dasd_int.h
++++ b/drivers/s390/block/dasd_int.h
+@@@ -687,8 -682,7 +688,12 @@@ struct dasd_queue 
+  #define DASD_STOPPED_PENDING 4         /* long busy */
+  #define DASD_STOPPED_DC_WAIT 8         /* disconnected, wait */
+  #define DASD_STOPPED_SU      16        /* summary unit check handling */
+++<<<<<<< HEAD
+ +#define DASD_STOPPED_PM      32        /* pm state transition */
+ +#define DASD_UNRESUMED_PM    64        /* pm resume failed state */
+++=======
++ #define DASD_STOPPED_PPRC    32        /* PPRC swap */
+++>>>>>>> 413862caad6f (s390/dasd: add copy pair swap capability)
+  #define DASD_STOPPED_NOSPC   128       /* no space left */
+  
+  /* per device flags */
+diff --git a/drivers/s390/block/dasd.c b/drivers/s390/block/dasd.c
+index 0f349c17b1b0..bc6177f37572 100644
+--- a/drivers/s390/block/dasd.c
++++ b/drivers/s390/block/dasd.c
+@@ -3985,7 +3985,7 @@ EXPORT_SYMBOL_GPL(dasd_generic_space_avail);
+ /*
+  * clear active requests and requeue them to block layer if possible
+  */
+-static int dasd_generic_requeue_all_requests(struct dasd_device *device)
++int dasd_generic_requeue_all_requests(struct dasd_device *device)
+ {
+ 	struct list_head requeue_queue;
+ 	struct dasd_ccw_req *cqr, *n;
+@@ -4059,6 +4059,7 @@ static int dasd_generic_requeue_all_requests(struct dasd_device *device)
+ 	dasd_schedule_device_bh(device);
+ 	return rc;
+ }
++EXPORT_SYMBOL_GPL(dasd_generic_requeue_all_requests);
+ 
+ static void do_requeue_requests(struct work_struct *work)
+ {
+diff --git a/drivers/s390/block/dasd_devmap.c b/drivers/s390/block/dasd_devmap.c
+index d163f59f35c2..860da18e202d 100644
+--- a/drivers/s390/block/dasd_devmap.c
++++ b/drivers/s390/block/dasd_devmap.c
+@@ -937,6 +937,7 @@ void dasd_add_link_to_gendisk(struct gendisk *gdp, struct dasd_device *device)
+ 	gdp->private_data = devmap;
+ 	spin_unlock(&dasd_devmap_lock);
+ }
++EXPORT_SYMBOL(dasd_add_link_to_gendisk);
+ 
+ struct dasd_device *dasd_device_from_gendisk(struct gendisk *gdp)
+ {
+diff --git a/drivers/s390/block/dasd_eckd.c b/drivers/s390/block/dasd_eckd.c
+index 0181191630d1..6296153f51a3 100644
+--- a/drivers/s390/block/dasd_eckd.c
++++ b/drivers/s390/block/dasd_eckd.c
+@@ -6218,6 +6218,99 @@ static int dasd_hosts_print(struct dasd_device *device, struct seq_file *m)
+ 	return 0;
+ }
+ 
++static struct dasd_device
++*copy_relation_find_device(struct dasd_copy_relation *copy,
++			   char *busid)
++{
++	int i;
++
++	for (i = 0; i < DASD_CP_ENTRIES; i++) {
++		if (copy->entry[i].configured &&
++		    strncmp(copy->entry[i].busid, busid, DASD_BUS_ID_SIZE) == 0)
++			return copy->entry[i].device;
++	}
++	return NULL;
++}
++
++/*
++ * set the new active/primary device
++ */
++static void copy_pair_set_active(struct dasd_copy_relation *copy, char *new_busid,
++				 char *old_busid)
++{
++	int i;
++
++	for (i = 0; i < DASD_CP_ENTRIES; i++) {
++		if (copy->entry[i].configured &&
++		    strncmp(copy->entry[i].busid, new_busid,
++			    DASD_BUS_ID_SIZE) == 0) {
++			copy->active = &copy->entry[i];
++			copy->entry[i].primary = true;
++		} else if (copy->entry[i].configured &&
++			   strncmp(copy->entry[i].busid, old_busid,
++				   DASD_BUS_ID_SIZE) == 0) {
++			copy->entry[i].primary = false;
++		}
++	}
++}
++
++/*
++ * The function will swap the role of a given copy pair.
++ * During the swap operation the relation of the blockdevice is disconnected
++ * from the old primary and connected to the new.
++ *
++ * IO is paused on the block queue before swap and may be resumed afterwards.
++ */
++static int dasd_eckd_copy_pair_swap(struct dasd_device *device, char *prim_busid,
++				    char *sec_busid)
++{
++	struct dasd_device *primary, *secondary;
++	struct dasd_copy_relation *copy;
++	struct dasd_block *block;
++	struct gendisk *gdp;
++
++	copy = device->copy;
++	if (!copy)
++		return DASD_COPYPAIRSWAP_INVALID;
++	primary = copy->active->device;
++	if (!primary)
++		return DASD_COPYPAIRSWAP_INVALID;
++	/* double check if swap has correct primary */
++	if (strncmp(dev_name(&primary->cdev->dev), prim_busid, DASD_BUS_ID_SIZE) != 0)
++		return DASD_COPYPAIRSWAP_PRIMARY;
++
++	secondary = copy_relation_find_device(copy, sec_busid);
++	if (!secondary)
++		return DASD_COPYPAIRSWAP_SECONDARY;
++
++	/*
++	 * usually the device should be quiesced for swap
++	 * for paranoia stop device and requeue requests again
++	 */
++	dasd_device_set_stop_bits(primary, DASD_STOPPED_PPRC);
++	dasd_device_set_stop_bits(secondary, DASD_STOPPED_PPRC);
++	dasd_generic_requeue_all_requests(primary);
++
++	/* swap DASD internal device <> block assignment */
++	block = primary->block;
++	primary->block = NULL;
++	secondary->block = block;
++	block->base = secondary;
++	/* set new primary device in COPY relation */
++	copy_pair_set_active(copy, sec_busid, prim_busid);
++
++	/* swap blocklayer device link */
++	gdp = block->gdp;
++	dasd_add_link_to_gendisk(gdp, secondary);
++
++	/* re-enable device */
++	dasd_device_remove_stop_bits(primary, DASD_STOPPED_PPRC);
++	dasd_device_remove_stop_bits(secondary, DASD_STOPPED_PPRC);
++	dasd_schedule_device_bh(secondary);
++
++	return DASD_COPYPAIRSWAP_SUCCESS;
++}
++
+ /*
+  * Perform Subsystem Function - Peer-to-Peer Remote Copy Extended Query
+  */
+@@ -6907,6 +7000,7 @@ static struct dasd_discipline dasd_eckd_discipline = {
+ 	.ese_read = dasd_eckd_ese_read,
+ 	.pprc_status = dasd_eckd_query_pprc_status,
+ 	.pprc_enabled = dasd_eckd_pprc_enabled,
++	.copy_pair_swap = dasd_eckd_copy_pair_swap,
+ };
+ 
+ static int __init
+* Unmerged path drivers/s390/block/dasd_int.h
