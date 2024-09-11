@@ -1,0 +1,151 @@
+RDMA/mlx5: Split mlx5_ib_update_xlt() into ODP and non-ODP cases
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-331.el8
+commit-author Jason Gunthorpe <jgg@nvidia.com>
+commit f1eaac37da20823816af274d69a9eed7444e9822
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-331.el8/f1eaac37.failed
+
+Mixing these together is just a mess, make a dedicated version,
+mlx5_ib_update_mr_pas(), which directly loads the whole MTT for a non-ODP
+MR.
+
+The split out version can trivially use a simple loop with
+rdma_for_each_block() which allows using the core code to compute the MR
+pages and avoids seeking in the SGL list after each chunk as the
+__mlx5_ib_populate_pas() call required.
+
+Significantly speeds loading large MTTs.
+
+Link: https://lore.kernel.org/r/20201026132314.1336717-5-leon@kernel.org
+	Signed-off-by: Leon Romanovsky <leonro@nvidia.com>
+	Signed-off-by: Jason Gunthorpe <jgg@nvidia.com>
+(cherry picked from commit f1eaac37da20823816af274d69a9eed7444e9822)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/infiniband/hw/mlx5/mlx5_ib.h
+#	drivers/infiniband/hw/mlx5/mr.c
+diff --cc drivers/infiniband/hw/mlx5/mlx5_ib.h
+index 67ae2266dca9,aadd43425a58..000000000000
+--- a/drivers/infiniband/hw/mlx5/mlx5_ib.h
++++ b/drivers/infiniband/hw/mlx5/mlx5_ib.h
+@@@ -1312,9 -1229,9 +1312,15 @@@ int mlx5_query_mad_ifc_port(struct ib_d
+  			    struct ib_port_attr *props);
+  int mlx5_ib_query_port(struct ib_device *ibdev, u8 port,
+  		       struct ib_port_attr *props);
+++<<<<<<< HEAD
+ +void __mlx5_ib_populate_pas(struct mlx5_ib_dev *dev, struct ib_umem *umem,
+ +			    int page_shift, size_t offset, size_t num_pages,
+ +			    __be64 *pas, int access_flags);
+++=======
++ void mlx5_ib_cont_pages(struct ib_umem *umem, u64 addr,
++ 			unsigned long max_page_shift,
++ 			int *shift);
+++>>>>>>> f1eaac37da20 (RDMA/mlx5: Split mlx5_ib_update_xlt() into ODP and non-ODP cases)
+  void mlx5_ib_populate_pas(struct ib_umem *umem, size_t page_size, __be64 *pas,
+  			  u64 access_flags);
+  void mlx5_ib_copy_pas(u64 *old, u64 *new, int step, int num);
+diff --cc drivers/infiniband/hw/mlx5/mr.c
+index b6fe790d60f0,3fa3809c2660..000000000000
+--- a/drivers/infiniband/hw/mlx5/mr.c
++++ b/drivers/infiniband/hw/mlx5/mr.c
+@@@ -1480,15 -1537,7 +1537,19 @@@ struct ib_mr *mlx5_ib_reg_user_mr(struc
+  		 * configured properly but left disabled. It is safe to go ahead
+  		 * and configure it again via UMR while enabling it.
+  		 */
+++<<<<<<< HEAD
+ +		int update_xlt_flags = MLX5_IB_UPD_XLT_ENABLE;
+ +
+ +		if (access_flags & IB_ACCESS_ON_DEMAND)
+ +			update_xlt_flags |= MLX5_IB_UPD_XLT_ZAP;
+ +
+ +		err = mlx5_ib_update_xlt(
+ +			mr, 0,
+ +			ib_umem_num_dma_blocks(umem, 1UL << mr->page_shift),
+ +			mr->page_shift, update_xlt_flags);
+++=======
++ 		err = mlx5_ib_update_mr_pas(mr, MLX5_IB_UPD_XLT_ENABLE);
+++>>>>>>> f1eaac37da20 (RDMA/mlx5: Split mlx5_ib_update_xlt() into ODP and non-ODP cases)
+  		if (err) {
+  			dereg_mr(dev, mr);
+  			return ERR_PTR(err);
+diff --git a/drivers/infiniband/hw/mlx5/mem.c b/drivers/infiniband/hw/mlx5/mem.c
+index 6747502cec9e..844545064c9e 100644
+--- a/drivers/infiniband/hw/mlx5/mem.c
++++ b/drivers/infiniband/hw/mlx5/mem.c
+@@ -36,70 +36,6 @@
+ #include "mlx5_ib.h"
+ #include <linux/jiffies.h>
+ 
+-/*
+- * Populate the given array with bus addresses from the umem.
+- *
+- * dev - mlx5_ib device
+- * umem - umem to use to fill the pages
+- * page_shift - determines the page size used in the resulting array
+- * offset - offset into the umem to start from,
+- *          only implemented for ODP umems
+- * num_pages - total number of pages to fill
+- * pas - bus addresses array to fill
+- * access_flags - access flags to set on all present pages.
+-		  use enum mlx5_ib_mtt_access_flags for this.
+- */
+-void __mlx5_ib_populate_pas(struct mlx5_ib_dev *dev, struct ib_umem *umem,
+-			    int page_shift, size_t offset, size_t num_pages,
+-			    __be64 *pas, int access_flags)
+-{
+-	int shift = page_shift - PAGE_SHIFT;
+-	int mask = (1 << shift) - 1;
+-	int i, k, idx;
+-	u64 cur = 0;
+-	u64 base;
+-	int len;
+-	struct scatterlist *sg;
+-	int entry;
+-
+-	i = 0;
+-	for_each_sg(umem->sg_head.sgl, sg, umem->nmap, entry) {
+-		len = sg_dma_len(sg) >> PAGE_SHIFT;
+-		base = sg_dma_address(sg);
+-
+-		/* Skip elements below offset */
+-		if (i + len < offset << shift) {
+-			i += len;
+-			continue;
+-		}
+-
+-		/* Skip pages below offset */
+-		if (i < offset << shift) {
+-			k = (offset << shift) - i;
+-			i = offset << shift;
+-		} else {
+-			k = 0;
+-		}
+-
+-		for (; k < len; k++) {
+-			if (!(i & mask)) {
+-				cur = base + (k << PAGE_SHIFT);
+-				cur |= access_flags;
+-				idx = (i >> shift) - offset;
+-
+-				pas[idx] = cpu_to_be64(cur);
+-				mlx5_ib_dbg(dev, "pas[%d] 0x%llx\n",
+-					    i >> shift, be64_to_cpu(pas[idx]));
+-			}
+-			i++;
+-
+-			/* Stop after num_pages reached */
+-			if (i >> shift >= offset + num_pages)
+-				return;
+-		}
+-	}
+-}
+-
+ /*
+  * Fill in a physical address list. ib_umem_num_dma_blocks() entries will be
+  * filled in the pas array.
+* Unmerged path drivers/infiniband/hw/mlx5/mlx5_ib.h
+* Unmerged path drivers/infiniband/hw/mlx5/mr.c
