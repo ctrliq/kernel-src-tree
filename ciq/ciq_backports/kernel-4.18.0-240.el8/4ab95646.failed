@@ -1,0 +1,188 @@
+ice: Support displaying ntuple rules
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Henry Tieman <henry.w.tieman@intel.com>
+commit 4ab956462f67763be4049b03a414aa7c9b2d4c96
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/4ab95646.failed
+
+Add functionality for ethtool --show-ntuple, allowing for filters to be
+displayed when set functionality is added. Add statistics related to
+Flow Director matches and status.
+
+	Signed-off-by: Henry Tieman <henry.w.tieman@intel.com>
+	Signed-off-by: Tony Nguyen <anthony.l.nguyen@intel.com>
+	Tested-by: Andrew Bowers <andrewx.bowers@intel.com>
+	Signed-off-by: Jeff Kirsher <jeffrey.t.kirsher@intel.com>
+(cherry picked from commit 4ab956462f67763be4049b03a414aa7c9b2d4c96)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/intel/ice/ice.h
+#	drivers/net/ethernet/intel/ice/ice_ethtool_fdir.c
+#	drivers/net/ethernet/intel/ice/ice_fdir.c
+#	drivers/net/ethernet/intel/ice/ice_fdir.h
+diff --cc drivers/net/ethernet/intel/ice/ice.h
+index 4f1d07a3de0e,e0c9e4a30d82..000000000000
+--- a/drivers/net/ethernet/intel/ice/ice.h
++++ b/drivers/net/ethernet/intel/ice/ice.h
+@@@ -494,8 -512,27 +494,29 @@@ static inline struct ice_vsi *ice_get_m
+  	return NULL;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ /**
++  * ice_get_ctrl_vsi - Get the control VSI
++  * @pf: PF instance
++  */
++ static inline struct ice_vsi *ice_get_ctrl_vsi(struct ice_pf *pf)
++ {
++ 	/* if pf->ctrl_vsi_idx is ICE_NO_VSI, control VSI was not set up */
++ 	if (!pf->vsi || pf->ctrl_vsi_idx == ICE_NO_VSI)
++ 		return NULL;
++ 
++ 	return pf->vsi[pf->ctrl_vsi_idx];
++ }
++ 
++ #define ICE_FD_STAT_CTR_BLOCK_COUNT	256
++ #define ICE_FD_STAT_PF_IDX(base_idx) \
++ 			((base_idx) * ICE_FD_STAT_CTR_BLOCK_COUNT)
++ #define ICE_FD_SB_STAT_IDX(base_idx) ICE_FD_STAT_PF_IDX(base_idx)
++ 
+++>>>>>>> 4ab956462f67 (ice: Support displaying ntuple rules)
+  int ice_vsi_setup_tx_rings(struct ice_vsi *vsi);
+  int ice_vsi_setup_rx_rings(struct ice_vsi *vsi);
+ -int ice_vsi_open_ctrl(struct ice_vsi *vsi);
+  void ice_set_ethtool_ops(struct net_device *netdev);
+  void ice_set_ethtool_safe_mode_ops(struct net_device *netdev);
+  u16 ice_get_avail_txq_count(struct ice_pf *pf);
+@@@ -517,6 -554,15 +538,18 @@@ int ice_get_rss(struct ice_vsi *vsi, u
+  void ice_fill_rss_lut(u8 *lut, u16 rss_table_size, u16 rss_size);
+  int ice_schedule_reset(struct ice_pf *pf, enum ice_reset_req reset);
+  void ice_print_link_msg(struct ice_vsi *vsi, bool isup);
+++<<<<<<< HEAD
+++=======
++ const char *ice_stat_str(enum ice_status stat_err);
++ const char *ice_aq_str(enum ice_aq_err aq_err);
++ void ice_vsi_manage_fdir(struct ice_vsi *vsi, bool ena);
++ int ice_get_ethtool_fdir_entry(struct ice_hw *hw, struct ethtool_rxnfc *cmd);
++ int
++ ice_get_fdir_fltr_ids(struct ice_hw *hw, struct ethtool_rxnfc *cmd,
++ 		      u32 *rule_locs);
++ void ice_fdir_release_flows(struct ice_hw *hw);
++ int ice_fdir_create_dflt_rules(struct ice_pf *pf);
+++>>>>>>> 4ab956462f67 (ice: Support displaying ntuple rules)
+  int ice_open(struct net_device *netdev);
+  int ice_stop(struct net_device *netdev);
+  
+* Unmerged path drivers/net/ethernet/intel/ice/ice_ethtool_fdir.c
+* Unmerged path drivers/net/ethernet/intel/ice/ice_fdir.c
+* Unmerged path drivers/net/ethernet/intel/ice/ice_fdir.h
+* Unmerged path drivers/net/ethernet/intel/ice/ice.h
+diff --git a/drivers/net/ethernet/intel/ice/ice_ethtool.c b/drivers/net/ethernet/intel/ice/ice_ethtool.c
+index c9dd76a663e5..ca32501735bb 100644
+--- a/drivers/net/ethernet/intel/ice/ice_ethtool.c
++++ b/drivers/net/ethernet/intel/ice/ice_ethtool.c
+@@ -129,6 +129,8 @@ static const struct ice_stats ice_gstrings_pf_stats[] = {
+ 	ICE_PF_STAT("illegal_bytes.nic", stats.illegal_bytes),
+ 	ICE_PF_STAT("mac_local_faults.nic", stats.mac_local_faults),
+ 	ICE_PF_STAT("mac_remote_faults.nic", stats.mac_remote_faults),
++	ICE_PF_STAT("fdir_sb_match.nic", stats.fd_sb_match),
++	ICE_PF_STAT("fdir_sb_status.nic", stats.fd_sb_status),
+ };
+ 
+ static const u32 ice_regs_dump_list[] = {
+@@ -2548,12 +2550,27 @@ ice_get_rxnfc(struct net_device *netdev, struct ethtool_rxnfc *cmd,
+ 	struct ice_netdev_priv *np = netdev_priv(netdev);
+ 	struct ice_vsi *vsi = np->vsi;
+ 	int ret = -EOPNOTSUPP;
++	struct ice_hw *hw;
++
++	hw = &vsi->back->hw;
+ 
+ 	switch (cmd->cmd) {
+ 	case ETHTOOL_GRXRINGS:
+ 		cmd->data = vsi->rss_size;
+ 		ret = 0;
+ 		break;
++	case ETHTOOL_GRXCLSRLCNT:
++		cmd->rule_cnt = hw->fdir_active_fltr;
++		/* report total rule count */
++		cmd->data = ice_get_fdir_cnt_all(hw);
++		ret = 0;
++		break;
++	case ETHTOOL_GRXCLSRULE:
++		ret = ice_get_ethtool_fdir_entry(hw, cmd);
++		break;
++	case ETHTOOL_GRXCLSRLALL:
++		ret = ice_get_fdir_fltr_ids(hw, cmd, (u32 *)rule_locs);
++		break;
+ 	case ETHTOOL_GRXFH:
+ 		ice_get_rss_hash_opt(vsi, cmd);
+ 		ret = 0;
+* Unmerged path drivers/net/ethernet/intel/ice/ice_ethtool_fdir.c
+* Unmerged path drivers/net/ethernet/intel/ice/ice_fdir.c
+* Unmerged path drivers/net/ethernet/intel/ice/ice_fdir.h
+diff --git a/drivers/net/ethernet/intel/ice/ice_hw_autogen.h b/drivers/net/ethernet/intel/ice/ice_hw_autogen.h
+index 0f5121db1671..419e5e7df086 100644
+--- a/drivers/net/ethernet/intel/ice/ice_hw_autogen.h
++++ b/drivers/net/ethernet/intel/ice/ice_hw_autogen.h
+@@ -329,6 +329,7 @@
+ #define GLPRT_TDOLD(_i)				(0x00381280 + ((_i) * 8))
+ #define GLPRT_UPRCL(_i)				(0x00381300 + ((_i) * 8))
+ #define GLPRT_UPTCL(_i)				(0x003811C0 + ((_i) * 8))
++#define GLSTAT_FD_CNT0L(_i)			(0x003A0000 + ((_i) * 8))
+ #define GLV_BPRCL(_i)				(0x003B6000 + ((_i) * 8))
+ #define GLV_BPTCL(_i)				(0x0030E000 + ((_i) * 8))
+ #define GLV_GORCL(_i)				(0x003B0000 + ((_i) * 8))
+diff --git a/drivers/net/ethernet/intel/ice/ice_main.c b/drivers/net/ethernet/intel/ice/ice_main.c
+index 40fd98d4ad25..074a54355870 100644
+--- a/drivers/net/ethernet/intel/ice/ice_main.c
++++ b/drivers/net/ethernet/intel/ice/ice_main.c
+@@ -4121,6 +4121,7 @@ void ice_update_pf_stats(struct ice_pf *pf)
+ {
+ 	struct ice_hw_port_stats *prev_ps, *cur_ps;
+ 	struct ice_hw *hw = &pf->hw;
++	u16 fd_ctr_base;
+ 	u8 port;
+ 
+ 	port = hw->port_info->lport;
+@@ -4209,6 +4210,12 @@ void ice_update_pf_stats(struct ice_pf *pf)
+ 	ice_stat_update40(hw, GLPRT_PTC9522L(port), pf->stat_prev_loaded,
+ 			  &prev_ps->tx_size_big, &cur_ps->tx_size_big);
+ 
++	fd_ctr_base = hw->fd_ctr_base;
++
++	ice_stat_update40(hw,
++			  GLSTAT_FD_CNT0L(ICE_FD_SB_STAT_IDX(fd_ctr_base)),
++			  pf->stat_prev_loaded, &prev_ps->fd_sb_match,
++			  &cur_ps->fd_sb_match);
+ 	ice_stat_update32(hw, GLPRT_LXONRXC(port), pf->stat_prev_loaded,
+ 			  &prev_ps->link_xon_rx, &cur_ps->link_xon_rx);
+ 
+@@ -4252,6 +4259,8 @@ void ice_update_pf_stats(struct ice_pf *pf)
+ 	ice_stat_update32(hw, GLPRT_RJC(port), pf->stat_prev_loaded,
+ 			  &prev_ps->rx_jabber, &cur_ps->rx_jabber);
+ 
++	cur_ps->fd_sb_status = test_bit(ICE_FLAG_FD_ENA, pf->flags) ? 1 : 0;
++
+ 	pf->stat_prev_loaded = true;
+ }
+ 
+diff --git a/drivers/net/ethernet/intel/ice/ice_type.h b/drivers/net/ethernet/intel/ice/ice_type.h
+index 7074afdaa83b..5e98270c1b67 100644
+--- a/drivers/net/ethernet/intel/ice/ice_type.h
++++ b/drivers/net/ethernet/intel/ice/ice_type.h
+@@ -636,6 +636,9 @@ struct ice_hw_port_stats {
+ 	u64 tx_size_1023;		/* ptc1023 */
+ 	u64 tx_size_1522;		/* ptc1522 */
+ 	u64 tx_size_big;		/* ptc9522 */
++	/* flow director stats */
++	u32 fd_sb_status;
++	u64 fd_sb_match;
+ };
+ 
+ /* Checksum and Shadow RAM pointers */
