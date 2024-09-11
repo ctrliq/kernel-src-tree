@@ -1,0 +1,391 @@
+crypto: chelsio - switch to skcipher API
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-338.el8
+commit-author Ard Biesheuvel <ardb@kernel.org>
+commit 7cea6d3e01c2f4bf5e0687dcc8b4215b92580c16
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-338.el8/7cea6d3e.failed
+
+Commit 7a7ffe65c8c5 ("crypto: skcipher - Add top-level skcipher interface")
+dated 20 august 2015 introduced the new skcipher API which is supposed to
+replace both blkcipher and ablkcipher. While all consumers of the API have
+been converted long ago, some producers of the ablkcipher remain, forcing
+us to keep the ablkcipher support routines alive, along with the matching
+code to expose [a]blkciphers via the skcipher API.
+
+So switch this driver to the skcipher API, allowing us to finally drop the
+ablkcipher code in the near future.
+
+	Cc: Atul Gupta <atul.gupta@chelsio.com>
+	Signed-off-by: Ard Biesheuvel <ardb@kernel.org>
+	Signed-off-by: Herbert Xu <herbert@gondor.apana.org.au>
+(cherry picked from commit 7cea6d3e01c2f4bf5e0687dcc8b4215b92580c16)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/crypto/chelsio/chcr_algo.c
+diff --cc drivers/crypto/chelsio/chcr_algo.c
+index 92eb653f8ca6,1b4a5664e604..000000000000
+--- a/drivers/crypto/chelsio/chcr_algo.c
++++ b/drivers/crypto/chelsio/chcr_algo.c
+@@@ -807,9 -757,8 +807,14 @@@ static inline void create_wreq(struct c
+   */
+  static struct sk_buff *create_cipher_wr(struct cipher_wr_param *wrparam)
+  {
+++<<<<<<< HEAD
+ +	struct crypto_ablkcipher *tfm = crypto_ablkcipher_reqtfm(wrparam->req);
+ +	struct chcr_context *ctx = c_ctx(tfm);
+ +	struct ablk_ctx *ablkctx = ABLK_CTX(ctx);
+++=======
++ 	struct crypto_skcipher *tfm = crypto_skcipher_reqtfm(wrparam->req);
++ 	struct ablk_ctx *ablkctx = ABLK_CTX(c_ctx(tfm));
+++>>>>>>> 7cea6d3e01c2 (crypto: chelsio - switch to skcipher API)
+  	struct sk_buff *skb = NULL;
+  	struct chcr_wr *chcr_req;
+  	struct cpl_rx_phys_dsgl *phys_cpl;
+@@@ -1069,13 -1017,13 +1074,18 @@@ static unsigned int adjust_ctr_overflow
+  	return bytes;
+  }
+  
+- static int chcr_update_tweak(struct ablkcipher_request *req, u8 *iv,
++ static int chcr_update_tweak(struct skcipher_request *req, u8 *iv,
+  			     u32 isfinal)
+  {
+- 	struct crypto_ablkcipher *tfm = crypto_ablkcipher_reqtfm(req);
++ 	struct crypto_skcipher *tfm = crypto_skcipher_reqtfm(req);
+  	struct ablk_ctx *ablkctx = ABLK_CTX(c_ctx(tfm));
+++<<<<<<< HEAD
+ +	struct chcr_blkcipher_req_ctx *reqctx = ablkcipher_request_ctx(req);
+ +	struct crypto_cipher *cipher;
+++=======
++ 	struct chcr_skcipher_req_ctx *reqctx = skcipher_request_ctx(req);
++ 	struct crypto_aes_ctx aes;
+++>>>>>>> 7cea6d3e01c2 (crypto: chelsio - switch to skcipher API)
+  	int ret, i;
+  	u8 *key;
+  	unsigned int keylen;
+@@@ -1098,17 -1045,18 +1108,17 @@@
+  		gf128mul_x_ble((le128 *)iv, (le128 *)iv);
+  
+  	if (!isfinal)
+ -		aes_decrypt(&aes, iv, iv);
+ -
+ -	memzero_explicit(&aes, sizeof(aes));
+ -	return 0;
+ +		crypto_cipher_decrypt_one(cipher, iv, iv);
+ +out:
+ +	return ret;
+  }
+  
+- static int chcr_update_cipher_iv(struct ablkcipher_request *req,
++ static int chcr_update_cipher_iv(struct skcipher_request *req,
+  				   struct cpl_fw6_pld *fw6_pld, u8 *iv)
+  {
+- 	struct crypto_ablkcipher *tfm = crypto_ablkcipher_reqtfm(req);
+- 	struct chcr_blkcipher_req_ctx *reqctx = ablkcipher_request_ctx(req);
+- 	int subtype = get_cryptoalg_subtype(crypto_ablkcipher_tfm(tfm));
++ 	struct crypto_skcipher *tfm = crypto_skcipher_reqtfm(req);
++ 	struct chcr_skcipher_req_ctx *reqctx = skcipher_request_ctx(req);
++ 	int subtype = get_cryptoalg_subtype(tfm);
+  	int ret = 0;
+  
+  	if (subtype == CRYPTO_ALG_SUB_TYPE_CTR)
+@@@ -1146,14 -1094,10 +1156,14 @@@ static int chcr_final_cipher_iv(struct 
+  	int ret = 0;
+  
+  	if (subtype == CRYPTO_ALG_SUB_TYPE_CTR)
+- 		ctr_add_iv(iv, req->info, DIV_ROUND_UP(reqctx->processed,
++ 		ctr_add_iv(iv, req->iv, DIV_ROUND_UP(reqctx->processed,
+  						       AES_BLOCK_SIZE));
+ -	else if (subtype == CRYPTO_ALG_SUB_TYPE_XTS)
+ -		ret = chcr_update_tweak(req, iv, 1);
+ +	else if (subtype == CRYPTO_ALG_SUB_TYPE_XTS) {
+ +		if (!reqctx->partial_req)
+ +			memcpy(iv, reqctx->iv, AES_BLOCK_SIZE);
+ +		else
+ +			ret = chcr_update_tweak(req, iv, 1);
+ +	}
+  	else if (subtype == CRYPTO_ALG_SUB_TYPE_CBC) {
+  		/*Already updated for Decrypt*/
+  		if (!reqctx->op)
+@@@ -1164,17 -1108,16 +1174,26 @@@
+  
+  }
+  
+- static int chcr_handle_cipher_resp(struct ablkcipher_request *req,
++ static int chcr_handle_cipher_resp(struct skcipher_request *req,
+  				   unsigned char *input, int err)
+  {
+++<<<<<<< HEAD
+ +	struct crypto_ablkcipher *tfm = crypto_ablkcipher_reqtfm(req);
+ +	struct chcr_context *ctx = c_ctx(tfm);
+++=======
++ 	struct crypto_skcipher *tfm = crypto_skcipher_reqtfm(req);
+++>>>>>>> 7cea6d3e01c2 (crypto: chelsio - switch to skcipher API)
+  	struct uld_ctx *u_ctx = ULD_CTX(c_ctx(tfm));
+  	struct ablk_ctx *ablkctx = ABLK_CTX(c_ctx(tfm));
+  	struct sk_buff *skb;
+  	struct cpl_fw6_pld *fw6_pld = (struct cpl_fw6_pld *)input;
+++<<<<<<< HEAD
+ +	struct chcr_blkcipher_req_ctx *reqctx = ablkcipher_request_ctx(req);
+ +	struct cipher_wr_param wrparam;
+++=======
++ 	struct chcr_skcipher_req_ctx *reqctx = skcipher_request_ctx(req);
++ 	struct  cipher_wr_param wrparam;
+++>>>>>>> 7cea6d3e01c2 (crypto: chelsio - switch to skcipher API)
+  	struct chcr_dev *dev = c_ctx(tfm)->dev;
+  	int bytes;
+  
+@@@ -1216,10 -1159,10 +1235,10 @@@
+  		goto complete;
+  	}
+  
+- 	if (get_cryptoalg_subtype(crypto_ablkcipher_tfm(tfm)) ==
++ 	if (get_cryptoalg_subtype(tfm) ==
+  	    CRYPTO_ALG_SUB_TYPE_CTR)
+  		bytes = adjust_ctr_overflow(reqctx->iv, bytes);
+ -	wrparam.qid = u_ctx->lldi.rxq_ids[c_ctx(tfm)->rx_qidx];
+ +	wrparam.qid = u_ctx->lldi.rxq_ids[reqctx->rxqidx];
+  	wrparam.req = req;
+  	wrparam.bytes = bytes;
+  	skb = create_cipher_wr(&wrparam);
+@@@ -1265,14 -1198,13 +1284,18 @@@ static int process_cipher(struct skciph
+  	int bytes, err = -EINVAL;
+  
+  	reqctx->processed = 0;
+++<<<<<<< HEAD
+ +	reqctx->partial_req = 0;
+ +	if (!req->info)
+++=======
++ 	if (!req->iv)
+++>>>>>>> 7cea6d3e01c2 (crypto: chelsio - switch to skcipher API)
+  		goto error;
+  	if ((ablkctx->enckey_len == 0) || (ivsize > AES_BLOCK_SIZE) ||
+- 	    (req->nbytes == 0) ||
+- 	    (req->nbytes % crypto_ablkcipher_blocksize(tfm))) {
++ 	    (req->cryptlen == 0) ||
++ 	    (req->cryptlen % crypto_skcipher_blocksize(tfm))) {
+  		pr_err("AES: Invalid value of Key Len %d nbytes %d IV Len %d\n",
+- 		       ablkctx->enckey_len, req->nbytes, ivsize);
++ 		       ablkctx->enckey_len, req->cryptlen, ivsize);
+  		goto error;
+  	}
+  
+@@@ -1365,21 -1296,13 +1388,25 @@@ error
+  	return err;
+  }
+  
+- static int chcr_aes_encrypt(struct ablkcipher_request *req)
++ static int chcr_aes_encrypt(struct skcipher_request *req)
+  {
+++<<<<<<< HEAD
+ +	struct crypto_ablkcipher *tfm = crypto_ablkcipher_reqtfm(req);
+ +	struct chcr_blkcipher_req_ctx *reqctx = ablkcipher_request_ctx(req);
+++=======
++ 	struct crypto_skcipher *tfm = crypto_skcipher_reqtfm(req);
+++>>>>>>> 7cea6d3e01c2 (crypto: chelsio - switch to skcipher API)
+  	struct chcr_dev *dev = c_ctx(tfm)->dev;
+  	struct sk_buff *skb = NULL;
+ -	int err, isfull = 0;
+ +	int err;
+  	struct uld_ctx *u_ctx = ULD_CTX(c_ctx(tfm));
+ +	struct chcr_context *ctx = c_ctx(tfm);
+ +	unsigned int cpu;
+ +
+ +	cpu = get_cpu();
+ +	reqctx->txqidx = cpu % ctx->ntxq;
+ +	reqctx->rxqidx = cpu % ctx->nrxq;
+ +	put_cpu();
+  
+  	err = chcr_inc_wrcount(dev);
+  	if (err)
+@@@ -1410,11 -1329,9 +1437,15 @@@ error
+  	return err;
+  }
+  
+- static int chcr_aes_decrypt(struct ablkcipher_request *req)
++ static int chcr_aes_decrypt(struct skcipher_request *req)
+  {
+++<<<<<<< HEAD
+ +	struct crypto_ablkcipher *tfm = crypto_ablkcipher_reqtfm(req);
+ +	struct chcr_blkcipher_req_ctx *reqctx =
+ +		ablkcipher_request_ctx(req);
+++=======
++ 	struct crypto_skcipher *tfm = crypto_skcipher_reqtfm(req);
+++>>>>>>> 7cea6d3e01c2 (crypto: chelsio - switch to skcipher API)
+  	struct uld_ctx *u_ctx = ULD_CTX(c_ctx(tfm));
+  	struct chcr_dev *dev = c_ctx(tfm)->dev;
+  	struct sk_buff *skb = NULL;
+@@@ -1484,25 -1411,15 +1515,31 @@@ static int chcr_init_tfm(struct crypto_
+  		return PTR_ERR(ablkctx->sw_cipher);
+  	}
+  
+++<<<<<<< HEAD
+ +	if (get_cryptoalg_subtype(tfm) == CRYPTO_ALG_SUB_TYPE_XTS) {
+ +		/* To update tweak*/
+ +		ablkctx->aes_generic = crypto_alloc_cipher("aes-generic", 0, 0);
+ +		if (IS_ERR(ablkctx->aes_generic)) {
+ +			pr_err("failed to allocate aes cipher for tweak\n");
+ +			return PTR_ERR(ablkctx->aes_generic);
+ +		}
+ +	} else
+ +		ablkctx->aes_generic = NULL;
+ +
+ +	init_completion(&ctx->cbc_aes_aio_done);
+ +	tfm->crt_ablkcipher.reqsize =  sizeof(struct chcr_blkcipher_req_ctx);
+ +	return chcr_device_init(crypto_tfm_ctx(tfm));
+++=======
++ 	crypto_skcipher_set_reqsize(tfm, sizeof(struct chcr_skcipher_req_ctx));
++ 
++ 	return chcr_device_init(ctx);
+++>>>>>>> 7cea6d3e01c2 (crypto: chelsio - switch to skcipher API)
+  }
+  
+- static int chcr_rfc3686_init(struct crypto_tfm *tfm)
++ static int chcr_rfc3686_init(struct crypto_skcipher *tfm)
+  {
+- 	struct crypto_alg *alg = tfm->__crt_alg;
+- 	struct chcr_context *ctx = crypto_tfm_ctx(tfm);
++ 	struct skcipher_alg *alg = crypto_skcipher_alg(tfm);
++ 	struct chcr_context *ctx = crypto_skcipher_ctx(tfm);
+  	struct ablk_ctx *ablkctx = ABLK_CTX(ctx);
+  
+  	/*RFC3686 initialises IV counter value to 1, rfc3686(ctr(aes))
+@@@ -2690,10 -2574,10 +2727,10 @@@ void chcr_add_aead_dst_ent(struct aead_
+  	temp = req->assoclen + req->cryptlen +
+  		(reqctx->op ? -authsize : authsize);
+  	dsgl_walk_add_sg(&dsgl_walk, req->dst, temp, 0);
+ -	dsgl_walk_end(&dsgl_walk, qid, ctx->pci_chan_id);
+ +	dsgl_walk_end(&dsgl_walk, qid, rx_channel_id);
+  }
+  
+- void chcr_add_cipher_src_ent(struct ablkcipher_request *req,
++ void chcr_add_cipher_src_ent(struct skcipher_request *req,
+  			     void *ulptx,
+  			     struct  cipher_wr_param *wrparam)
+  {
+@@@ -2721,11 -2605,10 +2758,11 @@@ void chcr_add_cipher_dst_ent(struct skc
+  			     struct  cipher_wr_param *wrparam,
+  			     unsigned short qid)
+  {
+- 	struct chcr_blkcipher_req_ctx *reqctx = ablkcipher_request_ctx(req);
+- 	struct crypto_ablkcipher *tfm = crypto_ablkcipher_reqtfm(wrparam->req);
++ 	struct chcr_skcipher_req_ctx *reqctx = skcipher_request_ctx(req);
++ 	struct crypto_skcipher *tfm = crypto_skcipher_reqtfm(wrparam->req);
+  	struct chcr_context *ctx = c_ctx(tfm);
+  	struct dsgl_walk dsgl_walk;
+ +	unsigned int rx_channel_id = reqctx->rxqidx / ctx->rxq_perchan;
+  
+  	dsgl_walk_init(&dsgl_walk, phys_cpl);
+  	dsgl_walk_add_sg(&dsgl_walk, reqctx->dstsg, wrparam->bytes,
+@@@ -3898,26 -3767,22 +3932,42 @@@ static struct chcr_alg_template driver_
+  		}
+  	},
+  	{
+- 		.type = CRYPTO_ALG_TYPE_ABLKCIPHER |
++ 		.type = CRYPTO_ALG_TYPE_SKCIPHER |
+  			CRYPTO_ALG_SUB_TYPE_CTR_RFC3686,
+  		.is_registered = 0,
+++<<<<<<< HEAD
+ +		.alg.crypto = {
+ +			.cra_name		= "rfc3686(ctr(aes))",
+ +			.cra_driver_name	= "rfc3686-ctr-aes-chcr",
+ +			.cra_blocksize		= 1,
+ +			.cra_init		= chcr_rfc3686_init,
+ +			.cra_exit		= chcr_cra_exit,
+ +			.cra_u.ablkcipher	= {
+ +				.min_keysize	= AES_MIN_KEY_SIZE +
+ +					CTR_RFC3686_NONCE_SIZE,
+ +				.max_keysize	= AES_MAX_KEY_SIZE +
+ +					CTR_RFC3686_NONCE_SIZE,
+ +				.ivsize		= CTR_RFC3686_IV_SIZE,
+ +				.setkey		= chcr_aes_rfc3686_setkey,
+ +				.encrypt	= chcr_aes_encrypt,
+ +				.decrypt	= chcr_aes_decrypt,
+ +				.geniv          = "seqiv",
+ +			}
+++=======
++ 		.alg.skcipher = {
++ 			.base.cra_name		= "rfc3686(ctr(aes))",
++ 			.base.cra_driver_name	= "rfc3686-ctr-aes-chcr",
++ 			.base.cra_blocksize	= 1,
++ 
++ 			.init			= chcr_rfc3686_init,
++ 			.exit			= chcr_exit_tfm,
++ 			.min_keysize		= AES_MIN_KEY_SIZE + CTR_RFC3686_NONCE_SIZE,
++ 			.max_keysize		= AES_MAX_KEY_SIZE + CTR_RFC3686_NONCE_SIZE,
++ 			.ivsize			= CTR_RFC3686_IV_SIZE,
++ 			.setkey			= chcr_aes_rfc3686_setkey,
++ 			.encrypt		= chcr_aes_encrypt,
++ 			.decrypt		= chcr_aes_decrypt,
+++>>>>>>> 7cea6d3e01c2 (crypto: chelsio - switch to skcipher API)
+  		}
+  	},
+  	/* SHA */
+* Unmerged path drivers/crypto/chelsio/chcr_algo.c
+diff --git a/drivers/crypto/chelsio/chcr_algo.h b/drivers/crypto/chelsio/chcr_algo.h
+index d1e6b51df0ce..f58c2b5c7fc5 100644
+--- a/drivers/crypto/chelsio/chcr_algo.h
++++ b/drivers/crypto/chelsio/chcr_algo.h
+@@ -287,7 +287,7 @@ struct hash_wr_param {
+ };
+ 
+ struct cipher_wr_param {
+-	struct ablkcipher_request *req;
++	struct skcipher_request *req;
+ 	char *iv;
+ 	int bytes;
+ 	unsigned short qid;
+diff --git a/drivers/crypto/chelsio/chcr_crypto.h b/drivers/crypto/chelsio/chcr_crypto.h
+index a44c542a320b..454ea2d3f816 100644
+--- a/drivers/crypto/chelsio/chcr_crypto.h
++++ b/drivers/crypto/chelsio/chcr_crypto.h
+@@ -160,9 +160,9 @@ static inline struct chcr_context *a_ctx(struct crypto_aead *tfm)
+ 	return crypto_aead_ctx(tfm);
+ }
+ 
+-static inline struct chcr_context *c_ctx(struct crypto_ablkcipher *tfm)
++static inline struct chcr_context *c_ctx(struct crypto_skcipher *tfm)
+ {
+-	return crypto_ablkcipher_ctx(tfm);
++	return crypto_skcipher_ctx(tfm);
+ }
+ 
+ static inline struct chcr_context *h_ctx(struct crypto_ahash *tfm)
+@@ -291,7 +291,7 @@ struct chcr_ahash_req_ctx {
+ 	u8 bfr2[CHCR_HASH_MAX_BLOCK_SIZE_128];
+ };
+ 
+-struct chcr_blkcipher_req_ctx {
++struct chcr_skcipher_req_ctx {
+ 	struct sk_buff *skb;
+ 	struct scatterlist *dstsg;
+ 	unsigned int processed;
+@@ -311,7 +311,7 @@ struct chcr_alg_template {
+ 	u32 type;
+ 	u32 is_registered;
+ 	union {
+-		struct crypto_alg crypto;
++		struct skcipher_alg skcipher;
+ 		struct ahash_alg hash;
+ 		struct aead_alg aead;
+ 	} alg;
+@@ -330,12 +330,12 @@ void chcr_add_aead_dst_ent(struct aead_request *req,
+ 			   struct cpl_rx_phys_dsgl *phys_cpl,
+ 			   unsigned short qid);
+ void chcr_add_aead_src_ent(struct aead_request *req, struct ulptx_sgl *ulptx);
+-void chcr_add_cipher_src_ent(struct ablkcipher_request *req,
++void chcr_add_cipher_src_ent(struct skcipher_request *req,
+ 			     void *ulptx,
+ 			     struct  cipher_wr_param *wrparam);
+-int chcr_cipher_dma_map(struct device *dev, struct ablkcipher_request *req);
+-void chcr_cipher_dma_unmap(struct device *dev, struct ablkcipher_request *req);
+-void chcr_add_cipher_dst_ent(struct ablkcipher_request *req,
++int chcr_cipher_dma_map(struct device *dev, struct skcipher_request *req);
++void chcr_cipher_dma_unmap(struct device *dev, struct skcipher_request *req);
++void chcr_add_cipher_dst_ent(struct skcipher_request *req,
+ 			     struct cpl_rx_phys_dsgl *phys_cpl,
+ 			     struct  cipher_wr_param *wrparam,
+ 			     unsigned short qid);
