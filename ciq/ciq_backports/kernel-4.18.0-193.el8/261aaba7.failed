@@ -1,0 +1,127 @@
+fuse: use iversion for readdir cache verification
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-193.el8
+commit-author Miklos Szeredi <mszeredi@redhat.com>
+commit 261aaba72fdba17b74a3a434d9f925b43d90e958
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-193.el8/261aaba7.failed
+
+Use the internal iversion counter to make sure modifications of the
+directory through this filesystem are not missed by the mtime check (due to
+mtime granularity).
+
+	Signed-off-by: Miklos Szeredi <mszeredi@redhat.com>
+(cherry picked from commit 261aaba72fdba17b74a3a434d9f925b43d90e958)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/fuse/dir.c
+diff --cc fs/fuse/dir.c
+index d84932d874f1,6800fdc3e730..000000000000
+--- a/fs/fuse/dir.c
++++ b/fs/fuse/dir.c
+@@@ -91,9 -87,15 +92,15 @@@ static void fuse_invalidate_attr_mask(s
+   */
+  void fuse_invalidate_attr(struct inode *inode)
+  {
+ -	get_fuse_inode(inode)->i_time = 0;
+ +	fuse_invalidate_attr_mask(inode, STATX_BASIC_STATS);
+  }
+  
++ static void fuse_dir_changed(struct inode *dir)
++ {
++ 	fuse_invalidate_attr(dir);
++ 	inode_maybe_inc_iversion(dir, false);
++ }
++ 
+  /**
+   * Mark the attributes as stale due to an atime change.  Avoid the invalidate if
+   * atime is not used.
+@@@ -452,8 -454,8 +459,13 @@@ static int fuse_create_open(struct inod
+  	kfree(forget);
+  	d_instantiate(entry, inode);
+  	fuse_change_entry_timeout(entry, &outentry);
+++<<<<<<< HEAD
+ +	fuse_invalidate_attr(dir);
+ +	err = finish_open(file, entry, generic_file_open, opened);
+++=======
++ 	fuse_dir_changed(dir);
++ 	err = finish_open(file, entry, generic_file_open);
+++>>>>>>> 261aaba72fdb (fuse: use iversion for readdir cache verification)
+  	if (err) {
+  		fuse_sync_release(ff, flags);
+  	} else {
+@@@ -554,12 -557,18 +566,22 @@@ static int create_new_entry(struct fuse
+  	}
+  	kfree(forget);
+  
+ -	d_drop(entry);
+ -	d = d_splice_alias(inode, entry);
+ -	if (IS_ERR(d))
+ -		return PTR_ERR(d);
+ +	err = d_instantiate_no_diralias(entry, inode);
+ +	if (err)
+ +		return err;
+  
+++<<<<<<< HEAD
+ +	fuse_change_entry_timeout(entry, &outarg);
+ +	fuse_invalidate_attr(dir);
+++=======
++ 	if (d) {
++ 		fuse_change_entry_timeout(d, &outarg);
++ 		dput(d);
++ 	} else {
++ 		fuse_change_entry_timeout(entry, &outarg);
++ 	}
++ 	fuse_dir_changed(dir);
+++>>>>>>> 261aaba72fdb (fuse: use iversion for readdir cache verification)
+  	return 0;
+  
+   out_put_forget_req:
+* Unmerged path fs/fuse/dir.c
+diff --git a/fs/fuse/fuse_i.h b/fs/fuse/fuse_i.h
+index e7076a1a0b4d..ae527831970b 100644
+--- a/fs/fuse/fuse_i.h
++++ b/fs/fuse/fuse_i.h
+@@ -123,6 +123,9 @@ struct fuse_inode {
+ 		/* modification time of directory when cache was started */
+ 		struct timespec64 mtime;
+ 
++		/* iversion of directory when cache was started */
++		u64 iversion;
++
+ 		/* protects above fields */
+ 		spinlock_t lock;
+ 	} rdc;
+diff --git a/fs/fuse/readdir.c b/fs/fuse/readdir.c
+index dafd6543cca2..ab18b78f4755 100644
+--- a/fs/fuse/readdir.c
++++ b/fs/fuse/readdir.c
+@@ -8,6 +8,7 @@
+ 
+ 
+ #include "fuse_i.h"
++#include <linux/iversion.h>
+ #include <linux/posix_acl.h>
+ #include <linux/pagemap.h>
+ #include <linux/highmem.h>
+@@ -447,6 +448,7 @@ static int fuse_readdir_cached(struct file *file, struct dir_context *ctx)
+ 		/* Starting cache? Set cache mtime. */
+ 		if (!ctx->pos && !fi->rdc.size) {
+ 			fi->rdc.mtime = inode->i_mtime;
++			fi->rdc.iversion = inode_query_iversion(inode);
+ 		}
+ 		spin_unlock(&fi->rdc.lock);
+ 		return UNCACHED;
+@@ -457,7 +459,8 @@ static int fuse_readdir_cached(struct file *file, struct dir_context *ctx)
+ 	 * changed, and reset the cache if so.
+ 	 */
+ 	if (!ctx->pos) {
+-		if (!timespec64_equal(&fi->rdc.mtime, &inode->i_mtime)) {
++		if (inode_peek_iversion(inode) != fi->rdc.iversion ||
++		    !timespec64_equal(&fi->rdc.mtime, &inode->i_mtime)) {
+ 			fuse_rdc_reset(inode);
+ 			goto retry_locked;
+ 		}
