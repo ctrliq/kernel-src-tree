@@ -1,0 +1,560 @@
+bpf: Add helper to retrieve socket in BPF
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-147.el8
+commit-author Joe Stringer <joe@wand.net.nz>
+commit 6acc9b432e6714d72d7d77ec7c27f6f8358d0c71
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-147.el8/6acc9b43.failed
+
+This patch adds new BPF helper functions, bpf_sk_lookup_tcp() and
+bpf_sk_lookup_udp() which allows BPF programs to find out if there is a
+socket listening on this host, and returns a socket pointer which the
+BPF program can then access to determine, for instance, whether to
+forward or drop traffic. bpf_sk_lookup_xxx() may take a reference on the
+socket, so when a BPF program makes use of this function, it must
+subsequently pass the returned pointer into the newly added sk_release()
+to return the reference.
+
+By way of example, the following pseudocode would filter inbound
+connections at XDP if there is no corresponding service listening for
+the traffic:
+
+  struct bpf_sock_tuple tuple;
+  struct bpf_sock_ops *sk;
+
+  populate_tuple(ctx, &tuple); // Extract the 5tuple from the packet
+  sk = bpf_sk_lookup_tcp(ctx, &tuple, sizeof tuple, netns, 0);
+  if (!sk) {
+    // Couldn't find a socket listening for this traffic. Drop.
+    return TC_ACT_SHOT;
+  }
+  bpf_sk_release(sk, 0);
+  return TC_ACT_OK;
+
+	Signed-off-by: Joe Stringer <joe@wand.net.nz>
+	Acked-by: Alexei Starovoitov <ast@kernel.org>
+	Signed-off-by: Daniel Borkmann <daniel@iogearbox.net>
+(cherry picked from commit 6acc9b432e6714d72d7d77ec7c27f6f8358d0c71)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/uapi/linux/bpf.h
+#	kernel/bpf/verifier.c
+#	tools/include/uapi/linux/bpf.h
+diff --cc include/uapi/linux/bpf.h
+index 4bb4aa8c40e5,f9187b41dff6..000000000000
+--- a/include/uapi/linux/bpf.h
++++ b/include/uapi/linux/bpf.h
+@@@ -2117,6 -2136,85 +2117,88 @@@ union bpf_attr 
+   *		the shared data.
+   *	Return
+   *		Pointer to the local storage area.
+++<<<<<<< HEAD
+++=======
++  *
++  * int bpf_sk_select_reuseport(struct sk_reuseport_md *reuse, struct bpf_map *map, void *key, u64 flags)
++  *	Description
++  *		Select a SO_REUSEPORT sk from a	BPF_MAP_TYPE_REUSEPORT_ARRAY map
++  *		It checks the selected sk is matching the incoming
++  *		request in the skb.
++  *	Return
++  *		0 on success, or a negative error in case of failure.
++  *
++  * struct bpf_sock *bpf_sk_lookup_tcp(void *ctx, struct bpf_sock_tuple *tuple, u32 tuple_size, u32 netns, u64 flags)
++  *	Description
++  *		Look for TCP socket matching *tuple*, optionally in a child
++  *		network namespace *netns*. The return value must be checked,
++  *		and if non-NULL, released via **bpf_sk_release**\ ().
++  *
++  *		The *ctx* should point to the context of the program, such as
++  *		the skb or socket (depending on the hook in use). This is used
++  *		to determine the base network namespace for the lookup.
++  *
++  *		*tuple_size* must be one of:
++  *
++  *		**sizeof**\ (*tuple*\ **->ipv4**)
++  *			Look for an IPv4 socket.
++  *		**sizeof**\ (*tuple*\ **->ipv6**)
++  *			Look for an IPv6 socket.
++  *
++  *		If the *netns* is zero, then the socket lookup table in the
++  *		netns associated with the *ctx* will be used. For the TC hooks,
++  *		this in the netns of the device in the skb. For socket hooks,
++  *		this in the netns of the socket. If *netns* is non-zero, then
++  *		it specifies the ID of the netns relative to the netns
++  *		associated with the *ctx*.
++  *
++  *		All values for *flags* are reserved for future usage, and must
++  *		be left at zero.
++  *
++  *		This helper is available only if the kernel was compiled with
++  *		**CONFIG_NET** configuration option.
++  *	Return
++  *		Pointer to *struct bpf_sock*, or NULL in case of failure.
++  *
++  * struct bpf_sock *bpf_sk_lookup_udp(void *ctx, struct bpf_sock_tuple *tuple, u32 tuple_size, u32 netns, u64 flags)
++  *	Description
++  *		Look for UDP socket matching *tuple*, optionally in a child
++  *		network namespace *netns*. The return value must be checked,
++  *		and if non-NULL, released via **bpf_sk_release**\ ().
++  *
++  *		The *ctx* should point to the context of the program, such as
++  *		the skb or socket (depending on the hook in use). This is used
++  *		to determine the base network namespace for the lookup.
++  *
++  *		*tuple_size* must be one of:
++  *
++  *		**sizeof**\ (*tuple*\ **->ipv4**)
++  *			Look for an IPv4 socket.
++  *		**sizeof**\ (*tuple*\ **->ipv6**)
++  *			Look for an IPv6 socket.
++  *
++  *		If the *netns* is zero, then the socket lookup table in the
++  *		netns associated with the *ctx* will be used. For the TC hooks,
++  *		this in the netns of the device in the skb. For socket hooks,
++  *		this in the netns of the socket. If *netns* is non-zero, then
++  *		it specifies the ID of the netns relative to the netns
++  *		associated with the *ctx*.
++  *
++  *		All values for *flags* are reserved for future usage, and must
++  *		be left at zero.
++  *
++  *		This helper is available only if the kernel was compiled with
++  *		**CONFIG_NET** configuration option.
++  *	Return
++  *		Pointer to *struct bpf_sock*, or NULL in case of failure.
++  *
++  * int bpf_sk_release(struct bpf_sock *sk)
++  *	Description
++  *		Release the reference held by *sock*. *sock* must be a non-NULL
++  *		pointer that was returned from bpf_sk_lookup_xxx\ ().
++  *	Return
++  *		0 on success, or a negative error in case of failure.
+++>>>>>>> 6acc9b432e67 (bpf: Add helper to retrieve socket in BPF)
+   */
+  #define __BPF_FUNC_MAPPER(FN)		\
+  	FN(unspec),			\
+@@@ -2200,7 -2298,12 +2282,16 @@@
+  	FN(rc_keydown),			\
+  	FN(skb_cgroup_id),		\
+  	FN(get_current_cgroup_id),	\
+++<<<<<<< HEAD
+ +	FN(get_local_storage),
+++=======
++ 	FN(get_local_storage),		\
++ 	FN(sk_select_reuseport),	\
++ 	FN(skb_ancestor_cgroup_id),	\
++ 	FN(sk_lookup_tcp),		\
++ 	FN(sk_lookup_udp),		\
++ 	FN(sk_release),
+++>>>>>>> 6acc9b432e67 (bpf: Add helper to retrieve socket in BPF)
+  
+  /* integer value in 'imm' field of BPF_CALL instruction selects which helper
+   * function eBPF program intends to call
+diff --cc kernel/bpf/verifier.c
+index 7ac5015d500f,73c81bef6ae8..000000000000
+--- a/kernel/bpf/verifier.c
++++ b/kernel/bpf/verifier.c
+@@@ -140,6 -141,24 +140,27 @@@ static const struct bpf_verifier_ops * 
+   *
+   * After the call R0 is set to return type of the function and registers R1-R5
+   * are set to NOT_INIT to indicate that they are no longer readable.
+++<<<<<<< HEAD
+++=======
++  *
++  * The following reference types represent a potential reference to a kernel
++  * resource which, after first being allocated, must be checked and freed by
++  * the BPF program:
++  * - PTR_TO_SOCKET_OR_NULL, PTR_TO_SOCKET
++  *
++  * When the verifier sees a helper call return a reference type, it allocates a
++  * pointer id for the reference and stores it in the current function state.
++  * Similar to the way that PTR_TO_MAP_VALUE_OR_NULL is converted into
++  * PTR_TO_MAP_VALUE, PTR_TO_SOCKET_OR_NULL becomes PTR_TO_SOCKET when the type
++  * passes through a NULL-check conditional. For the branch wherein the state is
++  * changed to CONST_IMM, the verifier releases the reference.
++  *
++  * For each helper function that allocates a reference, such as
++  * bpf_sk_lookup_tcp(), there is a corresponding release function, such as
++  * bpf_sk_release(). When a reference type passes into the release function,
++  * the verifier also releases the reference. If any unchecked or unreleased
++  * reference remains at the end of the program, the verifier rejects it.
+++>>>>>>> 6acc9b432e67 (bpf: Add helper to retrieve socket in BPF)
+   */
+  
+  /* verifier_state + insn_idx are pushed to stack when branch is encountered */
+@@@ -251,7 -271,42 +272,46 @@@ static bool type_is_pkt_pointer(enum bp
+  
+  static bool reg_type_may_be_null(enum bpf_reg_type type)
+  {
+++<<<<<<< HEAD
+ +	return type == PTR_TO_MAP_VALUE_OR_NULL;
+++=======
++ 	return type == PTR_TO_MAP_VALUE_OR_NULL ||
++ 	       type == PTR_TO_SOCKET_OR_NULL;
++ }
++ 
++ static bool type_is_refcounted(enum bpf_reg_type type)
++ {
++ 	return type == PTR_TO_SOCKET;
++ }
++ 
++ static bool type_is_refcounted_or_null(enum bpf_reg_type type)
++ {
++ 	return type == PTR_TO_SOCKET || type == PTR_TO_SOCKET_OR_NULL;
++ }
++ 
++ static bool reg_is_refcounted(const struct bpf_reg_state *reg)
++ {
++ 	return type_is_refcounted(reg->type);
++ }
++ 
++ static bool reg_is_refcounted_or_null(const struct bpf_reg_state *reg)
++ {
++ 	return type_is_refcounted_or_null(reg->type);
++ }
++ 
++ static bool arg_type_is_refcounted(enum bpf_arg_type type)
++ {
++ 	return type == ARG_PTR_TO_SOCKET;
++ }
++ 
++ /* Determine whether the function releases some resources allocated by another
++  * function call. The first reference type argument will be assumed to be
++  * released by release_reference().
++  */
++ static bool is_release_function(enum bpf_func_id func_id)
++ {
++ 	return func_id == BPF_FUNC_sk_release;
+++>>>>>>> 6acc9b432e67 (bpf: Add helper to retrieve socket in BPF)
+  }
+  
+  /* string representation of 'enum bpf_reg_type' */
+diff --cc tools/include/uapi/linux/bpf.h
+index dd0da04bd3ab,f9187b41dff6..000000000000
+--- a/tools/include/uapi/linux/bpf.h
++++ b/tools/include/uapi/linux/bpf.h
+@@@ -2101,6 -2136,85 +2101,88 @@@ union bpf_attr 
+   *		the shared data.
+   *	Return
+   *		Pointer to the local storage area.
+++<<<<<<< HEAD
+++=======
++  *
++  * int bpf_sk_select_reuseport(struct sk_reuseport_md *reuse, struct bpf_map *map, void *key, u64 flags)
++  *	Description
++  *		Select a SO_REUSEPORT sk from a	BPF_MAP_TYPE_REUSEPORT_ARRAY map
++  *		It checks the selected sk is matching the incoming
++  *		request in the skb.
++  *	Return
++  *		0 on success, or a negative error in case of failure.
++  *
++  * struct bpf_sock *bpf_sk_lookup_tcp(void *ctx, struct bpf_sock_tuple *tuple, u32 tuple_size, u32 netns, u64 flags)
++  *	Description
++  *		Look for TCP socket matching *tuple*, optionally in a child
++  *		network namespace *netns*. The return value must be checked,
++  *		and if non-NULL, released via **bpf_sk_release**\ ().
++  *
++  *		The *ctx* should point to the context of the program, such as
++  *		the skb or socket (depending on the hook in use). This is used
++  *		to determine the base network namespace for the lookup.
++  *
++  *		*tuple_size* must be one of:
++  *
++  *		**sizeof**\ (*tuple*\ **->ipv4**)
++  *			Look for an IPv4 socket.
++  *		**sizeof**\ (*tuple*\ **->ipv6**)
++  *			Look for an IPv6 socket.
++  *
++  *		If the *netns* is zero, then the socket lookup table in the
++  *		netns associated with the *ctx* will be used. For the TC hooks,
++  *		this in the netns of the device in the skb. For socket hooks,
++  *		this in the netns of the socket. If *netns* is non-zero, then
++  *		it specifies the ID of the netns relative to the netns
++  *		associated with the *ctx*.
++  *
++  *		All values for *flags* are reserved for future usage, and must
++  *		be left at zero.
++  *
++  *		This helper is available only if the kernel was compiled with
++  *		**CONFIG_NET** configuration option.
++  *	Return
++  *		Pointer to *struct bpf_sock*, or NULL in case of failure.
++  *
++  * struct bpf_sock *bpf_sk_lookup_udp(void *ctx, struct bpf_sock_tuple *tuple, u32 tuple_size, u32 netns, u64 flags)
++  *	Description
++  *		Look for UDP socket matching *tuple*, optionally in a child
++  *		network namespace *netns*. The return value must be checked,
++  *		and if non-NULL, released via **bpf_sk_release**\ ().
++  *
++  *		The *ctx* should point to the context of the program, such as
++  *		the skb or socket (depending on the hook in use). This is used
++  *		to determine the base network namespace for the lookup.
++  *
++  *		*tuple_size* must be one of:
++  *
++  *		**sizeof**\ (*tuple*\ **->ipv4**)
++  *			Look for an IPv4 socket.
++  *		**sizeof**\ (*tuple*\ **->ipv6**)
++  *			Look for an IPv6 socket.
++  *
++  *		If the *netns* is zero, then the socket lookup table in the
++  *		netns associated with the *ctx* will be used. For the TC hooks,
++  *		this in the netns of the device in the skb. For socket hooks,
++  *		this in the netns of the socket. If *netns* is non-zero, then
++  *		it specifies the ID of the netns relative to the netns
++  *		associated with the *ctx*.
++  *
++  *		All values for *flags* are reserved for future usage, and must
++  *		be left at zero.
++  *
++  *		This helper is available only if the kernel was compiled with
++  *		**CONFIG_NET** configuration option.
++  *	Return
++  *		Pointer to *struct bpf_sock*, or NULL in case of failure.
++  *
++  * int bpf_sk_release(struct bpf_sock *sk)
++  *	Description
++  *		Release the reference held by *sock*. *sock* must be a non-NULL
++  *		pointer that was returned from bpf_sk_lookup_xxx\ ().
++  *	Return
++  *		0 on success, or a negative error in case of failure.
+++>>>>>>> 6acc9b432e67 (bpf: Add helper to retrieve socket in BPF)
+   */
+  #define __BPF_FUNC_MAPPER(FN)		\
+  	FN(unspec),			\
+@@@ -2184,7 -2298,12 +2266,16 @@@
+  	FN(rc_keydown),			\
+  	FN(skb_cgroup_id),		\
+  	FN(get_current_cgroup_id),	\
+++<<<<<<< HEAD
+ +	FN(get_local_storage),
+++=======
++ 	FN(get_local_storage),		\
++ 	FN(sk_select_reuseport),	\
++ 	FN(skb_ancestor_cgroup_id),	\
++ 	FN(sk_lookup_tcp),		\
++ 	FN(sk_lookup_udp),		\
++ 	FN(sk_release),
+++>>>>>>> 6acc9b432e67 (bpf: Add helper to retrieve socket in BPF)
+  
+  /* integer value in 'imm' field of BPF_CALL instruction selects which helper
+   * function eBPF program intends to call
+* Unmerged path include/uapi/linux/bpf.h
+* Unmerged path kernel/bpf/verifier.c
+diff --git a/net/core/filter.c b/net/core/filter.c
+index 9215221d9011..0d7a01865d03 100644
+--- a/net/core/filter.c
++++ b/net/core/filter.c
+@@ -58,13 +58,17 @@
+ #include <net/busy_poll.h>
+ #include <net/tcp.h>
+ #include <net/xfrm.h>
++#include <net/udp.h>
+ #include <linux/bpf_trace.h>
+ #include <net/xdp_sock.h>
+ #include <linux/inetdevice.h>
++#include <net/inet_hashtables.h>
++#include <net/inet6_hashtables.h>
+ #include <net/ip_fib.h>
+ #include <net/flow.h>
+ #include <net/arp.h>
+ #include <net/ipv6.h>
++#include <net/net_namespace.h>
+ #include <linux/seg6_local.h>
+ #include <net/seg6.h>
+ #include <net/seg6_local.h>
+@@ -4737,6 +4741,141 @@ static const struct bpf_func_proto bpf_lwt_seg6_adjust_srh_proto = {
+ };
+ #endif /* CONFIG_IPV6_SEG6_BPF */
+ 
++struct sock *sk_lookup(struct net *net, struct bpf_sock_tuple *tuple,
++		       struct sk_buff *skb, u8 family, u8 proto)
++{
++	int dif = skb->dev->ifindex;
++	bool refcounted = false;
++	struct sock *sk = NULL;
++
++	if (family == AF_INET) {
++		__be32 src4 = tuple->ipv4.saddr;
++		__be32 dst4 = tuple->ipv4.daddr;
++		int sdif = inet_sdif(skb);
++
++		if (proto == IPPROTO_TCP)
++			sk = __inet_lookup(net, &tcp_hashinfo, skb, 0,
++					   src4, tuple->ipv4.sport,
++					   dst4, tuple->ipv4.dport,
++					   dif, sdif, &refcounted);
++		else
++			sk = __udp4_lib_lookup(net, src4, tuple->ipv4.sport,
++					       dst4, tuple->ipv4.dport,
++					       dif, sdif, &udp_table, skb);
++#if IS_ENABLED(CONFIG_IPV6)
++	} else {
++		struct in6_addr *src6 = (struct in6_addr *)&tuple->ipv6.saddr;
++		struct in6_addr *dst6 = (struct in6_addr *)&tuple->ipv6.daddr;
++		int sdif = inet6_sdif(skb);
++
++		if (proto == IPPROTO_TCP)
++			sk = __inet6_lookup(net, &tcp_hashinfo, skb, 0,
++					    src6, tuple->ipv6.sport,
++					    dst6, tuple->ipv6.dport,
++					    dif, sdif, &refcounted);
++		else
++			sk = __udp6_lib_lookup(net, src6, tuple->ipv6.sport,
++					       dst6, tuple->ipv6.dport,
++					       dif, sdif, &udp_table, skb);
++#endif
++	}
++
++	if (unlikely(sk && !refcounted && !sock_flag(sk, SOCK_RCU_FREE))) {
++		WARN_ONCE(1, "Found non-RCU, unreferenced socket!");
++		sk = NULL;
++	}
++	return sk;
++}
++
++/* bpf_sk_lookup performs the core lookup for different types of sockets,
++ * taking a reference on the socket if it doesn't have the flag SOCK_RCU_FREE.
++ * Returns the socket as an 'unsigned long' to simplify the casting in the
++ * callers to satisfy BPF_CALL declarations.
++ */
++static unsigned long
++bpf_sk_lookup(struct sk_buff *skb, struct bpf_sock_tuple *tuple, u32 len,
++	      u8 proto, u64 netns_id, u64 flags)
++{
++	struct net *caller_net;
++	struct sock *sk = NULL;
++	u8 family = AF_UNSPEC;
++	struct net *net;
++
++	family = len == sizeof(tuple->ipv4) ? AF_INET : AF_INET6;
++	if (unlikely(family == AF_UNSPEC || netns_id > U32_MAX || flags))
++		goto out;
++
++	if (skb->dev)
++		caller_net = dev_net(skb->dev);
++	else
++		caller_net = sock_net(skb->sk);
++	if (netns_id) {
++		net = get_net_ns_by_id(caller_net, netns_id);
++		if (unlikely(!net))
++			goto out;
++		sk = sk_lookup(net, tuple, skb, family, proto);
++		put_net(net);
++	} else {
++		net = caller_net;
++		sk = sk_lookup(net, tuple, skb, family, proto);
++	}
++
++	if (sk)
++		sk = sk_to_full_sk(sk);
++out:
++	return (unsigned long) sk;
++}
++
++BPF_CALL_5(bpf_sk_lookup_tcp, struct sk_buff *, skb,
++	   struct bpf_sock_tuple *, tuple, u32, len, u64, netns_id, u64, flags)
++{
++	return bpf_sk_lookup(skb, tuple, len, IPPROTO_TCP, netns_id, flags);
++}
++
++static const struct bpf_func_proto bpf_sk_lookup_tcp_proto = {
++	.func		= bpf_sk_lookup_tcp,
++	.gpl_only	= false,
++	.pkt_access	= true,
++	.ret_type	= RET_PTR_TO_SOCKET_OR_NULL,
++	.arg1_type	= ARG_PTR_TO_CTX,
++	.arg2_type	= ARG_PTR_TO_MEM,
++	.arg3_type	= ARG_CONST_SIZE,
++	.arg4_type	= ARG_ANYTHING,
++	.arg5_type	= ARG_ANYTHING,
++};
++
++BPF_CALL_5(bpf_sk_lookup_udp, struct sk_buff *, skb,
++	   struct bpf_sock_tuple *, tuple, u32, len, u64, netns_id, u64, flags)
++{
++	return bpf_sk_lookup(skb, tuple, len, IPPROTO_UDP, netns_id, flags);
++}
++
++static const struct bpf_func_proto bpf_sk_lookup_udp_proto = {
++	.func		= bpf_sk_lookup_udp,
++	.gpl_only	= false,
++	.pkt_access	= true,
++	.ret_type	= RET_PTR_TO_SOCKET_OR_NULL,
++	.arg1_type	= ARG_PTR_TO_CTX,
++	.arg2_type	= ARG_PTR_TO_MEM,
++	.arg3_type	= ARG_CONST_SIZE,
++	.arg4_type	= ARG_ANYTHING,
++	.arg5_type	= ARG_ANYTHING,
++};
++
++BPF_CALL_1(bpf_sk_release, struct sock *, sk)
++{
++	if (!sock_flag(sk, SOCK_RCU_FREE))
++		sock_gen_put(sk);
++	return 0;
++}
++
++static const struct bpf_func_proto bpf_sk_release_proto = {
++	.func		= bpf_sk_release,
++	.gpl_only	= false,
++	.ret_type	= RET_INTEGER,
++	.arg1_type	= ARG_PTR_TO_SOCKET,
++};
++
+ bool bpf_helper_changes_pkt_data(void *func)
+ {
+ 	if (func == bpf_skb_vlan_push ||
+@@ -4940,6 +5079,12 @@ tc_cls_act_func_proto(enum bpf_func_id func_id, const struct bpf_prog *prog)
+ 	case BPF_FUNC_skb_cgroup_id:
+ 		return &bpf_skb_cgroup_id_proto;
+ #endif
++	case BPF_FUNC_sk_lookup_tcp:
++		return &bpf_sk_lookup_tcp_proto;
++	case BPF_FUNC_sk_lookup_udp:
++		return &bpf_sk_lookup_udp_proto;
++	case BPF_FUNC_sk_release:
++		return &bpf_sk_release_proto;
+ 	default:
+ 		return bpf_base_func_proto(func_id);
+ 	}
+@@ -5040,6 +5185,12 @@ sk_skb_func_proto(enum bpf_func_id func_id, const struct bpf_prog *prog)
+ 		return &bpf_sk_redirect_hash_proto;
+ 	case BPF_FUNC_get_local_storage:
+ 		return &bpf_get_local_storage_proto;
++	case BPF_FUNC_sk_lookup_tcp:
++		return &bpf_sk_lookup_tcp_proto;
++	case BPF_FUNC_sk_lookup_udp:
++		return &bpf_sk_lookup_udp_proto;
++	case BPF_FUNC_sk_release:
++		return &bpf_sk_release_proto;
+ 	default:
+ 		return bpf_base_func_proto(func_id);
+ 	}
+* Unmerged path tools/include/uapi/linux/bpf.h
+diff --git a/tools/testing/selftests/bpf/bpf_helpers.h b/tools/testing/selftests/bpf/bpf_helpers.h
+index e4be7730222d..1d407b3494f9 100644
+--- a/tools/testing/selftests/bpf/bpf_helpers.h
++++ b/tools/testing/selftests/bpf/bpf_helpers.h
+@@ -143,6 +143,18 @@ static unsigned long long (*bpf_skb_cgroup_id)(void *ctx) =
+ 	(void *) BPF_FUNC_skb_cgroup_id;
+ static unsigned long long (*bpf_skb_ancestor_cgroup_id)(void *ctx, int level) =
+ 	(void *) BPF_FUNC_skb_ancestor_cgroup_id;
++static struct bpf_sock *(*bpf_sk_lookup_tcp)(void *ctx,
++					     struct bpf_sock_tuple *tuple,
++					     int size, unsigned int netns_id,
++					     unsigned long long flags) =
++	(void *) BPF_FUNC_sk_lookup_tcp;
++static struct bpf_sock *(*bpf_sk_lookup_udp)(void *ctx,
++					     struct bpf_sock_tuple *tuple,
++					     int size, unsigned int netns_id,
++					     unsigned long long flags) =
++	(void *) BPF_FUNC_sk_lookup_udp;
++static int (*bpf_sk_release)(struct bpf_sock *sk) =
++	(void *) BPF_FUNC_sk_release;
+ 
+ /* llvm builtin functions that eBPF C program may use to
+  * emit BPF_LD_ABS and BPF_LD_IND instructions
