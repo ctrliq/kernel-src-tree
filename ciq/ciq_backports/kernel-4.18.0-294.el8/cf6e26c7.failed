@@ -1,0 +1,741 @@
+ASoC: soc-component: merge snd_soc_component_read() and snd_soc_component_read32()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+Rebuild_CHGLOG: - [sound] ALSA: ASoC: soc-component: merge snd_soc_component_read() and snd_soc_component_read32() (Jaroslav Kysela) [1869536]
+Rebuild_FUZZ: 96.47%
+commit-author Kuninori Morimoto <kuninori.morimoto.gx@renesas.com>
+commit cf6e26c71bfdff823fd40945b07666d75f1e1412
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/cf6e26c7.failed
+
+We had read/write function for Codec, Platform, etc,
+but these has been merged into snd_soc_component_read/write().
+
+Internally, it is using regmap or driver function.
+In read case, each styles are like below
+
+regmap
+	ret = regmap_read(..., reg, &val);
+
+driver function
+	val = xxx->read(..., reg);
+
+Because of this kind of different style, to keep same read style,
+when we merged each read function into snd_soc_component_read(),
+we created snd_soc_component_read32(), like below.
+commit 738b49efe6c6 ("ASoC: add snd_soc_component_read32")
+
+(1)	val = snd_soc_component_read32(component, reg);
+
+(2)	ret = snd_soc_component_read(component, reg, &val);
+
+Many drivers are using snd_soc_component_read32(), and
+some drivers are using snd_soc_component_read() today.
+
+In generally, we don't check read function successes,
+because, we will have many other issues at initial timing
+if read function didn't work.
+
+Now we can use soc_component_err() when error case.
+This means, it is easy to notice if error occurred.
+
+This patch aggressively merge snd_soc_component_read() and _read32(),
+and makes snd_soc_component_read/write() as generally style.
+
+This patch do
+	1) merge snd_soc_component_read() and snd_soc_component_read32()
+	2) it uses soc_component_err() when error case (easy to notice)
+	3) keeps read32 for now by #define
+	4) update snd_soc_component_read() for all drivers
+
+Because _read() user drivers are not too many, this patch changes
+all user drivers.
+
+	Signed-off-by: Kuninori Morimoto <kuninori.morimoto.gx@renesas.com>
+	Reviewed-by: Kai Vehmanen <kai.vehmanen@linux.intel.com>
+Link: https://lore.kernel.org/r/87sgev4mfl.wl-kuninori.morimoto.gx@renesas.com
+	Signed-off-by: Mark Brown <broonie@kernel.org>
+(cherry picked from commit cf6e26c71bfdff823fd40945b07666d75f1e1412)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	sound/soc/codecs/cs47l35.c
+#	sound/soc/codecs/cs47l85.c
+#	sound/soc/codecs/madera.c
+#	sound/soc/meson/aiu-encoder-i2s.c
+#	sound/soc/meson/aiu-fifo-i2s.c
+#	sound/soc/meson/aiu-fifo.c
+#	sound/soc/soc-component.c
+diff --cc sound/soc/soc-component.c
+index 7624ff5b67d3,428f88decfdb..000000000000
+--- a/sound/soc/soc-component.c
++++ b/sound/soc/soc-component.c
+@@@ -400,6 -403,181 +400,184 @@@ EXPORT_SYMBOL_GPL(snd_soc_component_exi
+  
+  #endif
+  
+++<<<<<<< HEAD
+++=======
++ /**
++  * snd_soc_component_read() - Read register value
++  * @component: Component to read from
++  * @reg: Register to read
++  *
++  * Return: read value
++  */
++ unsigned int snd_soc_component_read(struct snd_soc_component *component,
++ 				    unsigned int reg)
++ {
++ 	int ret;
++ 	unsigned int val = 0;
++ 
++ 	if (component->regmap)
++ 		ret = regmap_read(component->regmap, reg, &val);
++ 	else if (component->driver->read) {
++ 		ret = 0;
++ 		val = component->driver->read(component, reg);
++ 	}
++ 	else
++ 		ret = -EIO;
++ 
++ 	if (ret < 0)
++ 		soc_component_ret(component, ret);
++ 
++ 	return val;
++ }
++ EXPORT_SYMBOL_GPL(snd_soc_component_read);
++ 
++ /**
++  * snd_soc_component_write() - Write register value
++  * @component: Component to write to
++  * @reg: Register to write
++  * @val: Value to write to the register
++  *
++  * Return: 0 on success, a negative error code otherwise.
++  */
++ int snd_soc_component_write(struct snd_soc_component *component,
++ 			    unsigned int reg, unsigned int val)
++ {
++ 	int ret = -EIO;
++ 
++ 	if (component->regmap)
++ 		ret = regmap_write(component->regmap, reg, val);
++ 	else if (component->driver->write)
++ 		ret = component->driver->write(component, reg, val);
++ 
++ 	return soc_component_ret(component, ret);
++ }
++ EXPORT_SYMBOL_GPL(snd_soc_component_write);
++ 
++ static int snd_soc_component_update_bits_legacy(
++ 	struct snd_soc_component *component, unsigned int reg,
++ 	unsigned int mask, unsigned int val, bool *change)
++ {
++ 	unsigned int old, new;
++ 	int ret = 0;
++ 
++ 	mutex_lock(&component->io_mutex);
++ 
++ 	old = snd_soc_component_read(component, reg);
++ 
++ 	new = (old & ~mask) | (val & mask);
++ 	*change = old != new;
++ 	if (*change)
++ 		ret = snd_soc_component_write(component, reg, new);
++ 
++ 	mutex_unlock(&component->io_mutex);
++ 
++ 	return soc_component_ret(component, ret);
++ }
++ 
++ /**
++  * snd_soc_component_update_bits() - Perform read/modify/write cycle
++  * @component: Component to update
++  * @reg: Register to update
++  * @mask: Mask that specifies which bits to update
++  * @val: New value for the bits specified by mask
++  *
++  * Return: 1 if the operation was successful and the value of the register
++  * changed, 0 if the operation was successful, but the value did not change.
++  * Returns a negative error code otherwise.
++  */
++ int snd_soc_component_update_bits(struct snd_soc_component *component,
++ 				  unsigned int reg, unsigned int mask, unsigned int val)
++ {
++ 	bool change;
++ 	int ret;
++ 
++ 	if (component->regmap)
++ 		ret = regmap_update_bits_check(component->regmap, reg, mask,
++ 					       val, &change);
++ 	else
++ 		ret = snd_soc_component_update_bits_legacy(component, reg,
++ 							   mask, val, &change);
++ 
++ 	if (ret < 0)
++ 		return soc_component_ret(component, ret);
++ 	return change;
++ }
++ EXPORT_SYMBOL_GPL(snd_soc_component_update_bits);
++ 
++ /**
++  * snd_soc_component_update_bits_async() - Perform asynchronous
++  *  read/modify/write cycle
++  * @component: Component to update
++  * @reg: Register to update
++  * @mask: Mask that specifies which bits to update
++  * @val: New value for the bits specified by mask
++  *
++  * This function is similar to snd_soc_component_update_bits(), but the update
++  * operation is scheduled asynchronously. This means it may not be completed
++  * when the function returns. To make sure that all scheduled updates have been
++  * completed snd_soc_component_async_complete() must be called.
++  *
++  * Return: 1 if the operation was successful and the value of the register
++  * changed, 0 if the operation was successful, but the value did not change.
++  * Returns a negative error code otherwise.
++  */
++ int snd_soc_component_update_bits_async(struct snd_soc_component *component,
++ 					unsigned int reg, unsigned int mask, unsigned int val)
++ {
++ 	bool change;
++ 	int ret;
++ 
++ 	if (component->regmap)
++ 		ret = regmap_update_bits_check_async(component->regmap, reg,
++ 						     mask, val, &change);
++ 	else
++ 		ret = snd_soc_component_update_bits_legacy(component, reg,
++ 							   mask, val, &change);
++ 
++ 	if (ret < 0)
++ 		return soc_component_ret(component, ret);
++ 	return change;
++ }
++ EXPORT_SYMBOL_GPL(snd_soc_component_update_bits_async);
++ 
++ /**
++  * snd_soc_component_async_complete() - Ensure asynchronous I/O has completed
++  * @component: Component for which to wait
++  *
++  * This function blocks until all asynchronous I/O which has previously been
++  * scheduled using snd_soc_component_update_bits_async() has completed.
++  */
++ void snd_soc_component_async_complete(struct snd_soc_component *component)
++ {
++ 	if (component->regmap)
++ 		regmap_async_complete(component->regmap);
++ }
++ EXPORT_SYMBOL_GPL(snd_soc_component_async_complete);
++ 
++ /**
++  * snd_soc_component_test_bits - Test register for change
++  * @component: component
++  * @reg: Register to test
++  * @mask: Mask that specifies which bits to test
++  * @value: Value to test against
++  *
++  * Tests a register with a new value and checks if the new value is
++  * different from the old value.
++  *
++  * Return: 1 for change, otherwise 0.
++  */
++ int snd_soc_component_test_bits(struct snd_soc_component *component,
++ 				unsigned int reg, unsigned int mask, unsigned int value)
++ {
++ 	unsigned int old, new;
++ 
++ 	old = snd_soc_component_read(component, reg);
++ 	new = (old & ~mask) | value;
++ 	return old != new;
++ }
++ EXPORT_SYMBOL_GPL(snd_soc_component_test_bits);
++ 
+++>>>>>>> cf6e26c71bfd (ASoC: soc-component: merge snd_soc_component_read() and snd_soc_component_read32())
+  int snd_soc_pcm_component_pointer(struct snd_pcm_substream *substream)
+  {
+  	struct snd_soc_pcm_runtime *rtd = substream->private_data;
+* Unmerged path sound/soc/codecs/cs47l35.c
+* Unmerged path sound/soc/codecs/cs47l85.c
+* Unmerged path sound/soc/codecs/madera.c
+* Unmerged path sound/soc/meson/aiu-encoder-i2s.c
+* Unmerged path sound/soc/meson/aiu-fifo-i2s.c
+* Unmerged path sound/soc/meson/aiu-fifo.c
+diff --git a/include/sound/soc-component.h b/include/sound/soc-component.h
+index 4a4bb723ca9f..f64cffa12967 100644
+--- a/include/sound/soc-component.h
++++ b/include/sound/soc-component.h
+@@ -333,9 +333,8 @@ void snd_soc_component_set_aux(struct snd_soc_component *component,
+ int snd_soc_component_init(struct snd_soc_component *component);
+ 
+ /* component IO */
+-int snd_soc_component_read(struct snd_soc_component *component,
+-			   unsigned int reg, unsigned int *val);
+-unsigned int snd_soc_component_read32(struct snd_soc_component *component,
++#define snd_soc_component_read32 snd_soc_component_read
++unsigned int snd_soc_component_read(struct snd_soc_component *component,
+ 				      unsigned int reg);
+ int snd_soc_component_write(struct snd_soc_component *component,
+ 			    unsigned int reg, unsigned int val);
+diff --git a/sound/soc/codecs/ak4613.c b/sound/soc/codecs/ak4613.c
+index c1181a20714d..d4d2f0d9231a 100644
+--- a/sound/soc/codecs/ak4613.c
++++ b/sound/soc/codecs/ak4613.c
+@@ -490,8 +490,8 @@ static void ak4613_dummy_write(struct work_struct *work)
+ 	 */
+ 	udelay(5000000 / priv->rate);
+ 
+-	snd_soc_component_read(component, PW_MGMT1, &mgmt1);
+-	snd_soc_component_read(component, PW_MGMT3, &mgmt3);
++	mgmt1 = snd_soc_component_read(component, PW_MGMT1);
++	mgmt3 = snd_soc_component_read(component, PW_MGMT3);
+ 
+ 	snd_soc_component_write(component, PW_MGMT1, mgmt1);
+ 	snd_soc_component_write(component, PW_MGMT3, mgmt3);
+* Unmerged path sound/soc/codecs/cs47l35.c
+* Unmerged path sound/soc/codecs/cs47l85.c
+diff --git a/sound/soc/codecs/inno_rk3036.c b/sound/soc/codecs/inno_rk3036.c
+index 14d8fe1c28a4..d0e8f0d2fbc1 100644
+--- a/sound/soc/codecs/inno_rk3036.c
++++ b/sound/soc/codecs/inno_rk3036.c
+@@ -48,11 +48,9 @@ static int rk3036_codec_antipop_get(struct snd_kcontrol *kcontrol,
+ 				    struct snd_ctl_elem_value *ucontrol)
+ {
+ 	struct snd_soc_component *component = snd_kcontrol_chip(kcontrol);
+-	int val, ret, regval;
++	int val, regval;
+ 
+-	ret = snd_soc_component_read(component, INNO_R09, &regval);
+-	if (ret)
+-		return ret;
++	regval = snd_soc_component_read(component, INNO_R09);
+ 	val = ((regval >> INNO_R09_HPL_ANITPOP_SHIFT) &
+ 	       INNO_R09_HP_ANTIPOP_MSK) == INNO_R09_HP_ANTIPOP_ON;
+ 	ucontrol->value.integer.value[0] = val;
+* Unmerged path sound/soc/codecs/madera.c
+diff --git a/sound/soc/codecs/nau8822.c b/sound/soc/codecs/nau8822.c
+index 78db3bd0b3bc..a4f661335c57 100644
+--- a/sound/soc/codecs/nau8822.c
++++ b/sound/soc/codecs/nau8822.c
+@@ -831,7 +831,7 @@ static int nau8822_hw_params(struct snd_pcm_substream *substream,
+ 	unsigned int ctrl_val, bclk_fs, bclk_div;
+ 
+ 	/* make BCLK and LRC divide configuration if the codec as master. */
+-	snd_soc_component_read(component, NAU8822_REG_CLOCKING, &ctrl_val);
++	ctrl_val = snd_soc_component_read(component, NAU8822_REG_CLOCKING);
+ 	if (ctrl_val & NAU8822_CLK_MASTER) {
+ 		/* get the bclk and fs ratio */
+ 		bclk_fs = snd_soc_params_to_bclk(params) / params_rate(params);
+diff --git a/sound/soc/codecs/rt1305.c b/sound/soc/codecs/rt1305.c
+index e27742abfa76..4e9dfd235e59 100644
+--- a/sound/soc/codecs/rt1305.c
++++ b/sound/soc/codecs/rt1305.c
+@@ -411,7 +411,7 @@ static int rt1305_is_rc_clk_from_pll(struct snd_soc_dapm_widget *source,
+ 	struct rt1305_priv *rt1305 = snd_soc_component_get_drvdata(component);
+ 	unsigned int val;
+ 
+-	snd_soc_component_read(component, RT1305_CLK_1, &val);
++	val = snd_soc_component_read(component, RT1305_CLK_1);
+ 
+ 	if (rt1305->sysclk_src == RT1305_FS_SYS_PRE_S_PLL1 &&
+ 		(val & RT1305_SEL_PLL_SRC_2_RCCLK))
+diff --git a/sound/soc/codecs/rt5682.c b/sound/soc/codecs/rt5682.c
+index 36cfd10f8b04..8b592069a7e2 100644
+--- a/sound/soc/codecs/rt5682.c
++++ b/sound/soc/codecs/rt5682.c
+@@ -2640,8 +2640,7 @@ static unsigned long rt5682_bclk_recalc_rate(struct clk_hw *hw,
+ 	struct snd_soc_component *component = rt5682->component;
+ 	unsigned int bclks_per_wclk;
+ 
+-	snd_soc_component_read(component, RT5682_TDM_TCON_CTRL,
+-		&bclks_per_wclk);
++	bclks_per_wclk = snd_soc_component_read(component, RT5682_TDM_TCON_CTRL);
+ 
+ 	switch (bclks_per_wclk & RT5682_TDM_BCLK_MS1_MASK) {
+ 	case RT5682_TDM_BCLK_MS1_256:
+diff --git a/sound/soc/codecs/tas5720.c b/sound/soc/codecs/tas5720.c
+index 37fab8f22800..e159f839d928 100644
+--- a/sound/soc/codecs/tas5720.c
++++ b/sound/soc/codecs/tas5720.c
+@@ -508,10 +508,10 @@ static int tas5722_volume_get(struct snd_kcontrol *kcontrol,
+ 	struct snd_soc_component *component = snd_soc_kcontrol_component(kcontrol);
+ 	unsigned int val;
+ 
+-	snd_soc_component_read(component, TAS5720_VOLUME_CTRL_REG, &val);
++	val = snd_soc_component_read(component, TAS5720_VOLUME_CTRL_REG);
+ 	ucontrol->value.integer.value[0] = val << 1;
+ 
+-	snd_soc_component_read(component, TAS5722_DIGITAL_CTRL2_REG, &val);
++	val = snd_soc_component_read(component, TAS5722_DIGITAL_CTRL2_REG);
+ 	ucontrol->value.integer.value[0] |= val & TAS5722_VOL_CONTROL_LSB;
+ 
+ 	return 0;
+diff --git a/sound/soc/codecs/tda7419.c b/sound/soc/codecs/tda7419.c
+index 2bf4f5e8af27..83d220054c96 100644
+--- a/sound/soc/codecs/tda7419.c
++++ b/sound/soc/codecs/tda7419.c
+@@ -187,18 +187,13 @@ static int tda7419_vol_get(struct snd_kcontrol *kcontrol,
+ 	int thresh = tvc->thresh;
+ 	unsigned int invert = tvc->invert;
+ 	int val;
+-	int ret;
+ 
+-	ret = snd_soc_component_read(component, reg, &val);
+-	if (ret < 0)
+-		return ret;
++	val = snd_soc_component_read(component, reg);
+ 	ucontrol->value.integer.value[0] =
+ 		tda7419_vol_get_value(val, mask, min, thresh, invert);
+ 
+ 	if (tda7419_vol_is_stereo(tvc)) {
+-		ret = snd_soc_component_read(component, rreg, &val);
+-		if (ret < 0)
+-			return ret;
++		val = snd_soc_component_read(component, rreg);
+ 		ucontrol->value.integer.value[1] =
+ 			tda7419_vol_get_value(val, mask, min, thresh, invert);
+ 	}
+diff --git a/sound/soc/codecs/tscs454.c b/sound/soc/codecs/tscs454.c
+index c3587af9985c..d0af16b4db2f 100644
+--- a/sound/soc/codecs/tscs454.c
++++ b/sound/soc/codecs/tscs454.c
+@@ -353,12 +353,7 @@ static int write_coeff_ram(struct snd_soc_component *component, u8 *coeff_ram,
+ 	for (cnt = 0; cnt < coeff_cnt; cnt++, coeff_addr++) {
+ 
+ 		for (trys = 0; trys < DACCRSTAT_MAX_TRYS; trys++) {
+-			ret = snd_soc_component_read(component, r_stat, &val);
+-			if (ret < 0) {
+-				dev_err(component->dev,
+-					"Failed to read stat (%d)\n", ret);
+-				return ret;
+-			}
++			val = snd_soc_component_read(component, r_stat);
+ 			if (!val)
+ 				break;
+ 		}
+@@ -444,12 +439,7 @@ static int coeff_ram_put(struct snd_kcontrol *kcontrol,
+ 	mutex_lock(&tscs454->pll1.lock);
+ 	mutex_lock(&tscs454->pll2.lock);
+ 
+-	ret = snd_soc_component_read(component, R_PLLSTAT, &val);
+-	if (ret < 0) {
+-		dev_err(component->dev, "Failed to read PLL status (%d)\n",
+-				ret);
+-		goto exit;
+-	}
++	val = snd_soc_component_read(component, R_PLLSTAT);
+ 	if (val) { /* PLLs locked */
+ 		ret = write_coeff_ram(component, coeff_ram,
+ 			r_stat, r_addr, r_wr,
+@@ -2642,13 +2632,10 @@ static int tscs454_set_sysclk(struct snd_soc_dai *dai,
+ 	struct tscs454 *tscs454 = snd_soc_component_get_drvdata(component);
+ 	unsigned int val;
+ 	int bclk_dai;
+-	int ret;
+ 
+ 	dev_dbg(component->dev, "%s(): freq = %u\n", __func__, freq);
+ 
+-	ret = snd_soc_component_read(component, R_PLLCTL, &val);
+-	if (ret < 0)
+-		return ret;
++	val = snd_soc_component_read(component, R_PLLCTL);
+ 
+ 	bclk_dai = (val & FM_PLLCTL_BCLKSEL) >> FB_PLLCTL_BCLKSEL;
+ 	if (bclk_dai != dai->id)
+@@ -3204,10 +3191,7 @@ static int tscs454_hw_params(struct snd_pcm_substream *substream,
+ 	}
+ 
+ 	if (!aifs_active(&tscs454->aifs_status)) { /* First active aif */
+-		ret = snd_soc_component_read(component, R_ISRC, &val);
+-		if (ret < 0)
+-			goto exit;
+-
++		val = snd_soc_component_read(component, R_ISRC);
+ 		if ((val & FM_ISRC_IBR) == FV_IBR_48)
+ 			tscs454->internal_rate.pll = &tscs454->pll1;
+ 		else
+diff --git a/sound/soc/fsl/fsl_audmix.c b/sound/soc/fsl/fsl_audmix.c
+index 8b9027f76d8a..a447bafa00d2 100644
+--- a/sound/soc/fsl/fsl_audmix.c
++++ b/sound/soc/fsl/fsl_audmix.c
+@@ -116,13 +116,9 @@ static int fsl_audmix_put_mix_clk_src(struct snd_kcontrol *kcontrol,
+ 	struct soc_enum *e = (struct soc_enum *)kcontrol->private_value;
+ 	unsigned int *item = ucontrol->value.enumerated.item;
+ 	unsigned int reg_val, val, mix_clk;
+-	int ret;
+ 
+ 	/* Get current state */
+-	ret = snd_soc_component_read(comp, FSL_AUDMIX_CTR, &reg_val);
+-	if (ret)
+-		return ret;
+-
++	reg_val = snd_soc_component_read(comp, FSL_AUDMIX_CTR);
+ 	mix_clk = ((reg_val & FSL_AUDMIX_CTR_MIXCLK_MASK)
+ 			>> FSL_AUDMIX_CTR_MIXCLK_SHIFT);
+ 	val = snd_soc_enum_item_to_val(e, item[0]);
+@@ -162,9 +158,7 @@ static int fsl_audmix_put_out_src(struct snd_kcontrol *kcontrol,
+ 	int ret;
+ 
+ 	/* Get current state */
+-	ret = snd_soc_component_read(comp, FSL_AUDMIX_CTR, &reg_val);
+-	if (ret)
+-		return ret;
++	reg_val = snd_soc_component_read(comp, FSL_AUDMIX_CTR);
+ 
+ 	/* "From" state */
+ 	out_src = ((reg_val & FSL_AUDMIX_CTR_OUTSRC_MASK)
+diff --git a/sound/soc/fsl/fsl_easrc.c b/sound/soc/fsl/fsl_easrc.c
+index 2f6b3d8bfcfc..58cc093ad741 100644
+--- a/sound/soc/fsl/fsl_easrc.c
++++ b/sound/soc/fsl/fsl_easrc.c
+@@ -79,11 +79,8 @@ static int fsl_easrc_get_reg(struct snd_kcontrol *kcontrol,
+ 	struct soc_mreg_control *mc =
+ 		(struct soc_mreg_control *)kcontrol->private_value;
+ 	unsigned int regval;
+-	int ret;
+ 
+-	ret = snd_soc_component_read(component, mc->regbase, &regval);
+-	if (ret < 0)
+-		return ret;
++	regval = snd_soc_component_read(component, mc->regbase);
+ 
+ 	ucontrol->value.integer.value[0] = regval;
+ 
+* Unmerged path sound/soc/meson/aiu-encoder-i2s.c
+* Unmerged path sound/soc/meson/aiu-fifo-i2s.c
+* Unmerged path sound/soc/meson/aiu-fifo.c
+diff --git a/sound/soc/soc-ac97.c b/sound/soc/soc-ac97.c
+index c086786e4471..906106ed8ca1 100644
+--- a/sound/soc/soc-ac97.c
++++ b/sound/soc/soc-ac97.c
+@@ -82,13 +82,12 @@ static int snd_soc_ac97_gpio_get(struct gpio_chip *chip, unsigned offset)
+ 	struct snd_soc_component *component = gpio_to_component(chip);
+ 	int ret;
+ 
+-	if (snd_soc_component_read(component, AC97_GPIO_STATUS, &ret) < 0)
+-		ret = -1;
++	ret = snd_soc_component_read(component, AC97_GPIO_STATUS);
+ 
+ 	dev_dbg(component->dev, "get gpio %d : %d\n", offset,
+-		ret < 0 ? ret : ret & (1 << offset));
++		ret & (1 << offset));
+ 
+-	return ret < 0 ? ret : !!(ret & (1 << offset));
++	return !!(ret & (1 << offset));
+ }
+ 
+ static void snd_soc_ac97_gpio_set(struct gpio_chip *chip, unsigned offset,
+* Unmerged path sound/soc/soc-component.c
+diff --git a/sound/soc/soc-dapm.c b/sound/soc/soc-dapm.c
+index 85aee012d60f..7558e66110ec 100644
+--- a/sound/soc/soc-dapm.c
++++ b/sound/soc/soc-dapm.c
+@@ -616,12 +616,11 @@ static const char *soc_dapm_prefix(struct snd_soc_dapm_context *dapm)
+ 	return dapm->component->name_prefix;
+ }
+ 
+-static int soc_dapm_read(struct snd_soc_dapm_context *dapm, int reg,
+-	unsigned int *value)
++static unsigned int soc_dapm_read(struct snd_soc_dapm_context *dapm, int reg)
+ {
+ 	if (!dapm->component)
+ 		return -EIO;
+-	return snd_soc_component_read(dapm->component, reg, value);
++	return  snd_soc_component_read(dapm->component, reg);
+ }
+ 
+ static int soc_dapm_update_bits(struct snd_soc_dapm_context *dapm,
+@@ -755,7 +754,7 @@ static int dapm_connect_mux(struct snd_soc_dapm_context *dapm,
+ 	int i;
+ 
+ 	if (e->reg != SND_SOC_NOPM) {
+-		soc_dapm_read(dapm, e->reg, &val);
++		val = soc_dapm_read(dapm, e->reg);
+ 		val = (val >> e->shift_l) & e->mask;
+ 		item = snd_soc_enum_val_to_item(e, val);
+ 	} else {
+@@ -792,7 +791,7 @@ static void dapm_set_mixer_path_status(struct snd_soc_dapm_path *p, int i,
+ 	unsigned int val;
+ 
+ 	if (reg != SND_SOC_NOPM) {
+-		soc_dapm_read(p->sink->dapm, reg, &val);
++		val = soc_dapm_read(p->sink->dapm, reg);
+ 		/*
+ 		 * The nth_path argument allows this function to know
+ 		 * which path of a kcontrol it is setting the initial
+@@ -807,7 +806,7 @@ static void dapm_set_mixer_path_status(struct snd_soc_dapm_path *p, int i,
+ 		 */
+ 		if (snd_soc_volsw_is_stereo(mc) && nth_path > 0) {
+ 			if (reg != mc->rreg)
+-				soc_dapm_read(p->sink->dapm, mc->rreg, &val);
++				val = soc_dapm_read(p->sink->dapm, mc->rreg);
+ 			val = (val >> mc->rshift) & mask;
+ 		} else {
+ 			val = (val >> shift) & mask;
+@@ -3268,7 +3267,7 @@ int snd_soc_dapm_new_widgets(struct snd_soc_card *card)
+ 
+ 		/* Read the initial power state from the device */
+ 		if (w->reg >= 0) {
+-			soc_dapm_read(w->dapm, w->reg, &val);
++			val = soc_dapm_read(w->dapm, w->reg);
+ 			val = val >> w->shift;
+ 			val &= w->mask;
+ 			if (val == w->on_val)
+@@ -3310,15 +3309,14 @@ int snd_soc_dapm_get_volsw(struct snd_kcontrol *kcontrol,
+ 	unsigned int mask = (1 << fls(max)) - 1;
+ 	unsigned int invert = mc->invert;
+ 	unsigned int reg_val, val, rval = 0;
+-	int ret = 0;
+ 
+ 	mutex_lock_nested(&card->dapm_mutex, SND_SOC_DAPM_CLASS_RUNTIME);
+ 	if (dapm_kcontrol_is_powered(kcontrol) && reg != SND_SOC_NOPM) {
+-		ret = soc_dapm_read(dapm, reg, &reg_val);
++		reg_val = soc_dapm_read(dapm, reg);
+ 		val = (reg_val >> shift) & mask;
+ 
+-		if (ret == 0 && reg != mc->rreg)
+-			ret = soc_dapm_read(dapm, mc->rreg, &reg_val);
++		if (reg != mc->rreg)
++			reg_val = soc_dapm_read(dapm, mc->rreg);
+ 
+ 		if (snd_soc_volsw_is_stereo(mc))
+ 			rval = (reg_val >> mc->rshift) & mask;
+@@ -3331,9 +3329,6 @@ int snd_soc_dapm_get_volsw(struct snd_kcontrol *kcontrol,
+ 	}
+ 	mutex_unlock(&card->dapm_mutex);
+ 
+-	if (ret)
+-		return ret;
+-
+ 	if (invert)
+ 		ucontrol->value.integer.value[0] = max - val;
+ 	else
+@@ -3346,7 +3341,7 @@ int snd_soc_dapm_get_volsw(struct snd_kcontrol *kcontrol,
+ 			ucontrol->value.integer.value[1] = rval;
+ 	}
+ 
+-	return ret;
++	return 0;
+ }
+ EXPORT_SYMBOL_GPL(snd_soc_dapm_get_volsw);
+ 
+@@ -3461,11 +3456,7 @@ int snd_soc_dapm_get_enum_double(struct snd_kcontrol *kcontrol,
+ 
+ 	mutex_lock_nested(&card->dapm_mutex, SND_SOC_DAPM_CLASS_RUNTIME);
+ 	if (e->reg != SND_SOC_NOPM && dapm_kcontrol_is_powered(kcontrol)) {
+-		int ret = soc_dapm_read(dapm, e->reg, &reg_val);
+-		if (ret) {
+-			mutex_unlock(&card->dapm_mutex);
+-			return ret;
+-		}
++		reg_val = soc_dapm_read(dapm, e->reg);
+ 	} else {
+ 		reg_val = dapm_kcontrol_get_value(kcontrol);
+ 	}
+diff --git a/sound/soc/soc-ops.c b/sound/soc/soc-ops.c
+index 55ffb34be95e..10f48827bb0e 100644
+--- a/sound/soc/soc-ops.c
++++ b/sound/soc/soc-ops.c
+@@ -63,11 +63,8 @@ int snd_soc_get_enum_double(struct snd_kcontrol *kcontrol,
+ 	struct soc_enum *e = (struct soc_enum *)kcontrol->private_value;
+ 	unsigned int val, item;
+ 	unsigned int reg_val;
+-	int ret;
+ 
+-	ret = snd_soc_component_read(component, e->reg, &reg_val);
+-	if (ret)
+-		return ret;
++	reg_val = snd_soc_component_read(component, e->reg);
+ 	val = (reg_val >> e->shift_l) & e->mask;
+ 	item = snd_soc_enum_val_to_item(e, val);
+ 	ucontrol->value.enumerated.item[0] = item;
+@@ -136,10 +133,7 @@ static int snd_soc_read_signed(struct snd_soc_component *component,
+ 	int ret;
+ 	unsigned int val;
+ 
+-	ret = snd_soc_component_read(component, reg, &val);
+-	if (ret < 0)
+-		return ret;
+-
++	val = snd_soc_component_read(component, reg);
+ 	val = (val >> shift) & mask;
+ 
+ 	if (!sign_bit) {
+@@ -375,19 +369,12 @@ int snd_soc_get_volsw_sx(struct snd_kcontrol *kcontrol,
+ 	int min = mc->min;
+ 	unsigned int mask = (1U << (fls(min + max) - 1)) - 1;
+ 	unsigned int val;
+-	int ret;
+-
+-	ret = snd_soc_component_read(component, reg, &val);
+-	if (ret < 0)
+-		return ret;
+ 
++	val = snd_soc_component_read(component, reg);
+ 	ucontrol->value.integer.value[0] = ((val >> shift) - min) & mask;
+ 
+ 	if (snd_soc_volsw_is_stereo(mc)) {
+-		ret = snd_soc_component_read(component, reg2, &val);
+-		if (ret < 0)
+-			return ret;
+-
++		val = snd_soc_component_read(component, reg2);
+ 		val = ((val >> rshift) - min) & mask;
+ 		ucontrol->value.integer.value[1] = val;
+ 	}
+@@ -548,12 +535,8 @@ int snd_soc_get_volsw_range(struct snd_kcontrol *kcontrol,
+ 	unsigned int mask = (1 << fls(max)) - 1;
+ 	unsigned int invert = mc->invert;
+ 	unsigned int val;
+-	int ret;
+-
+-	ret = snd_soc_component_read(component, reg, &val);
+-	if (ret)
+-		return ret;
+ 
++	val = snd_soc_component_read(component, reg);
+ 	ucontrol->value.integer.value[0] = (val >> shift) & mask;
+ 	if (invert)
+ 		ucontrol->value.integer.value[0] =
+@@ -563,10 +546,7 @@ int snd_soc_get_volsw_range(struct snd_kcontrol *kcontrol,
+ 			ucontrol->value.integer.value[0] - min;
+ 
+ 	if (snd_soc_volsw_is_stereo(mc)) {
+-		ret = snd_soc_component_read(component, rreg, &val);
+-		if (ret)
+-			return ret;
+-
++		val = snd_soc_component_read(component, rreg);
+ 		ucontrol->value.integer.value[1] = (val >> shift) & mask;
+ 		if (invert)
+ 			ucontrol->value.integer.value[1] =
+@@ -833,12 +813,9 @@ int snd_soc_get_xr_sx(struct snd_kcontrol *kcontrol,
+ 	long val = 0;
+ 	unsigned int regval;
+ 	unsigned int i;
+-	int ret;
+ 
+ 	for (i = 0; i < regcount; i++) {
+-		ret = snd_soc_component_read(component, regbase+i, &regval);
+-		if (ret)
+-			return ret;
++		regval = snd_soc_component_read(component, regbase+i);
+ 		val |= (regval & regwmask) << (regwshift*(regcount-i-1));
+ 	}
+ 	val &= mask;
+@@ -918,12 +895,8 @@ int snd_soc_get_strobe(struct snd_kcontrol *kcontrol,
+ 	unsigned int mask = 1 << shift;
+ 	unsigned int invert = mc->invert != 0;
+ 	unsigned int val;
+-	int ret;
+-
+-	ret = snd_soc_component_read(component, reg, &val);
+-	if (ret)
+-		return ret;
+ 
++	val = snd_soc_component_read(component, reg);
+ 	val &= mask;
+ 
+ 	if (shift != 0 && val != 0)
