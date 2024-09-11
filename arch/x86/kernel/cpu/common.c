@@ -1056,7 +1056,7 @@ static void __init early_identify_cpu(struct cpuinfo_x86 *c)
 #endif
 	c->x86_cache_alignment = c->x86_clflush_size;
 
-	memset(&c->x86_capability, 0, sizeof c->x86_capability);
+	memset(&c->x86_capability, 0, sizeof(c->x86_capability));
 	c->extended_cpuid_level = 0;
 
 	/* cyrix could have cpuid enabled via c_identify()*/
@@ -1316,7 +1316,7 @@ static void identify_cpu(struct cpuinfo_x86 *c)
 	c->x86_virt_bits = 32;
 #endif
 	c->x86_cache_alignment = c->x86_clflush_size;
-	memset(&c->x86_capability, 0, sizeof c->x86_capability);
+	memset(&c->x86_capability, 0, sizeof(c->x86_capability));
 
 	generic_identify(c);
 
