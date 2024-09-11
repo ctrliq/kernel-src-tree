@@ -1,0 +1,138 @@
+KVM: x86: pull kvm->srcu read-side to kvm_arch_vcpu_ioctl_run
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-408.el8
+commit-author Paolo Bonzini <pbonzini@redhat.com>
+commit 8d25b7beca7ed6ca34f53f0f8abd009e2be15d94
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-408.el8/8d25b7be.failed
+
+kvm_arch_vcpu_ioctl_run is already doing srcu_read_lock/unlock in two
+places, namely vcpu_run and post_kvm_run_save, and a third is actually
+needed around the call to vcpu->arch.complete_userspace_io to avoid
+the following splat:
+
+  WARNING: suspicious RCU usage
+  arch/x86/kvm/pmu.c:190 suspicious rcu_dereference_check() usage!
+  other info that might help us debug this:
+  rcu_scheduler_active = 2, debug_locks = 1
+  1 lock held by CPU 28/KVM/370841:
+  #0: ff11004089f280b8 (&vcpu->mutex){+.+.}-{3:3}, at: kvm_vcpu_ioctl+0x87/0x730 [kvm]
+  Call Trace:
+   <TASK>
+   dump_stack_lvl+0x59/0x73
+   reprogram_fixed_counter+0x15d/0x1a0 [kvm]
+   kvm_pmu_trigger_event+0x1a3/0x260 [kvm]
+   ? free_moved_vector+0x1b4/0x1e0
+   complete_fast_pio_in+0x8a/0xd0 [kvm]
+
+This splat is not at all unexpected, since complete_userspace_io callbacks
+can execute similar code to vmexits.  For example, SVM with nrips=false
+will call into the emulator from svm_skip_emulated_instruction().
+
+While it's tempting to never acquire kvm->srcu for an uninitialized vCPU,
+practically speaking there's no penalty to acquiring kvm->srcu "early"
+as the KVM_MP_STATE_UNINITIALIZED path is a one-time thing per vCPU.  On
+the other hand, seemingly innocuous helpers like kvm_apic_accept_events()
+and sync_regs() can theoretically reach code that might access
+SRCU-protected data structures, e.g. sync_regs() can trigger forced
+existing of nested mode via kvm_vcpu_ioctl_x86_set_vcpu_events().
+
+	Reported-by: Like Xu <likexu@tencent.com>
+Co-developed-by: Sean Christopherson <seanjc@google.com>
+	Signed-off-by: Sean Christopherson <seanjc@google.com>
+	Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+(cherry picked from commit 8d25b7beca7ed6ca34f53f0f8abd009e2be15d94)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kvm/x86.c
+diff --cc arch/x86/kvm/x86.c
+index cb917ed70ca0,eb4029660bd9..000000000000
+--- a/arch/x86/kvm/x86.c
++++ b/arch/x86/kvm/x86.c
+@@@ -10187,16 -10188,32 +10182,17 @@@ out
+  	return r;
+  }
+  
++ /* Called within kvm->srcu read side.  */
+  static inline int vcpu_block(struct kvm *kvm, struct kvm_vcpu *vcpu)
+  {
+ -	bool hv_timer;
+ -
+ -	if (!kvm_arch_vcpu_runnable(vcpu)) {
+ -		/*
+ -		 * Switch to the software timer before halt-polling/blocking as
+ -		 * the guest's timer may be a break event for the vCPU, and the
+ -		 * hypervisor timer runs only when the CPU is in guest mode.
+ -		 * Switch before halt-polling so that KVM recognizes an expired
+ -		 * timer before blocking.
+ -		 */
+ -		hv_timer = kvm_lapic_hv_timer_in_use(vcpu);
+ -		if (hv_timer)
+ -			kvm_lapic_switch_to_sw_timer(vcpu);
+ -
+ +	if (!kvm_arch_vcpu_runnable(vcpu) &&
+ +	    (!kvm_x86_ops.pre_block || static_call(kvm_x86_pre_block)(vcpu) == 0)) {
+  		srcu_read_unlock(&kvm->srcu, vcpu->srcu_idx);
+ -		if (vcpu->arch.mp_state == KVM_MP_STATE_HALTED)
+ -			kvm_vcpu_halt(vcpu);
+ -		else
+ -			kvm_vcpu_block(vcpu);
+ +		kvm_vcpu_block(vcpu);
+  		vcpu->srcu_idx = srcu_read_lock(&kvm->srcu);
+  
+ -		if (hv_timer)
+ -			kvm_lapic_switch_to_hv_timer(vcpu);
+ +		if (kvm_x86_ops.post_block)
+ +			static_call(kvm_x86_post_block)(vcpu);
+  
+  		if (!kvm_check_request(KVM_REQ_UNHALT, vcpu))
+  			return 1;
+@@@ -10261,16 -10278,12 +10257,23 @@@ static int vcpu_run(struct kvm_vcpu *vc
+  			break;
+  		}
+  
+ -		if (__xfer_to_guest_mode_work_pending()) {
+ +		if (signal_pending(current)) {
+ +			r = -EINTR;
+ +			vcpu->run->exit_reason = KVM_EXIT_INTR;
+ +			++vcpu->stat.signal_exits;
+ +			break;
+ +		}
+ +		if (need_resched()) {
+  			srcu_read_unlock(&kvm->srcu, vcpu->srcu_idx);
+++<<<<<<< HEAD
+ +			cond_resched();
+ +			vcpu->srcu_idx = srcu_read_lock(&kvm->srcu);
+++=======
++ 			r = xfer_to_guest_mode_handle_work(vcpu);
++ 			vcpu->srcu_idx = srcu_read_lock(&kvm->srcu);
++ 			if (r)
++ 				return r;
+++>>>>>>> 8d25b7beca7e (KVM: x86: pull kvm->srcu read-side to kvm_arch_vcpu_ioctl_run)
+  		}
+  	}
+  
+@@@ -10390,7 -10406,16 +10393,19 @@@ int kvm_arch_vcpu_ioctl_run(struct kvm_
+  			r = -EINTR;
+  			goto out;
+  		}
+++<<<<<<< HEAD
+++=======
++ 		/*
++ 		 * It should be impossible for the hypervisor timer to be in
++ 		 * use before KVM has ever run the vCPU.
++ 		 */
++ 		WARN_ON_ONCE(kvm_lapic_hv_timer_in_use(vcpu));
++ 
++ 		srcu_read_unlock(&kvm->srcu, vcpu->srcu_idx);
+++>>>>>>> 8d25b7beca7e (KVM: x86: pull kvm->srcu read-side to kvm_arch_vcpu_ioctl_run)
+  		kvm_vcpu_block(vcpu);
++ 		vcpu->srcu_idx = srcu_read_lock(&kvm->srcu);
++ 
+  		if (kvm_apic_accept_events(vcpu) < 0) {
+  			r = 0;
+  			goto out;
+* Unmerged path arch/x86/kvm/x86.c
