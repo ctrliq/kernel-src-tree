@@ -1,0 +1,147 @@
+of: Use device_type helpers to access the node type
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-448.el8
+commit-author Rob Herring <robh@kernel.org>
+commit e8b1dee21420f871e300d46342f2c98a2e08158d
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-448.el8/e8b1dee2.failed
+
+Remove directly accessing device_node.type pointer and use the accessors
+instead. This will eventually allow removing the type pointer.
+
+	Cc: Frank Rowand <frowand.list@gmail.com>
+	Cc: devicetree@vger.kernel.org
+	Signed-off-by: Rob Herring <robh@kernel.org>
+(cherry picked from commit e8b1dee21420f871e300d46342f2c98a2e08158d)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/of/base.c
+diff --cc drivers/of/base.c
+index 7b4dbaaf5b7a,57c837140a8b..000000000000
+--- a/drivers/of/base.c
++++ b/drivers/of/base.c
+@@@ -821,6 -757,68 +828,71 @@@ struct device_node *of_get_next_availab
+  EXPORT_SYMBOL(of_get_next_available_child);
+  
+  /**
+++<<<<<<< HEAD
+++=======
++  *	of_get_next_cpu_node - Iterate on cpu nodes
++  *	@prev:	previous child of the /cpus node, or NULL to get first
++  *
++  *	Returns a cpu node pointer with refcount incremented, use of_node_put()
++  *	on it when done. Returns NULL when prev is the last child. Decrements
++  *	the refcount of prev.
++  */
++ struct device_node *of_get_next_cpu_node(struct device_node *prev)
++ {
++ 	struct device_node *next = NULL;
++ 	unsigned long flags;
++ 	struct device_node *node;
++ 
++ 	if (!prev)
++ 		node = of_find_node_by_path("/cpus");
++ 
++ 	raw_spin_lock_irqsave(&devtree_lock, flags);
++ 	if (prev)
++ 		next = prev->sibling;
++ 	else if (node) {
++ 		next = node->child;
++ 		of_node_put(node);
++ 	}
++ 	for (; next; next = next->sibling) {
++ 		if (!(of_node_name_eq(next, "cpu") ||
++ 		      __of_node_is_type(next, "cpu")))
++ 			continue;
++ 		if (of_node_get(next))
++ 			break;
++ 	}
++ 	of_node_put(prev);
++ 	raw_spin_unlock_irqrestore(&devtree_lock, flags);
++ 	return next;
++ }
++ EXPORT_SYMBOL(of_get_next_cpu_node);
++ 
++ /**
++  * of_get_compatible_child - Find compatible child node
++  * @parent:	parent node
++  * @compatible:	compatible string
++  *
++  * Lookup child node whose compatible property contains the given compatible
++  * string.
++  *
++  * Returns a node pointer with refcount incremented, use of_node_put() on it
++  * when done; or NULL if not found.
++  */
++ struct device_node *of_get_compatible_child(const struct device_node *parent,
++ 				const char *compatible)
++ {
++ 	struct device_node *child;
++ 
++ 	for_each_child_of_node(parent, child) {
++ 		if (of_device_is_compatible(child, compatible))
++ 			break;
++ 	}
++ 
++ 	return child;
++ }
++ EXPORT_SYMBOL(of_get_compatible_child);
++ 
++ /**
+++>>>>>>> e8b1dee21420 (of: Use device_type helpers to access the node type)
+   *	of_get_child_by_name - Find the child node by name for a given parent
+   *	@node:	parent node
+   *	@name:	child name to look for.
+diff --git a/drivers/of/address.c b/drivers/of/address.c
+index 482c392891a1..70ea6285200c 100644
+--- a/drivers/of/address.c
++++ b/drivers/of/address.c
+@@ -110,8 +110,8 @@ static int of_bus_pci_match(struct device_node *np)
+ 	 * "vci" is for the /chaos bridge on 1st-gen PCI powermacs
+ 	 * "ht" is hypertransport
+ 	 */
+-	return !strcmp(np->type, "pci") || !strcmp(np->type, "pciex") ||
+-		!strcmp(np->type, "vci") || !strcmp(np->type, "ht");
++	return of_node_is_type(np, "pci") || of_node_is_type(np, "pciex") ||
++		of_node_is_type(np, "vci") || of_node_is_type(np, "ht");
+ }
+ 
+ static void of_bus_pci_count_cells(struct device_node *np,
+* Unmerged path drivers/of/base.c
+diff --git a/drivers/of/device.c b/drivers/of/device.c
+index 1e7c5716fe58..8c5782168e27 100644
+--- a/drivers/of/device.c
++++ b/drivers/of/device.c
+@@ -230,7 +230,7 @@ static ssize_t of_device_get_modalias(struct device *dev, char *str, ssize_t len
+ 	/* Name & Type */
+ 	/* %p eats all alphanum characters, so %c must be used here */
+ 	csize = snprintf(str, len, "of:N%pOFn%c%s", dev->of_node, 'T',
+-			 dev->of_node->type);
++			 of_node_get_device_type(dev->of_node));
+ 	tsize = csize;
+ 	len -= csize;
+ 	if (str)
+@@ -300,7 +300,7 @@ EXPORT_SYMBOL_GPL(of_device_modalias);
+  */
+ void of_device_uevent(struct device *dev, struct kobj_uevent_env *env)
+ {
+-	const char *compat;
++	const char *compat, *type;
+ 	struct alias_prop *app;
+ 	struct property *p;
+ 	int seen = 0;
+@@ -310,8 +310,9 @@ void of_device_uevent(struct device *dev, struct kobj_uevent_env *env)
+ 
+ 	add_uevent_var(env, "OF_NAME=%pOFn", dev->of_node);
+ 	add_uevent_var(env, "OF_FULLNAME=%pOF", dev->of_node);
+-	if (dev->of_node->type && strcmp("<NULL>", dev->of_node->type) != 0)
+-		add_uevent_var(env, "OF_TYPE=%s", dev->of_node->type);
++	type = of_node_get_device_type(dev->of_node);
++	if (type)
++		add_uevent_var(env, "OF_TYPE=%s", type);
+ 
+ 	/* Since the compatible field can contain pretty much anything
+ 	 * it's not really legal to split it out with commas. We split it
