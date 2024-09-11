@@ -1,0 +1,168 @@
+selinux: add tracepoint on audited events
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-310.el8
+commit-author Thiébaud Weksteen <tweek@google.com>
+commit dd8166212d9a2eca3181567c953d5687aea4d7dc
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-310.el8/dd816621.failed
+
+The audit data currently captures which process and which target
+is responsible for a denial. There is no data on where exactly in the
+process that call occurred. Debugging can be made easier by being able to
+reconstruct the unified kernel and userland stack traces [1]. Add a
+tracepoint on the SELinux denials which can then be used by userland
+(i.e. perf).
+
+Although this patch could manually be added by each OS developer to
+trouble shoot a denial, adding it to the kernel streamlines the
+developers workflow.
+
+It is possible to use perf for monitoring the event:
+  # perf record -e avc:selinux_audited -g -a
+  ^C
+  # perf report -g
+  [...]
+      6.40%     6.40%  audited=800000 tclass=4
+               |
+                  __libc_start_main
+                  |
+                  |--4.60%--__GI___ioctl
+                  |          entry_SYSCALL_64
+                  |          do_syscall_64
+                  |          __x64_sys_ioctl
+                  |          ksys_ioctl
+                  |          binder_ioctl
+                  |          binder_set_nice
+                  |          can_nice
+                  |          capable
+                  |          security_capable
+                  |          cred_has_capability.isra.0
+                  |          slow_avc_audit
+                  |          common_lsm_audit
+                  |          avc_audit_post_callback
+                  |          avc_audit_post_callback
+                  |
+
+It is also possible to use the ftrace interface:
+  # echo 1 > /sys/kernel/debug/tracing/events/avc/selinux_audited/enable
+  # cat /sys/kernel/debug/tracing/trace
+  tracer: nop
+  entries-in-buffer/entries-written: 1/1   #P:8
+  [...]
+  dmesg-3624  [001] 13072.325358: selinux_denied: audited=800000 tclass=4
+
+The tclass value can be mapped to a class by searching
+security/selinux/flask.h. The audited value is a bit field of the
+permissions described in security/selinux/av_permissions.h for the
+corresponding class.
+
+[1] https://source.android.com/devices/tech/debug/native_stack_dump
+
+	Signed-off-by: Thiébaud Weksteen <tweek@google.com>
+	Suggested-by: Joel Fernandes <joelaf@google.com>
+	Reviewed-by: Peter Enderborg <peter.enderborg@sony.com>
+	Acked-by: Stephen Smalley <stephen.smalley.work@gmail.com>
+	Signed-off-by: Paul Moore <paul@paul-moore.com>
+(cherry picked from commit dd8166212d9a2eca3181567c953d5687aea4d7dc)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	MAINTAINERS
+diff --cc MAINTAINERS
+index e4ec93b44e67,ed19f56503f4..000000000000
+--- a/MAINTAINERS
++++ b/MAINTAINERS
+@@@ -13116,14 -15566,16 +13116,23 @@@ L:	selinux@tycho.nsa.gov (moderated fo
+  W:	https://selinuxproject.org
+  W:	https://github.com/SELinuxProject
+  T:	git git://git.kernel.org/pub/scm/linux/kernel/git/pcmoore/selinux.git
+++<<<<<<< HEAD
+ +S:	Supported
+ +F:	include/linux/selinux*
+++=======
++ F:	Documentation/ABI/obsolete/sysfs-selinux-checkreqprot
++ F:	Documentation/ABI/obsolete/sysfs-selinux-disable
++ F:	Documentation/admin-guide/LSM/SELinux.rst
++ F:	include/trace/events/avc.h
++ F:	include/uapi/linux/selinux_netlink.h
++ F:	scripts/selinux/
+++>>>>>>> dd8166212d9a (selinux: add tracepoint on audited events)
+  F:	security/selinux/
+ +F:	scripts/selinux/
+ +F:	Documentation/admin-guide/LSM/SELinux.rst
+  
+  SENSABLE PHANTOM
+ -M:	Jiri Slaby <jirislaby@kernel.org>
+ +M:	Jiri Slaby <jirislaby@gmail.com>
+  S:	Maintained
+  F:	drivers/misc/phantom.c
+  F:	include/uapi/linux/phantom.h
+* Unmerged path MAINTAINERS
+diff --git a/include/trace/events/avc.h b/include/trace/events/avc.h
+new file mode 100644
+index 000000000000..07c058a9bbcd
+--- /dev/null
++++ b/include/trace/events/avc.h
+@@ -0,0 +1,37 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++/*
++ * Author: Thiébaud Weksteen <tweek@google.com>
++ */
++#undef TRACE_SYSTEM
++#define TRACE_SYSTEM avc
++
++#if !defined(_TRACE_SELINUX_H) || defined(TRACE_HEADER_MULTI_READ)
++#define _TRACE_SELINUX_H
++
++#include <linux/tracepoint.h>
++
++TRACE_EVENT(selinux_audited,
++
++	TP_PROTO(struct selinux_audit_data *sad),
++
++	TP_ARGS(sad),
++
++	TP_STRUCT__entry(
++		__field(unsigned int, tclass)
++		__field(unsigned int, audited)
++	),
++
++	TP_fast_assign(
++		__entry->tclass = sad->tclass;
++		__entry->audited = sad->audited;
++	),
++
++	TP_printk("tclass=%u audited=%x",
++		__entry->tclass,
++		__entry->audited)
++);
++
++#endif
++
++/* This part must be outside protection */
++#include <trace/define_trace.h>
+diff --git a/security/selinux/avc.c b/security/selinux/avc.c
+index b0e1bc12d07a..e24328208d17 100644
+--- a/security/selinux/avc.c
++++ b/security/selinux/avc.c
+@@ -34,6 +34,9 @@
+ #include "avc_ss.h"
+ #include "classmap.h"
+ 
++#define CREATE_TRACE_POINTS
++#include <trace/events/avc.h>
++
+ #define AVC_CACHE_SLOTS			512
+ #define AVC_DEF_CACHE_THRESHOLD		512
+ #define AVC_CACHE_RECLAIM		16
+@@ -709,6 +712,8 @@ static void avc_audit_post_callback(struct audit_buffer *ab, void *a)
+ 	u32 scontext_len;
+ 	int rc;
+ 
++	trace_selinux_audited(sad);
++
+ 	rc = security_sid_to_context(sad->state, sad->ssid, &scontext,
+ 				     &scontext_len);
+ 	if (rc)
