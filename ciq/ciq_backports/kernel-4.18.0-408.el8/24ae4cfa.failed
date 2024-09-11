@@ -1,0 +1,135 @@
+KVM: x86/mmu: Allow enabling/disabling dirty logging under MMU read lock
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-408.el8
+commit-author Ben Gardon <bgardon@google.com>
+commit 24ae4cfaaaa22a4f293acd0c7d97804454b7e9fb
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-408.el8/24ae4cfa.failed
+
+To reduce lock contention and interference with page fault handlers,
+allow the TDP MMU functions which enable and disable dirty logging
+to operate under the MMU read lock.
+
+	Signed-off-by: Ben Gardon <bgardon@google.com>
+Message-Id: <20210401233736.638171-12-bgardon@google.com>
+	Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+(cherry picked from commit 24ae4cfaaaa22a4f293acd0c7d97804454b7e9fb)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kvm/mmu/tdp_mmu.c
+diff --cc arch/x86/kvm/mmu/tdp_mmu.c
+index 83e4cca9867b,335c126d9860..000000000000
+--- a/arch/x86/kvm/mmu/tdp_mmu.c
++++ b/arch/x86/kvm/mmu/tdp_mmu.c
+@@@ -503,12 -505,10 +504,12 @@@ static void handle_changed_spte(struct 
+   * Returns: true if the SPTE was set, false if it was not. If false is returned,
+   *	    this function will have no side-effects.
+   */
+- static inline bool tdp_mmu_set_spte_atomic(struct kvm *kvm,
+- 					   struct tdp_iter *iter,
+- 					   u64 new_spte)
++ static inline bool tdp_mmu_set_spte_atomic_no_dirty_log(struct kvm *kvm,
++ 							struct tdp_iter *iter,
++ 							u64 new_spte)
+  {
+ +	WARN_ON_ONCE(iter->yielded);
+ +
+  	lockdep_assert_held_read(&kvm->mmu_lock);
+  
+  	/*
+@@@ -1131,7 -1096,8 +1145,12 @@@ static bool wrprot_gfn_range(struct kv
+  
+  	for_each_tdp_pte_min_level(iter, root->spt, root->role.level,
+  				   min_level, start, end) {
+++<<<<<<< HEAD
+ +		if (tdp_mmu_iter_cond_resched(kvm, &iter, false))
+++=======
++ retry:
++ 		if (tdp_mmu_iter_cond_resched(kvm, &iter, false, true))
+++>>>>>>> 24ae4cfaaaa2 (KVM: x86/mmu: Allow enabling/disabling dirty logging under MMU read lock)
+  			continue;
+  
+  		if (!is_shadow_present_pte(iter.old_spte) ||
+@@@ -1160,7 -1134,9 +1187,13 @@@ bool kvm_tdp_mmu_wrprot_slot(struct kv
+  	struct kvm_mmu_page *root;
+  	bool spte_set = false;
+  
+++<<<<<<< HEAD
+ +	for_each_tdp_mmu_root_yield_safe(kvm, root, slot->as_id)
+++=======
++ 	lockdep_assert_held_read(&kvm->mmu_lock);
++ 
++ 	for_each_tdp_mmu_root_yield_safe(kvm, root, slot->as_id, true)
+++>>>>>>> 24ae4cfaaaa2 (KVM: x86/mmu: Allow enabling/disabling dirty logging under MMU read lock)
+  		spte_set |= wrprot_gfn_range(kvm, root, slot->base_gfn,
+  			     slot->base_gfn + slot->npages, min_level);
+  
+@@@ -1184,7 -1160,8 +1217,12 @@@ static bool clear_dirty_gfn_range(struc
+  	rcu_read_lock();
+  
+  	tdp_root_for_each_leaf_pte(iter, root, start, end) {
+++<<<<<<< HEAD
+ +		if (tdp_mmu_iter_cond_resched(kvm, &iter, false))
+++=======
++ retry:
++ 		if (tdp_mmu_iter_cond_resched(kvm, &iter, false, true))
+++>>>>>>> 24ae4cfaaaa2 (KVM: x86/mmu: Allow enabling/disabling dirty logging under MMU read lock)
+  			continue;
+  
+  		if (spte_ad_need_write_protect(iter.old_spte)) {
+@@@ -1219,7 -1204,9 +1265,13 @@@ bool kvm_tdp_mmu_clear_dirty_slot(struc
+  	struct kvm_mmu_page *root;
+  	bool spte_set = false;
+  
+++<<<<<<< HEAD
+ +	for_each_tdp_mmu_root_yield_safe(kvm, root, slot->as_id)
+++=======
++ 	lockdep_assert_held_read(&kvm->mmu_lock);
++ 
++ 	for_each_tdp_mmu_root_yield_safe(kvm, root, slot->as_id, true)
+++>>>>>>> 24ae4cfaaaa2 (KVM: x86/mmu: Allow enabling/disabling dirty logging under MMU read lock)
+  		spte_set |= clear_dirty_gfn_range(kvm, root, slot->base_gfn,
+  				slot->base_gfn + slot->npages);
+  
+diff --git a/arch/x86/kvm/mmu/mmu.c b/arch/x86/kvm/mmu/mmu.c
+index 4401a1a9e22e..5ba9964f48dc 100644
+--- a/arch/x86/kvm/mmu/mmu.c
++++ b/arch/x86/kvm/mmu/mmu.c
+@@ -5727,10 +5727,14 @@ void kvm_mmu_slot_remove_write_access(struct kvm *kvm,
+ 	write_lock(&kvm->mmu_lock);
+ 	flush = slot_handle_level(kvm, memslot, slot_rmap_write_protect,
+ 				start_level, KVM_MAX_HUGEPAGE_LEVEL, false);
+-	if (is_tdp_mmu_enabled(kvm))
+-		flush |= kvm_tdp_mmu_wrprot_slot(kvm, memslot, start_level);
+ 	write_unlock(&kvm->mmu_lock);
+ 
++	if (is_tdp_mmu_enabled(kvm)) {
++		read_lock(&kvm->mmu_lock);
++		flush |= kvm_tdp_mmu_wrprot_slot(kvm, memslot, start_level);
++		read_unlock(&kvm->mmu_lock);
++	}
++
+ 	/*
+ 	 * We can flush all the TLBs out of the mmu lock without TLB
+ 	 * corruption since we just change the spte from writable to
+@@ -5827,10 +5831,14 @@ void kvm_mmu_slot_leaf_clear_dirty(struct kvm *kvm,
+ 
+ 	write_lock(&kvm->mmu_lock);
+ 	flush = slot_handle_leaf(kvm, memslot, __rmap_clear_dirty, false);
+-	if (is_tdp_mmu_enabled(kvm))
+-		flush |= kvm_tdp_mmu_clear_dirty_slot(kvm, memslot);
+ 	write_unlock(&kvm->mmu_lock);
+ 
++	if (is_tdp_mmu_enabled(kvm)) {
++		read_lock(&kvm->mmu_lock);
++		flush |= kvm_tdp_mmu_clear_dirty_slot(kvm, memslot);
++		read_unlock(&kvm->mmu_lock);
++	}
++
+ 	/*
+ 	 * It's also safe to flush TLBs out of mmu lock here as currently this
+ 	 * function is only used for dirty logging, in which case flushing TLB
+* Unmerged path arch/x86/kvm/mmu/tdp_mmu.c
