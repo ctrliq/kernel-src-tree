@@ -1059,6 +1059,9 @@ static int qat_alg_ablkcipher_encrypt(struct ablkcipher_request *req)
 	struct device *dev = &GET_DEV(ctx->inst->accel_dev);
 	int ret, ctr = 0;
 
+	if (req->nbytes == 0)
+		return 0;
+
 	qat_req->iv = dma_alloc_coherent(dev, AES_BLOCK_SIZE,
 					 &qat_req->iv_paddr, GFP_ATOMIC);
 	if (!qat_req->iv)
@@ -1115,6 +1118,9 @@ static int qat_alg_ablkcipher_decrypt(struct ablkcipher_request *req)
 	struct icp_qat_fw_la_bulk_req *msg;
 	struct device *dev = &GET_DEV(ctx->inst->accel_dev);
 	int ret, ctr = 0;
+
+	if (req->nbytes == 0)
+		return 0;
 
 	qat_req->iv = dma_alloc_coherent(dev, AES_BLOCK_SIZE,
 					 &qat_req->iv_paddr, GFP_ATOMIC);
