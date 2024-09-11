@@ -1,0 +1,190 @@
+net/mlx5e: Protect neigh hash encap list with spinlock and rcu
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-193.el8
+Rebuild_CHGLOG: - [netdrv] mlx5e: Protect neigh hash encap list with spinlock and rcu (Alaa Hleihel) [1663231 1724336]
+Rebuild_FUZZ: 96.67%
+commit-author Vlad Buslov <vladbu@mellanox.com>
+commit ac0d917632cf7fbbe953f2ec82c2c979ab1b4a06
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-193.el8/ac0d9176.failed
+
+Rcu-ify mlx5e_neigh_hash_entry->encap_list by changing operations on encap
+list to their rcu counterparts and extending encap structure with rcu_head
+to free the encap instances after rcu grace period. Use rcu read lock when
+traversing encap list. Implement helper mlx5e_get_next_valid_encap()
+function that is used by mlx5e_tc_update_neigh_used_value() to safely
+iterate over valid entries of nhe->encap_list.
+
+	Signed-off-by: Vlad Buslov <vladbu@mellanox.com>
+	Reviewed-by: Jianbo Liu <jianbol@mellanox.com>
+	Reviewed-by: Roi Dayan <roid@mellanox.com>
+	Signed-off-by: Saeed Mahameed <saeedm@mellanox.com>
+(cherry picked from commit ac0d917632cf7fbbe953f2ec82c2c979ab1b4a06)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/mellanox/mlx5/core/en_rep.h
+#	drivers/net/ethernet/mellanox/mlx5/core/en_tc.c
+diff --cc drivers/net/ethernet/mellanox/mlx5/core/en_rep.h
+index 6cf6542d1e86,a0ae5069d8c3..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_rep.h
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_rep.h
+@@@ -166,6 -172,10 +168,13 @@@ struct mlx5e_encap_entry 
+  	u8 flags;
+  	char *encap_header;
+  	int encap_size;
+++<<<<<<< HEAD
+++=======
++ 	refcount_t refcnt;
++ 	struct completion res_ready;
++ 	int compl_result;
++ 	struct rcu_head rcu;
+++>>>>>>> ac0d917632cf (net/mlx5e: Protect neigh hash encap list with spinlock and rcu)
+  };
+  
+  struct mlx5e_rep_sq {
+diff --cc drivers/net/ethernet/mellanox/mlx5/core/en_tc.c
+index c033e0d4fc59,a4d11274be30..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_tc.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_tc.c
+@@@ -1247,14 -1477,19 +1292,24 @@@ void mlx5e_tc_update_neigh_used_value(s
+  	else
+  		return;
+  
+++<<<<<<< HEAD
+ +	list_for_each_entry(e, &nhe->encap_list, encap_list) {
+ +		struct encap_flow_item *efi;
+ +		if (!(e->flags & MLX5_ENCAP_ENTRY_VALID))
+ +			continue;
+ +		list_for_each_entry(efi, &e->flows, list) {
+++=======
++ 	/* mlx5e_get_next_valid_encap() releases previous encap before returning
++ 	 * next one.
++ 	 */
++ 	while ((e = mlx5e_get_next_valid_encap(nhe, e)) != NULL) {
++ 		struct encap_flow_item *efi, *tmp;
++ 
++ 		list_for_each_entry_safe(efi, tmp, &e->flows, list) {
+++>>>>>>> ac0d917632cf (net/mlx5e: Protect neigh hash encap list with spinlock and rcu)
+  			flow = container_of(efi, struct mlx5e_tc_flow,
+  					    encaps[efi->index]);
+ -			if (IS_ERR(mlx5e_flow_get(flow)))
+ -				continue;
+ -
+ -			if (mlx5e_is_offloaded_flow(flow)) {
+ +			if (flow->flags & MLX5E_TC_FLOW_OFFLOADED) {
+  				counter = mlx5e_tc_get_counter(flow);
+  				lastuse = mlx5_fc_query_lastuse(counter);
+  				if (time_after((unsigned long)lastuse, nhe->reported_lastuse)) {
+@@@ -1262,9 -1498,15 +1317,17 @@@
+  					break;
+  				}
+  			}
+ -
+ -			mlx5e_flow_put(netdev_priv(e->out_dev), flow);
+  		}
+++<<<<<<< HEAD
+ +		if (neigh_used)
+++=======
++ 
++ 		if (neigh_used) {
++ 			/* release current encap before breaking the loop */
++ 			mlx5e_encap_put(netdev_priv(e->out_dev), e);
+++>>>>>>> ac0d917632cf (net/mlx5e: Protect neigh hash encap list with spinlock and rcu)
+  			break;
++ 		}
+  	}
+  
+  	if (neigh_used) {
+@@@ -1296,11 -1533,45 +1359,52 @@@ static void mlx5e_detach_encap(struct m
+  
+  		if (e->flags & MLX5_ENCAP_ENTRY_VALID)
+  			mlx5_packet_reformat_dealloc(priv->mdev, e->encap_id);
+ +
+ +		hash_del_rcu(&e->encap_hlist);
+ +		kfree(e->encap_header);
+ +		kfree(e);
+  	}
+++<<<<<<< HEAD
+++=======
++ 
++ 	kfree(e->encap_header);
++ 	kfree_rcu(e, rcu);
++ }
++ 
++ void mlx5e_encap_put(struct mlx5e_priv *priv, struct mlx5e_encap_entry *e)
++ {
++ 	struct mlx5_eswitch *esw = priv->mdev->priv.eswitch;
++ 
++ 	if (!refcount_dec_and_mutex_lock(&e->refcnt, &esw->offloads.encap_tbl_lock))
++ 		return;
++ 	hash_del_rcu(&e->encap_hlist);
++ 	mutex_unlock(&esw->offloads.encap_tbl_lock);
++ 
++ 	mlx5e_encap_dealloc(priv, e);
++ }
++ 
++ static void mlx5e_detach_encap(struct mlx5e_priv *priv,
++ 			       struct mlx5e_tc_flow *flow, int out_index)
++ {
++ 	struct mlx5e_encap_entry *e = flow->encaps[out_index].e;
++ 	struct mlx5_eswitch *esw = priv->mdev->priv.eswitch;
++ 
++ 	/* flow wasn't fully initialized */
++ 	if (!e)
++ 		return;
++ 
++ 	mutex_lock(&esw->offloads.encap_tbl_lock);
++ 	list_del(&flow->encaps[out_index].list);
++ 	flow->encaps[out_index].e = NULL;
++ 	if (!refcount_dec_and_test(&e->refcnt)) {
++ 		mutex_unlock(&esw->offloads.encap_tbl_lock);
++ 		return;
++ 	}
++ 	hash_del_rcu(&e->encap_hlist);
++ 	mutex_unlock(&esw->offloads.encap_tbl_lock);
++ 
++ 	mlx5e_encap_dealloc(priv, e);
+++>>>>>>> ac0d917632cf (net/mlx5e: Protect neigh hash encap list with spinlock and rcu)
+  }
+  
+  static void __mlx5e_tc_del_fdb_peer_flow(struct mlx5e_tc_flow *flow)
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/en_rep.c b/drivers/net/ethernet/mellanox/mlx5/core/en_rep.c
+index e3ab7df3e76c..b09829dc6540 100644
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_rep.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_rep.c
+@@ -1075,6 +1075,7 @@ static int mlx5e_rep_neigh_entry_create(struct mlx5e_priv *priv,
+ 	(*nhe)->priv = priv;
+ 	memcpy(&(*nhe)->m_neigh, &e->m_neigh, sizeof(e->m_neigh));
+ 	INIT_WORK(&(*nhe)->neigh_update_work, mlx5e_rep_neigh_update);
++	spin_lock_init(&(*nhe)->encap_list_lock);
+ 	INIT_LIST_HEAD(&(*nhe)->encap_list);
+ 	refcount_set(&(*nhe)->refcnt, 1);
+ 
+@@ -1114,7 +1115,10 @@ int mlx5e_rep_encap_entry_attach(struct mlx5e_priv *priv,
+ 	}
+ 
+ 	e->nhe = nhe;
+-	list_add(&e->encap_list, &nhe->encap_list);
++	spin_lock(&nhe->encap_list_lock);
++	list_add_rcu(&e->encap_list, &nhe->encap_list);
++	spin_unlock(&nhe->encap_list_lock);
++
+ 	mutex_unlock(&rpriv->neigh_update.encap_lock);
+ 
+ 	return 0;
+@@ -1130,7 +1134,9 @@ void mlx5e_rep_encap_entry_detach(struct mlx5e_priv *priv,
+ 	if (!e->nhe)
+ 		return;
+ 
+-	list_del(&e->encap_list);
++	spin_lock(&e->nhe->encap_list_lock);
++	list_del_rcu(&e->encap_list);
++	spin_unlock(&e->nhe->encap_list_lock);
+ 
+ 	mlx5e_rep_neigh_entry_release(e->nhe);
+ 	e->nhe = NULL;
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/en_rep.h
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/en_tc.c
