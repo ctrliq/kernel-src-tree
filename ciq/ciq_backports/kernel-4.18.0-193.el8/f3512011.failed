@@ -1,0 +1,353 @@
+pseries/fadump: move out platform specific support from generic code
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-193.el8
+commit-author Hari Bathini <hbathini@linux.ibm.com>
+commit f35120115b767c49ad8de56dd78c86540a14df5b
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-193.el8/f3512011.failed
+
+Move code that supports processing the crash'ed kernel's memory
+preserved by firmware to platform specific callback functions.
+
+	Signed-off-by: Hari Bathini <hbathini@linux.ibm.com>
+	Signed-off-by: Michael Ellerman <mpe@ellerman.id.au>
+Link: https://lore.kernel.org/r/156821337690.5656.13050665924800177744.stgit@hbathini.in.ibm.com
+(cherry picked from commit f35120115b767c49ad8de56dd78c86540a14df5b)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/powerpc/kernel/fadump.c
+#	arch/powerpc/platforms/pseries/rtas-fadump.c
+diff --cc arch/powerpc/kernel/fadump.c
+index 56526469b148,9d9f7c384a71..000000000000
+--- a/arch/powerpc/kernel/fadump.c
++++ b/arch/powerpc/kernel/fadump.c
+@@@ -45,11 -32,7 +44,12 @@@
+  #include <asm/fadump-internal.h>
+  #include <asm/setup.h>
+  
+- #include "../platforms/pseries/rtas-fadump.h"
+- 
+  static struct fw_dump fw_dump;
+++<<<<<<< HEAD
+ +static struct rtas_fadump_mem_struct fdm;
+ +static const struct rtas_fadump_mem_struct *fdm_active;
+++=======
+++>>>>>>> f35120115b76 (pseries/fadump: move out platform specific support from generic code)
+  
+  static DEFINE_MUTEX(fadump_mutex);
+  struct fad_crash_memory_ranges *crash_memory_ranges;
+@@@ -121,65 -104,13 +121,69 @@@ static int __init fadump_cma_init(void
+  #endif /* CONFIG_CMA */
+  
+  /* Scan the Firmware Assisted dump configuration details. */
+- int __init early_init_dt_scan_fw_dump(unsigned long node,
+- 			const char *uname, int depth, void *data)
++ int __init early_init_dt_scan_fw_dump(unsigned long node, const char *uname,
++ 				      int depth, void *data)
+  {
+ +	const __be32 *sections;
+ +	int i, num_sections;
+ +	int size;
+ +	const __be32 *token;
+ +
+  	if (depth != 1 || strcmp(uname, "rtas") != 0)
+  		return 0;
+  
+++<<<<<<< HEAD
+ +	/*
+ +	 * Check if Firmware Assisted dump is supported. if yes, check
+ +	 * if dump has been initiated on last reboot.
+ +	 */
+ +	token = of_get_flat_dt_prop(node, "ibm,configure-kernel-dump", NULL);
+ +	if (!token)
+ +		return 1;
+ +
+ +	fw_dump.fadump_supported = 1;
+ +	fw_dump.ibm_configure_kernel_dump = be32_to_cpu(*token);
+ +
+ +	/*
+ +	 * The 'ibm,kernel-dump' rtas node is present only if there is
+ +	 * dump data waiting for us.
+ +	 */
+ +	fdm_active = of_get_flat_dt_prop(node, "ibm,kernel-dump", NULL);
+ +	if (fdm_active)
+ +		fw_dump.dump_active = 1;
+ +
+ +	/* Get the sizes required to store dump data for the firmware provided
+ +	 * dump sections.
+ +	 * For each dump section type supported, a 32bit cell which defines
+ +	 * the ID of a supported section followed by two 32 bit cells which
+ +	 * gives teh size of the section in bytes.
+ +	 */
+ +	sections = of_get_flat_dt_prop(node, "ibm,configure-kernel-dump-sizes",
+ +					&size);
+ +
+ +	if (!sections)
+ +		return 1;
+ +
+ +	num_sections = size / (3 * sizeof(u32));
+ +
+ +	for (i = 0; i < num_sections; i++, sections += 3) {
+ +		u32 type = (u32)of_read_number(sections, 1);
+ +
+ +		switch (type) {
+ +		case RTAS_FADUMP_CPU_STATE_DATA:
+ +			fw_dump.cpu_state_data_size =
+ +					of_read_ulong(&sections[1], 2);
+ +			break;
+ +		case RTAS_FADUMP_HPTE_REGION:
+ +			fw_dump.hpte_region_size =
+ +					of_read_ulong(&sections[1], 2);
+ +			break;
+ +		}
+ +	}
+ +
+++=======
++ 	rtas_fadump_dt_scan(&fw_dump, node);
+++>>>>>>> f35120115b76 (pseries/fadump: move out platform specific support from generic code)
+  	return 1;
+  }
+  
+@@@ -702,70 -513,9 +696,10 @@@ void crash_fadump(struct pt_regs *regs
+  
+  	fdh->online_mask = *cpu_online_mask;
+  
+ -	fw_dump.ops->fadump_trigger(fdh, str);
+ +	/* Call ibm,os-term rtas call to trigger firmware assisted dump */
+ +	rtas_os_term((char *)str);
+  }
+  
+- #define GPR_MASK	0xffffff0000000000
+- static inline int fadump_gpr_index(u64 id)
+- {
+- 	int i = -1;
+- 	char str[3];
+- 
+- 	if ((id & GPR_MASK) == fadump_str_to_u64("GPR")) {
+- 		/* get the digits at the end */
+- 		id &= ~GPR_MASK;
+- 		id >>= 24;
+- 		str[2] = '\0';
+- 		str[1] = id & 0xff;
+- 		str[0] = (id >> 8) & 0xff;
+- 		sscanf(str, "%d", &i);
+- 		if (i > 31)
+- 			i = -1;
+- 	}
+- 	return i;
+- }
+- 
+- static inline void fadump_set_regval(struct pt_regs *regs, u64 reg_id,
+- 								u64 reg_val)
+- {
+- 	int i;
+- 
+- 	i = fadump_gpr_index(reg_id);
+- 	if (i >= 0)
+- 		regs->gpr[i] = (unsigned long)reg_val;
+- 	else if (reg_id == fadump_str_to_u64("NIA"))
+- 		regs->nip = (unsigned long)reg_val;
+- 	else if (reg_id == fadump_str_to_u64("MSR"))
+- 		regs->msr = (unsigned long)reg_val;
+- 	else if (reg_id == fadump_str_to_u64("CTR"))
+- 		regs->ctr = (unsigned long)reg_val;
+- 	else if (reg_id == fadump_str_to_u64("LR"))
+- 		regs->link = (unsigned long)reg_val;
+- 	else if (reg_id == fadump_str_to_u64("XER"))
+- 		regs->xer = (unsigned long)reg_val;
+- 	else if (reg_id == fadump_str_to_u64("CR"))
+- 		regs->ccr = (unsigned long)reg_val;
+- 	else if (reg_id == fadump_str_to_u64("DAR"))
+- 		regs->dar = (unsigned long)reg_val;
+- 	else if (reg_id == fadump_str_to_u64("DSISR"))
+- 		regs->dsisr = (unsigned long)reg_val;
+- }
+- 
+- static struct rtas_fadump_reg_entry*
+- fadump_read_registers(struct rtas_fadump_reg_entry *reg_entry, struct pt_regs *regs)
+- {
+- 	memset(regs, 0, sizeof(struct pt_regs));
+- 
+- 	while (be64_to_cpu(reg_entry->reg_id) != fadump_str_to_u64("CPUEND")) {
+- 		fadump_set_regval(regs, be64_to_cpu(reg_entry->reg_id),
+- 					be64_to_cpu(reg_entry->reg_value));
+- 		reg_entry++;
+- 	}
+- 	reg_entry++;
+- 	return reg_entry;
+- }
+- 
+  u32 *fadump_regs_to_elf_notes(u32 *buf, struct pt_regs *regs)
+  {
+  	struct elf_prstatus prstatus;
+@@@ -1322,72 -931,19 +1114,45 @@@ static int register_fadump(void
+  	fadump_create_elfcore_headers(vaddr);
+  
+  	/* register the future kernel dump with firmware. */
+ -	pr_debug("Registering for firmware-assisted kernel dump...\n");
+ -	return fw_dump.ops->fadump_register(&fw_dump);
+ +	return register_fw_dump(&fdm);
+ +}
+ +
+ +static int fadump_unregister_dump(struct rtas_fadump_mem_struct *fdm)
+ +{
+ +	int rc = 0;
+ +	unsigned int wait_time;
+ +
+ +	pr_debug("Un-register firmware-assisted dump\n");
+ +
+ +	/* TODO: Add upper time limit for the delay */
+ +	do {
+ +		rc = rtas_call(fw_dump.ibm_configure_kernel_dump, 3, 1, NULL,
+ +			FADUMP_UNREGISTER, fdm,
+ +			sizeof(struct rtas_fadump_mem_struct));
+ +
+ +		wait_time = rtas_busy_delay_time(rc);
+ +		if (wait_time)
+ +			mdelay(wait_time);
+ +	} while (wait_time);
+ +
+ +	if (rc) {
+ +		printk(KERN_ERR "Failed to un-register firmware-assisted dump."
+ +			" unexpected error(%d).\n", rc);
+ +		return rc;
+ +	}
+ +	fw_dump.dump_registered = 0;
+ +	return 0;
+  }
+  
+- static int fadump_invalidate_dump(const struct rtas_fadump_mem_struct *fdm)
+- {
+- 	int rc = 0;
+- 	unsigned int wait_time;
+- 
+- 	pr_debug("Invalidating firmware-assisted dump registration\n");
+- 
+- 	/* TODO: Add upper time limit for the delay */
+- 	do {
+- 		rc = rtas_call(fw_dump.ibm_configure_kernel_dump, 3, 1, NULL,
+- 			FADUMP_INVALIDATE, fdm,
+- 			sizeof(struct rtas_fadump_mem_struct));
+- 
+- 		wait_time = rtas_busy_delay_time(rc);
+- 		if (wait_time)
+- 			mdelay(wait_time);
+- 	} while (wait_time);
+- 
+- 	if (rc) {
+- 		pr_err("Failed to invalidate firmware-assisted dump registration. Unexpected error (%d).\n", rc);
+- 		return rc;
+- 	}
+- 	fw_dump.dump_active = 0;
+- 	fdm_active = NULL;
+- 	return 0;
+- }
+- 
+  void fadump_cleanup(void)
+  {
+  	/* Invalidate the registration only if dump is active. */
+  	if (fw_dump.dump_active) {
+- 		/* pass the same memory dump structure provided by platform */
+- 		fadump_invalidate_dump(fdm_active);
++ 		pr_debug("Invalidating firmware-assisted dump registration\n");
++ 		fw_dump.ops->fadump_invalidate(&fw_dump);
+  	} else if (fw_dump.dump_registered) {
+  		/* Un-register Firmware-assisted dump if it was registered. */
+ -		fw_dump.ops->fadump_unregister(&fw_dump);
+ +		fadump_unregister_dump(&fdm);
+  		free_crash_memory_ranges();
+  	}
+  }
+@@@ -1538,8 -1094,10 +1303,9 @@@ static ssize_t fadump_register_store(st
+  		if (fw_dump.dump_registered == 0) {
+  			goto unlock_out;
+  		}
++ 
+  		/* Un-register Firmware-assisted dump */
+ -		pr_debug("Un-register firmware-assisted dump\n");
+ -		fw_dump.ops->fadump_unregister(&fw_dump);
+ +		fadump_unregister_dump(&fdm);
+  		break;
+  	case 1:
+  		if (fw_dump.dump_registered == 1) {
+@@@ -1567,56 -1123,8 +1331,61 @@@ static int fadump_region_show(struct se
+  		return 0;
+  
+  	mutex_lock(&fadump_mutex);
+++<<<<<<< HEAD
+ +	if (fdm_active)
+ +		fdm_ptr = fdm_active;
+ +	else {
+ +		mutex_unlock(&fadump_mutex);
+ +		fdm_ptr = &fdm;
+ +	}
+ +
+ +	seq_printf(m,
+ +			"CPU : [%#016llx-%#016llx] %#llx bytes, "
+ +			"Dumped: %#llx\n",
+ +			be64_to_cpu(fdm_ptr->cpu_state_data.destination_address),
+ +			be64_to_cpu(fdm_ptr->cpu_state_data.destination_address) +
+ +			be64_to_cpu(fdm_ptr->cpu_state_data.source_len) - 1,
+ +			be64_to_cpu(fdm_ptr->cpu_state_data.source_len),
+ +			be64_to_cpu(fdm_ptr->cpu_state_data.bytes_dumped));
+ +	seq_printf(m,
+ +			"HPTE: [%#016llx-%#016llx] %#llx bytes, "
+ +			"Dumped: %#llx\n",
+ +			be64_to_cpu(fdm_ptr->hpte_region.destination_address),
+ +			be64_to_cpu(fdm_ptr->hpte_region.destination_address) +
+ +			be64_to_cpu(fdm_ptr->hpte_region.source_len) - 1,
+ +			be64_to_cpu(fdm_ptr->hpte_region.source_len),
+ +			be64_to_cpu(fdm_ptr->hpte_region.bytes_dumped));
+ +	seq_printf(m,
+ +			"DUMP: [%#016llx-%#016llx] %#llx bytes, "
+ +			"Dumped: %#llx\n",
+ +			be64_to_cpu(fdm_ptr->rmr_region.destination_address),
+ +			be64_to_cpu(fdm_ptr->rmr_region.destination_address) +
+ +			be64_to_cpu(fdm_ptr->rmr_region.source_len) - 1,
+ +			be64_to_cpu(fdm_ptr->rmr_region.source_len),
+ +			be64_to_cpu(fdm_ptr->rmr_region.bytes_dumped));
+ +
+ +	if (!fdm_active ||
+ +		(fw_dump.reserve_dump_area_start ==
+ +		be64_to_cpu(fdm_ptr->cpu_state_data.destination_address)))
+ +		goto out;
+ +
+ +	/* Dump is active. Show reserved memory region. */
+ +	seq_printf(m,
+ +			"    : [%#016llx-%#016llx] %#llx bytes, "
+ +			"Dumped: %#llx\n",
+ +			(unsigned long long)fw_dump.reserve_dump_area_start,
+ +			be64_to_cpu(fdm_ptr->cpu_state_data.destination_address) - 1,
+ +			be64_to_cpu(fdm_ptr->cpu_state_data.destination_address) -
+ +			fw_dump.reserve_dump_area_start,
+ +			be64_to_cpu(fdm_ptr->cpu_state_data.destination_address) -
+ +			fw_dump.reserve_dump_area_start);
+ +out:
+ +	if (fdm_active)
+ +		mutex_unlock(&fadump_mutex);
+++=======
++ 	fw_dump.ops->fadump_region_show(&fw_dump, m);
++ 	mutex_unlock(&fadump_mutex);
+++>>>>>>> f35120115b76 (pseries/fadump: move out platform specific support from generic code)
+  	return 0;
+  }
+  
+@@@ -1702,7 -1200,8 +1471,12 @@@ int __init setup_fadump(void
+  	}
+  	/* Initialize the kernel dump memory structure for FAD registration. */
+  	else if (fw_dump.reserve_dump_area_size)
+++<<<<<<< HEAD
+ +		init_fadump_mem_struct(&fdm, fw_dump.reserve_dump_area_start);
+++=======
++ 		fw_dump.ops->fadump_init_mem_struct(&fw_dump);
++ 
+++>>>>>>> f35120115b76 (pseries/fadump: move out platform specific support from generic code)
+  	fadump_init_files();
+  
+  	return 1;
+* Unmerged path arch/powerpc/platforms/pseries/rtas-fadump.c
+* Unmerged path arch/powerpc/kernel/fadump.c
+* Unmerged path arch/powerpc/platforms/pseries/rtas-fadump.c
