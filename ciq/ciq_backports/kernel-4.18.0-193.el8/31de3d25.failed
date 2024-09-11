@@ -1,0 +1,135 @@
+x86/kvm/hyper-v: move VMX controls sanitization out of nested_enable_evmcs()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-193.el8
+Rebuild_CHGLOG: - [x86] kvm/hyper-v: move VMX controls sanitization out of nested_enable_evmcs() (Vitaly Kuznetsov) [1786288]
+Rebuild_FUZZ: 97.30%
+commit-author Vitaly Kuznetsov <vkuznets@redhat.com>
+commit 31de3d2500e49e9f44fdda1830a37f4d9735bcdd
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-193.el8/31de3d25.failed
+
+With fine grained VMX feature enablement QEMU>=4.2 tries to do KVM_SET_MSRS
+with default (matching CPU model) values and in case eVMCS is also enabled,
+fails.
+
+It would be possible to drop VMX feature filtering completely and make
+this a guest's responsibility: if it decides to use eVMCS it should know
+which fields are available and which are not. Hyper-V mostly complies to
+this, however, there are some problematic controls:
+SECONDARY_EXEC_VIRTUALIZE_APIC_ACCESSES
+VM_{ENTRY,EXIT}_LOAD_IA32_PERF_GLOBAL_CTRL
+
+which Hyper-V enables. As there are no corresponding fields in eVMCS, we
+can't handle this properly in KVM. This is a Hyper-V issue.
+
+Move VMX controls sanitization from nested_enable_evmcs() to vmx_get_msr(),
+and do the bare minimum (only clear controls which are known to cause issues).
+This allows userspace to keep setting controls it wants and at the same
+time hides them from the guest.
+
+	Signed-off-by: Vitaly Kuznetsov <vkuznets@redhat.com>
+	Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+(cherry picked from commit 31de3d2500e49e9f44fdda1830a37f4d9735bcdd)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kvm/vmx/vmx.c
+diff --cc arch/x86/kvm/vmx/vmx.c
+index 1496da3f09e5,ba334acaa37e..000000000000
+--- a/arch/x86/kvm/vmx/vmx.c
++++ b/arch/x86/kvm/vmx/vmx.c
+@@@ -1830,15 -1853,19 +1830,31 @@@ static int vmx_get_msr(struct kvm_vcpu 
+  	case MSR_IA32_VMX_BASIC ... MSR_IA32_VMX_VMFUNC:
+  		if (!nested_vmx_allowed(vcpu))
+  			return 1;
+++<<<<<<< HEAD
+ +		return vmx_get_vmx_msr(&vmx->nested.msrs, msr_info->index,
+ +				       &msr_info->data);
+ +	case MSR_IA32_XSS:
+ +		if (!vmx_xsaves_supported() ||
+ +		    (!msr_info->host_initiated &&
+ +		     !(guest_cpuid_has(vcpu, X86_FEATURE_XSAVE) &&
+ +		       guest_cpuid_has(vcpu, X86_FEATURE_XSAVES))))
+ +			return 1;
+ +		msr_info->data = vcpu->arch.ia32_xss;
+++=======
++ 		if (vmx_get_vmx_msr(&vmx->nested.msrs, msr_info->index,
++ 				    &msr_info->data))
++ 			return 1;
++ 		/*
++ 		 * Enlightened VMCS v1 doesn't have certain fields, but buggy
++ 		 * Hyper-V versions are still trying to use corresponding
++ 		 * features when they are exposed. Filter out the essential
++ 		 * minimum.
++ 		 */
++ 		if (!msr_info->host_initiated &&
++ 		    vmx->nested.enlightened_vmcs_enabled)
++ 			nested_evmcs_filter_control_msr(msr_info->index,
++ 							&msr_info->data);
+++>>>>>>> 31de3d2500e4 (x86/kvm/hyper-v: move VMX controls sanitization out of nested_enable_evmcs())
+  		break;
+  	case MSR_IA32_RTIT_CTL:
+  		if (pt_mode != PT_MODE_HOST_GUEST)
+diff --git a/arch/x86/kvm/vmx/evmcs.c b/arch/x86/kvm/vmx/evmcs.c
+index 89c3e0caf39f..ba886fb7bc39 100644
+--- a/arch/x86/kvm/vmx/evmcs.c
++++ b/arch/x86/kvm/vmx/evmcs.c
+@@ -346,6 +346,32 @@ uint16_t nested_get_evmcs_version(struct kvm_vcpu *vcpu)
+        return 0;
+ }
+ 
++void nested_evmcs_filter_control_msr(u32 msr_index, u64 *pdata)
++{
++	u32 ctl_low = (u32)*pdata;
++	u32 ctl_high = (u32)(*pdata >> 32);
++
++	/*
++	 * Hyper-V 2016 and 2019 try using these features even when eVMCS
++	 * is enabled but there are no corresponding fields.
++	 */
++	switch (msr_index) {
++	case MSR_IA32_VMX_EXIT_CTLS:
++	case MSR_IA32_VMX_TRUE_EXIT_CTLS:
++		ctl_high &= ~VM_EXIT_LOAD_IA32_PERF_GLOBAL_CTRL;
++		break;
++	case MSR_IA32_VMX_ENTRY_CTLS:
++	case MSR_IA32_VMX_TRUE_ENTRY_CTLS:
++		ctl_high &= ~VM_ENTRY_LOAD_IA32_PERF_GLOBAL_CTRL;
++		break;
++	case MSR_IA32_VMX_PROCBASED_CTLS2:
++		ctl_high &= ~SECONDARY_EXEC_VIRTUALIZE_APIC_ACCESSES;
++		break;
++	}
++
++	*pdata = ctl_low | ((u64)ctl_high << 32);
++}
++
+ int nested_enable_evmcs(struct kvm_vcpu *vcpu,
+ 			uint16_t *vmcs_version)
+ {
+@@ -356,11 +382,5 @@ int nested_enable_evmcs(struct kvm_vcpu *vcpu,
+ 	if (vmcs_version)
+ 		*vmcs_version = nested_get_evmcs_version(vcpu);
+ 
+-	vmx->nested.msrs.pinbased_ctls_high &= ~EVMCS1_UNSUPPORTED_PINCTRL;
+-	vmx->nested.msrs.entry_ctls_high &= ~EVMCS1_UNSUPPORTED_VMENTRY_CTRL;
+-	vmx->nested.msrs.exit_ctls_high &= ~EVMCS1_UNSUPPORTED_VMEXIT_CTRL;
+-	vmx->nested.msrs.secondary_ctls_high &= ~EVMCS1_UNSUPPORTED_2NDEXEC;
+-	vmx->nested.msrs.vmfunc_controls &= ~EVMCS1_UNSUPPORTED_VMFUNC;
+-
+ 	return 0;
+ }
+diff --git a/arch/x86/kvm/vmx/evmcs.h b/arch/x86/kvm/vmx/evmcs.h
+index 07ebf6882a45..b88d9807a796 100644
+--- a/arch/x86/kvm/vmx/evmcs.h
++++ b/arch/x86/kvm/vmx/evmcs.h
+@@ -201,5 +201,6 @@ bool nested_enlightened_vmentry(struct kvm_vcpu *vcpu, u64 *evmcs_gpa);
+ uint16_t nested_get_evmcs_version(struct kvm_vcpu *vcpu);
+ int nested_enable_evmcs(struct kvm_vcpu *vcpu,
+ 			uint16_t *vmcs_version);
++void nested_evmcs_filter_control_msr(u32 msr_index, u64 *pdata);
+ 
+ #endif /* __KVM_X86_VMX_EVMCS_H */
+* Unmerged path arch/x86/kvm/vmx/vmx.c
