@@ -1,0 +1,281 @@
+KVM: x86: fix handling of role.cr4_pae and rename it to 'gpte_size'
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-147.el8
+commit-author Sean Christopherson <sean.j.christopherson@intel.com>
+commit 47c42e6b4192a2ac8b6c9858ebcf400a9eff7a10
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-147.el8/47c42e6b.failed
+
+The cr4_pae flag is a bit of a misnomer, its purpose is really to track
+whether the guest PTE that is being shadowed is a 4-byte entry or an
+8-byte entry.  Prior to supporting nested EPT, the size of the gpte was
+reflected purely by CR4.PAE.  KVM fudged things a bit for direct sptes,
+but it was mostly harmless since the size of the gpte never mattered.
+Now that a spte may be tracking an indirect EPT entry, relying on
+CR4.PAE is wrong and ill-named.
+
+For direct shadow pages, force the gpte_size to '1' as they are always
+8-byte entries; EPT entries can only be 8-bytes and KVM always uses
+8-byte entries for NPT and its identity map (when running with EPT but
+not unrestricted guest).
+
+Likewise, nested EPT entries are always 8-bytes.  Nested EPT presents a
+unique scenario as the size of the entries are not dictated by CR4.PAE,
+but neither is the shadow page a direct map.  To handle this scenario,
+set cr0_wp=1 and smap_andnot_wp=1, an otherwise impossible combination,
+to denote a nested EPT shadow page.  Use the information to avoid
+incorrectly zapping an unsync'd indirect page in __kvm_sync_page().
+
+Providing a consistent and accurate gpte_size fixes a bug reported by
+Vitaly where fast_cr3_switch() always fails when switching from L2 to
+L1 as kvm_mmu_get_page() would force role.cr4_pae=0 for direct pages,
+whereas kvm_calc_mmu_role_common() would set it according to CR4.PAE.
+
+Fixes: 7dcd575520082 ("x86/kvm/mmu: check if tdp/shadow MMU reconfiguration is needed")
+	Reported-by: Vitaly Kuznetsov <vkuznets@redhat.com>
+	Tested-by: Vitaly Kuznetsov <vkuznets@redhat.com>
+	Signed-off-by: Sean Christopherson <sean.j.christopherson@intel.com>
+	Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+(cherry picked from commit 47c42e6b4192a2ac8b6c9858ebcf400a9eff7a10)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kvm/mmu.c
+diff --cc arch/x86/kvm/mmu.c
+index 7df43ed1e670,776a58b00682..000000000000
+--- a/arch/x86/kvm/mmu.c
++++ b/arch/x86/kvm/mmu.c
+@@@ -4763,17 -4776,51 +4769,61 @@@ static void paging32E_init_context(stru
+  	paging64_init_context_common(vcpu, context, PT32E_ROOT_LEVEL);
+  }
+  
+ -static union kvm_mmu_extended_role kvm_calc_mmu_role_ext(struct kvm_vcpu *vcpu)
+ -{
+ -	union kvm_mmu_extended_role ext = {0};
+ -
+ +static union kvm_mmu_page_role
+ +kvm_calc_tdp_mmu_root_page_role(struct kvm_vcpu *vcpu)
+ +{
+ +	union kvm_mmu_page_role role = {0};
+ +
+++<<<<<<< HEAD
+ +	role.guest_mode = is_guest_mode(vcpu);
+ +	role.smm = is_smm(vcpu);
+ +	role.ad_disabled = (shadow_accessed_mask == 0);
+ +	role.level = kvm_x86_ops->get_tdp_level(vcpu);
+ +	role.direct = true;
+ +	role.access = ACC_ALL;
+++=======
++ 	ext.cr0_pg = !!is_paging(vcpu);
++ 	ext.cr4_smep = !!kvm_read_cr4_bits(vcpu, X86_CR4_SMEP);
++ 	ext.cr4_smap = !!kvm_read_cr4_bits(vcpu, X86_CR4_SMAP);
++ 	ext.cr4_pse = !!is_pse(vcpu);
++ 	ext.cr4_pke = !!kvm_read_cr4_bits(vcpu, X86_CR4_PKE);
++ 	ext.cr4_la57 = !!kvm_read_cr4_bits(vcpu, X86_CR4_LA57);
++ 	ext.maxphyaddr = cpuid_maxphyaddr(vcpu);
++ 
++ 	ext.valid = 1;
++ 
++ 	return ext;
++ }
++ 
++ static union kvm_mmu_role kvm_calc_mmu_role_common(struct kvm_vcpu *vcpu,
++ 						   bool base_only)
++ {
++ 	union kvm_mmu_role role = {0};
++ 
++ 	role.base.access = ACC_ALL;
++ 	role.base.nxe = !!is_nx(vcpu);
++ 	role.base.cr0_wp = is_write_protection(vcpu);
++ 	role.base.smm = is_smm(vcpu);
++ 	role.base.guest_mode = is_guest_mode(vcpu);
++ 
++ 	if (base_only)
++ 		return role;
++ 
++ 	role.ext = kvm_calc_mmu_role_ext(vcpu);
++ 
++ 	return role;
++ }
++ 
++ static union kvm_mmu_role
++ kvm_calc_tdp_mmu_root_page_role(struct kvm_vcpu *vcpu, bool base_only)
++ {
++ 	union kvm_mmu_role role = kvm_calc_mmu_role_common(vcpu, base_only);
++ 
++ 	role.base.ad_disabled = (shadow_accessed_mask == 0);
++ 	role.base.level = kvm_x86_ops->get_tdp_level(vcpu);
++ 	role.base.direct = true;
++ 	role.base.gpte_is_8_bytes = true;
+++>>>>>>> 47c42e6b4192 (KVM: x86: fix handling of role.cr4_pae and rename it to 'gpte_size')
+  
+  	return role;
+  }
+@@@ -4823,29 -4875,24 +4873,38 @@@ static void init_kvm_tdp_mmu(struct kvm
+  	reset_tdp_shadow_zero_bits_mask(vcpu, context);
+  }
+  
+ -static union kvm_mmu_role
+ -kvm_calc_shadow_mmu_root_page_role(struct kvm_vcpu *vcpu, bool base_only)
+ -{
+ -	union kvm_mmu_role role = kvm_calc_mmu_role_common(vcpu, base_only);
+ -
+ +static union kvm_mmu_page_role
+ +kvm_calc_shadow_mmu_root_page_role(struct kvm_vcpu *vcpu)
+ +{
+ +	union kvm_mmu_page_role role = {0};
+ +	bool smep = kvm_read_cr4_bits(vcpu, X86_CR4_SMEP);
+ +	bool smap = kvm_read_cr4_bits(vcpu, X86_CR4_SMAP);
+ +
+++<<<<<<< HEAD
+ +	role.nxe = is_nx(vcpu);
+ +	role.cr4_pae = !!is_pae(vcpu);
+ +	role.cr0_wp  = is_write_protection(vcpu);
+ +	role.smep_andnot_wp = smep && !is_write_protection(vcpu);
+ +	role.smap_andnot_wp = smap && !is_write_protection(vcpu);
+ +	role.guest_mode = is_guest_mode(vcpu);
+ +	role.smm = is_smm(vcpu);
+ +	role.direct = !is_paging(vcpu);
+ +	role.access = ACC_ALL;
+++=======
++ 	role.base.smep_andnot_wp = role.ext.cr4_smep &&
++ 		!is_write_protection(vcpu);
++ 	role.base.smap_andnot_wp = role.ext.cr4_smap &&
++ 		!is_write_protection(vcpu);
++ 	role.base.direct = !is_paging(vcpu);
++ 	role.base.gpte_is_8_bytes = !!is_pae(vcpu);
+++>>>>>>> 47c42e6b4192 (KVM: x86: fix handling of role.cr4_pae and rename it to 'gpte_size')
+  
+  	if (!is_long_mode(vcpu))
+ -		role.base.level = PT32E_ROOT_LEVEL;
+ +		role.level = PT32E_ROOT_LEVEL;
+  	else if (is_la57_mode(vcpu))
+ -		role.base.level = PT64_ROOT_5LEVEL;
+ +		role.level = PT64_ROOT_5LEVEL;
+  	else
+ -		role.base.level = PT64_ROOT_4LEVEL;
+ +		role.level = PT64_ROOT_4LEVEL;
+  
+  	return role;
+  }
+@@@ -4869,16 -4921,31 +4928,40 @@@ void kvm_init_shadow_mmu(struct kvm_vcp
+  }
+  EXPORT_SYMBOL_GPL(kvm_init_shadow_mmu);
+  
+ -static union kvm_mmu_role
+ -kvm_calc_shadow_ept_root_page_role(struct kvm_vcpu *vcpu, bool accessed_dirty,
+ -				   bool execonly)
+ +static union kvm_mmu_page_role
+ +kvm_calc_shadow_ept_root_page_role(struct kvm_vcpu *vcpu, bool accessed_dirty)
+  {
+++<<<<<<< HEAD
+ +	union kvm_mmu_page_role role = vcpu->arch.mmu->base_role;
+ +
+ +	role.level = PT64_ROOT_4LEVEL;
+ +	role.direct = false;
+ +	role.ad_disabled = !accessed_dirty;
+ +	role.guest_mode = true;
+ +	role.access = ACC_ALL;
+++=======
++ 	union kvm_mmu_role role = {0};
++ 
++ 	/* SMM flag is inherited from root_mmu */
++ 	role.base.smm = vcpu->arch.root_mmu.mmu_role.base.smm;
++ 
++ 	role.base.level = PT64_ROOT_4LEVEL;
++ 	role.base.gpte_is_8_bytes = true;
++ 	role.base.direct = false;
++ 	role.base.ad_disabled = !accessed_dirty;
++ 	role.base.guest_mode = true;
++ 	role.base.access = ACC_ALL;
++ 
++ 	/*
++ 	 * WP=1 and NOT_WP=1 is an impossible combination, use WP and the
++ 	 * SMAP variation to denote shadow EPT entries.
++ 	 */
++ 	role.base.cr0_wp = true;
++ 	role.base.smap_andnot_wp = true;
++ 
++ 	role.ext = kvm_calc_mmu_role_ext(vcpu);
++ 	role.ext.execonly = execonly;
+++>>>>>>> 47c42e6b4192 (KVM: x86: fix handling of role.cr4_pae and rename it to 'gpte_size')
+  
+  	return role;
+  }
+diff --git a/Documentation/virtual/kvm/mmu.txt b/Documentation/virtual/kvm/mmu.txt
+index f365102c80f5..2efe0efc516e 100644
+--- a/Documentation/virtual/kvm/mmu.txt
++++ b/Documentation/virtual/kvm/mmu.txt
+@@ -142,7 +142,7 @@ Shadow pages contain the following information:
+     If clear, this page corresponds to a guest page table denoted by the gfn
+     field.
+   role.quadrant:
+-    When role.cr4_pae=0, the guest uses 32-bit gptes while the host uses 64-bit
++    When role.gpte_is_8_bytes=0, the guest uses 32-bit gptes while the host uses 64-bit
+     sptes.  That means a guest page table contains more ptes than the host,
+     so multiple shadow pages are needed to shadow one guest page.
+     For first-level shadow pages, role.quadrant can be 0 or 1 and denotes the
+@@ -158,9 +158,9 @@ Shadow pages contain the following information:
+     The page is invalid and should not be used.  It is a root page that is
+     currently pinned (by a cpu hardware register pointing to it); once it is
+     unpinned it will be destroyed.
+-  role.cr4_pae:
+-    Contains the value of cr4.pae for which the page is valid (e.g. whether
+-    32-bit or 64-bit gptes are in use).
++  role.gpte_is_8_bytes:
++    Reflects the size of the guest PTE for which the page is valid, i.e. '1'
++    if 64-bit gptes are in use, '0' if 32-bit gptes are in use.
+   role.nxe:
+     Contains the value of efer.nxe for which the page is valid.
+   role.cr0_wp:
+@@ -173,6 +173,9 @@ Shadow pages contain the following information:
+     Contains the value of cr4.smap && !cr0.wp for which the page is valid
+     (pages for which this is true are different from other pages; see the
+     treatment of cr0.wp=0 below).
++  role.ept_sp:
++    This is a virtual flag to denote a shadowed nested EPT page.  ept_sp
++    is true if "cr0_wp && smap_andnot_wp", an otherwise invalid combination.
+   role.smm:
+     Is 1 if the page is valid in system management mode.  This field
+     determines which of the kvm_memslots array was used to build this
+diff --git a/arch/x86/include/asm/kvm_host.h b/arch/x86/include/asm/kvm_host.h
+index 4f4095c7b53d..b376abfe29d6 100644
+--- a/arch/x86/include/asm/kvm_host.h
++++ b/arch/x86/include/asm/kvm_host.h
+@@ -253,14 +253,14 @@ struct kvm_mmu_memory_cache {
+  * kvm_memory_slot.arch.gfn_track which is 16 bits, so the role bits used
+  * by indirect shadow page can not be more than 15 bits.
+  *
+- * Currently, we used 14 bits that are @level, @cr4_pae, @quadrant, @access,
++ * Currently, we used 14 bits that are @level, @gpte_is_8_bytes, @quadrant, @access,
+  * @nxe, @cr0_wp, @smep_andnot_wp and @smap_andnot_wp.
+  */
+ union kvm_mmu_page_role {
+ 	u32 word;
+ 	struct {
+ 		unsigned level:4;
+-		unsigned cr4_pae:1;
++		unsigned gpte_is_8_bytes:1;
+ 		unsigned quadrant:2;
+ 		unsigned direct:1;
+ 		unsigned access:3;
+* Unmerged path arch/x86/kvm/mmu.c
+diff --git a/arch/x86/kvm/mmutrace.h b/arch/x86/kvm/mmutrace.h
+index 9f6c855a0043..dd30dccd2ad5 100644
+--- a/arch/x86/kvm/mmutrace.h
++++ b/arch/x86/kvm/mmutrace.h
+@@ -29,10 +29,10 @@
+ 								        \
+ 	role.word = __entry->role;					\
+ 									\
+-	trace_seq_printf(p, "sp gfn %llx l%u%s q%u%s %s%s"		\
++	trace_seq_printf(p, "sp gfn %llx l%u %u-byte q%u%s %s%s"	\
+ 			 " %snxe %sad root %u %s%c",			\
+ 			 __entry->gfn, role.level,			\
+-			 role.cr4_pae ? " pae" : "",			\
++			 role.gpte_is_8_bytes ? 8 : 4,			\
+ 			 role.quadrant,					\
+ 			 role.direct ? " direct" : "",			\
+ 			 access_str[role.access],			\
