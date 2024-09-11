@@ -1,0 +1,109 @@
+blk-mq: always free hctx after request queue is freed
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-147.el8
+commit-author Ming Lei <ming.lei@redhat.com>
+commit 2f8f1336a48bd5186de3476da0a3e2ec06d0533a
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-147.el8/2f8f1336.failed
+
+In normal queue cleanup path, hctx is released after request queue
+is freed, see blk_mq_release().
+
+However, in __blk_mq_update_nr_hw_queues(), hctx may be freed because
+of hw queues shrinking. This way is easy to cause use-after-free,
+because: one implicit rule is that it is safe to call almost all block
+layer APIs if the request queue is alive; and one hctx may be retrieved
+by one API, then the hctx can be freed by blk_mq_update_nr_hw_queues();
+finally use-after-free is triggered.
+
+Fixes this issue by always freeing hctx after releasing request queue.
+If some hctxs are removed in blk_mq_update_nr_hw_queues(), introduce
+a per-queue list to hold them, then try to resuse these hctxs if numa
+node is matched.
+
+	Cc: Dongli Zhang <dongli.zhang@oracle.com>
+	Cc: James Smart <james.smart@broadcom.com>
+	Cc: Bart Van Assche <bart.vanassche@wdc.com>
+	Cc: linux-scsi@vger.kernel.org,
+	Cc: Martin K . Petersen <martin.petersen@oracle.com>,
+	Cc: Christoph Hellwig <hch@lst.de>,
+	Cc: James E . J . Bottomley <jejb@linux.vnet.ibm.com>,
+	Reviewed-by: Hannes Reinecke <hare@suse.com>
+	Tested-by: James Smart <james.smart@broadcom.com>
+	Signed-off-by: Ming Lei <ming.lei@redhat.com>
+	Signed-off-by: Jens Axboe <axboe@kernel.dk>
+(cherry picked from commit 2f8f1336a48bd5186de3476da0a3e2ec06d0533a)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	block/blk-mq.c
+#	include/linux/blk-mq.h
+diff --cc block/blk-mq.c
+index 6eaec7025d6a,08a6248d8536..000000000000
+--- a/block/blk-mq.c
++++ b/block/blk-mq.c
+@@@ -2263,12 -2268,11 +2263,19 @@@ static void blk_mq_exit_hctx(struct req
+  	if (set->ops->exit_hctx)
+  		set->ops->exit_hctx(hctx, hctx_idx);
+  
+ +	if (hctx->flags & BLK_MQ_F_BLOCKING)
+ +		cleanup_srcu_struct(hctx->srcu);
+ +
+  	blk_mq_remove_cpuhp(hctx);
+++<<<<<<< HEAD
+ +	blk_free_flush_queue(hctx->fq);
+ +	sbitmap_free(&hctx->ctx_map);
+++=======
++ 
++ 	spin_lock(&q->unused_hctx_lock);
++ 	list_add(&hctx->hctx_list, &q->unused_hctx_list);
++ 	spin_unlock(&q->unused_hctx_lock);
+++>>>>>>> 2f8f1336a48b (blk-mq: always free hctx after request queue is freed)
+  }
+  
+  static void blk_mq_exit_hw_queues(struct request_queue *q,
+diff --cc include/linux/blk-mq.h
+index f58bd25e3629,15d1aa53d96c..000000000000
+--- a/include/linux/blk-mq.h
++++ b/include/linux/blk-mq.h
+@@@ -70,14 -70,7 +70,18 @@@ struct blk_mq_hw_ctx 
+  	struct dentry		*sched_debugfs_dir;
+  #endif
+  
+++<<<<<<< HEAD
+ +	RH_KABI_RESERVE(1)
+ +	RH_KABI_RESERVE(2)
+ +	RH_KABI_RESERVE(3)
+ +	RH_KABI_RESERVE(4)
+ +	RH_KABI_RESERVE(5)
+ +	RH_KABI_RESERVE(6)
+ +	RH_KABI_RESERVE(7)
+ +	RH_KABI_RESERVE(8)
+++=======
++ 	struct list_head	hctx_list;
+++>>>>>>> 2f8f1336a48b (blk-mq: always free hctx after request queue is freed)
+  
+  	/* Must be the last member - see also blk_mq_hw_ctx_size(). */
+  	struct srcu_struct	srcu[0];
+* Unmerged path block/blk-mq.c
+* Unmerged path include/linux/blk-mq.h
+diff --git a/include/linux/blkdev.h b/include/linux/blkdev.h
+index e4cfc3fbcfc4..e5d43733ea37 100644
+--- a/include/linux/blkdev.h
++++ b/include/linux/blkdev.h
+@@ -550,6 +550,13 @@ struct request_queue {
+ 
+ 	struct mutex		sysfs_lock;
+ 
++	/*
++	 * for reusing dead hctx instance in case of updating
++	 * nr_hw_queues
++	 */
++	struct list_head	unused_hctx_list;
++	spinlock_t		unused_hctx_lock;
++
+ 	atomic_t		mq_freeze_depth;
+ 
+ #if defined(CONFIG_BLK_DEV_BSG)
