@@ -650,8 +650,11 @@ int nested_svm_vmexit(struct vcpu_svm *svm)
 	/* On vmexit the  GIF is set to false */
 	svm_set_gif(svm, false);
 
-	svm->vmcb->control.tsc_offset = svm->vcpu.arch.tsc_offset =
-		svm->vcpu.arch.l1_tsc_offset;
+	svm->vcpu.arch.tsc_offset = svm->vcpu.arch.l1_tsc_offset;
+	if (svm->vmcb->control.tsc_offset != svm->vcpu.arch.tsc_offset) {
+		svm->vmcb->control.tsc_offset = svm->vcpu.arch.tsc_offset;
+		vmcb_mark_dirty(svm->vmcb, VMCB_INTERCEPTS);
+	}
 
 	svm->nested.ctl.nested_cr3 = 0;
 
@@ -673,8 +676,6 @@ int nested_svm_vmexit(struct vcpu_svm *svm)
 	svm->vmcb->save.dr7 = DR7_FIXED_1;
 	svm->vmcb->save.cpl = 0;
 	svm->vmcb->control.exit_int_info = 0;
-
-	vmcb_mark_all_dirty(svm->vmcb);
 
 	trace_kvm_nested_vmexit_inject(vmcb12->control.exit_code,
 				       vmcb12->control.exit_info_1,
