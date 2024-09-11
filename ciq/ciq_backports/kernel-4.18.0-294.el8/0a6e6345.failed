@@ -1,0 +1,375 @@
+s390/qdio: extend polling support to multiple queues
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Julian Wiedmann <jwi@linux.ibm.com>
+commit 0a6e634535f1b47b00501c0b563a827eb1f8ec8c
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/0a6e6345.failed
+
+When the support for polling drivers was initially added, it only
+considered Input Queue 0. But as QDIO interrupts are actually for the
+full device and not a single queue, this doesn't really fit for
+configurations where multiple Input Queues are used.
+
+Rework the qdio code so that interrupts for a polling driver are not
+split up into actions for each queue. Instead deliver the interrupt as
+a single event, and let the driver decide which queue needs what action.
+
+When re-enabling the QDIO interrupt via qdio_start_irq(), this means
+that the qdio code needs to
+(1) put _all_ eligible queues back into a state where they raise IRQs,
+(2) and afterwards check _all_ eligible queues for new work to bridge
+    the race window.
+
+On the qeth side of things (as the only qdio polling driver), we can now
+add CQ polling support to the main NAPI poll routine. It doesn't consume
+NAPI budget, and to avoid hogging the CPU we yield control after
+completing one full queue worth of buffers.
+The subsequent qdio_start_irq() will check for any additional work, and
+have us re-schedule the NAPI instance accordingly.
+
+	Signed-off-by: Julian Wiedmann <jwi@linux.ibm.com>
+	Acked-by: Heiko Carstens <heiko.carstens@de.ibm.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 0a6e634535f1b47b00501c0b563a827eb1f8ec8c)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/s390/net/qeth_core_main.c
+diff --cc drivers/s390/net/qeth_core_main.c
+index 7c95b272c820,68bba8d057d1..000000000000
+--- a/drivers/s390/net/qeth_core_main.c
++++ b/drivers/s390/net/qeth_core_main.c
+@@@ -5355,10 -5547,45 +5324,48 @@@ int qeth_poll(struct napi_struct *napi
+  		}
+  	}
+  
+++<<<<<<< HEAD
+++=======
++ 	return work_done;
++ }
++ 
++ static void qeth_cq_poll(struct qeth_card *card)
++ {
++ 	unsigned int work_done = 0;
++ 
++ 	while (work_done < QDIO_MAX_BUFFERS_PER_Q) {
++ 		unsigned int start, error;
++ 		int completed;
++ 
++ 		completed = qdio_inspect_queue(CARD_DDEV(card), 1, true, &start,
++ 					       &error);
++ 		if (completed <= 0)
++ 			return;
++ 
++ 		qeth_qdio_cq_handler(card, error, 1, start, completed);
++ 		work_done += completed;
++ 	}
++ }
++ 
++ int qeth_poll(struct napi_struct *napi, int budget)
++ {
++ 	struct qeth_card *card = container_of(napi, struct qeth_card, napi);
++ 	unsigned int work_done;
++ 
++ 	work_done = qeth_rx_poll(card, budget);
++ 
++ 	if (card->options.cq == QETH_CQ_ENABLED)
++ 		qeth_cq_poll(card);
++ 
++ 	/* Exhausted the RX budget. Keep IRQ disabled, we get called again. */
++ 	if (budget && work_done >= budget)
++ 		return work_done;
++ 
+++>>>>>>> 0a6e634535f1 (s390/qdio: extend polling support to multiple queues)
+  	if (napi_complete_done(napi, work_done) &&
+- 	    qdio_start_irq(CARD_DDEV(card), 0))
++ 	    qdio_start_irq(CARD_DDEV(card)))
+  		napi_schedule(napi);
+ -
+ +out:
+  	return work_done;
+  }
+  EXPORT_SYMBOL_GPL(qeth_poll);
+diff --git a/arch/s390/include/asm/qdio.h b/arch/s390/include/asm/qdio.h
+index 1e3517b0518b..e577f8533009 100644
+--- a/arch/s390/include/asm/qdio.h
++++ b/arch/s390/include/asm/qdio.h
+@@ -338,7 +338,7 @@ typedef void qdio_handler_t(struct ccw_device *, unsigned int, int,
+  * @no_output_qs: number of output queues
+  * @input_handler: handler to be called for input queues
+  * @output_handler: handler to be called for output queues
+- * @queue_start_poll_array: polling handlers (one per input queue or NULL)
++ * @irq_poll: Data IRQ polling handler (NULL when not supported)
+  * @scan_threshold: # of in-use buffers that triggers scan on output queue
+  * @int_parm: interruption parameter
+  * @input_sbal_addr_array:  address of no_input_qs * 128 pointers
+@@ -359,8 +359,7 @@ struct qdio_initialize {
+ 	unsigned int no_output_qs;
+ 	qdio_handler_t *input_handler;
+ 	qdio_handler_t *output_handler;
+-	void (**queue_start_poll_array) (struct ccw_device *, int,
+-					  unsigned long);
++	void (*irq_poll)(struct ccw_device *cdev, unsigned long data);
+ 	unsigned int scan_threshold;
+ 	unsigned long int_parm;
+ 	struct qdio_buffer **input_sbal_addr_array;
+@@ -415,8 +414,8 @@ extern int qdio_activate(struct ccw_device *);
+ extern void qdio_release_aob(struct qaob *);
+ extern int do_QDIO(struct ccw_device *, unsigned int, int, unsigned int,
+ 		   unsigned int);
+-extern int qdio_start_irq(struct ccw_device *, int);
+-extern int qdio_stop_irq(struct ccw_device *, int);
++extern int qdio_start_irq(struct ccw_device *cdev);
++extern int qdio_stop_irq(struct ccw_device *cdev);
+ extern int qdio_get_next_buffers(struct ccw_device *, int, int *, int *);
+ extern int qdio_inspect_queue(struct ccw_device *cdev, unsigned int nr,
+ 			      bool is_input, unsigned int *bufnr,
+diff --git a/drivers/s390/cio/qdio.h b/drivers/s390/cio/qdio.h
+index e24a2cde487a..4a0411a474f1 100644
+--- a/drivers/s390/cio/qdio.h
++++ b/drivers/s390/cio/qdio.h
+@@ -177,8 +177,8 @@ struct qdio_queue_perf_stat {
+ 	unsigned int nr_sbal_total;
+ };
+ 
+-enum qdio_queue_irq_states {
+-	QDIO_QUEUE_IRQS_DISABLED,
++enum qdio_irq_poll_states {
++	QDIO_IRQ_DISABLED,
+ };
+ 
+ struct qdio_input_q {
+@@ -188,10 +188,6 @@ struct qdio_input_q {
+ 	int ack_count;
+ 	/* last time of noticing incoming data */
+ 	u64 timestamp;
+-	/* upper-layer polling flag */
+-	unsigned long queue_irq_state;
+-	/* callback to start upper-layer polling */
+-	void (*queue_start_poll) (struct ccw_device *, int, unsigned long);
+ };
+ 
+ struct qdio_output_q {
+@@ -297,6 +293,9 @@ struct qdio_irq {
+ 	struct qdio_q *input_qs[QDIO_MAX_QUEUES_PER_IRQ];
+ 	struct qdio_q *output_qs[QDIO_MAX_QUEUES_PER_IRQ];
+ 
++	void (*irq_poll)(struct ccw_device *cdev, unsigned long data);
++	unsigned long poll_state;
++
+ 	debug_info_t *debug_area;
+ 	struct mutex setup_mutex;
+ 	struct qdio_dev_perf_stat perf_stat;
+diff --git a/drivers/s390/cio/qdio_debug.c b/drivers/s390/cio/qdio_debug.c
+index 8544faddf80c..e7b978639156 100644
+--- a/drivers/s390/cio/qdio_debug.c
++++ b/drivers/s390/cio/qdio_debug.c
+@@ -128,8 +128,8 @@ static int qstat_show(struct seq_file *m, void *v)
+ 			   q->u.in.ack_start, q->u.in.ack_count);
+ 		seq_printf(m, "DSCI: %x   IRQs disabled: %u\n",
+ 			   *(u8 *)q->irq_ptr->dsci,
+-			   test_bit(QDIO_QUEUE_IRQS_DISABLED,
+-			   &q->u.in.queue_irq_state));
++			   test_bit(QDIO_IRQ_DISABLED,
++				    &q->irq_ptr->poll_state));
+ 	}
+ 	seq_printf(m, "SBAL states:\n");
+ 	seq_printf(m, "|0      |8      |16     |24     |32     |40     |48     |56  63|\n");
+diff --git a/drivers/s390/cio/qdio_main.c b/drivers/s390/cio/qdio_main.c
+index 2886b95f4741..4273ff2196ec 100644
+--- a/drivers/s390/cio/qdio_main.c
++++ b/drivers/s390/cio/qdio_main.c
+@@ -950,19 +950,14 @@ static void qdio_int_handler_pci(struct qdio_irq *irq_ptr)
+ 	if (unlikely(irq_ptr->state != QDIO_IRQ_STATE_ACTIVE))
+ 		return;
+ 
+-	for_each_input_queue(irq_ptr, q, i) {
+-		if (q->u.in.queue_start_poll) {
+-			/* skip if polling is enabled or already in work */
+-			if (test_and_set_bit(QDIO_QUEUE_IRQS_DISABLED,
+-				     &q->u.in.queue_irq_state)) {
+-				QDIO_PERF_STAT_INC(irq_ptr, int_discarded);
+-				continue;
+-			}
+-			q->u.in.queue_start_poll(q->irq_ptr->cdev, q->nr,
+-						 q->irq_ptr->int_parm);
+-		} else {
++	if (irq_ptr->irq_poll) {
++		if (!test_and_set_bit(QDIO_IRQ_DISABLED, &irq_ptr->poll_state))
++			irq_ptr->irq_poll(irq_ptr->cdev, irq_ptr->int_parm);
++		else
++			QDIO_PERF_STAT_INC(irq_ptr, int_discarded);
++	} else {
++		for_each_input_queue(irq_ptr, q, i)
+ 			tasklet_schedule(&q->tasklet);
+-		}
+ 	}
+ 
+ 	if (!pci_out_supported(irq_ptr) || !irq_ptr->scan_threshold)
+@@ -1607,24 +1602,26 @@ EXPORT_SYMBOL_GPL(do_QDIO);
+ /**
+  * qdio_start_irq - process input buffers
+  * @cdev: associated ccw_device for the qdio subchannel
+- * @nr: input queue number
+  *
+  * Return codes
+  *   0 - success
+  *   1 - irqs not started since new data is available
+  */
+-int qdio_start_irq(struct ccw_device *cdev, int nr)
++int qdio_start_irq(struct ccw_device *cdev)
+ {
+ 	struct qdio_q *q;
+ 	struct qdio_irq *irq_ptr = cdev->private->qdio_data;
++	unsigned int i;
+ 
+ 	if (!irq_ptr)
+ 		return -ENODEV;
+-	q = irq_ptr->input_qs[nr];
+ 
+ 	clear_nonshared_ind(irq_ptr);
+-	qdio_stop_polling(q);
+-	clear_bit(QDIO_QUEUE_IRQS_DISABLED, &q->u.in.queue_irq_state);
++
++	for_each_input_queue(irq_ptr, q, i)
++		qdio_stop_polling(q);
++
++	clear_bit(QDIO_IRQ_DISABLED, &irq_ptr->poll_state);
+ 
+ 	/*
+ 	 * We need to check again to not lose initiative after
+@@ -1632,13 +1629,16 @@ int qdio_start_irq(struct ccw_device *cdev, int nr)
+ 	 */
+ 	if (test_nonshared_ind(irq_ptr))
+ 		goto rescan;
+-	if (!qdio_inbound_q_done(q, q->first_to_check))
+-		goto rescan;
++
++	for_each_input_queue(irq_ptr, q, i) {
++		if (!qdio_inbound_q_done(q, q->first_to_check))
++			goto rescan;
++	}
++
+ 	return 0;
+ 
+ rescan:
+-	if (test_and_set_bit(QDIO_QUEUE_IRQS_DISABLED,
+-			     &q->u.in.queue_irq_state))
++	if (test_and_set_bit(QDIO_IRQ_DISABLED, &irq_ptr->poll_state))
+ 		return 0;
+ 	else
+ 		return 1;
+@@ -1726,23 +1726,19 @@ EXPORT_SYMBOL(qdio_get_next_buffers);
+ /**
+  * qdio_stop_irq - disable interrupt processing for the device
+  * @cdev: associated ccw_device for the qdio subchannel
+- * @nr: input queue number
+  *
+  * Return codes
+  *   0 - interrupts were already disabled
+  *   1 - interrupts successfully disabled
+  */
+-int qdio_stop_irq(struct ccw_device *cdev, int nr)
++int qdio_stop_irq(struct ccw_device *cdev)
+ {
+-	struct qdio_q *q;
+ 	struct qdio_irq *irq_ptr = cdev->private->qdio_data;
+ 
+ 	if (!irq_ptr)
+ 		return -ENODEV;
+-	q = irq_ptr->input_qs[nr];
+ 
+-	if (test_and_set_bit(QDIO_QUEUE_IRQS_DISABLED,
+-			     &q->u.in.queue_irq_state))
++	if (test_and_set_bit(QDIO_IRQ_DISABLED, &irq_ptr->poll_state))
+ 		return 0;
+ 	else
+ 		return 1;
+diff --git a/drivers/s390/cio/qdio_setup.c b/drivers/s390/cio/qdio_setup.c
+index 23295f2c8e04..17fba00f6c3d 100644
+--- a/drivers/s390/cio/qdio_setup.c
++++ b/drivers/s390/cio/qdio_setup.c
+@@ -224,15 +224,6 @@ static void setup_queues(struct qdio_irq *irq_ptr,
+ 		setup_queues_misc(q, irq_ptr, qdio_init->input_handler, i);
+ 
+ 		q->is_input_q = 1;
+-		if (qdio_init->queue_start_poll_array &&
+-		    qdio_init->queue_start_poll_array[i]) {
+-			q->u.in.queue_start_poll =
+-				qdio_init->queue_start_poll_array[i];
+-			set_bit(QDIO_QUEUE_IRQS_DISABLED,
+-				&q->u.in.queue_irq_state);
+-		} else {
+-			q->u.in.queue_start_poll = NULL;
+-		}
+ 
+ 		setup_storage_lists(q, irq_ptr, input_sbal_array, i);
+ 		input_sbal_array += QDIO_MAX_BUFFERS_PER_Q;
+@@ -484,6 +475,13 @@ int qdio_setup_irq(struct qdio_irq *irq_ptr, struct qdio_initialize *init_data)
+ 	ccw_device_get_schid(cdev, &irq_ptr->schid);
+ 	setup_queues(irq_ptr, init_data);
+ 
++	if (init_data->irq_poll) {
++		irq_ptr->irq_poll = init_data->irq_poll;
++		set_bit(QDIO_IRQ_DISABLED, &irq_ptr->poll_state);
++	} else {
++		irq_ptr->irq_poll = NULL;
++	}
++
+ 	setup_qib(irq_ptr, init_data);
+ 	qdio_setup_thinint(irq_ptr);
+ 	set_impl_params(irq_ptr, init_data->qib_param_field_format,
+diff --git a/drivers/s390/cio/qdio_thinint.c b/drivers/s390/cio/qdio_thinint.c
+index 999b998ea0c9..ea09df7209f0 100644
+--- a/drivers/s390/cio/qdio_thinint.c
++++ b/drivers/s390/cio/qdio_thinint.c
+@@ -135,28 +135,24 @@ static inline void tiqdio_call_inq_handlers(struct qdio_irq *irq)
+ 	    has_multiple_inq_on_dsci(irq))
+ 		xchg(irq->dsci, 0);
+ 
++	if (irq->irq_poll) {
++		if (!test_and_set_bit(QDIO_IRQ_DISABLED, &irq->poll_state))
++			irq->irq_poll(irq->cdev, irq->int_parm);
++		else
++			QDIO_PERF_STAT_INC(irq, int_discarded);
++
++		return;
++	}
++
+ 	for_each_input_queue(irq, q, i) {
+-		if (q->u.in.queue_start_poll) {
+-			/* skip if polling is enabled or already in work */
+-			if (test_and_set_bit(QDIO_QUEUE_IRQS_DISABLED,
+-					     &q->u.in.queue_irq_state)) {
+-				QDIO_PERF_STAT_INC(irq, int_discarded);
+-				continue;
+-			}
+-
+-			/* avoid dsci clear here, done after processing */
+-			q->u.in.queue_start_poll(irq->cdev, q->nr,
+-						 irq->int_parm);
+-		} else {
+-			if (!shared_ind(irq))
+-				xchg(irq->dsci, 0);
+-
+-			/*
+-			 * Call inbound processing but not directly
+-			 * since that could starve other thinint queues.
+-			 */
+-			tasklet_schedule(&q->tasklet);
+-		}
++		if (!shared_ind(irq))
++			xchg(irq->dsci, 0);
++
++		/*
++		 * Call inbound processing but not directly
++		 * since that could starve other thinint queues.
++		 */
++		tasklet_schedule(&q->tasklet);
+ 	}
+ }
+ 
+* Unmerged path drivers/s390/net/qeth_core_main.c
