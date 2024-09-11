@@ -1,0 +1,159 @@
+devlink: add timeout information to status_notify
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Shannon Nelson <snelson@pensando.io>
+commit f92970c694b36a4dbac2b650b173c78c0f0954cc
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/f92970c6.failed
+
+Add a timeout element to the DEVLINK_CMD_FLASH_UPDATE_STATUS
+netlink message for use by a userland utility to show that
+a particular firmware flash activity may take a long but
+bounded time to finish.  Also add a handy helper for drivers
+to make use of the new timeout value.
+
+UI usage hints:
+ - if non-zero, add timeout display to the end of the status line
+ 	[component] status_msg  ( Xm Ys : Am Bs )
+     using the timeout value for Am Bs and updating the Xm Ys
+     every second
+ - if the timeout expires while awaiting the next update,
+   display something like
+ 	[component] status_msg  ( timeout reached : Am Bs )
+ - if new status notify messages are received, remove
+   the timeout and start over
+
+	Signed-off-by: Shannon Nelson <snelson@pensando.io>
+	Reviewed-by: Jakub Kicinski <kuba@kernel.org>
+	Reviewed-by: Jacob Keller <jacob.e.keller@intel.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit f92970c694b36a4dbac2b650b173c78c0f0954cc)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/uapi/linux/devlink.h
+diff --cc include/uapi/linux/devlink.h
+index 87c83a82991b,a2ecc8b00611..000000000000
+--- a/include/uapi/linux/devlink.h
++++ b/include/uapi/linux/devlink.h
+@@@ -455,6 -457,14 +455,17 @@@ enum devlink_attr 
+  
+  	DEVLINK_ATTR_INFO_BOARD_SERIAL_NUMBER,	/* string */
+  
+++<<<<<<< HEAD
+++=======
++ 	DEVLINK_ATTR_PORT_LANES,			/* u32 */
++ 	DEVLINK_ATTR_PORT_SPLITTABLE,			/* u8 */
++ 
++ 	DEVLINK_ATTR_PORT_EXTERNAL,		/* u8 */
++ 	DEVLINK_ATTR_PORT_CONTROLLER_NUMBER,	/* u32 */
++ 
++ 	DEVLINK_ATTR_FLASH_UPDATE_STATUS_TIMEOUT,	/* u64 */
++ 
+++>>>>>>> f92970c694b3 (devlink: add timeout information to status_notify)
+  	/* add new attributes above here, update the policy in devlink.c */
+  
+  	__DEVLINK_ATTR_MAX,
+diff --git a/include/net/devlink.h b/include/net/devlink.h
+index 8fb457f77884..30c9661c0af0 100644
+--- a/include/net/devlink.h
++++ b/include/net/devlink.h
+@@ -1360,6 +1360,10 @@ void devlink_flash_update_status_notify(struct devlink *devlink,
+ 					const char *component,
+ 					unsigned long done,
+ 					unsigned long total);
++void devlink_flash_update_timeout_notify(struct devlink *devlink,
++					 const char *status_msg,
++					 const char *component,
++					 unsigned long timeout);
+ 
+ int devlink_traps_register(struct devlink *devlink,
+ 			   const struct devlink_trap *traps,
+* Unmerged path include/uapi/linux/devlink.h
+diff --git a/net/core/devlink.c b/net/core/devlink.c
+index 67dcebc29a46..9b77e21afd0a 100644
+--- a/net/core/devlink.c
++++ b/net/core/devlink.c
+@@ -2990,7 +2990,9 @@ static int devlink_nl_flash_update_fill(struct sk_buff *msg,
+ 					enum devlink_command cmd,
+ 					const char *status_msg,
+ 					const char *component,
+-					unsigned long done, unsigned long total)
++					unsigned long done,
++					unsigned long total,
++					unsigned long timeout)
+ {
+ 	void *hdr;
+ 
+@@ -3018,6 +3020,9 @@ static int devlink_nl_flash_update_fill(struct sk_buff *msg,
+ 	if (nla_put_u64_64bit(msg, DEVLINK_ATTR_FLASH_UPDATE_STATUS_TOTAL,
+ 			      total, DEVLINK_ATTR_PAD))
+ 		goto nla_put_failure;
++	if (nla_put_u64_64bit(msg, DEVLINK_ATTR_FLASH_UPDATE_STATUS_TIMEOUT,
++			      timeout, DEVLINK_ATTR_PAD))
++		goto nla_put_failure;
+ 
+ out:
+ 	genlmsg_end(msg, hdr);
+@@ -3033,7 +3038,8 @@ static void __devlink_flash_update_notify(struct devlink *devlink,
+ 					  const char *status_msg,
+ 					  const char *component,
+ 					  unsigned long done,
+-					  unsigned long total)
++					  unsigned long total,
++					  unsigned long timeout)
+ {
+ 	struct sk_buff *msg;
+ 	int err;
+@@ -3047,7 +3053,7 @@ static void __devlink_flash_update_notify(struct devlink *devlink,
+ 		return;
+ 
+ 	err = devlink_nl_flash_update_fill(msg, devlink, cmd, status_msg,
+-					   component, done, total);
++					   component, done, total, timeout);
+ 	if (err)
+ 		goto out_free_msg;
+ 
+@@ -3063,7 +3069,7 @@ void devlink_flash_update_begin_notify(struct devlink *devlink)
+ {
+ 	__devlink_flash_update_notify(devlink,
+ 				      DEVLINK_CMD_FLASH_UPDATE,
+-				      NULL, NULL, 0, 0);
++				      NULL, NULL, 0, 0, 0);
+ }
+ EXPORT_SYMBOL_GPL(devlink_flash_update_begin_notify);
+ 
+@@ -3071,7 +3077,7 @@ void devlink_flash_update_end_notify(struct devlink *devlink)
+ {
+ 	__devlink_flash_update_notify(devlink,
+ 				      DEVLINK_CMD_FLASH_UPDATE_END,
+-				      NULL, NULL, 0, 0);
++				      NULL, NULL, 0, 0, 0);
+ }
+ EXPORT_SYMBOL_GPL(devlink_flash_update_end_notify);
+ 
+@@ -3083,10 +3089,21 @@ void devlink_flash_update_status_notify(struct devlink *devlink,
+ {
+ 	__devlink_flash_update_notify(devlink,
+ 				      DEVLINK_CMD_FLASH_UPDATE_STATUS,
+-				      status_msg, component, done, total);
++				      status_msg, component, done, total, 0);
+ }
+ EXPORT_SYMBOL_GPL(devlink_flash_update_status_notify);
+ 
++void devlink_flash_update_timeout_notify(struct devlink *devlink,
++					 const char *status_msg,
++					 const char *component,
++					 unsigned long timeout)
++{
++	__devlink_flash_update_notify(devlink,
++				      DEVLINK_CMD_FLASH_UPDATE_STATUS,
++				      status_msg, component, 0, 0, timeout);
++}
++EXPORT_SYMBOL_GPL(devlink_flash_update_timeout_notify);
++
+ static int devlink_nl_cmd_flash_update(struct sk_buff *skb,
+ 				       struct genl_info *info)
+ {
