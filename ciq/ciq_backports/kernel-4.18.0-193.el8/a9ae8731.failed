@@ -1,0 +1,241 @@
+drm/amdgpu: Call find_vma under mmap_sem
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-193.el8
+commit-author Jason Gunthorpe <jgg@ziepe.ca>
+commit a9ae8731e6e52829a935d81a65d7f925cb95dbac
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-193.el8/a9ae8731.failed
+
+find_vma() must be called under the mmap_sem, reorganize this code to
+do the vma check after entering the lock.
+
+Further, fix the unlocked use of struct task_struct's mm, instead use
+the mm from hmm_mirror which has an active mm_grab. Also the mm_grab
+must be converted to a mm_get before acquiring mmap_sem or calling
+find_vma().
+
+Fixes: 66c45500bfdc ("drm/amdgpu: use new HMM APIs and helpers")
+Fixes: 0919195f2b0d ("drm/amdgpu: Enable amdgpu_ttm_tt_get_user_pages in worker threads")
+Link: https://lore.kernel.org/r/20191112202231.3856-11-jgg@ziepe.ca
+	Acked-by: Christian König <christian.koenig@amd.com>
+	Reviewed-by: Felix Kuehling <Felix.Kuehling@amd.com>
+	Reviewed-by: Philip Yang <Philip.Yang@amd.com>
+	Tested-by: Philip Yang <Philip.Yang@amd.com>
+	Signed-off-by: Jason Gunthorpe <jgg@mellanox.com>
+(cherry picked from commit a9ae8731e6e52829a935d81a65d7f925cb95dbac)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/gpu/drm/amd/amdgpu/amdgpu_ttm.c
+diff --cc drivers/gpu/drm/amd/amdgpu/amdgpu_ttm.c
+index 73e71e61dc99,c0e41f1f0c23..000000000000
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_ttm.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_ttm.c
+@@@ -29,6 -29,18 +29,21 @@@
+   *    Thomas Hellstrom <thomas-at-tungstengraphics-dot-com>
+   *    Dave Airlie
+   */
+++<<<<<<< HEAD
+++=======
++ 
++ #include <linux/dma-mapping.h>
++ #include <linux/iommu.h>
++ #include <linux/hmm.h>
++ #include <linux/pagemap.h>
++ #include <linux/sched/task.h>
++ #include <linux/sched/mm.h>
++ #include <linux/seq_file.h>
++ #include <linux/slab.h>
++ #include <linux/swap.h>
++ #include <linux/swiotlb.h>
++ 
+++>>>>>>> a9ae8731e6e5 (drm/amdgpu: Call find_vma under mmap_sem)
+  #include <drm/ttm/ttm_bo_api.h>
+  #include <drm/ttm/ttm_bo_driver.h>
+  #include <drm/ttm/ttm_placement.h>
+@@@ -723,80 -774,111 +738,161 @@@ struct amdgpu_ttm_tt 
+  };
+  
+  /**
+ - * amdgpu_ttm_tt_get_user_pages - get device accessible pages that back user
+ - * memory and start HMM tracking CPU page table update
+ + * amdgpu_ttm_tt_get_user_pages - Pin pages of memory pointed to by a USERPTR
+ + * pointer to memory
+   *
+ - * Calling function must call amdgpu_ttm_tt_userptr_range_done() once and only
+ - * once afterwards to stop HMM tracking
+ + * Called by amdgpu_gem_userptr_ioctl() and amdgpu_cs_parser_bos().
+ + * This provides a wrapper around the get_user_pages() call to provide
+ + * device accessible pages that back user memory.
+   */
+ -#if IS_ENABLED(CONFIG_DRM_AMDGPU_USERPTR)
+ -
+ -#define MAX_RETRY_HMM_RANGE_FAULT	16
+ -
+ -int amdgpu_ttm_tt_get_user_pages(struct amdgpu_bo *bo, struct page **pages)
+ +int amdgpu_ttm_tt_get_user_pages(struct ttm_tt *ttm, struct page **pages)
+  {
+ -	struct hmm_mirror *mirror = bo->mn ? &bo->mn->mirror : NULL;
+ -	struct ttm_tt *ttm = bo->tbo.ttm;
+  	struct amdgpu_ttm_tt *gtt = (void *)ttm;
+++<<<<<<< HEAD
+ +	struct mm_struct *mm = gtt->usertask->mm;
+ +	unsigned int flags = 0;
+ +	unsigned pinned = 0;
+ +	int r;
+ +
+ +	if (!mm) /* Happens during process shutdown */
+ +		return -ESRCH;
+ +
+ +	if (!(gtt->userflags & AMDGPU_GEM_USERPTR_READONLY))
+ +		flags |= FOLL_WRITE;
+ +
+ +	down_read(&mm->mmap_sem);
+++=======
++ 	struct mm_struct *mm;
++ 	unsigned long start = gtt->userptr;
++ 	struct vm_area_struct *vma;
++ 	struct hmm_range *range;
++ 	unsigned long i;
++ 	uint64_t *pfns;
++ 	int r = 0;
++ 
++ 	if (unlikely(!mirror)) {
++ 		DRM_DEBUG_DRIVER("Failed to get hmm_mirror\n");
++ 		return -EFAULT;
++ 	}
++ 
++ 	mm = mirror->hmm->mmu_notifier.mm;
++ 	if (!mmget_not_zero(mm)) /* Happens during process shutdown */
++ 		return -ESRCH;
++ 
++ 	range = kzalloc(sizeof(*range), GFP_KERNEL);
++ 	if (unlikely(!range)) {
++ 		r = -ENOMEM;
++ 		goto out;
++ 	}
++ 
++ 	pfns = kvmalloc_array(ttm->num_pages, sizeof(*pfns), GFP_KERNEL);
++ 	if (unlikely(!pfns)) {
++ 		r = -ENOMEM;
++ 		goto out_free_ranges;
++ 	}
++ 
++ 	amdgpu_hmm_init_range(range);
++ 	range->default_flags = range->flags[HMM_PFN_VALID];
++ 	range->default_flags |= amdgpu_ttm_tt_is_readonly(ttm) ?
++ 				0 : range->flags[HMM_PFN_WRITE];
++ 	range->pfn_flags_mask = 0;
++ 	range->pfns = pfns;
++ 	range->start = start;
++ 	range->end = start + ttm->num_pages * PAGE_SIZE;
++ 
++ 	hmm_range_register(range, mirror);
++ 
++ 	/*
++ 	 * Just wait for range to be valid, safe to ignore return value as we
++ 	 * will use the return value of hmm_range_fault() below under the
++ 	 * mmap_sem to ascertain the validity of the range.
++ 	 */
++ 	hmm_range_wait_until_valid(range, HMM_RANGE_DEFAULT_TIMEOUT);
++ 
++ 	down_read(&mm->mmap_sem);
++ 	vma = find_vma(mm, start);
++ 	if (unlikely(!vma || start < vma->vm_start)) {
++ 		r = -EFAULT;
++ 		goto out_unlock;
++ 	}
++ 	if (unlikely((gtt->userflags & AMDGPU_GEM_USERPTR_ANONONLY) &&
++ 		vma->vm_file)) {
++ 		r = -EPERM;
++ 		goto out_unlock;
++ 	}
++ 
++ 	r = hmm_range_fault(range, 0);
++ 	up_read(&mm->mmap_sem);
+++>>>>>>> a9ae8731e6e5 (drm/amdgpu: Call find_vma under mmap_sem)
+  
+ -	if (unlikely(r < 0))
+ -		goto out_free_pfns;
+ -
+ -	for (i = 0; i < ttm->num_pages; i++) {
+ -		pages[i] = hmm_device_entry_to_page(range, pfns[i]);
+ -		if (unlikely(!pages[i])) {
+ -			pr_err("Page fault failed for pfn[%lu] = 0x%llx\n",
+ -			       i, pfns[i]);
+ -			r = -ENOMEM;
+ +	if (gtt->userflags & AMDGPU_GEM_USERPTR_ANONONLY) {
+ +		/*
+ +		 * check that we only use anonymous memory to prevent problems
+ +		 * with writeback
+ +		 */
+ +		unsigned long end = gtt->userptr + ttm->num_pages * PAGE_SIZE;
+ +		struct vm_area_struct *vma;
+  
+ -			goto out_free_pfns;
+ +		vma = find_vma(mm, gtt->userptr);
+ +		if (!vma || vma->vm_file || vma->vm_end < end) {
+ +			up_read(&mm->mmap_sem);
+ +			return -EPERM;
+  		}
+  	}
+  
+++<<<<<<< HEAD
+ +	/* loop enough times using contiguous pages of memory */
+ +	do {
+ +		unsigned num_pages = ttm->num_pages - pinned;
+ +		uint64_t userptr = gtt->userptr + pinned * PAGE_SIZE;
+ +		struct page **p = pages + pinned;
+ +		struct amdgpu_ttm_gup_task_list guptask;
+++=======
++ 	gtt->range = range;
++ 	mmput(mm);
+++>>>>>>> a9ae8731e6e5 (drm/amdgpu: Call find_vma under mmap_sem)
+ +
+ +		guptask.task = current;
+ +		spin_lock(&gtt->guptasklock);
+ +		list_add(&guptask.list, &gtt->guptasks);
+ +		spin_unlock(&gtt->guptasklock);
+ +
+ +		if (mm == current->mm)
+ +			r = get_user_pages(userptr, num_pages, flags, p, NULL);
+ +		else
+ +			r = get_user_pages_remote(gtt->usertask,
+ +					mm, userptr, num_pages,
+ +					flags, p, NULL, NULL);
+  
+ +		spin_lock(&gtt->guptasklock);
+ +		list_del(&guptask.list);
+ +		spin_unlock(&gtt->guptasklock);
+ +
+ +		if (r < 0)
+ +			goto release_pages;
+ +
+ +		pinned += r;
+ +
+ +	} while (pinned < ttm->num_pages);
+ +
+ +	up_read(&mm->mmap_sem);
+  	return 0;
+  
+++<<<<<<< HEAD
+ +release_pages:
+ +	release_pages(pages, pinned);
+ +	up_read(&mm->mmap_sem);
+++=======
++ out_unlock:
++ 	up_read(&mm->mmap_sem);
++ out_free_pfns:
++ 	hmm_range_unregister(range);
++ 	kvfree(pfns);
++ out_free_ranges:
++ 	kfree(range);
++ out:
++ 	mmput(mm);
+++>>>>>>> a9ae8731e6e5 (drm/amdgpu: Call find_vma under mmap_sem)
+  	return r;
+  }
+  
+* Unmerged path drivers/gpu/drm/amd/amdgpu/amdgpu_ttm.c
