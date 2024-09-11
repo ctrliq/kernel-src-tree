@@ -1,0 +1,75 @@
+scsi: lpfc: nvme: avoid hang / use-after-free when destroying localport
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-147.el8
+commit-author Ewan D. Milne <emilne@redhat.com>
+commit 7961cba6f7d8215fa632df3d220e5154bb825249
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-147.el8/7961cba6.failed
+
+We cannot wait on a completion object in the lpfc_nvme_lport structure in
+the _destroy_localport() code path because the NVMe/fc transport will free
+that structure immediately after the .localport_delete() callback.  This
+results in a use-after-free, and a hang if slub_debug=FZPU is enabled.
+
+Fix this by putting the completion on the stack.
+
+	Signed-off-by: Ewan D. Milne <emilne@redhat.com>
+	Acked-by: James Smart <james.smart@broadcom.com>
+	Signed-off-by: Martin K. Petersen <martin.petersen@oracle.com>
+(cherry picked from commit 7961cba6f7d8215fa632df3d220e5154bb825249)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/scsi/lpfc/lpfc_nvme.c
+diff --cc drivers/scsi/lpfc/lpfc_nvme.c
+index 487d0f5395c3,8c9f79042228..000000000000
+--- a/drivers/scsi/lpfc/lpfc_nvme.c
++++ b/drivers/scsi/lpfc/lpfc_nvme.c
+@@@ -2181,14 -2591,16 +2182,14 @@@ lpfc_nvme_destroy_localport(struct lpfc
+  #if (IS_ENABLED(CONFIG_NVME_FC))
+  	struct nvme_fc_local_port *localport;
+  	struct lpfc_nvme_lport *lport;
+ -	struct lpfc_nvme_ctrl_stat *cstat;
+  	int ret;
++ 	DECLARE_COMPLETION_ONSTACK(lport_unreg_cmp);
+  
+  	if (vport->nvmei_support == 0)
+  		return;
+  
+  	localport = vport->localport;
+- 	vport->localport = NULL;
+  	lport = (struct lpfc_nvme_lport *)localport->private;
+ -	cstat = lport->cstat;
+  
+  	lpfc_printf_vlog(vport, KERN_INFO, LOG_NVME,
+  			 "6011 Destroying NVME localport %p\n",
+@@@ -2203,7 -2615,9 +2204,13 @@@
+  	/* Wait for completion.  This either blocks
+  	 * indefinitely or succeeds
+  	 */
+++<<<<<<< HEAD
+ +	lpfc_nvme_lport_unreg_wait(vport, lport);
+++=======
++ 	lpfc_nvme_lport_unreg_wait(vport, lport, &lport_unreg_cmp);
++ 	vport->localport = NULL;
++ 	kfree(cstat);
+++>>>>>>> 7961cba6f7d8 (scsi: lpfc: nvme: avoid hang / use-after-free when destroying localport)
+  
+  	/* Regardless of the unregister upcall response, clear
+  	 * nvmei_support.  All rports are unregistered and the
+* Unmerged path drivers/scsi/lpfc/lpfc_nvme.c
+diff --git a/drivers/scsi/lpfc/lpfc_nvme.h b/drivers/scsi/lpfc/lpfc_nvme.h
+index 6b6d88cefdb8..593c48ff634e 100644
+--- a/drivers/scsi/lpfc/lpfc_nvme.h
++++ b/drivers/scsi/lpfc/lpfc_nvme.h
+@@ -46,7 +46,7 @@ struct lpfc_nvme_qhandle {
+ /* Declare nvme-based local and remote port definitions. */
+ struct lpfc_nvme_lport {
+ 	struct lpfc_vport *vport;
+-	struct completion lport_unreg_done;
++	struct completion *lport_unreg_cmp;
+ 	/* Add stats counters here */
+ 	atomic_t fc4NvmeLsRequests;
+ 	atomic_t fc4NvmeLsCmpls;
