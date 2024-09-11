@@ -1,0 +1,105 @@
+sched/vtime: Bring up complete kcpustat accessor
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Frederic Weisbecker <frederic@kernel.org>
+commit 74722bb223d0f236303b60c9509ff924a9713780
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/74722bb2.failed
+
+Many callsites want to fetch the values of system, user, user_nice, guest
+or guest_nice kcpustat fields altogether or at least a pair of these.
+
+In that case calling kcpustat_field() for each requested field brings
+unecessary overhead when we could fetch all of them in a row.
+
+So provide kcpustat_cpu_fetch() that fetches the whole kcpustat array
+in a vtime safe way under the same RCU and seqcount block.
+
+	Signed-off-by: Frederic Weisbecker <frederic@kernel.org>
+	Cc: Peter Zijlstra <peterz@infradead.org>
+	Cc: Wanpeng Li <wanpengli@tencent.com>
+	Cc: Yauheni Kaliuta <yauheni.kaliuta@redhat.com>
+Link: https://lkml.kernel.org/r/20191121024430.19938-3-frederic@kernel.org
+	Signed-off-by: Ingo Molnar <mingo@kernel.org>
+(cherry picked from commit 74722bb223d0f236303b60c9509ff924a9713780)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	kernel/sched/cputime.c
+diff --cc kernel/sched/cputime.c
+index c3032fb00ef6,d43318a489f2..000000000000
+--- a/kernel/sched/cputime.c
++++ b/kernel/sched/cputime.c
+@@@ -896,8 -912,41 +896,44 @@@ void task_cputime(struct task_struct *t
+  	} while (read_seqcount_retry(&vtime->seqcount, seq));
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static int vtime_state_check(struct vtime *vtime, int cpu)
++ {
++ 	/*
++ 	 * We raced against a context switch, fetch the
++ 	 * kcpustat task again.
++ 	 */
++ 	if (vtime->cpu != cpu && vtime->cpu != -1)
++ 		return -EAGAIN;
++ 
++ 	/*
++ 	 * Two possible things here:
++ 	 * 1) We are seeing the scheduling out task (prev) or any past one.
++ 	 * 2) We are seeing the scheduling in task (next) but it hasn't
++ 	 *    passed though vtime_task_switch() yet so the pending
++ 	 *    cputime of the prev task may not be flushed yet.
++ 	 *
++ 	 * Case 1) is ok but 2) is not. So wait for a safe VTIME state.
++ 	 */
++ 	if (vtime->state == VTIME_INACTIVE)
++ 		return -EAGAIN;
++ 
++ 	return 0;
++ }
++ 
++ static u64 kcpustat_user_vtime(struct vtime *vtime)
++ {
++ 	if (vtime->state == VTIME_USER)
++ 		return vtime->utime + vtime_delta(vtime);
++ 	else if (vtime->state == VTIME_GUEST)
++ 		return vtime->gtime + vtime_delta(vtime);
++ 	return 0;
++ }
++ 
+++>>>>>>> 74722bb223d0 (sched/vtime: Bring up complete kcpustat accessor)
+  static int kcpustat_field_vtime(u64 *cpustat,
+ -				struct task_struct *tsk,
+ +				struct vtime *vtime,
+  				enum cpu_usage_stat usage,
+  				int cpu, u64 *val)
+  {
+diff --git a/include/linux/kernel_stat.h b/include/linux/kernel_stat.h
+index 79781196eb25..89f0745c096d 100644
+--- a/include/linux/kernel_stat.h
++++ b/include/linux/kernel_stat.h
+@@ -81,12 +81,19 @@ static inline unsigned int kstat_cpu_irqs_sum(unsigned int cpu)
+ #ifdef CONFIG_VIRT_CPU_ACCOUNTING_GEN
+ extern u64 kcpustat_field(struct kernel_cpustat *kcpustat,
+ 			  enum cpu_usage_stat usage, int cpu);
++extern void kcpustat_cpu_fetch(struct kernel_cpustat *dst, int cpu);
+ #else
+ static inline u64 kcpustat_field(struct kernel_cpustat *kcpustat,
+ 				 enum cpu_usage_stat usage, int cpu)
+ {
+ 	return kcpustat->cpustat[usage];
+ }
++
++static inline void kcpustat_cpu_fetch(struct kernel_cpustat *dst, int cpu)
++{
++	*dst = kcpustat_cpu(cpu);
++}
++
+ #endif
+ 
+ extern void account_user_time(struct task_struct *, u64);
+* Unmerged path kernel/sched/cputime.c
