@@ -1,0 +1,169 @@
+net: fix race between napi kthread mode and busy poll
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-331.el8
+commit-author Wei Wang <weiwan@google.com>
+commit cb038357937ee4f589aab2469ec3896dce90f317
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-331.el8/cb038357.failed
+
+Currently, napi_thread_wait() checks for NAPI_STATE_SCHED bit to
+determine if the kthread owns this napi and could call napi->poll() on
+it. However, if socket busy poll is enabled, it is possible that the
+busy poll thread grabs this SCHED bit (after the previous napi->poll()
+invokes napi_complete_done() and clears SCHED bit) and tries to poll
+on the same napi. napi_disable() could grab the SCHED bit as well.
+This patch tries to fix this race by adding a new bit
+NAPI_STATE_SCHED_THREADED in napi->state. This bit gets set in
+____napi_schedule() if the threaded mode is enabled, and gets cleared
+in napi_complete_done(), and we only poll the napi in kthread if this
+bit is set. This helps distinguish the ownership of the napi between
+kthread and other scenarios and fixes the race issue.
+
+Fixes: 29863d41bb6e ("net: implement threaded-able napi poll loop support")
+	Reported-by: Martin Zaharinov <micron10@gmail.com>
+	Suggested-by: Jakub Kicinski <kuba@kernel.org>
+	Signed-off-by: Wei Wang <weiwan@google.com>
+	Cc: Alexander Duyck <alexanderduyck@fb.com>
+	Cc: Eric Dumazet <edumazet@google.com>
+	Cc: Paolo Abeni <pabeni@redhat.com>
+	Cc: Hannes Frederic Sowa <hannes@stressinduktion.org>
+	Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit cb038357937ee4f589aab2469ec3896dce90f317)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/netdevice.h
+#	net/core/dev.c
+diff --cc include/linux/netdevice.h
+index 4a78471bc3fe,87a5d186faff..000000000000
+--- a/include/linux/netdevice.h
++++ b/include/linux/netdevice.h
+@@@ -362,6 -359,8 +362,11 @@@ enum 
+  	NAPI_STATE_NO_BUSY_POLL,	/* Do not add in napi_hash, no busy polling */
+  	NAPI_STATE_IN_BUSY_POLL,	/* sk_busy_loop() owns this NAPI */
+  	NAPI_STATE_PREFER_BUSY_POLL,	/* prefer busy-polling over softirq processing*/
+++<<<<<<< HEAD
+++=======
++ 	NAPI_STATE_THREADED,		/* The poll is performed inside its own thread*/
++ 	NAPI_STATE_SCHED_THREADED,	/* Napi is currently scheduled in threaded mode */
+++>>>>>>> cb038357937e (net: fix race between napi kthread mode and busy poll)
+  };
+  
+  enum {
+@@@ -373,6 -372,8 +378,11 @@@
+  	NAPIF_STATE_NO_BUSY_POLL	= BIT(NAPI_STATE_NO_BUSY_POLL),
+  	NAPIF_STATE_IN_BUSY_POLL	= BIT(NAPI_STATE_IN_BUSY_POLL),
+  	NAPIF_STATE_PREFER_BUSY_POLL	= BIT(NAPI_STATE_PREFER_BUSY_POLL),
+++<<<<<<< HEAD
+++=======
++ 	NAPIF_STATE_THREADED		= BIT(NAPI_STATE_THREADED),
++ 	NAPIF_STATE_SCHED_THREADED	= BIT(NAPI_STATE_SCHED_THREADED),
+++>>>>>>> cb038357937e (net: fix race between napi kthread mode and busy poll)
+  };
+  
+  enum gro_result {
+diff --cc net/core/dev.c
+index a223efdd8606,bb568f7cb81b..000000000000
+--- a/net/core/dev.c
++++ b/net/core/dev.c
+@@@ -4117,6 -4283,29 +4117,32 @@@ int dev_tx_weight __read_mostly = 64
+  static inline void ____napi_schedule(struct softnet_data *sd,
+  				     struct napi_struct *napi)
+  {
+++<<<<<<< HEAD
+++=======
++ 	struct task_struct *thread;
++ 
++ 	if (test_bit(NAPI_STATE_THREADED, &napi->state)) {
++ 		/* Paired with smp_mb__before_atomic() in
++ 		 * napi_enable()/dev_set_threaded().
++ 		 * Use READ_ONCE() to guarantee a complete
++ 		 * read on napi->thread. Only call
++ 		 * wake_up_process() when it's not NULL.
++ 		 */
++ 		thread = READ_ONCE(napi->thread);
++ 		if (thread) {
++ 			/* Avoid doing set_bit() if the thread is in
++ 			 * INTERRUPTIBLE state, cause napi_thread_wait()
++ 			 * makes sure to proceed with napi polling
++ 			 * if the thread is explicitly woken from here.
++ 			 */
++ 			if (READ_ONCE(thread->state) != TASK_INTERRUPTIBLE)
++ 				set_bit(NAPI_STATE_SCHED_THREADED, &napi->state);
++ 			wake_up_process(thread);
++ 			return;
++ 		}
++ 	}
++ 
+++>>>>>>> cb038357937e (net: fix race between napi kthread mode and busy poll)
+  	list_add_tail(&napi->poll_list, &sd->poll_list);
+  	__raise_softirq_irqoff(NET_RX_SOFTIRQ);
+  }
+@@@ -6483,6 -6974,59 +6510,62 @@@ out_unlock
+  	return work;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static int napi_thread_wait(struct napi_struct *napi)
++ {
++ 	bool woken = false;
++ 
++ 	set_current_state(TASK_INTERRUPTIBLE);
++ 
++ 	while (!kthread_should_stop() && !napi_disable_pending(napi)) {
++ 		/* Testing SCHED_THREADED bit here to make sure the current
++ 		 * kthread owns this napi and could poll on this napi.
++ 		 * Testing SCHED bit is not enough because SCHED bit might be
++ 		 * set by some other busy poll thread or by napi_disable().
++ 		 */
++ 		if (test_bit(NAPI_STATE_SCHED_THREADED, &napi->state) || woken) {
++ 			WARN_ON(!list_empty(&napi->poll_list));
++ 			__set_current_state(TASK_RUNNING);
++ 			return 0;
++ 		}
++ 
++ 		schedule();
++ 		/* woken being true indicates this thread owns this napi. */
++ 		woken = true;
++ 		set_current_state(TASK_INTERRUPTIBLE);
++ 	}
++ 	__set_current_state(TASK_RUNNING);
++ 	return -1;
++ }
++ 
++ static int napi_threaded_poll(void *data)
++ {
++ 	struct napi_struct *napi = data;
++ 	void *have;
++ 
++ 	while (!napi_thread_wait(napi)) {
++ 		for (;;) {
++ 			bool repoll = false;
++ 
++ 			local_bh_disable();
++ 
++ 			have = netpoll_poll_lock(napi);
++ 			__napi_poll(napi, &repoll);
++ 			netpoll_poll_unlock(have);
++ 
++ 			local_bh_enable();
++ 
++ 			if (!repoll)
++ 				break;
++ 
++ 			cond_resched();
++ 		}
++ 	}
++ 	return 0;
++ }
++ 
+++>>>>>>> cb038357937e (net: fix race between napi kthread mode and busy poll)
+  static __latent_entropy void net_rx_action(struct softirq_action *h)
+  {
+  	struct softnet_data *sd = this_cpu_ptr(&softnet_data);
+* Unmerged path include/linux/netdevice.h
+* Unmerged path net/core/dev.c
