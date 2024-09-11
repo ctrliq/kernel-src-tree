@@ -1,0 +1,160 @@
+net/mlx5e: Activate HW multipath and handle port affinity based on FIB events
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-147.el8
+commit-author Roi Dayan <roid@mellanox.com>
+commit 544fe7c2e654124870e774157d99da357dce22dc
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-147.el8/544fe7c2.failed
+
+To support multipath offload we are going to track SW multipath route
+and related nexthops. To do that we register to FIB notifier and handle
+the route and next-hops events and reflect that as port affinity to HW.
+
+When there is a new multipath route entry that all next-hops are the
+ports of an HCA we will activate LAG in HW.
+
+Egress wise, we use HW LAG as the means to emulate multipath on current
+HW which doesn't support port selection based on xmit hash. In the
+presence of multiple VFs which use multiple SQs (send queues) this
+yields fairly good distribution.
+
+HA wise, HW LAG buys us the ability for a given RQ (receive queue) to
+receive traffic from both ports and for SQs to migrate xmitting over
+the active port if their base port fails.
+
+When the route entry is being updated to single path we will update
+the HW port affinity to use that port only.
+
+If a next-hop becomes dead we update the HW port affinity to the living
+port.
+
+When all next-hops are alive again we reset the affinity to default.
+
+Due to FW/HW limitations, when a route is deleted we are not disabling
+the HW LAG since doing so will not allow us to enable it again while
+VFs are bounded. Typically this is just a temporary state when a
+routing daemon removes dead routes and later adds them back as needed.
+
+This patch only handles events for AF_INET.
+
+	Signed-off-by: Roi Dayan <roid@mellanox.com>
+	Reviewed-by: Or Gerlitz <ogerlitz@mellanox.com>
+	Signed-off-by: Saeed Mahameed <saeedm@mellanox.com>
+(cherry picked from commit 544fe7c2e654124870e774157d99da357dce22dc)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/mellanox/mlx5/core/lag.c
+#	drivers/net/ethernet/mellanox/mlx5/core/lag.h
+#	drivers/net/ethernet/mellanox/mlx5/core/lag_mp.c
+diff --cc drivers/net/ethernet/mellanox/mlx5/core/lag.c
+index 333f773609a0,48aa6e030bcf..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx5/core/lag.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/lag.c
+@@@ -35,34 -35,8 +35,39 @@@
+  #include <linux/mlx5/vport.h>
+  #include "mlx5_core.h"
+  #include "eswitch.h"
+++<<<<<<< HEAD
+ +
+ +enum {
+ +	MLX5_LAG_FLAG_BONDED = 1 << 0,
+ +};
+ +
+ +struct lag_func {
+ +	struct mlx5_core_dev *dev;
+ +	struct net_device    *netdev;
+ +};
+ +
+ +/* Used for collection of netdev event info. */
+ +struct lag_tracker {
+ +	enum   netdev_lag_tx_type           tx_type;
+ +	struct netdev_lag_lower_state_info  netdev_state[MLX5_MAX_PORTS];
+ +	unsigned int is_bonded:1;
+ +};
+ +
+ +/* LAG data of a ConnectX card.
+ + * It serves both its phys functions.
+ + */
+ +struct mlx5_lag {
+ +	u8                        flags;
+ +	u8                        v2p_map[MLX5_MAX_PORTS];
+ +	struct lag_func           pf[MLX5_MAX_PORTS];
+ +	struct lag_tracker        tracker;
+ +	struct delayed_work       bond_work;
+ +	struct notifier_block     nb;
+ +};
+++=======
++ #include "lag.h"
++ #include "lag_mp.h"
+++>>>>>>> 544fe7c2e654 (net/mlx5e: Activate HW multipath and handle port affinity based on FIB events)
+  
+  /* General purpose, use for short periods of time.
+   * Beware of lock dependencies (preferably, no locks should be acquired
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/lag.h
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/lag_mp.c
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/eswitch.c b/drivers/net/ethernet/mellanox/mlx5/core/eswitch.c
+index fdc619fdeef9..cfb19db968a0 100644
+--- a/drivers/net/ethernet/mellanox/mlx5/core/eswitch.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/eswitch.c
+@@ -2228,3 +2228,10 @@ bool mlx5_esw_lag_prereq(struct mlx5_core_dev *dev0, struct mlx5_core_dev *dev1)
+ 
+ 	return false;
+ }
++
++bool mlx5_esw_multipath_prereq(struct mlx5_core_dev *dev0,
++			       struct mlx5_core_dev *dev1)
++{
++	return (dev0->priv.eswitch->mode == SRIOV_OFFLOADS &&
++		dev1->priv.eswitch->mode == SRIOV_OFFLOADS);
++}
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/eswitch.h b/drivers/net/ethernet/mellanox/mlx5/core/eswitch.h
+index ea6bca2dae6d..ed316bf68459 100644
+--- a/drivers/net/ethernet/mellanox/mlx5/core/eswitch.h
++++ b/drivers/net/ethernet/mellanox/mlx5/core/eswitch.h
+@@ -331,6 +331,8 @@ static inline bool mlx5_eswitch_vlan_actions_supported(struct mlx5_core_dev *dev
+ 
+ bool mlx5_esw_lag_prereq(struct mlx5_core_dev *dev0,
+ 			 struct mlx5_core_dev *dev1);
++bool mlx5_esw_multipath_prereq(struct mlx5_core_dev *dev0,
++			       struct mlx5_core_dev *dev1);
+ 
+ #define MLX5_DEBUG_ESWITCH_MASK BIT(3)
+ 
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/lag.c
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/lag.h
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/lag_mp.c
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/lag_mp.h b/drivers/net/ethernet/mellanox/mlx5/core/lag_mp.h
+new file mode 100644
+index 000000000000..6d14b1100be9
+--- /dev/null
++++ b/drivers/net/ethernet/mellanox/mlx5/core/lag_mp.h
+@@ -0,0 +1,26 @@
++/* SPDX-License-Identifier: GPL-2.0 OR Linux-OpenIB */
++/* Copyright (c) 2019 Mellanox Technologies. */
++
++#ifndef __MLX5_LAG_MP_H__
++#define __MLX5_LAG_MP_H__
++
++#include "lag.h"
++#include "mlx5_core.h"
++
++struct lag_mp {
++	struct notifier_block     fib_nb;
++	struct fib_info           *mfi; /* used in tracking fib events */
++};
++
++#ifdef CONFIG_MLX5_ESWITCH
++
++int mlx5_lag_mp_init(struct mlx5_lag *ldev);
++void mlx5_lag_mp_cleanup(struct mlx5_lag *ldev);
++
++#else /* CONFIG_MLX5_ESWITCH */
++
++static inline int mlx5_lag_mp_init(struct mlx5_lag *ldev) { return 0; }
++static inline void mlx5_lag_mp_cleanup(struct mlx5_lag *ldev) {}
++
++#endif /* CONFIG_MLX5_ESWITCH */
++#endif /* __MLX5_LAG_MP_H__ */
