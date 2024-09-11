@@ -1,0 +1,468 @@
+rcu: Rename *_kfree_callback/*_kfree_rcu_offset/kfree_call_*
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Uladzislau Rezki (Sony) <urezki@gmail.com>
+commit c408b215f58f7156bb6bafb64c0263ee907033df
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/c408b215.failed
+
+The following changes are introduced:
+
+1. Rename rcu_invoke_kfree_callback() to rcu_invoke_kvfree_callback(),
+as well as the associated trace events, so the rcu_kfree_callback(),
+becomes rcu_kvfree_callback(). The reason is to be aligned with kvfree()
+notation.
+
+2. Rename __is_kfree_rcu_offset to __is_kvfree_rcu_offset. All RCU
+paths use kvfree() now instead of kfree(), thus rename it.
+
+3. Rename kfree_call_rcu() to the kvfree_call_rcu(). The reason is,
+it is capable of freeing vmalloc() memory now. Do the same with
+__kfree_rcu() macro, it becomes __kvfree_rcu(), the goal is the
+same.
+
+	Reviewed-by: Joel Fernandes (Google) <joel@joelfernandes.org>
+Co-developed-by: Joel Fernandes (Google) <joel@joelfernandes.org>
+	Signed-off-by: Joel Fernandes (Google) <joel@joelfernandes.org>
+	Signed-off-by: Uladzislau Rezki (Sony) <urezki@gmail.com>
+	Signed-off-by: Paul E. McKenney <paulmck@kernel.org>
+(cherry picked from commit c408b215f58f7156bb6bafb64c0263ee907033df)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/rcutree.h
+#	kernel/rcu/tiny.c
+#	kernel/rcu/tree.c
+diff --cc include/linux/rcutree.h
+index 9320061f1ced,d2f4064ebd1d..000000000000
+--- a/include/linux/rcutree.h
++++ b/include/linux/rcutree.h
+@@@ -46,8 -33,7 +46,12 @@@ static inline void rcu_virt_note_contex
+  }
+  
+  void synchronize_rcu_expedited(void);
+++<<<<<<< HEAD
+ +void kfree_call_rcu(struct rcu_head *head, rcu_callback_t func);
+ +void kfree_call_rcu_nobatch(struct rcu_head *head, rcu_callback_t func);
+++=======
++ void kvfree_call_rcu(struct rcu_head *head, rcu_callback_t func);
+++>>>>>>> c408b215f58f (rcu: Rename *_kfree_callback/*_kfree_rcu_offset/kfree_call_*)
+  
+  void rcu_barrier(void);
+  bool rcu_eqs_special_set(int cpu);
+diff --cc kernel/rcu/tiny.c
+index 319285a8c55c,aa897c3f2e92..000000000000
+--- a/kernel/rcu/tiny.c
++++ b/kernel/rcu/tiny.c
+@@@ -86,6 -75,31 +86,34 @@@ void rcu_sched_clock_irq(int user
+  	}
+  }
+  
+++<<<<<<< HEAD
+++=======
++ /*
++  * Reclaim the specified callback, either by invoking it for non-kfree cases or
++  * freeing it directly (for kfree). Return true if kfreeing, false otherwise.
++  */
++ static inline bool rcu_reclaim_tiny(struct rcu_head *head)
++ {
++ 	rcu_callback_t f;
++ 	unsigned long offset = (unsigned long)head->func;
++ 
++ 	rcu_lock_acquire(&rcu_callback_map);
++ 	if (__is_kvfree_rcu_offset(offset)) {
++ 		trace_rcu_invoke_kvfree_callback("", head, offset);
++ 		kvfree((void *)head - offset);
++ 		rcu_lock_release(&rcu_callback_map);
++ 		return true;
++ 	}
++ 
++ 	trace_rcu_invoke_callback("", head);
++ 	f = head->func;
++ 	WRITE_ONCE(head->func, (rcu_callback_t)0L);
++ 	f(head);
++ 	rcu_lock_release(&rcu_callback_map);
++ 	return false;
++ }
++ 
+++>>>>>>> c408b215f58f (rcu: Rename *_kfree_callback/*_kfree_rcu_offset/kfree_call_*)
+  /* Invoke the RCU callbacks whose grace period has elapsed.  */
+  static __latent_entropy void rcu_process_callbacks(struct softirq_action *unused)
+  {
+diff --cc kernel/rcu/tree.c
+index 4aa7b6bbcde6,f22c47e72287..000000000000
+--- a/kernel/rcu/tree.c
++++ b/kernel/rcu/tree.c
+@@@ -2613,13 -2899,15 +2613,24 @@@ __call_rcu(struct rcu_head *head, rcu_c
+  		if (rcu_segcblist_empty(&rdp->cblist))
+  			rcu_segcblist_init(&rdp->cblist);
+  	}
+++<<<<<<< HEAD
+ +	rcu_nocb_lock(rdp);
+ +	was_alldone = !rcu_segcblist_pend_cbs(&rdp->cblist);
+ +	rcu_segcblist_enqueue(&rdp->cblist, head, lazy);
+ +	if (__is_kfree_rcu_offset((unsigned long)func))
+ +		trace_rcu_kfree_callback(rcu_state.name, head,
+++=======
++ 
++ 	check_cb_ovld(rdp);
++ 	if (rcu_nocb_try_bypass(rdp, head, &was_alldone, flags))
++ 		return; // Enqueued onto ->nocb_bypass, so just leave.
++ 	// If no-CBs CPU gets here, rcu_nocb_try_bypass() acquired ->nocb_lock.
++ 	rcu_segcblist_enqueue(&rdp->cblist, head);
++ 	if (__is_kvfree_rcu_offset((unsigned long)func))
++ 		trace_rcu_kvfree_callback(rcu_state.name, head,
+++>>>>>>> c408b215f58f (rcu: Rename *_kfree_callback/*_kfree_rcu_offset/kfree_call_*)
+  					 (unsigned long)func,
+ +					 rcu_segcblist_n_lazy_cbs(&rdp->cblist),
+  					 rcu_segcblist_n_cbs(&rdp->cblist));
+  	else
+  		trace_rcu_callback(rcu_state.name, head,
+@@@ -2734,17 -3117,74 +2745,73 @@@ static void kfree_rcu_work(struct work_
+  	krwp = container_of(to_rcu_work(work),
+  			    struct kfree_rcu_cpu_work, rcu_work);
+  	krcp = krwp->krcp;
+ -
+ -	raw_spin_lock_irqsave(&krcp->lock, flags);
+ -	// Channels 1 and 2.
+ -	for (i = 0; i < FREE_N_CHANNELS; i++) {
+ -		bkvhead[i] = krwp->bkvhead_free[i];
+ -		krwp->bkvhead_free[i] = NULL;
+ -	}
+ -
+ -	// Channel 3.
+ +	spin_lock_irqsave(&krcp->lock, flags);
+  	head = krwp->head_free;
+  	krwp->head_free = NULL;
+ -	raw_spin_unlock_irqrestore(&krcp->lock, flags);
+ +	spin_unlock_irqrestore(&krcp->lock, flags);
+  
+++<<<<<<< HEAD
+ +	// List "head" is now private, so traverse locklessly.
+++=======
++ 	// Handle two first channels.
++ 	for (i = 0; i < FREE_N_CHANNELS; i++) {
++ 		for (; bkvhead[i]; bkvhead[i] = bnext) {
++ 			bnext = bkvhead[i]->next;
++ 			debug_rcu_bhead_unqueue(bkvhead[i]);
++ 
++ 			rcu_lock_acquire(&rcu_callback_map);
++ 			if (i == 0) { // kmalloc() / kfree().
++ 				trace_rcu_invoke_kfree_bulk_callback(
++ 					rcu_state.name, bkvhead[i]->nr_records,
++ 					bkvhead[i]->records);
++ 
++ 				kfree_bulk(bkvhead[i]->nr_records,
++ 					bkvhead[i]->records);
++ 			} else { // vmalloc() / vfree().
++ 				for (j = 0; j < bkvhead[i]->nr_records; j++) {
++ 					trace_rcu_invoke_kvfree_callback(
++ 						rcu_state.name,
++ 						bkvhead[i]->records[j], 0);
++ 
++ 					vfree(bkvhead[i]->records[j]);
++ 				}
++ 			}
++ 			rcu_lock_release(&rcu_callback_map);
++ 
++ 			krcp = krc_this_cpu_lock(&flags);
++ 			if (put_cached_bnode(krcp, bkvhead[i]))
++ 				bkvhead[i] = NULL;
++ 			krc_this_cpu_unlock(krcp, flags);
++ 
++ 			if (bkvhead[i])
++ 				free_page((unsigned long) bkvhead[i]);
++ 
++ 			cond_resched_tasks_rcu_qs();
++ 		}
++ 	}
++ 
++ 	/*
++ 	 * Emergency case only. It can happen under low memory
++ 	 * condition when an allocation gets failed, so the "bulk"
++ 	 * path can not be temporary maintained.
++ 	 */
+++>>>>>>> c408b215f58f (rcu: Rename *_kfree_callback/*_kfree_rcu_offset/kfree_call_*)
+  	for (; head; head = next) {
+ -		unsigned long offset = (unsigned long)head->func;
+ -		void *ptr = (void *)head - offset;
+ -
+  		next = head->next;
+++<<<<<<< HEAD
+ +		// Potentially optimize with kfree_bulk in future.
+ +		debug_rcu_head_unqueue(head);
+ +		__rcu_reclaim(rcu_state.name, head);
+++=======
++ 		debug_rcu_head_unqueue((struct rcu_head *)ptr);
++ 		rcu_lock_acquire(&rcu_callback_map);
++ 		trace_rcu_invoke_kvfree_callback(rcu_state.name, head, offset);
++ 
++ 		if (!WARN_ON_ONCE(!__is_kvfree_rcu_offset(offset)))
++ 			kvfree(ptr);
++ 
++ 		rcu_lock_release(&rcu_callback_map);
+++>>>>>>> c408b215f58f (rcu: Rename *_kfree_callback/*_kfree_rcu_offset/kfree_call_*)
+  		cond_resched_tasks_rcu_qs();
+  	}
+  }
+@@@ -2810,34 -3282,74 +2877,41 @@@ static void kfree_rcu_monitor(struct wo
+  	if (krcp->monitor_todo)
+  		kfree_rcu_drain_unlock(krcp, flags);
+  	else
+ -		raw_spin_unlock_irqrestore(&krcp->lock, flags);
+ +		spin_unlock_irqrestore(&krcp->lock, flags);
+  }
+  
+ -static inline bool
+ -kvfree_call_rcu_add_ptr_to_bulk(struct kfree_rcu_cpu *krcp, void *ptr)
+ +/*
+ + * This version of kfree_call_rcu does not do batching of kfree_rcu() requests.
+ + * Used only by rcuperf torture test for comparison with kfree_rcu_batch().
+ + */
+ +void kfree_call_rcu_nobatch(struct rcu_head *head, rcu_callback_t func)
+  {
+ -	struct kvfree_rcu_bulk_data *bnode;
+ -	int idx;
+ -
+ -	if (unlikely(!krcp->initialized))
+ -		return false;
+ -
+ -	lockdep_assert_held(&krcp->lock);
+ -	idx = !!is_vmalloc_addr(ptr);
+ -
+ -	/* Check if a new block is required. */
+ -	if (!krcp->bkvhead[idx] ||
+ -			krcp->bkvhead[idx]->nr_records == KVFREE_BULK_MAX_ENTR) {
+ -		bnode = get_cached_bnode(krcp);
+ -		if (!bnode) {
+ -			/*
+ -			 * To keep this path working on raw non-preemptible
+ -			 * sections, prevent the optional entry into the
+ -			 * allocator as it uses sleeping locks. In fact, even
+ -			 * if the caller of kfree_rcu() is preemptible, this
+ -			 * path still is not, as krcp->lock is a raw spinlock.
+ -			 * With additional page pre-allocation in the works,
+ -			 * hitting this return is going to be much less likely.
+ -			 */
+ -			if (IS_ENABLED(CONFIG_PREEMPT_RT))
+ -				return false;
+ -
+ -			bnode = (struct kvfree_rcu_bulk_data *)
+ -				__get_free_page(GFP_NOWAIT | __GFP_NOWARN);
+ -		}
+ -
+ -		/* Switch to emergency path. */
+ -		if (unlikely(!bnode))
+ -			return false;
+ -
+ -		/* Initialize the new block. */
+ -		bnode->nr_records = 0;
+ -		bnode->next = krcp->bkvhead[idx];
+ -
+ -		/* Attach it to the head. */
+ -		krcp->bkvhead[idx] = bnode;
+ -	}
+ -
+ -	/* Finally insert. */
+ -	krcp->bkvhead[idx]->records
+ -		[krcp->bkvhead[idx]->nr_records++] = ptr;
+ -
+ -	return true;
+ +	__call_rcu(head, func, 1);
+  }
+ +EXPORT_SYMBOL_GPL(kfree_call_rcu_nobatch);
+  
+  /*
+ - * Queue a request for lazy invocation of appropriate free routine after a
+ - * grace period. Please note there are three paths are maintained, two are the
+ - * main ones that use array of pointers interface and third one is emergency
+ - * one, that is used only when the main path can not be maintained temporary,
+ - * due to memory pressure.
+ + * Queue a request for lazy invocation of kfree() after a grace period.
+ + *
+++<<<<<<< HEAD
+ + * Each kfree_call_rcu() request is added to a batch. The batch will be drained
+ + * every KFREE_DRAIN_JIFFIES number of jiffies. All the objects in the batch
+ + * will be kfree'd in workqueue context. This allows us to:
+ + *
+ + * 1.	Batch requests together to reduce the number of grace periods during
+ + *	heavy kfree_rcu() load.
+   *
+ + * 2.	It makes it possible to use kfree_bulk() on a large number of
+ + *	kfree_rcu() requests thus reducing cache misses and the per-object
+ + *	overhead of kfree().
+++=======
++  * Each kvfree_call_rcu() request is added to a batch. The batch will be drained
++  * every KFREE_DRAIN_JIFFIES number of jiffies. All the objects in the batch will
++  * be free'd in workqueue context. This allows us to: batch requests together to
++  * reduce the number of grace periods during heavy kfree_rcu()/kvfree_rcu() load.
+++>>>>>>> c408b215f58f (rcu: Rename *_kfree_callback/*_kfree_rcu_offset/kfree_call_*)
+   */
+- void kfree_call_rcu(struct rcu_head *head, rcu_callback_t func)
++ void kvfree_call_rcu(struct rcu_head *head, rcu_callback_t func)
+  {
+  	unsigned long flags;
+  	struct kfree_rcu_cpu *krcp;
+@@@ -2868,12 -3386,60 +2942,12 @@@
+  	}
+  
+  unlock_return:
+ -	krc_this_cpu_unlock(krcp, flags);
+ +	if (krcp->initialized)
+ +		spin_unlock(&krcp->lock);
+ +	local_irq_restore(flags);
+  }
+- EXPORT_SYMBOL_GPL(kfree_call_rcu);
++ EXPORT_SYMBOL_GPL(kvfree_call_rcu);
+  
+ -static unsigned long
+ -kfree_rcu_shrink_count(struct shrinker *shrink, struct shrink_control *sc)
+ -{
+ -	int cpu;
+ -	unsigned long count = 0;
+ -
+ -	/* Snapshot count of all CPUs */
+ -	for_each_online_cpu(cpu) {
+ -		struct kfree_rcu_cpu *krcp = per_cpu_ptr(&krc, cpu);
+ -
+ -		count += READ_ONCE(krcp->count);
+ -	}
+ -
+ -	return count;
+ -}
+ -
+ -static unsigned long
+ -kfree_rcu_shrink_scan(struct shrinker *shrink, struct shrink_control *sc)
+ -{
+ -	int cpu, freed = 0;
+ -	unsigned long flags;
+ -
+ -	for_each_online_cpu(cpu) {
+ -		int count;
+ -		struct kfree_rcu_cpu *krcp = per_cpu_ptr(&krc, cpu);
+ -
+ -		count = krcp->count;
+ -		raw_spin_lock_irqsave(&krcp->lock, flags);
+ -		if (krcp->monitor_todo)
+ -			kfree_rcu_drain_unlock(krcp, flags);
+ -		else
+ -			raw_spin_unlock_irqrestore(&krcp->lock, flags);
+ -
+ -		sc->nr_to_scan -= count;
+ -		freed += count;
+ -
+ -		if (sc->nr_to_scan <= 0)
+ -			break;
+ -	}
+ -
+ -	return freed;
+ -}
+ -
+ -static struct shrinker kfree_rcu_shrinker = {
+ -	.count_objects = kfree_rcu_shrink_count,
+ -	.scan_objects = kfree_rcu_shrink_scan,
+ -	.batch = 0,
+ -	.seeks = DEFAULT_SEEKS,
+ -};
+ -
+  void __init kfree_rcu_scheduler_running(void)
+  {
+  	int cpu;
+diff --git a/include/linux/rcupdate.h b/include/linux/rcupdate.h
+index aa13a21dba9d..ededc791bafd 100644
+--- a/include/linux/rcupdate.h
++++ b/include/linux/rcupdate.h
+@@ -826,17 +826,17 @@ static inline notrace void rcu_read_unlock_sched_notrace(void)
+ 
+ /*
+  * Does the specified offset indicate that the corresponding rcu_head
+- * structure can be handled by kfree_rcu()?
++ * structure can be handled by kvfree_rcu()?
+  */
+-#define __is_kfree_rcu_offset(offset) ((offset) < 4096)
++#define __is_kvfree_rcu_offset(offset) ((offset) < 4096)
+ 
+ /*
+  * Helper macro for kfree_rcu() to prevent argument-expansion eyestrain.
+  */
+-#define __kfree_rcu(head, offset) \
++#define __kvfree_rcu(head, offset) \
+ 	do { \
+-		BUILD_BUG_ON(!__is_kfree_rcu_offset(offset)); \
+-		kfree_call_rcu(head, (rcu_callback_t)(unsigned long)(offset)); \
++		BUILD_BUG_ON(!__is_kvfree_rcu_offset(offset)); \
++		kvfree_call_rcu(head, (rcu_callback_t)(unsigned long)(offset)); \
+ 	} while (0)
+ 
+ /**
+@@ -855,7 +855,7 @@ static inline notrace void rcu_read_unlock_sched_notrace(void)
+  * Because the functions are not allowed in the low-order 4096 bytes of
+  * kernel virtual memory, offsets up to 4095 bytes can be accommodated.
+  * If the offset is larger than 4095 bytes, a compile-time error will
+- * be generated in __kfree_rcu().  If this error is triggered, you can
++ * be generated in __kvfree_rcu(). If this error is triggered, you can
+  * either fall back to use of call_rcu() or rearrange the structure to
+  * position the rcu_head structure into the first 4096 bytes.
+  *
+@@ -870,7 +870,7 @@ do {									\
+ 	typeof (ptr) ___p = (ptr);					\
+ 									\
+ 	if (___p)							\
+-		__kfree_rcu(&((___p)->rhf), offsetof(typeof(*(ptr)), rhf)); \
++		__kvfree_rcu(&((___p)->rhf), offsetof(typeof(*(ptr)), rhf)); \
+ } while (0)
+ 
+ /*
+diff --git a/include/linux/rcutiny.h b/include/linux/rcutiny.h
+index 296f9116796b..96e2d8946f3c 100644
+--- a/include/linux/rcutiny.h
++++ b/include/linux/rcutiny.h
+@@ -47,7 +47,7 @@ static inline void synchronize_rcu_expedited(void)
+ 	synchronize_rcu();
+ }
+ 
+-static inline void kfree_call_rcu(struct rcu_head *head, rcu_callback_t func)
++static inline void kvfree_call_rcu(struct rcu_head *head, rcu_callback_t func)
+ {
+ 	call_rcu(head, func);
+ }
+* Unmerged path include/linux/rcutree.h
+diff --git a/include/trace/events/rcu.h b/include/trace/events/rcu.h
+index 0f83f4223cfb..e1df9836e5fc 100644
+--- a/include/trace/events/rcu.h
++++ b/include/trace/events/rcu.h
+@@ -509,13 +509,13 @@ TRACE_EVENT_RCU(rcu_callback,
+ 
+ /*
+  * Tracepoint for the registration of a single RCU callback of the special
+- * kfree() form.  The first argument is the RCU type, the second argument
++ * kvfree() form.  The first argument is the RCU type, the second argument
+  * is a pointer to the RCU callback, the third argument is the offset
+  * of the callback within the enclosing RCU-protected data structure,
+  * the fourth argument is the number of lazy callbacks queued, and the
+  * fifth argument is the total number of callbacks queued.
+  */
+-TRACE_EVENT_RCU(rcu_kfree_callback,
++TRACE_EVENT_RCU(rcu_kvfree_callback,
+ 
+ 	TP_PROTO(const char *rcuname, struct rcu_head *rhp, unsigned long offset,
+ 		 long qlen_lazy, long qlen),
+@@ -604,12 +604,12 @@ TRACE_EVENT_RCU(rcu_invoke_callback,
+ 
+ /*
+  * Tracepoint for the invocation of a single RCU callback of the special
+- * kfree() form.  The first argument is the RCU flavor, the second
++ * kvfree() form.  The first argument is the RCU flavor, the second
+  * argument is a pointer to the RCU callback, and the third argument
+  * is the offset of the callback within the enclosing RCU-protected
+  * data structure.
+  */
+-TRACE_EVENT_RCU(rcu_invoke_kfree_callback,
++TRACE_EVENT_RCU(rcu_invoke_kvfree_callback,
+ 
+ 	TP_PROTO(const char *rcuname, struct rcu_head *rhp, unsigned long offset),
+ 
+* Unmerged path kernel/rcu/tiny.c
+* Unmerged path kernel/rcu/tree.c
