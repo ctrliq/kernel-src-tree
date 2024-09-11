@@ -1226,6 +1226,13 @@ static struct xfrm6_tunnel vti_ipv6_handler __read_mostly = {
 	.err_handler	=	vti6_err,
 	.priority	=	0,
 };
+
+static struct xfrm6_tunnel vti_ip6ip_handler __read_mostly = {
+	.handler	=	vti6_rcv_tunnel,
+	.cb_handler	=	vti6_rcv_cb,
+	.err_handler	=	vti6_err,
+	.priority	=	0,
+};
 #endif
 
 /**
@@ -1258,7 +1265,7 @@ static int __init vti6_tunnel_init(void)
 	err = xfrm6_tunnel_register(&vti_ipv6_handler, AF_INET6);
 	if (err < 0)
 		goto vti_tunnel_ipv6_failed;
-	err = xfrm6_tunnel_register(&vti_ipv6_handler, AF_INET);
+	err = xfrm6_tunnel_register(&vti_ip6ip_handler, AF_INET);
 	if (err < 0)
 		goto vti_tunnel_ip6ip_failed;
 #endif
@@ -1272,7 +1279,7 @@ static int __init vti6_tunnel_init(void)
 
 rtnl_link_failed:
 #if IS_ENABLED(CONFIG_INET6_XFRM_TUNNEL)
-	err = xfrm6_tunnel_deregister(&vti_ipv6_handler, AF_INET);
+	err = xfrm6_tunnel_deregister(&vti_ip6ip_handler, AF_INET);
 vti_tunnel_ip6ip_failed:
 	err = xfrm6_tunnel_deregister(&vti_ipv6_handler, AF_INET6);
 vti_tunnel_ipv6_failed:
@@ -1296,7 +1303,7 @@ static void __exit vti6_tunnel_cleanup(void)
 {
 	rtnl_link_unregister(&vti6_link_ops);
 #if IS_ENABLED(CONFIG_INET6_XFRM_TUNNEL)
-	xfrm6_tunnel_deregister(&vti_ipv6_handler, AF_INET);
+	xfrm6_tunnel_deregister(&vti_ip6ip_handler, AF_INET);
 	xfrm6_tunnel_deregister(&vti_ipv6_handler, AF_INET6);
 #endif
 	xfrm6_protocol_deregister(&vti_ipcomp6_protocol, IPPROTO_COMP);
