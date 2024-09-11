@@ -1,0 +1,479 @@
+NFS: Add softreval behaviour to nfs_lookup_revalidate()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Trond Myklebust <trondmy@gmail.com>
+commit f7b37b8b139860ed786bf8ce4358290c6053d94d
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/f7b37b8b.failed
+
+If the server is unavaliable, we want to allow the revalidating
+lookup to time out, and to default to validating the cached dentry
+if the 'softreval' mount option is set.
+
+	Signed-off-by: Trond Myklebust <trond.myklebust@hammerspace.com>
+	Signed-off-by: Anna Schumaker <Anna.Schumaker@Netapp.com>
+(cherry picked from commit f7b37b8b139860ed786bf8ce4358290c6053d94d)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/nfs/dir.c
+#	fs/nfs/internal.h
+#	fs/nfs/namespace.c
+#	fs/nfs/nfs4namespace.c
+diff --cc fs/nfs/dir.c
+index abd8dc43875a,bfc66f3f00e1..000000000000
+--- a/fs/nfs/dir.c
++++ b/fs/nfs/dir.c
+@@@ -1297,11 -1142,17 +1297,22 @@@ nfs_lookup_revalidate_dentry(struct ino
+  	if (fhandle == NULL || fattr == NULL || IS_ERR(label))
+  		goto out;
+  
+++<<<<<<< HEAD
+ +	dir_verifier = nfs_save_change_attribute(dir);
+ +	ret = NFS_PROTO(dir)->lookup(dir, &dentry->d_name, fhandle, fattr, label);
+++=======
++ 	ret = NFS_PROTO(dir)->lookup(dir, dentry, fhandle, fattr, label);
+++>>>>>>> f7b37b8b1398 (NFS: Add softreval behaviour to nfs_lookup_revalidate())
+  	if (ret < 0) {
+- 		if (ret == -ESTALE || ret == -ENOENT)
++ 		switch (ret) {
++ 		case -ESTALE:
++ 		case -ENOENT:
+  			ret = 0;
++ 			break;
++ 		case -ETIMEDOUT:
++ 			if (NFS_SERVER(inode)->flags & NFS_MOUNT_SOFTREVAL)
++ 				ret = 1;
++ 		}
+  		goto out;
+  	}
+  	ret = 0;
+@@@ -1564,9 -1414,8 +1575,9 @@@ struct dentry *nfs_lookup(struct inode 
+  	if (IS_ERR(label))
+  		goto out;
+  
+ +	dir_verifier = nfs_save_change_attribute(dir);
+  	trace_nfs_lookup_enter(dir, dentry, flags);
+- 	error = NFS_PROTO(dir)->lookup(dir, &dentry->d_name, fhandle, fattr, label);
++ 	error = NFS_PROTO(dir)->lookup(dir, dentry, fhandle, fattr, label);
+  	if (error == -ENOENT)
+  		goto no_entry;
+  	if (error < 0) {
+diff --cc fs/nfs/internal.h
+index 8dcf11de77be,f80c47d5ff27..000000000000
+--- a/fs/nfs/internal.h
++++ b/fs/nfs/internal.h
+@@@ -31,15 -33,14 +31,26 @@@ static inline int nfs_attr_use_mounted_
+  	return 1;
+  }
+  
+++<<<<<<< HEAD
+ +struct nfs_clone_mount {
+ +	const struct super_block *sb;
+ +	const struct dentry *dentry;
+ +	char *hostname;
+ +	char *mnt_path;
+ +	struct sockaddr *addr;
+ +	size_t addrlen;
+ +	rpc_authflavor_t authflavor;
+ +};
+++=======
++ static inline bool nfs_lookup_is_soft_revalidate(const struct dentry *dentry)
++ {
++ 	if (!(NFS_SB(dentry->d_sb)->flags & NFS_MOUNT_SOFTREVAL))
++ 		return false;
++ 	if (!d_is_positive(dentry) || !NFS_FH(d_inode(dentry))->size)
++ 		return false;
++ 	return true;
++ }
+++>>>>>>> f7b37b8b1398 (NFS: Add softreval behaviour to nfs_lookup_revalidate())
+  
+  /*
+   * Note: RFC 1813 doesn't limit the number of auth flavors that
+diff --cc fs/nfs/namespace.c
+index c0e82b030c1f,ad6077404947..000000000000
+--- a/fs/nfs/namespace.c
++++ b/fs/nfs/namespace.c
+@@@ -264,68 -293,22 +264,74 @@@ struct vfsmount *nfs_do_submount(struc
+  }
+  EXPORT_SYMBOL_GPL(nfs_do_submount);
+  
+ -int nfs_submount(struct fs_context *fc, struct nfs_server *server)
+ +struct vfsmount *nfs_submount(struct nfs_server *server, struct dentry *dentry,
+ +			      struct nfs_fh *fh, struct nfs_fattr *fattr)
+  {
+ -	struct nfs_fs_context *ctx = nfs_fc2context(fc);
+ -	struct dentry *dentry = ctx->clone_data.dentry;
+ -	struct dentry *parent = dget_parent(dentry);
+  	int err;
+ +	struct dentry *parent = dget_parent(dentry);
+  
+  	/* Look it up again to get its attributes */
+++<<<<<<< HEAD
+ +	err = server->nfs_client->rpc_ops->lookup(d_inode(parent), &dentry->d_name, fh, fattr, NULL);
+++=======
++ 	err = server->nfs_client->rpc_ops->lookup(d_inode(parent), dentry,
++ 						  ctx->mntfh, ctx->clone_data.fattr,
++ 						  NULL);
+++>>>>>>> f7b37b8b1398 (NFS: Add softreval behaviour to nfs_lookup_revalidate())
+  	dput(parent);
+  	if (err != 0)
+ -		return err;
+ +		return ERR_PTR(err);
+  
+ -	ctx->selected_flavor = server->client->cl_auth->au_flavor;
+ -	return nfs_do_submount(fc);
+ +	return nfs_do_submount(dentry, fh, fattr, server->client->cl_auth->au_flavor);
+  }
+  EXPORT_SYMBOL_GPL(nfs_submount);
+ +
+ +static int param_set_nfs_timeout(const char *val, const struct kernel_param *kp)
+ +{
+ +	long num;
+ +	int ret;
+ +
+ +	if (!val)
+ +		return -EINVAL;
+ +	ret = kstrtol(val, 0, &num);
+ +	if (ret)
+ +		return -EINVAL;
+ +	if (num > 0) {
+ +		if (num >= INT_MAX / HZ)
+ +			num = INT_MAX;
+ +		else
+ +			num *= HZ;
+ +		*((int *)kp->arg) = num;
+ +		if (!list_empty(&nfs_automount_list))
+ +			mod_delayed_work(system_wq, &nfs_automount_task, num);
+ +	} else {
+ +		*((int *)kp->arg) = -1*HZ;
+ +		cancel_delayed_work(&nfs_automount_task);
+ +	}
+ +	return 0;
+ +}
+ +
+ +static int param_get_nfs_timeout(char *buffer, const struct kernel_param *kp)
+ +{
+ +	long num = *((int *)kp->arg);
+ +
+ +	if (num > 0) {
+ +		if (num >= INT_MAX - (HZ - 1))
+ +			num = INT_MAX / HZ;
+ +		else
+ +			num = (num + (HZ - 1)) / HZ;
+ +	} else
+ +		num = -1;
+ +	return scnprintf(buffer, PAGE_SIZE, "%li\n", num);
+ +}
+ +
+ +static const struct kernel_param_ops param_ops_nfs_timeout = {
+ +	.set = param_set_nfs_timeout,
+ +	.get = param_get_nfs_timeout,
+ +};
+ +#define param_check_nfs_timeout(name, p) __param_check(name, p, int);
+ +
+ +module_param(nfs_mountpoint_expiry_timeout, nfs_timeout, 0644);
+ +MODULE_PARM_DESC(nfs_mountpoint_expiry_timeout,
+ +		"Set the NFS automounted mountpoint timeout value (seconds)."
+ +		"Values <= 0 turn expiration off.");
+diff --cc fs/nfs/nfs4namespace.c
+index 1ec3b72ae697,3ea1c1008b5b..000000000000
+--- a/fs/nfs/nfs4namespace.c
++++ b/fs/nfs/nfs4namespace.c
+@@@ -374,45 -420,47 +374,49 @@@ static struct vfsmount *nfs_do_refmount
+  
+  	err = nfs4_proc_fs_locations(client, d_inode(parent), &dentry->d_name, fs_locations, page);
+  	dput(parent);
+ -	if (err != 0)
+ -		goto out_free_2;
+ -
+ -	err = -ENOENT;
+ -	if (fs_locations->nlocations <= 0 ||
+ +	if (err != 0 ||
+ +	    fs_locations->nlocations <= 0 ||
+  	    fs_locations->fs_path.ncomponents <= 0)
+ -		goto out_free_2;
+ +		goto out_free;
+  
+ -	err = nfs_follow_referral(fc, fs_locations);
+ -out_free_2:
+ -	kfree(fs_locations);
+ +	mnt = nfs_follow_referral(dentry, fs_locations);
+  out_free:
+  	__free_page(page);
+ -	return err;
+ +	kfree(fs_locations);
+ +	return mnt;
+  }
+  
+ -int nfs4_submount(struct fs_context *fc, struct nfs_server *server)
+ +struct vfsmount *nfs4_submount(struct nfs_server *server, struct dentry *dentry,
+ +			       struct nfs_fh *fh, struct nfs_fattr *fattr)
+  {
+ -	struct nfs_fs_context *ctx = nfs_fc2context(fc);
+ -	struct dentry *dentry = ctx->clone_data.dentry;
+ +	rpc_authflavor_t flavor = server->client->cl_auth->au_flavor;
+  	struct dentry *parent = dget_parent(dentry);
+  	struct inode *dir = d_inode(parent);
+- 	const struct qstr *name = &dentry->d_name;
+  	struct rpc_clnt *client;
+ -	int ret;
+ +	struct vfsmount *mnt;
+  
+  	/* Look it up again to get its attributes and sec flavor */
+++<<<<<<< HEAD
+ +	client = nfs4_proc_lookup_mountpoint(dir, name, fh, fattr);
+++=======
++ 	client = nfs4_proc_lookup_mountpoint(dir, dentry, ctx->mntfh,
++ 					     ctx->clone_data.fattr);
+++>>>>>>> f7b37b8b1398 (NFS: Add softreval behaviour to nfs_lookup_revalidate())
+  	dput(parent);
+  	if (IS_ERR(client))
+ -		return PTR_ERR(client);
+ +		return ERR_CAST(client);
+  
+ -	ctx->selected_flavor = client->cl_auth->au_flavor;
+ -	if (ctx->clone_data.fattr->valid & NFS_ATTR_FATTR_V4_REFERRAL) {
+ -		ret = nfs_do_refmount(fc, client);
+ -	} else {
+ -		ret = nfs_do_submount(fc);
+ +	if (fattr->valid & NFS_ATTR_FATTR_V4_REFERRAL) {
+ +		mnt = nfs_do_refmount(client, dentry);
+ +		goto out;
+  	}
+  
+ +	if (client->cl_auth->au_flavor != flavor)
+ +		flavor = client->cl_auth->au_flavor;
+ +	mnt = nfs_do_submount(dentry, fh, fattr, flavor);
+ +out:
+  	rpc_shutdown_client(client);
+ -	return ret;
+ +	return mnt;
+  }
+  
+  /*
+* Unmerged path fs/nfs/dir.c
+* Unmerged path fs/nfs/internal.h
+* Unmerged path fs/nfs/namespace.c
+diff --git a/fs/nfs/nfs3proc.c b/fs/nfs/nfs3proc.c
+index 9446eff223cd..fa383fd3ccdf 100644
+--- a/fs/nfs/nfs3proc.c
++++ b/fs/nfs/nfs3proc.c
+@@ -149,14 +149,14 @@ nfs3_proc_setattr(struct dentry *dentry, struct nfs_fattr *fattr,
+ }
+ 
+ static int
+-nfs3_proc_lookup(struct inode *dir, const struct qstr *name,
++nfs3_proc_lookup(struct inode *dir, struct dentry *dentry,
+ 		 struct nfs_fh *fhandle, struct nfs_fattr *fattr,
+ 		 struct nfs4_label *label)
+ {
+ 	struct nfs3_diropargs	arg = {
+ 		.fh		= NFS_FH(dir),
+-		.name		= name->name,
+-		.len		= name->len
++		.name		= dentry->d_name.name,
++		.len		= dentry->d_name.len
+ 	};
+ 	struct nfs3_diropres	res = {
+ 		.fh		= fhandle,
+@@ -168,20 +168,25 @@ nfs3_proc_lookup(struct inode *dir, const struct qstr *name,
+ 		.rpc_resp	= &res,
+ 	};
+ 	int			status;
++	unsigned short task_flags = 0;
+ 
++	/* Is this is an attribute revalidation, subject to softreval? */
++	if (nfs_lookup_is_soft_revalidate(dentry))
++		task_flags |= RPC_TASK_TIMEOUT;
++
++	dprintk("NFS call  lookup %pd2\n", dentry);
+ 	res.dir_attr = nfs_alloc_fattr();
+ 	if (res.dir_attr == NULL)
+ 		return -ENOMEM;
+ 
+-	dprintk("NFS call  lookup %s\n", name->name);
+ 	nfs_fattr_init(fattr);
+-	status = rpc_call_sync(NFS_CLIENT(dir), &msg, 0);
++	status = rpc_call_sync(NFS_CLIENT(dir), &msg, task_flags);
+ 	nfs_refresh_inode(dir, res.dir_attr);
+ 	if (status >= 0 && !(fattr->valid & NFS_ATTR_FATTR)) {
+ 		msg.rpc_proc = &nfs3_procedures[NFS3PROC_GETATTR];
+ 		msg.rpc_argp = fhandle;
+ 		msg.rpc_resp = fattr;
+-		status = rpc_call_sync(NFS_CLIENT(dir), &msg, 0);
++		status = rpc_call_sync(NFS_CLIENT(dir), &msg, task_flags);
+ 	}
+ 	nfs_free_fattr(res.dir_attr);
+ 	dprintk("NFS reply lookup: %d\n", status);
+diff --git a/fs/nfs/nfs4_fs.h b/fs/nfs/nfs4_fs.h
+index cacd477891c1..5869216a4968 100644
+--- a/fs/nfs/nfs4_fs.h
++++ b/fs/nfs/nfs4_fs.h
+@@ -305,8 +305,10 @@ extern int nfs4_proc_fs_locations(struct rpc_clnt *, struct inode *, const struc
+ extern int nfs4_proc_get_locations(struct inode *, struct nfs4_fs_locations *,
+ 		struct page *page, const struct cred *);
+ extern int nfs4_proc_fsid_present(struct inode *, const struct cred *);
+-extern struct rpc_clnt *nfs4_proc_lookup_mountpoint(struct inode *, const struct qstr *,
+-			    struct nfs_fh *, struct nfs_fattr *);
++extern struct rpc_clnt *nfs4_proc_lookup_mountpoint(struct inode *,
++						    struct dentry *,
++						    struct nfs_fh *,
++						    struct nfs_fattr *);
+ extern int nfs4_proc_secinfo(struct inode *, const struct qstr *, struct nfs4_secinfo_flavors *);
+ extern const struct xattr_handler *nfs4_xattr_handlers[];
+ extern int nfs4_set_rw_stateid(nfs4_stateid *stateid,
+* Unmerged path fs/nfs/nfs4namespace.c
+diff --git a/fs/nfs/nfs4proc.c b/fs/nfs/nfs4proc.c
+index b3556eac3d7b..31c325f9dc1f 100644
+--- a/fs/nfs/nfs4proc.c
++++ b/fs/nfs/nfs4proc.c
+@@ -4103,7 +4103,7 @@ nfs4_proc_setattr(struct dentry *dentry, struct nfs_fattr *fattr,
+ }
+ 
+ static int _nfs4_proc_lookup(struct rpc_clnt *clnt, struct inode *dir,
+-		const struct qstr *name, struct nfs_fh *fhandle,
++		struct dentry *dentry, struct nfs_fh *fhandle,
+ 		struct nfs_fattr *fattr, struct nfs4_label *label)
+ {
+ 	struct nfs_server *server = NFS_SERVER(dir);
+@@ -4111,7 +4111,7 @@ static int _nfs4_proc_lookup(struct rpc_clnt *clnt, struct inode *dir,
+ 	struct nfs4_lookup_arg args = {
+ 		.bitmask = server->attr_bitmask,
+ 		.dir_fh = NFS_FH(dir),
+-		.name = name,
++		.name = &dentry->d_name,
+ 	};
+ 	struct nfs4_lookup_res res = {
+ 		.server = server,
+@@ -4124,13 +4124,20 @@ static int _nfs4_proc_lookup(struct rpc_clnt *clnt, struct inode *dir,
+ 		.rpc_argp = &args,
+ 		.rpc_resp = &res,
+ 	};
++	unsigned short task_flags = 0;
++
++	/* Is this is an attribute revalidation, subject to softreval? */
++	if (nfs_lookup_is_soft_revalidate(dentry))
++		task_flags |= RPC_TASK_TIMEOUT;
+ 
+ 	args.bitmask = nfs4_bitmask(server, label);
+ 
+ 	nfs_fattr_init(fattr);
+ 
+-	dprintk("NFS call  lookup %s\n", name->name);
+-	status = nfs4_call_sync(clnt, server, &msg, &args.seq_args, &res.seq_res, 0);
++	dprintk("NFS call  lookup %pd2\n", dentry);
++	nfs4_init_sequence(&args.seq_args, &res.seq_res, 0, 0);
++	status = nfs4_do_call_sync(clnt, server, &msg,
++			&args.seq_args, &res.seq_res, task_flags);
+ 	dprintk("NFS reply lookup: %d\n", status);
+ 	return status;
+ }
+@@ -4144,16 +4151,17 @@ static void nfs_fixup_secinfo_attributes(struct nfs_fattr *fattr)
+ }
+ 
+ static int nfs4_proc_lookup_common(struct rpc_clnt **clnt, struct inode *dir,
+-				   const struct qstr *name, struct nfs_fh *fhandle,
++				   struct dentry *dentry, struct nfs_fh *fhandle,
+ 				   struct nfs_fattr *fattr, struct nfs4_label *label)
+ {
+ 	struct nfs4_exception exception = {
+ 		.interruptible = true,
+ 	};
+ 	struct rpc_clnt *client = *clnt;
++	const struct qstr *name = &dentry->d_name;
+ 	int err;
+ 	do {
+-		err = _nfs4_proc_lookup(client, dir, name, fhandle, fattr, label);
++		err = _nfs4_proc_lookup(client, dir, dentry, fhandle, fattr, label);
+ 		trace_nfs4_lookup(dir, name, err);
+ 		switch (err) {
+ 		case -NFS4ERR_BADNAME:
+@@ -4188,14 +4196,14 @@ static int nfs4_proc_lookup_common(struct rpc_clnt **clnt, struct inode *dir,
+ 	return err;
+ }
+ 
+-static int nfs4_proc_lookup(struct inode *dir, const struct qstr *name,
++static int nfs4_proc_lookup(struct inode *dir, struct dentry *dentry,
+ 			    struct nfs_fh *fhandle, struct nfs_fattr *fattr,
+ 			    struct nfs4_label *label)
+ {
+ 	int status;
+ 	struct rpc_clnt *client = NFS_CLIENT(dir);
+ 
+-	status = nfs4_proc_lookup_common(&client, dir, name, fhandle, fattr, label);
++	status = nfs4_proc_lookup_common(&client, dir, dentry, fhandle, fattr, label);
+ 	if (client != NFS_CLIENT(dir)) {
+ 		rpc_shutdown_client(client);
+ 		nfs_fixup_secinfo_attributes(fattr);
+@@ -4204,13 +4212,13 @@ static int nfs4_proc_lookup(struct inode *dir, const struct qstr *name,
+ }
+ 
+ struct rpc_clnt *
+-nfs4_proc_lookup_mountpoint(struct inode *dir, const struct qstr *name,
++nfs4_proc_lookup_mountpoint(struct inode *dir, struct dentry *dentry,
+ 			    struct nfs_fh *fhandle, struct nfs_fattr *fattr)
+ {
+ 	struct rpc_clnt *client = NFS_CLIENT(dir);
+ 	int status;
+ 
+-	status = nfs4_proc_lookup_common(&client, dir, name, fhandle, fattr, NULL);
++	status = nfs4_proc_lookup_common(&client, dir, dentry, fhandle, fattr, NULL);
+ 	if (status < 0)
+ 		return ERR_PTR(status);
+ 	return (client == NFS_CLIENT(dir)) ? rpc_clone_client(client) : client;
+diff --git a/fs/nfs/proc.c b/fs/nfs/proc.c
+index 0f7288b94633..de4f09118ca0 100644
+--- a/fs/nfs/proc.c
++++ b/fs/nfs/proc.c
+@@ -147,14 +147,14 @@ nfs_proc_setattr(struct dentry *dentry, struct nfs_fattr *fattr,
+ }
+ 
+ static int
+-nfs_proc_lookup(struct inode *dir, const struct qstr *name,
++nfs_proc_lookup(struct inode *dir, struct dentry *dentry,
+ 		struct nfs_fh *fhandle, struct nfs_fattr *fattr,
+ 		struct nfs4_label *label)
+ {
+ 	struct nfs_diropargs	arg = {
+ 		.fh		= NFS_FH(dir),
+-		.name		= name->name,
+-		.len		= name->len
++		.name		= dentry->d_name.name,
++		.len		= dentry->d_name.len
+ 	};
+ 	struct nfs_diropok	res = {
+ 		.fh		= fhandle,
+@@ -166,10 +166,15 @@ nfs_proc_lookup(struct inode *dir, const struct qstr *name,
+ 		.rpc_resp	= &res,
+ 	};
+ 	int			status;
++	unsigned short task_flags = 0;
+ 
+-	dprintk("NFS call  lookup %s\n", name->name);
++	/* Is this is an attribute revalidation, subject to softreval? */
++	if (nfs_lookup_is_soft_revalidate(dentry))
++		task_flags |= RPC_TASK_TIMEOUT;
++
++	dprintk("NFS call  lookup %pd2\n", dentry);
+ 	nfs_fattr_init(fattr);
+-	status = rpc_call_sync(NFS_CLIENT(dir), &msg, 0);
++	status = rpc_call_sync(NFS_CLIENT(dir), &msg, task_flags);
+ 	dprintk("NFS reply lookup: %d\n", status);
+ 	return status;
+ }
+diff --git a/include/linux/nfs_xdr.h b/include/linux/nfs_xdr.h
+index 832bd4359ec7..af89e0261b2c 100644
+--- a/include/linux/nfs_xdr.h
++++ b/include/linux/nfs_xdr.h
+@@ -1635,7 +1635,7 @@ struct nfs_rpc_ops {
+ 			    struct inode *);
+ 	int	(*setattr) (struct dentry *, struct nfs_fattr *,
+ 			    struct iattr *);
+-	int	(*lookup)  (struct inode *, const struct qstr *,
++	int	(*lookup)  (struct inode *, struct dentry *,
+ 			    struct nfs_fh *, struct nfs_fattr *,
+ 			    struct nfs4_label *);
+ 	int	(*lookupp) (struct inode *, struct nfs_fh *,
