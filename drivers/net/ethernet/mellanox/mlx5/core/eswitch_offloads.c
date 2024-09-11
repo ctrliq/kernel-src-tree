@@ -2785,6 +2785,7 @@ int esw_offloads_enable(struct mlx5_eswitch *esw)
 	struct mapping_ctx *reg_c0_obj_pool;
 	struct mlx5_vport *vport;
 	unsigned long i;
+	u64 mapping_id;
 	int err;
 
 	mutex_init(&esw->offloads.termtbl_mutex);
@@ -2802,9 +2803,13 @@ int esw_offloads_enable(struct mlx5_eswitch *esw)
 	if (err)
 		goto err_vport_metadata;
 
-	reg_c0_obj_pool = mapping_create(sizeof(struct mlx5_mapped_obj),
-					 ESW_REG_C0_USER_DATA_METADATA_MASK,
-					 true);
+	mapping_id = mlx5_query_nic_system_image_guid(esw->dev);
+
+	reg_c0_obj_pool = mapping_create_for_id(mapping_id, MAPPING_TYPE_CHAIN,
+						sizeof(struct mlx5_mapped_obj),
+						ESW_REG_C0_USER_DATA_METADATA_MASK,
+						true);
+
 	if (IS_ERR(reg_c0_obj_pool)) {
 		err = PTR_ERR(reg_c0_obj_pool);
 		goto err_pool;
