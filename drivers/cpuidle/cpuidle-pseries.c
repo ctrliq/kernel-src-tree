@@ -23,7 +23,7 @@
 #include <asm/plpar_wrappers.h>
 #include <asm/rtas.h>
 
-struct cpuidle_driver pseries_idle_driver = {
+static struct cpuidle_driver pseries_idle_driver = {
 	.name             = "pseries_idle",
 	.owner            = THIS_MODULE,
 };
