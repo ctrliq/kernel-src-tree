@@ -3497,7 +3497,8 @@ static fastpath_t svm_vcpu_run(struct kvm_vcpu *vcpu)
 	return exit_fastpath;
 }
 
-static void svm_load_mmu_pgd(struct kvm_vcpu *vcpu, unsigned long root)
+static void svm_load_mmu_pgd(struct kvm_vcpu *vcpu, unsigned long root,
+			     int root_level)
 {
 	struct vcpu_svm *svm = to_svm(vcpu);
 	unsigned long cr3;
