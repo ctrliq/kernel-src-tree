@@ -1,0 +1,159 @@
+thunderbolt: Add support for PCIe tunneling disabled (SL5)
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-326.el8
+commit-author Mika Westerberg <mika.westerberg@linux.intel.com>
+commit 3cd542e6e6afb6fa6c34d4094d498f42e22110f5
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-326.el8/3cd542e6.failed
+
+Recent Intel Thunderbolt firmware connection manager has support for
+another security level, SL5, that disables PCIe tunneling. This option
+can be turned on from the BIOS.
+
+When this is set the driver exposes a new security level "nopcie" to the
+userspace and hides the authorized attribute under connected devices.
+
+While there we also hide it when "dponly" security level is enabled
+since it is not really usable in that case anyway.
+
+	Signed-off-by: Mika Westerberg <mika.westerberg@linux.intel.com>
+	Acked-by: Yehezkel Bernat <YehezkelShB@gmail.com>
+(cherry picked from commit 3cd542e6e6afb6fa6c34d4094d498f42e22110f5)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	Documentation/ABI/testing/sysfs-bus-thunderbolt
+#	drivers/thunderbolt/domain.c
+diff --cc Documentation/ABI/testing/sysfs-bus-thunderbolt
+index d11120ebfee7,d7f09d011b6d..000000000000
+--- a/Documentation/ABI/testing/sysfs-bus-thunderbolt
++++ b/Documentation/ABI/testing/sysfs-bus-thunderbolt
+@@@ -65,16 -74,20 +65,22 @@@ Contact:	thunderbolt-software@lists.01.
+  Description:	This attribute holds current Thunderbolt security level
+  		set by the system BIOS. Possible values are:
+  
+ -		=======  ==================================================
+ -		none     All devices are automatically authorized
+ -		user     Devices are only authorized based on writing
+ -		         appropriate value to the authorized attribute
+ -		secure   Require devices that support secure connect at
+ -			 minimum. User needs to authorize each device.
+ -		dponly   Automatically tunnel Display port (and USB). No
+ -			 PCIe tunnels are created.
+ -		usbonly  Automatically tunnel USB controller of the
+ +		none: All devices are automatically authorized
+ +		user: Devices are only authorized based on writing
+ +		      appropriate value to the authorized attribute
+ +		secure: Require devices that support secure connect at
+ +			minimum. User needs to authorize each device.
+ +		dponly: Automatically tunnel Display port (and USB). No
+ +			PCIe tunnels are created.
+ +		usbonly: Automatically tunnel USB controller of the
+  			 connected Thunderbolt dock (and Display Port). All
+  			 PCIe links downstream of the dock are removed.
+++<<<<<<< HEAD
+++=======
++ 		nopcie   USB4 system where PCIe tunneling is disabled from
++ 			 the BIOS.
++ 		=======  ==================================================
+++>>>>>>> 3cd542e6e6af (thunderbolt: Add support for PCIe tunneling disabled (SL5))
+  
+  What: /sys/bus/thunderbolt/devices/.../authorized
+  Date:		Sep 2017
+diff --cc drivers/thunderbolt/domain.c
+index d2b92a8be577,a1c79c9c4f66..000000000000
+--- a/drivers/thunderbolt/domain.c
++++ b/drivers/thunderbolt/domain.c
+@@@ -238,6 -239,22 +239,25 @@@ err_free_str
+  }
+  static DEVICE_ATTR_RW(boot_acl);
+  
+++<<<<<<< HEAD
+++=======
++ static ssize_t deauthorization_show(struct device *dev,
++ 				    struct device_attribute *attr,
++ 				    char *buf)
++ {
++ 	const struct tb *tb = container_of(dev, struct tb, dev);
++ 	bool deauthorization = false;
++ 
++ 	/* Only meaningful if authorization is supported */
++ 	if (tb->security_level == TB_SECURITY_USER ||
++ 	    tb->security_level == TB_SECURITY_SECURE)
++ 		deauthorization = !!tb->cm_ops->disapprove_switch;
++ 
++ 	return sprintf(buf, "%d\n", deauthorization);
++ }
++ static DEVICE_ATTR_RO(deauthorization);
++ 
+++>>>>>>> 3cd542e6e6af (thunderbolt: Add support for PCIe tunneling disabled (SL5))
+  static ssize_t iommu_dma_protection_show(struct device *dev,
+  					 struct device_attribute *attr,
+  					 char *buf)
+* Unmerged path Documentation/ABI/testing/sysfs-bus-thunderbolt
+diff --git a/Documentation/admin-guide/thunderbolt.rst b/Documentation/admin-guide/thunderbolt.rst
+index 613cb24c76c7..67fada48c07b 100644
+--- a/Documentation/admin-guide/thunderbolt.rst
++++ b/Documentation/admin-guide/thunderbolt.rst
+@@ -47,6 +47,9 @@ be DMA masters and thus read contents of the host memory without CPU and OS
+ knowing about it. There are ways to prevent this by setting up an IOMMU but
+ it is not always available for various reasons.
+ 
++Some USB4 systems have a BIOS setting to disable PCIe tunneling. This is
++treated as another security level (nopcie).
++
+ The security levels are as follows:
+ 
+   none
+@@ -77,6 +80,10 @@ The security levels are as follows:
+     Display Port in a dock. All PCIe links downstream of the dock are
+     removed.
+ 
++  nopcie
++    PCIe tunneling is disabled/forbidden from the BIOS. Available in some
++    USB4 systems.
++
+ The current security level can be read from
+ ``/sys/bus/thunderbolt/devices/domainX/security`` where ``domainX`` is
+ the Thunderbolt domain the host controller manages. There is typically
+* Unmerged path drivers/thunderbolt/domain.c
+diff --git a/drivers/thunderbolt/switch.c b/drivers/thunderbolt/switch.c
+index 9dfd930832cf..8b6ce0431e6f 100644
+--- a/drivers/thunderbolt/switch.c
++++ b/drivers/thunderbolt/switch.c
+@@ -1742,7 +1742,11 @@ static umode_t switch_attr_is_visible(struct kobject *kobj,
+ 	struct device *dev = kobj_to_dev(kobj);
+ 	struct tb_switch *sw = tb_to_switch(dev);
+ 
+-	if (attr == &dev_attr_device.attr) {
++	if (attr == &dev_attr_authorized.attr) {
++		if (sw->tb->security_level == TB_SECURITY_NOPCIE ||
++		    sw->tb->security_level == TB_SECURITY_DPONLY)
++			return 0;
++	} else if (attr == &dev_attr_device.attr) {
+ 		if (!sw->device)
+ 			return 0;
+ 	} else if (attr == &dev_attr_device_name.attr) {
+diff --git a/include/linux/thunderbolt.h b/include/linux/thunderbolt.h
+index 034dccf93955..659a0a810fa1 100644
+--- a/include/linux/thunderbolt.h
++++ b/include/linux/thunderbolt.h
+@@ -45,6 +45,8 @@ enum tb_cfg_pkg_type {
+  * @TB_SECURITY_USBONLY: Only tunnel USB controller of the connected
+  *			 Thunderbolt dock (and Display Port). All PCIe
+  *			 links downstream of the dock are removed.
++ * @TB_SECURITY_NOPCIE: For USB4 systems this level is used when the
++ *			PCIe tunneling is disabled from the BIOS.
+  */
+ enum tb_security_level {
+ 	TB_SECURITY_NONE,
+@@ -52,6 +54,7 @@ enum tb_security_level {
+ 	TB_SECURITY_SECURE,
+ 	TB_SECURITY_DPONLY,
+ 	TB_SECURITY_USBONLY,
++	TB_SECURITY_NOPCIE,
+ };
+ 
+ /**
