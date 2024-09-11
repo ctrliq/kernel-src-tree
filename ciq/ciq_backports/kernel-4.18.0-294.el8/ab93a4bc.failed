@@ -1,0 +1,120 @@
+sched/fair: Remove distribute_running from CFS bandwidth
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Josh Don <joshdon@google.com>
+commit ab93a4bc955b3980c699430bc0b633f0d8b607be
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/ab93a4bc.failed
+
+This is mostly a revert of commit:
+
+  baa9be4ffb55 ("sched/fair: Fix throttle_list starvation with low CFS quota")
+
+The primary use of distribute_running was to determine whether to add
+throttled entities to the head or the tail of the throttled list. Now
+that we always add to the tail, we can remove this field.
+
+The other use of distribute_running is in the slack_timer, so that we
+don't start a distribution while one is already running. However, even
+in the event that this race occurs, it is fine to have two distributions
+running (especially now that distribute grabs the cfs_b->lock to
+determine remaining quota before assigning).
+
+	Signed-off-by: Josh Don <joshdon@google.com>
+	Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+	Reviewed-by: Phil Auld <pauld@redhat.com>
+	Tested-by: Phil Auld <pauld@redhat.com>
+Link: https://lkml.kernel.org/r/20200410225208.109717-3-joshdon@google.com
+(cherry picked from commit ab93a4bc955b3980c699430bc0b633f0d8b607be)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	kernel/sched/sched.h
+diff --cc kernel/sched/sched.h
+index 37e9dd93d67c,7198683b2869..000000000000
+--- a/kernel/sched/sched.h
++++ b/kernel/sched/sched.h
+@@@ -348,16 -346,10 +348,22 @@@ struct cfs_bandwidth 
+  	u64			quota;
+  	u64			runtime;
+  	s64			hierarchical_quota;
+ -
+ +	RH_KABI_DEPRECATE(u64, runtime_expires)
+ +	RH_KABI_DEPRECATE(int, expires_seq)
+ +
+ +	RH_KABI_REPLACE_SPLIT(short idle,
+ +				u8 idle,
+ +				u8 period_active)
+ +	RH_KABI_REPLACE_SPLIT(short period_active,
+ +				u8 distribute_running,
+ +				u8 slack_started)
+ +
+++<<<<<<< HEAD
+++=======
++ 	u8			idle;
++ 	u8			period_active;
++ 	u8			slack_started;
+++>>>>>>> ab93a4bc955b (sched/fair: Remove distribute_running from CFS bandwidth)
+  	struct hrtimer		period_timer;
+  	struct hrtimer		slack_timer;
+  	struct list_head	throttled_cfs_rq;
+diff --git a/kernel/sched/fair.c b/kernel/sched/fair.c
+index ac26c9598ae7..8a5481cd9f0f 100644
+--- a/kernel/sched/fair.c
++++ b/kernel/sched/fair.c
+@@ -4933,14 +4933,12 @@ static int do_sched_cfs_period_timer(struct cfs_bandwidth *cfs_b, int overrun, u
+ 	/*
+ 	 * This check is repeated as we release cfs_b->lock while we unthrottle.
+ 	 */
+-	while (throttled && cfs_b->runtime > 0 && !cfs_b->distribute_running) {
+-		cfs_b->distribute_running = 1;
++	while (throttled && cfs_b->runtime > 0) {
+ 		raw_spin_unlock_irqrestore(&cfs_b->lock, flags);
+ 		/* we can't nest cfs_b->lock while distributing bandwidth */
+ 		distribute_cfs_runtime(cfs_b);
+ 		raw_spin_lock_irqsave(&cfs_b->lock, flags);
+ 
+-		cfs_b->distribute_running = 0;
+ 		throttled = !list_empty(&cfs_b->throttled_cfs_rq);
+ 	}
+ 
+@@ -5054,10 +5052,6 @@ static void do_sched_cfs_slack_timer(struct cfs_bandwidth *cfs_b)
+ 	/* confirm we're still not at a refresh boundary */
+ 	raw_spin_lock_irqsave(&cfs_b->lock, flags);
+ 	cfs_b->slack_started = false;
+-	if (cfs_b->distribute_running) {
+-		raw_spin_unlock_irqrestore(&cfs_b->lock, flags);
+-		return;
+-	}
+ 
+ 	if (runtime_refresh_within(cfs_b, min_bandwidth_expiration)) {
+ 		raw_spin_unlock_irqrestore(&cfs_b->lock, flags);
+@@ -5067,9 +5061,6 @@ static void do_sched_cfs_slack_timer(struct cfs_bandwidth *cfs_b)
+ 	if (cfs_b->quota != RUNTIME_INF && cfs_b->runtime > slice)
+ 		runtime = cfs_b->runtime;
+ 
+-	if (runtime)
+-		cfs_b->distribute_running = 1;
+-
+ 	raw_spin_unlock_irqrestore(&cfs_b->lock, flags);
+ 
+ 	if (!runtime)
+@@ -5078,7 +5069,6 @@ static void do_sched_cfs_slack_timer(struct cfs_bandwidth *cfs_b)
+ 	distribute_cfs_runtime(cfs_b);
+ 
+ 	raw_spin_lock_irqsave(&cfs_b->lock, flags);
+-	cfs_b->distribute_running = 0;
+ 	raw_spin_unlock_irqrestore(&cfs_b->lock, flags);
+ }
+ 
+@@ -5220,7 +5210,6 @@ void init_cfs_bandwidth(struct cfs_bandwidth *cfs_b)
+ 	cfs_b->period_timer.function = sched_cfs_period_timer;
+ 	hrtimer_init(&cfs_b->slack_timer, CLOCK_MONOTONIC, HRTIMER_MODE_REL);
+ 	cfs_b->slack_timer.function = sched_cfs_slack_timer;
+-	cfs_b->distribute_running = 0;
+ 	cfs_b->slack_started = false;
+ }
+ 
+* Unmerged path kernel/sched/sched.h
