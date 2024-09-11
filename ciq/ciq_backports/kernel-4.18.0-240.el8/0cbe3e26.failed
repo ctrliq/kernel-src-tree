@@ -1,0 +1,314 @@
+mm: update ptep_modify_prot_start/commit to take vm_area_struct as arg
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Aneesh Kumar K.V <aneesh.kumar@linux.ibm.com>
+commit 0cbe3e26abe0cfe7effb67f620a77d46cce628b2
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/0cbe3e26.failed
+
+Patch series "NestMMU pte upgrade workaround for mprotect", v5.
+
+We can upgrade pte access (R -> RW transition) via mprotect.  We need to
+make sure we follow the recommended pte update sequence as outlined in
+commit bd5050e38aec ("powerpc/mm/radix: Change pte relax sequence to
+handle nest MMU hang") for such updates.  This patch series does that.
+
+This patch (of 5):
+
+Some architectures may want to call flush_tlb_range from these helpers.
+
+Link: http://lkml.kernel.org/r/20190116085035.29729-2-aneesh.kumar@linux.ibm.com
+	Signed-off-by: Aneesh Kumar K.V <aneesh.kumar@linux.ibm.com>
+	Cc: Nicholas Piggin <npiggin@gmail.com>
+	Cc: Benjamin Herrenschmidt <benh@kernel.crashing.org>
+	Cc: Paul Mackerras <paulus@samba.org>
+	Cc: Michael Ellerman <mpe@ellerman.id.au>
+	Cc: Heiko Carstens <heiko.carstens@de.ibm.com>
+	Cc: Martin Schwidefsky <schwidefsky@de.ibm.com>
+	Cc: Ingo Molnar <mingo@elte.hu>
+	Cc: "H. Peter Anvin" <hpa@zytor.com>
+	Cc: Thomas Gleixner <tglx@linutronix.de>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit 0cbe3e26abe0cfe7effb67f620a77d46cce628b2)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/include/asm/paravirt.h
+diff --cc arch/x86/include/asm/paravirt.h
+index 76dbf9fc8714,c5a7f18cce7e..000000000000
+--- a/arch/x86/include/asm/paravirt.h
++++ b/arch/x86/include/asm/paravirt.h
+@@@ -431,21 -427,21 +431,33 @@@ static inline pte_t ptep_modify_prot_st
+  {
+  	pteval_t ret;
+  
+++<<<<<<< HEAD
+ +	ret = PVOP_CALL3(pteval_t, pv_mmu_ops.ptep_modify_prot_start,
+ +			 mm, addr, ptep);
+++=======
++ 	ret = PVOP_CALL3(pteval_t, mmu.ptep_modify_prot_start, vma, addr, ptep);
+++>>>>>>> 0cbe3e26abe0 (mm: update ptep_modify_prot_start/commit to take vm_area_struct as arg)
+  
+  	return (pte_t) { .pte = ret };
+  }
+  
+- static inline void ptep_modify_prot_commit(struct mm_struct *mm, unsigned long addr,
++ static inline void ptep_modify_prot_commit(struct vm_area_struct *vma, unsigned long addr,
+  					   pte_t *ptep, pte_t pte)
+  {
++ 
+  	if (sizeof(pteval_t) > sizeof(long))
+  		/* 5 arg words */
+++<<<<<<< HEAD
+ +		pv_mmu_ops.ptep_modify_prot_commit(mm, addr, ptep, pte);
+ +	else
+ +		PVOP_VCALL4(pv_mmu_ops.ptep_modify_prot_commit,
+ +			    mm, addr, ptep, pte.pte);
+++=======
++ 		pv_ops.mmu.ptep_modify_prot_commit(vma, addr, ptep, pte);
++ 	else
++ 		PVOP_VCALL4(mmu.ptep_modify_prot_commit,
++ 			    vma, addr, ptep, pte.pte);
+++>>>>>>> 0cbe3e26abe0 (mm: update ptep_modify_prot_start/commit to take vm_area_struct as arg)
+  }
+  
+  static inline void set_pte(pte_t *ptep, pte_t pte)
+diff --git a/arch/s390/include/asm/pgtable.h b/arch/s390/include/asm/pgtable.h
+index 78d1a7110bc1..f0bd3e282d30 100644
+--- a/arch/s390/include/asm/pgtable.h
++++ b/arch/s390/include/asm/pgtable.h
+@@ -1080,8 +1080,8 @@ static inline pte_t ptep_get_and_clear(struct mm_struct *mm,
+ }
+ 
+ #define __HAVE_ARCH_PTEP_MODIFY_PROT_TRANSACTION
+-pte_t ptep_modify_prot_start(struct mm_struct *, unsigned long, pte_t *);
+-void ptep_modify_prot_commit(struct mm_struct *, unsigned long, pte_t *, pte_t);
++pte_t ptep_modify_prot_start(struct vm_area_struct *, unsigned long, pte_t *);
++void ptep_modify_prot_commit(struct vm_area_struct *, unsigned long, pte_t *, pte_t);
+ 
+ #define __HAVE_ARCH_PTEP_CLEAR_FLUSH
+ static inline pte_t ptep_clear_flush(struct vm_area_struct *vma,
+diff --git a/arch/s390/mm/pgtable.c b/arch/s390/mm/pgtable.c
+index ae894ac83fd6..620fbb3032bf 100644
+--- a/arch/s390/mm/pgtable.c
++++ b/arch/s390/mm/pgtable.c
+@@ -301,12 +301,13 @@ pte_t ptep_xchg_lazy(struct mm_struct *mm, unsigned long addr,
+ }
+ EXPORT_SYMBOL(ptep_xchg_lazy);
+ 
+-pte_t ptep_modify_prot_start(struct mm_struct *mm, unsigned long addr,
++pte_t ptep_modify_prot_start(struct vm_area_struct *vma, unsigned long addr,
+ 			     pte_t *ptep)
+ {
+ 	pgste_t pgste;
+ 	pte_t old;
+ 	int nodat;
++	struct mm_struct *mm = vma->vm_mm;
+ 
+ 	preempt_disable();
+ 	pgste = ptep_xchg_start(mm, addr, ptep);
+@@ -320,10 +321,11 @@ pte_t ptep_modify_prot_start(struct mm_struct *mm, unsigned long addr,
+ }
+ EXPORT_SYMBOL(ptep_modify_prot_start);
+ 
+-void ptep_modify_prot_commit(struct mm_struct *mm, unsigned long addr,
++void ptep_modify_prot_commit(struct vm_area_struct *vma, unsigned long addr,
+ 			     pte_t *ptep, pte_t pte)
+ {
+ 	pgste_t pgste;
++	struct mm_struct *mm = vma->vm_mm;
+ 
+ 	if (!MACHINE_HAS_NX)
+ 		pte_val(pte) &= ~_PAGE_NOEXEC;
+* Unmerged path arch/x86/include/asm/paravirt.h
+diff --git a/arch/x86/include/asm/paravirt_types.h b/arch/x86/include/asm/paravirt_types.h
+index 84499d90941a..3e12d3196046 100644
+--- a/arch/x86/include/asm/paravirt_types.h
++++ b/arch/x86/include/asm/paravirt_types.h
+@@ -57,6 +57,7 @@ struct task_struct;
+ struct cpumask;
+ struct flush_tlb_info;
+ struct mmu_gather;
++struct vm_area_struct;
+ 
+ /*
+  * Wrapper type for pointers to code which uses the non-standard
+@@ -252,9 +253,9 @@ struct pv_mmu_ops {
+ 			   pte_t *ptep, pte_t pteval);
+ 	void (*set_pmd)(pmd_t *pmdp, pmd_t pmdval);
+ 
+-	pte_t (*ptep_modify_prot_start)(struct mm_struct *mm, unsigned long addr,
++	pte_t (*ptep_modify_prot_start)(struct vm_area_struct *vma, unsigned long addr,
+ 					pte_t *ptep);
+-	void (*ptep_modify_prot_commit)(struct mm_struct *mm, unsigned long addr,
++	void (*ptep_modify_prot_commit)(struct vm_area_struct *vma, unsigned long addr,
+ 					pte_t *ptep, pte_t pte);
+ 
+ 	struct paravirt_callee_save pte_val;
+diff --git a/arch/x86/xen/mmu.h b/arch/x86/xen/mmu.h
+index a7e47cf7ec6c..6e4c6bd62203 100644
+--- a/arch/x86/xen/mmu.h
++++ b/arch/x86/xen/mmu.h
+@@ -17,8 +17,8 @@ bool __set_phys_to_machine(unsigned long pfn, unsigned long mfn);
+ 
+ void set_pte_mfn(unsigned long vaddr, unsigned long pfn, pgprot_t flags);
+ 
+-pte_t xen_ptep_modify_prot_start(struct mm_struct *mm, unsigned long addr, pte_t *ptep);
+-void  xen_ptep_modify_prot_commit(struct mm_struct *mm, unsigned long addr,
++pte_t xen_ptep_modify_prot_start(struct vm_area_struct *vma, unsigned long addr, pte_t *ptep);
++void  xen_ptep_modify_prot_commit(struct vm_area_struct *vma, unsigned long addr,
+ 				  pte_t *ptep, pte_t pte);
+ 
+ unsigned long xen_read_cr2_direct(void);
+diff --git a/arch/x86/xen/mmu_pv.c b/arch/x86/xen/mmu_pv.c
+index 283841f8d9fa..b8ca99b38668 100644
+--- a/arch/x86/xen/mmu_pv.c
++++ b/arch/x86/xen/mmu_pv.c
+@@ -298,20 +298,20 @@ static void xen_set_pte_at(struct mm_struct *mm, unsigned long addr,
+ 	__xen_set_pte(ptep, pteval);
+ }
+ 
+-pte_t xen_ptep_modify_prot_start(struct mm_struct *mm,
++pte_t xen_ptep_modify_prot_start(struct vm_area_struct *vma,
+ 				 unsigned long addr, pte_t *ptep)
+ {
+ 	/* Just return the pte as-is.  We preserve the bits on commit */
+-	trace_xen_mmu_ptep_modify_prot_start(mm, addr, ptep, *ptep);
++	trace_xen_mmu_ptep_modify_prot_start(vma->vm_mm, addr, ptep, *ptep);
+ 	return *ptep;
+ }
+ 
+-void xen_ptep_modify_prot_commit(struct mm_struct *mm, unsigned long addr,
++void xen_ptep_modify_prot_commit(struct vm_area_struct *vma, unsigned long addr,
+ 				 pte_t *ptep, pte_t pte)
+ {
+ 	struct mmu_update u;
+ 
+-	trace_xen_mmu_ptep_modify_prot_commit(mm, addr, ptep, pte);
++	trace_xen_mmu_ptep_modify_prot_commit(vma->vm_mm, addr, ptep, pte);
+ 	xen_mc_batch();
+ 
+ 	u.ptr = virt_to_machine(ptep).maddr | MMU_PT_UPDATE_PRESERVE_AD;
+diff --git a/fs/proc/task_mmu.c b/fs/proc/task_mmu.c
+index 85cefc505c86..cfa320922816 100644
+--- a/fs/proc/task_mmu.c
++++ b/fs/proc/task_mmu.c
+@@ -947,10 +947,10 @@ static inline void clear_soft_dirty(struct vm_area_struct *vma,
+ 	pte_t ptent = *pte;
+ 
+ 	if (pte_present(ptent)) {
+-		ptent = ptep_modify_prot_start(vma->vm_mm, addr, pte);
++		ptent = ptep_modify_prot_start(vma, addr, pte);
+ 		ptent = pte_wrprotect(ptent);
+ 		ptent = pte_clear_soft_dirty(ptent);
+-		ptep_modify_prot_commit(vma->vm_mm, addr, pte, ptent);
++		ptep_modify_prot_commit(vma, addr, pte, ptent);
+ 	} else if (is_swap_pte(ptent)) {
+ 		ptent = pte_swp_clear_soft_dirty(ptent);
+ 		set_pte_at(vma->vm_mm, addr, pte, ptent);
+diff --git a/include/asm-generic/pgtable.h b/include/asm-generic/pgtable.h
+index 6ebca2e305b2..d34567e9c87d 100644
+--- a/include/asm-generic/pgtable.h
++++ b/include/asm-generic/pgtable.h
+@@ -606,7 +606,7 @@ static inline int pmd_none_or_clear_bad(pmd_t *pmd)
+ 	return 0;
+ }
+ 
+-static inline pte_t __ptep_modify_prot_start(struct mm_struct *mm,
++static inline pte_t __ptep_modify_prot_start(struct vm_area_struct *vma,
+ 					     unsigned long addr,
+ 					     pte_t *ptep)
+ {
+@@ -615,10 +615,10 @@ static inline pte_t __ptep_modify_prot_start(struct mm_struct *mm,
+ 	 * non-present, preventing the hardware from asynchronously
+ 	 * updating it.
+ 	 */
+-	return ptep_get_and_clear(mm, addr, ptep);
++	return ptep_get_and_clear(vma->vm_mm, addr, ptep);
+ }
+ 
+-static inline void __ptep_modify_prot_commit(struct mm_struct *mm,
++static inline void __ptep_modify_prot_commit(struct vm_area_struct *vma,
+ 					     unsigned long addr,
+ 					     pte_t *ptep, pte_t pte)
+ {
+@@ -626,7 +626,7 @@ static inline void __ptep_modify_prot_commit(struct mm_struct *mm,
+ 	 * The pte is non-present, so there's no hardware state to
+ 	 * preserve.
+ 	 */
+-	set_pte_at(mm, addr, ptep, pte);
++	set_pte_at(vma->vm_mm, addr, ptep, pte);
+ }
+ 
+ #ifndef __HAVE_ARCH_PTEP_MODIFY_PROT_TRANSACTION
+@@ -644,22 +644,22 @@ static inline void __ptep_modify_prot_commit(struct mm_struct *mm,
+  * queue the update to be done at some later time.  The update must be
+  * actually committed before the pte lock is released, however.
+  */
+-static inline pte_t ptep_modify_prot_start(struct mm_struct *mm,
++static inline pte_t ptep_modify_prot_start(struct vm_area_struct *vma,
+ 					   unsigned long addr,
+ 					   pte_t *ptep)
+ {
+-	return __ptep_modify_prot_start(mm, addr, ptep);
++	return __ptep_modify_prot_start(vma, addr, ptep);
+ }
+ 
+ /*
+  * Commit an update to a pte, leaving any hardware-controlled bits in
+  * the PTE unmodified.
+  */
+-static inline void ptep_modify_prot_commit(struct mm_struct *mm,
++static inline void ptep_modify_prot_commit(struct vm_area_struct *vma,
+ 					   unsigned long addr,
+ 					   pte_t *ptep, pte_t pte)
+ {
+-	__ptep_modify_prot_commit(mm, addr, ptep, pte);
++	__ptep_modify_prot_commit(vma, addr, ptep, pte);
+ }
+ #endif /* __HAVE_ARCH_PTEP_MODIFY_PROT_TRANSACTION */
+ #endif /* CONFIG_MMU */
+diff --git a/mm/memory.c b/mm/memory.c
+index cb40d471f31c..d742afb40e74 100644
+--- a/mm/memory.c
++++ b/mm/memory.c
+@@ -3900,12 +3900,12 @@ static vm_fault_t do_numa_page(struct vm_fault *vmf)
+ 	 * Make it present again, Depending on how arch implementes non
+ 	 * accessible ptes, some can allow access by kernel mode.
+ 	 */
+-	pte = ptep_modify_prot_start(vma->vm_mm, vmf->address, vmf->pte);
++	pte = ptep_modify_prot_start(vma, vmf->address, vmf->pte);
+ 	pte = pte_modify(pte, vma->vm_page_prot);
+ 	pte = pte_mkyoung(pte);
+ 	if (was_writable)
+ 		pte = pte_mkwrite(pte);
+-	ptep_modify_prot_commit(vma->vm_mm, vmf->address, vmf->pte, pte);
++	ptep_modify_prot_commit(vma, vmf->address, vmf->pte, pte);
+ 	update_mmu_cache(vma, vmf->address, vmf->pte);
+ 
+ 	page = vm_normal_page(vma, vmf->address, pte);
+diff --git a/mm/mprotect.c b/mm/mprotect.c
+index 86837f25055b..89b4c8153c13 100644
+--- a/mm/mprotect.c
++++ b/mm/mprotect.c
+@@ -110,7 +110,7 @@ static unsigned long change_pte_range(struct vm_area_struct *vma, pmd_t *pmd,
+ 					continue;
+ 			}
+ 
+-			ptent = ptep_modify_prot_start(mm, addr, pte);
++			ptent = ptep_modify_prot_start(vma, addr, pte);
+ 			ptent = pte_modify(ptent, newprot);
+ 			if (preserve_write)
+ 				ptent = pte_mk_savedwrite(ptent);
+@@ -121,7 +121,7 @@ static unsigned long change_pte_range(struct vm_area_struct *vma, pmd_t *pmd,
+ 					 !(vma->vm_flags & VM_SOFTDIRTY))) {
+ 				ptent = pte_mkwrite(ptent);
+ 			}
+-			ptep_modify_prot_commit(mm, addr, pte, ptent);
++			ptep_modify_prot_commit(vma, addr, pte, ptent);
+ 			pages++;
+ 		} else if (IS_ENABLED(CONFIG_MIGRATION)) {
+ 			swp_entry_t entry = pte_to_swp_entry(oldpte);
