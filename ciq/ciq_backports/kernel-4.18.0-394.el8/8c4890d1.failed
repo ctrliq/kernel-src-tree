@@ -1,0 +1,253 @@
+smp, irq_work: Continue smp_call_function*() and irq_work*() integration
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-394.el8
+commit-author Peter Zijlstra <peterz@infradead.org>
+commit 8c4890d1c3358fb8023d46e1e554c41d54f02878
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-394.el8/8c4890d1.failed
+
+Instead of relying on BUG_ON() to ensure the various data structures
+line up, use a bunch of horrible unions to make it all automatic.
+
+Much of the union magic is to ensure irq_work and smp_call_function do
+not (yet) see the members of their respective data structures change
+name.
+
+	Suggested-by: Linus Torvalds <torvalds@linux-foundation.org>
+	Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+	Signed-off-by: Ingo Molnar <mingo@kernel.org>
+	Reviewed-by: Frederic Weisbecker <frederic@kernel.org>
+Link: https://lkml.kernel.org/r/20200622100825.844455025@infradead.org
+(cherry picked from commit 8c4890d1c3358fb8023d46e1e554c41d54f02878)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/irq_work.h
+#	include/linux/sched.h
+#	include/linux/smp.h
+#	kernel/sched/core.c
+#	kernel/smp.c
+diff --cc include/linux/irq_work.h
+index 52859a85ce23,30823780c192..000000000000
+--- a/include/linux/irq_work.h
++++ b/include/linux/irq_work.h
+@@@ -2,8 -2,7 +2,12 @@@
+  #ifndef _LINUX_IRQ_WORK_H
+  #define _LINUX_IRQ_WORK_H
+  
+++<<<<<<< HEAD
+ +#include <linux/llist.h>
+ +#include <linux/rh_kabi.h>
+++=======
++ #include <linux/smp_types.h>
+++>>>>>>> 8c4890d1c335 (smp, irq_work: Continue smp_call_function*() and irq_work*() integration)
+  
+  /*
+   * An entry can be in one of four states:
+@@@ -14,19 -13,14 +18,30 @@@
+   * busy      NULL, 2 -> {free, claimed} : callback in progress, can be claimed
+   */
+  
+++<<<<<<< HEAD
+ +#define IRQ_WORK_PENDING	BIT(0)
+ +#define IRQ_WORK_BUSY		BIT(1)
+ +
+ +/* Doesn't want IPI, wait for tick: */
+ +#define IRQ_WORK_LAZY		BIT(2)
+ +/* Run hard IRQ context, even on RT */
+ +#define IRQ_WORK_HARD_IRQ	BIT(3)
+ +
+ +#define IRQ_WORK_CLAIMED	(IRQ_WORK_PENDING | IRQ_WORK_BUSY)
+ +
+ +struct irq_work {
+ +	RH_KABI_REPLACE(unsigned long flags, atomic_t flags)
+ +	struct llist_node llnode;
+++=======
++ struct irq_work {
++ 	union {
++ 		struct __call_single_node node;
++ 		struct {
++ 			struct llist_node llnode;
++ 			atomic_t flags;
++ 		};
++ 	};
+++>>>>>>> 8c4890d1c335 (smp, irq_work: Continue smp_call_function*() and irq_work*() integration)
+  	void (*func)(struct irq_work *);
+  };
+  
+diff --cc include/linux/sched.h
+index 6d61d76e88d8,692e327d7455..000000000000
+--- a/include/linux/sched.h
++++ b/include/linux/sched.h
+@@@ -736,8 -654,8 +736,12 @@@ struct task_struct 
+  	unsigned int			ptrace;
+  
+  #ifdef CONFIG_SMP
+++<<<<<<< HEAD
+ +	struct llist_node		wake_entry;
+++=======
+++>>>>>>> 8c4890d1c335 (smp, irq_work: Continue smp_call_function*() and irq_work*() integration)
+  	int				on_cpu;
++ 	struct __call_single_node	wake_entry;
+  #ifdef CONFIG_THREAD_INFO_IN_TASK
+  	/* Current CPU: */
+  	unsigned int			cpu;
+diff --cc include/linux/smp.h
+index f30fcf12cc27,80d557ef8a11..000000000000
+--- a/include/linux/smp.h
++++ b/include/linux/smp.h
+@@@ -16,11 -16,20 +16,26 @@@
+  
+  typedef void (*smp_call_func_t)(void *info);
+  typedef bool (*smp_cond_func_t)(int cpu, void *info);
+++<<<<<<< HEAD
+ +struct __call_single_data {
+ +	struct llist_node llist;
+++=======
++ 
++ /*
++  * structure shares (partial) layout with struct irq_work
++  */
++ struct __call_single_data {
++ 	union {
++ 		struct __call_single_node node;
++ 		struct {
++ 			struct llist_node llist;
++ 			unsigned int flags;
++ 		};
++ 	};
+++>>>>>>> 8c4890d1c335 (smp, irq_work: Continue smp_call_function*() and irq_work*() integration)
+  	smp_call_func_t func;
+  	void *info;
+ +	unsigned int flags;
+  };
+  
+  /* Use __aligned() to avoid to use 2 cache lines for 1 csd */
+diff --cc kernel/sched/core.c
+index 631f3e8030ae,ca5db40392d4..000000000000
+--- a/kernel/sched/core.c
++++ b/kernel/sched/core.c
+@@@ -2418,12 -2328,8 +2418,17 @@@ static void __ttwu_queue_wakelist(struc
+  
+  	p->sched_remote_wakeup = !!(wake_flags & WF_MIGRATED);
+  
+++<<<<<<< HEAD
+ +	if (llist_add(&p->wake_entry, &rq->wake_list)) {
+ +		if (!set_nr_if_polling(rq->idle))
+ +			smp_call_function_single_async(cpu, &rq->wake_csd);
+ +		else
+ +			trace_sched_wake_idle_without_ipi(cpu);
+ +	}
+++=======
++ 	WRITE_ONCE(rq->ttwu_pending, 1);
++ 	__smp_call_single_queue(cpu, &p->wake_entry.llist);
+++>>>>>>> 8c4890d1c335 (smp, irq_work: Continue smp_call_function*() and irq_work*() integration)
+  }
+  
+  void wake_up_if_idle(int cpu)
+@@@ -2967,7 -2786,7 +2972,11 @@@ static void __sched_fork(unsigned long 
+  #endif
+  	init_numa_balancing(clone_flags, p);
+  #ifdef CONFIG_SMP
+++<<<<<<< HEAD
+ +	p->migration_pending = NULL;
+++=======
++ 	p->wake_entry.u_flags = CSD_TYPE_TTWU;
+++>>>>>>> 8c4890d1c335 (smp, irq_work: Continue smp_call_function*() and irq_work*() integration)
+  #endif
+  }
+  
+diff --cc kernel/smp.c
+index db3e44b3aed3,aa17eedff5be..000000000000
+--- a/kernel/smp.c
++++ b/kernel/smp.c
+@@@ -602,7 -668,6 +602,10 @@@ void __init setup_nr_cpu_ids(void
+  void __init smp_init(void)
+  {
+  	int num_nodes, num_cpus;
+++<<<<<<< HEAD
+ +	unsigned int cpu;
+++=======
+++>>>>>>> 8c4890d1c335 (smp, irq_work: Continue smp_call_function*() and irq_work*() integration)
+  
+  	idle_threads_init();
+  	cpuhp_threads_init();
+* Unmerged path include/linux/irq_work.h
+* Unmerged path include/linux/sched.h
+* Unmerged path include/linux/smp.h
+diff --git a/include/linux/smp_types.h b/include/linux/smp_types.h
+new file mode 100644
+index 000000000000..364b3ae3e41d
+--- /dev/null
++++ b/include/linux/smp_types.h
+@@ -0,0 +1,66 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++#ifndef __LINUX_SMP_TYPES_H
++#define __LINUX_SMP_TYPES_H
++
++#include <linux/llist.h>
++
++enum {
++	CSD_FLAG_LOCK		= 0x01,
++
++	IRQ_WORK_PENDING	= 0x01,
++	IRQ_WORK_BUSY		= 0x02,
++	IRQ_WORK_LAZY		= 0x04, /* No IPI, wait for tick */
++	IRQ_WORK_HARD_IRQ	= 0x08, /* IRQ context on PREEMPT_RT */
++
++	IRQ_WORK_CLAIMED	= (IRQ_WORK_PENDING | IRQ_WORK_BUSY),
++
++	CSD_TYPE_ASYNC		= 0x00,
++	CSD_TYPE_SYNC		= 0x10,
++	CSD_TYPE_IRQ_WORK	= 0x20,
++	CSD_TYPE_TTWU		= 0x30,
++
++	CSD_FLAG_TYPE_MASK	= 0xF0,
++};
++
++/*
++ * struct __call_single_node is the primary type on
++ * smp.c:call_single_queue.
++ *
++ * flush_smp_call_function_queue() only reads the type from
++ * __call_single_node::u_flags as a regular load, the above
++ * (anonymous) enum defines all the bits of this word.
++ *
++ * Other bits are not modified until the type is known.
++ *
++ * CSD_TYPE_SYNC/ASYNC:
++ *	struct {
++ *		struct llist_node node;
++ *		unsigned int flags;
++ *		smp_call_func_t func;
++ *		void *info;
++ *	};
++ *
++ * CSD_TYPE_IRQ_WORK:
++ *	struct {
++ *		struct llist_node node;
++ *		atomic_t flags;
++ *		void (*func)(struct irq_work *);
++ *	};
++ *
++ * CSD_TYPE_TTWU:
++ *	struct {
++ *		struct llist_node node;
++ *		unsigned int flags;
++ *	};
++ *
++ */
++
++struct __call_single_node {
++	struct llist_node	llist;
++	union {
++		unsigned int	u_flags;
++		atomic_t	a_flags;
++	};
++};
++
++#endif /* __LINUX_SMP_TYPES_H */
+* Unmerged path kernel/sched/core.c
+* Unmerged path kernel/smp.c
