@@ -1,0 +1,87 @@
+cgroup: never call do_group_exit() with task->frozen bit set
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-147.el8
+commit-author Roman Gushchin <guro@fb.com>
+commit f2b31bb598248c04721cb8485e6091a9feb045ac
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-147.el8/f2b31bb5.failed
+
+I've got two independent reports that cgroup_task_frozen() check
+in cgroup_exit() has been triggered by lkp libhugetlbfs-test and
+LTP ptrace01 tests.
+
+For example:
+[   44.576072] WARNING: CPU: 1 PID: 3028 at kernel/cgroup/cgroup.c:5932 cgroup_exit+0x148/0x160
+[   44.577724] Modules linked in: crct10dif_pclmul crc32_pclmul crc32c_intel ghash_clmulni_intel sr_mod cdrom
+bochs_drm sg ttm ata_generic pata_acpi ppdev drm_kms_helper snd_pcm syscopyarea aesni_intel snd_timer
+sysfillrect sysimgblt snd crypto_simd cryptd glue_helper soundcore fb_sys_fops joydev drm serio_raw pcspkr
+ata_piix libata i2c_piix4 floppy parport_pc parport ip_tables
+[   44.583106] CPU: 1 PID: 3028 Comm: ptrace-write-hu Not tainted 5.1.0-rc3-00053-g9262503 #5
+[   44.584600] Hardware name: QEMU Standard PC (i440FX + PIIX, 1996), BIOS 1.10.2-1 04/01/2014
+[   44.586116] RIP: 0010:cgroup_exit+0x148/0x160
+[   44.587135] Code: 0f 84 50 ff ff ff 48 8b 85 c8 0c 00 00 48 8b 78 70 e8 ec 2e 00 00 e9 3b ff ff ff f0 ff 43 60
+0f 88 72 21 89 00 e9 48 ff ff ff <0f> 0b e9 1b ff ff ff e8 3c 73 f4 ff 66 90 66 2e 0f 1f 84 00 00 00
+[   44.590113] RSP: 0018:ffffb25702dcfd30 EFLAGS: 00010002
+[   44.591167] RAX: ffff96a7fee32410 RBX: ffff96a7ff1d6000 RCX: dead000000000200
+[   44.592446] RDX: ffff96a7ff1d6080 RSI: ffff96a7fec75290 RDI: ffff96a7fec75290
+[   44.593715] RBP: ffff96a7fec745c0 R08: ffff96a7fec74658 R09: 0000000000000000
+[   44.594985] R10: 0000000000000000 R11: 0000000000000001 R12: ffff96a7fec75101
+[   44.596266] R13: ffff96a7fec745c0 R14: ffff96a7ff3bde30 R15: ffff96a7fec75130
+[   44.597550] FS:  0000000000000000(0000) GS:ffff96a7dd700000(0000) knlGS:0000000000000000
+[   44.598950] CS:  0010 DS: 002b ES: 002b CR0: 0000000080050033
+[   44.600098] CR2: 00000000f7a00000 CR3: 000000000d20e000 CR4: 00000000000406e0
+[   44.601417] Call Trace:
+[   44.602777]  do_exit+0x337/0xc40
+[   44.603677]  do_group_exit+0x3a/0xa0
+[   44.604610]  get_signal+0x12e/0x8d0
+[   44.605533]  ? __switch_to_asm+0x40/0x70
+[   44.606503]  do_signal+0x36/0x650
+[   44.607409]  ? __switch_to_asm+0x40/0x70
+[   44.608383]  ? __schedule+0x267/0x860
+[   44.609329]  exit_to_usermode_loop+0x89/0xf0
+[   44.610349]  do_fast_syscall_32+0x251/0x2e3
+[   44.611357]  entry_SYSENTER_compat+0x7f/0x91
+[   44.612376] ---[ end trace e4ca5cfc4b7f7964 ]---
+
+The problem is caused by the ptrace_signal() call in the for loop
+in get_signal(). There is a cgroup_enter_frozen() call inside
+ptrace_signal(), so after exit from ptrace_signal() the task->frozen
+bit might be set. In this case do_group_exit() can be called with the
+task->frozen bit set and trigger the warning. This is only place where
+we can leave the loop with the task->frozen bit set and without
+setting JOBCTL_TRAP_FREEZE and TIF_SIGPENDING.
+
+To resolve this problem, let's move cgroup_leave_frozen(true) call to
+just after the fatal label. If the task is going to die, the frozen
+bit must be cleared no matter how we get into this point.
+
+	Reported-by: kernel test robot <rong.a.chen@intel.com>
+	Reported-by: Qian Cai <cai@lca.pw>
+	Cc: Oleg Nesterov <oleg@redhat.com>
+	Cc: Tejun Heo <tj@kernel.org>
+	Signed-off-by: Roman Gushchin <guro@fb.com>
+	Signed-off-by: Tejun Heo <tj@kernel.org>
+(cherry picked from commit f2b31bb598248c04721cb8485e6091a9feb045ac)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	kernel/signal.c
+diff --cc kernel/signal.c
+index 99d3b75cccbf,8607b11ff936..000000000000
+--- a/kernel/signal.c
++++ b/kernel/signal.c
+@@@ -2548,6 -2606,8 +2548,11 @@@ relock
+  
+  	fatal:
+  		spin_unlock_irq(&sighand->siglock);
+++<<<<<<< HEAD
+++=======
++ 		if (unlikely(cgroup_task_frozen(current)))
++ 			cgroup_leave_frozen(true);
+++>>>>>>> f2b31bb59824 (cgroup: never call do_group_exit() with task->frozen bit set)
+  
+  		/*
+  		 * Anything else is fatal, maybe with a core dump.
+* Unmerged path kernel/signal.c
