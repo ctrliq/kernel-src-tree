@@ -1,0 +1,224 @@
+net/tls: fix no wakeup on partial reads
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-147.el8
+Rebuild_CHGLOG: - [net] tls: fix no wakeup on partial reads (Sabrina Dubroca) [1711821]
+Rebuild_FUZZ: 94.59%
+commit-author Jakub Kicinski <jakub.kicinski@netronome.com>
+commit 04b25a5411f966c2e586909a8496553b71876fae
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-147.el8/04b25a54.failed
+
+When tls_sw_recvmsg() partially copies a record it pops that
+record from ctx->recv_pkt and places it on rx_list.
+
+Next iteration of tls_sw_recvmsg() reads from rx_list via
+process_rx_list() before it enters the decryption loop.
+If there is no more records to be read tls_wait_data()
+will put the process on the wait queue and got to sleep.
+This is incorrect, because some data was already copied
+in process_rx_list().
+
+In case of RPC connections process may never get woken up,
+because peer also simply blocks in read().
+
+I think this may also fix a similar issue when BPF is at
+play, because after __tcp_bpf_recvmsg() returns some data
+we subtract it from len and use continue to restart the
+loop, but len could have just reached 0, so again we'd
+sleep unnecessarily. That's added by:
+commit d3b18ad31f93 ("tls: add bpf support to sk_msg handling")
+
+Fixes: 692d7b5d1f91 ("tls: Fix recvmsg() to be able to peek across multiple records")
+	Reported-by: David Beckett <david.beckett@netronome.com>
+	Signed-off-by: Jakub Kicinski <jakub.kicinski@netronome.com>
+	Reviewed-by: Dirk van der Merwe <dirk.vandermerwe@netronome.com>
+	Tested-by: David Beckett <david.beckett@netronome.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 04b25a5411f966c2e586909a8496553b71876fae)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/tls/tls_sw.c
+diff --cc net/tls/tls_sw.c
+index 3f443983a6b3,960494f437ac..000000000000
+--- a/net/tls/tls_sw.c
++++ b/net/tls/tls_sw.c
+@@@ -1312,18 -1699,54 +1312,24 @@@ int tls_sw_recvmsg(struct sock *sk
+  	if (unlikely(flags & MSG_ERRQUEUE))
+  		return sock_recv_errqueue(sk, msg, len, SOL_IP, IP_RECVERR);
+  
+ -	psock = sk_psock_get(sk);
+  	lock_sock(sk);
+  
+ -	/* Process pending decrypted records. It must be non-zero-copy */
+ -	err = process_rx_list(ctx, msg, &control, &cmsg, 0, len, false,
+ -			      is_peek);
+ -	if (err < 0) {
+ -		tls_err_abort(sk, err);
+ -		goto end;
+ -	} else {
+ -		copied = err;
+ -	}
+ -
+ -	if (len <= copied)
+ -		goto recv_end;
+ -
+  	target = sock_rcvlowat(sk, flags & MSG_WAITALL, len);
+ -	len = len - copied;
+  	timeo = sock_rcvtimeo(sk, flags & MSG_DONTWAIT);
+++<<<<<<< HEAD
+ +	do {
+++=======
++ 
++ 	while (len && (decrypted + copied < target || ctx->recv_pkt)) {
++ 		bool retain_skb = false;
+++>>>>>>> 04b25a5411f9 (net/tls: fix no wakeup on partial reads)
+  		bool zc = false;
+ -		int to_decrypt;
+ -		int chunk = 0;
+ -		bool async_capable;
+  		bool async = false;
+ +		int chunk = 0;
+  
+ -		skb = tls_wait_data(sk, psock, flags, timeo, &err);
+ -		if (!skb) {
+ -			if (psock) {
+ -				int ret = __tcp_bpf_recvmsg(sk, psock,
+ -							    msg, len, flags);
+ -
+ -				if (ret > 0) {
+ -					decrypted += ret;
+ -					len -= ret;
+ -					continue;
+ -				}
+ -			}
+ +		skb = tls_wait_data(sk, flags, timeo, &err);
+ +		if (!skb)
+  			goto recv_end;
+ -		} else {
+ -			tlm = tls_msg(skb);
+ -			if (prot->version == TLS_1_3_VERSION)
+ -				tlm->control = 0;
+ -			else
+ -				tlm->control = ctx->control;
+ -		}
+  
+  		rxm = strp_msg(skb);
+  
+@@@ -1340,76 -1802,55 +1346,80 @@@
+  					goto recv_end;
+  				}
+  			}
+ +		} else if (control != ctx->control) {
+ +			goto recv_end;
+  		}
+  
+ -		if (async)
+ -			goto pick_next_record;
+ +		if (!ctx->decrypted) {
+ +			int to_copy = rxm->full_len - tls_ctx->rx.overhead_size;
+  
+ -		if (!zc) {
+ -			if (rxm->full_len > len) {
+ -				retain_skb = true;
+ -				chunk = len;
+ -			} else {
+ -				chunk = rxm->full_len;
+ -			}
+ +			if (!is_kvec && to_copy <= len &&
+ +			    likely(!(flags & MSG_PEEK)))
+ +				zc = true;
+  
+ -			err = skb_copy_datagram_msg(skb, rxm->offset,
+ -						    msg, chunk);
+ -			if (err < 0)
+ +			err = decrypt_skb_update(sk, skb, &msg->msg_iter,
+ +						 &chunk, &zc);
+ +			if (err < 0 && err != -EINPROGRESS) {
+ +				tls_err_abort(sk, EBADMSG);
+  				goto recv_end;
+ +			}
+  
+ -			if (!is_peek) {
+ -				rxm->offset = rxm->offset + chunk;
+ -				rxm->full_len = rxm->full_len - chunk;
+ +			if (err == -EINPROGRESS) {
+ +				async = true;
+ +				num_async++;
+ +				goto pick_next_record;
+  			}
+ -		}
+  
+ -pick_next_record:
+ -		if (chunk > len)
+ -			chunk = len;
+ +			ctx->decrypted = true;
+ +		}
+  
+ -		decrypted += chunk;
+ -		len -= chunk;
+ +		if (!zc) {
+ +			chunk = min_t(unsigned int, rxm->full_len, len);
+  
+ -		/* For async or peek case, queue the current skb */
+ -		if (async || is_peek || retain_skb) {
+ -			skb_queue_tail(&ctx->rx_list, skb);
+ -			skb = NULL;
+ +			err = skb_copy_datagram_msg(skb, rxm->offset, msg,
+ +						    chunk);
+ +			if (err < 0)
+ +				goto recv_end;
+  		}
+  
+ -		if (tls_sw_advance_skb(sk, skb, chunk)) {
+ -			/* Return full control message to
+ -			 * userspace before trying to parse
+ -			 * another message type
+ -			 */
+ -			msg->msg_flags |= MSG_EOR;
+ -			if (ctx->control != TLS_RECORD_TYPE_DATA)
+ -				goto recv_end;
+ +pick_next_record:
+ +		copied += chunk;
+ +		len -= chunk;
+ +		if (likely(!(flags & MSG_PEEK))) {
+ +			u8 control = ctx->control;
+ +
+ +			/* For async, drop current skb reference */
+ +			if (async)
+ +				skb = NULL;
+ +
+ +			if (tls_sw_advance_skb(sk, skb, chunk)) {
+ +				/* Return full control message to
+ +				 * userspace before trying to parse
+ +				 * another message type
+ +				 */
+ +				msg->msg_flags |= MSG_EOR;
+ +				if (control != TLS_RECORD_TYPE_DATA)
+ +					goto recv_end;
+ +			} else {
+ +				break;
+ +			}
+  		} else {
+ +			/* MSG_PEEK right now cannot look beyond current skb
+ +			 * from strparser, meaning we cannot advance skb here
+ +			 * and thus unpause strparser since we'd loose original
+ +			 * one.
+ +			 */
+  			break;
+  		}
+++<<<<<<< HEAD
+ +
+ +		/* If we have a new message from strparser, continue now. */
+ +		if (copied >= target && !ctx->recv_pkt)
+ +			break;
+ +	} while (len);
+++=======
++ 	}
+++>>>>>>> 04b25a5411f9 (net/tls: fix no wakeup on partial reads)
+  
+  recv_end:
+  	if (num_async) {
+* Unmerged path net/tls/tls_sw.c
