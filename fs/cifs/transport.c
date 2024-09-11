@@ -453,8 +453,8 @@ smb_send(struct TCP_Server_Info *server, struct smb_hdr *smb_buffer,
 }
 
 static int
-wait_for_free_credits(struct TCP_Server_Info *server, const int flags,
-		      unsigned int *instance)
+wait_for_free_credits(struct TCP_Server_Info *server, const int num_credits,
+		      const int flags, unsigned int *instance)
 {
 	int rc;
 	int *credits;
@@ -480,11 +480,11 @@ wait_for_free_credits(struct TCP_Server_Info *server, const int flags,
 	}
 
 	while (1) {
-		if (*credits <= 0) {
+		if (*credits < num_credits) {
 			spin_unlock(&server->req_lock);
 			cifs_num_waiters_inc(server);
 			rc = wait_event_killable(server->request_q,
-						 has_credits(server, credits));
+				has_credits(server, credits, num_credits));
 			cifs_num_waiters_dec(server);
 			if (rc)
 				return rc;
@@ -502,8 +502,8 @@ wait_for_free_credits(struct TCP_Server_Info *server, const int flags,
 
 			/* update # of requests on the wire to server */
 			if ((flags & CIFS_TIMEOUT_MASK) != CIFS_BLOCKING_OP) {
-				*credits -= 1;
-				server->in_flight++;
+				*credits -= num_credits;
+				server->in_flight += num_credits;
 				*instance = server->reconnect_instance;
 			}
 			spin_unlock(&server->req_lock);
@@ -517,7 +517,7 @@ static int
 wait_for_free_request(struct TCP_Server_Info *server, const int flags,
 		      unsigned int *instance)
 {
-	return wait_for_free_credits(server, flags, instance);
+	return wait_for_free_credits(server, 1, flags, instance);
 }
 
 int
