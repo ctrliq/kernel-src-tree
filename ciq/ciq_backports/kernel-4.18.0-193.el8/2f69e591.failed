@@ -1,0 +1,234 @@
+{IB, net}/mlx5: E-Switch, Use index of rep for vport to IB port mapping
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-193.el8
+commit-author Bodong Wang <bodong@mellanox.com>
+commit 2f69e591e4531d3192841a4eb2bd9b512f5a8b66
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-193.el8/2f69e591.failed
+
+In the single IB device mode, the mapping between vport number and
+rep relies on a counter. However for dynamic vport allocation, it is
+desired to keep consistent map of eswitch vport and IB port.
+
+Hence, simplify code to remove the free running counter and instead
+use the available vport index during load/unload sequence from the
+eswitch.
+
+	Signed-off-by: Bodong Wang <bodong@mellanox.com>
+	Suggested-by: Parav Pandit <parav@mellanox.com>
+	Reviewed-by: Parav Pandit <parav@mellanox.com>
+	Reviewed-by: Mark Bloch <markb@mellanox.com>
+	Signed-off-by: Saeed Mahameed <saeedm@mellanox.com>
+(cherry picked from commit 2f69e591e4531d3192841a4eb2bd9b512f5a8b66)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/infiniband/hw/mlx5/ib_rep.c
+#	drivers/net/ethernet/mellanox/mlx5/core/eswitch_offloads.c
+diff --cc drivers/infiniband/hw/mlx5/ib_rep.c
+index 95ac97af6166,1de16a93fc64..000000000000
+--- a/drivers/infiniband/hw/mlx5/ib_rep.c
++++ b/drivers/infiniband/hw/mlx5/ib_rep.c
+@@@ -6,53 -6,22 +6,66 @@@
+  #include "ib_rep.h"
+  #include "srq.h"
+  
+ +static const struct mlx5_ib_profile rep_profile = {
+ +	STAGE_CREATE(MLX5_IB_STAGE_INIT,
+ +		     mlx5_ib_stage_init_init,
+ +		     mlx5_ib_stage_init_cleanup),
+ +	STAGE_CREATE(MLX5_IB_STAGE_FLOW_DB,
+ +		     mlx5_ib_stage_rep_flow_db_init,
+ +		     NULL),
+ +	STAGE_CREATE(MLX5_IB_STAGE_CAPS,
+ +		     mlx5_ib_stage_caps_init,
+ +		     NULL),
+ +	STAGE_CREATE(MLX5_IB_STAGE_NON_DEFAULT_CB,
+ +		     mlx5_ib_stage_rep_non_default_cb,
+ +		     NULL),
+ +	STAGE_CREATE(MLX5_IB_STAGE_ROCE,
+ +		     mlx5_ib_stage_rep_roce_init,
+ +		     mlx5_ib_stage_rep_roce_cleanup),
+ +	STAGE_CREATE(MLX5_IB_STAGE_SRQ,
+ +		     mlx5_init_srq_table,
+ +		     mlx5_cleanup_srq_table),
+ +	STAGE_CREATE(MLX5_IB_STAGE_DEVICE_RESOURCES,
+ +		     mlx5_ib_stage_dev_res_init,
+ +		     mlx5_ib_stage_dev_res_cleanup),
+ +	STAGE_CREATE(MLX5_IB_STAGE_COUNTERS,
+ +		     mlx5_ib_stage_counters_init,
+ +		     mlx5_ib_stage_counters_cleanup),
+ +	STAGE_CREATE(MLX5_IB_STAGE_BFREG,
+ +		     mlx5_ib_stage_bfrag_init,
+ +		     mlx5_ib_stage_bfrag_cleanup),
+ +	STAGE_CREATE(MLX5_IB_STAGE_PRE_IB_REG_UMR,
+ +		     NULL,
+ +		     mlx5_ib_stage_pre_ib_reg_umr_cleanup),
+ +	STAGE_CREATE(MLX5_IB_STAGE_IB_REG,
+ +		     mlx5_ib_stage_ib_reg_init,
+ +		     mlx5_ib_stage_ib_reg_cleanup),
+ +	STAGE_CREATE(MLX5_IB_STAGE_POST_IB_REG_UMR,
+ +		     mlx5_ib_stage_post_ib_reg_umr_init,
+ +		     NULL),
+ +};
+ +
+  static int
+ -mlx5_ib_set_vport_rep(struct mlx5_core_dev *dev, struct mlx5_eswitch_rep *rep)
+ +mlx5_ib_nic_rep_load(struct mlx5_core_dev *dev, struct mlx5_eswitch_rep *rep)
+  {
+  	struct mlx5_ib_dev *ibdev;
+++<<<<<<< HEAD
+++=======
++ 	int vport_index;
++ 
++ 	ibdev = mlx5_ib_get_uplink_ibdev(dev->priv.eswitch);
++ 	vport_index = rep->vport_index;
++ 
++ 	ibdev->port[vport_index].rep = rep;
++ 	write_lock(&ibdev->port[vport_index].roce.netdev_lock);
++ 	ibdev->port[vport_index].roce.netdev =
++ 		mlx5_ib_get_rep_netdev(dev->priv.eswitch, rep->vport);
++ 	write_unlock(&ibdev->port[vport_index].roce.netdev_lock);
+++>>>>>>> 2f69e591e453 ({IB, net}/mlx5: E-Switch, Use index of rep for vport to IB port mapping)
+  
+ +	ibdev = mlx5_ib_rep_to_dev(rep);
+ +	if (!__mlx5_ib_add(ibdev, ibdev->profile))
+ +		return -EINVAL;
+  	return 0;
+  }
+  
+@@@ -74,16 -42,25 +87,31 @@@ mlx5_ib_vport_rep_load(struct mlx5_core
+  	if (!ibdev)
+  		return -ENOMEM;
+  
+ -	ibdev->port = kcalloc(num_ports, sizeof(*ibdev->port),
+ -			      GFP_KERNEL);
+ -	if (!ibdev->port) {
+ +	ibdev->rep = rep;
+ +	ibdev->mdev = dev;
+ +	ibdev->num_ports = max(MLX5_CAP_GEN(dev, num_ports),
+ +			       MLX5_CAP_GEN(dev, num_vhca_ports));
+ +	if (!__mlx5_ib_add(ibdev, &rep_profile)) {
+  		ib_dealloc_device(&ibdev->ib_dev);
+ -		return -ENOMEM;
+ +		return -EINVAL;
+  	}
+  
+++<<<<<<< HEAD
+ +	rep->rep_if[REP_IB].priv = ibdev;
+++=======
++ 	ibdev->is_rep = true;
++ 	vport_index = rep->vport_index;
++ 	ibdev->port[vport_index].rep = rep;
++ 	ibdev->port[vport_index].roce.netdev =
++ 		mlx5_ib_get_rep_netdev(dev->priv.eswitch, rep->vport);
++ 	ibdev->mdev = dev;
++ 	ibdev->num_ports = num_ports;
++ 
++ 	if (!__mlx5_ib_add(ibdev, profile))
++ 		return -EINVAL;
++ 
++ 	rep->rep_data[REP_IB].priv = ibdev;
+++>>>>>>> 2f69e591e453 ({IB, net}/mlx5: E-Switch, Use index of rep for vport to IB port mapping)
+  
+  	return 0;
+  }
+diff --cc drivers/net/ethernet/mellanox/mlx5/core/eswitch_offloads.c
+index 2a02050a09e7,24af2744453b..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx5/core/eswitch_offloads.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/eswitch_offloads.c
+@@@ -1219,37 -1407,58 +1219,43 @@@ int esw_offloads_init_reps(struct mlx5_
+  	if (!esw->offloads.vport_reps)
+  		return -ENOMEM;
+  
+ +	offloads = &esw->offloads;
+  	mlx5_query_nic_vport_mac_address(dev, 0, hw_id);
+  
+++<<<<<<< HEAD
+ +	for (vport = 0; vport < total_vfs; vport++) {
+ +		rep = &offloads->vport_reps[vport];
+ +
+ +		rep->vport = vport;
+++=======
++ 	mlx5_esw_for_all_reps(esw, vport_index, rep) {
++ 		rep->vport = mlx5_eswitch_index_to_vport_num(esw, vport_index);
++ 		rep->vport_index = vport_index;
+++>>>>>>> 2f69e591e453 ({IB, net}/mlx5: E-Switch, Use index of rep for vport to IB port mapping)
+  		ether_addr_copy(rep->hw_id, hw_id);
+ -
+ -		for (rep_type = 0; rep_type < NUM_REP_TYPES; rep_type++)
+ -			atomic_set(&rep->rep_data[rep_type].state,
+ -				   REP_UNREGISTERED);
+  	}
+  
+ -	return 0;
+ -}
+ +	offloads->vport_reps[0].vport = FDB_UPLINK_VPORT;
+  
+ -static void __esw_offloads_unload_rep(struct mlx5_eswitch *esw,
+ -				      struct mlx5_eswitch_rep *rep, u8 rep_type)
+ -{
+ -	if (atomic_cmpxchg(&rep->rep_data[rep_type].state,
+ -			   REP_LOADED, REP_REGISTERED) == REP_LOADED)
+ -		esw->offloads.rep_ops[rep_type]->unload(rep);
+ +	return 0;
+  }
+  
+ -static void __unload_reps_special_vport(struct mlx5_eswitch *esw, u8 rep_type)
+ +static void esw_offloads_unload_reps_type(struct mlx5_eswitch *esw, int nvports,
+ +					  u8 rep_type)
+  {
+  	struct mlx5_eswitch_rep *rep;
+ +	int vport;
+  
+ -	if (mlx5_ecpf_vport_exists(esw->dev)) {
+ -		rep = mlx5_eswitch_get_rep(esw, MLX5_VPORT_ECPF);
+ -		__esw_offloads_unload_rep(esw, rep, rep_type);
+ -	}
+ +	for (vport = nvports - 1; vport >= 0; vport--) {
+ +		rep = &esw->offloads.vport_reps[vport];
+ +		if (!rep->rep_if[rep_type].valid)
+ +			continue;
+  
+ -	if (mlx5_core_is_ecpf_esw_manager(esw->dev)) {
+ -		rep = mlx5_eswitch_get_rep(esw, MLX5_VPORT_PF);
+ -		__esw_offloads_unload_rep(esw, rep, rep_type);
+ +		rep->rep_if[rep_type].unload(rep);
+  	}
+ -
+ -	rep = mlx5_eswitch_get_rep(esw, MLX5_VPORT_UPLINK);
+ -	__esw_offloads_unload_rep(esw, rep, rep_type);
+  }
+  
+ -static void __unload_reps_vf_vport(struct mlx5_eswitch *esw, int nvports,
+ -				   u8 rep_type)
+ -{
+ -	struct mlx5_eswitch_rep *rep;
+ -	int i;
+ -
+ -	mlx5_esw_for_each_vf_rep_reverse(esw, i, rep, nvports)
+ -		__esw_offloads_unload_rep(esw, rep, rep_type);
+ -}
+ -
+ -static void esw_offloads_unload_vf_reps(struct mlx5_eswitch *esw, int nvports)
+ +static void esw_offloads_unload_reps(struct mlx5_eswitch *esw, int nvports)
+  {
+  	u8 rep_type = NUM_REP_TYPES;
+  
+* Unmerged path drivers/infiniband/hw/mlx5/ib_rep.c
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/eswitch_offloads.c
+diff --git a/include/linux/mlx5/eswitch.h b/include/linux/mlx5/eswitch.h
+index 5c8be6f99f8d..d13a403af04a 100644
+--- a/include/linux/mlx5/eswitch.h
++++ b/include/linux/mlx5/eswitch.h
+@@ -38,6 +38,8 @@ struct mlx5_eswitch_rep {
+ 	u16		       vport;
+ 	u8		       hw_id[ETH_ALEN];
+ 	u16		       vlan;
++	/* Only IB rep is using vport_index */
++	u16		       vport_index;
+ 	u32		       vlan_refcount;
+ };
+ 
