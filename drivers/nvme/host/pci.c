@@ -189,7 +189,7 @@ struct nvme_queue {
 	dma_addr_t cq_dma_addr;
 	u32 __iomem *q_db;
 	u16 q_depth;
-	s16 cq_vector;
+	u16 cq_vector;
 	u16 sq_tail;
 	u16 last_sq_tail;
 	u16 cq_head;
@@ -200,6 +200,7 @@ struct nvme_queue {
 #define NVMEQ_ENABLED		0
 #define NVMEQ_SQ_CMB		1
 #define NVMEQ_DELETE_ERROR	2
+#define NVMEQ_POLLED		3
 	u32 *dbbuf_sq_db;
 	u32 *dbbuf_cq_db;
 	u32 *dbbuf_sq_ei;
@@ -1086,7 +1087,7 @@ static int nvme_poll_irqdisable(struct nvme_queue *nvmeq, unsigned int tag)
 	 * using the CQ lock.  For normal interrupt driven threads we have
 	 * to disable the interrupt to avoid racing with it.
 	 */
-	if (nvmeq->cq_vector == -1) {
+	if (test_bit(NVMEQ_POLLED, &nvmeq->flags)) {
 		spin_lock(&nvmeq->cq_poll_lock);
 		found = nvme_process_cq(nvmeq, &start, &end, tag);
 		spin_unlock(&nvmeq->cq_poll_lock);
@@ -1146,7 +1147,7 @@ static int adapter_alloc_cq(struct nvme_dev *dev, u16 qid,
 	struct nvme_command c;
 	int flags = NVME_QUEUE_PHYS_CONTIG;
 
-	if (vector != -1)
+	if (!test_bit(NVMEQ_POLLED, &nvmeq->flags))
 		flags |= NVME_CQ_IRQ_ENABLED;
 
 	/*
@@ -1159,10 +1160,7 @@ static int adapter_alloc_cq(struct nvme_dev *dev, u16 qid,
 	c.create_cq.cqid = cpu_to_le16(qid);
 	c.create_cq.qsize = cpu_to_le16(nvmeq->q_depth - 1);
 	c.create_cq.cq_flags = cpu_to_le16(flags);
-	if (vector != -1)
-		c.create_cq.irq_vector = cpu_to_le16(vector);
-	else
-		c.create_cq.irq_vector = 0;
+	c.create_cq.irq_vector = cpu_to_le16(vector);
 
 	return nvme_submit_sync_cmd(dev->ctrl.admin_q, &c, NULL, 0);
 }
@@ -1408,10 +1406,8 @@ static int nvme_suspend_queue(struct nvme_queue *nvmeq)
 	nvmeq->dev->online_queues--;
 	if (!nvmeq->qid && nvmeq->dev->ctrl.admin_q)
 		blk_mq_quiesce_queue(nvmeq->dev->ctrl.admin_q);
-	if (nvmeq->cq_vector == -1)
-		return 0;
-	pci_free_irq(to_pci_dev(nvmeq->dev->dev), nvmeq->cq_vector, nvmeq);
-	nvmeq->cq_vector = -1;
+	if (!test_and_clear_bit(NVMEQ_POLLED, &nvmeq->flags))
+		pci_free_irq(to_pci_dev(nvmeq->dev->dev), nvmeq->cq_vector, nvmeq);
 	return 0;
 }
 
@@ -1505,7 +1501,6 @@ static int nvme_alloc_queue(struct nvme_dev *dev, int qid, int depth)
 	nvmeq->q_db = &dev->dbs[qid * 2 * dev->db_stride];
 	nvmeq->q_depth = depth;
 	nvmeq->qid = qid;
-	nvmeq->cq_vector = -1;
 	dev->ctrl.queue_count++;
 
 	return 0;
@@ -1550,7 +1545,7 @@ static int nvme_create_queue(struct nvme_queue *nvmeq, int qid, bool polled)
 {
 	struct nvme_dev *dev = nvmeq->dev;
 	int result;
-	s16 vector;
+	u16 vector = 0;
 
 	clear_bit(NVMEQ_DELETE_ERROR, &nvmeq->flags);
 
@@ -1561,7 +1556,7 @@ static int nvme_create_queue(struct nvme_queue *nvmeq, int qid, bool polled)
 	if (!polled)
 		vector = dev->num_vecs == 1 ? 0 : qid;
 	else
-		vector = -1;
+		set_bit(NVMEQ_POLLED, &nvmeq->flags);
 
 	result = adapter_alloc_cq(dev, qid, nvmeq, vector);
 	if (result)
@@ -1576,7 +1571,8 @@ static int nvme_create_queue(struct nvme_queue *nvmeq, int qid, bool polled)
 	nvmeq->cq_vector = vector;
 	nvme_init_queue(nvmeq, qid);
 
-	if (vector != -1) {
+	if (!polled) {
+		nvmeq->cq_vector = vector;
 		result = queue_request_irq(nvmeq);
 		if (result < 0)
 			goto release_sq;
@@ -1586,7 +1582,6 @@ static int nvme_create_queue(struct nvme_queue *nvmeq, int qid, bool polled)
 	return result;
 
 release_sq:
-	nvmeq->cq_vector = -1;
 	dev->online_queues--;
 	adapter_delete_sq(dev, qid);
 release_cq:
@@ -1728,7 +1723,7 @@ static int nvme_pci_configure_admin_queue(struct nvme_dev *dev)
 	nvme_init_queue(nvmeq, 0);
 	result = queue_request_irq(nvmeq);
 	if (result) {
-		nvmeq->cq_vector = -1;
+		dev->online_queues--;
 		return result;
 	}
 
@@ -2169,10 +2164,8 @@ static int nvme_setup_io_queues(struct nvme_dev *dev)
 	 * number of interrupts.
 	 */
 	result = queue_request_irq(adminq);
-	if (result) {
-		adminq->cq_vector = -1;
+	if (result)
 		return result;
-	}
 	set_bit(NVMEQ_ENABLED, &adminq->flags);
 
 	result = nvme_create_io_queues(dev);
