@@ -1,0 +1,285 @@
+bpf: decouple the lifetime of cgroup_bpf from cgroup itself
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-147.el8
+commit-author Roman Gushchin <guro@fb.com>
+commit 4bfc0bb2c60e2f4cc8eb60f03cf8dfa72336272a
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-147.el8/4bfc0bb2.failed
+
+Currently the lifetime of bpf programs attached to a cgroup is bound
+to the lifetime of the cgroup itself. It means that if a user
+forgets (or intentionally avoids) to detach a bpf program before
+removing the cgroup, it will stay attached up to the release of the
+cgroup. Since the cgroup can stay in the dying state (the state
+between being rmdir()'ed and being released) for a very long time, it
+leads to a waste of memory. Also, it blocks a possibility to implement
+the memcg-based memory accounting for bpf objects, because a circular
+reference dependency will occur. Charged memory pages are pinning the
+corresponding memory cgroup, and if the memory cgroup is pinning
+the attached bpf program, nothing will be ever released.
+
+A dying cgroup can not contain any processes, so the only chance for
+an attached bpf program to be executed is a live socket associated
+with the cgroup. So in order to release all bpf data early, let's
+count associated sockets using a new percpu refcounter. On cgroup
+removal the counter is transitioned to the atomic mode, and as soon
+as it reaches 0, all bpf programs are detached.
+
+Because cgroup_bpf_release() can block, it can't be called from
+the percpu ref counter callback directly, so instead an asynchronous
+work is scheduled.
+
+The reference counter is not socket specific, and can be used for any
+other types of programs, which can be executed from a cgroup-bpf hook
+outside of the process context, had such a need arise in the future.
+
+	Signed-off-by: Roman Gushchin <guro@fb.com>
+	Cc: jolsa@redhat.com
+	Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+(cherry picked from commit 4bfc0bb2c60e2f4cc8eb60f03cf8dfa72336272a)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/cgroup.h
+diff --cc include/linux/cgroup.h
+index 0c4d56acfdca,49e8facf7c4a..000000000000
+--- a/include/linux/cgroup.h
++++ b/include/linux/cgroup.h
+@@@ -843,4 -881,65 +843,68 @@@ static inline void put_cgroup_ns(struc
+  		free_cgroup_ns(ns);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ #ifdef CONFIG_CGROUPS
++ 
++ void cgroup_enter_frozen(void);
++ void cgroup_leave_frozen(bool always_leave);
++ void cgroup_update_frozen(struct cgroup *cgrp);
++ void cgroup_freeze(struct cgroup *cgrp, bool freeze);
++ void cgroup_freezer_migrate_task(struct task_struct *task, struct cgroup *src,
++ 				 struct cgroup *dst);
++ 
++ static inline bool cgroup_task_freeze(struct task_struct *task)
++ {
++ 	bool ret;
++ 
++ 	if (task->flags & PF_KTHREAD)
++ 		return false;
++ 
++ 	rcu_read_lock();
++ 	ret = test_bit(CGRP_FREEZE, &task_dfl_cgroup(task)->flags);
++ 	rcu_read_unlock();
++ 
++ 	return ret;
++ }
++ 
++ static inline bool cgroup_task_frozen(struct task_struct *task)
++ {
++ 	return task->frozen;
++ }
++ 
++ #else /* !CONFIG_CGROUPS */
++ 
++ static inline void cgroup_enter_frozen(void) { }
++ static inline void cgroup_leave_frozen(bool always_leave) { }
++ static inline bool cgroup_task_freeze(struct task_struct *task)
++ {
++ 	return false;
++ }
++ static inline bool cgroup_task_frozen(struct task_struct *task)
++ {
++ 	return false;
++ }
++ 
++ #endif /* !CONFIG_CGROUPS */
++ 
++ #ifdef CONFIG_CGROUP_BPF
++ static inline void cgroup_bpf_get(struct cgroup *cgrp)
++ {
++ 	percpu_ref_get(&cgrp->bpf.refcnt);
++ }
++ 
++ static inline void cgroup_bpf_put(struct cgroup *cgrp)
++ {
++ 	percpu_ref_put(&cgrp->bpf.refcnt);
++ }
++ 
++ #else /* CONFIG_CGROUP_BPF */
++ 
++ static inline void cgroup_bpf_get(struct cgroup *cgrp) {}
++ static inline void cgroup_bpf_put(struct cgroup *cgrp) {}
++ 
++ #endif /* CONFIG_CGROUP_BPF */
++ 
+++>>>>>>> 4bfc0bb2c60e (bpf: decouple the lifetime of cgroup_bpf from cgroup itself)
+  #endif /* _LINUX_CGROUP_H */
+diff --git a/include/linux/bpf-cgroup.h b/include/linux/bpf-cgroup.h
+index a0b1041de9f3..d81d84bb96e3 100644
+--- a/include/linux/bpf-cgroup.h
++++ b/include/linux/bpf-cgroup.h
+@@ -6,6 +6,7 @@
+ #include <linux/errno.h>
+ #include <linux/jump_label.h>
+ #include <linux/percpu.h>
++#include <linux/percpu-refcount.h>
+ #include <linux/rbtree.h>
+ #include <uapi/linux/bpf.h>
+ 
+@@ -70,10 +71,16 @@ struct cgroup_bpf {
+ 
+ 	/* temp storage for effective prog array used by prog_attach/detach */
+ 	struct bpf_prog_array __rcu *inactive;
++
++	/* reference counter used to detach bpf programs after cgroup removal */
++	struct percpu_ref refcnt;
++
++	/* cgroup_bpf is released using a work queue */
++	struct work_struct release_work;
+ };
+ 
+-void cgroup_bpf_put(struct cgroup *cgrp);
+ int cgroup_bpf_inherit(struct cgroup *cgrp);
++void cgroup_bpf_offline(struct cgroup *cgrp);
+ 
+ int __cgroup_bpf_attach(struct cgroup *cgrp, struct bpf_prog *prog,
+ 			enum bpf_attach_type type, u32 flags);
+@@ -263,8 +270,8 @@ int cgroup_bpf_prog_query(const union bpf_attr *attr,
+ 
+ struct bpf_prog;
+ struct cgroup_bpf {};
+-static inline void cgroup_bpf_put(struct cgroup *cgrp) {}
+ static inline int cgroup_bpf_inherit(struct cgroup *cgrp) { return 0; }
++static inline void cgroup_bpf_offline(struct cgroup *cgrp) {}
+ 
+ static inline int cgroup_bpf_prog_attach(const union bpf_attr *attr,
+ 					 enum bpf_prog_type ptype,
+* Unmerged path include/linux/cgroup.h
+diff --git a/kernel/bpf/cgroup.c b/kernel/bpf/cgroup.c
+index 0a377875698f..4a926faa9a51 100644
+--- a/kernel/bpf/cgroup.c
++++ b/kernel/bpf/cgroup.c
+@@ -21,12 +21,21 @@
+ DEFINE_STATIC_KEY_FALSE(cgroup_bpf_enabled_key);
+ EXPORT_SYMBOL(cgroup_bpf_enabled_key);
+ 
++void cgroup_bpf_offline(struct cgroup *cgrp)
++{
++	cgroup_get(cgrp);
++	percpu_ref_kill(&cgrp->bpf.refcnt);
++}
++
+ /**
+- * cgroup_bpf_put() - put references of all bpf programs
+- * @cgrp: the cgroup to modify
++ * cgroup_bpf_release() - put references of all bpf programs and
++ *                        release all cgroup bpf data
++ * @work: work structure embedded into the cgroup to modify
+  */
+-void cgroup_bpf_put(struct cgroup *cgrp)
++static void cgroup_bpf_release(struct work_struct *work)
+ {
++	struct cgroup *cgrp = container_of(work, struct cgroup,
++					   bpf.release_work);
+ 	enum bpf_cgroup_storage_type stype;
+ 	unsigned int type;
+ 
+@@ -46,6 +55,22 @@ void cgroup_bpf_put(struct cgroup *cgrp)
+ 		}
+ 		bpf_prog_array_free(cgrp->bpf.effective[type]);
+ 	}
++
++	percpu_ref_exit(&cgrp->bpf.refcnt);
++	cgroup_put(cgrp);
++}
++
++/**
++ * cgroup_bpf_release_fn() - callback used to schedule releasing
++ *                           of bpf cgroup data
++ * @ref: percpu ref counter structure
++ */
++static void cgroup_bpf_release_fn(struct percpu_ref *ref)
++{
++	struct cgroup *cgrp = container_of(ref, struct cgroup, bpf.refcnt);
++
++	INIT_WORK(&cgrp->bpf.release_work, cgroup_bpf_release);
++	queue_work(system_wq, &cgrp->bpf.release_work);
+ }
+ 
+ /* count number of elements in the list.
+@@ -166,7 +191,12 @@ int cgroup_bpf_inherit(struct cgroup *cgrp)
+  */
+ #define	NR ARRAY_SIZE(cgrp->bpf.effective)
+ 	struct bpf_prog_array __rcu *arrays[NR] = {};
+-	int i;
++	int ret, i;
++
++	ret = percpu_ref_init(&cgrp->bpf.refcnt, cgroup_bpf_release_fn, 0,
++			      GFP_KERNEL);
++	if (ret)
++		return ret;
+ 
+ 	for (i = 0; i < NR; i++)
+ 		INIT_LIST_HEAD(&cgrp->bpf.progs[i]);
+@@ -182,6 +212,9 @@ int cgroup_bpf_inherit(struct cgroup *cgrp)
+ cleanup:
+ 	for (i = 0; i < NR; i++)
+ 		bpf_prog_array_free(arrays[i]);
++
++	percpu_ref_exit(&cgrp->bpf.refcnt);
++
+ 	return -ENOMEM;
+ }
+ 
+diff --git a/kernel/cgroup/cgroup.c b/kernel/cgroup/cgroup.c
+index 0344a4e6701f..bd70d54a2bd3 100644
+--- a/kernel/cgroup/cgroup.c
++++ b/kernel/cgroup/cgroup.c
+@@ -4753,8 +4753,6 @@ static void css_release_work_fn(struct work_struct *work)
+ 		if (cgrp->kn)
+ 			RCU_INIT_POINTER(*(void __rcu __force **)&cgrp->kn->priv,
+ 					 NULL);
+-
+-		cgroup_bpf_put(cgrp);
+ 	}
+ 
+ 	mutex_unlock(&cgroup_mutex);
+@@ -5250,6 +5248,8 @@ static int cgroup_destroy_locked(struct cgroup *cgrp)
+ 
+ 	cgroup1_check_for_release(parent);
+ 
++	cgroup_bpf_offline(cgrp);
++
+ 	/* put the base reference */
+ 	percpu_ref_kill(&cgrp->self.refcnt);
+ 
+@@ -5961,6 +5961,7 @@ void cgroup_sk_alloc(struct sock_cgroup_data *skcd)
+ 		 * Don't use cgroup_get_live().
+ 		 */
+ 		cgroup_get(sock_cgroup_ptr(skcd));
++		cgroup_bpf_get(sock_cgroup_ptr(skcd));
+ 		return;
+ 	}
+ 
+@@ -5972,6 +5973,7 @@ void cgroup_sk_alloc(struct sock_cgroup_data *skcd)
+ 		cset = task_css_set(current);
+ 		if (likely(cgroup_tryget(cset->dfl_cgrp))) {
+ 			skcd->val = (unsigned long)cset->dfl_cgrp;
++			cgroup_bpf_get(cset->dfl_cgrp);
+ 			break;
+ 		}
+ 		cpu_relax();
+@@ -5982,7 +5984,10 @@ void cgroup_sk_alloc(struct sock_cgroup_data *skcd)
+ 
+ void cgroup_sk_free(struct sock_cgroup_data *skcd)
+ {
+-	cgroup_put(sock_cgroup_ptr(skcd));
++	struct cgroup *cgrp = sock_cgroup_ptr(skcd);
++
++	cgroup_bpf_put(cgrp);
++	cgroup_put(cgrp);
+ }
+ 
+ #endif	/* CONFIG_SOCK_CGROUP_DATA */
