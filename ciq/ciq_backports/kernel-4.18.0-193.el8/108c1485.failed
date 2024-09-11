@@ -1,0 +1,181 @@
+locking/lockdep: Add support for dynamic keys
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-193.el8
+commit-author Bart Van Assche <bvanassche@acm.org>
+commit 108c14858b9ea224686e476c8f5ec345a0df9e27
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-193.el8/108c1485.failed
+
+A shortcoming of the current lockdep implementation is that it requires
+lock keys to be allocated statically. That forces all instances of lock
+objects that occur in a given data structure to share a lock key. Since
+lock dependency analysis groups lock objects per key sharing lock keys
+can cause false positive lockdep reports. Make it possible to avoid
+such false positive reports by allowing lock keys to be allocated
+dynamically. Require that dynamically allocated lock keys are
+registered before use by calling lockdep_register_key(). Complain about
+attempts to register the same lock key pointer twice without calling
+lockdep_unregister_key() between successive registration calls.
+
+The purpose of the new lock_keys_hash[] data structure that keeps
+track of all dynamic keys is twofold:
+
+  - Verify whether the lockdep_register_key() and lockdep_unregister_key()
+    functions are used correctly.
+
+  - Avoid that lockdep_init_map() complains when encountering a dynamically
+    allocated key.
+
+	Signed-off-by: Bart Van Assche <bvanassche@acm.org>
+	Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+	Cc: Andrew Morton <akpm@linux-foundation.org>
+	Cc: Johannes Berg <johannes@sipsolutions.net>
+	Cc: Linus Torvalds <torvalds@linux-foundation.org>
+	Cc: Paul E. McKenney <paulmck@linux.vnet.ibm.com>
+	Cc: Peter Zijlstra <peterz@infradead.org>
+	Cc: Thomas Gleixner <tglx@linutronix.de>
+	Cc: Waiman Long <longman@redhat.com>
+	Cc: Will Deacon <will.deacon@arm.com>
+	Cc: johannes.berg@intel.com
+	Cc: tj@kernel.org
+Link: https://lkml.kernel.org/r/20190214230058.196511-19-bvanassche@acm.org
+	Signed-off-by: Ingo Molnar <mingo@kernel.org>
+(cherry picked from commit 108c14858b9ea224686e476c8f5ec345a0df9e27)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	kernel/locking/lockdep.c
+diff --cc kernel/locking/lockdep.c
+index aed5c03ce876,c73bc4334bee..000000000000
+--- a/kernel/locking/lockdep.c
++++ b/kernel/locking/lockdep.c
+@@@ -135,9 -140,12 +135,12 @@@ static struct lock_list list_entries[MA
+  /*
+   * All data structures here are protected by the global debug_lock.
+   *
+ - * nr_lock_classes is the number of elements of lock_classes[] that is
+ - * in use.
+ + * Mutex key structs only get allocated, once during bootup, and never
+ + * get freed - this significantly simplifies the debugging code.
+   */
++ #define KEYHASH_BITS		(MAX_LOCKDEP_KEYS_BITS - 1)
++ #define KEYHASH_SIZE		(1UL << KEYHASH_BITS)
++ static struct hlist_head lock_keys_hash[KEYHASH_SIZE];
+  unsigned long nr_lock_classes;
+  #ifndef CONFIG_DEBUG_LOCKDEP
+  static
+@@@ -4320,7 -4852,55 +4387,49 @@@ void lockdep_reset_lock(struct lockdep_
+  	raw_local_irq_restore(flags);
+  }
+  
+ -void lockdep_reset_lock(struct lockdep_map *lock)
+ -{
+ -	init_data_structures_once();
+ -
+ -	if (inside_selftest())
+ -		lockdep_reset_lock_imm(lock);
+ -	else
+ -		lockdep_reset_lock_reg(lock);
+ -}
+ -
+++<<<<<<< HEAD
+ +void __init lockdep_info(void)
+++=======
++ /* Unregister a dynamically allocated key. */
++ void lockdep_unregister_key(struct lock_class_key *key)
++ {
++ 	struct hlist_head *hash_head = keyhashentry(key);
++ 	struct lock_class_key *k;
++ 	struct pending_free *pf;
++ 	unsigned long flags;
++ 	bool found = false;
++ 
++ 	might_sleep();
++ 
++ 	if (WARN_ON_ONCE(static_obj(key)))
++ 		return;
++ 
++ 	raw_local_irq_save(flags);
++ 	if (!graph_lock())
++ 		goto out_irq;
++ 
++ 	pf = get_pending_free();
++ 	hlist_for_each_entry_rcu(k, hash_head, hash_entry) {
++ 		if (k == key) {
++ 			hlist_del_rcu(&k->hash_entry);
++ 			found = true;
++ 			break;
++ 		}
++ 	}
++ 	WARN_ON_ONCE(!found);
++ 	__lockdep_free_key_range(pf, key, 1);
++ 	call_rcu_zapped(pf);
++ 	graph_unlock();
++ out_irq:
++ 	raw_local_irq_restore(flags);
++ 
++ 	/* Wait until is_dynamic_key() has finished accessing k->hash_entry. */
++ 	synchronize_rcu();
++ }
++ EXPORT_SYMBOL_GPL(lockdep_unregister_key);
++ 
++ void __init lockdep_init(void)
+++>>>>>>> 108c14858b9e (locking/lockdep: Add support for dynamic keys)
+  {
+  	printk("Lock dependency validator: Copyright (c) 2006 Red Hat, Inc., Ingo Molnar\n");
+  
+diff --git a/include/linux/lockdep.h b/include/linux/lockdep.h
+index dad038683702..e292f40c579e 100644
+--- a/include/linux/lockdep.h
++++ b/include/linux/lockdep.h
+@@ -46,15 +46,19 @@ extern int lock_stat;
+ #define NR_LOCKDEP_CACHING_CLASSES	2
+ 
+ /*
+- * Lock-classes are keyed via unique addresses, by embedding the
+- * lockclass-key into the kernel (or module) .data section. (For
+- * static locks we use the lock address itself as the key.)
++ * A lockdep key is associated with each lock object. For static locks we use
++ * the lock address itself as the key. Dynamically allocated lock objects can
++ * have a statically or dynamically allocated key. Dynamically allocated lock
++ * keys must be registered before being used and must be unregistered before
++ * the key memory is freed.
+  */
+ struct lockdep_subclass_key {
+ 	char __one_byte;
+ } __attribute__ ((__packed__));
+ 
++/* hash_entry is used to keep track of dynamically allocated keys. */
+ struct lock_class_key {
++	struct hlist_node		hash_entry;
+ 	struct lockdep_subclass_key	subkeys[MAX_LOCKDEP_SUBCLASSES];
+ };
+ 
+@@ -270,6 +274,9 @@ extern void lockdep_set_selftest_task(struct task_struct *task);
+ extern void lockdep_off(void);
+ extern void lockdep_on(void);
+ 
++extern void lockdep_register_key(struct lock_class_key *key);
++extern void lockdep_unregister_key(struct lock_class_key *key);
++
+ /*
+  * These methods are used by specific locking variants (spinlocks,
+  * rwlocks, mutexes and rwsems) to pass init/acquire/release events
+@@ -431,6 +438,14 @@ static inline void lockdep_set_selftest_task(struct task_struct *task)
+  */
+ struct lock_class_key { };
+ 
++static inline void lockdep_register_key(struct lock_class_key *key)
++{
++}
++
++static inline void lockdep_unregister_key(struct lock_class_key *key)
++{
++}
++
+ /*
+  * The lockdep_map takes no space if lockdep is disabled:
+  */
+* Unmerged path kernel/locking/lockdep.c
