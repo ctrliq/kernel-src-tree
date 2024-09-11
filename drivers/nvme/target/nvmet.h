@@ -239,6 +239,7 @@ struct nvmet_subsys {
 
 	u64			ver;
 	char			serial[NVMET_SN_MAX_SIZE];
+	bool			subsys_discovered;
 	char			*subsysnqn;
 	bool			pi_support;
 
