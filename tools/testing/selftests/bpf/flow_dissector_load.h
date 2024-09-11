@@ -23,19 +23,19 @@ static inline int bpf_flow_load(struct bpf_object **obj,
 
 	main_prog = bpf_object__find_program_by_title(*obj, section_name);
 	if (!main_prog)
-		return ret;
+		return -1;
 
 	*prog_fd = bpf_program__fd(main_prog);
 	if (*prog_fd < 0)
-		return ret;
+		return -1;
 
 	prog_array = bpf_object__find_map_by_name(*obj, map_name);
 	if (!prog_array)
-		return ret;
+		return -1;
 
 	prog_array_fd = bpf_map__fd(prog_array);
 	if (prog_array_fd < 0)
-		return ret;
+		return -1;
 
 	i = 0;
 	bpf_object__for_each_program(prog, *obj) {
