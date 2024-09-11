@@ -199,6 +199,7 @@ out:
 static int ceph_init_file_info(struct inode *inode, struct file *file,
 					int fmode, bool isdir)
 {
+	struct ceph_inode_info *ci = ceph_inode(inode);
 	struct ceph_file_info *fi;
 
 	dout("%s %p %p 0%o (%s)\n", __func__, inode, file,
@@ -209,7 +210,7 @@ static int ceph_init_file_info(struct inode *inode, struct file *file,
 		struct ceph_dir_file_info *dfi =
 			kmem_cache_zalloc(ceph_dir_file_cachep, GFP_KERNEL);
 		if (!dfi) {
-			ceph_put_fmode(ceph_inode(inode), fmode); /* clean up */
+			ceph_put_fmode(ci, fmode); /* clean up */
 			return -ENOMEM;
 		}
 
@@ -220,7 +221,7 @@ static int ceph_init_file_info(struct inode *inode, struct file *file,
 	} else {
 		fi = kmem_cache_zalloc(ceph_file_cachep, GFP_KERNEL);
 		if (!fi) {
-			ceph_put_fmode(ceph_inode(inode), fmode); /* clean up */
+			ceph_put_fmode(ci, fmode); /* clean up */
 			return -ENOMEM;
 		}
 
@@ -230,6 +231,7 @@ static int ceph_init_file_info(struct inode *inode, struct file *file,
 	fi->fmode = fmode;
 	spin_lock_init(&fi->rw_contexts_lock);
 	INIT_LIST_HEAD(&fi->rw_contexts);
+	fi->meta_err = errseq_sample(&ci->i_meta_err);
 
 	return 0;
 }
