@@ -1,0 +1,182 @@
+KVM: arm64/sve: Simplify KVM_REG_ARM64_SVE_VLS array sizing
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-147.el8
+commit-author Dave Martin <Dave.Martin@arm.com>
+commit 4bd774e57b29f5bbf296d1daf69cc761e1e75fa8
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-147.el8/4bd774e5.failed
+
+A complicated DIV_ROUND_UP() expression is currently written out
+explicitly in multiple places in order to specify the size of the
+bitmap exchanged with userspace to represent the value of the
+KVM_REG_ARM64_SVE_VLS pseudo-register.
+
+Userspace currently has no direct way to work this out either: for
+documentation purposes, the size is just quoted as 8 u64s.
+
+To make this more intuitive, this patch replaces these with a
+single define, which is also exported to userspace as
+KVM_ARM64_SVE_VLS_WORDS.
+
+Since the number of words in a bitmap is just the index of the last
+word used + 1, this patch expresses the bound that way instead.
+This should make it clearer what is being expressed.
+
+For userspace convenience, the minimum and maximum possible vector
+lengths relevant to the KVM ABI are exposed to UAPI as
+KVM_ARM64_SVE_VQ_MIN, KVM_ARM64_SVE_VQ_MAX.  Since the only direct
+use for these at present is manipulation of KVM_REG_ARM64_SVE_VLS,
+no corresponding _VL_ macros are defined.  They could be added
+later if a need arises.
+
+Since use of DIV_ROUND_UP() was the only reason for including
+<linux/kernel.h> in guest.c, this patch also removes that #include.
+
+	Suggested-by: Andrew Jones <drjones@redhat.com>
+	Signed-off-by: Dave Martin <Dave.Martin@arm.com>
+	Reviewed-by: Andrew Jones <drjones@redhat.com>
+	Signed-off-by: Marc Zyngier <marc.zyngier@arm.com>
+(cherry picked from commit 4bd774e57b29f5bbf296d1daf69cc761e1e75fa8)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/arm64/include/uapi/asm/kvm.h
+#	arch/arm64/kvm/guest.c
+diff --cc arch/arm64/include/uapi/asm/kvm.h
+index d64f2243cb12,edd2db8e5160..000000000000
+--- a/arch/arm64/include/uapi/asm/kvm.h
++++ b/arch/arm64/include/uapi/asm/kvm.h
+@@@ -257,6 -258,15 +257,18 @@@ struct kvm_vcpu_events 
+  	 KVM_REG_SIZE_U256 |						\
+  	 ((i) & (KVM_ARM64_SVE_MAX_SLICES - 1)))
+  
+++<<<<<<< HEAD
+++=======
++ #define KVM_ARM64_SVE_VQ_MIN __SVE_VQ_MIN
++ #define KVM_ARM64_SVE_VQ_MAX __SVE_VQ_MAX
++ 
++ /* Vector lengths pseudo-register: */
++ #define KVM_REG_ARM64_SVE_VLS		(KVM_REG_ARM64 | KVM_REG_ARM64_SVE | \
++ 					 KVM_REG_SIZE_U512 | 0xffff)
++ #define KVM_ARM64_SVE_VLS_WORDS	\
++ 	((KVM_ARM64_SVE_VQ_MAX - KVM_ARM64_SVE_VQ_MIN) / 64 + 1)
++ 
+++>>>>>>> 4bd774e57b29 (KVM: arm64/sve: Simplify KVM_REG_ARM64_SVE_VLS array sizing)
+  /* Device Control API: ARM VGIC */
+  #define KVM_DEV_ARM_VGIC_GRP_ADDR	0
+  #define KVM_DEV_ARM_VGIC_GRP_DIST_REGS	1
+diff --cc arch/arm64/kvm/guest.c
+index 988c23a37725,5bb909c3ff7c..000000000000
+--- a/arch/arm64/kvm/guest.c
++++ b/arch/arm64/kvm/guest.c
+@@@ -206,6 -205,79 +205,82 @@@ out
+  	return err;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ #define vq_word(vq) (((vq) - SVE_VQ_MIN) / 64)
++ #define vq_mask(vq) ((u64)1 << ((vq) - SVE_VQ_MIN) % 64)
++ 
++ static bool vq_present(
++ 	const u64 (*const vqs)[KVM_ARM64_SVE_VLS_WORDS],
++ 	unsigned int vq)
++ {
++ 	return (*vqs)[vq_word(vq)] & vq_mask(vq);
++ }
++ 
++ static int get_sve_vls(struct kvm_vcpu *vcpu, const struct kvm_one_reg *reg)
++ {
++ 	unsigned int max_vq, vq;
++ 	u64 vqs[KVM_ARM64_SVE_VLS_WORDS];
++ 
++ 	if (!vcpu_has_sve(vcpu))
++ 		return -ENOENT;
++ 
++ 	if (WARN_ON(!sve_vl_valid(vcpu->arch.sve_max_vl)))
++ 		return -EINVAL;
++ 
++ 	memset(vqs, 0, sizeof(vqs));
++ 
++ 	max_vq = sve_vq_from_vl(vcpu->arch.sve_max_vl);
++ 	for (vq = SVE_VQ_MIN; vq <= max_vq; ++vq)
++ 		if (sve_vq_available(vq))
++ 			vqs[vq_word(vq)] |= vq_mask(vq);
++ 
++ 	if (copy_to_user((void __user *)reg->addr, vqs, sizeof(vqs)))
++ 		return -EFAULT;
++ 
++ 	return 0;
++ }
++ 
++ static int set_sve_vls(struct kvm_vcpu *vcpu, const struct kvm_one_reg *reg)
++ {
++ 	unsigned int max_vq, vq;
++ 	u64 vqs[KVM_ARM64_SVE_VLS_WORDS];
++ 
++ 	if (!vcpu_has_sve(vcpu))
++ 		return -ENOENT;
++ 
++ 	if (kvm_arm_vcpu_sve_finalized(vcpu))
++ 		return -EPERM; /* too late! */
++ 
++ 	if (WARN_ON(vcpu->arch.sve_state))
++ 		return -EINVAL;
++ 
++ 	if (copy_from_user(vqs, (const void __user *)reg->addr, sizeof(vqs)))
++ 		return -EFAULT;
++ 
++ 	max_vq = 0;
++ 	for (vq = SVE_VQ_MIN; vq <= SVE_VQ_MAX; ++vq)
++ 		if (vq_present(&vqs, vq))
++ 			max_vq = vq;
++ 
++ 	if (max_vq > sve_vq_from_vl(kvm_sve_max_vl))
++ 		return -EINVAL;
++ 
++ 	for (vq = SVE_VQ_MIN; vq <= max_vq; ++vq)
++ 		if (vq_present(&vqs, vq) != sve_vq_available(vq))
++ 			return -EINVAL;
++ 
++ 	/* Can't run with no vector lengths at all: */
++ 	if (max_vq < SVE_VQ_MIN)
++ 		return -EINVAL;
++ 
++ 	/* vcpu->arch.sve_state will be alloc'd by kvm_vcpu_finalize_sve() */
++ 	vcpu->arch.sve_max_vl = sve_vl_from_vq(max_vq);
++ 
++ 	return 0;
++ }
++ 
+++>>>>>>> 4bd774e57b29 (KVM: arm64/sve: Simplify KVM_REG_ARM64_SVE_VLS array sizing)
+  #define SVE_REG_SLICE_SHIFT	0
+  #define SVE_REG_SLICE_BITS	5
+  #define SVE_REG_ID_SHIFT	(SVE_REG_SLICE_SHIFT + SVE_REG_SLICE_BITS)
+diff --git a/Documentation/virtual/kvm/api.txt b/Documentation/virtual/kvm/api.txt
+index 87022d2958d4..f36909005372 100644
+--- a/Documentation/virtual/kvm/api.txt
++++ b/Documentation/virtual/kvm/api.txt
+@@ -2157,13 +2157,15 @@ and KVM_ARM_VCPU_FINALIZE for more information about this procedure.
+ KVM_REG_ARM64_SVE_VLS is a pseudo-register that allows the set of vector
+ lengths supported by the vcpu to be discovered and configured by
+ userspace.  When transferred to or from user memory via KVM_GET_ONE_REG
+-or KVM_SET_ONE_REG, the value of this register is of type __u64[8], and
+-encodes the set of vector lengths as follows:
++or KVM_SET_ONE_REG, the value of this register is of type
++__u64[KVM_ARM64_SVE_VLS_WORDS], and encodes the set of vector lengths as
++follows:
+ 
+-__u64 vector_lengths[8];
++__u64 vector_lengths[KVM_ARM64_SVE_VLS_WORDS];
+ 
+ if (vq >= SVE_VQ_MIN && vq <= SVE_VQ_MAX &&
+-    ((vector_lengths[(vq - 1) / 64] >> ((vq - 1) % 64)) & 1))
++    ((vector_lengths[(vq - KVM_ARM64_SVE_VQ_MIN) / 64] >>
++		((vq - KVM_ARM64_SVE_VQ_MIN) % 64)) & 1))
+ 	/* Vector length vq * 16 bytes supported */
+ else
+ 	/* Vector length vq * 16 bytes not supported */
+* Unmerged path arch/arm64/include/uapi/asm/kvm.h
+* Unmerged path arch/arm64/kvm/guest.c
