@@ -2546,13 +2546,10 @@ static ssize_t r5c_journal_mode_show(struct mddev *mddev, char *page)
 	struct r5conf *conf;
 	int ret;
 
-	ret = mddev_lock(mddev);
-	if (ret)
-		return ret;
-
+	spin_lock(&mddev->lock);
 	conf = mddev->private;
 	if (!conf || !conf->log) {
-		mddev_unlock(mddev);
+		spin_unlock(&mddev->lock);
 		return 0;
 	}
 
@@ -2572,7 +2569,7 @@ static ssize_t r5c_journal_mode_show(struct mddev *mddev, char *page)
 	default:
 		ret = 0;
 	}
-	mddev_unlock(mddev);
+	spin_unlock(&mddev->lock);
 	return ret;
 }
 
