@@ -296,6 +296,7 @@ static void ena_init_io_rings(struct ena_adapter *adapter)
 		txr->sgl_size = adapter->max_tx_sgl_size;
 		txr->smoothed_interval =
 			ena_com_get_nonadaptive_moderation_interval_tx(ena_dev);
+		txr->disable_meta_caching = adapter->disable_meta_caching;
 
 		/* RX specific ring state */
 		rxr->ring_size = adapter->requested_rx_ring_size;
@@ -2281,7 +2282,9 @@ int ena_update_queue_count(struct ena_adapter *adapter, u32 new_channel_count)
 	return dev_was_up ? ena_open(adapter->netdev) : 0;
 }
 
-static void ena_tx_csum(struct ena_com_tx_ctx *ena_tx_ctx, struct sk_buff *skb)
+static void ena_tx_csum(struct ena_com_tx_ctx *ena_tx_ctx,
+			struct sk_buff *skb,
+			bool disable_meta_caching)
 {
 	u32 mss = skb_shinfo(skb)->gso_size;
 	struct ena_com_tx_meta *ena_meta = &ena_tx_ctx->ena_meta;
@@ -2325,7 +2328,9 @@ static void ena_tx_csum(struct ena_com_tx_ctx *ena_tx_ctx, struct sk_buff *skb)
 		ena_meta->l3_hdr_len = skb_network_header_len(skb);
 		ena_meta->l3_hdr_offset = skb_network_offset(skb);
 		ena_tx_ctx->meta_valid = 1;
-
+	} else if (disable_meta_caching) {
+		memset(ena_meta, 0, sizeof(*ena_meta));
+		ena_tx_ctx->meta_valid = 1;
 	} else {
 		ena_tx_ctx->meta_valid = 0;
 	}
@@ -2509,7 +2514,7 @@ static netdev_tx_t ena_start_xmit(struct sk_buff *skb, struct net_device *dev)
 	ena_tx_ctx.header_len = header_len;
 
 	/* set flags and meta data */
-	ena_tx_csum(&ena_tx_ctx, skb);
+	ena_tx_csum(&ena_tx_ctx, skb, tx_ring->disable_meta_caching);
 
 	if (unlikely(ena_com_is_doorbell_needed(tx_ring->ena_com_io_sq, &ena_tx_ctx))) {
 		netif_dbg(adapter, tx_queued, dev,
@@ -3774,6 +3779,11 @@ static int ena_probe(struct pci_dev *pdev, const struct pci_device_id *ent)
 	adapter->last_monitored_tx_qid = 0;
 
 	adapter->rx_copybreak = ENA_DEFAULT_RX_COPYBREAK;
+	if (ena_dev->tx_mem_queue_type == ENA_ADMIN_PLACEMENT_POLICY_DEV)
+		adapter->disable_meta_caching =
+			!!(get_feat_ctx.llq.accel_mode.u.get.supported_flags &
+			   BIT(ENA_ADMIN_DISABLE_META_CACHING));
+
 	adapter->wd_state = wd_state;
 
 	snprintf(adapter->name, ENA_NAME_MAX_LEN, "ena_%d", adapters_found);
