@@ -1,0 +1,103 @@
+net: sched: flower: protect flower classifier state with spinlock
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-193.el8
+Rebuild_CHGLOG: - [net] sched: flower: protect flower classifier state with spinlock (Ivan Vecera) [1751856]
+Rebuild_FUZZ: 96.00%
+commit-author Vlad Buslov <vladbu@mellanox.com>
+commit 3d81e7118d572f37456922929b2b289138b2174f
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-193.el8/3d81e711.failed
+
+struct tcf_proto was extended with spinlock to be used by classifiers
+instead of global rtnl lock. Use it to protect shared flower classifier
+data structures (handle_idr, mask hashtable and list) and fields of
+individual filters that can be accessed concurrently. This patch set uses
+tcf_proto->lock as per instance lock that protects all filters on
+tcf_proto.
+
+	Signed-off-by: Vlad Buslov <vladbu@mellanox.com>
+	Reviewed-by: Stefano Brivio <sbrivio@redhat.com>
+	Acked-by: Jiri Pirko <jiri@mellanox.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 3d81e7118d572f37456922929b2b289138b2174f)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/sched/cls_flower.c
+diff --cc net/sched/cls_flower.c
+index ffd0c5b3e320,04210d645c78..000000000000
+--- a/net/sched/cls_flower.c
++++ b/net/sched/cls_flower.c
+@@@ -460,11 -515,23 +464,30 @@@ static bool __fl_delete(struct tcf_prot
+  {
+  	struct cls_fl_head *head = fl_head_dereference(tp);
+  	bool async = tcf_exts_get_net(&f->exts);
+ +	bool last;
+  
+++<<<<<<< HEAD
+ +	idr_remove(&head->handle_idr, f->handle);
+ +	list_del_rcu(&f->list);
+ +	last = fl_mask_put(head, f->mask, async);
+++=======
++ 	*last = false;
++ 
++ 	spin_lock(&tp->lock);
++ 	if (f->deleted) {
++ 		spin_unlock(&tp->lock);
++ 		return -ENOENT;
++ 	}
++ 
++ 	f->deleted = true;
++ 	rhashtable_remove_fast(&f->mask->ht, &f->ht_node,
++ 			       f->mask->filter_ht_params);
++ 	idr_remove(&head->handle_idr, f->handle);
++ 	list_del_rcu(&f->list);
++ 	spin_unlock(&tp->lock);
++ 
++ 	*last = fl_mask_put(head, f->mask, async);
+++>>>>>>> 3d81e7118d57 (net: sched: flower: protect flower classifier state with spinlock)
+  	if (!tc_skip_hw(f->flags))
+  		fl_hw_destroy_filter(tp, f, extack);
+  	tcf_unbind_filter(tp, &f->res);
+@@@ -1431,7 -1509,24 +1454,21 @@@ static int fl_change(struct net *net, s
+  	if (!tc_in_hw(fnew->flags))
+  		fnew->flags |= TCA_CLS_FLAGS_NOT_IN_HW;
+  
+++<<<<<<< HEAD
+++=======
++ 	spin_lock(&tp->lock);
++ 
++ 	/* tp was deleted concurrently. -EAGAIN will cause caller to lookup
++ 	 * proto again or create new one, if necessary.
++ 	 */
++ 	if (tp->deleting) {
++ 		err = -EAGAIN;
++ 		goto errout_hw;
++ 	}
++ 
++ 	refcount_inc(&fnew->refcnt);
+++>>>>>>> 3d81e7118d57 (net: sched: flower: protect flower classifier state with spinlock)
+  	if (fold) {
+ -		/* Fold filter was deleted concurrently. Retry lookup. */
+ -		if (fold->deleted) {
+ -			err = -EAGAIN;
+ -			goto errout_hw;
+ -		}
+ -
+  		fnew->handle = handle;
+  
+  		err = rhashtable_insert_fast(&fnew->mask->ht, &fnew->ht_node,
+@@@ -1444,7 -1539,10 +1481,9 @@@
+  				       fold->mask->filter_ht_params);
+  		idr_replace(&head->handle_idr, fnew, fnew->handle);
+  		list_replace_rcu(&fold->list, &fnew->list);
+ -		fold->deleted = true;
+  
++ 		spin_unlock(&tp->lock);
++ 
+  		fl_mask_put(head, fold->mask, true);
+  		if (!tc_skip_hw(fold->flags))
+  			fl_hw_destroy_filter(tp, fold, NULL);
+* Unmerged path net/sched/cls_flower.c
