@@ -1,0 +1,150 @@
+futex: Provide state handling for exec() as well
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Thomas Gleixner <tglx@linutronix.de>
+commit af8cbda2cfcaa5515d61ec500498d46e9a8247e2
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/af8cbda2.failed
+
+exec() attempts to handle potentially held futexes gracefully by running
+the futex exit handling code like exit() does.
+
+The current implementation has no protection against concurrent incoming
+waiters. The reason is that the futex state cannot be set to
+FUTEX_STATE_DEAD after the cleanup because the task struct is still active
+and just about to execute the new binary.
+
+While its arguably buggy when a task holds a futex over exec(), for
+consistency sake the state handling can at least cover the actual futex
+exit cleanup section. This provides state consistency protection accross
+the cleanup. As the futex state of the task becomes FUTEX_STATE_OK after the
+cleanup has been finished, this cannot prevent subsequent attempts to
+attach to the task in case that the cleanup was not successfull in mopping
+up all leftovers.
+
+	Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+	Reviewed-by: Ingo Molnar <mingo@kernel.org>
+	Acked-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+Link: https://lkml.kernel.org/r/20191106224556.753355618@linutronix.de
+
+
+(cherry picked from commit af8cbda2cfcaa5515d61ec500498d46e9a8247e2)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	kernel/futex.c
+diff --cc kernel/futex.c
+index ec3cc9521f31,0c9850af2724..000000000000
+--- a/kernel/futex.c
++++ b/kernel/futex.c
+@@@ -3608,9 -3655,102 +3608,106 @@@ void exit_robust_list(struct task_struc
+  		cond_resched();
+  	}
+  
+ -	if (pending) {
+ +	if (pending)
+  		handle_futex_death((void __user *)pending + futex_offset,
+++<<<<<<< HEAD
+ +				   curr, pip);
+++=======
++ 				   curr, pip, HANDLE_DEATH_PENDING);
++ 	}
++ }
++ 
++ static void futex_cleanup(struct task_struct *tsk)
++ {
++ 	if (unlikely(tsk->robust_list)) {
++ 		exit_robust_list(tsk);
++ 		tsk->robust_list = NULL;
++ 	}
++ 
++ #ifdef CONFIG_COMPAT
++ 	if (unlikely(tsk->compat_robust_list)) {
++ 		compat_exit_robust_list(tsk);
++ 		tsk->compat_robust_list = NULL;
++ 	}
++ #endif
++ 
++ 	if (unlikely(!list_empty(&tsk->pi_state_list)))
++ 		exit_pi_state_list(tsk);
++ }
++ 
++ /**
++  * futex_exit_recursive - Set the tasks futex state to FUTEX_STATE_DEAD
++  * @tsk:	task to set the state on
++  *
++  * Set the futex exit state of the task lockless. The futex waiter code
++  * observes that state when a task is exiting and loops until the task has
++  * actually finished the futex cleanup. The worst case for this is that the
++  * waiter runs through the wait loop until the state becomes visible.
++  *
++  * This is called from the recursive fault handling path in do_exit().
++  *
++  * This is best effort. Either the futex exit code has run already or
++  * not. If the OWNER_DIED bit has been set on the futex then the waiter can
++  * take it over. If not, the problem is pushed back to user space. If the
++  * futex exit code did not run yet, then an already queued waiter might
++  * block forever, but there is nothing which can be done about that.
++  */
++ void futex_exit_recursive(struct task_struct *tsk)
++ {
++ 	tsk->futex_state = FUTEX_STATE_DEAD;
++ }
++ 
++ static void futex_cleanup_begin(struct task_struct *tsk)
++ {
++ 	/*
++ 	 * Switch the state to FUTEX_STATE_EXITING under tsk->pi_lock.
++ 	 *
++ 	 * This ensures that all subsequent checks of tsk->futex_state in
++ 	 * attach_to_pi_owner() must observe FUTEX_STATE_EXITING with
++ 	 * tsk->pi_lock held.
++ 	 *
++ 	 * It guarantees also that a pi_state which was queued right before
++ 	 * the state change under tsk->pi_lock by a concurrent waiter must
++ 	 * be observed in exit_pi_state_list().
++ 	 */
++ 	raw_spin_lock_irq(&tsk->pi_lock);
++ 	tsk->futex_state = FUTEX_STATE_EXITING;
++ 	raw_spin_unlock_irq(&tsk->pi_lock);
++ }
++ 
++ static void futex_cleanup_end(struct task_struct *tsk, int state)
++ {
++ 	/*
++ 	 * Lockless store. The only side effect is that an observer might
++ 	 * take another loop until it becomes visible.
++ 	 */
++ 	tsk->futex_state = state;
++ }
++ 
++ void futex_exec_release(struct task_struct *tsk)
++ {
++ 	/*
++ 	 * The state handling is done for consistency, but in the case of
++ 	 * exec() there is no way to prevent futher damage as the PID stays
++ 	 * the same. But for the unlikely and arguably buggy case that a
++ 	 * futex is held on exec(), this provides at least as much state
++ 	 * consistency protection which is possible.
++ 	 */
++ 	futex_cleanup_begin(tsk);
++ 	futex_cleanup(tsk);
++ 	/*
++ 	 * Reset the state to FUTEX_STATE_OK. The task is alive and about
++ 	 * exec a new binary.
++ 	 */
++ 	futex_cleanup_end(tsk, FUTEX_STATE_OK);
++ }
++ 
++ void futex_exit_release(struct task_struct *tsk)
++ {
++ 	futex_cleanup_begin(tsk);
++ 	futex_cleanup(tsk);
++ 	futex_cleanup_end(tsk, FUTEX_STATE_DEAD);
+++>>>>>>> af8cbda2cfca (futex: Provide state handling for exec() as well)
+  }
+  
+  long do_futex(u32 __user *uaddr, int op, u32 val, ktime_t *timeout,
+* Unmerged path kernel/futex.c
