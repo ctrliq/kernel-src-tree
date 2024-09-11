@@ -505,7 +505,7 @@ static ssize_t docked_show(struct device *dev,
 	struct acpi_device *adev = NULL;
 
 	acpi_bus_get_device(dock_station->handle, &adev);
-	return snprintf(buf, PAGE_SIZE, "%u\n", acpi_device_enumerated(adev));
+	return sysfs_emit(buf, "%u\n", acpi_device_enumerated(adev));
 }
 static DEVICE_ATTR_RO(docked);
 
@@ -517,7 +517,7 @@ static ssize_t flags_show(struct device *dev,
 {
 	struct dock_station *dock_station = dev->platform_data;
 
-	return snprintf(buf, PAGE_SIZE, "%d\n", dock_station->flags);
+	return sysfs_emit(buf, "%d\n", dock_station->flags);
 
 }
 static DEVICE_ATTR_RO(flags);
@@ -556,7 +556,7 @@ static ssize_t uid_show(struct device *dev,
 	if (ACPI_FAILURE(status))
 		return 0;
 
-	return snprintf(buf, PAGE_SIZE, "%llx\n", lbuf);
+	return sysfs_emit(buf, "%llx\n", lbuf);
 }
 static DEVICE_ATTR_RO(uid);
 
@@ -575,7 +575,7 @@ static ssize_t type_show(struct device *dev,
 	else
 		type = "unknown";
 
-	return snprintf(buf, PAGE_SIZE, "%s\n", type);
+	return sysfs_emit(buf, "%s\n", type);
 }
 static DEVICE_ATTR_RO(type);
 
