@@ -82,6 +82,7 @@ irqreturn_t idxd_misc_thread(int vec, void *data)
 	bool err = false;
 
 	cause = ioread32(idxd->reg_base + IDXD_INTCAUSE_OFFSET);
+	iowrite32(cause, idxd->reg_base + IDXD_INTCAUSE_OFFSET);
 
 	if (cause & IDXD_INTC_ERR) {
 		spin_lock_bh(&idxd->dev_lock);
@@ -139,7 +140,6 @@ irqreturn_t idxd_misc_thread(int vec, void *data)
 		dev_warn_once(dev, "Unexpected interrupt cause bits set: %#x\n",
 			      val);
 
-	iowrite32(cause, idxd->reg_base + IDXD_INTCAUSE_OFFSET);
 	if (!err)
 		goto out;
 
