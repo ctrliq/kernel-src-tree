@@ -1,0 +1,359 @@
+block: Move blk_mq_bio_list_merge() into blk-merge.c
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-310.el8
+commit-author Baolin Wang <baolin.wang@linux.alibaba.com>
+commit bdc6a287bc98e8f32bf52c9cb2d1bdf75975f5a0
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-310.el8/bdc6a287.failed
+
+Move the blk_mq_bio_list_merge() into blk-merge.c and
+rename it as a generic name.
+
+	Reviewed-by: Christoph Hellwig <hch@lst.de>
+	Signed-off-by: Baolin Wang <baolin.wang@linux.alibaba.com>
+	Signed-off-by: Jens Axboe <axboe@kernel.dk>
+(cherry picked from commit bdc6a287bc98e8f32bf52c9cb2d1bdf75975f5a0)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	block/blk-merge.c
+#	block/blk-mq-sched.c
+#	block/blk.h
+#	block/kyber-iosched.c
+#	include/linux/blk-mq.h
+diff --cc block/blk-merge.c
+index e8b0b583f180,b09e9fc44236..000000000000
+--- a/block/blk-merge.c
++++ b/block/blk-merge.c
+@@@ -880,3 -896,203 +880,206 @@@ enum elv_merge blk_try_merge(struct req
+  		return ELEVATOR_FRONT_MERGE;
+  	return ELEVATOR_NO_MERGE;
+  }
+++<<<<<<< HEAD
+++=======
++ 
++ static void blk_account_io_merge_bio(struct request *req)
++ {
++ 	if (!blk_do_io_stat(req))
++ 		return;
++ 
++ 	part_stat_lock();
++ 	part_stat_inc(req->part, merges[op_stat_group(req_op(req))]);
++ 	part_stat_unlock();
++ }
++ 
++ bool bio_attempt_back_merge(struct request *req, struct bio *bio,
++ 		unsigned int nr_segs)
++ {
++ 	const int ff = bio->bi_opf & REQ_FAILFAST_MASK;
++ 
++ 	if (!ll_back_merge_fn(req, bio, nr_segs))
++ 		return false;
++ 
++ 	trace_block_bio_backmerge(req->q, req, bio);
++ 	rq_qos_merge(req->q, req, bio);
++ 
++ 	if ((req->cmd_flags & REQ_FAILFAST_MASK) != ff)
++ 		blk_rq_set_mixed_merge(req);
++ 
++ 	req->biotail->bi_next = bio;
++ 	req->biotail = bio;
++ 	req->__data_len += bio->bi_iter.bi_size;
++ 
++ 	bio_crypt_free_ctx(bio);
++ 
++ 	blk_account_io_merge_bio(req);
++ 	return true;
++ }
++ 
++ bool bio_attempt_front_merge(struct request *req, struct bio *bio,
++ 		unsigned int nr_segs)
++ {
++ 	const int ff = bio->bi_opf & REQ_FAILFAST_MASK;
++ 
++ 	if (!ll_front_merge_fn(req, bio, nr_segs))
++ 		return false;
++ 
++ 	trace_block_bio_frontmerge(req->q, req, bio);
++ 	rq_qos_merge(req->q, req, bio);
++ 
++ 	if ((req->cmd_flags & REQ_FAILFAST_MASK) != ff)
++ 		blk_rq_set_mixed_merge(req);
++ 
++ 	bio->bi_next = req->bio;
++ 	req->bio = bio;
++ 
++ 	req->__sector = bio->bi_iter.bi_sector;
++ 	req->__data_len += bio->bi_iter.bi_size;
++ 
++ 	bio_crypt_do_front_merge(req, bio);
++ 
++ 	blk_account_io_merge_bio(req);
++ 	return true;
++ }
++ 
++ bool bio_attempt_discard_merge(struct request_queue *q, struct request *req,
++ 		struct bio *bio)
++ {
++ 	unsigned short segments = blk_rq_nr_discard_segments(req);
++ 
++ 	if (segments >= queue_max_discard_segments(q))
++ 		goto no_merge;
++ 	if (blk_rq_sectors(req) + bio_sectors(bio) >
++ 	    blk_rq_get_max_sectors(req, blk_rq_pos(req)))
++ 		goto no_merge;
++ 
++ 	rq_qos_merge(q, req, bio);
++ 
++ 	req->biotail->bi_next = bio;
++ 	req->biotail = bio;
++ 	req->__data_len += bio->bi_iter.bi_size;
++ 	req->nr_phys_segments = segments + 1;
++ 
++ 	blk_account_io_merge_bio(req);
++ 	return true;
++ no_merge:
++ 	req_set_nomerge(q, req);
++ 	return false;
++ }
++ 
++ /**
++  * blk_attempt_plug_merge - try to merge with %current's plugged list
++  * @q: request_queue new bio is being queued at
++  * @bio: new bio being queued
++  * @nr_segs: number of segments in @bio
++  * @same_queue_rq: pointer to &struct request that gets filled in when
++  * another request associated with @q is found on the plug list
++  * (optional, may be %NULL)
++  *
++  * Determine whether @bio being queued on @q can be merged with a request
++  * on %current's plugged list.  Returns %true if merge was successful,
++  * otherwise %false.
++  *
++  * Plugging coalesces IOs from the same issuer for the same purpose without
++  * going through @q->queue_lock.  As such it's more of an issuing mechanism
++  * than scheduling, and the request, while may have elvpriv data, is not
++  * added on the elevator at this point.  In addition, we don't have
++  * reliable access to the elevator outside queue lock.  Only check basic
++  * merging parameters without querying the elevator.
++  *
++  * Caller must ensure !blk_queue_nomerges(q) beforehand.
++  */
++ bool blk_attempt_plug_merge(struct request_queue *q, struct bio *bio,
++ 		unsigned int nr_segs, struct request **same_queue_rq)
++ {
++ 	struct blk_plug *plug;
++ 	struct request *rq;
++ 	struct list_head *plug_list;
++ 
++ 	plug = blk_mq_plug(q, bio);
++ 	if (!plug)
++ 		return false;
++ 
++ 	plug_list = &plug->mq_list;
++ 
++ 	list_for_each_entry_reverse(rq, plug_list, queuelist) {
++ 		bool merged = false;
++ 
++ 		if (rq->q == q && same_queue_rq) {
++ 			/*
++ 			 * Only blk-mq multiple hardware queues case checks the
++ 			 * rq in the same queue, there should be only one such
++ 			 * rq in a queue
++ 			 **/
++ 			*same_queue_rq = rq;
++ 		}
++ 
++ 		if (rq->q != q || !blk_rq_merge_ok(rq, bio))
++ 			continue;
++ 
++ 		switch (blk_try_merge(rq, bio)) {
++ 		case ELEVATOR_BACK_MERGE:
++ 			merged = bio_attempt_back_merge(rq, bio, nr_segs);
++ 			break;
++ 		case ELEVATOR_FRONT_MERGE:
++ 			merged = bio_attempt_front_merge(rq, bio, nr_segs);
++ 			break;
++ 		case ELEVATOR_DISCARD_MERGE:
++ 			merged = bio_attempt_discard_merge(q, rq, bio);
++ 			break;
++ 		default:
++ 			break;
++ 		}
++ 
++ 		if (merged)
++ 			return true;
++ 	}
++ 
++ 	return false;
++ }
++ 
++ /*
++  * Iterate list of requests and see if we can merge this bio with any
++  * of them.
++  */
++ bool blk_bio_list_merge(struct request_queue *q, struct list_head *list,
++ 			struct bio *bio, unsigned int nr_segs)
++ {
++ 	struct request *rq;
++ 	int checked = 8;
++ 
++ 	list_for_each_entry_reverse(rq, list, queuelist) {
++ 		bool merged = false;
++ 
++ 		if (!checked--)
++ 			break;
++ 
++ 		if (!blk_rq_merge_ok(rq, bio))
++ 			continue;
++ 
++ 		switch (blk_try_merge(rq, bio)) {
++ 		case ELEVATOR_BACK_MERGE:
++ 			if (blk_mq_sched_allow_merge(q, rq, bio))
++ 				merged = bio_attempt_back_merge(rq, bio,
++ 						nr_segs);
++ 			break;
++ 		case ELEVATOR_FRONT_MERGE:
++ 			if (blk_mq_sched_allow_merge(q, rq, bio))
++ 				merged = bio_attempt_front_merge(rq, bio,
++ 						nr_segs);
++ 			break;
++ 		case ELEVATOR_DISCARD_MERGE:
++ 			merged = bio_attempt_discard_merge(q, rq, bio);
++ 			break;
++ 		default:
++ 			continue;
++ 		}
++ 
++ 		return merged;
++ 	}
++ 
++ 	return false;
++ }
++ EXPORT_SYMBOL_GPL(blk_bio_list_merge);
+++>>>>>>> bdc6a287bc98 (block: Move blk_mq_bio_list_merge() into blk-merge.c)
+diff --cc block/blk-mq-sched.c
+index 5b9c2ae8a81c,82acff96c093..000000000000
+--- a/block/blk-mq-sched.c
++++ b/block/blk-mq-sched.c
+@@@ -393,48 -392,6 +393,51 @@@ bool blk_mq_sched_try_merge(struct requ
+  EXPORT_SYMBOL_GPL(blk_mq_sched_try_merge);
+  
+  /*
+++<<<<<<< HEAD
+ + * Iterate list of requests and see if we can merge this bio with any
+ + * of them.
+ + */
+ +bool blk_mq_bio_list_merge(struct request_queue *q, struct list_head *list,
+ +			   struct bio *bio)
+ +{
+ +	struct request *rq;
+ +	int checked = 8;
+ +
+ +	list_for_each_entry_reverse(rq, list, queuelist) {
+ +		bool merged = false;
+ +
+ +		if (!checked--)
+ +			break;
+ +
+ +		if (!blk_rq_merge_ok(rq, bio))
+ +			continue;
+ +
+ +		switch (blk_try_merge(rq, bio)) {
+ +		case ELEVATOR_BACK_MERGE:
+ +			if (blk_mq_sched_allow_merge(q, rq, bio))
+ +				merged = bio_attempt_back_merge(q, rq, bio);
+ +			break;
+ +		case ELEVATOR_FRONT_MERGE:
+ +			if (blk_mq_sched_allow_merge(q, rq, bio))
+ +				merged = bio_attempt_front_merge(q, rq, bio);
+ +			break;
+ +		case ELEVATOR_DISCARD_MERGE:
+ +			merged = bio_attempt_discard_merge(q, rq, bio);
+ +			break;
+ +		default:
+ +			continue;
+ +		}
+ +
+ +		return merged;
+ +	}
+ +
+ +	return false;
+ +}
+ +EXPORT_SYMBOL_GPL(blk_mq_bio_list_merge);
+ +
+ +/*
+++=======
+++>>>>>>> bdc6a287bc98 (block: Move blk_mq_bio_list_merge() into blk-merge.c)
+   * Reverse check our software queue for entries that we could potentially
+   * merge with. Currently includes a hand-wavy stop count of 8, to not spend
+   * too much time checking for merges.
+@@@ -447,7 -405,7 +450,11 @@@ static bool blk_mq_attempt_merge(struc
+  
+  	lockdep_assert_held(&ctx->lock);
+  
+++<<<<<<< HEAD
+ +	if (blk_mq_bio_list_merge(q, &ctx->rq_lists[type], bio)) {
+++=======
++ 	if (blk_bio_list_merge(q, &ctx->rq_lists[type], bio, nr_segs)) {
+++>>>>>>> bdc6a287bc98 (block: Move blk_mq_bio_list_merge() into blk-merge.c)
+  		ctx->rq_merged++;
+  		return true;
+  	}
+diff --cc block/blk.h
+index ab5a1d796429,d6152d20d4e2..000000000000
+--- a/block/blk.h
++++ b/block/blk.h
+@@@ -171,7 -176,9 +171,13 @@@ bool bio_attempt_back_merge(struct requ
+  bool bio_attempt_discard_merge(struct request_queue *q, struct request *req,
+  		struct bio *bio);
+  bool blk_attempt_plug_merge(struct request_queue *q, struct bio *bio,
+++<<<<<<< HEAD
+ +			    struct request **same_queue_rq);
+++=======
++ 		unsigned int nr_segs, struct request **same_queue_rq);
++ bool blk_bio_list_merge(struct request_queue *q, struct list_head *list,
++ 			struct bio *bio, unsigned int nr_segs);
+++>>>>>>> bdc6a287bc98 (block: Move blk_mq_bio_list_merge() into blk-merge.c)
+  
+  void blk_account_io_start(struct request *req);
+  void blk_account_io_done(struct request *req, u64 now);
+diff --cc block/kyber-iosched.c
+index 21ec0f0a1fa9,6d4ba0e9688e..000000000000
+--- a/block/kyber-iosched.c
++++ b/block/kyber-iosched.c
+@@@ -583,7 -573,7 +583,11 @@@ static bool kyber_bio_merge(struct blk_
+  	bool merged;
+  
+  	spin_lock(&kcq->lock);
+++<<<<<<< HEAD
+ +	merged = blk_mq_bio_list_merge(hctx->queue, rq_list, bio);
+++=======
++ 	merged = blk_bio_list_merge(hctx->queue, rq_list, bio, nr_segs);
+++>>>>>>> bdc6a287bc98 (block: Move blk_mq_bio_list_merge() into blk-merge.c)
+  	spin_unlock(&kcq->lock);
+  
+  	return merged;
+diff --cc include/linux/blk-mq.h
+index 4398a1cc6066,21a02e0577dd..000000000000
+--- a/include/linux/blk-mq.h
++++ b/include/linux/blk-mq.h
+@@@ -411,8 -489,6 +411,11 @@@ void blk_mq_kick_requeue_list(struct re
+  void blk_mq_delay_kick_requeue_list(struct request_queue *q, unsigned long msecs);
+  void blk_mq_complete_request(struct request *rq);
+  bool blk_mq_complete_request_remote(struct request *rq);
+++<<<<<<< HEAD
+ +bool blk_mq_bio_list_merge(struct request_queue *q, struct list_head *list,
+ +			   struct bio *bio);
+++=======
+++>>>>>>> bdc6a287bc98 (block: Move blk_mq_bio_list_merge() into blk-merge.c)
+  bool blk_mq_queue_stopped(struct request_queue *q);
+  void blk_mq_stop_hw_queue(struct blk_mq_hw_ctx *hctx);
+  void blk_mq_start_hw_queue(struct blk_mq_hw_ctx *hctx);
+* Unmerged path block/blk-merge.c
+* Unmerged path block/blk-mq-sched.c
+* Unmerged path block/blk.h
+* Unmerged path block/kyber-iosched.c
+* Unmerged path include/linux/blk-mq.h
