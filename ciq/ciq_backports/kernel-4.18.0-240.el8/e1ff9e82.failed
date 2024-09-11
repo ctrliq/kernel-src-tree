@@ -1,0 +1,262 @@
+net: mptcp: improve fallback to TCP
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+Rebuild_CHGLOG: - [net] mptcp: improve fallback to TCP (Florian Westphal) [1858276]
+Rebuild_FUZZ: 92.31%
+commit-author Davide Caratti <dcaratti@redhat.com>
+commit e1ff9e82e2ea53d01540692a85c16a77e1089537
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/e1ff9e82.failed
+
+Keep using MPTCP sockets and a use "dummy mapping" in case of fallback
+to regular TCP. When fallback is triggered, skip addition of the MPTCP
+option on send.
+
+Closes: https://github.com/multipath-tcp/mptcp_net-next/issues/11
+Closes: https://github.com/multipath-tcp/mptcp_net-next/issues/22
+Co-developed-by: Paolo Abeni <pabeni@redhat.com>
+	Signed-off-by: Paolo Abeni <pabeni@redhat.com>
+	Signed-off-by: Davide Caratti <dcaratti@redhat.com>
+	Reviewed-by: Mat Martineau <mathew.j.martineau@linux.intel.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit e1ff9e82e2ea53d01540692a85c16a77e1089537)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/mptcp/options.c
+#	net/mptcp/protocol.c
+#	net/mptcp/protocol.h
+#	net/mptcp/subflow.c
+diff --cc net/mptcp/options.c
+index cef902429d80,b96d3660562f..000000000000
+--- a/net/mptcp/options.c
++++ b/net/mptcp/options.c
+@@@ -817,34 -815,37 +821,42 @@@ void mptcp_incoming_options(struct soc
+  {
+  	struct mptcp_subflow_context *subflow = mptcp_subflow_ctx(sk);
+  	struct mptcp_sock *msk = mptcp_sk(subflow->conn);
+ -	struct mptcp_options_received mp_opt;
+ +	struct mptcp_options_received *mp_opt;
+  	struct mptcp_ext *mpext;
+  
+++<<<<<<< HEAD
+ +	mp_opt = &opt_rx->mptcp;
+ +	if (!check_fully_established(msk, sk, subflow, skb, mp_opt))
+++=======
++ 	if (__mptcp_check_fallback(msk))
++ 		return;
++ 
++ 	mptcp_get_options(skb, &mp_opt);
++ 	if (!check_fully_established(msk, sk, subflow, skb, &mp_opt))
+++>>>>>>> e1ff9e82e2ea (net: mptcp: improve fallback to TCP)
+  		return;
+  
+ -	if (mp_opt.add_addr && add_addr_hmac_valid(msk, &mp_opt)) {
+ +	if (mp_opt->add_addr && add_addr_hmac_valid(msk, mp_opt)) {
+  		struct mptcp_addr_info addr;
+  
+ -		addr.port = htons(mp_opt.port);
+ -		addr.id = mp_opt.addr_id;
+ -		if (mp_opt.family == MPTCP_ADDR_IPVERSION_4) {
+ +		addr.port = htons(mp_opt->port);
+ +		addr.id = mp_opt->addr_id;
+ +		if (mp_opt->family == MPTCP_ADDR_IPVERSION_4) {
+  			addr.family = AF_INET;
+ -			addr.addr = mp_opt.addr;
+ +			addr.addr = mp_opt->addr;
+  		}
+  #if IS_ENABLED(CONFIG_MPTCP_IPV6)
+ -		else if (mp_opt.family == MPTCP_ADDR_IPVERSION_6) {
+ +		else if (mp_opt->family == MPTCP_ADDR_IPVERSION_6) {
+  			addr.family = AF_INET6;
+ -			addr.addr6 = mp_opt.addr6;
+ +			addr.addr6 = mp_opt->addr6;
+  		}
+  #endif
+ -		if (!mp_opt.echo)
+ +		if (!mp_opt->echo)
+  			mptcp_pm_add_addr_received(msk, &addr);
+ -		mp_opt.add_addr = 0;
+ +		mp_opt->add_addr = 0;
+  	}
+  
+ -	if (!mp_opt.dss)
+ +	if (!mp_opt->dss)
+  		return;
+  
+  	/* we can't wait for recvmsg() to update the ack_seq, otherwise
+diff --cc net/mptcp/protocol.c
+index 829a4b559bf8,84ae96be9837..000000000000
+--- a/net/mptcp/protocol.c
++++ b/net/mptcp/protocol.c
+@@@ -701,7 -755,7 +717,11 @@@ static int mptcp_sendmsg(struct sock *s
+  {
+  	int mss_now = 0, size_goal = 0, ret = 0;
+  	struct mptcp_sock *msk = mptcp_sk(sk);
+++<<<<<<< HEAD
+ +	struct socket *ssock;
+++=======
++ 	struct page_frag *pfrag;
+++>>>>>>> e1ff9e82e2ea (net: mptcp: improve fallback to TCP)
+  	size_t copied = 0;
+  	struct sock *ssk;
+  	bool tx_ok;
+@@@ -720,15 -774,7 +740,19 @@@
+  			goto out;
+  	}
+  
+++<<<<<<< HEAD
+ +fallback:
+ +	ssock = __mptcp_tcp_fallback(msk);
+ +	if (unlikely(ssock)) {
+ +		release_sock(sk);
+ +		pr_debug("fallback passthrough");
+ +		ret = sock_sendmsg(ssock, msg);
+ +		return ret >= 0 ? ret + copied : (copied ? copied : ret);
+ +	}
+ +
+++=======
++ 	pfrag = sk_page_frag(sk);
+++>>>>>>> e1ff9e82e2ea (net: mptcp: improve fallback to TCP)
+  restart:
+  	mptcp_clean_una(sk);
+  
+diff --cc net/mptcp/protocol.h
+index 07a6c079534b,a709df659ae0..000000000000
+--- a/net/mptcp/protocol.h
++++ b/net/mptcp/protocol.h
+@@@ -89,6 -88,47 +89,50 @@@
+  #define MPTCP_DATA_READY	0
+  #define MPTCP_SEND_SPACE	1
+  #define MPTCP_WORK_RTX		2
+++<<<<<<< HEAD
+++=======
++ #define MPTCP_WORK_EOF		3
++ #define MPTCP_FALLBACK_DONE	4
++ 
++ struct mptcp_options_received {
++ 	u64	sndr_key;
++ 	u64	rcvr_key;
++ 	u64	data_ack;
++ 	u64	data_seq;
++ 	u32	subflow_seq;
++ 	u16	data_len;
++ 	u16	mp_capable : 1,
++ 		mp_join : 1,
++ 		dss : 1,
++ 		add_addr : 1,
++ 		rm_addr : 1,
++ 		family : 4,
++ 		echo : 1,
++ 		backup : 1;
++ 	u32	token;
++ 	u32	nonce;
++ 	u64	thmac;
++ 	u8	hmac[20];
++ 	u8	join_id;
++ 	u8	use_map:1,
++ 		dsn64:1,
++ 		data_fin:1,
++ 		use_ack:1,
++ 		ack64:1,
++ 		mpc_map:1,
++ 		__unused:2;
++ 	u8	addr_id;
++ 	u8	rm_id;
++ 	union {
++ 		struct in_addr	addr;
++ #if IS_ENABLED(CONFIG_MPTCP_IPV6)
++ 		struct in6_addr	addr6;
++ #endif
++ 	};
++ 	u64	ahmac;
++ 	u16	port;
++ };
+++>>>>>>> e1ff9e82e2ea (net: mptcp: improve fallback to TCP)
+  
+  static inline __be32 mptcp_option(u8 subopt, u8 len, u8 nib, u8 field)
+  {
+diff --cc net/mptcp/subflow.c
+index c928ab97b1e2,cb8a42ff4646..000000000000
+--- a/net/mptcp/subflow.c
++++ b/net/mptcp/subflow.c
+@@@ -218,20 -224,45 +218,56 @@@ static void subflow_finish_connect(stru
+  		parent->sk_state_change(parent);
+  	}
+  
+++<<<<<<< HEAD
+ +	if (subflow->conn_finished || !tcp_sk(sk)->is_mptcp)
+++=======
++ 	/* be sure no special action on any packet other than syn-ack */
++ 	if (subflow->conn_finished)
++ 		return;
++ 
++ 	subflow->conn_finished = 1;
++ 	subflow->ssn_offset = TCP_SKB_CB(skb)->seq;
++ 	pr_debug("subflow=%p synack seq=%x", subflow, subflow->ssn_offset);
++ 
++ 	mptcp_get_options(skb, &mp_opt);
++ 	if (subflow->request_mptcp && mp_opt.mp_capable) {
++ 		subflow->mp_capable = 1;
++ 		subflow->can_ack = 1;
++ 		subflow->remote_key = mp_opt.sndr_key;
++ 		pr_debug("subflow=%p, remote_key=%llu", subflow,
++ 			 subflow->remote_key);
++ 	} else if (subflow->request_join && mp_opt.mp_join) {
++ 		subflow->mp_join = 1;
++ 		subflow->thmac = mp_opt.thmac;
++ 		subflow->remote_nonce = mp_opt.nonce;
++ 		pr_debug("subflow=%p, thmac=%llu, remote_nonce=%u", subflow,
++ 			 subflow->thmac, subflow->remote_nonce);
++ 	} else {
++ 		if (subflow->request_mptcp)
++ 			MPTCP_INC_STATS(sock_net(sk),
++ 					MPTCP_MIB_MPCAPABLEACTIVEFALLBACK);
++ 		mptcp_do_fallback(sk);
++ 		pr_fallback(mptcp_sk(subflow->conn));
++ 	}
++ 
++ 	if (mptcp_check_fallback(sk))
+++>>>>>>> e1ff9e82e2ea (net: mptcp: improve fallback to TCP)
+  		return;
+  
+  	if (subflow->mp_capable) {
+  		pr_debug("subflow=%p, remote_key=%llu", mptcp_subflow_ctx(sk),
+  			 subflow->remote_key);
+  		mptcp_finish_connect(sk);
+ -	} else if (subflow->mp_join) {
+ -		u8 hmac[SHA256_DIGEST_SIZE];
+++<<<<<<< HEAD
+ +		subflow->conn_finished = 1;
+  
+ +		if (skb) {
+ +			pr_debug("synack seq=%u", TCP_SKB_CB(skb)->seq);
+ +			subflow->ssn_offset = TCP_SKB_CB(skb)->seq;
+ +		}
+++=======
+++>>>>>>> e1ff9e82e2ea (net: mptcp: improve fallback to TCP)
+ +	} else if (subflow->mp_join) {
+  		pr_debug("subflow=%p, thmac=%llu, remote_nonce=%u",
+  			 subflow, subflow->thmac,
+  			 subflow->remote_nonce);
+@@@ -243,11 -275,10 +279,8 @@@
+  		subflow_generate_hmac(subflow->local_key, subflow->remote_key,
+  				      subflow->local_nonce,
+  				      subflow->remote_nonce,
+ -				      hmac);
+ -
+ -		memcpy(subflow->hmac, hmac, MPTCPOPT_HMAC_LEN);
+ +				      subflow->hmac);
+  
+- 		if (skb)
+- 			subflow->ssn_offset = TCP_SKB_CB(skb)->seq;
+- 
+  		if (!mptcp_finish_join(sk))
+  			goto do_reset;
+  
+* Unmerged path net/mptcp/options.c
+* Unmerged path net/mptcp/protocol.c
+* Unmerged path net/mptcp/protocol.h
+* Unmerged path net/mptcp/subflow.c
