@@ -1,0 +1,136 @@
+KVM: x86/mmu: Automatically update iter->old_spte if cmpxchg fails
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-408.el8
+commit-author David Matlack <dmatlack@google.com>
+commit 3255530ab191cf75caa2cfc52fe984f5c4c44c74
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-408.el8/3255530a.failed
+
+Consolidate a bunch of code that was manually re-reading the spte if the
+cmpxchg failed. There is no extra cost of doing this because we already
+have the spte value as a result of the cmpxchg (and in fact this
+eliminates re-reading the spte), and none of the call sites depend on
+iter->old_spte retaining the stale spte value.
+
+	Reviewed-by: Ben Gardon <bgardon@google.com>
+	Reviewed-by: Peter Xu <peterx@redhat.com>
+	Reviewed-by: Sean Christopherson <seanjc@google.com>
+	Signed-off-by: David Matlack <dmatlack@google.com>
+Message-Id: <20220119230739.2234394-4-dmatlack@google.com>
+	Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+(cherry picked from commit 3255530ab191cf75caa2cfc52fe984f5c4c44c74)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kvm/mmu/tdp_mmu.c
+diff --cc arch/x86/kvm/mmu/tdp_mmu.c
+index 81d8077f43f3,7b5b02018d8d..000000000000
+--- a/arch/x86/kvm/mmu/tdp_mmu.c
++++ b/arch/x86/kvm/mmu/tdp_mmu.c
+@@@ -504,9 -508,13 +504,12 @@@ static void handle_changed_spte(struct 
+  }
+  
+  /*
+ - * tdp_mmu_set_spte_atomic - Set a TDP MMU SPTE atomically
+ - * and handle the associated bookkeeping.  Do not mark the page dirty
+ - * in KVM's dirty bitmaps.
+ + * tdp_mmu_set_spte_atomic - Set a TDP MMU SPTE atomically and handle the
+ + * associated bookkeeping
+   *
++  * If setting the SPTE fails because it has changed, iter->old_spte will be
++  * refreshed to the current value of the spte.
++  *
+   * @kvm: kvm instance
+   * @iter: a tdp_iter instance currently on the SPTE that should be set
+   * @new_spte: The value the SPTE should be set to
+@@@ -532,12 -544,21 +539,20 @@@ static inline bool tdp_mmu_set_spte_ato
+  	 * Note, fast_pf_fix_direct_spte() can also modify TDP MMU SPTEs and
+  	 * does not hold the mmu_lock.
+  	 */
+- 	if (cmpxchg64(rcu_dereference(iter->sptep), iter->old_spte,
+- 		      new_spte) != iter->old_spte)
++ 	old_spte = cmpxchg64(sptep, iter->old_spte, new_spte);
++ 	if (old_spte != iter->old_spte) {
++ 		/*
++ 		 * The page table entry was modified by a different logical
++ 		 * CPU. Refresh iter->old_spte with the current value so the
++ 		 * caller operates on fresh data, e.g. if it retries
++ 		 * tdp_mmu_set_spte_atomic().
++ 		 */
++ 		iter->old_spte = old_spte;
+  		return false;
++ 	}
+  
+ -	__handle_changed_spte(kvm, iter->as_id, iter->gfn, iter->old_spte,
+ -			      new_spte, iter->level, true);
+ -	handle_changed_spte_acc_track(iter->old_spte, new_spte, iter->level);
+ +	handle_changed_spte(kvm, iter->as_id, iter->gfn, iter->old_spte,
+ +			    new_spte, iter->level, true);
+  
+  	return true;
+  }
+@@@ -732,8 -782,12 +747,17 @@@ static bool zap_gfn_range(struct kvm *k
+  		    !is_last_spte(iter.old_spte, iter.level))
+  			continue;
+  
+++<<<<<<< HEAD
+ +		tdp_mmu_set_spte(kvm, &iter, 0);
+ +		flush = true;
+++=======
++ 		if (!shared) {
++ 			tdp_mmu_set_spte(kvm, &iter, 0);
++ 			flush = true;
++ 		} else if (!tdp_mmu_zap_spte_atomic(kvm, &iter)) {
++ 			goto retry;
++ 		}
+++>>>>>>> 3255530ab191 (KVM: x86/mmu: Automatically update iter->old_spte if cmpxchg fails)
+  	}
+  
+  	rcu_read_unlock();
+@@@ -1248,7 -1218,9 +1272,13 @@@ static bool wrprot_gfn_range(struct kv
+  
+  		new_spte = iter.old_spte & ~PT_WRITABLE_MASK;
+  
+++<<<<<<< HEAD
+ +		tdp_mmu_set_spte_no_dirty_log(kvm, &iter, new_spte);
+++=======
++ 		if (!tdp_mmu_set_spte_atomic(kvm, &iter, new_spte))
++ 			goto retry;
++ 
+++>>>>>>> 3255530ab191 (KVM: x86/mmu: Automatically update iter->old_spte if cmpxchg fails)
+  		spte_set = true;
+  	}
+  
+@@@ -1306,7 -1281,9 +1336,13 @@@ static bool clear_dirty_gfn_range(struc
+  				continue;
+  		}
+  
+++<<<<<<< HEAD
+ +		tdp_mmu_set_spte_no_dirty_log(kvm, &iter, new_spte);
+++=======
++ 		if (!tdp_mmu_set_spte_atomic(kvm, &iter, new_spte))
++ 			goto retry;
++ 
+++>>>>>>> 3255530ab191 (KVM: x86/mmu: Automatically update iter->old_spte if cmpxchg fails)
+  		spte_set = true;
+  	}
+  
+@@@ -1428,9 -1406,9 +1464,15 @@@ static bool zap_collapsible_spte_range(
+  							    pfn, PG_LEVEL_NUM))
+  			continue;
+  
+++<<<<<<< HEAD
+ +		tdp_mmu_set_spte(kvm, &iter, 0);
+ +
+ +		flush = true;
+++=======
++ 		/* Note, a successful atomic zap also does a remote TLB flush. */
++ 		if (!tdp_mmu_zap_spte_atomic(kvm, &iter))
++ 			goto retry;
+++>>>>>>> 3255530ab191 (KVM: x86/mmu: Automatically update iter->old_spte if cmpxchg fails)
+  	}
+  
+  	rcu_read_unlock();
+* Unmerged path arch/x86/kvm/mmu/tdp_mmu.c
