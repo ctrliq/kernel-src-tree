@@ -1,0 +1,86 @@
+sd_zbc: Fix report zones buffer allocation
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Damien Le Moal <damien.lemoal@wdc.com>
+commit b091ac616846a1da75b1f2566b41255ce7f0e0a6
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/b091ac61.failed
+
+During disk scan and revalidation done with sd_revalidate(), the zones
+of a zoned disk are checked using the helper function
+blk_revalidate_disk_zones() if a configuration change is detected
+(change in the number of zones or zone size). The function
+blk_revalidate_disk_zones() issues report_zones calls that are very
+large, that is, to obtain zone information for all zones of the disk
+with a single command. The size of the report zones command buffer
+necessary for such large request generally is lower than the disk
+max_hw_sectors and KMALLOC_MAX_SIZE (4MB) and succeeds on boot (no
+memory fragmentation), but often fail at run time (e.g. hot-plug
+event). This causes the disk revalidation to fail and the disk
+capacity to be changed to 0.
+
+This problem can be avoided by using vmalloc() instead of kmalloc() for
+the buffer allocation. To limit the amount of memory to be allocated,
+this patch also introduces the arbitrary SD_ZBC_REPORT_MAX_ZONES
+maximum number of zones to report with a single report zones command.
+This limit may be lowered further to satisfy the disk max_hw_sectors
+limit. Finally, to ensure that the vmalloc-ed buffer can always be
+mapped in a request, the buffer size is further limited to at most
+queue_max_segments() pages, allowing successful mapping of the buffer
+even in the worst case scenario where none of the buffer pages are
+contiguous.
+
+Fixes: 515ce6061312 ("scsi: sd_zbc: Fix sd_zbc_report_zones() buffer allocation")
+Fixes: e76239a3748c ("block: add a report_zones method")
+	Cc: stable@vger.kernel.org
+	Reviewed-by: Christoph Hellwig <hch@lst.de>
+	Reviewed-by: Martin K. Petersen <martin.petersen@oracle.com>
+	Signed-off-by: Damien Le Moal <damien.lemoal@wdc.com>
+	Signed-off-by: Jens Axboe <axboe@kernel.dk>
+(cherry picked from commit b091ac616846a1da75b1f2566b41255ce7f0e0a6)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/scsi/sd_zbc.c
+diff --cc drivers/scsi/sd_zbc.c
+index 4e15db16e91e,db16c19e05c4..000000000000
+--- a/drivers/scsi/sd_zbc.c
++++ b/drivers/scsi/sd_zbc.c
+@@@ -114,27 -161,19 +162,31 @@@ static void *sd_zbc_alloc_report_buffer
+   * Execute a report zones command on the target disk.
+   */
+  int sd_zbc_report_zones(struct gendisk *disk, sector_t sector,
+ -			struct blk_zone *zones, unsigned int *nr_zones)
+ +			struct blk_zone *zones, unsigned int *nr_zones,
+ +			gfp_t gfp_mask)
+  {
+  	struct scsi_disk *sdkp = scsi_disk(disk);
+- 	unsigned int i, buflen, nrz = *nr_zones;
++ 	unsigned int i, nrz = *nr_zones;
+  	unsigned char *buf;
+- 	size_t offset = 0;
++ 	size_t buflen = 0, offset = 0;
+  	int ret = 0;
+  
+  	if (!sd_is_zoned(sdkp))
+  		/* Not a zoned device */
+  		return -EOPNOTSUPP;
+  
+++<<<<<<< HEAD
+ +	/*
+ +	 * Get a reply buffer for the number of requested zones plus a header,
+ +	 * without exceeding the device maximum command size. For ATA disks,
+ +	 * buffers must be aligned to 512B.
+ +	 */
+ +	buflen = min(queue_max_hw_sectors(disk->queue) << 9,
+ +		     roundup((nrz + 1) * 64, 512));
+ +	buf = kmalloc(buflen, gfp_mask);
+++=======
++ 	buf = sd_zbc_alloc_report_buffer(sdkp, nrz, &buflen);
+++>>>>>>> b091ac616846 (sd_zbc: Fix report zones buffer allocation)
+  	if (!buf)
+  		return -ENOMEM;
+  
+* Unmerged path drivers/scsi/sd_zbc.c
