@@ -1,0 +1,135 @@
+KVM: x86/mmu: Protect marking SPs unsync when using TDP MMU with spinlock
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-408.el8
+commit-author Sean Christopherson <seanjc@google.com>
+commit ce25681d59ffc4303321e555a2d71b1946af07da
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-408.el8/ce25681d.failed
+
+Add yet another spinlock for the TDP MMU and take it when marking indirect
+shadow pages unsync.  When using the TDP MMU and L1 is running L2(s) with
+nested TDP, KVM may encounter shadow pages for the TDP entries managed by
+L1 (controlling L2) when handling a TDP MMU page fault.  The unsync logic
+is not thread safe, e.g. the kvm_mmu_page fields are not atomic, and
+misbehaves when a shadow page is marked unsync via a TDP MMU page fault,
+which runs with mmu_lock held for read, not write.
+
+Lack of a critical section manifests most visibly as an underflow of
+unsync_children in clear_unsync_child_bit() due to unsync_children being
+corrupted when multiple CPUs write it without a critical section and
+without atomic operations.  But underflow is the best case scenario.  The
+worst case scenario is that unsync_children prematurely hits '0' and
+leads to guest memory corruption due to KVM neglecting to properly sync
+shadow pages.
+
+Use an entirely new spinlock even though piggybacking tdp_mmu_pages_lock
+would functionally be ok.  Usurping the lock could degrade performance when
+building upper level page tables on different vCPUs, especially since the
+unsync flow could hold the lock for a comparatively long time depending on
+the number of indirect shadow pages and the depth of the paging tree.
+
+For simplicity, take the lock for all MMUs, even though KVM could fairly
+easily know that mmu_lock is held for write.  If mmu_lock is held for
+write, there cannot be contention for the inner spinlock, and marking
+shadow pages unsync across multiple vCPUs will be slow enough that
+bouncing the kvm_arch cacheline should be in the noise.
+
+Note, even though L2 could theoretically be given access to its own EPT
+entries, a nested MMU must hold mmu_lock for write and thus cannot race
+against a TDP MMU page fault.  I.e. the additional spinlock only _needs_ to
+be taken by the TDP MMU, as opposed to being taken by any MMU for a VM
+that is running with the TDP MMU enabled.  Holding mmu_lock for read also
+prevents the indirect shadow page from being freed.  But as above, keep
+it simple and always take the lock.
+
+Alternative #1, the TDP MMU could simply pass "false" for can_unsync and
+effectively disable unsync behavior for nested TDP.  Write protecting leaf
+shadow pages is unlikely to noticeably impact traditional L1 VMMs, as such
+VMMs typically don't modify TDP entries, but the same may not hold true for
+non-standard use cases and/or VMMs that are migrating physical pages (from
+L1's perspective).
+
+Alternative #2, the unsync logic could be made thread safe.  In theory,
+simply converting all relevant kvm_mmu_page fields to atomics and using
+atomic bitops for the bitmap would suffice.  However, (a) an in-depth audit
+would be required, (b) the code churn would be substantial, and (c) legacy
+shadow paging would incur additional atomic operations in performance
+sensitive paths for no benefit (to legacy shadow paging).
+
+Fixes: a2855afc7ee8 ("KVM: x86/mmu: Allow parallel page faults for the TDP MMU")
+	Cc: stable@vger.kernel.org
+	Cc: Ben Gardon <bgardon@google.com>
+	Signed-off-by: Sean Christopherson <seanjc@google.com>
+Message-Id: <20210812181815.3378104-1-seanjc@google.com>
+	Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+(cherry picked from commit ce25681d59ffc4303321e555a2d71b1946af07da)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kvm/mmu/mmu.c
+diff --cc arch/x86/kvm/mmu/mmu.c
+index 4c612c0dc324,47b765270239..000000000000
+--- a/arch/x86/kvm/mmu/mmu.c
++++ b/arch/x86/kvm/mmu/mmu.c
+@@@ -5664,9 -5563,15 +5690,21 @@@ void kvm_mmu_init_vm(struct kvm *kvm
+  {
+  	struct kvm_page_track_notifier_node *node = &kvm->arch.mmu_sp_tracker;
+  
+++<<<<<<< HEAD
+ +	kvm_mmu_init_tdp_mmu(kvm);
+ +
+ +	kvm->arch.memslots_have_rmaps = true;
+++=======
++ 	spin_lock_init(&kvm->arch.mmu_unsync_pages_lock);
++ 
++ 	if (!kvm_mmu_init_tdp_mmu(kvm))
++ 		/*
++ 		 * No smp_load/store wrappers needed here as we are in
++ 		 * VM init and there cannot be any memslots / other threads
++ 		 * accessing this struct kvm yet.
++ 		 */
++ 		kvm->arch.memslots_have_rmaps = true;
+++>>>>>>> ce25681d59ff (KVM: x86/mmu: Protect marking SPs unsync when using TDP MMU with spinlock)
+  
+  	node->track_write = kvm_mmu_pte_write;
+  	node->track_flush_slot = kvm_mmu_invalidate_zap_pages_in_memslot;
+diff --git a/Documentation/virt/kvm/locking.rst b/Documentation/virt/kvm/locking.rst
+index 35eca377543d..88fa495abbac 100644
+--- a/Documentation/virt/kvm/locking.rst
++++ b/Documentation/virt/kvm/locking.rst
+@@ -25,10 +25,10 @@ On x86:
+ 
+ - vcpu->mutex is taken outside kvm->arch.hyperv.hv_lock
+ 
+-- kvm->arch.mmu_lock is an rwlock.  kvm->arch.tdp_mmu_pages_lock is
+-  taken inside kvm->arch.mmu_lock, and cannot be taken without already
+-  holding kvm->arch.mmu_lock (typically with ``read_lock``, otherwise
+-  there's no need to take kvm->arch.tdp_mmu_pages_lock at all).
++- kvm->arch.mmu_lock is an rwlock.  kvm->arch.tdp_mmu_pages_lock and
++  kvm->arch.mmu_unsync_pages_lock are taken inside kvm->arch.mmu_lock, and
++  cannot be taken without already holding kvm->arch.mmu_lock (typically with
++  ``read_lock`` for the TDP MMU, thus the need for additional spinlocks).
+ 
+ Everything else is a leaf: no other lock is taken inside the critical
+ sections.
+diff --git a/arch/x86/include/asm/kvm_host.h b/arch/x86/include/asm/kvm_host.h
+index c108053d930b..f53b335fddfe 100644
+--- a/arch/x86/include/asm/kvm_host.h
++++ b/arch/x86/include/asm/kvm_host.h
+@@ -1050,6 +1050,13 @@ struct kvm_arch {
+ 	struct list_head lpage_disallowed_mmu_pages;
+ 	struct kvm_page_track_notifier_node mmu_sp_tracker;
+ 	struct kvm_page_track_notifier_head track_notifier_head;
++	/*
++	 * Protects marking pages unsync during page faults, as TDP MMU page
++	 * faults only take mmu_lock for read.  For simplicity, the unsync
++	 * pages lock is always taken when marking pages unsync regardless of
++	 * whether mmu_lock is held for read or write.
++	 */
++	spinlock_t mmu_unsync_pages_lock;
+ 
+ 	struct list_head assigned_dev_head;
+ 	struct iommu_domain *iommu_domain;
+* Unmerged path arch/x86/kvm/mmu/mmu.c
