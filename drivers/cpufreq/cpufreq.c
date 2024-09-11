@@ -2392,7 +2392,10 @@ int cpufreq_set_policy(struct cpufreq_policy *policy,
 	new_policy->min = dev_pm_qos_read_value(cpu_dev, DEV_PM_QOS_MIN_FREQUENCY);
 	new_policy->max = dev_pm_qos_read_value(cpu_dev, DEV_PM_QOS_MAX_FREQUENCY);
 
-	/* verify the cpu speed can be set within this limit */
+	/*
+	 * Verify that the CPU speed can be set within these limits and make sure
+	 * that min <= max.
+	 */
 	ret = cpufreq_driver->verify(new_policy);
 	if (ret)
 		return ret;
