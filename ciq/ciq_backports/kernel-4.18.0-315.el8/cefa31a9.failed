@@ -1,0 +1,137 @@
+netfilter: nft_log: perform module load from nf_tables
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-315.el8
+commit-author Florian Westphal <fw@strlen.de>
+commit cefa31a9d46112c0706c218ea549bccf298a0068
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-315.el8/cefa31a9.failed
+
+modprobe calls from the nf_logger_find_get() API causes deadlock in very
+special cases because they occur with the nf_tables transaction mutex held.
+
+In the specific case of nf_log, deadlock is via:
+
+ A nf_tables -> transaction mutex -> nft_log -> modprobe -> nf_log_syslog \
+	    -> pernet_ops rwsem -> wait for C
+ B netlink event -> rtnl_mutex -> nf_tables transaction mutex -> wait for A
+ C close() -> ip6mr_sk_done -> rtnl_mutex -> wait for B
+
+Earlier patch added NFLOG/xt_LOG module softdeps to avoid the need to load
+the backend module during a transaction.
+
+For nft_log we would have to add a softdep for both nfnetlink_log or
+nf_log_syslog, since we do not know in advance which of the two backends
+are going to be configured.
+
+This defers the modprobe op until after the transaction mutex is released.
+
+	Tested-by: Phil Sutter <phil@nwl.cc>
+	Signed-off-by: Florian Westphal <fw@strlen.de>
+	Signed-off-by: Pablo Neira Ayuso <pablo@netfilter.org>
+(cherry picked from commit cefa31a9d46112c0706c218ea549bccf298a0068)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/net/netfilter/nf_tables.h
+diff --cc include/net/netfilter/nf_tables.h
+index f2e03a3cc4be,8fefa112ae89..000000000000
+--- a/include/net/netfilter/nf_tables.h
++++ b/include/net/netfilter/nf_tables.h
+@@@ -1467,4 -1556,15 +1467,18 @@@ void nft_chain_filter_fini(void)
+  
+  void __init nft_chain_route_init(void);
+  void nft_chain_route_fini(void);
+++<<<<<<< HEAD
+++=======
++ 
++ void nf_tables_trans_destroy_flush_work(void);
++ 
++ int nf_msecs_to_jiffies64(const struct nlattr *nla, u64 *result);
++ __be64 nf_jiffies64_to_msecs(u64 input);
++ 
++ #ifdef CONFIG_MODULES
++ __printf(2, 3) int nft_request_module(struct net *net, const char *fmt, ...);
++ #else
++ static inline int nft_request_module(struct net *net, const char *fmt, ...) { return -ENOENT; }
++ #endif
+++>>>>>>> cefa31a9d461 (netfilter: nft_log: perform module load from nf_tables)
+  #endif /* _NET_NF_TABLES_H */
+* Unmerged path include/net/netfilter/nf_tables.h
+diff --git a/net/netfilter/nf_log.c b/net/netfilter/nf_log.c
+index a61d6df6e5f6..206c6fd386e6 100644
+--- a/net/netfilter/nf_log.c
++++ b/net/netfilter/nf_log.c
+@@ -176,9 +176,6 @@ int nf_logger_find_get(int pf, enum nf_log_type type)
+ 		return 0;
+ 	}
+ 
+-	if (rcu_access_pointer(loggers[pf][type]) == NULL)
+-		request_module("nf-logger-%u-%u", pf, type);
+-
+ 	rcu_read_lock();
+ 	logger = rcu_dereference(loggers[pf][type]);
+ 	if (logger == NULL)
+diff --git a/net/netfilter/nf_tables_api.c b/net/netfilter/nf_tables_api.c
+index 94134a2f2b50..31c1ed2c27eb 100644
+--- a/net/netfilter/nf_tables_api.c
++++ b/net/netfilter/nf_tables_api.c
+@@ -578,8 +578,8 @@ struct nft_module_request {
+ };
+ 
+ #ifdef CONFIG_MODULES
+-static __printf(2, 3) int nft_request_module(struct net *net, const char *fmt,
+-					     ...)
++__printf(2, 3) int nft_request_module(struct net *net, const char *fmt,
++				      ...)
+ {
+ 	char module_name[MODULE_NAME_LEN];
+ 	struct nft_module_request *req;
+@@ -612,6 +612,7 @@ static __printf(2, 3) int nft_request_module(struct net *net, const char *fmt,
+ 
+ 	return -EAGAIN;
+ }
++EXPORT_SYMBOL_GPL(nft_request_module);
+ #endif
+ 
+ static void lockdep_nfnl_nft_mutex_not_held(void)
+diff --git a/net/netfilter/nft_log.c b/net/netfilter/nft_log.c
+index 655187bed5d8..63071c6ab249 100644
+--- a/net/netfilter/nft_log.c
++++ b/net/netfilter/nft_log.c
+@@ -131,6 +131,20 @@ static const struct nla_policy nft_log_policy[NFTA_LOG_MAX + 1] = {
+ 	[NFTA_LOG_FLAGS]	= { .type = NLA_U32 },
+ };
+ 
++static int nft_log_modprobe(struct net *net, enum nf_log_type t)
++{
++	switch (t) {
++	case NF_LOG_TYPE_LOG:
++		return nft_request_module(net, "%s", "nf_log_syslog");
++	case NF_LOG_TYPE_ULOG:
++		return nft_request_module(net, "%s", "nfnetlink_log");
++	case NF_LOG_TYPE_MAX:
++		break;
++	}
++
++	return -ENOENT;
++}
++
+ static int nft_log_init(const struct nft_ctx *ctx,
+ 			const struct nft_expr *expr,
+ 			const struct nlattr * const tb[])
+@@ -200,8 +214,12 @@ static int nft_log_init(const struct nft_ctx *ctx,
+ 		return 0;
+ 
+ 	err = nf_logger_find_get(ctx->family, li->type);
+-	if (err < 0)
++	if (err < 0) {
++		if (nft_log_modprobe(ctx->net, li->type) == -EAGAIN)
++			err = -EAGAIN;
++
+ 		goto err1;
++	}
+ 
+ 	return 0;
+ 
