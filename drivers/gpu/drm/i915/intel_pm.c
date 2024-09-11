@@ -4344,6 +4344,17 @@ icl_get_total_relative_data_rate(struct intel_crtc_state *intel_cstate,
 	return total_data_rate;
 }
 
+static const struct skl_wm_level *
+skl_plane_wm_level(const struct intel_crtc_state *crtc_state,
+		   enum plane_id plane_id,
+		   int level)
+{
+	const struct skl_plane_wm *wm =
+		&crtc_state->wm.skl.optimal.planes[plane_id];
+
+	return &wm->wm[level];
+}
+
 static int
 skl_allocate_pipe_ddb(struct intel_crtc_state *cstate,
 		      struct skl_ddb_allocation *ddb /* out */)
@@ -5173,8 +5184,12 @@ void skl_write_plane_wm(struct intel_plane *plane,
 		&crtc_state->wm.skl.plane_ddb_uv[plane_id];
 
 	for (level = 0; level <= max_level; level++) {
+		const struct skl_wm_level *wm_level;
+
+		wm_level = skl_plane_wm_level(crtc_state, plane_id, level);
+
 		skl_write_wm_level(dev_priv, PLANE_WM(pipe, plane_id, level),
-				   &wm->wm[level]);
+				   wm_level);
 	}
 	skl_write_wm_level(dev_priv, PLANE_WM_TRANS(pipe, plane_id),
 			   &wm->trans_wm);
@@ -5207,8 +5222,12 @@ void skl_write_cursor_wm(struct intel_plane *plane,
 		&crtc_state->wm.skl.plane_ddb_y[plane_id];
 
 	for (level = 0; level <= max_level; level++) {
+		const struct skl_wm_level *wm_level;
+
+		wm_level = skl_plane_wm_level(crtc_state, plane_id, level);
+
 		skl_write_wm_level(dev_priv, CUR_WM(pipe, level),
-				   &wm->wm[level]);
+				   wm_level);
 	}
 	skl_write_wm_level(dev_priv, CUR_WM_TRANS(pipe), &wm->trans_wm);
 
