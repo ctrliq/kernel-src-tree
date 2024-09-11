@@ -4887,7 +4887,6 @@ static void qeth_core_free_card(struct qeth_card *card)
 	qeth_clean_channel(&card->data);
 	qeth_put_cmd(card->read_cmd);
 	destroy_workqueue(card->event_wq);
-	qeth_free_qdio_queues(card);
 	unregister_service_level(&card->qeth_service_level);
 	dev_set_drvdata(&card->gdev->dev, NULL);
 	kfree(card);
@@ -5802,6 +5801,8 @@ static void qeth_core_remove_device(struct ccwgroup_device *gdev)
 		card->discipline->remove(gdev);
 		qeth_core_free_discipline(card);
 	}
+
+	qeth_free_qdio_queues(card);
 
 	free_netdev(card->dev);
 	qeth_core_free_card(card);
