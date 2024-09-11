@@ -1,0 +1,136 @@
+io_uring: properly mark async work as bounded vs unbounded
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Jens Axboe <axboe@kernel.dk>
+commit 5f8fd2d3e0a7aa7fc9d97226be24286edd289835
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/5f8fd2d3.failed
+
+Now that io-wq supports separating the two request lifetime types, mark
+the following IO as having unbounded runtimes:
+
+- Any read/write to a non-regular file
+- Any specific networked IO
+- Any poll command
+
+	Signed-off-by: Jens Axboe <axboe@kernel.dk>
+(cherry picked from commit 5f8fd2d3e0a7aa7fc9d97226be24286edd289835)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/io_uring.c
+diff --cc fs/io_uring.c
+index fca9cdc96d77,02a4f5e8a6e4..000000000000
+--- a/fs/io_uring.c
++++ b/fs/io_uring.c
+@@@ -476,12 -505,66 +476,30 @@@ static inline void io_queue_async_work(
+  		switch (req->submit.sqe->opcode) {
+  		case IORING_OP_WRITEV:
+  		case IORING_OP_WRITE_FIXED:
+++<<<<<<< HEAD
+ +			rw = !(req->rw.ki_flags & IOCB_DIRECT);
+++=======
++ 			do_hashed = true;
++ 			/* fall-through */
++ 		case IORING_OP_READV:
++ 		case IORING_OP_READ_FIXED:
++ 		case IORING_OP_SENDMSG:
++ 		case IORING_OP_RECVMSG:
++ 		case IORING_OP_ACCEPT:
++ 		case IORING_OP_POLL_ADD:
++ 			/*
++ 			 * We know REQ_F_ISREG is not set on some of these
++ 			 * opcodes, but this enables us to keep the check in
++ 			 * just one place.
++ 			 */
++ 			if (!(req->flags & REQ_F_ISREG))
++ 				req->work.flags |= IO_WQ_WORK_UNBOUND;
+++>>>>>>> 5f8fd2d3e0a7 (io_uring: properly mark async work as bounded vs unbounded)
+  			break;
+  		}
+ -		if (io_sqe_needs_user(req->submit.sqe))
+ -			req->work.flags |= IO_WQ_WORK_NEEDS_USER;
+ -	}
+ -
+ -	return do_hashed;
+ -}
+ -
+ -static inline void io_queue_async_work(struct io_ring_ctx *ctx,
+ -				       struct io_kiocb *req)
+ -{
+ -	bool do_hashed = io_prep_async_work(req);
+ -
+ -	trace_io_uring_queue_async_work(ctx, do_hashed, req, &req->work,
+ -					req->flags);
+ -	if (!do_hashed) {
+ -		io_wq_enqueue(ctx->io_wq, &req->work);
+ -	} else {
+ -		io_wq_enqueue_hashed(ctx->io_wq, &req->work,
+ -					file_inode(req->file));
+  	}
+ -}
+ -
+ -static void io_kill_timeout(struct io_kiocb *req)
+ -{
+ -	int ret;
+ -
+ -	ret = hrtimer_try_to_cancel(&req->timeout.timer);
+ -	if (ret != -1) {
+ -		atomic_inc(&req->ctx->cq_timeouts);
+ -		list_del_init(&req->list);
+ -		io_cqring_fill_event(req, 0);
+ -		io_put_req(req, NULL);
+ -	}
+ -}
+  
+ -static void io_kill_timeouts(struct io_ring_ctx *ctx)
+ -{
+ -	struct io_kiocb *req, *tmp;
+ -
+ -	spin_lock_irq(&ctx->completion_lock);
+ -	list_for_each_entry_safe(req, tmp, &ctx->timeout_list, list)
+ -		io_kill_timeout(req);
+ -	spin_unlock_irq(&ctx->completion_lock);
+ +	queue_work(ctx->sqo_wq[rw], &req->work);
+  }
+  
+  static void io_commit_cqring(struct io_ring_ctx *ctx)
+@@@ -3173,26 -3757,12 +3191,35 @@@ static int io_sq_offload_start(struct i
+  		goto err;
+  	}
+  
+++<<<<<<< HEAD
+ +	/* Do QD, or 2 * CPUS, whatever is smallest */
+ +	ctx->sqo_wq[0] = alloc_workqueue("io_ring-wq",
+ +			WQ_UNBOUND | WQ_FREEZABLE,
+ +			min(ctx->sq_entries - 1, 2 * num_online_cpus()));
+ +	if (!ctx->sqo_wq[0]) {
+ +		ret = -ENOMEM;
+ +		goto err;
+ +	}
+ +
+ +	/*
+ +	 * This is for buffered writes, where we want to limit the parallelism
+ +	 * due to file locking in file systems. As "normal" buffered writes
+ +	 * should parellelize on writeout quite nicely, limit us to having 2
+ +	 * pending. This avoids massive contention on the inode when doing
+ +	 * buffered async writes.
+ +	 */
+ +	ctx->sqo_wq[1] = alloc_workqueue("io_ring-write-wq",
+ +						WQ_UNBOUND | WQ_FREEZABLE, 2);
+ +	if (!ctx->sqo_wq[1]) {
+ +		ret = -ENOMEM;
+++=======
++ 	/* Do QD, or 4 * CPUS, whatever is smallest */
++ 	concurrency = min(ctx->sq_entries, 4 * num_online_cpus());
++ 	ctx->io_wq = io_wq_create(concurrency, ctx->sqo_mm, ctx->user);
++ 	if (IS_ERR(ctx->io_wq)) {
++ 		ret = PTR_ERR(ctx->io_wq);
++ 		ctx->io_wq = NULL;
+++>>>>>>> 5f8fd2d3e0a7 (io_uring: properly mark async work as bounded vs unbounded)
+  		goto err;
+  	}
+  
+* Unmerged path fs/io_uring.c
