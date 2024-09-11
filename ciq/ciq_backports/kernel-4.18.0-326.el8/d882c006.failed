@@ -1,0 +1,298 @@
+mm: pass migratetype into memmap_init_zone() and move_pfn_range_to_zone()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-326.el8
+commit-author David Hildenbrand <david@redhat.com>
+commit d882c0067d99d0f2add9a41628703cc99511a639
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-326.el8/d882c006.failed
+
+On the memory onlining path, we want to start with MIGRATE_ISOLATE, to
+un-isolate the pages after memory onlining is complete.  Let's allow
+passing in the migratetype.
+
+	Signed-off-by: David Hildenbrand <david@redhat.com>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Reviewed-by: Oscar Salvador <osalvador@suse.de>
+	Acked-by: Michal Hocko <mhocko@suse.com>
+	Cc: Wei Yang <richard.weiyang@linux.alibaba.com>
+	Cc: Baoquan He <bhe@redhat.com>
+	Cc: Pankaj Gupta <pankaj.gupta.linux@gmail.com>
+	Cc: Tony Luck <tony.luck@intel.com>
+	Cc: Fenghua Yu <fenghua.yu@intel.com>
+	Cc: Logan Gunthorpe <logang@deltatee.com>
+	Cc: Dan Williams <dan.j.williams@intel.com>
+	Cc: Mike Rapoport <rppt@kernel.org>
+	Cc: "Matthew Wilcox (Oracle)" <willy@infradead.org>
+	Cc: Michel Lespinasse <walken@google.com>
+	Cc: Charan Teja Reddy <charante@codeaurora.org>
+	Cc: Mel Gorman <mgorman@techsingularity.net>
+Link: https://lkml.kernel.org/r/20200819175957.28465-10-david@redhat.com
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit d882c0067d99d0f2add9a41628703cc99511a639)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	mm/memremap.c
+diff --cc mm/memremap.c
+index 03e38b7a38f1,73a206d0f645..000000000000
+--- a/mm/memremap.c
++++ b/mm/memremap.c
+@@@ -175,6 -186,115 +175,118 @@@ static void dev_pagemap_percpu_release(
+  	complete(&pgmap->done);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static int pagemap_range(struct dev_pagemap *pgmap, struct mhp_params *params,
++ 		int range_id, int nid)
++ {
++ 	struct range *range = &pgmap->ranges[range_id];
++ 	struct dev_pagemap *conflict_pgmap;
++ 	int error, is_ram;
++ 
++ 	if (WARN_ONCE(pgmap_altmap(pgmap) && range_id > 0,
++ 				"altmap not supported for multiple ranges\n"))
++ 		return -EINVAL;
++ 
++ 	conflict_pgmap = get_dev_pagemap(PHYS_PFN(range->start), NULL);
++ 	if (conflict_pgmap) {
++ 		WARN(1, "Conflicting mapping in same section\n");
++ 		put_dev_pagemap(conflict_pgmap);
++ 		return -ENOMEM;
++ 	}
++ 
++ 	conflict_pgmap = get_dev_pagemap(PHYS_PFN(range->end), NULL);
++ 	if (conflict_pgmap) {
++ 		WARN(1, "Conflicting mapping in same section\n");
++ 		put_dev_pagemap(conflict_pgmap);
++ 		return -ENOMEM;
++ 	}
++ 
++ 	is_ram = region_intersects(range->start, range_len(range),
++ 		IORESOURCE_SYSTEM_RAM, IORES_DESC_NONE);
++ 
++ 	if (is_ram != REGION_DISJOINT) {
++ 		WARN_ONCE(1, "attempted on %s region %#llx-%#llx\n",
++ 				is_ram == REGION_MIXED ? "mixed" : "ram",
++ 				range->start, range->end);
++ 		return -ENXIO;
++ 	}
++ 
++ 	error = xa_err(xa_store_range(&pgmap_array, PHYS_PFN(range->start),
++ 				PHYS_PFN(range->end), pgmap, GFP_KERNEL));
++ 	if (error)
++ 		return error;
++ 
++ 	if (nid < 0)
++ 		nid = numa_mem_id();
++ 
++ 	error = track_pfn_remap(NULL, &params->pgprot, PHYS_PFN(range->start), 0,
++ 			range_len(range));
++ 	if (error)
++ 		goto err_pfn_remap;
++ 
++ 	mem_hotplug_begin();
++ 
++ 	/*
++ 	 * For device private memory we call add_pages() as we only need to
++ 	 * allocate and initialize struct page for the device memory. More-
++ 	 * over the device memory is un-accessible thus we do not want to
++ 	 * create a linear mapping for the memory like arch_add_memory()
++ 	 * would do.
++ 	 *
++ 	 * For all other device memory types, which are accessible by
++ 	 * the CPU, we do want the linear mapping and thus use
++ 	 * arch_add_memory().
++ 	 */
++ 	if (pgmap->type == MEMORY_DEVICE_PRIVATE) {
++ 		error = add_pages(nid, PHYS_PFN(range->start),
++ 				PHYS_PFN(range_len(range)), params);
++ 	} else {
++ 		error = kasan_add_zero_shadow(__va(range->start), range_len(range));
++ 		if (error) {
++ 			mem_hotplug_done();
++ 			goto err_kasan;
++ 		}
++ 
++ 		error = arch_add_memory(nid, range->start, range_len(range),
++ 					params);
++ 	}
++ 
++ 	if (!error) {
++ 		struct zone *zone;
++ 
++ 		zone = &NODE_DATA(nid)->node_zones[ZONE_DEVICE];
++ 		move_pfn_range_to_zone(zone, PHYS_PFN(range->start),
++ 				PHYS_PFN(range_len(range)), params->altmap,
++ 				MIGRATE_MOVABLE);
++ 	}
++ 
++ 	mem_hotplug_done();
++ 	if (error)
++ 		goto err_add_memory;
++ 
++ 	/*
++ 	 * Initialization of the pages has been deferred until now in order
++ 	 * to allow us to do the work while not holding the hotplug lock.
++ 	 */
++ 	memmap_init_zone_device(&NODE_DATA(nid)->node_zones[ZONE_DEVICE],
++ 				PHYS_PFN(range->start),
++ 				PHYS_PFN(range_len(range)), pgmap);
++ 	percpu_ref_get_many(pgmap->ref, pfn_end(pgmap, range_id)
++ 			- pfn_first(pgmap, range_id));
++ 	return 0;
++ 
++ err_add_memory:
++ 	kasan_remove_zero_shadow(__va(range->start), range_len(range));
++ err_kasan:
++ 	untrack_pfn(NULL, PHYS_PFN(range->start), range_len(range));
++ err_pfn_remap:
++ 	pgmap_array_delete(range);
++ 	return error;
++ }
++ 
++ 
+++>>>>>>> d882c0067d99 (mm: pass migratetype into memmap_init_zone() and move_pfn_range_to_zone())
+  /*
+   * Not device managed version of dev_memremap_pages, undone by
+   * memunmap_pages().  Please use dev_memremap_pages if you have a struct
+diff --git a/arch/ia64/mm/init.c b/arch/ia64/mm/init.c
+index 5ab64d9d3462..af5dae81dcaf 100644
+--- a/arch/ia64/mm/init.c
++++ b/arch/ia64/mm/init.c
+@@ -498,7 +498,7 @@ virtual_memmap_init(u64 start, u64 end, void *arg)
+ 	if (map_start < map_end)
+ 		memmap_init_zone((unsigned long)(map_end - map_start),
+ 				 args->nid, args->zone, page_to_pfn(map_start),
+-				 MEMINIT_EARLY, NULL);
++				 MEMINIT_EARLY, NULL, MIGRATE_MOVABLE);
+ 	return 0;
+ }
+ 
+@@ -508,7 +508,7 @@ memmap_init (unsigned long size, int nid, unsigned long zone,
+ {
+ 	if (!vmem_map) {
+ 		memmap_init_zone(size, nid, zone, start_pfn,
+-				 MEMINIT_EARLY, NULL);
++				 MEMINIT_EARLY, NULL, MIGRATE_MOVABLE);
+ 	} else {
+ 		struct page *start;
+ 		struct memmap_init_callback_data args;
+diff --git a/include/linux/memory_hotplug.h b/include/linux/memory_hotplug.h
+index 22064bc6f351..de87e393f978 100644
+--- a/include/linux/memory_hotplug.h
++++ b/include/linux/memory_hotplug.h
+@@ -350,7 +350,8 @@ extern int __add_memory(int nid, u64 start, u64 size);
+ extern int add_memory(int nid, u64 start, u64 size);
+ extern int add_memory_resource(int nid, struct resource *resource);
+ extern void move_pfn_range_to_zone(struct zone *zone, unsigned long start_pfn,
+-		unsigned long nr_pages, struct vmem_altmap *altmap);
++				   unsigned long nr_pages,
++				   struct vmem_altmap *altmap, int migratetype);
+ extern void remove_pfn_range_from_zone(struct zone *zone,
+ 				       unsigned long start_pfn,
+ 				       unsigned long nr_pages);
+diff --git a/include/linux/mm.h b/include/linux/mm.h
+index be5eb0ce5da1..b2af0a872fa9 100644
+--- a/include/linux/mm.h
++++ b/include/linux/mm.h
+@@ -2332,7 +2332,7 @@ extern int __meminit __early_pfn_to_nid(unsigned long pfn,
+ 
+ extern void set_dma_reserve(unsigned long new_dma_reserve);
+ extern void memmap_init_zone(unsigned long, int, unsigned long, unsigned long,
+-		enum meminit_context, struct vmem_altmap *);
++		enum meminit_context, struct vmem_altmap *, int migratetype);
+ extern void setup_per_zone_wmarks(void);
+ extern int __meminit init_per_zone_wmark_min(void);
+ extern void mem_init(void);
+diff --git a/mm/memory_hotplug.c b/mm/memory_hotplug.c
+index ba2c3f735a9a..33bc62642dec 100644
+--- a/mm/memory_hotplug.c
++++ b/mm/memory_hotplug.c
+@@ -668,9 +668,14 @@ static void __meminit resize_pgdat_range(struct pglist_data *pgdat, unsigned lon
+  * Associate the pfn range with the given zone, initializing the memmaps
+  * and resizing the pgdat/zone data to span the added pages. After this
+  * call, all affected pages are PG_reserved.
++ *
++ * All aligned pageblocks are initialized to the specified migratetype
++ * (usually MIGRATE_MOVABLE). Besides setting the migratetype, no related
++ * zone stats (e.g., nr_isolate_pageblock) are touched.
+  */
+ void __ref move_pfn_range_to_zone(struct zone *zone, unsigned long start_pfn,
+-		unsigned long nr_pages, struct vmem_altmap *altmap)
++				  unsigned long nr_pages,
++				  struct vmem_altmap *altmap, int migratetype)
+ {
+ 	struct pglist_data *pgdat = zone->zone_pgdat;
+ 	int nid = pgdat->node_id;
+@@ -695,7 +700,7 @@ void __ref move_pfn_range_to_zone(struct zone *zone, unsigned long start_pfn,
+ 	 * are reserved so nobody should be touching them so we should be safe
+ 	 */
+ 	memmap_init_zone(nr_pages, nid, zone_idx(zone), start_pfn,
+-			 MEMINIT_HOTPLUG, altmap);
++			 MEMINIT_HOTPLUG, altmap, migratetype);
+ 
+ 	set_zone_contiguous(zone);
+ }
+@@ -775,7 +780,7 @@ int __ref online_pages(unsigned long pfn, unsigned long nr_pages,
+ 
+ 	/* associate pfn range with the zone */
+ 	zone = zone_for_pfn_range(online_type, nid, pfn, nr_pages);
+-	move_pfn_range_to_zone(zone, pfn, nr_pages, NULL);
++	move_pfn_range_to_zone(zone, pfn, nr_pages, NULL, MIGRATE_MOVABLE);
+ 
+ 	arg.start_pfn = pfn;
+ 	arg.nr_pages = nr_pages;
+* Unmerged path mm/memremap.c
+diff --git a/mm/page_alloc.c b/mm/page_alloc.c
+index 08e4c57cf4d4..bc0858edd016 100644
+--- a/mm/page_alloc.c
++++ b/mm/page_alloc.c
+@@ -6005,10 +6005,15 @@ overlap_memmap_init(unsigned long zone, unsigned long *pfn)
+  * Initially all pages are reserved - free ones are freed
+  * up by memblock_free_all() once the early boot process is
+  * done. Non-atomic initialization, single-pass.
++ *
++ * All aligned pageblocks are initialized to the specified migratetype
++ * (usually MIGRATE_MOVABLE). Besides setting the migratetype, no related
++ * zone stats (e.g., nr_isolate_pageblock) are touched.
+  */
+ void __meminit memmap_init_zone(unsigned long size, int nid, unsigned long zone,
+-		unsigned long start_pfn, enum meminit_context context,
+-		struct vmem_altmap *altmap)
++		unsigned long start_pfn,
++		enum meminit_context context,
++		struct vmem_altmap *altmap, int migratetype)
+ {
+ 	unsigned long pfn, end_pfn = start_pfn + size;
+ 	struct page *page;
+@@ -6052,14 +6057,12 @@ void __meminit memmap_init_zone(unsigned long size, int nid, unsigned long zone,
+ 			__SetPageReserved(page);
+ 
+ 		/*
+-		 * Mark the block movable so that blocks are reserved for
+-		 * movable at startup. This will force kernel allocations
+-		 * to reserve their blocks rather than leaking throughout
+-		 * the address space during boot when many long-lived
+-		 * kernel allocations are made.
++		 * Usually, we want to mark the pageblock MIGRATE_MOVABLE,
++		 * such that unmovable allocations won't be scattered all
++		 * over the place during system boot.
+ 		 */
+ 		if (IS_ALIGNED(pfn, pageblock_nr_pages)) {
+-			set_pageblock_migratetype(page, MIGRATE_MOVABLE);
++			set_pageblock_migratetype(page, migratetype);
+ 			cond_resched();
+ 		}
+ 		pfn++;
+@@ -6159,7 +6162,7 @@ void __meminit __weak memmap_init(unsigned long size, int nid,
+ 		if (end_pfn > start_pfn) {
+ 			size = end_pfn - start_pfn;
+ 			memmap_init_zone(size, nid, zone, start_pfn,
+-					 MEMINIT_EARLY, NULL);
++					 MEMINIT_EARLY, NULL, MIGRATE_MOVABLE);
+ 		}
+ 	}
+ }
