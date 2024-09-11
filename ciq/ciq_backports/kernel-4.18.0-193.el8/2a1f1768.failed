@@ -1,0 +1,263 @@
+net/mlx5e: Refactor neigh update for concurrent execution
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-193.el8
+Rebuild_CHGLOG: - [netdrv] mlx5e: Refactor neigh update for concurrent execution (Alaa Hleihel) [1663231 1724336]
+Rebuild_FUZZ: 96.36%
+commit-author Vlad Buslov <vladbu@mellanox.com>
+commit 2a1f1768fa17805ca2e937e2e034a7c3433d3bdc
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-193.el8/2a1f1768.failed
+
+In order to remove dependency on rtnl lock and allow neigh update workqueue
+task to execute concurrently with tc, refactor mlx5e_rep_neigh_update() for
+concurrent execution:
+
+- Lock encap table when accessing encap entry to prevent concurrent
+  changes. To do this properly, the initial encap state check is moved from
+  mlx5e_rep_neigh_update() into mlx5e_rep_update_flows() to be performed
+  under encap_tbl_lock protection.
+
+- Wait for encap to be fully initialized before accessing it by means of
+  'res_ready' completion.
+
+- Add mlx5e_take_all_encap_flows() helper which is used to construct a
+  temporary list of flows and efi indexes that is used to access current
+  encap data in flow which can be attached to multiple encaps
+  simultaneously. Release the flows from temporary list after
+  encap_tbl_lock critical section. This is necessary because
+  mlx5e_flow_put() can't be called while holding encap_tbl_lock.
+
+- Modify mlx5e_tc_encap_flows_add() and mlx5e_tc_encap_flows_del() to work
+  with user-provided list of flows built by mlx5e_take_all_encap_flows(),
+  instead of traversing encap flow list directly.
+
+This is first step in complex neigh update refactoring, which is finished
+by following commit in this series.
+
+	Signed-off-by: Vlad Buslov <vladbu@mellanox.com>
+	Reviewed-by: Roi Dayan <roid@mellanox.com>
+	Signed-off-by: Saeed Mahameed <saeedm@mellanox.com>
+(cherry picked from commit 2a1f1768fa17805ca2e937e2e034a7c3433d3bdc)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/mellanox/mlx5/core/en_rep.c
+#	drivers/net/ethernet/mellanox/mlx5/core/en_tc.c
+#	drivers/net/ethernet/mellanox/mlx5/core/en_tc.h
+diff --cc drivers/net/ethernet/mellanox/mlx5/core/en_rep.c
+index e3ab7df3e76c,5217f39828a4..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_rep.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_rep.c
+@@@ -675,12 -658,12 +691,21 @@@ static void mlx5e_rep_neigh_update(stru
+  	neigh_connected = (nud_state & NUD_VALID) && !dead;
+  
+  	list_for_each_entry(e, &nhe->encap_list, encap_list) {
+++<<<<<<< HEAD
+ +		encap_connected = !!(e->flags & MLX5_ENCAP_ENTRY_VALID);
+ +		priv = netdev_priv(e->out_dev);
+ +
+ +		if (encap_connected != neigh_connected ||
+ +		    !ether_addr_equal(e->h_dest, ha))
+ +			mlx5e_rep_update_flows(priv, e, neigh_connected, ha);
+++=======
++ 		if (!mlx5e_encap_take(e))
++ 			continue;
++ 
++ 		priv = netdev_priv(e->out_dev);
++ 		mlx5e_rep_update_flows(priv, e, neigh_connected, ha);
++ 		mlx5e_encap_put(priv, e);
+++>>>>>>> 2a1f1768fa17 (net/mlx5e: Refactor neigh update for concurrent execution)
+  	}
+  	mlx5e_rep_neigh_entry_release(nhe);
+  	rtnl_unlock();
+diff --cc drivers/net/ethernet/mellanox/mlx5/core/en_tc.c
+index c033e0d4fc59,b63bae05955b..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_tc.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_tc.c
+@@@ -121,6 -125,11 +121,13 @@@ struct mlx5e_tc_flow 
+  	struct list_head	hairpin; /* flows sharing the same hairpin */
+  	struct list_head	peer;    /* flows with peer flow */
+  	struct list_head	unready; /* flows not ready to be offloaded (e.g due to missing route) */
+++<<<<<<< HEAD
+++=======
++ 	int			tmp_efi_index;
++ 	struct list_head	tmp_list; /* temporary flow list used by neigh update */
++ 	refcount_t		refcnt;
++ 	struct rcu_head		rcu_head;
+++>>>>>>> 2a1f1768fa17 (net/mlx5e: Refactor neigh update for concurrent execution)
+  	union {
+  		struct mlx5_esw_flow_attr esw_attr[0];
+  		struct mlx5_nic_flow_attr nic_attr[0];
+@@@ -1142,11 -1315,10 +1150,18 @@@ void mlx5e_tc_encap_flows_add(struct ml
+  	e->flags |= MLX5_ENCAP_ENTRY_VALID;
+  	mlx5e_rep_queue_neigh_stats_work(priv);
+  
+++<<<<<<< HEAD
+ +	list_for_each_entry(efi, &e->flows, list) {
+ +		bool all_flow_encaps_valid = true;
+ +		int i;
+ +
+ +		flow = container_of(efi, struct mlx5e_tc_flow, encaps[efi->index]);
+++=======
++ 	list_for_each_entry(flow, flow_list, tmp_list) {
++ 		bool all_flow_encaps_valid = true;
++ 		int i;
++ 
+++>>>>>>> 2a1f1768fa17 (net/mlx5e: Refactor neigh update for concurrent execution)
+  		esw_attr = flow->esw_attr;
+  		spec = &esw_attr->parse_attr->spec;
+  
+@@@ -1177,8 -1349,9 +1192,13 @@@
+  		}
+  
+  		mlx5e_tc_unoffload_from_slow_path(esw, flow, &slow_attr);
+ +		flow->flags |= MLX5E_TC_FLOW_OFFLOADED; /* was unset when slow path rule removed */
+  		flow->rule[0] = rule;
+++<<<<<<< HEAD
+++=======
++ 		/* was unset when slow path rule removed */
++ 		flow_flag_set(flow, OFFLOADED);
+++>>>>>>> 2a1f1768fa17 (net/mlx5e: Refactor neigh update for concurrent execution)
+  	}
+  }
+  
+@@@ -1193,8 -1366,7 +1214,12 @@@ void mlx5e_tc_encap_flows_del(struct ml
+  	struct mlx5e_tc_flow *flow;
+  	int err;
+  
+++<<<<<<< HEAD
+ +	list_for_each_entry(efi, &e->flows, list) {
+ +		flow = container_of(efi, struct mlx5e_tc_flow, encaps[efi->index]);
+++=======
++ 	list_for_each_entry(flow, flow_list, tmp_list) {
+++>>>>>>> 2a1f1768fa17 (net/mlx5e: Refactor neigh update for concurrent execution)
+  		spec = &flow->esw_attr->parse_attr->spec;
+  
+  		/* update from encap rule to slow path rule */
+@@@ -1210,8 -1382,9 +1235,13 @@@
+  		}
+  
+  		mlx5e_tc_unoffload_fdb_rules(esw, flow, flow->esw_attr);
+ +		flow->flags |= MLX5E_TC_FLOW_OFFLOADED; /* was unset when fast path rule removed */
+  		flow->rule[0] = rule;
+++<<<<<<< HEAD
+++=======
++ 		/* was unset when fast path rule removed */
++ 		flow_flag_set(flow, OFFLOADED);
+++>>>>>>> 2a1f1768fa17 (net/mlx5e: Refactor neigh update for concurrent execution)
+  	}
+  
+  	/* we know that the encap is valid */
+@@@ -1227,6 -1400,78 +1257,81 @@@ static struct mlx5_fc *mlx5e_tc_get_cou
+  		return flow->nic_attr->counter;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ /* Takes reference to all flows attached to encap and adds the flows to
++  * flow_list using 'tmp_list' list_head in mlx5e_tc_flow.
++  */
++ void mlx5e_take_all_encap_flows(struct mlx5e_encap_entry *e, struct list_head *flow_list)
++ {
++ 	struct encap_flow_item *efi;
++ 	struct mlx5e_tc_flow *flow;
++ 
++ 	list_for_each_entry(efi, &e->flows, list) {
++ 		flow = container_of(efi, struct mlx5e_tc_flow, encaps[efi->index]);
++ 		if (IS_ERR(mlx5e_flow_get(flow)))
++ 			continue;
++ 
++ 		flow->tmp_efi_index = efi->index;
++ 		list_add(&flow->tmp_list, flow_list);
++ 	}
++ }
++ 
++ /* Iterate over tmp_list of flows attached to flow_list head. */
++ void mlx5e_put_encap_flow_list(struct mlx5e_priv *priv, struct list_head *flow_list)
++ {
++ 	struct mlx5e_tc_flow *flow, *tmp;
++ 
++ 	list_for_each_entry_safe(flow, tmp, flow_list, tmp_list)
++ 		mlx5e_flow_put(priv, flow);
++ }
++ 
++ static struct mlx5e_encap_entry *
++ mlx5e_get_next_valid_encap(struct mlx5e_neigh_hash_entry *nhe,
++ 			   struct mlx5e_encap_entry *e)
++ {
++ 	struct mlx5e_encap_entry *next = NULL;
++ 
++ retry:
++ 	rcu_read_lock();
++ 
++ 	/* find encap with non-zero reference counter value */
++ 	for (next = e ?
++ 		     list_next_or_null_rcu(&nhe->encap_list,
++ 					   &e->encap_list,
++ 					   struct mlx5e_encap_entry,
++ 					   encap_list) :
++ 		     list_first_or_null_rcu(&nhe->encap_list,
++ 					    struct mlx5e_encap_entry,
++ 					    encap_list);
++ 	     next;
++ 	     next = list_next_or_null_rcu(&nhe->encap_list,
++ 					  &next->encap_list,
++ 					  struct mlx5e_encap_entry,
++ 					  encap_list))
++ 		if (mlx5e_encap_take(next))
++ 			break;
++ 
++ 	rcu_read_unlock();
++ 
++ 	/* release starting encap */
++ 	if (e)
++ 		mlx5e_encap_put(netdev_priv(e->out_dev), e);
++ 	if (!next)
++ 		return next;
++ 
++ 	/* wait for encap to be fully initialized */
++ 	wait_for_completion(&next->res_ready);
++ 	/* continue searching if encap entry is not in valid state after completion */
++ 	if (!(next->flags & MLX5_ENCAP_ENTRY_VALID)) {
++ 		e = next;
++ 		goto retry;
++ 	}
++ 
++ 	return next;
++ }
++ 
+++>>>>>>> 2a1f1768fa17 (net/mlx5e: Refactor neigh update for concurrent execution)
+  void mlx5e_tc_update_neigh_used_value(struct mlx5e_neigh_hash_entry *nhe)
+  {
+  	struct mlx5e_neigh *m_neigh = &nhe->m_neigh;
+diff --cc drivers/net/ethernet/mellanox/mlx5/core/en_tc.h
+index f62e81902d27,924c6ef86a14..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_tc.h
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_tc.h
+@@@ -63,9 -72,16 +63,20 @@@ int mlx5e_stats_flower(struct net_devic
+  
+  struct mlx5e_encap_entry;
+  void mlx5e_tc_encap_flows_add(struct mlx5e_priv *priv,
+- 			      struct mlx5e_encap_entry *e);
++ 			      struct mlx5e_encap_entry *e,
++ 			      struct list_head *flow_list);
+  void mlx5e_tc_encap_flows_del(struct mlx5e_priv *priv,
+++<<<<<<< HEAD
+ +			      struct mlx5e_encap_entry *e);
+++=======
++ 			      struct mlx5e_encap_entry *e,
++ 			      struct list_head *flow_list);
++ bool mlx5e_encap_take(struct mlx5e_encap_entry *e);
++ void mlx5e_encap_put(struct mlx5e_priv *priv, struct mlx5e_encap_entry *e);
+++>>>>>>> 2a1f1768fa17 (net/mlx5e: Refactor neigh update for concurrent execution)
++ 
++ void mlx5e_take_all_encap_flows(struct mlx5e_encap_entry *e, struct list_head *flow_list);
++ void mlx5e_put_encap_flow_list(struct mlx5e_priv *priv, struct list_head *flow_list);
+  
+  struct mlx5e_neigh_hash_entry;
+  void mlx5e_tc_update_neigh_used_value(struct mlx5e_neigh_hash_entry *nhe);
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/en_rep.c
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/en_tc.c
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/en_tc.h
