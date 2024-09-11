@@ -1,0 +1,237 @@
+gfs2: use iomap for buffered I/O in ordered and writeback mode
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-331.el8
+commit-author Christoph Hellwig <hch@lst.de>
+commit 2164f9b9186962ffb7c687e18ec6f5255525f09d
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-331.el8/2164f9b9.failed
+
+Switch to using the iomap readpage and writepage helpers for all I/O in
+the ordered and writeback modes, and thus eliminate using buffer_heads
+for I/O in these cases.  The journaled data mode is left untouched.
+
+(Andreas Gruenbacher: In gfs2_unstuffer_page, switch from mark_buffer_dirty
+to set_page_dirty instead of accidentally leaving the page / buffer clean.)
+
+	Signed-off-by: Christoph Hellwig <hch@lst.de>
+	Signed-off-by: Andreas Gruenbacher <agruenba@redhat.com>
+(cherry picked from commit 2164f9b9186962ffb7c687e18ec6f5255525f09d)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/gfs2/aops.c
+diff --cc fs/gfs2/aops.c
+index 1ae3611c9c3d,a195eb60624e..000000000000
+--- a/fs/gfs2/aops.c
++++ b/fs/gfs2/aops.c
+@@@ -106,13 -97,8 +104,18 @@@ static int gfs2_writepage_common(struc
+  		goto out;
+  	if (current->journal_info)
+  		goto redirty;
+++<<<<<<< HEAD
+ +	/* Is the page fully outside i_size? (truncate in progress) */
+ +	offset = i_size & (PAGE_SIZE-1);
+ +	if (page->index > end_index || (page->index == end_index && !offset)) {
+ +		page->mapping->a_ops->invalidatepage(page, 0, PAGE_SIZE);
+ +		goto out;
+ +	}
+ +	return 1;
+++=======
++ 	return iomap_writepage(page, wbc, &wpc, &gfs2_writeback_ops);
++ 
+++>>>>>>> 2164f9b91869 (gfs2: use iomap for buffered I/O in ordered and writeback mode)
+  redirty:
+  	redirty_page_for_writepage(wbc, page);
+  out:
+@@@ -498,25 -460,15 +502,31 @@@ static int stuffed_readpage(struct gfs2
+  }
+  
+  
+ +/**
+ + * __gfs2_readpage - readpage
+ + * @file: The file to read a page for
+ + * @page: The page to read
+ + *
+ + * This is the core of gfs2's readpage. It's used by the internal file
+ + * reading code as in that case we already hold the glock. Also it's
+ + * called by gfs2_readpage() once the required lock has been granted.
+ + */
+ +
+  static int __gfs2_readpage(void *file, struct page *page)
+  {
+++<<<<<<< HEAD
+ +	struct gfs2_inode *ip = GFS2_I(page->mapping->host);
+ +	struct gfs2_sbd *sdp = GFS2_SB(page->mapping->host);
+ +
+++=======
++ 	struct inode *inode = page->mapping->host;
++ 	struct gfs2_inode *ip = GFS2_I(inode);
++ 	struct gfs2_sbd *sdp = GFS2_SB(inode);
+++>>>>>>> 2164f9b91869 (gfs2: use iomap for buffered I/O in ordered and writeback mode)
+  	int error;
+  
+- 	if (i_blocksize(page->mapping->host) == PAGE_SIZE &&
+- 	    !page_has_buffers(page)) {
++ 	if (!gfs2_is_jdata(ip) ||
++ 	    (i_blocksize(inode) == PAGE_SIZE && !page_has_buffers(page))) {
+  		error = iomap_readpage(page, &gfs2_iomap_ops);
+  	} else if (gfs2_is_stuffed(ip)) {
+  		error = stuffed_readpage(ip, page);
+@@@ -624,27 -551,17 +634,36 @@@ int gfs2_internal_read(struct gfs2_inod
+   * 4. gfs2_block_map() is relied upon to set BH_Boundary in the right places.
+   */
+  
+ -static void gfs2_readahead(struct readahead_control *rac)
+ +static int gfs2_readpages(struct file *file, struct address_space *mapping,
+ +			  struct list_head *pages, unsigned nr_pages)
+  {
+ -	struct inode *inode = rac->mapping->host;
+ +	struct inode *inode = mapping->host;
+  	struct gfs2_inode *ip = GFS2_I(inode);
+ +	struct gfs2_sbd *sdp = GFS2_SB(inode);
+ +	struct gfs2_holder gh;
+ +	int ret;
+  
+++<<<<<<< HEAD
+ +	gfs2_holder_init(ip->i_gl, LM_ST_SHARED, 0, &gh);
+ +	ret = gfs2_glock_nq(&gh);
+ +	if (unlikely(ret))
+ +		goto out_uninit;
+ +	if (!gfs2_is_stuffed(ip))
+ +		ret = mpage_readpages(mapping, pages, nr_pages, gfs2_block_map);
+ +	gfs2_glock_dq(&gh);
+ +out_uninit:
+ +	gfs2_holder_uninit(&gh);
+ +	if (unlikely(gfs2_withdrawn(sdp)))
+ +		ret = -EIO;
+ +	return ret;
+++=======
++ 	if (gfs2_is_stuffed(ip))
++ 		;
++ 	else if (gfs2_is_jdata(ip))
++ 		mpage_readahead(rac, gfs2_block_map);
++ 	else
++ 		iomap_readahead(rac, &gfs2_iomap_ops);
+++>>>>>>> 2164f9b91869 (gfs2: use iomap for buffered I/O in ordered and writeback mode)
+  }
+  
+  /**
+@@@ -864,13 -780,14 +883,18 @@@ static const struct address_space_opera
+  	.writepage = gfs2_writepage,
+  	.writepages = gfs2_writepages,
+  	.readpage = gfs2_readpage,
+++<<<<<<< HEAD
+ +	.readpages = gfs2_readpages,
+++=======
++ 	.readahead = gfs2_readahead,
++ 	.set_page_dirty = iomap_set_page_dirty,
++ 	.releasepage = iomap_releasepage,
++ 	.invalidatepage = iomap_invalidatepage,
+++>>>>>>> 2164f9b91869 (gfs2: use iomap for buffered I/O in ordered and writeback mode)
+  	.bmap = gfs2_bmap,
+- 	.invalidatepage = gfs2_invalidatepage,
+- 	.releasepage = gfs2_releasepage,
+  	.direct_IO = noop_direct_IO,
+- 	.migratepage = buffer_migrate_page,
+- 	.is_partially_uptodate = block_is_partially_uptodate,
++ 	.migratepage = iomap_migrate_page,
++ 	.is_partially_uptodate = iomap_is_partially_uptodate,
+  	.error_remove_page = generic_error_remove_page,
+  };
+  
+* Unmerged path fs/gfs2/aops.c
+diff --git a/fs/gfs2/bmap.c b/fs/gfs2/bmap.c
+index 43b2618706ac..338f43ed6fb9 100644
+--- a/fs/gfs2/bmap.c
++++ b/fs/gfs2/bmap.c
+@@ -59,7 +59,6 @@ static int gfs2_unstuffer_page(struct gfs2_inode *ip, struct buffer_head *dibh,
+ 			       u64 block, struct page *page)
+ {
+ 	struct inode *inode = &ip->i_inode;
+-	struct buffer_head *bh;
+ 	int release = 0;
+ 
+ 	if (!page || page->index) {
+@@ -83,20 +82,21 @@ static int gfs2_unstuffer_page(struct gfs2_inode *ip, struct buffer_head *dibh,
+ 		SetPageUptodate(page);
+ 	}
+ 
+-	if (!page_has_buffers(page))
+-		create_empty_buffers(page, BIT(inode->i_blkbits),
+-				     BIT(BH_Uptodate));
++	if (gfs2_is_jdata(ip)) {
++		struct buffer_head *bh;
+ 
+-	bh = page_buffers(page);
++		if (!page_has_buffers(page))
++			create_empty_buffers(page, BIT(inode->i_blkbits),
++					     BIT(BH_Uptodate));
+ 
+-	if (!buffer_mapped(bh))
+-		map_bh(bh, inode->i_sb, block);
++		bh = page_buffers(page);
++		if (!buffer_mapped(bh))
++			map_bh(bh, inode->i_sb, block);
+ 
+-	set_buffer_uptodate(bh);
+-	if (gfs2_is_jdata(ip))
++		set_buffer_uptodate(bh);
+ 		gfs2_trans_add_data(ip->i_gl, bh);
+-	else {
+-		mark_buffer_dirty(bh);
++	} else {
++		set_page_dirty(page);
+ 		gfs2_ordered_add_inode(ip);
+ 	}
+ 
+@@ -1162,7 +1162,8 @@ static int gfs2_iomap_begin(struct inode *inode, loff_t pos, loff_t length,
+ 	struct metapath mp = { .mp_aheight = 1, };
+ 	int ret;
+ 
+-	iomap->flags |= IOMAP_F_BUFFER_HEAD;
++	if (gfs2_is_jdata(ip))
++		iomap->flags |= IOMAP_F_BUFFER_HEAD;
+ 
+ 	trace_gfs2_iomap_start(ip, pos, length, flags);
+ 	if (gfs2_iomap_need_write_lock(flags)) {
+@@ -2518,3 +2519,26 @@ int __gfs2_punch_hole(struct file *file, loff_t offset, loff_t length)
+ 		gfs2_trans_end(sdp);
+ 	return error;
+ }
++
++static int gfs2_map_blocks(struct iomap_writepage_ctx *wpc, struct inode *inode,
++		loff_t offset)
++{
++	struct metapath mp = { .mp_aheight = 1, };
++	int ret;
++
++	if (WARN_ON_ONCE(gfs2_is_stuffed(GFS2_I(inode))))
++		return -EIO;
++
++	if (offset >= wpc->iomap.offset &&
++	    offset < wpc->iomap.offset + wpc->iomap.length)
++		return 0;
++
++	memset(&wpc->iomap, 0, sizeof(wpc->iomap));
++	ret = gfs2_iomap_get(inode, offset, INT_MAX, 0, &wpc->iomap, &mp);
++	release_metapath(&mp);
++	return ret;
++}
++
++const struct iomap_writeback_ops gfs2_writeback_ops = {
++	.map_blocks		= gfs2_map_blocks,
++};
+diff --git a/fs/gfs2/bmap.h b/fs/gfs2/bmap.h
+index 19a1fd772c61..1c1f5315719d 100644
+--- a/fs/gfs2/bmap.h
++++ b/fs/gfs2/bmap.h
+@@ -47,6 +47,7 @@ static inline void gfs2_write_calc_reserv(const struct gfs2_inode *ip,
+ }
+ 
+ extern const struct iomap_ops gfs2_iomap_ops;
++extern const struct iomap_writeback_ops gfs2_writeback_ops;
+ 
+ extern int gfs2_unstuff_dinode(struct gfs2_inode *ip, struct page *page);
+ extern int gfs2_block_map(struct inode *inode, sector_t lblock,
