@@ -1,0 +1,480 @@
+x86/fpu: Add XFD handling for dynamic states
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-365.el8
+commit-author Chang S. Bae <chang.seok.bae@intel.com>
+commit db3e7321b4b84b1cb39598ff79b90d1252481378
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-365.el8/db3e7321.failed
+
+To handle the dynamic sizing of buffers on first use the XFD MSR has to be
+armed. Store the delta between the maximum available and the default
+feature bits in init_fpstate where it can be retrieved for task creation.
+
+If the delta is non zero then dynamic features are enabled. This needs also
+to enable the static key which guards the XFD updates. This is delayed to
+an initcall because the FPU setup runs before jump labels are initialized.
+
+	Signed-off-by: Chang S. Bae <chang.seok.bae@intel.com>
+	Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+	Signed-off-by: Borislav Petkov <bp@suse.de>
+Link: https://lore.kernel.org/r/20211021225527.10184-23-chang.seok.bae@intel.com
+(cherry picked from commit db3e7321b4b84b1cb39598ff79b90d1252481378)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kernel/fpu/xstate.c
+diff --cc arch/x86/kernel/fpu/xstate.c
+index f744359fb635,987a07bc668b..000000000000
+--- a/arch/x86/kernel/fpu/xstate.c
++++ b/arch/x86/kernel/fpu/xstate.c
+@@@ -734,11 -823,25 +734,28 @@@ static int __init init_xstate_size(void
+   * We enabled the XSAVE hardware, but something went wrong and
+   * we can not use it.  Disable it.
+   */
+ -static void __init fpu__init_disable_system_xstate(unsigned int legacy_size)
+ +static void __init fpu__init_disable_system_xstate(void)
+  {
+ -	fpu_kernel_cfg.max_features = 0;
+ +	xfeatures_mask_all = 0;
+  	cr4_clear_bits(X86_CR4_OSXSAVE);
+  	setup_clear_cpu_cap(X86_FEATURE_XSAVE);
+++<<<<<<< HEAD
+++=======
++ 
++ 	/* Restore the legacy size.*/
++ 	fpu_kernel_cfg.max_size = legacy_size;
++ 	fpu_kernel_cfg.default_size = legacy_size;
++ 	fpu_user_cfg.max_size = legacy_size;
++ 	fpu_user_cfg.default_size = legacy_size;
++ 
++ 	/*
++ 	 * Prevent enabling the static branch which enables writes to the
++ 	 * XFD MSR.
++ 	 */
++ 	init_fpstate.xfd = 0;
++ 
++ 	fpstate_reset(&current->thread.fpu);
+++>>>>>>> db3e7321b4b8 (x86/fpu: Add XFD handling for dynamic states)
+  }
+  
+  /*
+@@@ -795,16 -898,40 +812,24 @@@ void __init fpu__init_system_xstate(voi
+  	 * Clear XSAVE features that are disabled in the normal CPUID.
+  	 */
+  	for (i = 0; i < ARRAY_SIZE(xsave_cpuid_features); i++) {
+ -		unsigned short cid = xsave_cpuid_features[i];
+ -
+ -		/* Careful: X86_FEATURE_FPU is 0! */
+ -		if ((i != XFEATURE_FP && !cid) || !boot_cpu_has(cid))
+ -			fpu_kernel_cfg.max_features &= ~BIT_ULL(i);
+ +		if (!boot_cpu_has(xsave_cpuid_features[i]))
+ +			xfeatures_mask_all &= ~BIT_ULL(i);
+  	}
+  
+ -	if (!cpu_feature_enabled(X86_FEATURE_XFD))
+ -		fpu_kernel_cfg.max_features &= ~XFEATURE_MASK_USER_DYNAMIC;
+ -
+ -	fpu_kernel_cfg.max_features &= XFEATURE_MASK_USER_SUPPORTED |
+ +	xfeatures_mask_all &= XFEATURE_MASK_USER_SUPPORTED |
+  			      XFEATURE_MASK_SUPERVISOR_SUPPORTED;
+  
+ -	fpu_user_cfg.max_features = fpu_kernel_cfg.max_features;
+ -	fpu_user_cfg.max_features &= XFEATURE_MASK_USER_SUPPORTED;
+ -
+ -	/* Clean out dynamic features from default */
+ -	fpu_kernel_cfg.default_features = fpu_kernel_cfg.max_features;
+ -	fpu_kernel_cfg.default_features &= ~XFEATURE_MASK_USER_DYNAMIC;
+ -
+ -	fpu_user_cfg.default_features = fpu_user_cfg.max_features;
+ -	fpu_user_cfg.default_features &= ~XFEATURE_MASK_USER_DYNAMIC;
+ -
+  	/* Store it for paranoia check at the end */
+ -	xfeatures = fpu_kernel_cfg.max_features;
+ +	xfeatures = xfeatures_mask_all;
+  
++ 	/*
++ 	 * Initialize the default XFD state in initfp_state and enable the
++ 	 * dynamic sizing mechanism if dynamic states are available.  The
++ 	 * static key cannot be enabled here because this runs before
++ 	 * jump_label_init(). This is delayed to an initcall.
++ 	 */
++ 	init_fpstate.xfd = fpu_user_cfg.max_features & XFEATURE_MASK_USER_DYNAMIC;
++ 
+  	/* Enable xstate instructions to be able to continue with initialization: */
+  	fpu__init_cpu_xstate();
+  	err = init_xstate_size();
+@@@ -1288,8 -1410,367 +1313,371 @@@ void xrstors(struct xregs_state *xstate
+  	WARN_ON_ONCE(err);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ #if IS_ENABLED(CONFIG_KVM)
++ void fpstate_clear_xstate_component(struct fpstate *fps, unsigned int xfeature)
++ {
++ 	void *addr = get_xsave_addr(&fps->regs.xsave, xfeature);
++ 
++ 	if (addr)
++ 		memset(addr, 0, xstate_sizes[xfeature]);
++ }
++ EXPORT_SYMBOL_GPL(fpstate_clear_xstate_component);
++ #endif
++ 
++ #ifdef CONFIG_X86_64
++ 
++ #ifdef CONFIG_X86_DEBUG_FPU
++ /*
++  * Ensure that a subsequent XSAVE* or XRSTOR* instruction with RFBM=@mask
++  * can safely operate on the @fpstate buffer.
++  */
++ static bool xstate_op_valid(struct fpstate *fpstate, u64 mask, bool rstor)
++ {
++ 	u64 xfd = __this_cpu_read(xfd_state);
++ 
++ 	if (fpstate->xfd == xfd)
++ 		return true;
++ 
++ 	 /*
++ 	  * The XFD MSR does not match fpstate->xfd. That's invalid when
++ 	  * the passed in fpstate is current's fpstate.
++ 	  */
++ 	if (fpstate->xfd == current->thread.fpu.fpstate->xfd)
++ 		return false;
++ 
++ 	/*
++ 	 * XRSTOR(S) from init_fpstate are always correct as it will just
++ 	 * bring all components into init state and not read from the
++ 	 * buffer. XSAVE(S) raises #PF after init.
++ 	 */
++ 	if (fpstate == &init_fpstate)
++ 		return rstor;
++ 
++ 	/*
++ 	 * XSAVE(S): clone(), fpu_swap_kvm_fpu()
++ 	 * XRSTORS(S): fpu_swap_kvm_fpu()
++ 	 */
++ 
++ 	/*
++ 	 * No XSAVE/XRSTOR instructions (except XSAVE itself) touch
++ 	 * the buffer area for XFD-disabled state components.
++ 	 */
++ 	mask &= ~xfd;
++ 
++ 	/*
++ 	 * Remove features which are valid in fpstate. They
++ 	 * have space allocated in fpstate.
++ 	 */
++ 	mask &= ~fpstate->xfeatures;
++ 
++ 	/*
++ 	 * Any remaining state components in 'mask' might be written
++ 	 * by XSAVE/XRSTOR. Fail validation it found.
++ 	 */
++ 	return !mask;
++ }
++ 
++ void xfd_validate_state(struct fpstate *fpstate, u64 mask, bool rstor)
++ {
++ 	WARN_ON_ONCE(!xstate_op_valid(fpstate, mask, rstor));
++ }
++ #endif /* CONFIG_X86_DEBUG_FPU */
++ 
++ static int __init xfd_update_static_branch(void)
++ {
++ 	/*
++ 	 * If init_fpstate.xfd has bits set then dynamic features are
++ 	 * available and the dynamic sizing must be enabled.
++ 	 */
++ 	if (init_fpstate.xfd)
++ 		static_branch_enable(&__fpu_state_size_dynamic);
++ 	return 0;
++ }
++ arch_initcall(xfd_update_static_branch)
++ 
++ void fpstate_free(struct fpu *fpu)
++ {
++ 	if (fpu->fpstate && fpu->fpstate != &fpu->__fpstate)
++ 		vfree(fpu->fpstate);
++ }
++ 
++ /**
++  * fpu_install_fpstate - Update the active fpstate in the FPU
++  *
++  * @fpu:	A struct fpu * pointer
++  * @newfps:	A struct fpstate * pointer
++  *
++  * Returns:	A null pointer if the last active fpstate is the embedded
++  *		one or the new fpstate is already installed;
++  *		otherwise, a pointer to the old fpstate which has to
++  *		be freed by the caller.
++  */
++ static struct fpstate *fpu_install_fpstate(struct fpu *fpu,
++ 					   struct fpstate *newfps)
++ {
++ 	struct fpstate *oldfps = fpu->fpstate;
++ 
++ 	if (fpu->fpstate == newfps)
++ 		return NULL;
++ 
++ 	fpu->fpstate = newfps;
++ 	return oldfps != &fpu->__fpstate ? oldfps : NULL;
++ }
++ 
++ /**
++  * fpstate_realloc - Reallocate struct fpstate for the requested new features
++  *
++  * @xfeatures:	A bitmap of xstate features which extend the enabled features
++  *		of that task
++  * @ksize:	The required size for the kernel buffer
++  * @usize:	The required size for user space buffers
++  *
++  * Note vs. vmalloc(): If the task with a vzalloc()-allocated buffer
++  * terminates quickly, vfree()-induced IPIs may be a concern, but tasks
++  * with large states are likely to live longer.
++  *
++  * Returns: 0 on success, -ENOMEM on allocation error.
++  */
++ static int fpstate_realloc(u64 xfeatures, unsigned int ksize,
++ 			   unsigned int usize)
++ {
++ 	struct fpu *fpu = &current->thread.fpu;
++ 	struct fpstate *curfps, *newfps = NULL;
++ 	unsigned int fpsize;
++ 
++ 	curfps = fpu->fpstate;
++ 	fpsize = ksize + ALIGN(offsetof(struct fpstate, regs), 64);
++ 
++ 	newfps = vzalloc(fpsize);
++ 	if (!newfps)
++ 		return -ENOMEM;
++ 	newfps->size = ksize;
++ 	newfps->user_size = usize;
++ 	newfps->is_valloc = true;
++ 
++ 	fpregs_lock();
++ 	/*
++ 	 * Ensure that the current state is in the registers before
++ 	 * swapping fpstate as that might invalidate it due to layout
++ 	 * changes.
++ 	 */
++ 	if (test_thread_flag(TIF_NEED_FPU_LOAD))
++ 		fpregs_restore_userregs();
++ 
++ 	newfps->xfeatures = curfps->xfeatures | xfeatures;
++ 	newfps->user_xfeatures = curfps->user_xfeatures | xfeatures;
++ 	newfps->xfd = curfps->xfd & ~xfeatures;
++ 
++ 	curfps = fpu_install_fpstate(fpu, newfps);
++ 
++ 	/* Do the final updates within the locked region */
++ 	xstate_init_xcomp_bv(&newfps->regs.xsave, newfps->xfeatures);
++ 	xfd_update_state(newfps);
++ 
++ 	fpregs_unlock();
++ 
++ 	vfree(curfps);
++ 	return 0;
++ }
++ 
++ static int validate_sigaltstack(unsigned int usize)
++ {
++ 	struct task_struct *thread, *leader = current->group_leader;
++ 	unsigned long framesize = get_sigframe_size();
++ 
++ 	lockdep_assert_held(&current->sighand->siglock);
++ 
++ 	/* get_sigframe_size() is based on fpu_user_cfg.max_size */
++ 	framesize -= fpu_user_cfg.max_size;
++ 	framesize += usize;
++ 	for_each_thread(leader, thread) {
++ 		if (thread->sas_ss_size && thread->sas_ss_size < framesize)
++ 			return -ENOSPC;
++ 	}
++ 	return 0;
++ }
++ 
++ static int __xstate_request_perm(u64 permitted, u64 requested)
++ {
++ 	/*
++ 	 * This deliberately does not exclude !XSAVES as we still might
++ 	 * decide to optionally context switch XCR0 or talk the silicon
++ 	 * vendors into extending XFD for the pre AMX states, especially
++ 	 * AVX512.
++ 	 */
++ 	bool compacted = cpu_feature_enabled(X86_FEATURE_XSAVES);
++ 	struct fpu *fpu = &current->group_leader->thread.fpu;
++ 	unsigned int ksize, usize;
++ 	u64 mask;
++ 	int ret;
++ 
++ 	/* Check whether fully enabled */
++ 	if ((permitted & requested) == requested)
++ 		return 0;
++ 
++ 	/* Calculate the resulting kernel state size */
++ 	mask = permitted | requested;
++ 	ksize = xstate_calculate_size(mask, compacted);
++ 
++ 	/* Calculate the resulting user state size */
++ 	mask &= XFEATURE_MASK_USER_SUPPORTED;
++ 	usize = xstate_calculate_size(mask, false);
++ 
++ 	ret = validate_sigaltstack(usize);
++ 	if (ret)
++ 		return ret;
++ 
++ 	/* Pairs with the READ_ONCE() in xstate_get_group_perm() */
++ 	WRITE_ONCE(fpu->perm.__state_perm, requested);
++ 	/* Protected by sighand lock */
++ 	fpu->perm.__state_size = ksize;
++ 	fpu->perm.__user_state_size = usize;
++ 	return ret;
++ }
++ 
++ /*
++  * Permissions array to map facilities with more than one component
++  */
++ static const u64 xstate_prctl_req[XFEATURE_MAX] = {
++ 	/* [XFEATURE_XTILE_DATA] = XFEATURE_MASK_XTILE, */
++ };
++ 
++ static int xstate_request_perm(unsigned long idx)
++ {
++ 	u64 permitted, requested;
++ 	int ret;
++ 
++ 	if (idx >= XFEATURE_MAX)
++ 		return -EINVAL;
++ 
++ 	/*
++ 	 * Look up the facility mask which can require more than
++ 	 * one xstate component.
++ 	 */
++ 	idx = array_index_nospec(idx, ARRAY_SIZE(xstate_prctl_req));
++ 	requested = xstate_prctl_req[idx];
++ 	if (!requested)
++ 		return -EOPNOTSUPP;
++ 
++ 	if ((fpu_user_cfg.max_features & requested) != requested)
++ 		return -EOPNOTSUPP;
++ 
++ 	/* Lockless quick check */
++ 	permitted = xstate_get_host_group_perm();
++ 	if ((permitted & requested) == requested)
++ 		return 0;
++ 
++ 	/* Protect against concurrent modifications */
++ 	spin_lock_irq(&current->sighand->siglock);
++ 	permitted = xstate_get_host_group_perm();
++ 	ret = __xstate_request_perm(permitted, requested);
++ 	spin_unlock_irq(&current->sighand->siglock);
++ 	return ret;
++ }
++ 
++ int xfd_enable_feature(u64 xfd_err)
++ {
++ 	u64 xfd_event = xfd_err & XFEATURE_MASK_USER_DYNAMIC;
++ 	unsigned int ksize, usize;
++ 	struct fpu *fpu;
++ 
++ 	if (!xfd_event) {
++ 		pr_err_once("XFD: Invalid xfd error: %016llx\n", xfd_err);
++ 		return 0;
++ 	}
++ 
++ 	/* Protect against concurrent modifications */
++ 	spin_lock_irq(&current->sighand->siglock);
++ 
++ 	/* If not permitted let it die */
++ 	if ((xstate_get_host_group_perm() & xfd_event) != xfd_event) {
++ 		spin_unlock_irq(&current->sighand->siglock);
++ 		return -EPERM;
++ 	}
++ 
++ 	fpu = &current->group_leader->thread.fpu;
++ 	ksize = fpu->perm.__state_size;
++ 	usize = fpu->perm.__user_state_size;
++ 	/*
++ 	 * The feature is permitted. State size is sufficient.  Dropping
++ 	 * the lock is safe here even if more features are added from
++ 	 * another task, the retrieved buffer sizes are valid for the
++ 	 * currently requested feature(s).
++ 	 */
++ 	spin_unlock_irq(&current->sighand->siglock);
++ 
++ 	/*
++ 	 * Try to allocate a new fpstate. If that fails there is no way
++ 	 * out.
++ 	 */
++ 	if (fpstate_realloc(xfd_event, ksize, usize))
++ 		return -EFAULT;
++ 	return 0;
++ }
++ #else /* CONFIG_X86_64 */
++ static inline int xstate_request_perm(unsigned long idx)
++ {
++ 	return -EPERM;
++ }
++ #endif  /* !CONFIG_X86_64 */
++ 
++ /**
++  * fpu_xstate_prctl - xstate permission operations
++  * @tsk:	Redundant pointer to current
++  * @option:	A subfunction of arch_prctl()
++  * @arg2:	option argument
++  * Return:	0 if successful; otherwise, an error code
++  *
++  * Option arguments:
++  *
++  * ARCH_GET_XCOMP_SUPP: Pointer to user space u64 to store the info
++  * ARCH_GET_XCOMP_PERM: Pointer to user space u64 to store the info
++  * ARCH_REQ_XCOMP_PERM: Facility number requested
++  *
++  * For facilities which require more than one XSTATE component, the request
++  * must be the highest state component number related to that facility,
++  * e.g. for AMX which requires XFEATURE_XTILE_CFG(17) and
++  * XFEATURE_XTILE_DATA(18) this would be XFEATURE_XTILE_DATA(18).
++  */
++ long fpu_xstate_prctl(struct task_struct *tsk, int option, unsigned long arg2)
++ {
++ 	u64 __user *uptr = (u64 __user *)arg2;
++ 	u64 permitted, supported;
++ 	unsigned long idx = arg2;
++ 
++ 	if (tsk != current)
++ 		return -EPERM;
++ 
++ 	switch (option) {
++ 	case ARCH_GET_XCOMP_SUPP:
++ 		supported = fpu_user_cfg.max_features |	fpu_user_cfg.legacy_features;
++ 		return put_user(supported, uptr);
++ 
++ 	case ARCH_GET_XCOMP_PERM:
++ 		/*
++ 		 * Lockless snapshot as it can also change right after the
++ 		 * dropping the lock.
++ 		 */
++ 		permitted = xstate_get_host_group_perm();
++ 		permitted &= XFEATURE_MASK_USER_SUPPORTED;
++ 		return put_user(permitted, uptr);
++ 
++ 	case ARCH_REQ_XCOMP_PERM:
++ 		if (!IS_ENABLED(CONFIG_X86_64))
++ 			return -EOPNOTSUPP;
++ 
++ 		return xstate_request_perm(idx);
++ 
++ 	default:
++ 		return -EINVAL;
++ 	}
++ }
++ 
+++>>>>>>> db3e7321b4b8 (x86/fpu: Add XFD handling for dynamic states)
+  #ifdef CONFIG_PROC_PID_ARCH_STATUS
+ +
+  /*
+   * Report the amount of time elapsed in millisecond since last AVX512
+   * use in the task.
+* Unmerged path arch/x86/kernel/fpu/xstate.c
