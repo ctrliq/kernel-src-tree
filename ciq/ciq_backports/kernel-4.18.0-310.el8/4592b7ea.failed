@@ -1,0 +1,154 @@
+KVM: x86: hyper-v: Allocate 'struct kvm_vcpu_hv' dynamically
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-310.el8
+commit-author Vitaly Kuznetsov <vkuznets@redhat.com>
+commit 4592b7eaa87d3525825d4ab2a35308bcec9e5ff9
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-310.el8/4592b7ea.failed
+
+Hyper-V context is only needed for guests which use Hyper-V emulation in
+KVM (e.g. Windows/Hyper-V guests). 'struct kvm_vcpu_hv' is, however, quite
+big, it accounts for more than 1/4 of the total 'struct kvm_vcpu_arch'
+which is also quite big already. This all looks like a waste.
+
+Allocate 'struct kvm_vcpu_hv' dynamically. This patch does not bring any
+(intentional) functional change as we still allocate the context
+unconditionally but it paves the way to doing that only when needed.
+
+	Signed-off-by: Vitaly Kuznetsov <vkuznets@redhat.com>
+Message-Id: <20210126134816.1880136-13-vkuznets@redhat.com>
+	Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+(cherry picked from commit 4592b7eaa87d3525825d4ab2a35308bcec9e5ff9)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/include/asm/kvm_host.h
+diff --cc arch/x86/include/asm/kvm_host.h
+index 3e713240c995,95eb6e93a4b7..000000000000
+--- a/arch/x86/include/asm/kvm_host.h
++++ b/arch/x86/include/asm/kvm_host.h
+@@@ -727,7 -736,8 +728,12 @@@ struct kvm_vcpu_arch 
+  	/* used for guest single stepping over the given code position */
+  	unsigned long singlestep_rip;
+  
+++<<<<<<< HEAD
+ +	struct kvm_vcpu_hv hyperv;
+++=======
++ 	struct kvm_vcpu_hv *hyperv;
++ 	struct kvm_vcpu_xen xen;
+++>>>>>>> 4592b7eaa87d (KVM: x86: hyper-v: Allocate 'struct kvm_vcpu_hv' dynamically)
+  
+  	cpumask_var_t wbinvd_dirty_mask;
+  
+* Unmerged path arch/x86/include/asm/kvm_host.h
+diff --git a/arch/x86/kvm/hyperv.c b/arch/x86/kvm/hyperv.c
+index c5f77ef20cbd..447fbecd0504 100644
+--- a/arch/x86/kvm/hyperv.c
++++ b/arch/x86/kvm/hyperv.c
+@@ -835,6 +835,9 @@ void kvm_hv_vcpu_uninit(struct kvm_vcpu *vcpu)
+ 
+ 	for (i = 0; i < ARRAY_SIZE(hv_vcpu->stimer); i++)
+ 		stimer_cleanup(&hv_vcpu->stimer[i]);
++
++	kfree(hv_vcpu);
++	vcpu->arch.hyperv = NULL;
+ }
+ 
+ bool kvm_hv_assist_page_enabled(struct kvm_vcpu *vcpu)
+@@ -879,16 +882,25 @@ static void stimer_init(struct kvm_vcpu_hv_stimer *stimer, int timer_index)
+ 	stimer_prepare_msg(stimer);
+ }
+ 
+-void kvm_hv_vcpu_init(struct kvm_vcpu *vcpu)
++int kvm_hv_vcpu_init(struct kvm_vcpu *vcpu)
+ {
+-	struct kvm_vcpu_hv *hv_vcpu = to_hv_vcpu(vcpu);
++	struct kvm_vcpu_hv *hv_vcpu;
+ 	int i;
+ 
++	hv_vcpu = kzalloc(sizeof(struct kvm_vcpu_hv), GFP_KERNEL_ACCOUNT);
++	if (!hv_vcpu)
++		return -ENOMEM;
++
++	vcpu->arch.hyperv = hv_vcpu;
++	hv_vcpu->vcpu = vcpu;
++
+ 	synic_init(&hv_vcpu->synic);
+ 
+ 	bitmap_zero(hv_vcpu->stimer_pending_bitmap, HV_SYNIC_STIMER_COUNT);
+ 	for (i = 0; i < ARRAY_SIZE(hv_vcpu->stimer); i++)
+ 		stimer_init(&hv_vcpu->stimer[i], i);
++
++	return 0;
+ }
+ 
+ void kvm_hv_vcpu_postcreate(struct kvm_vcpu *vcpu)
+diff --git a/arch/x86/kvm/hyperv.h b/arch/x86/kvm/hyperv.h
+index 69fb2e2ca018..c33ef1128c2e 100644
+--- a/arch/x86/kvm/hyperv.h
++++ b/arch/x86/kvm/hyperv.h
+@@ -57,20 +57,19 @@ static inline struct kvm_hv *to_kvm_hv(struct kvm *kvm)
+ 
+ static inline struct kvm_vcpu_hv *to_hv_vcpu(struct kvm_vcpu *vcpu)
+ {
+-	return &vcpu->arch.hyperv;
++	return vcpu->arch.hyperv;
+ }
+ 
+ static inline struct kvm_vcpu *hv_vcpu_to_vcpu(struct kvm_vcpu_hv *hv_vcpu)
+ {
+-	struct kvm_vcpu_arch *arch;
+-
+-	arch = container_of(hv_vcpu, struct kvm_vcpu_arch, hyperv);
+-	return container_of(arch, struct kvm_vcpu, arch);
++	return hv_vcpu->vcpu;
+ }
+ 
+ static inline struct kvm_vcpu_hv_synic *vcpu_to_synic(struct kvm_vcpu *vcpu)
+ {
+-	return &vcpu->arch.hyperv.synic;
++	struct kvm_vcpu_hv *hv_vcpu = to_hv_vcpu(vcpu);
++
++	return &hv_vcpu->synic;
+ }
+ 
+ static inline struct kvm_vcpu *synic_to_vcpu(struct kvm_vcpu_hv_synic *synic)
+@@ -94,7 +93,7 @@ int kvm_hv_synic_set_irq(struct kvm *kvm, u32 vcpu_id, u32 sint);
+ void kvm_hv_synic_send_eoi(struct kvm_vcpu *vcpu, int vector);
+ int kvm_hv_activate_synic(struct kvm_vcpu *vcpu, bool dont_zero_synic_pages);
+ 
+-void kvm_hv_vcpu_init(struct kvm_vcpu *vcpu);
++int kvm_hv_vcpu_init(struct kvm_vcpu *vcpu);
+ void kvm_hv_vcpu_postcreate(struct kvm_vcpu *vcpu);
+ void kvm_hv_vcpu_uninit(struct kvm_vcpu *vcpu);
+ 
+diff --git a/arch/x86/kvm/x86.c b/arch/x86/kvm/x86.c
+index 5b18614d5081..1c5b134b0c46 100644
+--- a/arch/x86/kvm/x86.c
++++ b/arch/x86/kvm/x86.c
+@@ -9957,11 +9957,12 @@ int kvm_arch_vcpu_create(struct kvm_vcpu *vcpu)
+ 	vcpu->arch.pending_external_vector = -1;
+ 	vcpu->arch.preempted_in_kernel = false;
+ 
+-	kvm_hv_vcpu_init(vcpu);
++	if (kvm_hv_vcpu_init(vcpu))
++		goto free_guest_fpu;
+ 
+ 	r = kvm_x86_ops.vcpu_create(vcpu);
+ 	if (r)
+-		goto free_guest_fpu;
++		goto free_hv_vcpu;
+ 
+ 	vcpu->arch.arch_capabilities = kvm_get_arch_capabilities();
+ 	vcpu->arch.msr_platform_info = MSR_PLATFORM_INFO_CPUID_FAULT;
+@@ -9972,6 +9973,8 @@ int kvm_arch_vcpu_create(struct kvm_vcpu *vcpu)
+ 	vcpu_put(vcpu);
+ 	return 0;
+ 
++free_hv_vcpu:
++	kvm_hv_vcpu_uninit(vcpu);
+ free_guest_fpu:
+ 	kmem_cache_free(x86_fpu_cache, vcpu->arch.guest_fpu);
+ free_user_fpu:
