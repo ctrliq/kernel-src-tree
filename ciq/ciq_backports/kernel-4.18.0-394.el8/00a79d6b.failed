@@ -1,0 +1,166 @@
+RDMA/core: Configure selinux QP during creation
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-394.el8
+commit-author Leon Romanovsky <leonro@nvidia.com>
+commit 00a79d6b996d46e9077b0d02a19c87b99305b94a
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-394.el8/00a79d6b.failed
+
+All QP creation flows called ib_create_qp_security(), but differently.
+This caused to the need to provide exclusion conditions for the XRC_TGT,
+because such QP already had selinux configuration call.
+
+In order to fix it, move ib_create_qp_security() to the general QP
+creation routine.
+
+Link: https://lore.kernel.org/r/4d7cd6f5828aca37fb62283e6b126b73ab86b18c.1628014762.git.leonro@nvidia.com
+	Signed-off-by: Leon Romanovsky <leonro@nvidia.com>
+	Signed-off-by: Jason Gunthorpe <jgg@nvidia.com>
+(cherry picked from commit 00a79d6b996d46e9077b0d02a19c87b99305b94a)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/infiniband/core/verbs.c
+diff --cc drivers/infiniband/core/verbs.c
+index 15688810fb77,1f0f0beebe22..000000000000
+--- a/drivers/infiniband/core/verbs.c
++++ b/drivers/infiniband/core/verbs.c
+@@@ -1200,19 -1201,82 +1200,88 @@@ static struct ib_qp *create_xrc_qp_user
+  }
+  
+  /**
+ - * _ib_create_qp - Creates a QP associated with the specified protection domain
+ - * @dev: IB device
+ + * ib_create_named_qp - Creates a kernel QP associated with the specified protection
+ + *   domain.
+   * @pd: The protection domain associated with the QP.
+ - * @attr: A list of initial attributes required to create the
+ + * @qp_init_attr: A list of initial attributes required to create the
+   *   QP.  If QP creation succeeds, then the attributes are updated to
+   *   the actual capabilities of the created QP.
+ - * @udata: User data
+ - * @uobj: uverbs obect
+   * @caller: caller's build-time module name
+ + *
+ + * NOTE: for user qp use ib_create_qp_user with valid udata!
+   */
+++<<<<<<< HEAD
+ +struct ib_qp *ib_create_named_qp(struct ib_pd *pd,
+ +				 struct ib_qp_init_attr *qp_init_attr,
+ +				 const char *caller)
+++=======
++ struct ib_qp *_ib_create_qp(struct ib_device *dev, struct ib_pd *pd,
++ 			    struct ib_qp_init_attr *attr,
++ 			    struct ib_udata *udata, struct ib_uqp_object *uobj,
++ 			    const char *caller)
++ {
++ 	struct ib_udata dummy = {};
++ 	struct ib_qp *qp;
++ 	int ret;
++ 
++ 	if (!dev->ops.create_qp)
++ 		return ERR_PTR(-EOPNOTSUPP);
++ 
++ 	qp = rdma_zalloc_drv_obj_numa(dev, ib_qp);
++ 	if (!qp)
++ 		return ERR_PTR(-ENOMEM);
++ 
++ 	qp->device = dev;
++ 	qp->pd = pd;
++ 	qp->uobject = uobj;
++ 	qp->real_qp = qp;
++ 
++ 	qp->qp_type = attr->qp_type;
++ 	qp->rwq_ind_tbl = attr->rwq_ind_tbl;
++ 	qp->srq = attr->srq;
++ 	qp->event_handler = attr->event_handler;
++ 	qp->port = attr->port_num;
++ 	qp->qp_context = attr->qp_context;
++ 
++ 	spin_lock_init(&qp->mr_lock);
++ 	INIT_LIST_HEAD(&qp->rdma_mrs);
++ 	INIT_LIST_HEAD(&qp->sig_mrs);
++ 
++ 	rdma_restrack_new(&qp->res, RDMA_RESTRACK_QP);
++ 	WARN_ONCE(!udata && !caller, "Missing kernel QP owner");
++ 	rdma_restrack_set_name(&qp->res, udata ? NULL : caller);
++ 	ret = dev->ops.create_qp(qp, attr, udata);
++ 	if (ret)
++ 		goto err_create;
++ 
++ 	/*
++ 	 * TODO: The mlx4 internally overwrites send_cq and recv_cq.
++ 	 * Unfortunately, it is not an easy task to fix that driver.
++ 	 */
++ 	qp->send_cq = attr->send_cq;
++ 	qp->recv_cq = attr->recv_cq;
++ 
++ 	ret = ib_create_qp_security(qp, dev);
++ 	if (ret)
++ 		goto err_security;
++ 
++ 	rdma_restrack_add(&qp->res);
++ 	return qp;
++ 
++ err_security:
++ 	qp->device->ops.destroy_qp(qp, udata ? &dummy : NULL);
++ err_create:
++ 	rdma_restrack_put(&qp->res);
++ 	kfree(qp);
++ 	return ERR_PTR(ret);
++ 
++ }
++ EXPORT_SYMBOL(_ib_create_qp);
++ 
++ struct ib_qp *ib_create_qp_kernel(struct ib_pd *pd,
++ 				  struct ib_qp_init_attr *qp_init_attr,
++ 				  const char *caller)
+++>>>>>>> 00a79d6b996d (RDMA/core: Configure selinux QP during creation)
+  {
+  	struct ib_device *device = pd ? pd->device : qp_init_attr->xrcd->device;
+  	struct ib_qp *qp;
+diff --git a/drivers/infiniband/core/uverbs_cmd.c b/drivers/infiniband/core/uverbs_cmd.c
+index 7d7b5054308d..157272130199 100644
+--- a/drivers/infiniband/core/uverbs_cmd.c
++++ b/drivers/infiniband/core/uverbs_cmd.c
+@@ -1449,10 +1449,6 @@ static int create_qp(struct uverbs_attr_bundle *attrs,
+ 	}
+ 
+ 	if (cmd->qp_type != IB_QPT_XRC_TGT) {
+-		ret = ib_create_qp_security(qp, device);
+-		if (ret)
+-			goto err_cb;
+-
+ 		atomic_inc(&pd->usecnt);
+ 		if (attr.send_cq)
+ 			atomic_inc(&attr.send_cq->usecnt);
+@@ -1504,9 +1500,6 @@ static int create_qp(struct uverbs_attr_bundle *attrs,
+ 	resp.response_length = uverbs_response_length(attrs, sizeof(resp));
+ 	return uverbs_response(attrs, &resp, sizeof(resp));
+ 
+-err_cb:
+-	ib_destroy_qp_user(qp, uverbs_get_cleared_udata(attrs));
+-
+ err_put:
+ 	if (!IS_ERR(xrcd_uobj))
+ 		uobj_put_read(xrcd_uobj);
+diff --git a/drivers/infiniband/core/uverbs_std_types_qp.c b/drivers/infiniband/core/uverbs_std_types_qp.c
+index 070994ed133d..2e4b3adad05a 100644
+--- a/drivers/infiniband/core/uverbs_std_types_qp.c
++++ b/drivers/infiniband/core/uverbs_std_types_qp.c
+@@ -280,12 +280,6 @@ static int UVERBS_HANDLER(UVERBS_METHOD_QP_CREATE)(
+ 	obj->uevent.uobject.object = qp;
+ 	uverbs_finalize_uobj_create(attrs, UVERBS_ATTR_CREATE_QP_HANDLE);
+ 
+-	if (attr.qp_type != IB_QPT_XRC_TGT) {
+-		ret = ib_create_qp_security(qp, device);
+-		if (ret)
+-			return ret;
+-	}
+-
+ 	set_caps(&attr, &cap, false);
+ 	ret = uverbs_copy_to_struct_or_zero(attrs,
+ 					UVERBS_ATTR_CREATE_QP_RESP_CAP, &cap,
+* Unmerged path drivers/infiniband/core/verbs.c
