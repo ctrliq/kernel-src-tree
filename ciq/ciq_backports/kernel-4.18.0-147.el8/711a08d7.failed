@@ -1,0 +1,168 @@
+scsi: qla2xxx: Change abort wait_loop from msleep to wait_event_timeout
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-147.el8
+commit-author Giridhar Malavali <gmalavali@marvell.com>
+commit 711a08d79f718abcdd3f86f44ffa8473ef1486ef
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-147.el8/711a08d7.failed
+
+This patch converts driver wait time from using msleep to
+wair_event_timeout to prevent race condition.
+
+	Signed-off-by: Giridhar Malavali <gmalavali@marvell.com>
+	Signed-off-by: Himanshu Madhani <hmadhani@marvell.com>
+	Signed-off-by: Martin K. Petersen <martin.petersen@oracle.com>
+(cherry picked from commit 711a08d79f718abcdd3f86f44ffa8473ef1486ef)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/scsi/qla2xxx/qla_os.c
+diff --cc drivers/scsi/qla2xxx/qla_os.c
+index 9c7c364118a9,57e1041e4ca2..000000000000
+--- a/drivers/scsi/qla2xxx/qla_os.c
++++ b/drivers/scsi/qla2xxx/qla_os.c
+@@@ -816,10 -823,43 +815,48 @@@ qla2xxx_qpair_sp_free_dma(void *ptr
+  		ha->gbl_dsd_inuse -= ctx1->dsd_use_cnt;
+  		ha->gbl_dsd_avail += ctx1->dsd_use_cnt;
+  		mempool_free(ctx1, ha->ctx_mempool);
+ -		sp->flags &= ~SRB_FCP_CMND_DMA_VALID;
+  	}
+++<<<<<<< HEAD
+ +end:
+ +	CMD_SP(cmd) = NULL;
+ +	qla2xxx_rel_qpair_sp(sp->qpair, sp);
+++=======
++ 	if (sp->flags & SRB_DIF_BUNDL_DMA_VALID) {
++ 		struct crc_context *difctx = sp->u.scmd.ctx;
++ 		struct dsd_dma *dif_dsd, *nxt_dsd;
++ 
++ 		list_for_each_entry_safe(dif_dsd, nxt_dsd,
++ 		    &difctx->ldif_dma_hndl_list, list) {
++ 			list_del(&dif_dsd->list);
++ 			dma_pool_free(ha->dif_bundl_pool, dif_dsd->dsd_addr,
++ 			    dif_dsd->dsd_list_dma);
++ 			kfree(dif_dsd);
++ 			difctx->no_dif_bundl--;
++ 		}
++ 
++ 		list_for_each_entry_safe(dif_dsd, nxt_dsd,
++ 		    &difctx->ldif_dsd_list, list) {
++ 			list_del(&dif_dsd->list);
++ 			dma_pool_free(ha->dl_dma_pool, dif_dsd->dsd_addr,
++ 			    dif_dsd->dsd_list_dma);
++ 			kfree(dif_dsd);
++ 			difctx->no_ldif_dsd--;
++ 		}
++ 
++ 		if (difctx->no_ldif_dsd) {
++ 			ql_dbg(ql_dbg_tgt+ql_dbg_verbose, sp->vha, 0xe022,
++ 			    "%s: difctx->no_ldif_dsd=%x\n",
++ 			    __func__, difctx->no_ldif_dsd);
++ 		}
++ 
++ 		if (difctx->no_dif_bundl) {
++ 			ql_dbg(ql_dbg_tgt+ql_dbg_verbose, sp->vha, 0xe022,
++ 			    "%s: difctx->no_dif_bundl=%x\n",
++ 			    __func__, difctx->no_dif_bundl);
++ 		}
++ 		sp->flags &= ~SRB_DIF_BUNDL_DMA_VALID;
++ 	}
+++>>>>>>> 711a08d79f71 (scsi: qla2xxx: Change abort wait_loop from msleep to wait_event_timeout)
+  }
+  
+  void
+@@@ -1313,9 -1376,6 +1354,12 @@@ qla2xxx_eh_abort(struct scsi_cmnd *cmd
+  	    vha->host_no, id, lun, sp, cmd, sp->handle);
+  
+  	/* Get a reference to the sp and drop the lock.*/
+++<<<<<<< HEAD
+ +	sp_get(sp);
+ +
+ +	spin_unlock_irqrestore(&ha->hardware_lock, flags);
+++=======
+++>>>>>>> 711a08d79f71 (scsi: qla2xxx: Change abort wait_loop from msleep to wait_event_timeout)
+  	rval = ha->isp_ops->abort_command(sp);
+  	if (rval) {
+  		if (rval == QLA_FUNCTION_PARAMETER_ERROR)
+@@@ -1331,23 -1391,47 +1375,61 @@@
+  		wait = 1;
+  	}
+  
+++<<<<<<< HEAD
+ +	spin_lock_irqsave(&ha->hardware_lock, flags);
+ +	sp->done(sp, 0);
+ +	spin_unlock_irqrestore(&ha->hardware_lock, flags);
+++=======
++ 	spin_lock_irqsave(qpair->qp_lock_ptr, flags);
+  
+- 	/* Did the command return during mailbox execution? */
+- 	if (ret == FAILED && !CMD_SP(cmd))
+- 		ret = SUCCESS;
+- 
++ 	/*
++ 	 * Releasing of the SRB and associated command resources
++ 	 * is managed through ref_count.
++ 	 * Whether we need to wait for the abort completion or complete
++ 	 * the abort handler should be based on the ref_count.
++ 	 */
++ 	if (atomic_read(&sp->ref_count) > 1) {
++ 		/*
++ 		 * The command is not yet completed. We need to wait for either
++ 		 * command completion or abort completion.
++ 		 */
++ 		DECLARE_WAIT_QUEUE_HEAD_ONSTACK(eh_waitq);
++ 		uint32_t ratov = ha->r_a_tov/10;
+++>>>>>>> 711a08d79f71 (scsi: qla2xxx: Change abort wait_loop from msleep to wait_event_timeout)
++ 
++ 		/* Go ahead and release the extra ref_count obtained earlier */
++ 		sp->done(sp, DID_RESET << 16);
++ 		sp->cwaitq = &eh_waitq;
++ 
+++<<<<<<< HEAD
+ +	/* Wait for the command to be returned. */
+ +	if (wait) {
+ +		if (qla2x00_eh_wait_on_command(cmd) != QLA_SUCCESS) {
+ +			ql_log(ql_log_warn, vha, 0x8006,
+ +			    "Abort handler timed out cmd=%p.\n", cmd);
+++=======
++ 		if (!wait_event_lock_irq_timeout(eh_waitq,
++ 		    CMD_SP(cmd) == NULL, *qpair->qp_lock_ptr,
++ 		    msecs_to_jiffies(4 * ratov * 1000))) {
++ 			/*
++ 			 * The abort got dropped, LOGO will be sent and the
++ 			 * original command will be completed with CS_TIMEOUT
++ 			 * completion
++ 			 */
++ 			ql_dbg(ql_dbg_taskm, vha, 0xffff,
++ 			    "%s: Abort wait timer (4 * R_A_TOV[%d]) expired\n",
++ 			    __func__, ha->r_a_tov);
++ 			sp->cwaitq = NULL;
+++>>>>>>> 711a08d79f71 (scsi: qla2xxx: Change abort wait_loop from msleep to wait_event_timeout)
+  			ret = FAILED;
++ 			goto end;
+  		}
++ 	} else {
++ 		/* Command completed while processing the abort */
++ 		sp->done(sp, DID_RESET << 16);
+  	}
+- 
++ end:
++ 	spin_unlock_irqrestore(qpair->qp_lock_ptr, flags);
+  	ql_log(ql_log_info, vha, 0x801c,
+  	    "Abort command issued nexus=%ld:%d:%llu --  %d %x.\n",
+  	    vha->host_no, id, lun, wait, ret);
+diff --git a/drivers/scsi/qla2xxx/qla_def.h b/drivers/scsi/qla2xxx/qla_def.h
+index 446d27517aa5..72814d3d33f9 100644
+--- a/drivers/scsi/qla2xxx/qla_def.h
++++ b/drivers/scsi/qla2xxx/qla_def.h
+@@ -541,6 +541,7 @@ typedef struct srb {
+ 	int rc;
+ 	int retry_count;
+ 	struct completion comp;
++	wait_queue_head_t *cwaitq;
+ 	union {
+ 		struct srb_iocb iocb_cmd;
+ 		struct bsg_job *bsg_job;
+* Unmerged path drivers/scsi/qla2xxx/qla_os.c
