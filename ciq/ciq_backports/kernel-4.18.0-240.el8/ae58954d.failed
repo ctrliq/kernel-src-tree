@@ -1,0 +1,177 @@
+block: don't handle bio based drivers in blk_revalidate_disk_zones
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Christoph Hellwig <hch@lst.de>
+commit ae58954d8734c44298f55ed71e683ea944994fab
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/ae58954d.failed
+
+bio based drivers only need to update q->nr_zones.  Do that manually
+instead of overloading blk_revalidate_disk_zones to keep that function
+simpler for the next round of changes that will rely even more on the
+request based functionality.
+
+	Reviewed-by: Javier González <javier@javigon.com>
+	Signed-off-by: Christoph Hellwig <hch@lst.de>
+	Signed-off-by: Jens Axboe <axboe@kernel.dk>
+(cherry picked from commit ae58954d8734c44298f55ed71e683ea944994fab)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	block/blk-zoned.c
+diff --cc block/blk-zoned.c
+index dfece77e25b8,51d427659ce7..000000000000
+--- a/block/blk-zoned.c
++++ b/block/blk-zoned.c
+@@@ -431,63 -426,29 +432,70 @@@ void blk_queue_free_zone_bitmaps(struc
+  int blk_revalidate_disk_zones(struct gendisk *disk)
+  {
+  	struct request_queue *q = disk->queue;
+ -	struct blk_revalidate_zone_args args = {
+ -		.disk		= disk,
+ -		.nr_zones	= blkdev_nr_zones(disk),
+ -	};
+ +	unsigned int nr_zones = __blkdev_nr_zones(q, get_capacity(disk));
+ +	unsigned long *seq_zones_wlock = NULL, *seq_zones_bitmap = NULL;
+ +	unsigned int i, rep_nr_zones = 0, z = 0, nrz;
+ +	struct blk_zone *zones = NULL;
+ +	sector_t sector = 0;
+  	int ret = 0;
+  
+++<<<<<<< HEAD
+ +	/*
+ +	 * BIO based queues do not use a scheduler so only q->nr_zones
+ +	 * needs to be updated so that the sysfs exposed value is correct.
+ +	 */
+ +	if (!queue_is_mq(q)) {
+ +		q->nr_zones = nr_zones;
+ +		return 0;
+ +	}
+++=======
++ 	if (WARN_ON_ONCE(!blk_queue_is_zoned(q)))
++ 		return -EIO;
++ 	if (WARN_ON_ONCE(!queue_is_mq(q)))
++ 		return -EIO;
+++>>>>>>> ae58954d8734 (block: don't handle bio based drivers in blk_revalidate_disk_zones)
+  
+ -	/*
+ -	 * Ensure that all memory allocations in this context are done as
+ -	 * if GFP_NOIO was specified.
+ -	 */
+ -	if (args.nr_zones) {
+ -		unsigned int noio_flag = memalloc_noio_save();
+ +	if (!blk_queue_is_zoned(q) || !nr_zones) {
+ +		nr_zones = 0;
+ +		goto update;
+ +	}
+  
+ -		ret = disk->fops->report_zones(disk, 0, args.nr_zones,
+ -					       blk_revalidate_zone_cb, &args);
+ -		memalloc_noio_restore(noio_flag);
+ +	/* Allocate bitmaps */
+ +	ret = -ENOMEM;
+ +	seq_zones_wlock = blk_alloc_zone_bitmap(q->node, nr_zones);
+ +	if (!seq_zones_wlock)
+ +		goto out;
+ +	seq_zones_bitmap = blk_alloc_zone_bitmap(q->node, nr_zones);
+ +	if (!seq_zones_bitmap)
+ +		goto out;
+ +
+ +	/* Get zone information and initialize seq_zones_bitmap */
+ +	rep_nr_zones = nr_zones;
+ +	zones = blk_alloc_zones(q->node, &rep_nr_zones);
+ +	if (!zones)
+ +		goto out;
+ +
+ +	while (z < nr_zones) {
+ +		nrz = min(nr_zones - z, rep_nr_zones);
+ +		ret = blk_report_zones(disk, sector, zones, &nrz, GFP_NOIO);
+ +		if (ret)
+ +			goto out;
+ +		if (!nrz)
+ +			break;
+ +		for (i = 0; i < nrz; i++) {
+ +			if (zones[i].type != BLK_ZONE_TYPE_CONVENTIONAL)
+ +				set_bit(z, seq_zones_bitmap);
+ +			z++;
+ +		}
+ +		sector += nrz * blk_queue_zone_sectors(q);
+ +	}
+ +
+ +	if (WARN_ON(z != nr_zones)) {
+ +		ret = -EIO;
+ +		goto out;
+  	}
+  
+ +update:
+  	/*
+  	 * Install the new bitmaps, making sure the queue is stopped and
+  	 * all I/Os are completed (i.e. a scheduler is not referencing the
+* Unmerged path block/blk-zoned.c
+diff --git a/drivers/block/null_blk_main.c b/drivers/block/null_blk_main.c
+index 88b01572e8f5..db03b232a417 100644
+--- a/drivers/block/null_blk_main.c
++++ b/drivers/block/null_blk_main.c
+@@ -1556,11 +1556,17 @@ static int null_gendisk_register(struct nullb *nullb)
+ 	disk->queue		= nullb->q;
+ 	strncpy(disk->disk_name, nullb->disk_name, DISK_NAME_LEN);
+ 
++#ifdef CONFIG_BLK_DEV_ZONED
+ 	if (nullb->dev->zoned) {
+-		ret = blk_revalidate_disk_zones(disk);
+-		if (ret)
+-			return ret;
++		if (queue_is_mq(nullb->q)) {
++			ret = blk_revalidate_disk_zones(disk);
++			if (ret)
++				return ret;
++		} else {
++			nullb->q->nr_zones = blkdev_nr_zones(disk);
++		}
+ 	}
++#endif
+ 
+ 	add_disk(disk);
+ 	return 0;
+diff --git a/drivers/md/dm-table.c b/drivers/md/dm-table.c
+index 32427355c2b5..3545281e5716 100644
+--- a/drivers/md/dm-table.c
++++ b/drivers/md/dm-table.c
+@@ -1942,12 +1942,14 @@ void dm_table_set_restrictions(struct dm_table *t, struct request_queue *q,
+ 	/*
+ 	 * For a zoned target, the number of zones should be updated for the
+ 	 * correct value to be exposed in sysfs queue/nr_zones. For a BIO based
+-	 * target, this is all that is needed. For a request based target, the
+-	 * queue zone bitmaps must also be updated.
+-	 * Use blk_revalidate_disk_zones() to handle this.
++	 * target, this is all that is needed.
+ 	 */
+-	if (blk_queue_is_zoned(q))
+-		blk_revalidate_disk_zones(t->md->disk);
++#ifdef CONFIG_BLK_DEV_ZONED
++	if (blk_queue_is_zoned(q)) {
++		WARN_ON_ONCE(queue_is_mq(q));
++		q->nr_zones = blkdev_nr_zones(t->md->disk);
++	}
++#endif
+ 
+ 	/* Allow reads to exceed readahead limits */
+ 	q->backing_dev_info->io_pages = limits->max_sectors >> (PAGE_SHIFT - 9);
+diff --git a/include/linux/blkdev.h b/include/linux/blkdev.h
+index 8825c79cd84f..abb762f40173 100644
+--- a/include/linux/blkdev.h
++++ b/include/linux/blkdev.h
+@@ -382,11 +382,6 @@ static inline unsigned int blkdev_nr_zones(struct block_device *bdev)
+ 	return 0;
+ }
+ 
+-static inline int blk_revalidate_disk_zones(struct gendisk *disk)
+-{
+-	return 0;
+-}
+-
+ static inline int blkdev_report_zones_ioctl(struct block_device *bdev,
+ 					    fmode_t mode, unsigned int cmd,
+ 					    unsigned long arg)
