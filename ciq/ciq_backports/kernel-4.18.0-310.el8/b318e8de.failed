@@ -1,0 +1,128 @@
+KVM: x86: Protect userspace MSR filter with SRCU, and set atomically-ish
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-310.el8
+commit-author Sean Christopherson <seanjc@google.com>
+commit b318e8decf6b9ef1bcf4ca06fae6d6a2cb5d5c5c
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-310.el8/b318e8de.failed
+
+Fix a plethora of issues with MSR filtering by installing the resulting
+filter as an atomic bundle instead of updating the live filter one range
+at a time.  The KVM_X86_SET_MSR_FILTER ioctl() isn't truly atomic, as
+the hardware MSR bitmaps won't be updated until the next VM-Enter, but
+the relevant software struct is atomically updated, which is what KVM
+really needs.
+
+Similar to the approach used for modifying memslots, make arch.msr_filter
+a SRCU-protected pointer, do all the work configuring the new filter
+outside of kvm->lock, and then acquire kvm->lock only when the new filter
+has been vetted and created.  That way vCPU readers either see the old
+filter or the new filter in their entirety, not some half-baked state.
+
+Yuan Yao pointed out a use-after-free in ksm_msr_allowed() due to a
+TOCTOU bug, but that's just the tip of the iceberg...
+
+  - Nothing is __rcu annotated, making it nigh impossible to audit the
+    code for correctness.
+  - kvm_add_msr_filter() has an unpaired smp_wmb().  Violation of kernel
+    coding style aside, the lack of a smb_rmb() anywhere casts all code
+    into doubt.
+  - kvm_clear_msr_filter() has a double free TOCTOU bug, as it grabs
+    count before taking the lock.
+  - kvm_clear_msr_filter() also has memory leak due to the same TOCTOU bug.
+
+The entire approach of updating the live filter is also flawed.  While
+installing a new filter is inherently racy if vCPUs are running, fixing
+the above issues also makes it trivial to ensure certain behavior is
+deterministic, e.g. KVM can provide deterministic behavior for MSRs with
+identical settings in the old and new filters.  An atomic update of the
+filter also prevents KVM from getting into a half-baked state, e.g. if
+installing a filter fails, the existing approach would leave the filter
+in a half-baked state, having already committed whatever bits of the
+filter were already processed.
+
+[*] https://lkml.kernel.org/r/20210312083157.25403-1-yaoyuan0329os@gmail.com
+
+Fixes: 1a155254ff93 ("KVM: x86: Introduce MSR filtering")
+	Cc: stable@vger.kernel.org
+	Cc: Alexander Graf <graf@amazon.com>
+	Reported-by: Yuan Yao <yaoyuan0329os@gmail.com>
+	Signed-off-by: Sean Christopherson <seanjc@google.com>
+Message-Id: <20210316184436.2544875-2-seanjc@google.com>
+	Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+(cherry picked from commit b318e8decf6b9ef1bcf4ca06fae6d6a2cb5d5c5c)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/include/asm/kvm_host.h
+#	arch/x86/kvm/x86.c
+diff --cc arch/x86/include/asm/kvm_host.h
+index 6d67ff1f4c5a,3768819693e5..000000000000
+--- a/arch/x86/include/asm/kvm_host.h
++++ b/arch/x86/include/asm/kvm_host.h
+@@@ -1013,16 -1048,13 +1019,24 @@@ struct kvm_arch 
+  	bool guest_can_read_msr_platform_info;
+  	bool exception_payload_enabled;
+  
++ 	bool bus_lock_detection_enabled;
++ 
+  	/* Deflect RDMSR and WRMSR to user space when they trigger a #GP */
+  	u32 user_space_msr_mask;
+++<<<<<<< HEAD
+ +
+ +	struct {
+ +		u8 count;
+ +		bool default_allow:1;
+ +		struct msr_bitmap_range ranges[16];
+ +	} msr_filter;
+ +
+ +	struct kvm_pmu_event_filter *pmu_event_filter;
+++=======
++ 	struct kvm_x86_msr_filter __rcu *msr_filter;
++ 
++ 	struct kvm_pmu_event_filter __rcu *pmu_event_filter;
+++>>>>>>> b318e8decf6b (KVM: x86: Protect userspace MSR filter with SRCU, and set atomically-ish)
+  	struct task_struct *nx_lpage_recovery_thread;
+  
+  #ifdef CONFIG_X86_64
+diff --cc arch/x86/kvm/x86.c
+index 0513472995aa,a04e78b89637..000000000000
+--- a/arch/x86/kvm/x86.c
++++ b/arch/x86/kvm/x86.c
+@@@ -10497,10 -10674,8 +10519,15 @@@ void kvm_arch_destroy_vm(struct kvm *kv
+  		__x86_set_memory_region(kvm, TSS_PRIVATE_MEMSLOT, 0, 0);
+  		mutex_unlock(&kvm->slots_lock);
+  	}
+++<<<<<<< HEAD
+ +	if (kvm_x86_ops.vm_destroy)
+ +		kvm_x86_ops.vm_destroy(kvm);
+ +	for (i = 0; i < kvm->arch.msr_filter.count; i++)
+ +		kfree(kvm->arch.msr_filter.ranges[i].bitmap);
+++=======
++ 	static_call_cond(kvm_x86_vm_destroy)(kvm);
++ 	kvm_free_msr_filter(srcu_dereference_check(kvm->arch.msr_filter, &kvm->srcu, 1));
+++>>>>>>> b318e8decf6b (KVM: x86: Protect userspace MSR filter with SRCU, and set atomically-ish)
+  	kvm_pic_destroy(kvm);
+  	kvm_ioapic_destroy(kvm);
+  	kvm_free_vcpus(kvm);
+diff --git a/Documentation/virt/kvm/api.rst b/Documentation/virt/kvm/api.rst
+index 0a23a80361e7..a9f913c65982 100644
+--- a/Documentation/virt/kvm/api.rst
++++ b/Documentation/virt/kvm/api.rst
+@@ -4781,8 +4781,10 @@ If an MSR access is not permitted through the filtering, it generates a
+ allows user space to deflect and potentially handle various MSR accesses
+ into user space.
+ 
+-If a vCPU is in running state while this ioctl is invoked, the vCPU may
+-experience inconsistent filtering behavior on MSR accesses.
++Note, invoking this ioctl with a vCPU is running is inherently racy.  However,
++KVM does guarantee that vCPUs will see either the previous filter or the new
++filter, e.g. MSRs with identical settings in both the old and new filter will
++have deterministic behavior.
+ 
+ 
+ 5. The kvm_run structure
+* Unmerged path arch/x86/include/asm/kvm_host.h
+* Unmerged path arch/x86/kvm/x86.c
