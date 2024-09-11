@@ -951,7 +951,7 @@ static long kvmppc_do_h_page_init_zero(struct kvm_vcpu *vcpu,
 		return ret;
 
 	/* Check if we've been invalidated */
-	raw_spin_lock(&kvm->mmu_lock.rlock);
+	arch_spin_lock(&kvm->mmu_lock.rlock.raw_lock);
 	if (mmu_notifier_retry(kvm, mmu_seq)) {
 		ret = H_TOO_HARD;
 		goto out_unlock;
@@ -963,7 +963,7 @@ static long kvmppc_do_h_page_init_zero(struct kvm_vcpu *vcpu,
 	kvmppc_update_dirty_map(memslot, dest >> PAGE_SHIFT, PAGE_SIZE);
 
 out_unlock:
-	raw_spin_unlock(&kvm->mmu_lock.rlock);
+	arch_spin_unlock(&kvm->mmu_lock.rlock.raw_lock);
 	return ret;
 }
 
@@ -987,7 +987,7 @@ static long kvmppc_do_h_page_init_copy(struct kvm_vcpu *vcpu,
 		return ret;
 
 	/* Check if we've been invalidated */
-	raw_spin_lock(&kvm->mmu_lock.rlock);
+	arch_spin_lock(&kvm->mmu_lock.rlock.raw_lock);
 	if (mmu_notifier_retry(kvm, mmu_seq)) {
 		ret = H_TOO_HARD;
 		goto out_unlock;
@@ -999,7 +999,7 @@ static long kvmppc_do_h_page_init_copy(struct kvm_vcpu *vcpu,
 	kvmppc_update_dirty_map(dest_memslot, dest >> PAGE_SHIFT, PAGE_SIZE);
 
 out_unlock:
-	raw_spin_unlock(&kvm->mmu_lock.rlock);
+	arch_spin_unlock(&kvm->mmu_lock.rlock.raw_lock);
 	return ret;
 }
 
