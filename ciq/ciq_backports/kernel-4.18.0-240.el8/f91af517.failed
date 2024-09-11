@@ -1,0 +1,194 @@
+KVM: x86: Refactor kvm_cpuid() param that controls out-of-range logic
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Sean Christopherson <sean.j.christopherson@intel.com>
+commit f91af5176cce77bb0d3292e46665c30af0792dcd
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/f91af517.failed
+
+Invert and rename the kvm_cpuid() param that controls out-of-range logic
+to better reflect the semantics of the affected callers, i.e. callers
+that bypass the out-of-range logic do so because they are looking up an
+exact guest CPUID entry, e.g. to query the maxphyaddr.
+
+Similarly, rename kvm_cpuid()'s internal "found" to "exact" to clarify
+that it tracks whether or not the exact requested leaf was found, as
+opposed to any usable leaf being found.
+
+No functional change intended.
+
+	Signed-off-by: Sean Christopherson <sean.j.christopherson@intel.com>
+	Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+(cherry picked from commit f91af5176cce77bb0d3292e46665c30af0792dcd)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kvm/cpuid.c
+#	arch/x86/kvm/emulate.c
+diff --cc arch/x86/kvm/cpuid.c
+index 78d6db1ce0f2,08280d8a2ac9..000000000000
+--- a/arch/x86/kvm/cpuid.c
++++ b/arch/x86/kvm/cpuid.c
+@@@ -1012,25 -990,14 +1012,36 @@@ bool kvm_cpuid(struct kvm_vcpu *vcpu, u
+  {
+  	u32 orig_function = *eax, function = *eax, index = *ecx;
+  	struct kvm_cpuid_entry2 *entry;
+++<<<<<<< HEAD
+ +	struct kvm_cpuid_entry2 *max;
+ +	bool found;
+ +
+ +	entry = kvm_find_cpuid_entry(vcpu, function, index);
+ +	found = entry;
+ +	/*
+ +	 * Intel CPUID semantics treats any query for an out-of-range
+ +	 * leaf as if the highest basic leaf (i.e. CPUID.0H:EAX) were
+ +	 * requested. AMD CPUID semantics returns all zeroes for any
+ +	 * undefined leaf, whether or not the leaf is in range.
+ +	 */
+ +	if (!entry && check_limit && !guest_cpuid_is_amd(vcpu) &&
+ +	    !cpuid_function_in_range(vcpu, function)) {
+ +		max = kvm_find_cpuid_entry(vcpu, 0, 0);
+ +		if (max) {
+ +			function = max->eax;
+ +			entry = kvm_find_cpuid_entry(vcpu, function, index);
+ +		}
+ +	}
+++=======
++ 	bool exact;
++ 
++ 	entry = kvm_find_cpuid_entry(vcpu, function, index);
++ 	exact = !!entry;
++ 
++ 	if (!entry && !exact_only)
++ 		entry = get_out_of_range_cpuid_entry(vcpu, &function, index);
++ 
+++>>>>>>> f91af5176cce (KVM: x86: Refactor kvm_cpuid() param that controls out-of-range logic)
+  	if (entry) {
+  		*eax = entry->eax;
+  		*ebx = entry->ebx;
+diff --cc arch/x86/kvm/emulate.c
+index 0c4142dbfbb3,fefa32d6af00..000000000000
+--- a/arch/x86/kvm/emulate.c
++++ b/arch/x86/kvm/emulate.c
+@@@ -2724,10 -2722,8 +2724,15 @@@ static bool vendor_intel(struct x86_emu
+  	u32 eax, ebx, ecx, edx;
+  
+  	eax = ecx = 0;
+++<<<<<<< HEAD
+ +	ctxt->ops->get_cpuid(ctxt, &eax, &ebx, &ecx, &edx, false);
+ +	return ebx == X86EMUL_CPUID_VENDOR_GenuineIntel_ebx
+ +		&& ecx == X86EMUL_CPUID_VENDOR_GenuineIntel_ecx
+ +		&& edx == X86EMUL_CPUID_VENDOR_GenuineIntel_edx;
+++=======
++ 	ctxt->ops->get_cpuid(ctxt, &eax, &ebx, &ecx, &edx, true);
++ 	return is_guest_vendor_intel(ebx, ecx, edx);
+++>>>>>>> f91af5176cce (KVM: x86: Refactor kvm_cpuid() param that controls out-of-range logic)
+  }
+  
+  static bool em_syscall_is_enabled(struct x86_emulate_ctxt *ctxt)
+@@@ -2744,33 -2740,24 +2749,33 @@@
+  
+  	eax = 0x00000000;
+  	ecx = 0x00000000;
+- 	ops->get_cpuid(ctxt, &eax, &ebx, &ecx, &edx, false);
++ 	ops->get_cpuid(ctxt, &eax, &ebx, &ecx, &edx, true);
+  	/*
+ -	 * remark: Intel CPUs only support "syscall" in 64bit longmode. Also a
+ -	 * 64bit guest with a 32bit compat-app running will #UD !! While this
+ -	 * behaviour can be fixed (by emulating) into AMD response - CPUs of
+ -	 * AMD can't behave like Intel.
+ +	 * Intel ("GenuineIntel")
+ +	 * remark: Intel CPUs only support "syscall" in 64bit
+ +	 * longmode. Also an 64bit guest with a
+ +	 * 32bit compat-app running will #UD !! While this
+ +	 * behaviour can be fixed (by emulating) into AMD
+ +	 * response - CPUs of AMD can't behave like Intel.
+  	 */
+ -	if (is_guest_vendor_intel(ebx, ecx, edx))
+ +	if (ebx == X86EMUL_CPUID_VENDOR_GenuineIntel_ebx &&
+ +	    ecx == X86EMUL_CPUID_VENDOR_GenuineIntel_ecx &&
+ +	    edx == X86EMUL_CPUID_VENDOR_GenuineIntel_edx)
+  		return false;
+  
+ -	if (is_guest_vendor_amd(ebx, ecx, edx) ||
+ -	    is_guest_vendor_hygon(ebx, ecx, edx))
+ +	/* AMD ("AuthenticAMD") */
+ +	if (ebx == X86EMUL_CPUID_VENDOR_AuthenticAMD_ebx &&
+ +	    ecx == X86EMUL_CPUID_VENDOR_AuthenticAMD_ecx &&
+ +	    edx == X86EMUL_CPUID_VENDOR_AuthenticAMD_edx)
+  		return true;
+  
+ -	/*
+ -	 * default: (not Intel, not AMD, not Hygon), apply Intel's
+ -	 * stricter rules...
+ -	 */
+ +	/* AMD ("AMDisbetter!") */
+ +	if (ebx == X86EMUL_CPUID_VENDOR_AMDisbetterI_ebx &&
+ +	    ecx == X86EMUL_CPUID_VENDOR_AMDisbetterI_ecx &&
+ +	    edx == X86EMUL_CPUID_VENDOR_AMDisbetterI_edx)
+ +		return true;
+ +
+ +	/* default: (not Intel, not AMD), apply Intel's stricter rules... */
+  	return false;
+  }
+  
+* Unmerged path arch/x86/kvm/cpuid.c
+diff --git a/arch/x86/kvm/cpuid.h b/arch/x86/kvm/cpuid.h
+index a2335b92a9a0..63cb7453f0ba 100644
+--- a/arch/x86/kvm/cpuid.h
++++ b/arch/x86/kvm/cpuid.h
+@@ -23,7 +23,7 @@ int kvm_vcpu_ioctl_get_cpuid2(struct kvm_vcpu *vcpu,
+ 			      struct kvm_cpuid2 *cpuid,
+ 			      struct kvm_cpuid_entry2 __user *entries);
+ bool kvm_cpuid(struct kvm_vcpu *vcpu, u32 *eax, u32 *ebx,
+-	       u32 *ecx, u32 *edx, bool check_limit);
++	       u32 *ecx, u32 *edx, bool exact_only);
+ 
+ int cpuid_query_maxphyaddr(struct kvm_vcpu *vcpu);
+ 
+* Unmerged path arch/x86/kvm/emulate.c
+diff --git a/arch/x86/kvm/kvm_emulate.h b/arch/x86/kvm/kvm_emulate.h
+index dcdb44a5fb11..daba25f3a0cd 100644
+--- a/arch/x86/kvm/kvm_emulate.h
++++ b/arch/x86/kvm/kvm_emulate.h
+@@ -221,7 +221,7 @@ struct x86_emulate_ops {
+ 			 enum x86_intercept_stage stage);
+ 
+ 	bool (*get_cpuid)(struct x86_emulate_ctxt *ctxt, u32 *eax, u32 *ebx,
+-			  u32 *ecx, u32 *edx, bool check_limit);
++			  u32 *ecx, u32 *edx, bool exact_only);
+ 	bool (*guest_has_long_mode)(struct x86_emulate_ctxt *ctxt);
+ 	bool (*guest_has_movbe)(struct x86_emulate_ctxt *ctxt);
+ 	bool (*guest_has_fxsr)(struct x86_emulate_ctxt *ctxt);
+diff --git a/arch/x86/kvm/svm.c b/arch/x86/kvm/svm.c
+index 720353d5a356..7b7f625c1764 100644
+--- a/arch/x86/kvm/svm.c
++++ b/arch/x86/kvm/svm.c
+@@ -2177,7 +2177,7 @@ static void svm_vcpu_reset(struct kvm_vcpu *vcpu, bool init_event)
+ 	}
+ 	init_vmcb(svm);
+ 
+-	kvm_cpuid(vcpu, &eax, &dummy, &dummy, &dummy, true);
++	kvm_cpuid(vcpu, &eax, &dummy, &dummy, &dummy, false);
+ 	kvm_rdx_write(vcpu, eax);
+ 
+ 	if (kvm_vcpu_apicv_active(vcpu) && !init_event)
+diff --git a/arch/x86/kvm/x86.c b/arch/x86/kvm/x86.c
+index d84116c1b5a2..8a34bce719a4 100644
+--- a/arch/x86/kvm/x86.c
++++ b/arch/x86/kvm/x86.c
+@@ -6189,9 +6189,10 @@ static int emulator_intercept(struct x86_emulate_ctxt *ctxt,
+ }
+ 
+ static bool emulator_get_cpuid(struct x86_emulate_ctxt *ctxt,
+-			u32 *eax, u32 *ebx, u32 *ecx, u32 *edx, bool check_limit)
++			      u32 *eax, u32 *ebx, u32 *ecx, u32 *edx,
++			      bool exact_only)
+ {
+-	return kvm_cpuid(emul_to_vcpu(ctxt), eax, ebx, ecx, edx, check_limit);
++	return kvm_cpuid(emul_to_vcpu(ctxt), eax, ebx, ecx, edx, exact_only);
+ }
+ 
+ static bool emulator_guest_has_long_mode(struct x86_emulate_ctxt *ctxt)
