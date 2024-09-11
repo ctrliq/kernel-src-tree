@@ -1,0 +1,133 @@
+drm/i915: Implement w/a 22010492432 for adl-s
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-448.el8
+commit-author Ville Syrjälä <ville.syrjala@linux.intel.com>
+commit d36bdd77b9e6aa7f5cb7b0f11ebbab8e5febf10b
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-448.el8/d36bdd77.failed
+
+adl-s needs the combo PLL DCO fraction w/a as well.
+Gets us slightly more accurate clock out of the PLL.
+
+	Cc: stable@vger.kernel.org
+	Signed-off-by: Ville Syrjälä <ville.syrjala@linux.intel.com>
+Link: https://patchwork.freedesktop.org/patch/msgid/20220613201439.23341-1-ville.syrjala@linux.intel.com
+	Reviewed-by: Matt Roper <matthew.d.roper@intel.com>
+(cherry picked from commit d36bdd77b9e6aa7f5cb7b0f11ebbab8e5febf10b)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/gpu/drm/i915/display/intel_dpll_mgr.c
+diff --cc drivers/gpu/drm/i915/display/intel_dpll_mgr.c
+index 32b3eceb7027,982e5b945680..000000000000
+--- a/drivers/gpu/drm/i915/display/intel_dpll_mgr.c
++++ b/drivers/gpu/drm/i915/display/intel_dpll_mgr.c
+@@@ -2552,96 -2458,16 +2552,101 @@@ static void cnl_wrpll_params_populate(s
+  	params->dco_fraction = dco & 0x7fff;
+  }
+  
+ -/*
+ - * Display WA #22010492432: ehl, tgl, adl-s, adl-p
+ - * Program half of the nominal DCO divider fraction value.
+ +static bool
+ +__cnl_ddi_calculate_wrpll(struct intel_crtc_state *crtc_state,
+ +			  struct skl_wrpll_params *wrpll_params,
+ +			  int ref_clock)
+ +{
+ +	u32 afe_clock = crtc_state->port_clock * 5;
+ +	u32 dco_min = 7998000;
+ +	u32 dco_max = 10000000;
+ +	u32 dco_mid = (dco_min + dco_max) / 2;
+ +	static const int dividers[] = {  2,  4,  6,  8, 10, 12,  14,  16,
+ +					 18, 20, 24, 28, 30, 32,  36,  40,
+ +					 42, 44, 48, 50, 52, 54,  56,  60,
+ +					 64, 66, 68, 70, 72, 76,  78,  80,
+ +					 84, 88, 90, 92, 96, 98, 100, 102,
+ +					  3,  5,  7,  9, 15, 21 };
+ +	u32 dco, best_dco = 0, dco_centrality = 0;
+ +	u32 best_dco_centrality = U32_MAX; /* Spec meaning of 999999 MHz */
+ +	int d, best_div = 0, pdiv = 0, qdiv = 0, kdiv = 0;
+ +
+ +	for (d = 0; d < ARRAY_SIZE(dividers); d++) {
+ +		dco = afe_clock * dividers[d];
+ +
+ +		if ((dco <= dco_max) && (dco >= dco_min)) {
+ +			dco_centrality = abs(dco - dco_mid);
+ +
+ +			if (dco_centrality < best_dco_centrality) {
+ +				best_dco_centrality = dco_centrality;
+ +				best_div = dividers[d];
+ +				best_dco = dco;
+ +			}
+ +		}
+ +	}
+ +
+ +	if (best_div == 0)
+ +		return false;
+ +
+ +	cnl_wrpll_get_multipliers(best_div, &pdiv, &qdiv, &kdiv);
+ +	cnl_wrpll_params_populate(wrpll_params, best_dco, ref_clock,
+ +				  pdiv, qdiv, kdiv);
+ +
+ +	return true;
+ +}
+ +
+ +static bool
+ +cnl_ddi_calculate_wrpll(struct intel_crtc_state *crtc_state,
+ +			struct skl_wrpll_params *wrpll_params)
+ +{
+ +	struct drm_i915_private *i915 = to_i915(crtc_state->uapi.crtc->dev);
+ +
+ +	return __cnl_ddi_calculate_wrpll(crtc_state, wrpll_params,
+ +					 i915->dpll.ref_clks.nssc);
+ +}
+ +
+ +static bool cnl_ddi_hdmi_pll_dividers(struct intel_crtc_state *crtc_state)
+ +{
+ +	u32 cfgcr0, cfgcr1;
+ +	struct skl_wrpll_params wrpll_params = { 0, };
+ +
+ +	cfgcr0 = DPLL_CFGCR0_HDMI_MODE;
+ +
+ +	if (!cnl_ddi_calculate_wrpll(crtc_state, &wrpll_params))
+ +		return false;
+ +
+ +	cfgcr0 |= DPLL_CFGCR0_DCO_FRACTION(wrpll_params.dco_fraction) |
+ +		wrpll_params.dco_integer;
+ +
+ +	cfgcr1 = DPLL_CFGCR1_QDIV_RATIO(wrpll_params.qdiv_ratio) |
+ +		DPLL_CFGCR1_QDIV_MODE(wrpll_params.qdiv_mode) |
+ +		DPLL_CFGCR1_KDIV(wrpll_params.kdiv) |
+ +		DPLL_CFGCR1_PDIV(wrpll_params.pdiv) |
+ +		DPLL_CFGCR1_CENTRAL_FREQ;
+ +
+ +	memset(&crtc_state->dpll_hw_state, 0,
+ +	       sizeof(crtc_state->dpll_hw_state));
+ +
+ +	crtc_state->dpll_hw_state.cfgcr0 = cfgcr0;
+ +	crtc_state->dpll_hw_state.cfgcr1 = cfgcr1;
+ +	return true;
+ +}
+ +
+ +/*
+-  * Display WA #22010492432: ehl, tgl, adl-p
+++ * Display WA #22010492432: ehl, tgl, adl-s, adl-p
+ + * Program half of the nominal DCO divider fraction value.
+   */
+  static bool
+  ehl_combo_pll_div_frac_wa_needed(struct drm_i915_private *i915)
+  {
+  	return ((IS_PLATFORM(i915, INTEL_ELKHARTLAKE) &&
+++<<<<<<< HEAD
+ +		 IS_JSL_EHL_REVID(i915, EHL_REVID_B0, REVID_FOREVER)) ||
+ +		 IS_TIGERLAKE(i915) || IS_ALDERLAKE_P(i915)) &&
+++=======
++ 		 IS_JSL_EHL_DISPLAY_STEP(i915, STEP_B0, STEP_FOREVER)) ||
++ 		 IS_TIGERLAKE(i915) || IS_ALDERLAKE_S(i915) || IS_ALDERLAKE_P(i915)) &&
+++>>>>>>> d36bdd77b9e6 (drm/i915: Implement w/a 22010492432 for adl-s)
+  		 i915->dpll.ref_clks.nssc == 38400;
+  }
+  
+* Unmerged path drivers/gpu/drm/i915/display/intel_dpll_mgr.c
