@@ -1,0 +1,310 @@
+powerpc/numa: remove start/stop_topology_update()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-331.el8
+commit-author Nathan Lynch <nathanl@linux.ibm.com>
+commit 1835303e5690cbeef2c07a9a5416045475ddaa13
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-331.el8/1835303e.failed
+
+These APIs have become no-ops, so remove them and all call sites.
+
+	Signed-off-by: Nathan Lynch <nathanl@linux.ibm.com>
+	Reviewed-by: Srikar Dronamraju <srikar@linux.vnet.ibm.com>
+	Signed-off-by: Michael Ellerman <mpe@ellerman.id.au>
+Link: https://lore.kernel.org/r/20200612051238.1007764-12-nathanl@linux.ibm.com
+(cherry picked from commit 1835303e5690cbeef2c07a9a5416045475ddaa13)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/powerpc/mm/numa.c
+diff --cc arch/powerpc/mm/numa.c
+index ea9e6ad56631,dec7ce3b5e67..000000000000
+--- a/arch/powerpc/mm/numa.c
++++ b/arch/powerpc/mm/numa.c
+@@@ -1553,212 -1210,13 +1551,218 @@@ int arch_update_cpu_topology(void
+  	return numa_update_cpu_topology(true);
+  }
+  
+++<<<<<<< HEAD
+ +static void topology_work_fn(struct work_struct *work)
+ +{
+ +	rebuild_sched_domains();
+ +}
+ +static DECLARE_WORK(topology_work, topology_work_fn);
+ +
+ +static void topology_schedule_update(void)
+ +{
+ +	schedule_work(&topology_work);
+ +}
+ +
+ +static void topology_timer_fn(struct timer_list *unused)
+ +{
+ +	if (prrn_enabled && cpumask_weight(&cpu_associativity_changes_mask))
+ +		topology_schedule_update();
+ +	else if (vphn_enabled) {
+ +		if (update_cpu_associativity_changes_mask() > 0)
+ +			topology_schedule_update();
+ +		reset_topology_timer();
+ +	}
+ +}
+ +static struct timer_list topology_timer;
+ +
+ +static void reset_topology_timer(void)
+ +{
+ +	if (vphn_enabled)
+ +		mod_timer(&topology_timer, jiffies + topology_timer_secs * HZ);
+ +}
+ +
+ +#ifdef CONFIG_SMP
+ +
+ +static int dt_update_callback(struct notifier_block *nb,
+ +				unsigned long action, void *data)
+ +{
+ +	struct of_reconfig_data *update = data;
+ +	int rc = NOTIFY_DONE;
+ +
+ +	switch (action) {
+ +	case OF_RECONFIG_UPDATE_PROPERTY:
+ +		if (!of_prop_cmp(update->dn->type, "cpu") &&
+ +		    !of_prop_cmp(update->prop->name, "ibm,associativity")) {
+ +			u32 core_id;
+ +			of_property_read_u32(update->dn, "reg", &core_id);
+ +			rc = dlpar_cpu_readd(core_id);
+ +			rc = NOTIFY_OK;
+ +		}
+ +		break;
+ +	}
+ +
+ +	return rc;
+ +}
+ +
+ +static struct notifier_block dt_update_nb = {
+ +	.notifier_call = dt_update_callback,
+ +};
+ +
+ +#endif
+ +
+ +/*
+ + * Start polling for associativity changes.
+ + */
+ +int start_topology_update(void)
+ +{
+ +	int rc = 0;
+ +
+ +	if (!topology_updates_enabled)
+ +		return 0;
+ +
+ +	if (firmware_has_feature(FW_FEATURE_PRRN)) {
+ +		if (!prrn_enabled) {
+ +			prrn_enabled = 1;
+ +#ifdef CONFIG_SMP
+ +			rc = of_reconfig_notifier_register(&dt_update_nb);
+ +#endif
+ +		}
+ +	}
+ +	if (firmware_has_feature(FW_FEATURE_VPHN) &&
+ +		   lppaca_shared_proc(get_lppaca())) {
+ +		if (!vphn_enabled) {
+ +			vphn_enabled = 1;
+ +			setup_cpu_associativity_change_counters();
+ +			timer_setup(&topology_timer, topology_timer_fn,
+ +				    TIMER_DEFERRABLE);
+ +			reset_topology_timer();
+ +		}
+ +	}
+ +
+ +	pr_info("Starting topology update%s%s\n",
+ +		(prrn_enabled ? " prrn_enabled" : ""),
+ +		(vphn_enabled ? " vphn_enabled" : ""));
+ +
+ +	return rc;
+ +}
+ +
+ +/*
+ + * Disable polling for VPHN associativity changes.
+ + */
+ +int stop_topology_update(void)
+ +{
+ +	int rc = 0;
+ +
+ +	if (!topology_updates_enabled)
+ +		return 0;
+ +
+ +	if (prrn_enabled) {
+ +		prrn_enabled = 0;
+ +#ifdef CONFIG_SMP
+ +		rc = of_reconfig_notifier_unregister(&dt_update_nb);
+ +#endif
+ +	}
+ +	if (vphn_enabled) {
+ +		vphn_enabled = 0;
+ +		rc = del_timer_sync(&topology_timer);
+ +	}
+ +
+ +	pr_info("Stopping topology update\n");
+ +
+ +	return rc;
+ +}
+ +
+++=======
+++>>>>>>> 1835303e5690 (powerpc/numa: remove start/stop_topology_update())
+  int prrn_is_enabled(void)
+  {
+ +	return prrn_enabled;
+ +}
+ +
+ +static int topology_read(struct seq_file *file, void *v)
+ +{
+ +	if (vphn_enabled || prrn_enabled)
+ +		seq_puts(file, "on\n");
+ +	else
+ +		seq_puts(file, "off\n");
+ +
+  	return 0;
+  }
+  
+ +static int topology_open(struct inode *inode, struct file *file)
+ +{
+ +	return single_open(file, topology_read, NULL);
+ +}
+ +
+ +static ssize_t topology_write(struct file *file, const char __user *buf,
+ +			      size_t count, loff_t *off)
+ +{
+ +	char kbuf[4]; /* "on" or "off" plus null. */
+ +	int read_len;
+ +
+ +	read_len = count < 3 ? count : 3;
+ +	if (copy_from_user(kbuf, buf, read_len))
+ +		return -EINVAL;
+ +
+ +	kbuf[read_len] = '\0';
+ +
+ +	if (!strncmp(kbuf, "on", 2)) {
+ +		topology_updates_enabled = true;
+ +		start_topology_update();
+ +	} else if (!strncmp(kbuf, "off", 3)) {
+ +		stop_topology_update();
+ +		topology_updates_enabled = false;
+ +	} else
+ +		return -EINVAL;
+ +
+ +	return count;
+ +}
+ +
+ +static const struct file_operations topology_ops = {
+ +	.read = seq_read,
+ +	.write = topology_write,
+ +	.open = topology_open,
+ +	.release = single_release
+ +};
+ +
+ +int cpu_to_coregroup_id(int cpu)
+ +{
+ +	__be32 associativity[VPHN_ASSOC_BUFSIZE] = {0};
+ +	int index;
+ +
+ +	if (cpu < 0 || cpu > nr_cpu_ids)
+ +		return -1;
+ +
+ +	if (!coregroup_enabled)
+ +		goto out;
+ +
+ +	if (!firmware_has_feature(FW_FEATURE_VPHN))
+ +		goto out;
+ +
+ +	if (vphn_get_associativity(cpu, associativity))
+ +		goto out;
+ +
+ +	index = of_read_number(associativity, 1);
+ +	if (index > min_common_depth + 1)
+ +		return of_read_number(&associativity[index - 1], 1);
+ +
+ +out:
+ +	return cpu_to_core_id(cpu);
+ +}
+ +
+  static int topology_update_init(void)
+  {
+++<<<<<<< HEAD
+ +	start_topology_update();
+ +
+ +	if (vphn_enabled)
+ +		topology_schedule_update();
+ +
+ +	if (!proc_create("powerpc/topology_updates", 0644, NULL, &topology_ops))
+ +		return -ENOMEM;
+ +
+++=======
+++>>>>>>> 1835303e5690 (powerpc/numa: remove start/stop_topology_update())
+  	topology_inited = 1;
+  	return 0;
+  }
+diff --git a/arch/powerpc/include/asm/topology.h b/arch/powerpc/include/asm/topology.h
+index 590f3fd3ef02..e4287a441ba1 100644
+--- a/arch/powerpc/include/asm/topology.h
++++ b/arch/powerpc/include/asm/topology.h
+@@ -93,21 +93,11 @@ static inline int cpu_distance(__be32 *cpu1_assoc, __be32 *cpu2_assoc)
+ #endif /* CONFIG_NUMA */
+ 
+ #if defined(CONFIG_NUMA) && defined(CONFIG_PPC_SPLPAR)
+-extern int start_topology_update(void);
+-extern int stop_topology_update(void);
+ extern int prrn_is_enabled(void);
+ extern int find_and_online_cpu_nid(int cpu);
+ extern int timed_topology_update(int nsecs);
+ extern int cpu_to_coregroup_id(int cpu);
+ #else
+-static inline int start_topology_update(void)
+-{
+-	return 0;
+-}
+-static inline int stop_topology_update(void)
+-{
+-	return 0;
+-}
+ static inline int prrn_is_enabled(void)
+ {
+ 	return 0;
+* Unmerged path arch/powerpc/mm/numa.c
+diff --git a/arch/powerpc/platforms/pseries/mobility.c b/arch/powerpc/platforms/pseries/mobility.c
+index 004912e4a3ff..405ac8218b9a 100644
+--- a/arch/powerpc/platforms/pseries/mobility.c
++++ b/arch/powerpc/platforms/pseries/mobility.c
+@@ -390,8 +390,6 @@ static ssize_t migration_store(struct class *class,
+ 	if (rc)
+ 		return rc;
+ 
+-	stop_topology_update();
+-
+ 	do {
+ 		rc = rtas_ibm_suspend_me(streamid);
+ 		if (rc == -EAGAIN)
+@@ -403,8 +401,6 @@ static ssize_t migration_store(struct class *class,
+ 
+ 	post_mobility_fixup();
+ 
+-	start_topology_update();
+-
+ 	return count;
+ }
+ 
+diff --git a/arch/powerpc/platforms/pseries/suspend.c b/arch/powerpc/platforms/pseries/suspend.c
+index f613779a2219..a7244a45e696 100644
+--- a/arch/powerpc/platforms/pseries/suspend.c
++++ b/arch/powerpc/platforms/pseries/suspend.c
+@@ -144,11 +144,8 @@ static ssize_t store_hibernate(struct device *dev,
+ 			ssleep(1);
+ 	} while (rc == -EAGAIN);
+ 
+-	if (!rc) {
+-		stop_topology_update();
++	if (!rc)
+ 		rc = pm_suspend(PM_SUSPEND_MEM);
+-		start_topology_update();
+-	}
+ 
+ 	stream_id = 0;
+ 
