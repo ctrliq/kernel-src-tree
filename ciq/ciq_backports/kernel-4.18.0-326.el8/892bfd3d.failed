@@ -1,0 +1,425 @@
+tcp: export timestamp helpers for mptcp
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-326.el8
+commit-author Florian Westphal <fw@strlen.de>
+commit 892bfd3ded0ef0f895ed6356d0f85e2009421747
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-326.el8/892bfd3d.failed
+
+MPTCP is builtin, so no need to add EXPORT_SYMBOL()s.
+
+It will be used to support SO_TIMESTAMP(NS) ancillary
+messages in the mptcp receive path.
+
+	Acked-by: Paolo Abeni <pabeni@redhat.com>
+	Signed-off-by: Florian Westphal <fw@strlen.de>
+	Signed-off-by: Mat Martineau <mathew.j.martineau@linux.intel.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 892bfd3ded0ef0f895ed6356d0f85e2009421747)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/net/tcp.h
+#	net/ipv4/tcp.c
+diff --cc include/net/tcp.h
+index cc8f283001ed,e668f1bf780d..000000000000
+--- a/include/net/tcp.h
++++ b/include/net/tcp.h
+@@@ -416,9 -411,16 +416,17 @@@ void tcp_syn_ack_timeout(const struct r
+  int tcp_recvmsg(struct sock *sk, struct msghdr *msg, size_t len, int nonblock,
+  		int flags, int *addr_len);
+  int tcp_set_rcvlowat(struct sock *sk, int val);
+++<<<<<<< HEAD
+++=======
++ int tcp_set_window_clamp(struct sock *sk, int val);
++ void tcp_update_recv_tstamps(struct sk_buff *skb,
++ 			     struct scm_timestamping_internal *tss);
++ void tcp_recv_timestamp(struct msghdr *msg, const struct sock *sk,
++ 			struct scm_timestamping_internal *tss);
+++>>>>>>> 892bfd3ded0e (tcp: export timestamp helpers for mptcp)
+  void tcp_data_ready(struct sock *sk);
+ -#ifdef CONFIG_MMU
+  int tcp_mmap(struct file *file, struct socket *sock,
+  	     struct vm_area_struct *vma);
+ -#endif
+  void tcp_parse_options(const struct net *net, const struct sk_buff *skb,
+  		       struct tcp_options_received *opt_rx,
+  		       int estab, struct tcp_fastopen_cookie *foc);
+diff --cc net/ipv4/tcp.c
+index 5426b63bed77,0e3f0e0e5b51..000000000000
+--- a/net/ipv4/tcp.c
++++ b/net/ipv4/tcp.c
+@@@ -1743,6 -1738,20 +1743,23 @@@ int tcp_set_rcvlowat(struct sock *sk, i
+  }
+  EXPORT_SYMBOL(tcp_set_rcvlowat);
+  
+++<<<<<<< HEAD
+++=======
++ void tcp_update_recv_tstamps(struct sk_buff *skb,
++ 			     struct scm_timestamping_internal *tss)
++ {
++ 	if (skb->tstamp)
++ 		tss->ts[0] = ktime_to_timespec64(skb->tstamp);
++ 	else
++ 		tss->ts[0] = (struct timespec64) {0};
++ 
++ 	if (skb_hwtstamps(skb)->hwtstamp)
++ 		tss->ts[2] = ktime_to_timespec64(skb_hwtstamps(skb)->hwtstamp);
++ 	else
++ 		tss->ts[2] = (struct timespec64) {0};
++ }
++ 
+++>>>>>>> 892bfd3ded0e (tcp: export timestamp helpers for mptcp)
+  #ifdef CONFIG_MMU
+  static const struct vm_operations_struct tcp_vm_ops = {
+  };
+@@@ -1762,17 -1771,307 +1779,300 @@@ int tcp_mmap(struct file *file, struct 
+  }
+  EXPORT_SYMBOL(tcp_mmap);
+  
+++<<<<<<< HEAD
+++=======
++ static skb_frag_t *skb_advance_to_frag(struct sk_buff *skb, u32 offset_skb,
++ 				       u32 *offset_frag)
++ {
++ 	skb_frag_t *frag;
++ 
++ 	offset_skb -= skb_headlen(skb);
++ 	if ((int)offset_skb < 0 || skb_has_frag_list(skb))
++ 		return NULL;
++ 
++ 	frag = skb_shinfo(skb)->frags;
++ 	while (offset_skb) {
++ 		if (skb_frag_size(frag) > offset_skb) {
++ 			*offset_frag = offset_skb;
++ 			return frag;
++ 		}
++ 		offset_skb -= skb_frag_size(frag);
++ 		++frag;
++ 	}
++ 	*offset_frag = 0;
++ 	return frag;
++ }
++ 
++ static bool can_map_frag(const skb_frag_t *frag)
++ {
++ 	return skb_frag_size(frag) == PAGE_SIZE && !skb_frag_off(frag);
++ }
++ 
++ static int find_next_mappable_frag(const skb_frag_t *frag,
++ 				   int remaining_in_skb)
++ {
++ 	int offset = 0;
++ 
++ 	if (likely(can_map_frag(frag)))
++ 		return 0;
++ 
++ 	while (offset < remaining_in_skb && !can_map_frag(frag)) {
++ 		offset += skb_frag_size(frag);
++ 		++frag;
++ 	}
++ 	return offset;
++ }
++ 
++ static void tcp_zerocopy_set_hint_for_skb(struct sock *sk,
++ 					  struct tcp_zerocopy_receive *zc,
++ 					  struct sk_buff *skb, u32 offset)
++ {
++ 	u32 frag_offset, partial_frag_remainder = 0;
++ 	int mappable_offset;
++ 	skb_frag_t *frag;
++ 
++ 	/* worst case: skip to next skb. try to improve on this case below */
++ 	zc->recv_skip_hint = skb->len - offset;
++ 
++ 	/* Find the frag containing this offset (and how far into that frag) */
++ 	frag = skb_advance_to_frag(skb, offset, &frag_offset);
++ 	if (!frag)
++ 		return;
++ 
++ 	if (frag_offset) {
++ 		struct skb_shared_info *info = skb_shinfo(skb);
++ 
++ 		/* We read part of the last frag, must recvmsg() rest of skb. */
++ 		if (frag == &info->frags[info->nr_frags - 1])
++ 			return;
++ 
++ 		/* Else, we must at least read the remainder in this frag. */
++ 		partial_frag_remainder = skb_frag_size(frag) - frag_offset;
++ 		zc->recv_skip_hint -= partial_frag_remainder;
++ 		++frag;
++ 	}
++ 
++ 	/* partial_frag_remainder: If part way through a frag, must read rest.
++ 	 * mappable_offset: Bytes till next mappable frag, *not* counting bytes
++ 	 * in partial_frag_remainder.
++ 	 */
++ 	mappable_offset = find_next_mappable_frag(frag, zc->recv_skip_hint);
++ 	zc->recv_skip_hint = mappable_offset + partial_frag_remainder;
++ }
++ 
++ static int tcp_recvmsg_locked(struct sock *sk, struct msghdr *msg, size_t len,
++ 			      int nonblock, int flags,
++ 			      struct scm_timestamping_internal *tss,
++ 			      int *cmsg_flags);
++ static int receive_fallback_to_copy(struct sock *sk,
++ 				    struct tcp_zerocopy_receive *zc, int inq,
++ 				    struct scm_timestamping_internal *tss)
++ {
++ 	unsigned long copy_address = (unsigned long)zc->copybuf_address;
++ 	struct msghdr msg = {};
++ 	struct iovec iov;
++ 	int err;
++ 
++ 	zc->length = 0;
++ 	zc->recv_skip_hint = 0;
++ 
++ 	if (copy_address != zc->copybuf_address)
++ 		return -EINVAL;
++ 
++ 	err = import_single_range(READ, (void __user *)copy_address,
++ 				  inq, &iov, &msg.msg_iter);
++ 	if (err)
++ 		return err;
++ 
++ 	err = tcp_recvmsg_locked(sk, &msg, inq, /*nonblock=*/1, /*flags=*/0,
++ 				 tss, &zc->msg_flags);
++ 	if (err < 0)
++ 		return err;
++ 
++ 	zc->copybuf_len = err;
++ 	if (likely(zc->copybuf_len)) {
++ 		struct sk_buff *skb;
++ 		u32 offset;
++ 
++ 		skb = tcp_recv_skb(sk, tcp_sk(sk)->copied_seq, &offset);
++ 		if (skb)
++ 			tcp_zerocopy_set_hint_for_skb(sk, zc, skb, offset);
++ 	}
++ 	return 0;
++ }
++ 
++ static int tcp_copy_straggler_data(struct tcp_zerocopy_receive *zc,
++ 				   struct sk_buff *skb, u32 copylen,
++ 				   u32 *offset, u32 *seq)
++ {
++ 	unsigned long copy_address = (unsigned long)zc->copybuf_address;
++ 	struct msghdr msg = {};
++ 	struct iovec iov;
++ 	int err;
++ 
++ 	if (copy_address != zc->copybuf_address)
++ 		return -EINVAL;
++ 
++ 	err = import_single_range(READ, (void __user *)copy_address,
++ 				  copylen, &iov, &msg.msg_iter);
++ 	if (err)
++ 		return err;
++ 	err = skb_copy_datagram_msg(skb, *offset, &msg, copylen);
++ 	if (err)
++ 		return err;
++ 	zc->recv_skip_hint -= copylen;
++ 	*offset += copylen;
++ 	*seq += copylen;
++ 	return (__s32)copylen;
++ }
++ 
++ static int tcp_zc_handle_leftover(struct tcp_zerocopy_receive *zc,
++ 				  struct sock *sk,
++ 				  struct sk_buff *skb,
++ 				  u32 *seq,
++ 				  s32 copybuf_len,
++ 				  struct scm_timestamping_internal *tss)
++ {
++ 	u32 offset, copylen = min_t(u32, copybuf_len, zc->recv_skip_hint);
++ 
++ 	if (!copylen)
++ 		return 0;
++ 	/* skb is null if inq < PAGE_SIZE. */
++ 	if (skb) {
++ 		offset = *seq - TCP_SKB_CB(skb)->seq;
++ 	} else {
++ 		skb = tcp_recv_skb(sk, *seq, &offset);
++ 		if (TCP_SKB_CB(skb)->has_rxtstamp) {
++ 			tcp_update_recv_tstamps(skb, tss);
++ 			zc->msg_flags |= TCP_CMSG_TS;
++ 		}
++ 	}
++ 
++ 	zc->copybuf_len = tcp_copy_straggler_data(zc, skb, copylen, &offset,
++ 						  seq);
++ 	return zc->copybuf_len < 0 ? 0 : copylen;
++ }
++ 
++ static int tcp_zerocopy_vm_insert_batch_error(struct vm_area_struct *vma,
++ 					      struct page **pending_pages,
++ 					      unsigned long pages_remaining,
++ 					      unsigned long *address,
++ 					      u32 *length,
++ 					      u32 *seq,
++ 					      struct tcp_zerocopy_receive *zc,
++ 					      u32 total_bytes_to_map,
++ 					      int err)
++ {
++ 	/* At least one page did not map. Try zapping if we skipped earlier. */
++ 	if (err == -EBUSY &&
++ 	    zc->flags & TCP_RECEIVE_ZEROCOPY_FLAG_TLB_CLEAN_HINT) {
++ 		u32 maybe_zap_len;
++ 
++ 		maybe_zap_len = total_bytes_to_map -  /* All bytes to map */
++ 				*length + /* Mapped or pending */
++ 				(pages_remaining * PAGE_SIZE); /* Failed map. */
++ 		zap_page_range(vma, *address, maybe_zap_len);
++ 		err = 0;
++ 	}
++ 
++ 	if (!err) {
++ 		unsigned long leftover_pages = pages_remaining;
++ 		int bytes_mapped;
++ 
++ 		/* We called zap_page_range, try to reinsert. */
++ 		err = vm_insert_pages(vma, *address,
++ 				      pending_pages,
++ 				      &pages_remaining);
++ 		bytes_mapped = PAGE_SIZE * (leftover_pages - pages_remaining);
++ 		*seq += bytes_mapped;
++ 		*address += bytes_mapped;
++ 	}
++ 	if (err) {
++ 		/* Either we were unable to zap, OR we zapped, retried an
++ 		 * insert, and still had an issue. Either ways, pages_remaining
++ 		 * is the number of pages we were unable to map, and we unroll
++ 		 * some state we speculatively touched before.
++ 		 */
++ 		const int bytes_not_mapped = PAGE_SIZE * pages_remaining;
++ 
++ 		*length -= bytes_not_mapped;
++ 		zc->recv_skip_hint += bytes_not_mapped;
++ 	}
++ 	return err;
++ }
++ 
++ static int tcp_zerocopy_vm_insert_batch(struct vm_area_struct *vma,
++ 					struct page **pages,
++ 					unsigned int pages_to_map,
++ 					unsigned long *address,
++ 					u32 *length,
++ 					u32 *seq,
++ 					struct tcp_zerocopy_receive *zc,
++ 					u32 total_bytes_to_map)
++ {
++ 	unsigned long pages_remaining = pages_to_map;
++ 	unsigned int pages_mapped;
++ 	unsigned int bytes_mapped;
++ 	int err;
++ 
++ 	err = vm_insert_pages(vma, *address, pages, &pages_remaining);
++ 	pages_mapped = pages_to_map - (unsigned int)pages_remaining;
++ 	bytes_mapped = PAGE_SIZE * pages_mapped;
++ 	/* Even if vm_insert_pages fails, it may have partially succeeded in
++ 	 * mapping (some but not all of the pages).
++ 	 */
++ 	*seq += bytes_mapped;
++ 	*address += bytes_mapped;
++ 
++ 	if (likely(!err))
++ 		return 0;
++ 
++ 	/* Error: maybe zap and retry + rollback state for failed inserts. */
++ 	return tcp_zerocopy_vm_insert_batch_error(vma, pages + pages_mapped,
++ 		pages_remaining, address, length, seq, zc, total_bytes_to_map,
++ 		err);
++ }
++ 
++ #define TCP_VALID_ZC_MSG_FLAGS   (TCP_CMSG_TS)
++ static void tcp_zc_finalize_rx_tstamp(struct sock *sk,
++ 				      struct tcp_zerocopy_receive *zc,
++ 				      struct scm_timestamping_internal *tss)
++ {
++ 	unsigned long msg_control_addr;
++ 	struct msghdr cmsg_dummy;
++ 
++ 	msg_control_addr = (unsigned long)zc->msg_control;
++ 	cmsg_dummy.msg_control = (void *)msg_control_addr;
++ 	cmsg_dummy.msg_controllen =
++ 		(__kernel_size_t)zc->msg_controllen;
++ 	cmsg_dummy.msg_flags = in_compat_syscall()
++ 		? MSG_CMSG_COMPAT : 0;
++ 	cmsg_dummy.msg_control_is_user = true;
++ 	zc->msg_flags = 0;
++ 	if (zc->msg_control == msg_control_addr &&
++ 	    zc->msg_controllen == cmsg_dummy.msg_controllen) {
++ 		tcp_recv_timestamp(&cmsg_dummy, sk, tss);
++ 		zc->msg_control = (__u64)
++ 			((uintptr_t)cmsg_dummy.msg_control);
++ 		zc->msg_controllen =
++ 			(__u64)cmsg_dummy.msg_controllen;
++ 		zc->msg_flags = (__u32)cmsg_dummy.msg_flags;
++ 	}
++ }
++ 
++ #define TCP_ZEROCOPY_PAGE_BATCH_SIZE 32
+++>>>>>>> 892bfd3ded0e (tcp: export timestamp helpers for mptcp)
+  static int tcp_zerocopy_receive(struct sock *sk,
+ -				struct tcp_zerocopy_receive *zc,
+ -				struct scm_timestamping_internal *tss)
+ +				struct tcp_zerocopy_receive *zc)
+  {
+ -	u32 length = 0, offset, vma_len, avail_len, copylen = 0;
+  	unsigned long address = (unsigned long)zc->address;
+ -	struct page *pages[TCP_ZEROCOPY_PAGE_BATCH_SIZE];
+ -	s32 copybuf_len = zc->copybuf_len;
+ -	struct tcp_sock *tp = tcp_sk(sk);
+  	const skb_frag_t *frags = NULL;
+ -	unsigned int pages_to_map = 0;
+ +	u32 length = 0, seq, offset;
+  	struct vm_area_struct *vma;
+  	struct sk_buff *skb = NULL;
+ -	u32 seq = tp->copied_seq;
+ -	u32 total_bytes_to_map;
+ -	int inq = tcp_inq(sk);
+ +	struct tcp_sock *tp;
+  	int ret;
+  
+ -	zc->copybuf_len = 0;
+ -	zc->msg_flags = 0;
+ -
+  	if (address & (PAGE_SIZE - 1) || address != zc->address)
+  		return -EINVAL;
+  
+@@@ -1852,25 -2194,11 +2152,30 @@@ out
+  }
+  #endif
+  
+ +static void tcp_update_recv_tstamps(struct sk_buff *skb,
+ +				    struct scm_timestamping *tss)
+ +{
+ +	if (skb->tstamp)
+ +		tss->ts[0] = ktime_to_timespec(skb->tstamp);
+ +	else
+ +		tss->ts[0] = (struct timespec) {0};
+ +
+ +	if (skb_hwtstamps(skb)->hwtstamp)
+ +		tss->ts[2] = ktime_to_timespec(skb_hwtstamps(skb)->hwtstamp);
+ +	else
+ +		tss->ts[2] = (struct timespec) {0};
+ +}
+ +
+  /* Similar to __sock_recv_timestamp, but does not require an skb */
+++<<<<<<< HEAD
+ +static void tcp_recv_timestamp(struct msghdr *msg, const struct sock *sk,
+ +			       struct scm_timestamping *tss)
+++=======
++ void tcp_recv_timestamp(struct msghdr *msg, const struct sock *sk,
++ 			struct scm_timestamping_internal *tss)
+++>>>>>>> 892bfd3ded0e (tcp: export timestamp helpers for mptcp)
+  {
+ -	int new_tstamp = sock_flag(sk, SOCK_TSTAMP_NEW);
+ +	struct timeval tv;
+  	bool has_timestamping = false;
+  
+  	if (tss->ts[0].tv_sec || tss->ts[0].tv_nsec) {
+* Unmerged path include/net/tcp.h
+* Unmerged path net/ipv4/tcp.c
