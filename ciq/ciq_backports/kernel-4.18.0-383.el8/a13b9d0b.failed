@@ -1,0 +1,150 @@
+x86/cpu: Use pinning mask for CR4 bits needing to be 0
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-383.el8
+commit-author Kees Cook <keescook@chromium.org>
+commit a13b9d0b97211579ea63b96c606de79b963c0f47
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-383.el8/a13b9d0b.failed
+
+The X86_CR4_FSGSBASE bit of CR4 should not change after boot[1]. Older
+kernels should enforce this bit to zero, and newer kernels need to
+enforce it depending on boot-time configuration (e.g. "nofsgsbase").
+To support a pinned bit being either 1 or 0, use an explicit mask in
+combination with the expected pinned bit values.
+
+[1] https://lore.kernel.org/lkml/20200527103147.GI325280@hirez.programming.kicks-ass.net
+
+	Signed-off-by: Kees Cook <keescook@chromium.org>
+	Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+	Cc: stable@vger.kernel.org
+Link: https://lkml.kernel.org/r/202006082013.71E29A42@keescook
+
+(cherry picked from commit a13b9d0b97211579ea63b96c606de79b963c0f47)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kernel/cpu/common.c
+diff --cc arch/x86/kernel/cpu/common.c
+index 2a2db559b939,95c090a45b4b..000000000000
+--- a/arch/x86/kernel/cpu/common.c
++++ b/arch/x86/kernel/cpu/common.c
+@@@ -376,21 -347,99 +376,113 @@@ out
+  	cr4_clear_bits(X86_CR4_UMIP);
+  }
+  
+++<<<<<<< HEAD
+ +static __init int x86_nofsgsbase_setup(char *arg)
+++=======
++ /* These bits should not change their value after CPU init is finished. */
++ static const unsigned long cr4_pinned_mask =
++ 	X86_CR4_SMEP | X86_CR4_SMAP | X86_CR4_UMIP | X86_CR4_FSGSBASE;
++ static DEFINE_STATIC_KEY_FALSE_RO(cr_pinning);
++ static unsigned long cr4_pinned_bits __ro_after_init;
++ 
++ void native_write_cr0(unsigned long val)
+++>>>>>>> a13b9d0b9721 (x86/cpu: Use pinning mask for CR4 bits needing to be 0)
+  {
+ -	unsigned long bits_missing = 0;
+ +	/* Require an exact match without trailing characters. */
+ +	if (strlen(arg))
+ +		return 0;
+  
+ -set_register:
+ -	asm volatile("mov %0,%%cr0": "+r" (val), "+m" (__force_order));
+ +	/* Do not emit a message if the feature is not present. */
+ +	if (!boot_cpu_has(X86_FEATURE_FSGSBASE))
+ +		return 1;
+  
+++<<<<<<< HEAD
+ +	setup_clear_cpu_cap(X86_FEATURE_FSGSBASE);
+ +	pr_info("FSGSBASE disabled via kernel command line\n");
+ +	return 1;
+++=======
++ 	if (static_branch_likely(&cr_pinning)) {
++ 		if (unlikely((val & X86_CR0_WP) != X86_CR0_WP)) {
++ 			bits_missing = X86_CR0_WP;
++ 			val |= bits_missing;
++ 			goto set_register;
++ 		}
++ 		/* Warn after we've set the missing bits. */
++ 		WARN_ONCE(bits_missing, "CR0 WP bit went missing!?\n");
++ 	}
++ }
++ EXPORT_SYMBOL(native_write_cr0);
++ 
++ void native_write_cr4(unsigned long val)
++ {
++ 	unsigned long bits_changed = 0;
++ 
++ set_register:
++ 	asm volatile("mov %0,%%cr4": "+r" (val), "+m" (cr4_pinned_bits));
++ 
++ 	if (static_branch_likely(&cr_pinning)) {
++ 		if (unlikely((val & cr4_pinned_mask) != cr4_pinned_bits)) {
++ 			bits_changed = (val & cr4_pinned_mask) ^ cr4_pinned_bits;
++ 			val = (val & ~cr4_pinned_mask) | cr4_pinned_bits;
++ 			goto set_register;
++ 		}
++ 		/* Warn after we've corrected the changed bits. */
++ 		WARN_ONCE(bits_changed, "pinned CR4 bits changed: 0x%lx!?\n",
++ 			  bits_changed);
++ 	}
++ }
++ #if IS_MODULE(CONFIG_LKDTM)
++ EXPORT_SYMBOL_GPL(native_write_cr4);
++ #endif
++ 
++ void cr4_update_irqsoff(unsigned long set, unsigned long clear)
++ {
++ 	unsigned long newval, cr4 = this_cpu_read(cpu_tlbstate.cr4);
++ 
++ 	lockdep_assert_irqs_disabled();
++ 
++ 	newval = (cr4 & ~clear) | set;
++ 	if (newval != cr4) {
++ 		this_cpu_write(cpu_tlbstate.cr4, newval);
++ 		__write_cr4(newval);
++ 	}
++ }
++ EXPORT_SYMBOL(cr4_update_irqsoff);
++ 
++ /* Read the CR4 shadow. */
++ unsigned long cr4_read_shadow(void)
++ {
++ 	return this_cpu_read(cpu_tlbstate.cr4);
++ }
++ EXPORT_SYMBOL_GPL(cr4_read_shadow);
++ 
++ void cr4_init(void)
++ {
++ 	unsigned long cr4 = __read_cr4();
++ 
++ 	if (boot_cpu_has(X86_FEATURE_PCID))
++ 		cr4 |= X86_CR4_PCIDE;
++ 	if (static_branch_likely(&cr_pinning))
++ 		cr4 = (cr4 & ~cr4_pinned_mask) | cr4_pinned_bits;
++ 
++ 	__write_cr4(cr4);
++ 
++ 	/* Initialize cr4 shadow for this CPU. */
++ 	this_cpu_write(cpu_tlbstate.cr4, cr4);
++ }
++ 
++ /*
++  * Once CPU feature detection is finished (and boot params have been
++  * parsed), record any of the sensitive CR bits that are set, and
++  * enable CR pinning.
++  */
++ static void __init setup_cr_pinning(void)
++ {
++ 	cr4_pinned_bits = this_cpu_read(cpu_tlbstate.cr4) & cr4_pinned_mask;
++ 	static_key_enable(&cr_pinning.key);
+++>>>>>>> a13b9d0b9721 (x86/cpu: Use pinning mask for CR4 bits needing to be 0)
+  }
+ +__setup("nofsgsbase", x86_nofsgsbase_setup);
+  
+  /*
+   * Protection Keys are not available in 32-bit mode.
+* Unmerged path arch/x86/kernel/cpu/common.c
