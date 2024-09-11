@@ -3525,7 +3525,7 @@ out:
 static int init_rmode_identity_map(struct kvm *kvm)
 {
 	struct kvm_vmx *kvm_vmx = to_kvm_vmx(kvm);
-	int i, idx, r = 0;
+	int i, r = 0;
 	kvm_pfn_t identity_map_pfn;
 	u32 tmp;
 
@@ -3533,7 +3533,7 @@ static int init_rmode_identity_map(struct kvm *kvm)
 	mutex_lock(&kvm->slots_lock);
 
 	if (likely(kvm_vmx->ept_identity_pagetable_done))
-		goto out2;
+		goto out;
 
 	if (!kvm_vmx->ept_identity_map_addr)
 		kvm_vmx->ept_identity_map_addr = VMX_EPT_IDENTITY_PAGETABLE_ADDR;
@@ -3542,9 +3542,8 @@ static int init_rmode_identity_map(struct kvm *kvm)
 	r = __x86_set_memory_region(kvm, IDENTITY_PAGETABLE_PRIVATE_MEMSLOT,
 				    kvm_vmx->ept_identity_map_addr, PAGE_SIZE);
 	if (r < 0)
-		goto out2;
+		goto out;
 
-	idx = srcu_read_lock(&kvm->srcu);
 	r = kvm_clear_guest_page(kvm, identity_map_pfn, 0, PAGE_SIZE);
 	if (r < 0)
 		goto out;
@@ -3560,9 +3559,6 @@ static int init_rmode_identity_map(struct kvm *kvm)
 	kvm_vmx->ept_identity_pagetable_done = true;
 
 out:
-	srcu_read_unlock(&kvm->srcu, idx);
-
-out2:
 	mutex_unlock(&kvm->slots_lock);
 	return r;
 }
