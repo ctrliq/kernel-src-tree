@@ -1,0 +1,210 @@
+bpf: Change insn_offset to insn_off in bpf_func_info
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-147.el8
+commit-author Martin KaFai Lau <kafai@fb.com>
+commit d30d42e08c76cb9323ec6121190eb026b07f773b
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-147.el8/d30d42e0.failed
+
+The later patch will introduce "struct bpf_line_info" which
+has member "line_off" and "file_off" referring back to the
+string section in btf.  The line_"off" and file_"off"
+are more consistent to the naming convention in btf.h that
+means "offset" (e.g. name_off in "struct btf_type").
+
+The to-be-added "struct bpf_line_info" also has another
+member, "insn_off" which is the same as the "insn_offset"
+in "struct bpf_func_info".  Hence, this patch renames "insn_offset"
+to "insn_off" for "struct bpf_func_info".
+
+	Signed-off-by: Martin KaFai Lau <kafai@fb.com>
+	Acked-by: Yonghong Song <yhs@fb.com>
+	Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+(cherry picked from commit d30d42e08c76cb9323ec6121190eb026b07f773b)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/uapi/linux/bpf.h
+#	kernel/bpf/verifier.c
+diff --cc include/uapi/linux/bpf.h
+index b049f187b868,a84fd232d934..000000000000
+--- a/include/uapi/linux/bpf.h
++++ b/include/uapi/linux/bpf.h
+@@@ -2735,4 -2967,32 +2735,35 @@@ enum bpf_task_fd_type 
+  	BPF_FD_TYPE_URETPROBE,		/* filename + offset */
+  };
+  
+++<<<<<<< HEAD
+++=======
++ struct bpf_flow_keys {
++ 	__u16	nhoff;
++ 	__u16	thoff;
++ 	__u16	addr_proto;			/* ETH_P_* of valid addrs */
++ 	__u8	is_frag;
++ 	__u8	is_first_frag;
++ 	__u8	is_encap;
++ 	__u8	ip_proto;
++ 	__be16	n_proto;
++ 	__be16	sport;
++ 	__be16	dport;
++ 	union {
++ 		struct {
++ 			__be32	ipv4_src;
++ 			__be32	ipv4_dst;
++ 		};
++ 		struct {
++ 			__u32	ipv6_src[4];	/* in6_addr; network order */
++ 			__u32	ipv6_dst[4];	/* in6_addr; network order */
++ 		};
++ 	};
++ };
++ 
++ struct bpf_func_info {
++ 	__u32	insn_off;
++ 	__u32	type_id;
++ };
++ 
+++>>>>>>> d30d42e08c76 (bpf: Change insn_offset to insn_off in bpf_func_info)
+  #endif /* _UAPI__LINUX_BPF_H__ */
+diff --cc kernel/bpf/verifier.c
+index 68f516c9326d,7658c61c1a88..000000000000
+--- a/kernel/bpf/verifier.c
++++ b/kernel/bpf/verifier.c
+@@@ -4494,6 -4641,130 +4494,133 @@@ err_free
+  	return ret;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ /* The minimum supported BTF func info size */
++ #define MIN_BPF_FUNCINFO_SIZE	8
++ #define MAX_FUNCINFO_REC_SIZE	252
++ 
++ static int check_btf_func(struct bpf_prog *prog, struct bpf_verifier_env *env,
++ 			  union bpf_attr *attr, union bpf_attr __user *uattr)
++ {
++ 	u32 i, nfuncs, urec_size, min_size, prev_offset;
++ 	u32 krec_size = sizeof(struct bpf_func_info);
++ 	struct bpf_func_info *krecord = NULL;
++ 	const struct btf_type *type;
++ 	void __user *urecord;
++ 	struct btf *btf;
++ 	int ret = 0;
++ 
++ 	nfuncs = attr->func_info_cnt;
++ 	if (!nfuncs)
++ 		return 0;
++ 
++ 	if (nfuncs != env->subprog_cnt) {
++ 		verbose(env, "number of funcs in func_info doesn't match number of subprogs\n");
++ 		return -EINVAL;
++ 	}
++ 
++ 	urec_size = attr->func_info_rec_size;
++ 	if (urec_size < MIN_BPF_FUNCINFO_SIZE ||
++ 	    urec_size > MAX_FUNCINFO_REC_SIZE ||
++ 	    urec_size % sizeof(u32)) {
++ 		verbose(env, "invalid func info rec size %u\n", urec_size);
++ 		return -EINVAL;
++ 	}
++ 
++ 	btf = btf_get_by_fd(attr->prog_btf_fd);
++ 	if (IS_ERR(btf)) {
++ 		verbose(env, "unable to get btf from fd\n");
++ 		return PTR_ERR(btf);
++ 	}
++ 
++ 	urecord = u64_to_user_ptr(attr->func_info);
++ 	min_size = min_t(u32, krec_size, urec_size);
++ 
++ 	krecord = kvcalloc(nfuncs, krec_size, GFP_KERNEL | __GFP_NOWARN);
++ 	if (!krecord) {
++ 		ret = -ENOMEM;
++ 		goto free_btf;
++ 	}
++ 
++ 	for (i = 0; i < nfuncs; i++) {
++ 		ret = bpf_check_uarg_tail_zero(urecord, krec_size, urec_size);
++ 		if (ret) {
++ 			if (ret == -E2BIG) {
++ 				verbose(env, "nonzero tailing record in func info");
++ 				/* set the size kernel expects so loader can zero
++ 				 * out the rest of the record.
++ 				 */
++ 				if (put_user(min_size, &uattr->func_info_rec_size))
++ 					ret = -EFAULT;
++ 			}
++ 			goto free_btf;
++ 		}
++ 
++ 		if (copy_from_user(&krecord[i], urecord, min_size)) {
++ 			ret = -EFAULT;
++ 			goto free_btf;
++ 		}
++ 
++ 		/* check insn_off */
++ 		if (i == 0) {
++ 			if (krecord[i].insn_off) {
++ 				verbose(env,
++ 					"nonzero insn_off %u for the first func info record",
++ 					krecord[i].insn_off);
++ 				ret = -EINVAL;
++ 				goto free_btf;
++ 			}
++ 		} else if (krecord[i].insn_off <= prev_offset) {
++ 			verbose(env,
++ 				"same or smaller insn offset (%u) than previous func info record (%u)",
++ 				krecord[i].insn_off, prev_offset);
++ 			ret = -EINVAL;
++ 			goto free_btf;
++ 		}
++ 
++ 		if (env->subprog_info[i].start != krecord[i].insn_off) {
++ 			verbose(env, "func_info BTF section doesn't match subprog layout in BPF program\n");
++ 			ret = -EINVAL;
++ 			goto free_btf;
++ 		}
++ 
++ 		/* check type_id */
++ 		type = btf_type_by_id(btf, krecord[i].type_id);
++ 		if (!type || BTF_INFO_KIND(type->info) != BTF_KIND_FUNC) {
++ 			verbose(env, "invalid type id %d in func info",
++ 				krecord[i].type_id);
++ 			ret = -EINVAL;
++ 			goto free_btf;
++ 		}
++ 
++ 		prev_offset = krecord[i].insn_off;
++ 		urecord += urec_size;
++ 	}
++ 
++ 	prog->aux->btf = btf;
++ 	prog->aux->func_info = krecord;
++ 	prog->aux->func_info_cnt = nfuncs;
++ 	return 0;
++ 
++ free_btf:
++ 	btf_put(btf);
++ 	kvfree(krecord);
++ 	return ret;
++ }
++ 
++ static void adjust_btf_func(struct bpf_verifier_env *env)
++ {
++ 	int i;
++ 
++ 	if (!env->prog->aux->func_info)
++ 		return;
++ 
++ 	for (i = 0; i < env->subprog_cnt; i++)
++ 		env->prog->aux->func_info[i].insn_off = env->subprog_info[i].start;
++ }
++ 
+++>>>>>>> d30d42e08c76 (bpf: Change insn_offset to insn_off in bpf_func_info)
+  /* check %cur's range satisfies %old's */
+  static bool range_within(struct bpf_reg_state *old,
+  			 struct bpf_reg_state *cur)
+* Unmerged path include/uapi/linux/bpf.h
+* Unmerged path kernel/bpf/verifier.c
