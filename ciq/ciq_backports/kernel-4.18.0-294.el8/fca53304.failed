@@ -1,0 +1,326 @@
+net/mlx5e: Optimize performance for IPv4/IPv6 ethertype
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Eli Britstein <elibr@mellanox.com>
+commit fca533041aac0426f5b5618a564aeb588fc125e9
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/fca53304.failed
+
+The HW is optimized for IPv4/IPv6. For such cases, pending capability,
+avoid matching on ethertype, and use ip_version field instead.
+
+	Signed-off-by: Eli Britstein <elibr@mellanox.com>
+	Reviewed-by: Roi Dayan <roid@mellanox.com>
+	Signed-off-by: Saeed Mahameed <saeedm@mellanox.com>
+(cherry picked from commit fca533041aac0426f5b5618a564aeb588fc125e9)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/mellanox/mlx5/core/en/tc_ct.c
+#	drivers/net/ethernet/mellanox/mlx5/core/en_tc.c
+diff --cc drivers/net/ethernet/mellanox/mlx5/core/en/tc_ct.c
+index a30e7acc2b42,afc19dca1f5f..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en/tc_ct.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en/tc_ct.c
+@@@ -170,116 -119,7 +170,120 @@@ mlx5_tc_ct_get_ct_priv(struct mlx5e_pri
+  }
+  
+  static int
+++<<<<<<< HEAD
+ +mlx5_tc_ct_rule_to_tuple(struct mlx5_ct_tuple *tuple, struct flow_rule *rule)
+ +{
+ +	struct flow_match_control control;
+ +	struct flow_match_basic basic;
+ +
+ +	flow_rule_match_basic(rule, &basic);
+ +	flow_rule_match_control(rule, &control);
+ +
+ +	tuple->n_proto = basic.key->n_proto;
+ +	tuple->ip_proto = basic.key->ip_proto;
+ +	tuple->addr_type = control.key->addr_type;
+ +
+ +	if (tuple->addr_type == FLOW_DISSECTOR_KEY_IPV4_ADDRS) {
+ +		struct flow_match_ipv4_addrs match;
+ +
+ +		flow_rule_match_ipv4_addrs(rule, &match);
+ +		tuple->ip.src_v4 = match.key->src;
+ +		tuple->ip.dst_v4 = match.key->dst;
+ +	} else if (tuple->addr_type == FLOW_DISSECTOR_KEY_IPV6_ADDRS) {
+ +		struct flow_match_ipv6_addrs match;
+ +
+ +		flow_rule_match_ipv6_addrs(rule, &match);
+ +		tuple->ip.src_v6 = match.key->src;
+ +		tuple->ip.dst_v6 = match.key->dst;
+ +	} else {
+ +		return -EOPNOTSUPP;
+ +	}
+ +
+ +	if (flow_rule_match_key(rule, FLOW_DISSECTOR_KEY_PORTS)) {
+ +		struct flow_match_ports match;
+ +
+ +		flow_rule_match_ports(rule, &match);
+ +		switch (tuple->ip_proto) {
+ +		case IPPROTO_TCP:
+ +		case IPPROTO_UDP:
+ +			tuple->port.src = match.key->src;
+ +			tuple->port.dst = match.key->dst;
+ +			break;
+ +		default:
+ +			return -EOPNOTSUPP;
+ +		}
+ +	} else {
+ +		return -EOPNOTSUPP;
+ +	}
+ +
+ +	return 0;
+ +}
+ +
+ +static int
+ +mlx5_tc_ct_rule_to_tuple_nat(struct mlx5_ct_tuple *tuple,
+ +			     struct flow_rule *rule)
+ +{
+ +	struct flow_action *flow_action = &rule->action;
+ +	struct flow_action_entry *act;
+ +	u32 offset, val, ip6_offset;
+ +	int i;
+ +
+ +	flow_action_for_each(i, act, flow_action) {
+ +		if (act->id != FLOW_ACTION_MANGLE)
+ +			continue;
+ +
+ +		offset = act->mangle.offset;
+ +		val = act->mangle.val;
+ +		switch (act->mangle.htype) {
+ +		case FLOW_ACT_MANGLE_HDR_TYPE_IP4:
+ +			if (offset == offsetof(struct iphdr, saddr))
+ +				tuple->ip.src_v4 = cpu_to_be32(val);
+ +			else if (offset == offsetof(struct iphdr, daddr))
+ +				tuple->ip.dst_v4 = cpu_to_be32(val);
+ +			else
+ +				return -EOPNOTSUPP;
+ +			break;
+ +
+ +		case FLOW_ACT_MANGLE_HDR_TYPE_IP6:
+ +			ip6_offset = (offset - offsetof(struct ipv6hdr, saddr));
+ +			ip6_offset /= 4;
+ +			if (ip6_offset < 8)
+ +				tuple->ip.src_v6.s6_addr32[ip6_offset] = cpu_to_be32(val);
+ +			else
+ +				return -EOPNOTSUPP;
+ +			break;
+ +
+ +		case FLOW_ACT_MANGLE_HDR_TYPE_TCP:
+ +			if (offset == offsetof(struct tcphdr, source))
+ +				tuple->port.src = cpu_to_be16(val);
+ +			else if (offset == offsetof(struct tcphdr, dest))
+ +				tuple->port.dst = cpu_to_be16(val);
+ +			else
+ +				return -EOPNOTSUPP;
+ +			break;
+ +
+ +		case FLOW_ACT_MANGLE_HDR_TYPE_UDP:
+ +			if (offset == offsetof(struct udphdr, source))
+ +				tuple->port.src = cpu_to_be16(val);
+ +			else if (offset == offsetof(struct udphdr, dest))
+ +				tuple->port.dst = cpu_to_be16(val);
+ +			else
+ +				return -EOPNOTSUPP;
+ +			break;
+ +
+ +		default:
+ +			return -EOPNOTSUPP;
+ +		}
+ +	}
+ +
+ +	return 0;
+ +}
+ +
+ +static int
+ +mlx5_tc_ct_set_tuple_match(struct mlx5_flow_spec *spec,
+++=======
++ mlx5_tc_ct_set_tuple_match(struct mlx5e_priv *priv, struct mlx5_flow_spec *spec,
+++>>>>>>> fca533041aac (net/mlx5e: Optimize performance for IPv4/IPv6 ethertype)
+  			   struct flow_rule *rule)
+  {
+  	void *headers_c = MLX5_ADDR_OF(fte_match_param, spec->match_criteria,
+@@@ -678,9 -531,9 +683,9 @@@ mlx5_tc_ct_entry_add_rule(struct mlx5_t
+  	attr->counter = entry->counter;
+  	attr->flags |= MLX5_ESW_ATTR_FLAG_NO_IN_PORT;
+  
+- 	mlx5_tc_ct_set_tuple_match(spec, flow_rule);
++ 	mlx5_tc_ct_set_tuple_match(netdev_priv(ct_priv->netdev), spec, flow_rule);
+  	mlx5e_tc_match_to_reg_match(spec, ZONE_TO_REG,
+ -				    entry->zone & MLX5_CT_ZONE_MASK,
+ +				    entry->tuple.zone & MLX5_CT_ZONE_MASK,
+  				    MLX5_CT_ZONE_MASK);
+  
+  	zone_rule->rule = mlx5_eswitch_add_offloaded_rule(esw, spec, attr);
+diff --cc drivers/net/ethernet/mellanox/mlx5/core/en_tc.c
+index 7faf65aa8dbd,0f119c08b835..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_tc.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_tc.c
+@@@ -2897,7 -3144,8 +2916,12 @@@ static bool modify_header_match_support
+  					  struct netlink_ext_ack *extack)
+  {
+  	const struct flow_action_entry *act;
+++<<<<<<< HEAD
+ +	bool modify_ip_header, modify_tuple;
+++=======
++ 	bool modify_ip_header;
++ 	void *headers_c;
+++>>>>>>> fca533041aac (net/mlx5e: Optimize performance for IPv4/IPv6 ethertype)
+  	void *headers_v;
+  	u16 ethertype;
+  	u8 ip_proto;
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/diag/fs_tracepoint.c b/drivers/net/ethernet/mellanox/mlx5/core/diag/fs_tracepoint.c
+index 8ecac81a385d..a700f3c86899 100644
+--- a/drivers/net/ethernet/mellanox/mlx5/core/diag/fs_tracepoint.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/diag/fs_tracepoint.c
+@@ -76,58 +76,59 @@ static void print_lyr_2_4_hdrs(struct trace_seq *p,
+ 		.v = MLX5_GET(fte_match_set_lyr_2_4, value, dmac_47_16) << 16 |
+ 		     MLX5_GET(fte_match_set_lyr_2_4, value, dmac_15_0)};
+ 	MASK_VAL_L2(u16, ethertype, ethertype);
++	MASK_VAL_L2(u8, ip_version, ip_version);
+ 
+ 	PRINT_MASKED_VALP(smac, u8 *, p, "%pM");
+ 	PRINT_MASKED_VALP(dmac, u8 *, p, "%pM");
+ 	PRINT_MASKED_VAL(ethertype, p, "%04x");
+ 
+-	if (ethertype.m == 0xffff) {
+-		if (ethertype.v == ETH_P_IP) {
++	if ((ethertype.m == 0xffff && ethertype.v == ETH_P_IP) ||
++	    (ip_version.m == 0xf && ip_version.v == 4)) {
+ #define MASK_VAL_L2_BE(type, name, fld) \
+ 	MASK_VAL_BE(type, fte_match_set_lyr_2_4, name, mask, value, fld)
+-			MASK_VAL_L2_BE(u32, src_ipv4,
+-				       src_ipv4_src_ipv6.ipv4_layout.ipv4);
+-			MASK_VAL_L2_BE(u32, dst_ipv4,
+-				       dst_ipv4_dst_ipv6.ipv4_layout.ipv4);
++		MASK_VAL_L2_BE(u32, src_ipv4,
++			       src_ipv4_src_ipv6.ipv4_layout.ipv4);
++		MASK_VAL_L2_BE(u32, dst_ipv4,
++			       dst_ipv4_dst_ipv6.ipv4_layout.ipv4);
+ 
+-			PRINT_MASKED_VALP(src_ipv4, typeof(&src_ipv4.v), p,
+-					  "%pI4");
+-			PRINT_MASKED_VALP(dst_ipv4, typeof(&dst_ipv4.v), p,
+-					  "%pI4");
+-		} else if (ethertype.v == ETH_P_IPV6) {
+-			static const struct in6_addr full_ones = {
+-				.in6_u.u6_addr32 = {__constant_htonl(0xffffffff),
+-						    __constant_htonl(0xffffffff),
+-						    __constant_htonl(0xffffffff),
+-						    __constant_htonl(0xffffffff)},
+-			};
+-			DECLARE_MASK_VAL(struct in6_addr, src_ipv6);
+-			DECLARE_MASK_VAL(struct in6_addr, dst_ipv6);
++		PRINT_MASKED_VALP(src_ipv4, typeof(&src_ipv4.v), p,
++				  "%pI4");
++		PRINT_MASKED_VALP(dst_ipv4, typeof(&dst_ipv4.v), p,
++				  "%pI4");
++	} else if ((ethertype.m == 0xffff && ethertype.v == ETH_P_IPV6) ||
++		   (ip_version.m == 0xf && ip_version.v == 6)) {
++		static const struct in6_addr full_ones = {
++			.in6_u.u6_addr32 = {__constant_htonl(0xffffffff),
++					    __constant_htonl(0xffffffff),
++					    __constant_htonl(0xffffffff),
++					    __constant_htonl(0xffffffff)},
++		};
++		DECLARE_MASK_VAL(struct in6_addr, src_ipv6);
++		DECLARE_MASK_VAL(struct in6_addr, dst_ipv6);
+ 
+-			memcpy(src_ipv6.m.in6_u.u6_addr8,
+-			       MLX5_ADDR_OF(fte_match_set_lyr_2_4, mask,
+-					    src_ipv4_src_ipv6.ipv6_layout.ipv6),
+-			       sizeof(src_ipv6.m));
+-			memcpy(dst_ipv6.m.in6_u.u6_addr8,
+-			       MLX5_ADDR_OF(fte_match_set_lyr_2_4, mask,
+-					    dst_ipv4_dst_ipv6.ipv6_layout.ipv6),
+-			       sizeof(dst_ipv6.m));
+-			memcpy(src_ipv6.v.in6_u.u6_addr8,
+-			       MLX5_ADDR_OF(fte_match_set_lyr_2_4, value,
+-					    src_ipv4_src_ipv6.ipv6_layout.ipv6),
+-			       sizeof(src_ipv6.v));
+-			memcpy(dst_ipv6.v.in6_u.u6_addr8,
+-			       MLX5_ADDR_OF(fte_match_set_lyr_2_4, value,
+-					    dst_ipv4_dst_ipv6.ipv6_layout.ipv6),
+-			       sizeof(dst_ipv6.v));
++		memcpy(src_ipv6.m.in6_u.u6_addr8,
++		       MLX5_ADDR_OF(fte_match_set_lyr_2_4, mask,
++				    src_ipv4_src_ipv6.ipv6_layout.ipv6),
++		       sizeof(src_ipv6.m));
++		memcpy(dst_ipv6.m.in6_u.u6_addr8,
++		       MLX5_ADDR_OF(fte_match_set_lyr_2_4, mask,
++				    dst_ipv4_dst_ipv6.ipv6_layout.ipv6),
++		       sizeof(dst_ipv6.m));
++		memcpy(src_ipv6.v.in6_u.u6_addr8,
++		       MLX5_ADDR_OF(fte_match_set_lyr_2_4, value,
++				    src_ipv4_src_ipv6.ipv6_layout.ipv6),
++		       sizeof(src_ipv6.v));
++		memcpy(dst_ipv6.v.in6_u.u6_addr8,
++		       MLX5_ADDR_OF(fte_match_set_lyr_2_4, value,
++				    dst_ipv4_dst_ipv6.ipv6_layout.ipv6),
++		       sizeof(dst_ipv6.v));
+ 
+-			if (!memcmp(&src_ipv6.m, &full_ones, sizeof(full_ones)))
+-				trace_seq_printf(p, "src_ipv6=%pI6 ",
+-						 &src_ipv6.v);
+-			if (!memcmp(&dst_ipv6.m, &full_ones, sizeof(full_ones)))
+-				trace_seq_printf(p, "dst_ipv6=%pI6 ",
+-						 &dst_ipv6.v);
+-		}
++		if (!memcmp(&src_ipv6.m, &full_ones, sizeof(full_ones)))
++			trace_seq_printf(p, "src_ipv6=%pI6 ",
++					 &src_ipv6.v);
++		if (!memcmp(&dst_ipv6.m, &full_ones, sizeof(full_ones)))
++			trace_seq_printf(p, "dst_ipv6=%pI6 ",
++					 &dst_ipv6.v);
+ 	}
+ 
+ #define PRINT_MASKED_VAL_L2(type, name, fld, p, format) {\
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/en/tc_ct.c
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/en/tc_tun.c b/drivers/net/ethernet/mellanox/mlx5/core/en/tc_tun.c
+index f8e3631243bd..254fb0c42757 100644
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en/tc_tun.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en/tc_tun.c
+@@ -542,8 +542,8 @@ int mlx5e_tc_tun_parse(struct net_device *filter_dev,
+ 				 ntohl(match.key->dst));
+ 
+ 			key_basic.n_proto = htons(ETH_P_IP);
+-			mlx5e_tc_set_ethertype(headers_c, headers_v,
+-					       &match_basic);
++			mlx5e_tc_set_ethertype(priv->mdev, &match_basic, true,
++					       headers_c, headers_v);
+ 		} else if (addr_type == FLOW_DISSECTOR_KEY_IPV6_ADDRS) {
+ 			struct flow_match_ipv6_addrs match;
+ 
+@@ -567,8 +567,8 @@ int mlx5e_tc_tun_parse(struct net_device *filter_dev,
+ 								  ipv6));
+ 
+ 			key_basic.n_proto = htons(ETH_P_IPV6);
+-			mlx5e_tc_set_ethertype(headers_c, headers_v,
+-					       &match_basic);
++			mlx5e_tc_set_ethertype(priv->mdev, &match_basic, true,
++					       headers_c, headers_v);
+ 		}
+ 	}
+ 
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/en_tc.c
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/en_tc.h b/drivers/net/ethernet/mellanox/mlx5/core/en_tc.h
+index f4fc854a8ab7..03009af25e92 100644
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_tc.h
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_tc.h
+@@ -169,8 +169,9 @@ void dealloc_mod_hdr_actions(struct mlx5e_tc_mod_hdr_acts *mod_hdr_acts);
+ struct mlx5e_tc_flow;
+ u32 mlx5e_tc_get_flow_tun_id(struct mlx5e_tc_flow *flow);
+ 
+-void mlx5e_tc_set_ethertype(void *headers_c, void *headers_v,
+-			    struct flow_match_basic *match);
++void mlx5e_tc_set_ethertype(struct mlx5_core_dev *mdev,
++			    struct flow_match_basic *match, bool outer,
++			    void *headers_c, void *headers_v);
+ 
+ #if IS_ENABLED(CONFIG_MLX5_CLS_ACT)
+ 
