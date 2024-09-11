@@ -1,0 +1,486 @@
+nvme: register ns_id attributes as default sysfs groups
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-147.el8
+commit-author Hannes Reinecke <hare@suse.de>
+commit 33b14f67a4e1eabd219fd6543da8f15ed86b641c
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-147.el8/33b14f67.failed
+
+We should be registering the ns_id attribute as default sysfs
+attribute groups, otherwise we have a race condition between
+the uevent and the attributes appearing in sysfs.
+
+	Suggested-by: Bart van Assche <bvanassche@acm.org>
+	Reviewed-by: Keith Busch <keith.busch@intel.com>
+	Signed-off-by: Hannes Reinecke <hare@suse.com>
+	Signed-off-by: Jens Axboe <axboe@kernel.dk>
+(cherry picked from commit 33b14f67a4e1eabd219fd6543da8f15ed86b641c)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/nvme/host/core.c
+#	drivers/nvme/host/multipath.c
+diff --cc drivers/nvme/host/core.c
+index ba08574a3166,e0a9e1c5b30e..000000000000
+--- a/drivers/nvme/host/core.c
++++ b/drivers/nvme/host/core.c
+@@@ -3099,19 -3107,12 +3107,23 @@@ static void nvme_alloc_ns(struct nvme_c
+  
+  	nvme_get_ctrl(ctrl);
+  
+++<<<<<<< HEAD
+ +	kfree(id);
+ +
+ +	device_add_disk(ctrl->device, ns->disk);
+ +	if (sysfs_create_group(&disk_to_dev(ns->disk)->kobj,
+ +					&nvme_ns_id_attr_group))
+ +		pr_warn("%s: failed to create sysfs group for identification\n",
+ +			ns->disk->disk_name);
+ +	if (ns->ndev && nvme_nvm_register_sysfs(ns))
+ +		pr_warn("%s: failed to register lightnvm sysfs group for identification\n",
+ +			ns->disk->disk_name);
+++=======
++ 	device_add_disk(ctrl->device, ns->disk, nvme_ns_id_attr_groups);
+++>>>>>>> 33b14f67a4e1 (nvme: register ns_id attributes as default sysfs groups)
+  
+ -	nvme_mpath_add_disk(ns, id);
+ +	nvme_mpath_add_disk(ns->head);
+  	nvme_fault_inject_init(ns);
+ -	kfree(id);
+ -
+  	return;
+   out_unlink_ns:
+  	mutex_lock(&ctrl->subsys->lock);
+diff --cc drivers/nvme/host/multipath.c
+index 1b128a2a399e,8e846095c42d..000000000000
+--- a/drivers/nvme/host/multipath.c
++++ b/drivers/nvme/host/multipath.c
+@@@ -203,24 -278,220 +203,233 @@@ void nvme_mpath_add_disk(struct nvme_ns
+  	if (!head->disk)
+  		return;
+  
+++<<<<<<< HEAD
+ +	mutex_lock(&head->subsys->lock);
+ +	if (!(head->disk->flags & GENHD_FL_UP)) {
+ +		device_add_disk(&head->subsys->dev, head->disk);
+ +		if (sysfs_create_group(&disk_to_dev(head->disk)->kobj,
+ +				&nvme_ns_id_attr_group))
+ +			pr_warn("%s: failed to create sysfs group for identification\n",
+ +				head->disk->disk_name);
+++=======
++ 	if (!(head->disk->flags & GENHD_FL_UP))
++ 		device_add_disk(&head->subsys->dev, head->disk,
++ 				nvme_ns_id_attr_groups);
++ 
++ 	kblockd_schedule_work(&ns->head->requeue_work);
++ }
++ 
++ static int nvme_parse_ana_log(struct nvme_ctrl *ctrl, void *data,
++ 		int (*cb)(struct nvme_ctrl *ctrl, struct nvme_ana_group_desc *,
++ 			void *))
++ {
++ 	void *base = ctrl->ana_log_buf;
++ 	size_t offset = sizeof(struct nvme_ana_rsp_hdr);
++ 	int error, i;
++ 
++ 	lockdep_assert_held(&ctrl->ana_lock);
++ 
++ 	for (i = 0; i < le16_to_cpu(ctrl->ana_log_buf->ngrps); i++) {
++ 		struct nvme_ana_group_desc *desc = base + offset;
++ 		u32 nr_nsids = le32_to_cpu(desc->nnsids);
++ 		size_t nsid_buf_size = nr_nsids * sizeof(__le32);
++ 
++ 		if (WARN_ON_ONCE(desc->grpid == 0))
++ 			return -EINVAL;
++ 		if (WARN_ON_ONCE(le32_to_cpu(desc->grpid) > ctrl->anagrpmax))
++ 			return -EINVAL;
++ 		if (WARN_ON_ONCE(desc->state == 0))
++ 			return -EINVAL;
++ 		if (WARN_ON_ONCE(desc->state > NVME_ANA_CHANGE))
++ 			return -EINVAL;
++ 
++ 		offset += sizeof(*desc);
++ 		if (WARN_ON_ONCE(offset > ctrl->ana_log_size - nsid_buf_size))
++ 			return -EINVAL;
++ 
++ 		error = cb(ctrl, desc, data);
++ 		if (error)
++ 			return error;
++ 
++ 		offset += nsid_buf_size;
++ 		if (WARN_ON_ONCE(offset > ctrl->ana_log_size - sizeof(*desc)))
++ 			return -EINVAL;
++ 	}
++ 
++ 	return 0;
++ }
++ 
++ static inline bool nvme_state_is_live(enum nvme_ana_state state)
++ {
++ 	return state == NVME_ANA_OPTIMIZED || state == NVME_ANA_NONOPTIMIZED;
++ }
++ 
++ static void nvme_update_ns_ana_state(struct nvme_ana_group_desc *desc,
++ 		struct nvme_ns *ns)
++ {
++ 	enum nvme_ana_state old;
++ 
++ 	mutex_lock(&ns->head->lock);
++ 	old = ns->ana_state;
++ 	ns->ana_grpid = le32_to_cpu(desc->grpid);
++ 	ns->ana_state = desc->state;
++ 	clear_bit(NVME_NS_ANA_PENDING, &ns->flags);
++ 
++ 	if (nvme_state_is_live(ns->ana_state) && !nvme_state_is_live(old))
++ 		nvme_mpath_set_live(ns);
++ 	mutex_unlock(&ns->head->lock);
++ }
++ 
++ static int nvme_update_ana_state(struct nvme_ctrl *ctrl,
++ 		struct nvme_ana_group_desc *desc, void *data)
++ {
++ 	u32 nr_nsids = le32_to_cpu(desc->nnsids), n = 0;
++ 	unsigned *nr_change_groups = data;
++ 	struct nvme_ns *ns;
++ 
++ 	dev_info(ctrl->device, "ANA group %d: %s.\n",
++ 			le32_to_cpu(desc->grpid),
++ 			nvme_ana_state_names[desc->state]);
++ 
++ 	if (desc->state == NVME_ANA_CHANGE)
++ 		(*nr_change_groups)++;
++ 
++ 	if (!nr_nsids)
++ 		return 0;
++ 
++ 	down_write(&ctrl->namespaces_rwsem);
++ 	list_for_each_entry(ns, &ctrl->namespaces, list) {
++ 		if (ns->head->ns_id != le32_to_cpu(desc->nsids[n]))
++ 			continue;
++ 		nvme_update_ns_ana_state(desc, ns);
++ 		if (++n == nr_nsids)
++ 			break;
++ 	}
++ 	up_write(&ctrl->namespaces_rwsem);
++ 	WARN_ON_ONCE(n < nr_nsids);
++ 	return 0;
++ }
++ 
++ static int nvme_read_ana_log(struct nvme_ctrl *ctrl, bool groups_only)
++ {
++ 	u32 nr_change_groups = 0;
++ 	int error;
++ 
++ 	mutex_lock(&ctrl->ana_lock);
++ 	error = nvme_get_log(ctrl, NVME_NSID_ALL, NVME_LOG_ANA,
++ 			groups_only ? NVME_ANA_LOG_RGO : 0,
++ 			ctrl->ana_log_buf, ctrl->ana_log_size, 0);
++ 	if (error) {
++ 		dev_warn(ctrl->device, "Failed to get ANA log: %d\n", error);
++ 		goto out_unlock;
++ 	}
++ 
++ 	error = nvme_parse_ana_log(ctrl, &nr_change_groups,
++ 			nvme_update_ana_state);
++ 	if (error)
++ 		goto out_unlock;
++ 
++ 	/*
++ 	 * In theory we should have an ANATT timer per group as they might enter
++ 	 * the change state at different times.  But that is a lot of overhead
++ 	 * just to protect against a target that keeps entering new changes
++ 	 * states while never finishing previous ones.  But we'll still
++ 	 * eventually time out once all groups are in change state, so this
++ 	 * isn't a big deal.
++ 	 *
++ 	 * We also double the ANATT value to provide some slack for transports
++ 	 * or AEN processing overhead.
++ 	 */
++ 	if (nr_change_groups)
++ 		mod_timer(&ctrl->anatt_timer, ctrl->anatt * HZ * 2 + jiffies);
++ 	else
++ 		del_timer_sync(&ctrl->anatt_timer);
++ out_unlock:
++ 	mutex_unlock(&ctrl->ana_lock);
++ 	return error;
++ }
++ 
++ static void nvme_ana_work(struct work_struct *work)
++ {
++ 	struct nvme_ctrl *ctrl = container_of(work, struct nvme_ctrl, ana_work);
++ 
++ 	nvme_read_ana_log(ctrl, false);
++ }
++ 
++ static void nvme_anatt_timeout(struct timer_list *t)
++ {
++ 	struct nvme_ctrl *ctrl = from_timer(ctrl, t, anatt_timer);
++ 
++ 	dev_info(ctrl->device, "ANATT timeout, resetting controller.\n");
++ 	nvme_reset_ctrl(ctrl);
++ }
++ 
++ void nvme_mpath_stop(struct nvme_ctrl *ctrl)
++ {
++ 	if (!nvme_ctrl_use_ana(ctrl))
++ 		return;
++ 	del_timer_sync(&ctrl->anatt_timer);
++ 	cancel_work_sync(&ctrl->ana_work);
++ }
++ 
++ static ssize_t ana_grpid_show(struct device *dev, struct device_attribute *attr,
++ 		char *buf)
++ {
++ 	return sprintf(buf, "%d\n", nvme_get_ns_from_dev(dev)->ana_grpid);
++ }
++ DEVICE_ATTR_RO(ana_grpid);
++ 
++ static ssize_t ana_state_show(struct device *dev, struct device_attribute *attr,
++ 		char *buf)
++ {
++ 	struct nvme_ns *ns = nvme_get_ns_from_dev(dev);
++ 
++ 	return sprintf(buf, "%s\n", nvme_ana_state_names[ns->ana_state]);
++ }
++ DEVICE_ATTR_RO(ana_state);
++ 
++ static int nvme_set_ns_ana_state(struct nvme_ctrl *ctrl,
++ 		struct nvme_ana_group_desc *desc, void *data)
++ {
++ 	struct nvme_ns *ns = data;
++ 
++ 	if (ns->ana_grpid == le32_to_cpu(desc->grpid)) {
++ 		nvme_update_ns_ana_state(desc, ns);
++ 		return -ENXIO; /* just break out of the loop */
++ 	}
++ 
++ 	return 0;
++ }
++ 
++ void nvme_mpath_add_disk(struct nvme_ns *ns, struct nvme_id_ns *id)
++ {
++ 	if (nvme_ctrl_use_ana(ns->ctrl)) {
++ 		mutex_lock(&ns->ctrl->ana_lock);
++ 		ns->ana_grpid = le32_to_cpu(id->anagrpid);
++ 		nvme_parse_ana_log(ns->ctrl, ns, nvme_set_ns_ana_state);
++ 		mutex_unlock(&ns->ctrl->ana_lock);
++ 	} else {
++ 		mutex_lock(&ns->head->lock);
++ 		ns->ana_state = NVME_ANA_OPTIMIZED; 
++ 		nvme_mpath_set_live(ns);
++ 		mutex_unlock(&ns->head->lock);
+++>>>>>>> 33b14f67a4e1 (nvme: register ns_id attributes as default sysfs groups)
+  	}
+ +	mutex_unlock(&head->subsys->lock);
+  }
+  
+  void nvme_mpath_remove_disk(struct nvme_ns_head *head)
+  {
+  	if (!head->disk)
+  		return;
+++<<<<<<< HEAD
+ +	sysfs_remove_group(&disk_to_dev(head->disk)->kobj,
+ +			   &nvme_ns_id_attr_group);
+ +	del_gendisk(head->disk);
+++=======
++ 	if (head->disk->flags & GENHD_FL_UP)
++ 		del_gendisk(head->disk);
+++>>>>>>> 33b14f67a4e1 (nvme: register ns_id attributes as default sysfs groups)
+  	blk_set_queue_dying(head->disk->queue);
+  	/* make sure all pending bios are cleaned up */
+  	kblockd_schedule_work(&head->requeue_work);
+* Unmerged path drivers/nvme/host/core.c
+diff --git a/drivers/nvme/host/lightnvm.c b/drivers/nvme/host/lightnvm.c
+index 6fe5923c95d4..1e4f97538838 100644
+--- a/drivers/nvme/host/lightnvm.c
++++ b/drivers/nvme/host/lightnvm.c
+@@ -1190,10 +1190,29 @@ static NVM_DEV_ATTR_12_RO(multiplane_modes);
+ static NVM_DEV_ATTR_12_RO(media_capabilities);
+ static NVM_DEV_ATTR_12_RO(max_phys_secs);
+ 
+-static struct attribute *nvm_dev_attrs_12[] = {
++/* 2.0 values */
++static NVM_DEV_ATTR_20_RO(groups);
++static NVM_DEV_ATTR_20_RO(punits);
++static NVM_DEV_ATTR_20_RO(chunks);
++static NVM_DEV_ATTR_20_RO(clba);
++static NVM_DEV_ATTR_20_RO(ws_min);
++static NVM_DEV_ATTR_20_RO(ws_opt);
++static NVM_DEV_ATTR_20_RO(maxoc);
++static NVM_DEV_ATTR_20_RO(maxocpu);
++static NVM_DEV_ATTR_20_RO(mw_cunits);
++static NVM_DEV_ATTR_20_RO(write_typ);
++static NVM_DEV_ATTR_20_RO(write_max);
++static NVM_DEV_ATTR_20_RO(reset_typ);
++static NVM_DEV_ATTR_20_RO(reset_max);
++
++static struct attribute *nvm_dev_attrs[] = {
++	/* version agnostic attrs */
+ 	&dev_attr_version.attr,
+ 	&dev_attr_capabilities.attr,
++	&dev_attr_read_typ.attr,
++	&dev_attr_read_max.attr,
+ 
++	/* 1.2 attrs */
+ 	&dev_attr_vendor_opcode.attr,
+ 	&dev_attr_device_mode.attr,
+ 	&dev_attr_media_manager.attr,
+@@ -1208,8 +1227,6 @@ static struct attribute *nvm_dev_attrs_12[] = {
+ 	&dev_attr_page_size.attr,
+ 	&dev_attr_hw_sector_size.attr,
+ 	&dev_attr_oob_sector_size.attr,
+-	&dev_attr_read_typ.attr,
+-	&dev_attr_read_max.attr,
+ 	&dev_attr_prog_typ.attr,
+ 	&dev_attr_prog_max.attr,
+ 	&dev_attr_erase_typ.attr,
+@@ -1218,33 +1235,7 @@ static struct attribute *nvm_dev_attrs_12[] = {
+ 	&dev_attr_media_capabilities.attr,
+ 	&dev_attr_max_phys_secs.attr,
+ 
+-	NULL,
+-};
+-
+-static const struct attribute_group nvm_dev_attr_group_12 = {
+-	.name		= "lightnvm",
+-	.attrs		= nvm_dev_attrs_12,
+-};
+-
+-/* 2.0 values */
+-static NVM_DEV_ATTR_20_RO(groups);
+-static NVM_DEV_ATTR_20_RO(punits);
+-static NVM_DEV_ATTR_20_RO(chunks);
+-static NVM_DEV_ATTR_20_RO(clba);
+-static NVM_DEV_ATTR_20_RO(ws_min);
+-static NVM_DEV_ATTR_20_RO(ws_opt);
+-static NVM_DEV_ATTR_20_RO(maxoc);
+-static NVM_DEV_ATTR_20_RO(maxocpu);
+-static NVM_DEV_ATTR_20_RO(mw_cunits);
+-static NVM_DEV_ATTR_20_RO(write_typ);
+-static NVM_DEV_ATTR_20_RO(write_max);
+-static NVM_DEV_ATTR_20_RO(reset_typ);
+-static NVM_DEV_ATTR_20_RO(reset_max);
+-
+-static struct attribute *nvm_dev_attrs_20[] = {
+-	&dev_attr_version.attr,
+-	&dev_attr_capabilities.attr,
+-
++	/* 2.0 attrs */
+ 	&dev_attr_groups.attr,
+ 	&dev_attr_punits.attr,
+ 	&dev_attr_chunks.attr,
+@@ -1255,8 +1246,6 @@ static struct attribute *nvm_dev_attrs_20[] = {
+ 	&dev_attr_maxocpu.attr,
+ 	&dev_attr_mw_cunits.attr,
+ 
+-	&dev_attr_read_typ.attr,
+-	&dev_attr_read_max.attr,
+ 	&dev_attr_write_typ.attr,
+ 	&dev_attr_write_max.attr,
+ 	&dev_attr_reset_typ.attr,
+@@ -1265,44 +1254,38 @@ static struct attribute *nvm_dev_attrs_20[] = {
+ 	NULL,
+ };
+ 
+-static const struct attribute_group nvm_dev_attr_group_20 = {
+-	.name		= "lightnvm",
+-	.attrs		= nvm_dev_attrs_20,
+-};
+-
+-int nvme_nvm_register_sysfs(struct nvme_ns *ns)
++static umode_t nvm_dev_attrs_visible(struct kobject *kobj,
++				     struct attribute *attr, int index)
+ {
++	struct device *dev = container_of(kobj, struct device, kobj);
++	struct gendisk *disk = dev_to_disk(dev);
++	struct nvme_ns *ns = disk->private_data;
+ 	struct nvm_dev *ndev = ns->ndev;
+-	struct nvm_geo *geo = &ndev->geo;
++	struct device_attribute *dev_attr =
++		container_of(attr, typeof(*dev_attr), attr);
+ 
+ 	if (!ndev)
+-		return -EINVAL;
+-
+-	switch (geo->major_ver_id) {
+-	case 1:
+-		return sysfs_create_group(&disk_to_dev(ns->disk)->kobj,
+-					&nvm_dev_attr_group_12);
+-	case 2:
+-		return sysfs_create_group(&disk_to_dev(ns->disk)->kobj,
+-					&nvm_dev_attr_group_20);
+-	}
+-
+-	return -EINVAL;
+-}
++		return 0;
+ 
+-void nvme_nvm_unregister_sysfs(struct nvme_ns *ns)
+-{
+-	struct nvm_dev *ndev = ns->ndev;
+-	struct nvm_geo *geo = &ndev->geo;
++	if (dev_attr->show == nvm_dev_attr_show)
++		return attr->mode;
+ 
+-	switch (geo->major_ver_id) {
++	switch (ndev->geo.major_ver_id) {
+ 	case 1:
+-		sysfs_remove_group(&disk_to_dev(ns->disk)->kobj,
+-					&nvm_dev_attr_group_12);
++		if (dev_attr->show == nvm_dev_attr_show_12)
++			return attr->mode;
+ 		break;
+ 	case 2:
+-		sysfs_remove_group(&disk_to_dev(ns->disk)->kobj,
+-					&nvm_dev_attr_group_20);
++		if (dev_attr->show == nvm_dev_attr_show_20)
++			return attr->mode;
+ 		break;
+ 	}
++
++	return 0;
+ }
++
++const struct attribute_group nvme_nvm_attr_group = {
++	.name		= "lightnvm",
++	.attrs		= nvm_dev_attrs,
++	.is_visible	= nvm_dev_attrs_visible,
++};
+* Unmerged path drivers/nvme/host/multipath.c
+diff --git a/drivers/nvme/host/nvme.h b/drivers/nvme/host/nvme.h
+index 5e9fbf4bca79..912c2b5bf121 100644
+--- a/drivers/nvme/host/nvme.h
++++ b/drivers/nvme/host/nvme.h
+@@ -441,7 +441,7 @@ int nvme_delete_ctrl_sync(struct nvme_ctrl *ctrl);
+ int nvme_get_log(struct nvme_ctrl *ctrl, u32 nsid, u8 log_page, u8 lsp,
+ 		void *log, size_t size, u64 offset);
+ 
+-extern const struct attribute_group nvme_ns_id_attr_group;
++extern const struct attribute_group *nvme_ns_id_attr_groups[];
+ extern const struct block_device_operations nvme_ns_head_ops;
+ 
+ #ifdef CONFIG_NVME_MULTIPATH
+@@ -510,8 +510,7 @@ static inline void nvme_mpath_check_last_path(struct nvme_ns *ns)
+ void nvme_nvm_update_nvm_info(struct nvme_ns *ns);
+ int nvme_nvm_register(struct nvme_ns *ns, char *disk_name, int node);
+ void nvme_nvm_unregister(struct nvme_ns *ns);
+-int nvme_nvm_register_sysfs(struct nvme_ns *ns);
+-void nvme_nvm_unregister_sysfs(struct nvme_ns *ns);
++extern const struct attribute_group nvme_nvm_attr_group;
+ int nvme_nvm_ioctl(struct nvme_ns *ns, unsigned int cmd, unsigned long arg);
+ #else
+ static inline void nvme_nvm_update_nvm_info(struct nvme_ns *ns) {};
+@@ -522,11 +521,6 @@ static inline int nvme_nvm_register(struct nvme_ns *ns, char *disk_name,
+ }
+ 
+ static inline void nvme_nvm_unregister(struct nvme_ns *ns) {};
+-static inline int nvme_nvm_register_sysfs(struct nvme_ns *ns)
+-{
+-	return 0;
+-}
+-static inline void nvme_nvm_unregister_sysfs(struct nvme_ns *ns) {};
+ static inline int nvme_nvm_ioctl(struct nvme_ns *ns, unsigned int cmd,
+ 							unsigned long arg)
+ {
