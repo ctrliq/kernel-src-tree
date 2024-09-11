@@ -1,0 +1,383 @@
+Bluetooth: Do not set cur_adv_instance in adv param MGMT request
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-358.el8
+commit-author Daniel Winkler <danielwinkler@google.com>
+commit b6f1b79deabd32f89adbf24ef7b30f82d029808a
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-358.el8/b6f1b79d.failed
+
+We set hdev->cur_adv_instance in the adv param MGMT request to allow the
+callback to the hci param request to set the tx power to the correct
+instance. Now that the callbacks use the advertising handle from the hci
+request (as they should), this workaround is no longer necessary.
+
+Furthermore, this change resolves a race condition that is more
+prevalent when using the extended advertising MGMT calls - if
+hdev->cur_adv_instance is set in the params request, then when the data
+request is called, we believe our new instance is already active. This
+treats it as an update and immediately schedules the instance with the
+controller, which has a potential race with the software rotation adv
+update. By not setting hdev->cur_adv_instance too early, the new
+instance is queued as it should be, to be used when the rotation comes
+around again.
+
+This change is tested on harrison peak to confirm that it resolves the
+race condition on registration, and that there is no regression in
+single- and multi-advertising automated tests.
+
+	Reviewed-by: Miao-chen Chou <mcchou@chromium.org>
+	Signed-off-by: Daniel Winkler <danielwinkler@google.com>
+	Signed-off-by: Marcel Holtmann <marcel@holtmann.org>
+(cherry picked from commit b6f1b79deabd32f89adbf24ef7b30f82d029808a)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/bluetooth/mgmt.c
+diff --cc net/bluetooth/mgmt.c
+index 838b33fb3b28,59f8016c4866..000000000000
+--- a/net/bluetooth/mgmt.c
++++ b/net/bluetooth/mgmt.c
+@@@ -6893,6 -7835,337 +6893,340 @@@ unlock
+  	return err;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static void add_ext_adv_params_complete(struct hci_dev *hdev, u8 status,
++ 					u16 opcode)
++ {
++ 	struct mgmt_pending_cmd *cmd;
++ 	struct mgmt_cp_add_ext_adv_params *cp;
++ 	struct mgmt_rp_add_ext_adv_params rp;
++ 	struct adv_info *adv_instance;
++ 	u32 flags;
++ 
++ 	BT_DBG("%s", hdev->name);
++ 
++ 	hci_dev_lock(hdev);
++ 
++ 	cmd = pending_find(MGMT_OP_ADD_EXT_ADV_PARAMS, hdev);
++ 	if (!cmd)
++ 		goto unlock;
++ 
++ 	cp = cmd->param;
++ 	adv_instance = hci_find_adv_instance(hdev, cp->instance);
++ 	if (!adv_instance)
++ 		goto unlock;
++ 
++ 	rp.instance = cp->instance;
++ 	rp.tx_power = adv_instance->tx_power;
++ 
++ 	/* While we're at it, inform userspace of the available space for this
++ 	 * advertisement, given the flags that will be used.
++ 	 */
++ 	flags = __le32_to_cpu(cp->flags);
++ 	rp.max_adv_data_len = tlv_data_max_len(hdev, flags, true);
++ 	rp.max_scan_rsp_len = tlv_data_max_len(hdev, flags, false);
++ 
++ 	if (status) {
++ 		/* If this advertisement was previously advertising and we
++ 		 * failed to update it, we signal that it has been removed and
++ 		 * delete its structure
++ 		 */
++ 		if (!adv_instance->pending)
++ 			mgmt_advertising_removed(cmd->sk, hdev, cp->instance);
++ 
++ 		hci_remove_adv_instance(hdev, cp->instance);
++ 
++ 		mgmt_cmd_status(cmd->sk, cmd->index, cmd->opcode,
++ 				mgmt_status(status));
++ 
++ 	} else {
++ 		mgmt_cmd_complete(cmd->sk, cmd->index, cmd->opcode,
++ 				  mgmt_status(status), &rp, sizeof(rp));
++ 	}
++ 
++ unlock:
++ 	if (cmd)
++ 		mgmt_pending_remove(cmd);
++ 
++ 	hci_dev_unlock(hdev);
++ }
++ 
++ static int add_ext_adv_params(struct sock *sk, struct hci_dev *hdev,
++ 			      void *data, u16 data_len)
++ {
++ 	struct mgmt_cp_add_ext_adv_params *cp = data;
++ 	struct mgmt_rp_add_ext_adv_params rp;
++ 	struct mgmt_pending_cmd *cmd = NULL;
++ 	struct adv_info *adv_instance;
++ 	struct hci_request req;
++ 	u32 flags, min_interval, max_interval;
++ 	u16 timeout, duration;
++ 	u8 status;
++ 	s8 tx_power;
++ 	int err;
++ 
++ 	BT_DBG("%s", hdev->name);
++ 
++ 	status = mgmt_le_support(hdev);
++ 	if (status)
++ 		return mgmt_cmd_status(sk, hdev->id, MGMT_OP_ADD_EXT_ADV_PARAMS,
++ 				       status);
++ 
++ 	if (cp->instance < 1 || cp->instance > hdev->le_num_of_adv_sets)
++ 		return mgmt_cmd_status(sk, hdev->id, MGMT_OP_ADD_EXT_ADV_PARAMS,
++ 				       MGMT_STATUS_INVALID_PARAMS);
++ 
++ 	/* The purpose of breaking add_advertising into two separate MGMT calls
++ 	 * for params and data is to allow more parameters to be added to this
++ 	 * structure in the future. For this reason, we verify that we have the
++ 	 * bare minimum structure we know of when the interface was defined. Any
++ 	 * extra parameters we don't know about will be ignored in this request.
++ 	 */
++ 	if (data_len < MGMT_ADD_EXT_ADV_PARAMS_MIN_SIZE)
++ 		return mgmt_cmd_status(sk, hdev->id, MGMT_OP_ADD_ADVERTISING,
++ 				       MGMT_STATUS_INVALID_PARAMS);
++ 
++ 	flags = __le32_to_cpu(cp->flags);
++ 
++ 	if (!requested_adv_flags_are_valid(hdev, flags))
++ 		return mgmt_cmd_status(sk, hdev->id, MGMT_OP_ADD_EXT_ADV_PARAMS,
++ 				       MGMT_STATUS_INVALID_PARAMS);
++ 
++ 	hci_dev_lock(hdev);
++ 
++ 	/* In new interface, we require that we are powered to register */
++ 	if (!hdev_is_powered(hdev)) {
++ 		err = mgmt_cmd_status(sk, hdev->id, MGMT_OP_ADD_EXT_ADV_PARAMS,
++ 				      MGMT_STATUS_REJECTED);
++ 		goto unlock;
++ 	}
++ 
++ 	if (adv_busy(hdev)) {
++ 		err = mgmt_cmd_status(sk, hdev->id, MGMT_OP_ADD_EXT_ADV_PARAMS,
++ 				      MGMT_STATUS_BUSY);
++ 		goto unlock;
++ 	}
++ 
++ 	/* Parse defined parameters from request, use defaults otherwise */
++ 	timeout = (flags & MGMT_ADV_PARAM_TIMEOUT) ?
++ 		  __le16_to_cpu(cp->timeout) : 0;
++ 
++ 	duration = (flags & MGMT_ADV_PARAM_DURATION) ?
++ 		   __le16_to_cpu(cp->duration) :
++ 		   hdev->def_multi_adv_rotation_duration;
++ 
++ 	min_interval = (flags & MGMT_ADV_PARAM_INTERVALS) ?
++ 		       __le32_to_cpu(cp->min_interval) :
++ 		       hdev->le_adv_min_interval;
++ 
++ 	max_interval = (flags & MGMT_ADV_PARAM_INTERVALS) ?
++ 		       __le32_to_cpu(cp->max_interval) :
++ 		       hdev->le_adv_max_interval;
++ 
++ 	tx_power = (flags & MGMT_ADV_PARAM_TX_POWER) ?
++ 		   cp->tx_power :
++ 		   HCI_ADV_TX_POWER_NO_PREFERENCE;
++ 
++ 	/* Create advertising instance with no advertising or response data */
++ 	err = hci_add_adv_instance(hdev, cp->instance, flags,
++ 				   0, NULL, 0, NULL, timeout, duration,
++ 				   tx_power, min_interval, max_interval);
++ 
++ 	if (err < 0) {
++ 		err = mgmt_cmd_status(sk, hdev->id, MGMT_OP_ADD_EXT_ADV_PARAMS,
++ 				      MGMT_STATUS_FAILED);
++ 		goto unlock;
++ 	}
++ 
++ 	/* Submit request for advertising params if ext adv available */
++ 	if (ext_adv_capable(hdev)) {
++ 		hci_req_init(&req, hdev);
++ 		adv_instance = hci_find_adv_instance(hdev, cp->instance);
++ 
++ 		/* Updating parameters of an active instance will return a
++ 		 * Command Disallowed error, so we must first disable the
++ 		 * instance if it is active.
++ 		 */
++ 		if (!adv_instance->pending)
++ 			__hci_req_disable_ext_adv_instance(&req, cp->instance);
++ 
++ 		__hci_req_setup_ext_adv_instance(&req, cp->instance);
++ 
++ 		err = hci_req_run(&req, add_ext_adv_params_complete);
++ 
++ 		if (!err)
++ 			cmd = mgmt_pending_add(sk, MGMT_OP_ADD_EXT_ADV_PARAMS,
++ 					       hdev, data, data_len);
++ 		if (!cmd) {
++ 			err = -ENOMEM;
++ 			hci_remove_adv_instance(hdev, cp->instance);
++ 			goto unlock;
++ 		}
++ 
++ 	} else {
++ 		rp.instance = cp->instance;
++ 		rp.tx_power = HCI_ADV_TX_POWER_NO_PREFERENCE;
++ 		rp.max_adv_data_len = tlv_data_max_len(hdev, flags, true);
++ 		rp.max_scan_rsp_len = tlv_data_max_len(hdev, flags, false);
++ 		err = mgmt_cmd_complete(sk, hdev->id,
++ 					MGMT_OP_ADD_EXT_ADV_PARAMS,
++ 					MGMT_STATUS_SUCCESS, &rp, sizeof(rp));
++ 	}
++ 
++ unlock:
++ 	hci_dev_unlock(hdev);
++ 
++ 	return err;
++ }
++ 
++ static int add_ext_adv_data(struct sock *sk, struct hci_dev *hdev, void *data,
++ 			    u16 data_len)
++ {
++ 	struct mgmt_cp_add_ext_adv_data *cp = data;
++ 	struct mgmt_rp_add_ext_adv_data rp;
++ 	u8 schedule_instance = 0;
++ 	struct adv_info *next_instance;
++ 	struct adv_info *adv_instance;
++ 	int err = 0;
++ 	struct mgmt_pending_cmd *cmd;
++ 	struct hci_request req;
++ 
++ 	BT_DBG("%s", hdev->name);
++ 
++ 	hci_dev_lock(hdev);
++ 
++ 	adv_instance = hci_find_adv_instance(hdev, cp->instance);
++ 
++ 	if (!adv_instance) {
++ 		err = mgmt_cmd_status(sk, hdev->id, MGMT_OP_ADD_EXT_ADV_DATA,
++ 				      MGMT_STATUS_INVALID_PARAMS);
++ 		goto unlock;
++ 	}
++ 
++ 	/* In new interface, we require that we are powered to register */
++ 	if (!hdev_is_powered(hdev)) {
++ 		err = mgmt_cmd_status(sk, hdev->id, MGMT_OP_ADD_EXT_ADV_DATA,
++ 				      MGMT_STATUS_REJECTED);
++ 		goto clear_new_instance;
++ 	}
++ 
++ 	if (adv_busy(hdev)) {
++ 		err = mgmt_cmd_status(sk, hdev->id, MGMT_OP_ADD_EXT_ADV_DATA,
++ 				      MGMT_STATUS_BUSY);
++ 		goto clear_new_instance;
++ 	}
++ 
++ 	/* Validate new data */
++ 	if (!tlv_data_is_valid(hdev, adv_instance->flags, cp->data,
++ 			       cp->adv_data_len, true) ||
++ 	    !tlv_data_is_valid(hdev, adv_instance->flags, cp->data +
++ 			       cp->adv_data_len, cp->scan_rsp_len, false)) {
++ 		err = mgmt_cmd_status(sk, hdev->id, MGMT_OP_ADD_EXT_ADV_DATA,
++ 				      MGMT_STATUS_INVALID_PARAMS);
++ 		goto clear_new_instance;
++ 	}
++ 
++ 	/* Set the data in the advertising instance */
++ 	hci_set_adv_instance_data(hdev, cp->instance, cp->adv_data_len,
++ 				  cp->data, cp->scan_rsp_len,
++ 				  cp->data + cp->adv_data_len);
++ 
++ 	/* We're good to go, update advertising data, parameters, and start
++ 	 * advertising.
++ 	 */
++ 
++ 	hci_req_init(&req, hdev);
++ 
++ 	hci_req_add(&req, HCI_OP_READ_LOCAL_NAME, 0, NULL);
++ 
++ 	if (ext_adv_capable(hdev)) {
++ 		__hci_req_update_adv_data(&req, cp->instance);
++ 		__hci_req_update_scan_rsp_data(&req, cp->instance);
++ 		__hci_req_enable_ext_advertising(&req, cp->instance);
++ 
++ 	} else {
++ 		/* If using software rotation, determine next instance to use */
++ 
++ 		if (hdev->cur_adv_instance == cp->instance) {
++ 			/* If the currently advertised instance is being changed
++ 			 * then cancel the current advertising and schedule the
++ 			 * next instance. If there is only one instance then the
++ 			 * overridden advertising data will be visible right
++ 			 * away
++ 			 */
++ 			cancel_adv_timeout(hdev);
++ 
++ 			next_instance = hci_get_next_instance(hdev,
++ 							      cp->instance);
++ 			if (next_instance)
++ 				schedule_instance = next_instance->instance;
++ 		} else if (!hdev->adv_instance_timeout) {
++ 			/* Immediately advertise the new instance if no other
++ 			 * instance is currently being advertised.
++ 			 */
++ 			schedule_instance = cp->instance;
++ 		}
++ 
++ 		/* If the HCI_ADVERTISING flag is set or there is no instance to
++ 		 * be advertised then we have no HCI communication to make.
++ 		 * Simply return.
++ 		 */
++ 		if (hci_dev_test_flag(hdev, HCI_ADVERTISING) ||
++ 		    !schedule_instance) {
++ 			if (adv_instance->pending) {
++ 				mgmt_advertising_added(sk, hdev, cp->instance);
++ 				adv_instance->pending = false;
++ 			}
++ 			rp.instance = cp->instance;
++ 			err = mgmt_cmd_complete(sk, hdev->id,
++ 						MGMT_OP_ADD_EXT_ADV_DATA,
++ 						MGMT_STATUS_SUCCESS, &rp,
++ 						sizeof(rp));
++ 			goto unlock;
++ 		}
++ 
++ 		err = __hci_req_schedule_adv_instance(&req, schedule_instance,
++ 						      true);
++ 	}
++ 
++ 	cmd = mgmt_pending_add(sk, MGMT_OP_ADD_EXT_ADV_DATA, hdev, data,
++ 			       data_len);
++ 	if (!cmd) {
++ 		err = -ENOMEM;
++ 		goto clear_new_instance;
++ 	}
++ 
++ 	if (!err)
++ 		err = hci_req_run(&req, add_advertising_complete);
++ 
++ 	if (err < 0) {
++ 		err = mgmt_cmd_status(sk, hdev->id, MGMT_OP_ADD_EXT_ADV_DATA,
++ 				      MGMT_STATUS_FAILED);
++ 		mgmt_pending_remove(cmd);
++ 		goto clear_new_instance;
++ 	}
++ 
++ 	/* We were successful in updating data, so trigger advertising_added
++ 	 * event if this is an instance that wasn't previously advertising. If
++ 	 * a failure occurs in the requests we initiated, we will remove the
++ 	 * instance again in add_advertising_complete
++ 	 */
++ 	if (adv_instance->pending)
++ 		mgmt_advertising_added(sk, hdev, cp->instance);
++ 
++ 	goto unlock;
++ 
++ clear_new_instance:
++ 	hci_remove_adv_instance(hdev, cp->instance);
++ 
++ unlock:
++ 	hci_dev_unlock(hdev);
++ 
++ 	return err;
++ }
++ 
+++>>>>>>> b6f1b79deabd (Bluetooth: Do not set cur_adv_instance in adv param MGMT request)
+  static void remove_advertising_complete(struct hci_dev *hdev, u8 status,
+  					u16 opcode)
+  {
+* Unmerged path net/bluetooth/mgmt.c
