@@ -1,0 +1,157 @@
+mm: thp: KVM: Explicitly check for THP when populating secondary MMU
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+Rebuild_CHGLOG: - [mm] thp: kvm: Explicitly check for THP when populating secondary MMU (Vitaly Kuznetsov) [1813987]
+Rebuild_FUZZ: 96.97%
+commit-author Sean Christopherson <sean.j.christopherson@intel.com>
+commit 005ba37cb89bcc0cf63c2029a41f8db165aeb615
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/005ba37c.failed
+
+Add a helper, is_transparent_hugepage(), to explicitly check whether a
+compound page is a THP and use it when populating KVM's secondary MMU.
+The explicit check fixes a bug where a remapped compound page, e.g. for
+an XDP Rx socket, is mapped into a KVM guest and is mistaken for a THP,
+which results in KVM incorrectly creating a huge page in its secondary
+MMU.
+
+Fixes: 936a5fe6e6148 ("thp: kvm mmu transparent hugepage support")
+	Reported-by: syzbot+c9d1fb51ac9d0d10c39d@syzkaller.appspotmail.com
+	Cc: Andrea Arcangeli <aarcange@redhat.com>
+	Cc: stable@vger.kernel.org
+	Signed-off-by: Sean Christopherson <sean.j.christopherson@intel.com>
+	Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+(cherry picked from commit 005ba37cb89bcc0cf63c2029a41f8db165aeb615)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	mm/huge_memory.c
+diff --cc mm/huge_memory.c
+index 0d42ef5a8901,9b3ee79d0edf..000000000000
+--- a/mm/huge_memory.c
++++ b/mm/huge_memory.c
+@@@ -491,7 -527,18 +491,22 @@@ void prep_transhuge_page(struct page *p
+  	set_compound_page_dtor(page, TRANSHUGE_PAGE_DTOR);
+  }
+  
+++<<<<<<< HEAD
+ +unsigned long __thp_get_unmapped_area(struct file *filp, unsigned long len,
+++=======
++ bool is_transparent_hugepage(struct page *page)
++ {
++ 	if (!PageCompound(page))
++ 		return 0;
++ 
++ 	page = compound_head(page);
++ 	return is_huge_zero_page(page) ||
++ 	       page[1].compound_dtor == TRANSHUGE_PAGE_DTOR;
++ }
++ EXPORT_SYMBOL_GPL(is_transparent_hugepage);
++ 
++ static unsigned long __thp_get_unmapped_area(struct file *filp, unsigned long len,
+++>>>>>>> 005ba37cb89b (mm: thp: KVM: Explicitly check for THP when populating secondary MMU)
+  		loff_t off, unsigned long flags, unsigned long size)
+  {
+  	unsigned long addr;
+diff --git a/arch/x86/kvm/mmu/mmu.c b/arch/x86/kvm/mmu/mmu.c
+index a8547d694650..75d477448cc1 100644
+--- a/arch/x86/kvm/mmu/mmu.c
++++ b/arch/x86/kvm/mmu/mmu.c
+@@ -3347,7 +3347,7 @@ static void transparent_hugepage_adjust(struct kvm_vcpu *vcpu,
+ 	 */
+ 	if (!is_error_noslot_pfn(pfn) && !kvm_is_reserved_pfn(pfn) &&
+ 	    !kvm_is_zone_device_pfn(pfn) && level == PT_PAGE_TABLE_LEVEL &&
+-	    PageTransCompoundMap(pfn_to_page(pfn))) {
++	    kvm_is_transparent_hugepage(pfn)) {
+ 		unsigned long mask;
+ 
+ 		/*
+@@ -5964,7 +5964,7 @@ static bool kvm_mmu_zap_collapsible_spte(struct kvm *kvm,
+ 		 */
+ 		if (sp->role.direct && !kvm_is_reserved_pfn(pfn) &&
+ 		    !kvm_is_zone_device_pfn(pfn) &&
+-		    PageTransCompoundMap(pfn_to_page(pfn))) {
++		    kvm_is_transparent_hugepage(pfn)) {
+ 			pte_list_remove(rmap_head, sptep);
+ 
+ 			if (kvm_available_flush_tlb_with_range())
+diff --git a/include/linux/huge_mm.h b/include/linux/huge_mm.h
+index 2674e6e72d71..611b36215cc5 100644
+--- a/include/linux/huge_mm.h
++++ b/include/linux/huge_mm.h
+@@ -132,6 +132,7 @@ extern unsigned long thp_get_unmapped_area(struct file *filp,
+ 
+ extern void prep_transhuge_page(struct page *page);
+ extern void free_transhuge_page(struct page *page);
++bool is_transparent_hugepage(struct page *page);
+ 
+ bool can_split_huge_page(struct page *page, int *pextra_pins);
+ int split_huge_page_to_list(struct page *page, struct list_head *list);
+@@ -262,6 +263,11 @@ static inline bool transparent_hugepage_enabled(struct vm_area_struct *vma)
+ 
+ static inline void prep_transhuge_page(struct page *page) {}
+ 
++static inline bool is_transparent_hugepage(struct page *page)
++{
++	return false;
++}
++
+ #define transparent_hugepage_flags 0UL
+ 
+ #define thp_get_unmapped_area	NULL
+diff --git a/include/linux/kvm_host.h b/include/linux/kvm_host.h
+index 4f3281952f3e..3081cd8398c7 100644
+--- a/include/linux/kvm_host.h
++++ b/include/linux/kvm_host.h
+@@ -985,6 +985,7 @@ int kvm_cpu_has_pending_timer(struct kvm_vcpu *vcpu);
+ 
+ bool kvm_is_reserved_pfn(kvm_pfn_t pfn);
+ bool kvm_is_zone_device_pfn(kvm_pfn_t pfn);
++bool kvm_is_transparent_hugepage(kvm_pfn_t pfn);
+ 
+ struct kvm_irq_ack_notifier {
+ 	struct hlist_node link;
+* Unmerged path mm/huge_memory.c
+diff --git a/virt/kvm/arm/mmu.c b/virt/kvm/arm/mmu.c
+index 6ac8a2ba9fd1..23be13e7422c 100644
+--- a/virt/kvm/arm/mmu.c
++++ b/virt/kvm/arm/mmu.c
+@@ -1384,14 +1384,8 @@ static bool transparent_hugepage_adjust(kvm_pfn_t *pfnp, phys_addr_t *ipap)
+ {
+ 	kvm_pfn_t pfn = *pfnp;
+ 	gfn_t gfn = *ipap >> PAGE_SHIFT;
+-	struct page *page = pfn_to_page(pfn);
+ 
+-	/*
+-	 * PageTransCompoundMap() returns true for THP and
+-	 * hugetlbfs. Make sure the adjustment is done only for THP
+-	 * pages.
+-	 */
+-	if (!PageHuge(page) && PageTransCompoundMap(page)) {
++	if (kvm_is_transparent_hugepage(pfn)) {
+ 		unsigned long mask;
+ 		/*
+ 		 * The address we faulted on is backed by a transparent huge
+diff --git a/virt/kvm/kvm_main.c b/virt/kvm/kvm_main.c
+index ab1703cddeb2..18e0bb1ccd7a 100644
+--- a/virt/kvm/kvm_main.c
++++ b/virt/kvm/kvm_main.c
+@@ -194,6 +194,16 @@ bool kvm_is_reserved_pfn(kvm_pfn_t pfn)
+ 	return true;
+ }
+ 
++bool kvm_is_transparent_hugepage(kvm_pfn_t pfn)
++{
++	struct page *page = pfn_to_page(pfn);
++
++	if (!PageTransCompoundMap(page))
++		return false;
++
++	return is_transparent_hugepage(compound_head(page));
++}
++
+ /*
+  * Switches to specified vcpu, until a matching vcpu_put()
+  */
