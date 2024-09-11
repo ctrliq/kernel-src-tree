@@ -1,0 +1,84 @@
+scsi: iscsi: Fix endpoint reuse regression
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-394.el8
+commit-author Mike Christie <michael.christie@oracle.com>
+commit 0aadafb5c34403a7cced1a8d61877048dc059f70
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-394.el8/0aadafb5.failed
+
+This patch fixes a bug where when using iSCSI offload we can free an
+endpoint while userspace still thinks it's active. That then causes the
+endpoint ID to be reused for a new connection's endpoint while userspace
+still thinks the ID is for the original connection. Userspace will then end
+up disconnecting a running connection's endpoint or trying to bind to
+another connection's endpoint.
+
+This bug is a regression added in:
+
+Commit 23d6fefbb3f6 ("scsi: iscsi: Fix in-kernel conn failure handling")
+
+where we added a in kernel ep_disconnect call to fix a bug in:
+
+Commit 0ab710458da1 ("scsi: iscsi: Perform connection failure entirely in
+kernel space")
+
+where we would call stop_conn without having done ep_disconnect. This early
+ep_disconnect call will then free the endpoint and it's ID while userspace
+still thinks the ID is valid.
+
+Fix the early release of the ID by having the in kernel recovery code keep
+a reference to the endpoint until userspace has called into the kernel to
+finish cleaning up the endpoint/connection. It requires the previous commit
+"scsi: iscsi: Release endpoint ID when its freed" which moved the freeing
+of the ID until when the endpoint is released.
+
+Link: https://lore.kernel.org/r/20220408001314.5014-5-michael.christie@oracle.com
+Fixes: 23d6fefbb3f6 ("scsi: iscsi: Fix in-kernel conn failure handling")
+	Tested-by: Manish Rangankar <mrangankar@marvell.com>
+	Reviewed-by: Lee Duncan <lduncan@suse.com>
+	Reviewed-by: Chris Leech <cleech@redhat.com>
+	Signed-off-by: Mike Christie <michael.christie@oracle.com>
+	Signed-off-by: Martin K. Petersen <martin.petersen@oracle.com>
+(cherry picked from commit 0aadafb5c34403a7cced1a8d61877048dc059f70)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/scsi/scsi_transport_iscsi.c
+diff --cc drivers/scsi/scsi_transport_iscsi.c
+index 46e03f51496a,f200da049f3b..000000000000
+--- a/drivers/scsi/scsi_transport_iscsi.c
++++ b/drivers/scsi/scsi_transport_iscsi.c
+@@@ -2253,6 -2235,27 +2253,30 @@@ static void iscsi_ep_disconnect(struct 
+  	ISCSI_DBG_TRANS_CONN(conn, "disconnect ep done.\n");
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static void iscsi_if_disconnect_bound_ep(struct iscsi_cls_conn *conn,
++ 					 struct iscsi_endpoint *ep,
++ 					 bool is_active)
++ {
++ 	/* Check if this was a conn error and the kernel took ownership */
++ 	if (!test_bit(ISCSI_CLS_CONN_BIT_CLEANUP, &conn->flags)) {
++ 		iscsi_ep_disconnect(conn, is_active);
++ 	} else {
++ 		ISCSI_DBG_TRANS_CONN(conn, "flush kernel conn cleanup.\n");
++ 		mutex_unlock(&conn->ep_mutex);
++ 
++ 		flush_work(&conn->cleanup_work);
++ 		/*
++ 		 * Userspace is now done with the EP so we can release the ref
++ 		 * iscsi_cleanup_conn_work_fn took.
++ 		 */
++ 		iscsi_put_endpoint(ep);
++ 		mutex_lock(&conn->ep_mutex);
++ 	}
++ }
++ 
+++>>>>>>> 0aadafb5c344 (scsi: iscsi: Fix endpoint reuse regression)
+  static int iscsi_if_stop_conn(struct iscsi_transport *transport,
+  			      struct iscsi_uevent *ev)
+  {
+* Unmerged path drivers/scsi/scsi_transport_iscsi.c
