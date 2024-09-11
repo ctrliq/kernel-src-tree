@@ -1,0 +1,481 @@
+ASoC: wm_adsp: Separate wm_adsp specifics in cs_dsp_client_ops
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-448.el8
+commit-author Simon Trimmer <simont@opensource.cirrus.com>
+commit 2dd044641ec3672433b9fe3ec47b236621757aa8
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-448.el8/2dd04464.failed
+
+This is preparation for moving the generic DSP support out of ASoC.
+The event callbacks let the client add custom handling of events.
+
+	Signed-off-by: Simon Trimmer <simont@opensource.cirrus.com>
+	Signed-off-by: Charles Keepax <ckeepax@opensource.cirrus.com>
+Link: https://lore.kernel.org/r/20210913160057.103842-16-simont@opensource.cirrus.com
+	Signed-off-by: Mark Brown <broonie@kernel.org>
+(cherry picked from commit 2dd044641ec3672433b9fe3ec47b236621757aa8)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	sound/soc/codecs/wm_adsp.c
+#	sound/soc/codecs/wm_adsp.h
+diff --cc sound/soc/codecs/wm_adsp.c
+index c1b5ea3b5718,6c5d55b3b311..000000000000
+--- a/sound/soc/codecs/wm_adsp.c
++++ b/sound/soc/codecs/wm_adsp.c
+@@@ -304,11 -314,14 +304,18 @@@
+  #define HALO_MPU_VIO_ERR_SRC_MASK           0x00007fff
+  #define HALO_MPU_VIO_ERR_SRC_SHIFT                   0
+  
+ -static const struct cs_dsp_ops cs_dsp_adsp1_ops;
+ -static const struct cs_dsp_ops cs_dsp_adsp2_ops[];
+ -static const struct cs_dsp_ops cs_dsp_halo_ops;
+ +static const struct wm_adsp_ops wm_adsp1_ops;
+ +static const struct wm_adsp_ops wm_adsp2_ops[];
+ +static const struct wm_adsp_ops wm_halo_ops;
+  
+++<<<<<<< HEAD
+ +struct wm_adsp_buf {
+++=======
++ static const struct cs_dsp_client_ops wm_adsp1_client_ops;
++ static const struct cs_dsp_client_ops wm_adsp2_client_ops;
++ 
++ struct cs_dsp_buf {
+++>>>>>>> 2dd044641ec3 (ASoC: wm_adsp: Separate wm_adsp specifics in cs_dsp_client_ops)
+  	struct list_head list;
+  	void *buf;
+  };
+@@@ -1505,11 -1551,11 +1512,19 @@@ static int wm_adsp_create_control(struc
+  
+  	list_add(&ctl->list, &dsp->ctl_list);
+  
+++<<<<<<< HEAD
+ +	if (flags & WMFW_CTL_FLAG_SYS)
+ +		return 0;
+ +
+ +	INIT_WORK(&ctl->work, wm_adsp_ctl_work);
+ +	schedule_work(&ctl->work);
+++=======
++ 	if (dsp->client_ops->control_add) {
++ 		ret = dsp->client_ops->control_add(ctl);
++ 		if (ret)
++ 			goto err_list_del;
++ 	}
+++>>>>>>> 2dd044641ec3 (ASoC: wm_adsp: Separate wm_adsp specifics in cs_dsp_client_ops)
+  
+  	return 0;
+  
+@@@ -2780,9 -2859,22 +2795,19 @@@ static int wm_adsp_common_init(struct w
+  	return 0;
+  }
+  
+ -static int cs_dsp_adsp1_init(struct cs_dsp *dsp)
+ -{
+ -	dsp->ops = &cs_dsp_adsp1_ops;
+ -
+ -	return cs_dsp_common_init(dsp);
+ -}
+ -
+  int wm_adsp1_init(struct wm_adsp *dsp)
+  {
+++<<<<<<< HEAD
+ +	dsp->ops = &wm_adsp1_ops;
+++=======
++ 	int ret;
++ 
++ 	dsp->cs_dsp.client_ops = &wm_adsp1_client_ops;
++ 
++ 	ret = cs_dsp_adsp1_init(&dsp->cs_dsp);
++ 	if (ret)
++ 		return ret;
+++>>>>>>> 2dd044641ec3 (ASoC: wm_adsp: Separate wm_adsp specifics in cs_dsp_client_ops)
+  
+  	return wm_adsp_common_init(dsp);
+  }
+@@@ -3216,6 -3385,113 +3241,116 @@@ static void wm_adsp2_stop_core(struct w
+  			   ADSP2_CORE_ENA | ADSP2_START, 0);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static int wm_adsp_event_post_run(struct cs_dsp *cs_dsp)
++ {
++ 	struct wm_adsp *dsp = container_of(cs_dsp, struct wm_adsp, cs_dsp);
++ 
++ 	if (wm_adsp_fw[dsp->fw].num_caps != 0)
++ 		return wm_adsp_buffer_init(dsp);
++ 
++ 	return 0;
++ }
++ 
++ static void wm_adsp_event_post_stop(struct cs_dsp *cs_dsp)
++ {
++ 	struct wm_adsp *dsp = container_of(cs_dsp, struct wm_adsp, cs_dsp);
++ 
++ 	if (wm_adsp_fw[dsp->fw].num_caps != 0)
++ 		wm_adsp_buffer_free(dsp);
++ 
++ 	dsp->fatal_error = false;
++ }
++ 
++ static int cs_dsp_run(struct cs_dsp *dsp)
++ {
++ 	int ret;
++ 
++ 	mutex_lock(&dsp->pwr_lock);
++ 
++ 	if (!dsp->booted) {
++ 		ret = -EIO;
++ 		goto err;
++ 	}
++ 
++ 	if (dsp->ops->enable_core) {
++ 		ret = dsp->ops->enable_core(dsp);
++ 		if (ret != 0)
++ 			goto err;
++ 	}
++ 
++ 	/* Sync set controls */
++ 	ret = cs_dsp_coeff_sync_controls(dsp);
++ 	if (ret != 0)
++ 		goto err;
++ 
++ 	if (dsp->ops->lock_memory) {
++ 		ret = dsp->ops->lock_memory(dsp, dsp->lock_regions);
++ 		if (ret != 0) {
++ 			cs_dsp_err(dsp, "Error configuring MPU: %d\n", ret);
++ 			goto err;
++ 		}
++ 	}
++ 
++ 	if (dsp->ops->start_core) {
++ 		ret = dsp->ops->start_core(dsp);
++ 		if (ret != 0)
++ 			goto err;
++ 	}
++ 
++ 	dsp->running = true;
++ 
++ 	if (dsp->client_ops->post_run) {
++ 		ret = dsp->client_ops->post_run(dsp);
++ 		if (ret)
++ 			goto err;
++ 	}
++ 
++ 	mutex_unlock(&dsp->pwr_lock);
++ 
++ 	return 0;
++ 
++ err:
++ 	if (dsp->ops->stop_core)
++ 		dsp->ops->stop_core(dsp);
++ 	if (dsp->ops->disable_core)
++ 		dsp->ops->disable_core(dsp);
++ 	mutex_unlock(&dsp->pwr_lock);
++ 
++ 	return ret;
++ }
++ 
++ static void cs_dsp_stop(struct cs_dsp *dsp)
++ {
++ 	/* Tell the firmware to cleanup */
++ 	cs_dsp_signal_event_controls(dsp, CS_DSP_FW_EVENT_SHUTDOWN);
++ 
++ 	if (dsp->ops->stop_watchdog)
++ 		dsp->ops->stop_watchdog(dsp);
++ 
++ 	/* Log firmware state, it can be useful for analysis */
++ 	if (dsp->ops->show_fw_status)
++ 		dsp->ops->show_fw_status(dsp);
++ 
++ 	mutex_lock(&dsp->pwr_lock);
++ 
++ 	dsp->running = false;
++ 
++ 	if (dsp->ops->stop_core)
++ 		dsp->ops->stop_core(dsp);
++ 	if (dsp->ops->disable_core)
++ 		dsp->ops->disable_core(dsp);
++ 
++ 	if (dsp->client_ops->post_stop)
++ 		dsp->client_ops->post_stop(dsp);
++ 
++ 	mutex_unlock(&dsp->pwr_lock);
++ 
++ 	cs_dsp_dbg(dsp, "Execution stopped\n");
++ }
++ 
+++>>>>>>> 2dd044641ec3 (ASoC: wm_adsp: Separate wm_adsp specifics in cs_dsp_client_ops)
+  int wm_adsp_event(struct snd_soc_dapm_widget *w,
+  		  struct snd_kcontrol *kcontrol, int event)
+  {
+@@@ -3390,9 -3585,23 +3525,20 @@@ int wm_adsp2_init(struct wm_adsp *dsp
+  		break;
+  	}
+  
+ -	return cs_dsp_common_init(dsp);
+ -}
+ -
+ -int wm_adsp2_init(struct wm_adsp *dsp)
+ -{
+ -	int ret;
+ -
+  	INIT_WORK(&dsp->boot_work, wm_adsp_boot_work);
+  
+++<<<<<<< HEAD
+ +	return 0;
+++=======
++ 	dsp->sys_config_size = sizeof(struct wm_adsp_system_config_xm_hdr);
++ 	dsp->cs_dsp.client_ops = &wm_adsp2_client_ops;
++ 
++ 	ret = cs_dsp_adsp2_init(&dsp->cs_dsp);
++ 	if (ret)
++ 		return ret;
++ 
++ 	return wm_adsp_common_init(dsp);
+++>>>>>>> 2dd044641ec3 (ASoC: wm_adsp: Separate wm_adsp specifics in cs_dsp_client_ops)
+  }
+  EXPORT_SYMBOL_GPL(wm_adsp2_init);
+  
+@@@ -3400,7 -3616,12 +3546,16 @@@ int wm_halo_init(struct wm_adsp *dsp
+  {
+  	int ret;
+  
+++<<<<<<< HEAD
+ +	ret = wm_adsp_common_init(dsp);
+++=======
++ 	INIT_WORK(&dsp->boot_work, wm_adsp_boot_work);
++ 
++ 	dsp->sys_config_size = sizeof(struct wm_halo_system_config_xm_hdr);
++ 	dsp->cs_dsp.client_ops = &wm_adsp2_client_ops;
++ 
++ 	ret = cs_dsp_halo_init(&dsp->cs_dsp);
+++>>>>>>> 2dd044641ec3 (ASoC: wm_adsp: Separate wm_adsp specifics in cs_dsp_client_ops)
+  	if (ret)
+  		return ret;
+  
+@@@ -3412,16 -3629,24 +3567,34 @@@
+  }
+  EXPORT_SYMBOL_GPL(wm_halo_init);
+  
+++<<<<<<< HEAD
+++=======
++ static void cs_dsp_remove(struct cs_dsp *dsp)
++ {
++ 	struct cs_dsp_coeff_ctl *ctl;
++ 
++ 	while (!list_empty(&dsp->ctl_list)) {
++ 		ctl = list_first_entry(&dsp->ctl_list, struct cs_dsp_coeff_ctl, list);
++ 
++ 		if (dsp->client_ops->control_remove)
++ 			dsp->client_ops->control_remove(ctl);
++ 
++ 		list_del(&ctl->list);
++ 		cs_dsp_free_ctl_blk(ctl);
++ 	}
++ }
++ 
+++>>>>>>> 2dd044641ec3 (ASoC: wm_adsp: Separate wm_adsp specifics in cs_dsp_client_ops)
+  void wm_adsp2_remove(struct wm_adsp *dsp)
+  {
+ -	cs_dsp_remove(&dsp->cs_dsp);
+ +	struct wm_coeff_ctl *ctl;
+ +
+ +	while (!list_empty(&dsp->ctl_list)) {
+ +		ctl = list_first_entry(&dsp->ctl_list, struct wm_coeff_ctl,
+ +					list);
+ +		list_del(&ctl->list);
+ +		wm_adsp_free_ctl_blk(ctl);
+ +	}
+  }
+  EXPORT_SYMBOL_GPL(wm_adsp2_remove);
+  
+@@@ -4357,9 -4584,10 +4530,10 @@@ irqreturn_t wm_adsp2_bus_error(int irq
+  	}
+  
+  	if (val & ADSP2_WDT_TIMEOUT_STS_MASK) {
+ -		cs_dsp_err(dsp, "watchdog timeout error\n");
+ +		adsp_err(dsp, "watchdog timeout error\n");
+  		dsp->ops->stop_watchdog(dsp);
+- 		wm_adsp_fatal_error(dsp);
++ 		if (dsp->client_ops->watchdog_expired)
++ 			dsp->client_ops->watchdog_expired(dsp);
+  	}
+  
+  	if (val & (ADSP2_ADDR_ERR_MASK | ADSP2_REGION_LOCK_ERR_MASK)) {
+@@@ -4463,6 -4704,19 +4637,22 @@@ exit_unlock
+  }
+  EXPORT_SYMBOL_GPL(wm_halo_bus_error);
+  
+++<<<<<<< HEAD
+++=======
++ static void cs_dsp_halo_wdt_expire(struct cs_dsp *dsp)
++ {
++ 	mutex_lock(&dsp->pwr_lock);
++ 
++ 	cs_dsp_warn(dsp, "WDT Expiry Fault\n");
++ 
++ 	dsp->ops->stop_watchdog(dsp);
++ 	if (dsp->client_ops->watchdog_expired)
++ 		dsp->client_ops->watchdog_expired(dsp);
++ 
++ 	mutex_unlock(&dsp->pwr_lock);
++ }
++ 
+++>>>>>>> 2dd044641ec3 (ASoC: wm_adsp: Separate wm_adsp specifics in cs_dsp_client_ops)
+  irqreturn_t wm_halo_wdt_expire(int irq, void *data)
+  {
+  	struct wm_adsp *dsp = data;
+@@@ -4479,30 -4727,34 +4669,39 @@@
+  }
+  EXPORT_SYMBOL_GPL(wm_halo_wdt_expire);
+  
+ -static const struct cs_dsp_ops cs_dsp_adsp1_ops = {
+ -	.validate_version = cs_dsp_validate_version,
+ -	.parse_sizes = cs_dsp_adsp1_parse_sizes,
+ -	.region_to_reg = cs_dsp_region_to_reg,
+ +static const struct wm_adsp_ops wm_adsp1_ops = {
+ +	.validate_version = wm_adsp_validate_version,
+ +	.parse_sizes = wm_adsp1_parse_sizes,
+ +	.region_to_reg = wm_adsp_region_to_reg,
+  };
+  
+++<<<<<<< HEAD
+ +static const struct wm_adsp_ops wm_adsp2_ops[] = {
+++=======
++ static const struct cs_dsp_client_ops wm_adsp1_client_ops = {
++ 	.control_add = wm_adsp_control_add,
++ 	.control_remove = wm_adsp_control_remove,
++ };
++ 
++ static const struct cs_dsp_ops cs_dsp_adsp2_ops[] = {
+++>>>>>>> 2dd044641ec3 (ASoC: wm_adsp: Separate wm_adsp specifics in cs_dsp_client_ops)
+  	{
+ -		.parse_sizes = cs_dsp_adsp2_parse_sizes,
+ -		.validate_version = cs_dsp_validate_version,
+ -		.setup_algs = cs_dsp_adsp2_setup_algs,
+ -		.region_to_reg = cs_dsp_region_to_reg,
+ +		.sys_config_size = sizeof(struct wm_adsp_system_config_xm_hdr),
+ +		.parse_sizes = wm_adsp2_parse_sizes,
+ +		.validate_version = wm_adsp_validate_version,
+ +		.setup_algs = wm_adsp2_setup_algs,
+ +		.region_to_reg = wm_adsp_region_to_reg,
+  
+ -		.show_fw_status = cs_dsp_adsp2_show_fw_status,
+ +		.show_fw_status = wm_adsp2_show_fw_status,
+  
+ -		.enable_memory = cs_dsp_adsp2_enable_memory,
+ -		.disable_memory = cs_dsp_adsp2_disable_memory,
+ +		.enable_memory = wm_adsp2_enable_memory,
+ +		.disable_memory = wm_adsp2_disable_memory,
+  
+ -		.enable_core = cs_dsp_adsp2_enable_core,
+ -		.disable_core = cs_dsp_adsp2_disable_core,
+ +		.enable_core = wm_adsp2_enable_core,
+ +		.disable_core = wm_adsp2_disable_core,
+  
+ -		.start_core = cs_dsp_adsp2_start_core,
+ -		.stop_core = cs_dsp_adsp2_stop_core,
+ +		.start_core = wm_adsp2_start_core,
+ +		.stop_core = wm_adsp2_stop_core,
+  
+  	},
+  	{
+@@@ -4546,20 -4796,27 +4745,28 @@@
+  	},
+  };
+  
+ -static const struct cs_dsp_ops cs_dsp_halo_ops = {
+ -	.parse_sizes = cs_dsp_adsp2_parse_sizes,
+ -	.validate_version = cs_dsp_halo_validate_version,
+ -	.setup_algs = cs_dsp_halo_setup_algs,
+ -	.region_to_reg = cs_dsp_halo_region_to_reg,
+ +static const struct wm_adsp_ops wm_halo_ops = {
+ +	.sys_config_size = sizeof(struct wm_halo_system_config_xm_hdr),
+ +	.parse_sizes = wm_adsp2_parse_sizes,
+ +	.validate_version = wm_halo_validate_version,
+ +	.setup_algs = wm_halo_setup_algs,
+ +	.region_to_reg = wm_halo_region_to_reg,
+  
+ -	.show_fw_status = cs_dsp_halo_show_fw_status,
+ -	.stop_watchdog = cs_dsp_halo_stop_watchdog,
+ +	.show_fw_status = wm_halo_show_fw_status,
+ +	.stop_watchdog = wm_halo_stop_watchdog,
+  
+ -	.lock_memory = cs_dsp_halo_configure_mpu,
+ +	.lock_memory = wm_halo_configure_mpu,
+  
+ -	.start_core = cs_dsp_halo_start_core,
+ -	.stop_core = cs_dsp_halo_stop_core,
+ +	.start_core = wm_halo_start_core,
+ +	.stop_core = wm_halo_stop_core,
+  };
+  
++ static const struct cs_dsp_client_ops wm_adsp2_client_ops = {
++ 	.control_add = wm_adsp_control_add,
++ 	.control_remove = wm_adsp_control_remove,
++ 	.post_run = wm_adsp_event_post_run,
++ 	.post_stop = wm_adsp_event_post_stop,
++ 	.watchdog_expired = wm_adsp_fatal_error,
++ };
++ 
+  MODULE_LICENSE("GPL v2");
+diff --cc sound/soc/codecs/wm_adsp.h
+index f22131d9cc29,25aaef74654c..000000000000
+--- a/sound/soc/codecs/wm_adsp.h
++++ b/sound/soc/codecs/wm_adsp.h
+@@@ -51,20 -51,38 +51,30 @@@ struct wm_adsp_alg_region 
+  
+  struct wm_adsp_compr;
+  struct wm_adsp_compr_buf;
+++<<<<<<< HEAD
+ +struct wm_adsp_ops;
+++=======
++ struct cs_dsp_ops;
++ struct cs_dsp_client_ops;
+++>>>>>>> 2dd044641ec3 (ASoC: wm_adsp: Separate wm_adsp specifics in cs_dsp_client_ops)
+  
+ -struct cs_dsp_coeff_ctl {
+ -	const char *fw_name;
+ -	/* Subname is needed to match with firmware */
+ -	const char *subname;
+ -	unsigned int subname_len;
+ -	struct cs_dsp_alg_region alg_region;
+ -	struct cs_dsp *dsp;
+ -	unsigned int enabled:1;
+ -	struct list_head list;
+ -	void *cache;
+ -	unsigned int offset;
+ -	size_t len;
+ -	unsigned int set:1;
+ -	unsigned int flags;
+ -	unsigned int type;
+ -
+ -	void *priv;
+ -};
+ -
+ -struct cs_dsp {
+ +struct wm_adsp {
+ +	const char *part;
+  	const char *name;
+ +	const char *fwf_name;
+  	int rev;
+  	int num;
+  	int type;
+  	struct device *dev;
+  	struct regmap *regmap;
+ +	struct snd_soc_component *component;
+  
+++<<<<<<< HEAD
+ +	const struct wm_adsp_ops *ops;
+++=======
++ 	const struct cs_dsp_ops *ops;
++ 	const struct cs_dsp_client_ops *client_ops;
+++>>>>>>> 2dd044641ec3 (ASoC: wm_adsp: Separate wm_adsp specifics in cs_dsp_client_ops)
+  
+  	unsigned int base;
+  	unsigned int base_sysinfo;
+* Unmerged path sound/soc/codecs/wm_adsp.c
+* Unmerged path sound/soc/codecs/wm_adsp.h
