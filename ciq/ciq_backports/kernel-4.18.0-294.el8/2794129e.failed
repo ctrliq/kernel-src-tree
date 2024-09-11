@@ -1,0 +1,134 @@
+mm/memory-hotplug: Allow memory resources to be children
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Dave Hansen <dave.hansen@linux.intel.com>
+commit 2794129e902d8eb69413d884dc6404b8716ed9ed
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/2794129e.failed
+
+The mm/resource.c code is used to manage the physical address
+space.  The current resource configuration can be viewed in
+/proc/iomem.  An example of this is at the bottom of this
+description.
+
+The nvdimm subsystem "owns" the physical address resources which
+map to persistent memory and has resources inserted for them as
+"Persistent Memory".  The best way to repurpose this for volatile
+use is to leave the existing resource in place, but add a "System
+RAM" resource underneath it. This clearly communicates the
+ownership relationship of this memory.
+
+The request_resource_conflict() API only deals with the
+top-level resources.  Replace it with __request_region() which
+will search for !IORESOURCE_BUSY areas lower in the resource
+tree than the top level.
+
+We *could* also simply truncate the existing top-level
+"Persistent Memory" resource and take over the released address
+space.  But, this means that if we ever decide to hot-unplug the
+"RAM" and give it back, we need to recreate the original setup,
+which may mean going back to the BIOS tables.
+
+This should have no real effect on the existing collision
+detection because the areas that truly conflict should be marked
+IORESOURCE_BUSY.
+
+00000000-00000fff : Reserved
+00001000-0009fbff : System RAM
+0009fc00-0009ffff : Reserved
+000a0000-000bffff : PCI Bus 0000:00
+000c0000-000c97ff : Video ROM
+000c9800-000ca5ff : Adapter ROM
+000f0000-000fffff : Reserved
+  000f0000-000fffff : System ROM
+00100000-9fffffff : System RAM
+  01000000-01e071d0 : Kernel code
+  01e071d1-027dfdff : Kernel data
+  02dc6000-0305dfff : Kernel bss
+a0000000-afffffff : Persistent Memory (legacy)
+  a0000000-a7ffffff : System RAM
+b0000000-bffdffff : System RAM
+bffe0000-bfffffff : Reserved
+c0000000-febfffff : PCI Bus 0000:00
+
+	Signed-off-by: Dave Hansen <dave.hansen@linux.intel.com>
+	Reviewed-by: Dan Williams <dan.j.williams@intel.com>
+	Reviewed-by: Vishal Verma <vishal.l.verma@intel.com>
+	Cc: Dave Jiang <dave.jiang@intel.com>
+	Cc: Ross Zwisler <zwisler@kernel.org>
+	Cc: Vishal Verma <vishal.l.verma@intel.com>
+	Cc: Tom Lendacky <thomas.lendacky@amd.com>
+	Cc: Andrew Morton <akpm@linux-foundation.org>
+	Cc: Michal Hocko <mhocko@suse.com>
+	Cc: linux-nvdimm@lists.01.org
+	Cc: linux-kernel@vger.kernel.org
+	Cc: linux-mm@kvack.org
+	Cc: Huang Ying <ying.huang@intel.com>
+	Cc: Fengguang Wu <fengguang.wu@intel.com>
+	Cc: Borislav Petkov <bp@suse.de>
+	Cc: Bjorn Helgaas <bhelgaas@google.com>
+	Cc: Yaowei Bai <baiyaowei@cmss.chinamobile.com>
+	Cc: Takashi Iwai <tiwai@suse.de>
+	Cc: Jerome Glisse <jglisse@redhat.com>
+	Cc: Keith Busch <keith.busch@intel.com>
+	Signed-off-by: Dan Williams <dan.j.williams@intel.com>
+(cherry picked from commit 2794129e902d8eb69413d884dc6404b8716ed9ed)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	mm/memory_hotplug.c
+diff --cc mm/memory_hotplug.c
+index 7bdcaf6f079f,b37f3a5c4833..000000000000
+--- a/mm/memory_hotplug.c
++++ b/mm/memory_hotplug.c
+@@@ -99,30 -99,21 +99,39 @@@ u64 max_mem_size = U64_MAX
+  /* add this memory to iomem resource */
+  static struct resource *register_memory_resource(u64 start, u64 size)
+  {
+++<<<<<<< HEAD
+ +	struct resource *res, *conflict;
+ +
+ +
+ +	/*
+ +	 * Make sure value parsed from 'mem=' only restricts memory adding
+ +	 * while booting, so that memory hotplug won't be impacted. Please
+ +	 * refer to document of 'mem=' in kernel-parameters.txt for more
+ +	 * details.
+ +	 */
+ +	if (start + size > max_mem_size && system_state < SYSTEM_RUNNING)
+ +		return ERR_PTR(-E2BIG);
+ +
+ +	res = kzalloc(sizeof(struct resource), GFP_KERNEL);
+ +	if (!res)
+ +		return ERR_PTR(-ENOMEM);
+++=======
++ 	struct resource *res;
++ 	unsigned long flags =  IORESOURCE_SYSTEM_RAM | IORESOURCE_BUSY;
++ 	char *resource_name = "System RAM";
+++>>>>>>> 2794129e902d (mm/memory-hotplug: Allow memory resources to be children)
+  
+- 	res->name = "System RAM";
+- 	res->start = start;
+- 	res->end = start + size - 1;
+- 	res->flags = IORESOURCE_SYSTEM_RAM | IORESOURCE_BUSY;
+- 	conflict =  request_resource_conflict(&iomem_resource, res);
+- 	if (conflict) {
+- 		pr_debug("System RAM resource %pR cannot be added\n", res);
+- 		kfree(res);
++ 	/*
++ 	 * Request ownership of the new memory range.  This might be
++ 	 * a child of an existing resource that was present but
++ 	 * not marked as busy.
++ 	 */
++ 	res = __request_region(&iomem_resource, start, size,
++ 			       resource_name, flags);
++ 
++ 	if (!res) {
++ 		pr_debug("Unable to reserve System RAM region: %016llx->%016llx\n",
++ 				start, start + size);
+  		return ERR_PTR(-EEXIST);
+  	}
+  	return res;
+* Unmerged path mm/memory_hotplug.c
