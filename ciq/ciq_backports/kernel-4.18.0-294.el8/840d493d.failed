@@ -1,0 +1,191 @@
+fs/xfs: Combine xfs_diflags_to_linux() and xfs_diflags_to_iflags()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Ira Weiny <ira.weiny@intel.com>
+commit 840d493dff1abb0cb0d73417148a3eeecd5f30d9
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/840d493d.failed
+
+The functionality in xfs_diflags_to_linux() and xfs_diflags_to_iflags() are
+nearly identical.  The only difference is that *_to_linux() is called after
+inode setup and disallows changing the DAX flag.
+
+Combining them can be done with a flag which indicates if this is the initial
+setup to allow the DAX flag to be properly set only at init time.
+
+So remove xfs_diflags_to_linux() and call the modified xfs_diflags_to_iflags()
+directly.
+
+While we are here simplify xfs_diflags_to_iflags() to take struct xfs_inode and
+use xfs_ip2xflags() to ensure future diflags are included correctly.
+
+	Reviewed-by: Dave Chinner <dchinner@redhat.com>
+	Reviewed-by: Darrick J. Wong <darrick.wong@oracle.com>
+	Signed-off-by: Ira Weiny <ira.weiny@intel.com>
+	Signed-off-by: Darrick J. Wong <darrick.wong@oracle.com>
+(cherry picked from commit 840d493dff1abb0cb0d73417148a3eeecd5f30d9)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/xfs/xfs_iops.c
+diff --cc fs/xfs/xfs_iops.c
+index 841eb213b84c,26a71237d70f..000000000000
+--- a/fs/xfs/xfs_iops.c
++++ b/fs/xfs/xfs_iops.c
+@@@ -1255,29 -1251,54 +1255,50 @@@ xfs_inode_supports_dax
+  		return false;
+  
+  	/* Device has to support DAX too. */
+ -	return xfs_inode_buftarg(ip)->bt_daxdev != NULL;
+ -}
+ -
+ -static bool
+ -xfs_inode_should_enable_dax(
+ -	struct xfs_inode *ip)
+ -{
+ -	if (!IS_ENABLED(CONFIG_FS_DAX))
+ -		return false;
+ -	if (ip->i_mount->m_flags & XFS_MOUNT_DAX_NEVER)
+ -		return false;
+ -	if (!xfs_inode_supports_dax(ip))
+ -		return false;
+ -	if (ip->i_mount->m_flags & XFS_MOUNT_DAX_ALWAYS)
+ -		return true;
+ -	if (ip->i_d.di_flags2 & XFS_DIFLAG2_DAX)
+ -		return true;
+ -	return false;
+ +	return xfs_find_daxdev_for_inode(VFS_I(ip)) != NULL;
+  }
+  
+- STATIC void
++ void
+  xfs_diflags_to_iflags(
+- 	struct inode		*inode,
+- 	struct xfs_inode	*ip)
++ 	struct xfs_inode	*ip,
++ 	bool init)
+  {
+- 	uint16_t		flags = ip->i_d.di_flags;
++ 	struct inode            *inode = VFS_I(ip);
++ 	unsigned int            xflags = xfs_ip2xflags(ip);
++ 	unsigned int            flags = 0;
+  
+- 	inode->i_flags &= ~(S_IMMUTABLE | S_APPEND | S_SYNC |
+- 			    S_NOATIME | S_DAX);
++ 	ASSERT(!(IS_DAX(inode) && init));
+  
+++<<<<<<< HEAD
+ +	if (flags & XFS_DIFLAG_IMMUTABLE)
+ +		inode->i_flags |= S_IMMUTABLE;
+ +	if (flags & XFS_DIFLAG_APPEND)
+ +		inode->i_flags |= S_APPEND;
+ +	if (flags & XFS_DIFLAG_SYNC)
+ +		inode->i_flags |= S_SYNC;
+ +	if (flags & XFS_DIFLAG_NOATIME)
+ +		inode->i_flags |= S_NOATIME;
+ +	if (xfs_inode_supports_dax(ip))
+ +		inode->i_flags |= S_DAX;
+++=======
++ 	if (xflags & FS_XFLAG_IMMUTABLE)
++ 		flags |= S_IMMUTABLE;
++ 	if (xflags & FS_XFLAG_APPEND)
++ 		flags |= S_APPEND;
++ 	if (xflags & FS_XFLAG_SYNC)
++ 		flags |= S_SYNC;
++ 	if (xflags & FS_XFLAG_NOATIME)
++ 		flags |= S_NOATIME;
++ 	if (init && xfs_inode_should_enable_dax(ip))
++ 		flags |= S_DAX;
++ 
++ 	/*
++ 	 * S_DAX can only be set during inode initialization and is never set by
++ 	 * the VFS, so we cannot mask off S_DAX in i_flags.
++ 	 */
++ 	inode->i_flags &= ~(S_IMMUTABLE | S_APPEND | S_SYNC | S_NOATIME);
++ 	inode->i_flags |= flags;
+++>>>>>>> 840d493dff1a (fs/xfs: Combine xfs_diflags_to_linux() and xfs_diflags_to_iflags())
+  }
+  
+  /*
+@@@ -1300,13 -1321,10 +1321,13 @@@ xfs_setup_inode
+  
+  	inode_sb_list_add(inode);
+  	/* make the inode look hashed for the writeback code */
+ -	inode_fake_hash(inode);
+ +	hlist_add_fake(&inode->i_hash);
+ +
+ +	inode->i_uid    = xfs_uid_to_kuid(ip->i_d.di_uid);
+ +	inode->i_gid    = xfs_gid_to_kgid(ip->i_d.di_gid);
+  
+  	i_size_write(inode, ip->i_d.di_size);
+- 	xfs_diflags_to_iflags(inode, ip);
++ 	xfs_diflags_to_iflags(ip, true);
+  
+  	if (S_ISDIR(inode->i_mode)) {
+  		/*
+diff --git a/fs/xfs/xfs_inode.h b/fs/xfs/xfs_inode.h
+index 0815406c74fa..9d86d7687d1f 100644
+--- a/fs/xfs/xfs_inode.h
++++ b/fs/xfs/xfs_inode.h
+@@ -478,6 +478,7 @@ int	xfs_break_layouts(struct inode *inode, uint *iolock,
+ /* from xfs_iops.c */
+ extern void xfs_setup_inode(struct xfs_inode *ip);
+ extern void xfs_setup_iops(struct xfs_inode *ip);
++extern void xfs_diflags_to_iflags(struct xfs_inode *ip, bool init);
+ 
+ /*
+  * When setting up a newly allocated inode, we need to call
+diff --git a/fs/xfs/xfs_ioctl.c b/fs/xfs/xfs_ioctl.c
+index 44d791730753..8ddf3e3896e3 100644
+--- a/fs/xfs/xfs_ioctl.c
++++ b/fs/xfs/xfs_ioctl.c
+@@ -1161,37 +1161,6 @@ xfs_flags2diflags2(
+ 	return di_flags2;
+ }
+ 
+-STATIC void
+-xfs_diflags_to_linux(
+-	struct xfs_inode	*ip)
+-{
+-	struct inode		*inode = VFS_I(ip);
+-	unsigned int		xflags = xfs_ip2xflags(ip);
+-
+-	if (xflags & FS_XFLAG_IMMUTABLE)
+-		inode->i_flags |= S_IMMUTABLE;
+-	else
+-		inode->i_flags &= ~S_IMMUTABLE;
+-	if (xflags & FS_XFLAG_APPEND)
+-		inode->i_flags |= S_APPEND;
+-	else
+-		inode->i_flags &= ~S_APPEND;
+-	if (xflags & FS_XFLAG_SYNC)
+-		inode->i_flags |= S_SYNC;
+-	else
+-		inode->i_flags &= ~S_SYNC;
+-	if (xflags & FS_XFLAG_NOATIME)
+-		inode->i_flags |= S_NOATIME;
+-	else
+-		inode->i_flags &= ~S_NOATIME;
+-#if 0	/* disabled until the flag switching races are sorted out */
+-	if (xflags & FS_XFLAG_DAX)
+-		inode->i_flags |= S_DAX;
+-	else
+-		inode->i_flags &= ~S_DAX;
+-#endif
+-}
+-
+ static int
+ xfs_ioctl_setattr_xflags(
+ 	struct xfs_trans	*tp,
+@@ -1238,7 +1207,7 @@ xfs_ioctl_setattr_xflags(
+ 	ip->i_d.di_flags = xfs_flags2diflags(ip, fa->fsx_xflags);
+ 	ip->i_d.di_flags2 = di_flags2;
+ 
+-	xfs_diflags_to_linux(ip);
++	xfs_diflags_to_iflags(ip, false);
+ 	xfs_trans_ichgtime(tp, ip, XFS_ICHGTIME_CHG);
+ 	xfs_trans_log_inode(tp, ip, XFS_ILOG_CORE);
+ 	XFS_STATS_INC(mp, xs_ig_attrchg);
+* Unmerged path fs/xfs/xfs_iops.c
