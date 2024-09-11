@@ -1,0 +1,180 @@
+net/ipv6: Add support for dumping addresses for a specific device
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-147.el8
+Rebuild_CHGLOG: - [net] ipv6: Add support for dumping addresses for a specific device (Petr Oros) [1700306]
+Rebuild_FUZZ: 96.83%
+commit-author David Ahern <dsahern@gmail.com>
+commit 6371a71f3a3b2bc47880dd76c2f176495802d0df
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-147.el8/6371a71f.failed
+
+If an RTM_GETADDR dump request has ifa_index set in the ifaddrmsg
+header, then return only the addresses for that device.
+
+Since inet6_dump_addr is reused for multicast and anycast addresses,
+this adds support for device specfic dumps of RTM_GETMULTICAST and
+RTM_GETANYCAST as well.
+
+	Signed-off-by: David Ahern <dsahern@gmail.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 6371a71f3a3b2bc47880dd76c2f176495802d0df)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/ipv6/addrconf.c
+diff --cc net/ipv6/addrconf.c
+index ff031adf9e83,45b84dd5c4eb..000000000000
+--- a/net/ipv6/addrconf.c
++++ b/net/ipv6/addrconf.c
+@@@ -4817,9 -4809,24 +4817,28 @@@ static inline int inet6_ifaddr_msgsize(
+  	       + nla_total_size(4)  /* IFA_RT_PRIORITY */;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ enum addr_type_t {
++ 	UNICAST_ADDR,
++ 	MULTICAST_ADDR,
++ 	ANYCAST_ADDR,
++ };
++ 
++ struct inet6_fill_args {
++ 	u32 portid;
++ 	u32 seq;
++ 	int event;
++ 	unsigned int flags;
++ 	int netnsid;
++ 	int ifindex;
++ 	enum addr_type_t type;
++ };
++ 
+++>>>>>>> 6371a71f3a3b (net/ipv6: Add support for dumping addresses for a specific device)
+  static int inet6_fill_ifaddr(struct sk_buff *skb, struct inet6_ifaddr *ifa,
+ -			     struct inet6_fill_args *args)
+ +			     u32 portid, u32 seq, int event, unsigned int flags,
+ +			     int netnsid)
+  {
+  	struct nlmsghdr  *nlh;
+  	u32 preferred, valid;
+@@@ -5019,6 -5016,61 +5038,64 @@@ next
+  	return err;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static int inet6_valid_dump_ifaddr_req(const struct nlmsghdr *nlh,
++ 				       struct inet6_fill_args *fillargs,
++ 				       struct net **tgt_net, struct sock *sk,
++ 				       struct netlink_callback *cb)
++ {
++ 	struct netlink_ext_ack *extack = cb->extack;
++ 	struct nlattr *tb[IFA_MAX+1];
++ 	struct ifaddrmsg *ifm;
++ 	int err, i;
++ 
++ 	if (nlh->nlmsg_len < nlmsg_msg_size(sizeof(*ifm))) {
++ 		NL_SET_ERR_MSG_MOD(extack, "Invalid header for address dump request");
++ 		return -EINVAL;
++ 	}
++ 
++ 	ifm = nlmsg_data(nlh);
++ 	if (ifm->ifa_prefixlen || ifm->ifa_flags || ifm->ifa_scope) {
++ 		NL_SET_ERR_MSG_MOD(extack, "Invalid values in header for address dump request");
++ 		return -EINVAL;
++ 	}
++ 
++ 	fillargs->ifindex = ifm->ifa_index;
++ 	if (fillargs->ifindex) {
++ 		cb->answer_flags |= NLM_F_DUMP_FILTERED;
++ 		fillargs->flags |= NLM_F_DUMP_FILTERED;
++ 	}
++ 
++ 	err = nlmsg_parse_strict(nlh, sizeof(*ifm), tb, IFA_MAX,
++ 				 ifa_ipv6_policy, extack);
++ 	if (err < 0)
++ 		return err;
++ 
++ 	for (i = 0; i <= IFA_MAX; ++i) {
++ 		if (!tb[i])
++ 			continue;
++ 
++ 		if (i == IFA_TARGET_NETNSID) {
++ 			struct net *net;
++ 
++ 			fillargs->netnsid = nla_get_s32(tb[i]);
++ 			net = rtnl_get_net_ns_capable(sk, fillargs->netnsid);
++ 			if (IS_ERR(net)) {
++ 				NL_SET_ERR_MSG_MOD(extack, "Invalid target network namespace id");
++ 				return PTR_ERR(net);
++ 			}
++ 			*tgt_net = net;
++ 		} else {
++ 			NL_SET_ERR_MSG_MOD(extack, "Unsupported attribute in dump request");
++ 			return -EINVAL;
++ 		}
++ 	}
++ 
++ 	return 0;
++ }
++ 
+++>>>>>>> 6371a71f3a3b (net/ipv6: Add support for dumping addresses for a specific device)
+  static int inet6_dump_addr(struct sk_buff *skb, struct netlink_callback *cb,
+  			   enum addr_type_t type)
+  {
+@@@ -5035,16 -5092,26 +5112,34 @@@
+  
+  	s_h = cb->args[0];
+  	s_idx = idx = cb->args[1];
+ -	s_ip_idx = cb->args[2];
+ -
+ -	if (cb->strict_check) {
+ -		int err;
+ -
+ +	s_ip_idx = ip_idx = cb->args[2];
+ +
+ +	if (nlmsg_parse(cb->nlh, sizeof(struct ifaddrmsg), tb, IFA_MAX,
+ +			ifa_ipv6_policy, NULL) >= 0) {
+ +		if (tb[IFA_TARGET_NETNSID]) {
+ +			netnsid = nla_get_s32(tb[IFA_TARGET_NETNSID]);
+ +
+++<<<<<<< HEAD
+ +			tgt_net = rtnl_get_net_ns_capable(skb->sk, netnsid);
+ +			if (IS_ERR(tgt_net))
+ +				return PTR_ERR(tgt_net);
+++=======
++ 		err = inet6_valid_dump_ifaddr_req(nlh, &fillargs, &tgt_net,
++ 						  skb->sk, cb);
++ 		if (err < 0)
++ 			return err;
++ 
++ 		if (fillargs.ifindex) {
++ 			dev = __dev_get_by_index(tgt_net, fillargs.ifindex);
++ 			if (!dev)
++ 				return -ENODEV;
++ 			idev = __in6_dev_get(dev);
++ 			if (idev) {
++ 				err = in6_dump_addrs(idev, skb, cb, s_ip_idx,
++ 						     &fillargs);
++ 			}
++ 			goto put_tgt_net;
+++>>>>>>> 6371a71f3a3b (net/ipv6: Add support for dumping addresses for a specific device)
+  		}
+  	}
+  
+@@@ -5074,8 -5140,8 +5169,13 @@@ done
+  	rcu_read_unlock();
+  	cb->args[0] = h;
+  	cb->args[1] = idx;
+++<<<<<<< HEAD
+ +	cb->args[2] = ip_idx;
+ +	if (netnsid >= 0)
+++=======
++ put_tgt_net:
++ 	if (fillargs.netnsid >= 0)
+++>>>>>>> 6371a71f3a3b (net/ipv6: Add support for dumping addresses for a specific device)
+  		put_net(tgt_net);
+  
+  	return skb->len;
+* Unmerged path net/ipv6/addrconf.c
