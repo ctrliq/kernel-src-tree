@@ -1,0 +1,267 @@
+sched/core: Further clarify sched_class::set_next_task()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Peter Zijlstra <peterz@infradead.org>
+commit a0e813f26ebcb25c0b5e504498fbd796cca1a4ba
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/a0e813f2.failed
+
+It turns out there really is something special to the first
+set_next_task() invocation. In specific the 'change' pattern really
+should not cause balance callbacks.
+
+	Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+	Cc: Linus Torvalds <torvalds@linux-foundation.org>
+	Cc: Peter Zijlstra <peterz@infradead.org>
+	Cc: Thomas Gleixner <tglx@linutronix.de>
+	Cc: bsegall@google.com
+	Cc: dietmar.eggemann@arm.com
+	Cc: juri.lelli@redhat.com
+	Cc: ktkhai@virtuozzo.com
+	Cc: mgorman@suse.de
+	Cc: qais.yousef@arm.com
+	Cc: qperret@google.com
+	Cc: rostedt@goodmis.org
+	Cc: valentin.schneider@arm.com
+	Cc: vincent.guittot@linaro.org
+Fixes: f95d4eaee6d0 ("sched/{rt,deadline}: Fix set_next_task vs pick_next_task")
+Link: https://lkml.kernel.org/r/20191108131909.775434698@infradead.org
+	Signed-off-by: Ingo Molnar <mingo@kernel.org>
+(cherry picked from commit a0e813f26ebcb25c0b5e504498fbd796cca1a4ba)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	kernel/sched/deadline.c
+#	kernel/sched/idle.c
+#	kernel/sched/rt.c
+#	kernel/sched/sched.h
+#	kernel/sched/stop_task.c
+diff --cc kernel/sched/deadline.c
+index f6520d44abd2,43323f875cb9..000000000000
+--- a/kernel/sched/deadline.c
++++ b/kernel/sched/deadline.c
+@@@ -1754,53 -1773,19 +1757,57 @@@ static struct sched_dl_entity *pick_nex
+  	return rb_entry(left, struct sched_dl_entity, rb_node);
+  }
+  
+ -static struct task_struct *pick_next_task_dl(struct rq *rq)
+ +static struct task_struct *
+ +pick_next_task_dl(struct rq *rq, struct task_struct *prev, struct rq_flags *rf)
+  {
+  	struct sched_dl_entity *dl_se;
+ -	struct dl_rq *dl_rq = &rq->dl;
+  	struct task_struct *p;
+ +	struct dl_rq *dl_rq;
+ +
+ +	dl_rq = &rq->dl;
+ +
+ +	if (need_pull_dl_task(rq, prev)) {
+ +		/*
+ +		 * This is OK, because current is on_cpu, which avoids it being
+ +		 * picked for load-balance and preemption/IRQs are still
+ +		 * disabled avoiding further scheduler activity on it and we're
+ +		 * being very careful to re-start the picking loop.
+ +		 */
+ +		rq_unpin_lock(rq, rf);
+ +		pull_dl_task(rq);
+ +		rq_repin_lock(rq, rf);
+ +		/*
+ +		 * pull_dl_task() can drop (and re-acquire) rq->lock; this
+ +		 * means a stop task can slip in, in which case we need to
+ +		 * re-start task selection.
+ +		 */
+ +		if (rq->stop && task_on_rq_queued(rq->stop))
+ +			return RETRY_TASK;
+ +	}
+  
+ -	if (!sched_dl_runnable(rq))
+ +	/*
+ +	 * When prev is DL, we may throttle it in put_prev_task().
+ +	 * So, we update time before we check for dl_nr_running.
+ +	 */
+ +	if (prev->sched_class == &dl_sched_class)
+ +		update_curr_dl(rq);
+ +
+ +	if (unlikely(!dl_rq->dl_nr_running))
+  		return NULL;
+  
+ +	put_prev_task(rq, prev);
+ +
+  	dl_se = pick_next_dl_entity(rq, dl_rq);
+  	BUG_ON(!dl_se);
+ +
+  	p = dl_task_of(dl_se);
+++<<<<<<< HEAD
+ +
+ +	set_next_task_dl(rq, p);
+ +
+++=======
++ 	set_next_task_dl(rq, p, true);
+++>>>>>>> a0e813f26ebc (sched/core: Further clarify sched_class::set_next_task())
+  	return p;
+  }
+  
+diff --cc kernel/sched/idle.c
+index b77157291d47,428cd05c0b5d..000000000000
+--- a/kernel/sched/idle.c
++++ b/kernel/sched/idle.c
+@@@ -403,8 -395,7 +403,12 @@@ pick_next_task_idle(struct rq *rq, stru
+  {
+  	struct task_struct *next = rq->idle;
+  
+++<<<<<<< HEAD
+ +	put_prev_task(rq, prev);
+ +	set_next_task_idle(rq, next);
+++=======
++ 	set_next_task_idle(rq, next, true);
+++>>>>>>> a0e813f26ebc (sched/core: Further clarify sched_class::set_next_task())
+  
+  	return next;
+  }
+diff --cc kernel/sched/rt.c
+index 9a6c4d4cbc91,e591d40fd645..000000000000
+--- a/kernel/sched/rt.c
++++ b/kernel/sched/rt.c
+@@@ -1547,48 -1567,15 +1550,52 @@@ static struct task_struct *_pick_next_t
+  	return rt_task_of(rt_se);
+  }
+  
+ -static struct task_struct *pick_next_task_rt(struct rq *rq)
+ +static struct task_struct *
+ +pick_next_task_rt(struct rq *rq, struct task_struct *prev, struct rq_flags *rf)
+  {
+  	struct task_struct *p;
+ +	struct rt_rq *rt_rq = &rq->rt;
+ +
+ +	if (need_pull_rt_task(rq, prev)) {
+ +		/*
+ +		 * This is OK, because current is on_cpu, which avoids it being
+ +		 * picked for load-balance and preemption/IRQs are still
+ +		 * disabled avoiding further scheduler activity on it and we're
+ +		 * being very careful to re-start the picking loop.
+ +		 */
+ +		rq_unpin_lock(rq, rf);
+ +		pull_rt_task(rq);
+ +		rq_repin_lock(rq, rf);
+ +		/*
+ +		 * pull_rt_task() can drop (and re-acquire) rq->lock; this
+ +		 * means a dl or stop task can slip in, in which case we need
+ +		 * to re-start task selection.
+ +		 */
+ +		if (unlikely((rq->stop && task_on_rq_queued(rq->stop)) ||
+ +			     rq->dl.dl_nr_running))
+ +			return RETRY_TASK;
+ +	}
+ +
+ +	/*
+ +	 * We may dequeue prev's rt_rq in put_prev_task().
+ +	 * So, we update time before rt_nr_running check.
+ +	 */
+ +	if (prev->sched_class == &rt_sched_class)
+ +		update_curr_rt(rq);
+  
+ -	if (!sched_rt_runnable(rq))
+ +	if (!rt_rq->rt_queued)
+  		return NULL;
+  
+ +	put_prev_task(rq, prev);
+ +
+  	p = _pick_next_task_rt(rq);
+++<<<<<<< HEAD
+ +
+ +	set_next_task_rt(rq, p);
+ +
+++=======
++ 	set_next_task_rt(rq, p, true);
+++>>>>>>> a0e813f26ebc (sched/core: Further clarify sched_class::set_next_task())
+  	return p;
+  }
+  
+diff --cc kernel/sched/sched.h
+index 53610e62107c,05c282775f21..000000000000
+--- a/kernel/sched/sched.h
++++ b/kernel/sched/sched.h
+@@@ -1676,24 -1713,15 +1676,31 @@@ struct sched_class 
+  
+  	void (*check_preempt_curr)(struct rq *rq, struct task_struct *p, int flags);
+  
+++<<<<<<< HEAD
+ +	/*
+ +	 * It is the responsibility of the pick_next_task() method that will
+ +	 * return the next task to call put_prev_task() on the @prev task or
+ +	 * something equivalent.
+ +	 *
+ +	 * May return RETRY_TASK when it finds a higher prio class has runnable
+ +	 * tasks.
+ +	 */
+ +	struct task_struct * (*pick_next_task)(struct rq *rq,
+ +					       struct task_struct *prev,
+ +					       struct rq_flags *rf);
+ +	void (*put_prev_task)(struct rq *rq, struct task_struct *p, struct rq_flags *rf);
+ +	void (*set_next_task)(struct rq *rq, struct task_struct *p);
+++=======
++ 	struct task_struct *(*pick_next_task)(struct rq *rq);
++ 
++ 	void (*put_prev_task)(struct rq *rq, struct task_struct *p);
++ 	void (*set_next_task)(struct rq *rq, struct task_struct *p, bool first);
+++>>>>>>> a0e813f26ebc (sched/core: Further clarify sched_class::set_next_task())
+  
+  #ifdef CONFIG_SMP
+ -	int (*balance)(struct rq *rq, struct task_struct *prev, struct rq_flags *rf);
+  	int  (*select_task_rq)(struct task_struct *p, int task_cpu, int sd_flag, int flags);
+ -	void (*migrate_task_rq)(struct task_struct *p, int new_cpu);
+ +	RH_KABI_REPLACE(void (*migrate_task_rq)(struct task_struct *p),\
+ +			void (*migrate_task_rq)(struct task_struct *p, int new_cpu))
+  
+  	void (*task_woken)(struct rq *this_rq, struct task_struct *task);
+  
+diff --cc kernel/sched/stop_task.c
+index 8f414018d5e0,4c9e9975684f..000000000000
+--- a/kernel/sched/stop_task.c
++++ b/kernel/sched/stop_task.c
+@@@ -28,18 -34,13 +28,23 @@@ static void set_next_task_stop(struct r
+  	stop->se.exec_start = rq_clock_task(rq);
+  }
+  
+ -static struct task_struct *pick_next_task_stop(struct rq *rq)
+ +static struct task_struct *
+ +pick_next_task_stop(struct rq *rq, struct task_struct *prev, struct rq_flags *rf)
+  {
+ -	if (!sched_stop_runnable(rq))
+ +	struct task_struct *stop = rq->stop;
+ +
+ +	if (!stop || !task_on_rq_queued(stop))
+  		return NULL;
+  
+++<<<<<<< HEAD
+ +	put_prev_task(rq, prev);
+ +	set_next_task_stop(rq, stop);
+ +
+ +	return stop;
+++=======
++ 	set_next_task_stop(rq, rq->stop, true);
++ 	return rq->stop;
+++>>>>>>> a0e813f26ebc (sched/core: Further clarify sched_class::set_next_task())
+  }
+  
+  static void
+* Unmerged path kernel/sched/deadline.c
+diff --git a/kernel/sched/fair.c b/kernel/sched/fair.c
+index c4c9dbbb5bf3..eb1d574a3f23 100644
+--- a/kernel/sched/fair.c
++++ b/kernel/sched/fair.c
+@@ -10050,7 +10050,7 @@ static void switched_to_fair(struct rq *rq, struct task_struct *p)
+  * This routine is mostly called to set cfs_rq->curr field when a task
+  * migrates between groups/classes.
+  */
+-static void set_next_task_fair(struct rq *rq, struct task_struct *p)
++static void set_next_task_fair(struct rq *rq, struct task_struct *p, bool first)
+ {
+ 	struct sched_entity *se = &p->se;
+ 
+* Unmerged path kernel/sched/idle.c
+* Unmerged path kernel/sched/rt.c
+* Unmerged path kernel/sched/sched.h
+* Unmerged path kernel/sched/stop_task.c
