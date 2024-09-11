@@ -1,0 +1,144 @@
+KVM: x86/mmu: Don't leak non-leaf SPTEs when zapping all SPTEs
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-408.el8
+commit-author Sean Christopherson <seanjc@google.com>
+commit 524a1e4e381fc5e7781008d5bd420fd1357c0113
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-408.el8/524a1e4e.failed
+
+Pass "all ones" as the end GFN to signal "zap all" for the TDP MMU and
+really zap all SPTEs in this case.  As is, zap_gfn_range() skips non-leaf
+SPTEs whose range exceeds the range to be zapped.  If shadow_phys_bits is
+not aligned to the range size of top-level SPTEs, e.g. 512gb with 4-level
+paging, the "zap all" flows will skip top-level SPTEs whose range extends
+beyond shadow_phys_bits and leak their SPs when the VM is destroyed.
+
+Use the current upper bound (based on host.MAXPHYADDR) to detect that the
+caller wants to zap all SPTEs, e.g. instead of using the max theoretical
+gfn, 1 << (52 - 12).  The more precise upper bound allows the TDP iterator
+to terminate its walk earlier when running on hosts with MAXPHYADDR < 52.
+
+Add a WARN on kmv->arch.tdp_mmu_pages when the TDP MMU is destroyed to
+help future debuggers should KVM decide to leak SPTEs again.
+
+The bug is most easily reproduced by running (and unloading!) KVM in a
+VM whose host.MAXPHYADDR < 39, as the SPTE for gfn=0 will be skipped.
+
+  =============================================================================
+  BUG kvm_mmu_page_header (Not tainted): Objects remaining in kvm_mmu_page_header on __kmem_cache_shutdown()
+  -----------------------------------------------------------------------------
+  Slab 0x000000004d8f7af1 objects=22 used=2 fp=0x00000000624d29ac flags=0x4000000000000200(slab|zone=1)
+  CPU: 0 PID: 1582 Comm: rmmod Not tainted 5.14.0-rc2+ #420
+  Hardware name: QEMU Standard PC (Q35 + ICH9, 2009), BIOS 0.0.0 02/06/2015
+  Call Trace:
+   dump_stack_lvl+0x45/0x59
+   slab_err+0x95/0xc9
+   __kmem_cache_shutdown.cold+0x3c/0x158
+   kmem_cache_destroy+0x3d/0xf0
+   kvm_mmu_module_exit+0xa/0x30 [kvm]
+   kvm_arch_exit+0x5d/0x90 [kvm]
+   kvm_exit+0x78/0x90 [kvm]
+   vmx_exit+0x1a/0x50 [kvm_intel]
+   __x64_sys_delete_module+0x13f/0x220
+   do_syscall_64+0x3b/0xc0
+   entry_SYSCALL_64_after_hwframe+0x44/0xae
+
+Fixes: faaf05b00aec ("kvm: x86/mmu: Support zapping SPTEs in the TDP MMU")
+	Cc: stable@vger.kernel.org
+	Cc: Ben Gardon <bgardon@google.com>
+	Signed-off-by: Sean Christopherson <seanjc@google.com>
+Message-Id: <20210812181414.3376143-2-seanjc@google.com>
+	Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+(cherry picked from commit 524a1e4e381fc5e7781008d5bd420fd1357c0113)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kvm/mmu/tdp_mmu.c
+diff --cc arch/x86/kvm/mmu/tdp_mmu.c
+index 506d3bdb9486,8783b9eb2b33..000000000000
+--- a/arch/x86/kvm/mmu/tdp_mmu.c
++++ b/arch/x86/kvm/mmu/tdp_mmu.c
+@@@ -66,11 -79,10 +67,15 @@@ static void tdp_mmu_free_sp_rcu_callbac
+  	tdp_mmu_free_sp(sp);
+  }
+  
+ -void kvm_tdp_mmu_put_root(struct kvm *kvm, struct kvm_mmu_page *root,
+ -			  bool shared)
+ +void kvm_tdp_mmu_put_root(struct kvm *kvm, struct kvm_mmu_page *root)
+  {
+++<<<<<<< HEAD
+ +	gfn_t max_gfn = 1ULL << (shadow_phys_bits - PAGE_SHIFT);
+ +
+ +	lockdep_assert_held_write(&kvm->mmu_lock);
+++=======
++ 	kvm_lockdep_assert_mmu_lock_held(kvm, shared);
+++>>>>>>> 524a1e4e381f (KVM: x86/mmu: Don't leak non-leaf SPTEs when zapping all SPTEs)
+  
+  	if (!refcount_dec_and_test(&root->tdp_mmu_root_count))
+  		return;
+@@@ -81,7 -93,7 +86,11 @@@
+  	list_del_rcu(&root->link);
+  	spin_unlock(&kvm->arch.tdp_mmu_pages_lock);
+  
+++<<<<<<< HEAD
+ +	zap_gfn_range(kvm, root, 0, max_gfn, false, false);
+++=======
++ 	zap_gfn_range(kvm, root, 0, -1ull, false, false, shared);
+++>>>>>>> 524a1e4e381f (KVM: x86/mmu: Don't leak non-leaf SPTEs when zapping all SPTEs)
+  
+  	call_rcu(&root->rcu_head, tdp_mmu_free_sp_rcu_callback);
+  }
+@@@ -691,15 -712,30 +700,29 @@@ static inline bool __must_check tdp_mmu
+   * scheduler needs the CPU or there is contention on the MMU lock. If this
+   * function cannot yield, it will not release the MMU lock or reschedule and
+   * the caller must ensure it does not supply too large a GFN range, or the
+ - * operation can cause a soft lockup.
+ - *
+ - * If shared is true, this thread holds the MMU lock in read mode and must
+ - * account for the possibility that other threads are modifying the paging
+ - * structures concurrently. If shared is false, this thread should hold the
+ - * MMU lock in write mode.
+ + * operation can cause a soft lockup.  Note, in some use cases a flush may be
+ + * required by prior actions.  Ensure the pending flush is performed prior to
+ + * yielding.
+   */
+  static bool zap_gfn_range(struct kvm *kvm, struct kvm_mmu_page *root,
+ -			  gfn_t start, gfn_t end, bool can_yield, bool flush,
+ -			  bool shared)
+ +			  gfn_t start, gfn_t end, bool can_yield, bool flush)
+  {
++ 	gfn_t max_gfn_host = 1ULL << (shadow_phys_bits - PAGE_SHIFT);
++ 	bool zap_all = (start == 0 && end >= max_gfn_host);
+  	struct tdp_iter iter;
+  
+++<<<<<<< HEAD
+++=======
++ 	/*
++ 	 * Bound the walk at host.MAXPHYADDR, guest accesses beyond that will
++ 	 * hit a #PF(RSVD) and never get to an EPT Violation/Misconfig / #NPF,
++ 	 * and so KVM will never install a SPTE for such addresses.
++ 	 */
++ 	end = min(end, max_gfn_host);
++ 
++ 	kvm_lockdep_assert_mmu_lock_held(kvm, shared);
++ 
+++>>>>>>> 524a1e4e381f (KVM: x86/mmu: Don't leak non-leaf SPTEs when zapping all SPTEs)
+  	rcu_read_lock();
+  
+  	tdp_root_for_each_pte(iter, root, start, end) {
+@@@ -754,7 -807,8 +777,12 @@@ void kvm_tdp_mmu_zap_all(struct kvm *kv
+  	int i;
+  
+  	for (i = 0; i < KVM_ADDRESS_SPACE_NUM; i++)
+++<<<<<<< HEAD
+ +		flush = kvm_tdp_mmu_zap_gfn_range(kvm, i, 0, max_gfn, flush);
+++=======
++ 		flush = kvm_tdp_mmu_zap_gfn_range(kvm, i, 0, -1ull,
++ 						  flush, false);
+++>>>>>>> 524a1e4e381f (KVM: x86/mmu: Don't leak non-leaf SPTEs when zapping all SPTEs)
+  
+  	if (flush)
+  		kvm_flush_remote_tlbs(kvm);
+* Unmerged path arch/x86/kvm/mmu/tdp_mmu.c
