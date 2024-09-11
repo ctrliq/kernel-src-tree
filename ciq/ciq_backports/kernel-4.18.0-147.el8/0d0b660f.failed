@@ -1,0 +1,245 @@
+nvme: add ANA support
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-147.el8
+commit-author Christoph Hellwig <hch@lst.de>
+commit 0d0b660f214dc4905db7b6bc998bad0c16dfb1ba
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-147.el8/0d0b660f.failed
+
+Add support for Asynchronous Namespace Access as specified in NVMe 1.3
+TP 4004.  With ANA each namespace attached to a controller belongs to an
+ANA group that describes the characteristics of accessing the namespaces
+through this controller.  In the optimized and non-optimized states
+namespaces can be accessed regularly, although in a multi-pathing
+environment we should always prefer to access a namespace through a
+controller where an optimized relationship exists.  Namespaces in
+Inaccessible, Permanent-Loss or Change state for a given controller
+should not be accessed.
+
+The states are updated through reading the ANA log page, which is read
+once during controller initialization, whenever the ANA change notice
+AEN is received, or when one of the ANA specific status codes that
+signal a state change is received on a command.
+
+The ANA state is kept in the nvme_ns structure, which makes the checks in
+the fast path very simple.  Updating the ANA state when reading the log
+page is also very simple, the only downside is that finding the initial
+ANA state when scanning for namespaces is a bit cumbersome.
+
+The gendisk for a ns_head is only registered once a live path for it
+exists.  Without that the kernel would hang during partition scanning.
+
+Includes fixes and improvements from Hannes Reinecke.
+
+	Signed-off-by: Christoph Hellwig <hch@lst.de>
+	Reviewed-by: Keith Busch <keith.busch@intel.com>
+	Reviewed-by: Martin K. Petersen <martin.petersen@oracle.com>
+	Reviewed-by: Johannes Thumshirn <jthumshirn@suse.de>
+(cherry picked from commit 0d0b660f214dc4905db7b6bc998bad0c16dfb1ba)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/nvme/host/core.c
+#	drivers/nvme/host/multipath.c
+diff --cc drivers/nvme/host/core.c
+index 4726c694b7b8,e62592c949ab..000000000000
+--- a/drivers/nvme/host/core.c
++++ b/drivers/nvme/host/core.c
+@@@ -1086,17 -1039,14 +1086,28 @@@ EXPORT_SYMBOL_GPL(nvme_set_queue_count)
+  
+  static void nvme_enable_aen(struct nvme_ctrl *ctrl)
+  {
+++<<<<<<< HEAD
+ +	u32 result, supported_aens = ctrl->oaes & NVME_AEN_SUPPORTED;
+ +	int status;
+ +
+ +	if (!supported_aens)
+ +		return;
+ +
+ +	status = nvme_set_features(ctrl, NVME_FEAT_ASYNC_EVENT, supported_aens,
+ +			NULL, 0, &result);
+ +	if (status)
+ +		dev_warn(ctrl->device, "Failed to configure AEN (cfg %x)\n",
+ +			 supported_aens);
+++=======
++ 	u32 supported = ctrl->oaes & NVME_AEN_SUPPORTED, result;
++ 	int status;
++ 
++ 	status = nvme_set_features(ctrl, NVME_FEAT_ASYNC_EVENT, supported, NULL,
++ 			0, &result);
++ 	if (status)
++ 		dev_warn(ctrl->device, "Failed to configure AEN (cfg %x)\n",
++ 			 supported);
+++>>>>>>> 0d0b660f214d (nvme: add ANA support)
+  }
+  
+  static int nvme_submit_io(struct nvme_ns *ns, struct nvme_user_io __user *uio)
+@@@ -3456,8 -3420,10 +3491,9 @@@ EXPORT_SYMBOL_GPL(nvme_complete_async_e
+  
+  void nvme_stop_ctrl(struct nvme_ctrl *ctrl)
+  {
++ 	nvme_mpath_stop(ctrl);
+  	nvme_stop_keep_alive(ctrl);
+  	flush_work(&ctrl->async_event_work);
+ -	flush_work(&ctrl->scan_work);
+  	cancel_work_sync(&ctrl->fw_act_work);
+  	if (ctrl->ops->stop_ctrl)
+  		ctrl->ops->stop_ctrl(ctrl);
+diff --cc drivers/nvme/host/multipath.c
+index 1b128a2a399e,c643872f8dac..000000000000
+--- a/drivers/nvme/host/multipath.c
++++ b/drivers/nvme/host/multipath.c
+@@@ -126,6 -185,21 +185,24 @@@ static blk_qc_t nvme_ns_head_make_reque
+  	return ret;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static bool nvme_ns_head_poll(struct request_queue *q, blk_qc_t qc)
++ {
++ 	struct nvme_ns_head *head = q->queuedata;
++ 	struct nvme_ns *ns;
++ 	bool found = false;
++ 	int srcu_idx;
++ 
++ 	srcu_idx = srcu_read_lock(&head->srcu);
++ 	ns = srcu_dereference(head->current_path, &head->srcu);
++ 	if (likely(ns && nvme_path_is_optimized(ns)))
++ 		found = ns->queue->poll_fn(q, qc);
++ 	srcu_read_unlock(&head->srcu, srcu_idx);
++ 	return found;
++ }
++ 
+++>>>>>>> 0d0b660f214d (nvme: add ANA support)
+  static void nvme_requeue_work(struct work_struct *work)
+  {
+  	struct nvme_ns_head *head =
+* Unmerged path drivers/nvme/host/core.c
+* Unmerged path drivers/nvme/host/multipath.c
+diff --git a/drivers/nvme/host/nvme.h b/drivers/nvme/host/nvme.h
+index 43c5bb60abbc..dd214798fb69 100644
+--- a/drivers/nvme/host/nvme.h
++++ b/drivers/nvme/host/nvme.h
+@@ -177,6 +177,7 @@ struct nvme_ctrl {
+ 	u16 oacs;
+ 	u16 nssa;
+ 	u16 nr_streams;
++	u32 max_namespaces;
+ 	atomic_t abort_limit;
+ 	u8 vwc;
+ 	u32 vs;
+@@ -199,6 +200,19 @@ struct nvme_ctrl {
+ 	struct work_struct fw_act_work;
+ 	unsigned long events;
+ 
++#ifdef CONFIG_NVME_MULTIPATH
++	/* asymmetric namespace access: */
++	u8 anacap;
++	u8 anatt;
++	u32 anagrpmax;
++	u32 nanagrpid;
++	struct mutex ana_lock;
++	struct nvme_ana_rsp_hdr *ana_log_buf;
++	size_t ana_log_size;
++	struct timer_list anatt_timer;
++	struct work_struct ana_work;
++#endif
++
+ 	/* Power saving configuration */
+ 	u64 ps_max_latency_us;
+ 	bool apst_enabled;
+@@ -263,6 +277,7 @@ struct nvme_ns_head {
+ 	struct bio_list		requeue_list;
+ 	spinlock_t		requeue_lock;
+ 	struct work_struct	requeue_work;
++	struct mutex		lock;
+ #endif
+ 	struct list_head	list;
+ 	struct srcu_struct      srcu;
+@@ -289,6 +304,10 @@ struct nvme_ns {
+ 	struct nvme_ctrl *ctrl;
+ 	struct request_queue *queue;
+ 	struct gendisk *disk;
++#ifdef CONFIG_NVME_MULTIPATH
++	enum nvme_ana_state ana_state;
++	u32 ana_grpid;
++#endif
+ 	struct list_head siblings;
+ 	struct nvm_dev *ndev;
+ 	struct kref kref;
+@@ -301,8 +320,9 @@ struct nvme_ns {
+ 	bool ext;
+ 	u8 pi_type;
+ 	unsigned long flags;
+-#define NVME_NS_REMOVING 0
+-#define NVME_NS_DEAD     1
++#define NVME_NS_REMOVING	0
++#define NVME_NS_DEAD     	1
++#define NVME_NS_ANA_PENDING	2
+ 	u16 noiob;
+ 
+ #ifdef CONFIG_FAULT_INJECTION_DEBUG_FS
+@@ -438,13 +458,17 @@ extern const struct attribute_group nvme_ns_id_attr_group;
+ extern const struct block_device_operations nvme_ns_head_ops;
+ 
+ #ifdef CONFIG_NVME_MULTIPATH
++bool nvme_ctrl_use_ana(struct nvme_ctrl *ctrl);
+ void nvme_set_disk_name(char *disk_name, struct nvme_ns *ns,
+ 			struct nvme_ctrl *ctrl, int *flags);
+ void nvme_failover_req(struct request *req);
+ void nvme_kick_requeue_lists(struct nvme_ctrl *ctrl);
+ int nvme_mpath_alloc_disk(struct nvme_ctrl *ctrl,struct nvme_ns_head *head);
+-void nvme_mpath_add_disk(struct nvme_ns_head *head);
++void nvme_mpath_add_disk(struct nvme_ns *ns, struct nvme_id_ns *id);
+ void nvme_mpath_remove_disk(struct nvme_ns_head *head);
++int nvme_mpath_init(struct nvme_ctrl *ctrl, struct nvme_id_ctrl *id);
++void nvme_mpath_uninit(struct nvme_ctrl *ctrl);
++void nvme_mpath_stop(struct nvme_ctrl *ctrl);
+ 
+ static inline void nvme_mpath_clear_current_path(struct nvme_ns *ns)
+ {
+@@ -463,7 +487,14 @@ static inline void nvme_mpath_check_last_path(struct nvme_ns *ns)
+ 		kblockd_schedule_work(&head->requeue_work);
+ }
+ 
++extern struct device_attribute dev_attr_ana_grpid;
++extern struct device_attribute dev_attr_ana_state;
++
+ #else
++static inline bool nvme_ctrl_use_ana(struct nvme_ctrl *ctrl)
++{
++	return false;
++}
+ /*
+  * Without the multipath code enabled, multiple controller per subsystems are
+  * visible as devices and thus we cannot use the subsystem instance.
+@@ -485,7 +516,8 @@ static inline int nvme_mpath_alloc_disk(struct nvme_ctrl *ctrl,
+ {
+ 	return 0;
+ }
+-static inline void nvme_mpath_add_disk(struct nvme_ns_head *head)
++static inline void nvme_mpath_add_disk(struct nvme_ns *ns,
++		struct nvme_id_ns *id)
+ {
+ }
+ static inline void nvme_mpath_remove_disk(struct nvme_ns_head *head)
+@@ -497,6 +529,17 @@ static inline void nvme_mpath_clear_current_path(struct nvme_ns *ns)
+ static inline void nvme_mpath_check_last_path(struct nvme_ns *ns)
+ {
+ }
++static inline int nvme_mpath_init(struct nvme_ctrl *ctrl,
++		struct nvme_id_ctrl *id)
++{
++	return 0;
++}
++static inline void nvme_mpath_uninit(struct nvme_ctrl *ctrl)
++{
++}
++static inline void nvme_mpath_stop(struct nvme_ctrl *ctrl)
++{
++}
+ #endif /* CONFIG_NVME_MULTIPATH */
+ 
+ #ifdef CONFIG_NVM
