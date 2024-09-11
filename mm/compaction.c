@@ -1623,7 +1623,6 @@ static enum compact_result compact_zone(struct zone *zone, struct compact_contro
 			ret = COMPACT_CONTENDED;
 			putback_movable_pages(&cc->migratepages);
 			cc->nr_migratepages = 0;
-			last_migrated_pfn = 0;
 			goto out;
 		case ISOLATE_NONE:
 			if (update_cached) {
