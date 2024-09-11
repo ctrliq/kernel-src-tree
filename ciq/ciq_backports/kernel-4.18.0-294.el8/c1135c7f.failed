@@ -1,0 +1,308 @@
+Drivers: hv: vmbus: Introduce types of GPADL
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+Rebuild_CHGLOG: - [hv] hv: vmbus: Introduce types of GPADL (Mohammed Gamal) [1886096]
+Rebuild_FUZZ: 88.61%
+commit-author Boqun Feng <boqun.feng@gmail.com>
+commit c1135c7fd0e95740cd4619ce389f43ffce043140
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/c1135c7f.failed
+
+This patch introduces two types of GPADL: HV_GPADL_{BUFFER, RING}. The
+types of GPADL are purely the concept in the guest, IOW the hypervisor
+treat them as the same.
+
+The reason of introducing the types for GPADL is to support guests whose
+page size is not 4k (the page size of Hyper-V hypervisor). In these
+guests, both the headers and the data parts of the ringbuffers need to
+be aligned to the PAGE_SIZE, because 1) some of the ringbuffers will be
+mapped into userspace and 2) we use "double mapping" mechanism to
+support fast wrap-around, and "double mapping" relies on ringbuffers
+being page-aligned. However, the Hyper-V hypervisor only uses 4k
+(HV_HYP_PAGE_SIZE) headers. Our solution to this is that we always make
+the headers of ringbuffers take one guest page and when GPADL is
+established between the guest and hypervisor, the only first 4k of
+header is used. To handle this special case, we need the types of GPADL
+to differ different guest memory usage for GPADL.
+
+Type enum is introduced along with several general interfaces to
+describe the differences between normal buffer GPADL and ringbuffer
+GPADL.
+
+	Signed-off-by: Boqun Feng <boqun.feng@gmail.com>
+	Reviewed-by: Michael Kelley <mikelley@microsoft.com>
+Link: https://lore.kernel.org/r/20200916034817.30282-4-boqun.feng@gmail.com
+	Signed-off-by: Wei Liu <wei.liu@kernel.org>
+(cherry picked from commit c1135c7fd0e95740cd4619ce389f43ffce043140)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/hv/channel.c
+diff --cc drivers/hv/channel.c
+index f0d317877d05,45267b6d069e..000000000000
+--- a/drivers/hv/channel.c
++++ b/drivers/hv/channel.c
+@@@ -566,8 -499,184 +665,187 @@@ cleanup
+  	kfree(msginfo);
+  	return ret;
+  }
++ 
++ /*
++  * vmbus_establish_gpadl - Establish a GPADL for the specified buffer
++  *
++  * @channel: a channel
++  * @kbuffer: from kmalloc or vmalloc
++  * @size: page-size multiple
++  * @gpadl_handle: some funky thing
++  */
++ int vmbus_establish_gpadl(struct vmbus_channel *channel, void *kbuffer,
++ 			  u32 size, u32 *gpadl_handle)
++ {
++ 	return __vmbus_establish_gpadl(channel, HV_GPADL_BUFFER, kbuffer, size,
++ 				       0U, gpadl_handle);
++ }
+  EXPORT_SYMBOL_GPL(vmbus_establish_gpadl);
+  
+++<<<<<<< HEAD
+++=======
++ static int __vmbus_open(struct vmbus_channel *newchannel,
++ 		       void *userdata, u32 userdatalen,
++ 		       void (*onchannelcallback)(void *context), void *context)
++ {
++ 	struct vmbus_channel_open_channel *open_msg;
++ 	struct vmbus_channel_msginfo *open_info = NULL;
++ 	struct page *page = newchannel->ringbuffer_page;
++ 	u32 send_pages, recv_pages;
++ 	unsigned long flags;
++ 	int err;
++ 
++ 	if (userdatalen > MAX_USER_DEFINED_BYTES)
++ 		return -EINVAL;
++ 
++ 	send_pages = newchannel->ringbuffer_send_offset;
++ 	recv_pages = newchannel->ringbuffer_pagecount - send_pages;
++ 
++ 	if (newchannel->state != CHANNEL_OPEN_STATE)
++ 		return -EINVAL;
++ 
++ 	newchannel->state = CHANNEL_OPENING_STATE;
++ 	newchannel->onchannel_callback = onchannelcallback;
++ 	newchannel->channel_callback_context = context;
++ 
++ 	err = hv_ringbuffer_init(&newchannel->outbound, page, send_pages);
++ 	if (err)
++ 		goto error_clean_ring;
++ 
++ 	err = hv_ringbuffer_init(&newchannel->inbound,
++ 				 &page[send_pages], recv_pages);
++ 	if (err)
++ 		goto error_clean_ring;
++ 
++ 	/* Establish the gpadl for the ring buffer */
++ 	newchannel->ringbuffer_gpadlhandle = 0;
++ 
++ 	err = __vmbus_establish_gpadl(newchannel, HV_GPADL_RING,
++ 				      page_address(newchannel->ringbuffer_page),
++ 				      (send_pages + recv_pages) << PAGE_SHIFT,
++ 				      newchannel->ringbuffer_send_offset << PAGE_SHIFT,
++ 				      &newchannel->ringbuffer_gpadlhandle);
++ 	if (err)
++ 		goto error_clean_ring;
++ 
++ 	/* Create and init the channel open message */
++ 	open_info = kmalloc(sizeof(*open_info) +
++ 			   sizeof(struct vmbus_channel_open_channel),
++ 			   GFP_KERNEL);
++ 	if (!open_info) {
++ 		err = -ENOMEM;
++ 		goto error_free_gpadl;
++ 	}
++ 
++ 	init_completion(&open_info->waitevent);
++ 	open_info->waiting_channel = newchannel;
++ 
++ 	open_msg = (struct vmbus_channel_open_channel *)open_info->msg;
++ 	open_msg->header.msgtype = CHANNELMSG_OPENCHANNEL;
++ 	open_msg->openid = newchannel->offermsg.child_relid;
++ 	open_msg->child_relid = newchannel->offermsg.child_relid;
++ 	open_msg->ringbuffer_gpadlhandle = newchannel->ringbuffer_gpadlhandle;
++ 	/*
++ 	 * The unit of ->downstream_ringbuffer_pageoffset is HV_HYP_PAGE and
++ 	 * the unit of ->ringbuffer_send_offset (i.e. send_pages) is PAGE, so
++ 	 * here we calculate it into HV_HYP_PAGE.
++ 	 */
++ 	open_msg->downstream_ringbuffer_pageoffset =
++ 		hv_ring_gpadl_send_hvpgoffset(send_pages << PAGE_SHIFT);
++ 	open_msg->target_vp = hv_cpu_number_to_vp_number(newchannel->target_cpu);
++ 
++ 	if (userdatalen)
++ 		memcpy(open_msg->userdata, userdata, userdatalen);
++ 
++ 	spin_lock_irqsave(&vmbus_connection.channelmsg_lock, flags);
++ 	list_add_tail(&open_info->msglistentry,
++ 		      &vmbus_connection.chn_msg_list);
++ 	spin_unlock_irqrestore(&vmbus_connection.channelmsg_lock, flags);
++ 
++ 	if (newchannel->rescind) {
++ 		err = -ENODEV;
++ 		goto error_free_info;
++ 	}
++ 
++ 	err = vmbus_post_msg(open_msg,
++ 			     sizeof(struct vmbus_channel_open_channel), true);
++ 
++ 	trace_vmbus_open(open_msg, err);
++ 
++ 	if (err != 0)
++ 		goto error_clean_msglist;
++ 
++ 	wait_for_completion(&open_info->waitevent);
++ 
++ 	spin_lock_irqsave(&vmbus_connection.channelmsg_lock, flags);
++ 	list_del(&open_info->msglistentry);
++ 	spin_unlock_irqrestore(&vmbus_connection.channelmsg_lock, flags);
++ 
++ 	if (newchannel->rescind) {
++ 		err = -ENODEV;
++ 		goto error_free_info;
++ 	}
++ 
++ 	if (open_info->response.open_result.status) {
++ 		err = -EAGAIN;
++ 		goto error_free_info;
++ 	}
++ 
++ 	newchannel->state = CHANNEL_OPENED_STATE;
++ 	kfree(open_info);
++ 	return 0;
++ 
++ error_clean_msglist:
++ 	spin_lock_irqsave(&vmbus_connection.channelmsg_lock, flags);
++ 	list_del(&open_info->msglistentry);
++ 	spin_unlock_irqrestore(&vmbus_connection.channelmsg_lock, flags);
++ error_free_info:
++ 	kfree(open_info);
++ error_free_gpadl:
++ 	vmbus_teardown_gpadl(newchannel, newchannel->ringbuffer_gpadlhandle);
++ 	newchannel->ringbuffer_gpadlhandle = 0;
++ error_clean_ring:
++ 	hv_ringbuffer_cleanup(&newchannel->outbound);
++ 	hv_ringbuffer_cleanup(&newchannel->inbound);
++ 	newchannel->state = CHANNEL_OPEN_STATE;
++ 	return err;
++ }
++ 
++ /*
++  * vmbus_connect_ring - Open the channel but reuse ring buffer
++  */
++ int vmbus_connect_ring(struct vmbus_channel *newchannel,
++ 		       void (*onchannelcallback)(void *context), void *context)
++ {
++ 	return  __vmbus_open(newchannel, NULL, 0, onchannelcallback, context);
++ }
++ EXPORT_SYMBOL_GPL(vmbus_connect_ring);
++ 
++ /*
++  * vmbus_open - Open the specified channel.
++  */
++ int vmbus_open(struct vmbus_channel *newchannel,
++ 	       u32 send_ringbuffer_size, u32 recv_ringbuffer_size,
++ 	       void *userdata, u32 userdatalen,
++ 	       void (*onchannelcallback)(void *context), void *context)
++ {
++ 	int err;
++ 
++ 	err = vmbus_alloc_ring(newchannel, send_ringbuffer_size,
++ 			       recv_ringbuffer_size);
++ 	if (err)
++ 		return err;
++ 
++ 	err = __vmbus_open(newchannel, userdata, userdatalen,
++ 			   onchannelcallback, context);
++ 	if (err)
++ 		vmbus_free_ring(newchannel);
++ 
++ 	return err;
++ }
++ EXPORT_SYMBOL_GPL(vmbus_open);
++ 
+++>>>>>>> c1135c7fd0e9 (Drivers: hv: vmbus: Introduce types of GPADL)
+  /*
+   * vmbus_teardown_gpadl -Teardown the specified GPADL handle
+   */
+* Unmerged path drivers/hv/channel.c
+diff --git a/include/linux/hyperv.h b/include/linux/hyperv.h
+index e67ba1a15c71..22bdd164f3e7 100644
+--- a/include/linux/hyperv.h
++++ b/include/linux/hyperv.h
+@@ -42,6 +42,48 @@
+ 
+ #pragma pack(push, 1)
+ 
++/*
++ * Types for GPADL, decides is how GPADL header is created.
++ *
++ * It doesn't make much difference between BUFFER and RING if PAGE_SIZE is the
++ * same as HV_HYP_PAGE_SIZE.
++ *
++ * If PAGE_SIZE is bigger than HV_HYP_PAGE_SIZE, the headers of ring buffers
++ * will be of PAGE_SIZE, however, only the first HV_HYP_PAGE will be put
++ * into gpadl, therefore the number for HV_HYP_PAGE and the indexes of each
++ * HV_HYP_PAGE will be different between different types of GPADL, for example
++ * if PAGE_SIZE is 64K:
++ *
++ * BUFFER:
++ *
++ * gva:    |--       64k      --|--       64k      --| ... |
++ * gpa:    | 4k | 4k | ... | 4k | 4k | 4k | ... | 4k |
++ * index:  0    1    2     15   16   17   18 .. 31   32 ...
++ *         |    |    ...   |    |    |   ...    |   ...
++ *         v    V          V    V    V          V
++ * gpadl:  | 4k | 4k | ... | 4k | 4k | 4k | ... | 4k | ... |
++ * index:  0    1    2 ... 15   16   17   18 .. 31   32 ...
++ *
++ * RING:
++ *
++ *         | header  |           data           | header  |     data      |
++ * gva:    |-- 64k --|--       64k      --| ... |-- 64k --|-- 64k --| ... |
++ * gpa:    | 4k | .. | 4k | 4k | ... | 4k | ... | 4k | .. | 4k | .. | ... |
++ * index:  0    1    16   17   18    31   ...   n   n+1  n+16 ...         2n
++ *         |         /    /          /          |         /               /
++ *         |        /    /          /           |        /               /
++ *         |       /    /   ...    /    ...     |       /      ...      /
++ *         |      /    /          /             |      /               /
++ *         |     /    /          /              |     /               /
++ *         V    V    V          V               V    V               v
++ * gpadl:  | 4k | 4k |   ...    |    ...        | 4k | 4k |  ...     |
++ * index:  0    1    2   ...    16   ...       n-15 n-14 n-13  ...  2n-30
++ */
++enum hv_gpadl_type {
++	HV_GPADL_BUFFER,
++	HV_GPADL_RING
++};
++
+ /* Single-page buffer */
+ struct hv_page_buffer {
+ 	u32 len;
+@@ -124,7 +166,7 @@ struct hv_ring_buffer {
+ 	} feature_bits;
+ 
+ 	/* Pad it to PAGE_SIZE so that data starts on page boundary */
+-	u8	reserved2[4028];
++	u8	reserved2[PAGE_SIZE - 68];
+ 
+ 	/*
+ 	 * Ring data starts here + RingDataStartOffset
+@@ -133,6 +175,10 @@ struct hv_ring_buffer {
+ 	u8 buffer[0];
+ } __packed;
+ 
++/* Calculate the proper size of a ringbuffer, it must be page-aligned */
++#define VMBUS_RING_SIZE(payload_sz) PAGE_ALIGN(sizeof(struct hv_ring_buffer) + \
++					       (payload_sz))
++
+ struct hv_ring_buffer_info {
+ 	struct hv_ring_buffer *ring_buffer;
+ 	u32 ring_size;			/* Include the shared header */
