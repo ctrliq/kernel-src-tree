@@ -1,0 +1,683 @@
+KVM: Move x86's MMU notifier memslot walkers to generic code
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-408.el8
+commit-author Sean Christopherson <seanjc@google.com>
+commit 3039bcc744980afe87c612122e47a27306483bc2
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-408.el8/3039bcc7.failed
+
+Move the hva->gfn lookup for MMU notifiers into common code.  Every arch
+does a similar lookup, and some arch code is all but identical across
+multiple architectures.
+
+In addition to consolidating code, this will allow introducing
+optimizations that will benefit all architectures without incurring
+multiple walks of the memslots, e.g. by taking mmu_lock if and only if a
+relevant range exists in the memslots.
+
+The use of __always_inline to avoid indirect call retpolines, as done by
+x86, may also benefit other architectures.
+
+Consolidating the lookups also fixes a wart in x86, where the legacy MMU
+and TDP MMU each do their own memslot walks.
+
+Lastly, future enhancements to the memslot implementation, e.g. to add an
+interval tree to track host address, will need to touch far less arch
+specific code.
+
+MIPS, PPC, and arm64 will be converted one at a time in future patches.
+
+	Signed-off-by: Sean Christopherson <seanjc@google.com>
+Message-Id: <20210402005658.3024832-3-seanjc@google.com>
+	Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+(cherry picked from commit 3039bcc744980afe87c612122e47a27306483bc2)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	virt/kvm/kvm_main.c
+diff --cc virt/kvm/kvm_main.c
+index 6f04c4e5e88c,20836cf342ba..000000000000
+--- a/virt/kvm/kvm_main.c
++++ b/virt/kvm/kvm_main.c
+@@@ -508,15 -597,25 +628,27 @@@ static void kvm_mmu_notifier_change_pte
+  
+  	KVM_MMU_UNLOCK(kvm);
+  	srcu_read_unlock(&kvm->srcu, idx);
++ #endif
+  }
+  
+ -static int kvm_mmu_notifier_invalidate_range_start(struct mmu_notifier *mn,
+ -					const struct mmu_notifier_range *range)
+ +static void kvm_mmu_notifier_invalidate_range_start(struct mmu_notifier *mn,
+ +						    struct mm_struct *mm,
+ +						    unsigned long start,
+ +						    unsigned long end)
+  {
+  	struct kvm *kvm = mmu_notifier_to_kvm(mn);
++ #ifdef KVM_ARCH_WANT_NEW_MMU_NOTIFIER_APIS
++ 	const struct kvm_hva_range hva_range = {
++ 		.start		= range->start,
++ 		.end		= range->end,
++ 		.pte		= __pte(0),
++ 		.handler	= kvm_unmap_gfn_range,
++ 		.flush_on_ret	= true,
++ 		.may_block	= mmu_notifier_range_blockable(range),
++ 	};
++ #else
+  	int need_tlb_flush = 0, idx;
++ #endif
+  
+  	trace_kvm_unmap_hva_range(range->start, range->end);
+  
+@@@ -542,17 -644,27 +677,34 @@@
+  		 * complete.
+  		 */
+  		kvm->mmu_notifier_range_start =
+ -			min(kvm->mmu_notifier_range_start, range->start);
+ +			min(kvm->mmu_notifier_range_start, start);
+  		kvm->mmu_notifier_range_end =
+ -			max(kvm->mmu_notifier_range_end, range->end);
+ +			max(kvm->mmu_notifier_range_end, end);
+  	}
+++<<<<<<< HEAD
+ +	need_tlb_flush = kvm_unmap_hva_range(kvm, start, end, 0);
+++=======
++ 
++ #ifdef KVM_ARCH_WANT_NEW_MMU_NOTIFIER_APIS
++ 	__kvm_handle_hva_range(kvm, &hva_range);
++ #else
++ 	need_tlb_flush = kvm_unmap_hva_range(kvm, range->start, range->end,
++ 					     range->flags);
+++>>>>>>> 3039bcc74498 (KVM: Move x86's MMU notifier memslot walkers to generic code)
+  	/* we've to flush the tlb before the pages can be freed */
+  	if (need_tlb_flush || kvm->tlbs_dirty)
+  		kvm_flush_remote_tlbs(kvm);
++ #endif
+  
+  	KVM_MMU_UNLOCK(kvm);
++ #ifndef KVM_ARCH_WANT_NEW_MMU_NOTIFIER_APIS
+  	srcu_read_unlock(&kvm->srcu, idx);
+++<<<<<<< HEAD
+++=======
++ #endif
++ 
++ 	return 0;
+++>>>>>>> 3039bcc74498 (KVM: Move x86's MMU notifier memslot walkers to generic code)
+  }
+  
+  static void kvm_mmu_notifier_invalidate_range_end(struct mmu_notifier *mn,
+diff --git a/arch/x86/include/asm/kvm_host.h b/arch/x86/include/asm/kvm_host.h
+index c108053d930b..4dbe356541dc 100644
+--- a/arch/x86/include/asm/kvm_host.h
++++ b/arch/x86/include/asm/kvm_host.h
+@@ -1823,6 +1823,7 @@ enum {
+ #define kvm_memslots_for_spte_role(kvm, role) __kvm_memslots(kvm, (role).smm)
+ 
+ #define KVM_ARCH_WANT_MMU_NOTIFIER
++#define KVM_ARCH_WANT_NEW_MMU_NOTIFIER_APIS
+ 
+ int kvm_cpu_has_injectable_intr(struct kvm_vcpu *v);
+ int kvm_cpu_has_interrupt(struct kvm_vcpu *vcpu);
+diff --git a/arch/x86/kvm/mmu/mmu.c b/arch/x86/kvm/mmu/mmu.c
+index 4401a1a9e22e..d7af63596a73 100644
+--- a/arch/x86/kvm/mmu/mmu.c
++++ b/arch/x86/kvm/mmu/mmu.c
+@@ -1418,26 +1418,25 @@ static bool kvm_zap_rmapp(struct kvm *kvm, struct kvm_rmap_head *rmap_head,
+ 	return pte_list_destroy(rmap_head);
+ }
+ 
+-static int kvm_unmap_rmapp(struct kvm *kvm, struct kvm_rmap_head *rmap_head,
+-			   struct kvm_memory_slot *slot, gfn_t gfn, int level,
+-			   unsigned long data)
++static bool kvm_unmap_rmapp(struct kvm *kvm, struct kvm_rmap_head *rmap_head,
++			    struct kvm_memory_slot *slot, gfn_t gfn, int level,
++			    pte_t unused)
+ {
+ 	return kvm_zap_rmapp(kvm, rmap_head, slot);
+ }
+ 
+-static int kvm_set_pte_rmapp(struct kvm *kvm, struct kvm_rmap_head *rmap_head,
+-			     struct kvm_memory_slot *slot, gfn_t gfn, int level,
+-			     unsigned long data)
++static bool kvm_set_pte_rmapp(struct kvm *kvm, struct kvm_rmap_head *rmap_head,
++			      struct kvm_memory_slot *slot, gfn_t gfn, int level,
++			      pte_t pte)
+ {
+ 	u64 *sptep;
+ 	struct rmap_iterator iter;
+ 	int need_flush = 0;
+ 	u64 new_spte;
+-	pte_t *ptep = (pte_t *)data;
+ 	kvm_pfn_t new_pfn;
+ 
+-	WARN_ON(pte_huge(*ptep));
+-	new_pfn = pte_pfn(*ptep);
++	WARN_ON(pte_huge(pte));
++	new_pfn = pte_pfn(pte);
+ 
+ restart:
+ 	for_each_rmap_spte(rmap_head, &iter, sptep) {
+@@ -1446,7 +1445,7 @@ static int kvm_set_pte_rmapp(struct kvm *kvm, struct kvm_rmap_head *rmap_head,
+ 
+ 		need_flush = 1;
+ 
+-		if (pte_write(*ptep)) {
++		if (pte_write(pte)) {
+ 			pte_list_remove(rmap_head, sptep);
+ 			goto restart;
+ 		} else {
+@@ -1534,86 +1533,52 @@ static void slot_rmap_walk_next(struct slot_rmap_walk_iterator *iterator)
+ 	     slot_rmap_walk_okay(_iter_);				\
+ 	     slot_rmap_walk_next(_iter_))
+ 
+-typedef int (*rmap_handler_t)(struct kvm *kvm, struct kvm_rmap_head *rmap_head,
+-			      struct kvm_memory_slot *slot, gfn_t gfn,
+-			      int level, unsigned long data);
++typedef bool (*rmap_handler_t)(struct kvm *kvm, struct kvm_rmap_head *rmap_head,
++			       struct kvm_memory_slot *slot, gfn_t gfn,
++			       int level, pte_t pte);
+ 
+-static __always_inline int kvm_handle_hva_range(struct kvm *kvm,
+-						unsigned long start,
+-						unsigned long end,
+-						unsigned long data,
+-						rmap_handler_t handler)
++static __always_inline bool kvm_handle_gfn_range(struct kvm *kvm,
++						 struct kvm_gfn_range *range,
++						 rmap_handler_t handler)
+ {
+-	struct kvm_memslots *slots;
+-	struct kvm_memory_slot *memslot;
+ 	struct slot_rmap_walk_iterator iterator;
+-	int ret = 0;
+-	int i;
++	bool ret = false;
+ 
+-	for (i = 0; i < KVM_ADDRESS_SPACE_NUM; i++) {
+-		slots = __kvm_memslots(kvm, i);
+-		kvm_for_each_memslot(memslot, slots) {
+-			unsigned long hva_start, hva_end;
+-			gfn_t gfn_start, gfn_end;
+-
+-			hva_start = max(start, memslot->userspace_addr);
+-			hva_end = min(end, memslot->userspace_addr +
+-				      (memslot->npages << PAGE_SHIFT));
+-			if (hva_start >= hva_end)
+-				continue;
+-			/*
+-			 * {gfn(page) | page intersects with [hva_start, hva_end)} =
+-			 * {gfn_start, gfn_start+1, ..., gfn_end-1}.
+-			 */
+-			gfn_start = hva_to_gfn_memslot(hva_start, memslot);
+-			gfn_end = hva_to_gfn_memslot(hva_end + PAGE_SIZE - 1, memslot);
+-
+-			for_each_slot_rmap_range(memslot, PG_LEVEL_4K,
+-						 KVM_MAX_HUGEPAGE_LEVEL,
+-						 gfn_start, gfn_end - 1,
+-						 &iterator)
+-				ret |= handler(kvm, iterator.rmap, memslot,
+-					       iterator.gfn, iterator.level, data);
+-		}
+-	}
++	for_each_slot_rmap_range(range->slot, PG_LEVEL_4K, KVM_MAX_HUGEPAGE_LEVEL,
++				 range->start, range->end - 1, &iterator)
++		ret |= handler(kvm, iterator.rmap, range->slot, iterator.gfn,
++			       iterator.level, range->pte);
+ 
+ 	return ret;
+ }
+ 
+-static int kvm_handle_hva(struct kvm *kvm, unsigned long hva,
+-			  unsigned long data, rmap_handler_t handler)
++bool kvm_unmap_gfn_range(struct kvm *kvm, struct kvm_gfn_range *range)
+ {
+-	return kvm_handle_hva_range(kvm, hva, hva + 1, data, handler);
+-}
+-
+-int kvm_unmap_hva_range(struct kvm *kvm, unsigned long start, unsigned long end,
+-			unsigned flags)
+-{
+-	int r;
++	bool flush;
+ 
+-	r = kvm_handle_hva_range(kvm, start, end, 0, kvm_unmap_rmapp);
++	flush = kvm_handle_gfn_range(kvm, range, kvm_unmap_rmapp);
+ 
+ 	if (is_tdp_mmu_enabled(kvm))
+-		r |= kvm_tdp_mmu_zap_hva_range(kvm, start, end);
++		flush |= kvm_tdp_mmu_unmap_gfn_range(kvm, range, flush);
+ 
+-	return r;
++	return flush;
+ }
+ 
+-int kvm_set_spte_hva(struct kvm *kvm, unsigned long hva, pte_t pte)
++bool kvm_set_spte_gfn(struct kvm *kvm, struct kvm_gfn_range *range)
+ {
+-	int r;
++	bool flush;
+ 
+-	r = kvm_handle_hva(kvm, hva, (unsigned long)&pte, kvm_set_pte_rmapp);
++	flush = kvm_handle_gfn_range(kvm, range, kvm_set_pte_rmapp);
+ 
+ 	if (is_tdp_mmu_enabled(kvm))
+-		r |= kvm_tdp_mmu_set_spte_hva(kvm, hva, &pte);
++		flush |= kvm_tdp_mmu_set_spte_gfn(kvm, range);
+ 
+-	return r;
++	return flush;
+ }
+ 
+-static int kvm_age_rmapp(struct kvm *kvm, struct kvm_rmap_head *rmap_head,
+-			 struct kvm_memory_slot *slot, gfn_t gfn, int level,
+-			 unsigned long data)
++static bool kvm_age_rmapp(struct kvm *kvm, struct kvm_rmap_head *rmap_head,
++			  struct kvm_memory_slot *slot, gfn_t gfn, int level,
++			  pte_t unused)
+ {
+ 	u64 *sptep;
+ 	struct rmap_iterator uninitialized_var(iter);
+@@ -1625,9 +1590,9 @@ static int kvm_age_rmapp(struct kvm *kvm, struct kvm_rmap_head *rmap_head,
+ 	return young;
+ }
+ 
+-static int kvm_test_age_rmapp(struct kvm *kvm, struct kvm_rmap_head *rmap_head,
+-			      struct kvm_memory_slot *slot, gfn_t gfn,
+-			      int level, unsigned long data)
++static bool kvm_test_age_rmapp(struct kvm *kvm, struct kvm_rmap_head *rmap_head,
++			       struct kvm_memory_slot *slot, gfn_t gfn,
++			       int level, pte_t unused)
+ {
+ 	u64 *sptep;
+ 	struct rmap_iterator iter;
+@@ -1650,29 +1615,31 @@ static void rmap_recycle(struct kvm_vcpu *vcpu, u64 *spte, gfn_t gfn)
+ 	slot = kvm_vcpu_gfn_to_memslot(vcpu, gfn);
+ 	rmap_head = __gfn_to_rmap(gfn, sp->role.level, slot);
+ 
+-	kvm_unmap_rmapp(vcpu->kvm, rmap_head, NULL, gfn, sp->role.level, 0);
++	kvm_unmap_rmapp(vcpu->kvm, rmap_head, NULL, gfn, sp->role.level, __pte(0));
+ 	kvm_flush_remote_tlbs_with_address(vcpu->kvm, sp->gfn,
+ 			KVM_PAGES_PER_HPAGE(sp->role.level));
+ }
+ 
+-int kvm_age_hva(struct kvm *kvm, unsigned long start, unsigned long end)
++bool kvm_age_gfn(struct kvm *kvm, struct kvm_gfn_range *range)
+ {
+-	int young = false;
++	bool young;
++
++	young = kvm_handle_gfn_range(kvm, range, kvm_age_rmapp);
+ 
+-	young = kvm_handle_hva_range(kvm, start, end, 0, kvm_age_rmapp);
+ 	if (is_tdp_mmu_enabled(kvm))
+-		young |= kvm_tdp_mmu_age_hva_range(kvm, start, end);
++		young |= kvm_tdp_mmu_age_gfn_range(kvm, range);
+ 
+ 	return young;
+ }
+ 
+-int kvm_test_age_hva(struct kvm *kvm, unsigned long hva)
++bool kvm_test_age_gfn(struct kvm *kvm, struct kvm_gfn_range *range)
+ {
+-	int young = false;
++	bool young;
++
++	young = kvm_handle_gfn_range(kvm, range, kvm_test_age_rmapp);
+ 
+-	young = kvm_handle_hva(kvm, hva, 0, kvm_test_age_rmapp);
+ 	if (is_tdp_mmu_enabled(kvm))
+-		young |= kvm_tdp_mmu_test_age_hva(kvm, hva);
++		young |= kvm_tdp_mmu_test_age_gfn(kvm, range);
+ 
+ 	return young;
+ }
+diff --git a/arch/x86/kvm/mmu/tdp_mmu.c b/arch/x86/kvm/mmu/tdp_mmu.c
+index 83e4cca9867b..ce5dfe800b09 100644
+--- a/arch/x86/kvm/mmu/tdp_mmu.c
++++ b/arch/x86/kvm/mmu/tdp_mmu.c
+@@ -913,204 +913,135 @@ int kvm_tdp_mmu_map(struct kvm_vcpu *vcpu, gpa_t gpa, u32 error_code,
+ 	return ret;
+ }
+ 
+-typedef int (*tdp_handler_t)(struct kvm *kvm, struct kvm_memory_slot *slot,
+-			     struct kvm_mmu_page *root, gfn_t start, gfn_t end,
+-			     unsigned long data);
+-
+-static __always_inline int kvm_tdp_mmu_handle_hva_range(struct kvm *kvm,
+-							unsigned long start,
+-							unsigned long end,
+-							unsigned long data,
+-							tdp_handler_t handler)
++bool kvm_tdp_mmu_unmap_gfn_range(struct kvm *kvm, struct kvm_gfn_range *range,
++				 bool flush)
+ {
+-	struct kvm_memslots *slots;
+-	struct kvm_memory_slot *memslot;
+ 	struct kvm_mmu_page *root;
+-	int ret = 0;
+-	int as_id;
+-
+-	for (as_id = 0; as_id < KVM_ADDRESS_SPACE_NUM; as_id++) {
+-		for_each_tdp_mmu_root_yield_safe(kvm, root, as_id) {
+-			slots = __kvm_memslots(kvm, as_id);
+-			kvm_for_each_memslot(memslot, slots) {
+-				unsigned long hva_start, hva_end;
+-				gfn_t gfn_start, gfn_end;
+-
+-				hva_start = max(start, memslot->userspace_addr);
+-				hva_end = min(end, memslot->userspace_addr +
+-					(memslot->npages << PAGE_SHIFT));
+-				if (hva_start >= hva_end)
+-					continue;
+-				/*
+-				 * {gfn(page) | page intersects with [hva_start, hva_end)} =
+-				 * {gfn_start, gfn_start+1, ..., gfn_end-1}.
+-				 */
+-				gfn_start = hva_to_gfn_memslot(hva_start, memslot);
+-				gfn_end = hva_to_gfn_memslot(hva_end + PAGE_SIZE - 1, memslot);
+-
+-				ret |= handler(kvm, memslot, root, gfn_start,
+-					gfn_end, data);
+-			}
+-		}
+-	}
+ 
+-	return ret;
+-}
++	for_each_tdp_mmu_root(kvm, root, range->slot->as_id)
++		flush |= zap_gfn_range(kvm, root, range->start, range->end,
++				       false, flush);
+ 
+-static __always_inline int kvm_tdp_mmu_handle_hva(struct kvm *kvm,
+-						  unsigned long addr,
+-						  unsigned long data,
+-						  tdp_handler_t handler)
+-{
+-	return kvm_tdp_mmu_handle_hva_range(kvm, addr, addr + 1, data, handler);
++	return flush;
+ }
+ 
+-static int zap_gfn_range_hva_wrapper(struct kvm *kvm,
+-				     struct kvm_memory_slot *slot,
+-				     struct kvm_mmu_page *root, gfn_t start,
+-				     gfn_t end, unsigned long unused)
+-{
+-	return zap_gfn_range(kvm, root, start, end, false, false);
+-}
++typedef bool (*tdp_handler_t)(struct kvm *kvm, struct tdp_iter *iter,
++			      struct kvm_gfn_range *range);
+ 
+-int kvm_tdp_mmu_zap_hva_range(struct kvm *kvm, unsigned long start,
+-			      unsigned long end)
++static __always_inline bool kvm_tdp_mmu_handle_gfn(struct kvm *kvm,
++						   struct kvm_gfn_range *range,
++						   tdp_handler_t handler)
+ {
+-	return kvm_tdp_mmu_handle_hva_range(kvm, start, end, 0,
+-					    zap_gfn_range_hva_wrapper);
++	struct kvm_mmu_page *root;
++	struct tdp_iter iter;
++	bool ret = false;
++
++	rcu_read_lock();
++
++	for_each_tdp_mmu_root(kvm, root, range->slot->as_id) {
++		tdp_root_for_each_leaf_pte(iter, root, range->start, range->end)
++			ret |= handler(kvm, &iter, range);
++	}
++
++	rcu_read_unlock();
++
++	return ret;
+ }
+ 
+ /*
+  * Mark the SPTEs range of GFNs [start, end) unaccessed and return non-zero
+  * if any of the GFNs in the range have been accessed.
+  */
+-static int age_gfn_range(struct kvm *kvm, struct kvm_memory_slot *slot,
+-			 struct kvm_mmu_page *root, gfn_t start, gfn_t end,
+-			 unsigned long unused)
++static bool age_gfn_range(struct kvm *kvm, struct tdp_iter *iter,
++			  struct kvm_gfn_range *range)
+ {
+-	struct tdp_iter iter;
+-	int young = 0;
+-	u64 new_spte;
++	u64 new_spte = 0;
+ 
+-	rcu_read_lock();
++	/* If we have a non-accessed entry we don't need to change the pte. */
++	if (!is_accessed_spte(iter->old_spte))
++		return false;
+ 
+-	tdp_root_for_each_leaf_pte(iter, root, start, end) {
++	new_spte = iter->old_spte;
++
++	if (spte_ad_enabled(new_spte)) {
++		new_spte &= ~shadow_accessed_mask;
++	} else {
+ 		/*
+-		 * If we have a non-accessed entry we don't need to change the
+-		 * pte.
++		 * Capture the dirty status of the page, so that it doesn't get
++		 * lost when the SPTE is marked for access tracking.
+ 		 */
+-		if (!is_accessed_spte(iter.old_spte))
+-			continue;
+-
+-		new_spte = iter.old_spte;
++		if (is_writable_pte(new_spte))
++			kvm_set_pfn_dirty(spte_to_pfn(new_spte));
+ 
+-		if (spte_ad_enabled(new_spte)) {
+-			new_spte &= ~shadow_accessed_mask;
+-		} else {
+-			/*
+-			 * Capture the dirty status of the page, so that it doesn't get
+-			 * lost when the SPTE is marked for access tracking.
+-			 */
+-			if (is_writable_pte(new_spte))
+-				kvm_set_pfn_dirty(spte_to_pfn(new_spte));
+-
+-			new_spte = mark_spte_for_access_track(new_spte);
+-		}
+-
+-		tdp_mmu_set_spte_no_acc_track(kvm, &iter, new_spte);
+-		young = 1;
++		new_spte = mark_spte_for_access_track(new_spte);
+ 	}
+ 
+-	rcu_read_unlock();
++	tdp_mmu_set_spte_no_acc_track(kvm, iter, new_spte);
+ 
+-	return young;
++	return true;
+ }
+ 
+-int kvm_tdp_mmu_age_hva_range(struct kvm *kvm, unsigned long start,
+-			      unsigned long end)
++bool kvm_tdp_mmu_age_gfn_range(struct kvm *kvm, struct kvm_gfn_range *range)
+ {
+-	return kvm_tdp_mmu_handle_hva_range(kvm, start, end, 0,
+-					    age_gfn_range);
++	return kvm_tdp_mmu_handle_gfn(kvm, range, age_gfn_range);
+ }
+ 
+-static int test_age_gfn(struct kvm *kvm, struct kvm_memory_slot *slot,
+-			struct kvm_mmu_page *root, gfn_t gfn, gfn_t end,
+-			unsigned long unused)
++static bool test_age_gfn(struct kvm *kvm, struct tdp_iter *iter,
++			 struct kvm_gfn_range *range)
+ {
+-	struct tdp_iter iter;
+-
+-	tdp_root_for_each_leaf_pte(iter, root, gfn, end)
+-		if (is_accessed_spte(iter.old_spte))
+-			return 1;
+-
+-	return 0;
++	return is_accessed_spte(iter->old_spte);
+ }
+ 
+-int kvm_tdp_mmu_test_age_hva(struct kvm *kvm, unsigned long hva)
++bool kvm_tdp_mmu_test_age_gfn(struct kvm *kvm, struct kvm_gfn_range *range)
+ {
+-	return kvm_tdp_mmu_handle_hva(kvm, hva, 0, test_age_gfn);
++	return kvm_tdp_mmu_handle_gfn(kvm, range, test_age_gfn);
+ }
+ 
+-/*
+- * Handle the changed_pte MMU notifier for the TDP MMU.
+- * data is a pointer to the new pte_t mapping the HVA specified by the MMU
+- * notifier.
+- * Returns non-zero if a flush is needed before releasing the MMU lock.
+- */
+-static int set_tdp_spte(struct kvm *kvm, struct kvm_memory_slot *slot,
+-			struct kvm_mmu_page *root, gfn_t gfn, gfn_t end,
+-			unsigned long data)
++static bool set_spte_gfn(struct kvm *kvm, struct tdp_iter *iter,
++			 struct kvm_gfn_range *range)
+ {
+-	struct tdp_iter iter;
+-	pte_t *ptep = (pte_t *)data;
+-	kvm_pfn_t new_pfn;
+ 	u64 new_spte;
+-	int need_flush = 0;
+ 
+-	rcu_read_lock();
++	/* Huge pages aren't expected to be modified without first being zapped. */
++	WARN_ON(pte_huge(range->pte) || range->start + 1 != range->end);
+ 
+-	WARN_ON(pte_huge(*ptep) || (gfn + 1) != end);
+-
+-	new_pfn = pte_pfn(*ptep);
+-
+-	tdp_root_for_each_leaf_pte(iter, root, gfn, gfn + 1) {
+-		if (iter.level != PG_LEVEL_4K)
+-			continue;
+-
+-		if (!is_shadow_present_pte(iter.old_spte))
+-			break;
+-
+-		/*
+-		 * Note, when changing a read-only SPTE, it's not strictly
+-		 * necessary to zero the SPTE before setting the new PFN, but
+-		 * doing so preserves the invariant that the PFN of a present
+-		 * leaf SPTE can never change.  See __handle_changed_spte().
+-		 */
+-		tdp_mmu_set_spte(kvm, &iter, 0);
++	if (iter->level != PG_LEVEL_4K ||
++	    !is_shadow_present_pte(iter->old_spte))
++		return false;
+ 
+-		if (!pte_write(*ptep)) {
+-			new_spte = kvm_mmu_changed_pte_notifier_make_spte(
+-					iter.old_spte, new_pfn);
++	/*
++	 * Note, when changing a read-only SPTE, it's not strictly necessary to
++	 * zero the SPTE before setting the new PFN, but doing so preserves the
++	 * invariant that the PFN of a present * leaf SPTE can never change.
++	 * See __handle_changed_spte().
++	 */
++	tdp_mmu_set_spte(kvm, iter, 0);
+ 
+-			tdp_mmu_set_spte(kvm, &iter, new_spte);
+-		}
++	if (!pte_write(range->pte)) {
++		new_spte = kvm_mmu_changed_pte_notifier_make_spte(iter->old_spte,
++								  pte_pfn(range->pte));
+ 
+-		need_flush = 1;
++		tdp_mmu_set_spte(kvm, iter, new_spte);
+ 	}
+ 
+-	if (need_flush)
+-		kvm_flush_remote_tlbs_with_address(kvm, gfn, 1);
+-
+-	rcu_read_unlock();
+-
+-	return 0;
++	return true;
+ }
+ 
+-int kvm_tdp_mmu_set_spte_hva(struct kvm *kvm, unsigned long address,
+-			     pte_t *host_ptep)
++/*
++ * Handle the changed_pte MMU notifier for the TDP MMU.
++ * data is a pointer to the new pte_t mapping the HVA specified by the MMU
++ * notifier.
++ * Returns non-zero if a flush is needed before releasing the MMU lock.
++ */
++bool kvm_tdp_mmu_set_spte_gfn(struct kvm *kvm, struct kvm_gfn_range *range)
+ {
+-	return kvm_tdp_mmu_handle_hva(kvm, address, (unsigned long)host_ptep,
+-				      set_tdp_spte);
++	bool flush = kvm_tdp_mmu_handle_gfn(kvm, range, set_spte_gfn);
++
++	/* FIXME: return 'flush' instead of flushing here. */
++	if (flush)
++		kvm_flush_remote_tlbs_with_address(kvm, range->start, 1);
++
++	return false;
+ }
+ 
+ /*
+diff --git a/arch/x86/kvm/mmu/tdp_mmu.h b/arch/x86/kvm/mmu/tdp_mmu.h
+index e151d36b592f..7d96b5f2e487 100644
+--- a/arch/x86/kvm/mmu/tdp_mmu.h
++++ b/arch/x86/kvm/mmu/tdp_mmu.h
+@@ -45,15 +45,11 @@ int kvm_tdp_mmu_map(struct kvm_vcpu *vcpu, gpa_t gpa, u32 error_code,
+ 		    int map_writable, int max_level, kvm_pfn_t pfn,
+ 		    bool prefault);
+ 
+-int kvm_tdp_mmu_zap_hva_range(struct kvm *kvm, unsigned long start,
+-			      unsigned long end);
+-
+-int kvm_tdp_mmu_age_hva_range(struct kvm *kvm, unsigned long start,
+-			      unsigned long end);
+-int kvm_tdp_mmu_test_age_hva(struct kvm *kvm, unsigned long hva);
+-
+-int kvm_tdp_mmu_set_spte_hva(struct kvm *kvm, unsigned long address,
+-			     pte_t *host_ptep);
++bool kvm_tdp_mmu_unmap_gfn_range(struct kvm *kvm, struct kvm_gfn_range *range,
++				 bool flush);
++bool kvm_tdp_mmu_age_gfn_range(struct kvm *kvm, struct kvm_gfn_range *range);
++bool kvm_tdp_mmu_test_age_gfn(struct kvm *kvm, struct kvm_gfn_range *range);
++bool kvm_tdp_mmu_set_spte_gfn(struct kvm *kvm, struct kvm_gfn_range *range);
+ 
+ bool kvm_tdp_mmu_wrprot_slot(struct kvm *kvm, struct kvm_memory_slot *slot,
+ 			     int min_level);
+diff --git a/include/linux/kvm_host.h b/include/linux/kvm_host.h
+index 20157fe0daad..5394677272f7 100644
+--- a/include/linux/kvm_host.h
++++ b/include/linux/kvm_host.h
+@@ -234,11 +234,25 @@ int kvm_async_pf_wakeup_all(struct kvm_vcpu *vcpu);
+ #endif
+ 
+ #ifdef KVM_ARCH_WANT_MMU_NOTIFIER
++#ifdef KVM_ARCH_WANT_NEW_MMU_NOTIFIER_APIS
++struct kvm_gfn_range {
++	struct kvm_memory_slot *slot;
++	gfn_t start;
++	gfn_t end;
++	pte_t pte;
++	bool may_block;
++};
++bool kvm_unmap_gfn_range(struct kvm *kvm, struct kvm_gfn_range *range);
++bool kvm_age_gfn(struct kvm *kvm, struct kvm_gfn_range *range);
++bool kvm_test_age_gfn(struct kvm *kvm, struct kvm_gfn_range *range);
++bool kvm_set_spte_gfn(struct kvm *kvm, struct kvm_gfn_range *range);
++#else
+ int kvm_unmap_hva_range(struct kvm *kvm,
+ 			unsigned long start, unsigned long end, unsigned flags);
+ int kvm_set_spte_hva(struct kvm *kvm, unsigned long hva, pte_t pte);
+ int kvm_age_hva(struct kvm *kvm, unsigned long start, unsigned long end);
+ int kvm_test_age_hva(struct kvm *kvm, unsigned long hva);
++#endif /* KVM_ARCH_WANT_NEW_MMU_NOTIFIER_APIS */
+ #endif
+ 
+ enum {
+* Unmerged path virt/kvm/kvm_main.c
