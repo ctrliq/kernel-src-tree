@@ -199,7 +199,7 @@ int mlx5_cmdif_debugfs_init(struct mlx5_core_dev *dev)
 	if (!*cmd)
 		return -ENOMEM;
 
-	for (i = 0; i < ARRAY_SIZE(dev->cmd.stats); i++) {
+	for (i = 0; i < MLX5_CMD_OP_MAX; i++) {
 		stats = &dev->cmd.stats[i];
 		namep = mlx5_command_str(i);
 		if (strcmp(namep, "unknown command opcode")) {
