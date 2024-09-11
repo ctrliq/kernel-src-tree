@@ -1,0 +1,150 @@
+mm/hmm: move hmm_vma_range_done and hmm_vma_fault to nouveau
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-193.el8
+commit-author Christoph Hellwig <hch@lst.de>
+commit 02712bc3250849c1cf99d626aea98f610e695f34
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-193.el8/02712bc3.failed
+
+These two functions are marked as a legacy APIs to get rid of, but seem to
+suit the current nouveau flow.  Move it to the only user in preparation
+for fixing a locking bug involving caller and callee.  All comments
+referring to the old API have been removed as this now is a driver private
+helper.
+
+Link: https://lore.kernel.org/r/20190724065258.16603-3-hch@lst.de
+	Tested-by: Ralph Campbell <rcampbell@nvidia.com>
+	Signed-off-by: Christoph Hellwig <hch@lst.de>
+	Reviewed-by: Jason Gunthorpe <jgg@mellanox.com>
+	Signed-off-by: Jason Gunthorpe <jgg@mellanox.com>
+(cherry picked from commit 02712bc3250849c1cf99d626aea98f610e695f34)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/gpu/drm/nouveau/nouveau_svm.c
+#	include/linux/hmm.h
+diff --cc drivers/gpu/drm/nouveau/nouveau_svm.c
+index 93ed43c413f0,6c1b04de0db8..000000000000
+--- a/drivers/gpu/drm/nouveau/nouveau_svm.c
++++ b/drivers/gpu/drm/nouveau/nouveau_svm.c
+@@@ -649,10 -691,10 +691,14 @@@ nouveau_svm_fault(struct nvif_notify *n
+  		range.values = nouveau_svm_pfn_values;
+  		range.pfn_shift = NVIF_VMM_PFNMAP_V0_ADDR_SHIFT;
+  again:
+++<<<<<<< HEAD
+ +		ret = hmm_vma_fault(&range, true);
+++=======
++ 		ret = nouveau_range_fault(&svmm->mirror, &range, true);
+++>>>>>>> 02712bc32508 (mm/hmm: move hmm_vma_range_done and hmm_vma_fault to nouveau)
+  		if (ret == 0) {
+  			mutex_lock(&svmm->mutex);
+- 			if (!hmm_vma_range_done(&range)) {
++ 			if (!nouveau_range_done(&range)) {
+  				mutex_unlock(&svmm->mutex);
+  				goto again;
+  			}
+diff --cc include/linux/hmm.h
+index 2f68a486cc0d,7ef56dc18050..000000000000
+--- a/include/linux/hmm.h
++++ b/include/linux/hmm.h
+@@@ -353,70 -455,36 +353,73 @@@ int hmm_mirror_register(struct hmm_mirr
+  void hmm_mirror_unregister(struct hmm_mirror *mirror);
+  
+  /*
+ - * Please see Documentation/vm/hmm.rst for how to use the range API.
+ + * hmm_mirror_mm_is_alive() - test if mm is still alive
+ + * @mirror: the HMM mm mirror for which we want to lock the mmap_sem
+ + * Returns: false if the mm is dead, true otherwise
+ + *
+ + * This is an optimization it will not accurately always return -EINVAL if the
+ + * mm is dead ie there can be false negative (process is being kill but HMM is
+ + * not yet inform of that). It is only intented to be use to optimize out case
+ + * where driver is about to do something time consuming and it would be better
+ + * to skip it if the mm is dead.
+ + */
+ +static inline bool hmm_mirror_mm_is_alive(struct hmm_mirror *mirror)
+ +{
+ +	struct mm_struct *mm;
+ +
+ +	if (!mirror || !mirror->hmm)
+ +		return false;
+ +	mm = READ_ONCE(mirror->hmm->mm);
+ +	if (mirror->hmm->dead || !mm)
+ +		return false;
+ +
+ +	return true;
+ +}
+ +
+ +
+ +/*
+ + * To snapshot the CPU page table, call hmm_vma_get_pfns(), then take a device
+ + * driver lock that serializes device page table updates, then call
+ + * hmm_vma_range_done(), to check if the snapshot is still valid. The same
+ + * device driver page table update lock must also be used in the
+ + * hmm_mirror_ops.sync_cpu_device_pagetables() callback, so that CPU page
+ + * table invalidation serializes on it.
+ + *
+ + * YOU MUST CALL hmm_vma_range_done() ONCE AND ONLY ONCE EACH TIME YOU CALL
+ + * hmm_vma_get_pfns() WITHOUT ERROR !
+ + *
+ + * IF YOU DO NOT FOLLOW THE ABOVE RULE THE SNAPSHOT CONTENT MIGHT BE INVALID !
+   */
+ -int hmm_range_register(struct hmm_range *range,
+ -		       struct hmm_mirror *mirror,
+ -		       unsigned long start,
+ -		       unsigned long end,
+ -		       unsigned page_shift);
+ -void hmm_range_unregister(struct hmm_range *range);
+ -long hmm_range_snapshot(struct hmm_range *range);
+ -long hmm_range_fault(struct hmm_range *range, bool block);
+ -long hmm_range_dma_map(struct hmm_range *range,
+ -		       struct device *device,
+ -		       dma_addr_t *daddrs,
+ -		       bool block);
+ -long hmm_range_dma_unmap(struct hmm_range *range,
+ -			 struct vm_area_struct *vma,
+ -			 struct device *device,
+ -			 dma_addr_t *daddrs,
+ -			 bool dirty);
+ +int hmm_vma_get_pfns(struct hmm_range *range);
+ +bool hmm_vma_range_done(struct hmm_range *range);
+ +
+++<<<<<<< HEAD
+  
+  /*
+ - * HMM_RANGE_DEFAULT_TIMEOUT - default timeout (ms) when waiting for a range
+ + * Fault memory on behalf of device driver. Unlike handle_mm_fault(), this will
+ + * not migrate any device memory back to system memory. The HMM pfn array will
+ + * be updated with the fault result and current snapshot of the CPU page table
+ + * for the range.
+ + *
+ + * The mmap_sem must be taken in read mode before entering and it might be
+ + * dropped by the function if the block argument is false. In that case, the
+ + * function returns -EAGAIN.
+ + *
+ + * Return value does not reflect if the fault was successful for every single
+ + * address or not. Therefore, the caller must to inspect the HMM pfn array to
+ + * determine fault status for each address.
+ + *
+ + * Trying to fault inside an invalid vma will result in -EINVAL.
+   *
+ - * When waiting for mmu notifiers we need some kind of time out otherwise we
+ - * could potentialy wait for ever, 1000ms ie 1s sounds like a long time to
+ - * wait already.
+ + * See the function description in mm/hmm.c for further documentation.
+   */
+ -#define HMM_RANGE_DEFAULT_TIMEOUT 1000
+ +int hmm_vma_fault(struct hmm_range *range, bool block);
+  
+++=======
+++>>>>>>> 02712bc32508 (mm/hmm: move hmm_vma_range_done and hmm_vma_fault to nouveau)
+  /* Below are for HMM internal use only! Not to be used by device driver! */
+ +void hmm_mm_destroy(struct mm_struct *mm);
+ +
+  static inline void hmm_mm_init(struct mm_struct *mm)
+  {
+  	mm->hmm = NULL;
+* Unmerged path drivers/gpu/drm/nouveau/nouveau_svm.c
+* Unmerged path include/linux/hmm.h
