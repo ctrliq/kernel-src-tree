@@ -1,0 +1,123 @@
+perf parse: Copy string to perf_evsel_config_term
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Leo Yan <leo.yan@linaro.org>
+commit 3220fb8d5e59d7a9b59d02965d4209aef7691e9f
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/3220fb8d.failed
+
+perf with CoreSight fails to record trace data with command:
+
+  perf record -e cs_etm/@tmc_etr0/u --per-thread ls
+  failed to set sink "" on event cs_etm/@tmc_etr0/u with 21 (Is a
+  directory)/perf/
+
+This failure is root caused with the commit 1dc925568f01 ("perf
+parse: Add a deep delete for parse event terms").
+
+The log shows, cs_etm fails to parse the sink attribution; cs_etm event
+relies on the event configuration to pass sink name, but the event
+specific configuration data cannot be passed properly with flow:
+
+  get_config_terms()
+    ADD_CONFIG_TERM(DRV_CFG, term->val.str);
+      __t->val.str = term->val.str;
+        `> __t->val.str is assigned to term->val.str;
+
+  parse_events_terms__purge()
+    parse_events_term__delete()
+      zfree(&term->val.str);
+        `> term->val.str is freed and assigned to NULL pointer;
+
+  cs_etm_set_sink_attr()
+    sink = __t->val.str;
+      `> sink string has been freed.
+
+To fix this issue, in the function get_config_terms(), this patch
+changes to use strdup() for allocation a new duplicate string rather
+than directly assignment string pointer.
+
+This patch addes a new field 'free_str' in the data structure
+perf_evsel_config_term; 'free_str' is set to true when the union is used
+as a string pointer; thus it can tell perf_evsel__free_config_terms() to
+free the string.
+
+Fixes: 1dc925568f01 ("perf parse: Add a deep delete for parse event terms")
+	Suggested-by: Jiri Olsa <jolsa@kernel.org>
+	Signed-off-by: Leo Yan <leo.yan@linaro.org>
+	Acked-by: Jiri Olsa <jolsa@kernel.org>
+	Cc: Adrian Hunter <adrian.hunter@intel.com>
+	Cc: Alexander Shishkin <alexander.shishkin@linux.intel.com>
+	Cc: Andi Kleen <ak@linux.intel.com>
+	Cc: Ian Rogers <irogers@google.com>
+	Cc: Mark Rutland <mark.rutland@arm.com>
+	Cc: Mathieu Poirier <mathieu.poirier@linaro.org>
+	Cc: Mike Leach <mike.leach@linaro.org>
+	Cc: Namhyung Kim <namhyung@kernel.org>
+	Cc: Peter Zijlstra <peterz@infradead.org>
+	Cc: Suzuki Poulouse <suzuki.poulose@arm.com>
+	Cc: linux-arm-kernel@lists.infradead.org
+Link: http://lore.kernel.org/lkml/20200117055251.24058-2-leo.yan@linaro.org
+[ Use zfree() in perf_evsel__free_config_terms ]
+	Signed-off-by: Arnaldo Carvalho de Melo <acme@redhat.com>
+
+:#	modified:   tools/perf/util/evsel_config.h
+
+(cherry picked from commit 3220fb8d5e59d7a9b59d02965d4209aef7691e9f)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	tools/perf/util/evsel_config.h
+#	tools/perf/util/parse-events.c
+diff --cc tools/perf/util/parse-events.c
+index ce2e8d2dbd45,c01ba6f8fdad..000000000000
+--- a/tools/perf/util/parse-events.c
++++ b/tools/perf/util/parse-events.c
+@@@ -1198,9 -1228,24 +1198,23 @@@ do {								
+  								\
+  	INIT_LIST_HEAD(&__t->list);				\
+  	__t->type       = PERF_EVSEL__CONFIG_TERM_ ## __type;	\
+ -	__t->weak	= term->weak;				\
+ -	list_add_tail(&__t->list, head_terms)
+ -
+ -#define ADD_CONFIG_TERM_VAL(__type, __name, __val)		\
+ -do {								\
+ -	ADD_CONFIG_TERM(__type);				\
+  	__t->val.__name = __val;				\
+++<<<<<<< HEAD
+ +	__t->weak	= term->weak;				\
+ +	list_add_tail(&__t->list, head_terms);			\
+++=======
++ } while (0)
++ 
++ #define ADD_CONFIG_TERM_STR(__type, __val)			\
++ do {								\
++ 	ADD_CONFIG_TERM(__type);				\
++ 	__t->val.str = strdup(__val);				\
++ 	if (!__t->val.str) {					\
++ 		zfree(&__t);					\
++ 		return -ENOMEM;					\
++ 	}							\
++ 	__t->free_str = true;					\
+++>>>>>>> 3220fb8d5e59 (perf parse: Copy string to perf_evsel_config_term)
+  } while (0)
+  
+  	struct parse_events_term *term;
+* Unmerged path tools/perf/util/evsel_config.h
+diff --git a/tools/perf/util/evsel.c b/tools/perf/util/evsel.c
+index c59d310d3797..63c28128acf6 100644
+--- a/tools/perf/util/evsel.c
++++ b/tools/perf/util/evsel.c
+@@ -1305,6 +1305,8 @@ static void perf_evsel__free_config_terms(struct perf_evsel *evsel)
+ 
+ 	list_for_each_entry_safe(term, h, &evsel->config_terms, list) {
+ 		list_del_init(&term->list);
++		if (term->free_str)
++			zfree(&term->val.str);
+ 		free(term);
+ 	}
+ }
+* Unmerged path tools/perf/util/evsel_config.h
+* Unmerged path tools/perf/util/parse-events.c
