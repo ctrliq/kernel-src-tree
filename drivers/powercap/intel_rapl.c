@@ -1578,7 +1578,7 @@ static void __exit rapl_exit(void)
 	powercap_unregister_control_type(rapl_msr_priv.control_type);
 }
 
-module_init(rapl_init);
+fs_initcall(rapl_init);
 module_exit(rapl_exit);
 
 MODULE_DESCRIPTION("Driver for Intel RAPL (Running Average Power Limit)");
