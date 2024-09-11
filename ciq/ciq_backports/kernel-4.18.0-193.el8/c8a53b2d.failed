@@ -1,0 +1,164 @@
+mm/hmm: Hold a mmgrab from hmm to mm
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-193.el8
+Rebuild_CHGLOG: - [mm] hmm: Hold a mmgrab from hmm to mm (Jerome Glisse) [1498655 1597758]
+Rebuild_FUZZ: 95.65%
+commit-author Jason Gunthorpe <jgg@ziepe.ca>
+commit c8a53b2db0aec40d8b217936e1b7f3d840c50390
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-193.el8/c8a53b2d.failed
+
+So long as a struct hmm pointer exists, so should the struct mm it is
+linked too. Hold the mmgrab() as soon as a hmm is created, and mmdrop() it
+once the hmm refcount goes to zero.
+
+Since mmdrop() (ie a 0 kref on struct mm) is now impossible with a !NULL
+mm->hmm delete the hmm_hmm_destroy().
+
+	Signed-off-by: Jason Gunthorpe <jgg@mellanox.com>
+	Reviewed-by: Jérôme Glisse <jglisse@redhat.com>
+	Reviewed-by: John Hubbard <jhubbard@nvidia.com>
+	Reviewed-by: Ralph Campbell <rcampbell@nvidia.com>
+	Reviewed-by: Ira Weiny <ira.weiny@intel.com>
+	Reviewed-by: Christoph Hellwig <hch@lst.de>
+	Tested-by: Philip Yang <Philip.Yang@amd.com>
+(cherry picked from commit c8a53b2db0aec40d8b217936e1b7f3d840c50390)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	mm/hmm.c
+diff --cc mm/hmm.c
+index bc98da945c75,080b17a2e87e..000000000000
+--- a/mm/hmm.c
++++ b/mm/hmm.c
+@@@ -29,7 -20,9 +29,8 @@@
+  #include <linux/swapops.h>
+  #include <linux/hugetlb.h>
+  #include <linux/memremap.h>
++ #include <linux/sched/mm.h>
+  #include <linux/jump_label.h>
+ -#include <linux/dma-mapping.h>
+  #include <linux/mmu_notifier.h>
+  #include <linux/memory_hotplug.h>
+  
+@@@ -83,13 -64,17 +84,14 @@@ static struct hmm *hmm_register(struct 
+  	hmm = kmalloc(sizeof(*hmm), GFP_KERNEL);
+  	if (!hmm)
+  		return NULL;
+ -	init_waitqueue_head(&hmm->wq);
+  	INIT_LIST_HEAD(&hmm->mirrors);
+  	init_rwsem(&hmm->mirrors_sem);
+ +	atomic_set(&hmm->sequence, 0);
+  	hmm->mmu_notifier.ops = NULL;
+  	INIT_LIST_HEAD(&hmm->ranges);
+ -	mutex_init(&hmm->lock);
+ -	kref_init(&hmm->kref);
+ -	hmm->notifiers = 0;
+ -	hmm->dead = false;
+ +	spin_lock_init(&hmm->lock);
+  	hmm->mm = mm;
++ 	mmgrab(hmm->mm);
+  
+  	spin_lock(&mm->page_table_lock);
+  	if (!mm->hmm)
+@@@ -121,39 -107,30 +124,66 @@@ error
+  	return NULL;
+  }
+  
+++<<<<<<< HEAD
+ +void hmm_mm_destroy(struct mm_struct *mm)
+ +{
+ +	kfree(mm->hmm);
+ +}
+ +
+ +static int hmm_invalidate_range(struct hmm *hmm,
+ +				const struct hmm_update *update)
+ +{
+ +	struct hmm_mirror *mirror;
+ +	struct hmm_range *range;
+ +
+ +	spin_lock(&hmm->lock);
+ +	list_for_each_entry(range, &hmm->ranges, list) {
+ +		if (update->end < range->start || update->start >= range->end)
+ +			continue;
+ +
+ +		range->valid = false;
+ +	}
+ +	spin_unlock(&hmm->lock);
+ +
+ +	down_read(&hmm->mirrors_sem);
+ +	list_for_each_entry(mirror, &hmm->mirrors, list) {
+ +		int ret;
+ +
+ +		ret = mirror->ops->sync_cpu_device_pagetables(mirror, update);
+ +		if (!update->blockable && ret == -EAGAIN) {
+ +			up_read(&hmm->mirrors_sem);
+ +			return -EAGAIN;
+ +		}
+ +	}
+ +	up_read(&hmm->mirrors_sem);
+ +
+ +	return 0;
+++=======
++ static void hmm_free_rcu(struct rcu_head *rcu)
++ {
++ 	kfree(container_of(rcu, struct hmm, rcu));
++ }
++ 
++ static void hmm_free(struct kref *kref)
++ {
++ 	struct hmm *hmm = container_of(kref, struct hmm, kref);
++ 	struct mm_struct *mm = hmm->mm;
++ 
++ 	mmu_notifier_unregister_no_release(&hmm->mmu_notifier, mm);
++ 
++ 	spin_lock(&mm->page_table_lock);
++ 	if (mm->hmm == hmm)
++ 		mm->hmm = NULL;
++ 	spin_unlock(&mm->page_table_lock);
++ 
++ 	mmdrop(hmm->mm);
++ 	mmu_notifier_call_srcu(&hmm->rcu, hmm_free_rcu);
++ }
++ 
++ static inline void hmm_put(struct hmm *hmm)
++ {
++ 	kref_put(&hmm->kref, hmm_free);
+++>>>>>>> c8a53b2db0ae (mm/hmm: Hold a mmgrab from hmm to mm)
+  }
+  
+  static void hmm_release(struct mmu_notifier *mn, struct mm_struct *mm)
+diff --git a/include/linux/hmm.h b/include/linux/hmm.h
+index 2f68a486cc0d..a8f77f224c03 100644
+--- a/include/linux/hmm.h
++++ b/include/linux/hmm.h
+@@ -415,14 +415,11 @@ bool hmm_vma_range_done(struct hmm_range *range);
+ int hmm_vma_fault(struct hmm_range *range, bool block);
+ 
+ /* Below are for HMM internal use only! Not to be used by device driver! */
+-void hmm_mm_destroy(struct mm_struct *mm);
+-
+ static inline void hmm_mm_init(struct mm_struct *mm)
+ {
+ 	mm->hmm = NULL;
+ }
+ #else /* IS_ENABLED(CONFIG_HMM_MIRROR) */
+-static inline void hmm_mm_destroy(struct mm_struct *mm) {}
+ static inline void hmm_mm_init(struct mm_struct *mm) {}
+ #endif /* IS_ENABLED(CONFIG_HMM_MIRROR) */
+ 
+diff --git a/kernel/fork.c b/kernel/fork.c
+index 958ed1205e11..05e2e3d47ced 100644
+--- a/kernel/fork.c
++++ b/kernel/fork.c
+@@ -674,7 +674,6 @@ void __mmdrop(struct mm_struct *mm)
+ 	WARN_ON_ONCE(mm == current->active_mm);
+ 	mm_free_pgd(mm);
+ 	destroy_context(mm);
+-	hmm_mm_destroy(mm);
+ 	mmu_notifier_mm_destroy(mm);
+ 	check_mm(mm);
+ 	put_user_ns(mm->user_ns);
+* Unmerged path mm/hmm.c
