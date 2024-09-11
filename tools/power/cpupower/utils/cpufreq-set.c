@@ -311,6 +311,7 @@ int cmd_freq_set(int argc, char **argv)
 		}
 	}
 
+	get_cpustate();
 
 	/* loop over CPUs */
 	for (cpu = bitmask_first(cpus_chosen);
@@ -327,6 +328,8 @@ int cmd_freq_set(int argc, char **argv)
 			return ret;
 		}
 	}
+
+	print_offline_cpus();
 
 	return 0;
 }
