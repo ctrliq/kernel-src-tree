@@ -1,0 +1,348 @@
+IB/core: Let IB core distribute cache update events
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-193.el8
+commit-author Parav Pandit <parav@mellanox.com>
+commit 6b57cea9221b0247ad5111b348522625e489a8e4
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-193.el8/6b57cea9.failed
+
+Currently when the low level driver notifies Pkey, GID, and port change
+events they are notified to the registered handlers in the order they are
+registered.
+
+IB core and other ULPs such as IPoIB are interested in GID, LID, Pkey
+change events.
+
+Since all GID queries done by ULPs are serviced by IB core, and the IB
+core deferes cache updates to a work queue, it is possible for other
+clients to see stale cache data when they handle their own events.
+
+For example, the below call tree shows how ipoib will call
+rdma_query_gid() concurrently with the update to the cache sitting in the
+WQ.
+
+mlx5_ib_handle_event()
+  ib_dispatch_event()
+    ib_cache_event()
+       queue_work() -> slow cache update
+
+    [..]
+    ipoib_event()
+     queue_work()
+       [..]
+       work handler
+         ipoib_ib_dev_flush_light()
+           __ipoib_ib_dev_flush()
+              ipoib_dev_addr_changed_valid()
+                rdma_query_gid() <- Returns old GID, cache not updated.
+
+Move all the event dispatch to a work queue so that the cache update is
+always done before any clients are notified.
+
+Fixes: f35faa4ba956 ("IB/core: Simplify ib_query_gid to always refer to cache")
+Link: https://lore.kernel.org/r/20191212113024.336702-3-leon@kernel.org
+	Signed-off-by: Parav Pandit <parav@mellanox.com>
+	Signed-off-by: Leon Romanovsky <leonro@mellanox.com>
+	Reviewed-by: Jason Gunthorpe <jgg@mellanox.com>
+	Signed-off-by: Jason Gunthorpe <jgg@mellanox.com>
+(cherry picked from commit 6b57cea9221b0247ad5111b348522625e489a8e4)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/infiniband/core/device.c
+#	include/rdma/ib_verbs.h
+diff --cc drivers/infiniband/core/device.c
+index 45bc8f4d7003,c38b2b0b078a..000000000000
+--- a/drivers/infiniband/core/device.c
++++ b/drivers/infiniband/core/device.c
+@@@ -313,10 -588,18 +313,23 @@@ struct ib_device *_ib_alloc_device(size
+  
+  	INIT_LIST_HEAD(&device->event_handler_list);
+  	spin_lock_init(&device->event_handler_lock);
+++<<<<<<< HEAD
+ +	rwlock_init(&device->client_data_lock);
+ +	INIT_LIST_HEAD(&device->client_data_list);
+ +	INIT_LIST_HEAD(&device->port_list);
+++=======
++ 	init_rwsem(&device->event_handler_rwsem);
++ 	mutex_init(&device->unregistration_lock);
++ 	/*
++ 	 * client_data needs to be alloc because we don't want our mark to be
++ 	 * destroyed if the user stores NULL in the client data.
++ 	 */
++ 	xa_init_flags(&device->client_data, XA_FLAGS_ALLOC);
++ 	init_rwsem(&device->client_data_rwsem);
++ 	xa_init_flags(&device->compat_devs, XA_FLAGS_ALLOC);
++ 	mutex_init(&device->compat_devs_mutex);
+++>>>>>>> 6b57cea9221b (IB/core: Let IB core distribute cache update events)
+  	init_completion(&device->unreg_completion);
+ -	INIT_WORK(&device->unregistration_work, ib_unregister_work);
+  
+  	return device;
+  }
+diff --cc include/rdma/ib_verbs.h
+index 909a15fe51a6,f36fb657518f..000000000000
+--- a/include/rdma/ib_verbs.h
++++ b/include/rdma/ib_verbs.h
+@@@ -2081,12 -2154,8 +2081,15 @@@ struct ib_port_cache 
+  
+  struct ib_cache {
+  	rwlock_t                lock;
+++<<<<<<< HEAD
+ +	struct ib_event_handler event_handler;
+ +	struct ib_port_cache   *ports;
+++=======
+++>>>>>>> 6b57cea9221b (IB/core: Let IB core distribute cache update events)
+  };
+  
+ +struct iw_cm_verbs;
+ +
+  struct ib_port_immutable {
+  	int                           pkey_tbl_len;
+  	int                           gid_tbl_len;
+@@@ -2431,16 -2628,18 +2434,20 @@@ struct ib_device 
+  	struct device                *dma_device;
+  	struct ib_device_ops	     ops;
+  	char                          name[IB_DEVICE_NAME_MAX];
+ -	struct rcu_head rcu_head;
+  
+  	struct list_head              event_handler_list;
+- 	spinlock_t                    event_handler_lock;
++ 	/* Protects event_handler_list */
++ 	struct rw_semaphore event_handler_rwsem;
++ 
++ 	/* Protects QP's event_handler calls and open_qp list */
++ 	spinlock_t event_handler_lock;
+  
+ -	struct rw_semaphore	      client_data_rwsem;
+ -	struct xarray                 client_data;
+ -	struct mutex                  unregistration_lock;
+ +	rwlock_t			client_data_lock;
+ +	struct list_head              core_list;
+ +	/* Access to the client_data_list is protected by the client_data_lock
+ +	 * rwlock and the lists_rwsem read-write semaphore
+ +	 */
+ +	struct list_head              client_data_list;
+  
+  	struct ib_cache               cache;
+  	/**
+diff --git a/drivers/infiniband/core/cache.c b/drivers/infiniband/core/cache.c
+index f50de4cb4cd9..dbe6d13c8b18 100644
+--- a/drivers/infiniband/core/cache.c
++++ b/drivers/infiniband/core/cache.c
+@@ -51,9 +51,8 @@ struct ib_pkey_cache {
+ 
+ struct ib_update_work {
+ 	struct work_struct work;
+-	struct ib_device  *device;
+-	u8                 port_num;
+-	bool		   enforce_security;
++	struct ib_event event;
++	bool enforce_security;
+ };
+ 
+ union ib_gid zgid;
+@@ -119,7 +118,7 @@ static void dispatch_gid_change_event(struct ib_device *ib_dev, u8 port)
+ 	event.element.port_num	= port;
+ 	event.event		= IB_EVENT_GID_CHANGE;
+ 
+-	ib_dispatch_event(&event);
++	ib_dispatch_event_clients(&event);
+ }
+ 
+ static const char * const gid_type_str[] = {
+@@ -1312,9 +1311,8 @@ static int config_non_roce_gid_cache(struct ib_device *device,
+ 	return ret;
+ }
+ 
+-static void ib_cache_update(struct ib_device *device,
+-			    u8                port,
+-			    bool	      enforce_security)
++static int
++ib_cache_update(struct ib_device *device, u8 port, bool enforce_security)
+ {
+ 	struct ib_port_attr       *tprops = NULL;
+ 	struct ib_pkey_cache      *pkey_cache = NULL, *old_pkey_cache;
+@@ -1322,11 +1320,11 @@ static void ib_cache_update(struct ib_device *device,
+ 	int                        ret;
+ 
+ 	if (!rdma_is_port_valid(device, port))
+-		return;
++		return -EINVAL;
+ 
+ 	tprops = kmalloc(sizeof *tprops, GFP_KERNEL);
+ 	if (!tprops)
+-		return;
++		return -ENOMEM;
+ 
+ 	ret = ib_query_port(device, port, tprops);
+ 	if (ret) {
+@@ -1344,8 +1342,10 @@ static void ib_cache_update(struct ib_device *device,
+ 	pkey_cache = kmalloc(struct_size(pkey_cache, table,
+ 					 tprops->pkey_tbl_len),
+ 			     GFP_KERNEL);
+-	if (!pkey_cache)
++	if (!pkey_cache) {
++		ret = -ENOMEM;
+ 		goto err;
++	}
+ 
+ 	pkey_cache->table_len = tprops->pkey_tbl_len;
+ 
+@@ -1380,50 +1380,84 @@ static void ib_cache_update(struct ib_device *device,
+ 
+ 	kfree(old_pkey_cache);
+ 	kfree(tprops);
+-	return;
++	return 0;
+ 
+ err:
+ 	kfree(pkey_cache);
+ 	kfree(tprops);
++	return ret;
++}
++
++static void ib_cache_event_task(struct work_struct *_work)
++{
++	struct ib_update_work *work =
++		container_of(_work, struct ib_update_work, work);
++	int ret;
++
++	/* Before distributing the cache update event, first sync
++	 * the cache.
++	 */
++	ret = ib_cache_update(work->event.device, work->event.element.port_num,
++			      work->enforce_security);
++
++	/* GID event is notified already for individual GID entries by
++	 * dispatch_gid_change_event(). Hence, notifiy for rest of the
++	 * events.
++	 */
++	if (!ret && work->event.event != IB_EVENT_GID_CHANGE)
++		ib_dispatch_event_clients(&work->event);
++
++	kfree(work);
+ }
+ 
+-static void ib_cache_task(struct work_struct *_work)
++static void ib_generic_event_task(struct work_struct *_work)
+ {
+ 	struct ib_update_work *work =
+ 		container_of(_work, struct ib_update_work, work);
+ 
+-	ib_cache_update(work->device,
+-			work->port_num,
+-			work->enforce_security);
++	ib_dispatch_event_clients(&work->event);
+ 	kfree(work);
+ }
+ 
+-static void ib_cache_event(struct ib_event_handler *handler,
+-			   struct ib_event *event)
++static bool is_cache_update_event(const struct ib_event *event)
++{
++	return (event->event == IB_EVENT_PORT_ERR    ||
++		event->event == IB_EVENT_PORT_ACTIVE ||
++		event->event == IB_EVENT_LID_CHANGE  ||
++		event->event == IB_EVENT_PKEY_CHANGE ||
++		event->event == IB_EVENT_CLIENT_REREGISTER ||
++		event->event == IB_EVENT_GID_CHANGE);
++}
++
++/**
++ * ib_dispatch_event - Dispatch an asynchronous event
++ * @event:Event to dispatch
++ *
++ * Low-level drivers must call ib_dispatch_event() to dispatch the
++ * event to all registered event handlers when an asynchronous event
++ * occurs.
++ */
++void ib_dispatch_event(const struct ib_event *event)
+ {
+ 	struct ib_update_work *work;
+ 
+-	if (event->event == IB_EVENT_PORT_ERR    ||
+-	    event->event == IB_EVENT_PORT_ACTIVE ||
+-	    event->event == IB_EVENT_LID_CHANGE  ||
+-	    event->event == IB_EVENT_PKEY_CHANGE ||
+-	    event->event == IB_EVENT_CLIENT_REREGISTER ||
+-	    event->event == IB_EVENT_GID_CHANGE) {
+-		work = kmalloc(sizeof *work, GFP_ATOMIC);
+-		if (work) {
+-			INIT_WORK(&work->work, ib_cache_task);
+-			work->device   = event->device;
+-			work->port_num = event->element.port_num;
+-			if (event->event == IB_EVENT_PKEY_CHANGE ||
+-			    event->event == IB_EVENT_GID_CHANGE)
+-				work->enforce_security = true;
+-			else
+-				work->enforce_security = false;
+-
+-			queue_work(ib_wq, &work->work);
+-		}
+-	}
++	work = kzalloc(sizeof(*work), GFP_ATOMIC);
++	if (!work)
++		return;
++
++	if (is_cache_update_event(event))
++		INIT_WORK(&work->work, ib_cache_event_task);
++	else
++		INIT_WORK(&work->work, ib_generic_event_task);
++
++	work->event = *event;
++	if (event->event == IB_EVENT_PKEY_CHANGE ||
++	    event->event == IB_EVENT_GID_CHANGE)
++		work->enforce_security = true;
++
++	queue_work(ib_wq, &work->work);
+ }
++EXPORT_SYMBOL(ib_dispatch_event);
+ 
+ int ib_cache_setup_one(struct ib_device *device)
+ {
+@@ -1449,9 +1483,6 @@ int ib_cache_setup_one(struct ib_device *device)
+ 	for (p = 0; p <= rdma_end_port(device) - rdma_start_port(device); ++p)
+ 		ib_cache_update(device, p + rdma_start_port(device), true);
+ 
+-	INIT_IB_EVENT_HANDLER(&device->cache.event_handler,
+-			      device, ib_cache_event);
+-	ib_register_event_handler(&device->cache.event_handler);
+ 	return 0;
+ }
+ 
+@@ -1477,14 +1508,12 @@ void ib_cache_release_one(struct ib_device *device)
+ 
+ void ib_cache_cleanup_one(struct ib_device *device)
+ {
+-	/* The cleanup function unregisters the event handler,
+-	 * waits for all in-progress workqueue elements and cleans
+-	 * up the GID cache. This function should be called after
+-	 * the device was removed from the devices list and all
+-	 * clients were removed, so the cache exists but is
++	/* The cleanup function waits for all in-progress workqueue
++	 * elements and cleans up the GID cache. This function should be
++	 * called after the device was removed from the devices list and
++	 * all clients were removed, so the cache exists but is
+ 	 * non-functional and shouldn't be updated anymore.
+ 	 */
+-	ib_unregister_event_handler(&device->cache.event_handler);
+ 	flush_workqueue(ib_wq);
+ 	gid_table_cleanup_one(device);
+ 
+diff --git a/drivers/infiniband/core/core_priv.h b/drivers/infiniband/core/core_priv.h
+index 6629502453b0..979d99adb897 100644
+--- a/drivers/infiniband/core/core_priv.h
++++ b/drivers/infiniband/core/core_priv.h
+@@ -113,6 +113,7 @@ unsigned long roce_gid_type_mask_support(struct ib_device *ib_dev, u8 port);
+ int ib_cache_setup_one(struct ib_device *device);
+ void ib_cache_cleanup_one(struct ib_device *device);
+ void ib_cache_release_one(struct ib_device *device);
++void ib_dispatch_event_clients(struct ib_event *event);
+ 
+ #ifdef CONFIG_CGROUP_RDMA
+ int ib_device_register_rdmacg(struct ib_device *device);
+* Unmerged path drivers/infiniband/core/device.c
+* Unmerged path include/rdma/ib_verbs.h
