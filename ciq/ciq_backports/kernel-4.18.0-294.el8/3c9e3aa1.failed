@@ -1,0 +1,185 @@
+kasan: add tag related helper functions
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Andrey Konovalov <andreyknvl@google.com>
+commit 3c9e3aa11094e821aff4a8f6812a6e032293dbc0
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/3c9e3aa1.failed
+
+This commit adds a few helper functions, that are meant to be used to work
+with tags embedded in the top byte of kernel pointers: to set, to get or
+to reset the top byte.
+
+Link: http://lkml.kernel.org/r/f6c6437bb8e143bc44f42c3c259c62e734be7935.1544099024.git.andreyknvl@google.com
+	Signed-off-by: Andrey Konovalov <andreyknvl@google.com>
+	Cc: Andrey Ryabinin <aryabinin@virtuozzo.com>
+	Cc: Christoph Lameter <cl@linux.com>
+	Cc: Dmitry Vyukov <dvyukov@google.com>
+	Cc: Mark Rutland <mark.rutland@arm.com>
+	Cc: Will Deacon <will.deacon@arm.com>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit 3c9e3aa11094e821aff4a8f6812a6e032293dbc0)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/kasan.h
+#	mm/kasan/tags.c
+diff --cc include/linux/kasan.h
+index fa457ffe3494,a477ce2abdc9..000000000000
+--- a/include/linux/kasan.h
++++ b/include/linux/kasan.h
+@@@ -155,4 -151,37 +155,40 @@@ static inline size_t kasan_metadata_siz
+  
+  #endif /* CONFIG_KASAN */
+  
+++<<<<<<< HEAD
+++=======
++ #ifdef CONFIG_KASAN_GENERIC
++ 
++ #define KASAN_SHADOW_INIT 0
++ 
++ void kasan_cache_shrink(struct kmem_cache *cache);
++ void kasan_cache_shutdown(struct kmem_cache *cache);
++ 
++ #else /* CONFIG_KASAN_GENERIC */
++ 
++ static inline void kasan_cache_shrink(struct kmem_cache *cache) {}
++ static inline void kasan_cache_shutdown(struct kmem_cache *cache) {}
++ 
++ #endif /* CONFIG_KASAN_GENERIC */
++ 
++ #ifdef CONFIG_KASAN_SW_TAGS
++ 
++ #define KASAN_SHADOW_INIT 0xFF
++ 
++ void kasan_init_tags(void);
++ 
++ void *kasan_reset_tag(const void *addr);
++ 
++ #else /* CONFIG_KASAN_SW_TAGS */
++ 
++ static inline void kasan_init_tags(void) { }
++ 
++ static inline void *kasan_reset_tag(const void *addr)
++ {
++ 	return (void *)addr;
++ }
++ 
++ #endif /* CONFIG_KASAN_SW_TAGS */
++ 
+++>>>>>>> 3c9e3aa11094 (kasan: add tag related helper functions)
+  #endif /* LINUX_KASAN_H */
+* Unmerged path mm/kasan/tags.c
+diff --git a/arch/arm64/include/asm/kasan.h b/arch/arm64/include/asm/kasan.h
+index 8758bb008436..b52aacd2c526 100644
+--- a/arch/arm64/include/asm/kasan.h
++++ b/arch/arm64/include/asm/kasan.h
+@@ -4,12 +4,16 @@
+ 
+ #ifndef __ASSEMBLY__
+ 
+-#ifdef CONFIG_KASAN
+-
+ #include <linux/linkage.h>
+ #include <asm/memory.h>
+ #include <asm/pgtable-types.h>
+ 
++#define arch_kasan_set_tag(addr, tag)	__tag_set(addr, tag)
++#define arch_kasan_reset_tag(addr)	__tag_reset(addr)
++#define arch_kasan_get_tag(addr)	__tag_get(addr)
++
++#ifdef CONFIG_KASAN
++
+ /*
+  * KASAN_SHADOW_START: beginning of the kernel virtual addresses.
+  * KASAN_SHADOW_END: KASAN_SHADOW_START + 1/N of kernel virtual addresses,
+diff --git a/arch/arm64/include/asm/memory.h b/arch/arm64/include/asm/memory.h
+index d7a8300dfdd8..b78f16689edd 100644
+--- a/arch/arm64/include/asm/memory.h
++++ b/arch/arm64/include/asm/memory.h
+@@ -235,6 +235,18 @@ extern u64			vabits_user;
+ #define untagged_addr(addr)	\
+ 	((__typeof__(addr))sign_extend64((u64)(addr), 55))
+ 
++#ifdef CONFIG_KASAN_SW_TAGS
++#define __tag_shifted(tag)	((u64)(tag) << 56)
++#define __tag_set(addr, tag)	(__typeof__(addr))( \
++		((u64)(addr) & ~__tag_shifted(0xff)) | __tag_shifted(tag))
++#define __tag_reset(addr)	untagged_addr(addr)
++#define __tag_get(addr)		(__u8)((u64)(addr) >> 56)
++#else
++#define __tag_set(addr, tag)	(addr)
++#define __tag_reset(addr)	(addr)
++#define __tag_get(addr)		0
++#endif
++
+ /*
+  * Physical vs virtual RAM address space conversion.  These are
+  * private definitions which should NOT be used outside memory.h
+diff --git a/arch/arm64/mm/kasan_init.c b/arch/arm64/mm/kasan_init.c
+index 26fefff7f86f..04117867c782 100644
+--- a/arch/arm64/mm/kasan_init.c
++++ b/arch/arm64/mm/kasan_init.c
+@@ -242,6 +242,8 @@ void __init kasan_init(void)
+ 	memset(kasan_early_shadow_page, 0, PAGE_SIZE);
+ 	cpu_replace_ttbr1(lm_alias(swapper_pg_dir));
+ 
++	kasan_init_tags();
++
+ 	/* At this point kasan is fully initialized. Enable error messages */
+ 	init_task.kasan_depth = 0;
+ 	pr_info("KernelAddressSanitizer initialized\n");
+* Unmerged path include/linux/kasan.h
+diff --git a/mm/kasan/kasan.h b/mm/kasan/kasan.h
+index c12dcfde2ebd..0b1c05c41a2d 100644
+--- a/mm/kasan/kasan.h
++++ b/mm/kasan/kasan.h
+@@ -8,6 +8,10 @@
+ #define KASAN_SHADOW_SCALE_SIZE (1UL << KASAN_SHADOW_SCALE_SHIFT)
+ #define KASAN_SHADOW_MASK       (KASAN_SHADOW_SCALE_SIZE - 1)
+ 
++#define KASAN_TAG_KERNEL	0xFF /* native kernel pointers tag */
++#define KASAN_TAG_INVALID	0xFE /* inaccessible memory tag */
++#define KASAN_TAG_MAX		0xFD /* maximum value for random tags */
++
+ #define KASAN_FREE_PAGE         0xFF  /* page was freed */
+ #define KASAN_PAGE_REDZONE      0xFE  /* redzone for kmalloc_large allocations */
+ #define KASAN_KMALLOC_REDZONE   0xFC  /* redzone inside slub object */
+@@ -120,6 +124,33 @@ static inline void quarantine_reduce(void) { }
+ static inline void quarantine_remove_cache(struct kmem_cache *cache) { }
+ #endif
+ 
++#ifdef CONFIG_KASAN_SW_TAGS
++
++u8 random_tag(void);
++
++#else
++
++static inline u8 random_tag(void)
++{
++	return 0;
++}
++
++#endif
++
++#ifndef arch_kasan_set_tag
++#define arch_kasan_set_tag(addr, tag)	((void *)(addr))
++#endif
++#ifndef arch_kasan_reset_tag
++#define arch_kasan_reset_tag(addr)	((void *)(addr))
++#endif
++#ifndef arch_kasan_get_tag
++#define arch_kasan_get_tag(addr)	0
++#endif
++
++#define set_tag(addr, tag)	((void *)arch_kasan_set_tag((addr), (tag)))
++#define reset_tag(addr)		((void *)arch_kasan_reset_tag(addr))
++#define get_tag(addr)		arch_kasan_get_tag(addr)
++
+ /*
+  * Exported functions for interfaces called from assembly or from generated
+  * code. Declarations here to avoid warning about missing declarations.
+* Unmerged path mm/kasan/tags.c
