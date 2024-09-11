@@ -1,0 +1,179 @@
+nvme-multipath: do not reset on unknown status
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author John Meneghini <johnm@netapp.com>
+commit 764e9332098c0e60251386a507fe46ac91276120
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/764e9332.failed
+
+The nvme multipath error handling defaults to controller reset if the
+error is unknown. There are, however, no existing nvme status codes that
+indicate a reset should be used, and resetting causes unnecessary
+disruption to the rest of IO.
+
+Change nvme's error handling to first check if failover should happen.
+If not, let the normal error handling take over rather than reset the
+controller.
+
+Based-on-a-patch-by: Christoph Hellwig <hch@lst.de>
+	Reviewed-by: Hannes Reinecke <hare@suse.de>
+	Signed-off-by: John Meneghini <johnm@netapp.com>
+	Signed-off-by: Keith Busch <kbusch@kernel.org>
+(cherry picked from commit 764e9332098c0e60251386a507fe46ac91276120)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/nvme/host/core.c
+#	drivers/nvme/host/multipath.c
+#	drivers/nvme/host/nvme.h
+diff --cc drivers/nvme/host/core.c
+index 54bfa09c007b,fde4b3a526ad..000000000000
+--- a/drivers/nvme/host/core.c
++++ b/drivers/nvme/host/core.c
+@@@ -269,13 -291,8 +269,18 @@@ void nvme_complete_rq(struct request *r
+  		nvme_req(req)->ctrl->comp_seen = true;
+  
+  	if (unlikely(status != BLK_STS_OK && nvme_req_needs_retry(req))) {
+++<<<<<<< HEAD
+ +		if (blk_path_error(status)) {
+ +			if (req->cmd_flags & REQ_NVME_MPATH) {
+ +				nvme_failover_req(req);
+ +				return;
+ +			}
+ +			nvme_update_ana(req);
+ +		}
+++=======
++ 		if ((req->cmd_flags & REQ_NVME_MPATH) && nvme_failover_req(req))
++ 			return;
+++>>>>>>> 764e9332098c (nvme-multipath: do not reset on unknown status)
+  
+  		if (!blk_queue_dying(req->q)) {
+  			nvme_retry_req(req);
+diff --cc drivers/nvme/host/multipath.c
+index 32d9f1d9cee4,90dd1d641b7b..000000000000
+--- a/drivers/nvme/host/multipath.c
++++ b/drivers/nvme/host/multipath.c
+@@@ -64,47 -64,16 +64,58 @@@ void nvme_set_disk_name(char *disk_name
+  	}
+  }
+  
+++<<<<<<< HEAD
+ +static bool nvme_ana_error(u16 status)
+ +{
+ +	switch (status & 0x7ff) {
+ +	case NVME_SC_ANA_TRANSITION:
+ +	case NVME_SC_ANA_INACCESSIBLE:
+ +	case NVME_SC_ANA_PERSISTENT_LOSS:
+ +		return true;
+ +	}
+ +	return false;
+ +}
+ +
+ +static void __nvme_update_ana(struct nvme_ns *ns)
+ +{
+ +	if (!ns->ctrl->ana_log_buf)
+ +		return;
+ +
+ +	set_bit(NVME_NS_ANA_PENDING, &ns->flags);
+ +	queue_work(nvme_wq, &ns->ctrl->ana_work);
+ +}
+ +
+ +void nvme_update_ana(struct request *req)
+ +{
+ +	struct nvme_ns *ns = req->q->queuedata;
+ +	u16 status = nvme_req(req)->status;
+ +
+ +	if (nvme_ana_error(status))
+ +		__nvme_update_ana(ns);
+ +}
+ +
+ +void nvme_failover_req(struct request *req)
+++=======
++ bool nvme_failover_req(struct request *req)
+++>>>>>>> 764e9332098c (nvme-multipath: do not reset on unknown status)
+  {
+  	struct nvme_ns *ns = req->q->queuedata;
+  	u16 status = nvme_req(req)->status;
+  	unsigned long flags;
+  
+++<<<<<<< HEAD
+ +	spin_lock_irqsave(&ns->head->requeue_lock, flags);
+ +	blk_steal_bios(&ns->head->requeue_list, req);
+ +	spin_unlock_irqrestore(&ns->head->requeue_lock, flags);
+ +	blk_mq_end_request(req, 0);
+ +
+ +	if (nvme_ana_error(status)) {
+++=======
++ 	switch (status & 0x7ff) {
++ 	case NVME_SC_ANA_TRANSITION:
++ 	case NVME_SC_ANA_INACCESSIBLE:
++ 	case NVME_SC_ANA_PERSISTENT_LOSS:
+++>>>>>>> 764e9332098c (nvme-multipath: do not reset on unknown status)
+  		/*
+  		 * If we got back an ANA error we know the controller is alive,
+  		 * but not ready to serve this namespaces.  The spec suggests
+@@@ -128,16 -98,17 +139,21 @@@
+  		nvme_mpath_clear_current_path(ns);
+  		break;
+  	default:
+- 		/*
+- 		 * Reset the controller for any non-ANA error as we don't know
+- 		 * what caused the error.
+- 		 */
+- 		nvme_reset_ctrl(ns->ctrl);
+- 		break;
++ 		/* This was a non-ANA error so follow the normal error path. */
++ 		return false;
+  	}
+  
+++<<<<<<< HEAD
+ +kick_requeue:
+++=======
++ 	spin_lock_irqsave(&ns->head->requeue_lock, flags);
++ 	blk_steal_bios(&ns->head->requeue_list, req);
++ 	spin_unlock_irqrestore(&ns->head->requeue_lock, flags);
++ 	blk_mq_end_request(req, 0);
++ 
+++>>>>>>> 764e9332098c (nvme-multipath: do not reset on unknown status)
+  	kblockd_schedule_work(&ns->head->requeue_work);
++ 	return true;
+  }
+  
+  void nvme_kick_requeue_lists(struct nvme_ctrl *ctrl)
+diff --cc drivers/nvme/host/nvme.h
+index 09ed30add536,d800b9a51c2c..000000000000
+--- a/drivers/nvme/host/nvme.h
++++ b/drivers/nvme/host/nvme.h
+@@@ -504,8 -550,7 +504,12 @@@ void nvme_mpath_wait_freeze(struct nvme
+  void nvme_mpath_start_freeze(struct nvme_subsystem *subsys);
+  void nvme_set_disk_name(char *disk_name, struct nvme_ns *ns,
+  			struct nvme_ctrl *ctrl, int *flags);
+++<<<<<<< HEAD
+ +void nvme_failover_req(struct request *req);
+ +void nvme_update_ana(struct request *req);
+++=======
++ bool nvme_failover_req(struct request *req);
+++>>>>>>> 764e9332098c (nvme-multipath: do not reset on unknown status)
+  void nvme_kick_requeue_lists(struct nvme_ctrl *ctrl);
+  int nvme_mpath_alloc_disk(struct nvme_ctrl *ctrl,struct nvme_ns_head *head);
+  void nvme_mpath_add_disk(struct nvme_ns *ns, struct nvme_id_ns *id);
+@@@ -544,12 -599,10 +548,13 @@@ static inline void nvme_set_disk_name(c
+  	sprintf(disk_name, "nvme%dn%d", ctrl->instance, ns->head->instance);
+  }
+  
+- static inline void nvme_failover_req(struct request *req)
++ static inline bool nvme_failover_req(struct request *req)
+  {
++ 	return false;
+  }
+ +static inline void nvme_update_ana(struct request *req)
+ +{
+ +}
+  static inline void nvme_kick_requeue_lists(struct nvme_ctrl *ctrl)
+  {
+  }
+* Unmerged path drivers/nvme/host/core.c
+* Unmerged path drivers/nvme/host/multipath.c
+* Unmerged path drivers/nvme/host/nvme.h
