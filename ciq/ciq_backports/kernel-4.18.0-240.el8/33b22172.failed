@@ -1,0 +1,406 @@
+KVM: x86: move nested-related kvm_x86_ops to a separate struct
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Paolo Bonzini <pbonzini@redhat.com>
+commit 33b22172452f05c351fd2fa24c28d2e76c7b0692
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/33b22172.failed
+
+Clean up some of the patching of kvm_x86_ops, by moving kvm_x86_ops related to
+nested virtualization into a separate struct.
+
+As a result, these ops will always be non-NULL on VMX.  This is not a problem:
+
+* check_nested_events is only called if is_guest_mode(vcpu) returns true
+
+* get_nested_state treats VMXOFF state the same as nested being disabled
+
+* set_nested_state fails if you attempt to set nested state while
+  nesting is disabled
+
+* nested_enable_evmcs could already be called on a CPU without VMX enabled
+  in CPUID.
+
+* nested_get_evmcs_version was fixed in the previous patch
+
+	Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+(cherry picked from commit 33b22172452f05c351fd2fa24c28d2e76c7b0692)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/include/asm/kvm_host.h
+#	arch/x86/kvm/hyperv.c
+#	arch/x86/kvm/svm/nested.c
+#	arch/x86/kvm/svm/svm.c
+#	arch/x86/kvm/svm/svm.h
+#	arch/x86/kvm/vmx/nested.c
+#	arch/x86/kvm/x86.c
+diff --cc arch/x86/include/asm/kvm_host.h
+index 10275c160b4e,a239a297be33..000000000000
+--- a/arch/x86/include/asm/kvm_host.h
++++ b/arch/x86/include/asm/kvm_host.h
+@@@ -1171,16 -1174,10 +1171,15 @@@ struct kvm_x86_ops 
+  
+  	int (*check_intercept)(struct kvm_vcpu *vcpu,
+  			       struct x86_instruction_info *info,
+ -			       enum x86_intercept_stage stage,
+ -			       struct x86_exception *exception);
+ -	void (*handle_exit_irqoff)(struct kvm_vcpu *vcpu);
+ +			       enum x86_intercept_stage stage);
+ +	void (*handle_exit_irqoff)(struct kvm_vcpu *vcpu,
+ +		enum exit_fastpath_completion *exit_fastpath);
+ +	bool (*mpx_supported)(void);
+ +	bool (*xsaves_supported)(void);
+ +	bool (*umip_emulated)(void);
+ +	bool (*pt_supported)(void);
+ +	bool (*pku_supported)(void);
+  
+- 	int (*check_nested_events)(struct kvm_vcpu *vcpu);
+  	void (*request_immediate_exit)(struct kvm_vcpu *vcpu);
+  
+  	void (*sched_in)(struct kvm_vcpu *kvm, int cpu);
+@@@ -1269,6 -1255,30 +1257,33 @@@
+  	int (*enable_direct_tlbflush)(struct kvm_vcpu *vcpu);
+  };
+  
+++<<<<<<< HEAD
+++=======
++ struct kvm_x86_nested_ops {
++ 	int (*check_events)(struct kvm_vcpu *vcpu);
++ 	int (*get_state)(struct kvm_vcpu *vcpu,
++ 			 struct kvm_nested_state __user *user_kvm_nested_state,
++ 			 unsigned user_data_size);
++ 	int (*set_state)(struct kvm_vcpu *vcpu,
++ 			 struct kvm_nested_state __user *user_kvm_nested_state,
++ 			 struct kvm_nested_state *kvm_state);
++ 	bool (*get_vmcs12_pages)(struct kvm_vcpu *vcpu);
++ 
++ 	int (*enable_evmcs)(struct kvm_vcpu *vcpu,
++ 			    uint16_t *vmcs_version);
++ 	uint16_t (*get_evmcs_version)(struct kvm_vcpu *vcpu);
++ };
++ 
++ struct kvm_x86_init_ops {
++ 	int (*cpu_has_kvm_support)(void);
++ 	int (*disabled_by_bios)(void);
++ 	int (*check_processor_compatibility)(void);
++ 	int (*hardware_setup)(void);
++ 
++ 	struct kvm_x86_ops *runtime_ops;
++ };
++ 
+++>>>>>>> 33b22172452f (KVM: x86: move nested-related kvm_x86_ops to a separate struct)
+  struct kvm_arch_async_pf {
+  	u32 token;
+  	gfn_t gfn;
+diff --cc arch/x86/kvm/hyperv.c
+index 1d09e7ed5d6f,2f96ff9e60ee..000000000000
+--- a/arch/x86/kvm/hyperv.c
++++ b/arch/x86/kvm/hyperv.c
+@@@ -1802,8 -1799,8 +1802,13 @@@ int kvm_vcpu_ioctl_get_hv_cpuid(struct 
+  	};
+  	int i, nent = ARRAY_SIZE(cpuid_entries);
+  
+++<<<<<<< HEAD
+ +	if (kvm_x86_ops->nested_get_evmcs_version)
+ +		evmcs_ver = kvm_x86_ops->nested_get_evmcs_version(vcpu);
+++=======
++ 	if (kvm_x86_ops.nested_ops->get_evmcs_version)
++ 		evmcs_ver = kvm_x86_ops.nested_ops->get_evmcs_version(vcpu);
+++>>>>>>> 33b22172452f (KVM: x86: move nested-related kvm_x86_ops to a separate struct)
+  
+  	/* Skip NESTED_FEATURES if eVMCS is not supported */
+  	if (!evmcs_ver)
+diff --cc arch/x86/kvm/svm/svm.c
+index 5320d1c8c1bc,c86f7278509b..000000000000
+--- a/arch/x86/kvm/svm/svm.c
++++ b/arch/x86/kvm/svm/svm.c
+@@@ -7443,9 -3902,9 +7443,15 @@@ static bool svm_apic_init_signal_blocke
+  	/*
+  	 * TODO: Last condition latch INIT signals on vCPU when
+  	 * vCPU is in guest-mode and vmcb12 defines intercept on INIT.
+++<<<<<<< HEAD
+ +	 * To properly emulate the INIT intercept, SVM should implement
+ +	 * kvm_x86_ops->check_nested_events() and call nested_svm_vmexit()
+ +	 * there if an INIT signal is pending.
+++=======
++ 	 * To properly emulate the INIT intercept,
++ 	 * svm_check_nested_events() should call nested_svm_vmexit()
++ 	 * if an INIT signal is pending.
+++>>>>>>> 33b22172452f (KVM: x86: move nested-related kvm_x86_ops to a separate struct)
+  	 */
+  	return !gif_set(svm) ||
+  		   (svm->vmcb->control.intercept & (1ULL << INTERCEPT_INIT));
+@@@ -7587,9 -4051,15 +7595,18 @@@ static struct kvm_x86_ops svm_x86_ops _
+  	.need_emulation_on_page_fault = svm_need_emulation_on_page_fault,
+  
+  	.apic_init_signal_blocked = svm_apic_init_signal_blocked,
+++<<<<<<< HEAD
+++=======
++ };
++ 
++ static struct kvm_x86_init_ops svm_init_ops __initdata = {
++ 	.cpu_has_kvm_support = has_svm,
++ 	.disabled_by_bios = is_disabled,
++ 	.hardware_setup = svm_hardware_setup,
++ 	.check_processor_compatibility = svm_check_processor_compat,
++ 
++ 	.runtime_ops = &svm_x86_ops,
+++>>>>>>> 33b22172452f (KVM: x86: move nested-related kvm_x86_ops to a separate struct)
+  };
+  
+  static int __init svm_init(void)
+diff --cc arch/x86/kvm/vmx/nested.c
+index 65d39111747b,56074d3443e0..000000000000
+--- a/arch/x86/kvm/vmx/nested.c
++++ b/arch/x86/kvm/vmx/nested.c
+@@@ -6315,28 -6427,27 +6315,40 @@@ __init int nested_vmx_hardware_setup(in
+  		init_vmcs_shadow_fields();
+  	}
+  
+ -	exit_handlers[EXIT_REASON_VMCLEAR]	= handle_vmclear;
+ -	exit_handlers[EXIT_REASON_VMLAUNCH]	= handle_vmlaunch;
+ -	exit_handlers[EXIT_REASON_VMPTRLD]	= handle_vmptrld;
+ -	exit_handlers[EXIT_REASON_VMPTRST]	= handle_vmptrst;
+ -	exit_handlers[EXIT_REASON_VMREAD]	= handle_vmread;
+ -	exit_handlers[EXIT_REASON_VMRESUME]	= handle_vmresume;
+ -	exit_handlers[EXIT_REASON_VMWRITE]	= handle_vmwrite;
+ -	exit_handlers[EXIT_REASON_VMOFF]	= handle_vmoff;
+ -	exit_handlers[EXIT_REASON_VMON]		= handle_vmon;
+ -	exit_handlers[EXIT_REASON_INVEPT]	= handle_invept;
+ -	exit_handlers[EXIT_REASON_INVVPID]	= handle_invvpid;
+ -	exit_handlers[EXIT_REASON_VMFUNC]	= handle_vmfunc;
+ -
+ +	nested_vmx_setup_ctls_msrs(&vmcs_config.nested,
+ +				   vmx_capability.ept, enable_apicv);
+ +
+++<<<<<<< HEAD
+ +	exit_handlers[EXIT_REASON_VMCLEAR]	= handle_vmclear,
+ +	exit_handlers[EXIT_REASON_VMLAUNCH]	= handle_vmlaunch,
+ +	exit_handlers[EXIT_REASON_VMPTRLD]	= handle_vmptrld,
+ +	exit_handlers[EXIT_REASON_VMPTRST]	= handle_vmptrst,
+ +	exit_handlers[EXIT_REASON_VMREAD]	= handle_vmread,
+ +	exit_handlers[EXIT_REASON_VMRESUME]	= handle_vmresume,
+ +	exit_handlers[EXIT_REASON_VMWRITE]	= handle_vmwrite,
+ +	exit_handlers[EXIT_REASON_VMOFF]	= handle_vmoff,
+ +	exit_handlers[EXIT_REASON_VMON]		= handle_vmon,
+ +	exit_handlers[EXIT_REASON_INVEPT]	= handle_invept,
+ +	exit_handlers[EXIT_REASON_INVVPID]	= handle_invvpid,
+ +	exit_handlers[EXIT_REASON_VMFUNC]	= handle_vmfunc,
+ +
+ +	kvm_x86_ops->check_nested_events = vmx_check_nested_events;
+ +	kvm_x86_ops->get_nested_state = vmx_get_nested_state;
+ +	kvm_x86_ops->set_nested_state = vmx_set_nested_state;
+ +	kvm_x86_ops->get_vmcs12_pages = nested_get_vmcs12_pages,
+ +	kvm_x86_ops->nested_enable_evmcs = nested_enable_evmcs;
+ +	kvm_x86_ops->nested_get_evmcs_version = nested_get_evmcs_version;
+ +
+++=======
+++>>>>>>> 33b22172452f (KVM: x86: move nested-related kvm_x86_ops to a separate struct)
+  	return 0;
+  }
++ 
++ struct kvm_x86_nested_ops vmx_nested_ops = {
++ 	.check_events = vmx_check_nested_events,
++ 	.get_state = vmx_get_nested_state,
++ 	.set_state = vmx_set_nested_state,
++ 	.get_vmcs12_pages = nested_get_vmcs12_pages,
++ 	.enable_evmcs = nested_enable_evmcs,
++ 	.get_evmcs_version = nested_get_evmcs_version,
++ };
+diff --cc arch/x86/kvm/x86.c
+index bef07866f41a,8c0b77ac8dc6..000000000000
+--- a/arch/x86/kvm/x86.c
++++ b/arch/x86/kvm/x86.c
+@@@ -3383,14 -3442,14 +3383,23 @@@ int kvm_vm_ioctl_check_extension(struc
+  		r = KVM_X2APIC_API_VALID_FLAGS;
+  		break;
+  	case KVM_CAP_NESTED_STATE:
+++<<<<<<< HEAD
+ +		r = kvm_x86_ops->get_nested_state ?
+ +			kvm_x86_ops->get_nested_state(NULL, NULL, 0) : 0;
+++=======
++ 		r = kvm_x86_ops.nested_ops->get_state ?
++ 			kvm_x86_ops.nested_ops->get_state(NULL, NULL, 0) : 0;
+++>>>>>>> 33b22172452f (KVM: x86: move nested-related kvm_x86_ops to a separate struct)
+  		break;
+  	case KVM_CAP_HYPERV_DIRECT_TLBFLUSH:
+ -		r = kvm_x86_ops.enable_direct_tlbflush != NULL;
+ +		r = kvm_x86_ops->enable_direct_tlbflush != NULL;
+  		break;
+  	case KVM_CAP_HYPERV_ENLIGHTENED_VMCS:
+++<<<<<<< HEAD
+ +		r = kvm_x86_ops->nested_enable_evmcs != NULL;
+++=======
++ 		r = kvm_x86_ops.nested_ops->enable_evmcs != NULL;
+++>>>>>>> 33b22172452f (KVM: x86: move nested-related kvm_x86_ops to a separate struct)
+  		break;
+  	default:
+  		break;
+@@@ -4177,9 -4235,9 +4186,15 @@@ static int kvm_vcpu_ioctl_enable_cap(st
+  		return kvm_hv_activate_synic(vcpu, cap->cap ==
+  					     KVM_CAP_HYPERV_SYNIC2);
+  	case KVM_CAP_HYPERV_ENLIGHTENED_VMCS:
+++<<<<<<< HEAD
+ +		if (!kvm_x86_ops->nested_enable_evmcs)
+ +			return -ENOTTY;
+ +		r = kvm_x86_ops->nested_enable_evmcs(vcpu, &vmcs_version);
+++=======
++ 		if (!kvm_x86_ops.nested_ops->enable_evmcs)
++ 			return -ENOTTY;
++ 		r = kvm_x86_ops.nested_ops->enable_evmcs(vcpu, &vmcs_version);
+++>>>>>>> 33b22172452f (KVM: x86: move nested-related kvm_x86_ops to a separate struct)
+  		if (!r) {
+  			user_ptr = (void __user *)(uintptr_t)cap->args[0];
+  			if (copy_to_user(user_ptr, &vmcs_version,
+@@@ -4494,7 -4552,7 +4509,11 @@@ long kvm_arch_vcpu_ioctl(struct file *f
+  		u32 user_data_size;
+  
+  		r = -EINVAL;
+++<<<<<<< HEAD
+ +		if (!kvm_x86_ops->get_nested_state)
+++=======
++ 		if (!kvm_x86_ops.nested_ops->get_state)
+++>>>>>>> 33b22172452f (KVM: x86: move nested-related kvm_x86_ops to a separate struct)
+  			break;
+  
+  		BUILD_BUG_ON(sizeof(user_data_size) != sizeof(user_kvm_nested_state->size));
+@@@ -4502,8 -4560,8 +4521,13 @@@
+  		if (get_user(user_data_size, &user_kvm_nested_state->size))
+  			break;
+  
+++<<<<<<< HEAD
+ +		r = kvm_x86_ops->get_nested_state(vcpu, user_kvm_nested_state,
+ +						  user_data_size);
+++=======
++ 		r = kvm_x86_ops.nested_ops->get_state(vcpu, user_kvm_nested_state,
++ 						     user_data_size);
+++>>>>>>> 33b22172452f (KVM: x86: move nested-related kvm_x86_ops to a separate struct)
+  		if (r < 0)
+  			break;
+  
+@@@ -4524,7 -4582,7 +4548,11 @@@
+  		int idx;
+  
+  		r = -EINVAL;
+++<<<<<<< HEAD
+ +		if (!kvm_x86_ops->set_nested_state)
+++=======
++ 		if (!kvm_x86_ops.nested_ops->set_state)
+++>>>>>>> 33b22172452f (KVM: x86: move nested-related kvm_x86_ops to a separate struct)
+  			break;
+  
+  		r = -EFAULT;
+@@@ -4546,7 -4604,7 +4574,11 @@@
+  			break;
+  
+  		idx = srcu_read_lock(&vcpu->kvm->srcu);
+++<<<<<<< HEAD
+ +		r = kvm_x86_ops->set_nested_state(vcpu, user_kvm_nested_state, &kvm_state);
+++=======
++ 		r = kvm_x86_ops.nested_ops->set_state(vcpu, user_kvm_nested_state, &kvm_state);
+++>>>>>>> 33b22172452f (KVM: x86: move nested-related kvm_x86_ops to a separate struct)
+  		srcu_read_unlock(&vcpu->kvm->srcu, idx);
+  		break;
+  	}
+@@@ -7622,8 -7699,8 +7654,13 @@@ static int inject_pending_event(struct 
+  	 * from L2 to L1 due to pending L1 events which require exit
+  	 * from L2 to L1.
+  	 */
+++<<<<<<< HEAD
+ +	if (is_guest_mode(vcpu) && kvm_x86_ops->check_nested_events) {
+ +		r = kvm_x86_ops->check_nested_events(vcpu);
+++=======
++ 	if (is_guest_mode(vcpu)) {
++ 		r = kvm_x86_ops.nested_ops->check_events(vcpu);
+++>>>>>>> 33b22172452f (KVM: x86: move nested-related kvm_x86_ops to a separate struct)
+  		if (r != 0)
+  			return r;
+  	}
+@@@ -7684,8 -7761,8 +7721,13 @@@
+  		 * proposal and current concerns.  Perhaps we should be setting
+  		 * KVM_REQ_EVENT only on certain events and not unconditionally?
+  		 */
+++<<<<<<< HEAD
+ +		if (is_guest_mode(vcpu) && kvm_x86_ops->check_nested_events) {
+ +			r = kvm_x86_ops->check_nested_events(vcpu);
+++=======
++ 		if (is_guest_mode(vcpu)) {
++ 			r = kvm_x86_ops.nested_ops->check_events(vcpu);
+++>>>>>>> 33b22172452f (KVM: x86: move nested-related kvm_x86_ops to a separate struct)
+  			if (r != 0)
+  				return r;
+  		}
+@@@ -8068,7 -8185,7 +8110,11 @@@ static int vcpu_enter_guest(struct kvm_
+  
+  	if (kvm_request_pending(vcpu)) {
+  		if (kvm_check_request(KVM_REQ_GET_VMCS12_PAGES, vcpu)) {
+++<<<<<<< HEAD
+ +			if (unlikely(!kvm_x86_ops->get_vmcs12_pages(vcpu))) {
+++=======
++ 			if (unlikely(!kvm_x86_ops.nested_ops->get_vmcs12_pages(vcpu))) {
+++>>>>>>> 33b22172452f (KVM: x86: move nested-related kvm_x86_ops to a separate struct)
+  				r = 0;
+  				goto out;
+  			}
+@@@ -8399,8 -8527,8 +8445,13 @@@ static inline int vcpu_block(struct kv
+  
+  static inline bool kvm_vcpu_running(struct kvm_vcpu *vcpu)
+  {
+++<<<<<<< HEAD
+ +	if (is_guest_mode(vcpu) && kvm_x86_ops->check_nested_events)
+ +		kvm_x86_ops->check_nested_events(vcpu);
+++=======
++ 	if (is_guest_mode(vcpu))
++ 		kvm_x86_ops.nested_ops->check_events(vcpu);
+++>>>>>>> 33b22172452f (KVM: x86: move nested-related kvm_x86_ops to a separate struct)
+  
+  	return (vcpu->arch.mp_state == KVM_MP_STATE_RUNNABLE &&
+  		!vcpu->arch.apf.halted);
+* Unmerged path arch/x86/kvm/svm/nested.c
+* Unmerged path arch/x86/kvm/svm/svm.h
+* Unmerged path arch/x86/include/asm/kvm_host.h
+* Unmerged path arch/x86/kvm/hyperv.c
+* Unmerged path arch/x86/kvm/svm/nested.c
+* Unmerged path arch/x86/kvm/svm/svm.c
+* Unmerged path arch/x86/kvm/svm/svm.h
+* Unmerged path arch/x86/kvm/vmx/nested.c
+diff --git a/arch/x86/kvm/vmx/nested.h b/arch/x86/kvm/vmx/nested.h
+index 22c93a1e37fb..d0be5a3ad4b7 100644
+--- a/arch/x86/kvm/vmx/nested.h
++++ b/arch/x86/kvm/vmx/nested.h
+@@ -303,4 +303,6 @@ static inline bool nested_cr4_valid(struct kvm_vcpu *vcpu, unsigned long val)
+ #define nested_guest_cr4_valid	nested_cr4_valid
+ #define nested_host_cr4_valid	nested_cr4_valid
+ 
++extern struct kvm_x86_nested_ops vmx_nested_ops;
++
+ #endif /* __KVM_X86_VMX_NESTED_H */
+diff --git a/arch/x86/kvm/vmx/vmx.c b/arch/x86/kvm/vmx/vmx.c
+index c35a20122f5f..4689a717dbbe 100644
+--- a/arch/x86/kvm/vmx/vmx.c
++++ b/arch/x86/kvm/vmx/vmx.c
+@@ -8000,6 +8000,7 @@ static struct kvm_x86_ops vmx_x86_ops __ro_after_init = {
+ 	.post_block = vmx_post_block,
+ 
+ 	.pmu_ops = &intel_pmu_ops,
++	.nested_ops = &vmx_nested_ops,
+ 
+ 	.update_pi_irte = vmx_update_pi_irte,
+ 
+@@ -8015,12 +8016,6 @@ static struct kvm_x86_ops vmx_x86_ops __ro_after_init = {
+ 	.pre_leave_smm = vmx_pre_leave_smm,
+ 	.enable_smi_window = enable_smi_window,
+ 
+-	.check_nested_events = NULL,
+-	.get_nested_state = NULL,
+-	.set_nested_state = NULL,
+-	.get_vmcs12_pages = NULL,
+-	.nested_enable_evmcs = NULL,
+-	.nested_get_evmcs_version = NULL,
+ 	.need_emulation_on_page_fault = vmx_need_emulation_on_page_fault,
+ 	.apic_init_signal_blocked = vmx_apic_init_signal_blocked,
+ };
+* Unmerged path arch/x86/kvm/x86.c
