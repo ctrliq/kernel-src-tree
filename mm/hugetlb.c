@@ -1565,7 +1565,6 @@ static bool prep_compound_gigantic_page(struct page *page, unsigned int order)
 			if (!page_ref_freeze(p, 1))
 				goto out_error;
 		}
-		set_page_count(p, 0);
 		set_compound_head(p, page);
 	}
 	atomic_set(compound_mapcount_ptr(page), -1);
