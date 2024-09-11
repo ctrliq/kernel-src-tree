@@ -1,0 +1,248 @@
+flow_offload: add skip_hw and skip_sw to control if offload the action
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-448.el8
+commit-author Baowen Zheng <baowen.zheng@corigine.com>
+commit 7adc576512110ef32b0424a727ee1d04359fc205
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-448.el8/7adc5765.failed
+
+We add skip_hw and skip_sw for user to control if offload the action
+to hardware.
+
+We also add in_hw_count for user to indicate if the action is offloaded
+to any hardware.
+
+	Signed-off-by: Baowen Zheng <baowen.zheng@corigine.com>
+	Signed-off-by: Simon Horman <simon.horman@corigine.com>
+	Acked-by: Jamal Hadi Salim <jhs@mojatatu.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 7adc576512110ef32b0424a727ee1d04359fc205)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/sched/act_api.c
+diff --cc net/sched/act_api.c
+index c4b1bd9de693,d446e89ececc..000000000000
+--- a/net/sched/act_api.c
++++ b/net/sched/act_api.c
+@@@ -135,8 -131,147 +135,149 @@@ static void free_tcf(struct tc_action *
+  	kfree(p);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static void offload_action_hw_count_set(struct tc_action *act,
++ 					u32 hw_count)
++ {
++ 	act->in_hw_count = hw_count;
++ }
++ 
++ static unsigned int tcf_offload_act_num_actions_single(struct tc_action *act)
++ {
++ 	if (is_tcf_pedit(act))
++ 		return tcf_pedit_nkeys(act);
++ 	else
++ 		return 1;
++ }
++ 
++ static bool tc_act_skip_hw(u32 flags)
++ {
++ 	return (flags & TCA_ACT_FLAGS_SKIP_HW) ? true : false;
++ }
++ 
++ static bool tc_act_skip_sw(u32 flags)
++ {
++ 	return (flags & TCA_ACT_FLAGS_SKIP_SW) ? true : false;
++ }
++ 
++ static bool tc_act_in_hw(struct tc_action *act)
++ {
++ 	return !!act->in_hw_count;
++ }
++ 
++ /* SKIP_HW and SKIP_SW are mutually exclusive flags. */
++ static bool tc_act_flags_valid(u32 flags)
++ {
++ 	flags &= TCA_ACT_FLAGS_SKIP_HW | TCA_ACT_FLAGS_SKIP_SW;
++ 
++ 	return flags ^ (TCA_ACT_FLAGS_SKIP_HW | TCA_ACT_FLAGS_SKIP_SW);
++ }
++ 
++ static int offload_action_init(struct flow_offload_action *fl_action,
++ 			       struct tc_action *act,
++ 			       enum offload_act_command  cmd,
++ 			       struct netlink_ext_ack *extack)
++ {
++ 	fl_action->extack = extack;
++ 	fl_action->command = cmd;
++ 	fl_action->index = act->tcfa_index;
++ 
++ 	if (act->ops->offload_act_setup)
++ 		return act->ops->offload_act_setup(act, fl_action, NULL, false);
++ 
++ 	return -EOPNOTSUPP;
++ }
++ 
++ static int tcf_action_offload_cmd(struct flow_offload_action *fl_act,
++ 				  u32 *hw_count,
++ 				  struct netlink_ext_ack *extack)
++ {
++ 	int err;
++ 
++ 	err = flow_indr_dev_setup_offload(NULL, NULL, TC_SETUP_ACT,
++ 					  fl_act, NULL, NULL);
++ 	if (err < 0)
++ 		return err;
++ 
++ 	if (hw_count)
++ 		*hw_count = err;
++ 
++ 	return 0;
++ }
++ 
++ /* offload the tc action after it is inserted */
++ static int tcf_action_offload_add(struct tc_action *action,
++ 				  struct netlink_ext_ack *extack)
++ {
++ 	bool skip_sw = tc_act_skip_sw(action->tcfa_flags);
++ 	struct tc_action *actions[TCA_ACT_MAX_PRIO] = {
++ 		[0] = action,
++ 	};
++ 	struct flow_offload_action *fl_action;
++ 	u32 in_hw_count = 0;
++ 	int num, err = 0;
++ 
++ 	if (tc_act_skip_hw(action->tcfa_flags))
++ 		return 0;
++ 
++ 	num = tcf_offload_act_num_actions_single(action);
++ 	fl_action = offload_action_alloc(num);
++ 	if (!fl_action)
++ 		return -ENOMEM;
++ 
++ 	err = offload_action_init(fl_action, action, FLOW_ACT_REPLACE, extack);
++ 	if (err)
++ 		goto fl_err;
++ 
++ 	err = tc_setup_action(&fl_action->action, actions);
++ 	if (err) {
++ 		NL_SET_ERR_MSG_MOD(extack,
++ 				   "Failed to setup tc actions for offload\n");
++ 		goto fl_err;
++ 	}
++ 
++ 	err = tcf_action_offload_cmd(fl_action, &in_hw_count, extack);
++ 	if (!err)
++ 		offload_action_hw_count_set(action, in_hw_count);
++ 
++ 	if (skip_sw && !tc_act_in_hw(action))
++ 		err = -EINVAL;
++ 
++ 	tc_cleanup_offload_action(&fl_action->action);
++ 
++ fl_err:
++ 	kfree(fl_action);
++ 
++ 	return err;
++ }
++ 
++ static int tcf_action_offload_del(struct tc_action *action)
++ {
++ 	struct flow_offload_action fl_act = {};
++ 	u32 in_hw_count = 0;
++ 	int err = 0;
++ 
++ 	if (!tc_act_in_hw(action))
++ 		return 0;
++ 
++ 	err = offload_action_init(&fl_act, action, FLOW_ACT_DESTROY, NULL);
++ 	if (err)
++ 		return err;
++ 
++ 	err = tcf_action_offload_cmd(&fl_act, &in_hw_count, NULL);
++ 	if (err)
++ 		return err;
++ 
++ 	if (action->in_hw_count != in_hw_count)
++ 		return -EINVAL;
++ 
++ 	return 0;
++ }
++ 
+++>>>>>>> 7adc57651211 (flow_offload: add skip_hw and skip_sw to control if offload the action)
+  static void tcf_action_cleanup(struct tc_action *p)
+  {
+ -	tcf_action_offload_del(p);
+  	if (p->ops->cleanup)
+  		p->ops->cleanup(p);
+  
+@@@ -928,8 -1066,10 +1075,15 @@@ static const struct nla_policy tcf_acti
+  	[TCA_ACT_COOKIE]	= { .type = NLA_BINARY,
+  				    .len = TC_COOKIE_MAX_SIZE },
+  	[TCA_ACT_OPTIONS]	= { .type = NLA_NESTED },
+++<<<<<<< HEAD
+ +	[TCA_ACT_FLAGS]		= NLA_POLICY_BITFIELD32_PTR(&tca_act_flags_allowed),
+ +	[TCA_ACT_HW_STATS]	= NLA_POLICY_BITFIELD32_PTR(&tca_act_hw_stats_allowed),
+++=======
++ 	[TCA_ACT_FLAGS]		= NLA_POLICY_BITFIELD32(TCA_ACT_FLAGS_NO_PERCPU_STATS |
++ 							TCA_ACT_FLAGS_SKIP_HW |
++ 							TCA_ACT_FLAGS_SKIP_SW),
++ 	[TCA_ACT_HW_STATS]	= NLA_POLICY_BITFIELD32(TCA_ACT_HW_STATS_ANY),
+++>>>>>>> 7adc57651211 (flow_offload: add skip_hw and skip_sw to control if offload the action)
+  };
+  
+  void tcf_idr_insert_many(struct tc_action *actions[])
+@@@ -1112,6 -1262,11 +1271,14 @@@ int tcf_action_init(struct net *net, st
+  		sz += tcf_action_fill_size(act);
+  		/* Start from index 0 */
+  		actions[i - 1] = act;
+++<<<<<<< HEAD
+++=======
++ 		if (!tc_act_bind(flags)) {
++ 			err = tcf_action_offload_add(act, extack);
++ 			if (tc_act_skip_sw(act->tcfa_flags) && err)
++ 				goto err;
++ 		}
+++>>>>>>> 7adc57651211 (flow_offload: add skip_hw and skip_sw to control if offload the action)
+  	}
+  
+  	/* We have to commit them all together, because if any error happened in
+diff --git a/include/net/act_api.h b/include/net/act_api.h
+index b5b624c7e488..8d73ac88e18c 100644
+--- a/include/net/act_api.h
++++ b/include/net/act_api.h
+@@ -44,6 +44,7 @@ struct tc_action {
+ 	u8			hw_stats;
+ 	u8			used_hw_stats;
+ 	bool			used_hw_stats_valid;
++	u32			in_hw_count;
+ };
+ #define tcf_index	common.tcfa_index
+ #define tcf_refcnt	common.tcfa_refcnt
+diff --git a/include/uapi/linux/pkt_cls.h b/include/uapi/linux/pkt_cls.h
+index 9a56760b5a76..af59f5186d71 100644
+--- a/include/uapi/linux/pkt_cls.h
++++ b/include/uapi/linux/pkt_cls.h
+@@ -19,13 +19,16 @@ enum {
+ 	TCA_ACT_FLAGS,
+ 	TCA_ACT_HW_STATS,
+ 	TCA_ACT_USED_HW_STATS,
++	TCA_ACT_IN_HW_COUNT,
+ 	__TCA_ACT_MAX
+ };
+ 
+ /* See other TCA_ACT_FLAGS_ * flags in include/net/act_api.h. */
+-#define TCA_ACT_FLAGS_NO_PERCPU_STATS 1 /* Don't use percpu allocator for
+-					 * actions stats.
+-					 */
++#define TCA_ACT_FLAGS_NO_PERCPU_STATS (1 << 0) /* Don't use percpu allocator for
++						* actions stats.
++						*/
++#define TCA_ACT_FLAGS_SKIP_HW	(1 << 1) /* don't offload action to HW */
++#define TCA_ACT_FLAGS_SKIP_SW	(1 << 2) /* don't use action in SW */
+ 
+ /* tca HW stats type
+  * When user does not pass the attribute, he does not care.
+* Unmerged path net/sched/act_api.c
