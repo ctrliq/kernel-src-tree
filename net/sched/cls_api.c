@@ -2930,7 +2930,6 @@ int tcf_exts_validate(struct net *net, struct tcf_proto *tp, struct nlattr **tb,
 				return err;
 			exts->nr_actions = err;
 		}
-		exts->net = net;
 	}
 #else
 	if ((exts->action && tb[exts->action]) ||
