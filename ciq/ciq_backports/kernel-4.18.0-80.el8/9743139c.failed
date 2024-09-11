@@ -1,0 +1,143 @@
+blk-mq: remove 'tag' parameter from mq_ops->poll()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-80.el8
+commit-author Jens Axboe <axboe@kernel.dk>
+commit 9743139c5d11ab170f70a308dcb88c342390adfb
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-80.el8/9743139c.failed
+
+We always pass in -1 now and none of the callers use the tag value,
+remove the parameter.
+
+	Reviewed-by: Christoph Hellwig <hch@lst.de>
+	Signed-off-by: Jens Axboe <axboe@kernel.dk>
+(cherry picked from commit 9743139c5d11ab170f70a308dcb88c342390adfb)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	block/blk-mq.c
+diff --cc block/blk-mq.c
+index 52f967bfb7fc,b66cca3ce1e5..000000000000
+--- a/block/blk-mq.c
++++ b/block/blk-mq.c
+@@@ -3361,7 -3349,56 +3361,60 @@@ static bool blk_mq_poll(struct request_
+  			return false;
+  	}
+  
+++<<<<<<< HEAD
+ +	return __blk_mq_poll(hctx, rq);
+++=======
++ 	return blk_mq_poll_hybrid_sleep(q, hctx, rq);
++ }
++ 
++ static int blk_mq_poll(struct request_queue *q, blk_qc_t cookie)
++ {
++ 	struct blk_mq_hw_ctx *hctx;
++ 	long state;
++ 
++ 	if (!test_bit(QUEUE_FLAG_POLL, &q->queue_flags))
++ 		return 0;
++ 
++ 	hctx = q->queue_hw_ctx[blk_qc_t_to_queue_num(cookie)];
++ 
++ 	/*
++ 	 * If we sleep, have the caller restart the poll loop to reset
++ 	 * the state. Like for the other success return cases, the
++ 	 * caller is responsible for checking if the IO completed. If
++ 	 * the IO isn't complete, we'll get called again and will go
++ 	 * straight to the busy poll loop.
++ 	 */
++ 	if (blk_mq_poll_hybrid(q, hctx, cookie))
++ 		return 1;
++ 
++ 	hctx->poll_considered++;
++ 
++ 	state = current->state;
++ 	while (!need_resched()) {
++ 		int ret;
++ 
++ 		hctx->poll_invoked++;
++ 
++ 		ret = q->mq_ops->poll(hctx);
++ 		if (ret > 0) {
++ 			hctx->poll_success++;
++ 			__set_current_state(TASK_RUNNING);
++ 			return ret;
++ 		}
++ 
++ 		if (signal_pending_state(state, current))
++ 			__set_current_state(TASK_RUNNING);
++ 
++ 		if (current->state == TASK_RUNNING)
++ 			return 1;
++ 		if (ret < 0)
++ 			break;
++ 		cpu_relax();
++ 	}
++ 
++ 	__set_current_state(TASK_RUNNING);
++ 	return 0;
+++>>>>>>> 9743139c5d11 (blk-mq: remove 'tag' parameter from mq_ops->poll())
+  }
+  
+  unsigned int blk_mq_rq_cpu(struct request *rq)
+* Unmerged path block/blk-mq.c
+diff --git a/drivers/nvme/host/pci.c b/drivers/nvme/host/pci.c
+index 12f1a221feb9..dd6a94a64098 100644
+--- a/drivers/nvme/host/pci.c
++++ b/drivers/nvme/host/pci.c
+@@ -1065,14 +1065,14 @@ static int __nvme_poll(struct nvme_queue *nvmeq, unsigned int tag)
+ 	return found;
+ }
+ 
+-static int nvme_poll(struct blk_mq_hw_ctx *hctx, unsigned int tag)
++static int nvme_poll(struct blk_mq_hw_ctx *hctx)
+ {
+ 	struct nvme_queue *nvmeq = hctx->driver_data;
+ 
+-	return __nvme_poll(nvmeq, tag);
++	return __nvme_poll(nvmeq, -1);
+ }
+ 
+-static int nvme_poll_noirq(struct blk_mq_hw_ctx *hctx, unsigned int tag)
++static int nvme_poll_noirq(struct blk_mq_hw_ctx *hctx)
+ {
+ 	struct nvme_queue *nvmeq = hctx->driver_data;
+ 	u16 start, end;
+@@ -1082,7 +1082,7 @@ static int nvme_poll_noirq(struct blk_mq_hw_ctx *hctx, unsigned int tag)
+ 		return 0;
+ 
+ 	spin_lock(&nvmeq->cq_lock);
+-	found = nvme_process_cq(nvmeq, &start, &end, tag);
++	found = nvme_process_cq(nvmeq, &start, &end, -1);
+ 	spin_unlock(&nvmeq->cq_lock);
+ 
+ 	nvme_complete_cqes(nvmeq, start, end);
+diff --git a/drivers/nvme/host/rdma.c b/drivers/nvme/host/rdma.c
+index 8ecaac370289..540baccc72c5 100644
+--- a/drivers/nvme/host/rdma.c
++++ b/drivers/nvme/host/rdma.c
+@@ -1696,7 +1696,7 @@ static blk_status_t nvme_rdma_queue_rq(struct blk_mq_hw_ctx *hctx,
+ 	return BLK_STS_IOERR;
+ }
+ 
+-static int nvme_rdma_poll(struct blk_mq_hw_ctx *hctx, unsigned int tag)
++static int nvme_rdma_poll(struct blk_mq_hw_ctx *hctx)
+ {
+ 	struct nvme_rdma_queue *queue = hctx->driver_data;
+ 	struct ib_cq *cq = queue->ib_cq;
+diff --git a/include/linux/blk-mq.h b/include/linux/blk-mq.h
+index 7d5e7f44a104..eb9c8a9e240f 100644
+--- a/include/linux/blk-mq.h
++++ b/include/linux/blk-mq.h
+@@ -122,7 +122,7 @@ typedef void (exit_request_fn)(struct blk_mq_tag_set *set, struct request *,
+ typedef bool (busy_iter_fn)(struct blk_mq_hw_ctx *, struct request *, void *,
+ 		bool);
+ typedef bool (busy_tag_iter_fn)(struct request *, void *, bool);
+-typedef int (poll_fn)(struct blk_mq_hw_ctx *, unsigned int);
++typedef int (poll_fn)(struct blk_mq_hw_ctx *);
+ typedef int (map_queues_fn)(struct blk_mq_tag_set *set);
+ typedef bool (busy_fn)(struct request_queue *);
+ 
