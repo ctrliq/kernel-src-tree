@@ -1,0 +1,316 @@
+bpf: Support access to bpf map fields
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Andrey Ignatov <rdna@fb.com>
+commit 41c48f3a98231738c5ce79f6f2aa6e40ba924d18
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/41c48f3a.failed
+
+There are multiple use-cases when it's convenient to have access to bpf
+map fields, both `struct bpf_map` and map type specific struct-s such as
+`struct bpf_array`, `struct bpf_htab`, etc.
+
+For example while working with sock arrays it can be necessary to
+calculate the key based on map->max_entries (some_hash % max_entries).
+Currently this is solved by communicating max_entries via "out-of-band"
+channel, e.g. via additional map with known key to get info about target
+map. That works, but is not very convenient and error-prone while
+working with many maps.
+
+In other cases necessary data is dynamic (i.e. unknown at loading time)
+and it's impossible to get it at all. For example while working with a
+hash table it can be convenient to know how much capacity is already
+used (bpf_htab.count.counter for BPF_F_NO_PREALLOC case).
+
+At the same time kernel knows this info and can provide it to bpf
+program.
+
+Fill this gap by adding support to access bpf map fields from bpf
+program for both `struct bpf_map` and map type specific fields.
+
+Support is implemented via btf_struct_access() so that a user can define
+their own `struct bpf_map` or map type specific struct in their program
+with only necessary fields and preserve_access_index attribute, cast a
+map to this struct and use a field.
+
+For example:
+
+	struct bpf_map {
+		__u32 max_entries;
+	} __attribute__((preserve_access_index));
+
+	struct bpf_array {
+		struct bpf_map map;
+		__u32 elem_size;
+	} __attribute__((preserve_access_index));
+
+	struct {
+		__uint(type, BPF_MAP_TYPE_ARRAY);
+		__uint(max_entries, 4);
+		__type(key, __u32);
+		__type(value, __u32);
+	} m_array SEC(".maps");
+
+	SEC("cgroup_skb/egress")
+	int cg_skb(void *ctx)
+	{
+		struct bpf_array *array = (struct bpf_array *)&m_array;
+		struct bpf_map *map = (struct bpf_map *)&m_array;
+
+		/* .. use map->max_entries or array->map.max_entries .. */
+	}
+
+Similarly to other btf_struct_access() use-cases (e.g. struct tcp_sock
+in net/ipv4/bpf_tcp_ca.c) the patch allows access to any fields of
+corresponding struct. Only reading from map fields is supported.
+
+For btf_struct_access() to work there should be a way to know btf id of
+a struct that corresponds to a map type. To get btf id there should be a
+way to get a stringified name of map-specific struct, such as
+"bpf_array", "bpf_htab", etc for a map type. Two new fields are added to
+`struct bpf_map_ops` to handle it:
+* .map_btf_name keeps a btf name of a struct returned by map_alloc();
+* .map_btf_id is used to cache btf id of that struct.
+
+To make btf ids calculation cheaper they're calculated once while
+preparing btf_vmlinux and cached same way as it's done for btf_id field
+of `struct bpf_func_proto`
+
+While calculating btf ids, struct names are NOT checked for collision.
+Collisions will be checked as a part of the work to prepare btf ids used
+in verifier in compile time that should land soon. The only known
+collision for `struct bpf_htab` (kernel/bpf/hashtab.c vs
+net/core/sock_map.c) was fixed earlier.
+
+Both new fields .map_btf_name and .map_btf_id must be set for a map type
+for the feature to work. If neither is set for a map type, verifier will
+return ENOTSUPP on a try to access map_ptr of corresponding type. If
+just one of them set, it's verifier misconfiguration.
+
+Only `struct bpf_array` for BPF_MAP_TYPE_ARRAY and `struct bpf_htab` for
+BPF_MAP_TYPE_HASH are supported by this patch. Other map types will be
+supported separately.
+
+The feature is available only for CONFIG_DEBUG_INFO_BTF=y and gated by
+perfmon_capable() so that unpriv programs won't have access to bpf map
+fields.
+
+	Signed-off-by: Andrey Ignatov <rdna@fb.com>
+	Signed-off-by: Daniel Borkmann <daniel@iogearbox.net>
+	Acked-by: John Fastabend <john.fastabend@gmail.com>
+	Acked-by: Martin KaFai Lau <kafai@fb.com>
+Link: https://lore.kernel.org/bpf/6479686a0cd1e9067993df57b4c3eef0e276fec9.1592600985.git.rdna@fb.com
+(cherry picked from commit 41c48f3a98231738c5ce79f6f2aa6e40ba924d18)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/bpf.h
+#	include/linux/bpf_verifier.h
+#	kernel/bpf/verifier.c
+diff --cc include/linux/bpf.h
+index 531af1e44e56,1e1501ee53ce..000000000000
+--- a/include/linux/bpf.h
++++ b/include/linux/bpf.h
+@@@ -93,7 -90,12 +93,16 @@@ struct bpf_map_ops 
+  	int (*map_direct_value_meta)(const struct bpf_map *map,
+  				     u64 imm, u32 *off);
+  	int (*map_mmap)(struct bpf_map *map, struct vm_area_struct *vma);
+++<<<<<<< HEAD
+ +	) /* RH_KABI_BROKEN_INSERT_BLOCK */
+++=======
++ 	__poll_t (*map_poll)(struct bpf_map *map, struct file *filp,
++ 			     struct poll_table_struct *pts);
++ 
++ 	/* BTF name and id of struct allocated by map_alloc */
++ 	const char * const map_btf_name;
++ 	int *map_btf_id;
+++>>>>>>> 41c48f3a9823 (bpf: Support access to bpf map fields)
+  };
+  
+  struct bpf_map_memory {
+@@@ -1104,6 -1108,26 +1113,29 @@@ struct bpf_map *bpf_map_get_curr_or_nex
+  
+  extern int sysctl_unprivileged_bpf_disabled;
+  
+++<<<<<<< HEAD
+++=======
++ static inline bool bpf_allow_ptr_leaks(void)
++ {
++ 	return perfmon_capable();
++ }
++ 
++ static inline bool bpf_allow_ptr_to_map_access(void)
++ {
++ 	return perfmon_capable();
++ }
++ 
++ static inline bool bpf_bypass_spec_v1(void)
++ {
++ 	return perfmon_capable();
++ }
++ 
++ static inline bool bpf_bypass_spec_v4(void)
++ {
++ 	return perfmon_capable();
++ }
++ 
+++>>>>>>> 41c48f3a9823 (bpf: Support access to bpf map fields)
+  int bpf_map_new_fd(struct bpf_map *map, int flags);
+  int bpf_prog_new_fd(struct bpf_prog *prog);
+  
+diff --cc include/linux/bpf_verifier.h
+index 37159d005edc,53c7bd568c5d..000000000000
+--- a/include/linux/bpf_verifier.h
++++ b/include/linux/bpf_verifier.h
+@@@ -378,6 -379,10 +378,13 @@@ struct bpf_verifier_env 
+  	u32 used_map_cnt;		/* number of used maps */
+  	u32 id_gen;			/* used to generate unique reg IDs */
+  	bool allow_ptr_leaks;
+++<<<<<<< HEAD
+++=======
++ 	bool allow_ptr_to_map_access;
++ 	bool bpf_capable;
++ 	bool bypass_spec_v1;
++ 	bool bypass_spec_v4;
+++>>>>>>> 41c48f3a9823 (bpf: Support access to bpf map fields)
+  	bool seen_direct_write;
+  	struct bpf_insn_aux_data *insn_aux_data; /* array of per-insn state */
+  	const struct bpf_line_info *prev_linfo;
+diff --cc kernel/bpf/verifier.c
+index b8aec186e303,7460f967cb75..000000000000
+--- a/kernel/bpf/verifier.c
++++ b/kernel/bpf/verifier.c
+@@@ -10850,7 -11015,11 +10915,15 @@@ int bpf_check(struct bpf_prog **prog, u
+  	if (attr->prog_flags & BPF_F_ANY_ALIGNMENT)
+  		env->strict_alignment = false;
+  
+++<<<<<<< HEAD
+ +	env->allow_ptr_leaks = is_priv;
+++=======
++ 	env->allow_ptr_leaks = bpf_allow_ptr_leaks();
++ 	env->allow_ptr_to_map_access = bpf_allow_ptr_to_map_access();
++ 	env->bypass_spec_v1 = bpf_bypass_spec_v1();
++ 	env->bypass_spec_v4 = bpf_bypass_spec_v4();
++ 	env->bpf_capable = bpf_capable();
+++>>>>>>> 41c48f3a9823 (bpf: Support access to bpf map fields)
+  
+  	if (is_priv)
+  		env->test_state_freq = attr->prog_flags & BPF_F_TEST_STATE_FREQ;
+* Unmerged path include/linux/bpf.h
+* Unmerged path include/linux/bpf_verifier.h
+diff --git a/kernel/bpf/arraymap.c b/kernel/bpf/arraymap.c
+index bf32bbe740a2..7e5be96114ca 100644
+--- a/kernel/bpf/arraymap.c
++++ b/kernel/bpf/arraymap.c
+@@ -502,6 +502,7 @@ static int array_map_mmap(struct bpf_map *map, struct vm_area_struct *vma)
+ 				   vma->vm_pgoff + pgoff);
+ }
+ 
++static int array_map_btf_id;
+ const struct bpf_map_ops array_map_ops = {
+ 	.map_alloc_check = array_map_alloc_check,
+ 	.map_alloc = array_map_alloc,
+@@ -518,6 +519,8 @@ const struct bpf_map_ops array_map_ops = {
+ 	.map_check_btf = array_map_check_btf,
+ 	.map_lookup_batch = generic_map_lookup_batch,
+ 	.map_update_batch = generic_map_update_batch,
++	.map_btf_name = "bpf_array",
++	.map_btf_id = &array_map_btf_id,
+ };
+ 
+ const struct bpf_map_ops percpu_array_map_ops = {
+diff --git a/kernel/bpf/btf.c b/kernel/bpf/btf.c
+index bcee2f08fd19..a999da075385 100644
+--- a/kernel/bpf/btf.c
++++ b/kernel/bpf/btf.c
+@@ -3571,6 +3571,41 @@ btf_get_prog_ctx_type(struct bpf_verifier_log *log, struct btf *btf,
+ 	return ctx_type;
+ }
+ 
++static const struct bpf_map_ops * const btf_vmlinux_map_ops[] = {
++#define BPF_PROG_TYPE(_id, _name, prog_ctx_type, kern_ctx_type)
++#define BPF_LINK_TYPE(_id, _name)
++#define BPF_MAP_TYPE(_id, _ops) \
++	[_id] = &_ops,
++#include <linux/bpf_types.h>
++#undef BPF_PROG_TYPE
++#undef BPF_LINK_TYPE
++#undef BPF_MAP_TYPE
++};
++
++static int btf_vmlinux_map_ids_init(const struct btf *btf,
++				    struct bpf_verifier_log *log)
++{
++	const struct bpf_map_ops *ops;
++	int i, btf_id;
++
++	for (i = 0; i < ARRAY_SIZE(btf_vmlinux_map_ops); ++i) {
++		ops = btf_vmlinux_map_ops[i];
++		if (!ops || (!ops->map_btf_name && !ops->map_btf_id))
++			continue;
++		if (!ops->map_btf_name || !ops->map_btf_id) {
++			bpf_log(log, "map type %d is misconfigured\n", i);
++			return -EINVAL;
++		}
++		btf_id = btf_find_by_name_kind(btf, ops->map_btf_name,
++					       BTF_KIND_STRUCT);
++		if (btf_id < 0)
++			return btf_id;
++		*ops->map_btf_id = btf_id;
++	}
++
++	return 0;
++}
++
+ static int btf_translate_to_vmlinux(struct bpf_verifier_log *log,
+ 				     struct btf *btf,
+ 				     const struct btf_type *t,
+@@ -3634,6 +3669,11 @@ struct btf *btf_parse_vmlinux(void)
+ 	/* btf_parse_vmlinux() runs under bpf_verifier_lock */
+ 	bpf_ctx_convert.t = btf_type_by_id(btf, btf_id);
+ 
++	/* find bpf map structs for map_ptr access checking */
++	err = btf_vmlinux_map_ids_init(btf, log);
++	if (err < 0)
++		goto errout;
++
+ 	bpf_struct_ops_init(btf, log);
+ 
+ 	btf_verifier_env_free(env);
+diff --git a/kernel/bpf/hashtab.c b/kernel/bpf/hashtab.c
+index 496ea743bae8..6857e3a671f7 100644
+--- a/kernel/bpf/hashtab.c
++++ b/kernel/bpf/hashtab.c
+@@ -1628,6 +1628,7 @@ htab_lru_map_lookup_and_delete_batch(struct bpf_map *map,
+ 						  true, false);
+ }
+ 
++static int htab_map_btf_id;
+ const struct bpf_map_ops htab_map_ops = {
+ 	.map_alloc_check = htab_map_alloc_check,
+ 	.map_alloc = htab_map_alloc,
+@@ -1639,6 +1640,8 @@ const struct bpf_map_ops htab_map_ops = {
+ 	.map_gen_lookup = htab_map_gen_lookup,
+ 	.map_seq_show_elem = htab_map_seq_show_elem,
+ 	BATCH_OPS(htab),
++	.map_btf_name = "bpf_htab",
++	.map_btf_id = &htab_map_btf_id,
+ };
+ 
+ const struct bpf_map_ops htab_lru_map_ops = {
+* Unmerged path kernel/bpf/verifier.c
+diff --git a/tools/testing/selftests/bpf/verifier/map_ptr_mixing.c b/tools/testing/selftests/bpf/verifier/map_ptr_mixing.c
+index cd26ee6b7b1d..1f2b8c4cb26d 100644
+--- a/tools/testing/selftests/bpf/verifier/map_ptr_mixing.c
++++ b/tools/testing/selftests/bpf/verifier/map_ptr_mixing.c
+@@ -56,7 +56,7 @@
+ 	.fixup_map_in_map = { 16 },
+ 	.fixup_map_array_48b = { 13 },
+ 	.result = REJECT,
+-	.errstr = "R0 invalid mem access 'map_ptr'",
++	.errstr = "only read from bpf_array is supported",
+ },
+ {
+ 	"cond: two branches returning different map pointers for lookup (tail, tail)",
