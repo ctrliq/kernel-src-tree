@@ -1,0 +1,216 @@
+x86/efi: Allocate e820 buffer before calling efi_exit_boot_service
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Eric Snowberg <eric.snowberg@oracle.com>
+commit b84a64fad40637b1c9fa4f4dbf847a23e29e672b
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/b84a64fa.failed
+
+The following commit:
+
+  d64934019f6c ("x86/efi: Use efi_exit_boot_services()")
+
+introduced a regression on systems with large memory maps causing them
+to hang on boot. The first "goto get_map" that was removed from
+exit_boot() ensured there was enough room for the memory map when
+efi_call_early(exit_boot_services) was called. This happens when
+(nr_desc > ARRAY_SIZE(params->e820_table).
+
+Chain of events:
+
+  exit_boot()
+    efi_exit_boot_services()
+      efi_get_memory_map                  <- at this point the mm can't grow over 8 desc
+      priv_func()
+        exit_boot_func()
+          allocate_e820ext()              <- new mm grows over 8 desc from e820 alloc
+      efi_call_early(exit_boot_services)  <- mm key doesn't match so retry
+      efi_call_early(get_memory_map)      <- not enough room for new mm
+      system hangs
+
+This patch allocates the e820 buffer before calling efi_exit_boot_services()
+and fixes the regression.
+
+ [ mingo: minor cleanliness edits. ]
+
+	Signed-off-by: Eric Snowberg <eric.snowberg@oracle.com>
+	Signed-off-by: Ard Biesheuvel <ard.biesheuvel@linaro.org>
+	Cc: <stable@vger.kernel.org>
+	Cc: Andy Lutomirski <luto@kernel.org>
+	Cc: Arend van Spriel <arend.vanspriel@broadcom.com>
+	Cc: Bhupesh Sharma <bhsharma@redhat.com>
+	Cc: Borislav Petkov <bp@alien8.de>
+	Cc: Dave Hansen <dave.hansen@intel.com>
+	Cc: Hans de Goede <hdegoede@redhat.com>
+	Cc: Joe Perches <joe@perches.com>
+	Cc: Jon Hunter <jonathanh@nvidia.com>
+	Cc: Julien Thierry <julien.thierry@arm.com>
+	Cc: Linus Torvalds <torvalds@linux-foundation.org>
+	Cc: Marc Zyngier <marc.zyngier@arm.com>
+	Cc: Matt Fleming <matt@codeblueprint.co.uk>
+	Cc: Nathan Chancellor <natechancellor@gmail.com>
+	Cc: Peter Zijlstra <peterz@infradead.org>
+	Cc: Sai Praneeth Prakhya <sai.praneeth.prakhya@intel.com>
+	Cc: Sedat Dilek <sedat.dilek@gmail.com>
+	Cc: Thomas Gleixner <tglx@linutronix.de>
+	Cc: YiFei Zhu <zhuyifei1999@gmail.com>
+	Cc: linux-efi@vger.kernel.org
+Link: http://lkml.kernel.org/r/20181129171230.18699-2-ard.biesheuvel@linaro.org
+	Signed-off-by: Ingo Molnar <mingo@kernel.org>
+(cherry picked from commit b84a64fad40637b1c9fa4f4dbf847a23e29e672b)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/boot/compressed/eboot.c
+diff --cc arch/x86/boot/compressed/eboot.c
+index 0fed7096a531,544ac4fafd11..000000000000
+--- a/arch/x86/boot/compressed/eboot.c
++++ b/arch/x86/boot/compressed/eboot.c
+@@@ -814,12 -635,43 +815,51 @@@ static efi_status_t alloc_e820ext(u32 n
+  	return status;
+  }
+  
++ static efi_status_t allocate_e820(struct boot_params *params,
++ 				  struct setup_data **e820ext,
++ 				  u32 *e820ext_size)
++ {
++ 	unsigned long map_size, desc_size, buff_size;
++ 	struct efi_boot_memmap boot_map;
++ 	efi_memory_desc_t *map;
++ 	efi_status_t status;
++ 	__u32 nr_desc;
++ 
++ 	boot_map.map		= &map;
++ 	boot_map.map_size	= &map_size;
++ 	boot_map.desc_size	= &desc_size;
++ 	boot_map.desc_ver	= NULL;
++ 	boot_map.key_ptr	= NULL;
++ 	boot_map.buff_size	= &buff_size;
++ 
++ 	status = efi_get_memory_map(sys_table, &boot_map);
++ 	if (status != EFI_SUCCESS)
++ 		return status;
++ 
++ 	nr_desc = buff_size / desc_size;
++ 
++ 	if (nr_desc > ARRAY_SIZE(params->e820_table)) {
++ 		u32 nr_e820ext = nr_desc - ARRAY_SIZE(params->e820_table);
++ 
++ 		status = alloc_e820ext(nr_e820ext, e820ext, e820ext_size);
++ 		if (status != EFI_SUCCESS)
++ 			return status;
++ 	}
++ 
++ 	return EFI_SUCCESS;
++ }
++ 
+  struct exit_boot_struct {
+++<<<<<<< HEAD
+ +	struct boot_params *boot_params;
+ +	struct efi_info *efi;
+ +	struct setup_data *e820ext;
+ +	__u32 e820ext_size;
+ +	bool is64;
+++=======
++ 	struct boot_params	*boot_params;
++ 	struct efi_info		*efi;
+++>>>>>>> b84a64fad406 (x86/efi: Allocate e820 buffer before calling efi_exit_boot_service)
+  };
+  
+  static efi_status_t exit_boot_func(efi_system_table_t *sys_table_arg,
+@@@ -832,32 -683,19 +871,37 @@@
+  	efi_status_t status;
+  	struct exit_boot_struct *p = priv;
+  
+++<<<<<<< HEAD
+ +	if (first) {
+ +		nr_desc = *map->buff_size / *map->desc_size;
+ +		if (nr_desc > ARRAY_SIZE(p->boot_params->e820_table)) {
+ +			u32 nr_e820ext = nr_desc -
+ +					ARRAY_SIZE(p->boot_params->e820_table);
+ +
+ +			status = alloc_e820ext(nr_e820ext, &p->e820ext,
+ +					       &p->e820ext_size);
+ +			if (status != EFI_SUCCESS)
+ +				return status;
+ +		}
+ +		first = false;
+ +	}
+ +
+ +	signature = p->is64 ? EFI64_LOADER_SIGNATURE : EFI32_LOADER_SIGNATURE;
+++=======
++ 	signature = efi_is_64bit() ? EFI64_LOADER_SIGNATURE
++ 				   : EFI32_LOADER_SIGNATURE;
+++>>>>>>> b84a64fad406 (x86/efi: Allocate e820 buffer before calling efi_exit_boot_service)
+  	memcpy(&p->efi->efi_loader_signature, signature, sizeof(__u32));
+  
+ -	p->efi->efi_systab		= (unsigned long)sys_table_arg;
+ -	p->efi->efi_memdesc_size	= *map->desc_size;
+ -	p->efi->efi_memdesc_version	= *map->desc_ver;
+ -	p->efi->efi_memmap		= (unsigned long)*map->map;
+ -	p->efi->efi_memmap_size		= *map->map_size;
+ +	p->efi->efi_systab = (unsigned long)sys_table_arg;
+ +	p->efi->efi_memdesc_size = *map->desc_size;
+ +	p->efi->efi_memdesc_version = *map->desc_ver;
+ +	p->efi->efi_memmap = (unsigned long)*map->map;
+ +	p->efi->efi_memmap_size = *map->map_size;
+  
+  #ifdef CONFIG_X86_64
+ -	p->efi->efi_systab_hi		= (unsigned long)sys_table_arg >> 32;
+ -	p->efi->efi_memmap_hi		= (unsigned long)*map->map >> 32;
+ +	p->efi->efi_systab_hi = (unsigned long)sys_table_arg >> 32;
+ +	p->efi->efi_memmap_hi = (unsigned long)*map->map >> 32;
+  #endif
+  
+  	return EFI_SUCCESS;
+@@@ -875,17 -712,18 +919,32 @@@ static efi_status_t exit_boot(struct bo
+  	struct efi_boot_memmap map;
+  	struct exit_boot_struct priv;
+  
+++<<<<<<< HEAD
+ +	map.map =		&mem_map;
+ +	map.map_size =		&map_sz;
+ +	map.desc_size =		&desc_size;
+ +	map.desc_ver =		&desc_version;
+ +	map.key_ptr =		&key;
+ +	map.buff_size =		&buff_size;
+ +	priv.boot_params =	boot_params;
+ +	priv.efi =		&boot_params->efi_info;
+ +	priv.e820ext =		NULL;
+ +	priv.e820ext_size =	0;
+ +	priv.is64 =		is64;
+++=======
++ 	map.map			= &mem_map;
++ 	map.map_size		= &map_sz;
++ 	map.desc_size		= &desc_size;
++ 	map.desc_ver		= &desc_version;
++ 	map.key_ptr		= &key;
++ 	map.buff_size		= &buff_size;
++ 	priv.boot_params	= boot_params;
++ 	priv.efi		= &boot_params->efi_info;
++ 
++ 	status = allocate_e820(boot_params, &e820ext, &e820ext_size);
++ 	if (status != EFI_SUCCESS)
++ 		return status;
+++>>>>>>> b84a64fad406 (x86/efi: Allocate e820 buffer before calling efi_exit_boot_service)
+  
+  	/* Might as well exit boot services now */
+  	status = efi_exit_boot_services(sys_table, handle, &map, &priv,
+@@@ -893,10 -731,8 +952,13 @@@
+  	if (status != EFI_SUCCESS)
+  		return status;
+  
+++<<<<<<< HEAD
+ +	e820ext = priv.e820ext;
+ +	e820ext_size = priv.e820ext_size;
+++=======
+++>>>>>>> b84a64fad406 (x86/efi: Allocate e820 buffer before calling efi_exit_boot_service)
+  	/* Historic? */
+ -	boot_params->alt_mem_k	= 32 * 1024;
+ +	boot_params->alt_mem_k = 32 * 1024;
+  
+  	status = setup_e820(boot_params, e820ext, e820ext_size);
+  	if (status != EFI_SUCCESS)
+* Unmerged path arch/x86/boot/compressed/eboot.c
