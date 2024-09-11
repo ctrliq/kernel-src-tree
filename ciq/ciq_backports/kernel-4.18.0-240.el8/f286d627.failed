@@ -1,0 +1,120 @@
+gfs2: Keep track of deleted inode generations in LVBs
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Andreas Gruenbacher <agruenba@redhat.com>
+commit f286d627ef026a4d04b41ae5917d58ddf243c3c5
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/f286d627.failed
+
+When deleting an inode, keep track of the generation of the deleted inode in
+the inode glock Lock Value Block (LVB).  When trying to delete an inode
+remotely, check the last-known inode generation against the deleted inode
+generation to skip duplicate remote deletes.  This avoids taking the resource
+group glock in order to verify the block type.
+
+	Signed-off-by: Andreas Gruenbacher <agruenba@redhat.com>
+(cherry picked from commit f286d627ef026a4d04b41ae5917d58ddf243c3c5)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/gfs2/glops.c
+diff --cc fs/gfs2/glops.c
+index c63bee9adb6a,63ae9e45ce34..000000000000
+--- a/fs/gfs2/glops.c
++++ b/fs/gfs2/glops.c
+@@@ -583,7 -692,8 +583,12 @@@ const struct gfs2_glock_operations gfs2
+  	.go_lock = inode_go_lock,
+  	.go_dump = inode_go_dump,
+  	.go_type = LM_TYPE_INODE,
+++<<<<<<< HEAD
+ +	.go_flags = GLOF_ASPACE | GLOF_LRU,
+++=======
++ 	.go_flags = GLOF_ASPACE | GLOF_LRU | GLOF_LVB,
++ 	.go_free = inode_go_free,
+++>>>>>>> f286d627ef02 (gfs2: Keep track of deleted inode generations in LVBs)
+  };
+  
+  const struct gfs2_glock_operations gfs2_rgrp_glops = {
+diff --git a/fs/gfs2/glock.c b/fs/gfs2/glock.c
+index 76c32d90eaaf..02550143613e 100644
+--- a/fs/gfs2/glock.c
++++ b/fs/gfs2/glock.c
+@@ -669,6 +669,25 @@ __acquires(&gl->gl_lockref.lock)
+ 	return;
+ }
+ 
++void gfs2_inode_remember_delete(struct gfs2_glock *gl, u64 generation)
++{
++	struct gfs2_inode_lvb *ri = (void *)gl->gl_lksb.sb_lvbptr;
++
++	if (ri->ri_magic == 0)
++		ri->ri_magic = cpu_to_be32(GFS2_MAGIC);
++	if (ri->ri_magic == cpu_to_be32(GFS2_MAGIC))
++		ri->ri_generation_deleted = cpu_to_be64(generation);
++}
++
++bool gfs2_inode_already_deleted(struct gfs2_glock *gl, u64 generation)
++{
++	struct gfs2_inode_lvb *ri = (void *)gl->gl_lksb.sb_lvbptr;
++
++	if (ri->ri_magic != cpu_to_be32(GFS2_MAGIC))
++		return false;
++	return generation <= be64_to_cpu(ri->ri_generation_deleted);
++}
++
+ static void delete_work_func(struct work_struct *work)
+ {
+ 	struct gfs2_glock *gl = container_of(work, struct gfs2_glock, gl_delete);
+diff --git a/fs/gfs2/glock.h b/fs/gfs2/glock.h
+index cff3f67734d7..4bb467d58eeb 100644
+--- a/fs/gfs2/glock.h
++++ b/fs/gfs2/glock.h
+@@ -306,4 +306,7 @@ static inline void glock_clear_object(struct gfs2_glock *gl, void *object)
+ 	spin_unlock(&gl->gl_lockref.lock);
+ }
+ 
++extern void gfs2_inode_remember_delete(struct gfs2_glock *gl, u64 generation);
++extern bool gfs2_inode_already_deleted(struct gfs2_glock *gl, u64 generation);
++
+ #endif /* __GLOCK_DOT_H__ */
+* Unmerged path fs/gfs2/glops.c
+diff --git a/fs/gfs2/super.c b/fs/gfs2/super.c
+index 54e9fed68925..4f75b8ff39aa 100644
+--- a/fs/gfs2/super.c
++++ b/fs/gfs2/super.c
+@@ -1604,6 +1604,8 @@ static void gfs2_evict_inode(struct inode *inode)
+ 		goto out;
+ 	}
+ 
++	if (gfs2_inode_already_deleted(ip->i_gl, ip->i_no_formal_ino))
++		goto out_truncate;
+ 	error = gfs2_check_blk_type(sdp, ip->i_no_addr, GFS2_BLKST_UNLINKED);
+ 	if (error)
+ 		goto out_truncate;
+@@ -1659,6 +1661,7 @@ static void gfs2_evict_inode(struct inode *inode)
+ 	   that subsequent inode creates don't see an old gl_object. */
+ 	glock_clear_object(ip->i_gl, ip);
+ 	error = gfs2_dinode_dealloc(ip);
++	gfs2_inode_remember_delete(ip->i_gl, ip->i_no_formal_ino);
+ 	goto out_unlock;
+ 
+ out_truncate:
+diff --git a/include/uapi/linux/gfs2_ondisk.h b/include/uapi/linux/gfs2_ondisk.h
+index 2dc10a034de1..07e508e6691b 100644
+--- a/include/uapi/linux/gfs2_ondisk.h
++++ b/include/uapi/linux/gfs2_ondisk.h
+@@ -171,6 +171,12 @@ struct gfs2_rindex {
+ #define GFS2_RGF_NOALLOC	0x00000008
+ #define GFS2_RGF_TRIMMED	0x00000010
+ 
++struct gfs2_inode_lvb {
++	__be32 ri_magic;
++	__be32 __pad;
++	__be64 ri_generation_deleted;
++};
++
+ struct gfs2_rgrp_lvb {
+ 	__be32 rl_magic;
+ 	__be32 rl_flags;
