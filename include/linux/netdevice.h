@@ -3406,6 +3406,13 @@ static inline int netif_set_xps_queue(struct net_device *dev,
 {
 	return 0;
 }
+
+static inline int __netif_set_xps_queue(struct net_device *dev,
+					const unsigned long *mask,
+					u16 index, bool is_rxqs_map)
+{
+	return 0;
+}
 #endif
 
 /**
