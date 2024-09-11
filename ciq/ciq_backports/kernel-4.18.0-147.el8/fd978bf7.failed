@@ -1,0 +1,159 @@
+bpf: Add reference tracking to verifier
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-147.el8
+commit-author Joe Stringer <joe@wand.net.nz>
+commit fd978bf7fd312581a7ca454a991f0ffb34c4204b
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-147.el8/fd978bf7.failed
+
+Allow helper functions to acquire a reference and return it into a
+register. Specific pointer types such as the PTR_TO_SOCKET will
+implicitly represent such a reference. The verifier must ensure that
+these references are released exactly once in each path through the
+program.
+
+To achieve this, this commit assigns an id to the pointer and tracks it
+in the 'bpf_func_state', then when the function or program exits,
+verifies that all of the acquired references have been freed. When the
+pointer is passed to a function that frees the reference, it is removed
+from the 'bpf_func_state` and all existing copies of the pointer in
+registers are marked invalid.
+
+	Signed-off-by: Joe Stringer <joe@wand.net.nz>
+	Acked-by: Alexei Starovoitov <ast@kernel.org>
+	Signed-off-by: Daniel Borkmann <daniel@iogearbox.net>
+(cherry picked from commit fd978bf7fd312581a7ca454a991f0ffb34c4204b)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	kernel/bpf/verifier.c
+diff --cc kernel/bpf/verifier.c
+index 7ac5015d500f,cd0d8bc00bd1..000000000000
+--- a/kernel/bpf/verifier.c
++++ b/kernel/bpf/verifier.c
+@@@ -1933,6 -2136,16 +2070,19 @@@ static int check_func_arg(struct bpf_ve
+  		err = check_ctx_reg(env, reg, regno);
+  		if (err < 0)
+  			return err;
+++<<<<<<< HEAD
+++=======
++ 	} else if (arg_type == ARG_PTR_TO_SOCKET) {
++ 		expected_type = PTR_TO_SOCKET;
++ 		if (type != expected_type)
++ 			goto err_type;
++ 		if (meta->ptr_id || !reg->id) {
++ 			verbose(env, "verifier internal error: mismatched references meta=%d, reg=%d\n",
++ 				meta->ptr_id, reg->id);
++ 			return -EFAULT;
++ 		}
++ 		meta->ptr_id = reg->id;
+++>>>>>>> fd978bf7fd31 (bpf: Add reference tracking to verifier)
+  	} else if (arg_type_is_mem_ptr(arg_type)) {
+  		expected_type = PTR_TO_STACK;
+  		/* One exception here. In case function allows for NULL to be
+@@@ -2520,6 -2831,13 +2760,16 @@@ static int check_helper_call(struct bpf
+  		}
+  		regs[BPF_REG_0].map_ptr = meta.map_ptr;
+  		regs[BPF_REG_0].id = ++env->id_gen;
+++<<<<<<< HEAD
+++=======
++ 	} else if (fn->ret_type == RET_PTR_TO_SOCKET_OR_NULL) {
++ 		int id = acquire_reference_state(env, insn_idx);
++ 		if (id < 0)
++ 			return id;
++ 		mark_reg_known_zero(env, regs, BPF_REG_0);
++ 		regs[BPF_REG_0].type = PTR_TO_SOCKET_OR_NULL;
++ 		regs[BPF_REG_0].id = id;
+++>>>>>>> fd978bf7fd31 (bpf: Add reference tracking to verifier)
+  	} else {
+  		verbose(env, "unknown return type %d of func %s#%d\n",
+  			fn->ret_type, func_id_name(func_id), func_id);
+@@@ -3763,12 -3925,16 +4014,14 @@@ static void mark_ptr_or_null_reg(struc
+  			} else {
+  				reg->type = PTR_TO_MAP_VALUE;
+  			}
+ -		} else if (reg->type == PTR_TO_SOCKET_OR_NULL) {
+ -			reg->type = PTR_TO_SOCKET;
+  		}
+- 		/* We don't need id from this point onwards anymore, thus we
+- 		 * should better reset it, so that state pruning has chances
+- 		 * to take effect.
+- 		 */
+- 		reg->id = 0;
++ 		if (is_null || !reg_is_refcounted(reg)) {
++ 			/* We don't need id from this point onwards anymore,
++ 			 * thus we should better reset it, so that state
++ 			 * pruning has chances to take effect.
++ 			 */
++ 			reg->id = 0;
++ 		}
+  	}
+  }
+  
+@@@ -4917,7 -5130,7 +5194,11 @@@ static int do_check(struct bpf_verifier
+  		}
+  
+  		regs = cur_regs(env);
+++<<<<<<< HEAD
+ +		env->insn_aux_data[env->insn_idx].seen = true;
+++=======
++ 		env->insn_aux_data[insn_idx].seen = true;
+++>>>>>>> fd978bf7fd31 (bpf: Add reference tracking to verifier)
+  
+  		if (class == BPF_ALU || class == BPF_ALU64) {
+  			err = check_alu_op(env, insn);
+diff --git a/include/linux/bpf_verifier.h b/include/linux/bpf_verifier.h
+index 60fc755117b1..30b6298b8d42 100644
+--- a/include/linux/bpf_verifier.h
++++ b/include/linux/bpf_verifier.h
+@@ -105,6 +105,17 @@ struct bpf_stack_state {
+ 	u8 slot_type[BPF_REG_SIZE];
+ };
+ 
++struct bpf_reference_state {
++	/* Track each reference created with a unique id, even if the same
++	 * instruction creates the reference multiple times (eg, via CALL).
++	 */
++	int id;
++	/* Instruction where the allocation of this reference occurred. This
++	 * is used purely to inform the user of a reference leak.
++	 */
++	int insn_idx;
++};
++
+ /* state of the program:
+  * type of all registers and stack info
+  */
+@@ -122,7 +133,9 @@ struct bpf_func_state {
+ 	 */
+ 	u32 subprogno;
+ 
+-	/* should be second to last. See copy_func_state() */
++	/* The following fields should be last. See copy_func_state() */
++	int acquired_refs;
++	struct bpf_reference_state *refs;
+ 	int allocated_stack;
+ 	struct bpf_stack_state *stack;
+ };
+@@ -231,11 +244,16 @@ __printf(2, 0) void bpf_verifier_vlog(struct bpf_verifier_log *log,
+ __printf(2, 3) void bpf_verifier_log_write(struct bpf_verifier_env *env,
+ 					   const char *fmt, ...);
+ 
+-static inline struct bpf_reg_state *cur_regs(struct bpf_verifier_env *env)
++static inline struct bpf_func_state *cur_func(struct bpf_verifier_env *env)
+ {
+ 	struct bpf_verifier_state *cur = env->cur_state;
+ 
+-	return cur->frame[cur->curframe]->regs;
++	return cur->frame[cur->curframe];
++}
++
++static inline struct bpf_reg_state *cur_regs(struct bpf_verifier_env *env)
++{
++	return cur_func(env)->regs;
+ }
+ 
+ int bpf_prog_offload_verifier_prep(struct bpf_verifier_env *env);
+* Unmerged path kernel/bpf/verifier.c
