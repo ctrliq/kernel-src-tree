@@ -3218,12 +3218,11 @@ static struct mlx5_ib_flow_prio *get_flow_table(struct mlx5_ib_dev *dev,
 	if (!ns)
 		return ERR_PTR(-ENOTSUPP);
 
-	if (num_entries > max_table_size)
-		return ERR_PTR(-ENOMEM);
+	max_table_size = min_t(int, num_entries, max_table_size);
 
 	ft = prio->flow_table;
 	if (!ft)
-		return _get_prio(ns, prio, priority, num_entries, num_groups,
+		return _get_prio(ns, prio, priority, max_table_size, num_groups,
 				 flags);
 
 	return prio;
@@ -3819,8 +3818,7 @@ _get_flow_table(struct mlx5_ib_dev *dev,
 		priority = FDB_BYPASS_PATH;
 	}
 
-	if (max_table_size < MLX5_FS_MAX_ENTRIES)
-		return ERR_PTR(-ENOMEM);
+	max_table_size = min_t(int, max_table_size, MLX5_FS_MAX_ENTRIES);
 
 	ns = mlx5_get_flow_namespace(dev->mdev, fs_matcher->ns_type);
 	if (!ns)
@@ -3839,7 +3837,7 @@ _get_flow_table(struct mlx5_ib_dev *dev,
 	if (prio->flow_table)
 		return prio;
 
-	return _get_prio(ns, prio, priority, MLX5_FS_MAX_ENTRIES,
+	return _get_prio(ns, prio, priority, max_table_size,
 			 MLX5_FS_MAX_TYPES, flags);
 }
 
