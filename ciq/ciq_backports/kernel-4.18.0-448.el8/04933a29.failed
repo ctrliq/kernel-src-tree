@@ -1,0 +1,221 @@
+fbcon: use lock_fb_info in fbcon_open/release
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-448.el8
+commit-author Daniel Vetter <daniel.vetter@ffwll.ch>
+commit 04933a294dacca3aaa480889d53e6195778d4578
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-448.el8/04933a29.failed
+
+Now we get to the real motiviation, because fbmem.c insists that
+that's the right lock for these.
+
+Ofc fbcon.c has a lot more places where it probably should call
+lock_fb_info(). But looking at fbmem.c at least most of these seem to
+be protected by console_lock() too, which is probably what papers over
+any issues.
+
+Note that this means we're shuffling around a bit the locking sections
+for some of the console takeover and unbind paths, but not all:
+- console binding/unbinding from the console layer never with
+lock_fb_info
+- unbind (as opposed to unlink) never bother with lock_fb_info
+
+Also the real serialization against set_par and set_pan are still
+doing by wrapping the entire ioctl code in console_lock(). So this
+shuffling shouldn't be worse than what we had from a "can you trigger
+races?" pov, but it's at least clearer.
+
+	Acked-by: Sam Ravnborg <sam@ravnborg.org>
+	Signed-off-by: Daniel Vetter <daniel.vetter@intel.com>
+	Cc: Daniel Vetter <daniel@ffwll.ch>
+	Cc: Claudio Suarez <cssk@net-c.es>
+	Cc: Tetsuo Handa <penguin-kernel@I-love.SAKURA.ne.jp>
+	Cc: Thomas Zimmermann <tzimmermann@suse.de>
+	Cc: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+	Cc: Du Cheng <ducheng2@gmail.com>
+	Cc: Sam Ravnborg <sam@ravnborg.org>
+	Cc: Matthew Wilcox <willy@infradead.org>
+	Cc: William Kucharski <william.kucharski@oracle.com>
+	Cc: Alex Deucher <alexander.deucher@amd.com>
+	Cc: Zheyu Ma <zheyuma97@gmail.com>
+	Cc: Zhen Lei <thunder.leizhen@huawei.com>
+	Cc: Xiyu Yang <xiyuyang19@fudan.edu.cn>
+Link: https://patchwork.freedesktop.org/patch/msgid/20220405210335.3434130-13-daniel.vetter@ffwll.ch
+(cherry picked from commit 04933a294dacca3aaa480889d53e6195778d4578)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/video/fbdev/core/fbcon.c
+#	drivers/video/fbdev/core/fbmem.c
+diff --cc drivers/video/fbdev/core/fbcon.c
+index 1a25ce50a9fd,cc960bf49991..000000000000
+--- a/drivers/video/fbdev/core/fbcon.c
++++ b/drivers/video/fbdev/core/fbcon.c
+@@@ -709,39 -682,57 +709,81 @@@ static int fbcon_invalid_charcount(stru
+  
+  #endif /* CONFIG_MISC_TILEBLITTING */
+  
+++<<<<<<< HEAD
+++=======
++ static void fbcon_release(struct fb_info *info)
++ {
++ 	lock_fb_info(info);
++ 	if (info->fbops->fb_release)
++ 		info->fbops->fb_release(info, 0);
++ 	unlock_fb_info(info);
++ 
++ 	module_put(info->fbops->owner);
++ }
++ 
++ static int fbcon_open(struct fb_info *info)
++ {
++ 	struct fbcon_ops *ops;
++ 
++ 	if (!try_module_get(info->fbops->owner))
++ 		return -ENODEV;
++ 
++ 	lock_fb_info(info);
++ 	if (info->fbops->fb_open &&
++ 	    info->fbops->fb_open(info, 0)) {
++ 		unlock_fb_info(info);
++ 		module_put(info->fbops->owner);
++ 		return -ENODEV;
++ 	}
++ 	unlock_fb_info(info);
++ 
++ 	ops = kzalloc(sizeof(struct fbcon_ops), GFP_KERNEL);
++ 	if (!ops) {
++ 		fbcon_release(info);
++ 		return -ENOMEM;
++ 	}
++ 
++ 	INIT_DELAYED_WORK(&ops->cursor_work, fb_flashcursor);
++ 	ops->info = info;
++ 	info->fbcon_par = ops;
++ 	ops->cur_blink_jiffies = HZ / 5;
++ 
++ 	return 0;
++ }
+++>>>>>>> 04933a294dac (fbcon: use lock_fb_info in fbcon_open/release)
+  
+  static int con2fb_acquire_newinfo(struct vc_data *vc, struct fb_info *info,
+ -				  int unit)
+ +				  int unit, int oldidx)
+  {
+ -	int err;
+ +	struct fbcon_ops *ops = NULL;
+ +	int err = 0;
+  
+ -	err = fbcon_open(info);
+ -	if (err)
+ -		return err;
+ +	if (!try_module_get(info->fbops->owner))
+ +		err = -ENODEV;
+  
+ -	if (vc)
+ -		set_blitting_type(vc, info);
+ +	if (!err && info->fbops->fb_open &&
+ +	    info->fbops->fb_open(info, 0))
+ +		err = -ENODEV;
+ +
+ +	if (!err) {
+ +		ops = kzalloc(sizeof(struct fbcon_ops), GFP_KERNEL);
+ +		if (!ops)
+ +			err = -ENOMEM;
+ +	}
+ +
+ +	if (!err) {
+ +		ops->cur_blink_jiffies = HZ / 5;
+ +		ops->info = info;
+ +		info->fbcon_par = ops;
+ +
+ +		if (vc)
+ +			set_blitting_type(vc, info);
+ +	}
+ +
+ +	if (err) {
+ +		con2fb_map[unit] = oldidx;
+ +		module_put(info->fbops->owner);
+ +	}
+  
+  	return err;
+  }
+diff --cc drivers/video/fbdev/core/fbmem.c
+index 32dffdd5addd,0e68d9456bc2..000000000000
+--- a/drivers/video/fbdev/core/fbmem.c
++++ b/drivers/video/fbdev/core/fbmem.c
+@@@ -1683,44 -1668,41 +1683,55 @@@ static int do_register_framebuffer(stru
+  
+  	if (!lockless_register_fb)
+  		console_lock();
+++<<<<<<< HEAD
+ +	lock_fb_info(fb_info);
+ +	ret = fbcon_fb_registered(fb_info);
+ +	unlock_fb_info(fb_info);
+++=======
++ 	else
++ 		atomic_inc(&ignore_console_lock_warning);
++ 	ret = fbcon_fb_registered(fb_info);
++ 
+++>>>>>>> 04933a294dac (fbcon: use lock_fb_info in fbcon_open/release)
+  	if (!lockless_register_fb)
+  		console_unlock();
+ -	else
+ -		atomic_dec(&ignore_console_lock_warning);
+ -	return ret;
+ +	return 0;
+  }
+  
+ -static void unbind_console(struct fb_info *fb_info)
+ +static int unbind_console(struct fb_info *fb_info)
+  {
+ +	struct fb_event event;
+ +	int ret;
+  	int i = fb_info->node;
+  
+ -	if (WARN_ON(i < 0 || i >= FB_MAX || registered_fb[i] != fb_info))
+ -		return;
+ +	if (i < 0 || i >= FB_MAX || registered_fb[i] != fb_info)
+ +		return -EINVAL;
+  
+  	console_lock();
+++<<<<<<< HEAD
+ +	lock_fb_info(fb_info);
+ +	event.info = fb_info;
+ +	ret = fb_notifier_call_chain(FB_EVENT_FB_UNBIND, &event);
+ +	unlock_fb_info(fb_info);
+++=======
++ 	fbcon_fb_unbind(fb_info);
+++>>>>>>> 04933a294dac (fbcon: use lock_fb_info in fbcon_open/release)
+  	console_unlock();
+ +
+ +	return ret;
+  }
+  
+ -static void unlink_framebuffer(struct fb_info *fb_info)
+ -{
+ -	int i;
+ +static int __unlink_framebuffer(struct fb_info *fb_info);
+  
+ -	i = fb_info->node;
+ -	if (WARN_ON(i < 0 || i >= FB_MAX || registered_fb[i] != fb_info))
+ -		return;
+ +static int do_unregister_framebuffer(struct fb_info *fb_info)
+ +{
+ +	struct fb_event event;
+ +	int ret;
+  
+ -	if (!fb_info->dev)
+ -		return;
+ +	ret = unbind_console(fb_info);
+  
+ -	device_destroy(fb_class, MKDEV(FB_MAJOR, i));
+ +	if (ret)
+ +		return -EINVAL;
+  
+  	pm_vt_switch_unregister(fb_info->dev);
+  
+* Unmerged path drivers/video/fbdev/core/fbcon.c
+* Unmerged path drivers/video/fbdev/core/fbmem.c
