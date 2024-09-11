@@ -1,0 +1,114 @@
+io_uring: don't setup async context for read/write fixed
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Jens Axboe <axboe@kernel.dk>
+commit 74566df3a71c1b92da608868cca787557d8be7b2
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/74566df3.failed
+
+We don't need it, and if we have it, then the retry handler will attempt
+to copy the non-existent iovec with the inline iovec, with a segment
+count that doesn't make sense.
+
+Fixes: f67676d160c6 ("io_uring: ensure async punted read/write requests copy iovec")
+	Reported-by: Jonathan Lemon <jonathan.lemon@gmail.com>
+	Signed-off-by: Jens Axboe <axboe@kernel.dk>
+(cherry picked from commit 74566df3a71c1b92da608868cca787557d8be7b2)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/io_uring.c
+diff --cc fs/io_uring.c
+index ab99aea677bc,8321c2f5589b..000000000000
+--- a/fs/io_uring.c
++++ b/fs/io_uring.c
+@@@ -1330,7 -1751,82 +1330,86 @@@ static ssize_t loop_rw_iter(int rw, str
+  	return ret;
+  }
+  
+++<<<<<<< HEAD
+ +static int io_read(struct io_kiocb *req, const struct sqe_submit *s,
+++=======
++ static void io_req_map_rw(struct io_kiocb *req, ssize_t io_size,
++ 			  struct iovec *iovec, struct iovec *fast_iov,
++ 			  struct iov_iter *iter)
++ {
++ 	req->io->rw.nr_segs = iter->nr_segs;
++ 	req->io->rw.size = io_size;
++ 	req->io->rw.iov = iovec;
++ 	if (!req->io->rw.iov) {
++ 		req->io->rw.iov = req->io->rw.fast_iov;
++ 		memcpy(req->io->rw.iov, fast_iov,
++ 			sizeof(struct iovec) * iter->nr_segs);
++ 	}
++ }
++ 
++ static int io_alloc_async_ctx(struct io_kiocb *req)
++ {
++ 	req->io = kmalloc(sizeof(*req->io), GFP_KERNEL);
++ 	return req->io == NULL;
++ }
++ 
++ static void io_rw_async(struct io_wq_work **workptr)
++ {
++ 	struct io_kiocb *req = container_of(*workptr, struct io_kiocb, work);
++ 	struct iovec *iov = NULL;
++ 
++ 	if (req->io->rw.iov != req->io->rw.fast_iov)
++ 		iov = req->io->rw.iov;
++ 	io_wq_submit_work(workptr);
++ 	kfree(iov);
++ }
++ 
++ static int io_setup_async_rw(struct io_kiocb *req, ssize_t io_size,
++ 			     struct iovec *iovec, struct iovec *fast_iov,
++ 			     struct iov_iter *iter)
++ {
++ 	if (req->opcode == IORING_OP_READ_FIXED ||
++ 	    req->opcode == IORING_OP_WRITE_FIXED)
++ 		return 0;
++ 	if (!req->io && io_alloc_async_ctx(req))
++ 		return -ENOMEM;
++ 
++ 	io_req_map_rw(req, io_size, iovec, fast_iov, iter);
++ 	req->work.func = io_rw_async;
++ 	return 0;
++ }
++ 
++ static int io_read_prep(struct io_kiocb *req, const struct io_uring_sqe *sqe,
++ 			bool force_nonblock)
++ {
++ 	struct io_async_ctx *io;
++ 	struct iov_iter iter;
++ 	ssize_t ret;
++ 
++ 	ret = io_prep_rw(req, sqe, force_nonblock);
++ 	if (ret)
++ 		return ret;
++ 
++ 	if (unlikely(!(req->file->f_mode & FMODE_READ)))
++ 		return -EBADF;
++ 
++ 	if (!req->io)
++ 		return 0;
++ 
++ 	io = req->io;
++ 	io->rw.iov = io->rw.fast_iov;
++ 	req->io = NULL;
++ 	ret = io_import_iovec(READ, req, &io->rw.iov, &iter);
++ 	req->io = io;
++ 	if (ret < 0)
++ 		return ret;
++ 
++ 	io_req_map_rw(req, ret, io->rw.iov, io->rw.fast_iov, &iter);
++ 	return 0;
++ }
++ 
++ static int io_read(struct io_kiocb *req, struct io_kiocb **nxt,
+++>>>>>>> 74566df3a71c (io_uring: don't setup async context for read/write fixed)
+  		   bool force_nonblock)
+  {
+  	struct iovec inline_vecs[UIO_FASTIOV], *iovec = inline_vecs;
+* Unmerged path fs/io_uring.c
