@@ -1,0 +1,140 @@
+mm/frame-vector: Use FOLL_LONGTERM
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-358.el8
+commit-author Daniel Vetter <daniel.vetter@ffwll.ch>
+commit 04769cb1c45a919cd94b931e6494d2a9afc32914
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-358.el8/04769cb1.failed
+
+This is used by media/videbuf2 for persistent dma mappings, not just
+for a single dma operation and then freed again, so needs
+FOLL_LONGTERM.
+
+Unfortunately current pup_locked doesn't support FOLL_LONGTERM due to
+locking issues. Rework the code to pull the pup path out from the
+mmap_sem critical section as suggested by Jason.
+
+By relying entirely on the vma checks in pin_user_pages and follow_pfn
+(for vm_flags and vma_is_fsdax) we can also streamline the code a lot.
+
+Note that pin_user_pages_fast is a safe replacement despite the
+seeming lack of checking for vma->vm_flasg & (VM_IO | VM_PFNMAP). Such
+ptes are marked with pte_mkspecial (which pup_fast rejects in the
+fastpath), and only architectures supporting that support the
+pin_user_pages_fast fastpath.
+
+	Signed-off-by: Daniel Vetter <daniel.vetter@intel.com>
+	Cc: Christoph Hellwig <hch@infradead.org>
+	Cc: Jason Gunthorpe <jgg@ziepe.ca>
+	Cc: Pawel Osciak <pawel@osciak.com>
+	Cc: Marek Szyprowski <m.szyprowski@samsung.com>
+	Cc: Kyungmin Park <kyungmin.park@samsung.com>
+	Cc: Tomasz Figa <tfiga@chromium.org>
+	Cc: Mauro Carvalho Chehab <mchehab@kernel.org>
+	Cc: Andrew Morton <akpm@linux-foundation.org>
+	Cc: John Hubbard <jhubbard@nvidia.com>
+	Cc: Jérôme Glisse <jglisse@redhat.com>
+	Cc: Jan Kara <jack@suse.cz>
+	Cc: Dan Williams <dan.j.williams@intel.com>
+	Cc: linux-mm@kvack.org
+	Cc: linux-arm-kernel@lists.infradead.org
+	Cc: linux-samsung-soc@vger.kernel.org
+	Cc: linux-media@vger.kernel.org
+	Signed-off-by: Daniel Vetter <daniel.vetter@ffwll.ch>
+Link: https://patchwork.freedesktop.org/patch/msgid/20201127164131.2244124-6-daniel.vetter@ffwll.ch
+(cherry picked from commit 04769cb1c45a919cd94b931e6494d2a9afc32914)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	mm/frame_vector.c
+diff --cc mm/frame_vector.c
+index 11e9f3044daf,f8c34b895c76..000000000000
+--- a/mm/frame_vector.c
++++ b/mm/frame_vector.c
+@@@ -46,37 -45,21 +45,46 @@@ int get_vaddr_frames(unsigned long star
+  	if (WARN_ON_ONCE(nr_frames > vec->nr_allocated))
+  		nr_frames = vec->nr_allocated;
+  
+++<<<<<<< HEAD
+ +	mmap_read_lock(mm);
+ +	locked = 1;
+ +	vma = find_vma_intersection(mm, start, start + 1);
+ +	if (!vma) {
+ +		ret = -EFAULT;
+ +		goto out;
+ +	}
+ +
+ +	/*
+ +	 * While get_vaddr_frames() could be used for transient (kernel
+ +	 * controlled lifetime) pinning of memory pages all current
+ +	 * users establish long term (userspace controlled lifetime)
+ +	 * page pinning. Treat get_vaddr_frames() like
+ +	 * get_user_pages_longterm() and disallow it for filesystem-dax
+ +	 * mappings.
+ +	 */
+ +	if (vma_is_fsdax(vma)) {
+ +		ret = -EOPNOTSUPP;
+ +		goto out;
+ +	}
+ +
+ +	if (!(vma->vm_flags & (VM_IO | VM_PFNMAP))) {
+++=======
++ 	start = untagged_addr(start);
++ 
++ 	ret = pin_user_pages_fast(start, nr_frames,
++ 				  FOLL_FORCE | FOLL_WRITE | FOLL_LONGTERM,
++ 				  (struct page **)(vec->ptrs));
++ 	if (ret > 0) {
+++>>>>>>> 04769cb1c45a (mm/frame-vector: Use FOLL_LONGTERM)
+  		vec->got_ref = true;
+  		vec->is_pfns = false;
+- 		ret = pin_user_pages_locked(start, nr_frames,
+- 			gup_flags, (struct page **)(vec->ptrs), &locked);
+- 		goto out;
++ 		goto out_unlocked;
+  	}
+  
++ 	mmap_read_lock(mm);
+  	vec->got_ref = false;
+  	vec->is_pfns = true;
++ 	ret = 0;
+  	do {
+  		unsigned long *nums = frame_vector_pfns(vec);
+  
+diff --git a/drivers/media/common/videobuf2/videobuf2-memops.c b/drivers/media/common/videobuf2/videobuf2-memops.c
+index c015532bfd96..be265a2c56af 100644
+--- a/drivers/media/common/videobuf2/videobuf2-memops.c
++++ b/drivers/media/common/videobuf2/videobuf2-memops.c
+@@ -40,7 +40,6 @@ struct frame_vector *vb2_create_framevec(unsigned long start,
+ 	unsigned long first, last;
+ 	unsigned long nr;
+ 	struct frame_vector *vec;
+-	unsigned int flags = FOLL_FORCE | FOLL_WRITE;
+ 
+ 	first = start >> PAGE_SHIFT;
+ 	last = (start + length - 1) >> PAGE_SHIFT;
+@@ -48,7 +47,7 @@ struct frame_vector *vb2_create_framevec(unsigned long start,
+ 	vec = frame_vector_create(nr);
+ 	if (!vec)
+ 		return ERR_PTR(-ENOMEM);
+-	ret = get_vaddr_frames(start & PAGE_MASK, nr, flags, vec);
++	ret = get_vaddr_frames(start & PAGE_MASK, nr, vec);
+ 	if (ret < 0)
+ 		goto out_destroy;
+ 	/* We accept only complete set of PFNs */
+diff --git a/include/linux/mm.h b/include/linux/mm.h
+index 8cd1bab50fcb..a70221ff2f9e 100644
+--- a/include/linux/mm.h
++++ b/include/linux/mm.h
+@@ -1664,7 +1664,7 @@ struct frame_vector {
+ struct frame_vector *frame_vector_create(unsigned int nr_frames);
+ void frame_vector_destroy(struct frame_vector *vec);
+ int get_vaddr_frames(unsigned long start, unsigned int nr_pfns,
+-		     unsigned int gup_flags, struct frame_vector *vec);
++		     struct frame_vector *vec);
+ void put_vaddr_frames(struct frame_vector *vec);
+ int frame_vector_to_pages(struct frame_vector *vec);
+ void frame_vector_to_pfns(struct frame_vector *vec);
+* Unmerged path mm/frame_vector.c
