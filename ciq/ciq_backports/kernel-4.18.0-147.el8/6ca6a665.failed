@@ -1,0 +1,400 @@
+taprio: Add support for setting the cycle-time manually
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-147.el8
+commit-author Vinicius Costa Gomes <vinicius.gomes@intel.com>
+commit 6ca6a6654225f3cd001304d33429c817e0c0b85f
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-147.el8/6ca6a665.failed
+
+IEEE 802.1Q-2018 defines that a the cycle-time of a schedule may be
+overridden, so the schedule is truncated to a determined "width".
+
+	Signed-off-by: Vinicius Costa Gomes <vinicius.gomes@intel.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 6ca6a6654225f3cd001304d33429c817e0c0b85f)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/uapi/linux/pkt_sched.h
+#	net/sched/sch_taprio.c
+diff --cc include/uapi/linux/pkt_sched.h
+index a26080235fb7,7a32276838e1..000000000000
+--- a/include/uapi/linux/pkt_sched.h
++++ b/include/uapi/linux/pkt_sched.h
+@@@ -1153,6 -1166,8 +1153,11 @@@ enum 
+  	TCA_TAPRIO_ATTR_SCHED_SINGLE_ENTRY, /* single entry */
+  	TCA_TAPRIO_ATTR_SCHED_CLOCKID, /* s32 */
+  	TCA_TAPRIO_PAD,
+++<<<<<<< HEAD
+++=======
++ 	TCA_TAPRIO_ATTR_ADMIN_SCHED, /* The admin sched, only used in dump */
++ 	TCA_TAPRIO_ATTR_SCHED_CYCLE_TIME, /* s64 */
+++>>>>>>> 6ca6a6654225 (taprio: Add support for setting the cycle-time manually)
+  	__TCA_TAPRIO_ATTR_MAX,
+  };
+  
+diff --cc net/sched/sch_taprio.c
+index fc147ade41b9,6b37ffda23ec..000000000000
+--- a/net/sched/sch_taprio.c
++++ b/net/sched/sch_taprio.c
+@@@ -41,6 -42,15 +41,18 @@@ struct sched_entry 
+  	u8 command;
+  };
+  
+++<<<<<<< HEAD
+++=======
++ struct sched_gate_list {
++ 	struct rcu_head rcu;
++ 	struct list_head entries;
++ 	size_t num_entries;
++ 	ktime_t cycle_close_time;
++ 	s64 cycle_time;
++ 	s64 base_time;
++ };
++ 
+++>>>>>>> 6ca6a6654225 (taprio: Add support for setting the cycle-time manually)
+  struct taprio_sched {
+  	struct Qdisc **qdiscs;
+  	struct Qdisc *root;
+@@@ -60,6 -69,60 +72,63 @@@
+  	struct list_head taprio_list;
+  };
+  
+++<<<<<<< HEAD
+++=======
++ static ktime_t sched_base_time(const struct sched_gate_list *sched)
++ {
++ 	if (!sched)
++ 		return KTIME_MAX;
++ 
++ 	return ns_to_ktime(sched->base_time);
++ }
++ 
++ static void taprio_free_sched_cb(struct rcu_head *head)
++ {
++ 	struct sched_gate_list *sched = container_of(head, struct sched_gate_list, rcu);
++ 	struct sched_entry *entry, *n;
++ 
++ 	if (!sched)
++ 		return;
++ 
++ 	list_for_each_entry_safe(entry, n, &sched->entries, list) {
++ 		list_del(&entry->list);
++ 		kfree(entry);
++ 	}
++ 
++ 	kfree(sched);
++ }
++ 
++ static void switch_schedules(struct taprio_sched *q,
++ 			     struct sched_gate_list **admin,
++ 			     struct sched_gate_list **oper)
++ {
++ 	rcu_assign_pointer(q->oper_sched, *admin);
++ 	rcu_assign_pointer(q->admin_sched, NULL);
++ 
++ 	if (*oper)
++ 		call_rcu(&(*oper)->rcu, taprio_free_sched_cb);
++ 
++ 	*oper = *admin;
++ 	*admin = NULL;
++ }
++ 
++ static ktime_t get_cycle_time(struct sched_gate_list *sched)
++ {
++ 	struct sched_entry *entry;
++ 	ktime_t cycle = 0;
++ 
++ 	if (sched->cycle_time != 0)
++ 		return sched->cycle_time;
++ 
++ 	list_for_each_entry(entry, &sched->entries, list)
++ 		cycle = ktime_add_ns(cycle, entry->interval);
++ 
++ 	sched->cycle_time = cycle;
++ 
++ 	return cycle;
++ }
++ 
+++>>>>>>> 6ca6a6654225 (taprio: Add support for setting the cycle-time manually)
+  static int taprio_enqueue(struct sk_buff *skb, struct Qdisc *sch,
+  			  struct sk_buff **to_free)
+  {
+@@@ -211,6 -274,38 +280,41 @@@ done
+  	return skb;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static bool should_restart_cycle(const struct sched_gate_list *oper,
++ 				 const struct sched_entry *entry)
++ {
++ 	if (list_is_last(&entry->list, &oper->entries))
++ 		return true;
++ 
++ 	if (ktime_compare(entry->close_time, oper->cycle_close_time) == 0)
++ 		return true;
++ 
++ 	return false;
++ }
++ 
++ static bool should_change_schedules(const struct sched_gate_list *admin,
++ 				    const struct sched_gate_list *oper,
++ 				    ktime_t close_time)
++ {
++ 	ktime_t next_base_time;
++ 
++ 	if (!admin)
++ 		return false;
++ 
++ 	next_base_time = sched_base_time(admin);
++ 
++ 	/* This is the simple case, the close_time would fall after
++ 	 * the next schedule base_time.
++ 	 */
++ 	if (ktime_compare(next_base_time, close_time) <= 0)
++ 		return true;
++ 
++ 	return false;
++ }
++ 
+++>>>>>>> 6ca6a6654225 (taprio: Add support for setting the cycle-time manually)
+  static enum hrtimer_restart advance_sched(struct hrtimer *timer)
+  {
+  	struct taprio_sched *q = container_of(timer, struct taprio_sched,
+@@@ -234,14 -339,26 +338,23 @@@
+  		goto first_run;
+  	}
+  
+++<<<<<<< HEAD
+ +	if (list_is_last(&entry->list, &q->entries))
+ +		next = list_first_entry(&q->entries, struct sched_entry,
+++=======
++ 	if (should_restart_cycle(oper, entry)) {
++ 		next = list_first_entry(&oper->entries, struct sched_entry,
+++>>>>>>> 6ca6a6654225 (taprio: Add support for setting the cycle-time manually)
+  					list);
+- 	else
++ 		oper->cycle_close_time = ktime_add_ns(oper->cycle_close_time,
++ 						      oper->cycle_time);
++ 	} else {
+  		next = list_next_entry(entry, list);
++ 	}
+  
+  	close_time = ktime_add_ns(entry->close_time, next->interval);
++ 	close_time = min_t(ktime_t, close_time, oper->cycle_close_time);
+  
+ -	if (should_change_schedules(admin, oper, close_time)) {
+ -		/* Set things so the next time this runs, the new
+ -		 * schedule runs.
+ -		 */
+ -		close_time = sched_base_time(admin);
+ -		switch_schedules(q, &admin, &oper);
+ -	}
+ -
+  	next->close_time = close_time;
+  	taprio_set_budget(q, next);
+  
+@@@ -426,55 -482,30 +540,58 @@@ static int parse_sched_list(struct nlat
+  	return i;
+  }
+  
+ -static int parse_taprio_schedule(struct nlattr **tb,
+ -				 struct sched_gate_list *new,
+ -				 struct netlink_ext_ack *extack)
+ +/* Returns the number of entries in case of success */
+ +static int parse_taprio_opt(struct nlattr **tb, struct taprio_sched *q,
+ +			    struct netlink_ext_ack *extack)
+  {
+  	int err = 0;
+ +	int clockid;
+  
+ -	if (tb[TCA_TAPRIO_ATTR_SCHED_SINGLE_ENTRY]) {
+ -		NL_SET_ERR_MSG(extack, "Adding a single entry is not supported");
+ -		return -ENOTSUPP;
+ -	}
+ +	if (tb[TCA_TAPRIO_ATTR_SCHED_ENTRY_LIST] &&
+ +	    tb[TCA_TAPRIO_ATTR_SCHED_SINGLE_ENTRY])
+ +		return -EINVAL;
+ +
+ +	if (tb[TCA_TAPRIO_ATTR_SCHED_SINGLE_ENTRY] && q->num_entries == 0)
+ +		return -EINVAL;
+ +
+ +	if (q->clockid == -1 && !tb[TCA_TAPRIO_ATTR_SCHED_CLOCKID])
+ +		return -EINVAL;
+  
+  	if (tb[TCA_TAPRIO_ATTR_SCHED_BASE_TIME])
+ -		new->base_time = nla_get_s64(tb[TCA_TAPRIO_ATTR_SCHED_BASE_TIME]);
+ +		q->base_time = nla_get_s64(
+ +			tb[TCA_TAPRIO_ATTR_SCHED_BASE_TIME]);
+ +
+ +	if (tb[TCA_TAPRIO_ATTR_SCHED_CLOCKID]) {
+ +		clockid = nla_get_s32(tb[TCA_TAPRIO_ATTR_SCHED_CLOCKID]);
+ +
+ +		/* We only support static clockids and we don't allow
+ +		 * for it to be modified after the first init.
+ +		 */
+ +		if (clockid < 0 || (q->clockid != -1 && q->clockid != clockid))
+ +			return -EINVAL;
+ +
+ +		q->clockid = clockid;
+ +	}
+  
++ 	if (tb[TCA_TAPRIO_ATTR_SCHED_CYCLE_TIME])
++ 		new->cycle_time = nla_get_s64(tb[TCA_TAPRIO_ATTR_SCHED_CYCLE_TIME]);
++ 
+  	if (tb[TCA_TAPRIO_ATTR_SCHED_ENTRY_LIST])
+  		err = parse_sched_list(
+ -			tb[TCA_TAPRIO_ATTR_SCHED_ENTRY_LIST], new, extack);
+ -	if (err < 0)
+ -		return err;
+ +			tb[TCA_TAPRIO_ATTR_SCHED_ENTRY_LIST], q, extack);
+ +	else if (tb[TCA_TAPRIO_ATTR_SCHED_SINGLE_ENTRY])
+ +		err = parse_sched_single_entry(
+ +			tb[TCA_TAPRIO_ATTR_SCHED_SINGLE_ENTRY], q, extack);
+  
+ -	return 0;
+ +	/* parse_sched_* return the number of entries in the schedule,
+ +	 * a schedule with zero entries is an error.
+ +	 */
+ +	if (err == 0) {
+ +		NL_SET_ERR_MSG(extack, "The schedule should contain at least one entry");
+ +		return -EINVAL;
+ +	}
+ +
+ +	return err;
+  }
+  
+  static int taprio_parse_mqprio_opt(struct net_device *dev,
+@@@ -533,10 -570,11 +650,9 @@@
+  	return 0;
+  }
+  
+ -static int taprio_get_start_time(struct Qdisc *sch,
+ -				 struct sched_gate_list *sched,
+ -				 ktime_t *start)
+ +static int taprio_get_start_time(struct Qdisc *sch, ktime_t *start)
+  {
+  	struct taprio_sched *q = qdisc_priv(sch);
+- 	struct sched_entry *entry;
+  	ktime_t now, base, cycle;
+  	s64 n;
+  
+@@@ -548,11 -586,7 +664,15 @@@
+  		return 0;
+  	}
+  
+++<<<<<<< HEAD
+ +	/* Calculate the cycle_time, by summing all the intervals.
+ +	 */
+ +	cycle = 0;
+ +	list_for_each_entry(entry, &q->entries, list)
+ +		cycle = ktime_add_ns(cycle, entry->interval);
+++=======
++ 	cycle = get_cycle_time(sched);
+++>>>>>>> 6ca6a6654225 (taprio: Add support for setting the cycle-time manually)
+  
+  	/* The qdisc is expected to have at least one sched_entry.  Moreover,
+  	 * any entry must have 'interval' > 0. Thus if the cycle time is zero,
+@@@ -570,22 -604,40 +690,46 @@@
+  	return 0;
+  }
+  
+++<<<<<<< HEAD
+ +static void taprio_start_sched(struct Qdisc *sch, ktime_t start)
+++=======
++ static void setup_first_close_time(struct taprio_sched *q,
++ 				   struct sched_gate_list *sched, ktime_t base)
++ {
++ 	struct sched_entry *first;
++ 	ktime_t cycle;
++ 
++ 	first = list_first_entry(&sched->entries,
++ 				 struct sched_entry, list);
++ 
++ 	cycle = get_cycle_time(sched);
++ 
++ 	/* FIXME: find a better place to do this */
++ 	sched->cycle_close_time = ktime_add_ns(base, cycle);
++ 
++ 	first->close_time = ktime_add_ns(base, first->interval);
++ 	taprio_set_budget(q, first);
++ 	rcu_assign_pointer(q->current_entry, NULL);
++ }
++ 
++ static void taprio_start_sched(struct Qdisc *sch,
++ 			       ktime_t start, struct sched_gate_list *new)
+++>>>>>>> 6ca6a6654225 (taprio: Add support for setting the cycle-time manually)
+  {
+  	struct taprio_sched *q = qdisc_priv(sch);
+ -	ktime_t expires;
+ +	struct sched_entry *first;
+ +	unsigned long flags;
+  
+ -	expires = hrtimer_get_expires(&q->advance_timer);
+ -	if (expires == 0)
+ -		expires = KTIME_MAX;
+ +	spin_lock_irqsave(&q->current_entry_lock, flags);
+  
+ -	/* If the new schedule starts before the next expiration, we
+ -	 * reprogram it to the earliest one, so we change the admin
+ -	 * schedule to the operational one at the right time.
+ -	 */
+ -	start = min_t(ktime_t, start, expires);
+ +	first = list_first_entry(&q->entries, struct sched_entry,
+ +				 list);
+ +
+ +	first->close_time = ktime_add_ns(start, first->interval);
+ +	taprio_set_budget(q, first);
+ +	rcu_assign_pointer(q->current_entry, NULL);
+ +
+ +	spin_unlock_irqrestore(&q->current_entry_lock, flags);
+  
+  	hrtimer_start(&q->advance_timer, start, HRTIMER_MODE_ABS);
+  }
+@@@ -868,6 -994,38 +1012,41 @@@ nla_put_failure
+  	return -1;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static int dump_schedule(struct sk_buff *msg,
++ 			 const struct sched_gate_list *root)
++ {
++ 	struct nlattr *entry_list;
++ 	struct sched_entry *entry;
++ 
++ 	if (nla_put_s64(msg, TCA_TAPRIO_ATTR_SCHED_BASE_TIME,
++ 			root->base_time, TCA_TAPRIO_PAD))
++ 		return -1;
++ 
++ 	if (nla_put_s64(msg, TCA_TAPRIO_ATTR_SCHED_CYCLE_TIME,
++ 			root->cycle_time, TCA_TAPRIO_PAD))
++ 		return -1;
++ 
++ 	entry_list = nla_nest_start_noflag(msg,
++ 					   TCA_TAPRIO_ATTR_SCHED_ENTRY_LIST);
++ 	if (!entry_list)
++ 		goto error_nest;
++ 
++ 	list_for_each_entry(entry, &root->entries, list) {
++ 		if (dump_entry(msg, entry) < 0)
++ 			goto error_nest;
++ 	}
++ 
++ 	nla_nest_end(msg, entry_list);
++ 	return 0;
++ 
++ error_nest:
++ 	nla_nest_cancel(msg, entry_list);
++ 	return -1;
++ }
++ 
+++>>>>>>> 6ca6a6654225 (taprio: Add support for setting the cycle-time manually)
+  static int taprio_dump(struct Qdisc *sch, struct sk_buff *skb)
+  {
+  	struct taprio_sched *q = qdisc_priv(sch);
+* Unmerged path include/uapi/linux/pkt_sched.h
+* Unmerged path net/sched/sch_taprio.c
