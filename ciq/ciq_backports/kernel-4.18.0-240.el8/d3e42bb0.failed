@@ -1,0 +1,159 @@
+bpf: Reuse log from btf_prase_vmlinux() in btf_struct_ops_init()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Martin KaFai Lau <kafai@fb.com>
+commit d3e42bb0a329fadff98fcb927714d0a486840e3b
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/d3e42bb0.failed
+
+Instead of using a locally defined "struct bpf_verifier_log log = {}",
+btf_struct_ops_init() should reuse the "log" from its calling
+function "btf_parse_vmlinux()".  It should also resolve the
+frame-size too large compiler warning in some ARCH.
+
+Fixes: 27ae7997a661 ("bpf: Introduce BPF_PROG_TYPE_STRUCT_OPS")
+	Signed-off-by: Martin KaFai Lau <kafai@fb.com>
+	Signed-off-by: Daniel Borkmann <daniel@iogearbox.net>
+	Acked-by: Andrii Nakryiko <andriin@fb.com>
+	Acked-by: Alexei Starovoitov <ast@kernel.org>
+Link: https://lore.kernel.org/bpf/20200127175145.1154438-1-kafai@fb.com
+(cherry picked from commit d3e42bb0a329fadff98fcb927714d0a486840e3b)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/bpf.h
+#	kernel/bpf/bpf_struct_ops.c
+#	kernel/bpf/btf.c
+diff --cc include/linux/bpf.h
+index 602dd6841705,49b1a70e12c8..000000000000
+--- a/include/linux/bpf.h
++++ b/include/linux/bpf.h
+@@@ -460,8 -695,83 +460,81 @@@ struct bpf_array_aux 
+  	 */
+  	enum bpf_prog_type type;
+  	bool jited;
+ -	/* Programs with direct jumps into programs part of this array. */
+ -	struct list_head poke_progs;
+ -	struct bpf_map *map;
+ -	struct mutex poke_mutex;
+ -	struct work_struct work;
+  };
+  
+++<<<<<<< HEAD
+++=======
++ struct bpf_struct_ops_value;
++ struct btf_type;
++ struct btf_member;
++ 
++ #define BPF_STRUCT_OPS_MAX_NR_MEMBERS 64
++ struct bpf_struct_ops {
++ 	const struct bpf_verifier_ops *verifier_ops;
++ 	int (*init)(struct btf *btf);
++ 	int (*check_member)(const struct btf_type *t,
++ 			    const struct btf_member *member);
++ 	int (*init_member)(const struct btf_type *t,
++ 			   const struct btf_member *member,
++ 			   void *kdata, const void *udata);
++ 	int (*reg)(void *kdata);
++ 	void (*unreg)(void *kdata);
++ 	const struct btf_type *type;
++ 	const struct btf_type *value_type;
++ 	const char *name;
++ 	struct btf_func_model func_models[BPF_STRUCT_OPS_MAX_NR_MEMBERS];
++ 	u32 type_id;
++ 	u32 value_id;
++ };
++ 
++ #if defined(CONFIG_BPF_JIT) && defined(CONFIG_BPF_SYSCALL)
++ #define BPF_MODULE_OWNER ((void *)((0xeB9FUL << 2) + POISON_POINTER_DELTA))
++ const struct bpf_struct_ops *bpf_struct_ops_find(u32 type_id);
++ void bpf_struct_ops_init(struct btf *btf, struct bpf_verifier_log *log);
++ bool bpf_struct_ops_get(const void *kdata);
++ void bpf_struct_ops_put(const void *kdata);
++ int bpf_struct_ops_map_sys_lookup_elem(struct bpf_map *map, void *key,
++ 				       void *value);
++ static inline bool bpf_try_module_get(const void *data, struct module *owner)
++ {
++ 	if (owner == BPF_MODULE_OWNER)
++ 		return bpf_struct_ops_get(data);
++ 	else
++ 		return try_module_get(owner);
++ }
++ static inline void bpf_module_put(const void *data, struct module *owner)
++ {
++ 	if (owner == BPF_MODULE_OWNER)
++ 		bpf_struct_ops_put(data);
++ 	else
++ 		module_put(owner);
++ }
++ #else
++ static inline const struct bpf_struct_ops *bpf_struct_ops_find(u32 type_id)
++ {
++ 	return NULL;
++ }
++ static inline void bpf_struct_ops_init(struct btf *btf,
++ 				       struct bpf_verifier_log *log)
++ {
++ }
++ static inline bool bpf_try_module_get(const void *data, struct module *owner)
++ {
++ 	return try_module_get(owner);
++ }
++ static inline void bpf_module_put(const void *data, struct module *owner)
++ {
++ 	module_put(owner);
++ }
++ static inline int bpf_struct_ops_map_sys_lookup_elem(struct bpf_map *map,
++ 						     void *key,
++ 						     void *value)
++ {
++ 	return -EINVAL;
++ }
++ #endif
++ 
+++>>>>>>> d3e42bb0a329 (bpf: Reuse log from btf_prase_vmlinux() in btf_struct_ops_init())
+  struct bpf_array {
+  	struct bpf_map map;
+  	u32 elem_size;
+diff --cc kernel/bpf/btf.c
+index 2a814759ff8d,8c9d8f266bef..000000000000
+--- a/kernel/bpf/btf.c
++++ b/kernel/bpf/btf.c
+@@@ -3499,6 -3623,28 +3499,31 @@@ struct btf *btf_parse_vmlinux(void
+  	if (err)
+  		goto errout;
+  
+++<<<<<<< HEAD
+++=======
++ 	/* find struct bpf_ctx_convert for type checking later */
++ 	for (i = 1; i <= btf->nr_types; i++) {
++ 		const struct btf_type *t;
++ 		const char *tname;
++ 
++ 		t = btf_type_by_id(btf, i);
++ 		if (!__btf_type_is_struct(t))
++ 			continue;
++ 		tname = __btf_name_by_offset(btf, t->name_off);
++ 		if (!strcmp(tname, "bpf_ctx_convert")) {
++ 			/* btf_parse_vmlinux() runs under bpf_verifier_lock */
++ 			bpf_ctx_convert.t = t;
++ 			break;
++ 		}
++ 	}
++ 	if (i > btf->nr_types) {
++ 		err = -ENOENT;
++ 		goto errout;
++ 	}
++ 
++ 	bpf_struct_ops_init(btf, log);
++ 
+++>>>>>>> d3e42bb0a329 (bpf: Reuse log from btf_prase_vmlinux() in btf_struct_ops_init())
+  	btf_verifier_env_free(env);
+  	refcount_set(&btf->refcnt, 1);
+  	return btf;
+* Unmerged path kernel/bpf/bpf_struct_ops.c
+* Unmerged path include/linux/bpf.h
+* Unmerged path kernel/bpf/bpf_struct_ops.c
+* Unmerged path kernel/bpf/btf.c
