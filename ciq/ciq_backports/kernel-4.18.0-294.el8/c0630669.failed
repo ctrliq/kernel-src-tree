@@ -1,0 +1,287 @@
+mm: thp: fix false negative of shmem vma's THP eligibility
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Yang Shi <yang.shi@linux.alibaba.com>
+commit c06306696f8368b08774e2a743dbc52d92a61693
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/c0630669.failed
+
+Commit 7635d9cbe832 ("mm, thp, proc: report THP eligibility for each
+vma") introduced THPeligible bit for processes' smaps.  But, when
+checking the eligibility for shmem vma, __transparent_hugepage_enabled()
+is called to override the result from shmem_huge_enabled().  It may
+result in the anonymous vma's THP flag override shmem's.  For example,
+running a simple test which create THP for shmem, but with anonymous THP
+disabled, when reading the process's smaps, it may show:
+
+  7fc92ec00000-7fc92f000000 rw-s 00000000 00:14 27764 /dev/shm/test
+  Size:               4096 kB
+  ...
+  [snip]
+  ...
+  ShmemPmdMapped:     4096 kB
+  ...
+  [snip]
+  ...
+  THPeligible:    0
+
+And, /proc/meminfo does show THP allocated and PMD mapped too:
+
+  ShmemHugePages:     4096 kB
+  ShmemPmdMapped:     4096 kB
+
+This doesn't make too much sense.  The shmem objects should be treated
+separately from anonymous THP.  Calling shmem_huge_enabled() with
+checking MMF_DISABLE_THP sounds good enough.  And, we could skip stack
+and dax vma check since we already checked if the vma is shmem already.
+
+Also check if vma is suitable for THP by calling
+transhuge_vma_suitable().
+
+And minor fix to smaps output format and documentation.
+
+Link: http://lkml.kernel.org/r/1560401041-32207-3-git-send-email-yang.shi@linux.alibaba.com
+Fixes: 7635d9cbe832 ("mm, thp, proc: report THP eligibility for each vma")
+	Signed-off-by: Yang Shi <yang.shi@linux.alibaba.com>
+	Acked-by: Hugh Dickins <hughd@google.com>
+	Cc: Kirill A. Shutemov <kirill.shutemov@linux.intel.com>
+	Cc: Michal Hocko <mhocko@suse.com>
+	Cc: Vlastimil Babka <vbabka@suse.cz>
+	Cc: David Rientjes <rientjes@google.com>
+	Cc: Andrea Arcangeli <aarcange@redhat.com>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit c06306696f8368b08774e2a743dbc52d92a61693)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	Documentation/filesystems/proc.txt
+#	fs/proc/task_mmu.c
+#	mm/huge_memory.c
+diff --cc Documentation/filesystems/proc.txt
+index 63d8ac00dd49,99ca040e3f90..000000000000
+--- a/Documentation/filesystems/proc.txt
++++ b/Documentation/filesystems/proc.txt
+@@@ -465,6 -486,8 +465,11 @@@ replaced by copy-on-write) part of the 
+  "SwapPss" shows proportional swap share of this mapping. Unlike "Swap", this
+  does not take into account swapped out page of underlying shmem objects.
+  "Locked" indicates whether the mapping is locked in memory or not.
+++<<<<<<< HEAD
+++=======
++ "THPeligible" indicates whether the mapping is eligible for allocating THP
++ pages - 1 if true, 0 otherwise. It just shows the current status.
+++>>>>>>> c06306696f83 (mm: thp: fix false negative of shmem vma's THP eligibility)
+  
+  "VmFlags" field deserves a separate description. This member represents the kernel
+  flags associated with the particular virtual memory area in two letter encoded
+diff --cc fs/proc/task_mmu.c
+index 7f3f589c8638,731642e0f5a0..000000000000
+--- a/fs/proc/task_mmu.c
++++ b/fs/proc/task_mmu.c
+@@@ -747,89 -816,82 +747,122 @@@ static void __show_smap(struct seq_fil
+  
+  static int show_smap(struct seq_file *m, void *v)
+  {
+++<<<<<<< HEAD
+++=======
++ 	struct vm_area_struct *vma = v;
++ 	struct mem_size_stats mss;
++ 
++ 	memset(&mss, 0, sizeof(mss));
++ 
++ 	smap_gather_stats(vma, &mss);
++ 
++ 	show_map_vma(m, vma);
++ 
++ 	SEQ_PUT_DEC("Size:           ", vma->vm_end - vma->vm_start);
++ 	SEQ_PUT_DEC(" kB\nKernelPageSize: ", vma_kernel_pagesize(vma));
++ 	SEQ_PUT_DEC(" kB\nMMUPageSize:    ", vma_mmu_pagesize(vma));
++ 	seq_puts(m, " kB\n");
++ 
++ 	__show_smap(m, &mss, false);
++ 
++ 	seq_printf(m, "THPeligible:		%d\n",
++ 		   transparent_hugepage_enabled(vma));
++ 
++ 	if (arch_pkeys_enabled())
++ 		seq_printf(m, "ProtectionKey:  %8u\n", vma_pkey(vma));
++ 	show_smap_vma_flags(m, vma);
++ 
++ 	m_cache_vma(m, vma);
++ 
++ 	return 0;
++ }
++ 
++ static int show_smaps_rollup(struct seq_file *m, void *v)
++ {
+++>>>>>>> c06306696f83 (mm: thp: fix false negative of shmem vma's THP eligibility)
+  	struct proc_maps_private *priv = m->private;
+ -	struct mem_size_stats mss;
+ -	struct mm_struct *mm;
+ -	struct vm_area_struct *vma;
+ -	unsigned long last_vma_end = 0;
+ +	struct vm_area_struct *vma = v;
+ +	struct mem_size_stats mss_stack;
+ +	struct mem_size_stats *mss;
+  	int ret = 0;
+ -
+ -	priv->task = get_proc_task(priv->inode);
+ -	if (!priv->task)
+ -		return -ESRCH;
+ -
+ -	mm = priv->mm;
+ -	if (!mm || !mmget_not_zero(mm)) {
+ -		ret = -ESRCH;
+ -		goto out_put_task;
+ +	bool rollup_mode;
+ +	bool last_vma;
+ +	bool walking = false;
+ +
+ +	if (priv->rollup) {
+ +		rollup_mode = true;
+ +		mss = priv->rollup;
+ +		if (mss->first) {
+ +			mss->first_vma_start = vma->vm_start;
+ +			mss->first = false;
+ +		}
+ +		last_vma = !m_next_vma(priv, vma);
+ +	} else {
+ +		rollup_mode = false;
+ +		memset(&mss_stack, 0, sizeof(mss_stack));
+ +		mss = &mss_stack;
+  	}
+  
+ -	memset(&mss, 0, sizeof(mss));
+ -
+ -	ret = down_read_killable(&mm->mmap_sem);
+ -	if (ret)
+ -		goto out_put_mm;
+ -
+ -	hold_task_mempolicy(priv);
+ +#ifdef CONFIG_SHMEM
+ +	/* In case of smaps_rollup, reset the value from previous vma */
+ +	mss->check_shmem_swap = false;
+ +	if (vma->vm_file && shmem_mapping(vma->vm_file->f_mapping)) {
+ +		/*
+ +		 * For shared or readonly shmem mappings we know that all
+ +		 * swapped out pages belong to the shmem object, and we can
+ +		 * obtain the swap value much more efficiently. For private
+ +		 * writable mappings, we might have COW pages that are
+ +		 * not affected by the parent swapped out pages of the shmem
+ +		 * object, so we have to distinguish them during the page walk.
+ +		 * Unless we know that the shmem object (or the part mapped by
+ +		 * our VMA) has no swapped out pages at all.
+ +		 */
+ +		unsigned long shmem_swapped = shmem_swap_usage(vma);
+  
+ -	for (vma = priv->mm->mmap; vma; vma = vma->vm_next) {
+ -		smap_gather_stats(vma, &mss);
+ -		last_vma_end = vma->vm_end;
+ +		if (!shmem_swapped || (vma->vm_flags & VM_SHARED) ||
+ +					!(vma->vm_flags & VM_WRITE)) {
+ +			mss->swap += shmem_swapped;
+ +		} else {
+ +			mss->check_shmem_swap = true;
+ +			walk_page_vma(vma, &smaps_shmem_walk_ops, mss);
+ +			walking = true;
+ +		}
+  	}
+ +#endif
+  
+ -	show_vma_header_prefix(m, priv->mm->mmap->vm_start,
+ -			       last_vma_end, 0, 0, 0, 0);
+ -	seq_pad(m, ' ');
+ -	seq_puts(m, "[rollup]\n");
+ -
+ -	__show_smap(m, &mss, true);
+ +	/* mmap_sem is held in m_start */
+ +	if (!walking)
+ +		walk_page_vma(vma, &smaps_walk_ops, mss);
+ +	if (vma->vm_flags & VM_LOCKED)
+ +		mss->pss_locked += mss->pss;
+ +
+ +	if (!rollup_mode) {
+ +		show_map_vma(m, vma);
+ +	} else if (last_vma) {
+ +		show_vma_header_prefix(
+ +			m, mss->first_vma_start, vma->vm_end, 0, 0, 0, 0);
+ +		seq_pad(m, ' ');
+ +		seq_puts(m, "[rollup]\n");
+ +	} else {
+ +		ret = SEQ_SKIP;
+ +	}
+  
+ -	release_task_mempolicy(priv);
+ -	up_read(&mm->mmap_sem);
+ +	if (!rollup_mode) {
+ +		SEQ_PUT_DEC("Size:           ", vma->vm_end - vma->vm_start);
+ +		SEQ_PUT_DEC(" kB\nKernelPageSize: ", vma_kernel_pagesize(vma));
+ +		SEQ_PUT_DEC(" kB\nMMUPageSize:    ", vma_mmu_pagesize(vma));
+ +		seq_puts(m, " kB\n");
+ +	}
+  
+ -out_put_mm:
+ -	mmput(mm);
+ -out_put_task:
+ -	put_task_struct(priv->task);
+ -	priv->task = NULL;
+ +	if (!rollup_mode || last_vma)
+ +		__show_smap(m, mss);
+  
+ +	if (!rollup_mode) {
+ +		if (arch_pkeys_enabled())
+ +			seq_printf(m, "ProtectionKey:  %8u\n", vma_pkey(vma));
+ +		show_smap_vma_flags(m, vma);
+ +	}
+ +	m_cache_vma(m, vma);
+  	return ret;
+  }
+  #undef SEQ_PUT_DEC
+diff --cc mm/huge_memory.c
+index d50d4bea43b7,1334ede667a8..000000000000
+--- a/mm/huge_memory.c
++++ b/mm/huge_memory.c
+@@@ -63,6 -61,21 +63,24 @@@ static struct shrinker deferred_split_s
+  static atomic_t huge_zero_refcount;
+  struct page *huge_zero_page __read_mostly;
+  
+++<<<<<<< HEAD
+++=======
++ bool transparent_hugepage_enabled(struct vm_area_struct *vma)
++ {
++ 	/* The addr is used to check if the vma size fits */
++ 	unsigned long addr = (vma->vm_end & HPAGE_PMD_MASK) - HPAGE_PMD_SIZE;
++ 
++ 	if (!transhuge_vma_suitable(vma, addr))
++ 		return false;
++ 	if (vma_is_anonymous(vma))
++ 		return __transparent_hugepage_enabled(vma);
++ 	if (vma_is_shmem(vma))
++ 		return shmem_huge_enabled(vma);
++ 
++ 	return false;
++ }
++ 
+++>>>>>>> c06306696f83 (mm: thp: fix false negative of shmem vma's THP eligibility)
+  static struct page *get_huge_zero_page(void)
+  {
+  	struct page *zero_page;
+* Unmerged path Documentation/filesystems/proc.txt
+* Unmerged path fs/proc/task_mmu.c
+* Unmerged path mm/huge_memory.c
+diff --git a/mm/shmem.c b/mm/shmem.c
+index fd519560c907..044435d29861 100644
+--- a/mm/shmem.c
++++ b/mm/shmem.c
+@@ -3871,6 +3871,9 @@ bool shmem_huge_enabled(struct vm_area_struct *vma)
+ 	loff_t i_size;
+ 	pgoff_t off;
+ 
++	if ((vma->vm_flags & VM_NOHUGEPAGE) ||
++	    test_bit(MMF_DISABLE_THP, &vma->vm_mm->flags))
++		return false;
+ 	if (shmem_huge == SHMEM_HUGE_FORCE)
+ 		return true;
+ 	if (shmem_huge == SHMEM_HUGE_DENY)
