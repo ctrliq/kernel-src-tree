@@ -1,0 +1,129 @@
+arm64/x86: KVM: Introduce steal-time cap
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Andrew Jones <drjones@redhat.com>
+commit 004a01241c5a0d375266ebf1c72f208de99294e9
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/004a0124.failed
+
+arm64 requires a vcpu fd (KVM_HAS_DEVICE_ATTR vcpu ioctl) to probe
+support for steal-time. However this is unnecessary, as only a KVM
+fd is required, and it complicates userspace (userspace may prefer
+delaying vcpu creation until after feature probing). Introduce a cap
+that can be checked instead. While x86 can already probe steal-time
+support with a kvm fd (KVM_GET_SUPPORTED_CPUID), we add the cap there
+too for consistency.
+
+	Signed-off-by: Andrew Jones <drjones@redhat.com>
+	Signed-off-by: Marc Zyngier <maz@kernel.org>
+	Reviewed-by: Steven Price <steven.price@arm.com>
+Link: https://lore.kernel.org/r/20200804170604.42662-7-drjones@redhat.com
+(cherry picked from commit 004a01241c5a0d375266ebf1c72f208de99294e9)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kvm/x86.c
+#	include/uapi/linux/kvm.h
+diff --cc arch/x86/kvm/x86.c
+index c2403e53a8de,c44d3a73b8eb..000000000000
+--- a/arch/x86/kvm/x86.c
++++ b/arch/x86/kvm/x86.c
+@@@ -3544,6 -3578,12 +3544,15 @@@ int kvm_vm_ioctl_check_extension(struc
+  	case KVM_CAP_HYPERV_ENLIGHTENED_VMCS:
+  		r = kvm_x86_ops.nested_ops->enable_evmcs != NULL;
+  		break;
+++<<<<<<< HEAD
+++=======
++ 	case KVM_CAP_SMALLER_MAXPHYADDR:
++ 		r = (int) allow_smaller_maxphyaddr;
++ 		break;
++ 	case KVM_CAP_STEAL_TIME:
++ 		r = sched_info_on();
++ 		break;
+++>>>>>>> 004a01241c5a (arm64/x86: KVM: Introduce steal-time cap)
+  	default:
+  		break;
+  	}
+diff --cc include/uapi/linux/kvm.h
+index f2c3051a98e4,3d8023474f2a..000000000000
+--- a/include/uapi/linux/kvm.h
++++ b/include/uapi/linux/kvm.h
+@@@ -1030,6 -1031,11 +1030,14 @@@ struct kvm_ppc_resize_hpt 
+  #define KVM_CAP_S390_PROTECTED 180
+  #define KVM_CAP_PPC_SECURE_GUEST 181
+  #define KVM_CAP_HALT_POLL 182
+++<<<<<<< HEAD
+++=======
++ #define KVM_CAP_ASYNC_PF_INT 183
++ #define KVM_CAP_LAST_CPU 184
++ #define KVM_CAP_SMALLER_MAXPHYADDR 185
++ #define KVM_CAP_S390_DIAG318 186
++ #define KVM_CAP_STEAL_TIME 187
+++>>>>>>> 004a01241c5a (arm64/x86: KVM: Introduce steal-time cap)
+  
+  #ifdef KVM_CAP_IRQ_ROUTING
+  
+diff --git a/Documentation/virt/kvm/api.rst b/Documentation/virt/kvm/api.rst
+index ba2c8db3f8cb..63319086f5d2 100644
+--- a/Documentation/virt/kvm/api.rst
++++ b/Documentation/virt/kvm/api.rst
+@@ -6159,3 +6159,16 @@ KVM can therefore start protected VMs.
+ This capability governs the KVM_S390_PV_COMMAND ioctl and the
+ KVM_MP_STATE_LOAD MP_STATE. KVM_SET_MP_STATE can fail for protected
+ guests when the state change is invalid.
++
++8.24 KVM_CAP_STEAL_TIME
++-----------------------
++
++:Architectures: arm64, x86
++
++This capability indicates that KVM supports steal time accounting.
++When steal time accounting is supported it may be enabled with
++architecture-specific interfaces.  This capability and the architecture-
++specific interfaces must be consistent, i.e. if one says the feature
++is supported, than the other should as well and vice versa.  For arm64
++see Documentation/virt/kvm/devices/vcpu.rst "KVM_ARM_VCPU_PVTIME_CTRL".
++For x86 see Documentation/virt/kvm/msr.rst "MSR_KVM_STEAL_TIME".
+diff --git a/arch/arm64/include/asm/kvm_host.h b/arch/arm64/include/asm/kvm_host.h
+index 9d7ed798fdbc..ae8cfe46951e 100644
+--- a/arch/arm64/include/asm/kvm_host.h
++++ b/arch/arm64/include/asm/kvm_host.h
+@@ -519,6 +519,7 @@ long kvm_hypercall_pv_features(struct kvm_vcpu *vcpu);
+ gpa_t kvm_init_stolen_time(struct kvm_vcpu *vcpu);
+ void kvm_update_stolen_time(struct kvm_vcpu *vcpu);
+ 
++bool kvm_arm_pvtime_supported(void);
+ int kvm_arm_pvtime_set_attr(struct kvm_vcpu *vcpu,
+ 			    struct kvm_device_attr *attr);
+ int kvm_arm_pvtime_get_attr(struct kvm_vcpu *vcpu,
+diff --git a/arch/arm64/kvm/arm.c b/arch/arm64/kvm/arm.c
+index f0907ca23f68..8892c6b1789a 100644
+--- a/arch/arm64/kvm/arm.c
++++ b/arch/arm64/kvm/arm.c
+@@ -234,6 +234,9 @@ int kvm_vm_ioctl_check_extension(struct kvm *kvm, long ext)
+ 		 */
+ 		r = 1;
+ 		break;
++	case KVM_CAP_STEAL_TIME:
++		r = kvm_arm_pvtime_supported();
++		break;
+ 	default:
+ 		r = kvm_arch_vm_ioctl_check_extension(kvm, ext);
+ 		break;
+diff --git a/arch/arm64/kvm/pvtime.c b/arch/arm64/kvm/pvtime.c
+index 75234321d896..920ac43077ad 100644
+--- a/arch/arm64/kvm/pvtime.c
++++ b/arch/arm64/kvm/pvtime.c
+@@ -71,7 +71,7 @@ gpa_t kvm_init_stolen_time(struct kvm_vcpu *vcpu)
+ 	return base;
+ }
+ 
+-static bool kvm_arm_pvtime_supported(void)
++bool kvm_arm_pvtime_supported(void)
+ {
+ 	return !!sched_info_on();
+ }
+* Unmerged path arch/x86/kvm/x86.c
+* Unmerged path include/uapi/linux/kvm.h
