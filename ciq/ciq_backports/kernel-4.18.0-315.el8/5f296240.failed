@@ -1,0 +1,242 @@
+locking/lockdep: Exclude local_lock_t from IRQ inversions
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-315.el8
+commit-author Boqun Feng <boqun.feng@gmail.com>
+commit 5f2962401c6e195222f320d12b3a55377b2d4653
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-315.el8/5f296240.failed
+
+The purpose of local_lock_t is to abstract: preempt_disable() /
+local_bh_disable() / local_irq_disable(). These are the traditional
+means of gaining access to per-cpu data, but are fundamentally
+non-preemptible.
+
+local_lock_t provides a per-cpu lock, that on !PREEMPT_RT reduces to
+no-ops, just like regular spinlocks do on UP.
+
+This gives rise to:
+
+	CPU0			CPU1
+
+	local_lock(B)		spin_lock_irq(A)
+	<IRQ>
+	  spin_lock(A)		local_lock(B)
+
+Where lockdep then figures things will lock up; which would be true if
+B were any other kind of lock. However this is a false positive, no
+such deadlock actually exists.
+
+For !RT the above local_lock(B) is preempt_disable(), and there's
+obviously no deadlock; alternatively, CPU0's B != CPU1's B.
+
+For RT the argument is that since local_lock() nests inside
+spin_lock(), it cannot be used in hardirq context, and therefore CPU0
+cannot in fact happen. Even though B is a real lock, it is a
+preemptible lock and any threaded-irq would simply schedule out and
+let the preempted task (which holds B) continue such that the task on
+CPU1 can make progress, after which the threaded-irq resumes and can
+finish.
+
+This means that we can never form an IRQ inversion on a local_lock
+dependency, so terminate the graph walk when looking for IRQ
+inversions when we encounter one.
+
+One consequence is that (for LOCKDEP_SMALL) when we look for redundant
+dependencies, A -> B is not redundant in the presence of A -> L -> B.
+
+	Signed-off-by: Boqun Feng <boqun.feng@gmail.com>
+[peterz: Changelog]
+	Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+(cherry picked from commit 5f2962401c6e195222f320d12b3a55377b2d4653)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	kernel/locking/lockdep.c
+diff --cc kernel/locking/lockdep.c
+index 53f2c3da5c8b,ad9afd8c7eb9..000000000000
+--- a/kernel/locking/lockdep.c
++++ b/kernel/locking/lockdep.c
+@@@ -1965,16 -2184,60 +1965,54 @@@ static inline int usage_accumulate(stru
+  }
+  
+  /*
+ - * There is a strong dependency path in the dependency graph: A -> B, and now
+ - * we need to decide which usage bit of B conflicts with the usage bits of A,
+ - * i.e. which usage bit of B may introduce safe->unsafe deadlocks.
+ - *
+ - * As above, if only_xr is false, which means A -> B has -(*N)-> dependency
+ - * path, any usage of B should be considered. Otherwise, we should only
+ - * consider _READ usage.
+ + * Forwards and backwards subgraph searching, for the purposes of
+ + * proving that two subgraphs can be connected by a new dependency
+ + * without creating any illegal irq-safe -> irq-unsafe lock dependency.
+   */
+ -static inline bool usage_match(struct lock_list *entry, void *mask)
+ +
+ +static inline int usage_match(struct lock_list *entry, void *mask)
+  {
+ -	if (!entry->only_xr)
+ -		return !!(entry->class->usage_mask & *(unsigned long *)mask);
+ -	else /* Mask out _READ usage bits */
+ -		return !!((entry->class->usage_mask & LOCKF_IRQ) & *(unsigned long *)mask);
+ +	return entry->class->usage_mask & *(unsigned long *)mask;
+  }
+  
++ static inline bool usage_skip(struct lock_list *entry, void *mask)
++ {
++ 	/*
++ 	 * Skip local_lock() for irq inversion detection.
++ 	 *
++ 	 * For !RT, local_lock() is not a real lock, so it won't carry any
++ 	 * dependency.
++ 	 *
++ 	 * For RT, an irq inversion happens when we have lock A and B, and on
++ 	 * some CPU we can have:
++ 	 *
++ 	 *	lock(A);
++ 	 *	<interrupted>
++ 	 *	  lock(B);
++ 	 *
++ 	 * where lock(B) cannot sleep, and we have a dependency B -> ... -> A.
++ 	 *
++ 	 * Now we prove local_lock() cannot exist in that dependency. First we
++ 	 * have the observation for any lock chain L1 -> ... -> Ln, for any
++ 	 * 1 <= i <= n, Li.inner_wait_type <= L1.inner_wait_type, otherwise
++ 	 * wait context check will complain. And since B is not a sleep lock,
++ 	 * therefore B.inner_wait_type >= 2, and since the inner_wait_type of
++ 	 * local_lock() is 3, which is greater than 2, therefore there is no
++ 	 * way the local_lock() exists in the dependency B -> ... -> A.
++ 	 *
++ 	 * As a result, we will skip local_lock(), when we search for irq
++ 	 * inversion bugs.
++ 	 */
++ 	if (entry->class->lock_type == LD_LOCK_PERCPU) {
++ 		if (DEBUG_LOCKS_WARN_ON(entry->class->wait_type_inner < LD_WAIT_CONFIG))
++ 			return false;
++ 
++ 		return true;
++ 	}
++ 
++ 	return false;
++ }
++ 
+  /*
+   * Find a node in the forwards-direction dependency sub-graph starting
+   * at @root->class that matches @bit.
+@@@ -1993,7 -2253,7 +2031,11 @@@ find_usage_forwards(struct lock_list *r
+  
+  	debug_atomic_inc(nr_find_usage_forwards_checks);
+  
+++<<<<<<< HEAD
+ +	result = __bfs_forwards(root, &usage_mask, usage_match, target_entry);
+++=======
++ 	result = __bfs_forwards(root, &usage_mask, usage_match, usage_skip, target_entry);
+++>>>>>>> 5f2962401c6e (locking/lockdep: Exclude local_lock_t from IRQ inversions)
+  
+  	return result;
+  }
+@@@ -2016,7 -2270,7 +2058,11 @@@ find_usage_backwards(struct lock_list *
+  
+  	debug_atomic_inc(nr_find_usage_backwards_checks);
+  
+++<<<<<<< HEAD
+ +	result = __bfs_backwards(root, &usage_mask, usage_match, target_entry);
+++=======
++ 	result = __bfs_backwards(root, &usage_mask, usage_match, usage_skip, target_entry);
+++>>>>>>> 5f2962401c6e (locking/lockdep: Exclude local_lock_t from IRQ inversions)
+  
+  	return result;
+  }
+@@@ -2346,11 -2633,10 +2392,16 @@@ static int check_irq_usage(struct task_
+  	 * Step 1: gather all hard/soft IRQs usages backward in an
+  	 * accumulated usage mask.
+  	 */
+ -	bfs_init_rootb(&this, prev);
+ +	this.parent = NULL;
+ +	this.class = hlock_class(prev);
+  
+++<<<<<<< HEAD
+ +	ret = __bfs_backwards(&this, &usage_mask, usage_accumulate, NULL);
+ +	if (ret < 0) {
+++=======
++ 	ret = __bfs_backwards(&this, &usage_mask, usage_accumulate, usage_skip, NULL);
++ 	if (bfs_error(ret)) {
+++>>>>>>> 5f2962401c6e (locking/lockdep: Exclude local_lock_t from IRQ inversions)
+  		print_bfs_bug(ret);
+  		return 0;
+  	}
+@@@ -2417,8 -2702,68 +2468,71 @@@ static inline int check_irq_usage(struc
+  {
+  	return 1;
+  }
++ 
++ static inline bool usage_skip(struct lock_list *entry, void *mask)
++ {
++ 	return false;
++ }
++ 
+  #endif /* CONFIG_TRACE_IRQFLAGS */
+  
+++<<<<<<< HEAD
+++=======
++ #ifdef CONFIG_LOCKDEP_SMALL
++ /*
++  * Check that the dependency graph starting at <src> can lead to
++  * <target> or not. If it can, <src> -> <target> dependency is already
++  * in the graph.
++  *
++  * Return BFS_RMATCH if it does, or BFS_RMATCH if it does not, return BFS_E* if
++  * any error appears in the bfs search.
++  */
++ static noinline enum bfs_result
++ check_redundant(struct held_lock *src, struct held_lock *target)
++ {
++ 	enum bfs_result ret;
++ 	struct lock_list *target_entry;
++ 	struct lock_list src_entry;
++ 
++ 	bfs_init_root(&src_entry, src);
++ 	/*
++ 	 * Special setup for check_redundant().
++ 	 *
++ 	 * To report redundant, we need to find a strong dependency path that
++ 	 * is equal to or stronger than <src> -> <target>. So if <src> is E,
++ 	 * we need to let __bfs() only search for a path starting at a -(E*)->,
++ 	 * we achieve this by setting the initial node's ->only_xr to true in
++ 	 * that case. And if <prev> is S, we set initial ->only_xr to false
++ 	 * because both -(S*)-> (equal) and -(E*)-> (stronger) are redundant.
++ 	 */
++ 	src_entry.only_xr = src->read == 0;
++ 
++ 	debug_atomic_inc(nr_redundant_checks);
++ 
++ 	/*
++ 	 * Note: we skip local_lock() for redundant check, because as the
++ 	 * comment in usage_skip(), A -> local_lock() -> B and A -> B are not
++ 	 * the same.
++ 	 */
++ 	ret = check_path(target, &src_entry, hlock_equal, usage_skip, &target_entry);
++ 
++ 	if (ret == BFS_RMATCH)
++ 		debug_atomic_inc(nr_redundant);
++ 
++ 	return ret;
++ }
++ 
++ #else
++ 
++ static inline enum bfs_result
++ check_redundant(struct held_lock *src, struct held_lock *target)
++ {
++ 	return BFS_RNOMATCH;
++ }
++ 
++ #endif
++ 
+++>>>>>>> 5f2962401c6e (locking/lockdep: Exclude local_lock_t from IRQ inversions)
+  static void inc_chains(int irq_context)
+  {
+  	if (irq_context & LOCK_CHAIN_HARDIRQ_CONTEXT)
+* Unmerged path kernel/locking/lockdep.c
