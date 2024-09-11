@@ -1,0 +1,649 @@
+xfrm: policy: delete inexact policies from inexact list on hash rebuild
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-193.el8
+commit-author Florian Westphal <fw@strlen.de>
+commit 1548bc4e0512700cf757192c106b3a20ab639223
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-193.el8/1548bc4e.failed
+
+An xfrm hash rebuild has to reset the inexact policy list before the
+policies get re-inserted: A change of hash thresholds will result in
+policies to get moved from inexact tree to the policy hash table.
+
+If the thresholds are increased again later, they get moved from hash
+table to inexact tree.
+
+We must unlink all policies from the inexact tree before re-insertion.
+
+Otherwise 'migrate' may find policies that are in main hash table a
+second time, when it searches the inexact lists.
+
+Furthermore, re-insertion without deletion can cause elements ->next to
+point back to itself, causing soft lockups or double-frees.
+
+	Reported-by: syzbot+9d971dd21eb26567036b@syzkaller.appspotmail.com
+Fixes: 9cf545ebd591da ("xfrm: policy: store inexact policies in a tree ordered by destination address")
+	Signed-off-by: Florian Westphal <fw@strlen.de>
+	Signed-off-by: Steffen Klassert <steffen.klassert@secunet.com>
+(cherry picked from commit 1548bc4e0512700cf757192c106b3a20ab639223)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/xfrm/xfrm_policy.c
+diff --cc net/xfrm/xfrm_policy.c
+index 6b43f9247a17,24dfd1e47cf0..000000000000
+--- a/net/xfrm/xfrm_policy.c
++++ b/net/xfrm/xfrm_policy.c
+@@@ -560,6 -680,523 +560,526 @@@ static void xfrm_hash_resize(struct wor
+  	mutex_unlock(&hash_resize_mutex);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ /* Make sure *pol can be inserted into fastbin.
++  * Useful to check that later insert requests will be sucessful
++  * (provided xfrm_policy_lock is held throughout).
++  */
++ static struct xfrm_pol_inexact_bin *
++ xfrm_policy_inexact_alloc_bin(const struct xfrm_policy *pol, u8 dir)
++ {
++ 	struct xfrm_pol_inexact_bin *bin, *prev;
++ 	struct xfrm_pol_inexact_key k = {
++ 		.family = pol->family,
++ 		.type = pol->type,
++ 		.dir = dir,
++ 		.if_id = pol->if_id,
++ 	};
++ 	struct net *net = xp_net(pol);
++ 
++ 	lockdep_assert_held(&net->xfrm.xfrm_policy_lock);
++ 
++ 	write_pnet(&k.net, net);
++ 	bin = rhashtable_lookup_fast(&xfrm_policy_inexact_table, &k,
++ 				     xfrm_pol_inexact_params);
++ 	if (bin)
++ 		return bin;
++ 
++ 	bin = kzalloc(sizeof(*bin), GFP_ATOMIC);
++ 	if (!bin)
++ 		return NULL;
++ 
++ 	bin->k = k;
++ 	INIT_HLIST_HEAD(&bin->hhead);
++ 	bin->root_d = RB_ROOT;
++ 	bin->root_s = RB_ROOT;
++ 	seqcount_init(&bin->count);
++ 
++ 	prev = rhashtable_lookup_get_insert_key(&xfrm_policy_inexact_table,
++ 						&bin->k, &bin->head,
++ 						xfrm_pol_inexact_params);
++ 	if (!prev) {
++ 		list_add(&bin->inexact_bins, &net->xfrm.inexact_bins);
++ 		return bin;
++ 	}
++ 
++ 	kfree(bin);
++ 
++ 	return IS_ERR(prev) ? NULL : prev;
++ }
++ 
++ static bool xfrm_pol_inexact_addr_use_any_list(const xfrm_address_t *addr,
++ 					       int family, u8 prefixlen)
++ {
++ 	if (xfrm_addr_any(addr, family))
++ 		return true;
++ 
++ 	if (family == AF_INET6 && prefixlen < INEXACT_PREFIXLEN_IPV6)
++ 		return true;
++ 
++ 	if (family == AF_INET && prefixlen < INEXACT_PREFIXLEN_IPV4)
++ 		return true;
++ 
++ 	return false;
++ }
++ 
++ static bool
++ xfrm_policy_inexact_insert_use_any_list(const struct xfrm_policy *policy)
++ {
++ 	const xfrm_address_t *addr;
++ 	bool saddr_any, daddr_any;
++ 	u8 prefixlen;
++ 
++ 	addr = &policy->selector.saddr;
++ 	prefixlen = policy->selector.prefixlen_s;
++ 
++ 	saddr_any = xfrm_pol_inexact_addr_use_any_list(addr,
++ 						       policy->family,
++ 						       prefixlen);
++ 	addr = &policy->selector.daddr;
++ 	prefixlen = policy->selector.prefixlen_d;
++ 	daddr_any = xfrm_pol_inexact_addr_use_any_list(addr,
++ 						       policy->family,
++ 						       prefixlen);
++ 	return saddr_any && daddr_any;
++ }
++ 
++ static void xfrm_pol_inexact_node_init(struct xfrm_pol_inexact_node *node,
++ 				       const xfrm_address_t *addr, u8 prefixlen)
++ {
++ 	node->addr = *addr;
++ 	node->prefixlen = prefixlen;
++ }
++ 
++ static struct xfrm_pol_inexact_node *
++ xfrm_pol_inexact_node_alloc(const xfrm_address_t *addr, u8 prefixlen)
++ {
++ 	struct xfrm_pol_inexact_node *node;
++ 
++ 	node = kzalloc(sizeof(*node), GFP_ATOMIC);
++ 	if (node)
++ 		xfrm_pol_inexact_node_init(node, addr, prefixlen);
++ 
++ 	return node;
++ }
++ 
++ static int xfrm_policy_addr_delta(const xfrm_address_t *a,
++ 				  const xfrm_address_t *b,
++ 				  u8 prefixlen, u16 family)
++ {
++ 	unsigned int pdw, pbi;
++ 	int delta = 0;
++ 
++ 	switch (family) {
++ 	case AF_INET:
++ 		if (sizeof(long) == 4 && prefixlen == 0)
++ 			return ntohl(a->a4) - ntohl(b->a4);
++ 		return (ntohl(a->a4) & ((~0UL << (32 - prefixlen)))) -
++ 		       (ntohl(b->a4) & ((~0UL << (32 - prefixlen))));
++ 	case AF_INET6:
++ 		pdw = prefixlen >> 5;
++ 		pbi = prefixlen & 0x1f;
++ 
++ 		if (pdw) {
++ 			delta = memcmp(a->a6, b->a6, pdw << 2);
++ 			if (delta)
++ 				return delta;
++ 		}
++ 		if (pbi) {
++ 			u32 mask = ~0u << (32 - pbi);
++ 
++ 			delta = (ntohl(a->a6[pdw]) & mask) -
++ 				(ntohl(b->a6[pdw]) & mask);
++ 		}
++ 		break;
++ 	default:
++ 		break;
++ 	}
++ 
++ 	return delta;
++ }
++ 
++ static void xfrm_policy_inexact_list_reinsert(struct net *net,
++ 					      struct xfrm_pol_inexact_node *n,
++ 					      u16 family)
++ {
++ 	unsigned int matched_s, matched_d;
++ 	struct hlist_node *newpos = NULL;
++ 	struct xfrm_policy *policy, *p;
++ 
++ 	matched_s = 0;
++ 	matched_d = 0;
++ 
++ 	list_for_each_entry_reverse(policy, &net->xfrm.policy_all, walk.all) {
++ 		bool matches_s, matches_d;
++ 
++ 		if (!policy->bydst_reinsert)
++ 			continue;
++ 
++ 		WARN_ON_ONCE(policy->family != family);
++ 
++ 		policy->bydst_reinsert = false;
++ 		hlist_for_each_entry(p, &n->hhead, bydst) {
++ 			if (policy->priority >= p->priority)
++ 				newpos = &p->bydst;
++ 			else
++ 				break;
++ 		}
++ 
++ 		if (newpos)
++ 			hlist_add_behind_rcu(&policy->bydst, newpos);
++ 		else
++ 			hlist_add_head_rcu(&policy->bydst, &n->hhead);
++ 
++ 		/* paranoia checks follow.
++ 		 * Check that the reinserted policy matches at least
++ 		 * saddr or daddr for current node prefix.
++ 		 *
++ 		 * Matching both is fine, matching saddr in one policy
++ 		 * (but not daddr) and then matching only daddr in another
++ 		 * is a bug.
++ 		 */
++ 		matches_s = xfrm_policy_addr_delta(&policy->selector.saddr,
++ 						   &n->addr,
++ 						   n->prefixlen,
++ 						   family) == 0;
++ 		matches_d = xfrm_policy_addr_delta(&policy->selector.daddr,
++ 						   &n->addr,
++ 						   n->prefixlen,
++ 						   family) == 0;
++ 		if (matches_s && matches_d)
++ 			continue;
++ 
++ 		WARN_ON_ONCE(!matches_s && !matches_d);
++ 		if (matches_s)
++ 			matched_s++;
++ 		if (matches_d)
++ 			matched_d++;
++ 		WARN_ON_ONCE(matched_s && matched_d);
++ 	}
++ }
++ 
++ static void xfrm_policy_inexact_node_reinsert(struct net *net,
++ 					      struct xfrm_pol_inexact_node *n,
++ 					      struct rb_root *new,
++ 					      u16 family)
++ {
++ 	struct rb_node **p, *parent = NULL;
++ 	struct xfrm_pol_inexact_node *node;
++ 
++ 	/* we should not have another subtree here */
++ 	WARN_ON_ONCE(!RB_EMPTY_ROOT(&n->root));
++ 
++ 	p = &new->rb_node;
++ 	while (*p) {
++ 		u8 prefixlen;
++ 		int delta;
++ 
++ 		parent = *p;
++ 		node = rb_entry(*p, struct xfrm_pol_inexact_node, node);
++ 
++ 		prefixlen = min(node->prefixlen, n->prefixlen);
++ 
++ 		delta = xfrm_policy_addr_delta(&n->addr, &node->addr,
++ 					       prefixlen, family);
++ 		if (delta < 0) {
++ 			p = &parent->rb_left;
++ 		} else if (delta > 0) {
++ 			p = &parent->rb_right;
++ 		} else {
++ 			struct xfrm_policy *tmp;
++ 
++ 			hlist_for_each_entry(tmp, &node->hhead, bydst)
++ 				tmp->bydst_reinsert = true;
++ 			hlist_for_each_entry(tmp, &n->hhead, bydst)
++ 				tmp->bydst_reinsert = true;
++ 
++ 			INIT_HLIST_HEAD(&node->hhead);
++ 			xfrm_policy_inexact_list_reinsert(net, node, family);
++ 
++ 			if (node->prefixlen == n->prefixlen) {
++ 				kfree_rcu(n, rcu);
++ 				return;
++ 			}
++ 
++ 			rb_erase(*p, new);
++ 			kfree_rcu(n, rcu);
++ 			n = node;
++ 			n->prefixlen = prefixlen;
++ 			*p = new->rb_node;
++ 			parent = NULL;
++ 		}
++ 	}
++ 
++ 	rb_link_node_rcu(&n->node, parent, p);
++ 	rb_insert_color(&n->node, new);
++ }
++ 
++ /* merge nodes v and n */
++ static void xfrm_policy_inexact_node_merge(struct net *net,
++ 					   struct xfrm_pol_inexact_node *v,
++ 					   struct xfrm_pol_inexact_node *n,
++ 					   u16 family)
++ {
++ 	struct xfrm_pol_inexact_node *node;
++ 	struct xfrm_policy *tmp;
++ 	struct rb_node *rnode;
++ 
++ 	/* To-be-merged node v has a subtree.
++ 	 *
++ 	 * Dismantle it and insert its nodes to n->root.
++ 	 */
++ 	while ((rnode = rb_first(&v->root)) != NULL) {
++ 		node = rb_entry(rnode, struct xfrm_pol_inexact_node, node);
++ 		rb_erase(&node->node, &v->root);
++ 		xfrm_policy_inexact_node_reinsert(net, node, &n->root,
++ 						  family);
++ 	}
++ 
++ 	hlist_for_each_entry(tmp, &v->hhead, bydst)
++ 		tmp->bydst_reinsert = true;
++ 	hlist_for_each_entry(tmp, &n->hhead, bydst)
++ 		tmp->bydst_reinsert = true;
++ 
++ 	INIT_HLIST_HEAD(&n->hhead);
++ 	xfrm_policy_inexact_list_reinsert(net, n, family);
++ }
++ 
++ static struct xfrm_pol_inexact_node *
++ xfrm_policy_inexact_insert_node(struct net *net,
++ 				struct rb_root *root,
++ 				xfrm_address_t *addr,
++ 				u16 family, u8 prefixlen, u8 dir)
++ {
++ 	struct xfrm_pol_inexact_node *cached = NULL;
++ 	struct rb_node **p, *parent = NULL;
++ 	struct xfrm_pol_inexact_node *node;
++ 
++ 	p = &root->rb_node;
++ 	while (*p) {
++ 		int delta;
++ 
++ 		parent = *p;
++ 		node = rb_entry(*p, struct xfrm_pol_inexact_node, node);
++ 
++ 		delta = xfrm_policy_addr_delta(addr, &node->addr,
++ 					       node->prefixlen,
++ 					       family);
++ 		if (delta == 0 && prefixlen >= node->prefixlen) {
++ 			WARN_ON_ONCE(cached); /* ipsec policies got lost */
++ 			return node;
++ 		}
++ 
++ 		if (delta < 0)
++ 			p = &parent->rb_left;
++ 		else
++ 			p = &parent->rb_right;
++ 
++ 		if (prefixlen < node->prefixlen) {
++ 			delta = xfrm_policy_addr_delta(addr, &node->addr,
++ 						       prefixlen,
++ 						       family);
++ 			if (delta)
++ 				continue;
++ 
++ 			/* This node is a subnet of the new prefix. It needs
++ 			 * to be removed and re-inserted with the smaller
++ 			 * prefix and all nodes that are now also covered
++ 			 * by the reduced prefixlen.
++ 			 */
++ 			rb_erase(&node->node, root);
++ 
++ 			if (!cached) {
++ 				xfrm_pol_inexact_node_init(node, addr,
++ 							   prefixlen);
++ 				cached = node;
++ 			} else {
++ 				/* This node also falls within the new
++ 				 * prefixlen. Merge the to-be-reinserted
++ 				 * node and this one.
++ 				 */
++ 				xfrm_policy_inexact_node_merge(net, node,
++ 							       cached, family);
++ 				kfree_rcu(node, rcu);
++ 			}
++ 
++ 			/* restart */
++ 			p = &root->rb_node;
++ 			parent = NULL;
++ 		}
++ 	}
++ 
++ 	node = cached;
++ 	if (!node) {
++ 		node = xfrm_pol_inexact_node_alloc(addr, prefixlen);
++ 		if (!node)
++ 			return NULL;
++ 	}
++ 
++ 	rb_link_node_rcu(&node->node, parent, p);
++ 	rb_insert_color(&node->node, root);
++ 
++ 	return node;
++ }
++ 
++ static void xfrm_policy_inexact_gc_tree(struct rb_root *r, bool rm)
++ {
++ 	struct xfrm_pol_inexact_node *node;
++ 	struct rb_node *rn = rb_first(r);
++ 
++ 	while (rn) {
++ 		node = rb_entry(rn, struct xfrm_pol_inexact_node, node);
++ 
++ 		xfrm_policy_inexact_gc_tree(&node->root, rm);
++ 		rn = rb_next(rn);
++ 
++ 		if (!hlist_empty(&node->hhead) || !RB_EMPTY_ROOT(&node->root)) {
++ 			WARN_ON_ONCE(rm);
++ 			continue;
++ 		}
++ 
++ 		rb_erase(&node->node, r);
++ 		kfree_rcu(node, rcu);
++ 	}
++ }
++ 
++ static void __xfrm_policy_inexact_prune_bin(struct xfrm_pol_inexact_bin *b, bool net_exit)
++ {
++ 	write_seqcount_begin(&b->count);
++ 	xfrm_policy_inexact_gc_tree(&b->root_d, net_exit);
++ 	xfrm_policy_inexact_gc_tree(&b->root_s, net_exit);
++ 	write_seqcount_end(&b->count);
++ 
++ 	if (!RB_EMPTY_ROOT(&b->root_d) || !RB_EMPTY_ROOT(&b->root_s) ||
++ 	    !hlist_empty(&b->hhead)) {
++ 		WARN_ON_ONCE(net_exit);
++ 		return;
++ 	}
++ 
++ 	if (rhashtable_remove_fast(&xfrm_policy_inexact_table, &b->head,
++ 				   xfrm_pol_inexact_params) == 0) {
++ 		list_del(&b->inexact_bins);
++ 		kfree_rcu(b, rcu);
++ 	}
++ }
++ 
++ static void xfrm_policy_inexact_prune_bin(struct xfrm_pol_inexact_bin *b)
++ {
++ 	struct net *net = read_pnet(&b->k.net);
++ 
++ 	spin_lock_bh(&net->xfrm.xfrm_policy_lock);
++ 	__xfrm_policy_inexact_prune_bin(b, false);
++ 	spin_unlock_bh(&net->xfrm.xfrm_policy_lock);
++ }
++ 
++ static void __xfrm_policy_inexact_flush(struct net *net)
++ {
++ 	struct xfrm_pol_inexact_bin *bin, *t;
++ 
++ 	lockdep_assert_held(&net->xfrm.xfrm_policy_lock);
++ 
++ 	list_for_each_entry_safe(bin, t, &net->xfrm.inexact_bins, inexact_bins)
++ 		__xfrm_policy_inexact_prune_bin(bin, false);
++ }
++ 
++ static struct hlist_head *
++ xfrm_policy_inexact_alloc_chain(struct xfrm_pol_inexact_bin *bin,
++ 				struct xfrm_policy *policy, u8 dir)
++ {
++ 	struct xfrm_pol_inexact_node *n;
++ 	struct net *net;
++ 
++ 	net = xp_net(policy);
++ 	lockdep_assert_held(&net->xfrm.xfrm_policy_lock);
++ 
++ 	if (xfrm_policy_inexact_insert_use_any_list(policy))
++ 		return &bin->hhead;
++ 
++ 	if (xfrm_pol_inexact_addr_use_any_list(&policy->selector.daddr,
++ 					       policy->family,
++ 					       policy->selector.prefixlen_d)) {
++ 		write_seqcount_begin(&bin->count);
++ 		n = xfrm_policy_inexact_insert_node(net,
++ 						    &bin->root_s,
++ 						    &policy->selector.saddr,
++ 						    policy->family,
++ 						    policy->selector.prefixlen_s,
++ 						    dir);
++ 		write_seqcount_end(&bin->count);
++ 		if (!n)
++ 			return NULL;
++ 
++ 		return &n->hhead;
++ 	}
++ 
++ 	/* daddr is fixed */
++ 	write_seqcount_begin(&bin->count);
++ 	n = xfrm_policy_inexact_insert_node(net,
++ 					    &bin->root_d,
++ 					    &policy->selector.daddr,
++ 					    policy->family,
++ 					    policy->selector.prefixlen_d, dir);
++ 	write_seqcount_end(&bin->count);
++ 	if (!n)
++ 		return NULL;
++ 
++ 	/* saddr is wildcard */
++ 	if (xfrm_pol_inexact_addr_use_any_list(&policy->selector.saddr,
++ 					       policy->family,
++ 					       policy->selector.prefixlen_s))
++ 		return &n->hhead;
++ 
++ 	write_seqcount_begin(&bin->count);
++ 	n = xfrm_policy_inexact_insert_node(net,
++ 					    &n->root,
++ 					    &policy->selector.saddr,
++ 					    policy->family,
++ 					    policy->selector.prefixlen_s, dir);
++ 	write_seqcount_end(&bin->count);
++ 	if (!n)
++ 		return NULL;
++ 
++ 	return &n->hhead;
++ }
++ 
++ static struct xfrm_policy *
++ xfrm_policy_inexact_insert(struct xfrm_policy *policy, u8 dir, int excl)
++ {
++ 	struct xfrm_pol_inexact_bin *bin;
++ 	struct xfrm_policy *delpol;
++ 	struct hlist_head *chain;
++ 	struct net *net;
++ 
++ 	bin = xfrm_policy_inexact_alloc_bin(policy, dir);
++ 	if (!bin)
++ 		return ERR_PTR(-ENOMEM);
++ 
++ 	net = xp_net(policy);
++ 	lockdep_assert_held(&net->xfrm.xfrm_policy_lock);
++ 
++ 	chain = xfrm_policy_inexact_alloc_chain(bin, policy, dir);
++ 	if (!chain) {
++ 		__xfrm_policy_inexact_prune_bin(bin, false);
++ 		return ERR_PTR(-ENOMEM);
++ 	}
++ 
++ 	delpol = xfrm_policy_insert_list(chain, policy, excl);
++ 	if (delpol && excl) {
++ 		__xfrm_policy_inexact_prune_bin(bin, false);
++ 		return ERR_PTR(-EEXIST);
++ 	}
++ 
++ 	chain = &net->xfrm.policy_inexact[dir];
++ 	xfrm_policy_insert_inexact_list(chain, policy);
++ 
++ 	if (delpol)
++ 		__xfrm_policy_inexact_prune_bin(bin, false);
++ 
++ 	return delpol;
++ }
++ 
+++>>>>>>> 1548bc4e0512 (xfrm: policy: delete inexact policies from inexact list on hash rebuild)
+  static void xfrm_hash_rebuild(struct work_struct *work)
+  {
+  	struct net *net = container_of(work, struct net,
+@@@ -590,9 -1227,56 +1110,15 @@@
+  	spin_lock_bh(&net->xfrm.xfrm_policy_lock);
+  	write_seqcount_begin(&xfrm_policy_hash_generation);
+  
+ -	/* make sure that we can insert the indirect policies again before
+ -	 * we start with destructive action.
+ -	 */
+ -	list_for_each_entry(policy, &net->xfrm.policy_all, walk.all) {
+ -		struct xfrm_pol_inexact_bin *bin;
+ -		u8 dbits, sbits;
+ -
+ -		dir = xfrm_policy_id2dir(policy->index);
+ -		if (policy->walk.dead || dir >= XFRM_POLICY_MAX)
+ -			continue;
+ -
+ -		if ((dir & XFRM_POLICY_MASK) == XFRM_POLICY_OUT) {
+ -			if (policy->family == AF_INET) {
+ -				dbits = rbits4;
+ -				sbits = lbits4;
+ -			} else {
+ -				dbits = rbits6;
+ -				sbits = lbits6;
+ -			}
+ -		} else {
+ -			if (policy->family == AF_INET) {
+ -				dbits = lbits4;
+ -				sbits = rbits4;
+ -			} else {
+ -				dbits = lbits6;
+ -				sbits = rbits6;
+ -			}
+ -		}
+ -
+ -		if (policy->selector.prefixlen_d < dbits ||
+ -		    policy->selector.prefixlen_s < sbits)
+ -			continue;
+ -
+ -		bin = xfrm_policy_inexact_alloc_bin(policy, dir);
+ -		if (!bin)
+ -			goto out_unlock;
+ -
+ -		if (!xfrm_policy_inexact_alloc_chain(bin, policy, dir))
+ -			goto out_unlock;
+ -	}
+ -
+  	/* reset the bydst and inexact table in all directions */
+  	for (dir = 0; dir < XFRM_POLICY_MAX; dir++) {
+- 		INIT_HLIST_HEAD(&net->xfrm.policy_inexact[dir]);
++ 		struct hlist_node *n;
++ 
++ 		hlist_for_each_entry_safe(policy, n,
++ 					  &net->xfrm.policy_inexact[dir],
++ 					  bydst_inexact_list)
++ 			hlist_del_init(&policy->bydst_inexact_list);
++ 
+  		hmask = net->xfrm.policy_bydst[dir].hmask;
+  		odst = net->xfrm.policy_bydst[dir].table;
+  		for (i = hmask; i >= 0; i--)
+@@@ -621,10 -1307,17 +1147,24 @@@
+  		}
+  		newpos = NULL;
+  		chain = policy_hash_bysel(net, &policy->selector,
+++<<<<<<< HEAD
+ +					  policy->family,
+ +					  xfrm_policy_id2dir(policy->index));
+ +		if (!chain)
+ +			chain = &net->xfrm.policy_inexact[dir];
+++=======
++ 					  policy->family, dir);
++ 
++ 		hlist_del_rcu(&policy->bydst);
++ 
++ 		if (!chain) {
++ 			void *p = xfrm_policy_inexact_insert(policy, dir, 0);
++ 
++ 			WARN_ONCE(IS_ERR(p), "reinsert: %ld\n", PTR_ERR(p));
++ 			continue;
++ 		}
++ 
+++>>>>>>> 1548bc4e0512 (xfrm: policy: delete inexact policies from inexact list on hash rebuild)
+  		hlist_for_each_entry(pol, chain, bydst) {
+  			if (policy->priority >= pol->priority)
+  				newpos = &pol->bydst;
+* Unmerged path net/xfrm/xfrm_policy.c
