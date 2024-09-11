@@ -1,0 +1,246 @@
+xen-swiotlb: split xen_swiotlb_init
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-365.el8
+commit-author Christoph Hellwig <hch@lst.de>
+commit a98f565462f0fca9096e8f53933364dc2a74bc90
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-365.el8/a98f5654.failed
+
+Split xen_swiotlb_init into a normal an an early case.  That makes both
+much simpler and more readable, and also allows marking the early
+code as __init and x86-only.
+
+	Signed-off-by: Christoph Hellwig <hch@lst.de>
+	Signed-off-by: Konrad Rzeszutek Wilk <konrad.wilk@oracle.com>
+(cherry picked from commit a98f565462f0fca9096e8f53933364dc2a74bc90)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/arm/xen/mm.c
+diff --cc arch/arm/xen/mm.c
+index cb44aa290e73,aae950cd053f..000000000000
+--- a/arch/arm/xen/mm.c
++++ b/arch/arm/xen/mm.c
+@@@ -189,8 -140,7 +189,12 @@@ int __init xen_mm_init(void
+  	struct gnttab_cache_flush cflush;
+  	if (!xen_initial_domain())
+  		return 0;
+++<<<<<<< HEAD
+ +	xen_swiotlb_init(1, false);
+ +	xen_dma_ops = &xen_swiotlb_dma_ops;
+++=======
++ 	xen_swiotlb_init();
+++>>>>>>> a98f565462f0 (xen-swiotlb: split xen_swiotlb_init)
+  
+  	cflush.op = 0;
+  	cflush.a.dev_bus_addr = 0;
+* Unmerged path arch/arm/xen/mm.c
+diff --git a/arch/x86/xen/pci-swiotlb-xen.c b/arch/x86/xen/pci-swiotlb-xen.c
+index 37c6056a7bba..c3bc1b4be5b6 100644
+--- a/arch/x86/xen/pci-swiotlb-xen.c
++++ b/arch/x86/xen/pci-swiotlb-xen.c
+@@ -57,7 +57,7 @@ int __init pci_xen_swiotlb_detect(void)
+ void __init pci_xen_swiotlb_init(void)
+ {
+ 	if (xen_swiotlb) {
+-		xen_swiotlb_init(1, true /* early */);
++		xen_swiotlb_init_early();
+ 		dma_ops = &xen_swiotlb_dma_ops;
+ 
+ #ifdef CONFIG_PCI
+@@ -74,7 +74,7 @@ int pci_xen_swiotlb_init_late(void)
+ 	if (xen_swiotlb)
+ 		return 0;
+ 
+-	rc = xen_swiotlb_init(1, false /* late */);
++	rc = xen_swiotlb_init();
+ 	if (rc)
+ 		return rc;
+ 
+diff --git a/drivers/xen/swiotlb-xen.c b/drivers/xen/swiotlb-xen.c
+index 8ccd85660984..788709c52aab 100644
+--- a/drivers/xen/swiotlb-xen.c
++++ b/drivers/xen/swiotlb-xen.c
+@@ -165,96 +165,112 @@ static const char *xen_swiotlb_error(enum xen_swiotlb_err err)
+ 
+ #define DEFAULT_NSLABS		ALIGN(SZ_64M >> IO_TLB_SHIFT, IO_TLB_SEGSIZE)
+ 
+-int __ref xen_swiotlb_init(int verbose, bool early)
++int __ref xen_swiotlb_init(void)
+ {
+-	unsigned long bytes, order;
+-	int rc = -ENOMEM;
+ 	enum xen_swiotlb_err m_ret = XEN_SWIOTLB_UNKNOWN;
++	unsigned long nslabs, bytes, order;
+ 	unsigned int repeat = 3;
++	int rc = -ENOMEM;
+ 	char *start;
+-	unsigned long nslabs;
+ 
+ 	nslabs = swiotlb_nr_tbl();
+-retry:
+ 	if (!nslabs)
+ 		nslabs = DEFAULT_NSLABS;
++retry:
++	m_ret = XEN_SWIOTLB_ENOMEM;
+ 	bytes = nslabs << IO_TLB_SHIFT;
+ 	order = get_order(bytes);
+ 
+ 	/*
+ 	 * Get IO TLB memory from any location.
+ 	 */
+-	if (early) {
+-		start = memblock_alloc(PAGE_ALIGN(bytes),
+-						  PAGE_SIZE);
+-		if (!start)
+-			panic("%s: Failed to allocate %lu bytes align=0x%lx\n",
+-			      __func__, PAGE_ALIGN(bytes), PAGE_SIZE);
+-	} else {
+ #define SLABS_PER_PAGE (1 << (PAGE_SHIFT - IO_TLB_SHIFT))
+ #define IO_TLB_MIN_SLABS ((1<<20) >> IO_TLB_SHIFT)
+-		while ((SLABS_PER_PAGE << order) > IO_TLB_MIN_SLABS) {
+-			start = (void *)xen_get_swiotlb_free_pages(order);
+-			if (start)
+-				break;
+-			order--;
+-		}
+-		if (order != get_order(bytes)) {
+-			pr_warn("Warning: only able to allocate %ld MB for software IO TLB\n",
+-				(PAGE_SIZE << order) >> 20);
+-			nslabs = SLABS_PER_PAGE << order;
+-			bytes = nslabs << IO_TLB_SHIFT;
+-		}
++	while ((SLABS_PER_PAGE << order) > IO_TLB_MIN_SLABS) {
++		start = (void *)xen_get_swiotlb_free_pages(order);
++		if (start)
++			break;
++		order--;
+ 	}
+-	if (!start) {
+-		m_ret = XEN_SWIOTLB_ENOMEM;
++	if (!start)
+ 		goto error;
++	if (order != get_order(bytes)) {
++		pr_warn("Warning: only able to allocate %ld MB for software IO TLB\n",
++			(PAGE_SIZE << order) >> 20);
++		nslabs = SLABS_PER_PAGE << order;
++		bytes = nslabs << IO_TLB_SHIFT;
+ 	}
++
+ 	/*
+ 	 * And replace that memory with pages under 4GB.
+ 	 */
+-	rc = xen_swiotlb_fixup(start,
+-			       bytes,
+-			       nslabs);
++	rc = xen_swiotlb_fixup(start, bytes, nslabs);
+ 	if (rc) {
+-		if (early)
+-			memblock_free(__pa(start),
+-				      PAGE_ALIGN(bytes));
+-		else {
+-			free_pages((unsigned long)start, order);
+-			start = NULL;
+-		}
++		free_pages((unsigned long)start, order);
+ 		m_ret = XEN_SWIOTLB_EFIXUP;
+ 		goto error;
+ 	}
+-	if (early) {
+-		if (swiotlb_init_with_tbl(start, nslabs,
+-			 verbose))
+-			panic("Cannot allocate SWIOTLB buffer");
+-		rc = 0;
+-	} else
+-		rc = swiotlb_late_init_with_tbl(start, nslabs);
+-
+-	if (!rc)
+-		swiotlb_set_max_segment(PAGE_SIZE);
+-
+-	return rc;
++	rc = swiotlb_late_init_with_tbl(start, nslabs);
++	if (rc)
++		return rc;
++	swiotlb_set_max_segment(PAGE_SIZE);
++	return 0;
+ error:
+ 	if (repeat--) {
+-		nslabs = max(1024UL, /* Min is 2MB */
+-					(nslabs >> 1));
++		/* Min is 2MB */
++		nslabs = max(1024UL, (nslabs >> 1));
+ 		pr_info("Lowering to %luMB\n",
+ 			(nslabs << IO_TLB_SHIFT) >> 20);
+ 		goto retry;
+ 	}
+ 	pr_err("%s (rc:%d)\n", xen_swiotlb_error(m_ret), rc);
+-	if (early)
+-		panic("%s (rc:%d)", xen_swiotlb_error(m_ret), rc);
+-	else
+-		free_pages((unsigned long)start, order);
++	free_pages((unsigned long)start, order);
+ 	return rc;
+ }
+ 
++#ifdef CONFIG_X86
++void __init xen_swiotlb_init_early(void)
++{
++	unsigned long nslabs, bytes;
++	unsigned int repeat = 3;
++	char *start;
++	int rc;
++
++	nslabs = swiotlb_nr_tbl();
++	if (!nslabs)
++		nslabs = DEFAULT_NSLABS;
++retry:
++	/*
++	 * Get IO TLB memory from any location.
++	 */
++	bytes = nslabs << IO_TLB_SHIFT;
++	start = memblock_alloc(PAGE_ALIGN(bytes), PAGE_SIZE);
++	if (!start)
++		panic("%s: Failed to allocate %lu bytes align=0x%lx\n",
++		      __func__, PAGE_ALIGN(bytes), PAGE_SIZE);
++
++	/*
++	 * And replace that memory with pages under 4GB.
++	 */
++	rc = xen_swiotlb_fixup(start, bytes, nslabs);
++	if (rc) {
++		memblock_free(__pa(start), PAGE_ALIGN(bytes));
++		if (repeat--) {
++			/* Min is 2MB */
++			nslabs = max(1024UL, (nslabs >> 1));
++			pr_info("Lowering to %luMB\n",
++				(nslabs << IO_TLB_SHIFT) >> 20);
++			goto retry;
++		}
++		panic("%s (rc:%d)", xen_swiotlb_error(XEN_SWIOTLB_EFIXUP), rc);
++	}
++
++	if (swiotlb_init_with_tbl(start, nslabs, false))
++		panic("Cannot allocate SWIOTLB buffer");
++	swiotlb_set_max_segment(PAGE_SIZE);
++}
++#endif /* CONFIG_X86 */
++
+ static void *
+ xen_swiotlb_alloc_coherent(struct device *hwdev, size_t size,
+ 			   dma_addr_t *dma_handle, gfp_t flags,
+diff --git a/include/xen/swiotlb-xen.h b/include/xen/swiotlb-xen.h
+index ffc0d3902b71..83714c72b2d9 100644
+--- a/include/xen/swiotlb-xen.h
++++ b/include/xen/swiotlb-xen.h
+@@ -9,7 +9,8 @@ void xen_dma_sync_for_cpu(dma_addr_t handle, phys_addr_t paddr, size_t size,
+ void xen_dma_sync_for_device(dma_addr_t handle, phys_addr_t paddr, size_t size,
+ 		enum dma_data_direction dir);
+ 
+-extern int xen_swiotlb_init(int verbose, bool early);
++int xen_swiotlb_init(void);
++void __init xen_swiotlb_init_early(void);
+ extern const struct dma_map_ops xen_swiotlb_dma_ops;
+ 
+ #endif /* __LINUX_SWIOTLB_XEN_H */
