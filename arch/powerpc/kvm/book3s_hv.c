@@ -1162,8 +1162,7 @@ static int kvmppc_hcall_impl_hv(unsigned long cmd)
 	return kvmppc_hcall_impl_hv_realmode(cmd);
 }
 
-static int kvmppc_emulate_debug_inst(struct kvm_run *run,
-					struct kvm_vcpu *vcpu)
+static int kvmppc_emulate_debug_inst(struct kvm_vcpu *vcpu)
 {
 	u32 last_inst;
 
@@ -1177,8 +1176,8 @@ static int kvmppc_emulate_debug_inst(struct kvm_run *run,
 	}
 
 	if (last_inst == KVMPPC_INST_SW_BREAKPOINT) {
-		run->exit_reason = KVM_EXIT_DEBUG;
-		run->debug.arch.address = kvmppc_get_pc(vcpu);
+		vcpu->run->exit_reason = KVM_EXIT_DEBUG;
+		vcpu->run->debug.arch.address = kvmppc_get_pc(vcpu);
 		return RESUME_HOST;
 	} else {
 		kvmppc_core_queue_program(vcpu, SRR1_PROGILL);
@@ -1279,9 +1278,10 @@ static int kvmppc_emulate_doorbell_instr(struct kvm_vcpu *vcpu)
 	return RESUME_GUEST;
 }
 
-static int kvmppc_handle_exit_hv(struct kvm_run *run, struct kvm_vcpu *vcpu,
+static int kvmppc_handle_exit_hv(struct kvm_vcpu *vcpu,
 				 struct task_struct *tsk)
 {
+	struct kvm_run *run = vcpu->run;
 	int r = RESUME_HOST;
 
 	vcpu->stat.sum_exits++;
@@ -1416,7 +1416,7 @@ static int kvmppc_handle_exit_hv(struct kvm_run *run, struct kvm_vcpu *vcpu,
 				swab32(vcpu->arch.emul_inst) :
 				vcpu->arch.emul_inst;
 		if (vcpu->guest_debug & KVM_GUESTDBG_USE_SW_BP) {
-			r = kvmppc_emulate_debug_inst(run, vcpu);
+			r = kvmppc_emulate_debug_inst(vcpu);
 		} else {
 			kvmppc_core_queue_program(vcpu, SRR1_PROGILL);
 			r = RESUME_GUEST;
@@ -1468,7 +1468,7 @@ static int kvmppc_handle_exit_hv(struct kvm_run *run, struct kvm_vcpu *vcpu,
 	return r;
 }
 
-static int kvmppc_handle_nested_exit(struct kvm_run *run, struct kvm_vcpu *vcpu)
+static int kvmppc_handle_nested_exit(struct kvm_vcpu *vcpu)
 {
 	int r;
 	int srcu_idx;
@@ -1526,7 +1526,7 @@ static int kvmppc_handle_nested_exit(struct kvm_run *run, struct kvm_vcpu *vcpu)
 	 */
 	case BOOK3S_INTERRUPT_H_DATA_STORAGE:
 		srcu_idx = srcu_read_lock(&vcpu->kvm->srcu);
-		r = kvmhv_nested_page_fault(run, vcpu);
+		r = kvmhv_nested_page_fault(vcpu);
 		srcu_read_unlock(&vcpu->kvm->srcu, srcu_idx);
 		break;
 	case BOOK3S_INTERRUPT_H_INST_STORAGE:
@@ -1536,7 +1536,7 @@ static int kvmppc_handle_nested_exit(struct kvm_run *run, struct kvm_vcpu *vcpu)
 		if (vcpu->arch.shregs.msr & HSRR1_HISI_WRITE)
 			vcpu->arch.fault_dsisr |= DSISR_ISSTORE;
 		srcu_idx = srcu_read_lock(&vcpu->kvm->srcu);
-		r = kvmhv_nested_page_fault(run, vcpu);
+		r = kvmhv_nested_page_fault(vcpu);
 		srcu_read_unlock(&vcpu->kvm->srcu, srcu_idx);
 		break;
 
@@ -2940,7 +2940,7 @@ static void post_guest_process(struct kvmppc_vcore *vc, bool is_master)
 
 		ret = RESUME_GUEST;
 		if (vcpu->arch.trap)
-			ret = kvmppc_handle_exit_hv(vcpu->run, vcpu,
+			ret = kvmppc_handle_exit_hv(vcpu,
 						    vcpu->arch.run_task);
 
 		vcpu->arch.ret = ret;
@@ -3906,15 +3906,16 @@ static int kvmhv_setup_mmu(struct kvm_vcpu *vcpu)
 	return r;
 }
 
-static int kvmppc_run_vcpu(struct kvm_run *kvm_run, struct kvm_vcpu *vcpu)
+static int kvmppc_run_vcpu(struct kvm_vcpu *vcpu)
 {
+	struct kvm_run *run = vcpu->run;
 	int n_ceded, i, r;
 	struct kvmppc_vcore *vc;
 	struct kvm_vcpu *v;
 
 	trace_kvmppc_run_vcpu_enter(vcpu);
 
-	kvm_run->exit_reason = 0;
+	run->exit_reason = 0;
 	vcpu->arch.ret = RESUME_GUEST;
 	vcpu->arch.trap = 0;
 	kvmppc_update_vpas(vcpu);
@@ -3958,8 +3959,8 @@ static int kvmppc_run_vcpu(struct kvm_run *kvm_run, struct kvm_vcpu *vcpu)
 			r = kvmhv_setup_mmu(vcpu);
 			spin_lock(&vc->lock);
 			if (r) {
-				kvm_run->exit_reason = KVM_EXIT_FAIL_ENTRY;
-				kvm_run->fail_entry.
+				run->exit_reason = KVM_EXIT_FAIL_ENTRY;
+				run->fail_entry.
 					hardware_entry_failure_reason = 0;
 				vcpu->arch.ret = r;
 				break;
@@ -4019,7 +4020,7 @@ static int kvmppc_run_vcpu(struct kvm_run *kvm_run, struct kvm_vcpu *vcpu)
 	if (vcpu->arch.state == KVMPPC_VCPU_RUNNABLE) {
 		kvmppc_remove_runnable(vc, vcpu);
 		vcpu->stat.signal_exits++;
-		kvm_run->exit_reason = KVM_EXIT_INTR;
+		run->exit_reason = KVM_EXIT_INTR;
 		vcpu->arch.ret = -EINTR;
 	}
 
@@ -4030,15 +4031,15 @@ static int kvmppc_run_vcpu(struct kvm_run *kvm_run, struct kvm_vcpu *vcpu)
 		wake_up(&v->arch.cpu_run);
 	}
 
-	trace_kvmppc_run_vcpu_exit(vcpu, kvm_run);
+	trace_kvmppc_run_vcpu_exit(vcpu);
 	spin_unlock(&vc->lock);
 	return vcpu->arch.ret;
 }
 
-int kvmhv_run_single_vcpu(struct kvm_run *kvm_run,
-			  struct kvm_vcpu *vcpu, u64 time_limit,
+int kvmhv_run_single_vcpu(struct kvm_vcpu *vcpu, u64 time_limit,
 			  unsigned long lpcr)
 {
+	struct kvm_run *run = vcpu->run;
 	int trap, r, pcpu;
 	int srcu_idx, lpid;
 	struct kvmppc_vcore *vc;
@@ -4047,7 +4048,7 @@ int kvmhv_run_single_vcpu(struct kvm_run *kvm_run,
 
 	trace_kvmppc_run_vcpu_enter(vcpu);
 
-	kvm_run->exit_reason = 0;
+	run->exit_reason = 0;
 	vcpu->arch.ret = RESUME_GUEST;
 	vcpu->arch.trap = 0;
 
@@ -4171,9 +4172,9 @@ int kvmhv_run_single_vcpu(struct kvm_run *kvm_run,
 	r = RESUME_GUEST;
 	if (trap) {
 		if (!nested)
-			r = kvmppc_handle_exit_hv(kvm_run, vcpu, current);
+			r = kvmppc_handle_exit_hv(vcpu, current);
 		else
-			r = kvmppc_handle_nested_exit(kvm_run, vcpu);
+			r = kvmppc_handle_nested_exit(vcpu);
 	}
 	vcpu->arch.ret = r;
 
@@ -4183,7 +4184,7 @@ int kvmhv_run_single_vcpu(struct kvm_run *kvm_run,
 		while (vcpu->arch.ceded && !kvmppc_vcpu_woken(vcpu)) {
 			if (signal_pending(current)) {
 				vcpu->stat.signal_exits++;
-				kvm_run->exit_reason = KVM_EXIT_INTR;
+				run->exit_reason = KVM_EXIT_INTR;
 				vcpu->arch.ret = -EINTR;
 				break;
 			}
@@ -4199,13 +4200,13 @@ int kvmhv_run_single_vcpu(struct kvm_run *kvm_run,
 
  done:
 	kvmppc_remove_runnable(vc, vcpu);
-	trace_kvmppc_run_vcpu_exit(vcpu, kvm_run);
+	trace_kvmppc_run_vcpu_exit(vcpu);
 
 	return vcpu->arch.ret;
 
  sigpend:
 	vcpu->stat.signal_exits++;
-	kvm_run->exit_reason = KVM_EXIT_INTR;
+	run->exit_reason = KVM_EXIT_INTR;
 	vcpu->arch.ret = -EINTR;
  out:
 	local_irq_enable();
@@ -4213,8 +4214,9 @@ int kvmhv_run_single_vcpu(struct kvm_run *kvm_run,
 	goto done;
 }
 
-static int kvmppc_vcpu_run_hv(struct kvm_run *run, struct kvm_vcpu *vcpu)
+static int kvmppc_vcpu_run_hv(struct kvm_vcpu *vcpu)
 {
+	struct kvm_run *run = vcpu->run;
 	int r;
 	int srcu_idx;
 	unsigned long ebb_regs[3] = {};	/* shut up GCC */
@@ -4298,10 +4300,10 @@ static int kvmppc_vcpu_run_hv(struct kvm_run *run, struct kvm_vcpu *vcpu)
 		 */
 		if (kvm->arch.threads_indep && kvm_is_radix(kvm) &&
 		    !no_mixing_hpt_and_radix)
-			r = kvmhv_run_single_vcpu(run, vcpu, ~(u64)0,
+			r = kvmhv_run_single_vcpu(vcpu, ~(u64)0,
 						  vcpu->arch.vcore->lpcr);
 		else
-			r = kvmppc_run_vcpu(run, vcpu);
+			r = kvmppc_run_vcpu(vcpu);
 
 		if (run->exit_reason == KVM_EXIT_PAPR_HCALL &&
 		    !(vcpu->arch.shregs.msr & MSR_PR)) {
@@ -4311,7 +4313,7 @@ static int kvmppc_vcpu_run_hv(struct kvm_run *run, struct kvm_vcpu *vcpu)
 			kvmppc_core_prepare_to_enter(vcpu);
 		} else if (r == RESUME_PAGE_FAULT) {
 			srcu_idx = srcu_read_lock(&kvm->srcu);
-			r = kvmppc_book3s_hv_page_fault(run, vcpu,
+			r = kvmppc_book3s_hv_page_fault(vcpu,
 				vcpu->arch.fault_dar, vcpu->arch.fault_dsisr);
 			srcu_read_unlock(&kvm->srcu, srcu_idx);
 		} else if (r == RESUME_PASSTHROUGH) {
@@ -4983,7 +4985,7 @@ static void kvmppc_core_destroy_vm_hv(struct kvm *kvm)
 }
 
 /* We don't need to emulate any privileged instructions or dcbz */
-static int kvmppc_core_emulate_op_hv(struct kvm_run *run, struct kvm_vcpu *vcpu,
+static int kvmppc_core_emulate_op_hv(struct kvm_vcpu *vcpu,
 				     unsigned int inst, int *advance)
 {
 	return EMULATE_FAIL;
