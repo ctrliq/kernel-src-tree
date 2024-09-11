@@ -1,0 +1,121 @@
+s390/pci: refactor zpci function states
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-448.el8
+commit-author Niklas Schnelle <schnelle@linux.ibm.com>
+commit f6576a1b4896b984dce0e8393efeba68cc2b96c8
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-448.el8/f6576a1b.failed
+
+The current zdev->state mixes the configuration states supported by CLP
+with an additional Online state which is used inconsistently to include
+enabled zPCI functions which are not yet visible to the common PCI
+subsytem. In preparation for a clean separation between architected
+configuration states and fine grained function states remove the Online
+function state.
+
+Where we previously checked for Online it is more accurate to check if
+the function is enabled to avoid an edge case where a disabled device
+was still treated as Online. This also simplifies checks whether
+a function is configured as this is now directly reflected by its
+function state.
+
+	Reviewed-by: Matthew Rosato <mjrosato@linux.ibm.com>
+	Signed-off-by: Niklas Schnelle <schnelle@linux.ibm.com>
+	Signed-off-by: Heiko Carstens <hca@linux.ibm.com>
+(cherry picked from commit f6576a1b4896b984dce0e8393efeba68cc2b96c8)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/s390/pci/pci.c
+diff --cc arch/s390/pci/pci.c
+index 6af47e2fa8a9,053113bcad60..000000000000
+--- a/arch/s390/pci/pci.c
++++ b/arch/s390/pci/pci.c
+@@@ -763,16 -768,14 +762,21 @@@ int zpci_create_device(struct zpci_dev 
+  
+  	return 0;
+  
+++<<<<<<< HEAD
+ +out_disable:
+ +	if (zdev->state == ZPCI_FN_STATE_ONLINE)
+++=======
++ error_disable:
++ 	if (zdev_enabled(zdev))
+++>>>>>>> f6576a1b4896 (s390/pci: refactor zpci function states)
+  		zpci_disable_device(zdev);
+ -error_destroy_iommu:
+ +
+ +out_destroy_iommu:
+  	zpci_destroy_iommu(zdev);
+ -error:
+ -	zpci_dbg(0, "add fid:%x, rc:%d\n", fid, rc);
+ -	kfree(zdev);
+ +out:
+ +	spin_lock(&zpci_list_lock);
+ +	list_del(&zdev->entry);
+ +	spin_unlock(&zpci_list_lock);
+  	return rc;
+  }
+  
+@@@ -814,13 -784,12 +818,16 @@@ void zpci_release_device(struct kref *k
+  	struct zpci_dev *zdev = container_of(kref, struct zpci_dev, kref);
+  
+  	if (zdev->zbus->bus)
+ -		zpci_remove_device(zdev, false);
+ +		zpci_remove_device(zdev);
+  
+- 	switch (zdev->state) {
+- 	case ZPCI_FN_STATE_ONLINE:
+- 	case ZPCI_FN_STATE_CONFIGURED:
++ 	if (zdev_enabled(zdev))
+  		zpci_disable_device(zdev);
+++<<<<<<< HEAD
+ +		/* fallthrough */
+++=======
++ 
++ 	switch (zdev->state) {
+++>>>>>>> f6576a1b4896 (s390/pci: refactor zpci function states)
+  	case ZPCI_FN_STATE_STANDBY:
+  		if (zdev->has_hp_slot)
+  			zpci_exit_slot(zdev);
+diff --git a/arch/s390/include/asm/pci.h b/arch/s390/include/asm/pci.h
+index 37481081a26c..e57e46521659 100644
+--- a/arch/s390/include/asm/pci.h
++++ b/arch/s390/include/asm/pci.h
+@@ -85,7 +85,6 @@ enum zpci_state {
+ 	ZPCI_FN_STATE_STANDBY = 0,
+ 	ZPCI_FN_STATE_CONFIGURED = 1,
+ 	ZPCI_FN_STATE_RESERVED = 2,
+-	ZPCI_FN_STATE_ONLINE = 3,
+ };
+ 
+ struct zpci_bar_struct {
+* Unmerged path arch/s390/pci/pci.c
+diff --git a/drivers/pci/hotplug/s390_pci_hpc.c b/drivers/pci/hotplug/s390_pci_hpc.c
+index 8534cf105796..5e7b6ea3c28f 100644
+--- a/drivers/pci/hotplug/s390_pci_hpc.c
++++ b/drivers/pci/hotplug/s390_pci_hpc.c
+@@ -20,12 +20,6 @@
+ 
+ #define SLOT_NAME_SIZE	10
+ 
+-static int zpci_fn_configured(enum zpci_state state)
+-{
+-	return state == ZPCI_FN_STATE_CONFIGURED ||
+-	       state == ZPCI_FN_STATE_ONLINE;
+-}
+-
+ static inline int zdev_configure(struct zpci_dev *zdev)
+ {
+ 	int ret = sclp_pci_configure(zdev->fid);
+@@ -85,7 +79,7 @@ static int disable_slot(struct hotplug_slot *hotplug_slot)
+ 	struct pci_dev *pdev;
+ 	int rc;
+ 
+-	if (!zpci_fn_configured(zdev->state))
++	if (zdev->state != ZPCI_FN_STATE_CONFIGURED)
+ 		return -EIO;
+ 
+ 	pdev = pci_get_slot(zdev->zbus->bus, zdev->devfn);
