@@ -1,0 +1,127 @@
+scsi: iscsi: Fix conn cleanup and stop race during iscsid restart
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-394.el8
+commit-author Mike Christie <michael.christie@oracle.com>
+commit 7c6e99c18167ed89729bf167ccb4a7e3ab3115ba
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-394.el8/7c6e99c1.failed
+
+If iscsid is doing a stop_conn at the same time the kernel is starting
+error recovery we can hit a race that allows the cleanup work to run on a
+valid connection. In the race, iscsi_if_stop_conn sees the cleanup bit set,
+but it calls flush_work on the clean_work before iscsi_conn_error_event has
+queued it. The flush then returns before the queueing and so the
+cleanup_work can run later and disconnect/stop a conn while it's in a
+connected state.
+
+The patch:
+
+Commit 0ab710458da1 ("scsi: iscsi: Perform connection failure entirely in
+kernel space")
+
+added the late stop_conn call bug originally, and the patch:
+
+Commit 23d6fefbb3f6 ("scsi: iscsi: Fix in-kernel conn failure handling")
+
+attempted to fix it but only fixed the normal EH case and left the above
+race for the iscsid restart case. For the normal EH case we don't hit the
+race because we only signal userspace to start recovery after we have done
+the queueing, so the flush will always catch the queued work or see it
+completed.
+
+For iscsid restart cases like boot, we can hit the race because iscsid will
+call down to the kernel before the kernel has signaled any error, so both
+code paths can be running at the same time. This adds a lock around the
+setting of the cleanup bit and queueing so they happen together.
+
+Link: https://lore.kernel.org/r/20220408001314.5014-6-michael.christie@oracle.com
+Fixes: 0ab710458da1 ("scsi: iscsi: Perform connection failure entirely in kernel space")
+	Tested-by: Manish Rangankar <mrangankar@marvell.com>
+	Reviewed-by: Lee Duncan <lduncan@suse.com>
+	Reviewed-by: Chris Leech <cleech@redhat.com>
+	Signed-off-by: Mike Christie <michael.christie@oracle.com>
+	Signed-off-by: Martin K. Petersen <martin.petersen@oracle.com>
+(cherry picked from commit 7c6e99c18167ed89729bf167ccb4a7e3ab3115ba)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/scsi/scsi_transport_iscsi.c
+diff --cc drivers/scsi/scsi_transport_iscsi.c
+index 46e03f51496a,63a4f0c022fd..000000000000
+--- a/drivers/scsi/scsi_transport_iscsi.c
++++ b/drivers/scsi/scsi_transport_iscsi.c
+@@@ -2253,6 -2235,30 +2253,33 @@@ static void iscsi_ep_disconnect(struct 
+  	ISCSI_DBG_TRANS_CONN(conn, "disconnect ep done.\n");
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static void iscsi_if_disconnect_bound_ep(struct iscsi_cls_conn *conn,
++ 					 struct iscsi_endpoint *ep,
++ 					 bool is_active)
++ {
++ 	/* Check if this was a conn error and the kernel took ownership */
++ 	spin_lock_irq(&conn->lock);
++ 	if (!test_bit(ISCSI_CLS_CONN_BIT_CLEANUP, &conn->flags)) {
++ 		spin_unlock_irq(&conn->lock);
++ 		iscsi_ep_disconnect(conn, is_active);
++ 	} else {
++ 		spin_unlock_irq(&conn->lock);
++ 		ISCSI_DBG_TRANS_CONN(conn, "flush kernel conn cleanup.\n");
++ 		mutex_unlock(&conn->ep_mutex);
++ 
++ 		flush_work(&conn->cleanup_work);
++ 		/*
++ 		 * Userspace is now done with the EP so we can release the ref
++ 		 * iscsi_cleanup_conn_work_fn took.
++ 		 */
++ 		iscsi_put_endpoint(ep);
++ 		mutex_lock(&conn->ep_mutex);
++ 	}
++ }
++ 
+++>>>>>>> 7c6e99c18167 (scsi: iscsi: Fix conn cleanup and stop race during iscsid restart)
+  static int iscsi_if_stop_conn(struct iscsi_transport *transport,
+  			      struct iscsi_uevent *ev)
+  {
+@@@ -2276,18 -2282,22 +2303,24 @@@
+  		/*
+  		 * Figure out if it was the kernel or userspace initiating this.
+  		 */
++ 		spin_lock_irq(&conn->lock);
+  		if (!test_and_set_bit(ISCSI_CLS_CONN_BIT_CLEANUP, &conn->flags)) {
+++<<<<<<< HEAD
+ +			if (conn->ep) {
+ +				/*
+ +				 * For offload, when iscsid is restarted it
+ +				 * won't know about existing endpoints. We
+ +				 * clean it up here for userspace.
+ +				 */
+ +				iscsi_ep_disconnect(conn, true);
+ +			}
+ +
+++=======
++ 			spin_unlock_irq(&conn->lock);
+++>>>>>>> 7c6e99c18167 (scsi: iscsi: Fix conn cleanup and stop race during iscsid restart)
+  			iscsi_stop_conn(conn, flag);
+  		} else {
++ 			spin_unlock_irq(&conn->lock);
+  			ISCSI_DBG_TRANS_CONN(conn,
+  					     "flush kernel conn cleanup.\n");
+  			flush_work(&conn->cleanup_work);
+* Unmerged path drivers/scsi/scsi_transport_iscsi.c
+diff --git a/include/scsi/scsi_transport_iscsi.h b/include/scsi/scsi_transport_iscsi.h
+index 13fc10453dc3..808afae7678e 100644
+--- a/include/scsi/scsi_transport_iscsi.h
++++ b/include/scsi/scsi_transport_iscsi.h
+@@ -211,6 +211,8 @@ struct iscsi_cls_conn {
+ 	struct mutex ep_mutex;
+ 	struct iscsi_endpoint *ep;
+ 
++	/* Used when accessing flags and queueing work. */
++	spinlock_t lock;
+ 	unsigned long flags;
+ 	struct work_struct cleanup_work;
+ 
