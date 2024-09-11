@@ -1,0 +1,128 @@
+thermal/core: Add critical and hot ops
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-326.el8
+commit-author Daniel Lezcano <daniel.lezcano@linaro.org>
+commit d7203eedf4f68e9909fd489453168a9d26bf0c3d
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-326.el8/d7203eed.failed
+
+Currently there is no way to the sensors to directly call an ops in
+interrupt mode without calling thermal_zone_device_update assuming all
+the trip points are defined.
+
+A sensor may want to do something special if a trip point is hot or
+critical.
+
+This patch adds the critical and hot ops to the thermal zone device,
+so a sensor can directly invoke them or let the thermal framework to
+call the sensor specific ones.
+
+	Tested-by: Kai-Heng Feng <kai.heng.feng@canonical.com>
+	Signed-off-by: Daniel Lezcano <daniel.lezcano@linaro.org>
+	Reviewed-by: Lukasz Luba <lukasz.luba@arm.com>
+Link: https://lore.kernel.org/r/20201210121514.25760-2-daniel.lezcano@linaro.org
+(cherry picked from commit d7203eedf4f68e9909fd489453168a9d26bf0c3d)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/thermal.h
+diff --cc include/linux/thermal.h
+index fa7337135635,31b84404f047..000000000000
+--- a/include/linux/thermal.h
++++ b/include/linux/thermal.h
+@@@ -465,20 -401,8 +467,24 @@@ void thermal_cdev_update(struct thermal
+  void thermal_notify_framework(struct thermal_zone_device *, int);
+  int thermal_zone_device_enable(struct thermal_zone_device *tz);
+  int thermal_zone_device_disable(struct thermal_zone_device *tz);
+++<<<<<<< HEAD
+ +int thermal_zone_device_is_enabled(struct thermal_zone_device *tz);
+++=======
++ void thermal_zone_device_critical(struct thermal_zone_device *tz);
+++>>>>>>> d7203eedf4f6 (thermal/core: Add critical and hot ops)
+  #else
+ +static inline bool cdev_is_power_actor(struct thermal_cooling_device *cdev)
+ +{ return false; }
+ +static inline int power_actor_get_max_power(struct thermal_cooling_device *cdev,
+ +			      struct thermal_zone_device *tz, u32 *max_power)
+ +{ return 0; }
+ +static inline int power_actor_get_min_power(struct thermal_cooling_device *cdev,
+ +					    struct thermal_zone_device *tz,
+ +					    u32 *min_power)
+ +{ return -ENODEV; }
+ +static inline int power_actor_set_power(struct thermal_cooling_device *cdev,
+ +			  struct thermal_instance *tz, u32 power)
+ +{ return 0; }
+  static inline struct thermal_zone_device *thermal_zone_device_register(
+  	const char *type, int trips, int mask, void *devdata,
+  	struct thermal_zone_device_ops *ops,
+diff --git a/drivers/thermal/thermal_core.c b/drivers/thermal/thermal_core.c
+index 513ce89f00a1..cf139cb114db 100644
+--- a/drivers/thermal/thermal_core.c
++++ b/drivers/thermal/thermal_core.c
+@@ -378,6 +378,25 @@ static void thermal_emergency_poweroff(void)
+ 			      msecs_to_jiffies(poweroff_delay_ms));
+ }
+ 
++void thermal_zone_device_critical(struct thermal_zone_device *tz)
++{
++	dev_emerg(&tz->device, "%s: critical temperature reached, "
++		  "shutting down\n", tz->type);
++
++	mutex_lock(&poweroff_lock);
++	if (!power_off_triggered) {
++		/*
++		 * Queue a backup emergency shutdown in the event of
++		 * orderly_poweroff failure
++		 */
++		thermal_emergency_poweroff();
++		orderly_poweroff(true);
++		power_off_triggered = true;
++	}
++	mutex_unlock(&poweroff_lock);
++}
++EXPORT_SYMBOL(thermal_zone_device_critical);
++
+ static void handle_critical_trips(struct thermal_zone_device *tz,
+ 				  int trip, enum thermal_trip_type trip_type)
+ {
+@@ -394,22 +413,10 @@ static void handle_critical_trips(struct thermal_zone_device *tz,
+ 	if (tz->ops->notify)
+ 		tz->ops->notify(tz, trip, trip_type);
+ 
+-	if (trip_type == THERMAL_TRIP_CRITICAL) {
+-		dev_emerg(&tz->device,
+-			  "critical temperature reached (%d C), shutting down\n",
+-			  tz->temperature / 1000);
+-		mutex_lock(&poweroff_lock);
+-		if (!power_off_triggered) {
+-			/*
+-			 * Queue a backup emergency shutdown in the event of
+-			 * orderly_poweroff failure
+-			 */
+-			thermal_emergency_poweroff();
+-			orderly_poweroff(true);
+-			power_off_triggered = true;
+-		}
+-		mutex_unlock(&poweroff_lock);
+-	}
++	if (trip_type == THERMAL_TRIP_HOT && tz->ops->hot)
++		tz->ops->hot(tz);
++	else if (trip_type == THERMAL_TRIP_CRITICAL)
++		tz->ops->critical(tz);
+ }
+ 
+ static void handle_thermal_trip(struct thermal_zone_device *tz, int trip)
+@@ -1331,6 +1338,10 @@ thermal_zone_device_register(const char *type, int trips, int mask,
+ 
+ 	tz->id = result;
+ 	strlcpy(tz->type, type, sizeof(tz->type));
++
++	if (!ops->critical)
++		ops->critical = thermal_zone_device_critical;
++
+ 	tz->ops = ops;
+ 	tz->tzp = tzp;
+ 	tz->device.class = &thermal_class;
+* Unmerged path include/linux/thermal.h
