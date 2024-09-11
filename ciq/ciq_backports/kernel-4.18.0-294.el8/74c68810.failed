@@ -1,0 +1,289 @@
+powerpc/watchpoint: Prepare handler to handle more than one watchpoint
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Ravi Bangoria <ravi.bangoria@linux.ibm.com>
+commit 74c6881019b7d56c327fffc268d97adb5eb1b4f9
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/74c68810.failed
+
+Currently we assume that we have only one watchpoint supported by hw.
+Get rid of that assumption and use dynamic loop instead. This should
+make supporting more watchpoints very easy.
+
+With more than one watchpoint, exception handler needs to know which
+DAWR caused the exception, and hw currently does not provide it. So
+we need sw logic for the same. To figure out which DAWR caused the
+exception, check all different combinations of user specified range,
+DAWR address range, actual access range and DAWRX constrains. For ex,
+if user specified range and actual access range overlaps but DAWRX is
+configured for readonly watchpoint and the instruction is store, this
+DAWR must not have caused exception.
+
+	Signed-off-by: Ravi Bangoria <ravi.bangoria@linux.ibm.com>
+	Reviewed-by: Michael Neuling <mikey@neuling.org>
+[mpe: Unsplit multi-line printk() strings, fix some sparse warnings]
+	Signed-off-by: Michael Ellerman <mpe@ellerman.id.au>
+Link: https://lore.kernel.org/r/20200514111741.97993-14-ravi.bangoria@linux.ibm.com
+(cherry picked from commit 74c6881019b7d56c327fffc268d97adb5eb1b4f9)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/powerpc/kernel/hw_breakpoint.c
+diff --cc arch/powerpc/kernel/hw_breakpoint.c
+index 3f3554b2c00f,5fdc6c4f14af..000000000000
+--- a/arch/powerpc/kernel/hw_breakpoint.c
++++ b/arch/powerpc/kernel/hw_breakpoint.c
+@@@ -72,8 -84,8 +93,13 @@@ int arch_install_hw_breakpoint(struct p
+  	 * Do not install DABR values if the instruction must be single-stepped.
+  	 * If so, DABR will be populated in single_step_dabr_instruction().
+  	 */
+++<<<<<<< HEAD
+ +	if (current->thread.last_hit_ubp != bp)
+ +		__set_breakpoint(info);
+++=======
++ 	if (!single_step_pending())
++ 		__set_breakpoint(i, info);
+++>>>>>>> 74c6881019b7 (powerpc/watchpoint: Prepare handler to handle more than one watchpoint)
+  
+  	return 0;
+  }
+@@@ -200,17 -255,24 +239,29 @@@ int hw_breakpoint_arch_parse(struct per
+  void thread_change_pc(struct task_struct *tsk, struct pt_regs *regs)
+  {
+  	struct arch_hw_breakpoint *info;
++ 	int i;
+  
+- 	if (likely(!tsk->thread.last_hit_ubp))
+- 		return;
++ 	for (i = 0; i < nr_wp_slots(); i++) {
++ 		if (unlikely(tsk->thread.last_hit_ubp[i]))
++ 			goto reset;
++ 	}
++ 	return;
+  
+- 	info = counter_arch_bp(tsk->thread.last_hit_ubp);
++ reset:
+  	regs->msr &= ~MSR_SE;
+++<<<<<<< HEAD
+ +	__set_breakpoint(info);
+ +	tsk->thread.last_hit_ubp = NULL;
+++=======
++ 	for (i = 0; i < nr_wp_slots(); i++) {
++ 		info = counter_arch_bp(__this_cpu_read(bp_per_reg[i]));
++ 		__set_breakpoint(i, info);
++ 		tsk->thread.last_hit_ubp[i] = NULL;
++ 	}
+++>>>>>>> 74c6881019b7 (powerpc/watchpoint: Prepare handler to handle more than one watchpoint)
+  }
+  
+- static bool dar_within_range(unsigned long dar, struct arch_hw_breakpoint *info)
++ static bool dar_in_user_range(unsigned long dar, struct arch_hw_breakpoint *info)
+  {
+  	return ((info->address <= dar) && (dar - info->address < info->len));
+  }
+@@@ -223,40 -306,55 +295,65 @@@ static bool dar_hw_range_overlaps(unsig
+  }
+  
+  /*
+-  * Handle debug exception notifications.
++  * If hw has multiple DAWR registers, we also need to check all
++  * dawrx constraint bits to confirm this is _really_ a valid event.
+   */
+- static bool stepping_handler(struct pt_regs *regs, struct perf_event *bp,
+- 			     struct arch_hw_breakpoint *info)
++ static bool check_dawrx_constraints(struct pt_regs *regs, int type,
++ 				    struct arch_hw_breakpoint *info)
+  {
+++<<<<<<< HEAD
+ +	unsigned int instr = 0;
+ +	int ret, type, size;
+ +	struct instruction_op op;
+ +	unsigned long addr = info->address;
+ +
+ +	if (__get_user_inatomic(instr, (unsigned int *)regs->nip))
+ +		goto fail;
+++=======
++ 	if (OP_IS_LOAD(type) && !(info->type & HW_BRK_TYPE_READ))
++ 		return false;
+  
+- 	ret = analyse_instr(&op, regs, instr);
+- 	type = GETTYPE(op.type);
+- 	size = GETSIZE(op.type);
++ 	if (OP_IS_STORE(type) && !(info->type & HW_BRK_TYPE_WRITE))
++ 		return false;
+++>>>>>>> 74c6881019b7 (powerpc/watchpoint: Prepare handler to handle more than one watchpoint)
+  
+- 	if (!ret && (type == LARX || type == STCX)) {
+- 		printk_ratelimited("Breakpoint hit on instruction that can't be emulated."
+- 				   " Breakpoint at 0x%lx will be disabled.\n", addr);
+- 		goto disable;
+- 	}
++ 	if (is_kernel_addr(regs->nip) && !(info->type & HW_BRK_TYPE_KERNEL))
++ 		return false;
++ 
++ 	if (user_mode(regs) && !(info->type & HW_BRK_TYPE_USER))
++ 		return false;
++ 
++ 	return true;
++ }
++ 
++ /*
++  * Return true if the event is valid wrt dawr configuration,
++  * including extraneous exception. Otherwise return false.
++  */
++ static bool check_constraints(struct pt_regs *regs, struct ppc_inst instr,
++ 			      int type, int size, struct arch_hw_breakpoint *info)
++ {
++ 	bool in_user_range = dar_in_user_range(regs->dar, info);
++ 	bool dawrx_constraints;
+  
+  	/*
+- 	 * If it's extraneous event, we still need to emulate/single-
+- 	 * step the instruction, but we don't generate an event.
++ 	 * 8xx supports only one breakpoint and thus we can
++ 	 * unconditionally return true.
+  	 */
+- 	if (size && !dar_range_overlaps(regs->dar, size, info))
+- 		info->type |= HW_BRK_TYPE_EXTRANEOUS_IRQ;
++ 	if (IS_ENABLED(CONFIG_PPC_8xx)) {
++ 		if (!in_user_range)
++ 			info->type |= HW_BRK_TYPE_EXTRANEOUS_IRQ;
++ 		return true;
++ 	}
+  
+- 	/* Do not emulate user-space instructions, instead single-step them */
+- 	if (user_mode(regs)) {
+- 		current->thread.last_hit_ubp = bp;
+- 		regs->msr |= MSR_SE;
++ 	if (unlikely(ppc_inst_equal(instr, ppc_inst(0)))) {
++ 		if (in_user_range)
++ 			return true;
++ 
++ 		if (dar_in_hw_range(regs->dar, info)) {
++ 			info->type |= HW_BRK_TYPE_EXTRANEOUS_IRQ;
++ 			return true;
++ 		}
+  		return false;
+  	}
+  
+@@@ -328,10 -541,20 +540,24 @@@ int hw_breakpoint_handler(struct die_ar
+  	 * As a policy, the callback is invoked in a 'trigger-after-execute'
+  	 * fashion
+  	 */
+- 	if (!(info->type & HW_BRK_TYPE_EXTRANEOUS_IRQ))
+- 		perf_bp_event(bp, regs);
++ 	for (i = 0; i < nr_wp_slots(); i++) {
++ 		if (!hit[i])
++ 			continue;
++ 		if (!(info[i]->type & HW_BRK_TYPE_EXTRANEOUS_IRQ))
++ 			perf_bp_event(bp[i], regs);
++ 	}
+  
++ reset:
++ 	for (i = 0; i < nr_wp_slots(); i++) {
++ 		if (!info[i])
++ 			continue;
++ 		__set_breakpoint(i, info[i]);
++ 	}
++ 
+++<<<<<<< HEAD
+ +	__set_breakpoint(info);
+++=======
+++>>>>>>> 74c6881019b7 (powerpc/watchpoint: Prepare handler to handle more than one watchpoint)
+  out:
+  	rcu_read_unlock();
+  	return rc;
+@@@ -352,20 -576,36 +579,48 @@@ static int single_step_dabr_instruction
+  	 * Check if we are single-stepping as a result of a
+  	 * previous HW Breakpoint exception
+  	 */
+- 	if (!bp)
++ 	for (i = 0; i < nr_wp_slots(); i++) {
++ 		bp = current->thread.last_hit_ubp[i];
++ 
++ 		if (!bp)
++ 			continue;
++ 
++ 		found = true;
++ 		info = counter_arch_bp(bp);
++ 
++ 		/*
++ 		 * We shall invoke the user-defined callback function in the
++ 		 * single stepping handler to confirm to 'trigger-after-execute'
++ 		 * semantics
++ 		 */
++ 		if (!(info->type & HW_BRK_TYPE_EXTRANEOUS_IRQ))
++ 			perf_bp_event(bp, regs);
++ 		current->thread.last_hit_ubp[i] = NULL;
++ 	}
++ 
++ 	if (!found)
+  		return NOTIFY_DONE;
+  
+- 	info = counter_arch_bp(bp);
++ 	for (i = 0; i < nr_wp_slots(); i++) {
++ 		bp = __this_cpu_read(bp_per_reg[i]);
++ 		if (!bp)
++ 			continue;
+  
+++<<<<<<< HEAD
+ +	/*
+ +	 * We shall invoke the user-defined callback function in the single
+ +	 * stepping handler to confirm to 'trigger-after-execute' semantics
+ +	 */
+ +	if (!(info->type & HW_BRK_TYPE_EXTRANEOUS_IRQ))
+ +		perf_bp_event(bp, regs);
+ +
+ +	__set_breakpoint(info);
+ +	current->thread.last_hit_ubp = NULL;
+++=======
++ 		info = counter_arch_bp(bp);
++ 		__set_breakpoint(i, info);
++ 	}
+++>>>>>>> 74c6881019b7 (powerpc/watchpoint: Prepare handler to handle more than one watchpoint)
+  
+  	/*
+  	 * If the process was being single-stepped by ptrace, let the
+diff --git a/arch/powerpc/include/asm/processor.h b/arch/powerpc/include/asm/processor.h
+index 8a9d505a7540..563311e32a8b 100644
+--- a/arch/powerpc/include/asm/processor.h
++++ b/arch/powerpc/include/asm/processor.h
+@@ -181,7 +181,7 @@ struct thread_struct {
+ 	 * Helps identify source of single-step exception and subsequent
+ 	 * hw-breakpoint enablement
+ 	 */
+-	struct perf_event *last_hit_ubp;
++	struct perf_event *last_hit_ubp[HBP_NUM_MAX];
+ #endif /* CONFIG_HAVE_HW_BREAKPOINT */
+ 	struct arch_hw_breakpoint hw_brk; /* info on the hardware breakpoint */
+ 	unsigned long	trap_nr;	/* last trap # on this thread */
+diff --git a/arch/powerpc/include/asm/sstep.h b/arch/powerpc/include/asm/sstep.h
+index 5df5fa2eeb53..eccde0371b27 100644
+--- a/arch/powerpc/include/asm/sstep.h
++++ b/arch/powerpc/include/asm/sstep.h
+@@ -52,6 +52,8 @@ enum instruction_type {
+ 
+ #define INSTR_TYPE_MASK	0x1f
+ 
++#define OP_IS_LOAD(type)	((LOAD <= (type) && (type) <= LOAD_VSX) || (type) == LARX)
++#define OP_IS_STORE(type)	((STORE <= (type) && (type) <= STORE_VSX) || (type) == STCX)
+ #define OP_IS_LOAD_STORE(type)	(LOAD <= (type) && (type) <= STCX)
+ 
+ /* Compute flags, ORed in with type */
+* Unmerged path arch/powerpc/kernel/hw_breakpoint.c
+diff --git a/arch/powerpc/kernel/process.c b/arch/powerpc/kernel/process.c
+index 6ca2453dede4..6834b5cdeade 100644
+--- a/arch/powerpc/kernel/process.c
++++ b/arch/powerpc/kernel/process.c
+@@ -617,9 +617,6 @@ void do_break (struct pt_regs *regs, unsigned long address,
+ 	if (debugger_break_match(regs))
+ 		return;
+ 
+-	/* Clear the breakpoint */
+-	hw_breakpoint_disable();
+-
+ 	/* Deliver the signal to userspace */
+ 	force_sig_fault(SIGTRAP, TRAP_HWBKPT, (void __user *)address, current);
+ }
