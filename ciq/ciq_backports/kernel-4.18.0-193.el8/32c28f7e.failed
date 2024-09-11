@@ -1,0 +1,218 @@
+page_pool: add tracepoints for page_pool with details need by XDP
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-193.el8
+commit-author Jesper Dangaard Brouer <brouer@redhat.com>
+commit 32c28f7e413981c7dd4a3ad9bbb1151e4b654261
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-193.el8/32c28f7e.failed
+
+The xdp tracepoints for mem id disconnect don't carry information about, why
+it was not safe_to_remove.  The tracepoint page_pool:page_pool_inflight in
+this patch can be used for extract this info for further debugging.
+
+This patchset also adds tracepoint for the pages_state_* release/hold
+transitions, including a pointer to the page.  This can be used for stats
+about in-flight pages, or used to debug page leakage via keeping track of
+page pointer and combining this with kprobe for __put_page().
+
+	Signed-off-by: Jesper Dangaard Brouer <brouer@redhat.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 32c28f7e413981c7dd4a3ad9bbb1151e4b654261)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/core/net-traces.c
+#	net/core/page_pool.c
+diff --cc net/core/net-traces.c
+index 419af6dfe29f,283ddb2dbc7d..000000000000
+--- a/net/core/net-traces.c
++++ b/net/core/net-traces.c
+@@@ -43,6 -43,18 +43,21 @@@ EXPORT_TRACEPOINT_SYMBOL_GPL(fdb_delete
+  EXPORT_TRACEPOINT_SYMBOL_GPL(br_fdb_update);
+  #endif
+  
+++<<<<<<< HEAD
+++=======
++ #if IS_ENABLED(CONFIG_PAGE_POOL)
++ #include <trace/events/page_pool.h>
++ #endif
++ 
++ #include <trace/events/neigh.h>
++ EXPORT_TRACEPOINT_SYMBOL_GPL(neigh_update);
++ EXPORT_TRACEPOINT_SYMBOL_GPL(neigh_update_done);
++ EXPORT_TRACEPOINT_SYMBOL_GPL(neigh_timer_handler);
++ EXPORT_TRACEPOINT_SYMBOL_GPL(neigh_event_send_done);
++ EXPORT_TRACEPOINT_SYMBOL_GPL(neigh_event_send_dead);
++ EXPORT_TRACEPOINT_SYMBOL_GPL(neigh_cleanup_and_release);
++ 
+++>>>>>>> 32c28f7e4139 (page_pool: add tracepoints for page_pool with details need by XDP)
+  EXPORT_TRACEPOINT_SYMBOL_GPL(kfree_skb);
+  
+  EXPORT_TRACEPOINT_SYMBOL_GPL(napi_poll);
+diff --cc net/core/page_pool.c
+index 41391b5dc14c,f55ab055d543..000000000000
+--- a/net/core/page_pool.c
++++ b/net/core/page_pool.c
+@@@ -151,6 -156,11 +154,14 @@@ static struct page *__page_pool_alloc_p
+  	page->dma_addr = dma;
+  
+  skip_dma_map:
+++<<<<<<< HEAD
+++=======
++ 	/* Track how many pages are held 'in-flight' */
++ 	pool->pages_state_hold_cnt++;
++ 
++ 	trace_page_pool_state_hold(pool, page, pool->pages_state_hold_cnt);
++ 
+++>>>>>>> 32c28f7e4139 (page_pool: add tracepoints for page_pool with details need by XDP)
+  	/* When page just alloc'ed is should/must have refcnt 1. */
+  	return page;
+  }
+@@@ -173,6 -183,33 +184,36 @@@ struct page *page_pool_alloc_pages(stru
+  }
+  EXPORT_SYMBOL(page_pool_alloc_pages);
+  
+++<<<<<<< HEAD
+++=======
++ /* Calculate distance between two u32 values, valid if distance is below 2^(31)
++  *  https://en.wikipedia.org/wiki/Serial_number_arithmetic#General_Solution
++  */
++ #define _distance(a, b)	(s32)((a) - (b))
++ 
++ static s32 page_pool_inflight(struct page_pool *pool)
++ {
++ 	u32 release_cnt = atomic_read(&pool->pages_state_release_cnt);
++ 	u32 hold_cnt = READ_ONCE(pool->pages_state_hold_cnt);
++ 	s32 distance;
++ 
++ 	distance = _distance(hold_cnt, release_cnt);
++ 
++ 	trace_page_pool_inflight(pool, distance, hold_cnt, release_cnt);
++ 	return distance;
++ }
++ 
++ static bool __page_pool_safe_to_destroy(struct page_pool *pool)
++ {
++ 	s32 inflight = page_pool_inflight(pool);
++ 
++ 	/* The distance should not be able to become negative */
++ 	WARN(inflight < 0, "Negative(%d) inflight packet-pages", inflight);
++ 
++ 	return (inflight == 0);
++ }
++ 
+++>>>>>>> 32c28f7e4139 (page_pool: add tracepoints for page_pool with details need by XDP)
+  /* Cleanup page_pool state from page */
+  static void __page_pool_clean_page(struct page_pool *pool,
+  				   struct page *page)
+@@@ -188,6 -225,10 +229,13 @@@
+  			     PAGE_SIZE << pool->p.order, pool->p.dma_dir,
+  			     DMA_ATTR_SKIP_CPU_SYNC);
+  	page->dma_addr = 0;
+++<<<<<<< HEAD
+++=======
++ skip_dma_unmap:
++ 	atomic_inc(&pool->pages_state_release_cnt);
++ 	trace_page_pool_state_release(pool, page,
++ 			      atomic_read(&pool->pages_state_release_cnt));
+++>>>>>>> 32c28f7e4139 (page_pool: add tracepoints for page_pool with details need by XDP)
+  }
+  
+  /* unmap the page and clean our state */
+diff --git a/include/trace/events/page_pool.h b/include/trace/events/page_pool.h
+new file mode 100644
+index 000000000000..47b5ee880aa9
+--- /dev/null
++++ b/include/trace/events/page_pool.h
+@@ -0,0 +1,87 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++#undef TRACE_SYSTEM
++#define TRACE_SYSTEM page_pool
++
++#if !defined(_TRACE_PAGE_POOL_H) || defined(TRACE_HEADER_MULTI_READ)
++#define      _TRACE_PAGE_POOL_H
++
++#include <linux/types.h>
++#include <linux/tracepoint.h>
++
++#include <net/page_pool.h>
++
++TRACE_EVENT(page_pool_inflight,
++
++	TP_PROTO(const struct page_pool *pool,
++		 s32 inflight, u32 hold, u32 release),
++
++	TP_ARGS(pool, inflight, hold, release),
++
++	TP_STRUCT__entry(
++		__field(const struct page_pool *, pool)
++		__field(s32,	inflight)
++		__field(u32,	hold)
++		__field(u32,	release)
++	),
++
++	TP_fast_assign(
++		__entry->pool		= pool;
++		__entry->inflight	= inflight;
++		__entry->hold		= hold;
++		__entry->release	= release;
++	),
++
++	TP_printk("page_pool=%p inflight=%d hold=%u release=%u",
++	  __entry->pool, __entry->inflight, __entry->hold, __entry->release)
++);
++
++TRACE_EVENT(page_pool_state_release,
++
++	TP_PROTO(const struct page_pool *pool,
++		 const struct page *page, u32 release),
++
++	TP_ARGS(pool, page, release),
++
++	TP_STRUCT__entry(
++		__field(const struct page_pool *,	pool)
++		__field(const struct page *,		page)
++		__field(u32,				release)
++	),
++
++	TP_fast_assign(
++		__entry->pool		= pool;
++		__entry->page		= page;
++		__entry->release	= release;
++	),
++
++	TP_printk("page_pool=%p page=%p release=%u",
++		  __entry->pool, __entry->page, __entry->release)
++);
++
++TRACE_EVENT(page_pool_state_hold,
++
++	TP_PROTO(const struct page_pool *pool,
++		 const struct page *page, u32 hold),
++
++	TP_ARGS(pool, page, hold),
++
++	TP_STRUCT__entry(
++		__field(const struct page_pool *,	pool)
++		__field(const struct page *,		page)
++		__field(u32,				hold)
++	),
++
++	TP_fast_assign(
++		__entry->pool	= pool;
++		__entry->page	= page;
++		__entry->hold	= hold;
++	),
++
++	TP_printk("page_pool=%p page=%p hold=%u",
++		  __entry->pool, __entry->page, __entry->hold)
++);
++
++#endif /* _TRACE_PAGE_POOL_H */
++
++/* This part must be outside protection */
++#include <trace/define_trace.h>
+* Unmerged path net/core/net-traces.c
+* Unmerged path net/core/page_pool.c
