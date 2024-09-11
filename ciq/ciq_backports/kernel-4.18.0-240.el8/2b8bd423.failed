@@ -1,0 +1,169 @@
+block/diskstats: more accurate approximation of io_ticks for slow disks
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Konstantin Khlebnikov <khlebnikov@yandex-team.ru>
+commit 2b8bd423614c595540eaadcfbc702afe8e155e50
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/2b8bd423.failed
+
+Currently io_ticks is approximated by adding one at each start and end of
+requests if jiffies counter has changed. This works perfectly for requests
+shorter than a jiffy or if one of requests starts/ends at each jiffy.
+
+If disk executes just one request at a time and they are longer than two
+jiffies then only first and last jiffies will be accounted.
+
+Fix is simple: at the end of request add up into io_ticks jiffies passed
+since last update rather than just one jiffy.
+
+Example: common HDD executes random read 4k requests around 12ms.
+
+fio --name=test --filename=/dev/sdb --rw=randread --direct=1 --runtime=30 &
+iostat -x 10 sdb
+
+Note changes of iostat's "%util" 8,43% -> 99,99% before/after patch:
+
+Before:
+
+Device:         rrqm/s   wrqm/s     r/s     w/s    rkB/s    wkB/s avgrq-sz avgqu-sz   await r_await w_await  svctm  %util
+sdb               0,00     0,00   82,60    0,00   330,40     0,00     8,00     0,96   12,09   12,09    0,00   1,02   8,43
+
+After:
+
+Device:         rrqm/s   wrqm/s     r/s     w/s    rkB/s    wkB/s avgrq-sz avgqu-sz   await r_await w_await  svctm  %util
+sdb               0,00     0,00   82,50    0,00   330,00     0,00     8,00     1,00   12,10   12,10    0,00  12,12  99,99
+
+Now io_ticks does not loose time between start and end of requests, but
+for queue-depth > 1 some I/O time between adjacent starts might be lost.
+
+For load estimation "%util" is not as useful as average queue length,
+but it clearly shows how often disk queue is completely empty.
+
+Fixes: 5b18b5a73760 ("block: delete part_round_stats and switch to less precise counting")
+	Signed-off-by: Konstantin Khlebnikov <khlebnikov@yandex-team.ru>
+	Reviewed-by: Ming Lei <ming.lei@redhat.com>
+	Signed-off-by: Jens Axboe <axboe@kernel.dk>
+(cherry picked from commit 2b8bd423614c595540eaadcfbc702afe8e155e50)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	Documentation/iostats.txt
+#	include/linux/genhd.h
+diff --cc Documentation/iostats.txt
+index 49df45f90e8a,9b14b0c2c9c4..000000000000
+--- a/Documentation/iostats.txt
++++ b/Documentation/iostats.txt
+@@@ -94,10 -95,14 +94,18 @@@ Field  9 -- # of I/Os currently in prog
+      The only field that should go to zero. Incremented as requests are
+      given to appropriate struct request_queue and decremented as they finish.
+  
+ -Field 10 -- # of milliseconds spent doing I/Os (unsigned int)
+ +Field 10 -- # of milliseconds spent doing I/Os
+      This field increases so long as field 9 is nonzero.
+  
+++<<<<<<< HEAD:Documentation/iostats.txt
+ +Field 11 -- weighted # of milliseconds spent doing I/Os
+++=======
++     Since 5.0 this field counts jiffies when at least one request was
++     started or completed. If request runs more than 2 jiffies then some
++     I/O time might be not accounted in case of concurrent requests.
++ 
++ Field 11 -- weighted # of milliseconds spent doing I/Os (unsigned int)
+++>>>>>>> 2b8bd423614c (block/diskstats: more accurate approximation of io_ticks for slow disks):Documentation/admin-guide/iostats.rst
+      This field is incremented at each I/O start, I/O completion, I/O
+      merge, or read of these stats by the number of I/Os in progress
+      (field 9) times the number of milliseconds spent doing I/O since the
+diff --cc include/linux/genhd.h
+index a76addf2f79d,13bb51f37b3f..000000000000
+--- a/include/linux/genhd.h
++++ b/include/linux/genhd.h
+@@@ -413,20 -422,7 +413,24 @@@ void part_dec_in_flight(struct request_
+  void part_inc_in_flight(struct request_queue *q, struct hd_struct *part,
+  			int rw);
+  
+++<<<<<<< HEAD
+ +static inline struct partition_meta_info *alloc_part_info(struct gendisk *disk)
+ +{
+ +	if (disk)
+ +		return kzalloc_node(sizeof(struct partition_meta_info),
+ +				    GFP_KERNEL, disk->node_id);
+ +	return kzalloc(sizeof(struct partition_meta_info), GFP_KERNEL);
+ +}
+ +
+ +static inline void free_part_info(struct hd_struct *part)
+ +{
+ +	kfree(part->info);
+ +}
+ +
+ +void update_io_ticks(struct hd_struct *part, unsigned long now);
+++=======
++ void update_io_ticks(struct hd_struct *part, unsigned long now, bool end);
+++>>>>>>> 2b8bd423614c (block/diskstats: more accurate approximation of io_ticks for slow disks)
+  
+  /* block/genhd.c */
+  extern void device_add_disk(struct device *parent, struct gendisk *disk,
+* Unmerged path Documentation/iostats.txt
+diff --git a/block/bio.c b/block/bio.c
+index 5073519c09c0..020b8073ccb7 100644
+--- a/block/bio.c
++++ b/block/bio.c
+@@ -1757,14 +1757,14 @@ void bio_check_pages_dirty(struct bio *bio)
+ }
+ EXPORT_SYMBOL_GPL(bio_check_pages_dirty);
+ 
+-void update_io_ticks(struct hd_struct *part, unsigned long now)
++void update_io_ticks(struct hd_struct *part, unsigned long now, bool end)
+ {
+ 	unsigned long stamp;
+ again:
+ 	stamp = READ_ONCE(part->stamp);
+ 	if (unlikely(stamp != now)) {
+ 		if (likely(cmpxchg(&part->stamp, stamp, now) == stamp)) {
+-			__part_stat_add(part, io_ticks, 1);
++			__part_stat_add(part, io_ticks, end ? now - stamp : 1);
+ 		}
+ 	}
+ 	if (part->partno) {
+@@ -1780,7 +1780,7 @@ void generic_start_io_acct(struct request_queue *q, int op,
+ 
+ 	part_stat_lock();
+ 
+-	update_io_ticks(part, jiffies);
++	update_io_ticks(part, jiffies, false);
+ 	part_stat_inc(part, ios[sgrp]);
+ 	part_stat_add(part, sectors[sgrp], sectors);
+ 	part_inc_in_flight(q, part, op_is_write(op));
+@@ -1798,7 +1798,7 @@ void generic_end_io_acct(struct request_queue *q, int req_op,
+ 
+ 	part_stat_lock();
+ 
+-	update_io_ticks(part, now);
++	update_io_ticks(part, now, true);
+ 	part_stat_add(part, nsecs[sgrp], jiffies_to_nsecs(duration));
+ 	part_stat_add(part, time_in_queue, duration);
+ 	part_dec_in_flight(q, part, op_is_write(req_op));
+diff --git a/block/blk-core.c b/block/blk-core.c
+index 95b8bc9a1350..9fca8f433d4d 100644
+--- a/block/blk-core.c
++++ b/block/blk-core.c
+@@ -1307,7 +1307,7 @@ void blk_account_io_done(struct request *req, u64 now)
+ 		part_stat_lock();
+ 		part = req->part;
+ 
+-		update_io_ticks(part, jiffies);
++		update_io_ticks(part, jiffies, true);
+ 		part_stat_inc(part, ios[sgrp]);
+ 		part_stat_add(part, nsecs[sgrp], now - req->start_time_ns);
+ 		part_stat_add(part, time_in_queue, nsecs_to_jiffies64(now - req->start_time_ns));
+@@ -1349,7 +1349,7 @@ void blk_account_io_start(struct request *rq, bool new_io)
+ 		rq->part = part;
+ 	}
+ 
+-	update_io_ticks(part, jiffies);
++	update_io_ticks(part, jiffies, false);
+ 
+ 	part_stat_unlock();
+ }
+* Unmerged path include/linux/genhd.h
