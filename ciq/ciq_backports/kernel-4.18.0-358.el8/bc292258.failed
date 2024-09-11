@@ -1,0 +1,157 @@
+Bluetooth: Add support for reading security information
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-358.el8
+commit-author Marcel Holtmann <marcel@holtmann.org>
+commit bc292258c580a82c9baef0a64f66971e010a40a9
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-358.el8/bc292258.failed
+
+To allow userspace to make correcty security policy decision, the kernel
+needs to export a few details of the supported security features and
+encryption key size information. This command exports this information
+and also allows future extensions if needed.
+
+	Signed-off-by: Marcel Holtmann <marcel@holtmann.org>
+	Reviewed-by: Alain Michaud <alainm@chromium.org>
+	Signed-off-by: Johan Hedberg <johan.hedberg@intel.com>
+(cherry picked from commit bc292258c580a82c9baef0a64f66971e010a40a9)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/net/bluetooth/mgmt.h
+#	net/bluetooth/mgmt.c
+diff --cc include/net/bluetooth/mgmt.h
+index 79792be43000,65dd6fd1fff3..000000000000
+--- a/include/net/bluetooth/mgmt.h
++++ b/include/net/bluetooth/mgmt.h
+@@@ -674,6 -672,15 +674,18 @@@ struct mgmt_cp_set_blocked_keys 
+  } __packed;
+  #define MGMT_OP_SET_BLOCKED_KEYS_SIZE 2
+  
+++<<<<<<< HEAD
+++=======
++ #define MGMT_OP_SET_WIDEBAND_SPEECH	0x0047
++ 
++ #define MGMT_OP_READ_SECURITY_INFO	0x0048
++ #define MGMT_READ_SECURITY_INFO_SIZE	0
++ struct mgmt_rp_read_security_info {
++ 	__le16   sec_len;
++ 	__u8     sec[0];
++ } __packed;
++ 
+++>>>>>>> bc292258c580 (Bluetooth: Add support for reading security information)
+  #define MGMT_EV_CMD_COMPLETE		0x0001
+  struct mgmt_ev_cmd_complete {
+  	__le16	opcode;
+diff --cc net/bluetooth/mgmt.c
+index a847ad7b38ed,7b9eac339c87..000000000000
+--- a/net/bluetooth/mgmt.c
++++ b/net/bluetooth/mgmt.c
+@@@ -3610,53 -3661,53 +3612,103 @@@ unlock
+  	return err;
+  }
+  
+++<<<<<<< HEAD
+ +static int set_blocked_keys(struct sock *sk, struct hci_dev *hdev, void *data,
+ +			    u16 len)
+ +{
+ +	int err = MGMT_STATUS_SUCCESS;
+ +	struct mgmt_cp_set_blocked_keys *keys = data;
+ +	const u16 max_key_count = ((U16_MAX - sizeof(*keys)) /
+ +				   sizeof(struct mgmt_blocked_key_info));
+ +	u16 key_count, expected_len;
+ +	int i;
+ +
+ +	BT_DBG("request for %s", hdev->name);
+ +
+ +	key_count = __le16_to_cpu(keys->key_count);
+ +	if (key_count > max_key_count) {
+ +		bt_dev_err(hdev, "too big key_count value %u", key_count);
+ +		return mgmt_cmd_status(sk, hdev->id, MGMT_OP_SET_BLOCKED_KEYS,
+ +				       MGMT_STATUS_INVALID_PARAMS);
+ +	}
+ +
+ +	expected_len = struct_size(keys, keys, key_count);
+ +	if (expected_len != len) {
+ +		bt_dev_err(hdev, "expected %u bytes, got %u bytes",
+ +			   expected_len, len);
+ +		return mgmt_cmd_status(sk, hdev->id, MGMT_OP_SET_BLOCKED_KEYS,
+ +				       MGMT_STATUS_INVALID_PARAMS);
+ +	}
+ +
+ +	hci_dev_lock(hdev);
+ +
+ +	hci_blocked_keys_clear(hdev);
+ +
+ +	for (i = 0; i < keys->key_count; ++i) {
+ +		struct blocked_key *b = kzalloc(sizeof(*b), GFP_KERNEL);
+ +
+ +		if (!b) {
+ +			err = MGMT_STATUS_NO_RESOURCES;
+ +			break;
+ +		}
+ +
+ +		b->type = keys->keys[i].type;
+ +		memcpy(b->val, keys->keys[i].val, sizeof(b->val));
+ +		list_add_rcu(&b->list, &hdev->blocked_keys);
+ +	}
+ +	hci_dev_unlock(hdev);
+ +
+ +	return mgmt_cmd_complete(sk, hdev->id, MGMT_OP_SET_BLOCKED_KEYS,
+ +				err, NULL, 0);
+++=======
++ static int read_security_info(struct sock *sk, struct hci_dev *hdev,
++ 			      void *data, u16 data_len)
++ {
++ 	char buf[16];
++ 	struct mgmt_rp_read_security_info *rp = (void *)buf;
++ 	u16 sec_len = 0;
++ 	u8 flags = 0;
++ 
++ 	bt_dev_dbg(hdev, "sock %p", sk);
++ 
++ 	memset(&buf, 0, sizeof(buf));
++ 
++ 	hci_dev_lock(hdev);
++ 
++ 	/* When the Read Simple Pairing Options command is supported, then
++ 	 * the remote public key validation is supported.
++ 	 */
++ 	if (hdev->commands[41] & 0x08)
++ 		flags |= 0x01;	/* Remote public key validation (BR/EDR) */
++ 
++ 	flags |= 0x02;		/* Remote public key validation (LE) */
++ 
++ 	/* When the Read Encryption Key Size command is supported, then the
++ 	 * encryption key size is enforced.
++ 	 */
++ 	if (hdev->commands[20] & 0x10)
++ 		flags |= 0x04;	/* Encryption key size enforcement (BR/EDR) */
++ 
++ 	flags |= 0x08;		/* Encryption key size enforcement (LE) */
++ 
++ 	sec_len = eir_append_data(rp->sec, sec_len, 0x01, &flags, 1);
++ 
++ 	/* When the Read Simple Pairing Options command is supported, then
++ 	 * also max encryption key size information is provided.
++ 	 */
++ 	if (hdev->commands[41] & 0x08)
++ 		sec_len = eir_append_le16(rp->sec, sec_len, 0x02,
++ 					  hdev->max_enc_key_size);
++ 
++ 	sec_len = eir_append_le16(rp->sec, sec_len, 0x03, SMP_MAX_ENC_KEY_SIZE);
++ 
++ 	rp->sec_len = cpu_to_le16(sec_len);
++ 
++ 	hci_dev_unlock(hdev);
++ 
++ 	return mgmt_cmd_complete(sk, hdev->id, MGMT_OP_READ_SECURITY_INFO, 0,
++ 				 rp, sizeof(*rp) + sec_len);
+++>>>>>>> bc292258c580 (Bluetooth: Add support for reading security information)
+  }
+  
+  static void read_local_oob_data_complete(struct hci_dev *hdev, u8 status,
+* Unmerged path include/net/bluetooth/mgmt.h
+* Unmerged path net/bluetooth/mgmt.c
