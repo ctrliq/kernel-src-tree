@@ -1,0 +1,123 @@
+ASoC: soc-link: add mark for snd_soc_link_startup/shutdown()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+Rebuild_CHGLOG: - [sound] ALSA: ASoC: soc-link: add mark for snd_soc_link_startup/shutdown() (Jaroslav Kysela) [1783462]
+Rebuild_FUZZ: 95.24%
+commit-author Kuninori Morimoto <kuninori.morimoto.gx@renesas.com>
+commit 6064ed73cd2405d13c252b190ac64c03ab40e4b9
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/6064ed73.failed
+
+soc_pcm_open() does rollback when failed (A),
+but, it is almost same as soc_pcm_close().
+
+	static int soc_pcm_open(xxx)
+	{
+		...
+		if (ret < 0)
+			goto xxx_err;
+		...
+		return 0;
+
+ ^	config_err:
+ |		...
+ |	rtd_startup_err:
+(A)		...
+ |	component_err:
+ |		...
+ v		return ret;
+	}
+
+The difference is
+soc_pcm_close() is for all dai/component/substream,
+rollback        is for succeeded part only.
+
+This kind of duplicated code can be a hotbed of bugs,
+thus, we want to share soc_pcm_close() and rollback.
+
+Now, soc_pcm_open/close() are handling
+	1) snd_soc_dai_startup/shutdown()
+=>	2) snd_soc_link_startup/shutdown()
+	3) snd_soc_component_module_get/put()
+	4) snd_soc_component_open/close()
+	5) pm_runtime_put/get()
+
+This patch is for 2) snd_soc_link_startup/shutdown().
+
+The idea of having bit-flag or counter is not enough for this purpose.
+For example if one DAI is used for 2xPlaybacks for some reasons,
+and if 1st Playback was succeeded but 2nd Playback was failed,
+2nd Playback rollback doesn't need to call shutdown.
+But it has succeeded bit-flag or counter via 1st Playback,
+thus, 2nd Playback rollback will call unneeded shutdown.
+And 1st Playback's necessary shutdown will not be called,
+because bit-flag or counter was cleared by wrong 2nd Playback rollback.
+
+To avoid such case, this patch marks substream pointer when startup() was
+succeeded. If rollback needed, it will check rollback flag and marked
+substream pointer.
+
+One note here is that it cares *current* startup() only now.
+but we might want to check *whole* marked substream in the future.
+This patch is using macro named "push/pop", so that it can be easily
+update.
+
+	Signed-off-by: Kuninori Morimoto <kuninori.morimoto.gx@renesas.com>
+Link: https://lore.kernel.org/r/87k0webwnv.wl-kuninori.morimoto.gx@renesas.com
+	Signed-off-by: Mark Brown <broonie@kernel.org>
+(cherry picked from commit 6064ed73cd2405d13c252b190ac64c03ab40e4b9)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/sound/soc-link.h
+#	sound/soc/soc-link.c
+#	sound/soc/soc-pcm.c
+diff --cc sound/soc/soc-pcm.c
+index 82d806ac486a,45c19643d8e3..000000000000
+--- a/sound/soc/soc-pcm.c
++++ b/sound/soc/soc-pcm.c
+@@@ -563,7 -684,7 +563,11 @@@ static int soc_pcm_close(struct snd_pcm
+  	for_each_rtd_dais(rtd, i, dai)
+  		snd_soc_dai_shutdown(dai, substream, 0);
+  
+++<<<<<<< HEAD
+ +	soc_rtd_shutdown(rtd, substream);
+++=======
++ 	snd_soc_link_shutdown(substream, 0);
+++>>>>>>> 6064ed73cd24 (ASoC: soc-link: add mark for snd_soc_link_startup/shutdown())
+  
+  	soc_pcm_components_close(substream);
+  
+@@@ -697,7 -815,7 +701,11 @@@ config_err
+  	for_each_rtd_dais_rollback(rtd, i, dai)
+  		snd_soc_dai_shutdown(dai, substream, 1);
+  
+++<<<<<<< HEAD
+ +	soc_rtd_shutdown(rtd, substream);
+++=======
++ 	snd_soc_link_shutdown(substream, 1);
+++>>>>>>> 6064ed73cd24 (ASoC: soc-link: add mark for snd_soc_link_startup/shutdown())
+  rtd_startup_err:
+  	soc_pcm_components_close(substream);
+  component_err:
+* Unmerged path include/sound/soc-link.h
+* Unmerged path sound/soc/soc-link.c
+* Unmerged path include/sound/soc-link.h
+diff --git a/include/sound/soc.h b/include/sound/soc.h
+index a662d4e3f02f..8c41628e9f18 100644
+--- a/include/sound/soc.h
++++ b/include/sound/soc.h
+@@ -1168,6 +1168,9 @@ struct snd_soc_pcm_runtime {
+ 	unsigned int num; /* 0-based and monotonic increasing */
+ 	struct list_head list; /* rtd list of the soc card */
+ 
++	/* function mark */
++	struct snd_pcm_substream *mark_startup;
++
+ 	/* bit field */
+ 	unsigned int pop_wait:1;
+ 	unsigned int fe_compr:1; /* for Dynamic PCM */
+* Unmerged path sound/soc/soc-link.c
+* Unmerged path sound/soc/soc-pcm.c
