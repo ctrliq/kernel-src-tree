@@ -1,0 +1,382 @@
+SUNRPC: Simplify TCP receive code by switching to using iterators
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-193.el8
+commit-author Trond Myklebust <trond.myklebust@hammerspace.com>
+commit 277e4ab7d530bf287e02b65cfcd3ea8f489784f6
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-193.el8/277e4ab7.failed
+
+Most of this code should also be reusable with other socket types.
+
+	Signed-off-by: Trond Myklebust <trond.myklebust@hammerspace.com>
+(cherry picked from commit 277e4ab7d530bf287e02b65cfcd3ea8f489784f6)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/sunrpc/xprtsock.c
+diff --cc net/sunrpc/xprtsock.c
+index b3c742fe8073,06aa75008708..000000000000
+--- a/net/sunrpc/xprtsock.c
++++ b/net/sunrpc/xprtsock.c
+@@@ -1173,263 -1480,7 +1496,224 @@@ static void xs_tcp_force_close(struct r
+  	xprt_force_disconnect(xprt);
+  }
+  
+++<<<<<<< HEAD
+ +static inline void xs_tcp_read_fraghdr(struct rpc_xprt *xprt, struct xdr_skb_reader *desc)
+ +{
+ +	struct sock_xprt *transport = container_of(xprt, struct sock_xprt, xprt);
+ +	size_t len, used;
+ +	char *p;
+ +
+ +	p = ((char *) &transport->recv.fraghdr) + transport->recv.offset;
+ +	len = sizeof(transport->recv.fraghdr) - transport->recv.offset;
+ +	used = xdr_skb_read_bits(desc, p, len);
+ +	transport->recv.offset += used;
+ +	if (used != len)
+ +		return;
+ +
+ +	transport->recv.len = ntohl(transport->recv.fraghdr);
+ +	if (transport->recv.len & RPC_LAST_STREAM_FRAGMENT)
+ +		transport->recv.flags |= TCP_RCV_LAST_FRAG;
+ +	else
+ +		transport->recv.flags &= ~TCP_RCV_LAST_FRAG;
+ +	transport->recv.len &= RPC_FRAGMENT_SIZE_MASK;
+ +
+ +	transport->recv.flags &= ~TCP_RCV_COPY_FRAGHDR;
+ +	transport->recv.offset = 0;
+ +
+ +	/* Sanity check of the record length */
+ +	if (unlikely(transport->recv.len < 8)) {
+ +		dprintk("RPC:       invalid TCP record fragment length\n");
+ +		xs_tcp_force_close(xprt);
+ +		return;
+ +	}
+ +	dprintk("RPC:       reading TCP record fragment of length %d\n",
+ +			transport->recv.len);
+ +}
+ +
+ +static void xs_tcp_check_fraghdr(struct sock_xprt *transport)
+ +{
+ +	if (transport->recv.offset == transport->recv.len) {
+ +		transport->recv.flags |= TCP_RCV_COPY_FRAGHDR;
+ +		transport->recv.offset = 0;
+ +		if (transport->recv.flags & TCP_RCV_LAST_FRAG) {
+ +			transport->recv.flags &= ~TCP_RCV_COPY_DATA;
+ +			transport->recv.flags |= TCP_RCV_COPY_XID;
+ +			transport->recv.copied = 0;
+ +		}
+ +	}
+ +}
+ +
+ +static inline void xs_tcp_read_xid(struct sock_xprt *transport, struct xdr_skb_reader *desc)
+ +{
+ +	size_t len, used;
+ +	char *p;
+ +
+ +	len = sizeof(transport->recv.xid) - transport->recv.offset;
+ +	dprintk("RPC:       reading XID (%zu bytes)\n", len);
+ +	p = ((char *) &transport->recv.xid) + transport->recv.offset;
+ +	used = xdr_skb_read_bits(desc, p, len);
+ +	transport->recv.offset += used;
+ +	if (used != len)
+ +		return;
+ +	transport->recv.flags &= ~TCP_RCV_COPY_XID;
+ +	transport->recv.flags |= TCP_RCV_READ_CALLDIR;
+ +	transport->recv.copied = 4;
+ +	dprintk("RPC:       reading %s XID %08x\n",
+ +			(transport->recv.flags & TCP_RPC_REPLY) ? "reply for"
+ +							      : "request with",
+ +			ntohl(transport->recv.xid));
+ +	xs_tcp_check_fraghdr(transport);
+ +}
+ +
+ +static inline void xs_tcp_read_calldir(struct sock_xprt *transport,
+ +				       struct xdr_skb_reader *desc)
+ +{
+ +	size_t len, used;
+ +	u32 offset;
+ +	char *p;
+ +
+ +	/*
+ +	 * We want transport->recv.offset to be 8 at the end of this routine
+ +	 * (4 bytes for the xid and 4 bytes for the call/reply flag).
+ +	 * When this function is called for the first time,
+ +	 * transport->recv.offset is 4 (after having already read the xid).
+ +	 */
+ +	offset = transport->recv.offset - sizeof(transport->recv.xid);
+ +	len = sizeof(transport->recv.calldir) - offset;
+ +	dprintk("RPC:       reading CALL/REPLY flag (%zu bytes)\n", len);
+ +	p = ((char *) &transport->recv.calldir) + offset;
+ +	used = xdr_skb_read_bits(desc, p, len);
+ +	transport->recv.offset += used;
+ +	if (used != len)
+ +		return;
+ +	transport->recv.flags &= ~TCP_RCV_READ_CALLDIR;
+ +	/*
+ +	 * We don't yet have the XDR buffer, so we will write the calldir
+ +	 * out after we get the buffer from the 'struct rpc_rqst'
+ +	 */
+ +	switch (ntohl(transport->recv.calldir)) {
+ +	case RPC_REPLY:
+ +		transport->recv.flags |= TCP_RCV_COPY_CALLDIR;
+ +		transport->recv.flags |= TCP_RCV_COPY_DATA;
+ +		transport->recv.flags |= TCP_RPC_REPLY;
+ +		break;
+ +	case RPC_CALL:
+ +		transport->recv.flags |= TCP_RCV_COPY_CALLDIR;
+ +		transport->recv.flags |= TCP_RCV_COPY_DATA;
+ +		transport->recv.flags &= ~TCP_RPC_REPLY;
+ +		break;
+ +	default:
+ +		dprintk("RPC:       invalid request message type\n");
+ +		xs_tcp_force_close(&transport->xprt);
+ +	}
+ +	xs_tcp_check_fraghdr(transport);
+ +}
+ +
+ +static inline void xs_tcp_read_common(struct rpc_xprt *xprt,
+ +				     struct xdr_skb_reader *desc,
+ +				     struct rpc_rqst *req)
+ +{
+ +	struct sock_xprt *transport =
+ +				container_of(xprt, struct sock_xprt, xprt);
+ +	struct xdr_buf *rcvbuf;
+ +	size_t len;
+ +	ssize_t r;
+ +
+ +	rcvbuf = &req->rq_private_buf;
+ +
+ +	if (transport->recv.flags & TCP_RCV_COPY_CALLDIR) {
+ +		/*
+ +		 * Save the RPC direction in the XDR buffer
+ +		 */
+ +		memcpy(rcvbuf->head[0].iov_base + transport->recv.copied,
+ +			&transport->recv.calldir,
+ +			sizeof(transport->recv.calldir));
+ +		transport->recv.copied += sizeof(transport->recv.calldir);
+ +		transport->recv.flags &= ~TCP_RCV_COPY_CALLDIR;
+ +	}
+ +
+ +	len = desc->count;
+ +	if (len > transport->recv.len - transport->recv.offset)
+ +		desc->count = transport->recv.len - transport->recv.offset;
+ +	r = xdr_partial_copy_from_skb(rcvbuf, transport->recv.copied,
+ +					  desc, xdr_skb_read_bits);
+ +
+ +	if (desc->count) {
+ +		/* Error when copying to the receive buffer,
+ +		 * usually because we weren't able to allocate
+ +		 * additional buffer pages. All we can do now
+ +		 * is turn off TCP_RCV_COPY_DATA, so the request
+ +		 * will not receive any additional updates,
+ +		 * and time out.
+ +		 * Any remaining data from this record will
+ +		 * be discarded.
+ +		 */
+ +		transport->recv.flags &= ~TCP_RCV_COPY_DATA;
+ +		dprintk("RPC:       XID %08x truncated request\n",
+ +				ntohl(transport->recv.xid));
+ +		dprintk("RPC:       xprt = %p, recv.copied = %lu, "
+ +				"recv.offset = %u, recv.len = %u\n",
+ +				xprt, transport->recv.copied,
+ +				transport->recv.offset, transport->recv.len);
+ +		return;
+ +	}
+ +
+ +	transport->recv.copied += r;
+ +	transport->recv.offset += r;
+ +	desc->count = len - r;
+ +
+ +	dprintk("RPC:       XID %08x read %zd bytes\n",
+ +			ntohl(transport->recv.xid), r);
+ +	dprintk("RPC:       xprt = %p, recv.copied = %lu, recv.offset = %u, "
+ +			"recv.len = %u\n", xprt, transport->recv.copied,
+ +			transport->recv.offset, transport->recv.len);
+ +
+ +	if (transport->recv.copied == req->rq_private_buf.buflen)
+ +		transport->recv.flags &= ~TCP_RCV_COPY_DATA;
+ +	else if (transport->recv.offset == transport->recv.len) {
+ +		if (transport->recv.flags & TCP_RCV_LAST_FRAG)
+ +			transport->recv.flags &= ~TCP_RCV_COPY_DATA;
+ +	}
+ +}
+ +
+ +/*
+ + * Finds the request corresponding to the RPC xid and invokes the common
+ + * tcp read code to read the data.
+ + */
+ +static inline int xs_tcp_read_reply(struct rpc_xprt *xprt,
+ +				    struct xdr_skb_reader *desc)
+ +{
+ +	struct sock_xprt *transport =
+ +				container_of(xprt, struct sock_xprt, xprt);
+ +	struct rpc_rqst *req;
+ +
+ +	dprintk("RPC:       read reply XID %08x\n", ntohl(transport->recv.xid));
+ +
+ +	/* Find and lock the request corresponding to this xid */
+ +	spin_lock(&xprt->recv_lock);
+ +	req = xprt_lookup_rqst(xprt, transport->recv.xid);
+ +	if (!req) {
+ +		dprintk("RPC:       XID %08x request not found!\n",
+ +				ntohl(transport->recv.xid));
+ +		spin_unlock(&xprt->recv_lock);
+ +		return -1;
+ +	}
+ +	xprt_pin_rqst(req);
+ +	spin_unlock(&xprt->recv_lock);
+ +
+ +	xs_tcp_read_common(xprt, desc, req);
+ +
+ +	spin_lock(&xprt->recv_lock);
+ +	if (!(transport->recv.flags & TCP_RCV_COPY_DATA))
+ +		xprt_complete_rqst(req->rq_task, transport->recv.copied);
+ +	xprt_unpin_rqst(req);
+ +	spin_unlock(&xprt->recv_lock);
+ +	return 0;
+ +}
+ +
+++=======
+++>>>>>>> 277e4ab7d530 (SUNRPC: Simplify TCP receive code by switching to using iterators)
+  #if defined(CONFIG_SUNRPC_BACKCHANNEL)
+- /*
+-  * Obtains an rpc_rqst previously allocated and invokes the common
+-  * tcp read code to read the data.  The result is placed in the callback
+-  * queue.
+-  * If we're unable to obtain the rpc_rqst we schedule the closing of the
+-  * connection and return -1.
+-  */
+- static int xs_tcp_read_callback(struct rpc_xprt *xprt,
+- 				       struct xdr_skb_reader *desc)
+- {
+- 	struct sock_xprt *transport =
+- 				container_of(xprt, struct sock_xprt, xprt);
+- 	struct rpc_rqst *req;
+- 
+- 	/* Look up the request corresponding to the given XID */
+- 	req = xprt_lookup_bc_request(xprt, transport->recv.xid);
+- 	if (req == NULL) {
+- 		printk(KERN_WARNING "Callback slot table overflowed\n");
+- 		xprt_force_disconnect(xprt);
+- 		return -1;
+- 	}
+- 
+- 	dprintk("RPC:       read callback  XID %08x\n", ntohl(req->rq_xid));
+- 	xs_tcp_read_common(xprt, desc, req);
+- 
+- 	if (!(transport->recv.flags & TCP_RCV_COPY_DATA))
+- 		xprt_complete_bc_request(req, transport->recv.copied);
+- 
+- 	return 0;
+- }
+- 
+- static inline int _xs_tcp_read_data(struct rpc_xprt *xprt,
+- 					struct xdr_skb_reader *desc)
+- {
+- 	struct sock_xprt *transport =
+- 				container_of(xprt, struct sock_xprt, xprt);
+- 
+- 	return (transport->recv.flags & TCP_RPC_REPLY) ?
+- 		xs_tcp_read_reply(xprt, desc) :
+- 		xs_tcp_read_callback(xprt, desc);
+- }
+- 
+  static int xs_tcp_bc_up(struct svc_serv *serv, struct net *net)
+  {
+  	int ret;
+diff --git a/include/linux/sunrpc/xprtsock.h b/include/linux/sunrpc/xprtsock.h
+index 005cfb6e7238..458bfe0137f5 100644
+--- a/include/linux/sunrpc/xprtsock.h
++++ b/include/linux/sunrpc/xprtsock.h
+@@ -31,15 +31,16 @@ struct sock_xprt {
+ 	 * State of TCP reply receive
+ 	 */
+ 	struct {
+-		__be32		fraghdr,
++		struct {
++			__be32	fraghdr,
+ 				xid,
+ 				calldir;
++		} __attribute__((packed));
+ 
+ 		u32		offset,
+ 				len;
+ 
+-		unsigned long	copied,
+-				flags;
++		unsigned long	copied;
+ 	} recv;
+ 
+ 	/*
+@@ -76,21 +77,9 @@ struct sock_xprt {
+ 	void			(*old_error_report)(struct sock *);
+ };
+ 
+-/*
+- * TCP receive state flags
+- */
+-#define TCP_RCV_LAST_FRAG	(1UL << 0)
+-#define TCP_RCV_COPY_FRAGHDR	(1UL << 1)
+-#define TCP_RCV_COPY_XID	(1UL << 2)
+-#define TCP_RCV_COPY_DATA	(1UL << 3)
+-#define TCP_RCV_READ_CALLDIR	(1UL << 4)
+-#define TCP_RCV_COPY_CALLDIR	(1UL << 5)
+-
+ /*
+  * TCP RPC flags
+  */
+-#define TCP_RPC_REPLY		(1UL << 6)
+-
+ #define XPRT_SOCK_CONNECTING	1U
+ #define XPRT_SOCK_DATA_READY	(2)
+ #define XPRT_SOCK_UPD_TIMEOUT	(3)
+diff --git a/include/trace/events/sunrpc.h b/include/trace/events/sunrpc.h
+index ebc5391bc56d..5341fed95e89 100644
+--- a/include/trace/events/sunrpc.h
++++ b/include/trace/events/sunrpc.h
+@@ -497,16 +497,6 @@ TRACE_EVENT(xs_tcp_data_ready,
+ 			__get_str(port), __entry->err, __entry->total)
+ );
+ 
+-#define rpc_show_sock_xprt_flags(flags) \
+-	__print_flags(flags, "|", \
+-		{ TCP_RCV_LAST_FRAG, "TCP_RCV_LAST_FRAG" }, \
+-		{ TCP_RCV_COPY_FRAGHDR, "TCP_RCV_COPY_FRAGHDR" }, \
+-		{ TCP_RCV_COPY_XID, "TCP_RCV_COPY_XID" }, \
+-		{ TCP_RCV_COPY_DATA, "TCP_RCV_COPY_DATA" }, \
+-		{ TCP_RCV_READ_CALLDIR, "TCP_RCV_READ_CALLDIR" }, \
+-		{ TCP_RCV_COPY_CALLDIR, "TCP_RCV_COPY_CALLDIR" }, \
+-		{ TCP_RPC_REPLY, "TCP_RPC_REPLY" })
+-
+ TRACE_EVENT(xs_tcp_data_recv,
+ 	TP_PROTO(struct sock_xprt *xs),
+ 
+@@ -516,7 +506,6 @@ TRACE_EVENT(xs_tcp_data_recv,
+ 		__string(addr, xs->xprt.address_strings[RPC_DISPLAY_ADDR])
+ 		__string(port, xs->xprt.address_strings[RPC_DISPLAY_PORT])
+ 		__field(u32, xid)
+-		__field(unsigned long, flags)
+ 		__field(unsigned long, copied)
+ 		__field(unsigned int, reclen)
+ 		__field(unsigned long, offset)
+@@ -526,15 +515,13 @@ TRACE_EVENT(xs_tcp_data_recv,
+ 		__assign_str(addr, xs->xprt.address_strings[RPC_DISPLAY_ADDR]);
+ 		__assign_str(port, xs->xprt.address_strings[RPC_DISPLAY_PORT]);
+ 		__entry->xid = be32_to_cpu(xs->recv.xid);
+-		__entry->flags = xs->recv.flags;
+ 		__entry->copied = xs->recv.copied;
+ 		__entry->reclen = xs->recv.len;
+ 		__entry->offset = xs->recv.offset;
+ 	),
+ 
+-	TP_printk("peer=[%s]:%s xid=0x%08x flags=%s copied=%lu reclen=%u offset=%lu",
++	TP_printk("peer=[%s]:%s xid=0x%08x copied=%lu reclen=%u offset=%lu",
+ 			__get_str(addr), __get_str(port), __entry->xid,
+-			rpc_show_sock_xprt_flags(__entry->flags),
+ 			__entry->copied, __entry->reclen, __entry->offset)
+ );
+ 
+* Unmerged path net/sunrpc/xprtsock.c
