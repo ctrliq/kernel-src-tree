@@ -1,0 +1,157 @@
+irqchip/gic-v3: Workaround Cavium erratum 38539 when reading GICD_TYPER2
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Marc Zyngier <maz@kernel.org>
+commit d01fd161e85904064290435f67f4ed59af5daf74
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/d01fd161.failed
+
+Despite the architecture spec requiring that reserved registers in the GIC
+distributor memory map are RES0 (and thus are not allowed to generate
+an exception), the Cavium ThunderX (aka TX1) SoC explodes as such:
+
+[    0.000000] GICv3: GIC: Using split EOI/Deactivate mode
+[    0.000000] GICv3: 128 SPIs implemented
+[    0.000000] GICv3: 0 Extended SPIs implemented
+[    0.000000] Internal error: synchronous external abort: 96000210 [#1] SMP
+[    0.000000] Modules linked in:
+[    0.000000] CPU: 0 PID: 0 Comm: swapper/0 Not tainted 5.4.0-rc4-00035-g3cf6a3d5725f #7956
+[    0.000000] Hardware name: cavium,thunder-88xx (DT)
+[    0.000000] pstate: 60000085 (nZCv daIf -PAN -UAO)
+[    0.000000] pc : __raw_readl+0x0/0x8
+[    0.000000] lr : gic_init_bases+0x110/0x560
+[    0.000000] sp : ffff800011243d90
+[    0.000000] x29: ffff800011243d90 x28: 0000000000000000
+[    0.000000] x27: 0000000000000018 x26: 0000000000000002
+[    0.000000] x25: ffff8000116f0000 x24: ffff000fbe6a2c80
+[    0.000000] x23: 0000000000000000 x22: ffff010fdc322b68
+[    0.000000] x21: ffff800010a7a208 x20: 00000000009b0404
+[    0.000000] x19: ffff80001124dad0 x18: 0000000000000010
+[    0.000000] x17: 000000004d8d492b x16: 00000000f67eb9af
+[    0.000000] x15: ffffffffffffffff x14: ffff800011249908
+[    0.000000] x13: ffff800091243ae7 x12: ffff800011243af4
+[    0.000000] x11: ffff80001126e000 x10: ffff800011243a70
+[    0.000000] x9 : 00000000ffffffd0 x8 : ffff80001069c828
+[    0.000000] x7 : 0000000000000059 x6 : ffff8000113fb4d1
+[    0.000000] x5 : 0000000000000001 x4 : 0000000000000000
+[    0.000000] x3 : 0000000000000000 x2 : 0000000000000000
+[    0.000000] x1 : 0000000000000000 x0 : ffff8000116f000c
+[    0.000000] Call trace:
+[    0.000000]  __raw_readl+0x0/0x8
+[    0.000000]  gic_of_init+0x188/0x224
+[    0.000000]  of_irq_init+0x200/0x3cc
+[    0.000000]  irqchip_init+0x1c/0x40
+[    0.000000]  init_IRQ+0x160/0x1d0
+[    0.000000]  start_kernel+0x2ec/0x4b8
+[    0.000000] Code: a8c47bfd d65f03c0 d538d080 d65f03c0 (b9400000)
+
+when reading the GICv4.1 GICD_TYPER2 register, which is unexpected...
+
+Work around it by adding a new quirk for the following variants:
+
+ ThunderX: CN88xx
+ OCTEON TX: CN83xx, CN81xx
+ OCTEON TX2: CN93xx, CN96xx, CN98xx, CNF95xx*
+
+and use this flag to avoid accessing GICD_TYPER2. Note that all
+reserved registers (including redistributors and ITS) are impacted
+by this erratum, but that only GICD_TYPER2 has to be worked around
+so far.
+
+	Signed-off-by: Marc Zyngier <maz@kernel.org>
+	Tested-by: Robert Richter <rrichter@marvell.com>
+	Tested-by: Mark Salter <msalter@redhat.com>
+	Tested-by: Tim Harvey <tharvey@gateworks.com>
+	Acked-by: Catalin Marinas <catalin.marinas@arm.com>
+	Acked-by: Robert Richter <rrichter@marvell.com>
+Link: https://lore.kernel.org/r/20191027144234.8395-11-maz@kernel.org
+Link: https://lore.kernel.org/r/20200311115649.26060-1-maz@kernel.org
+(cherry picked from commit d01fd161e85904064290435f67f4ed59af5daf74)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	Documentation/arm64/silicon-errata.rst
+#	drivers/irqchip/irq-gic-v3.c
+diff --cc drivers/irqchip/irq-gic-v3.c
+index 1b503e86ee7a,1eec9d4649d5..000000000000
+--- a/drivers/irqchip/irq-gic-v3.c
++++ b/drivers/irqchip/irq-gic-v3.c
+@@@ -1466,6 -1465,70 +1467,73 @@@ static bool gic_enable_quirk_msm8996(vo
+  	return true;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static bool gic_enable_quirk_cavium_38539(void *data)
++ {
++ 	struct gic_chip_data *d = data;
++ 
++ 	d->flags |= FLAGS_WORKAROUND_CAVIUM_ERRATUM_38539;
++ 
++ 	return true;
++ }
++ 
++ static bool gic_enable_quirk_hip06_07(void *data)
++ {
++ 	struct gic_chip_data *d = data;
++ 
++ 	/*
++ 	 * HIP06 GICD_IIDR clashes with GIC-600 product number (despite
++ 	 * not being an actual ARM implementation). The saving grace is
++ 	 * that GIC-600 doesn't have ESPI, so nothing to do in that case.
++ 	 * HIP07 doesn't even have a proper IIDR, and still pretends to
++ 	 * have ESPI. In both cases, put them right.
++ 	 */
++ 	if (d->rdists.gicd_typer & GICD_TYPER_ESPI) {
++ 		/* Zero both ESPI and the RES0 field next to it... */
++ 		d->rdists.gicd_typer &= ~GENMASK(9, 8);
++ 		return true;
++ 	}
++ 
++ 	return false;
++ }
++ 
++ static const struct gic_quirk gic_quirks[] = {
++ 	{
++ 		.desc	= "GICv3: Qualcomm MSM8996 broken firmware",
++ 		.compatible = "qcom,msm8996-gic-v3",
++ 		.init	= gic_enable_quirk_msm8996,
++ 	},
++ 	{
++ 		.desc	= "GICv3: HIP06 erratum 161010803",
++ 		.iidr	= 0x0204043b,
++ 		.mask	= 0xffffffff,
++ 		.init	= gic_enable_quirk_hip06_07,
++ 	},
++ 	{
++ 		.desc	= "GICv3: HIP07 erratum 161010803",
++ 		.iidr	= 0x00000000,
++ 		.mask	= 0xffffffff,
++ 		.init	= gic_enable_quirk_hip06_07,
++ 	},
++ 	{
++ 		/*
++ 		 * Reserved register accesses generate a Synchronous
++ 		 * External Abort. This erratum applies to:
++ 		 * - ThunderX: CN88xx
++ 		 * - OCTEON TX: CN83xx, CN81xx
++ 		 * - OCTEON TX2: CN93xx, CN96xx, CN98xx, CNF95xx*
++ 		 */
++ 		.desc	= "GICv3: Cavium erratum 38539",
++ 		.iidr	= 0xa000034c,
++ 		.mask	= 0xe8f00fff,
++ 		.init	= gic_enable_quirk_cavium_38539,
++ 	},
++ 	{
++ 	}
++ };
++ 
+++>>>>>>> d01fd161e859 (irqchip/gic-v3: Workaround Cavium erratum 38539 when reading GICD_TYPER2)
+  static void gic_enable_nmi_support(void)
+  {
+  	int i;
+* Unmerged path Documentation/arm64/silicon-errata.rst
+* Unmerged path Documentation/arm64/silicon-errata.rst
+* Unmerged path drivers/irqchip/irq-gic-v3.c
