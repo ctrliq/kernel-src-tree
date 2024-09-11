@@ -1,0 +1,135 @@
+libbpf: Ensure ELF symbols table is found before further ELF processing
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-315.el8
+commit-author Andrii Nakryiko <andriin@fb.com>
+commit 0201c575831171292489f14a8b6f79f98936b4d1
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-315.el8/0201c575.failed
+
+libbpf ELF parsing logic might need symbols available before ELF parsing is
+completed, so we need to make sure that symbols table section is found in
+a separate pass before all the subsequent sections are processed.
+
+	Signed-off-by: Andrii Nakryiko <andriin@fb.com>
+	Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+	Acked-by: John Fastabend <john.fastabend@gmail.com>
+Link: https://lore.kernel.org/bpf/20200903203542.15944-2-andriin@fb.com
+(cherry picked from commit 0201c575831171292489f14a8b6f79f98936b4d1)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	tools/lib/bpf/libbpf.c
+diff --cc tools/lib/bpf/libbpf.c
+index 133c0050e689,ac56d4db6d3e..000000000000
+--- a/tools/lib/bpf/libbpf.c
++++ b/tools/lib/bpf/libbpf.c
+@@@ -2598,44 -2565,210 +2598,75 @@@ report
+  static int bpf_object__elf_collect(struct bpf_object *obj)
+  {
+  	Elf *elf = obj->efile.elf;
+ +	GElf_Ehdr *ep = &obj->efile.ehdr;
+  	Elf_Data *btf_ext_data = NULL;
+  	Elf_Data *btf_data = NULL;
+- 	Elf_Scn *scn = NULL;
+  	int idx = 0, err = 0;
++ 	const char *name;
++ 	Elf_Data *data;
++ 	Elf_Scn *scn;
++ 	GElf_Shdr sh;
+  
+++<<<<<<< HEAD
+ +	/* Elf is corrupted/truncated, avoid calling elf_strptr. */
+ +	if (!elf_rawdata(elf_getscn(elf, ep->e_shstrndx), NULL)) {
+ +		pr_warn("failed to get e_shstrndx from %s\n", obj->path);
+ +		return -LIBBPF_ERRNO__FORMAT;
+ +	}
+ +
+ +	while ((scn = elf_nextscn(elf, scn)) != NULL) {
+ +		char *name;
+ +		GElf_Shdr sh;
+ +		Elf_Data *data;
+++=======
++ 	/* a bunch of ELF parsing functionality depends on processing symbols,
++ 	 * so do the first pass and find the symbol table
++ 	 */
++ 	scn = NULL;
++ 	while ((scn = elf_nextscn(elf, scn)) != NULL) {
++ 		if (elf_sec_hdr(obj, scn, &sh))
++ 			return -LIBBPF_ERRNO__FORMAT;
+++>>>>>>> 0201c5758311 (libbpf: Ensure ELF symbols table is found before further ELF processing)
++ 
++ 		if (sh.sh_type == SHT_SYMTAB) {
++ 			if (obj->efile.symbols) {
++ 				pr_warn("elf: multiple symbol tables in %s\n", obj->path);
++ 				return -LIBBPF_ERRNO__FORMAT;
++ 			}
++ 
++ 			data = elf_sec_data(obj, scn);
++ 			if (!data)
++ 				return -LIBBPF_ERRNO__FORMAT;
++ 
++ 			obj->efile.symbols = data;
++ 			obj->efile.symbols_shndx = elf_ndxscn(scn);
++ 			obj->efile.strtabidx = sh.sh_link;
++ 		}
++ 	}
+  
++ 	scn = NULL;
++ 	while ((scn = elf_nextscn(elf, scn)) != NULL) {
+  		idx++;
+ -
+ -		if (elf_sec_hdr(obj, scn, &sh))
+ +		if (gelf_getshdr(scn, &sh) != &sh) {
+ +			pr_warn("failed to get section(%d) header from %s\n",
+ +				idx, obj->path);
+  			return -LIBBPF_ERRNO__FORMAT;
+ +		}
+  
+ -		name = elf_sec_str(obj, sh.sh_name);
+ -		if (!name)
+ +		name = elf_strptr(elf, ep->e_shstrndx, sh.sh_name);
+ +		if (!name) {
+ +			pr_warn("failed to get section(%d) name from %s\n",
+ +				idx, obj->path);
+  			return -LIBBPF_ERRNO__FORMAT;
+ +		}
+  
+ -		if (ignore_elf_section(&sh, name))
+ -			continue;
+ -
+ -		data = elf_sec_data(obj, scn);
+ -		if (!data)
+ +		data = elf_getdata(scn, 0);
+ +		if (!data) {
+ +			pr_warn("failed to get section(%d) data from %s(%s)\n",
+ +				idx, name, obj->path);
+  			return -LIBBPF_ERRNO__FORMAT;
+ -
+ -		pr_debug("elf: section(%d) %s, size %ld, link %d, flags %lx, type=%d\n",
+ +		}
+ +		pr_debug("section(%d) %s, size %ld, link %d, flags %lx, type=%d\n",
+  			 idx, name, (unsigned long)data->d_size,
+  			 (int)sh.sh_link, (unsigned long)sh.sh_flags,
+  			 (int)sh.sh_type);
+@@@ -2661,14 -2790,7 +2692,18 @@@
+  		} else if (strcmp(name, BTF_EXT_ELF_SEC) == 0) {
+  			btf_ext_data = data;
+  		} else if (sh.sh_type == SHT_SYMTAB) {
+++<<<<<<< HEAD
+ +			if (obj->efile.symbols) {
+ +				pr_warn("bpf: multiple SYMTAB in %s\n",
+ +					obj->path);
+ +				return -LIBBPF_ERRNO__FORMAT;
+ +			}
+ +			obj->efile.symbols = data;
+ +			obj->efile.symbols_shndx = idx;
+ +			obj->efile.strtabidx = sh.sh_link;
+++=======
++ 			/* already processed during the first pass above */
+++>>>>>>> 0201c5758311 (libbpf: Ensure ELF symbols table is found before further ELF processing)
+  		} else if (sh.sh_type == SHT_PROGBITS && data->d_size > 0) {
+  			if (sh.sh_flags & SHF_EXECINSTR) {
+  				if (strcmp(name, ".text") == 0)
+* Unmerged path tools/lib/bpf/libbpf.c
