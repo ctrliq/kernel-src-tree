@@ -1,0 +1,317 @@
+KVM: x86: hyper-v: Make Hyper-V emulation enablement conditional
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-310.el8
+commit-author Vitaly Kuznetsov <vkuznets@redhat.com>
+commit 8f014550dfb114cc7f42a517d20d2cf887a0b771
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-310.el8/8f014550.failed
+
+Hyper-V emulation is enabled in KVM unconditionally. This is bad at least
+from security standpoint as it is an extra attack surface. Ideally, there
+should be a per-VM capability explicitly enabled by VMM but currently it
+is not the case and we can't mandate one without breaking backwards
+compatibility. We can, however, check guest visible CPUIDs and only enable
+Hyper-V emulation when "Hv#1" interface was exposed in
+HYPERV_CPUID_INTERFACE.
+
+Note, VMMs are free to act in any sequence they like, e.g. they can try
+to set MSRs first and CPUIDs later so we still need to allow the host
+to read/write Hyper-V specific MSRs unconditionally.
+
+	Signed-off-by: Vitaly Kuznetsov <vkuznets@redhat.com>
+Message-Id: <20210126134816.1880136-14-vkuznets@redhat.com>
+[Add selftest vcpu_set_hv_cpuid API to avoid breaking xen_vmcall_test. - Paolo]
+	Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+(cherry picked from commit 8f014550dfb114cc7f42a517d20d2cf887a0b771)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/include/asm/kvm_host.h
+#	arch/x86/kvm/cpuid.c
+#	arch/x86/kvm/x86.c
+#	arch/x86/kvm/xen.c
+#	tools/testing/selftests/kvm/x86_64/xen_vmcall_test.c
+diff --cc arch/x86/include/asm/kvm_host.h
+index 3e713240c995,84499aad01a4..000000000000
+--- a/arch/x86/include/asm/kvm_host.h
++++ b/arch/x86/include/asm/kvm_host.h
+@@@ -727,7 -736,9 +727,13 @@@ struct kvm_vcpu_arch 
+  	/* used for guest single stepping over the given code position */
+  	unsigned long singlestep_rip;
+  
+++<<<<<<< HEAD
+ +	struct kvm_vcpu_hv hyperv;
+++=======
++ 	bool hyperv_enabled;
++ 	struct kvm_vcpu_hv *hyperv;
++ 	struct kvm_vcpu_xen xen;
+++>>>>>>> 8f014550dfb1 (KVM: x86: hyper-v: Make Hyper-V emulation enablement conditional)
+  
+  	cpumask_var_t wbinvd_dirty_mask;
+  
+diff --cc arch/x86/kvm/cpuid.c
+index cdc2d2920dbf,c8f2592ccc99..000000000000
+--- a/arch/x86/kvm/cpuid.c
++++ b/arch/x86/kvm/cpuid.c
+@@@ -179,10 -179,16 +179,17 @@@ static void kvm_vcpu_after_set_cpuid(st
+  	vcpu->arch.cr4_guest_rsvd_bits =
+  	    __cr4_reserved_bits(guest_cpuid_has, vcpu);
+  
+++<<<<<<< HEAD
+ +	vcpu->arch.reserved_gpa_bits = rsvd_bits(cpuid_maxphyaddr(vcpu), 63);
+++=======
++ 	kvm_hv_set_cpuid(vcpu);
++ 
++ 	/* Invoke the vendor callback only after the above state is updated. */
++ 	static_call(kvm_x86_vcpu_after_set_cpuid)(vcpu);
+++>>>>>>> 8f014550dfb1 (KVM: x86: hyper-v: Make Hyper-V emulation enablement conditional)
+  
+ -	/*
+ -	 * Except for the MMU, which needs to be reset after any vendor
+ -	 * specific adjustments to the reserved GPA bits.
+ -	 */
+ -	kvm_mmu_reset_context(vcpu);
+ +	/* Invoke the vendor callback only after the above state is updated. */
+ +	kvm_x86_ops.vcpu_after_set_cpuid(vcpu);
+  }
+  
+  static int is_efer_nx(void)
+diff --cc arch/x86/kvm/x86.c
+index 5b18614d5081,1e5c304d14ab..000000000000
+--- a/arch/x86/kvm/x86.c
++++ b/arch/x86/kvm/x86.c
+@@@ -8096,7 -8159,10 +8096,14 @@@ int kvm_emulate_hypercall(struct kvm_vc
+  	unsigned long nr, a0, a1, a2, a3, ret;
+  	int op_64_bit;
+  
+++<<<<<<< HEAD
+ +	if (kvm_hv_hypercall_enabled(vcpu->kvm))
+++=======
++ 	if (kvm_xen_hypercall_enabled(vcpu->kvm))
++ 		return kvm_xen_hypercall(vcpu);
++ 
++ 	if (kvm_hv_hypercall_enabled(vcpu))
+++>>>>>>> 8f014550dfb1 (KVM: x86: hyper-v: Make Hyper-V emulation enablement conditional)
+  		return kvm_hv_hypercall(vcpu);
+  
+  	nr = kvm_rax_read(vcpu);
+* Unmerged path arch/x86/kvm/xen.c
+* Unmerged path tools/testing/selftests/kvm/x86_64/xen_vmcall_test.c
+* Unmerged path arch/x86/include/asm/kvm_host.h
+* Unmerged path arch/x86/kvm/cpuid.c
+diff --git a/arch/x86/kvm/hyperv.c b/arch/x86/kvm/hyperv.c
+index c5f77ef20cbd..65d368192c40 100644
+--- a/arch/x86/kvm/hyperv.c
++++ b/arch/x86/kvm/hyperv.c
+@@ -36,6 +36,9 @@
+ #include "trace.h"
+ #include "irq.h"
+ 
++/* "Hv#1" signature */
++#define HYPERV_CPUID_SIGNATURE_EAX 0x31237648
++
+ #define KVM_HV_MAX_SPARSE_VCPU_SET_BITS DIV_ROUND_UP(KVM_MAX_VCPUS, 64)
+ 
+ static void stimer_mark_pending(struct kvm_vcpu_hv_stimer *stimer,
+@@ -1508,6 +1511,9 @@ int kvm_hv_set_msr_common(struct kvm_vcpu *vcpu, u32 msr, u64 data, bool host)
+ {
+ 	struct kvm_hv *hv = to_kvm_hv(vcpu->kvm);
+ 
++	if (!host && !vcpu->arch.hyperv_enabled)
++		return 1;
++
+ 	if (kvm_hv_msr_partition_wide(msr)) {
+ 		int r;
+ 
+@@ -1523,6 +1529,9 @@ int kvm_hv_get_msr_common(struct kvm_vcpu *vcpu, u32 msr, u64 *pdata, bool host)
+ {
+ 	struct kvm_hv *hv = to_kvm_hv(vcpu->kvm);
+ 
++	if (!host && !vcpu->arch.hyperv_enabled)
++		return 1;
++
+ 	if (kvm_hv_msr_partition_wide(msr)) {
+ 		int r;
+ 
+@@ -1737,9 +1746,20 @@ static u64 kvm_hv_send_ipi(struct kvm_vcpu *vcpu, u64 ingpa, u64 outgpa,
+ 	return HV_STATUS_SUCCESS;
+ }
+ 
+-bool kvm_hv_hypercall_enabled(struct kvm *kvm)
++void kvm_hv_set_cpuid(struct kvm_vcpu *vcpu)
++{
++	struct kvm_cpuid_entry2 *entry;
++
++	entry = kvm_find_cpuid_entry(vcpu, HYPERV_CPUID_INTERFACE, 0);
++	if (entry && entry->eax == HYPERV_CPUID_SIGNATURE_EAX)
++		vcpu->arch.hyperv_enabled = true;
++	else
++		vcpu->arch.hyperv_enabled = false;
++}
++
++bool kvm_hv_hypercall_enabled(struct kvm_vcpu *vcpu)
+ {
+-	return to_kvm_hv(kvm)->hv_guest_os_id != 0;
++	return vcpu->arch.hyperv_enabled && to_kvm_hv(vcpu->kvm)->hv_guest_os_id;
+ }
+ 
+ static void kvm_hv_hypercall_set_result(struct kvm_vcpu *vcpu, u64 result)
+@@ -2072,8 +2092,7 @@ int kvm_get_hv_cpuid(struct kvm_vcpu *vcpu, struct kvm_cpuid2 *cpuid,
+ 			break;
+ 
+ 		case HYPERV_CPUID_INTERFACE:
+-			memcpy(signature, "Hv#1\0\0\0\0\0\0\0\0", 12);
+-			ent->eax = signature[0];
++			ent->eax = HYPERV_CPUID_SIGNATURE_EAX;
+ 			break;
+ 
+ 		case HYPERV_CPUID_VERSION:
+diff --git a/arch/x86/kvm/hyperv.h b/arch/x86/kvm/hyperv.h
+index 69fb2e2ca018..d4a3611f941f 100644
+--- a/arch/x86/kvm/hyperv.h
++++ b/arch/x86/kvm/hyperv.h
+@@ -86,7 +86,7 @@ static inline struct kvm_hv_syndbg *to_hv_syndbg(struct kvm_vcpu *vcpu)
+ int kvm_hv_set_msr_common(struct kvm_vcpu *vcpu, u32 msr, u64 data, bool host);
+ int kvm_hv_get_msr_common(struct kvm_vcpu *vcpu, u32 msr, u64 *pdata, bool host);
+ 
+-bool kvm_hv_hypercall_enabled(struct kvm *kvm);
++bool kvm_hv_hypercall_enabled(struct kvm_vcpu *vcpu);
+ int kvm_hv_hypercall(struct kvm_vcpu *vcpu);
+ 
+ void kvm_hv_irq_routing_update(struct kvm *kvm);
+@@ -131,6 +131,7 @@ void kvm_hv_invalidate_tsc_page(struct kvm *kvm);
+ 
+ void kvm_hv_init_vm(struct kvm *kvm);
+ void kvm_hv_destroy_vm(struct kvm *kvm);
++void kvm_hv_set_cpuid(struct kvm_vcpu *vcpu);
+ int kvm_vm_ioctl_hv_eventfd(struct kvm *kvm, struct kvm_hyperv_eventfd *args);
+ int kvm_get_hv_cpuid(struct kvm_vcpu *vcpu, struct kvm_cpuid2 *cpuid,
+ 		     struct kvm_cpuid_entry2 __user *entries);
+* Unmerged path arch/x86/kvm/x86.c
+* Unmerged path arch/x86/kvm/xen.c
+diff --git a/tools/testing/selftests/kvm/include/x86_64/processor.h b/tools/testing/selftests/kvm/include/x86_64/processor.h
+index c34a6512465c..750b61dd8281 100644
+--- a/tools/testing/selftests/kvm/include/x86_64/processor.h
++++ b/tools/testing/selftests/kvm/include/x86_64/processor.h
+@@ -392,6 +392,7 @@ uint64_t kvm_hypercall(uint64_t nr, uint64_t a0, uint64_t a1, uint64_t a2,
+ 		       uint64_t a3);
+ 
+ struct kvm_cpuid2 *kvm_get_supported_hv_cpuid(void);
++void vcpu_set_hv_cpuid(struct kvm_vm *vm, uint32_t vcpuid);
+ struct kvm_cpuid2 *vcpu_get_supported_hv_cpuid(struct kvm_vm *vm, uint32_t vcpuid);
+ 
+ /*
+diff --git a/tools/testing/selftests/kvm/lib/x86_64/processor.c b/tools/testing/selftests/kvm/lib/x86_64/processor.c
+index efb540c90732..d092d6f00cbb 100644
+--- a/tools/testing/selftests/kvm/lib/x86_64/processor.c
++++ b/tools/testing/selftests/kvm/lib/x86_64/processor.c
+@@ -1247,6 +1247,41 @@ struct kvm_cpuid2 *kvm_get_supported_hv_cpuid(void)
+ 	return cpuid;
+ }
+ 
++void vcpu_set_hv_cpuid(struct kvm_vm *vm, uint32_t vcpuid)
++{
++	static struct kvm_cpuid2 *cpuid_full;
++	struct kvm_cpuid2 *cpuid_sys, *cpuid_hv;
++	int i, nent = 0;
++
++	if (!cpuid_full) {
++		cpuid_sys = kvm_get_supported_cpuid();
++		cpuid_hv = kvm_get_supported_hv_cpuid();
++
++		cpuid_full = malloc(sizeof(*cpuid_full) +
++				    (cpuid_sys->nent + cpuid_hv->nent) *
++				    sizeof(struct kvm_cpuid_entry2));
++		if (!cpuid_full) {
++			perror("malloc");
++			abort();
++		}
++
++		/* Need to skip KVM CPUID leaves 0x400000xx */
++		for (i = 0; i < cpuid_sys->nent; i++) {
++			if (cpuid_sys->entries[i].function >= 0x40000000 &&
++			    cpuid_sys->entries[i].function < 0x40000100)
++				continue;
++			cpuid_full->entries[nent] = cpuid_sys->entries[i];
++			nent++;
++		}
++
++		memcpy(&cpuid_full->entries[nent], cpuid_hv->entries,
++		       cpuid_hv->nent * sizeof(struct kvm_cpuid_entry2));
++		cpuid_full->nent = nent + cpuid_hv->nent;
++	}
++
++	vcpu_set_cpuid(vm, vcpuid, cpuid_full);
++}
++
+ struct kvm_cpuid2 *vcpu_get_supported_hv_cpuid(struct kvm_vm *vm, uint32_t vcpuid)
+ {
+ 	static struct kvm_cpuid2 *cpuid;
+diff --git a/tools/testing/selftests/kvm/x86_64/evmcs_test.c b/tools/testing/selftests/kvm/x86_64/evmcs_test.c
+index 39a3cb2bd103..ca22ee6d19cb 100644
+--- a/tools/testing/selftests/kvm/x86_64/evmcs_test.c
++++ b/tools/testing/selftests/kvm/x86_64/evmcs_test.c
+@@ -78,42 +78,6 @@ void guest_code(struct vmx_pages *vmx_pages)
+ 	GUEST_ASSERT(vmlaunch());
+ }
+ 
+-struct kvm_cpuid2 *guest_get_cpuid(void)
+-{
+-	static struct kvm_cpuid2 *cpuid_full;
+-	struct kvm_cpuid2 *cpuid_sys, *cpuid_hv;
+-	int i, nent = 0;
+-
+-	if (cpuid_full)
+-		return cpuid_full;
+-
+-	cpuid_sys = kvm_get_supported_cpuid();
+-	cpuid_hv = kvm_get_supported_hv_cpuid();
+-
+-	cpuid_full = malloc(sizeof(*cpuid_full) +
+-			    (cpuid_sys->nent + cpuid_hv->nent) *
+-			    sizeof(struct kvm_cpuid_entry2));
+-	if (!cpuid_full) {
+-		perror("malloc");
+-		abort();
+-	}
+-
+-	/* Need to skip KVM CPUID leaves 0x400000xx */
+-	for (i = 0; i < cpuid_sys->nent; i++) {
+-		if (cpuid_sys->entries[i].function >= 0x40000000 &&
+-		    cpuid_sys->entries[i].function < 0x40000100)
+-			continue;
+-		cpuid_full->entries[nent] = cpuid_sys->entries[i];
+-		nent++;
+-	}
+-
+-	memcpy(&cpuid_full->entries[nent], cpuid_hv->entries,
+-	       cpuid_hv->nent * sizeof(struct kvm_cpuid_entry2));
+-	cpuid_full->nent = nent + cpuid_hv->nent;
+-
+-	return cpuid_full;
+-}
+-
+ int main(int argc, char *argv[])
+ {
+ 	vm_vaddr_t vmx_pages_gva = 0;
+@@ -135,7 +99,7 @@ int main(int argc, char *argv[])
+ 		exit(KSFT_SKIP);
+ 	}
+ 
+-	vcpu_set_cpuid(vm, VCPU_ID, guest_get_cpuid());
++	vcpu_set_hv_cpuid(vm, VCPU_ID);
+ 	vcpu_enable_evmcs(vm, VCPU_ID);
+ 
+ 	run = vcpu_state(vm, VCPU_ID);
+@@ -179,7 +143,7 @@ int main(int argc, char *argv[])
+ 		/* Restore state in a new VM.  */
+ 		kvm_vm_restart(vm, O_RDWR);
+ 		vm_vcpu_add(vm, VCPU_ID);
+-		vcpu_set_cpuid(vm, VCPU_ID, guest_get_cpuid());
++		vcpu_set_hv_cpuid(vm, VCPU_ID);
+ 		vcpu_enable_evmcs(vm, VCPU_ID);
+ 		vcpu_load_state(vm, VCPU_ID, state);
+ 		run = vcpu_state(vm, VCPU_ID);
+* Unmerged path tools/testing/selftests/kvm/x86_64/xen_vmcall_test.c
