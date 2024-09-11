@@ -1,0 +1,150 @@
+tools/libbpf: Add support for bpf map element iterator
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Yonghong Song <yhs@fb.com>
+commit cd31039a7347610863aa8b77a9162048999723d0
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/cd31039a.failed
+
+Add map_fd to bpf_iter_attach_opts and flags to
+bpf_link_create_opts. Later on, bpftool or selftest
+will be able to create a bpf map element iterator
+by passing map_fd to the kernel during link
+creation time.
+
+	Signed-off-by: Yonghong Song <yhs@fb.com>
+	Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+Link: https://lore.kernel.org/bpf/20200723184117.590673-1-yhs@fb.com
+(cherry picked from commit cd31039a7347610863aa8b77a9162048999723d0)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	tools/lib/bpf/libbpf.c
+#	tools/lib/bpf/libbpf.h
+diff --cc tools/lib/bpf/libbpf.c
+index e5cdf8ffc7c5,a05aa7e2bab6..000000000000
+--- a/tools/lib/bpf/libbpf.c
++++ b/tools/lib/bpf/libbpf.c
+@@@ -8109,7 -8257,63 +8109,67 @@@ bpf_program__attach_cgroup(struct bpf_p
+  	if (link_fd < 0) {
+  		link_fd = -errno;
+  		free(link);
+++<<<<<<< HEAD
+ +		pr_warn("program '%s': failed to attach to cgroup: %s\n",
+++=======
++ 		pr_warn("program '%s': failed to attach to %s: %s\n",
++ 			bpf_program__title(prog, false), target_name,
++ 			libbpf_strerror_r(link_fd, errmsg, sizeof(errmsg)));
++ 		return ERR_PTR(link_fd);
++ 	}
++ 	link->fd = link_fd;
++ 	return link;
++ }
++ 
++ struct bpf_link *
++ bpf_program__attach_cgroup(struct bpf_program *prog, int cgroup_fd)
++ {
++ 	return bpf_program__attach_fd(prog, cgroup_fd, "cgroup");
++ }
++ 
++ struct bpf_link *
++ bpf_program__attach_netns(struct bpf_program *prog, int netns_fd)
++ {
++ 	return bpf_program__attach_fd(prog, netns_fd, "netns");
++ }
++ 
++ struct bpf_link *
++ bpf_program__attach_iter(struct bpf_program *prog,
++ 			 const struct bpf_iter_attach_opts *opts)
++ {
++ 	DECLARE_LIBBPF_OPTS(bpf_link_create_opts, link_create_opts);
++ 	char errmsg[STRERR_BUFSIZE];
++ 	struct bpf_link *link;
++ 	int prog_fd, link_fd;
++ 	__u32 target_fd = 0;
++ 
++ 	if (!OPTS_VALID(opts, bpf_iter_attach_opts))
++ 		return ERR_PTR(-EINVAL);
++ 
++ 	if (OPTS_HAS(opts, map_fd)) {
++ 		target_fd = opts->map_fd;
++ 		link_create_opts.flags = BPF_ITER_LINK_MAP_FD;
++ 	}
++ 
++ 	prog_fd = bpf_program__fd(prog);
++ 	if (prog_fd < 0) {
++ 		pr_warn("program '%s': can't attach before loaded\n",
++ 			bpf_program__title(prog, false));
++ 		return ERR_PTR(-EINVAL);
++ 	}
++ 
++ 	link = calloc(1, sizeof(*link));
++ 	if (!link)
++ 		return ERR_PTR(-ENOMEM);
++ 	link->detach = &bpf_link__detach_fd;
++ 
++ 	link_fd = bpf_link_create(prog_fd, target_fd, BPF_TRACE_ITER,
++ 				  &link_create_opts);
++ 	if (link_fd < 0) {
++ 		link_fd = -errno;
++ 		free(link);
++ 		pr_warn("program '%s': failed to attach to iterator: %s\n",
+++>>>>>>> cd31039a7347 (tools/libbpf: Add support for bpf map element iterator)
+  			bpf_program__title(prog, false),
+  			libbpf_strerror_r(link_fd, errmsg, sizeof(errmsg)));
+  		return ERR_PTR(link_fd);
+diff --cc tools/lib/bpf/libbpf.h
+index 02e427ddd9d9,c6813791fa7e..000000000000
+--- a/tools/lib/bpf/libbpf.h
++++ b/tools/lib/bpf/libbpf.h
+@@@ -272,6 -262,16 +272,19 @@@ struct bpf_map
+  
+  LIBBPF_API struct bpf_link *bpf_map__attach_struct_ops(struct bpf_map *map);
+  
+++<<<<<<< HEAD
+++=======
++ struct bpf_iter_attach_opts {
++ 	size_t sz; /* size of this struct for forward/backward compatibility */
++ 	__u32 map_fd;
++ };
++ #define bpf_iter_attach_opts__last_field map_fd
++ 
++ LIBBPF_API struct bpf_link *
++ bpf_program__attach_iter(struct bpf_program *prog,
++ 			 const struct bpf_iter_attach_opts *opts);
++ 
+++>>>>>>> cd31039a7347 (tools/libbpf: Add support for bpf map element iterator)
+  struct bpf_insn;
+  
+  /*
+diff --git a/tools/lib/bpf/bpf.c b/tools/lib/bpf/bpf.c
+index da45889fc732..1fb2ee2dc1cb 100644
+--- a/tools/lib/bpf/bpf.c
++++ b/tools/lib/bpf/bpf.c
+@@ -598,6 +598,7 @@ int bpf_link_create(int prog_fd, int target_fd,
+ 	attr.link_create.prog_fd = prog_fd;
+ 	attr.link_create.target_fd = target_fd;
+ 	attr.link_create.attach_type = attach_type;
++	attr.link_create.flags = OPTS_GET(opts, flags, 0);
+ 
+ 	return sys_bpf(BPF_LINK_CREATE, &attr, sizeof(attr));
+ }
+diff --git a/tools/lib/bpf/bpf.h b/tools/lib/bpf/bpf.h
+index f8c9bd418cb7..9b7906ec098f 100644
+--- a/tools/lib/bpf/bpf.h
++++ b/tools/lib/bpf/bpf.h
+@@ -170,8 +170,9 @@ LIBBPF_API int bpf_prog_detach2(int prog_fd, int attachable_fd,
+ 
+ struct bpf_link_create_opts {
+ 	size_t sz; /* size of this struct for forward/backward compatibility */
++	__u32 flags;
+ };
+-#define bpf_link_create_opts__last_field sz
++#define bpf_link_create_opts__last_field flags
+ 
+ LIBBPF_API int bpf_link_create(int prog_fd, int target_fd,
+ 			       enum bpf_attach_type attach_type,
+* Unmerged path tools/lib/bpf/libbpf.c
+* Unmerged path tools/lib/bpf/libbpf.h
