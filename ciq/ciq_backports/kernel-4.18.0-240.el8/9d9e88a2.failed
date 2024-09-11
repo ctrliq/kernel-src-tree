@@ -1,0 +1,240 @@
+io_uring: polled fixed file must go through free iteration
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Jens Axboe <axboe@kernel.dk>
+commit 9d9e88a24c1f20ebfc2f28b1762ce78c0b9e1cb3
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/9d9e88a2.failed
+
+When we changed the file registration handling, it became important to
+iterate the bulk request freeing list for fixed files as well, or we
+miss dropping the fixed file reference. If not, we're leaking references,
+and we'll get a kworker stuck waiting for file references to disappear.
+
+This also means we can remove the special casing of fixed vs non-fixed
+files, we need to iterate for both and we can just rely on
+__io_req_aux_free() doing io_put_file() instead of doing it manually.
+
+Fixes: 055895537302 ("io_uring: refactor file register/unregister/update handling")
+	Signed-off-by: Jens Axboe <axboe@kernel.dk>
+(cherry picked from commit 9d9e88a24c1f20ebfc2f28b1762ce78c0b9e1cb3)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/io_uring.c
+diff --cc fs/io_uring.c
+index 2afa3b27779e,70ae7e840c85..000000000000
+--- a/fs/io_uring.c
++++ b/fs/io_uring.c
+@@@ -623,15 -1357,96 +623,80 @@@ static void io_free_req_many(struct io_
+  
+  static void __io_free_req(struct io_kiocb *req)
+  {
+ -	__io_req_aux_free(req);
+ -
+ -	if (req->flags & REQ_F_INFLIGHT) {
+ -		struct io_ring_ctx *ctx = req->ctx;
+ -		unsigned long flags;
+ -
+ -		spin_lock_irqsave(&ctx->inflight_lock, flags);
+ -		list_del(&req->inflight_entry);
+ -		if (waitqueue_active(&ctx->inflight_wait))
+ -			wake_up(&ctx->inflight_wait);
+ -		spin_unlock_irqrestore(&ctx->inflight_lock, flags);
+ -	}
+ -
+ +	if (req->file && !(req->flags & REQ_F_FIXED_FILE))
+ +		fput(req->file);
+  	percpu_ref_put(&req->ctx->refs);
+ -	if (likely(!io_is_fallback_req(req)))
+ -		kmem_cache_free(req_cachep, req);
+ -	else
+ -		clear_bit_unlock(0, (unsigned long *) &req->ctx->fallback_req);
+ +	kmem_cache_free(req_cachep, req);
+  }
+  
+ -struct req_batch {
+ -	void *reqs[IO_IOPOLL_BATCH];
+ -	int to_free;
+ -	int need_iter;
+ -};
+ -
+ -static void io_free_req_many(struct io_ring_ctx *ctx, struct req_batch *rb)
+ +static void io_req_link_next(struct io_kiocb *req)
+  {
+++<<<<<<< HEAD
+ +	struct io_kiocb *nxt;
+++=======
++ 	if (!rb->to_free)
++ 		return;
++ 	if (rb->need_iter) {
++ 		int i, inflight = 0;
++ 		unsigned long flags;
++ 
++ 		for (i = 0; i < rb->to_free; i++) {
++ 			struct io_kiocb *req = rb->reqs[i];
++ 
++ 			if (req->flags & REQ_F_INFLIGHT)
++ 				inflight++;
++ 			__io_req_aux_free(req);
++ 		}
++ 		if (!inflight)
++ 			goto do_free;
++ 
++ 		spin_lock_irqsave(&ctx->inflight_lock, flags);
++ 		for (i = 0; i < rb->to_free; i++) {
++ 			struct io_kiocb *req = rb->reqs[i];
++ 
++ 			if (req->flags & REQ_F_INFLIGHT) {
++ 				list_del(&req->inflight_entry);
++ 				if (!--inflight)
++ 					break;
++ 			}
++ 		}
++ 		spin_unlock_irqrestore(&ctx->inflight_lock, flags);
++ 
++ 		if (waitqueue_active(&ctx->inflight_wait))
++ 			wake_up(&ctx->inflight_wait);
++ 	}
++ do_free:
++ 	kmem_cache_free_bulk(req_cachep, rb->to_free, rb->reqs);
++ 	percpu_ref_put_many(&ctx->refs, rb->to_free);
++ 	rb->to_free = rb->need_iter = 0;
++ }
++ 
++ static bool io_link_cancel_timeout(struct io_kiocb *req)
++ {
++ 	struct io_ring_ctx *ctx = req->ctx;
++ 	int ret;
++ 
++ 	ret = hrtimer_try_to_cancel(&req->io->timeout.timer);
++ 	if (ret != -1) {
++ 		io_cqring_fill_event(req, -ECANCELED);
++ 		io_commit_cqring(ctx);
++ 		req->flags &= ~REQ_F_LINK_HEAD;
++ 		io_put_req(req);
++ 		return true;
++ 	}
++ 
++ 	return false;
++ }
++ 
++ static void io_req_link_next(struct io_kiocb *req, struct io_kiocb **nxtptr)
++ {
++ 	struct io_ring_ctx *ctx = req->ctx;
++ 	bool wake_ev = false;
++ 
++ 	/* Already got next link */
++ 	if (req->flags & REQ_F_LINK_NEXT)
++ 		return;
+++>>>>>>> 9d9e88a24c1f (io_uring: polled fixed file must go through free iteration)
+  
+  	/*
+  	 * The list should never be empty when we are called here. But could
+@@@ -693,11 -1594,98 +758,50 @@@ static void io_put_req(struct io_kiocb 
+  		io_free_req(req);
+  }
+  
+ -static void io_steal_work(struct io_kiocb *req,
+ -			  struct io_wq_work **workptr)
+ -{
+ -	/*
+ -	 * It's in an io-wq worker, so there always should be at least
+ -	 * one reference, which will be dropped in io_put_work() just
+ -	 * after the current handler returns.
+ -	 *
+ -	 * It also means, that if the counter dropped to 1, then there is
+ -	 * no asynchronous users left, so it's safe to steal the next work.
+ -	 */
+ -	if (refcount_read(&req->refs) == 1) {
+ -		struct io_kiocb *nxt = NULL;
+ -
+ -		io_req_find_next(req, &nxt);
+ -		if (nxt)
+ -			io_wq_assign_next(workptr, nxt);
+ -	}
+ -}
+ -
+ -/*
+ - * Must only be used if we don't need to care about links, usually from
+ - * within the completion handling itself.
+ - */
+ -static void __io_double_put_req(struct io_kiocb *req)
+ -{
+ -	/* drop both submit and complete references */
+ -	if (refcount_sub_and_test(2, &req->refs))
+ -		__io_free_req(req);
+ -}
+ -
+ -static void io_double_put_req(struct io_kiocb *req)
+ -{
+ -	/* drop both submit and complete references */
+ -	if (refcount_sub_and_test(2, &req->refs))
+ -		io_free_req(req);
+ -}
+ -
+ -static unsigned io_cqring_events(struct io_ring_ctx *ctx, bool noflush)
+ +static unsigned io_cqring_events(struct io_cq_ring *ring)
+  {
+ -	struct io_rings *rings = ctx->rings;
+ -
+ -	if (test_bit(0, &ctx->cq_check_overflow)) {
+ -		/*
+ -		 * noflush == true is from the waitqueue handler, just ensure
+ -		 * we wake up the task, and the next invocation will flush the
+ -		 * entries. We cannot safely to it from here.
+ -		 */
+ -		if (noflush && !list_empty(&ctx->cq_overflow_list))
+ -			return -1U;
+ -
+ -		io_cqring_overflow_flush(ctx, false);
+ -	}
+ -
+  	/* See comment at the top of this file */
+  	smp_rmb();
+++<<<<<<< HEAD
+ +	return READ_ONCE(ring->r.tail) - READ_ONCE(ring->r.head);
+++=======
++ 	return ctx->cached_cq_tail - READ_ONCE(rings->cq.head);
++ }
++ 
++ static inline unsigned int io_sqring_entries(struct io_ring_ctx *ctx)
++ {
++ 	struct io_rings *rings = ctx->rings;
++ 
++ 	/* make sure SQ entry isn't read before tail */
++ 	return smp_load_acquire(&rings->sq.tail) - ctx->cached_sq_head;
++ }
++ 
++ static inline bool io_req_multi_free(struct req_batch *rb, struct io_kiocb *req)
++ {
++ 	if ((req->flags & REQ_F_LINK_HEAD) || io_is_fallback_req(req))
++ 		return false;
++ 
++ 	if (req->file || req->io)
++ 		rb->need_iter++;
++ 
++ 	rb->reqs[rb->to_free++] = req;
++ 	if (unlikely(rb->to_free == ARRAY_SIZE(rb->reqs)))
++ 		io_free_req_many(req->ctx, rb);
++ 	return true;
++ }
++ 
++ static int io_put_kbuf(struct io_kiocb *req)
++ {
++ 	struct io_buffer *kbuf;
++ 	int cflags;
++ 
++ 	kbuf = (struct io_buffer *) (unsigned long) req->rw.addr;
++ 	cflags = kbuf->bid << IORING_CQE_BUFFER_SHIFT;
++ 	cflags |= IORING_CQE_F_BUFFER;
++ 	req->rw.addr = 0;
++ 	kfree(kbuf);
++ 	return cflags;
+++>>>>>>> 9d9e88a24c1f (io_uring: polled fixed file must go through free iteration)
+  }
+  
+  /*
+* Unmerged path fs/io_uring.c
