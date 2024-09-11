@@ -1136,7 +1136,6 @@ static snd_pcm_uframes_t pcxhr_stream_pointer(struct snd_pcm_substream *subs)
 static const struct snd_pcm_ops pcxhr_ops = {
 	.open      = pcxhr_open,
 	.close     = pcxhr_close,
-	.ioctl     = snd_pcm_lib_ioctl,
 	.prepare   = pcxhr_prepare,
 	.hw_params = pcxhr_hw_params,
 	.hw_free   = pcxhr_hw_free,
