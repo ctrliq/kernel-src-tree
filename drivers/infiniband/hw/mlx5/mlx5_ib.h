@@ -601,7 +601,6 @@ struct mlx5_ib_mr {
 	struct ib_umem	       *umem;
 	struct mlx5_shared_mr_info	*smr_info;
 	struct list_head	list;
-	unsigned int		order;
 	struct mlx5_cache_ent  *cache_ent;
 	u32 out[MLX5_ST_SZ_DW(create_mkey_out)];
 	struct mlx5_core_sig_ctx    *sig;
