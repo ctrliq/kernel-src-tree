@@ -388,7 +388,7 @@ static inline void qdio_sync_queues(struct qdio_q *q)
 int debug_get_buf_state(struct qdio_q *q, unsigned int bufnr,
 			unsigned char *state)
 {
-	if (need_siga_sync(q))
+	if (qdio_need_siga_sync(q->irq_ptr))
 		qdio_siga_sync_q(q);
 	return get_buf_state(q, bufnr, state, 0);
 }
@@ -510,7 +510,7 @@ static inline int qdio_inbound_q_done(struct qdio_q *q, unsigned int start)
 	if (!atomic_read(&q->nr_buf_used))
 		return 1;
 
-	if (need_siga_sync(q))
+	if (qdio_need_siga_sync(q->irq_ptr))
 		qdio_siga_sync_q(q);
 	get_buf_state(q, start, &state, 0);
 
@@ -600,7 +600,7 @@ static int qdio_kick_outbound_q(struct qdio_q *q, unsigned int count,
 	int retries = 0, cc;
 	unsigned int busy_bit;
 
-	if (!need_siga_out(q))
+	if (!qdio_need_siga_out(q->irq_ptr))
 		return 0;
 
 	DBF_DEV_EVENT(DBF_INFO, q->irq_ptr, "siga-w:%1d", q->nr);
@@ -1252,7 +1252,7 @@ static int handle_inbound(struct qdio_q *q, unsigned int callflags,
 	count = set_buf_states(q, bufnr, SLSB_CU_INPUT_EMPTY, count);
 	atomic_add(count, &q->nr_buf_used);
 
-	if (need_siga_in(q))
+	if (qdio_need_siga_in(q->irq_ptr))
 		return qdio_siga_input(q);
 
 	return 0;
@@ -1293,7 +1293,7 @@ static int handle_outbound(struct qdio_q *q, unsigned int callflags,
 
 		WARN_ON_ONCE(!IS_ALIGNED(phys_aob, 256));
 		rc = qdio_kick_outbound_q(q, count, phys_aob);
-	} else if (need_siga_sync(q)) {
+	} else if (qdio_need_siga_sync(q->irq_ptr)) {
 		rc = qdio_siga_sync_q(q);
 	} else if (count < QDIO_MAX_BUFFERS_PER_Q &&
 		   get_buf_state(q, prev_buf(bufnr), &state, 0) > 0 &&
@@ -1431,7 +1431,7 @@ int qdio_inspect_queue(struct ccw_device *cdev, unsigned int nr, bool is_input,
 		return -ENODEV;
 	q = is_input ? irq_ptr->input_qs[nr] : irq_ptr->output_qs[nr];
 
-	if (need_siga_sync(q))
+	if (qdio_need_siga_sync(irq_ptr))
 		qdio_siga_sync_q(q);
 
 	return __qdio_inspect_queue(q, bufnr, error);
