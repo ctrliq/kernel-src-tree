@@ -1,0 +1,162 @@
+net_sched: improve and refactor tcf_action_put_many()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-80.el8
+commit-author Cong Wang <xiyou.wangcong@gmail.com>
+commit edfaf94fa705181eeb2fe0c36c0b902dedbd40f1
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-80.el8/edfaf94f.failed
+
+tcf_action_put_many() is mostly called to clean up actions on
+failure path, but tcf_action_put_many(&actions[acts_deleted]) is
+used in the ugliest way: it passes a slice of the array and
+uses an additional NULL at the end to avoid out-of-bound
+access.
+
+acts_deleted is completely unnecessary since we can teach
+tcf_action_put_many() scan the whole array and checks against
+NULL pointer. Which also means tcf_action_delete() should
+set deleted action pointers to NULL to avoid double free.
+
+Fixes: 90b73b77d08e ("net: sched: change action API to use array of pointers to actions")
+	Cc: Jiri Pirko <jiri@mellanox.com>
+	Cc: Vlad Buslov <vladbu@mellanox.com>
+	Signed-off-by: Cong Wang <xiyou.wangcong@gmail.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit edfaf94fa705181eeb2fe0c36c0b902dedbd40f1)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/sched/act_api.c
+diff --cc net/sched/act_api.c
+index 798bd0da5ca2,cd69a6afcf88..000000000000
+--- a/net/sched/act_api.c
++++ b/net/sched/act_api.c
+@@@ -614,6 -681,28 +614,31 @@@ int tcf_action_destroy(struct list_hea
+  	return ret;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static int tcf_action_put(struct tc_action *p)
++ {
++ 	return __tcf_action_put(p, false);
++ }
++ 
++ /* Put all actions in this array, skip those NULL's. */
++ static void tcf_action_put_many(struct tc_action *actions[])
++ {
++ 	int i;
++ 
++ 	for (i = 0; i < TCA_ACT_MAX_PRIO; i++) {
++ 		struct tc_action *a = actions[i];
++ 		const struct tc_action_ops *ops;
++ 
++ 		if (!a)
++ 			continue;
++ 		ops = a->ops;
++ 		if (tcf_action_put(a))
++ 			module_put(ops->owner);
++ 	}
++ }
++ 
+++>>>>>>> edfaf94fa705 (net_sched: improve and refactor tcf_action_put_many())
+  int
+  tcf_action_dump_old(struct sk_buff *skb, struct tc_action *a, int bind, int ref)
+  {
+@@@ -1105,8 -1179,37 +1130,42 @@@ err_out
+  	return err;
+  }
+  
+++<<<<<<< HEAD
+ +static int
+ +tcf_del_notify(struct net *net, struct nlmsghdr *n, struct list_head *actions,
+++=======
++ static int tcf_action_delete(struct net *net, struct tc_action *actions[],
++ 			     struct netlink_ext_ack *extack)
++ {
++ 	u32 act_index;
++ 	int ret, i;
++ 
++ 	for (i = 0; i < TCA_ACT_MAX_PRIO && actions[i]; i++) {
++ 		struct tc_action *a = actions[i];
++ 		const struct tc_action_ops *ops = a->ops;
++ 
++ 		/* Actions can be deleted concurrently so we must save their
++ 		 * type and id to search again after reference is released.
++ 		 */
++ 		act_index = a->tcfa_index;
++ 
++ 		if (tcf_action_put(a)) {
++ 			/* last reference, action was deleted concurrently */
++ 			module_put(ops->owner);
++ 		} else  {
++ 			/* now do the delete */
++ 			ret = ops->delete(net, act_index);
++ 			if (ret < 0)
++ 				return ret;
++ 		}
++ 		actions[i] = NULL;
++ 	}
++ 	return 0;
++ }
++ 
++ static int
++ tcf_del_notify(struct net *net, struct nlmsghdr *n, struct tc_action *actions[],
+++>>>>>>> edfaf94fa705 (net_sched: improve and refactor tcf_action_put_many())
+  	       u32 portid, size_t attr_size, struct netlink_ext_ack *extack)
+  {
+  	int ret;
+@@@ -1125,7 -1228,7 +1184,11 @@@
+  	}
+  
+  	/* now do the delete */
+++<<<<<<< HEAD
+ +	ret = tcf_action_destroy(actions, 0);
+++=======
++ 	ret = tcf_action_delete(net, actions, extack);
+++>>>>>>> edfaf94fa705 (net_sched: improve and refactor tcf_action_put_many())
+  	if (ret < 0) {
+  		NL_SET_ERR_MSG(extack, "Failed to delete TC action");
+  		kfree_skb(skb);
+@@@ -1147,7 -1250,7 +1210,11 @@@ tca_action_gd(struct net *net, struct n
+  	struct nlattr *tb[TCA_ACT_MAX_PRIO + 1];
+  	struct tc_action *act;
+  	size_t attr_size = 0;
+++<<<<<<< HEAD
+ +	LIST_HEAD(actions);
+++=======
++ 	struct tc_action *actions[TCA_ACT_MAX_PRIO] = {};
+++>>>>>>> edfaf94fa705 (net_sched: improve and refactor tcf_action_put_many())
+  
+  	ret = nla_parse_nested(tb, TCA_ACT_MAX_PRIO, nla, NULL, extack);
+  	if (ret < 0)
+@@@ -1175,16 -1278,15 +1242,24 @@@
+  	attr_size = tcf_action_full_attrs_size(attr_size);
+  
+  	if (event == RTM_GETACTION)
+ -		ret = tcf_get_notify(net, portid, n, actions, event, extack);
+ +		ret = tcf_get_notify(net, portid, n, &actions, event, extack);
+  	else { /* delete */
+++<<<<<<< HEAD
+ +		ret = tcf_del_notify(net, n, &actions, portid, attr_size, extack);
+++=======
++ 		ret = tcf_del_notify(net, n, actions, portid, attr_size, extack);
+++>>>>>>> edfaf94fa705 (net_sched: improve and refactor tcf_action_put_many())
+  		if (ret)
+  			goto err;
+- 		return ret;
++ 		return 0;
+  	}
+  err:
+++<<<<<<< HEAD
+ +	if (event != RTM_GETACTION)
+ +		tcf_action_destroy(&actions, 0);
+++=======
++ 	tcf_action_put_many(actions);
+++>>>>>>> edfaf94fa705 (net_sched: improve and refactor tcf_action_put_many())
+  	return ret;
+  }
+  
+* Unmerged path net/sched/act_api.c
