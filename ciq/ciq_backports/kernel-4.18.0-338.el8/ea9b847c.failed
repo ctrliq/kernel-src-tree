@@ -1,0 +1,270 @@
+ice: enable transmit timestamps for E810 devices
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-338.el8
+commit-author Jacob Keller <jacob.e.keller@intel.com>
+commit ea9b847cda647b9849b0b9fa0447e876a1ac62e1
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-338.el8/ea9b847c.failed
+
+Add support for enabling Tx timestamp requests for outgoing packets on
+E810 devices.
+
+The ice hardware can support multiple outstanding Tx timestamp requests.
+When sending a descriptor to hardware, a Tx timestamp request is made by
+setting a request bit, and assigning an index that represents which Tx
+timestamp index to store the timestamp in.
+
+Hardware makes no effort to synchronize the index use, so it is up to
+software to ensure that Tx timestamp indexes are not re-used before the
+timestamp is reported back.
+
+To do this, introduce a Tx timestamp tracker which will keep track of
+currently in-use indexes.
+
+In the hot path, if a packet has a timestamp request, an index will be
+requested from the tracker. Unfortunately, this does require a lock as
+the indexes are shared across all queues on a PHY. There are not enough
+indexes to reliably assign only 1 to each queue.
+
+For the E810 devices, the timestamp indexes are not shared across PHYs,
+so each port can have its own tracking.
+
+Once hardware captures a timestamp, an interrupt is fired. In this
+interrupt, trigger a new work item that will figure out which timestamp
+was completed, and report the timestamp back to the stack.
+
+This function loops through the Tx timestamp indexes and checks whether
+there is now a valid timestamp. If so, it clears the PHY timestamp
+indication in the PHY memory, locks and removes the SKB and bit in the
+tracker, then reports the timestamp to the stack.
+
+It is possible in some cases that a timestamp request will be initiated
+but never completed. This might occur if the packet is dropped by
+software or hardware before it reaches the PHY.
+
+Add a task to the periodic work function that will check whether
+a timestamp request is more than a few seconds old. If so, the timestamp
+index is cleared in the PHY, and the SKB is released.
+
+Just as with Rx timestamps, the Tx timestamps are only 40 bits wide, and
+use the same overall logic for extending to 64 bits of nanoseconds.
+
+With this change, E810 devices should be able to perform basic PTP
+functionality.
+
+Future changes will extend the support to cover the E822-based devices.
+
+	Signed-off-by: Jacob Keller <jacob.e.keller@intel.com>
+	Tested-by: Tony Brelinski <tonyx.brelinski@intel.com>
+	Signed-off-by: Tony Nguyen <anthony.l.nguyen@intel.com>
+(cherry picked from commit ea9b847cda647b9849b0b9fa0447e876a1ac62e1)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/intel/ice/ice_ethtool.c
+#	drivers/net/ethernet/intel/ice/ice_main.c
+#	drivers/net/ethernet/intel/ice/ice_ptp.c
+#	drivers/net/ethernet/intel/ice/ice_ptp.h
+#	drivers/net/ethernet/intel/ice/ice_txrx.h
+diff --cc drivers/net/ethernet/intel/ice/ice_ethtool.c
+index a184af55ebda,d95a5daca114..000000000000
+--- a/drivers/net/ethernet/intel/ice/ice_ethtool.c
++++ b/drivers/net/ethernet/intel/ice/ice_ethtool.c
+@@@ -3227,6 -3195,31 +3227,34 @@@ ice_set_rxfh(struct net_device *netdev
+  	return 0;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static int
++ ice_get_ts_info(struct net_device *dev, struct ethtool_ts_info *info)
++ {
++ 	struct ice_pf *pf = ice_netdev_to_pf(dev);
++ 
++ 	/* only report timestamping if PTP is enabled */
++ 	if (!test_bit(ICE_FLAG_PTP, pf->flags))
++ 		return ethtool_op_get_ts_info(dev, info);
++ 
++ 	info->so_timestamping = SOF_TIMESTAMPING_TX_SOFTWARE |
++ 				SOF_TIMESTAMPING_RX_SOFTWARE |
++ 				SOF_TIMESTAMPING_SOFTWARE |
++ 				SOF_TIMESTAMPING_TX_HARDWARE |
++ 				SOF_TIMESTAMPING_RX_HARDWARE |
++ 				SOF_TIMESTAMPING_RAW_HARDWARE;
++ 
++ 	info->phc_index = ice_get_ptp_clock_index(pf);
++ 
++ 	info->tx_types = BIT(HWTSTAMP_TX_OFF) | BIT(HWTSTAMP_TX_ON);
++ 
++ 	info->rx_filters = BIT(HWTSTAMP_FILTER_NONE) | BIT(HWTSTAMP_FILTER_ALL);
++ 
++ 	return 0;
++ }
++ 
+++>>>>>>> ea9b847cda64 (ice: enable transmit timestamps for E810 devices)
+  /**
+   * ice_get_max_txq - return the maximum number of Tx queues for in a PF
+   * @pf: PF structure
+diff --cc drivers/net/ethernet/intel/ice/ice_main.c
+index 0510fcf5eb90,96276533822e..000000000000
+--- a/drivers/net/ethernet/intel/ice/ice_main.c
++++ b/drivers/net/ethernet/intel/ice/ice_main.c
+@@@ -2726,11 -2792,24 +2726,32 @@@ static irqreturn_t ice_misc_intr(int __
+  		}
+  	}
+  
+++<<<<<<< HEAD
+ +	if (oicr & PFINT_OICR_HMC_ERR_M) {
+ +		ena_mask &= ~PFINT_OICR_HMC_ERR_M;
+ +		dev_dbg(dev, "HMC Error interrupt - info 0x%x, data 0x%x\n",
+ +			rd32(hw, PFHMC_ERRORINFO),
+ +			rd32(hw, PFHMC_ERRORDATA));
+++=======
++ 	if (oicr & PFINT_OICR_TSYN_TX_M) {
++ 		ena_mask &= ~PFINT_OICR_TSYN_TX_M;
++ 		ice_ptp_process_ts(pf);
++ 	}
++ 
++ #define ICE_AUX_CRIT_ERR (PFINT_OICR_PE_CRITERR_M | PFINT_OICR_HMC_ERR_M | PFINT_OICR_PE_PUSH_M)
++ 	if (oicr & ICE_AUX_CRIT_ERR) {
++ 		struct iidc_event *event;
++ 
++ 		ena_mask &= ~ICE_AUX_CRIT_ERR;
++ 		event = kzalloc(sizeof(*event), GFP_KERNEL);
++ 		if (event) {
++ 			set_bit(IIDC_EVENT_CRIT_ERR, event->type);
++ 			/* report the entire OICR value to AUX driver */
++ 			event->reg = oicr;
++ 			ice_send_event_to_aux(pf, event);
++ 			kfree(event);
++ 		}
+++>>>>>>> ea9b847cda64 (ice: enable transmit timestamps for E810 devices)
+  	}
+  
+  	/* Report any remaining unexpected interrupts */
+diff --cc drivers/net/ethernet/intel/ice/ice_txrx.h
+index 90957a75ab37,1e46e80f3d6f..000000000000
+--- a/drivers/net/ethernet/intel/ice/ice_txrx.h
++++ b/drivers/net/ethernet/intel/ice/ice_txrx.h
+@@@ -308,6 -312,10 +309,13 @@@ struct ice_ring 
+  	u32 txq_teid;			/* Added Tx queue TEID */
+  	u16 rx_buf_len;
+  	u8 dcb_tc;			/* Traffic class of ring */
+++<<<<<<< HEAD
+++=======
++ 	struct ice_ptp_tx *tx_tstamps;
++ 	u64 cached_phctime;
++ 	u8 ptp_rx:1;
++ 	u8 ptp_tx:1;
+++>>>>>>> ea9b847cda64 (ice: enable transmit timestamps for E810 devices)
+  } ____cacheline_internodealigned_in_smp;
+  
+  static inline bool ice_ring_uses_build_skb(struct ice_ring *ring)
+* Unmerged path drivers/net/ethernet/intel/ice/ice_ptp.c
+* Unmerged path drivers/net/ethernet/intel/ice/ice_ptp.h
+diff --git a/drivers/net/ethernet/intel/ice/ice_base.c b/drivers/net/ethernet/intel/ice/ice_base.c
+index 952e41a1e001..97a4c341048f 100644
+--- a/drivers/net/ethernet/intel/ice/ice_base.c
++++ b/drivers/net/ethernet/intel/ice/ice_base.c
+@@ -264,6 +264,15 @@ ice_setup_tx_ctx(struct ice_ring *ring, struct ice_tlan_ctx *tlan_ctx, u16 pf_q)
+ 	/* make sure the context is associated with the right VSI */
+ 	tlan_ctx->src_vsi = ice_get_hw_vsi_num(hw, vsi->idx);
+ 
++	/* Restrict Tx timestamps to the PF VSI */
++	switch (vsi->type) {
++	case ICE_VSI_PF:
++		tlan_ctx->tsyn_ena = 1;
++		break;
++	default:
++		break;
++	}
++
+ 	tlan_ctx->tso_ena = ICE_TX_LEGACY;
+ 	tlan_ctx->tso_qnum = pf_q;
+ 
+* Unmerged path drivers/net/ethernet/intel/ice/ice_ethtool.c
+diff --git a/drivers/net/ethernet/intel/ice/ice_hw_autogen.h b/drivers/net/ethernet/intel/ice/ice_hw_autogen.h
+index c02295f48915..058ed30bfcaa 100644
+--- a/drivers/net/ethernet/intel/ice/ice_hw_autogen.h
++++ b/drivers/net/ethernet/intel/ice/ice_hw_autogen.h
+@@ -155,6 +155,7 @@
+ #define PFINT_MBX_CTL_ITR_INDX_M		ICE_M(0x3, 11)
+ #define PFINT_MBX_CTL_CAUSE_ENA_M		BIT(30)
+ #define PFINT_OICR				0x0016CA00
++#define PFINT_OICR_TSYN_TX_M			BIT(11)
+ #define PFINT_OICR_ECC_ERR_M			BIT(16)
+ #define PFINT_OICR_MAL_DETECT_M			BIT(19)
+ #define PFINT_OICR_GRST_M			BIT(20)
+diff --git a/drivers/net/ethernet/intel/ice/ice_lib.c b/drivers/net/ethernet/intel/ice/ice_lib.c
+index 35a2380e512a..e9ac12c1d859 100644
+--- a/drivers/net/ethernet/intel/ice/ice_lib.c
++++ b/drivers/net/ethernet/intel/ice/ice_lib.c
+@@ -1281,6 +1281,7 @@ static int ice_vsi_alloc_rings(struct ice_vsi *vsi)
+ 		ring->reg_idx = vsi->txq_map[i];
+ 		ring->ring_active = false;
+ 		ring->vsi = vsi;
++		ring->tx_tstamps = &pf->ptp.port.tx;
+ 		ring->dev = dev;
+ 		ring->count = vsi->num_tx_desc;
+ 		WRITE_ONCE(vsi->tx_rings[i], ring);
+* Unmerged path drivers/net/ethernet/intel/ice/ice_main.c
+* Unmerged path drivers/net/ethernet/intel/ice/ice_ptp.c
+* Unmerged path drivers/net/ethernet/intel/ice/ice_ptp.h
+diff --git a/drivers/net/ethernet/intel/ice/ice_txrx.c b/drivers/net/ethernet/intel/ice/ice_txrx.c
+index 27e051d04493..1452a212ef1e 100644
+--- a/drivers/net/ethernet/intel/ice/ice_txrx.c
++++ b/drivers/net/ethernet/intel/ice/ice_txrx.c
+@@ -2340,6 +2340,41 @@ static bool ice_chk_linearize(struct sk_buff *skb, unsigned int count)
+ 	return count != ICE_MAX_BUF_TXD;
+ }
+ 
++/**
++ * ice_tstamp - set up context descriptor for hardware timestamp
++ * @tx_ring: pointer to the Tx ring to send buffer on
++ * @skb: pointer to the SKB we're sending
++ * @first: Tx buffer
++ * @off: Tx offload parameters
++ */
++static void
++ice_tstamp(struct ice_ring *tx_ring, struct sk_buff *skb,
++	   struct ice_tx_buf *first, struct ice_tx_offload_params *off)
++{
++	s8 idx;
++
++	/* only timestamp the outbound packet if the user has requested it */
++	if (likely(!(skb_shinfo(skb)->tx_flags & SKBTX_HW_TSTAMP)))
++		return;
++
++	if (!tx_ring->ptp_tx)
++		return;
++
++	/* Tx timestamps cannot be sampled when doing TSO */
++	if (first->tx_flags & ICE_TX_FLAGS_TSO)
++		return;
++
++	/* Grab an open timestamp slot */
++	idx = ice_ptp_request_ts(tx_ring->tx_tstamps, skb);
++	if (idx < 0)
++		return;
++
++	off->cd_qw1 |= (u64)(ICE_TX_DESC_DTYPE_CTX |
++			     (ICE_TX_CTX_DESC_TSYN << ICE_TXD_CTX_QW1_CMD_S) |
++			     ((u64)idx << ICE_TXD_CTX_QW1_TSO_LEN_S));
++	first->tx_flags |= ICE_TX_FLAGS_TSYN;
++}
++
+ /**
+  * ice_xmit_frame_ring - Sends buffer on Tx ring
+  * @skb: send buffer
+@@ -2409,6 +2444,8 @@ ice_xmit_frame_ring(struct sk_buff *skb, struct ice_ring *tx_ring)
+ 					ICE_TX_CTX_DESC_SWTCH_UPLINK <<
+ 					ICE_TXD_CTX_QW1_CMD_S);
+ 
++	ice_tstamp(tx_ring, skb, first, &offload);
++
+ 	if (offload.cd_qw1 & ICE_TX_DESC_DTYPE_CTX) {
+ 		struct ice_tx_ctx_desc *cdesc;
+ 		u16 i = tx_ring->next_to_use;
+* Unmerged path drivers/net/ethernet/intel/ice/ice_txrx.h
