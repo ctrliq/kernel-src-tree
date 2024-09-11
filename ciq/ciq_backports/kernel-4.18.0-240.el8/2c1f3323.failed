@@ -1,0 +1,254 @@
+KVM: nVMX: Split VM-Exit reflection logic into L0 vs. L1 wants
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Sean Christopherson <sean.j.christopherson@intel.com>
+commit 2c1f3323802e4c4495bc8cc55d4867ded6014274
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/2c1f3323.failed
+
+Split the logic that determines whether a nested VM-Exit is reflected
+into L1 into "L0 wants" and "L1 wants" to document the core control flow
+at a high level.  If L0 wants the VM-Exit, e.g. because the exit is due
+to a hardware event that isn't passed through to L1, then KVM should
+handle the exit in L0 without considering L1's configuration.  Then, if
+L0 doesn't want the exit, KVM needs to query L1's wants to determine
+whether or not L1 "caused" the exit, e.g. by setting an exiting control,
+versus the exit occurring due to an L0 setting, e.g. when L0 intercepts
+an action that L1 chose to pass-through.
+
+Note, this adds an extra read on vmcs.VM_EXIT_INTR_INFO for exception.
+This will be addressed in a future patch via a VMX-wide enhancement,
+rather than pile on another case where vmx->exit_intr_info is
+conditionally available.
+
+	Suggested-by: Vitaly Kuznetsov <vkuznets@redhat.com>
+	Signed-off-by: Sean Christopherson <sean.j.christopherson@intel.com>
+Message-Id: <20200415175519.14230-6-sean.j.christopherson@intel.com>
+	Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+(cherry picked from commit 2c1f3323802e4c4495bc8cc55d4867ded6014274)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kvm/vmx/nested.c
+diff --cc arch/x86/kvm/vmx/nested.c
+index 14550eccb946,c2745cd9e022..000000000000
+--- a/arch/x86/kvm/vmx/nested.c
++++ b/arch/x86/kvm/vmx/nested.c
+@@@ -5576,69 -5642,91 +5576,126 @@@ static bool nested_vmx_exit_handled_mtf
+  }
+  
+  /*
+-  * Return true if we should exit from L2 to L1 to handle an exit, or false if we
+-  * should handle it ourselves in L0 (and then continue L2). Only call this
+-  * when in is_guest_mode (L2).
++  * Return true if L0 wants to handle an exit from L2 regardless of whether or not
++  * L1 wants the exit.  Only call this when in is_guest_mode (L2).
+   */
+++<<<<<<< HEAD
+ +bool nested_vmx_exit_reflected(struct kvm_vcpu *vcpu, u32 exit_reason)
+ +{
+ +	u32 intr_info = vmcs_read32(VM_EXIT_INTR_INFO);
+ +	struct vcpu_vmx *vmx = to_vmx(vcpu);
+++=======
++ static bool nested_vmx_l0_wants_exit(struct kvm_vcpu *vcpu, u32 exit_reason)
++ {
++ 	u32 intr_info;
++ 
++ 	switch (exit_reason) {
++ 	case EXIT_REASON_EXCEPTION_NMI:
++ 		intr_info = vmcs_read32(VM_EXIT_INTR_INFO);
++ 		if (is_nmi(intr_info))
++ 			return true;
++ 		else if (is_page_fault(intr_info))
++ 			return vcpu->arch.apf.host_apf_reason || !enable_ept;
++ 		else if (is_debug(intr_info) &&
++ 			 vcpu->guest_debug &
++ 			 (KVM_GUESTDBG_SINGLESTEP | KVM_GUESTDBG_USE_HW_BP))
++ 			return true;
++ 		else if (is_breakpoint(intr_info) &&
++ 			 vcpu->guest_debug & KVM_GUESTDBG_USE_SW_BP)
++ 			return true;
++ 		return false;
++ 	case EXIT_REASON_EXTERNAL_INTERRUPT:
++ 		return true;
++ 	case EXIT_REASON_MCE_DURING_VMENTRY:
++ 		return true;
++ 	case EXIT_REASON_EPT_VIOLATION:
++ 		/*
++ 		 * L0 always deals with the EPT violation. If nested EPT is
++ 		 * used, and the nested mmu code discovers that the address is
++ 		 * missing in the guest EPT table (EPT12), the EPT violation
++ 		 * will be injected with nested_ept_inject_page_fault()
++ 		 */
++ 		return true;
++ 	case EXIT_REASON_EPT_MISCONFIG:
++ 		/*
++ 		 * L2 never uses directly L1's EPT, but rather L0's own EPT
++ 		 * table (shadow on EPT) or a merged EPT table that L0 built
++ 		 * (EPT on EPT). So any problems with the structure of the
++ 		 * table is L0's fault.
++ 		 */
++ 		return true;
++ 	case EXIT_REASON_PREEMPTION_TIMER:
++ 		return true;
++ 	case EXIT_REASON_PML_FULL:
++ 		/* We emulate PML support to L1. */
++ 		return true;
++ 	case EXIT_REASON_VMFUNC:
++ 		/* VM functions are emulated through L2->L0 vmexits. */
++ 		return true;
++ 	case EXIT_REASON_ENCLS:
++ 		/* SGX is never exposed to L1 */
++ 		return true;
++ 	default:
++ 		break;
++ 	}
++ 	return false;
++ }
++ 
++ /*
++  * Return 1 if L1 wants to intercept an exit from L2.  Only call this when in
++  * is_guest_mode (L2).
++  */
++ static bool nested_vmx_l1_wants_exit(struct kvm_vcpu *vcpu, u32 exit_reason)
++ {
+++>>>>>>> 2c1f3323802e (KVM: nVMX: Split VM-Exit reflection logic into L0 vs. L1 wants)
+  	struct vmcs12 *vmcs12 = get_vmcs12(vcpu);
+ -	u32 intr_info;
+ +
+ +	if (vmx->nested.nested_run_pending)
+ +		return false;
+ +
+ +	if (unlikely(vmx->fail)) {
+ +		trace_kvm_nested_vmenter_failed(
+ +			"hardware VM-instruction error: ",
+ +			vmcs_read32(VM_INSTRUCTION_ERROR));
+ +		return true;
+ +	}
+ +
+ +	/*
+ +	 * The host physical addresses of some pages of guest memory
+ +	 * are loaded into the vmcs02 (e.g. vmcs12's Virtual APIC
+ +	 * Page). The CPU may write to these pages via their host
+ +	 * physical address while L2 is running, bypassing any
+ +	 * address-translation-based dirty tracking (e.g. EPT write
+ +	 * protection).
+ +	 *
+ +	 * Mark them dirty on every exit from L2 to prevent them from
+ +	 * getting out of sync with dirty tracking.
+ +	 */
+ +	nested_mark_vmcs12_pages_dirty(vcpu);
+ +
+ +	trace_kvm_nested_vmexit(kvm_rip_read(vcpu), exit_reason,
+ +				vmcs_readl(EXIT_QUALIFICATION),
+ +				vmx->idt_vectoring_info,
+ +				intr_info,
+ +				vmcs_read32(VM_EXIT_INTR_ERROR_CODE),
+ +				KVM_ISA_VMX);
+  
+  	switch (exit_reason) {
+  	case EXIT_REASON_EXCEPTION_NMI:
+ -		intr_info = vmcs_read32(VM_EXIT_INTR_INFO);
+  		if (is_nmi(intr_info))
+- 			return false;
++ 			return true;
+  		else if (is_page_fault(intr_info))
+- 			return !vmx->vcpu.arch.apf.host_apf_reason && enable_ept;
+- 		else if (is_debug(intr_info) &&
+- 			 vcpu->guest_debug &
+- 			 (KVM_GUESTDBG_SINGLESTEP | KVM_GUESTDBG_USE_HW_BP))
+- 			return false;
+- 		else if (is_breakpoint(intr_info) &&
+- 			 vcpu->guest_debug & KVM_GUESTDBG_USE_SW_BP)
+- 			return false;
++ 			return true;
+  		return vmcs12->exception_bitmap &
+  				(1u << (intr_info & INTR_INFO_VECTOR_MASK));
+  	case EXIT_REASON_EXTERNAL_INTERRUPT:
+- 		return false;
++ 		return nested_exit_on_intr(vcpu);
+  	case EXIT_REASON_TRIPLE_FAULT:
+  		return true;
+ -	case EXIT_REASON_INTERRUPT_WINDOW:
+ -		return nested_cpu_has(vmcs12, CPU_BASED_INTR_WINDOW_EXITING);
+ +	case EXIT_REASON_PENDING_INTERRUPT:
+ +		return nested_cpu_has(vmcs12, CPU_BASED_VIRTUAL_INTR_PENDING);
+  	case EXIT_REASON_NMI_WINDOW:
+ -		return nested_cpu_has(vmcs12, CPU_BASED_NMI_WINDOW_EXITING);
+ +		return nested_cpu_has(vmcs12, CPU_BASED_VIRTUAL_NMI_PENDING);
+  	case EXIT_REASON_TASK_SWITCH:
+  		return true;
+  	case EXIT_REASON_CPUID:
+@@@ -5761,6 -5822,66 +5791,69 @@@
+  	}
+  }
+  
+++<<<<<<< HEAD
+++=======
++ /*
++  * Conditionally reflect a VM-Exit into L1.  Returns %true if the VM-Exit was
++  * reflected into L1.
++  */
++ bool nested_vmx_reflect_vmexit(struct kvm_vcpu *vcpu, u32 exit_reason)
++ {
++ 	struct vcpu_vmx *vmx = to_vmx(vcpu);
++ 	u32 exit_intr_info, exit_qual;
++ 
++ 	WARN_ON_ONCE(vmx->nested.nested_run_pending);
++ 
++ 	/*
++ 	 * Late nested VM-Fail shares the same flow as nested VM-Exit since KVM
++ 	 * has already loaded L2's state.
++ 	 */
++ 	if (unlikely(vmx->fail)) {
++ 		trace_kvm_nested_vmenter_failed(
++ 			"hardware VM-instruction error: ",
++ 			vmcs_read32(VM_INSTRUCTION_ERROR));
++ 		exit_intr_info = 0;
++ 		exit_qual = 0;
++ 		goto reflect_vmexit;
++ 	}
++ 
++ 	exit_intr_info = vmcs_read32(VM_EXIT_INTR_INFO);
++ 	exit_qual = vmcs_readl(EXIT_QUALIFICATION);
++ 
++ 	trace_kvm_nested_vmexit(kvm_rip_read(vcpu), exit_reason, exit_qual,
++ 				vmx->idt_vectoring_info, exit_intr_info,
++ 				vmcs_read32(VM_EXIT_INTR_ERROR_CODE),
++ 				KVM_ISA_VMX);
++ 
++ 	/* If L0 (KVM) wants the exit, it trumps L1's desires. */
++ 	if (nested_vmx_l0_wants_exit(vcpu, exit_reason))
++ 		return false;
++ 
++ 	/* If L1 doesn't want the exit, handle it in L0. */
++ 	if (!nested_vmx_l1_wants_exit(vcpu, exit_reason))
++ 		return false;
++ 
++ 	/*
++ 	 * At this point, the exit interruption info in exit_intr_info
++ 	 * is only valid for EXCEPTION_NMI exits.  For EXTERNAL_INTERRUPT
++ 	 * we need to query the in-kernel LAPIC.
++ 	 */
++ 	WARN_ON(exit_reason == EXIT_REASON_EXTERNAL_INTERRUPT);
++ 
++ 	if ((exit_intr_info &
++ 	     (INTR_INFO_VALID_MASK | INTR_INFO_DELIVER_CODE_MASK)) ==
++ 	    (INTR_INFO_VALID_MASK | INTR_INFO_DELIVER_CODE_MASK)) {
++ 		struct vmcs12 *vmcs12 = get_vmcs12(vcpu);
++ 
++ 		vmcs12->vm_exit_intr_error_code =
++ 			vmcs_read32(VM_EXIT_INTR_ERROR_CODE);
++ 	}
++ 
++ reflect_vmexit:
++ 	nested_vmx_vmexit(vcpu, exit_reason, exit_intr_info, exit_qual);
++ 	return true;
++ }
+++>>>>>>> 2c1f3323802e (KVM: nVMX: Split VM-Exit reflection logic into L0 vs. L1 wants)
+  
+  static int vmx_get_nested_state(struct kvm_vcpu *vcpu,
+  				struct kvm_nested_state __user *user_kvm_nested_state,
+* Unmerged path arch/x86/kvm/vmx/nested.c
