@@ -1,0 +1,304 @@
+locking/rtmutex: Guard regular sleeping locks specific functions
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-358.el8
+commit-author Thomas Gleixner <tglx@linutronix.de>
+commit e17ba59b7e8e1f67e36d8fcc46daa13370efcf11
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-358.el8/e17ba59b.failed
+
+Guard the regular sleeping lock specific functionality, which is used for
+rtmutex on non-RT enabled kernels and for mutex, rtmutex and semaphores on
+RT enabled kernels so the code can be reused for the RT specific
+implementation of spinlocks and rwlocks in a different compilation unit.
+
+No functional change.
+
+	Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+	Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+	Signed-off-by: Ingo Molnar <mingo@kernel.org>
+Link: https://lore.kernel.org/r/20210815211303.311535693@linutronix.de
+(cherry picked from commit e17ba59b7e8e1f67e36d8fcc46daa13370efcf11)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	kernel/locking/rtmutex.c
+#	kernel/locking/rwsem.c
+diff --cc kernel/locking/rtmutex.c
+index 9b4b88de33e3,949781aa54b1..000000000000
+--- a/kernel/locking/rtmutex.c
++++ b/kernel/locking/rtmutex.c
+@@@ -1077,10 -1207,10 +1206,10 @@@ static __always_inline void __rt_mutex_
+  /*
+   * Remove a waiter from a lock and give up
+   *
+-  * Must be called with lock->wait_lock held and interrupts disabled. I must
++  * Must be called with lock->wait_lock held and interrupts disabled. It must
+   * have just failed to try_to_take_rt_mutex().
+   */
+ -static void __sched remove_waiter(struct rt_mutex_base *lock,
+ +static void __sched remove_waiter(struct rt_mutex *lock,
+  				  struct rt_mutex_waiter *waiter)
+  {
+  	bool is_top_waiter = (waiter == rt_mutex_top_waiter(lock));
+@@@ -1259,25 -1367,17 +1388,26 @@@ static int __sched rt_mutex_slowlock(st
+  	return ret;
+  }
+  
+ -static inline int __rt_mutex_slowlock_locked(struct rt_mutex_base *lock,
+ -					     unsigned int state)
+ +static __always_inline int __rt_mutex_lock(struct rt_mutex *lock,
+ +					   unsigned int state)
+  {
+ -	struct rt_mutex_waiter waiter;
+ -	int ret;
+ +	if (likely(rt_mutex_cmpxchg_acquire(lock, NULL, current)))
+ +		return 0;
+  
+ -	rt_mutex_init_waiter(&waiter);
+ +	return rt_mutex_slowlock(lock, state, NULL, RT_MUTEX_MIN_CHAINWALK);
+ +}
+++<<<<<<< HEAD
+  
+ -	ret = __rt_mutex_slowlock(lock, state, RT_MUTEX_MIN_CHAINWALK, &waiter);
+ +static int __sched __rt_mutex_slowtrylock(struct rt_mutex *lock)
+ +{
+ +	int ret = try_to_take_rt_mutex(lock, current, NULL);
+ +
+ +	/*
+ +	 * try_to_take_rt_mutex() sets the lock waiters bit
+ +	 * unconditionally. Clean this up.
+ +	 */
+ +	fixup_rt_mutex_waiters(lock);
+  
+ -	debug_rt_mutex_free_waiter(&waiter);
+  	return ret;
+  }
+  
+@@@ -1310,82 -1407,12 +1440,85 @@@ static int __sched rt_mutex_slowtrylock
+  	return ret;
+  }
+  
+ -static __always_inline int __rt_mutex_lock(struct rt_mutex_base *lock,
+ -					   unsigned int state)
+ +static __always_inline int __rt_mutex_trylock(struct rt_mutex *lock)
+  {
+  	if (likely(rt_mutex_cmpxchg_acquire(lock, NULL, current)))
+ -		return 0;
+ +		return 1;
+  
+ -	return rt_mutex_slowlock(lock, state);
+ +	return rt_mutex_slowtrylock(lock);
+ +}
+ +
+ +/*
+ + * Slow path to release a rt-mutex.
+ + */
+ +static void __sched rt_mutex_slowunlock(struct rt_mutex *lock)
+ +{
+ +	DEFINE_WAKE_Q(wake_q);
+ +	unsigned long flags;
+ +
+ +	/* irqsave required to support early boot calls */
+ +	raw_spin_lock_irqsave(&lock->wait_lock, flags);
+ +
+ +	debug_rt_mutex_unlock(lock);
+ +
+ +	/*
+ +	 * We must be careful here if the fast path is enabled. If we
+ +	 * have no waiters queued we cannot set owner to NULL here
+ +	 * because of:
+ +	 *
+ +	 * foo->lock->owner = NULL;
+ +	 *			rtmutex_lock(foo->lock);   <- fast path
+ +	 *			free = atomic_dec_and_test(foo->refcnt);
+ +	 *			rtmutex_unlock(foo->lock); <- fast path
+ +	 *			if (free)
+ +	 *				kfree(foo);
+ +	 * raw_spin_unlock(foo->lock->wait_lock);
+ +	 *
+ +	 * So for the fastpath enabled kernel:
+ +	 *
+ +	 * Nothing can set the waiters bit as long as we hold
+ +	 * lock->wait_lock. So we do the following sequence:
+ +	 *
+ +	 *	owner = rt_mutex_owner(lock);
+ +	 *	clear_rt_mutex_waiters(lock);
+ +	 *	raw_spin_unlock(&lock->wait_lock);
+ +	 *	if (cmpxchg(&lock->owner, owner, 0) == owner)
+ +	 *		return;
+ +	 *	goto retry;
+ +	 *
+ +	 * The fastpath disabled variant is simple as all access to
+ +	 * lock->owner is serialized by lock->wait_lock:
+ +	 *
+ +	 *	lock->owner = NULL;
+ +	 *	raw_spin_unlock(&lock->wait_lock);
+ +	 */
+ +	while (!rt_mutex_has_waiters(lock)) {
+ +		/* Drops lock->wait_lock ! */
+ +		if (unlock_rt_mutex_safe(lock, flags) == true)
+ +			return;
+ +		/* Relock the rtmutex and try again */
+ +		raw_spin_lock_irqsave(&lock->wait_lock, flags);
+ +	}
+ +
+ +	/*
+ +	 * The wakeup next waiter path does not suffer from the above
+ +	 * race. See the comments there.
+ +	 *
+ +	 * Queue the next waiter for wakeup once we release the wait_lock.
+ +	 */
+ +	mark_wakeup_next_waiter(&wake_q, lock);
+ +	raw_spin_unlock_irqrestore(&lock->wait_lock, flags);
+ +
+ +	rt_mutex_postunlock(&wake_q);
+ +}
+ +
+ +static __always_inline void __rt_mutex_unlock(struct rt_mutex *lock)
+ +{
+ +	if (likely(rt_mutex_cmpxchg_release(lock, current, NULL)))
+ +		return;
+ +
+ +	rt_mutex_slowunlock(lock);
+  }
+++=======
++ #endif /* RT_MUTEX_BUILD_MUTEX */
+++>>>>>>> e17ba59b7e8e (locking/rtmutex: Guard regular sleeping locks specific functions)
+diff --cc kernel/locking/rwsem.c
+index b251178daca3,2847833d5583..000000000000
+--- a/kernel/locking/rwsem.c
++++ b/kernel/locking/rwsem.c
+@@@ -1352,6 -1345,114 +1352,117 @@@ static inline void __downgrade_write(st
+  		rwsem_downgrade_wake(sem);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ #else /* !CONFIG_PREEMPT_RT */
++ 
++ #define RT_MUTEX_BUILD_MUTEX
++ #include "rtmutex.c"
++ 
++ #define rwbase_set_and_save_current_state(state)	\
++ 	set_current_state(state)
++ 
++ #define rwbase_restore_current_state()			\
++ 	__set_current_state(TASK_RUNNING)
++ 
++ #define rwbase_rtmutex_lock_state(rtm, state)		\
++ 	__rt_mutex_lock(rtm, state)
++ 
++ #define rwbase_rtmutex_slowlock_locked(rtm, state)	\
++ 	__rt_mutex_slowlock_locked(rtm, state)
++ 
++ #define rwbase_rtmutex_unlock(rtm)			\
++ 	__rt_mutex_unlock(rtm)
++ 
++ #define rwbase_rtmutex_trylock(rtm)			\
++ 	__rt_mutex_trylock(rtm)
++ 
++ #define rwbase_signal_pending_state(state, current)	\
++ 	signal_pending_state(state, current)
++ 
++ #define rwbase_schedule()				\
++ 	schedule()
++ 
++ #include "rwbase_rt.c"
++ 
++ #ifdef CONFIG_DEBUG_LOCK_ALLOC
++ void __rwsem_init(struct rw_semaphore *sem, const char *name,
++ 		  struct lock_class_key *key)
++ {
++ 	debug_check_no_locks_freed((void *)sem, sizeof(*sem));
++ 	lockdep_init_map_wait(&sem->dep_map, name, key, 0, LD_WAIT_SLEEP);
++ }
++ EXPORT_SYMBOL(__rwsem_init);
++ #endif
++ 
++ static inline void __down_read(struct rw_semaphore *sem)
++ {
++ 	rwbase_read_lock(&sem->rwbase, TASK_UNINTERRUPTIBLE);
++ }
++ 
++ static inline int __down_read_interruptible(struct rw_semaphore *sem)
++ {
++ 	return rwbase_read_lock(&sem->rwbase, TASK_INTERRUPTIBLE);
++ }
++ 
++ static inline int __down_read_killable(struct rw_semaphore *sem)
++ {
++ 	return rwbase_read_lock(&sem->rwbase, TASK_KILLABLE);
++ }
++ 
++ static inline int __down_read_trylock(struct rw_semaphore *sem)
++ {
++ 	return rwbase_read_trylock(&sem->rwbase);
++ }
++ 
++ static inline void __up_read(struct rw_semaphore *sem)
++ {
++ 	rwbase_read_unlock(&sem->rwbase, TASK_NORMAL);
++ }
++ 
++ static inline void __sched __down_write(struct rw_semaphore *sem)
++ {
++ 	rwbase_write_lock(&sem->rwbase, TASK_UNINTERRUPTIBLE);
++ }
++ 
++ static inline int __sched __down_write_killable(struct rw_semaphore *sem)
++ {
++ 	return rwbase_write_lock(&sem->rwbase, TASK_KILLABLE);
++ }
++ 
++ static inline int __down_write_trylock(struct rw_semaphore *sem)
++ {
++ 	return rwbase_write_trylock(&sem->rwbase);
++ }
++ 
++ static inline void __up_write(struct rw_semaphore *sem)
++ {
++ 	rwbase_write_unlock(&sem->rwbase);
++ }
++ 
++ static inline void __downgrade_write(struct rw_semaphore *sem)
++ {
++ 	rwbase_write_downgrade(&sem->rwbase);
++ }
++ 
++ /* Debug stubs for the common API */
++ #define DEBUG_RWSEMS_WARN_ON(c, sem)
++ 
++ static inline void __rwsem_set_reader_owned(struct rw_semaphore *sem,
++ 					    struct task_struct *owner)
++ {
++ }
++ 
++ static inline bool is_rwsem_reader_owned(struct rw_semaphore *sem)
++ {
++ 	int count = atomic_read(&sem->rwbase.readers);
++ 
++ 	return count < 0 && count != READER_BIAS;
++ }
++ 
++ #endif /* CONFIG_PREEMPT_RT */
++ 
+++>>>>>>> e17ba59b7e8e (locking/rtmutex: Guard regular sleeping locks specific functions)
+  /*
+   * lock for reading
+   */
+* Unmerged path kernel/locking/rtmutex.c
+diff --git a/kernel/locking/rtmutex_api.c b/kernel/locking/rtmutex_api.c
+index fc1322f5b219..04df69d979b9 100644
+--- a/kernel/locking/rtmutex_api.c
++++ b/kernel/locking/rtmutex_api.c
+@@ -5,6 +5,7 @@
+ #include <linux/spinlock.h>
+ #include <linux/export.h>
+ 
++#define RT_MUTEX_BUILD_MUTEX
+ #include "rtmutex.c"
+ 
+ /*
+* Unmerged path kernel/locking/rwsem.c
