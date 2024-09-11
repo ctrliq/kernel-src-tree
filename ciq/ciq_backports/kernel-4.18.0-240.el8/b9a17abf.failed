@@ -1,0 +1,175 @@
+devlink: implement DEVLINK_CMD_REGION_NEW
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Jacob Keller <jacob.e.keller@intel.com>
+commit b9a17abfde842bb09f894ba96a5cd9f5944f6bfa
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/b9a17abf.failed
+
+Implement support for the DEVLINK_CMD_REGION_NEW command for creating
+snapshots. This new command parallels the existing
+DEVLINK_CMD_REGION_DEL.
+
+In order for DEVLINK_CMD_REGION_NEW to work for a region, the new
+".snapshot" operation must be implemented in the region's ops structure.
+
+The desired snapshot id must be provided. This helps avoid confusion on
+the purpose of DEVLINK_CMD_REGION_NEW, and keeps the API simpler.
+
+The requested id will be inserted into the xarray tracking the number of
+snapshots using each id. If this id is already used by another snapshot
+on any region, an error will be returned.
+
+	Signed-off-by: Jacob Keller <jacob.e.keller@intel.com>
+	Reviewed-by: Jiri Pirko <jiri@mellanox.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit b9a17abfde842bb09f894ba96a5cd9f5944f6bfa)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	Documentation/networking/devlink/devlink-region.rst
+#	net/core/devlink.c
+diff --cc net/core/devlink.c
+index a66f1417ec7a,d20efdc8cc73..000000000000
+--- a/net/core/devlink.c
++++ b/net/core/devlink.c
+@@@ -3661,6 -3769,110 +3661,113 @@@ out_free_msg
+  }
+  
+  /**
+++<<<<<<< HEAD
+++=======
++  * __devlink_snapshot_id_increment - Increment number of snapshots using an id
++  *	@devlink: devlink instance
++  *	@id: the snapshot id
++  *
++  *	Track when a new snapshot begins using an id. Load the count for the
++  *	given id from the snapshot xarray, increment it, and store it back.
++  *
++  *	Called when a new snapshot is created with the given id.
++  *
++  *	The id *must* have been previously allocated by
++  *	devlink_region_snapshot_id_get().
++  *
++  *	Returns 0 on success, or an error on failure.
++  */
++ static int __devlink_snapshot_id_increment(struct devlink *devlink, u32 id)
++ {
++ 	unsigned long count;
++ 	void *p;
++ 
++ 	lockdep_assert_held(&devlink->lock);
++ 
++ 	p = xa_load(&devlink->snapshot_ids, id);
++ 	if (WARN_ON(!p))
++ 		return -EINVAL;
++ 
++ 	if (WARN_ON(!xa_is_value(p)))
++ 		return -EINVAL;
++ 
++ 	count = xa_to_value(p);
++ 	count++;
++ 
++ 	return xa_err(xa_store(&devlink->snapshot_ids, id, xa_mk_value(count),
++ 			       GFP_KERNEL));
++ }
++ 
++ /**
++  * __devlink_snapshot_id_decrement - Decrease number of snapshots using an id
++  *	@devlink: devlink instance
++  *	@id: the snapshot id
++  *
++  *	Track when a snapshot is deleted and stops using an id. Load the count
++  *	for the given id from the snapshot xarray, decrement it, and store it
++  *	back.
++  *
++  *	If the count reaches zero, erase this id from the xarray, freeing it
++  *	up for future re-use by devlink_region_snapshot_id_get().
++  *
++  *	Called when a snapshot using the given id is deleted, and when the
++  *	initial allocator of the id is finished using it.
++  */
++ static void __devlink_snapshot_id_decrement(struct devlink *devlink, u32 id)
++ {
++ 	unsigned long count;
++ 	void *p;
++ 
++ 	lockdep_assert_held(&devlink->lock);
++ 
++ 	p = xa_load(&devlink->snapshot_ids, id);
++ 	if (WARN_ON(!p))
++ 		return;
++ 
++ 	if (WARN_ON(!xa_is_value(p)))
++ 		return;
++ 
++ 	count = xa_to_value(p);
++ 
++ 	if (count > 1) {
++ 		count--;
++ 		xa_store(&devlink->snapshot_ids, id, xa_mk_value(count),
++ 			 GFP_KERNEL);
++ 	} else {
++ 		/* If this was the last user, we can erase this id */
++ 		xa_erase(&devlink->snapshot_ids, id);
++ 	}
++ }
++ 
++ /**
++  *	__devlink_snapshot_id_insert - Insert a specific snapshot ID
++  *	@devlink: devlink instance
++  *	@id: the snapshot id
++  *
++  *	Mark the given snapshot id as used by inserting a zero value into the
++  *	snapshot xarray.
++  *
++  *	This must be called while holding the devlink instance lock. Unlike
++  *	devlink_snapshot_id_get, the initial reference count is zero, not one.
++  *	It is expected that the id will immediately be used before
++  *	releasing the devlink instance lock.
++  *
++  *	Returns zero on success, or an error code if the snapshot id could not
++  *	be inserted.
++  */
++ static int __devlink_snapshot_id_insert(struct devlink *devlink, u32 id)
++ {
++ 	lockdep_assert_held(&devlink->lock);
++ 
++ 	if (WARN_ON(xa_load(&devlink->snapshot_ids, id)))
++ 		return -EEXIST;
++ 
++ 	return xa_err(xa_store(&devlink->snapshot_ids, id, xa_mk_value(0),
++ 			       GFP_KERNEL));
++ }
++ 
++ /**
+++>>>>>>> b9a17abfde84 (devlink: implement DEVLINK_CMD_REGION_NEW)
+   *	__devlink_region_snapshot_id_get - get snapshot ID
+   *	@devlink: devlink instance
+   *	@id: storage to return snapshot id
+* Unmerged path Documentation/networking/devlink/devlink-region.rst
+* Unmerged path Documentation/networking/devlink/devlink-region.rst
+diff --git a/include/net/devlink.h b/include/net/devlink.h
+index 64ff6066eb41..3ec26f3a73bd 100644
+--- a/include/net/devlink.h
++++ b/include/net/devlink.h
+@@ -497,10 +497,16 @@ struct devlink_info_req;
+  * struct devlink_region_ops - Region operations
+  * @name: region name
+  * @destructor: callback used to free snapshot memory when deleting
++ * @snapshot: callback to request an immediate snapshot. On success,
++ *            the data variable must be updated to point to the snapshot data.
++ *            The function will be called while the devlink instance lock is
++ *            held.
+  */
+ struct devlink_region_ops {
+ 	const char *name;
+ 	void (*destructor)(const void *data);
++	int (*snapshot)(struct devlink *devlink, struct netlink_ext_ack *extack,
++			u8 **data);
+ };
+ 
+ struct devlink_fmsg;
+* Unmerged path net/core/devlink.c
