@@ -1,0 +1,181 @@
+mmc: core: Rework wp-gpio handling
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Michał Mirosław <mirq-linux@rere.qmqm.pl>
+commit 9073d10b098973519044f5fcdc25586810b435da
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/9073d10b.failed
+
+Use MMC_CAP2_RO_ACTIVE_HIGH flag as indicator if GPIO line is to be
+inverted compared to DT/platform-specified polarity. The flag is not used
+after init in GPIO mode anyway. No functional changes intended.
+
+	Signed-off-by: Michał Mirosław <mirq-linux@rere.qmqm.pl>
+Link: https://lore.kernel.org/r/a60f563f11bbff821da2fa2949ca82922b144860.1576031637.git.mirq-linux@rere.qmqm.pl
+	Signed-off-by: Ulf Hansson <ulf.hansson@linaro.org>
+(cherry picked from commit 9073d10b098973519044f5fcdc25586810b435da)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/mmc/core/host.c
+#	drivers/mmc/host/pxamci.c
+#	drivers/mmc/host/sdhci-esdhc-imx.c
+diff --cc drivers/mmc/core/host.c
+index abf9e884386c,b3484def0a8b..000000000000
+--- a/drivers/mmc/core/host.c
++++ b/drivers/mmc/core/host.c
+@@@ -258,9 -254,11 +257,15 @@@ int mmc_of_parse(struct mmc_host *host
+  	}
+  
+  	/* Parse Write Protection */
+- 	ro_cap_invert = device_property_read_bool(dev, "wp-inverted");
+  
+++<<<<<<< HEAD
+ +	ret = mmc_gpiod_request_ro(host, "wp", 0, false, 0, &ro_gpio_invert);
+++=======
++ 	if (device_property_read_bool(dev, "wp-inverted"))
++ 		host->caps2 |= MMC_CAP2_RO_ACTIVE_HIGH;
++ 
++ 	ret = mmc_gpiod_request_ro(host, "wp", 0, 0, NULL);
+++>>>>>>> 9073d10b0989 (mmc: core: Rework wp-gpio handling)
+  	if (!ret)
+  		dev_info(host->parent, "Got WP GPIO\n");
+  	else if (ret != -ENOENT && ret != -ENOSYS)
+diff --cc drivers/mmc/host/pxamci.c
+index c763b404510f,b2bbcb09a49e..000000000000
+--- a/drivers/mmc/host/pxamci.c
++++ b/drivers/mmc/host/pxamci.c
+@@@ -774,48 -725,41 +774,71 @@@ static int pxamci_probe(struct platform
+  	}
+  
+  	if (host->pdata) {
+ -		host->detect_delay_ms = host->pdata->detect_delay_ms;
+ -
+ -		host->power = devm_gpiod_get_optional(dev, "power", GPIOD_OUT_LOW);
+ -		if (IS_ERR(host->power)) {
+ -			dev_err(dev, "Failed requesting gpio_power\n");
+ +		gpio_cd = host->pdata->gpio_card_detect;
+ +		gpio_ro = host->pdata->gpio_card_ro;
+ +		gpio_power = host->pdata->gpio_power;
+ +	}
+ +	if (gpio_is_valid(gpio_power)) {
+ +		ret = devm_gpio_request(&pdev->dev, gpio_power,
+ +					"mmc card power");
+ +		if (ret) {
+ +			dev_err(&pdev->dev, "Failed requesting gpio_power %d\n",
+ +				gpio_power);
+  			goto out;
+  		}
+ -
+ -		/* FIXME: should we pass detection delay to debounce? */
+ -		ret = mmc_gpiod_request_cd(mmc, "cd", 0, false, 0, NULL);
+ -		if (ret && ret != -ENOENT) {
+ -			dev_err(dev, "Failed requesting gpio_cd\n");
+ +		gpio_direction_output(gpio_power,
+ +				      host->pdata->gpio_power_invert);
+ +	}
+ +	if (gpio_is_valid(gpio_ro)) {
+ +		ret = mmc_gpio_request_ro(mmc, gpio_ro);
+ +		if (ret) {
+ +			dev_err(&pdev->dev, "Failed requesting gpio_ro %d\n",
+ +				gpio_ro);
+  			goto out;
+++<<<<<<< HEAD
+ +		} else {
+ +			mmc->caps2 |= host->pdata->gpio_card_ro_invert ?
+ +				0 : MMC_CAP2_RO_ACTIVE_HIGH;
+ +		}
+++=======
++ 		}
++ 
++ 		if (!host->pdata->gpio_card_ro_invert)
++ 			mmc->caps2 |= MMC_CAP2_RO_ACTIVE_HIGH;
++ 
++ 		ret = mmc_gpiod_request_ro(mmc, "wp", 0, 0, NULL);
++ 		if (ret && ret != -ENOENT) {
++ 			dev_err(dev, "Failed requesting gpio_ro\n");
++ 			goto out;
++ 		}
++ 		if (!ret)
++ 			host->use_ro_gpio = true;
++ 
++ 		if (host->pdata->init)
++ 			host->pdata->init(dev, pxamci_detect_irq, mmc);
++ 
++ 		if (host->power && host->pdata->setpower)
++ 			dev_warn(dev, "gpio_power and setpower() both defined\n");
++ 		if (host->use_ro_gpio && host->pdata->get_ro)
++ 			dev_warn(dev, "gpio_ro and get_ro() both defined\n");
+++>>>>>>> 9073d10b0989 (mmc: core: Rework wp-gpio handling)
+  	}
+  
+ +	if (gpio_is_valid(gpio_cd))
+ +		ret = mmc_gpio_request_cd(mmc, gpio_cd, 0);
+ +	if (ret) {
+ +		dev_err(&pdev->dev, "Failed requesting gpio_cd %d\n", gpio_cd);
+ +		goto out;
+ +	}
+ +
+ +	if (host->pdata && host->pdata->init)
+ +		host->pdata->init(&pdev->dev, pxamci_detect_irq, mmc);
+ +
+ +	if (gpio_is_valid(gpio_power) && host->pdata->setpower)
+ +		dev_warn(&pdev->dev, "gpio_power and setpower() both defined\n");
+ +	if (gpio_is_valid(gpio_ro) && host->pdata->get_ro)
+ +		dev_warn(&pdev->dev, "gpio_ro and get_ro() both defined\n");
+ +
+  	mmc_add_host(mmc);
+  
+  	return 0;
+diff --cc drivers/mmc/host/sdhci-esdhc-imx.c
+index 4eb3d29ecde1,3be9739fec30..000000000000
+--- a/drivers/mmc/host/sdhci-esdhc-imx.c
++++ b/drivers/mmc/host/sdhci-esdhc-imx.c
+@@@ -1205,7 -1379,9 +1205,13 @@@ static int sdhci_esdhc_imx_probe_nondt(
+  				host->mmc->parent->platform_data);
+  	/* write_protect */
+  	if (boarddata->wp_type == ESDHC_WP_GPIO) {
+++<<<<<<< HEAD
+ +		err = mmc_gpio_request_ro(host->mmc, boarddata->wp_gpio);
+++=======
++ 		host->mmc->caps2 |= MMC_CAP2_RO_ACTIVE_HIGH;
++ 
++ 		err = mmc_gpiod_request_ro(host->mmc, "wp", 0, 0, NULL);
+++>>>>>>> 9073d10b0989 (mmc: core: Rework wp-gpio handling)
+  		if (err) {
+  			dev_err(mmc_dev(host->mmc),
+  				"failed to request write-protect gpio!\n");
+diff --git a/drivers/gpio/gpiolib-of.c b/drivers/gpio/gpiolib-of.c
+index f90ba3c6ac6b..932a3cf3425e 100644
+--- a/drivers/gpio/gpiolib-of.c
++++ b/drivers/gpio/gpiolib-of.c
+@@ -74,10 +74,6 @@ static void of_gpio_flags_quirks(struct device_node *np,
+ 			if (of_property_read_bool(np, "cd-inverted"))
+ 				*flags ^= OF_GPIO_ACTIVE_LOW;
+ 		}
+-		if (!strcmp(propname, "wp-gpios")) {
+-			if (of_property_read_bool(np, "wp-inverted"))
+-				*flags ^= OF_GPIO_ACTIVE_LOW;
+-		}
+ 	}
+ 	/*
+ 	 * Some GPIO fixed regulator quirks.
+* Unmerged path drivers/mmc/core/host.c
+diff --git a/drivers/mmc/core/slot-gpio.c b/drivers/mmc/core/slot-gpio.c
+index 2a833686784b..81cd42fbaba5 100644
+--- a/drivers/mmc/core/slot-gpio.c
++++ b/drivers/mmc/core/slot-gpio.c
+@@ -325,6 +325,9 @@ int mmc_gpiod_request_ro(struct mmc_host *host, const char *con_id,
+ 			return ret;
+ 	}
+ 
++	if (host->caps2 & MMC_CAP2_RO_ACTIVE_HIGH)
++		gpiod_toggle_active_low(desc);
++
+ 	if (gpio_invert)
+ 		*gpio_invert = !gpiod_is_active_low(desc);
+ 
+* Unmerged path drivers/mmc/host/pxamci.c
+* Unmerged path drivers/mmc/host/sdhci-esdhc-imx.c
