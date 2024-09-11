@@ -1,0 +1,477 @@
+selftests/bpf: add tests for libbpf's hashmap
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-193.el8
+commit-author Andrii Nakryiko <andriin@fb.com>
+commit 5d04ec687cf98bc6e8073c646994736a46ed4e24
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-193.el8/5d04ec68.failed
+
+Test all APIs for internal hashmap implementation.
+
+	Signed-off-by: Andrii Nakryiko <andriin@fb.com>
+	Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+(cherry picked from commit 5d04ec687cf98bc6e8073c646994736a46ed4e24)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	tools/testing/selftests/bpf/.gitignore
+#	tools/testing/selftests/bpf/Makefile
+diff --cc tools/testing/selftests/bpf/.gitignore
+index 159e0044042b,138b6c063916..000000000000
+--- a/tools/testing/selftests/bpf/.gitignore
++++ b/tools/testing/selftests/bpf/.gitignore
+@@@ -24,3 -24,15 +24,18 @@@ test_skb_cgroup_id_use
+  test_socket_cookie
+  test_cgroup_storage
+  test_select_reuseport
+++<<<<<<< HEAD
+++=======
++ test_flow_dissector
++ flow_dissector_load
++ test_netcnt
++ test_section_names
++ test_tcpnotify_user
++ test_libbpf
++ test_tcp_check_syncookie_user
++ test_sysctl
++ alu32
++ libbpf.pc
++ libbpf.so.*
++ test_hashmap
+++>>>>>>> 5d04ec687cf9 (selftests/bpf: add tests for libbpf's hashmap)
+diff --cc tools/testing/selftests/bpf/Makefile
+index 9bfa8b025d92,ddae06498a00..000000000000
+--- a/tools/testing/selftests/bpf/Makefile
++++ b/tools/testing/selftests/bpf/Makefile
+@@@ -24,22 -23,20 +24,26 @@@ TEST_GEN_PROGS = test_verifier test_ta
+  	test_align test_verifier_log test_dev_cgroup test_tcpbpf_user \
+  	test_sock test_btf test_sockmap test_lirc_mode2_user get_cgroup_id_user \
+  	test_socket_cookie test_cgroup_storage test_select_reuseport test_section_names \
+++<<<<<<< HEAD
+ +	test_netcnt test_tcpnotify_user
+++=======
++ 	test_netcnt test_tcpnotify_user test_sock_fields test_sysctl test_hashmap
+ -
+ -BPF_OBJ_FILES = $(patsubst %.c,%.o, $(notdir $(wildcard progs/*.c)))
+ -TEST_GEN_FILES = $(BPF_OBJ_FILES)
+ -
+ -# Also test sub-register code-gen if LLVM has eBPF v3 processor support which
+ -# contains both ALU32 and JMP32 instructions.
+ -SUBREG_CODEGEN := $(shell echo "int cal(int a) { return a > 0; }" | \
+ -			$(CLANG) -target bpf -O2 -emit-llvm -S -x c - -o - | \
+ -			$(LLC) -mattr=+alu32 -mcpu=v3 2>&1 | \
+ -			grep 'if w')
+ -ifneq ($(SUBREG_CODEGEN),)
+ -TEST_GEN_FILES += $(patsubst %.o,alu32/%.o, $(BPF_OBJ_FILES))
+ -endif
+++>>>>>>> 5d04ec687cf9 (selftests/bpf: add tests for libbpf's hashmap)
+ +
+ +TEST_GEN_FILES = test_pkt_access.o test_xdp.o test_l4lb.o test_tcp_estats.o test_obj_id.o \
+ +	test_pkt_md_access.o test_xdp_redirect.o test_xdp_meta.o sockmap_parse_prog.o     \
+ +	sockmap_verdict_prog.o dev_cgroup.o sample_ret0.o test_tracepoint.o \
+ +	test_l4lb_noinline.o test_xdp_noinline.o test_stacktrace_map.o \
+ +	test_tcpnotify_kern.o \
+ +	sample_map_ret0.o test_tcpbpf_kern.o test_stacktrace_build_id.o \
+ +	sockmap_tcp_msg_prog.o connect4_prog.o connect6_prog.o test_adjust_tail.o \
+ +	test_btf_haskv.o test_btf_nokv.o test_sockmap_kern.o test_tunnel_kern.o \
+ +	test_get_stack_rawtp.o test_sockmap_kern.o test_sockhash_kern.o \
+ +	test_lwt_seg6local.o sendmsg4_prog.o sendmsg6_prog.o test_lirc_mode2_kern.o \
+ +	get_cgroup_id_kern.o socket_cookie_prog.o test_select_reuseport_kern.o \
+ +	test_skb_cgroup_id_kern.o bpf_flow.o netcnt_prog.o \
+ +	test_sk_lookup_kern.o test_xdp_vlan.o test_queue_map.o test_stack_map.o \
+ +	xdp_dummy.o test_map_in_map.o
+  
+  # Order correspond to 'make run_tests' order
+  TEST_PROGS := test_kmod.sh \
+* Unmerged path tools/testing/selftests/bpf/.gitignore
+* Unmerged path tools/testing/selftests/bpf/Makefile
+diff --git a/tools/testing/selftests/bpf/test_hashmap.c b/tools/testing/selftests/bpf/test_hashmap.c
+new file mode 100644
+index 000000000000..b64094c981e3
+--- /dev/null
++++ b/tools/testing/selftests/bpf/test_hashmap.c
+@@ -0,0 +1,382 @@
++// SPDX-License-Identifier: (LGPL-2.1 OR BSD-2-Clause)
++
++/*
++ * Tests for libbpf's hashmap.
++ *
++ * Copyright (c) 2019 Facebook
++ */
++#include <stdio.h>
++#include <errno.h>
++#include <linux/err.h>
++#include "hashmap.h"
++
++#define CHECK(condition, format...) ({					\
++	int __ret = !!(condition);					\
++	if (__ret) {							\
++		fprintf(stderr, "%s:%d:FAIL ", __func__, __LINE__);	\
++		fprintf(stderr, format);				\
++	}								\
++	__ret;								\
++})
++
++size_t hash_fn(const void *k, void *ctx)
++{
++	return (long)k;
++}
++
++bool equal_fn(const void *a, const void *b, void *ctx)
++{
++	return (long)a == (long)b;
++}
++
++static inline size_t next_pow_2(size_t n)
++{
++	size_t r = 1;
++
++	while (r < n)
++		r <<= 1;
++	return r;
++}
++
++static inline size_t exp_cap(size_t sz)
++{
++	size_t r = next_pow_2(sz);
++
++	if (sz * 4 / 3 > r)
++		r <<= 1;
++	return r;
++}
++
++#define ELEM_CNT 62
++
++int test_hashmap_generic(void)
++{
++	struct hashmap_entry *entry, *tmp;
++	int err, bkt, found_cnt, i;
++	long long found_msk;
++	struct hashmap *map;
++
++	fprintf(stderr, "%s: ", __func__);
++
++	map = hashmap__new(hash_fn, equal_fn, NULL);
++	if (CHECK(IS_ERR(map), "failed to create map: %ld\n", PTR_ERR(map)))
++		return 1;
++
++	for (i = 0; i < ELEM_CNT; i++) {
++		const void *oldk, *k = (const void *)(long)i;
++		void *oldv, *v = (void *)(long)(1024 + i);
++
++		err = hashmap__update(map, k, v, &oldk, &oldv);
++		if (CHECK(err != -ENOENT, "unexpected result: %d\n", err))
++			return 1;
++
++		if (i % 2) {
++			err = hashmap__add(map, k, v);
++		} else {
++			err = hashmap__set(map, k, v, &oldk, &oldv);
++			if (CHECK(oldk != NULL || oldv != NULL,
++				  "unexpected k/v: %p=%p\n", oldk, oldv))
++				return 1;
++		}
++
++		if (CHECK(err, "failed to add k/v %ld = %ld: %d\n",
++			       (long)k, (long)v, err))
++			return 1;
++
++		if (CHECK(!hashmap__find(map, k, &oldv),
++			  "failed to find key %ld\n", (long)k))
++			return 1;
++		if (CHECK(oldv != v, "found value is wrong: %ld\n", (long)oldv))
++			return 1;
++	}
++
++	if (CHECK(hashmap__size(map) != ELEM_CNT,
++		  "invalid map size: %zu\n", hashmap__size(map)))
++		return 1;
++	if (CHECK(hashmap__capacity(map) != exp_cap(hashmap__size(map)),
++		  "unexpected map capacity: %zu\n", hashmap__capacity(map)))
++		return 1;
++
++	found_msk = 0;
++	hashmap__for_each_entry(map, entry, bkt) {
++		long k = (long)entry->key;
++		long v = (long)entry->value;
++
++		found_msk |= 1ULL << k;
++		if (CHECK(v - k != 1024, "invalid k/v pair: %ld = %ld\n", k, v))
++			return 1;
++	}
++	if (CHECK(found_msk != (1ULL << ELEM_CNT) - 1,
++		  "not all keys iterated: %llx\n", found_msk))
++		return 1;
++
++	for (i = 0; i < ELEM_CNT; i++) {
++		const void *oldk, *k = (const void *)(long)i;
++		void *oldv, *v = (void *)(long)(256 + i);
++
++		err = hashmap__add(map, k, v);
++		if (CHECK(err != -EEXIST, "unexpected add result: %d\n", err))
++			return 1;
++
++		if (i % 2)
++			err = hashmap__update(map, k, v, &oldk, &oldv);
++		else
++			err = hashmap__set(map, k, v, &oldk, &oldv);
++
++		if (CHECK(err, "failed to update k/v %ld = %ld: %d\n",
++			       (long)k, (long)v, err))
++			return 1;
++		if (CHECK(!hashmap__find(map, k, &oldv),
++			  "failed to find key %ld\n", (long)k))
++			return 1;
++		if (CHECK(oldv != v, "found value is wrong: %ld\n", (long)oldv))
++			return 1;
++	}
++
++	if (CHECK(hashmap__size(map) != ELEM_CNT,
++		  "invalid updated map size: %zu\n", hashmap__size(map)))
++		return 1;
++	if (CHECK(hashmap__capacity(map) != exp_cap(hashmap__size(map)),
++		  "unexpected map capacity: %zu\n", hashmap__capacity(map)))
++		return 1;
++
++	found_msk = 0;
++	hashmap__for_each_entry_safe(map, entry, tmp, bkt) {
++		long k = (long)entry->key;
++		long v = (long)entry->value;
++
++		found_msk |= 1ULL << k;
++		if (CHECK(v - k != 256,
++			  "invalid updated k/v pair: %ld = %ld\n", k, v))
++			return 1;
++	}
++	if (CHECK(found_msk != (1ULL << ELEM_CNT) - 1,
++		  "not all keys iterated after update: %llx\n", found_msk))
++		return 1;
++
++	found_cnt = 0;
++	hashmap__for_each_key_entry(map, entry, (void *)0) {
++		found_cnt++;
++	}
++	if (CHECK(!found_cnt, "didn't find any entries for key 0\n"))
++		return 1;
++
++	found_msk = 0;
++	found_cnt = 0;
++	hashmap__for_each_key_entry_safe(map, entry, tmp, (void *)0) {
++		const void *oldk, *k;
++		void *oldv, *v;
++
++		k = entry->key;
++		v = entry->value;
++
++		found_cnt++;
++		found_msk |= 1ULL << (long)k;
++
++		if (CHECK(!hashmap__delete(map, k, &oldk, &oldv),
++			  "failed to delete k/v %ld = %ld\n",
++			  (long)k, (long)v))
++			return 1;
++		if (CHECK(oldk != k || oldv != v,
++			  "invalid deleted k/v: expected %ld = %ld, got %ld = %ld\n",
++			  (long)k, (long)v, (long)oldk, (long)oldv))
++			return 1;
++		if (CHECK(hashmap__delete(map, k, &oldk, &oldv),
++			  "unexpectedly deleted k/v %ld = %ld\n",
++			  (long)oldk, (long)oldv))
++			return 1;
++	}
++
++	if (CHECK(!found_cnt || !found_msk,
++		  "didn't delete any key entries\n"))
++		return 1;
++	if (CHECK(hashmap__size(map) != ELEM_CNT - found_cnt,
++		  "invalid updated map size (already deleted: %d): %zu\n",
++		  found_cnt, hashmap__size(map)))
++		return 1;
++	if (CHECK(hashmap__capacity(map) != exp_cap(hashmap__size(map)),
++		  "unexpected map capacity: %zu\n", hashmap__capacity(map)))
++		return 1;
++
++	hashmap__for_each_entry_safe(map, entry, tmp, bkt) {
++		const void *oldk, *k;
++		void *oldv, *v;
++
++		k = entry->key;
++		v = entry->value;
++
++		found_cnt++;
++		found_msk |= 1ULL << (long)k;
++
++		if (CHECK(!hashmap__delete(map, k, &oldk, &oldv),
++			  "failed to delete k/v %ld = %ld\n",
++			  (long)k, (long)v))
++			return 1;
++		if (CHECK(oldk != k || oldv != v,
++			  "invalid old k/v: expect %ld = %ld, got %ld = %ld\n",
++			  (long)k, (long)v, (long)oldk, (long)oldv))
++			return 1;
++		if (CHECK(hashmap__delete(map, k, &oldk, &oldv),
++			  "unexpectedly deleted k/v %ld = %ld\n",
++			  (long)k, (long)v))
++			return 1;
++	}
++
++	if (CHECK(found_cnt != ELEM_CNT || found_msk != (1ULL << ELEM_CNT) - 1,
++		  "not all keys were deleted: found_cnt:%d, found_msk:%llx\n",
++		  found_cnt, found_msk))
++		return 1;
++	if (CHECK(hashmap__size(map) != 0,
++		  "invalid updated map size (already deleted: %d): %zu\n",
++		  found_cnt, hashmap__size(map)))
++		return 1;
++
++	found_cnt = 0;
++	hashmap__for_each_entry(map, entry, bkt) {
++		CHECK(false, "unexpected map entries left: %ld = %ld\n",
++			     (long)entry->key, (long)entry->value);
++		return 1;
++	}
++
++	hashmap__free(map);
++	hashmap__for_each_entry(map, entry, bkt) {
++		CHECK(false, "unexpected map entries left: %ld = %ld\n",
++			     (long)entry->key, (long)entry->value);
++		return 1;
++	}
++
++	fprintf(stderr, "OK\n");
++	return 0;
++}
++
++size_t collision_hash_fn(const void *k, void *ctx)
++{
++	return 0;
++}
++
++int test_hashmap_multimap(void)
++{
++	void *k1 = (void *)0, *k2 = (void *)1;
++	struct hashmap_entry *entry;
++	struct hashmap *map;
++	long found_msk;
++	int err, bkt;
++
++	fprintf(stderr, "%s: ", __func__);
++
++	/* force collisions */
++	map = hashmap__new(collision_hash_fn, equal_fn, NULL);
++	if (CHECK(IS_ERR(map), "failed to create map: %ld\n", PTR_ERR(map)))
++		return 1;
++
++
++	/* set up multimap:
++	 * [0] -> 1, 2, 4;
++	 * [1] -> 8, 16, 32;
++	 */
++	err = hashmap__append(map, k1, (void *)1);
++	if (CHECK(err, "failed to add k/v: %d\n", err))
++		return 1;
++	err = hashmap__append(map, k1, (void *)2);
++	if (CHECK(err, "failed to add k/v: %d\n", err))
++		return 1;
++	err = hashmap__append(map, k1, (void *)4);
++	if (CHECK(err, "failed to add k/v: %d\n", err))
++		return 1;
++
++	err = hashmap__append(map, k2, (void *)8);
++	if (CHECK(err, "failed to add k/v: %d\n", err))
++		return 1;
++	err = hashmap__append(map, k2, (void *)16);
++	if (CHECK(err, "failed to add k/v: %d\n", err))
++		return 1;
++	err = hashmap__append(map, k2, (void *)32);
++	if (CHECK(err, "failed to add k/v: %d\n", err))
++		return 1;
++
++	if (CHECK(hashmap__size(map) != 6,
++		  "invalid map size: %zu\n", hashmap__size(map)))
++		return 1;
++
++	/* verify global iteration still works and sees all values */
++	found_msk = 0;
++	hashmap__for_each_entry(map, entry, bkt) {
++		found_msk |= (long)entry->value;
++	}
++	if (CHECK(found_msk != (1 << 6) - 1,
++		  "not all keys iterated: %lx\n", found_msk))
++		return 1;
++
++	/* iterate values for key 1 */
++	found_msk = 0;
++	hashmap__for_each_key_entry(map, entry, k1) {
++		found_msk |= (long)entry->value;
++	}
++	if (CHECK(found_msk != (1 | 2 | 4),
++		  "invalid k1 values: %lx\n", found_msk))
++		return 1;
++
++	/* iterate values for key 2 */
++	found_msk = 0;
++	hashmap__for_each_key_entry(map, entry, k2) {
++		found_msk |= (long)entry->value;
++	}
++	if (CHECK(found_msk != (8 | 16 | 32),
++		  "invalid k2 values: %lx\n", found_msk))
++		return 1;
++
++	fprintf(stderr, "OK\n");
++	return 0;
++}
++
++int test_hashmap_empty()
++{
++	struct hashmap_entry *entry;
++	int bkt;
++	struct hashmap *map;
++	void *k = (void *)0;
++
++	fprintf(stderr, "%s: ", __func__);
++
++	/* force collisions */
++	map = hashmap__new(hash_fn, equal_fn, NULL);
++	if (CHECK(IS_ERR(map), "failed to create map: %ld\n", PTR_ERR(map)))
++		return 1;
++
++	if (CHECK(hashmap__size(map) != 0,
++		  "invalid map size: %zu\n", hashmap__size(map)))
++		return 1;
++	if (CHECK(hashmap__capacity(map) != 0,
++		  "invalid map capacity: %zu\n", hashmap__capacity(map)))
++		return 1;
++	if (CHECK(hashmap__find(map, k, NULL), "unexpected find\n"))
++		return 1;
++	if (CHECK(hashmap__delete(map, k, NULL, NULL), "unexpected delete\n"))
++		return 1;
++
++	hashmap__for_each_entry(map, entry, bkt) {
++		CHECK(false, "unexpected iterated entry\n");
++		return 1;
++	}
++	hashmap__for_each_key_entry(map, entry, k) {
++		CHECK(false, "unexpected key entry\n");
++		return 1;
++	}
++
++	fprintf(stderr, "OK\n");
++	return 0;
++}
++
++int main(int argc, char **argv)
++{
++	bool failed = false;
++
++	if (test_hashmap_generic())
++		failed = true;
++	if (test_hashmap_multimap())
++		failed = true;
++	if (test_hashmap_empty())
++		failed = true;
++
++	return failed;
++}
