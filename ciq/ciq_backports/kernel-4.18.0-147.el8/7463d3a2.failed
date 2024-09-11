@@ -1,0 +1,138 @@
+tls: Fix write space handling
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-147.el8
+commit-author Boris Pismenny <borisp@mellanox.com>
+commit 7463d3a2db0efea3701aab5eeb310e0d8157aff7
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-147.el8/7463d3a2.failed
+
+TLS device cannot use the sw context. This patch returns the original
+tls device write space handler and moves the sw/device specific portions
+to the relevant files.
+
+Also, we remove the write_space call for the tls_sw flow, because it
+handles partial records in its delayed tx work handler.
+
+Fixes: a42055e8d2c3 ("net/tls: Add support for async encryption of records for performance")
+	Signed-off-by: Boris Pismenny <borisp@mellanox.com>
+	Reviewed-by: Eran Ben Elisha <eranbe@mellanox.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 7463d3a2db0efea3701aab5eeb310e0d8157aff7)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/net/tls.h
+diff --cc include/net/tls.h
+index 6da19b6e6db1,a5a938583295..000000000000
+--- a/include/net/tls.h
++++ b/include/net/tls.h
+@@@ -468,6 -510,18 +468,21 @@@ tls_offload_ctx_tx(const struct tls_con
+  	return (struct tls_offload_context_tx *)tls_ctx->priv_ctx_tx;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static inline bool tls_sw_has_ctx_tx(const struct sock *sk)
++ {
++ 	struct tls_context *ctx = tls_get_ctx(sk);
++ 
++ 	if (!ctx)
++ 		return false;
++ 	return !!tls_sw_ctx_tx(ctx);
++ }
++ 
++ void tls_sw_write_space(struct sock *sk, struct tls_context *ctx);
++ void tls_device_write_space(struct sock *sk, struct tls_context *ctx);
++ 
+++>>>>>>> 7463d3a2db0e (tls: Fix write space handling)
+  static inline struct tls_offload_context_rx *
+  tls_offload_ctx_rx(const struct tls_context *tls_ctx)
+  {
+* Unmerged path include/net/tls.h
+diff --git a/net/tls/tls_device.c b/net/tls/tls_device.c
+index be826fc2113a..310224e66c33 100644
+--- a/net/tls/tls_device.c
++++ b/net/tls/tls_device.c
+@@ -542,6 +542,23 @@ static int tls_device_push_pending_record(struct sock *sk, int flags)
+ 	return tls_push_data(sk, &msg_iter, 0, flags, TLS_RECORD_TYPE_DATA);
+ }
+ 
++void tls_device_write_space(struct sock *sk, struct tls_context *ctx)
++{
++	int rc = 0;
++
++	if (!sk->sk_write_pending && tls_is_partially_sent_record(ctx)) {
++		gfp_t sk_allocation = sk->sk_allocation;
++
++		sk->sk_allocation = GFP_ATOMIC;
++		rc = tls_push_partial_record(sk, ctx,
++					     MSG_DONTWAIT | MSG_NOSIGNAL);
++		sk->sk_allocation = sk_allocation;
++	}
++
++	if (!rc)
++		ctx->sk_write_space(sk);
++}
++
+ void handle_device_resync(struct sock *sk, u32 seq, u64 rcd_sn)
+ {
+ 	struct tls_context *tls_ctx = tls_get_ctx(sk);
+diff --git a/net/tls/tls_main.c b/net/tls/tls_main.c
+index a0dcca82c8b9..abb17d830f84 100644
+--- a/net/tls/tls_main.c
++++ b/net/tls/tls_main.c
+@@ -221,7 +221,6 @@ int tls_push_pending_closed_record(struct sock *sk,
+ static void tls_write_space(struct sock *sk)
+ {
+ 	struct tls_context *ctx = tls_get_ctx(sk);
+-	struct tls_sw_context_tx *tx_ctx = tls_sw_ctx_tx(ctx);
+ 
+ 	/* If in_tcp_sendpages call lower protocol write space handler
+ 	 * to ensure we wake up any waiting operations there. For example
+@@ -232,14 +231,12 @@ static void tls_write_space(struct sock *sk)
+ 		return;
+ 	}
+ 
+-	/* Schedule the transmission if tx list is ready */
+-	if (is_tx_ready(tx_ctx) && !sk->sk_write_pending) {
+-		/* Schedule the transmission */
+-		if (!test_and_set_bit(BIT_TX_SCHEDULED, &tx_ctx->tx_bitmask))
+-			schedule_delayed_work(&tx_ctx->tx_work.work, 0);
+-	}
+-
+-	ctx->sk_write_space(sk);
++#ifdef CONFIG_TLS_DEVICE
++	if (ctx->tx_conf == TLS_HW)
++		tls_device_write_space(sk, ctx);
++	else
++#endif
++		tls_sw_write_space(sk, ctx);
+ }
+ 
+ static void tls_ctx_free(struct tls_context *ctx)
+diff --git a/net/tls/tls_sw.c b/net/tls/tls_sw.c
+index ad7a18109304..43fd77f7aab6 100644
+--- a/net/tls/tls_sw.c
++++ b/net/tls/tls_sw.c
+@@ -1496,6 +1496,19 @@ static void tx_work_handler(struct work_struct *work)
+ 	release_sock(sk);
+ }
+ 
++void tls_sw_write_space(struct sock *sk, struct tls_context *ctx)
++{
++	struct tls_sw_context_tx *tx_ctx = tls_sw_ctx_tx(ctx);
++
++	/* Schedule the transmission if tx list is ready */
++	if (is_tx_ready(tx_ctx) && !sk->sk_write_pending) {
++		/* Schedule the transmission */
++		if (!test_and_set_bit(BIT_TX_SCHEDULED,
++				      &tx_ctx->tx_bitmask))
++			schedule_delayed_work(&tx_ctx->tx_work.work, 0);
++	}
++}
++
+ int tls_set_sw_offload(struct sock *sk, struct tls_context *ctx, int tx)
+ {
+ 	struct tls_crypto_info *crypto_info;
