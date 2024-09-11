@@ -154,6 +154,7 @@ static int acp3x_i2s_trigger(struct snd_pcm_substream *substream,
 	struct snd_soc_card *card;
 	struct acp3x_platform_info *pinfo;
 	u32 ret, val, period_bytes, reg_val, ier_val, water_val;
+	u32 buf_size, buf_reg;
 
 	prtd = substream->private_data;
 	rtd = substream->runtime->private_data;
@@ -167,6 +168,8 @@ static int acp3x_i2s_trigger(struct snd_pcm_substream *substream,
 	}
 	period_bytes = frames_to_bytes(substream->runtime,
 			substream->runtime->period_size);
+	buf_size = frames_to_bytes(substream->runtime,
+			substream->runtime->buffer_size);
 	switch (cmd) {
 	case SNDRV_PCM_TRIGGER_START:
 	case SNDRV_PCM_TRIGGER_RESUME:
@@ -180,6 +183,7 @@ static int acp3x_i2s_trigger(struct snd_pcm_substream *substream,
 					mmACP_BT_TX_INTR_WATERMARK_SIZE;
 				reg_val = mmACP_BTTDM_ITER;
 				ier_val = mmACP_BTTDM_IER;
+				buf_reg = mmACP_BT_TX_RINGBUFSIZE;
 				break;
 			case I2S_SP_INSTANCE:
 			default:
@@ -187,6 +191,7 @@ static int acp3x_i2s_trigger(struct snd_pcm_substream *substream,
 					mmACP_I2S_TX_INTR_WATERMARK_SIZE;
 				reg_val = mmACP_I2STDM_ITER;
 				ier_val = mmACP_I2STDM_IER;
+				buf_reg = mmACP_I2S_TX_RINGBUFSIZE;
 			}
 		} else {
 			switch (rtd->i2s_instance) {
@@ -195,6 +200,7 @@ static int acp3x_i2s_trigger(struct snd_pcm_substream *substream,
 					mmACP_BT_RX_INTR_WATERMARK_SIZE;
 				reg_val = mmACP_BTTDM_IRER;
 				ier_val = mmACP_BTTDM_IER;
+				buf_reg = mmACP_BT_RX_RINGBUFSIZE;
 				break;
 			case I2S_SP_INSTANCE:
 			default:
@@ -202,9 +208,11 @@ static int acp3x_i2s_trigger(struct snd_pcm_substream *substream,
 					mmACP_I2S_RX_INTR_WATERMARK_SIZE;
 				reg_val = mmACP_I2STDM_IRER;
 				ier_val = mmACP_I2STDM_IER;
+				buf_reg = mmACP_I2S_RX_RINGBUFSIZE;
 			}
 		}
 		rv_writel(period_bytes, rtd->acp3x_base + water_val);
+		rv_writel(buf_size, rtd->acp3x_base + buf_reg);
 		val = rv_readl(rtd->acp3x_base + reg_val);
 		val = val | BIT(0);
 		rv_writel(val, rtd->acp3x_base + reg_val);
