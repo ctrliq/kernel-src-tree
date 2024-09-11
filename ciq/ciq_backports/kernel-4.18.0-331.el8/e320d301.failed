@@ -1,0 +1,152 @@
+mm/page_alloc.c: fix freeing non-compound pages
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-331.el8
+commit-author Matthew Wilcox (Oracle) <willy@infradead.org>
+commit e320d3012d25b1fb5f3df4edb7bd44a1c362ec10
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-331.el8/e320d301.failed
+
+Here is a very rare race which leaks memory:
+
+Page P0 is allocated to the page cache.  Page P1 is free.
+
+Thread A                Thread B                Thread C
+find_get_entry():
+xas_load() returns P0
+						Removes P0 from page cache
+						P0 finds its buddy P1
+			alloc_pages(GFP_KERNEL, 1) returns P0
+			P0 has refcount 1
+page_cache_get_speculative(P0)
+P0 has refcount 2
+			__free_pages(P0)
+			P0 has refcount 1
+put_page(P0)
+P1 is not freed
+
+Fix this by freeing all the pages in __free_pages() that won't be freed
+by the call to put_page().  It's usually not a good idea to split a page,
+but this is a very unlikely scenario.
+
+Fixes: e286781d5f2e ("mm: speculative page references")
+	Signed-off-by: Matthew Wilcox (Oracle) <willy@infradead.org>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Acked-by: Mike Rapoport <rppt@linux.ibm.com>
+	Cc: Nick Piggin <npiggin@gmail.com>
+	Cc: Hugh Dickins <hughd@google.com>
+	Cc: Peter Zijlstra <peterz@infradead.org>
+Link: https://lkml.kernel.org/r/20200926213919.26642-1-willy@infradead.org
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit e320d3012d25b1fb5f3df4edb7bd44a1c362ec10)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	lib/Makefile
+diff --cc lib/Makefile
+index 1783f626c913,49a2a9e36224..000000000000
+--- a/lib/Makefile
++++ b/lib/Makefile
+@@@ -85,7 -93,15 +85,17 @@@ obj-$(CONFIG_TEST_XARRAY) += test_xarra
+  obj-$(CONFIG_TEST_PARMAN) += test_parman.o
+  obj-$(CONFIG_TEST_KMOD) += test_kmod.o
+  obj-$(CONFIG_TEST_DEBUG_VIRTUAL) += test_debug_virtual.o
+ -obj-$(CONFIG_TEST_MEMCAT_P) += test_memcat_p.o
+  obj-$(CONFIG_TEST_OBJAGG) += test_objagg.o
+++<<<<<<< HEAD
+++=======
++ CFLAGS_test_stackinit.o += $(call cc-disable-warning, switch-unreachable)
++ obj-$(CONFIG_TEST_STACKINIT) += test_stackinit.o
++ obj-$(CONFIG_TEST_BLACKHOLE_DEV) += test_blackhole_dev.o
++ obj-$(CONFIG_TEST_MEMINIT) += test_meminit.o
++ obj-$(CONFIG_TEST_LOCKUP) += test_lockup.o
++ obj-$(CONFIG_TEST_HMM) += test_hmm.o
++ obj-$(CONFIG_TEST_FREE_PAGES) += test_free_pages.o
+++>>>>>>> e320d3012d25 (mm/page_alloc.c: fix freeing non-compound pages)
+  
+  #
+  # CFLAGS for compiling floating point code inside the kernel. x86/Makefile turns
+diff --git a/lib/Kconfig.debug b/lib/Kconfig.debug
+index df94dcbfbfd0..2276d673ed82 100644
+--- a/lib/Kconfig.debug
++++ b/lib/Kconfig.debug
+@@ -2210,6 +2210,15 @@ config TEST_MEMCAT_P
+ 
+ 	  If unsure, say N.
+ 
++config TEST_FREE_PAGES
++	tristate "Test freeing pages"
++	help
++	  Test that a memory leak does not occur due to a race between
++	  freeing a block of pages and a speculative page reference.
++	  Loading this module is safe if your kernel has the bug fixed.
++	  If the bug is not fixed, it will leak gigabytes of memory and
++	  probably OOM your system.
++
+ config TEST_FPU
+ 	tristate "Test floating point operations in kernel space"
+ 	depends on X86 && !KCOV_INSTRUMENT_ALL
+* Unmerged path lib/Makefile
+diff --git a/lib/test_free_pages.c b/lib/test_free_pages.c
+new file mode 100644
+index 000000000000..074e76bd76b2
+--- /dev/null
++++ b/lib/test_free_pages.c
+@@ -0,0 +1,42 @@
++// SPDX-License-Identifier: GPL-2.0+
++/*
++ * test_free_pages.c: Check that free_pages() doesn't leak memory
++ * Copyright (c) 2020 Oracle
++ * Author: Matthew Wilcox <willy@infradead.org>
++ */
++
++#include <linux/gfp.h>
++#include <linux/mm.h>
++#include <linux/module.h>
++
++static void test_free_pages(gfp_t gfp)
++{
++	unsigned int i;
++
++	for (i = 0; i < 1000 * 1000; i++) {
++		unsigned long addr = __get_free_pages(gfp, 3);
++		struct page *page = virt_to_page(addr);
++
++		/* Simulate page cache getting a speculative reference */
++		get_page(page);
++		free_pages(addr, 3);
++		put_page(page);
++	}
++}
++
++static int m_in(void)
++{
++	test_free_pages(GFP_KERNEL);
++	test_free_pages(GFP_KERNEL | __GFP_COMP);
++
++	return 0;
++}
++
++static void m_ex(void)
++{
++}
++
++module_init(m_in);
++module_exit(m_ex);
++MODULE_AUTHOR("Matthew Wilcox <willy@infradead.org>");
++MODULE_LICENSE("GPL");
+diff --git a/mm/page_alloc.c b/mm/page_alloc.c
+index 2996dc63335c..8e10abf06687 100644
+--- a/mm/page_alloc.c
++++ b/mm/page_alloc.c
+@@ -4997,6 +4997,9 @@ void __free_pages(struct page *page, unsigned int order)
+ {
+ 	if (put_page_testzero(page))
+ 		free_the_page(page, order);
++	else if (!PageHead(page))
++		while (order-- > 0)
++			free_the_page(page + (1 << order), order);
+ }
+ EXPORT_SYMBOL(__free_pages);
+ 
