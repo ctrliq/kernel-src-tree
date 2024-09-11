@@ -1,0 +1,473 @@
+x86/fpu: Optimize out sigframe xfeatures when in init state
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-365.el8
+commit-author Dave Hansen <dave.hansen@linux.intel.com>
+commit 30d02551ba4f681cfa605cedacf231b8641169f0
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-365.el8/30d02551.failed
+
+tl;dr: AMX state is ~8k.  Signal frames can have space for this
+~8k and each signal entry writes out all 8k even if it is zeros.
+Skip writing zeros for AMX to speed up signal delivery by about
+4% overall when AMX is in its init state.
+
+This is a user-visible change to the sigframe ABI.
+
+== Hardware XSAVE Background ==
+
+XSAVE state components may be tracked by the processor as being
+in their initial configuration.  Software can detect which
+features are in this configuration by looking at the XSTATE_BV
+field in an XSAVE buffer or with the XGETBV(1) instruction.
+
+Both the XSAVE and XSAVEOPT instructions enumerate features s
+being in the initial configuration via the XSTATE_BV field in the
+XSAVE header,  However, XSAVEOPT declines to actually write
+features in their initial configuration to the buffer.  XSAVE
+writes the feature unconditionally, regardless of whether it is
+in the initial configuration or not.
+
+Basically, XSAVE users never need to inspect XSTATE_BV to
+determine if the feature has been written to the buffer.
+XSAVEOPT users *do* need to inspect XSTATE_BV.  They might also
+need to clear out the buffer if they want to make an isolated
+change to the state, like modifying one register.
+
+== Software Signal / XSAVE Background ==
+
+Signal frames have historically been written with XSAVE itself.
+Each state is written in its entirety, regardless of being in its
+initial configuration.
+
+In other words, the signal frame ABI uses the XSAVE behavior, not
+the XSAVEOPT behavior.
+
+== Problem ==
+
+This means that any application which has acquired permission to
+use AMX via ARCH_REQ_XCOMP_PERM will write 8k of state to the
+signal frame.  This 8k write will occur even when AMX was in its
+initial configuration and software *knows* this because of
+XSTATE_BV.
+
+This problem also exists to a lesser degree with AVX-512 and its
+2k of state.  However, AVX-512 use does not require
+ARCH_REQ_XCOMP_PERM and is more likely to have existing users
+which would be impacted by any change in behavior.
+
+== Solution ==
+
+Stop writing out AMX xfeatures which are in their initial state
+to the signal frame.  This effectively makes the signal frame
+XSAVE buffer look as if it were written with a combination of
+XSAVEOPT and XSAVE behavior.  Userspace which handles XSAVEOPT-
+style buffers should be able to handle this naturally.
+
+For now, include only the AMX xfeatures: XTILE and XTILEDATA in
+this new behavior.  These require new ABI to use anyway, which
+makes their users very unlikely to be broken.  This XSAVEOPT-like
+behavior should be expected for all future dynamic xfeatures.  It
+may also be extended to legacy features like AVX-512 in the
+future.
+
+Only attempt this optimization on systems with dynamic features.
+Disable dynamic feature support (XFD) if XGETBV1 is unavailable
+by adding a CPUID dependency.
+
+This has been measured to reduce the *overall* cycle cost of
+signal delivery by about 4%.
+
+Fixes: 2308ee57d93d ("x86/fpu/amx: Enable the AMX feature in 64-bit mode")
+	Signed-off-by: Dave Hansen <dave.hansen@linux.intel.com>
+	Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+	Tested-by: "Chang S. Bae" <chang.seok.bae@intel.com>
+Link: https://lore.kernel.org/r/20211102224750.FA412E26@davehans-spike.ostc.intel.com
+
+(cherry picked from commit 30d02551ba4f681cfa605cedacf231b8641169f0)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	Documentation/x86/xstate.rst
+#	arch/x86/kernel/cpu/cpuid-deps.c
+#	arch/x86/kernel/fpu/xstate.h
+diff --cc arch/x86/kernel/cpu/cpuid-deps.c
+index d9ead9c20408,c881bcafba7d..000000000000
+--- a/arch/x86/kernel/cpu/cpuid-deps.c
++++ b/arch/x86/kernel/cpu/cpuid-deps.c
+@@@ -76,6 -76,8 +76,11 @@@ static const struct cpuid_dep cpuid_dep
+  	{ X86_FEATURE_SGX1,			X86_FEATURE_SGX       },
+  	{ X86_FEATURE_SGX2,			X86_FEATURE_SGX1      },
+  	{ X86_FEATURE_XFD,			X86_FEATURE_XSAVES    },
+++<<<<<<< HEAD
+++=======
++ 	{ X86_FEATURE_XFD,			X86_FEATURE_XGETBV1   },
++ 	{ X86_FEATURE_AMX_TILE,			X86_FEATURE_XFD       },
+++>>>>>>> 30d02551ba4f (x86/fpu: Optimize out sigframe xfeatures when in init state)
+  	{}
+  };
+  
+diff --cc arch/x86/kernel/fpu/xstate.h
+index 0789a04ee705,86ea7c0fa2f6..000000000000
+--- a/arch/x86/kernel/fpu/xstate.h
++++ b/arch/x86/kernel/fpu/xstate.h
+@@@ -4,7 -4,12 +4,8 @@@
+  
+  #include <asm/cpufeature.h>
+  #include <asm/fpu/xstate.h>
++ #include <asm/fpu/xcr.h>
+  
+ -#ifdef CONFIG_X86_64
+ -DECLARE_PER_CPU(u64, xfd_state);
+ -#endif
+ -
+  static inline void xstate_init_xcomp_bv(struct xregs_state *xsave, u64 mask)
+  {
+  	/*
+@@@ -15,4 -20,292 +16,295 @@@
+  		xsave->header.xcomp_bv = mask | XCOMP_BV_COMPACTED_FORMAT;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static inline u64 xstate_get_host_group_perm(void)
++ {
++ 	/* Pairs with WRITE_ONCE() in xstate_request_perm() */
++ 	return READ_ONCE(current->group_leader->thread.fpu.perm.__state_perm);
++ }
++ 
++ enum xstate_copy_mode {
++ 	XSTATE_COPY_FP,
++ 	XSTATE_COPY_FX,
++ 	XSTATE_COPY_XSAVE,
++ };
++ 
++ struct membuf;
++ extern void __copy_xstate_to_uabi_buf(struct membuf to, struct fpstate *fpstate,
++ 				      u32 pkru_val, enum xstate_copy_mode copy_mode);
++ extern void copy_xstate_to_uabi_buf(struct membuf to, struct task_struct *tsk,
++ 				    enum xstate_copy_mode mode);
++ extern int copy_uabi_from_kernel_to_xstate(struct fpstate *fpstate, const void *kbuf);
++ extern int copy_sigframe_from_user_to_xstate(struct fpstate *fpstate, const void __user *ubuf);
++ 
++ 
++ extern void fpu__init_cpu_xstate(void);
++ extern void fpu__init_system_xstate(unsigned int legacy_size);
++ 
++ extern void *get_xsave_addr(struct xregs_state *xsave, int xfeature_nr);
++ 
++ static inline u64 xfeatures_mask_supervisor(void)
++ {
++ 	return fpu_kernel_cfg.max_features & XFEATURE_MASK_SUPERVISOR_SUPPORTED;
++ }
++ 
++ static inline u64 xfeatures_mask_independent(void)
++ {
++ 	if (!cpu_feature_enabled(X86_FEATURE_ARCH_LBR))
++ 		return XFEATURE_MASK_INDEPENDENT & ~XFEATURE_MASK_LBR;
++ 
++ 	return XFEATURE_MASK_INDEPENDENT;
++ }
++ 
++ /* XSAVE/XRSTOR wrapper functions */
++ 
++ #ifdef CONFIG_X86_64
++ #define REX_PREFIX	"0x48, "
++ #else
++ #define REX_PREFIX
++ #endif
++ 
++ /* These macros all use (%edi)/(%rdi) as the single memory argument. */
++ #define XSAVE		".byte " REX_PREFIX "0x0f,0xae,0x27"
++ #define XSAVEOPT	".byte " REX_PREFIX "0x0f,0xae,0x37"
++ #define XSAVES		".byte " REX_PREFIX "0x0f,0xc7,0x2f"
++ #define XRSTOR		".byte " REX_PREFIX "0x0f,0xae,0x2f"
++ #define XRSTORS		".byte " REX_PREFIX "0x0f,0xc7,0x1f"
++ 
++ /*
++  * After this @err contains 0 on success or the trap number when the
++  * operation raises an exception.
++  */
++ #define XSTATE_OP(op, st, lmask, hmask, err)				\
++ 	asm volatile("1:" op "\n\t"					\
++ 		     "xor %[err], %[err]\n"				\
++ 		     "2:\n\t"						\
++ 		     _ASM_EXTABLE_TYPE(1b, 2b, EX_TYPE_FAULT_MCE_SAFE)	\
++ 		     : [err] "=a" (err)					\
++ 		     : "D" (st), "m" (*st), "a" (lmask), "d" (hmask)	\
++ 		     : "memory")
++ 
++ /*
++  * If XSAVES is enabled, it replaces XSAVEOPT because it supports a compact
++  * format and supervisor states in addition to modified optimization in
++  * XSAVEOPT.
++  *
++  * Otherwise, if XSAVEOPT is enabled, XSAVEOPT replaces XSAVE because XSAVEOPT
++  * supports modified optimization which is not supported by XSAVE.
++  *
++  * We use XSAVE as a fallback.
++  *
++  * The 661 label is defined in the ALTERNATIVE* macros as the address of the
++  * original instruction which gets replaced. We need to use it here as the
++  * address of the instruction where we might get an exception at.
++  */
++ #define XSTATE_XSAVE(st, lmask, hmask, err)				\
++ 	asm volatile(ALTERNATIVE_2(XSAVE,				\
++ 				   XSAVEOPT, X86_FEATURE_XSAVEOPT,	\
++ 				   XSAVES,   X86_FEATURE_XSAVES)	\
++ 		     "\n"						\
++ 		     "xor %[err], %[err]\n"				\
++ 		     "3:\n"						\
++ 		     ".pushsection .fixup,\"ax\"\n"			\
++ 		     "4: movl $-2, %[err]\n"				\
++ 		     "jmp 3b\n"						\
++ 		     ".popsection\n"					\
++ 		     _ASM_EXTABLE(661b, 4b)				\
++ 		     : [err] "=r" (err)					\
++ 		     : "D" (st), "m" (*st), "a" (lmask), "d" (hmask)	\
++ 		     : "memory")
++ 
++ /*
++  * Use XRSTORS to restore context if it is enabled. XRSTORS supports compact
++  * XSAVE area format.
++  */
++ #define XSTATE_XRESTORE(st, lmask, hmask)				\
++ 	asm volatile(ALTERNATIVE(XRSTOR,				\
++ 				 XRSTORS, X86_FEATURE_XSAVES)		\
++ 		     "\n"						\
++ 		     "3:\n"						\
++ 		     _ASM_EXTABLE_TYPE(661b, 3b, EX_TYPE_FPU_RESTORE)	\
++ 		     :							\
++ 		     : "D" (st), "m" (*st), "a" (lmask), "d" (hmask)	\
++ 		     : "memory")
++ 
++ #if defined(CONFIG_X86_64) && defined(CONFIG_X86_DEBUG_FPU)
++ extern void xfd_validate_state(struct fpstate *fpstate, u64 mask, bool rstor);
++ #else
++ static inline void xfd_validate_state(struct fpstate *fpstate, u64 mask, bool rstor) { }
++ #endif
++ 
++ #ifdef CONFIG_X86_64
++ static inline void xfd_update_state(struct fpstate *fpstate)
++ {
++ 	if (fpu_state_size_dynamic()) {
++ 		u64 xfd = fpstate->xfd;
++ 
++ 		if (__this_cpu_read(xfd_state) != xfd) {
++ 			wrmsrl(MSR_IA32_XFD, xfd);
++ 			__this_cpu_write(xfd_state, xfd);
++ 		}
++ 	}
++ }
++ #else
++ static inline void xfd_update_state(struct fpstate *fpstate) { }
++ #endif
++ 
++ /*
++  * Save processor xstate to xsave area.
++  *
++  * Uses either XSAVE or XSAVEOPT or XSAVES depending on the CPU features
++  * and command line options. The choice is permanent until the next reboot.
++  */
++ static inline void os_xsave(struct fpstate *fpstate)
++ {
++ 	u64 mask = fpstate->xfeatures;
++ 	u32 lmask = mask;
++ 	u32 hmask = mask >> 32;
++ 	int err;
++ 
++ 	WARN_ON_FPU(!alternatives_patched);
++ 	xfd_validate_state(fpstate, mask, false);
++ 
++ 	XSTATE_XSAVE(&fpstate->regs.xsave, lmask, hmask, err);
++ 
++ 	/* We should never fault when copying to a kernel buffer: */
++ 	WARN_ON_FPU(err);
++ }
++ 
++ /*
++  * Restore processor xstate from xsave area.
++  *
++  * Uses XRSTORS when XSAVES is used, XRSTOR otherwise.
++  */
++ static inline void os_xrstor(struct fpstate *fpstate, u64 mask)
++ {
++ 	u32 lmask = mask;
++ 	u32 hmask = mask >> 32;
++ 
++ 	xfd_validate_state(fpstate, mask, true);
++ 	XSTATE_XRESTORE(&fpstate->regs.xsave, lmask, hmask);
++ }
++ 
++ /* Restore of supervisor state. Does not require XFD */
++ static inline void os_xrstor_supervisor(struct fpstate *fpstate)
++ {
++ 	u64 mask = xfeatures_mask_supervisor();
++ 	u32 lmask = mask;
++ 	u32 hmask = mask >> 32;
++ 
++ 	XSTATE_XRESTORE(&fpstate->regs.xsave, lmask, hmask);
++ }
++ 
++ /*
++  * XSAVE itself always writes all requested xfeatures.  Removing features
++  * from the request bitmap reduces the features which are written.
++  * Generate a mask of features which must be written to a sigframe.  The
++  * unset features can be optimized away and not written.
++  *
++  * This optimization is user-visible.  Only use for states where
++  * uninitialized sigframe contents are tolerable, like dynamic features.
++  *
++  * Users of buffers produced with this optimization must check XSTATE_BV
++  * to determine which features have been optimized out.
++  */
++ static inline u64 xfeatures_need_sigframe_write(void)
++ {
++ 	u64 xfeaures_to_write;
++ 
++ 	/* In-use features must be written: */
++ 	xfeaures_to_write = xfeatures_in_use();
++ 
++ 	/* Also write all non-optimizable sigframe features: */
++ 	xfeaures_to_write |= XFEATURE_MASK_USER_SUPPORTED &
++ 			     ~XFEATURE_MASK_SIGFRAME_INITOPT;
++ 
++ 	return xfeaures_to_write;
++ }
++ 
++ /*
++  * Save xstate to user space xsave area.
++  *
++  * We don't use modified optimization because xrstor/xrstors might track
++  * a different application.
++  *
++  * We don't use compacted format xsave area for backward compatibility for
++  * old applications which don't understand the compacted format of the
++  * xsave area.
++  *
++  * The caller has to zero buf::header before calling this because XSAVE*
++  * does not touch the reserved fields in the header.
++  */
++ static inline int xsave_to_user_sigframe(struct xregs_state __user *buf)
++ {
++ 	/*
++ 	 * Include the features which are not xsaved/rstored by the kernel
++ 	 * internally, e.g. PKRU. That's user space ABI and also required
++ 	 * to allow the signal handler to modify PKRU.
++ 	 */
++ 	struct fpstate *fpstate = current->thread.fpu.fpstate;
++ 	u64 mask = fpstate->user_xfeatures;
++ 	u32 lmask;
++ 	u32 hmask;
++ 	int err;
++ 
++ 	/* Optimize away writing unnecessary xfeatures: */
++ 	if (fpu_state_size_dynamic())
++ 		mask &= xfeatures_need_sigframe_write();
++ 
++ 	lmask = mask;
++ 	hmask = mask >> 32;
++ 	xfd_validate_state(fpstate, mask, false);
++ 
++ 	stac();
++ 	XSTATE_OP(XSAVE, buf, lmask, hmask, err);
++ 	clac();
++ 
++ 	return err;
++ }
++ 
++ /*
++  * Restore xstate from user space xsave area.
++  */
++ static inline int xrstor_from_user_sigframe(struct xregs_state __user *buf, u64 mask)
++ {
++ 	struct xregs_state *xstate = ((__force struct xregs_state *)buf);
++ 	u32 lmask = mask;
++ 	u32 hmask = mask >> 32;
++ 	int err;
++ 
++ 	xfd_validate_state(current->thread.fpu.fpstate, mask, true);
++ 
++ 	stac();
++ 	XSTATE_OP(XRSTOR, xstate, lmask, hmask, err);
++ 	clac();
++ 
++ 	return err;
++ }
++ 
++ /*
++  * Restore xstate from kernel space xsave area, return an error code instead of
++  * an exception.
++  */
++ static inline int os_xrstor_safe(struct fpstate *fpstate, u64 mask)
++ {
++ 	struct xregs_state *xstate = &fpstate->regs.xsave;
++ 	u32 lmask = mask;
++ 	u32 hmask = mask >> 32;
++ 	int err;
++ 
++ 	/* Ensure that XFD is up to date */
++ 	xfd_update_state(fpstate);
++ 
++ 	if (cpu_feature_enabled(X86_FEATURE_XSAVES))
++ 		XSTATE_OP(XRSTORS, xstate, lmask, hmask, err);
++ 	else
++ 		XSTATE_OP(XRSTOR, xstate, lmask, hmask, err);
++ 
++ 	return err;
++ }
++ 
++ 
+++>>>>>>> 30d02551ba4f (x86/fpu: Optimize out sigframe xfeatures when in init state)
+  #endif
+* Unmerged path Documentation/x86/xstate.rst
+* Unmerged path Documentation/x86/xstate.rst
+diff --git a/arch/x86/include/asm/fpu/xcr.h b/arch/x86/include/asm/fpu/xcr.h
+index 1c7ab8d95da5..c601c0972eea 100644
+--- a/arch/x86/include/asm/fpu/xcr.h
++++ b/arch/x86/include/asm/fpu/xcr.h
+@@ -14,6 +14,7 @@ static inline void ldmxcsr(u32 mxcsr)
+ extern unsigned int mxcsr_feature_mask;
+ 
+ #define XCR_XFEATURE_ENABLED_MASK	0x00000000
++#define XCR_XFEATURE_IN_USE_MASK	0x00000001
+ 
+ static inline u64 xgetbv(u32 index)
+ {
+@@ -31,4 +32,15 @@ static inline void xsetbv(u32 index, u64 value)
+ 	asm volatile("xsetbv" :: "a" (eax), "d" (edx), "c" (index));
+ }
+ 
++/*
++ * Return a mask of xfeatures which are currently being tracked
++ * by the processor as being in the initial configuration.
++ *
++ * Callers should check X86_FEATURE_XGETBV1.
++ */
++static inline u64 xfeatures_in_use(void)
++{
++	return xgetbv(XCR_XFEATURE_IN_USE_MASK);
++}
++
+ #endif /* _ASM_X86_FPU_XCR_H */
+diff --git a/arch/x86/include/asm/fpu/xstate.h b/arch/x86/include/asm/fpu/xstate.h
+index 2df5bd667a43..52fbed6ba795 100644
+--- a/arch/x86/include/asm/fpu/xstate.h
++++ b/arch/x86/include/asm/fpu/xstate.h
+@@ -129,6 +129,13 @@ static inline u64 xfeatures_mask_independent(void)
+ 	return XFEATURE_MASK_INDEPENDENT;
+ }
+ 
++/*
++ * Features in this mask have space allocated in the signal frame, but may not
++ * have that space initialized when the feature is in its init state.
++ */
++#define XFEATURE_MASK_SIGFRAME_INITOPT	(XFEATURE_MASK_XTILE | \
++					 XFEATURE_MASK_USER_DYNAMIC)
++
+ extern u64 xstate_fx_sw_bytes[USER_XSTATE_FX_SW_WORDS];
+ 
+ extern void __init update_regset_xstate_info(unsigned int size,
+* Unmerged path arch/x86/kernel/cpu/cpuid-deps.c
+* Unmerged path arch/x86/kernel/fpu/xstate.h
