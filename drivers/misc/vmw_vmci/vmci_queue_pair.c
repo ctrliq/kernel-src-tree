@@ -662,7 +662,7 @@ static int qp_host_get_user_memory(u64 produce_uva,
 				     produce_q->kernel_if->num_pages,
 				     FOLL_WRITE,
 				     produce_q->kernel_if->u.h.header_page);
-	if (retval < produce_q->kernel_if->num_pages) {
+	if (retval < (int)produce_q->kernel_if->num_pages) {
 		pr_debug("get_user_pages_fast(produce) failed (retval=%d)",
 			retval);
 		qp_release_pages(produce_q->kernel_if->u.h.header_page,
@@ -675,7 +675,7 @@ static int qp_host_get_user_memory(u64 produce_uva,
 				     consume_q->kernel_if->num_pages,
 				     FOLL_WRITE,
 				     consume_q->kernel_if->u.h.header_page);
-	if (retval < consume_q->kernel_if->num_pages) {
+	if (retval < (int)consume_q->kernel_if->num_pages) {
 		pr_debug("get_user_pages_fast(consume) failed (retval=%d)",
 			retval);
 		qp_release_pages(consume_q->kernel_if->u.h.header_page,
