@@ -1,0 +1,199 @@
+io_uring: re-set iov base/len for buffer select retry
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Jens Axboe <axboe@kernel.dk>
+commit dddb3e26f6d88c5344d28cb5ff9d3d6fa05c4f7a
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/dddb3e26.failed
+
+We already have the buffer selected, but we should set the iter list
+again.
+
+	Cc: stable@vger.kernel.org # v5.7
+	Signed-off-by: Jens Axboe <axboe@kernel.dk>
+(cherry picked from commit dddb3e26f6d88c5344d28cb5ff9d3d6fa05c4f7a)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/io_uring.c
+diff --cc fs/io_uring.c
+index 047c6a5f549f,70f0f2f940fb..000000000000
+--- a/fs/io_uring.c
++++ b/fs/io_uring.c
+@@@ -1188,100 -2360,91 +1188,131 @@@ static int io_import_fixed(struct io_ri
+  	return 0;
+  }
+  
+ -static ssize_t io_iov_buffer_select(struct io_kiocb *req, struct iovec *iov,
+ -				    bool needs_lock)
+ +static ssize_t io_import_iovec(struct io_ring_ctx *ctx, int rw,
+ +			       const struct sqe_submit *s, struct iovec **iovec,
+ +			       struct iov_iter *iter)
+  {
+++<<<<<<< HEAD
+ +	const struct io_uring_sqe *sqe = s->sqe;
+ +	void __user *buf = u64_to_user_ptr(READ_ONCE(sqe->addr));
+ +	size_t sqe_len = READ_ONCE(sqe->len);
+++=======
++ 	if (req->flags & REQ_F_BUFFER_SELECTED) {
++ 		struct io_buffer *kbuf;
++ 
++ 		kbuf = (struct io_buffer *) (unsigned long) req->rw.addr;
++ 		iov[0].iov_base = u64_to_user_ptr(kbuf->addr);
++ 		iov[0].iov_len = kbuf->len;
++ 		return 0;
++ 	}
++ 	if (!req->rw.len)
++ 		return 0;
++ 	else if (req->rw.len > 1)
++ 		return -EINVAL;
++ 
++ #ifdef CONFIG_COMPAT
++ 	if (req->ctx->compat)
++ 		return io_compat_import(req, iov, needs_lock);
++ #endif
++ 
++ 	return __io_iov_buffer_select(req, iov, needs_lock);
++ }
++ 
++ static ssize_t io_import_iovec(int rw, struct io_kiocb *req,
++ 			       struct iovec **iovec, struct iov_iter *iter,
++ 			       bool needs_lock)
++ {
++ 	void __user *buf = u64_to_user_ptr(req->rw.addr);
++ 	size_t sqe_len = req->rw.len;
++ 	ssize_t ret;
+++>>>>>>> dddb3e26f6d8 (io_uring: re-set iov base/len for buffer select retry)
+  	u8 opcode;
+  
+ -	opcode = req->opcode;
+ -	if (opcode == IORING_OP_READ_FIXED || opcode == IORING_OP_WRITE_FIXED) {
+ +	/*
+ +	 * We're reading ->opcode for the second time, but the first read
+ +	 * doesn't care whether it's _FIXED or not, so it doesn't matter
+ +	 * whether ->opcode changes concurrently. The first read does care
+ +	 * about whether it is a READ or a WRITE, so we don't trust this read
+ +	 * for that purpose and instead let the caller pass in the read/write
+ +	 * flag.
+ +	 */
+ +	opcode = READ_ONCE(sqe->opcode);
+ +	if (opcode == IORING_OP_READ_FIXED ||
+ +	    opcode == IORING_OP_WRITE_FIXED) {
+ +		ssize_t ret = io_import_fixed(ctx, rw, sqe, iter);
+  		*iovec = NULL;
+ -		return io_import_fixed(req, rw, iter);
+ +		return ret < 0 ? ret : sqe_len;
+  	}
+  
+ -	/* buffer index only valid with fixed read/write, or buffer select  */
+ -	if (req->buf_index && !(req->flags & REQ_F_BUFFER_SELECT))
+ -		return -EINVAL;
+ +	if (!s->has_user)
+ +		return -EFAULT;
+  
+ -	if (opcode == IORING_OP_READ || opcode == IORING_OP_WRITE) {
+ -		if (req->flags & REQ_F_BUFFER_SELECT) {
+ -			buf = io_rw_buffer_select(req, &sqe_len, needs_lock);
+ -			if (IS_ERR(buf)) {
+ -				*iovec = NULL;
+ -				return PTR_ERR(buf);
+ -			}
+ -			req->rw.len = sqe_len;
+ -		}
+ +#ifdef CONFIG_COMPAT
+ +	if (ctx->compat)
+ +		return compat_import_iovec(rw, buf, sqe_len, UIO_FASTIOV,
+ +						iovec, iter);
+ +#endif
+  
+ -		ret = import_single_range(rw, buf, sqe_len, *iovec, iter);
+ -		*iovec = NULL;
+ -		return ret < 0 ? ret : sqe_len;
+ -	}
+ +	return import_iovec(rw, buf, sqe_len, UIO_FASTIOV, iovec, iter);
+ +}
+  
+ -	if (req->io) {
+ -		struct io_async_rw *iorw = &req->io->rw;
+ +static inline bool io_should_merge(struct async_list *al, struct kiocb *kiocb)
+ +{
+ +	if (al->file == kiocb->ki_filp) {
+ +		off_t start, end;
+  
+ -		*iovec = iorw->iov;
+ -		iov_iter_init(iter, rw, *iovec, iorw->nr_segs, iorw->size);
+ -		if (iorw->iov == iorw->fast_iov)
+ -			*iovec = NULL;
+ -		return iorw->size;
+ +		/*
+ +		 * Allow merging if we're anywhere in the range of the same
+ +		 * page. Generally this happens for sub-page reads or writes,
+ +		 * and it's beneficial to allow the first worker to bring the
+ +		 * page in and the piggy backed work can then work on the
+ +		 * cached page.
+ +		 */
+ +		start = al->io_start & PAGE_MASK;
+ +		end = (al->io_start + al->io_len + PAGE_SIZE - 1) & PAGE_MASK;
+ +		if (kiocb->ki_pos >= start && kiocb->ki_pos <= end)
+ +			return true;
+  	}
+  
+ -	if (req->flags & REQ_F_BUFFER_SELECT) {
+ -		ret = io_iov_buffer_select(req, *iovec, needs_lock);
+ -		if (!ret) {
+ -			ret = (*iovec)->iov_len;
+ -			iov_iter_init(iter, rw, *iovec, 1, ret);
+ +	al->file = NULL;
+ +	return false;
+ +}
+ +
+ +/*
+ + * Make a note of the last file/offset/direction we punted to async
+ + * context. We'll use this information to see if we can piggy back a
+ + * sequential request onto the previous one, if it's still hasn't been
+ + * completed by the async worker.
+ + */
+ +static void io_async_list_note(int rw, struct io_kiocb *req, size_t len)
+ +{
+ +	struct async_list *async_list = &req->ctx->pending_async[rw];
+ +	struct kiocb *kiocb = &req->rw;
+ +	struct file *filp = kiocb->ki_filp;
+ +
+ +	if (io_should_merge(async_list, kiocb)) {
+ +		unsigned long max_bytes;
+ +
+ +		/* Use 8x RA size as a decent limiter for both reads/writes */
+ +		max_bytes = filp->f_ra.ra_pages << (PAGE_SHIFT + 3);
+ +		if (!max_bytes)
+ +			max_bytes = VM_READAHEAD_PAGES << (PAGE_SHIFT + 3);
+ +
+ +		/* If max len are exceeded, reset the state */
+ +		if (async_list->io_len + len <= max_bytes) {
+ +			req->flags |= REQ_F_SEQ_PREV;
+ +			async_list->io_len += len;
+ +		} else {
+ +			async_list->file = NULL;
+  		}
+ -		*iovec = NULL;
+ -		return ret;
+  	}
+  
+ -#ifdef CONFIG_COMPAT
+ -	if (req->ctx->compat)
+ -		return compat_import_iovec(rw, buf, sqe_len, UIO_FASTIOV,
+ -						iovec, iter);
+ -#endif
+ -
+ -	return import_iovec(rw, buf, sqe_len, UIO_FASTIOV, iovec, iter);
+ +	/* New file? Reset state. */
+ +	if (async_list->file != filp) {
+ +		async_list->io_start = kiocb->ki_pos;
+ +		async_list->io_len = len;
+ +		async_list->file = filp;
+ +	}
+  }
+  
+  /*
+* Unmerged path fs/io_uring.c
