@@ -1,0 +1,329 @@
+drm/i915/display: Wait PSR2 get out of deep sleep to update pipe
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-365.el8
+commit-author José Roberto de Souza <jose.souza@intel.com>
+commit fed98c16f13f4c68fc507384d3429516ef5c3b6d
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-365.el8/fed98c16.failed
+
+Alderlake-P was getting 'max time under evasion' messages when PSR2
+is enabled, this is due PIPE_SCANLINE/PIPEDSL returning 0 over a
+period of time longer than VBLANK_EVASION_TIME_US.
+
+For PSR1 we had the same issue so intel_psr_wait_for_idle() was
+implemented to wait for PSR1 to get into idle state but nothing was
+done for PSR2.
+
+For PSR2 we can't only wait for idle state as PSR2 tends to keep
+into sleep state(ready to send selective updates).
+Waiting for any state below deep sleep proved to be effective in
+avoiding the evasion messages and also not wasted a lot of time.
+
+v2:
+- dropping the additional wait_for loops, only the _wait_for_atomic()
+is necessary
+- waiting for states below EDP_PSR2_STATUS_STATE_DEEP_SLEEP
+
+v3:
+- dropping intel_wait_for_condition_atomic() function
+
+	Cc: Ville Syrjälä <ville.syrjala@linux.intel.com>
+	Cc: Gwan-gyeong Mun <gwan-gyeong.mun@intel.com>
+	Signed-off-by: José Roberto de Souza <jose.souza@intel.com>
+	Reviewed-by: Gwan-gyeong Mun <gwan-gyeong.mun@intel.com>
+Link: https://patchwork.freedesktop.org/patch/msgid/20211005231851.67698-1-jose.souza@intel.com
+(cherry picked from commit fed98c16f13f4c68fc507384d3429516ef5c3b6d)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/gpu/drm/i915/display/intel_display_debugfs.c
+#	drivers/gpu/drm/i915/display/intel_psr.c
+diff --cc drivers/gpu/drm/i915/display/intel_display_debugfs.c
+index d62b18d5ecd8,d7d6dde518a3..000000000000
+--- a/drivers/gpu/drm/i915/display/intel_display_debugfs.c
++++ b/drivers/gpu/drm/i915/display/intel_display_debugfs.c
+@@@ -300,9 -302,8 +300,14 @@@ psr_source_status(struct drm_i915_priva
+  			"TG_ON"
+  		};
+  		val = intel_de_read(dev_priv,
+++<<<<<<< HEAD
+ +				    EDP_PSR2_STATUS(dev_priv->psr.transcoder));
+ +		status_val = (val & EDP_PSR2_STATUS_STATE_MASK) >>
+ +			      EDP_PSR2_STATUS_STATE_SHIFT;
+++=======
++ 				    EDP_PSR2_STATUS(intel_dp->psr.transcoder));
++ 		status_val = REG_FIELD_GET(EDP_PSR2_STATUS_STATE_MASK, val);
+++>>>>>>> fed98c16f13f (drm/i915/display: Wait PSR2 get out of deep sleep to update pipe)
+  		if (status_val < ARRAY_SIZE(live_status))
+  			status = live_status[status_val];
+  	} else {
+diff --cc drivers/gpu/drm/i915/display/intel_psr.c
+index 2c6c4a4f9477,d35db50ef967..000000000000
+--- a/drivers/gpu/drm/i915/display/intel_psr.c
++++ b/drivers/gpu/drm/i915/display/intel_psr.c
+@@@ -1448,81 -1725,111 +1448,99 @@@ skip_sel_fetch_set_loop
+  	return 0;
+  }
+  
+ -static void _intel_psr_pre_plane_update(const struct intel_atomic_state *state,
+ -					const struct intel_crtc_state *crtc_state)
+ -{
+ -	struct intel_encoder *encoder;
+ -
+ -	for_each_intel_encoder_mask_with_psr(state->base.dev, encoder,
+ -					     crtc_state->uapi.encoder_mask) {
+ -		struct intel_dp *intel_dp = enc_to_intel_dp(encoder);
+ -		struct intel_psr *psr = &intel_dp->psr;
+ -		bool needs_to_disable = false;
+ -
+ -		mutex_lock(&psr->lock);
+ -
+ -		/*
+ -		 * Reasons to disable:
+ -		 * - PSR disabled in new state
+ -		 * - All planes will go inactive
+ -		 * - Changing between PSR versions
+ -		 */
+ -		needs_to_disable |= !crtc_state->has_psr;
+ -		needs_to_disable |= !crtc_state->active_planes;
+ -		needs_to_disable |= crtc_state->has_psr2 != psr->psr2_enabled;
+ -
+ -		if (psr->enabled && needs_to_disable)
+ -			intel_psr_disable_locked(intel_dp);
+ -
+ -		mutex_unlock(&psr->lock);
+ -	}
+ -}
+ -
+ -void intel_psr_pre_plane_update(const struct intel_atomic_state *state)
+ -{
+ -	struct drm_i915_private *dev_priv = to_i915(state->base.dev);
+ -	struct intel_crtc_state *crtc_state;
+ -	struct intel_crtc *crtc;
+ -	int i;
+ -
+ -	if (!HAS_PSR(dev_priv))
+ -		return;
+ -
+ -	for_each_new_intel_crtc_in_state(state, crtc, crtc_state, i)
+ -		_intel_psr_pre_plane_update(state, crtc_state);
+ -}
+ -
+ -static void _intel_psr_post_plane_update(const struct intel_atomic_state *state,
+ -					 const struct intel_crtc_state *crtc_state)
+ +/**
+ + * intel_psr_update - Update PSR state
+ + * @intel_dp: Intel DP
+ + * @crtc_state: new CRTC state
+ + * @conn_state: new CONNECTOR state
+ + *
+ + * This functions will update PSR states, disabling, enabling or switching PSR
+ + * version when executing fastsets. For full modeset, intel_psr_disable() and
+ + * intel_psr_enable() should be called instead.
+ + */
+ +void intel_psr_update(struct intel_dp *intel_dp,
+ +		      const struct intel_crtc_state *crtc_state,
+ +		      const struct drm_connector_state *conn_state)
+  {
+ -	struct drm_i915_private *dev_priv = to_i915(state->base.dev);
+ -	struct intel_encoder *encoder;
+ +	struct drm_i915_private *dev_priv = dp_to_i915(intel_dp);
+ +	struct i915_psr *psr = &dev_priv->psr;
+ +	bool enable, psr2_enable;
+  
+ -	if (!crtc_state->has_psr)
+ +	if (!CAN_PSR(dev_priv) || READ_ONCE(psr->dp) != intel_dp)
+  		return;
+  
+ -	for_each_intel_encoder_mask_with_psr(state->base.dev, encoder,
+ -					     crtc_state->uapi.encoder_mask) {
+ -		struct intel_dp *intel_dp = enc_to_intel_dp(encoder);
+ -		struct intel_psr *psr = &intel_dp->psr;
+ -
+ -		mutex_lock(&psr->lock);
+ +	mutex_lock(&dev_priv->psr.lock);
+  
+ -		drm_WARN_ON(&dev_priv->drm, psr->enabled && !crtc_state->active_planes);
+ -
+ -		/* Only enable if there is active planes */
+ -		if (!psr->enabled && crtc_state->active_planes)
+ -			intel_psr_enable_locked(intel_dp, crtc_state);
+ +	enable = crtc_state->has_psr;
+ +	psr2_enable = crtc_state->has_psr2;
+  
+ +	if (enable == psr->enabled && psr2_enable == psr->psr2_enabled) {
+  		/* Force a PSR exit when enabling CRC to avoid CRC timeouts */
+  		if (crtc_state->crc_enabled && psr->enabled)
+ -			psr_force_hw_tracking_exit(intel_dp);
+ +			psr_force_hw_tracking_exit(dev_priv);
+ +		else if (INTEL_GEN(dev_priv) < 9 && psr->enabled) {
+ +			/*
+ +			 * Activate PSR again after a force exit when enabling
+ +			 * CRC in older gens
+ +			 */
+ +			if (!dev_priv->psr.active &&
+ +			    !dev_priv->psr.busy_frontbuffer_bits)
+ +				schedule_work(&dev_priv->psr.work);
+ +		}
+  
+ -		mutex_unlock(&psr->lock);
+ +		goto unlock;
+  	}
+ -}
+  
+ -void intel_psr_post_plane_update(const struct intel_atomic_state *state)
+ -{
+ -	struct drm_i915_private *dev_priv = to_i915(state->base.dev);
+ -	struct intel_crtc_state *crtc_state;
+ -	struct intel_crtc *crtc;
+ -	int i;
+ +	if (psr->enabled)
+ +		intel_psr_disable_locked(intel_dp);
+  
+ -	if (!HAS_PSR(dev_priv))
+ -		return;
+ +	if (enable)
+ +		intel_psr_enable_locked(dev_priv, crtc_state, conn_state);
+  
+ -	for_each_new_intel_crtc_in_state(state, crtc, crtc_state, i)
+ -		_intel_psr_post_plane_update(state, crtc_state);
+ +unlock:
+ +	mutex_unlock(&dev_priv->psr.lock);
+  }
+  
+++<<<<<<< HEAD
+ +/**
+ + * intel_psr_wait_for_idle - wait for PSR1 to idle
+ + * @new_crtc_state: new CRTC state
+ + * @out_value: PSR status in case of failure
+ + *
+ + * This function is expected to be called from pipe_update_start() where it is
+ + * not expected to race with PSR enable or disable.
+ + *
+ + * Returns: 0 on success or -ETIMEOUT if PSR status does not idle.
+ + */
+ +int intel_psr_wait_for_idle(const struct intel_crtc_state *new_crtc_state,
+ +			    u32 *out_value)
+++=======
++ static int _psr2_ready_for_pipe_update_locked(struct intel_dp *intel_dp)
++ {
++ 	struct drm_i915_private *dev_priv = dp_to_i915(intel_dp);
++ 
++ 	/*
++ 	 * Any state lower than EDP_PSR2_STATUS_STATE_DEEP_SLEEP is enough.
++ 	 * As all higher states has bit 4 of PSR2 state set we can just wait for
++ 	 * EDP_PSR2_STATUS_STATE_DEEP_SLEEP to be cleared.
++ 	 */
++ 	return intel_de_wait_for_clear(dev_priv,
++ 				       EDP_PSR2_STATUS(intel_dp->psr.transcoder),
++ 				       EDP_PSR2_STATUS_STATE_DEEP_SLEEP, 50);
++ }
++ 
++ static int _psr1_ready_for_pipe_update_locked(struct intel_dp *intel_dp)
+++>>>>>>> fed98c16f13f (drm/i915/display: Wait PSR2 get out of deep sleep to update pipe)
+  {
+ -	struct drm_i915_private *dev_priv = dp_to_i915(intel_dp);
+ +	struct intel_crtc *crtc = to_intel_crtc(new_crtc_state->uapi.crtc);
+ +	struct drm_i915_private *dev_priv = to_i915(crtc->base.dev);
+ +
+ +	if (!dev_priv->psr.enabled || !new_crtc_state->has_psr)
+ +		return 0;
+ +
+ +	/* FIXME: Update this for PSR2 if we need to wait for idle */
+ +	if (READ_ONCE(dev_priv->psr.psr2_enabled))
+ +		return 0;
+  
+  	/*
+  	 * From bspec: Panel Self Refresh (BDW+)
+@@@ -1530,16 -1837,53 +1548,66 @@@
+  	 * exit training time + 1.5 ms of aux channel handshake. 50 ms is
+  	 * defensive enough to cover everything.
+  	 */
+++<<<<<<< HEAD
+ +
+ +	return __intel_wait_for_register(&dev_priv->uncore,
+ +					 EDP_PSR_STATUS(dev_priv->psr.transcoder),
+ +					 EDP_PSR_STATUS_STATE_MASK,
+ +					 EDP_PSR_STATUS_STATE_IDLE, 2, 50,
+ +					 out_value);
+ +}
+ +
+ +static bool __psr_wait_for_idle_locked(struct drm_i915_private *dev_priv)
+ +{
+++=======
++ 	return intel_de_wait_for_clear(dev_priv,
++ 				       EDP_PSR_STATUS(intel_dp->psr.transcoder),
++ 				       EDP_PSR_STATUS_STATE_MASK, 50);
++ }
++ 
++ /**
++  * intel_psr_wait_for_idle - wait for PSR be ready for a pipe update
++  * @new_crtc_state: new CRTC state
++  *
++  * This function is expected to be called from pipe_update_start() where it is
++  * not expected to race with PSR enable or disable.
++  */
++ void intel_psr_wait_for_idle(const struct intel_crtc_state *new_crtc_state)
++ {
++ 	struct drm_i915_private *dev_priv = to_i915(new_crtc_state->uapi.crtc->dev);
++ 	struct intel_encoder *encoder;
++ 
++ 	if (!new_crtc_state->has_psr)
++ 		return;
++ 
++ 	for_each_intel_encoder_mask_with_psr(&dev_priv->drm, encoder,
++ 					     new_crtc_state->uapi.encoder_mask) {
++ 		struct intel_dp *intel_dp = enc_to_intel_dp(encoder);
++ 		int ret;
++ 
++ 		mutex_lock(&intel_dp->psr.lock);
++ 
++ 		if (!intel_dp->psr.enabled) {
++ 			mutex_unlock(&intel_dp->psr.lock);
++ 			continue;
++ 		}
++ 
++ 		if (intel_dp->psr.psr2_enabled)
++ 			ret = _psr2_ready_for_pipe_update_locked(intel_dp);
++ 		else
++ 			ret = _psr1_ready_for_pipe_update_locked(intel_dp);
++ 
++ 		if (ret)
++ 			drm_err(&dev_priv->drm, "PSR wait timed out, atomic update may fail\n");
++ 
++ 		mutex_unlock(&intel_dp->psr.lock);
++ 	}
++ }
++ 
++ static bool __psr_wait_for_idle_locked(struct intel_dp *intel_dp)
++ {
++ 	struct drm_i915_private *dev_priv = dp_to_i915(intel_dp);
+++>>>>>>> fed98c16f13f (drm/i915/display: Wait PSR2 get out of deep sleep to update pipe)
+  	i915_reg_t reg;
+  	u32 mask;
+  	int err;
+* Unmerged path drivers/gpu/drm/i915/display/intel_display_debugfs.c
+* Unmerged path drivers/gpu/drm/i915/display/intel_psr.c
+diff --git a/drivers/gpu/drm/i915/i915_reg.h b/drivers/gpu/drm/i915/i915_reg.h
+index bb852024d031..779aa6844638 100644
+--- a/drivers/gpu/drm/i915/i915_reg.h
++++ b/drivers/gpu/drm/i915/i915_reg.h
+@@ -4616,11 +4616,11 @@ enum {
+ #define  PSR_EVENT_LPSP_MODE_EXIT		(1 << 1)
+ #define  PSR_EVENT_PSR_DISABLE			(1 << 0)
+ 
+-#define _PSR2_STATUS_A			0x60940
+-#define _PSR2_STATUS_EDP		0x6f940
+-#define EDP_PSR2_STATUS(tran)		_MMIO_TRANS2(tran, _PSR2_STATUS_A)
+-#define EDP_PSR2_STATUS_STATE_MASK     (0xf << 28)
+-#define EDP_PSR2_STATUS_STATE_SHIFT    28
++#define _PSR2_STATUS_A				0x60940
++#define _PSR2_STATUS_EDP			0x6f940
++#define EDP_PSR2_STATUS(tran)			_MMIO_TRANS2(tran, _PSR2_STATUS_A)
++#define EDP_PSR2_STATUS_STATE_MASK		REG_GENMASK(31, 28)
++#define EDP_PSR2_STATUS_STATE_DEEP_SLEEP	REG_FIELD_PREP(EDP_PSR2_STATUS_STATE_MASK, 0x8)
+ 
+ #define _PSR2_SU_STATUS_A		0x60914
+ #define _PSR2_SU_STATUS_EDP		0x6f914
