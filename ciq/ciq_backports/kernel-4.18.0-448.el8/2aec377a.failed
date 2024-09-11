@@ -1,0 +1,366 @@
+dm table: remove dm_table_get_num_targets() wrapper
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-448.el8
+commit-author Mike Snitzer <snitzer@kernel.org>
+commit 2aec377a29250b942f14d3c16d49783da3e9df11
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-448.el8/2aec377a.failed
+
+More efficient and readable to just access table->num_targets directly.
+
+	Suggested-by: Linus Torvalds <torvalds@linux-foundation.org>
+	Signed-off-by: Mike Snitzer <snitzer@kernel.org>
+(cherry picked from commit 2aec377a29250b942f14d3c16d49783da3e9df11)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/md/dm-ima.c
+#	drivers/md/dm-table.c
+#	drivers/md/dm-zone.c
+diff --cc drivers/md/dm-table.c
+index f2992664f9c8,b4af34041a6f..000000000000
+--- a/drivers/md/dm-table.c
++++ b/drivers/md/dm-table.c
+@@@ -1187,6 -1205,206 +1187,209 @@@ static int dm_table_register_integrity(
+  	return 0;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ #ifdef CONFIG_BLK_INLINE_ENCRYPTION
++ 
++ struct dm_crypto_profile {
++ 	struct blk_crypto_profile profile;
++ 	struct mapped_device *md;
++ };
++ 
++ struct dm_keyslot_evict_args {
++ 	const struct blk_crypto_key *key;
++ 	int err;
++ };
++ 
++ static int dm_keyslot_evict_callback(struct dm_target *ti, struct dm_dev *dev,
++ 				     sector_t start, sector_t len, void *data)
++ {
++ 	struct dm_keyslot_evict_args *args = data;
++ 	int err;
++ 
++ 	err = blk_crypto_evict_key(bdev_get_queue(dev->bdev), args->key);
++ 	if (!args->err)
++ 		args->err = err;
++ 	/* Always try to evict the key from all devices. */
++ 	return 0;
++ }
++ 
++ /*
++  * When an inline encryption key is evicted from a device-mapper device, evict
++  * it from all the underlying devices.
++  */
++ static int dm_keyslot_evict(struct blk_crypto_profile *profile,
++ 			    const struct blk_crypto_key *key, unsigned int slot)
++ {
++ 	struct mapped_device *md =
++ 		container_of(profile, struct dm_crypto_profile, profile)->md;
++ 	struct dm_keyslot_evict_args args = { key };
++ 	struct dm_table *t;
++ 	int srcu_idx;
++ 	int i;
++ 	struct dm_target *ti;
++ 
++ 	t = dm_get_live_table(md, &srcu_idx);
++ 	if (!t)
++ 		return 0;
++ 	for (i = 0; i < t->num_targets; i++) {
++ 		ti = dm_table_get_target(t, i);
++ 		if (!ti->type->iterate_devices)
++ 			continue;
++ 		ti->type->iterate_devices(ti, dm_keyslot_evict_callback, &args);
++ 	}
++ 	dm_put_live_table(md, srcu_idx);
++ 	return args.err;
++ }
++ 
++ static int
++ device_intersect_crypto_capabilities(struct dm_target *ti, struct dm_dev *dev,
++ 				     sector_t start, sector_t len, void *data)
++ {
++ 	struct blk_crypto_profile *parent = data;
++ 	struct blk_crypto_profile *child =
++ 		bdev_get_queue(dev->bdev)->crypto_profile;
++ 
++ 	blk_crypto_intersect_capabilities(parent, child);
++ 	return 0;
++ }
++ 
++ void dm_destroy_crypto_profile(struct blk_crypto_profile *profile)
++ {
++ 	struct dm_crypto_profile *dmcp = container_of(profile,
++ 						      struct dm_crypto_profile,
++ 						      profile);
++ 
++ 	if (!profile)
++ 		return;
++ 
++ 	blk_crypto_profile_destroy(profile);
++ 	kfree(dmcp);
++ }
++ 
++ static void dm_table_destroy_crypto_profile(struct dm_table *t)
++ {
++ 	dm_destroy_crypto_profile(t->crypto_profile);
++ 	t->crypto_profile = NULL;
++ }
++ 
++ /*
++  * Constructs and initializes t->crypto_profile with a crypto profile that
++  * represents the common set of crypto capabilities of the devices described by
++  * the dm_table.  However, if the constructed crypto profile doesn't support all
++  * crypto capabilities that are supported by the current mapped_device, it
++  * returns an error instead, since we don't support removing crypto capabilities
++  * on table changes.  Finally, if the constructed crypto profile is "empty" (has
++  * no crypto capabilities at all), it just sets t->crypto_profile to NULL.
++  */
++ static int dm_table_construct_crypto_profile(struct dm_table *t)
++ {
++ 	struct dm_crypto_profile *dmcp;
++ 	struct blk_crypto_profile *profile;
++ 	struct dm_target *ti;
++ 	unsigned int i;
++ 	bool empty_profile = true;
++ 
++ 	dmcp = kmalloc(sizeof(*dmcp), GFP_KERNEL);
++ 	if (!dmcp)
++ 		return -ENOMEM;
++ 	dmcp->md = t->md;
++ 
++ 	profile = &dmcp->profile;
++ 	blk_crypto_profile_init(profile, 0);
++ 	profile->ll_ops.keyslot_evict = dm_keyslot_evict;
++ 	profile->max_dun_bytes_supported = UINT_MAX;
++ 	memset(profile->modes_supported, 0xFF,
++ 	       sizeof(profile->modes_supported));
++ 
++ 	for (i = 0; i < t->num_targets; i++) {
++ 		ti = dm_table_get_target(t, i);
++ 
++ 		if (!dm_target_passes_crypto(ti->type)) {
++ 			blk_crypto_intersect_capabilities(profile, NULL);
++ 			break;
++ 		}
++ 		if (!ti->type->iterate_devices)
++ 			continue;
++ 		ti->type->iterate_devices(ti,
++ 					  device_intersect_crypto_capabilities,
++ 					  profile);
++ 	}
++ 
++ 	if (t->md->queue &&
++ 	    !blk_crypto_has_capabilities(profile,
++ 					 t->md->queue->crypto_profile)) {
++ 		DMWARN("Inline encryption capabilities of new DM table were more restrictive than the old table's. This is not supported!");
++ 		dm_destroy_crypto_profile(profile);
++ 		return -EINVAL;
++ 	}
++ 
++ 	/*
++ 	 * If the new profile doesn't actually support any crypto capabilities,
++ 	 * we may as well represent it with a NULL profile.
++ 	 */
++ 	for (i = 0; i < ARRAY_SIZE(profile->modes_supported); i++) {
++ 		if (profile->modes_supported[i]) {
++ 			empty_profile = false;
++ 			break;
++ 		}
++ 	}
++ 
++ 	if (empty_profile) {
++ 		dm_destroy_crypto_profile(profile);
++ 		profile = NULL;
++ 	}
++ 
++ 	/*
++ 	 * t->crypto_profile is only set temporarily while the table is being
++ 	 * set up, and it gets set to NULL after the profile has been
++ 	 * transferred to the request_queue.
++ 	 */
++ 	t->crypto_profile = profile;
++ 
++ 	return 0;
++ }
++ 
++ static void dm_update_crypto_profile(struct request_queue *q,
++ 				     struct dm_table *t)
++ {
++ 	if (!t->crypto_profile)
++ 		return;
++ 
++ 	/* Make the crypto profile less restrictive. */
++ 	if (!q->crypto_profile) {
++ 		blk_crypto_register(t->crypto_profile, q);
++ 	} else {
++ 		blk_crypto_update_capabilities(q->crypto_profile,
++ 					       t->crypto_profile);
++ 		dm_destroy_crypto_profile(t->crypto_profile);
++ 	}
++ 	t->crypto_profile = NULL;
++ }
++ 
++ #else /* CONFIG_BLK_INLINE_ENCRYPTION */
++ 
++ static int dm_table_construct_crypto_profile(struct dm_table *t)
++ {
++ 	return 0;
++ }
++ 
++ void dm_destroy_crypto_profile(struct blk_crypto_profile *profile)
++ {
++ }
++ 
++ static void dm_table_destroy_crypto_profile(struct dm_table *t)
++ {
++ }
++ 
++ static void dm_update_crypto_profile(struct request_queue *q,
++ 				     struct dm_table *t)
++ {
++ }
++ 
++ #endif /* !CONFIG_BLK_INLINE_ENCRYPTION */
++ 
+++>>>>>>> 2aec377a2925 (dm table: remove dm_table_get_num_targets() wrapper)
+  /*
+   * Prepares the table for use by building the indices,
+   * setting the type, and allocating mempools.
+@@@ -1329,6 -1561,22 +1532,25 @@@ static int count_device(struct dm_targe
+  	return 0;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static bool dm_table_supports_poll(struct dm_table *t)
++ {
++ 	struct dm_target *ti;
++ 	unsigned i = 0;
++ 
++ 	while (i < t->num_targets) {
++ 		ti = dm_table_get_target(t, i++);
++ 
++ 		if (!ti->type->iterate_devices ||
++ 		    ti->type->iterate_devices(ti, device_not_poll_capable, NULL))
++ 			return false;
++ 	}
++ 
++ 	return true;
++ }
++ 
+++>>>>>>> 2aec377a2925 (dm table: remove dm_table_get_num_targets() wrapper)
+  /*
+   * Check whether a table has no data devices attached using each
+   * target's iterate_devices method.
+@@@ -1880,16 -2071,27 +2102,11 @@@ void dm_table_set_restrictions(struct d
+  		if (!static_key_enabled(&zoned_enabled.key))
+  			static_branch_enable(&zoned_enabled);
+  	}
+ +#endif
+  
+ -	dm_update_crypto_profile(q, t);
+ -	disk_update_readahead(t->md->disk);
+ -
+ -	/*
+ -	 * Check for request-based device is left to
+ -	 * dm_mq_init_request_queue()->blk_mq_init_allocated_queue().
+ -	 *
+ -	 * For bio-based device, only set QUEUE_FLAG_POLL when all
+ -	 * underlying devices supporting polling.
+ -	 */
+ -	if (__table_type_bio_based(t->type)) {
+ -		if (dm_table_supports_poll(t))
+ -			blk_queue_flag_set(QUEUE_FLAG_POLL, q);
+ -		else
+ -			blk_queue_flag_clear(QUEUE_FLAG_POLL, q);
+ -	}
+ -
+ -	return 0;
+ +	blk_queue_update_readahead(q);
+  }
+  
+- unsigned int dm_table_get_num_targets(struct dm_table *t)
+- {
+- 	return t->num_targets;
+- }
+- 
+  struct list_head *dm_table_get_devices(struct dm_table *t)
+  {
+  	return &t->devices;
+* Unmerged path drivers/md/dm-ima.c
+* Unmerged path drivers/md/dm-zone.c
+* Unmerged path drivers/md/dm-ima.c
+diff --git a/drivers/md/dm-ioctl.c b/drivers/md/dm-ioctl.c
+index 7c87b145fb80..2ac14ef5510a 100644
+--- a/drivers/md/dm-ioctl.c
++++ b/drivers/md/dm-ioctl.c
+@@ -799,7 +799,7 @@ static void __dev_status(struct mapped_device *md, struct dm_ioctl *param)
+ 		if (!(param->flags & DM_QUERY_INACTIVE_TABLE_FLAG)) {
+ 			if (get_disk_ro(disk))
+ 				param->flags |= DM_READONLY_FLAG;
+-			param->target_count = dm_table_get_num_targets(table);
++			param->target_count = table->num_targets;
+ 		}
+ 
+ 		param->flags |= DM_ACTIVE_PRESENT_FLAG;
+@@ -812,7 +812,7 @@ static void __dev_status(struct mapped_device *md, struct dm_ioctl *param)
+ 		if (table) {
+ 			if (!(dm_table_get_mode(table) & FMODE_WRITE))
+ 				param->flags |= DM_READONLY_FLAG;
+-			param->target_count = dm_table_get_num_targets(table);
++			param->target_count = table->num_targets;
+ 		}
+ 		dm_put_live_table(md, srcu_idx);
+ 	}
+@@ -1207,7 +1207,7 @@ static void retrieve_status(struct dm_table *table,
+ 		type = STATUSTYPE_INFO;
+ 
+ 	/* Get all the target info */
+-	num_targets = dm_table_get_num_targets(table);
++	num_targets = table->num_targets;
+ 	for (i = 0; i < num_targets; i++) {
+ 		struct dm_target *ti = dm_table_get_target(table, i);
+ 		size_t l;
+* Unmerged path drivers/md/dm-table.c
+* Unmerged path drivers/md/dm-zone.c
+diff --git a/drivers/md/dm.c b/drivers/md/dm.c
+index 92dde437a06d..5485bf66c966 100644
+--- a/drivers/md/dm.c
++++ b/drivers/md/dm.c
+@@ -488,7 +488,7 @@ static int dm_prepare_ioctl(struct mapped_device *md, int *srcu_idx,
+ 		return r;
+ 
+ 	/* We only support devices that have a single target */
+-	if (dm_table_get_num_targets(map) != 1)
++	if (map->num_targets != 1)
+ 		return r;
+ 
+ 	tgt = dm_table_get_target(map, 0);
+@@ -3052,7 +3052,7 @@ static int dm_call_pr(struct block_device *bdev, iterate_devices_callout_fn fn,
+ 		goto out;
+ 
+ 	/* We only support devices that have a single target */
+-	if (dm_table_get_num_targets(table) != 1)
++	if (table->num_targets != 1)
+ 		goto out;
+ 	ti = dm_table_get_target(table, 0);
+ 
+diff --git a/include/linux/device-mapper.h b/include/linux/device-mapper.h
+index d5bec8ef9bb6..baa823f06474 100644
+--- a/include/linux/device-mapper.h
++++ b/include/linux/device-mapper.h
+@@ -556,7 +556,6 @@ void dm_sync_table(struct mapped_device *md);
+  * Queries
+  */
+ sector_t dm_table_get_size(struct dm_table *t);
+-unsigned int dm_table_get_num_targets(struct dm_table *t);
+ fmode_t dm_table_get_mode(struct dm_table *t);
+ struct mapped_device *dm_table_get_md(struct dm_table *t);
+ const char *dm_table_device_name(struct dm_table *t);
