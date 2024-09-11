@@ -1,0 +1,143 @@
+nvme: lift the file open code from nvme_ctrl_get_by_path
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-310.el8
+commit-author Chaitanya Kulkarni <chaitanya.kulkarni@wdc.com>
+commit b2702aaaa45c2d1028bc8c51b49106041be7aae5
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-310.el8/b2702aaa.failed
+
+Lift opening the file open/close code from nvme_ctrl_get_by_path into
+the caller, just keeping a simple nvme_ctrl_from_file() helper.
+
+	Signed-off-by: Chaitanya Kulkarni <chaitanya.kulkarni@wdc.com>
+[hch: refactored a bit, split the bug fixes into a separate prep patch]
+	Signed-off-by: Christoph Hellwig <hch@lst.de>
+	Reviewed-by: Logan Gunthorpe <logang@deltatee.com>
+(cherry picked from commit b2702aaaa45c2d1028bc8c51b49106041be7aae5)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/nvme/host/core.c
+diff --cc drivers/nvme/host/core.c
+index 54516561f752,35cd177bda08..000000000000
+--- a/drivers/nvme/host/core.c
++++ b/drivers/nvme/host/core.c
+@@@ -4628,28 -4668,13 +4628,17 @@@ void nvme_sync_queues(struct nvme_ctrl 
+  }
+  EXPORT_SYMBOL_GPL(nvme_sync_queues);
+  
+- struct nvme_ctrl *nvme_ctrl_get_by_path(const char *path)
++ struct nvme_ctrl *nvme_ctrl_from_file(struct file *file)
+  {
+- 	struct nvme_ctrl *ctrl;
+- 	struct file *f;
+- 
+- 	f = filp_open(path, O_RDWR, 0);
+- 	if (IS_ERR(f))
+- 		return ERR_CAST(f);
+- 
+- 	if (f->f_op != &nvme_dev_fops) {
+- 		ctrl = ERR_PTR(-EINVAL);
+- 		goto out_close;
+- 	}
+- 
+- 	ctrl = f->private_data;
+- 	nvme_get_ctrl(ctrl);
+- 
+- out_close:
+- 	filp_close(f, NULL);
+- 	return ctrl;
++ 	if (file->f_op != &nvme_dev_fops)
++ 		return NULL;
++ 	return file->private_data;
+  }
+++<<<<<<< HEAD
+ +EXPORT_SYMBOL_GPL(nvme_ctrl_get_by_path);
+++=======
++ EXPORT_SYMBOL_NS_GPL(nvme_ctrl_from_file, NVME_TARGET_PASSTHRU);
+++>>>>>>> b2702aaaa45c (nvme: lift the file open code from nvme_ctrl_get_by_path)
+  
+  /*
+   * Check we didn't inadvertently grow the command structure sizes:
+* Unmerged path drivers/nvme/host/core.c
+diff --git a/drivers/nvme/host/nvme.h b/drivers/nvme/host/nvme.h
+index efa4f4700780..afbd468b236c 100644
+--- a/drivers/nvme/host/nvme.h
++++ b/drivers/nvme/host/nvme.h
+@@ -793,7 +793,7 @@ static inline int nvme_hwmon_init(struct nvme_ctrl *ctrl)
+ u32 nvme_command_effects(struct nvme_ctrl *ctrl, struct nvme_ns *ns,
+ 			 u8 opcode);
+ void nvme_execute_passthru_rq(struct request *rq);
+-struct nvme_ctrl *nvme_ctrl_get_by_path(const char *path);
++struct nvme_ctrl *nvme_ctrl_from_file(struct file *file);
+ struct nvme_ns *nvme_find_get_ns(struct nvme_ctrl *ctrl, unsigned nsid);
+ void nvme_put_ns(struct nvme_ns *ns);
+ 
+diff --git a/drivers/nvme/target/passthru.c b/drivers/nvme/target/passthru.c
+index dacfa7435d0b..e3a5f8499a0b 100644
+--- a/drivers/nvme/target/passthru.c
++++ b/drivers/nvme/target/passthru.c
+@@ -474,6 +474,7 @@ u16 nvmet_parse_passthru_admin_cmd(struct nvmet_req *req)
+ int nvmet_passthru_ctrl_enable(struct nvmet_subsys *subsys)
+ {
+ 	struct nvme_ctrl *ctrl;
++	struct file *file;
+ 	int ret = -EINVAL;
+ 	void *old;
+ 
+@@ -488,24 +489,29 @@ int nvmet_passthru_ctrl_enable(struct nvmet_subsys *subsys)
+ 		goto out_unlock;
+ 	}
+ 
+-	ctrl = nvme_ctrl_get_by_path(subsys->passthru_ctrl_path);
+-	if (IS_ERR(ctrl)) {
+-		ret = PTR_ERR(ctrl);
++	file = filp_open(subsys->passthru_ctrl_path, O_RDWR, 0);
++	if (IS_ERR(file)) {
++		ret = PTR_ERR(file);
++		goto out_unlock;
++	}
++
++	ctrl = nvme_ctrl_from_file(file);
++	if (!ctrl) {
+ 		pr_err("failed to open nvme controller %s\n",
+ 		       subsys->passthru_ctrl_path);
+ 
+-		goto out_unlock;
++		goto out_put_file;
+ 	}
+ 
+ 	old = xa_cmpxchg(&passthru_subsystems, ctrl->cntlid, NULL,
+ 			 subsys, GFP_KERNEL);
+ 	if (xa_is_err(old)) {
+ 		ret = xa_err(old);
+-		goto out_put_ctrl;
++		goto out_put_file;
+ 	}
+ 
+ 	if (old)
+-		goto out_put_ctrl;
++		goto out_put_file;
+ 
+ 	subsys->passthru_ctrl = ctrl;
+ 	subsys->ver = ctrl->vs;
+@@ -516,13 +522,12 @@ int nvmet_passthru_ctrl_enable(struct nvmet_subsys *subsys)
+ 			NVME_TERTIARY(subsys->ver));
+ 		subsys->ver = NVME_VS(1, 2, 1);
+ 	}
+-
++	nvme_get_ctrl(ctrl);
+ 	__module_get(subsys->passthru_ctrl->ops->module);
+-	mutex_unlock(&subsys->lock);
+-	return 0;
++	ret = 0;
+ 
+-out_put_ctrl:
+-	nvme_put_ctrl(ctrl);
++out_put_file:
++	filp_close(file, NULL);
+ out_unlock:
+ 	mutex_unlock(&subsys->lock);
+ 	return ret;
