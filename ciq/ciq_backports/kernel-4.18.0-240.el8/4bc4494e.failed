@@ -1,0 +1,199 @@
+io_uring: remove extra nxt check after punt
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Pavel Begunkov <asml.silence@gmail.com>
+commit 4bc4494ec7c97ee38e2aa3d1cd76e289c49ac083
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/4bc4494e.failed
+
+After __io_queue_sqe() ended up in io_queue_async_work(), it's already
+known that there is no @nxt req, so skip the check and return from the
+function.
+
+Also, @nxt initialisation now can be done just before
+io_put_req_find_next(), as there is no jumping until it's checked.
+
+	Signed-off-by: Pavel Begunkov <asml.silence@gmail.com>
+	Signed-off-by: Jens Axboe <axboe@kernel.dk>
+(cherry picked from commit 4bc4494ec7c97ee38e2aa3d1cd76e289c49ac083)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/io_uring.c
+diff --cc fs/io_uring.c
+index 7842c6de7135,d70bc7747e84..000000000000
+--- a/fs/io_uring.c
++++ b/fs/io_uring.c
+@@@ -2211,8 -4853,164 +2211,169 @@@ static int __io_queue_sqe(struct io_rin
+  	return ret;
+  }
+  
+++<<<<<<< HEAD
+ +static int io_queue_sqe(struct io_ring_ctx *ctx, struct io_kiocb *req,
+ +			struct sqe_submit *s, bool force_nonblock)
+++=======
++ static enum hrtimer_restart io_link_timeout_fn(struct hrtimer *timer)
++ {
++ 	struct io_timeout_data *data = container_of(timer,
++ 						struct io_timeout_data, timer);
++ 	struct io_kiocb *req = data->req;
++ 	struct io_ring_ctx *ctx = req->ctx;
++ 	struct io_kiocb *prev = NULL;
++ 	unsigned long flags;
++ 
++ 	spin_lock_irqsave(&ctx->completion_lock, flags);
++ 
++ 	/*
++ 	 * We don't expect the list to be empty, that will only happen if we
++ 	 * race with the completion of the linked work.
++ 	 */
++ 	if (!list_empty(&req->link_list)) {
++ 		prev = list_entry(req->link_list.prev, struct io_kiocb,
++ 				  link_list);
++ 		if (refcount_inc_not_zero(&prev->refs)) {
++ 			list_del_init(&req->link_list);
++ 			prev->flags &= ~REQ_F_LINK_TIMEOUT;
++ 		} else
++ 			prev = NULL;
++ 	}
++ 
++ 	spin_unlock_irqrestore(&ctx->completion_lock, flags);
++ 
++ 	if (prev) {
++ 		req_set_fail_links(prev);
++ 		io_async_find_and_cancel(ctx, req, prev->user_data, NULL,
++ 						-ETIME);
++ 		io_put_req(prev);
++ 	} else {
++ 		io_cqring_add_event(req, -ETIME);
++ 		io_put_req(req);
++ 	}
++ 	return HRTIMER_NORESTART;
++ }
++ 
++ static void io_queue_linked_timeout(struct io_kiocb *req)
++ {
++ 	struct io_ring_ctx *ctx = req->ctx;
++ 
++ 	/*
++ 	 * If the list is now empty, then our linked request finished before
++ 	 * we got a chance to setup the timer
++ 	 */
++ 	spin_lock_irq(&ctx->completion_lock);
++ 	if (!list_empty(&req->link_list)) {
++ 		struct io_timeout_data *data = &req->io->timeout;
++ 
++ 		data->timer.function = io_link_timeout_fn;
++ 		hrtimer_start(&data->timer, timespec64_to_ktime(data->ts),
++ 				data->mode);
++ 	}
++ 	spin_unlock_irq(&ctx->completion_lock);
++ 
++ 	/* drop submission reference */
++ 	io_put_req(req);
++ }
++ 
++ static struct io_kiocb *io_prep_linked_timeout(struct io_kiocb *req)
++ {
++ 	struct io_kiocb *nxt;
++ 
++ 	if (!(req->flags & REQ_F_LINK))
++ 		return NULL;
++ 	/* for polled retry, if flag is set, we already went through here */
++ 	if (req->flags & REQ_F_POLLED)
++ 		return NULL;
++ 
++ 	nxt = list_first_entry_or_null(&req->link_list, struct io_kiocb,
++ 					link_list);
++ 	if (!nxt || nxt->opcode != IORING_OP_LINK_TIMEOUT)
++ 		return NULL;
++ 
++ 	req->flags |= REQ_F_LINK_TIMEOUT;
++ 	return nxt;
++ }
++ 
++ static void __io_queue_sqe(struct io_kiocb *req, const struct io_uring_sqe *sqe)
++ {
++ 	struct io_kiocb *linked_timeout;
++ 	struct io_kiocb *nxt;
++ 	const struct cred *old_creds = NULL;
++ 	int ret;
++ 
++ again:
++ 	linked_timeout = io_prep_linked_timeout(req);
++ 
++ 	if (req->work.creds && req->work.creds != current_cred()) {
++ 		if (old_creds)
++ 			revert_creds(old_creds);
++ 		if (old_creds == req->work.creds)
++ 			old_creds = NULL; /* restored original creds */
++ 		else
++ 			old_creds = override_creds(req->work.creds);
++ 	}
++ 
++ 	ret = io_issue_sqe(req, sqe, &nxt, true);
++ 
++ 	/*
++ 	 * We async punt it if the file wasn't marked NOWAIT, or if the file
++ 	 * doesn't support non-blocking read/write attempts
++ 	 */
++ 	if (ret == -EAGAIN && (!(req->flags & REQ_F_NOWAIT) ||
++ 	    (req->flags & REQ_F_MUST_PUNT))) {
++ 		if (io_arm_poll_handler(req)) {
++ 			if (linked_timeout)
++ 				io_queue_linked_timeout(linked_timeout);
++ 			goto exit;
++ 		}
++ punt:
++ 		if (io_op_defs[req->opcode].file_table) {
++ 			ret = io_grab_files(req);
++ 			if (ret)
++ 				goto err;
++ 		}
++ 
++ 		/*
++ 		 * Queued up for async execution, worker will release
++ 		 * submit reference when the iocb is actually submitted.
++ 		 */
++ 		io_queue_async_work(req);
++ 		goto exit;
++ 	}
++ 
++ err:
++ 	nxt = NULL;
++ 	/* drop submission reference */
++ 	io_put_req_find_next(req, &nxt);
++ 
++ 	if (linked_timeout) {
++ 		if (!ret)
++ 			io_queue_linked_timeout(linked_timeout);
++ 		else
++ 			io_put_req(linked_timeout);
++ 	}
++ 
++ 	/* and drop final reference, if we failed */
++ 	if (ret) {
++ 		io_cqring_add_event(req, ret);
++ 		req_set_fail_links(req);
++ 		io_put_req(req);
++ 	}
++ 	if (nxt) {
++ 		req = nxt;
++ 
++ 		if (req->flags & REQ_F_FORCE_ASYNC)
++ 			goto punt;
++ 		goto again;
++ 	}
++ exit:
++ 	if (old_creds)
++ 		revert_creds(old_creds);
++ }
++ 
++ static void io_queue_sqe(struct io_kiocb *req, const struct io_uring_sqe *sqe)
+++>>>>>>> 4bc4494ec7c9 (io_uring: remove extra nxt check after punt)
+  {
+  	int ret;
+  
+* Unmerged path fs/io_uring.c
