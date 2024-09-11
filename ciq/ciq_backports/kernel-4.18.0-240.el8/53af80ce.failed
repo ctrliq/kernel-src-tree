@@ -1,0 +1,278 @@
+gfs2: Fix BUG during unmount after file system withdraw
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Bob Peterson <rpeterso@redhat.com>
+commit 53af80ce0eaeb0fc4ce4b565c30e3a16e8e05de0
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/53af80ce.failed
+
+Before this patch, when the logd daemon was forced to withdraw, it
+would try to request its journal be recovered by another cluster node.
+However, in single-user cases with lock_nolock, there are no other
+nodes to recover the journal. Function signal_our_withdraw() was
+recognizing the lock_nolock situation, but not until after it had
+evicted its journal inode. Since the journal descriptor that points
+to the inode was never removed from the master list, when the unmount
+occurred, it did another iput on the evicted inode, which resulted in
+a BUG_ON(inode->i_state & I_CLEAR).
+
+This patch moves the check for this situation earlier in function
+signal_our_withdraw(), which avoids the extra iput, so the unmount
+may happen normally.
+
+	Signed-off-by: Bob Peterson <rpeterso@redhat.com>
+	Signed-off-by: Andreas Gruenbacher <agruenba@redhat.com>
+(cherry picked from commit 53af80ce0eaeb0fc4ce4b565c30e3a16e8e05de0)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/gfs2/util.c
+diff --cc fs/gfs2/util.c
+index 0a814ccac41d,aa087a5675af..000000000000
+--- a/fs/gfs2/util.c
++++ b/fs/gfs2/util.c
+@@@ -36,7 -39,237 +36,241 @@@ void gfs2_assert_i(struct gfs2_sbd *sdp
+  	fs_emerg(sdp, "fatal assertion failed\n");
+  }
+  
+++<<<<<<< HEAD
+ +int gfs2_lm_withdraw(struct gfs2_sbd *sdp, const char *fmt, ...)
+++=======
++ /**
++  * check_journal_clean - Make sure a journal is clean for a spectator mount
++  * @sdp: The GFS2 superblock
++  * @jd: The journal descriptor
++  *
++  * Returns: 0 if the journal is clean or locked, else an error
++  */
++ int check_journal_clean(struct gfs2_sbd *sdp, struct gfs2_jdesc *jd,
++ 			bool verbose)
++ {
++ 	int error;
++ 	struct gfs2_holder j_gh;
++ 	struct gfs2_log_header_host head;
++ 	struct gfs2_inode *ip;
++ 
++ 	ip = GFS2_I(jd->jd_inode);
++ 	error = gfs2_glock_nq_init(ip->i_gl, LM_ST_SHARED, LM_FLAG_NOEXP |
++ 				   GL_EXACT | GL_NOCACHE, &j_gh);
++ 	if (error) {
++ 		if (verbose)
++ 			fs_err(sdp, "Error %d locking journal for spectator "
++ 			       "mount.\n", error);
++ 		return -EPERM;
++ 	}
++ 	error = gfs2_jdesc_check(jd);
++ 	if (error) {
++ 		if (verbose)
++ 			fs_err(sdp, "Error checking journal for spectator "
++ 			       "mount.\n");
++ 		goto out_unlock;
++ 	}
++ 	error = gfs2_find_jhead(jd, &head, false);
++ 	if (error) {
++ 		if (verbose)
++ 			fs_err(sdp, "Error parsing journal for spectator "
++ 			       "mount.\n");
++ 		goto out_unlock;
++ 	}
++ 	if (!(head.lh_flags & GFS2_LOG_HEAD_UNMOUNT)) {
++ 		error = -EPERM;
++ 		if (verbose)
++ 			fs_err(sdp, "jid=%u: Journal is dirty, so the first "
++ 			       "mounter must not be a spectator.\n",
++ 			       jd->jd_jid);
++ 	}
++ 
++ out_unlock:
++ 	gfs2_glock_dq_uninit(&j_gh);
++ 	return error;
++ }
++ 
++ static void signal_our_withdraw(struct gfs2_sbd *sdp)
++ {
++ 	struct gfs2_glock *gl = sdp->sd_live_gh.gh_gl;
++ 	struct inode *inode = sdp->sd_jdesc->jd_inode;
++ 	struct gfs2_inode *ip = GFS2_I(inode);
++ 	u64 no_formal_ino = ip->i_no_formal_ino;
++ 	int ret = 0;
++ 	int tries;
++ 
++ 	if (test_bit(SDF_NORECOVERY, &sdp->sd_flags))
++ 		return;
++ 
++ 	/* Prevent any glock dq until withdraw recovery is complete */
++ 	set_bit(SDF_WITHDRAW_RECOVERY, &sdp->sd_flags);
++ 	/*
++ 	 * Don't tell dlm we're bailing until we have no more buffers in the
++ 	 * wind. If journal had an IO error, the log code should just purge
++ 	 * the outstanding buffers rather than submitting new IO. Making the
++ 	 * file system read-only will flush the journal, etc.
++ 	 *
++ 	 * During a normal unmount, gfs2_make_fs_ro calls gfs2_log_shutdown
++ 	 * which clears SDF_JOURNAL_LIVE. In a withdraw, we must not write
++ 	 * any UNMOUNT log header, so we can't call gfs2_log_shutdown, and
++ 	 * therefore we need to clear SDF_JOURNAL_LIVE manually.
++ 	 */
++ 	clear_bit(SDF_JOURNAL_LIVE, &sdp->sd_flags);
++ 	if (!sb_rdonly(sdp->sd_vfs))
++ 		ret = gfs2_make_fs_ro(sdp);
++ 
++ 	if (sdp->sd_lockstruct.ls_ops->lm_lock == NULL) { /* lock_nolock */
++ 		if (!ret)
++ 			ret = -EIO;
++ 		clear_bit(SDF_WITHDRAW_RECOVERY, &sdp->sd_flags);
++ 		goto skip_recovery;
++ 	}
++ 	/*
++ 	 * Drop the glock for our journal so another node can recover it.
++ 	 */
++ 	if (gfs2_holder_initialized(&sdp->sd_journal_gh)) {
++ 		gfs2_glock_dq_wait(&sdp->sd_journal_gh);
++ 		gfs2_holder_uninit(&sdp->sd_journal_gh);
++ 	}
++ 	sdp->sd_jinode_gh.gh_flags |= GL_NOCACHE;
++ 	gfs2_glock_dq(&sdp->sd_jinode_gh);
++ 	if (test_bit(SDF_FS_FROZEN, &sdp->sd_flags)) {
++ 		/* Make sure gfs2_unfreeze works if partially-frozen */
++ 		flush_workqueue(gfs2_freeze_wq);
++ 		atomic_set(&sdp->sd_freeze_state, SFS_FROZEN);
++ 		thaw_super(sdp->sd_vfs);
++ 	} else {
++ 		wait_on_bit(&gl->gl_flags, GLF_DEMOTE, TASK_UNINTERRUPTIBLE);
++ 	}
++ 
++ 	/*
++ 	 * holder_uninit to force glock_put, to force dlm to let go
++ 	 */
++ 	gfs2_holder_uninit(&sdp->sd_jinode_gh);
++ 
++ 	/*
++ 	 * Note: We need to be careful here:
++ 	 * Our iput of jd_inode will evict it. The evict will dequeue its
++ 	 * glock, but the glock dq will wait for the withdraw unless we have
++ 	 * exception code in glock_dq.
++ 	 */
++ 	iput(inode);
++ 	/*
++ 	 * Wait until the journal inode's glock is freed. This allows try locks
++ 	 * on other nodes to be successful, otherwise we remain the owner of
++ 	 * the glock as far as dlm is concerned.
++ 	 */
++ 	if (gl->gl_ops->go_free) {
++ 		set_bit(GLF_FREEING, &gl->gl_flags);
++ 		wait_on_bit(&gl->gl_flags, GLF_FREEING, TASK_UNINTERRUPTIBLE);
++ 	}
++ 
++ 	/*
++ 	 * Dequeue the "live" glock, but keep a reference so it's never freed.
++ 	 */
++ 	gfs2_glock_hold(gl);
++ 	gfs2_glock_dq_wait(&sdp->sd_live_gh);
++ 	/*
++ 	 * We enqueue the "live" glock in EX so that all other nodes
++ 	 * get a demote request and act on it. We don't really want the
++ 	 * lock in EX, so we send a "try" lock with 1CB to produce a callback.
++ 	 */
++ 	fs_warn(sdp, "Requesting recovery of jid %d.\n",
++ 		sdp->sd_lockstruct.ls_jid);
++ 	gfs2_holder_reinit(LM_ST_EXCLUSIVE, LM_FLAG_TRY_1CB | LM_FLAG_NOEXP,
++ 			   &sdp->sd_live_gh);
++ 	msleep(GL_GLOCK_MAX_HOLD);
++ 	/*
++ 	 * This will likely fail in a cluster, but succeed standalone:
++ 	 */
++ 	ret = gfs2_glock_nq(&sdp->sd_live_gh);
++ 
++ 	/*
++ 	 * If we actually got the "live" lock in EX mode, there are no other
++ 	 * nodes available to replay our journal. So we try to replay it
++ 	 * ourselves. We hold the "live" glock to prevent other mounters
++ 	 * during recovery, then just dequeue it and reacquire it in our
++ 	 * normal SH mode. Just in case the problem that caused us to
++ 	 * withdraw prevents us from recovering our journal (e.g. io errors
++ 	 * and such) we still check if the journal is clean before proceeding
++ 	 * but we may wait forever until another mounter does the recovery.
++ 	 */
++ 	if (ret == 0) {
++ 		fs_warn(sdp, "No other mounters found. Trying to recover our "
++ 			"own journal jid %d.\n", sdp->sd_lockstruct.ls_jid);
++ 		if (gfs2_recover_journal(sdp->sd_jdesc, 1))
++ 			fs_warn(sdp, "Unable to recover our journal jid %d.\n",
++ 				sdp->sd_lockstruct.ls_jid);
++ 		gfs2_glock_dq_wait(&sdp->sd_live_gh);
++ 		gfs2_holder_reinit(LM_ST_SHARED, LM_FLAG_NOEXP | GL_EXACT,
++ 				   &sdp->sd_live_gh);
++ 		gfs2_glock_nq(&sdp->sd_live_gh);
++ 	}
++ 
++ 	gfs2_glock_queue_put(gl); /* drop the extra reference we acquired */
++ 	clear_bit(SDF_WITHDRAW_RECOVERY, &sdp->sd_flags);
++ 
++ 	/*
++ 	 * At this point our journal is evicted, so we need to get a new inode
++ 	 * for it. Once done, we need to call gfs2_find_jhead which
++ 	 * calls gfs2_map_journal_extents to map it for us again.
++ 	 *
++ 	 * Note that we don't really want it to look up a FREE block. The
++ 	 * GFS2_BLKST_FREE simply overrides a block check in gfs2_inode_lookup
++ 	 * which would otherwise fail because it requires grabbing an rgrp
++ 	 * glock, which would fail with -EIO because we're withdrawing.
++ 	 */
++ 	inode = gfs2_inode_lookup(sdp->sd_vfs, DT_UNKNOWN,
++ 				  sdp->sd_jdesc->jd_no_addr, no_formal_ino,
++ 				  GFS2_BLKST_FREE);
++ 	if (IS_ERR(inode)) {
++ 		fs_warn(sdp, "Reprocessing of jid %d failed with %ld.\n",
++ 			sdp->sd_lockstruct.ls_jid, PTR_ERR(inode));
++ 		goto skip_recovery;
++ 	}
++ 	sdp->sd_jdesc->jd_inode = inode;
++ 
++ 	/*
++ 	 * Now wait until recovery is complete.
++ 	 */
++ 	for (tries = 0; tries < 10; tries++) {
++ 		ret = check_journal_clean(sdp, sdp->sd_jdesc, false);
++ 		if (!ret)
++ 			break;
++ 		msleep(HZ);
++ 		fs_warn(sdp, "Waiting for journal recovery jid %d.\n",
++ 			sdp->sd_lockstruct.ls_jid);
++ 	}
++ skip_recovery:
++ 	if (!ret)
++ 		fs_warn(sdp, "Journal recovery complete for jid %d.\n",
++ 			sdp->sd_lockstruct.ls_jid);
++ 	else
++ 		fs_warn(sdp, "Journal recovery skipped for %d until next "
++ 			"mount.\n", sdp->sd_lockstruct.ls_jid);
++ 	fs_warn(sdp, "Glock dequeues delayed: %lu\n", sdp->sd_glock_dqs_held);
++ 	sdp->sd_glock_dqs_held = 0;
++ 	wake_up_bit(&sdp->sd_flags, SDF_WITHDRAW_RECOVERY);
++ }
++ 
++ void gfs2_lm(struct gfs2_sbd *sdp, const char *fmt, ...)
++ {
++ 	struct va_format vaf;
++ 	va_list args;
++ 
++ 	if (sdp->sd_args.ar_errors == GFS2_ERRORS_WITHDRAW &&
++ 	    test_bit(SDF_WITHDRAWN, &sdp->sd_flags))
++ 		return;
++ 
++ 	va_start(args, fmt);
++ 	vaf.fmt = fmt;
++ 	vaf.va = &args;
++ 	fs_err(sdp, "%pV", &vaf);
++ 	va_end(args);
++ }
++ 
++ int gfs2_withdraw(struct gfs2_sbd *sdp)
+++>>>>>>> 53af80ce0eae (gfs2: Fix BUG during unmount after file system withdraw)
+  {
+  	struct lm_lockstruct *ls = &sdp->sd_lockstruct;
+  	const struct lm_lockops *lm = ls->ls_ops;
+* Unmerged path fs/gfs2/util.c
