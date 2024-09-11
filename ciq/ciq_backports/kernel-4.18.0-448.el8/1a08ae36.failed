@@ -1,0 +1,253 @@
+mm cma: rename PF_MEMALLOC_NOCMA to PF_MEMALLOC_PIN
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-448.el8
+commit-author Pavel Tatashin <pasha.tatashin@soleen.com>
+commit 1a08ae36cf8b5f26d0c64ebfe46f8eb07ea0b678
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-448.el8/1a08ae36.failed
+
+PF_MEMALLOC_NOCMA is used ot guarantee that the allocator will not
+return pages that might belong to CMA region.  This is currently used
+for long term gup to make sure that such pins are not going to be done
+on any CMA pages.
+
+When PF_MEMALLOC_NOCMA has been introduced we haven't realized that it
+is focusing on CMA pages too much and that there is larger class of
+pages that need the same treatment.  MOVABLE zone cannot contain any
+long term pins as well so it makes sense to reuse and redefine this flag
+for that usecase as well.  Rename the flag to PF_MEMALLOC_PIN which
+defines an allocation context which can only get pages suitable for
+long-term pins.
+
+Also rename: memalloc_nocma_save()/memalloc_nocma_restore to
+memalloc_pin_save()/memalloc_pin_restore() and make the new functions
+common.
+
+[rppt@linux.ibm.com: fix renaming of PF_MEMALLOC_NOCMA to PF_MEMALLOC_PIN]
+  Link: https://lkml.kernel.org/r/20210331163816.11517-1-rppt@kernel.org
+
+Link: https://lkml.kernel.org/r/20210215161349.246722-6-pasha.tatashin@soleen.com
+	Signed-off-by: Pavel Tatashin <pasha.tatashin@soleen.com>
+	Reviewed-by: John Hubbard <jhubbard@nvidia.com>
+	Acked-by: Michal Hocko <mhocko@suse.com>
+	Signed-off-by: Mike Rapoport <rppt@linux.ibm.com>
+	Cc: Dan Williams <dan.j.williams@intel.com>
+	Cc: David Hildenbrand <david@redhat.com>
+	Cc: David Rientjes <rientjes@google.com>
+	Cc: Ingo Molnar <mingo@redhat.com>
+	Cc: Ira Weiny <ira.weiny@intel.com>
+	Cc: James Morris <jmorris@namei.org>
+	Cc: Jason Gunthorpe <jgg@nvidia.com>
+	Cc: Jason Gunthorpe <jgg@ziepe.ca>
+	Cc: Joonsoo Kim <iamjoonsoo.kim@lge.com>
+	Cc: Matthew Wilcox <willy@infradead.org>
+	Cc: Mel Gorman <mgorman@suse.de>
+	Cc: Michal Hocko <mhocko@kernel.org>
+	Cc: Mike Kravetz <mike.kravetz@oracle.com>
+	Cc: Oscar Salvador <osalvador@suse.de>
+	Cc: Peter Zijlstra <peterz@infradead.org>
+	Cc: Sasha Levin <sashal@kernel.org>
+	Cc: Steven Rostedt (VMware) <rostedt@goodmis.org>
+	Cc: Tyler Hicks <tyhicks@linux.microsoft.com>
+	Cc: Vlastimil Babka <vbabka@suse.cz>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit 1a08ae36cf8b5f26d0c64ebfe46f8eb07ea0b678)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/sched.h
+#	mm/gup.c
+#	mm/page_alloc.c
+diff --cc include/linux/sched.h
+index 3641dfde2dd2,d2c881384517..000000000000
+--- a/include/linux/sched.h
++++ b/include/linux/sched.h
+@@@ -1645,9 -1583,7 +1645,13 @@@ extern struct pid *cad_pid
+  #define PF_SWAPWRITE		0x00800000	/* Allowed to write to swap */
+  #define PF_NO_SETAFFINITY	0x04000000	/* Userland is not allowed to meddle with cpus_mask */
+  #define PF_MCE_EARLY		0x08000000      /* Early kill for mce process policy */
+++<<<<<<< HEAD
+ +#define PF_MEMALLOC_NOCMA	0x10000000	/* All allocation request will have _GFP_MOVABLE cleared */
+ +#define PF_IO_WORKER		0x20000000	/* Task is an IO worker */
+ +#define PF_MUTEX_TESTER		0x20000000	/* Thread belongs to the rt mutex tester */
+++=======
++ #define PF_MEMALLOC_PIN		0x10000000	/* Allocation context constrained to zones which allow long term pinning. */
+++>>>>>>> 1a08ae36cf8b (mm cma: rename PF_MEMALLOC_NOCMA to PF_MEMALLOC_PIN)
+  #define PF_FREEZER_SKIP		0x40000000	/* Freezer should not count it as freezable */
+  #define PF_SUSPEND_TASK		0x80000000      /* This thread called freeze_processes() and should not be frozen */
+  
+diff --cc mm/gup.c
+index b6ca92e3db6b,a1eff7ad31da..000000000000
+--- a/mm/gup.c
++++ b/mm/gup.c
+@@@ -2066,64 -1718,23 +2066,80 @@@ static long __gup_longterm_locked(struc
+  				  struct vm_area_struct **vmas,
+  				  unsigned int gup_flags)
+  {
+ +	struct vm_area_struct **vmas_tmp = vmas;
+  	unsigned long flags = 0;
+++<<<<<<< HEAD
+ +	long rc, i;
+ +
+ +	if (gup_flags & FOLL_LONGTERM) {
+ +		if (!pages)
+ +			return -EINVAL;
+ +
+ +		if (!vmas_tmp) {
+ +			vmas_tmp = kcalloc(nr_pages,
+ +					   sizeof(struct vm_area_struct *),
+ +					   GFP_KERNEL);
+ +			if (!vmas_tmp)
+ +				return -ENOMEM;
+ +		}
+ +		flags = memalloc_nocma_save();
+ +	}
+ +
+ +	rc = __get_user_pages_locked(tsk, mm, start, nr_pages, pages,
+ +				     vmas_tmp, NULL, gup_flags);
+ +
+ +	if (gup_flags & FOLL_LONGTERM) {
+ +		if (rc < 0)
+ +			goto out;
+ +
+ +		if (check_dax_vmas(vmas_tmp, rc)) {
+ +			if (gup_flags & FOLL_PIN)
+ +				unpin_user_pages(pages, rc);
+ +			else
+ +				for (i = 0; i < rc; i++)
+ +					put_page(pages[i]);
+ +			rc = -EOPNOTSUPP;
+ +			goto out;
+ +		}
+ +
+ +		rc = check_and_migrate_cma_pages(tsk, mm, start, rc, pages,
+ +						 vmas_tmp, gup_flags);
+ +out:
+ +		memalloc_nocma_restore(flags);
+++=======
++ 	long rc;
++ 
++ 	if (gup_flags & FOLL_LONGTERM)
++ 		flags = memalloc_pin_save();
++ 
++ 	rc = __get_user_pages_locked(mm, start, nr_pages, pages, vmas, NULL,
++ 				     gup_flags);
++ 
++ 	if (gup_flags & FOLL_LONGTERM) {
++ 		if (rc > 0)
++ 			rc = check_and_migrate_cma_pages(mm, start, rc, pages,
++ 							 vmas, gup_flags);
++ 		memalloc_pin_restore(flags);
+++>>>>>>> 1a08ae36cf8b (mm cma: rename PF_MEMALLOC_NOCMA to PF_MEMALLOC_PIN)
+  	}
+ +
+ +	if (vmas_tmp != vmas)
+ +		kfree(vmas_tmp);
+  	return rc;
+  }
+ +#else /* !CONFIG_FS_DAX && !CONFIG_CMA */
+ +static __always_inline long __gup_longterm_locked(struct task_struct *tsk,
+ +						  struct mm_struct *mm,
+ +						  unsigned long start,
+ +						  unsigned long nr_pages,
+ +						  struct page **pages,
+ +						  struct vm_area_struct **vmas,
+ +						  unsigned int flags)
+ +{
+ +	return __get_user_pages_locked(tsk, mm, start, nr_pages, pages, vmas,
+ +				       NULL, flags);
+ +}
+ +#endif /* CONFIG_FS_DAX || CONFIG_CMA */
+  
+  static bool is_valid_gup_flags(unsigned int gup_flags)
+  {
+diff --cc mm/page_alloc.c
+index dc61c5b711ae,c2fc6a64bef9..000000000000
+--- a/mm/page_alloc.c
++++ b/mm/page_alloc.c
+@@@ -3778,6 -3859,20 +3778,23 @@@ alloc_flags_nofragment(struct zone *zon
+  	return alloc_flags;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static inline unsigned int current_alloc_flags(gfp_t gfp_mask,
++ 					unsigned int alloc_flags)
++ {
++ #ifdef CONFIG_CMA
++ 	unsigned int pflags = current->flags;
++ 
++ 	if (!(pflags & PF_MEMALLOC_PIN) &&
++ 	    gfp_migratetype(gfp_mask) == MIGRATE_MOVABLE)
++ 		alloc_flags |= ALLOC_CMA;
++ 
++ #endif
++ 	return alloc_flags;
++ }
++ 
+++>>>>>>> 1a08ae36cf8b (mm cma: rename PF_MEMALLOC_NOCMA to PF_MEMALLOC_PIN)
+  /*
+   * get_page_from_freelist goes through the zonelist trying to allocate
+   * a page.
+* Unmerged path include/linux/sched.h
+diff --git a/include/linux/sched/mm.h b/include/linux/sched/mm.h
+index 0b21b5736e43..d81c810d621d 100644
+--- a/include/linux/sched/mm.h
++++ b/include/linux/sched/mm.h
+@@ -300,29 +300,18 @@ static inline void memalloc_noreclaim_restore(unsigned int flags)
+ 	current->flags = (current->flags & ~PF_MEMALLOC) | flags;
+ }
+ 
+-#ifdef CONFIG_CMA
+-static inline unsigned int memalloc_nocma_save(void)
++static inline unsigned int memalloc_pin_save(void)
+ {
+-	unsigned int flags = current->flags & PF_MEMALLOC_NOCMA;
++	unsigned int flags = current->flags & PF_MEMALLOC_PIN;
+ 
+-	current->flags |= PF_MEMALLOC_NOCMA;
++	current->flags |= PF_MEMALLOC_PIN;
+ 	return flags;
+ }
+ 
+-static inline void memalloc_nocma_restore(unsigned int flags)
+-{
+-	current->flags = (current->flags & ~PF_MEMALLOC_NOCMA) | flags;
+-}
+-#else
+-static inline unsigned int memalloc_nocma_save(void)
+-{
+-	return 0;
+-}
+-
+-static inline void memalloc_nocma_restore(unsigned int flags)
++static inline void memalloc_pin_restore(unsigned int flags)
+ {
++	current->flags = (current->flags & ~PF_MEMALLOC_PIN) | flags;
+ }
+-#endif
+ 
+ #ifdef CONFIG_MEMCG
+ DECLARE_PER_CPU(struct mem_cgroup *, int_active_memcg);
+* Unmerged path mm/gup.c
+diff --git a/mm/hugetlb.c b/mm/hugetlb.c
+index b420ddf66759..69c862942cad 100644
+--- a/mm/hugetlb.c
++++ b/mm/hugetlb.c
+@@ -1057,10 +1057,10 @@ static void enqueue_huge_page(struct hstate *h, struct page *page)
+ static struct page *dequeue_huge_page_node_exact(struct hstate *h, int nid)
+ {
+ 	struct page *page;
+-	bool nocma = !!(current->flags & PF_MEMALLOC_NOCMA);
++	bool pin = !!(current->flags & PF_MEMALLOC_PIN);
+ 
+ 	list_for_each_entry(page, &h->hugepage_freelists[nid], lru) {
+-		if (nocma && is_migrate_cma_page(page))
++		if (pin && is_migrate_cma_page(page))
+ 			continue;
+ 
+ 		if (!PageHWPoison(page))
+* Unmerged path mm/page_alloc.c
