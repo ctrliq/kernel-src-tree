@@ -1,0 +1,175 @@
+powerpc/sysfs: Show idle_purr and idle_spurr for every CPU
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Gautham R. Shenoy <ego@linux.vnet.ibm.com>
+commit 6909f179ca7a73f243dca7c829facca1cc1d4ff5
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/6909f179.failed
+
+On Pseries LPARs, to calculate utilization, we need to know the
+[S]PURR ticks when the CPUs were busy or idle.
+
+The total PURR and SPURR ticks are already exposed via the per-cpu
+sysfs files "purr" and "spurr". This patch adds support for exposing
+the idle PURR and SPURR ticks via new per-cpu sysfs files named
+"idle_purr" and "idle_spurr".
+
+This patch also adds helper functions to accurately read the values of
+idle_purr and idle_spurr especially from an interrupt context between
+when the interrupt has occurred between the pseries_idle_prolog() and
+pseries_idle_epilog(). This will ensure that the idle purr/spurr
+values corresponding to the latest idle period is accounted for before
+these values are read.
+
+	Signed-off-by: Gautham R. Shenoy <ego@linux.vnet.ibm.com>
+	Signed-off-by: Michael Ellerman <mpe@ellerman.id.au>
+Link: https://lore.kernel.org/r/1586249263-14048-5-git-send-email-ego@linux.vnet.ibm.com
+(cherry picked from commit 6909f179ca7a73f243dca7c829facca1cc1d4ff5)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/powerpc/include/asm/idle.h
+#	arch/powerpc/kernel/sysfs.c
+diff --cc arch/powerpc/kernel/sysfs.c
+index 755dc98a57ae,571b3259697e..000000000000
+--- a/arch/powerpc/kernel/sysfs.c
++++ b/arch/powerpc/kernel/sysfs.c
+@@@ -18,6 -19,8 +18,11 @@@
+  #include <asm/smp.h>
+  #include <asm/pmc.h>
+  #include <asm/firmware.h>
+++<<<<<<< HEAD
+++=======
++ #include <asm/idle.h>
++ #include <asm/svm.h>
+++>>>>>>> 6909f179ca7a (powerpc/sysfs: Show idle_purr and idle_spurr for every CPU)
+  
+  #include "cacheinfo.h"
+  #include "setup.h"
+@@@ -709,11 -740,95 +714,79 @@@ static struct device_attribute pa6t_att
+  	__ATTR(tsr1, 0600, show_tsr1, store_tsr1),
+  	__ATTR(tsr2, 0600, show_tsr2, store_tsr2),
+  	__ATTR(tsr3, 0600, show_tsr3, store_tsr3),
+ -#endif /* HAS_PPC_PA6T */
+ +#endif /* CONFIG_DEBUG_KERNEL */
+  };
+ -#endif
+ -
+ -#ifdef CONFIG_PPC_SVM
+ -static ssize_t show_svm(struct device *dev, struct device_attribute *attr, char *buf)
+ -{
+ -	return sprintf(buf, "%u\n", is_secure_guest());
+ -}
+ -static DEVICE_ATTR(svm, 0444, show_svm, NULL);
+ -
+ -static void create_svm_file(void)
+ -{
+ -	device_create_file(cpu_subsys.dev_root, &dev_attr_svm);
+ -}
+ -#else
+ -static void create_svm_file(void)
+ -{
+ -}
+ -#endif /* CONFIG_PPC_SVM */
+ +#endif /* HAS_PPC_PMC_PA6T */
+ +#endif /* HAS_PPC_PMC_CLASSIC */
+  
++ #ifdef CONFIG_PPC_PSERIES
++ static void read_idle_purr(void *val)
++ {
++ 	u64 *ret = val;
++ 
++ 	*ret = read_this_idle_purr();
++ }
++ 
++ static ssize_t idle_purr_show(struct device *dev,
++ 			      struct device_attribute *attr, char *buf)
++ {
++ 	struct cpu *cpu = container_of(dev, struct cpu, dev);
++ 	u64 val;
++ 
++ 	smp_call_function_single(cpu->dev.id, read_idle_purr, &val, 1);
++ 	return sprintf(buf, "%llx\n", val);
++ }
++ static DEVICE_ATTR(idle_purr, 0400, idle_purr_show, NULL);
++ 
++ static void create_idle_purr_file(struct device *s)
++ {
++ 	if (firmware_has_feature(FW_FEATURE_LPAR))
++ 		device_create_file(s, &dev_attr_idle_purr);
++ }
++ 
++ static void remove_idle_purr_file(struct device *s)
++ {
++ 	if (firmware_has_feature(FW_FEATURE_LPAR))
++ 		device_remove_file(s, &dev_attr_idle_purr);
++ }
++ 
++ static void read_idle_spurr(void *val)
++ {
++ 	u64 *ret = val;
++ 
++ 	*ret = read_this_idle_spurr();
++ }
++ 
++ static ssize_t idle_spurr_show(struct device *dev,
++ 			       struct device_attribute *attr, char *buf)
++ {
++ 	struct cpu *cpu = container_of(dev, struct cpu, dev);
++ 	u64 val;
++ 
++ 	smp_call_function_single(cpu->dev.id, read_idle_spurr, &val, 1);
++ 	return sprintf(buf, "%llx\n", val);
++ }
++ static DEVICE_ATTR(idle_spurr, 0400, idle_spurr_show, NULL);
++ 
++ static void create_idle_spurr_file(struct device *s)
++ {
++ 	if (firmware_has_feature(FW_FEATURE_LPAR))
++ 		device_create_file(s, &dev_attr_idle_spurr);
++ }
++ 
++ static void remove_idle_spurr_file(struct device *s)
++ {
++ 	if (firmware_has_feature(FW_FEATURE_LPAR))
++ 		device_remove_file(s, &dev_attr_idle_spurr);
++ }
++ 
++ #else /* CONFIG_PPC_PSERIES */
++ #define create_idle_purr_file(s)
++ #define remove_idle_purr_file(s)
++ #define create_idle_spurr_file(s)
++ #define remove_idle_spurr_file(s)
++ #endif /* CONFIG_PPC_PSERIES */
++ 
+  static int register_cpu_online(unsigned int cpu)
+  {
+  	struct cpu *c = &per_cpu(cpu_devices, cpu);
+@@@ -857,14 -977,20 +933,18 @@@ static int unregister_cpu_online(unsign
+  			device_remove_file(s, &pmc_attrs[i]);
+  
+  #ifdef CONFIG_PPC64
+ -#ifdef CONFIG_PMU_SYSFS
+  	if (cpu_has_feature(CPU_FTR_MMCRA))
+  		device_remove_file(s, &dev_attr_mmcra);
+ -#endif /* CONFIG_PMU_SYSFS */
+  
+- 	if (cpu_has_feature(CPU_FTR_PURR))
++ 	if (cpu_has_feature(CPU_FTR_PURR)) {
+  		device_remove_file(s, &dev_attr_purr);
++ 		remove_idle_purr_file(s);
++ 	}
+  
+- 	if (cpu_has_feature(CPU_FTR_SPURR))
++ 	if (cpu_has_feature(CPU_FTR_SPURR)) {
+  		device_remove_file(s, &dev_attr_spurr);
++ 		remove_idle_spurr_file(s);
++ 	}
+  
+  	if (cpu_has_feature(CPU_FTR_DSCR))
+  		device_remove_file(s, &dev_attr_dscr);
+* Unmerged path arch/powerpc/include/asm/idle.h
+* Unmerged path arch/powerpc/include/asm/idle.h
+* Unmerged path arch/powerpc/kernel/sysfs.c
