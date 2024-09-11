@@ -1,0 +1,104 @@
+net: sched: flower: don't call synchronize_rcu() on mask creation
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-193.el8
+Rebuild_CHGLOG: - [net] sched: flower: don't call synchronize_rcu() on mask creation (Ivan Vecera) [1751856]
+Rebuild_FUZZ: 96.00%
+commit-author Vlad Buslov <vladbu@mellanox.com>
+commit 99815f5031db36414178f45e3009fb5f0e219dd4
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-193.el8/99815f50.failed
+
+Current flower mask creating code assumes that temporary mask that is used
+when inserting new filter is stack allocated. To prevent race condition
+with data patch synchronize_rcu() is called every time fl_create_new_mask()
+replaces temporary stack allocated mask. As reported by Jiri, this
+increases runtime of creating 20000 flower classifiers from 4 seconds to
+163 seconds. However, this design is no longer necessary since temporary
+mask was converted to be dynamically allocated by commit 2cddd2014782
+("net/sched: cls_flower: allocate mask dynamically in fl_change()").
+
+Remove synchronize_rcu() calls from mask creation code. Instead, refactor
+fl_change() to always deallocate temporary mask with rcu grace period.
+
+Fixes: 195c234d15c9 ("net: sched: flower: handle concurrent mask insertion")
+	Reported-by: Jiri Pirko <jiri@mellanox.com>
+	Signed-off-by: Vlad Buslov <vladbu@mellanox.com>
+	Tested-by: Jiri Pirko <jiri@mellanox.com>
+	Acked-by: Jiri Pirko <jiri@mellanox.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 99815f5031db36414178f45e3009fb5f0e219dd4)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/sched/cls_flower.c
+diff --cc net/sched/cls_flower.c
+index bf30bf04d4ea,eedd5786c084..000000000000
+--- a/net/sched/cls_flower.c
++++ b/net/sched/cls_flower.c
+@@@ -326,11 -335,18 +329,19 @@@ static void fl_mask_free_work(struct wo
+  	struct fl_flow_mask *mask = container_of(to_rcu_work(work),
+  						 struct fl_flow_mask, rwork);
+  
+- 	fl_mask_free(mask);
++ 	fl_mask_free(mask, true);
++ }
++ 
++ static void fl_uninit_mask_free_work(struct work_struct *work)
++ {
++ 	struct fl_flow_mask *mask = container_of(to_rcu_work(work),
++ 						 struct fl_flow_mask, rwork);
++ 
++ 	fl_mask_free(mask, false);
+  }
+  
+ -static bool fl_mask_put(struct cls_fl_head *head, struct fl_flow_mask *mask)
+ +static bool fl_mask_put(struct cls_fl_head *head, struct fl_flow_mask *mask,
+ +			bool async)
+  {
+  	if (!refcount_dec_and_test(&mask->refcnt))
+  		return false;
+@@@ -1489,23 -1646,30 +1491,30 @@@ static int fl_change(struct net *net, s
+  	*arg = fnew;
+  
+  	kfree(tb);
+- 	kfree(mask);
++ 	tcf_queue_work(&mask->rwork, fl_uninit_mask_free_work);
+  	return 0;
+  
+ -errout_ht:
+ -	spin_lock(&tp->lock);
+ +errout_idr:
+ +	idr_remove(&head->handle_idr, fnew->handle);
+  errout_hw:
+ -	fnew->deleted = true;
+ -	spin_unlock(&tp->lock);
+  	if (!tc_skip_hw(fnew->flags))
+ -		fl_hw_destroy_filter(tp, fnew, rtnl_held, NULL);
+ -	if (in_ht)
+ -		rhashtable_remove_fast(&fnew->mask->ht, &fnew->ht_node,
+ -				       fnew->mask->filter_ht_params);
+ +		fl_hw_destroy_filter(tp, fnew, NULL);
+  errout_mask:
+ -	fl_mask_put(head, fnew->mask);
+ +	fl_mask_put(head, fnew->mask, true);
+  errout:
+ -	__fl_put(fnew);
+ +	tcf_exts_destroy(&fnew->exts);
+ +	kfree(fnew);
+  errout_tb:
+  	kfree(tb);
+  errout_mask_alloc:
+++<<<<<<< HEAD
+ +	kfree(mask);
+++=======
++ 	tcf_queue_work(&mask->rwork, fl_uninit_mask_free_work);
++ errout_fold:
++ 	if (fold)
++ 		__fl_put(fold);
+++>>>>>>> 99815f5031db (net: sched: flower: don't call synchronize_rcu() on mask creation)
+  	return err;
+  }
+  
+* Unmerged path net/sched/cls_flower.c
