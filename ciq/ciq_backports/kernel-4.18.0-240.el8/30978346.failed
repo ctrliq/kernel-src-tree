@@ -1,0 +1,141 @@
+x86: Add "nopv" parameter to disable PV extensions
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+Rebuild_CHGLOG: - [x86] Add "nopv" parameter to disable PV extensions (Vitaly Kuznetsov) [1813987]
+Rebuild_FUZZ: 94.74%
+commit-author Zhenzhong Duan <zhenzhong.duan@oracle.com>
+commit 30978346372e5c43a652cfbd4533c6bd5427c33b
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/30978346.failed
+
+In virtualization environment, PV extensions (drivers, interrupts,
+timers, etc) are enabled in the majority of use cases which is the
+best option.
+
+However, in some cases (kexec not fully working, benchmarking)
+we want to disable PV extensions. We have "xen_nopv" for that purpose
+but only for XEN. For a consistent admin experience a common command
+line parameter "nopv" set across all PV guest implementations is a
+better choice.
+
+There are guest types which just won't work without PV extensions,
+like Xen PV, Xen PVH and jailhouse. add a "ignore_nopv" member to
+struct hypervisor_x86 set to true for those guest types and call
+the detect functions only if nopv is false or ignore_nopv is true.
+
+	Suggested-by: Juergen Gross <jgross@suse.com>
+	Signed-off-by: Zhenzhong Duan <zhenzhong.duan@oracle.com>
+	Reviewed-by: Juergen Gross <jgross@suse.com>
+	Cc: Thomas Gleixner <tglx@linutronix.de>
+	Cc: Ingo Molnar <mingo@redhat.com>
+	Cc: Borislav Petkov <bp@alien8.de>
+	Cc: Jan Kiszka <jan.kiszka@siemens.com>
+	Cc: Boris Ostrovsky <boris.ostrovsky@oracle.com>
+	Cc: Stefano Stabellini <sstabellini@kernel.org>
+	Signed-off-by: Juergen Gross <jgross@suse.com>
+(cherry picked from commit 30978346372e5c43a652cfbd4533c6bd5427c33b)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	Documentation/admin-guide/kernel-parameters.txt
+diff --cc Documentation/admin-guide/kernel-parameters.txt
+index 1585dbf3e53c,936e8e7e6474..000000000000
+--- a/Documentation/admin-guide/kernel-parameters.txt
++++ b/Documentation/admin-guide/kernel-parameters.txt
+@@@ -5366,6 -5244,24 +5366,27 @@@
+  			Disables the PV optimizations forcing the HVM guest to
+  			run as generic HVM guest with no PV drivers.
+  
+++<<<<<<< HEAD
+++=======
++ 	xen_scrub_pages=	[XEN]
++ 			Boolean option to control scrubbing pages before giving them back
++ 			to Xen, for use by other domains. Can be also changed at runtime
++ 			with /sys/devices/system/xen_memory/xen_memory0/scrub_pages.
++ 			Default value controlled with CONFIG_XEN_SCRUB_PAGES_DEFAULT.
++ 
++ 	xen_timer_slop=	[X86-64,XEN]
++ 			Set the timer slop (in nanoseconds) for the virtual Xen
++ 			timers (default is 100000). This adjusts the minimum
++ 			delta of virtualized Xen timers, where lower values
++ 			improve timer resolution at the expense of processing
++ 			more timer interrupts.
++ 
++ 	nopv=		[X86,XEN,KVM,HYPER_V,VMWARE]
++ 			Disables the PV optimizations forcing the guest to run
++ 			as generic guest with no PV drivers. Currently support
++ 			XEN HVM, KVM, HYPER_V and VMWARE guest.
++ 
+++>>>>>>> 30978346372e (x86: Add "nopv" parameter to disable PV extensions)
+  	xirc2ps_cs=	[NET,PCMCIA]
+  			Format:
+  			<irq>,<irq_mask>,<io>,<full_duplex>,<do_sound>,<lockup_hack>[,<irq2>[,<irq3>[,<irq4>]]]
+* Unmerged path Documentation/admin-guide/kernel-parameters.txt
+diff --git a/arch/x86/include/asm/hypervisor.h b/arch/x86/include/asm/hypervisor.h
+index 8c5aaba6633f..00240b033bc1 100644
+--- a/arch/x86/include/asm/hypervisor.h
++++ b/arch/x86/include/asm/hypervisor.h
+@@ -52,8 +52,12 @@ struct hypervisor_x86 {
+ 
+ 	/* runtime callbacks */
+ 	struct x86_hyper_runtime runtime;
++
++	/* ignore nopv parameter */
++	bool ignore_nopv;
+ };
+ 
++extern bool nopv;
+ extern enum x86_hypervisor_type x86_hyper_type;
+ extern void init_hypervisor_platform(void);
+ static inline bool hypervisor_is_type(enum x86_hypervisor_type type)
+diff --git a/arch/x86/kernel/cpu/hypervisor.c b/arch/x86/kernel/cpu/hypervisor.c
+index 479ca4728de0..337ff07d9a6e 100644
+--- a/arch/x86/kernel/cpu/hypervisor.c
++++ b/arch/x86/kernel/cpu/hypervisor.c
+@@ -54,6 +54,14 @@ static const __initconst struct hypervisor_x86 * const hypervisors[] =
+ enum x86_hypervisor_type x86_hyper_type;
+ EXPORT_SYMBOL(x86_hyper_type);
+ 
++bool __initdata nopv;
++static __init int parse_nopv(char *arg)
++{
++	nopv = true;
++	return 0;
++}
++early_param("nopv", parse_nopv);
++
+ static inline const struct hypervisor_x86 * __init
+ detect_hypervisor_vendor(void)
+ {
+@@ -61,6 +69,9 @@ detect_hypervisor_vendor(void)
+ 	uint32_t pri, max_pri = 0;
+ 
+ 	for (p = hypervisors; p < hypervisors + ARRAY_SIZE(hypervisors); p++) {
++		if (unlikely(nopv) && !(*p)->ignore_nopv)
++			continue;
++
+ 		pri = (*p)->detect();
+ 		if (pri > max_pri) {
+ 			max_pri = pri;
+diff --git a/arch/x86/kernel/jailhouse.c b/arch/x86/kernel/jailhouse.c
+index 1b2ee55a2dfb..c52c4105841f 100644
+--- a/arch/x86/kernel/jailhouse.c
++++ b/arch/x86/kernel/jailhouse.c
+@@ -217,4 +217,5 @@ const struct hypervisor_x86 x86_hyper_jailhouse __refconst = {
+ 	.detect			= jailhouse_detect,
+ 	.init.init_platform	= jailhouse_init_platform,
+ 	.init.x2apic_available	= jailhouse_x2apic_available,
++	.ignore_nopv		= true,
+ };
+diff --git a/arch/x86/xen/enlighten_pv.c b/arch/x86/xen/enlighten_pv.c
+index 439a94bf89ad..1e1f1a4e09a1 100644
+--- a/arch/x86/xen/enlighten_pv.c
++++ b/arch/x86/xen/enlighten_pv.c
+@@ -1457,4 +1457,5 @@ const __initconst struct hypervisor_x86 x86_hyper_xen_pv = {
+ 	.detect                 = xen_platform_pv,
+ 	.type			= X86_HYPER_XEN_PV,
+ 	.runtime.pin_vcpu       = xen_pin_vcpu,
++	.ignore_nopv		= true,
+ };
