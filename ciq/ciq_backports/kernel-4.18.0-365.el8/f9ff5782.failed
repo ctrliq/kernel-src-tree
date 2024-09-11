@@ -1,0 +1,186 @@
+bnxt_en: introduce new firmware message API based on DMA pools
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-365.el8
+commit-author Edwin Peer <edwin.peer@broadcom.com>
+commit f9ff578251dc2f1cf5b9b007e050033d8414829d
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-365.el8/f9ff5782.failed
+
+This change constitutes a major step towards supporting multiple
+firmware commands in flight by maintaining a separate response buffer
+for the duration of each request. These firmware commands are also
+known as Hardware Resource Manager (HWRM) commands.  Using separate
+response buffers requires an API change in order for callers to be
+able to free the buffer when done.
+
+It is impossible to keep the existing APIs unchanged.  The existing
+usage for a simple HWRM message request such as the following:
+
+        struct input req = {0};
+        bnxt_hwrm_cmd_hdr_init(bp, &req, REQ_TYPE, -1, -1);
+        rc = hwrm_send_message(bp, &req, sizeof(req), HWRM_CMD_TIMEOUT);
+        if (rc)
+                /* error */
+
+changes to:
+
+         struct input *req;
+         rc = hwrm_req_init(bp, req, REQ_TYPE);
+         if (rc)
+                 /* error */
+         rc = hwrm_req_send(bp, req); /* consumes req */
+         if (rc)
+                 /* error */
+
+The key changes are:
+
+1. The req is no longer allocated on the stack.
+2. The caller must call hwrm_req_init() to allocate a req buffer and
+   check for a valid buffer.
+3. The req buffer is automatically released when hwrm_req_send() returns.
+4. If the caller wants to check the firmware response, the caller must
+   call hwrm_req_hold() to take ownership of the response buffer and
+   release it afterwards using hwrm_req_drop().  The caller is no longer
+   required to explicitly hold the hwrm_cmd_lock mutex to read the
+   response.
+5. Because the firmware commands and responses all have different sizes,
+   some safeguards are added to the code.
+
+This patch maintains legacy API compatibiltiy, implementing the old
+API in terms of the new.  The follow-on patches will convert all
+callers to use the new APIs.
+
+v2: Fix redefined writeq with parisc .config
+    Fix "cast from pointer to integer of different size" warning in
+hwrm_calc_sentinel()
+
+	Signed-off-by: Edwin Peer <edwin.peer@broadcom.com>
+	Signed-off-by: Michael Chan <michael.chan@broadcom.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit f9ff578251dc2f1cf5b9b007e050033d8414829d)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/broadcom/bnxt/bnxt_hwrm.c
+#	drivers/net/ethernet/broadcom/bnxt/bnxt_hwrm.h
+* Unmerged path drivers/net/ethernet/broadcom/bnxt/bnxt_hwrm.c
+* Unmerged path drivers/net/ethernet/broadcom/bnxt/bnxt_hwrm.h
+diff --git a/drivers/net/ethernet/broadcom/bnxt/bnxt.c b/drivers/net/ethernet/broadcom/bnxt/bnxt.c
+index 0e43f4db9b86..e7841858b09b 100644
+--- a/drivers/net/ethernet/broadcom/bnxt/bnxt.c
++++ b/drivers/net/ethernet/broadcom/bnxt/bnxt.c
+@@ -3942,6 +3942,9 @@ static void bnxt_free_hwrm_resources(struct bnxt *bp)
+ 				  bp->hwrm_cmd_resp_dma_addr);
+ 		bp->hwrm_cmd_resp_addr = NULL;
+ 	}
++
++	dma_pool_destroy(bp->hwrm_dma_pool);
++	bp->hwrm_dma_pool = NULL;
+ }
+ 
+ static int bnxt_alloc_hwrm_resources(struct bnxt *bp)
+@@ -3954,33 +3957,10 @@ static int bnxt_alloc_hwrm_resources(struct bnxt *bp)
+ 	if (!bp->hwrm_cmd_resp_addr)
+ 		return -ENOMEM;
+ 
+-	return 0;
+-}
+-
+-static void bnxt_free_hwrm_short_cmd_req(struct bnxt *bp)
+-{
+-	if (bp->hwrm_short_cmd_req_addr) {
+-		struct pci_dev *pdev = bp->pdev;
+-
+-		dma_free_coherent(&pdev->dev, bp->hwrm_max_ext_req_len,
+-				  bp->hwrm_short_cmd_req_addr,
+-				  bp->hwrm_short_cmd_req_dma_addr);
+-		bp->hwrm_short_cmd_req_addr = NULL;
+-	}
+-}
+-
+-static int bnxt_alloc_hwrm_short_cmd_req(struct bnxt *bp)
+-{
+-	struct pci_dev *pdev = bp->pdev;
+-
+-	if (bp->hwrm_short_cmd_req_addr)
+-		return 0;
+-
+-	bp->hwrm_short_cmd_req_addr =
+-		dma_alloc_coherent(&pdev->dev, bp->hwrm_max_ext_req_len,
+-				   &bp->hwrm_short_cmd_req_dma_addr,
+-				   GFP_KERNEL);
+-	if (!bp->hwrm_short_cmd_req_addr)
++	bp->hwrm_dma_pool = dma_pool_create("bnxt_hwrm", &pdev->dev,
++					    BNXT_HWRM_DMA_SIZE,
++					    BNXT_HWRM_DMA_ALIGN, 0);
++	if (!bp->hwrm_dma_pool)
+ 		return -ENOMEM;
+ 
+ 	return 0;
+@@ -11865,12 +11845,6 @@ static int bnxt_fw_init_one_p1(struct bnxt *bp)
+ 			return rc;
+ 	}
+ 
+-	if ((bp->fw_cap & BNXT_FW_CAP_SHORT_CMD) ||
+-	    bp->hwrm_max_ext_req_len > BNXT_HWRM_MAX_REQ_LEN) {
+-		rc = bnxt_alloc_hwrm_short_cmd_req(bp);
+-		if (rc)
+-			return rc;
+-	}
+ 	bnxt_nvm_cfg_ver_get(bp);
+ 
+ 	rc = bnxt_hwrm_func_reset(bp);
+@@ -12797,7 +12771,6 @@ static void bnxt_remove_one(struct pci_dev *pdev)
+ 	bnxt_clear_int_mode(bp);
+ 	bnxt_hwrm_func_drv_unrgtr(bp);
+ 	bnxt_free_hwrm_resources(bp);
+-	bnxt_free_hwrm_short_cmd_req(bp);
+ 	bnxt_ethtool_free(bp);
+ 	bnxt_dcb_free(bp);
+ 	kfree(bp->edev);
+@@ -13366,7 +13339,6 @@ static int bnxt_init_one(struct pci_dev *pdev, const struct pci_device_id *ent)
+ 
+ init_err_pci_clean:
+ 	bnxt_hwrm_func_drv_unrgtr(bp);
+-	bnxt_free_hwrm_short_cmd_req(bp);
+ 	bnxt_free_hwrm_resources(bp);
+ 	bnxt_ethtool_free(bp);
+ 	bnxt_ptp_clear(bp);
+diff --git a/drivers/net/ethernet/broadcom/bnxt/bnxt.h b/drivers/net/ethernet/broadcom/bnxt/bnxt.h
+index 50326e2ad60e..baa90f37027d 100644
+--- a/drivers/net/ethernet/broadcom/bnxt/bnxt.h
++++ b/drivers/net/ethernet/broadcom/bnxt/bnxt.h
+@@ -1894,10 +1894,9 @@ struct bnxt {
+ 	u16			hwrm_cmd_seq;
+ 	u16                     hwrm_cmd_kong_seq;
+ 	u16			hwrm_intr_seq_id;
+-	void			*hwrm_short_cmd_req_addr;
+-	dma_addr_t		hwrm_short_cmd_req_dma_addr;
+ 	void			*hwrm_cmd_resp_addr;
+ 	dma_addr_t		hwrm_cmd_resp_dma_addr;
++	struct dma_pool		*hwrm_dma_pool;
+ 
+ 	struct rtnl_link_stats64	net_stats_prev;
+ 	struct bnxt_stats_mem	port_stats;
+@@ -1997,7 +1996,7 @@ struct bnxt {
+ 	struct mutex		sriov_lock;
+ #endif
+ 
+-#if BITS_PER_LONG == 32
++#ifndef writeq
+ 	/* ensure atomic 64-bit doorbell writes on 32-bit systems. */
+ 	spinlock_t		db_lock;
+ #endif
+@@ -2126,7 +2125,7 @@ static inline u32 bnxt_tx_avail(struct bnxt *bp, struct bnxt_tx_ring_info *txr)
+ 		((txr->tx_prod - txr->tx_cons) & bp->tx_ring_mask);
+ }
+ 
+-#if BITS_PER_LONG == 32
++#ifndef writeq
+ #define writeq(val64, db)			\
+ do {						\
+ 	spin_lock(&bp->db_lock);		\
+* Unmerged path drivers/net/ethernet/broadcom/bnxt/bnxt_hwrm.c
+* Unmerged path drivers/net/ethernet/broadcom/bnxt/bnxt_hwrm.h
