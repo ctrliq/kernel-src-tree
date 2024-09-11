@@ -1,0 +1,125 @@
+selftests/bpf: Add Userspace tests for TCP_WINDOW_CLAMP
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-326.el8
+commit-author Prankur gupta <prankgup@fb.com>
+commit 55144f31f0d2fdd3e74ead67f1649bf577961eaa
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-326.el8/55144f31.failed
+
+Adding selftests for new added functionality to set TCP_WINDOW_CLAMP
+from bpf setsockopt.
+
+	Signed-off-by: Prankur gupta <prankgup@fb.com>
+	Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+Link: https://lore.kernel.org/bpf/20201202213152.435886-3-prankgup@fb.com
+(cherry picked from commit 55144f31f0d2fdd3e74ead67f1649bf577961eaa)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	tools/testing/selftests/bpf/prog_tests/tcpbpf_user.c
+#	tools/testing/selftests/bpf/test_tcpbpf.h
+diff --cc tools/testing/selftests/bpf/test_tcpbpf.h
+index 6220b95cbd02,9dd9b5590f9d..000000000000
+--- a/tools/testing/selftests/bpf/test_tcpbpf.h
++++ b/tools/testing/selftests/bpf/test_tcpbpf.h
+@@@ -14,5 -14,9 +14,12 @@@ struct tcpbpf_globals 
+  	__u64 bytes_acked;
+  	__u32 num_listen;
+  	__u32 num_close_events;
+++<<<<<<< HEAD
+++=======
++ 	__u32 tcp_save_syn;
++ 	__u32 tcp_saved_syn;
++ 	__u32 window_clamp_client;
++ 	__u32 window_clamp_server;
+++>>>>>>> 55144f31f0d2 (selftests/bpf: Add Userspace tests for TCP_WINDOW_CLAMP)
+  };
+  #endif
+* Unmerged path tools/testing/selftests/bpf/prog_tests/tcpbpf_user.c
+diff --git a/tools/testing/selftests/bpf/bpf_tcp_helpers.h b/tools/testing/selftests/bpf/bpf_tcp_helpers.h
+index 20f3a8cd2f99..942dd0dbb7e3 100644
+--- a/tools/testing/selftests/bpf/bpf_tcp_helpers.h
++++ b/tools/testing/selftests/bpf/bpf_tcp_helpers.h
+@@ -56,6 +56,7 @@ struct tcp_sock {
+ 	__u32	rcv_nxt;
+ 	__u32	snd_nxt;
+ 	__u32	snd_una;
++	__u32	window_clamp;
+ 	__u8	ecn_flags;
+ 	__u32	delivered;
+ 	__u32	delivered_ce;
+* Unmerged path tools/testing/selftests/bpf/prog_tests/tcpbpf_user.c
+diff --git a/tools/testing/selftests/bpf/progs/test_tcpbpf_kern.c b/tools/testing/selftests/bpf/progs/test_tcpbpf_kern.c
+index 3e6912e4df3d..a364e34ba2d9 100644
+--- a/tools/testing/selftests/bpf/progs/test_tcpbpf_kern.c
++++ b/tools/testing/selftests/bpf/progs/test_tcpbpf_kern.c
+@@ -12,6 +12,7 @@
+ #include <linux/tcp.h>
+ #include <bpf/bpf_helpers.h>
+ #include <bpf/bpf_endian.h>
++#include "bpf_tcp_helpers.h"
+ #include "test_tcpbpf.h"
+ 
+ struct {
+@@ -50,12 +51,35 @@ static inline void update_event_map(int event)
+ 
+ int _version SEC("version") = 1;
+ 
++/**
++ * SOL_TCP is defined in <netinet/tcp.h> while
++ * TCP_SAVED_SYN is defined in already included <linux/tcp.h>
++ */
++#ifndef SOL_TCP
++#define SOL_TCP 6
++#endif
++
++static __always_inline int get_tp_window_clamp(struct bpf_sock_ops *skops)
++{
++	struct bpf_sock *sk;
++	struct tcp_sock *tp;
++
++	sk = skops->sk;
++	if (!sk)
++		return -1;
++	tp = bpf_skc_to_tcp_sock(sk);
++	if (!tp)
++		return -1;
++	return tp->window_clamp;
++}
++
+ SEC("sockops")
+ int bpf_testcb(struct bpf_sock_ops *skops)
+ {
+ 	char header[sizeof(struct ipv6hdr) + sizeof(struct tcphdr)];
+ 	struct bpf_sock_ops *reuse = skops;
+ 	struct tcphdr *thdr;
++	int window_clamp = 9216;
+ 	int good_call_rv = 0;
+ 	int bad_call_rv = 0;
+ 	int save_syn = 1;
+@@ -108,6 +132,11 @@ int bpf_testcb(struct bpf_sock_ops *skops)
+ 	update_event_map(op);
+ 
+ 	switch (op) {
++	case BPF_SOCK_OPS_TCP_CONNECT_CB:
++		rv = bpf_setsockopt(skops, SOL_TCP, TCP_WINDOW_CLAMP,
++				    &window_clamp, sizeof(window_clamp));
++		global.window_clamp_client = get_tp_window_clamp(skops);
++		break;
+ 	case BPF_SOCK_OPS_ACTIVE_ESTABLISHED_CB:
+ 		/* Test failure to set largest cb flag (assumes not defined) */
+ 		bad_call_rv = bpf_sock_ops_cb_flags_set(skops, 0x80);
+@@ -149,6 +178,10 @@ int bpf_testcb(struct bpf_sock_ops *skops)
+ 						    BPF_ANY);
+ 			}
+ 		}
++		rv = bpf_setsockopt(skops, SOL_TCP, TCP_WINDOW_CLAMP,
++				    &window_clamp, sizeof(window_clamp));
++
++		global.window_clamp_server = get_tp_window_clamp(skops);
+ 		break;
+ 	case BPF_SOCK_OPS_RTO_CB:
+ 		break;
+* Unmerged path tools/testing/selftests/bpf/test_tcpbpf.h
