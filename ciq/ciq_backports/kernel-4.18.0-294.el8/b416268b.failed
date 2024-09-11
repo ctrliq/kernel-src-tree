@@ -1,0 +1,122 @@
+mptcp: use mptcp worker for path management
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Florian Westphal <fw@strlen.de>
+commit b416268b7a819c0508ed0dc81461e513b110f2ac
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/b416268b.failed
+
+We can re-use the existing work queue to handle path management
+instead of a dedicated work queue.  Just move pm_worker to protocol.c,
+call it from the mptcp worker and get rid of the msk lock (already held).
+
+	Signed-off-by: Florian Westphal <fw@strlen.de>
+	Reviewed-by: Mat Martineau <mathew.j.martineau@linux.intel.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit b416268b7a819c0508ed0dc81461e513b110f2ac)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/mptcp/pm.c
+diff --cc net/mptcp/pm.c
+index 977d9c8b1453,a8ad20559aaa..000000000000
+--- a/net/mptcp/pm.c
++++ b/net/mptcp/pm.c
+@@@ -228,17 -196,7 +196,17 @@@ void mptcp_pm_data_init(struct mptcp_so
+  	mptcp_pm_nl_data_init(msk);
+  }
+  
+++<<<<<<< HEAD
+ +void mptcp_pm_close(struct mptcp_sock *msk)
+ +{
+ +	if (cancel_work_sync(&msk->pm.work))
+ +		sock_put((struct sock *)msk);
+ +}
+ +
+ +void mptcp_pm_init(void)
+++=======
++ void __init mptcp_pm_init(void)
+++>>>>>>> b416268b7a81 (mptcp: use mptcp worker for path management)
+  {
+- 	pm_wq = alloc_workqueue("pm_wq", WQ_UNBOUND | WQ_MEM_RECLAIM, 8);
+- 	if (!pm_wq)
+- 		panic("Failed to allocate workqueue");
+- 
+  	mptcp_pm_nl_init();
+  }
+* Unmerged path net/mptcp/pm.c
+diff --git a/net/mptcp/protocol.c b/net/mptcp/protocol.c
+index 1f07872a4e91..5988c2960065 100644
+--- a/net/mptcp/protocol.c
++++ b/net/mptcp/protocol.c
+@@ -1238,6 +1238,29 @@ static unsigned int mptcp_sync_mss(struct sock *sk, u32 pmtu)
+ 	return 0;
+ }
+ 
++static void pm_work(struct mptcp_sock *msk)
++{
++	struct mptcp_pm_data *pm = &msk->pm;
++
++	spin_lock_bh(&msk->pm.lock);
++
++	pr_debug("msk=%p status=%x", msk, pm->status);
++	if (pm->status & BIT(MPTCP_PM_ADD_ADDR_RECEIVED)) {
++		pm->status &= ~BIT(MPTCP_PM_ADD_ADDR_RECEIVED);
++		mptcp_pm_nl_add_addr_received(msk);
++	}
++	if (pm->status & BIT(MPTCP_PM_ESTABLISHED)) {
++		pm->status &= ~BIT(MPTCP_PM_ESTABLISHED);
++		mptcp_pm_nl_fully_established(msk);
++	}
++	if (pm->status & BIT(MPTCP_PM_SUBFLOW_ESTABLISHED)) {
++		pm->status &= ~BIT(MPTCP_PM_SUBFLOW_ESTABLISHED);
++		mptcp_pm_nl_subflow_established(msk);
++	}
++
++	spin_unlock_bh(&msk->pm.lock);
++}
++
+ static void mptcp_worker(struct work_struct *work)
+ {
+ 	struct mptcp_sock *msk = container_of(work, struct mptcp_sock, work);
+@@ -1254,6 +1277,9 @@ static void mptcp_worker(struct work_struct *work)
+ 	__mptcp_flush_join_list(msk);
+ 	__mptcp_move_skbs(msk);
+ 
++	if (msk->pm.status)
++		pm_work(msk);
++
+ 	if (test_and_clear_bit(MPTCP_WORK_EOF, &msk->flags))
+ 		mptcp_check_for_eof(msk);
+ 
+@@ -1446,7 +1472,6 @@ static void mptcp_close(struct sock *sk, long timeout)
+ 	}
+ 
+ 	mptcp_cancel_work(sk);
+-	mptcp_pm_close(msk);
+ 
+ 	__skb_queue_purge(&sk->sk_receive_queue);
+ 
+diff --git a/net/mptcp/protocol.h b/net/mptcp/protocol.h
+index d755af8e07e9..1efd1a4d7ee4 100644
+--- a/net/mptcp/protocol.h
++++ b/net/mptcp/protocol.h
+@@ -174,8 +174,6 @@ struct mptcp_pm_data {
+ 	u8		local_addr_max;
+ 	u8		subflows_max;
+ 	u8		status;
+-
+-	struct		work_struct work;
+ };
+ 
+ struct mptcp_data_frag {
+@@ -409,7 +407,6 @@ void mptcp_crypto_hmac_sha(u64 key1, u64 key2, u8 *msg, int len, void *hmac);
+ 
+ void mptcp_pm_init(void);
+ void mptcp_pm_data_init(struct mptcp_sock *msk);
+-void mptcp_pm_close(struct mptcp_sock *msk);
+ void mptcp_pm_new_connection(struct mptcp_sock *msk, int server_side);
+ void mptcp_pm_fully_established(struct mptcp_sock *msk);
+ bool mptcp_pm_allow_new_subflow(struct mptcp_sock *msk);
