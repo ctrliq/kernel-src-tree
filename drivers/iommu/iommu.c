@@ -2719,17 +2719,6 @@ arch_initcall(iommu_quirks);
 /*
  * Per device IOMMU features.
  */
-bool iommu_dev_has_feature(struct device *dev, enum iommu_dev_features feat)
-{
-	const struct iommu_ops *ops = dev->bus->iommu_ops;
-
-	if (ops && ops->dev_has_feat)
-		return ops->dev_has_feat(dev, feat);
-
-	return false;
-}
-EXPORT_SYMBOL_GPL(iommu_dev_has_feature);
-
 int iommu_dev_enable_feature(struct device *dev, enum iommu_dev_features feat)
 {
 	const struct iommu_ops *ops = dev->bus->iommu_ops;
