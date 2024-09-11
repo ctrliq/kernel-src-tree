@@ -1,0 +1,210 @@
+KVM: x86: Move MMU's PML logic to common code
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-310.el8
+commit-author Sean Christopherson <seanjc@google.com>
+commit a018eba53870aa30e5e57465771cb209680f20c2
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-310.el8/a018eba5.failed
+
+Drop the facade of KVM's PML logic being vendor specific and move the
+bits that aren't truly VMX specific into common x86 code.  The MMU logic
+for dealing with PML is tightly coupled to the feature and to VMX's
+implementation, bouncing through kvm_x86_ops obfuscates the code without
+providing any meaningful separation of concerns or encapsulation.
+
+No functional change intended.
+
+	Signed-off-by: Sean Christopherson <seanjc@google.com>
+Message-Id: <20210213005015.1651772-10-seanjc@google.com>
+	Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+(cherry picked from commit a018eba53870aa30e5e57465771cb209680f20c2)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/include/asm/kvm-x86-ops.h
+#	arch/x86/include/asm/kvm_host.h
+#	arch/x86/kvm/mmu/mmu.c
+#	arch/x86/kvm/vmx/vmx.c
+#	arch/x86/kvm/x86.c
+diff --cc arch/x86/include/asm/kvm-x86-ops.h
+index 355a2ab8fc09,90affdb2cbbc..000000000000
+--- a/arch/x86/include/asm/kvm-x86-ops.h
++++ b/arch/x86/include/asm/kvm-x86-ops.h
+@@@ -93,11 -93,6 +93,14 @@@ KVM_X86_OP(check_intercept
+  KVM_X86_OP(handle_exit_irqoff)
+  KVM_X86_OP_NULL(request_immediate_exit)
+  KVM_X86_OP(sched_in)
+++<<<<<<< HEAD
+ +KVM_X86_OP_NULL(slot_enable_log_dirty)
+ +KVM_X86_OP_NULL(slot_disable_log_dirty)
+ +KVM_X86_OP_NULL(flush_log_dirty)
+ +KVM_X86_OP_NULL(enable_log_dirty_pt_masked)
+ +KVM_X86_OP_NULL(cpu_dirty_log_size)
+++=======
+++>>>>>>> a018eba53870 (KVM: x86: Move MMU's PML logic to common code)
+  KVM_X86_OP_NULL(pre_block)
+  KVM_X86_OP_NULL(post_block)
+  KVM_X86_OP_NULL(vcpu_blocking)
+diff --cc arch/x86/include/asm/kvm_host.h
+index 35dd7577a5ae,5cf382ec48b0..000000000000
+--- a/arch/x86/include/asm/kvm_host.h
++++ b/arch/x86/include/asm/kvm_host.h
+@@@ -1263,29 -1271,10 +1263,21 @@@ struct kvm_x86_ops 
+  	void (*sched_in)(struct kvm_vcpu *kvm, int cpu);
+  
+  	/*
+- 	 * Arch-specific dirty logging hooks. These hooks are only supposed to
+- 	 * be valid if the specific arch has hardware-accelerated dirty logging
+- 	 * mechanism. Currently only for PML on VMX.
+- 	 *
+- 	 *  - slot_enable_log_dirty:
+- 	 *	called when enabling log dirty mode for the slot.
+- 	 *  - slot_disable_log_dirty:
+- 	 *	called when disabling log dirty mode for the slot.
+- 	 *	also called when slot is created with log dirty disabled.
+- 	 *  - flush_log_dirty:
+- 	 *	called before reporting dirty_bitmap to userspace.
+- 	 *  - enable_log_dirty_pt_masked:
+- 	 *	called when reenabling log dirty for the GFNs in the mask after
+- 	 *	corresponding bits are cleared in slot->dirty_bitmap.
++ 	 * Size of the CPU's dirty log buffer, i.e. VMX's PML buffer.  A zero
++ 	 * value indicates CPU dirty logging is unsupported or disabled.
+  	 */
+++<<<<<<< HEAD
+ +	void (*slot_enable_log_dirty)(struct kvm *kvm,
+ +				      struct kvm_memory_slot *slot);
+ +	void (*slot_disable_log_dirty)(struct kvm *kvm,
+ +				       struct kvm_memory_slot *slot);
+ +	void (*flush_log_dirty)(struct kvm *kvm);
+ +	void (*enable_log_dirty_pt_masked)(struct kvm *kvm,
+ +					   struct kvm_memory_slot *slot,
+ +					   gfn_t offset, unsigned long mask);
+++=======
++ 	int cpu_dirty_log_size;
+++>>>>>>> a018eba53870 (KVM: x86: Move MMU's PML logic to common code)
+  
+  	/* pmu operations of sub-arch */
+  	const struct kvm_pmu_ops *pmu_ops;
+diff --cc arch/x86/kvm/mmu/mmu.c
+index d71bddea6b0a,f208697781fc..000000000000
+--- a/arch/x86/kvm/mmu/mmu.c
++++ b/arch/x86/kvm/mmu/mmu.c
+@@@ -1284,9 -1283,8 +1283,14 @@@ void kvm_arch_mmu_enable_log_dirty_pt_m
+  				struct kvm_memory_slot *slot,
+  				gfn_t gfn_offset, unsigned long mask)
+  {
+++<<<<<<< HEAD
+ +	if (kvm_x86_ops.enable_log_dirty_pt_masked)
+ +		kvm_x86_ops.enable_log_dirty_pt_masked(kvm, slot, gfn_offset,
+ +				mask);
+++=======
++ 	if (kvm_x86_ops.cpu_dirty_log_size)
++ 		kvm_mmu_clear_dirty_pt_masked(kvm, slot, gfn_offset, mask);
+++>>>>>>> a018eba53870 (KVM: x86: Move MMU's PML logic to common code)
+  	else
+  		kvm_mmu_write_protect_pt_masked(kvm, slot, gfn_offset, mask);
+  }
+diff --cc arch/x86/kvm/vmx/vmx.c
+index 9c626d532031,eb207ffb7873..000000000000
+--- a/arch/x86/kvm/vmx/vmx.c
++++ b/arch/x86/kvm/vmx/vmx.c
+@@@ -7685,10 -7697,7 +7641,14 @@@ static struct kvm_x86_ops vmx_x86_ops _
+  
+  	.sched_in = vmx_sched_in,
+  
+++<<<<<<< HEAD
+ +	.slot_enable_log_dirty = vmx_slot_enable_log_dirty,
+ +	.slot_disable_log_dirty = vmx_slot_disable_log_dirty,
+ +	.flush_log_dirty = vmx_flush_log_dirty,
+ +	.enable_log_dirty_pt_masked = vmx_enable_log_dirty_pt_masked,
+++=======
++ 	.cpu_dirty_log_size = PML_ENTITY_NUM,
+++>>>>>>> a018eba53870 (KVM: x86: Move MMU's PML logic to common code)
+  
+  	.pre_block = vmx_pre_block,
+  	.post_block = vmx_post_block,
+@@@ -7827,12 -7841,8 +7787,17 @@@ static __init int hardware_setup(void
+  	if (!enable_ept || !enable_ept_ad_bits || !cpu_has_vmx_pml())
+  		enable_pml = 0;
+  
+++<<<<<<< HEAD
+ +	if (!enable_pml) {
+ +		vmx_x86_ops.slot_enable_log_dirty = NULL;
+ +		vmx_x86_ops.slot_disable_log_dirty = NULL;
+ +		vmx_x86_ops.flush_log_dirty = NULL;
+ +		vmx_x86_ops.enable_log_dirty_pt_masked = NULL;
+ +	}
+++=======
++ 	if (!enable_pml)
++ 		vmx_x86_ops.cpu_dirty_log_size = 0;
+++>>>>>>> a018eba53870 (KVM: x86: Move MMU's PML logic to common code)
+  
+  	if (!cpu_has_vmx_preemption_timer())
+  		enable_preemption_timer = false;
+diff --cc arch/x86/kvm/x86.c
+index 59a49c0dfe72,e89fe98a0099..000000000000
+--- a/arch/x86/kvm/x86.c
++++ b/arch/x86/kvm/x86.c
+@@@ -5184,11 -5214,18 +5184,23 @@@ static int kvm_vm_ioctl_reinject(struc
+  
+  void kvm_arch_sync_dirty_log(struct kvm *kvm, struct kvm_memory_slot *memslot)
+  {
++ 
+  	/*
+- 	 * Flush potentially hardware-cached dirty pages to dirty_bitmap.
++ 	 * Flush all CPUs' dirty log buffers to the  dirty_bitmap.  Called
++ 	 * before reporting dirty_bitmap to userspace.  KVM flushes the buffers
++ 	 * on all VM-Exits, thus we only need to kick running vCPUs to force a
++ 	 * VM-Exit.
+  	 */
+++<<<<<<< HEAD
+ +	if (kvm_x86_ops.flush_log_dirty)
+ +		kvm_x86_ops.flush_log_dirty(kvm);
+++=======
++ 	struct kvm_vcpu *vcpu;
++ 	int i;
++ 
++ 	kvm_for_each_vcpu(i, vcpu, kvm)
++ 		kvm_vcpu_kick(vcpu);
+++>>>>>>> a018eba53870 (KVM: x86: Move MMU's PML logic to common code)
+  }
+  
+  int kvm_vm_ioctl_irq_line(struct kvm *kvm, struct kvm_irq_level *irq_event,
+@@@ -10690,8 -10817,10 +10702,15 @@@ static void kvm_mmu_slot_apply_flags(st
+  	 * is enabled the D-bit or the W-bit will be cleared.
+  	 */
+  	if (new->flags & KVM_MEM_LOG_DIRTY_PAGES) {
+++<<<<<<< HEAD
+ +		if (kvm_x86_ops.slot_enable_log_dirty) {
+ +			kvm_x86_ops.slot_enable_log_dirty(kvm, new);
+++=======
++ 		if (kvm_x86_ops.cpu_dirty_log_size) {
++ 			if (!kvm_dirty_log_manual_protect_and_init_set(kvm))
++ 				kvm_mmu_slot_leaf_clear_dirty(kvm, new);
++ 			kvm_mmu_slot_largepage_remove_write_access(kvm, new);
+++>>>>>>> a018eba53870 (KVM: x86: Move MMU's PML logic to common code)
+  		} else {
+  			int level =
+  				kvm_dirty_log_manual_protect_and_init_set(kvm) ?
+@@@ -10707,9 -10836,8 +10726,14 @@@
+  			 */
+  			kvm_mmu_slot_remove_write_access(kvm, new, level);
+  		}
+++<<<<<<< HEAD
+ +	} else {
+ +		if (kvm_x86_ops.slot_disable_log_dirty)
+ +			kvm_x86_ops.slot_disable_log_dirty(kvm, new);
+++=======
++ 	} else if (kvm_x86_ops.cpu_dirty_log_size) {
++ 		kvm_mmu_slot_set_dirty(kvm, new);
+++>>>>>>> a018eba53870 (KVM: x86: Move MMU's PML logic to common code)
+  	}
+  }
+  
+* Unmerged path arch/x86/include/asm/kvm-x86-ops.h
+* Unmerged path arch/x86/include/asm/kvm_host.h
+* Unmerged path arch/x86/kvm/mmu/mmu.c
+* Unmerged path arch/x86/kvm/vmx/vmx.c
+* Unmerged path arch/x86/kvm/x86.c
