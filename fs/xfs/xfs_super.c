@@ -183,12 +183,6 @@ xfs_parseargs(
 		mp->m_flags |= XFS_MOUNT_WSYNC;
 
 	/*
-	 * Set some default flags that could be cleared by the mount option
-	 * parsing.
-	 */
-	mp->m_flags |= XFS_MOUNT_COMPAT_IOSIZE;
-
-	/*
 	 * These can be overridden by the mount option parsing.
 	 */
 	mp->m_logbufs = -1;
@@ -275,10 +269,10 @@ xfs_parseargs(
 			mp->m_flags &= ~XFS_MOUNT_IKEEP;
 			break;
 		case Opt_largeio:
-			mp->m_flags &= ~XFS_MOUNT_COMPAT_IOSIZE;
+			mp->m_flags |= XFS_MOUNT_LARGEIO;
 			break;
 		case Opt_nolargeio:
-			mp->m_flags |= XFS_MOUNT_COMPAT_IOSIZE;
+			mp->m_flags &= ~XFS_MOUNT_LARGEIO;
 			break;
 		case Opt_attr2:
 			mp->m_flags |= XFS_MOUNT_ATTR2;
@@ -436,12 +430,12 @@ xfs_showargs(
 		{ XFS_MOUNT_GRPID,		",grpid" },
 		{ XFS_MOUNT_DISCARD,		",discard" },
 		{ XFS_MOUNT_SMALL_INUMS,	",inode32" },
+		{ XFS_MOUNT_LARGEIO,		",largeio" },
 		{ XFS_MOUNT_DAX,		",dax" },
 		{ 0, NULL }
 	};
 	static struct proc_xfs_info xfs_info_unset[] = {
 		/* the few simple ones we can get from the mount struct */
-		{ XFS_MOUNT_COMPAT_IOSIZE,	",largeio" },
 		{ XFS_MOUNT_SMALL_INUMS,	",inode64" },
 		{ 0, NULL }
 	};
