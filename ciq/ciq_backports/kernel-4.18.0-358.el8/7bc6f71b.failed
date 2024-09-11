@@ -1,0 +1,514 @@
+powerpc/vas: Define and use common vas_window struct
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-358.el8
+commit-author Haren Myneni <haren@linux.ibm.com>
+commit 7bc6f71bdff5f8921e324da0a8fad6f4e2e63a85
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-358.el8/7bc6f71b.failed
+
+Many elements in vas_struct are used on PowerNV and PowerVM
+platforms. vas_window is used for both TX and RX windows on
+PowerNV and for TX windows on PowerVM. So some elements are
+specific to these platforms.
+
+So this patch defines common vas_window and platform
+specific window structs (pnv_vas_window on PowerNV). Also adds
+the corresponding changes in PowerNV vas code.
+
+	Signed-off-by: Haren Myneni <haren@linux.ibm.com>
+	Reviewed-by: Nicholas Piggin <npiggin@gmail.com>
+	Signed-off-by: Michael Ellerman <mpe@ellerman.id.au>
+Link: https://lore.kernel.org/r/1698c35c158dfe52c6d2166667823d3d4a463353.camel@linux.ibm.com
+
+(cherry picked from commit 7bc6f71bdff5f8921e324da0a8fad6f4e2e63a85)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/powerpc/include/asm/vas.h
+#	arch/powerpc/platforms/powernv/vas-fault.c
+#	arch/powerpc/platforms/powernv/vas-window.c
+#	arch/powerpc/platforms/powernv/vas.h
+diff --cc arch/powerpc/include/asm/vas.h
+index 6c441ad0e6ea,14ad7982874c..000000000000
+--- a/arch/powerpc/include/asm/vas.h
++++ b/arch/powerpc/include/asm/vas.h
+@@@ -9,9 -5,11 +9,7 @@@
+  
+  #ifndef _ASM_POWERPC_VAS_H
+  #define _ASM_POWERPC_VAS_H
+ -#include <linux/sched/mm.h>
+ -#include <linux/mmu_context.h>
+ -#include <asm/icswx.h>
+ -#include <uapi/asm/vas-api.h>
+  
+- struct vas_window;
+- 
+  /*
+   * Min and max FIFO sizes are based on Version 1.05 Section 3.1.4.25
+   * (Local FIFO Size Register) of the VAS workbook.
+@@@ -53,6 -51,64 +51,67 @@@ enum vas_cop_type 
+  };
+  
+  /*
+++<<<<<<< HEAD
+++=======
++  * User space VAS windows are opened by tasks and take references
++  * to pid and mm until windows are closed.
++  * Stores pid, mm, and tgid for each window.
++  */
++ struct vas_user_win_ref {
++ 	struct pid *pid;	/* PID of owner */
++ 	struct pid *tgid;	/* Thread group ID of owner */
++ 	struct mm_struct *mm;	/* Linux process mm_struct */
++ };
++ 
++ /*
++  * Common VAS window struct on PowerNV and PowerVM
++  */
++ struct vas_window {
++ 	u32 winid;
++ 	u32 wcreds_max;	/* Window credits */
++ 	enum vas_cop_type cop;
++ 	struct vas_user_win_ref task_ref;
++ 	char *dbgname;
++ 	struct dentry *dbgdir;
++ };
++ 
++ /*
++  * User space window operations used for powernv and powerVM
++  */
++ struct vas_user_win_ops {
++ 	struct vas_window * (*open_win)(int vas_id, u64 flags,
++ 				enum vas_cop_type);
++ 	u64 (*paste_addr)(struct vas_window *);
++ 	int (*close_win)(struct vas_window *);
++ };
++ 
++ static inline void put_vas_user_win_ref(struct vas_user_win_ref *ref)
++ {
++ 	/* Drop references to pid, tgid, and mm */
++ 	put_pid(ref->pid);
++ 	put_pid(ref->tgid);
++ 	if (ref->mm)
++ 		mmdrop(ref->mm);
++ }
++ 
++ static inline void vas_user_win_add_mm_context(struct vas_user_win_ref *ref)
++ {
++ 	mm_context_add_vas_window(ref->mm);
++ 	/*
++ 	 * Even a process that has no foreign real address mapping can
++ 	 * use an unpaired COPY instruction (to no real effect). Issue
++ 	 * CP_ABORT to clear any pending COPY and prevent a covert
++ 	 * channel.
++ 	 *
++ 	 * __switch_to() will issue CP_ABORT on future context switches
++ 	 * if process / thread has any open VAS window (Use
++ 	 * current->mm->context.vas_windows).
++ 	 */
++ 	asm volatile(PPC_CP_ABORT);
++ }
++ 
++ /*
+++>>>>>>> 7bc6f71bdff5 (powerpc/vas: Define and use common vas_window struct)
+   * Receive window attributes specified by the (in-kernel) owner of window.
+   */
+  struct vas_rx_win_attr {
+diff --cc arch/powerpc/platforms/powernv/vas-fault.c
+index 3d21fce254b7,a7aabc18039e..000000000000
+--- a/arch/powerpc/platforms/powernv/vas-fault.c
++++ b/arch/powerpc/platforms/powernv/vas-fault.c
+@@@ -293,7 -149,14 +293,18 @@@ irqreturn_t vas_fault_thread_fn(int irq
+  
+  			WARN_ON_ONCE(1);
+  		} else {
+++<<<<<<< HEAD
+ +			update_csb(window, crb);
+++=======
++ 			/*
++ 			 * NX sees faults only with user space windows.
++ 			 */
++ 			if (window->user_win)
++ 				vas_update_csb(crb, &window->vas_win.task_ref);
++ 			else
++ 				WARN_ON_ONCE(!window->user_win);
++ 
+++>>>>>>> 7bc6f71bdff5 (powerpc/vas: Define and use common vas_window struct)
+  			/*
+  			 * Return credit for send window after processing
+  			 * fault CRB.
+diff --cc arch/powerpc/platforms/powernv/vas-window.c
+index 5516ad56ba07,0f8d39fbf2b2..000000000000
+--- a/arch/powerpc/platforms/powernv/vas-window.c
++++ b/arch/powerpc/platforms/powernv/vas-window.c
+@@@ -190,7 -187,7 +190,11 @@@ static void unmap_winctx_mmio_bars(stru
+   * OS/User Window Context (UWC) MMIO Base Address Region for the given window.
+   * Map these bus addresses and save the mapped kernel addresses in @window.
+   */
+++<<<<<<< HEAD
+ +int map_winctx_mmio_bars(struct vas_window *window)
+++=======
++ static int map_winctx_mmio_bars(struct pnv_vas_window *window)
+++>>>>>>> 7bc6f71bdff5 (powerpc/vas: Define and use common vas_window struct)
+  {
+  	int len;
+  	u64 start;
+@@@ -218,7 -215,7 +222,11 @@@
+   *	 registers are not sequential. And, we can only write to offsets
+   *	 with valid registers.
+   */
+++<<<<<<< HEAD
+ +void reset_window_regs(struct vas_window *window)
+++=======
++ static void reset_window_regs(struct pnv_vas_window *window)
+++>>>>>>> 7bc6f71bdff5 (powerpc/vas: Define and use common vas_window struct)
+  {
+  	write_hvwc_reg(window, VREG(LPID), 0ULL);
+  	write_hvwc_reg(window, VREG(PID), 0ULL);
+@@@ -361,7 -358,8 +369,12 @@@ static void init_rsvd_tx_buf_count(stru
+   *	as a one-time task? That could work for NX but what about other
+   *	receivers?  Let the receivers tell us the rx-fifo buffers for now.
+   */
+++<<<<<<< HEAD
+ +int init_winctx_regs(struct vas_window *window, struct vas_winctx *winctx)
+++=======
++ static void init_winctx_regs(struct pnv_vas_window *window,
++ 			     struct vas_winctx *winctx)
+++>>>>>>> 7bc6f71bdff5 (powerpc/vas: Define and use common vas_window struct)
+  {
+  	u64 val;
+  	int fifo_size;
+@@@ -1069,53 -1067,11 +1084,61 @@@ struct vas_window *vas_tx_win_open(int 
+  			rc = -ENODEV;
+  			goto free_window;
+  		}
+++<<<<<<< HEAD
+ +
+ +		/*
+ +		 * Window opened by a child thread may not be closed when
+ +		 * it exits. So take reference to its pid and release it
+ +		 * when the window is free by parent thread.
+ +		 * Acquire a reference to the task's pid to make sure
+ +		 * pid will not be re-used - needed only for multithread
+ +		 * applications.
+ +		 */
+ +		txwin->pid = get_task_pid(current, PIDTYPE_PID);
+ +		/*
+ +		 * Acquire a reference to the task's mm.
+ +		 */
+ +		txwin->mm = get_task_mm(current);
+ +
+ +		if (!txwin->mm) {
+ +			put_pid(txwin->pid);
+ +			pr_err("VAS: pid(%d): mm_struct is not found\n",
+ +					current->pid);
+ +			rc = -EPERM;
+ +			goto free_window;
+ +		}
+ +
+ +		mmgrab(txwin->mm);
+ +		mmput(txwin->mm);
+ +		mm_context_add_vas_window(txwin->mm);
+ +		/*
+ +		 * Process closes window during exit. In the case of
+ +		 * multithread application, the child thread can open
+ +		 * window and can exit without closing it. so takes tgid
+ +		 * reference until window closed to make sure tgid is not
+ +		 * reused.
+ +		 */
+ +		txwin->tgid = find_get_pid(task_tgid_vnr(current));
+ +		/*
+ +		 * Even a process that has no foreign real address mapping can
+ +		 * use an unpaired COPY instruction (to no real effect). Issue
+ +		 * CP_ABORT to clear any pending COPY and prevent a covert
+ +		 * channel.
+ +		 *
+ +		 * __switch_to() will issue CP_ABORT on future context switches
+ +		 * if process / thread has any open VAS window (Use
+ +		 * current->mm->context.vas_windows in upstream kernel).
+ +		 * To fix kABI issue, current->mm->vas_windows will be used in RH
+ +		 * kerbnel.
+ +		 */
+ +		asm volatile(PPC_CP_ABORT);
+++=======
++ 		rc = get_vas_user_win_ref(&txwin->vas_win.task_ref);
++ 		if (rc)
++ 			goto free_window;
++ 
++ 		vas_user_win_add_mm_context(&txwin->vas_win.task_ref);
+++>>>>>>> 7bc6f71bdff5 (powerpc/vas: Define and use common vas_window struct)
+  	}
+  
+  	set_vinst_win(vinst, txwin);
+@@@ -1346,13 -1310,8 +1377,18 @@@ int vas_win_close(struct vas_window *vw
+  	/* if send window, drop reference to matching receive window */
+  	if (window->tx_win) {
+  		if (window->user_win) {
+++<<<<<<< HEAD
+ +			/* Drop references to pid. tgid and mm */
+ +			put_pid(window->pid);
+ +			put_pid(window->tgid);
+ +			if (window->mm) {
+ +				mm_context_remove_vas_window(window->mm);
+ +				mmdrop(window->mm);
+ +			}
+++=======
++ 			put_vas_user_win_ref(&vwin->task_ref);
++ 			mm_context_remove_vas_window(vwin->task_ref.mm);
+++>>>>>>> 7bc6f71bdff5 (powerpc/vas: Define and use common vas_window struct)
+  		}
+  		put_rx_win(window->rxwin);
+  	}
+@@@ -1449,3 -1408,64 +1485,67 @@@ struct pnv_vas_window *vas_pswid_to_win
+  
+  	return window;
+  }
+++<<<<<<< HEAD
+++=======
++ 
++ static struct vas_window *vas_user_win_open(int vas_id, u64 flags,
++ 				enum vas_cop_type cop_type)
++ {
++ 	struct vas_tx_win_attr txattr = {};
++ 
++ 	vas_init_tx_win_attr(&txattr, cop_type);
++ 
++ 	txattr.lpid = mfspr(SPRN_LPID);
++ 	txattr.pidr = mfspr(SPRN_PID);
++ 	txattr.user_win = true;
++ 	txattr.rsvd_txbuf_count = false;
++ 	txattr.pswid = false;
++ 
++ 	pr_devel("Pid %d: Opening txwin, PIDR %ld\n", txattr.pidr,
++ 				mfspr(SPRN_PID));
++ 
++ 	return vas_tx_win_open(vas_id, cop_type, &txattr);
++ }
++ 
++ static u64 vas_user_win_paste_addr(struct vas_window *txwin)
++ {
++ 	struct pnv_vas_window *win;
++ 	u64 paste_addr;
++ 
++ 	win = container_of(txwin, struct pnv_vas_window, vas_win);
++ 	vas_win_paste_addr(win, &paste_addr, NULL);
++ 
++ 	return paste_addr;
++ }
++ 
++ static int vas_user_win_close(struct vas_window *txwin)
++ {
++ 	vas_win_close(txwin);
++ 
++ 	return 0;
++ }
++ 
++ static const struct vas_user_win_ops vops =  {
++ 	.open_win	=	vas_user_win_open,
++ 	.paste_addr	=	vas_user_win_paste_addr,
++ 	.close_win	=	vas_user_win_close,
++ };
++ 
++ /*
++  * Supporting only nx-gzip coprocessor type now, but this API code
++  * extended to other coprocessor types later.
++  */
++ int vas_register_api_powernv(struct module *mod, enum vas_cop_type cop_type,
++ 			     const char *name)
++ {
++ 
++ 	return vas_register_coproc_api(mod, cop_type, name, &vops);
++ }
++ EXPORT_SYMBOL_GPL(vas_register_api_powernv);
++ 
++ void vas_unregister_api_powernv(void)
++ {
++ 	vas_unregister_coproc_api();
++ }
++ EXPORT_SYMBOL_GPL(vas_unregister_api_powernv);
+++>>>>>>> 7bc6f71bdff5 (powerpc/vas: Define and use common vas_window struct)
+diff --cc arch/powerpc/platforms/powernv/vas.h
+index 27337783457b,8bb08e395de0..000000000000
+--- a/arch/powerpc/platforms/powernv/vas.h
++++ b/arch/powerpc/platforms/powernv/vas.h
+@@@ -337,12 -334,13 +337,12 @@@ struct vas_instance 
+  	int fifo_in_progress;	/* To wake up thread or return IRQ_HANDLED */
+  	spinlock_t fault_lock;	/* Protects fifo_in_progress update */
+  	void *fault_fifo;
+- 	struct vas_window *fault_win; /* Fault window */
++ 	struct pnv_vas_window *fault_win; /* Fault window */
+  
+  	struct mutex mutex;
+- 	struct vas_window *rxwin[VAS_COP_TYPE_MAX];
+- 	struct vas_window *windows[VAS_WINDOWS_PER_CHIP];
++ 	struct pnv_vas_window *rxwin[VAS_COP_TYPE_MAX];
++ 	struct pnv_vas_window *windows[VAS_WINDOWS_PER_CHIP];
+  
+ -	char *name;
+  	char *dbgname;
+  	struct dentry *dbgdir;
+  };
+@@@ -359,13 -357,6 +359,16 @@@ struct pnv_vas_window 
+  	bool user_win;		/* True if user space window */
+  	void *hvwc_map;		/* HV window context */
+  	void *uwc_map;		/* OS/User window context */
+++<<<<<<< HEAD
+ +	struct pid *pid;	/* Linux process id of owner */
+ +	struct pid *tgid;	/* Thread group ID of owner */
+ +	struct mm_struct *mm;	/* Linux process mm_struct */
+ +	int wcreds_max;		/* Window credits */
+ +
+ +	char *dbgname;
+ +	struct dentry *dbgdir;
+++=======
+++>>>>>>> 7bc6f71bdff5 (powerpc/vas: Define and use common vas_window struct)
+  
+  	/* Fields applicable only to send windows */
+  	void *paste_kaddr;
+@@@ -437,18 -427,18 +439,23 @@@ extern void vas_window_free_dbgdir(stru
+  extern int vas_setup_fault_window(struct vas_instance *vinst);
+  extern irqreturn_t vas_fault_thread_fn(int irq, void *data);
+  extern irqreturn_t vas_fault_handler(int irq, void *dev_id);
+- extern void vas_return_credit(struct vas_window *window, bool tx);
+- extern struct vas_window *vas_pswid_to_window(struct vas_instance *vinst,
++ extern void vas_return_credit(struct pnv_vas_window *window, bool tx);
++ extern struct pnv_vas_window *vas_pswid_to_window(struct vas_instance *vinst,
+  						uint32_t pswid);
+++<<<<<<< HEAD
+ +extern void vas_win_paste_addr(struct vas_window *window, u64 *addr,
+ +					int *len);
+++=======
++ extern void vas_win_paste_addr(struct pnv_vas_window *window, u64 *addr,
++ 				int *len);
+++>>>>>>> 7bc6f71bdff5 (powerpc/vas: Define and use common vas_window struct)
+  
+  static inline int vas_window_pid(struct vas_window *window)
+  {
+ -	return pid_vnr(window->task_ref.pid);
+ +	return pid_vnr(window->pid);
+  }
+  
+- static inline void vas_log_write(struct vas_window *win, char *name,
++ static inline void vas_log_write(struct pnv_vas_window *win, char *name,
+  			void *regptr, u64 val)
+  {
+  	if (val)
+* Unmerged path arch/powerpc/include/asm/vas.h
+diff --git a/arch/powerpc/platforms/powernv/vas-debug.c b/arch/powerpc/platforms/powernv/vas-debug.c
+index ad271d20048c..aa2a31abdda6 100644
+--- a/arch/powerpc/platforms/powernv/vas-debug.c
++++ b/arch/powerpc/platforms/powernv/vas-debug.c
+@@ -13,6 +13,7 @@
+ #include <linux/slab.h>
+ #include <linux/debugfs.h>
+ #include <linux/seq_file.h>
++#include <asm/vas.h>
+ #include "vas.h"
+ 
+ static struct dentry *vas_debugfs;
+@@ -32,7 +33,7 @@ static char *cop_to_str(int cop)
+ 
+ static int info_dbg_show(struct seq_file *s, void *private)
+ {
+-	struct vas_window *window = s->private;
++	struct pnv_vas_window *window = s->private;
+ 
+ 	mutex_lock(&vas_mutex);
+ 
+@@ -40,9 +41,9 @@ static int info_dbg_show(struct seq_file *s, void *private)
+ 	if (!window->hvwc_map)
+ 		goto unlock;
+ 
+-	seq_printf(s, "Type: %s, %s\n", cop_to_str(window->cop),
++	seq_printf(s, "Type: %s, %s\n", cop_to_str(window->vas_win.cop),
+ 					window->tx_win ? "Send" : "Receive");
+-	seq_printf(s, "Pid : %d\n", vas_window_pid(window));
++	seq_printf(s, "Pid : %d\n", vas_window_pid(&window->vas_win));
+ 
+ unlock:
+ 	mutex_unlock(&vas_mutex);
+@@ -61,7 +62,7 @@ static const struct file_operations info_fops = {
+ 	.release	= single_release,
+ };
+ 
+-static inline void print_reg(struct seq_file *s, struct vas_window *win,
++static inline void print_reg(struct seq_file *s, struct pnv_vas_window *win,
+ 			char *name, u32 reg)
+ {
+ 	seq_printf(s, "0x%016llx %s\n", read_hvwc_reg(win, name, reg), name);
+@@ -69,7 +70,7 @@ static inline void print_reg(struct seq_file *s, struct vas_window *win,
+ 
+ static int hvwc_dbg_show(struct seq_file *s, void *private)
+ {
+-	struct vas_window *window = s->private;
++	struct pnv_vas_window *window = s->private;
+ 
+ 	mutex_lock(&vas_mutex);
+ 
+@@ -127,8 +128,10 @@ static const struct file_operations hvwc_fops = {
+ 	.release	= single_release,
+ };
+ 
+-void vas_window_free_dbgdir(struct vas_window *window)
++void vas_window_free_dbgdir(struct pnv_vas_window *pnv_win)
+ {
++	struct vas_window *window =  &pnv_win->vas_win;
++
+ 	if (window->dbgdir) {
+ 		debugfs_remove_recursive(window->dbgdir);
+ 		kfree(window->dbgname);
+@@ -137,21 +140,21 @@ void vas_window_free_dbgdir(struct vas_window *window)
+ 	}
+ }
+ 
+-void vas_window_init_dbgdir(struct vas_window *window)
++void vas_window_init_dbgdir(struct pnv_vas_window *window)
+ {
+ 	struct dentry *d;
+ 
+ 	if (!window->vinst->dbgdir)
+ 		return;
+ 
+-	window->dbgname = kzalloc(16, GFP_KERNEL);
+-	if (!window->dbgname)
++	window->vas_win.dbgname = kzalloc(16, GFP_KERNEL);
++	if (!window->vas_win.dbgname)
+ 		return;
+ 
+-	snprintf(window->dbgname, 16, "w%d", window->winid);
++	snprintf(window->vas_win.dbgname, 16, "w%d", window->vas_win.winid);
+ 
+-	d = debugfs_create_dir(window->dbgname, window->vinst->dbgdir);
+-	window->dbgdir = d;
++	d = debugfs_create_dir(window->vas_win.dbgname, window->vinst->dbgdir);
++	window->vas_win.dbgdir = d;
+ 
+ 	debugfs_create_file("info", 0444, d, window, &info_fops);
+ 	debugfs_create_file("hvwc", 0444, d, window, &hvwc_fops);
+* Unmerged path arch/powerpc/platforms/powernv/vas-fault.c
+diff --git a/arch/powerpc/platforms/powernv/vas-trace.h b/arch/powerpc/platforms/powernv/vas-trace.h
+index a449b9f0c12e..ca2e08f2ddc0 100644
+--- a/arch/powerpc/platforms/powernv/vas-trace.h
++++ b/arch/powerpc/platforms/powernv/vas-trace.h
+@@ -80,7 +80,7 @@ TRACE_EVENT(	vas_tx_win_open,
+ TRACE_EVENT(	vas_paste_crb,
+ 
+ 		TP_PROTO(struct task_struct *tsk,
+-			struct vas_window *win),
++			struct pnv_vas_window *win),
+ 
+ 		TP_ARGS(tsk, win),
+ 
+@@ -96,7 +96,7 @@ TRACE_EVENT(	vas_paste_crb,
+ 		TP_fast_assign(
+ 			__entry->pid = tsk->pid;
+ 			__entry->vasid = win->vinst->vas_id;
+-			__entry->winid = win->winid;
++			__entry->winid = win->vas_win.winid;
+ 			__entry->paste_kaddr = (unsigned long)win->paste_kaddr
+ 		),
+ 
+* Unmerged path arch/powerpc/platforms/powernv/vas-window.c
+* Unmerged path arch/powerpc/platforms/powernv/vas.h
