@@ -18,7 +18,7 @@
 
 struct nvmet_subsys *nvmet_disc_subsys;
 
-u64 nvmet_genctr;
+static u64 nvmet_genctr;
 
 void nvmet_referral_enable(struct nvmet_port *parent, struct nvmet_port *port)
 {
