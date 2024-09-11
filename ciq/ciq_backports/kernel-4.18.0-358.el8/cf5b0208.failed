@@ -1,0 +1,244 @@
+printk: introduce CONSOLE_LOG_MAX
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-358.el8
+commit-author John Ogness <john.ogness@linutronix.de>
+commit cf5b0208fda4602d0ef383a86e942fb3dcb8852b
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-358.el8/cf5b0208.failed
+
+Instead of using "LOG_LINE_MAX + PREFIX_MAX" for temporary buffer
+sizes, introduce CONSOLE_LOG_MAX. This represents the maximum size
+that is allowed to be printed to the console for a single record.
+
+	Signed-off-by: John Ogness <john.ogness@linutronix.de>
+	Reviewed-by: Petr Mladek <pmladek@suse.com>
+	Signed-off-by: Petr Mladek <pmladek@suse.com>
+Link: https://lore.kernel.org/r/20210303101528.29901-8-john.ogness@linutronix.de
+(cherry picked from commit cf5b0208fda4602d0ef383a86e942fb3dcb8852b)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	kernel/printk/printk.c
+diff --cc kernel/printk/printk.c
+index 9c33249065a6,2c8873fa2f29..000000000000
+--- a/kernel/printk/printk.c
++++ b/kernel/printk/printk.c
+@@@ -1381,16 -1409,80 +1386,21 @@@ static size_t msg_print_text(const stru
+  	return len;
+  }
+  
+ -static size_t get_record_print_text_size(struct printk_info *info,
+ -					 unsigned int line_count,
+ -					 bool syslog, bool time)
+ -{
+ -	char prefix[PREFIX_MAX];
+ -	size_t prefix_len;
+ -
+ -	prefix_len = info_print_prefix(info, syslog, time, prefix);
+ -
+ -	/*
+ -	 * Each line will be preceded with a prefix. The intermediate
+ -	 * newlines are already within the text, but a final trailing
+ -	 * newline will be added.
+ -	 */
+ -	return ((prefix_len * line_count) + info->text_len + 1);
+ -}
+ -
+ -/*
+ - * Beginning with @start_seq, find the first record where it and all following
+ - * records up to (but not including) @max_seq fit into @size.
+ - *
+ - * @max_seq is simply an upper bound and does not need to exist. If the caller
+ - * does not require an upper bound, -1 can be used for @max_seq.
+ - */
+ -static u64 find_first_fitting_seq(u64 start_seq, u64 max_seq, size_t size,
+ -				  bool syslog, bool time)
+ -{
+ -	struct printk_info info;
+ -	unsigned int line_count;
+ -	size_t len = 0;
+ -	u64 seq;
+ -
+ -	/* Determine the size of the records up to @max_seq. */
+ -	prb_for_each_info(start_seq, prb, seq, &info, &line_count) {
+ -		if (info.seq >= max_seq)
+ -			break;
+ -		len += get_record_print_text_size(&info, line_count, syslog, time);
+ -	}
+ -
+ -	/*
+ -	 * Adjust the upper bound for the next loop to avoid subtracting
+ -	 * lengths that were never added.
+ -	 */
+ -	if (seq < max_seq)
+ -		max_seq = seq;
+ -
+ -	/*
+ -	 * Move first record forward until length fits into the buffer. Ignore
+ -	 * newest messages that were not counted in the above cycle. Messages
+ -	 * might appear and get lost in the meantime. This is a best effort
+ -	 * that prevents an infinite loop that could occur with a retry.
+ -	 */
+ -	prb_for_each_info(start_seq, prb, seq, &info, &line_count) {
+ -		if (len <= size || info.seq >= max_seq)
+ -			break;
+ -		len -= get_record_print_text_size(&info, line_count, syslog, time);
+ -	}
+ -
+ -	return seq;
+ -}
+ -
+  static int syslog_print(char __user *buf, int size)
+  {
+ -	struct printk_info info;
+ -	struct printk_record r;
+  	char *text;
+ +	struct printk_log *msg;
+  	int len = 0;
+  
+- 	text = kmalloc(LOG_LINE_MAX + PREFIX_MAX, GFP_KERNEL);
++ 	text = kmalloc(CONSOLE_LOG_MAX, GFP_KERNEL);
+  	if (!text)
+  		return -ENOMEM;
+  
+++<<<<<<< HEAD
+++=======
++ 	prb_rec_init_rd(&r, &info, text, CONSOLE_LOG_MAX);
++ 
+++>>>>>>> cf5b0208fda4 (printk: introduce CONSOLE_LOG_MAX)
+  	while (size > 0) {
+  		size_t n;
+  		size_t skip;
+@@@ -1452,14 -1540,14 +1462,14 @@@
+  
+  static int syslog_print_all(char __user *buf, int size, bool clear)
+  {
+ -	struct printk_info info;
+ -	struct printk_record r;
+  	char *text;
+  	int len = 0;
+ +	u64 next_seq;
+  	u64 seq;
+ +	u32 idx;
+  	bool time;
+  
+- 	text = kmalloc(LOG_LINE_MAX + PREFIX_MAX, GFP_KERNEL);
++ 	text = kmalloc(CONSOLE_LOG_MAX, GFP_KERNEL);
+  	if (!text)
+  		return -ENOMEM;
+  
+@@@ -1469,38 -1557,20 +1479,42 @@@
+  	 * Find first record that fits, including all following records,
+  	 * into the user-provided buffer for this dump.
+  	 */
+ -	seq = find_first_fitting_seq(clear_seq, -1, size, true, time);
+ +	seq = clear_seq;
+ +	idx = clear_idx;
+ +	while (seq < log_next_seq) {
+ +		struct printk_log *msg = log_from_idx(idx);
+ +
+++<<<<<<< HEAD
+ +		len += msg_print_text(msg, true, time, NULL, 0);
+ +		idx = log_next(idx);
+ +		seq++;
+ +	}
+ +
+ +	/* move first record forward until length fits into the buffer */
+ +	seq = clear_seq;
+ +	idx = clear_idx;
+ +	while (len > size && seq < log_next_seq) {
+ +		struct printk_log *msg = log_from_idx(idx);
+  
+ +		len -= msg_print_text(msg, true, time, NULL, 0);
+ +		idx = log_next(idx);
+ +		seq++;
+ +	}
+ +
+ +	/* last message fitting into this dump */
+ +	next_seq = log_next_seq;
+++=======
++ 	prb_rec_init_rd(&r, &info, text, CONSOLE_LOG_MAX);
+++>>>>>>> cf5b0208fda4 (printk: introduce CONSOLE_LOG_MAX)
+  
+  	len = 0;
+ -	prb_for_each_record(seq, prb, seq, &r) {
+ -		int textlen;
+ -
+ -		textlen = record_print_text(&r, true, time);
+ +	while (len >= 0 && seq < next_seq) {
+ +		struct printk_log *msg = log_from_idx(idx);
+ +		int textlen = msg_print_text(msg, true, time, text,
+ +					     LOG_LINE_MAX + PREFIX_MAX);
+  
+ -		if (len + textlen > size) {
+ -			seq--;
+ -			break;
+ -		}
+ +		idx = log_next(idx);
+ +		seq++;
+  
+  		logbuf_unlock_irq();
+  		if (copy_to_user(buf + len, text, textlen))
+@@@ -2081,28 -2192,30 +2095,27 @@@ EXPORT_SYMBOL(printk)
+  
+  #else /* CONFIG_PRINTK */
+  
+- #define LOG_LINE_MAX		0
+- #define PREFIX_MAX		0
++ #define CONSOLE_LOG_MAX		0
+  #define printk_time		false
+  
+ -#define prb_read_valid(rb, seq, r)	false
+ -#define prb_first_valid_seq(rb)		0
+ -
+  static u64 syslog_seq;
+ +static u32 syslog_idx;
+  static u64 console_seq;
+ +static u32 console_idx;
+  static u64 exclusive_console_stop_seq;
+ -static unsigned long console_dropped;
+ -
+ -static size_t record_print_text(const struct printk_record *r,
+ -				bool syslog, bool time)
+ -{
+ -	return 0;
+ -}
+ -static ssize_t info_print_ext_header(char *buf, size_t size,
+ -				     struct printk_info *info)
+ -{
+ -	return 0;
+ -}
+ +static u64 log_first_seq;
+ +static u32 log_first_idx;
+ +static u64 log_next_seq;
+ +static char *log_text(const struct printk_log *msg) { return NULL; }
+ +static char *log_dict(const struct printk_log *msg) { return NULL; }
+ +static struct printk_log *log_from_idx(u32 idx) { return NULL; }
+ +static u32 log_next(u32 idx) { return 0; }
+ +static ssize_t msg_print_ext_header(char *buf, size_t size,
+ +				    struct printk_log *msg,
+ +				    u64 seq) { return 0; }
+  static ssize_t msg_print_ext_body(char *buf, size_t size,
+ -				  char *text, size_t text_len,
+ -				  struct dev_printk_info *dev_info) { return 0; }
+ +				  char *dict, size_t dict_len,
+ +				  char *text, size_t text_len) { return 0; }
+  static void console_lock_spinning_enable(void) { }
+  static int console_lock_spinning_disable_and_check(void) { return 0; }
+  static void call_console_drivers(const char *ext_text, size_t ext_len,
+@@@ -2399,9 -2510,11 +2412,9 @@@ static inline int can_use_console(void
+  void console_unlock(void)
+  {
+  	static char ext_text[CONSOLE_EXT_LOG_MAX];
+- 	static char text[LOG_LINE_MAX + PREFIX_MAX];
++ 	static char text[CONSOLE_LOG_MAX];
+  	unsigned long flags;
+  	bool do_cond_resched, retry;
+ -	struct printk_info info;
+ -	struct printk_record r;
+  
+  	if (console_suspended) {
+  		up_console_sem();
+* Unmerged path kernel/printk/printk.c
