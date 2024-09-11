@@ -1,0 +1,172 @@
+ALSA: firewire-lib: use packet descriptor for IR context
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-193.el8
+commit-author Takashi Sakamoto <o-takashi@sakamocchi.jp>
+commit 753e717986c24b60962367708479555212730b9f
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-193.el8/753e7179.failed
+
+This commit uses packet descriptor to parse headers of IR context and
+parse timing information for sequence transferred by target device.
+
+	Signed-off-by: Takashi Sakamoto <o-takashi@sakamocchi.jp>
+	Signed-off-by: Takashi Iwai <tiwai@suse.de>
+(cherry picked from commit 753e717986c24b60962367708479555212730b9f)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	sound/firewire/amdtp-stream.c
+diff --cc sound/firewire/amdtp-stream.c
+index 51ab268a7513,68502a8864b9..000000000000
+--- a/sound/firewire/amdtp-stream.c
++++ b/sound/firewire/amdtp-stream.c
+@@@ -686,6 -678,80 +688,83 @@@ static inline u32 compute_it_cycle(cons
+  	return increment_cycle_count(cycle, QUEUE_LENGTH);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static int generate_device_pkt_descs(struct amdtp_stream *s,
++ 				     struct pkt_desc *descs,
++ 				     const __be32 *ctx_header,
++ 				     unsigned int packets)
++ {
++ 	unsigned int dbc = s->data_block_counter;
++ 	int i;
++ 	int err;
++ 
++ 	for (i = 0; i < packets; ++i) {
++ 		struct pkt_desc *desc = descs + i;
++ 		unsigned int index = (s->packet_index + i) % QUEUE_LENGTH;
++ 		unsigned int cycle;
++ 		unsigned int payload_length;
++ 		unsigned int data_blocks;
++ 		unsigned int syt;
++ 
++ 		cycle = compute_cycle_count(ctx_header[1]);
++ 
++ 		err = parse_ir_ctx_header(s, cycle, ctx_header, &payload_length,
++ 					  &data_blocks, &dbc, &syt, i);
++ 		if (err < 0)
++ 			return err;
++ 
++ 		desc->cycle = cycle;
++ 		desc->syt = syt;
++ 		desc->data_blocks = data_blocks;
++ 		desc->data_block_counter = dbc;
++ 		desc->ctx_payload = s->buffer.packets[index].buffer;
++ 
++ 		if (!(s->flags & CIP_DBC_IS_END_EVENT))
++ 			dbc = (dbc + desc->data_blocks) & 0xff;
++ 
++ 		ctx_header +=
++ 			s->ctx_data.tx.ctx_header_size / sizeof(*ctx_header);
++ 	}
++ 
++ 	s->data_block_counter = dbc;
++ 
++ 	return 0;
++ }
++ 
++ static void generate_ideal_pkt_descs(struct amdtp_stream *s,
++ 				     struct pkt_desc *descs,
++ 				     const __be32 *ctx_header,
++ 				     unsigned int packets)
++ {
++ 	unsigned int dbc = s->data_block_counter;
++ 	int i;
++ 
++ 	for (i = 0; i < packets; ++i) {
++ 		struct pkt_desc *desc = descs + i;
++ 		unsigned int index = (s->packet_index + i) % QUEUE_LENGTH;
++ 
++ 		desc->cycle = compute_cycle_count(*ctx_header);
++ 		desc->syt = calculate_syt(s, desc->cycle);
++ 		desc->data_blocks = calculate_data_blocks(s, desc->syt);
++ 
++ 		if (s->flags & CIP_DBC_IS_END_EVENT)
++ 			dbc = (dbc + desc->data_blocks) & 0xff;
++ 
++ 		desc->data_block_counter = dbc;
++ 
++ 		if (!(s->flags & CIP_DBC_IS_END_EVENT))
++ 			dbc = (dbc + desc->data_blocks) & 0xff;
++ 
++ 		desc->ctx_payload = s->buffer.packets[index].buffer;
++ 
++ 		++ctx_header;
++ 	}
++ 
++ 	s->data_block_counter = dbc;
++ }
++ 
+++>>>>>>> 753e717986c2 (ALSA: firewire-lib: use packet descriptor for IR context)
+  static inline void cancel_stream(struct amdtp_stream *s)
+  {
+  	s->packet_index = -1;
+@@@ -757,36 -825,30 +838,62 @@@ static void in_stream_callback(struct f
+  	// The number of packets in buffer.
+  	packets = header_length / s->ctx_data.tx.ctx_header_size;
+  
++ 	err = generate_device_pkt_descs(s, s->pkt_descs, ctx_header, packets);
++ 	if (err < 0) {
++ 		if (err != -EAGAIN) {
++ 			cancel_stream(s);
++ 			return;
++ 		}
++ 	}
++ 
+  	for (i = 0; i < packets; i++) {
+++<<<<<<< HEAD
+ +		u32 cycle;
+ +		unsigned int payload_length;
+ +		unsigned int data_blocks;
+ +		unsigned int syt;
+ +		__be32 *buffer;
+ +		unsigned int pcm_frames = 0;
+ +		struct fw_iso_packet params = {0};
+ +		struct snd_pcm_substream *pcm;
+ +		int err;
+ +
+ +		cycle = compute_cycle_count(ctx_header[1]);
+ +		err = parse_ir_ctx_header(s, cycle, ctx_header, &payload_length,
+ +					  &data_blocks, &syt, i);
+ +		if (err < 0 && err != -EAGAIN)
+ +			break;
+ +
+ +		if (err >= 0) {
+ +			buffer = s->buffer.packets[s->packet_index].buffer;
+ +			pcm_frames = s->process_data_blocks(s, buffer,
+ +							    data_blocks, &syt);
+ +
+ +			if (!(s->flags & CIP_DBC_IS_END_EVENT)) {
+ +				s->data_block_counter += data_blocks;
+ +				s->data_block_counter &= 0xff;
+ +			}
+ +		}
+ +
+ +		if (queue_in_packet(s, &params) < 0)
+ +			break;
+++=======
++ 		const struct pkt_desc *desc = s->pkt_descs;
++ 		unsigned int pcm_frames = 0;
++ 		struct fw_iso_packet params = {0};
++ 		struct snd_pcm_substream *pcm;
++ 
++ 		if (err >= 0) {
++ 			pcm_frames = s->process_data_blocks(s,
++ 					desc->ctx_payload, desc->data_blocks,
++ 					desc->data_block_counter);
++ 		}
++ 
++ 		if (queue_in_packet(s, &params) < 0) {
++ 			cancel_stream(s);
++ 			return;
++ 		}
+++>>>>>>> 753e717986c2 (ALSA: firewire-lib: use packet descriptor for IR context)
+  
+  		pcm = READ_ONCE(s->pcm);
+  		if (pcm && pcm_frames > 0)
+* Unmerged path sound/firewire/amdtp-stream.c
