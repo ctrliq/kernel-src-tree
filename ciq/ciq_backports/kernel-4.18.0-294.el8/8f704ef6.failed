@@ -1,0 +1,118 @@
+stmmac: fix signed 64-bit division
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Arnd Bergmann <arnd@arndb.de>
+commit 8f704ef666406fc5e42032308a2b366ea7bca846
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/8f704ef6.failed
+
+I link error on 32-bit ARM points to yet another arithmetic bug:
+
+drivers/net/ethernet/stmicro/stmmac/stmmac_tc.o: In function `tc_setup_cbs':
+stmmac_tc.c:(.text+0x148): undefined reference to `__aeabi_uldivmod'
+stmmac_tc.c:(.text+0x1fc): undefined reference to `__aeabi_uldivmod'
+stmmac_tc.c:(.text+0x308): undefined reference to `__aeabi_uldivmod'
+stmmac_tc.c:(.text+0x320): undefined reference to `__aeabi_uldivmod'
+stmmac_tc.c:(.text+0x33c): undefined reference to `__aeabi_uldivmod'
+drivers/net/ethernet/stmicro/stmmac/stmmac_tc.o:stmmac_tc.c:(.text+0x3a4): more undefined references to `__aeabi_uldivmod' follow
+
+I observe that the last change to add the 'ul' prefix was incorrect,
+as it did not turn the result of the multiplication into a 64-bit
+expression on 32-bit architectures. Further, it seems that the
+do_div() macro gets confused by the fact that we pass a signed
+variable rather than unsigned into it.
+
+This changes the code to instead use the div_s64() helper that is
+meant for signed division, along with changing the constant suffix
+to 'll' to actually make it a 64-bit argument everywhere, fixing
+both of the issues I pointed out.
+
+I'm not completely convinced that this makes the code correct, but
+I'm fairly sure that we have two problems less than before.
+
+Fixes: 1f705bc61aee ("net: stmmac: Add support for CBS QDISC")
+Fixes: c18a9c096683 ("net: stmmac_tc: use 64-bit arithmetic instead of 32-bit")
+	Signed-off-by: Arnd Bergmann <arnd@arndb.de>
+	Acked-by: Gustavo A. R. Silva <gustavo@embeddedor.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 8f704ef666406fc5e42032308a2b366ea7bca846)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/stmicro/stmmac/stmmac_tc.c
+diff --cc drivers/net/ethernet/stmicro/stmmac/stmmac_tc.c
+index 225c833b2291,1a96dd9c1091..000000000000
+--- a/drivers/net/ethernet/stmicro/stmmac/stmmac_tc.c
++++ b/drivers/net/ethernet/stmicro/stmmac/stmmac_tc.c
+@@@ -288,6 -289,65 +288,68 @@@ static int tc_init(struct stmmac_priv *
+  	return 0;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static int tc_setup_cbs(struct stmmac_priv *priv,
++ 			struct tc_cbs_qopt_offload *qopt)
++ {
++ 	u32 tx_queues_count = priv->plat->tx_queues_to_use;
++ 	u32 queue = qopt->queue;
++ 	u32 ptr, speed_div;
++ 	u32 mode_to_use;
++ 	u64 value;
++ 	int ret;
++ 
++ 	/* Queue 0 is not AVB capable */
++ 	if (queue <= 0 || queue >= tx_queues_count)
++ 		return -EINVAL;
++ 	if (priv->speed != SPEED_100 && priv->speed != SPEED_1000)
++ 		return -EOPNOTSUPP;
++ 
++ 	mode_to_use = priv->plat->tx_queues_cfg[queue].mode_to_use;
++ 	if (mode_to_use == MTL_QUEUE_DCB && qopt->enable) {
++ 		ret = stmmac_dma_qmode(priv, priv->ioaddr, queue, MTL_QUEUE_AVB);
++ 		if (ret)
++ 			return ret;
++ 
++ 		priv->plat->tx_queues_cfg[queue].mode_to_use = MTL_QUEUE_AVB;
++ 	} else if (!qopt->enable) {
++ 		return stmmac_dma_qmode(priv, priv->ioaddr, queue, MTL_QUEUE_DCB);
++ 	}
++ 
++ 	/* Port Transmit Rate and Speed Divider */
++ 	ptr = (priv->speed == SPEED_100) ? 4 : 8;
++ 	speed_div = (priv->speed == SPEED_100) ? 100000 : 1000000;
++ 
++ 	/* Final adjustments for HW */
++ 	value = div_s64(qopt->idleslope * 1024ll * ptr, speed_div);
++ 	priv->plat->tx_queues_cfg[queue].idle_slope = value & GENMASK(31, 0);
++ 
++ 	value = div_s64(-qopt->sendslope * 1024ll * ptr, speed_div);
++ 	priv->plat->tx_queues_cfg[queue].send_slope = value & GENMASK(31, 0);
++ 
++ 	value = qopt->hicredit * 1024ll * 8;
++ 	priv->plat->tx_queues_cfg[queue].high_credit = value & GENMASK(31, 0);
++ 
++ 	value = qopt->locredit * 1024ll * 8;
++ 	priv->plat->tx_queues_cfg[queue].low_credit = value & GENMASK(31, 0);
++ 
++ 	ret = stmmac_config_cbs(priv, priv->hw,
++ 				priv->plat->tx_queues_cfg[queue].send_slope,
++ 				priv->plat->tx_queues_cfg[queue].idle_slope,
++ 				priv->plat->tx_queues_cfg[queue].high_credit,
++ 				priv->plat->tx_queues_cfg[queue].low_credit,
++ 				queue);
++ 	if (ret)
++ 		return ret;
++ 
++ 	dev_info(priv->device, "CBS queue %d: send %d, idle %d, hi %d, lo %d\n",
++ 			queue, qopt->sendslope, qopt->idleslope,
++ 			qopt->hicredit, qopt->locredit);
++ 	return 0;
++ }
++ 
+++>>>>>>> 8f704ef66640 (stmmac: fix signed 64-bit division)
+  const struct stmmac_tc_ops dwmac510_tc_ops = {
+  	.init = tc_init,
+  	.setup_cls_u32 = tc_setup_cls_u32,
+* Unmerged path drivers/net/ethernet/stmicro/stmmac/stmmac_tc.c
