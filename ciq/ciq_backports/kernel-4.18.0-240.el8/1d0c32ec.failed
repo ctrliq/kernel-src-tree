@@ -1,0 +1,140 @@
+KVM: PPC: Fix kernel crash with PR KVM
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Greg Kurz <groug@kaod.org>
+commit 1d0c32ec3b860a32df593a22bad0d1dbc5546a59
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/1d0c32ec.failed
+
+With PR KVM, shutting down a VM causes the host kernel to crash:
+
+[  314.219284] BUG: Unable to handle kernel data access on read at 0xc00800000176c638
+[  314.219299] Faulting instruction address: 0xc008000000d4ddb0
+cpu 0x0: Vector: 300 (Data Access) at [c00000036da077a0]
+    pc: c008000000d4ddb0: kvmppc_mmu_pte_flush_all+0x68/0xd0 [kvm_pr]
+    lr: c008000000d4dd94: kvmppc_mmu_pte_flush_all+0x4c/0xd0 [kvm_pr]
+    sp: c00000036da07a30
+   msr: 900000010280b033
+   dar: c00800000176c638
+ dsisr: 40000000
+  current = 0xc00000036d4c0000
+  paca    = 0xc000000001a00000   irqmask: 0x03   irq_happened: 0x01
+    pid   = 1992, comm = qemu-system-ppc
+Linux version 5.6.0-master-gku+ (greg@palmb) (gcc version 7.5.0 (Ubuntu 7.5.0-3ubuntu1~18.04)) #17 SMP Wed Mar 18 13:49:29 CET 2020
+enter ? for help
+[c00000036da07ab0] c008000000d4fbe0 kvmppc_mmu_destroy_pr+0x28/0x60 [kvm_pr]
+[c00000036da07ae0] c0080000009eab8c kvmppc_mmu_destroy+0x34/0x50 [kvm]
+[c00000036da07b00] c0080000009e50c0 kvm_arch_vcpu_destroy+0x108/0x140 [kvm]
+[c00000036da07b30] c0080000009d1b50 kvm_vcpu_destroy+0x28/0x80 [kvm]
+[c00000036da07b60] c0080000009e4434 kvm_arch_destroy_vm+0xbc/0x190 [kvm]
+[c00000036da07ba0] c0080000009d9c2c kvm_put_kvm+0x1d4/0x3f0 [kvm]
+[c00000036da07c00] c0080000009da760 kvm_vm_release+0x38/0x60 [kvm]
+[c00000036da07c30] c000000000420be0 __fput+0xe0/0x310
+[c00000036da07c90] c0000000001747a0 task_work_run+0x150/0x1c0
+[c00000036da07cf0] c00000000014896c do_exit+0x44c/0xd00
+[c00000036da07dc0] c0000000001492f4 do_group_exit+0x64/0xd0
+[c00000036da07e00] c000000000149384 sys_exit_group+0x24/0x30
+[c00000036da07e20] c00000000000b9d0 system_call+0x5c/0x68
+
+This is caused by a use-after-free in kvmppc_mmu_pte_flush_all()
+which dereferences vcpu->arch.book3s which was previously freed by
+kvmppc_core_vcpu_free_pr(). This happens because kvmppc_mmu_destroy()
+is called after kvmppc_core_vcpu_free() since commit ff030fdf5573
+("KVM: PPC: Move kvm_vcpu_init() invocation to common code").
+
+The kvmppc_mmu_destroy() helper calls one of the following depending
+on the KVM backend:
+
+- kvmppc_mmu_destroy_hv() which does nothing (Book3s HV)
+
+- kvmppc_mmu_destroy_pr() which undoes the effects of
+  kvmppc_mmu_init() (Book3s PR 32-bit)
+
+- kvmppc_mmu_destroy_pr() which undoes the effects of
+  kvmppc_mmu_init() (Book3s PR 64-bit)
+
+- kvmppc_mmu_destroy_e500() which does nothing (BookE e500/e500mc)
+
+It turns out that this is only relevant to PR KVM actually. And both
+32 and 64 backends need vcpu->arch.book3s to be valid when calling
+kvmppc_mmu_destroy_pr(). So instead of calling kvmppc_mmu_destroy()
+from kvm_arch_vcpu_destroy(), call kvmppc_mmu_destroy_pr() at the
+beginning of kvmppc_core_vcpu_free_pr(). This is consistent with
+kvmppc_mmu_init() being the last call in kvmppc_core_vcpu_create_pr().
+
+For the same reason, if kvmppc_core_vcpu_create_pr() returns an
+error then this means that kvmppc_mmu_init() was either not called
+or failed, in which case kvmppc_mmu_destroy() should not be called.
+Drop the line in the error path of kvm_arch_vcpu_create().
+
+Fixes: ff030fdf5573 ("KVM: PPC: Move kvm_vcpu_init() invocation to common code")
+	Signed-off-by: Greg Kurz <groug@kaod.org>
+	Reviewed-by: Sean Christopherson <sean.j.christopherson@intel.com>
+	Signed-off-by: Michael Ellerman <mpe@ellerman.id.au>
+Link: https://lore.kernel.org/r/158455341029.178873.15248663726399374882.stgit@bahia.lan
+(cherry picked from commit 1d0c32ec3b860a32df593a22bad0d1dbc5546a59)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/powerpc/kvm/powerpc.c
+diff --cc arch/powerpc/kvm/powerpc.c
+index ad5a8fa98211,302e9dccdd6d..000000000000
+--- a/arch/powerpc/kvm/powerpc.c
++++ b/arch/powerpc/kvm/powerpc.c
+@@@ -736,17 -752,15 +736,23 @@@ struct kvm_vcpu *kvm_arch_vcpu_create(s
+  
+  	err = kvmppc_core_vcpu_create(vcpu);
+  	if (err)
+ -		goto out_vcpu_uninit;
+ +		goto uninit_vcpu;
+  
+  	vcpu->arch.wqp = &vcpu->wq;
+ -	kvmppc_create_vcpu_debugfs(vcpu, vcpu->vcpu_id);
+ -	return 0;
+ -
+ +	kvmppc_create_vcpu_debugfs(vcpu, id);
+ +	return vcpu;
+ +
+++<<<<<<< HEAD
+ +uninit_vcpu:
+ +	kvm_vcpu_uninit(vcpu);
+ +free_vcpu:
+ +	kmem_cache_free(kvm_vcpu_cache, vcpu);
+ +	return ERR_PTR(err);
+++=======
++ out_vcpu_uninit:
++ 	kvmppc_subarch_vcpu_uninit(vcpu);
++ 	return err;
+++>>>>>>> 1d0c32ec3b86 (KVM: PPC: Fix kernel crash with PR KVM)
+  }
+  
+  void kvm_arch_vcpu_postcreate(struct kvm_vcpu *vcpu)
+@@@ -777,9 -791,7 +783,13 @@@ void kvm_arch_vcpu_destroy(struct kvm_v
+  
+  	kvmppc_core_vcpu_free(vcpu);
+  
+++<<<<<<< HEAD
+ +	kvm_vcpu_uninit(vcpu);
+ +
+ +	kmem_cache_free(kvm_vcpu_cache, vcpu);
+++=======
++ 	kvmppc_subarch_vcpu_uninit(vcpu);
+++>>>>>>> 1d0c32ec3b86 (KVM: PPC: Fix kernel crash with PR KVM)
+  }
+  
+  int kvm_cpu_has_pending_timer(struct kvm_vcpu *vcpu)
+diff --git a/arch/powerpc/kvm/book3s_pr.c b/arch/powerpc/kvm/book3s_pr.c
+index aea6b5f43477..00497eb53710 100644
+--- a/arch/powerpc/kvm/book3s_pr.c
++++ b/arch/powerpc/kvm/book3s_pr.c
+@@ -1784,6 +1784,7 @@ static void kvmppc_core_vcpu_free_pr(struct kvm_vcpu *vcpu)
+ {
+ 	struct kvmppc_vcpu_book3s *vcpu_book3s = to_book3s(vcpu);
+ 
++	kvmppc_mmu_destroy_pr(vcpu);
+ 	free_page((unsigned long)vcpu->arch.shared & PAGE_MASK);
+ #ifdef CONFIG_KVM_BOOK3S_32_HANDLER
+ 	kfree(vcpu->arch.shadow_vcpu);
+* Unmerged path arch/powerpc/kvm/powerpc.c
