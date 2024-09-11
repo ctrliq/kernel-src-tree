@@ -1,0 +1,243 @@
+nvme: use driver pdu command for passthrough
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-358.el8
+commit-author Keith Busch <kbusch@kernel.org>
+commit f4b9e6c90c572519041f4c5d9c4c3dd50aff42d4
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-358.el8/f4b9e6c9.failed
+
+All nvme transport drivers preallocate an nvme command for each request.
+Assume to use that command for nvme_setup_cmd() instead of requiring
+drivers pass a pointer to it. All nvme drivers must initialize the
+generic nvme_request 'cmd' to point to the transport's preallocated
+nvme_command.
+
+The generic nvme_request cmd pointer had previously been used only as a
+temporary copy for passthrough commands. Since it now points to the
+command that gets dispatched, passthrough commands must directly set it
+up prior to executing the request.
+
+	Signed-off-by: Keith Busch <kbusch@kernel.org>
+	Reviewed-by: Jens Axboe <axboe@kernel.dk>
+	Reviewed-by: Himanshu Madhani <himanshu.madhani@oracle.com>
+	Signed-off-by: Christoph Hellwig <hch@lst.de>
+(cherry picked from commit f4b9e6c90c572519041f4c5d9c4c3dd50aff42d4)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/nvme/host/pci.c
+diff --cc drivers/nvme/host/pci.c
+index 69a84b00b954,d47bb18b976a..000000000000
+--- a/drivers/nvme/host/pci.c
++++ b/drivers/nvme/host/pci.c
+@@@ -858,7 -933,7 +859,11 @@@ static blk_status_t nvme_queue_rq(struc
+  	if (unlikely(!test_bit(NVMEQ_ENABLED, &nvmeq->flags)))
+  		return BLK_STS_IOERR;
+  
+++<<<<<<< HEAD
+ +	ret = nvme_setup_cmd(ns, req, &cmnd);
+++=======
++ 	ret = nvme_setup_cmd(ns, req);
+++>>>>>>> f4b9e6c90c57 (nvme: use driver pdu command for passthrough)
+  	if (ret)
+  		return ret;
+  
+diff --git a/drivers/nvme/host/core.c b/drivers/nvme/host/core.c
+index a3b233f500f9..6275707de341 100644
+--- a/drivers/nvme/host/core.c
++++ b/drivers/nvme/host/core.c
+@@ -621,6 +621,9 @@ EXPORT_SYMBOL_GPL(nvme_put_ns);
+ 
+ static inline void nvme_clear_nvme_request(struct request *req)
+ {
++	struct nvme_command *cmd = nvme_req(req)->cmd;
++
++	memset(cmd, 0, sizeof(*cmd));
+ 	nvme_req(req)->retries = 0;
+ 	nvme_req(req)->flags = 0;
+ 	req->rq_flags |= RQF_DONTPREP;
+@@ -639,9 +642,12 @@ static inline void nvme_init_request(struct request *req,
+ 	else /* no queuedata implies admin queue */
+ 		req->timeout = NVME_ADMIN_TIMEOUT;
+ 
++	/* passthru commands should let the driver set the SGL flags */
++	cmd->common.flags &= ~NVME_CMD_SGL_ALL;
++
+ 	req->cmd_flags |= REQ_FAILFAST_DRIVER;
+ 	nvme_clear_nvme_request(req);
+-	nvme_req(req)->cmd = cmd;
++	memcpy(nvme_req(req)->cmd, cmd, sizeof(*cmd));
+ }
+ 
+ struct request *nvme_alloc_request(struct request_queue *q,
+@@ -770,14 +776,6 @@ static void nvme_assign_write_stream(struct nvme_ctrl *ctrl,
+ 		req->q->write_hints[streamid] += blk_rq_bytes(req) >> 9;
+ }
+ 
+-static inline void nvme_setup_passthrough(struct request *req,
+-		struct nvme_command *cmd)
+-{
+-	memcpy(cmd, nvme_req(req)->cmd, sizeof(*cmd));
+-	/* passthru commands should let the driver set the SGL flags */
+-	cmd->common.flags &= ~NVME_CMD_SGL_ALL;
+-}
+-
+ static inline void nvme_setup_flush(struct nvme_ns *ns,
+ 		struct nvme_command *cmnd)
+ {
+@@ -931,19 +929,18 @@ void nvme_cleanup_cmd(struct request *req)
+ }
+ EXPORT_SYMBOL_GPL(nvme_cleanup_cmd);
+ 
+-blk_status_t nvme_setup_cmd(struct nvme_ns *ns, struct request *req,
+-		struct nvme_command *cmd)
++blk_status_t nvme_setup_cmd(struct nvme_ns *ns, struct request *req)
+ {
++	struct nvme_command *cmd = nvme_req(req)->cmd;
+ 	blk_status_t ret = BLK_STS_OK;
+ 
+ 	if (!(req->rq_flags & RQF_DONTPREP))
+ 		nvme_clear_nvme_request(req);
+ 
+-	memset(cmd, 0, sizeof(*cmd));
+ 	switch (req_op(req)) {
+ 	case REQ_OP_DRV_IN:
+ 	case REQ_OP_DRV_OUT:
+-		nvme_setup_passthrough(req, cmd);
++		/* these are setup prior to execution in nvme_init_request() */
+ 		break;
+ 	case REQ_OP_FLUSH:
+ 		nvme_setup_flush(ns, cmd);
+diff --git a/drivers/nvme/host/fc.c b/drivers/nvme/host/fc.c
+index 5d384c7a691e..2bfdc856e96f 100644
+--- a/drivers/nvme/host/fc.c
++++ b/drivers/nvme/host/fc.c
+@@ -2128,6 +2128,7 @@ nvme_fc_init_request(struct blk_mq_tag_set *set, struct request *rq,
+ 	op->op.fcp_req.first_sgl = op->sgl;
+ 	op->op.fcp_req.private = &op->priv[0];
+ 	nvme_req(rq)->ctrl = &ctrl->ctrl;
++	nvme_req(rq)->cmd = &op->op.cmd_iu.sqe;
+ 	return res;
+ }
+ 
+@@ -2759,8 +2760,6 @@ nvme_fc_queue_rq(struct blk_mq_hw_ctx *hctx,
+ 	struct nvme_fc_ctrl *ctrl = queue->ctrl;
+ 	struct request *rq = bd->rq;
+ 	struct nvme_fc_fcp_op *op = blk_mq_rq_to_pdu(rq);
+-	struct nvme_fc_cmd_iu *cmdiu = &op->cmd_iu;
+-	struct nvme_command *sqe = &cmdiu->sqe;
+ 	enum nvmefc_fcp_datadir	io_dir;
+ 	bool queue_ready = test_bit(NVME_FC_Q_LIVE, &queue->flags);
+ 	u32 data_len;
+@@ -2770,7 +2769,7 @@ nvme_fc_queue_rq(struct blk_mq_hw_ctx *hctx,
+ 	    !nvmf_check_ready(&queue->ctrl->ctrl, rq, queue_ready))
+ 		return nvmf_fail_nonready_command(&queue->ctrl->ctrl, rq);
+ 
+-	ret = nvme_setup_cmd(ns, rq, sqe);
++	ret = nvme_setup_cmd(ns, rq);
+ 	if (ret)
+ 		return ret;
+ 
+diff --git a/drivers/nvme/host/nvme.h b/drivers/nvme/host/nvme.h
+index 6299d4f17651..f5dfa85cab8a 100644
+--- a/drivers/nvme/host/nvme.h
++++ b/drivers/nvme/host/nvme.h
+@@ -620,8 +620,7 @@ void nvme_start_freeze(struct nvme_ctrl *ctrl);
+ struct request *nvme_alloc_request(struct request_queue *q,
+ 		struct nvme_command *cmd, blk_mq_req_flags_t flags);
+ void nvme_cleanup_cmd(struct request *req);
+-blk_status_t nvme_setup_cmd(struct nvme_ns *ns, struct request *req,
+-		struct nvme_command *cmd);
++blk_status_t nvme_setup_cmd(struct nvme_ns *ns, struct request *req);
+ int nvme_submit_sync_cmd(struct request_queue *q, struct nvme_command *cmd,
+ 		void *buf, unsigned bufflen);
+ int __nvme_submit_sync_cmd(struct request_queue *q, struct nvme_command *cmd,
+* Unmerged path drivers/nvme/host/pci.c
+diff --git a/drivers/nvme/host/rdma.c b/drivers/nvme/host/rdma.c
+index 6bb5dfb8f083..a18f52a5feec 100644
+--- a/drivers/nvme/host/rdma.c
++++ b/drivers/nvme/host/rdma.c
+@@ -330,6 +330,7 @@ static int nvme_rdma_init_request(struct blk_mq_tag_set *set,
+ 			NVME_RDMA_DATA_SGL_SIZE;
+ 
+ 	req->queue = queue;
++	nvme_req(rq)->cmd = req->sqe.data;
+ 
+ 	return 0;
+ }
+@@ -2062,7 +2063,7 @@ static blk_status_t nvme_rdma_queue_rq(struct blk_mq_hw_ctx *hctx,
+ 	struct request *rq = bd->rq;
+ 	struct nvme_rdma_request *req = blk_mq_rq_to_pdu(rq);
+ 	struct nvme_rdma_qe *sqe = &req->sqe;
+-	struct nvme_command *c = sqe->data;
++	struct nvme_command *c = nvme_req(rq)->cmd;
+ 	struct ib_device *dev;
+ 	bool queue_ready = test_bit(NVME_RDMA_Q_LIVE, &queue->flags);
+ 	blk_status_t ret;
+@@ -2085,7 +2086,7 @@ static blk_status_t nvme_rdma_queue_rq(struct blk_mq_hw_ctx *hctx,
+ 	ib_dma_sync_single_for_cpu(dev, sqe->dma,
+ 			sizeof(struct nvme_command), DMA_TO_DEVICE);
+ 
+-	ret = nvme_setup_cmd(ns, rq, c);
++	ret = nvme_setup_cmd(ns, rq);
+ 	if (ret)
+ 		goto unmap_qe;
+ 
+diff --git a/drivers/nvme/host/tcp.c b/drivers/nvme/host/tcp.c
+index 76c2bc731f89..398f205de31f 100644
+--- a/drivers/nvme/host/tcp.c
++++ b/drivers/nvme/host/tcp.c
+@@ -412,6 +412,7 @@ static int nvme_tcp_init_request(struct blk_mq_tag_set *set,
+ {
+ 	struct nvme_tcp_ctrl *ctrl = set->driver_data;
+ 	struct nvme_tcp_request *req = blk_mq_rq_to_pdu(rq);
++	struct nvme_tcp_cmd_pdu *pdu;
+ 	int queue_idx = (set == &ctrl->tag_set) ? hctx_idx + 1 : 0;
+ 	struct nvme_tcp_queue *queue = &ctrl->queues[queue_idx];
+ 	u8 hdgst = nvme_tcp_hdgst_len(queue);
+@@ -422,8 +423,10 @@ static int nvme_tcp_init_request(struct blk_mq_tag_set *set,
+ 	if (!req->pdu)
+ 		return -ENOMEM;
+ 
++	pdu = req->pdu;
+ 	req->queue = queue;
+ 	nvme_req(rq)->ctrl = &ctrl->ctrl;
++	nvme_req(rq)->cmd = &pdu->cmd;
+ 
+ 	return 0;
+ }
+@@ -2265,7 +2268,7 @@ static blk_status_t nvme_tcp_setup_cmd_pdu(struct nvme_ns *ns,
+ 	u8 hdgst = nvme_tcp_hdgst_len(queue), ddgst = 0;
+ 	blk_status_t ret;
+ 
+-	ret = nvme_setup_cmd(ns, rq, &pdu->cmd);
++	ret = nvme_setup_cmd(ns, rq);
+ 	if (ret)
+ 		return ret;
+ 
+diff --git a/drivers/nvme/target/loop.c b/drivers/nvme/target/loop.c
+index e11ee1447e56..a3ed569e6965 100644
+--- a/drivers/nvme/target/loop.c
++++ b/drivers/nvme/target/loop.c
+@@ -149,7 +149,7 @@ static blk_status_t nvme_loop_queue_rq(struct blk_mq_hw_ctx *hctx,
+ 	if (!nvmf_check_ready(&queue->ctrl->ctrl, req, queue_ready))
+ 		return nvmf_fail_nonready_command(&queue->ctrl->ctrl, req);
+ 
+-	ret = nvme_setup_cmd(ns, req, &iod->cmd);
++	ret = nvme_setup_cmd(ns, req);
+ 	if (ret)
+ 		return ret;
+ 
+@@ -213,8 +213,10 @@ static int nvme_loop_init_request(struct blk_mq_tag_set *set,
+ 		unsigned int numa_node)
+ {
+ 	struct nvme_loop_ctrl *ctrl = set->driver_data;
++	struct nvme_loop_iod *iod = blk_mq_rq_to_pdu(req);
+ 
+ 	nvme_req(req)->ctrl = &ctrl->ctrl;
++	nvme_req(req)->cmd = &iod->cmd;
+ 	return nvme_loop_init_iod(ctrl, blk_mq_rq_to_pdu(req),
+ 			(set == &ctrl->tag_set) ? hctx_idx + 1 : 0);
+ }
