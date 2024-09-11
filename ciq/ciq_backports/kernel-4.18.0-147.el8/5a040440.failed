@@ -1,0 +1,172 @@
+drm/i915: Fix legacy gamma mode for ICL
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-147.el8
+commit-author Ville Syrjälä <ville.syrjala@linux.intel.com>
+commit 5a0404408d3266fa3116979297b3bb47fdb9dc0b
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-147.el8/5a040440.failed
+
+We must remember to actually enable the post CSC gamma if
+we expect the legacy LUT to work. Seems to fix NV12 crc
+tests on the SDR planes. Curiously we apparently managed to
+get 100% match for the HDR planes even without chopping
+off the low bits.
+
+	Cc: Uma Shankar <uma.shankar@intel.com>
+	Signed-off-by: Ville Syrjälä <ville.syrjala@linux.intel.com>
+Link: https://patchwork.freedesktop.org/patch/msgid/20190315195445.26527-1-ville.syrjala@linux.intel.com
+	Reviewed-by: Maarten Lankhorst <maarten.lankhorst@linux.intel.com>
+(cherry picked from commit 5a0404408d3266fa3116979297b3bb47fdb9dc0b)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/gpu/drm/i915/intel_color.c
+diff --cc drivers/gpu/drm/i915/intel_color.c
+index 6218c9abc57c,467fd1a1630c..000000000000
+--- a/drivers/gpu/drm/i915/intel_color.c
++++ b/drivers/gpu/drm/i915/intel_color.c
+@@@ -624,48 -800,104 +624,83 @@@ int intel_color_check(struct drm_crtc *
+  
+  	degamma_length = INTEL_INFO(dev_priv)->color.degamma_lut_size;
+  	gamma_length = INTEL_INFO(dev_priv)->color.gamma_lut_size;
+ -	degamma_tests = INTEL_INFO(dev_priv)->color.degamma_lut_tests;
+ -	gamma_tests = INTEL_INFO(dev_priv)->color.gamma_lut_tests;
+  
+++<<<<<<< HEAD
+ +	/*
+ +	 * We allow both degamma & gamma luts at the right size or
+ +	 * NULL.
+ +	 */
+ +	if ((!crtc_state->degamma_lut ||
+ +	     drm_color_lut_size(crtc_state->degamma_lut) == degamma_length) &&
+ +	    (!crtc_state->gamma_lut ||
+ +	     drm_color_lut_size(crtc_state->gamma_lut) == gamma_length))
+++=======
++ 	/* C8 needs the legacy LUT all to itself */
++ 	if (crtc_state->c8_planes &&
++ 	    !crtc_state_is_legacy_gamma(crtc_state))
++ 		return -EINVAL;
++ 
++ 	crtc_state->gamma_enable = (gamma_lut || degamma_lut) &&
++ 		!crtc_state->c8_planes;
++ 
++ 	if (INTEL_GEN(dev_priv) >= 9 ||
++ 	    IS_BROADWELL(dev_priv) || IS_HASWELL(dev_priv))
++ 		limited_color_range = crtc_state->limited_color_range;
++ 
++ 	crtc_state->csc_enable =
++ 		crtc_state->output_format != INTEL_OUTPUT_FORMAT_RGB ||
++ 		crtc_state->base.ctm || limited_color_range;
++ 
++ 	ret = intel_color_add_affected_planes(crtc_state);
++ 	if (ret)
++ 		return ret;
++ 
++ 	crtc_state->csc_mode = 0;
++ 
++ 	if (IS_CHERRYVIEW(dev_priv))
++ 		crtc_state->cgm_mode = chv_cgm_mode(crtc_state);
++ 
++ 	/* Always allow legacy gamma LUT with no further checking. */
++ 	if (!crtc_state->gamma_enable ||
++ 	    crtc_state_is_legacy_gamma(crtc_state)) {
++ 		crtc_state->gamma_mode = GAMMA_MODE_MODE_8BIT;
++ 		if (INTEL_GEN(dev_priv) >= 11 &&
++ 		    crtc_state->gamma_enable)
++ 			crtc_state->gamma_mode |= POST_CSC_GAMMA_ENABLE;
+++>>>>>>> 5a0404408d32 (drm/i915: Fix legacy gamma mode for ICL)
+  		return 0;
+ -	}
+ -
+ -	if (check_lut_size(degamma_lut, degamma_length) ||
+ -	    check_lut_size(gamma_lut, gamma_length))
+ -		return -EINVAL;
+ -
+ -	if (drm_color_lut_check(degamma_lut, degamma_tests) ||
+ -	    drm_color_lut_check(gamma_lut, gamma_tests))
+ -		return -EINVAL;
+ -
+ -	if (INTEL_GEN(dev_priv) >= 11)
+ -		crtc_state->gamma_mode = GAMMA_MODE_MODE_10BIT |
+ -					 PRE_CSC_GAMMA_ENABLE |
+ -					 POST_CSC_GAMMA_ENABLE;
+ -	else if (INTEL_GEN(dev_priv) >= 10 || IS_GEMINILAKE(dev_priv))
+ -		crtc_state->gamma_mode = GAMMA_MODE_MODE_10BIT;
+ -	else if (INTEL_GEN(dev_priv) >= 9 || IS_BROADWELL(dev_priv))
+ -		crtc_state->gamma_mode = GAMMA_MODE_MODE_SPLIT;
+ -	else
+ -		crtc_state->gamma_mode = GAMMA_MODE_MODE_8BIT;
+  
+ -	if (INTEL_GEN(dev_priv) >= 11) {
+ -		if (crtc_state->output_format != INTEL_OUTPUT_FORMAT_RGB ||
+ -		    crtc_state->limited_color_range)
+ -			crtc_state->csc_mode |= ICL_OUTPUT_CSC_ENABLE;
+ -
+ -		if (crtc_state->base.ctm)
+ -			crtc_state->csc_mode |= ICL_CSC_ENABLE;
+ -	}
+ +	/*
+ +	 * We also allow no degamma lut/ctm and a gamma lut at the legacy
+ +	 * size (256 entries).
+ +	 */
+ +	if (crtc_state_is_legacy_gamma(crtc_state))
+ +		return 0;
+  
+ -	return 0;
+ +	return -EINVAL;
+  }
+  
+ -void intel_color_init(struct intel_crtc *crtc)
+ +void intel_color_init(struct drm_crtc *crtc)
+  {
+ -	struct drm_i915_private *dev_priv = to_i915(crtc->base.dev);
+ -
+ -	drm_mode_crtc_set_gamma_size(&crtc->base, 256);
+ -
+ -	if (HAS_GMCH(dev_priv)) {
+ -		if (IS_CHERRYVIEW(dev_priv))
+ -			dev_priv->display.load_luts = cherryview_load_luts;
+ -		else
+ -			dev_priv->display.load_luts = i9xx_load_luts;
+ -
+ -		dev_priv->display.color_commit = i9xx_color_commit;
+ +	struct drm_i915_private *dev_priv = to_i915(crtc->dev);
+ +
+ +	drm_mode_crtc_set_gamma_size(crtc, 256);
+ +
+ +	if (IS_CHERRYVIEW(dev_priv)) {
+ +		dev_priv->display.load_csc_matrix = cherryview_load_csc_matrix;
+ +		dev_priv->display.load_luts = cherryview_load_luts;
+ +	} else if (IS_HASWELL(dev_priv)) {
+ +		dev_priv->display.load_csc_matrix = ilk_load_csc_matrix;
+ +		dev_priv->display.load_luts = haswell_load_luts;
+ +	} else if (IS_BROADWELL(dev_priv) || IS_GEN9_BC(dev_priv) ||
+ +		   IS_BROXTON(dev_priv)) {
+ +		dev_priv->display.load_csc_matrix = ilk_load_csc_matrix;
+ +		dev_priv->display.load_luts = broadwell_load_luts;
+ +	} else if (IS_GEMINILAKE(dev_priv) || IS_CANNONLAKE(dev_priv)) {
+ +		dev_priv->display.load_csc_matrix = ilk_load_csc_matrix;
+ +		dev_priv->display.load_luts = glk_load_luts;
+  	} else {
+ -		if (INTEL_GEN(dev_priv) >= 11)
+ -			dev_priv->display.load_luts = icl_load_luts;
+ -		else if (IS_CANNONLAKE(dev_priv) || IS_GEMINILAKE(dev_priv))
+ -			dev_priv->display.load_luts = glk_load_luts;
+ -		else if (INTEL_GEN(dev_priv) >= 9 || IS_BROADWELL(dev_priv))
+ -			dev_priv->display.load_luts = broadwell_load_luts;
+ -		else
+ -			dev_priv->display.load_luts = i9xx_load_luts;
+ -
+ -		if (INTEL_GEN(dev_priv) >= 9)
+ -			dev_priv->display.color_commit = skl_color_commit;
+ -		else if (IS_BROADWELL(dev_priv) || IS_HASWELL(dev_priv))
+ -			dev_priv->display.color_commit = hsw_color_commit;
+ -		else
+ -			dev_priv->display.color_commit = ilk_color_commit;
+ +		dev_priv->display.load_luts = i9xx_load_luts;
+  	}
+  
+  	/* Enable color management support when we have degamma & gamma LUTs. */
+* Unmerged path drivers/gpu/drm/i915/intel_color.c
