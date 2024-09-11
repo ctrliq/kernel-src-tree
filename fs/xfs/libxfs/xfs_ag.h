@@ -10,6 +10,23 @@
 struct xfs_mount;
 struct xfs_trans;
 
+/*
+ * Perag iteration APIs
+ */
+#define for_each_perag(mp, next_agno, pag) \
+	for ((next_agno) = 0, (pag) = xfs_perag_get((mp), 0); \
+		(pag) != NULL; \
+		(next_agno) = (pag)->pag_agno + 1, \
+		xfs_perag_put(pag), \
+		(pag) = xfs_perag_get((mp), (next_agno)))
+
+#define for_each_perag_tag(mp, next_agno, pag, tag) \
+	for ((next_agno) = 0, (pag) = xfs_perag_get_tag((mp), 0, (tag)); \
+		(pag) != NULL; \
+		(next_agno) = (pag)->pag_agno + 1, \
+		xfs_perag_put(pag), \
+		(pag) = xfs_perag_get_tag((mp), (next_agno), (tag)))
+
 struct aghdr_init_data {
 	/* per ag data */
 	xfs_agblock_t		agno;		/* ag to init */
