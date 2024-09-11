@@ -1,0 +1,217 @@
+ethtool: provide netdev features with FEATURES_GET request
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Michal Kubecek <mkubecek@suse.cz>
+commit 0524399d4612f5af38b8383680dde4df4bc4eea2
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/0524399d.failed
+
+Implement FEATURES_GET request to get network device features. These are
+traditionally available via ETHTOOL_GFEATURES ioctl request.
+
+v2:
+  - style cleanup suggested by Jakub Kicinski
+
+	Signed-off-by: Michal Kubecek <mkubecek@suse.cz>
+	Reviewed-by: Jakub Kicinski <kuba@kernel.org>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 0524399d4612f5af38b8383680dde4df4bc4eea2)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	Documentation/networking/ethtool-netlink.rst
+#	include/uapi/linux/ethtool_netlink.h
+#	net/ethtool/Makefile
+#	net/ethtool/netlink.c
+#	net/ethtool/netlink.h
+diff --cc net/ethtool/Makefile
+index f68387618973,5be8c9ab26d1..000000000000
+--- a/net/ethtool/Makefile
++++ b/net/ethtool/Makefile
+@@@ -1,3 -1,8 +1,12 @@@
+  # SPDX-License-Identifier: GPL-2.0-only
+  
+++<<<<<<< HEAD
+ +obj-y		+= ioctl.o common.o
+++=======
++ obj-y				+= ioctl.o common.o
++ 
++ obj-$(CONFIG_ETHTOOL_NETLINK)	+= ethtool_nl.o
++ 
++ ethtool_nl-y	:= netlink.o bitset.o strset.o linkinfo.o linkmodes.o \
++ 		   linkstate.o debug.o wol.o features.o
+++>>>>>>> 0524399d4612 (ethtool: provide netdev features with FEATURES_GET request)
+* Unmerged path Documentation/networking/ethtool-netlink.rst
+* Unmerged path include/uapi/linux/ethtool_netlink.h
+* Unmerged path net/ethtool/netlink.c
+* Unmerged path net/ethtool/netlink.h
+* Unmerged path Documentation/networking/ethtool-netlink.rst
+* Unmerged path include/uapi/linux/ethtool_netlink.h
+* Unmerged path net/ethtool/Makefile
+diff --git a/net/ethtool/common.h b/net/ethtool/common.h
+index bbb788908cb1..4ec641d06d94 100644
+--- a/net/ethtool/common.h
++++ b/net/ethtool/common.h
+@@ -5,6 +5,8 @@
+ 
+ #include <linux/ethtool.h>
+ 
++#define ETHTOOL_DEV_FEATURE_WORDS	DIV_ROUND_UP(NETDEV_FEATURE_COUNT, 32)
++
+ /* compose link mode index from speed, type and duplex */
+ #define ETHTOOL_LINK_MODE(speed, type, duplex) \
+ 	ETHTOOL_LINK_MODE_ ## speed ## base ## type ## _ ## duplex ## _BIT
+diff --git a/net/ethtool/features.c b/net/ethtool/features.c
+new file mode 100644
+index 000000000000..a0cc2b969053
+--- /dev/null
++++ b/net/ethtool/features.c
+@@ -0,0 +1,131 @@
++// SPDX-License-Identifier: GPL-2.0-only
++
++#include "netlink.h"
++#include "common.h"
++#include "bitset.h"
++
++struct features_req_info {
++	struct ethnl_req_info	base;
++};
++
++struct features_reply_data {
++	struct ethnl_reply_data	base;
++	u32			hw[ETHTOOL_DEV_FEATURE_WORDS];
++	u32			wanted[ETHTOOL_DEV_FEATURE_WORDS];
++	u32			active[ETHTOOL_DEV_FEATURE_WORDS];
++	u32			nochange[ETHTOOL_DEV_FEATURE_WORDS];
++	u32			all[ETHTOOL_DEV_FEATURE_WORDS];
++};
++
++#define FEATURES_REPDATA(__reply_base) \
++	container_of(__reply_base, struct features_reply_data, base)
++
++static const struct nla_policy
++features_get_policy[ETHTOOL_A_FEATURES_MAX + 1] = {
++	[ETHTOOL_A_FEATURES_UNSPEC]	= { .type = NLA_REJECT },
++	[ETHTOOL_A_FEATURES_HEADER]	= { .type = NLA_NESTED },
++	[ETHTOOL_A_FEATURES_HW]		= { .type = NLA_REJECT },
++	[ETHTOOL_A_FEATURES_WANTED]	= { .type = NLA_REJECT },
++	[ETHTOOL_A_FEATURES_ACTIVE]	= { .type = NLA_REJECT },
++	[ETHTOOL_A_FEATURES_NOCHANGE]	= { .type = NLA_REJECT },
++};
++
++static void ethnl_features_to_bitmap32(u32 *dest, netdev_features_t src)
++{
++	unsigned int i;
++
++	for (i = 0; i < ETHTOOL_DEV_FEATURE_WORDS; i++)
++		dest[i] = src >> (32 * i);
++}
++
++static int features_prepare_data(const struct ethnl_req_info *req_base,
++				 struct ethnl_reply_data *reply_base,
++				 struct genl_info *info)
++{
++	struct features_reply_data *data = FEATURES_REPDATA(reply_base);
++	struct net_device *dev = reply_base->dev;
++	netdev_features_t all_features;
++
++	ethnl_features_to_bitmap32(data->hw, dev->hw_features);
++	ethnl_features_to_bitmap32(data->wanted, dev->wanted_features);
++	ethnl_features_to_bitmap32(data->active, dev->features);
++	ethnl_features_to_bitmap32(data->nochange, NETIF_F_NEVER_CHANGE);
++	all_features = GENMASK_ULL(NETDEV_FEATURE_COUNT - 1, 0);
++	ethnl_features_to_bitmap32(data->all, all_features);
++
++	return 0;
++}
++
++static int features_reply_size(const struct ethnl_req_info *req_base,
++			       const struct ethnl_reply_data *reply_base)
++{
++	const struct features_reply_data *data = FEATURES_REPDATA(reply_base);
++	bool compact = req_base->flags & ETHTOOL_FLAG_COMPACT_BITSETS;
++	unsigned int len = 0;
++	int ret;
++
++	ret = ethnl_bitset32_size(data->hw, data->all, NETDEV_FEATURE_COUNT,
++				  netdev_features_strings, compact);
++	if (ret < 0)
++		return ret;
++	len += ret;
++	ret = ethnl_bitset32_size(data->wanted, NULL, NETDEV_FEATURE_COUNT,
++				  netdev_features_strings, compact);
++	if (ret < 0)
++		return ret;
++	len += ret;
++	ret = ethnl_bitset32_size(data->active, NULL, NETDEV_FEATURE_COUNT,
++				  netdev_features_strings, compact);
++	if (ret < 0)
++		return ret;
++	len += ret;
++	ret = ethnl_bitset32_size(data->nochange, NULL, NETDEV_FEATURE_COUNT,
++				  netdev_features_strings, compact);
++	if (ret < 0)
++		return ret;
++	len += ret;
++
++	return len;
++}
++
++static int features_fill_reply(struct sk_buff *skb,
++			       const struct ethnl_req_info *req_base,
++			       const struct ethnl_reply_data *reply_base)
++{
++	const struct features_reply_data *data = FEATURES_REPDATA(reply_base);
++	bool compact = req_base->flags & ETHTOOL_FLAG_COMPACT_BITSETS;
++	int ret;
++
++	ret = ethnl_put_bitset32(skb, ETHTOOL_A_FEATURES_HW, data->hw,
++				 data->all, NETDEV_FEATURE_COUNT,
++				 netdev_features_strings, compact);
++	if (ret < 0)
++		return ret;
++	ret = ethnl_put_bitset32(skb, ETHTOOL_A_FEATURES_WANTED, data->wanted,
++				 NULL, NETDEV_FEATURE_COUNT,
++				 netdev_features_strings, compact);
++	if (ret < 0)
++		return ret;
++	ret = ethnl_put_bitset32(skb, ETHTOOL_A_FEATURES_ACTIVE, data->active,
++				 NULL, NETDEV_FEATURE_COUNT,
++				 netdev_features_strings, compact);
++	if (ret < 0)
++		return ret;
++	return ethnl_put_bitset32(skb, ETHTOOL_A_FEATURES_NOCHANGE,
++				  data->nochange, NULL, NETDEV_FEATURE_COUNT,
++				  netdev_features_strings, compact);
++}
++
++const struct ethnl_request_ops ethnl_features_request_ops = {
++	.request_cmd		= ETHTOOL_MSG_FEATURES_GET,
++	.reply_cmd		= ETHTOOL_MSG_FEATURES_GET_REPLY,
++	.hdr_attr		= ETHTOOL_A_FEATURES_HEADER,
++	.max_attr		= ETHTOOL_A_FEATURES_MAX,
++	.req_info_size		= sizeof(struct features_req_info),
++	.reply_data_size	= sizeof(struct features_reply_data),
++	.request_policy		= features_get_policy,
++
++	.prepare_data		= features_prepare_data,
++	.reply_size		= features_reply_size,
++	.fill_reply		= features_fill_reply,
++};
+diff --git a/net/ethtool/ioctl.c b/net/ethtool/ioctl.c
+index 093ecc4fca15..67062db096e3 100644
+--- a/net/ethtool/ioctl.c
++++ b/net/ethtool/ioctl.c
+@@ -61,8 +61,6 @@ EXPORT_SYMBOL(ethtool_op_get_ts_info);
+ 
+ /* Handlers for each ethtool command */
+ 
+-#define ETHTOOL_DEV_FEATURE_WORDS	((NETDEV_FEATURE_COUNT + 31) / 32)
+-
+ static int ethtool_get_features(struct net_device *dev, void __user *useraddr)
+ {
+ 	struct ethtool_gfeatures cmd = {
+* Unmerged path net/ethtool/netlink.c
+* Unmerged path net/ethtool/netlink.h
