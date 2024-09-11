@@ -1,0 +1,128 @@
+ASoC: soc-component: move snd_soc_component_stream_event()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-193.el8
+Rebuild_CHGLOG: - [sound] ALSA: ASoC: soc-component: move snd_soc_component_stream_event() (Jaroslav Kysela) [1738610]
+Rebuild_FUZZ: 95.08%
+commit-author Kuninori Morimoto <kuninori.morimoto.gx@renesas.com>
+commit 8e2a990d76aced95c6f01c2d67d8835c86f0ca67
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-193.el8/8e2a990d.failed
+
+Current soc-dapm / soc-core are using a long way round to call
+.stream_event.
+
+	if (driver->stream_event)
+		dapm->stream_event = ...;
+	...
+	if (dapm->stream_event)
+		ret = dapm->stream_event(...);
+
+We can directly call it via driver->stream_event.
+One note here is that both Card and Component have dapm,
+but, Card's dapm doesn't have dapm->component.
+We need to check it.
+
+This patch moves snd_soc_component_stream_event() to soc-component.c
+and updates parameters.
+dapm->stream_event is no longer needed
+
+	Signed-off-by: Kuninori Morimoto <kuninori.morimoto.gx@renesas.com>
+Link: https://lore.kernel.org/r/87v9vp4d0r.wl-kuninori.morimoto.gx@renesas.com
+	Signed-off-by: Mark Brown <broonie@kernel.org>
+(cherry picked from commit 8e2a990d76aced95c6f01c2d67d8835c86f0ca67)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/sound/soc-component.h
+#	sound/soc/soc-component.c
+#	sound/soc/soc-core.c
+diff --cc sound/soc/soc-core.c
+index 279fcb0cb18d,8cfbe5fb5921..000000000000
+--- a/sound/soc/soc-core.c
++++ b/sound/soc/soc-core.c
+@@@ -3090,22 -2646,6 +3090,25 @@@ int snd_soc_register_dai(struct snd_soc
+  }
+  EXPORT_SYMBOL_GPL(snd_soc_register_dai);
+  
+++<<<<<<< HEAD
+ +static void snd_soc_component_seq_notifier(struct snd_soc_dapm_context *dapm,
+ +	enum snd_soc_dapm_type type, int subseq)
+ +{
+ +	struct snd_soc_component *component = dapm->component;
+ +
+ +	component->driver->seq_notifier(component, type, subseq);
+ +}
+ +
+ +static int snd_soc_component_stream_event(struct snd_soc_dapm_context *dapm,
+ +	int event)
+ +{
+ +	struct snd_soc_component *component = dapm->component;
+ +
+ +	return component->driver->stream_event(component, event);
+ +}
+ +
+++=======
+++>>>>>>> 8e2a990d76ac (ASoC: soc-component: move snd_soc_component_stream_event())
+  static int snd_soc_component_set_bias_level(struct snd_soc_dapm_context *dapm,
+  					enum snd_soc_bias_level level)
+  {
+@@@ -3134,10 -2674,6 +3137,13 @@@ static int snd_soc_component_initialize
+  	dapm->bias_level = SND_SOC_BIAS_OFF;
+  	dapm->idle_bias_off = !driver->idle_bias_on;
+  	dapm->suspend_bias_off = driver->suspend_bias_off;
+++<<<<<<< HEAD
+ +	if (driver->seq_notifier)
+ +		dapm->seq_notifier = snd_soc_component_seq_notifier;
+ +	if (driver->stream_event)
+ +		dapm->stream_event = snd_soc_component_stream_event;
+++=======
+++>>>>>>> 8e2a990d76ac (ASoC: soc-component: move snd_soc_component_stream_event())
+  	if (driver->set_bias_level)
+  		dapm->set_bias_level = snd_soc_component_set_bias_level;
+  
+* Unmerged path include/sound/soc-component.h
+* Unmerged path sound/soc/soc-component.c
+* Unmerged path include/sound/soc-component.h
+diff --git a/include/sound/soc-dapm.h b/include/sound/soc-dapm.h
+index c00a0b8ade08..25e844590308 100644
+--- a/include/sound/soc-dapm.h
++++ b/include/sound/soc-dapm.h
+@@ -670,7 +670,6 @@ struct snd_soc_dapm_context {
+ 	enum snd_soc_bias_level target_bias_level;
+ 	struct list_head list;
+ 
+-	int (*stream_event)(struct snd_soc_dapm_context *dapm, int event);
+ 	int (*set_bias_level)(struct snd_soc_dapm_context *dapm,
+ 			      enum snd_soc_bias_level level);
+ 
+* Unmerged path sound/soc/soc-component.c
+* Unmerged path sound/soc/soc-core.c
+diff --git a/sound/soc/soc-dapm.c b/sound/soc/soc-dapm.c
+index 7874989d43fc..6370dab8530e 100644
+--- a/sound/soc/soc-dapm.c
++++ b/sound/soc/soc-dapm.c
+@@ -1936,6 +1936,7 @@ static int dapm_power_widgets(struct snd_soc_card *card, int event)
+ 	LIST_HEAD(down_list);
+ 	ASYNC_DOMAIN_EXCLUSIVE(async_domain);
+ 	enum snd_soc_bias_level bias;
++	int ret;
+ 
+ 	lockdep_assert_held(&card->dapm_mutex);
+ 
+@@ -2052,8 +2053,12 @@ static int dapm_power_widgets(struct snd_soc_card *card, int event)
+ 
+ 	/* do we need to notify any clients that DAPM event is complete */
+ 	list_for_each_entry(d, &card->dapm_list, list) {
+-		if (d->stream_event)
+-			d->stream_event(d, event);
++		if (!d->component)
++			continue;
++
++		ret = snd_soc_component_stream_event(d->component, event);
++		if (ret < 0)
++			return ret;
+ 	}
+ 
+ 	pop_dbg(card->dev, card->pop_time,
