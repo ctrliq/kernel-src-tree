@@ -1,0 +1,275 @@
+drm/i915/gvt: Change from vfio_group_(un)pin_pages to vfio_(un)pin_pages
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-448.el8
+Rebuild_CHGLOG: - Revert "drm/i915/gvt: Change from vfio_group_(un)pin_pages to vfio_(un)pin_pages" (Jocelyn Falempe) [2115880]
+Rebuild_FUZZ: 94.12%
+commit-author Jason Gunthorpe <jgg@nvidia.com>
+commit 5eb20a78c032da9c5d00090953c1bed6c4e3f143
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-448.el8/5eb20a78.failed
+
+Use the existing vfio_device versions of vfio_(un)pin_pages(). There is no
+reason to use a group interface here, kvmgt has easy access to a
+vfio_device.
+
+Delete kvmgt_vdev::vfio_group since these calls were the last users.
+
+	Reviewed-by: Kevin Tian <kevin.tian@intel.com>
+	Reviewed-by: Christoph Hellwig <hch@lst.de>
+	Signed-off-by: Jason Gunthorpe <jgg@nvidia.com>
+	Acked-by: Zhi Wang <zhi.a.wang@intel.com>
+Link: https://lore.kernel.org/r/5-v4-8045e76bf00b+13d-vfio_mdev_no_group_jgg@nvidia.com
+	Signed-off-by: Alex Williamson <alex.williamson@redhat.com>
+(cherry picked from commit 5eb20a78c032da9c5d00090953c1bed6c4e3f143)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/gpu/drm/i915/gvt/gvt.h
+#	drivers/gpu/drm/i915/gvt/kvmgt.c
+diff --cc drivers/gpu/drm/i915/gvt/gvt.h
+index 0c0615602343,2af4c83e733c..000000000000
+--- a/drivers/gpu/drm/i915/gvt/gvt.h
++++ b/drivers/gpu/drm/i915/gvt/gvt.h
+@@@ -218,13 -210,34 +218,42 @@@ struct intel_vgpu 
+  	struct intel_vgpu_vblank_timer vblank_timer;
+  
+  	u32 scan_nonprivbb;
+++<<<<<<< HEAD
+++=======
++ 
++ 	struct vfio_device vfio_device;
++ 	struct vfio_region *region;
++ 	int num_regions;
++ 	struct eventfd_ctx *intx_trigger;
++ 	struct eventfd_ctx *msi_trigger;
++ 
++ 	/*
++ 	 * Two caches are used to avoid mapping duplicated pages (eg.
++ 	 * scratch pages). This help to reduce dma setup overhead.
++ 	 */
++ 	struct rb_root gfn_cache;
++ 	struct rb_root dma_addr_cache;
++ 	unsigned long nr_cache_entries;
++ 	struct mutex cache_lock;
++ 
++ 	struct notifier_block iommu_notifier;
++ 	struct notifier_block group_notifier;
++ 	struct kvm *kvm;
++ 	struct work_struct release_work;
++ 	atomic_t released;
++ 
++ 	struct kvm_page_track_notifier_node track_node;
++ #define NR_BKT (1 << 18)
++ 	struct hlist_head ptable[NR_BKT];
++ #undef NR_BKT
+++>>>>>>> 5eb20a78c032 (drm/i915/gvt: Change from vfio_group_(un)pin_pages to vfio_(un)pin_pages)
+  };
+  
+ +static inline void *intel_vgpu_vdev(struct intel_vgpu *vgpu)
+ +{
+ +	return vgpu->vdev;
+ +}
+ +
+  /* validating GM healthy status*/
+  #define vgpu_is_vm_unhealthy(ret_val) \
+  	(((ret_val) == -EBADRQC) || ((ret_val) == -EFAULT))
+diff --cc drivers/gpu/drm/i915/gvt/kvmgt.c
+index 5bd0c74fc4ad,7655ffa97d51..000000000000
+--- a/drivers/gpu/drm/i915/gvt/kvmgt.c
++++ b/drivers/gpu/drm/i915/gvt/kvmgt.c
+@@@ -270,7 -243,7 +270,11 @@@ static void gvt_unpin_guest_page(struc
+  	for (npage = 0; npage < total_pages; npage++) {
+  		unsigned long cur_gfn = gfn + npage;
+  
+++<<<<<<< HEAD
+ +		ret = vfio_group_unpin_pages(vdev->vfio_group, &cur_gfn, 1);
+++=======
++ 		ret = vfio_unpin_pages(&vgpu->vfio_device, &cur_gfn, 1);
+++>>>>>>> 5eb20a78c032 (drm/i915/gvt: Change from vfio_group_(un)pin_pages to vfio_(un)pin_pages)
+  		drm_WARN_ON(&i915->drm, ret != 1);
+  	}
+  }
+@@@ -294,8 -266,8 +298,13 @@@ static int gvt_pin_guest_page(struct in
+  		unsigned long cur_gfn = gfn + npage;
+  		unsigned long pfn;
+  
+++<<<<<<< HEAD
+ +		ret = vfio_group_pin_pages(vdev->vfio_group, &cur_gfn, 1,
+ +					   IOMMU_READ | IOMMU_WRITE, &pfn);
+++=======
++ 		ret = vfio_pin_pages(&vgpu->vfio_device, &cur_gfn, 1,
++ 				     IOMMU_READ | IOMMU_WRITE, &pfn);
+++>>>>>>> 5eb20a78c032 (drm/i915/gvt: Change from vfio_group_(un)pin_pages to vfio_(un)pin_pages)
+  		if (ret != 1) {
+  			gvt_vgpu_err("vfio_pin_pages failed for gfn 0x%lx, ret %d\n",
+  				     cur_gfn, ret);
+@@@ -901,20 -778,39 +910,19 @@@ static int intel_vgpu_group_notifier(st
+  	return NOTIFY_OK;
+  }
+  
+ -static bool __kvmgt_vgpu_exist(struct intel_vgpu *vgpu)
+ +static int intel_vgpu_open(struct mdev_device *mdev)
+  {
+ -	struct intel_vgpu *itr;
+ -	int id;
+ -	bool ret = false;
+ -
+ -	mutex_lock(&vgpu->gvt->lock);
+ -	for_each_active_vgpu(vgpu->gvt, itr, id) {
+ -		if (!itr->attached)
+ -			continue;
+ -
+ -		if (vgpu->kvm == itr->kvm) {
+ -			ret = true;
+ -			goto out;
+ -		}
+ -	}
+ -out:
+ -	mutex_unlock(&vgpu->gvt->lock);
+ -	return ret;
+ -}
+ -
+ -static int intel_vgpu_open_device(struct vfio_device *vfio_dev)
+ -{
+ -	struct intel_vgpu *vgpu = vfio_dev_to_vgpu(vfio_dev);
+ +	struct intel_vgpu *vgpu = mdev_get_drvdata(mdev);
+ +	struct kvmgt_vdev *vdev = kvmgt_vdev(vgpu);
+  	unsigned long events;
+  	int ret;
+- 	struct vfio_group *vfio_group;
+  
+ -	vgpu->iommu_notifier.notifier_call = intel_vgpu_iommu_notifier;
+ -	vgpu->group_notifier.notifier_call = intel_vgpu_group_notifier;
+ +	vdev->iommu_notifier.notifier_call = intel_vgpu_iommu_notifier;
+ +	vdev->group_notifier.notifier_call = intel_vgpu_group_notifier;
+  
+  	events = VFIO_IOMMU_NOTIFY_DMA_UNMAP;
+ -	ret = vfio_register_notifier(vfio_dev, VFIO_IOMMU_NOTIFY, &events,
+ -				     &vgpu->iommu_notifier);
+ +	ret = vfio_register_notifier(mdev_dev(mdev), VFIO_IOMMU_NOTIFY, &events,
+ +				&vdev->iommu_notifier);
+  	if (ret != 0) {
+  		gvt_vgpu_err("vfio_register_notifier for iommu failed: %d\n",
+  			ret);
+@@@ -930,42 -826,45 +938,61 @@@
+  		goto undo_iommu;
+  	}
+  
+++<<<<<<< HEAD
+ +	vfio_group = vfio_group_get_external_user_from_dev(mdev_dev(mdev));
+ +	if (IS_ERR_OR_NULL(vfio_group)) {
+ +		ret = !vfio_group ? -EFAULT : PTR_ERR(vfio_group);
+ +		gvt_vgpu_err("vfio_group_get_external_user_from_dev failed\n");
+ +		goto undo_register;
+ +	}
+ +	vdev->vfio_group = vfio_group;
+ +
+ +	/* Take a module reference as mdev core doesn't take
+ +	 * a reference for vendor driver.
+ +	 */
+ +	if (!try_module_get(THIS_MODULE)) {
+ +		ret = -ENODEV;
+ +		goto undo_group;
+ +	}
+ +
+ +	ret = kvmgt_guest_init(mdev);
+ +	if (ret)
+ +		goto undo_group;
+++=======
++ 	ret = -EEXIST;
++ 	if (vgpu->attached)
++ 		goto undo_register;
++ 
++ 	ret = -ESRCH;
++ 	if (!vgpu->kvm || vgpu->kvm->mm != current->mm) {
++ 		gvt_vgpu_err("KVM is required to use Intel vGPU\n");
++ 		goto undo_register;
++ 	}
++ 
++ 	ret = -EEXIST;
++ 	if (__kvmgt_vgpu_exist(vgpu))
++ 		goto undo_register;
+++>>>>>>> 5eb20a78c032 (drm/i915/gvt: Change from vfio_group_(un)pin_pages to vfio_(un)pin_pages)
+  
+ -	vgpu->attached = true;
+ -	kvm_get_kvm(vgpu->kvm);
+ -
+ -	kvmgt_protect_table_init(vgpu);
+ -	gvt_cache_init(vgpu);
+ -
+ -	vgpu->track_node.track_write = kvmgt_page_track_write;
+ -	vgpu->track_node.track_flush_slot = kvmgt_page_track_flush_slot;
+ -	kvm_page_track_register_notifier(vgpu->kvm, &vgpu->track_node);
+ -
+ -	debugfs_create_ulong(KVMGT_DEBUGFS_FILENAME, 0444, vgpu->debugfs,
+ -			     &vgpu->nr_cache_entries);
+ +	intel_gvt_ops->vgpu_activate(vgpu);
+  
+ -	intel_gvt_activate_vgpu(vgpu);
+ +	atomic_set(&vdev->released, 0);
+ +	return ret;
+  
+ -	atomic_set(&vgpu->released, 0);
+ -	return 0;
+++<<<<<<< HEAD
+ +undo_group:
+ +	vfio_group_put_external_user(vdev->vfio_group);
+ +	vdev->vfio_group = NULL;
+  
+++=======
+++>>>>>>> 5eb20a78c032 (drm/i915/gvt: Change from vfio_group_(un)pin_pages to vfio_(un)pin_pages)
+  undo_register:
+ -	vfio_unregister_notifier(vfio_dev, VFIO_GROUP_NOTIFY,
+ -				 &vgpu->group_notifier);
+ +	vfio_unregister_notifier(mdev_dev(mdev), VFIO_GROUP_NOTIFY,
+ +					&vdev->group_notifier);
+  
+  undo_iommu:
+ -	vfio_unregister_notifier(vfio_dev, VFIO_IOMMU_NOTIFY,
+ -				 &vgpu->iommu_notifier);
+ +	vfio_unregister_notifier(mdev_dev(mdev), VFIO_IOMMU_NOTIFY,
+ +					&vdev->iommu_notifier);
+  out:
+  	return ret;
+  }
+@@@ -1007,24 -903,22 +1034,27 @@@ static void __intel_vgpu_release(struc
+  	drm_WARN(&i915->drm, ret,
+  		 "vfio_unregister_notifier for group failed: %d\n", ret);
+  
+ -	debugfs_remove(debugfs_lookup(KVMGT_DEBUGFS_FILENAME, vgpu->debugfs));
+ +	/* dereference module reference taken at open */
+ +	module_put(THIS_MODULE);
+  
+ -	kvm_page_track_unregister_notifier(vgpu->kvm, &vgpu->track_node);
+ -	kvm_put_kvm(vgpu->kvm);
+ -	kvmgt_protect_table_destroy(vgpu);
+ -	gvt_cache_destroy(vgpu);
+ +	info = (struct kvmgt_guest_info *)vgpu->handle;
+ +	kvmgt_guest_exit(info);
+  
+  	intel_vgpu_release_msi_eventfd_ctx(vgpu);
+++<<<<<<< HEAD
+ +	vfio_group_put_external_user(vdev->vfio_group);
+++=======
+++>>>>>>> 5eb20a78c032 (drm/i915/gvt: Change from vfio_group_(un)pin_pages to vfio_(un)pin_pages)
+  
+ -	vgpu->kvm = NULL;
+ -	vgpu->attached = false;
+ +	vdev->kvm = NULL;
+ +	vgpu->handle = 0;
+  }
+  
+ -static void intel_vgpu_close_device(struct vfio_device *vfio_dev)
+ +static void intel_vgpu_release(struct mdev_device *mdev)
+  {
+ -	__intel_vgpu_release(vfio_dev_to_vgpu(vfio_dev));
+ +	struct intel_vgpu *vgpu = mdev_get_drvdata(mdev);
+ +
+ +	__intel_vgpu_release(vgpu);
+  }
+  
+  static void intel_vgpu_release_work(struct work_struct *work)
+* Unmerged path drivers/gpu/drm/i915/gvt/gvt.h
+* Unmerged path drivers/gpu/drm/i915/gvt/kvmgt.c
