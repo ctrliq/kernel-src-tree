@@ -1,0 +1,196 @@
+bpf: Fix IPv6 dport byte order in bpf_sk_lookup_udp
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-147.el8
+commit-author Andrey Ignatov <rdna@fb.com>
+commit b13b8787c95c156b093305e9f006a6fb7d9119b1
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-147.el8/b13b8787.failed
+
+Lookup functions in sk_lookup have different expectations about byte
+order of provided arguments.
+
+Specifically __inet_lookup, __udp4_lib_lookup and __udp6_lib_lookup
+expect dport to be in network byte order and do ntohs(dport) internally.
+
+At the same time __inet6_lookup expects dport to be in host byte order
+and correspondingly name the argument hnum.
+
+sk_lookup works correctly with __inet_lookup, __udp4_lib_lookup and
+__inet6_lookup with regard to dport. But in __udp6_lib_lookup case it
+uses host instead of expected network byte order. It makes result
+returned by bpf_sk_lookup_udp for IPv6 incorrect.
+
+The patch fixes byte order of dport passed to __udp6_lib_lookup.
+
+Originally sk_lookup properly handled UDPv6, but not TCPv6. 5ef0ae84f02a
+fixes TCPv6 but breaks UDPv6.
+
+Fixes: 5ef0ae84f02a ("bpf: Fix IPv6 dport byte-order in bpf_sk_lookup")
+	Signed-off-by: Andrey Ignatov <rdna@fb.com>
+	Acked-by: Joe Stringer <joe@wand.net.nz>
+	Acked-by: Martin KaFai Lau <kafai@fb.com>
+	Signed-off-by: Daniel Borkmann <daniel@iogearbox.net>
+(cherry picked from commit b13b8787c95c156b093305e9f006a6fb7d9119b1)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/core/filter.c
+diff --cc net/core/filter.c
+index ed8de8b22015,9a1327eb25fa..000000000000
+--- a/net/core/filter.c
++++ b/net/core/filter.c
+@@@ -4757,6 -4823,148 +4757,151 @@@ static const struct bpf_func_proto bpf_
+  };
+  #endif /* CONFIG_IPV6_SEG6_BPF */
+  
+++<<<<<<< HEAD
+++=======
++ #ifdef CONFIG_INET
++ static struct sock *sk_lookup(struct net *net, struct bpf_sock_tuple *tuple,
++ 			      struct sk_buff *skb, u8 family, u8 proto)
++ {
++ 	bool refcounted = false;
++ 	struct sock *sk = NULL;
++ 	int dif = 0;
++ 
++ 	if (skb->dev)
++ 		dif = skb->dev->ifindex;
++ 
++ 	if (family == AF_INET) {
++ 		__be32 src4 = tuple->ipv4.saddr;
++ 		__be32 dst4 = tuple->ipv4.daddr;
++ 		int sdif = inet_sdif(skb);
++ 
++ 		if (proto == IPPROTO_TCP)
++ 			sk = __inet_lookup(net, &tcp_hashinfo, skb, 0,
++ 					   src4, tuple->ipv4.sport,
++ 					   dst4, tuple->ipv4.dport,
++ 					   dif, sdif, &refcounted);
++ 		else
++ 			sk = __udp4_lib_lookup(net, src4, tuple->ipv4.sport,
++ 					       dst4, tuple->ipv4.dport,
++ 					       dif, sdif, &udp_table, skb);
++ #if IS_ENABLED(CONFIG_IPV6)
++ 	} else {
++ 		struct in6_addr *src6 = (struct in6_addr *)&tuple->ipv6.saddr;
++ 		struct in6_addr *dst6 = (struct in6_addr *)&tuple->ipv6.daddr;
++ 		int sdif = inet6_sdif(skb);
++ 
++ 		if (proto == IPPROTO_TCP)
++ 			sk = __inet6_lookup(net, &tcp_hashinfo, skb, 0,
++ 					    src6, tuple->ipv6.sport,
++ 					    dst6, ntohs(tuple->ipv6.dport),
++ 					    dif, sdif, &refcounted);
++ 		else if (likely(ipv6_bpf_stub))
++ 			sk = ipv6_bpf_stub->udp6_lib_lookup(net,
++ 							    src6, tuple->ipv6.sport,
++ 							    dst6, tuple->ipv6.dport,
++ 							    dif, sdif,
++ 							    &udp_table, skb);
++ #endif
++ 	}
++ 
++ 	if (unlikely(sk && !refcounted && !sock_flag(sk, SOCK_RCU_FREE))) {
++ 		WARN_ONCE(1, "Found non-RCU, unreferenced socket!");
++ 		sk = NULL;
++ 	}
++ 	return sk;
++ }
++ 
++ /* bpf_sk_lookup performs the core lookup for different types of sockets,
++  * taking a reference on the socket if it doesn't have the flag SOCK_RCU_FREE.
++  * Returns the socket as an 'unsigned long' to simplify the casting in the
++  * callers to satisfy BPF_CALL declarations.
++  */
++ static unsigned long
++ bpf_sk_lookup(struct sk_buff *skb, struct bpf_sock_tuple *tuple, u32 len,
++ 	      u8 proto, u64 netns_id, u64 flags)
++ {
++ 	struct net *caller_net;
++ 	struct sock *sk = NULL;
++ 	u8 family = AF_UNSPEC;
++ 	struct net *net;
++ 
++ 	family = len == sizeof(tuple->ipv4) ? AF_INET : AF_INET6;
++ 	if (unlikely(family == AF_UNSPEC || netns_id > U32_MAX || flags))
++ 		goto out;
++ 
++ 	if (skb->dev)
++ 		caller_net = dev_net(skb->dev);
++ 	else
++ 		caller_net = sock_net(skb->sk);
++ 	if (netns_id) {
++ 		net = get_net_ns_by_id(caller_net, netns_id);
++ 		if (unlikely(!net))
++ 			goto out;
++ 		sk = sk_lookup(net, tuple, skb, family, proto);
++ 		put_net(net);
++ 	} else {
++ 		net = caller_net;
++ 		sk = sk_lookup(net, tuple, skb, family, proto);
++ 	}
++ 
++ 	if (sk)
++ 		sk = sk_to_full_sk(sk);
++ out:
++ 	return (unsigned long) sk;
++ }
++ 
++ BPF_CALL_5(bpf_sk_lookup_tcp, struct sk_buff *, skb,
++ 	   struct bpf_sock_tuple *, tuple, u32, len, u64, netns_id, u64, flags)
++ {
++ 	return bpf_sk_lookup(skb, tuple, len, IPPROTO_TCP, netns_id, flags);
++ }
++ 
++ static const struct bpf_func_proto bpf_sk_lookup_tcp_proto = {
++ 	.func		= bpf_sk_lookup_tcp,
++ 	.gpl_only	= false,
++ 	.pkt_access	= true,
++ 	.ret_type	= RET_PTR_TO_SOCKET_OR_NULL,
++ 	.arg1_type	= ARG_PTR_TO_CTX,
++ 	.arg2_type	= ARG_PTR_TO_MEM,
++ 	.arg3_type	= ARG_CONST_SIZE,
++ 	.arg4_type	= ARG_ANYTHING,
++ 	.arg5_type	= ARG_ANYTHING,
++ };
++ 
++ BPF_CALL_5(bpf_sk_lookup_udp, struct sk_buff *, skb,
++ 	   struct bpf_sock_tuple *, tuple, u32, len, u64, netns_id, u64, flags)
++ {
++ 	return bpf_sk_lookup(skb, tuple, len, IPPROTO_UDP, netns_id, flags);
++ }
++ 
++ static const struct bpf_func_proto bpf_sk_lookup_udp_proto = {
++ 	.func		= bpf_sk_lookup_udp,
++ 	.gpl_only	= false,
++ 	.pkt_access	= true,
++ 	.ret_type	= RET_PTR_TO_SOCKET_OR_NULL,
++ 	.arg1_type	= ARG_PTR_TO_CTX,
++ 	.arg2_type	= ARG_PTR_TO_MEM,
++ 	.arg3_type	= ARG_CONST_SIZE,
++ 	.arg4_type	= ARG_ANYTHING,
++ 	.arg5_type	= ARG_ANYTHING,
++ };
++ 
++ BPF_CALL_1(bpf_sk_release, struct sock *, sk)
++ {
++ 	if (!sock_flag(sk, SOCK_RCU_FREE))
++ 		sock_gen_put(sk);
++ 	return 0;
++ }
++ 
++ static const struct bpf_func_proto bpf_sk_release_proto = {
++ 	.func		= bpf_sk_release,
++ 	.gpl_only	= false,
++ 	.ret_type	= RET_INTEGER,
++ 	.arg1_type	= ARG_PTR_TO_SOCKET,
++ };
++ #endif /* CONFIG_INET */
++ 
+++>>>>>>> b13b8787c95c (bpf: Fix IPv6 dport byte order in bpf_sk_lookup_udp)
+  bool bpf_helper_changes_pkt_data(void *func)
+  {
+  	if (func == bpf_skb_vlan_push ||
+* Unmerged path net/core/filter.c
