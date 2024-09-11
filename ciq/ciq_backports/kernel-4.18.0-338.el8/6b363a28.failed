@@ -1,0 +1,193 @@
+Crypto/chcr: fix ctr, cbc, xts and rfc3686-ctr failed tests
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-338.el8
+commit-author Devulapally Shiva Krishna <shiva@chelsio.com>
+commit 6b363a286cd01961423f5dcd648b265088ec56d0
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-338.el8/6b363a28.failed
+
+This solves the following issues observed during self test when
+CONFIG_CRYPTO_MANAGER_EXTRA_TESTS is enabled.
+
+1. Added fallback for cbc, ctr and rfc3686 if req->nbytes is zero
+and for xts added a fallback case if req->nbytes is not multiple of 16.
+
+2. In case of cbc-aes, solved wrong iv update. When
+chcr_cipher_fallback() is called, used req->info pointer instead of
+reqctx->iv.
+
+3. In cbc-aes decryption there was a wrong result. This occurs when
+chcr_cipher_fallback() is called from chcr_handle_cipher_resp().
+In the fallback function iv(req->info) used is wrongly updated.
+So use the initial iv for this case.
+
+4)In case of ctr-aes encryption observed wrong result. In adjust_ctr_overflow()
+there is condition which checks if ((bytes / AES_BLOCK_SIZE) > c),
+where c is the number of blocks which can be processed without iv overflow,
+but for the above bytes (req->nbytes < 32 , not a multiple of 16) this
+condition fails and the 2nd block is corrupted as it requires the rollover iv.
+So added a '=' condition in this to take care of this.
+
+5)In rfc3686-ctr there was wrong result observed. This occurs when
+chcr_cipher_fallback() is called from chcr_handle_cipher_resp().
+Here also copying initial_iv in init_iv pointer for handling the fallback
+case correctly.
+
+	Signed-off-by: Ayush Sawal <ayush.sawal@chelsio.com>
+	Signed-off-by: Devulapally Shiva Krishna <shiva@chelsio.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 6b363a286cd01961423f5dcd648b265088ec56d0)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/crypto/chelsio/chcr_algo.c
+diff --cc drivers/crypto/chelsio/chcr_algo.c
+index 6febc8e0f8e0,51adba5685a4..000000000000
+--- a/drivers/crypto/chelsio/chcr_algo.c
++++ b/drivers/crypto/chelsio/chcr_algo.c
+@@@ -1164,18 -1155,19 +1164,30 @@@ static int chcr_final_cipher_iv(struct 
+  
+  }
+  
+ -static int chcr_handle_cipher_resp(struct skcipher_request *req,
+ +static int chcr_handle_cipher_resp(struct ablkcipher_request *req,
+  				   unsigned char *input, int err)
+  {
+++<<<<<<< HEAD
+ +	struct crypto_ablkcipher *tfm = crypto_ablkcipher_reqtfm(req);
+ +	struct chcr_context *ctx = c_ctx(tfm);
+ +	struct uld_ctx *u_ctx = ULD_CTX(c_ctx(tfm));
+ +	struct ablk_ctx *ablkctx = ABLK_CTX(c_ctx(tfm));
+ +	struct sk_buff *skb;
+ +	struct cpl_fw6_pld *fw6_pld = (struct cpl_fw6_pld *)input;
+ +	struct chcr_blkcipher_req_ctx *reqctx = ablkcipher_request_ctx(req);
+ +	struct cipher_wr_param wrparam;
+++=======
++ 	struct chcr_skcipher_req_ctx *reqctx = skcipher_request_ctx(req);
++ 	struct crypto_skcipher *tfm = crypto_skcipher_reqtfm(req);
++ 	struct cpl_fw6_pld *fw6_pld = (struct cpl_fw6_pld *)input;
++ 	struct ablk_ctx *ablkctx = ABLK_CTX(c_ctx(tfm));
++ 	struct uld_ctx *u_ctx = ULD_CTX(c_ctx(tfm));
+++>>>>>>> 6b363a286cd0 (Crypto/chcr: fix ctr, cbc, xts and rfc3686-ctr failed tests)
+  	struct chcr_dev *dev = c_ctx(tfm)->dev;
++ 	struct chcr_context *ctx = c_ctx(tfm);
++ 	struct adapter *adap = padap(ctx->dev);
++ 	struct cipher_wr_param wrparam;
++ 	struct sk_buff *skb;
+  	int bytes;
+  
+  	if (err)
+@@@ -1257,22 -1251,30 +1271,41 @@@ static int process_cipher(struct ablkci
+  				  struct sk_buff **skb,
+  				  unsigned short op_type)
+  {
+++<<<<<<< HEAD
+ +	struct crypto_ablkcipher *tfm = crypto_ablkcipher_reqtfm(req);
+ +	unsigned int ivsize = crypto_ablkcipher_ivsize(tfm);
+ +	struct chcr_blkcipher_req_ctx *reqctx = ablkcipher_request_ctx(req);
+++=======
++ 	struct chcr_skcipher_req_ctx *reqctx = skcipher_request_ctx(req);
++ 	struct crypto_skcipher *tfm = crypto_skcipher_reqtfm(req);
++ 	unsigned int ivsize = crypto_skcipher_ivsize(tfm);
+++>>>>>>> 6b363a286cd0 (Crypto/chcr: fix ctr, cbc, xts and rfc3686-ctr failed tests)
+  	struct ablk_ctx *ablkctx = ABLK_CTX(c_ctx(tfm));
++ 	struct adapter *adap = padap(c_ctx(tfm)->dev);
+  	struct	cipher_wr_param wrparam;
+  	int bytes, err = -EINVAL;
++ 	int subtype;
+  
+  	reqctx->processed = 0;
+  	reqctx->partial_req = 0;
+ -	if (!req->iv)
+ +	if (!req->info)
+  		goto error;
++ 	subtype = get_cryptoalg_subtype(tfm);
+  	if ((ablkctx->enckey_len == 0) || (ivsize > AES_BLOCK_SIZE) ||
+++<<<<<<< HEAD
+ +	    (req->nbytes == 0) ||
+ +	    (req->nbytes % crypto_ablkcipher_blocksize(tfm))) {
+++=======
++ 	    (req->cryptlen == 0) ||
++ 	    (req->cryptlen % crypto_skcipher_blocksize(tfm))) {
++ 		if (req->cryptlen == 0 && subtype != CRYPTO_ALG_SUB_TYPE_XTS)
++ 			goto fallback;
++ 		else if (req->cryptlen % crypto_skcipher_blocksize(tfm) &&
++ 			 subtype == CRYPTO_ALG_SUB_TYPE_XTS)
++ 			goto fallback;
+++>>>>>>> 6b363a286cd0 (Crypto/chcr: fix ctr, cbc, xts and rfc3686-ctr failed tests)
+  		pr_err("AES: Invalid value of Key Len %d nbytes %d IV Len %d\n",
+ -		       ablkctx->enckey_len, req->cryptlen, ivsize);
+ +		       ablkctx->enckey_len, req->nbytes, ivsize);
+  		goto error;
+  	}
+  
+@@@ -1309,16 -1311,14 +1342,23 @@@
+  		else
+  			bytes = rounddown(bytes, 16);
+  	} else {
+ -		bytes = req->cryptlen;
+ +		bytes = req->nbytes;
+ +	}
+++<<<<<<< HEAD
+ +	if (get_cryptoalg_subtype(crypto_ablkcipher_tfm(tfm)) ==
+ +	    CRYPTO_ALG_SUB_TYPE_CTR) {
+ +		bytes = adjust_ctr_overflow(req->info, bytes);
+  	}
+ +	if (get_cryptoalg_subtype(crypto_ablkcipher_tfm(tfm)) ==
+ +	    CRYPTO_ALG_SUB_TYPE_CTR_RFC3686) {
+++=======
++ 	if (subtype == CRYPTO_ALG_SUB_TYPE_CTR) {
++ 		bytes = adjust_ctr_overflow(req->iv, bytes);
++ 	}
++ 	if (subtype == CRYPTO_ALG_SUB_TYPE_CTR_RFC3686) {
+++>>>>>>> 6b363a286cd0 (Crypto/chcr: fix ctr, cbc, xts and rfc3686-ctr failed tests)
+  		memcpy(reqctx->iv, ablkctx->nonce, CTR_RFC3686_NONCE_SIZE);
+ -		memcpy(reqctx->iv + CTR_RFC3686_NONCE_SIZE, req->iv,
+ +		memcpy(reqctx->iv + CTR_RFC3686_NONCE_SIZE, req->info,
+  				CTR_RFC3686_IV_SIZE);
+  
+  		/* initialize counter portion of counter block */
+@@@ -1327,7 -1328,8 +1368,12 @@@
+  
+  	} else {
+  
+++<<<<<<< HEAD
+ +		memcpy(reqctx->iv, req->info, IV);
+++=======
++ 		memcpy(reqctx->iv, req->iv, IV);
++ 		memcpy(reqctx->init_iv, req->iv, IV);
+++>>>>>>> 6b363a286cd0 (Crypto/chcr: fix ctr, cbc, xts and rfc3686-ctr failed tests)
+  	}
+  	if (unlikely(bytes == 0)) {
+  		chcr_cipher_dma_unmap(&ULD_CTX(c_ctx(tfm))->lldi.pdev->dev,
+@@@ -1336,8 -1339,10 +1383,15 @@@ fallback:       atomic_inc(&adap->chcr_
+  					   req->base.flags,
+  					   req->src,
+  					   req->dst,
+++<<<<<<< HEAD
+ +					   req->nbytes,
+ +					   reqctx->iv,
+++=======
++ 					   req->cryptlen,
++ 					   subtype ==
++ 					   CRYPTO_ALG_SUB_TYPE_CTR_RFC3686 ?
++ 					   reqctx->iv : req->iv,
+++>>>>>>> 6b363a286cd0 (Crypto/chcr: fix ctr, cbc, xts and rfc3686-ctr failed tests)
+  					   op_type);
+  		goto error;
+  	}
+* Unmerged path drivers/crypto/chelsio/chcr_algo.c
+diff --git a/drivers/crypto/chelsio/chcr_crypto.h b/drivers/crypto/chelsio/chcr_crypto.h
+index a44c542a320b..1a30bcc743c0 100644
+--- a/drivers/crypto/chelsio/chcr_crypto.h
++++ b/drivers/crypto/chelsio/chcr_crypto.h
+@@ -303,6 +303,7 @@ struct chcr_blkcipher_req_ctx {
+ 	unsigned int op;
+ 	u16 imm;
+ 	u8 iv[CHCR_MAX_CRYPTO_IV_LEN];
++	u8 init_iv[CHCR_MAX_CRYPTO_IV_LEN];
+ 	u16 txqidx;
+ 	u16 rxqidx;
+ };
