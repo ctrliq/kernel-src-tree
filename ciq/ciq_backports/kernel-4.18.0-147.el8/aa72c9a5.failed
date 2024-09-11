@@ -1,0 +1,137 @@
+IB/uverbs: Remove rdma_explicit_destroy() from the ioctl methods
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-147.el8
+commit-author Jason Gunthorpe <jgg@ziepe.ca>
+commit aa72c9a5f986444f5e245767402ed1f3066fca2c
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-147.el8/aa72c9a5.failed
+
+The core code will destroy the HW object on behalf of the method, if the
+method provides an implementation it must simply copy data from the stub
+uobj into the response. Destroy methods cannot touch the HW object.
+
+	Signed-off-by: Jason Gunthorpe <jgg@mellanox.com>
+(cherry picked from commit aa72c9a5f986444f5e245767402ed1f3066fca2c)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/infiniband/core/uverbs_ioctl.c
+diff --cc drivers/infiniband/core/uverbs_ioctl.c
+index 03065bad8dae,404acfcdbeb2..000000000000
+--- a/drivers/infiniband/core/uverbs_ioctl.c
++++ b/drivers/infiniband/core/uverbs_ioctl.c
+@@@ -153,11 -149,23 +154,27 @@@ static int uverbs_process_attr(struct i
+  		if (!object)
+  			return -EINVAL;
+  
+++<<<<<<< HEAD
+ +		o_attr->uobject = uverbs_get_uobject_from_context(
+++=======
++ 		/* specs are allowed to have only one destroy attribute */
++ 		WARN_ON(spec->u.obj.access == UVERBS_ACCESS_DESTROY &&
++ 			*destroy_attr);
++ 		if (spec->u.obj.access == UVERBS_ACCESS_DESTROY)
++ 			*destroy_attr = o_attr;
++ 
++ 		/*
++ 		 * The type of uattr->data is u64 for UVERBS_ATTR_TYPE_IDR and
++ 		 * s64 for UVERBS_ATTR_TYPE_FD. We can cast the u64 to s64
++ 		 * here without caring about truncation as we know that the
++ 		 * IDR implementation today rejects negative IDs
++ 		 */
++ 		o_attr->uobject = uverbs_get_uobject_from_file(
+++>>>>>>> aa72c9a5f986 (IB/uverbs: Remove rdma_explicit_destroy() from the ioctl methods)
+  					object->type_attrs,
+ -					ufile,
+ -					spec->u.obj.access,
+ -					uattr->data_s64);
+ +					ucontext,
+ +					spec->obj.access,
+ +					(int)uattr->data);
+  
+  		if (IS_ERR(o_attr->uobject))
+  			return PTR_ERR(o_attr->uobject);
+@@@ -267,8 -274,9 +285,14 @@@ static int uverbs_uattrs_process(struc
+  			num_given_buckets = ret + 1;
+  
+  		attr_spec_bucket = method->attr_buckets[ret];
+++<<<<<<< HEAD
+ +		ret = uverbs_process_attr(ibdev, ucontext, uattr, attr_id,
+ +					  attr_spec_bucket, &attr_bundle->hash[ret],
+++=======
++ 		ret = uverbs_process_attr(ufile, uattr, attr_id,
++ 					  attr_spec_bucket,
++ 					  &attr_bundle->hash[ret], destroy_attr,
+++>>>>>>> aa72c9a5f986 (IB/uverbs: Remove rdma_explicit_destroy() from the ioctl methods)
+  					  uattr_ptr++);
+  		if (ret) {
+  			uverbs_finalize_attrs(attr_bundle,
+@@@ -323,10 -331,11 +347,17 @@@ static int uverbs_handle_method(struct 
+  	int ret;
+  	int finalize_ret;
+  	int num_given_buckets;
++ 	struct uverbs_obj_attr *destroy_attr = NULL;
+  
+++<<<<<<< HEAD
+ +	num_given_buckets = uverbs_uattrs_process(ibdev, ufile->ucontext, uattrs,
+ +						  num_uattrs, method_spec,
+ +						  attr_bundle, uattr_ptr);
+++=======
++ 	num_given_buckets =
++ 		uverbs_uattrs_process(ufile, uattrs, num_uattrs, method_spec,
++ 				      attr_bundle, &destroy_attr, uattr_ptr);
+++>>>>>>> aa72c9a5f986 (IB/uverbs: Remove rdma_explicit_destroy() from the ioctl methods)
+  	if (num_given_buckets <= 0)
+  		return -EINVAL;
+  
+diff --git a/drivers/infiniband/core/rdma_core.c b/drivers/infiniband/core/rdma_core.c
+index 7abca5514e4d..a0706f103719 100644
+--- a/drivers/infiniband/core/rdma_core.c
++++ b/drivers/infiniband/core/rdma_core.c
+@@ -782,10 +782,7 @@ int uverbs_finalize_object(struct ib_uobject *uobj,
+ 		rdma_lookup_put_uobject(uobj, true);
+ 		break;
+ 	case UVERBS_ACCESS_DESTROY:
+-		if (commit)
+-			ret = rdma_remove_commit_uobject(uobj);
+-		else
+-			rdma_lookup_put_uobject(uobj, true);
++		rdma_lookup_put_uobject(uobj, true);
+ 		break;
+ 	case UVERBS_ACCESS_NEW:
+ 		if (commit)
+* Unmerged path drivers/infiniband/core/uverbs_ioctl.c
+diff --git a/drivers/infiniband/core/uverbs_std_types_cq.c b/drivers/infiniband/core/uverbs_std_types_cq.c
+index 150b7c04ce15..8fbd943b7a27 100644
+--- a/drivers/infiniband/core/uverbs_std_types_cq.c
++++ b/drivers/infiniband/core/uverbs_std_types_cq.c
+@@ -167,21 +167,12 @@ static int UVERBS_HANDLER(UVERBS_METHOD_CQ_DESTROY)(struct ib_device *ib_dev,
+ {
+ 	struct ib_uobject *uobj =
+ 		uverbs_attr_get_uobject(attrs, UVERBS_ATTR_DESTROY_CQ_HANDLE);
+-	struct ib_uverbs_destroy_cq_resp resp;
+-	struct ib_ucq_object *obj;
+-	int ret;
+-
+-	if (IS_ERR(uobj))
+-		return PTR_ERR(uobj);
+-
+-	obj = container_of(uobj, struct ib_ucq_object, uobject);
+-
+-	ret = rdma_explicit_destroy(uobj);
+-	if (ret)
+-		return ret;
+-
+-	resp.comp_events_reported  = obj->comp_events_reported;
+-	resp.async_events_reported = obj->async_events_reported;
++	struct ib_ucq_object *obj =
++		container_of(uobj, struct ib_ucq_object, uobject);
++	struct ib_uverbs_destroy_cq_resp resp = {
++		.comp_events_reported = obj->comp_events_reported,
++		.async_events_reported = obj->async_events_reported
++	};
+ 
+ 	return uverbs_copy_to(attrs, UVERBS_ATTR_DESTROY_CQ_RESP, &resp,
+ 			      sizeof(resp));
