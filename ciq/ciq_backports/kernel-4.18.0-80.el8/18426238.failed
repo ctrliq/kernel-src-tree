@@ -1,0 +1,151 @@
+PCI: Handle error return from pci_reset_bridge_secondary_bus()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-80.el8
+commit-author Sinan Kaya <okaya@codeaurora.org>
+commit 1842623850d09b0b1147d4974573aa305658d97f
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-80.el8/18426238.failed
+
+Commit 01fd61c0b9bd ("PCI: Add a return type for
+pci_reset_bridge_secondary_bus()") added a return value to the function to
+return if a device is accessible following a reset.  Callers are not
+checking the value.
+
+Pass error code up high in the stack if device is not accessible.
+
+Fixes: 01fd61c0b9bd ("PCI: Add a return type for pci_reset_bridge_secondary_bus()")
+	Signed-off-by: Sinan Kaya <okaya@codeaurora.org>
+	Signed-off-by: Bjorn Helgaas <bhelgaas@google.com>
+(cherry picked from commit 1842623850d09b0b1147d4974573aa305658d97f)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/pci/hotplug/pciehp_hpc.c
+diff --cc drivers/pci/hotplug/pciehp_hpc.c
+index 5b15e76f3564,bbaa2114f953..000000000000
+--- a/drivers/pci/hotplug/pciehp_hpc.c
++++ b/drivers/pci/hotplug/pciehp_hpc.c
+@@@ -777,16 -743,18 +778,22 @@@ int pciehp_reset_slot(struct slot *slot
+  	pcie_write_cmd(ctrl, 0, ctrl_mask);
+  	ctrl_dbg(ctrl, "%s: SLOTCTRL %x write cmd %x\n", __func__,
+  		 pci_pcie_cap(ctrl->pcie->port) + PCI_EXP_SLTCTL, 0);
+ -	if (pciehp_poll_mode)
+ -		del_timer_sync(&ctrl->poll_timer);
+  
+- 	pci_reset_bridge_secondary_bus(ctrl->pcie->port);
++ 	rc = pci_reset_bridge_secondary_bus(ctrl->pcie->port);
+  
+  	pcie_capability_write_word(pdev, PCI_EXP_SLTSTA, stat_mask);
+  	pcie_write_cmd_nowait(ctrl, ctrl_mask, ctrl_mask);
+  	ctrl_dbg(ctrl, "%s: SLOTCTRL %x write cmd %x\n", __func__,
+  		 pci_pcie_cap(ctrl->pcie->port) + PCI_EXP_SLTCTL, ctrl_mask);
+++<<<<<<< HEAD
+ +
+ +	up_write(&ctrl->reset_lock);
+ +	return 0;
+++=======
++ 	if (pciehp_poll_mode)
++ 		int_poll_timeout(&ctrl->poll_timer);
++ 	return rc;
+++>>>>>>> 1842623850d0 (PCI: Handle error return from pci_reset_bridge_secondary_bus())
+  }
+  
+  int pcie_init_notification(struct controller *ctrl)
+* Unmerged path drivers/pci/hotplug/pciehp_hpc.c
+diff --git a/drivers/pci/pci.c b/drivers/pci/pci.c
+index 216dcb4b0a67..625db046ba4f 100644
+--- a/drivers/pci/pci.c
++++ b/drivers/pci/pci.c
+@@ -4559,9 +4559,7 @@ static int pci_parent_bus_reset(struct pci_dev *dev, int probe)
+ 	if (probe)
+ 		return 0;
+ 
+-	pci_reset_bridge_secondary_bus(dev->bus->self);
+-
+-	return 0;
++	return pci_reset_bridge_secondary_bus(dev->bus->self);
+ }
+ 
+ static int pci_reset_hotplug_slot(struct hotplug_slot *hotplug, int probe)
+@@ -5156,6 +5154,8 @@ EXPORT_SYMBOL_GPL(pci_try_reset_slot);
+ 
+ static int pci_bus_reset(struct pci_bus *bus, int probe)
+ {
++	int ret;
++
+ 	if (!bus->self || !pci_bus_resetable(bus))
+ 		return -ENOTTY;
+ 
+@@ -5166,11 +5166,11 @@ static int pci_bus_reset(struct pci_bus *bus, int probe)
+ 
+ 	might_sleep();
+ 
+-	pci_reset_bridge_secondary_bus(bus->self);
++	ret = pci_reset_bridge_secondary_bus(bus->self);
+ 
+ 	pci_bus_unlock(bus);
+ 
+-	return 0;
++	return ret;
+ }
+ 
+ /**
+@@ -5230,7 +5230,7 @@ int pci_try_reset_bus(struct pci_bus *bus)
+ 
+ 	if (pci_bus_trylock(bus)) {
+ 		might_sleep();
+-		pci_reset_bridge_secondary_bus(bus->self);
++		rc = pci_reset_bridge_secondary_bus(bus->self);
+ 		pci_bus_unlock(bus);
+ 	} else
+ 		rc = -EAGAIN;
+diff --git a/drivers/pci/pcie/aer.c b/drivers/pci/pcie/aer.c
+index c7d5232e5a1c..7e37bbf78f04 100644
+--- a/drivers/pci/pcie/aer.c
++++ b/drivers/pci/pcie/aer.c
+@@ -1537,6 +1537,7 @@ static pci_ers_result_t aer_root_reset(struct pci_dev *dev)
+ {
+ 	u32 reg32;
+ 	int pos;
++	int rc;
+ 
+ 	pos = dev->aer_cap;
+ 
+@@ -1545,7 +1546,7 @@ static pci_ers_result_t aer_root_reset(struct pci_dev *dev)
+ 	reg32 &= ~ROOT_PORT_INTR_ON_MESG_MASK;
+ 	pci_write_config_dword(dev, pos + PCI_ERR_ROOT_COMMAND, reg32);
+ 
+-	pci_reset_bridge_secondary_bus(dev);
++	rc = pci_reset_bridge_secondary_bus(dev);
+ 	pci_printk(KERN_DEBUG, dev, "Root Port link has been reset\n");
+ 
+ 	/* Clear Root Error Status */
+@@ -1557,7 +1558,7 @@ static pci_ers_result_t aer_root_reset(struct pci_dev *dev)
+ 	reg32 |= ROOT_PORT_INTR_ON_MESG_MASK;
+ 	pci_write_config_dword(dev, pos + PCI_ERR_ROOT_COMMAND, reg32);
+ 
+-	return PCI_ERS_RESULT_RECOVERED;
++	return rc ? PCI_ERS_RESULT_DISCONNECT : PCI_ERS_RESULT_RECOVERED;
+ }
+ 
+ /**
+diff --git a/drivers/pci/pcie/err.c b/drivers/pci/pcie/err.c
+index 674984a9277a..49a965d2440e 100644
+--- a/drivers/pci/pcie/err.c
++++ b/drivers/pci/pcie/err.c
+@@ -175,9 +175,11 @@ static int report_resume(struct pci_dev *dev, void *data)
+  */
+ static pci_ers_result_t default_reset_link(struct pci_dev *dev)
+ {
+-	pci_reset_bridge_secondary_bus(dev);
++	int rc;
++
++	rc = pci_reset_bridge_secondary_bus(dev);
+ 	pci_printk(KERN_DEBUG, dev, "downstream link has been reset\n");
+-	return PCI_ERS_RESULT_RECOVERED;
++	return rc ? PCI_ERS_RESULT_DISCONNECT : PCI_ERS_RESULT_RECOVERED;
+ }
+ 
+ static pci_ers_result_t reset_link(struct pci_dev *dev, u32 service)
