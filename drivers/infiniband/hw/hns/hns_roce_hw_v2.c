@@ -3570,6 +3570,17 @@ static int hns_roce_v2_modify_qp(struct ib_qp *ibqp,
 			vlan = rdma_vlan_dev_vlan_id(gid_attr->ndev);
 		}
 
+		if (is_vlan_dev(gid_attr->ndev)) {
+			roce_set_bit(context->byte_76_srqn_op_en,
+				     V2_QPC_BYTE_76_RQ_VLAN_EN_S, 1);
+			roce_set_bit(qpc_mask->byte_76_srqn_op_en,
+				     V2_QPC_BYTE_76_RQ_VLAN_EN_S, 0);
+			roce_set_bit(context->byte_168_irrl_idx,
+				     V2_QPC_BYTE_168_SQ_VLAN_EN_S, 1);
+			roce_set_bit(qpc_mask->byte_168_irrl_idx,
+				     V2_QPC_BYTE_168_SQ_VLAN_EN_S, 0);
+		}
+
 		roce_set_field(context->byte_24_mtu_tc,
 			       V2_QPC_BYTE_24_VLAN_ID_M,
 			       V2_QPC_BYTE_24_VLAN_ID_S, vlan);
