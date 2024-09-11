@@ -1659,7 +1659,7 @@ static int hns_roce_config_sgid_table(struct hns_roce_dev *hr_dev,
 }
 
 static int hns_roce_v2_set_gid(struct hns_roce_dev *hr_dev, u8 port,
-			       int gid_index, union ib_gid *gid,
+			       int gid_index, const union ib_gid *gid,
 			       const struct ib_gid_attr *attr)
 {
 	enum hns_roce_sgid_type sgid_type = GID_TYPE_FLAG_ROCE_V1;
