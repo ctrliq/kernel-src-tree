@@ -1,0 +1,456 @@
+powerpc/powernv/mce: Print correct severity for MCE error.
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+Rebuild_CHGLOG: - [powerpc] powerpc/powernv/mce: Print correct severity for MCE error (Diego Domingos) [1822675]
+Rebuild_FUZZ: 99.13%
+commit-author Mahesh Salgaonkar <mahesh@linux.vnet.ibm.com>
+commit cda6618d060b5e8afc93e691d4bcd987f3dd4393
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/cda6618d.failed
+
+Currently all machine check errors are printed as severe errors which
+isn't correct. Print soft errors as warning instead of severe errors.
+
+	Signed-off-by: Mahesh Salgaonkar <mahesh@linux.vnet.ibm.com>
+	Signed-off-by: Michael Ellerman <mpe@ellerman.id.au>
+(cherry picked from commit cda6618d060b5e8afc93e691d4bcd987f3dd4393)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/powerpc/include/asm/mce.h
+diff --cc arch/powerpc/include/asm/mce.h
+index 95ec50eadb94,d6dc75f9e9bb..000000000000
+--- a/arch/powerpc/include/asm/mce.h
++++ b/arch/powerpc/include/asm/mce.h
+@@@ -110,26 -110,26 +110,36 @@@ enum MCE_LinkErrorType 
+  };
+  
+  struct machine_check_event {
+- 	enum MCE_Version	version:8;	/* 0x00 */
+- 	uint8_t			in_use;		/* 0x01 */
+- 	enum MCE_Severity	severity:8;	/* 0x02 */
+- 	enum MCE_Initiator	initiator:8;	/* 0x03 */
+- 	enum MCE_ErrorType	error_type:8;	/* 0x04 */
+- 	enum MCE_Disposition	disposition:8;	/* 0x05 */
+- 	uint16_t		cpu;		/* 0x06 */
+- 	uint64_t		gpr3;		/* 0x08 */
+- 	uint64_t		srr0;		/* 0x10 */
+- 	uint64_t		srr1;		/* 0x18 */
+- 	union {					/* 0x20 */
++ 	enum MCE_Version	version:8;
++ 	u8			in_use;
++ 	enum MCE_Severity	severity:8;
++ 	enum MCE_Initiator	initiator:8;
++ 	enum MCE_ErrorType	error_type:8;
++ 	enum MCE_Disposition	disposition:8;
++ 	bool			sync_error;
++ 	u16			cpu;
++ 	u64			gpr3;
++ 	u64			srr0;
++ 	u64			srr1;
++ 	union {
+  		struct {
+  			enum MCE_UeErrorType ue_error_type:8;
+++<<<<<<< HEAD
+ +			uint8_t		effective_address_provided;
+ +			uint8_t		physical_address_provided;
+ +			uint8_t		ignore_event;
+ +			uint8_t		reserved_1[4];
+ +			uint64_t	effective_address;
+ +			uint64_t	physical_address;
+ +			uint8_t		reserved_2[8];
+++=======
++ 			u8		effective_address_provided;
++ 			u8		physical_address_provided;
++ 			u8		reserved_1[5];
++ 			u64		effective_address;
++ 			u64		physical_address;
++ 			u8		reserved_2[8];
+++>>>>>>> cda6618d060b (powerpc/powernv/mce: Print correct severity for MCE error.)
+  		} ue_error;
+  
+  		struct {
+@@@ -195,7 -195,7 +205,11 @@@ struct mce_error_info 
+  	} u;
+  	enum MCE_Severity	severity:8;
+  	enum MCE_Initiator	initiator:8;
+++<<<<<<< HEAD
+ +	bool			ignore_event;
+++=======
++ 	bool			sync_error;
+++>>>>>>> cda6618d060b (powerpc/powernv/mce: Print correct severity for MCE error.)
+  };
+  
+  #define MAX_MC_EVT	100
+* Unmerged path arch/powerpc/include/asm/mce.h
+diff --git a/arch/powerpc/kernel/mce.c b/arch/powerpc/kernel/mce.c
+index b4119ae43b3c..2cfd112794b4 100644
+--- a/arch/powerpc/kernel/mce.c
++++ b/arch/powerpc/kernel/mce.c
+@@ -126,6 +126,7 @@ void save_mce_event(struct pt_regs *regs, long handled,
+ 
+ 	mce->initiator = mce_err->initiator;
+ 	mce->severity = mce_err->severity;
++	mce->sync_error = mce_err->sync_error;
+ 
+ 	/*
+ 	 * Populate the mce error_type and type-specific error_type.
+@@ -401,9 +402,9 @@ void machine_check_print_event_info(struct machine_check_event *evt,
+ 		break;
+ 	case MCE_SEV_WARNING:
+ 		level = KERN_WARNING;
+-		sevstr = "";
++		sevstr = "Warning";
+ 		break;
+-	case MCE_SEV_ERROR_SYNC:
++	case MCE_SEV_SEVERE:
+ 		level = KERN_ERR;
+ 		sevstr = "Severe";
+ 		break;
+diff --git a/arch/powerpc/kernel/mce_power.c b/arch/powerpc/kernel/mce_power.c
+index e15100ace981..e4721bf1d447 100644
+--- a/arch/powerpc/kernel/mce_power.c
++++ b/arch/powerpc/kernel/mce_power.c
+@@ -142,106 +142,107 @@ struct mce_ierror_table {
+ 	unsigned int error_subtype;
+ 	unsigned int initiator;
+ 	unsigned int severity;
++	bool sync_error;
+ };
+ 
+ static const struct mce_ierror_table mce_p7_ierror_table[] = {
+ { 0x00000000001c0000, 0x0000000000040000, true,
+   MCE_ERROR_TYPE_UE,  MCE_UE_ERROR_IFETCH,
+-  MCE_INITIATOR_CPU,  MCE_SEV_ERROR_SYNC, },
++  MCE_INITIATOR_CPU,  MCE_SEV_SEVERE, true },
+ { 0x00000000001c0000, 0x0000000000080000, true,
+   MCE_ERROR_TYPE_SLB, MCE_SLB_ERROR_PARITY,
+-  MCE_INITIATOR_CPU,  MCE_SEV_ERROR_SYNC, },
++  MCE_INITIATOR_CPU,  MCE_SEV_SEVERE, true },
+ { 0x00000000001c0000, 0x00000000000c0000, true,
+   MCE_ERROR_TYPE_SLB, MCE_SLB_ERROR_MULTIHIT,
+-  MCE_INITIATOR_CPU,  MCE_SEV_ERROR_SYNC, },
++  MCE_INITIATOR_CPU,  MCE_SEV_WARNING, true },
+ { 0x00000000001c0000, 0x0000000000100000, true,
+   MCE_ERROR_TYPE_SLB, MCE_SLB_ERROR_INDETERMINATE, /* BOTH */
+-  MCE_INITIATOR_CPU,  MCE_SEV_ERROR_SYNC, },
++  MCE_INITIATOR_CPU,  MCE_SEV_WARNING, true },
+ { 0x00000000001c0000, 0x0000000000140000, true,
+   MCE_ERROR_TYPE_TLB, MCE_TLB_ERROR_MULTIHIT,
+-  MCE_INITIATOR_CPU,  MCE_SEV_ERROR_SYNC, },
++  MCE_INITIATOR_CPU,  MCE_SEV_WARNING, true },
+ { 0x00000000001c0000, 0x0000000000180000, true,
+   MCE_ERROR_TYPE_UE,  MCE_UE_ERROR_PAGE_TABLE_WALK_IFETCH,
+-  MCE_INITIATOR_CPU,  MCE_SEV_ERROR_SYNC, },
++  MCE_INITIATOR_CPU,  MCE_SEV_SEVERE, true },
+ { 0x00000000001c0000, 0x00000000001c0000, true,
+   MCE_ERROR_TYPE_UE,  MCE_UE_ERROR_IFETCH,
+-  MCE_INITIATOR_CPU,  MCE_SEV_ERROR_SYNC, },
+-{ 0, 0, 0, 0, 0, 0 } };
++  MCE_INITIATOR_CPU,  MCE_SEV_SEVERE, true },
++{ 0, 0, 0, 0, 0, 0, 0 } };
+ 
+ static const struct mce_ierror_table mce_p8_ierror_table[] = {
+ { 0x00000000081c0000, 0x0000000000040000, true,
+   MCE_ERROR_TYPE_UE,  MCE_UE_ERROR_IFETCH,
+-  MCE_INITIATOR_CPU,  MCE_SEV_ERROR_SYNC, },
++  MCE_INITIATOR_CPU,  MCE_SEV_SEVERE, true },
+ { 0x00000000081c0000, 0x0000000000080000, true,
+   MCE_ERROR_TYPE_SLB, MCE_SLB_ERROR_PARITY,
+-  MCE_INITIATOR_CPU,  MCE_SEV_ERROR_SYNC, },
++  MCE_INITIATOR_CPU,  MCE_SEV_SEVERE, true },
+ { 0x00000000081c0000, 0x00000000000c0000, true,
+   MCE_ERROR_TYPE_SLB, MCE_SLB_ERROR_MULTIHIT,
+-  MCE_INITIATOR_CPU,  MCE_SEV_ERROR_SYNC, },
++  MCE_INITIATOR_CPU,  MCE_SEV_WARNING, true },
+ { 0x00000000081c0000, 0x0000000000100000, true,
+   MCE_ERROR_TYPE_ERAT,MCE_ERAT_ERROR_MULTIHIT,
+-  MCE_INITIATOR_CPU,  MCE_SEV_ERROR_SYNC, },
++  MCE_INITIATOR_CPU,  MCE_SEV_WARNING, true },
+ { 0x00000000081c0000, 0x0000000000140000, true,
+   MCE_ERROR_TYPE_TLB, MCE_TLB_ERROR_MULTIHIT,
+-  MCE_INITIATOR_CPU,  MCE_SEV_ERROR_SYNC, },
++  MCE_INITIATOR_CPU,  MCE_SEV_WARNING, true },
+ { 0x00000000081c0000, 0x0000000000180000, true,
+   MCE_ERROR_TYPE_UE,  MCE_UE_ERROR_PAGE_TABLE_WALK_IFETCH,
+-  MCE_INITIATOR_CPU,  MCE_SEV_ERROR_SYNC, },
++  MCE_INITIATOR_CPU,  MCE_SEV_SEVERE, true },
+ { 0x00000000081c0000, 0x00000000001c0000, true,
+   MCE_ERROR_TYPE_UE,  MCE_UE_ERROR_IFETCH,
+-  MCE_INITIATOR_CPU,  MCE_SEV_ERROR_SYNC, },
++  MCE_INITIATOR_CPU,  MCE_SEV_SEVERE, true },
+ { 0x00000000081c0000, 0x0000000008000000, true,
+   MCE_ERROR_TYPE_LINK,MCE_LINK_ERROR_IFETCH_TIMEOUT,
+-  MCE_INITIATOR_CPU,  MCE_SEV_ERROR_SYNC, },
++  MCE_INITIATOR_CPU,  MCE_SEV_SEVERE, true },
+ { 0x00000000081c0000, 0x0000000008040000, true,
+   MCE_ERROR_TYPE_LINK,MCE_LINK_ERROR_PAGE_TABLE_WALK_IFETCH_TIMEOUT,
+-  MCE_INITIATOR_CPU,  MCE_SEV_ERROR_SYNC, },
+-{ 0, 0, 0, 0, 0, 0 } };
++  MCE_INITIATOR_CPU,  MCE_SEV_SEVERE, true },
++{ 0, 0, 0, 0, 0, 0, 0 } };
+ 
+ static const struct mce_ierror_table mce_p9_ierror_table[] = {
+ { 0x00000000081c0000, 0x0000000000040000, true,
+   MCE_ERROR_TYPE_UE,  MCE_UE_ERROR_IFETCH,
+-  MCE_INITIATOR_CPU,  MCE_SEV_ERROR_SYNC, },
++  MCE_INITIATOR_CPU,  MCE_SEV_SEVERE, true },
+ { 0x00000000081c0000, 0x0000000000080000, true,
+   MCE_ERROR_TYPE_SLB, MCE_SLB_ERROR_PARITY,
+-  MCE_INITIATOR_CPU,  MCE_SEV_ERROR_SYNC, },
++  MCE_INITIATOR_CPU,  MCE_SEV_SEVERE, true },
+ { 0x00000000081c0000, 0x00000000000c0000, true,
+   MCE_ERROR_TYPE_SLB, MCE_SLB_ERROR_MULTIHIT,
+-  MCE_INITIATOR_CPU,  MCE_SEV_ERROR_SYNC, },
++  MCE_INITIATOR_CPU,  MCE_SEV_WARNING, true },
+ { 0x00000000081c0000, 0x0000000000100000, true,
+   MCE_ERROR_TYPE_ERAT,MCE_ERAT_ERROR_MULTIHIT,
+-  MCE_INITIATOR_CPU,  MCE_SEV_ERROR_SYNC, },
++  MCE_INITIATOR_CPU,  MCE_SEV_WARNING, true },
+ { 0x00000000081c0000, 0x0000000000140000, true,
+   MCE_ERROR_TYPE_TLB, MCE_TLB_ERROR_MULTIHIT,
+-  MCE_INITIATOR_CPU,  MCE_SEV_ERROR_SYNC, },
++  MCE_INITIATOR_CPU,  MCE_SEV_WARNING, true },
+ { 0x00000000081c0000, 0x0000000000180000, true,
+   MCE_ERROR_TYPE_UE,  MCE_UE_ERROR_PAGE_TABLE_WALK_IFETCH,
+-  MCE_INITIATOR_CPU,  MCE_SEV_ERROR_SYNC, },
++  MCE_INITIATOR_CPU,  MCE_SEV_SEVERE, true },
+ { 0x00000000081c0000, 0x00000000001c0000, true,
+   MCE_ERROR_TYPE_RA,  MCE_RA_ERROR_IFETCH_FOREIGN,
+-  MCE_INITIATOR_CPU,  MCE_SEV_ERROR_SYNC, },
++  MCE_INITIATOR_CPU,  MCE_SEV_SEVERE, true },
+ { 0x00000000081c0000, 0x0000000008000000, true,
+   MCE_ERROR_TYPE_LINK,MCE_LINK_ERROR_IFETCH_TIMEOUT,
+-  MCE_INITIATOR_CPU,  MCE_SEV_ERROR_SYNC, },
++  MCE_INITIATOR_CPU,  MCE_SEV_SEVERE, true },
+ { 0x00000000081c0000, 0x0000000008040000, true,
+   MCE_ERROR_TYPE_LINK,MCE_LINK_ERROR_PAGE_TABLE_WALK_IFETCH_TIMEOUT,
+-  MCE_INITIATOR_CPU,  MCE_SEV_ERROR_SYNC, },
++  MCE_INITIATOR_CPU,  MCE_SEV_SEVERE, true },
+ { 0x00000000081c0000, 0x00000000080c0000, true,
+   MCE_ERROR_TYPE_RA,  MCE_RA_ERROR_IFETCH,
+-  MCE_INITIATOR_CPU,  MCE_SEV_ERROR_SYNC, },
++  MCE_INITIATOR_CPU,  MCE_SEV_SEVERE, true },
+ { 0x00000000081c0000, 0x0000000008100000, true,
+   MCE_ERROR_TYPE_RA,  MCE_RA_ERROR_PAGE_TABLE_WALK_IFETCH,
+-  MCE_INITIATOR_CPU,  MCE_SEV_ERROR_SYNC, },
++  MCE_INITIATOR_CPU,  MCE_SEV_SEVERE, true },
+ { 0x00000000081c0000, 0x0000000008140000, false,
+   MCE_ERROR_TYPE_RA,  MCE_RA_ERROR_STORE,
+-  MCE_INITIATOR_CPU,  MCE_SEV_FATAL, }, /* ASYNC is fatal */
++  MCE_INITIATOR_CPU,  MCE_SEV_FATAL, false }, /* ASYNC is fatal */
+ { 0x00000000081c0000, 0x0000000008180000, false,
+   MCE_ERROR_TYPE_LINK,MCE_LINK_ERROR_STORE_TIMEOUT,
+-  MCE_INITIATOR_CPU,  MCE_SEV_FATAL, }, /* ASYNC is fatal */
++  MCE_INITIATOR_CPU,  MCE_SEV_FATAL, false }, /* ASYNC is fatal */
+ { 0x00000000081c0000, 0x00000000081c0000, true,
+   MCE_ERROR_TYPE_RA,  MCE_RA_ERROR_PAGE_TABLE_WALK_IFETCH_FOREIGN,
+-  MCE_INITIATOR_CPU,  MCE_SEV_ERROR_SYNC, },
+-{ 0, 0, 0, 0, 0, 0 } };
++  MCE_INITIATOR_CPU,  MCE_SEV_SEVERE, true },
++{ 0, 0, 0, 0, 0, 0, 0 } };
+ 
+ struct mce_derror_table {
+ 	unsigned long dsisr_value;
+@@ -250,103 +251,104 @@ struct mce_derror_table {
+ 	unsigned int error_subtype;
+ 	unsigned int initiator;
+ 	unsigned int severity;
++	bool sync_error;
+ };
+ 
+ static const struct mce_derror_table mce_p7_derror_table[] = {
+ { 0x00008000, false,
+   MCE_ERROR_TYPE_UE,   MCE_UE_ERROR_LOAD_STORE,
+-  MCE_INITIATOR_CPU,   MCE_SEV_ERROR_SYNC, },
++  MCE_INITIATOR_CPU,   MCE_SEV_SEVERE, true },
+ { 0x00004000, true,
+   MCE_ERROR_TYPE_UE,   MCE_UE_ERROR_PAGE_TABLE_WALK_LOAD_STORE,
+-  MCE_INITIATOR_CPU,   MCE_SEV_ERROR_SYNC, },
++  MCE_INITIATOR_CPU,   MCE_SEV_SEVERE, true },
+ { 0x00000800, true,
+   MCE_ERROR_TYPE_ERAT, MCE_ERAT_ERROR_MULTIHIT,
+-  MCE_INITIATOR_CPU,   MCE_SEV_ERROR_SYNC, },
++  MCE_INITIATOR_CPU,   MCE_SEV_WARNING, true },
+ { 0x00000400, true,
+   MCE_ERROR_TYPE_TLB,  MCE_TLB_ERROR_MULTIHIT,
+-  MCE_INITIATOR_CPU,   MCE_SEV_ERROR_SYNC, },
++  MCE_INITIATOR_CPU,   MCE_SEV_WARNING, true },
+ { 0x00000080, true,
+   MCE_ERROR_TYPE_SLB,  MCE_SLB_ERROR_MULTIHIT,	/* Before PARITY */
+-  MCE_INITIATOR_CPU,   MCE_SEV_ERROR_SYNC, },
++  MCE_INITIATOR_CPU,   MCE_SEV_WARNING, true },
+ { 0x00000100, true,
+   MCE_ERROR_TYPE_SLB,  MCE_SLB_ERROR_PARITY,
+-  MCE_INITIATOR_CPU,   MCE_SEV_ERROR_SYNC, },
++  MCE_INITIATOR_CPU,   MCE_SEV_SEVERE, true },
+ { 0x00000040, true,
+   MCE_ERROR_TYPE_SLB,  MCE_SLB_ERROR_INDETERMINATE, /* BOTH */
+-  MCE_INITIATOR_CPU,   MCE_SEV_ERROR_SYNC, },
+-{ 0, false, 0, 0, 0, 0 } };
++  MCE_INITIATOR_CPU,   MCE_SEV_WARNING, true },
++{ 0, false, 0, 0, 0, 0, 0 } };
+ 
+ static const struct mce_derror_table mce_p8_derror_table[] = {
+ { 0x00008000, false,
+   MCE_ERROR_TYPE_UE,   MCE_UE_ERROR_LOAD_STORE,
+-  MCE_INITIATOR_CPU,   MCE_SEV_ERROR_SYNC, },
++  MCE_INITIATOR_CPU,   MCE_SEV_SEVERE, true },
+ { 0x00004000, true,
+   MCE_ERROR_TYPE_UE,   MCE_UE_ERROR_PAGE_TABLE_WALK_LOAD_STORE,
+-  MCE_INITIATOR_CPU,   MCE_SEV_ERROR_SYNC, },
++  MCE_INITIATOR_CPU,   MCE_SEV_SEVERE, true },
+ { 0x00002000, true,
+   MCE_ERROR_TYPE_LINK, MCE_LINK_ERROR_LOAD_TIMEOUT,
+-  MCE_INITIATOR_CPU,   MCE_SEV_ERROR_SYNC, },
++  MCE_INITIATOR_CPU,   MCE_SEV_SEVERE, true },
+ { 0x00001000, true,
+   MCE_ERROR_TYPE_LINK, MCE_LINK_ERROR_PAGE_TABLE_WALK_LOAD_STORE_TIMEOUT,
+-  MCE_INITIATOR_CPU,   MCE_SEV_ERROR_SYNC, },
++  MCE_INITIATOR_CPU,   MCE_SEV_SEVERE, true },
+ { 0x00000800, true,
+   MCE_ERROR_TYPE_ERAT, MCE_ERAT_ERROR_MULTIHIT,
+-  MCE_INITIATOR_CPU,   MCE_SEV_ERROR_SYNC, },
++  MCE_INITIATOR_CPU,   MCE_SEV_WARNING, true },
+ { 0x00000400, true,
+   MCE_ERROR_TYPE_TLB,  MCE_TLB_ERROR_MULTIHIT,
+-  MCE_INITIATOR_CPU,   MCE_SEV_ERROR_SYNC, },
++  MCE_INITIATOR_CPU,   MCE_SEV_WARNING, true },
+ { 0x00000200, true,
+   MCE_ERROR_TYPE_ERAT, MCE_ERAT_ERROR_MULTIHIT, /* SECONDARY ERAT */
+-  MCE_INITIATOR_CPU,   MCE_SEV_ERROR_SYNC, },
++  MCE_INITIATOR_CPU,   MCE_SEV_WARNING, true },
+ { 0x00000080, true,
+   MCE_ERROR_TYPE_SLB,  MCE_SLB_ERROR_MULTIHIT,	/* Before PARITY */
+-  MCE_INITIATOR_CPU,   MCE_SEV_ERROR_SYNC, },
++  MCE_INITIATOR_CPU,   MCE_SEV_WARNING, true },
+ { 0x00000100, true,
+   MCE_ERROR_TYPE_SLB,  MCE_SLB_ERROR_PARITY,
+-  MCE_INITIATOR_CPU,   MCE_SEV_ERROR_SYNC, },
+-{ 0, false, 0, 0, 0, 0 } };
++  MCE_INITIATOR_CPU,   MCE_SEV_SEVERE, true },
++{ 0, false, 0, 0, 0, 0, 0 } };
+ 
+ static const struct mce_derror_table mce_p9_derror_table[] = {
+ { 0x00008000, false,
+   MCE_ERROR_TYPE_UE,   MCE_UE_ERROR_LOAD_STORE,
+-  MCE_INITIATOR_CPU,   MCE_SEV_ERROR_SYNC, },
++  MCE_INITIATOR_CPU,   MCE_SEV_SEVERE, true },
+ { 0x00004000, true,
+   MCE_ERROR_TYPE_UE,   MCE_UE_ERROR_PAGE_TABLE_WALK_LOAD_STORE,
+-  MCE_INITIATOR_CPU,   MCE_SEV_ERROR_SYNC, },
++  MCE_INITIATOR_CPU,   MCE_SEV_SEVERE, true },
+ { 0x00002000, true,
+   MCE_ERROR_TYPE_LINK, MCE_LINK_ERROR_LOAD_TIMEOUT,
+-  MCE_INITIATOR_CPU,   MCE_SEV_ERROR_SYNC, },
++  MCE_INITIATOR_CPU,   MCE_SEV_SEVERE, true },
+ { 0x00001000, true,
+   MCE_ERROR_TYPE_LINK, MCE_LINK_ERROR_PAGE_TABLE_WALK_LOAD_STORE_TIMEOUT,
+-  MCE_INITIATOR_CPU,   MCE_SEV_ERROR_SYNC, },
++  MCE_INITIATOR_CPU,   MCE_SEV_SEVERE, true },
+ { 0x00000800, true,
+   MCE_ERROR_TYPE_ERAT, MCE_ERAT_ERROR_MULTIHIT,
+-  MCE_INITIATOR_CPU,   MCE_SEV_ERROR_SYNC, },
++  MCE_INITIATOR_CPU,   MCE_SEV_WARNING, true },
+ { 0x00000400, true,
+   MCE_ERROR_TYPE_TLB,  MCE_TLB_ERROR_MULTIHIT,
+-  MCE_INITIATOR_CPU,   MCE_SEV_ERROR_SYNC, },
++  MCE_INITIATOR_CPU,   MCE_SEV_WARNING, true },
+ { 0x00000200, false,
+   MCE_ERROR_TYPE_USER, MCE_USER_ERROR_TLBIE,
+-  MCE_INITIATOR_CPU,   MCE_SEV_ERROR_SYNC, },
++  MCE_INITIATOR_CPU,   MCE_SEV_WARNING, true },
+ { 0x00000080, true,
+   MCE_ERROR_TYPE_SLB,  MCE_SLB_ERROR_MULTIHIT,	/* Before PARITY */
+-  MCE_INITIATOR_CPU,   MCE_SEV_ERROR_SYNC, },
++  MCE_INITIATOR_CPU,   MCE_SEV_WARNING, true },
+ { 0x00000100, true,
+   MCE_ERROR_TYPE_SLB,  MCE_SLB_ERROR_PARITY,
+-  MCE_INITIATOR_CPU,   MCE_SEV_ERROR_SYNC, },
++  MCE_INITIATOR_CPU,   MCE_SEV_SEVERE, true },
+ { 0x00000040, true,
+   MCE_ERROR_TYPE_RA,   MCE_RA_ERROR_LOAD,
+-  MCE_INITIATOR_CPU,   MCE_SEV_ERROR_SYNC, },
++  MCE_INITIATOR_CPU,   MCE_SEV_SEVERE, true },
+ { 0x00000020, false,
+   MCE_ERROR_TYPE_RA,   MCE_RA_ERROR_PAGE_TABLE_WALK_LOAD_STORE,
+-  MCE_INITIATOR_CPU,   MCE_SEV_ERROR_SYNC, },
++  MCE_INITIATOR_CPU,   MCE_SEV_SEVERE, true },
+ { 0x00000010, false,
+   MCE_ERROR_TYPE_RA,   MCE_RA_ERROR_PAGE_TABLE_WALK_LOAD_STORE_FOREIGN,
+-  MCE_INITIATOR_CPU,   MCE_SEV_ERROR_SYNC, },
++  MCE_INITIATOR_CPU,   MCE_SEV_SEVERE, true },
+ { 0x00000008, false,
+   MCE_ERROR_TYPE_RA,   MCE_RA_ERROR_LOAD_STORE_FOREIGN,
+-  MCE_INITIATOR_CPU,   MCE_SEV_ERROR_SYNC, },
+-{ 0, false, 0, 0, 0, 0 } };
++  MCE_INITIATOR_CPU,   MCE_SEV_SEVERE, true },
++{ 0, false, 0, 0, 0, 0, 0 } };
+ 
+ static int mce_find_instr_ea_and_phys(struct pt_regs *regs, uint64_t *addr,
+ 					uint64_t *phys_addr)
+@@ -436,11 +438,12 @@ static int mce_handle_ierror(struct pt_regs *regs,
+ 			mce_err->u.link_error_type = table[i].error_subtype;
+ 			break;
+ 		}
++		mce_err->sync_error = table[i].sync_error;
+ 		mce_err->severity = table[i].severity;
+ 		mce_err->initiator = table[i].initiator;
+ 		if (table[i].nip_valid) {
+ 			*addr = regs->nip;
+-			if (mce_err->severity == MCE_SEV_ERROR_SYNC &&
++			if (mce_err->sync_error &&
+ 				table[i].error_type == MCE_ERROR_TYPE_UE) {
+ 				unsigned long pfn;
+ 
+@@ -457,8 +460,9 @@ static int mce_handle_ierror(struct pt_regs *regs,
+ 	}
+ 
+ 	mce_err->error_type = MCE_ERROR_TYPE_UNKNOWN;
+-	mce_err->severity = MCE_SEV_ERROR_SYNC;
++	mce_err->severity = MCE_SEV_SEVERE;
+ 	mce_err->initiator = MCE_INITIATOR_CPU;
++	mce_err->sync_error = true;
+ 
+ 	return 0;
+ }
+@@ -528,11 +532,12 @@ static int mce_handle_derror(struct pt_regs *regs,
+ 			mce_err->u.link_error_type = table[i].error_subtype;
+ 			break;
+ 		}
++		mce_err->sync_error = table[i].sync_error;
+ 		mce_err->severity = table[i].severity;
+ 		mce_err->initiator = table[i].initiator;
+ 		if (table[i].dar_valid)
+ 			*addr = regs->dar;
+-		else if (mce_err->severity == MCE_SEV_ERROR_SYNC &&
++		else if (mce_err->sync_error &&
+ 				table[i].error_type == MCE_ERROR_TYPE_UE) {
+ 			/*
+ 			 * We do a maximum of 4 nested MCE calls, see
+@@ -549,8 +554,9 @@ static int mce_handle_derror(struct pt_regs *regs,
+ 		return handled;
+ 
+ 	mce_err->error_type = MCE_ERROR_TYPE_UNKNOWN;
+-	mce_err->severity = MCE_SEV_ERROR_SYNC;
++	mce_err->severity = MCE_SEV_SEVERE;
+ 	mce_err->initiator = MCE_INITIATOR_CPU;
++	mce_err->sync_error = true;
+ 
+ 	return 0;
+ }
+diff --git a/arch/powerpc/platforms/powernv/opal.c b/arch/powerpc/platforms/powernv/opal.c
+index 054491677ba0..7923697c0320 100644
+--- a/arch/powerpc/platforms/powernv/opal.c
++++ b/arch/powerpc/platforms/powernv/opal.c
+@@ -494,7 +494,7 @@ static int opal_recover_mce(struct pt_regs *regs,
+ 		recovered = 0;
+ 	}
+ 
+-	if (!recovered && evt->severity == MCE_SEV_ERROR_SYNC) {
++	if (!recovered && evt->sync_error) {
+ 		/*
+ 		 * Try to kill processes if we get a synchronous machine check
+ 		 * (e.g., one caused by execution of this instruction). This
