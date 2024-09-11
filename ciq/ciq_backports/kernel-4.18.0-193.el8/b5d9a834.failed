@@ -1,0 +1,137 @@
+net/tls: don't clear TX resync flag on error
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-193.el8
+Rebuild_CHGLOG: - [net] tls: don't clear TX resync flag on error (Sabrina Dubroca) [1760375]
+Rebuild_FUZZ: 95.24%
+commit-author Dirk van der Merwe <dirk.vandermerwe@netronome.com>
+commit b5d9a834f4fd1b6abfa527ec351c871084dd23a3
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-193.el8/b5d9a834.failed
+
+Introduce a return code for the tls_dev_resync callback.
+
+When the driver TX resync fails, kernel can retry the resync again
+until it succeeds.  This prevents drivers from attempting to offload
+TLS packets if the connection is known to be out of sync.
+
+We don't worry about the RX resync since they will be retried naturally
+as more encrypted records get received.
+
+	Signed-off-by: Dirk van der Merwe <dirk.vandermerwe@netronome.com>
+	Reviewed-by: Jakub Kicinski <jakub.kicinski@netronome.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit b5d9a834f4fd1b6abfa527ec351c871084dd23a3)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/mellanox/mlx5/core/en_accel/tls.c
+#	drivers/net/ethernet/netronome/nfp/crypto/tls.c
+#	include/net/tls.h
+#	net/tls/tls_device.c
+diff --cc drivers/net/ethernet/mellanox/mlx5/core/en_accel/tls.c
+index e88340e196f7,ca07c86427a7..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_accel/tls.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_accel/tls.c
+@@@ -160,8 -160,9 +160,14 @@@ static void mlx5e_tls_del(struct net_de
+  				direction == TLS_OFFLOAD_CTX_DIR_TX);
+  }
+  
+++<<<<<<< HEAD
+ +static void mlx5e_tls_resync_rx(struct net_device *netdev, struct sock *sk,
+ +				u32 seq, u64 rcd_sn)
+++=======
++ static int mlx5e_tls_resync(struct net_device *netdev, struct sock *sk,
++ 			    u32 seq, u8 *rcd_sn_data,
++ 			    enum tls_offload_ctx_dir direction)
+++>>>>>>> b5d9a834f4fd (net/tls: don't clear TX resync flag on error)
+  {
+  	struct tls_context *tls_ctx = tls_get_ctx(sk);
+  	struct mlx5e_priv *priv = netdev_priv(netdev);
+diff --cc include/net/tls.h
+index 654ae56c8ae2,584609174fe0..000000000000
+--- a/include/net/tls.h
++++ b/include/net/tls.h
+@@@ -293,6 -291,32 +293,35 @@@ struct tls_context 
+  	refcount_t refcount;
+  };
+  
+++<<<<<<< HEAD
+++=======
++ enum tls_offload_ctx_dir {
++ 	TLS_OFFLOAD_CTX_DIR_RX,
++ 	TLS_OFFLOAD_CTX_DIR_TX,
++ };
++ 
++ struct tlsdev_ops {
++ 	int (*tls_dev_add)(struct net_device *netdev, struct sock *sk,
++ 			   enum tls_offload_ctx_dir direction,
++ 			   struct tls_crypto_info *crypto_info,
++ 			   u32 start_offload_tcp_sn);
++ 	void (*tls_dev_del)(struct net_device *netdev,
++ 			    struct tls_context *ctx,
++ 			    enum tls_offload_ctx_dir direction);
++ 	int (*tls_dev_resync)(struct net_device *netdev,
++ 			      struct sock *sk, u32 seq, u8 *rcd_sn,
++ 			      enum tls_offload_ctx_dir direction);
++ };
++ 
++ enum tls_offload_sync_type {
++ 	TLS_OFFLOAD_SYNC_TYPE_DRIVER_REQ = 0,
++ 	TLS_OFFLOAD_SYNC_TYPE_CORE_NEXT_HINT = 1,
++ };
++ 
++ #define TLS_DEVICE_RESYNC_NH_START_IVAL		2
++ #define TLS_DEVICE_RESYNC_NH_MAX_IVAL		128
++ 
+++>>>>>>> b5d9a834f4fd (net/tls: don't clear TX resync flag on error)
+  struct tls_offload_context_rx {
+  	/* sw must be the first member of tls_offload_context_rx */
+  	struct tls_sw_context_rx sw;
+diff --cc net/tls/tls_device.c
+index 330d54f9f11e,77fa3b5f2b49..000000000000
+--- a/net/tls/tls_device.c
++++ b/net/tls/tls_device.c
+@@@ -209,6 -209,33 +209,36 @@@ void tls_device_free_resources_tx(struc
+  	tls_free_partial_record(sk, tls_ctx);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static void tls_device_resync_tx(struct sock *sk, struct tls_context *tls_ctx,
++ 				 u32 seq)
++ {
++ 	struct net_device *netdev;
++ 	struct sk_buff *skb;
++ 	int err = 0;
++ 	u8 *rcd_sn;
++ 
++ 	skb = tcp_write_queue_tail(sk);
++ 	if (skb)
++ 		TCP_SKB_CB(skb)->eor = 1;
++ 
++ 	rcd_sn = tls_ctx->tx.rec_seq;
++ 
++ 	down_read(&device_offload_lock);
++ 	netdev = tls_ctx->netdev;
++ 	if (netdev)
++ 		err = netdev->tlsdev_ops->tls_dev_resync(netdev, sk, seq,
++ 							 rcd_sn,
++ 							 TLS_OFFLOAD_CTX_DIR_TX);
++ 	up_read(&device_offload_lock);
++ 	if (err)
++ 		return;
++ 
++ 	clear_bit_unlock(TLS_TX_SYNC_SCHED, &tls_ctx->flags);
++ }
++ 
+++>>>>>>> b5d9a834f4fd (net/tls: don't clear TX resync flag on error)
+  static void tls_append_frag(struct tls_record_info *record,
+  			    struct page_frag *pfrag,
+  			    int size)
+* Unmerged path drivers/net/ethernet/netronome/nfp/crypto/tls.c
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/en_accel/tls.c
+* Unmerged path drivers/net/ethernet/netronome/nfp/crypto/tls.c
+* Unmerged path include/net/tls.h
+* Unmerged path net/tls/tls_device.c
