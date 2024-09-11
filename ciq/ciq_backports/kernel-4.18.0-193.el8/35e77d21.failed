@@ -1,0 +1,377 @@
+SUNRPC: Add rpc_auth::au_ralign field
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-193.el8
+commit-author Chuck Lever <chuck.lever@oracle.com>
+commit 35e77d21baa04b554bf3dc9a08dfa7e569286e51
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-193.el8/35e77d21.failed
+
+Currently rpc_inline_rcv_pages() uses au_rslack to estimate the
+size of the upper layer reply header. This is fine for auth flavors
+where au_verfsize == au_rslack.
+
+However, some auth flavors have more going on. krb5i for example has
+two more words after the verifier, and another blob following the
+RPC message. The calculation involving au_rslack pushes the upper
+layer reply header too far into the rcv_buf.
+
+au_rslack is still valuable: it's the amount of buffer space needed
+for the reply, and is used when allocating the reply buffer. We'll
+keep that.
+
+But, add a new field that can be used to properly estimate the
+location of the upper layer header in each RPC reply, based on the
+auth flavor in use.
+
+	Signed-off-by: Chuck Lever <chuck.lever@oracle.com>
+	Signed-off-by: Anna Schumaker <Anna.Schumaker@Netapp.com>
+(cherry picked from commit 35e77d21baa04b554bf3dc9a08dfa7e569286e51)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/sunrpc/auth.h
+#	net/sunrpc/auth_gss/auth_gss.c
+#	net/sunrpc/auth_null.c
+#	net/sunrpc/auth_unix.c
+#	net/sunrpc/clnt.c
+diff --cc include/linux/sunrpc/auth.h
+index bca2741a3eb0,5f9076fdb090..000000000000
+--- a/include/linux/sunrpc/auth.h
++++ b/include/linux/sunrpc/auth.h
+@@@ -74,14 -74,12 +74,20 @@@ struct rpc_cred_cache
+  struct rpc_authops;
+  struct rpc_auth {
+  	unsigned int		au_cslack;	/* call cred size estimate */
+++<<<<<<< HEAD
+ +				/* guess at number of u32's auth adds before
+ +				 * reply data; normally the verifier size: */
+ +	unsigned int		au_rslack;
+ +				/* for gss, used to calculate au_rslack: */
+ +	unsigned int		au_verfsize;
+- 
+- 	unsigned int		au_flags;	/* various flags */
+- 	const struct rpc_authops *au_ops;		/* operations */
+++=======
++ 	unsigned int		au_rslack;	/* reply cred size estimate */
++ 	unsigned int		au_verfsize;	/* size of reply verifier */
++ 	unsigned int		au_ralign;	/* words before UL header */
+++>>>>>>> 35e77d21baa0 (SUNRPC: Add rpc_auth::au_ralign field)
++ 
++ 	unsigned int		au_flags;
++ 	const struct rpc_authops *au_ops;
+  	rpc_authflavor_t	au_flavor;	/* pseudoflavor (note may
+  						 * differ from the flavor in
+  						 * au_ops->au_flavor in gss
+diff --cc net/sunrpc/auth_gss/auth_gss.c
+index 6e951620fbcd,c67e2ad151ae..000000000000
+--- a/net/sunrpc/auth_gss/auth_gss.c
++++ b/net/sunrpc/auth_gss/auth_gss.c
+@@@ -1053,6 -1016,8 +1053,11 @@@ gss_create_new(const struct rpc_auth_cr
+  	auth = &gss_auth->rpc_auth;
+  	auth->au_cslack = GSS_CRED_SLACK >> 2;
+  	auth->au_rslack = GSS_VERF_SLACK >> 2;
+++<<<<<<< HEAD
+++=======
++ 	auth->au_verfsize = GSS_VERF_SLACK >> 2;
++ 	auth->au_ralign = GSS_VERF_SLACK >> 2;
+++>>>>>>> 35e77d21baa0 (SUNRPC: Add rpc_auth::au_ralign field)
+  	auth->au_flags = 0;
+  	auth->au_ops = &authgss_ops;
+  	auth->au_flavor = flavor;
+@@@ -1920,79 -1889,113 +1925,125 @@@ out
+  	return status;
+  }
+  
+ -static int
+ -gss_unwrap_resp_auth(struct rpc_cred *cred)
+ +static inline int
+ +gss_unwrap_resp_integ(struct rpc_cred *cred, struct gss_cl_ctx *ctx,
+ +		struct rpc_rqst *rqstp, __be32 **p)
+  {
+++<<<<<<< HEAD
+ +	struct xdr_buf	*rcv_buf = &rqstp->rq_rcv_buf;
+ +	struct xdr_buf integ_buf;
+++=======
++ 	struct rpc_auth *auth = cred->cr_auth;
++ 
++ 	auth->au_rslack = auth->au_verfsize;
++ 	auth->au_ralign = auth->au_verfsize;
++ 	return 0;
++ }
++ 
++ static int
++ gss_unwrap_resp_integ(struct rpc_task *task, struct rpc_cred *cred,
++ 		      struct gss_cl_ctx *ctx, struct rpc_rqst *rqstp,
++ 		      struct xdr_stream *xdr)
++ {
++ 	struct xdr_buf integ_buf, *rcv_buf = &rqstp->rq_rcv_buf;
++ 	u32 data_offset, mic_offset, integ_len, maj_stat;
++ 	struct rpc_auth *auth = cred->cr_auth;
+++>>>>>>> 35e77d21baa0 (SUNRPC: Add rpc_auth::au_ralign field)
+  	struct xdr_netobj mic;
+ -	__be32 *p;
+ +	u32 data_offset, mic_offset;
+ +	u32 integ_len;
+ +	u32 maj_stat;
+ +	int status = -EIO;
+  
+ -	p = xdr_inline_decode(xdr, 2 * sizeof(*p));
+ -	if (unlikely(!p))
+ -		goto unwrap_failed;
+ -	integ_len = be32_to_cpup(p++);
+ +	integ_len = ntohl(*(*p)++);
+  	if (integ_len & 3)
+ -		goto unwrap_failed;
+ -	data_offset = (u8 *)(p) - (u8 *)rcv_buf->head[0].iov_base;
+ +		return status;
+ +	data_offset = (u8 *)(*p) - (u8 *)rcv_buf->head[0].iov_base;
+  	mic_offset = integ_len + data_offset;
+  	if (mic_offset > rcv_buf->len)
+ -		goto unwrap_failed;
+ -	if (be32_to_cpup(p) != rqstp->rq_seqno)
+ -		goto bad_seqno;
+ +		return status;
+ +	if (ntohl(*(*p)++) != rqstp->rq_seqno)
+ +		return status;
+ +
+ +	if (xdr_buf_subsegment(rcv_buf, &integ_buf, data_offset,
+ +				mic_offset - data_offset))
+ +		return status;
+  
+ -	if (xdr_buf_subsegment(rcv_buf, &integ_buf, data_offset, integ_len))
+ -		goto unwrap_failed;
+  	if (xdr_buf_read_netobj(rcv_buf, &mic, mic_offset))
+ -		goto unwrap_failed;
+ +		return status;
+ +
+  	maj_stat = gss_verify_mic(ctx->gc_gss_ctx, &integ_buf, &mic);
+  	if (maj_stat == GSS_S_CONTEXT_EXPIRED)
+  		clear_bit(RPCAUTH_CRED_UPTODATE, &cred->cr_flags);
+  	if (maj_stat != GSS_S_COMPLETE)
+++<<<<<<< HEAD
+ +		return status;
+++=======
++ 		goto bad_mic;
++ 
++ 	auth->au_rslack = auth->au_verfsize + 2 + 1 + XDR_QUADLEN(mic.len);
++ 	auth->au_ralign = auth->au_verfsize + 2;
+++>>>>>>> 35e77d21baa0 (SUNRPC: Add rpc_auth::au_ralign field)
+  	return 0;
+ -unwrap_failed:
+ -	trace_rpcgss_unwrap_failed(task);
+ -	return -EIO;
+ -bad_seqno:
+ -	trace_rpcgss_bad_seqno(task, rqstp->rq_seqno, be32_to_cpup(p));
+ -	return -EIO;
+ -bad_mic:
+ -	trace_rpcgss_verify_mic(task, maj_stat);
+ -	return -EIO;
+  }
+  
+ -static int
+ -gss_unwrap_resp_priv(struct rpc_task *task, struct rpc_cred *cred,
+ -		     struct gss_cl_ctx *ctx, struct rpc_rqst *rqstp,
+ -		     struct xdr_stream *xdr)
+ -{
+ +static inline int
+ +gss_unwrap_resp_priv(struct rpc_cred *cred, struct gss_cl_ctx *ctx,
+ +		struct rpc_rqst *rqstp, __be32 **p)
+ +{
+++<<<<<<< HEAD
+ +	struct xdr_buf  *rcv_buf = &rqstp->rq_rcv_buf;
+ +	u32 offset;
+ +	u32 opaque_len;
+ +	u32 maj_stat;
+ +	int status = -EIO;
+++=======
++ 	struct xdr_buf *rcv_buf = &rqstp->rq_rcv_buf;
++ 	struct kvec *head = rqstp->rq_rcv_buf.head;
++ 	struct rpc_auth *auth = cred->cr_auth;
++ 	unsigned int savedlen = rcv_buf->len;
++ 	u32 offset, opaque_len, maj_stat;
++ 	__be32 *p;
+++>>>>>>> 35e77d21baa0 (SUNRPC: Add rpc_auth::au_ralign field)
+  
+ -	p = xdr_inline_decode(xdr, 2 * sizeof(*p));
+ -	if (unlikely(!p))
+ -		goto unwrap_failed;
+ -	opaque_len = be32_to_cpup(p++);
+ -	offset = (u8 *)(p) - (u8 *)head->iov_base;
+ +	opaque_len = ntohl(*(*p)++);
+ +	offset = (u8 *)(*p) - (u8 *)rcv_buf->head[0].iov_base;
+  	if (offset + opaque_len > rcv_buf->len)
+ -		goto unwrap_failed;
+ +		return status;
+ +	/* remove padding: */
+  	rcv_buf->len = offset + opaque_len;
+  
+  	maj_stat = gss_unwrap(ctx->gc_gss_ctx, offset, rcv_buf);
+  	if (maj_stat == GSS_S_CONTEXT_EXPIRED)
+  		clear_bit(RPCAUTH_CRED_UPTODATE, &cred->cr_flags);
+  	if (maj_stat != GSS_S_COMPLETE)
+ -		goto bad_unwrap;
+ -	/* gss_unwrap decrypted the sequence number */
+ -	if (be32_to_cpup(p++) != rqstp->rq_seqno)
+ -		goto bad_seqno;
+ +		return status;
+ +	if (ntohl(*(*p)++) != rqstp->rq_seqno)
+ +		return status;
+  
+++<<<<<<< HEAD
+++=======
++ 	/* gss_unwrap redacts the opaque blob from the head iovec.
++ 	 * rcv_buf has changed, thus the stream needs to be reset.
++ 	 */
++ 	xdr_init_decode(xdr, rcv_buf, p, rqstp);
++ 
++ 	auth->au_rslack = auth->au_verfsize + 2 +
++ 			  XDR_QUADLEN(savedlen - rcv_buf->len);
++ 	auth->au_ralign = auth->au_verfsize + 2 +
++ 			  XDR_QUADLEN(savedlen - rcv_buf->len);
+++>>>>>>> 35e77d21baa0 (SUNRPC: Add rpc_auth::au_ralign field)
+  	return 0;
+ -unwrap_failed:
+ -	trace_rpcgss_unwrap_failed(task);
+ -	return -EIO;
+ -bad_seqno:
+ -	trace_rpcgss_bad_seqno(task, rqstp->rq_seqno, be32_to_cpup(--p));
+ -	return -EIO;
+ -bad_unwrap:
+ -	trace_rpcgss_unwrap(task, maj_stat);
+ -	return -EIO;
+ +}
+ +
+ +static int
+ +gss_unwrap_req_decode(kxdrdproc_t decode, struct rpc_rqst *rqstp,
+ +		      __be32 *p, void *obj)
+ +{
+ +	struct xdr_stream xdr;
+ +
+ +	xdr_init_decode(&xdr, &rqstp->rq_rcv_buf, p, rqstp);
+ +	return decode(rqstp, &xdr, obj);
+  }
+  
+  static bool
+diff --cc net/sunrpc/auth_null.c
+index d0ceac57c06e,41a633a4049e..000000000000
+--- a/net/sunrpc/auth_null.c
++++ b/net/sunrpc/auth_null.c
+@@@ -114,6 -114,8 +114,11 @@@ stati
+  struct rpc_auth null_auth = {
+  	.au_cslack	= NUL_CALLSLACK,
+  	.au_rslack	= NUL_REPLYSLACK,
+++<<<<<<< HEAD
+++=======
++ 	.au_verfsize	= NUL_REPLYSLACK,
++ 	.au_ralign	= NUL_REPLYSLACK,
+++>>>>>>> 35e77d21baa0 (SUNRPC: Add rpc_auth::au_ralign field)
+  	.au_ops		= &authnull_ops,
+  	.au_flavor	= RPC_AUTH_NULL,
+  	.au_count	= REFCOUNT_INIT(1),
+diff --cc net/sunrpc/auth_unix.c
+index fc8a59134640,c048eb6deaaf..000000000000
+--- a/net/sunrpc/auth_unix.c
++++ b/net/sunrpc/auth_unix.c
+@@@ -142,29 -160,35 +142,36 @@@ unx_refresh(struct rpc_task *task
+  	return 0;
+  }
+  
+ -static int
+ -unx_validate(struct rpc_task *task, struct xdr_stream *xdr)
+ +static __be32 *
+ +unx_validate(struct rpc_task *task, __be32 *p)
+  {
+ -	struct rpc_auth *auth = task->tk_rqstp->rq_cred->cr_auth;
+ -	__be32 *p;
+ -	u32 size;
+ -
+ -	p = xdr_inline_decode(xdr, 2 * sizeof(*p));
+ -	if (!p)
+ -		return -EIO;
+ -	switch (*p++) {
+ -	case rpc_auth_null:
+ -	case rpc_auth_unix:
+ -	case rpc_auth_short:
+ -		break;
+ -	default:
+ -		return -EIO;
+ +	rpc_authflavor_t	flavor;
+ +	u32			size;
+ +
+ +	flavor = ntohl(*p++);
+ +	if (flavor != RPC_AUTH_NULL &&
+ +	    flavor != RPC_AUTH_UNIX &&
+ +	    flavor != RPC_AUTH_SHORT) {
+ +		printk("RPC: bad verf flavor: %u\n", flavor);
+ +		return ERR_PTR(-EIO);
+ +	}
+ +
+++<<<<<<< HEAD
+ +	size = ntohl(*p++);
+ +	if (size > RPC_MAX_AUTH_SIZE) {
+ +		printk("RPC: giant verf size: %u\n", size);
+ +		return ERR_PTR(-EIO);
+  	}
+ -	size = be32_to_cpup(p);
+ -	if (size > RPC_MAX_AUTH_SIZE)
+ -		return -EIO;
+ -	p = xdr_inline_decode(xdr, size);
+ -	if (!p)
+ -		return -EIO;
+ +	task->tk_rqstp->rq_cred->cr_auth->au_rslack = (size >> 2) + 2;
+ +	p += (size >> 2);
+  
+ +	return p;
+++=======
++ 	auth->au_verfsize = XDR_QUADLEN(size) + 2;
++ 	auth->au_rslack = XDR_QUADLEN(size) + 2;
++ 	auth->au_ralign = XDR_QUADLEN(size) + 2;
++ 	return 0;
+++>>>>>>> 35e77d21baa0 (SUNRPC: Add rpc_auth::au_ralign field)
+  }
+  
+  int __init rpc_init_authunix(void)
+diff --cc net/sunrpc/clnt.c
+index 415348b16ff1,99bfeb17367c..000000000000
+--- a/net/sunrpc/clnt.c
++++ b/net/sunrpc/clnt.c
+@@@ -1169,6 -1164,29 +1169,32 @@@ struct rpc_task *rpc_run_bc_task(struc
+  }
+  #endif /* CONFIG_SUNRPC_BACKCHANNEL */
+  
+++<<<<<<< HEAD
+++=======
++ /**
++  * rpc_prepare_reply_pages - Prepare to receive a reply data payload into pages
++  * @req: RPC request to prepare
++  * @pages: vector of struct page pointers
++  * @base: offset in first page where receive should start, in bytes
++  * @len: expected size of the upper layer data payload, in bytes
++  * @hdrsize: expected size of upper layer reply header, in XDR words
++  *
++  */
++ void rpc_prepare_reply_pages(struct rpc_rqst *req, struct page **pages,
++ 			     unsigned int base, unsigned int len,
++ 			     unsigned int hdrsize)
++ {
++ 	/* Subtract one to force an extra word of buffer space for the
++ 	 * payload's XDR pad to fall into the rcv_buf's tail iovec.
++ 	 */
++ 	hdrsize += RPC_REPHDRSIZE + req->rq_cred->cr_auth->au_ralign - 1;
++ 
++ 	xdr_inline_pages(&req->rq_rcv_buf, hdrsize << 2, pages, base, len);
++ 	trace_rpc_reply_pages(req);
++ }
++ EXPORT_SYMBOL_GPL(rpc_prepare_reply_pages);
++ 
+++>>>>>>> 35e77d21baa0 (SUNRPC: Add rpc_auth::au_ralign field)
+  void
+  rpc_call_start(struct rpc_task *task)
+  {
+* Unmerged path include/linux/sunrpc/auth.h
+* Unmerged path net/sunrpc/auth_gss/auth_gss.c
+* Unmerged path net/sunrpc/auth_null.c
+* Unmerged path net/sunrpc/auth_unix.c
+* Unmerged path net/sunrpc/clnt.c
