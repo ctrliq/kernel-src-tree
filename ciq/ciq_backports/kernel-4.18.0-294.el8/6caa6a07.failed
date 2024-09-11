@@ -1,0 +1,120 @@
+mm: memcontrol: move out cgroup swaprate throttling
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Johannes Weiner <hannes@cmpxchg.org>
+commit 6caa6a0703e03236f46461342e31ca53d0e3c091
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/6caa6a07.failed
+
+The cgroup swaprate throttling is about matching new anon allocations to
+the rate of available IO when that is being throttled.  It's the io
+controller hooking into the VM, rather than a memory controller thing.
+
+Rename mem_cgroup_throttle_swaprate() to cgroup_throttle_swaprate(), and
+drop the @memcg argument which is only used to check whether the preceding
+page charge has succeeded and the fault is proceeding.
+
+We could decouple the call from mem_cgroup_try_charge() here as well, but
+that would cause unnecessary churn: the following patches convert all
+callsites to a new charge API and we'll decouple as we go along.
+
+	Signed-off-by: Johannes Weiner <hannes@cmpxchg.org>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Reviewed-by: Alex Shi <alex.shi@linux.alibaba.com>
+	Reviewed-by: Joonsoo Kim <iamjoonsoo.kim@lge.com>
+	Reviewed-by: Shakeel Butt <shakeelb@google.com>
+	Cc: Hugh Dickins <hughd@google.com>
+	Cc: "Kirill A. Shutemov" <kirill@shutemov.name>
+	Cc: Michal Hocko <mhocko@suse.com>
+	Cc: Roman Gushchin <guro@fb.com>
+	Cc: Balbir Singh <bsingharora@gmail.com>
+Link: http://lkml.kernel.org/r/20200508183105.225460-5-hannes@cmpxchg.org
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit 6caa6a0703e03236f46461342e31ca53d0e3c091)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	mm/memcontrol.c
+diff --cc mm/memcontrol.c
+index ef707fd00e25,bc0f55d0cc08..000000000000
+--- a/mm/memcontrol.c
++++ b/mm/memcontrol.c
+@@@ -6359,15 -6551,13 +6359,20 @@@ out
+  }
+  
+  int mem_cgroup_try_charge_delay(struct page *page, struct mm_struct *mm,
+ -			  gfp_t gfp_mask, struct mem_cgroup **memcgp)
+ +			  gfp_t gfp_mask, struct mem_cgroup **memcgp,
+ +			  bool compound)
+  {
+- 	struct mem_cgroup *memcg;
+  	int ret;
+  
+++<<<<<<< HEAD
+ +	ret = mem_cgroup_try_charge(page, mm, gfp_mask, memcgp, compound);
+ +	memcg = *memcgp;
+ +	mem_cgroup_throttle_swaprate(memcg, page_to_nid(page), gfp_mask);
+++=======
++ 	ret = mem_cgroup_try_charge(page, mm, gfp_mask, memcgp);
++ 	if (*memcgp)
++ 		cgroup_throttle_swaprate(page, gfp_mask);
+++>>>>>>> 6caa6a0703e0 (mm: memcontrol: move out cgroup swaprate throttling)
+  	return ret;
+  }
+  
+diff --git a/include/linux/swap.h b/include/linux/swap.h
+index 8552871db183..f653c4e9fd32 100644
+--- a/include/linux/swap.h
++++ b/include/linux/swap.h
+@@ -649,11 +649,9 @@ static inline int mem_cgroup_swappiness(struct mem_cgroup *mem)
+ #endif
+ 
+ #if defined(CONFIG_SWAP) && defined(CONFIG_MEMCG) && defined(CONFIG_BLK_CGROUP)
+-extern void mem_cgroup_throttle_swaprate(struct mem_cgroup *memcg, int node,
+-					 gfp_t gfp_mask);
++extern void cgroup_throttle_swaprate(struct page *page, gfp_t gfp_mask);
+ #else
+-static inline void mem_cgroup_throttle_swaprate(struct mem_cgroup *memcg,
+-						int node, gfp_t gfp_mask)
++static inline void cgroup_throttle_swaprate(struct page *page, gfp_t gfp_mask)
+ {
+ }
+ #endif
+* Unmerged path mm/memcontrol.c
+diff --git a/mm/swapfile.c b/mm/swapfile.c
+index b77fb155eaf4..0095e3fa4548 100644
+--- a/mm/swapfile.c
++++ b/mm/swapfile.c
+@@ -3916,11 +3916,12 @@ static void free_swap_count_continuations(struct swap_info_struct *si)
+ }
+ 
+ #if defined(CONFIG_MEMCG) && defined(CONFIG_BLK_CGROUP)
+-void mem_cgroup_throttle_swaprate(struct mem_cgroup *memcg, int node,
+-				  gfp_t gfp_mask)
++void cgroup_throttle_swaprate(struct page *page, gfp_t gfp_mask)
+ {
+ 	struct swap_info_struct *si, *next;
+-	if (!(gfp_mask & __GFP_IO) || !memcg)
++	int nid = page_to_nid(page);
++
++	if (!(gfp_mask & __GFP_IO))
+ 		return;
+ 
+ 	if (!blk_cgroup_congested())
+@@ -3934,11 +3935,10 @@ void mem_cgroup_throttle_swaprate(struct mem_cgroup *memcg, int node,
+ 		return;
+ 
+ 	spin_lock(&swap_avail_lock);
+-	plist_for_each_entry_safe(si, next, &swap_avail_heads[node],
+-				  avail_lists[node]) {
++	plist_for_each_entry_safe(si, next, &swap_avail_heads[nid],
++				  avail_lists[nid]) {
+ 		if (si->bdev) {
+-			blkcg_schedule_throttle(bdev_get_queue(si->bdev),
+-						true);
++			blkcg_schedule_throttle(bdev_get_queue(si->bdev), true);
+ 			break;
+ 		}
+ 	}
