@@ -2232,9 +2232,11 @@ static int ionic_open(struct net_device *netdev)
 	if (test_and_clear_bit(IONIC_LIF_F_BROKEN, lif->state))
 		netdev_info(netdev, "clearing broken state\n");
 
+	mutex_lock(&lif->queue_lock);
+
 	err = ionic_txrx_alloc(lif);
 	if (err)
-		return err;
+		goto err_unlock;
 
 	err = ionic_txrx_init(lif);
 	if (err)
@@ -2255,12 +2257,15 @@ static int ionic_open(struct net_device *netdev)
 			goto err_txrx_deinit;
 	}
 
+	mutex_unlock(&lif->queue_lock);
 	return 0;
 
 err_txrx_deinit:
 	ionic_txrx_deinit(lif);
 err_txrx_free:
 	ionic_txrx_free(lif);
+err_unlock:
+	mutex_unlock(&lif->queue_lock);
 	return err;
 }
 
@@ -2280,9 +2285,11 @@ static int ionic_stop(struct net_device *netdev)
 	if (test_bit(IONIC_LIF_F_FW_RESET, lif->state))
 		return 0;
 
+	mutex_lock(&lif->queue_lock);
 	ionic_stop_queues(lif);
 	ionic_txrx_deinit(lif);
 	ionic_txrx_free(lif);
+	mutex_unlock(&lif->queue_lock);
 
 	return 0;
 }
