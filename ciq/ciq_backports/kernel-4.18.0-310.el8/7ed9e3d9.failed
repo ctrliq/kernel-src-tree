@@ -1,0 +1,176 @@
+vhost-vdpa: fix page pinning leakage in error path
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-310.el8
+commit-author Si-Wei Liu <si-wei.liu@oracle.com>
+commit 7ed9e3d97c32d969caded2dfb6e67c1a2cc5a0b1
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-310.el8/7ed9e3d9.failed
+
+Pinned pages are not properly accounted particularly when
+mapping error occurs on IOTLB update. Clean up dangling
+pinned pages for the error path. As the inflight pinned
+pages, specifically for memory region that strides across
+multiple chunks, would need more than one free page for
+book keeping and accounting. For simplicity, pin pages
+for all memory in the IOVA range in one go rather than
+have multiple pin_user_pages calls to make up the entire
+region. This way it's easier to track and account the
+pages already mapped, particularly for clean-up in the
+error path.
+
+Fixes: 4c8cf31885f6 ("vhost: introduce vDPA-based backend")
+	Signed-off-by: Si-Wei Liu <si-wei.liu@oracle.com>
+Link: https://lore.kernel.org/r/1601701330-16837-3-git-send-email-si-wei.liu@oracle.com
+	Signed-off-by: Michael S. Tsirkin <mst@redhat.com>
+(cherry picked from commit 7ed9e3d97c32d969caded2dfb6e67c1a2cc5a0b1)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/vhost/vdpa.c
+diff --cc drivers/vhost/vdpa.c
+index 3a75e8b39c56,62a9bb0efc55..000000000000
+--- a/drivers/vhost/vdpa.c
++++ b/drivers/vhost/vdpa.c
+@@@ -617,61 -615,86 +615,129 @@@ static int vhost_vdpa_process_iotlb_upd
+  	if (!npages)
+  		return -EINVAL;
+  
+++<<<<<<< HEAD
+ +	down_read(&dev->mm->mmap_sem);
+++=======
++ 	page_list = kvmalloc_array(npages, sizeof(struct page *), GFP_KERNEL);
++ 	vmas = kvmalloc_array(npages, sizeof(struct vm_area_struct *),
++ 			      GFP_KERNEL);
++ 	if (!page_list || !vmas) {
++ 		ret = -ENOMEM;
++ 		goto free;
++ 	}
+  
+- 	locked = atomic64_add_return(npages, &dev->mm->pinned_vm);
+- 	lock_limit = rlimit(RLIMIT_MEMLOCK) >> PAGE_SHIFT;
++ 	mmap_read_lock(dev->mm);
+++>>>>>>> 7ed9e3d97c32 (vhost-vdpa: fix page pinning leakage in error path)
+  
+- 	if (locked > lock_limit) {
++ 	lock_limit = rlimit(RLIMIT_MEMLOCK) >> PAGE_SHIFT;
++ 	if (npages + atomic64_read(&dev->mm->pinned_vm) > lock_limit) {
+  		ret = -ENOMEM;
+- 		goto out;
++ 		goto unlock;
+  	}
+  
+++<<<<<<< HEAD
+ +	cur_base = msg->uaddr & PAGE_MASK;
+ +	iova &= PAGE_MASK;
+ +
+ +	while (npages) {
+ +		pinned = min_t(unsigned long, npages, list_size);
+ +		ret = get_user_pages(cur_base, pinned,
+ +				     gup_flags, page_list, NULL);
+ +		if (ret != pinned)
+ +			goto out;
+ +
+ +		if (!last_pfn)
+ +			map_pfn = page_to_pfn(page_list[0]);
+ +
+ +		for (i = 0; i < ret; i++) {
+ +			unsigned long this_pfn = page_to_pfn(page_list[i]);
+ +			u64 csize;
+ +
+ +			if (last_pfn && (this_pfn != last_pfn + 1)) {
+ +				/* Pin a contiguous chunk of memory */
+ +				csize = (last_pfn - map_pfn + 1) << PAGE_SHIFT;
+ +				if (vhost_vdpa_map(v, iova, csize,
+ +						   map_pfn << PAGE_SHIFT,
+ +						   msg->perm))
+ +					goto out;
+ +				map_pfn = this_pfn;
+ +				iova += csize;
+ +			}
+ +
+ +			last_pfn = this_pfn;
+++=======
++ 	pinned = pin_user_pages(msg->uaddr & PAGE_MASK, npages, gup_flags,
++ 				page_list, vmas);
++ 	if (npages != pinned) {
++ 		if (pinned < 0) {
++ 			ret = pinned;
++ 		} else {
++ 			unpin_user_pages(page_list, pinned);
++ 			ret = -ENOMEM;
+++>>>>>>> 7ed9e3d97c32 (vhost-vdpa: fix page pinning leakage in error path)
+  		}
++ 		goto unlock;
++ 	}
+  
+- 		cur_base += ret << PAGE_SHIFT;
+- 		npages -= ret;
++ 	iova &= PAGE_MASK;
++ 	map_pfn = page_to_pfn(page_list[0]);
++ 
++ 	/* One more iteration to avoid extra vdpa_map() call out of loop. */
++ 	for (i = 0; i <= npages; i++) {
++ 		unsigned long this_pfn;
++ 		u64 csize;
++ 
++ 		/* The last chunk may have no valid PFN next to it */
++ 		this_pfn = i < npages ? page_to_pfn(page_list[i]) : -1UL;
++ 
++ 		if (last_pfn && (this_pfn == -1UL ||
++ 				 this_pfn != last_pfn + 1)) {
++ 			/* Pin a contiguous chunk of memory */
++ 			csize = last_pfn - map_pfn + 1;
++ 			ret = vhost_vdpa_map(v, iova, csize << PAGE_SHIFT,
++ 					     map_pfn << PAGE_SHIFT,
++ 					     msg->perm);
++ 			if (ret) {
++ 				/*
++ 				 * Unpin the rest chunks of memory on the
++ 				 * flight with no corresponding vdpa_map()
++ 				 * calls having been made yet. On the other
++ 				 * hand, vdpa_unmap() in the failure path
++ 				 * is in charge of accounting the number of
++ 				 * pinned pages for its own.
++ 				 * This asymmetrical pattern of accounting
++ 				 * is for efficiency to pin all pages at
++ 				 * once, while there is no other callsite
++ 				 * of vdpa_map() than here above.
++ 				 */
++ 				unpin_user_pages(&page_list[nmap],
++ 						 npages - nmap);
++ 				goto out;
++ 			}
++ 			atomic64_add(csize, &dev->mm->pinned_vm);
++ 			nmap += csize;
++ 			iova += csize << PAGE_SHIFT;
++ 			map_pfn = this_pfn;
++ 		}
++ 		last_pfn = this_pfn;
+  	}
+  
+- 	/* Pin the rest chunk */
+- 	ret = vhost_vdpa_map(v, iova, (last_pfn - map_pfn + 1) << PAGE_SHIFT,
+- 			     map_pfn << PAGE_SHIFT, msg->perm);
++ 	WARN_ON(nmap != npages);
+  out:
+- 	if (ret) {
++ 	if (ret)
+  		vhost_vdpa_unmap(v, msg->iova, msg->size);
+++<<<<<<< HEAD
+ +		atomic64_sub(npages, &dev->mm->pinned_vm);
+ +	}
+ +	up_read(&dev->mm->mmap_sem);
+ +	free_page((unsigned long)page_list);
+++=======
++ unlock:
++ 	mmap_read_unlock(dev->mm);
++ free:
++ 	kvfree(vmas);
++ 	kvfree(page_list);
+++>>>>>>> 7ed9e3d97c32 (vhost-vdpa: fix page pinning leakage in error path)
+  	return ret;
+  }
+  
+* Unmerged path drivers/vhost/vdpa.c
