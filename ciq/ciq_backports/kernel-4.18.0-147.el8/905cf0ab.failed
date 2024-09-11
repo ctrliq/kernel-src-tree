@@ -1,0 +1,171 @@
+rtnetlink: Update rtnl_dump_ifinfo for strict data checking
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-147.el8
+commit-author David Ahern <dsahern@gmail.com>
+commit 905cf0abe8c2c892313f08e38d808eee4e794987
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-147.el8/905cf0ab.failed
+
+Update rtnl_dump_ifinfo for strict data checking. If the flag is set,
+the dump request is expected to have an ifinfomsg struct as the header
+potentially followed by one or more attributes. Any data passed in the
+header or as an attribute is taken as a request to influence the data
+returned. Only values supported by the dump handler are allowed to be
+non-0 or set in the request. At the moment only the IFA_TARGET_NETNSID,
+IFLA_EXT_MASK, IFLA_MASTER, and IFLA_LINKINFO attributes are supported.
+
+Existing code does not fail the dump if nlmsg_parse fails. That behavior
+is kept for non-strict checking.
+
+	Signed-off-by: David Ahern <dsahern@gmail.com>
+	Acked-by: Christian Brauner <christian@brauner.io>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 905cf0abe8c2c892313f08e38d808eee4e794987)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/core/rtnetlink.c
+diff --cc net/core/rtnetlink.c
+index 6f954f7b6892,12fd52105005..000000000000
+--- a/net/core/rtnetlink.c
++++ b/net/core/rtnetlink.c
+@@@ -1881,9 -1876,54 +1881,53 @@@ static struct net *get_target_net(struc
+  	}
+  	return net;
+  }
+ -EXPORT_SYMBOL_GPL(rtnl_get_net_ns_capable);
+  
++ static int rtnl_valid_dump_ifinfo_req(const struct nlmsghdr *nlh,
++ 				      bool strict_check, struct nlattr **tb,
++ 				      struct netlink_ext_ack *extack)
++ {
++ 	int hdrlen;
++ 
++ 	if (strict_check) {
++ 		struct ifinfomsg *ifm;
++ 
++ 		if (nlh->nlmsg_len < nlmsg_msg_size(sizeof(*ifm))) {
++ 			NL_SET_ERR_MSG(extack, "Invalid header for link dump");
++ 			return -EINVAL;
++ 		}
++ 
++ 		ifm = nlmsg_data(nlh);
++ 		if (ifm->__ifi_pad || ifm->ifi_type || ifm->ifi_flags ||
++ 		    ifm->ifi_change) {
++ 			NL_SET_ERR_MSG(extack, "Invalid values in header for link dump request");
++ 			return -EINVAL;
++ 		}
++ 		if (ifm->ifi_index) {
++ 			NL_SET_ERR_MSG(extack, "Filter by device index not supported for link dumps");
++ 			return -EINVAL;
++ 		}
++ 
++ 		return nlmsg_parse_strict(nlh, sizeof(*ifm), tb, IFLA_MAX,
++ 					  ifla_policy, extack);
++ 	}
++ 
++ 	/* A hack to preserve kernel<->userspace interface.
++ 	 * The correct header is ifinfomsg. It is consistent with rtnl_getlink.
++ 	 * However, before Linux v3.9 the code here assumed rtgenmsg and that's
++ 	 * what iproute2 < v3.9.0 used.
++ 	 * We can detect the old iproute2. Even including the IFLA_EXT_MASK
++ 	 * attribute, its netlink message is shorter than struct ifinfomsg.
++ 	 */
++ 	hdrlen = nlmsg_len(nlh) < sizeof(struct ifinfomsg) ?
++ 		 sizeof(struct rtgenmsg) : sizeof(struct ifinfomsg);
++ 
++ 	return nlmsg_parse(nlh, hdrlen, tb, IFLA_MAX, ifla_policy, extack);
++ }
++ 
+  static int rtnl_dump_ifinfo(struct sk_buff *skb, struct netlink_callback *cb)
+  {
++ 	struct netlink_ext_ack *extack = cb->extack;
++ 	const struct nlmsghdr *nlh = cb->nlh;
+  	struct net *net = sock_net(skb->sk);
+  	struct net *tgt_net = net;
+  	int h, s_h;
+@@@ -1902,38 -1941,49 +1945,72 @@@
+  	s_h = cb->args[0];
+  	s_idx = cb->args[1];
+  
+- 	/* A hack to preserve kernel<->userspace interface.
+- 	 * The correct header is ifinfomsg. It is consistent with rtnl_getlink.
+- 	 * However, before Linux v3.9 the code here assumed rtgenmsg and that's
+- 	 * what iproute2 < v3.9.0 used.
+- 	 * We can detect the old iproute2. Even including the IFLA_EXT_MASK
+- 	 * attribute, its netlink message is shorter than struct ifinfomsg.
+- 	 */
+- 	hdrlen = nlmsg_len(cb->nlh) < sizeof(struct ifinfomsg) ?
+- 		 sizeof(struct rtgenmsg) : sizeof(struct ifinfomsg);
++ 	err = rtnl_valid_dump_ifinfo_req(nlh, cb->strict_check, tb, extack);
++ 	if (err < 0) {
++ 		if (cb->strict_check)
++ 			return err;
+  
+++<<<<<<< HEAD
+ +	if (nlmsg_parse(cb->nlh, hdrlen, tb, IFLA_MAX,
+ +			ifla_policy, NULL) >= 0) {
+ +		if (tb[IFLA_IF_NETNSID]) {
+ +			netnsid = nla_get_s32(tb[IFLA_IF_NETNSID]);
+ +			tgt_net = get_target_net(skb->sk, netnsid);
+ +			if (IS_ERR(tgt_net))
+ +				return PTR_ERR(tgt_net);
+ +		}
+ +
+ +		if (tb[IFLA_EXT_MASK])
+ +			ext_filter_mask = nla_get_u32(tb[IFLA_EXT_MASK]);
+ +
+ +		if (tb[IFLA_MASTER])
+ +			master_idx = nla_get_u32(tb[IFLA_MASTER]);
+ +
+ +		if (tb[IFLA_LINKINFO])
+ +			kind_ops = linkinfo_to_kind_ops(tb[IFLA_LINKINFO]);
+ +
+ +		if (master_idx || kind_ops)
+ +			flags |= NLM_F_DUMP_FILTERED;
+++=======
++ 		goto walk_entries;
+++>>>>>>> 905cf0abe8c2 (rtnetlink: Update rtnl_dump_ifinfo for strict data checking)
+  	}
+  
++ 	for (i = 0; i <= IFLA_MAX; ++i) {
++ 		if (!tb[i])
++ 			continue;
++ 
++ 		/* new attributes should only be added with strict checking */
++ 		switch (i) {
++ 		case IFLA_TARGET_NETNSID:
++ 			netnsid = nla_get_s32(tb[i]);
++ 			tgt_net = rtnl_get_net_ns_capable(skb->sk, netnsid);
++ 			if (IS_ERR(tgt_net)) {
++ 				NL_SET_ERR_MSG(extack, "Invalid target network namespace id");
++ 				return PTR_ERR(tgt_net);
++ 			}
++ 			break;
++ 		case IFLA_EXT_MASK:
++ 			ext_filter_mask = nla_get_u32(tb[i]);
++ 			break;
++ 		case IFLA_MASTER:
++ 			master_idx = nla_get_u32(tb[i]);
++ 			break;
++ 		case IFLA_LINKINFO:
++ 			kind_ops = linkinfo_to_kind_ops(tb[i]);
++ 			break;
++ 		default:
++ 			if (cb->strict_check) {
++ 				NL_SET_ERR_MSG(extack, "Unsupported attribute in link dump request");
++ 				return -EINVAL;
++ 			}
++ 		}
++ 	}
++ 
++ 	if (master_idx || kind_ops)
++ 		flags |= NLM_F_DUMP_FILTERED;
++ 
++ walk_entries:
+  	for (h = s_h; h < NETDEV_HASHENTRIES; h++, s_idx = 0) {
+  		idx = 0;
+  		head = &tgt_net->dev_index_head[h];
+* Unmerged path net/core/rtnetlink.c
