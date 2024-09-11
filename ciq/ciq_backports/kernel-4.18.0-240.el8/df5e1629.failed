@@ -1,0 +1,188 @@
+netfilter: conntrack: remove pkt_to_tuple callback
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Florian Westphal <fw@strlen.de>
+commit df5e1629087a45ca915fa0f69ea662175261855e
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/df5e1629.failed
+
+GRE is now builtin, so we can handle it via direct call and
+remove the callback.
+
+	Signed-off-by: Florian Westphal <fw@strlen.de>
+	Signed-off-by: Pablo Neira Ayuso <pablo@netfilter.org>
+(cherry picked from commit df5e1629087a45ca915fa0f69ea662175261855e)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/netfilter/nf_conntrack_proto_gre.h
+#	net/netfilter/nf_conntrack_core.c
+#	net/netfilter/nf_conntrack_proto_generic.c
+diff --cc include/linux/netfilter/nf_conntrack_proto_gre.h
+index b8d95564bd53,25f9a770fb84..000000000000
+--- a/include/linux/netfilter/nf_conntrack_proto_gre.h
++++ b/include/linux/netfilter/nf_conntrack_proto_gre.h
+@@@ -28,7 -29,8 +28,12 @@@ int nf_ct_gre_keymap_add(struct nf_con
+  /* delete keymap entries */
+  void nf_ct_gre_keymap_destroy(struct nf_conn *ct);
+  
+++<<<<<<< HEAD
+ +void nf_nat_need_gre(void);
+ +
+++=======
++ bool gre_pkt_to_tuple(const struct sk_buff *skb, unsigned int dataoff,
++ 		      struct net *net, struct nf_conntrack_tuple *tuple);
+++>>>>>>> df5e1629087a (netfilter: conntrack: remove pkt_to_tuple callback)
+  #endif /* __KERNEL__ */
+  #endif /* _CONNTRACK_PROTO_GRE_H */
+diff --cc net/netfilter/nf_conntrack_core.c
+index 680e0b0d92a5,b71e271f2b44..000000000000
+--- a/net/netfilter/nf_conntrack_core.c
++++ b/net/netfilter/nf_conntrack_core.c
+@@@ -275,8 -274,16 +275,21 @@@ nf_ct_get_tuple(const struct sk_buff *s
+  	tuple->dst.protonum = protonum;
+  	tuple->dst.dir = IP_CT_DIR_ORIGINAL;
+  
+++<<<<<<< HEAD
+ +	if (unlikely(l4proto->pkt_to_tuple))
+ +		return l4proto->pkt_to_tuple(skb, dataoff, net, tuple);
+++=======
++ 	switch (protonum) {
++ 	case IPPROTO_ICMPV6:
++ 		return icmpv6_pkt_to_tuple(skb, dataoff, net, tuple);
++ 	case IPPROTO_ICMP:
++ 		return icmp_pkt_to_tuple(skb, dataoff, net, tuple);
++ #ifdef CONFIG_NF_CT_PROTO_GRE
++ 	case IPPROTO_GRE:
++ 		return gre_pkt_to_tuple(skb, dataoff, net, tuple);
++ #endif
++ 	}
+++>>>>>>> df5e1629087a (netfilter: conntrack: remove pkt_to_tuple callback)
+  
+  	/* Actually only need first 4 bytes to get ports. */
+  	inet_hdr = skb_header_pointer(skb, dataoff, sizeof(_inet_hdr), &_inet_hdr);
+diff --cc net/netfilter/nf_conntrack_proto_generic.c
+index 5ceb58c2c816,5a5bf7cb6508..000000000000
+--- a/net/netfilter/nf_conntrack_proto_generic.c
++++ b/net/netfilter/nf_conntrack_proto_generic.c
+@@@ -26,48 -27,26 +26,51 @@@ static bool nf_generic_should_process(u
+  	}
+  }
+  
+++<<<<<<< HEAD
+ +static inline struct nf_generic_net *generic_pernet(struct net *net)
+ +{
+ +	return &net->ct.nf_ct_proto.generic;
+ +}
+ +
+ +static bool generic_pkt_to_tuple(const struct sk_buff *skb,
+ +				 unsigned int dataoff,
+ +				 struct net *net, struct nf_conntrack_tuple *tuple)
+ +{
+ +	tuple->src.u.all = 0;
+ +	tuple->dst.u.all = 0;
+ +
+ +	return true;
+ +}
+ +
+ +static unsigned int *generic_get_timeouts(struct net *net)
+ +{
+ +	return &(generic_pernet(net)->timeout);
+ +}
+ +
+++=======
+++>>>>>>> df5e1629087a (netfilter: conntrack: remove pkt_to_tuple callback)
+  /* Returns verdict for packet, or -1 for invalid. */
+  static int generic_packet(struct nf_conn *ct,
+ -			  struct sk_buff *skb,
+ +			  const struct sk_buff *skb,
+  			  unsigned int dataoff,
+  			  enum ip_conntrack_info ctinfo,
+ -			  const struct nf_hook_state *state)
+ +			  unsigned int *timeout)
+  {
+ -	const unsigned int *timeout = nf_ct_timeout_lookup(ct);
+ +	nf_ct_refresh_acct(ct, ctinfo, skb, *timeout);
+ +	return NF_ACCEPT;
+ +}
+  
+ -	if (!nf_generic_should_process(nf_ct_protonum(ct))) {
+ +/* Called when a new connection for this protocol found. */
+ +static bool generic_new(struct nf_conn *ct, const struct sk_buff *skb,
+ +			unsigned int dataoff, unsigned int *timeouts)
+ +{
+ +	bool ret;
+ +
+ +	ret = nf_generic_should_process(nf_ct_protonum(ct));
+ +	if (!ret)
+  		pr_warn_once("conntrack: generic helper won't handle protocol %d. Please consider loading the specific helper module.\n",
+  			     nf_ct_protonum(ct));
+ -		return -NF_ACCEPT;
+ -	}
+ -
+ -	if (!timeout)
+ -		timeout = &nf_generic_pernet(nf_ct_net(ct))->timeout;
+ -
+ -	nf_ct_refresh_acct(ct, ctinfo, skb, *timeout);
+ -	return NF_ACCEPT;
+ +	return ret;
+  }
+  
+  #ifdef CONFIG_NF_CONNTRACK_TIMEOUT
+@@@ -156,12 -138,8 +159,11 @@@ static struct nf_proto_net *generic_get
+  
+  const struct nf_conntrack_l4proto nf_conntrack_l4proto_generic =
+  {
+ +	.l3proto		= PF_UNSPEC,
+  	.l4proto		= 255,
+- 	.pkt_to_tuple		= generic_pkt_to_tuple,
+  	.packet			= generic_packet,
+ +	.get_timeouts		= generic_get_timeouts,
+ +	.new			= generic_new,
+  #ifdef CONFIG_NF_CONNTRACK_TIMEOUT
+  	.ctnl_timeout		= {
+  		.nlattr_to_obj	= generic_timeout_nlattr_to_obj,
+* Unmerged path include/linux/netfilter/nf_conntrack_proto_gre.h
+diff --git a/include/net/netfilter/nf_conntrack_l4proto.h b/include/net/netfilter/nf_conntrack_l4proto.h
+index 264f50873a3a..636cfdfab00f 100644
+--- a/include/net/netfilter/nf_conntrack_l4proto.h
++++ b/include/net/netfilter/nf_conntrack_l4proto.h
+@@ -30,11 +30,6 @@ struct nf_conntrack_l4proto {
+ 	/* protoinfo nlattr size, closes a hole */
+ 	u16 nlattr_size;
+ 
+-	/* Try to fill in the third arg: dataoff is offset past network protocol
+-           hdr.  Return true if possible. */
+-	bool (*pkt_to_tuple)(const struct sk_buff *skb, unsigned int dataoff,
+-			     struct net *net, struct nf_conntrack_tuple *tuple);
+-
+ 	/* Invert the per-proto part of the tuple: ie. turn xmit into reply.
+ 	 * Only used by icmp, most protocols use a generic version.
+ 	 */
+* Unmerged path net/netfilter/nf_conntrack_core.c
+* Unmerged path net/netfilter/nf_conntrack_proto_generic.c
+diff --git a/net/netfilter/nf_conntrack_proto_gre.c b/net/netfilter/nf_conntrack_proto_gre.c
+index c9e1b1061af6..fb4f0b0bf17e 100644
+--- a/net/netfilter/nf_conntrack_proto_gre.c
++++ b/net/netfilter/nf_conntrack_proto_gre.c
+@@ -180,8 +180,8 @@ EXPORT_SYMBOL_GPL(nf_ct_gre_keymap_destroy);
+ /* PUBLIC CONNTRACK PROTO HELPER FUNCTIONS */
+ 
+ /* gre hdr info to tuple */
+-static bool gre_pkt_to_tuple(const struct sk_buff *skb, unsigned int dataoff,
+-			     struct net *net, struct nf_conntrack_tuple *tuple)
++bool gre_pkt_to_tuple(const struct sk_buff *skb, unsigned int dataoff,
++		      struct net *net, struct nf_conntrack_tuple *tuple)
+ {
+ 	const struct pptp_gre_header *pgrehdr;
+ 	struct pptp_gre_header _pgrehdr;
+@@ -346,7 +346,6 @@ static int gre_init_net(struct net *net)
+ static const struct nf_conntrack_l4proto nf_conntrack_l4proto_gre4 = {
+ 	.l3proto	 = AF_INET,
+ 	.l4proto	 = IPPROTO_GRE,
+-	.pkt_to_tuple	 = gre_pkt_to_tuple,
+ #ifdef CONFIG_NF_CONNTRACK_PROCFS
+ 	.print_conntrack = gre_print_conntrack,
+ #endif
