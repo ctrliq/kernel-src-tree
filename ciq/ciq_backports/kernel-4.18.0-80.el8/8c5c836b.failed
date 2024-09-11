@@ -1,0 +1,277 @@
+vfs: clean up generic_remap_file_range_prep return value
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-80.el8
+commit-author Darrick J. Wong <darrick.wong@oracle.com>
+commit 8c5c836bd6c3b9f9fc1c5a210d630b8c42f4f7df
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-80.el8/8c5c836b.failed
+
+Since the remap prep function can update the length of the remap
+request, we can change this function to return the usual return status
+instead of the odd behavior it has now.
+
+	Signed-off-by: Darrick J. Wong <darrick.wong@oracle.com>
+	Reviewed-by: Christoph Hellwig <hch@lst.de>
+	Signed-off-by: Dave Chinner <david@fromorbit.com>
+
+(cherry picked from commit 8c5c836bd6c3b9f9fc1c5a210d630b8c42f4f7df)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/ocfs2/refcounttree.c
+#	fs/read_write.c
+#	fs/xfs/xfs_reflink.c
+diff --cc fs/ocfs2/refcounttree.c
+index 35fa3d6d96ae,46bbd315c39f..000000000000
+--- a/fs/ocfs2/refcounttree.c
++++ b/fs/ocfs2/refcounttree.c
+@@@ -4843,8 -4851,8 +4843,13 @@@ int ocfs2_reflink_remap_range(struct fi
+  		goto out_unlock;
+  
+  	ret = generic_remap_file_range_prep(file_in, pos_in, file_out, pos_out,
+++<<<<<<< HEAD
+ +			&len, is_dedupe);
+ +	if (ret <= 0)
+++=======
++ 			&len, remap_flags);
++ 	if (ret < 0 || len == 0)
+++>>>>>>> 8c5c836bd6c3 (vfs: clean up generic_remap_file_range_prep return value)
+  		goto out_unlock;
+  
+  	/* Lock out changes to the allocation maps and remap. */
+diff --cc fs/read_write.c
+index 734c5661fb69,6b40a43edf18..000000000000
+--- a/fs/read_write.c
++++ b/fs/read_write.c
+@@@ -1978,12 -1842,186 +1978,194 @@@ int vfs_dedupe_file_range_compare(struc
+  out_error:
+  	return error;
+  }
+ +EXPORT_SYMBOL(vfs_dedupe_file_range_compare);
+  
+++<<<<<<< HEAD
+ +int vfs_dedupe_file_range_one(struct file *src_file, loff_t src_pos,
+ +			      struct file *dst_file, loff_t dst_pos, u64 len)
+ +{
+ +	s64 ret;
+++=======
++ /*
++  * Check that the two inodes are eligible for cloning, the ranges make
++  * sense, and then flush all dirty data.  Caller must ensure that the
++  * inodes have been locked against any other modifications.
++  *
++  * If there's an error, then the usual negative error code is returned.
++  * Otherwise returns 0 with *len set to the request length.
++  */
++ int generic_remap_file_range_prep(struct file *file_in, loff_t pos_in,
++ 				  struct file *file_out, loff_t pos_out,
++ 				  loff_t *len, unsigned int remap_flags)
++ {
++ 	struct inode *inode_in = file_inode(file_in);
++ 	struct inode *inode_out = file_inode(file_out);
++ 	bool same_inode = (inode_in == inode_out);
++ 	int ret;
++ 
++ 	/* Don't touch certain kinds of inodes */
++ 	if (IS_IMMUTABLE(inode_out))
++ 		return -EPERM;
++ 
++ 	if (IS_SWAPFILE(inode_in) || IS_SWAPFILE(inode_out))
++ 		return -ETXTBSY;
++ 
++ 	/* Don't reflink dirs, pipes, sockets... */
++ 	if (S_ISDIR(inode_in->i_mode) || S_ISDIR(inode_out->i_mode))
++ 		return -EISDIR;
++ 	if (!S_ISREG(inode_in->i_mode) || !S_ISREG(inode_out->i_mode))
++ 		return -EINVAL;
++ 
++ 	/* Zero length dedupe exits immediately; reflink goes to EOF. */
++ 	if (*len == 0) {
++ 		loff_t isize = i_size_read(inode_in);
++ 
++ 		if ((remap_flags & REMAP_FILE_DEDUP) || pos_in == isize)
++ 			return 0;
++ 		if (pos_in > isize)
++ 			return -EINVAL;
++ 		*len = isize - pos_in;
++ 		if (*len == 0)
++ 			return 0;
++ 	}
++ 
++ 	/* Check that we don't violate system file offset limits. */
++ 	ret = generic_remap_checks(file_in, pos_in, file_out, pos_out, len,
++ 			remap_flags);
++ 	if (ret)
++ 		return ret;
++ 
++ 	/* Wait for the completion of any pending IOs on both files */
++ 	inode_dio_wait(inode_in);
++ 	if (!same_inode)
++ 		inode_dio_wait(inode_out);
++ 
++ 	ret = filemap_write_and_wait_range(inode_in->i_mapping,
++ 			pos_in, pos_in + *len - 1);
++ 	if (ret)
++ 		return ret;
++ 
++ 	ret = filemap_write_and_wait_range(inode_out->i_mapping,
++ 			pos_out, pos_out + *len - 1);
++ 	if (ret)
++ 		return ret;
++ 
++ 	/*
++ 	 * Check that the extents are the same.
++ 	 */
++ 	if (remap_flags & REMAP_FILE_DEDUP) {
++ 		bool		is_same = false;
++ 
++ 		ret = vfs_dedupe_file_range_compare(inode_in, pos_in,
++ 				inode_out, pos_out, *len, &is_same);
++ 		if (ret)
++ 			return ret;
++ 		if (!is_same)
++ 			return -EBADE;
++ 	}
++ 
++ 	ret = generic_remap_check_len(inode_in, inode_out, pos_out, len,
++ 			remap_flags);
++ 	if (ret)
++ 		return ret;
++ 
++ 	/* If can't alter the file contents, we're done. */
++ 	if (!(remap_flags & REMAP_FILE_DEDUP)) {
++ 		/* Update the timestamps, since we can alter file contents. */
++ 		if (!(file_out->f_mode & FMODE_NOCMTIME)) {
++ 			ret = file_update_time(file_out);
++ 			if (ret)
++ 				return ret;
++ 		}
++ 
++ 		/*
++ 		 * Clear the security bits if the process is not being run by
++ 		 * root.  This keeps people from modifying setuid and setgid
++ 		 * binaries.
++ 		 */
++ 		ret = file_remove_privs(file_out);
++ 		if (ret)
++ 			return ret;
++ 	}
++ 
++ 	return 0;
++ }
++ EXPORT_SYMBOL(generic_remap_file_range_prep);
++ 
++ loff_t do_clone_file_range(struct file *file_in, loff_t pos_in,
++ 			   struct file *file_out, loff_t pos_out,
++ 			   loff_t len, unsigned int remap_flags)
++ {
++ 	struct inode *inode_in = file_inode(file_in);
++ 	struct inode *inode_out = file_inode(file_out);
++ 	loff_t ret;
++ 
++ 	WARN_ON_ONCE(remap_flags);
++ 
++ 	if (S_ISDIR(inode_in->i_mode) || S_ISDIR(inode_out->i_mode))
++ 		return -EISDIR;
++ 	if (!S_ISREG(inode_in->i_mode) || !S_ISREG(inode_out->i_mode))
++ 		return -EINVAL;
++ 
++ 	/*
++ 	 * FICLONE/FICLONERANGE ioctls enforce that src and dest files are on
++ 	 * the same mount. Practically, they only need to be on the same file
++ 	 * system.
++ 	 */
++ 	if (inode_in->i_sb != inode_out->i_sb)
++ 		return -EXDEV;
++ 
++ 	if (!(file_in->f_mode & FMODE_READ) ||
++ 	    !(file_out->f_mode & FMODE_WRITE) ||
++ 	    (file_out->f_flags & O_APPEND))
++ 		return -EBADF;
++ 
++ 	if (!file_in->f_op->remap_file_range)
++ 		return -EOPNOTSUPP;
++ 
++ 	ret = remap_verify_area(file_in, pos_in, len, false);
++ 	if (ret)
++ 		return ret;
++ 
++ 	ret = remap_verify_area(file_out, pos_out, len, true);
++ 	if (ret)
++ 		return ret;
++ 
++ 	ret = file_in->f_op->remap_file_range(file_in, pos_in,
++ 			file_out, pos_out, len, remap_flags);
++ 	if (ret < 0)
++ 		return ret;
++ 
++ 	fsnotify_access(file_in);
++ 	fsnotify_modify(file_out);
++ 	return ret;
++ }
++ EXPORT_SYMBOL(do_clone_file_range);
++ 
++ loff_t vfs_clone_file_range(struct file *file_in, loff_t pos_in,
++ 			    struct file *file_out, loff_t pos_out,
++ 			    loff_t len, unsigned int remap_flags)
++ {
++ 	loff_t ret;
++ 
++ 	file_start_write(file_out);
++ 	ret = do_clone_file_range(file_in, pos_in, file_out, pos_out, len,
++ 				  remap_flags);
++ 	file_end_write(file_out);
++ 
++ 	return ret;
++ }
++ EXPORT_SYMBOL(vfs_clone_file_range);
++ 
++ loff_t vfs_dedupe_file_range_one(struct file *src_file, loff_t src_pos,
++ 				 struct file *dst_file, loff_t dst_pos,
++ 				 loff_t len, unsigned int remap_flags)
++ {
++ 	loff_t ret;
++ 
++ 	WARN_ON_ONCE(remap_flags & ~(REMAP_FILE_DEDUP |
++ 				     REMAP_FILE_CAN_SHORTEN));
+++>>>>>>> 8c5c836bd6c3 (vfs: clean up generic_remap_file_range_prep return value)
+  
+  	ret = mnt_want_write_file(dst_file);
+  	if (ret)
+diff --cc fs/xfs/xfs_reflink.c
+index a7757a128a78,9b1ea42c81d1..000000000000
+--- a/fs/xfs/xfs_reflink.c
++++ b/fs/xfs/xfs_reflink.c
+@@@ -1327,8 -1328,8 +1327,13 @@@ xfs_reflink_remap_prep
+  		goto out_unlock;
+  
+  	ret = generic_remap_file_range_prep(file_in, pos_in, file_out, pos_out,
+++<<<<<<< HEAD
+ +			len, is_dedupe);
+ +	if (ret <= 0)
+++=======
++ 			len, remap_flags);
++ 	if (ret < 0 || *len == 0)
+++>>>>>>> 8c5c836bd6c3 (vfs: clean up generic_remap_file_range_prep return value)
+  		goto out_unlock;
+  
+  	/*
+@@@ -1430,8 -1408,8 +1435,13 @@@ xfs_reflink_remap_range
+  
+  	/* Prepare and then clone file data. */
+  	ret = xfs_reflink_remap_prep(file_in, pos_in, file_out, pos_out,
+++<<<<<<< HEAD
+ +			&len, is_dedupe);
+ +	if (ret <= 0)
+++=======
++ 			&len, remap_flags);
++ 	if (ret < 0 || len == 0)
+++>>>>>>> 8c5c836bd6c3 (vfs: clean up generic_remap_file_range_prep return value)
+  		return ret;
+  
+  	trace_xfs_reflink_remap_range(src, pos_in, len, dest, pos_out);
+* Unmerged path fs/ocfs2/refcounttree.c
+* Unmerged path fs/read_write.c
+* Unmerged path fs/xfs/xfs_reflink.c
