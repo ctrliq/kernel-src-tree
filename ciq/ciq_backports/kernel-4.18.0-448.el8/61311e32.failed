@@ -1,0 +1,158 @@
+s390/pci: narrow scope of zpci_configure_device()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-448.el8
+commit-author Niklas Schnelle <schnelle@linux.ibm.com>
+commit 61311e32892b008886478bdba4ce2a34f4d938f8
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-448.el8/61311e32.failed
+
+Currently zpci_configure_device() can be called on a zPCI function in
+two completely different states. Either the underlying zPCI function has
+already been configured by the platform and we are only doing the
+scanning to get it usable by Linux drivers. Or the underlying function
+is in Standby and we first do an SCLP to get it configured. This makes
+zpci_configure_device() harder to reason about. Since calling
+zpci_configure_device() on a function in Standby only happens in
+enable_slot() simply pull out the SCLP call and setting of zdev->state
+and thus call zpci_configure_device() under the same circumstances as
+in the event handling code.
+
+	Reviewed-by: Matthew Rosato <mjrosato@linux.ibm.com>
+	Reviewed-by: Pierre Morel <pmorel@linux.ibm.com>
+	Signed-off-by: Niklas Schnelle <schnelle@linux.ibm.com>
+	Signed-off-by: Heiko Carstens <hca@linux.ibm.com>
+(cherry picked from commit 61311e32892b008886478bdba4ce2a34f4d938f8)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/s390/pci/pci.c
+#	drivers/pci/hotplug/s390_pci_hpc.c
+diff --cc arch/s390/pci/pci.c
+index 6af47e2fa8a9,c01b6dbac7cf..000000000000
+--- a/arch/s390/pci/pci.c
++++ b/arch/s390/pci/pci.c
+@@@ -746,33 -727,45 +746,63 @@@ int zpci_create_device(struct zpci_dev 
+  	list_add_tail(&zdev->entry, &zpci_list);
+  	spin_unlock(&zpci_list_lock);
+  
+ -	return zdev;
+ +	rc = zpci_init_iommu(zdev);
+ +	if (rc)
+ +		goto out;
+  
+++<<<<<<< HEAD
+ +	mutex_init(&zdev->lock);
+ +	if (zdev->state == ZPCI_FN_STATE_CONFIGURED) {
+ +		rc = zpci_enable_device(zdev);
+ +		if (rc)
+ +			goto out_destroy_iommu;
+ +	}
+ +
+ +	rc = zpci_bus_device_register(zdev, &pci_root_ops);
+ +	if (rc)
+ +		goto out_disable;
+++=======
++ error_destroy_iommu:
++ 	zpci_destroy_iommu(zdev);
++ error:
++ 	zpci_dbg(0, "add fid:%x, rc:%d\n", fid, rc);
++ 	kfree(zdev);
++ 	return ERR_PTR(rc);
++ }
++ 
++ /**
++  * zpci_configure_device() - Configure a zpci_dev
++  * @zdev: The zpci_dev to be configured
++  * @fh: The general function handle supplied by the platform
++  *
++  * Given a device in the configuration state Configured, enables, scans and
++  * adds it to the common code PCI subsystem. If any failure occurs, the
++  * zpci_dev is left disabled.
++  *
++  * Return: 0 on success, or an error code otherwise
++  */
++ int zpci_configure_device(struct zpci_dev *zdev, u32 fh)
++ {
++ 	int rc;
++ 
++ 	zdev->fh = fh;
++ 	/* the PCI function will be scanned once function 0 appears */
++ 	if (!zdev->zbus->bus)
++ 		return 0;
+++>>>>>>> 61311e32892b (s390/pci: narrow scope of zpci_configure_device())
+  
+ -	/* For function 0 on a multi-function bus scan whole bus as we might
+ -	 * have to pick up existing functions waiting for it to allow creating
+ -	 * the PCI bus
+ -	 */
+ -	if (zdev->devfn == 0 && zdev->zbus->multifunction)
+ -		rc = zpci_bus_scan_bus(zdev->zbus);
+ -	else
+ -		rc = zpci_bus_scan_device(zdev);
+ +	return 0;
+  
+ +out_disable:
+ +	if (zdev->state == ZPCI_FN_STATE_ONLINE)
+ +		zpci_disable_device(zdev);
+ +
+ +out_destroy_iommu:
+ +	zpci_destroy_iommu(zdev);
+ +out:
+ +	spin_lock(&zpci_list_lock);
+ +	list_del(&zdev->entry);
+ +	spin_unlock(&zpci_list_lock);
+  	return rc;
+  }
+  
+diff --cc drivers/pci/hotplug/s390_pci_hpc.c
+index 8534cf105796,f8f056be71b7..000000000000
+--- a/drivers/pci/hotplug/s390_pci_hpc.c
++++ b/drivers/pci/hotplug/s390_pci_hpc.c
+@@@ -52,30 -24,18 +52,43 @@@ static int enable_slot(struct hotplug_s
+  {
+  	struct zpci_dev *zdev = container_of(hotplug_slot, struct zpci_dev,
+  					     hotplug_slot);
+++<<<<<<< HEAD
+ +	struct zpci_bus *zbus = zdev->zbus;
+++=======
+++>>>>>>> 61311e32892b (s390/pci: narrow scope of zpci_configure_device())
+  	int rc;
+  
+  	if (zdev->state != ZPCI_FN_STATE_STANDBY)
+  		return -EIO;
+  
+++<<<<<<< HEAD
+ +	rc = zdev_configure(zdev);
+ +	if (rc)
+ +		return rc;
+ +
+ +	rc = zpci_enable_device(zdev);
+ +	if (rc)
+ +		goto out_deconfigure;
+ +
+ +	pci_scan_slot(zbus->bus, zdev->devfn);
+ +	pci_lock_rescan_remove();
+ +	pci_bus_add_devices(zbus->bus);
+ +	pci_unlock_rescan_remove();
+ +
+ +	return rc;
+ +
+ +out_deconfigure:
+ +	zdev_deconfigure(zdev);
+ +	return rc;
+++=======
++ 	rc = sclp_pci_configure(zdev->fid);
++ 	zpci_dbg(3, "conf fid:%x, rc:%d\n", zdev->fid, rc);
++ 	if (rc)
++ 		return rc;
++ 	zdev->state = ZPCI_FN_STATE_CONFIGURED;
++ 
++ 	return zpci_configure_device(zdev, zdev->fh);
+++>>>>>>> 61311e32892b (s390/pci: narrow scope of zpci_configure_device())
+  }
+  
+  static int disable_slot(struct hotplug_slot *hotplug_slot)
+* Unmerged path arch/s390/pci/pci.c
+* Unmerged path drivers/pci/hotplug/s390_pci_hpc.c
