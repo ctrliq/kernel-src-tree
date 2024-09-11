@@ -1,0 +1,236 @@
+KVM: selftests: Introduce VM_MODE_PXXV48_4K
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-193.el8
+commit-author Peter Xu <peterx@redhat.com>
+commit 567a9f1e9deb273a2c02dd18c254208537fcefaa
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-193.el8/567a9f1e.failed
+
+The naming VM_MODE_P52V48_4K is explicit but unclear when used on
+x86_64 machines, because x86_64 machines are having various physical
+address width rather than some static values.  Here's some examples:
+
+  - Intel Xeon E3-1220:  36 bits
+  - Intel Core i7-8650:  39 bits
+  - AMD   EPYC 7251:     48 bits
+
+All of them are using 48 bits linear address width but with totally
+different physical address width (and most of the old machines should
+be less than 52 bits).
+
+Let's create a new guest mode called VM_MODE_PXXV48_4K for current
+x86_64 tests and make it as the default to replace the old naming of
+VM_MODE_P52V48_4K because it shows more clearly that the PA width is
+not really a constant.  Meanwhile we also stop assuming all the x86
+machines are having 52 bits PA width but instead we fetch the real
+vm->pa_bits from CPUID 0x80000008 during runtime.
+
+We currently make this exclusively used by x86_64 but no other arch.
+
+As a slight touch up, moving DEBUG macro from dirty_log_test.c to
+kvm_util.h so lib can use it too.
+
+	Signed-off-by: Peter Xu <peterx@redhat.com>
+	Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+(cherry picked from commit 567a9f1e9deb273a2c02dd18c254208537fcefaa)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	tools/testing/selftests/kvm/lib/x86_64/processor.c
+diff --cc tools/testing/selftests/kvm/lib/x86_64/processor.c
+index 7371b5fea4a8,c53dbc6bc568..000000000000
+--- a/tools/testing/selftests/kvm/lib/x86_64/processor.c
++++ b/tools/testing/selftests/kvm/lib/x86_64/processor.c
+@@@ -1141,3 -1141,41 +1141,44 @@@ void vcpu_load_state(struct kvm_vm *vm
+  			r);
+  	}
+  }
+++<<<<<<< HEAD
+++=======
++ 
++ bool is_intel_cpu(void)
++ {
++ 	int eax, ebx, ecx, edx;
++ 	const uint32_t *chunk;
++ 	const int leaf = 0;
++ 
++ 	__asm__ __volatile__(
++ 		"cpuid"
++ 		: /* output */ "=a"(eax), "=b"(ebx),
++ 		  "=c"(ecx), "=d"(edx)
++ 		: /* input */ "0"(leaf), "2"(0));
++ 
++ 	chunk = (const uint32_t *)("GenuineIntel");
++ 	return (ebx == chunk[0] && edx == chunk[1] && ecx == chunk[2]);
++ }
++ 
++ uint32_t kvm_get_cpuid_max(void)
++ {
++ 	return kvm_get_supported_cpuid_entry(0x80000000)->eax;
++ }
++ 
++ void kvm_get_cpu_address_width(unsigned int *pa_bits, unsigned int *va_bits)
++ {
++ 	struct kvm_cpuid_entry2 *entry;
++ 	bool pae;
++ 
++ 	/* SDM 4.1.4 */
++ 	if (kvm_get_cpuid_max() < 0x80000008) {
++ 		pae = kvm_get_supported_cpuid_entry(1)->edx & (1 << 6);
++ 		*pa_bits = pae ? 36 : 32;
++ 		*va_bits = 32;
++ 	} else {
++ 		entry = kvm_get_supported_cpuid_entry(0x80000008);
++ 		*pa_bits = entry->eax & 0xff;
++ 		*va_bits = (entry->eax >> 8) & 0xff;
++ 	}
++ }
+++>>>>>>> 567a9f1e9deb (KVM: selftests: Introduce VM_MODE_PXXV48_4K)
+diff --git a/tools/testing/selftests/kvm/dirty_log_test.c b/tools/testing/selftests/kvm/dirty_log_test.c
+index a310c854f969..fd7bed84cd47 100644
+--- a/tools/testing/selftests/kvm/dirty_log_test.c
++++ b/tools/testing/selftests/kvm/dirty_log_test.c
+@@ -19,8 +19,6 @@
+ #include "kvm_util.h"
+ #include "processor.h"
+ 
+-#define DEBUG printf
+-
+ #define VCPU_ID				1
+ 
+ /* The memory slot index to track dirty pages */
+@@ -241,6 +239,7 @@ static void run_test(enum vm_guest_mode mode, unsigned long iterations,
+ 
+ 	switch (mode) {
+ 	case VM_MODE_P52V48_4K:
++	case VM_MODE_PXXV48_4K:
+ 		guest_pa_bits = 52;
+ 		guest_page_shift = 12;
+ 		break;
+@@ -433,7 +432,7 @@ int main(int argc, char *argv[])
+ #endif
+ 
+ #ifdef __x86_64__
+-	vm_guest_mode_params_init(VM_MODE_P52V48_4K, true, true);
++	vm_guest_mode_params_init(VM_MODE_PXXV48_4K, true, true);
+ #endif
+ #ifdef __aarch64__
+ 	vm_guest_mode_params_init(VM_MODE_P40V48_4K, true, true);
+diff --git a/tools/testing/selftests/kvm/include/kvm_util.h b/tools/testing/selftests/kvm/include/kvm_util.h
+index 91ca600b443e..1265b2c1001b 100644
+--- a/tools/testing/selftests/kvm/include/kvm_util.h
++++ b/tools/testing/selftests/kvm/include/kvm_util.h
+@@ -26,6 +26,12 @@ struct kvm_vm;
+ typedef uint64_t vm_paddr_t; /* Virtual Machine (Guest) physical address */
+ typedef uint64_t vm_vaddr_t; /* Virtual Machine (Guest) virtual address */
+ 
++#ifndef NDEBUG
++#define DEBUG(...) printf(__VA_ARGS__);
++#else
++#define DEBUG(...)
++#endif
++
+ /* Minimum allocated guest virtual and physical addresses */
+ #define KVM_UTIL_MIN_VADDR		0x2000
+ 
+@@ -40,11 +46,14 @@ enum vm_guest_mode {
+ 	VM_MODE_P48V48_64K,
+ 	VM_MODE_P40V48_4K,
+ 	VM_MODE_P40V48_64K,
++	VM_MODE_PXXV48_4K,	/* For 48bits VA but ANY bits PA */
+ 	NUM_VM_MODES,
+ };
+ 
+-#ifdef __aarch64__
++#if defined(__aarch64__)
+ #define VM_MODE_DEFAULT VM_MODE_P40V48_4K
++#elif defined(__x86_64__)
++#define VM_MODE_DEFAULT VM_MODE_PXXV48_4K
+ #else
+ #define VM_MODE_DEFAULT VM_MODE_P52V48_4K
+ #endif
+diff --git a/tools/testing/selftests/kvm/include/x86_64/processor.h b/tools/testing/selftests/kvm/include/x86_64/processor.h
+index 6063d5b2f356..d36ea90c250c 100644
+--- a/tools/testing/selftests/kvm/include/x86_64/processor.h
++++ b/tools/testing/selftests/kvm/include/x86_64/processor.h
+@@ -325,6 +325,9 @@ uint64_t vcpu_get_msr(struct kvm_vm *vm, uint32_t vcpuid, uint64_t msr_index);
+ void vcpu_set_msr(struct kvm_vm *vm, uint32_t vcpuid, uint64_t msr_index,
+ 	  	  uint64_t msr_value);
+ 
++uint32_t kvm_get_cpuid_max(void);
++void kvm_get_cpu_address_width(unsigned int *pa_bits, unsigned int *va_bits);
++
+ /*
+  * Basic CPU control in CR0
+  */
+diff --git a/tools/testing/selftests/kvm/lib/aarch64/processor.c b/tools/testing/selftests/kvm/lib/aarch64/processor.c
+index c278e2f68b10..64cdd4516755 100644
+--- a/tools/testing/selftests/kvm/lib/aarch64/processor.c
++++ b/tools/testing/selftests/kvm/lib/aarch64/processor.c
+@@ -271,6 +271,9 @@ void vcpu_setup(struct kvm_vm *vm, int vcpuid, int pgd_memslot, int gdt_memslot)
+ 	case VM_MODE_P52V48_4K:
+ 		TEST_ASSERT(false, "AArch64 does not support 4K sized pages "
+ 				   "with 52-bit physical address ranges");
++	case VM_MODE_PXXV48_4K:
++		TEST_ASSERT(false, "AArch64 does not support 4K sized pages "
++				   "with ANY-bit physical address ranges");
+ 	case VM_MODE_P52V48_64K:
+ 		tcr_el1 |= 1ul << 14; /* TG0 = 64KB */
+ 		tcr_el1 |= 6ul << 32; /* IPS = 52 bits */
+diff --git a/tools/testing/selftests/kvm/lib/kvm_util.c b/tools/testing/selftests/kvm/lib/kvm_util.c
+index 78349c83aabc..96705ecbfb85 100644
+--- a/tools/testing/selftests/kvm/lib/kvm_util.c
++++ b/tools/testing/selftests/kvm/lib/kvm_util.c
+@@ -9,6 +9,7 @@
+ #include "test_util.h"
+ #include "kvm_util.h"
+ #include "kvm_util_internal.h"
++#include "processor.h"
+ 
+ #include <assert.h>
+ #include <sys/mman.h>
+@@ -102,12 +103,13 @@ static void vm_open(struct kvm_vm *vm, int perm)
+ }
+ 
+ const char * const vm_guest_mode_string[] = {
+-	"PA-bits:52, VA-bits:48, 4K pages",
+-	"PA-bits:52, VA-bits:48, 64K pages",
+-	"PA-bits:48, VA-bits:48, 4K pages",
+-	"PA-bits:48, VA-bits:48, 64K pages",
+-	"PA-bits:40, VA-bits:48, 4K pages",
+-	"PA-bits:40, VA-bits:48, 64K pages",
++	"PA-bits:52,  VA-bits:48,  4K pages",
++	"PA-bits:52,  VA-bits:48, 64K pages",
++	"PA-bits:48,  VA-bits:48,  4K pages",
++	"PA-bits:48,  VA-bits:48, 64K pages",
++	"PA-bits:40,  VA-bits:48,  4K pages",
++	"PA-bits:40,  VA-bits:48, 64K pages",
++	"PA-bits:ANY, VA-bits:48,  4K pages",
+ };
+ _Static_assert(sizeof(vm_guest_mode_string)/sizeof(char *) == NUM_VM_MODES,
+ 	       "Missing new mode strings?");
+@@ -185,6 +187,21 @@ struct kvm_vm *_vm_create(enum vm_guest_mode mode, uint64_t phy_pages, int perm)
+ 		vm->page_size = 0x10000;
+ 		vm->page_shift = 16;
+ 		break;
++	case VM_MODE_PXXV48_4K:
++#ifdef __x86_64__
++		kvm_get_cpu_address_width(&vm->pa_bits, &vm->va_bits);
++		TEST_ASSERT(vm->va_bits == 48, "Linear address width "
++			    "(%d bits) not supported", vm->va_bits);
++		vm->pgtable_levels = 4;
++		vm->page_size = 0x1000;
++		vm->page_shift = 12;
++		DEBUG("Guest physical address width detected: %d\n",
++		      vm->pa_bits);
++#else
++		TEST_ASSERT(false, "VM_MODE_PXXV48_4K not supported on "
++			    "non-x86 platforms");
++#endif
++		break;
+ 	default:
+ 		TEST_ASSERT(false, "Unknown guest mode, mode: 0x%x", mode);
+ 	}
+* Unmerged path tools/testing/selftests/kvm/lib/x86_64/processor.c
