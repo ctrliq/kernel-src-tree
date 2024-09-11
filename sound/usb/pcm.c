@@ -145,8 +145,7 @@ static struct audioformat *find_substream_format(struct snd_usb_substream *subs)
 			   subs->channels, subs);
 }
 
-static int init_pitch_v1(struct snd_usb_audio *chip, int iface,
-			 struct usb_host_interface *alts,
+static int init_pitch_v1(struct snd_usb_audio *chip,
 			 struct audioformat *fmt)
 {
 	struct usb_device *dev = chip->dev;
@@ -154,9 +153,7 @@ static int init_pitch_v1(struct snd_usb_audio *chip, int iface,
 	unsigned char data[1];
 	int err;
 
-	if (get_iface_desc(alts)->bNumEndpoints < 1)
-		return -EINVAL;
-	ep = get_endpoint(alts, 0)->bEndpointAddress;
+	ep = fmt->endpoint;
 
 	data[0] = 1;
 	err = snd_usb_ctl_msg(dev, usb_sndctrlpipe(dev, 0), UAC_SET_CUR,
@@ -165,15 +162,14 @@ static int init_pitch_v1(struct snd_usb_audio *chip, int iface,
 			      data, sizeof(data));
 	if (err < 0) {
 		usb_audio_err(chip, "%d:%d: cannot set enable PITCH\n",
-			      iface, ep);
+			      fmt->iface, ep);
 		return err;
 	}
 
 	return 0;
 }
 
-static int init_pitch_v2(struct snd_usb_audio *chip, int iface,
-			 struct usb_host_interface *alts,
+static int init_pitch_v2(struct snd_usb_audio *chip,
 			 struct audioformat *fmt)
 {
 	struct usb_device *dev = chip->dev;
@@ -187,7 +183,7 @@ static int init_pitch_v2(struct snd_usb_audio *chip, int iface,
 			      data, sizeof(data));
 	if (err < 0) {
 		usb_audio_err(chip, "%d:%d: cannot set enable PITCH (v2)\n",
-			      iface, fmt->altsetting);
+			      fmt->iface, fmt->altsetting);
 		return err;
 	}
 
@@ -197,8 +193,7 @@ static int init_pitch_v2(struct snd_usb_audio *chip, int iface,
 /*
  * initialize the pitch control and sample rate
  */
-int snd_usb_init_pitch(struct snd_usb_audio *chip, int iface,
-		       struct usb_host_interface *alts,
+int snd_usb_init_pitch(struct snd_usb_audio *chip,
 		       struct audioformat *fmt)
 {
 	/* if endpoint doesn't have pitch control, bail out */
@@ -208,10 +203,10 @@ int snd_usb_init_pitch(struct snd_usb_audio *chip, int iface,
 	switch (fmt->protocol) {
 	case UAC_VERSION_1:
 	default:
-		return init_pitch_v1(chip, iface, alts, fmt);
+		return init_pitch_v1(chip, fmt);
 
 	case UAC_VERSION_2:
-		return init_pitch_v2(chip, iface, alts, fmt);
+		return init_pitch_v2(chip, fmt);
 	}
 }
 
@@ -683,7 +678,7 @@ static int set_format(struct snd_usb_substream *subs, struct audioformat *fmt)
 		return err;
 
 	if (subs->need_setup_ep) {
-		err = snd_usb_init_pitch(chip, fmt->iface, alts, fmt);
+		err = snd_usb_init_pitch(chip, fmt);
 		if (err < 0)
 			return err;
 	}
