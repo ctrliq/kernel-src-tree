@@ -73,6 +73,8 @@ bool kvm_tdp_mmu_write_protect_gfn(struct kvm *kvm,
 
 int kvm_tdp_mmu_get_walk(struct kvm_vcpu *vcpu, u64 addr, u64 *sptes,
 			 int *root_level);
+u64 *kvm_tdp_mmu_fast_pf_get_last_sptep(struct kvm_vcpu *vcpu, u64 addr,
+					u64 *spte);
 
 #ifdef CONFIG_X86_64
 void kvm_mmu_init_tdp_mmu(struct kvm *kvm);
