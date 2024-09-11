@@ -1809,7 +1809,6 @@ int iommu_domain_get_attr(struct iommu_domain *domain,
 	struct iommu_domain_geometry *geometry;
 	bool *paging;
 	int ret = 0;
-	u32 *count;
 
 	switch (attr) {
 	case DOMAIN_ATTR_GEOMETRY:
@@ -1820,15 +1819,6 @@ int iommu_domain_get_attr(struct iommu_domain *domain,
 	case DOMAIN_ATTR_PAGING:
 		paging  = data;
 		*paging = (domain->pgsize_bitmap != 0UL);
-		break;
-	case DOMAIN_ATTR_WINDOWS:
-		count = data;
-
-		if (domain->ops->domain_get_windows != NULL)
-			*count = domain->ops->domain_get_windows(domain);
-		else
-			ret = -ENODEV;
-
 		break;
 	default:
 		if (!domain->ops->domain_get_attr)
@@ -1845,18 +1835,8 @@ int iommu_domain_set_attr(struct iommu_domain *domain,
 			  enum iommu_attr attr, void *data)
 {
 	int ret = 0;
-	u32 *count;
 
 	switch (attr) {
-	case DOMAIN_ATTR_WINDOWS:
-		count = data;
-
-		if (domain->ops->domain_set_windows != NULL)
-			ret = domain->ops->domain_set_windows(domain, *count);
-		else
-			ret = -ENODEV;
-
-		break;
 	default:
 		if (domain->ops->domain_set_attr == NULL)
 			return -EINVAL;
