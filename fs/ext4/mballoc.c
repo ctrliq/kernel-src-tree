@@ -2174,7 +2174,7 @@ static noinline_for_stack int
 ext4_mb_regular_allocator(struct ext4_allocation_context *ac)
 {
 	ext4_group_t ngroups, group, i;
-	int cr;
+	int cr = -1;
 	int err = 0, first_err = 0;
 	struct ext4_sb_info *sbi;
 	struct super_block *sb;
@@ -2324,6 +2324,10 @@ repeat:
 out:
 	if (!err && ac->ac_status != AC_STATUS_FOUND && first_err)
 		err = first_err;
+
+	mb_debug(1, "Best len %d, origin len %d, ac_status %u, ac_flags 0x%x, cr %d ret %d\n",
+		 ac->ac_b_ex.fe_len, ac->ac_o_ex.fe_len, ac->ac_status,
+		 ac->ac_flags, cr, err);
 	return err;
 }
 
@@ -3967,7 +3971,7 @@ ext4_mb_discard_group_preallocations(struct super_block *sb,
 	mb_debug(1, "discard preallocation for group %u\n", group);
 
 	if (list_empty(&grp->bb_prealloc_list))
-		return 0;
+		goto out_dbg;
 
 	bitmap_bh = ext4_read_block_bitmap(sb, group);
 	if (IS_ERR(bitmap_bh)) {
@@ -3975,7 +3979,7 @@ ext4_mb_discard_group_preallocations(struct super_block *sb,
 		ext4_error_err(sb, -err,
 			       "Error %d reading block bitmap for %u",
 			       err, group);
-		return 0;
+		goto out_dbg;
 	}
 
 	err = ext4_mb_load_buddy(sb, group, &e4b);
@@ -3983,7 +3987,7 @@ ext4_mb_discard_group_preallocations(struct super_block *sb,
 		ext4_warning(sb, "Error %d loading buddy information for %u",
 			     err, group);
 		put_bh(bitmap_bh);
-		return 0;
+		goto out_dbg;
 	}
 
 	if (needed == 0)
@@ -4031,6 +4035,8 @@ repeat:
 	/* found anything to free? */
 	if (list_empty(&list)) {
 		BUG_ON(free != 0);
+		mb_debug(1, "Someone else may have freed PA for this group %u\n",
+			 group);
 		goto out;
 	}
 
@@ -4055,6 +4061,9 @@ out:
 	ext4_unlock_group(sb, group);
 	ext4_mb_unload_buddy(&e4b);
 	put_bh(bitmap_bh);
+out_dbg:
+	mb_debug(1, "discarded (%d) blocks preallocated for group %u bb_free (%d)\n",
+		 free, group, grp->bb_free);
 	return free;
 }
 
@@ -4635,6 +4644,7 @@ ext4_fsblk_t ext4_mb_new_blocks(handle_t *handle,
 			ar->len = ar->len >> 1;
 		}
 		if (!ar->len) {
+			ext4_mb_show_pa(sb);
 			*errp = -ENOSPC;
 			return 0;
 		}
