@@ -1,0 +1,200 @@
+KVM: arm/arm64: Clean up vcpu finalization function parameter naming
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-147.el8
+commit-author Dave Martin <Dave.Martin@arm.com>
+commit 92e68b2b1ba004be55b2094fb8b5c11d0b24d11d
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-147.el8/92e68b2b.failed
+
+Currently, the internal vcpu finalization functions use a different
+name ("what") for the feature parameter than the name ("feature")
+used in the documentation.
+
+To avoid future confusion, this patch converts everything to use
+the name "feature" consistently.
+
+No functional change.
+
+	Suggested-by: Andrew Jones <drjones@redhat.com>
+	Signed-off-by: Dave Martin <Dave.Martin@arm.com>
+	Reviewed-by: Andrew Jones <drjones@redhat.com>
+	Signed-off-by: Marc Zyngier <marc.zyngier@arm.com>
+(cherry picked from commit 92e68b2b1ba004be55b2094fb8b5c11d0b24d11d)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/arm/include/asm/kvm_host.h
+#	arch/arm64/include/asm/kvm_host.h
+#	arch/arm64/kvm/reset.c
+diff --cc arch/arm/include/asm/kvm_host.h
+index 4d0897ce0a24,fe7754315e9c..000000000000
+--- a/arch/arm/include/asm/kvm_host.h
++++ b/arch/arm/include/asm/kvm_host.h
+@@@ -360,4 -412,14 +360,17 @@@ static inline int kvm_arm_setup_stage2(
+  	return 0;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static inline int kvm_arm_vcpu_finalize(struct kvm_vcpu *vcpu, int feature)
++ {
++ 	return -EINVAL;
++ }
++ 
++ static inline bool kvm_arm_vcpu_is_finalized(struct kvm_vcpu *vcpu)
++ {
++ 	return true;
++ }
++ 
+++>>>>>>> 92e68b2b1ba0 (KVM: arm/arm64: Clean up vcpu finalization function parameter naming)
+  #endif /* __ARM_KVM_HOST_H__ */
+diff --cc arch/arm64/include/asm/kvm_host.h
+index 7eeddb2d82c2,7a096fdb333d..000000000000
+--- a/arch/arm64/include/asm/kvm_host.h
++++ b/arch/arm64/include/asm/kvm_host.h
+@@@ -568,4 -627,10 +568,13 @@@ void kvm_arch_free_vm(struct kvm *kvm)
+  
+  int kvm_arm_setup_stage2(struct kvm *kvm, unsigned long type);
+  
+++<<<<<<< HEAD
+++=======
++ int kvm_arm_vcpu_finalize(struct kvm_vcpu *vcpu, int feature);
++ bool kvm_arm_vcpu_is_finalized(struct kvm_vcpu *vcpu);
++ 
++ #define kvm_arm_vcpu_sve_finalized(vcpu) \
++ 	((vcpu)->arch.flags & KVM_ARM64_VCPU_SVE_FINALIZED)
++ 
+++>>>>>>> 92e68b2b1ba0 (KVM: arm/arm64: Clean up vcpu finalization function parameter naming)
+  #endif /* __ARM64_KVM_HOST_H__ */
+diff --cc arch/arm64/kvm/reset.c
+index 9b8e8bd8b60b,3402543fdcd3..000000000000
+--- a/arch/arm64/kvm/reset.c
++++ b/arch/arm64/kvm/reset.c
+@@@ -95,6 -108,119 +95,122 @@@ int kvm_arch_vm_ioctl_check_extension(s
+  	return r;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ unsigned int kvm_sve_max_vl;
++ 
++ int kvm_arm_init_sve(void)
++ {
++ 	if (system_supports_sve()) {
++ 		kvm_sve_max_vl = sve_max_virtualisable_vl;
++ 
++ 		/*
++ 		 * The get_sve_reg()/set_sve_reg() ioctl interface will need
++ 		 * to be extended with multiple register slice support in
++ 		 * order to support vector lengths greater than
++ 		 * SVE_VL_ARCH_MAX:
++ 		 */
++ 		if (WARN_ON(kvm_sve_max_vl > SVE_VL_ARCH_MAX))
++ 			kvm_sve_max_vl = SVE_VL_ARCH_MAX;
++ 
++ 		/*
++ 		 * Don't even try to make use of vector lengths that
++ 		 * aren't available on all CPUs, for now:
++ 		 */
++ 		if (kvm_sve_max_vl < sve_max_vl)
++ 			pr_warn("KVM: SVE vector length for guests limited to %u bytes\n",
++ 				kvm_sve_max_vl);
++ 	}
++ 
++ 	return 0;
++ }
++ 
++ static int kvm_vcpu_enable_sve(struct kvm_vcpu *vcpu)
++ {
++ 	if (!system_supports_sve())
++ 		return -EINVAL;
++ 
++ 	/* Verify that KVM startup enforced this when SVE was detected: */
++ 	if (WARN_ON(!has_vhe()))
++ 		return -EINVAL;
++ 
++ 	vcpu->arch.sve_max_vl = kvm_sve_max_vl;
++ 
++ 	/*
++ 	 * Userspace can still customize the vector lengths by writing
++ 	 * KVM_REG_ARM64_SVE_VLS.  Allocation is deferred until
++ 	 * kvm_arm_vcpu_finalize(), which freezes the configuration.
++ 	 */
++ 	vcpu->arch.flags |= KVM_ARM64_GUEST_HAS_SVE;
++ 
++ 	return 0;
++ }
++ 
++ /*
++  * Finalize vcpu's maximum SVE vector length, allocating
++  * vcpu->arch.sve_state as necessary.
++  */
++ static int kvm_vcpu_finalize_sve(struct kvm_vcpu *vcpu)
++ {
++ 	void *buf;
++ 	unsigned int vl;
++ 
++ 	vl = vcpu->arch.sve_max_vl;
++ 
++ 	/*
++ 	 * Resposibility for these properties is shared between
++ 	 * kvm_arm_init_arch_resources(), kvm_vcpu_enable_sve() and
++ 	 * set_sve_vls().  Double-check here just to be sure:
++ 	 */
++ 	if (WARN_ON(!sve_vl_valid(vl) || vl > sve_max_virtualisable_vl ||
++ 		    vl > SVE_VL_ARCH_MAX))
++ 		return -EIO;
++ 
++ 	buf = kzalloc(SVE_SIG_REGS_SIZE(sve_vq_from_vl(vl)), GFP_KERNEL);
++ 	if (!buf)
++ 		return -ENOMEM;
++ 
++ 	vcpu->arch.sve_state = buf;
++ 	vcpu->arch.flags |= KVM_ARM64_VCPU_SVE_FINALIZED;
++ 	return 0;
++ }
++ 
++ int kvm_arm_vcpu_finalize(struct kvm_vcpu *vcpu, int feature)
++ {
++ 	switch (feature) {
++ 	case KVM_ARM_VCPU_SVE:
++ 		if (!vcpu_has_sve(vcpu))
++ 			return -EINVAL;
++ 
++ 		if (kvm_arm_vcpu_sve_finalized(vcpu))
++ 			return -EPERM;
++ 
++ 		return kvm_vcpu_finalize_sve(vcpu);
++ 	}
++ 
++ 	return -EINVAL;
++ }
++ 
++ bool kvm_arm_vcpu_is_finalized(struct kvm_vcpu *vcpu)
++ {
++ 	if (vcpu_has_sve(vcpu) && !kvm_arm_vcpu_sve_finalized(vcpu))
++ 		return false;
++ 
++ 	return true;
++ }
++ 
++ void kvm_arch_vcpu_uninit(struct kvm_vcpu *vcpu)
++ {
++ 	kfree(vcpu->arch.sve_state);
++ }
++ 
++ static void kvm_vcpu_reset_sve(struct kvm_vcpu *vcpu)
++ {
++ 	if (vcpu_has_sve(vcpu))
++ 		memset(vcpu->arch.sve_state, 0, vcpu_sve_state_size(vcpu));
++ }
++ 
+++>>>>>>> 92e68b2b1ba0 (KVM: arm/arm64: Clean up vcpu finalization function parameter naming)
+  /**
+   * kvm_reset_vcpu - sets core registers and sys_regs to reset value
+   * @vcpu: The VCPU pointer
+* Unmerged path arch/arm/include/asm/kvm_host.h
+* Unmerged path arch/arm64/include/asm/kvm_host.h
+* Unmerged path arch/arm64/kvm/reset.c
