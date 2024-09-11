@@ -23,6 +23,7 @@
 
 #include <nvif/cl507c.h>
 #include <nvif/event.h>
+#include <nvif/timer.h>
 
 #include <drm/drm_atomic_helper.h>
 #include <drm/drm_plane_helper.h>
