@@ -1,0 +1,330 @@
+KVM: cleanup allocation of rmaps and page tracking data
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-408.el8
+commit-author David Stevens <stevensd@chromium.org>
+commit 1e76a3ce0d3cdfc6b506e21047a26471bc1cc92e
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-408.el8/1e76a3ce.failed
+
+Unify the flags for rmaps and page tracking data, using a
+single flag in struct kvm_arch and a single loop to go
+over all the address spaces and memslots.  This avoids
+code duplication between alloc_all_memslots_rmaps and
+kvm_page_track_enable_mmu_write_tracking.
+
+	Signed-off-by: David Stevens <stevensd@chromium.org>
+[This patch is the delta between David's v2 and v3, with conflicts
+ fixed and my own commit message. - Paolo]
+Co-developed-by: Sean Christopherson <seanjc@google.com>
+	Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+(cherry picked from commit 1e76a3ce0d3cdfc6b506e21047a26471bc1cc92e)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/include/asm/kvm_host.h
+#	arch/x86/include/asm/kvm_page_track.h
+#	arch/x86/kvm/mmu.h
+#	arch/x86/kvm/mmu/mmu.c
+#	arch/x86/kvm/mmu/page_track.c
+diff --cc arch/x86/include/asm/kvm_host.h
+index 45d5ce5def55,b4fece3bb061..000000000000
+--- a/arch/x86/include/asm/kvm_host.h
++++ b/arch/x86/include/asm/kvm_host.h
+@@@ -1201,10 -1212,11 +1201,15 @@@ struct kvm_arch 
+  #endif /* CONFIG_X86_64 */
+  
+  	/*
+- 	 * If set, rmaps have been allocated for all memslots and should be
+- 	 * allocated for any newly created or modified memslots.
++ 	 * If set, at least one shadow root has been allocated. This flag
++ 	 * is used as one input when determining whether certain memslot
++ 	 * related allocations are necessary.
+  	 */
+++<<<<<<< HEAD
+ +	bool memslots_have_rmaps;
+++=======
++ 	bool shadow_root_allocated;
+++>>>>>>> 1e76a3ce0d3c (KVM: cleanup allocation of rmaps and page tracking data)
+  
+  #if IS_ENABLED(CONFIG_HYPERV)
+  	hpa_t	hv_root_tdp;
+@@@ -1920,4 -1939,9 +1925,12 @@@ static inline int kvm_cpu_get_apicid(in
+  
+  int kvm_cpu_dirty_log_size(void);
+  
+++<<<<<<< HEAD
+++=======
++ int memslot_rmap_alloc(struct kvm_memory_slot *slot, unsigned long npages);
++ 
++ #define KVM_CLOCK_VALID_FLAGS						\
++ 	(KVM_CLOCK_TSC_STABLE | KVM_CLOCK_REALTIME | KVM_CLOCK_HOST_TSC)
++ 
+++>>>>>>> 1e76a3ce0d3c (KVM: cleanup allocation of rmaps and page tracking data)
+  #endif /* _ASM_X86_KVM_HOST_H */
+diff --cc arch/x86/include/asm/kvm_page_track.h
+index 9cd9230e5cc8,9d4a3b1b25b9..000000000000
+--- a/arch/x86/include/asm/kvm_page_track.h
++++ b/arch/x86/include/asm/kvm_page_track.h
+@@@ -49,8 -49,12 +49,14 @@@ struct kvm_page_track_notifier_node 
+  int kvm_page_track_init(struct kvm *kvm);
+  void kvm_page_track_cleanup(struct kvm *kvm);
+  
+++<<<<<<< HEAD
+++=======
++ bool kvm_page_track_write_tracking_enabled(struct kvm *kvm);
++ int kvm_page_track_write_tracking_alloc(struct kvm_memory_slot *slot);
++ 
+++>>>>>>> 1e76a3ce0d3c (KVM: cleanup allocation of rmaps and page tracking data)
+  void kvm_page_track_free_memslot(struct kvm_memory_slot *slot);
+ -int kvm_page_track_create_memslot(struct kvm *kvm,
+ -				  struct kvm_memory_slot *slot,
+ +int kvm_page_track_create_memslot(struct kvm_memory_slot *slot,
+  				  unsigned long npages);
+  
+  void kvm_slot_page_track_add_page(struct kvm *kvm,
+diff --cc arch/x86/kvm/mmu.h
+index 58b438826461,2df48d60c949..000000000000
+--- a/arch/x86/kvm/mmu.h
++++ b/arch/x86/kvm/mmu.h
+@@@ -264,4 -304,51 +264,54 @@@ int kvm_arch_write_log_dirty(struct kvm
+  int kvm_mmu_post_init_vm(struct kvm *kvm);
+  void kvm_mmu_pre_destroy_vm(struct kvm *kvm);
+  
+++<<<<<<< HEAD
+++=======
++ static inline bool kvm_shadow_root_allocated(struct kvm *kvm)
++ {
++ 	/*
++ 	 * Read shadow_root_allocated before related pointers. Hence, threads
++ 	 * reading shadow_root_allocated in any lock context are guaranteed to
++ 	 * see the pointers. Pairs with smp_store_release in
++ 	 * mmu_first_shadow_root_alloc.
++ 	 */
++ 	return smp_load_acquire(&kvm->arch.shadow_root_allocated);
++ }
++ 
++ #ifdef CONFIG_X86_64
++ static inline bool is_tdp_mmu_enabled(struct kvm *kvm) { return kvm->arch.tdp_mmu_enabled; }
++ #else
++ static inline bool is_tdp_mmu_enabled(struct kvm *kvm) { return false; }
++ #endif
++ 
++ static inline bool kvm_memslots_have_rmaps(struct kvm *kvm)
++ {
++ 	return !is_tdp_mmu_enabled(kvm) || kvm_shadow_root_allocated(kvm);
++ }
++ 
++ static inline gfn_t gfn_to_index(gfn_t gfn, gfn_t base_gfn, int level)
++ {
++ 	/* KVM_HPAGE_GFN_SHIFT(PG_LEVEL_4K) must be 0. */
++ 	return (gfn >> KVM_HPAGE_GFN_SHIFT(level)) -
++ 		(base_gfn >> KVM_HPAGE_GFN_SHIFT(level));
++ }
++ 
++ static inline unsigned long
++ __kvm_mmu_slot_lpages(struct kvm_memory_slot *slot, unsigned long npages,
++ 		      int level)
++ {
++ 	return gfn_to_index(slot->base_gfn + npages - 1,
++ 			    slot->base_gfn, level) + 1;
++ }
++ 
++ static inline unsigned long
++ kvm_mmu_slot_lpages(struct kvm_memory_slot *slot, int level)
++ {
++ 	return __kvm_mmu_slot_lpages(slot, slot->npages, level);
++ }
++ 
++ static inline void kvm_update_page_stats(struct kvm *kvm, int level, int count)
++ {
++ 	atomic64_add(count, &kvm->stat.pages[level - 1]);
++ }
+++>>>>>>> 1e76a3ce0d3c (KVM: cleanup allocation of rmaps and page tracking data)
+  #endif
+diff --cc arch/x86/kvm/mmu/mmu.c
+index 8ec545b124be,701db0794581..000000000000
+--- a/arch/x86/kvm/mmu/mmu.c
++++ b/arch/x86/kvm/mmu/mmu.c
+@@@ -3462,6 -3488,10 +3523,13 @@@ static int mmu_alloc_shadow_roots(struc
+  		}
+  	}
+  
+++<<<<<<< HEAD
+++=======
++ 	r = mmu_first_shadow_root_alloc(vcpu->kvm);
++ 	if (r)
++ 		return r;
++ 
+++>>>>>>> 1e76a3ce0d3c (KVM: cleanup allocation of rmaps and page tracking data)
+  	write_lock(&vcpu->kvm->mmu_lock);
+  	r = make_mmu_pages_available(vcpu);
+  	if (r < 0)
+@@@ -5632,9 -5659,9 +5700,13 @@@ void kvm_mmu_init_vm(struct kvm *kvm
+  {
+  	struct kvm_page_track_notifier_node *node = &kvm->arch.mmu_sp_tracker;
+  
+ -	spin_lock_init(&kvm->arch.mmu_unsync_pages_lock);
+ +	kvm_mmu_init_tdp_mmu(kvm);
+  
+++<<<<<<< HEAD
+ +	kvm->arch.memslots_have_rmaps = true;
+++=======
++ 	kvm_mmu_init_tdp_mmu(kvm);
+++>>>>>>> 1e76a3ce0d3c (KVM: cleanup allocation of rmaps and page tracking data)
+  
+  	node->track_write = kvm_mmu_pte_write;
+  	node->track_flush_slot = kvm_mmu_invalidate_zap_pages_in_memslot;
+diff --cc arch/x86/kvm/mmu/page_track.c
+index 58985087b096,cc4eb5b7fb76..000000000000
+--- a/arch/x86/kvm/mmu/page_track.c
++++ b/arch/x86/kvm/mmu/page_track.c
+@@@ -16,8 -16,15 +16,17 @@@
+  
+  #include <asm/kvm_page_track.h>
+  
+ -#include "mmu.h"
+  #include "mmu_internal.h"
+  
+++<<<<<<< HEAD
+++=======
++ bool kvm_page_track_write_tracking_enabled(struct kvm *kvm)
++ {
++ 	return IS_ENABLED(CONFIG_KVM_EXTERNAL_WRITE_TRACKING) ||
++ 	       !tdp_enabled || kvm_shadow_root_allocated(kvm);
++ }
++ 
+++>>>>>>> 1e76a3ce0d3c (KVM: cleanup allocation of rmaps and page tracking data)
+  void kvm_page_track_free_memslot(struct kvm_memory_slot *slot)
+  {
+  	int i;
+@@@ -28,12 -35,17 +37,19 @@@
+  	}
+  }
+  
+ -int kvm_page_track_create_memslot(struct kvm *kvm,
+ -				  struct kvm_memory_slot *slot,
+ +int kvm_page_track_create_memslot(struct kvm_memory_slot *slot,
+  				  unsigned long npages)
+  {
+ -	int i;
+ +	int  i;
+  
+  	for (i = 0; i < KVM_PAGE_TRACK_MAX; i++) {
+++<<<<<<< HEAD
+++=======
++ 		if (i == KVM_PAGE_TRACK_WRITE &&
++ 		    !kvm_page_track_write_tracking_enabled(kvm))
++ 			continue;
++ 
+++>>>>>>> 1e76a3ce0d3c (KVM: cleanup allocation of rmaps and page tracking data)
+  		slot->arch.gfn_track[i] =
+  			kvcalloc(npages, sizeof(*slot->arch.gfn_track[i]),
+  				 GFP_KERNEL_ACCOUNT);
+@@@ -56,6 -68,21 +72,24 @@@ static inline bool page_track_mode_is_v
+  	return true;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ int kvm_page_track_write_tracking_alloc(struct kvm_memory_slot *slot)
++ {
++ 	unsigned short *gfn_track;
++ 
++ 	if (slot->arch.gfn_track[KVM_PAGE_TRACK_WRITE])
++ 		return 0;
++ 
++ 	gfn_track = kvcalloc(slot->npages, sizeof(*gfn_track), GFP_KERNEL_ACCOUNT);
++ 	if (gfn_track == NULL)
++ 		return -ENOMEM;
++ 
++ 	slot->arch.gfn_track[KVM_PAGE_TRACK_WRITE] = gfn_track;
++ 	return 0;
++ }
++ 
+++>>>>>>> 1e76a3ce0d3c (KVM: cleanup allocation of rmaps and page tracking data)
+  static void update_gfn_track(struct kvm_memory_slot *slot, gfn_t gfn,
+  			     enum kvm_page_track_mode mode, short count)
+  {
+@@@ -91,6 -118,10 +125,13 @@@ void kvm_slot_page_track_add_page(struc
+  	if (WARN_ON(!page_track_mode_is_valid(mode)))
+  		return;
+  
+++<<<<<<< HEAD
+++=======
++ 	if (WARN_ON(mode == KVM_PAGE_TRACK_WRITE &&
++ 		    !kvm_page_track_write_tracking_enabled(kvm)))
++ 		return;
++ 
+++>>>>>>> 1e76a3ce0d3c (KVM: cleanup allocation of rmaps and page tracking data)
+  	update_gfn_track(slot, gfn, mode, 1);
+  
+  	/*
+@@@ -125,6 -156,10 +166,13 @@@ void kvm_slot_page_track_remove_page(st
+  	if (WARN_ON(!page_track_mode_is_valid(mode)))
+  		return;
+  
+++<<<<<<< HEAD
+++=======
++ 	if (WARN_ON(mode == KVM_PAGE_TRACK_WRITE &&
++ 		    !kvm_page_track_write_tracking_enabled(kvm)))
++ 		return;
++ 
+++>>>>>>> 1e76a3ce0d3c (KVM: cleanup allocation of rmaps and page tracking data)
+  	update_gfn_track(slot, gfn, mode, -1);
+  
+  	/*
+@@@ -146,6 -185,10 +194,13 @@@ bool kvm_slot_page_track_is_active(stru
+  	if (!slot)
+  		return false;
+  
+++<<<<<<< HEAD
+++=======
++ 	if (mode == KVM_PAGE_TRACK_WRITE &&
++ 	    !kvm_page_track_write_tracking_enabled(vcpu->kvm))
++ 		return false;
++ 
+++>>>>>>> 1e76a3ce0d3c (KVM: cleanup allocation of rmaps and page tracking data)
+  	index = gfn_to_index(gfn, slot->base_gfn, PG_LEVEL_4K);
+  	return !!READ_ONCE(slot->arch.gfn_track[mode][index]);
+  }
+* Unmerged path arch/x86/include/asm/kvm_host.h
+* Unmerged path arch/x86/include/asm/kvm_page_track.h
+* Unmerged path arch/x86/kvm/mmu.h
+* Unmerged path arch/x86/kvm/mmu/mmu.c
+* Unmerged path arch/x86/kvm/mmu/page_track.c
+diff --git a/arch/x86/kvm/mmu/tdp_mmu.h b/arch/x86/kvm/mmu/tdp_mmu.h
+index 4a73a04d420c..c364c2c14654 100644
+--- a/arch/x86/kvm/mmu/tdp_mmu.h
++++ b/arch/x86/kvm/mmu/tdp_mmu.h
+@@ -95,7 +95,6 @@ u64 *kvm_tdp_mmu_fast_pf_get_last_sptep(struct kvm_vcpu *vcpu, u64 addr,
+ #ifdef CONFIG_X86_64
+ void kvm_mmu_init_tdp_mmu(struct kvm *kvm);
+ void kvm_mmu_uninit_tdp_mmu(struct kvm *kvm);
+-static inline bool is_tdp_mmu_enabled(struct kvm *kvm) { return kvm->arch.tdp_mmu_enabled; }
+ static inline bool is_tdp_mmu_page(struct kvm_mmu_page *sp) { return sp->tdp_mmu_page; }
+ 
+ static inline bool is_tdp_mmu(struct kvm_mmu *mmu)
+@@ -117,7 +116,6 @@ static inline bool is_tdp_mmu(struct kvm_mmu *mmu)
+ #else
+ static inline void kvm_mmu_init_tdp_mmu(struct kvm *kvm) {}
+ static inline void kvm_mmu_uninit_tdp_mmu(struct kvm *kvm) {}
+-static inline bool is_tdp_mmu_enabled(struct kvm *kvm) { return false; }
+ static inline bool is_tdp_mmu_page(struct kvm_mmu_page *sp) { return false; }
+ static inline bool is_tdp_mmu(struct kvm_mmu *mmu) { return false; }
+ #endif
+diff --git a/arch/x86/kvm/x86.c b/arch/x86/kvm/x86.c
+index 1b1a9834002b..1b291e75fe3e 100644
+--- a/arch/x86/kvm/x86.c
++++ b/arch/x86/kvm/x86.c
+@@ -11554,8 +11554,7 @@ void kvm_arch_free_memslot(struct kvm *kvm, struct kvm_memory_slot *slot)
+ 	kvm_page_track_free_memslot(slot);
+ }
+ 
+-static int memslot_rmap_alloc(struct kvm_memory_slot *slot,
+-			      unsigned long npages)
++int memslot_rmap_alloc(struct kvm_memory_slot *slot, unsigned long npages)
+ {
+ 	const int sz = sizeof(*slot->arch.rmap[0]);
+ 	int i;
