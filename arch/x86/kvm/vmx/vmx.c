@@ -1378,8 +1378,11 @@ static u64 host_efer;
 static void ept_save_pdptrs(struct kvm_vcpu *vcpu);
 
 /*
- * Keep MSR_STAR at the end, as setup_msrs() will try to optimize it
- * away by decrementing the array size.
+ * Though SYSCALL is only supported in 64-bit mode on Intel CPUs, kvm
+ * will emulate SYSCALL in legacy mode if the vendor string in guest
+ * CPUID.0:{EBX,ECX,EDX} is "AuthenticAMD" or "AMDisbetter!" To
+ * support this emulation, IA32_STAR must always be included in
+ * vmx_msr_index[], even in i386 builds.
  */
 static const u32 vmx_msr_index[] = {
 #ifdef CONFIG_X86_64
