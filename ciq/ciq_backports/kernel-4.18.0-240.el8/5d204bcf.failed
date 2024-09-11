@@ -1,0 +1,119 @@
+io_uring: don't map read/write iovec potentially twice
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Jens Axboe <axboe@kernel.dk>
+commit 5d204bcfa09330972ad3428a8f81c23f371d3e6d
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/5d204bcf.failed
+
+If we have a read/write that is deferred, we already setup the async IO
+context for that request, and mapped it. When we later try and execute
+the request and we get -EAGAIN, we don't want to attempt to re-map it.
+If we do, we end up with garbage in the iovec, which typically leads
+to an -EFAULT or -EINVAL completion.
+
+	Cc: stable@vger.kernel.org # 5.5
+	Reported-by: Dan Melnic <dmm@fb.com>
+	Signed-off-by: Jens Axboe <axboe@kernel.dk>
+(cherry picked from commit 5d204bcfa09330972ad3428a8f81c23f371d3e6d)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/io_uring.c
+diff --cc fs/io_uring.c
+index 943ec60fc256,678a1b245e10..000000000000
+--- a/fs/io_uring.c
++++ b/fs/io_uring.c
+@@@ -1330,7 -2132,85 +1330,89 @@@ static ssize_t loop_rw_iter(int rw, str
+  	return ret;
+  }
+  
+++<<<<<<< HEAD
+ +static int io_read(struct io_kiocb *req, const struct sqe_submit *s,
+++=======
++ static void io_req_map_rw(struct io_kiocb *req, ssize_t io_size,
++ 			  struct iovec *iovec, struct iovec *fast_iov,
++ 			  struct iov_iter *iter)
++ {
++ 	req->io->rw.nr_segs = iter->nr_segs;
++ 	req->io->rw.size = io_size;
++ 	req->io->rw.iov = iovec;
++ 	if (!req->io->rw.iov) {
++ 		req->io->rw.iov = req->io->rw.fast_iov;
++ 		memcpy(req->io->rw.iov, fast_iov,
++ 			sizeof(struct iovec) * iter->nr_segs);
++ 	}
++ }
++ 
++ static int io_alloc_async_ctx(struct io_kiocb *req)
++ {
++ 	if (!io_op_defs[req->opcode].async_ctx)
++ 		return 0;
++ 	req->io = kmalloc(sizeof(*req->io), GFP_KERNEL);
++ 	return req->io == NULL;
++ }
++ 
++ static void io_rw_async(struct io_wq_work **workptr)
++ {
++ 	struct io_kiocb *req = container_of(*workptr, struct io_kiocb, work);
++ 	struct iovec *iov = NULL;
++ 
++ 	if (req->io->rw.iov != req->io->rw.fast_iov)
++ 		iov = req->io->rw.iov;
++ 	io_wq_submit_work(workptr);
++ 	kfree(iov);
++ }
++ 
++ static int io_setup_async_rw(struct io_kiocb *req, ssize_t io_size,
++ 			     struct iovec *iovec, struct iovec *fast_iov,
++ 			     struct iov_iter *iter)
++ {
++ 	if (!io_op_defs[req->opcode].async_ctx)
++ 		return 0;
++ 	if (!req->io) {
++ 		if (io_alloc_async_ctx(req))
++ 			return -ENOMEM;
++ 
++ 		io_req_map_rw(req, io_size, iovec, fast_iov, iter);
++ 	}
++ 	req->work.func = io_rw_async;
++ 	return 0;
++ }
++ 
++ static int io_read_prep(struct io_kiocb *req, const struct io_uring_sqe *sqe,
++ 			bool force_nonblock)
++ {
++ 	struct io_async_ctx *io;
++ 	struct iov_iter iter;
++ 	ssize_t ret;
++ 
++ 	ret = io_prep_rw(req, sqe, force_nonblock);
++ 	if (ret)
++ 		return ret;
++ 
++ 	if (unlikely(!(req->file->f_mode & FMODE_READ)))
++ 		return -EBADF;
++ 
++ 	if (!req->io)
++ 		return 0;
++ 
++ 	io = req->io;
++ 	io->rw.iov = io->rw.fast_iov;
++ 	req->io = NULL;
++ 	ret = io_import_iovec(READ, req, &io->rw.iov, &iter);
++ 	req->io = io;
++ 	if (ret < 0)
++ 		return ret;
++ 
++ 	io_req_map_rw(req, ret, io->rw.iov, io->rw.fast_iov, &iter);
++ 	return 0;
++ }
++ 
++ static int io_read(struct io_kiocb *req, struct io_kiocb **nxt,
+++>>>>>>> 5d204bcfa093 (io_uring: don't map read/write iovec potentially twice)
+  		   bool force_nonblock)
+  {
+  	struct iovec inline_vecs[UIO_FASTIOV], *iovec = inline_vecs;
+* Unmerged path fs/io_uring.c
