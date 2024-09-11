@@ -1,0 +1,169 @@
+x86/speculation/l1tf: Increase l1tf memory limit for Nehalem+
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-80.el8
+commit-author Andi Kleen <ak@linux.intel.com>
+commit cc51e5428ea54f575d49cfcede1d4cb3a72b4ec4
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-80.el8/cc51e542.failed
+
+On Nehalem and newer core CPUs the CPU cache internally uses 44 bits
+physical address space. The L1TF workaround is limited by this internal
+cache address width, and needs to have one bit free there for the
+mitigation to work.
+
+Older client systems report only 36bit physical address space so the range
+check decides that L1TF is not mitigated for a 36bit phys/32GB system with
+some memory holes.
+
+But since these actually have the larger internal cache width this warning
+is bogus because it would only really be needed if the system had more than
+43bits of memory.
+
+Add a new internal x86_cache_bits field. Normally it is the same as the
+physical bits field reported by CPUID, but for Nehalem and newerforce it to
+be at least 44bits.
+
+Change the L1TF memory size warning to use the new cache_bits field to
+avoid bogus warnings and remove the bogus comment about memory size.
+
+Fixes: 17dbca119312 ("x86/speculation/l1tf: Add sysfs reporting for l1tf")
+	Reported-by: George Anchev <studio@anchev.net>
+	Reported-by: Christopher Snowhill <kode54@gmail.com>
+	Signed-off-by: Andi Kleen <ak@linux.intel.com>
+	Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+	Cc: x86@kernel.org
+	Cc: linux-kernel@vger.kernel.org
+	Cc: Michael Hocko <mhocko@suse.com>
+	Cc: vbabka@suse.cz
+	Cc: stable@vger.kernel.org
+Link: https://lkml.kernel.org/r/20180824170351.34874-1-andi@firstfloor.org
+
+(cherry picked from commit cc51e5428ea54f575d49cfcede1d4cb3a72b4ec4)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/include/asm/processor.h
+#	arch/x86/kernel/cpu/bugs.c
+diff --cc arch/x86/include/asm/processor.h
+index cfd29ee8c3da,d53c54b842da..000000000000
+--- a/arch/x86/include/asm/processor.h
++++ b/arch/x86/include/asm/processor.h
+@@@ -181,6 -183,11 +183,14 @@@ extern const struct seq_operations cpui
+  
+  extern void cpu_detect(struct cpuinfo_x86 *c);
+  
+++<<<<<<< HEAD
+++=======
++ static inline unsigned long long l1tf_pfn_limit(void)
++ {
++ 	return BIT_ULL(boot_cpu_data.x86_cache_bits - 1 - PAGE_SHIFT);
++ }
++ 
+++>>>>>>> cc51e5428ea5 (x86/speculation/l1tf: Increase l1tf memory limit for Nehalem+)
+  extern void early_cpu_init(void);
+  extern void identify_boot_cpu(void);
+  extern void identify_secondary_cpu(struct cpuinfo_x86 *);
+diff --cc arch/x86/kernel/cpu/bugs.c
+index a486ecae12ba,40bdaea97fe7..000000000000
+--- a/arch/x86/kernel/cpu/bugs.c
++++ b/arch/x86/kernel/cpu/bugs.c
+@@@ -654,6 -659,54 +654,57 @@@ void x86_spec_ctrl_setup_ap(void
+  
+  #undef pr_fmt
+  #define pr_fmt(fmt)	"L1TF: " fmt
+++<<<<<<< HEAD
+++=======
++ 
++ /* Default mitigation for L1TF-affected CPUs */
++ enum l1tf_mitigations l1tf_mitigation __ro_after_init = L1TF_MITIGATION_FLUSH;
++ #if IS_ENABLED(CONFIG_KVM_INTEL)
++ EXPORT_SYMBOL_GPL(l1tf_mitigation);
++ #endif
++ enum vmx_l1d_flush_state l1tf_vmx_mitigation = VMENTER_L1D_FLUSH_AUTO;
++ EXPORT_SYMBOL_GPL(l1tf_vmx_mitigation);
++ 
++ /*
++  * These CPUs all support 44bits physical address space internally in the
++  * cache but CPUID can report a smaller number of physical address bits.
++  *
++  * The L1TF mitigation uses the top most address bit for the inversion of
++  * non present PTEs. When the installed memory reaches into the top most
++  * address bit due to memory holes, which has been observed on machines
++  * which report 36bits physical address bits and have 32G RAM installed,
++  * then the mitigation range check in l1tf_select_mitigation() triggers.
++  * This is a false positive because the mitigation is still possible due to
++  * the fact that the cache uses 44bit internally. Use the cache bits
++  * instead of the reported physical bits and adjust them on the affected
++  * machines to 44bit if the reported bits are less than 44.
++  */
++ static void override_cache_bits(struct cpuinfo_x86 *c)
++ {
++ 	if (c->x86 != 6)
++ 		return;
++ 
++ 	switch (c->x86_model) {
++ 	case INTEL_FAM6_NEHALEM:
++ 	case INTEL_FAM6_WESTMERE:
++ 	case INTEL_FAM6_SANDYBRIDGE:
++ 	case INTEL_FAM6_IVYBRIDGE:
++ 	case INTEL_FAM6_HASWELL_CORE:
++ 	case INTEL_FAM6_HASWELL_ULT:
++ 	case INTEL_FAM6_HASWELL_GT3E:
++ 	case INTEL_FAM6_BROADWELL_CORE:
++ 	case INTEL_FAM6_BROADWELL_GT3E:
++ 	case INTEL_FAM6_SKYLAKE_MOBILE:
++ 	case INTEL_FAM6_SKYLAKE_DESKTOP:
++ 	case INTEL_FAM6_KABYLAKE_MOBILE:
++ 	case INTEL_FAM6_KABYLAKE_DESKTOP:
++ 		if (c->x86_cache_bits < 44)
++ 			c->x86_cache_bits = 44;
++ 		break;
++ 	}
++ }
++ 
+++>>>>>>> cc51e5428ea5 (x86/speculation/l1tf: Increase l1tf memory limit for Nehalem+)
+  static void __init l1tf_select_mitigation(void)
+  {
+  	u64 half_pa;
+@@@ -661,6 -714,22 +712,25 @@@
+  	if (!boot_cpu_has_bug(X86_BUG_L1TF))
+  		return;
+  
+++<<<<<<< HEAD
+++=======
++ 	override_cache_bits(&boot_cpu_data);
++ 
++ 	switch (l1tf_mitigation) {
++ 	case L1TF_MITIGATION_OFF:
++ 	case L1TF_MITIGATION_FLUSH_NOWARN:
++ 	case L1TF_MITIGATION_FLUSH:
++ 		break;
++ 	case L1TF_MITIGATION_FLUSH_NOSMT:
++ 	case L1TF_MITIGATION_FULL:
++ 		cpu_smt_disable(false);
++ 		break;
++ 	case L1TF_MITIGATION_FULL_FORCE:
++ 		cpu_smt_disable(true);
++ 		break;
++ 	}
++ 
+++>>>>>>> cc51e5428ea5 (x86/speculation/l1tf: Increase l1tf memory limit for Nehalem+)
+  #if CONFIG_PGTABLE_LEVELS == 2
+  	pr_warn("Kernel not compiled for PAE. No mitigation for L1TF\n");
+  	return;
+* Unmerged path arch/x86/include/asm/processor.h
+* Unmerged path arch/x86/kernel/cpu/bugs.c
+diff --git a/arch/x86/kernel/cpu/common.c b/arch/x86/kernel/cpu/common.c
+index ace344834b64..66a32199046d 100644
+--- a/arch/x86/kernel/cpu/common.c
++++ b/arch/x86/kernel/cpu/common.c
+@@ -919,6 +919,7 @@ static void get_cpu_address_sizes(struct cpuinfo_x86 *c)
+ 	else if (cpu_has(c, X86_FEATURE_PAE) || cpu_has(c, X86_FEATURE_PSE36))
+ 		c->x86_phys_bits = 36;
+ #endif
++	c->x86_cache_bits = c->x86_phys_bits;
+ }
+ 
+ static void identify_cpu_without_cpuid(struct cpuinfo_x86 *c)
