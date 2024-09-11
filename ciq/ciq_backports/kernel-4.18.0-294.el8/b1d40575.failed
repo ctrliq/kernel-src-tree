@@ -1,0 +1,304 @@
+KVM: x86: Switch KVM guest to using interrupts for page ready APF delivery
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Vitaly Kuznetsov <vkuznets@redhat.com>
+commit b1d405751cd5792856b1b8333aafaca6bf09ccbb
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/b1d40575.failed
+
+KVM now supports using interrupt for 'page ready' APF event delivery and
+legacy mechanism was deprecated. Switch KVM guests to the new one.
+
+	Signed-off-by: Vitaly Kuznetsov <vkuznets@redhat.com>
+Message-Id: <20200525144125.143875-9-vkuznets@redhat.com>
+[Use HYPERVISOR_CALLBACK_VECTOR instead of a separate vector. - Paolo]
+	Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+(cherry picked from commit b1d405751cd5792856b1b8333aafaca6bf09ccbb)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/entry/entry_32.S
+#	arch/x86/entry/entry_64.S
+#	arch/x86/kernel/kvm.c
+diff --cc arch/x86/entry/entry_32.S
+index 3c3090e4eeca,e0d1938c0415..000000000000
+--- a/arch/x86/entry/entry_32.S
++++ b/arch/x86/entry/entry_32.S
+@@@ -1440,18 -1475,45 +1440,27 @@@ BUILD_INTERRUPT3(hv_stimer0_callback_ve
+  
+  #endif /* CONFIG_HYPERV */
+  
+++<<<<<<< HEAD
+ +ENTRY(page_fault)
+++=======
++ #ifdef CONFIG_KVM_GUEST
++ BUILD_INTERRUPT3(kvm_async_pf_vector, HYPERVISOR_CALLBACK_VECTOR,
++ 		 kvm_async_pf_intr)
++ #endif
++ 
++ SYM_CODE_START(page_fault)
+++>>>>>>> b1d405751cd5 (KVM: x86: Switch KVM guest to using interrupts for page ready APF delivery)
+  	ASM_CLAC
+  	pushl	$do_page_fault
+ -	jmp	common_exception_read_cr2
+ -SYM_CODE_END(page_fault)
+ +	ALIGN
+ +	jmp common_exception
+ +END(page_fault)
+  
+ -SYM_CODE_START_LOCAL_NOALIGN(common_exception_read_cr2)
+ +common_exception:
+  	/* the function address is in %gs's slot on the stack */
+ -	SAVE_ALL switch_stacks=1 skip_gs=1 unwind_espfix=1
+ -
+ -	ENCODE_FRAME_POINTER
+ -
+ -	/* fixup %gs */
+ -	GS_TO_REG %ecx
+ -	movl	PT_GS(%esp), %edi
+ -	REG_TO_PTGS %ecx
+ -	SET_KERNEL_GS %ecx
+ -
+ -	GET_CR2_INTO(%ecx)			# might clobber %eax
+ -
+ -	/* fixup orig %eax */
+ -	movl	PT_ORIG_EAX(%esp), %edx		# get the error code
+ -	movl	$-1, PT_ORIG_EAX(%esp)		# no syscall to restart
+ -
+ -	TRACE_IRQS_OFF
+ -	movl	%esp, %eax			# pt_regs pointer
+ -	CALL_NOSPEC edi
+ -	jmp	ret_from_exception
+ -SYM_CODE_END(common_exception_read_cr2)
+ -
+ -SYM_CODE_START_LOCAL_NOALIGN(common_exception)
+ -	/* the function address is in %gs's slot on the stack */
+ -	SAVE_ALL switch_stacks=1 skip_gs=1 unwind_espfix=1
+ +	SAVE_ALL switch_stacks=1 skip_gs=1
+  	ENCODE_FRAME_POINTER
+ +	UNWIND_ESPFIX_STACK
+  
+  	/* fixup %gs */
+  	GS_TO_REG %ecx
+diff --cc arch/x86/entry/entry_64.S
+index 955c9ec809bc,cd8af69dd9ff..000000000000
+--- a/arch/x86/entry/entry_64.S
++++ b/arch/x86/entry/entry_64.S
+@@@ -1175,7 -1185,17 +1175,21 @@@ apicinterrupt3 HYPERV_STIMER0_VECTOR 
+  	hv_stimer0_callback_vector hv_stimer0_vector_handler
+  #endif /* CONFIG_HYPERV */
+  
+++<<<<<<< HEAD
+ +idtentry debug			do_debug		has_error_code=0	paranoid=1 shift_ist=DEBUG_STACK
+++=======
++ #if IS_ENABLED(CONFIG_ACRN_GUEST)
++ apicinterrupt3 HYPERVISOR_CALLBACK_VECTOR \
++ 	acrn_hv_callback_vector acrn_hv_vector_handler
++ #endif
++ 
++ #ifdef CONFIG_KVM_GUEST
++ apicinterrupt3 HYPERVISOR_CALLBACK_VECTOR \
++ 	kvm_async_pf_vector kvm_async_pf_intr
++ #endif
++ 
++ idtentry debug			do_debug		has_error_code=0	paranoid=1 shift_ist=IST_INDEX_DB ist_offset=DB_STACK_OFFSET
+++>>>>>>> b1d405751cd5 (KVM: x86: Switch KVM guest to using interrupts for page ready APF delivery)
+  idtentry int3			do_int3			has_error_code=0	create_gap=1
+  idtentry stack_segment		do_stack_segment	has_error_code=1
+  
+diff --cc arch/x86/kernel/kvm.c
+index 34ea59cb4c95,3a0115e8d880..000000000000
+--- a/arch/x86/kernel/kvm.c
++++ b/arch/x86/kernel/kvm.c
+@@@ -241,44 -217,68 +241,90 @@@ again
+  }
+  EXPORT_SYMBOL_GPL(kvm_async_pf_task_wake);
+  
+ -u32 kvm_read_and_reset_apf_flags(void)
+ +u32 kvm_read_and_reset_pf_reason(void)
+  {
+ -	u32 flags = 0;
+ +	u32 reason = 0;
+  
+  	if (__this_cpu_read(apf_reason.enabled)) {
+ -		flags = __this_cpu_read(apf_reason.flags);
+ -		__this_cpu_write(apf_reason.flags, 0);
+ +		reason = __this_cpu_read(apf_reason.reason);
+ +		__this_cpu_write(apf_reason.reason, 0);
+  	}
+  
+ -	return flags;
+ +	return reason;
+  }
+ -EXPORT_SYMBOL_GPL(kvm_read_and_reset_apf_flags);
+ -NOKPROBE_SYMBOL(kvm_read_and_reset_apf_flags);
+ +EXPORT_SYMBOL_GPL(kvm_read_and_reset_pf_reason);
+ +NOKPROBE_SYMBOL(kvm_read_and_reset_pf_reason);
+  
+ -bool __kvm_handle_async_pf(struct pt_regs *regs, u32 token)
+ +dotraplinkage void
+ +do_async_page_fault(struct pt_regs *regs, unsigned long error_code)
+  {
+++<<<<<<< HEAD
+ +	enum ctx_state prev_state;
+ +
+ +	switch (kvm_read_and_reset_pf_reason()) {
+ +	default:
+ +		do_page_fault(regs, error_code);
+ +		break;
+ +	case KVM_PV_REASON_PAGE_NOT_PRESENT:
+ +		/* page is swapped out by the host. */
+ +		prev_state = exception_enter();
+ +		kvm_async_pf_task_wait((u32)read_cr2(), !user_mode(regs));
+ +		exception_exit(prev_state);
+ +		break;
+ +	case KVM_PV_REASON_PAGE_READY:
+ +		rcu_irq_enter();
+ +		kvm_async_pf_task_wake((u32)read_cr2());
+ +		rcu_irq_exit();
+ +		break;
+ +	}
+++=======
++ 	u32 flags = kvm_read_and_reset_apf_flags();
++ 
++ 	if (!flags)
++ 		return false;
++ 
++ 	/*
++ 	 * If the host managed to inject an async #PF into an interrupt
++ 	 * disabled region, then die hard as this is not going to end well
++ 	 * and the host side is seriously broken.
++ 	 */
++ 	if (unlikely(!(regs->flags & X86_EFLAGS_IF)))
++ 		panic("Host injected async #PF in interrupt disabled region\n");
++ 
++ 	if (flags & KVM_PV_REASON_PAGE_NOT_PRESENT) {
++ 		if (unlikely(!(user_mode(regs))))
++ 			panic("Host injected async #PF in kernel mode\n");
++ 		/* Page is swapped out by the host. */
++ 		kvm_async_pf_task_wait_schedule(token);
++ 		return true;
++ 	}
++ 
++ 	WARN_ONCE(1, "Unexpected async PF flags: %x\n", flags);
++ 	return true;
+++>>>>>>> b1d405751cd5 (KVM: x86: Switch KVM guest to using interrupts for page ready APF delivery)
+  }
+ -NOKPROBE_SYMBOL(__kvm_handle_async_pf);
+ +NOKPROBE_SYMBOL(do_async_page_fault);
+  
++ __visible void __irq_entry kvm_async_pf_intr(struct pt_regs *regs)
++ {
++ 	u32 token;
++ 
++ 	entering_ack_irq();
++ 
++ 	inc_irq_stat(irq_hv_callback_count);
++ 
++ 	if (__this_cpu_read(apf_reason.enabled)) {
++ 		token = __this_cpu_read(apf_reason.token);
++ 		rcu_irq_enter();
++ 		kvm_async_pf_task_wake(token);
++ 		rcu_irq_exit();
++ 		__this_cpu_write(apf_reason.token, 0);
++ 		wrmsrl(MSR_KVM_ASYNC_PF_ACK, 1);
++ 	}
++ 
++ 	exiting_irq();
++ }
++ 
+  static void __init paravirt_ops_setup(void)
+  {
+  	pv_info.name = "KVM";
+@@@ -322,21 -322,22 +368,33 @@@ static notrace void kvm_guest_apic_eoi_
+  
+  static void kvm_guest_cpu_init(void)
+  {
+++<<<<<<< HEAD
+ +	if (kvm_para_has_feature(KVM_FEATURE_ASYNC_PF) && kvmapf) {
+ +		u64 pa = slow_virt_to_phys(this_cpu_ptr(&apf_reason));
+ +
+ +#ifdef CONFIG_PREEMPTION
+ +		pa |= KVM_ASYNC_PF_SEND_ALWAYS;
+ +#endif
+ +		pa |= KVM_ASYNC_PF_ENABLED;
+++=======
++ 	if (kvm_para_has_feature(KVM_FEATURE_ASYNC_PF_INT) && kvmapf) {
++ 		u64 pa = slow_virt_to_phys(this_cpu_ptr(&apf_reason));
++ 
++ 		WARN_ON_ONCE(!static_branch_likely(&kvm_async_pf_enabled));
++ 
++ 		pa = slow_virt_to_phys(this_cpu_ptr(&apf_reason));
++ 		pa |= KVM_ASYNC_PF_ENABLED | KVM_ASYNC_PF_DELIVERY_AS_INT;
+++>>>>>>> b1d405751cd5 (KVM: x86: Switch KVM guest to using interrupts for page ready APF delivery)
+  
+  		if (kvm_para_has_feature(KVM_FEATURE_ASYNC_PF_VMEXIT))
+  			pa |= KVM_ASYNC_PF_DELIVERY_AS_PF_VMEXIT;
+  
++ 		wrmsrl(MSR_KVM_ASYNC_PF_INT, HYPERVISOR_CALLBACK_VECTOR);
++ 
+  		wrmsrl(MSR_KVM_ASYNC_PF_EN, pa);
+  		__this_cpu_write(apf_reason.enabled, 1);
+ -		pr_info("KVM setup async PF for cpu %d\n", smp_processor_id());
+ +		printk(KERN_INFO"KVM setup async PF for cpu %d\n",
+ +		       smp_processor_id());
+  	}
+  
+  	if (kvm_para_has_feature(KVM_FEATURE_PV_EOI)) {
+@@@ -666,6 -659,11 +724,14 @@@ static void __init kvm_guest_init(void
+  	if (kvm_para_has_feature(KVM_FEATURE_PV_EOI))
+  		apic_set_eoi_write(kvm_guest_apic_eoi_write);
+  
+++<<<<<<< HEAD
+++=======
++ 	if (kvm_para_has_feature(KVM_FEATURE_ASYNC_PF_INT) && kvmapf) {
++ 		static_branch_enable(&kvm_async_pf_enabled);
++ 		alloc_intr_gate(HYPERVISOR_CALLBACK_VECTOR, kvm_async_pf_vector);
++ 	}
++ 
+++>>>>>>> b1d405751cd5 (KVM: x86: Switch KVM guest to using interrupts for page ready APF delivery)
+  #ifdef CONFIG_SMP
+  	smp_ops.smp_prepare_cpus = kvm_smp_prepare_cpus;
+  	smp_ops.smp_prepare_boot_cpu = kvm_smp_prepare_boot_cpu;
+diff --git a/arch/x86/Kconfig b/arch/x86/Kconfig
+index 3fc0a4c91af5..ceb47631c039 100644
+--- a/arch/x86/Kconfig
++++ b/arch/x86/Kconfig
+@@ -801,6 +801,7 @@ config KVM_GUEST
+ 	depends on PARAVIRT
+ 	select PARAVIRT_CLOCK
+ 	select ARCH_CPUIDLE_HALTPOLL
++	select X86_HV_CALLBACK_VECTOR
+ 	default y
+ 	---help---
+ 	  This option enables various optimizations for running under the KVM
+* Unmerged path arch/x86/entry/entry_32.S
+* Unmerged path arch/x86/entry/entry_64.S
+diff --git a/arch/x86/include/asm/kvm_para.h b/arch/x86/include/asm/kvm_para.h
+index 5ed3cf1c3934..49462236bfcc 100644
+--- a/arch/x86/include/asm/kvm_para.h
++++ b/arch/x86/include/asm/kvm_para.h
+@@ -4,6 +4,7 @@
+ 
+ #include <asm/processor.h>
+ #include <asm/alternative.h>
++#include <linux/interrupt.h>
+ #include <uapi/asm/kvm_para.h>
+ 
+ extern void kvmclock_init(void);
+@@ -94,6 +95,12 @@ u32 kvm_read_and_reset_pf_reason(void);
+ extern void kvm_disable_steal_time(void);
+ void do_async_page_fault(struct pt_regs *regs, unsigned long error_code);
+ 
++extern __visible void kvm_async_pf_vector(void);
++#ifdef CONFIG_TRACING
++#define trace_kvm_async_pf_vector kvm_async_pf_vector
++#endif
++__visible void __irq_entry kvm_async_pf_intr(struct pt_regs *regs);
++
+ #ifdef CONFIG_PARAVIRT_SPINLOCKS
+ void __init kvm_spinlock_init(void);
+ #else /* !CONFIG_PARAVIRT_SPINLOCKS */
+* Unmerged path arch/x86/kernel/kvm.c
