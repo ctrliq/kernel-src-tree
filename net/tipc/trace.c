@@ -105,7 +105,7 @@ int tipc_skb_dump(struct sk_buff *skb, bool more, char *buf)
 			break;
 		default:
 			break;
-		};
+		}
 		i += scnprintf(buf + i, sz - i, " | %u",
 			       msg_src_droppable(hdr));
 		i += scnprintf(buf + i, sz - i, " %u",
@@ -116,7 +116,7 @@ int tipc_skb_dump(struct sk_buff *skb, bool more, char *buf)
 	default:
 		/* need more? */
 		break;
-	};
+	}
 
 	i += scnprintf(buf + i, sz - i, "\n");
 	if (!more)
