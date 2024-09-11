@@ -1,0 +1,1159 @@
+net: switchdev: remove the transaction structure from port object notifiers
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-358.el8
+commit-author Vladimir Oltean <vladimir.oltean@nxp.com>
+commit ffb68fc58e9640762be891f9aebe4f5aac615ab3
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-358.el8/ffb68fc5.failed
+
+Since the introduction of the switchdev API, port objects were
+transmitted to drivers for offloading using a two-step transactional
+model, with a prepare phase that was supposed to catch all errors, and a
+commit phase that was supposed to never fail.
+
+Some classes of failures can never be avoided, like hardware access, or
+memory allocation. In the latter case, merely attempting to move the
+memory allocation to the preparation phase makes it impossible to avoid
+memory leaks, since commit 91cf8eceffc1 ("switchdev: Remove unused
+transaction item queue") which has removed the unused mechanism of
+passing on the allocated memory between one phase and another.
+
+It is time we admit that separating the preparation from the commit
+phase is something that is best left for the driver to decide, and not
+something that should be baked into the API, especially since there are
+no switchdev callers that depend on this.
+
+This patch removes the struct switchdev_trans member from switchdev port
+object notifier structures, and converts drivers to not look at this
+member.
+
+Where driver conversion is trivial (like in the case of the Marvell
+Prestera driver, NXP DPAA2 switch, TI CPSW, and Rocker drivers), it is
+done in this patch.
+
+Where driver conversion needs more attention (DSA, Mellanox Spectrum),
+the conversion is left for subsequent patches and here we only fake the
+prepare/commit phases at a lower level, just not in the switchdev
+notifier itself.
+
+Where the code has a natural structure that is best left alone as a
+preparation and a commit phase (as in the case of the Ocelot switch),
+that structure is left in place, just made to not depend upon the
+switchdev transactional model.
+
+	Signed-off-by: Vladimir Oltean <vladimir.oltean@nxp.com>
+	Reviewed-by: Florian Fainelli <f.fainelli@gmail.com>
+	Acked-by: Linus Walleij <linus.walleij@linaro.org>
+	Acked-by: Jiri Pirko <jiri@nvidia.com>
+	Reviewed-by: Ido Schimmel <idosch@nvidia.com>
+	Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+(cherry picked from commit ffb68fc58e9640762be891f9aebe4f5aac615ab3)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/marvell/prestera/prestera_switchdev.c
+#	drivers/net/ethernet/mscc/ocelot_net.c
+#	drivers/net/ethernet/ti/cpsw_switchdev.c
+#	drivers/staging/fsl-dpaa2/ethsw/ethsw.c
+#	net/dsa/slave.c
+#	net/dsa/switch.c
+diff --cc drivers/staging/fsl-dpaa2/ethsw/ethsw.c
+index 1f9a4c8ef2da,197dea9c3b42..000000000000
+--- a/drivers/staging/fsl-dpaa2/ethsw/ethsw.c
++++ b/drivers/staging/fsl-dpaa2/ethsw/ethsw.c
+@@@ -720,35 -974,54 +720,71 @@@ static int swdev_port_attr_set(struct n
+  	return err;
+  }
+  
+++<<<<<<< HEAD
+ +static int port_vlans_add(struct net_device *netdev,
+ +			  const struct switchdev_obj_port_vlan *vlan,
+ +			  struct switchdev_trans *trans)
+ +{
+ +	struct ethsw_port_priv *port_priv = netdev_priv(netdev);
+ +	int vid, err;
+ +
+ +	if (switchdev_trans_ph_prepare(trans))
+ +		return 0;
+++=======
++ static int dpaa2_switch_port_vlans_add(struct net_device *netdev,
++ 				       const struct switchdev_obj_port_vlan *vlan)
++ {
++ 	struct ethsw_port_priv *port_priv = netdev_priv(netdev);
++ 	struct ethsw_core *ethsw = port_priv->ethsw_data;
++ 	struct dpsw_attr *attr = &ethsw->sw_attr;
++ 	int err = 0;
++ 
++ 	/* Make sure that the VLAN is not already configured
++ 	 * on the switch port
++ 	 */
++ 	if (port_priv->vlans[vlan->vid] & ETHSW_VLAN_MEMBER)
++ 		return -EEXIST;
++ 
++ 	/* Check if there is space for a new VLAN */
++ 	err = dpsw_get_attributes(ethsw->mc_io, 0, ethsw->dpsw_handle,
++ 				  &ethsw->sw_attr);
++ 	if (err) {
++ 		netdev_err(netdev, "dpsw_get_attributes err %d\n", err);
++ 		return err;
++ 	}
++ 	if (attr->max_vlans - attr->num_vlans < 1)
++ 		return -ENOSPC;
++ 
++ 	/* Check if there is space for a new VLAN */
++ 	err = dpsw_get_attributes(ethsw->mc_io, 0, ethsw->dpsw_handle,
++ 				  &ethsw->sw_attr);
++ 	if (err) {
++ 		netdev_err(netdev, "dpsw_get_attributes err %d\n", err);
++ 		return err;
++ 	}
++ 	if (attr->max_vlans - attr->num_vlans < 1)
++ 		return -ENOSPC;
+++>>>>>>> ffb68fc58e96 (net: switchdev: remove the transaction structure from port object notifiers)
+  
+ -	if (!port_priv->ethsw_data->vlans[vlan->vid]) {
+ -		/* this is a new VLAN */
+ -		err = dpaa2_switch_add_vlan(port_priv->ethsw_data, vlan->vid);
+ -		if (err)
+ -			return err;
+ +	for (vid = vlan->vid_begin; vid <= vlan->vid_end; vid++) {
+ +		if (!port_priv->ethsw_data->vlans[vid]) {
+ +			/* this is a new VLAN */
+ +			err = ethsw_add_vlan(port_priv->ethsw_data, vid);
+ +			if (err)
+ +				return err;
+  
+ -		port_priv->ethsw_data->vlans[vlan->vid] |= ETHSW_VLAN_GLOBAL;
+ +			port_priv->ethsw_data->vlans[vid] |= ETHSW_VLAN_GLOBAL;
+ +		}
+ +		err = ethsw_port_add_vlan(port_priv, vid, vlan->flags);
+ +		if (err)
+ +			break;
+  	}
+  
+ -	return dpaa2_switch_port_add_vlan(port_priv, vlan->vid, vlan->flags);
+ +	return err;
+  }
+  
+ -static int dpaa2_switch_port_lookup_address(struct net_device *netdev, int is_uc,
+ -					    const unsigned char *addr)
+ +static int port_lookup_address(struct net_device *netdev, int is_uc,
+ +			       const unsigned char *addr)
+  {
+  	struct netdev_hw_addr_list *list = (is_uc) ? &netdev->uc : &netdev->mc;
+  	struct netdev_hw_addr *ha;
+@@@ -764,21 -1037,17 +800,23 @@@
+  	return 0;
+  }
+  
+++<<<<<<< HEAD
+ +static int port_mdb_add(struct net_device *netdev,
+ +			const struct switchdev_obj_port_mdb *mdb,
+ +			struct switchdev_trans *trans)
+++=======
++ static int dpaa2_switch_port_mdb_add(struct net_device *netdev,
++ 				     const struct switchdev_obj_port_mdb *mdb)
+++>>>>>>> ffb68fc58e96 (net: switchdev: remove the transaction structure from port object notifiers)
+  {
+  	struct ethsw_port_priv *port_priv = netdev_priv(netdev);
+  	int err;
+  
+- 	if (switchdev_trans_ph_prepare(trans))
+- 		return 0;
+- 
+  	/* Check if address is already set on this port */
+ -	if (dpaa2_switch_port_lookup_address(netdev, 0, mdb->addr))
+ +	if (port_lookup_address(netdev, 0, mdb->addr))
+  		return -EEXIST;
+  
+ -	err = dpaa2_switch_port_fdb_add_mc(port_priv, mdb->addr);
+ +	err = ethsw_port_fdb_add_mc(port_priv, mdb->addr);
+  	if (err)
+  		return err;
+  
+@@@ -791,22 -1060,19 +829,36 @@@
+  	return err;
+  }
+  
+++<<<<<<< HEAD
+ +static int swdev_port_obj_add(struct net_device *netdev,
+ +			      const struct switchdev_obj *obj,
+ +			      struct switchdev_trans *trans)
+++=======
++ static int dpaa2_switch_port_obj_add(struct net_device *netdev,
++ 				     const struct switchdev_obj *obj)
+++>>>>>>> ffb68fc58e96 (net: switchdev: remove the transaction structure from port object notifiers)
+  {
+  	int err;
+  
+  	switch (obj->id) {
+  	case SWITCHDEV_OBJ_ID_PORT_VLAN:
+++<<<<<<< HEAD
+ +		err = port_vlans_add(netdev,
+ +				     SWITCHDEV_OBJ_PORT_VLAN(obj),
+ +				     trans);
+ +		break;
+ +	case SWITCHDEV_OBJ_ID_PORT_MDB:
+ +		err = port_mdb_add(netdev,
+ +				   SWITCHDEV_OBJ_PORT_MDB(obj),
+ +				   trans);
+++=======
++ 		err = dpaa2_switch_port_vlans_add(netdev,
++ 						  SWITCHDEV_OBJ_PORT_VLAN(obj));
++ 		break;
++ 	case SWITCHDEV_OBJ_ID_PORT_MDB:
++ 		err = dpaa2_switch_port_mdb_add(netdev,
++ 						SWITCHDEV_OBJ_PORT_MDB(obj));
+++>>>>>>> ffb68fc58e96 (net: switchdev: remove the transaction structure from port object notifiers)
+  		break;
+  	default:
+  		err = -EOPNOTSUPP;
+@@@ -1101,11 -1392,10 +1153,15 @@@ ethsw_switchdev_port_obj_event(unsigne
+  
+  	switch (event) {
+  	case SWITCHDEV_PORT_OBJ_ADD:
+++<<<<<<< HEAD
+ +		err = swdev_port_obj_add(netdev, port_obj_info->obj,
+ +					 port_obj_info->trans);
+++=======
++ 		err = dpaa2_switch_port_obj_add(netdev, port_obj_info->obj);
+++>>>>>>> ffb68fc58e96 (net: switchdev: remove the transaction structure from port object notifiers)
+  		break;
+  	case SWITCHDEV_PORT_OBJ_DEL:
+ -		err = dpaa2_switch_port_obj_del(netdev, port_obj_info->obj);
+ +		err = swdev_port_obj_del(netdev, port_obj_info->obj);
+  		break;
+  	}
+  
+diff --cc net/dsa/slave.c
+index 24cc4de02bd3,0eefb50aae8c..000000000000
+--- a/net/dsa/slave.c
++++ b/net/dsa/slave.c
+@@@ -300,9 -303,75 +300,81 @@@ static int dsa_slave_port_attr_set(stru
+  	return ret;
+  }
+  
+++<<<<<<< HEAD
+ +static int dsa_slave_port_obj_add(struct net_device *dev,
+ +				  const struct switchdev_obj *obj,
+ +				  struct switchdev_trans *trans)
+++=======
++ /* Must be called under rcu_read_lock() */
++ static int
++ dsa_slave_vlan_check_for_8021q_uppers(struct net_device *slave,
++ 				      const struct switchdev_obj_port_vlan *vlan)
++ {
++ 	struct net_device *upper_dev;
++ 	struct list_head *iter;
++ 
++ 	netdev_for_each_upper_dev_rcu(slave, upper_dev, iter) {
++ 		u16 vid;
++ 
++ 		if (!is_vlan_dev(upper_dev))
++ 			continue;
++ 
++ 		vid = vlan_dev_vlan_id(upper_dev);
++ 		if (vid == vlan->vid)
++ 			return -EBUSY;
++ 	}
++ 
++ 	return 0;
++ }
++ 
++ static int dsa_slave_vlan_add(struct net_device *dev,
++ 			      const struct switchdev_obj *obj)
++ {
++ 	struct net_device *master = dsa_slave_to_master(dev);
++ 	struct dsa_port *dp = dsa_slave_to_port(dev);
++ 	struct switchdev_obj_port_vlan vlan;
++ 	int err;
++ 
++ 	if (obj->orig_dev != dev)
++ 		return -EOPNOTSUPP;
++ 
++ 	if (dsa_port_skip_vlan_configuration(dp))
++ 		return 0;
++ 
++ 	vlan = *SWITCHDEV_OBJ_PORT_VLAN(obj);
++ 
++ 	/* Deny adding a bridge VLAN when there is already an 802.1Q upper with
++ 	 * the same VID.
++ 	 */
++ 	if (br_vlan_enabled(dp->bridge_dev)) {
++ 		rcu_read_lock();
++ 		err = dsa_slave_vlan_check_for_8021q_uppers(dev, &vlan);
++ 		rcu_read_unlock();
++ 		if (err)
++ 			return err;
++ 	}
++ 
++ 	err = dsa_port_vlan_add(dp, &vlan);
++ 	if (err)
++ 		return err;
++ 
++ 	/* We need the dedicated CPU port to be a member of the VLAN as well.
++ 	 * Even though drivers often handle CPU membership in special ways,
++ 	 * it doesn't make sense to program a PVID, so clear this flag.
++ 	 */
++ 	vlan.flags &= ~BRIDGE_VLAN_INFO_PVID;
++ 
++ 	err = dsa_port_vlan_add(dp->cpu_dp, &vlan);
++ 	if (err)
++ 		return err;
++ 
++ 	return vlan_vid_add(master, htons(ETH_P_8021Q), vlan.vid);
++ }
++ 
++ static int dsa_slave_port_obj_add(struct net_device *dev,
++ 				  const struct switchdev_obj *obj,
++ 				  struct netlink_ext_ack *extack)
+++>>>>>>> ffb68fc58e96 (net: switchdev: remove the transaction structure from port object notifiers)
+  {
+  	struct dsa_port *dp = dsa_slave_to_port(dev);
+  	int err;
+@@@ -314,18 -383,18 +386,27 @@@
+  
+  	switch (obj->id) {
+  	case SWITCHDEV_OBJ_ID_PORT_MDB:
+++<<<<<<< HEAD
+ +		err = dsa_port_mdb_add(dp, SWITCHDEV_OBJ_PORT_MDB(obj), trans);
+++=======
++ 		if (obj->orig_dev != dev)
++ 			return -EOPNOTSUPP;
++ 		err = dsa_port_mdb_add(dp, SWITCHDEV_OBJ_PORT_MDB(obj));
+++>>>>>>> ffb68fc58e96 (net: switchdev: remove the transaction structure from port object notifiers)
+  		break;
+  	case SWITCHDEV_OBJ_ID_HOST_MDB:
+  		/* DSA can directly translate this to a normal MDB add,
+  		 * but on the CPU port.
+  		 */
+- 		err = dsa_port_mdb_add(dp->cpu_dp, SWITCHDEV_OBJ_PORT_MDB(obj),
+- 				       trans);
++ 		err = dsa_port_mdb_add(dp->cpu_dp, SWITCHDEV_OBJ_PORT_MDB(obj));
+  		break;
+  	case SWITCHDEV_OBJ_ID_PORT_VLAN:
+++<<<<<<< HEAD
+ +		err = dsa_port_vlan_add(dp, SWITCHDEV_OBJ_PORT_VLAN(obj),
+ +					trans);
+++=======
++ 		err = dsa_slave_vlan_add(dev, obj);
+++>>>>>>> ffb68fc58e96 (net: switchdev: remove the transaction structure from port object notifiers)
+  		break;
+  	default:
+  		err = -EOPNOTSUPP;
+@@@ -1003,6 -1272,258 +1084,261 @@@ static int dsa_slave_get_ts_info(struc
+  	return ds->ops->get_ts_info(ds, p->dp->index, ts);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static int dsa_slave_vlan_rx_add_vid(struct net_device *dev, __be16 proto,
++ 				     u16 vid)
++ {
++ 	struct net_device *master = dsa_slave_to_master(dev);
++ 	struct dsa_port *dp = dsa_slave_to_port(dev);
++ 	struct switchdev_obj_port_vlan vlan = {
++ 		.obj.id = SWITCHDEV_OBJ_ID_PORT_VLAN,
++ 		.vid = vid,
++ 		/* This API only allows programming tagged, non-PVID VIDs */
++ 		.flags = 0,
++ 	};
++ 	int ret;
++ 
++ 	/* User port... */
++ 	ret = dsa_port_vlan_add(dp, &vlan);
++ 	if (ret)
++ 		return ret;
++ 
++ 	/* And CPU port... */
++ 	ret = dsa_port_vlan_add(dp->cpu_dp, &vlan);
++ 	if (ret)
++ 		return ret;
++ 
++ 	return vlan_vid_add(master, proto, vid);
++ }
++ 
++ static int dsa_slave_vlan_rx_kill_vid(struct net_device *dev, __be16 proto,
++ 				      u16 vid)
++ {
++ 	struct net_device *master = dsa_slave_to_master(dev);
++ 	struct dsa_port *dp = dsa_slave_to_port(dev);
++ 	struct switchdev_obj_port_vlan vlan = {
++ 		.vid = vid,
++ 		/* This API only allows programming tagged, non-PVID VIDs */
++ 		.flags = 0,
++ 	};
++ 	int err;
++ 
++ 	/* Do not deprogram the CPU port as it may be shared with other user
++ 	 * ports which can be members of this VLAN as well.
++ 	 */
++ 	err = dsa_port_vlan_del(dp, &vlan);
++ 	if (err)
++ 		return err;
++ 
++ 	vlan_vid_del(master, proto, vid);
++ 
++ 	return 0;
++ }
++ 
++ struct dsa_hw_port {
++ 	struct list_head list;
++ 	struct net_device *dev;
++ 	int old_mtu;
++ };
++ 
++ static int dsa_hw_port_list_set_mtu(struct list_head *hw_port_list, int mtu)
++ {
++ 	const struct dsa_hw_port *p;
++ 	int err;
++ 
++ 	list_for_each_entry(p, hw_port_list, list) {
++ 		if (p->dev->mtu == mtu)
++ 			continue;
++ 
++ 		err = dev_set_mtu(p->dev, mtu);
++ 		if (err)
++ 			goto rollback;
++ 	}
++ 
++ 	return 0;
++ 
++ rollback:
++ 	list_for_each_entry_continue_reverse(p, hw_port_list, list) {
++ 		if (p->dev->mtu == p->old_mtu)
++ 			continue;
++ 
++ 		if (dev_set_mtu(p->dev, p->old_mtu))
++ 			netdev_err(p->dev, "Failed to restore MTU\n");
++ 	}
++ 
++ 	return err;
++ }
++ 
++ static void dsa_hw_port_list_free(struct list_head *hw_port_list)
++ {
++ 	struct dsa_hw_port *p, *n;
++ 
++ 	list_for_each_entry_safe(p, n, hw_port_list, list)
++ 		kfree(p);
++ }
++ 
++ /* Make the hardware datapath to/from @dev limited to a common MTU */
++ static void dsa_bridge_mtu_normalization(struct dsa_port *dp)
++ {
++ 	struct list_head hw_port_list;
++ 	struct dsa_switch_tree *dst;
++ 	int min_mtu = ETH_MAX_MTU;
++ 	struct dsa_port *other_dp;
++ 	int err;
++ 
++ 	if (!dp->ds->mtu_enforcement_ingress)
++ 		return;
++ 
++ 	if (!dp->bridge_dev)
++ 		return;
++ 
++ 	INIT_LIST_HEAD(&hw_port_list);
++ 
++ 	/* Populate the list of ports that are part of the same bridge
++ 	 * as the newly added/modified port
++ 	 */
++ 	list_for_each_entry(dst, &dsa_tree_list, list) {
++ 		list_for_each_entry(other_dp, &dst->ports, list) {
++ 			struct dsa_hw_port *hw_port;
++ 			struct net_device *slave;
++ 
++ 			if (other_dp->type != DSA_PORT_TYPE_USER)
++ 				continue;
++ 
++ 			if (other_dp->bridge_dev != dp->bridge_dev)
++ 				continue;
++ 
++ 			if (!other_dp->ds->mtu_enforcement_ingress)
++ 				continue;
++ 
++ 			slave = other_dp->slave;
++ 
++ 			if (min_mtu > slave->mtu)
++ 				min_mtu = slave->mtu;
++ 
++ 			hw_port = kzalloc(sizeof(*hw_port), GFP_KERNEL);
++ 			if (!hw_port)
++ 				goto out;
++ 
++ 			hw_port->dev = slave;
++ 			hw_port->old_mtu = slave->mtu;
++ 
++ 			list_add(&hw_port->list, &hw_port_list);
++ 		}
++ 	}
++ 
++ 	/* Attempt to configure the entire hardware bridge to the newly added
++ 	 * interface's MTU first, regardless of whether the intention of the
++ 	 * user was to raise or lower it.
++ 	 */
++ 	err = dsa_hw_port_list_set_mtu(&hw_port_list, dp->slave->mtu);
++ 	if (!err)
++ 		goto out;
++ 
++ 	/* Clearly that didn't work out so well, so just set the minimum MTU on
++ 	 * all hardware bridge ports now. If this fails too, then all ports will
++ 	 * still have their old MTU rolled back anyway.
++ 	 */
++ 	dsa_hw_port_list_set_mtu(&hw_port_list, min_mtu);
++ 
++ out:
++ 	dsa_hw_port_list_free(&hw_port_list);
++ }
++ 
++ static int dsa_slave_change_mtu(struct net_device *dev, int new_mtu)
++ {
++ 	struct net_device *master = dsa_slave_to_master(dev);
++ 	struct dsa_port *dp = dsa_slave_to_port(dev);
++ 	struct dsa_slave_priv *p = netdev_priv(dev);
++ 	struct dsa_switch *ds = p->dp->ds;
++ 	struct dsa_port *cpu_dp;
++ 	int port = p->dp->index;
++ 	int largest_mtu = 0;
++ 	int new_master_mtu;
++ 	int old_master_mtu;
++ 	int mtu_limit;
++ 	int cpu_mtu;
++ 	int err, i;
++ 
++ 	if (!ds->ops->port_change_mtu)
++ 		return -EOPNOTSUPP;
++ 
++ 	for (i = 0; i < ds->num_ports; i++) {
++ 		int slave_mtu;
++ 
++ 		if (!dsa_is_user_port(ds, i))
++ 			continue;
++ 
++ 		/* During probe, this function will be called for each slave
++ 		 * device, while not all of them have been allocated. That's
++ 		 * ok, it doesn't change what the maximum is, so ignore it.
++ 		 */
++ 		if (!dsa_to_port(ds, i)->slave)
++ 			continue;
++ 
++ 		/* Pretend that we already applied the setting, which we
++ 		 * actually haven't (still haven't done all integrity checks)
++ 		 */
++ 		if (i == port)
++ 			slave_mtu = new_mtu;
++ 		else
++ 			slave_mtu = dsa_to_port(ds, i)->slave->mtu;
++ 
++ 		if (largest_mtu < slave_mtu)
++ 			largest_mtu = slave_mtu;
++ 	}
++ 
++ 	cpu_dp = dsa_to_port(ds, port)->cpu_dp;
++ 
++ 	mtu_limit = min_t(int, master->max_mtu, dev->max_mtu);
++ 	old_master_mtu = master->mtu;
++ 	new_master_mtu = largest_mtu + cpu_dp->tag_ops->overhead;
++ 	if (new_master_mtu > mtu_limit)
++ 		return -ERANGE;
++ 
++ 	/* If the master MTU isn't over limit, there's no need to check the CPU
++ 	 * MTU, since that surely isn't either.
++ 	 */
++ 	cpu_mtu = largest_mtu;
++ 
++ 	/* Start applying stuff */
++ 	if (new_master_mtu != old_master_mtu) {
++ 		err = dev_set_mtu(master, new_master_mtu);
++ 		if (err < 0)
++ 			goto out_master_failed;
++ 
++ 		/* We only need to propagate the MTU of the CPU port to
++ 		 * upstream switches.
++ 		 */
++ 		err = dsa_port_mtu_change(cpu_dp, cpu_mtu, true);
++ 		if (err)
++ 			goto out_cpu_failed;
++ 	}
++ 
++ 	err = dsa_port_mtu_change(dp, new_mtu, false);
++ 	if (err)
++ 		goto out_port_failed;
++ 
++ 	dev->mtu = new_mtu;
++ 
++ 	dsa_bridge_mtu_normalization(dp);
++ 
++ 	return 0;
++ 
++ out_port_failed:
++ 	if (new_master_mtu != old_master_mtu)
++ 		dsa_port_mtu_change(cpu_dp, old_master_mtu -
++ 				    cpu_dp->tag_ops->overhead,
++ 				    true);
++ out_cpu_failed:
++ 	if (new_master_mtu != old_master_mtu)
++ 		dev_set_mtu(master, old_master_mtu);
++ out_master_failed:
++ 	return err;
++ }
++ 
+++>>>>>>> ffb68fc58e96 (net: switchdev: remove the transaction structure from port object notifiers)
+  static const struct ethtool_ops dsa_slave_ethtool_ops = {
+  	.get_drvinfo		= dsa_slave_get_drvinfo,
+  	.get_regs_len		= dsa_slave_get_regs_len,
+diff --cc net/dsa/switch.c
+index b93511726069,5b0bf29e1375..000000000000
+--- a/net/dsa/switch.c
++++ b/net/dsa/switch.c
+@@@ -102,55 -178,37 +102,75 @@@ static int dsa_switch_fdb_del(struct ds
+  	return ds->ops->port_fdb_del(ds, port, info->addr, info->vid);
+  }
+  
+++<<<<<<< HEAD
+ +static int
+ +dsa_switch_mdb_prepare_bitmap(struct dsa_switch *ds,
+ +			      const struct switchdev_obj_port_mdb *mdb,
+ +			      const unsigned long *bitmap)
+++=======
++ static bool dsa_switch_mdb_match(struct dsa_switch *ds, int port,
++ 				 struct dsa_notifier_mdb_info *info)
++ {
++ 	if (ds->index == info->sw_index && port == info->port)
++ 		return true;
++ 
++ 	if (dsa_is_dsa_port(ds, port))
++ 		return true;
++ 
++ 	return false;
++ }
++ 
++ static int dsa_switch_mdb_add(struct dsa_switch *ds,
++ 			      struct dsa_notifier_mdb_info *info)
+++>>>>>>> ffb68fc58e96 (net: switchdev: remove the transaction structure from port object notifiers)
+  {
+  	int port, err;
+  
+  	if (!ds->ops->port_mdb_prepare || !ds->ops->port_mdb_add)
+  		return -EOPNOTSUPP;
+  
+ -	for (port = 0; port < ds->num_ports; port++) {
+ -		if (dsa_switch_mdb_match(ds, port, info)) {
+ -			err = ds->ops->port_mdb_prepare(ds, port, info->mdb);
+ -			if (err)
+ -				return err;
+ -		}
+ +	for_each_set_bit(port, bitmap, ds->num_ports) {
+ +		err = ds->ops->port_mdb_prepare(ds, port, mdb);
+ +		if (err)
+ +			return err;
+  	}
+  
+++<<<<<<< HEAD
+ +	return 0;
+ +}
+ +
+ +static void dsa_switch_mdb_add_bitmap(struct dsa_switch *ds,
+ +				      const struct switchdev_obj_port_mdb *mdb,
+ +				      const unsigned long *bitmap)
+ +{
+ +	int port;
+ +
+ +	for_each_set_bit(port, bitmap, ds->num_ports)
+ +		ds->ops->port_mdb_add(ds, port, mdb);
+ +}
+ +
+ +static int dsa_switch_mdb_add(struct dsa_switch *ds,
+ +			      struct dsa_notifier_mdb_info *info)
+ +{
+ +	const struct switchdev_obj_port_mdb *mdb = info->mdb;
+ +	struct switchdev_trans *trans = info->trans;
+ +	DECLARE_BITMAP(group, ds->num_ports);
+ +	int port;
+ +
+ +	/* Build a mask of Multicast group members */
+ +	bitmap_zero(group, ds->num_ports);
+ +	if (ds->index == info->sw_index)
+ +		set_bit(info->port, group);
+++=======
+++>>>>>>> ffb68fc58e96 (net: switchdev: remove the transaction structure from port object notifiers)
+  	for (port = 0; port < ds->num_ports; port++)
+ -		if (dsa_switch_mdb_match(ds, port, info))
+ -			ds->ops->port_mdb_add(ds, port, info->mdb);
+ +		if (dsa_is_dsa_port(ds, port))
+ +			set_bit(port, group);
+ +
+ +	if (switchdev_trans_ph_prepare(trans))
+ +		return dsa_switch_mdb_prepare_bitmap(ds, mdb, group);
+ +
+ +	dsa_switch_mdb_add_bitmap(ds, mdb, group);
+  
+  	return 0;
+  }
+@@@ -169,56 -225,37 +189,76 @@@ static int dsa_switch_mdb_del(struct ds
+  	return 0;
+  }
+  
+++<<<<<<< HEAD
+ +static int
+ +dsa_switch_vlan_prepare_bitmap(struct dsa_switch *ds,
+ +			       const struct switchdev_obj_port_vlan *vlan,
+ +			       const unsigned long *bitmap)
+++=======
++ static bool dsa_switch_vlan_match(struct dsa_switch *ds, int port,
++ 				  struct dsa_notifier_vlan_info *info)
++ {
++ 	if (ds->index == info->sw_index && port == info->port)
++ 		return true;
++ 
++ 	if (dsa_is_dsa_port(ds, port))
++ 		return true;
++ 
++ 	return false;
++ }
++ 
++ static int dsa_switch_vlan_add(struct dsa_switch *ds,
++ 			       struct dsa_notifier_vlan_info *info)
+++>>>>>>> ffb68fc58e96 (net: switchdev: remove the transaction structure from port object notifiers)
+  {
+  	int port, err;
+  
+  	if (!ds->ops->port_vlan_prepare || !ds->ops->port_vlan_add)
+  		return -EOPNOTSUPP;
+  
+ -	for (port = 0; port < ds->num_ports; port++) {
+ -		if (dsa_switch_vlan_match(ds, port, info)) {
+ -			err = ds->ops->port_vlan_prepare(ds, port, info->vlan);
+ -			if (err)
+ -				return err;
+ -		}
+ +	for_each_set_bit(port, bitmap, ds->num_ports) {
+ +		err = ds->ops->port_vlan_prepare(ds, port, vlan);
+ +		if (err)
+ +			return err;
+  	}
+  
+++<<<<<<< HEAD
+ +	return 0;
+ +}
+ +
+ +static void
+ +dsa_switch_vlan_add_bitmap(struct dsa_switch *ds,
+ +			   const struct switchdev_obj_port_vlan *vlan,
+ +			   const unsigned long *bitmap)
+ +{
+ +	int port;
+ +
+ +	for_each_set_bit(port, bitmap, ds->num_ports)
+ +		ds->ops->port_vlan_add(ds, port, vlan);
+ +}
+ +
+ +static int dsa_switch_vlan_add(struct dsa_switch *ds,
+ +			       struct dsa_notifier_vlan_info *info)
+ +{
+ +	const struct switchdev_obj_port_vlan *vlan = info->vlan;
+ +	struct switchdev_trans *trans = info->trans;
+ +	DECLARE_BITMAP(members, ds->num_ports);
+ +	int port;
+ +
+ +	/* Build a mask of VLAN members */
+ +	bitmap_zero(members, ds->num_ports);
+ +	if (ds->index == info->sw_index)
+ +		set_bit(info->port, members);
+++=======
+++>>>>>>> ffb68fc58e96 (net: switchdev: remove the transaction structure from port object notifiers)
+  	for (port = 0; port < ds->num_ports; port++)
+ -		if (dsa_switch_vlan_match(ds, port, info))
+ -			ds->ops->port_vlan_add(ds, port, info->vlan);
+ +		if (dsa_is_cpu_port(ds, port) || dsa_is_dsa_port(ds, port))
+ +			set_bit(port, members);
+ +
+ +	if (switchdev_trans_ph_prepare(trans))
+ +		return dsa_switch_vlan_prepare_bitmap(ds, vlan, members);
+ +
+ +	dsa_switch_vlan_add_bitmap(ds, vlan, members);
+  
+  	return 0;
+  }
+* Unmerged path drivers/net/ethernet/marvell/prestera/prestera_switchdev.c
+* Unmerged path drivers/net/ethernet/mscc/ocelot_net.c
+* Unmerged path drivers/net/ethernet/ti/cpsw_switchdev.c
+* Unmerged path drivers/net/ethernet/marvell/prestera/prestera_switchdev.c
+diff --git a/drivers/net/ethernet/mellanox/mlxsw/spectrum_switchdev.c b/drivers/net/ethernet/mellanox/mlxsw/spectrum_switchdev.c
+index 14ce372c3f85..aa9224473e7c 100644
+--- a/drivers/net/ethernet/mellanox/mlxsw/spectrum_switchdev.c
++++ b/drivers/net/ethernet/mellanox/mlxsw/spectrum_switchdev.c
+@@ -1720,8 +1720,7 @@ static int mlxsw_sp_port_remove_from_mid(struct mlxsw_sp_port *mlxsw_sp_port,
+ }
+ 
+ static int mlxsw_sp_port_mdb_add(struct mlxsw_sp_port *mlxsw_sp_port,
+-				 const struct switchdev_obj_port_mdb *mdb,
+-				 struct switchdev_trans *trans)
++				 const struct switchdev_obj_port_mdb *mdb)
+ {
+ 	struct mlxsw_sp *mlxsw_sp = mlxsw_sp_port->mlxsw_sp;
+ 	struct net_device *orig_dev = mdb->obj.orig_dev;
+@@ -1733,9 +1732,6 @@ static int mlxsw_sp_port_mdb_add(struct mlxsw_sp_port *mlxsw_sp_port,
+ 	u16 fid_index;
+ 	int err = 0;
+ 
+-	if (switchdev_trans_ph_commit(trans))
+-		return 0;
+-
+ 	bridge_port = mlxsw_sp_bridge_port_find(mlxsw_sp->bridge, orig_dev);
+ 	if (!bridge_port)
+ 		return 0;
+@@ -1817,32 +1813,38 @@ mlxsw_sp_port_mrouter_update_mdb(struct mlxsw_sp_port *mlxsw_sp_port,
+ 
+ static int mlxsw_sp_port_obj_add(struct net_device *dev,
+ 				 const struct switchdev_obj *obj,
+-				 struct switchdev_trans *trans,
+ 				 struct netlink_ext_ack *extack)
+ {
+ 	struct mlxsw_sp_port *mlxsw_sp_port = netdev_priv(dev);
+ 	const struct switchdev_obj_port_vlan *vlan;
++	struct switchdev_trans trans;
+ 	int err = 0;
+ 
+ 	switch (obj->id) {
+ 	case SWITCHDEV_OBJ_ID_PORT_VLAN:
+ 		vlan = SWITCHDEV_OBJ_PORT_VLAN(obj);
+-		err = mlxsw_sp_port_vlans_add(mlxsw_sp_port, vlan, trans,
++
++		trans.ph_prepare = true;
++		err = mlxsw_sp_port_vlans_add(mlxsw_sp_port, vlan, &trans,
+ 					      extack);
+ 
+-		if (switchdev_trans_ph_prepare(trans)) {
+-			/* The event is emitted before the changes are actually
+-			 * applied to the bridge. Therefore schedule the respin
+-			 * call for later, so that the respin logic sees the
+-			 * updated bridge state.
+-			 */
+-			mlxsw_sp_span_respin(mlxsw_sp_port->mlxsw_sp);
+-		}
++		/* The event is emitted before the changes are actually
++		 * applied to the bridge. Therefore schedule the respin
++		 * call for later, so that the respin logic sees the
++		 * updated bridge state.
++		 */
++		mlxsw_sp_span_respin(mlxsw_sp_port->mlxsw_sp);
++
++		if (err)
++			break;
++
++		trans.ph_prepare = false;
++		err = mlxsw_sp_port_vlans_add(mlxsw_sp_port, vlan, &trans,
++					      extack);
+ 		break;
+ 	case SWITCHDEV_OBJ_ID_PORT_MDB:
+ 		err = mlxsw_sp_port_mdb_add(mlxsw_sp_port,
+-					    SWITCHDEV_OBJ_PORT_MDB(obj),
+-					    trans);
++					    SWITCHDEV_OBJ_PORT_MDB(obj));
+ 		break;
+ 	default:
+ 		err = -EOPNOTSUPP;
+@@ -3452,13 +3454,13 @@ mlxsw_sp_switchdev_vxlan_vlan_del(struct mlxsw_sp *mlxsw_sp,
+ static int
+ mlxsw_sp_switchdev_vxlan_vlans_add(struct net_device *vxlan_dev,
+ 				   struct switchdev_notifier_port_obj_info *
+-				   port_obj_info)
++				   port_obj_info,
++				   struct switchdev_trans *trans)
+ {
+ 	struct switchdev_obj_port_vlan *vlan =
+ 		SWITCHDEV_OBJ_PORT_VLAN(port_obj_info->obj);
+ 	bool flag_untagged = vlan->flags & BRIDGE_VLAN_INFO_UNTAGGED;
+ 	bool flag_pvid = vlan->flags & BRIDGE_VLAN_INFO_PVID;
+-	struct switchdev_trans *trans = port_obj_info->trans;
+ 	struct mlxsw_sp_bridge_device *bridge_device;
+ 	struct netlink_ext_ack *extack;
+ 	struct mlxsw_sp *mlxsw_sp;
+@@ -3539,12 +3541,22 @@ mlxsw_sp_switchdev_handle_vxlan_obj_add(struct net_device *vxlan_dev,
+ 					struct switchdev_notifier_port_obj_info *
+ 					port_obj_info)
+ {
++	struct switchdev_trans trans;
+ 	int err = 0;
+ 
+ 	switch (port_obj_info->obj->id) {
+ 	case SWITCHDEV_OBJ_ID_PORT_VLAN:
++		trans.ph_prepare = true;
++		err = mlxsw_sp_switchdev_vxlan_vlans_add(vxlan_dev,
++							 port_obj_info,
++							 &trans);
++		if (err)
++			break;
++
++		trans.ph_prepare = false;
+ 		err = mlxsw_sp_switchdev_vxlan_vlans_add(vxlan_dev,
+-							 port_obj_info);
++							 port_obj_info,
++							 &trans);
+ 		break;
+ 	default:
+ 		break;
+* Unmerged path drivers/net/ethernet/mscc/ocelot_net.c
+diff --git a/drivers/net/ethernet/rocker/rocker_main.c b/drivers/net/ethernet/rocker/rocker_main.c
+index 6bf36ef15dab..63f105fe9dd6 100644
+--- a/drivers/net/ethernet/rocker/rocker_main.c
++++ b/drivers/net/ethernet/rocker/rocker_main.c
+@@ -1639,17 +1639,13 @@ rocker_world_port_attr_bridge_ageing_time_set(struct rocker_port *rocker_port,
+ 
+ static int
+ rocker_world_port_obj_vlan_add(struct rocker_port *rocker_port,
+-			       const struct switchdev_obj_port_vlan *vlan,
+-			       struct switchdev_trans *trans)
++			       const struct switchdev_obj_port_vlan *vlan)
+ {
+ 	struct rocker_world_ops *wops = rocker_port->rocker->wops;
+ 
+ 	if (!wops->port_obj_vlan_add)
+ 		return -EOPNOTSUPP;
+ 
+-	if (switchdev_trans_ph_prepare(trans))
+-		return 0;
+-
+ 	return wops->port_obj_vlan_add(rocker_port, vlan);
+ }
+ 
+@@ -2103,8 +2099,7 @@ static int rocker_port_attr_set(struct net_device *dev,
+ }
+ 
+ static int rocker_port_obj_add(struct net_device *dev,
+-			       const struct switchdev_obj *obj,
+-			       struct switchdev_trans *trans)
++			       const struct switchdev_obj *obj)
+ {
+ 	struct rocker_port *rocker_port = netdev_priv(dev);
+ 	int err = 0;
+@@ -2112,8 +2107,7 @@ static int rocker_port_obj_add(struct net_device *dev,
+ 	switch (obj->id) {
+ 	case SWITCHDEV_OBJ_ID_PORT_VLAN:
+ 		err = rocker_world_port_obj_vlan_add(rocker_port,
+-						     SWITCHDEV_OBJ_PORT_VLAN(obj),
+-						     trans);
++						     SWITCHDEV_OBJ_PORT_VLAN(obj));
+ 		break;
+ 	default:
+ 		err = -EOPNOTSUPP;
+@@ -2828,8 +2822,7 @@ rocker_switchdev_port_obj_event(unsigned long event, struct net_device *netdev,
+ 
+ 	switch (event) {
+ 	case SWITCHDEV_PORT_OBJ_ADD:
+-		err = rocker_port_obj_add(netdev, port_obj_info->obj,
+-					  port_obj_info->trans);
++		err = rocker_port_obj_add(netdev, port_obj_info->obj);
+ 		break;
+ 	case SWITCHDEV_PORT_OBJ_DEL:
+ 		err = rocker_port_obj_del(netdev, port_obj_info->obj);
+* Unmerged path drivers/net/ethernet/ti/cpsw_switchdev.c
+* Unmerged path drivers/staging/fsl-dpaa2/ethsw/ethsw.c
+diff --git a/include/net/switchdev.h b/include/net/switchdev.h
+index 4c14c5b37237..e69f859199ba 100644
+--- a/include/net/switchdev.h
++++ b/include/net/switchdev.h
+@@ -183,7 +183,6 @@ struct switchdev_notifier_fdb_info {
+ struct switchdev_notifier_port_obj_info {
+ 	struct switchdev_notifier_info info; /* must be first */
+ 	const struct switchdev_obj *obj;
+-	struct switchdev_trans *trans;
+ 	bool handled;
+ };
+ 
+@@ -238,7 +237,6 @@ int switchdev_handle_port_obj_add(struct net_device *dev,
+ 			bool (*check_cb)(const struct net_device *dev),
+ 			int (*add_cb)(struct net_device *dev,
+ 				      const struct switchdev_obj *obj,
+-				      struct switchdev_trans *trans,
+ 				      struct netlink_ext_ack *extack));
+ int switchdev_handle_port_obj_del(struct net_device *dev,
+ 			struct switchdev_notifier_port_obj_info *port_obj_info,
+@@ -322,7 +320,6 @@ switchdev_handle_port_obj_add(struct net_device *dev,
+ 			bool (*check_cb)(const struct net_device *dev),
+ 			int (*add_cb)(struct net_device *dev,
+ 				      const struct switchdev_obj *obj,
+-				      struct switchdev_trans *trans,
+ 				      struct netlink_ext_ack *extack))
+ {
+ 	return 0;
+diff --git a/net/dsa/dsa_priv.h b/net/dsa/dsa_priv.h
+index 4aeecfbc0008..e0fb5eab8e8d 100644
+--- a/net/dsa/dsa_priv.h
++++ b/net/dsa/dsa_priv.h
+@@ -52,7 +52,6 @@ struct dsa_notifier_fdb_info {
+ /* DSA_NOTIFIER_MDB_* */
+ struct dsa_notifier_mdb_info {
+ 	const struct switchdev_obj_port_mdb *mdb;
+-	struct switchdev_trans *trans;
+ 	int sw_index;
+ 	int port;
+ };
+@@ -60,7 +59,6 @@ struct dsa_notifier_mdb_info {
+ /* DSA_NOTIFIER_VLAN_* */
+ struct dsa_notifier_vlan_info {
+ 	const struct switchdev_obj_port_vlan *vlan;
+-	struct switchdev_trans *trans;
+ 	int sw_index;
+ 	int port;
+ };
+@@ -155,13 +153,11 @@ int dsa_port_fdb_del(struct dsa_port *dp, const unsigned char *addr,
+ 		     u16 vid);
+ int dsa_port_fdb_dump(struct dsa_port *dp, dsa_fdb_dump_cb_t *cb, void *data);
+ int dsa_port_mdb_add(const struct dsa_port *dp,
+-		     const struct switchdev_obj_port_mdb *mdb,
+-		     struct switchdev_trans *trans);
++		     const struct switchdev_obj_port_mdb *mdb);
+ int dsa_port_mdb_del(const struct dsa_port *dp,
+ 		     const struct switchdev_obj_port_mdb *mdb);
+ int dsa_port_vlan_add(struct dsa_port *dp,
+-		      const struct switchdev_obj_port_vlan *vlan,
+-		      struct switchdev_trans *trans);
++		      const struct switchdev_obj_port_vlan *vlan);
+ int dsa_port_vlan_del(struct dsa_port *dp,
+ 		      const struct switchdev_obj_port_vlan *vlan);
+ int dsa_port_link_register_of(struct dsa_port *dp);
+diff --git a/net/dsa/port.c b/net/dsa/port.c
+index 2d7e01b23572..667d2749ff9e 100644
+--- a/net/dsa/port.c
++++ b/net/dsa/port.c
+@@ -216,13 +216,11 @@ int dsa_port_fdb_dump(struct dsa_port *dp, dsa_fdb_dump_cb_t *cb, void *data)
+ }
+ 
+ int dsa_port_mdb_add(const struct dsa_port *dp,
+-		     const struct switchdev_obj_port_mdb *mdb,
+-		     struct switchdev_trans *trans)
++		     const struct switchdev_obj_port_mdb *mdb)
+ {
+ 	struct dsa_notifier_mdb_info info = {
+ 		.sw_index = dp->ds->index,
+ 		.port = dp->index,
+-		.trans = trans,
+ 		.mdb = mdb,
+ 	};
+ 
+@@ -242,13 +240,11 @@ int dsa_port_mdb_del(const struct dsa_port *dp,
+ }
+ 
+ int dsa_port_vlan_add(struct dsa_port *dp,
+-		      const struct switchdev_obj_port_vlan *vlan,
+-		      struct switchdev_trans *trans)
++		      const struct switchdev_obj_port_vlan *vlan)
+ {
+ 	struct dsa_notifier_vlan_info info = {
+ 		.sw_index = dp->ds->index,
+ 		.port = dp->index,
+-		.trans = trans,
+ 		.vlan = vlan,
+ 	};
+ 
+* Unmerged path net/dsa/slave.c
+* Unmerged path net/dsa/switch.c
+diff --git a/net/switchdev/switchdev.c b/net/switchdev/switchdev.c
+index b8f2957d0fcb..e3933deb0fc7 100644
+--- a/net/switchdev/switchdev.c
++++ b/net/switchdev/switchdev.c
+@@ -225,7 +225,6 @@ static size_t switchdev_obj_size(const struct switchdev_obj *obj)
+ static int switchdev_port_obj_notify(enum switchdev_notifier_type nt,
+ 				     struct net_device *dev,
+ 				     const struct switchdev_obj *obj,
+-				     struct switchdev_trans *trans,
+ 				     struct netlink_ext_ack *extack)
+ {
+ 	int rc;
+@@ -233,7 +232,6 @@ static int switchdev_port_obj_notify(enum switchdev_notifier_type nt,
+ 
+ 	struct switchdev_notifier_port_obj_info obj_info = {
+ 		.obj = obj,
+-		.trans = trans,
+ 		.handled = false,
+ 	};
+ 
+@@ -252,35 +250,10 @@ static int switchdev_port_obj_add_now(struct net_device *dev,
+ 				      const struct switchdev_obj *obj,
+ 				      struct netlink_ext_ack *extack)
+ {
+-	struct switchdev_trans trans;
+-	int err;
+-
+ 	ASSERT_RTNL();
+ 
+-	/* Phase I: prepare for obj add. Driver/device should fail
+-	 * here if there are going to be issues in the commit phase,
+-	 * such as lack of resources or support.  The driver/device
+-	 * should reserve resources needed for the commit phase here,
+-	 * but should not commit the obj.
+-	 */
+-
+-	trans.ph_prepare = true;
+-	err = switchdev_port_obj_notify(SWITCHDEV_PORT_OBJ_ADD,
+-					dev, obj, &trans, extack);
+-	if (err)
+-		return err;
+-
+-	/* Phase II: commit obj add.  This cannot fail as a fault
+-	 * of driver/device.  If it does, it's a bug in the driver/device
+-	 * because the driver said everythings was OK in phase I.
+-	 */
+-
+-	trans.ph_prepare = false;
+-	err = switchdev_port_obj_notify(SWITCHDEV_PORT_OBJ_ADD,
+-					dev, obj, &trans, extack);
+-	WARN(err, "%s: Commit of object (id=%d) failed.\n", dev->name, obj->id);
+-
+-	return err;
++	return switchdev_port_obj_notify(SWITCHDEV_PORT_OBJ_ADD,
++					 dev, obj, extack);
+ }
+ 
+ static void switchdev_port_obj_add_deferred(struct net_device *dev,
+@@ -311,10 +284,6 @@ static int switchdev_port_obj_add_defer(struct net_device *dev,
+  *	@obj: object to add
+  *	@extack: netlink extended ack
+  *
+- *	Use a 2-phase prepare-commit transaction model to ensure
+- *	system is not left in a partially updated state due to
+- *	failure from driver/device.
+- *
+  *	rtnl_lock must be held and must not be in atomic section,
+  *	in case SWITCHDEV_F_DEFER flag is not set.
+  */
+@@ -333,7 +302,7 @@ static int switchdev_port_obj_del_now(struct net_device *dev,
+ 				      const struct switchdev_obj *obj)
+ {
+ 	return switchdev_port_obj_notify(SWITCHDEV_PORT_OBJ_DEL,
+-					 dev, obj, NULL, NULL);
++					 dev, obj, NULL);
+ }
+ 
+ static void switchdev_port_obj_del_deferred(struct net_device *dev,
+@@ -453,7 +422,6 @@ static int __switchdev_handle_port_obj_add(struct net_device *dev,
+ 			bool (*check_cb)(const struct net_device *dev),
+ 			int (*add_cb)(struct net_device *dev,
+ 				      const struct switchdev_obj *obj,
+-				      struct switchdev_trans *trans,
+ 				      struct netlink_ext_ack *extack))
+ {
+ 	struct netlink_ext_ack *extack;
+@@ -466,8 +434,7 @@ static int __switchdev_handle_port_obj_add(struct net_device *dev,
+ 	if (check_cb(dev)) {
+ 		/* This flag is only checked if the return value is success. */
+ 		port_obj_info->handled = true;
+-		return add_cb(dev, port_obj_info->obj, port_obj_info->trans,
+-			      extack);
++		return add_cb(dev, port_obj_info->obj, extack);
+ 	}
+ 
+ 	/* Switch ports might be stacked under e.g. a LAG. Ignore the
+@@ -495,7 +462,6 @@ int switchdev_handle_port_obj_add(struct net_device *dev,
+ 			bool (*check_cb)(const struct net_device *dev),
+ 			int (*add_cb)(struct net_device *dev,
+ 				      const struct switchdev_obj *obj,
+-				      struct switchdev_trans *trans,
+ 				      struct netlink_ext_ack *extack))
+ {
+ 	int err;
