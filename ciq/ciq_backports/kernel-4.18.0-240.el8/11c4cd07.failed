@@ -1,0 +1,172 @@
+vfio-pci: Fault mmaps to enable vma tracking
+
+jira LE-1907
+cve CVE-2020-12888
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Alex Williamson <alex.williamson@redhat.com>
+commit 11c4cd07ba111a09f49625f9e4c851d83daf0a22
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/11c4cd07.failed
+
+Rather than calling remap_pfn_range() when a region is mmap'd, setup
+a vm_ops handler to support dynamic faulting of the range on access.
+This allows us to manage a list of vmas actively mapping the area that
+we can later use to invalidate those mappings.  The open callback
+invalidates the vma range so that all tracking is inserted in the
+fault handler and removed in the close handler.
+
+	Reviewed-by: Peter Xu <peterx@redhat.com>
+	Signed-off-by: Alex Williamson <alex.williamson@redhat.com>
+(cherry picked from commit 11c4cd07ba111a09f49625f9e4c851d83daf0a22)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/vfio/pci/vfio_pci_private.h
+diff --cc drivers/vfio/pci/vfio_pci_private.h
+index 1812cf22fc4f,9b25f9f6ce1d..000000000000
+--- a/drivers/vfio/pci/vfio_pci_private.h
++++ b/drivers/vfio/pci/vfio_pci_private.h
+@@@ -87,10 -86,21 +87,24 @@@ struct vfio_pci_reflck 
+  	struct mutex		lock;
+  };
+  
+++<<<<<<< HEAD
+++=======
++ struct vfio_pci_vf_token {
++ 	struct mutex		lock;
++ 	uuid_t			uuid;
++ 	int			users;
++ };
++ 
++ struct vfio_pci_mmap_vma {
++ 	struct vm_area_struct	*vma;
++ 	struct list_head	vma_next;
++ };
++ 
+++>>>>>>> 11c4cd07ba11 (vfio-pci: Fault mmaps to enable vma tracking)
+  struct vfio_pci_device {
+  	struct pci_dev		*pdev;
+ -	void __iomem		*barmap[PCI_STD_NUM_BARS];
+ -	bool			bar_mmap_supported[PCI_STD_NUM_BARS];
+ +	void __iomem		*barmap[PCI_STD_RESOURCE_END + 1];
+ +	bool			bar_mmap_supported[PCI_STD_RESOURCE_END + 1];
+  	u8			*pci_config_map;
+  	u8			*vconfig;
+  	struct perm_bits	*msi_perm;
+@@@ -125,6 -135,10 +139,13 @@@
+  	struct list_head	dummy_resources_list;
+  	struct mutex		ioeventfds_lock;
+  	struct list_head	ioeventfds_list;
+++<<<<<<< HEAD
+++=======
++ 	struct vfio_pci_vf_token	*vf_token;
++ 	struct notifier_block	nb;
++ 	struct mutex		vma_lock;
++ 	struct list_head	vma_list;
+++>>>>>>> 11c4cd07ba11 (vfio-pci: Fault mmaps to enable vma tracking)
+  };
+  
+  #define is_intx(vdev) (vdev->irq_type == VFIO_PCI_INTX_IRQ_INDEX)
+diff --git a/drivers/vfio/pci/vfio_pci.c b/drivers/vfio/pci/vfio_pci.c
+index 67a9ee3b9cfc..de9c441cacbf 100644
+--- a/drivers/vfio/pci/vfio_pci.c
++++ b/drivers/vfio/pci/vfio_pci.c
+@@ -1207,6 +1207,70 @@ static ssize_t vfio_pci_write(void *device_data, const char __user *buf,
+ 	return vfio_pci_rw(device_data, (char __user *)buf, count, ppos, true);
+ }
+ 
++static int vfio_pci_add_vma(struct vfio_pci_device *vdev,
++			    struct vm_area_struct *vma)
++{
++	struct vfio_pci_mmap_vma *mmap_vma;
++
++	mmap_vma = kmalloc(sizeof(*mmap_vma), GFP_KERNEL);
++	if (!mmap_vma)
++		return -ENOMEM;
++
++	mmap_vma->vma = vma;
++
++	mutex_lock(&vdev->vma_lock);
++	list_add(&mmap_vma->vma_next, &vdev->vma_list);
++	mutex_unlock(&vdev->vma_lock);
++
++	return 0;
++}
++
++/*
++ * Zap mmaps on open so that we can fault them in on access and therefore
++ * our vma_list only tracks mappings accessed since last zap.
++ */
++static void vfio_pci_mmap_open(struct vm_area_struct *vma)
++{
++	zap_vma_ptes(vma, vma->vm_start, vma->vm_end - vma->vm_start);
++}
++
++static void vfio_pci_mmap_close(struct vm_area_struct *vma)
++{
++	struct vfio_pci_device *vdev = vma->vm_private_data;
++	struct vfio_pci_mmap_vma *mmap_vma;
++
++	mutex_lock(&vdev->vma_lock);
++	list_for_each_entry(mmap_vma, &vdev->vma_list, vma_next) {
++		if (mmap_vma->vma == vma) {
++			list_del(&mmap_vma->vma_next);
++			kfree(mmap_vma);
++			break;
++		}
++	}
++	mutex_unlock(&vdev->vma_lock);
++}
++
++static vm_fault_t vfio_pci_mmap_fault(struct vm_fault *vmf)
++{
++	struct vm_area_struct *vma = vmf->vma;
++	struct vfio_pci_device *vdev = vma->vm_private_data;
++
++	if (vfio_pci_add_vma(vdev, vma))
++		return VM_FAULT_OOM;
++
++	if (remap_pfn_range(vma, vma->vm_start, vma->vm_pgoff,
++			    vma->vm_end - vma->vm_start, vma->vm_page_prot))
++		return VM_FAULT_SIGBUS;
++
++	return VM_FAULT_NOPAGE;
++}
++
++static const struct vm_operations_struct vfio_pci_mmap_ops = {
++	.open = vfio_pci_mmap_open,
++	.close = vfio_pci_mmap_close,
++	.fault = vfio_pci_mmap_fault,
++};
++
+ static int vfio_pci_mmap(void *device_data, struct vm_area_struct *vma)
+ {
+ 	struct vfio_pci_device *vdev = device_data;
+@@ -1265,8 +1329,14 @@ static int vfio_pci_mmap(void *device_data, struct vm_area_struct *vma)
+ 	vma->vm_page_prot = pgprot_noncached(vma->vm_page_prot);
+ 	vma->vm_pgoff = (pci_resource_start(pdev, index) >> PAGE_SHIFT) + pgoff;
+ 
+-	return remap_pfn_range(vma, vma->vm_start, vma->vm_pgoff,
+-			       req_len, vma->vm_page_prot);
++	/*
++	 * See remap_pfn_range(), called from vfio_pci_fault() but we can't
++	 * change vm_flags within the fault handler.  Set them now.
++	 */
++	vma->vm_flags |= VM_IO | VM_PFNMAP | VM_DONTEXPAND | VM_DONTDUMP;
++	vma->vm_ops = &vfio_pci_mmap_ops;
++
++	return 0;
+ }
+ 
+ static void vfio_pci_request(void *device_data, unsigned int count)
+@@ -1341,6 +1411,8 @@ static int vfio_pci_probe(struct pci_dev *pdev, const struct pci_device_id *id)
+ 	spin_lock_init(&vdev->irqlock);
+ 	mutex_init(&vdev->ioeventfds_lock);
+ 	INIT_LIST_HEAD(&vdev->ioeventfds_list);
++	mutex_init(&vdev->vma_lock);
++	INIT_LIST_HEAD(&vdev->vma_list);
+ 
+ 	ret = vfio_add_group_dev(&pdev->dev, &vfio_pci_ops, vdev);
+ 	if (ret) {
+* Unmerged path drivers/vfio/pci/vfio_pci_private.h
