@@ -1,0 +1,427 @@
+net/mlx5e: Add TX port timestamp support
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-326.el8
+commit-author Eran Ben Elisha <eranbe@nvidia.com>
+commit 1880bc4e4a96691bfccd1882115af4e5431b4c7a
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-326.el8/1880bc4e.failed
+
+Transmitted packet timestamping accuracy can be improved when using
+timestamp from the port, instead of packet CQE creation timestamp, as
+it better reflects the actual time of a packet's transmit.
+
+TX port timestamping is supported starting from ConnectX6-DX hardware.
+Although at the original completion, only CQE timestamp can be attached,
+we are able to get TX port timestamping via an additional completion over
+a special CQ associated with the SQ (in addition to the regular CQ).
+
+Driver to ignore the original packet completion timestamp, and report
+back the timestamp of the special CQ completion. If the absolute timestamp
+
+diff between the two completions is greater than 1 / 128 second, ignore
+the TX port timestamp as it has a jitter which is too big.
+No skb will be generate out of the extra completion.
+
+Allocate additional CQ per ptpsq, to receive the TX port timestamp.
+
+Driver to hold an skb FIFO in order to map between transmitted skb to
+the two expected completions. When using ptpsq, hold double refcount on
+the skb, to gaurantee it will not get released before both completions
+arrive.
+
+Expose dedicated counters of the ptp additional CQ and connect it to the
+TX health reporter.
+
+This patch improves TX Hardware timestamping offset to be less than 40ns
+at a 100Gbps line rate, compared to 600ns before.
+
+With that, making our HW compliant with G.8273.2 class C, and allow Linux
+systems to be deployed in the 5G telco edge, where this standard is a
+must.
+
+	Signed-off-by: Eran Ben Elisha <eranbe@nvidia.com>
+	Reviewed-by: Tariq Toukan <tariqt@nvidia.com>
+	Signed-off-by: Saeed Mahameed <saeedm@nvidia.com>
+(cherry picked from commit 1880bc4e4a96691bfccd1882115af4e5431b4c7a)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/mellanox/mlx5/core/en.h
+#	drivers/net/ethernet/mellanox/mlx5/core/en/params.h
+#	drivers/net/ethernet/mellanox/mlx5/core/en/ptp.c
+#	drivers/net/ethernet/mellanox/mlx5/core/en/ptp.h
+#	drivers/net/ethernet/mellanox/mlx5/core/en/reporter_tx.c
+#	drivers/net/ethernet/mellanox/mlx5/core/en_stats.c
+#	drivers/net/ethernet/mellanox/mlx5/core/en_stats.h
+diff --cc drivers/net/ethernet/mellanox/mlx5/core/en.h
+index 7b8794f5edfa,a1a81cfeb607..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en.h
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en.h
+@@@ -703,6 -715,12 +703,15 @@@ struct mlx5e_channel_stats 
+  	struct mlx5e_xdpsq_stats xsksq;
+  } ____cacheline_aligned_in_smp;
+  
+++<<<<<<< HEAD
+++=======
++ struct mlx5e_port_ptp_stats {
++ 	struct mlx5e_ch_stats ch;
++ 	struct mlx5e_sq_stats sq[MLX5E_MAX_NUM_TC];
++ 	struct mlx5e_ptp_cq_stats cq[MLX5E_MAX_NUM_TC];
++ } ____cacheline_aligned_in_smp;
++ 
+++>>>>>>> 1880bc4e4a96 (net/mlx5e: Add TX port timestamp support)
+  enum {
+  	MLX5E_STATE_OPENED,
+  	MLX5E_STATE_DESTROYING,
+diff --cc drivers/net/ethernet/mellanox/mlx5/core/en/params.h
+index 187007ad3349,3959254d4181..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en/params.h
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en/params.h
+@@@ -41,6 -41,15 +41,18 @@@ struct mlx5e_channel_param 
+  	struct mlx5e_sq_param      async_icosq;
+  };
+  
+++<<<<<<< HEAD
+++=======
++ struct mlx5e_create_sq_param {
++ 	struct mlx5_wq_ctrl        *wq_ctrl;
++ 	u32                         cqn;
++ 	u32                         ts_cqe_to_dest_cqn;
++ 	u32                         tisn;
++ 	u8                          tis_lst_sz;
++ 	u8                          min_inline_mode;
++ };
++ 
+++>>>>>>> 1880bc4e4a96 (net/mlx5e: Add TX port timestamp support)
+  static inline bool mlx5e_qid_get_ch_if_in_group(struct mlx5e_params *params,
+  						u16 qid,
+  						enum mlx5e_rq_group group,
+diff --cc drivers/net/ethernet/mellanox/mlx5/core/en/reporter_tx.c
+index 826584380216,d7275c84313e..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en/reporter_tx.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en/reporter_tx.c
+@@@ -204,6 -214,132 +204,135 @@@ mlx5e_tx_reporter_build_diagnose_output
+  	return 0;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static int
++ mlx5e_tx_reporter_build_diagnose_output_ptpsq(struct devlink_fmsg *fmsg,
++ 					      struct mlx5e_ptpsq *ptpsq, int tc)
++ {
++ 	int err;
++ 
++ 	err = devlink_fmsg_obj_nest_start(fmsg);
++ 	if (err)
++ 		return err;
++ 
++ 	err = devlink_fmsg_string_pair_put(fmsg, "channel", "ptp");
++ 	if (err)
++ 		return err;
++ 
++ 	err = mlx5e_tx_reporter_build_diagnose_output_sq_common(fmsg, &ptpsq->txqsq, tc);
++ 	if (err)
++ 		return err;
++ 
++ 	err = mlx5e_health_fmsg_named_obj_nest_start(fmsg, "Port TS");
++ 	if (err)
++ 		return err;
++ 
++ 	err = mlx5e_health_cq_diag_fmsg(&ptpsq->ts_cq, fmsg);
++ 	if (err)
++ 		return err;
++ 
++ 	err = mlx5e_health_fmsg_named_obj_nest_end(fmsg);
++ 	if (err)
++ 		return err;
++ 
++ 	err = devlink_fmsg_obj_nest_end(fmsg);
++ 	if (err)
++ 		return err;
++ 
++ 	return 0;
++ }
++ 
++ static int
++ mlx5e_tx_reporter_diagnose_generic_txqsq(struct devlink_fmsg *fmsg,
++ 					 struct mlx5e_txqsq *txqsq)
++ {
++ 	u32 sq_stride, sq_sz;
++ 	int err;
++ 
++ 	err = mlx5e_health_fmsg_named_obj_nest_start(fmsg, "SQ");
++ 	if (err)
++ 		return err;
++ 
++ 	sq_sz = mlx5_wq_cyc_get_size(&txqsq->wq);
++ 	sq_stride = MLX5_SEND_WQE_BB;
++ 
++ 	err = devlink_fmsg_u64_pair_put(fmsg, "stride size", sq_stride);
++ 	if (err)
++ 		return err;
++ 
++ 	err = devlink_fmsg_u32_pair_put(fmsg, "size", sq_sz);
++ 	if (err)
++ 		return err;
++ 
++ 	err = mlx5e_health_cq_common_diag_fmsg(&txqsq->cq, fmsg);
++ 	if (err)
++ 		return err;
++ 
++ 	return mlx5e_health_fmsg_named_obj_nest_end(fmsg);
++ }
++ 
++ static int
++ mlx5e_tx_reporter_diagnose_generic_tx_port_ts(struct devlink_fmsg *fmsg,
++ 					      struct mlx5e_ptpsq *ptpsq)
++ {
++ 	int err;
++ 
++ 	err = mlx5e_health_fmsg_named_obj_nest_start(fmsg, "Port TS");
++ 	if (err)
++ 		return err;
++ 
++ 	err = mlx5e_health_cq_common_diag_fmsg(&ptpsq->ts_cq, fmsg);
++ 	if (err)
++ 		return err;
++ 
++ 	return mlx5e_health_fmsg_named_obj_nest_end(fmsg);
++ }
++ 
++ static int
++ mlx5e_tx_reporter_diagnose_common_config(struct devlink_health_reporter *reporter,
++ 					 struct devlink_fmsg *fmsg)
++ {
++ 	struct mlx5e_priv *priv = devlink_health_reporter_priv(reporter);
++ 	struct mlx5e_txqsq *generic_sq = priv->txq2sq[0];
++ 	struct mlx5e_ptpsq *generic_ptpsq;
++ 	int err;
++ 
++ 	err = mlx5e_health_fmsg_named_obj_nest_start(fmsg, "Common Config");
++ 	if (err)
++ 		return err;
++ 
++ 	err = mlx5e_tx_reporter_diagnose_generic_txqsq(fmsg, generic_sq);
++ 	if (err)
++ 		return err;
++ 
++ 	generic_ptpsq = priv->channels.port_ptp ?
++ 			&priv->channels.port_ptp->ptpsq[0] :
++ 			NULL;
++ 	if (!generic_ptpsq)
++ 		goto out;
++ 
++ 	err = mlx5e_health_fmsg_named_obj_nest_start(fmsg, "PTP");
++ 	if (err)
++ 		return err;
++ 
++ 	err = mlx5e_tx_reporter_diagnose_generic_txqsq(fmsg, &generic_ptpsq->txqsq);
++ 	if (err)
++ 		return err;
++ 
++ 	err = mlx5e_tx_reporter_diagnose_generic_tx_port_ts(fmsg, generic_ptpsq);
++ 	if (err)
++ 		return err;
++ 
++ 	err = mlx5e_health_fmsg_named_obj_nest_end(fmsg);
++ 	if (err)
++ 		return err;
++ 
++ out:
++ 	return mlx5e_health_fmsg_named_obj_nest_end(fmsg);
++ }
++ 
+++>>>>>>> 1880bc4e4a96 (net/mlx5e: Add TX port timestamp support)
+  static int mlx5e_tx_reporter_diagnose(struct devlink_health_reporter *reporter,
+  				      struct devlink_fmsg *fmsg,
+  				      struct netlink_ext_ack *extack)
+diff --cc drivers/net/ethernet/mellanox/mlx5/core/en_stats.c
+index ebfb47a09128,2cf2042b37c7..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_stats.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_stats.c
+@@@ -1690,6 -1709,37 +1690,40 @@@ static const struct counter_desc ch_sta
+  	{ MLX5E_DECLARE_CH_STAT(struct mlx5e_ch_stats, eq_rearm) },
+  };
+  
+++<<<<<<< HEAD
+++=======
++ static const struct counter_desc ptp_sq_stats_desc[] = {
++ 	{ MLX5E_DECLARE_PTP_TX_STAT(struct mlx5e_sq_stats, packets) },
++ 	{ MLX5E_DECLARE_PTP_TX_STAT(struct mlx5e_sq_stats, bytes) },
++ 	{ MLX5E_DECLARE_PTP_TX_STAT(struct mlx5e_sq_stats, csum_partial) },
++ 	{ MLX5E_DECLARE_PTP_TX_STAT(struct mlx5e_sq_stats, csum_partial_inner) },
++ 	{ MLX5E_DECLARE_PTP_TX_STAT(struct mlx5e_sq_stats, added_vlan_packets) },
++ 	{ MLX5E_DECLARE_PTP_TX_STAT(struct mlx5e_sq_stats, nop) },
++ 	{ MLX5E_DECLARE_PTP_TX_STAT(struct mlx5e_sq_stats, csum_none) },
++ 	{ MLX5E_DECLARE_PTP_TX_STAT(struct mlx5e_sq_stats, stopped) },
++ 	{ MLX5E_DECLARE_PTP_TX_STAT(struct mlx5e_sq_stats, dropped) },
++ 	{ MLX5E_DECLARE_PTP_TX_STAT(struct mlx5e_sq_stats, xmit_more) },
++ 	{ MLX5E_DECLARE_PTP_TX_STAT(struct mlx5e_sq_stats, recover) },
++ 	{ MLX5E_DECLARE_PTP_TX_STAT(struct mlx5e_sq_stats, cqes) },
++ 	{ MLX5E_DECLARE_PTP_TX_STAT(struct mlx5e_sq_stats, wake) },
++ 	{ MLX5E_DECLARE_PTP_TX_STAT(struct mlx5e_sq_stats, cqe_err) },
++ };
++ 
++ static const struct counter_desc ptp_ch_stats_desc[] = {
++ 	{ MLX5E_DECLARE_PTP_CH_STAT(struct mlx5e_ch_stats, events) },
++ 	{ MLX5E_DECLARE_PTP_CH_STAT(struct mlx5e_ch_stats, poll) },
++ 	{ MLX5E_DECLARE_PTP_CH_STAT(struct mlx5e_ch_stats, arm) },
++ 	{ MLX5E_DECLARE_PTP_CH_STAT(struct mlx5e_ch_stats, eq_rearm) },
++ };
++ 
++ static const struct counter_desc ptp_cq_stats_desc[] = {
++ 	{ MLX5E_DECLARE_PTP_CQ_STAT(struct mlx5e_ptp_cq_stats, cqe) },
++ 	{ MLX5E_DECLARE_PTP_CQ_STAT(struct mlx5e_ptp_cq_stats, err_cqe) },
++ 	{ MLX5E_DECLARE_PTP_CQ_STAT(struct mlx5e_ptp_cq_stats, abort) },
++ 	{ MLX5E_DECLARE_PTP_CQ_STAT(struct mlx5e_ptp_cq_stats, abort_abs_diff_ns) },
++ };
++ 
+++>>>>>>> 1880bc4e4a96 (net/mlx5e: Add TX port timestamp support)
+  #define NUM_RQ_STATS			ARRAY_SIZE(rq_stats_desc)
+  #define NUM_SQ_STATS			ARRAY_SIZE(sq_stats_desc)
+  #define NUM_XDPSQ_STATS			ARRAY_SIZE(xdpsq_stats_desc)
+@@@ -1697,6 -1747,69 +1731,72 @@@
+  #define NUM_XSKRQ_STATS			ARRAY_SIZE(xskrq_stats_desc)
+  #define NUM_XSKSQ_STATS			ARRAY_SIZE(xsksq_stats_desc)
+  #define NUM_CH_STATS			ARRAY_SIZE(ch_stats_desc)
+++<<<<<<< HEAD
+++=======
++ #define NUM_PTP_SQ_STATS		ARRAY_SIZE(ptp_sq_stats_desc)
++ #define NUM_PTP_CH_STATS		ARRAY_SIZE(ptp_ch_stats_desc)
++ #define NUM_PTP_CQ_STATS		ARRAY_SIZE(ptp_cq_stats_desc)
++ 
++ static MLX5E_DECLARE_STATS_GRP_OP_NUM_STATS(ptp)
++ {
++ 	return priv->port_ptp_opened ?
++ 	       NUM_PTP_CH_STATS +
++ 	       ((NUM_PTP_SQ_STATS + NUM_PTP_CQ_STATS) * priv->max_opened_tc) :
++ 	       0;
++ }
++ 
++ static MLX5E_DECLARE_STATS_GRP_OP_FILL_STRS(ptp)
++ {
++ 	int i, tc;
++ 
++ 	if (!priv->port_ptp_opened)
++ 		return idx;
++ 
++ 	for (i = 0; i < NUM_PTP_CH_STATS; i++)
++ 		sprintf(data + (idx++) * ETH_GSTRING_LEN,
++ 			ptp_ch_stats_desc[i].format);
++ 
++ 	for (tc = 0; tc < priv->max_opened_tc; tc++)
++ 		for (i = 0; i < NUM_PTP_SQ_STATS; i++)
++ 			sprintf(data + (idx++) * ETH_GSTRING_LEN,
++ 				ptp_sq_stats_desc[i].format, tc);
++ 
++ 	for (tc = 0; tc < priv->max_opened_tc; tc++)
++ 		for (i = 0; i < NUM_PTP_CQ_STATS; i++)
++ 			sprintf(data + (idx++) * ETH_GSTRING_LEN,
++ 				ptp_cq_stats_desc[i].format, tc);
++ 	return idx;
++ }
++ 
++ static MLX5E_DECLARE_STATS_GRP_OP_FILL_STATS(ptp)
++ {
++ 	int i, tc;
++ 
++ 	if (!priv->port_ptp_opened)
++ 		return idx;
++ 
++ 	for (i = 0; i < NUM_PTP_CH_STATS; i++)
++ 		data[idx++] =
++ 			MLX5E_READ_CTR64_CPU(&priv->port_ptp_stats.ch,
++ 					     ptp_ch_stats_desc, i);
++ 
++ 	for (tc = 0; tc < priv->max_opened_tc; tc++)
++ 		for (i = 0; i < NUM_PTP_SQ_STATS; i++)
++ 			data[idx++] =
++ 				MLX5E_READ_CTR64_CPU(&priv->port_ptp_stats.sq[tc],
++ 						     ptp_sq_stats_desc, i);
++ 
++ 	for (tc = 0; tc < priv->max_opened_tc; tc++)
++ 		for (i = 0; i < NUM_PTP_CQ_STATS; i++)
++ 			data[idx++] =
++ 				MLX5E_READ_CTR64_CPU(&priv->port_ptp_stats.cq[tc],
++ 						     ptp_cq_stats_desc, i);
++ 
++ 	return idx;
++ }
++ 
++ static MLX5E_DECLARE_STATS_GRP_OP_UPDATE_STATS(ptp) { return; }
+++>>>>>>> 1880bc4e4a96 (net/mlx5e: Add TX port timestamp support)
+  
+  static MLX5E_DECLARE_STATS_GRP_OP_NUM_STATS(channels)
+  {
+diff --cc drivers/net/ethernet/mellanox/mlx5/core/en_stats.h
+index 162daaadb0d8,e41fc11f2ce7..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_stats.h
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_stats.h
+@@@ -51,6 -51,10 +51,13 @@@
+  #define MLX5E_DECLARE_XSKSQ_STAT(type, fld) "tx%d_xsk_"#fld, offsetof(type, fld)
+  #define MLX5E_DECLARE_CH_STAT(type, fld) "ch%d_"#fld, offsetof(type, fld)
+  
+++<<<<<<< HEAD
+++=======
++ #define MLX5E_DECLARE_PTP_TX_STAT(type, fld) "ptp_tx%d_"#fld, offsetof(type, fld)
++ #define MLX5E_DECLARE_PTP_CH_STAT(type, fld) "ptp_ch_"#fld, offsetof(type, fld)
++ #define MLX5E_DECLARE_PTP_CQ_STAT(type, fld) "ptp_cq%d_"#fld, offsetof(type, fld)
++ 
+++>>>>>>> 1880bc4e4a96 (net/mlx5e: Add TX port timestamp support)
+  struct counter_desc {
+  	char		format[ETH_GSTRING_LEN];
+  	size_t		offset; /* Byte offset */
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/en/ptp.c
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/en/ptp.h
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/en.h
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/en/params.h
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/en/ptp.c
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/en/ptp.h
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/en/reporter_tx.c
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/en_main.c b/drivers/net/ethernet/mellanox/mlx5/core/en_main.c
+index 7a96c281f40e..0da193cb82d9 100644
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_main.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_main.c
+@@ -1216,6 +1216,7 @@ static int mlx5e_create_sq(struct mlx5_core_dev *mdev,
+ 	MLX5_SET(sqc,  sqc, tis_lst_sz, csp->tis_lst_sz);
+ 	MLX5_SET(sqc,  sqc, tis_num_0, csp->tisn);
+ 	MLX5_SET(sqc,  sqc, cqn, csp->cqn);
++	MLX5_SET(sqc,  sqc, ts_cqe_to_dest_cqn, csp->ts_cqe_to_dest_cqn);
+ 
+ 	if (MLX5_CAP_ETH(mdev, wqe_inline_mode) == MLX5_CAP_INLINE_MODE_VPORT_CONTEXT)
+ 		MLX5_SET(sqc,  sqc, min_wqe_inline_mode, csp->min_inline_mode);
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/en_stats.c
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/en_stats.h
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/en_tx.c b/drivers/net/ethernet/mellanox/mlx5/core/en_tx.c
+index 1a9150d6c228..005d8e5e6d5b 100644
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_tx.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_tx.c
+@@ -403,6 +403,12 @@ mlx5e_txwqe_complete(struct mlx5e_txqsq *sq, struct sk_buff *skb,
+ 
+ 	mlx5e_tx_check_stop(sq);
+ 
++	if (unlikely(sq->ptpsq)) {
++		mlx5e_skb_cb_hwtstamp_init(skb);
++		mlx5e_skb_fifo_push(&sq->ptpsq->skb_fifo, skb);
++		skb_get(skb);
++	}
++
+ 	send_doorbell = __netdev_tx_sent_queue(sq->txq, attr->num_bytes, xmit_more);
+ 	if (send_doorbell)
+ 		mlx5e_notify_hw(wq, sq->pc, sq->uar_map, cseg);
+@@ -709,7 +715,11 @@ static void mlx5e_consume_skb(struct mlx5e_txqsq *sq, struct sk_buff *skb,
+ 		u64 ts = get_cqe_ts(cqe);
+ 
+ 		hwts.hwtstamp = mlx5_timecounter_cyc2time(sq->clock, ts);
+-		skb_tstamp_tx(skb, &hwts);
++		if (sq->ptpsq)
++			mlx5e_skb_cb_hwtstamp_handler(skb, MLX5E_SKB_CB_CQE_HWTSTAMP,
++						      hwts.hwtstamp, sq->ptpsq->cq_stats);
++		else
++			skb_tstamp_tx(skb, &hwts);
+ 	}
+ 
+ 	napi_consume_skb(skb, napi_budget);
