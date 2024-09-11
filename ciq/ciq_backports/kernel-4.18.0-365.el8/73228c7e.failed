@@ -1,0 +1,337 @@
+KASAN: port KASAN Tests to KUnit
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-365.el8
+commit-author Patricia Alfonso <trishalfonso@google.com>
+commit 73228c7ecc5e40c0851c4703c5ec6ed38123e989
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-365.el8/73228c7e.failed
+
+Transfer all previous tests for KASAN to KUnit so they can be run more
+easily.  Using kunit_tool, developers can run these tests with their other
+KUnit tests and see "pass" or "fail" with the appropriate KASAN report
+instead of needing to parse each KASAN report to test KASAN
+functionalities.  All KASAN reports are still printed to dmesg.
+
+Stack tests do not work properly when KASAN_STACK is enabled so those
+tests use a check for "if IS_ENABLED(CONFIG_KASAN_STACK)" so they only run
+if stack instrumentation is enabled.  If KASAN_STACK is not enabled, KUnit
+will print a statement to let the user know this test was not run with
+KASAN_STACK enabled.
+
+copy_user_test and kasan_rcu_uaf cannot be run in KUnit so there is a
+separate test file for those tests, which can be run as before as a
+module.
+
+[trishalfonso@google.com: v14]
+  Link: https://lkml.kernel.org/r/20200915035828.570483-4-davidgow@google.com
+
+	Signed-off-by: Patricia Alfonso <trishalfonso@google.com>
+	Signed-off-by: David Gow <davidgow@google.com>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Tested-by: Andrey Konovalov <andreyknvl@google.com>
+	Reviewed-by: Brendan Higgins <brendanhiggins@google.com>
+	Reviewed-by: Andrey Konovalov <andreyknvl@google.com>
+	Reviewed-by: Dmitry Vyukov <dvyukov@google.com>
+	Cc: Andrey Ryabinin <aryabinin@virtuozzo.com>
+	Cc: Ingo Molnar <mingo@redhat.com>
+	Cc: Juri Lelli <juri.lelli@redhat.com>
+	Cc: Peter Zijlstra <a.p.zijlstra@chello.nl>
+	Cc: Shuah Khan <shuah@kernel.org>
+	Cc: Vincent Guittot <vincent.guittot@linaro.org>
+Link: https://lkml.kernel.org/r/20200910070331.3358048-4-davidgow@google.com
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit 73228c7ecc5e40c0851c4703c5ec6ed38123e989)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	lib/Makefile
+#	lib/test_kasan.c
+diff --cc lib/Makefile
+index bb1847ed69d0,d4af75136c54..000000000000
+--- a/lib/Makefile
++++ b/lib/Makefile
+@@@ -64,9 -63,15 +64,15 @@@ obj-$(CONFIG_TEST_FIRMWARE) += test_fir
+  obj-$(CONFIG_TEST_SYSCTL) += test_sysctl.o
+  obj-$(CONFIG_TEST_HASH) += test_hash.o test_siphash.o
+  obj-$(CONFIG_TEST_IDA) += test_ida.o
+- obj-$(CONFIG_TEST_KASAN) += test_kasan.o
++ obj-$(CONFIG_KASAN_KUNIT_TEST) += test_kasan.o
+  CFLAGS_test_kasan.o += -fno-builtin
+++<<<<<<< HEAD
+++=======
++ CFLAGS_test_kasan.o += $(call cc-disable-warning, vla)
++ obj-$(CONFIG_TEST_KASAN_MODULE) += test_kasan_module.o
++ CFLAGS_test_kasan_module.o += -fno-builtin
+++>>>>>>> 73228c7ecc5e (KASAN: port KASAN Tests to KUnit)
+  obj-$(CONFIG_TEST_UBSAN) += test_ubsan.o
+ -CFLAGS_test_ubsan.o += $(call cc-disable-warning, vla)
+  UBSAN_SANITIZE_test_ubsan.o := y
+  obj-$(CONFIG_TEST_KSTRTOX) += test-kstrtox.o
+  obj-$(CONFIG_TEST_LIST_SORT) += test_list_sort.o
+diff --cc lib/test_kasan.c
+index 5679dda37d78,63c26171a791..000000000000
+--- a/lib/test_kasan.c
++++ b/lib/test_kasan.c
+@@@ -2,15 -3,8 +2,13 @@@
+   *
+   * Copyright (c) 2014 Samsung Electronics Co., Ltd.
+   * Author: Andrey Ryabinin <a.ryabinin@samsung.com>
+ + *
+ + * This program is free software; you can redistribute it and/or modify
+ + * it under the terms of the GNU General Public License version 2 as
+ + * published by the Free Software Foundation.
+ + *
+   */
+  
+- #define pr_fmt(fmt) "kasan test: %s " fmt, __func__
+- 
+  #include <linux/bitops.h>
+  #include <linux/delay.h>
+  #include <linux/kasan.h>
+@@@ -36,15 -32,50 +34,60 @@@
+   * are not eliminated as dead code.
+   */
+  
+ -void *kasan_ptr_result;
+  int kasan_int_result;
+++<<<<<<< HEAD
+ +void *kasan_ptr_result;
+ +
+ +/*
+ + * Note: test functions are marked noinline so that their names appear in
+ + * reports.
+ + */
+ +
+ +static noinline void __init kmalloc_oob_right(void)
+++=======
++ 
++ static struct kunit_resource resource;
++ static struct kunit_kasan_expectation fail_data;
++ static bool multishot;
++ 
++ static int kasan_test_init(struct kunit *test)
++ {
++ 	/*
++ 	 * Temporarily enable multi-shot mode and set panic_on_warn=0.
++ 	 * Otherwise, we'd only get a report for the first case.
++ 	 */
++ 	multishot = kasan_save_enable_multi_shot();
++ 
++ 	return 0;
++ }
++ 
++ static void kasan_test_exit(struct kunit *test)
++ {
++ 	kasan_restore_multi_shot(multishot);
++ }
++ 
++ /**
++  * KUNIT_EXPECT_KASAN_FAIL() - Causes a test failure when the expression does
++  * not cause a KASAN error. This uses a KUnit resource named "kasan_data." Do
++  * Do not use this name for a KUnit resource outside here.
++  *
++  */
++ #define KUNIT_EXPECT_KASAN_FAIL(test, condition) do { \
++ 	fail_data.report_expected = true; \
++ 	fail_data.report_found = false; \
++ 	kunit_add_named_resource(test, \
++ 				NULL, \
++ 				NULL, \
++ 				&resource, \
++ 				"kasan_data", &fail_data); \
++ 	condition; \
++ 	KUNIT_EXPECT_EQ(test, \
++ 			fail_data.report_expected, \
++ 			fail_data.report_found); \
++ } while (0)
++ 
++ static void kmalloc_oob_right(struct kunit *test)
+++>>>>>>> 73228c7ecc5e (KASAN: port KASAN Tests to KUnit)
+  {
+  	char *ptr;
+  	size_t size = 123;
+@@@ -785,19 -690,14 +702,23 @@@ static void kmalloc_double_kzfree(struc
+  	char *ptr;
+  	size_t size = 16;
+  
+++<<<<<<< HEAD
+ +	pr_info("double-free (kzfree)\n");
+++=======
+++>>>>>>> 73228c7ecc5e (KASAN: port KASAN Tests to KUnit)
+  	ptr = kmalloc(size, GFP_KERNEL);
+- 	if (!ptr) {
+- 		pr_err("Allocation failed\n");
+- 		return;
+- 	}
++ 	KUNIT_ASSERT_NOT_ERR_OR_NULL(test, ptr);
+  
+++<<<<<<< HEAD
+ +	kzfree(ptr);
+ +	kzfree(ptr);
+++=======
++ 	kfree_sensitive(ptr);
++ 	KUNIT_EXPECT_KASAN_FAIL(test, kfree_sensitive(ptr));
+++>>>>>>> 73228c7ecc5e (KASAN: port KASAN Tests to KUnit)
+  }
+  
+- #ifdef CONFIG_KASAN_VMALLOC
+- static noinline void __init vmalloc_oob(void)
++ static void vmalloc_oob(struct kunit *test)
+  {
+  	void *area;
+  
+diff --git a/lib/Kconfig.kasan b/lib/Kconfig.kasan
+index ca648a80b940..e026d19ec154 100644
+--- a/lib/Kconfig.kasan
++++ b/lib/Kconfig.kasan
+@@ -165,12 +165,24 @@ config KASAN_VMALLOC
+ 	  for KASAN to detect more sorts of errors (and to support vmapped
+ 	  stacks), but at the cost of higher memory usage.
+ 
+-config TEST_KASAN
+-	tristate "Module for testing KASAN for bug detection"
+-	depends on m
++config KASAN_KUNIT_TEST
++	tristate "KUnit-compatible tests of KASAN bug detection capabilities" if !KUNIT_ALL_TESTS
++	depends on KASAN && KUNIT
++	default KUNIT_ALL_TESTS
+ 	help
+-	  This is a test module doing various nasty things like
+-	  out of bounds accesses, use after free. It is useful for testing
++	  This is a KUnit test suite doing various nasty things like
++	  out of bounds and use after free accesses. It is useful for testing
+ 	  kernel debugging features like KASAN.
+ 
++	  For more information on KUnit and unit tests in general, please refer
++	  to the KUnit documentation in Documentation/dev-tools/kunit
++
++config TEST_KASAN_MODULE
++	tristate "KUnit-incompatible tests of KASAN bug detection capabilities"
++	depends on m && KASAN
++	help
++	  This is a part of the KASAN test suite that is incompatible with
++	  KUnit. Currently includes tests that do bad copy_from/to_user
++	  accesses.
++
+ endif # KASAN
+* Unmerged path lib/Makefile
+* Unmerged path lib/test_kasan.c
+diff --git a/lib/test_kasan_module.c b/lib/test_kasan_module.c
+new file mode 100644
+index 000000000000..2d68db6ae67b
+--- /dev/null
++++ b/lib/test_kasan_module.c
+@@ -0,0 +1,111 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ *
++ * Copyright (c) 2014 Samsung Electronics Co., Ltd.
++ * Author: Andrey Ryabinin <a.ryabinin@samsung.com>
++ */
++
++#define pr_fmt(fmt) "kasan test: %s " fmt, __func__
++
++#include <linux/mman.h>
++#include <linux/module.h>
++#include <linux/printk.h>
++#include <linux/slab.h>
++#include <linux/uaccess.h>
++
++#include "../mm/kasan/kasan.h"
++
++#define OOB_TAG_OFF (IS_ENABLED(CONFIG_KASAN_GENERIC) ? 0 : KASAN_SHADOW_SCALE_SIZE)
++
++static noinline void __init copy_user_test(void)
++{
++	char *kmem;
++	char __user *usermem;
++	size_t size = 10;
++	int unused;
++
++	kmem = kmalloc(size, GFP_KERNEL);
++	if (!kmem)
++		return;
++
++	usermem = (char __user *)vm_mmap(NULL, 0, PAGE_SIZE,
++			    PROT_READ | PROT_WRITE | PROT_EXEC,
++			    MAP_ANONYMOUS | MAP_PRIVATE, 0);
++	if (IS_ERR(usermem)) {
++		pr_err("Failed to allocate user memory\n");
++		kfree(kmem);
++		return;
++	}
++
++	pr_info("out-of-bounds in copy_from_user()\n");
++	unused = copy_from_user(kmem, usermem, size + 1 + OOB_TAG_OFF);
++
++	pr_info("out-of-bounds in copy_to_user()\n");
++	unused = copy_to_user(usermem, kmem, size + 1 + OOB_TAG_OFF);
++
++	pr_info("out-of-bounds in __copy_from_user()\n");
++	unused = __copy_from_user(kmem, usermem, size + 1 + OOB_TAG_OFF);
++
++	pr_info("out-of-bounds in __copy_to_user()\n");
++	unused = __copy_to_user(usermem, kmem, size + 1 + OOB_TAG_OFF);
++
++	pr_info("out-of-bounds in __copy_from_user_inatomic()\n");
++	unused = __copy_from_user_inatomic(kmem, usermem, size + 1 + OOB_TAG_OFF);
++
++	pr_info("out-of-bounds in __copy_to_user_inatomic()\n");
++	unused = __copy_to_user_inatomic(usermem, kmem, size + 1 + OOB_TAG_OFF);
++
++	pr_info("out-of-bounds in strncpy_from_user()\n");
++	unused = strncpy_from_user(kmem, usermem, size + 1 + OOB_TAG_OFF);
++
++	vm_munmap((unsigned long)usermem, PAGE_SIZE);
++	kfree(kmem);
++}
++
++static struct kasan_rcu_info {
++	int i;
++	struct rcu_head rcu;
++} *global_rcu_ptr;
++
++static noinline void __init kasan_rcu_reclaim(struct rcu_head *rp)
++{
++	struct kasan_rcu_info *fp = container_of(rp,
++						struct kasan_rcu_info, rcu);
++
++	kfree(fp);
++	fp->i = 1;
++}
++
++static noinline void __init kasan_rcu_uaf(void)
++{
++	struct kasan_rcu_info *ptr;
++
++	pr_info("use-after-free in kasan_rcu_reclaim\n");
++	ptr = kmalloc(sizeof(struct kasan_rcu_info), GFP_KERNEL);
++	if (!ptr) {
++		pr_err("Allocation failed\n");
++		return;
++	}
++
++	global_rcu_ptr = rcu_dereference_protected(ptr, NULL);
++	call_rcu(&global_rcu_ptr->rcu, kasan_rcu_reclaim);
++}
++
++
++static int __init test_kasan_module_init(void)
++{
++	/*
++	 * Temporarily enable multi-shot mode. Otherwise, we'd only get a
++	 * report for the first case.
++	 */
++	bool multishot = kasan_save_enable_multi_shot();
++
++	copy_user_test();
++	kasan_rcu_uaf();
++
++	kasan_restore_multi_shot(multishot);
++	return -EAGAIN;
++}
++
++module_init(test_kasan_module_init);
++MODULE_LICENSE("GPL");
