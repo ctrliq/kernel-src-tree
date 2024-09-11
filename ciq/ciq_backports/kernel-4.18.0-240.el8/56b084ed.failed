@@ -1,0 +1,211 @@
+Bluetooth: hci_qca: Remove set but not used variable 'opcode'
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author YueHaibing <yuehaibing@huawei.com>
+commit 56b084ed6eaa0a6353395deffb601dbd6570a1a5
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/56b084ed.failed
+
+Fixes gcc '-Wunused-but-set-variable' warning:
+
+drivers/bluetooth/hci_qca.c: In function 'qca_controller_memdump':
+drivers/bluetooth/hci_qca.c:980:6: warning:
+ variable 'opcode' set but not used [-Wunused-but-set-variable]
+
+It is never used since commit d841502c79e3 ("Bluetooth: hci_qca: Collect
+controller memory dump during SSR"), so remove it.
+
+	Reported-by: Hulk Robot <hulkci@huawei.com>
+	Signed-off-by: YueHaibing <yuehaibing@huawei.com>
+	Signed-off-by: Marcel Holtmann <marcel@holtmann.org>
+(cherry picked from commit 56b084ed6eaa0a6353395deffb601dbd6570a1a5)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/bluetooth/hci_qca.c
+diff --cc drivers/bluetooth/hci_qca.c
+index c7723b08787d,82e4cd4b6663..000000000000
+--- a/drivers/bluetooth/hci_qca.c
++++ b/drivers/bluetooth/hci_qca.c
+@@@ -775,6 -953,175 +775,178 @@@ static int qca_ibs_wake_ack(struct hci_
+  	return 0;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static int qca_recv_acl_data(struct hci_dev *hdev, struct sk_buff *skb)
++ {
++ 	/* We receive debug logs from chip as an ACL packets.
++ 	 * Instead of sending the data to ACL to decode the
++ 	 * received data, we are pushing them to the above layers
++ 	 * as a diagnostic packet.
++ 	 */
++ 	if (get_unaligned_le16(skb->data) == QCA_DEBUG_HANDLE)
++ 		return hci_recv_diag(hdev, skb);
++ 
++ 	return hci_recv_frame(hdev, skb);
++ }
++ 
++ static void qca_controller_memdump(struct work_struct *work)
++ {
++ 	struct qca_data *qca = container_of(work, struct qca_data,
++ 					    ctrl_memdump_evt);
++ 	struct hci_uart *hu = qca->hu;
++ 	struct sk_buff *skb;
++ 	struct qca_memdump_event_hdr *cmd_hdr;
++ 	struct qca_memdump_data *qca_memdump = qca->qca_memdump;
++ 	struct qca_dump_size *dump;
++ 	char *memdump_buf;
++ 	char nullBuff[QCA_DUMP_PACKET_SIZE] = { 0 };
++ 	u16 seq_no;
++ 	u32 dump_size;
++ 
++ 	while ((skb = skb_dequeue(&qca->rx_memdump_q))) {
++ 
++ 		if (!qca_memdump) {
++ 			qca_memdump = kzalloc(sizeof(struct qca_memdump_data),
++ 					      GFP_ATOMIC);
++ 			if (!qca_memdump)
++ 				return;
++ 
++ 			qca->qca_memdump = qca_memdump;
++ 		}
++ 
++ 		qca->memdump_state = QCA_MEMDUMP_COLLECTING;
++ 		cmd_hdr = (void *) skb->data;
++ 		seq_no = __le16_to_cpu(cmd_hdr->seq_no);
++ 		skb_pull(skb, sizeof(struct qca_memdump_event_hdr));
++ 
++ 		if (!seq_no) {
++ 
++ 			/* This is the first frame of memdump packet from
++ 			 * the controller, Disable IBS to recevie dump
++ 			 * with out any interruption, ideally time required for
++ 			 * the controller to send the dump is 8 seconds. let us
++ 			 * start timer to handle this asynchronous activity.
++ 			 */
++ 			clear_bit(QCA_IBS_ENABLED, &qca->flags);
++ 			set_bit(QCA_MEMDUMP_COLLECTION, &qca->flags);
++ 			dump = (void *) skb->data;
++ 			dump_size = __le32_to_cpu(dump->dump_size);
++ 			if (!(dump_size)) {
++ 				bt_dev_err(hu->hdev, "Rx invalid memdump size");
++ 				kfree_skb(skb);
++ 				return;
++ 			}
++ 
++ 			bt_dev_info(hu->hdev, "QCA collecting dump of size:%u",
++ 				    dump_size);
++ 			mod_timer(&qca->memdump_timer, (jiffies +
++ 				  msecs_to_jiffies(MEMDUMP_TIMEOUT_MS)));
++ 
++ 			skb_pull(skb, sizeof(dump_size));
++ 			memdump_buf = vmalloc(dump_size);
++ 			qca_memdump->memdump_buf_head = memdump_buf;
++ 			qca_memdump->memdump_buf_tail = memdump_buf;
++ 		}
++ 
++ 		memdump_buf = qca_memdump->memdump_buf_tail;
++ 
++ 		/* If sequence no 0 is missed then there is no point in
++ 		 * accepting the other sequences.
++ 		 */
++ 		if (!memdump_buf) {
++ 			bt_dev_err(hu->hdev, "QCA: Discarding other packets");
++ 			kfree(qca_memdump);
++ 			kfree_skb(skb);
++ 			qca->qca_memdump = NULL;
++ 			return;
++ 		}
++ 
++ 		/* There could be chance of missing some packets from
++ 		 * the controller. In such cases let us store the dummy
++ 		 * packets in the buffer.
++ 		 */
++ 		while ((seq_no > qca_memdump->current_seq_no + 1) &&
++ 			seq_no != QCA_LAST_SEQUENCE_NUM) {
++ 			bt_dev_err(hu->hdev, "QCA controller missed packet:%d",
++ 				   qca_memdump->current_seq_no);
++ 			memcpy(memdump_buf, nullBuff, QCA_DUMP_PACKET_SIZE);
++ 			memdump_buf = memdump_buf + QCA_DUMP_PACKET_SIZE;
++ 			qca_memdump->received_dump += QCA_DUMP_PACKET_SIZE;
++ 			qca_memdump->current_seq_no++;
++ 		}
++ 
++ 		memcpy(memdump_buf, (unsigned char *) skb->data, skb->len);
++ 		memdump_buf = memdump_buf + skb->len;
++ 		qca_memdump->memdump_buf_tail = memdump_buf;
++ 		qca_memdump->current_seq_no = seq_no + 1;
++ 		qca_memdump->received_dump += skb->len;
++ 		qca->qca_memdump = qca_memdump;
++ 		kfree_skb(skb);
++ 		if (seq_no == QCA_LAST_SEQUENCE_NUM) {
++ 			bt_dev_info(hu->hdev, "QCA writing crash dump of size %d bytes",
++ 				   qca_memdump->received_dump);
++ 			memdump_buf = qca_memdump->memdump_buf_head;
++ 			dev_coredumpv(&hu->serdev->dev, memdump_buf,
++ 				      qca_memdump->received_dump, GFP_KERNEL);
++ 			del_timer(&qca->memdump_timer);
++ 			kfree(qca->qca_memdump);
++ 			qca->qca_memdump = NULL;
++ 			qca->memdump_state = QCA_MEMDUMP_COLLECTED;
++ 		}
++ 	}
++ 
++ }
++ 
++ int qca_controller_memdump_event(struct hci_dev *hdev, struct sk_buff *skb)
++ {
++ 	struct hci_uart *hu = hci_get_drvdata(hdev);
++ 	struct qca_data *qca = hu->priv;
++ 
++ 	skb_queue_tail(&qca->rx_memdump_q, skb);
++ 	queue_work(qca->workqueue, &qca->ctrl_memdump_evt);
++ 
++ 	return 0;
++ }
++ 
++ static int qca_recv_event(struct hci_dev *hdev, struct sk_buff *skb)
++ {
++ 	struct hci_uart *hu = hci_get_drvdata(hdev);
++ 	struct qca_data *qca = hu->priv;
++ 
++ 	if (test_bit(QCA_DROP_VENDOR_EVENT, &qca->flags)) {
++ 		struct hci_event_hdr *hdr = (void *)skb->data;
++ 
++ 		/* For the WCN3990 the vendor command for a baudrate change
++ 		 * isn't sent as synchronous HCI command, because the
++ 		 * controller sends the corresponding vendor event with the
++ 		 * new baudrate. The event is received and properly decoded
++ 		 * after changing the baudrate of the host port. It needs to
++ 		 * be dropped, otherwise it can be misinterpreted as
++ 		 * response to a later firmware download command (also a
++ 		 * vendor command).
++ 		 */
++ 
++ 		if (hdr->evt == HCI_EV_VENDOR)
++ 			complete(&qca->drop_ev_comp);
++ 
++ 		kfree_skb(skb);
++ 
++ 		return 0;
++ 	}
++ 	/* We receive chip memory dump as an event packet, With a dedicated
++ 	 * handler followed by a hardware error event. When this event is
++ 	 * received we store dump into a file before closing hci. This
++ 	 * dump will help in triaging the issues.
++ 	 */
++ 	if ((skb->data[0] == HCI_VENDOR_PKT) &&
++ 	    (get_unaligned_be16(skb->data + 2) == QCA_SSR_DUMP_HANDLE))
++ 		return qca_controller_memdump_event(hdev, skb);
++ 
++ 	return hci_recv_frame(hdev, skb);
++ }
++ 
+++>>>>>>> 56b084ed6eaa (Bluetooth: hci_qca: Remove set but not used variable 'opcode')
+  #define QCA_IBS_SLEEP_IND_EVENT \
+  	.type = HCI_IBS_SLEEP_IND, \
+  	.hlen = 0, \
+* Unmerged path drivers/bluetooth/hci_qca.c
