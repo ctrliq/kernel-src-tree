@@ -137,7 +137,6 @@ void map__init(struct map *map, u64 start, u64 end, u64 pgoff, struct dso *dso)
 	map->map_ip   = map__map_ip;
 	map->unmap_ip = map__unmap_ip;
 	RB_CLEAR_NODE(&map->rb_node);
-	map->groups   = NULL;
 	map->erange_warned = false;
 	refcount_set(&map->refcnt, 1);
 }
@@ -385,7 +384,6 @@ struct map *map__clone(struct map *from)
 		refcount_set(&map->refcnt, 1);
 		RB_CLEAR_NODE(&map->rb_node);
 		dso__get(map->dso);
-		map->groups = NULL;
 	}
 
 	return map;
@@ -579,7 +577,6 @@ void map_groups__init(struct map_groups *mg, struct machine *machine)
 void map_groups__insert(struct map_groups *mg, struct map *map)
 {
 	maps__insert(&mg->maps, map);
-	map->groups = mg;
 }
 
 static void __maps__purge(struct maps *maps)
@@ -757,7 +754,6 @@ static void __map_groups__insert(struct map_groups *mg, struct map *map)
 {
 	__maps__insert(&mg->maps, map);
 	__maps__insert_name(&mg->maps, map);
-	map->groups = mg;
 }
 
 int map_groups__fixup_overlappings(struct map_groups *mg, struct map *map, FILE *fp)
