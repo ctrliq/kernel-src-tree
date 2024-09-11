@@ -1,0 +1,189 @@
+fbcon: Fix delayed takeover locking
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-448.el8
+commit-author Daniel Vetter <daniel.vetter@ffwll.ch>
+commit 9d79799193b728b62c9899d931b5009da1f89b67
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-448.el8/9d797991.failed
+
+I messed up the delayed takover path in the locking conversion in
+6e7da3af008b ("fbcon: Move console_lock for register/unlink/unregister").
+
+If CONFIG_FRAMEBUFFER_CONSOLE_DEFERRED_TAKEOVER is enabled, fbcon take-over
+doesn't take place when calling fbcon_fb_registered(). Instead, is deferred
+using a workqueue and its fbcon_register_existing_fbs() function calls to
+fbcon_fb_registered() again for each registered fbcon fb.
+
+This leads to the console_lock tried to be held twice, causing a deadlock.
+
+Fix it by re-extracting the lockless function and using it in the
+delayed takeover path, where we need to hold the lock already to
+iterate over the list of already registered fb. Well the current code
+still is broken in there (since the list is protected by a
+registration_lock, which we can't take here because it nests the other
+way round with console_lock), but in the future this will be a list
+protected by console_lock when this is all sorted out.
+
+While reviewing the broken commit I realized that I've left some
+outdated comments about the locking behind. Fix those too.
+
+v2: Improve commit message (Javier)
+
+	Reported-by: Nathan Chancellor <nathan@kernel.org>
+	Tested-by: Nathan Chancellor <nathan@kernel.org>
+	Reviewed-by: Javier Martinez Canillas <javierm@redhat.com>
+	Cc: Nathan Chancellor <nathan@kernel.org>
+Fixes: 6e7da3af008b ("fbcon: Move console_lock for register/unlink/unregister")
+	Cc: Sam Ravnborg <sam@ravnborg.org>
+	Cc: Thomas Zimmermann <tzimmermann@suse.de>
+	Cc: Du Cheng <ducheng2@gmail.com>
+	Cc: Claudio Suarez <cssk@net-c.es>
+	Cc: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+	Cc: Tetsuo Handa <penguin-kernel@I-love.SAKURA.ne.jp>
+	Cc: Matthew Wilcox <willy@infradead.org>
+	Cc: Zheyu Ma <zheyuma97@gmail.com>
+	Cc: Guenter Roeck <linux@roeck-us.net>
+	Cc: Helge Deller <deller@gmx.de>
+	Cc: Geert Uytterhoeven <geert@linux-m68k.org>
+	Cc: Javier Martinez Canillas <javierm@redhat.com>
+	Signed-off-by: Daniel Vetter <daniel.vetter@intel.com>
+Link: https://patchwork.freedesktop.org/patch/msgid/20220413082128.348186-1-daniel.vetter@ffwll.ch
+(cherry picked from commit 9d79799193b728b62c9899d931b5009da1f89b67)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/video/fbdev/core/fbcon.c
+diff --cc drivers/video/fbdev/core/fbcon.c
+index 91b5fa80c451,34744a16d41b..000000000000
+--- a/drivers/video/fbdev/core/fbcon.c
++++ b/drivers/video/fbdev/core/fbcon.c
+@@@ -3092,25 -2767,22 +3092,29 @@@ static int fbcon_unbind(void
+  
+  	if (!ret)
+  		fbcon_has_console_bind = 0;
+ +
+ +	return ret;
+  }
+  #else
+ -static inline void fbcon_unbind(void) {}
+ +static inline int fbcon_unbind(void)
+ +{
+ +	return -EINVAL;
+ +}
+  #endif /* CONFIG_VT_HW_CONSOLE_BINDING */
+  
+++<<<<<<< HEAD
+ +/* called with console_lock held */
+ +static int fbcon_fb_unbind(int idx)
+++=======
++ void fbcon_fb_unbind(struct fb_info *info)
+++>>>>>>> 9d79799193b7 (fbcon: Fix delayed takeover locking)
+  {
+ -	int i, new_idx = -1;
+ -	int idx = info->node;
+ +	int i, new_idx = -1, ret = 0;
+  
+ -	console_lock();
+ +	WARN_CONSOLE_UNLOCKED();
+  
+ -	if (!fbcon_has_console_bind) {
+ -		console_unlock();
+ -		return;
+ -	}
+ +	if (!fbcon_has_console_bind)
+ +		return 0;
+  
+  	for (i = first_fb_vc; i <= last_fb_vc; i++) {
+  		if (con2fb_map[i] != idx &&
+@@@ -3148,13 -2815,12 +3152,12 @@@
+  				}
+  			}
+  		}
+ -		fbcon_unbind();
+ +		ret = fbcon_unbind();
+  	}
+  
+ -	console_unlock();
+ +	return ret;
+  }
+  
+- /* called with console_lock held */
+  void fbcon_fb_unregistered(struct fb_info *info)
+  {
+  	int i, idx;
+@@@ -3250,12 -2920,20 +3253,18 @@@ static inline void fbcon_select_primary
+  }
+  #endif /* CONFIG_FRAMEBUFFER_DETECT_PRIMARY */
+  
+ -static bool lockless_register_fb;
+ -module_param_named_unsafe(lockless_register_fb, lockless_register_fb, bool, 0400);
+ -MODULE_PARM_DESC(lockless_register_fb,
+ -	"Lockless framebuffer registration for debugging [default=off]");
+ -
+  /* called with console_lock held */
+- int fbcon_fb_registered(struct fb_info *info)
++ static int do_fb_registered(struct fb_info *info)
+  {
+  	int ret = 0, i, idx;
+  
+  	WARN_CONSOLE_UNLOCKED();
+++<<<<<<< HEAD
+++=======
++ 
++ 	fbcon_registered_fb[info->node] = info;
++ 	fbcon_num_registered_fb++;
+++>>>>>>> 9d79799193b7 (fbcon: Fix delayed takeover locking)
+  
+  	idx = info->node;
+  	fbcon_select_primary(info);
+@@@ -3282,6 -2960,25 +3291,28 @@@
+  		}
+  	}
+  
+++<<<<<<< HEAD
+++=======
++ 	return ret;
++ }
++ 
++ int fbcon_fb_registered(struct fb_info *info)
++ {
++ 	int ret;
++ 
++ 	if (!lockless_register_fb)
++ 		console_lock();
++ 	else
++ 		atomic_inc(&ignore_console_lock_warning);
++ 
++ 	ret = do_fb_registered(info);
++ 
++ 	if (!lockless_register_fb)
++ 		console_unlock();
++ 	else
++ 		atomic_dec(&ignore_console_lock_warning);
++ 
+++>>>>>>> 9d79799193b7 (fbcon: Fix delayed takeover locking)
+  	return ret;
+  }
+  
+@@@ -3613,10 -3284,11 +3644,18 @@@ static void fbcon_register_existing_fbs
+  
+  	console_lock();
+  
+++<<<<<<< HEAD
+ +	for (i = 0; i < FB_MAX; i++) {
+ +		if (registered_fb[i])
+ +			fbcon_fb_registered(registered_fb[i]);
+ +	}
+++=======
++ 	deferred_takeover = false;
++ 	logo_shown = FBCON_LOGO_DONTSHOW;
++ 
++ 	fbcon_for_each_registered_fb(i)
++ 		do_fb_registered(fbcon_registered_fb[i]);
+++>>>>>>> 9d79799193b7 (fbcon: Fix delayed takeover locking)
+  
+  	console_unlock();
+  }
+* Unmerged path drivers/video/fbdev/core/fbcon.c
