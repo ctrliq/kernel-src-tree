@@ -131,8 +131,11 @@ static bool qedf_initiate_fipvlan_req(struct qedf_ctx *qedf)
 			return false;
 		}
 
-		if (qedf->vlan_id > 0)
+		if (qedf->vlan_id > 0) {
+			QEDF_INFO(&qedf->dbg_ctx, QEDF_LOG_DISC,
+				  "vlan = 0x%x already set.\n", qedf->vlan_id);
 			return true;
+		}
 
 		QEDF_INFO(&(qedf->dbg_ctx), QEDF_LOG_DISC,
 			   "Retry %d.\n", qedf->fipvlan_retries);
@@ -165,6 +168,8 @@ static void qedf_handle_link_update(struct work_struct *work)
 			return;
 
 		if (atomic_read(&qedf->link_state) != QEDF_LINK_UP) {
+			QEDF_INFO(&qedf->dbg_ctx, QEDF_LOG_DISC,
+				  "Link is down, resetting vlan_id.\n");
 			qedf->vlan_id = 0;
 			return;
 		}
@@ -314,8 +319,10 @@ int qedf_send_flogi(struct qedf_ctx *qedf)
 
 	lport = qedf->lport;
 
-	if (!lport->tt.elsct_send)
+	if (!lport->tt.elsct_send) {
+		QEDF_ERR(&qedf->dbg_ctx, "tt.elsct_send not set.\n");
 		return -EINVAL;
+	}
 
 	fp = fc_frame_alloc(lport, sizeof(struct fc_els_flogi));
 	if (!fp) {
@@ -2344,12 +2351,14 @@ static void qedf_recv_frame(struct qedf_ctx *qedf,
 	fr_dev(fp) = lport;
 	fr_sof(fp) = hp->fcoe_sof;
 	if (skb_copy_bits(skb, fr_len, &crc_eof, sizeof(crc_eof))) {
+		QEDF_INFO(NULL, QEDF_LOG_LL2, "skb_copy_bits failed.\n");
 		kfree_skb(skb);
 		return;
 	}
 	fr_eof(fp) = crc_eof.fcoe_eof;
 	fr_crc(fp) = crc_eof.fcoe_crc32;
 	if (pskb_trim(skb, fr_len)) {
+		QEDF_INFO(NULL, QEDF_LOG_LL2, "pskb_trim failed.\n");
 		kfree_skb(skb);
 		return;
 	}
@@ -2410,9 +2419,9 @@ static void qedf_recv_frame(struct qedf_ctx *qedf,
 	 * empty then this is not addressed to our port so simply drop it.
 	 */
 	if (lport->port_id != ntoh24(fh->fh_d_id) && !vn_port) {
-		QEDF_INFO(&(qedf->dbg_ctx), QEDF_LOG_LL2,
-		    "Dropping frame due to destination mismatch: lport->port_id=%x fh->d_id=%x.\n",
-		    lport->port_id, ntoh24(fh->fh_d_id));
+		QEDF_INFO(&qedf->dbg_ctx, QEDF_LOG_LL2,
+			  "Dropping frame due to destination mismatch: lport->port_id=0x%x fh->d_id=0x%x.\n",
+			  lport->port_id, ntoh24(fh->fh_d_id));
 		kfree_skb(skb);
 		return;
 	}
@@ -2421,6 +2430,8 @@ static void qedf_recv_frame(struct qedf_ctx *qedf,
 	if ((fh->fh_type == FC_TYPE_BLS) && (f_ctl & FC_FC_SEQ_CTX) &&
 	    (f_ctl & FC_FC_EX_CTX)) {
 		/* Drop incoming ABTS response that has both SEQ/EX CTX set */
+		QEDF_INFO(&qedf->dbg_ctx, QEDF_LOG_LL2,
+			  "Dropping ABTS response as both SEQ/EX CTX set.\n");
 		kfree_skb(skb);
 		return;
 	}
@@ -2564,8 +2575,9 @@ static int qedf_alloc_and_init_sb(struct qedf_ctx *qedf,
 	    sizeof(struct status_block_e4), &sb_phys, GFP_KERNEL);
 
 	if (!sb_virt) {
-		QEDF_ERR(&(qedf->dbg_ctx), "Status block allocation failed "
-			  "for id = %d.\n", sb_id);
+		QEDF_ERR(&qedf->dbg_ctx,
+			 "Status block allocation failed for id = %d.\n",
+			 sb_id);
 		return -ENOMEM;
 	}
 
@@ -2573,8 +2585,9 @@ static int qedf_alloc_and_init_sb(struct qedf_ctx *qedf,
 	    sb_id, QED_SB_TYPE_STORAGE);
 
 	if (ret) {
-		QEDF_ERR(&(qedf->dbg_ctx), "Status block initialization "
-			  "failed for id = %d.\n", sb_id);
+		QEDF_ERR(&qedf->dbg_ctx,
+			 "Status block initialization failed (0x%x) for id = %d.\n",
+			 ret, sb_id);
 		return ret;
 	}
 
@@ -2658,13 +2671,18 @@ void qedf_process_cqe(struct qedf_ctx *qedf, struct fcoe_cqe *cqe)
 	io_req = &qedf->cmd_mgr->cmds[xid];
 
 	/* Completion not for a valid I/O anymore so just return */
-	if (!io_req)
+	if (!io_req) {
+		QEDF_ERR(&qedf->dbg_ctx,
+			 "io_req is NULL for xid=0x%x.\n", xid);
 		return;
+	}
 
 	fcport = io_req->fcport;
 
 	if (fcport == NULL) {
-		QEDF_ERR(&(qedf->dbg_ctx), "fcport is NULL.\n");
+		QEDF_ERR(&qedf->dbg_ctx,
+			 "fcport is NULL for xid=0x%x io_req=%p.\n",
+			 xid, io_req);
 		return;
 	}
 
@@ -2673,7 +2691,8 @@ void qedf_process_cqe(struct qedf_ctx *qedf, struct fcoe_cqe *cqe)
 	 * isn't valid and shouldn't be taken. We should just return.
 	 */
 	if (!test_bit(QEDF_RPORT_SESSION_READY, &fcport->flags)) {
-		QEDF_ERR(&(qedf->dbg_ctx), "Session not offloaded yet.\n");
+		QEDF_ERR(&qedf->dbg_ctx,
+			 "Session not offloaded yet, fcport = %p.\n", fcport);
 		return;
 	}
 
@@ -2885,6 +2904,7 @@ static int qedf_alloc_global_queues(struct qedf_ctx *qedf)
 	 */
 	if (!qedf->p_cpuq) {
 		status = 1;
+		QEDF_ERR(&qedf->dbg_ctx, "p_cpuq is NULL.\n");
 		goto mem_alloc_failure;
 	}
 
@@ -2900,8 +2920,10 @@ static int qedf_alloc_global_queues(struct qedf_ctx *qedf)
 
 	/* Allocate DMA coherent buffers for BDQ */
 	rc = qedf_alloc_bdq(qedf);
-	if (rc)
+	if (rc) {
+		QEDF_ERR(&qedf->dbg_ctx, "Unable to allocate bdq.\n");
 		goto mem_alloc_failure;
+	}
 
 	/* Allocate a CQ and an associated PBL for each MSI-X vector */
 	for (i = 0; i < qedf->num_queues; i++) {
@@ -3213,6 +3235,7 @@ static int __qedf_probe(struct pci_dev *pdev, int mode)
 	qed_params.is_vf = is_vf;
 	qedf->cdev = qed_ops->common->probe(pdev, &qed_params);
 	if (!qedf->cdev) {
+		QEDF_ERR(&qedf->dbg_ctx, "common probe failed.\n");
 		rc = -ENODEV;
 		goto err1;
 	}
@@ -3281,8 +3304,10 @@ static int __qedf_probe(struct pci_dev *pdev, int mode)
 
 	/* Setup interrupts */
 	rc = qedf_setup_int(qedf);
-	if (rc)
+	if (rc) {
+		QEDF_ERR(&qedf->dbg_ctx, "Setup interrupts failed.\n");
 		goto err3;
+	}
 
 	rc = qed_ops->start(qedf->cdev, &qedf->tasks);
 	if (rc) {
