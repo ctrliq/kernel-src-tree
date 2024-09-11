@@ -1355,6 +1355,7 @@ lpfc_linkup_port(struct lpfc_vport *vport)
 	vport->fc_flag |= FC_NDISC_ACTIVE;
 	vport->fc_ns_retry = 0;
 	spin_unlock_irq(shost->host_lock);
+	lpfc_setup_fdmi_mask(vport);
 
 	lpfc_linkup_cleanup_nodes(vport);
 }
@@ -1386,8 +1387,8 @@ lpfc_linkup(struct lpfc_hba *phba)
 	phba->pport->rcv_flogi_cnt = 0;
 	spin_unlock_irq(shost->host_lock);
 
-	/* reinitialize initial FLOGI flag */
-	phba->hba_flag &= ~(HBA_FLOGI_ISSUED);
+	/* reinitialize initial HBA flag */
+	phba->hba_flag &= ~(HBA_FLOGI_ISSUED | HBA_RHBA_CMPL);
 	phba->defer_flogi_acc_flag = false;
 
 	return 0;
