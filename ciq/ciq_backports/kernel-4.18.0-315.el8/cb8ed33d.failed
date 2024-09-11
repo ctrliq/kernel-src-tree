@@ -1,0 +1,178 @@
+mt76: dma: add the capability to define a custom rx napi poll routine
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-315.el8
+commit-author Lorenzo Bianconi <lorenzo@kernel.org>
+commit cb8ed33d4b3f4ef8cbff2d164bffeca678427f5a
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-315.el8/cb8ed33d.failed
+
+Add the capability to define a custom rx napi callback for each driver.
+This is a preliminary patch to properly support runtime-pm on rx side
+
+	Signed-off-by: Lorenzo Bianconi <lorenzo@kernel.org>
+	Signed-off-by: Felix Fietkau <nbd@nbd.name>
+(cherry picked from commit cb8ed33d4b3f4ef8cbff2d164bffeca678427f5a)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/wireless/mediatek/mt76/mt7915/dma.c
+diff --cc drivers/net/wireless/mediatek/mt76/mt7915/dma.c
+index 4f7c5fd83efb,11d0b760abd7..000000000000
+--- a/drivers/net/wireless/mediatek/mt76/mt7915/dma.c
++++ b/drivers/net/wireless/mediatek/mt76/mt7915/dma.c
+@@@ -281,7 -195,25 +281,29 @@@ int mt7915_dma_init(struct mt7915_dev *
+  	if (ret)
+  		return ret;
+  
+++<<<<<<< HEAD
+ +	ret = mt76_init_queues(dev);
+++=======
++ 	if (dev->dbdc_support) {
++ 		ret = mt76_queue_alloc(dev, &dev->mt76.q_rx[MT_RXQ_EXT],
++ 				       MT7915_RXQ_BAND1, MT7915_RX_RING_SIZE,
++ 				       rx_buf_size,
++ 				       MT_RX_DATA_RING_BASE + hif1_ofs);
++ 		if (ret)
++ 			return ret;
++ 
++ 		/* event from WA */
++ 		ret = mt76_queue_alloc(dev, &dev->mt76.q_rx[MT_RXQ_EXT_WA],
++ 				       MT7915_RXQ_MCU_WA_EXT,
++ 				       MT7915_RX_MCU_RING_SIZE,
++ 				       rx_buf_size,
++ 				       MT_RX_EVENT_RING_BASE + hif1_ofs);
++ 		if (ret)
++ 			return ret;
++ 	}
++ 
++ 	ret = mt76_init_queues(dev, mt76_dma_rx_poll);
+++>>>>>>> cb8ed33d4b3f (mt76: dma: add the capability to define a custom rx napi poll routine)
+  	if (ret < 0)
+  		return ret;
+  
+diff --git a/drivers/net/wireless/mediatek/mt76/dma.c b/drivers/net/wireless/mediatek/mt76/dma.c
+index c498a3f11af1..b88f1ff58e19 100644
+--- a/drivers/net/wireless/mediatek/mt76/dma.c
++++ b/drivers/net/wireless/mediatek/mt76/dma.c
+@@ -596,8 +596,7 @@ mt76_dma_rx_process(struct mt76_dev *dev, struct mt76_queue *q, int budget)
+ 	return done;
+ }
+ 
+-static int
+-mt76_dma_rx_poll(struct napi_struct *napi, int budget)
++int mt76_dma_rx_poll(struct napi_struct *napi, int budget)
+ {
+ 	struct mt76_dev *dev;
+ 	int qid, done = 0, cur;
+@@ -622,17 +621,18 @@ mt76_dma_rx_poll(struct napi_struct *napi, int budget)
+ 
+ 	return done;
+ }
++EXPORT_SYMBOL_GPL(mt76_dma_rx_poll);
+ 
+ static int
+-mt76_dma_init(struct mt76_dev *dev)
++mt76_dma_init(struct mt76_dev *dev,
++	      int (*poll)(struct napi_struct *napi, int budget))
+ {
+ 	int i;
+ 
+ 	init_dummy_netdev(&dev->napi_dev);
+ 
+ 	mt76_for_each_q_rx(dev, i) {
+-		netif_napi_add(&dev->napi_dev, &dev->napi[i], mt76_dma_rx_poll,
+-			       64);
++		netif_napi_add(&dev->napi_dev, &dev->napi[i], poll, 64);
+ 		mt76_dma_rx_fill(dev, &dev->q_rx[i]);
+ 		napi_enable(&dev->napi[i]);
+ 	}
+diff --git a/drivers/net/wireless/mediatek/mt76/dma.h b/drivers/net/wireless/mediatek/mt76/dma.h
+index e7c27697ef04..fdf786f975ea 100644
+--- a/drivers/net/wireless/mediatek/mt76/dma.h
++++ b/drivers/net/wireless/mediatek/mt76/dma.h
+@@ -45,6 +45,7 @@ enum mt76_mcu_evt_type {
+ 	EVT_EVENT_DFS_DETECT_RSP,
+ };
+ 
++int mt76_dma_rx_poll(struct napi_struct *napi, int budget);
+ void mt76_dma_attach(struct mt76_dev *dev);
+ void mt76_dma_cleanup(struct mt76_dev *dev);
+ 
+diff --git a/drivers/net/wireless/mediatek/mt76/mt76.h b/drivers/net/wireless/mediatek/mt76/mt76.h
+index 1f34f62819ee..f566c0317567 100644
+--- a/drivers/net/wireless/mediatek/mt76/mt76.h
++++ b/drivers/net/wireless/mediatek/mt76/mt76.h
+@@ -167,7 +167,8 @@ struct mt76_mcu_ops {
+ };
+ 
+ struct mt76_queue_ops {
+-	int (*init)(struct mt76_dev *dev);
++	int (*init)(struct mt76_dev *dev,
++		    int (*poll)(struct napi_struct *napi, int budget));
+ 
+ 	int (*alloc)(struct mt76_dev *dev, struct mt76_queue *q,
+ 		     int idx, int n_desc, int bufsize,
+@@ -766,7 +767,7 @@ static inline u16 mt76_rev(struct mt76_dev *dev)
+ #define mt76xx_chip(dev) mt76_chip(&((dev)->mt76))
+ #define mt76xx_rev(dev) mt76_rev(&((dev)->mt76))
+ 
+-#define mt76_init_queues(dev)		(dev)->mt76.queue_ops->init(&((dev)->mt76))
++#define mt76_init_queues(dev, ...)		(dev)->mt76.queue_ops->init(&((dev)->mt76), __VA_ARGS__)
+ #define mt76_queue_alloc(dev, ...)	(dev)->mt76.queue_ops->alloc(&((dev)->mt76), __VA_ARGS__)
+ #define mt76_tx_queue_skb_raw(dev, ...)	(dev)->mt76.queue_ops->tx_queue_skb_raw(&((dev)->mt76), __VA_ARGS__)
+ #define mt76_tx_queue_skb(dev, ...)	(dev)->mt76.queue_ops->tx_queue_skb(&((dev)->mt76), __VA_ARGS__)
+diff --git a/drivers/net/wireless/mediatek/mt76/mt7603/dma.c b/drivers/net/wireless/mediatek/mt76/mt7603/dma.c
+index 3f479d9d63aa..c52eb96696bd 100644
+--- a/drivers/net/wireless/mediatek/mt76/mt7603/dma.c
++++ b/drivers/net/wireless/mediatek/mt76/mt7603/dma.c
+@@ -219,7 +219,7 @@ int mt7603_dma_init(struct mt7603_dev *dev)
+ 		return ret;
+ 
+ 	mt76_wr(dev, MT_DELAY_INT_CFG, 0);
+-	ret = mt76_init_queues(dev);
++	ret = mt76_init_queues(dev, mt76_dma_rx_poll);
+ 	if (ret)
+ 		return ret;
+ 
+diff --git a/drivers/net/wireless/mediatek/mt76/mt7615/dma.c b/drivers/net/wireless/mediatek/mt76/mt7615/dma.c
+index 847ccaa0296f..18d1adf82529 100644
+--- a/drivers/net/wireless/mediatek/mt76/mt7615/dma.c
++++ b/drivers/net/wireless/mediatek/mt76/mt7615/dma.c
+@@ -241,7 +241,7 @@ int mt7615_dma_init(struct mt7615_dev *dev)
+ 
+ 	mt76_wr(dev, MT_DELAY_INT_CFG, 0);
+ 
+-	ret = mt76_init_queues(dev);
++	ret = mt76_init_queues(dev, mt76_dma_rx_poll);
+ 	if (ret < 0)
+ 		return ret;
+ 
+diff --git a/drivers/net/wireless/mediatek/mt76/mt76x02_mmio.c b/drivers/net/wireless/mediatek/mt76/mt76x02_mmio.c
+index 1caa9f703491..be14a04b2254 100644
+--- a/drivers/net/wireless/mediatek/mt76/mt76x02_mmio.c
++++ b/drivers/net/wireless/mediatek/mt76/mt76x02_mmio.c
+@@ -227,7 +227,7 @@ int mt76x02_dma_init(struct mt76x02_dev *dev)
+ 	if (ret)
+ 		return ret;
+ 
+-	ret = mt76_init_queues(dev);
++	ret = mt76_init_queues(dev, mt76_dma_rx_poll);
+ 	if (ret)
+ 		return ret;
+ 
+* Unmerged path drivers/net/wireless/mediatek/mt76/mt7915/dma.c
+diff --git a/drivers/net/wireless/mediatek/mt76/mt7921/dma.c b/drivers/net/wireless/mediatek/mt76/mt7921/dma.c
+index cd9665610284..912503de1a88 100644
+--- a/drivers/net/wireless/mediatek/mt76/mt7921/dma.c
++++ b/drivers/net/wireless/mediatek/mt76/mt7921/dma.c
+@@ -295,7 +295,7 @@ int mt7921_dma_init(struct mt7921_dev *dev)
+ 	if (ret)
+ 		return ret;
+ 
+-	ret = mt76_init_queues(dev);
++	ret = mt76_init_queues(dev, mt76_dma_rx_poll);
+ 	if (ret < 0)
+ 		return ret;
+ 
