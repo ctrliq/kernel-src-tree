@@ -1,0 +1,125 @@
+mm: add __clear_page_lru_flags() to replace page_off_lru()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-358.el8
+commit-author Yu Zhao <yuzhao@google.com>
+commit 875601796267214f286d3581fe74f2805d060fe8
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-358.el8/87560179.failed
+
+Similar to page_off_lru(), the new function does non-atomic clearing
+of PageLRU() in addition to PageActive() and PageUnevictable(), on a
+page that has no references left.
+
+If PageActive() and PageUnevictable() are both set, refuse to clear
+either and leave them to bad_page(). This is a behavior change that
+is meant to help debug.
+
+Link: https://lore.kernel.org/linux-mm/20201207220949.830352-7-yuzhao@google.com/
+Link: https://lkml.kernel.org/r/20210122220600.906146-7-yuzhao@google.com
+	Signed-off-by: Yu Zhao <yuzhao@google.com>
+	Cc: Alex Shi <alex.shi@linux.alibaba.com>
+	Cc: Hugh Dickins <hughd@google.com>
+	Cc: Johannes Weiner <hannes@cmpxchg.org>
+	Cc: Matthew Wilcox <willy@infradead.org>
+	Cc: Michal Hocko <mhocko@kernel.org>
+	Cc: Roman Gushchin <guro@fb.com>
+	Cc: Vladimir Davydov <vdavydov.dev@gmail.com>
+	Cc: Vlastimil Babka <vbabka@suse.cz>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit 875601796267214f286d3581fe74f2805d060fe8)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	mm/swap.c
+diff --cc mm/swap.c
+index 78fee54efe0c,1455fa56a0ee..000000000000
+--- a/mm/swap.c
++++ b/mm/swap.c
+@@@ -83,8 -84,8 +83,13 @@@ static void __page_cache_release(struc
+  
+  		lruvec = lock_page_lruvec_irqsave(page, &flags);
+  		VM_BUG_ON_PAGE(!PageLRU(page), page);
+++<<<<<<< HEAD
+ +		__ClearPageLRU(page);
+ +		del_page_from_lru_list(page, lruvec, page_off_lru(page));
+++=======
++ 		del_page_from_lru_list(page, lruvec);
++ 		__clear_page_lru_flags(page);
+++>>>>>>> 875601796267 (mm: add __clear_page_lru_flags() to replace page_off_lru())
+  		unlock_page_lruvec_irqrestore(lruvec, flags);
+  	}
+  	__ClearPageWaiters(page);
+@@@ -856,8 -910,8 +861,13 @@@ void release_pages(struct page **pages
+  				lock_batch = 0;
+  
+  			VM_BUG_ON_PAGE(!PageLRU(page), page);
+++<<<<<<< HEAD
+ +			__ClearPageLRU(page);
+ +			del_page_from_lru_list(page, lruvec, page_off_lru(page));
+++=======
++ 			del_page_from_lru_list(page, lruvec);
++ 			__clear_page_lru_flags(page);
+++>>>>>>> 875601796267 (mm: add __clear_page_lru_flags() to replace page_off_lru())
+  		}
+  
+  		__ClearPageWaiters(page);
+diff --git a/include/linux/mm_inline.h b/include/linux/mm_inline.h
+index b714bf7a0dfe..f7b19b8409cc 100644
+--- a/include/linux/mm_inline.h
++++ b/include/linux/mm_inline.h
+@@ -82,27 +82,19 @@ static inline enum lru_list page_lru_base_type(struct page *page)
+ }
+ 
+ /**
+- * page_off_lru - which LRU list was page on? clearing its lru flags.
+- * @page: the page to test
+- *
+- * Returns the LRU list a page was on, as an index into the array of LRU
+- * lists; and clears its Unevictable or Active flags, ready for freeing.
++ * __clear_page_lru_flags - clear page lru flags before releasing a page
++ * @page: the page that was on lru and now has a zero reference
+  */
+-static __always_inline enum lru_list page_off_lru(struct page *page)
++static __always_inline void __clear_page_lru_flags(struct page *page)
+ {
+-	enum lru_list lru;
++	__ClearPageLRU(page);
+ 
+-	if (PageUnevictable(page)) {
+-		__ClearPageUnevictable(page);
+-		lru = LRU_UNEVICTABLE;
+-	} else {
+-		lru = page_lru_base_type(page);
+-		if (PageActive(page)) {
+-			__ClearPageActive(page);
+-			lru += LRU_ACTIVE;
+-		}
+-	}
+-	return lru;
++	/* this shouldn't happen, so leave the flags to bad_page() */
++	if (PageActive(page) && PageUnevictable(page))
++		return;
++
++	__ClearPageActive(page);
++	__ClearPageUnevictable(page);
+ }
+ 
+ /**
+* Unmerged path mm/swap.c
+diff --git a/mm/vmscan.c b/mm/vmscan.c
+index 622f69d66ebc..ba8dd4fc325d 100644
+--- a/mm/vmscan.c
++++ b/mm/vmscan.c
+@@ -1859,8 +1859,7 @@ static unsigned noinline_for_stack move_pages_to_lru(struct lruvec *lruvec,
+ 		SetPageLRU(page);
+ 
+ 		if (unlikely(put_page_testzero(page))) {
+-			__ClearPageLRU(page);
+-			__ClearPageActive(page);
++			__clear_page_lru_flags(page);
+ 
+ 			if (unlikely(PageCompound(page))) {
+ 				spin_unlock_irq(&lruvec->lru_lock);
