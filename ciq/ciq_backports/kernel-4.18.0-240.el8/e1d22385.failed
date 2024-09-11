@@ -1,0 +1,119 @@
+arm64: fix kernel stack overflow in kdump capture kernel
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Wei Li <liwei391@huawei.com>
+commit e1d22385ea6686ff3dcd7092d84465c193849829
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/e1d22385.failed
+
+When enabling ARM64_PSEUDO_NMI feature in kdump capture kernel, it will
+report a kernel stack overflow exception:
+
+[    0.000000] CPU features: detected: IRQ priority masking
+[    0.000000] alternatives: patching kernel code
+[    0.000000] Insufficient stack space to handle exception!
+[    0.000000] ESR: 0x96000044 -- DABT (current EL)
+[    0.000000] FAR: 0x0000000000000040
+[    0.000000] Task stack:     [0xffff0000097f0000..0xffff0000097f4000]
+[    0.000000] IRQ stack:      [0x0000000000000000..0x0000000000004000]
+[    0.000000] Overflow stack: [0xffff80002b7cf290..0xffff80002b7d0290]
+[    0.000000] CPU: 0 PID: 0 Comm: swapper Not tainted 4.19.34-lw+ #3
+[    0.000000] pstate: 400003c5 (nZcv DAIF -PAN -UAO)
+[    0.000000] pc : el1_sync+0x0/0xb8
+[    0.000000] lr : el1_irq+0xb8/0x140
+[    0.000000] sp : 0000000000000040
+[    0.000000] pmr_save: 00000070
+[    0.000000] x29: ffff0000097f3f60 x28: ffff000009806240
+[    0.000000] x27: 0000000080000000 x26: 0000000000004000
+[    0.000000] x25: 0000000000000000 x24: ffff000009329028
+[    0.000000] x23: 0000000040000005 x22: ffff000008095c6c
+[    0.000000] x21: ffff0000097f3f70 x20: 0000000000000070
+[    0.000000] x19: ffff0000097f3e30 x18: ffffffffffffffff
+[    0.000000] x17: 0000000000000000 x16: 0000000000000000
+[    0.000000] x15: ffff0000097f9708 x14: ffff000089a382ef
+[    0.000000] x13: ffff000009a382fd x12: ffff000009824000
+[    0.000000] x11: ffff0000097fb7b0 x10: ffff000008730028
+[    0.000000] x9 : ffff000009440018 x8 : 000000000000000d
+[    0.000000] x7 : 6b20676e69686374 x6 : 000000000000003b
+[    0.000000] x5 : 0000000000000000 x4 : ffff000008093600
+[    0.000000] x3 : 0000000400000008 x2 : 7db2e689fc2b8e00
+[    0.000000] x1 : 0000000000000000 x0 : ffff0000097f3e30
+[    0.000000] Kernel panic - not syncing: kernel stack overflow
+[    0.000000] CPU: 0 PID: 0 Comm: swapper Not tainted 4.19.34-lw+ #3
+[    0.000000] Call trace:
+[    0.000000]  dump_backtrace+0x0/0x1b8
+[    0.000000]  show_stack+0x24/0x30
+[    0.000000]  dump_stack+0xa8/0xcc
+[    0.000000]  panic+0x134/0x30c
+[    0.000000]  __stack_chk_fail+0x0/0x28
+[    0.000000]  handle_bad_stack+0xfc/0x108
+[    0.000000]  __bad_stack+0x90/0x94
+[    0.000000]  el1_sync+0x0/0xb8
+[    0.000000]  init_gic_priority_masking+0x4c/0x70
+[    0.000000]  smp_prepare_boot_cpu+0x60/0x68
+[    0.000000]  start_kernel+0x1e8/0x53c
+[    0.000000] ---[ end Kernel panic - not syncing: kernel stack overflow ]---
+
+The reason is init_gic_priority_masking() may unmask PSR.I while the
+irq stacks are not inited yet. Some "NMI" could be raised unfortunately
+and it will just go into this exception.
+
+In this patch, we just write the PMR in smp_prepare_boot_cpu(), and delay
+unmasking PSR.I after irq stacks inited in init_IRQ().
+
+Fixes: e79321883842 ("arm64: Switch to PMR masking when starting CPUs")
+	Cc: Will Deacon <will.deacon@arm.com>
+	Reviewed-by: Marc Zyngier <marc.zyngier@arm.com>
+	Signed-off-by: Wei Li <liwei391@huawei.com>
+[JT: make init_gic_priority_masking() not modify daif, rebase on other
+     priority masking fixes]
+	Signed-off-by: Julien Thierry <julien.thierry@arm.com>
+	Signed-off-by: Catalin Marinas <catalin.marinas@arm.com>
+(cherry picked from commit e1d22385ea6686ff3dcd7092d84465c193849829)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/arm64/kernel/smp.c
+diff --cc arch/arm64/kernel/smp.c
+index 9a5312935440,83cdb0aa2ff1..000000000000
+--- a/arch/arm64/kernel/smp.c
++++ b/arch/arm64/kernel/smp.c
+@@@ -192,11 -192,7 +192,15 @@@ static void init_gic_priority_masking(v
+  
+  	WARN_ON(!(cpuflags & PSR_I_BIT));
+  
+++<<<<<<< HEAD
+ +	gic_write_pmr(GIC_PRIO_IRQOFF);
+ +
+ +	/* We can only unmask PSR.I if we can take aborts */
+ +	if (!(cpuflags & PSR_A_BIT))
+ +		write_sysreg(cpuflags & ~PSR_I_BIT, daif);
+++=======
++ 	gic_write_pmr(GIC_PRIO_IRQON | GIC_PRIO_PSR_I_SET);
+++>>>>>>> e1d22385ea66 (arm64: fix kernel stack overflow in kdump capture kernel)
+  }
+  
+  /*
+diff --git a/arch/arm64/kernel/irq.c b/arch/arm64/kernel/irq.c
+index fdd9cb27fed5..e8daa7aa77bc 100644
+--- a/arch/arm64/kernel/irq.c
++++ b/arch/arm64/kernel/irq.c
+@@ -77,6 +77,15 @@ void __init init_IRQ(void)
+ 	irqchip_init();
+ 	if (!handle_arch_irq)
+ 		panic("No interrupt controller found.");
++
++	if (system_uses_irq_prio_masking()) {
++		/*
++		 * Now that we have a stack for our IRQ handler, set
++		 * the PMR/PSR pair to a consistent state.
++		 */
++		WARN_ON(read_sysreg(daif) & PSR_A_BIT);
++		local_daif_restore(DAIF_PROCCTX_NOIRQ);
++	}
+ }
+ 
+ /*
+* Unmerged path arch/arm64/kernel/smp.c
