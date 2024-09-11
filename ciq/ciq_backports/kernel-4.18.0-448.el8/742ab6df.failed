@@ -1,0 +1,126 @@
+x86/kvm/vmx: Make noinstr clean
+
+jira LE-1907
+cve CVE-2022-29901
+cve CVE-2022-29900
+cve CVE-2022-23825
+cve CVE-2022-23816
+Rebuild_History Non-Buildable kernel-4.18.0-448.el8
+commit-author Peter Zijlstra <peterz@infradead.org>
+commit 742ab6df974ae8384a2dd213db1a3a06cf6d8936
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-448.el8/742ab6df.failed
+
+The recent mmio_stale_data fixes broke the noinstr constraints:
+
+  vmlinux.o: warning: objtool: vmx_vcpu_enter_exit+0x15b: call to wrmsrl.constprop.0() leaves .noinstr.text section
+  vmlinux.o: warning: objtool: vmx_vcpu_enter_exit+0x1bf: call to kvm_arch_has_assigned_device() leaves .noinstr.text section
+
+make it all happy again.
+
+	Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+	Signed-off-by: Borislav Petkov <bp@suse.de>
+(cherry picked from commit 742ab6df974ae8384a2dd213db1a3a06cf6d8936)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kvm/vmx/vmx.c
+diff --cc arch/x86/kvm/vmx/vmx.c
+index 020468feb063,009bbae9ad66..000000000000
+--- a/arch/x86/kvm/vmx/vmx.c
++++ b/arch/x86/kvm/vmx/vmx.c
+@@@ -359,6 -363,60 +359,63 @@@ static int vmentry_l1d_flush_get(char *
+  	return sprintf(s, "%s\n", vmentry_l1d_param[l1tf_vmx_mitigation].option);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static void vmx_setup_fb_clear_ctrl(void)
++ {
++ 	u64 msr;
++ 
++ 	if (boot_cpu_has(X86_FEATURE_ARCH_CAPABILITIES) &&
++ 	    !boot_cpu_has_bug(X86_BUG_MDS) &&
++ 	    !boot_cpu_has_bug(X86_BUG_TAA)) {
++ 		rdmsrl(MSR_IA32_ARCH_CAPABILITIES, msr);
++ 		if (msr & ARCH_CAP_FB_CLEAR_CTRL)
++ 			vmx_fb_clear_ctrl_available = true;
++ 	}
++ }
++ 
++ static __always_inline void vmx_disable_fb_clear(struct vcpu_vmx *vmx)
++ {
++ 	u64 msr;
++ 
++ 	if (!vmx->disable_fb_clear)
++ 		return;
++ 
++ 	msr = __rdmsr(MSR_IA32_MCU_OPT_CTRL);
++ 	msr |= FB_CLEAR_DIS;
++ 	native_wrmsrl(MSR_IA32_MCU_OPT_CTRL, msr);
++ 	/* Cache the MSR value to avoid reading it later */
++ 	vmx->msr_ia32_mcu_opt_ctrl = msr;
++ }
++ 
++ static __always_inline void vmx_enable_fb_clear(struct vcpu_vmx *vmx)
++ {
++ 	if (!vmx->disable_fb_clear)
++ 		return;
++ 
++ 	vmx->msr_ia32_mcu_opt_ctrl &= ~FB_CLEAR_DIS;
++ 	native_wrmsrl(MSR_IA32_MCU_OPT_CTRL, vmx->msr_ia32_mcu_opt_ctrl);
++ }
++ 
++ static void vmx_update_fb_clear_dis(struct kvm_vcpu *vcpu, struct vcpu_vmx *vmx)
++ {
++ 	vmx->disable_fb_clear = vmx_fb_clear_ctrl_available;
++ 
++ 	/*
++ 	 * If guest will not execute VERW, there is no need to set FB_CLEAR_DIS
++ 	 * at VMEntry. Skip the MSR read/write when a guest has no use case to
++ 	 * execute VERW.
++ 	 */
++ 	if ((vcpu->arch.arch_capabilities & ARCH_CAP_FB_CLEAR) ||
++ 	   ((vcpu->arch.arch_capabilities & ARCH_CAP_MDS_NO) &&
++ 	    (vcpu->arch.arch_capabilities & ARCH_CAP_TAA_NO) &&
++ 	    (vcpu->arch.arch_capabilities & ARCH_CAP_PSDP_NO) &&
++ 	    (vcpu->arch.arch_capabilities & ARCH_CAP_FBSDP_NO) &&
++ 	    (vcpu->arch.arch_capabilities & ARCH_CAP_SBDR_SSDP_NO)))
++ 		vmx->disable_fb_clear = false;
++ }
++ 
+++>>>>>>> 742ab6df974a (x86/kvm/vmx: Make noinstr clean)
+  static const struct kernel_param_ops vmentry_l1d_flush_ops = {
+  	.set = vmentry_l1d_flush_set,
+  	.get = vmentry_l1d_flush_get,
+* Unmerged path arch/x86/kvm/vmx/vmx.c
+diff --git a/arch/x86/kvm/x86.c b/arch/x86/kvm/x86.c
+index e4b2e9f4e847..42d6397390ff 100644
+--- a/arch/x86/kvm/x86.c
++++ b/arch/x86/kvm/x86.c
+@@ -12532,9 +12532,9 @@ void kvm_arch_end_assignment(struct kvm *kvm)
+ }
+ EXPORT_SYMBOL_GPL(kvm_arch_end_assignment);
+ 
+-bool kvm_arch_has_assigned_device(struct kvm *kvm)
++bool noinstr kvm_arch_has_assigned_device(struct kvm *kvm)
+ {
+-	return atomic_read(&kvm->arch.assigned_device_count);
++	return arch_atomic_read(&kvm->arch.assigned_device_count);
+ }
+ EXPORT_SYMBOL_GPL(kvm_arch_has_assigned_device);
+ 
+diff --git a/include/linux/kvm_host.h b/include/linux/kvm_host.h
+index aa808a535e4f..eaebea642665 100644
+--- a/include/linux/kvm_host.h
++++ b/include/linux/kvm_host.h
+@@ -1363,7 +1363,7 @@ static inline void kvm_arch_end_assignment(struct kvm *kvm)
+ {
+ }
+ 
+-static inline bool kvm_arch_has_assigned_device(struct kvm *kvm)
++static __always_inline bool kvm_arch_has_assigned_device(struct kvm *kvm)
+ {
+ 	return false;
+ }
