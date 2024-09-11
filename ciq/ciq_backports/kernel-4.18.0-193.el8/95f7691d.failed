@@ -1,0 +1,195 @@
+SUNRPC: Convert xprt receive queue to use an rbtree
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-193.el8
+commit-author Trond Myklebust <trond.myklebust@hammerspace.com>
+commit 95f7691daa57bbd68caac2bdad79e0b08f4d46c1
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-193.el8/95f7691d.failed
+
+If the server is slow, we can find ourselves with quite a lot of entries
+on the receive queue. Converting the search from an O(n) to O(log(n))
+can make a significant difference, particularly since we have to hold
+a number of locks while searching.
+
+	Signed-off-by: Trond Myklebust <trond.myklebust@hammerspace.com>
+(cherry picked from commit 95f7691daa57bbd68caac2bdad79e0b08f4d46c1)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/sunrpc/xprt.h
+#	net/sunrpc/xprt.c
+diff --cc include/linux/sunrpc/xprt.h
+index e7472a422479,9be399020dab..000000000000
+--- a/include/linux/sunrpc/xprt.h
++++ b/include/linux/sunrpc/xprt.h
+@@@ -82,7 -82,14 +82,18 @@@ struct rpc_rqst 
+  	struct page		**rq_enc_pages;	/* scratch pages for use by
+  						   gss privacy code */
+  	void (*rq_release_snd_buf)(struct rpc_rqst *); /* release rq_enc_pages */
+++<<<<<<< HEAD
+ +	struct list_head	rq_list;
+++=======
++ 
++ 	union {
++ 		struct list_head	rq_list;	/* Slot allocation list */
++ 		struct rb_node		rq_recv;	/* Receive queue */
++ 	};
++ 
++ 	struct list_head	rq_xmit;	/* Send queue */
++ 	struct list_head	rq_xmit2;	/* Send queue */
+++>>>>>>> 95f7691daa57 (SUNRPC: Convert xprt receive queue to use an rbtree)
+  
+  	void			*rq_buffer;	/* Call XDR encode buffer */
+  	size_t			rq_callsize;
+@@@ -249,7 -259,8 +260,12 @@@ struct rpc_xprt 
+  	struct list_head	bc_pa_list;	/* List of preallocated
+  						 * backchannel rpc_rqst's */
+  #endif /* CONFIG_SUNRPC_BACKCHANNEL */
+++<<<<<<< HEAD
+ +	struct list_head	recv;
+++=======
++ 
++ 	struct rb_root		recv_queue;	/* Receive queue */
+++>>>>>>> 95f7691daa57 (SUNRPC: Convert xprt receive queue to use an rbtree)
+  
+  	struct {
+  		unsigned long		bind_count,	/* total number of binds */
+diff --cc net/sunrpc/xprt.c
+index 630756a22e78,480461ad0c86..000000000000
+--- a/net/sunrpc/xprt.c
++++ b/net/sunrpc/xprt.c
+@@@ -696,7 -753,7 +696,11 @@@ static voi
+  xprt_schedule_autodisconnect(struct rpc_xprt *xprt)
+  	__must_hold(&xprt->transport_lock)
+  {
+++<<<<<<< HEAD
+ +	if (list_empty(&xprt->recv) && xprt_has_timer(xprt))
+++=======
++ 	if (RB_EMPTY_ROOT(&xprt->recv_queue) && xprt_has_timer(xprt))
+++>>>>>>> 95f7691daa57 (SUNRPC: Convert xprt receive queue to use an rbtree)
+  		mod_timer(&xprt->timer, xprt->last_used + xprt->idle_timeout);
+  }
+  
+@@@ -706,7 -763,7 +710,11 @@@ xprt_init_autodisconnect(struct timer_l
+  	struct rpc_xprt *xprt = from_timer(xprt, t, timer);
+  
+  	spin_lock(&xprt->transport_lock);
+++<<<<<<< HEAD
+ +	if (!list_empty(&xprt->recv))
+++=======
++ 	if (!RB_EMPTY_ROOT(&xprt->recv_queue))
+++>>>>>>> 95f7691daa57 (SUNRPC: Convert xprt receive queue to use an rbtree)
+  		goto out_abort;
+  	/* Reset xprt->last_used to avoid connect/autodisconnect cycling */
+  	xprt->last_used = jiffies;
+@@@ -830,12 -960,12 +907,21 @@@ struct rpc_rqst *xprt_lookup_rqst(struc
+  {
+  	struct rpc_rqst *entry;
+  
+++<<<<<<< HEAD
+ +	list_for_each_entry(entry, &xprt->recv, rq_list)
+ +		if (entry->rq_xid == xid) {
+ +			trace_xprt_lookup_rqst(xprt, xid, 0);
+ +			entry->rq_rtt = ktime_sub(ktime_get(), entry->rq_xtime);
+ +			return entry;
+ +		}
+++=======
++ 	entry = xprt_request_rb_find(xprt, xid);
++ 	if (entry != NULL) {
++ 		trace_xprt_lookup_rqst(xprt, xid, 0);
++ 		entry->rq_rtt = ktime_sub(ktime_get(), entry->rq_xtime);
++ 		return entry;
++ 	}
+++>>>>>>> 95f7691daa57 (SUNRPC: Convert xprt receive queue to use an rbtree)
+  
+  	dprintk("RPC:       xprt_lookup_rqst did not find xid %08x\n",
+  			ntohl(xid));
+@@@ -886,6 -1016,64 +972,67 @@@ static void xprt_wait_on_pinned_rqst(st
+  	wait_var_event(&req->rq_pin, !xprt_is_pinned_rqst(req));
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static bool
++ xprt_request_data_received(struct rpc_task *task)
++ {
++ 	return !test_bit(RPC_TASK_NEED_RECV, &task->tk_runstate) &&
++ 		READ_ONCE(task->tk_rqstp->rq_reply_bytes_recvd) != 0;
++ }
++ 
++ static bool
++ xprt_request_need_enqueue_receive(struct rpc_task *task, struct rpc_rqst *req)
++ {
++ 	return !test_bit(RPC_TASK_NEED_RECV, &task->tk_runstate) &&
++ 		READ_ONCE(task->tk_rqstp->rq_reply_bytes_recvd) == 0;
++ }
++ 
++ /**
++  * xprt_request_enqueue_receive - Add an request to the receive queue
++  * @task: RPC task
++  *
++  */
++ void
++ xprt_request_enqueue_receive(struct rpc_task *task)
++ {
++ 	struct rpc_rqst *req = task->tk_rqstp;
++ 	struct rpc_xprt *xprt = req->rq_xprt;
++ 
++ 	if (!xprt_request_need_enqueue_receive(task, req))
++ 		return;
++ 	spin_lock(&xprt->queue_lock);
++ 
++ 	/* Update the softirq receive buffer */
++ 	memcpy(&req->rq_private_buf, &req->rq_rcv_buf,
++ 			sizeof(req->rq_private_buf));
++ 
++ 	/* Add request to the receive list */
++ 	xprt_request_rb_insert(xprt, req);
++ 	set_bit(RPC_TASK_NEED_RECV, &task->tk_runstate);
++ 	spin_unlock(&xprt->queue_lock);
++ 
++ 	xprt_reset_majortimeo(req);
++ 	/* Turn off autodisconnect */
++ 	del_singleshot_timer_sync(&xprt->timer);
++ }
++ 
++ /**
++  * xprt_request_dequeue_receive_locked - Remove a request from the receive queue
++  * @task: RPC task
++  *
++  * Caller must hold xprt->queue_lock.
++  */
++ static void
++ xprt_request_dequeue_receive_locked(struct rpc_task *task)
++ {
++ 	struct rpc_rqst *req = task->tk_rqstp;
++ 
++ 	if (test_and_clear_bit(RPC_TASK_NEED_RECV, &task->tk_runstate))
++ 		xprt_request_rb_remove(req->rq_xprt, req);
++ }
++ 
+++>>>>>>> 95f7691daa57 (SUNRPC: Convert xprt receive queue to use an rbtree)
+  /**
+   * xprt_update_rtt - Update RPC RTT statistics
+   * @task: RPC request that recently completed
+@@@ -1403,10 -1779,11 +1550,15 @@@ static void xprt_init(struct rpc_xprt *
+  
+  	spin_lock_init(&xprt->transport_lock);
+  	spin_lock_init(&xprt->reserve_lock);
+ -	spin_lock_init(&xprt->queue_lock);
+ +	spin_lock_init(&xprt->recv_lock);
+  
+  	INIT_LIST_HEAD(&xprt->free);
+++<<<<<<< HEAD
+ +	INIT_LIST_HEAD(&xprt->recv);
+++=======
++ 	xprt->recv_queue = RB_ROOT;
++ 	INIT_LIST_HEAD(&xprt->xmit_queue);
+++>>>>>>> 95f7691daa57 (SUNRPC: Convert xprt receive queue to use an rbtree)
+  #if defined(CONFIG_SUNRPC_BACKCHANNEL)
+  	spin_lock_init(&xprt->bc_pa_lock);
+  	INIT_LIST_HEAD(&xprt->bc_pa_list);
+* Unmerged path include/linux/sunrpc/xprt.h
+* Unmerged path net/sunrpc/xprt.c
