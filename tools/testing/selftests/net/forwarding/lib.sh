@@ -248,6 +248,11 @@ busywait()
 	done
 }
 
+wait_for_offload()
+{
+	"$@" | grep -q offload
+}
+
 until_counter_is()
 {
 	local expr=$1; shift
