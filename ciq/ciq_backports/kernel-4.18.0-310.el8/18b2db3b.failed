@@ -1,0 +1,368 @@
+mm: Convert page kmemcg type to a page memcg flag
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-310.el8
+commit-author Roman Gushchin <guro@fb.com>
+commit 18b2db3b0385226b71cb3288474fa5a6e4a45474
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-310.el8/18b2db3b.failed
+
+PageKmemcg flag is currently defined as a page type (like buddy, offline,
+table and guard).  Semantically it means that the page was accounted as a
+kernel memory by the page allocator and has to be uncharged on the
+release.
+
+As a side effect of defining the flag as a page type, the accounted page
+can't be mapped to userspace (look at page_has_type() and comments above).
+In particular, this blocks the accounting of vmalloc-backed memory used
+by some bpf maps, because these maps do map the memory to userspace.
+
+One option is to fix it by complicating the access to page->mapcount,
+which provides some free bits for page->page_type.
+
+But it's way better to move this flag into page->memcg_data flags.
+Indeed, the flag makes no sense without enabled memory cgroups and memory
+cgroup pointer set in particular.
+
+This commit replaces PageKmemcg() and __SetPageKmemcg() with
+PageMemcgKmem() and an open-coded OR operation setting the memcg pointer
+with the MEMCG_DATA_KMEM bit.  __ClearPageKmemcg() can be simple deleted,
+as the whole memcg_data is zeroed at once.
+
+As a bonus, on !CONFIG_MEMCG build the PageMemcgKmem() check will be
+compiled out.
+
+	Signed-off-by: Roman Gushchin <guro@fb.com>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+	Reviewed-by: Shakeel Butt <shakeelb@google.com>
+	Acked-by: Johannes Weiner <hannes@cmpxchg.org>
+	Acked-by: Michal Hocko <mhocko@suse.com>
+Link: https://lkml.kernel.org/r/20201027001657.3398190-5-guro@fb.com
+Link: https://lore.kernel.org/bpf/20201201215900.3569844-5-guro@fb.com
+(cherry picked from commit 18b2db3b0385226b71cb3288474fa5a6e4a45474)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/memcontrol.h
+#	mm/memcontrol.c
+diff --cc include/linux/memcontrol.h
+index 748026eb20df,7c9d43476166..000000000000
+--- a/include/linux/memcontrol.h
++++ b/include/linux/memcontrol.h
+@@@ -408,6 -343,175 +408,178 @@@ struct mem_cgroup 
+  
+  extern struct mem_cgroup *root_mem_cgroup;
+  
+++<<<<<<< HEAD
+++=======
++ enum page_memcg_data_flags {
++ 	/* page->memcg_data is a pointer to an objcgs vector */
++ 	MEMCG_DATA_OBJCGS = (1UL << 0),
++ 	/* page has been accounted as a non-slab kernel page */
++ 	MEMCG_DATA_KMEM = (1UL << 1),
++ 	/* the next bit after the last actual flag */
++ 	__NR_MEMCG_DATA_FLAGS  = (1UL << 2),
++ };
++ 
++ #define MEMCG_DATA_FLAGS_MASK (__NR_MEMCG_DATA_FLAGS - 1)
++ 
++ /*
++  * page_memcg - get the memory cgroup associated with a page
++  * @page: a pointer to the page struct
++  *
++  * Returns a pointer to the memory cgroup associated with the page,
++  * or NULL. This function assumes that the page is known to have a
++  * proper memory cgroup pointer. It's not safe to call this function
++  * against some type of pages, e.g. slab pages or ex-slab pages.
++  *
++  * Any of the following ensures page and memcg binding stability:
++  * - the page lock
++  * - LRU isolation
++  * - lock_page_memcg()
++  * - exclusive reference
++  */
++ static inline struct mem_cgroup *page_memcg(struct page *page)
++ {
++ 	unsigned long memcg_data = page->memcg_data;
++ 
++ 	VM_BUG_ON_PAGE(PageSlab(page), page);
++ 	VM_BUG_ON_PAGE(memcg_data & MEMCG_DATA_OBJCGS, page);
++ 
++ 	return (struct mem_cgroup *)(memcg_data & ~MEMCG_DATA_FLAGS_MASK);
++ }
++ 
++ /*
++  * page_memcg_rcu - locklessly get the memory cgroup associated with a page
++  * @page: a pointer to the page struct
++  *
++  * Returns a pointer to the memory cgroup associated with the page,
++  * or NULL. This function assumes that the page is known to have a
++  * proper memory cgroup pointer. It's not safe to call this function
++  * against some type of pages, e.g. slab pages or ex-slab pages.
++  */
++ static inline struct mem_cgroup *page_memcg_rcu(struct page *page)
++ {
++ 	VM_BUG_ON_PAGE(PageSlab(page), page);
++ 	WARN_ON_ONCE(!rcu_read_lock_held());
++ 
++ 	return (struct mem_cgroup *)(READ_ONCE(page->memcg_data) &
++ 				     ~MEMCG_DATA_FLAGS_MASK);
++ }
++ 
++ /*
++  * page_memcg_check - get the memory cgroup associated with a page
++  * @page: a pointer to the page struct
++  *
++  * Returns a pointer to the memory cgroup associated with the page,
++  * or NULL. This function unlike page_memcg() can take any  page
++  * as an argument. It has to be used in cases when it's not known if a page
++  * has an associated memory cgroup pointer or an object cgroups vector.
++  *
++  * Any of the following ensures page and memcg binding stability:
++  * - the page lock
++  * - LRU isolation
++  * - lock_page_memcg()
++  * - exclusive reference
++  */
++ static inline struct mem_cgroup *page_memcg_check(struct page *page)
++ {
++ 	/*
++ 	 * Because page->memcg_data might be changed asynchronously
++ 	 * for slab pages, READ_ONCE() should be used here.
++ 	 */
++ 	unsigned long memcg_data = READ_ONCE(page->memcg_data);
++ 
++ 	if (memcg_data & MEMCG_DATA_OBJCGS)
++ 		return NULL;
++ 
++ 	return (struct mem_cgroup *)(memcg_data & ~MEMCG_DATA_FLAGS_MASK);
++ }
++ 
++ /*
++  * PageMemcgKmem - check if the page has MemcgKmem flag set
++  * @page: a pointer to the page struct
++  *
++  * Checks if the page has MemcgKmem flag set. The caller must ensure that
++  * the page has an associated memory cgroup. It's not safe to call this function
++  * against some types of pages, e.g. slab pages.
++  */
++ static inline bool PageMemcgKmem(struct page *page)
++ {
++ 	VM_BUG_ON_PAGE(page->memcg_data & MEMCG_DATA_OBJCGS, page);
++ 	return page->memcg_data & MEMCG_DATA_KMEM;
++ }
++ 
++ #ifdef CONFIG_MEMCG_KMEM
++ /*
++  * page_objcgs - get the object cgroups vector associated with a page
++  * @page: a pointer to the page struct
++  *
++  * Returns a pointer to the object cgroups vector associated with the page,
++  * or NULL. This function assumes that the page is known to have an
++  * associated object cgroups vector. It's not safe to call this function
++  * against pages, which might have an associated memory cgroup: e.g.
++  * kernel stack pages.
++  */
++ static inline struct obj_cgroup **page_objcgs(struct page *page)
++ {
++ 	unsigned long memcg_data = READ_ONCE(page->memcg_data);
++ 
++ 	VM_BUG_ON_PAGE(memcg_data && !(memcg_data & MEMCG_DATA_OBJCGS), page);
++ 	VM_BUG_ON_PAGE(memcg_data & MEMCG_DATA_KMEM, page);
++ 
++ 	return (struct obj_cgroup **)(memcg_data & ~MEMCG_DATA_FLAGS_MASK);
++ }
++ 
++ /*
++  * page_objcgs_check - get the object cgroups vector associated with a page
++  * @page: a pointer to the page struct
++  *
++  * Returns a pointer to the object cgroups vector associated with the page,
++  * or NULL. This function is safe to use if the page can be directly associated
++  * with a memory cgroup.
++  */
++ static inline struct obj_cgroup **page_objcgs_check(struct page *page)
++ {
++ 	unsigned long memcg_data = READ_ONCE(page->memcg_data);
++ 
++ 	if (!memcg_data || !(memcg_data & MEMCG_DATA_OBJCGS))
++ 		return NULL;
++ 
++ 	VM_BUG_ON_PAGE(memcg_data & MEMCG_DATA_KMEM, page);
++ 
++ 	return (struct obj_cgroup **)(memcg_data & ~MEMCG_DATA_FLAGS_MASK);
++ }
++ 
++ /*
++  * set_page_objcgs - associate a page with a object cgroups vector
++  * @page: a pointer to the page struct
++  * @objcgs: a pointer to the object cgroups vector
++  *
++  * Atomically associates a page with a vector of object cgroups.
++  */
++ static inline bool set_page_objcgs(struct page *page,
++ 					struct obj_cgroup **objcgs)
++ {
++ 	return !cmpxchg(&page->memcg_data, 0, (unsigned long)objcgs |
++ 			MEMCG_DATA_OBJCGS);
++ }
++ #else
++ static inline struct obj_cgroup **page_objcgs(struct page *page)
++ {
++ 	return NULL;
++ }
++ 
++ static inline struct obj_cgroup **page_objcgs_check(struct page *page)
++ {
++ 	return NULL;
++ }
++ 
++ static inline bool set_page_objcgs(struct page *page,
++ 					struct obj_cgroup **objcgs)
++ {
++ 	return true;
++ }
++ #endif
++ 
+++>>>>>>> 18b2db3b0385 (mm: Convert page kmemcg type to a page memcg flag)
+  static __always_inline bool memcg_stat_item_in_bytes(int idx)
+  {
+  	if (idx == MEMCG_PERCPU_B)
+@@@ -974,6 -1117,27 +1146,30 @@@ void mem_cgroup_split_huge_fixup(struc
+  
+  struct mem_cgroup;
+  
+++<<<<<<< HEAD
+++=======
++ static inline struct mem_cgroup *page_memcg(struct page *page)
++ {
++ 	return NULL;
++ }
++ 
++ static inline struct mem_cgroup *page_memcg_rcu(struct page *page)
++ {
++ 	WARN_ON_ONCE(!rcu_read_lock_held());
++ 	return NULL;
++ }
++ 
++ static inline struct mem_cgroup *page_memcg_check(struct page *page)
++ {
++ 	return NULL;
++ }
++ 
++ static inline bool PageMemcgKmem(struct page *page)
++ {
++ 	return false;
++ }
++ 
+++>>>>>>> 18b2db3b0385 (mm: Convert page kmemcg type to a page memcg flag)
+  static inline bool mem_cgroup_is_root(struct mem_cgroup *memcg)
+  {
+  	return true;
+diff --cc mm/memcontrol.c
+index e4ee0600b869,e0366e306221..000000000000
+--- a/mm/memcontrol.c
++++ b/mm/memcontrol.c
+@@@ -3061,8 -3090,8 +3061,13 @@@ int __memcg_kmem_charge_page(struct pag
+  	if (memcg && !mem_cgroup_is_root(memcg)) {
+  		ret = __memcg_kmem_charge(memcg, gfp, 1 << order);
+  		if (!ret) {
+++<<<<<<< HEAD
+ +			page->mem_cgroup = memcg;
+ +			__SetPageKmemcg(page);
+++=======
++ 			page->memcg_data = (unsigned long)memcg |
++ 				MEMCG_DATA_KMEM;
+++>>>>>>> 18b2db3b0385 (mm: Convert page kmemcg type to a page memcg flag)
+  			return 0;
+  		}
+  		css_put(&memcg->css);
+@@@ -3085,12 -3114,8 +3090,8 @@@ void __memcg_kmem_uncharge_page(struct 
+  
+  	VM_BUG_ON_PAGE(mem_cgroup_is_root(memcg), page);
+  	__memcg_kmem_uncharge(memcg, nr_pages);
+ -	page->memcg_data = 0;
+ +	page->mem_cgroup = NULL;
+  	css_put(&memcg->css);
+- 
+- 	/* slab pages do not have PageKmemcg flag set */
+- 	if (PageKmemcg(page))
+- 		__ClearPageKmemcg(page);
+  }
+  
+  static bool consume_obj_stock(struct obj_cgroup *objcg, unsigned int nr_bytes)
+@@@ -6855,15 -6873,13 +6856,13 @@@ static void uncharge_page(struct page *
+  	nr_pages = compound_nr(page);
+  	ug->nr_pages += nr_pages;
+  
+- 	if (!PageKmemcg(page)) {
+- 		ug->pgpgout++;
+- 	} else {
++ 	if (PageMemcgKmem(page))
+  		ug->nr_kmem += nr_pages;
+- 		__ClearPageKmemcg(page);
+- 	}
++ 	else
++ 		ug->pgpgout++;
+  
+  	ug->dummy_page = page;
+ -	page->memcg_data = 0;
+ +	page->mem_cgroup = NULL;
+  	css_put(&ug->memcg->css);
+  }
+  
+* Unmerged path include/linux/memcontrol.h
+diff --git a/include/linux/page-flags.h b/include/linux/page-flags.h
+index d7900e66cc8e..9443f8a43236 100644
+--- a/include/linux/page-flags.h
++++ b/include/linux/page-flags.h
+@@ -706,9 +706,8 @@ PAGEFLAG_FALSE(DoubleMap)
+ #define PAGE_MAPCOUNT_RESERVE	-128
+ #define PG_buddy	0x00000080
+ #define PG_offline	0x00000100
+-#define PG_kmemcg	0x00000200
+-#define PG_table	0x00000400
+-#define PG_guard	0x00000800
++#define PG_table	0x00000200
++#define PG_guard	0x00000400
+ 
+ #define PageType(page, flag)						\
+ 	((page->page_type & (PAGE_TYPE_BASE | flag)) == PAGE_TYPE_BASE)
+@@ -749,12 +748,6 @@ PAGE_TYPE_OPS(Buddy, buddy)
+  */
+ PAGE_TYPE_OPS(Offline, offline)
+ 
+-/*
+- * If kmemcg is enabled, the buddy allocator will set PageKmemcg() on
+- * pages allocated with __GFP_ACCOUNT. It gets cleared on page free.
+- */
+-PAGE_TYPE_OPS(Kmemcg, kmemcg)
+-
+ /*
+  * Marks pages in use as page tables.
+  */
+* Unmerged path mm/memcontrol.c
+diff --git a/mm/page_alloc.c b/mm/page_alloc.c
+index 8c7425895151..43115fec038a 100644
+--- a/mm/page_alloc.c
++++ b/mm/page_alloc.c
+@@ -1183,7 +1183,7 @@ static __always_inline bool free_pages_prepare(struct page *page,
+ 		 * Do not let hwpoison pages hit pcplists/buddy
+ 		 * Untie memcg state and reset page's owner
+ 		 */
+-		if (memcg_kmem_enabled() && PageKmemcg(page))
++		if (memcg_kmem_enabled() && PageMemcgKmem(page))
+ 			__memcg_kmem_uncharge_page(page, order);
+ 		reset_page_owner(page, order);
+ 		return false;
+@@ -1213,7 +1213,7 @@ static __always_inline bool free_pages_prepare(struct page *page,
+ 	}
+ 	if (PageMappingFlags(page))
+ 		page->mapping = NULL;
+-	if (memcg_kmem_enabled() && PageKmemcg(page))
++	if (memcg_kmem_enabled() && PageMemcgKmem(page))
+ 		__memcg_kmem_uncharge_page(page, order);
+ 	if (check_free)
+ 		bad += check_free_page(page);
