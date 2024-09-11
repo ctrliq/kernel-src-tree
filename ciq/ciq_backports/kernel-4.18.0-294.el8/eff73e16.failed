@@ -1,0 +1,146 @@
+s390/qeth: tolerate pre-filled RX buffer
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Julian Wiedmann <jwi@linux.ibm.com>
+commit eff73e16ee116f6eafa2be48fab42659a27cb453
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/eff73e16.failed
+
+When preparing a buffer for RX refill, tolerate that it already has a
+pool_entry attached. Otherwise we could easily leak such a pool_entry
+when re-driving the RX refill after an error (from eg. do_qdio()).
+
+This needs some minor adjustment in the code that drains RX buffer(s)
+prior to RX refill and during teardown, so that ->pool_entry is NULLed
+accordingly.
+
+Fixes: 4a71df50047f ("qeth: new qeth device driver")
+	Signed-off-by: Julian Wiedmann <jwi@linux.ibm.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit eff73e16ee116f6eafa2be48fab42659a27cb453)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/s390/net/qeth_core_main.c
+diff --cc drivers/s390/net/qeth_core_main.c
+index 245ab75ddf53,b356ee5de9f8..000000000000
+--- a/drivers/s390/net/qeth_core_main.c
++++ b/drivers/s390/net/qeth_core_main.c
+@@@ -5515,51 -5760,74 +5522,79 @@@ int qeth_poll(struct napi_struct *napi
+  				card->rx.b_count = 0;
+  				break;
+  			}
+++<<<<<<< HEAD
+ +			card->rx.b_element =
+ +				&card->qdio.in_q->bufs[card->rx.b_index]
+ +				.buffer->element[0];
+++=======
++ 		}
++ 
++ 		/* Process one completed RX buffer: */
++ 		buffer = &card->qdio.in_q->bufs[card->rx.b_index];
++ 		if (!(card->rx.qdio_err &&
++ 		      qeth_check_qdio_errors(card, buffer->buffer,
++ 					     card->rx.qdio_err, "qinerr")))
++ 			skbs_done = qeth_extract_skbs(card, budget, buffer,
++ 						      &done);
++ 		else
++ 			done = true;
++ 
++ 		work_done += skbs_done;
++ 		budget -= skbs_done;
++ 
++ 		if (done) {
++ 			QETH_CARD_STAT_INC(card, rx_bufs);
++ 			qeth_put_buffer_pool_entry(card, buffer->pool_entry);
++ 			buffer->pool_entry = NULL;
++ 			qeth_queue_input_buffer(card, card->rx.b_index);
++ 			card->rx.b_count--;
++ 
++ 			/* Step forward to next buffer: */
++ 			card->rx.b_index = QDIO_BUFNR(card->rx.b_index + 1);
++ 			card->rx.buf_element = 0;
+++>>>>>>> eff73e16ee11 (s390/qeth: tolerate pre-filled RX buffer)
+  			card->rx.e_offset = 0;
+  		}
+ -	}
+ -
+ -	return work_done;
+ -}
+ -
+ -static void qeth_cq_poll(struct qeth_card *card)
+ -{
+ -	unsigned int work_done = 0;
+ -
+ -	while (work_done < QDIO_MAX_BUFFERS_PER_Q) {
+ -		unsigned int start, error;
+ -		int completed;
+  
+ -		completed = qdio_inspect_queue(CARD_DDEV(card), 1, true, &start,
+ -					       &error);
+ -		if (completed <= 0)
+ -			return;
+ +		while (card->rx.b_count) {
+ +			buffer = &card->qdio.in_q->bufs[card->rx.b_index];
+ +			if (!(card->rx.qdio_err &&
+ +			    qeth_check_qdio_errors(card, buffer->buffer,
+ +			    card->rx.qdio_err, "qinerr")))
+ +				work_done +=
+ +					card->discipline->process_rx_buffer(
+ +						card, new_budget, &done);
+ +			else
+ +				done = 1;
+ +
+ +			if (done) {
+ +				QETH_CARD_STAT_INC(card, rx_bufs);
+ +				qeth_put_buffer_pool_entry(card,
+ +					buffer->pool_entry);
+ +				qeth_queue_input_buffer(card, card->rx.b_index);
+ +				card->rx.b_count--;
+ +				if (card->rx.b_count) {
+ +					card->rx.b_index =
+ +						QDIO_BUFNR(card->rx.b_index + 1);
+ +					card->rx.b_element =
+ +						&card->qdio.in_q
+ +						->bufs[card->rx.b_index]
+ +						.buffer->element[0];
+ +					card->rx.e_offset = 0;
+ +				}
+ +			}
+  
+ -		qeth_qdio_cq_handler(card, error, 1, start, completed);
+ -		work_done += completed;
+ +			if (work_done >= budget)
+ +				goto out;
+ +			else
+ +				new_budget = budget - work_done;
+ +		}
+  	}
+ -}
+ -
+ -int qeth_poll(struct napi_struct *napi, int budget)
+ -{
+ -	struct qeth_card *card = container_of(napi, struct qeth_card, napi);
+ -	unsigned int work_done;
+ -
+ -	work_done = qeth_rx_poll(card, budget);
+ -
+ -	if (card->options.cq == QETH_CQ_ENABLED)
+ -		qeth_cq_poll(card);
+ -
+ -	/* Exhausted the RX budget. Keep IRQ disabled, we get called again. */
+ -	if (budget && work_done >= budget)
+ -		return work_done;
+  
+  	if (napi_complete_done(napi, work_done) &&
+ -	    qdio_start_irq(CARD_DDEV(card)))
+ +	    qdio_start_irq(CARD_DDEV(card), 0))
+  		napi_schedule(napi);
+ -
+ +out:
+  	return work_done;
+  }
+  EXPORT_SYMBOL_GPL(qeth_poll);
+* Unmerged path drivers/s390/net/qeth_core_main.c
