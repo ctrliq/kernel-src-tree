@@ -1,0 +1,208 @@
+irqdomain/treewide: Keep firmware node unconditionally allocated
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-408.el8
+commit-author Thomas Gleixner <tglx@linutronix.de>
+commit e3beca48a45b5e0e6e6a4e0124276b8248dcc9bb
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-408.el8/e3beca48.failed
+
+Quite some non OF/ACPI users of irqdomains allocate firmware nodes of type
+IRQCHIP_FWNODE_NAMED or IRQCHIP_FWNODE_NAMED_ID and free them right after
+creating the irqdomain. The only purpose of these FW nodes is to convey
+name information. When this was introduced the core code did not store the
+pointer to the node in the irqdomain. A recent change stored the firmware
+node pointer in irqdomain for other reasons and missed to notice that the
+usage sites which do the alloc_fwnode/create_domain/free_fwnode sequence
+are broken by this. Storing a dangling pointer is dangerous itself, but in
+case that the domain is destroyed later on this leads to a double free.
+
+Remove the freeing of the firmware node after creating the irqdomain from
+all affected call sites to cure this.
+
+Fixes: 711419e504eb ("irqdomain: Add the missing assignment of domain->fwnode for named fwnode")
+	Reported-by: Andy Shevchenko <andriy.shevchenko@linux.intel.com>
+	Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+	Acked-by: Bjorn Helgaas <bhelgaas@google.com>
+	Acked-by: Marc Zyngier <maz@kernel.org>
+	Cc: stable@vger.kernel.org
+Link: https://lkml.kernel.org/r/873661qakd.fsf@nanos.tec.linutronix.de
+
+(cherry picked from commit e3beca48a45b5e0e6e6a4e0124276b8248dcc9bb)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/mips/pci/pci-xtalk-bridge.c
+#	drivers/mfd/ioc3.c
+* Unmerged path arch/mips/pci/pci-xtalk-bridge.c
+* Unmerged path drivers/mfd/ioc3.c
+* Unmerged path arch/mips/pci/pci-xtalk-bridge.c
+diff --git a/arch/x86/kernel/apic/io_apic.c b/arch/x86/kernel/apic/io_apic.c
+index 0ef537be9520..6925904c7c48 100644
+--- a/arch/x86/kernel/apic/io_apic.c
++++ b/arch/x86/kernel/apic/io_apic.c
+@@ -2345,12 +2345,12 @@ static int mp_irqdomain_create(int ioapic)
+ 	ip->irqdomain = irq_domain_create_linear(fn, hwirqs, cfg->ops,
+ 						 (void *)(long)ioapic);
+ 
+-	/* Release fw handle if it was allocated above */
+-	if (!cfg->dev)
+-		irq_domain_free_fwnode(fn);
+-
+-	if (!ip->irqdomain)
++	if (!ip->irqdomain) {
++		/* Release fw handle if it was allocated above */
++		if (!cfg->dev)
++			irq_domain_free_fwnode(fn);
+ 		return -ENOMEM;
++	}
+ 
+ 	ip->irqdomain->parent = parent;
+ 
+diff --git a/arch/x86/kernel/apic/msi.c b/arch/x86/kernel/apic/msi.c
+index f3ecf25fec59..14afa0c32202 100644
+--- a/arch/x86/kernel/apic/msi.c
++++ b/arch/x86/kernel/apic/msi.c
+@@ -236,12 +236,13 @@ void __init arch_init_msi_domain(struct irq_domain *parent)
+ 		msi_default_domain =
+ 			pci_msi_create_irq_domain(fn, &pci_msi_domain_info,
+ 						  parent);
+-		irq_domain_free_fwnode(fn);
+ 	}
+-	if (!msi_default_domain)
++	if (!msi_default_domain) {
++		irq_domain_free_fwnode(fn);
+ 		pr_warn("failed to initialize irqdomain for MSI/MSI-x.\n");
+-	else
++	} else {
+ 		msi_default_domain->flags |= IRQ_DOMAIN_MSI_NOMASK_QUIRK;
++	}
+ }
+ 
+ #ifdef CONFIG_IRQ_REMAP
+@@ -274,7 +275,8 @@ struct irq_domain *arch_create_remap_msi_irq_domain(struct irq_domain *parent,
+ 	if (!fn)
+ 		return NULL;
+ 	d = pci_msi_create_irq_domain(fn, &pci_msi_ir_domain_info, parent);
+-	irq_domain_free_fwnode(fn);
++	if (!d)
++		irq_domain_free_fwnode(fn);
+ 	return d;
+ }
+ #endif
+@@ -348,7 +350,8 @@ static struct irq_domain *dmar_get_irq_domain(void)
+ 	if (fn) {
+ 		dmar_domain = msi_create_irq_domain(fn, &dmar_msi_domain_info,
+ 						    x86_vector_domain);
+-		irq_domain_free_fwnode(fn);
++		if (!dmar_domain)
++			irq_domain_free_fwnode(fn);
+ 	}
+ out:
+ 	mutex_unlock(&dmar_lock);
+@@ -472,7 +475,10 @@ struct irq_domain *hpet_create_irq_domain(int hpet_id)
+ 	}
+ 
+ 	d = msi_create_irq_domain(fn, domain_info, parent);
+-	irq_domain_free_fwnode(fn);
++	if (!d) {
++		irq_domain_free_fwnode(fn);
++		kfree(domain_info);
++	}
+ 	return d;
+ }
+ 
+diff --git a/arch/x86/kernel/apic/vector.c b/arch/x86/kernel/apic/vector.c
+index 59bfa6f40ab4..fb1af794a362 100644
+--- a/arch/x86/kernel/apic/vector.c
++++ b/arch/x86/kernel/apic/vector.c
+@@ -724,7 +724,6 @@ int __init arch_early_irq_init(void)
+ 	x86_vector_domain = irq_domain_create_tree(fn, &x86_vector_domain_ops,
+ 						   NULL);
+ 	BUG_ON(x86_vector_domain == NULL);
+-	irq_domain_free_fwnode(fn);
+ 	irq_set_default_host(x86_vector_domain);
+ 
+ 	arch_init_msi_domain(x86_vector_domain);
+diff --git a/arch/x86/platform/uv/uv_irq.c b/arch/x86/platform/uv/uv_irq.c
+index 612e92416955..e3e4881d2314 100644
+--- a/arch/x86/platform/uv/uv_irq.c
++++ b/arch/x86/platform/uv/uv_irq.c
+@@ -167,9 +167,10 @@ static struct irq_domain *uv_get_irq_domain(void)
+ 		goto out;
+ 
+ 	uv_domain = irq_domain_create_tree(fn, &uv_domain_ops, NULL);
+-	irq_domain_free_fwnode(fn);
+ 	if (uv_domain)
+ 		uv_domain->parent = x86_vector_domain;
++	else
++		irq_domain_free_fwnode(fn);
+ out:
+ 	mutex_unlock(&uv_lock);
+ 
+diff --git a/drivers/iommu/amd/iommu.c b/drivers/iommu/amd/iommu.c
+index 5958b4ca6282..8ca415ff9d2a 100644
+--- a/drivers/iommu/amd/iommu.c
++++ b/drivers/iommu/amd/iommu.c
+@@ -3547,9 +3547,10 @@ int amd_iommu_create_irq_domain(struct amd_iommu *iommu)
+ 	if (!fn)
+ 		return -ENOMEM;
+ 	iommu->ir_domain = irq_domain_create_tree(fn, &amd_ir_domain_ops, iommu);
+-	irq_domain_free_fwnode(fn);
+-	if (!iommu->ir_domain)
++	if (!iommu->ir_domain) {
++		irq_domain_free_fwnode(fn);
+ 		return -ENOMEM;
++	}
+ 
+ 	iommu->ir_domain->parent = arch_get_ir_parent_domain();
+ 	iommu->msi_domain = arch_create_remap_msi_irq_domain(iommu->ir_domain,
+diff --git a/drivers/iommu/hyperv-iommu.c b/drivers/iommu/hyperv-iommu.c
+index a5189cadc523..164fe3c786a4 100644
+--- a/drivers/iommu/hyperv-iommu.c
++++ b/drivers/iommu/hyperv-iommu.c
+@@ -156,7 +156,10 @@ static int __init hyperv_prepare_irq_remapping(void)
+ 				0, IOAPIC_REMAPPING_ENTRY, fn,
+ 				&hyperv_ir_domain_ops, NULL);
+ 
+-	irq_domain_free_fwnode(fn);
++	if (!ioapic_ir_domain) {
++		irq_domain_free_fwnode(fn);
++		return -ENOMEM;
++	}
+ 
+ 	/*
+ 	 * Hyper-V doesn't provide irq remapping function for
+diff --git a/drivers/iommu/intel/irq_remapping.c b/drivers/iommu/intel/irq_remapping.c
+index b9288dea5302..373ae952d70c 100644
+--- a/drivers/iommu/intel/irq_remapping.c
++++ b/drivers/iommu/intel/irq_remapping.c
+@@ -570,8 +570,8 @@ static int intel_setup_irq_remapping(struct intel_iommu *iommu)
+ 					    0, INTR_REMAP_TABLE_ENTRIES,
+ 					    fn, &intel_ir_domain_ops,
+ 					    iommu);
+-	irq_domain_free_fwnode(fn);
+ 	if (!iommu->ir_domain) {
++		irq_domain_free_fwnode(fn);
+ 		pr_err("IR%d: failed to allocate irqdomain\n", iommu->seq_id);
+ 		goto out_free_bitmap;
+ 	}
+* Unmerged path drivers/mfd/ioc3.c
+diff --git a/drivers/pci/controller/vmd.c b/drivers/pci/controller/vmd.c
+index a76b73a266d1..3e3d61002b96 100644
+--- a/drivers/pci/controller/vmd.c
++++ b/drivers/pci/controller/vmd.c
+@@ -587,9 +587,10 @@ static int vmd_enable_domain(struct vmd_dev *vmd, unsigned long features)
+ 
+ 	vmd->irq_domain = pci_msi_create_irq_domain(fn, &vmd_msi_domain_info,
+ 						    x86_vector_domain);
+-	irq_domain_free_fwnode(fn);
+-	if (!vmd->irq_domain)
++	if (!vmd->irq_domain) {
++		irq_domain_free_fwnode(fn);
+ 		return -ENODEV;
++	}
+ 
+ 	pci_add_resource(&resources, &vmd->resources[0]);
+ 	pci_add_resource_offset(&resources, &vmd->resources[1], offset[0]);
