@@ -392,12 +392,12 @@ static inline bool nested_npt_enabled(struct vcpu_svm *svm)
  * if we are emulating VM-Entry into a guest with NPT enabled.
  */
 static int nested_svm_load_cr3(struct kvm_vcpu *vcpu, unsigned long cr3,
-			       bool nested_npt)
+			       bool nested_npt, bool reload_pdptrs)
 {
 	if (CC(kvm_vcpu_is_illegal_gpa(vcpu, cr3)))
 		return -EINVAL;
 
-	if (!nested_npt && is_pae_paging(vcpu) &&
+	if (reload_pdptrs && !nested_npt && is_pae_paging(vcpu) &&
 	    CC(!load_pdptrs(vcpu, vcpu->arch.walk_mmu, cr3)))
 		return -EINVAL;
 
@@ -585,7 +585,7 @@ int enter_svm_guest_mode(struct kvm_vcpu *vcpu, u64 vmcb12_gpa,
 	nested_vmcb02_prepare_save(svm, vmcb12);
 
 	ret = nested_svm_load_cr3(&svm->vcpu, vmcb12->save.cr3,
-				  nested_npt_enabled(svm));
+				  nested_npt_enabled(svm), true);
 	if (ret)
 		return ret;
 
@@ -838,7 +838,7 @@ int nested_svm_vmexit(struct vcpu_svm *svm)
 
 	nested_svm_uninit_mmu_context(vcpu);
 
-	rc = nested_svm_load_cr3(vcpu, svm->vmcb->save.cr3, false);
+	rc = nested_svm_load_cr3(vcpu, svm->vmcb->save.cr3, false, true);
 	if (rc)
 		return 1;
 
@@ -1335,6 +1335,19 @@ static int svm_set_nested_state(struct kvm_vcpu *vcpu,
 		goto out_free;
 
 	/*
+	 * While the nested guest CR3 is already checked and set by
+	 * KVM_SET_SREGS, it was set when nested state was yet loaded,
+	 * thus MMU might not be initialized correctly.
+	 * Set it again to fix this.
+	 */
+
+	ret = nested_svm_load_cr3(&svm->vcpu, vcpu->arch.cr3,
+				  nested_npt_enabled(svm), false);
+	if (WARN_ON_ONCE(ret))
+		goto out_free;
+
+
+	/*
 	 * All checks done, we can enter guest mode. Userspace provides
 	 * vmcb12.control, which will be combined with L1 and stored into
 	 * vmcb02, and the L1 save state which we store in vmcb01.
@@ -1374,9 +1387,14 @@ static bool svm_get_nested_state_pages(struct kvm_vcpu *vcpu)
 	if (WARN_ON(!is_guest_mode(vcpu)))
 		return true;
 
-	if (nested_svm_load_cr3(&svm->vcpu, vcpu->arch.cr3,
-				nested_npt_enabled(svm)))
-		return false;
+	if (!nested_npt_enabled(svm) && is_pae_paging(vcpu))
+		/*
+		 * Reload the guest's PDPTRs since after a migration
+		 * the guest CR3 might be restored prior to setting the nested
+		 * state which can lead to a load of wrong PDPTRs.
+		 */
+		if (CC(!load_pdptrs(vcpu, vcpu->arch.walk_mmu, vcpu->arch.cr3)))
+			return false;
 
 	if (!nested_svm_vmrun_msrpm(svm)) {
 		vcpu->run->exit_reason = KVM_EXIT_INTERNAL_ERROR;
