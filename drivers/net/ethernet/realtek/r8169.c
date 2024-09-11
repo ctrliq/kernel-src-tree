@@ -3368,6 +3368,12 @@ static void rtl8411_hw_phy_config(struct rtl8169_private *tp)
 	rtl_writephy(tp, 0x1f, 0x0000);
 }
 
+static void rtl8168g_disable_aldps(struct rtl8169_private *tp)
+{
+	phy_write(tp->phydev, 0x1f, 0x0a43);
+	phy_clear_bits(tp->phydev, 0x10, BIT(2));
+}
+
 static void rtl8168g_1_hw_phy_config(struct rtl8169_private *tp)
 {
 	rtl_apply_firmware(tp);
@@ -3426,10 +3432,7 @@ static void rtl8168g_1_hw_phy_config(struct rtl8169_private *tp)
 	rtl_writephy(tp, 0x14, 0x9065);
 	rtl_writephy(tp, 0x14, 0x1065);
 
-	/* Check ALDPS bit, disable it if enabled */
-	rtl_writephy(tp, 0x1f, 0x0a43);
-	if (rtl_readphy(tp, 0x10) & 0x0004)
-		rtl_w0w1_phy(tp, 0x10, 0x0000, 0x0004);
+	rtl8168g_disable_aldps(tp);
 
 	rtl_writephy(tp, 0x1f, 0x0000);
 }
@@ -3541,10 +3544,7 @@ static void rtl8168h_1_hw_phy_config(struct rtl8169_private *tp)
 	rtl_w0w1_phy(tp, 0x11, 0x0000, 0x0080);
 	rtl_writephy(tp, 0x1f, 0x0000);
 
-	/* Check ALDPS bit, disable it if enabled */
-	rtl_writephy(tp, 0x1f, 0x0a43);
-	if (rtl_readphy(tp, 0x10) & 0x0004)
-		rtl_w0w1_phy(tp, 0x10, 0x0000, 0x0004);
+	rtl8168g_disable_aldps(tp);
 
 	rtl_writephy(tp, 0x1f, 0x0000);
 }
@@ -3614,10 +3614,7 @@ static void rtl8168h_2_hw_phy_config(struct rtl8169_private *tp)
 	rtl_w0w1_phy(tp, 0x11, 0x0000, 0x0080);
 	rtl_writephy(tp, 0x1f, 0x0000);
 
-	/* Check ALDPS bit, disable it if enabled */
-	rtl_writephy(tp, 0x1f, 0x0a43);
-	if (rtl_readphy(tp, 0x10) & 0x0004)
-		rtl_w0w1_phy(tp, 0x10, 0x0000, 0x0004);
+	rtl8168g_disable_aldps(tp);
 
 	rtl_writephy(tp, 0x1f, 0x0000);
 }
@@ -3656,10 +3653,7 @@ static void rtl8168ep_1_hw_phy_config(struct rtl8169_private *tp)
 	rtl_w0w1_phy(tp, 0x11, 0x4000, 0x2000);
 	rtl_writephy(tp, 0x1f, 0x0000);
 
-	/* Check ALDPS bit, disable it if enabled */
-	rtl_writephy(tp, 0x1f, 0x0a43);
-	if (rtl_readphy(tp, 0x10) & 0x0004)
-		rtl_w0w1_phy(tp, 0x10, 0x0000, 0x0004);
+	rtl8168g_disable_aldps(tp);
 
 	rtl_writephy(tp, 0x1f, 0x0000);
 }
@@ -3747,10 +3741,7 @@ static void rtl8168ep_2_hw_phy_config(struct rtl8169_private *tp)
 	rtl_writephy(tp, 0x14, 0x1065);
 	rtl_writephy(tp, 0x1f, 0x0000);
 
-	/* Check ALDPS bit, disable it if enabled */
-	rtl_writephy(tp, 0x1f, 0x0a43);
-	if (rtl_readphy(tp, 0x10) & 0x0004)
-		rtl_w0w1_phy(tp, 0x10, 0x0000, 0x0004);
+	rtl8168g_disable_aldps(tp);
 
 	rtl_writephy(tp, 0x1f, 0x0000);
 }
