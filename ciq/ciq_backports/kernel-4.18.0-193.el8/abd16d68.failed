@@ -1,0 +1,213 @@
+x86/fpu: Use a feature number instead of mask in two more helpers
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-193.el8
+commit-author Sebastian Andrzej Siewior <bigeasy@linutronix.de>
+commit abd16d68d65229e5acafdadc32704239131bf2ea
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-193.el8/abd16d68.failed
+
+After changing the argument of __raw_xsave_addr() from a mask to
+number Dave suggested to check if it makes sense to do the same for
+get_xsave_addr(). As it turns out it does.
+
+Only get_xsave_addr() needs the mask to check if the requested feature
+is part of what is supported/saved and then uses the number again. The
+shift operation is cheaper compared to fls64() (find last bit set).
+Also, the feature number uses less opcode space compared to the mask. :)
+
+Make the get_xsave_addr() argument a xfeature number instead of a mask
+and fix up its callers.
+
+Furthermore, use xfeature_nr and xfeature_mask consistently.
+
+This results in the following changes to the kvm code:
+
+  feature -> xfeature_mask
+  index -> xfeature_nr
+
+	Suggested-by: Dave Hansen <dave.hansen@linux.intel.com>
+	Signed-off-by: Sebastian Andrzej Siewior <bigeasy@linutronix.de>
+	Signed-off-by: Borislav Petkov <bp@suse.de>
+	Reviewed-by: Dave Hansen <dave.hansen@intel.com>
+	Reviewed-by: Thomas Gleixner <tglx@linutronix.de>
+	Cc: Andy Lutomirski <luto@kernel.org>
+	Cc: "Eric W. Biederman" <ebiederm@xmission.com>
+	Cc: "H. Peter Anvin" <hpa@zytor.com>
+	Cc: Ingo Molnar <mingo@redhat.com>
+	Cc: Jann Horn <jannh@google.com>
+	Cc: "Jason A. Donenfeld" <Jason@zx2c4.com>
+	Cc: kvm ML <kvm@vger.kernel.org>
+	Cc: Masami Hiramatsu <mhiramat@kernel.org>
+	Cc: Paolo Bonzini <pbonzini@redhat.com>
+	Cc: Peter Zijlstra <peterz@infradead.org>
+	Cc: "Radim Krčmář" <rkrcmar@redhat.com>
+	Cc: Rasmus Villemoes <linux@rasmusvillemoes.dk>
+	Cc: Rik van Riel <riel@surriel.com>
+	Cc: Sergey Senozhatsky <sergey.senozhatsky@gmail.com>
+	Cc: Siarhei Liakh <Siarhei.Liakh@concurrent-rt.com>
+	Cc: x86-ml <x86@kernel.org>
+Link: https://lkml.kernel.org/r/20190403164156.19645-12-bigeasy@linutronix.de
+(cherry picked from commit abd16d68d65229e5acafdadc32704239131bf2ea)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kernel/fpu/xstate.c
+diff --cc arch/x86/kernel/fpu/xstate.c
+index 87a57b7642d3,9c459fd1d38e..000000000000
+--- a/arch/x86/kernel/fpu/xstate.c
++++ b/arch/x86/kernel/fpu/xstate.c
+@@@ -866,10 -862,10 +866,14 @@@ void *get_xsave_addr(struct xregs_stat
+  	 * or because the "init optimization" caused it
+  	 * to not be saved.
+  	 */
+- 	if (!(xsave->header.xfeatures & xstate_feature))
++ 	if (!(xsave->header.xfeatures & BIT_ULL(xfeature_nr)))
+  		return NULL;
+  
+++<<<<<<< HEAD
+ +	return __raw_xsave_addr(xsave, xstate_feature);
+++=======
++ 	return __raw_xsave_addr(xsave, xfeature_nr);
+++>>>>>>> abd16d68d652 (x86/fpu: Use a feature number instead of mask in two more helpers)
+  }
+  EXPORT_SYMBOL_GPL(get_xsave_addr);
+  
+diff --git a/arch/x86/include/asm/fpu/xstate.h b/arch/x86/include/asm/fpu/xstate.h
+index 48581988d78c..fbe41f808e5d 100644
+--- a/arch/x86/include/asm/fpu/xstate.h
++++ b/arch/x86/include/asm/fpu/xstate.h
+@@ -46,8 +46,8 @@ extern void __init update_regset_xstate_info(unsigned int size,
+ 					     u64 xstate_mask);
+ 
+ void fpu__xstate_clear_all_cpu_caps(void);
+-void *get_xsave_addr(struct xregs_state *xsave, int xstate);
+-const void *get_xsave_field_ptr(int xstate_field);
++void *get_xsave_addr(struct xregs_state *xsave, int xfeature_nr);
++const void *get_xsave_field_ptr(int xfeature_nr);
+ int using_compacted_format(void);
+ int copy_xstate_to_kernel(void *kbuf, struct xregs_state *xsave, unsigned int offset, unsigned int size);
+ int copy_xstate_to_user(void __user *ubuf, struct xregs_state *xsave, unsigned int offset, unsigned int size);
+* Unmerged path arch/x86/kernel/fpu/xstate.c
+diff --git a/arch/x86/kernel/traps.c b/arch/x86/kernel/traps.c
+index e60fdb56292f..a67289c733d3 100644
+--- a/arch/x86/kernel/traps.c
++++ b/arch/x86/kernel/traps.c
+@@ -455,7 +455,7 @@ dotraplinkage void do_bounds(struct pt_regs *regs, long error_code)
+ 	 * which is all zeros which indicates MPX was not
+ 	 * responsible for the exception.
+ 	 */
+-	bndcsr = get_xsave_field_ptr(XFEATURE_MASK_BNDCSR);
++	bndcsr = get_xsave_field_ptr(XFEATURE_BNDCSR);
+ 	if (!bndcsr)
+ 		goto exit_trap;
+ 
+diff --git a/arch/x86/kvm/x86.c b/arch/x86/kvm/x86.c
+index e45a5f0a3c94..2d0fd7a1ac66 100644
+--- a/arch/x86/kvm/x86.c
++++ b/arch/x86/kvm/x86.c
+@@ -3681,15 +3681,15 @@ static void fill_xsave(u8 *dest, struct kvm_vcpu *vcpu)
+ 	 */
+ 	valid = xstate_bv & ~XFEATURE_MASK_FPSSE;
+ 	while (valid) {
+-		u64 feature = valid & -valid;
+-		int index = fls64(feature) - 1;
+-		void *src = get_xsave_addr(xsave, feature);
++		u64 xfeature_mask = valid & -valid;
++		int xfeature_nr = fls64(xfeature_mask) - 1;
++		void *src = get_xsave_addr(xsave, xfeature_nr);
+ 
+ 		if (src) {
+ 			u32 size, offset, ecx, edx;
+-			cpuid_count(XSTATE_CPUID, index,
++			cpuid_count(XSTATE_CPUID, xfeature_nr,
+ 				    &size, &offset, &ecx, &edx);
+-			if (feature == XFEATURE_MASK_PKRU)
++			if (xfeature_nr == XFEATURE_PKRU)
+ 				memcpy(dest + offset, &vcpu->arch.pkru,
+ 				       sizeof(vcpu->arch.pkru));
+ 			else
+@@ -3697,7 +3697,7 @@ static void fill_xsave(u8 *dest, struct kvm_vcpu *vcpu)
+ 
+ 		}
+ 
+-		valid -= feature;
++		valid -= xfeature_mask;
+ 	}
+ }
+ 
+@@ -3724,22 +3724,22 @@ static void load_xsave(struct kvm_vcpu *vcpu, u8 *src)
+ 	 */
+ 	valid = xstate_bv & ~XFEATURE_MASK_FPSSE;
+ 	while (valid) {
+-		u64 feature = valid & -valid;
+-		int index = fls64(feature) - 1;
+-		void *dest = get_xsave_addr(xsave, feature);
++		u64 xfeature_mask = valid & -valid;
++		int xfeature_nr = fls64(xfeature_mask) - 1;
++		void *dest = get_xsave_addr(xsave, xfeature_nr);
+ 
+ 		if (dest) {
+ 			u32 size, offset, ecx, edx;
+-			cpuid_count(XSTATE_CPUID, index,
++			cpuid_count(XSTATE_CPUID, xfeature_nr,
+ 				    &size, &offset, &ecx, &edx);
+-			if (feature == XFEATURE_MASK_PKRU)
++			if (xfeature_nr == XFEATURE_PKRU)
+ 				memcpy(&vcpu->arch.pkru, src + offset,
+ 				       sizeof(vcpu->arch.pkru));
+ 			else
+ 				memcpy(dest, src + offset, size);
+ 		}
+ 
+-		valid -= feature;
++		valid -= xfeature_mask;
+ 	}
+ }
+ 
+@@ -8868,11 +8868,11 @@ void kvm_vcpu_reset(struct kvm_vcpu *vcpu, bool init_event)
+ 		if (init_event)
+ 			kvm_put_guest_fpu(vcpu);
+ 		mpx_state_buffer = get_xsave_addr(&vcpu->arch.guest_fpu->state.xsave,
+-					XFEATURE_MASK_BNDREGS);
++					XFEATURE_BNDREGS);
+ 		if (mpx_state_buffer)
+ 			memset(mpx_state_buffer, 0, sizeof(struct mpx_bndreg_state));
+ 		mpx_state_buffer = get_xsave_addr(&vcpu->arch.guest_fpu->state.xsave,
+-					XFEATURE_MASK_BNDCSR);
++					XFEATURE_BNDCSR);
+ 		if (mpx_state_buffer)
+ 			memset(mpx_state_buffer, 0, sizeof(struct mpx_bndcsr));
+ 		if (init_event)
+diff --git a/arch/x86/mm/mpx.c b/arch/x86/mm/mpx.c
+index de1851d15699..c1ec9d81c627 100644
+--- a/arch/x86/mm/mpx.c
++++ b/arch/x86/mm/mpx.c
+@@ -142,7 +142,7 @@ int mpx_fault_info(struct mpx_fault_info *info, struct pt_regs *regs)
+ 		goto err_out;
+ 	}
+ 	/* get bndregs field from current task's xsave area */
+-	bndregs = get_xsave_field_ptr(XFEATURE_MASK_BNDREGS);
++	bndregs = get_xsave_field_ptr(XFEATURE_BNDREGS);
+ 	if (!bndregs) {
+ 		err = -EINVAL;
+ 		goto err_out;
+@@ -190,7 +190,7 @@ static __user void *mpx_get_bounds_dir(void)
+ 	 * The bounds directory pointer is stored in a register
+ 	 * only accessible if we first do an xsave.
+ 	 */
+-	bndcsr = get_xsave_field_ptr(XFEATURE_MASK_BNDCSR);
++	bndcsr = get_xsave_field_ptr(XFEATURE_BNDCSR);
+ 	if (!bndcsr)
+ 		return MPX_INVALID_BOUNDS_DIR;
+ 
+@@ -376,7 +376,7 @@ static int do_mpx_bt_fault(void)
+ 	const struct mpx_bndcsr *bndcsr;
+ 	struct mm_struct *mm = current->mm;
+ 
+-	bndcsr = get_xsave_field_ptr(XFEATURE_MASK_BNDCSR);
++	bndcsr = get_xsave_field_ptr(XFEATURE_BNDCSR);
+ 	if (!bndcsr)
+ 		return -EINVAL;
+ 	/*
