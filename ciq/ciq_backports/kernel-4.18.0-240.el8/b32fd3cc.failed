@@ -1,0 +1,147 @@
+net/tls: add statistics for installed sessions
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+Rebuild_CHGLOG: - [net] tls: add statistics for installed sessions (Sabrina Dubroca) [1819627]
+Rebuild_FUZZ: 95.45%
+commit-author Jakub Kicinski <jakub.kicinski@netronome.com>
+commit b32fd3cc31d723bf2ab859667be3612c0086ec72
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/b32fd3cc.failed
+
+Add SNMP stats for number of sockets with successfully
+installed sessions.  Break them down to software and
+hardware ones.  Note that if hardware offload fails
+stack uses software implementation, and counts the
+session appropriately.
+
+	Signed-off-by: Jakub Kicinski <jakub.kicinski@netronome.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit b32fd3cc31d723bf2ab859667be3612c0086ec72)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	Documentation/networking/tls.rst
+#	include/uapi/linux/snmp.h
+#	net/tls/tls_proc.c
+diff --cc Documentation/networking/tls.rst
+index 5bcbf75e2025,cfba587af5c9..000000000000
+--- a/Documentation/networking/tls.rst
++++ b/Documentation/networking/tls.rst
+@@@ -213,3 -213,23 +213,26 @@@ A patchset to OpenSSL to use ktls as th
+  of calling send directly after a handshake using gnutls.
+  Since it doesn't implement a full record layer, control
+  messages are not supported.
+++<<<<<<< HEAD
+++=======
++ 
++ Statistics
++ ==========
++ 
++ TLS implementation exposes the following per-namespace statistics
++ (``/proc/net/tls_stat``):
++ 
++ - ``TlsCurrTxSw``, ``TlsCurrRxSw`` -
++   number of TX and RX sessions currently installed where host handles
++   cryptography
++ 
++ - ``TlsCurrTxDevice``, ``TlsCurrRxDevice`` -
++   number of TX and RX sessions currently installed where NIC handles
++   cryptography
++ 
++ - ``TlsTxSw``, ``TlsRxSw`` -
++   number of TX and RX sessions opened with host cryptography
++ 
++ - ``TlsTxDevice``, ``TlsRxDevice`` -
++   number of TX and RX sessions opened with NIC cryptography
+++>>>>>>> b32fd3cc31d7 (net/tls: add statistics for installed sessions)
+diff --cc include/uapi/linux/snmp.h
+index 0b7605eafbdb,1b4613b5af70..000000000000
+--- a/include/uapi/linux/snmp.h
++++ b/include/uapi/linux/snmp.h
+@@@ -322,4 -323,19 +322,22 @@@ enu
+  	__LINUX_MIB_XFRMMAX
+  };
+  
+++<<<<<<< HEAD
+++=======
++ /* linux TLS mib definitions */
++ enum
++ {
++ 	LINUX_MIB_TLSNUM = 0,
++ 	LINUX_MIB_TLSCURRTXSW,			/* TlsCurrTxSw */
++ 	LINUX_MIB_TLSCURRRXSW,			/* TlsCurrRxSw */
++ 	LINUX_MIB_TLSCURRTXDEVICE,		/* TlsCurrTxDevice */
++ 	LINUX_MIB_TLSCURRRXDEVICE,		/* TlsCurrRxDevice */
++ 	LINUX_MIB_TLSTXSW,			/* TlsTxSw */
++ 	LINUX_MIB_TLSRXSW,			/* TlsRxSw */
++ 	LINUX_MIB_TLSTXDEVICE,			/* TlsTxDevice */
++ 	LINUX_MIB_TLSRXDEVICE,			/* TlsRxDevice */
++ 	__LINUX_MIB_TLSMAX
++ };
++ 
+++>>>>>>> b32fd3cc31d7 (net/tls: add statistics for installed sessions)
+  #endif	/* _LINUX_SNMP_H */
+* Unmerged path net/tls/tls_proc.c
+* Unmerged path Documentation/networking/tls.rst
+* Unmerged path include/uapi/linux/snmp.h
+diff --git a/net/tls/tls_main.c b/net/tls/tls_main.c
+index f7a147ae7fd3..fc964a54a377 100644
+--- a/net/tls/tls_main.c
++++ b/net/tls/tls_main.c
+@@ -287,14 +287,19 @@ static void tls_sk_proto_cleanup(struct sock *sk,
+ 		kfree(ctx->tx.rec_seq);
+ 		kfree(ctx->tx.iv);
+ 		tls_sw_release_resources_tx(sk);
++		TLS_DEC_STATS(sock_net(sk), LINUX_MIB_TLSCURRTXSW);
+ 	} else if (ctx->tx_conf == TLS_HW) {
+ 		tls_device_free_resources_tx(sk);
++		TLS_DEC_STATS(sock_net(sk), LINUX_MIB_TLSCURRTXDEVICE);
+ 	}
+ 
+-	if (ctx->rx_conf == TLS_SW)
++	if (ctx->rx_conf == TLS_SW) {
+ 		tls_sw_release_resources_rx(sk);
+-	else if (ctx->rx_conf == TLS_HW)
++		TLS_DEC_STATS(sock_net(sk), LINUX_MIB_TLSCURRRXSW);
++	} else if (ctx->rx_conf == TLS_HW) {
+ 		tls_device_offload_cleanup_rx(sk);
++		TLS_DEC_STATS(sock_net(sk), LINUX_MIB_TLSCURRRXDEVICE);
++	}
+ }
+ 
+ static void tls_sk_proto_close(struct sock *sk, long timeout)
+@@ -534,19 +539,29 @@ static int do_tls_setsockopt_conf(struct sock *sk, char __user *optval,
+ 	if (tx) {
+ 		rc = tls_set_device_offload(sk, ctx);
+ 		conf = TLS_HW;
+-		if (rc) {
++		if (!rc) {
++			TLS_INC_STATS(sock_net(sk), LINUX_MIB_TLSTXDEVICE);
++			TLS_INC_STATS(sock_net(sk), LINUX_MIB_TLSCURRTXDEVICE);
++		} else {
+ 			rc = tls_set_sw_offload(sk, ctx, 1);
+ 			if (rc)
+ 				goto err_crypto_info;
++			TLS_INC_STATS(sock_net(sk), LINUX_MIB_TLSTXSW);
++			TLS_INC_STATS(sock_net(sk), LINUX_MIB_TLSCURRTXSW);
+ 			conf = TLS_SW;
+ 		}
+ 	} else {
+ 		rc = tls_set_device_offload_rx(sk, ctx);
+ 		conf = TLS_HW;
+-		if (rc) {
++		if (!rc) {
++			TLS_INC_STATS(sock_net(sk), LINUX_MIB_TLSRXDEVICE);
++			TLS_INC_STATS(sock_net(sk), LINUX_MIB_TLSCURRRXDEVICE);
++		} else {
+ 			rc = tls_set_sw_offload(sk, ctx, 0);
+ 			if (rc)
+ 				goto err_crypto_info;
++			TLS_INC_STATS(sock_net(sk), LINUX_MIB_TLSRXSW);
++			TLS_INC_STATS(sock_net(sk), LINUX_MIB_TLSCURRRXSW);
+ 			conf = TLS_SW;
+ 		}
+ 		tls_sw_strparser_arm(sk, ctx);
+* Unmerged path net/tls/tls_proc.c
