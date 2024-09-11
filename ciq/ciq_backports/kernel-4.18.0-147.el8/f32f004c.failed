@@ -1,0 +1,429 @@
+ida: Convert to XArray
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-147.el8
+commit-author Matthew Wilcox <willy@infradead.org>
+commit f32f004cddf86d63a9c42994bbce9f4e2f07c9fa
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-147.el8/f32f004c.failed
+
+Use the XA_TRACK_FREE ability to track which entries have a free bit,
+similarly to how it uses the radix tree's IDR_FREE tag.  This eliminates
+the per-cpu ida_bitmap preload, and fixes the memory consumption
+regression I introduced when making the IDR able to store any pointer.
+
+	Signed-off-by: Matthew Wilcox <willy@infradead.org>
+(cherry picked from commit f32f004cddf86d63a9c42994bbce9f4e2f07c9fa)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	lib/idr.c
+#	lib/radix-tree.c
+#	tools/testing/radix-tree/idr-test.c
+diff --cc lib/idr.c
+index 729e381e23b4,3c20ad9b0463..000000000000
+--- a/lib/idr.c
++++ b/lib/idr.c
+@@@ -327,190 -328,38 +328,203 @@@ EXPORT_SYMBOL(idr_replace)
+  /*
+   * Developer's notes:
+   *
+-  * The IDA uses the functionality provided by the IDR & radix tree to store
+-  * bitmaps in each entry.  The IDR_FREE tag means there is at least one bit
+-  * free, unlike the IDR where it means at least one entry is free.
++  * The IDA uses the functionality provided by the XArray to store bitmaps in
++  * each entry.  The XA_FREE_MARK is only cleared when all bits in the bitmap
++  * have been set.
+   *
+-  * I considered telling the radix tree that each slot is an order-10 node
+-  * and storing the bit numbers in the radix tree, but the radix tree can't
+-  * allow a single multiorder entry at index 0, which would significantly
+-  * increase memory consumption for the IDA.  So instead we divide the index
+-  * by the number of bits in the leaf bitmap before doing a radix tree lookup.
++  * I considered telling the XArray that each slot is an order-10 node
++  * and indexing by bit number, but the XArray can't allow a single multi-index
++  * entry in the head, which would significantly increase memory consumption
++  * for the IDA.  So instead we divide the index by the number of bits in the
++  * leaf bitmap before doing a radix tree lookup.
+   *
+   * As an optimisation, if there are only a few low bits set in any given
+++<<<<<<< HEAD
+ + * leaf, instead of allocating a 128-byte bitmap, we use the 'exceptional
+ + * entry' functionality of the radix tree to store BITS_PER_LONG - 2 bits
+ + * directly in the entry.  By being really tricksy, we could store
+ + * BITS_PER_LONG - 1 bits, but there're diminishing returns after optimising
+ + * for 0-3 allocated IDs.
+-  *
+-  * We allow the radix tree 'exceptional' count to get out of date.  Nothing
+-  * in the IDA nor the radix tree code checks it.  If it becomes important
+-  * to maintain an accurate exceptional count, switch the rcu_assign_pointer()
+-  * calls to radix_tree_iter_replace() which will correct the exceptional
+-  * count.
+-  *
+-  * The IDA always requires a lock to alloc/free.  If we add a 'test_bit'
+++=======
++  * leaf, instead of allocating a 128-byte bitmap, we store the bits
++  * as a value entry.  Value entries never have the XA_FREE_MARK cleared
++  * because we can always convert them into a bitmap entry.
+++>>>>>>> f32f004cddf8 (ida: Convert to XArray)
++  *
++  * It would be possible to optimise further; once we've run out of a
++  * single 128-byte bitmap, we currently switch to a 576-byte node, put
++  * the 128-byte bitmap in the first entry and then start allocating extra
++  * 128-byte entries.  We could instead use the 512 bytes of the node's
++  * data as a bitmap before moving to that scheme.  I do not believe this
++  * is a worthwhile optimisation; Rasmus Villemoes surveyed the current
++  * users of the IDA and almost none of them use more than 1024 entries.
++  * Those that do use more than the 8192 IDs that the 512 bytes would
++  * provide.
++  *
++  * The IDA always uses a lock to alloc/free.  If we add a 'test_bit'
+   * equivalent, it will still need locking.  Going to RCU lookup would require
+   * using RCU to free bitmaps, and that's not trivial without embedding an
+   * RCU head in the bitmap, which adds a 2-pointer overhead to each 128-byte
+   * bitmap, which is excessive.
+   */
+  
+++<<<<<<< HEAD
+ +#define IDA_MAX (0x80000000U / IDA_BITMAP_BITS - 1)
+ +
+ +static int ida_get_new_above(struct ida *ida, int start)
+ +{
+ +	struct radix_tree_root *root = &ida->ida_rt;
+ +	void __rcu **slot;
+ +	struct radix_tree_iter iter;
+ +	struct ida_bitmap *bitmap;
+ +	unsigned long index;
+ +	unsigned bit, ebit;
+ +	int new;
+ +
+ +	index = start / IDA_BITMAP_BITS;
+ +	bit = start % IDA_BITMAP_BITS;
+ +	ebit = bit + RADIX_TREE_EXCEPTIONAL_SHIFT;
+ +
+ +	slot = radix_tree_iter_init(&iter, index);
+ +	for (;;) {
+ +		if (slot)
+ +			slot = radix_tree_next_slot(slot, &iter,
+ +						RADIX_TREE_ITER_TAGGED);
+ +		if (!slot) {
+ +			slot = idr_get_free(root, &iter, GFP_NOWAIT, IDA_MAX);
+ +			if (IS_ERR(slot)) {
+ +				if (slot == ERR_PTR(-ENOMEM))
+ +					return -EAGAIN;
+ +				return PTR_ERR(slot);
+ +			}
+ +		}
+ +		if (iter.index > index) {
+ +			bit = 0;
+ +			ebit = RADIX_TREE_EXCEPTIONAL_SHIFT;
+ +		}
+ +		new = iter.index * IDA_BITMAP_BITS;
+ +		bitmap = rcu_dereference_raw(*slot);
+ +		if (radix_tree_exception(bitmap)) {
+ +			unsigned long tmp = (unsigned long)bitmap;
+ +			ebit = find_next_zero_bit(&tmp, BITS_PER_LONG, ebit);
+ +			if (ebit < BITS_PER_LONG) {
+ +				tmp |= 1UL << ebit;
+ +				rcu_assign_pointer(*slot, (void *)tmp);
+ +				return new + ebit -
+ +					RADIX_TREE_EXCEPTIONAL_SHIFT;
+ +			}
+ +			bitmap = this_cpu_xchg(ida_bitmap, NULL);
+ +			if (!bitmap)
+ +				return -EAGAIN;
+ +			bitmap->bitmap[0] = tmp >> RADIX_TREE_EXCEPTIONAL_SHIFT;
+ +			rcu_assign_pointer(*slot, bitmap);
+ +		}
+ +
+ +		if (bitmap) {
+ +			bit = find_next_zero_bit(bitmap->bitmap,
+ +							IDA_BITMAP_BITS, bit);
+ +			new += bit;
+ +			if (new < 0)
+ +				return -ENOSPC;
+ +			if (bit == IDA_BITMAP_BITS)
+ +				continue;
+ +
+ +			__set_bit(bit, bitmap->bitmap);
+ +			if (bitmap_full(bitmap->bitmap, IDA_BITMAP_BITS))
+ +				radix_tree_iter_tag_clear(root, &iter,
+ +								IDR_FREE);
+ +		} else {
+ +			new += bit;
+ +			if (new < 0)
+ +				return -ENOSPC;
+ +			if (ebit < BITS_PER_LONG) {
+ +				bitmap = (void *)((1UL << ebit) |
+ +						RADIX_TREE_EXCEPTIONAL_ENTRY);
+ +				radix_tree_iter_replace(root, &iter, slot,
+ +						bitmap);
+ +				return new;
+ +			}
+ +			bitmap = this_cpu_xchg(ida_bitmap, NULL);
+ +			if (!bitmap)
+ +				return -EAGAIN;
+ +			__set_bit(bit, bitmap->bitmap);
+ +			radix_tree_iter_replace(root, &iter, slot, bitmap);
+ +		}
+ +
+ +		return new;
+ +	}
+ +}
+ +
+ +static void ida_remove(struct ida *ida, int id)
+ +{
+ +	unsigned long index = id / IDA_BITMAP_BITS;
+ +	unsigned offset = id % IDA_BITMAP_BITS;
+ +	struct ida_bitmap *bitmap;
+ +	unsigned long *btmp;
+ +	struct radix_tree_iter iter;
+ +	void __rcu **slot;
+ +
+ +	slot = radix_tree_iter_lookup(&ida->ida_rt, &iter, index);
+ +	if (!slot)
+ +		goto err;
+ +
+ +	bitmap = rcu_dereference_raw(*slot);
+ +	if (radix_tree_exception(bitmap)) {
+ +		btmp = (unsigned long *)slot;
+ +		offset += RADIX_TREE_EXCEPTIONAL_SHIFT;
+ +		if (offset >= BITS_PER_LONG)
+ +			goto err;
+ +	} else {
+ +		btmp = bitmap->bitmap;
+ +	}
+ +	if (!test_bit(offset, btmp))
+ +		goto err;
+ +
+ +	__clear_bit(offset, btmp);
+ +	radix_tree_iter_tag_set(&ida->ida_rt, &iter, IDR_FREE);
+ +	if (radix_tree_exception(bitmap)) {
+ +		if (rcu_dereference_raw(*slot) ==
+ +					(void *)RADIX_TREE_EXCEPTIONAL_ENTRY)
+ +			radix_tree_iter_delete(&ida->ida_rt, &iter, slot);
+ +	} else if (bitmap_empty(btmp, IDA_BITMAP_BITS)) {
+ +		kfree(bitmap);
+ +		radix_tree_iter_delete(&ida->ida_rt, &iter, slot);
+ +	}
+ +	return;
+ + err:
+ +	WARN(1, "ida_free called for id=%d which is not allocated.\n", id);
+ +}
+ +
+ +/**
+ + * ida_destroy() - Free all IDs.
+ + * @ida: IDA handle.
+ + *
+ + * Calling this function frees all IDs and releases all resources used
+ + * by an IDA.  When this call returns, the IDA is empty and can be reused
+ + * or freed.  If the IDA is already empty, there is no need to call this
+ + * function.
+ + *
+ + * Context: Any context.
+ + */
+ +void ida_destroy(struct ida *ida)
+ +{
+ +	unsigned long flags;
+ +	struct radix_tree_iter iter;
+ +	void __rcu **slot;
+ +
+ +	xa_lock_irqsave(&ida->ida_rt, flags);
+ +	radix_tree_for_each_slot(slot, &ida->ida_rt, &iter, 0) {
+ +		struct ida_bitmap *bitmap = rcu_dereference_raw(*slot);
+ +		if (!radix_tree_exception(bitmap))
+ +			kfree(bitmap);
+ +		radix_tree_iter_delete(&ida->ida_rt, &iter, slot);
+ +	}
+ +	xa_unlock_irqrestore(&ida->ida_rt, flags);
+ +}
+ +EXPORT_SYMBOL(ida_destroy);
+ +
+++=======
+++>>>>>>> f32f004cddf8 (ida: Convert to XArray)
+  /**
+   * ida_alloc_range() - Allocate an unused ID.
+   * @ida: IDA handle.
+diff --cc lib/radix-tree.c
+index a904a8ddd174,68702061464f..000000000000
+--- a/lib/radix-tree.c
++++ b/lib/radix-tree.c
+@@@ -277,99 -255,6 +277,102 @@@ static unsigned long next_index(unsigne
+  	return (index & ~node_maxindex(node)) + (offset << node->shift);
+  }
+  
+++<<<<<<< HEAD
+ +#ifndef __KERNEL__
+ +static void dump_node(struct radix_tree_node *node, unsigned long index)
+ +{
+ +	unsigned long i;
+ +
+ +	pr_debug("radix node: %p offset %d indices %lu-%lu parent %p tags %lx %lx %lx shift %d count %d exceptional %d\n",
+ +		node, node->offset, index, index | node_maxindex(node),
+ +		node->parent,
+ +		node->tags[0][0], node->tags[1][0], node->tags[2][0],
+ +		node->shift, node->count, node->exceptional);
+ +
+ +	for (i = 0; i < RADIX_TREE_MAP_SIZE; i++) {
+ +		unsigned long first = index | (i << node->shift);
+ +		unsigned long last = first | ((1UL << node->shift) - 1);
+ +		void *entry = node->slots[i];
+ +		if (!entry)
+ +			continue;
+ +		if (entry == RADIX_TREE_RETRY) {
+ +			pr_debug("radix retry offset %ld indices %lu-%lu parent %p\n",
+ +					i, first, last, node);
+ +		} else if (!radix_tree_is_internal_node(entry)) {
+ +			pr_debug("radix entry %p offset %ld indices %lu-%lu parent %p\n",
+ +					entry, i, first, last, node);
+ +		} else if (is_sibling_entry(node, entry)) {
+ +			pr_debug("radix sblng %p offset %ld indices %lu-%lu parent %p val %p\n",
+ +					entry, i, first, last, node,
+ +					*(void **)entry_to_node(entry));
+ +		} else {
+ +			dump_node(entry_to_node(entry), first);
+ +		}
+ +	}
+ +}
+ +
+ +/* For debug */
+ +static void radix_tree_dump(struct radix_tree_root *root)
+ +{
+ +	pr_debug("radix root: %p rnode %p tags %x\n",
+ +			root, root->rnode,
+ +			root->gfp_mask >> ROOT_TAG_SHIFT);
+ +	if (!radix_tree_is_internal_node(root->rnode))
+ +		return;
+ +	dump_node(entry_to_node(root->rnode), 0);
+ +}
+ +
+ +static void dump_ida_node(void *entry, unsigned long index)
+ +{
+ +	unsigned long i;
+ +
+ +	if (!entry)
+ +		return;
+ +
+ +	if (radix_tree_is_internal_node(entry)) {
+ +		struct radix_tree_node *node = entry_to_node(entry);
+ +
+ +		pr_debug("ida node: %p offset %d indices %lu-%lu parent %p free %lx shift %d count %d\n",
+ +			node, node->offset, index * IDA_BITMAP_BITS,
+ +			((index | node_maxindex(node)) + 1) *
+ +				IDA_BITMAP_BITS - 1,
+ +			node->parent, node->tags[0][0], node->shift,
+ +			node->count);
+ +		for (i = 0; i < RADIX_TREE_MAP_SIZE; i++)
+ +			dump_ida_node(node->slots[i],
+ +					index | (i << node->shift));
+ +	} else if (radix_tree_exceptional_entry(entry)) {
+ +		pr_debug("ida excp: %p offset %d indices %lu-%lu data %lx\n",
+ +				entry, (int)(index & RADIX_TREE_MAP_MASK),
+ +				index * IDA_BITMAP_BITS,
+ +				index * IDA_BITMAP_BITS + BITS_PER_LONG -
+ +					RADIX_TREE_EXCEPTIONAL_SHIFT,
+ +				(unsigned long)entry >>
+ +					RADIX_TREE_EXCEPTIONAL_SHIFT);
+ +	} else {
+ +		struct ida_bitmap *bitmap = entry;
+ +
+ +		pr_debug("ida btmp: %p offset %d indices %lu-%lu data", bitmap,
+ +				(int)(index & RADIX_TREE_MAP_MASK),
+ +				index * IDA_BITMAP_BITS,
+ +				(index + 1) * IDA_BITMAP_BITS - 1);
+ +		for (i = 0; i < IDA_BITMAP_LONGS; i++)
+ +			pr_cont(" %lx", bitmap->bitmap[i]);
+ +		pr_cont("\n");
+ +	}
+ +}
+ +
+ +static void ida_dump(struct ida *ida)
+ +{
+ +	struct radix_tree_root *root = &ida->ida_rt;
+ +	pr_debug("ida: %p node %p free %d\n", ida, root->rnode,
+ +				root->gfp_mask >> ROOT_TAG_SHIFT);
+ +	dump_ida_node(root->rnode, 0);
+ +}
+ +#endif
+ +
+++=======
+++>>>>>>> f32f004cddf8 (ida: Convert to XArray)
+  /*
+   * This assumes that the caller has performed appropriate preallocation, and
+   * that the caller has pinned this thread of control to the current CPU.
+diff --cc tools/testing/radix-tree/idr-test.c
+index f620c831a4b5,1b63bdb7688f..000000000000
+--- a/tools/testing/radix-tree/idr-test.c
++++ b/tools/testing/radix-tree/idr-test.c
+@@@ -409,9 -408,9 +408,14 @@@ void ida_check_conv_user(void
+  	for (i = 0; i < 1000000; i++) {
+  		int id = ida_alloc(&ida, GFP_NOWAIT);
+  		if (id == -ENOMEM) {
+++<<<<<<< HEAD
+ +			IDA_BUG_ON(&ida, (i % IDA_BITMAP_BITS) !=
+ +					BITS_PER_LONG - 2);
+++=======
++ 			IDA_BUG_ON(&ida, ((i % IDA_BITMAP_BITS) !=
++ 					  BITS_PER_XA_VALUE) &&
++ 					 ((i % IDA_BITMAP_BITS) != 0));
+++>>>>>>> f32f004cddf8 (ida: Convert to XArray)
+  			id = ida_alloc(&ida, GFP_KERNEL);
+  		} else {
+  			IDA_BUG_ON(&ida, (i % IDA_BITMAP_BITS) ==
+diff --git a/include/linux/idr.h b/include/linux/idr.h
+index 3ec8628ce17f..60daf34b625d 100644
+--- a/include/linux/idr.h
++++ b/include/linux/idr.h
+@@ -214,8 +214,7 @@ static inline void idr_preload_end(void)
+ 	     ++id, (entry) = idr_get_next((idr), &(id)))
+ 
+ /*
+- * IDA - IDR based id allocator, use when translation from id to
+- * pointer isn't necessary.
++ * IDA - ID Allocator, use when translation from id to pointer isn't necessary.
+  */
+ #define IDA_CHUNK_SIZE		128	/* 128 bytes per chunk */
+ #define IDA_BITMAP_LONGS	(IDA_CHUNK_SIZE / sizeof(long))
+@@ -225,14 +224,14 @@ struct ida_bitmap {
+ 	unsigned long		bitmap[IDA_BITMAP_LONGS];
+ };
+ 
+-DECLARE_PER_CPU(struct ida_bitmap *, ida_bitmap);
+-
+ struct ida {
+-	struct radix_tree_root	ida_rt;
++	struct xarray xa;
+ };
+ 
++#define IDA_INIT_FLAGS	(XA_FLAGS_LOCK_IRQ | XA_FLAGS_ALLOC)
++
+ #define IDA_INIT(name)	{						\
+-	.ida_rt = RADIX_TREE_INIT(name, IDR_RT_MARKER | GFP_NOWAIT),	\
++	.xa = XARRAY_INIT(name, IDA_INIT_FLAGS)				\
+ }
+ #define DEFINE_IDA(name)	struct ida name = IDA_INIT(name)
+ 
+@@ -292,7 +291,7 @@ static inline int ida_alloc_max(struct ida *ida, unsigned int max, gfp_t gfp)
+ 
+ static inline void ida_init(struct ida *ida)
+ {
+-	INIT_RADIX_TREE(&ida->ida_rt, IDR_RT_MARKER | GFP_NOWAIT);
++	xa_init_flags(&ida->xa, IDA_INIT_FLAGS);
+ }
+ 
+ #define ida_simple_get(ida, start, end, gfp)	\
+@@ -301,9 +300,6 @@ static inline void ida_init(struct ida *ida)
+ 
+ static inline bool ida_is_empty(const struct ida *ida)
+ {
+-	return radix_tree_empty(&ida->ida_rt);
++	return xa_empty(&ida->xa);
+ }
+-
+-/* in lib/radix-tree.c */
+-int ida_pre_get(struct ida *ida, gfp_t gfp_mask);
+ #endif /* __IDR_H__ */
+* Unmerged path lib/idr.c
+* Unmerged path lib/radix-tree.c
+* Unmerged path tools/testing/radix-tree/idr-test.c
