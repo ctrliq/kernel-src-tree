@@ -1,0 +1,177 @@
+KVM: x86: hyper-v: Introduce KVM_CAP_HYPERV_ENFORCE_CPUID
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-358.el8
+commit-author Vitaly Kuznetsov <vkuznets@redhat.com>
+commit 644f706719f0297bc5f65c8891de1c32f042eae5
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-358.el8/644f7067.failed
+
+Modeled after KVM_CAP_ENFORCE_PV_FEATURE_CPUID, the new capability allows
+for limiting Hyper-V features to those exposed to the guest in Hyper-V
+CPUIDs (0x40000003, 0x40000004, ...).
+
+	Signed-off-by: Vitaly Kuznetsov <vkuznets@redhat.com>
+	Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+Message-Id: <20210521095204.2161214-3-vkuznets@redhat.com>
+	Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+(cherry picked from commit 644f706719f0297bc5f65c8891de1c32f042eae5)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	Documentation/virt/kvm/api.rst
+#	include/uapi/linux/kvm.h
+diff --cc Documentation/virt/kvm/api.rst
+index 544e84d709e6,80154d5d98a1..000000000000
+--- a/Documentation/virt/kvm/api.rst
++++ b/Documentation/virt/kvm/api.rst
+@@@ -6767,3 -6856,49 +6767,52 @@@ vcpu_info is set
+  The KVM_XEN_HVM_CONFIG_RUNSTATE flag indicates that the runstate-related
+  features KVM_XEN_VCPU_ATTR_TYPE_RUNSTATE_ADDR/_CURRENT/_DATA/_ADJUST are
+  supported by the KVM_XEN_VCPU_SET_ATTR/KVM_XEN_VCPU_GET_ATTR ioctls.
+++<<<<<<< HEAD
+++=======
++ 
++ 8.31 KVM_CAP_PPC_MULTITCE
++ -------------------------
++ 
++ :Capability: KVM_CAP_PPC_MULTITCE
++ :Architectures: ppc
++ :Type: vm
++ 
++ This capability means the kernel is capable of handling hypercalls
++ H_PUT_TCE_INDIRECT and H_STUFF_TCE without passing those into the user
++ space. This significantly accelerates DMA operations for PPC KVM guests.
++ User space should expect that its handlers for these hypercalls
++ are not going to be called if user space previously registered LIOBN
++ in KVM (via KVM_CREATE_SPAPR_TCE or similar calls).
++ 
++ In order to enable H_PUT_TCE_INDIRECT and H_STUFF_TCE use in the guest,
++ user space might have to advertise it for the guest. For example,
++ IBM pSeries (sPAPR) guest starts using them if "hcall-multi-tce" is
++ present in the "ibm,hypertas-functions" device-tree property.
++ 
++ The hypercalls mentioned above may or may not be processed successfully
++ in the kernel based fast path. If they can not be handled by the kernel,
++ they will get passed on to user space. So user space still has to have
++ an implementation for these despite the in kernel acceleration.
++ 
++ This capability is always enabled.
++ 
++ 8.32 KVM_CAP_PTP_KVM
++ --------------------
++ 
++ :Architectures: arm64
++ 
++ This capability indicates that the KVM virtual PTP service is
++ supported in the host. A VMM can check whether the service is
++ available to the guest on migration.
++ 
++ 8.33 KVM_CAP_HYPERV_ENFORCE_CPUID
++ -----------------------------
++ 
++ Architectures: x86
++ 
++ When enabled, KVM will disable emulated Hyper-V features provided to the
++ guest according to the bits Hyper-V CPUID feature leaves. Otherwise, all
++ currently implmented Hyper-V features are provided unconditionally when
++ Hyper-V identification is set in the HYPERV_CPUID_INTERFACE (0x40000001)
++ leaf.
+++>>>>>>> 644f706719f0 (KVM: x86: hyper-v: Introduce KVM_CAP_HYPERV_ENFORCE_CPUID)
+diff --cc include/uapi/linux/kvm.h
+index 1e90d5a48059,792816144092..000000000000
+--- a/include/uapi/linux/kvm.h
++++ b/include/uapi/linux/kvm.h
+@@@ -1079,6 -1081,9 +1079,11 @@@ struct kvm_ppc_resize_hpt 
+  #define KVM_CAP_SET_GUEST_DEBUG2 195
+  #define KVM_CAP_SGX_ATTRIBUTE 196
+  #define KVM_CAP_VM_COPY_ENC_CONTEXT_FROM 197
+++<<<<<<< HEAD
+++=======
++ #define KVM_CAP_PTP_KVM 198
++ #define KVM_CAP_HYPERV_ENFORCE_CPUID 199
+++>>>>>>> 644f706719f0 (KVM: x86: hyper-v: Introduce KVM_CAP_HYPERV_ENFORCE_CPUID)
+  
+  #ifdef KVM_CAP_IRQ_ROUTING
+  
+* Unmerged path Documentation/virt/kvm/api.rst
+diff --git a/arch/x86/include/asm/kvm_host.h b/arch/x86/include/asm/kvm_host.h
+index 32b2a9c1142c..b71096ca4e8e 100644
+--- a/arch/x86/include/asm/kvm_host.h
++++ b/arch/x86/include/asm/kvm_host.h
+@@ -548,6 +548,7 @@ struct kvm_vcpu_hv {
+ 	struct kvm_vcpu_hv_stimer stimer[HV_SYNIC_STIMER_COUNT];
+ 	DECLARE_BITMAP(stimer_pending_bitmap, HV_SYNIC_STIMER_COUNT);
+ 	cpumask_t tlb_flush;
++	bool enforce_cpuid;
+ };
+ 
+ /* Xen HVM per vcpu emulation context */
+diff --git a/arch/x86/kvm/hyperv.c b/arch/x86/kvm/hyperv.c
+index 7738c262ba2c..9e86933bde33 100644
+--- a/arch/x86/kvm/hyperv.c
++++ b/arch/x86/kvm/hyperv.c
+@@ -1853,6 +1853,27 @@ void kvm_hv_set_cpuid(struct kvm_vcpu *vcpu)
+ 		vcpu->arch.hyperv_enabled = false;
+ }
+ 
++int kvm_hv_set_enforce_cpuid(struct kvm_vcpu *vcpu, bool enforce)
++{
++	struct kvm_vcpu_hv *hv_vcpu;
++	int ret = 0;
++
++	if (!to_hv_vcpu(vcpu)) {
++		if (enforce) {
++			ret = kvm_hv_vcpu_init(vcpu);
++			if (ret)
++				return ret;
++		} else {
++			return 0;
++		}
++	}
++
++	hv_vcpu = to_hv_vcpu(vcpu);
++	hv_vcpu->enforce_cpuid = enforce;
++
++	return ret;
++}
++
+ bool kvm_hv_hypercall_enabled(struct kvm_vcpu *vcpu)
+ {
+ 	return vcpu->arch.hyperv_enabled && to_kvm_hv(vcpu->kvm)->hv_guest_os_id;
+diff --git a/arch/x86/kvm/hyperv.h b/arch/x86/kvm/hyperv.h
+index 60547d5cb6d7..730da8537d05 100644
+--- a/arch/x86/kvm/hyperv.h
++++ b/arch/x86/kvm/hyperv.h
+@@ -138,6 +138,7 @@ void kvm_hv_invalidate_tsc_page(struct kvm *kvm);
+ void kvm_hv_init_vm(struct kvm *kvm);
+ void kvm_hv_destroy_vm(struct kvm *kvm);
+ void kvm_hv_set_cpuid(struct kvm_vcpu *vcpu);
++int kvm_hv_set_enforce_cpuid(struct kvm_vcpu *vcpu, bool enforce);
+ int kvm_vm_ioctl_hv_eventfd(struct kvm *kvm, struct kvm_hyperv_eventfd *args);
+ int kvm_get_hv_cpuid(struct kvm_vcpu *vcpu, struct kvm_cpuid2 *cpuid,
+ 		     struct kvm_cpuid_entry2 __user *entries);
+diff --git a/arch/x86/kvm/x86.c b/arch/x86/kvm/x86.c
+index 01c783f4d278..9a99cb223bda 100644
+--- a/arch/x86/kvm/x86.c
++++ b/arch/x86/kvm/x86.c
+@@ -3957,6 +3957,7 @@ int kvm_vm_ioctl_check_extension(struct kvm *kvm, long ext)
+ 	case KVM_CAP_HYPERV_TLBFLUSH:
+ 	case KVM_CAP_HYPERV_SEND_IPI:
+ 	case KVM_CAP_HYPERV_CPUID:
++	case KVM_CAP_HYPERV_ENFORCE_CPUID:
+ 	case KVM_CAP_SYS_HYPERV_CPUID:
+ 	case KVM_CAP_PCI_SEGMENT:
+ 	case KVM_CAP_DEBUGREGS:
+@@ -4883,6 +4884,9 @@ static int kvm_vcpu_ioctl_enable_cap(struct kvm_vcpu *vcpu,
+ 
+ 		return static_call(kvm_x86_enable_direct_tlbflush)(vcpu);
+ 
++	case KVM_CAP_HYPERV_ENFORCE_CPUID:
++		return kvm_hv_set_enforce_cpuid(vcpu, cap->args[0]);
++
+ 	case KVM_CAP_ENFORCE_PV_FEATURE_CPUID:
+ 		vcpu->arch.pv_cpuid.enforce = cap->args[0];
+ 		if (vcpu->arch.pv_cpuid.enforce)
+* Unmerged path include/uapi/linux/kvm.h
