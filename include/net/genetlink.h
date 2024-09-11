@@ -86,8 +86,6 @@ struct genl_family {
 	RH_KABI_RESERVE(8)
 };
 
-struct nlattr **genl_family_attrbuf(const struct genl_family *family);
-
 /**
  * struct genl_info - receiving information
  * @snd_seq: sending sequence number
