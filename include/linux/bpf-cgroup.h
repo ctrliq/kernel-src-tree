@@ -90,7 +90,7 @@ struct cgroup_bpf {
 	)
 
 	/* temp storage for effective prog array used by prog_attach/detach */
-	struct bpf_prog_array __rcu *inactive;
+	struct bpf_prog_array *inactive;
 
 	RH_KABI_EXTEND(struct percpu_ref refcnt)
 	RH_KABI_EXTEND(struct work_struct release_work)
