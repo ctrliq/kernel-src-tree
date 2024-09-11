@@ -1,0 +1,178 @@
+nvmet: add buffered I/O support for file backed ns
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-147.el8
+commit-author Chaitanya Kulkarni <chaitanya.kulkarni@wdc.com>
+commit 55eb942eda2ccbbbea61db4c1a774ba22b618046
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-147.el8/55eb942e.failed
+
+Add a new "buffered_io" attribute, which disabled direct I/O and thus
+enables page cache based caching when enabled.   The attribute can only
+be changed when the namespace is disabled as the file has to be reopend
+for the change to take effect.
+
+The possibly blocking read/write are deferred to a newly introduced
+global workqueue.
+
+	Signed-off-by: Chaitanya Kulkarni <chaitanya.kulkarni@wdc.com>
+	Signed-off-by: Christoph Hellwig <hch@lst.de>
+(cherry picked from commit 55eb942eda2ccbbbea61db4c1a774ba22b618046)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/nvme/target/configfs.c
+diff --cc drivers/nvme/target/configfs.c
+index ebed21c35410,fee56b3a23bc..000000000000
+--- a/drivers/nvme/target/configfs.c
++++ b/drivers/nvme/target/configfs.c
+@@@ -490,9 -440,7 +518,13 @@@ static struct configfs_attribute *nvmet
+  	&nvmet_ns_attr_device_nguid,
+  	&nvmet_ns_attr_device_uuid,
+  	&nvmet_ns_attr_enable,
+++<<<<<<< HEAD
+ +#ifdef CONFIG_PCI_P2PDMA
+ +	&nvmet_ns_attr_p2pmem,
+ +#endif
+++=======
++ 	&nvmet_ns_attr_buffered_io,
+++>>>>>>> 55eb942eda2c (nvmet: add buffered I/O support for file backed ns)
+  	NULL,
+  };
+  
+* Unmerged path drivers/nvme/target/configfs.c
+diff --git a/drivers/nvme/target/core.c b/drivers/nvme/target/core.c
+index 88a7c44b9580..ca45e9b2eaff 100644
+--- a/drivers/nvme/target/core.c
++++ b/drivers/nvme/target/core.c
+@@ -19,6 +19,7 @@
+ 
+ #include "nvmet.h"
+ 
++struct workqueue_struct *buffered_io_wq;
+ static const struct nvmet_fabrics_ops *nvmet_transports[NVMF_TRTYPE_MAX];
+ static DEFINE_IDA(cntlid_ida);
+ 
+@@ -541,6 +542,7 @@ struct nvmet_ns *nvmet_ns_alloc(struct nvmet_subsys *subsys, u32 nsid)
+ 	ns->nsid = nsid;
+ 	ns->subsys = subsys;
+ 	uuid_gen(&ns->uuid);
++	ns->buffered_io = false;
+ 
+ 	return ns;
+ }
+@@ -1292,6 +1294,12 @@ static int __init nvmet_init(void)
+ {
+ 	int error;
+ 
++	buffered_io_wq = alloc_workqueue("nvmet-buffered-io-wq",
++			WQ_MEM_RECLAIM, 0);
++	if (!buffered_io_wq) {
++		error = -ENOMEM;
++		goto out;
++	}
+ 	error = nvmet_init_discovery();
+ 	if (error)
+ 		goto out;
+@@ -1312,6 +1320,7 @@ static void __exit nvmet_exit(void)
+ 	nvmet_exit_configfs();
+ 	nvmet_exit_discovery();
+ 	ida_destroy(&cntlid_ida);
++	destroy_workqueue(buffered_io_wq);
+ 
+ 	BUILD_BUG_ON(sizeof(struct nvmf_disc_rsp_page_entry) != 1024);
+ 	BUILD_BUG_ON(sizeof(struct nvmf_disc_rsp_page_hdr) != 1024);
+diff --git a/drivers/nvme/target/io-cmd-file.c b/drivers/nvme/target/io-cmd-file.c
+index 8c42b3a8c420..57c660e3245d 100644
+--- a/drivers/nvme/target/io-cmd-file.c
++++ b/drivers/nvme/target/io-cmd-file.c
+@@ -16,6 +16,8 @@
+ void nvmet_file_ns_disable(struct nvmet_ns *ns)
+ {
+ 	if (ns->file) {
++		if (ns->buffered_io)
++			flush_workqueue(buffered_io_wq);
+ 		mempool_destroy(ns->bvec_pool);
+ 		ns->bvec_pool = NULL;
+ 		kmem_cache_destroy(ns->bvec_cache);
+@@ -27,11 +29,14 @@ void nvmet_file_ns_disable(struct nvmet_ns *ns)
+ 
+ int nvmet_file_ns_enable(struct nvmet_ns *ns)
+ {
+-	int ret;
++	int flags = O_RDWR | O_LARGEFILE;
+ 	struct kstat stat;
++	int ret;
++
++	if (!ns->buffered_io)
++		flags |= O_DIRECT;
+ 
+-	ns->file = filp_open(ns->device_path,
+-			O_RDWR | O_LARGEFILE | O_DIRECT, 0);
++	ns->file = filp_open(ns->device_path, flags, 0);
+ 	if (IS_ERR(ns->file)) {
+ 		pr_err("failed to open file %s: (%ld)\n",
+ 				ns->device_path, PTR_ERR(ns->file));
+@@ -100,7 +105,7 @@ static ssize_t nvmet_file_submit_bvec(struct nvmet_req *req, loff_t pos,
+ 
+ 	iocb->ki_pos = pos;
+ 	iocb->ki_filp = req->ns->file;
+-	iocb->ki_flags = IOCB_DIRECT | ki_flags;
++	iocb->ki_flags = ki_flags | iocb_flags(req->ns->file);
+ 
+ 	ret = call_iter(iocb, &iter);
+ 
+@@ -189,6 +194,19 @@ static void nvmet_file_execute_rw(struct nvmet_req *req)
+ 	nvmet_file_submit_bvec(req, pos, bv_cnt, total_len);
+ }
+ 
++static void nvmet_file_buffered_io_work(struct work_struct *w)
++{
++	struct nvmet_req *req = container_of(w, struct nvmet_req, f.work);
++
++	nvmet_file_execute_rw(req);
++}
++
++static void nvmet_file_execute_rw_buffered_io(struct nvmet_req *req)
++{
++	INIT_WORK(&req->f.work, nvmet_file_buffered_io_work);
++	queue_work(buffered_io_wq, &req->f.work);
++}
++
+ static void nvmet_file_flush_work(struct work_struct *w)
+ {
+ 	struct nvmet_req *req = container_of(w, struct nvmet_req, f.work);
+@@ -280,7 +298,10 @@ u16 nvmet_file_parse_io_cmd(struct nvmet_req *req)
+ 	switch (cmd->common.opcode) {
+ 	case nvme_cmd_read:
+ 	case nvme_cmd_write:
+-		req->execute = nvmet_file_execute_rw;
++		if (req->ns->buffered_io)
++			req->execute = nvmet_file_execute_rw_buffered_io;
++		else
++			req->execute = nvmet_file_execute_rw;
+ 		req->data_len = nvmet_rw_len(req);
+ 		return 0;
+ 	case nvme_cmd_flush:
+diff --git a/drivers/nvme/target/nvmet.h b/drivers/nvme/target/nvmet.h
+index ec9283b6fd89..9d2ce4b3af42 100644
+--- a/drivers/nvme/target/nvmet.h
++++ b/drivers/nvme/target/nvmet.h
+@@ -66,6 +66,7 @@ struct nvmet_ns {
+ 	u8			nguid[16];
+ 	uuid_t			uuid;
+ 
++	bool			buffered_io;
+ 	bool			enabled;
+ 	struct nvmet_subsys	*subsys;
+ 	const char		*device_path;
+@@ -284,6 +285,8 @@ struct nvmet_req {
+ 	struct device *p2p_client;
+ };
+ 
++extern struct workqueue_struct *buffered_io_wq;
++
+ static inline void nvmet_set_status(struct nvmet_req *req, u16 status)
+ {
+ 	req->rsp->status = cpu_to_le16(status << 1);
